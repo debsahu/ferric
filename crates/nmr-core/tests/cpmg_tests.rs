@@ -18,10 +18,11 @@ use nmr_core::cpmg::{
     compute_r2eff_from_intensities, evaluate_exchange_gate, fit_cpmg_global_cpu,
     fit_r1rho_trott_palmer_cpu, format_cpmg_fit_json, format_cpmg_fit_tsv, r1rho_trott_palmer_2002,
     r2eff_baldwin2014, r2eff_cr72, r2eff_lm63, r2eff_numerical_2x2, read_cpmg_series_tsv,
-    write_cpmg_series_tsv, CpmgFitConfig, CpmgSeriesDataset, ExchangeGateConfig, R1RhoOffResPoint,
-    RawCpmgIntensityPlane,
+    write_cpmg_series_tsv, CpmgFitConfig, CpmgModel, CpmgSeriesDataset, ExchangeGateConfig,
+    R1RhoOffResPoint, RawCpmgIntensityPlane,
 };
 use nmr_core::rng::Rng;
+use serde_json::json;
 
 #[test]
 fn test_baldwin2014_matches_numerical_2x2_propagator_under_0p02_across_all_regimes() {
@@ -86,7 +87,24 @@ fn test_baldwin2014_matches_numerical_2x2_propagator_under_0p02_across_all_regim
         100.0,
     );
     let b14_fast = r2eff_baldwin2014(12.0, 12.0, pb_fast, kex_fast, dw_fast, 0.04, 100.0);
-    assert!((lm - b14_fast).abs() < 0.02);
+    let lm_diff = (lm - b14_fast).abs();
+    assert!(lm_diff < 0.02);
+
+    let n_grid =
+        kex_list.len() * pb_list.len() * delta_r2_list.len() * dw_rad_list.len() * nu_list.len();
+    println!(
+        "W4_METRIC_JSON: {}",
+        json!({
+            "task": "T13.5",
+            "kind": "cpmg_baldwin_vs_num2x2",
+            "n_grid_points": n_grid,
+            "max_err_s_inv": max_err,
+            "gate_s_inv": 0.02,
+            "max_cr72_gap_dr2_s_inv": max_cr72_gap_nonzero_dr2,
+            "lm63_fast_diff_s_inv": lm_diff,
+            "passed": max_err < 0.02 && lm_diff < 0.02,
+        })
+    );
 }
 
 #[test]
@@ -171,6 +189,21 @@ fn test_replicate_plane_r2eff_propagation_and_exchange_gate() {
         !flat_verdict.significant_exchange,
         "flat residue must be rejected by exchange gate"
     );
+    println!(
+        "W4_METRIC_JSON: {}",
+        json!({
+            "task": "T13.5",
+            "kind": "cpmg_exchange_gate",
+            "ex_rex_s_inv": ex_verdict.observed_rex_s_inv,
+            "ex_delta_aic": ex_verdict.delta_aic,
+            "ex_f_pvalue": ex_verdict.f_pvalue,
+            "ex_significant": ex_verdict.significant_exchange,
+            "flat_rex_s_inv": flat_verdict.observed_rex_s_inv,
+            "flat_f_pvalue": flat_verdict.f_pvalue,
+            "flat_significant": flat_verdict.significant_exchange,
+            "passed": ex_verdict.significant_exchange && !flat_verdict.significant_exchange,
+        })
+    );
 }
 
 #[test]
@@ -193,22 +226,48 @@ fn test_multifield_600_800_mhz_global_cpmg_fit_under_2pct_and_trott_palmer_r1rho
 
     let mut rng = Rng::new(20261350);
     let err_s_inv = 0.12;
-    let mut series = Vec::new();
 
-    for &(seq_id, res_name, dw_ppm, base_r2_600) in &exchanging {
+    for &(model, model_label, seed_m) in &[
+        (CpmgModel::Baldwin2014, "Baldwin2014", 20261350_u64),
+        (CpmgModel::Cr72, "CR72", 20261351_u64),
+    ] {
+        let mut rng_m = Rng::new(seed_m);
+        let mut model_series = Vec::new();
+        for &(seq_id, res_name, dw_ppm, base_r2_600) in &exchanging {
+            for &(larmor_mhz, r2_inc) in &fields {
+                let r20 = base_r2_600 + r2_inc;
+                let dw_rad = TAU * larmor_mhz * dw_ppm;
+                let r2_vals: Vec<f64> = nu_grid
+                    .iter()
+                    .map(|&nu| {
+                        let clean = match model {
+                            CpmgModel::Cr72 => r2eff_cr72(r20, r20, true_pb, true_kex, dw_rad, nu),
+                            _ => {
+                                r2eff_baldwin2014(r20, r20, true_pb, true_kex, dw_rad, t_relax, nu)
+                            }
+                        };
+                        clean + rng_m.normal(0.0, err_s_inv)
+                    })
+                    .collect();
+                model_series.push(CpmgSeriesDataset {
+                    seq_id,
+                    res_name: res_name.to_string(),
+                    larmor_mhz,
+                    t_relax_s: t_relax,
+                    nu_cpmg_hz: nu_grid.clone(),
+                    r2_eff_s_inv: r2_vals,
+                    r2_eff_err: vec![err_s_inv; nu_grid.len()],
+                });
+            }
+        }
         for &(larmor_mhz, r2_inc) in &fields {
-            let r20 = base_r2_600 + r2_inc;
-            let dw_rad = TAU * larmor_mhz * dw_ppm;
             let r2_vals: Vec<f64> = nu_grid
                 .iter()
-                .map(|&nu| {
-                    r2eff_baldwin2014(r20, r20, true_pb, true_kex, dw_rad, t_relax, nu)
-                        + rng.normal(0.0, err_s_inv)
-                })
+                .map(|_| 11.0 + r2_inc + rng_m.normal(0.0, err_s_inv))
                 .collect();
-            series.push(CpmgSeriesDataset {
-                seq_id,
-                res_name: res_name.to_string(),
+            model_series.push(CpmgSeriesDataset {
+                seq_id: 99,
+                res_name: "SER".to_string(),
                 larmor_mhz,
                 t_relax_s: t_relax,
                 nu_cpmg_hz: nu_grid.clone(),
@@ -216,60 +275,74 @@ fn test_multifield_600_800_mhz_global_cpmg_fit_under_2pct_and_trott_palmer_r1rho
                 r2_eff_err: vec![err_s_inv; nu_grid.len()],
             });
         }
-    }
-    // Add a non-exchanging flat decoy residue (filtered out automatically by exchange gate!)
-    for &(larmor_mhz, r2_inc) in &fields {
-        let r2_vals: Vec<f64> = nu_grid
-            .iter()
-            .map(|_| 11.0 + r2_inc + rng.normal(0.0, err_s_inv))
-            .collect();
-        series.push(CpmgSeriesDataset {
-            seq_id: 99,
-            res_name: "SER".to_string(),
-            larmor_mhz,
-            t_relax_s: t_relax,
-            nu_cpmg_hz: nu_grid.clone(),
-            r2_eff_s_inv: r2_vals,
-            r2_eff_err: vec![err_s_inv; nu_grid.len()],
-        });
-    }
 
-    let tsv = write_cpmg_series_tsv(&series);
-    let parsed = read_cpmg_series_tsv(&tsv).expect("CPMG TSV roundtrip");
-    assert_eq!(parsed.len(), series.len());
+        let tsv = write_cpmg_series_tsv(&model_series);
+        let parsed = read_cpmg_series_tsv(&tsv).expect("CPMG TSV roundtrip");
+        assert_eq!(parsed.len(), model_series.len());
 
-    let fit = fit_cpmg_global_cpu(&parsed, &CpmgFitConfig::default()).expect("global CPMG fit");
-    assert_eq!(
-        fit.residues.len(),
-        exchanging.len(),
-        "flat decoy 99 must be gated out"
-    );
-
-    let rel_pb = (fit.p_b - true_pb).abs() / true_pb;
-    let rel_kex = (fit.k_ex_s_inv - true_kex).abs() / true_kex;
-    assert!(
-        rel_pb < 0.02,
-        "p_B relative error {rel_pb:.4} >= 2% (fit={}, true={true_pb})",
-        fit.p_b
-    );
-    assert!(
-        rel_kex < 0.02,
-        "k_ex relative error {rel_kex:.4} >= 2% (fit={}, true={true_kex})",
-        fit.k_ex_s_inv
-    );
-    for (rf, &(_, _, true_dw, _)) in fit.residues.iter().zip(exchanging.iter()) {
-        let rel_dw = (rf.dw_ppm - true_dw).abs() / true_dw;
-        assert!(
-            rel_dw < 0.02,
-            "res {} |dw| relative error {rel_dw:.4} >= 2% (fit={}, true={true_dw})",
-            rf.seq_id,
-            rf.dw_ppm
+        let cfg = CpmgFitConfig {
+            model,
+            ..CpmgFitConfig::default()
+        };
+        let fit = fit_cpmg_global_cpu(&parsed, &cfg).expect("global CPMG fit");
+        assert_eq!(
+            fit.residues.len(),
+            exchanging.len(),
+            "flat decoy 99 must be gated out ({model_label})"
         );
-    }
 
-    let out_tsv = format_cpmg_fit_tsv(&fit);
-    let out_json = format_cpmg_fit_json(&fit).unwrap();
-    assert!(out_tsv.contains("baldwin2014") && out_json.contains("\"k_ex_s_inv\""));
+        let rel_pb = (fit.p_b - true_pb).abs() / true_pb;
+        let rel_kex = (fit.k_ex_s_inv - true_kex).abs() / true_kex;
+        assert!(
+            rel_pb < 0.02,
+            "{model_label} p_B relative error {rel_pb:.4} >= 2% (fit={}, true={true_pb})",
+            fit.p_b
+        );
+        assert!(
+            rel_kex < 0.02,
+            "{model_label} k_ex relative error {rel_kex:.4} >= 2% (fit={}, true={true_kex})",
+            fit.k_ex_s_inv
+        );
+        let mut max_rel_dw = 0.0f64;
+        for (rf, &(_, _, true_dw, _)) in fit.residues.iter().zip(exchanging.iter()) {
+            let rel_dw = (rf.dw_ppm - true_dw).abs() / true_dw;
+            max_rel_dw = max_rel_dw.max(rel_dw);
+            assert!(
+                rel_dw < 0.02,
+                "{model_label} res {} |dw| relative error {rel_dw:.4} >= 2% (fit={}, true={true_dw})",
+                rf.seq_id,
+                rf.dw_ppm
+            );
+        }
+
+        println!(
+            "W4_METRIC_JSON: {}",
+            json!({
+                "task": "T13.5",
+                "kind": "cpmg_cpu_multifield_fit",
+                "model": model_label,
+                "fields_1h_mhz": [600, 800],
+                "n_exchanging": fit.residues.len(),
+                "n_gated_out": 1,
+                "true_pb": true_pb,
+                "fit_pb": fit.p_b,
+                "rel_err_pb_pct": rel_pb * 100.0,
+                "true_kex_s_inv": true_kex,
+                "fit_kex_s_inv": fit.k_ex_s_inv,
+                "rel_err_kex_pct": rel_kex * 100.0,
+                "max_rel_dw_pct": max_rel_dw * 100.0,
+                "reduced_chi2": fit.reduced_chi2,
+                "dof": fit.dof,
+                "passed": true,
+            })
+        );
+
+        if model == CpmgModel::Baldwin2014 {
+            let out_tsv = format_cpmg_fit_tsv(&fit);
+            let out_json = format_cpmg_fit_json(&fit).unwrap();
+            assert!(out_tsv.contains("baldwin2014") && out_json.contains("\"k_ex_s_inv\""));
+        }
+    }
 
     // Verify Trott–Palmer (2002) asymmetric off-resonance R1rho recovers SIGNED dw_ab_ppm!
     let major_ppm = 120.0;
@@ -298,6 +371,22 @@ fn test_multifield_600_800_mhz_global_cpmg_fit_under_2pct_and_trott_palmer_r1rho
         (tp_fit.dw_ab_ppm - true_signed_dw).abs() < 0.12 && tp_fit.dw_ab_ppm < 0.0,
         "Trott-Palmer R1rho must recover negative signed dw_AB = -4.2 ppm, got {:.3}",
         tp_fit.dw_ab_ppm
+    );
+    println!(
+        "W4_METRIC_JSON: {}",
+        json!({
+            "task": "T13.5",
+            "kind": "r1rho_trott_palmer_fit",
+            "true_pb": 0.025,
+            "fit_pb": tp_fit.p_b,
+            "true_kex_s_inv": 1400.0,
+            "fit_kex_s_inv": tp_fit.k_ex_s_inv,
+            "true_dw_ab_ppm": true_signed_dw,
+            "fit_dw_ab_ppm": tp_fit.dw_ab_ppm,
+            "dw_abs_err_ppm": (tp_fit.dw_ab_ppm - true_signed_dw).abs(),
+            "reduced_chi2": tp_fit.chi2 / ((r1rho_pts.len().saturating_sub(5).max(1)) as f64),
+            "passed": true,
+        })
     );
 }
 

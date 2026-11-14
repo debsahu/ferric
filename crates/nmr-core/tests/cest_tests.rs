@@ -15,17 +15,20 @@ use std::f64::consts::TAU;
 
 use nmr_core::cest::{
     build_liouvillian_2state, build_liouvillian_3state, expm_eigen_reference,
-    expm_high_order_reference, expm_pade66, fit_cest_global_cpu, format_cest_fit_json,
-    format_cest_fit_tsv, read_cest_profiles_tsv, simulate_cest_2state_profile,
-    simulate_cest_3state_profile, write_cest_profiles_tsv, Cest2StateParams, Cest3StateParams,
-    CestFitConfig, CestNormalization, CestProfileDataset,
+    expm_high_order_reference, expm_pade66, fit_cest_3state_profile_cpu, fit_cest_global_cpu,
+    format_cest_fit_json, format_cest_fit_tsv, read_cest_profiles_tsv,
+    simulate_cest_2state_profile, simulate_cest_3state_profile, write_cest_profiles_tsv,
+    Cest2StateParams, Cest3StateParams, CestFitConfig, CestNormalization, CestProfileDataset,
 };
 use nmr_core::rng::Rng;
+use serde_json::json;
 
 #[test]
 fn test_pade66_expm_matches_eigen_and_high_order_to_1e11_2state_and_3state() {
-    let mut max_err_vs_eigen = 0.0f64;
-    let mut max_err_vs_high = 0.0f64;
+    let mut max_err_vs_eigen_7x7 = 0.0f64;
+    let mut max_err_vs_high_7x7 = 0.0f64;
+    let mut max_err_vs_eigen_10x10 = 0.0f64;
+    let mut max_err_vs_high_10x10 = 0.0f64;
 
     // Sweep diverse 2-state CEST and high-R2B DEST Liouvillians
     let regimes_2state = [
@@ -64,8 +67,8 @@ fn test_pade66_expm_matches_eigen_and_high_order_to_1e11_2state_and_3state() {
 
         for i in 0..7 {
             for j in 0..7 {
-                max_err_vs_eigen = max_err_vs_eigen.max((pade[i][j] - eig[i][j]).abs());
-                max_err_vs_high = max_err_vs_high.max((pade[i][j] - high[i][j]).abs());
+                max_err_vs_eigen_7x7 = max_err_vs_eigen_7x7.max((pade[i][j] - eig[i][j]).abs());
+                max_err_vs_high_7x7 = max_err_vs_high_7x7.max((pade[i][j] - high[i][j]).abs());
             }
         }
     }
@@ -101,14 +104,26 @@ fn test_pade66_expm_matches_eigen_and_high_order_to_1e11_2state_and_3state() {
 
         for i in 0..10 {
             for j in 0..10 {
-                max_err_vs_eigen = max_err_vs_eigen.max((pade[i][j] - eig[i][j]).abs());
-                max_err_vs_high = max_err_vs_high.max((pade[i][j] - high[i][j]).abs());
+                max_err_vs_eigen_10x10 = max_err_vs_eigen_10x10.max((pade[i][j] - eig[i][j]).abs());
+                max_err_vs_high_10x10 = max_err_vs_high_10x10.max((pade[i][j] - high[i][j]).abs());
             }
         }
     }
 
+    let max_err_vs_eigen = max_err_vs_eigen_7x7.max(max_err_vs_eigen_10x10);
+    let max_err_vs_high = max_err_vs_high_7x7.max(max_err_vs_high_10x10);
     println!(
-        "[T13.4 CPU Pade66] max_err_vs_eigen={max_err_vs_eigen:.3e}, max_err_vs_high={max_err_vs_high:.3e}"
+        "W4_METRIC_JSON: {}",
+        json!({
+            "task": "T13.4",
+            "kind": "cest_cpu_pade66",
+            "max_err_vs_eigen_7x7": max_err_vs_eigen_7x7,
+            "max_err_vs_high_7x7": max_err_vs_high_7x7,
+            "max_err_vs_eigen_10x10": max_err_vs_eigen_10x10,
+            "max_err_vs_high_10x10": max_err_vs_high_10x10,
+            "gate": 1e-11,
+            "passed": max_err_vs_eigen < 1e-11 && max_err_vs_high < 1e-11,
+        })
     );
     assert!(
         max_err_vs_eigen < 1e-11,
@@ -237,6 +252,21 @@ fn test_3state_cest_dips_and_dest_dark_state_broadening_and_b1_quadrature() {
         "DEST dark-state wing must strongly attenuate signal at +35 ppm (got {})",
         dest_curve[idx_wing]
     );
+    println!(
+        "W4_METRIC_JSON: {}",
+        json!({
+            "task": "T13.4",
+            "kind": "cest_3state_dest_quad",
+            "dip_major_i_i0": curve3[idx_at(118.0)],
+            "dip_b_i_i0": curve3[idx_at(122.0)],
+            "dip_c_i_i0": curve3[idx_at(114.5)],
+            "quad_11v15_max_diff": max_quad_11v15,
+            "quad_5v15_excited_max_diff": max_quad_5v15_excited,
+            "dest_wing_35ppm_i_i0": dest_curve[idx_wing],
+            "monomer_wing_35ppm_i_i0": mono_curve[idx_wing],
+            "passed": true,
+        })
+    );
 }
 
 #[test]
@@ -327,8 +357,12 @@ fn test_dual_b1_15hz_30hz_global_cest_fit_done_gate_and_io() {
         fit.k_ex_err
     );
 
+    let mut max_dw_err = 0.0f64;
+    let mut sum_sq_dw = 0.0f64;
     for (rf, &(_, _, _, true_dw, _, _, _)) in fit.residues.iter().zip(residues.iter()) {
         let dw_err = (rf.dw_ab_ppm - true_dw).abs();
+        max_dw_err = max_dw_err.max(dw_err);
+        sum_sq_dw += dw_err * dw_err;
         assert!(
             dw_err < 0.05,
             "res {} dw_AB error {dw_err:.4} ppm >= 0.05 ppm (fit={:.4}, true={true_dw})",
@@ -336,10 +370,151 @@ fn test_dual_b1_15hz_30hz_global_cest_fit_done_gate_and_io() {
             rf.dw_ab_ppm
         );
     }
+    let rms_dw_err = (sum_sq_dw / (residues.len() as f64)).sqrt();
+    println!(
+        "W4_METRIC_JSON: {}",
+        json!({
+            "task": "T13.4",
+            "kind": "cest_cpu_2state_fit",
+            "n_residues": residues.len(),
+            "b1_fields_hz": [15.0, 30.0],
+            "true_pb": true_pb,
+            "fit_pb": fit.p_b,
+            "pb_err": fit.p_b_err,
+            "true_kex_s_inv": true_kex,
+            "fit_kex_s_inv": fit.k_ex_s_inv,
+            "kex_err_s_inv": fit.k_ex_err,
+            "max_dw_abs_err_ppm": max_dw_err,
+            "rms_dw_err_ppm": rms_dw_err,
+            "reduced_chi2": fit.reduced_chi2,
+            "dof": fit.dof,
+            "passed": true,
+        })
+    );
 
     let surf = fit.chi2_surface.as_ref().expect("2D chi2 surface present");
     assert_eq!(surf.chi2_2d.len(), 81);
     let fit_tsv = format_cest_fit_tsv(&fit);
     let fit_json = format_cest_fit_json(&fit).expect("CEST JSON");
     assert!(fit_tsv.contains("dw_ab_ppm") && fit_json.contains("\"p_b\""));
+}
+
+#[test]
+fn test_dual_b1_3state_cest_linear_and_triangular_parameter_recovery() {
+    let larmor_mhz = 60.8106;
+    let t_ex_s = 0.45;
+    let major_ppm = 118.5;
+    let offsets: Vec<f64> = (0..=80).map(|i| 110.5 + 0.20 * (i as f64)).collect();
+    let sigma = 0.0012;
+
+    for &(topology, fit_tri, true_k_ac, seed) in &[
+        ("linear", false, 0.0, 0xCE57_357A_u64),
+        ("triangular", true, 90.0, 0xCE57_357B_u64),
+    ] {
+        let mut rng = Rng::new(seed);
+        let true_pb = 0.022;
+        let true_pc = 0.014;
+        let true_k_ab = 165.0;
+        let true_k_bc = 125.0;
+        let true_dw_ab = 4.20;
+        let true_dw_ac = -3.60;
+
+        let mut profiles = Vec::new();
+        for &b1_hz in &[15.0, 30.0] {
+            let p3 = Cest3StateParams {
+                p_b: true_pb,
+                p_c: true_pc,
+                k_ex_ab_s_inv: true_k_ab,
+                k_ex_bc_s_inv: true_k_bc,
+                k_ex_ac_s_inv: true_k_ac,
+                major_ppm,
+                dw_ab_ppm: true_dw_ab,
+                dw_ac_ppm: true_dw_ac,
+                r1a_s_inv: 1.30,
+                r2a_s_inv: 14.0,
+                r1b_s_inv: 1.30,
+                r2b_s_inv: 20.0,
+                r1c_s_inv: 1.30,
+                r2c_s_inv: 22.0,
+                larmor_mhz,
+                t_ex_s,
+                b1_hz,
+                b1_inhomogeneity_frac: 0.0,
+                n_b1_quad: 1,
+                normalization: CestNormalization::ThermalEquilibrium,
+            };
+            let clean = simulate_cest_3state_profile(&p3, &offsets).unwrap();
+            let noisy: Vec<f64> = clean
+                .iter()
+                .map(|&y| (y + rng.normal(0.0, sigma)).max(0.0))
+                .collect();
+            profiles.push(CestProfileDataset {
+                seq_id: 33,
+                res_name: "VAL".to_string(),
+                larmor_mhz,
+                t_ex_s,
+                b1_hz,
+                b1_inhomogeneity_frac: 0.0,
+                normalization: CestNormalization::ThermalEquilibrium,
+                major_ppm_hint: None,
+                offsets_ppm: offsets.clone(),
+                intensities: noisy,
+                uncertainties: vec![sigma; offsets.len()],
+            });
+        }
+
+        let fit3 = fit_cest_3state_profile_cpu(&profiles, 1, fit_tri)
+            .expect("3-state Bloch-McConnell CEST fit");
+        // Minor dips B and C may come out in either slot `(B, C)` depending on deepest dip order;
+        // match by shift proximity so assertions are permutation-invariant.
+        let (fit_pb, fit_pc, fit_dw_ab, fit_dw_ac) =
+            if (fit3.dw_ab_ppm - true_dw_ab).abs() <= (fit3.dw_ac_ppm - true_dw_ab).abs() {
+                (fit3.p_b, fit3.p_c, fit3.dw_ab_ppm, fit3.dw_ac_ppm)
+            } else {
+                (fit3.p_c, fit3.p_b, fit3.dw_ac_ppm, fit3.dw_ab_ppm)
+            };
+
+        assert!(
+            (fit_pb - true_pb).abs() < 0.0025,
+            "3-state ({topology}) p_B recovery: got {fit_pb:.5}, true {true_pb}"
+        );
+        assert!(
+            (fit_pc - true_pc).abs() < 0.0025,
+            "3-state ({topology}) p_C recovery: got {fit_pc:.5}, true {true_pc}"
+        );
+        assert!(
+            (fit_dw_ab - true_dw_ab).abs() < 0.06,
+            "3-state ({topology}) dw_AB recovery: got {fit_dw_ab:.4}, true {true_dw_ab}"
+        );
+        assert!(
+            (fit_dw_ac - true_dw_ac).abs() < 0.06,
+            "3-state ({topology}) dw_AC recovery: got {fit_dw_ac:.4}, true {true_dw_ac}"
+        );
+
+        println!(
+            "W4_METRIC_JSON: {}",
+            json!({
+                "task": "T13.4",
+                "kind": "cest_cpu_3state_fit",
+                "topology": topology,
+                "true_pb": true_pb,
+                "fit_pb": fit_pb,
+                "true_pc": true_pc,
+                "fit_pc": fit_pc,
+                "true_kex_ab_s_inv": true_k_ab,
+                "fit_kex_ab_s_inv": fit3.k_ex_ab_s_inv,
+                "true_kex_bc_s_inv": true_k_bc,
+                "fit_kex_bc_s_inv": fit3.k_ex_bc_s_inv,
+                "true_kex_ac_s_inv": true_k_ac,
+                "fit_kex_ac_s_inv": fit3.k_ex_ac_s_inv,
+                "true_dw_ab_ppm": true_dw_ab,
+                "fit_dw_ab_ppm": fit_dw_ab,
+                "true_dw_ac_ppm": true_dw_ac,
+                "fit_dw_ac_ppm": fit_dw_ac,
+                "reduced_chi2": fit3.reduced_chi2,
+                "dof": fit3.dof,
+                "passed": true,
+            })
+        );
+    }
 }

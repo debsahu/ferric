@@ -21,12 +21,13 @@ use std::time::Instant;
 
 use nmr_core::cest::{
     build_liouvillian_2state, build_liouvillian_3state, expm_eigen_reference,
-    expm_high_order_reference, simulate_cest_2state_profile, simulate_cest_3state_profile,
-    Cest2StateParams, Cest3StateParams, CestFitConfig, CestNormalization, CestProfileDataset,
+    expm_high_order_reference, fit_cest_global_cpu, simulate_cest_2state_profile,
+    simulate_cest_3state_profile, Cest2StateParams, Cest3StateParams, CestFitConfig,
+    CestNormalization, CestProfileDataset,
 };
 use nmr_core::cpmg::{
-    r1rho_trott_palmer_2002, r2eff_baldwin2014, r2eff_cr72, r2eff_flat, r2eff_lm63, CpmgFitConfig,
-    CpmgModel, CpmgSeriesDataset,
+    fit_cpmg_global_cpu, r1rho_trott_palmer_2002, r2eff_baldwin2014, r2eff_cr72, r2eff_flat,
+    r2eff_lm63, CpmgFitConfig, CpmgModel, CpmgSeriesDataset,
 };
 use nmr_core::rng::Rng;
 use nmr_gpu::cest_gpu::{
@@ -38,6 +39,21 @@ use nmr_gpu::cpmg_gpu::{
     validate_cpmg_storage_bytes, CpmgGpuEvalRequest, CpmgGpuPipeline,
 };
 use nmr_gpu::GpuEngine;
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 fn is_software_cpu_adapter_probe() -> bool {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -221,19 +237,17 @@ fn test_webgpu_pade66_expm_and_2state_3state_cest_dest_parity_under_1e5() {
         5,
     )
     .expect("WebGPU 2-state CEST+DEST batch");
+    let mut max_cest2_diff = 0.0f64;
     for (g, c) in gpu_2s[0].iter().zip(cpu_cest.iter()) {
-        assert!(
-            (g - c).abs() < 1e-5,
-            "2-state CEST GPU vs CPU diff {}",
-            (g - c).abs()
-        );
+        let d = (g - c).abs();
+        max_cest2_diff = max_cest2_diff.max(d);
+        assert!(d < 1e-5, "2-state CEST GPU vs CPU diff {d}");
     }
+    let mut max_dest2_diff = 0.0f64;
     for (g, c) in gpu_2s[1].iter().zip(cpu_dest.iter()) {
-        assert!(
-            (g - c).abs() < 1e-5,
-            "2-state DEST GPU vs CPU diff {}",
-            (g - c).abs()
-        );
+        let d = (g - c).abs();
+        max_dest2_diff = max_dest2_diff.max(d);
+        assert!(d < 1e-5, "2-state DEST GPU vs CPU diff {d}");
     }
 
     let p3 = Cest3StateParams {
@@ -260,13 +274,21 @@ fn test_webgpu_pade66_expm_and_2state_3state_cest_dest_parity_under_1e5() {
     };
     let cpu_3s = simulate_cest_3state_profile(&p3, &offsets).unwrap();
     let gpu_3s = simulate_cest_3state_batch_gpu(&engine, &[(p3, offsets.as_slice())], 5).unwrap();
+    let mut max_cest3_diff = 0.0f64;
     for (g, c) in gpu_3s[0].iter().zip(cpu_3s.iter()) {
-        assert!(
-            (g - c).abs() < 1e-5,
-            "3-state CEST GPU vs CPU diff {}",
-            (g - c).abs()
-        );
+        let d = (g - c).abs();
+        max_cest3_diff = max_cest3_diff.max(d);
+        assert!(d < 1e-5, "3-state CEST GPU vs CPU diff {d}");
     }
+    println!(
+        "W4_METRIC_JSON: {{\"task\":\"T13.4\",\"kind\":\"cest_webgpu_parity\",\"adapter\":\"{}\",\"max_err_7x7\":{:.6e},\"max_err_10x10\":{:.6e},\"max_cest2_curve_diff\":{:.6e},\"max_dest2_curve_diff\":{:.6e},\"max_cest3_curve_diff\":{:.6e},\"gate\":1e-5,\"passed\":true}}",
+        json_escape(&engine.adapter_name),
+        max_err7,
+        max_err10,
+        max_cest2_diff,
+        max_dest2_diff,
+        max_cest3_diff,
+    );
 }
 
 #[test]
@@ -370,10 +392,28 @@ fn test_webgpu_dual_b1_15hz_30hz_global_cest_fit_done_gate_under_1p5s() {
             rf.dw_ab_ppm
         );
     }
+    let cpu_fit = fit_cest_global_cpu(&profiles, &cfg).expect("CPU global CEST fit parity");
+    let mut max_gpu_cpu_dw_diff = 0.0f64;
+    for (rg, rc) in fit.residues.iter().zip(cpu_fit.residues.iter()) {
+        max_gpu_cpu_dw_diff = max_gpu_cpu_dw_diff.max((rg.dw_ab_ppm - rc.dw_ab_ppm).abs());
+    }
+    assert!(
+        (fit.p_b - cpu_fit.p_b).abs() < 2e-4 && (fit.k_ex_s_inv - cpu_fit.k_ex_s_inv).abs() < 2.0,
+        "WebGPU vs CPU global CEST fit parity check"
+    );
     println!(
-        "[T13.4 WebGPU CEST Fit] p_B={:.4}% (true=1.50%), k_ex={:.2} s^-1 (true=150), max|ddw|={max_dw_err:.4} ppm, time={elapsed_s:.3} s",
-        fit.p_b * 100.0,
-        fit.k_ex_s_inv
+        "W4_METRIC_JSON: {{\"task\":\"T13.4\",\"kind\":\"cest_webgpu_2state_fit\",\"adapter\":\"{}\",\"true_pb\":{:.6},\"gpu_pb\":{:.6},\"cpu_pb\":{:.6},\"true_kex_s_inv\":{:.3},\"gpu_kex_s_inv\":{:.3},\"cpu_kex_s_inv\":{:.3},\"max_gpu_dw_err_ppm\":{:.6},\"max_gpu_vs_cpu_dw_diff_ppm\":{:.6e},\"gpu_elapsed_s\":{:.4},\"gate_s\":{:.2},\"passed\":true}}",
+        json_escape(&engine.adapter_name),
+        true_pb,
+        fit.p_b,
+        cpu_fit.p_b,
+        true_kex,
+        fit.k_ex_s_inv,
+        cpu_fit.k_ex_s_inv,
+        max_dw_err,
+        max_gpu_cpu_dw_diff,
+        elapsed_s,
+        max_cest_secs,
     );
 }
 
@@ -428,11 +468,13 @@ fn test_webgpu_multifield_600_800_cpmg_global_fit_under_2pct_and_0p5s() {
         r2eff_baldwin2014(14.0, 32.0, 0.04, 650.0, 1350.0, 0.040, 100.0),
         r1rho_trott_palmer_2002(1.4, 13.5, 0.025, 1200.0, -900.0, -1600.0, TAU * 350.0).2,
     ];
+    let mut max_forward_diff = 0.0f64;
     for (i, (&g, &c)) in gpu_vals.iter().zip(cpu_refs.iter()).enumerate() {
+        let d = (g - c).abs();
+        max_forward_diff = max_forward_diff.max(d);
         assert!(
-            (g - c).abs() < 2e-3,
-            "CPMG model {i} GPU vs CPU diff {:.3e} (gpu={g}, cpu={c})",
-            (g - c).abs()
+            d < 2e-3,
+            "CPMG model {i} GPU vs CPU diff {d:.3e} (gpu={g}, cpu={c})"
         );
     }
 
@@ -453,102 +495,140 @@ fn test_webgpu_multifield_600_800_cpmg_global_fit_under_2pct_and_0p5s() {
         (85, "PHE", 2.55, [13.1, 15.7]),
     ];
 
-    let mut rng = Rng::new(0xC946_600D_2026);
     let err_s_inv = 0.08;
-    let mut series = Vec::new();
-    for &(seq_id, res_name, dw_ppm, r20_pair) in &exchanging {
-        for (fi, &larmor) in fields_15n.iter().enumerate() {
-            let dw_rad = TAU * larmor * dw_ppm;
-            let r2_vals: Vec<f64> = nu_grid
-                .iter()
-                .map(|&nu| {
-                    r2eff_baldwin2014(
-                        r20_pair[fi],
-                        r20_pair[fi],
-                        true_pb,
-                        true_kex,
-                        dw_rad,
-                        t_relax_s,
-                        nu,
-                    ) + rng.normal(0.0, err_s_inv)
-                })
-                .collect();
+    let max_cpmg_secs = if is_sw_cpu { 20.0 } else { 0.5 };
+
+    for &(model, model_label, seed_m) in &[
+        (CpmgModel::Baldwin2014, "Baldwin2014", 0xC946_600D_2026_u64),
+        (CpmgModel::Cr72, "CR72", 0xC946_600D_2027_u64),
+    ] {
+        let mut rng = Rng::new(seed_m);
+        let mut series = Vec::new();
+        for &(seq_id, res_name, dw_ppm, r20_pair) in &exchanging {
+            for (fi, &larmor) in fields_15n.iter().enumerate() {
+                let dw_rad = TAU * larmor * dw_ppm;
+                let r2_vals: Vec<f64> = nu_grid
+                    .iter()
+                    .map(|&nu| {
+                        let clean = match model {
+                            CpmgModel::Cr72 => r2eff_cr72(
+                                r20_pair[fi],
+                                r20_pair[fi],
+                                true_pb,
+                                true_kex,
+                                dw_rad,
+                                nu,
+                            ),
+                            _ => r2eff_baldwin2014(
+                                r20_pair[fi],
+                                r20_pair[fi],
+                                true_pb,
+                                true_kex,
+                                dw_rad,
+                                t_relax_s,
+                                nu,
+                            ),
+                        };
+                        clean + rng.normal(0.0, err_s_inv)
+                    })
+                    .collect();
+                series.push(CpmgSeriesDataset {
+                    seq_id,
+                    res_name: res_name.to_string(),
+                    larmor_mhz: larmor,
+                    t_relax_s,
+                    nu_cpmg_hz: nu_grid.clone(),
+                    r2_eff_s_inv: r2_vals,
+                    r2_eff_err: vec![err_s_inv; nu_grid.len()],
+                });
+            }
+        }
+        // Non-exchanging decoy residue 99 (`dw = 0`)
+        for &larmor in &fields_15n {
             series.push(CpmgSeriesDataset {
-                seq_id,
-                res_name: res_name.to_string(),
+                seq_id: 99,
+                res_name: "GLY".to_string(),
                 larmor_mhz: larmor,
                 t_relax_s,
                 nu_cpmg_hz: nu_grid.clone(),
-                r2_eff_s_inv: r2_vals,
+                r2_eff_s_inv: nu_grid
+                    .iter()
+                    .map(|_| 11.2 + rng.normal(0.0, err_s_inv))
+                    .collect(),
                 r2_eff_err: vec![err_s_inv; nu_grid.len()],
             });
         }
-    }
-    // Non-exchanging decoy residue 99 (`dw = 0`)
-    for &larmor in &fields_15n {
-        series.push(CpmgSeriesDataset {
-            seq_id: 99,
-            res_name: "GLY".to_string(),
-            larmor_mhz: larmor,
-            t_relax_s,
-            nu_cpmg_hz: nu_grid.clone(),
-            r2_eff_s_inv: nu_grid
-                .iter()
-                .map(|_| 11.2 + rng.normal(0.0, err_s_inv))
-                .collect(),
-            r2_eff_err: vec![err_s_inv; nu_grid.len()],
-        });
-    }
 
-    let max_cpmg_secs = if is_sw_cpu { 20.0 } else { 0.5 };
+        let cfg = CpmgFitConfig {
+            model,
+            ..CpmgFitConfig::default()
+        };
+        let t0 = Instant::now();
+        let fit = fit_cpmg_global_gpu(&engine, &series, &cfg)
+            .expect("WebGPU multi-field global CPMG fit");
+        let elapsed_s = t0.elapsed().as_secs_f64();
+        let cpu_fit = fit_cpmg_global_cpu(&series, &cfg).expect("CPU multi-field global CPMG fit");
 
-    let t0 = Instant::now();
-    let fit = fit_cpmg_global_gpu(&engine, &series, &CpmgFitConfig::default())
-        .expect("WebGPU multi-field global CPMG fit");
-    let elapsed_s = t0.elapsed().as_secs_f64();
-
-    assert!(
-        elapsed_s < max_cpmg_secs,
-        "WebGPU multi-field global CPMG fit took {elapsed_s:.3} s (must be < {max_cpmg_secs} s on {})",
-        engine.adapter_name
-    );
-    assert_eq!(
-        fit.residues.len(),
-        exchanging.len(),
-        "decoy residue 99 must be gated out"
-    );
-
-    let rel_pb = (fit.p_b - true_pb).abs() / true_pb;
-    let rel_kex = (fit.k_ex_s_inv - true_kex).abs() / true_kex;
-    assert!(
-        rel_pb < 0.02,
-        "WebGPU p_B rel error {rel_pb:.4} >= 2% (fit={}, true={true_pb})",
-        fit.p_b
-    );
-    assert!(
-        rel_kex < 0.02,
-        "WebGPU k_ex rel error {rel_kex:.4} >= 2% (fit={}, true={true_kex})",
-        fit.k_ex_s_inv
-    );
-    let mut max_rel_dw = 0.0f64;
-    for (rf, &(_, _, true_dw, _)) in fit.residues.iter().zip(exchanging.iter()) {
-        let rel_dw = (rf.dw_ppm - true_dw).abs() / true_dw;
-        max_rel_dw = max_rel_dw.max(rel_dw);
         assert!(
-            rel_dw < 0.02,
-            "WebGPU res {} |dw| rel error {rel_dw:.4} >= 2% (fit={}, true={true_dw})",
-            rf.seq_id,
-            rf.dw_ppm
+            elapsed_s < max_cpmg_secs,
+            "WebGPU multi-field global CPMG fit ({model_label}) took {elapsed_s:.3} s (must be < {max_cpmg_secs} s on {})",
+            engine.adapter_name
+        );
+        assert_eq!(
+            fit.residues.len(),
+            exchanging.len(),
+            "decoy residue 99 must be gated out ({model_label})"
+        );
+
+        let rel_pb = (fit.p_b - true_pb).abs() / true_pb;
+        let rel_kex = (fit.k_ex_s_inv - true_kex).abs() / true_kex;
+        assert!(
+            rel_pb < 0.02,
+            "WebGPU {model_label} p_B rel error {rel_pb:.4} >= 2% (fit={}, true={true_pb})",
+            fit.p_b
+        );
+        assert!(
+            rel_kex < 0.02,
+            "WebGPU {model_label} k_ex rel error {rel_kex:.4} >= 2% (fit={}, true={true_kex})",
+            fit.k_ex_s_inv
+        );
+        let mut max_rel_dw = 0.0f64;
+        let mut max_gpu_cpu_dw_diff = 0.0f64;
+        for ((rf, rc), &(_, _, true_dw, _)) in fit
+            .residues
+            .iter()
+            .zip(cpu_fit.residues.iter())
+            .zip(exchanging.iter())
+        {
+            let rel_dw = (rf.dw_ppm - true_dw).abs() / true_dw;
+            max_rel_dw = max_rel_dw.max(rel_dw);
+            max_gpu_cpu_dw_diff = max_gpu_cpu_dw_diff.max((rf.dw_ppm - rc.dw_ppm).abs());
+            assert!(
+                rel_dw < 0.02,
+                "WebGPU {model_label} res {} |dw| rel error {rel_dw:.4} >= 2% (fit={}, true={true_dw})",
+                rf.seq_id,
+                rf.dw_ppm
+            );
+        }
+        println!(
+            "W4_METRIC_JSON: {{\"task\":\"T13.5\",\"kind\":\"cpmg_webgpu_multifield_fit\",\"adapter\":\"{}\",\"model\":\"{}\",\"max_forward_5model_diff\":{:.6e},\"true_pb\":{:.6},\"gpu_pb\":{:.6},\"cpu_pb\":{:.6},\"rel_err_pb_pct\":{:.4},\"true_kex_s_inv\":{:.3},\"gpu_kex_s_inv\":{:.3},\"cpu_kex_s_inv\":{:.3},\"rel_err_kex_pct\":{:.4},\"max_rel_dw_pct\":{:.4},\"max_gpu_vs_cpu_dw_diff_ppm\":{:.6e},\"gpu_elapsed_s\":{:.4},\"gate_s\":{:.2},\"passed\":true}}",
+            json_escape(&engine.adapter_name),
+            model_label,
+            max_forward_diff,
+            true_pb,
+            fit.p_b,
+            cpu_fit.p_b,
+            rel_pb * 100.0,
+            true_kex,
+            fit.k_ex_s_inv,
+            cpu_fit.k_ex_s_inv,
+            rel_kex * 100.0,
+            max_rel_dw * 100.0,
+            max_gpu_cpu_dw_diff,
+            elapsed_s,
+            max_cpmg_secs,
         );
     }
-    println!(
-        "[T13.5 WebGPU CPMG Fit] p_B={:.4}% (err={:.2}%), k_ex={:.2} s^-1 (err={:.2}%), max_dw_err={:.2}%, time={elapsed_s:.3} s",
-        fit.p_b * 100.0,
-        rel_pb * 100.0,
-        fit.k_ex_s_inv,
-        rel_kex * 100.0,
-        max_rel_dw * 100.0
-    );
 }
 
 #[test]

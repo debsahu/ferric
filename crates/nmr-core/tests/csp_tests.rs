@@ -12,12 +12,14 @@
 //! 2013, 73, 1–16) and Kuhn (1955) / Munkres (1957).
 
 use nmr_core::csp::{
-    combined_amide_csp_ppm, diluted_conc_from_stock_addition,
+    combined_amide_csp_ppm, combined_methyl_csp_ppm, diluted_conc_from_stock_addition,
     diluted_protein_conc_for_target_ligand, fit_csp_global_kd, format_csp_json, format_csp_tsv,
-    quadratic_bound_fraction, track_titration_trajectories, write_csp_trajectories_tsv,
-    AssignedAmidePeak, CspAnalysisConfig, UnassignedHsqcPeak, UnassignedTitrationStep,
+    quadratic_bound_fraction, track_methyl_hmqc_trajectories, track_titration_trajectories,
+    write_csp_trajectories_tsv, AssignedAmidePeak, CspAnalysisConfig, UnassignedHsqcPeak,
+    UnassignedTitrationStep,
 };
 use nmr_core::rng::Rng;
+use serde_json::json;
 
 #[allow(clippy::type_complexity)]
 fn build_synthetic_titration(
@@ -165,6 +167,62 @@ fn test_weak_500um_and_tight_5um_binding_kd_done_gate_vs_naive_mm_failure() {
     for id in &pocket_t {
         assert!(fit_t.thresholds.significant_seq_ids.contains(id));
     }
+
+    let weak_tp = pocket_w
+        .iter()
+        .filter(|id| fit_w.thresholds.significant_seq_ids.contains(id))
+        .count();
+    let weak_fp = fit_w.thresholds.significant_seq_ids.len() - weak_tp;
+    println!(
+        "W4_METRIC_JSON: {}",
+        json!({
+            "task": "T13.6",
+            "kind": "csp_titration_kd_fit",
+            "experiment": "15N-HSQC",
+            "regime": "weak",
+            "p0_um": 100.0,
+            "true_kd_um": 500.0,
+            "fit_kd_um": fit_w.global_kd_um,
+            "ci95_low_um": fit_w.global_kd_ci95_low_um,
+            "ci95_high_um": fit_w.global_kd_ci95_high_um,
+            "rel_err_pct": rel_err_weak * 100.0,
+            "naive_mm_kd_um": fit_w.global_naive_mm_kd_um,
+            "mm_overestimate_x": fit_w.global_naive_mm_kd_um / 500.0,
+            "pocket_true": pocket_w.len(),
+            "pocket_detected": weak_tp,
+            "pocket_false_pos": weak_fp,
+            "threshold_2sigma_ppm": fit_w.thresholds.threshold_2sigma_ppm,
+            "passed": true,
+        })
+    );
+
+    let tight_tp = pocket_t
+        .iter()
+        .filter(|id| fit_t.thresholds.significant_seq_ids.contains(id))
+        .count();
+    let tight_fp = fit_t.thresholds.significant_seq_ids.len() - tight_tp;
+    println!(
+        "W4_METRIC_JSON: {}",
+        json!({
+            "task": "T13.6",
+            "kind": "csp_titration_kd_fit",
+            "experiment": "15N-HSQC",
+            "regime": "tight",
+            "p0_um": 100.0,
+            "true_kd_um": 5.0,
+            "fit_kd_um": fit_t.global_kd_um,
+            "ci95_low_um": fit_t.global_kd_ci95_low_um,
+            "ci95_high_um": fit_t.global_kd_ci95_high_um,
+            "rel_err_pct": rel_err_tight * 100.0,
+            "naive_mm_kd_um": fit_t.global_naive_mm_kd_um,
+            "mm_overestimate_x": mm_ratio,
+            "pocket_true": pocket_t.len(),
+            "pocket_detected": tight_tp,
+            "pocket_false_pos": tight_fp,
+            "threshold_2sigma_ppm": fit_t.thresholds.threshold_2sigma_ppm,
+            "passed": true,
+        })
+    );
 
     // Verify Gly vs non-Gly alpha_N, stock addition helper, and TSV/JSON export
     assert!((combined_amide_csp_ppm(0.3, 2.0, "GLY") - 0.5).abs() < 1e-12);
@@ -316,5 +374,132 @@ fn test_explicit_apo_zero_ligand_step_deduplication_matches_implicit_apo() {
     assert!(
         (fit_implicit.global_kd_um - fit_explicit.global_kd_um).abs() < 1e-12,
         "global Kd must be invariant whether [L]_t = 0 is implicit or explicit"
+    );
+    println!(
+        "W4_METRIC_JSON: {}",
+        json!({
+            "task": "T13.6",
+            "kind": "csp_tracker_robustness",
+            "broadened_slack_abstained": true,
+            "neighbor_preserved": true,
+            "saturated_recovered": true,
+            "apo_zero_step_dedup_exact": (fit_implicit.global_kd_um - fit_explicit.global_kd_um).abs() < 1e-12,
+            "passed": true,
+        })
+    );
+}
+
+#[test]
+fn test_methyl_13c_hmqc_titration_tracking_and_tight_kd_recovery() {
+    let mut rng = Rng::new(0x13C_4DAD_2026);
+    let n_methyl = 36usize;
+    let pocket_ids = [6, 11, 18, 24, 30, 34];
+    let kd_true = 12.0;
+    let p0_um = 100.0;
+    let l_stock_um = 10_000.0;
+    let ligand_steps = [10.0, 25.0, 50.0, 80.0, 110.0, 150.0, 220.0, 350.0, 550.0];
+
+    let mut apo = Vec::with_capacity(n_methyl);
+    let mut true_shifts = Vec::with_capacity(n_methyl);
+    for idx in 0..n_methyl {
+        let seq_id = (idx + 1) as i32;
+        let res_name = match idx % 4 {
+            0 => "ILE",
+            1 => "LEU",
+            2 => "VAL",
+            _ => "ALA",
+        };
+        let gx = (idx % 6) as f64;
+        let gy = (idx / 6) as f64;
+        let h0 = 0.25 + 0.26 * gx + rng.uniform(-0.025, 0.025);
+        let c0 = 11.5 + 2.4 * gy + rng.uniform(-0.25, 0.25);
+        let (dh_max, dc_max) = if let Some(pos) = pocket_ids.iter().position(|&id| id == seq_id) {
+            let sign = if pos % 2 == 0 { 1.0 } else { -1.0 };
+            (
+                sign * (0.14 + 0.025 * (pos as f64)),
+                sign * (0.55 + 0.09 * (pos as f64)),
+            )
+        } else {
+            (rng.normal(0.0, 0.004), rng.normal(0.0, 0.015))
+        };
+        apo.push(AssignedAmidePeak {
+            seq_index: idx,
+            seq_id,
+            res_name: res_name.to_string(),
+            h_ppm: h0,
+            n_ppm: c0,
+        });
+        true_shifts.push((dh_max, dc_max));
+    }
+
+    let mut steps = Vec::with_capacity(ligand_steps.len());
+    for (si, &l_t) in ligand_steps.iter().enumerate() {
+        let p_t = diluted_protein_conc_for_target_ligand(p0_um, l_stock_um, l_t).unwrap();
+        let fb = quadratic_bound_fraction(p_t, l_t, kd_true);
+        let mut peaks = Vec::with_capacity(n_methyl);
+        for r in 0..n_methyl {
+            let (dh_m, dc_m) = true_shifts[r];
+            peaks.push(UnassignedHsqcPeak {
+                h_ppm: apo[r].h_ppm + fb * dh_m + rng.normal(0.0, 0.0010),
+                n_ppm: apo[r].n_ppm + fb * dc_m + rng.normal(0.0, 0.0050),
+            });
+        }
+        rng.shuffle(&mut peaks);
+        steps.push(UnassignedTitrationStep {
+            label: format!("hmqc_{}", si + 1),
+            protein_conc_um: p_t,
+            ligand_conc_um: l_t,
+            peaks,
+        });
+    }
+
+    assert!((combined_methyl_csp_ppm(0.3, 1.0) - 0.3_f64.hypot(0.3)).abs() < 1e-12);
+    let cfg = CspAnalysisConfig {
+        max_step_csp_ppm: 0.40,
+        collinearity_penalty: 0.35,
+        csp_sigma_ppm: 0.0020,
+        n_mc: 250,
+        mc_seed: 20261313,
+    };
+    let traj = track_methyl_hmqc_trajectories(&apo, &steps, &cfg).expect("track 13C-HMQC");
+    let fit = fit_csp_global_kd(&traj, &cfg).expect("fit 13C-HMQC Kd");
+    let rel_err = (fit.global_kd_um - kd_true).abs() / kd_true;
+    assert!(
+        rel_err < 0.02,
+        "13C-HMQC methyl Kd=12 uM rel error {rel_err:.4} >= 2% (got {:.4})",
+        fit.global_kd_um
+    );
+    let tp = pocket_ids
+        .iter()
+        .filter(|id| fit.thresholds.significant_seq_ids.contains(id))
+        .count();
+    let fp = fit.thresholds.significant_seq_ids.len() - tp;
+    assert_eq!(
+        tp,
+        pocket_ids.len(),
+        "all methyl pocket sites must be detected"
+    );
+
+    println!(
+        "W4_METRIC_JSON: {}",
+        json!({
+            "task": "T13.6",
+            "kind": "csp_titration_kd_fit",
+            "experiment": "13C-HMQC",
+            "regime": "tight_methyl",
+            "p0_um": p0_um,
+            "true_kd_um": kd_true,
+            "fit_kd_um": fit.global_kd_um,
+            "ci95_low_um": fit.global_kd_ci95_low_um,
+            "ci95_high_um": fit.global_kd_ci95_high_um,
+            "rel_err_pct": rel_err * 100.0,
+            "naive_mm_kd_um": fit.global_naive_mm_kd_um,
+            "mm_overestimate_x": fit.global_naive_mm_kd_um / kd_true,
+            "pocket_true": pocket_ids.len(),
+            "pocket_detected": tp,
+            "pocket_false_pos": fp,
+            "threshold_2sigma_ppm": fit.thresholds.threshold_2sigma_ppm,
+            "passed": true,
+        })
     );
 }

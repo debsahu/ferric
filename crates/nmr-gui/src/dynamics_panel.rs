@@ -1557,14 +1557,26 @@ mod tests {
         assert!((track_data.rex_s_inv[&1] - 6.4).abs() < 1e-9);
         assert!((track_data.rex_max_s_inv - 6.4).abs() < 1e-9);
 
-        // 3. Project CSP
+        // 3. Project CSP (binding-pocket 3D highlight projection onto QuantitativeTrackData)
         let p_csp = panel
             .build_overlay_projection(QuantitativeTrack::LigandCsp)
             .expect("CSP projection");
         p_csp.apply_to(&mut track_data, &seq_ids);
         assert_eq!(track_data.active_track, QuantitativeTrack::LigandCsp);
+        assert!((track_data.csp_ppm[&0] - 0.03).abs() < 1e-9);
         assert!((track_data.csp_ppm[&1] - 0.42).abs() < 1e-9);
         assert!((track_data.csp_max_ppm - 0.42).abs() < 1e-9);
+
+        let n_pocket_above_0p15 = track_data.csp_ppm.values().filter(|&&v| v >= 0.15).count();
+        assert_eq!(n_pocket_above_0p15, 1);
+        println!(
+            "W4_METRIC_JSON: {{\"task\":\"T13.6\",\"kind\":\"gui_3d_pocket_overlay\",\"n_residues\":{},\"n_pocket_highlighted\":{},\"csp_max_ppm\":{:.4},\"rex_max_s_inv\":{:.4},\"s2_projected\":true,\"rex_projected\":true,\"csp_projected\":true,\"putty_enabled\":{},\"passed\":true}}",
+            seq_ids.len(),
+            n_pocket_above_0p15,
+            track_data.csp_max_ppm,
+            track_data.rex_max_s_inv,
+            track_data.putty_enabled,
+        );
     }
 
     #[test]

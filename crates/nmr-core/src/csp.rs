@@ -38,6 +38,19 @@ pub fn combined_amide_csp_ppm(dh_ppm: f64, dn_ppm: f64, res_name: &str) -> f64 {
     dh_ppm.hypot(alpha * dn_ppm)
 }
 
+/// Canonical `13C`-to-`1H` methyl `HMQC` chemical shift scaling factor `alpha_C = 0.30` per
+/// Williamson (*Prog. Nucl. Magn. Reson. Spectrosc.* 2013) and Tugarinov & Kay.
+#[inline]
+pub fn methyl_alpha_c(_res_name: &str) -> f64 {
+    0.30
+}
+
+/// Combined `1H-13C` methyl `HMQC` chemical shift perturbation `sqrt(dH^2 + (0.30 * dC)^2)` (`ppm`).
+#[inline]
+pub fn combined_methyl_csp_ppm(dh_ppm: f64, dc_ppm: f64) -> f64 {
+    dh_ppm.hypot(0.30 * dc_ppm)
+}
+
 /// Exact dilution-corrected `[P]_t` (`uM`) and `[L]_t` (`uM`) when adding `v_added_ul` of ligand
 /// stock (`ligand_stock_um`) into an initial apo sample volume `v0_ul` (`initial_protein_um`).
 #[inline]
@@ -313,13 +326,36 @@ pub fn hungarian_min_cost_assignment(cost: &[Vec<f64>]) -> Result<(Vec<usize>, f
     Ok((row_to_col, total_cost))
 }
 
-/// Track fast-exchange `2D HSQC` peaks across ligand titration steps sorted by `[L]_t`, combining
-/// directional linear-trajectory extrapolation with exact Hungarian global minimum-cost matching.
+/// Track fast-exchange `2D 1H-15N HSQC` peaks across ligand titration steps sorted by `[L]_t`,
+/// combining directional linear-trajectory extrapolation with exact Hungarian global minimum-cost matching.
 pub fn track_titration_trajectories(
     apo_peaks: &[AssignedAmidePeak],
     steps: &[UnassignedTitrationStep],
     config: &CspAnalysisConfig,
 ) -> Result<Vec<ResidueCspTrajectory>, String> {
+    track_titration_trajectories_with_alpha(apo_peaks, steps, config, amide_alpha_n)
+}
+
+/// Track fast-exchange `2D 1H-13C HMQC` methyl peaks across ligand titration steps sorted by
+/// `[L]_t` (`alpha_C = 0.30` heteronuclear shift scaling), returning smooth [`ResidueCspTrajectory`]
+/// isotherms directly compatible with [`fit_csp_global_kd`].
+pub fn track_methyl_hmqc_trajectories(
+    apo_peaks: &[AssignedAmidePeak],
+    steps: &[UnassignedTitrationStep],
+    config: &CspAnalysisConfig,
+) -> Result<Vec<ResidueCspTrajectory>, String> {
+    track_titration_trajectories_with_alpha(apo_peaks, steps, config, methyl_alpha_c)
+}
+
+fn track_titration_trajectories_with_alpha<FAlpha>(
+    apo_peaks: &[AssignedAmidePeak],
+    steps: &[UnassignedTitrationStep],
+    config: &CspAnalysisConfig,
+    alpha_fn: FAlpha,
+) -> Result<Vec<ResidueCspTrajectory>, String>
+where
+    FAlpha: Fn(&str) -> f64,
+{
     if apo_peaks.is_empty() {
         return Err(
             "track_titration_trajectories requires at least one assigned apo peak".to_string(),
@@ -379,12 +415,12 @@ pub fn track_titration_trajectories(
         }
 
         let n_peaks = step.peaks.len();
-        // Columns `0..n_peaks` = observed HSQC peaks; columns `n_peaks .. n_peaks + n_res` = slack unmatched slots
+        // Columns `0..n_peaks` = observed HSQC/HMQC peaks; columns `n_peaks .. n_peaks + n_res` = slack unmatched slots
         let n_cols = n_peaks + n_res;
         let mut cost = vec![vec![max_gate_cost * 4.0; n_cols]; n_res];
 
         for r in 0..n_res {
-            let alpha = amide_alpha_n(&apo_peaks[r].res_name);
+            let alpha = alpha_fn(&apo_peaks[r].res_name);
             let (lh, ln, ll) = last_pos[r];
 
             // Extrapolate expected position along fast-exchange chord with damped saturation cap
@@ -398,7 +434,7 @@ pub fn track_titration_trajectories(
                 (lh, ln)
             };
 
-            // Established chord unit vector from apo in `(dH, alpha * dN)` space
+            // Established chord unit vector from apo in `(dH, alpha * dX)` space
             let chord_x = lh - apo_peaks[r].h_ppm;
             let chord_y = alpha * (ln - apo_peaks[r].n_ppm);
             let chord_len = chord_x.hypot(chord_y);
@@ -432,11 +468,9 @@ pub fn track_titration_trajectories(
         for (r, &col) in assignment.iter().enumerate() {
             if col < n_peaks && cost[r][col] <= max_gate_cost {
                 let pk = step.peaks[col];
-                let csp = combined_amide_csp_ppm(
-                    pk.h_ppm - apo_peaks[r].h_ppm,
-                    pk.n_ppm - apo_peaks[r].n_ppm,
-                    &apo_peaks[r].res_name,
-                );
+                let alpha = alpha_fn(&apo_peaks[r].res_name);
+                let csp =
+                    (pk.h_ppm - apo_peaks[r].h_ppm).hypot(alpha * (pk.n_ppm - apo_peaks[r].n_ppm));
                 prev_pos[r] = Some(last_pos[r]);
                 last_pos[r] = (pk.h_ppm, pk.n_ppm, step.ligand_conc_um);
                 trajectories[r].max_observed_csp_ppm =

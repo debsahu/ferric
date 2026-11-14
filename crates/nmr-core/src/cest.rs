@@ -2592,3 +2592,326 @@ pub fn format_cest_fit_tsv(res: &CestGlobalFitResult) -> String {
 pub fn format_cest_fit_json(res: &CestGlobalFitResult) -> Result<String, String> {
     serde_json::to_string_pretty(res).map_err(|e| format!("failed to serialize CEST JSON: {e}"))
 }
+
+/// Fitted 3-state (`10x10` linear or triangular `A <-> B <-> C`) Bloch–McConnell `CEST` result
+/// across multi-`B1` saturation profiles for a single spin system (`T13.4`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Cest3StateFitResult {
+    pub seq_id: i32,
+    pub res_name: String,
+    pub p_b: f64,
+    pub p_c: f64,
+    pub k_ex_ab_s_inv: f64,
+    pub k_ex_bc_s_inv: f64,
+    pub k_ex_ac_s_inv: f64,
+    pub major_ppm: f64,
+    pub dw_ab_ppm: f64,
+    pub dw_ac_ppm: f64,
+    pub r1a_s_inv: f64,
+    pub r2a_s_inv: f64,
+    pub r2b_s_inv: f64,
+    pub r2c_s_inv: f64,
+    pub chi2: f64,
+    pub reduced_chi2: f64,
+    pub dof: usize,
+    pub iterations: usize,
+    pub converged: bool,
+}
+
+/// Fit 3-state (`10x10` `A <-> B <-> C`) Bloch–McConnell `CEST` populations, exchange rates, and
+/// excited-state chemical shifts `(p_B, p_C, k_ex_AB, k_ex_BC, major_ppm, dw_AB, dw_AC, R1A, R2A,
+/// R2B, R2C)` across multi-`B1` profiles for one residue via damped Levenberg–Marquardt (`T13.4`).
+///
+/// When `fit_triangular_ac` is `false`, linear sequential exchange (`A <-> B <-> C`, `k_ex_AC = 0`)
+/// is enforced; when `true`, `k_ex_AC` is co-optimized alongside `k_ex_AB` and `k_ex_BC`.
+pub fn fit_cest_3state_profile_cpu(
+    profiles: &[CestProfileDataset],
+    n_b1_quad: usize,
+    fit_triangular_ac: bool,
+) -> Result<Cest3StateFitResult, String> {
+    if profiles.is_empty() {
+        return Err("fit_cest_3state_profile_cpu requires at least one CEST profile".to_string());
+    }
+    let first = &profiles[0];
+    let mut total_pts = 0usize;
+    for (pi, prof) in profiles.iter().enumerate() {
+        if prof.offsets_ppm.is_empty()
+            || prof.offsets_ppm.len() != prof.intensities.len()
+            || prof.offsets_ppm.len() != prof.uncertainties.len()
+        {
+            return Err(format!(
+                "3-state CEST profile {pi} has empty or mismatched array lengths"
+            ));
+        }
+        total_pts += prof.offsets_ppm.len();
+    }
+
+    // Seed `major_ppm` and the two excited-state dips `(dw_ab_ppm, dw_ac_ppm)` from the lowest-B1
+    // profile where saturation dips are sharpest.
+    let sharpest = profiles
+        .iter()
+        .min_by(|a, b| a.b1_hz.total_cmp(&b.b1_hz))
+        .unwrap_or(first);
+    let major_seed = sharpest.major_ppm_hint.unwrap_or_else(|| {
+        sharpest
+            .offsets_ppm
+            .iter()
+            .copied()
+            .zip(sharpest.intensities.iter().copied())
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(x, _)| x)
+            .unwrap_or(118.0)
+    });
+
+    // Collect local minima well separated from `major_seed` (`|off - major| >= 1.0 ppm`)
+    let mut dip_cands: Vec<(f64, f64)> = Vec::new();
+    let n_sh = sharpest.offsets_ppm.len();
+    for i in 1..n_sh.saturating_sub(1) {
+        let x = sharpest.offsets_ppm[i];
+        let y = sharpest.intensities[i];
+        if (x - major_seed).abs() >= 1.0
+            && y <= sharpest.intensities[i - 1]
+            && y <= sharpest.intensities[i + 1]
+        {
+            dip_cands.push((x - major_seed, y));
+        }
+    }
+    dip_cands.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+    let dw_b_seed = dip_cands.first().map(|c| c.0).unwrap_or(3.5);
+    let dw_c_seed = dip_cands
+        .iter()
+        .skip(1)
+        .find(|c| (c.0 - dw_b_seed).abs() >= 1.0)
+        .map(|c| c.0)
+        .unwrap_or(-3.5);
+
+    // Parameter vector `x`:
+    // [0]=ln(p_B), [1]=ln(p_C), [2]=ln(k_ex_AB), [3]=ln(k_ex_BC),
+    // [4]=major_ppm, [5]=dw_ab_ppm, [6]=dw_ac_ppm,
+    // [7]=ln(R1A), [8]=ln(R2A), [9]=ln(R2B), [10]=ln(R2C), optional [11]=ln(k_ex_AC)
+    let mut x = vec![
+        0.020_f64.ln(),
+        0.012_f64.ln(),
+        180.0_f64.ln(),
+        140.0_f64.ln(),
+        major_seed,
+        dw_b_seed,
+        dw_c_seed,
+        1.30_f64.ln(),
+        14.0_f64.ln(),
+        20.0_f64.ln(),
+        22.0_f64.ln(),
+    ];
+    if fit_triangular_ac {
+        x.push(80.0_f64.ln());
+    }
+    let m_dim = x.len();
+
+    let clamp_vec = |v: &mut [f64]| {
+        v[0] = v[0].clamp((-8.5_f64).max(1e-5_f64.ln()), 0.30_f64.ln());
+        v[1] = v[1].clamp((-8.5_f64).max(1e-5_f64.ln()), 0.30_f64.ln());
+        v[2] = v[2].clamp(2.0_f64.ln(), 8_000.0_f64.ln());
+        v[3] = v[3].clamp(2.0_f64.ln(), 8_000.0_f64.ln());
+        v[4] = v[4].clamp(major_seed - 2.0, major_seed + 2.0);
+        v[5] = v[5].clamp(-25.0, 25.0);
+        v[6] = v[6].clamp(-25.0, 25.0);
+        v[7] = v[7].clamp(0.15_f64.ln(), 12.0_f64.ln());
+        v[8] = v[8].clamp(1.0_f64.ln(), 150.0_f64.ln());
+        v[9] = v[9].clamp(1.0_f64.ln(), 25_000.0_f64.ln());
+        v[10] = v[10].clamp(1.0_f64.ln(), 25_000.0_f64.ln());
+        if v.len() > 11 {
+            v[11] = v[11].clamp(0.5_f64.ln(), 8_000.0_f64.ln());
+        }
+    };
+
+    let eval_residuals = |v: &[f64]| -> Result<(Vec<f64>, f64), String> {
+        let pb = v[0].exp();
+        let pc = v[1].exp();
+        if pb + pc >= 0.90 {
+            return Err("p_B + p_C >= 0.90".to_string());
+        }
+        let k_ac = if v.len() > 11 { v[11].exp() } else { 0.0 };
+        let mut res = Vec::with_capacity(total_pts);
+        let mut chi2 = 0.0;
+        for prof in profiles {
+            let p3 = Cest3StateParams {
+                p_b: pb,
+                p_c: pc,
+                k_ex_ab_s_inv: v[2].exp(),
+                k_ex_bc_s_inv: v[3].exp(),
+                k_ex_ac_s_inv: k_ac,
+                major_ppm: v[4],
+                dw_ab_ppm: v[5],
+                dw_ac_ppm: v[6],
+                r1a_s_inv: v[7].exp(),
+                r2a_s_inv: v[8].exp(),
+                r1b_s_inv: v[7].exp(),
+                r2b_s_inv: v[9].exp(),
+                r1c_s_inv: v[7].exp(),
+                r2c_s_inv: v[10].exp(),
+                larmor_mhz: prof.larmor_mhz,
+                t_ex_s: prof.t_ex_s,
+                b1_hz: prof.b1_hz,
+                b1_inhomogeneity_frac: prof.b1_inhomogeneity_frac,
+                n_b1_quad: n_b1_quad.max(1),
+                normalization: prof.normalization,
+            };
+            let pred = simulate_cest_3state_profile(&p3, &prof.offsets_ppm)?;
+            for ((&y_obs, &y_hat), &sig) in prof
+                .intensities
+                .iter()
+                .zip(pred.iter())
+                .zip(prof.uncertainties.iter())
+            {
+                let z = (y_obs - y_hat) / sig.max(1e-5);
+                chi2 += z * z;
+                res.push(z);
+            }
+        }
+        Ok((res, chi2))
+    };
+
+    let (mut cur_res, mut cur_chi2) = eval_residuals(&x)?;
+    let mut lambda = 1e-2f64;
+    let mut iterations = 0usize;
+    let mut converged = false;
+    let eps = 1e-5f64;
+
+    for iter in 0..45 {
+        iterations = iter + 1;
+        let mut jtj = vec![vec![0.0f64; m_dim]; m_dim];
+        let mut jtr = vec![0.0f64; m_dim];
+        let mut j_cols = Vec::with_capacity(m_dim);
+        for col in 0..m_dim {
+            let mut xp = x.clone();
+            xp[col] += eps;
+            let (rp, _) = eval_residuals(&xp)?;
+            let mut jc = Vec::with_capacity(total_pts);
+            for i in 0..total_pts {
+                let ji = -(rp[i] - cur_res[i]) / eps;
+                jtr[col] += ji * cur_res[i];
+                jc.push(ji);
+            }
+            j_cols.push(jc);
+        }
+        for a in 0..m_dim {
+            for b in a..m_dim {
+                let mut s = 0.0;
+                for i in 0..total_pts {
+                    s += j_cols[a][i] * j_cols[b][i];
+                }
+                jtj[a][b] = s;
+                jtj[b][a] = s;
+            }
+        }
+
+        let max_g = jtr.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        if max_g < 1e-6 {
+            converged = true;
+            break;
+        }
+
+        let mut accepted = false;
+        for _sub in 0..8 {
+            let mut a_mat = jtj.clone();
+            for (d, row) in a_mat.iter_mut().enumerate() {
+                row[d] += lambda * row[d].max(1e-3);
+            }
+            if let Some(dx) = solve_dense_linear_3s(&a_mat, &jtr) {
+                let mut x_try = x.clone();
+                let mut step_norm = 0.0f64;
+                for d in 0..m_dim {
+                    x_try[d] += dx[d];
+                    step_norm = step_norm.max(dx[d].abs());
+                }
+                clamp_vec(&mut x_try);
+                if let Ok((r_try, c2_try)) = eval_residuals(&x_try) {
+                    if c2_try < cur_chi2 {
+                        let rel = (cur_chi2 - c2_try) / cur_chi2.max(1.0);
+                        x = x_try;
+                        cur_res = r_try;
+                        cur_chi2 = c2_try;
+                        lambda = (lambda * 0.35).max(1e-9);
+                        accepted = true;
+                        if step_norm < 1e-6 || rel < 1e-9 {
+                            converged = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            lambda = (lambda * 4.0).min(1e7);
+        }
+        if converged || !accepted {
+            break;
+        }
+    }
+
+    let dof = total_pts.saturating_sub(m_dim);
+    Ok(Cest3StateFitResult {
+        seq_id: first.seq_id,
+        res_name: first.res_name.clone(),
+        p_b: x[0].exp(),
+        p_c: x[1].exp(),
+        k_ex_ab_s_inv: x[2].exp(),
+        k_ex_bc_s_inv: x[3].exp(),
+        k_ex_ac_s_inv: if x.len() > 11 { x[11].exp() } else { 0.0 },
+        major_ppm: x[4],
+        dw_ab_ppm: x[5],
+        dw_ac_ppm: x[6],
+        r1a_s_inv: x[7].exp(),
+        r2a_s_inv: x[8].exp(),
+        r2b_s_inv: x[9].exp(),
+        r2c_s_inv: x[10].exp(),
+        chi2: cur_chi2,
+        reduced_chi2: cur_chi2 / (dof.max(1) as f64),
+        dof,
+        iterations,
+        converged,
+    })
+}
+
+fn solve_dense_linear_3s(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+    let n = b.len();
+    let mut aug: Vec<Vec<f64>> = a
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let mut r = row.clone();
+            r.push(b[i]);
+            r
+        })
+        .collect();
+    for k in 0..n {
+        let mut piv = k;
+        let mut piv_abs = aug[k][k].abs();
+        for (r, row) in aug.iter().enumerate().skip(k + 1) {
+            if row[k].abs() > piv_abs {
+                piv_abs = row[k].abs();
+                piv = r;
+            }
+        }
+        if piv_abs < 1e-14 {
+            return None;
+        }
+        if piv != k {
+            aug.swap(k, piv);
+        }
+        let diag = aug[k][k];
+        for c in k..=n {
+            aug[k][c] /= diag;
+        }
+        for r in 0..n {
+            if r != k {
+                let f = aug[r][k];
+                if f.abs() > 0.0 {
+                    for c in k..=n {
+                        aug[r][c] -= f * aug[k][c];
+                    }
+                }
+            }
+        }
+    }
+    Some(aug.into_iter().map(|r| r[n]).collect())
+}
