@@ -16,6 +16,7 @@ pub mod bayes_sa;
 pub mod c13_detected;
 pub mod classify;
 pub mod dihedrals;
+pub mod dosy;
 pub mod evaluate;
 pub mod evo_graph;
 pub mod fid;
