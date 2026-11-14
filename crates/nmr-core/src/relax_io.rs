@@ -729,6 +729,7 @@ fn extract_stored_proc_jcamp(proc_map: Option<&HashMap<String, String>>) -> Stor
         reverse,
         bc_mod,
         bcfw_ppm,
+        pulprog_p1_deg: None,
     }
 }
 
@@ -1159,6 +1160,7 @@ fn trace_index_for_interleaving(
 }
 
 fn infer_bruker_pseudo3d_interleaving(
+    dir: &Path,
     pp_text: Option<&str>,
     acqus: &HashMap<String, String>,
     chem_is_acqu2s: bool,
@@ -1182,6 +1184,23 @@ fn infer_bruker_pseudo3d_interleaving(
                 {
                     return Pseudo3DInterleaving::T1QuadPlane;
                 }
+            }
+        }
+        if let Ok(interp) = crate::pulprog::interpret_bruker_dir(dir) {
+            match interp.pseudo_3d_order {
+                crate::pulprog::Pseudo3DStorageOrder::PlaneQueued => {
+                    return Pseudo3DInterleaving::PlaneQueued;
+                }
+                crate::pulprog::Pseudo3DStorageOrder::T1Interleaved => {
+                    if let Some(inner_to_quad) = interp.pseudo_3d_list_inner_to_quad {
+                        return if inner_to_quad {
+                            Pseudo3DInterleaving::T1QuadPlane
+                        } else {
+                            Pseudo3DInterleaving::T1PlaneQuad
+                        };
+                    }
+                }
+                crate::pulprog::Pseudo3DStorageOrder::NotPseudo3D => {}
             }
         }
         let mut pos_id0 = None;
@@ -1542,7 +1561,7 @@ pub fn read_bruker_pseudo3d(
     };
 
     let interleaving = interleaving_override.unwrap_or_else(|| {
-        infer_bruker_pseudo3d_interleaving(pp_txt.as_deref(), &acqus, chem_is_acqu2s)
+        infer_bruker_pseudo3d_interleaving(dir, pp_txt.as_deref(), &acqus, chem_is_acqu2s)
     });
 
     let n0 = axis_x.complex_points;
@@ -1598,6 +1617,7 @@ pub fn read_bruker_pseudo3d(
             axis_y: axis_y.clone(),
             data: p_data,
             nus_mask: None,
+            truncated_traces: None,
         });
     }
 
@@ -1893,6 +1913,7 @@ pub fn read_varian_pseudo3d(
             axis_y: axis_y.clone(),
             data: p_data,
             nus_mask: None,
+            truncated_traces: None,
         });
     }
 

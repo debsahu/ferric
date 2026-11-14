@@ -67,6 +67,8 @@ pub struct StoredDimProc {
     pub reverse: bool,
     pub bc_mod: Option<i32>,
     pub bcfw_ppm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pulprog_p1_deg: Option<f64>,
 }
 
 fn default_states_recombined() -> bool {
@@ -107,7 +109,7 @@ pub struct FidAxisMeta {
 pub type Complex64 = [f64; 2];
 
 /// Raw 1D FID (`[n0]` complex points).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Fid1D {
     pub name: String,
     pub vendor: FidVendor,
@@ -118,7 +120,7 @@ pub struct Fid1D {
 
 /// Raw 2D FID normalized into uniform hypercomplex `[n1_cplx * 2 * n0]` traces:
 /// for indirect increment `k1 in 0..n1_cplx`, `comp = 0` is the cosine trace and `comp = 1` is the sine trace.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Fid2D {
     pub name: String,
     pub vendor: FidVendor,
@@ -131,6 +133,10 @@ pub struct Fid2D {
     /// `Some` of length `axis_y.complex_points` (`true` at sampled `k1`, `false` and zero-filled in `data`
     /// at unsampled `k1`) when non-uniformly sampled (NUS), or `None` when uniformly sampled.
     pub nus_mask: Option<Vec<bool>>,
+    /// `Some((observed_traces, expected_traces))` when loaded with `allow_truncated_fid = true`
+    /// and missing indirect traces were zero-filled; `None` for complete acquisitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_traces: Option<(usize, usize)>,
 }
 
 impl Fid2D {
@@ -144,7 +150,7 @@ impl Fid2D {
 
 /// Raw 3D FID normalized into uniform hypercomplex `[n2_cplx * 2 * n1_cplx * 2 * n0]` traces:
 /// `axis_x` = direct (`F3`, `1H`), `axis_y` = `F2` (`acqu2s` / `ni`), `axis_z` = `F1` (`acqu3s` / `ni2`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Fid3D {
     pub name: String,
     pub vendor: FidVendor,
@@ -156,6 +162,10 @@ pub struct Fid3D {
     /// `Some` of length `axis_z.complex_points * axis_y.complex_points` (indexed `k2 * n1_cplx + k1`,
     /// `true` where sampled and zero-filled in `data` where unsampled) when NUS, or `None` when uniform.
     pub nus_mask: Option<Vec<bool>>,
+    /// `Some((observed_traces, expected_traces))` when loaded with `allow_truncated_fid = true`
+    /// and missing indirect traces were zero-filled; `None` for complete acquisitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_traces: Option<(usize, usize)>,
 }
 
 impl Fid3D {
@@ -333,20 +343,34 @@ fn find_relpath_file_ci(dir: &Path, rel: &str) -> Option<PathBuf> {
 /// Detect vendor and dimensionality of a raw FID directory (`acqus` -> Bruker, `procpar` -> Varian)
 /// and load the dataset (automatically detecting uniform vs NUS schedules).
 pub fn read_fid_auto(dir: impl AsRef<Path>) -> Result<RawFid, String> {
+    read_fid_auto_opts(dir, false)
+}
+
+/// Same as [`read_fid_auto`], with explicit opt-in `allow_truncated_fid` zero-filling for halted acquisitions.
+pub fn read_fid_auto_opts(
+    dir: impl AsRef<Path>,
+    allow_truncated_fid: bool,
+) -> Result<RawFid, String> {
     let p = resolve_fid_dir(dir.as_ref())?;
     if find_file_ci(&p, "acqus").is_some() || find_file_ci(&p, "acqu").is_some() {
         let has_3 = find_file_ci(&p, "acqu3s").is_some() || find_file_ci(&p, "acqu3").is_some();
         let has_2 = find_file_ci(&p, "acqu2s").is_some() || find_file_ci(&p, "acqu2").is_some();
         let has_ser = find_file_ci(&p, "ser").is_some();
         if has_3 && has_ser {
-            Ok(RawFid::Dim3(read_bruker_fid_3d(&p)?))
+            Ok(RawFid::Dim3(read_bruker_fid_3d_opts(
+                &p,
+                allow_truncated_fid,
+            )?))
         } else if has_2 && has_ser {
-            Ok(RawFid::Dim2(read_bruker_fid_2d(&p)?))
+            Ok(RawFid::Dim2(read_bruker_fid_2d_opts(
+                &p,
+                allow_truncated_fid,
+            )?))
         } else {
             Ok(RawFid::Dim1(read_bruker_fid_1d(&p)?))
         }
     } else if find_file_ci(&p, "procpar").is_some() {
-        read_varian_fid_auto(&p)
+        read_varian_fid_auto_opts(&p, allow_truncated_fid)
     } else {
         Err(format!(
             "unrecognized FID directory {}: neither Bruker acqus nor Varian procpar found",
@@ -357,7 +381,12 @@ pub fn read_fid_auto(dir: impl AsRef<Path>) -> Result<RawFid, String> {
 
 /// Read a 2D raw FID directory (Bruker `ser` + `acqus`/`acqu2s` or Varian `fid` + `procpar`).
 pub fn read_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
-    match read_fid_auto(dir)? {
+    read_fid_2d_opts(dir, false)
+}
+
+/// Read a 2D raw FID directory with explicit opt-in `allow_truncated_fid` zero-filling for halted acquisitions.
+pub fn read_fid_2d_opts(dir: impl AsRef<Path>, allow_truncated_fid: bool) -> Result<Fid2D, String> {
+    match read_fid_auto_opts(dir, allow_truncated_fid)? {
         RawFid::Dim2(f) => Ok(f),
         RawFid::Dim1(_) => Err("expected 2D FID dataset, found 1D FID".to_string()),
         RawFid::Dim3(_) => Err("expected 2D FID dataset, found 3D FID".to_string()),
@@ -366,11 +395,39 @@ pub fn read_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
 
 /// Read a 3D raw FID directory (Bruker `ser` + `acqus`/`acqu2s`/`acqu3s` or Varian `fid` + `procpar`).
 pub fn read_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
-    match read_fid_auto(dir)? {
+    read_fid_3d_opts(dir, false)
+}
+
+/// Read a 3D raw FID directory with explicit opt-in `allow_truncated_fid` zero-filling for halted acquisitions.
+pub fn read_fid_3d_opts(dir: impl AsRef<Path>, allow_truncated_fid: bool) -> Result<Fid3D, String> {
+    match read_fid_auto_opts(dir, allow_truncated_fid)? {
         RawFid::Dim3(f) => Ok(f),
         RawFid::Dim1(_) => Err("expected 3D FID dataset, found 1D FID".to_string()),
         RawFid::Dim2(_) => Err("expected 3D FID dataset, found 2D FID".to_string()),
     }
+}
+
+pub(crate) fn format_truncated_fid_name_warning(
+    label: &str,
+    observed: usize,
+    expected: usize,
+) -> String {
+    let pct = 100.0 * (observed as f64) / (expected.max(1) as f64);
+    let missing = expected.saturating_sub(observed);
+    let name = if label.is_empty() { "fid" } else { label };
+    format!(
+        "{name}: halted acquisition ({observed}/{expected} traces, {pct:.1}%); zero-filling {missing} missing indirect traces"
+    )
+}
+
+pub(crate) fn format_truncated_fid_warning(dir: &Path, observed: usize, expected: usize) -> String {
+    let label = dir.file_name().and_then(|s| s.to_str()).unwrap_or("fid");
+    format_truncated_fid_name_warning(label, observed, expected)
+}
+
+fn warn_truncated_fid(dir: &Path, observed: usize, expected: usize) {
+    let msg = format_truncated_fid_warning(dir, observed, expected);
+    eprintln!("warning: [truncated-fid] {msg}");
 }
 
 fn resolve_fid_dir(path: &Path) -> Result<PathBuf, String> {
@@ -389,48 +446,51 @@ fn resolve_fid_dir(path: &Path) -> Result<PathBuf, String> {
 // NUS Schedule File Helpers (Bruker `nuslist` & Varian `sampling.sch`)
 // ============================================================================
 
-fn parse_nus_schedule_1d(path: &Path, n1_cplx: usize) -> Result<Vec<usize>, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|e| format!("failed to read NUS schedule {}: {e}", path.display()))?;
-    let mut coords = Vec::new();
-    for (line_no, raw_line) in text.lines().enumerate() {
-        let clean = raw_line.split(['#', ';']).next().unwrap_or("").trim();
-        if clean.is_empty() {
-            continue;
-        }
-        let toks: Vec<&str> = clean.split_whitespace().collect();
-        if toks.len() != 1 {
-            return Err(format!(
-                "invalid 2D NUS schedule {} at line {}: expected 1 integer coordinate, got '{}'",
-                path.display(),
-                line_no + 1,
-                clean
-            ));
-        }
-        let k1: usize = toks[0].parse().map_err(|e| {
-            format!(
-                "invalid integer '{}' in 2D NUS schedule {} at line {}: {e}",
-                toks[0],
-                path.display(),
-                line_no + 1
-            )
-        })?;
-        if k1 >= n1_cplx {
-            return Err(format!(
-                "out-of-bounds 2D NUS coordinate k1={k1} in {} at line {} (full grid n1_cplx={n1_cplx})",
-                path.display(),
-                line_no + 1
-            ));
-        }
-        coords.push(k1);
+const MAX_FID_TEXT_HEADER_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_FID_PROCPAR_VALUES: usize = 1_000_000;
+
+/// Read a spectrometer text parameter/schedule/pulseprogram file up to `MAX_FID_TEXT_HEADER_BYTES`,
+/// decoding ISO-8859-1 / Latin-1 header comments cleanly via `String::from_utf8_lossy`.
+fn read_text_lossy_capped(path: &Path) -> Result<String, String> {
+    let meta = fs::metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    if meta.len() > MAX_FID_TEXT_HEADER_BYTES {
+        return Err(format!(
+            "text header {} ({} bytes) exceeds {} byte safety cap",
+            path.display(),
+            meta.len(),
+            MAX_FID_TEXT_HEADER_BYTES
+        ));
     }
-    if coords.is_empty() {
-        return Err(format!("NUS schedule file {} is empty", path.display()));
+    use std::io::Read;
+    let f = fs::File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let mut buf = Vec::with_capacity((meta.len() as usize).min(65_536));
+    f.take(MAX_FID_TEXT_HEADER_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    if (buf.len() as u64) > MAX_FID_TEXT_HEADER_BYTES {
+        return Err(format!(
+            "text header {} exceeds {} byte safety cap",
+            path.display(),
+            MAX_FID_TEXT_HEADER_BYTES
+        ));
     }
-    Ok(coords)
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Parse a 2-column 3D NUS schedule (`col0 col1` per line).
+fn parse_nus_schedule_1d(path: &Path, n1_cplx: usize) -> Result<Vec<usize>, String> {
+    let text = read_text_lossy_capped(path)
+        .map_err(|e| format!("failed to read NUS schedule {}: {e}", path.display()))?;
+    let decoded = crate::pulprog::decode_nuslist_str(
+        &text,
+        &[n1_cplx],
+        crate::pulprog::AcquisitionOrder::Dim2D,
+    )
+    .map_err(|e| format!("invalid 2D NUS schedule {}: {e}", path.display()))?;
+    Ok(decoded.points.into_iter().map(|r| r[0]).collect())
+}
+
+/// Parse a 2-column 3D NUS schedule (`col0 col1` per line), automatically detecting 0-based vs
+/// 1-based schedule indexing and `AQSEQ` (`321` vs `312`) column ordering.
 /// When `col0_is_y` is `true` (Bruker `AQSEQ == 0` `3-2-1` and Varian `ni, ni2`), returns `(k1_y, k2_z)`;
 /// when `col0_is_y` is `false` (Bruker `AQSEQ == 1` `3-1-2`), returns `(k1_y, k2_z)` with columns swapped.
 fn parse_nus_schedule_2d(
@@ -439,53 +499,16 @@ fn parse_nus_schedule_2d(
     n2_cplx: usize,
     col0_is_y: bool,
 ) -> Result<Vec<(usize, usize)>, String> {
-    let text = fs::read_to_string(path)
+    let text = read_text_lossy_capped(path)
         .map_err(|e| format!("failed to read 3D NUS schedule {}: {e}", path.display()))?;
-    let mut coords = Vec::new();
-    for (line_no, raw_line) in text.lines().enumerate() {
-        let clean = raw_line.split(['#', ';']).next().unwrap_or("").trim();
-        if clean.is_empty() {
-            continue;
-        }
-        let toks: Vec<&str> = clean.split_whitespace().collect();
-        if toks.len() != 2 {
-            return Err(format!(
-                "invalid 3D NUS schedule {} at line {}: expected 2 integer coordinates, got '{}'",
-                path.display(),
-                line_no + 1,
-                clean
-            ));
-        }
-        let c0: usize = toks[0].parse().map_err(|e| {
-            format!(
-                "invalid integer '{}' in 3D NUS schedule {} at line {}: {e}",
-                toks[0],
-                path.display(),
-                line_no + 1
-            )
-        })?;
-        let c1: usize = toks[1].parse().map_err(|e| {
-            format!(
-                "invalid integer '{}' in 3D NUS schedule {} at line {}: {e}",
-                toks[1],
-                path.display(),
-                line_no + 1
-            )
-        })?;
-        let (k1, k2) = if col0_is_y { (c0, c1) } else { (c1, c0) };
-        if k1 >= n1_cplx || k2 >= n2_cplx {
-            return Err(format!(
-                "out-of-bounds 3D NUS coordinate (k1={k1}, k2={k2}) in {} at line {} (full grid n1_cplx={n1_cplx}, n2_cplx={n2_cplx})",
-                path.display(),
-                line_no + 1
-            ));
-        }
-        coords.push((k1, k2));
-    }
-    if coords.is_empty() {
-        return Err(format!("3D NUS schedule file {} is empty", path.display()));
-    }
-    Ok(coords)
+    let aqseq = if col0_is_y {
+        crate::pulprog::AcquisitionOrder::Aqseq321
+    } else {
+        crate::pulprog::AcquisitionOrder::Aqseq312
+    };
+    let decoded = crate::pulprog::decode_nuslist_str(&text, &[n1_cplx, n2_cplx], aqseq)
+        .map_err(|e| format!("invalid 3D NUS schedule {}: {e}", path.display()))?;
+    Ok(decoded.points.into_iter().map(|r| (r[0], r[1])).collect())
 }
 
 fn find_bruker_nuslist_file(dir: &Path, acqus: &HashMap<String, String>) -> Option<PathBuf> {
@@ -536,8 +559,7 @@ fn find_varian_schedule_file(dir: &Path, pp: &HashMap<String, ProcparVal>) -> Op
 // ============================================================================
 
 fn parse_jcamp_file(path: &Path) -> Result<HashMap<String, String>, String> {
-    let text =
-        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let text = read_text_lossy_capped(path)?;
     Ok(parse_jcamp_str(&text))
 }
 
@@ -696,6 +718,23 @@ fn extract_bruker_stored_proc(proc_map: Option<&HashMap<String, String>>) -> Sto
         reverse,
         bc_mod,
         bcfw_ppm,
+        pulprog_p1_deg: None,
+    }
+}
+
+/// Return `proc_map`'s calibrated `##$SF` (MHz) ONLY when physically consistent within `2%` of
+/// the acquisition base frequency `bf1` (guarding against uncalibrated XWIN-NMR 2.x `proc2s`/`proc3s`
+/// templates that retain `1H` `SF = 600.13` and `OFFSET = -898657.9` on `15N`/`13C` indirect axes).
+fn bruker_proc_valid_sf(proc_map: Option<&HashMap<String, String>>, bf1: f64) -> Option<f64> {
+    let sf = proc_map?
+        .get("SF")?
+        .parse::<f64>()
+        .ok()
+        .filter(|&v| v > 0.0 && v.is_finite())?;
+    if bf1 > 0.0 && (sf - bf1).abs() / bf1.max(1e-6) <= 0.02 {
+        Some(sf)
+    } else {
+        None
     }
 }
 
@@ -703,15 +742,23 @@ fn bruker_proc_first_ppm(
     proc_map: Option<&HashMap<String, String>>,
     sfo1: f64,
     obs_mhz: f64,
+    bf1: f64,
     sw_hz: f64,
 ) -> f64 {
     if let Some(p) = proc_map {
+        let sf_ok = p
+            .get("SF")
+            .is_none_or(|_| bruker_proc_valid_sf(Some(p), bf1).is_some());
         let sref = p
             .get("SREF_mod")
             .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(1);
-        if sref != 0 {
-            if let Some(offset) = p.get("OFFSET").and_then(|v| v.parse::<f64>().ok()) {
+        if sf_ok && sref != 0 {
+            if let Some(offset) = p
+                .get("OFFSET")
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|&v| v.is_finite() && v.abs() <= 1000.0)
+            {
                 let si = p
                     .get("SI")
                     .and_then(|v| v.parse::<usize>().ok())
@@ -875,12 +922,9 @@ fn parse_bruker_direct_axis(
         .or_else(|| sw_ppm_acq.map(|sw| sw * sfo1))
         .ok_or("missing ##$SW_h / ##$SW in Bruker acqus")?;
 
-    let proc_sf = procs
-        .and_then(|p| p.get("SF"))
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|&v| v > 0.0);
+    let proc_sf = bruker_proc_valid_sf(procs, bf1);
     let obs_mhz = proc_sf.unwrap_or(bf1);
-    let first_ppm = bruker_proc_first_ppm(procs, sfo1, obs_mhz, sw_hz);
+    let first_ppm = bruker_proc_first_ppm(procs, sfo1, obs_mhz, bf1, sw_hz);
 
     let grpdly_raw = acqus
         .get("GRPDLY")
@@ -955,7 +999,17 @@ fn resolve_bruker_indirect_sfo1(
     sfo_ind: f64,
     bf_ind: f64,
 ) -> f64 {
-    if proc_ind.is_some() || label != "15N" || bf_ind <= 0.0 {
+    let has_valid_proc_cal = proc_ind.is_some_and(|p| {
+        let sf_ok = p
+            .get("SF")
+            .is_none_or(|_| bruker_proc_valid_sf(Some(p), bf_ind).is_some());
+        let off_ok = p
+            .get("OFFSET")
+            .and_then(|v| v.parse::<f64>().ok())
+            .is_some_and(|o| o.is_finite() && o.abs() <= 1000.0);
+        sf_ok && off_ok
+    });
+    if has_valid_proc_cal || !matches!(label, "15N" | "13C") || bf_ind <= 0.0 {
         return sfo_ind;
     }
     for ch in 2..=4 {
@@ -963,7 +1017,7 @@ fn resolve_bruker_indirect_sfo1(
         let Some(raw_nuc) = acqus.get(&nuc_key) else {
             continue;
         };
-        if normalize_nucleus_label(raw_nuc, "") != "15N" {
+        if normalize_nucleus_label(raw_nuc, "") != label {
             continue;
         }
         let bf_key = format!("BF{ch}");
@@ -977,13 +1031,27 @@ fn resolve_bruker_indirect_sfo1(
         if (bf_ch - bf_ind).abs() <= 1e-3 && sfo_ch > 0.0 {
             let ppm_ch = (sfo_ch - bf_ch) * 1.0e6 / bf_ch;
             let ppm_ind = (sfo_ind - bf_ind) * 1.0e6 / bf_ind;
-            let uninit_ind = ppm_ind.abs() <= 1e-3 && (90.0..=150.0).contains(&ppm_ch);
-            if (ppm_ch - ppm_ind).abs() <= 20.0 || uninit_ind {
+            let uninit_ind =
+                label == "15N" && ppm_ind.abs() <= 1e-3 && (90.0..=150.0).contains(&ppm_ch);
+            let max_delta = if label == "15N" { 20.0 } else { 15.0 };
+            if (ppm_ch - ppm_ind).abs() <= max_delta || uninit_ind {
                 return sfo_ch;
             }
         }
     }
     sfo_ind
+}
+
+fn decode_bruker_proc_mc2(mc2: i32, fallback_label: &str) -> Result<QuadMode, String> {
+    match mc2 {
+        0 => Ok(QuadMode::Qf),
+        3 => Ok(QuadMode::States),
+        4 => Ok(QuadMode::StatesTppi),
+        5 => Ok(QuadMode::EchoAntiecho),
+        other => Err(format!(
+            "unsupported Bruker indirect proc MC2={other} fallback on {fallback_label} (expected 0=QF, 3=States, 4=States-TPPI, 5=Echo-Antiecho; 1=QSEQ, 2=TPPI, and unknown codes rejected; never guessing)"
+        )),
+    }
 }
 
 fn parse_bruker_indirect_axis(
@@ -992,6 +1060,7 @@ fn parse_bruker_indirect_axis(
     proc_ind: Option<&HashMap<String, String>>,
     fallback_label: &str,
     td_override: Option<usize>,
+    ind_phys: Option<&crate::pulprog::IndirectDimPhysics>,
 ) -> Result<FidAxisMeta, String> {
     let td = match td_override {
         Some(v) => v,
@@ -1005,19 +1074,49 @@ fn parse_bruker_indirect_axis(
         return Err(format!("invalid Bruker indirect TD={td}"));
     }
 
-    let fnmode: i32 = acqu_ind
-        .get("FnMODE")
-        .ok_or_else(|| format!("missing ##$FnMODE in Bruker indirect ({fallback_label}) acqus"))?
-        .parse()
-        .map_err(|e| format!("invalid FnMODE: {e}"))?;
+    let fnmode_opt: Option<i32> =
+        match acqu_ind.get("FnMODE") {
+            Some(raw) => Some(raw.parse::<i32>().map_err(|e| {
+                format!("invalid FnMODE in Bruker indirect ({fallback_label}): {e}")
+            })?),
+            None => None,
+        };
 
     // Bruker FnMODE codes: 0=Undefined, 1=QF, 2=QSEQ, 3=TPPI, 4=States, 5=States-TPPI, 6=Echo-Antiecho.
-    let quad_mode = match fnmode {
-        1 => QuadMode::Qf,
-        4 => QuadMode::States,
-        5 => QuadMode::StatesTppi,
-        6 => QuadMode::EchoAntiecho,
-        other => {
+    // Legacy XWIN-NMR 2.x (`BMRB 6209`) omits `##$FnMODE` (or sets `FnMODE = 0`):
+    // - Priority 1: `ind_phys` (`pulprog`) `QuadSource::SynthesizedManualLoop { .. }`.
+    // - Priority 2: `proc_ind` `##$MC2` (`0=>Qf`, `3=>States`, `4=>StatesTppi`, `5=>EchoAntiecho`, fail-closed on `1`/`2`/unknown).
+    // - Priority 3: Fail closed (`missing ##$FnMODE ... and neither pulseprogram manual loop nor proc MC2 fallback available`).
+    let manual_loop_quad = ind_phys.and_then(|ip| match ip.quad_source {
+        crate::pulprog::QuadSource::SynthesizedManualLoop { .. } => ip.quad_mode.to_fid_quad_mode(),
+        _ => None,
+    });
+
+    let quad_mode = match fnmode_opt {
+        None | Some(0) => {
+            if let Some(qm) = manual_loop_quad {
+                qm
+            } else if let Some(mc2_raw) = proc_ind.and_then(|p| p.get("MC2")) {
+                let mc2 = mc2_raw.trim().parse::<i32>().map_err(|e| {
+                    format!("invalid ##$MC2 '{mc2_raw}' in Bruker indirect ({fallback_label}): {e}")
+                })?;
+                decode_bruker_proc_mc2(mc2, fallback_label)?
+            } else {
+                return Err(match fnmode_opt {
+                    Some(0) => format!(
+                        "unsupported Bruker indirect FnMODE=0 on {fallback_label} and neither pulseprogram manual loop nor proc MC2 fallback available (never guessing)"
+                    ),
+                    _ => format!(
+                        "missing ##$FnMODE in Bruker indirect ({fallback_label}) acqus and neither pulseprogram manual loop nor proc MC2 fallback available (never guessing)"
+                    ),
+                });
+            }
+        }
+        Some(1) => manual_loop_quad.unwrap_or(QuadMode::Qf),
+        Some(4) => QuadMode::States,
+        Some(5) => QuadMode::StatesTppi,
+        Some(6) => QuadMode::EchoAntiecho,
+        Some(other) => {
             return Err(format!(
                 "unsupported Bruker indirect FnMODE={other} on {fallback_label} (expected 1=QF, 4=States, 5=States-TPPI, 6=Echo-Antiecho; 0=Undefined, 2=QSEQ, 3=TPPI rejected; never guessing)"
             ));
@@ -1026,7 +1125,7 @@ fn parse_bruker_indirect_axis(
 
     if quad_mode != QuadMode::Qf && td < 2 {
         return Err(format!(
-            "Bruker indirect {fallback_label} has hypercomplex FnMODE={fnmode} but TD={td} < 2"
+            "Bruker indirect {fallback_label} has hypercomplex quadrature ({quad_mode:?}) but TD={td} < 2"
         ));
     }
 
@@ -1046,7 +1145,30 @@ fn parse_bruker_indirect_axis(
         .get("BF1")
         .and_then(|v| v.parse().ok())
         .unwrap_or(sfo1_raw);
-    let sfo1 = resolve_bruker_indirect_sfo1(acqus, proc_ind, &label, sfo1_raw, bf1);
+    let mut sfo1 = resolve_bruker_indirect_sfo1(acqus, proc_ind, &label, sfo1_raw, bf1);
+
+    let proc_sf = bruker_proc_valid_sf(proc_ind, bf1);
+    let obs_mhz = proc_sf.unwrap_or(bf1);
+
+    // When `proc_ind` lacks a valid calibrated `(SF, OFFSET)` and `pulprog` resolved an active
+    // intra-scan `fq*list` carrier (e.g. XWIN-NMR 2.x `hncof.s` switching `O3 = 45 ppm` -> `176 ppm`
+    // for `d0` CO evolution), honor that hardware synthesizer carrier!
+    let has_valid_proc_offset = proc_ind.is_some_and(|p| {
+        let sf_ok = p.get("SF").is_none() || proc_sf.is_some();
+        let off_ok = p
+            .get("OFFSET")
+            .and_then(|v| v.parse::<f64>().ok())
+            .is_some_and(|o| o.is_finite() && o.abs() <= 1000.0);
+        sf_ok && off_ok
+    });
+    if !has_valid_proc_offset {
+        if let Some(ip) = ind_phys {
+            let raw_ppm = (sfo1 - bf1) * 1.0e6 / bf1.max(1e-6);
+            if (ip.carrier_ppm - raw_ppm).abs() > 1.0 && ip.obs_mhz > 0.0 {
+                sfo1 = ip.obs_mhz * (1.0 + ip.carrier_ppm * 1.0e-6);
+            }
+        }
+    }
 
     // In TopSpin 2.x/3.x/4.x indirect acqu2s/acqu3s, SW (ppm) * SFO1 (MHz) is authoritative
     // because SW_h may retain a default 1D template value or be omitted.
@@ -1064,12 +1186,7 @@ fn parse_bruker_indirect_axis(
         })
         .ok_or_else(|| format!("missing ##$SW / ##$SW_h in Bruker indirect ({fallback_label})"))?;
 
-    let proc_sf = proc_ind
-        .and_then(|p| p.get("SF"))
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|&v| v > 0.0);
-    let obs_mhz = proc_sf.unwrap_or(bf1);
-    let first_ppm = bruker_proc_first_ppm(proc_ind, sfo1, obs_mhz, sw_hz);
+    let first_ppm = bruker_proc_first_ppm(proc_ind, sfo1, obs_mhz, bf1, sw_hz);
 
     let complex_points = if quad_mode == QuadMode::Qf {
         td
@@ -1083,6 +1200,18 @@ fn parse_bruker_indirect_axis(
         } else {
             (*td_eff / 2).min(complex_points).max(1)
         };
+    }
+    if proc_ind.and_then(|p| p.get("FCOR")).is_none()
+        && ind_phys.is_some_and(|ip| ip.half_dwell_sampling || ip.predicted_phc1_deg.abs() >= 360.0)
+    {
+        stored_proc.fcor = Some(1.0);
+    }
+    if stored_proc.p0_deg.is_none() && stored_proc.p1_deg.is_none() {
+        if let Some(ip) = ind_phys {
+            if ip.predicted_phc1_deg.abs() >= 360.0 {
+                stored_proc.pulprog_p1_deg = Some(-ip.predicted_phc1_deg);
+            }
+        }
     }
 
     Ok(FidAxisMeta {
@@ -1176,19 +1305,68 @@ fn determine_bruker_ser_stride(
     allow_trailing_blocks: bool,
     dir: &Path,
 ) -> Result<usize, String> {
+    determine_bruker_ser_stride_opts(
+        file_len,
+        n_traces,
+        td_words,
+        word_bytes,
+        allow_trailing_blocks,
+        false,
+        dir,
+    )
+    .map(|(stride, _)| stride)
+}
+
+fn determine_bruker_ser_stride_opts(
+    file_len: usize,
+    n_traces: usize,
+    td_words: usize,
+    word_bytes: usize,
+    allow_trailing_blocks: bool,
+    allow_truncated_fid: bool,
+    dir: &Path,
+) -> Result<(usize, usize), String> {
     let raw_trace_bytes = td_words * word_bytes;
     let stride_1024 = raw_trace_bytes.div_ceil(1024) * 1024;
     let stride_256w = td_words.div_ceil(256) * 256 * word_bytes;
 
     if file_len == n_traces * stride_1024 {
-        Ok(stride_1024)
+        Ok((stride_1024, n_traces))
     } else if file_len == n_traces * stride_256w {
-        Ok(stride_256w)
+        Ok((stride_256w, n_traces))
     } else if allow_trailing_blocks
         && file_len > n_traces * stride_1024
         && file_len.is_multiple_of(stride_1024)
     {
-        Ok(stride_1024)
+        Ok((stride_1024, n_traces))
+    } else if allow_truncated_fid && file_len < n_traces * stride_1024 {
+        let stride = if stride_256w != stride_1024
+            && file_len >= stride_256w
+            && file_len.is_multiple_of(stride_256w)
+            && !file_len.is_multiple_of(stride_1024)
+        {
+            stride_256w
+        } else if (raw_trace_bytes < stride_1024
+            && file_len < stride_1024
+            && file_len >= raw_trace_bytes)
+            || (raw_trace_bytes != stride_1024
+                && !file_len.is_multiple_of(stride_1024)
+                && file_len.is_multiple_of(raw_trace_bytes)
+                && (file_len / raw_trace_bytes) < n_traces)
+        {
+            raw_trace_bytes
+        } else {
+            stride_1024
+        };
+        // Accept only complete `stride`-aligned blocks (discarding any trailing partial mid-scan write).
+        let observed = file_len / stride;
+        if observed == 0 {
+            return Err(format!(
+                "Bruker ser in {} is truncated before completing even 1 trace ({file_len} B < {raw_trace_bytes} B)",
+                dir.display()
+            ));
+        }
+        Ok((stride, observed.min(n_traces)))
     } else if file_len < n_traces * raw_trace_bytes {
         Err(format!(
             "Bruker ser in {} is smaller than expected trace count ({file_len} B < {n_traces} traces x {stride_1024} B)",
@@ -1271,6 +1449,7 @@ fn scale_complex_slice(dst: &mut [Complex64], scale: f64) {
 /// Read a Bruker 1D `fid` directory (`acqus` + `fid`).
 pub fn read_bruker_fid_1d(dir: impl AsRef<Path>) -> Result<Fid1D, String> {
     let dir = resolve_fid_dir(dir.as_ref())?;
+    let _ = interpret_bruker_dir_checked(&dir)?;
     let acqus = read_merged_bruker_params(&dir, "acqus", "acqu")?;
     validate_bruker_fntype(&dir, &acqus, &[])?;
     let procs = read_optional_bruker_proc(&dir, "procs");
@@ -1311,10 +1490,51 @@ pub fn read_bruker_fid_1d(dir: impl AsRef<Path>) -> Result<Fid1D, String> {
     })
 }
 
-fn read_optional_bruker_pulseprogram(dir: &Path) -> Option<String> {
-    find_file_ci(dir, "pulseprogram")
-        .or_else(|| find_file_ci(dir, "pulseprogram.precomp"))
-        .and_then(|p| fs::read_to_string(p).ok())
+/// Fail-closed symlink containment check for `<exp_dir>/pulseprogram` and `pulseprogram.precomp`.
+fn verify_bruker_pulseprogram_containment(dir: &Path) -> Result<(), String> {
+    let canon_root = fs::canonicalize(dir)
+        .map_err(|e| format!("failed to canonicalize {}: {e}", dir.display()))?;
+    for name in ["pulseprogram", "pulseprogram.precomp"] {
+        if let Some(p) = find_child_ci(dir, name) {
+            let canon_p = fs::canonicalize(&p).map_err(|e| {
+                format!(
+                    "unsafe or broken symlink for {name} in {}: {e}",
+                    dir.display()
+                )
+            })?;
+            if !canon_p.starts_with(&canon_root) {
+                return Err(format!(
+                    "unsafe pulseprogram symlink escape: {} resolves to {} outside {}",
+                    p.display(),
+                    canon_p.display(),
+                    canon_root.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn interpret_bruker_dir_checked(
+    dir: &Path,
+) -> Result<Option<crate::pulprog::PulprogInterpretation>, String> {
+    verify_bruker_pulseprogram_containment(dir)?;
+    match crate::pulprog::interpret_bruker_dir(dir) {
+        Ok(pi) => Ok(Some(pi)),
+        Err(e @ crate::pulprog::PulprogError::UnsafeIncludePath(_)) => Err(format!(
+            "unsafe pulseprogram/#include path in {}: {e}",
+            dir.display()
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
+fn read_optional_bruker_pulseprogram(dir: &Path) -> Result<Option<String>, String> {
+    verify_bruker_pulseprogram_containment(dir)?;
+    match find_file_ci(dir, "pulseprogram").or_else(|| find_file_ci(dir, "pulseprogram.precomp")) {
+        Some(p) => read_text_lossy_capped(&p).map(Some),
+        None => Ok(None),
+    }
 }
 
 fn contains_word_token(line: &str, word: &str) -> bool {
@@ -1517,7 +1737,9 @@ pub fn infer_bruker_raw_indirect_reverse(
 
         let macro_name = if f_dim == 1 { "F1PH" } else { "F2PH" };
         let inc_tok = if f_dim == 1 { "id0" } else { "id10" };
+        let dec_evo_tok = if f_dim == 1 { "dd0" } else { "dd10" };
         let precomp_loop = if f_dim == 1 { "t1loop" } else { "t2loop" };
+        let has_evo_decremented = rf_lines.iter().any(|l| contains_word_token(l, dec_evo_tok));
 
         let quad_reg_sign = extract_calph_90deg_macro(txt, macro_name)
             .or_else(|| {
@@ -1536,13 +1758,17 @@ pub fn infer_bruker_raw_indirect_reverse(
                 None
             })
             .or_else(|| {
-                // Classic Avance loop: 2-step quadrature `ip<k>` / `dp<k>` appears immediately before `id0` / `id10`
+                // Classic Avance loop: 2-step quadrature `ip<k>` / `dp<k>` appears immediately before `id0`/`dd0` or `id10`/`dd10`
                 for (idx, line) in rf_lines.iter().enumerate() {
-                    if contains_word_token(line, inc_tok) {
+                    if contains_word_token(line, inc_tok) || contains_word_token(line, dec_evo_tok)
+                    {
                         for prev in (0..idx).rev().take(4) {
                             if contains_word_token(
                                 rf_lines[prev],
                                 if f_dim == 1 { "id10" } else { "id0" },
+                            ) || contains_word_token(
+                                rf_lines[prev],
+                                if f_dim == 1 { "dd10" } else { "dd0" },
                             ) {
                                 break;
                             }
@@ -1584,6 +1810,9 @@ pub fn infer_bruker_raw_indirect_reverse(
                         net_sign = -net_sign;
                     }
                 }
+                if has_evo_decremented {
+                    net_sign = -net_sign;
+                }
                 return net_sign < 0;
             }
         }
@@ -1594,7 +1823,16 @@ pub fn infer_bruker_raw_indirect_reverse(
 
 /// Read a Bruker 2D `ser` directory (`acqus`, `acqu2s`, and `ser`), automatically detecting uniform vs NUS.
 pub fn read_bruker_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
+    read_bruker_fid_2d_opts(dir, false)
+}
+
+/// Read a Bruker 2D `ser` directory with explicit opt-in `allow_truncated_fid` zero-filling for halted acquisitions.
+pub fn read_bruker_fid_2d_opts(
+    dir: impl AsRef<Path>,
+    allow_truncated_fid: bool,
+) -> Result<Fid2D, String> {
     let dir = resolve_fid_dir(dir.as_ref())?;
+    verify_bruker_pulseprogram_containment(&dir)?;
     let acqus = read_merged_bruker_params(&dir, "acqus", "acqu")?;
     let acqu2s = read_merged_bruker_params(&dir, "acqu2s", "acqu2")?;
     let is_fntype_nus = validate_bruker_fntype(&dir, &acqus, &[&acqu2s])?;
@@ -1638,13 +1876,27 @@ pub fn read_bruker_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
         td_acq_y
     };
 
-    let mut axis_y =
-        parse_bruker_indirect_axis(&acqus, &acqu2s, proc2s.as_ref(), "15N", Some(td_full_y))?;
+    let pulprog_interp = interpret_bruker_dir_checked(&dir)?;
+    let ind_phys_y = pulprog_interp
+        .as_ref()
+        .and_then(|pi| pi.indirect_dims.first());
+
+    let mut axis_y = parse_bruker_indirect_axis(
+        &acqus,
+        &acqu2s,
+        proc2s.as_ref(),
+        "15N",
+        Some(td_full_y),
+        ind_phys_y,
+    )?;
     if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
-        let pp_txt = read_optional_bruker_pulseprogram(&dir);
-        let pulprog = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
-        axis_y.stored_proc.reverse =
-            infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog, 1, axis_y.quad_mode);
+        axis_y.stored_proc.reverse = if let Some(ip) = ind_phys_y {
+            ip.reverse_frequency
+        } else {
+            let pp_txt = read_optional_bruker_pulseprogram(&dir)?;
+            let pulprog = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
+            infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog, 1, axis_y.quad_mode)
+        };
     }
     let q1_mult = if axis_y.quad_mode == QuadMode::Qf {
         1
@@ -1656,6 +1908,7 @@ pub fn read_bruker_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
     let big_endian = bytorda != 0;
     let trace_byte_len = n0 * 2 * word_bytes;
     let mut data = vec![[0.0, 0.0]; n1 * 2 * n0];
+    let mut truncated_traces: Option<(usize, usize)> = None;
 
     let nus_mask = if is_nus {
         let sched_path = sched_file.ok_or_else(|| {
@@ -1673,20 +1926,29 @@ pub fn read_bruker_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
                 coords.len()
             ));
         }
-        let stride = determine_bruker_ser_stride(
+        let (stride, observed) = determine_bruker_ser_stride_opts(
             bytes.len(),
             n_acq_traces,
             axis_x.td_raw,
             word_bytes,
             false,
+            allow_truncated_fid,
             &dir,
         )?;
+        if observed < n_acq_traces {
+            truncated_traces = Some((observed, n_acq_traces));
+            warn_truncated_fid(&dir, observed, n_acq_traces);
+        }
+        let zero_tr = vec![[0.0, 0.0]; n0];
         let mut counts = vec![0usize; n1];
         let mut tmp_cos = vec![[0.0, 0.0]; n0];
         let mut tmp_sin = vec![[0.0, 0.0]; n0];
 
         for (row_idx, &k1) in coords.iter().enumerate() {
             if axis_y.quad_mode == QuadMode::Qf {
+                if row_idx >= observed {
+                    break;
+                }
                 let off = row_idx * stride;
                 let tr = decode_bruker_trace(
                     &bytes[off..off + trace_byte_len],
@@ -1696,20 +1958,27 @@ pub fn read_bruker_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
                 );
                 add_complex_slice(&mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0], &tr);
             } else {
+                if 2 * row_idx >= observed {
+                    break;
+                }
                 let off0 = (2 * row_idx) * stride;
-                let off1 = (2 * row_idx + 1) * stride;
                 let z0 = decode_bruker_trace(
                     &bytes[off0..off0 + trace_byte_len],
                     n0 * 2,
                     big_endian,
                     dtypa,
                 );
-                let z1 = decode_bruker_trace(
-                    &bytes[off1..off1 + trace_byte_len],
-                    n0 * 2,
-                    big_endian,
-                    dtypa,
-                );
+                let z1 = if 2 * row_idx + 1 < observed {
+                    let off1 = (2 * row_idx + 1) * stride;
+                    decode_bruker_trace(
+                        &bytes[off1..off1 + trace_byte_len],
+                        n0 * 2,
+                        big_endian,
+                        dtypa,
+                    )
+                } else {
+                    zero_tr.clone()
+                };
                 recombine_quad_pair(axis_y.quad_mode, k1, &z0, &z1, &mut tmp_cos, &mut tmp_sin);
                 add_complex_slice(&mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0], &tmp_cos);
                 add_complex_slice(&mut data[(k1 * 2 + 1) * n0..(k1 * 2 + 2) * n0], &tmp_sin);
@@ -1726,16 +1995,22 @@ pub fn read_bruker_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
         }
         Some(counts.into_iter().map(|c| c > 0).collect())
     } else {
-        let stride = determine_bruker_ser_stride(
+        let (stride, observed) = determine_bruker_ser_stride_opts(
             bytes.len(),
             td_acq_y,
             axis_x.td_raw,
             word_bytes,
             true,
+            allow_truncated_fid,
             &dir,
         )?;
+        if observed < td_acq_y {
+            truncated_traces = Some((observed, td_acq_y));
+            warn_truncated_fid(&dir, observed, td_acq_y);
+        }
+        let zero_tr = vec![[0.0, 0.0]; n0];
         if axis_y.quad_mode == QuadMode::Qf {
-            for k1 in 0..n1 {
+            for k1 in 0..n1.min(observed) {
                 let off = k1 * stride;
                 let tr = decode_bruker_trace(
                     &bytes[off..off + trace_byte_len],
@@ -1747,20 +2022,27 @@ pub fn read_bruker_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
             }
         } else {
             for k1 in 0..n1 {
+                if 2 * k1 >= observed {
+                    break;
+                }
                 let off0 = (2 * k1) * stride;
-                let off1 = (2 * k1 + 1) * stride;
                 let z0 = decode_bruker_trace(
                     &bytes[off0..off0 + trace_byte_len],
                     n0 * 2,
                     big_endian,
                     dtypa,
                 );
-                let z1 = decode_bruker_trace(
-                    &bytes[off1..off1 + trace_byte_len],
-                    n0 * 2,
-                    big_endian,
-                    dtypa,
-                );
+                let z1 = if 2 * k1 + 1 < observed {
+                    let off1 = (2 * k1 + 1) * stride;
+                    decode_bruker_trace(
+                        &bytes[off1..off1 + trace_byte_len],
+                        n0 * 2,
+                        big_endian,
+                        dtypa,
+                    )
+                } else {
+                    zero_tr.clone()
+                };
                 let (cos_slice, sin_slice) =
                     data[(k1 * 2) * n0..(k1 * 2 + 2) * n0].split_at_mut(n0);
                 recombine_quad_pair(axis_y.quad_mode, k1, &z0, &z1, cos_slice, sin_slice);
@@ -1784,6 +2066,7 @@ pub fn read_bruker_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
         axis_y,
         data,
         nus_mask,
+        truncated_traces,
     })
 }
 
@@ -1859,7 +2142,16 @@ fn accumulate_bruker_3d_point<F>(
 
 /// Read a Bruker 3D `ser` directory (`acqus`, `acqu2s`, `acqu3s`, and `ser`), automatically detecting uniform vs NUS.
 pub fn read_bruker_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
+    read_bruker_fid_3d_opts(dir, false)
+}
+
+/// Read a Bruker 3D `ser` directory with explicit opt-in `allow_truncated_fid` zero-filling for halted acquisitions.
+pub fn read_bruker_fid_3d_opts(
+    dir: impl AsRef<Path>,
+    allow_truncated_fid: bool,
+) -> Result<Fid3D, String> {
     let dir = resolve_fid_dir(dir.as_ref())?;
+    verify_bruker_pulseprogram_containment(&dir)?;
     let acqus = read_merged_bruker_params(&dir, "acqus", "acqu")?;
     let acqu2s = read_merged_bruker_params(&dir, "acqu2s", "acqu2")?;
     let acqu3s = read_merged_bruker_params(&dir, "acqu3s", "acqu3")?;
@@ -1878,13 +2170,22 @@ pub fn read_bruker_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
 
     let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
 
-    let aqseq: i32 = acqus.get("AQSEQ").and_then(|v| v.parse().ok()).unwrap_or(0);
-    if !matches!(aqseq, 0 | 1) {
+    let pulprog_interp = interpret_bruker_dir_checked(&dir)?;
+    let header_aqseq: i32 = match acqus.get("AQSEQ") {
+        Some(v) => v.trim().parse::<i32>().unwrap_or(-1),
+        None => 0,
+    };
+    if !matches!(header_aqseq, 0 | 1) {
         return Err(format!(
-            "unsupported Bruker 3D AQSEQ={aqseq} in {} (expected 0 for 3-2-1 or 1 for 3-1-2)",
+            "unsupported Bruker 3D AQSEQ={header_aqseq} in {} (expected 0 for 3-2-1 or 1 for 3-1-2)",
             dir.display()
         ));
     }
+    let aqseq: i32 = match pulprog_interp.as_ref().map(|pi| pi.aqseq) {
+        Some(crate::pulprog::AcquisitionOrder::Aqseq312) => 1,
+        Some(crate::pulprog::AcquisitionOrder::Aqseq321) => 0,
+        _ => header_aqseq,
+    };
 
     let ser_path = find_file_ci(&dir, "ser")
         .ok_or_else(|| format!("missing 3D ser binary file in {}", dir.display()))?;
@@ -1949,22 +2250,47 @@ pub fn read_bruker_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
         (td_acq_y, td_acq_z)
     };
 
-    let mut axis_y =
-        parse_bruker_indirect_axis(&acqus, &acqu2s, proc2s.as_ref(), "15N", Some(td_full_y))?;
-    let mut axis_z =
-        parse_bruker_indirect_axis(&acqus, &acqu3s, proc3s.as_ref(), "13C", Some(td_full_z))?;
+    let ind_phys_y = pulprog_interp
+        .as_ref()
+        .and_then(|pi| pi.indirect_dims.first());
+    let ind_phys_z = pulprog_interp
+        .as_ref()
+        .and_then(|pi| pi.indirect_dims.get(1));
+
+    let mut axis_y = parse_bruker_indirect_axis(
+        &acqus,
+        &acqu2s,
+        proc2s.as_ref(),
+        "15N",
+        Some(td_full_y),
+        ind_phys_y,
+    )?;
+    let mut axis_z = parse_bruker_indirect_axis(
+        &acqus,
+        &acqu3s,
+        proc3s.as_ref(),
+        "13C",
+        Some(td_full_z),
+        ind_phys_z,
+    )?;
     if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none()
         || proc3s.as_ref().and_then(|p| p.get("REVERSE")).is_none()
     {
-        let pp_txt = read_optional_bruker_pulseprogram(&dir);
+        let pp_txt = read_optional_bruker_pulseprogram(&dir)?;
         let pulprog = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
         if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
-            axis_y.stored_proc.reverse =
-                infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog, 2, axis_y.quad_mode);
+            axis_y.stored_proc.reverse = if let Some(ip) = ind_phys_y {
+                ip.reverse_frequency
+            } else {
+                infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog, 2, axis_y.quad_mode)
+            };
         }
         if proc3s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
-            axis_z.stored_proc.reverse =
-                infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog, 1, axis_z.quad_mode);
+            axis_z.stored_proc.reverse = if let Some(ip) = ind_phys_z {
+                ip.reverse_frequency
+            } else {
+                infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog, 1, axis_z.quad_mode)
+            };
         }
     }
 
@@ -1986,6 +2312,7 @@ pub fn read_bruker_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
     let trace_byte_len = n0 * 2 * word_bytes;
 
     let mut data = vec![[0.0, 0.0]; n2 * 2 * n1 * 2 * n0];
+    let mut truncated_traces: Option<(usize, usize)> = None;
     let mut z00_cos = vec![[0.0, 0.0]; n0];
     let mut z00_sin = vec![[0.0, 0.0]; n0];
     let mut z01_cos = vec![[0.0, 0.0]; n0];
@@ -2012,18 +2339,26 @@ pub fn read_bruker_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
                 coords.len()
             ));
         }
-        let stride = determine_bruker_ser_stride(
+        let (stride, observed) = determine_bruker_ser_stride_opts(
             bytes.len(),
             expected_acq_traces,
             axis_x.td_raw,
             word_bytes,
             false,
+            allow_truncated_fid,
             &dir,
         )?;
+        if observed < expected_acq_traces {
+            truncated_traces = Some((observed, expected_acq_traces));
+            warn_truncated_fid(&dir, observed, expected_acq_traces);
+        }
         let mut counts = vec![0usize; n2 * n1];
 
         for (row_idx, &(k1, k2)) in coords.iter().enumerate() {
             let row_base = row_idx * traces_per_row;
+            if row_base >= observed {
+                break;
+            }
             let fetch_sub = |iy_sub: usize, iz_sub: usize| -> Vec<Complex64> {
                 let sub_idx = if aqseq == 0 {
                     // F2 (`iy_sub`) is inner / fastest, F1 (`iz_sub`) is outer / slowest
@@ -2032,7 +2367,11 @@ pub fn read_bruker_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
                     // F1 (`iz_sub`) is inner / fastest, F2 (`iy_sub`) is outer / slowest
                     iy_sub * q2_mult + iz_sub
                 };
-                let off = (row_base + sub_idx) * stride;
+                let tidx = row_base + sub_idx;
+                if tidx >= observed {
+                    return vec![[0.0, 0.0]; n0];
+                }
+                let off = tidx * stride;
                 decode_bruker_trace(&bytes[off..off + trace_byte_len], n0 * 2, big_endian, dtypa)
             };
             accumulate_bruker_3d_point(
@@ -2068,16 +2407,29 @@ pub fn read_bruker_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
         }
         Some(counts.into_iter().map(|c| c > 0).collect())
     } else {
-        let stride = determine_bruker_ser_stride(
+        let (stride, observed) = determine_bruker_ser_stride_opts(
             bytes.len(),
             total_acq_param,
             axis_x.td_raw,
             word_bytes,
             true,
+            allow_truncated_fid,
             &dir,
         )?;
+        if observed < total_acq_param {
+            truncated_traces = Some((observed, total_acq_param));
+            warn_truncated_fid(&dir, observed, total_acq_param);
+        }
         for k2 in 0..n2 {
             for k1 in 0..n1 {
+                let min_tidx = if aqseq == 0 {
+                    (k2 * q2_mult) * td_full_y + (k1 * q1_mult)
+                } else {
+                    (k1 * q1_mult) * td_full_z + (k2 * q2_mult)
+                };
+                if min_tidx >= observed {
+                    continue;
+                }
                 let fetch_sub = |iy_sub: usize, iz_sub: usize| -> Vec<Complex64> {
                     let iy = k1 * q1_mult + iy_sub;
                     let iz = k2 * q2_mult + iz_sub;
@@ -2086,6 +2438,9 @@ pub fn read_bruker_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
                     } else {
                         iy * td_full_z + iz
                     };
+                    if tidx >= observed {
+                        return vec![[0.0, 0.0]; n0];
+                    }
                     let off = tidx * stride;
                     decode_bruker_trace(
                         &bytes[off..off + trace_byte_len],
@@ -2131,7 +2486,149 @@ pub fn read_bruker_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
         axis_z,
         data,
         nus_mask,
+        truncated_traces,
     })
+}
+
+/// De-interleave a Bruker pseudo-3D relaxation / titration / CEST `ser` directory
+/// (e.g. `hsqct1etf3gpsi3d`, `hsqct2etf3gpsi3d`) into an ordered `Vec<Fid2D>` of 2D planes,
+/// honoring symbolic `pulprog` `PlaneQueued` vs `T1Interleaved` storage order!
+pub fn read_bruker_pseudo3d_planes_2d(
+    dir: impl AsRef<Path>,
+) -> Result<(Vec<Fid2D>, crate::pulprog::Pseudo3DStorageOrder), String> {
+    let dir = resolve_fid_dir(dir.as_ref())?;
+    verify_bruker_pulseprogram_containment(&dir)?;
+    let acqus = read_merged_bruker_params(&dir, "acqus", "acqu")?;
+    let acqu2s = read_merged_bruker_params(&dir, "acqu2s", "acqu2")?;
+    let acqu3s = read_merged_bruker_params(&dir, "acqu3s", "acqu3")?;
+    let procs = read_optional_bruker_proc(&dir, "procs");
+    let proc2s = read_optional_bruker_proc(&dir, "proc2s");
+    let proc3s = read_optional_bruker_proc(&dir, "proc3s");
+
+    let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
+    let pulprog_interp = crate::pulprog::interpret_bruker_dir(&dir).map_err(|e| {
+        format!(
+            "failed to interpret Bruker pseudo-3D pulseprogram in {}: {e}",
+            dir.display()
+        )
+    })?;
+    let storage_order = match pulprog_interp.pseudo_3d_order {
+        crate::pulprog::Pseudo3DStorageOrder::NotPseudo3D => {
+            crate::pulprog::Pseudo3DStorageOrder::PlaneQueued
+        }
+        other => other,
+    };
+
+    let ind_y = pulprog_interp.indirect_dims.first();
+    let ind_z = pulprog_interp.indirect_dims.get(1);
+    let mut axis_2 =
+        parse_bruker_indirect_axis(&acqus, &acqu2s, proc2s.as_ref(), "15N", None, ind_y)?;
+    let mut axis_3 =
+        parse_bruker_indirect_axis(&acqus, &acqu3s, proc3s.as_ref(), "15N", None, ind_z)?;
+    if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
+        if let Some(ip) = ind_y {
+            axis_2.stored_proc.reverse = ip.reverse_frequency;
+        }
+    }
+    if proc3s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
+        if let Some(ip) = ind_z {
+            axis_3.stored_proc.reverse = ip.reverse_frequency;
+        }
+    }
+
+    let inner_is_qf = axis_2.quad_mode == QuadMode::Qf && axis_3.quad_mode != QuadMode::Qf;
+    let outer_is_qf = axis_3.quad_mode == QuadMode::Qf && axis_2.quad_mode != QuadMode::Qf;
+    if !inner_is_qf && !outer_is_qf {
+        return Err(format!(
+            "Bruker directory {} is not a 1-QF + 1-hypercomplex pseudo-3D dataset (F2={:?}, F1={:?})",
+            dir.display(),
+            axis_2.quad_mode,
+            axis_3.quad_mode
+        ));
+    }
+
+    let (axis_t1, n_planes) = if inner_is_qf {
+        (axis_3, axis_2.td_raw.max(1))
+    } else {
+        (axis_2, axis_3.td_raw.max(1))
+    };
+
+    let n0 = axis_x.complex_points;
+    let n_t1 = axis_t1.complex_points;
+    let q_mult = 2usize;
+    let total_traces = n_planes * n_t1 * q_mult;
+
+    let ser_path = find_file_ci(&dir, "ser")
+        .ok_or_else(|| format!("missing pseudo-3D ser binary file in {}", dir.display()))?;
+    let bytes =
+        fs::read(&ser_path).map_err(|e| format!("failed to read {}: {e}", ser_path.display()))?;
+    let word_bytes = if dtypa == 2 { 8 } else { 4 };
+    let stride = determine_bruker_ser_stride(
+        bytes.len(),
+        total_traces,
+        axis_x.td_raw,
+        word_bytes,
+        true,
+        &dir,
+    )?;
+    let big_endian = bytorda != 0;
+    let trace_byte_len = n0 * 2 * word_bytes;
+    let pulse_program = acqus.get("PULPROG").cloned().unwrap_or_default();
+    let base_name = dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("pseudo3d")
+        .to_string();
+
+    let list_inner_to_quad = pulprog_interp
+        .pseudo_3d_list_inner_to_quad
+        .unwrap_or(inner_is_qf);
+    let mut planes = Vec::with_capacity(n_planes);
+    for p in 0..n_planes {
+        let mut plane_data = vec![[0.0, 0.0]; n_t1 * 2 * n0];
+        for k1 in 0..n_t1 {
+            let (t0_idx, t1_idx) = match (storage_order, list_inner_to_quad) {
+                (crate::pulprog::Pseudo3DStorageOrder::T1Interleaved, true) => (
+                    (k1 * q_mult) * n_planes + p,
+                    (k1 * q_mult + 1) * n_planes + p,
+                ),
+                (crate::pulprog::Pseudo3DStorageOrder::T1Interleaved, false) => (
+                    (k1 * n_planes + p) * q_mult,
+                    (k1 * n_planes + p) * q_mult + 1,
+                ),
+                _ => ((p * n_t1 + k1) * q_mult, (p * n_t1 + k1) * q_mult + 1),
+            };
+            let off0 = t0_idx * stride;
+            let off1 = t1_idx * stride;
+            let z0 = decode_bruker_trace(
+                &bytes[off0..off0 + trace_byte_len],
+                n0 * 2,
+                big_endian,
+                dtypa,
+            );
+            let z1 = decode_bruker_trace(
+                &bytes[off1..off1 + trace_byte_len],
+                n0 * 2,
+                big_endian,
+                dtypa,
+            );
+            let (cos_slice, sin_slice) =
+                plane_data[(k1 * 2) * n0..(k1 * 2 + 2) * n0].split_at_mut(n0);
+            recombine_quad_pair(axis_t1.quad_mode, k1, &z0, &z1, cos_slice, sin_slice);
+        }
+        planes.push(Fid2D {
+            name: format!("{base_name}_plane{p}"),
+            vendor: FidVendor::Bruker,
+            pulse_program: pulse_program.clone(),
+            axis_x: axis_x.clone(),
+            axis_y: axis_t1.clone(),
+            data: plane_data,
+            nus_mask: None,
+            truncated_traces: None,
+        });
+    }
+
+    Ok((planes, storage_order))
 }
 
 // ============================================================================
@@ -2199,8 +2696,13 @@ fn parse_procpar_str(text: &str) -> Result<HashMap<String, ProcparVal>, String> 
                 .split_once(char::is_whitespace)
                 .unwrap_or((first_val_line, ""));
             let count: usize = count_str.parse().unwrap_or(1);
-            let mut strs = Vec::with_capacity(count);
-            if !rem.trim().is_empty() {
+            if count > MAX_FID_PROCPAR_VALUES {
+                return Err(format!(
+                    "Varian procpar parameter '{name}' value count ({count}) exceeds limit ({MAX_FID_PROCPAR_VALUES})"
+                ));
+            }
+            let mut strs = Vec::with_capacity(count.min(1024));
+            if !rem.trim().is_empty() && count > 0 {
                 strs.push(unquote_procpar(rem.trim()));
             }
             while strs.len() < count && idx < lines.len() {
@@ -2211,12 +2713,21 @@ fn parse_procpar_str(text: &str) -> Result<HashMap<String, ProcparVal>, String> 
             map.insert(name, ProcparVal::Strings(strs));
         } else {
             // Real/integer array (`basictype == 1` or `0`): `<count> v1 v2 ...` possibly wrapping lines
-            let mut nums_raw = Vec::new();
             let first_tokens: Vec<&str> = lines[idx].split_whitespace().collect();
             idx += 1;
+            let mut nums_raw = Vec::new();
             if let Some(cnt_tok) = first_tokens.first() {
                 let count: usize = cnt_tok.parse().unwrap_or(0);
+                if count > MAX_FID_PROCPAR_VALUES {
+                    return Err(format!(
+                        "Varian procpar parameter '{name}' value count ({count}) exceeds limit ({MAX_FID_PROCPAR_VALUES})"
+                    ));
+                }
+                nums_raw.reserve(count.min(1024));
                 for &t in &first_tokens[1..] {
+                    if nums_raw.len() >= count {
+                        break;
+                    }
                     if let Ok(v) = t.parse::<f64>() {
                         nums_raw.push(v);
                     }
@@ -2228,6 +2739,9 @@ fn parse_procpar_str(text: &str) -> Result<HashMap<String, ProcparVal>, String> 
                         break;
                     }
                     for &t in &more {
+                        if nums_raw.len() >= count {
+                            break;
+                        }
                         if let Ok(v) = t.parse::<f64>() {
                             nums_raw.push(v);
                         }
@@ -2268,7 +2782,10 @@ struct VarianBinaryFid {
     traces: Vec<Vec<Complex64>>,
 }
 
-fn read_varian_fid_binary(path: &Path) -> Result<VarianBinaryFid, String> {
+fn read_varian_fid_binary(
+    path: &Path,
+    allow_truncated_fid: bool,
+) -> Result<VarianBinaryFid, String> {
     let bytes =
         fs::read(path).map_err(|e| format!("failed to read Varian fid {}: {e}", path.display()))?;
     if bytes.len() < 32 {
@@ -2303,7 +2820,7 @@ fn read_varian_fid_binary(path: &Path) -> Result<VarianBinaryFid, String> {
         return Err(format!("invalid Varian np={np} in {}", path.display()));
     }
     let total_needed = 32 + nblocks * bbytes;
-    if bytes.len() < total_needed {
+    if bytes.len() < total_needed && (!allow_truncated_fid || bbytes == 0) {
         return Err(format!(
             "Varian fid {} truncated: header declares {total_needed} B ({nblocks} blocks x {bbytes} B), got {} B",
             path.display(),
@@ -2312,10 +2829,20 @@ fn read_varian_fid_binary(path: &Path) -> Result<VarianBinaryFid, String> {
     }
 
     let n_cplx = np / 2;
-    let mut traces = Vec::with_capacity(nblocks * ntraces);
     let hdr_bytes_per_block = nbheaders * 28;
+    let trace_bytes = np * ebytes;
+    let blocks_in_file = if bytes.len() >= total_needed {
+        nblocks
+    } else {
+        // Include any final partially written block that still holds >= 1 complete trace
+        let full = bytes.len().saturating_sub(32) / bbytes;
+        let rem = bytes.len().saturating_sub(32) % bbytes;
+        (full + usize::from(trace_bytes > 0 && rem >= hdr_bytes_per_block + trace_bytes))
+            .min(nblocks)
+    };
+    let mut traces = Vec::with_capacity(blocks_in_file * ntraces);
 
-    for b in 0..nblocks {
+    for b in 0..blocks_in_file {
         let b_off = 32 + b * bbytes;
         let blk_status = if nbheaders >= 1 && b_off + 4 <= bytes.len() {
             u16::from_be_bytes(bytes[b_off + 2..b_off + 4].try_into().unwrap())
@@ -2327,7 +2854,10 @@ fn read_varian_fid_binary(path: &Path) -> Result<VarianBinaryFid, String> {
 
         let data_start = b_off + hdr_bytes_per_block;
         for tr in 0..ntraces {
-            let t_off = data_start + tr * np * ebytes;
+            let t_off = data_start + tr * trace_bytes;
+            if t_off + trace_bytes > bytes.len() {
+                break;
+            }
             let mut cvec = Vec::with_capacity(n_cplx);
             if is_float && ebytes == 4 {
                 for k in 0..n_cplx {
@@ -2358,6 +2888,14 @@ fn read_varian_fid_binary(path: &Path) -> Result<VarianBinaryFid, String> {
             }
             traces.push(cvec);
         }
+    }
+
+    if bytes.len() < total_needed && traces.is_empty() {
+        return Err(format!(
+            "Varian fid {} truncated before completing 1 trace: header declares {total_needed} B, got {} B",
+            path.display(),
+            bytes.len()
+        ));
     }
 
     Ok(VarianBinaryFid { np, traces })
@@ -2622,11 +3160,11 @@ fn varian_fcoef_conjugate_for_fft(fcoef: Option<[f64; 8]>) -> bool {
     }
 }
 
-fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
+#[allow(clippy::too_many_lines)]
+fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<RawFid, String> {
     let procpar_path = find_file_ci(dir, "procpar")
         .ok_or_else(|| format!("missing Varian procpar in {}", dir.display()))?;
-    let procpar_txt = fs::read_to_string(&procpar_path)
-        .map_err(|e| format!("failed to read {}: {e}", procpar_path.display()))?;
+    let procpar_txt = read_text_lossy_capped(&procpar_path)?;
     let pp = parse_procpar_str(&procpar_txt)?;
 
     // When a Varian/Kay post-acquisition preprocessor (`mungefid` / `r2s` / `se_sort`) recombines
@@ -2641,7 +3179,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
         })
         .or_else(|| find_file_ci(dir, "fid"))
         .ok_or_else(|| format!("missing Varian fid binary in {}", dir.display()))?;
-    let bin = read_varian_fid_binary(&fid_path)?;
+    let bin = read_varian_fid_binary(&fid_path, allow_truncated_fid)?;
 
     let sfrq = pp
         .get("sfrq")
@@ -2695,6 +3233,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
             reverse: false,
             bc_mod: None,
             bcfw_ppm: None,
+            pulprog_p1_deg: None,
         },
     };
 
@@ -2831,6 +3370,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
             reverse: false,
             bc_mod: None,
             bcfw_ppm: None,
+            pulprog_p1_deg: None,
         },
     };
 
@@ -2841,6 +3381,8 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
         let is_nus = explicit_nus || (sched_file.is_some() && bin.traces.len() < uniform_traces);
 
         let mut data = vec![[0.0, 0.0]; ni * 2 * n0];
+        let zero_trace = vec![[0.0, 0.0]; n0];
+        let mut truncated_traces: Option<(usize, usize)> = None;
         let nus_mask = if is_nus {
             let sched_path = sched_file.ok_or_else(|| {
                 format!(
@@ -2851,31 +3393,43 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
             let coords = parse_nus_schedule_1d(&sched_path, ni)?;
             let expected_acq = coords.len() * p1_mult;
             if bin.traces.len() != expected_acq {
-                return Err(format!(
-                    "Varian 2D NUS trace count mismatch in {}: fid has {} traces, but schedule {} has {} points ({expected_acq} traces)",
-                    dir.display(),
-                    bin.traces.len(),
-                    sched_path.display(),
-                    coords.len()
-                ));
+                if allow_truncated_fid && !bin.traces.is_empty() && bin.traces.len() < expected_acq
+                {
+                    warn_truncated_fid(dir, bin.traces.len(), expected_acq);
+                    truncated_traces = Some((bin.traces.len(), expected_acq));
+                } else {
+                    return Err(format!(
+                        "Varian 2D NUS trace count mismatch in {}: fid has {} traces, but schedule {} has {} points ({expected_acq} traces)",
+                        dir.display(),
+                        bin.traces.len(),
+                        sched_path.display(),
+                        coords.len()
+                    ));
+                }
             }
             let mut counts = vec![0usize; ni];
             let mut tmp_cos = vec![[0.0, 0.0]; n0];
             let mut tmp_sin = vec![[0.0, 0.0]; n0];
             for (row_idx, &k1) in coords.iter().enumerate() {
                 if qm1 == QuadMode::Qf {
+                    if row_idx >= bin.traces.len() {
+                        break;
+                    }
                     add_complex_slice(
                         &mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0],
                         &bin.traces[row_idx],
                     );
                 } else {
-                    apply_varian_fcoef_pair(
-                        coef1,
-                        &bin.traces[2 * row_idx],
-                        &bin.traces[2 * row_idx + 1],
-                        &mut tmp_cos,
-                        &mut tmp_sin,
-                    );
+                    if 2 * row_idx >= bin.traces.len() {
+                        break;
+                    }
+                    let t0 = &bin.traces[2 * row_idx];
+                    let t1 = bin
+                        .traces
+                        .get(2 * row_idx + 1)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&zero_trace);
+                    apply_varian_fcoef_pair(coef1, t0, t1, &mut tmp_cos, &mut tmp_sin);
                     add_complex_slice(&mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0], &tmp_cos);
                     add_complex_slice(&mut data[(k1 * 2 + 1) * n0..(k1 * 2 + 2) * n0], &tmp_sin);
                 }
@@ -2906,26 +3460,33 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
                 }
             }
             if bin.traces.len() < uniform_traces {
-                return Err(format!(
-                    "Varian 2D fid in {} has {} traces, expected {uniform_traces} (missing sampling.sch for NUS or incomplete run)",
-                    dir.display(),
-                    bin.traces.len()
-                ));
+                if !allow_truncated_fid || bin.traces.is_empty() {
+                    return Err(format!(
+                        "Varian 2D fid in {} has {} traces, expected {uniform_traces} (missing sampling.sch for NUS or incomplete run)",
+                        dir.display(),
+                        bin.traces.len()
+                    ));
+                }
+                warn_truncated_fid(dir, bin.traces.len(), uniform_traces);
+                truncated_traces = Some((bin.traces.len(), uniform_traces));
             }
             if qm1 == QuadMode::Qf {
-                for k1 in 0..ni {
+                for k1 in 0..ni.min(bin.traces.len()) {
                     data[(k1 * 2) * n0..(k1 * 2 + 1) * n0].copy_from_slice(&bin.traces[k1]);
                 }
             } else {
                 for k1 in 0..ni {
+                    if 2 * k1 >= bin.traces.len() {
+                        break;
+                    }
+                    let t0 = &bin.traces[2 * k1];
+                    let t1 = bin
+                        .traces
+                        .get(2 * k1 + 1)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&zero_trace);
                     let (cos_s, sin_s) = data[(k1 * 2) * n0..(k1 * 2 + 2) * n0].split_at_mut(n0);
-                    apply_varian_fcoef_pair(
-                        coef1,
-                        &bin.traces[2 * k1],
-                        &bin.traces[2 * k1 + 1],
-                        cos_s,
-                        sin_s,
-                    );
+                    apply_varian_fcoef_pair(coef1, t0, t1, cos_s, sin_s);
                 }
             }
             None
@@ -2939,6 +3500,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
             axis_y,
             data,
             nus_mask,
+            truncated_traces,
         }));
     }
 
@@ -2986,6 +3548,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
             reverse: false,
             bc_mod: None,
             bcfw_ppm: None,
+            pulprog_p1_deg: None,
         },
     };
 
@@ -3011,6 +3574,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
     let is_nus = explicit_nus || (sched_file.is_some() && bin.traces.len() < uniform_traces);
 
     let mut data = vec![[0.0, 0.0]; ni2 * 2 * ni * 2 * n0];
+    let zero_trace = vec![[0.0, 0.0]; n0];
     let mut y_e_cos = vec![[0.0, 0.0]; n0];
     let mut y_e_sin = vec![[0.0, 0.0]; n0];
     let mut y_o_cos = vec![[0.0, 0.0]; n0];
@@ -3018,6 +3582,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
     let mut z_cos = vec![[0.0, 0.0]; n0];
     let mut z_sin = vec![[0.0, 0.0]; n0];
     let traces_per_point = p1_mult * p2_mult;
+    let mut truncated_traces: Option<(usize, usize)> = None;
 
     let nus_mask = if is_nus {
         let sched_path = sched_file.ok_or_else(|| {
@@ -3029,24 +3594,35 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
         let coords = parse_nus_schedule_2d(&sched_path, ni, ni2, true)?;
         let expected_acq = coords.len() * traces_per_point;
         if bin.traces.len() != expected_acq {
-            return Err(format!(
-                "Varian 3D NUS trace count mismatch in {}: fid has {} traces, but schedule {} has {} points ({expected_acq} traces)",
-                dir.display(),
-                bin.traces.len(),
-                sched_path.display(),
-                coords.len()
-            ));
+            if allow_truncated_fid && !bin.traces.is_empty() && bin.traces.len() < expected_acq {
+                warn_truncated_fid(dir, bin.traces.len(), expected_acq);
+                truncated_traces = Some((bin.traces.len(), expected_acq));
+            } else {
+                return Err(format!(
+                    "Varian 3D NUS trace count mismatch in {}: fid has {} traces, but schedule {} has {} points ({expected_acq} traces)",
+                    dir.display(),
+                    bin.traces.len(),
+                    sched_path.display(),
+                    coords.len()
+                ));
+            }
         }
         let mut counts = vec![0usize; ni2 * ni];
         for (row_idx, &(k1, k2)) in coords.iter().enumerate() {
             let base_tr = row_idx * traces_per_point;
+            if base_tr >= bin.traces.len() {
+                break;
+            }
             let fetch_sub = |p1: usize, p2: usize| -> &[Complex64] {
                 let inner = if phase2_fastest {
                     p1 * p2_mult + p2
                 } else {
                     p2 * p1_mult + p1
                 };
-                &bin.traces[base_tr + inner]
+                bin.traces
+                    .get(base_tr + inner)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&zero_trace)
             };
             accumulate_varian_3d_point(
                 qm1,
@@ -3095,23 +3671,33 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
             }
         }
         if bin.traces.len() < uniform_traces {
-            return Err(format!(
-                "Varian 3D fid in {} has {} traces, expected {uniform_traces} (missing sampling.sch for NUS or incomplete run)",
-                dir.display(),
-                bin.traces.len()
-            ));
+            if !allow_truncated_fid || bin.traces.is_empty() {
+                return Err(format!(
+                    "Varian 3D fid in {} has {} traces, expected {uniform_traces} (missing sampling.sch for NUS or incomplete run)",
+                    dir.display(),
+                    bin.traces.len()
+                ));
+            }
+            warn_truncated_fid(dir, bin.traces.len(), uniform_traces);
+            truncated_traces = Some((bin.traces.len(), uniform_traces));
         }
 
-        for k2 in 0..ni2 {
+        'outer_3d: for k2 in 0..ni2 {
             for k1 in 0..ni {
                 let base_tr = (k2 * ni + k1) * traces_per_point;
+                if base_tr >= bin.traces.len() {
+                    break 'outer_3d;
+                }
                 let fetch_sub = |p1: usize, p2: usize| -> &[Complex64] {
                     let inner = if phase2_fastest {
                         p1 * p2_mult + p2
                     } else {
                         p2 * p1_mult + p1
                     };
-                    &bin.traces[base_tr + inner]
+                    bin.traces
+                        .get(base_tr + inner)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&zero_trace)
                 };
                 accumulate_varian_3d_point(
                     qm1,
@@ -3145,5 +3731,6 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
         axis_z,
         data,
         nus_mask,
+        truncated_traces,
     }))
 }

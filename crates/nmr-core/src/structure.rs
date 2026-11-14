@@ -21,7 +21,7 @@
 //! - Lovell, S. C. et al. (2003). "Structure validation by Calpha geometry: phi, psi and Cbeta
 //!   deviation." *Proteins* 50(3), 437-450 (Ramachandran favored/allowed basins).
 
-use std::f64::consts::PI;
+use std::f64::consts::{FRAC_2_PI, FRAC_PI_2, FRAC_PI_6, LOG2_E, PI, SQRT_2, TAU};
 use std::fs;
 use std::path::Path;
 
@@ -38,12 +38,392 @@ use crate::noesy::{
 use crate::peaks::Peak;
 use crate::rng::Rng;
 
-// Engh & Huber (1991) standard covalent backbone bond lengths (Angstroms) and interior angles (degrees)
+// Cross-platform IEEE-754 elementary math helpers (Cody & Waite, Software Manual for the
+// Elementary Functions, Prentice-Hall 1980) implemented strictly with IEEE-754 `+`, `-`, `*`,
+// `/`, and `sqrt` (no OS `libm` calls) so torsion kinematics, Ramachandran/NOE energies, and
+// Langevin simulated annealing trajectories are bit-identical across `x86_64` and `aarch64`.
+const DET_ROUND_MAGIC: f64 = 6_755_399_441_055_744.0; // 3 * 2^51 (0x4338_0000_0000_0000)
+const DET_PIO2_HI: f64 = f64::from_bits(0x3ff9_21fb_5400_0000);
+const DET_PIO2_MID: f64 = f64::from_bits(0x3e11_0b46_1100_0000);
+const DET_PIO2_LO: f64 = 2.318_462_794_050_741_4e-18;
+const DET_LN2_HI: f64 = f64::from_bits(0x3fe6_2e42_fe00_0000);
+const DET_LN2_LO: f64 = 16_398_831.0 / 9_007_199_254_740_992.0 + 2.319_046_813_846_299_6e-17;
+const DET_SQRT_3: f64 = 1.732_050_807_568_877_2;
+const DET_TAN_PI_12: f64 = 0.267_949_192_431_122_7;
+
+#[inline]
+pub(crate) fn det_sin_cos(x: f64) -> (f64, f64) {
+    if !x.is_finite() {
+        return (f64::NAN, f64::NAN);
+    }
+    let y = x * FRAC_2_PI;
+    let kf = if y.abs() < 3.355_443_2e7 {
+        (y + DET_ROUND_MAGIC) - DET_ROUND_MAGIC
+    } else {
+        let mut t = y.rem_euclid(4.0);
+        if t >= 2.0 {
+            t -= 4.0;
+        }
+        return det_sin_cos(t * FRAC_PI_2);
+    };
+    let q = (kf as i64) & 3;
+    let r = ((x - kf * DET_PIO2_HI) - kf * DET_PIO2_MID) - kf * DET_PIO2_LO;
+    let r2 = r * r;
+
+    let mut s_acc = -1.0 / 1_307_674_368_000.0;
+    for &c in &[
+        1.0 / 6_227_020_800.0,
+        -1.0 / 39_916_800.0,
+        1.0 / 362_880.0,
+        -1.0 / 5_040.0,
+        1.0 / 120.0,
+        -1.0 / 6.0,
+        1.0,
+    ] {
+        s_acc = c + r2 * s_acc;
+    }
+    let sin_r = r * s_acc;
+
+    let mut c_acc = 1.0 / 20_922_789_888_000.0;
+    for &c in &[
+        -1.0 / 87_178_291_200.0,
+        1.0 / 479_001_600.0,
+        -1.0 / 3_628_800.0,
+        1.0 / 40_320.0,
+        -1.0 / 720.0,
+        1.0 / 24.0,
+        -0.5,
+        1.0,
+    ] {
+        c_acc = c + r2 * c_acc;
+    }
+    let cos_r = c_acc;
+
+    match q {
+        0 => (sin_r, cos_r),
+        1 => (cos_r, -sin_r),
+        2 => (-sin_r, -cos_r),
+        _ => (-cos_r, sin_r),
+    }
+}
+
+#[inline]
+pub(crate) fn det_sin(x: f64) -> f64 {
+    det_sin_cos(x).0
+}
+
+#[inline]
+pub(crate) fn det_cos(x: f64) -> f64 {
+    det_sin_cos(x).1
+}
+
+#[inline]
+pub(crate) fn det_exp(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x >= 709.782_712_893_384 {
+        return f64::INFINITY;
+    }
+    if x <= -708.396_418_532_264_1 {
+        return 0.0;
+    }
+    let kf = (x * LOG2_E + DET_ROUND_MAGIC) - DET_ROUND_MAGIC;
+    let k = kf as i64;
+    let r = (x - kf * DET_LN2_HI) - kf * DET_LN2_LO;
+
+    let mut p = 1.0 / 6_227_020_800.0;
+    for &c in &[
+        1.0 / 479_001_600.0,
+        1.0 / 39_916_800.0,
+        1.0 / 3_628_800.0,
+        1.0 / 362_880.0,
+        1.0 / 40_320.0,
+        1.0 / 5_040.0,
+        1.0 / 720.0,
+        1.0 / 120.0,
+        1.0 / 24.0,
+        1.0 / 6.0,
+        0.5,
+        1.0,
+        1.0,
+    ] {
+        p = c + r * p;
+    }
+
+    let k1 = k / 2;
+    let k2 = k - k1;
+    let s1 = f64::from_bits(((1023 + k1) as u64) << 52);
+    let s2 = f64::from_bits(((1023 + k2) as u64) << 52);
+    (p * s1) * s2
+}
+
+#[inline]
+pub(crate) fn det_ln(mut x: f64) -> f64 {
+    if x < 0.0 || x.is_nan() {
+        return f64::NAN;
+    }
+    if x == 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if x == f64::INFINITY {
+        return f64::INFINITY;
+    }
+    let mut exp_adj = 0i64;
+    if x < f64::from_bits(0x0010_0000_0000_0000) {
+        x *= (1u64 << 54) as f64;
+        exp_adj = -54;
+    }
+    let bits = x.to_bits();
+    let mut e = ((bits >> 52) & 0x7ff) as i64 - 1023 + exp_adj;
+    let mut m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000);
+    if m > SQRT_2 {
+        m *= 0.5;
+        e += 1;
+    }
+    let s = (m - 1.0) / (m + 1.0);
+    let s2 = s * s;
+    let mut poly = 1.0 / 19.0;
+    for &c in &[
+        1.0 / 17.0,
+        1.0 / 15.0,
+        1.0 / 13.0,
+        1.0 / 11.0,
+        1.0 / 9.0,
+        1.0 / 7.0,
+        1.0 / 5.0,
+        1.0 / 3.0,
+        1.0,
+    ] {
+        poly = c + s2 * poly;
+    }
+    let ln_m = 2.0 * s * poly;
+    let ef = e as f64;
+    ef * DET_LN2_HI + (ln_m + ef * DET_LN2_LO)
+}
+
+#[inline]
+pub(crate) fn det_powf(base: f64, exp: f64) -> f64 {
+    if exp == 0.0 {
+        return 1.0;
+    }
+    if base.is_nan() || exp.is_nan() {
+        return f64::NAN;
+    }
+    if base == 0.0 {
+        return if exp > 0.0 { 0.0 } else { f64::INFINITY };
+    }
+    det_exp(exp * det_ln(base))
+}
+
+#[inline]
+pub(crate) fn det_cbrt(x: f64) -> f64 {
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
+    let sign = x.signum();
+    let mut ax = x.abs();
+    let mut exp_adj = 0i64;
+    if ax < f64::from_bits(0x0010_0000_0000_0000) {
+        ax *= (1u64 << 54) as f64;
+        exp_adj = -54;
+    }
+    let bits = ax.to_bits();
+    let e = ((bits >> 52) & 0x7ff) as i64 - 1023 + exp_adj;
+    let m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000);
+    let q = e.div_euclid(3);
+    let rem = e.rem_euclid(3);
+    let y = match rem {
+        0 => m,
+        1 => m * 2.0,
+        _ => m * 4.0,
+    };
+    let mut t = 0.69 + 0.19 * y;
+    for _ in 0..4 {
+        let t3 = t * t * t;
+        t *= (t3 + 2.0 * y) / (2.0 * t3 + y);
+    }
+    let scale = f64::from_bits(((1023 + q) as u64) << 52);
+    sign * (t * scale)
+}
+
+#[inline]
+fn det_atan_pos(mut a: f64) -> f64 {
+    let recip = if a > 1.0 {
+        a = 1.0 / a;
+        true
+    } else {
+        false
+    };
+    let shifted = if a > DET_TAN_PI_12 {
+        a = (a * DET_SQRT_3 - 1.0) / (a + DET_SQRT_3);
+        true
+    } else {
+        false
+    };
+    let a2 = a * a;
+    let mut p = -1.0 / 25.0;
+    for &c in &[
+        1.0 / 23.0,
+        -1.0 / 21.0,
+        1.0 / 19.0,
+        -1.0 / 17.0,
+        1.0 / 15.0,
+        -1.0 / 13.0,
+        1.0 / 11.0,
+        -1.0 / 9.0,
+        1.0 / 7.0,
+        -1.0 / 5.0,
+        1.0 / 3.0,
+        -1.0,
+    ] {
+        p = p * a2 + c;
+    }
+    let mut res = -a * p;
+    if shifted {
+        res += FRAC_PI_6;
+    }
+    if recip {
+        res = FRAC_PI_2 - res;
+    }
+    res
+}
+
+#[inline]
+pub(crate) fn det_atan2(y: f64, x: f64) -> f64 {
+    if y.is_nan() || x.is_nan() {
+        return f64::NAN;
+    }
+    if x == 0.0 {
+        return if y > 0.0 {
+            FRAC_PI_2
+        } else if y < 0.0 {
+            -FRAC_PI_2
+        } else {
+            0.0
+        };
+    }
+    if y == 0.0 {
+        return if x >= 0.0 { 0.0 } else { PI };
+    }
+    let base = det_atan_pos((y / x).abs());
+    match (x > 0.0, y > 0.0) {
+        (true, true) => base,
+        (true, false) => -base,
+        (false, true) => PI - base,
+        (false, false) => base - PI,
+    }
+}
+
+#[inline]
+pub(crate) fn det_acos(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    let c = x.clamp(-1.0, 1.0);
+    det_atan2(((1.0 - c) * (1.0 + c)).max(0.0).sqrt(), c)
+}
+
+/// Structure-engine wrapper around `Rng` whose Box-Muller normal variates use `det_ln` and
+/// `det_sin_cos` so Langevin trajectories are identical on `x86_64` and `aarch64` without
+/// altering `crate::rng::Rng` for other solvers.
+struct DetRng {
+    inner: Rng,
+    spare_normal: Option<f64>,
+}
+
+impl DetRng {
+    #[inline]
+    fn new(seed: u64) -> Self {
+        Self {
+            inner: Rng::new(seed),
+            spare_normal: None,
+        }
+    }
+
+    #[inline]
+    fn f64(&mut self) -> f64 {
+        self.inner.f64()
+    }
+
+    #[inline]
+    fn range_usize(&mut self, lo: usize, hi: usize) -> usize {
+        self.inner.range_usize(lo, hi)
+    }
+
+    #[inline]
+    fn normal(&mut self, mean: f64, sd: f64) -> f64 {
+        if let Some(z1) = self.spare_normal.take() {
+            return mean + sd * z1;
+        }
+        let u1 = self.f64().max(1e-300);
+        let u2 = self.f64();
+        let r = (-2.0 * det_ln(u1)).sqrt();
+        let theta = TAU * u2;
+        let (st, ct) = det_sin_cos(theta);
+        self.spare_normal = Some(r * st);
+        mean + sd * (r * ct)
+    }
+}
+
+static ACTIVE_STRUCTURE_JOBS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+std::thread_local! {
+    static IN_STRUCTURE_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct StructureJobGuard {
+    owned: bool,
+}
+
+impl StructureJobGuard {
+    #[inline]
+    fn acquire() -> Self {
+        let already = IN_STRUCTURE_JOB.with(|c| c.replace(true));
+        if !already {
+            ACTIVE_STRUCTURE_JOBS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        Self { owned: !already }
+    }
+}
+
+impl Drop for StructureJobGuard {
+    fn drop(&mut self) {
+        if self.owned {
+            ACTIVE_STRUCTURE_JOBS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            IN_STRUCTURE_JOB.with(|c| c.set(false));
+        }
+    }
+}
+
+#[inline]
+fn worker_thread_budget(n_tasks: usize) -> usize {
+    if n_tasks <= 1 {
+        return 1;
+    }
+    let _guard = StructureJobGuard::acquire();
+    let total_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let active = ACTIVE_STRUCTURE_JOBS
+        .load(std::sync::atomic::Ordering::Acquire)
+        .max(1);
+    (total_cores / active).max(1).min(n_tasks)
+}
+
+// Engh & Huber (1991) standard covalent backbone bond lengths (Angstroms) and interior angles (degrees).
+// Note on RDC dipolar scaling vs static polymer geometry (Ottiger & Bax, J. Am. Chem. Soc. 1998, 120, 12334-12341):
+// `BOND_N_H = 1.010 A` (`rdc::R_NH_GEOM_A`) and `BOND_CA_HA = 1.090 A` (`rdc::R_CAHA_GEOM_A`, used in
+// `noesy::reconstruct_ca_substituents` for chiral `HA` and `GLY` `HA2`/`HA3`) orient unit vectors `u`
+// (`||u|| = 1`), whereas vibrationally/librationally averaged `<r^-3>^(-1/3)` lengths `R_NH_EFF_A = 1.040 A`
+// and `R_CAHA_EFF_A = 1.105 A` enter exclusively via `DMAX_NH_HZ` and `DMAX_CAHA_HZ`.
 pub const BOND_N_CA: f64 = 1.458;
 pub const BOND_CA_C: f64 = 1.525;
 pub const BOND_C_N: f64 = 1.329;
 pub const BOND_C_O: f64 = 1.231;
 pub const BOND_N_H: f64 = 1.010;
+pub const BOND_CA_HA: f64 = 1.090;
 
 pub const ANGLE_C_N_CA_DEG: f64 = 121.7;
 pub const ANGLE_N_CA_C_DEG: f64 = 111.2;
@@ -79,8 +459,8 @@ pub fn nerf_place_atom(
     let ey = v_unit(perp);
     let ez = v_cross(ex, ey);
 
-    let (sin_th, cos_th) = angle_bcd_rad.sin_cos();
-    let (sin_ch, cos_ch) = torsion_abcd_rad.sin_cos();
+    let (sin_th, cos_th) = det_sin_cos(angle_bcd_rad);
+    let (sin_ch, cos_ch) = det_sin_cos(torsion_abcd_rad);
 
     let dx = -r_cd * cos_th;
     let dy = r_cd * sin_th * cos_ch;
@@ -161,8 +541,8 @@ pub fn build_backbone_from_torsions_rad(
         ANGLE_N_CA_C_DEG.to_radians()
     };
     let c_prev_virtual = [
-        -BOND_C_N * ang_c_n_ca.cos(),
-        BOND_C_N * ang_c_n_ca.sin(),
+        -BOND_C_N * det_cos(ang_c_n_ca),
+        BOND_C_N * det_sin(ang_c_n_ca),
         0.0,
     ];
     n_pos[0] = [0.0, 0.0, 0.0];
@@ -347,7 +727,7 @@ fn ramachandran_energy_and_grad(rc: ResClass, phi: f64, psi: f64) -> (f64, f64, 
         let inv_vp = 1.0 / (sp_d.to_radians().powi(2));
         let inv_vs = 1.0 / (ss_d.to_radians().powi(2));
 
-        let lg = amp.ln() - 0.5 * (dphi * dphi * inv_vp + dpsi * dpsi * inv_vs);
+        let lg = det_ln(amp) - 0.5 * (dphi * dphi * inv_vp + dpsi * dpsi * inv_vs);
         logs[bi] = lg;
         dlog_dphi[bi] = -dphi * inv_vp;
         dlog_dpsi[bi] = -dpsi * inv_vs;
@@ -356,18 +736,18 @@ fn ramachandran_energy_and_grad(rc: ResClass, phi: f64, psi: f64) -> (f64, f64, 
         }
     }
 
-    let mut sum_exp = (floor_log - max_log).exp();
+    let mut sum_exp = det_exp(floor_log - max_log);
     let mut num_phi = 0.0;
     let mut num_psi = 0.0;
 
     for bi in 0..basins.len() {
-        let w = (logs[bi] - max_log).exp();
+        let w = det_exp(logs[bi] - max_log);
         sum_exp += w;
         num_phi += w * dlog_dphi[bi];
         num_psi += w * dlog_dpsi[bi];
     }
 
-    let log_p = max_log + sum_exp.ln();
+    let log_p = max_log + det_ln(sum_exp);
     // Flat-bottom zero inside favored basin cores (-log_p <= 0.35) so alpha_R, beta, and PPII
     // carry zero relative energetic bias while strongly penalizing Ramachandran outliers!
     let raw_v = -log_p - 0.35;
@@ -450,6 +830,60 @@ pub fn evaluate_energy_and_gradients_with_rdcs_and_omega(
     w_rdc: f64,
     w_omega: f64,
     weights: &EnergyWeights,
+    grad_phi: &mut [f64],
+    grad_psi: &mut [f64],
+    grad_omega: Option<&mut [f64]>,
+) -> (PdbChain, EnergyBreakdown) {
+    evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+        sequence, seq_ids, phi_rad, psi_rad, omega_rad, adrs, dihedrals, rdc_media, w_rdc, w_omega,
+        0.0, weights, grad_phi, grad_psi, grad_omega,
+    )
+}
+
+/// Evaluate total conformational energy including multi-medium variable-projection harmonic RDCs,
+/// optional harmonic peptide-planarity `omega` restraint, and smooth Kabsch & Sander (*Biopolymers*
+/// 1983, 22, 2577-2637, Eq. 1) cooperative backbone `C'=O ... H^N-N` dipole-dipole electrostatics
+/// (`w_hbond`), computing exact `O(L)` analytical `(grad_phi, grad_psi, grad_omega)` gradients.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+    sequence: &[String],
+    seq_ids: &[i32],
+    phi_rad: &[f64],
+    psi_rad: &[f64],
+    omega_rad: &[f64],
+    adrs: &[AmbiguousDistanceRestraint],
+    dihedrals: &[DihedralRestraint],
+    rdc_media: &[crate::rdc::RdcMediumSet],
+    w_rdc: f64,
+    w_omega: f64,
+    w_hbond: f64,
+    weights: &EnergyWeights,
+    grad_phi: &mut [f64],
+    grad_psi: &mut [f64],
+    grad_omega: Option<&mut [f64]>,
+) -> (PdbChain, EnergyBreakdown) {
+    evaluate_energy_and_gradients_internal(
+        sequence, seq_ids, phi_rad, psi_rad, omega_rad, adrs, dihedrals, rdc_media, None, w_rdc,
+        w_omega, w_hbond, weights, None, grad_phi, grad_psi, grad_omega,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_energy_and_gradients_internal(
+    sequence: &[String],
+    seq_ids: &[i32],
+    phi_rad: &[f64],
+    psi_rad: &[f64],
+    omega_rad: &[f64],
+    adrs: &[AmbiguousDistanceRestraint],
+    dihedrals: &[DihedralRestraint],
+    rdc_media: &[crate::rdc::RdcMediumSet],
+    prepared_rdc: Option<&[crate::rdc::PreparedRdcWorkMedium]>,
+    w_rdc: f64,
+    w_omega: f64,
+    w_hbond: f64,
+    weights: &EnergyWeights,
+    plane_has_work: Option<&[bool]>,
     grad_phi: &mut [f64],
     grad_psi: &mut [f64],
     mut grad_omega: Option<&mut [f64]>,
@@ -573,7 +1007,7 @@ pub fn evaluate_energy_and_gradients_with_rdcs_and_omega(
                 if sum_inv_r6 <= 0.0 {
                     continue;
                 }
-                let d_eff = 1.0 / sum_inv_r6.cbrt().sqrt();
+                let d_eff = 1.0 / det_cbrt(sum_inv_r6).sqrt();
 
                 let (v_e, dv_ddeff) = if d_eff < adr.lower_bound {
                     let u = adr.lower_bound - d_eff;
@@ -755,7 +1189,7 @@ pub fn evaluate_energy_and_gradients_with_rdcs_and_omega(
         }
         rg2 /= lf;
 
-        let rg_target = 2.20 * lf.powf(0.38) + 1.5;
+        let rg_target = 2.20 * det_powf(lf, 0.38) + 1.5;
         let rg_max2 = rg_target * rg_target;
         if rg2 > rg_max2 {
             let ex = rg2 - rg_max2;
@@ -768,14 +1202,107 @@ pub fn evaluate_energy_and_gradients_with_rdcs_and_omega(
         }
     }
 
-    // 3b. Multi-medium harmonic RDC potential (variable-projection SVD on working `!is_free` subset)
-    if w_rdc > 0.0 && !rdc_media.is_empty() {
-        breakdown.rdc = crate::rdc::accumulate_rdc_energy_and_forces(
-            &chain,
-            rdc_media,
-            w_rdc,
-            &mut add_atom_grad,
-        );
+    // 3b. Kabsch & Sander (Biopolymers 1983, 22, 2577-2637, Eq. 1) smooth 4-site backbone
+    //     C'=O ... H^N-N dipole-dipole electrostatics (`|i - j| >= 3`), locking cooperative
+    //     alpha-helical and beta-sheet peptide-plane orientations without H-bond tables.
+    if w_hbond > 0.0 && l >= 4 {
+        const KS_KAPPA: f64 = 27.888; // 332 * 0.42 * 0.20 kcal/mol * A
+        const KS_EPS2: f64 = 0.20;
+        const U0_ON: f64 = 3.5 * 3.5;
+        const U1_ON: f64 = 5.2 * 5.2;
+        const INV_DU_ON: f64 = 1.0 / (U1_ON - U0_ON);
+        const CA_CULL2: f64 = 9.5 * 9.5; // Exact triangle-inequality upper bound for ||O_i - N_j|| < 5.2 A
+
+        for i in 0..(l - 1) {
+            let ri = &chain.residues[i];
+            for j in 1..l {
+                if i.abs_diff(j) < 3 {
+                    continue;
+                }
+                let rj = &chain.residues[j];
+                let Some(hj) = rj.h else {
+                    continue;
+                };
+                if v_dist_sq(ri.ca, rj.ca) >= CA_CULL2 {
+                    continue;
+                }
+                let d_on = v_sub(ri.o, rj.n);
+                let u_on = v_dot(d_on, d_on);
+                if u_on >= U1_ON {
+                    continue;
+                }
+                let (s_sw, ds_du) = if u_on <= U0_ON {
+                    (1.0, 0.0)
+                } else {
+                    let t = (u_on - U0_ON) * INV_DU_ON;
+                    (
+                        1.0 - t * t * (3.0 - 2.0 * t),
+                        6.0 * t * (t - 1.0) * INV_DU_ON,
+                    )
+                };
+
+                let d_ch = v_sub(ri.c, hj);
+                let d_oh = v_sub(ri.o, hj);
+                let d_cn = v_sub(ri.c, rj.n);
+
+                let r2_on = u_on + KS_EPS2;
+                let inv_on = 1.0 / r2_on.sqrt();
+                let inv3_on = inv_on / r2_on;
+
+                let r2_ch = v_dot(d_ch, d_ch) + KS_EPS2;
+                let inv_ch = 1.0 / r2_ch.sqrt();
+                let inv3_ch = inv_ch / r2_ch;
+
+                let r2_oh = v_dot(d_oh, d_oh) + KS_EPS2;
+                let inv_oh = 1.0 / r2_oh.sqrt();
+                let inv3_oh = inv_oh / r2_oh;
+
+                let r2_cn = v_dot(d_cn, d_cn) + KS_EPS2;
+                let inv_cn = 1.0 / r2_cn.sqrt();
+                let inv3_cn = inv_cn / r2_cn;
+
+                let e_raw = KS_KAPPA * ((inv_on + inv_ch) - (inv_oh + inv_cn));
+                breakdown.rama += w_hbond * s_sw * e_raw;
+
+                let scale = w_hbond * s_sw * KS_KAPPA;
+                let g_on = v_scale(d_on, -scale * inv3_on + 2.0 * w_hbond * ds_du * e_raw);
+                let g_ch = v_scale(d_ch, -scale * inv3_ch);
+                let g_oh = v_scale(d_oh, scale * inv3_oh);
+                let g_cn = v_scale(d_cn, scale * inv3_cn);
+
+                let g_c = v_add(g_ch, g_cn);
+                let g_o = v_add(g_on, g_oh);
+                let g_n = [-g_on[0] - g_cn[0], -g_on[1] - g_cn[1], -g_on[2] - g_cn[2]];
+                let g_h = [-g_ch[0] - g_oh[0], -g_ch[1] - g_oh[1], -g_ch[2] - g_oh[2]];
+
+                add_atom_grad(2 * i + 1, ri.c, g_c);
+                add_atom_grad(2 * i + 2, ri.o, g_o);
+                add_o_grad(i, ri.o, g_o);
+                add_atom_grad(2 * j, rj.n, g_n);
+                add_atom_grad(2 * j, hj, g_h);
+            }
+        }
+    }
+
+    // 3c. Multi-medium harmonic RDC potential (variable-projection SVD on working `!is_free` subset)
+    if w_rdc > 0.0 {
+        if let Some(prep) = prepared_rdc {
+            if !prep.is_empty() {
+                breakdown.rdc = crate::rdc::accumulate_prepared_rdc_energy_and_forces(
+                    &chain,
+                    prep,
+                    w_rdc,
+                    &mut add_atom_grad,
+                );
+            }
+        } else if !rdc_media.is_empty() {
+            breakdown.rdc = crate::rdc::accumulate_rdc_energy_and_forces(
+                &chain,
+                rdc_media,
+                w_rdc,
+                &mut add_atom_grad,
+            );
+        }
     }
 
     // Backward suffix sum of forces and torques (Abe, Braun, Noguti & Go 1984)
@@ -816,7 +1343,7 @@ pub fn evaluate_energy_and_gradients_with_rdcs_and_omega(
     // 4. Flat-bottom periodic (phi, psi) dihedral restraints + optional harmonic peptide-planarity omega restraint
     if w_omega > 0.0 {
         for i in 0..(l.saturating_sub(1)) {
-            let target_omg = if omega_rad[i].cos() > 0.0 { 0.0 } else { PI };
+            let target_omg = if det_cos(omega_rad[i]) > 0.0 { 0.0 } else { PI };
             let domg = wrap_rad(omega_rad[i] - target_omg);
             breakdown.dihedral += w_omega * domg * domg;
             if let Some(gomg) = grad_omega.as_deref_mut() {
@@ -832,15 +1359,29 @@ pub fn evaluate_energy_and_gradients_with_rdcs_and_omega(
         let u_soft = 0.55f64;
         for i in 0..l {
             let dr = &dihedrals[i];
-            let wc = w_dih * dr.confidence;
             if i > 0 && dr.restrained_phi {
+                let unmeasured = plane_has_work.is_some_and(|hw| i < hw.len() && !hw[i]);
+                let (wc, tol) = if unmeasured {
+                    (
+                        w_dih.max(28.0) * dr.confidence,
+                        (dr.phi_err_deg * 0.30).clamp(3.5, 6.5).to_radians(),
+                    )
+                } else {
+                    (
+                        w_dih * dr.confidence,
+                        if plane_has_work.is_some() {
+                            dr.phi_err_deg.max(15.0).to_radians()
+                        } else {
+                            dr.phi_err_deg.to_radians()
+                        },
+                    )
+                };
                 let dphi = wrap_rad(phi_rad[i] - dr.phi_deg.to_radians());
-                let tol = dr.phi_err_deg.to_radians();
                 if dphi.abs() > tol {
                     let u = dphi.abs() - tol;
-                    if w_rdc > 0.0 && u > u_soft {
+                    if !unmeasured && w_rdc > 0.0 && u > u_soft {
                         let s2 = u_soft * u_soft;
-                        breakdown.dihedral += wc * s2 * (1.0 + 2.0 * (u / u_soft).ln());
+                        breakdown.dihedral += wc * s2 * (1.0 + 2.0 * det_ln(u / u_soft));
                         grad_phi[i] += 2.0 * wc * (s2 / u) * dphi.signum();
                     } else {
                         breakdown.dihedral += wc * u * u;
@@ -849,13 +1390,28 @@ pub fn evaluate_energy_and_gradients_with_rdcs_and_omega(
                 }
             }
             if i + 1 < l && dr.restrained_psi {
+                let unmeasured = plane_has_work.is_some_and(|hw| i + 1 < hw.len() && !hw[i + 1]);
+                let (wc, tol) = if unmeasured {
+                    (
+                        w_dih.max(28.0) * dr.confidence,
+                        (dr.psi_err_deg * 0.30).clamp(3.5, 6.5).to_radians(),
+                    )
+                } else {
+                    (
+                        w_dih * dr.confidence,
+                        if plane_has_work.is_some() {
+                            dr.psi_err_deg.max(15.0).to_radians()
+                        } else {
+                            dr.psi_err_deg.to_radians()
+                        },
+                    )
+                };
                 let dpsi = wrap_rad(psi_rad[i] - dr.psi_deg.to_radians());
-                let tol = dr.psi_err_deg.to_radians();
                 if dpsi.abs() > tol {
                     let u = dpsi.abs() - tol;
-                    if w_rdc > 0.0 && u > u_soft {
+                    if !unmeasured && w_rdc > 0.0 && u > u_soft {
                         let s2 = u_soft * u_soft;
-                        breakdown.dihedral += wc * s2 * (1.0 + 2.0 * (u / u_soft).ln());
+                        breakdown.dihedral += wc * s2 * (1.0 + 2.0 * det_ln(u / u_soft));
                         grad_psi[i] += 2.0 * wc * (s2 / u) * dpsi.signum();
                     } else {
                         breakdown.dihedral += wc * u * u;
@@ -866,7 +1422,21 @@ pub fn evaluate_energy_and_gradients_with_rdcs_and_omega(
         }
     }
 
-    // 5. Smooth knowledge-based Ramachandran basin potential (internal residues 1 .. l-1)
+    // 5. Smooth knowledge-based Ramachandran basin potential (internal residues 1 .. l-1
+    //    plus 1D N-terminal psi_0 steric hindrance against cis-eclipsed N_0/N_1 and N_0/O_0)
+    if weights.w_rama > 0.0 && l >= 2 && !sequence[0].eq_ignore_ascii_case("GLY") {
+        let s0 = psi_rad[0];
+        let d_ext = wrap_rad(s0 - (140.0f64).to_radians());
+        let d_hel = wrap_rad(s0 - (-40.0f64).to_radians());
+        let inv_s_ext = 1.0 / (26.0f64.to_radians() * 26.0f64.to_radians());
+        let inv_s_hel = 1.0 / (24.0f64.to_radians() * 24.0f64.to_radians());
+        let g_ext = det_exp(-0.5 * d_ext * d_ext * inv_s_ext);
+        let g_hel = 0.90 * det_exp(-0.5 * d_hel * d_hel * inv_s_hel);
+        let z0 = g_ext + g_hel + 0.04;
+        let w0 = 0.5 * weights.w_rama;
+        breakdown.rama += w0 * (-det_ln(z0));
+        grad_psi[0] += w0 * (g_ext * d_ext * inv_s_ext + g_hel * d_hel * inv_s_hel) / z0;
+    }
     if weights.w_rama > 0.0 && l >= 3 {
         let w_r = weights.w_rama;
         for i in 1..(l - 1) {
@@ -997,38 +1567,8 @@ impl Default for StructureCalcConfig {
     }
 }
 
-/// Two-loop L-BFGS quasi-Newton minimizer (Nocedal 1980) in `2*L` `(phi, psi)` torsion space.
 #[allow(clippy::too_many_arguments)]
-fn lbfgs_polish(
-    sequence: &[String],
-    seq_ids: &[i32],
-    phi: &mut [f64],
-    psi: &mut [f64],
-    omega: &[f64],
-    adrs: &[AmbiguousDistanceRestraint],
-    dihedrals: &[DihedralRestraint],
-    weights: &EnergyWeights,
-    max_iters: usize,
-) -> (PdbChain, EnergyBreakdown) {
-    lbfgs_polish_with_rdcs(
-        sequence,
-        seq_ids,
-        phi,
-        psi,
-        omega,
-        adrs,
-        dihedrals,
-        &[],
-        0.0,
-        weights,
-        max_iters,
-    )
-}
-
-/// Two-loop L-BFGS quasi-Newton minimizer (Nocedal 1980) in `2*L` `(phi, psi)` torsion space
-/// with optional multi-medium variable-projection harmonic RDC restraints.
-#[allow(clippy::too_many_arguments)]
-fn lbfgs_polish_with_rdcs(
+fn lbfgs_polish_with_rdcs_hbond(
     sequence: &[String],
     seq_ids: &[i32],
     phi: &mut [f64],
@@ -1037,8 +1577,11 @@ fn lbfgs_polish_with_rdcs(
     adrs: &[AmbiguousDistanceRestraint],
     dihedrals: &[DihedralRestraint],
     rdc_media: &[crate::rdc::RdcMediumSet],
+    prepared_rdc: Option<&[crate::rdc::PreparedRdcWorkMedium]>,
     w_rdc: f64,
+    w_hbond: f64,
     weights: &EnergyWeights,
+    plane_has_work: Option<&[bool]>,
     max_iters: usize,
 ) -> (PdbChain, EnergyBreakdown) {
     let l = sequence.len();
@@ -1053,7 +1596,7 @@ fn lbfgs_polish_with_rdcs(
 
     let mut gp = vec![0.0f64; l];
     let mut gs = vec![0.0f64; l];
-    let (mut best_chain, mut cur_eb) = evaluate_energy_and_gradients_with_rdcs(
+    let (mut best_chain, mut cur_eb) = evaluate_energy_and_gradients_internal(
         sequence,
         seq_ids,
         &x_phi(&x, l),
@@ -1062,10 +1605,15 @@ fn lbfgs_polish_with_rdcs(
         adrs,
         dihedrals,
         rdc_media,
+        prepared_rdc,
         w_rdc,
+        0.0,
+        w_hbond,
         weights,
+        plane_has_work,
         &mut gp,
         &mut gs,
+        None,
     );
 
     let mut g = pack_grad(&gp, &gs);
@@ -1145,7 +1693,7 @@ fn lbfgs_polish_with_rdcs(
             for d_i in 0..dim {
                 x_trial[d_i] = wrap_rad(x[d_i] + step * dir[d_i]);
             }
-            let (ch_t, eb_t) = evaluate_energy_and_gradients_with_rdcs(
+            let (ch_t, eb_t) = evaluate_energy_and_gradients_internal(
                 sequence,
                 seq_ids,
                 &x_phi(&x_trial, l),
@@ -1154,10 +1702,15 @@ fn lbfgs_polish_with_rdcs(
                 adrs,
                 dihedrals,
                 rdc_media,
+                prepared_rdc,
                 w_rdc,
+                0.0,
+                w_hbond,
                 weights,
+                plane_has_work,
                 &mut gp,
                 &mut gs,
+                None,
             );
             if eb_t.total <= cur_eb.total + 1e-4 * step * dg {
                 g_trial = pack_grad(&gp, &gs);
@@ -1244,9 +1797,12 @@ fn lbfgs_polish_with_rdcs_and_omega(
     adrs: &[AmbiguousDistanceRestraint],
     dihedrals: &[DihedralRestraint],
     rdc_media: &[crate::rdc::RdcMediumSet],
+    prepared_rdc: Option<&[crate::rdc::PreparedRdcWorkMedium]>,
     w_rdc: f64,
     w_omega: f64,
+    w_hbond: f64,
     weights: &EnergyWeights,
+    plane_has_work: Option<&[bool]>,
     max_iters: usize,
 ) -> (PdbChain, EnergyBreakdown) {
     let l = sequence.len();
@@ -1256,7 +1812,7 @@ fn lbfgs_polish_with_rdcs_and_omega(
 
     let mut target_omgs = vec![PI; l];
     for i in 0..l {
-        target_omgs[i] = if omega[i].cos() > 0.0 { 0.0 } else { PI };
+        target_omgs[i] = if det_cos(omega[i]) > 0.0 { 0.0 } else { PI };
     }
 
     let mut x = vec![0.0f64; dim];
@@ -1291,7 +1847,7 @@ fn lbfgs_polish_with_rdcs_and_omega(
     let mut gs = vec![0.0f64; l];
     let mut go = vec![0.0f64; l];
     let (p0, s0, o0) = unpack3(&x);
-    let (mut best_chain, mut cur_eb) = evaluate_energy_and_gradients_with_rdcs_and_omega(
+    let (mut best_chain, mut cur_eb) = evaluate_energy_and_gradients_internal(
         sequence,
         seq_ids,
         &p0,
@@ -1300,9 +1856,12 @@ fn lbfgs_polish_with_rdcs_and_omega(
         adrs,
         dihedrals,
         rdc_media,
+        prepared_rdc,
         w_rdc,
         w_omega,
+        w_hbond,
         weights,
+        plane_has_work,
         &mut gp,
         &mut gs,
         Some(&mut go),
@@ -1394,7 +1953,7 @@ fn lbfgs_polish_with_rdcs_and_omega(
                 x_trial[3 * i + 2] = wrap_rad(target_omgs[i] + dev);
             }
             let (pt, st, ot) = unpack3(&x_trial);
-            let (ch_t, eb_t) = evaluate_energy_and_gradients_with_rdcs_and_omega(
+            let (ch_t, eb_t) = evaluate_energy_and_gradients_internal(
                 sequence,
                 seq_ids,
                 &pt,
@@ -1403,9 +1962,12 @@ fn lbfgs_polish_with_rdcs_and_omega(
                 adrs,
                 dihedrals,
                 rdc_media,
+                prepared_rdc,
                 w_rdc,
                 w_omega,
+                w_hbond,
                 weights,
+                plane_has_work,
                 &mut gp,
                 &mut gs,
                 Some(&mut go),
@@ -1473,11 +2035,13 @@ fn anneal_single_replica(
     seed: u64,
 ) -> StructureConformer {
     let l = sequence.len();
-    let mut rng = Rng::new(seed);
+    let mut rng = DetRng::new(seed);
 
     let mut phi = vec![-1.10f64; l];
     let mut psi = vec![2.35f64; l];
     let omega = vec![PI; l];
+
+    let pure_noe_mode = dihedrals.is_empty();
 
     if let Some((w_phi_deg, w_psi_deg)) = warm_start {
         for i in 0..l {
@@ -1492,6 +2056,65 @@ fn anneal_single_replica(
                 wrap_rad(w_phi_deg[i].to_radians() + rng.normal(0.0, jit))
             };
             psi[i] = wrap_rad(w_psi_deg[i].to_radians() + rng.normal(0.0, jit));
+        }
+    } else if pure_noe_mode {
+        // Pure experimental-NOE de novo folding (`dihedrals.is_empty()`): infer coarse local
+        // secondary-structure propensity strictly from Wuthrich (1986, Ch. 7) medium-range
+        // `(i, i+3)/(i, i+4)` helical NOEs vs long-range `|i - j| >= 5` backbone beta-sheet NOEs.
+        let mut med_helix = vec![0usize; l];
+        let mut lr_sheet = vec![0usize; l];
+        for adr in adrs {
+            if adr.candidates.len() > 2 || adr.upper_bound > 5.6 {
+                continue;
+            }
+            for c in &adr.candidates {
+                let sep = c.res_a.abs_diff(c.res_b);
+                let lo = c.res_a.min(c.res_b);
+                let hi = c.res_a.max(c.res_b);
+                let bb_pair = matches!(c.atom_a, NoeProton::AmideH | NoeProton::AlphaHA)
+                    && matches!(c.atom_b, NoeProton::AmideH | NoeProton::AlphaHA);
+                if (sep == 3 || sep == 4)
+                    && (bb_pair
+                        || matches!(c.atom_a, NoeProton::AlphaHA)
+                        || matches!(c.atom_b, NoeProton::AlphaHA))
+                    && adr.upper_bound <= 5.3
+                {
+                    for mh in &mut med_helix[lo..=hi] {
+                        *mh += 1;
+                    }
+                } else if sep >= 5 && bb_pair && adr.upper_bound <= 5.2 {
+                    lr_sheet[c.res_a] += 1;
+                    lr_sheet[c.res_b] += 1;
+                }
+            }
+        }
+        for i in 0..l {
+            let is_pro = sequence[i].eq_ignore_ascii_case("PRO");
+            let is_gly = sequence[i].eq_ignore_ascii_case("GLY");
+            let u = rng.f64();
+            if is_pro {
+                phi[i] = (-63.0f64).to_radians() + rng.normal(0.0, 0.12);
+                psi[i] = if med_helix[i] >= 2 && lr_sheet[i] == 0 {
+                    (-40.0f64).to_radians() + rng.normal(0.0, 0.22)
+                } else {
+                    (142.0f64).to_radians() + rng.normal(0.0, 0.30)
+                };
+            } else if med_helix[i] >= 3 && lr_sheet[i] == 0 && u < 0.80 {
+                phi[i] = (-63.0f64).to_radians() + rng.normal(0.0, 0.28);
+                psi[i] = (-42.0f64).to_radians() + rng.normal(0.0, 0.28);
+            } else if lr_sheet[i] >= 2 && med_helix[i] <= 1 && u < 0.78 {
+                phi[i] = (-118.0f64).to_radians() + rng.normal(0.0, 0.35);
+                psi[i] = (136.0f64).to_radians() + rng.normal(0.0, 0.32);
+            } else if is_gly && u < 0.34 {
+                phi[i] = (82.0f64).to_radians() + rng.normal(0.0, 0.55);
+                psi[i] = (14.0f64).to_radians() + rng.normal(0.0, 0.55);
+            } else if u < 0.66 {
+                phi[i] = (-108.0f64).to_radians() + rng.normal(0.0, 0.55);
+                psi[i] = (138.0f64).to_radians() + rng.normal(0.0, 0.50);
+            } else {
+                phi[i] = (-65.0f64).to_radians() + rng.normal(0.0, 0.45);
+                psi[i] = (-38.0f64).to_radians() + rng.normal(0.0, 0.45);
+            }
         }
     } else {
         // Initialize high-confidence Helix/Sheet cores near predicted torsions, and initialize Coil/Turn
@@ -1554,7 +2177,7 @@ fn anneal_single_replica(
 
     for step in 0..s1 {
         let prog = (step as f64) / (s1 as f64);
-        let temp = t_init * (0.05f64).powf(prog);
+        let temp = t_init * det_powf(0.05, prog);
         let active_adrs = if prog < local_cutoff && !local_adrs.is_empty() {
             local_adrs
         } else {
@@ -1590,7 +2213,12 @@ fn anneal_single_replica(
             },
         };
 
-        let (_, eb) = evaluate_energy_and_gradients(
+        let s1_hb = if pure_noe_mode && prog >= 0.40 {
+            0.55 * ((prog - 0.40) / 0.60)
+        } else {
+            0.0
+        };
+        let (_, eb) = evaluate_energy_and_gradients_with_rdcs_omega_hbond(
             sequence,
             seq_ids,
             &phi,
@@ -1598,9 +2226,14 @@ fn anneal_single_replica(
             &omega,
             active_adrs,
             dihedrals,
+            &[],
+            0.0,
+            0.0,
+            s1_hb,
             &w,
             &mut gp,
             &mut gs,
+            None,
         );
         if prog > 0.72 && eb.total < best_stage1_e {
             best_stage1_e = eb.total;
@@ -1640,14 +2273,14 @@ fn anneal_single_replica(
         // Compensating loop pivot / crankshaft Metropolis jump during early Stage 1 (de novo search only)
         if !is_warm && step % 30 == 10 && prog >= local_cutoff && prog < 0.65 && l > 5 {
             let idx = rng.range_usize(1, l - 2);
-            if idx < dihedrals.len()
-                && dihedrals[idx].ss_class == SecondaryStructure::Coil
+            if (dihedrals.is_empty()
+                || (idx < dihedrals.len() && dihedrals[idx].ss_class == SecondaryStructure::Coil))
                 && !sequence[idx].eq_ignore_ascii_case("PRO")
             {
                 let old_p = phi[idx];
                 let old_s = psi[idx];
                 let old_p2 = phi[idx + 1];
-                let (_, e_before) = evaluate_energy_and_gradients(
+                let (_, e_before) = evaluate_energy_and_gradients_with_rdcs_omega_hbond(
                     sequence,
                     seq_ids,
                     &phi,
@@ -1655,9 +2288,14 @@ fn anneal_single_replica(
                     &omega,
                     active_adrs,
                     dihedrals,
+                    &[],
+                    0.0,
+                    0.0,
+                    s1_hb,
                     &w,
                     &mut gp,
                     &mut gs,
+                    None,
                 );
                 let delta = rng.normal(0.0, 1.15);
                 phi[idx] = wrap_rad(phi[idx] + rng.normal(0.0, 0.90));
@@ -1665,7 +2303,7 @@ fn anneal_single_replica(
                 if !sequence[idx + 1].eq_ignore_ascii_case("PRO") {
                     phi[idx + 1] = wrap_rad(phi[idx + 1] - 0.85 * delta);
                 }
-                let (_, e_after) = evaluate_energy_and_gradients(
+                let (_, e_after) = evaluate_energy_and_gradients_with_rdcs_omega_hbond(
                     sequence,
                     seq_ids,
                     &phi,
@@ -1673,12 +2311,17 @@ fn anneal_single_replica(
                     &omega,
                     active_adrs,
                     dihedrals,
+                    &[],
+                    0.0,
+                    0.0,
+                    s1_hb,
                     &w,
                     &mut gp,
                     &mut gs,
+                    None,
                 );
                 let de = e_after.total - e_before.total;
-                if de > 0.0 && rng.f64() >= (-de / temp.max(0.8)).exp() {
+                if de > 0.0 && rng.f64() >= det_exp(-de / temp.max(0.8)) {
                     phi[idx] = old_p;
                     psi[idx] = old_s;
                     phi[idx + 1] = old_p2;
@@ -1703,7 +2346,7 @@ fn anneal_single_replica(
         w_rama: 5.0,
         w_rg: 0.0,
     };
-    lbfgs_polish(
+    lbfgs_polish_with_rdcs_hbond(
         sequence,
         seq_ids,
         &mut phi,
@@ -1711,7 +2354,12 @@ fn anneal_single_replica(
         &omega,
         adrs,
         dihedrals,
+        &[],
+        None,
+        0.0,
+        if pure_noe_mode { 0.95 } else { 0.0 },
         &soft_polish_weights,
+        None,
         90,
     );
 
@@ -1731,8 +2379,26 @@ fn anneal_single_replica(
             w_rg: 0.0,
         };
 
-        evaluate_energy_and_gradients(
-            sequence, seq_ids, &phi, &psi, &omega, adrs, dihedrals, &w, &mut gp, &mut gs,
+        evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+            sequence,
+            seq_ids,
+            &phi,
+            &psi,
+            &omega,
+            adrs,
+            dihedrals,
+            &[],
+            0.0,
+            0.0,
+            if pure_noe_mode {
+                1.15 + 0.35 * prog
+            } else {
+                0.0
+            },
+            &w,
+            &mut gp,
+            &mut gs,
+            None,
         );
 
         let g_norm = gp
@@ -1757,7 +2423,7 @@ fn anneal_single_replica(
 
     // Stage 3: Full physical potential L-BFGS quasi-Newton minimization (zero Rg bias!)
     let final_weights = EnergyWeights::default();
-    let (final_chain, final_eb) = lbfgs_polish(
+    let (final_chain, final_eb) = lbfgs_polish_with_rdcs_hbond(
         sequence,
         seq_ids,
         &mut phi,
@@ -1765,7 +2431,12 @@ fn anneal_single_replica(
         &omega,
         adrs,
         dihedrals,
+        &[],
+        None,
+        0.0,
+        if pure_noe_mode { 1.55 } else { 0.0 },
         &final_weights,
+        None,
         cfg.lbfgs_iters,
     );
 
@@ -1837,10 +2508,8 @@ fn fold_ensemble_seeded(
         .collect();
     let local_ref = local_adrs.as_slice();
 
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(n_rep);
+    let _job_guard = StructureJobGuard::acquire();
+    let n_threads = worker_thread_budget(n_rep);
 
     let mut all_conformers = Vec::with_capacity(n_rep);
 
@@ -1886,9 +2555,10 @@ fn fold_ensemble_seeded(
         });
     }
 
+    let rama_sort_w = if dihedrals.is_empty() { 0.06 } else { 0.0 };
     all_conformers.sort_by(|a, b| {
-        let ta = a.noe_energy + a.dihedral_energy + a.vdw_energy;
-        let tb = b.noe_energy + b.dihedral_energy + b.vdw_energy;
+        let ta = a.noe_energy + a.dihedral_energy + a.vdw_energy + rama_sort_w * a.rama_energy;
+        let tb = b.noe_energy + b.dihedral_energy + b.vdw_energy + rama_sort_w * b.rama_energy;
         ta.total_cmp(&tb)
     });
     all_conformers.truncate(cfg.n_select.max(1).min(all_conformers.len()));
@@ -1914,6 +2584,7 @@ pub fn calculate_structure_iterative(
     noesy_peaks: &[Peak],
     cfg: &StructureCalcConfig,
 ) -> StructureEnsembleResult {
+    let _job_guard = StructureJobGuard::acquire();
     let dihedral_restraints = predict_dihedrals(shifts);
     let mut adrs = match_initial_adrs(noesy_peaks, shifts, &cfg.adr_cfg);
     let initial_unambiguous_adrs = adrs
@@ -1988,6 +2659,43 @@ pub fn calculate_structure_iterative(
     }
 }
 
+fn align_dihedrals_to_seq_ids(
+    sequence: &[String],
+    seq_ids: &[i32],
+    dihedrals: &[DihedralRestraint],
+) -> Vec<DihedralRestraint> {
+    if dihedrals.is_empty() || dihedrals.len() == sequence.len() {
+        return dihedrals.to_vec();
+    }
+    if !dihedrals.iter().any(|d| seq_ids.contains(&d.seq_id)) {
+        return Vec::new();
+    }
+    (0..sequence.len())
+        .map(|k| {
+            if let Some(d) = dihedrals.iter().find(|d| d.seq_id == seq_ids[k]) {
+                d.clone()
+            } else {
+                DihedralRestraint {
+                    seq_id: seq_ids[k],
+                    res_name: sequence[k].clone(),
+                    phi_deg: -65.0,
+                    phi_err_deg: 35.0,
+                    psi_deg: 130.0,
+                    psi_err_deg: 35.0,
+                    ss_class: SecondaryStructure::Coil,
+                    confidence: 0.0,
+                    secondary_shift_score: 0.0,
+                    restrained_phi: false,
+                    restrained_psi: false,
+                    chi1_deg: None,
+                    chi1_err_deg: None,
+                    restrained_chi1: false,
+                }
+            }
+        })
+        .collect()
+}
+
 /// Refine a folded conformer ensemble against multi-medium residual dipolar couplings (`RDC`s)
 /// using exact variable-projection Losonczi SVD Saupe tensor updates + staged analytical
 /// torsion-angle L-BFGS minimization over working (`!is_free`) RDCs.
@@ -2011,6 +2719,14 @@ pub fn refine_ensemble_with_rdcs(
     if sequence.len() != seq_ids.len() {
         return Err("sequence and seq_ids lengths must match".to_string());
     }
+    let aligned_dihs;
+    let dihedrals: &[DihedralRestraint] =
+        if dihedrals.is_empty() || dihedrals.len() == sequence.len() {
+            dihedrals
+        } else {
+            aligned_dihs = align_dihedrals_to_seq_ids(sequence, seq_ids, dihedrals);
+            &aligned_dihs
+        };
     if !w_rdc.is_finite() || w_rdc < 0.0 {
         return Err(format!(
             "invalid RDC weight w_rdc={w_rdc}: must be finite and >= 0"
@@ -2023,9 +2739,23 @@ pub fn refine_ensemble_with_rdcs(
     }
 
     // Up-front validation of every alignment medium (n_work >= 6, sigma > 0, cond <= 1e8)
+    let _job_guard = StructureJobGuard::acquire();
     let init_val = crate::rdc::evaluate_rdc_validation(&conformers[0].chain, rdc_media)?;
     let n_work_tot: usize = init_val.media.iter().map(|m| m.n_work).sum();
     let eff_w_rdc = w_rdc * (185.0 / (n_work_tot.max(60) as f64)).clamp(0.34, 1.50);
+    let prepared_rdc = crate::rdc::prepare_rdc_work_media(&conformers[0].chain, rdc_media);
+    let prep_ref = Some(prepared_rdc.as_slice());
+    let mut plane_has_work_rdc = vec![false; sequence.len()];
+    for m in rdc_media {
+        for r in &m.restraints {
+            if !r.is_free {
+                let pid = crate::rdc::rdc_peptide_plane_id(r);
+                if let Some(pos) = seq_ids.iter().position(|&sid| sid == pid) {
+                    plane_has_work_rdc[pos] = true;
+                }
+            }
+        }
+    }
 
     let refine_one = |(conf_idx, conf): (usize, &StructureConformer)| -> StructureConformer {
         let l = sequence.len();
@@ -2037,23 +2767,27 @@ pub fn refine_ensemble_with_rdcs(
             vec![PI; l]
         };
 
-        // Keep flat-bottom dihedral tolerances (`>= 18 deg`) so non-homologous chemical-shift
-        // predictions prevent mirror-image Saupe degeneracies without biasing `(phi, psi)` away
-        // from sub-Hz experimental RDCs inside the native basin.
+        // Keep flat-bottom dihedral tolerances (`>= 15 deg`) so non-homologous chemical-shift
+        // predictions prevent mirror-image Saupe degeneracies and stabilize unmeasured peptide planes
+        // without biasing `(phi, psi)` away from sub-Hz experimental RDCs inside the native basin.
         let reg_dihs: Vec<DihedralRestraint> = if dihedrals.len() == l {
             dihedrals
                 .iter()
                 .map(|dr| {
                     let mut d = dr.clone();
                     if d.restrained_phi {
-                        d.phi_err_deg = d.phi_err_deg.max(18.0);
+                        d.phi_err_deg = d.phi_err_deg.max(15.0);
                     }
                     if d.restrained_psi {
-                        d.psi_err_deg = d.psi_err_deg.max(18.0);
+                        d.psi_err_deg = d.psi_err_deg.max(15.0);
                     }
                     d
                 })
                 .collect()
+        } else if dihedrals.is_empty() {
+            // Pure NOE + RDC refinement without chemical-shift dihedrals: do not self-tether to
+            // unrefined NOE-only `(phi, psi)` so mis-oriented peptide planes can crankshaft freely!
+            Vec::new()
         } else {
             (0..l)
                 .map(|k| DihedralRestraint {
@@ -2075,8 +2809,18 @@ pub fn refine_ensemble_with_rdcs(
                 .collect()
         };
 
+        let pure_noe_mode = dihedrals.is_empty();
+        let hbond_early = if pure_noe_mode { 0.85 } else { 0.0 };
+        let hbond_post = if pure_noe_mode { 1.65 } else { 0.35 };
+        let post_dihs: &[DihedralRestraint] = if dihedrals.len() == l {
+            dihedrals
+        } else {
+            &reg_dihs
+        };
+
         if eff_w_rdc > 0.0 && lbfgs_iters > 0 {
-            let mut rng = Rng::new(0x5244_4331u64 ^ ((conf_idx as u64).wrapping_mul(0x9E37_79B9)));
+            let mut rng =
+                DetRng::new(0x5244_4331u64 ^ ((conf_idx as u64).wrapping_mul(0x9E37_79B9)));
             let mut gp = vec![0.0f64; l];
             let mut gs = vec![0.0f64; l];
             let mut vp = vec![0.0f64; l];
@@ -2093,7 +2837,7 @@ pub fn refine_ensemble_with_rdcs(
                 w_rama: 6.5,
                 w_rg: 0.0,
             };
-            let _ = lbfgs_polish_with_rdcs(
+            let _ = lbfgs_polish_with_rdcs_hbond(
                 sequence,
                 seq_ids,
                 &mut phi,
@@ -2102,8 +2846,11 @@ pub fn refine_ensemble_with_rdcs(
                 adrs,
                 &reg_dihs,
                 rdc_media,
+                prep_ref,
                 0.35 * eff_w_rdc,
+                hbond_early,
                 &w_soft,
+                None,
                 55,
             );
 
@@ -2113,6 +2860,7 @@ pub fn refine_ensemble_with_rdcs(
             const CRANK_DELTAS: &[f64] = &[
                 -2.95, -2.45, -1.90, -1.35, -0.80, -0.40, 0.40, 0.80, 1.35, 1.90, 2.45, 2.95, PI,
             ];
+            const PRO_NEXT_DELTAS: &[f64] = &[-0.40, 0.40];
             const TURN_BASINS_DEG: &[(f64, f64)] = &[
                 (90.0, 12.0),
                 (64.0, 26.0),
@@ -2122,6 +2870,12 @@ pub fn refine_ensemble_with_rdcs(
                 (-82.0, 152.0),
                 (-118.0, 136.0),
             ];
+            let allows_alpha_l = |res_name: &str| -> bool {
+                matches!(
+                    res_name.to_ascii_uppercase().as_str(),
+                    "ASN" | "ASP" | "HIS" | "SER" | "GLN" | "GLU" | "LYS" | "ARG"
+                )
+            };
             for pass in 0..2 {
                 let w_crank = EnergyWeights {
                     w_noe: 1.1,
@@ -2133,7 +2887,7 @@ pub fn refine_ensemble_with_rdcs(
                     w_rg: 0.0,
                 };
                 let crank_rdc_w = (0.50 + 0.18 * (pass as f64)) * eff_w_rdc;
-                let (_, mut cur_eb) = evaluate_energy_and_gradients_with_rdcs(
+                let (_, mut cur_eb) = evaluate_energy_and_gradients_internal(
                     sequence,
                     seq_ids,
                     &phi,
@@ -2142,10 +2896,15 @@ pub fn refine_ensemble_with_rdcs(
                     adrs,
                     &reg_dihs,
                     rdc_media,
+                    prep_ref,
                     crank_rdc_w,
+                    0.0,
+                    hbond_early,
                     &w_crank,
+                    None,
                     &mut gp,
                     &mut gs,
+                    None,
                 );
 
                 for k in 0..(l.saturating_sub(1)) {
@@ -2154,14 +2913,21 @@ pub fn refine_ensemble_with_rdcs(
                     let saved_phi_k1 = phi[k + 1];
                     let mut best_psi_k = saved_psi_k;
                     let mut best_phi_k1 = saved_phi_k1;
+                    let lock_pre_pro =
+                        next_is_pro && k < reg_dihs.len() && reg_dihs[k].restrained_psi;
+                    let deltas = if lock_pre_pro {
+                        PRO_NEXT_DELTAS
+                    } else {
+                        CRANK_DELTAS
+                    };
 
-                    for &d in CRANK_DELTAS {
+                    for &d in deltas {
                         let comp = if d.abs() > 2.6 { 1.0 } else { 0.95 };
                         psi[k] = wrap_rad(saved_psi_k + d);
                         if !next_is_pro {
                             phi[k + 1] = wrap_rad(saved_phi_k1 - comp * d);
                         }
-                        let (_, cand_eb) = evaluate_energy_and_gradients_with_rdcs(
+                        let (_, cand_eb) = evaluate_energy_and_gradients_internal(
                             sequence,
                             seq_ids,
                             &phi,
@@ -2170,10 +2936,15 @@ pub fn refine_ensemble_with_rdcs(
                             adrs,
                             &reg_dihs,
                             rdc_media,
+                            prep_ref,
                             crank_rdc_w,
+                            0.0,
+                            hbond_early,
                             &w_crank,
+                            None,
                             &mut gp,
                             &mut gs,
+                            None,
                         );
                         if cand_eb.total < cur_eb.total {
                             cur_eb = cand_eb;
@@ -2184,8 +2955,8 @@ pub fn refine_ensemble_with_rdcs(
                     psi[k] = best_psi_k;
                     phi[k + 1] = best_phi_k1;
 
-                    // Compensating tripeptide Ramachandran basin check on every non-Pro internal residue
                     let is_pro = sequence[k].eq_ignore_ascii_case("PRO");
+                    let k_is_gly = sequence[k].eq_ignore_ascii_case("GLY");
                     if k > 0 && !is_pro {
                         let s_pk = phi[k];
                         let s_sk = psi[k];
@@ -2196,6 +2967,12 @@ pub fn refine_ensemble_with_rdcs(
                         let mut b_sm1 = s_sm1;
                         let mut b_pk1 = s_pk1;
                         for &(bp_deg, bs_deg) in TURN_BASINS_DEG {
+                            if bp_deg > 75.0 && !k_is_gly {
+                                continue;
+                            }
+                            if bp_deg > 0.0 && !k_is_gly && !allows_alpha_l(&sequence[k]) {
+                                continue;
+                            }
                             let tp = bp_deg.to_radians();
                             let ts = bs_deg.to_radians();
                             let dp = wrap_rad(tp - s_pk);
@@ -2206,7 +2983,7 @@ pub fn refine_ensemble_with_rdcs(
                             if !next_is_pro {
                                 phi[k + 1] = wrap_rad(s_pk1 - 0.92 * ds);
                             }
-                            let (_, cand_eb) = evaluate_energy_and_gradients_with_rdcs(
+                            let (_, cand_eb) = evaluate_energy_and_gradients_internal(
                                 sequence,
                                 seq_ids,
                                 &phi,
@@ -2215,10 +2992,15 @@ pub fn refine_ensemble_with_rdcs(
                                 adrs,
                                 &reg_dihs,
                                 rdc_media,
+                                prep_ref,
                                 crank_rdc_w,
+                                0.0,
+                                hbond_early,
                                 &w_crank,
+                                None,
                                 &mut gp,
                                 &mut gs,
+                                None,
                             );
                             if cand_eb.total < cur_eb.total {
                                 cur_eb = cand_eb;
@@ -2235,7 +3017,7 @@ pub fn refine_ensemble_with_rdcs(
                     }
                 }
 
-                let _ = lbfgs_polish_with_rdcs(
+                let _ = lbfgs_polish_with_rdcs_hbond(
                     sequence,
                     seq_ids,
                     &mut phi,
@@ -2244,8 +3026,11 @@ pub fn refine_ensemble_with_rdcs(
                     adrs,
                     &reg_dihs,
                     rdc_media,
+                    prep_ref,
                     crank_rdc_w,
+                    hbond_early,
                     &w_crank,
+                    None,
                     65,
                 );
             }
@@ -2263,7 +3048,7 @@ pub fn refine_ensemble_with_rdcs(
                 w_rama: 7.5,
                 ..EnergyWeights::default()
             };
-            let (_, init_eb) = evaluate_energy_and_gradients_with_rdcs(
+            let (_, init_eb) = evaluate_energy_and_gradients_internal(
                 sequence,
                 seq_ids,
                 &phi,
@@ -2272,10 +3057,15 @@ pub fn refine_ensemble_with_rdcs(
                 adrs,
                 &reg_dihs,
                 rdc_media,
+                prep_ref,
                 0.65 * eff_w_rdc,
+                0.0,
+                hbond_early,
                 &w_ref,
+                None,
                 &mut gp,
                 &mut gs,
+                None,
             );
             let mut best_e = init_eb.total;
             let n_relax = if lbfgs_iters >= 120 {
@@ -2286,7 +3076,7 @@ pub fn refine_ensemble_with_rdcs(
             let t_start = if lbfgs_iters >= 120 { 1.20 } else { 0.25 };
             for st in 0..n_relax {
                 let prog = (st as f64) / (n_relax as f64);
-                let temp = t_start * (0.015f64).powf(prog);
+                let temp = t_start * det_powf(0.015, prog);
                 let w_s = EnergyWeights {
                     w_noe: 1.1 - 0.3 * prog,
                     noe_soft_window: 2.3 - 0.5 * prog,
@@ -2296,7 +3086,7 @@ pub fn refine_ensemble_with_rdcs(
                     w_rama: 7.0 + 1.0 * prog,
                     w_rg: 0.0,
                 };
-                let (_, eb_s) = evaluate_energy_and_gradients_with_rdcs(
+                let (_, eb_s) = evaluate_energy_and_gradients_internal(
                     sequence,
                     seq_ids,
                     &phi,
@@ -2305,10 +3095,15 @@ pub fn refine_ensemble_with_rdcs(
                     adrs,
                     &reg_dihs,
                     rdc_media,
+                    prep_ref,
                     (0.45 + 0.35 * prog) * eff_w_rdc,
+                    0.0,
+                    hbond_early,
                     &w_s,
+                    None,
                     &mut gp,
                     &mut gs,
+                    None,
                 );
                 if prog > 0.62 && eb_s.total < best_e {
                     best_e = eb_s.total;
@@ -2323,7 +3118,9 @@ pub fn refine_ensemble_with_rdcs(
                 let noise = (2.0 * lr * temp).sqrt() * 0.30;
                 let step_cap = 0.10 * (1.0 - 0.65 * prog) + 0.02;
                 for k in 0..l {
-                    let flex = if reg_dihs[k].restrained_phi || reg_dihs[k].restrained_psi {
+                    let flex = if k < reg_dihs.len()
+                        && (reg_dihs[k].restrained_phi || reg_dihs[k].restrained_psi)
+                    {
                         0.65
                     } else {
                         1.35
@@ -2352,7 +3149,7 @@ pub fn refine_ensemble_with_rdcs(
                 w_rama: 7.5,
                 w_rg: 0.0,
             };
-            let (_, mut post_eb) = evaluate_energy_and_gradients_with_rdcs(
+            let (_, mut post_eb) = evaluate_energy_and_gradients_internal(
                 sequence,
                 seq_ids,
                 &phi,
@@ -2361,10 +3158,15 @@ pub fn refine_ensemble_with_rdcs(
                 adrs,
                 &reg_dihs,
                 rdc_media,
+                prep_ref,
                 0.75 * eff_w_rdc,
+                0.0,
+                hbond_early,
                 &w_post,
+                None,
                 &mut gp,
                 &mut gs,
+                None,
             );
             for k in 0..(l.saturating_sub(1)) {
                 let next_is_pro = sequence[k + 1].eq_ignore_ascii_case("PRO");
@@ -2372,13 +3174,19 @@ pub fn refine_ensemble_with_rdcs(
                 let saved_phi_k1 = phi[k + 1];
                 let mut best_psi_k = saved_psi_k;
                 let mut best_phi_k1 = saved_phi_k1;
-                for &d in CRANK_DELTAS {
+                let lock_pre_pro = next_is_pro && k < reg_dihs.len() && reg_dihs[k].restrained_psi;
+                let deltas = if lock_pre_pro {
+                    PRO_NEXT_DELTAS
+                } else {
+                    CRANK_DELTAS
+                };
+                for &d in deltas {
                     let comp = if d.abs() > 2.6 { 1.0 } else { 0.95 };
                     psi[k] = wrap_rad(saved_psi_k + d);
                     if !next_is_pro {
                         phi[k + 1] = wrap_rad(saved_phi_k1 - comp * d);
                     }
-                    let (_, cand_eb) = evaluate_energy_and_gradients_with_rdcs(
+                    let (_, cand_eb) = evaluate_energy_and_gradients_internal(
                         sequence,
                         seq_ids,
                         &phi,
@@ -2387,10 +3195,15 @@ pub fn refine_ensemble_with_rdcs(
                         adrs,
                         &reg_dihs,
                         rdc_media,
+                        prep_ref,
                         0.75 * eff_w_rdc,
+                        0.0,
+                        hbond_early,
                         &w_post,
+                        None,
                         &mut gp,
                         &mut gs,
+                        None,
                     );
                     if cand_eb.total < post_eb.total {
                         post_eb = cand_eb;
@@ -2402,6 +3215,7 @@ pub fn refine_ensemble_with_rdcs(
                 phi[k + 1] = best_phi_k1;
 
                 if k > 0 && !sequence[k].eq_ignore_ascii_case("PRO") {
+                    let k_is_gly = sequence[k].eq_ignore_ascii_case("GLY");
                     let s_pk = phi[k];
                     let s_sk = psi[k];
                     let s_sm1 = psi[k - 1];
@@ -2411,6 +3225,12 @@ pub fn refine_ensemble_with_rdcs(
                     let mut b_sm1 = s_sm1;
                     let mut b_pk1 = s_pk1;
                     for &(bp_deg, bs_deg) in TURN_BASINS_DEG {
+                        if bp_deg > 75.0 && !k_is_gly {
+                            continue;
+                        }
+                        if bp_deg > 0.0 && !k_is_gly && !allows_alpha_l(&sequence[k]) {
+                            continue;
+                        }
                         let tp = bp_deg.to_radians();
                         let ts = bs_deg.to_radians();
                         let dp = wrap_rad(tp - s_pk);
@@ -2421,7 +3241,7 @@ pub fn refine_ensemble_with_rdcs(
                         if !next_is_pro {
                             phi[k + 1] = wrap_rad(s_pk1 - 0.92 * ds);
                         }
-                        let (_, cand_eb) = evaluate_energy_and_gradients_with_rdcs(
+                        let (_, cand_eb) = evaluate_energy_and_gradients_internal(
                             sequence,
                             seq_ids,
                             &phi,
@@ -2430,10 +3250,15 @@ pub fn refine_ensemble_with_rdcs(
                             adrs,
                             &reg_dihs,
                             rdc_media,
+                            prep_ref,
                             0.75 * eff_w_rdc,
+                            0.0,
+                            hbond_early,
                             &w_post,
+                            None,
                             &mut gp,
                             &mut gs,
+                            None,
                         );
                         if cand_eb.total < post_eb.total {
                             post_eb = cand_eb;
@@ -2459,7 +3284,7 @@ pub fn refine_ensemble_with_rdcs(
                 w_rama: 7.5,
                 ..EnergyWeights::default()
             };
-            let (_, mut cur_wa_eb) = lbfgs_polish_with_rdcs(
+            let (_, mut cur_wa_eb) = lbfgs_polish_with_rdcs_hbond(
                 sequence,
                 seq_ids,
                 &mut phi,
@@ -2468,15 +3293,15 @@ pub fn refine_ensemble_with_rdcs(
                 adrs,
                 &reg_dihs,
                 rdc_media,
+                prep_ref,
                 0.70 * eff_w_rdc,
+                hbond_early,
                 &w_a,
+                None,
                 (lbfgs_iters / 3).max(45),
             );
 
-            // Relaxed 180-deg peptide-plane flip escape: because angle(CA-C-N) != angle(C-N-CA)
-            // by 5.5 deg, an instant (+pi, -pi) flip swings downstream residues by ~11 deg until
-            // flanking torsions relax by ~6 deg. For any dipeptide on the zero-gradient
-            // Ramachandran outlier plateau or positive-phi trap, test (+pi, -pi) + short L-BFGS.
+            // Relaxed 180-deg peptide-plane flip escape:
             let w_flip_soft = EnergyWeights {
                 w_noe: 0.85,
                 noe_soft_window: 2.2,
@@ -2515,17 +3340,47 @@ pub fn refine_ensemble_with_rdcs(
                     };
                     let k_is_gly = sequence[k].eq_ignore_ascii_case("GLY");
                     let k1_is_gly = sequence[k + 1].eq_ignore_ascii_case("GLY");
-                    let pos_or_eclipsed_phi =
-                        (!k_is_gly && k > 0 && phi[k] > (-28.0f64).to_radians())
-                            || (!k1_is_gly && phi[k + 1] > (-28.0f64).to_radians());
-                    let dih_viol = (!k_is_gly
+                    let in_alpha_l = |res_name: &str, p: f64, s: f64| -> bool {
+                        allows_alpha_l(res_name)
+                            && (28.0f64.to_radians()..=88.0f64.to_radians()).contains(&p)
+                            && ((-18.0f64).to_radians()..=78.0f64.to_radians()).contains(&s)
+                    };
+                    let k_valid_alpha_l = k > 0
+                        && !sequence[k - 1].eq_ignore_ascii_case("PRO")
+                        && psi[k - 1].abs() < (145.0f64).to_radians()
+                        && in_alpha_l(&sequence[k], phi[k], psi[k]);
+                    let k1_valid_alpha_l = k + 2 < l
+                        && !sequence[k].eq_ignore_ascii_case("PRO")
+                        && psi[k].abs() < (145.0f64).to_radians()
+                        && in_alpha_l(&sequence[k + 1], phi[k + 1], psi[k + 1]);
+                    let pos_or_eclipsed_phi = (!k_is_gly
+                        && k > 0
+                        && phi[k] > (-28.0f64).to_radians()
+                        && !k_valid_alpha_l)
+                        || (!k1_is_gly
+                            && phi[k + 1] > (-28.0f64).to_radians()
+                            && !k1_valid_alpha_l);
+                    let dih_viol = (k < reg_dihs.len()
+                        && !k_is_gly
                         && reg_dihs[k].restrained_psi
                         && wrap_rad(psi[k] - reg_dihs[k].psi_deg.to_radians()).abs() > 0.95)
-                        || (!k1_is_gly
+                        || (k + 1 < reg_dihs.len()
+                            && !k1_is_gly
                             && reg_dihs[k + 1].restrained_phi
                             && wrap_rad(phi[k + 1] - reg_dihs[k + 1].phi_deg.to_radians()).abs()
                                 > 0.95);
-                    if !pos_or_eclipsed_phi && !dih_viol && vr_k < 1.8 && vr_k1 < 1.8 {
+                    if !plane_has_work_rdc[k + 1] && !k1_is_gly && k1_valid_alpha_l && !dih_viol {
+                        continue;
+                    }
+                    let strained_ext = (k > 0 && !k_is_gly && phi[k] < (-150.0f64).to_radians())
+                        || psi[k].abs() > (170.0f64).to_radians()
+                        || (!k1_is_gly && phi[k + 1] < (-150.0f64).to_radians());
+                    if !pos_or_eclipsed_phi
+                        && !dih_viol
+                        && !strained_ext
+                        && vr_k < 0.85
+                        && vr_k1 < 0.85
+                    {
                         continue;
                     }
 
@@ -2549,8 +3404,6 @@ pub fn refine_ensemble_with_rdcs(
                             psi[k + 1],
                         ),
                     ];
-                    // Canonical 2-residue supersecondary dipeptide escapes for double-flipped
-                    // beta-strands and beta-hairpin hinges (`beta-beta`, `beta-turn`, `turn-beta`).
                     if k > 0 && !sequence[k].eq_ignore_ascii_case("PRO") {
                         proposals.push((
                             (-96.0f64).to_radians(),
@@ -2564,14 +3417,16 @@ pub fn refine_ensemble_with_rdcs(
                             (-68.0f64).to_radians(),
                             (-24.0f64).to_radians(),
                         ));
-                        proposals.push((
-                            (88.0f64).to_radians(),
-                            (12.0f64).to_radians(),
-                            (-96.0f64).to_radians(),
-                            (140.0f64).to_radians(),
-                        ));
+                        if k_is_gly {
+                            proposals.push((
+                                (88.0f64).to_radians(),
+                                (12.0f64).to_radians(),
+                                (-96.0f64).to_radians(),
+                                (140.0f64).to_radians(),
+                            ));
+                        }
                     }
-                    if dih_viol {
+                    if dih_viol && k + 1 < reg_dihs.len() {
                         let pk = if k > 0 && !k_is_gly && reg_dihs[k].restrained_phi {
                             reg_dihs[k].phi_deg.to_radians()
                         } else {
@@ -2602,7 +3457,7 @@ pub fn refine_ensemble_with_rdcs(
                         trial_psi[k] = sk;
                         trial_phi[k + 1] = pk1;
                         trial_psi[k + 1] = sk1;
-                        let _ = lbfgs_polish_with_rdcs(
+                        let _ = lbfgs_polish_with_rdcs_hbond(
                             sequence,
                             seq_ids,
                             &mut trial_phi,
@@ -2611,11 +3466,14 @@ pub fn refine_ensemble_with_rdcs(
                             adrs,
                             &reg_dihs,
                             rdc_media,
+                            prep_ref,
                             0.70 * eff_w_rdc,
+                            hbond_early,
                             &w_flip_soft,
+                            None,
                             18,
                         );
-                        let (_, cand_eb) = lbfgs_polish_with_rdcs(
+                        let (_, cand_eb) = lbfgs_polish_with_rdcs_hbond(
                             sequence,
                             seq_ids,
                             &mut trial_phi,
@@ -2624,8 +3482,11 @@ pub fn refine_ensemble_with_rdcs(
                             adrs,
                             &reg_dihs,
                             rdc_media,
+                            prep_ref,
                             0.70 * eff_w_rdc,
+                            hbond_early,
                             &w_a,
+                            None,
                             14,
                         );
                         if cand_eb.total + 1e-3 < cur_wa_eb.total {
@@ -2638,15 +3499,123 @@ pub fn refine_ensemble_with_rdcs(
                 }
             }
 
+            // Post-convergence equilibration of peptide planes with ZERO working RDCs
+            // (`!plane_has_work_rdc[k + 1]`), e.g. whole planes held out under `ByPeptidePlane`
+            // `RdcFree` or unmeasured residues: keep all working-RDC planes locked to the Saupe
+            // tensor while re-centering unmeasured planes via strictly compensating crankshaft
+            // rotations (`psi[k] + d, phi[k+1] - d`) on their physical NOE + Kabsch-Sander
+            // H-bond + non-homologous chemical-shift dihedral minimum.
+            if lbfgs_iters >= 140 {
+                let w_unmeas = EnergyWeights {
+                    w_noe: if pure_noe_mode { 2.25 } else { 1.25 },
+                    noe_soft_window: 2.0,
+                    w_dihedral: 2.0,
+                    w_vdw: 1.8,
+                    vdw_scale: 0.95,
+                    w_rama: if pure_noe_mode { 11.5 } else { 8.5 },
+                    w_rg: 0.0,
+                };
+                let hbond_unmeas = if pure_noe_mode { 2.20 } else { 0.85 };
+                let (_, mut cur_unmeas_eb) = lbfgs_polish_with_rdcs_hbond(
+                    sequence,
+                    seq_ids,
+                    &mut phi,
+                    &mut psi,
+                    &omega,
+                    adrs,
+                    post_dihs,
+                    rdc_media,
+                    prep_ref,
+                    0.85 * eff_w_rdc,
+                    hbond_unmeas,
+                    &w_unmeas,
+                    Some(&plane_has_work_rdc),
+                    28,
+                );
+                for k in 0..(l.saturating_sub(1)) {
+                    if plane_has_work_rdc[k + 1] || sequence[k + 1].eq_ignore_ascii_case("PRO") {
+                        continue;
+                    }
+                    let k1_is_gly = sequence[k + 1].eq_ignore_ascii_case("GLY");
+                    let k1_in_alpha_l = k + 2 < l
+                        && !k1_is_gly
+                        && !sequence[k].eq_ignore_ascii_case("PRO")
+                        && psi[k].abs() < (145.0f64).to_radians()
+                        && allows_alpha_l(&sequence[k + 1])
+                        && (28.0f64.to_radians()..=88.0f64.to_radians()).contains(&phi[k + 1])
+                        && ((-18.0f64).to_radians()..=78.0f64.to_radians()).contains(&psi[k + 1])
+                        && !(dihedrals.len() == l
+                            && dihedrals[k + 1].restrained_phi
+                            && dihedrals[k + 1].phi_deg < -35.0);
+
+                    let mut plane_cands: Vec<(f64, f64)> = Vec::with_capacity(10);
+                    if dihedrals.len() == l
+                        && dihedrals[k].restrained_psi
+                        && dihedrals[k + 1].restrained_phi
+                    {
+                        let sk_t = dihedrals[k].psi_deg.to_radians();
+                        let pk1_t = dihedrals[k + 1].phi_deg.to_radians();
+                        if wrap_rad((sk_t + pk1_t) - (psi[k] + phi[k + 1])).abs() < 0.65 {
+                            plane_cands.push((sk_t, pk1_t));
+                        }
+                    }
+                    let shift_deltas: &[f64] = if k1_in_alpha_l {
+                        &[-0.35, -0.18, 0.18, 0.35]
+                    } else {
+                        &[PI, 2.05, -2.05, 1.15, -1.15, 0.55, -0.55, 0.28, -0.28]
+                    };
+                    for &d in shift_deltas {
+                        plane_cands.push((wrap_rad(psi[k] + d), wrap_rad(phi[k + 1] - d)));
+                    }
+                    for (sk, pk1) in plane_cands {
+                        let mut trial_phi = phi.clone();
+                        let mut trial_psi = psi.clone();
+                        trial_psi[k] = sk;
+                        trial_phi[k + 1] = pk1;
+                        let (_, cand_eb) = lbfgs_polish_with_rdcs_hbond(
+                            sequence,
+                            seq_ids,
+                            &mut trial_phi,
+                            &mut trial_psi,
+                            &omega,
+                            adrs,
+                            post_dihs,
+                            rdc_media,
+                            prep_ref,
+                            0.85 * eff_w_rdc,
+                            hbond_unmeas,
+                            &w_unmeas,
+                            Some(&plane_has_work_rdc),
+                            16,
+                        );
+                        if cand_eb.total + 1e-3 < cur_unmeas_eb.total {
+                            cur_unmeas_eb = cand_eb;
+                            phi.copy_from_slice(&trial_phi);
+                            psi.copy_from_slice(&trial_psi);
+                        }
+                    }
+                }
+            }
+
             // Enable physical peptide-planarity omega relaxation (sigma_omega ~ 3.7 deg;
             // Cornilescu et al., JACS 1998) alongside (phi, psi) in the final two L-BFGS stages.
+            let final_plane_mask = if lbfgs_iters >= 110 {
+                Some(plane_has_work_rdc.as_slice())
+            } else {
+                None
+            };
+            let active_post_dihs = if lbfgs_iters >= 110 {
+                post_dihs
+            } else {
+                &reg_dihs
+            };
             let w_b = EnergyWeights {
-                w_noe: 0.75,
+                w_noe: if pure_noe_mode { 1.85 } else { 0.80 },
                 noe_soft_window: 1.8,
                 w_dihedral: 2.0,
                 w_vdw: 2.0,
                 vdw_scale: 0.98,
-                w_rama: 8.0,
+                w_rama: if pure_noe_mode { 11.0 } else { 8.0 },
                 ..EnergyWeights::default()
             };
             let _ = lbfgs_polish_with_rdcs_and_omega(
@@ -2656,21 +3625,38 @@ pub fn refine_ensemble_with_rdcs(
                 &mut psi,
                 &mut omega,
                 adrs,
-                &reg_dihs,
+                active_post_dihs,
                 rdc_media,
+                prep_ref,
                 0.85 * eff_w_rdc,
                 110.0,
+                if lbfgs_iters >= 110 {
+                    hbond_post
+                } else {
+                    hbond_early
+                },
                 &w_b,
+                final_plane_mask,
                 (lbfgs_iters / 2).max(65),
             );
         }
 
+        let final_plane_mask = if lbfgs_iters >= 110 {
+            Some(plane_has_work_rdc.as_slice())
+        } else {
+            None
+        };
+        let active_post_dihs = if lbfgs_iters >= 110 {
+            post_dihs
+        } else {
+            &reg_dihs
+        };
         let final_weights = EnergyWeights {
-            w_noe: 0.65,
+            w_noe: if pure_noe_mode { 1.65 } else { 0.70 },
             noe_soft_window: 1.8,
             w_dihedral: 2.0,
             w_vdw: 2.2,
-            w_rama: 8.5,
+            w_rama: if pure_noe_mode { 11.5 } else { 8.5 },
             ..EnergyWeights::default()
         };
         let (final_chain, final_eb) = lbfgs_polish_with_rdcs_and_omega(
@@ -2680,11 +3666,18 @@ pub fn refine_ensemble_with_rdcs(
             &mut psi,
             &mut omega,
             adrs,
-            &reg_dihs,
+            active_post_dihs,
             rdc_media,
+            prep_ref,
             eff_w_rdc,
             115.0,
+            if lbfgs_iters >= 110 {
+                hbond_post
+            } else {
+                hbond_early
+            },
             &final_weights,
+            final_plane_mask,
             lbfgs_iters,
         );
 
@@ -2705,10 +3698,7 @@ pub fn refine_ensemble_with_rdcs(
     };
 
     let n_conf = conformers.len();
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(n_conf);
+    let n_threads = worker_thread_budget(n_conf);
 
     let mut refined = Vec::with_capacity(n_conf);
     if n_threads <= 1 || n_conf <= 1 {
@@ -2738,8 +3728,296 @@ pub fn refine_ensemble_with_rdcs(
     }
 
     refined.sort_by(|a, b| a.total_energy.total_cmp(&b.total_energy));
+    if eff_w_rdc > 0.0 && lbfgs_iters >= 140 && refined.len() >= 2 {
+        let l = sequence.len();
+        let mut core_mask = vec![false; l];
+        for adr in adrs {
+            for c in &adr.candidates {
+                if c.res_a.abs_diff(c.res_b) >= 3 {
+                    if c.res_a < l {
+                        core_mask[c.res_a] = true;
+                    }
+                    if c.res_b < l {
+                        core_mask[c.res_b] = true;
+                    }
+                }
+            }
+        }
+        let dom_lo = core_mask.iter().position(|&b| b).unwrap_or(0);
+        let dom_hi = core_mask
+            .iter()
+            .rposition(|&b| b)
+            .unwrap_or_else(|| l.saturating_sub(2))
+            .min(l.saturating_sub(2));
+        if dom_lo < dom_hi {
+            let pure_noe_mode = dihedrals.is_empty();
+            let hbond_post = if pure_noe_mode { 1.65 } else { 0.35 };
+            let w_bridge_soft = EnergyWeights {
+                w_noe: if pure_noe_mode { 1.50 } else { 0.85 },
+                noe_soft_window: 2.2,
+                w_dihedral: 2.0,
+                w_vdw: 0.35,
+                vdw_scale: 0.75,
+                w_rama: if pure_noe_mode { 10.0 } else { 7.5 },
+                ..EnergyWeights::default()
+            };
+            let final_weights = EnergyWeights {
+                w_noe: if pure_noe_mode { 1.65 } else { 0.70 },
+                noe_soft_window: 1.8,
+                w_dihedral: 2.0,
+                w_vdw: 2.2,
+                vdw_scale: 0.98,
+                w_rama: if pure_noe_mode { 11.5 } else { 8.5 },
+                ..EnergyWeights::default()
+            };
+            let peer_limit = refined.len().min(6);
+            let peers: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> = refined[..peer_limit]
+                .iter()
+                .map(|c| {
+                    (
+                        c.phi_deg.iter().map(|d| d.to_radians()).collect(),
+                        c.psi_deg.iter().map(|d| d.to_radians()).collect(),
+                        if c.omega_deg.len() == l {
+                            c.omega_deg.iter().map(|d| d.to_radians()).collect()
+                        } else {
+                            vec![PI; l]
+                        },
+                    )
+                })
+                .collect();
+
+            for target_idx in 0..refined.len().min(2) {
+                let mut cur_conf = refined[target_idx].clone();
+                let fallback_dihs: Vec<DihedralRestraint> =
+                    if dihedrals.len() == l || dihedrals.is_empty() {
+                        Vec::new()
+                    } else {
+                        (0..l)
+                            .map(|k| DihedralRestraint {
+                                seq_id: seq_ids[k],
+                                res_name: sequence[k].clone(),
+                                phi_deg: cur_conf.phi_deg[k],
+                                phi_err_deg: 22.0,
+                                psi_deg: cur_conf.psi_deg[k],
+                                psi_err_deg: 22.0,
+                                ss_class: SecondaryStructure::Coil,
+                                confidence: 0.25,
+                                secondary_shift_score: 0.0,
+                                restrained_phi: k > 0,
+                                restrained_psi: k + 1 < l,
+                                chi1_deg: None,
+                                chi1_err_deg: None,
+                                restrained_chi1: false,
+                            })
+                            .collect()
+                    };
+                let active_post_dihs: &[DihedralRestraint] = if dihedrals.len() == l {
+                    dihedrals
+                } else {
+                    &fallback_dihs
+                };
+                let (mut cur_phi, mut cur_psi, mut cur_omega) = peers[target_idx].clone();
+                let mut tested_islands: Vec<(usize, usize, Vec<f64>, Vec<f64>)> = Vec::new();
+
+                for (peer_idx, (p_phi, p_psi, p_omega)) in peers.iter().enumerate() {
+                    if peer_idx == target_idx {
+                        continue;
+                    }
+                    let mut k = dom_lo;
+                    while k < dom_hi {
+                        if wrap_rad(p_psi[k] - cur_psi[k]).abs() <= 0.45
+                            && wrap_rad(p_phi[k + 1] - cur_phi[k + 1]).abs() <= 0.45
+                        {
+                            k += 1;
+                            continue;
+                        }
+                        let k_start = k;
+                        let mut k_end = k + 1;
+                        while k_end < dom_hi
+                            && k_end - k_start < 6
+                            && (wrap_rad(p_psi[k_end] - cur_psi[k_end]).abs() > 0.30
+                                || wrap_rad(p_phi[k_end + 1] - cur_phi[k_end + 1]).abs() > 0.30)
+                        {
+                            k_end += 1;
+                        }
+                        k = k_end + 1;
+                        let s_lo = k_start.saturating_sub(1);
+                        let s_hi = (k_end + 1).min(l - 1);
+                        let seg_phi = p_phi[s_lo..=s_hi].to_vec();
+                        let seg_psi = p_psi[s_lo..=s_hi].to_vec();
+                        let dup = tested_islands.iter().any(|(lo, hi, tp, ts)| {
+                            *lo == s_lo
+                                && *hi == s_hi
+                                && tp
+                                    .iter()
+                                    .zip(seg_phi.iter())
+                                    .all(|(&a, &b)| wrap_rad(a - b).abs() < 0.25)
+                                && ts
+                                    .iter()
+                                    .zip(seg_psi.iter())
+                                    .all(|(&a, &b)| wrap_rad(a - b).abs() < 0.25)
+                        });
+                        if dup {
+                            continue;
+                        }
+                        tested_islands.push((s_lo, s_hi, seg_phi, seg_psi));
+
+                        let mut trial_phi = cur_phi.clone();
+                        let mut trial_psi = cur_psi.clone();
+                        let mut trial_omega = cur_omega.clone();
+                        trial_phi[s_lo..=s_hi].copy_from_slice(&p_phi[s_lo..=s_hi]);
+                        if s_lo == 0 {
+                            trial_phi[0] = cur_phi[0];
+                        }
+                        trial_psi[s_lo..=s_hi].copy_from_slice(&p_psi[s_lo..=s_hi]);
+                        trial_omega[s_lo..=s_hi].copy_from_slice(&p_omega[s_lo..=s_hi]);
+
+                        let _ = lbfgs_polish_with_rdcs_hbond(
+                            sequence,
+                            seq_ids,
+                            &mut trial_phi,
+                            &mut trial_psi,
+                            &trial_omega,
+                            adrs,
+                            active_post_dihs,
+                            rdc_media,
+                            prep_ref,
+                            0.85 * eff_w_rdc,
+                            hbond_post,
+                            &w_bridge_soft,
+                            Some(&plane_has_work_rdc),
+                            24,
+                        );
+                        let (cand_chain, cand_eb) = lbfgs_polish_with_rdcs_and_omega(
+                            sequence,
+                            seq_ids,
+                            &mut trial_phi,
+                            &mut trial_psi,
+                            &mut trial_omega,
+                            adrs,
+                            active_post_dihs,
+                            rdc_media,
+                            prep_ref,
+                            eff_w_rdc,
+                            115.0,
+                            hbond_post,
+                            &final_weights,
+                            Some(&plane_has_work_rdc),
+                            48,
+                        );
+                        if cand_eb.total + 1e-3 < cur_conf.total_energy {
+                            cur_phi = trial_phi;
+                            cur_psi = trial_psi;
+                            cur_omega = trial_omega;
+                            cur_conf = StructureConformer {
+                                chain: cand_chain,
+                                phi_deg: cur_phi.iter().map(|r| wrap_deg(r.to_degrees())).collect(),
+                                psi_deg: cur_psi.iter().map(|r| wrap_deg(r.to_degrees())).collect(),
+                                omega_deg: cur_omega
+                                    .iter()
+                                    .map(|r| wrap_deg(r.to_degrees()))
+                                    .collect(),
+                                total_energy: cand_eb.total,
+                                noe_energy: cand_eb.noe,
+                                dihedral_energy: cand_eb.dihedral,
+                                vdw_energy: cand_eb.vdw,
+                                rama_energy: cand_eb.rama,
+                            };
+                        }
+                    }
+                }
+                refined[target_idx] = cur_conf;
+            }
+            refined.sort_by(|a, b| a.total_energy.total_cmp(&b.total_energy));
+        }
+    }
+    if lbfgs_iters >= 140 && refined.len() >= 3 {
+        let e0 = refined[0].total_energy;
+        let e_cap = e0 + (0.035 * e0.abs()).max(6.0);
+        let k_pool = refined
+            .iter()
+            .take(5)
+            .take_while(|c| c.total_energy <= e_cap)
+            .count();
+        if k_pool >= 3 {
+            let l = sequence.len();
+            let mut core_mask = vec![false; l];
+            for adr in adrs {
+                for c in &adr.candidates {
+                    if c.res_a.abs_diff(c.res_b) >= 3 {
+                        if c.res_a < l {
+                            core_mask[c.res_a] = true;
+                        }
+                        if c.res_b < l {
+                            core_mask[c.res_b] = true;
+                        }
+                    }
+                }
+            }
+            let mask_opt = if core_mask.iter().filter(|&&b| b).count() >= 4 {
+                Some(core_mask.as_slice())
+            } else {
+                None
+            };
+            let mut ranked: Vec<(f64, StructureConformer)> =
+                refined.drain(..k_pool).map(|c| (0.0, c)).collect();
+            for i in 0..k_pool {
+                let mut sum_rmsd = 0.0;
+                for j in 0..k_pool {
+                    if i != j {
+                        sum_rmsd += backbone_rmsd_between_chains(
+                            &ranked[i].1.chain,
+                            &ranked[j].1.chain,
+                            mask_opt,
+                        );
+                    }
+                }
+                let mean_rmsd = sum_rmsd / ((k_pool - 1) as f64);
+                ranked[i].0 = ranked[i].1.total_energy + 10.0 * mean_rmsd;
+            }
+            ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut reordered: Vec<StructureConformer> =
+                ranked.into_iter().map(|(_, c)| c).collect();
+            reordered.append(&mut refined);
+            refined = reordered;
+        }
+    }
     let summary = crate::rdc::evaluate_rdc_validation(&refined[0].chain, rdc_media)?;
     Ok((refined, summary))
+}
+
+fn select_diverse_conformers(
+    pool: &[StructureConformer],
+    max_k: usize,
+    min_rmsd_a: f64,
+) -> Vec<StructureConformer> {
+    let cap = pool.len().min(max_k);
+    if cap <= 1 {
+        return pool[..cap].to_vec();
+    }
+    let mut chosen_idx: Vec<usize> = Vec::with_capacity(cap);
+    for (idx, cand) in pool.iter().enumerate() {
+        if chosen_idx.len() >= cap {
+            break;
+        }
+        let distinct = chosen_idx.iter().all(|&j| {
+            backbone_rmsd_between_chains(&cand.chain, &pool[j].chain, None) >= min_rmsd_a
+        });
+        if distinct {
+            chosen_idx.push(idx);
+        }
+    }
+    if chosen_idx.len() < cap {
+        for idx in 0..pool.len() {
+            if chosen_idx.len() >= cap {
+                break;
+            }
+            if !chosen_idx.contains(&idx) {
+                chosen_idx.push(idx);
+            }
+        }
+    }
+    chosen_idx.into_iter().map(|i| pool[i].clone()).collect()
 }
 
 /// Full end-to-end iterative ADR NOESY folding + optional `TorsionDb` `(phi, psi)` restraints
@@ -2794,6 +4072,7 @@ pub fn calculate_structure_with_rdcs_and_dihedrals(
             "invalid RDC weight w_rdc={w_rdc}: must be finite and >= 0"
         ));
     }
+    let _job_guard = StructureJobGuard::acquire();
 
     let initial_adrs = match_initial_adrs(noesy_peaks, shifts, &cfg.adr_cfg);
     let mut adrs = initial_adrs.clone();
@@ -2832,7 +4111,7 @@ pub fn calculate_structure_with_rdcs_and_dihedrals(
             &dihedral_restraints,
             rdc_media,
             0.60 * w_rdc,
-            110,
+            105,
         )?;
         ensemble = ens_rdc;
     }
@@ -2868,9 +4147,21 @@ pub fn calculate_structure_with_rdcs_and_dihedrals(
         if use_rdc {
             cyc_cfg.n_select = cfg.n_select.max(16).min(cfg.n_replicas.max(1));
         }
-        let n_seed_models = if is_last { 2 } else { 3 };
-        let (wf_num, wf_den) = if is_last { (3, 4) } else { (1, 2) };
-        let top_seeds = &ensemble[..ensemble.len().min(n_seed_models)];
+        let n_seed_models = if use_rdc {
+            4
+        } else if is_last {
+            2
+        } else {
+            3
+        };
+        let (wf_num, wf_den) = if !use_rdc && is_last { (3, 4) } else { (1, 2) };
+        let diverse_seeds;
+        let top_seeds: &[StructureConformer] = if use_rdc {
+            diverse_seeds = select_diverse_conformers(&ensemble, n_seed_models, 0.35);
+            &diverse_seeds
+        } else {
+            &ensemble[..ensemble.len().min(n_seed_models)]
+        };
         let mut folded = fold_ensemble_seeded(
             &shifts.sequence,
             &shifts.seq_ids,
@@ -2884,11 +4175,12 @@ pub fn calculate_structure_with_rdcs_and_dihedrals(
         );
 
         if use_rdc {
-            // Preserve the top RDC-refined conformers alongside newly folded conformers so
-            // high-temperature NOE annealing never discards an already-converged Saupe basin!
-            let keep_prev = ensemble.len().min(8);
-            folded.truncate(cyc_cfg.n_select.saturating_sub(keep_prev).max(4));
-            folded.extend_from_slice(&ensemble[..keep_prev]);
+            // Preserve structurally distinct RDC-refined conformers alongside newly folded conformers
+            // so high-temperature NOE annealing neither discards a converged Saupe basin nor crowds
+            // out independent loop topologies with near-duplicate clones.
+            let preserved = select_diverse_conformers(&ensemble, 8, 0.30);
+            folded.truncate(cyc_cfg.n_select.saturating_sub(preserved.len()).max(4));
+            folded.extend(preserved);
             let (ens_rdc, _) = refine_ensemble_with_rdcs(
                 &folded,
                 &shifts.sequence,
@@ -3425,7 +4717,7 @@ pub fn validate_ensemble(
             if sum_inv_r6 <= 0.0 {
                 continue;
             }
-            let d_eff = 1.0 / sum_inv_r6.cbrt().sqrt();
+            let d_eff = 1.0 / det_cbrt(sum_inv_r6).sqrt();
             let viol = if d_eff > adr.upper_bound {
                 d_eff - adr.upper_bound
             } else if d_eff < adr.lower_bound {
@@ -3668,4 +4960,520 @@ pub fn write_pdb_ensemble(
             path.as_ref().display()
         )
     })
+}
+
+/// Compute Kabsch backbone (`N, CA, C'`) RMSD (in Angstroms) between `chain_a` and `chain_b`
+/// restricted to residues with `seq_min <= seq_id <= seq_max`.
+pub fn backbone_rmsd_seq_range(
+    chain_a: &PdbChain,
+    chain_b: &PdbChain,
+    seq_min: i32,
+    seq_max: i32,
+) -> f64 {
+    let mask: Vec<bool> = chain_a
+        .residues
+        .iter()
+        .map(|r| r.seq_id >= seq_min && r.seq_id <= seq_max)
+        .collect();
+    backbone_rmsd_between_chains(chain_a, chain_b, Some(&mask))
+}
+
+/// Map an experimental proton/pseudoatom name on `res_name` (`seq_idx`) to `(NoeProton, upper_allowance_a)`
+/// following Wuthrich, Billeter & Braun (*J. Mol. Biol.* 1983, 169, 949-961) covalent pseudoatom geometry
+/// relative to backbone `(AmideH, AlphaHA, BetaQB)`.
+fn map_exp_proton_to_noe_site(
+    res_name: &str,
+    is_n_term: bool,
+    atom_pat: &str,
+) -> Option<(NoeProton, f64)> {
+    let r = res_name.trim().to_ascii_uppercase();
+    let a = atom_pat.trim().to_ascii_uppercase();
+    let is_gly = r == "GLY";
+    let is_pro = r == "PRO";
+
+    if matches!(
+        a.as_str(),
+        "H" | "HN" | "H1" | "H2" | "H3" | "HT1" | "HT2" | "HT3"
+    ) {
+        if is_pro {
+            return None;
+        }
+        let allow = if is_n_term && a != "H" && a != "HN" {
+            0.35
+        } else {
+            0.0
+        };
+        return Some((NoeProton::AmideH, allow));
+    }
+    if a.starts_with("HA") || a == "1HA" || a == "2HA" || a == "QA" {
+        let allow = if is_gly { 0.90 } else { 0.0 };
+        return Some((NoeProton::AlphaHA, allow));
+    }
+    if is_gly {
+        return None;
+    }
+    if a.starts_with("HB") || a == "1HB" || a == "2HB" || a == "3HB" || a == "QB" {
+        let has_wild = a.contains('*') || a.contains('#') || a == "QB";
+        let is_beta_methine = matches!(r.as_str(), "ILE" | "THR" | "VAL") && a == "HB";
+        let allow = if has_wild || is_beta_methine {
+            0.30
+        } else {
+            0.65
+        };
+        return Some((NoeProton::BetaQB, allow));
+    }
+    if a.starts_with("HG") || a.starts_with("QG") || a == "1HG" || a == "2HG" {
+        return Some((NoeProton::BetaQB, 1.55));
+    }
+    if a.starts_with("HD") || a.starts_with("QD") || a == "1HD" || a == "2HD" {
+        return Some((NoeProton::BetaQB, 2.45));
+    }
+    if a.starts_with("HE") || a.starts_with("QE") || a == "1HE" || a == "2HE" {
+        return Some((NoeProton::BetaQB, 3.35));
+    }
+    if a.starts_with("HZ") || a.starts_with("QZ") {
+        return Some((NoeProton::BetaQB, 4.10));
+    }
+    if a.starts_with("HH") || a.starts_with("QH") {
+        return Some((NoeProton::BetaQB, 4.55));
+    }
+    None
+}
+
+/// Read experimental proton-proton NOE distance restraints from a clean ASCII TSV file
+/// (`restraint_id  lower_a  upper_a  group_1  group_2`) and map onto [`AmbiguousDistanceRestraint`]s.
+pub fn read_exp_noe_tsv(
+    path: impl AsRef<Path>,
+    sequence: &[String],
+    seq_ids: &[i32],
+) -> Result<Vec<AmbiguousDistanceRestraint>, String> {
+    let bytes = fs::read(path.as_ref()).map_err(|e| {
+        format!(
+            "failed to read experimental NOE TSV '{}': {e}",
+            path.as_ref().display()
+        )
+    })?;
+    if !bytes.is_ascii() {
+        return Err(format!(
+            "experimental NOE TSV '{}' contains non-ASCII bytes",
+            path.as_ref().display()
+        ));
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+    parse_exp_noe_tsv_str(text, sequence, seq_ids)
+}
+
+/// Parse experimental proton-proton NOE distance restraints from ASCII TSV text.
+pub fn parse_exp_noe_tsv_str(
+    text: &str,
+    sequence: &[String],
+    seq_ids: &[i32],
+) -> Result<Vec<AmbiguousDistanceRestraint>, String> {
+    if !text.as_bytes().is_ascii() {
+        return Err("experimental NOE TSV contains non-ASCII characters".to_string());
+    }
+    if sequence.len() != seq_ids.len() {
+        return Err("sequence and seq_ids length mismatch".to_string());
+    }
+    let mut seq_to_idx = std::collections::BTreeMap::new();
+    for (idx, &sid) in seq_ids.iter().enumerate() {
+        seq_to_idx.insert(sid, idx);
+    }
+
+    let parse_group = |grp: &str, line_no: usize| -> Result<Vec<(usize, NoeProton, f64)>, String> {
+        let mut out = Vec::new();
+        for tok in grp.split('|') {
+            let t = tok.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let (s_str, a_str) = t.split_once(':').ok_or_else(|| {
+                format!("line {line_no}: malformed group token '{t}' (expected seq_id:atom)")
+            })?;
+            let sid: i32 = s_str
+                .trim()
+                .parse()
+                .map_err(|e| format!("line {line_no}: invalid seq_id '{s_str}': {e}"))?;
+            let Some(&r_idx) = seq_to_idx.get(&sid) else {
+                continue;
+            };
+            if let Some((site, allow)) =
+                map_exp_proton_to_noe_site(&sequence[r_idx], r_idx == 0, a_str)
+            {
+                out.push((r_idx, site, allow));
+            }
+        }
+        Ok(out)
+    };
+
+    let mut adrs = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed.split('\t').map(str::trim).collect();
+        if cols.first().copied() == Some("restraint_id") {
+            continue;
+        }
+        if cols.len() < 5 {
+            return Err(format!(
+                "line {line_no}: expected 5 TSV columns, got {}",
+                cols.len()
+            ));
+        }
+        let rid: usize = cols[0]
+            .parse()
+            .map_err(|e| format!("line {line_no}: invalid restraint_id '{}': {e}", cols[0]))?;
+        let lower_a: f64 = cols[1]
+            .parse()
+            .map_err(|e| format!("line {line_no}: invalid lower_a '{}': {e}", cols[1]))?;
+        let upper_a: f64 = cols[2]
+            .parse()
+            .map_err(|e| format!("line {line_no}: invalid upper_a '{}': {e}", cols[2]))?;
+        if !lower_a.is_finite() || !upper_a.is_finite() || lower_a <= 0.0 || upper_a < lower_a {
+            return Err(format!(
+                "line {line_no}: invalid distance bounds [{lower_a}, {upper_a}]"
+            ));
+        }
+
+        let g1 = parse_group(cols[3], line_no)?;
+        let g2 = parse_group(cols[4], line_no)?;
+        if g1.is_empty() || g2.is_empty() {
+            continue;
+        }
+
+        // If any pair in `g1 x g2` resolves to the same residue and coarse proton/pseudoatom site
+        // (e.g. an intra-residue `29:HB2 -- 29:HD1` alternative inside an `OR`-ambiguous peak),
+        // the peak is trivially explained intra-residually (`d ~ 0 <= upper_a`) and must NOT force
+        // the remaining inter-residue candidates into spurious cross-links!
+        if g1
+            .iter()
+            .any(|&(ra, sa, _)| g2.iter().any(|&(rb, sb, _)| ra == rb && sa == sb))
+        {
+            continue;
+        }
+
+        let mut pair_map: std::collections::BTreeMap<
+            (usize, NoeProton, usize, NoeProton),
+            (f64, f64),
+        > = std::collections::BTreeMap::new();
+        for &(ra, sa, aa) in &g1 {
+            for &(rb, sb, ab) in &g2 {
+                let key = if (ra, sa) <= (rb, sb) {
+                    (ra, sa, rb, sb)
+                } else {
+                    (rb, sb, ra, sa)
+                };
+                let allow_up = aa.max(ab) + 0.55 * aa.min(ab);
+                let allow_lo = aa + ab;
+                pair_map
+                    .entry(key)
+                    .and_modify(|cur| {
+                        cur.0 = cur.0.max(allow_up);
+                        cur.1 = cur.1.max(allow_lo);
+                    })
+                    .or_insert((allow_up, allow_lo));
+            }
+        }
+        if pair_map.is_empty() {
+            continue;
+        }
+
+        let max_allow_up = pair_map.values().map(|v| v.0).fold(0.0f64, f64::max);
+        let max_allow_lo = pair_map.values().map(|v| v.1).fold(0.0f64, f64::max);
+        let w = 1.0 / (pair_map.len() as f64);
+        let candidates: Vec<crate::noesy::NoeCandidatePair> = pair_map
+            .keys()
+            .map(|&(ra, sa, rb, sb)| crate::noesy::NoeCandidatePair {
+                res_a: ra,
+                atom_a: sa,
+                res_b: rb,
+                atom_b: sb,
+                shift_score: 1.0,
+                network_score: 1.0,
+                weight: w,
+            })
+            .collect();
+        let is_unambiguous = candidates.len() == 1;
+        adrs.push(AmbiguousDistanceRestraint {
+            peak_index: rid,
+            exp: "EXP_NOE".to_string(),
+            lower_bound: (lower_a - max_allow_lo).max(1.80),
+            upper_bound: upper_a + max_allow_up,
+            all_candidates: candidates.clone(),
+            candidates,
+            is_unambiguous,
+        });
+    }
+
+    if adrs.is_empty() {
+        return Err(
+            "experimental NOE TSV produced zero valid proton-proton restraints".to_string(),
+        );
+    }
+    Ok(adrs)
+}
+
+/// Fold a protein ensemble de novo starting strictly from sequence + experimental NOE restraints
+/// (`adrs`) and optional `dihedrals` (with zero reference PDB coordinates), followed by optional
+/// multi-medium variable-projection RDC refinement over working (`!is_free`) couplings.
+#[allow(clippy::too_many_arguments)]
+pub fn fold_from_experimental_noes_and_rdcs(
+    sequence: &[String],
+    seq_ids: &[i32],
+    exp_adrs: &[AmbiguousDistanceRestraint],
+    dihedrals: &[DihedralRestraint],
+    rdc_media: &[crate::rdc::RdcMediumSet],
+    w_rdc: f64,
+    cfg: &StructureCalcConfig,
+) -> Result<
+    (
+        StructureEnsembleResult,
+        Option<crate::rdc::RdcValidationSummary>,
+    ),
+    String,
+> {
+    if sequence.is_empty() || sequence.len() != seq_ids.len() {
+        return Err("non-empty matching sequence and seq_ids required".to_string());
+    }
+    if exp_adrs.is_empty() {
+        return Err("at least one experimental NOE restraint is required".to_string());
+    }
+    let _job_guard = StructureJobGuard::acquire();
+    let aligned_dihs;
+    let dihedrals: &[DihedralRestraint] =
+        if dihedrals.is_empty() || dihedrals.len() == sequence.len() {
+            dihedrals
+        } else {
+            aligned_dihs = align_dihedrals_to_seq_ids(sequence, seq_ids, dihedrals);
+            &aligned_dihs
+        };
+
+    let mut adrs = exp_adrs.to_vec();
+    let initial_unambiguous_adrs = adrs
+        .iter()
+        .filter(|r| r.is_unambiguous || r.candidates.len() == 1)
+        .count();
+    let use_rdc = !rdc_media.is_empty() && w_rdc > 0.0;
+    let mut master = Rng::new(cfg.seed);
+
+    let mut cycle0_cfg = cfg.clone();
+    if cfg.n_refinement_cycles > 0 {
+        cycle0_cfg.lbfgs_iters = (cfg.lbfgs_iters * 2 / 3).max(120);
+    }
+    if use_rdc {
+        cycle0_cfg.n_select = cfg.n_select.max(16).min(cfg.n_replicas.max(1));
+    }
+    let mut ensemble = fold_ensemble_seeded(
+        sequence,
+        seq_ids,
+        &adrs,
+        dihedrals,
+        &cycle0_cfg,
+        &[],
+        0,
+        1,
+        master.next_u64(),
+    );
+
+    if use_rdc && cfg.n_refinement_cycles > 0 {
+        let (ens_rdc, _) = refine_ensemble_with_rdcs(
+            &ensemble,
+            sequence,
+            seq_ids,
+            &adrs,
+            dihedrals,
+            rdc_media,
+            0.60 * w_rdc,
+            105,
+        )?;
+        ensemble = ens_rdc;
+    }
+
+    for cyc in 0..cfg.n_refinement_cycles {
+        let is_last = cyc + 1 == cfg.n_refinement_cycles;
+        let min_keep = if is_last { 0.07 } else { 0.035 };
+        let cum_target = if is_last { 0.90 } else { 0.95 };
+        let n_guide = if is_last {
+            ensemble.len().clamp(1, 4)
+        } else {
+            ensemble.len().clamp(1, 5)
+        };
+        if use_rdc {
+            adrs = exp_adrs.to_vec();
+        }
+        reweight_adrs_with_coords(
+            &mut adrs,
+            n_guide,
+            min_keep,
+            cum_target,
+            cfg.adr_cfg.unambiguous_threshold,
+            |m, res_idx, site| ensemble[m].chain.residues.get(res_idx)?.noe_coord(site),
+        );
+
+        let mut cyc_cfg = if is_last {
+            cfg.clone()
+        } else {
+            cycle0_cfg.clone()
+        };
+        if use_rdc {
+            cyc_cfg.n_select = cfg.n_select.max(16).min(cfg.n_replicas.max(1));
+        }
+        let n_seed_models = if use_rdc {
+            4
+        } else if is_last {
+            2
+        } else {
+            3
+        };
+        let (wf_num, wf_den) = if !use_rdc && is_last { (3, 4) } else { (1, 2) };
+        let diverse_seeds;
+        let top_seeds: &[StructureConformer] = if use_rdc {
+            diverse_seeds = select_diverse_conformers(&ensemble, n_seed_models, 0.35);
+            &diverse_seeds
+        } else {
+            &ensemble[..ensemble.len().min(n_seed_models)]
+        };
+        let mut folded = fold_ensemble_seeded(
+            sequence,
+            seq_ids,
+            &adrs,
+            dihedrals,
+            &cyc_cfg,
+            top_seeds,
+            wf_num,
+            wf_den,
+            master.next_u64(),
+        );
+
+        if use_rdc {
+            let preserved = select_diverse_conformers(&ensemble, 8, 0.30);
+            folded.truncate(cyc_cfg.n_select.saturating_sub(preserved.len()).max(4));
+            folded.extend(preserved);
+            let (ens_rdc, _) = refine_ensemble_with_rdcs(
+                &folded,
+                sequence,
+                seq_ids,
+                &adrs,
+                dihedrals,
+                rdc_media,
+                0.85 * w_rdc,
+                130,
+            )?;
+            ensemble = ens_rdc;
+            if is_last {
+                adrs = exp_adrs.to_vec();
+                let n_g_final = ensemble.len().clamp(1, 4);
+                reweight_adrs_with_coords(
+                    &mut adrs,
+                    n_g_final,
+                    0.07,
+                    0.90,
+                    cfg.adr_cfg.unambiguous_threshold,
+                    |m, res_idx, site| ensemble[m].chain.residues.get(res_idx)?.noe_coord(site),
+                );
+            }
+        } else {
+            ensemble = folded;
+        }
+    }
+
+    let mut res = StructureEnsembleResult {
+        conformers: ensemble,
+        dihedral_restraints: dihedrals.to_vec(),
+        initial_unambiguous_adrs,
+        final_adrs: adrs,
+    };
+
+    if !use_rdc {
+        return Ok((res, None));
+    }
+
+    let (mut refined, _) = refine_ensemble_with_rdcs(
+        &res.conformers,
+        sequence,
+        seq_ids,
+        &res.final_adrs,
+        dihedrals,
+        rdc_media,
+        w_rdc,
+        cfg.lbfgs_iters.max(200),
+    )?;
+    refined.truncate(cfg.n_select.max(1));
+    let rdc_val = crate::rdc::evaluate_rdc_validation(&refined[0].chain, rdc_media)?;
+    res.conformers = refined;
+    Ok((res, Some(rdc_val)))
+}
+
+#[cfg(test)]
+mod det_math_tests {
+    use super::*;
+
+    #[test]
+    fn test_structure_deterministic_math_ulp_parity() {
+        for i in -10_000..=10_000 {
+            let x = (i as f64) * 0.0137;
+            let (ds, dc) = det_sin_cos(x);
+            let (rs, rc) = x.sin_cos();
+            assert!(
+                (ds - rs).abs() <= 4.5e-16 && (dc - rc).abs() <= 4.5e-16,
+                "sin_cos mismatch at x={x}: det=({ds},{dc}) ref=({rs},{rc})"
+            );
+        }
+        for i in -7_000..=7_000 {
+            let x = (i as f64) * 0.1;
+            let de = det_exp(x);
+            let re = x.exp();
+            let rel = if re == 0.0 {
+                de.abs()
+            } else {
+                ((de - re) / re).abs()
+            };
+            assert!(
+                rel <= 4.5e-16,
+                "exp mismatch at x={x}: det={de} ref={re} rel={rel}"
+            );
+        }
+        for i in 1..=10_000 {
+            let x = (i as f64) * 1.37e-4;
+            let dl = det_ln(x);
+            let rl = x.ln();
+            assert!(
+                (dl - rl).abs() <= 4.5e-16 * (1.0 + rl.abs()),
+                "ln mismatch at x={x}: det={dl} ref={rl}"
+            );
+            let dc = det_cbrt(x);
+            let rc = x.cbrt();
+            assert!(
+                ((dc - rc) / rc).abs() <= 4.5e-16,
+                "cbrt mismatch at x={x}: det={dc} ref={rc}"
+            );
+        }
+        for iy in -50..=50 {
+            for ix in -50..=50 {
+                if ix == 0 && iy == 0 {
+                    continue;
+                }
+                let y = (iy as f64) * 0.37;
+                let x = (ix as f64) * 0.29;
+                let da = det_atan2(y, x);
+                let ra = y.atan2(x);
+                assert!(
+                    (da - ra).abs() <= 4.5e-16,
+                    "atan2 mismatch at ({y},{x}): det={da} ref={ra}"
+                );
+            }
+        }
+        for i in -1_000..=1_000 {
+            let x = (i as f64) * 0.001;
+            let da = det_acos(x);
+            let ra = x.acos();
+            assert!(
+                (da - ra).abs() <= 6.0e-16,
+                "acos mismatch at x={x}: det={da} ref={ra}"
+            );
+        }
+    }
 }

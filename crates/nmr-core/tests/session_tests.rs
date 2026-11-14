@@ -91,6 +91,11 @@ fn sample_processing_recipe(
             final_noise_sigma: 2.35,
             fista_momentum: true,
         }),
+        enable_axis_rescue: true,
+        axis_rescue_audit: None,
+        allow_truncated_fid: false,
+        truncated_fid_zero_filled: false,
+        truncated_fid_warning: None,
     }
 }
 

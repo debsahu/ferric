@@ -34,12 +34,19 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::fid::{
-    read_fid_2d, read_fid_3d, Complex64, Fid1D, Fid2D, Fid3D, FidAxisMeta, FidVendor, QuadMode,
-    StoredWindowHint,
+    format_truncated_fid_name_warning, read_fid_2d_opts, read_fid_3d_opts, Complex64, Fid1D, Fid2D,
+    Fid3D, FidAxisMeta, FidVendor, QuadMode, StoredWindowHint,
 };
 use crate::ops::{
     auto_phase_1d, auto_phase_direct_nd, auto_phase_indirect_nd, hilbert_transform_in_place,
     lock_all_positive_polarity_3d, lock_biphasic_ca_polarity_3d, AutoPhaseConfig, PolarityMode,
+};
+pub use crate::pulprog::{
+    apply_indirect_axis_transform_3d, evaluate_3d_axis_hypotheses_against_hsqc,
+    evaluate_3d_axis_hypotheses_against_roots, extract_hsqc_2d_roots_for_verification,
+    verify_3d_axis_hypotheses_against_hsqc, verify_3d_axis_hypotheses_against_roots,
+    AxisHypothesisScore, AxisHypothesisVerification, AxisTransformOp, NamedAxisHypothesis,
+    MIN_AXIS_RESCUE_LN_BF,
 };
 use crate::spectrum::{AxisPpm, Spectrum2D, Spectrum3D};
 
@@ -190,6 +197,61 @@ impl Default for NusIstConfig {
     }
 }
 
+/// Compact serializable audit record for empirical 3D indirect-axis `{sign, fold}` verification
+/// against a `2D 15N-HSQC` (`docs/specs/11-fid-processing.md` §1.5; `13.3:P1-1`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AxisRescueAuditRecord {
+    pub experiment: String,
+    pub selected: NamedAxisHypothesis,
+    pub enabled: bool,
+    pub applied: bool,
+    pub polarity_flipped: bool,
+    pub ln_bayes_factor_vs_canonical: f64,
+    pub canonical_matched_fraction: f64,
+    pub selected_matched_fraction: f64,
+}
+
+impl AxisRescueAuditRecord {
+    pub fn from_verification(
+        experiment: impl Into<String>,
+        ver: &AxisHypothesisVerification,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            experiment: experiment.into(),
+            selected: ver.selected,
+            enabled,
+            applied: ver.applied,
+            polarity_flipped: ver.polarity_flipped,
+            ln_bayes_factor_vs_canonical: ver.ln_bayes_factor_vs_canonical,
+            canonical_matched_fraction: ver.canonical_matched_fraction,
+            selected_matched_fraction: ver.selected_matched_fraction,
+        }
+    }
+
+    /// Returns a standardized `warning:` diagnostic whenever a non-canonical 3D axis transform
+    /// or polarity flip was applied to a cube (`13.3:P1-1`).
+    pub fn warning_message(&self) -> Option<String> {
+        if self.applied || self.polarity_flipped {
+            Some(format!(
+                "warning: [axis-rescue] applied non-canonical 3D axis transform {:?} on {} (ln_BF={:.2}, matched_HSQC={:.1}% -> {:.1}%, polarity_flipped={}); pass --no-axis-rescue (or enable_axis_rescue=false) to disable",
+                self.selected,
+                self.experiment,
+                self.ln_bayes_factor_vs_canonical,
+                self.canonical_matched_fraction * 100.0,
+                self.selected_matched_fraction * 100.0,
+                self.polarity_flipped,
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+fn default_axis_rescue_enabled() -> bool {
+    true
+}
+
 /// Complete deterministic processing recipe for 1D, 2D, or 3D FIDs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProcessingRecipe {
@@ -197,6 +259,22 @@ pub struct ProcessingRecipe {
     pub dims: Vec<DimRecipe>,
     /// NUS IST/FISTA reconstruction parameters (populated when `nus_mask.is_some()`, or used as fallback if NUS).
     pub nus: Option<NusIstConfig>,
+    /// Enable empirical `{sign, fold}` indirect-axis likelihood rescue against `2D 15N-HSQC` (`default = true`; `--no-axis-rescue` sets `false`).
+    #[serde(default = "default_axis_rescue_enabled")]
+    pub enable_axis_rescue: bool,
+    /// Provenance audit record populated when 3D `(1H, 15N)` registration evaluates `{sign, fold}` axis hypotheses against `2D 15N-HSQC`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub axis_rescue_audit: Option<AxisRescueAuditRecord>,
+    /// Explicit opt-in (`--allow-truncated-fid`, default `false`) permitting halted/truncated FID acquisitions
+    /// to zero-fill missing indirect traces instead of failing closed.
+    #[serde(default)]
+    pub allow_truncated_fid: bool,
+    /// `true` when this recipe processed a halted FID whose missing indirect traces were zero-filled.
+    #[serde(default)]
+    pub truncated_fid_zero_filled: bool,
+    /// Diagnostic warning recorded when missing indirect traces of a halted FID were zero-filled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_fid_warning: Option<String>,
 }
 
 impl DimRecipe {
@@ -365,6 +443,16 @@ impl DimRecipe {
         self.phase_source = PhaseSource::Auto;
         self.fcor = 0.5;
     }
+
+    /// Switch this dimension to `PhaseSource::Auto` while preserving an explicit acquisition-time
+    /// `FCOR` (`stored_fcor`, e.g. `1.0` for half-dwell $t_1(0) = \Delta t_1 / 2$ or Varian
+    /// `f1180='y'`) and defaulting to `0.5` otherwise (Otting et al. 1986; Marion et al. 1989).
+    fn set_auto_phase_with_stored_fcor(&mut self, stored_fcor: Option<f64>) {
+        self.p0_deg = None;
+        self.p1_deg = None;
+        self.phase_source = PhaseSource::Auto;
+        self.fcor = stored_fcor.unwrap_or(0.5);
+    }
 }
 
 impl ProcessingRecipe {
@@ -372,28 +460,52 @@ impl ProcessingRecipe {
         Self {
             dims: vec![DimRecipe::from_axis_meta(&fid.axis_x, 0)],
             nus: None,
+            enable_axis_rescue: true,
+            axis_rescue_audit: None,
+            allow_truncated_fid: false,
+            truncated_fid_zero_filled: false,
+            truncated_fid_warning: None,
         }
     }
 
     pub fn from_fid_2d(fid: &Fid2D) -> Self {
+        let (allow_truncated_fid, truncated_fid_zero_filled, truncated_fid_warning) =
+            if let Some((obs, exp)) = fid.truncated_traces {
+                (
+                    true,
+                    true,
+                    Some(format_truncated_fid_name_warning(&fid.name, obs, exp)),
+                )
+            } else {
+                (false, false, None)
+            };
         let mut rec = Self {
             dims: vec![
                 DimRecipe::from_axis_meta(&fid.axis_x, 0),
                 DimRecipe::from_axis_meta(&fid.axis_y, 1),
             ],
             nus: fid.nus_mask.as_ref().map(|_| NusIstConfig::default()),
+            enable_axis_rescue: true,
+            axis_rescue_audit: None,
+            allow_truncated_fid,
+            truncated_fid_zero_filled,
+            truncated_fid_warning,
         };
+        let axes = [&fid.axis_x, &fid.axis_y];
         if fid.vendor == FidVendor::Varian {
             // Varian `.fid/procpar` stores VnmrJ 1D interactive scout cursor `rp*`/`lp*` rather
-            // than calibrated 2D spectral phases; solve both dimensions via blind autophasing.
-            rec.set_auto_phase();
+            // than calibrated 2D spectral phases; solve both dimensions via blind autophasing,
+            // preserving explicit `fcor = Some(1.0)` when `f1180 = 'y'` (Marion et al. 1989).
+            for (d, ax) in rec.dims.iter_mut().zip(axes) {
+                d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
+            }
         } else {
-            for d in &mut rec.dims {
+            for (d, ax) in rec.dims.iter_mut().zip(axes) {
                 if matches!(
                     d.phase_source,
                     PhaseSource::AutoChen2002 | PhaseSource::DefaultZero
                 ) {
-                    d.set_auto_phase();
+                    d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
                 }
             }
         }
@@ -401,6 +513,16 @@ impl ProcessingRecipe {
     }
 
     pub fn from_fid_3d(fid: &Fid3D) -> Self {
+        let (allow_truncated_fid, truncated_fid_zero_filled, truncated_fid_warning) =
+            if let Some((obs, exp)) = fid.truncated_traces {
+                (
+                    true,
+                    true,
+                    Some(format_truncated_fid_name_warning(&fid.name, obs, exp)),
+                )
+            } else {
+                (false, false, None)
+            };
         let mut rec = Self {
             dims: vec![
                 DimRecipe::from_axis_meta(&fid.axis_x, 0),
@@ -408,16 +530,24 @@ impl ProcessingRecipe {
                 DimRecipe::from_axis_meta(&fid.axis_z, 2),
             ],
             nus: fid.nus_mask.as_ref().map(|_| NusIstConfig::default()),
+            enable_axis_rescue: true,
+            axis_rescue_audit: None,
+            allow_truncated_fid,
+            truncated_fid_zero_filled,
+            truncated_fid_warning,
         };
+        let axes = [&fid.axis_x, &fid.axis_y, &fid.axis_z];
         if fid.vendor == FidVendor::Varian {
-            rec.set_auto_phase();
+            for (d, ax) in rec.dims.iter_mut().zip(axes) {
+                d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
+            }
         } else {
-            for d in &mut rec.dims {
+            for (d, ax) in rec.dims.iter_mut().zip(axes) {
                 if matches!(
                     d.phase_source,
                     PhaseSource::AutoChen2002 | PhaseSource::DefaultZero
                 ) {
-                    d.set_auto_phase();
+                    d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
                 }
             }
         }
@@ -476,6 +606,28 @@ impl ProcessingRecipe {
     /// Builder helper to toggle indirect Mirror-Image Linear Prediction.
     pub fn with_linear_prediction(mut self, enabled: bool) -> Self {
         self.set_linear_prediction(enabled);
+        self
+    }
+
+    /// Enable or disable empirical `{sign, fold}` indirect-axis likelihood rescue (`--no-axis-rescue`).
+    pub fn set_axis_rescue(&mut self, enabled: bool) {
+        self.enable_axis_rescue = enabled;
+    }
+
+    /// Builder helper to toggle empirical `{sign, fold}` indirect-axis likelihood rescue.
+    pub fn with_axis_rescue(mut self, enabled: bool) -> Self {
+        self.enable_axis_rescue = enabled;
+        self
+    }
+
+    /// Enable or disable zero-filling halted/truncated FID acquisitions (`--allow-truncated-fid`).
+    pub fn set_allow_truncated_fid(&mut self, allow: bool) {
+        self.allow_truncated_fid = allow;
+    }
+
+    /// Builder helper to toggle opt-in zero-filling for halted/truncated FID acquisitions.
+    pub fn with_allow_truncated_fid(mut self, allow: bool) -> Self {
+        self.allow_truncated_fid = allow;
         self
     }
 
@@ -1303,6 +1455,37 @@ fn auto_phase_cfg_for_exp(exp: &str) -> AutoPhaseConfig {
         AutoPhaseConfig::biphasic()
     } else {
         AutoPhaseConfig::default()
+    }
+}
+
+/// Solve blind indirect phase `(p0_deg, p1_deg)` on `ops`-convention traces (`Re(tr * exp(+i phi))`),
+/// pre-rotating by `pulprog_p1_deg` when multi-half-dwell initial sampling (`|p1| >= 360°`, e.g.
+/// XWIN-NMR 2.x `cnst0 = 1 -> -540°` or `cnst0 = 2 -> -900°`) places `p1` outside `[-90°, +90°]`.
+fn solve_indirect_phase_with_pulprog_p1(
+    cand_cols: &[Vec<Complex64>],
+    axis_full: &AxisPpm,
+    cfg: &AutoPhaseConfig,
+    pulprog_p1_deg: Option<f64>,
+) -> (f64, f64) {
+    if let Some(p1_seed) = pulprog_p1_deg.filter(|p| p.abs() >= 360.0) {
+        let mut rotated: Vec<Vec<Complex64>> = Vec::with_capacity(cand_cols.len());
+        for tr in cand_cols {
+            let n = tr.len().max(1) as f64;
+            let step_rad = p1_seed.to_radians() / n;
+            let mut r = Vec::with_capacity(tr.len());
+            for (k, &[re, im]) in tr.iter().enumerate() {
+                let (ss, cs) = ((k as f64) * step_rad).sin_cos();
+                r.push([re * cs - im * ss, re * ss + im * cs]);
+            }
+            rotated.push(r);
+        }
+        let mut local_cfg = cfg.clone();
+        local_cfg.max_abs_p1_deg = local_cfg.max_abs_p1_deg.min(30.0);
+        let sol = auto_phase_indirect_nd(&rotated, axis_full, &local_cfg);
+        (sol.p0_deg, p1_seed + sol.p1_deg)
+    } else {
+        let sol = auto_phase_indirect_nd(cand_cols, axis_full, cfg);
+        (sol.p0_deg, sol.p1_deg)
     }
 }
 
@@ -2155,6 +2338,13 @@ pub fn process_fid_2d_mut(
             recipe.dims.len()
         ));
     }
+    if let Some((obs, exp)) = fid.truncated_traces {
+        recipe.truncated_fid_zero_filled = true;
+        if recipe.truncated_fid_warning.is_none() {
+            recipe.truncated_fid_warning =
+                Some(format_truncated_fid_name_warning(&fid.name, obs, exp));
+        }
+    }
 
     let n0 = fid.axis_x.complex_points;
     let n1 = fid.axis_y.complex_points;
@@ -2316,6 +2506,15 @@ pub fn process_fid_2d_mut(
     let auto_solved_y = dim_y.p0_deg.is_none()
         && dim_y.p1_deg.is_none()
         && !matches!(dim_y.phase_source, PhaseSource::DefaultZero);
+    if auto_solved_y {
+        // Solve blind indirect `(p0, p1)` without a `+0.5 * s(0)` DC bias (unless multi-dwell `pulprog_p1_deg`
+        // already guarantees `|p1| >= 360°`, which requires `fcor = 1.0`); `fcor` is reconciled after solve.
+        dim_y.fcor = if fid.axis_y.stored_proc.pulprog_p1_deg.is_some() {
+            1.0
+        } else {
+            0.5
+        };
+    }
 
     let (p0_y, p1_y) = match (dim_y.p0_deg, dim_y.p1_deg, dim_y.phase_source) {
         (Some(p0), Some(p1), _) => (p0, p1),
@@ -2367,9 +2566,12 @@ pub fn process_fid_2d_mut(
                 cand_cols.push(conj_trace_for_ops(&sc));
             }
             if let Some(ax_y_full) = ax_y_rep {
-                let sol =
-                    auto_phase_indirect_nd(&cand_cols, &ax_y_full, &AutoPhaseConfig::default());
-                (sol.p0_deg, sol.p1_deg)
+                solve_indirect_phase_with_pulprog_p1(
+                    &cand_cols,
+                    &ax_y_full,
+                    &AutoPhaseConfig::default(),
+                    fid.axis_y.stored_proc.pulprog_p1_deg,
+                )
             } else {
                 (0.0, 0.0)
             }
@@ -2377,9 +2579,10 @@ pub fn process_fid_2d_mut(
     };
     recipe.dims[1].p0_deg = Some(p0_y);
     recipe.dims[1].p1_deg = Some(p1_y);
-    if auto_solved_y && p1_y.abs() > 15.0 {
-        dim_y.fcor = 1.0;
-        recipe.dims[1].fcor = 1.0;
+    if auto_solved_y {
+        let fc = if p1_y.abs() > 15.0 { 1.0 } else { 0.5 };
+        dim_y.fcor = fc;
+        recipe.dims[1].fcor = fc;
     }
 
     // Process each `ix in 0..nx_out` column independently in parallel, storing transposed `[nx_out * ny_out]`
@@ -2931,6 +3134,13 @@ fn process_fid_3d_inner(
             recipe.dims.len()
         ));
     }
+    if let Some((obs, exp_tr)) = fid.truncated_traces {
+        recipe.truncated_fid_zero_filled = true;
+        if recipe.truncated_fid_warning.is_none() {
+            recipe.truncated_fid_warning =
+                Some(format_truncated_fid_name_warning(&fid.name, obs, exp_tr));
+        }
+    }
 
     let n0 = fid.axis_x.complex_points;
     let n1 = fid.axis_y.complex_points;
@@ -3099,6 +3309,20 @@ fn process_fid_3d_inner(
     let need_auto_z = dim_z.p0_deg.is_none()
         && dim_z.p1_deg.is_none()
         && !matches!(dim_z.phase_source, PhaseSource::DefaultZero);
+    if need_auto_y {
+        dim_y.fcor = if fid.axis_y.stored_proc.pulprog_p1_deg.is_some() {
+            1.0
+        } else {
+            0.5
+        };
+    }
+    if need_auto_z {
+        dim_z.fcor = if fid.axis_z.stored_proc.pulprog_p1_deg.is_some() {
+            1.0
+        } else {
+            0.5
+        };
+    }
 
     let (mut p0_y, p1_y) = (dim_y.p0_deg.unwrap_or(0.0), dim_y.p1_deg.unwrap_or(0.0));
     let (mut p0_z, p1_z) = (dim_z.p0_deg.unwrap_or(0.0), dim_z.p1_deg.unwrap_or(0.0));
@@ -3228,17 +3452,22 @@ fn process_fid_3d_inner(
                 {
                     cfg_y.polarity = PolarityMode::AllPositive;
                 }
-                let sol = auto_phase_indirect_nd(&cand_y_cols, &ax_y_full, &cfg_y);
-                (sol.p0_deg, sol.p1_deg)
+                solve_indirect_phase_with_pulprog_p1(
+                    &cand_y_cols,
+                    &ax_y_full,
+                    &cfg_y,
+                    fid.axis_y.stored_proc.pulprog_p1_deg,
+                )
             } else {
                 (0.0, 0.0)
             }
         } else {
             (p0_y, p1_y)
         };
-        if need_auto_y && sy1.abs() > 15.0 {
-            dim_y.fcor = 1.0;
-            recipe.dims[1].fcor = 1.0;
+        if need_auto_y {
+            let fc = if sy1.abs() > 15.0 { 1.0 } else { 0.5 };
+            dim_y.fcor = fc;
+            recipe.dims[1].fcor = fc;
         }
 
         let (sz0, sz1) = if need_auto_z {
@@ -3392,8 +3621,12 @@ fn process_fid_3d_inner(
                 {
                     cfg_z.polarity = PolarityMode::AllPositive;
                 }
-                let sol = auto_phase_indirect_nd(&cand_z_cols, &ax_z_full, &cfg_z);
-                (sol.p0_deg, sol.p1_deg)
+                solve_indirect_phase_with_pulprog_p1(
+                    &cand_z_cols,
+                    &ax_z_full,
+                    &cfg_z,
+                    fid.axis_z.stored_proc.pulprog_p1_deg,
+                )
             } else {
                 (0.0, 0.0)
             }
@@ -3410,9 +3643,10 @@ fn process_fid_3d_inner(
     p0_z = p0_z_solved;
     let p1_y = p1_y_solved;
     let p1_z = p1_z_solved;
-    if need_auto_z && p1_z.abs() > 15.0 {
-        dim_z.fcor = 1.0;
-        recipe.dims[2].fcor = 1.0;
+    if need_auto_z {
+        let fc = if p1_z.abs() > 15.0 { 1.0 } else { 0.5 };
+        dim_z.fcor = fc;
+        recipe.dims[2].fcor = fc;
     }
     recipe.dims[1].p0_deg = Some(p0_y);
     recipe.dims[1].p1_deg = Some(p1_y);
@@ -3648,10 +3882,10 @@ fn process_fid_3d_inner(
             if is_mirrored_aliphatic_cacb_3d(&out_spec, full_c_axis, c0_off) {
                 recipe.dims[c_dim].conjugate_for_fft = !recipe.dims[c_dim].conjugate_for_fft;
                 if need_auto_y {
-                    recipe.dims[1].set_auto_phase();
+                    recipe.dims[1].set_auto_phase_with_stored_fcor(fid.axis_y.stored_proc.fcor);
                 }
                 if need_auto_z {
-                    recipe.dims[2].set_auto_phase();
+                    recipe.dims[2].set_auto_phase_with_stored_fcor(fid.axis_z.stored_proc.fcor);
                 }
                 return process_fid_3d_inner(fid, exp, recipe, false);
             }
@@ -3684,12 +3918,34 @@ fn process_fid_3d_inner(
 /// Updates `spec_3d.axis_x.first_ppm += dh` and `spec_3d.axis_y.first_ppm += dn` in place when a
 /// statistically significant peak alignment shift is detected within `[-max_dh_ppm, +max_dh_ppm]`
 /// and `[-max_dn_ppm, +max_dn_ppm]`, returning `(applied_dh_ppm, applied_dn_ppm)`.
+#[deprecated(
+    since = "0.9.0",
+    note = "use register_3d_hn_to_hsqc_2d_with_audit to preserve AxisRescueAuditRecord provenance"
+)]
 pub fn register_3d_hn_to_hsqc_2d(
     spec_3d: &mut Spectrum3D,
     hsqc_2d: &Spectrum2D,
     max_dh_ppm: f64,
     max_dn_ppm: f64,
 ) -> (f64, f64) {
+    let (dh, dn, _) =
+        register_3d_hn_to_hsqc_2d_with_audit(spec_3d, hsqc_2d, max_dh_ppm, max_dn_ppm, true);
+    (dh, dn)
+}
+
+/// Align a 3D `(1H, 15N, 13C)` cube to a 2D `15N-HSQC` while returning a full
+/// [`AxisRescueAuditRecord`] (`13.3:P1-1`). When `enable_axis_rescue` is `true` and a
+/// non-canonical `{sign, fold}` hypothesis beats `Canonical` by `>= MIN_AXIS_RESCUE_LN_BF`,
+/// applies the transform in-place and emits a loud `warning:` line on `stderr`; when
+/// `enable_axis_rescue` is `false` (`--no-axis-rescue`), evaluates the diagnostic scores
+/// read-only without mutating the 3D axes (`applied = false`).
+pub fn register_3d_hn_to_hsqc_2d_with_audit(
+    spec_3d: &mut Spectrum3D,
+    hsqc_2d: &Spectrum2D,
+    max_dh_ppm: f64,
+    max_dn_ppm: f64,
+    enable_axis_rescue: bool,
+) -> (f64, f64, Option<AxisRescueAuditRecord>) {
     let nx3 = spec_3d.axis_x.size;
     let ny3 = spec_3d.axis_y.size;
     let nz3 = spec_3d.axis_z.size;
@@ -3703,7 +3959,23 @@ pub fn register_3d_hn_to_hsqc_2d(
         || max_dh_ppm <= 0.0
         || max_dn_ppm <= 0.0
     {
-        return (0.0, 0.0);
+        return (0.0, 0.0, None);
+    }
+
+    // 0. Empirical `{sign, fold}` indirect-axis likelihood verification against `hsqc_2d`
+    //    (`docs/specs/11-fid-processing.md` §1.5; `13.3:P1-1`): rescues inverted (`REVERSE`) or
+    //    half-SW-shifted (`States` <-> `States-TPPI`) indirect 15N/13C axes when log-Bayes factor
+    //    exceeds `MIN_AXIS_RESCUE_LN_BF` (`12.0` nats) and `enable_axis_rescue` is `true`,
+    //    recording full provenance and emitting a `stderr` warning whenever a transform fires.
+    let ver = if enable_axis_rescue {
+        crate::pulprog::verify_3d_axis_hypotheses_against_hsqc(spec_3d, hsqc_2d, None)
+    } else {
+        crate::pulprog::evaluate_3d_axis_hypotheses_against_hsqc(spec_3d, hsqc_2d, None)
+    };
+    let audit =
+        AxisRescueAuditRecord::from_verification(spec_3d.exp.clone(), &ver, enable_axis_rescue);
+    if let Some(warn_msg) = audit.warning_message() {
+        eprintln!("{warn_msg}");
     }
 
     // 1. Build 2D `(15N, 1H)` max-abs sky-projection of `spec_3d` (supports both AllPositive & Biphasic cubes)
@@ -3719,7 +3991,7 @@ pub fn register_3d_hn_to_hsqc_2d(
     }
     let max3 = proj.iter().copied().fold(0.0_f64, f64::max);
     if max3 <= 0.0 {
-        return (0.0, 0.0);
+        return (0.0, 0.0, Some(audit));
     }
     let mut scratch = proj.clone();
     let med3 = median_in_place(&mut scratch);
@@ -3750,7 +4022,7 @@ pub fn register_3d_hn_to_hsqc_2d(
         }
     }
     if pts3.len() < 4 {
-        return (0.0, 0.0);
+        return (0.0, 0.0, Some(audit));
     }
     pts3.sort_by(|a, b| b.0.total_cmp(&a.0));
     pts3.truncate(256);
@@ -3762,7 +4034,7 @@ pub fn register_3d_hn_to_hsqc_2d(
         .map(|&v| v as f64)
         .fold(0.0_f64, f64::max);
     if max2 <= 0.0 {
-        return (0.0, 0.0);
+        return (0.0, 0.0, Some(audit));
     }
     let mut scratch2: Vec<f64> = hsqc_2d.data.iter().map(|&v| v as f64).collect();
     let med2 = median_in_place(&mut scratch2);
@@ -3792,7 +4064,7 @@ pub fn register_3d_hn_to_hsqc_2d(
         }
     }
     if pts2.len() < 4 {
-        return (0.0, 0.0);
+        return (0.0, 0.0, Some(audit));
     }
     pts2.sort_by(|a, b| b.0.total_cmp(&a.0));
     pts2.truncate(256);
@@ -3813,7 +4085,7 @@ pub fn register_3d_hn_to_hsqc_2d(
         }
     }
     if pairs.is_empty() {
-        return (0.0, 0.0);
+        return (0.0, 0.0, Some(audit));
     }
 
     let inv_vh = 1.0 / (sig_h * sig_h);
@@ -3871,9 +4143,9 @@ pub fn register_3d_hn_to_hsqc_2d(
     if best_score > 0.0 && best_score > zero_score * 1.08 + 1e-6 {
         spec_3d.axis_x.first_ppm += best_dh;
         spec_3d.axis_y.first_ppm += best_dn;
-        (best_dh, best_dn)
+        (best_dh, best_dn, Some(audit))
     } else {
-        (0.0, 0.0)
+        (0.0, 0.0, Some(audit))
     }
 }
 
@@ -3883,8 +4155,19 @@ pub fn process_fid_dir_2d(
     no_crop: bool,
     lp: bool,
 ) -> Result<(Spectrum2D, ProcessingRecipe), String> {
-    let fid = read_fid_2d(dir)?;
+    process_fid_dir_2d_opts(dir, no_crop, lp, false)
+}
+
+/// Read and process a 2D FID directory with explicit `allow_truncated_fid` opt-in zero-filling for halted acquisitions.
+pub fn process_fid_dir_2d_opts(
+    dir: impl AsRef<Path>,
+    no_crop: bool,
+    lp: bool,
+    allow_truncated_fid: bool,
+) -> Result<(Spectrum2D, ProcessingRecipe), String> {
+    let fid = read_fid_2d_opts(dir, allow_truncated_fid)?;
     let mut recipe = ProcessingRecipe::from_fid_2d(&fid);
+    recipe.allow_truncated_fid = allow_truncated_fid;
     if no_crop {
         recipe.set_no_crop();
     }
@@ -3902,8 +4185,20 @@ pub fn process_fid_dir_3d(
     no_crop: bool,
     lp: bool,
 ) -> Result<(Spectrum3D, ProcessingRecipe), String> {
-    let fid = read_fid_3d(dir)?;
+    process_fid_dir_3d_opts(dir, exp, no_crop, lp, false)
+}
+
+/// Read and process a 3D FID directory with explicit `allow_truncated_fid` opt-in zero-filling for halted acquisitions.
+pub fn process_fid_dir_3d_opts(
+    dir: impl AsRef<Path>,
+    exp: &str,
+    no_crop: bool,
+    lp: bool,
+    allow_truncated_fid: bool,
+) -> Result<(Spectrum3D, ProcessingRecipe), String> {
+    let fid = read_fid_3d_opts(dir, allow_truncated_fid)?;
     let mut recipe = ProcessingRecipe::from_fid_3d(&fid);
+    recipe.allow_truncated_fid = allow_truncated_fid;
     if no_crop {
         recipe.set_no_crop();
     }
