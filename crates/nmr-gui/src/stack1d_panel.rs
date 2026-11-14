@@ -975,6 +975,8 @@ pub fn normalize_traces(traces: &mut [Trace1d], mode: NormalizationMode) {
                 trace.generation = trace.generation.wrapping_add(1);
             }
             NormalizationMode::ReferencePeakHeight { ppm_min, ppm_max } => {
+                let saved_scale = trace.scale;
+                trace.scale = 1.0;
                 let lo = ppm_min.min(ppm_max);
                 let hi = ppm_min.max(ppm_max);
                 let mut peak_abs = 0.0_f64;
@@ -987,11 +989,13 @@ pub fn normalize_traces(traces: &mut [Trace1d], mode: NormalizationMode) {
                     }
                 }
                 peak_abs = peak_abs
-                    .max((trace.sample_at_ppm(lo) / trace.scale.max(1e-30)).abs())
-                    .max((trace.sample_at_ppm(hi) / trace.scale.max(1e-30)).abs());
+                    .max(trace.sample_at_ppm(lo).abs())
+                    .max(trace.sample_at_ppm(hi).abs());
                 if peak_abs > 1e-30 {
                     trace.scale = 1.0 / peak_abs;
                     trace.generation = trace.generation.wrapping_add(1);
+                } else {
+                    trace.scale = saved_scale;
                 }
             }
             NormalizationMode::ReferenceRegionIntegral { ppm_min, ppm_max } => {
@@ -2317,11 +2321,29 @@ impl Stack1dState {
         let mut h = 0xcbf2_9ce4_8422_2325_u64;
         for (i, tr) in self.traces.iter().enumerate() {
             h ^= (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            for &b in tr.id.as_bytes() {
+                h = h.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(b);
+            }
+            h = h.wrapping_mul(0x0000_0100_0000_01b3) ^ (tr.len() as u64);
             h = h.wrapping_mul(0x0000_0100_0000_01b3) ^ tr.generation;
             h = h.wrapping_mul(0x0000_0100_0000_01b3) ^ tr.scale.to_bits();
             h = h.wrapping_mul(0x0000_0100_0000_01b3) ^ tr.shift_offset_ppm.to_bits();
             h = h.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(tr.visible);
             h = h.wrapping_mul(0x0000_0100_0000_01b3) ^ tr.covariate.to_bits();
+            if let Some((p_lo, p_hi)) = tr.ppm_bounds() {
+                h = h.wrapping_mul(0x0000_0100_0000_01b3) ^ p_lo.to_bits();
+                h = h.wrapping_mul(0x0000_0100_0000_01b3) ^ p_hi.to_bits();
+            }
+            if let Some(top) = tr.lod.levels.last() {
+                for bk in top {
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3) ^ bk.min_val.to_bits();
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3) ^ bk.max_val.to_bits();
+                }
+            } else {
+                for &v in &tr.intensities {
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3) ^ v.to_bits();
+                }
+            }
         }
         h
     }
@@ -3620,7 +3642,8 @@ mod tests {
         // Locked trace must remain strictly untouched (scale == 1.0)
         assert_eq!(traces[2].scale, 1.0);
 
-        // Reference peak-height normalization on [1.30, 1.70] ppm
+        // Reference peak-height normalization on [1.30, 1.70] ppm (including negative prior `scale = -2.0`)
+        traces[0].scale = -2.0;
         normalize_traces(
             &mut traces,
             NormalizationMode::ReferencePeakHeight {
@@ -3632,6 +3655,42 @@ mod tests {
         let apex_2 = traces[1].sample_at_ppm(1.50);
         assert!((apex_1 - 1.0).abs() < 1e-12, "apex_1 = {apex_1}");
         assert!((apex_2 - 1.0).abs() < 1e-12, "apex_2 = {apex_2}");
+
+        // Out-of-bounds empty region preserves prior negative scale untouched
+        traces[0].scale = -2.0;
+        normalize_traces(
+            &mut traces,
+            NormalizationMode::ReferencePeakHeight {
+                ppm_min: 25.0,
+                ppm_max: 30.0,
+            },
+        );
+        assert_eq!(traces[0].scale, -2.0);
+        normalize_traces(
+            &mut traces,
+            NormalizationMode::ReferencePeakHeight {
+                ppm_min: 1.30,
+                ppm_max: 1.70,
+            },
+        );
+        assert!((traces[0].sample_at_ppm(1.50) - 1.0).abs() < 1e-12);
+
+        // Verify `trace_signature_hash` invalidates when fresh traces of equal length (`gen=1, scale=1`) are swapped in
+        let s_a = Stack1dState::with_traces(vec![Trace1d::new(
+            "fresh_a",
+            "A",
+            0.0,
+            ppm.clone(),
+            vec![1.0; n],
+        )]);
+        let s_b = Stack1dState::with_traces(vec![Trace1d::new(
+            "fresh_b",
+            "B",
+            0.0,
+            ppm.clone(),
+            vec![1.0; n],
+        )]);
+        assert_ne!(s_a.trace_signature_hash(), s_b.trace_signature_hash());
 
         // Reference region-integral normalization on [1.30, 1.70] ppm
         normalize_traces(
