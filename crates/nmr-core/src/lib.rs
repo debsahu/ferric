@@ -21,6 +21,7 @@ pub mod evo_graph;
 pub mod fid;
 pub mod idp_propensity;
 pub mod idp_solver;
+pub mod mcp;
 pub mod methyl_solver;
 pub mod methyl_trosy;
 pub mod nef;
