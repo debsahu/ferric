@@ -11,10 +11,15 @@ use std::path::PathBuf;
 use std::process::{self, Command};
 
 use nmr_core::qc::{
-    eval_monotone_calibration_map, fit_isotonic_monotone_knots,
-    fit_isotonic_monotone_knots_shrunk_toward, DatasetQcReport, ProteinReliabilityCurve,
-    CANONICAL_CALIBRATION_GRID_12, CANONICAL_CALIBRATION_LAPLACE_PRIOR, EVO_GRAPH_CALIBRATED_RUNS,
-    STANDARD_CPU_CALIBRATED_RUNS, STANDARD_GPU_CALIBRATED_RUNS,
+    eval_monotone_calibration_map, fit_isotonic_monotone_knots, fit_isotonic_monotone_knots_beta,
+    fit_isotonic_monotone_knots_shrunk_toward, DatasetQcReport, DatasetQcVerdict,
+    ProteinReliabilityCurve, CANDIDATE_GPU_SHRINKAGE_WEIGHTS,
+    CANONICAL_BAYES_SA_GPU_CPU_SHRINKAGE_WEIGHT, CANONICAL_CALIBRATION_GRID_12,
+    CANONICAL_CALIBRATION_LAPLACE_PRIOR, CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT,
+    CANONICAL_PROTEIN_HC_GATE, EVO_GRAPH_CALIBRATED_RUNS, QC_MIN_LARGE_OFFSET_GAIN_PER_OBS,
+    QC_PROTEIN_HC_CONFIDENCE_CAP, STANDARD_CPU_CALIBRATED_RUNS, STANDARD_CPU_PRIOR_ALPHA,
+    STANDARD_CPU_PRIOR_BETA, STANDARD_GPU_CALIBRATED_RUNS, STANDARD_GPU_PRIOR_ALPHA,
+    STANDARD_GPU_PRIOR_BETA, UNIFORM_CALIBRATION_GRID_10,
 };
 
 fn nmrassign_bin() -> PathBuf {
@@ -366,5 +371,274 @@ fn test_p1_8_default_cpu_assign_is_calibrated_and_mismatched_runs_warns_and_mark
         "expected `calibration_warning=` in .str header:\n{uncal_str}"
     );
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_p1_1_cli_pick_and_pipeline_stderr_warning_report_and_no_axis_rescue() {
+    use nmr_core::nmrstar::read_star;
+    use nmr_core::pulprog::{apply_indirect_axis_transform_3d, AxisTransformOp};
+    use nmr_core::simulate::{
+        render_hsqc_2d, render_triple_3d, simulate, SimConfig, SpectrumRenderConfig,
+    };
+    use nmr_core::spectrum::{write_ucsf_2d, write_ucsf_3d};
+
+    let dir = std::env::temp_dir().join(format!("nmr_p13_p1_1_cli_{}", process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let ref_data = read_star(fixture_star_path(), None).unwrap();
+    let (sim_peaks, _) = simulate(
+        &ref_data,
+        &SimConfig {
+            p_missing_peak: 0.0,
+            spurious_rate: 0.0,
+            seed: 13,
+            ..SimConfig::default()
+        },
+    );
+    let rcfg = SpectrumRenderConfig {
+        nx_h: 128,
+        ny_n: 64,
+        nz_c: 64,
+        ..SpectrumRenderConfig::default()
+    };
+    let hsqc = render_hsqc_2d(&sim_peaks, &rcfg);
+    let mut hnco_corrupted = render_triple_3d("HNCO", &sim_peaks, &rcfg);
+    apply_indirect_axis_transform_3d(
+        &mut hnco_corrupted,
+        AxisTransformOp::HalfSwShift,
+        AxisTransformOp::Canonical,
+        Some("HNCO"),
+        false,
+    );
+
+    let hsqc_path = dir.join("HSQC.ucsf");
+    let hnco_path = dir.join("HNCO_halfsw.ucsf");
+    write_ucsf_2d(&hsqc_path, &hsqc).unwrap();
+    write_ucsf_3d(&hnco_path, &hnco_corrupted).unwrap();
+
+    // 1. Default `nmrassign pick`: emits `warning: [axis-rescue]` on `stderr`!
+    let out_on = dir.join("peaks_on.tsv");
+    let res_on = Command::new(nmrassign_bin())
+        .args([
+            "pick",
+            "--hsqc",
+            hsqc_path.to_str().unwrap(),
+            "--triple",
+            &format!("HNCO={}", hnco_path.display()),
+            "--method",
+            "classical",
+            "--out",
+            out_on.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run nmrassign pick (rescue on)");
+    assert!(
+        res_on.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&res_on.stderr)
+    );
+    let stderr_on = String::from_utf8_lossy(&res_on.stderr);
+    assert!(
+        stderr_on.contains("warning: [axis-rescue]"),
+        "expected `warning: [axis-rescue]` on stderr, got:\n{stderr_on}"
+    );
+    assert!(
+        stderr_on.contains("HalfSwShiftN"),
+        "expected `HalfSwShiftN` in stderr warning, got:\n{stderr_on}"
+    );
+
+    // 2. Opt-out `nmrassign pick --no-axis-rescue`: NO `[axis-rescue]` warning on `stderr`!
+    let out_off = dir.join("peaks_off.tsv");
+    let res_off = Command::new(nmrassign_bin())
+        .args([
+            "pick",
+            "--hsqc",
+            hsqc_path.to_str().unwrap(),
+            "--triple",
+            &format!("HNCO={}", hnco_path.display()),
+            "--method",
+            "classical",
+            "--no-axis-rescue",
+            "--out",
+            out_off.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run nmrassign pick (--no-axis-rescue)");
+    assert!(
+        res_off.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&res_off.stderr)
+    );
+    let stderr_off = String::from_utf8_lossy(&res_off.stderr);
+    assert!(
+        !stderr_off.contains("[axis-rescue]"),
+        "expected zero axis-rescue warnings with --no-axis-rescue, got:\n{stderr_off}"
+    );
+
+    // 3. `nmrassign pipeline` records the applied rescue inside `report.html` (`id="axis-rescue-provenance"`)!
+    let pipe_dir = dir.join("pipe_out");
+    let res_pipe = Command::new(nmrassign_bin())
+        .args([
+            "pipeline",
+            "--star",
+            fixture_star_path().to_str().unwrap(),
+            "--hsqc",
+            hsqc_path.to_str().unwrap(),
+            "--triple",
+            &format!("HNCO={}", hnco_path.display()),
+            "--method",
+            "classical",
+            "--solver",
+            "standard",
+            "--engine",
+            "cpu",
+            "--runs",
+            "1",
+            "--steps",
+            "100",
+            "--out-dir",
+            pipe_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run nmrassign pipeline");
+    assert!(
+        res_pipe.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&res_pipe.stderr)
+    );
+    let report_html = fs::read_to_string(pipe_dir.join("report.html")).expect("read report.html");
+    assert!(report_html.contains("id=\"axis-rescue-provenance\""));
+    assert!(report_html.contains("HalfSwShiftN"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_phase13_p1_7_p1_8_q4_cli_json_and_calibration_contracts() {
+    // 1. Primary 10-bin calibration grid (`ECE_10`), nested LOPO shrinkage candidates, and protein HC gate constants
+    assert_eq!(UNIFORM_CALIBRATION_GRID_10.len(), 11);
+    assert_eq!(UNIFORM_CALIBRATION_GRID_10.first().copied(), Some(0.0));
+    assert_eq!(UNIFORM_CALIBRATION_GRID_10.last().copied(), Some(1.0));
+    assert_eq!(
+        CANDIDATE_GPU_SHRINKAGE_WEIGHTS,
+        &[0.0, 0.20, 0.35, 0.50, 0.65, 0.80, 1.0]
+    );
+    assert!((CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT - 0.00).abs() < 1e-12);
+    assert!((CANONICAL_BAYES_SA_GPU_CPU_SHRINKAGE_WEIGHT - 0.20).abs() < 1e-12);
+    assert!((QC_PROTEIN_HC_CONFIDENCE_CAP - 0.79).abs() < 1e-12);
+    assert!((QC_MIN_LARGE_OFFSET_GAIN_PER_OBS - 0.15).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_corroborated_connectivity - 0.45).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_hc_call_fraction - 0.0).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_crowded_solution_margin - 0.55).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.multiplicity_penalty_floor - 0.0).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_chain_corroborated_frac - 0.0).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_unary_specificity - 0.0).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_bidir_aliphatic_frac - 0.58).abs() < 1e-12);
+    assert!((STANDARD_GPU_PRIOR_ALPHA - 0.35).abs() < 1e-12);
+    assert!((STANDARD_GPU_PRIOR_BETA - 0.65).abs() < 1e-12);
+
+    // 2. Q4 `warn_sub_hc_uncalibrated` & `is_call_calibrated` invariants
+    let mut warn_qc = DatasetQcReport {
+        verdict: DatasetQcVerdict::Warn,
+        warn_sub_hc_uncalibrated: true,
+        ..DatasetQcReport::default()
+    };
+    assert!(!warn_qc.is_call_calibrated(0.79));
+    assert!(warn_qc.is_call_calibrated(0.80));
+    warn_qc.mark_uncalibrated_runs("standard (CPU)", 8, STANDARD_CPU_CALIBRATED_RUNS);
+    assert!(!warn_qc.is_call_calibrated(0.95));
+
+    // 3. Conservative Beta(0.75, 2.25) PAV prior for CPU `standard` (`P1-8`)
+    let sparse = vec![(0.81, true), (0.82, true), (0.99, true)];
+    let sym = fit_isotonic_monotone_knots(
+        &sparse,
+        CANONICAL_CALIBRATION_GRID_12,
+        CANONICAL_CALIBRATION_LAPLACE_PRIOR,
+    );
+    let cons = fit_isotonic_monotone_knots_beta(
+        &sparse,
+        CANONICAL_CALIBRATION_GRID_12,
+        STANDARD_CPU_PRIOR_ALPHA,
+        STANDARD_CPU_PRIOR_BETA,
+    );
+    assert!(
+        eval_monotone_calibration_map(0.81, &cons) < eval_monotone_calibration_map(0.81, &sym),
+        "Beta(0.75, 2.25) must be strictly more conservative than symmetric Beta(0.25, 0.25) on sparse bins"
+    );
+
+    // 4. Verify `real_manifest.tsv` spent-cohort relabels (`cold_p12` -> `seen_p12`, `cold_p13` -> `seen_p13`; `P1-7` & `F4`)
+    let manifest_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/benchmark/real_manifest.tsv");
+    let manifest_txt = fs::read_to_string(&manifest_path).expect("read real_manifest.tsv");
+    let mut n_seen_p12 = 0usize;
+    let mut n_seen_p13 = 0usize;
+    for line in manifest_txt.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with("bmrb_id") {
+            continue;
+        }
+        assert!(
+            !t.ends_with("\tcold_p12") && !t.ends_with("\tcold_p13"),
+            "spent cohorts `cold_p12` / `cold_p13` must be relabeled `seen_*`: {t}"
+        );
+        if t.ends_with("\tseen_p12") {
+            n_seen_p12 += 1;
+        }
+        if t.ends_with("\tseen_p13") {
+            n_seen_p13 += 1;
+        }
+    }
+    assert_eq!(n_seen_p12, 7, "expected 7 relabeled `seen_p12` rows");
+    assert_eq!(n_seen_p13, 7, "expected 7 relabeled `seen_p13` rows");
+
+    // 5. CLI `real-benchmark --json-out` schema check for Phase 13 ECE_10 / debiased_ece_10 / Bernoulli floor fields
+    let dir = std::env::temp_dir().join(format!("nmr_p13_cal_cli_{}", process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let mini_manifest = dir.join("mini_manifest.tsv");
+    fs::write(
+        &mini_manifest,
+        "bmrb_id\tprotein\tresidues\tfield_mhz\tvendor\texperiments\tsplit\tcohort\n\
+         99999\tDummyDev\t60\t600\tBruker\tHSQC,HNCO,HNCACB,CBCACONH\tdev\tdev\n",
+    )
+    .unwrap();
+    let json_out = dir.join("bench_out.json");
+    let empty_root = dir.join("empty_root");
+    let out = Command::new(nmrassign_bin())
+        .args([
+            "real-benchmark",
+            "--manifest",
+            mini_manifest.to_str().unwrap(),
+            "--split",
+            "dev",
+            "--data-root",
+            empty_root.to_str().unwrap(),
+            "--json-out",
+            json_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run real-benchmark");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json_txt = fs::read_to_string(&json_out).expect("read bench_out.json");
+    for key in [
+        "\"mean_protein_ece\":",
+        "\"mean_protein_ece_10\":",
+        "\"mean_protein_debiased_ece_10\":",
+        "\"mean_protein_ece_10_bernoulli_floor\":",
+        "\"mean_protein_ece_12\":",
+        "\"debiased_ece_10\":",
+        "\"ece_10_bernoulli_floor\":",
+    ] {
+        assert!(
+            json_txt.contains(key),
+            "CLI real-benchmark JSON missing {key}:\n{json_txt}"
+        );
+    }
     let _ = fs::remove_dir_all(&dir);
 }

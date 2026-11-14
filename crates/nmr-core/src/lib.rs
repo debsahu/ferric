@@ -12,6 +12,7 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod aromatic;
+pub mod bayes_sa;
 pub mod c13_detected;
 pub mod cest;
 pub mod classify;
@@ -25,6 +26,7 @@ pub mod idp_propensity;
 pub mod idp_solver;
 pub mod methyl_solver;
 pub mod methyl_trosy;
+pub mod modelfree;
 pub mod nef;
 pub mod neural_picker;
 pub mod nmrstar;
@@ -38,8 +40,11 @@ pub mod peaks;
 pub mod picker;
 pub mod priors;
 pub mod process;
+pub mod pulprog;
 pub mod qc;
 pub mod rdc;
+pub mod relax_fit;
+pub mod relax_io;
 pub mod report;
 pub mod rng;
 pub mod service;
