@@ -23,12 +23,17 @@ use std::f64::consts::TAU;
 
 use eframe::egui;
 use nmr_core::cest::{
-    simulate_cest_2state_profile, Cest2StateParams, CestGlobalFitResult, CestProfileDataset,
+    fit_cest_global_cpu, read_cest_profiles_tsv, simulate_cest_2state_profile, Cest2StateParams,
+    CestFitConfig, CestGlobalFitResult, CestNormalization, CestProfileDataset,
 };
-use nmr_core::cpmg::{evaluate_cpmg_model, CpmgGlobalFitResult, CpmgSeriesDataset};
+use nmr_core::cpmg::{
+    evaluate_cpmg_model, fit_cpmg_global_cpu, r2eff_baldwin2014, read_cpmg_series_tsv,
+    CpmgFitConfig, CpmgGlobalFitResult, CpmgSeriesDataset,
+};
 use nmr_core::csp::{
-    fit_naive_michaelis_menten_kd, naive_michaelis_menten_csp, quadratic_tight_binding_csp,
-    CspGlobalFitResult, ResidueCspTrajectory, TrimmedCspThresholds,
+    fit_csp_global_kd, fit_naive_michaelis_menten_kd, naive_michaelis_menten_csp,
+    quadratic_tight_binding_csp, CspAnalysisConfig, CspGlobalFitResult, ResidueCspTrajectory,
+    ResidueTitrationPoint, TrimmedCspThresholds,
 };
 
 use crate::mol3d_overlay::{ColormapKind, QuantitativeTrack, QuantitativeTrackData};
@@ -323,6 +328,354 @@ impl DynamicsStudioPanel {
         self.csp_threshold = resolved_thresh;
     }
 
+    /// Return `true` if `text` matches a `CEST`/`DEST` profile TSV, `CPMG` series TSV, or `CSP`
+    /// tracked trajectory TSV supported by [`Self::import_exchange_or_csp_tsv`].
+    pub fn looks_like_exchange_or_csp_tsv(text: &str) -> bool {
+        let trimmed = text.trim_start();
+        trimmed.starts_with("# nmrassign_cest_profiles")
+            || trimmed.starts_with("# nmrassign_cpmg_series")
+            || trimmed.starts_with("# nmrassign_csp_trajectories")
+            || trimmed.contains("seq_id\tres_name\tlarmor_mhz\tt_ex_s\tb1_hz\t")
+            || trimmed.contains("seq_id\tres_name\tlarmor_mhz\tt_relax_s\tnu_cpmg_hz\t")
+            || trimmed.contains("seq_index\tseq_id\tres_name\tprotein_conc_um\tligand_conc_um\t")
+    }
+
+    /// Parse and fit a pasted or dropped `CEST`/`DEST` profile TSV, `CPMG` series TSV, or `CSP`
+    /// trajectory TSV (`desktop` + `wasm32` compatible).
+    pub fn import_exchange_or_csp_tsv(&mut self, text: &str) -> Result<String, String> {
+        let trimmed = text.trim();
+        if trimmed.starts_with("# nmrassign_cest_profiles")
+            || trimmed.contains("seq_id\tres_name\tlarmor_mhz\tt_ex_s\tb1_hz\t")
+        {
+            let profiles = read_cest_profiles_tsv(trimmed)?;
+            if profiles.is_empty() {
+                return Err("no CEST/DEST profiles found in TSV".to_string());
+            }
+            let cfg = CestFitConfig {
+                max_lm_iters: 35,
+                compute_chi2_surface: false,
+                ..CestFitConfig::default()
+            };
+            let fit = fit_cest_global_cpu(&profiles, &cfg)?;
+            let summary = format!(
+                "Loaded {} CEST profiles ({} residues): p_B = {:.2}% ± {:.2}%, k_ex = {:.1} ± {:.1} s⁻¹",
+                profiles.len(),
+                fit.residues.len(),
+                fit.p_b * 100.0,
+                fit.p_b_err * 100.0,
+                fit.k_ex_s_inv,
+                fit.k_ex_err,
+            );
+            self.active_tab = DynamicsStudioTab::CestDest;
+            self.selected_seq_id = profiles.first().map(|p| p.seq_id);
+            self.set_cest_data(profiles, Some(fit));
+            return Ok(summary);
+        }
+
+        if trimmed.starts_with("# nmrassign_cpmg_series")
+            || trimmed.contains("seq_id\tres_name\tlarmor_mhz\tt_relax_s\tnu_cpmg_hz\t")
+        {
+            let series = read_cpmg_series_tsv(trimmed)?;
+            if series.is_empty() {
+                return Err("no CPMG series found in TSV".to_string());
+            }
+            let fit = fit_cpmg_global_cpu(&series, &CpmgFitConfig::default())?;
+            let summary = format!(
+                "Loaded {} CPMG curves ({} exchanging residues): p_B = {:.2}% ± {:.2}%, k_ex = {:.1} ± {:.1} s⁻¹",
+                series.len(),
+                fit.residues.len(),
+                fit.p_b * 100.0,
+                fit.p_b_err * 100.0,
+                fit.k_ex_s_inv,
+                fit.k_ex_err,
+            );
+            self.active_tab = DynamicsStudioTab::CpmgDispersion;
+            self.selected_seq_id = fit
+                .residues
+                .first()
+                .map(|r| r.seq_id)
+                .or_else(|| series.first().map(|s| s.seq_id));
+            self.set_cpmg_data(series, Some(fit));
+            return Ok(summary);
+        }
+
+        if trimmed.starts_with("# nmrassign_csp_trajectories")
+            || trimmed.contains("seq_index\tseq_id\tres_name\tprotein_conc_um\tligand_conc_um\t")
+        {
+            let mut by_res: BTreeMap<(usize, i32), ResidueCspTrajectory> = BTreeMap::new();
+            for (line_no, raw_line) in trimmed.lines().enumerate() {
+                let line = raw_line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let cols: Vec<&str> = line.split('\t').collect();
+                if cols[0] == "seq_index" {
+                    continue;
+                }
+                if cols.len() < 8 {
+                    return Err(format!(
+                        "line {}: expected 8 columns in CSP trajectory TSV, got {}",
+                        line_no + 1,
+                        cols.len()
+                    ));
+                }
+                let seq_index: usize = cols[0]
+                    .parse()
+                    .map_err(|e| format!("line {}: invalid seq_index: {e}", line_no + 1))?;
+                let seq_id: i32 = cols[1]
+                    .parse()
+                    .map_err(|e| format!("line {}: invalid seq_id: {e}", line_no + 1))?;
+                let res_name = cols[2].trim().to_string();
+                let protein_conc_um: f64 = cols[3]
+                    .parse()
+                    .map_err(|e| format!("line {}: invalid protein_conc_um: {e}", line_no + 1))?;
+                let ligand_conc_um: f64 = cols[4]
+                    .parse()
+                    .map_err(|e| format!("line {}: invalid ligand_conc_um: {e}", line_no + 1))?;
+                let matched_peak =
+                    if cols[5].eq_ignore_ascii_case("na") || cols[6].eq_ignore_ascii_case("na") {
+                        None
+                    } else {
+                        let h: f64 = cols[5]
+                            .parse()
+                            .map_err(|e| format!("line {}: invalid h_ppm: {e}", line_no + 1))?;
+                        let n: f64 = cols[6]
+                            .parse()
+                            .map_err(|e| format!("line {}: invalid n_ppm: {e}", line_no + 1))?;
+                        Some((h, n))
+                    };
+                let csp_ppm = if cols[7].eq_ignore_ascii_case("na") {
+                    None
+                } else {
+                    Some(
+                        cols[7]
+                            .parse::<f64>()
+                            .map_err(|e| format!("line {}: invalid csp_ppm: {e}", line_no + 1))?,
+                    )
+                };
+                let entry =
+                    by_res
+                        .entry((seq_index, seq_id))
+                        .or_insert_with(|| ResidueCspTrajectory {
+                            seq_index,
+                            seq_id,
+                            res_name,
+                            apo_h_ppm: matched_peak.map(|p| p.0).unwrap_or(0.0),
+                            apo_n_ppm: matched_peak.map(|p| p.1).unwrap_or(0.0),
+                            points: Vec::new(),
+                            max_observed_csp_ppm: 0.0,
+                        });
+                if ligand_conc_um <= 1e-12 {
+                    if let Some((h, n)) = matched_peak {
+                        entry.apo_h_ppm = h;
+                        entry.apo_n_ppm = n;
+                    }
+                }
+                if let Some(c) = csp_ppm {
+                    entry.max_observed_csp_ppm = entry.max_observed_csp_ppm.max(c);
+                }
+                entry.points.push(ResidueTitrationPoint {
+                    protein_conc_um,
+                    ligand_conc_um,
+                    matched_peak,
+                    csp_ppm,
+                });
+            }
+            let trajectories: Vec<ResidueCspTrajectory> = by_res.into_values().collect();
+            let cfg = CspAnalysisConfig {
+                n_mc: 120,
+                ..CspAnalysisConfig::default()
+            };
+            let fit = fit_csp_global_kd(&trajectories, &cfg)?;
+            let summary = format!(
+                "Loaded {} CSP trajectories ({} >=2σ pocket sites): Kd = {:.2} ± {:.2} µM",
+                trajectories.len(),
+                fit.thresholds.significant_seq_ids.len(),
+                fit.global_kd_um,
+                fit.global_kd_sd_um,
+            );
+            self.active_tab = DynamicsStudioTab::LigandCsp;
+            self.selected_seq_id = fit
+                .thresholds
+                .significant_seq_ids
+                .first()
+                .copied()
+                .or_else(|| trajectories.first().map(|t| t.seq_id));
+            self.set_csp_data(trajectories, Some(fit), None);
+            return Ok(summary);
+        }
+
+        Err("unrecognized exchange/CSP TSV header".to_string())
+    }
+
+    /// Populate synthetic dual-`B1` `CEST`, dual-field `Baldwin2014` `CPMG`, and tight-binding
+    /// `CSP` `K_d` datasets aligned with `sequence`/`seq_ids` when empty (`desktop` + `wasm32`).
+    pub fn ensure_demo_exchange_and_csp(
+        &mut self,
+        sequence: &[String],
+        seq_ids: &[i32],
+    ) -> Result<String, String> {
+        let default_seq = [
+            "MET", "GLN", "ILE", "PHE", "VAL", "LYS", "THR", "LEU", "THR", "GLY", "LYS", "THR",
+            "ILE", "THR", "LEU", "GLU", "VAL", "GLU", "PRO", "SER", "ASP", "THR", "ILE", "GLU",
+        ];
+        let n_res = if sequence.is_empty() {
+            default_seq.len()
+        } else {
+            sequence.len().min(36)
+        };
+        let res_at = |k: usize| -> (i32, String) {
+            let rn = sequence
+                .get(k)
+                .cloned()
+                .unwrap_or_else(|| default_seq[k % default_seq.len()].to_string());
+            let sid = seq_ids.get(k).copied().unwrap_or((k + 1) as i32);
+            (sid, rn)
+        };
+
+        let ex_indices = [
+            2usize.min(n_res.saturating_sub(1)),
+            6usize.min(n_res.saturating_sub(1)),
+            12usize.min(n_res.saturating_sub(1)),
+            (n_res * 3 / 4).min(n_res.saturating_sub(1)),
+        ];
+
+        if self.cest_profiles.is_empty() {
+            let offsets: Vec<f64> = (0..=48).map(|j| 108.0 + 0.45 * (j as f64)).collect();
+            let mut profs = Vec::new();
+            for (ei, &k) in ex_indices.iter().enumerate() {
+                let (sid, rn) = res_at(k);
+                let major = 114.5 + 2.6 * (ei as f64);
+                let dw = if ei % 2 == 0 {
+                    4.8 + 0.5 * (ei as f64)
+                } else {
+                    -4.4
+                };
+                for &b1_hz in &[15.0, 30.0] {
+                    let p = Cest2StateParams {
+                        p_b: 0.015,
+                        k_ex_s_inv: 150.0,
+                        major_ppm: major,
+                        dw_ab_ppm: dw,
+                        r1a_s_inv: 1.40,
+                        r2a_s_inv: 14.0,
+                        r1b_s_inv: 1.40,
+                        r2b_s_inv: 19.0,
+                        larmor_mhz: 60.8106,
+                        t_ex_s: 0.40,
+                        b1_hz,
+                        b1_inhomogeneity_frac: 0.0,
+                        n_b1_quad: 1,
+                        normalization: CestNormalization::ZeroTimePhaseCycled,
+                    };
+                    let y = simulate_cest_2state_profile(&p, &offsets)?;
+                    profs.push(CestProfileDataset {
+                        seq_id: sid,
+                        res_name: rn.clone(),
+                        larmor_mhz: 60.8106,
+                        t_ex_s: 0.40,
+                        b1_hz,
+                        b1_inhomogeneity_frac: 0.0,
+                        normalization: CestNormalization::ZeroTimePhaseCycled,
+                        major_ppm_hint: Some(major),
+                        offsets_ppm: offsets.clone(),
+                        intensities: y,
+                        uncertainties: vec![0.003; offsets.len()],
+                    });
+                }
+            }
+            let cfg = CestFitConfig {
+                n_b1_quad: 1,
+                max_lm_iters: 25,
+                compute_chi2_surface: false,
+                ..CestFitConfig::default()
+            };
+            let fit = fit_cest_global_cpu(&profs, &cfg)?;
+            self.set_cest_data(profs, Some(fit));
+        }
+
+        if self.cpmg_series.is_empty() {
+            let nus = [
+                50.0, 100.0, 150.0, 200.0, 300.0, 400.0, 600.0, 800.0, 1000.0,
+            ];
+            let mut series = Vec::new();
+            for (ei, &k) in ex_indices.iter().enumerate() {
+                let (sid, rn) = res_at(k);
+                let dw_ppm = 2.8 + 0.6 * (ei as f64);
+                for &(larmor_mhz, r20) in &[(60.8106, 11.8), (81.0808, 14.2)] {
+                    let dw_rad = TAU * larmor_mhz * dw_ppm;
+                    let r2_vals: Vec<f64> = nus
+                        .iter()
+                        .map(|&nu| r2eff_baldwin2014(r20, r20, 0.035, 900.0, dw_rad, 0.040, nu))
+                        .collect();
+                    series.push(CpmgSeriesDataset {
+                        seq_id: sid,
+                        res_name: rn.clone(),
+                        larmor_mhz,
+                        t_relax_s: 0.040,
+                        nu_cpmg_hz: nus.to_vec(),
+                        r2_eff_s_inv: r2_vals,
+                        r2_eff_err: vec![0.12; nus.len()],
+                    });
+                }
+            }
+            let fit = fit_cpmg_global_cpu(&series, &CpmgFitConfig::default())?;
+            self.set_cpmg_data(series, Some(fit));
+        }
+
+        if self.csp_trajectories.is_empty() {
+            let ligands = [0.0, 20.0, 45.0, 75.0, 110.0, 160.0, 250.0, 450.0];
+            let mut trajs = Vec::with_capacity(n_res);
+            for k in 0..n_res {
+                let (sid, rn) = res_at(k);
+                let is_pocket = ex_indices.contains(&k);
+                let dmax = if is_pocket {
+                    0.26 + 0.05 * ((k % 3) as f64)
+                } else {
+                    0.012 + 0.004 * ((k % 4) as f64)
+                };
+                let apo_h = 7.60 + 0.04 * (k as f64);
+                let apo_n = 115.0 + 0.45 * (k as f64);
+                let mut max_c = 0.0f64;
+                let pts: Vec<ResidueTitrationPoint> = ligands
+                    .iter()
+                    .map(|&l| {
+                        let c = quadratic_tight_binding_csp(dmax, 100.0, l, 8.0);
+                        max_c = max_c.max(c);
+                        ResidueTitrationPoint {
+                            protein_conc_um: 100.0,
+                            ligand_conc_um: l,
+                            matched_peak: Some((apo_h + c, apo_n)),
+                            csp_ppm: Some(c),
+                        }
+                    })
+                    .collect();
+                trajs.push(ResidueCspTrajectory {
+                    seq_index: k,
+                    seq_id: sid,
+                    res_name: rn,
+                    apo_h_ppm: apo_h,
+                    apo_n_ppm: apo_n,
+                    points: pts,
+                    max_observed_csp_ppm: max_c,
+                });
+            }
+            let cfg = CspAnalysisConfig {
+                n_mc: 60,
+                ..CspAnalysisConfig::default()
+            };
+            let fit = fit_csp_global_kd(&trajs, &cfg)?;
+            self.set_csp_data(trajs, Some(fit), None);
+        }
+
+        let cest_pb = self.cest_fit.as_ref().map(|f| f.p_b * 100.0).unwrap_or(0.0);
+        let cpmg_kex = self.cpmg_fit.as_ref().map(|f| f.k_ex_s_inv).unwrap_or(0.0);
+        let csp_kd = self.csp_fit.as_ref().map(|f| f.global_kd_um).unwrap_or(0.0);
+        Ok(format!(
+            "Dynamics Studio ready: CEST p_B = {cest_pb:.2}%, CPMG k_ex = {cpmg_kex:.0} s⁻¹, CSP tight-binding Kd = {csp_kd:.2} µM"
+        ))
+    }
+
     /// Build a 1-click [`QuantitativeOverlayProjection`] for Lipari–Szabo `S^2`, chemical exchange
     /// `R_ex` (preferring model-free `R_ex`, falling back to `CPMG` observed/fitted `R_ex`), or
     /// ligand titration `Delta_delta_comb` (`CSP`).
@@ -473,6 +826,19 @@ impl DynamicsStudioPanel {
             {
                 output.overlay_projection =
                     self.build_overlay_projection(QuantitativeTrack::LigandCsp);
+            }
+
+            if (self.cest_profiles.is_empty()
+                || self.cpmg_series.is_empty()
+                || self.csp_trajectories.is_empty())
+                && ui
+                    .small_button("Load Demo CEST / CPMG / CSP")
+                    .on_hover_text(
+                        "Populate synthetic dual-B1 CEST, multi-field Baldwin2014 CPMG, and tight-binding CSP Kd curves",
+                    )
+                    .clicked()
+            {
+                let _ = self.ensure_demo_exchange_and_csp(&[], &[]);
             }
         });
         ui.separator();
@@ -1677,5 +2043,49 @@ mod tests {
         assert_eq!(decay.len(), 11);
         assert!((decay[0].1 - 1.0).abs() < 1e-12);
         assert!(decay[10].1 < decay[0].1);
+    }
+
+    #[test]
+    fn test_demo_population_and_tsv_import_across_cest_cpmg_and_csp() {
+        use nmr_core::cest::write_cest_profiles_tsv;
+        use nmr_core::cpmg::write_cpmg_series_tsv;
+        use nmr_core::csp::write_csp_trajectories_tsv;
+
+        let mut panel = DynamicsStudioPanel::new();
+        let summary = panel
+            .ensure_demo_exchange_and_csp(&[], &[])
+            .expect("populate demo exchange & csp");
+        assert!(summary.contains("CEST"));
+        assert!(panel.cest_fit.is_some());
+        assert!(panel.cpmg_fit.is_some());
+        assert!(panel.csp_fit.is_some());
+
+        let cest_tsv = write_cest_profiles_tsv(&panel.cest_profiles);
+        let cpmg_tsv = write_cpmg_series_tsv(&panel.cpmg_series);
+        let csp_tsv = write_csp_trajectories_tsv(&panel.csp_trajectories);
+
+        assert!(DynamicsStudioPanel::looks_like_exchange_or_csp_tsv(
+            &cest_tsv
+        ));
+        assert!(DynamicsStudioPanel::looks_like_exchange_or_csp_tsv(
+            &cpmg_tsv
+        ));
+        assert!(DynamicsStudioPanel::looks_like_exchange_or_csp_tsv(
+            &csp_tsv
+        ));
+
+        let mut fresh = DynamicsStudioPanel::new();
+        fresh
+            .import_exchange_or_csp_tsv(&cest_tsv)
+            .expect("import cest tsv");
+        assert_eq!(fresh.active_tab, DynamicsStudioTab::CestDest);
+        fresh
+            .import_exchange_or_csp_tsv(&cpmg_tsv)
+            .expect("import cpmg tsv");
+        assert_eq!(fresh.active_tab, DynamicsStudioTab::CpmgDispersion);
+        fresh
+            .import_exchange_or_csp_tsv(&csp_tsv)
+            .expect("import csp tsv");
+        assert_eq!(fresh.active_tab, DynamicsStudioTab::LigandCsp);
     }
 }

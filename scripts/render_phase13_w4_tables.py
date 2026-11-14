@@ -2,8 +2,8 @@
 """Deterministic Markdown table renderer for Phase 13 Wave 4 (Slice 13.6: T13.4, T13.5, T13.6).
 
 Reads raw `W4_METRIC_JSON:` structured records emitted by `--release -- --nocapture` runs of
-`cest_tests`, `cpmg_tests`, `csp_tests`, `exchange_gpu_tests`, and `dynamics_panel::tests`, plus
-optional workspace regression logs and benchmark JSON/log artifacts under `--results-dir`, and
+`cest_tests`, `cpmg_tests`, `csp_tests`, `exchange_gpu_tests`, `dynamics_panel::tests`, and
+`exchange_cli_tests`, plus optional workspace regression logs and benchmark JSON/log artifacts under `--results-dir`, and
 emits reproducible Markdown tables and FIPS 180-4 SHA-256 digests with zero hardcoded metrics.
 
 Provenance: Original clean-room reporting script for algorithmic benchmarks citing McConnell
@@ -32,6 +32,7 @@ SLICE_13_6_COMMANDS = [
     ["cargo", "test", "--release", "-p", "nmr-core", "--test", "csp_tests", "--", "--nocapture"],
     ["cargo", "test", "--release", "-p", "nmr-gpu", "--test", "exchange_gpu_tests", "--", "--nocapture"],
     ["cargo", "test", "--release", "-p", "nmr-gui", "--lib", "dynamics_panel", "--", "--nocapture"],
+    ["cargo", "test", "--release", "-p", "nmr-cli", "--test", "exchange_cli_tests", "--", "--nocapture"],
 ]
 
 
@@ -320,6 +321,7 @@ def render_t13_6_section(records: list[dict[str, Any]]) -> str:
     kd_fits = find_all(records, "csp_titration_kd_fit")
     rob = find_single(records, "csp_tracker_robustness")
     gui_ov = find_single(records, "gui_3d_pocket_overlay")
+    cli_e2e = find_single(records, "exchange_cli_e2e")
 
     lines = [
         "### T13.6 — Automated `HSQC`/`HMQC` Titration Peak Tracking, Quadratic `1:1 Kd` Recovery & 3D Binding-Pocket Highlight",
@@ -358,6 +360,11 @@ def render_t13_6_section(records: list[dict[str, Any]]) -> str:
             f"| `nmr-gui::dynamics_panel` 3D overlay | 1-click projection of `LigandCsp`, `LipariSzaboS2`, and `ChemicalExchangeRex` into `mol3d_overlay::QuantitativeTrackData` | `{gui_ov['n_pocket_highlighted']} / {gui_ov['n_residues']}` pocket site highlighted (`CSP_max = {gui_ov['csp_max_ppm']:.2f} ppm`, `R_ex,max = {gui_ov['rex_max_s_inv']:.2f} s^-1`, `putty = {gui_ov['putty_enabled']}`) | {fmt_status(bool(gui_ov['passed']))} |"
         )
 
+    if cli_e2e is not None:
+        lines.append(
+            f"| `nmr-cli::exchange_cmd` (`cest` / `cpmg` / `csp`) | End-to-end CLI 2-/3-state `CEST`, multi-field `CPMG` + `R1rho`, and dilution-corrected + `--star` `CSP` `Kd` | `cest={cli_e2e['cest_subcommand']}`, `cpmg={cli_e2e['cpmg_subcommand']}`, `csp={cli_e2e['csp_subcommand']}`; tight `Kd = {cli_e2e['tight_kd_um']:.3f} uM` (`{cli_e2e['tight_kd_rel_err_pct']:.2f}%` err), Ubiquitin `--star` `Kd = {cli_e2e['ubq_star_kd_um']:.2f} uM` | {fmt_status(bool(cli_e2e['passed']))} |"
+        )
+
     return "\n".join(lines)
 
 
@@ -373,7 +380,7 @@ def render_regression_section(
             if passed > 0 or failed > 0:
                 cited.append(sl)
                 rows.append(
-                    f"| Slice `13.6` (`cest`, `cpmg`, `csp`, `exchange_gpu`, `dynamics_panel`) | `{sl.name}` | `{passed} passed, {failed} failed` | {fmt_status(failed == 0 and passed > 0)} |"
+                    f"| Slice `13.6` (`cest`, `cpmg`, `csp`, `exchange_gpu`, `dynamics_panel`, `exchange_cli`) | `{sl.name}` | `{passed} passed, {failed} failed` | {fmt_status(failed == 0 and passed > 0)} |"
                 )
 
     ws_log = results_dir / "w4_workspace_tests.log"
@@ -455,7 +462,7 @@ def main() -> int:
     parser.add_argument(
         "--run",
         action="store_true",
-        help="Run the 5 Slice 13.6 `--release -- --nocapture` test suites and write `w4_slice_13_6_tests.log` + `w4_slice_13_6_metrics.jsonl` into `--results-dir` before rendering.",
+        help="Run the 6 Slice 13.6 `--release -- --nocapture` test suites and write `w4_slice_13_6_tests.log` + `w4_slice_13_6_metrics.jsonl` into `--results-dir` before rendering.",
     )
     parser.add_argument(
         "--out",

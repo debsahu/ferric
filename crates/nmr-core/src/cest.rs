@@ -2593,6 +2593,12 @@ pub fn format_cest_fit_json(res: &CestGlobalFitResult) -> Result<String, String>
     serde_json::to_string_pretty(res).map_err(|e| format!("failed to serialize CEST JSON: {e}"))
 }
 
+/// Format a slice of [`Cest3StateFitResult`] items as pretty JSON.
+pub fn format_cest_3state_fit_json(res: &[Cest3StateFitResult]) -> Result<String, String> {
+    serde_json::to_string_pretty(res)
+        .map_err(|e| format!("failed to serialize 3-state CEST JSON: {e}"))
+}
+
 /// Fitted 3-state (`10x10` linear or triangular `A <-> B <-> C`) Bloch–McConnell `CEST` result
 /// across multi-`B1` saturation profiles for a single spin system (`T13.4`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

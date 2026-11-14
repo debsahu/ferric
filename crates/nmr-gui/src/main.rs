@@ -118,6 +118,7 @@ use nmr_gui::{
         default_overlay_palette, ContourPipelineResource, MultiContourCallback, OverlayLayerSpec,
         SyncCrosshair,
     },
+    dynamics_panel::{DynamicsStudioOutput, DynamicsStudioPanel, DynamicsStudioTab},
     ingest_panel::{IngestAction, IngestDropOutcome, IngestExecutionPlan, IngestPanelState},
     keymap::{poll_global_modifier_shortcuts, ChordDispatcher, CONTOUR_FLOOR_STEP_RATIO},
     mol3d_overlay::{Mol3dSyncAction, QuantitativeTrack},
@@ -1638,6 +1639,8 @@ struct NmrWorkbenchApp {
     loaded_pdb_text: Option<String>,
     relax_panel: RelaxPanelState,
     show_relax_panel: bool,
+    dynamics_panel: DynamicsStudioPanel,
+    show_dynamics_panel: bool,
 
     // Spectra for GPU contour & 3D strip visualization
     hsqc_spec: Option<Spectrum2D>,
@@ -1820,6 +1823,8 @@ impl NmrWorkbenchApp {
             loaded_pdb_text: None,
             relax_panel: RelaxPanelState::new(),
             show_relax_panel: false,
+            dynamics_panel: DynamicsStudioPanel::new(),
+            show_dynamics_panel: false,
             hsqc_spec: None,
             hsqc_arc: Arc::new(Vec::new()),
             hsqc_gen: 1,
@@ -2198,6 +2203,36 @@ impl NmrWorkbenchApp {
                     self.status_msg = msg;
                 }
             }
+        }
+    }
+
+    fn apply_dynamics_panel_output(&mut self, out: DynamicsStudioOutput) {
+        if let Some(sid) = out.clicked_seq_id {
+            let res_idx = if !self.seq_ids.is_empty() {
+                self.seq_ids.iter().position(|&id| id == sid)
+            } else if sid >= 1 {
+                Some((sid - 1) as usize)
+            } else {
+                None
+            };
+            if let Some(k) = res_idx.filter(|&k| k < self.sequence.len()) {
+                self.select_residue_and_sync_strip(k);
+            }
+        }
+        if let Some(proj) = out.overlay_projection {
+            let count = proj.values_by_seq_id.len();
+            let track_label = match proj.track {
+                QuantitativeTrack::LipariSzaboS2 => "Lipari–Szabo S²",
+                QuantitativeTrack::ChemicalExchangeRex => "Chemical Exchange R_ex",
+                QuantitativeTrack::LigandCsp => "Ligand Titration CSP Δδ_comb",
+                _ => "Quantitative Track",
+            };
+            proj.apply_to(&mut self.mol3d_panel.track_data, &self.seq_ids);
+            self.show_mol3d_viewport = true;
+            self.has_structure_or_dynamics = true;
+            self.mol3d_panel.rebuild_for_test();
+            self.status_msg =
+                format!("Mapped {track_label} ({count} residues) onto 3D structure putty");
         }
     }
 
@@ -3122,12 +3157,30 @@ impl NmrWorkbenchApp {
                 Ok(msg) => {
                     self.workspace_mode = WorkspaceMode::ProteinNmr;
                     self.show_relax_panel = true;
+                    self.show_dynamics_panel = false;
                     self.has_structure_or_dynamics = true;
                     self.status_msg = msg;
                 }
                 Err(e) => {
                     self.status_msg =
                         format!("Relaxation series import error ({source_label}): {e}");
+                }
+            }
+            return;
+        }
+
+        // Check CEST / CPMG / Ligand CSP trajectory TSV (`T13.4`–`T13.6`)
+        if DynamicsStudioPanel::looks_like_exchange_or_csp_tsv(trimmed) {
+            match self.dynamics_panel.import_exchange_or_csp_tsv(trimmed) {
+                Ok(msg) => {
+                    self.workspace_mode = WorkspaceMode::ProteinNmr;
+                    self.show_dynamics_panel = true;
+                    self.show_relax_panel = false;
+                    self.has_structure_or_dynamics = true;
+                    self.status_msg = msg;
+                }
+                Err(e) => {
+                    self.status_msg = format!("Exchange / CSP import error ({source_label}): {e}");
                 }
             }
             return;
@@ -5088,6 +5141,31 @@ impl NmrWorkbenchApp {
                 .clicked()
             {
                 self.show_relax_panel = !self.show_relax_panel;
+                if self.show_relax_panel {
+                    self.show_dynamics_panel = false;
+                }
+            }
+            let dyn_btn = egui::Button::new(
+                egui::RichText::new("⚡ CEST / CPMG / CSP")
+                    .size(12.0)
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(if self.show_dynamics_panel {
+                egui::Color32::from_rgb(138, 86, 28)
+            } else {
+                egui::Color32::from_rgb(34, 42, 58)
+            });
+            if ui
+                .add(dyn_btn)
+                .on_hover_text(
+                    "Open CEST/DEST saturation dips, CPMG dispersion & Ligand Titration CSP Kd Studio",
+                )
+                .clicked()
+            {
+                self.show_dynamics_panel = !self.show_dynamics_panel;
+                if self.show_dynamics_panel {
+                    self.show_relax_panel = false;
+                }
             }
             if ui.small_button("📌 Assign/Lock (at)").clicked() {
                 self.show_assign_popover = true;
@@ -6465,6 +6543,7 @@ impl NmrWorkbenchApp {
             WorkbenchAction::FitRelaxationR1R2HetNoe => {
                 self.workspace_mode = WorkspaceMode::ProteinNmr;
                 self.show_relax_panel = true;
+                self.show_dynamics_panel = false;
                 self.has_structure_or_dynamics = true;
                 let pdb_ref = self.loaded_pdb_text.clone();
                 let res = if self.relax_panel.has_fitted_rates() {
@@ -6484,6 +6563,7 @@ impl NmrWorkbenchApp {
             WorkbenchAction::RunModelFreeLipariSzabo => {
                 self.workspace_mode = WorkspaceMode::ProteinNmr;
                 self.show_relax_panel = true;
+                self.show_dynamics_panel = false;
                 self.has_structure_or_dynamics = true;
                 let pdb_ref = self.loaded_pdb_text.clone();
                 let res = if !self.relax_panel.r1_fits.is_empty()
@@ -6510,12 +6590,73 @@ impl NmrWorkbenchApp {
                     Err(e) => self.status_msg = format!("Model-Free error: {e}"),
                 }
             }
+            WorkbenchAction::AnalyzeCestExchange => {
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.show_dynamics_panel = true;
+                self.show_relax_panel = false;
+                self.has_structure_or_dynamics = true;
+                self.dynamics_panel.active_tab = DynamicsStudioTab::CestDest;
+                match self
+                    .dynamics_panel
+                    .ensure_demo_exchange_and_csp(&self.sequence, &self.seq_ids)
+                {
+                    Ok(msg) => self.status_msg = msg,
+                    Err(e) => self.status_msg = format!("CEST solver error: {e}"),
+                }
+            }
+            WorkbenchAction::AnalyzeCpmgDispersion => {
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.show_dynamics_panel = true;
+                self.show_relax_panel = false;
+                self.has_structure_or_dynamics = true;
+                self.dynamics_panel.active_tab = DynamicsStudioTab::CpmgDispersion;
+                match self
+                    .dynamics_panel
+                    .ensure_demo_exchange_and_csp(&self.sequence, &self.seq_ids)
+                {
+                    Ok(msg) => {
+                        self.status_msg = msg;
+                        if let Some(proj) = self
+                            .dynamics_panel
+                            .build_overlay_projection(QuantitativeTrack::ChemicalExchangeRex)
+                        {
+                            self.apply_dynamics_panel_output(DynamicsStudioOutput {
+                                clicked_seq_id: None,
+                                overlay_projection: Some(proj),
+                            });
+                        }
+                    }
+                    Err(e) => self.status_msg = format!("CPMG dispersion error: {e}"),
+                }
+            }
+            WorkbenchAction::FitLigandTitrationCspKd => {
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.show_dynamics_panel = true;
+                self.show_relax_panel = false;
+                self.has_structure_or_dynamics = true;
+                self.dynamics_panel.active_tab = DynamicsStudioTab::LigandCsp;
+                match self
+                    .dynamics_panel
+                    .ensure_demo_exchange_and_csp(&self.sequence, &self.seq_ids)
+                {
+                    Ok(msg) => {
+                        self.status_msg = msg;
+                        if let Some(proj) = self
+                            .dynamics_panel
+                            .build_overlay_projection(QuantitativeTrack::LigandCsp)
+                        {
+                            self.apply_dynamics_panel_output(DynamicsStudioOutput {
+                                clicked_seq_id: None,
+                                overlay_projection: Some(proj),
+                            });
+                        }
+                    }
+                    Err(e) => self.status_msg = format!("CSP tight-binding Kd error: {e}"),
+                }
+            }
             WorkbenchAction::AssignNoesyRestraints
             | WorkbenchAction::FoldStructureEnsemble
-            | WorkbenchAction::ValidateEnsembleRmsdRamachandran
-            | WorkbenchAction::AnalyzeCpmgDispersion
-            | WorkbenchAction::AnalyzeCestExchange
-            | WorkbenchAction::FitLigandTitrationCspKd => {
+            | WorkbenchAction::ValidateEnsembleRmsdRamachandran => {
                 self.has_structure_or_dynamics = true;
                 self.status_msg = format!("Triggered {}", action.metadata().title);
             }
@@ -7010,18 +7151,36 @@ impl eframe::App for NmrWorkbenchApp {
                 }
 
                 let mut relax_actions = Vec::new();
+                let mut dyn_output: Option<DynamicsStudioOutput> = None;
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut self.show_relax_panel,
-                            false,
-                            "🎯 2D HSQC Contours",
-                        );
-                        ui.selectable_value(
-                            &mut self.show_relax_panel,
-                            true,
-                            "📈 Relaxation & Lipari–Szabo S²",
-                        );
+                        if ui
+                            .selectable_label(
+                                !self.show_relax_panel && !self.show_dynamics_panel,
+                                "🎯 2D HSQC Contours",
+                            )
+                            .clicked()
+                        {
+                            self.show_relax_panel = false;
+                            self.show_dynamics_panel = false;
+                        }
+                        if ui
+                            .selectable_label(
+                                self.show_relax_panel,
+                                "📈 Relaxation & Lipari–Szabo S²",
+                            )
+                            .clicked()
+                        {
+                            self.show_relax_panel = true;
+                            self.show_dynamics_panel = false;
+                        }
+                        if ui
+                            .selectable_label(self.show_dynamics_panel, "⚡ CEST / CPMG / CSP & Kd")
+                            .clicked()
+                        {
+                            self.show_dynamics_panel = true;
+                            self.show_relax_panel = false;
+                        }
                     });
                     ui.separator();
                     if self.show_relax_panel {
@@ -7032,12 +7191,23 @@ impl eframe::App for NmrWorkbenchApp {
                             self.selected_res,
                             self.loaded_pdb_text.as_deref(),
                         );
+                    } else if self.show_dynamics_panel {
+                        if self.dynamics_panel.selected_seq_id.is_none() {
+                            if let Some(k) = self.selected_res {
+                                self.dynamics_panel.selected_seq_id =
+                                    Some(self.seq_ids.get(k).copied().unwrap_or((k + 1) as i32));
+                            }
+                        }
+                        dyn_output = Some(self.dynamics_panel.show(ui));
                     } else {
                         self.draw_hsqc_canvas(ui);
                     }
                 });
                 if !relax_actions.is_empty() {
                     self.apply_relax_panel_actions(relax_actions);
+                }
+                if let Some(out) = dyn_output {
+                    self.apply_dynamics_panel_output(out);
                 }
             }
             WorkspaceMode::OctetChem => {

@@ -6,6 +6,7 @@
 //! Provenance: Original CLI implementing `docs/specs/01-data-io.md` through `docs/specs/15-structure-viewer.md`
 //! and Octet-Draw CLI workflows.
 
+pub mod exchange_cmd;
 pub mod methyl_cmd;
 pub mod relax_cmd;
 
@@ -214,6 +215,9 @@ fn usage() -> String {
        nmrassign methyl          --pdb <model.pdb> --hmqc <2d_or_tsv> --noesy <3d_or_tsv> [--labeling ILV-proS|ILV-proR|ILV-racemic|ILVMAT|<RES:ATOM,...>] [--hmcmcbca <hmcm.tsv>] [--engine gpu|cpu] [--seeds <N>] [-o <out.str>]\n\
        nmrassign relax           (--series <series.tsv|series.nef|dir> | --planes <p1,p2,...>) --out <rates.tsv> [--kind r1|r2|r1rho|hetnoe] [--peaks <peaks.tsv> | --star <shifts.str>] [--vdlist <file> | --delays <csv>] [--engine cpu|gpu|auto] [--mc-trials 500]\n\
        nmrassign modelfree       (--r1 <r1.tsv> --r2 <r2.tsv> [--hetnoe <noe.tsv>] ... | --rates <rates.tsv> ...) --out <modelfree.tsv> [--pdb <opt.pdb>] [--diffusion auto|isotropic|axial|anisotropic] [--criterion aic|aicc|bic|ftest]\n\
+       nmrassign cest            --in <profiles.tsv> [--in <profiles_b2.tsv> ...] [--out <fit.tsv>] [--states 2|3] [--triangular] [--b1-quad 5] [--engine cpu|gpu|auto] [--chi2-surface] [--json-out <fit.json>]\n\
+       nmrassign cpmg            (--in <cpmg.tsv> ... | --raw-planes <planes.tsv> ... | --r1rho <r1rho.tsv> --major-ppm <ppm> --larmor-mhz <mhz>) [--out <fit.tsv>] [--model baldwin2014|cr72|lm63|numerical2x2|flat] [--engine cpu|gpu|auto] [--json-out <fit.json>]\n\
+       nmrassign csp             (--apo-peaks <apo.tsv> | --star <apo.str>) --step <[L]_uM[:[P]_uM]=path> ... [--out <csp.tsv>] [--experiment hsqc|hmqc] [--protein-um 100.0] [--ligand-stock-um <uM>] [--mc-trials 400] [--trajectories-out <traj.tsv>] [--json-out <csp.json>]\n\
        nmrassign structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--rdc <rdcs.tsv|rdcs.nef>] [--torsion-db] [--include-chi1] [--rdc-weight 0.75] [--rdc-free-frac 0.20] [--engine auto|gpu|cpu] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
@@ -8323,6 +8327,9 @@ fn main() {
         "methyl" => methyl_cmd::run_methyl_cli(&args[1..]),
         "relax" => relax_cmd::run_relax_cli(&args[1..]),
         "modelfree" | "model-free" => relax_cmd::run_modelfree_cli(&args[1..]),
+        "cest" | "dest" => exchange_cmd::run_cest_cli(&args[1..]),
+        "cpmg" | "r1rho" => exchange_cmd::run_cpmg_cli(&args[1..]),
+        "csp" => exchange_cmd::run_csp_cli(&args[1..]),
         "structure" => cmd_structure(&args[1..]),
         "nef-import" => cmd_nef_import(&args[1..]),
         "nef-export" => cmd_nef_export(&args[1..]),

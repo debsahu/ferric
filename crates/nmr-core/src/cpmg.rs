@@ -2081,3 +2081,8 @@ pub fn format_cpmg_fit_tsv(res: &CpmgGlobalFitResult) -> String {
 pub fn format_cpmg_fit_json(res: &CpmgGlobalFitResult) -> Result<String, String> {
     serde_json::to_string_pretty(res).map_err(|e| format!("failed to serialize CPMG JSON: {e}"))
 }
+
+/// Format an [`R1RhoFitResult`] as pretty JSON.
+pub fn format_r1rho_fit_json(res: &R1RhoFitResult) -> Result<String, String> {
+    serde_json::to_string_pretty(res).map_err(|e| format!("failed to serialize R1rho JSON: {e}"))
+}
