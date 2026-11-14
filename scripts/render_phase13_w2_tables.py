@@ -1436,6 +1436,263 @@ def render_ci_fix(root: Path, extra_files: list[Path]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_p1_3_5(root: Path, extra_files: list[Path]) -> str:
+    w2 = root / "data/private/w2_results"
+    rdc_rs_p = root / "crates/nmr-core/tests/rdc_tests.rs"
+    spec_p = root / "docs/specs/04-structure.md"
+    prov_p = root / "data/benchmark/PROVENANCE.md"
+    todo_p = root / "TODO.md"
+    real_bench_rs_p = root / "crates/nmr-cli/src/real_benchmark.rs"
+    golden_log_p = w2 / "w2_p1_4_golden_sha256_test.log"
+    sweep_log_p = w2 / "w2_p1_4_rdc_15seed_ignored_test.log"
+    ci_json_p = w2 / "w2_p1_3_linux_ci_run.json"
+    ci_rdc_log_p = w2 / "w2_p1_3_linux_ci_rdc_tests.log"
+    full_pack_p = root / "data/private/phase13_W2_review_pack.md"
+
+    p135_files: list[Path] = [
+        rdc_rs_p,
+        spec_p,
+        prov_p,
+        todo_p,
+        golden_log_p,
+        sweep_log_p,
+        ci_json_p,
+        ci_rdc_log_p,
+        *extra_files,
+        full_pack_p,
+    ]
+    lines: list[str] = []
+    lines.append(
+        "### `13.2:P1-3`–`P1-5` Remediation Artifact & Review Pack FIPS 180-4 SHA-256 Digests"
+    )
+    lines.append("")
+    lines.append(
+        "Generated mechanically by `python3 scripts/render_phase13_w2_tables.py --section p1-3-5 --extra-file data/private/phase13_W2_p1_3_5_review_pack.md`:"
+    )
+    lines.append("")
+    lines.append("| Artifact Path | Bytes | SHA-256 |")
+    lines.append("|---|---:|---|")
+    seen_paths: set[Path] = set()
+    for fp in p135_files:
+        if fp.exists() and fp not in seen_paths:
+            seen_paths.add(fp)
+            digest, nbytes = sha256_file(fp)
+            rel = fp.relative_to(root) if fp.is_relative_to(root) else fp
+            lines.append(f"| `{rel}` | {nbytes:,} | `{digest}` |")
+
+    # 1. 13.2:P1-3 Linux x86_64 GitHub Actions CI run verification
+    lines.append("")
+    lines.append(
+        "### `13.2:P1-3` — Pre-Main Branch Linux `x86_64` GitHub Actions CI Verification (`w2_p1_3_linux_ci_run.json`)"
+    )
+    lines.append("")
+    lines.append(
+        "| Run ID | Branch | Tested Commit SHA | Workflow Status / Conclusion | Job / Step Summary |"
+    )
+    lines.append("|---|---|---|---|---|")
+    if ci_json_p.exists():
+        ci_raw = json.loads(ci_json_p.read_text(encoding="utf-8"))
+        ci_obj = ci_raw[0] if isinstance(ci_raw, list) and ci_raw else ci_raw
+        run_id = (
+            ci_obj.get("databaseId")
+            or ci_obj.get("id")
+            or ci_obj.get("run_id")
+            or "?"
+        )
+        branch = (
+            ci_obj.get("headBranch")
+            or ci_obj.get("head_branch")
+            or ci_obj.get("branch")
+            or "?"
+        )
+        head_sha = (
+            ci_obj.get("headSha")
+            or ci_obj.get("head_sha")
+            or ci_obj.get("sha")
+            or "?"
+        )
+        status = str(ci_obj.get("status", "completed"))
+        conclusion = str(ci_obj.get("conclusion", "?"))
+        if conclusion.lower() != "success":
+            raise RuntimeError(
+                f"Expected Linux CI conclusion == 'success', got {conclusion!r} in {ci_json_p}"
+            )
+        jobs = ci_obj.get("jobs", [])
+        if jobs:
+            job_parts: list[str] = []
+            for jb in jobs:
+                jname = jb.get("name", "job")
+                jconc = jb.get("conclusion") or jb.get("status") or "?"
+                t0 = jb.get("startedAt") or jb.get("started_at") or ""
+                t1 = jb.get("completedAt") or jb.get("completed_at") or ""
+                tspan = f" ({t0} -> {t1})" if (t0 and t1) else ""
+                job_parts.append(f"`{jname}: {jconc}`{tspan}")
+            job_summary = "; ".join(job_parts)
+        else:
+            job_summary = "`all jobs: success`"
+        if ci_rdc_log_p.exists():
+            ci_log_txt = ci_rdc_log_p.read_text(encoding="utf-8", errors="replace")
+            golden_ci_ok = (
+                "test test_cross_os_rdc_anneal_golden_coordinate_sha256 ... ok"
+                in ci_log_txt
+            )
+            m_ci_rdc = re.search(
+                r"Running [^\n]*rdc_tests[^\n]*\n(?:.*\n)*?test result: ok\.\s+(\d+) passed;\s+(\d+) failed;\s+(\d+) ignored;",
+                ci_log_txt,
+            )
+            if m_ci_rdc:
+                job_summary += (
+                    f"; Linux `rdc_tests`: `{m_ci_rdc.group(1)} passed; {m_ci_rdc.group(2)} failed; {m_ci_rdc.group(3)} ignored`"
+                )
+            if golden_ci_ok:
+                job_summary += "; Linux `test_cross_os_rdc_anneal_golden_coordinate_sha256`: **`ok`**"
+        lines.append(
+            f"| `{run_id}` | `{branch}` | `{head_sha}` | **`{status}` / `{conclusion.upper()}`** | {job_summary} |"
+        )
+    else:
+        lines.append(
+            "| `PENDING_CI_RUN` | `ci/w2-rdc-determinism` | `PENDING` | `awaiting w2_p1_3_linux_ci_run.json` | — |"
+        )
+
+    # 2. 13.2:P1-4 Golden coordinate SHA-256 & committed #[ignore] 15/15 sweep
+    rdc_rs_txt = rdc_rs_p.read_text(encoding="utf-8")
+    m_const_sha = re.search(
+        r'const EXPECTED_GOLDEN_COORD_SHA256:\s*&str\s*=\s*"([0-9a-f]{64})";',
+        rdc_rs_txt,
+    )
+    has_ignored_sweep = bool(
+        re.search(
+            r"#\[test\]\s*#\[ignore\]\s*fn test_five_seed_multi_target_rdc_refinement_sweep\(\)",
+            rdc_rs_txt,
+        )
+    )
+    golden_txt = golden_log_p.read_text(encoding="utf-8")
+    m_golden_run = re.search(
+        r"\[CROSS-OS GOLDEN RDC SHA256\] sha256=([0-9a-f]{64}) q_work=([0-9.]+) plane_q_free=([0-9.]+)",
+        golden_txt,
+    )
+    m_golden_res = re.search(
+        r"test result: ok\.\s+(\d+) passed;\s+(\d+) failed;.*finished in ([0-9.]+s)",
+        golden_txt,
+    )
+    sweep_txt = sweep_log_p.read_text(encoding="utf-8")
+    m_sweep_res = re.search(
+        r"test result: ok\.\s+(\d+) passed;\s+(\d+) failed;.*finished in ([0-9.]+s)",
+        sweep_txt,
+    )
+    m_r1 = re.search(
+        r"\[5SEED_RANGE 1D3Z\] Q_work=([0-9.]+)\.\.([0-9.]+) plane_Q_free=([0-9.]+)\.\.([0-9.]+) lowE=([0-9.]+)\.\.([0-9.]+) mean=([0-9.]+)\.\.([0-9.]+) Rama=([0-9.]+%)\.\.([0-9.]+%)",
+        sweep_txt,
+    )
+    m_ru = re.search(
+        r"\[5SEED_RANGE 1UBQ\] Q_work=([0-9.]+)\.\.([0-9.]+) plane_Q_free=([0-9.]+)\.\.([0-9.]+) lowE=([0-9.]+)\.\.([0-9.]+) mean=([0-9.]+)\.\.([0-9.]+)",
+        sweep_txt,
+    )
+    m_rg = re.search(
+        r"\[5SEED_RANGE GB1\] Q_work=([0-9.]+)\.\.([0-9.]+) plane_Q_free=([0-9.]+)\.\.([0-9.]+) 1D_NH_Q_free=([0-9.]+)\.\.([0-9.]+) lowE=([0-9.]+)\.\.([0-9.]+) mean=([0-9.]+)\.\.([0-9.]+)",
+        sweep_txt,
+    )
+    if not all(
+        [
+            m_const_sha,
+            has_ignored_sweep,
+            m_golden_run,
+            m_golden_res,
+            m_sweep_res,
+            m_r1,
+            m_ru,
+            m_rg,
+        ]
+    ):
+        raise RuntimeError(
+            "Failed to parse 13.2:P1-4 golden coordinate SHA-256 or 15-seed sweep outputs"
+        )
+    assert m_const_sha and m_golden_run and m_golden_res and m_sweep_res
+    assert m_r1 and m_ru and m_rg
+    if m_const_sha.group(1) != m_golden_run.group(1):
+        raise RuntimeError("Golden SHA-256 constant vs measured log mismatch")
+
+    gates = parse_rdc_test_gates(rdc_rs_p)
+    g1, gu, gg = gates["1D3Z"], gates["1UBQ"], gates["GB1"]
+    n_seed_lines = len(re.findall(r"^\[5SEED (?:1D3Z|1UBQ|GB1) seed=\d+\]", sweep_txt, re.M))
+    if n_seed_lines != 15:
+        raise RuntimeError(f"Expected 15 [5SEED ...] lines, got {n_seed_lines}")
+
+    lines.append("")
+    lines.append(
+        "### `13.2:P1-4` — Committed Cross-OS Golden Coordinate Digest & `#[ignore]` `15/15` Multi-Target Sweep (`rdc_tests.rs`)"
+    )
+    lines.append("")
+    lines.append("| Committed Test & Scope | Measured Output | Status |")
+    lines.append("|---|---|---|")
+    lines.append(
+        f"| `test_cross_os_rdc_anneal_golden_coordinate_sha256` (non-ignored; `GB1` `seed=20260402`, `dihedrals -> rdc -> structure`, `0` OS `libm`) | `sha256={m_golden_run.group(1)}` (`q_work={m_golden_run.group(2)}, plane_q_free={m_golden_run.group(3)}`, `{m_golden_res.group(3)}`) | **`MATCH == EXPECTED_GOLDEN_COORD_SHA256` (`{m_golden_res.group(1)} passed; {m_golden_res.group(2)} failed`)** |"
+    )
+    lines.append(
+        f"| `#[ignore] test_five_seed_multi_target_rdc_refinement_sweep` (`5` seeds x `3` development targets = `15` runs) | `{n_seed_lines}/15` seed lines asserted against unweakened gates (`{m_sweep_res.group(3)}`) | **`{m_sweep_res.group(1)} passed; {m_sweep_res.group(2)} failed` (`15/15 PASS`)** |"
+    )
+
+    lines.append("")
+    lines.append(
+        "| Development Target (`13.2:P1-5` Relabel) | Seeds | `Q_work` Range (Gate) | `ByPeptidePlane Q_free` Range (Gate) | Auxiliary Range (Gate) | `lowE` BB RMSD Range (Gate) | `mean` BB RMSD Range (Gate) |"
+    )
+    lines.append("|---|---:|---|---|---|---|---|")
+    lines.append(
+        f"| `1D3Z` Self-Consistency *(dev target)* | `2026..=2030` | `{m_r1.group(1)}–{m_r1.group(2)}` (`<{g1['qw']:.2f}`) | `{m_r1.group(3)}–{m_r1.group(4)}` (`<{g1['qf']:.2f}`) | `Rama {m_r1.group(9)}–{m_r1.group(10)}` (`>=94.0%`) | `{m_r1.group(5)}–{m_r1.group(6)} Å` (`<{g1['lowe']:.2f} Å`) | `{m_r1.group(7)}–{m_r1.group(8)} Å` (`< pre`) |"
+    )
+    lines.append(
+        f"| `1UBQ` Non-Circular Protocol *(dev target)* | `20260401..=20260405` | `{m_ru.group(1)}–{m_ru.group(2)}` (`<{gu['qw']:.2f}`) | `{m_ru.group(3)}–{m_ru.group(4)}` (`<{gu['qf']:.2f}`) | `0` shifts / `0` sim NOEs | `{m_ru.group(5)}–{m_ru.group(6)} Å` (`<{gu['lowe']:.2f} Å`) | `{m_ru.group(7)}–{m_ru.group(8)} Å` (`<{gu['mean']:.2f} Å`) |"
+    )
+    lines.append(
+        f"| `GB1 -> 1PGA` Non-Circular Protocol *(dev target)* | `20260402..=20260406` | `{m_rg.group(1)}–{m_rg.group(2)}` (`<{gg['qw']:.2f}`) | `{m_rg.group(3)}–{m_rg.group(4)}` (`<{gg['qf']:.2f}`) | `1D_NH Q_free {m_rg.group(5)}–{m_rg.group(6)}` (`<{gg['nh_qf']:.2f}`) | `{m_rg.group(7)}–{m_rg.group(8)} Å` (`<{gg['lowe']:.2f} Å`) | `{m_rg.group(9)}–{m_rg.group(10)} Å` (`<{gg['mean']:.2f} Å`) |"
+    )
+
+    # 3. 13.2:P1-5 & F8 documentation candor & gate parity verification
+    doc_gates = parse_provenance_gate_spec(prov_p)
+    rs_active, rs_retired = parse_rust_gate_constants(real_bench_rs_p)
+    if doc_gates != rs_active + rs_retired:
+        raise RuntimeError("CALIBRATION-GATE-SPEC parity broken in PROVENANCE.md!")
+
+    lines.append("")
+    lines.append(
+        "### `13.2:P1-5` & `F8` — Documentation Candor, 5-Seed Range Sync & Gate-Spec Integrity Audit"
+    )
+    lines.append("")
+    lines.append(
+        "| Target File | Pre-Fix Linux Failures (`0.9520` / `0.5691`) | Dev-Target Relabel & Determinism Scope | 5-Seed Ranges (`1D3Z`, `1UBQ`, `GB1`) | `F8` Independent Target Mandate |"
+    )
+    lines.append("|---|---|---|---|---|")
+    req_ranges = [
+        f"{m_r1.group(3)}–{m_r1.group(4)}",
+        f"{m_ru.group(3)}–{m_ru.group(4)}",
+        f"{m_rg.group(3)}–{m_rg.group(4)}",
+        f"{m_rg.group(5)}–{m_rg.group(6)}",
+    ]
+    for doc_fp in [spec_p, prov_p, todo_p]:
+        dtxt = doc_fp.read_text(encoding="utf-8")
+        rel_n = doc_fp.relative_to(root)
+        has_fail = ("43612388518" in dtxt) and ("0.9520" in dtxt) and ("0.5691" in dtxt)
+        has_dev = (
+            ("development target" in dtxt.lower())
+            and ("torsion_db.rs" in dtxt)
+            and ("dihedrals.rs" in dtxt)
+        )
+        has_rng = all(rg in dtxt for rg in req_ranges)
+        has_f8 = ("F8" in dtxt) and ("1IGD" in dtxt)
+        if not (has_fail and has_dev and has_rng and has_f8):
+            raise RuntimeError(
+                f"Candor check failed on {rel_n}: fail={has_fail}, dev={has_dev}, rng={has_rng}, f8={has_f8}"
+            )
+        lines.append(
+            f"| `{rel_n}` | **`RECORDED`** | **`RECORDED`** | **`SYNCED (4/4 Q_free ranges)`** | **`TRACKED (F8)`** |"
+        )
+    lines.append(
+        f"| `CALIBRATION-GATE-SPEC` (`PROVENANCE.md` <-> `real_benchmark.rs`) | — | — | — | **`MATCH ({len(doc_gates)}/6 gates)`** |"
+    )
+
+    return "\n".join(lines) + "\n"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
@@ -1443,7 +1700,16 @@ def main() -> None:
     ap.add_argument("--extra-file", action="append", default=[])
     ap.add_argument(
         "--section",
-        choices=["all", "digests", "13.1", "13.2", "13.4", "remediation", "ci-fix"],
+        choices=[
+            "all",
+            "digests",
+            "13.1",
+            "13.2",
+            "13.4",
+            "remediation",
+            "ci-fix",
+            "p1-3-5",
+        ],
         default="all",
     )
     args = ap.parse_args()
@@ -1463,6 +1729,8 @@ def main() -> None:
         parts.append(render_remediation(root, extras))
     if args.section == "ci-fix":
         parts.append(render_ci_fix(root, extras))
+    if args.section == "p1-3-5":
+        parts.append(render_p1_3_5(root, extras))
 
     md = "\n".join(parts)
     if args.out is not None:
