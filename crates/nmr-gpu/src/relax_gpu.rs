@@ -91,6 +91,8 @@ struct StrictMapFuture<'a> {
     state: Arc<Mutex<StrictMapState>>,
     #[cfg(not(target_arch = "wasm32"))]
     submission_index: Option<wgpu::SubmissionIndex>,
+    #[cfg(not(target_arch = "wasm32"))]
+    timeout_polls: u16,
 }
 
 impl Future for StrictMapFuture<'_> {
@@ -112,12 +114,23 @@ impl Future for StrictMapFuture<'_> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let sub_idx = self.submission_index.clone();
-            self.device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: sub_idx,
-                    timeout: Some(std::time::Duration::from_millis(200)),
-                })
-                .map_err(|e| format!("GPU device poll failed: {e}"))?;
+            match self.device.poll(wgpu::PollType::Wait {
+                submission_index: sub_idx,
+                timeout: Some(std::time::Duration::from_millis(200)),
+            }) {
+                Ok(_) => {}
+                Err(wgpu::PollError::Timeout) => {
+                    self.timeout_polls = self.timeout_polls.saturating_add(1);
+                    if self.timeout_polls >= 300 {
+                        return Poll::Ready(
+                            Err("GPU device poll timed out after 60 s".to_string()),
+                        );
+                    }
+                }
+                Err(e) => {
+                    return Poll::Ready(Err(format!("GPU device poll failed: {e}")));
+                }
+            }
             let mut guard = self
                 .state
                 .lock()
@@ -206,6 +219,8 @@ async fn read_buffer_strict_async<T: Pod>(
         state,
         #[cfg(not(target_arch = "wasm32"))]
         submission_index: Some(sub_idx),
+        #[cfg(not(target_arch = "wasm32"))]
+        timeout_polls: 0,
     }
     .await?;
 
