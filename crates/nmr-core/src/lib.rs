@@ -25,6 +25,7 @@ pub mod methyl_solver;
 pub mod methyl_trosy;
 pub mod nef;
 pub mod neural_picker;
+pub mod nmr1d;
 pub mod nmrstar;
 pub mod noesy;
 pub mod octet_analyt;
