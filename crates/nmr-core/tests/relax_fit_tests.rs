@@ -10,7 +10,8 @@
 //! and d'Auvergne & Gooley (*J. Biomol. NMR* 2003).
 
 use std::f64::consts::PI;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use nmr_core::noesy::{parse_pdb_first_model, v_norm, v_scale, v_sub};
 use nmr_core::relax_fit::{
@@ -20,6 +21,24 @@ use nmr_core::relax_fit::{
     HetNoeInput, OffsetModelGate, RelaxPhysicsConfig, ResidueRelaxRates, TrimmedTauMConfig,
 };
 use nmr_core::rng::Rng;
+use serde_json::json;
+
+fn emit_w3_metrics(record_id: &str, payload: serde_json::Value) {
+    let line = serde_json::to_string(&payload).expect("serialize W3 metrics JSON");
+    println!("[W3_METRICS_JSON] {line}");
+    if let Ok(dir_str) = std::env::var("NMR_W3_METRICS_DIR") {
+        if !dir_str.trim().is_empty() {
+            let dir = Path::new(&dir_str);
+            fs::create_dir_all(dir).expect("create NMR_W3_METRICS_DIR");
+            let tmp_path = dir.join(format!("{record_id}.{}.tmp", std::process::id()));
+            let out_path = dir.join(format!("{record_id}.json"));
+            let pretty =
+                serde_json::to_string_pretty(&payload).expect("pretty-serialize W3 metrics JSON");
+            fs::write(&tmp_path, format!("{pretty}\n")).expect("write temp W3 metrics JSON");
+            fs::rename(&tmp_path, &out_path).expect("commit W3 metrics JSON");
+        }
+    }
+}
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -122,6 +141,8 @@ fn two_param_and_aic_bic_three_param_decay_fits_and_crlb_mc_agreement() {
             .collect(),
         sigmas: vec![2.5; 8],
     };
+    let mut max_off_rate_err = 0.0_f64;
+    let mut max_off_c_err = 0.0_f64;
     for gate in [
         OffsetModelGate::Aic,
         OffsetModelGate::Aicc,
@@ -141,8 +162,12 @@ fn two_param_and_aic_bic_three_param_decay_fits_and_crlb_mc_agreement() {
             fit_off.used_three_param,
             "gate {gate:?} must select 3-param model"
         );
-        assert!((fit_off.rate - 3.1).abs() < 1.0e-4);
-        assert!((fit_off.offset_c - 45.0).abs() < 1.0e-2);
+        let r_err = (fit_off.rate - 3.1).abs();
+        let c_err = (fit_off.offset_c - 45.0).abs();
+        max_off_rate_err = max_off_rate_err.max(r_err);
+        max_off_c_err = max_off_c_err.max(c_err);
+        assert!(r_err < 1.0e-4);
+        assert!(c_err < 1.0e-2);
     }
 
     // 3. Small-sample Hurvich–Tsai `AICc` guard (`n <= k + 1`): at `n = 4`, 3-param (`k = 3`, `n - k - 1 = 0`)
@@ -170,6 +195,26 @@ fn two_param_and_aic_bic_three_param_decay_fits_and_crlb_mc_agreement() {
     assert!(
         !fit_n4_aicc.used_three_param,
         "AICc must reject 3-parameter model at n = 4 (n <= k + 1)"
+    );
+
+    emit_w3_metrics(
+        "t13_2_cpu_decay",
+        json!({
+            "record_id": "t13_2_cpu_decay",
+            "task": "T13.2",
+            "n_residues": n_res,
+            "n_delays": delays.len(),
+            "mc_replicates": cfg.mc_replicates,
+            "mean_mc_over_fisher_ratio": mean_ratio,
+            "within_2sigma_count": within_2sigma,
+            "within_2sigma_pct": 100.0 * (within_2sigma as f64) / (n_res as f64),
+            "pure_2param_aic_rejected_3p": !fit_pure.used_three_param,
+            "pure_2param_rate_abs_err": (fit_pure.rate - 4.2).abs(),
+            "offset_3param_gates_passed": 3,
+            "offset_3param_max_rate_err": max_off_rate_err,
+            "offset_3param_max_c_err": max_off_c_err,
+            "small_sample_n4_aicc_rejected_3p": !fit_n4_aicc.used_three_param
+        }),
     );
 }
 
@@ -219,6 +264,23 @@ fn steady_state_hetnoe_positive_and_negative_error_propagation_and_mc_cis() {
         results[1].sigma_noe
     );
     assert!(results[1].noe_ci95[0] < results[1].noe && results[1].noe < results[1].noe_ci95[1]);
+
+    emit_w3_metrics(
+        "t13_2_hetnoe",
+        json!({
+            "record_id": "t13_2_hetnoe",
+            "task": "T13.2",
+            "mc_replicates": 4000,
+            "pos_noe": results[0].noe,
+            "pos_sigma_analytical": results[0].sigma_noe,
+            "pos_sigma_mc": results[0].sigma_noe_mc,
+            "pos_mc_over_analytical_ratio": results[0].sigma_noe_mc / results[0].sigma_noe,
+            "neg_noe": results[1].noe,
+            "neg_sigma_analytical": results[1].sigma_noe,
+            "neg_sigma_mc": results[1].sigma_noe_mc,
+            "neg_mc_over_analytical_ratio": results[1].sigma_noe_mc / results[1].sigma_noe
+        }),
+    );
 }
 
 #[test]
@@ -282,11 +344,14 @@ fn kay_torchia_bax_outlier_trimmed_tau_m_and_axial_diffusion_recovery() {
         est.tau_m_sec * 1.0e9,
         rel_err * 100.0
     );
-    for rex_sid in [23, 25, 53, 68, 69, 70, 71, 72] {
+    let planted_outliers = [23, 25, 53, 68, 69, 70, 71, 72];
+    let mut planted_rejected = 0usize;
+    for rex_sid in planted_outliers {
         assert!(
             est.excluded_seq_ids.contains(&rex_sid),
             "outlier residue {rex_sid} must be excluded from trimmed core set"
         );
+        planted_rejected += 1;
     }
 
     // Axial diffusion recovery on real 1UBQ N-H bond vectors!
@@ -362,6 +427,27 @@ fn kay_torchia_bax_outlier_trimmed_tau_m_and_axial_diffusion_recovery() {
     assert!(
         ang_deg < 1.5,
         "axial symmetry axis angle error {ang_deg:.3} deg must be < 1.5 deg"
+    );
+
+    emit_w3_metrics(
+        "t13_2_tau_m_axial",
+        json!({
+            "record_id": "t13_2_tau_m_axial",
+            "task": "T13.2",
+            "iso_n_residues": iso_rates.len(),
+            "iso_tau_m_true_ns": tau_true * 1.0e9,
+            "iso_tau_m_fit_ns": est.tau_m_sec * 1.0e9,
+            "iso_tau_m_rel_err_pct": rel_err * 100.0,
+            "iso_planted_outliers_total": planted_outliers.len(),
+            "iso_planted_outliers_rejected": planted_rejected,
+            "iso_outliers_rejected": est.excluded_seq_ids.len(),
+            "iso_core_retained": est.retained_seq_ids.len(),
+            "ubq_nh_vectors": nh_vecs.len(),
+            "axial_ratio_true": ratio_true,
+            "axial_ratio_fit": ax_est.anisotropy_ratio,
+            "axial_ratio_rel_err_pct": ((ax_est.anisotropy_ratio - ratio_true) / ratio_true).abs() * 100.0,
+            "axial_axis_angle_err_deg": ang_deg
+        }),
     );
 }
 
@@ -453,7 +539,26 @@ fn farrow_1995_reduced_spectral_density_mapping_recovers_exact_j0_jwn_j087wh() {
         let mu = xs.iter().sum::<f64>() / (xs.len() as f64);
         (xs.iter().map(|&x| (x - mu).powi(2)).sum::<f64>() / ((xs.len() - 1) as f64)).sqrt()
     };
-    assert!(((sd_of(&v0) / rsd.sigma_j_0) - 1.0).abs() <= 0.03);
-    assert!(((sd_of(&vn) / rsd.sigma_j_omega_n) - 1.0).abs() <= 0.03);
-    assert!(((sd_of(&vh) / rsd.sigma_j_087_omega_h) - 1.0).abs() <= 0.03);
+    let r_j0 = sd_of(&v0) / rsd.sigma_j_0;
+    let r_jn = sd_of(&vn) / rsd.sigma_j_omega_n;
+    let r_jh = sd_of(&vh) / rsd.sigma_j_087_omega_h;
+    assert!((r_j0 - 1.0).abs() <= 0.03);
+    assert!((r_jn - 1.0).abs() <= 0.03);
+    assert!((r_jh - 1.0).abs() <= 0.03);
+
+    emit_w3_metrics(
+        "t13_2_spectral_density",
+        json!({
+            "record_id": "t13_2_spectral_density",
+            "task": "T13.2",
+            "field_mhz": field_mhz,
+            "mc_replicates": n_mc,
+            "j0_rel_err_pct": ((rsd.j_0 - j0_true) / j0_true).abs() * 100.0,
+            "jwn_rel_err_pct": ((rsd.j_omega_n - jn_true) / jn_true).abs() * 100.0,
+            "j087wh_rel_err_pct": ((rsd.j_087_omega_h - jh_true) / jh_true).abs() * 100.0,
+            "j0_mc_over_analytical_sigma": r_j0,
+            "jwn_mc_over_analytical_sigma": r_jn,
+            "j087wh_mc_over_analytical_sigma": r_jh
+        }),
+    );
 }

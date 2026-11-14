@@ -11,12 +11,43 @@
 //! 1982a,b), Clore et al. (*JACS* 1990), Mandel, Akke & Palmer (*J. Mol. Biol.* 1995), Woessner
 //! (*J. Chem. Phys.* 1962), and d'Auvergne & Gooley (*J. Biomol. NMR* 2003).
 
+use std::fs;
+use std::path::Path;
 use std::time::Instant;
 
 use nmr_core::relax_fit::{fit_decay_batch_cpu, DecayCurveInput, ExpFitConfig, OffsetModelGate};
 use nmr_core::rng::Rng;
 use nmr_gpu::relax_gpu::{fit_decay_batch_with_pipeline, RelaxGpuPipeline};
 use nmr_gpu::GpuEngine;
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn emit_w3_metrics_raw_json(record_id: &str, json_line: &str) {
+    println!("[W3_METRICS_JSON] {json_line}");
+    if let Ok(dir_str) = std::env::var("NMR_W3_METRICS_DIR") {
+        if !dir_str.trim().is_empty() {
+            let dir = Path::new(&dir_str);
+            fs::create_dir_all(dir).expect("create NMR_W3_METRICS_DIR");
+            let tmp_path = dir.join(format!("{record_id}.{}.tmp", std::process::id()));
+            let out_path = dir.join(format!("{record_id}.json"));
+            fs::write(&tmp_path, format!("{json_line}\n")).expect("write temp W3 GPU metrics JSON");
+            fs::rename(&tmp_path, &out_path).expect("commit W3 GPU metrics JSON");
+        }
+    }
+}
 
 fn require_gpu_or_allow_skip() -> Option<(GpuEngine, bool)> {
     let is_cpu_adapter = {
@@ -164,6 +195,23 @@ fn gpu_150_residues_x_1000_mc_completes_under_100ms_with_1e5_cpu_parity_and_3pct
         "[T13.2 WebGPU Gate] 150x1000 MC in {elapsed_ms:.2} ms on {} ({}) | max |R_gpu - R_cpu| = {max_abs_rate_diff:.3e} | MC/Fisher = {mean_mc_fisher_ratio:.5}",
         engine.adapter_name, engine.backend_name
     );
+
+    let bench_json = format!(
+        "{{\"record_id\":\"t13_2_gpu_bench\",\"task\":\"T13.2\",\"adapter_name\":\"{}\",\"backend_name\":\"{}\",\"is_software_cpu\":{},\"n_residues\":{},\"mc_replicates\":{},\"total_fits\":{},\"elapsed_ms\":{:.6},\"ceiling_ms\":{:.1},\"max_abs_gpu_cpu_rate_diff\":{:.9e},\"mean_mc_over_fisher_ratio\":{:.8},\"ci95_covered_count\":{},\"ci95_covered_pct\":{:.4}}}",
+        json_escape(&engine.adapter_name),
+        json_escape(&engine.backend_name),
+        is_software_cpu,
+        n_res,
+        cfg.mc_replicates,
+        n_res * (cfg.mc_replicates + 1),
+        elapsed_ms,
+        ceiling_ms,
+        max_abs_rate_diff,
+        mean_mc_fisher_ratio,
+        covered_95,
+        100.0 * (covered_95 as f64) / (n_res as f64)
+    );
+    emit_w3_metrics_raw_json("t13_2_gpu_bench", &bench_json);
 }
 
 #[test]
@@ -210,14 +258,17 @@ fn gpu_three_param_aic_gate_and_tdr_multi_chunk_dispatch_match_cpu() {
     )
     .expect("CPU AIC point fits");
 
+    let mut max_tdr_rate_diff = 0.0_f64;
     for (g, c) in gpu_fits.iter().zip(cpu_fits.iter()) {
         assert_eq!(g.used_three_param, c.used_three_param);
+        let diff = (g.rate - c.rate).abs();
+        max_tdr_rate_diff = max_tdr_rate_diff.max(diff);
         assert!(
-            (g.rate - c.rate).abs() < 1.0e-5,
+            diff < 1.0e-5,
             "AIC 2p/3p GPU rate {:.7} vs CPU {:.7} diff {:.3e} must be < 1e-5",
             g.rate,
             c.rate,
-            (g.rate - c.rate).abs()
+            diff
         );
         assert!(g.sigma_rate_mc > 0.0 && g.sigma_rate_mc.is_finite());
     }
@@ -252,5 +303,17 @@ fn gpu_three_param_aic_gate_and_tdr_multi_chunk_dispatch_match_cpu() {
         fit_decay_batch_with_pipeline(&engine, &pipe, &n4_curves, &aicc_cfg).expect("GPU n=4 AICc");
     let cpu_n4 = fit_decay_batch_cpu(&n4_curves, &aicc_cfg).expect("CPU n=4 AICc");
     assert!(!gpu_n4[0].used_three_param && !cpu_n4[0].used_three_param);
-    assert!((gpu_n4[0].rate - cpu_n4[0].rate).abs() < 1.0e-5);
+    let n4_diff = (gpu_n4[0].rate - cpu_n4[0].rate).abs();
+    assert!(n4_diff < 1.0e-5);
+
+    let tdr_json = format!(
+        "{{\"record_id\":\"t13_2_gpu_tdr_aicc\",\"task\":\"T13.2\",\"n_curves\":{},\"mc_replicates\":{},\"total_fits\":{},\"aic_selection_exact_matches\":{},\"max_abs_gpu_cpu_rate_diff\":{:.9e},\"browser_default_limits_verified\":true,\"small_sample_n4_aicc_parity\":true,\"n4_gpu_cpu_rate_diff\":{:.9e}}}",
+        curves.len(),
+        cfg.mc_replicates,
+        curves.len() * (cfg.mc_replicates + 1),
+        curves.len(),
+        max_tdr_rate_diff,
+        n4_diff
+    );
+    emit_w3_metrics_raw_json("t13_2_gpu_tdr_aicc", &tdr_json);
 }

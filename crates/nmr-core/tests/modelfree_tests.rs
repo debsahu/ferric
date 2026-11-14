@@ -13,7 +13,8 @@
 //! 1962), and d'Auvergne & Gooley (*J. Biomol. NMR* 2003).
 
 use std::f64::consts::PI;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use nmr_core::modelfree::{
     extract_nh_unit_vectors_from_pdb, fit_modelfree_dataset, group_multifield_rates,
@@ -26,6 +27,24 @@ use nmr_core::relax_fit::{
     HetNoeInput, OffsetModelGate, RelaxPhysicsConfig, ResidueRelaxRates,
 };
 use nmr_core::rng::Rng;
+use serde_json::json;
+
+fn emit_w3_metrics(record_id: &str, payload: serde_json::Value) {
+    let line = serde_json::to_string(&payload).expect("serialize W3 metrics JSON");
+    println!("[W3_METRICS_JSON] {line}");
+    if let Ok(dir_str) = std::env::var("NMR_W3_METRICS_DIR") {
+        if !dir_str.trim().is_empty() {
+            let dir = Path::new(&dir_str);
+            fs::create_dir_all(dir).expect("create NMR_W3_METRICS_DIR");
+            let tmp_path = dir.join(format!("{record_id}.{}.tmp", std::process::id()));
+            let out_path = dir.join(format!("{record_id}.json"));
+            let pretty =
+                serde_json::to_string_pretty(&payload).expect("pretty-serialize W3 metrics JSON");
+            fs::write(&tmp_path, format!("{pretty}\n")).expect("write temp W3 metrics JSON");
+            fs::rename(&tmp_path, &out_path).expect("commit W3 metrics JSON");
+        }
+    }
+}
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -136,6 +155,7 @@ fn synthetic_m1_m5_multifield_parameter_recovery_and_b0_squared_rex_scaling() {
     );
 
     let mut s2_abs_err_sum = 0.0_f64;
+    let mut max_rex_abs_err = 0.0_f64;
     for (fit_r, &(m_true, p_true)) in result.residues.iter().zip(truths.iter()) {
         assert_eq!(
             fit_r.selected_model, m_true,
@@ -144,8 +164,10 @@ fn synthetic_m1_m5_multifield_parameter_recovery_and_b0_squared_rex_scaling() {
         );
         s2_abs_err_sum += (fit_r.params.s2 - p_true.s2).abs();
         if m_true == ModelFreeId::M3 || m_true == ModelFreeId::M4 {
+            let rex_err = (fit_r.params.rex_ref_s_inv - p_true.rex_ref_s_inv).abs();
+            max_rex_abs_err = max_rex_abs_err.max(rex_err);
             assert!(
-                (fit_r.params.rex_ref_s_inv - p_true.rex_ref_s_inv).abs() < 0.02,
+                rex_err < 0.02,
                 "Rex recovery {:.4} vs {:.4}",
                 fit_r.params.rex_ref_s_inv,
                 p_true.rex_ref_s_inv
@@ -221,6 +243,28 @@ fn synthetic_m1_m5_multifield_parameter_recovery_and_b0_squared_rex_scaling() {
     let tsv = write_modelfree_tsv_str(&result);
     assert!(tsv.contains("seq_id\tres_name\tmodel\ts2"));
     assert!(tsv.lines().count() == 52);
+
+    emit_w3_metrics(
+        "t13_3_multifield_m1_m5",
+        json!({
+            "record_id": "t13_3_multifield_m1_m5",
+            "task": "T13.3",
+            "fields_mhz": [600.0, 800.0],
+            "n_residues": 50,
+            "rex_800_over_600_ratio": rex_800 / rex_600,
+            "rex_quadratic_theory_ratio": (800.0_f64 / 600.0).powi(2),
+            "rex_scaling_abs_err": (rex_800 / rex_600 - (800.0_f64 / 600.0).powi(2)).abs(),
+            "noiseless_model_exact_matches": 50,
+            "noiseless_s2_mae": s2_mae,
+            "noiseless_tau_m_true_ns": tau_m_true * 1.0e9,
+            "noiseless_tau_m_fit_ns": tau_fit * 1.0e9,
+            "noiseless_tau_m_rel_err_pct": tau_rel_err * 100.0,
+            "noiseless_max_rex_abs_err": max_rex_abs_err,
+            "noisy_0p4pct_s2_mae": noisy_s2_mae,
+            "noisy_0p4pct_tau_m_fit_ns": noisy_res.diffusion_tensor.effective_tau_m_sec() * 1.0e9,
+            "noisy_0p4pct_tau_m_rel_err_pct": noisy_tau_err * 100.0
+        }),
+    );
 }
 
 #[test]
@@ -242,6 +286,7 @@ fn ubiquitin_1ubq_prolate_and_oblate_axial_and_fully_anisotropic_diffusion_recov
         theta_t.sin() * phi_t.sin(),
         theta_t.cos(),
     ];
+    let mut woessner_cont_max_diff = 0.0_f64;
     for &(d_perp, d_par) in &[(3.2e7_f64, 4.9e7_f64), (4.4e7_f64, 2.9e7_f64)] {
         let ax3 = woessner_axial_components(u_test, axis_t, d_perp, d_par);
         let an5 = woessner_anisotropic_components(
@@ -255,9 +300,13 @@ fn ubiquitin_1ubq_prolate_and_oblate_axial_and_fully_anisotropic_diffusion_recov
         let p_loc = LocalMfParams::m2(0.84, 55.0e-12);
         let obs_ax = predict_r1_r2_noe(&ax3, &p_loc, 800.0, 600.0, &phys);
         let obs_an = predict_r1_r2_noe(&an5, &p_loc, 800.0, 600.0, &phys);
-        assert!((obs_ax.0 - obs_an.0).abs() < 1.0e-11);
-        assert!((obs_ax.1 - obs_an.1).abs() < 1.0e-11);
-        assert!((obs_ax.2 - obs_an.2).abs() < 1.0e-11);
+        let d0 = (obs_ax.0 - obs_an.0).abs();
+        let d1 = (obs_ax.1 - obs_an.1).abs();
+        let d2 = (obs_ax.2 - obs_an.2).abs();
+        woessner_cont_max_diff = woessner_cont_max_diff.max(d0).max(d1).max(d2);
+        assert!(d0 < 1.0e-11);
+        assert!(d1 < 1.0e-11);
+        assert!(d2 < 1.0e-11);
     }
 
     // 2. Prolate axial diffusion recovery on 1UBQ N-H vectors across M1..M5 + Auto symmetry selection!
@@ -336,49 +385,52 @@ fn ubiquitin_1ubq_prolate_and_oblate_axial_and_fully_anisotropic_diffusion_recov
     )
     .expect("fit 1UBQ Auto diffusion");
 
-    match auto_res.diffusion_tensor {
-        DiffusionTensor::AxialSymmetric {
-            d_perp_s_inv,
-            d_par_s_inv,
-            theta_rad,
-            phi_rad,
-        } => {
-            let ratio_fit = d_par_s_inv / d_perp_s_inv;
-            assert!(
-                ((ratio_fit - 1.48) / 1.48).abs() < 0.015,
-                "1UBQ prolate D_par/D_perp {ratio_fit:.4} vs 1.4800"
-            );
-            let tm_true = true_tensor.effective_tau_m_sec();
-            let tm_fit = auto_res.diffusion_tensor.effective_tau_m_sec();
-            assert!(
-                ((tm_fit - tm_true) / tm_true).abs() < 0.005,
-                "1UBQ axial effective tau_m error {:.4}% must be < 0.5%",
-                ((tm_fit - tm_true) / tm_true).abs() * 100.0
-            );
-            let ax_true = [
-                theta_true.sin() * phi_true.cos(),
-                theta_true.sin() * phi_true.sin(),
-                theta_true.cos(),
-            ];
-            let ax_fit = [
-                theta_rad.sin() * phi_rad.cos(),
-                theta_rad.sin() * phi_rad.sin(),
-                theta_rad.cos(),
-            ];
-            let ang_deg =
-                (ax_true[0] * ax_fit[0] + ax_true[1] * ax_fit[1] + ax_true[2] * ax_fit[2])
-                    .abs()
-                    .clamp(0.0, 1.0)
-                    .acos()
-                    * 180.0
-                    / PI;
-            assert!(
-                ang_deg < 1.5,
-                "1UBQ prolate axis orientation error {ang_deg:.3} deg must be < 1.5 deg"
-            );
-        }
-        other => panic!("Auto diffusion selection should choose AxialSymmetric, got {other:?}"),
-    }
+    let (prolate_ratio_fit, prolate_tm_rel_err_pct, prolate_ang_deg) =
+        match auto_res.diffusion_tensor {
+            DiffusionTensor::AxialSymmetric {
+                d_perp_s_inv,
+                d_par_s_inv,
+                theta_rad,
+                phi_rad,
+            } => {
+                let ratio_fit = d_par_s_inv / d_perp_s_inv;
+                assert!(
+                    ((ratio_fit - 1.48) / 1.48).abs() < 0.015,
+                    "1UBQ prolate D_par/D_perp {ratio_fit:.4} vs 1.4800"
+                );
+                let tm_true = true_tensor.effective_tau_m_sec();
+                let tm_fit = auto_res.diffusion_tensor.effective_tau_m_sec();
+                let tm_rel_err = ((tm_fit - tm_true) / tm_true).abs();
+                assert!(
+                    tm_rel_err < 0.005,
+                    "1UBQ axial effective tau_m error {:.4}% must be < 0.5%",
+                    tm_rel_err * 100.0
+                );
+                let ax_true = [
+                    theta_true.sin() * phi_true.cos(),
+                    theta_true.sin() * phi_true.sin(),
+                    theta_true.cos(),
+                ];
+                let ax_fit = [
+                    theta_rad.sin() * phi_rad.cos(),
+                    theta_rad.sin() * phi_rad.sin(),
+                    theta_rad.cos(),
+                ];
+                let ang_deg =
+                    (ax_true[0] * ax_fit[0] + ax_true[1] * ax_fit[1] + ax_true[2] * ax_fit[2])
+                        .abs()
+                        .clamp(0.0, 1.0)
+                        .acos()
+                        * 180.0
+                        / PI;
+                assert!(
+                    ang_deg < 1.5,
+                    "1UBQ prolate axis orientation error {ang_deg:.3} deg must be < 1.5 deg"
+                );
+                (ratio_fit, tm_rel_err * 100.0, ang_deg)
+            }
+            other => panic!("Auto diffusion selection should choose AxialSymmetric, got {other:?}"),
+        };
 
     let s2_mae: f64 = auto_res
         .residues
@@ -459,6 +511,24 @@ fn ubiquitin_1ubq_prolate_and_oblate_axial_and_fully_anisotropic_diffusion_recov
         / aniso_true.effective_tau_m_sec())
     .abs();
     assert!(tm_aniso_err < 0.005);
+
+    emit_w3_metrics(
+        "t13_3_ubq_diffusion",
+        json!({
+            "record_id": "t13_3_ubq_diffusion",
+            "task": "T13.3",
+            "ubq_nh_vectors": nh_vecs.len(),
+            "woessner_continuity_max_obs_diff": woessner_cont_max_diff,
+            "auto_selected_kind": "AxialSymmetric",
+            "prolate_ratio_true": 1.48,
+            "prolate_ratio_fit": prolate_ratio_fit,
+            "prolate_ratio_rel_err_pct": ((prolate_ratio_fit - 1.48) / 1.48).abs() * 100.0,
+            "prolate_tau_m_rel_err_pct": prolate_tm_rel_err_pct,
+            "prolate_axis_angle_err_deg": prolate_ang_deg,
+            "prolate_s2_mae": s2_mae,
+            "anisotropic_tau_m_rel_err_pct": tm_aniso_err * 100.0
+        }),
+    );
 }
 
 #[test]
@@ -660,21 +730,51 @@ fn aic_model_selection_exceeds_95pct_accuracy_under_2pct_gaussian_intensity_nois
         "tau_m error {tau_err_pct:.4}% under 2% intensity noise must be < 0.5%"
     );
 
-    // Also smoke-verify BIC, AICc, and Palmer F-test criteria execute cleanly
-    for crit in [
+    // Evaluate AICc, BIC, and Palmer F-test across all 100 noisy residues as well
+    let mut alt_correct = [0usize; 3];
+    for (c_idx, crit) in [
         ModelSelectionCriterion::Aicc,
         ModelSelectionCriterion::Bic,
         ModelSelectionCriterion::PalmerFTest,
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let alt = fit_modelfree_dataset(
-            &mf_inputs[..25],
+            &mf_inputs,
             &ModelFreeConfig {
+                diffusion_kind: DiffusionTensorKind::Isotropic,
                 selection_criterion: crit,
-                ..ModelFreeConfig::default()
+                ref_field_mhz: Some(ref_mhz),
+                physics: phys,
+                enable_model_elimination: true,
+                max_outer_iters: 6,
+                mc_replicates: 0,
+                seed: 42,
             },
         )
         .unwrap();
-        assert_eq!(alt.residues.len(), 25);
+        assert_eq!(alt.residues.len(), n_res);
+        alt_correct[c_idx] = alt
+            .residues
+            .iter()
+            .zip(truths.iter())
+            .filter(|(r, &(m_true, _))| r.selected_model == m_true)
+            .count();
+    }
+
+    let mut per_model_ok = [0usize; 5];
+    for (r, &(m_true, _)) in mf_res.residues.iter().zip(truths.iter()) {
+        if r.selected_model == m_true {
+            let m_idx = match m_true {
+                ModelFreeId::M1 => 0,
+                ModelFreeId::M2 => 1,
+                ModelFreeId::M3 => 2,
+                ModelFreeId::M4 => 3,
+                ModelFreeId::M5 => 4,
+            };
+            per_model_ok[m_idx] += 1;
+        }
     }
 
     // Verify small-sample `AICc` `m_obs <= k + 1` guard in Model-Free selection:
@@ -786,4 +886,37 @@ fn aic_model_selection_exceeds_95pct_accuracy_under_2pct_gaussian_intensity_nois
         &aicc_mf_cfg,
     );
     assert_eq!(fit_obs2.selected_model, ModelFreeId::M1);
+
+    emit_w3_metrics(
+        "t13_3_noisy_selection",
+        json!({
+            "record_id": "t13_3_noisy_selection",
+            "task": "T13.3",
+            "n_residues": n_res,
+            "per_model_total": n_res / 5,
+            "intensity_noise_pct": 2.0,
+            "fields_mhz": [600.0, 800.0],
+            "aic_correct_count": correct_count,
+            "aic_accuracy_pct": accuracy_pct,
+            "aic_per_model_correct": {
+                "M1": per_model_ok[0],
+                "M2": per_model_ok[1],
+                "M3": per_model_ok[2],
+                "M4": per_model_ok[3],
+                "M5": per_model_ok[4]
+            },
+            "aicc_correct_count": alt_correct[0],
+            "aicc_accuracy_pct": (alt_correct[0] as f64) * 100.0 / (n_res as f64),
+            "bic_correct_count": alt_correct[1],
+            "bic_accuracy_pct": (alt_correct[1] as f64) * 100.0 / (n_res as f64),
+            "palmer_ftest_correct_count": alt_correct[2],
+            "palmer_ftest_accuracy_pct": (alt_correct[2] as f64) * 100.0 / (n_res as f64),
+            "tau_m_true_ns": tau_m_true * 1.0e9,
+            "tau_m_fit_ns": mf_res.diffusion_tensor.effective_tau_m_sec() * 1.0e9,
+            "tau_m_rel_err_pct": tau_err_pct,
+            "s2_mean_bias": s2_mean_bias,
+            "s2_mae": s2_mae,
+            "small_sample_aicc_guards_verified": true
+        }),
+    );
 }

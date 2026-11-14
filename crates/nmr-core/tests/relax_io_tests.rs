@@ -28,6 +28,24 @@ use nmr_core::relax_io::{
 };
 use nmr_core::rng::Rng;
 use nmr_core::spectrum::{AxisPpm, Spectrum2D};
+use serde_json::json;
+
+fn emit_w3_metrics(record_id: &str, payload: serde_json::Value) {
+    let line = serde_json::to_string(&payload).expect("serialize W3 metrics JSON");
+    println!("[W3_METRICS_JSON] {line}");
+    if let Ok(dir_str) = std::env::var("NMR_W3_METRICS_DIR") {
+        if !dir_str.trim().is_empty() {
+            let dir = Path::new(&dir_str);
+            fs::create_dir_all(dir).expect("create NMR_W3_METRICS_DIR");
+            let tmp_path = dir.join(format!("{record_id}.{}.tmp", std::process::id()));
+            let out_path = dir.join(format!("{record_id}.json"));
+            let pretty =
+                serde_json::to_string_pretty(&payload).expect("pretty-serialize W3 metrics JSON");
+            fs::write(&tmp_path, format!("{pretty}\n")).expect("write temp W3 metrics JSON");
+            fs::rename(&tmp_path, &out_path).expect("commit W3 metrics JSON");
+        }
+    }
+}
 
 fn temp_test_dir(tag: &str) -> std::path::PathBuf {
     let dir =
@@ -119,6 +137,44 @@ relaxT 1 1 8 0 0 2 1 0 1 64
     let v_sched_2 =
         parse_varian_relax_schedule(&procpar_quad_outer, None).expect("parse varian phase,relaxT");
     assert_eq!(v_sched_2.interleaving, Pseudo3DInterleaving::T1QuadPlane);
+
+    let vd_expected = [0.010, 0.050, 5.0e-4, 2.5e-4, 0.100, 0.500, 1.250, 0.050];
+    let vd_max_err = vd
+        .iter()
+        .zip(vd_expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    let fq_expected_hz = [
+        -600.0,
+        0.0,
+        300.0,
+        600.0,
+        1500.0,
+        (105.0 - 118.0) * 60.81,
+        (120.0 - 118.0) * 60.81,
+    ];
+    let fq_max_err_hz = fq
+        .iter()
+        .zip(fq_expected_hz.iter())
+        .map(|(f, e)| (f.offset_hz - e).abs())
+        .fold(0.0_f64, f64::max);
+    emit_w3_metrics(
+        "t13_1_schedules",
+        json!({
+            "record_id": "t13_1_schedules",
+            "task": "T13.1",
+            "vdlist_count": vd.len(),
+            "vdlist_max_abs_err_sec": vd_max_err,
+            "vclist_count": counts.len(),
+            "nu_cpmg_max_hz": nu_cpmg[4],
+            "nu_cpmg_max_abs_err_hz": (nu_cpmg[4] - 400.0).abs(),
+            "fqlist_count": fq.len(),
+            "fqlist_max_abs_err_hz": fq_max_err_hz,
+            "varian_param_name": v_sched.param_name,
+            "varian_relaxt_count": v_sched.schedule.primary_values().len(),
+            "varian_interleaving_modes_verified": 2
+        }),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -523,20 +579,26 @@ fn bruker_and_varian_raw_pseudo3d_interleaving_modes_match_identically() {
         let _ = fs::remove_dir_all(&vdir);
     }
 
+    let mut bruker_max_il_diff = 0.0_f64;
+    let mut varian_max_il_diff = 0.0_f64;
     for mode_idx in 1..3 {
         for r in 0..peaks.len() {
             for p in 0..delays.len() {
                 let b0 = bruker_results[0].traces[r].intensities[p];
                 let bm = bruker_results[mode_idx].traces[r].intensities[p];
+                let b_rel = ((bm - b0) / b0.abs()).abs();
+                bruker_max_il_diff = bruker_max_il_diff.max(b_rel);
                 assert!(
-                    ((bm - b0) / b0.abs()).abs() < 1.0e-11,
+                    b_rel < 1.0e-11,
                     "Bruker interleaving mode {mode_idx} mismatch at res {r}, plane {p}: {bm} vs {b0}"
                 );
 
                 let v0 = varian_results[0].traces[r].intensities[p];
                 let vm = varian_results[mode_idx].traces[r].intensities[p];
+                let v_rel = ((vm - v0) / v0.abs()).abs();
+                varian_max_il_diff = varian_max_il_diff.max(v_rel);
                 assert!(
-                    ((vm - v0) / v0.abs()).abs() < 1.0e-11,
+                    v_rel < 1.0e-11,
                     "Varian interleaving mode {mode_idx} mismatch at res {r}, plane {p}: {vm} vs {v0}"
                 );
             }
@@ -544,6 +606,8 @@ fn bruker_and_varian_raw_pseudo3d_interleaving_modes_match_identically() {
     }
 
     // Verify normalized decay ratios I(t)/I(t_0) match exp(-R*(t - t_0)) to < 0.2%
+    let mut bruker_max_ratio_err = 0.0_f64;
+    let mut varian_max_ratio_err = 0.0_f64;
     for (r, &(_, _, _, r_true)) in peaks.iter().enumerate() {
         let b_i0 = bruker_results[0].traces[r].intensities[0];
         let v_i0 = varian_results[0].traces[r].intensities[0];
@@ -551,16 +615,35 @@ fn bruker_and_varian_raw_pseudo3d_interleaving_modes_match_identically() {
             let expected_ratio = (-r_true * (t - delays[0])).exp();
             let b_ratio = bruker_results[0].traces[r].intensities[p] / b_i0;
             let v_ratio = varian_results[0].traces[r].intensities[p] / v_i0;
+            let b_err = (b_ratio - expected_ratio).abs();
+            let v_err = (v_ratio - expected_ratio).abs();
+            bruker_max_ratio_err = bruker_max_ratio_err.max(b_err);
+            varian_max_ratio_err = varian_max_ratio_err.max(v_err);
             assert!(
-                (b_ratio - expected_ratio).abs() < 2.0e-3,
+                b_err < 2.0e-3,
                 "Bruker decay ratio {b_ratio:.5} vs {expected_ratio:.5}"
             );
             assert!(
-                (v_ratio - expected_ratio).abs() < 2.0e-3,
+                v_err < 2.0e-3,
                 "Varian decay ratio {v_ratio:.5} vs {expected_ratio:.5}"
             );
         }
     }
+
+    emit_w3_metrics(
+        "t13_1_interleaving",
+        json!({
+            "record_id": "t13_1_interleaving",
+            "task": "T13.1",
+            "n_planes": delays.len(),
+            "n_peaks": peaks.len(),
+            "interleaving_modes": 3,
+            "bruker_max_rel_interleaving_diff": bruker_max_il_diff,
+            "varian_max_rel_interleaving_diff": varian_max_il_diff,
+            "bruker_max_decay_ratio_err": bruker_max_ratio_err,
+            "varian_max_decay_ratio_err": varian_max_ratio_err
+        }),
+    );
 }
 
 #[test]
@@ -616,6 +699,9 @@ fn twenty_plane_bruker_and_varian_snr4_done_gate_eliminates_positive_picking_bia
     let mut sum_locked_snr4 = 0.0_f64;
     let mut sum_naive_snr4 = 0.0_f64;
     let mut sum_true_snr4 = 0.0_f64;
+    let mut trial0_mad_max_err = 0.0_f64;
+    let mut trial0_dup_dof = 0usize;
+    let mut trial0_dup_var_scale = 1.0_f64;
 
     let cfg = RelaxIntegrationConfig {
         shape_model: FootprintShapeModel::Gaussian,
@@ -691,6 +777,13 @@ fn twenty_plane_bruker_and_varian_snr4_done_gate_eliminates_positive_picking_bia
                 "duplicate_variance_scale={:.4} should be ~1.0 under stationary Gaussian noise",
                 ds.duplicate_variance_scale
             );
+            trial0_mad_max_err = ds
+                .plane_noise_mad
+                .iter()
+                .map(|&m| (m - sigma_noise).abs())
+                .fold(0.0_f64, f64::max);
+            trial0_dup_dof = ds.duplicate_dof;
+            trial0_dup_var_scale = ds.duplicate_variance_scale;
         }
 
         for (tr, nv) in ds.traces.iter().zip(naive.iter()).take(n_res) {
@@ -962,6 +1055,34 @@ fn twenty_plane_bruker_and_varian_snr4_done_gate_eliminates_positive_picking_bia
         v_naive_bias_pct > 8.0,
         "Varian raw 20-plane SNR=4 naive local-max bias +{v_naive_bias_pct:.3}% must be > 8.0%"
     );
+
+    emit_w3_metrics(
+        "t13_1_snr4_gate",
+        json!({
+            "record_id": "t13_1_snr4_gate",
+            "task": "T13.1",
+            "n_planes": delays.len(),
+            "snr_initial": i0_true / sigma_noise,
+            "snr_final": 4.0,
+            "stack_n_residues": n_res,
+            "stack_n_trials": n_trials,
+            "stack_total_points": n_res * n_trials * delays.len(),
+            "stack_locked_all_bias_pct": rel_bias_locked_all,
+            "stack_locked_snr4_bias_pct": rel_bias_locked_snr4,
+            "stack_naive_snr4_bias_pct": rel_bias_naive_snr4,
+            "stack_mad_max_abs_err": trial0_mad_max_err,
+            "stack_duplicate_dof": trial0_dup_dof,
+            "stack_duplicate_var_scale": trial0_dup_var_scale,
+            "bruker_raw_n_peaks": raw_peaks.len(),
+            "bruker_raw_n_reps": 8,
+            "bruker_raw_locked_snr4_bias_pct": b_locked_bias_pct,
+            "bruker_raw_naive_snr4_bias_pct": b_naive_bias_pct,
+            "varian_raw_n_peaks": raw_peaks.len(),
+            "varian_raw_n_reps": 8,
+            "varian_raw_locked_snr4_bias_pct": v_locked_bias_pct,
+            "varian_raw_naive_snr4_bias_pct": v_naive_bias_pct
+        }),
+    );
 }
 
 #[test]
@@ -1064,13 +1185,16 @@ fn overlapping_footprints_deconvolve_and_tsv_nef_roundtrip_cleanly() {
         ds.traces[0].footprint.overlap_cluster_id,
         ds.traces[1].footprint.overlap_cluster_id
     );
+    let mut overlap_max_ratio_err = 0.0_f64;
     for (r, &rate) in rates.iter().enumerate() {
         let a0 = ds.traces[r].intensities[0];
         let a3 = ds.traces[r].intensities[3];
         let obs_ratio = a3 / a0;
         let exp_ratio = (-rate * delays[3]).exp();
+        let err = (obs_ratio - exp_ratio).abs();
+        overlap_max_ratio_err = overlap_max_ratio_err.max(err);
         assert!(
-            (obs_ratio - exp_ratio).abs() < 0.015,
+            err < 0.015,
             "overlapping peak {r} ratio {obs_ratio:.4} vs expected {exp_ratio:.4}"
         );
     }
@@ -1090,9 +1214,13 @@ fn overlapping_footprints_deconvolve_and_tsv_nef_roundtrip_cleanly() {
     let from_nef = parse_relax_series_nef_str(&nef_txt).expect("parse relax NEF");
     assert_eq!(from_nef.experiment_kind, ds.experiment_kind);
     assert_eq!(from_nef.traces.len(), ds.traces.len());
+    let mut max_tsv_err = 0.0_f64;
+    let mut max_nef_err = 0.0_f64;
     for p in 0..delays.len() {
         let diff_tsv = (from_tsv.traces[0].intensities[p] - ds.traces[0].intensities[p]).abs();
         let diff_nef = (from_nef.traces[0].intensities[p] - ds.traces[0].intensities[p]).abs();
+        max_tsv_err = max_tsv_err.max(diff_tsv);
+        max_nef_err = max_nef_err.max(diff_nef);
         assert!(diff_tsv < 1.0e-3 && diff_nef < 1.0e-3);
     }
 
@@ -1158,19 +1286,39 @@ fn overlapping_footprints_deconvolve_and_tsv_nef_roundtrip_cleanly() {
         parse_relax_series_tsv_str(&write_relax_series_tsv_str(&pv_ds)).expect("parse pv TSV");
     let pv_from_nef =
         parse_relax_series_nef_str(&write_relax_series_nef_str(&pv_ds)).expect("parse pv NEF");
+    let mut pv_eta_max_err = 0.0_f64;
+    let mut pv_vol_max_err = 0.0_f64;
     for idx in 0..3 {
         let orig = &pv_ds.traces[idx].footprint;
         for restored in [
             &pv_from_tsv.traces[idx].footprint,
             &pv_from_nef.traces[idx].footprint,
         ] {
-            assert!((restored.eta_h - orig.eta_h).abs() < 2.0e-5);
-            assert!((restored.eta_x - orig.eta_x).abs() < 2.0e-5);
+            let eh_err = (restored.eta_h - orig.eta_h).abs();
+            let ex_err = (restored.eta_x - orig.eta_x).abs();
+            let vol_err =
+                (restored.unit_volume_factor_ppm2() - orig.unit_volume_factor_ppm2()).abs();
+            pv_eta_max_err = pv_eta_max_err.max(eh_err).max(ex_err);
+            pv_vol_max_err = pv_vol_max_err.max(vol_err);
+            assert!(eh_err < 2.0e-5);
+            assert!(ex_err < 2.0e-5);
             assert_eq!(restored.overlap_cluster_id, orig.overlap_cluster_id);
-            assert!(
-                (restored.unit_volume_factor_ppm2() - orig.unit_volume_factor_ppm2()).abs()
-                    < 1.0e-5
-            );
+            assert!(vol_err < 1.0e-5);
         }
     }
+
+    emit_w3_metrics(
+        "t13_1_overlap_roundtrip",
+        json!({
+            "record_id": "t13_1_overlap_roundtrip",
+            "task": "T13.1",
+            "overlap_cluster_shared": ds.traces[0].footprint.overlap_cluster_id == ds.traces[1].footprint.overlap_cluster_id,
+            "overlap_max_decay_ratio_err": overlap_max_ratio_err,
+            "gaussian_tsv_max_abs_err": max_tsv_err,
+            "gaussian_nef_max_abs_err": max_nef_err,
+            "pseudovoigt_eta_max_abs_err": pv_eta_max_err,
+            "pseudovoigt_vol_factor_max_abs_err": pv_vol_max_err,
+            "pseudovoigt_clusters_preserved": true
+        }),
+    );
 }
