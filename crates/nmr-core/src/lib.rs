@@ -13,7 +13,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod aromatic;
 pub mod c13_detected;
+pub mod cest;
 pub mod classify;
+pub mod cpmg;
+pub mod csp;
 pub mod dihedrals;
 pub mod evaluate;
 pub mod evo_graph;
