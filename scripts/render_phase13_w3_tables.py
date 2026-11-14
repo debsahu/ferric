@@ -101,6 +101,28 @@ def run_w3_suites(root: Path, results_dir: Path) -> None:
             "--",
             "--nocapture",
         ],
+        [
+            "cargo",
+            "test",
+            "--release",
+            "-p",
+            "nmr-cli",
+            "--test",
+            "relax_cli_tests",
+            "--",
+            "--nocapture",
+        ],
+        [
+            "cargo",
+            "test",
+            "--release",
+            "-p",
+            "nmr-gui",
+            "--lib",
+            "relax_panel",
+            "--",
+            "--nocapture",
+        ],
     ]
     combined_out: list[str] = []
     root_str = str(root.resolve())

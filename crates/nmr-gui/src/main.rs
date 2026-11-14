@@ -120,8 +120,9 @@ use nmr_gui::{
     },
     ingest_panel::{IngestAction, IngestDropOutcome, IngestExecutionPlan, IngestPanelState},
     keymap::{poll_global_modifier_shortcuts, ChordDispatcher, CONTOUR_FLOOR_STEP_RATIO},
-    mol3d_overlay::Mol3dSyncAction,
+    mol3d_overlay::{Mol3dSyncAction, QuantitativeTrack},
     mol3d_viewer::{Mol3dPipelineResource, Mol3dViewerPanel},
+    relax_panel::{RelaxPanelAction, RelaxPanelState},
     session_io::WorkbenchSessionController,
     sidechain_widget::{
         AssignedAtomInfo, SequenceRibbonState, SidechainInspectorPanel, SidechainWorkspaceInput,
@@ -1634,6 +1635,9 @@ struct NmrWorkbenchApp {
     overwrite_curated_rings: bool,
     mol3d_panel: Mol3dViewerPanel,
     show_mol3d_viewport: bool,
+    loaded_pdb_text: Option<String>,
+    relax_panel: RelaxPanelState,
+    show_relax_panel: bool,
 
     // Spectra for GPU contour & 3D strip visualization
     hsqc_spec: Option<Spectrum2D>,
@@ -1813,6 +1817,9 @@ impl NmrWorkbenchApp {
             overwrite_curated_rings: false,
             mol3d_panel: Mol3dViewerPanel::new(),
             show_mol3d_viewport: true,
+            loaded_pdb_text: None,
+            relax_panel: RelaxPanelState::new(),
+            show_relax_panel: false,
             hsqc_spec: None,
             hsqc_arc: Arc::new(Vec::new()),
             hsqc_gen: 1,
@@ -2132,6 +2139,9 @@ impl NmrWorkbenchApp {
                         }
                     }
                 }
+                if text.lines().any(|ln| ln.starts_with("ATOM  ")) {
+                    self.loaded_pdb_text = Some(text.to_string());
+                }
                 self.show_mol3d_viewport = true;
                 self.has_structure_or_dynamics = true;
                 self.workspace_mode = WorkspaceMode::ProteinNmr;
@@ -2143,6 +2153,50 @@ impl NmrWorkbenchApp {
             }
             Err(e) => {
                 self.status_msg = format!("3D structure load error ({source_label}): {e}");
+            }
+        }
+    }
+
+    fn apply_relax_panel_actions(&mut self, actions: Vec<RelaxPanelAction>) {
+        for act in actions {
+            match act {
+                RelaxPanelAction::SelectResidueIndex(k) => {
+                    if k < self.sequence.len() {
+                        self.select_residue_and_sync_strip(k);
+                    }
+                }
+                RelaxPanelAction::ExportTo3dTrack {
+                    track,
+                    s2_by_seq_idx,
+                    rex_by_seq_idx,
+                    rex_max_s_inv,
+                } => {
+                    let count = match track {
+                        QuantitativeTrack::LipariSzaboS2 => s2_by_seq_idx.len(),
+                        QuantitativeTrack::ChemicalExchangeRex => rex_by_seq_idx.len(),
+                        _ => s2_by_seq_idx.len(),
+                    };
+                    self.mol3d_panel.track_data.lipari_szabo_s2 = s2_by_seq_idx;
+                    self.mol3d_panel.track_data.rex_s_inv = rex_by_seq_idx;
+                    self.mol3d_panel.track_data.rex_max_s_inv = rex_max_s_inv;
+                    self.mol3d_panel.track_data.active_track = track;
+                    self.mol3d_panel.track_data.putty_enabled = true;
+                    self.show_mol3d_viewport = true;
+                    self.has_structure_or_dynamics = true;
+                    self.mol3d_panel.rebuild_for_test();
+                    let track_label = match track {
+                        QuantitativeTrack::LipariSzaboS2 => "Lipari–Szabo S²",
+                        QuantitativeTrack::ChemicalExchangeRex => "Chemical Exchange R_ex",
+                        _ => "Quantitative Track",
+                    };
+                    self.status_msg = format!(
+                        "Mapped {track_label} ({count} residues) onto 3D PDB B-factor putty"
+                    );
+                }
+                RelaxPanelAction::StatusMessage(msg) => {
+                    self.has_structure_or_dynamics = true;
+                    self.status_msg = msg;
+                }
             }
         }
     }
@@ -2255,6 +2309,7 @@ impl NmrWorkbenchApp {
             &self.sequence,
             &self.seq_ids,
         );
+        self.loaded_pdb_text = Some(DEMO_UBIQUITIN_1UBQ_PDB.to_string());
         self.has_structure_or_dynamics = true;
         self.run_assignment();
     }
@@ -3056,6 +3111,26 @@ impl NmrWorkbenchApp {
                 }
                 return;
             }
+        }
+
+        // Check Relaxation Series TSV / NEF (`save_nmrassign_relaxation_series` or `# nmrassign_relax_series`)
+        if trimmed.contains("save_nmrassign_relaxation_series")
+            || trimmed.contains("experiment_kind=")
+            || trimmed.starts_with("# nmrassign_relax_series")
+        {
+            match self.relax_panel.import_series_text(trimmed) {
+                Ok(msg) => {
+                    self.workspace_mode = WorkspaceMode::ProteinNmr;
+                    self.show_relax_panel = true;
+                    self.has_structure_or_dynamics = true;
+                    self.status_msg = msg;
+                }
+                Err(e) => {
+                    self.status_msg =
+                        format!("Relaxation series import error ({source_label}): {e}");
+                }
+            }
+            return;
         }
 
         // Check NEF v1.1 (`data_nef_...`, `save_nef_molecular_system`, or `_nmrassign_workbench`)
@@ -4995,6 +5070,25 @@ impl NmrWorkbenchApp {
                     }
                 }
             }
+            let relax_btn = egui::Button::new(
+                egui::RichText::new("📈 Relax / S²")
+                    .size(12.0)
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(if self.show_relax_panel {
+                egui::Color32::from_rgb(28, 122, 92)
+            } else {
+                egui::Color32::from_rgb(34, 42, 58)
+            });
+            if ui
+                .add(relax_btn)
+                .on_hover_text(
+                    "Open Relaxation (R1/R2/hetNOE) & Lipari-Szabo Model-Free S² workbench",
+                )
+                .clicked()
+            {
+                self.show_relax_panel = !self.show_relax_panel;
+            }
             if ui.small_button("📌 Assign/Lock (at)").clicked() {
                 self.show_assign_popover = true;
             }
@@ -6368,11 +6462,57 @@ impl NmrWorkbenchApp {
                 self.status_msg =
                     "Opened live 2D IUPAC covalent sidechain Z-score inspector".to_string();
             }
+            WorkbenchAction::FitRelaxationR1R2HetNoe => {
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.show_relax_panel = true;
+                self.has_structure_or_dynamics = true;
+                let pdb_ref = self.loaded_pdb_text.clone();
+                let res = if self.relax_panel.has_fitted_rates() {
+                    self.relax_panel.refit_loaded_curves()
+                } else {
+                    self.relax_panel.load_demo_dynamics(
+                        &self.sequence,
+                        &self.seq_ids,
+                        pdb_ref.as_deref(),
+                    )
+                };
+                match res {
+                    Ok(msg) => self.status_msg = msg,
+                    Err(e) => self.status_msg = format!("Relaxation fit error: {e}"),
+                }
+            }
+            WorkbenchAction::RunModelFreeLipariSzabo => {
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.show_relax_panel = true;
+                self.has_structure_or_dynamics = true;
+                let pdb_ref = self.loaded_pdb_text.clone();
+                let res = if !self.relax_panel.r1_fits.is_empty()
+                    && !self.relax_panel.r2_fits.is_empty()
+                {
+                    self.relax_panel.run_modelfree(pdb_ref.as_deref())
+                } else {
+                    self.relax_panel.load_demo_dynamics(
+                        &self.sequence,
+                        &self.seq_ids,
+                        pdb_ref.as_deref(),
+                    )
+                };
+                match res {
+                    Ok(msg) => {
+                        self.status_msg = msg;
+                        if let Some(act) = self
+                            .relax_panel
+                            .build_3d_track_export(&self.seq_ids, QuantitativeTrack::LipariSzaboS2)
+                        {
+                            self.apply_relax_panel_actions(vec![act]);
+                        }
+                    }
+                    Err(e) => self.status_msg = format!("Model-Free error: {e}"),
+                }
+            }
             WorkbenchAction::AssignNoesyRestraints
             | WorkbenchAction::FoldStructureEnsemble
             | WorkbenchAction::ValidateEnsembleRmsdRamachandran
-            | WorkbenchAction::FitRelaxationR1R2HetNoe
-            | WorkbenchAction::RunModelFreeLipariSzabo
             | WorkbenchAction::AnalyzeCpmgDispersion
             | WorkbenchAction::AnalyzeCestExchange
             | WorkbenchAction::FitLigandTitrationCspKd => {
@@ -6869,9 +7009,36 @@ impl eframe::App for NmrWorkbenchApp {
                     }
                 }
 
+                let mut relax_actions = Vec::new();
                 egui::CentralPanel::default().show(ui, |ui| {
-                    self.draw_hsqc_canvas(ui);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.show_relax_panel,
+                            false,
+                            "🎯 2D HSQC Contours",
+                        );
+                        ui.selectable_value(
+                            &mut self.show_relax_panel,
+                            true,
+                            "📈 Relaxation & Lipari–Szabo S²",
+                        );
+                    });
+                    ui.separator();
+                    if self.show_relax_panel {
+                        relax_actions = self.relax_panel.ui(
+                            ui,
+                            &self.sequence,
+                            &self.seq_ids,
+                            self.selected_res,
+                            self.loaded_pdb_text.as_deref(),
+                        );
+                    } else {
+                        self.draw_hsqc_canvas(ui);
+                    }
                 });
+                if !relax_actions.is_empty() {
+                    self.apply_relax_panel_actions(relax_actions);
+                }
             }
             WorkspaceMode::OctetChem => {
                 self.octet_app.ui(ui);

@@ -14,6 +14,7 @@ pub mod ingest_panel;
 pub mod keymap;
 pub mod mol3d_overlay;
 pub mod mol3d_viewer;
+pub mod relax_panel;
 pub mod session_io;
 pub mod sidechain_widget;
 pub mod strip_tiler;

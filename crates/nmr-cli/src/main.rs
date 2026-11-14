@@ -7,6 +7,7 @@
 //! and Octet-Draw CLI workflows.
 
 pub mod methyl_cmd;
+pub mod relax_cmd;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -211,6 +212,8 @@ fn usage() -> String {
        nmrassign priors          --stars <dir_or_file> --out <priors.json>\n\
        nmrassign sidechain       --star <ref.str> [--peaks <peaks.tsv>] [--aromatic] [--ph <f64>] [--arom-c13hsqc <path>] [--hbcbgcdhd <path>] [--hbcbgcdce <path>] [--aromatic-tocsy <path>] [--aromatic-noesy <path>] [--his-hmqc <path>] [--trp-hsqc <path>] [--stereospec] [--j-couplings <j.tsv>] [--intra-noes <noes.tsv>] [--pdb <model.pdb>] [--out <all_atom.str>] [--runs 16] [--steps 2500] [--seed 2026]\n\
        nmrassign methyl          --pdb <model.pdb> --hmqc <2d_or_tsv> --noesy <3d_or_tsv> [--labeling ILV-proS|ILV-proR|ILV-racemic|ILVMAT|<RES:ATOM,...>] [--hmcmcbca <hmcm.tsv>] [--engine gpu|cpu] [--seeds <N>] [-o <out.str>]\n\
+       nmrassign relax           (--series <series.tsv|series.nef|dir> | --planes <p1,p2,...>) --out <rates.tsv> [--kind r1|r2|r1rho|hetnoe] [--peaks <peaks.tsv> | --star <shifts.str>] [--vdlist <file> | --delays <csv>] [--engine cpu|gpu|auto] [--mc-trials 500]\n\
+       nmrassign modelfree       (--r1 <r1.tsv> --r2 <r2.tsv> [--hetnoe <noe.tsv>] ... | --rates <rates.tsv> ...) --out <modelfree.tsv> [--pdb <opt.pdb>] [--diffusion auto|isotropic|axial|anisotropic] [--criterion aic|aicc|bic|ftest]\n\
        nmrassign structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--rdc <rdcs.tsv|rdcs.nef>] [--torsion-db] [--include-chi1] [--rdc-weight 0.75] [--rdc-free-frac 0.20] [--engine auto|gpu|cpu] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
@@ -8318,6 +8321,8 @@ fn main() {
         "priors" => cmd_priors(&args[1..]),
         "sidechain" => cmd_sidechain(&args[1..]),
         "methyl" => methyl_cmd::run_methyl_cli(&args[1..]),
+        "relax" => relax_cmd::run_relax_cli(&args[1..]),
+        "modelfree" | "model-free" => relax_cmd::run_modelfree_cli(&args[1..]),
         "structure" => cmd_structure(&args[1..]),
         "nef-import" => cmd_nef_import(&args[1..]),
         "nef-export" => cmd_nef_export(&args[1..]),
