@@ -268,3 +268,53 @@ fn test_hungarian_tracker_handles_exchange_broadened_missing_peak_without_hijack
         "Residue 1 must recover its saturated peak at s3"
     );
 }
+
+#[test]
+fn test_explicit_apo_zero_ligand_step_deduplication_matches_implicit_apo() {
+    let cfg = CspAnalysisConfig {
+        max_step_csp_ppm: 0.45,
+        collinearity_penalty: 0.35,
+        csp_sigma_ppm: 0.0025,
+        n_mc: 100,
+        mc_seed: 777,
+    };
+    let tight_l = [15.0, 40.0, 80.0, 120.0, 200.0, 350.0];
+    let (apo, steps_no_zero, _) = build_synthetic_titration(8.0, 100.0, 10_000.0, &tight_l, 909);
+
+    let mut steps_with_zero = Vec::with_capacity(steps_no_zero.len() + 1);
+    steps_with_zero.push(UnassignedTitrationStep {
+        label: "apo_0uM".to_string(),
+        protein_conc_um: 100.0,
+        ligand_conc_um: 0.0,
+        peaks: apo
+            .iter()
+            .map(|p| UnassignedHsqcPeak {
+                h_ppm: p.h_ppm,
+                n_ppm: p.n_ppm,
+            })
+            .collect(),
+    });
+    steps_with_zero.extend(steps_no_zero.iter().cloned());
+
+    let traj_implicit = track_titration_trajectories(&apo, &steps_no_zero, &cfg).unwrap();
+    let traj_explicit = track_titration_trajectories(&apo, &steps_with_zero, &cfg).unwrap();
+
+    for (ti, te) in traj_implicit.iter().zip(traj_explicit.iter()) {
+        assert_eq!(
+            ti.points.len(),
+            te.points.len(),
+            "explicit [L]_t == 0 step must merge into apo point without duplicating [L]_t = 0"
+        );
+        assert_eq!(te.points.len(), 1 + tight_l.len());
+        assert!((te.points[0].protein_conc_um - 100.0).abs() < 1e-12);
+        assert!((te.points[0].ligand_conc_um - 0.0).abs() < 1e-12);
+    }
+
+    let fit_implicit = fit_csp_global_kd(&traj_implicit, &cfg).unwrap();
+    let fit_explicit = fit_csp_global_kd(&traj_explicit, &cfg).unwrap();
+    assert_eq!(fit_implicit.global_dof, fit_explicit.global_dof);
+    assert!(
+        (fit_implicit.global_kd_um - fit_explicit.global_kd_um).abs() < 1e-12,
+        "global Kd must be invariant whether [L]_t = 0 is implicit or explicit"
+    );
+}

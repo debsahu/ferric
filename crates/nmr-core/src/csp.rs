@@ -361,6 +361,23 @@ pub fn track_titration_trajectories(
     let max_gate_cost = config.max_step_csp_ppm.max(0.05).powi(2);
 
     for step in sorted_steps {
+        if !step.ligand_conc_um.is_finite() || step.ligand_conc_um < 0.0 {
+            return Err(format!(
+                "titration step '{}' has invalid negative or non-finite ligand_conc_um ({})",
+                step.label, step.ligand_conc_um
+            ));
+        }
+        // If caller explicitly passed an apo `[L]_t == 0` spectrum in `steps`, merge its
+        // `[P]_t` into the initial apo point instead of double-counting `[L]_t = 0`.
+        if step.ligand_conc_um <= 1e-12 {
+            if step.protein_conc_um.is_finite() && step.protein_conc_um > 0.0 {
+                for traj in &mut trajectories {
+                    traj.points[0].protein_conc_um = step.protein_conc_um;
+                }
+            }
+            continue;
+        }
+
         let n_peaks = step.peaks.len();
         // Columns `0..n_peaks` = observed HSQC peaks; columns `n_peaks .. n_peaks + n_res` = slack unmatched slots
         let n_cols = n_peaks + n_res;
@@ -859,7 +876,7 @@ pub fn fit_csp_global_kd(
 
     let global_pts: usize = global_indices.iter().map(|&i| obs_tuples[i].len()).sum();
     let global_params = 1 + global_indices.len();
-    let global_dof = global_pts.saturating_sub(global_params).max(1);
+    let global_dof = global_pts.saturating_sub(global_params);
 
     Ok(CspGlobalFitResult {
         global_kd_um,
@@ -868,7 +885,7 @@ pub fn fit_csp_global_kd(
         global_kd_ci95_high_um,
         global_naive_mm_kd_um,
         global_chi2,
-        global_reduced_chi2: global_chi2 / (global_dof as f64),
+        global_reduced_chi2: global_chi2 / (global_dof.max(1) as f64),
         global_dof,
         thresholds,
         trajectories: trajectories.to_vec(),

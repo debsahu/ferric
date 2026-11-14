@@ -13,7 +13,7 @@ struct CpmgGpuUniforms {
     n_pb: u32,
     n_kex: u32,
     model_code: u32, // 0=Flat, 1=LM63, 2=CR72, 3=Baldwin2014, 4=TrottPalmerR1rho
-    _pad0: u32,
+    job_offset: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -312,12 +312,13 @@ fn eval_cpmg_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn grid_search_cpmg(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let job_idx = gid.x;
-    if (job_idx >= params.n_jobs) {
+    let local_idx = gid.x;
+    if (local_idx >= params.n_jobs) {
         return;
     }
-    let res_idx = job_idx % params.n_res;
-    let g_idx = job_idx / params.n_res;
+    let global_idx = params.job_offset + local_idx;
+    let res_idx = global_idx % params.n_res;
+    let g_idx = global_idx / params.n_res;
     let ipb = g_idx / params.n_kex;
     let ikex = g_idx % params.n_kex;
 
@@ -360,5 +361,5 @@ fn grid_search_cpmg(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let opt_dw = 0.5 * (lo + hi);
     let opt_c2 = residue_chi2_for_dw(res_idx, params.model_code, pb, kex, opt_dw);
-    out_grid_cells[job_idx] = GridCellOutGpu(opt_c2, opt_dw);
+    out_grid_cells[local_idx] = GridCellOutGpu(opt_c2, opt_dw);
 }

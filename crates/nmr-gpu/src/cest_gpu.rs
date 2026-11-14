@@ -569,12 +569,16 @@ pub async fn simulate_cest_2state_batch_with_pipeline_async(
 
     for (c_idx, (p, offs)) in requests.iter().enumerate() {
         let (e0, inv_i0) = compute_2state_e0_inv_i0(p)?;
-        let start = offsets_flat.len() as u32;
-        let len = offs.len() as u32;
+        let start = u32::try_from(offsets_flat.len())
+            .map_err(|_| "CEST 2-state offset index exceeds u32::MAX".to_string())?;
+        let len = u32::try_from(offs.len())
+            .map_err(|_| "CEST 2-state profile offset count exceeds u32::MAX".to_string())?;
+        let c_idx_u32 = u32::try_from(c_idx)
+            .map_err(|_| "CEST 2-state curve index exceeds u32::MAX".to_string())?;
         for (local_i, &rf) in offs.iter().enumerate() {
             offsets_flat.push(rf as f32);
             jobs_all.push(JobMapGpu {
-                curve_idx: c_idx as u32,
+                curve_idx: c_idx_u32,
                 local_offset_idx: local_i as u32,
             });
         }
@@ -602,6 +606,11 @@ pub async fn simulate_cest_2state_batch_with_pipeline_async(
         return Ok(vec![Vec::new(); requests.len()]);
     }
 
+    validate_cest_storage_bytes(
+        &engine.device,
+        "quad_2s",
+        std::mem::size_of_val(quad_gpu.as_slice()) as u64,
+    )?;
     validate_cest_storage_bytes(
         &engine.device,
         "curves_2s",
@@ -798,12 +807,16 @@ pub async fn simulate_cest_3state_batch_gpu_async(
 
     for (c_idx, (p, offs)) in requests.iter().enumerate() {
         let (e0, inv_i0) = compute_3state_e0_inv_i0(p)?;
-        let start = offsets_flat.len() as u32;
-        let len = offs.len() as u32;
+        let start = u32::try_from(offsets_flat.len())
+            .map_err(|_| "CEST 3-state offset index exceeds u32::MAX".to_string())?;
+        let len = u32::try_from(offs.len())
+            .map_err(|_| "CEST 3-state profile offset count exceeds u32::MAX".to_string())?;
+        let c_idx_u32 = u32::try_from(c_idx)
+            .map_err(|_| "CEST 3-state curve index exceeds u32::MAX".to_string())?;
         for (local_i, &rf) in offs.iter().enumerate() {
             offsets_flat.push(rf as f32);
             jobs_all.push(JobMapGpu {
-                curve_idx: c_idx as u32,
+                curve_idx: c_idx_u32,
                 local_offset_idx: local_i as u32,
             });
         }
@@ -839,6 +852,11 @@ pub async fn simulate_cest_3state_batch_gpu_async(
         return Ok(vec![Vec::new(); requests.len()]);
     }
 
+    validate_cest_storage_bytes(
+        &engine.device,
+        "quad_3s",
+        std::mem::size_of_val(quad_gpu.as_slice()) as u64,
+    )?;
     validate_cest_storage_bytes(
         &engine.device,
         "curves_3s",

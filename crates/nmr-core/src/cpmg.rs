@@ -901,12 +901,55 @@ pub fn fit_r1rho_trott_palmer_cpu(
 // 3. Statistical Exchange Gate (`Flat` Null vs Dispersion: AIC + Nested F-test)
 // ============================================================================
 
+#[inline]
+fn hurvich_tsai_aicc(chi2: f64, n: usize, k: usize) -> f64 {
+    if n <= k + 1 {
+        f64::INFINITY
+    } else {
+        let kf = k as f64;
+        let nf = n as f64;
+        chi2 + 2.0 * kf + (2.0 * kf * (kf + 1.0)) / (nf - kf - 1.0)
+    }
+}
+
 /// Evaluate the statistical exchange gate on all static-field series of a single residue.
 pub fn evaluate_exchange_gate(
     residue_series: &[&CpmgSeriesDataset],
     gate_cfg: &ExchangeGateConfig,
 ) -> ExchangeGateVerdict {
-    let first = residue_series[0];
+    let Some(&first) = residue_series.first() else {
+        return ExchangeGateVerdict {
+            seq_id: 0,
+            res_name: String::new(),
+            significant_exchange: false,
+            observed_rex_s_inv: 0.0,
+            flat_chi2: 0.0,
+            ex_chi2: 0.0,
+            delta_aic: f64::NEG_INFINITY,
+            f_stat: 0.0,
+            f_pvalue: 1.0,
+        };
+    };
+
+    for s in residue_series {
+        if s.r2_eff_s_inv.is_empty()
+            || s.r2_eff_s_inv.len() != s.r2_eff_err.len()
+            || s.nu_cpmg_hz.len() != s.r2_eff_s_inv.len()
+        {
+            return ExchangeGateVerdict {
+                seq_id: first.seq_id,
+                res_name: first.res_name.clone(),
+                significant_exchange: false,
+                observed_rex_s_inv: 0.0,
+                flat_chi2: 0.0,
+                ex_chi2: 0.0,
+                delta_aic: f64::NEG_INFINITY,
+                f_stat: 0.0,
+                f_pvalue: 1.0,
+            };
+        }
+    }
+
     let n_fields = residue_series.len();
     let mut total_pts = 0usize;
     let mut flat_chi2 = 0.0f64;
@@ -950,13 +993,19 @@ pub fn evaluate_exchange_gate(
 
     let k_flat = n_fields;
     let k_ex_params = n_fields + 2;
-    let aic_flat = flat_chi2 + 2.0 * (k_flat as f64);
-    let aic_ex = best_ex_chi2 + 2.0 * (k_ex_params as f64);
-    let delta_aic = aic_flat - aic_ex;
+    let aic_flat = hurvich_tsai_aicc(flat_chi2, total_pts, k_flat);
+    let aic_ex = hurvich_tsai_aicc(best_ex_chi2, total_pts, k_ex_params);
+    let delta_aic = if aic_ex.is_finite() && aic_flat.is_finite() {
+        aic_flat - aic_ex
+    } else if !aic_ex.is_finite() && aic_flat.is_finite() {
+        f64::NEG_INFINITY
+    } else {
+        0.0
+    };
 
     let df1 = (k_ex_params - k_flat) as f64;
     let df2 = total_pts.saturating_sub(k_ex_params) as f64;
-    let (f_stat, f_pvalue) = if df2 >= 1.0 && flat_chi2 > best_ex_chi2 {
+    let (f_stat, f_pvalue) = if total_pts > k_ex_params && flat_chi2 > best_ex_chi2 {
         let num = (flat_chi2 - best_ex_chi2) / df1;
         let den = (best_ex_chi2 / df2).max(1e-15);
         let f = num / den;
@@ -966,7 +1015,9 @@ pub fn evaluate_exchange_gate(
         (0.0, 1.0)
     };
 
-    let significant = max_obs_rex >= gate_cfg.min_delta_r2_eff_s_inv
+    let significant = total_pts > k_ex_params + 1
+        && max_obs_rex >= gate_cfg.min_delta_r2_eff_s_inv
+        && delta_aic.is_finite()
         && delta_aic >= gate_cfg.min_delta_aic
         && f_pvalue <= gate_cfg.max_f_pvalue;
 
@@ -991,6 +1042,12 @@ fn fit_lm63_linear_profile_chi2(series: &[&CpmgSeriesDataset], k_ex: f64) -> Opt
     let mut per_field_data = Vec::with_capacity(series.len());
 
     for s in series {
+        if s.nu_cpmg_hz.is_empty()
+            || s.nu_cpmg_hz.len() != s.r2_eff_s_inv.len()
+            || s.nu_cpmg_hz.len() != s.r2_eff_err.len()
+        {
+            return None;
+        }
         let scale2 = (TAU * s.larmor_mhz).powi(2);
         let mut w_sum = 0.0;
         let mut wg_sum = 0.0;
@@ -1339,7 +1396,7 @@ where
                 n_points: r_pts,
             });
         }
-        let dof = total_pts.saturating_sub(n_params).max(1);
+        let dof = total_pts.saturating_sub(n_params);
         return Ok(CpmgGlobalFitResult {
             model: CpmgModel::Flat,
             p_b: 0.0,
@@ -1349,7 +1406,7 @@ where
             k_ab_s_inv: 0.0,
             k_ba_s_inv: 0.0,
             total_chi2,
-            reduced_chi2: total_chi2 / (dof as f64),
+            reduced_chi2: total_chi2 / (dof.max(1) as f64),
             dof,
             iterations: 1,
             converged: true,
@@ -1644,7 +1701,7 @@ where
         });
     }
 
-    let dof = total_pts.saturating_sub(n_params).max(1);
+    let dof = total_pts.saturating_sub(n_params);
     Ok(CpmgGlobalFitResult {
         model: config.model,
         p_b,
@@ -1654,7 +1711,7 @@ where
         k_ab_s_inv: p_b * k_ex_s_inv,
         k_ba_s_inv: (1.0 - p_b) * k_ex_s_inv,
         total_chi2: current_chi2,
-        reduced_chi2: current_chi2 / (dof as f64),
+        reduced_chi2: current_chi2 / (dof.max(1) as f64),
         dof,
         iterations,
         converged,

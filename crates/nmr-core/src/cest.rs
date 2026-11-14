@@ -2006,8 +2006,8 @@ where
     }
 
     let n_params = 2 + n_res * n_local_cols;
-    let dof = total_pts.saturating_sub(n_params).max(1);
-    let reduced_chi2 = current_chi2 / (dof as f64);
+    let dof = total_pts.saturating_sub(n_params);
+    let reduced_chi2 = current_chi2 / (dof.max(1) as f64);
 
     let chi2_surface = if config.compute_chi2_surface {
         let (npb, nkex) = config.surface_grid_dims;

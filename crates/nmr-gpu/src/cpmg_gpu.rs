@@ -29,7 +29,7 @@ struct CpmgGpuUniforms {
     n_pb: u32,
     n_kex: u32,
     model_code: u32,
-    _pad0: u32,
+    job_offset: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -422,7 +422,7 @@ pub async fn evaluate_cpmg_batch_gpu_async(
             n_pb: 0,
             n_kex: 0,
             model_code: 0,
-            _pad0: 0,
+            job_offset: 0,
             _pad1: 0,
             _pad2: 0,
         };
@@ -561,15 +561,39 @@ pub async fn profile_cpmg_grid_with_pipeline_async(
         _ => 3,
     };
 
+    let n_res_u32 =
+        u32::try_from(n_res).map_err(|_| format!("CPMG residue count {n_res} exceeds u32::MAX"))?;
+    let n_pb_u32 =
+        u32::try_from(n_pb).map_err(|_| format!("CPMG p_B grid count {n_pb} exceeds u32::MAX"))?;
+    let n_kex_u32 = u32::try_from(n_kex)
+        .map_err(|_| format!("CPMG k_ex grid count {n_kex} exceeds u32::MAX"))?;
+    let total_jobs = n_pb
+        .checked_mul(n_kex)
+        .and_then(|v| v.checked_mul(n_res))
+        .ok_or_else(|| "CPMG grid total job count overflowed usize".to_string())?;
+    let _ = u32::try_from(total_jobs)
+        .map_err(|_| format!("CPMG grid total job count {total_jobs} exceeds u32::MAX"))?;
+
     let mut spans = Vec::with_capacity(n_res);
     let mut series_meta = Vec::new();
     let mut obs_points = Vec::new();
 
     for r_series in res_groups {
-        let s_start = series_meta.len() as u32;
+        let s_start = u32::try_from(series_meta.len())
+            .map_err(|_| "CPMG series_meta index exceeds u32::MAX".to_string())?;
+        let s_len = u32::try_from(r_series.len())
+            .map_err(|_| "CPMG residue series count exceeds u32::MAX".to_string())?;
         for s in r_series {
-            let p_start = obs_points.len() as u32;
-            for i in 0..s.nu_cpmg_hz.len() {
+            let p_start = u32::try_from(obs_points.len())
+                .map_err(|_| "CPMG obs_points index exceeds u32::MAX".to_string())?;
+            let n_pts = s
+                .nu_cpmg_hz
+                .len()
+                .min(s.r2_eff_s_inv.len())
+                .min(s.r2_eff_err.len());
+            let pt_len = u32::try_from(n_pts)
+                .map_err(|_| "CPMG series point count exceeds u32::MAX".to_string())?;
+            for i in 0..n_pts {
                 let sig = s.r2_eff_err[i].max(1e-3);
                 obs_points.push(ObsPointGpu {
                     nu_cpmg_hz: s.nu_cpmg_hz[i] as f32,
@@ -582,19 +606,42 @@ pub async fn profile_cpmg_grid_with_pipeline_async(
                 larmor_mhz: s.larmor_mhz as f32,
                 t_relax_s: s.t_relax_s as f32,
                 pt_start: p_start,
-                pt_len: s.nu_cpmg_hz.len() as u32,
+                pt_len,
             });
         }
         spans.push(ResidueSpanGpu {
             series_start: s_start,
-            series_len: r_series.len() as u32,
+            series_len: s_len,
         });
     }
 
+    let pb_f32: Vec<f32> = pb_grid.iter().map(|&v| v as f32).collect();
+    let kex_f32: Vec<f32> = kex_grid.iter().map(|&v| v as f32).collect();
+
+    validate_cpmg_storage_bytes(
+        &engine.device,
+        "cpmg_spans",
+        std::mem::size_of_val(spans.as_slice()) as u64,
+    )?;
+    validate_cpmg_storage_bytes(
+        &engine.device,
+        "cpmg_series_meta",
+        std::mem::size_of_val(series_meta.as_slice()) as u64,
+    )?;
     validate_cpmg_storage_bytes(
         &engine.device,
         "cpmg_obs_points",
         std::mem::size_of_val(obs_points.as_slice()) as u64,
+    )?;
+    validate_cpmg_storage_bytes(
+        &engine.device,
+        "cpmg_pb_grid",
+        std::mem::size_of_val(pb_f32.as_slice()) as u64,
+    )?;
+    validate_cpmg_storage_bytes(
+        &engine.device,
+        "cpmg_kex_grid",
+        std::mem::size_of_val(kex_f32.as_slice()) as u64,
     )?;
 
     let dummies = DummyCpmgBuffers::new(&engine.device);
@@ -619,7 +666,13 @@ pub async fn profile_cpmg_grid_with_pipeline_async(
             contents: bytemuck::cast_slice(&obs_points),
             usage: wgpu::BufferUsages::STORAGE,
         });
-    let kex_f32: Vec<f32> = kex_grid.iter().map(|&v| v as f32).collect();
+    let pb_buf = engine
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("cpmg-grid-pb"),
+            contents: bytemuck::cast_slice(&pb_f32),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
     let kex_buf = engine
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -628,32 +681,24 @@ pub async fn profile_cpmg_grid_with_pipeline_async(
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-    let max_wg = (engine.device.limits().max_compute_workgroups_per_dimension as usize) * 64;
+    let max_wg =
+        (engine.device.limits().max_compute_workgroups_per_dimension as usize).saturating_mul(64);
     let max_jobs = MAX_CPMG_JOBS_PER_DISPATCH.min(max_wg.max(64));
-    let rows_per_chunk = (max_jobs / (n_kex * n_res).max(1)).max(1);
 
-    let mut all_cells = Vec::with_capacity(n_pb * n_kex * n_res);
-    for pb_chunk in pb_grid.chunks(rows_per_chunk) {
-        let chunk_n_pb = pb_chunk.len();
-        let n_jobs = chunk_n_pb * n_kex * n_res;
+    let mut all_cells = Vec::with_capacity(total_jobs);
+    let mut job_start = 0usize;
+    while job_start < total_jobs {
+        let n_jobs = (total_jobs - job_start).min(max_jobs);
         let out_bytes = aligned_copy_bytes((n_jobs * std::mem::size_of::<GridCellOutGpu>()) as u64);
         validate_cpmg_storage_bytes(&engine.device, "cpmg_grid_out", out_bytes)?;
 
-        let pb_f32: Vec<f32> = pb_chunk.iter().map(|&v| v as f32).collect();
-        let pb_buf = engine
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("cpmg-grid-pb"),
-                contents: bytemuck::cast_slice(&pb_f32),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
         let uniforms = CpmgGpuUniforms {
             n_jobs: n_jobs as u32,
-            n_res: n_res as u32,
-            n_pb: chunk_n_pb as u32,
-            n_kex: n_kex as u32,
+            n_res: n_res_u32,
+            n_pb: n_pb_u32,
+            n_kex: n_kex_u32,
             model_code,
-            _pad0: 0,
+            job_offset: job_start as u32,
             _pad1: 0,
             _pad2: 0,
         };
@@ -737,6 +782,7 @@ pub async fn profile_cpmg_grid_with_pipeline_async(
                 best_dw_ppm: c.best_dw_ppm as f64,
             });
         }
+        job_start += n_jobs;
     }
     Ok(all_cells)
 }

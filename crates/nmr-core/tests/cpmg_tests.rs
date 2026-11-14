@@ -300,3 +300,67 @@ fn test_multifield_600_800_mhz_global_cpmg_fit_under_2pct_and_trott_palmer_r1rho
         tp_fit.dw_ab_ppm
     );
 }
+
+#[test]
+fn test_exchange_gate_empty_slice_small_sample_aicc_and_zero_dof_guards() {
+    let default_gate = ExchangeGateConfig::default();
+
+    // 1. Empty slice does not panic and returns non-significant verdict
+    let empty_verdict = evaluate_exchange_gate(&[], &default_gate);
+    assert!(!empty_verdict.significant_exchange);
+    assert_eq!(empty_verdict.f_pvalue, 1.0);
+
+    // 2. Mismatched array lengths do not panic and return non-significant verdict
+    let mismatched = CpmgSeriesDataset {
+        seq_id: 7,
+        res_name: "ALA".to_string(),
+        larmor_mhz: 60.8106,
+        t_relax_s: 0.040,
+        nu_cpmg_hz: vec![50.0, 100.0, 200.0],
+        r2_eff_s_inv: vec![18.0, 15.0],
+        r2_eff_err: vec![0.1, 0.1, 0.1],
+    };
+    assert!(!evaluate_exchange_gate(&[&mismatched], &default_gate).significant_exchange);
+
+    // 3. Small-sample Hurvich-Tsai AICc (`N <= k_ex_params + 1` -> `N = 3, 4` for single-field
+    // `k_ex_params = 3`) rejects exchange even when `max_f_pvalue = 1.0` (AIC-only gate)!
+    let aic_only_gate = ExchangeGateConfig {
+        min_delta_r2_eff_s_inv: 1.0,
+        min_delta_aic: 2.0,
+        max_f_pvalue: 1.0,
+    };
+    for n_pts in [3usize, 4usize] {
+        let tiny = CpmgSeriesDataset {
+            seq_id: 11,
+            res_name: "VAL".to_string(),
+            larmor_mhz: 60.8106,
+            t_relax_s: 0.040,
+            nu_cpmg_hz: (0..n_pts).map(|i| 50.0 * ((i + 1) as f64)).collect(),
+            r2_eff_s_inv: (0..n_pts).map(|i| 22.0 - 3.5 * (i as f64)).collect(),
+            r2_eff_err: vec![0.05; n_pts],
+        };
+        let v = evaluate_exchange_gate(&[&tiny], &aic_only_gate);
+        assert!(
+            !v.significant_exchange,
+            "small-sample N={n_pts} <= k_ex+1=4 must be rejected even under AIC-only gate"
+        );
+    }
+
+    // 4. True `dof = 0` when `total_pts <= n_params` (with `filter_by_exchange_gate = false`)
+    let underdetermined = CpmgSeriesDataset {
+        seq_id: 12,
+        res_name: "LEU".to_string(),
+        larmor_mhz: 60.8106,
+        t_relax_s: 0.040,
+        nu_cpmg_hz: vec![50.0, 200.0, 800.0],
+        r2_eff_s_inv: vec![16.0, 14.0, 12.5],
+        r2_eff_err: vec![0.1, 0.1, 0.1],
+    };
+    let cfg_no_gate = CpmgFitConfig {
+        filter_by_exchange_gate: false,
+        ..CpmgFitConfig::default()
+    };
+    let fit_zero_dof = fit_cpmg_global_cpu(&[underdetermined], &cfg_no_gate).unwrap();
+    assert_eq!(fit_zero_dof.dof, 0);
+    assert!(fit_zero_dof.reduced_chi2.is_finite());
+}

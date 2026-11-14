@@ -26,7 +26,7 @@ use nmr_core::cest::{
 };
 use nmr_core::cpmg::{
     r1rho_trott_palmer_2002, r2eff_baldwin2014, r2eff_cr72, r2eff_flat, r2eff_lm63, CpmgFitConfig,
-    CpmgSeriesDataset,
+    CpmgModel, CpmgSeriesDataset,
 };
 use nmr_core::rng::Rng;
 use nmr_gpu::cest_gpu::{
@@ -34,13 +34,46 @@ use nmr_gpu::cest_gpu::{
     simulate_cest_3state_batch_gpu, validate_cest_storage_bytes,
 };
 use nmr_gpu::cpmg_gpu::{
-    evaluate_cpmg_batch_gpu, fit_cpmg_global_gpu, validate_cpmg_storage_bytes, CpmgGpuEvalRequest,
+    evaluate_cpmg_batch_gpu, fit_cpmg_global_gpu, profile_cpmg_grid_with_pipeline_async,
+    validate_cpmg_storage_bytes, CpmgGpuEvalRequest, CpmgGpuPipeline,
 };
 use nmr_gpu::GpuEngine;
 
-fn require_gpu_engine() -> Option<GpuEngine> {
+fn is_software_cpu_adapter_probe() -> bool {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    if let Ok(adapter) =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            ..Default::default()
+        }))
+    {
+        let info = adapter.get_info();
+        if info.device_type == wgpu::DeviceType::Cpu {
+            return true;
+        }
+        let lower = info.name.to_ascii_lowercase();
+        lower.contains("llvmpipe")
+            || lower.contains("lavapipe")
+            || lower.contains("basic render")
+            || lower.contains("swiftshader")
+    } else {
+        false
+    }
+}
+
+fn require_gpu_engine() -> Option<(GpuEngine, bool)> {
     match GpuEngine::new_headless() {
-        Ok(eng) => Some(eng),
+        Ok(eng) => {
+            let lower = eng.adapter_name.to_ascii_lowercase();
+            let is_sw_cpu = is_software_cpu_adapter_probe()
+                || lower.contains("llvmpipe")
+                || lower.contains("lavapipe")
+                || lower.contains("basic render")
+                || lower.contains("swiftshader");
+            Some((eng, is_sw_cpu))
+        }
         Err(e) => {
             if std::env::var("NMR_ALLOW_NO_GPU").as_deref() == Ok("1") {
                 eprintln!("Skipping GPU exchange test because NMR_ALLOW_NO_GPU=1 ({e})");
@@ -56,7 +89,7 @@ fn require_gpu_engine() -> Option<GpuEngine> {
 
 #[test]
 fn test_webgpu_pade66_expm_and_2state_3state_cest_dest_parity_under_1e5() {
-    let Some(engine) = require_gpu_engine() else {
+    let Some((engine, _is_sw_cpu)) = require_gpu_engine() else {
         return;
     };
 
@@ -238,7 +271,7 @@ fn test_webgpu_pade66_expm_and_2state_3state_cest_dest_parity_under_1e5() {
 
 #[test]
 fn test_webgpu_dual_b1_15hz_30hz_global_cest_fit_done_gate_under_1p5s() {
-    let Some(engine) = require_gpu_engine() else {
+    let Some((engine, is_sw_cpu)) = require_gpu_engine() else {
         return;
     };
 
@@ -305,14 +338,6 @@ fn test_webgpu_dual_b1_15hz_30hz_global_cest_fit_done_gate_under_1p5s() {
         ..CestFitConfig::default()
     };
 
-    let is_sw_cpu = engine
-        .adapter_name
-        .to_ascii_lowercase()
-        .contains("llvmpipe")
-        || engine
-            .adapter_name
-            .to_ascii_lowercase()
-            .contains("lavapipe");
     let max_cest_secs = if is_sw_cpu { 30.0 } else { 1.5 };
 
     let t0 = Instant::now();
@@ -354,7 +379,7 @@ fn test_webgpu_dual_b1_15hz_30hz_global_cest_fit_done_gate_under_1p5s() {
 
 #[test]
 fn test_webgpu_multifield_600_800_cpmg_global_fit_under_2pct_and_0p5s() {
-    let Some(engine) = require_gpu_engine() else {
+    let Some((engine, is_sw_cpu)) = require_gpu_engine() else {
         return;
     };
 
@@ -475,14 +500,6 @@ fn test_webgpu_multifield_600_800_cpmg_global_fit_under_2pct_and_0p5s() {
         });
     }
 
-    let is_sw_cpu = engine
-        .adapter_name
-        .to_ascii_lowercase()
-        .contains("llvmpipe")
-        || engine
-            .adapter_name
-            .to_ascii_lowercase()
-            .contains("lavapipe");
     let max_cpmg_secs = if is_sw_cpu { 20.0 } else { 0.5 };
 
     let t0 = Instant::now();
@@ -555,4 +572,35 @@ fn test_baseline_webgpu_limits_and_oversized_buffer_guards() {
         + 1024;
     assert!(validate_cest_storage_bytes(&engine.device, "test_over", over).is_err());
     assert!(validate_cpmg_storage_bytes(&engine.device, "test_over", over).is_err());
+
+    // Verify flat `job_offset` TDR chunking when a single `p_B` row has `n_kex * n_res = 40,000`
+    // (`> MAX_CPMG_JOBS_PER_DISPATCH = 32,768`).
+    let single_ds: Vec<CpmgSeriesDataset> = (0..200_i32)
+        .map(|ri| CpmgSeriesDataset {
+            seq_id: ri + 1,
+            res_name: "ALA".to_string(),
+            larmor_mhz: 60.8106,
+            t_relax_s: 0.040,
+            nu_cpmg_hz: vec![50.0, 200.0, 800.0],
+            r2_eff_s_inv: vec![16.5, 13.8, 12.6],
+            r2_eff_err: vec![0.10, 0.10, 0.10],
+        })
+        .collect();
+    let res_groups: Vec<Vec<&CpmgSeriesDataset>> = single_ds.iter().map(|s| vec![s]).collect();
+    let pb_row = vec![0.025];
+    let kex_row: Vec<f64> = (0..200).map(|i| 100.0 + 15.0 * (i as f64)).collect();
+    let pipe = CpmgGpuPipeline::new(&engine.device);
+    let cells = pollster::block_on(profile_cpmg_grid_with_pipeline_async(
+        &engine,
+        &pipe,
+        &res_groups,
+        &pb_row,
+        &kex_row,
+        CpmgModel::Baldwin2014,
+    ))
+    .expect("single-pB-row >32,768 flat job chunking must succeed without overflow");
+    assert_eq!(cells.len(), 40_000);
+    assert!(cells
+        .iter()
+        .all(|c| c.best_chi2.is_finite() && c.best_dw_ppm > 0.0));
 }
