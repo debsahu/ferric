@@ -676,4 +676,114 @@ fn aic_model_selection_exceeds_95pct_accuracy_under_2pct_gaussian_intensity_nois
         .unwrap();
         assert_eq!(alt.residues.len(), 25);
     }
+
+    // Verify small-sample `AICc` `m_obs <= k + 1` guard in Model-Free selection:
+    // - At single-field `m_obs = 3` (`R1, R2, hetNOE`), `M2`..`M5` (`k >= 2`) have `m_obs <= k + 1` (`AICc = +inf`), so `M1` is strictly selected!
+    // - At two-field NOE-less `m_obs = 4` (`R1, R2` x 2), `M4` & `M5` (`k = 3`) have `AICc = +inf` and cannot be selected!
+    // - At `m_obs = 2` (`R1, R2` at 1 field), all models have `AICc = +inf` and fallback selects `M1` cleanly!
+    let tensor_iso = DiffusionTensor::Isotropic {
+        tau_m_sec: tau_m_true,
+    };
+    let p_m4 = LocalMfParams::m4(0.75, 80.0e-12, 4.5);
+    let (r1_6, r2_6, n_6) = predict_r1_r2_noe(&rot, &p_m4, 600.0, 600.0, &phys);
+    let (r1_8, r2_8, _) = predict_r1_r2_noe(&rot, &p_m4, 800.0, 600.0, &phys);
+    let aicc_mf_cfg = ModelFreeConfig {
+        selection_criterion: ModelSelectionCriterion::Aicc,
+        enable_model_elimination: false,
+        ..ModelFreeConfig::default()
+    };
+
+    let obs3 = MultiFieldResidueInput {
+        seq_id: 901,
+        res_name: "ALA".to_string(),
+        nh_unit_vec: None,
+        fields: vec![ResidueRelaxRates {
+            seq_id: 901,
+            res_name: "ALA".to_string(),
+            field_mhz: 600.0,
+            r1: r1_6,
+            sigma_r1: 0.01 * r1_6,
+            r2: r2_6,
+            sigma_r2: 0.01 * r2_6,
+            hetnoe: Some(n_6),
+            sigma_hetnoe: Some(0.01),
+        }],
+    };
+    let fit_obs3 = nmr_core::modelfree::fit_and_select_residue_modelfree(
+        &obs3,
+        &tensor_iso,
+        600.0,
+        &aicc_mf_cfg,
+    );
+    assert_eq!(fit_obs3.selected_model, ModelFreeId::M1);
+    assert!(fit_obs3.candidate_fits[0].aicc.is_finite());
+    for c in &fit_obs3.candidate_fits[1..] {
+        assert!(c.aicc.is_infinite());
+    }
+
+    let obs4 = MultiFieldResidueInput {
+        seq_id: 902,
+        res_name: "ALA".to_string(),
+        nh_unit_vec: None,
+        fields: vec![
+            ResidueRelaxRates {
+                seq_id: 902,
+                res_name: "ALA".to_string(),
+                field_mhz: 600.0,
+                r1: r1_6,
+                sigma_r1: 0.01 * r1_6,
+                r2: r2_6,
+                sigma_r2: 0.01 * r2_6,
+                hetnoe: None,
+                sigma_hetnoe: None,
+            },
+            ResidueRelaxRates {
+                seq_id: 902,
+                res_name: "ALA".to_string(),
+                field_mhz: 800.0,
+                r1: r1_8,
+                sigma_r1: 0.01 * r1_8,
+                r2: r2_8,
+                sigma_r2: 0.01 * r2_8,
+                hetnoe: None,
+                sigma_hetnoe: None,
+            },
+        ],
+    };
+    let fit_obs4 = nmr_core::modelfree::fit_and_select_residue_modelfree(
+        &obs4,
+        &tensor_iso,
+        600.0,
+        &aicc_mf_cfg,
+    );
+    assert!(
+        fit_obs4.candidate_fits[3].aicc.is_infinite()
+            && fit_obs4.candidate_fits[4].aicc.is_infinite()
+    );
+    assert_ne!(fit_obs4.selected_model, ModelFreeId::M4);
+    assert_ne!(fit_obs4.selected_model, ModelFreeId::M5);
+
+    let obs2 = MultiFieldResidueInput {
+        seq_id: 903,
+        res_name: "ALA".to_string(),
+        nh_unit_vec: None,
+        fields: vec![ResidueRelaxRates {
+            seq_id: 903,
+            res_name: "ALA".to_string(),
+            field_mhz: 600.0,
+            r1: r1_6,
+            sigma_r1: 0.01 * r1_6,
+            r2: r2_6,
+            sigma_r2: 0.01 * r2_6,
+            hetnoe: None,
+            sigma_hetnoe: None,
+        }],
+    };
+    let fit_obs2 = nmr_core::modelfree::fit_and_select_residue_modelfree(
+        &obs2,
+        &tensor_iso,
+        600.0,
+        &aicc_mf_cfg,
+    );
+    assert_eq!(fit_obs2.selected_model, ModelFreeId::M1);
 }

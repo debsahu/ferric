@@ -144,6 +144,33 @@ fn two_param_and_aic_bic_three_param_decay_fits_and_crlb_mc_agreement() {
         assert!((fit_off.rate - 3.1).abs() < 1.0e-4);
         assert!((fit_off.offset_c - 45.0).abs() < 1.0e-2);
     }
+
+    // 3. Small-sample Hurvich–Tsai `AICc` guard (`n <= k + 1`): at `n = 4`, 3-param (`k = 3`, `n - k - 1 = 0`)
+    // has `AICc = +inf` and MUST be rejected even when a large baseline offset `C = +80.0` is present!
+    let n4_offset_curve = DecayCurveInput {
+        seq_id: 503,
+        res_name: "THR".to_string(),
+        times_sec: vec![0.0, 0.2, 0.6, 1.5],
+        intensities: [0.0, 0.2, 0.6, 1.5]
+            .iter()
+            .map(|&t: &f64| 400.0 * (-3.0_f64 * t).exp() + 80.0)
+            .collect(),
+        sigmas: vec![2.0; 4],
+    };
+    let fit_n4_aicc = fit_decay_curve_cpu(
+        &n4_offset_curve,
+        &ExpFitConfig {
+            offset_gate: OffsetModelGate::Aicc,
+            mc_replicates: 0,
+            seed: 23,
+            max_rate_s_inv: 200.0,
+        },
+    )
+    .unwrap();
+    assert!(
+        !fit_n4_aicc.used_three_param,
+        "AICc must reject 3-parameter model at n = 4 (n <= k + 1)"
+    );
 }
 
 #[test]

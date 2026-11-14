@@ -230,4 +230,27 @@ fn gpu_three_param_aic_gate_and_tdr_multi_chunk_dispatch_match_cpu() {
         fit_decay_batch_with_pipeline(&browser_eng, &browser_pipe, &curves[..16], &cfg)
             .expect("baseline default limits dispatch");
     assert_eq!(browser_fits.len(), 16);
+
+    // Verify small-sample Hurvich–Tsai `AICc` guard (`n = 4 <= k + 1`) rejects 3-param identically on GPU & CPU
+    let n4_curves = vec![DecayCurveInput {
+        seq_id: 901,
+        res_name: "THR".to_string(),
+        times_sec: vec![0.0, 0.2, 0.6, 1.5],
+        intensities: [0.0, 0.2, 0.6, 1.5]
+            .iter()
+            .map(|&t: &f64| 500.0 * (-2.8_f64 * t).exp() + 80.0)
+            .collect(),
+        sigmas: vec![2.0; 4],
+    }];
+    let aicc_cfg = ExpFitConfig {
+        offset_gate: OffsetModelGate::Aicc,
+        mc_replicates: 100,
+        seed: 77,
+        max_rate_s_inv: 200.0,
+    };
+    let gpu_n4 =
+        fit_decay_batch_with_pipeline(&engine, &pipe, &n4_curves, &aicc_cfg).expect("GPU n=4 AICc");
+    let cpu_n4 = fit_decay_batch_cpu(&n4_curves, &aicc_cfg).expect("CPU n=4 AICc");
+    assert!(!gpu_n4[0].used_three_param && !cpu_n4[0].used_three_param);
+    assert!((gpu_n4[0].rate - cpu_n4[0].rate).abs() < 1.0e-5);
 }

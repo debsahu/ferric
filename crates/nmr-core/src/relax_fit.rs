@@ -541,8 +541,12 @@ fn info_criterion(chi2: f64, k: usize, n: usize, gate: OffsetModelGate) -> f64 {
     let nf = (n.max(1)) as f64;
     match gate {
         OffsetModelGate::Aicc => {
-            let denom = ((n as isize) - (k as isize) - 1).max(1) as f64;
-            chi2 + 2.0 * kf + (2.0 * kf * (kf + 1.0)) / denom
+            if n <= k + 1 {
+                f64::INFINITY
+            } else {
+                let denom = (n - k - 1) as f64;
+                chi2 + 2.0 * kf + (2.0 * kf * (kf + 1.0)) / denom
+            }
         }
         OffsetModelGate::Bic => chi2 + kf * nf.ln(),
         _ => chi2 + 2.0 * kf,

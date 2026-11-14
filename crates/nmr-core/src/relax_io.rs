@@ -33,7 +33,7 @@
 //! - Korzhnev, D. M., Billeter, M., Arseniev, A. S. & Orekhov, V. Y. (*Prog. Nucl. Magn. Reson.
 //!   Spectrosc.* **2001**, 38, 197–266) — quantitative lineshape/footprint integration vs peak-height bias.
 //! - Public format specifications: Bruker JCAMP-DX v5.0 (`acqus`, `vdlist`, `vclist`, `fqlist`, `ser`),
-//!   Varian/Agilent VnmrJ `procpar` & binary `fid`, and CCPN NEF v1.1 (Gutmanas et al.,
+//!   Varian/Agilent VnmrJ `procpar` & binary `fid`, and NMR Exchange Format (NEF) v1.1 (Gutmanas et al.,
 //!   *Nat. Struct. Mol. Biol.* **2015**, 22, 433–434).
 
 use std::collections::{BTreeMap, HashMap};
@@ -489,7 +489,9 @@ pub fn parse_bruker_fqlist(
 
         for tok in clean.split_whitespace() {
             let t_low = tok.to_ascii_lowercase();
-            let (num_str, tok_mode, scale) = if let Some(p) = t_low.strip_suffix("khz") {
+            let (num_str, tok_mode, scale) = if let Some(p) = t_low.strip_suffix("mhz") {
+                (p, FqRefMode::SfoHz, 1.0e6)
+            } else if let Some(p) = t_low.strip_suffix("khz") {
                 (p, FqRefMode::SfoHz, 1.0e3)
             } else if let Some(p) = t_low.strip_suffix("hz") {
                 (p, mode_if_hz(mode), 1.0)
@@ -812,7 +814,7 @@ fn parse_procpar_local(text: &str) -> Result<HashMap<String, LocalProcparVal>, S
             idx += 1;
             let (cnt_s, rem) = first.split_once(char::is_whitespace).unwrap_or((first, ""));
             let count: usize = cnt_s.parse().unwrap_or(1);
-            let mut strs = Vec::with_capacity(count);
+            let mut strs = Vec::with_capacity(count.min(lines.len()));
             if !rem.trim().is_empty() {
                 strs.push(unquote_pp(rem.trim()));
             }
@@ -2668,8 +2670,8 @@ fn build_reference_composite(
         }
     }
 
-    // Rank planes by median seed SNR; select the single highest-SNR plane (plus any near-identical
-    // high-SNR early planes >= 85% of max SNR) so low-SNR decay planes remain 100% independent!
+    // Rank planes by aggregate seed SNR and select the single highest-SNR plane so all other
+    // decay planes remain 100% statistically independent of the footprint fit!
     let mut plane_snrs = Vec::with_capacity(planes.len());
     for (p, sp) in planes.iter().enumerate() {
         let mut sum_abs = 0.0_f64;
@@ -3127,7 +3129,7 @@ pub fn write_relax_series_tsv_str(ds: &RelaxSeriesDataset) -> String {
         ds.duplicate_variance_scale
     ));
     s.push_str(&format!("# duplicate_dof: {}\n", ds.duplicate_dof));
-    s.push_str("seq_id\tres_name\tatom_h\tatom_x\tdelta_h_ppm\tdelta_x_ppm\tsigma_h_ppm\tsigma_x_ppm\tplane_idx\tx_value\tx_extra\tintensity\tsigma_intensity\tvolume\tplane_mad\tis_duplicate\n");
+    s.push_str("seq_id\tres_name\tatom_h\tatom_x\tdelta_h_ppm\tdelta_x_ppm\tsigma_h_ppm\tsigma_x_ppm\teta_h\teta_x\toverlap_cluster_id\tplane_idx\tx_value\tx_extra\tintensity\tsigma_intensity\tvolume\tplane_mad\tis_duplicate\n");
 
     let x_vals = ds.schedule.primary_values();
     for tr in &ds.traces {
@@ -3141,7 +3143,7 @@ pub fn write_relax_series_tsv_str(ds: &RelaxSeriesDataset) -> String {
                 RelaxSchedule::VariableDelaysSec { .. } => ".".to_string(),
             };
             s.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{:.5}\t{:.5}\t{:.5}\t{:.5}\t{}\t{:.9}\t{}\t{:.6e}\t{:.6e}\t{:.6e}\t{:.6e}\t{}\n",
+                "{}\t{}\t{}\t{}\t{:.5}\t{:.5}\t{:.5}\t{:.5}\t{:.5}\t{:.5}\t{}\t{}\t{:.9}\t{}\t{:.6e}\t{:.6e}\t{:.6e}\t{:.6e}\t{}\n",
                 fp.seq_id,
                 fp.res_name,
                 fp.atom_h,
@@ -3150,6 +3152,9 @@ pub fn write_relax_series_tsv_str(ds: &RelaxSeriesDataset) -> String {
                 fp.delta_x_ppm,
                 fp.sigma_h_ppm,
                 fp.sigma_x_ppm,
+                fp.eta_h,
+                fp.eta_x,
+                fp.overlap_cluster_id,
                 p_idx,
                 x_val,
                 x_extra,
@@ -3239,9 +3244,9 @@ pub fn parse_relax_series_tsv_str(text: &str) -> Result<RelaxSeriesDataset, Stri
         }
 
         let cols: Vec<&str> = trimmed.split('\t').collect();
-        if cols.len() < 16 {
+        if cols.len() != 19 && cols.len() != 16 {
             return Err(format!(
-                "relaxation TSV line {} has {} columns, expected 16",
+                "relaxation TSV line {} has {} columns, expected 19 (or 16 legacy)",
                 line_no + 1,
                 cols.len()
             ));
@@ -3264,26 +3269,40 @@ pub fn parse_relax_series_tsv_str(text: &str) -> Result<RelaxSeriesDataset, Stri
         let sx: f64 = cols[7]
             .parse()
             .map_err(|e| format!("invalid sigma_x_ppm on line {}: {e}", line_no + 1))?;
-        let p_idx: usize = cols[8]
+        let (eta_h, eta_x, overlap_cluster_id, base) = if cols.len() == 19 {
+            let eh: f64 = cols[8]
+                .parse()
+                .map_err(|e| format!("invalid eta_h on line {}: {e}", line_no + 1))?;
+            let ex: f64 = cols[9]
+                .parse()
+                .map_err(|e| format!("invalid eta_x on line {}: {e}", line_no + 1))?;
+            let cid: usize = cols[10]
+                .parse()
+                .map_err(|e| format!("invalid overlap_cluster_id on line {}: {e}", line_no + 1))?;
+            (eh, ex, cid, 11usize)
+        } else {
+            (0.0_f64, 0.0_f64, 0usize, 8usize)
+        };
+        let p_idx: usize = cols[base]
             .parse()
             .map_err(|e| format!("invalid plane_idx on line {}: {e}", line_no + 1))?;
-        let x_val: f64 = cols[9]
+        let x_val: f64 = cols[base + 1]
             .parse()
             .map_err(|e| format!("invalid x_value on line {}: {e}", line_no + 1))?;
-        let x_extra = cols[10].to_string();
-        let inten: f64 = cols[11]
+        let x_extra = cols[base + 2].to_string();
+        let inten: f64 = cols[base + 3]
             .parse()
             .map_err(|e| format!("invalid intensity on line {}: {e}", line_no + 1))?;
-        let sig: f64 = cols[12]
+        let sig: f64 = cols[base + 4]
             .parse()
             .map_err(|e| format!("invalid sigma_intensity on line {}: {e}", line_no + 1))?;
-        let vol: f64 = cols[13]
+        let vol: f64 = cols[base + 5]
             .parse()
             .map_err(|e| format!("invalid volume on line {}: {e}", line_no + 1))?;
-        let mad: f64 = cols[14]
+        let mad: f64 = cols[base + 6]
             .parse()
             .map_err(|e| format!("invalid plane_mad on line {}: {e}", line_no + 1))?;
-        let is_dup = cols[15] == "1" || cols[15].eq_ignore_ascii_case("true");
+        let is_dup = cols[base + 7] == "1" || cols[base + 7].eq_ignore_ascii_case("true");
 
         plane_meta.insert(p_idx, (x_val, x_extra, mad, is_dup));
         let key = (seq_id, atom_h.clone(), atom_x.clone());
@@ -3299,9 +3318,9 @@ pub fn parse_relax_series_tsv_str(text: &str) -> Result<RelaxSeriesDataset, Stri
                     delta_x_ppm: dx,
                     sigma_h_ppm: sh,
                     sigma_x_ppm: sx,
-                    eta_h: 0.0,
-                    eta_x: 0.0,
-                    overlap_cluster_id: 0,
+                    eta_h,
+                    eta_x,
+                    overlap_cluster_id,
                 },
                 BTreeMap::new(),
             )
@@ -3505,6 +3524,9 @@ pub fn write_relax_series_nef_str(ds: &RelaxSeriesDataset) -> String {
     s.push_str("      _nmrassign_relax_data.delta_x_ppm\n");
     s.push_str("      _nmrassign_relax_data.sigma_h_ppm\n");
     s.push_str("      _nmrassign_relax_data.sigma_x_ppm\n");
+    s.push_str("      _nmrassign_relax_data.eta_h\n");
+    s.push_str("      _nmrassign_relax_data.eta_x\n");
+    s.push_str("      _nmrassign_relax_data.overlap_cluster_id\n");
     s.push_str("      _nmrassign_relax_data.plane_index\n");
     s.push_str("      _nmrassign_relax_data.value\n");
     s.push_str("      _nmrassign_relax_data.value_uncertainty\n");
@@ -3515,7 +3537,7 @@ pub fn write_relax_series_nef_str(ds: &RelaxSeriesDataset) -> String {
         let fp = &tr.footprint;
         for p_idx in 0..x_vals.len() {
             s.push_str(&format!(
-                "      {} {} {} {} {} {:.5} {:.5} {:.5} {:.5} {} {:.6e} {:.6e} {:.6e}\n",
+                "      {} {} {} {} {} {:.5} {:.5} {:.5} {:.5} {:.5} {:.5} {} {} {:.6e} {:.6e} {:.6e}\n",
                 row_id,
                 fp.seq_id,
                 fp.res_name,
@@ -3525,6 +3547,9 @@ pub fn write_relax_series_nef_str(ds: &RelaxSeriesDataset) -> String {
                 fp.delta_x_ppm,
                 fp.sigma_h_ppm,
                 fp.sigma_x_ppm,
+                fp.eta_h,
+                fp.eta_x,
+                fp.overlap_cluster_id,
                 p_idx,
                 tr.intensities[p_idx],
                 tr.sigmas[p_idx],
@@ -3636,9 +3661,9 @@ pub fn parse_relax_series_nef_str(nef_text: &str) -> Result<RelaxSeriesDataset, 
             }
             LoopSection::Data => {
                 let cols: Vec<&str> = t.split_whitespace().collect();
-                if cols.len() < 13 {
+                if cols.len() != 16 && cols.len() != 13 {
                     return Err(format!(
-                        "NEF relax_data line {} has {} tokens, expected 13",
+                        "NEF relax_data line {} has {} tokens, expected 16 (or 13 legacy)",
                         line_no + 1,
                         cols.len()
                     ));
@@ -3661,16 +3686,30 @@ pub fn parse_relax_series_nef_str(nef_text: &str) -> Result<RelaxSeriesDataset, 
                 let sx: f64 = cols[8]
                     .parse()
                     .map_err(|e| format!("invalid NEF sigma_x_ppm: {e}"))?;
-                let p_idx: usize = cols[9]
+                let (eta_h, eta_x, overlap_cluster_id, base) = if cols.len() == 16 {
+                    let eh: f64 = cols[9]
+                        .parse()
+                        .map_err(|e| format!("invalid NEF eta_h: {e}"))?;
+                    let ex: f64 = cols[10]
+                        .parse()
+                        .map_err(|e| format!("invalid NEF eta_x: {e}"))?;
+                    let cid: usize = cols[11]
+                        .parse()
+                        .map_err(|e| format!("invalid NEF overlap_cluster_id: {e}"))?;
+                    (eh, ex, cid, 12usize)
+                } else {
+                    (0.0_f64, 0.0_f64, 0usize, 9usize)
+                };
+                let p_idx: usize = cols[base]
                     .parse()
                     .map_err(|e| format!("invalid NEF data plane_index: {e}"))?;
-                let val: f64 = cols[10]
+                let val: f64 = cols[base + 1]
                     .parse()
                     .map_err(|e| format!("invalid NEF data value: {e}"))?;
-                let sig: f64 = cols[11]
+                let sig: f64 = cols[base + 2]
                     .parse()
                     .map_err(|e| format!("invalid NEF data uncertainty: {e}"))?;
-                let vol: f64 = cols[12]
+                let vol: f64 = cols[base + 3]
                     .parse()
                     .map_err(|e| format!("invalid NEF data volume: {e}"))?;
 
@@ -3687,9 +3726,9 @@ pub fn parse_relax_series_nef_str(nef_text: &str) -> Result<RelaxSeriesDataset, 
                             delta_x_ppm: dx,
                             sigma_h_ppm: sh,
                             sigma_x_ppm: sx,
-                            eta_h: 0.0,
-                            eta_x: 0.0,
-                            overlap_cluster_id: 0,
+                            eta_h,
+                            eta_x,
+                            overlap_cluster_id,
                         },
                         BTreeMap::new(),
                     )

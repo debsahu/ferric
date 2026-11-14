@@ -76,18 +76,20 @@ sfo hz
 0.0
 +300Hz
 +0.6kHz
++0.0015MHz
 bf ppm
 105.0
 120.0ppm
 ";
     let fq = parse_bruker_fqlist(fq_txt, 60.81, 118.0).expect("parse fqlist");
-    assert_eq!(fq.len(), 6);
+    assert_eq!(fq.len(), 7);
     assert!((fq[0].offset_hz - (-600.0)).abs() < 1.0e-9);
     assert!((fq[0].offset_ppm - (118.0 - 600.0 / 60.81)).abs() < 1.0e-9);
     assert!((fq[3].offset_hz - 600.0).abs() < 1.0e-9);
-    assert!((fq[4].offset_ppm - 105.0).abs() < 1.0e-9);
-    assert!((fq[4].offset_hz - (105.0 - 118.0) * 60.81).abs() < 1.0e-9);
-    assert!((fq[5].offset_ppm - 120.0).abs() < 1.0e-9);
+    assert!((fq[4].offset_hz - 1500.0).abs() < 1.0e-9);
+    assert!((fq[5].offset_ppm - 105.0).abs() < 1.0e-9);
+    assert!((fq[5].offset_hz - (105.0 - 118.0) * 60.81).abs() < 1.0e-9);
+    assert!((fq[6].offset_ppm - 120.0).abs() < 1.0e-9);
 
     let procpar_interleaved = "\
 array 2 2 8192 0 0 2 1 0 1 64
@@ -1092,5 +1094,83 @@ fn overlapping_footprints_deconvolve_and_tsv_nef_roundtrip_cleanly() {
         let diff_tsv = (from_tsv.traces[0].intensities[p] - ds.traces[0].intensities[p]).abs();
         let diff_nef = (from_nef.traces[0].intensities[p] - ds.traces[0].intensities[p]).abs();
         assert!(diff_tsv < 1.0e-3 && diff_nef < 1.0e-3);
+    }
+
+    // Also verify PseudoVoigt footprint (`eta_h`, `eta_x`, and `overlap_cluster_id > 0`) lossless TSV & NEF round-trip!
+    let mut pv_seeds = seeds.clone();
+    pv_seeds.push(TargetPeakSeed {
+        seq_id: 40,
+        res_name: "ALA".to_string(),
+        atom_h: "H".to_string(),
+        atom_x: "N".to_string(),
+        delta_h_ppm: 7.900,
+        delta_x_ppm: 116.50,
+    });
+    let mut pv_planes = Vec::new();
+    for (p_idx, &t) in delays.iter().enumerate() {
+        let mut data = vec![0.0f32; ny * nx];
+        for iy in 0..ny {
+            let py = ax_y.index_to_ppm(iy as f64);
+            for ix in 0..nx {
+                let px = ax_x.index_to_ppm(ix as f64);
+                let v = 110.0
+                    * (-1.8 * t).exp()
+                    * footprint_eval_2d(px, py, 8.400, 119.00, sh, sn, 0.35, 0.45)
+                    + 85.0
+                        * (-3.6 * t).exp()
+                        * footprint_eval_2d(px, py, 8.432, 119.22, sh, sn, 0.35, 0.45)
+                    + 95.0
+                        * (-2.2 * t).exp()
+                        * footprint_eval_2d(px, py, 7.900, 116.50, sh, sn, 0.55, 0.25);
+                data[iy * nx + ix] = v as f32;
+            }
+        }
+        pv_planes.push(Spectrum2D {
+            name: format!("pv_p{p_idx}"),
+            axis_x: ax_x.clone(),
+            axis_y: ax_y.clone(),
+            data,
+        });
+    }
+    let pv_ds = integrate_relax_planes(
+        "pv_r1",
+        RelaxExperimentKind::R1,
+        RelaxSchedule::VariableDelaysSec {
+            delays_sec: delays.clone(),
+        },
+        &pv_planes,
+        &pv_seeds,
+        &RelaxIntegrationConfig {
+            shape_model: FootprintShapeModel::PseudoVoigt,
+            ref_plane_indices: Some(vec![0]),
+            ..RelaxIntegrationConfig::default()
+        },
+    )
+    .expect("integrate PseudoVoigt stack");
+    assert!(pv_ds.traces[2].footprint.eta_h > 0.10);
+    assert!(pv_ds.traces[2].footprint.eta_x > 0.05);
+    assert_ne!(
+        pv_ds.traces[0].footprint.overlap_cluster_id,
+        pv_ds.traces[2].footprint.overlap_cluster_id
+    );
+
+    let pv_from_tsv =
+        parse_relax_series_tsv_str(&write_relax_series_tsv_str(&pv_ds)).expect("parse pv TSV");
+    let pv_from_nef =
+        parse_relax_series_nef_str(&write_relax_series_nef_str(&pv_ds)).expect("parse pv NEF");
+    for idx in 0..3 {
+        let orig = &pv_ds.traces[idx].footprint;
+        for restored in [
+            &pv_from_tsv.traces[idx].footprint,
+            &pv_from_nef.traces[idx].footprint,
+        ] {
+            assert!((restored.eta_h - orig.eta_h).abs() < 2.0e-5);
+            assert!((restored.eta_x - orig.eta_x).abs() < 2.0e-5);
+            assert_eq!(restored.overlap_cluster_id, orig.overlap_cluster_id);
+            assert!(
+                (restored.unit_volume_factor_ppm2() - orig.unit_volume_factor_ppm2()).abs()
+                    < 1.0e-5
+            );
+        }
     }
 }

@@ -60,19 +60,19 @@ Independent per-plane local-maximum peak picking (`extract_naive_local_max_serie
    - Baseline amplitude variance propagates white pixel variance $\hat{\sigma}_{\text{mad}, p}^2 \sum_u W_{r,u}^2$ (and optional stationary 2D FT noise autocorrelation $\hat{\rho}(\Delta x, \Delta y)$ when `account_spatial_noise_corr = true`).
    - When duplicate delays/offsets $|x_p - x_q| \le \text{duplicate\_tol}$ exist, replicate residuals are pooled across all $M$ peaks and duplicate groups $g$:
      $$\chi^2_{\text{dup}} = \sum_{g} \sum_{r=1}^{M} \sum_{p \in g} \frac{(\hat{A}_{r,p} - \bar{A}_{r,g})^2}{\sigma_{0,r,p}^2}, \qquad \nu_{\text{dup}} = M \sum_g (|g| - 1)$$
-     shrinking toward unity with prior weight $\nu_0 = 8$:
-     $$s_{\text{pool}}^2 = \frac{\nu_0 + \chi^2_{\text{dup}}}{\nu_0 + \nu_{\text{dup}}}, \qquad \sigma_{r, p} = s_{\text{pool}} \, \sigma_{0, r, p}$$
+     shrinking toward unity with prior weight $\nu_0 = 4$ (floored at $s_{\text{pool}}^2 \ge 0.25$):
+     $$s_{\text{pool}}^2 = \max\!\left(0.25,\; \frac{\nu_0 + \chi^2_{\text{dup}}}{\nu_0 + \nu_{\text{dup}}}\right), \qquad \sigma_{r, p} = s_{\text{pool}} \, \sigma_{0, r, p}$$
 
 ### 1.3 Relaxation-Series TSV & NEF Interchange
-- `write_relax_series_tsv_str` / `parse_relax_series_tsv_str`: lossless round-trip tabular format carrying header metadata (`experiment_kind`, `schedule` encoding, `duplicate_dof`, `duplicate_variance_scale`), per-plane MAD noise, and per-(residue, plane) `(intensity, sigma, volume)` rows.
-- `write_relax_series_nef_str` / `parse_relax_series_nef_str`: NEF v1.1 `save_nmrassign_relaxation_series_<name>` saveframe with `_nef_relaxation_list` header tags and `loop_ _nef_relaxation` records.
+- `write_relax_series_tsv_str` / `parse_relax_series_tsv_str`: lossless round-trip tabular format carrying header metadata (`experiment_kind`, `schedule` encoding, `duplicate_dof`, `duplicate_variance_scale`), per-plane MAD noise, full locked footprint parameters (`delta_h_ppm`, `delta_x_ppm`, `sigma_h_ppm`, `sigma_x_ppm`, `eta_h`, `eta_x`, `overlap_cluster_id`), and per-(residue, plane) `(intensity, sigma, volume)` rows.
+- `write_relax_series_nef_str` / `parse_relax_series_nef_str`: NEF v1.1 vendor-extensible `save_nmrassign_relaxation_series_<name>` saveframe with `_nmrassign_relax_list` header tags and `loop_ _nmrassign_relax_plane` / `loop_ _nmrassign_relax_data` records (preserving `eta_h`, `eta_x`, and `overlap_cluster_id`).
 
 ### 1.4 Batched CPU & WebGPU Exponential Curve Fitter (`relax_fit.rs`, `relax_gpu.rs`, `shaders/relax_mc.wgsl`)
 Each extracted decay curve (`DecayCurveInput { seq_id, res_name, times_sec, intensities, sigmas }`) is normalized to dimensionless coordinates $u_k = t_k / t_{\max} \in [0, 1]$, $y_k = I_k / I_{\text{scale}} \in [-1, 1]$, $s_k = \sigma_k / I_{\text{scale}}$, and $w_k = s_k^{-2}$:
 
 1. **2-Parameter & AIC/BIC-Gated 3-Parameter Models (`OffsetModelGate`)**:
    - Canonical 2-parameter decay: $I(t) = I_0 e^{-R t}$ (`OffsetModelGate::Disabled`).
-   - Optional 3-parameter offset decay: $I(t) = I_0 e^{-R t} + C$, gated against the 2-parameter fit by `Aic` ($\chi^2 + 2k$), `Aicc`, `Bic` ($\chi^2 + k \ln n$), or `AlwaysThreeParam`.
+   - Optional 3-parameter offset decay: $I(t) = I_0 e^{-R t} + C$, gated against the 2-parameter fit by `Aic` ($\chi^2 + 2k$), `Aicc` ($\chi^2 + 2k + \frac{2k(k+1)}{n-k-1}$ for $n > k+1$, $+\infty$ for $n \le k+1$), `Bic` ($\chi^2 + k \ln n$), or `AlwaysThreeParam`.
    - Solved via coarse quadratic Variable-Projection grid scan + weighted log-linear starter + damped $2\times 2$ / $3\times 3$ Levenberg–Marquardt with exact linear-amplitude VarPro projection at every iteration, followed on `f32` WebGPU (`relax_mc.wgsl`) by Kahan-summed residual-form 1D VarPro Newton score polishing ($\phi(\tilde{R}) = \sum_k w_k u_k e^{-\tilde{R} u_k}(y_k - \hat{I}_0(\tilde{R}) e^{-\tilde{R} u_k}) = 0$) to eliminate $\sqrt{\epsilon_{\text{f32}}}$ zero-order $\chi^2$ rounding and achieve **`< 1e-5` CPU/WebGPU rate parity**.
 2. **Analytical Cramér–Rao / Fisher Bounds & Parametric Monte Carlo Bootstrap**:
    - Exact $2 \times 2$ Fisher Information Matrix for $I(t) = I_0 e^{-R t}$ (`fisher_crlb_two_param`):
@@ -130,7 +130,7 @@ Backbone amide $\text{N–H}$ unit bond vectors $\mathbf{u}_i \in \mathbb{S}^2$ 
 ### 2.4 Model Elimination, Selection Criteria, & Global Alternating Optimization
 - **Per-Residue Multi-Start Bounded LM (`fit_single_model_on_residue`)**: Optimizes $(S^2, \ln\tau_e, R_{\text{ex,ref}})$ or $(S_f^2, S_s^2, \ln\tau_s)$ from deterministic multi-start grids, followed by exact physical-coordinate Fisher covariance inversion (`local_fisher_uncertainties`).
 - **d'Auvergne & Gooley (2003, 2006) + Mandel–Akke–Palmer (1995) Model Elimination (`enable_model_elimination`)**: Eliminates over-parameterized fits ($k > m_{\text{obs}}$), boundary-pinned timescales ($\tau_e < 2\text{ ps}$ or $> 0.48\tau_m$; $\tau_s < 150\text{ ps}$ or $> 0.52\tau_m$), negligible/non-physical amplitudes ($S^2 > 0.985$ on `M2`/`M4`; $R_{\text{ex,ref}} < 0.20\text{ s}^{-1}$ on `M3`/`M4`; $S_f^2 > 0.975$ or $S_s^2 > 0.975$ on `M5`), and unidentifiable extra parameters ($\sigma_{\text{Fisher}}(\theta) / \theta$ exceeding identifiability bounds) prior to statistical model ranking.
-- **Model Selection (`ModelSelectionCriterion`)**: Supports `Aic` ($\chi^2 + 2k$), `Aicc`, `Bic` ($\chi^2 + k \ln m_{\text{obs}}$), and `PalmerFTest` (nested $\alpha = 0.05$ $\Delta\chi^2 > 3.841 / 5.991$ hierarchy).
+- **Model Selection (`ModelSelectionCriterion`)**: Supports `Aic` ($\chi^2 + 2k$), `Aicc` ($+\infty$ when $m_{\text{obs}} \le k + 1$, falling back to `M1` when $m_{\text{obs}} \le 2$), `Bic` ($\chi^2 + k \ln m_{\text{obs}}$), and `PalmerFTest` (nested $\alpha = 0.05$ $\Delta\chi^2 > 3.841 / 5.991$ hierarchy).
 - **Profiled Global Alternating Optimization (`fit_modelfree_dataset`)**: Initializes global diffusion from Kay–Torchia–Bax outlier-trimmed $R_2 / R_1$, then alternates multi-threaded per-residue `M1`–`M5` selection with global diffusion optimization where fast local parameters are warm-profiled inside `global_profiled_chi2` to decouple global $\tau_m / \mathbf{D}$ from local $S_i^2$. Exports tabular summaries via `write_modelfree_tsv_str`.
 
 ---

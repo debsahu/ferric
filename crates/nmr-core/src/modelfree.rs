@@ -1114,8 +1114,11 @@ pub fn fit_single_model_on_residue(
     let kf = k as f64;
     let nf = (m_obs.max(1)) as f64;
     let aic = chi2 + 2.0 * kf;
-    let denom_aicc = ((m_obs as isize) - (k as isize) - 1).max(1) as f64;
-    let aicc = aic + (2.0 * kf * (kf + 1.0)) / denom_aicc;
+    let aicc = if m_obs <= k + 1 {
+        f64::INFINITY
+    } else {
+        aic + (2.0 * kf * (kf + 1.0)) / ((m_obs - k - 1) as f64)
+    };
     let bic = chi2 + kf * nf.ln();
 
     // d'Auvergne & Gooley (2003, 2006) + Mandel, Akke & Palmer (1995) model elimination:
@@ -1200,7 +1203,7 @@ pub fn fit_and_select_residue_modelfree(
         ModelSelectionCriterion::Aicc => candidates
             .iter()
             .enumerate()
-            .filter(|(_, c)| !c.eliminated)
+            .filter(|(_, c)| !c.eliminated && c.aicc.is_finite())
             .min_by(|a, b| a.1.aicc.total_cmp(&b.1.aicc))
             .map(|(i, _)| i)
             .unwrap_or(0),
@@ -1745,35 +1748,14 @@ fn fit_with_fixed_diffusion_symmetry(
             }
             let ax =
                 estimate_initial_axial_diffusion_from_r2_r1(&primary_rates, &nh_vecs, &trim_cfg)?;
-            // Seed asymmetric rotor from converged axial symmetry axis `(alpha = phi, beta = theta)` with slight rhombic split
-            let (dx0, dy0, dz0) = if ax.d_par_s_inv >= ax.d_perp_s_inv {
-                (
-                    0.96 * ax.d_perp_s_inv,
-                    1.04 * ax.d_perp_s_inv,
-                    ax.d_par_s_inv,
-                )
-            } else {
-                (
-                    ax.d_par_s_inv,
-                    0.96 * ax.d_perp_s_inv,
-                    1.04 * ax.d_perp_s_inv,
-                )
-            };
-            // Note: `euler_zyz_matrix(alpha, beta, 0)` has third row `[sin(beta)cos(alpha), sin(beta)sin(alpha), cos(beta)]`,
-            // which aligns the principal Z axis (`dz`) identically with `axis = [sin(theta)cos(phi), sin(theta)sin(phi), cos(theta)]`!
-            let init_z = if ax.d_par_s_inv >= ax.d_perp_s_inv {
-                (dx0, dy0, dz0)
-            } else {
-                (
-                    0.96 * ax.d_perp_s_inv,
-                    1.04 * ax.d_perp_s_inv,
-                    ax.d_par_s_inv,
-                )
-            };
+            // Seed asymmetric rotor from converged axial symmetry axis `(alpha = phi, beta = theta)` with slight rhombic split.
+            // `euler_zyz_matrix(alpha, beta, 0)` has third row `[sin(beta)cos(alpha), sin(beta)sin(alpha), cos(beta)]`,
+            // aligning principal Z (`dz`) identically with `axis = [sin(theta)cos(phi), sin(theta)sin(phi), cos(theta)]`
+            // for both prolate (`d_par >= d_perp`) and oblate (`d_par < d_perp`) seeds!
             DiffusionTensor::FullyAnisotropic {
-                dx_s_inv: init_z.0,
-                dy_s_inv: init_z.1,
-                dz_s_inv: init_z.2,
+                dx_s_inv: 0.96 * ax.d_perp_s_inv,
+                dy_s_inv: 1.04 * ax.d_perp_s_inv,
+                dz_s_inv: ax.d_par_s_inv,
                 alpha_rad: ax.phi_rad,
                 beta_rad: ax.theta_rad,
                 gamma_rad: 0.25,

@@ -517,7 +517,10 @@ fn info_criterion_gpu(chi2: f32, k: u32, n: u32, gate: u32) -> f32 {
     let kf = f32(k);
     let nf = f32(max(n, 1u));
     if (gate == 2u) {
-        let denom_i = max(i32(n) - i32(k) - 1, 1);
+        if (n <= k + 1u) {
+            return 1.0e38;
+        }
+        let denom_i = i32(n) - i32(k) - 1;
         return chi2 + 2.0 * kf + (2.0 * kf * (kf + 1.0)) / f32(denom_i);
     }
     if (gate == 3u) {
@@ -553,7 +556,7 @@ fn fit_point_estimates(@builtin(global_invocation_id) gid: vec3<u32>) {
         out_c = f3.z;
         out_chi2 = f3.w;
         use_3p = 1u;
-    } else if (params.offset_gate >= 1u && params.offset_gate <= 3u && n_pts >= 4u) {
+    } else if (params.offset_gate >= 1u && params.offset_gate <= 3u && n_pts >= 4u && !(params.offset_gate == 2u && n_pts <= 4u)) {
         let f3 = fit_three_param(cmeta.pt_offset, n_pts, &y_obs, cmeta.r_tilde_max);
         let ic2 = info_criterion_gpu(f2.z, 2u, n_pts, params.offset_gate);
         let ic3 = info_criterion_gpu(f3.w, 3u, n_pts, params.offset_gate);
