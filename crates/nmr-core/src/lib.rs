@@ -23,6 +23,7 @@ pub mod idp_propensity;
 pub mod idp_solver;
 pub mod methyl_solver;
 pub mod methyl_trosy;
+pub mod multiplet;
 pub mod nef;
 pub mod neural_picker;
 pub mod nmrstar;
