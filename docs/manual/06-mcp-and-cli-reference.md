@@ -268,7 +268,7 @@ Add the following block to your client's `mcpServers` configuration file (for **
 ```json
 {
   "mcpServers": {
-    "nmr-assign-workbench": {
+    "nmrassign-workbench": {
       "url": "http://127.0.0.1:54912/mcp",
       "headers": {
         "Authorization": "Bearer <session-bearer-token>"
@@ -284,7 +284,7 @@ Add the following block to your client's `mcpServers` configuration file (for **
 
 Every `MCP` request passes through defense-in-depth security checks (`McpSecurityPolicy`):
 
-1. **Default-Safe `ReadOnly` Mode**: Both the `stdio` server and the `nmr-gui` bridge default to **`McpAccessMode::ReadOnly`**. Mutating tools (`write_curated_peak_tsv`, `export_nmrstar_shifts`, `propose_curation_edit`) carry MCP safety annotations (`readOnlyHint: false`, `destructiveHint: true`) and are unconditionally rejected (`-32002 ERR_READ_ONLY_DENIED` / `isError: true`) unless the user explicitly enables `ReadWrite`.
+1. **Default-Safe `ReadOnly` Mode**: Both the `stdio` server and the `nmr-gui` bridge default to **`McpAccessMode::ReadOnly`**. State-modifying tools (`write_curated_peak_tsv`, `export_nmrstar_shifts`, `navigate_workbench`, `propose_curation_edit`, `undo_last_ai_edit`) carry MCP safety annotations (`readOnlyHint: false`, `destructiveHint: true`) and are unconditionally rejected (`-32002 ERR_READ_ONLY_DENIED` / `isError: true`) unless the user explicitly enables `ReadWrite`.
 2. **Canonicalized Path Sandbox (`resolve_sandboxed_path`)**:
    - Rejects empty paths, embedded null bytes (`\0`), and any lexical `..` (`ParentDir`) traversal before touching the filesystem.
    - Blocks access to hidden credential and secret locations (`.ssh`, `.aws`, `.gnupg`, `.env`, `.env.*`, `.netrc`, `.kube`, `id_rsa`, `id_ed25519`).
@@ -309,7 +309,7 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
 | `write_curated_peak_tsv` | `stdio` | `ReadWrite` | Write filtered/curated 7-column peak `TSV` strictly inside `allowed_roots` |
 | `export_nmrstar_shifts` | `stdio` | `ReadWrite` | Write `NMR-STAR v3.2` chemical shifts strictly inside `allowed_roots` |
 | `get_workbench_state` | `gui` | `ReadOnly` | Snapshot active residue, `(1H, 15N, 13C)` crosshair, ranked strip candidates, undo depth & QC |
-| `navigate_workbench` | `gui` | `ReadOnly` | Jump strips/crosshairs to a residue or highlight 3D PDB pocket residues |
+| `navigate_workbench` | `gui` | `ReadWrite` | Jump strips/crosshairs to a residue or highlight 3D PDB pocket residues (Undo-logged) |
 | `capture_viewport_png` | `gui` | `ReadOnly` | Encode active 2D contour / 3D strip / 3D ribbon viewport as RFC 2083 `image/png` Base64 |
 | `propose_curation_edit` | `gui` | `ReadWrite` | Apply an Undo-logged spin-system assignment, unassignment, or peak exclusion |
 | `undo_last_ai_edit` | `gui` | `ReadWrite` | Revert the most recent AI curation action from `McpUndoLog` |
