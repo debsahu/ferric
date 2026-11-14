@@ -24,7 +24,7 @@ use nmr_core::structure::{
     evaluate_rdc_torsion_energy_and_gradients_fixed_saupe, fold_from_experimental_noes_and_rdcs,
     read_exp_noe_tsv, validate_ensemble, EnergyWeights, StructureCalcConfig, BOND_CA_HA,
 };
-use nmr_core::torsion_db::{predict_torsions_with_firewall, HomologFirewallQuery};
+use nmr_core::torsion_db::{predict_torsions_with_firewall, sha256_hex, HomologFirewallQuery};
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1654,4 +1654,469 @@ fn test_noncircular_gb1_3gb1_exp_noe_fold_rdc_refine_vs_1pga_xray() {
         post_rmsd_mean < pre_rmsd_mean,
         "RDC refinement must improve independent 1PGA (1..56) mean BB RMSD ({pre_rmsd_mean:.3} -> {post_rmsd_mean:.3} A)"
     );
+}
+
+#[test]
+fn test_cross_os_rdc_anneal_golden_coordinate_sha256() {
+    const EXPECTED_GOLDEN_COORD_SHA256: &str =
+        "becb91f6cdfc2358740be5e43861b0af6456e0b68a5e62ce779090fea9483639";
+
+    let root = workspace_root();
+    let xray_1pga = parse_pdb_first_model(root.join("data/pdb_refs/1pga.pdb")).expect("read 1PGA");
+    let seq: Vec<String> = xray_1pga
+        .residues
+        .iter()
+        .map(|r| r.res_name.clone())
+        .collect();
+    let seq_ids: Vec<i32> = xray_1pga.residues.iter().map(|r| r.seq_id).collect();
+
+    let exp_adrs = read_exp_noe_tsv(
+        root.join("data/fixtures/gb1_3gb1_exp_noe.tsv"),
+        &seq,
+        &seq_ids,
+    )
+    .expect("read experimental 3GB1 NOEs");
+
+    let shifts_gb1 = read_star_all_atoms(root.join("data/fixtures/gb1_bmr7280_shifts.str"), None)
+        .expect("read BMRB 7280 shifts");
+    // Use `dihedrals::predict_dihedrals` (`0` OS `libm` calls) -> `rdc` (`0` OS `libm` calls)
+    // -> `structure` (`0` OS `libm` calls) so every operation in this cross-OS golden coordinate
+    // digest test is strictly IEEE-754 bit-deterministic across `x86_64` and `aarch64`.
+    let det_dihs_gb1 = nmr_core::dihedrals::predict_dihedrals(&shifts_gb1);
+
+    let mut media =
+        read_rdc_tsv(root.join("data/fixtures/gb1_3gb1_rdc.tsv")).expect("read 3GB1 RDCs");
+    partition_rdc_free_set(&mut media, 0.20, 2026);
+
+    let cfg = StructureCalcConfig {
+        n_replicas: 2,
+        n_select: 2,
+        n_refinement_cycles: 1,
+        stage1_steps: 200,
+        stage2_steps: 300,
+        lbfgs_iters: 40,
+        seed: 20260402,
+        ..StructureCalcConfig::default()
+    };
+
+    let (rdc_ens, Some(rdc_val)) = fold_from_experimental_noes_and_rdcs(
+        &seq,
+        &seq_ids,
+        &exp_adrs,
+        &det_dihs_gb1,
+        &media,
+        0.55,
+        &cfg,
+    )
+    .expect("deterministic cross-OS GB1 RDC fold") else {
+        panic!("expected Some(RdcValidationSummary)");
+    };
+
+    let mut coord_bytes: Vec<u8> =
+        Vec::with_capacity(rdc_ens.conformers[0].chain.residues.len() * 224);
+    let push_vec3 = |buf: &mut Vec<u8>, v: [f64; 3]| {
+        for c in v {
+            buf.extend_from_slice(&c.to_le_bytes());
+        }
+    };
+    let push_opt_vec3 = |buf: &mut Vec<u8>, opt: Option<[f64; 3]>| match opt {
+        Some(v) => {
+            buf.push(1u8);
+            for c in v {
+                buf.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        None => buf.push(0u8),
+    };
+    for res in &rdc_ens.conformers[0].chain.residues {
+        push_vec3(&mut coord_bytes, res.n);
+        push_vec3(&mut coord_bytes, res.ca);
+        push_vec3(&mut coord_bytes, res.c);
+        push_vec3(&mut coord_bytes, res.o);
+        push_opt_vec3(&mut coord_bytes, res.h);
+        push_opt_vec3(&mut coord_bytes, res.cb);
+        push_vec3(&mut coord_bytes, res.ha);
+        push_opt_vec3(&mut coord_bytes, res.ha2);
+        push_opt_vec3(&mut coord_bytes, res.ha3);
+    }
+
+    let coord_sha = sha256_hex(&coord_bytes);
+    println!(
+        "[CROSS-OS GOLDEN RDC SHA256] sha256={} q_work={:.4} plane_q_free={:.4}",
+        coord_sha, rdc_val.overall_q_work, rdc_val.overall_q_free
+    );
+    assert!(
+        rdc_val.overall_q_work.is_finite() && rdc_val.overall_q_free.is_finite(),
+        "non-finite golden RDC Q metrics"
+    );
+    assert_eq!(
+        coord_sha, EXPECTED_GOLDEN_COORD_SHA256,
+        "cross-OS golden RDC coordinate SHA-256 drifted (got {coord_sha})"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_five_seed_multi_target_rdc_refinement_sweep() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Debug)]
+    struct SweepRow {
+        target: &'static str,
+        seed: u64,
+        q_work: f64,
+        plane_q_free: f64,
+        nh_q_free: Option<f64>,
+        low_e: f64,
+        mean_e: f64,
+        rama_pct: Option<f64>,
+    }
+
+    let root = workspace_root();
+    let jobs: Vec<(&'static str, u64)> = vec![
+        ("1D3Z", 2026),
+        ("1D3Z", 2027),
+        ("1D3Z", 2028),
+        ("1D3Z", 2029),
+        ("1D3Z", 2030),
+        ("1UBQ", 20260401),
+        ("1UBQ", 20260402),
+        ("1UBQ", 20260403),
+        ("1UBQ", 20260404),
+        ("1UBQ", 20260405),
+        ("GB1", 20260402),
+        ("GB1", 20260403),
+        ("GB1", 20260404),
+        ("GB1", 20260405),
+        ("GB1", 20260406),
+    ];
+
+    let pdb_1d3z = parse_pdb_first_model(root.join("data/pdb_refs/1d3z.pdb")).unwrap();
+    let shifts_1d3z = read_star_all_atoms(root.join("data/benchmark/bmr17769.str"), None).unwrap();
+    let mut media_1d3z = read_rdc_tsv(root.join("data/fixtures/ubiquitin_1d3z_rdc.tsv")).unwrap();
+    partition_rdc_free_set(&mut media_1d3z, 0.20, 199807);
+    let peaks_1d3z = simulate_noesy_peaks(&pdb_1d3z, &shifts_1d3z, &NoesySimConfig::default());
+    let fw_ubq = HomologFirewallQuery {
+        query_pdb_ids: vec!["1D3Z".to_string(), "1UBQ".to_string(), "1G6J".to_string()],
+        query_bmrb_ids: vec!["bmr17769".to_string(), "bmr5387".to_string()],
+        query_uniprot_id: Some("P0CG48".to_string()),
+        query_family_id: Some("3.10.20.90".to_string()),
+        query_topology_id: Some("3.10.20".to_string()),
+        query_ca_coords: Some(pdb_1d3z.residues.iter().map(|r| r.ca).collect()),
+    };
+    let fw_dihs_1d3z =
+        predict_torsions_with_firewall(&shifts_1d3z, &fw_ubq).to_dihedral_restraints();
+
+    let xray_1ubq =
+        parse_pdb_first_model(root.join("data/fixtures/ubiquitin_1ubq_xray.pdb")).unwrap();
+    let seq_ubq: Vec<String> = xray_1ubq
+        .residues
+        .iter()
+        .map(|r| r.res_name.clone())
+        .collect();
+    let seq_ids_ubq: Vec<i32> = xray_1ubq.residues.iter().map(|r| r.seq_id).collect();
+    let exp_adrs_ubq = read_exp_noe_tsv(
+        root.join("data/fixtures/ubiquitin_1d3z_exp_noe.tsv"),
+        &seq_ubq,
+        &seq_ids_ubq,
+    )
+    .unwrap();
+    let mut media_ubq = read_rdc_tsv(root.join("data/fixtures/ubiquitin_1d3z_rdc.tsv")).unwrap();
+    partition_rdc_free_set_with_mode(
+        &mut media_ubq,
+        0.20,
+        199807,
+        RdcFreeStratification::ByPeptidePlane,
+    );
+
+    let xray_1pga = parse_pdb_first_model(root.join("data/pdb_refs/1pga.pdb")).unwrap();
+    let seq_gb1: Vec<String> = xray_1pga
+        .residues
+        .iter()
+        .map(|r| r.res_name.clone())
+        .collect();
+    let seq_ids_gb1: Vec<i32> = xray_1pga.residues.iter().map(|r| r.seq_id).collect();
+    let exp_adrs_gb1 = read_exp_noe_tsv(
+        root.join("data/fixtures/gb1_3gb1_exp_noe.tsv"),
+        &seq_gb1,
+        &seq_ids_gb1,
+    )
+    .unwrap();
+    let mut media_gb1 = read_rdc_tsv(root.join("data/fixtures/gb1_3gb1_rdc.tsv")).unwrap();
+    partition_rdc_free_set_with_mode(
+        &mut media_gb1,
+        0.20,
+        2026,
+        RdcFreeStratification::ByPeptidePlane,
+    );
+    let nh_only_media_gb1: Vec<RdcMediumSet> = media_gb1
+        .iter()
+        .map(|m| RdcMediumSet {
+            medium_id: m.medium_id.clone(),
+            restraints: m
+                .restraints
+                .iter()
+                .filter(|r| r.bond_type == RdcBondType::NH)
+                .cloned()
+                .collect(),
+        })
+        .collect();
+    let shifts_gb1 =
+        read_star_all_atoms(root.join("data/fixtures/gb1_bmr7280_shifts.str"), None).unwrap();
+    let fw_gb1 = HomologFirewallQuery {
+        query_pdb_ids: vec![
+            "1PGA".to_string(),
+            "3GB1".to_string(),
+            "1GB1".to_string(),
+            "2GB1".to_string(),
+            "2QMT".to_string(),
+        ],
+        query_bmrb_ids: vec!["bmr7280".to_string(), "bmr15156".to_string()],
+        query_uniprot_id: Some("P06654".to_string()),
+        query_family_id: Some("3.10.20.10".to_string()),
+        query_topology_id: Some("3.10.20".to_string()),
+        query_ca_coords: None,
+    };
+    let fw_dihs_gb1 = predict_torsions_with_firewall(&shifts_gb1, &fw_gb1).to_dihedral_restraints();
+
+    let next_idx = AtomicUsize::new(0);
+    let slots: Mutex<Vec<Option<SweepRow>>> = Mutex::new(vec![None; jobs.len()]);
+
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| loop {
+                let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                if idx >= jobs.len() {
+                    break;
+                }
+                let (target, seed) = jobs[idx];
+                let cfg = StructureCalcConfig {
+                    seed,
+                    ..StructureCalcConfig::default()
+                };
+                let row = match target {
+                    "1D3Z" => {
+                        let (rdc_res, Some(val)) = calculate_structure_with_rdcs_and_dihedrals(
+                            &shifts_1d3z,
+                            &peaks_1d3z,
+                            fw_dihs_1d3z.clone(),
+                            &media_1d3z,
+                            0.75,
+                            &cfg,
+                        )
+                        .unwrap() else {
+                            panic!("expected Some(RdcValidationSummary)");
+                        };
+                        let sv = validate_ensemble(
+                            &rdc_res.conformers,
+                            &rdc_res.final_adrs,
+                            &fw_dihs_1d3z,
+                            Some(&pdb_1d3z),
+                        );
+                        SweepRow {
+                            target,
+                            seed,
+                            q_work: val.overall_q_work,
+                            plane_q_free: val.overall_q_free,
+                            nh_q_free: None,
+                            low_e: sv.lowest_energy_rmsd_ordered_to_ref.unwrap(),
+                            mean_e: sv.mean_backbone_rmsd_ordered_to_ref.unwrap(),
+                            rama_pct: Some(
+                                sv.ramachandran_favored_pct + sv.ramachandran_allowed_pct,
+                            ),
+                        }
+                    }
+                    "1UBQ" => {
+                        let (rdc_ens, Some(val)) = fold_from_experimental_noes_and_rdcs(
+                            &seq_ubq,
+                            &seq_ids_ubq,
+                            &exp_adrs_ubq,
+                            &[],
+                            &media_ubq,
+                            0.75,
+                            &cfg,
+                        )
+                        .unwrap() else {
+                            panic!("expected Some(RdcValidationSummary)");
+                        };
+                        let low_e = backbone_rmsd_seq_range(
+                            &rdc_ens.conformers[0].chain,
+                            &xray_1ubq,
+                            1,
+                            71,
+                        );
+                        let mean_e = rdc_ens
+                            .conformers
+                            .iter()
+                            .map(|c| backbone_rmsd_seq_range(&c.chain, &xray_1ubq, 1, 71))
+                            .sum::<f64>()
+                            / (rdc_ens.conformers.len() as f64);
+                        SweepRow {
+                            target,
+                            seed,
+                            q_work: val.overall_q_work,
+                            plane_q_free: val.overall_q_free,
+                            nh_q_free: None,
+                            low_e,
+                            mean_e,
+                            rama_pct: None,
+                        }
+                    }
+                    "GB1" => {
+                        let (rdc_ens, Some(val)) = fold_from_experimental_noes_and_rdcs(
+                            &seq_gb1,
+                            &seq_ids_gb1,
+                            &exp_adrs_gb1,
+                            &fw_dihs_gb1,
+                            &media_gb1,
+                            0.75,
+                            &cfg,
+                        )
+                        .unwrap() else {
+                            panic!("expected Some(RdcValidationSummary)");
+                        };
+                        let nh_val = evaluate_rdc_validation(
+                            &rdc_ens.conformers[0].chain,
+                            &nh_only_media_gb1,
+                        )
+                        .unwrap();
+                        let low_e = backbone_rmsd_seq_range(
+                            &rdc_ens.conformers[0].chain,
+                            &xray_1pga,
+                            1,
+                            56,
+                        );
+                        let mean_e = rdc_ens
+                            .conformers
+                            .iter()
+                            .map(|c| backbone_rmsd_seq_range(&c.chain, &xray_1pga, 1, 56))
+                            .sum::<f64>()
+                            / (rdc_ens.conformers.len() as f64);
+                        SweepRow {
+                            target,
+                            seed,
+                            q_work: val.overall_q_work,
+                            plane_q_free: val.overall_q_free,
+                            nh_q_free: Some(nh_val.overall_q_free),
+                            low_e,
+                            mean_e,
+                            rama_pct: None,
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                slots.lock().unwrap()[idx] = Some(row);
+            });
+        }
+    });
+
+    let rows: Vec<SweepRow> = slots
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.expect("completed sweep row"))
+        .collect();
+
+    let min_max = |vals: &[f64]| -> (f64, f64) {
+        let lo = vals.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (lo, hi)
+    };
+
+    for &target in &["1D3Z", "1UBQ", "GB1"] {
+        let grp: Vec<&SweepRow> = rows.iter().filter(|r| r.target == target).collect();
+        assert_eq!(grp.len(), 5);
+        for r in &grp {
+            match target {
+                "1D3Z" => {
+                    let rama = r.rama_pct.unwrap();
+                    println!(
+                        "[5SEED 1D3Z seed={}] Qw={:.4} Qf={:.4} lowE={:.3} mean={:.3} Rama={:.1}%",
+                        r.seed, r.q_work, r.plane_q_free, r.low_e, r.mean_e, rama
+                    );
+                    assert!(
+                        r.q_work < 0.14 && r.plane_q_free < 0.34 && r.low_e < 0.80 && rama >= 94.0,
+                        "1D3Z seed={} failed gate: Qw={:.4} Qf={:.4} lowE={:.3} Rama={:.1}%",
+                        r.seed,
+                        r.q_work,
+                        r.plane_q_free,
+                        r.low_e,
+                        rama
+                    );
+                }
+                "1UBQ" => {
+                    println!(
+                        "[5SEED 1UBQ seed={}] Qw={:.4} Qf={:.4} lowE={:.3} mean={:.3}",
+                        r.seed, r.q_work, r.plane_q_free, r.low_e, r.mean_e
+                    );
+                    assert!(
+                        r.q_work < 0.22
+                            && r.plane_q_free < 0.65
+                            && r.low_e < 1.80
+                            && r.mean_e < 2.35,
+                        "1UBQ seed={} failed gate: Qw={:.4} Qf={:.4} lowE={:.3} mean={:.3}",
+                        r.seed,
+                        r.q_work,
+                        r.plane_q_free,
+                        r.low_e,
+                        r.mean_e
+                    );
+                }
+                "GB1" => {
+                    let nh_qf = r.nh_q_free.unwrap();
+                    println!(
+                        "[5SEED GB1 seed={}] Qw={:.4} Qf={:.4} NH_Qf={:.4} lowE={:.3} mean={:.3}",
+                        r.seed, r.q_work, r.plane_q_free, nh_qf, r.low_e, r.mean_e
+                    );
+                    assert!(
+                        r.q_work < 0.25
+                            && r.plane_q_free < 0.55
+                            && nh_qf < 0.35
+                            && r.low_e < 1.50
+                            && r.mean_e < 2.00,
+                        "GB1 seed={} failed gate: Qw={:.4} Qf={:.4} NH_Qf={:.4} lowE={:.3} mean={:.3}",
+                        r.seed,
+                        r.q_work,
+                        r.plane_q_free,
+                        nh_qf,
+                        r.low_e,
+                        r.mean_e
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let qw_v: Vec<f64> = grp.iter().map(|r| r.q_work).collect();
+        let qf_v: Vec<f64> = grp.iter().map(|r| r.plane_q_free).collect();
+        let le_v: Vec<f64> = grp.iter().map(|r| r.low_e).collect();
+        let me_v: Vec<f64> = grp.iter().map(|r| r.mean_e).collect();
+        let (qw_lo, qw_hi) = min_max(&qw_v);
+        let (qf_lo, qf_hi) = min_max(&qf_v);
+        let (le_lo, le_hi) = min_max(&le_v);
+        let (me_lo, me_hi) = min_max(&me_v);
+        match target {
+            "1D3Z" => {
+                let rm_v: Vec<f64> = grp.iter().map(|r| r.rama_pct.unwrap()).collect();
+                let (rm_lo, rm_hi) = min_max(&rm_v);
+                println!(
+                    "[5SEED_RANGE 1D3Z] Q_work={qw_lo:.4}..{qw_hi:.4} plane_Q_free={qf_lo:.4}..{qf_hi:.4} lowE={le_lo:.3}..{le_hi:.3} mean={me_lo:.3}..{me_hi:.3} Rama={rm_lo:.1}%..{rm_hi:.1}%"
+                );
+            }
+            "1UBQ" => {
+                println!(
+                    "[5SEED_RANGE 1UBQ] Q_work={qw_lo:.4}..{qw_hi:.4} plane_Q_free={qf_lo:.4}..{qf_hi:.4} lowE={le_lo:.3}..{le_hi:.3} mean={me_lo:.3}..{me_hi:.3}"
+                );
+            }
+            "GB1" => {
+                let nh_v: Vec<f64> = grp.iter().map(|r| r.nh_q_free.unwrap()).collect();
+                let (nh_lo, nh_hi) = min_max(&nh_v);
+                println!(
+                    "[5SEED_RANGE GB1] Q_work={qw_lo:.4}..{qw_hi:.4} plane_Q_free={qf_lo:.4}..{qf_hi:.4} 1D_NH_Q_free={nh_lo:.4}..{nh_hi:.4} lowE={le_lo:.3}..{le_hi:.3} mean={me_lo:.3}..{me_hi:.3}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
 }
