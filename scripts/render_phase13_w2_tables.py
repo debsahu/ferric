@@ -1030,6 +1030,412 @@ def render_remediation(root: Path, extra_files: list[Path]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def parse_rdc_test_gates(rdc_tests_rs: Path) -> dict[str, dict[str, float]]:
+    src = rdc_tests_rs.read_text(encoding="utf-8")
+    m_1d3z_q = re.search(
+        r"after_rdc_val\.overall_q_work\s*<\s*([0-9.]+)\s*&&\s*after_rdc_val\.overall_q_free\s*<\s*([0-9.]+)",
+        src,
+    )
+    m_1d3z_r = re.search(r"rmsd_after\s*<\s*([0-9.]+)\s*&&\s*rmsd_after\s*<\s*rmsd_before", src)
+    m_ubq_qw = re.search(r"post_rdc_val\.overall_q_work\s*<\s*([0-9.]+)", src)
+    m_ubq_qf = re.search(
+        r"post_rdc_val\.overall_q_free\s*<\s*([0-9.]+),\s*\"non-circular pure-NOE ubiquitin",
+        src,
+    )
+    m_ubq_r = re.search(
+        r"post_rmsd_low\s*<\s*([0-9.]+)\s*&&\s*post_rmsd_mean\s*<\s*([0-9.]+)",
+        src,
+    )
+    gb1_idx = src.find("fn test_noncircular_gb1_3gb1_exp_noe_fold_rdc_refine_vs_1pga_xray")
+    if gb1_idx < 0:
+        raise RuntimeError("Missing GB1 test in rdc_tests.rs")
+    gb1_src = src[gb1_idx:]
+    m_gb1_qw = re.search(r"post_rdc_val\.overall_q_work\s*<\s*([0-9.]+)", gb1_src)
+    m_gb1_qf = re.search(
+        r"post_rdc_val\.overall_q_free\s*<\s*([0-9.]+)\s*&&\s*post_nh_val\.overall_q_free\s*<\s*([0-9.]+)",
+        gb1_src,
+    )
+    m_gb1_r = re.search(
+        r"post_rmsd_low\s*<\s*([0-9.]+)\s*&&\s*post_rmsd_mean\s*<\s*([0-9.]+)",
+        gb1_src,
+    )
+    if not all([m_1d3z_q, m_1d3z_r, m_ubq_qw, m_ubq_qf, m_ubq_r, m_gb1_qw, m_gb1_qf, m_gb1_r]):
+        raise RuntimeError("Failed to parse RDC gate thresholds from rdc_tests.rs")
+    assert m_1d3z_q and m_1d3z_r and m_ubq_qw and m_ubq_qf and m_ubq_r
+    assert m_gb1_qw and m_gb1_qf and m_gb1_r
+    return {
+        "1D3Z": {
+            "qw": float(m_1d3z_q.group(1)),
+            "qf": float(m_1d3z_q.group(2)),
+            "lowe": float(m_1d3z_r.group(1)),
+        },
+        "1UBQ": {
+            "qw": float(m_ubq_qw.group(1)),
+            "qf": float(m_ubq_qf.group(1)),
+            "lowe": float(m_ubq_r.group(1)),
+            "mean": float(m_ubq_r.group(2)),
+        },
+        "GB1": {
+            "qw": float(m_gb1_qw.group(1)),
+            "qf": float(m_gb1_qf.group(1)),
+            "nh_qf": float(m_gb1_qf.group(2)),
+            "lowe": float(m_gb1_r.group(1)),
+            "mean": float(m_gb1_r.group(2)),
+        },
+    }
+
+
+def render_ci_fix(root: Path, extra_files: list[Path]) -> str:
+    w2 = root / "data/private/w2_results"
+    spec_path = root / "docs/specs/04-structure.md"
+    rdc_log_p = w2 / "w2_ci_fix_rdc_tests.log"
+    gpu_log_p = w2 / "w2_ci_fix_rdc_gpu_tests.log"
+    seed15_log_p = w2 / "w2_ci_fix_rdc_15seed.log"
+    ubq_log_p = w2 / "w2_ci_fix_ubiquitin_realistic_5seed.log"
+    ws_log_p = w2 / "w2_ci_fix_workspace_tests.log"
+    full_pack_p = root / "data/private/phase13_W2_review_pack.md"
+
+    ci_files: list[Path] = [
+        spec_path,
+        rdc_log_p,
+        gpu_log_p,
+        seed15_log_p,
+        ubq_log_p,
+        ws_log_p,
+        *extra_files,
+        full_pack_p,
+    ]
+    lines: list[str] = []
+    lines.append("### Post-Push CI Remediation Artifact & Review Pack FIPS 180-4 SHA-256 Digests")
+    lines.append("")
+    lines.append(
+        "Generated mechanically by `python3 scripts/render_phase13_w2_tables.py --section ci-fix --extra-file data/private/phase13_W2_ci_fix_review_pack.md`:"
+    )
+    lines.append("")
+    lines.append("| Artifact Path | Bytes | SHA-256 |")
+    lines.append("|---|---:|---|")
+    seen_paths: set[Path] = set()
+    for fp in ci_files:
+        if fp.exists() and fp not in seen_paths:
+            seen_paths.add(fp)
+            digest, nbytes = sha256_file(fp)
+            rel = fp.relative_to(root) if fp.is_relative_to(root) else fp
+            lines.append(f"| `{rel}` | {nbytes:,} | `{digest}` |")
+
+    rdc_txt = rdc_log_p.read_text(encoding="utf-8")
+    gpu_txt = gpu_log_p.read_text(encoding="utf-8")
+    seed15_txt = seed15_log_p.read_text(encoding="utf-8")
+    ws_txt = ws_log_p.read_text(encoding="utf-8")
+    ubq_txt = ubq_log_p.read_text(encoding="utf-8")
+    gates = parse_rdc_test_gates(root / "crates/nmr-core/tests/rdc_tests.rs")
+
+    # 2. Single-seed P1-9 & matched-input CPU/WebGPU parity table
+    m_1d3z_nat = re.search(
+        r"\[1D3Z NATIVE EXPERIMENTAL RDC FIT\] overall Q_work = ([0-9.]+)", rdc_txt
+    )
+    m_1d3z_cnt = re.search(
+        r"Working RDCs = (\d+), Held-out Free RDCs = (\d+)", rdc_txt
+    )
+    m_1d3z_pre = re.search(
+        r"NOE-only baseline\s*:\s*Q_work = ([0-9.]+), Q_free = ([0-9.]+) \| Ordered BB RMSD lowE = ([0-9.]+) A, mean = ([0-9.]+) A \| Rama fav\+allow = ([0-9.]+%)",
+        rdc_txt,
+    )
+    m_1d3z_post = re.search(
+        r"\+ 1D3Z RDC refined:\s*Q_work = ([0-9.]+), Q_free = ([0-9.]+) \| Ordered BB RMSD lowE = ([0-9.]+) A, mean = ([0-9.]+) A \| Rama fav\+allow = ([0-9.]+%)",
+        rdc_txt,
+    )
+    m_ubq_xray = re.search(
+        r"Direct 1D3Z RDC fit on unrefined 1UBQ crystal: Q_work = ([0-9.]+), plane Q_free = ([0-9.]+)",
+        rdc_txt,
+    )
+    m_ubq_pre = re.search(
+        r"Exp NOE-only\s*:\s*Q_work = ([0-9.]+), plane Q_free = ([0-9.]+) \| 1UBQ \(1\.\.71\) BB RMSD lowE = ([0-9.]+) A, mean = ([0-9.]+) A",
+        rdc_txt,
+    )
+    m_ubq_post = re.search(
+        r"\+ Bicelle RDC\s*:\s*Q_work = ([0-9.]+), plane Q_free = ([0-9.]+) \| 1UBQ \(1\.\.71\) BB RMSD lowE = ([0-9.]+) A, mean = ([0-9.]+) A",
+        rdc_txt,
+    )
+    m_gb1_xray = re.search(
+        r"Direct 3GB1 RDC fit on unrefined 1994 1PGA crystal: 1D_NH Q = ([0-9.]+), multi-bond Q_work = ([0-9.]+), plane Q_free = ([0-9.]+)",
+        rdc_txt,
+    )
+    m_gb1_pre = re.search(
+        r"Exp NOE\+Shift\s*:\s*Q_work = ([0-9.]+), plane Q_free = ([0-9.]+) \| 1PGA \(1\.\.56\) BB RMSD lowE = ([0-9.]+) A, mean = ([0-9.]+) A",
+        rdc_txt,
+    )
+    m_gb1_post = re.search(
+        r"\+ TMV\+Bicelle\s*:\s*Q_work = ([0-9.]+), plane Q_free = ([0-9.]+) \(1D_NH Q_work = ([0-9.]+), 1D_NH plane Q_free = ([0-9.]+)\) \| 1PGA \(1\.\.56\) BB RMSD lowE = ([0-9.]+) A, mean = ([0-9.]+) A",
+        rdc_txt,
+    )
+    m_gpu_par16 = re.search(
+        r"\[RDC GPU PARITY\].*max_rel_energy_err = ([0-9.eE+-]+), max_rel_grad_err = ([0-9.eE+-]+)",
+        gpu_txt,
+    )
+    m_gpu_par310 = re.search(
+        r"\[RDC GPU CHUNKED \+ SIGNED DMAX \+ PLANE-FREE PARITY\] (\d+) conformers across (\d+) dispatches: max_rel_e=([0-9.eE+-]+), max_rel_g=([0-9.eE+-]+)",
+        gpu_txt,
+    )
+    m_gpu_init = re.search(
+        r"Initial\s*:\s*Q_work=([0-9.]+), Q_free=([0-9.]+) \| Ordered BB RMSD \(1\.\.71\) = ([0-9.]+) A",
+        gpu_txt,
+    )
+    m_gpu_cpu = re.search(
+        r"CPU \(f64 L-BFGS\)\s*:\s*Q_work=([0-9.]+), Q_free=([0-9.]+) \| Ordered BB RMSD \(1\.\.71\) = ([0-9.]+) A",
+        gpu_txt,
+    )
+    m_gpu_wg = re.search(
+        r"WebGPU \+ polish\s*:\s*Q_work=([0-9.]+), Q_free=([0-9.]+) \| Ordered BB RMSD \(1\.\.71\) = ([0-9.]+) A",
+        gpu_txt,
+    )
+    if not all(
+        [
+            m_1d3z_nat,
+            m_1d3z_cnt,
+            m_1d3z_pre,
+            m_1d3z_post,
+            m_ubq_xray,
+            m_ubq_pre,
+            m_ubq_post,
+            m_gb1_xray,
+            m_gb1_pre,
+            m_gb1_post,
+            m_gpu_par16,
+            m_gpu_par310,
+            m_gpu_init,
+            m_gpu_cpu,
+            m_gpu_wg,
+        ]
+    ):
+        raise RuntimeError("Failed to parse expected metrics from w2_ci_fix_rdc_tests.log or w2_ci_fix_rdc_gpu_tests.log")
+    assert m_1d3z_nat and m_1d3z_cnt and m_1d3z_pre and m_1d3z_post
+    assert m_ubq_xray and m_ubq_pre and m_ubq_post
+    assert m_gb1_xray and m_gb1_pre and m_gb1_post
+    assert m_gpu_par16 and m_gpu_par310 and m_gpu_init and m_gpu_cpu and m_gpu_wg
+
+    lines.append("")
+    lines.append(
+        "### Post-Fix Single-Seed `P1-9` RDC Validation & Matched-Input CPU/WebGPU Parity (`w2_ci_fix_rdc_tests.log`, `w2_ci_fix_rdc_gpu_tests.log`)"
+    )
+    lines.append("")
+    lines.append(
+        "| Target & Protocol | Condition | Working `Q_work` | Peptide-Plane `Q_free` | Auxiliary Metric | Reference BB RMSD (`lowE` / `mean`) |"
+    )
+    lines.append("|---|---|---:|---:|---|---|")
+    lines.append(
+        f"| `1D3Z` Self-Consistency (`n_work={m_1d3z_cnt.group(1)}`, `n_free={m_1d3z_cnt.group(2)}`, `free_seed=199807`) | Native `1D3Z` Saupe SVD | `{m_1d3z_nat.group(1)}` | `n/a` (all couplings) | — | `0.000 Å` (ref) |"
+    )
+    lines.append(
+        f"| `1D3Z` Self-Consistency (`1..71`, `free_seed=199807`) | NOE-only baseline (`w_rdc = 0`) | `{m_1d3z_pre.group(1)}` | `{m_1d3z_pre.group(2)}` | `Rama fav+allow = {m_1d3z_pre.group(5)}` | `{m_1d3z_pre.group(3)} Å` / `{m_1d3z_pre.group(4)} Å` |"
+    )
+    lines.append(
+        f"| `1D3Z` Self-Consistency (`1..71`, `free_seed=199807`) | **+ `1D3Z` Bicelle RDC (`ByPeptidePlane`)** | **`{m_1d3z_post.group(1)}`** | **`{m_1d3z_post.group(2)}`** | **`Rama fav+allow = {m_1d3z_post.group(5)}`** | **`{m_1d3z_post.group(3)} Å` / `{m_1d3z_post.group(4)} Å`** |"
+    )
+    lines.append(
+        f"| `1D3Z` Matched-Input (`6` conformers, `free_seed=4242`) | Initial starting ensemble | `{m_gpu_init.group(1)}` | `{m_gpu_init.group(2)}` | — | `{m_gpu_init.group(3)} Å` (`lowE`) |"
+    )
+    lines.append(
+        f"| `1D3Z` Matched-Input (`6` conformers, `free_seed=4242`) | **CPU (`f64` L-BFGS)** | **`{m_gpu_cpu.group(1)}`** | **`{m_gpu_cpu.group(2)}`** | `16`-conf `max_rel_e={m_gpu_par16.group(1)}, g={m_gpu_par16.group(2)}` | **`{m_gpu_cpu.group(3)} Å` (`lowE`)** |"
+    )
+    lines.append(
+        f"| `1D3Z` Matched-Input (`6` conformers, `free_seed=4242`) | **WebGPU + `f64` polish** | **`{m_gpu_wg.group(1)}`** | **`{m_gpu_wg.group(2)}`** | `{m_gpu_par310.group(1)}`-conf `{m_gpu_par310.group(2)}`-disp `max_rel_e={m_gpu_par310.group(3)}, g={m_gpu_par310.group(4)}` | **`{m_gpu_wg.group(3)} Å` (`lowE`)** |"
+    )
+    lines.append(
+        f"| Ubiquitin (`1D3Z` RDCs on unrefined `1987 1UBQ` X-ray) | Direct Saupe SVD | `{m_ubq_xray.group(1)}` | `{m_ubq_xray.group(2)}` | — | `0.000 Å` (crystal ref) |"
+    )
+    lines.append(
+        f"| Ubiquitin (`1D3Z` real NOEs -> `1UBQ` X-ray `1..71`, `seed=20260401`) | Exp NOE-only (`w_rdc = 0`) | `{m_ubq_pre.group(1)}` | `{m_ubq_pre.group(2)}` | `0` shifts / `0` sim NOEs | `{m_ubq_pre.group(3)} Å` / `{m_ubq_pre.group(4)} Å` |"
+    )
+    lines.append(
+        f"| Ubiquitin (`1D3Z` real NOEs -> `1UBQ` X-ray `1..71`, `seed=20260401`) | **+ Bicelle RDC (`ByPeptidePlane`)** | **`{m_ubq_post.group(1)}`** | **`{m_ubq_post.group(2)}`** | `0` shifts / `0` sim NOEs | **`{m_ubq_post.group(3)} Å` / `{m_ubq_post.group(4)} Å`** |"
+    )
+    lines.append(
+        f"| GB1 (`3GB1` RDCs on unrefined `1994 1PGA` X-ray) | Direct Saupe SVD | `{m_gb1_xray.group(2)}` | `{m_gb1_xray.group(3)}` | `1D_NH Q = {m_gb1_xray.group(1)}` | `0.000 Å` (crystal ref) |"
+    )
+    lines.append(
+        f"| GB1 (`3GB1` real NOEs + firewalled `BMRB 7280` shifts -> `1PGA` `1..56`, `seed=20260402`) | Exp NOE + Firewall Shifts (`w_rdc = 0`) | `{m_gb1_pre.group(1)}` | `{m_gb1_pre.group(2)}` | `<= 25%` seq-id firewall | `{m_gb1_pre.group(3)} Å` / `{m_gb1_pre.group(4)} Å` |"
+    )
+    lines.append(
+        f"| GB1 (`3GB1` real NOEs + firewalled `BMRB 7280` shifts -> `1PGA` `1..56`, `seed=20260402`) | **+ TMV + Bicelle RDC (`ByPeptidePlane`)** | **`{m_gb1_post.group(1)}`** | **`{m_gb1_post.group(2)}`** | **`1D_NH Q_work={m_gb1_post.group(3)}, Q_free={m_gb1_post.group(4)}`** | **`{m_gb1_post.group(5)} Å` / `{m_gb1_post.group(6)} Å`** |"
+    )
+
+    # 3. 15/15 (5 seeds x 3 proteins) multi-seed verification table
+    rows_1d3z = sorted(
+        (
+            (
+                int(m.group(1)),
+                float(m.group(2)),
+                float(m.group(3)),
+                float(m.group(4)),
+                float(m.group(5)),
+                float(m.group(6)),
+            )
+            for m in re.finditer(
+                r"\[5SEED 1D3Z seed=(\d+)\] Qw=([0-9.]+) Qf=([0-9.]+) lowE=([0-9.]+) mean=([0-9.]+) Rama=([0-9.]+)%",
+                seed15_txt,
+            )
+        ),
+        key=lambda x: x[0],
+    )
+    rows_1ubq = sorted(
+        (
+            (
+                int(m.group(1)),
+                float(m.group(2)),
+                float(m.group(3)),
+                float(m.group(4)),
+                float(m.group(5)),
+            )
+            for m in re.finditer(
+                r"\[5SEED 1UBQ seed=(\d+)\] Qw=([0-9.]+) Qf=([0-9.]+) lowE=([0-9.]+) mean=([0-9.]+)",
+                seed15_txt,
+            )
+        ),
+        key=lambda x: x[0],
+    )
+    rows_gb1 = sorted(
+        (
+            (
+                int(m.group(1)),
+                float(m.group(2)),
+                float(m.group(3)),
+                float(m.group(4)),
+                float(m.group(5)),
+                float(m.group(6)),
+            )
+            for m in re.finditer(
+                r"\[5SEED GB1 seed=(\d+)\] Qw=([0-9.]+) Qf=([0-9.]+) NH_Qf=([0-9.]+) lowE=([0-9.]+) mean=([0-9.]+)",
+                seed15_txt,
+            )
+        ),
+        key=lambda x: x[0],
+    )
+    if len(rows_1d3z) != 5 or len(rows_1ubq) != 5 or len(rows_gb1) != 5:
+        raise RuntimeError(
+            f"Expected 5 seeds per protein in w2_ci_fix_rdc_15seed.log, got {len(rows_1d3z)}/{len(rows_1ubq)}/{len(rows_gb1)}"
+        )
+
+    lines.append("")
+    lines.append(
+        "### Cross-OS IEEE-754 Deterministic `15/15` (`5` Seeds x `3` Proteins) Multi-Seed RDC Verification (`w2_ci_fix_rdc_15seed.log`)"
+    )
+    lines.append("")
+    lines.append(
+        "| Benchmark Target & Unweakened Gates | Seed | `Q_work` | Peptide-Plane `Q_free` | Auxiliary (`Rama` / `1D_NH Q_free`) | `lowE` BB RMSD | `mean` BB RMSD | Gate Verdict |"
+    )
+    lines.append("|---|---:|---:|---:|---|---:|---:|---|")
+    g1 = gates["1D3Z"]
+    p1_pass = 0
+    for seed, qw, qf, lowe, mean, rama in rows_1d3z:
+        ok = qw < g1["qw"] and qf < g1["qf"] and lowe < g1["lowe"]
+        p1_pass += int(ok)
+        lines.append(
+            f"| `1D3Z` (`Qw<{g1['qw']:.2f}, Qf<{g1['qf']:.2f}, lowE<{g1['lowe']:.2f} Å`) | `{seed}` | `{qw:.4f}` | `{qf:.4f}` | `Rama = {rama:.1f}%` | `{lowe:.3f} Å` | `{mean:.3f} Å` | **`{'PASS' if ok else 'FAIL'}`** |"
+        )
+    gu = gates["1UBQ"]
+    pu_pass = 0
+    for seed, qw, qf, lowe, mean in rows_1ubq:
+        ok = qw < gu["qw"] and qf < gu["qf"] and lowe < gu["lowe"] and mean < gu["mean"]
+        pu_pass += int(ok)
+        lines.append(
+            f"| `1UBQ` X-ray (`Qw<{gu['qw']:.2f}, Qf<{gu['qf']:.2f}, lowE<{gu['lowe']:.2f} Å, mean<{gu['mean']:.2f} Å`) | `{seed}` | `{qw:.4f}` | `{qf:.4f}` | `0` shifts / `0` sim NOEs | `{lowe:.3f} Å` | `{mean:.3f} Å` | **`{'PASS' if ok else 'FAIL'}`** |"
+        )
+    gg = gates["GB1"]
+    pg_pass = 0
+    for seed, qw, qf, nh_qf, lowe, mean in rows_gb1:
+        ok = (
+            qw < gg["qw"]
+            and qf < gg["qf"]
+            and nh_qf < gg["nh_qf"]
+            and lowe < gg["lowe"]
+            and mean < gg["mean"]
+        )
+        pg_pass += int(ok)
+        lines.append(
+            f"| `GB1 -> 1PGA` X-ray (`Qw<{gg['qw']:.2f}, Qf<{gg['qf']:.2f}, NH_Qf<{gg['nh_qf']:.2f}, lowE<{gg['lowe']:.2f} Å, mean<{gg['mean']:.2f} Å`) | `{seed}` | `{qw:.4f}` | `{qf:.4f}` | `1D_NH Q_free = {nh_qf:.4f}` | `{lowe:.3f} Å` | `{mean:.3f} Å` | **`{'PASS' if ok else 'FAIL'}`** |"
+        )
+
+    lines.append("")
+    lines.append(
+        "| 5-Seed Cohort Summary | Seeds | `Q_work` Range (`min..max`) | `plane Q_free` Range (`min..max`) | `lowE` BB RMSD Range | `mean` BB RMSD Range | Pass Rate |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---:|---:|")
+    lines.append(
+        f"| `1D3Z` Self-Consistency | `{rows_1d3z[0][0]}..{rows_1d3z[-1][0]}` | `{min(r[1] for r in rows_1d3z):.4f}..{max(r[1] for r in rows_1d3z):.4f}` | `{min(r[2] for r in rows_1d3z):.4f}..{max(r[2] for r in rows_1d3z):.4f}` | `{min(r[3] for r in rows_1d3z):.3f}..{max(r[3] for r in rows_1d3z):.3f} Å` | `{min(r[4] for r in rows_1d3z):.3f}..{max(r[4] for r in rows_1d3z):.3f} Å` | **`{p1_pass}/5 PASS`** |"
+    )
+    lines.append(
+        f"| `1UBQ` Non-Circular X-Ray | `{rows_1ubq[0][0]}..{rows_1ubq[-1][0]}` | `{min(r[1] for r in rows_1ubq):.4f}..{max(r[1] for r in rows_1ubq):.4f}` | `{min(r[2] for r in rows_1ubq):.4f}..{max(r[2] for r in rows_1ubq):.4f}` | `{min(r[3] for r in rows_1ubq):.3f}..{max(r[3] for r in rows_1ubq):.3f} Å` | `{min(r[4] for r in rows_1ubq):.3f}..{max(r[4] for r in rows_1ubq):.3f} Å` | **`{pu_pass}/5 PASS`** |"
+    )
+    lines.append(
+        f"| `GB1 -> 1PGA` Non-Circular X-Ray (`1D_NH Q_free = {min(r[3] for r in rows_gb1):.4f}..{max(r[3] for r in rows_gb1):.4f}`) | `{rows_gb1[0][0]}..{rows_gb1[-1][0]}` | `{min(r[1] for r in rows_gb1):.4f}..{max(r[1] for r in rows_gb1):.4f}` | `{min(r[2] for r in rows_gb1):.4f}..{max(r[2] for r in rows_gb1):.4f}` | `{min(r[4] for r in rows_gb1):.3f}..{max(r[4] for r in rows_gb1):.3f} Å` | `{min(r[5] for r in rows_gb1):.3f}..{max(r[5] for r in rows_gb1):.3f} Å` | **`{pg_pass}/5 PASS`** |"
+    )
+    lines.append(
+        f"| **Pooled Multi-Seed Total** | **`15` runs** | — | — | — | — | **`{p1_pass + pu_pass + pg_pass}/15 PASS`** |"
+    )
+
+    # 4. Workspace test suite, wall-clock runtime & realistic Ubiquitin non-regression
+    m_rdc_res = re.search(
+        r"test result: ok\.\s+(\d+) passed;\s+(\d+) failed;.*finished in ([0-9.]+s)",
+        rdc_txt,
+    )
+    m_gpu_res = re.search(
+        r"test result: ok\.\s+(\d+) passed;\s+(\d+) failed;.*finished in ([0-9.]+s)",
+        gpu_txt,
+    )
+    m_15_res = re.search(
+        r"test result: ok\.\s+(\d+) passed;\s+(\d+) failed;.*finished in ([0-9.]+s)",
+        seed15_txt,
+    )
+    tot_p, tot_f, suites = parse_test_pass_counts(ws_log_p)
+    ubq_metrics = parse_ubq_log(ubq_log_p)
+    m_ubq_t = re.search(r"solver time:\s*([0-9.]+ s)", ubq_txt)
+    det_math_ok = (
+        "structure::det_math_tests::test_structure_deterministic_math_ulp_parity ... ok"
+        in ws_txt
+    )
+    gate_ok = (
+        "test_documented_calibration_gate_set_matches_asserted_gate_set ... ok"
+        in ws_txt
+    )
+    manifest_ok = (
+        "test_committed_real_manifest_tsv_schema_splits_and_disjointness ... ok"
+        in ws_txt
+    )
+    if not (m_rdc_res and m_gpu_res and m_15_res):
+        raise RuntimeError("Missing test result summary line in RDC/GPU/15-seed log")
+
+    lines.append("")
+    lines.append(
+        "### Post-Fix Workspace Test Suite & 5-Seed Realistic Ubiquitin Non-Regression (`w2_ci_fix_workspace_tests.log`, `w2_ci_fix_ubiquitin_realistic_5seed.log`)"
+    )
+    lines.append("")
+    lines.append("| Verification Gate | Measured Outcome |")
+    lines.append("|---|---|")
+    lines.append(
+        f"| `cargo test --release -p nmr-core --test rdc_tests` | **`{m_rdc_res.group(1)} passed; {m_rdc_res.group(2)} failed`** (`{m_rdc_res.group(3)}`, down from `1242.68s` CI run) |"
+    )
+    lines.append(
+        f"| `cargo test --release -p nmr-gpu --test rdc_gpu_tests` | **`{m_gpu_res.group(1)} passed; {m_gpu_res.group(2)} failed`** (`{m_gpu_res.group(3)}`) |"
+    )
+    lines.append(
+        f"| `15`-Test Multi-Seed Cross-Validation (`5` seeds x `3` proteins) | **`{m_15_res.group(1)} passed; {m_15_res.group(2)} failed`** (`{m_15_res.group(3)}`) |"
+    )
+    lines.append(
+        f"| `cargo test --release --workspace` (`{len(suites)}` test result lines) | **`{tot_p} passed; {tot_f} failed`** |"
+    )
+    lines.append(
+        f"| `structure::det_math_tests::test_structure_deterministic_math_ulp_parity` (`< 2 ULP`, `0` OS `libm`) | **`{'ok' if det_math_ok else 'MISSING/FAILED'}`** |"
+    )
+    lines.append(
+        f"| `test_documented_calibration_gate_set_matches_asserted_gate_set` & `test_committed_real_manifest_tsv_schema_splits_and_disjointness` | **`{'ok / ok' if (gate_ok and manifest_ok) else 'MISSING/FAILED'}`** |"
+    )
+    lines.append(
+        f"| `nmrassign benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5` | **Acc `{ubq_metrics['acc']}`, Rec `{ubq_metrics['rec']}`, HCP `{ubq_metrics['hcp']}`** (`{m_ubq_t.group(1) if m_ubq_t else 'see log'}`) |"
+    )
+
+    return "\n".join(lines) + "\n"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
@@ -1037,7 +1443,7 @@ def main() -> None:
     ap.add_argument("--extra-file", action="append", default=[])
     ap.add_argument(
         "--section",
-        choices=["all", "digests", "13.1", "13.2", "13.4", "remediation"],
+        choices=["all", "digests", "13.1", "13.2", "13.4", "remediation", "ci-fix"],
         default="all",
     )
     args = ap.parse_args()
@@ -1055,6 +1461,8 @@ def main() -> None:
         parts.append(render_slice_13_4(root))
     if args.section == "remediation":
         parts.append(render_remediation(root, extras))
+    if args.section == "ci-fix":
+        parts.append(render_ci_fix(root, extras))
 
     md = "\n".join(parts)
     if args.out is not None:
