@@ -1056,14 +1056,14 @@ pub fn decompose_saupe_matrix(s_mat: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3],
     // Convention: `rot = Rz(alpha) * Ry(beta) * Rz(gamma)` (`s_mat = rot * diag(principal_s) * rot^T`),
     // where `beta in [0, 180]`, `alpha in [0, 360)`, `gamma in [0, 360)`.
     let cos_beta = rot[2][2].clamp(-1.0, 1.0);
-    let beta = cos_beta.acos();
-    let sin_beta = beta.sin();
+    let beta = crate::structure::det_acos(cos_beta);
+    let sin_beta = crate::structure::det_sin(beta);
     let (alpha, gamma) = if sin_beta > 1e-8 {
-        let a_rad = rot[1][2].atan2(rot[0][2]);
-        let g_rad = rot[2][1].atan2(-rot[2][0]);
+        let a_rad = crate::structure::det_atan2(rot[1][2], rot[0][2]);
+        let g_rad = crate::structure::det_atan2(rot[2][1], -rot[2][0]);
         (a_rad, g_rad)
     } else {
-        let a_rad = rot[1][0].atan2(rot[0][0]);
+        let a_rad = crate::structure::det_atan2(rot[1][0], rot[0][0]);
         (a_rad, 0.0)
     };
     let wrap_360 = |deg: f64| -> f64 {
@@ -1099,9 +1099,9 @@ pub fn saupe_matrix_from_pas(
     let syy = -0.5 * szz * (1.0 + 1.5 * r);
     let diag = [sxx, syy, szz];
 
-    let (sa, ca) = euler_zyz_deg[0].to_radians().sin_cos();
-    let (sb, cb) = euler_zyz_deg[1].to_radians().sin_cos();
-    let (sg, cg) = euler_zyz_deg[2].to_radians().sin_cos();
+    let (sa, ca) = crate::structure::det_sin_cos(euler_zyz_deg[0].to_radians());
+    let (sb, cb) = crate::structure::det_sin_cos(euler_zyz_deg[1].to_radians());
+    let (sg, cg) = crate::structure::det_sin_cos(euler_zyz_deg[2].to_radians());
 
     let rot = [
         [ca * cb * cg - sa * sg, -ca * cb * sg - sa * cg, ca * sb],
@@ -1357,6 +1357,395 @@ pub fn evaluate_rdc_validation(
     })
 }
 
+/// Pre-resolved atom slot on a `PdbResidue` for zero-allocation inner-loop RDC evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RdcAtomSlot {
+    N,
+    H,
+    CA,
+    HA,
+    HA2,
+    HA3,
+    C,
+    O,
+    CB,
+}
+
+impl RdcAtomSlot {
+    #[inline]
+    fn parse_for_residue(res: &PdbResidue, atom_name: &str) -> Option<(Self, usize)> {
+        let norm = normalize_rdc_atom_name(atom_name);
+        let is_gly = res.res_name.eq_ignore_ascii_case("GLY");
+        match norm {
+            "N" => Some((Self::N, 0)),
+            "H" => res.h.map(|_| (Self::H, 0)),
+            "CA" => Some((Self::CA, 0)),
+            "HA" => (!is_gly).then_some((Self::HA, 1)),
+            "HA2" => (is_gly && res.ha2.is_some()).then_some((Self::HA2, 1)),
+            "HA3" => (is_gly && res.ha3.is_some()).then_some((Self::HA3, 1)),
+            "C" => Some((Self::C, 1)),
+            "O" => Some((Self::O, 2)),
+            "CB" => res.cb.map(|_| (Self::CB, 1)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn coord(self, res: &PdbResidue) -> Option<Vec3> {
+        match self {
+            Self::N => Some(res.n),
+            Self::H => res.h,
+            Self::CA => Some(res.ca),
+            Self::HA => Some(res.ha),
+            Self::HA2 => res.ha2,
+            Self::HA3 => res.ha3,
+            Self::C => Some(res.c),
+            Self::O => Some(res.o),
+            Self::CB => res.cb,
+        }
+    }
+}
+
+/// Pre-indexed working (`!is_free`) RDC restraint for allocation-free L-BFGS / Langevin force steps.
+/// Held-out `is_free` restraints are physically excluded at construction so optimization kernels
+/// never hold or inspect cross-validation data.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreparedWorkRdc {
+    pub res_a: usize,
+    pub seg_a: usize,
+    pub slot_a: RdcAtomSlot,
+    pub res_b: usize,
+    pub seg_b: usize,
+    pub slot_b: RdcAtomSlot,
+    pub d_obs_hz: f64,
+    pub inv_sigma: f64,
+    pub inv_sigma2: f64,
+    pub d_max_hz: f64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedRdcWorkMedium {
+    pub restraints: Vec<PreparedWorkRdc>,
+}
+
+/// Pre-resolve strictly working (`!is_free`) RDC restraints against `chain` residue ordering once
+/// prior to torsion-space refinement.
+pub(crate) fn prepare_rdc_work_media(
+    chain: &PdbChain,
+    media: &[RdcMediumSet],
+) -> Vec<PreparedRdcWorkMedium> {
+    let mut seq_to_idx = BTreeMap::new();
+    for (idx, r) in chain.residues.iter().enumerate() {
+        seq_to_idx.insert(r.seq_id, idx);
+    }
+
+    let mut out = Vec::with_capacity(media.len());
+    for m in media {
+        let mut work = Vec::with_capacity(m.restraints.len());
+        for r in &m.restraints {
+            if r.is_free {
+                continue;
+            }
+            if r.validate().is_err() {
+                continue;
+            }
+            let (Some(&res_a), Some(&res_b)) =
+                (seq_to_idx.get(&r.seq_id_1), seq_to_idx.get(&r.seq_id_2))
+            else {
+                continue;
+            };
+            let (Some((slot_a, off_a)), Some((slot_b, off_b))) = (
+                RdcAtomSlot::parse_for_residue(&chain.residues[res_a], &r.atom_name_1),
+                RdcAtomSlot::parse_for_residue(&chain.residues[res_b], &r.atom_name_2),
+            ) else {
+                continue;
+            };
+            let inv_sigma = 1.0 / r.sigma_hz;
+            work.push(PreparedWorkRdc {
+                res_a,
+                seg_a: 2 * res_a + off_a,
+                slot_a,
+                res_b,
+                seg_b: 2 * res_b + off_b,
+                slot_b,
+                d_obs_hz: r.d_obs_hz,
+                inv_sigma,
+                inv_sigma2: inv_sigma * inv_sigma,
+                d_max_hz: r.d_max_hz,
+            });
+        }
+        out.push(PreparedRdcWorkMedium { restraints: work });
+    }
+    out
+}
+
+/// Stack-only streaming Givens QR accumulator `Q^T [A | b] = [R | z]` for `(n_work x 5)` Losonczi
+/// design matrices, followed by 5x5 one-sided Hestenes-Jacobi SVD (`O(1)` stack memory, zero heap
+/// allocations, full IEEE-754 `f64` singular-value dynamic range without forming `A^T A`).
+#[derive(Clone, Copy, Debug)]
+struct GivensQr5 {
+    r: [[f64; 5]; 5],
+    z: [f64; 5],
+    n_rows: usize,
+}
+
+impl GivensQr5 {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            r: [[0.0; 5]; 5],
+            z: [0.0; 5],
+            n_rows: 0,
+        }
+    }
+
+    #[inline]
+    fn push_row(&mut self, mut x: [f64; 5], mut beta: f64) {
+        for j in 0..5 {
+            let b_val = x[j];
+            if b_val == 0.0 {
+                continue;
+            }
+            let a_val = self.r[j][j];
+            let scale = a_val.abs().max(b_val.abs());
+            if scale <= 1e-300 {
+                continue;
+            }
+            let na = a_val / scale;
+            let nb = b_val / scale;
+            let r_norm = scale * (na * na + nb * nb).sqrt();
+            let c = a_val / r_norm;
+            let s = b_val / r_norm;
+            self.r[j][j] = r_norm;
+            x[j] = 0.0;
+            for (r_jc, x_c) in self.r[j][(j + 1)..5]
+                .iter_mut()
+                .zip(x[(j + 1)..5].iter_mut())
+            {
+                let r_old = *r_jc;
+                let x_old = *x_c;
+                *r_jc = c * r_old + s * x_old;
+                *x_c = -s * r_old + c * x_old;
+            }
+            let z_j = self.z[j];
+            self.z[j] = c * z_j + s * beta;
+            beta = -s * z_j + c * beta;
+        }
+        self.n_rows += 1;
+    }
+
+    #[inline]
+    fn solve_saupe_matrix(&self) -> Option<[[f64; 3]; 3]> {
+        if self.n_rows < 6 {
+            return None;
+        }
+        let mut w = self.r;
+        let mut v = [[0.0f64; 5]; 5];
+        for (i, row) in v.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+
+        for _sweep in 0..45 {
+            let mut max_off = 0.0f64;
+            for p in 0..4 {
+                for q in (p + 1)..5 {
+                    let mut app = 0.0f64;
+                    let mut aqq = 0.0f64;
+                    let mut apq = 0.0f64;
+                    for row in &w {
+                        app += row[p] * row[p];
+                        aqq += row[q] * row[q];
+                        apq += row[p] * row[q];
+                    }
+                    let scale = (app * aqq).sqrt();
+                    if scale <= 1e-300 {
+                        continue;
+                    }
+                    let rel = apq.abs() / scale;
+                    if rel > max_off {
+                        max_off = rel;
+                    }
+                    if rel <= 1e-15 {
+                        continue;
+                    }
+                    let zeta = (aqq - app) / (2.0 * apq);
+                    let t = if zeta >= 0.0 {
+                        1.0 / (zeta + (1.0 + zeta * zeta).sqrt())
+                    } else {
+                        -1.0 / (-zeta + (1.0 + zeta * zeta).sqrt())
+                    };
+                    let c = 1.0 / (1.0 + t * t).sqrt();
+                    let s = c * t;
+                    for row in &mut w {
+                        let wp = row[p];
+                        let wq = row[q];
+                        row[p] = c * wp - s * wq;
+                        row[q] = s * wp + c * wq;
+                    }
+                    for row in &mut v {
+                        let vp = row[p];
+                        let vq = row[q];
+                        row[p] = c * vp - s * vq;
+                        row[q] = s * vp + c * vq;
+                    }
+                }
+            }
+            if max_off <= 1e-15 {
+                break;
+            }
+        }
+
+        let mut sigma = [0.0f64; 5];
+        let mut s_max = 0.0f64;
+        let mut s_min = f64::INFINITY;
+        for (j, sig_j) in sigma.iter_mut().enumerate() {
+            let mut n2 = 0.0f64;
+            for row in &w {
+                n2 += row[j] * row[j];
+            }
+            let sj = n2.sqrt();
+            *sig_j = sj;
+            if sj > s_max {
+                s_max = sj;
+            }
+            if sj < s_min {
+                s_min = sj;
+            }
+        }
+        if !s_max.is_finite() || !s_min.is_finite() || s_max <= 1e-30 || s_min <= 0.0 {
+            return None;
+        }
+        let cond = s_max / s_min;
+        if !cond.is_finite() || cond > MAX_SAUPE_SVD_COND {
+            return None;
+        }
+
+        // Columns of W satisfy w_col_j = sigma_j * u_col_j, so (U^T z)_j / sigma_j = (W^T z)_j / sigma_j^2
+        let mut scaled_ut_z = [0.0f64; 5];
+        for j in 0..5 {
+            let mut wt_z = 0.0f64;
+            for (w_row, &z_r) in w.iter().zip(self.z.iter()) {
+                wt_z += w_row[j] * z_r;
+            }
+            scaled_ut_z[j] = wt_z / (sigma[j] * sigma[j]);
+        }
+
+        let mut s_5 = [0.0f64; 5];
+        for i in 0..5 {
+            let mut acc = 0.0f64;
+            for j in 0..5 {
+                acc += v[i][j] * scaled_ut_z[j];
+            }
+            s_5[i] = acc;
+        }
+
+        let syy = s_5[0];
+        let szz = s_5[1];
+        let sxy = s_5[2];
+        let sxz = s_5[3];
+        let syz = s_5[4];
+        let sxx = -(syy + szz);
+        Some([[sxx, sxy, sxz], [sxy, syy, syz], [sxz, syz, szz]])
+    }
+}
+
+/// Zero-allocation inner-loop variable-projection RDC energy and Cartesian force accumulation
+/// over pre-resolved working (`!is_free`) restraints.
+pub(crate) fn accumulate_prepared_rdc_energy_and_forces<F>(
+    chain: &PdbChain,
+    prepared_media: &[PreparedRdcWorkMedium],
+    w_rdc: f64,
+    mut add_atom_grad: F,
+) -> f64
+where
+    F: FnMut(usize, Vec3, Vec3),
+{
+    if w_rdc <= 0.0 || prepared_media.is_empty() || chain.residues.is_empty() {
+        return 0.0;
+    }
+
+    let mut total_e = 0.0f64;
+    for m in prepared_media {
+        if m.restraints.len() < 6 {
+            continue;
+        }
+        let mut qr = GivensQr5::new();
+        let mut bad_geom = false;
+        for r in &m.restraints {
+            let (Some(pa), Some(pb)) = (
+                r.slot_a.coord(&chain.residues[r.res_a]),
+                r.slot_b.coord(&chain.residues[r.res_b]),
+            ) else {
+                continue;
+            };
+            let dv = v_sub(pb, pa);
+            let dist = v_norm(dv);
+            if !dist.is_finite() || dist < 1e-6 {
+                bad_geom = true;
+                break;
+            }
+            let inv_d = 1.0 / dist;
+            let ux = dv[0] * inv_d;
+            let uy = dv[1] * inv_d;
+            let uz = dv[2] * inv_d;
+            let w_scale = r.d_max_hz * r.inv_sigma;
+            qr.push_row(
+                [
+                    w_scale * (uy * uy - ux * ux),
+                    w_scale * (uz * uz - ux * ux),
+                    w_scale * (2.0 * ux * uy),
+                    w_scale * (2.0 * ux * uz),
+                    w_scale * (2.0 * uy * uz),
+                ],
+                r.d_obs_hz * r.inv_sigma,
+            );
+        }
+        if bad_geom {
+            continue;
+        }
+        let Some(s) = qr.solve_saupe_matrix() else {
+            continue;
+        };
+
+        for r in &m.restraints {
+            let (Some(pa), Some(pb)) = (
+                r.slot_a.coord(&chain.residues[r.res_a]),
+                r.slot_b.coord(&chain.residues[r.res_b]),
+            ) else {
+                continue;
+            };
+            let v = v_sub(pb, pa);
+            let dist = v_norm(v);
+            if dist < 1e-6 {
+                continue;
+            }
+            let inv_r = 1.0 / dist;
+            let u = v_scale(v, inv_r);
+            let su = [
+                s[0][0] * u[0] + s[0][1] * u[1] + s[0][2] * u[2],
+                s[1][0] * u[0] + s[1][1] * u[1] + s[1][2] * u[2],
+                s[2][0] * u[0] + s[2][1] * u[1] + s[2][2] * u[2],
+            ];
+            let ut_s_u = v_dot(u, su);
+            let d_calc = r.d_max_hz * ut_s_u;
+            let resid = d_calc - r.d_obs_hz;
+
+            total_e += 0.5 * w_rdc * resid * resid * r.inv_sigma2;
+
+            let pref = w_rdc * resid * r.inv_sigma2 * (2.0 * r.d_max_hz * inv_r);
+            let grad_pb = [
+                pref * (su[0] - ut_s_u * u[0]),
+                pref * (su[1] - ut_s_u * u[1]),
+                pref * (su[2] - ut_s_u * u[2]),
+            ];
+            add_atom_grad(r.seg_b, pb, grad_pb);
+            add_atom_grad(r.seg_a, pa, [-grad_pb[0], -grad_pb[1], -grad_pb[2]]);
+        }
+    }
+
+    total_e
+}
+
 /// Evaluate the variable-projection harmonic RDC energy across working (`!is_free`) restraints
 /// and accumulate exact Envelope-Theorem Cartesian gradients into `add_atom_grad(seg, pos, force)`.
 ///
@@ -1384,10 +1773,49 @@ where
     let mut total_e = 0.0f64;
 
     for m in media {
-        let Ok((fit, _)) = fit_saupe_tensor_with_points(chain, m) else {
+        let mut qr = GivensQr5::new();
+        let mut bad_medium = false;
+        for r in &m.restraints {
+            if r.validate().is_err() {
+                bad_medium = true;
+                break;
+            }
+            let (Some((_, _, p1)), Some((_, _, p2))) = (
+                resolve_chain_rdc_atom(chain, &seq_to_idx, r.seq_id_1, &r.atom_name_1),
+                resolve_chain_rdc_atom(chain, &seq_to_idx, r.seq_id_2, &r.atom_name_2),
+            ) else {
+                continue;
+            };
+            let dv = v_sub(p2, p1);
+            let dist = v_norm(dv);
+            if !dist.is_finite() || dist < 1e-6 {
+                bad_medium = true;
+                break;
+            }
+            if !r.is_free {
+                let inv_d = 1.0 / dist;
+                let ux = dv[0] * inv_d;
+                let uy = dv[1] * inv_d;
+                let uz = dv[2] * inv_d;
+                let w_scale = r.d_max_hz / r.sigma_hz;
+                qr.push_row(
+                    [
+                        w_scale * (uy * uy - ux * ux),
+                        w_scale * (uz * uz - ux * ux),
+                        w_scale * (2.0 * ux * uy),
+                        w_scale * (2.0 * ux * uz),
+                        w_scale * (2.0 * uy * uz),
+                    ],
+                    r.d_obs_hz / r.sigma_hz,
+                );
+            }
+        }
+        if bad_medium {
+            continue;
+        }
+        let Some(s) = qr.solve_saupe_matrix() else {
             continue;
         };
-        let s = &fit.s_matrix;
 
         for r in &m.restraints {
             if r.is_free {
