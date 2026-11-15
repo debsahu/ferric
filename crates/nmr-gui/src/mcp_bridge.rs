@@ -972,20 +972,61 @@ pub fn constant_time_eq(expected: &[u8], provided: &[u8]) -> bool {
 fn fill_os_entropy(raw: &mut [u8; 32]) -> bool {
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         use std::io::Read as _;
-        if f.read_exact(raw).is_ok() {
+        if f.read_exact(raw).is_ok() && raw.iter().any(|&b| b != 0) {
             return true;
         }
     }
     false
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn fill_os_entropy(raw: &mut [u8; 32]) -> bool {
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    #[link(name = "bcrypt")]
+    #[allow(non_snake_case)]
+    extern "system" {
+        fn BCryptGenRandom(
+            hAlgorithm: *mut core::ffi::c_void,
+            pbBuffer: *mut u8,
+            cbBuffer: u32,
+            dwFlags: u32,
+        ) -> i32;
+    }
+    // SAFETY: `pbBuffer` points to a valid, mutable 32-byte stack array (`cbBuffer = 32`),
+    // `hAlgorithm` is NULL as required when `BCRYPT_USE_SYSTEM_PREFERRED_RNG` (`0x00000002`)
+    // is passed per the Windows CNG `BCryptGenRandom` contract, and `status == 0`
+    // (`STATUS_SUCCESS`) plus non-zero output bytes are verified before returning `true`.
+    let status = unsafe {
+        BCryptGenRandom(
+            core::ptr::null_mut(),
+            raw.as_mut_ptr(),
+            raw.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    status == 0 && raw.iter().any(|&b| b != 0)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn fill_os_entropy(_raw: &mut [u8; 32]) -> bool {
     false
 }
 
-/// Generate a fresh 256-bit (`nmr_mcp_<64-hex>`) loopback bearer token from OS entropy
-/// (`/dev/urandom` on Unix, with multi-round `RandomState` SipHash mixer fallback on `wasm32`).
+/// Generate a fresh `nmr_mcp_<64-hex>` loopback bearer token (`72` ASCII chars total):
+///
+/// - **Native Unix (`#[cfg(unix)]`)**: draws 256 bits (`32` non-zero-verified bytes) from the
+///   kernel CSPRNG via `/dev/urandom`.
+/// - **Native Windows (`#[cfg(windows)]`)**: draws 256 bits (`32` non-zero-verified bytes) from
+///   the Windows CNG system CSPRNG via `BCryptGenRandom(..., BCRYPT_USE_SYSTEM_PREFERRED_RNG)`
+///   (`bcrypt.dll`, checking `NTSTATUS == 0` and non-zero output bytes).
+/// - **Non-Unix / non-Windows targets (`#[cfg(not(any(unix, windows)))]`, e.g. `wasm32`, or if
+///   an OS CSPRNG read fails)**: mixes four `std::collections::hash_map::RandomState` SipHash
+///   hashers with a monotonic `AtomicU64` sequence counter. **Entropy ceiling**: `RandomState`
+///   derives from `std`'s per-thread 128-bit seed (or deterministic/address-space seed on bare
+///   `wasm32-unknown-unknown` without host OS randomness), so this fallback provides at most the
+///   entropy of `std`'s `RandomState` initialization (`<= 128` bits rather than 256 independent
+///   CSPRNG bits) and exists only for non-networked UI state on targets such as `wasm32` where
+///   `start_bridge` already disables TCP socket binding.
 pub fn generate_bearer_token() -> String {
     let mut raw = [0u8; 32];
     if !fill_os_entropy(&mut raw) {
@@ -2791,8 +2832,20 @@ mod tests {
         assert!(constant_time_eq(b"", b""));
 
         let tok = generate_bearer_token();
+        let tok2 = generate_bearer_token();
         assert!(tok.starts_with("nmr_mcp_"));
         assert_eq!(tok.len(), 72);
+        assert_ne!(tok, tok2);
+        let hex_tail = &tok["nmr_mcp_".len()..];
+        assert_eq!(hex_tail.len(), 64);
+        assert!(hex_tail.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
+        assert_ne!(hex_tail, "0".repeat(64));
+        #[cfg(any(unix, windows))]
+        {
+            let mut probe = [0u8; 32];
+            assert!(fill_os_entropy(&mut probe));
+            assert!(probe.iter().any(|&b| b != 0));
+        }
         let masked = mask_bearer_token(&tok);
         assert!(masked.contains("••••••••••••"));
         assert!(!masked.contains(&tok[16..48]));

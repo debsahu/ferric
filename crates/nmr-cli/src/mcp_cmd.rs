@@ -22,6 +22,81 @@ use nmr_core::mcp::{
     McpServer,
 };
 
+/// Minimum required trimmed byte/character length for a user-supplied HTTP `Bearer` token
+/// (`nmrassign mcp --transport http` and `nmrassign mcp-config --bridge-port`).
+pub const MIN_HTTP_BEARER_TOKEN_LEN: usize = 32;
+
+#[cfg(unix)]
+fn fill_os_csprng_bytes(raw: &mut [u8; 32]) -> bool {
+    if let Ok(mut f) = fs::File::open("/dev/urandom") {
+        use std::io::Read as _;
+        if f.read_exact(raw).is_ok() && raw.iter().any(|&b| b != 0) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn fill_os_csprng_bytes(raw: &mut [u8; 32]) -> bool {
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    #[link(name = "bcrypt")]
+    #[allow(non_snake_case)]
+    extern "system" {
+        fn BCryptGenRandom(
+            hAlgorithm: *mut core::ffi::c_void,
+            pbBuffer: *mut u8,
+            cbBuffer: u32,
+            dwFlags: u32,
+        ) -> i32;
+    }
+    // SAFETY: `pbBuffer` points to a valid, mutable 32-byte stack buffer (`cbBuffer = 32`),
+    // `hAlgorithm` is NULL with `BCRYPT_USE_SYSTEM_PREFERRED_RNG` (`0x00000002`) per Windows CNG,
+    // and `status == 0` (`STATUS_SUCCESS`) plus non-zero output bytes are checked before use.
+    let status = unsafe {
+        BCryptGenRandom(
+            core::ptr::null_mut(),
+            raw.as_mut_ptr(),
+            raw.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    status == 0 && raw.iter().any(|&b| b != 0)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn fill_os_csprng_bytes(_raw: &mut [u8; 32]) -> bool {
+    false
+}
+
+fn generate_csprng_bearer_token_hex() -> Result<String, String> {
+    let mut raw = [0u8; 32];
+    if !fill_os_csprng_bytes(&mut raw) {
+        return Err(format!(
+            "OS CSPRNG unavailable on this platform; set NMR_MCP_BEARER_TOKEN (>= {MIN_HTTP_BEARER_TOKEN_LEN} chars) explicitly"
+        ));
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for b in raw {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    Ok(out)
+}
+
+fn validate_http_bearer_token(raw: &str, source: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.len() < MIN_HTTP_BEARER_TOKEN_LEN {
+        return Err(format!(
+            "MCP HTTP bearer token from {source} is too short ({} chars; minimum is {MIN_HTTP_BEARER_TOKEN_LEN} characters). \
+             Prefer setting NMR_MCP_BEARER_TOKEN to >= {MIN_HTTP_BEARER_TOKEN_LEN} random characters (or omit both NMR_MCP_BEARER_TOKEN and --token on `nmrassign mcp --transport http` to auto-generate a 256-bit OS CSPRNG token).",
+            trimmed.len()
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum McpTransportKind {
     Stdio,
@@ -75,8 +150,14 @@ Options:
   --read-only / --read-write     Shorthand flags for --mode.
   --expose-blocked-write-tools   Include write tools in tools/list while still denying execution in read-only mode.
   --bind <127.0.0.1:port>        Loopback bind address for --transport http (non-loopback IPs are rejected).
-  --token <bearer>               Required secret Bearer token when --transport http is selected.
+  --token <bearer>               Bearer token (>= 32 chars) for --transport http. Prefer injecting
+                                 NMR_MCP_BEARER_TOKEN (>= 32 chars) via environment instead of ps-visible
+                                 process argv; omitting both auto-generates a 256-bit (64-hex-char) OS CSPRNG
+                                 token emitted on stderr.
   --max-requests <N>             Optional request cap before clean exit on --transport http.
+
+Environment:
+  NMR_MCP_BEARER_TOKEN           Preferred HTTP Bearer secret (>= 32 chars; avoids ps-visible --token argv).
 "
 }
 
@@ -88,6 +169,10 @@ Usage:
                        [--root <dir> ...] [--mode read-only|read-write]
                        [--bridge-port <port> [--token <bearer>]]
                        [--command <nmrassign_bin>] [-o <mcp_config.json>]
+
+Notes:
+  For --bridge-port <port>, any supplied --token or NMR_MCP_BEARER_TOKEN must be >= 32 characters;
+  prefer NMR_MCP_BEARER_TOKEN environment injection over ps-visible --token CLI arguments.
 "
 }
 
@@ -103,9 +188,7 @@ pub fn run_mcp_cli(args: &[String]) -> Result<(), String> {
     let mut mode = McpAccessMode::ReadOnly;
     let mut hide_write_tools_in_read_only = true;
     let mut bind_spec = "127.0.0.1:8765".to_string();
-    let mut bearer_token: Option<String> = env::var("NMR_MCP_BEARER_TOKEN")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let mut cli_bearer_token: Option<String> = None;
     let mut max_requests: Option<usize> = None;
 
     let mut i = 0usize;
@@ -150,10 +233,12 @@ pub fn run_mcp_cli(args: &[String]) -> Result<(), String> {
             }
             "--token" => {
                 i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| "--token requires a non-empty bearer string".to_string())?;
-                bearer_token = Some(val.clone());
+                let val = args.get(i).ok_or_else(|| {
+                    format!(
+                        "--token requires a bearer string (>= {MIN_HTTP_BEARER_TOKEN_LEN} chars; prefer NMR_MCP_BEARER_TOKEN)"
+                    )
+                })?;
+                cli_bearer_token = Some(val.clone());
             }
             "--max-requests" => {
                 i += 1;
@@ -195,19 +280,28 @@ pub fn run_mcp_cli(args: &[String]) -> Result<(), String> {
         }
         McpTransportKind::Http => {
             let bind_addr = parse_loopback_bind_addr(&bind_spec).map_err(|e| format!("{e}"))?;
-            let token = bearer_token
-                .as_deref()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .ok_or_else(|| {
-                    "MCP HTTP transport requires a non-empty --token <bearer>".to_string()
-                })?;
+            let (token, auto_generated) = if let Some(raw_cli) = cli_bearer_token.as_deref() {
+                (validate_http_bearer_token(raw_cli, "--token")?, false)
+            } else if let Ok(raw_env) = env::var("NMR_MCP_BEARER_TOKEN") {
+                (
+                    validate_http_bearer_token(&raw_env, "NMR_MCP_BEARER_TOKEN")?,
+                    false,
+                )
+            } else {
+                (generate_csprng_bearer_token_hex()?, true)
+            };
 
             let listener = TcpListener::bind(bind_addr)
                 .map_err(|e| format!("failed to bind loopback MCP HTTP socket {bind_addr}: {e}"))?;
             let local_addr = listener
                 .local_addr()
                 .map_err(|e| format!("failed to query local MCP HTTP socket address: {e}"))?;
+            if auto_generated {
+                eprintln!("MCP_HTTP_BEARER_TOKEN {token}");
+                eprintln!(
+                    "MCP_HTTP_NOTE auto-generated 256-bit OS CSPRNG bearer token above; prefer NMR_MCP_BEARER_TOKEN (>= {MIN_HTTP_BEARER_TOKEN_LEN} chars) over ps-visible --token argv"
+                );
+            }
             eprintln!("MCP_HTTP_LISTENING http://{local_addr}");
 
             if max_requests == Some(0) {
@@ -220,7 +314,7 @@ pub fn run_mcp_cli(args: &[String]) -> Result<(), String> {
                     Ok(stream) => {
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-                        let _ = handle_mcp_http_stream(&mut server, stream, token);
+                        let _ = handle_mcp_http_stream(&mut server, stream, &token);
                         served += 1;
                         if let Some(limit) = max_requests {
                             if served >= limit {
@@ -301,9 +395,11 @@ pub fn run_mcp_config_cli(args: &[String]) -> Result<(), String> {
             }
             "--token" => {
                 i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| "--token requires a non-empty bearer token".to_string())?;
+                let val = args.get(i).ok_or_else(|| {
+                    format!(
+                        "--token requires a bearer token (>= {MIN_HTTP_BEARER_TOKEN_LEN} chars; prefer NMR_MCP_BEARER_TOKEN)"
+                    )
+                })?;
                 bearer_token = Some(val.clone());
             }
             "--command" => {
@@ -338,9 +434,13 @@ pub fn run_mcp_config_cli(args: &[String]) -> Result<(), String> {
     })?;
 
     let client_mode = if let Some(port) = bridge_port {
-        let token = bearer_token
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| "REPLACE_WITH_WORKBENCH_SESSION_TOKEN".to_string());
+        let token = if let Some(raw_cli) = bearer_token.as_deref() {
+            validate_http_bearer_token(raw_cli, "--token")?
+        } else if let Ok(raw_env) = env::var("NMR_MCP_BEARER_TOKEN") {
+            validate_http_bearer_token(&raw_env, "NMR_MCP_BEARER_TOKEN")?
+        } else {
+            "REPLACE_WITH_WORKBENCH_SESSION_TOKEN".to_string()
+        };
         McpClientMode::HttpBridge {
             endpoint_url: format!("http://127.0.0.1:{port}/mcp"),
             bearer_token: token,
@@ -374,4 +474,39 @@ pub fn run_mcp_config_cli(args: &[String]) -> Result<(), String> {
         println!("{rendered}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_min_http_bearer_token_len_and_validation() {
+        assert_eq!(MIN_HTTP_BEARER_TOKEN_LEN, 32);
+        assert!(validate_http_bearer_token("", "--token").is_err());
+        assert!(validate_http_bearer_token("   ", "NMR_MCP_BEARER_TOKEN").is_err());
+        assert!(
+            validate_http_bearer_token("0123456789abcdef0123456789abcde", "--token").is_err(),
+            "31-char token must be rejected"
+        );
+        let ok_32 = validate_http_bearer_token(
+            "  0123456789abcdef0123456789abcdef  ",
+            "NMR_MCP_BEARER_TOKEN",
+        );
+        assert_eq!(ok_32.as_deref(), Ok("0123456789abcdef0123456789abcdef"));
+
+        #[cfg(any(unix, windows))]
+        {
+            let t1 = generate_csprng_bearer_token_hex();
+            let t2 = generate_csprng_bearer_token_hex();
+            assert!(t1.is_ok() && t2.is_ok());
+            if let (Ok(a), Ok(b)) = (t1, t2) {
+                assert_eq!(a.len(), 64);
+                assert_eq!(b.len(), 64);
+                assert_ne!(a, b);
+                assert!(a.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
+                assert_ne!(a, "0".repeat(64));
+            }
+        }
+    }
 }

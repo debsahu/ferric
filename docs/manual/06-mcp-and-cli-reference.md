@@ -209,10 +209,13 @@ nmrassign export-fig --out-dir docs/assets [--panel all|hsqc|strips|pdb-s2|nmr1d
 # Self-hosted loopback HTTP REST job service & browser dashboard
 nmrassign serve --bind 127.0.0.1:8080 --storage ./jobs
 
-# Sandboxed JSON-RPC 2.0 MCP server (default --mode read-only; prefer NMR_MCP_BEARER_TOKEN over argv --token) & client config generator
+# Sandboxed JSON-RPC 2.0 MCP server (default --mode read-only; prefer NMR_MCP_BEARER_TOKEN >= 32 chars over ps-visible --token argv;
+# omitting both on --transport http auto-generates a 256-bit 64-hex-char OS CSPRNG token emitted on stderr) & client config generator
 nmrassign mcp --transport stdio --root ./project_dir --mode read-only
 NMR_MCP_BEARER_TOKEN="<32+-char-session-token>" nmrassign mcp --transport http --bind 127.0.0.1:54912 --root ./project_dir --mode read-only
-nmrassign mcp-config --client antigravity --root ./project_dir --mode read-only [--bridge-port 54912]
+nmrassign mcp --transport http --bind 127.0.0.1:0 --root ./project_dir --mode read-only
+NMR_MCP_BEARER_TOKEN="<32+-char-session-token>" nmrassign mcp-config --client antigravity --bridge-port 54912 --mode read-only
+nmrassign mcp-config --client antigravity --root ./project_dir --mode read-only
 
 # Rate-limited (<= 1 req/s) CC0 BMRB downloader writing SHA-256 PROVENANCE.md
 nmrassign fetch-bmrb --id 17769 --dest ./data/private/bmrb/17769
@@ -236,7 +239,7 @@ nmrassign real-benchmark --manifest data/benchmark/real_manifest.tsv --split dev
 `nmr-assign` implements the open **Model Context Protocol (`MCP`, JSON-RPC 2.0)** specification in pure safe Rust (`serde`, `serde_json`, `std::io`, `std::net`—zero external SDK or image-encoding crates) across two complementary transports:
 
 > [!IMPORTANT] MCP Validation Scope (In-Process / Subprocess Protocol Self-Consistency)
-> JSON-RPC 2.0 framing (`stdio` newline & `Content-Length` pre-allocation caps), canonicalized path sandboxing, loopback HTTP bearer-token / DNS-rebinding guards, `256`-step Undo curation reversibility, and RFC 2083 viewport `PNG` encoding are verified via deterministic Rust unit tests and `nmrassign mcp` CLI subprocess E2E tests (`0` live interactive GUI sessions against external Antigravity, Claude Desktop, or Cursor binaries are executed in automated CI; live client smoke testing and non-Unix / CLI bearer-token hardening are tracked openly under follow-ups **`F18`**, **`F19`**, and **`F20`**).
+> JSON-RPC 2.0 framing (`stdio` newline & `Content-Length` pre-allocation caps), canonicalized path sandboxing, loopback HTTP bearer-token (`>= 32`-character floor, `NMR_MCP_BEARER_TOKEN` environment injection, and 256-bit OS CSPRNG auto-generation on Unix `/dev/urandom` & Windows `BCryptGenRandom`) / DNS-rebinding guards, `256`-step Undo curation reversibility, and RFC 2083 viewport `PNG` encoding are verified via deterministic Rust unit tests and `nmrassign mcp` CLI subprocess E2E tests (`0` live interactive GUI sessions against external Antigravity, Claude Desktop, or Cursor binaries are executed in automated CI; live external client smoke testing is tracked openly under follow-up **`F18`**).
 
 | Transport Mode | Implementation | Ideal Use Case |
 | :--- | :--- | :--- |
@@ -277,7 +280,7 @@ Add the following block to your client's `mcpServers` configuration file (for **
 #### 2. Live `nmr-gui` Desktop Loopback Bridge Mode (`HttpBridge`)
 
 1. Open `nmr-gui` on your desktop, navigate to the **`🔌 MCP Bridge`** panel, choose **`ReadOnly`** (default) or **`ReadWrite`**, and click **Start Local Bridge**.
-2. `nmr-gui` binds strictly to `127.0.0.1:<port>` (ephemeral loopback port by default) and generates a fresh random session bearer token.
+2. `nmr-gui` binds strictly to `127.0.0.1:<port>` (ephemeral loopback port by default) and generates a fresh 256-bit OS CSPRNG session bearer token (`nmr_mcp_<64-hex>`, drawn from `/dev/urandom` on Unix and Windows CNG `BCryptGenRandom` on Windows).
 3. Click **Copy MCP Config** for **Antigravity**, **Claude Desktop**, or **Cursor**, which produces:
 
 ```json
@@ -304,9 +307,10 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
    - Rejects empty paths, embedded null bytes (`\0`), and any lexical `..` (`ParentDir`) traversal before touching the filesystem.
    - Blocks access to hidden credential and secret locations (`.ssh`, `.aws`, `.gnupg`, `.env`, `.env.*`, `.netrc`, `.kube`, `id_rsa`, `id_ed25519`).
    - Canonicalizes every configured `allowed_root` and target path via `std::fs::canonicalize`, blocking symlinks or dangling links escaping `--root`, and formats responses as workspace-relative paths so host user home directories are never leaked.
-3. **Loopback-Only Binding, Constant-Time Auth & DNS-Rebinding Defense**:
-   - The desktop HTTP bridge refuses non-loopback bind addresses (`0.0.0.0`, LAN IPs, `[::]`).
-   - Every HTTP request must carry `Authorization: Bearer <token>` verified via non-branching constant-time byte comparison (`401 Unauthorized`; pass tokens to headless `nmrassign mcp --transport http` via `NMR_MCP_BEARER_TOKEN` with `>= 32` random characters rather than `ps`-visible `--token` argv), a loopback `Host` header (`127.0.0.1` or `localhost`), and **zero** cross-origin browser `Origin` headers (`403 Forbidden`), defeating local browser CSRF and DNS-rebinding attacks.
+3. **Loopback-Only Binding, 256-Bit CSPRNG / `>= 32`-Char Bearer Floor & DNS-Rebinding Defense**:
+   - Both `nmr-gui` and `nmrassign mcp --transport http` refuse non-loopback bind addresses (`0.0.0.0`, LAN IPs, `[::]`).
+   - Every HTTP request must carry `Authorization: Bearer <token>` verified via non-branching constant-time byte comparison (`401 Unauthorized`), a loopback `Host` header (`127.0.0.1`, `[::1]`, or `localhost`), and **zero** cross-origin browser `Origin` headers (`403 Forbidden`), defeating local browser CSRF and DNS-rebinding attacks.
+   - For headless `nmrassign mcp --transport http` and `nmrassign mcp-config --bridge-port`, strongly prefer injecting `NMR_MCP_BEARER_TOKEN` via environment variables rather than passing `--token <bearer>` in `ps`-visible process `argv`. Any user-supplied token (`NMR_MCP_BEARER_TOKEN` or `--token`) must be at least **`32` trimmed characters** (`MIN_HTTP_BEARER_TOKEN_LEN = 32`, returning an error on shorter secrets); omitting both `NMR_MCP_BEARER_TOKEN` and `--token` on `nmrassign mcp --transport http` automatically generates a fresh 256-bit (`64`-hex-char) OS CSPRNG bearer token (`/dev/urandom` on Unix, Windows CNG `BCryptGenRandom` on Windows) and emits `MCP_HTTP_BEARER_TOKEN <hex64>` on `stderr` while keeping `stdout` clean.
 4. **100% Reversible AI Curation (`256`-Step `McpUndoLog`)**:
    - In `nmr-gui`, all 9 live workbench operations (`get_workbench_state`, `capture_viewport_png`, `undo_last_ai_edit`, plus the 3 `navigate_workbench` actions and 3 `propose_curation_edit` actions) synchronize safely with the render thread; mutating commands (`AssignSpinSystemToResidue`, `UnassignResidue`, `TogglePeakExclusion`, `JumpToResidue`, `SetCrosshairPpm`, `HighlightResidues3d`) execute exclusively through `McpUndoLog` (`MAX_MCP_UNDO_DEPTH = 256`), preserving bijective `(cluster_id <-> seq_id)` displacements so pressing **`Cmd/Ctrl+Z`** (or calling `undo_last_ai_edit`) restores the exact prior state in one step.
 
