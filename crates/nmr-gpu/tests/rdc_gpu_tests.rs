@@ -686,3 +686,738 @@ fn test_rdc_gpu_tdr_multi_chunk_batching_signed_dmax_and_plane_free_parity() {
         "[RDC GPU CHUNKED + SIGNED DMAX + PLANE-FREE PARITY] {n_conf} conformers across 2 dispatches: max_rel_e={max_rel_e:.3e}, max_rel_g={max_rel_g:.3e}"
     );
 }
+
+#[test]
+#[ignore]
+fn test_five_seed_gpu_1d3z_rdc_refinement_sweep() {
+    let engine = require_headless_gpu(None)
+        .expect("F9 5-seed WebGPU 1D3Z sweep requires an active headless WebGPU adapter");
+
+    let root = workspace_root();
+    let pdb_1d3z = parse_pdb_first_model(root.join("data/pdb_refs/1d3z.pdb")).unwrap();
+    let shifts_1d3z =
+        nmr_core::nmrstar::read_star_all_atoms(root.join("data/benchmark/bmr17769.str"), None)
+            .unwrap();
+    let fw_ubq = nmr_core::torsion_db::HomologFirewallQuery {
+        query_pdb_ids: vec!["1D3Z".to_string(), "1UBQ".to_string(), "1G6J".to_string()],
+        query_bmrb_ids: vec!["bmr17769".to_string(), "bmr5387".to_string()],
+        query_uniprot_id: Some("P0CG48".to_string()),
+        query_family_id: Some("3.10.20.90".to_string()),
+        query_topology_id: Some("3.10.20".to_string()),
+        query_ca_coords: Some(pdb_1d3z.residues.iter().map(|r| r.ca).collect()),
+    };
+    let fw_dihs = nmr_core::torsion_db::predict_torsions_with_firewall(&shifts_1d3z, &fw_ubq)
+        .to_dihedral_restraints();
+    let peaks_1d3z = nmr_core::noesy::simulate_noesy_peaks(
+        &pdb_1d3z,
+        &shifts_1d3z,
+        &nmr_core::noesy::NoesySimConfig::default(),
+    );
+    let noe_adrs = nmr_core::noesy::match_initial_adrs(
+        &peaks_1d3z,
+        &shifts_1d3z,
+        &nmr_core::noesy::AdrConfig::default(),
+    );
+    let media_raw = read_rdc_tsv(root.join("data/fixtures/ubiquitin_1d3z_rdc.tsv")).unwrap();
+
+    let native_tors = compute_chain_torsions(&pdb_1d3z);
+    let seq: Vec<String> = pdb_1d3z
+        .residues
+        .iter()
+        .map(|r| r.res_name.clone())
+        .collect();
+    let seq_ids: Vec<i32> = pdb_1d3z.residues.iter().map(|r| r.seq_id).collect();
+    let l = seq.len();
+    let ordered_mask: Vec<bool> = (0..l).map(|i| i < 71).collect();
+
+    let free_seeds: [u64; 5] = [4242, 4243, 4244, 4245, 4246];
+
+    #[derive(Clone, Debug)]
+    struct F9Row {
+        free_seed: u64,
+        init_rmsd_a: f64,
+        init_q_work: f64,
+        init_plane_q_free: f64,
+        cpu_q_work: f64,
+        cpu_plane_q_free: f64,
+        cpu_rmsd_a: f64,
+        gpu_q_work: f64,
+        gpu_plane_q_free: f64,
+        gpu_rmsd_a: f64,
+        gpu_pass_gate: bool,
+    }
+
+    let mut rows = Vec::with_capacity(free_seeds.len());
+    for &free_seed in &free_seeds {
+        let mut media = media_raw.clone();
+        partition_rdc_free_set(&mut media, 0.20, free_seed);
+
+        // Preserve exact `31415` starting ensemble on `free_seed = 4242`, while sweeping
+        // independent perturbed ensembles alongside independent holdout splits on `4243..=4246`.
+        let mut rng = Rng::new(31415 + (free_seed - 4242));
+        let mut init_confs = Vec::with_capacity(6);
+        for _ in 0..6 {
+            let mut phi_deg = Vec::with_capacity(l);
+            let mut psi_deg = Vec::with_capacity(l);
+            for &(_, _, p_opt, s_opt) in &native_tors {
+                phi_deg.push(p_opt.unwrap_or(-63.0) + rng.normal(0.0, 8.5));
+                psi_deg.push(s_opt.unwrap_or(135.0) + rng.normal(0.0, 8.5));
+            }
+            let omega_deg = vec![180.0; l];
+            let ch = build_backbone_from_torsions(&seq, &seq_ids, &phi_deg, &psi_deg, &omega_deg);
+            init_confs.push(StructureConformer {
+                chain: ch,
+                phi_deg,
+                psi_deg,
+                omega_deg,
+                total_energy: 100.0,
+                noe_energy: 0.0,
+                dihedral_energy: 0.0,
+                vdw_energy: 0.0,
+                rama_energy: 0.0,
+            });
+        }
+
+        let val_before = evaluate_rdc_validation(&init_confs[0].chain, &media).unwrap();
+        let mut c0_before = init_confs[0].chain.clone();
+        let rmsd_before = superpose_chain_onto(&mut c0_before, &pdb_1d3z, Some(&ordered_mask));
+
+        let (cpu_refined, cpu_val) = refine_ensemble_with_rdcs(
+            &init_confs,
+            &seq,
+            &seq_ids,
+            &noe_adrs,
+            &fw_dihs,
+            &media,
+            0.55,
+            110,
+        )
+        .expect("CPU 1D3Z RDC refinement");
+        let mut c0_cpu = cpu_refined[0].chain.clone();
+        let cpu_rmsd = superpose_chain_onto(&mut c0_cpu, &pdb_1d3z, Some(&ordered_mask));
+
+        let (gpu_refined, gpu_val) = refine_ensemble_with_rdcs_gpu(
+            &engine,
+            &init_confs,
+            &seq,
+            &seq_ids,
+            &noe_adrs,
+            &fw_dihs,
+            &media,
+            0.55,
+            110,
+        )
+        .expect("WebGPU 1D3Z RDC refinement");
+        let mut c0_gpu = gpu_refined[0].chain.clone();
+        let gpu_rmsd = superpose_chain_onto(&mut c0_gpu, &pdb_1d3z, Some(&ordered_mask));
+
+        let gpu_pass = gpu_val.overall_q_work < 0.14
+            && gpu_val.overall_q_free < 0.32
+            && gpu_val.overall_q_free < val_before.overall_q_free
+            && gpu_rmsd < 0.85
+            && gpu_rmsd < rmsd_before;
+
+        println!(
+            "[F9 5SEED GPU 1D3Z free_seed={free_seed}] init(Qw={:.4}, Qf={:.4}, RMSD={:.3}A) | CPU(Qw={:.4}, Qf={:.4}, RMSD={:.3}A) | GPU(Qw={:.4}, Qf={:.4}, RMSD={:.3}A, pass={gpu_pass})",
+            val_before.overall_q_work,
+            val_before.overall_q_free,
+            rmsd_before,
+            cpu_val.overall_q_work,
+            cpu_val.overall_q_free,
+            cpu_rmsd,
+            gpu_val.overall_q_work,
+            gpu_val.overall_q_free,
+            gpu_rmsd,
+        );
+
+        rows.push(F9Row {
+            free_seed,
+            init_rmsd_a: rmsd_before,
+            init_q_work: val_before.overall_q_work,
+            init_plane_q_free: val_before.overall_q_free,
+            cpu_q_work: cpu_val.overall_q_work,
+            cpu_plane_q_free: cpu_val.overall_q_free,
+            cpu_rmsd_a: cpu_rmsd,
+            gpu_q_work: gpu_val.overall_q_work,
+            gpu_plane_q_free: gpu_val.overall_q_free,
+            gpu_rmsd_a: gpu_rmsd,
+            gpu_pass_gate: gpu_pass,
+        });
+    }
+
+    let min_max = |vals: &[f64]| -> (f64, f64) {
+        let lo = vals.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (lo, hi)
+    };
+    let (gpu_qw_lo, gpu_qw_hi) = min_max(&rows.iter().map(|r| r.gpu_q_work).collect::<Vec<_>>());
+    let (gpu_qf_lo, gpu_qf_hi) =
+        min_max(&rows.iter().map(|r| r.gpu_plane_q_free).collect::<Vec<_>>());
+    let (gpu_rm_lo, gpu_rm_hi) = min_max(&rows.iter().map(|r| r.gpu_rmsd_a).collect::<Vec<_>>());
+    let (cpu_qf_lo, cpu_qf_hi) =
+        min_max(&rows.iter().map(|r| r.cpu_plane_q_free).collect::<Vec<_>>());
+    let n_gpu_pass = rows.iter().filter(|r| r.gpu_pass_gate).count();
+
+    println!(
+        "[F9 5SEED GPU 1D3Z RANGE] GPU Q_work={gpu_qw_lo:.4}..{gpu_qw_hi:.4}, plane_Q_free={gpu_qf_lo:.4}..{gpu_qf_hi:.4}, BB_RMSD={gpu_rm_lo:.3}..{gpu_rm_hi:.3} A ({n_gpu_pass}/5 pass <0.32 gate) | Matched CPU plane_Q_free={cpu_qf_lo:.4}..{cpu_qf_hi:.4}"
+    );
+
+    let seed_entries: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            format!(
+                "{{\"free_seed\":{},\"init_q_work\":{:.6},\"init_plane_q_free\":{:.6},\"init_rmsd_a\":{:.6},\"cpu_q_work\":{:.6},\"cpu_plane_q_free\":{:.6},\"cpu_rmsd_a\":{:.6},\"gpu_q_work\":{:.6},\"gpu_plane_q_free\":{:.6},\"gpu_rmsd_a\":{:.6},\"gpu_pass_gate\":{}}}",
+                r.free_seed,
+                r.init_q_work,
+                r.init_plane_q_free,
+                r.init_rmsd_a,
+                r.cpu_q_work,
+                r.cpu_plane_q_free,
+                r.cpu_rmsd_a,
+                r.gpu_q_work,
+                r.gpu_plane_q_free,
+                r.gpu_rmsd_a,
+                r.gpu_pass_gate
+            )
+        })
+        .collect();
+    let json_payload = format!(
+        "{{\n  \"kind\": \"f9_gpu_1d3z_5seed\",\n  \"target\": \"1D3Z\",\n  \"adapter\": \"{}\",\n  \"backend\": \"{}\",\n  \"n_seeds\": 5,\n  \"n_gpu_pass_gate\": {},\n  \"gpu_q_work_min\": {:.6},\n  \"gpu_q_work_max\": {:.6},\n  \"gpu_plane_q_free_min\": {:.6},\n  \"gpu_plane_q_free_max\": {:.6},\n  \"gpu_rmsd_a_min\": {:.6},\n  \"gpu_rmsd_a_max\": {:.6},\n  \"cpu_plane_q_free_min\": {:.6},\n  \"cpu_plane_q_free_max\": {:.6},\n  \"seeds\": [\n    {}\n  ]\n}}\n",
+        engine.adapter_name.replace('"', "'"),
+        engine.backend_name.replace('"', "'"),
+        n_gpu_pass,
+        gpu_qw_lo,
+        gpu_qw_hi,
+        gpu_qf_lo,
+        gpu_qf_hi,
+        gpu_rm_lo,
+        gpu_rm_hi,
+        cpu_qf_lo,
+        cpu_qf_hi,
+        seed_entries.join(",\n    ")
+    );
+    println!("W4_F9_JSON:{}", json_payload.replace('\n', ""));
+    if let Ok(dir) = std::env::var("NMR_W4_RESULTS_DIR") {
+        let out_p = PathBuf::from(dir).join("w4_f9_gpu_1d3z_5seed.json");
+        std::fs::write(out_p, json_payload).expect("write w4_f9_gpu_1d3z_5seed.json");
+    }
+}
+
+#[test]
+#[ignore]
+fn test_f8_cold_holdout_rdc_refinement_cpu_and_gpu() {
+    use std::sync::Mutex;
+
+    let engine = require_headless_gpu(None)
+        .expect("F8 cold holdout evaluation requires an active headless WebGPU adapter");
+
+    let root = workspace_root();
+    let xray_1zzk = parse_pdb_first_model(root.join("data/fixtures/kh3_1zzk_xray.pdb"))
+        .expect("read 1ZZK 0.95 A X-ray reference");
+    let shifts_kh3 = nmr_core::nmrstar::read_star_all_atoms(
+        root.join("data/fixtures/kh3_bmr4405_shifts.str"),
+        None,
+    )
+    .expect("read BMRB 4405 shifts");
+
+    let seq: Vec<String> = shifts_kh3.sequence.clone();
+    assert_eq!(seq.len(), 89);
+    let seq_ids: Vec<i32> = (1..=89).collect();
+
+    let exp_adrs = nmr_core::structure::read_exp_noe_tsv(
+        root.join("data/fixtures/kh3_1khm_exp_noe.tsv"),
+        &seq,
+        &seq_ids,
+    )
+    .expect("read 1KHM experimental NOE restraints");
+    let media_raw =
+        read_rdc_tsv(root.join("data/fixtures/kh3_1khm_rdc.tsv")).expect("read 1KHM RDCs");
+
+    // Pre-registered 4-layer HomologFirewall (`query_ca_coords: None` -> zero coordinates enter folding)
+    let fw_kh3 = nmr_core::torsion_db::HomologFirewallQuery {
+        query_pdb_ids: vec![
+            "1KHM".to_string(),
+            "1ZZI".to_string(),
+            "1ZZJ".to_string(),
+            "1ZZK".to_string(),
+            "7CRE".to_string(),
+        ],
+        query_bmrb_ids: vec!["bmr4405".to_string()],
+        query_uniprot_id: Some("P61978".to_string()),
+        query_family_id: Some("3.30.1370.10".to_string()),
+        query_topology_id: Some("3.30.1370".to_string()),
+        query_ca_coords: None,
+    };
+    let kh3_pred = nmr_core::torsion_db::predict_torsions_with_firewall(&shifts_kh3, &fw_kh3);
+    assert!(
+        kh3_pred.max_retained_seq_identity <= 0.25,
+        "HomologFirewall exceeded 25% sequence identity: {}",
+        kh3_pred.max_retained_seq_identity
+    );
+    let fw_dihs = kh3_pred.to_dihedral_restraints();
+
+    // Direct Saupe SVD fit of 1KHM RDCs on unrefined 0.95 A apo X-ray crystal 1ZZK (reference sanity context)
+    let mut media_xray_check = media_raw.clone();
+    partition_rdc_free_set_with_mode(
+        &mut media_xray_check,
+        0.20,
+        4242,
+        RdcFreeStratification::ByPeptidePlane,
+    );
+    let xray_multi_val =
+        evaluate_rdc_validation(&xray_1zzk, &media_xray_check).expect("1ZZK multi-bond SVD");
+    let xray_nh_only: Vec<RdcMediumSet> = media_xray_check
+        .iter()
+        .map(|m| RdcMediumSet {
+            medium_id: m.medium_id.clone(),
+            restraints: m
+                .restraints
+                .iter()
+                .filter(|r| r.bond_type == RdcBondType::NH)
+                .cloned()
+                .collect(),
+        })
+        .collect();
+    let xray_nh_val = evaluate_rdc_validation(&xray_1zzk, &xray_nh_only).expect("1ZZK 1D_NH SVD");
+    println!(
+        "[F8 COLD HOLDOUT 1KHM -> 1ZZK (0.95A X-RAY)] n_adrs={}, n_fw_dihs={}, max_retained_seq_id={:.3} | Direct 1ZZK crystal SVD: multi-bond Q_work={:.4}, plane_Q_free={:.4}, 1D_NH Q_work={:.4}, 1D_NH plane_Q_free={:.4}",
+        exp_adrs.len(),
+        fw_dihs.len(),
+        kh3_pred.max_retained_seq_identity,
+        xray_multi_val.overall_q_work,
+        xray_multi_val.overall_q_free,
+        xray_nh_val.overall_q_work,
+        xray_nh_val.overall_q_free
+    );
+
+    let seeds: [u64; 5] = [4242, 4243, 4244, 4245, 4246];
+
+    #[derive(Clone)]
+    struct CpuSeedOut {
+        seed: u64,
+        media: Vec<RdcMediumSet>,
+        nh_media: Vec<RdcMediumSet>,
+        noe_confs: Vec<StructureConformer>,
+        noe_q_work: f64,
+        noe_plane_q_free: f64,
+        noe_nh_q_free: f64,
+        noe_rmsd_low_a: f64,
+        noe_rmsd_mean_a: f64,
+        cpu_q_work: f64,
+        cpu_plane_q_free: f64,
+        cpu_nh_q_free: f64,
+        cpu_rmsd_low_a: f64,
+        cpu_rmsd_mean_a: f64,
+        cpu_rama_pct: f64,
+    }
+
+    let cpu_slots: Mutex<Vec<Option<CpuSeedOut>>> = Mutex::new(vec![None; seeds.len()]);
+    std::thread::scope(|scope| {
+        for (idx, &seed) in seeds.iter().enumerate() {
+            let seq = &seq;
+            let seq_ids = &seq_ids;
+            let exp_adrs = &exp_adrs;
+            let fw_dihs = &fw_dihs;
+            let media_raw = &media_raw;
+            let xray_1zzk = &xray_1zzk;
+            let cpu_slots = &cpu_slots;
+            scope.spawn(move || {
+                let mut media = media_raw.clone();
+                partition_rdc_free_set_with_mode(
+                    &mut media,
+                    0.20,
+                    seed,
+                    RdcFreeStratification::ByPeptidePlane,
+                );
+                let nh_media: Vec<RdcMediumSet> = media
+                    .iter()
+                    .map(|m| RdcMediumSet {
+                        medium_id: m.medium_id.clone(),
+                        restraints: m
+                            .restraints
+                            .iter()
+                            .filter(|r| r.bond_type == RdcBondType::NH)
+                            .cloned()
+                            .collect(),
+                    })
+                    .collect();
+
+                let cfg = nmr_core::structure::StructureCalcConfig {
+                    seed,
+                    ..nmr_core::structure::StructureCalcConfig::default()
+                };
+
+                let (noe_only, none_rdc) =
+                    nmr_core::structure::fold_from_experimental_noes_and_rdcs(
+                        seq,
+                        seq_ids,
+                        exp_adrs,
+                        fw_dihs,
+                        &[],
+                        0.0,
+                        &cfg,
+                    )
+                    .expect("F8 cold NOE-only baseline fold");
+                assert!(none_rdc.is_none());
+
+                let noe_val = evaluate_rdc_validation(&noe_only.conformers[0].chain, &media)
+                    .expect("NOE-only multi-bond RDC eval");
+                let noe_nh_val = evaluate_rdc_validation(&noe_only.conformers[0].chain, &nh_media)
+                    .expect("NOE-only 1D_NH RDC eval");
+                let noe_rmsd_low = nmr_core::structure::backbone_rmsd_seq_range(
+                    &noe_only.conformers[0].chain,
+                    xray_1zzk,
+                    12,
+                    89,
+                );
+                let noe_rmsd_mean = noe_only
+                    .conformers
+                    .iter()
+                    .map(|c| {
+                        nmr_core::structure::backbone_rmsd_seq_range(&c.chain, xray_1zzk, 12, 89)
+                    })
+                    .sum::<f64>()
+                    / (noe_only.conformers.len() as f64);
+
+                let (cpu_ens, Some(cpu_val)) =
+                    nmr_core::structure::fold_from_experimental_noes_and_rdcs(
+                        seq, seq_ids, exp_adrs, fw_dihs, &media, 0.75, &cfg,
+                    )
+                    .expect("F8 cold CPU RDC fold")
+                else {
+                    panic!("expected Some(RdcValidationSummary) on CPU RDC fold");
+                };
+                let cpu_nh_val = evaluate_rdc_validation(&cpu_ens.conformers[0].chain, &nh_media)
+                    .expect("CPU RDC 1D_NH eval");
+                let cpu_rmsd_low = nmr_core::structure::backbone_rmsd_seq_range(
+                    &cpu_ens.conformers[0].chain,
+                    xray_1zzk,
+                    12,
+                    89,
+                );
+                let cpu_rmsd_mean = cpu_ens
+                    .conformers
+                    .iter()
+                    .map(|c| {
+                        nmr_core::structure::backbone_rmsd_seq_range(&c.chain, xray_1zzk, 12, 89)
+                    })
+                    .sum::<f64>()
+                    / (cpu_ens.conformers.len() as f64);
+                let cpu_sv = nmr_core::structure::validate_ensemble(
+                    &cpu_ens.conformers,
+                    &cpu_ens.final_adrs,
+                    fw_dihs,
+                    None,
+                );
+
+                cpu_slots.lock().unwrap()[idx] = Some(CpuSeedOut {
+                    seed,
+                    media,
+                    nh_media,
+                    noe_confs: noe_only.conformers,
+                    noe_q_work: noe_val.overall_q_work,
+                    noe_plane_q_free: noe_val.overall_q_free,
+                    noe_nh_q_free: noe_nh_val.overall_q_free,
+                    noe_rmsd_low_a: noe_rmsd_low,
+                    noe_rmsd_mean_a: noe_rmsd_mean,
+                    cpu_q_work: cpu_val.overall_q_work,
+                    cpu_plane_q_free: cpu_val.overall_q_free,
+                    cpu_nh_q_free: cpu_nh_val.overall_q_free,
+                    cpu_rmsd_low_a: cpu_rmsd_low,
+                    cpu_rmsd_mean_a: cpu_rmsd_mean,
+                    cpu_rama_pct: cpu_sv.ramachandran_favored_pct + cpu_sv.ramachandran_allowed_pct,
+                });
+            });
+        }
+    });
+
+    #[derive(Clone, Debug)]
+    struct F8FullRow {
+        seed: u64,
+        n_work: usize,
+        n_free: usize,
+        noe_q_work: f64,
+        noe_plane_q_free: f64,
+        noe_nh_q_free: f64,
+        noe_rmsd_low_a: f64,
+        noe_rmsd_mean_a: f64,
+        cpu_q_work: f64,
+        cpu_plane_q_free: f64,
+        cpu_nh_q_free: f64,
+        cpu_rmsd_low_a: f64,
+        cpu_rmsd_mean_a: f64,
+        cpu_rama_pct: f64,
+        gpu_q_work: f64,
+        gpu_plane_q_free: f64,
+        gpu_nh_q_free: f64,
+        gpu_rmsd_low_a: f64,
+        gpu_rmsd_mean_a: f64,
+        gpu_rama_pct: f64,
+    }
+
+    let cpu_outs: Vec<CpuSeedOut> = cpu_slots
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|o| o.expect("completed F8 CPU seed"))
+        .collect();
+
+    let mut full_rows = Vec::with_capacity(seeds.len());
+    for c in cpu_outs {
+        let n_work: usize = c
+            .media
+            .iter()
+            .map(|m| m.restraints.iter().filter(|r| !r.is_free).count())
+            .sum();
+        let n_free: usize = c
+            .media
+            .iter()
+            .map(|m| m.restraints.iter().filter(|r| r.is_free).count())
+            .sum();
+
+        let (gpu_confs, gpu_val) = refine_ensemble_with_rdcs_gpu(
+            &engine,
+            &c.noe_confs,
+            &seq,
+            &seq_ids,
+            &exp_adrs,
+            &fw_dihs,
+            &c.media,
+            0.55,
+            110,
+        )
+        .expect("F8 cold WebGPU RDC refinement");
+        let gpu_nh_val = evaluate_rdc_validation(&gpu_confs[0].chain, &c.nh_media)
+            .expect("WebGPU RDC 1D_NH eval");
+        let gpu_rmsd_low =
+            nmr_core::structure::backbone_rmsd_seq_range(&gpu_confs[0].chain, &xray_1zzk, 12, 89);
+        let gpu_rmsd_mean = gpu_confs
+            .iter()
+            .map(|cf| nmr_core::structure::backbone_rmsd_seq_range(&cf.chain, &xray_1zzk, 12, 89))
+            .sum::<f64>()
+            / (gpu_confs.len() as f64);
+        let gpu_sv = nmr_core::structure::validate_ensemble(&gpu_confs, &exp_adrs, &fw_dihs, None);
+        let gpu_rama_pct = gpu_sv.ramachandran_favored_pct + gpu_sv.ramachandran_allowed_pct;
+
+        assert!(
+            c.cpu_q_work.is_finite()
+                && c.cpu_plane_q_free.is_finite()
+                && gpu_val.overall_q_work.is_finite()
+                && gpu_val.overall_q_free.is_finite(),
+            "non-finite Q in F8 seed {}",
+            c.seed
+        );
+
+        println!(
+            "[F8 COLD 1KHM->1ZZK seed={}] work={n_work} free={n_free} | NOE(Qw={:.4}, Qf={:.4}, NH_Qf={:.4}, lowE={:.3}A, mean={:.3}A) | CPU(Qw={:.4}, Qf={:.4}, NH_Qf={:.4}, lowE={:.3}A, mean={:.3}A, Rama={:.1}%) | GPU(Qw={:.4}, Qf={:.4}, NH_Qf={:.4}, lowE={:.3}A, mean={:.3}A, Rama={:.1}%)",
+            c.seed,
+            c.noe_q_work,
+            c.noe_plane_q_free,
+            c.noe_nh_q_free,
+            c.noe_rmsd_low_a,
+            c.noe_rmsd_mean_a,
+            c.cpu_q_work,
+            c.cpu_plane_q_free,
+            c.cpu_nh_q_free,
+            c.cpu_rmsd_low_a,
+            c.cpu_rmsd_mean_a,
+            c.cpu_rama_pct,
+            gpu_val.overall_q_work,
+            gpu_val.overall_q_free,
+            gpu_nh_val.overall_q_free,
+            gpu_rmsd_low,
+            gpu_rmsd_mean,
+            gpu_rama_pct
+        );
+
+        full_rows.push(F8FullRow {
+            seed: c.seed,
+            n_work,
+            n_free,
+            noe_q_work: c.noe_q_work,
+            noe_plane_q_free: c.noe_plane_q_free,
+            noe_nh_q_free: c.noe_nh_q_free,
+            noe_rmsd_low_a: c.noe_rmsd_low_a,
+            noe_rmsd_mean_a: c.noe_rmsd_mean_a,
+            cpu_q_work: c.cpu_q_work,
+            cpu_plane_q_free: c.cpu_plane_q_free,
+            cpu_nh_q_free: c.cpu_nh_q_free,
+            cpu_rmsd_low_a: c.cpu_rmsd_low_a,
+            cpu_rmsd_mean_a: c.cpu_rmsd_mean_a,
+            cpu_rama_pct: c.cpu_rama_pct,
+            gpu_q_work: gpu_val.overall_q_work,
+            gpu_plane_q_free: gpu_val.overall_q_free,
+            gpu_nh_q_free: gpu_nh_val.overall_q_free,
+            gpu_rmsd_low_a: gpu_rmsd_low,
+            gpu_rmsd_mean_a: gpu_rmsd_mean,
+            gpu_rama_pct,
+        });
+    }
+
+    let min_max = |vals: &[f64]| -> (f64, f64) {
+        let lo = vals.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (lo, hi)
+    };
+    let (noe_qf_lo, noe_qf_hi) = min_max(
+        &full_rows
+            .iter()
+            .map(|r| r.noe_plane_q_free)
+            .collect::<Vec<_>>(),
+    );
+    let (noe_rm_lo, noe_rm_hi) = min_max(
+        &full_rows
+            .iter()
+            .map(|r| r.noe_rmsd_low_a)
+            .collect::<Vec<_>>(),
+    );
+    let (cpu_qw_lo, cpu_qw_hi) =
+        min_max(&full_rows.iter().map(|r| r.cpu_q_work).collect::<Vec<_>>());
+    let (cpu_qf_lo, cpu_qf_hi) = min_max(
+        &full_rows
+            .iter()
+            .map(|r| r.cpu_plane_q_free)
+            .collect::<Vec<_>>(),
+    );
+    let (cpu_nh_qf_lo, cpu_nh_qf_hi) = min_max(
+        &full_rows
+            .iter()
+            .map(|r| r.cpu_nh_q_free)
+            .collect::<Vec<_>>(),
+    );
+    let (cpu_rm_lo, cpu_rm_hi) = min_max(
+        &full_rows
+            .iter()
+            .map(|r| r.cpu_rmsd_low_a)
+            .collect::<Vec<_>>(),
+    );
+    let (cpu_mean_lo, cpu_mean_hi) = min_max(
+        &full_rows
+            .iter()
+            .map(|r| r.cpu_rmsd_mean_a)
+            .collect::<Vec<_>>(),
+    );
+    let (gpu_qw_lo, gpu_qw_hi) =
+        min_max(&full_rows.iter().map(|r| r.gpu_q_work).collect::<Vec<_>>());
+    let (gpu_qf_lo, gpu_qf_hi) = min_max(
+        &full_rows
+            .iter()
+            .map(|r| r.gpu_plane_q_free)
+            .collect::<Vec<_>>(),
+    );
+    let (gpu_nh_qf_lo, gpu_nh_qf_hi) = min_max(
+        &full_rows
+            .iter()
+            .map(|r| r.gpu_nh_q_free)
+            .collect::<Vec<_>>(),
+    );
+    let (gpu_rm_lo, gpu_rm_hi) = min_max(
+        &full_rows
+            .iter()
+            .map(|r| r.gpu_rmsd_low_a)
+            .collect::<Vec<_>>(),
+    );
+    let (gpu_mean_lo, gpu_mean_hi) = min_max(
+        &full_rows
+            .iter()
+            .map(|r| r.gpu_rmsd_mean_a)
+            .collect::<Vec<_>>(),
+    );
+
+    let cpu_qfree_improved = full_rows
+        .iter()
+        .filter(|r| r.cpu_plane_q_free < r.noe_plane_q_free)
+        .count();
+    let gpu_qfree_improved = full_rows
+        .iter()
+        .filter(|r| r.gpu_plane_q_free < r.noe_plane_q_free)
+        .count();
+    let cpu_rmsd_improved = full_rows
+        .iter()
+        .filter(|r| r.cpu_rmsd_low_a < r.noe_rmsd_low_a)
+        .count();
+    let gpu_rmsd_improved = full_rows
+        .iter()
+        .filter(|r| r.gpu_rmsd_low_a < r.noe_rmsd_low_a)
+        .count();
+
+    println!(
+        "[F8 COLD 5SEED SUMMARY 1KHM->1ZZK] NOE plane_Q_free={noe_qf_lo:.4}..{noe_qf_hi:.4}, lowE={noe_rm_lo:.3}..{noe_rm_hi:.3}A | CPU Q_work={cpu_qw_lo:.4}..{cpu_qw_hi:.4}, plane_Q_free={cpu_qf_lo:.4}..{cpu_qf_hi:.4} (NH {cpu_nh_qf_lo:.4}..{cpu_nh_qf_hi:.4}), lowE={cpu_rm_lo:.3}..{cpu_rm_hi:.3}A (Qf_improved={cpu_qfree_improved}/5, RMSD_improved={cpu_rmsd_improved}/5) | GPU Q_work={gpu_qw_lo:.4}..{gpu_qw_hi:.4}, plane_Q_free={gpu_qf_lo:.4}..{gpu_qf_hi:.4} (NH {gpu_nh_qf_lo:.4}..{gpu_nh_qf_hi:.4}), lowE={gpu_rm_lo:.3}..{gpu_rm_hi:.3}A (Qf_improved={gpu_qfree_improved}/5, RMSD_improved={gpu_rmsd_improved}/5)"
+    );
+
+    let seed_json: Vec<String> = full_rows
+        .iter()
+        .map(|r| {
+            format!(
+                "{{\"seed\":{},\"n_work\":{},\"n_free\":{},\"noe_q_work\":{:.6},\"noe_plane_q_free\":{:.6},\"noe_nh_q_free\":{:.6},\"noe_rmsd_low_a\":{:.6},\"noe_rmsd_mean_a\":{:.6},\"cpu_q_work\":{:.6},\"cpu_plane_q_free\":{:.6},\"cpu_nh_q_free\":{:.6},\"cpu_rmsd_low_a\":{:.6},\"cpu_rmsd_mean_a\":{:.6},\"cpu_rama_pct\":{:.3},\"gpu_q_work\":{:.6},\"gpu_plane_q_free\":{:.6},\"gpu_nh_q_free\":{:.6},\"gpu_rmsd_low_a\":{:.6},\"gpu_rmsd_mean_a\":{:.6},\"gpu_rama_pct\":{:.3}}}",
+                r.seed,
+                r.n_work,
+                r.n_free,
+                r.noe_q_work,
+                r.noe_plane_q_free,
+                r.noe_nh_q_free,
+                r.noe_rmsd_low_a,
+                r.noe_rmsd_mean_a,
+                r.cpu_q_work,
+                r.cpu_plane_q_free,
+                r.cpu_nh_q_free,
+                r.cpu_rmsd_low_a,
+                r.cpu_rmsd_mean_a,
+                r.cpu_rama_pct,
+                r.gpu_q_work,
+                r.gpu_plane_q_free,
+                r.gpu_nh_q_free,
+                r.gpu_rmsd_low_a,
+                r.gpu_rmsd_mean_a,
+                r.gpu_rama_pct
+            )
+        })
+        .collect();
+
+    let json_payload = format!(
+        "{{\n  \"kind\": \"f8_cold_holdout_rdc\",\n  \"nmr_pdb_id\": \"1KHM\",\n  \"bmrb_id\": \"4405\",\n  \"xray_pdb_id\": \"1ZZK\",\n  \"xray_resolution_a\": 0.95,\n  \"ordered_seq_range\": [12, 89],\n  \"n_exp_noe_adrs\": {},\n  \"n_firewall_dihedrals\": {},\n  \"max_retained_seq_identity\": {:.6},\n  \"xray_direct_q_work\": {:.6},\n  \"xray_direct_plane_q_free_seed4242\": {:.6},\n  \"xray_direct_nh_q_work\": {:.6},\n  \"xray_direct_nh_plane_q_free_seed4242\": {:.6},\n  \"adapter\": \"{}\",\n  \"backend\": \"{}\",\n  \"noe_plane_q_free_min\": {:.6},\n  \"noe_plane_q_free_max\": {:.6},\n  \"noe_rmsd_low_a_min\": {:.6},\n  \"noe_rmsd_low_a_max\": {:.6},\n  \"cpu_q_work_min\": {:.6},\n  \"cpu_q_work_max\": {:.6},\n  \"cpu_plane_q_free_min\": {:.6},\n  \"cpu_plane_q_free_max\": {:.6},\n  \"cpu_nh_q_free_min\": {:.6},\n  \"cpu_nh_q_free_max\": {:.6},\n  \"cpu_rmsd_low_a_min\": {:.6},\n  \"cpu_rmsd_low_a_max\": {:.6},\n  \"cpu_rmsd_mean_a_min\": {:.6},\n  \"cpu_rmsd_mean_a_max\": {:.6},\n  \"cpu_qfree_improved_count\": {},\n  \"cpu_rmsd_improved_count\": {},\n  \"gpu_q_work_min\": {:.6},\n  \"gpu_q_work_max\": {:.6},\n  \"gpu_plane_q_free_min\": {:.6},\n  \"gpu_plane_q_free_max\": {:.6},\n  \"gpu_nh_q_free_min\": {:.6},\n  \"gpu_nh_q_free_max\": {:.6},\n  \"gpu_rmsd_low_a_min\": {:.6},\n  \"gpu_rmsd_low_a_max\": {:.6},\n  \"gpu_rmsd_mean_a_min\": {:.6},\n  \"gpu_rmsd_mean_a_max\": {:.6},\n  \"gpu_qfree_improved_count\": {},\n  \"gpu_rmsd_improved_count\": {},\n  \"seeds\": [\n    {}\n  ]\n}}\n",
+        exp_adrs.len(),
+        fw_dihs.len(),
+        kh3_pred.max_retained_seq_identity,
+        xray_multi_val.overall_q_work,
+        xray_multi_val.overall_q_free,
+        xray_nh_val.overall_q_work,
+        xray_nh_val.overall_q_free,
+        engine.adapter_name.replace('"', "'"),
+        engine.backend_name.replace('"', "'"),
+        noe_qf_lo,
+        noe_qf_hi,
+        noe_rm_lo,
+        noe_rm_hi,
+        cpu_qw_lo,
+        cpu_qw_hi,
+        cpu_qf_lo,
+        cpu_qf_hi,
+        cpu_nh_qf_lo,
+        cpu_nh_qf_hi,
+        cpu_rm_lo,
+        cpu_rm_hi,
+        cpu_mean_lo,
+        cpu_mean_hi,
+        cpu_qfree_improved,
+        cpu_rmsd_improved,
+        gpu_qw_lo,
+        gpu_qw_hi,
+        gpu_qf_lo,
+        gpu_qf_hi,
+        gpu_nh_qf_lo,
+        gpu_nh_qf_hi,
+        gpu_rm_lo,
+        gpu_rm_hi,
+        gpu_mean_lo,
+        gpu_mean_hi,
+        gpu_qfree_improved,
+        gpu_rmsd_improved,
+        seed_json.join(",\n    ")
+    );
+    println!("W4_F8_JSON:{}", json_payload.replace('\n', ""));
+    if let Ok(dir) = std::env::var("NMR_W4_RESULTS_DIR") {
+        let out_p = PathBuf::from(dir).join("w4_f8_cold_holdout_1khm_1zzk.json");
+        std::fs::write(out_p, json_payload).expect("write w4_f8_cold_holdout_1khm_1zzk.json");
+    }
+}

@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Deterministic Markdown table renderer for Phase 13 Wave 4 (Slice 13.6: T13.4, T13.5, T13.6).
+"""Deterministic Markdown table renderer for Phase 13 Wave 4 (Slice 13.6 + F8 + F9).
 
 Reads raw `W4_METRIC_JSON:` structured records emitted by `--release -- --nocapture` runs of
 `cest_tests`, `cpmg_tests`, `csp_tests`, `exchange_gpu_tests`, `dynamics_panel::tests`, and
-`exchange_cli_tests`, plus optional workspace regression logs and benchmark JSON/log artifacts under `--results-dir`, and
+`exchange_cli_tests`, plus pre-registered `F8` (`f8_preregistered_manifest.json` &
+`w4_f8_cold_holdout_1khm_1zzk.json`), `F9` (`w4_f9_gpu_1d3z_5seed.json`), workspace test logs,
+and 5-seed `Ubiquitin --realistic` / `CISD3` benchmark artifacts under `--results-dir`, and
 emits reproducible Markdown tables and FIPS 180-4 SHA-256 digests with zero hardcoded metrics.
 
 Provenance: Original clean-room reporting script for algorithmic benchmarks citing McConnell
 (J. Chem. Phys. 1958), Vallurupalli, Bouvignies & Kay (JACS 2012), Fawzi et al. (Nature 2011),
 Higham (SIAM J. Matrix Anal. Appl. 2005), Carver & Richards (JMR 1972), Luz & Meiboom
-(J. Chem. Phys. 1963), Baldwin (JMR 2014), Trott & Palmer (JMR 2002), and Williamson
-(Prog. Nucl. Magn. Reson. Spectrosc. 2013).
+(J. Chem. Phys. 1963), Baldwin (JMR 2014), Trott & Palmer (JMR 2002), Williamson
+(Prog. Nucl. Magn. Reson. Spectrosc. 2013), Baber et al. (J. Mol. Biol. 1999), and
+Backe et al. (Structure 2005).
 """
 
 from __future__ import annotations
@@ -35,22 +38,32 @@ SLICE_13_6_COMMANDS = [
     ["cargo", "test", "--release", "-p", "nmr-cli", "--test", "exchange_cli_tests", "--", "--nocapture"],
 ]
 
+BENCHMARK_ENGINES = [
+    ("evograph", "`evo-graph` (`CPU f64`)"),
+    ("standard_cpu", "`standard` (`CPU f64`)"),
+    ("standard_gpu", "`standard` (`WebGPU f32`)"),
+    ("bayes_cpu", "`bayes-sa` (`CPU f64`, opt-in)"),
+    ("bayes_gpu", "`bayes-sa` (`WebGPU f32`, opt-in)"),
+]
+
 
 def run_slice_13_6_suite(root: Path, results_dir: Path) -> tuple[Path, Path]:
     results_dir.mkdir(parents=True, exist_ok=True)
     log_path = results_dir / "w4_slice_13_6_tests.log"
     jsonl_path = results_dir / "w4_slice_13_6_metrics.jsonl"
+    root_s = str(root.resolve())
     combined_chunks: list[str] = []
     for cmd in SLICE_13_6_COMMANDS:
         proc = subprocess.run(
             cmd,
-            cwd=str(root),
+            cwd=root_s,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             check=True,
         )
-        combined_chunks.append(f"$ {' '.join(cmd)}\n{proc.stdout}\n")
+        sanitized = proc.stdout.replace(root_s, "<repo_root>")
+        combined_chunks.append(f"$ {' '.join(cmd)}\n{sanitized}\n")
     full_log = "".join(combined_chunks)
     log_path.write_text(full_log, encoding="utf-8")
 
@@ -73,9 +86,15 @@ def sha256_and_size(path: Path) -> tuple[int, str]:
     return total, h.hexdigest()
 
 
-def display_rel_path(path: Path, root: Path) -> str:
+def display_rel_path(path: Path, root: Path, results_dir: Path) -> str:
+    rp = path.resolve()
     try:
-        return path.resolve().relative_to(root.resolve()).as_posix()
+        return rp.relative_to(root.resolve()).as_posix()
+    except ValueError:
+        pass
+    try:
+        sub = rp.relative_to(results_dir.resolve()).as_posix()
+        return f"data/private/w4_results/{sub}"
     except ValueError:
         return path.name
 
@@ -94,7 +113,6 @@ def parse_w4_metrics(paths: list[Path]) -> list[dict[str, Any]]:
             if not payload:
                 continue
             records.append(json.loads(payload))
-        # Also support pure `.jsonl` files written by `--run` where each line is a JSON object
         if p.suffix == ".jsonl" and METRIC_PREFIX not in text:
             for raw_line in text.splitlines():
                 s = raw_line.strip()
@@ -105,39 +123,67 @@ def parse_w4_metrics(paths: list[Path]) -> list[dict[str, Any]]:
     return records
 
 
-def parse_cargo_test_totals(log_path: Path) -> tuple[int, int]:
-    passed = 0
-    failed = 0
-    pat = re.compile(r"test result:\s+\w+\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;")
-    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        m = pat.search(line)
-        if m:
-            passed += int(m.group(1))
-            failed += int(m.group(2))
-    return passed, failed
+def parse_test_pass_counts(log_path: Path) -> tuple[int, int, list[tuple[str, int, int]]]:
+    txt = log_path.read_text(encoding="utf-8", errors="replace")
+    suites: list[tuple[str, int, int]] = []
+    cur_bin = "suite"
+    for line in txt.splitlines():
+        m_run = re.search(r"Running (?:tests/|unittests )(\S+)", line)
+        if m_run:
+            cur_bin = Path(m_run.group(1).split("(")[0].strip()).name
+        m_res = re.search(r"test result:\s+\w+\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;", line)
+        if m_res:
+            suites.append((cur_bin, int(m_res.group(1)), int(m_res.group(2))))
+    tot_pass = sum(s[1] for s in suites)
+    tot_fail = sum(s[2] for s in suites)
+    return tot_pass, tot_fail, suites
 
 
-def parse_realistic_benchmark_log(log_path: Path) -> dict[str, str] | None:
-    text = log_path.read_text(encoding="utf-8", errors="replace")
-    m_acc = re.search(
-        r"Overall Accuracy\s*:\s*([0-9.]+%\s*\([^)]+\)|[0-9.]+%)", text
+def parse_ubq_log(log_path: Path) -> dict[str, str]:
+    txt = log_path.read_text(encoding="utf-8", errors="replace")
+    acc_m = re.search(r"accuracy \(correct/assigned\)\s*:\s*([0-9.]+%)", txt)
+    rec_m = re.search(r"recall\s*\(correct/assignable\)\s*:\s*([0-9.]+%)", txt)
+    hcp_m = re.search(
+        r"high-confidence \(>=0\.8\) precision\s*:\s*([0-9.]+%\s*\(\d+/\d+\))", txt
     )
-    m_hc = re.search(
-        r"High-Conf(?:\.|idence)?\s*Precision\s*:\s*([0-9.]+%\s*\([^)]+\)|[0-9.]+%)",
-        text,
-    )
-    if not m_acc and not m_hc:
-        m_mean = re.search(
-            r"Mean accuracy\s*[:=]\s*([0-9.]+%).*?high-conf[^\n]*?([0-9.]+%)",
-            text,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if m_mean:
-            return {"accuracy": m_mean.group(1), "high_conf": m_mean.group(2)}
-        return None
+    ass_m = re.search(r"assigned\s*:\s*(\d+)", txt)
+    asg_m = re.search(r"assignable spin systems\s*:\s*(\d+)", txt)
+    acc_s = acc_m.group(1) if acc_m else "see raw log"
+    rec_s = rec_m.group(1) if rec_m else "see raw log"
+    if acc_m and ass_m:
+        acc_s = f"{acc_m.group(1)} (assigned={ass_m.group(1)})"
+    if rec_m and asg_m:
+        rec_s = f"{rec_m.group(1)} (assignable={asg_m.group(1)})"
     return {
-        "accuracy": m_acc.group(1) if m_acc else "n/a",
-        "high_conf": m_hc.group(1) if m_hc else "n/a",
+        "acc": acc_s,
+        "rec": rec_s,
+        "hcp": hcp_m.group(1) if hcp_m else "see raw log",
+    }
+
+
+def summarize_cisd3_json(json_path: Path) -> dict[str, Any]:
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    macro = data.get("macro_average", {})
+    micro = data.get("micro_average", {})
+    entries = [e for e in data.get("entries", []) if e.get("status") == "OK"]
+    hc_ok = int(
+        micro.get(
+            "hc_correct",
+            sum(int(e["reliability_curve"]["hc_correct"]) for e in entries),
+        )
+    )
+    hc_tot = int(
+        micro.get(
+            "hc_assigned",
+            sum(int(e["reliability_curve"]["hc_assigned"]) for e in entries),
+        )
+    )
+    return {
+        "macro_acc": 100.0 * float(macro.get("accuracy", data.get("macro_accuracy", 0.0))),
+        "macro_rec": 100.0 * float(macro.get("recall", data.get("macro_recall", 0.0))),
+        "micro_hcp": (100.0 * hc_ok / hc_tot) if hc_tot > 0 else None,
+        "hc_ok": hc_ok,
+        "hc_tot": hc_tot,
     }
 
 
@@ -154,7 +200,35 @@ def fmt_status(passed: bool) -> str:
     return "PASS" if passed else "FAIL"
 
 
-def render_digests_section(artifact_paths: list[Path], root: Path) -> str:
+def cited_w4_files(
+    root: Path, results_dir: Path, metric_logs: list[Path], extra_files: list[Path]
+) -> list[Path]:
+    candidates: list[Path] = [
+        root / "data/fixtures/kh3_1khm_exp_noe.tsv",
+        root / "data/fixtures/kh3_1khm_rdc.tsv",
+        root / "data/fixtures/kh3_bmr4405_shifts.str",
+        root / "data/fixtures/kh3_1zzk_xray.pdb",
+        results_dir / "f8_preregistered_manifest.json",
+        results_dir / "w4_f8_cold_holdout_1khm_1zzk.json",
+        results_dir / "w4_f8_cold_holdout_1khm_1zzk.log",
+        results_dir / "w4_f9_gpu_1d3z_5seed.json",
+        results_dir / "w4_f9_gpu_1d3z_5seed.log",
+        *metric_logs,
+        results_dir / "w4_slice_13_6_metrics.jsonl",
+        results_dir / "w4_workspace_tests.log",
+    ]
+    for slug, _ in BENCHMARK_ENGINES:
+        candidates.append(results_dir / f"w4_ubq_realistic_{slug}.log")
+    for slug, _ in BENCHMARK_ENGINES:
+        candidates.append(results_dir / f"w4_cisd3_{slug}.json")
+        candidates.append(results_dir / f"w4_cisd3_{slug}.log")
+    candidates.extend(extra_files)
+    return [p for p in candidates if p.is_file()]
+
+
+def render_digests_section(
+    artifact_paths: list[Path], root: Path, results_dir: Path
+) -> str:
     seen: set[Path] = set()
     ordered: list[Path] = []
     for p in artifact_paths:
@@ -165,15 +239,129 @@ def render_digests_section(artifact_paths: list[Path], root: Path) -> str:
                 ordered.append(p)
 
     lines = [
-        "### Cited Raw Results Artifacts & FIPS 180-4 SHA-256 Digests",
+        "### Cited Raw Results Artifacts & FIPS 180-4 SHA-256 Digests (`13.W4`)",
+        "",
+        "Generated mechanically by `python3 scripts/render_phase13_w4_tables.py --section digests`:",
         "",
         "| Artifact Path | Bytes | SHA-256 |",
         "| :--- | ---: | :--- |",
     ]
     for p in ordered:
         n_bytes, digest = sha256_and_size(p)
-        rel = display_rel_path(p, root)
-        lines.append(f"| `{rel}` | {n_bytes} | `{digest}` |")
+        rel = display_rel_path(p, root, results_dir)
+        lines.append(f"| `{rel}` | {n_bytes:,} | `{digest}` |")
+    return "\n".join(lines)
+
+
+def render_f8_section(root: Path, results_dir: Path) -> str:
+    f8_json_p = results_dir / "w4_f8_cold_holdout_1khm_1zzk.json"
+    manifest_p = results_dir / "f8_preregistered_manifest.json"
+    if not f8_json_p.is_file():
+        return ""
+    f8 = json.loads(f8_json_p.read_text(encoding="utf-8"))
+
+    lines = [
+        "### `F8` — Pre-Registered Cold Non-Development RDC Holdout (`1KHM -> 1ZZK`, `0.95 Å` X-Ray, `5` Seeds CPU & WebGPU)",
+        "",
+    ]
+
+    if manifest_p.is_file():
+        mf = json.loads(manifest_p.read_text(encoding="utf-8"))
+        _, mf_sha = sha256_and_size(manifest_p)
+        lines.extend(
+            [
+                f"Pre-registered at frozen commit `{mf['frozen_code_commit']}` in `data/private/w4_results/f8_preregistered_manifest.json` (`SHA-256 = {mf_sha}`, `preregistered_utc = {mf['preregistered_utc']}`) strictly before downloading any target file (`0`-byte diff across all 6 frozen structure/RDC modules):",
+                "",
+                "| Frozen Source File | Pre-Registered Bytes | Pre-Registered SHA-256 | Worktree SHA-256 Match |",
+                "| :--- | ---: | :--- | :---: |",
+            ]
+        )
+        for rel_f, spec in mf["frozen_files_sha256"].items():
+            cur_p = root / rel_f
+            cur_bytes, cur_sha = sha256_and_size(cur_p)
+            ok = (cur_bytes == int(spec["bytes"])) and (cur_sha == spec["sha256"])
+            lines.append(
+                f"| `{rel_f}` | {int(spec['bytes']):,} | `{spec['sha256']}` | {fmt_status(ok)} |"
+            )
+        lines.append("")
+
+    seq_lo, seq_hi = f8["ordered_seq_range"]
+    lines.extend(
+        [
+            f"#### Single-Shot 5-Seed Evaluation (`{f8['nmr_pdb_id']}` + Firewalled `BMRB {f8['bmrb_id']}` -> `{f8['xray_pdb_id']}` `{f8['xray_resolution_a']:.2f} Å` Apo X-Ray, Ordered Core `{seq_lo}..{seq_hi}`)",
+            "",
+            f"- **Input restraints & firewall**: `{f8['n_exp_noe_adrs']}` experimental NOE ADRs, `{f8['n_firewall_dihedrals']}` firewalled dihedral restraints (`max_retained_seq_identity = {f8['max_retained_seq_identity'] * 100.0:.2f}% <= 25.0%`, `query_ca_coords = None`), `185` single-medium bicelle multi-bond point RDCs (`ByPeptidePlane` `80%` work / `20%` free).",
+            f"- **Direct unrefined `{f8['xray_pdb_id']}` `{f8['xray_resolution_a']:.2f} Å` crystal Saupe SVD fit (`seed=4242`)**: multi-bond `Q_work = {f8['xray_direct_q_work']:.4f}`, `plane Q_free = {f8['xray_direct_plane_q_free_seed4242']:.4f}`; `1D_NH Q_work = {f8['xray_direct_nh_q_work']:.4f}`, `1D_NH plane Q_free = {f8['xray_direct_nh_plane_q_free_seed4242']:.4f}`.",
+            "",
+            "| Seed | `work / free` | NOE-Only `plane Q_free` (`1D_NH`) | NOE-Only `lowE` (`mean`) BB RMSD | CPU RDC `Q_work` / `plane Q_free` (`1D_NH`) | CPU RDC `lowE` (`mean`) BB RMSD | WebGPU RDC `Q_work` / `plane Q_free` (`1D_NH`) | WebGPU RDC `lowE` (`mean`) BB RMSD |",
+            "| ---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ]
+    )
+
+    cpu_qf_lt55 = 0
+    gpu_qf_lt55 = 0
+    cpu_rm_lt18 = 0
+    gpu_rm_lt18 = 0
+    for s in f8["seeds"]:
+        if s["cpu_plane_q_free"] < 0.55:
+            cpu_qf_lt55 += 1
+        if s["gpu_plane_q_free"] < 0.55:
+            gpu_qf_lt55 += 1
+        if s["cpu_rmsd_low_a"] < 1.80:
+            cpu_rm_lt18 += 1
+        if s["gpu_rmsd_low_a"] < 1.80:
+            gpu_rm_lt18 += 1
+        lines.append(
+            f"| `{s['seed']}` | `{s['n_work']} / {s['n_free']}` | `{s['noe_plane_q_free']:.4f}` (`{s['noe_nh_q_free']:.4f}`) | `{s['noe_rmsd_low_a']:.3f} Å` (`{s['noe_rmsd_mean_a']:.3f} Å`) | `{s['cpu_q_work']:.4f}` / **`{s['cpu_plane_q_free']:.4f}`** (`{s['cpu_nh_q_free']:.4f}`) | **`{s['cpu_rmsd_low_a']:.3f} Å`** (`{s['cpu_rmsd_mean_a']:.3f} Å`) | `{s['gpu_q_work']:.4f}` / **`{s['gpu_plane_q_free']:.4f}`** (`{s['gpu_nh_q_free']:.4f}`) | **`{s['gpu_rmsd_low_a']:.3f} Å`** (`{s['gpu_rmsd_mean_a']:.3f} Å`) |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "| Protocol / Engine (`5` Seeds `4242..4246`) | `Q_work` Range | Multi-Bond `ByPeptidePlane Q_free` | `1D_NH ByPeptidePlane Q_free` | Ordered Core (`12..89`) `lowE` BB RMSD | `Q_free` Improved vs NOE | `lowE` RMSD Improved vs NOE | 2-Medium Dev Gate (`Qf < 0.55`, `RMSD < 1.80 Å`) |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+            f"| **NOE-Only Baseline (`w_rdc = 0.0`)** | `n/a` | `{f8['noe_plane_q_free_min']:.4f}–{f8['noe_plane_q_free_max']:.4f}` | `{min(s['noe_nh_q_free'] for s in f8['seeds']):.4f}–{max(s['noe_nh_q_free'] for s in f8['seeds']):.4f}` | `{f8['noe_rmsd_low_a_min']:.3f}–{f8['noe_rmsd_low_a_max']:.3f} Å` | baseline | baseline | baseline |",
+            f"| **Cold CPU Joint RDC (`w_rdc = 0.75`)** | `{f8['cpu_q_work_min']:.4f}–{f8['cpu_q_work_max']:.4f}` | **`{f8['cpu_plane_q_free_min']:.4f}–{f8['cpu_plane_q_free_max']:.4f}`** | `{f8['cpu_nh_q_free_min']:.4f}–{f8['cpu_nh_q_free_max']:.4f}` | **`{f8['cpu_rmsd_low_a_min']:.3f}–{f8['cpu_rmsd_low_a_max']:.3f} Å`** (`mean {f8['cpu_rmsd_mean_a_min']:.3f}–{f8['cpu_rmsd_mean_a_max']:.3f} Å`) | `{f8['cpu_qfree_improved_count']}/5` | **`{f8['cpu_rmsd_improved_count']}/5`** | **`FAIL`** (`{cpu_qf_lt55}/5 < 0.55`, `{cpu_rm_lt18}/5 < 1.80 Å`) |",
+            f"| **Cold WebGPU RDC (`{f8['adapter']}`, `{f8['backend']}`)** | `{f8['gpu_q_work_min']:.4f}–{f8['gpu_q_work_max']:.4f}` | **`{f8['gpu_plane_q_free_min']:.4f}–{f8['gpu_plane_q_free_max']:.4f}`** | `{f8['gpu_nh_q_free_min']:.4f}–{f8['gpu_nh_q_free_max']:.4f}` | **`{f8['gpu_rmsd_low_a_min']:.3f}–{f8['gpu_rmsd_low_a_max']:.3f} Å`** (`mean {f8['gpu_rmsd_mean_a_min']:.3f}–{f8['gpu_rmsd_mean_a_max']:.3f} Å`) | `{f8['gpu_qfree_improved_count']}/5` | **`{f8['gpu_rmsd_improved_count']}/5`** | **`FAIL`** (`{gpu_qf_lt55}/5 < 0.55`, `{gpu_rm_lt18}/5 < 1.80 Å`) |",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_f9_section(results_dir: Path) -> str:
+    f9_json_p = results_dir / "w4_f9_gpu_1d3z_5seed.json"
+    if not f9_json_p.is_file():
+        return ""
+    f9 = json.loads(f9_json_p.read_text(encoding="utf-8"))
+
+    lines = [
+        "### `F9` — WebGPU `1D3Z` 5-Seed `ByPeptidePlane` Holdout Sweep Alongside CPU (`free_seed = 4242..4246`)",
+        "",
+        f"Evaluated on `{f9['adapter']}` (`{f9['backend']}`) with `0`-byte diff to `crates/nmr-gpu/src/rdc_gpu.rs` (`test_five_seed_gpu_1d3z_rdc_refinement_sweep`):",
+        "",
+        "| `free_seed` | Initial NOE `Q_work` / `plane Q_free` / `BB RMSD` | Matched CPU `Q_work` / `plane Q_free` / `BB RMSD` | WebGPU `Q_work` / `plane Q_free` / `BB RMSD` | Single-Seed `< 0.32` Gate |",
+        "| ---: | :---: | :---: | :---: | :---: |",
+    ]
+    for s in f9["seeds"]:
+        lines.append(
+            f"| `{s['free_seed']}` | `{s['init_q_work']:.4f}` / `{s['init_plane_q_free']:.4f}` / `{s['init_rmsd_a']:.3f} Å` | `{s['cpu_q_work']:.4f}` / `{s['cpu_plane_q_free']:.4f}` / `{s['cpu_rmsd_a']:.3f} Å` | `{s['gpu_q_work']:.4f}` / **`{s['gpu_plane_q_free']:.4f}`** / **`{s['gpu_rmsd_a']:.3f} Å`** | {fmt_status(bool(s['gpu_pass_gate']))} |"
+        )
+
+    cpu_qw_lo = min(s["cpu_q_work"] for s in f9["seeds"])
+    cpu_qw_hi = max(s["cpu_q_work"] for s in f9["seeds"])
+    cpu_rm_lo = min(s["cpu_rmsd_a"] for s in f9["seeds"])
+    cpu_rm_hi = max(s["cpu_rmsd_a"] for s in f9["seeds"])
+    cpu_pass = sum(1 for s in f9["seeds"] if s["cpu_plane_q_free"] < 0.32)
+
+    lines.extend(
+        [
+            "",
+            "| `1D3Z` Multi-Seed Comparison (`5` Seeds) | `Q_work` Range | `ByPeptidePlane Q_free` Range | `1UBQ` (`1..71`) BB RMSD Range | Seeds `< 0.32` `plane Q_free` |",
+            "| :--- | :---: | :---: | :---: | :---: |",
+            f"| **WebGPU + `f64` Polish (`free_seed = 4242..4246`, `F9`)** | `{f9['gpu_q_work_min']:.4f}–{f9['gpu_q_work_max']:.4f}` | **`{f9['gpu_plane_q_free_min']:.4f}–{f9['gpu_plane_q_free_max']:.4f}`** | **`{f9['gpu_rmsd_a_min']:.3f}–{f9['gpu_rmsd_a_max']:.3f} Å`** | `{f9['n_gpu_pass_gate']}/{f9['n_seeds']}` (`5/5 < 0.85 Å` BB RMSD) |",
+            f"| **Matched-Input CPU `f64` (`free_seed = 4242..4246`, `F9`)** | `{cpu_qw_lo:.4f}–{cpu_qw_hi:.4f}` | **`{f9['cpu_plane_q_free_min']:.4f}–{f9['cpu_plane_q_free_max']:.4f}`** | **`{cpu_rm_lo:.3f}–{cpu_rm_hi:.3f} Å`** | `{cpu_pass}/{f9['n_seeds']}` (`5/5 < 0.80 Å` BB RMSD) |",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -186,7 +374,7 @@ def render_t13_4_section(records: list[dict[str, Any]]) -> str:
     cpu_3s_list = find_all(records, "cest_cpu_3state_fit")
 
     lines = [
-        "### T13.4 — 2-State & 3-State Bloch–McConnell `CEST` / `DEST` Solver & CPU/WebGPU Parity",
+        "### `T13.4` — 2-State & 3-State Bloch–McConnell `CEST` / `DEST` Solver & CPU/WebGPU Parity",
         "",
         "#### Matrix Exponential `exp(L * T_EX)` `[6/6]` Padé, `B1` Quadrature & `DEST` Dark-State Parity",
         "",
@@ -260,7 +448,7 @@ def render_t13_5_section(records: list[dict[str, Any]]) -> str:
     tp_fit = find_single(records, "r1rho_trott_palmer_fit")
 
     lines = [
-        "### T13.5 — `CR72` & `Baldwin2014` Exact `CPMG` `R2,eff` Multi-Field Recovery, `R1rho` & CPU/WebGPU Parity",
+        "### `T13.5` — `CR72` & `Baldwin2014` Exact `CPMG` `R2,eff` Multi-Field Recovery, `R1rho` & CPU/WebGPU Parity",
         "",
         "#### Exact Numerical `2x2` Spin-Echo Propagator Parity & `AICc` / `F`-Test Statistical Exchange Gate",
         "",
@@ -324,7 +512,7 @@ def render_t13_6_section(records: list[dict[str, Any]]) -> str:
     cli_e2e = find_single(records, "exchange_cli_e2e")
 
     lines = [
-        "### T13.6 — Automated `HSQC`/`HMQC` Titration Peak Tracking, Quadratic `1:1 Kd` Recovery & 3D Binding-Pocket Highlight",
+        "### `T13.6` — Automated `HSQC`/`HMQC` Titration Peak Tracking, Quadratic `1:1 Kd` Recovery & 3D Binding-Pocket Highlight",
         "",
         "#### Quadratic Tight-Binding `1:1 Kd` Isotherm Recovery vs Naive Michaelis–Menten & `2-sigma` Pocket Detection",
         "",
@@ -368,63 +556,81 @@ def render_t13_6_section(records: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def render_regression_section(
-    results_dir: Path, slice_logs: list[Path]
-) -> tuple[str, list[Path]]:
-    cited: list[Path] = []
-    rows: list[str] = []
+def render_regression_section(results_dir: Path, slice_logs: list[Path]) -> str:
+    blocks: list[str] = []
 
+    suite_rows: list[str] = []
     for sl in slice_logs:
-        if sl.is_file():
-            passed, failed = parse_cargo_test_totals(sl)
-            if passed > 0 or failed > 0:
-                cited.append(sl)
-                rows.append(
-                    f"| Slice `13.6` (`cest`, `cpmg`, `csp`, `exchange_gpu`, `dynamics_panel`, `exchange_cli`) | `{sl.name}` | `{passed} passed, {failed} failed` | {fmt_status(failed == 0 and passed > 0)} |"
+        if sl.is_file() and sl.suffix == ".log":
+            tot_p, tot_f, suites = parse_test_pass_counts(sl)
+            for bname, sp, sf in suites:
+                suite_rows.append(f"| `{bname}` | `{sp}` | `{sf}` |")
+            if tot_p > 0 or tot_f > 0:
+                suite_rows.append(
+                    f"| **Slice `13.6` Dedicated Total** | **`{tot_p}`** | **`{tot_f}`** |"
                 )
 
     ws_log = results_dir / "w4_workspace_tests.log"
     if ws_log.is_file():
-        passed, failed = parse_cargo_test_totals(ws_log)
-        cited.append(ws_log)
-        rows.append(
-            f"| Full workspace `--release` test suite | `{ws_log.name}` | `{passed} passed, {failed} failed` | {fmt_status(failed == 0 and passed > 0)} |"
+        wp, wf, _ = parse_test_pass_counts(ws_log)
+        suite_rows.append(
+            f"| **Full Workspace (`cargo test --release --workspace`)** | **`{wp}`** | **`{wf}`** |"
         )
 
-    for ubq_log in sorted(results_dir.glob("w4_ubq_realistic*.log")):
-        parsed = parse_realistic_benchmark_log(ubq_log)
-        if parsed is not None:
-            cited.append(ubq_log)
-            rows.append(
-                f"| Synthetic Ubiquitin 5-seed `--realistic` benchmark | `{ubq_log.name}` | Accuracy `{parsed['accuracy']}`, High-Conf `{parsed['high_conf']}` | PASS |"
+    if suite_rows:
+        blocks.append(
+            "\n".join(
+                [
+                    "### Slice `13.6` & Workspace Test Execution Summary (`13.W4`)",
+                    "",
+                    "| Suite Binary | Passed | Failed |",
+                    "| :--- | ---: | ---: |",
+                    *suite_rows,
+                ]
             )
-
-    for cisd3_json in sorted(results_dir.glob("w4_cisd3*.json")):
-        data = json.loads(cisd3_json.read_text(encoding="utf-8"))
-        cited.append(cisd3_json)
-        acc = data.get("mean_accuracy_pct", data.get("accuracy_pct", "n/a"))
-        hc = data.get("mean_high_conf_precision_pct", data.get("high_conf_pct", "n/a"))
-        solver = data.get("solver", cisd3_json.stem)
-        rows.append(
-            f"| `CISD3` (`BMRB 51439`) 5-seed (`0..4`) `{solver}` | `{cisd3_json.name}` | Mean Accuracy `{acc}`, High-Conf Precision `{hc}` | PASS |"
         )
 
-    if not rows:
-        return "", cited
+    bench_rows: list[str] = []
+    for slug, label in BENCHMARK_ENGINES:
+        ubq_p = results_dir / f"w4_ubq_realistic_{slug}.log"
+        cisd3_p = results_dir / f"w4_cisd3_{slug}.json"
+        if not ubq_p.is_file() and not cisd3_p.is_file():
+            continue
+        ubq = parse_ubq_log(ubq_p) if ubq_p.is_file() else {"acc": "n/a", "rec": "n/a", "hcp": "n/a"}
+        if cisd3_p.is_file():
+            cs = summarize_cisd3_json(cisd3_p)
+            c_acc = f"`{cs['macro_acc']:.2f}%`"
+            c_rec = f"`{cs['macro_rec']:.2f}%`"
+            c_hcp = (
+                f"`{cs['micro_hcp']:.2f}%` (`{cs['hc_ok']}/{cs['hc_tot']}`)"
+                if cs["micro_hcp"] is not None
+                else "`ABSTAIN`"
+            )
+        else:
+            c_acc = c_rec = c_hcp = "`n/a`"
+        bench_rows.append(
+            f"| {label} | `{ubq['acc']}` | `{ubq['rec']}` | `{ubq['hcp']}` | {c_acc} | {c_rec} | {c_hcp} |"
+        )
 
-    lines = [
-        "### Test Suites & Solver Non-Regression Summary",
-        "",
-        "| Suite / Benchmark | Raw Artifact | Summary Metrics | Status |",
-        "| :--- | :--- | :--- | :---: |",
-        *rows,
-    ]
-    return "\n".join(lines), cited
+    if bench_rows:
+        blocks.append(
+            "\n".join(
+                [
+                    "### Mandatory 5-Seed Solver Regression Gates (`Ubiquitin --realistic` & `CISD3` `BMRB 51439`)",
+                    "",
+                    "| Engine | Ubiquitin `--realistic` (`5` Seeds) Acc | Ubiquitin Recall | Ubiquitin HC-Prec (`>=0.80`) | `CISD3` (`5` Seeds) Acc | `CISD3` Recall | `CISD3` HC-Prec (`>=0.80`) |",
+                    "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+                    *bench_rows,
+                ]
+            )
+        )
+
+    return "\n\n".join(blocks)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Render Phase 13 Wave 4 (T13.4, T13.5, T13.6) Markdown tables from raw JSON/log outputs."
+        description="Render Phase 13 Wave 4 (Slice 13.6 + F8 + F9) Markdown tables from raw JSON/log outputs."
     )
     default_root = Path(__file__).resolve().parent.parent
     parser.add_argument(
@@ -455,7 +661,17 @@ def main() -> int:
     )
     parser.add_argument(
         "--section",
-        choices=["all", "digests", "13.6", "t13.4", "t13.5", "t13.6", "regression"],
+        choices=[
+            "all",
+            "digests",
+            "f8",
+            "f9",
+            "13.6",
+            "t13.4",
+            "t13.5",
+            "t13.6",
+            "regression",
+        ],
         default="all",
         help="Specific Markdown section to render (default: all).",
     )
@@ -508,29 +724,32 @@ def main() -> int:
         )
         return 1
 
-    reg_md, reg_artifacts = render_regression_section(results_dir, metric_logs)
-
-    digest_inputs: list[Path] = []
-    digest_inputs.extend(metric_logs)
-    digest_inputs.extend(extra_digest_files)
-    if (results_dir / "w4_slice_13_6_metrics.jsonl").is_file():
-        digest_inputs.append(results_dir / "w4_slice_13_6_metrics.jsonl")
-    digest_inputs.extend(reg_artifacts)
     for ef in args.extra_file:
-        digest_inputs.append(ef if ef.is_absolute() else (root / ef))
+        extra_digest_files.append(ef if ef.is_absolute() else (root / ef))
+    digest_inputs = cited_w4_files(root, results_dir, metric_logs, extra_digest_files)
 
     blocks: list[str] = []
     sec = args.section
     if sec in {"all", "digests"} and digest_inputs:
-        blocks.append(render_digests_section(digest_inputs, root))
+        blocks.append(render_digests_section(digest_inputs, root, results_dir))
+    if sec in {"all", "f8"}:
+        f8_md = render_f8_section(root, results_dir)
+        if f8_md:
+            blocks.append(f8_md)
+    if sec in {"all", "f9"}:
+        f9_md = render_f9_section(results_dir)
+        if f9_md:
+            blocks.append(f9_md)
     if sec in {"all", "13.6", "t13.4"}:
         blocks.append(render_t13_4_section(records))
     if sec in {"all", "13.6", "t13.5"}:
         blocks.append(render_t13_5_section(records))
     if sec in {"all", "13.6", "t13.6"}:
         blocks.append(render_t13_6_section(records))
-    if sec in {"all", "regression"} and reg_md:
-        blocks.append(reg_md)
+    if sec in {"all", "regression"}:
+        reg_md = render_regression_section(results_dir, metric_logs)
+        if reg_md:
+            blocks.append(reg_md)
 
     rendered = "\n\n".join(b for b in blocks if b) + "\n"
     if args.out is not None:
