@@ -175,23 +175,23 @@ nmrassign csp \
   --out ./out/csp_kd.tsv
 
 # Analytical 1D DSP, Voigt/Hoye J-trees, journal export & NIST-traceable GUM qNMR purity
-nmrassign nmr1d process --in ./data/compound_1h/1 --solvent CDCl3 --hsvd --deconvolve --out ./out/spec1d.jdx
-nmrassign nmr1d multiplet --in ./out/spec1d.jdx --solvent CDCl3 --style acs --out ./out/multiplets.txt
-nmrassign nmr1d qnmr --in ./out/spec1d.jdx \
-  --std-id DMSO2 --std-mass-mg 5.12 --std-purity 0.9994 \
-  --analyte-mass-mg 12.40 --analyte-mw 180.16 --analyte-protons 3 \
-  --analyte-ppm 2.28:2.42 --out ./out/qnmr_report.json
+nmrassign nmr1d process --in ./data/compound_1h/1 --solvent CDCl3 --hsvd --deconvolve --out ./out/spec1d.tsv
+nmrassign nmr1d multiplet --in ./out/spec1d.tsv --solvent CDCl3 --style acs --out ./out/multiplets.tsv --report-out ./out/multiplets.txt
+nmrassign nmr1d qnmr --in ./out/spec1d.tsv \
+  --std-crm DMSO2 --std-mass-mg 5.12 --std-purity 0.9994 --std-region 3.05:2.95 \
+  --analyte-mass-mg 12.40 --analyte-mw 180.16 --analyte-region 2.42:2.28:3:Ac \
+  --out ./out/qnmr.tsv --json-out ./out/qnmr_report.json
 
 # Pseudo-2D Stejskal-Tanner / Wu-Johnson BPP-LED DOSY (default BIC fit; opt-in Tikhonov ILT & MW)
-nmrassign dosy fit --in ./data/mixture_dosy/10 --criterion bic --solvent CDCl3 --temp-k 298.15 --engine auto --out ./out/dosy_bic.tsv
-nmrassign dosy ilt --in ./data/mixture_dosy/10 --strategy gcv --out ./out/dosy_ilt.tsv
+nmrassign dosy fit --in ./data/mixture_decay.tsv --exp-dir ./data/mixture_dosy/10 --criterion bic --solvent CDCl3 --temp-k 298.15 --engine auto --out ./out/dosy_bic.tsv
+nmrassign dosy ilt --in ./data/mixture_decay.tsv --exp-dir ./data/mixture_dosy/10 --strategy gcv --out ./out/dosy_ilt.tsv
 nmrassign dosy mw --d 7.8e-10 --solvent CDCl3 --temp-k 298.15
 
 # Untargeted 1D Metabolomics: AI-Binning + PQN, PCA Hotelling T^2/Q, k-fold OPLS-DA & STOCSY
-nmrassign metabolomics bin --manifest cohort_manifest.tsv --out cohort_matrix.tsv --method aib --norm pqn --align-ppm 0.025
-nmrassign metabolomics pca --matrix cohort_matrix.tsv --out pca_report.json --components 3 --scale pareto
-nmrassign metabolomics oplsda --matrix cohort_matrix.tsv --out oplsda_biomarkers.tsv --ortho 1 --scale pareto --cv-folds 7 --permutations 200
-nmrassign metabolomics stocsy --matrix cohort_matrix.tsv --driver-ppm 1.33 --out stocsy_1p33ppm.tsv
+nmrassign metabolomics bin --manifest cohort_manifest.tsv -o cohort_buckets.csv --study-out cohort_study.json --method aib --norm pqn --align auto --max-shift 0.025 --mask urine
+nmrassign metabolomics pca --in cohort_buckets.csv -o pca_report.json --components 3 --scale pareto
+nmrassign metabolomics oplsda --in cohort_buckets.csv --biomarkers-out oplsda_biomarkers.csv -o oplsda_summary.json --ortho 1 --scale pareto --cv-folds 7 --permutations 200
+nmrassign metabolomics stocsy --in cohort_buckets.csv --driver-ppm 1.33 --min-r2 0.80 -o stocsy_1p33ppm.json
 ```
 
 #### 5. `chem`, `export-fig`, `serve`, `mcp`, `mcp-config` & Reproducible Benchmark Suites
@@ -209,9 +209,9 @@ nmrassign export-fig --out-dir docs/assets [--panel all|hsqc|strips|pdb-s2|nmr1d
 # Self-hosted loopback HTTP REST job service & browser dashboard
 nmrassign serve --bind 127.0.0.1:8080 --storage ./jobs
 
-# Sandboxed JSON-RPC 2.0 MCP server (default --mode read-only) & client config generator
+# Sandboxed JSON-RPC 2.0 MCP server (default --mode read-only; prefer NMR_MCP_BEARER_TOKEN over argv --token) & client config generator
 nmrassign mcp --transport stdio --root ./project_dir --mode read-only
-nmrassign mcp --transport http --bind 127.0.0.1:54912 --token <session-token> --root ./project_dir --mode read-only
+NMR_MCP_BEARER_TOKEN="<32+-char-session-token>" nmrassign mcp --transport http --bind 127.0.0.1:54912 --root ./project_dir --mode read-only
 nmrassign mcp-config --client antigravity --root ./project_dir --mode read-only [--bridge-port 54912]
 
 # Rate-limited (<= 1 req/s) CC0 BMRB downloader writing SHA-256 PROVENANCE.md
@@ -236,7 +236,7 @@ nmrassign real-benchmark --manifest data/benchmark/real_manifest.tsv --split dev
 `nmr-assign` implements the open **Model Context Protocol (`MCP`, JSON-RPC 2.0)** specification in pure safe Rust (`serde`, `serde_json`, `std::io`, `std::net`—zero external SDK or image-encoding crates) across two complementary transports:
 
 > [!IMPORTANT] MCP Validation Scope (In-Process / Subprocess Protocol Self-Consistency)
-> JSON-RPC 2.0 framing (`stdio` newline & `Content-Length` pre-allocation caps), canonicalized path sandboxing, loopback HTTP bearer-token / DNS-rebinding guards, `256`-step Undo curation reversibility, and RFC 2083 viewport `PNG` encoding are verified via deterministic Rust unit tests and `nmrassign mcp` CLI subprocess E2E tests (`0` live interactive GUI sessions against external Antigravity, Claude Desktop, or Cursor binaries are executed in automated CI; end-to-end multi-client host smoke testing is tracked openly under follow-up **`F18`**).
+> JSON-RPC 2.0 framing (`stdio` newline & `Content-Length` pre-allocation caps), canonicalized path sandboxing, loopback HTTP bearer-token / DNS-rebinding guards, `256`-step Undo curation reversibility, and RFC 2083 viewport `PNG` encoding are verified via deterministic Rust unit tests and `nmrassign mcp` CLI subprocess E2E tests (`0` live interactive GUI sessions against external Antigravity, Claude Desktop, or Cursor binaries are executed in automated CI; live client smoke testing and non-Unix / CLI bearer-token hardening are tracked openly under follow-ups **`F18`**, **`F19`**, and **`F20`**).
 
 | Transport Mode | Implementation | Ideal Use Case |
 | :--- | :--- | :--- |
@@ -251,7 +251,7 @@ Client JSON configurations can be generated programmatically via `generate_mcp_c
 
 #### 1. Headless `stdio` Mode (`ReadOnly` Default)
 
-Add the following block to your client's `mcpServers` configuration file (for **Antigravity** `mcp_config.json`, **Claude Desktop** `claude_desktop_config.json`, or **Cursor** `.cursor/mcp.json`), substituting your binary and project directory:
+Add the following block to your client's `mcpServers` configuration file (for **Antigravity** `mcp_config.json`, **Claude Desktop** `claude_desktop_config.json`, **Cursor** `.cursor/mcp.json`, or `--client generic` MCP JSON), substituting your binary and project directory:
 
 ```json
 {
@@ -306,9 +306,9 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
    - Canonicalizes every configured `allowed_root` and target path via `std::fs::canonicalize`, blocking symlinks or dangling links escaping `--root`, and formats responses as workspace-relative paths so host user home directories are never leaked.
 3. **Loopback-Only Binding, Constant-Time Auth & DNS-Rebinding Defense**:
    - The desktop HTTP bridge refuses non-loopback bind addresses (`0.0.0.0`, LAN IPs, `[::]`).
-   - Every HTTP request must carry `Authorization: Bearer <token>` verified via non-branching constant-time byte comparison (`401 Unauthorized`), a loopback `Host` header (`127.0.0.1` or `localhost`), and **zero** cross-origin browser `Origin` headers (`403 Forbidden`), defeating local browser CSRF and DNS-rebinding attacks.
+   - Every HTTP request must carry `Authorization: Bearer <token>` verified via non-branching constant-time byte comparison (`401 Unauthorized`; pass tokens to headless `nmrassign mcp --transport http` via `NMR_MCP_BEARER_TOKEN` with `>= 32` random characters rather than `ps`-visible `--token` argv), a loopback `Host` header (`127.0.0.1` or `localhost`), and **zero** cross-origin browser `Origin` headers (`403 Forbidden`), defeating local browser CSRF and DNS-rebinding attacks.
 4. **100% Reversible AI Curation (`256`-Step `McpUndoLog`)**:
-   - In `nmr-gui`, AI curation commands (`AssignSpinSystemToResidue`, `UnassignResidue`, `TogglePeakExclusion`, `JumpToResidue`, `SetCrosshairPpm`, `HighlightResidues3d`) execute exclusively through `McpUndoLog` (`MAX_MCP_UNDO_DEPTH = 256`), preserving bijective `(cluster_id <-> seq_id)` displacements so pressing **`Cmd/Ctrl+Z`** (or calling `undo_last_ai_edit`) restores the exact prior state in one step.
+   - In `nmr-gui`, all 9 live workbench operations (`get_workbench_state`, `capture_viewport_png`, `undo_last_ai_edit`, plus the 3 `navigate_workbench` actions and 3 `propose_curation_edit` actions) synchronize safely with the render thread; mutating commands (`AssignSpinSystemToResidue`, `UnassignResidue`, `TogglePeakExclusion`, `JumpToResidue`, `SetCrosshairPpm`, `HighlightResidues3d`) execute exclusively through `McpUndoLog` (`MAX_MCP_UNDO_DEPTH = 256`), preserving bijective `(cluster_id <-> seq_id)` displacements so pressing **`Cmd/Ctrl+Z`** (or calling `undo_last_ai_edit`) restores the exact prior state in one step.
 
 ### Built-In `MCP` Tools, Resources, Prompts & Error Codes
 
@@ -320,7 +320,7 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
 | `read_nmrstar_summary` | `stdio` | `ReadOnly` | Parse sequence, backbone/sidechain chemical shift counts & ambiguity codes |
 | `read_peak_list_summary` | `stdio` | `ReadOnly` | Summarize picked peak counts per experiment and assembled `SpinSystem` roots |
 | `evaluate_dataset_qc` | `stdio` | `ReadOnly` | Run `DatasetQcReport` completeness, aliphatic corroboration & referencing checks |
-| `predict_homolog_free_torsions` | `stdio` | `ReadOnly` | Predict 3/9-mer $(\phi, \psi)$ restraints under the `<= 25%` 4-layer `HomologFirewall` |
+| `predict_homolog_free_torsions` | `stdio` | `ReadOnly` | Predict 3/9-mer $(\phi, \psi)$ restraints under the `<= 25%` sequence-identity 4-layer `HomologFirewall` |
 | `fit_relaxation_or_exchange` | `stdio` | `ReadOnly` | Fit $R_1$/$R_2$/hetNOE, Lipari–Szabo `M1`–`M5` $S^2$, Bloch–McConnell `CEST`, or Baldwin `CPMG` |
 | `track_csp_titration` | `stdio` | `ReadOnly` | Track 2D `HSQC`/`HMQC` ligand titration trajectories and fit quadratic tight-binding $K_d$ |
 | `analyze_nmr1d_spectrum` | `stdio` | `ReadOnly` | Run 1D DSP, Fulmer solvent referencing, Voigt/Hoye `J`-trees, journal formatting & GUM `qNMR` |
@@ -329,10 +329,10 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
 | `write_curated_peak_tsv` | `stdio` | `ReadWrite` | Write filtered/curated 7-column peak `TSV` strictly inside `allowed_roots` |
 | `export_nmrstar_shifts` | `stdio` | `ReadWrite` | Write `NMR-STAR v3.2` chemical shifts strictly inside `allowed_roots` |
 | `get_workbench_state` | `gui` | `ReadOnly` | Snapshot active residue, `(1H, 15N, 13C)` crosshair, ranked strip candidates, undo depth & QC |
-| `navigate_workbench` | `gui` | `ReadWrite` | Jump strips/crosshairs to a residue or highlight 3D PDB pocket residues (Undo-logged) |
+| `navigate_workbench` | `gui` | `ReadWrite` | Undo-logged navigation (`action`: `"jump_to_residue"`, `"set_crosshair_ppm"`, or `"highlight_residues_3d"`) |
 | `capture_viewport_png` | `gui` | `ReadOnly` | Encode active 2D contour / 3D strip / 3D ribbon viewport as RFC 2083 `image/png` Base64 |
-| `propose_curation_edit` | `gui` | `ReadWrite` | Apply an Undo-logged spin-system assignment, unassignment, or peak exclusion |
-| `undo_last_ai_edit` | `gui` | `ReadWrite` | Revert the most recent AI curation action from `McpUndoLog` |
+| `propose_curation_edit` | `gui` | `ReadWrite` | Undo-logged curation (`action`: `"assign_spin_system"`, `"unassign_residue"`, or `"toggle_peak_exclusion"`) |
+| `undo_last_ai_edit` | `gui` | `ReadWrite` | Revert the most recent AI navigation or curation action from `McpUndoLog` |
 
 #### Built-In `nmr://` Resources & Guided Spectroscopist Prompts
 

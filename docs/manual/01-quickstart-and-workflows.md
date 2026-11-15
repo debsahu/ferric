@@ -64,6 +64,12 @@ Launch `nmr-gui` (`cargo run --release -p nmr-gui`) and drag a spectrometer fold
 | **Sparse Fallback** | `3D HNCA` + `3D HN(CO)CA` | Supported cleanly when `CB` transfer is sensitivity-limited; `DatasetQcReport` monitors bidirectional aliphatic corroboration |
 | **Aliphatic & Aromatic Sidechains** | `13C-HSQC`, `3D HCCH-TOCSY`, `CC(CO)NH`, `H(CC)(CO)NH`, `2D (HB)CB(CGCD)HD/HE`, `His 15N-HMQC` | Completes `CHn` rotamers, `Phe`/`Tyr`/`Trp`/`His` rings, and `His` protonation/tautomer states |
 
+![2D 1H-15N HSQC contour overlay and spin-system roots](../assets/01_hsqc_contour_overlay.svg)
+*Figure 1.1: Deterministic `nmrassign export-fig --panel hsqc` output showing positive and aliased-negative 2D `1H-15N` HSQC marching-squares contours, 1D F1/F2 skyline projections, and `evo-graph` assigned Ubiquitin spin-system roots (`seed = 42`).*
+
+![3D HNCACB sequential strip walk Phe4 to Gly10](../assets/02_sequential_strip_walk.svg)
+*Figure 1.2: Deterministic `nmrassign export-fig --panel strips` 3D `HNCACB` sequential strip walk across Ubiquitin `Phe4 -> Gly10`, illustrating intra-residue `i` and sequential `i-1` `CA`/`CB` ladders, `Thr7` `CB > CA` phase inversion, and `Gly10` `CB` absence (`seed = 42`).*
+
 ### Step-by-Step Globular CLI Workflow
 
 ```bash
@@ -119,7 +125,7 @@ nmrassign structure \
 > - **Backbone assignment is strictly sequence-only**: neither `torsion_db` nor 3D PDB coordinates are ever consulted during `nmrassign assign` unless a user explicitly invokes structure-based `methyl` or `paramagnetic` `PCS` fitting.
 > - **Histidine tautomer & metal safety (`nmr-core::aromatic`)**: `His` tautomer states (`Nδ1-H`, `Nε2-H`, imidazolium) require at least one `15N` observation for `Resolved` status and abstain cleanly (`FastExchangeUncommitted` or `MetalCoordinatedCandidate`) under $\chi^2_{0.95}$ residual gates, preventing false tautomer calls on Zn-coordinated histidines.
 > - **Stereospecific prochiral commitment (`nmr-core::stereospec`)**: `HB2`/`HB3`, `HG1`/`HG2`, and `HD1`/`HD2` receive `Ambiguity_code = 1` **only** when the Student-$t(\nu=4)$ `3J` + local-NOE + tempered Lovell rotamer posterior reaches $\ge 0.90$; dynamic surface sidechains default safely to `Ambiguity_code = 2`.
-- **`RDC` & 3D folding validation scope**: `Ubiquitin` (`1D3Z`/`1UBQ`) and `GB1` (`2JSV`/`1PGB`) served as development folding targets; on the pre-registered single-shot unseen `1KHM` (`KH3` domain, `BMRB 4969` vs X-ray `1ZZK`) benchmark, multi-medium `RDC` refinement improved held-out $Q_{\text{free}}$ (`0.958 -> 0.506`) while overall backbone `CA` RMSD was `3.89 Å` under synthetic NOESY distance restraints (real deposited experimental NOESY peak-list validation is tracked openly under follow-up `F8`).
+> - **`RDC` & 3D folding validation scope (`F8`)**: `Ubiquitin` (`1D3Z`/`1UBQ`) and `GB1` (`2JSV`/`1PGB`) served as development folding targets; on the cold experimental unseen target `1KHM` (`KH3` domain, `89 aa`, experimental NOEs + single-medium bicelle `RDC`s + firewalled `BMRB 4405` shifts evaluated against `0.95 Å` apo X-ray `1ZZK`), adding `RDC`s improves NOE-only backbone RMSD (`3.824–4.798 Å`) on `5/5` seeds to `1.862–4.141 Å` (`CPU`) / `2.390–3.988 Å` (`WebGPU` `lowE`) and improves `ByPeptidePlane` $Q_{\text{free}}$ on `4/5` seeds, while `< 1.80 Å` development-target accuracy is not reached on an unseen protein.
 
 ---
 
@@ -251,3 +257,6 @@ For synthetic organic chemistry, natural products, pharmaceutical quality contro
    - Compute internal-standard `qNMR` mass-fraction purity `% w/w` (`nmrassign nmr1d qnmr`) with GUM expanded uncertainty $U_{k=2}$ against NIST/USP primary standards (`DMSO2`, Maleic acid, `TMB`, `DMT`) with automatic $d_1 < 5 T_1$ saturation warnings.
    - Separate mixture components in situ via Bruker `difflist` (`STE` / `BPP-LED`) or Varian `gzlvl1` pseudo-2D `DOSY` (`nmrassign dosy fit`, `dosy ilt`, `dosy mw`) using `BIC`-selected discrete 1–3 component Stejskal–Tanner fitting on CPU/WebGPU, Stokes–Einstein $R_h$/`MW` estimation, and 4-mode multi-spectrum kinetics/difference stacks.
    - Run untargeted 1D cohort bucketing (`AI-Binning`), `PQN` dilution normalization, `PCA` Hotelling $T^2$/$Q$ outlier screening, leak-free stratified `k`-fold `OPLS-DA`, and `STOCSY` spin-system correlation (`nmrassign metabolomics {bin, pca, oplsda, stocsy}`).
+
+![Octet 2D chemical depiction and 1H/13C chemical shift linking](../assets/08_octet_structure_link.svg)
+*Figure 1.3: Deterministic `nmrassign export-fig --panel octet` output rendering ACS-styled `(S)`-Ibuprofen 2D skeletal depiction with Cahn–Ingold–Prelog stereochemical perception and linked `1H`/`13C` chemical-shift table.*

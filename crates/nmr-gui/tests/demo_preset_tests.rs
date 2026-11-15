@@ -71,8 +71,9 @@ fn test_builtin_demo_suite_in_memory_and_headless_panels() {
         .study
         .as_ref()
         .expect("metabolomics pipeline must be pre-solved");
-    assert!(study.buckets.len() >= 10);
-    assert!(study.opls_da.is_some());
+    let metab_buckets = study.buckets.len();
+    let opls_q2 = study.opls_da.as_ref().expect("OPLS-DA must be solved").q2;
+    assert!(metab_buckets >= 10);
     assert!(suite.metabolomics_panel.active_stocsy.is_some());
 
     // 6. Headless egui rendering smoke test across 1D Stack, DOSY, and Metabolomics panels
@@ -93,4 +94,19 @@ fn test_builtin_demo_suite_in_memory_and_headless_panels() {
     assert_eq!(suite.peaks.len(), suite_repeat.peaks.len());
     assert_eq!(suite.hsqc_2d.data, suite_repeat.hsqc_2d.data);
     assert_eq!(suite.status_summary(), suite_repeat.status_summary());
+    println!(
+        "P16_METRIC_JSON:{{\"suite\":\"demo_preset_tests\",\"seq_len\":{},\"peaks_count\":{},\"spin_systems_count\":{},\"hsqc_nx\":{},\"hsqc_ny\":{},\"hncacb_nz\":{},\"hnco_nz\":{},\"stack1d_traces\":{},\"dosy_peaks\":{},\"metabolomics_samples\":{},\"metabolomics_buckets\":{},\"opls_q2\":{:.6},\"headless_egui_panels\":3,\"deterministic_repeat\":true}}",
+        suite.ubiquitin_ref.sequence.len(),
+        suite.peaks.len(),
+        suite.systems.len(),
+        suite.hsqc_2d.axis_x.size,
+        suite.hsqc_2d.axis_y.size,
+        suite.hncacb_3d.axis_z.size,
+        suite.hnco_3d.axis_z.size,
+        suite.stack1d_panel.traces.len(),
+        suite.dosy_panel.peaks.len(),
+        suite.metabolomics_panel.samples.len(),
+        metab_buckets,
+        opls_q2
+    );
 }

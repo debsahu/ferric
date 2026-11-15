@@ -84,6 +84,9 @@ The interactive **`📚 1D Stack & Kinetics`** panel (`nmr-gui::stack1d_panel`, 
 
 Includes **interval FFT cross-correlation peak alignment** (`align_traces_interval_fft`; Savorani, Tomasi & Engelsen 2010) to remove small pH/temperature peak drift prior to difference or arrayed integral kinetics export (`TSV`, `SVG`, `PNG`).
 
+![Analytical 1D multiplet J-tree, kinetics stack and qNMR](../assets/04_nmr1d_multiplet_stack.svg)
+*Figure 5.1: Deterministic `nmrassign export-fig --panel nmr1d-stack` showcase of recursive Hoye `ddd` `J`-coupling splitting trees, a 5-timepoint arrayed reaction stack, and ISO GUM internal-standard `qNMR` purity metrology (synthetic forward-model showcase).*
+
 ---
 
 ## Pseudo-2D `DOSY`: Stejskal–Tanner vs Tikhonov `ILT` Caveats
@@ -115,7 +118,7 @@ For polydisperse polymers or continuous size distributions, `solve_tikhonov_ilt`
 
 $$\min_{\mathbf{f} \ge 0} \; \|\mathbf{K}\mathbf{f} - \mathbf{y}\|_2^2 + \lambda \|\mathbf{L}_2 \mathbf{f}\|_2^2$$
 
-selecting $\lambda > 0$ over a 24-point logarithmic $\lambda$ sweep via Generalized Cross-Validation (`gcv`, default), Menger-curvature `lcurve` corner detection (which frequently selects the same optimal $\lambda$ grid index as `gcv` on smooth bimodal decays), baseline-$\sigma$ Morozov `discrepancy`, or an explicit `--fixed-lambda` value.
+selecting $\lambda > 0$ over a 25-point logarithmic $\lambda$ sweep via Generalized Cross-Validation (`gcv`, default), Menger-curvature `lcurve` corner detection (which frequently selects the same optimal $\lambda$ grid index as `gcv` on smooth bimodal decays), baseline-$\sigma$ Morozov `discrepancy`, or an explicit `--strategy fixed --lambda <val>` setting.
 
 > [!CAUTION] Inverse Laplace Transform (`ILT`) Conditioning Caveat
 > Real-valued continuous Laplace inversion is **exponentially ill-conditioned** (singular values of $K_{m,q} = e^{-b_m D_q}$ decay super-exponentially):
@@ -130,23 +133,29 @@ From fitted $D$, `nmr-core::dosy` computes temperature-compensated Stokes–Eins
 
 $$R_h = \frac{k_B T}{6\pi \eta(T) D}, \qquad \widehat{\text{MW}} = \left(\frac{\alpha_{\text{solv}}}{D}\right)^{1/\beta_{\text{solv}}}$$
 
+![Pseudo-2D BPP-LED DOSY diffusion map](../assets/05_dosy_2d_diffusion_map.svg)
+*Figure 5.2: Deterministic `nmrassign export-fig --panel dosy` pseudo-2D `BPP-LED` `DOSY` diffusivity map separating a three-component mixture (`Maleate`, `Raffinose`, `Lysozyme`) via `BIC`-selected Stejskal–Tanner fitting alongside Stokes–Einstein hydrodynamic `MW` calibration (synthetic forward-model showcase).*
+
 ### Headless CLI Quick Reference (`nmr1d` & `dosy`)
 
 ```bash
 # 1. Process raw 1D FID (or .jdx / Bruker 1r), autophase, Whittaker baseline, HSVD & Voigt pick
-nmrassign nmr1d process --in ./data/compound_1h/1 --solvent CDCl3 --hsvd --deconvolve --out ./out/spec1d.jdx
+nmrassign nmr1d process --in ./data/compound_1h/1 --solvent CDCl3 --hsvd --deconvolve --out ./out/spec1d.tsv
 
 # 2. Extract Hoye J-coupling multiplet trees & ACS/JOC/RSC/Nature experimental paragraph
-nmrassign nmr1d multiplet --in ./out/spec1d.jdx --solvent CDCl3 --style acs --out ./out/multiplets.txt
+nmrassign nmr1d multiplet --in ./out/spec1d.tsv --solvent CDCl3 --style acs \
+  --out ./out/multiplets.tsv --report-out ./out/multiplets.txt
 
 # 3. Compute ISO GUM internal-standard qNMR purity (% w/w, U_k=2, and 5*T1 saturation audit)
-nmrassign nmr1d qnmr --in ./out/spec1d.jdx \
-  --std-id DMSO2 --std-mass-mg 5.12 --std-purity 0.9994 \
-  --analyte-mass-mg 12.40 --analyte-mw 180.16 --analyte-protons 3 \
-  --analyte-ppm 2.28:2.42 --out ./out/qnmr_report.json
+nmrassign nmr1d qnmr --in ./out/spec1d.tsv \
+  --std-crm DMSO2 --std-mass-mg 5.12 --std-purity 0.9994 --std-region 3.05:2.95 \
+  --analyte-mass-mg 12.40 --analyte-mw 180.16 --analyte-region 2.42:2.28:3:Ac \
+  --out ./out/qnmr.tsv --json-out ./out/qnmr_report.json
 
 # 4. Discrete BIC Stejskal-Tanner / BPP-LED DOSY fit, opt-in Tikhonov ILT & Stokes-Einstein MW
-nmrassign dosy fit --in ./data/mixture_dosy/10 --criterion bic --solvent CDCl3 --temp-k 298.15 --engine auto --out ./out/dosy_bic.tsv
-nmrassign dosy ilt --in ./data/mixture_dosy/10 --strategy gcv --out ./out/dosy_ilt.tsv
+nmrassign dosy fit --in ./data/mixture_decay.tsv --exp-dir ./data/mixture_dosy/10 \
+  --criterion bic --solvent CDCl3 --temp-k 298.15 --engine auto --out ./out/dosy_bic.tsv
+nmrassign dosy ilt --in ./data/mixture_decay.tsv --exp-dir ./data/mixture_dosy/10 \
+  --strategy gcv --out ./out/dosy_ilt.tsv
 nmrassign dosy mw --d 7.8e-10 --solvent CDCl3 --temp-k 298.15
 ```

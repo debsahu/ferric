@@ -265,6 +265,9 @@ fn test_export_fig_all_deterministic_zero_diff_vs_committed_assets() {
         .expect("nmrassign export-fig --panel all should succeed");
 
     let committed_dir = repo_assets_dir();
+    let mut total_bytes = 0usize;
+    let mut min_bytes = usize::MAX;
+    let mut max_bytes = 0usize;
     for &(_slug, fname) in EXPECTED_PANELS {
         let p_a = dir_a.path.join(fname);
         let p_b = dir_b.path.join(fname);
@@ -291,9 +294,25 @@ fn test_export_fig_all_deterministic_zero_diff_vs_committed_assets() {
             "{fname}: fresh export-fig output must have 0-byte diff vs committed docs/assets/{fname}"
         );
 
+        let n_b = bytes_a.len();
+        assert!(
+            n_b < 250 * 1024,
+            "{fname}: SVG size {n_b} B exceeds 250 KiB budget"
+        );
+        total_bytes += n_b;
+        min_bytes = min_bytes.min(n_b);
+        max_bytes = max_bytes.max(n_b);
+
         let svg_text = std::str::from_utf8(&bytes_a).expect("UTF-8 SVG output");
         assert_valid_svg_document(fname, svg_text);
     }
+    println!(
+        "P16_METRIC_JSON:{{\"suite\":\"export_fig_cli_tests\",\"panels_verified\":{},\"total_svg_bytes\":{},\"min_svg_bytes\":{},\"max_svg_bytes\":{},\"zero_diff_repeat\":true,\"zero_diff_committed\":true,\"adversarial_err_cases\":6}}",
+        EXPECTED_PANELS.len(),
+        total_bytes,
+        min_bytes,
+        max_bytes
+    );
 }
 
 #[test]

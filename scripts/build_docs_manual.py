@@ -32,8 +32,24 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import unquote, urlsplit
 
 
+def _read_workspace_version() -> str:
+    cargo_toml = Path(__file__).resolve().parent.parent / "Cargo.toml"
+    if cargo_toml.is_file():
+        in_ws_pkg = False
+        for raw_line in cargo_toml.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith("["):
+                in_ws_pkg = stripped == "[workspace.package]"
+                continue
+            if in_ws_pkg:
+                m = re.match(r'^version\s*=\s*"([^"]+)"', stripped)
+                if m:
+                    return m.group(1)
+    return "0.11.0"
+
+
 SITE_TITLE = "nmr-assign Manual"
-SITE_VERSION_BADGE = "v0.12.0 · Rust + WebGPU"
+SITE_VERSION_BADGE = f"v{_read_workspace_version()} · Rust + WebGPU"
 SITE_TAGLINE = "Clean-Room Biomolecular & Analytical NMR Platform"
 
 EXPECTED_MANUAL_CHAPTERS: Tuple[str, ...] = (
@@ -128,7 +144,8 @@ class ParsedPage:
 def strip_markdown_inline(raw: str) -> str:
     """Convert Markdown inline markup into clean human-readable plain text."""
     text = raw
-    # Replace links [label](url) -> label
+    # Replace images ![alt](url) -> alt and links [label](url) -> label
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     # Strip inline code backticks
     text = re.sub(r"`+([^`]+)`+", r"\1", text)
@@ -691,12 +708,18 @@ def highlight_code(code: str, lang: str) -> str:
 # ---------------------------------------------------------------------------
 
 def rewrite_internal_href(raw_href: str) -> str:
-    """Rewrite internal ``*.md`` links (with optional ``#anchor``) to ``*.html``."""
+    """Rewrite internal ``*.md`` and ``../assets/*`` links for static manual output."""
     parsed = urlsplit(raw_href)
     if parsed.scheme or parsed.netloc:
         return raw_href
     path_part = parsed.path
-    if path_part.endswith(".md"):
+    if path_part.startswith("../assets/"):
+        rel_asset = path_part[len("../assets/") :]
+        if rel_asset and ".." not in Path(rel_asset).parts and not rel_asset.startswith("/"):
+            path_part = f"assets/{rel_asset}"
+    elif path_part in ("../demo", "../demo/", "../demo/index.html"):
+        path_part = "demo/index.html"
+    elif path_part.endswith(".md"):
         path_part = path_part[:-3] + ".html"
     if parsed.fragment:
         return f"{path_part}#{parsed.fragment}"
@@ -732,6 +755,28 @@ def render_inline_markdown(
         return put_token(render_math_html(expr, display=False))
 
     work = re.sub(r"(?<!\\)\$([^\$\n]+?)(?<!\\)\$", repl_math, work)
+
+    # 2b. Extract Markdown images ![alt](src)
+    def repl_image(m: re.Match[str]) -> str:
+        raw_alt = m.group(1)
+        raw_src = m.group(2).strip()
+        plain_alt = strip_markdown_inline(re.sub(r"\x00TOK\d+END\x00", "code", raw_alt))
+        if links_out is not None:
+            links_out.append(
+                LinkRef(
+                    source_md=md_name,
+                    line_no=line_no,
+                    raw_target=raw_src,
+                    label_text=plain_alt,
+                )
+            )
+        final_src = html.escape(rewrite_internal_href(raw_src), quote=True)
+        alt_escaped = html.escape(plain_alt, quote=True)
+        return put_token(
+            f'<img class="manual-img" src="{final_src}" alt="{alt_escaped}" loading="lazy" decoding="async">'
+        )
+
+    work = re.sub(r"!\[([^\]]*)\]\(([^)\s]+)\)", repl_image, work)
 
     # 3. Extract Markdown links [label](href)
     def repl_link(m: re.Match[str]) -> str:
@@ -1083,6 +1128,41 @@ def parse_markdown_blocks(
             out_html.append(list_html)
             continue
 
+        # 7b. Standalone Markdown figure ![alt](src) (with optional italic caption on next line)
+        fig_m = re.match(r"^!\[([^\]]*)\]\(([^)\s]+)\)$", stripped)
+        if fig_m:
+            raw_alt = fig_m.group(1)
+            raw_src = fig_m.group(2).strip()
+            plain_alt = strip_markdown_inline(raw_alt)
+            links_out.append(
+                LinkRef(
+                    source_md=md_name,
+                    line_no=abs_line,
+                    raw_target=raw_src,
+                    label_text=plain_alt,
+                )
+            )
+            final_src = html.escape(rewrite_internal_href(raw_src), quote=True)
+            alt_escaped = html.escape(plain_alt, quote=True)
+            append_search_text(plain_alt)
+            i += 1
+            caption_html = ""
+            if i < n:
+                next_s = lines[i].strip()
+                if len(next_s) >= 3 and next_s.startswith("*") and next_s.endswith("*") and not next_s.startswith("**"):
+                    cap_inner = next_s[1:-1].strip()
+                    cap_rendered = render_inline_markdown(cap_inner, md_name, base_line + i, links_out)
+                    caption_html = f"<figcaption>{cap_rendered}</figcaption>"
+                    append_search_text(strip_markdown_inline(cap_inner))
+                    i += 1
+            out_html.append(
+                f'<figure class="manual-figure">'
+                f'<img class="manual-img" src="{final_src}" alt="{alt_escaped}" loading="lazy" decoding="async">'
+                f"{caption_html}"
+                f"</figure>"
+            )
+            continue
+
         # 8. Paragraph
         para_lines: List[Tuple[int, str]] = []
         while i < n:
@@ -1098,6 +1178,7 @@ def parse_markdown_blocks(
                 or cur_s.startswith(">")
                 or ("|" in cur_s and i + 1 < n and is_table_separator(lines[i + 1]))
                 or re.match(r"^(\s*)([-*]|\d+\.)\s+", cur)
+                or re.match(r"^!\[([^\]]*)\]\(([^)\s]+)\)$", cur_s)
             ):
                 break
             para_lines.append((base_line + i, cur_s))
@@ -1565,6 +1646,33 @@ table { width: 100%; border-collapse: collapse; font-size: 0.89rem; }
 th, td { padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--border); vertical-align: top; }
 thead th { background: var(--bg-subtle); font-weight: 600; color: var(--fg); }
 tbody tr:last-child td { border-bottom: none; }
+
+.manual-figure {
+  margin: 1.35rem 0;
+  padding: 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elev);
+  box-shadow: var(--shadow);
+  text-align: center;
+}
+.manual-img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+  border-radius: 6px;
+}
+td .manual-img {
+  margin-bottom: 0.45rem;
+}
+.manual-figure figcaption {
+  margin-top: 0.65rem;
+  font-size: 0.84rem;
+  line-height: 1.45;
+  color: var(--fg-muted);
+  text-align: left;
+}
 
 blockquote {
   margin: 1rem 0;
@@ -2190,12 +2298,17 @@ def render_page_html(
 def build_site_files(
     pages: Sequence[ParsedPage],
     demo_html_path: Optional[Path] = None,
+    assets_dir: Optional[Path] = None,
 ) -> Dict[str, bytes]:
     """Assemble the complete deterministic static site in memory as relative_path -> UTF-8 bytes."""
     files: Dict[str, bytes] = {}
     files[".nojekyll"] = b""
     files["assets/style.css"] = MANUAL_CSS.encode("utf-8")
     files["assets/manual.js"] = MANUAL_JS.encode("utf-8")
+
+    if assets_dir is not None and assets_dir.is_dir():
+        for svg_path in sorted(assets_dir.glob("*.svg")):
+            files[f"assets/{svg_path.name}"] = svg_path.read_bytes()
 
     has_demo = demo_html_path is not None and demo_html_path.is_file()
     if has_demo and demo_html_path is not None:
@@ -2478,7 +2591,25 @@ def run_self_tests() -> int:
         assert any("restricted product name" in e for e in tok_errs), f"expected token error, got {tok_errs}"
         assert any("forbidden host path" in e for e in tok_errs), f"expected host path error, got {tok_errs}"
 
-    print("build_docs_manual.py self-tests passed (5/5 adversarial & determinism checks).")
+        # 5. Embedded SVG figure & missing-asset image check
+        assets_tmp = root / "assets_src"
+        assets_tmp.mkdir()
+        (assets_tmp / "01_test.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"></svg>\n', encoding="utf-8")
+        fig_md = root / "05-fig.md"
+        fig_md.write_text(
+            "# Ch5\n\n![Test showcase SVG](../assets/01_test.svg)\n*Figure 1: Deterministic showcase.*\n",
+            encoding="utf-8",
+        )
+        p_fig = [parse_manual_page(valid_md), parse_manual_page(fig_md)]
+        site_fig = build_site_files(p_fig, assets_dir=assets_tmp)
+        assert not validate_internal_links(p_fig, site_fig), "bundled ../assets/*.svg should validate cleanly"
+        assert '<figure class="manual-figure">' in site_fig["05-fig.html"].decode("utf-8")
+        missing_fig_errs = validate_internal_links(p_fig, build_site_files(p_fig))
+        assert any("broken internal link target" in e for e in missing_fig_errs), (
+            f"expected missing SVG asset error, got {missing_fig_errs}"
+        )
+
+    print("build_docs_manual.py self-tests passed (6/6 adversarial & determinism checks).")
     return 0
 
 
@@ -2486,6 +2617,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     repo_root = Path(__file__).resolve().parent.parent
     default_src = repo_root / "docs" / "manual"
     default_demo_html = repo_root / "docs" / "demo" / "index.html"
+    default_assets_dir = repo_root / "docs" / "assets"
     default_out = repo_root / "target" / "manual"
 
     parser = argparse.ArgumentParser(
@@ -2519,20 +2651,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_self_tests()
 
     md_paths = discover_manual_pages(args.src)
-    demo_html = default_demo_html if args.src.resolve() == default_src.resolve() else None
+    is_default_src = args.src.resolve() == default_src.resolve()
+    demo_html = default_demo_html if is_default_src else None
+    assets_dir = default_assets_dir if is_default_src else None
     pages = [parse_manual_page(p) for p in md_paths]
-    site_files = build_site_files(pages, demo_html_path=demo_html)
+    site_files = build_site_files(pages, demo_html_path=demo_html, assets_dir=assets_dir)
     write_site_to_disk(args.out, site_files)
 
     if args.check:
         errors = validate_markdown_hygiene(
             md_paths,
-            enforce_expected_roster=(args.src.resolve() == default_src.resolve()),
+            enforce_expected_roster=is_default_src,
         )
         errors.extend(validate_internal_links(pages, site_files))
         # Re-parse and re-render to guarantee 100% deterministic byte output
         pages_second = [parse_manual_page(p) for p in discover_manual_pages(args.src)]
-        second_files = build_site_files(pages_second, demo_html_path=demo_html)
+        second_files = build_site_files(pages_second, demo_html_path=demo_html, assets_dir=assets_dir)
         if site_digest(site_files) != site_digest(second_files):
             errors.append("non-deterministic build output detected across consecutive renders")
 
