@@ -424,10 +424,13 @@ def render_t14_4_section(records: list[dict[str, Any]]) -> str:
         k1_ok = int(cpu_disc["pure_k1_correct"])
         k2_ok = int(cpu_disc["mixed_k2_correct"])
         lines.append(
-            f"| `BIC` model-order selection (`40` noisy seeds, `SNR=40` pure / `SNR=60` mixed) | CPU `f64` | Pure `K=1`: `{k1_ok}/{n_tr}` (`{100.0 * k1_ok / n_tr:.1f}%`), Mixed `K=2`: `{k2_ok}/{n_tr}` (`{100.0 * k2_ok / n_tr:.1f}%`) | `>= 95.0%` (`38/40`) | {fmt_status(bool(cpu_disc['passed']))} |"
+            f"| `BIC` model-order selection (`40` noisy seeds, `SNR=40` pure / per-component `SNR 56.3-68.8` mixed [`45 & 55 / sigma=0.8`]) | CPU `f64` | Pure `K=1`: `{k1_ok}/{n_tr}` (`{100.0 * k1_ok / n_tr:.1f}%`), Mixed `K=2`: `{k2_ok}/{n_tr}` (`{100.0 * k2_ok / n_tr:.1f}%`) | `>= 95.0%` (`38/40`) | {fmt_status(bool(cpu_disc['passed']))} |"
         )
         lines.append(
-            f"| Noisy diffusivity accuracy (`K=1`, `K=2`, and `32`-point `K=3` tri-exponential) | CPU `f64` | `K=1`: `{100.0 * cpu_disc['mean_pure_rel_err']:.2f}%`, `K=2`: `({100.0 * cpu_disc['mean_mix_d1_rel_err']:.2f}%, {100.0 * cpu_disc['mean_mix_d2_rel_err']:.2f}%)`, `K={cpu_disc['tri_selected_k']}` max err: `{100.0 * cpu_disc['max_tri_rel_err']:.4f}%` | `< 2.5%` / `< 8.0%` / `< 2.0%` | {fmt_status(bool(cpu_disc['passed']))} |"
+            f"| Noisy diffusivity accuracy (`K=1` `SNR=40`, `K=2` per-component `SNR 56.3-68.8`) | CPU `f64` | `K=1`: `{100.0 * cpu_disc['mean_pure_rel_err']:.2f}%`, `K=2`: `({100.0 * cpu_disc['mean_mix_d1_rel_err']:.2f}%, {100.0 * cpu_disc['mean_mix_d2_rel_err']:.2f}%)` | `< 2.5%` / `< 8.0%` | {fmt_status(bool(cpu_disc['passed']))} |"
+        )
+        lines.append(
+            f"| Noiseless `K=3` tri-exponential exact recovery (`32`-point wide-`b` grid) | CPU `f64` | Selected `K={cpu_disc['tri_selected_k']}`, max rel err `{cpu_disc['max_tri_rel_err']:.2e}` (`{100.0 * cpu_disc['max_tri_rel_err']:.2e}%`) | `K=3`, `< 2.0%` | {fmt_status(bool(cpu_disc['passed']))} |"
         )
 
     if gpu_par is not None:
@@ -450,9 +453,23 @@ def render_t14_4_section(records: list[dict[str, Any]]) -> str:
         ]
     )
 
-    for rec in sorted(ilt_list, key=lambda r: str(r.get("strategy", ""))):
+    sorted_ilt = sorted(ilt_list, key=lambda r: str(r.get("strategy", "")))
+    same_lambda = (
+        len(sorted_ilt) >= 2
+        and len({f"{r['selected_lambda']:.6e}" for r in sorted_ilt}) == 1
+    )
+    for rec in sorted_ilt:
+        shared_note = (
+            " *(shared 24-pt grid index with LCurve)*"
+            if (same_lambda and rec["strategy"] == "GCV")
+            else (
+                " *(shared 24-pt grid index with GCV — same reconstruction)*"
+                if (same_lambda and rec["strategy"] == "LCurve")
+                else ""
+            )
+        )
         lines.append(
-            f"| Tikhonov `ILT` (`SecondDerivative` + `NNLS`, `{rec['strategy']}`) | `alpha = {rec['selected_lambda']:.3e}` (`{rec['n_modes']}` modes) | `abs(d log10 D) = ({rec['log10_err_slow']:.4f}, {rec['log10_err_fast']:.4f})` dex; areas `({100.0 * rec['area_slow']:.1f}%, {100.0 * rec['area_fast']:.1f}%)` | `< 0.08` dex, `50% +- 12%` | {fmt_status(bool(rec['passed']))} |"
+            f"| Tikhonov `ILT` (`SecondDerivative` + `NNLS`, `{rec['strategy']}`) | `alpha = {rec['selected_lambda']:.3e}` (`{rec['n_modes']}` modes){shared_note} | `abs(d log10 D) = ({rec['log10_err_slow']:.4f}, {rec['log10_err_fast']:.4f})` dex; areas `({100.0 * rec['area_slow']:.1f}%, {100.0 * rec['area_fast']:.1f}%)` | `< 0.08` dex, `50% +- 12%` | {fmt_status(bool(rec['passed']))} |"
         )
 
     if hydro is not None:
@@ -490,7 +507,7 @@ def render_t14_5_section(records: list[dict[str, Any]]) -> str:
 
     if aib is not None:
         lines.append(
-            f"| `Adaptive Intelligent Binning` (`AIB`) vs `0.04 ppm` uniform bins | L-Lactate `4.11 ppm` quartet & L-Valine `0.985 ppm` doublet | `AIB` single-bucket capture `({100.0 * aib['aib_lac_q_share']:.1f}%, {100.0 * aib['aib_val_1_share']:.1f}%)` vs Uniform split `({100.0 * aib['uni_lac_q_share']:.1f}%, {100.0 * aib['uni_val_1_share']:.1f}%)` | `AIB > 95.0%` | {fmt_status(bool(aib['passed']))} |"
+            f"| `Adaptive Intelligent Binning` (`AIB`) vs `0.04 ppm` uniform bins | L-Lactate `4.11 ppm` quartet & L-Valine `0.985 ppm` doublet | `AIB` single-bucket/window integral ratio `({100.0 * aib['aib_lac_q_share']:.1f}%, {100.0 * aib['aib_val_1_share']:.1f}%)` *(includes Lorentzian wings beyond fixed window)* vs Uniform split `({100.0 * aib['uni_lac_q_share']:.1f}%, {100.0 * aib['uni_val_1_share']:.1f}%)` | `AIB > 95.0%` | {fmt_status(bool(aib['passed']))} |"
         )
 
     lines.extend(
@@ -504,8 +521,10 @@ def render_t14_5_section(records: list[dict[str, Any]]) -> str:
     )
 
     if opls_o is not None:
+        p_o = float(opls_o["perm_p_q2"])
+        p_o_str = f"p <= 1/101 ({p_o:.4f}, 100-perm floor)" if abs(p_o - 1.0 / 101.0) < 1e-5 else f"perm_p = {p_o:.4f}"
         lines.append(
-            f"| `OPLS-DA` (`1 + 1` NIPALS, `4.5x` orthogonal drift) | `N = 24`, `P = 80`, `7`-fold stratified CV + `100` perms | `R2X_o = {opls_o['r2_x_orthogonal']:.3f}` vs `R2X_p = {opls_o['r2_x_predictive']:.3f}`, `R2Y = {opls_o['r2_y']:.4f}`, `Q2 = {opls_o['q2']:.4f}`, `perm_p = {opls_o['perm_p_q2']:.4f}` | `Q2 > 0.85`, `perm_p <= 0.02` | {fmt_status(bool(opls_o['passed']))} |"
+            f"| `OPLS-DA` (`1 + 1` NIPALS, `4.5x` orthogonal drift) | `N = 24`, `P = 80`, `7`-fold stratified CV + `100` perms | `R2X_o = {opls_o['r2_x_orthogonal']:.3f}` vs `R2X_p = {opls_o['r2_x_predictive']:.3f}`, `R2Y = {opls_o['r2_y']:.4f}`, `Q2 = {opls_o['q2']:.4f}`, `{p_o_str}` | `Q2 > 0.85`, `perm_p <= 0.02` | {fmt_status(bool(opls_o['passed']))} |"
         )
 
     if opls_n is not None:
@@ -519,8 +538,10 @@ def render_t14_5_section(records: list[dict[str, Any]]) -> str:
         )
 
     if cli_e2e is not None and cli_null is not None:
+        p_cli = float(cli_e2e["opls_perm_p"])
+        p_cli_str = f"p <= 1/101 ({p_cli:.4f}, 100-perm floor)" if abs(p_cli - 1.0 / 101.0) < 1e-5 else f"p = {p_cli:.4f}"
         lines.append(
-            f"| `nmrassign metabolomics bin / pca / oplsda / stocsy` CLI | `24`-sample demo + null-shuffled guard | `P = {cli_e2e['n_buckets']}`, `PC1 = {100.0 * cli_e2e['pca_pc1_var']:.1f}%`, `OPLS Q2 = {cli_e2e['opls_q2']:.4f}` (`p = {cli_e2e['opls_perm_p']:.4f}`), null `Q2 = {cli_null['null_q2']:.4f}` (`OVERFIT WARNING`), `STOCSY #1 = {cli_e2e['stocsy_top_bmrb_id']}` | End-to-end CLI parity | {fmt_status(bool(cli_e2e['passed'] and cli_null['passed']))} |"
+            f"| `nmrassign metabolomics bin / pca / oplsda / stocsy` CLI | `24`-sample demo + null-shuffled guard | `P = {cli_e2e['n_buckets']}`, `PC1 = {100.0 * cli_e2e['pca_pc1_var']:.1f}%`, `OPLS Q2 = {cli_e2e['opls_q2']:.4f}` (`{p_cli_str}`), null `Q2 = {cli_null['null_q2']:.4f}` (`OVERFIT WARNING`), `STOCSY #1 = {cli_e2e['stocsy_top_bmrb_id']}` | End-to-end CLI parity | {fmt_status(bool(cli_e2e['passed'] and cli_null['passed']))} |"
         )
 
     return "\n".join(lines)
