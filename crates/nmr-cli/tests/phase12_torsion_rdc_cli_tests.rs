@@ -35,10 +35,10 @@ fn test_phase12_cli_version_is_0_8_0_and_help_lists_torsions_and_rdc() {
     assert!(ver_out.status.success());
     let ver_stdout = String::from_utf8_lossy(&ver_out.stdout);
     assert!(
-        ver_stdout.starts_with("nmrassign 0.9.0 ("),
-        "expected version 0.9.0, got: {ver_stdout}"
+        ver_stdout.starts_with("nmrassign 0.10.0 ("),
+        "expected version 0.10.0, got: {ver_stdout}"
     );
-    assert_eq!(nmr_core::VERSION, "0.9.0");
+    assert_eq!(nmr_core::VERSION, "0.10.0");
 
     let help_out = Command::new(&bin)
         .arg("--help")

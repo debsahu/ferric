@@ -4,6 +4,113 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
+## [0.10.0] — 2026-11-15 — Phase 14: Multi-Nuclear Analytical 1D NMR Processing, Global Pseudo-Voigt Deconvolution, Hoye Multiplet `J`-Trees & `qNMR` (`T14.1`–`T14.2`), 4-Mode 1D Stack & Kinetics Studio (`T14.3`), GPU/CPU Pseudo-2D `DOSY` & Tikhonov `ILT` (`T14.4`), and Clean-Room 1D Metabolomics & Chemometrics (`T14.5`)
+
+- **Tag:** `v0.10.0`
+- **Architectural Summary & Candid Scientific Disclosures (`T14.1`–`T14.5`, `F15` Closed, Open `F5`, `F6`, `F10`–`F14`, `F16`, `F17`):**
+  - **1. Mandatory Validation Scope Candor (`14.1`–`14.4` — Synthetic Forward-Model Self-Consistency) & Open Follow-Up Ledger:**
+    - **Synthetic Forward-Model Self-Consistency Across All Phase 14 Subsystems**: **Every quantitative `T14.1`–`T14.5` benchmark in `v0.10.0` is a synthetic forward-model self-consistency test** fit over synthesized multi-nuclear 1D FIDs, planted phase/baseline/solvent perturbations, simulated first- and second-order spin-coupled multiplets, synthetic `qNMR` analyte/internal-standard mixtures, synthetic first-order kinetics stacks, simulated multi-exponential Stejskal–Tanner / Wu–Johnson `BPP-LED` diffusion decays, and synthetic biofluid cohorts scored against a literature-curated CC0 `BMRB` canonical reference table (`0` real deposited raw 1D small-molecule `fid`s or certified `qNMR` reference materials [`F14`], `0` real deposited raw Bruker `difflist`/`ser` or Varian `DOSY` datasets [`F16`], and `0` deposited public `MetaboLights` [`MTBLS1`] experimental 1D metabolomics cohorts [`F17`] have been evaluated yet).
+    - **Closed `14.W1` Follow-Up (`[x] F15`) & Open Post-`v0.10.0` Follow-Ups**: Closed **`[x] F15`** in `14.W2` by adding pre-allocation oversized-`SI` length guards, `NaN`/`Inf` rejection, and adversarial `is_err()`/`expect_err()` error-path suites across 1D Bruker `1r`/`procs` + TSV/JSON FID ingest (`nmr1d_tests`, `nmr1d_cli_tests`), `DOSY` (`dosy_tests`, `dosy_metabolomics_cli_tests`), and `Metabolomics` (`metabolomics_tests`). Carryover items **`F5`**, **`F6`**, **`F10`**–**`F14`**, **`F16`**, and **`F17`** remain explicitly open (`[ ]`) in `TODO.md`.
+    - **Zero-Regression & Dependency Freeze**: `0` new external crate dependencies (`Cargo.toml` / `Cargo.lock` bump workspace version `0.9.0 -> 0.10.0` and promote existing workspace `serde`/`serde_json` into `nmr-cli` normal dependencies only; `THIRD_PARTY.md`, `docs/specs/03-assignment.md`, and all protein backbone assignment, structure, RDC, relaxation, and exchange solvers are untouched).
+
+  - **2. Analytical Multi-Nuclear 1D Processing, Pseudo-Voigt Deconvolution, Hoye Multiplet `J`-Trees & `qNMR` (`T14.1`–`T14.2`, `docs/specs/17-nmr1d-and-dosy.md` §§1–2):**
+    - **`T14.1` (`nmr-core::nmr1d`)**: Arbitrary-nucleus (`1H`, `13C`, `19F`, `31P`, `15N`, `11B`, `29Si`) time-domain windowing (exponential, Lorentz-to-Gauss, cosine-bell), zero-filling, Parseval-preserving FFT (`2.66e-14`), causal Hilbert imaginary reconstruction (`3.85e-14`), Chen et al. (*JMR* **2002**) first-derivative minimum-entropy + negative-lobe autophasing (including biphasic `13C DEPT-135`), signal-masked Whittaker (`Eilers` *Anal. Chem.* **2003**) & Bernstein (`Cobas` **2003**) baseline correction (`1023x` RMS roll suppression), Barkhuijsen (*JMR* **1987**) Hankel SVD time-domain residual water subtraction (`99.998%` suppression, `0.0095%` solute perturbation at `0.12 ppm`), Fulmer (*Organometallics* **2010**) residual solvent referencing, and analytical-Jacobian coupled-cluster pseudo-Voigt LM deconvolution (`1.18%` overlapping area err).
+    - **`T14.2` (`nmr-core::multiplet`, `nmrassign nmr1d process|multiplet|qnmr`)**: Closed-form variance-propagated integration, Hoye (*JOC* **1994**, **2002**) recursive doublet-stripping `J`-coupling trees (`28/28` synthetic classes across `s`..`dddd`/`tt`, `max abs(dJ) = 0.011 Hz`) + second-order `AB` & exact spin-$1/2$ QM roofing, `ACS`/`JOC`/`RSC`/`Nature` journal report strings, `Octet` `.mol`/`.sdf`/SMILES proton-group linking, and Pauli (*J. Med. Chem.* **2014**) internal-standard `qNMR` molar purity + GUM `k = 2` expanded uncertainty + `5 * T1` relaxation-delay guard (`P_fit = 98.399%` vs `98.40%`).
+
+    **`T14.1` — Analytical 1D Processing, Autophasing, Baseline, `HSVD` & Pseudo-Voigt Deconvolution (`Synthetic Forward-Model Self-Consistency`):**
+
+    | Verification Check (`nmr1d_tests`) | Synthetic Forward-Model Scenario | Measured Metric | Gate | Status |
+    | :--- | :--- | :--- | :--- | :---: |
+    | Parseval `19F` FFT area, Hilbert imag reconstruction, Lorentz-to-Gauss & Fulmer `CDCl3` cal | Wide-SW `-220..+20 ppm` `19F` FID, real-only `1r`, tight doublet + mis-referenced `CDCl3` | `abs(dArea) = 2.66e-14`, Hilbert rel err `3.85e-14`, valley `1.173 -> 0.928`, cal err `3.04e-05 ppm` | `< 1e-10` / `< 1e-3 ppm` | `PASS` |
+    | Chen (2002) minimum-entropy + negative-lobe autophasing (`1H` + Hilbert `1r` + biphasic `DEPT-135`) | Planted `(PHC0, PHC1)` across `1H` complex, real-only Hilbert, and `CH/CH3 > 0`, `CH2 < 0` `13C` | `1H`: `abs(dPHC0) = 0.60 deg`, `abs(dPHC1) = 1.12 deg`; Hilbert: `0.46 deg` / `0.34 deg`; `DEPT-135`: `1.78 deg` / `3.19 deg` | `<= 2.0 deg` / `<= 5.0 deg` | `PASS` |
+    | Signal-masked Whittaker `pls` & Bernstein polynomial baseline flattening | Curved quartic + sinusoidal roll beneath `1H` quartet | Whittaker `1023.0x` RMS suppression (`0.718%` quartet area err); Bernstein `145.4x` | `>= 20x` RMS, `< 1.5%` area err | `PASS` |
+    | Barkhuijsen (1987) time-domain `HSVD` residual water subtraction | `1000x` `HDO` pole at `4.79 ppm` + nearby `4.91 ppm` anomeric solute (`0.12 ppm` offset) | `99.998%` water suppression (`1` pole(s)), nearby solute perturbation `0.0095%` | `>= 99.0%` water, `< 1.0%` solute | `PASS` |
+    | Coupled-cluster Levenberg–Marquardt analytical-Jacobian pseudo-Voigt deconvolution | Overlapping `6`-line `1H` multiplet cluster + raw FID end-to-end | Max component area err `1.18%` (`1.93%` raw FID E2E), max pos err `0.0154 Hz`, RMSD `7.76e-02` | `< 1.5%` (`< 2.5%` E2E) | `PASS` |
+
+    **`T14.2` — Normalized Integration, Hoye (1994) Multiplet `J`-Trees, Second-Order Roofing & `qNMR` (`Synthetic Forward-Model Self-Consistency`):**
+
+    | Verification Check (`multiplet_tests`) | Synthetic Forward-Model Scenario | Measured Metric | Gate | Status |
+    | :--- | :--- | :--- | :--- | :---: |
+    | Trapezoidal integration & closed-form $\sigma_I$ vs 1,500-trial Monte Carlo | White-noise 1D spectra with uncorrupted & linear-edge tilt correction | `sigma_I` rel err `1.71%` (`None`) / `4.25%` (`AutoLinearEdges`), MAD noise RMS err `2.59%` | `< 8.0%` vs MC | `PASS` |
+    | Hoye (1994/2002) recursive doublet-stripping `J`-coupling tree sweep (`16` classes) | `28` noisy synthetic multiplets (`s`, `br s`, `d`, `t`, `q`, `quint`, `sext`, `sept`, `dd`, `ddd`, `dddd`, `dt`, `td`, `dq`, `qd`, `tt`) | `28/28` (`100.0%`) exact class match, `max abs(dJ) = 0.0110 Hz` | `100%` class, `< 0.20 Hz` | `PASS` |
+    | Second-order `AB` quartet & exact spin-$1/2$ QM Hamiltonian strong roofing ($\Delta\nu/J \in [2.5, 3.0]$) | `9` roofed `AB` / `ABX` (`dd`) / `ABXY` (`ddd`) spin systems | `9/9` passed; `AB` `abs(dJ) = 0.00e+00 Hz`, Zeeman err `1.11e-06 ppm`, QM `ddd` `abs(dJ_1) = 5.95e-05 Hz` | `< 0.15 Hz` | `PASS` |
+    | Pauli (2014) internal-standard `qNMR` molar purity, GUM `k=2` uncertainty & `5 * T1` guard | Synthetic analyte (`P_true = 98.40%`) + `TMB` CRM + multi-tube replicates + short-`d1` check | `P_fit = 98.399%` (`abs(dP) = 0.0010%`), `U(k=2) = 0.138%`, `[C] = 105.57 mM`, `RSD = 0.136%`, `5*T1` guard `True` | `abs(dP) < 0.15%`, guard `true` | `PASS` |
+
+    **End-to-End `nmrassign nmr1d` CLI Verification (`nmr1d_cli_tests`):**
+
+    | Subcommand (`nmrassign nmr1d ...`) | End-to-End Pipeline Scenario | Measured CLI Output Metric | Status |
+    | :--- | :--- | :--- | :---: |
+    | `nmr1d process` (raw `FID` JSON -> TSV + JSON) | `HSVD` water subtraction + Chen-2002 autophase + Whittaker baseline + Fulmer `CDCl3` cal + Voigt LM | `3` `HSVD` poles subtracted, `CDCl3` cal err `1.02e-04 ppm`, `2:3` Voigt area ratio `2.0117` (`0.585%` err) | `PASS` |
+    | `nmr1d process` (`JCAMP-DX` `.jdx` & Bruker `pdata/1/1r`) | `JCAMP-DX` + Bruker binary `1r`/`procs` ingest -> baseline flatten + Voigt doublet fit | `2048` spectral points ingested, `2` Voigt doublet components recovered | `PASS` |
+    | `nmr1d multiplet` (`ACS`/`JOC`/`RSC`/`Nature` + `Octet` `.mol`/`SMILES`) | Ethyl acetate (`q`/`s`/`t`) `.mol` + `SMILES` atom-group linking & `dd`/`ddd`/`dt`/`td` tree sweep | `3` `Octet` proton-group links, `max abs(dJ) = 0.00403 Hz`, classes `dd,ddd,dt,td` | `PASS` |
+    | `nmr1d qnmr` (direct 1D spectrum regions + `5 * T1` guard) | `TMB` internal CRM (`6.09 ppm`) + analyte quartet (`4.12 ppm`, `P_true = 98.40%`) + short-`d1` guard | `P_fit = 98.3950%` (`abs(dP) = 0.0050%`), `U(k=2) = 0.2479%`, `5*T1` warning `True` | `PASS` |
+
+  - **3. Multi-Spectrum 1D Overlay, Stack, Difference & Kinetics Workbench (`T14.3`, `docs/specs/17-nmr1d-and-dosy.md` §3):**
+    - **`T14.3` (`nmr-gui::stack1d_panel`)**: `wasm32`-clean 4-mode interactive 1D comparison studio (**Superimposed Overlay**, **Tilted/Vertical Stack**, **Reference-Scaled Difference** $S_i(\delta) - \alpha S_{\text{ref}}(\delta)$, and **Pseudo-2D Waterfall/Heatmap**) with exact apex-preserving min/max `LOD` decimation across `32 x 65,536`-point spectra, Savorani (*JMR* **2010**) regional FFT cross-correlation interval alignment (`~2e-5 ppm` shift recovery), and arrayed ROI kinetics integration + TSV/SVG export.
+
+    **`T14.3` — Multi-Spectrum 1D Overlay, Stack, Difference & Kinetics Workbench (`Synthetic Forward-Model Self-Consistency`):**
+
+    | Verification Check (`nmr-gui::stack1d_panel`) | Synthetic Forward-Model Scenario | Measured Metric | Gate | Status |
+    | :--- | :--- | :--- | :--- | :---: |
+    | Headless `egui` 4-mode rendering + `32 x 64k`-point min/max `LOD` pyramid | `Superimposed`, `TiltedStack`, `Difference`, `WaterfallHeatmap` + 1-sample `+42.5 / -19.25` apices | `4/4` modes rendered (`0` panics), `32 x 65,536` exact apex preservation `True` | `4/4` modes, exact apices | `PASS` |
+    | Reference-scaled difference trace $S_i(\delta) - \alpha S_{\text{ref}}(\delta)$ OLS $\alpha$ recovery | Matrix background + minor analyte trace (Gaussian & Lorentzian lineshapes) | Gaussian `abs(dalpha) = 1.11e-16`, Lorentzian `abs(dalpha) = 6.41e-07`, analyte area err `2.06e-10` | `< 1e-4` | `PASS` |
+    | Savorani (2010) regional FFT cross-correlation interval alignment | Opposite pH-induced shifts (`+0.032 ppm` aromatic, `-0.024 ppm` aliphatic) | Aromatic shift err `2.15e-05 ppm`, aliphatic err `2.23e-05 ppm`, global err `1.95e-05 ppm`, `r_min = 0.999996` | `< 5e-4 ppm`, `r > 0.999` | `PASS` |
+    | Exact sub-bin linear quadrature & arrayed first-order kinetics ROI matrix | `8`-timepoint `A -> P` decay/growth stack (`t = 0..100 min`) | Quadrature err `0.00e+00`, conversion `conv(0) = 0.0016 -> conv(100) = 0.9834` | `< 1e-12` | `PASS` |
+
+  - **4. Pseudo-2D Diffusion-Ordered Spectroscopy (`DOSY`) & Untargeted 1D NMR Metabolomics (`T14.4`–`T14.5`, `docs/specs/17-nmr1d-and-dosy.md` §4 & `docs/specs/20-metabolomics-chemometrics.md`):**
+    - **`T14.4` (`nmr-core::dosy`, `nmr-gpu::dosy_gpu`, `shaders/dosy.wgsl`, `nmr-gui::dosy_panel`, `nmrassign dosy`)**: Bruker `difflist`/`acqus` & Varian `gzlvl`/`procpar` gradient list ingest, CPU (`f64`) & WebGPU (`f32`) column-wise discrete 1–3 component Stejskal–Tanner (*J. Chem. Phys.* **1965**) / Wu–Johnson (*JMR A* **1995**) `BPP-LED` LM solver with `BIC`/`AIC` model-order selection as default (`40/40` pure `K=1` [`SNR=40`] & `40/40` mixed `K=2` [per-component `SNR 56.3-68.8`, `45 & 55 / sigma=0.8`]; noisy `K=1` err `2.03%`, noisy `K=2` `(3.58%, 6.20%)`, and **noiseless** `32`-point `K=3` tri-exponential exact recovery [max rel err `9.73e-12`]), opt-in Provencher (*Comput. Phys. Commun.* **1982**) second-derivative Tikhonov `CONTIN`-style `NNLS` inverse Laplace transform (on the 24-point log-grid sweep, `GCV` and Menger-curvature `L-curve` select the identical `alpha = 4.062e-3` index — one shared reconstruction, labeled with explicit non-uniqueness/artifact caveats), and Stokes–Einstein / Evans (*Angew. Chem.* **2013**) `SEGWE` $R_h$ & `MW` estimation.
+    - **`T14.5` (`nmr-core::metabolomics`, `nmr-gui::metabolomics_panel`, `nmrassign metabolomics`, `docs/specs/20-metabolomics-chemometrics.md`)**: Clean-room untargeted 1D metabolomics pipeline implementing De Meyer (*Anal. Chem.* **2008**) Adaptive Intelligent Binning (`AIB`, `100.5%`/`101.6%` single-bucket/window integral ratio [valley-bounded bucket includes Lorentzian wing area beyond fixed window] vs `51.0%`/`57.8%` `0.04 ppm` uniform split), Dieterle (*Anal. Chem.* **2006**) Probabilistic Quotient Normalization (`PQN`, `0.077%` dilution/spike error vs `51.5%` `TSA` distortion), van den Berg (*BMC Genomics* **2006**) Pareto/UV scaling, `PCA` + Hotelling $T^2$, leak-free stratified $k$-fold cross-validated `NIPALS` `OPLS-DA` (`Trygg & Wold` **2002**, `p <= 1/101` [`0.0099`, `100`-perm floor] & `Westerhuis` **2008** shuffled-label anti-overfit guard), and `Cloarec` (*Anal. Chem.* **2005**) `STOCSY` structural correlation matched against a CC0 `BMRB` canonical small-molecule shift library.
+
+    **Slice `14.3` (`T14.4`) — Pseudo-2D `DOSY` CPU/WebGPU Stejskal–Tanner, Opt-In Tikhonov `ILT` & Stokes–Einstein Hydrodynamics:**
+
+    **Discrete 1–3 Component Stejskal–Tanner / Wu–Johnson CPU (`f64`) & WebGPU (`f32`) Fitting + `BIC` Selection:**
+
+    | Verification Check | Engine | Measured Metric | Quantitative Gate | Status |
+    | :--- | :--- | :--- | :--- | :---: |
+    | `BIC` model-order selection (`40` noisy seeds, `SNR=40` pure / per-component `SNR 56.3-68.8` mixed [`45 & 55 / sigma=0.8`]) | CPU `f64` | Pure `K=1`: `40/40` (`100.0%`), Mixed `K=2`: `40/40` (`100.0%`) | `>= 95.0%` (`38/40`) | PASS |
+    | Noisy diffusivity accuracy (`K=1` `SNR=40`, `K=2` per-component `SNR 56.3-68.8`) | CPU `f64` | `K=1`: `2.03%`, `K=2`: `(3.58%, 6.20%)` | `< 2.5%` / `< 8.0%` | PASS |
+    | Noiseless `K=3` tri-exponential exact recovery (`32`-point wide-`b` grid) | CPU `f64` | Selected `K=3`, max rel err `9.73e-12` (`9.73e-10%`) | `K=3`, `< 2.0%` | PASS |
+    | Parallel column-wise WGSL `LM` (`32` cols, `K=1..2` + `BIC`) vs CPU `f64` | WebGPU `f32` (`Apple M5 Pro`) | `100%` `BIC` order match; max `abs(dD)/D` mono `0.0003%`, bi `0.0094%` | `< 1.0%` GPU–CPU diff | PASS |
+    | `nmrassign dosy fit` CLI (`Bruker difflist/acqus` + `Varian procpar` + `--engine gpu`) | CPU `f64` + WebGPU `f32` | `K=1` err `0.044%`, `K=2` err `0.254%`, GPU–CPU `abs(d log10 D) = 6.13e-06` dex | `< 1.5%` / `< 0.015` dex | PASS |
+
+    **Opt-In `CONTIN`-Style Second-Derivative Tikhonov `ILT` & Stokes–Einstein Hydrodynamics:**
+
+    | Subsystem & Strategy | Selected `alpha` / Reference | Measured Recovery | Quantitative Gate | Status |
+    | :--- | :--- | :--- | :--- | :---: |
+    | Tikhonov `ILT` (`SecondDerivative` + `NNLS`, `GCV`) | `alpha = 4.062e-03` (`2` modes) *(shared 24-pt grid index with LCurve)* | `abs(d log10 D) = (0.0055, 0.0310)` dex; areas `(47.3%, 52.6%)` | `< 0.08` dex, `50% +- 12%` | PASS |
+    | Tikhonov `ILT` (`SecondDerivative` + `NNLS`, `LCurve`) | `alpha = 4.062e-03` (`2` modes) *(shared 24-pt grid index with GCV — same reconstruction)* | `abs(d log10 D) = (0.0055, 0.0310)` dex; areas `(47.3%, 52.6%)` | `< 0.08` dex, `50% +- 12%` | PASS |
+    | Stokes–Einstein $R_h$ & empirical power-law `MW` (`D2O`, `298.15 K`) | Lysozyme (`14.3 kDa`) & Sucrose (`342.3 Da`) | Lysozyme: `R_h = 19.29 A`, `MW = 14390 Da`; Sucrose: `R_h = 4.57 A`, `MW = 349.3 Da` | `[18.8, 20.2] A` (`< 8%` MW) / `[4.4, 4.8] A` (`< 10%` MW) | PASS |
+
+    **Slice `14.4` (`T14.5`) — Untargeted 1D NMR Metabolomics (`AIB`, `PQN`, `PCA`, `OPLS-DA` & `STOCSY`, Spec `20`):**
+
+    **Preprocessing (`PQN` Dilution Invariance & `De Meyer 2008` Adaptive Intelligent Binning):**
+
+    | Preprocessing Gate | Perturbation / Comparison | Measured Metric | Quantitative Gate | Status |
+    | :--- | :--- | :--- | :--- | :---: |
+    | `PQN` (`Dieterle 2006`) vs `TSA` dilution & spike invariance | `2x` & `5x` dilution + `18x` D-Glucose spike | `PQN` max non-spiked error `0.077%` vs `TSA` distortion `51.5%` | `PQN < 1.0%` (`TSA > 40%`) | PASS |
+    | `Adaptive Intelligent Binning` (`AIB`) vs `0.04 ppm` uniform bins | L-Lactate `4.11 ppm` quartet & L-Valine `0.985 ppm` doublet | `AIB` single-bucket/window integral ratio `(100.5%, 101.6%)` *(includes Lorentzian wings beyond fixed window)* vs Uniform split `(51.0%, 57.8%)` | `AIB > 95.0%` | PASS |
+
+    **Chemometrics (`PCA`, Leak-Free Stratified `OPLS-DA`, Null-Label Guard & `STOCSY` Biomarker Identification):**
+
+    | Chemometrics / CLI Gate | Cohort / Driver | Measured Metric | Quantitative Gate | Status |
+    | :--- | :--- | :--- | :--- | :---: |
+    | `OPLS-DA` (`1 + 1` NIPALS, `4.5x` orthogonal drift) | `N = 24`, `P = 80`, `7`-fold stratified CV + `100` perms | `R2X_o = 0.977` vs `R2X_p = 0.018`, `R2Y = 0.9956`, `Q2 = 0.9946`, `p <= 1/101 (0.0099, 100-perm floor)` | `Q2 > 0.85`, `perm_p <= 0.02` | PASS |
+    | Anti-overfitting null-label guard (`Westerhuis 2008`) | `P = 200 >> N = 24` shuffled labels (`120` perms) | In-sample `R2Y = 0.969`, leak-free `Q2 = -0.0972`, `perm_p = 0.3471`, `validated = False` | `Q2 < 0.10`, `perm_p > 0.10`, `validated = false` | PASS |
+    | `STOCSY` (`Cloarec 2005`) + CC0 `BMRB` library match | Driver `1.330 ppm` (`L-Lactate` `CH3` doublet) | Recovers `4.110 ppm` `CH` quartet (`r = 1.0000`, `r^2 = 1.0000`, `cov 3H:1H = 3.02:1`), #1 `bmse000036` (`score = 1.000`) | `r^2 > 0.90`, `#1 = bmse000036` | PASS |
+    | `nmrassign metabolomics bin / pca / oplsda / stocsy` CLI | `24`-sample demo + null-shuffled guard | `P = 120`, `PC1 = 70.9%`, `OPLS Q2 = 0.9743` (`p <= 1/101 (0.0099, 100-perm floor)`), null `Q2 = -0.4847` (`OVERFIT WARNING`), `STOCSY #1 = bmse000036` | End-to-end CLI parity | PASS |
+
+  - **5. Mandatory `AGENTS.md` 5-Seed `--realistic` Ubiquitin & `CISD3` (`BMRB 51439`) Solver Regression Gates (`v0.10.0`):**
+
+    **Mandatory 5-Seed Solver Non-Regression Gates (`Ubiquitin --realistic` & `CISD3` `BMRB 51439`):**
+
+    | Engine | Ubiquitin `--realistic` (`5` Seeds) Acc | Ubiquitin Recall | Ubiquitin HC-Prec (`>=0.80`) | `CISD3` (`5` Seeds) Acc | `CISD3` Recall | `CISD3` HC-Prec (`>=0.80`) |
+    | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+    | `evo-graph` (`CPU f64`) | `98.4% (assigned=319)` | `90.8% (assignable=346)` | `98.4% (310/315)` | `64.38%` | `40.39%` | `100.00%` (`59/59`) |
+    | `standard` (`CPU f64`) | `90.0% (assigned=279)` | `72.5% (assignable=346)` | `97.1% (170/175)` | `62.50%` | `39.22%` | `92.86%` (`52/56`) |
+    | `standard` (`WebGPU f32`) | `88.4% (assigned=275)` | `70.2% (assignable=346)` | `95.8% (181/189)` | `58.75%` | `36.86%` | `96.61%` (`57/59`) |
+
+---
+
 ## [0.9.0] — 2026-11-15 — Phase 13: 26-Fold LOPO Calibration & Cold-HCP Claim Withdrawal, Non-Circular RDC Validation & Cold `1KHM -> 1ZZK` Holdout (`F8`/`F9`), Executed `pulseprogram` Physics Interpreter (`T13.0`), Opt-In Bayesian Specific-Heat SA Solver (`T13.0b`), and GPU $^{15}\text{N}$ Spin Relaxation, Model-Free ($S^2$), `CEST`/`DEST`, `CPMG`/$R_{1\rho}$ & Tight-Binding `CSP` $K_d$ Studio (`T13.1`–`T13.6`)
 
 - **Tag:** `v0.9.0`
