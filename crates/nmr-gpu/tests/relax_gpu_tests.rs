@@ -317,3 +317,130 @@ fn gpu_three_param_aic_gate_and_tdr_multi_chunk_dispatch_match_cpu() {
     );
     emit_w3_metrics_raw_json("t13_2_gpu_tdr_aicc", &tdr_json);
 }
+
+#[test]
+fn gpu_two_param_kahan_centered_varpro_maintains_sub_1e5_parity_across_extreme_regimes() {
+    let Some((engine, _)) = require_gpu_or_allow_skip() else {
+        return;
+    };
+    let pipe = RelaxGpuPipeline::new(&engine.device);
+    let mut rng = Rng::new(20261712);
+
+    // Exercise (a) slow near-flat R1 decays (`|de_i| << e_bar` over `[0.02, 0.50] s`),
+    // (b) short-delay steep R2 decays (`t_max = 0.184 s`), and (c) heteroscedastic weights (`8x` sigma span).
+    let slow_flat_r1_delays: Vec<f64> = (0..16).map(|k| 0.02 + (k as f64) * 0.032).collect();
+    let short_r2_delays = vec![
+        0.008, 0.016, 0.024, 0.032, 0.048, 0.064, 0.088, 0.112, 0.144, 0.184, 0.016, 0.064,
+    ];
+    let hetero_delays = vec![
+        0.005, 0.020, 0.050, 0.090, 0.150, 0.230, 0.340, 0.480, 0.680, 0.950, 1.300, 1.750,
+    ];
+
+    let mut curves = Vec::with_capacity(60);
+    for idx in 0..60usize {
+        let (delays, rate_true, i0_true) = match idx % 3 {
+            0 => (
+                &slow_flat_r1_delays,
+                0.25 + ((idx / 3) as f64) * 0.05,
+                2500.0 + (idx as f64) * 15.0,
+            ),
+            1 => (
+                &short_r2_delays,
+                8.0 + ((idx / 3) as f64) * 1.10,
+                1800.0 + (idx as f64) * 10.0,
+            ),
+            _ => (
+                &hetero_delays,
+                1.10 + ((idx / 3) as f64) * 0.22,
+                1500.0 + (idx as f64) * 12.0,
+            ),
+        };
+        let sigmas: Vec<f64> = delays
+            .iter()
+            .enumerate()
+            .map(|(k, _)| {
+                let mult = if idx % 3 == 2 {
+                    1.0 + 7.0 * ((k as f64) / ((delays.len() - 1) as f64))
+                } else {
+                    1.0
+                };
+                i0_true * 0.005 * mult
+            })
+            .collect();
+        let intensities: Vec<f64> = delays
+            .iter()
+            .zip(sigmas.iter())
+            .map(|(&t, &sig)| i0_true * (-rate_true * t).exp() + rng.normal(0.0, sig * 0.5))
+            .collect();
+        curves.push(DecayCurveInput {
+            seq_id: (idx as i32) + 1001,
+            res_name: "ALA".to_string(),
+            times_sec: delays.clone(),
+            intensities,
+            sigmas,
+        });
+    }
+
+    let cfg_2p = ExpFitConfig {
+        offset_gate: OffsetModelGate::Disabled,
+        mc_replicates: 64,
+        seed: 0xF120_2026,
+        max_rate_s_inv: 200.0,
+    };
+    let gpu_2p =
+        fit_decay_batch_with_pipeline(&engine, &pipe, &curves, &cfg_2p).expect("GPU centered 2p");
+    let cpu_2p = fit_decay_batch_cpu(
+        &curves,
+        &ExpFitConfig {
+            mc_replicates: 0,
+            ..cfg_2p.clone()
+        },
+    )
+    .expect("CPU 2p reference");
+
+    let mut max_rate_diff = 0.0_f64;
+    let mut max_rel_i0_diff = 0.0_f64;
+    for (g, c) in gpu_2p.iter().zip(cpu_2p.iter()) {
+        assert!(!g.used_three_param && !c.used_three_param);
+        let dr = (g.rate - c.rate).abs();
+        let rel_i0 = (g.i0 - c.i0).abs() / c.i0.abs().max(1.0);
+        max_rate_diff = max_rate_diff.max(dr);
+        max_rel_i0_diff = max_rel_i0_diff.max(rel_i0);
+        assert!(
+            dr < 1.0e-5,
+            "seq {} centered 2p GPU/CPU rate diff {dr:.3e} (gpu={:.8}, cpu={:.8}) exceeds 1e-5",
+            g.seq_id,
+            g.rate,
+            c.rate
+        );
+        assert!(
+            rel_i0 < 1.0e-5,
+            "seq {} centered 2p GPU/CPU relative I0 diff {rel_i0:.3e} exceeds 1e-5",
+            g.seq_id
+        );
+        assert!(
+            (g.chi2 - c.chi2).abs() <= 1.0e-3 * c.chi2.max(1.0),
+            "seq {} centered 2p chi2 drift: gpu={:.6}, cpu={:.6}",
+            g.seq_id,
+            g.chi2,
+            c.chi2
+        );
+    }
+
+    // Also verify exact 2p vs 3p AIC selection agreement when centered 2p chi2 feeds info_criterion_gpu
+    let cfg_aic = ExpFitConfig {
+        offset_gate: OffsetModelGate::Aic,
+        mc_replicates: 0,
+        ..cfg_2p
+    };
+    let gpu_aic =
+        fit_decay_batch_with_pipeline(&engine, &pipe, &curves, &cfg_aic).expect("GPU AIC check");
+    let cpu_aic = fit_decay_batch_cpu(&curves, &cfg_aic).expect("CPU AIC check");
+    for (g, c) in gpu_aic.iter().zip(cpu_aic.iter()) {
+        assert_eq!(g.used_three_param, c.used_three_param);
+        assert!((g.rate - c.rate).abs() < 1.0e-5);
+    }
+    println!(
+        "[F12 Centered 2p Gate] 60 extreme curves max |R_gpu - R_cpu| = {max_rate_diff:.3e} | max |dI0|/I0 = {max_rel_i0_diff:.3e}"
+    );
+}
