@@ -1626,7 +1626,7 @@ def render_p1_3_5(root: Path, extra_files: list[Path]) -> str:
     lines.append("| Committed Test & Scope | Measured Output | Status |")
     lines.append("|---|---|---|")
     lines.append(
-        f"| `test_cross_os_rdc_anneal_golden_coordinate_sha256` (non-ignored; `GB1` `seed=20260402`, `dihedrals -> rdc -> structure`, `0` OS `libm`) | `sha256={m_golden_run.group(1)}` (`q_work={m_golden_run.group(2)}, plane_q_free={m_golden_run.group(3)}`, `{m_golden_res.group(3)}`) | **`MATCH == EXPECTED_GOLDEN_COORD_SHA256` (`{m_golden_res.group(1)} passed; {m_golden_res.group(2)} failed`)** |"
+        f"| `test_cross_os_rdc_anneal_golden_coordinate_sha256` (non-ignored; `GB1` `seed=20260402`, `torsion_db -> noesy -> dihedrals -> rdc -> structure`, `0` OS `libm`) | `sha256={m_golden_run.group(1)}` (`q_work={m_golden_run.group(2)}, plane_q_free={m_golden_run.group(3)}`, `{m_golden_res.group(3)}`) | **`MATCH == EXPECTED_GOLDEN_COORD_SHA256` (`{m_golden_res.group(1)} passed; {m_golden_res.group(2)} failed`)** |"
     )
     lines.append(
         f"| `#[ignore] test_five_seed_multi_target_rdc_refinement_sweep` (`5` seeds x `3` development targets = `15` runs) | `{n_seed_lines}/15` seed lines asserted against unweakened gates (`{m_sweep_res.group(3)}`) | **`{m_sweep_res.group(1)} passed; {m_sweep_res.group(2)} failed` (`15/15 PASS`)** |"
@@ -1675,7 +1675,10 @@ def render_p1_3_5(root: Path, extra_files: list[Path]) -> str:
         has_dev = (
             ("development target" in dtxt.lower())
             and ("torsion_db.rs" in dtxt)
+            and ("noesy.rs" in dtxt)
             and ("dihedrals.rs" in dtxt)
+            and ("rdc.rs" in dtxt)
+            and ("structure.rs" in dtxt)
         )
         has_rng = all(rg in dtxt for rg in req_ranges)
         has_f8 = ("F8" in dtxt) and ("1IGD" in dtxt)

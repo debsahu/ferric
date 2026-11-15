@@ -1659,7 +1659,7 @@ fn test_noncircular_gb1_3gb1_exp_noe_fold_rdc_refine_vs_1pga_xray() {
 #[test]
 fn test_cross_os_rdc_anneal_golden_coordinate_sha256() {
     const EXPECTED_GOLDEN_COORD_SHA256: &str =
-        "becb91f6cdfc2358740be5e43861b0af6456e0b68a5e62ce779090fea9483639";
+        "bacc6cdec4c47214c7429cb30910c059313a5c1251b4b50bc6fd357f9cb9bf0c";
 
     let root = workspace_root();
     let xray_1pga = parse_pdb_first_model(root.join("data/pdb_refs/1pga.pdb")).expect("read 1PGA");
@@ -1679,10 +1679,21 @@ fn test_cross_os_rdc_anneal_golden_coordinate_sha256() {
 
     let shifts_gb1 = read_star_all_atoms(root.join("data/fixtures/gb1_bmr7280_shifts.str"), None)
         .expect("read BMRB 7280 shifts");
-    // Use `dihedrals::predict_dihedrals` (`0` OS `libm` calls) -> `rdc` (`0` OS `libm` calls)
-    // -> `structure` (`0` OS `libm` calls) so every operation in this cross-OS golden coordinate
-    // digest test is strictly IEEE-754 bit-deterministic across `x86_64` and `aarch64`.
-    let det_dihs_gb1 = nmr_core::dihedrals::predict_dihedrals(&shifts_gb1);
+    let fw_gb1 = HomologFirewallQuery {
+        query_pdb_ids: vec![
+            "1PGA".to_string(),
+            "3GB1".to_string(),
+            "1GB1".to_string(),
+            "2GB1".to_string(),
+            "2QMT".to_string(),
+        ],
+        query_bmrb_ids: vec!["bmr7280".to_string(), "bmr15156".to_string()],
+        query_uniprot_id: Some("P06654".to_string()),
+        query_family_id: Some("3.10.20.10".to_string()),
+        query_topology_id: Some("3.10.20".to_string()),
+        query_ca_coords: None,
+    };
+    let fw_dihs_gb1 = predict_torsions_with_firewall(&shifts_gb1, &fw_gb1).to_dihedral_restraints();
 
     let mut media =
         read_rdc_tsv(root.join("data/fixtures/gb1_3gb1_rdc.tsv")).expect("read 3GB1 RDCs");
@@ -1703,7 +1714,7 @@ fn test_cross_os_rdc_anneal_golden_coordinate_sha256() {
         &seq,
         &seq_ids,
         &exp_adrs,
-        &det_dihs_gb1,
+        &fw_dihs_gb1,
         &media,
         0.55,
         &cfg,
@@ -1883,8 +1894,13 @@ fn test_five_seed_multi_target_rdc_refinement_sweep() {
     let next_idx = AtomicUsize::new(0);
     let slots: Mutex<Vec<Option<SweepRow>>> = Mutex::new(vec![None; jobs.len()]);
 
+    let n_workers = (std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        / 3)
+    .clamp(2, 5);
     std::thread::scope(|scope| {
-        for _ in 0..2 {
+        for _ in 0..n_workers {
             scope.spawn(|| loop {
                 let idx = next_idx.fetch_add(1, Ordering::Relaxed);
                 if idx >= jobs.len() {
@@ -2035,32 +2051,11 @@ fn test_five_seed_multi_target_rdc_refinement_sweep() {
                         "[5SEED 1D3Z seed={}] Qw={:.4} Qf={:.4} lowE={:.3} mean={:.3} Rama={:.1}%",
                         r.seed, r.q_work, r.plane_q_free, r.low_e, r.mean_e, rama
                     );
-                    assert!(
-                        r.q_work < 0.14 && r.plane_q_free < 0.34 && r.low_e < 0.80 && rama >= 94.0,
-                        "1D3Z seed={} failed gate: Qw={:.4} Qf={:.4} lowE={:.3} Rama={:.1}%",
-                        r.seed,
-                        r.q_work,
-                        r.plane_q_free,
-                        r.low_e,
-                        rama
-                    );
                 }
                 "1UBQ" => {
                     println!(
                         "[5SEED 1UBQ seed={}] Qw={:.4} Qf={:.4} lowE={:.3} mean={:.3}",
                         r.seed, r.q_work, r.plane_q_free, r.low_e, r.mean_e
-                    );
-                    assert!(
-                        r.q_work < 0.22
-                            && r.plane_q_free < 0.65
-                            && r.low_e < 1.80
-                            && r.mean_e < 2.35,
-                        "1UBQ seed={} failed gate: Qw={:.4} Qf={:.4} lowE={:.3} mean={:.3}",
-                        r.seed,
-                        r.q_work,
-                        r.plane_q_free,
-                        r.low_e,
-                        r.mean_e
                     );
                 }
                 "GB1" => {
@@ -2068,20 +2063,6 @@ fn test_five_seed_multi_target_rdc_refinement_sweep() {
                     println!(
                         "[5SEED GB1 seed={}] Qw={:.4} Qf={:.4} NH_Qf={:.4} lowE={:.3} mean={:.3}",
                         r.seed, r.q_work, r.plane_q_free, nh_qf, r.low_e, r.mean_e
-                    );
-                    assert!(
-                        r.q_work < 0.25
-                            && r.plane_q_free < 0.55
-                            && nh_qf < 0.35
-                            && r.low_e < 1.50
-                            && r.mean_e < 2.00,
-                        "GB1 seed={} failed gate: Qw={:.4} Qf={:.4} NH_Qf={:.4} lowE={:.3} mean={:.3}",
-                        r.seed,
-                        r.q_work,
-                        r.plane_q_free,
-                        nh_qf,
-                        r.low_e,
-                        r.mean_e
                     );
                 }
                 _ => unreachable!(),
@@ -2117,6 +2098,58 @@ fn test_five_seed_multi_target_rdc_refinement_sweep() {
                 );
             }
             _ => unreachable!(),
+        }
+    }
+
+    for &target in &["1D3Z", "1UBQ", "GB1"] {
+        let grp: Vec<&SweepRow> = rows.iter().filter(|r| r.target == target).collect();
+        for r in &grp {
+            match target {
+                "1D3Z" => {
+                    let rama = r.rama_pct.unwrap();
+                    assert!(
+                        r.q_work < 0.14 && r.plane_q_free < 0.34 && r.low_e < 0.80 && rama >= 94.0,
+                        "1D3Z seed={} failed gate: Qw={:.4} Qf={:.4} lowE={:.3} Rama={:.1}%",
+                        r.seed,
+                        r.q_work,
+                        r.plane_q_free,
+                        r.low_e,
+                        rama
+                    );
+                }
+                "1UBQ" => {
+                    assert!(
+                        r.q_work < 0.22
+                            && r.plane_q_free < 0.65
+                            && r.low_e < 1.80
+                            && r.mean_e < 2.35,
+                        "1UBQ seed={} failed gate: Qw={:.4} Qf={:.4} lowE={:.3} mean={:.3}",
+                        r.seed,
+                        r.q_work,
+                        r.plane_q_free,
+                        r.low_e,
+                        r.mean_e
+                    );
+                }
+                "GB1" => {
+                    let nh_qf = r.nh_q_free.unwrap();
+                    assert!(
+                        r.q_work < 0.25
+                            && r.plane_q_free < 0.55
+                            && nh_qf < 0.35
+                            && r.low_e < 1.50
+                            && r.mean_e < 2.00,
+                        "GB1 seed={} failed gate: Qw={:.4} Qf={:.4} NH_Qf={:.4} lowE={:.3} mean={:.3}",
+                        r.seed,
+                        r.q_work,
+                        r.plane_q_free,
+                        nh_qf,
+                        r.low_e,
+                        r.mean_e
+                    );
+                }
+                _ => unreachable!(),
+            }
         }
     }
 }

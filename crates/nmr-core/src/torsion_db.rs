@@ -35,7 +35,9 @@ use crate::nef::{NefDihedralRestraint, NefDihedralRestraintList};
 use crate::nmrstar::Reference;
 use crate::noesy::{v_add, v_dist_sq, v_sub, Vec3};
 use crate::priors::three_to_one;
-use crate::structure::kabsch_transform;
+use crate::structure::{
+    det_atan2, det_cbrt, det_cos, det_exp, det_ln, det_sin, det_sin_cos, kabsch_transform,
+};
 
 const EMBEDDED_TORSION_CORPUS_TSV: &str =
     include_str!("../../../data/torsion_db/torsion_corpus.tsv");
@@ -1179,7 +1181,7 @@ pub fn tm_score_ca(query_ca: &[[f64; 3]], template_ca: &[[f64; 3]]) -> f64 {
 
     let l_norm = lq.min(lt);
     let d0 = if l_norm > 15 {
-        (1.24 * ((l_norm as f64) - 15.0).cbrt() - 1.8).max(0.5)
+        (1.24 * det_cbrt((l_norm as f64) - 15.0) - 1.8).max(0.5)
     } else {
         0.5
     };
@@ -1697,7 +1699,7 @@ fn estimate_offsets_from_sec_shifts(raw: &[[Option<f64>; 6]]) -> GlobalShiftOffs
         for sh in raw {
             let mut lls = [0.0f64; 3];
             for s in 0..3 {
-                let mut ll = PRIORS[s].ln();
+                let mut ll = det_ln(PRIORS[s]);
                 for k in 0..6 {
                     if let Some(v) = sh[k] {
                         let z = (v - offs[k] - mus[s][k]) / SIG[k];
@@ -1707,9 +1709,9 @@ fn estimate_offsets_from_sec_shifts(raw: &[[Option<f64>; 6]]) -> GlobalShiftOffs
                 lls[s] = ll;
             }
             let max_ll = lls[0].max(lls[1]).max(lls[2]);
-            let p0 = (lls[0] - max_ll).exp();
-            let p1 = (lls[1] - max_ll).exp();
-            let p2 = (lls[2] - max_ll).exp();
+            let p0 = det_exp(lls[0] - max_ll);
+            let p1 = det_exp(lls[1] - max_ll);
+            let p2 = det_exp(lls[2] - max_ll);
             let p_sum = p0 + p1 + p2;
             let ph = p1 / p_sum;
             let pe = p2 / p_sum;
@@ -1800,7 +1802,7 @@ pub fn compute_rci_and_s2(sec_shifts: &[[Option<f64>; 6]]) -> (Vec<f64>, Vec<f64
             }
         }
         let rci_v = s / w.max(1e-9);
-        let s2_v = (1.0 - 0.4 * (1.0 + 17.8 * rci_v).ln()).clamp(0.0, 1.0);
+        let s2_v = (1.0 - 0.4 * det_ln(1.0 + 17.8 * rci_v)).clamp(0.0, 1.0);
         rci_out.push(rci_v);
         s2_out.push(s2_v);
     }
@@ -2159,8 +2161,9 @@ pub fn predict_torsions_with_db_and_cutoff(
                 .iter()
                 .copied()
                 .filter(|&(_, p, s, _, _)| {
-                    periodic_angle_abs_diff_deg(p, p0).hypot(periodic_angle_abs_diff_deg(s, s0))
-                        <= 40.0
+                    let dp = periodic_angle_abs_diff_deg(p, p0);
+                    let ds = periodic_angle_abs_diff_deg(s, s0);
+                    (dp * dp + ds * ds).sqrt() <= 40.0
                 })
                 .collect();
             if cl.len() > best_cluster.len() {
@@ -2198,18 +2201,18 @@ pub fn predict_torsions_with_db_and_cutoff(
         let mut cos_psi = 0.0f64;
         let mut ws = Vec::with_capacity(best_cluster.len());
         for &(d, p, s, _, _) in &best_cluster {
-            let w = (-0.45 * (d - d_min)).exp();
+            let w = det_exp(-0.45 * (d - d_min));
             ws.push(w);
             w_tot += w;
-            let (sp, cp) = p.to_radians().sin_cos();
-            let (ss, cs) = s.to_radians().sin_cos();
+            let (sp, cp) = det_sin_cos(p.to_radians());
+            let (ss, cs) = det_sin_cos(s.to_radians());
             sin_phi += w * sp;
             cos_phi += w * cp;
             sin_psi += w * ss;
             cos_psi += w * cs;
         }
-        let pred_phi = wrap_deg((sin_phi / w_tot).atan2(cos_phi / w_tot).to_degrees());
-        let pred_psi = wrap_deg((sin_psi / w_tot).atan2(cos_psi / w_tot).to_degrees());
+        let pred_phi = wrap_deg(det_atan2(sin_phi / w_tot, cos_phi / w_tot).to_degrees());
+        let pred_psi = wrap_deg(det_atan2(sin_psi / w_tot, cos_psi / w_tot).to_degrees());
 
         let mut var_phi = 0.0f64;
         let mut var_psi = 0.0f64;
@@ -2221,7 +2224,7 @@ pub fn predict_torsions_with_db_and_cutoff(
         }
         let std_phi = (var_phi / w_tot).sqrt().max(5.0);
         let std_psi = (var_psi / w_tot).sqrt().max(5.0);
-        let comb_std = std_phi.hypot(std_psi);
+        let comb_std = (std_phi * std_phi + std_psi * std_psi).sqrt();
 
         if comb_std > 25.0 || is_ramachandran_outlier(&res_name, pred_phi, pred_psi) {
             predictions.push(ResidueTorsionPrediction {
@@ -2264,13 +2267,13 @@ pub fn predict_torsions_with_db_and_cutoff(
                 let cw: f64 = best_chi_cl.iter().map(|x| x.0).sum();
                 let sc: f64 = best_chi_cl
                     .iter()
-                    .map(|&(w, c)| w * c.to_radians().sin())
+                    .map(|&(w, c)| w * det_sin(c.to_radians()))
                     .sum();
                 let cc: f64 = best_chi_cl
                     .iter()
-                    .map(|&(w, c)| w * c.to_radians().cos())
+                    .map(|&(w, c)| w * det_cos(c.to_radians()))
                     .sum();
-                let m_chi = wrap_deg((sc / cw).atan2(cc / cw).to_degrees());
+                let m_chi = wrap_deg(det_atan2(sc / cw, cc / cw).to_degrees());
                 let v_chi: f64 = best_chi_cl
                     .iter()
                     .map(|&(w, c)| {

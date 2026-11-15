@@ -813,11 +813,19 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
             .enumerate()
             .map(|(i, dr)| {
                 let mut d = dr.clone();
-                if d.restrained_phi && plane_has_work[i] {
-                    d.phi_err_deg = d.phi_err_deg.max(14.0);
+                if d.restrained_phi {
+                    if plane_has_work[i] {
+                        d.phi_err_deg = d.phi_err_deg.max(14.0);
+                    } else {
+                        d.phi_err_deg = (d.phi_err_deg * 0.70).max(6.0);
+                    }
                 }
-                if d.restrained_psi && (i + 1 < l && plane_has_work[i + 1]) {
-                    d.psi_err_deg = d.psi_err_deg.max(14.0);
+                if d.restrained_psi {
+                    if i + 1 < l && plane_has_work[i + 1] {
+                        d.psi_err_deg = d.psi_err_deg.max(14.0);
+                    } else {
+                        d.psi_err_deg = (d.psi_err_deg * 0.70).max(6.0);
+                    }
                 }
                 d
             })
@@ -982,11 +990,7 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
         });
     }
 
-    let polish_iters = if n_iters >= 100 {
-        n_iters.max(145)
-    } else {
-        n_iters.clamp(40, 140)
-    };
+    let polish_iters = n_iters.max(40);
     nmr_core::structure::refine_ensemble_with_rdcs(
         &best_seeds,
         sequence,

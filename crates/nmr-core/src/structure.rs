@@ -327,14 +327,14 @@ pub(crate) fn det_acos(x: f64) -> f64 {
 /// Structure-engine wrapper around `Rng` whose Box-Muller normal variates use `det_ln` and
 /// `det_sin_cos` so Langevin trajectories are identical on `x86_64` and `aarch64` without
 /// altering `crate::rng::Rng` for other solvers.
-struct DetRng {
+pub(crate) struct DetRng {
     inner: Rng,
     spare_normal: Option<f64>,
 }
 
 impl DetRng {
     #[inline]
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self {
             inner: Rng::new(seed),
             spare_normal: None,
@@ -342,17 +342,17 @@ impl DetRng {
     }
 
     #[inline]
-    fn f64(&mut self) -> f64 {
+    pub(crate) fn f64(&mut self) -> f64 {
         self.inner.f64()
     }
 
     #[inline]
-    fn range_usize(&mut self, lo: usize, hi: usize) -> usize {
+    pub(crate) fn range_usize(&mut self, lo: usize, hi: usize) -> usize {
         self.inner.range_usize(lo, hi)
     }
 
     #[inline]
-    fn normal(&mut self, mean: f64, sd: f64) -> f64 {
+    pub(crate) fn normal(&mut self, mean: f64, sd: f64) -> f64 {
         if let Some(z1) = self.spare_normal.take() {
             return mean + sd * z1;
         }
@@ -884,6 +884,49 @@ fn evaluate_energy_and_gradients_internal(
     w_hbond: f64,
     weights: &EnergyWeights,
     plane_has_work: Option<&[bool]>,
+    grad_phi: &mut [f64],
+    grad_psi: &mut [f64],
+    grad_omega: Option<&mut [f64]>,
+) -> (PdbChain, EnergyBreakdown) {
+    evaluate_energy_and_gradients_internal_nterm(
+        sequence,
+        seq_ids,
+        phi_rad,
+        psi_rad,
+        omega_rad,
+        adrs,
+        dihedrals,
+        rdc_media,
+        prepared_rdc,
+        w_rdc,
+        w_omega,
+        w_hbond,
+        weights,
+        plane_has_work,
+        w_rdc > 0.0,
+        grad_phi,
+        grad_psi,
+        grad_omega,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_energy_and_gradients_internal_nterm(
+    sequence: &[String],
+    seq_ids: &[i32],
+    phi_rad: &[f64],
+    psi_rad: &[f64],
+    omega_rad: &[f64],
+    adrs: &[AmbiguousDistanceRestraint],
+    dihedrals: &[DihedralRestraint],
+    rdc_media: &[crate::rdc::RdcMediumSet],
+    prepared_rdc: Option<&[crate::rdc::PreparedRdcWorkMedium]>,
+    w_rdc: f64,
+    w_omega: f64,
+    w_hbond: f64,
+    weights: &EnergyWeights,
+    plane_has_work: Option<&[bool]>,
+    stagg_nterm_psi0: bool,
     grad_phi: &mut [f64],
     grad_psi: &mut [f64],
     mut grad_omega: Option<&mut [f64]>,
@@ -1431,7 +1474,8 @@ fn evaluate_energy_and_gradients_internal(
         let inv_s_ext = 1.0 / (26.0f64.to_radians() * 26.0f64.to_radians());
         let inv_s_hel = 1.0 / (24.0f64.to_radians() * 24.0f64.to_radians());
         let g_ext = det_exp(-0.5 * d_ext * d_ext * inv_s_ext);
-        let g_hel = 0.90 * det_exp(-0.5 * d_hel * d_hel * inv_s_hel);
+        let hel_amp = if stagg_nterm_psi0 { 0.20 } else { 0.90 };
+        let g_hel = hel_amp * det_exp(-0.5 * d_hel * d_hel * inv_s_hel);
         let z0 = g_ext + g_hel + 0.04;
         let w0 = 0.5 * weights.w_rama;
         breakdown.rama += w0 * (-det_ln(z0));
@@ -1584,6 +1628,43 @@ fn lbfgs_polish_with_rdcs_hbond(
     plane_has_work: Option<&[bool]>,
     max_iters: usize,
 ) -> (PdbChain, EnergyBreakdown) {
+    lbfgs_polish_with_rdcs_hbond_nterm(
+        sequence,
+        seq_ids,
+        phi,
+        psi,
+        omega,
+        adrs,
+        dihedrals,
+        rdc_media,
+        prepared_rdc,
+        w_rdc,
+        w_hbond,
+        weights,
+        plane_has_work,
+        w_rdc > 0.0,
+        max_iters,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lbfgs_polish_with_rdcs_hbond_nterm(
+    sequence: &[String],
+    seq_ids: &[i32],
+    phi: &mut [f64],
+    psi: &mut [f64],
+    omega: &[f64],
+    adrs: &[AmbiguousDistanceRestraint],
+    dihedrals: &[DihedralRestraint],
+    rdc_media: &[crate::rdc::RdcMediumSet],
+    prepared_rdc: Option<&[crate::rdc::PreparedRdcWorkMedium]>,
+    w_rdc: f64,
+    w_hbond: f64,
+    weights: &EnergyWeights,
+    plane_has_work: Option<&[bool]>,
+    stagg_nterm_psi0: bool,
+    max_iters: usize,
+) -> (PdbChain, EnergyBreakdown) {
     let l = sequence.len();
     let dim = 2 * l;
     let m_hist = 7usize;
@@ -1596,7 +1677,7 @@ fn lbfgs_polish_with_rdcs_hbond(
 
     let mut gp = vec![0.0f64; l];
     let mut gs = vec![0.0f64; l];
-    let (mut best_chain, mut cur_eb) = evaluate_energy_and_gradients_internal(
+    let (mut best_chain, mut cur_eb) = evaluate_energy_and_gradients_internal_nterm(
         sequence,
         seq_ids,
         &x_phi(&x, l),
@@ -1611,6 +1692,7 @@ fn lbfgs_polish_with_rdcs_hbond(
         w_hbond,
         weights,
         plane_has_work,
+        stagg_nterm_psi0,
         &mut gp,
         &mut gs,
         None,
@@ -1693,7 +1775,7 @@ fn lbfgs_polish_with_rdcs_hbond(
             for d_i in 0..dim {
                 x_trial[d_i] = wrap_rad(x[d_i] + step * dir[d_i]);
             }
-            let (ch_t, eb_t) = evaluate_energy_and_gradients_internal(
+            let (ch_t, eb_t) = evaluate_energy_and_gradients_internal_nterm(
                 sequence,
                 seq_ids,
                 &x_phi(&x_trial, l),
@@ -1708,6 +1790,7 @@ fn lbfgs_polish_with_rdcs_hbond(
                 w_hbond,
                 weights,
                 plane_has_work,
+                stagg_nterm_psi0,
                 &mut gp,
                 &mut gs,
                 None,
@@ -2032,6 +2115,7 @@ fn anneal_single_replica(
     dihedrals: &[DihedralRestraint],
     cfg: &StructureCalcConfig,
     warm_start: Option<(&[f64], &[f64])>,
+    stagg_nterm_psi0: bool,
     seed: u64,
 ) -> StructureConformer {
     let l = sequence.len();
@@ -2218,7 +2302,7 @@ fn anneal_single_replica(
         } else {
             0.0
         };
-        let (_, eb) = evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+        let (_, eb) = evaluate_energy_and_gradients_internal_nterm(
             sequence,
             seq_ids,
             &phi,
@@ -2227,10 +2311,13 @@ fn anneal_single_replica(
             active_adrs,
             dihedrals,
             &[],
+            None,
             0.0,
             0.0,
             s1_hb,
             &w,
+            None,
+            stagg_nterm_psi0,
             &mut gp,
             &mut gs,
             None,
@@ -2280,7 +2367,7 @@ fn anneal_single_replica(
                 let old_p = phi[idx];
                 let old_s = psi[idx];
                 let old_p2 = phi[idx + 1];
-                let (_, e_before) = evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+                let (_, e_before) = evaluate_energy_and_gradients_internal_nterm(
                     sequence,
                     seq_ids,
                     &phi,
@@ -2289,10 +2376,13 @@ fn anneal_single_replica(
                     active_adrs,
                     dihedrals,
                     &[],
+                    None,
                     0.0,
                     0.0,
                     s1_hb,
                     &w,
+                    None,
+                    stagg_nterm_psi0,
                     &mut gp,
                     &mut gs,
                     None,
@@ -2303,7 +2393,7 @@ fn anneal_single_replica(
                 if !sequence[idx + 1].eq_ignore_ascii_case("PRO") {
                     phi[idx + 1] = wrap_rad(phi[idx + 1] - 0.85 * delta);
                 }
-                let (_, e_after) = evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+                let (_, e_after) = evaluate_energy_and_gradients_internal_nterm(
                     sequence,
                     seq_ids,
                     &phi,
@@ -2312,10 +2402,13 @@ fn anneal_single_replica(
                     active_adrs,
                     dihedrals,
                     &[],
+                    None,
                     0.0,
                     0.0,
                     s1_hb,
                     &w,
+                    None,
+                    stagg_nterm_psi0,
                     &mut gp,
                     &mut gs,
                     None,
@@ -2346,7 +2439,7 @@ fn anneal_single_replica(
         w_rama: 5.0,
         w_rg: 0.0,
     };
-    lbfgs_polish_with_rdcs_hbond(
+    lbfgs_polish_with_rdcs_hbond_nterm(
         sequence,
         seq_ids,
         &mut phi,
@@ -2360,6 +2453,7 @@ fn anneal_single_replica(
         if pure_noe_mode { 0.95 } else { 0.0 },
         &soft_polish_weights,
         None,
+        stagg_nterm_psi0,
         90,
     );
 
@@ -2379,7 +2473,7 @@ fn anneal_single_replica(
             w_rg: 0.0,
         };
 
-        evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+        evaluate_energy_and_gradients_internal_nterm(
             sequence,
             seq_ids,
             &phi,
@@ -2388,6 +2482,7 @@ fn anneal_single_replica(
             adrs,
             dihedrals,
             &[],
+            None,
             0.0,
             0.0,
             if pure_noe_mode {
@@ -2396,6 +2491,8 @@ fn anneal_single_replica(
                 0.0
             },
             &w,
+            None,
+            stagg_nterm_psi0,
             &mut gp,
             &mut gs,
             None,
@@ -2423,7 +2520,7 @@ fn anneal_single_replica(
 
     // Stage 3: Full physical potential L-BFGS quasi-Newton minimization (zero Rg bias!)
     let final_weights = EnergyWeights::default();
-    let (final_chain, final_eb) = lbfgs_polish_with_rdcs_hbond(
+    let (final_chain, final_eb) = lbfgs_polish_with_rdcs_hbond_nterm(
         sequence,
         seq_ids,
         &mut phi,
@@ -2437,6 +2534,7 @@ fn anneal_single_replica(
         if pure_noe_mode { 1.55 } else { 0.0 },
         &final_weights,
         None,
+        stagg_nterm_psi0,
         cfg.lbfgs_iters,
     );
 
@@ -2475,6 +2573,7 @@ pub fn fold_ensemble(
         &[],
         0,
         1,
+        false,
         cycle_seed,
     )
 }
@@ -2489,6 +2588,7 @@ fn fold_ensemble_seeded(
     prior_conformers: &[StructureConformer],
     warm_fraction_num: usize,
     warm_fraction_den: usize,
+    stagg_nterm_psi0: bool,
     cycle_seed: u64,
 ) -> Vec<StructureConformer> {
     let n_rep = cfg.n_replicas.max(1);
@@ -2522,7 +2622,15 @@ fn fold_ensemble_seeded(
                 None
             };
             all_conformers.push(anneal_single_replica(
-                sequence, seq_ids, local_ref, adrs, dihedrals, cfg, warm, s,
+                sequence,
+                seq_ids,
+                local_ref,
+                adrs,
+                dihedrals,
+                cfg,
+                warm,
+                stagg_nterm_psi0,
+                s,
             ));
         }
     } else {
@@ -2541,7 +2649,15 @@ fn fold_ensemble_seeded(
                                 None
                             };
                             anneal_single_replica(
-                                sequence, seq_ids, local_ref, adrs, dihedrals, cfg, warm, s,
+                                sequence,
+                                seq_ids,
+                                local_ref,
+                                adrs,
+                                dihedrals,
+                                cfg,
+                                warm,
+                                stagg_nterm_psi0,
+                                s,
                             )
                         })
                         .collect::<Vec<_>>()
@@ -2608,6 +2724,7 @@ pub fn calculate_structure_iterative(
         &[],
         0,
         1,
+        false,
         master.next_u64(),
     );
 
@@ -2647,6 +2764,7 @@ pub fn calculate_structure_iterative(
             top_seeds,
             wf_num,
             wf_den,
+            false,
             master.next_u64(),
         );
     }
@@ -3450,9 +3568,24 @@ pub fn refine_ensemble_with_rdcs(
                         proposals.push((pk, sk, pk1, sk1));
                     }
 
+                    let k_trapped_pos_phi =
+                        !k_is_gly && k > 0 && phi[k] > (-28.0f64).to_radians() && !k_valid_alpha_l;
                     for (pk, sk, pk1, sk1) in proposals {
                         let mut trial_phi = phi.clone();
                         let mut trial_psi = psi.clone();
+                        if k_trapped_pos_phi {
+                            let dp0 = wrap_rad(pk - phi[k]);
+                            let ds1 = wrap_rad(sk1 - psi[k + 1]);
+                            if !sequence[k].eq_ignore_ascii_case("PRO") && dp0.abs() > 0.05 {
+                                trial_psi[k - 1] = wrap_rad(psi[k - 1] - 0.90 * dp0);
+                            }
+                            if k + 2 < l
+                                && !sequence[k + 2].eq_ignore_ascii_case("PRO")
+                                && ds1.abs() > 0.05
+                            {
+                                trial_phi[k + 2] = wrap_rad(phi[k + 2] - 0.90 * ds1);
+                            }
+                        }
                         trial_phi[k] = pk;
                         trial_psi[k] = sk;
                         trial_phi[k + 1] = pk1;
@@ -4099,6 +4232,7 @@ pub fn calculate_structure_with_rdcs_and_dihedrals(
         &[],
         0,
         1,
+        use_rdc,
         master.next_u64(),
     );
 
@@ -4171,6 +4305,7 @@ pub fn calculate_structure_with_rdcs_and_dihedrals(
             top_seeds,
             wf_num,
             wf_den,
+            use_rdc,
             master.next_u64(),
         );
 
@@ -5275,6 +5410,7 @@ pub fn fold_from_experimental_noes_and_rdcs(
         &[],
         0,
         1,
+        use_rdc,
         master.next_u64(),
     );
 
@@ -5345,6 +5481,7 @@ pub fn fold_from_experimental_noes_and_rdcs(
             top_seeds,
             wf_num,
             wf_den,
+            use_rdc,
             master.next_u64(),
         );
 
