@@ -1,0 +1,80 @@
+name: Bug Report
+description: Report a reproducible bug in the CLI, desktop/WebGPU workbench, DSP/solvers, or documentation
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue in `nmr-assign`!
+        **Clean-Room & Privacy Policy:** Please cite public **BMRB / PDB accessions** or minimal synthetic inputs only. Never paste or attach unpublished private spectra or source code, macros, parameter tables, or output files from proprietary, academic-only, GPL, or AGPL NMR software.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component / Surface
+      options:
+        - "CLI (nmrassign)"
+        - "Desktop GUI (nmr-gui native)"
+        - "Browser WebGPU Demo (wasm32)"
+        - "Raw FID / Custom pulprog / Composable DSP (nmr-core)"
+        - "Macromolecular Assignment Solvers (evo-graph / standard / bayes-sa / IDP / Methyl-TROSY)"
+        - "Spin Relaxation & Chemical Exchange (R1/R2/hetNOE, S^2, CEST, CPMG, CSP)"
+        - "Analytical 1D NMR, Multiplets, qNMR, DOSY & Metabolomics"
+        - "3D Structure Viewer, Torsions, RDCs & Octet 2D Depiction"
+        - "MCP Server & Live Workbench Bridge"
+        - "Documentation / Build / CI"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: nmrassign Version & Git Commit
+      description: Output of `nmrassign --version` (or release tag)
+      placeholder: "nmrassign 0.12.0"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: OS, GPU Backend & Browser (if WebGPU Demo)
+      placeholder: "macOS 15.1 (Apple M3, Metal) / Ubuntu 24.04 (Vulkan) / Chrome 131 WebGPU"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: data_format
+    attributes:
+      label: Input Spectrum / Project Format
+      options:
+        - "Bruker Raw FID (ser / fid + acqus)"
+        - "Bruker Processed (pdata/1/2rr / 3rrr / 1r)"
+        - "Varian / Agilent (fid + procpar)"
+        - "JEOL Delta / JCAMP-DX (.jdf / .jdx)"
+        - "NMRPipe (.ft1 / .ft2 / .ft3)"
+        - "Sparky (.ucsf)"
+        - "NMR-STAR v3 (.str) / NEF v1.1 (.nef)"
+        - "Built-in Demo / Synthetic Fixture"
+        - "Not Applicable"
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to Reproduce, Expected Physics/Output & Actual Behavior
+      description: Provide exact CLI commands or GUI actions and a public BMRB ID (e.g., BMRB 17769) if applicable.
+      placeholder: |
+        1. Run `nmrassign ...`
+        2. Expected: ...
+        3. Observed: ...
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: clean_room
+    attributes:
+      label: Clean-Room & Data Hygiene Check
+      options:
+        - label: I confirm this report contains no unpublished private data and no code, macros, or parameter files from proprietary, academic-licensed, GPL, or AGPL NMR packages.
+          required: true

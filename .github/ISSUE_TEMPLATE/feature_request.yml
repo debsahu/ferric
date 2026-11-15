@@ -1,0 +1,48 @@
+name: Feature / Method Request
+description: Propose a new NMR spectroscopy workflow, clean-room algorithm, or UI enhancement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Clean-Room Policy:** Every algorithm in `nmr-assign` is implemented from peer-reviewed literature, public specifications (NMR-STAR v3, NEF v1.1, JCAMP-DX), or original derivations. Please cite papers/DOIs rather than referencing internals or code of restricted, proprietary, GPL, or AGPL packages.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Target Area
+      options:
+        - "Raw FID Processing, NUS & pulprog Physics"
+        - "Backbone / Sidechain / Methyl / IDP / Paramagnetic Assignment"
+        - "Spin Relaxation, Model-Free Dynamics & Chemical Exchange"
+        - "Small-Molecule 1D NMR, Multiplets, qNMR & DOSY"
+        - "1D NMR Metabolomics & Chemometrics"
+        - "3D Biomolecular Structure, Torsions, RDCs & Octet 2D Chemistry"
+        - "Interactive Desktop / wasm32 WebGPU Workbench UX"
+        - "MCP Copilot Tools & CLI Automation"
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Scientific Motivation & Proposed Workflow
+      description: Describe the spectroscopic problem, inputs, and desired CLI/GUI/MCP output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: references
+    attributes:
+      label: Literature Citations / Public Standards
+      description: Peer-reviewed papers (authors, journal, year, DOI) or public BMRB/PDB test cases.
+      placeholder: "e.g., Lipari & Szabo, J. Am. Chem. Soc. 1982, 104, 4546 (DOI: 10.1021/ja00381a009)"
+
+  - type: checkboxes
+    id: clean_room
+    attributes:
+      label: Clean-Room Confirmation
+      options:
+        - label: I confirm this proposal is based on peer-reviewed literature, open standards, or original ideas, with no material copied from proprietary, academic-licensed, GPL, or AGPL software.
+          required: true

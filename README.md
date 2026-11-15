@@ -9,6 +9,8 @@
 
 `nmr-assign` (`nmrassign` CLI + `nmr-gui` desktop/WebAssembly workbench) processes raw time-domain FIDs (Bruker `ser`/`fid` + custom `pulprog`, Varian/Agilent, JEOL Delta, JCAMP-DX) and frequency-domain spectra (Bruker `pdata`, NMRPipe, Sparky `.ucsf`) end-to-end in pure clean-room Rust (`f64` reference algorithms) and cross-vendor WebGPU (`wgpu` WGSL compute & contour shaders).
 
+> **Human-in-the-Loop Development & Acknowledgements:** `nmr-assign` is developed with a human NMR scientist ([`@debsahu`](https://github.com/debsahu)) in the loop throughout the entire process—owning the scientific specifications, spin-physics and scoring rules, benchmark validation, and release governance. Development was supported by compute credits generously given by Google under [**Google Gemini for Science**](https://ai.google/gemini-for-science/), and [`@debsahu`](https://github.com/debsahu)'s personal Claude ([Anthropic](https://www.anthropic.com/)) was used for independent code and scientific review.
+
 ## Deterministic Scientific Showcase
 
 Every panel below is generated deterministically (`seed = 42`, zero external plotting libraries) directly from `nmr-core` forward models and solvers via `nmrassign export-fig --out-dir docs/assets`:
