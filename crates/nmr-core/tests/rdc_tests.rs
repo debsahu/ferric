@@ -1767,6 +1767,153 @@ fn test_cross_os_rdc_anneal_golden_coordinate_sha256() {
 }
 
 #[test]
+fn test_cross_os_rdc_anneal_golden_coordinate_sha256_1d3z_and_1ubq() {
+    const EXPECTED_GOLDEN_1D3Z_COORD_SHA256: &str =
+        "a4b78f6a74ab8ecfa39c42c4daed0fb795fadfe2e4fc748559cb53be58ccccce";
+    const EXPECTED_GOLDEN_1UBQ_COORD_SHA256: &str =
+        "c180fb18fc1135969f50796640c0781fab26cf109c44d47c1ee9b6e7e3e675ab";
+
+    let chain_coord_sha256 = |chain: &PdbChain| -> String {
+        let mut coord_bytes: Vec<u8> = Vec::with_capacity(chain.residues.len() * 224);
+        let push_vec3 = |buf: &mut Vec<u8>, v: [f64; 3]| {
+            for c in v {
+                buf.extend_from_slice(&c.to_le_bytes());
+            }
+        };
+        let push_opt_vec3 = |buf: &mut Vec<u8>, opt: Option<[f64; 3]>| match opt {
+            Some(v) => {
+                buf.push(1u8);
+                for c in v {
+                    buf.extend_from_slice(&c.to_le_bytes());
+                }
+            }
+            None => buf.push(0u8),
+        };
+        for res in &chain.residues {
+            push_vec3(&mut coord_bytes, res.n);
+            push_vec3(&mut coord_bytes, res.ca);
+            push_vec3(&mut coord_bytes, res.c);
+            push_vec3(&mut coord_bytes, res.o);
+            push_opt_vec3(&mut coord_bytes, res.h);
+            push_opt_vec3(&mut coord_bytes, res.cb);
+            push_vec3(&mut coord_bytes, res.ha);
+            push_opt_vec3(&mut coord_bytes, res.ha2);
+            push_opt_vec3(&mut coord_bytes, res.ha3);
+        }
+        sha256_hex(&coord_bytes)
+    };
+
+    let root = workspace_root();
+    let cfg = StructureCalcConfig {
+        n_replicas: 2,
+        n_select: 2,
+        n_refinement_cycles: 1,
+        stage1_steps: 200,
+        stage2_steps: 300,
+        lbfgs_iters: 40,
+        seed: 4242,
+        ..StructureCalcConfig::default()
+    };
+
+    // 1. 1D3Z CPU path: simulate_noesy_peaks + predict_torsions_with_firewall (with Layer-4 TM-score
+    //    query_ca_coords) + match_initial_adrs + multi-cycle ADR reweighting + bicelle RDC refinement.
+    let pdb_1d3z =
+        parse_pdb_first_model(root.join("data/pdb_refs/1d3z.pdb")).expect("read 1D3Z PDB");
+    let shifts_1d3z = read_star_all_atoms(root.join("data/benchmark/bmr17769.str"), None)
+        .expect("read BMRB 17769 shifts");
+    let mut media_1d3z =
+        read_rdc_tsv(root.join("data/fixtures/ubiquitin_1d3z_rdc.tsv")).expect("read 1D3Z RDCs");
+    partition_rdc_free_set(&mut media_1d3z, 0.20, 4242);
+    let peaks_1d3z = simulate_noesy_peaks(&pdb_1d3z, &shifts_1d3z, &NoesySimConfig::default());
+    let fw_ubq = HomologFirewallQuery {
+        query_pdb_ids: vec!["1D3Z".to_string(), "1UBQ".to_string(), "1G6J".to_string()],
+        query_bmrb_ids: vec!["bmr17769".to_string(), "bmr5387".to_string()],
+        query_uniprot_id: Some("P0CG48".to_string()),
+        query_family_id: Some("3.10.20.90".to_string()),
+        query_topology_id: Some("3.10.20".to_string()),
+        query_ca_coords: Some(pdb_1d3z.residues.iter().map(|r| r.ca).collect()),
+    };
+    let fw_dihs_1d3z =
+        predict_torsions_with_firewall(&shifts_1d3z, &fw_ubq).to_dihedral_restraints();
+
+    let (ens_1d3z, Some(val_1d3z)) = calculate_structure_with_rdcs_and_dihedrals(
+        &shifts_1d3z,
+        &peaks_1d3z,
+        fw_dihs_1d3z,
+        &media_1d3z,
+        0.75,
+        &cfg,
+    )
+    .expect("deterministic cross-OS 1D3Z RDC fold") else {
+        panic!("expected Some(RdcValidationSummary) for 1D3Z golden path");
+    };
+    let sha_1d3z = chain_coord_sha256(&ens_1d3z.conformers[0].chain);
+    println!(
+        "[CROSS-OS GOLDEN 1D3Z RDC SHA256] sha256={} q_work={:.4} plane_q_free={:.4}",
+        sha_1d3z, val_1d3z.overall_q_work, val_1d3z.overall_q_free
+    );
+
+    // 2. 1UBQ CPU path: experimental 1D3Z NOE ADRs (`dihedrals = &[]`) + ByPeptidePlane bicelle RDCs
+    //    + fold_from_experimental_noes_and_rdcs.
+    let xray_1ubq = parse_pdb_first_model(root.join("data/fixtures/ubiquitin_1ubq_xray.pdb"))
+        .expect("read 1UBQ X-ray PDB");
+    let seq_ubq: Vec<String> = xray_1ubq
+        .residues
+        .iter()
+        .map(|r| r.res_name.clone())
+        .collect();
+    let seq_ids_ubq: Vec<i32> = xray_1ubq.residues.iter().map(|r| r.seq_id).collect();
+    let exp_adrs_ubq = read_exp_noe_tsv(
+        root.join("data/fixtures/ubiquitin_1d3z_exp_noe.tsv"),
+        &seq_ubq,
+        &seq_ids_ubq,
+    )
+    .expect("read experimental 1D3Z NOEs");
+    let mut media_ubq =
+        read_rdc_tsv(root.join("data/fixtures/ubiquitin_1d3z_rdc.tsv")).expect("read 1D3Z RDCs");
+    partition_rdc_free_set_with_mode(
+        &mut media_ubq,
+        0.20,
+        4242,
+        RdcFreeStratification::ByPeptidePlane,
+    );
+
+    let (ens_1ubq, Some(val_1ubq)) = fold_from_experimental_noes_and_rdcs(
+        &seq_ubq,
+        &seq_ids_ubq,
+        &exp_adrs_ubq,
+        &[],
+        &media_ubq,
+        0.75,
+        &cfg,
+    )
+    .expect("deterministic cross-OS 1UBQ RDC fold") else {
+        panic!("expected Some(RdcValidationSummary) for 1UBQ golden path");
+    };
+    let sha_1ubq = chain_coord_sha256(&ens_1ubq.conformers[0].chain);
+    println!(
+        "[CROSS-OS GOLDEN 1UBQ RDC SHA256] sha256={} q_work={:.4} plane_q_free={:.4}",
+        sha_1ubq, val_1ubq.overall_q_work, val_1ubq.overall_q_free
+    );
+
+    assert!(
+        val_1d3z.overall_q_work.is_finite()
+            && val_1d3z.overall_q_free.is_finite()
+            && val_1ubq.overall_q_work.is_finite()
+            && val_1ubq.overall_q_free.is_finite(),
+        "non-finite golden 1D3Z/1UBQ RDC Q metrics"
+    );
+    assert_eq!(
+        sha_1d3z, EXPECTED_GOLDEN_1D3Z_COORD_SHA256,
+        "cross-OS golden 1D3Z RDC coordinate SHA-256 drifted (got {sha_1d3z})"
+    );
+    assert_eq!(
+        sha_1ubq, EXPECTED_GOLDEN_1UBQ_COORD_SHA256,
+        "cross-OS golden 1UBQ RDC coordinate SHA-256 drifted (got {sha_1ubq})"
+    );
+}
+
+#[test]
 #[ignore]
 fn test_five_seed_multi_target_rdc_refinement_sweep() {
     use std::sync::atomic::{AtomicUsize, Ordering};

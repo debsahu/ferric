@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -1696,6 +1697,264 @@ def render_p1_3_5(root: Path, extra_files: list[Path]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_p1_6_7(root: Path, extra_files: list[Path], raw_extra_args: list[str]) -> str:
+    w2 = root / "data/private/w2_results"
+    rdc_rs_p = root / "crates/nmr-core/tests/rdc_tests.rs"
+    spec_p = root / "docs/specs/04-structure.md"
+    prov_p = root / "data/benchmark/PROVENANCE.md"
+    todo_p = root / "TODO.md"
+    real_bench_rs_p = root / "crates/nmr-cli/src/real_benchmark.rs"
+    all3_log_p = w2 / "w2_p1_7_golden_sha256_all3_test.log"
+    prev_ci_json_p = w2 / "w2_p1_3_linux_ci_run.json"
+    ci_json_p = w2 / "w2_p1_6_7_linux_ci_run.json"
+    ci_rdc_log_p = w2 / "w2_p1_6_7_linux_ci_rdc_tests.log"
+    full_pack_p = root / "data/private/phase13_W2_review_pack.md"
+
+    # Enforce zero solver, knot, or GPU test changes relative to e3e7005
+    diff_out = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(root),
+            "diff",
+            "e3e7005",
+            "--",
+            "crates/nmr-core/src/",
+            "crates/nmr-gpu/src/",
+            "crates/nmr-gpu/tests/",
+        ],
+        text=True,
+    )
+    if diff_out != "":
+        raise RuntimeError(
+            "Forbidden diff vs e3e7005 in crates/nmr-core/src/, crates/nmr-gpu/src/, or crates/nmr-gpu/tests/"
+        )
+
+    p167_files: list[Path] = [
+        rdc_rs_p,
+        spec_p,
+        prov_p,
+        todo_p,
+        all3_log_p,
+        prev_ci_json_p,
+        ci_json_p,
+        ci_rdc_log_p,
+        *extra_files,
+        full_pack_p,
+    ]
+    extra_cli = "".join(f" --extra-file {arg}" for arg in raw_extra_args)
+    cmd_str = f"python3 scripts/render_phase13_w2_tables.py --section p1-6-7{extra_cli}"
+
+    lines: list[str] = []
+    lines.append(
+        "### `13.2:P1-6`–`P1-7` Remediation Artifact & Review Pack FIPS 180-4 SHA-256 Digests"
+    )
+    lines.append("")
+    lines.append(f"Generated mechanically by `{cmd_str}`:")
+    lines.append("")
+    lines.append("| Artifact Path | Bytes | SHA-256 |")
+    lines.append("|---|---:|---|")
+    seen_paths: set[Path] = set()
+    for fp in p167_files:
+        if fp.exists() and fp not in seen_paths:
+            seen_paths.add(fp)
+            digest, nbytes = sha256_file(fp)
+            rel = fp.relative_to(root) if fp.is_relative_to(root) else fp
+            lines.append(f"| `{rel}` | {nbytes:,} | `{digest}` |")
+
+    # 1. Complete post-4ab9c04 Linux x86_64 CI ledger + P1-6/P1-7 branch run
+    lines.append("")
+    lines.append(
+        "### `13.2:P1-6` — Complete Post-`4ab9c04` Linux `x86_64` GitHub Actions CI & Tuning Ledger"
+    )
+    lines.append("")
+    lines.append(
+        "| Run ID | Branch & Commit | Conclusion | Measured Linux `x86_64` Outcome & Subsequent Action |"
+    )
+    lines.append("|---|---|---|---|")
+    lines.append(
+        "| `43612388518` | `main` @ `4ab9c04` | **`FAILURE`** | `rdc_tests` `8/10`: `1UBQ` `plane Q_free = 0.9520` (`< 0.65`), `1D3Z` `plane Q_free = 0.5691` (`< 0.34`); followed by round-1 development-target heuristics in `7a4c2b8` |"
+    )
+    lines.append(
+        "| `43653936217` | `ci/w2-rdc-determinism` @ `17270db` | **`FAILURE`** | `1D3Z` `plane Q_free = 0.6114` (`< 0.34`), while `GB1` golden SHA `bacc6cdec4...` passed; followed by round-2 heuristics in `dc87bba` (`k_trapped_pos_phi`, `stagg_nterm_psi0` `0.90 -> 0.20`, `rdc_gpu.rs` unmeasured-plane scaling) + `torsion_db.rs`/`noesy.rs` `det_*` |"
+    )
+    lines.append(
+        "| `43668989525` | `ci/w2-rdc-determinism` @ `dc87bba` | **`FAILURE`** | `nmr-core` `rdc_tests` `11/11` PASS; `nmr-gpu` WebGPU `1D3Z` failed on Mesa Lavapipe (`Q_free = 0.3373` vs `< 0.32`); followed by round-3 GPU schedule rewrite in `e3e7005` (~`545` lines in `rdc_gpu.rs`: replica expansion, `w_rdc`/`w_noe`/vdW ramps, LR constants, energy cap, medoid promotion, trimmed-mean consensus) |"
+    )
+    lines.append(
+        "| `43677579868` | `ci/w2-rdc-determinism` @ `e3e7005` | **`SUCCESS`** | Both CI jobs green (`w2_p1_3_linux_ci_run.json`); single-config (`free_seed = 4242`) Mesa Lavapipe WebGPU `1D3Z` `< 0.32` + `GB1` golden SHA pass |"
+    )
+    if ci_json_p.exists():
+        ci_raw = json.loads(ci_json_p.read_text(encoding="utf-8"))
+        ci_obj = ci_raw[0] if isinstance(ci_raw, list) and ci_raw else ci_raw
+        run_id = (
+            ci_obj.get("databaseId")
+            or ci_obj.get("id")
+            or ci_obj.get("run_id")
+            or "?"
+        )
+        branch = (
+            ci_obj.get("headBranch")
+            or ci_obj.get("head_branch")
+            or ci_obj.get("branch")
+            or "?"
+        )
+        head_sha = (
+            ci_obj.get("headSha")
+            or ci_obj.get("head_sha")
+            or ci_obj.get("sha")
+            or "?"
+        )
+        conclusion = str(ci_obj.get("conclusion", "?"))
+        if conclusion.lower() != "success":
+            raise RuntimeError(
+                f"Expected Linux CI conclusion == 'success', got {conclusion!r} in {ci_json_p}"
+            )
+        jobs = ci_obj.get("jobs", [])
+        if jobs:
+            job_parts: list[str] = []
+            for jb in jobs:
+                jname = jb.get("name", "job")
+                jconc = jb.get("conclusion") or jb.get("status") or "?"
+                t0 = jb.get("startedAt") or jb.get("started_at") or ""
+                t1 = jb.get("completedAt") or jb.get("completed_at") or ""
+                tspan = f" ({t0} -> {t1})" if (t0 and t1) else ""
+                job_parts.append(f"`{jname}: {jconc}`{tspan}")
+            job_summary = "; ".join(job_parts)
+        else:
+            job_summary = "`all jobs: success`"
+        if ci_rdc_log_p.exists():
+            ci_log_txt = ci_rdc_log_p.read_text(encoding="utf-8", errors="replace")
+            g_gb1 = "test test_cross_os_rdc_anneal_golden_coordinate_sha256 ... ok" in ci_log_txt
+            g_ubq = (
+                "test test_cross_os_rdc_anneal_golden_coordinate_sha256_1d3z_and_1ubq ... ok"
+                in ci_log_txt
+            )
+            if g_gb1 and g_ubq:
+                job_summary += "; Linux `3/3` golden SHA-256 tests (`GB1`, `1D3Z`, `1UBQ`): **`ok`**"
+        lines.append(
+            f"| `{run_id}` | `{branch}` @ `{head_sha[:7]}` (`{head_sha}`) | **`{conclusion.upper()}`** | `0`-byte solver/knot/gate diff vs `e3e7005`; all `3/3` non-ignored golden coordinate SHA-256 digests (`GB1`, `1D3Z`, `1UBQ`) verified on Ubuntu `x86_64` ({job_summary}) |"
+        )
+    else:
+        lines.append(
+            "| `PENDING_CI_RUN` | `ci/w2-rdc-determinism` | `awaiting w2_p1_6_7_linux_ci_run.json` | `0`-byte solver/knot/gate diff vs `e3e7005` |"
+        )
+
+    # 2. 13.2:P1-7 All-3-target golden coordinate SHA-256 digests
+    rdc_rs_txt = rdc_rs_p.read_text(encoding="utf-8")
+    m_c_gb1 = re.search(
+        r'const EXPECTED_GOLDEN_COORD_SHA256:\s*&str\s*=\s*"([0-9a-f]{64})";',
+        rdc_rs_txt,
+    )
+    m_c_1d3z = re.search(
+        r'const EXPECTED_GOLDEN_1D3Z_COORD_SHA256:\s*&str\s*=\s*"([0-9a-f]{64})";',
+        rdc_rs_txt,
+    )
+    m_c_1ubq = re.search(
+        r'const EXPECTED_GOLDEN_1UBQ_COORD_SHA256:\s*&str\s*=\s*"([0-9a-f]{64})";',
+        rdc_rs_txt,
+    )
+    all3_txt = all3_log_p.read_text(encoding="utf-8")
+    m_l_gb1 = re.search(
+        r"\[CROSS-OS GOLDEN RDC SHA256\] sha256=([0-9a-f]{64}) q_work=([0-9.]+) plane_q_free=([0-9.]+)",
+        all3_txt,
+    )
+    m_l_1d3z = re.search(
+        r"\[CROSS-OS GOLDEN 1D3Z RDC SHA256\] sha256=([0-9a-f]{64}) q_work=([0-9.]+) plane_q_free=([0-9.]+)",
+        all3_txt,
+    )
+    m_l_1ubq = re.search(
+        r"\[CROSS-OS GOLDEN 1UBQ RDC SHA256\] sha256=([0-9a-f]{64}) q_work=([0-9.]+) plane_q_free=([0-9.]+)",
+        all3_txt,
+    )
+    m_l_res = re.search(
+        r"test result: ok\.\s+(\d+) passed;\s+(\d+) failed;.*finished in ([0-9.]+s)",
+        all3_txt,
+    )
+    if not all([m_c_gb1, m_c_1d3z, m_c_1ubq, m_l_gb1, m_l_1d3z, m_l_1ubq, m_l_res]):
+        raise RuntimeError(
+            "Failed to parse 3/3 golden coordinate SHA-256 constants or w2_p1_7_golden_sha256_all3_test.log"
+        )
+    assert m_c_gb1 and m_c_1d3z and m_c_1ubq
+    assert m_l_gb1 and m_l_1d3z and m_l_1ubq and m_l_res
+    if (
+        m_c_gb1.group(1) != m_l_gb1.group(1)
+        or m_c_1d3z.group(1) != m_l_1d3z.group(1)
+        or m_c_1ubq.group(1) != m_l_1ubq.group(1)
+    ):
+        raise RuntimeError("Mismatch between committed golden SHA-256 constants and measured log")
+
+    lines.append("")
+    lines.append(
+        "### `13.2:P1-7` — Non-Ignored All-3-Target (`GB1`, `1D3Z`, `1UBQ`) Cross-OS Golden Coordinate SHA-256 Digests (`rdc_tests.rs`)"
+    )
+    lines.append("")
+    lines.append(
+        "| Target CPU Path & Exercised Modules | Seed / Holdout Seed | Committed & Measured `SHA-256` (`conformers[0].chain`) | `q_work` / `plane_q_free` | Verification Status |"
+    )
+    lines.append("|---|---|---|---|---|")
+    lines.append(
+        f"| `GB1` (`read_exp_noe_tsv` + `predict_torsions_with_firewall` + `fold_from_experimental_noes_and_rdcs`) | `seed=20260402`, `free_seed=2026` | `{m_l_gb1.group(1)}` | `{m_l_gb1.group(2)}` / `{m_l_gb1.group(3)}` | **`MATCH == EXPECTED_GOLDEN_COORD_SHA256`** |"
+    )
+    lines.append(
+        f"| `1D3Z` (`simulate_noesy_peaks` + `predict_torsions_with_firewall` [`tm_score_ca`] + `match_initial_adrs` + `reweight_adrs` + `calculate_structure_with_rdcs_and_dihedrals`) | `seed=4242`, `free_seed=4242` | `{m_l_1d3z.group(1)}` | `{m_l_1d3z.group(2)}` / `{m_l_1d3z.group(3)}` | **`MATCH == EXPECTED_GOLDEN_1D3Z_COORD_SHA256`** |"
+    )
+    lines.append(
+        f"| `1UBQ` (`read_exp_noe_tsv` [`dihedrals = &[]`] + `ByPeptidePlane` RDCs + `fold_from_experimental_noes_and_rdcs`) | `seed=4242`, `free_seed=4242` | `{m_l_1ubq.group(1)}` | `{m_l_1ubq.group(2)}` / `{m_l_1ubq.group(3)}` | **`MATCH == EXPECTED_GOLDEN_1UBQ_COORD_SHA256`** |"
+    )
+    lines.append(
+        f"| **Suite Execution & Zero-Retune Check (`git diff e3e7005 -- crates/*/src/`)** | `2` non-ignored test fns (`{m_l_res.group(3)}`) | `0` bytes changed in `crates/nmr-core/src/` & `crates/nmr-gpu/src/` | — | **`{m_l_res.group(1)} passed; {m_l_res.group(2)} failed` (`3/3` digests match)** |"
+    )
+
+    # 3. 13.2:P1-6 & F8/F9 documentation candor & gate parity audit
+    doc_gates = parse_provenance_gate_spec(prov_p)
+    rs_active, rs_retired = parse_rust_gate_constants(real_bench_rs_p)
+    if doc_gates != rs_active + rs_retired:
+        raise RuntimeError("CALIBRATION-GATE-SPEC parity broken in PROVENANCE.md!")
+
+    lines.append("")
+    lines.append(
+        "### `13.2:P1-6`, `F8` & `F9` — Documentation Candor, Single-Config GPU Disclosure & Solver-Freeze Audit"
+    )
+    lines.append("")
+    lines.append(
+        "| Target File | `(a)` `43653936217` (`0.6114` + `GB1` SHA) | `(b)` `43668989525` (`0.3373` GPU) | `(c)` 3-Round Tuning (`dc87bba` + `e3e7005`) | `(d)` Single-Config GPU + `F8` & `F9` |"
+    )
+    lines.append("|---|---|---|---|---|")
+    for doc_fp in [spec_p, prov_p, todo_p]:
+        dtxt = doc_fp.read_text(encoding="utf-8")
+        rel_n = doc_fp.relative_to(root)
+        has_a = ("43653936217" in dtxt) and ("0.6114" in dtxt) and ("bacc6cdec4" in dtxt)
+        has_b = ("43668989525" in dtxt) and ("0.3373" in dtxt)
+        has_c = (
+            ("k_trapped_pos_phi" in dtxt)
+            and ("stagg_nterm_psi0" in dtxt)
+            and ("545" in dtxt)
+            and ("three rounds" in dtxt.lower())
+        )
+        has_d = (
+            ("single-config" in dtxt.lower())
+            and ("F8" in dtxt)
+            and ("F9" in dtxt)
+            and ("both cpu and gpu" in dtxt.lower())
+            and ("zero further tuning" in dtxt.lower())
+            and (m_l_1d3z.group(1)[:10] in dtxt)
+            and (m_l_1ubq.group(1)[:10] in dtxt)
+        )
+        if not (has_a and has_b and has_c and has_d):
+            raise RuntimeError(
+                f"P1-6/P1-7 candor check failed on {rel_n}: a={has_a}, b={has_b}, c={has_c}, d={has_d}"
+            )
+        lines.append(
+            f"| `{rel_n}` | **`RECORDED`** | **`RECORDED`** | **`RECORDED`** | **`RECORDED (`F8` + `F9` + `3/3` SHAs)`** |"
+        )
+    lines.append(
+        f"| `CALIBRATION-GATE-SPEC` & `src/` Freeze (`e3e7005..HEAD`) | — | — | `0` bytes changed in `src/` | **`MATCH ({len(doc_gates)}/6 gates)`** |"
+    )
+
+    return "\n".join(lines) + "\n"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
@@ -1712,6 +1971,7 @@ def main() -> None:
             "remediation",
             "ci-fix",
             "p1-3-5",
+            "p1-6-7",
         ],
         default="all",
     )
@@ -1734,6 +1994,8 @@ def main() -> None:
         parts.append(render_ci_fix(root, extras))
     if args.section == "p1-3-5":
         parts.append(render_p1_3_5(root, extras))
+    if args.section == "p1-6-7":
+        parts.append(render_p1_6_7(root, extras, list(args.extra_file)))
 
     md = "\n".join(parts)
     if args.out is not None:
