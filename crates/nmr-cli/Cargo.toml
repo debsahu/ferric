@@ -14,7 +14,5 @@ path = "src/main.rs"
 [dependencies]
 nmr-core = { path = "../nmr-core" }
 nmr-gpu = { path = "../nmr-gpu" }
-
-[dev-dependencies]
 serde.workspace = true
 serde_json.workspace = true

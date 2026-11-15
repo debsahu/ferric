@@ -6,7 +6,9 @@
 //! Provenance: Original CLI implementing `docs/specs/01-data-io.md` through `docs/specs/15-structure-viewer.md`
 //! and Octet-Draw CLI workflows.
 
+pub mod dosy_cmd;
 pub mod exchange_cmd;
+pub mod metabolomics_cmd;
 pub mod methyl_cmd;
 pub mod relax_cmd;
 
@@ -224,6 +226,8 @@ fn usage() -> String {
        nmrassign report          --star|--shifts <shifts.str|shifts.nef> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--rdc <rdcs.tsv|rdcs.nef>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]\n\
        nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--idp-propensity] [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard|bayes-sa] [--no-auto-ref] [--locks <SPEC>] [--method classical|neural] [--engine auto|gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        nmrassign serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
+       nmrassign dosy            fit|ilt|mw [--in <decay.tsv|json> | --exp-dir <bruker_or_varian_dir> | --demo] [--engine cpu|gpu|auto] [--criterion bic|aic] [--max-components 3] [-o <out.tsv|json>]\n\
+       nmrassign metabolomics    bin|pca|oplsda|stocsy [--in <study.json|buckets.csv> | --cohort <json> | --manifest <tsv> | --demo] [-o <out>]\n\
        nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}}>] [--solvent CDCl3] [--mhz 400]\n",
         version_string()
     )
@@ -8336,6 +8340,8 @@ fn main() {
         "report" => cmd_report(&args[1..]),
         "pipeline" => cmd_pipeline(&args[1..]),
         "serve" => cmd_serve(&args[1..]),
+        "dosy" => dosy_cmd::run_dosy_cli(&args[1..]),
+        "metabolomics" | "metab" => metabolomics_cmd::run_metabolomics_cli(&args[1..]),
         "chem" => cmd_chem(&args[1..]),
         other => Err(format!("unknown subcommand {other:?}\n\n{}", usage())),
     };

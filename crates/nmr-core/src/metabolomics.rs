@@ -4,7 +4,7 @@
 //! `VIP` / Benjamini–Hochberg `FDR` Volcano biomarker discovery, and Statistical Total Correlation
 //! Spectroscopy (`STOCSY`) coupled to a public-domain CC0 `BMRB` biofluid metabolite library.
 //!
-//! Provenance: Original clean-room implementation of `docs/specs/19-metabolomics-chemometrics.md`
+//! Provenance: Original clean-room implementation of `docs/specs/20-metabolomics-chemometrics.md`
 //! (`T14.5`) derived strictly from peer-reviewed literature and CC0 `BMRB` reference data (zero
 //! external source code, proprietary libraries, or copyleft packages consulted):
 //! 1. Interval Fast Fourier cross-correlation local peak alignment:

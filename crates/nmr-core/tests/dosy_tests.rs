@@ -350,6 +350,26 @@ fn mono_bi_tri_stejskal_tanner_bic_selection_and_bootstrap_cis() {
     )
     .unwrap();
     assert_eq!(tri_sel.selected_k, 3);
+    let max_tri_rel_err = d_tri
+        .iter()
+        .enumerate()
+        .map(|(k, &dt)| (tri_fit.components[k].d_m2_s - dt).abs() / dt)
+        .fold(0.0_f64, f64::max);
+    println!(
+        "W2_METRIC_JSON: {}",
+        serde_json::json!({
+            "kind": "dosy_cpu_discrete",
+            "n_trials": n_trials,
+            "pure_k1_correct": pure_k1_correct,
+            "mixed_k2_correct": mixed_k2_correct,
+            "mean_pure_rel_err": sum_err_pure / (pure_k1_correct as f64),
+            "mean_mix_d1_rel_err": sum_err_d1 / (mixed_k2_correct as f64),
+            "mean_mix_d2_rel_err": sum_err_d2 / (mixed_k2_correct as f64),
+            "tri_selected_k": tri_sel.selected_k,
+            "max_tri_rel_err": max_tri_rel_err,
+            "passed": true,
+        })
+    );
 }
 
 #[test]
@@ -400,6 +420,25 @@ fn tikhonov_ilt_bimodal_recovery_gcv_and_lcurve() {
         );
         assert!((top2[0].area_fraction - 0.50).abs() < 0.12);
         assert!((top2[1].area_fraction - 0.50).abs() < 0.12);
+        let strat_label = match strat {
+            IltLambdaStrategy::Gcv => "GCV",
+            IltLambdaStrategy::LCurve => "LCurve",
+            _ => "other",
+        };
+        println!(
+            "W2_METRIC_JSON: {}",
+            serde_json::json!({
+                "kind": "dosy_ilt_bimodal",
+                "strategy": strat_label,
+                "selected_lambda": res.selected_lambda,
+                "n_modes": res.modes.len(),
+                "log10_err_slow": log_err_1,
+                "log10_err_fast": log_err_2,
+                "area_slow": top2[0].area_fraction,
+                "area_fast": top2[1].area_fraction,
+                "passed": true,
+            })
+        );
     }
 }
 
@@ -557,5 +596,16 @@ fn stokes_einstein_hydrodynamics_lysozyme_small_molecules_and_solvents() {
             - 450.0)
             .abs()
             < 1.0e-9
+    );
+    println!(
+        "W2_METRIC_JSON: {}",
+        serde_json::json!({
+            "kind": "dosy_hydrodynamics",
+            "lysozyme_rh_a": lyso.r_h_angstrom,
+            "lysozyme_mw_da": lyso.estimated_mw_da,
+            "sucrose_rh_a": sucr.r_h_angstrom,
+            "sucrose_mw_da": sucr.estimated_mw_da,
+            "passed": true,
+        })
     );
 }

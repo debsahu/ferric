@@ -113,6 +113,8 @@ fn test_pqn_dilution_and_glucose_spike_invariance_vs_tsa_failure() {
         },
     );
 
+    let mut max_pqn_err = 0.0_f64;
+    let mut min_tsa_spike_err = f64::INFINITY;
     // Check non-spiked isolated buckets: Formate (8.448 ppm), Acetate (1.918 ppm), Alanine (1.478 ppm), Lactate (1.330 ppm)
     for target_ppm in [8.448, 1.918, 1.478, 1.330] {
         let b_idx = buckets
@@ -142,6 +144,7 @@ fn test_pqn_dilution_and_glucose_spike_invariance_vs_tsa_failure() {
                 target_ppm,
                 pqn_rel_err
             );
+            max_pqn_err = max_pqn_err.max(pqn_rel_err);
 
             let is_rel_err = ((is_mat[sample_i][b_idx] - ref_is) / ref_is).abs();
             assert!(
@@ -160,7 +163,17 @@ fn test_pqn_dilution_and_glucose_spike_invariance_vs_tsa_failure() {
             "TSA should fail by >40% under 18x Glucose spike, got {:.4}",
             tsa_spike_err
         );
+        min_tsa_spike_err = min_tsa_spike_err.min(tsa_spike_err);
     }
+    println!(
+        "W2_METRIC_JSON: {}",
+        serde_json::json!({
+            "kind": "metab_pqn_vs_tsa",
+            "max_pqn_rel_err": max_pqn_err,
+            "min_tsa_spike_rel_err": min_tsa_spike_err,
+            "passed": true,
+        })
+    );
 }
 
 /// [Test 2] Interval FFT cross-correlation alignment rescues pH-shifted Citrate (`2.54 / 2.68 ppm`)
@@ -351,6 +364,17 @@ fn test_adaptive_intelligent_binning_preserves_j_multiplets_vs_uniform_splitting
         "Valine gamma1 (0.985 ppm) and gamma2 (1.037 ppm) doublets must occupy distinct valley-split buckets"
     );
     assert_ne!(idx_lac_q, idx_lac_d);
+    println!(
+        "W2_METRIC_JSON: {}",
+        serde_json::json!({
+            "kind": "metab_aib_vs_uniform",
+            "aib_lac_q_share": aib_lac_q_share,
+            "aib_val_1_share": aib_val_1_share,
+            "uni_lac_q_share": uni_lac_q_share,
+            "uni_val_1_share": uni_val_1_share,
+            "passed": true,
+        })
+    );
 }
 
 /// [Test 4] Solvent, residual water (`4.80 ppm`), and urinary urea (`5.78 ppm`) region masking.
@@ -537,6 +561,18 @@ fn test_opls_da_separates_predictive_shift_from_large_orthogonal_variation() {
         "Expected permutation p <= 0.02 and validated=true, got p={:.4}",
         opls.permutation.p_value_q2
     );
+    println!(
+        "W2_METRIC_JSON: {}",
+        serde_json::json!({
+            "kind": "metab_oplsda_ortho",
+            "r2_x_predictive": opls.r2_x_predictive,
+            "r2_x_orthogonal": opls.r2_x_orthogonal,
+            "r2_y": opls.r2_y,
+            "q2": opls.q2,
+            "perm_p_q2": opls.permutation.p_value_q2,
+            "passed": true,
+        })
+    );
 }
 
 /// [Test 7] Anti-overfitting check (`Westerhuis et al. 2008`): on a high-dimensional (`P = 200 >> N = 24`)
@@ -588,6 +624,17 @@ fn test_opls_da_null_labels_anti_overfitting_check() {
     assert!(
         !opls.permutation.is_validated,
         "Null model must NEVER be flagged as validated!"
+    );
+    println!(
+        "W2_METRIC_JSON: {}",
+        serde_json::json!({
+            "kind": "metab_oplsda_null",
+            "in_sample_r2_y": opls.r2_y,
+            "null_q2": opls.q2,
+            "null_perm_p_q2": opls.permutation.p_value_q2,
+            "is_validated": opls.permutation.is_validated,
+            "passed": true,
+        })
     );
 }
 
@@ -765,6 +812,20 @@ fn test_stocsy_lactate_driver_recovers_411_quartet_and_matches_bmrb_lactate() {
     assert_eq!(top_match.bmrb_id, "bmse000036");
     assert_eq!(top_match.matched_multiplets, 2);
     assert!(top_match.score > 0.85);
+    println!(
+        "W2_METRIC_JSON: {}",
+        serde_json::json!({
+            "kind": "metab_stocsy_lactate",
+            "driver_ppm": stocsy.driver_ppm,
+            "quartet_ppm": q_bucket.center_ppm,
+            "quartet_r": r_quartet,
+            "quartet_r2": r2_quartet,
+            "stoich_ratio_3_to_1": stoich_ratio,
+            "top_bmrb_id": top_match.bmrb_id,
+            "top_score": top_match.score,
+            "passed": true,
+        })
+    );
 }
 
 /// [Test 11] Built-in CC0/BMRB human biofluid library completeness (`>= 25` required canonical entries)

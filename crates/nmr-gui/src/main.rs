@@ -118,6 +118,7 @@ use nmr_gui::{
         default_overlay_palette, ContourPipelineResource, MultiContourCallback, OverlayLayerSpec,
         SyncCrosshair,
     },
+    dosy_panel::{render_dosy_panel, DosyPanelAction, DosyPanelState},
     dynamics_panel::{DynamicsStudioOutput, DynamicsStudioPanel, DynamicsStudioTab},
     ingest_panel::{IngestAction, IngestDropOutcome, IngestExecutionPlan, IngestPanelState},
     keymap::{poll_global_modifier_shortcuts, ChordDispatcher, CONTOUR_FLOOR_STEP_RATIO},
@@ -282,6 +283,7 @@ fn format_star_in_memory(
 enum WorkspaceMode {
     ProteinNmr,
     OctetChem,
+    Dosy,
     Metabolomics,
 }
 
@@ -1594,6 +1596,7 @@ impl OctetBackendAdapter for CoreOctetBackendAdapter {
 struct NmrWorkbenchApp {
     workspace_mode: WorkspaceMode,
     octet_app: OctetDrawPanel,
+    dosy_panel: DosyPanelState,
     metabolomics_panel: MetabolomicsStudioPanel,
     #[cfg(not(target_arch = "wasm32"))]
     gpu_engine: Option<GpuEngine>,
@@ -1781,6 +1784,7 @@ impl NmrWorkbenchApp {
         let mut app = Self {
             workspace_mode: WorkspaceMode::ProteinNmr,
             octet_app,
+            dosy_panel: DosyPanelState::default(),
             metabolomics_panel: MetabolomicsStudioPanel::new(),
             solver_kind: GuiSolverKind::default(),
             regime_kind: GuiRegimeKind::default(),
@@ -3825,6 +3829,11 @@ impl NmrWorkbenchApp {
                 &mut self.workspace_mode,
                 WorkspaceMode::OctetChem,
                 egui::RichText::new("⚗️ Octet Chemical Draw & 1D NMR").strong(),
+            );
+            ui.selectable_value(
+                &mut self.workspace_mode,
+                WorkspaceMode::Dosy,
+                egui::RichText::new("🌊 2D DOSY Studio").strong(),
             );
             ui.selectable_value(
                 &mut self.workspace_mode,
@@ -7221,6 +7230,28 @@ impl eframe::App for NmrWorkbenchApp {
             }
             WorkspaceMode::OctetChem => {
                 self.octet_app.ui(ui);
+            }
+            WorkspaceMode::Dosy => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    for action in render_dosy_panel(ui, &mut self.dosy_panel) {
+                        match action {
+                            DosyPanelAction::SelectedPeak { index, ppm } => {
+                                self.status_msg =
+                                    format!("DOSY selected peak #{} at {:.3} ppm", index + 1, ppm);
+                            }
+                            DosyPanelAction::ToggledIlt { enabled } => {
+                                self.status_msg = format!(
+                                    "DOSY Tikhonov ILT {}",
+                                    if enabled { "enabled" } else { "disabled" }
+                                );
+                            }
+                            DosyPanelAction::LoadedDemoMixture => {
+                                self.status_msg =
+                                    "Loaded synthetic 3-species DOSY mixture".to_string();
+                            }
+                        }
+                    }
+                });
             }
             WorkspaceMode::Metabolomics => {
                 egui::CentralPanel::default().show(ui, |ui| {

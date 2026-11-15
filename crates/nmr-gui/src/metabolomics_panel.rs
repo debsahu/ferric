@@ -2,7 +2,7 @@
 //! Biomarker Discovery Studio (`T14.5`, native desktop + `wasm32-unknown-unknown`).
 //!
 //! Provenance: Clean-room original human-computer interaction and plotting implementation of
-//! `docs/specs/19-metabolomics-chemometrics.md` §9.2 built strictly on `eframe::egui` and
+//! `docs/specs/20-metabolomics-chemometrics.md` §9.2 built strictly on `eframe::egui` and
 //! `nmr_core::metabolomics` (Savorani et al. *J. Magn. Reson.* 2010; De Meyer et al. *Anal. Chem.*
 //! 2008; Dieterle et al. *Anal. Chem.* 2006; Trygg & Wold *J. Chemom.* 2002; Bylesjö et al.
 //! *J. Chemom.* 2006; Westerhuis et al. *Metabolomics* 2008; Wiklund et al. *Anal. Chem.* 2008;

@@ -635,6 +635,8 @@ mod tests {
             fit_dosy_columns_gpu(&engine, &b_vals, &cols, &cfg, 5.0).expect("GPU DOSY fit");
         assert_eq!(gpu_fits.len(), cols.len());
 
+        let mut max_mono_rel_diff = 0.0_f64;
+        let mut max_bi_rel_diff = 0.0_f64;
         for (idx, g) in gpu_fits.iter().enumerate() {
             if idx % 5 == 4 {
                 assert_eq!(g.selected_k, 0, "baseline column {idx} should be skipped");
@@ -656,6 +658,7 @@ mod tests {
                     rel_d < 0.01,
                     "mono D GPU/CPU relative diff {rel_d:.4e} >= 1% on col {idx}"
                 );
+                max_mono_rel_diff = max_mono_rel_diff.max(rel_d);
             } else {
                 assert_eq!(g.selected_k, 2, "mixed column {idx} must pick K=2");
                 let rel_d1 = (g.bi_d_1_m2_s - cpu.best_fit.components[0].d_m2_s).abs()
@@ -666,8 +669,17 @@ mod tests {
                     rel_d1 < 0.01 && rel_d2 < 0.01,
                     "bi D GPU/CPU relative diff ({rel_d1:.4e}, {rel_d2:.4e}) >= 1% on col {idx}"
                 );
+                max_bi_rel_diff = max_bi_rel_diff.max(rel_d1.max(rel_d2));
             }
         }
+        println!(
+            "W2_METRIC_JSON: {{\"kind\":\"dosy_webgpu_parity\",\"adapter\":\"{}\",\"backend\":\"{}\",\"n_columns\":{},\"max_mono_rel_diff\":{:.6e},\"max_bi_rel_diff\":{:.6e},\"passed\":true}}",
+            engine.adapter_name.replace('"', ""),
+            engine.backend_name.replace('"', ""),
+            cols.len(),
+            max_mono_rel_diff,
+            max_bi_rel_diff,
+        );
     }
 
     #[test]
