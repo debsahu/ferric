@@ -64,7 +64,10 @@ def format_artifact_path(path: Path, root: Path, results_dir: Path) -> str:
     if resolved.is_relative_to(root_res):
         return resolved.relative_to(root_res).as_posix()
     if resolved.is_relative_to(res_dir):
-        return f"<results_dir>/{resolved.relative_to(res_dir).as_posix()}"
+        rel = resolved.relative_to(res_dir).as_posix()
+        if res_dir.parts[-3:] == ("data", "private", "w3_results"):
+            return f"data/private/w3_results/{rel}"
+        return f"<results_dir>/{rel}"
     return resolved.name
 
 

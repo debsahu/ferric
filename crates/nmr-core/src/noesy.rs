@@ -21,8 +21,8 @@ use crate::dihedrals::{align_by_res_names, random_coil_shifts};
 use crate::nmrstar::Reference;
 use crate::peaks::Peak;
 use crate::picker::{estimate_noise_mad, PickerConfig};
-use crate::rng::Rng;
 use crate::spectrum::{AxisPpm, Spectrum3D};
+use crate::structure::{det_atan2, det_exp, det_ln, det_powf, DetRng};
 
 /// Cartesian 3D coordinate `(x, y, z)` in Angstroms.
 pub type Vec3 = [f64; 3];
@@ -97,7 +97,7 @@ pub fn calc_dihedral_deg(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3) -> f64 {
     let x = v_dot(v, w);
     let m = v_cross(b1, v);
     let y = v_dot(m, w);
-    y.atan2(x).to_degrees()
+    det_atan2(y, x).to_degrees()
 }
 
 /// Proton / pseudoatom site participating in 3D `15N`-edited and `13C`-edited NOESY crosspeaks.
@@ -637,7 +637,7 @@ pub fn simulate_noesy_peaks(pdb: &PdbChain, shifts: &Reference, cfg: &NoesySimCo
     }
 
     let proton_table = collect_proton_shifts(shifts, cfg.synthesize_missing_aliphatic_protons);
-    let mut rng = Rng::new(cfg.seed);
+    let mut rng = DetRng::new(cfg.seed);
     let mut peaks = Vec::new();
 
     for (ia, pa) in proton_table.iter().enumerate() {
@@ -702,8 +702,9 @@ pub fn simulate_noesy_peaks(pdb: &PdbChain, shifts: &Reference, cfg: &NoesySimCo
             }
 
             let r_eff = r.max(1.85);
-            let log_jitter = rng.normal(0.0, 0.10).exp();
-            let volume = cfg.i0_scale * r_eff.powi(-6) * log_jitter;
+            let r_eff2 = r_eff * r_eff;
+            let log_jitter = det_exp(rng.normal(0.0, 0.10));
+            let volume = cfg.i0_scale / (r_eff2 * r_eff2 * r_eff2) * log_jitter;
 
             let h_obs = pa.h_ppm + rng.normal(0.0, cfg.sigma_h_ppm);
             let heavy_obs = heavy_a + rng.normal(0.0, cfg.sigma_heavy_ppm);
@@ -741,7 +742,7 @@ pub fn render_noesy_3d_spectrum(
     let axis_z = AxisPpm::from_bounds("1H_noe", nz, 10.5, 0.5, 600.0);
 
     let mut data = vec![0.0f32; nx * ny * nz];
-    let mut rng = Rng::new(seed);
+    let mut rng = DetRng::new(seed);
     if noise_sd > 0.0 {
         for v in &mut data {
             *v = rng.normal(0.0, noise_sd as f64) as f32;
@@ -787,7 +788,7 @@ pub fn render_noesy_3d_spectrum(
                         continue;
                     }
                     let gx = -0.5 * ((ix as f64 - cx) / sig_px).powi(2);
-                    let w = (gx + gy + gz).exp() as f32;
+                    let w = det_exp(gx + gy + gz) as f32;
                     data[((iz as usize) * ny + (iy as usize)) * nx + (ix as usize)] += amp * w;
                 }
             }
@@ -810,9 +811,9 @@ fn subvoxel_3pt(ym1: f32, y0: f32, yp1: f32) -> f64 {
     let b = (y0.abs()) as f64;
     let c = (yp1.abs()) as f64;
     if a > 0.0 && b > a && b > c && c > 0.0 {
-        let la = a.ln();
-        let lb = b.ln();
-        let lc = c.ln();
+        let la = det_ln(a);
+        let lb = det_ln(b);
+        let lc = det_ln(c);
         let denom = la - 2.0 * lb + lc;
         if denom.abs() > 1e-12 {
             return (0.5 * (la - lc) / denom).clamp(-0.5, 0.5);
@@ -919,7 +920,7 @@ pub fn pick_noesy_3d(
 /// `1.8-5.65 A` weak) from peak intensity/volume using `r_app = (I_0 / V)^(1/6)`.
 pub fn calibrate_noe_bounds(volume: f64, i0_scale: f64) -> (f64, f64) {
     let v = volume.max(1.0);
-    let r_app = (i0_scale / v).powf(1.0 / 6.0);
+    let r_app = det_powf(i0_scale / v, 1.0 / 6.0);
     let upper = if r_app <= 2.60 {
         2.95
     } else if r_app <= 3.40 {
@@ -1025,7 +1026,7 @@ pub fn match_initial_adrs(
                 let dn = (p.n - hv).abs();
                 if dh <= cfg.tol_h_anchor && dn <= cfg.tol_n_anchor {
                     let z2 = (dh / sig_h).powi(2) + (dn / sig_n).powi(2);
-                    donors.push((di, (-0.5 * z2).exp()));
+                    donors.push((di, det_exp(-0.5 * z2)));
                 }
             } else if is_13c && matches!(pr.site, NoeProton::AlphaHA | NoeProton::BetaQB) {
                 let Some(c_obs) = p.c else { continue };
@@ -1033,7 +1034,7 @@ pub fn match_initial_adrs(
                 let dc = (c_obs - hv).abs();
                 if dh <= cfg.tol_h_anchor && dc <= cfg.tol_c_anchor {
                     let z2 = (dh / sig_h).powi(2) + (dc / sig_c).powi(2);
-                    donors.push((di, (-0.5 * z2).exp()));
+                    donors.push((di, det_exp(-0.5 * z2)));
                 }
             }
         }
@@ -1047,7 +1048,7 @@ pub fn match_initial_adrs(
             let dh2 = (h2_obs - pr.h_ppm).abs();
             if dh2 <= cfg.tol_h_indirect {
                 let z2 = (dh2 / sig_h2).powi(2);
-                acceptors.push((ai, (-0.5 * z2).exp()));
+                acceptors.push((ai, det_exp(-0.5 * z2)));
             }
         }
         if acceptors.is_empty() {
@@ -1079,7 +1080,7 @@ pub fn match_initial_adrs(
         }
 
         let vol = p.volume.or(p.height).unwrap_or(500.0);
-        let r_app = (cfg.i0_scale / vol.max(1.0)).powf(1.0 / 6.0);
+        let r_app = det_powf(cfg.i0_scale / vol.max(1.0), 1.0 / 6.0);
 
         // Covalent intra-residue geometry bound: in any L-amino acid (phi, psi),
         // d(H_i, HA_i) <= 3.08 A and d(H_i, QB_i) <= 3.80 A. When a weak crosspeak (r_app > 3.35 A
