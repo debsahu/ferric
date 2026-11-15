@@ -460,15 +460,15 @@ def render_mcp_protocol_and_security_section(records: list[dict[str, Any]]) -> s
         "| :--- | :--- | :--- | :--- | :---: |",
         (
             f"| `fit_relaxation_or_exchange` (`relaxation` / `cest` / `cpmg`) "
-            f"| `R1` (`600 MHz`), dual-`B1` `CEST` (`15 & 30 Hz`), dual-field `CPMG` (`600 & 800 MHz`) "
+            f"| `R1` (`600 MHz`), dual-`B1` `CEST` (`15 & 30 Hz`), dual-field `CPMG` (`600 & 800 MHz`) *(noiseless forward-model round-trip)* "
             f"| `R1 = {p13['r1_rate_s_inv']:.4f} s^-1`, `CEST p_B = {p13['cest_pb']:.4f}` (`k_ex = {p13['cest_kex_s_inv']:.1f} s^-1`), `CPMG p_B = {p13['cpmg_pb']:.4f}` (`k_ex = {p13['cpmg_kex_s_inv']:.1f} s^-1`) "
-            "| `R1 = 1.65 s^-1`, `CEST (0.030, 180 s^-1)`, `CPMG (0.040, 900 s^-1)` | PASS |"
+            "| `R1 = 1.65 s^-1`, `CEST (0.030, 180 s^-1)`, `CPMG (0.040, 900 s^-1)` *(noiseless round-trip)* | PASS |"
         ),
         (
             f"| `track_csp_titration` (`amide` `1H-15N` HSQC) "
-            f"| `6`-point titration (`[P]_T = 50 uM`, `[L]_T = 0..280 uM`) "
+            f"| `6`-point titration (`[P]_T = 50 uM`, `[L]_T = 0..280 uM`) *(noiseless forward-model round-trip)* "
             f"| `global K_d = {p13['csp_global_kd_um']:.3f} uM` (sandbox rejects `../outside/evil_step.tsv`) "
-            "| `K_d = 30.0 +- 2.0 uM` | PASS |"
+            "| `K_d = 30.0 +- 2.0 uM` *(noiseless round-trip)* | PASS |"
         ),
         (
             f"| `analyze_nmr1d_spectrum` & `fit_dosy_diffusion` "

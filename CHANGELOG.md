@@ -4,6 +4,63 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
+## [0.11.0] — 2026-11-15 — Phase 15: Clean-Room Model Context Protocol (`MCP`) JSON-RPC 2.0 Server (`T15.1`), Live Desktop Workbench Loopback Bridge & `256`-Step Undo (`T15.2`), and Sandbox Security, Spectroscopist Prompts & Client Config Generator (`T15.3`)
+
+- **Tag:** `v0.11.0`
+- **Architectural Summary & Candid Scientific / Validation Disclosures (`T15.1`–`T15.3`, `F15` Closed, Open `F5`, `F6`, `F10`–`F14`, `F16`–`F20`):**
+  - **1. Mandatory Validation Scope Candor (`15.1`–`15.3` — In-Process & Subprocess Protocol Self-Consistency) & Open Follow-Up Ledger:**
+    - **Automated In-Process & CLI Subprocess Protocol Verification (`F18`)**: **All `T15.1`–`T15.3` `MCP` protocol framing (`Content-Length` `stdio` & Streamable loopback HTTP), workspace canonical path sandboxing, `ReadOnly` / `ReadWrite` permission guardrails, bearer-token authentication, `256`-step Undo/Redo workbench curation, and `image/png` viewport snapshot gates in `v0.11.0` are verified via automated Rust in-process unit and CLI subprocess end-to-end tests** (`0` live interactive sessions against external Antigravity, Claude Desktop, or Cursor client binaries are recorded in automated CI — tracked as open post-`v0.11.0` follow-up **`F18`** in `TODO.md` and `docs/specs/18-mcp-server-and-bridge.md`).
+    - **Follow-Up Ledger Status**: **`[x] F7`**, **`[x] F8`**, **`[x] F9`**, and **`[x] F15`** remain closed; carryover follow-ups **`F5`**, **`F6`**, **`F10`**–**`F14`**, **`F16`**, **`F17`**, and Phase 15 follow-ups **`F18`** (live external host-client smoke transcripts), **`F19`** (Windows native OS CSPRNG entropy & doc-comment alignment in `mcp_bridge::generate_bearer_token`), and **`F20`** (`nmrassign mcp --transport http` minimum token-length floor & `NMR_MCP_BEARER_TOKEN` env-var hygiene) remain explicitly open (`[ ]`) in `TODO.md`.
+    - **Zero-Regression & Zero-New-Crate Dependency Freeze**: `0` new external crate dependencies (`Cargo.toml` / `Cargo.lock` bump workspace version `0.10.0 -> 0.11.0` only; `THIRD_PARTY.md`, `docs/specs/03-assignment.md`, and all backbone assignment, structure, RDC, relaxation/exchange, 1D/`qNMR`, `DOSY`, and `Metabolomics` solvers are untouched).
+
+  - **2. Clean-Room `MCP` JSON-RPC 2.0 Server, Live Desktop Workbench Bridge & Sandbox Security (`T15.1`–`T15.3`, `docs/specs/18-mcp-server-and-bridge.md`):**
+    - **`T15.1` (`nmr-core::mcp`, `nmrassign mcp`)**: Pure-Rust JSON-RPC 2.0 & `MCP` server over `stdio` and `127.0.0.1` / `[::1]` loopback HTTP exposing `12` structured `tools` (`10` read-only + `2` `ReadWrite`-gated), `4` `nmr://` resource schemes, and `5` guided `prompts` across Bruker/Varian `pulprog` audit (`inspect_workspace`), `NMR-STAR` & peak-list summaries (`summarize_nmr_star`, `summarize_peak_list`), solver `DatasetQcReport` (`run_qc_diagnostics`), homolog-firewalled backbone torsion prediction (`predict_homolog_free_torsions` enforcing `DEFAULT_FIREWALL_MAX_SEQ_IDENTITY = 0.25`, `<= 25%` sequence-identity ceiling), Phase 13 relaxation/exchange (`fit_relaxation_or_exchange`, `track_csp_titration` — verified via **noiseless forward-model round-trip** checks), Phase 14 1D/`DOSY`/Metabolomics (`analyze_nmr1d_spectrum`, `fit_dosy_diffusion`, `run_metabolomics_chemometrics`), and `ReadWrite`-gated `curate_peak_list` / `export_nmr_star_or_nef`.
+    - **`T15.2` (`nmr-gui::mcp_bridge`, `crates/nmr-gui/src/main.rs`)**: Authenticated `127.0.0.1` loopback desktop workbench bridge (`9` live tools, `<= 4 MiB` pre-allocation HTTP `413` body cap, constant-time `256`-bit Bearer auth, `Host`/`Origin` DNS-rebinding defense) inspecting live spectra/peaks/assignments, executing `256`-step Undo/Redo-backed UI navigation and curation edits (`Cmd/Ctrl+Z` reverts AI actions while preserving bijective `cluster_id <-> seq_id` assignment invariants), providing 1-click client config copy, and exporting RFC 2083 `image/png` viewport snapshots (`wasm32`-clean).
+    - **`T15.3` (`nmr-cli::mcp_cmd`, `mcp_tests`, `mcp_cli_tests`)**: Defense-in-depth pre-allocation `Content-Length`/HTTP body caps (`<= 16 MiB` core `stdio`/HTTP, `0` panics, `0` production `.unwrap()`/`.expect()`), loopback-only HTTP bind enforcement, `ReadOnly` vs `ReadWrite` gating, canonical workspace path sandboxing blocking `9` escape vectors (`..`, nested `..`, sibling-prefix paths, `NUL` bytes, escaping symlinks, `.ssh`/`.aws`/`.env`, and manifest-embedded `..` paths), `5` guided curation prompts (`triage-qc`, `resolve-ambiguous-strips`, `deconvolve-1d-mixture-dosy`, `fit-cest-cpmg-exchange`, `analyze-metabolomics-cohort`), `nmrassign mcp-config` (`antigravity`, `claude-desktop`, `cursor`), and version-agnostic CLI test `test_cli_version_matches_workspace_and_help_lists_torsions_and_rdc`.
+
+    **Phase `15.W1` (`T15.1` + `T15.2` + `T15.3`) — Clean-Room `MCP` Server, Live Workbench Bridge & Sandbox Security:**
+
+    **Protocol Surface, Loopback Bridge & Adversarial Sandbox Guardrails (`T15.1`–`T15.3`):**
+
+    | Subsystem & Security Check | Layer | Measured Metric | Gate | Status |
+    | :--- | :--- | :--- | :--- | :---: |
+    | Core MCP JSON-RPC 2.0 tool & prompt catalog (`protocolVersion = 2024-11-05`) | `nmr-core::mcp` | `12` tools (`10` read-only + `2` mutating), `5` prompts | `12` tools (`10` RO + `2` RW), `5` prompts | PASS |
+    | Pre-allocation `Content-Length` cap & non-loopback bind rejection | `nmr-core::mcp` + `nmrassign mcp` | `stdio <= 16 MiB`, `HTTP <= 16 MiB` (`HTTP 413 = True`), `3` non-loopback CLI binds rejected | Pre-alloc `Err` / `413`, loopback-only bind | PASS |
+    | Canonicalized workspace path sandbox & credential blocklist | `McpSecurityPolicy` | `9` escape vectors blocked (`..`, nested `..`, sibling-prefix, NUL, symlinks, `.ssh`/`.aws`/`.env`, manifest paths) | `ERR_SECURITY_VIOLATION` (`-32001`), `0` leaks | PASS |
+    | Live desktop loopback HTTP bridge, Undo ring & viewport PNG | `nmr-gui::mcp_bridge` | `HTTP <= 4 MiB` (`401 = True`, `403 = True`, `413 = True`), `256`-step Undo (`roundtrip = True`), `16x12` PNG (`848 B`) | `256`-step bijective Undo, valid RFC 2083 PNG | PASS |
+    | Subprocess CLI `stdio`/`http` E2E & client config generator | `nmr-cli::mcp_cmd` | `stdio RO/RW = True`, `HTTP 200/401/403/413 = True`, `3` IDE schemas (`Antigravity`, `Claude Desktop`, `Cursor`) | Subprocess exit `0` on valid, non-zero on invalid | PASS |
+
+    **Scientific Phase 13 & Phase 14 (`T14.5` Metabolomics) MCP Tool Verification:**
+
+    | MCP Tool Name | Synthetic Dataset / Mode | Measured Tool Output | Expected Reference | Status |
+    | :--- | :--- | :--- | :--- | :---: |
+    | `fit_relaxation_or_exchange` (`relaxation` / `cest` / `cpmg`) | `R1` (`600 MHz`), dual-`B1` `CEST` (`15 & 30 Hz`), dual-field `CPMG` (`600 & 800 MHz`) *(noiseless forward-model round-trip)* | `R1 = 1.6500 s^-1`, `CEST p_B = 0.0300` (`k_ex = 180.0 s^-1`), `CPMG p_B = 0.0400` (`k_ex = 900.0 s^-1`) | `R1 = 1.65 s^-1`, `CEST (0.030, 180 s^-1)`, `CPMG (0.040, 900 s^-1)` *(noiseless round-trip)* | PASS |
+    | `track_csp_titration` (`amide` `1H-15N` HSQC) | `6`-point titration (`[P]_T = 50 uM`, `[L]_T = 0..280 uM`) *(noiseless forward-model round-trip)* | `global K_d = 30.043 uM` (sandbox rejects `../outside/evil_step.tsv`) | `K_d = 30.0 +- 2.0 uM` *(noiseless round-trip)* | PASS |
+    | `analyze_nmr1d_spectrum` & `fit_dosy_diffusion` | `500 MHz` `CDCl3` 1D (`Quartet`/`Triplet` + `ACS`) & `16`-pt `D2O` `DOSY` (`BIC` + `ILT`) | Quartet `J = 7.171 Hz`, `DOSY` mixture `K = 2`, pure `K = 1` | `J = 7.10 +- 0.25 Hz`, `K = (2, 1)` | PASS |
+    | `run_metabolomics_chemometrics` (`AI-Binning` + `PQN` + `PCA` + `OPLS-DA` + `STOCSY`) | `8`-sample `D2O` cohort manifest (`4 Control` vs `4 Case`) | `OPLS-DA Q2 = 0.9367`, top marker `1.330 ppm`, `STOCSY (1.33 -> 4.11 ppm) r^2 = 0.9999` | `Q2 > 0.75`, marker `1.33 / 4.11 ppm`, `r^2 > 0.90` | PASS |
+
+    **Wave `15.W1` & Workspace Test Execution Summary:**
+
+    | Suite Binary | Passed | Failed |
+    | :--- | ---: | ---: |
+    | `nmr-core::mcp_tests` | `15` | `0` |
+    | `nmr-gui::mcp_bridge` | `8` | `0` |
+    | `nmr-cli::mcp_cli_tests` | `3` | `0` |
+    | **Wave `15.W1` Dedicated Total** | **`26`** | **`0`** |
+    | **Full Workspace (`cargo test --release --workspace`, `75` binaries)** | **`541`** | **`0`** |
+
+  - **3. Mandatory `AGENTS.md` 5-Seed `--realistic` Ubiquitin & `CISD3` (`BMRB 51439`) Solver Regression Gates (`v0.11.0`):**
+
+    **Mandatory 5-Seed Solver Non-Regression Gates (`Ubiquitin --realistic` & `CISD3` `BMRB 51439`):**
+
+    | Engine | Ubiquitin `--realistic` (`5` Seeds) Acc | Ubiquitin Recall | Ubiquitin HC-Prec (`>=0.80`) | `CISD3` (`5` Seeds) Acc | `CISD3` Recall | `CISD3` HC-Prec (`>=0.80`) |
+    | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+    | `evo-graph` (`CPU f64`) | `98.4% (assigned=319)` | `90.8% (assignable=346)` | `98.4% (310/315)` | `64.38%` | `40.39%` | `100.00%` (`59/59`) |
+    | `standard` (`CPU f64`) | `90.0% (assigned=279)` | `72.5% (assignable=346)` | `97.1% (170/175)` | `62.50%` | `39.22%` | `92.86%` (`52/56`) |
+    | `standard` (`WebGPU f32`) | `88.4% (assigned=275)` | `70.2% (assignable=346)` | `95.8% (181/189)` | `58.75%` | `36.86%` | `96.61%` (`57/59`) |
+
+---
+
 ## [0.10.0] — 2026-11-15 — Phase 14: Multi-Nuclear Analytical 1D NMR Processing, Global Pseudo-Voigt Deconvolution, Hoye Multiplet `J`-Trees & `qNMR` (`T14.1`–`T14.2`), 4-Mode 1D Stack & Kinetics Studio (`T14.3`), GPU/CPU Pseudo-2D `DOSY` & Tikhonov `ILT` (`T14.4`), and Clean-Room 1D Metabolomics & Chemometrics (`T14.5`)
 
 - **Tag:** `v0.10.0`
