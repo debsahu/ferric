@@ -568,6 +568,206 @@ impl SyncCrosshair {
     }
 }
 
+/// Physical chemical-shift bounds and minimum span floors for 2D `(F2, F1)` spectrum pinch-zoom
+/// and pan clamping (`[x_min_ppm, x_max_ppm]`, `[y_min_ppm, y_max_ppm]`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewBounds2dLimits {
+    pub x_min_ppm: f32,
+    pub x_max_ppm: f32,
+    pub y_min_ppm: f32,
+    pub y_max_ppm: f32,
+    pub min_x_span_ppm: f32,
+    pub min_y_span_ppm: f32,
+}
+
+impl Default for ViewBounds2dLimits {
+    fn default() -> Self {
+        Self::default_hn()
+    }
+}
+
+impl ViewBounds2dLimits {
+    /// Standard physical bounds for amide `¹H–¹⁵N` / heteronuclear 2D NMR viewports.
+    #[inline]
+    pub const fn default_hn() -> Self {
+        Self {
+            x_min_ppm: -2.0,
+            x_max_ppm: 18.0,
+            y_min_ppm: 60.0,
+            y_max_ppm: 220.0,
+            min_x_span_ppm: 0.08,
+            min_y_span_ppm: 0.80,
+        }
+    }
+
+    /// Derive padded physical viewport bounds around a loaded [`Spectrum2D`] (`15%` margin on each
+    /// side so edge peaks can be centered comfortably while preventing runaway zoom-out/pan).
+    pub fn from_spectrum_2d(spec: &Spectrum2D) -> Self {
+        let sx_min = spec.axis_x.min_ppm() as f32;
+        let sx_max = spec.axis_x.max_ppm() as f32;
+        let sy_min = spec.axis_y.min_ppm() as f32;
+        let sy_max = spec.axis_y.max_ppm() as f32;
+        if !sx_min.is_finite()
+            || !sx_max.is_finite()
+            || !sy_min.is_finite()
+            || !sy_max.is_finite()
+            || (sx_max - sx_min).abs() < 1e-4
+            || (sy_max - sy_min).abs() < 1e-4
+        {
+            return Self::default_hn();
+        }
+        let x_span = (sx_max - sx_min).abs();
+        let y_span = (sy_max - sy_min).abs();
+        let x_pad = (x_span * 0.15).max(0.25);
+        let y_pad = (y_span * 0.15).max(2.0);
+        Self {
+            x_min_ppm: sx_min.min(sx_max) - x_pad,
+            x_max_ppm: sx_min.max(sx_max) + x_pad,
+            y_min_ppm: sy_min.min(sy_max) - y_pad,
+            y_max_ppm: sy_min.max(sy_max) + y_pad,
+            min_x_span_ppm: (x_span * 0.015).clamp(0.04, 0.25),
+            min_y_span_ppm: (y_span * 0.015).clamp(0.40, 2.50),
+        }
+    }
+}
+
+#[inline]
+fn clamp_axis_1d_preserving_dir(
+    a: f32,
+    b: f32,
+    prefer_descending: bool,
+    min_bound: f32,
+    max_bound: f32,
+    min_span: f32,
+) -> (f32, f32) {
+    let lo_bound = min_bound.min(max_bound);
+    let hi_bound = min_bound.max(max_bound);
+    let max_span = (hi_bound - lo_bound).max(1e-3);
+    let eff_min_span = min_span.clamp(1e-4, max_span);
+
+    let raw_mid = if a.is_finite() && b.is_finite() {
+        0.5 * (a + b)
+    } else {
+        0.5 * (lo_bound + hi_bound)
+    };
+    let raw_span = if a.is_finite() && b.is_finite() {
+        (b - a).abs()
+    } else {
+        max_span
+    };
+    let span = raw_span.clamp(eff_min_span, max_span);
+    let mut lo = raw_mid - 0.5 * span;
+    let mut hi = raw_mid + 0.5 * span;
+    if lo < lo_bound {
+        hi += lo_bound - lo;
+        lo = lo_bound;
+    }
+    if hi > hi_bound {
+        lo -= hi - hi_bound;
+        hi = hi_bound;
+    }
+    lo = lo.max(lo_bound);
+    hi = hi.min(hi_bound);
+    if prefer_descending {
+        (hi, lo)
+    } else {
+        (lo, hi)
+    }
+}
+
+/// Clamp a 2D `[h_left, h_right, n_top, n_bottom]` ppm viewport window to [`ViewBounds2dLimits`],
+/// preserving standard NMR axis orientation (`h_left >= h_right`, `n_top <= n_bottom` or inverted).
+#[inline]
+pub fn clamp_view_ppm_2d(view_ppm: [f32; 4], limits: ViewBounds2dLimits) -> [f32; 4] {
+    let x_desc = !view_ppm[0].is_finite() || !view_ppm[1].is_finite() || view_ppm[0] >= view_ppm[1];
+    let y_desc = view_ppm[2].is_finite() && view_ppm[3].is_finite() && view_ppm[2] > view_ppm[3];
+    let (h_left, h_right) = clamp_axis_1d_preserving_dir(
+        view_ppm[0],
+        view_ppm[1],
+        x_desc,
+        limits.x_min_ppm,
+        limits.x_max_ppm,
+        limits.min_x_span_ppm,
+    );
+    let (n_top, n_bottom) = clamp_axis_1d_preserving_dir(
+        view_ppm[2],
+        view_ppm[3],
+        y_desc,
+        limits.y_min_ppm,
+        limits.y_max_ppm,
+        limits.min_y_span_ppm,
+    );
+    [h_left, h_right, n_top, n_bottom]
+}
+
+/// Apply two-finger multi-touch pinch-to-zoom (`zoom_delta > 1.0` zooms IN around `gesture_center`,
+/// `zoom_delta < 1.0` zooms OUT) and two-finger pan (`translation_delta`) to a 2D spectrum
+/// `[h_left, h_right, n_top, n_bottom]` ppm window, clamped safely to [`ViewBounds2dLimits`].
+pub fn apply_pinch_zoom_and_pan_2d(
+    view_ppm: [f32; 4],
+    rect: egui::Rect,
+    gesture_center: egui::Pos2,
+    zoom_delta: f32,
+    translation_delta: egui::Vec2,
+    limits: ViewBounds2dLimits,
+) -> [f32; 4] {
+    let base = clamp_view_ppm_2d(view_ppm, limits);
+    if rect.width() <= 1.0 || rect.height() <= 1.0 {
+        return base;
+    }
+    let scale = if zoom_delta.is_finite() && zoom_delta > 0.0 {
+        1.0 / zoom_delta.clamp(0.20, 5.0)
+    } else {
+        1.0
+    };
+    let u = if gesture_center.x.is_finite() {
+        ((gesture_center.x - rect.left()) / rect.width()).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let v = if gesture_center.y.is_finite() {
+        ((gesture_center.y - rect.top()) / rect.height()).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+
+    let anchor_x = base[0] + u * (base[1] - base[0]);
+    let anchor_y = base[2] + v * (base[3] - base[2]);
+    let mut z_left = anchor_x + (base[0] - anchor_x) * scale;
+    let mut z_right = anchor_x + (base[1] - anchor_x) * scale;
+    let mut z_top = anchor_y + (base[2] - anchor_y) * scale;
+    let mut z_bottom = anchor_y + (base[3] - anchor_y) * scale;
+
+    if translation_delta.x.is_finite() && translation_delta.y.is_finite() {
+        let dx_ppm = -translation_delta.x / rect.width() * (z_right - z_left);
+        let dy_ppm = -translation_delta.y / rect.height() * (z_bottom - z_top);
+        z_left += dx_ppm;
+        z_right += dx_ppm;
+        z_top += dy_ppm;
+        z_bottom += dy_ppm;
+    }
+
+    let x_desc = base[0] >= base[1];
+    let y_desc = base[2] > base[3];
+    let (h_left, h_right) = clamp_axis_1d_preserving_dir(
+        z_left,
+        z_right,
+        x_desc,
+        limits.x_min_ppm,
+        limits.x_max_ppm,
+        limits.min_x_span_ppm,
+    );
+    let (n_top, n_bottom) = clamp_axis_1d_preserving_dir(
+        z_top,
+        z_bottom,
+        y_desc,
+        limits.y_min_ppm,
+        limits.y_max_ppm,
+        limits.min_y_span_ppm,
+    );
+    [h_left, h_right, n_top, n_bottom]
+}
+
 struct CachedSpecBuffer {
     spec_gen: u64,
     spec_len: usize,

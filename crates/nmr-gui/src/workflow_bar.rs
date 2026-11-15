@@ -1839,6 +1839,941 @@ pub fn draw_workbench_chrome(
     actions
 }
 
+// ============================================================================
+// Responsive Mobile / Tablet / Desktop Layout Shell (`CompactMobile`, `TabletSplit`, `DesktopFull`)
+// ============================================================================
+
+/// Upper viewport width boundary (`px`) for `CompactMobile` phones (`< 680.0 px`).
+pub const COMPACT_MOBILE_MAX_WIDTH: f32 = 680.0;
+/// Lower viewport width boundary (`px`) for `DesktopFull` multi-dock layout (`>= 1024.0 px`).
+pub const DESKTOP_FULL_MIN_WIDTH: f32 = 1024.0;
+/// Minimum touch-friendly interactive button height (`px`) inside mobile chrome & tab bars.
+pub const MOBILE_TOUCH_MIN_HEIGHT: f32 = 34.0;
+
+/// Dynamic per-frame responsive viewport class derived from `ctx.content_rect().width()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResponsiveBreakpoint {
+    /// Phones & narrow split windows (`< 680.0 px`): zero side docks, compact single-row header,
+    /// bottom navigation bar, full-width `CentralPanel`.
+    CompactMobile,
+    /// Tablets & medium split windows (`680.0..1024.0 px`): at most ONE docked side panel
+    /// (`220..=300 px`), preserving `>= 420.0 px` for `CentralPanel`.
+    TabletSplit,
+    /// Full desktop workbench (`>= 1024.0 px`): simultaneous left (`3D`) + right (`Strips`) docks.
+    DesktopFull,
+}
+
+impl ResponsiveBreakpoint {
+    /// Classify a logical viewport width (`px`) into its responsive layout tier.
+    #[inline]
+    pub fn from_width(width: f32) -> Self {
+        if width < COMPACT_MOBILE_MAX_WIDTH {
+            Self::CompactMobile
+        } else if width < DESKTOP_FULL_MIN_WIDTH {
+            Self::TabletSplit
+        } else {
+            Self::DesktopFull
+        }
+    }
+
+    /// Derive the active breakpoint dynamically from `ctx.content_rect().width()`.
+    #[inline]
+    pub fn from_ctx(ctx: &egui::Context) -> Self {
+        Self::from_width(ctx.content_rect().width())
+    }
+}
+
+/// Top-level workspace mode mirrored across the responsive shell and host application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HostWorkspaceMode {
+    ProteinNmr,
+    OctetChem,
+    Dosy,
+    Metabolomics,
+}
+
+/// Top-level mobile mode switch in the compact mobile header (`Protein` vs `ChemStudio`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MobileWorkspaceFamily {
+    ProteinNmr,
+    ChemStudio,
+}
+
+/// Primary bottom-navigation views in `CompactMobile` `ProteinNmr` mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MobileProteinTab {
+    /// `2D` — full-width 2D ¹H–¹⁵N HSQC contour canvas with pinch-to-zoom & pan.
+    Contours2d,
+    /// `Strips` — full-width 3D strip tiler & spin-system inspector inside a 2D scroll viewport.
+    Strips,
+    /// `3D PDB` — full-width interactive 3D macromolecular structure viewport.
+    Structure3d,
+    /// `Dyn / 1D` — Relaxation/S², CEST/CPMG/CSP, and 1D Stack/Kinetics sub-views.
+    Dynamics1d,
+    /// `Seq & Tools` — sequence confidence ribbon, solver/picker controls & 6-stage stepper.
+    SeqAndTools,
+}
+
+impl MobileProteinTab {
+    pub const ALL: [Self; 5] = [
+        Self::Contours2d,
+        Self::Strips,
+        Self::Structure3d,
+        Self::Dynamics1d,
+        Self::SeqAndTools,
+    ];
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Contours2d => "🎯 2D",
+            Self::Strips => "📊 Strips",
+            Self::Structure3d => "🧊 3D PDB",
+            Self::Dynamics1d => "📈 Dyn / 1D",
+            Self::SeqAndTools => "🧬 Seq & Tools",
+        }
+    }
+}
+
+/// Sub-selector inside `MobileProteinTab::Dynamics1d`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MobileDynamicsSubTab {
+    RelaxationS2,
+    ExchangeCestCpmgCsp,
+    Stack1d,
+}
+
+impl MobileDynamicsSubTab {
+    pub const ALL: [Self; 3] = [Self::RelaxationS2, Self::ExchangeCestCpmgCsp, Self::Stack1d];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RelaxationS2 => "📈 Relax & S²",
+            Self::ExchangeCestCpmgCsp => "⚡ CEST / CPMG / CSP",
+            Self::Stack1d => "📚 1D Stack",
+        }
+    }
+}
+
+/// Primary bottom-navigation views in `CompactMobile` `ChemStudio` mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MobileChemTab {
+    /// Full-width 2D chemical structure drawing & clean-2D canvas.
+    Octet2dDraw,
+    /// Full-width 1D multiplets, ROI integrals & qNMR stoichiometry view.
+    Multiplets1dQnmr,
+    /// Full-width pseudo-2D DOSY diffusion studio.
+    Dosy2d,
+    /// Full-width metabolomics PCA / OPLS-DA / STOCSY studio.
+    Metabolomics,
+}
+
+impl MobileChemTab {
+    pub const ALL: [Self; 4] = [
+        Self::Octet2dDraw,
+        Self::Multiplets1dQnmr,
+        Self::Dosy2d,
+        Self::Metabolomics,
+    ];
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Octet2dDraw => "✏️ Octet 2D",
+            Self::Multiplets1dQnmr => "📉 1D / qNMR",
+            Self::Dosy2d => "🌊 DOSY",
+            Self::Metabolomics => "🧪 Metab.",
+        }
+    }
+}
+
+/// Single-dock selector for `TabletSplit` (`680.0..1024.0 px`) so left and right docks are never
+/// open simultaneously.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TabletActiveDock {
+    StripsRight,
+    Mol3dLeft,
+    Hidden,
+}
+
+/// Measured panel rectangles from the most recent rendered frame, exposed for layout verification.
+#[derive(Debug, Clone, Copy)]
+pub struct ResponsiveFrameMetrics {
+    pub breakpoint: ResponsiveBreakpoint,
+    pub content_rect: egui::Rect,
+    pub top_header_rect: egui::Rect,
+    pub bottom_nav_rect: Option<egui::Rect>,
+    pub status_bar_rect: egui::Rect,
+    pub left_dock_rect: Option<egui::Rect>,
+    pub right_dock_rect: Option<egui::Rect>,
+    pub central_panel_rect: egui::Rect,
+    pub active_viz_rect: egui::Rect,
+}
+
+impl Default for ResponsiveFrameMetrics {
+    fn default() -> Self {
+        let z = egui::Rect::ZERO;
+        Self {
+            breakpoint: ResponsiveBreakpoint::DesktopFull,
+            content_rect: z,
+            top_header_rect: z,
+            bottom_nav_rect: None,
+            status_bar_rect: z,
+            left_dock_rect: None,
+            right_dock_rect: None,
+            central_panel_rect: z,
+            active_viz_rect: z,
+        }
+    }
+}
+
+impl ResponsiveFrameMetrics {
+    /// Count how many left/right side docks were mounted during this frame (`0`, `1`, or `2`).
+    #[inline]
+    pub fn docked_side_panel_count(&self) -> usize {
+        usize::from(self.left_dock_rect.is_some()) + usize::from(self.right_dock_rect.is_some())
+    }
+}
+
+/// Persistent responsive navigation state across frames.
+#[derive(Debug, Clone)]
+pub struct ResponsiveShellState {
+    pub mobile_family: MobileWorkspaceFamily,
+    pub protein_tab: MobileProteinTab,
+    pub dynamics_sub_tab: MobileDynamicsSubTab,
+    pub chem_tab: MobileChemTab,
+    pub tablet_dock: TabletActiveDock,
+    pub mobile_menu_open: bool,
+    pub last_breakpoint: Option<ResponsiveBreakpoint>,
+    pub last_metrics: ResponsiveFrameMetrics,
+}
+
+impl Default for ResponsiveShellState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResponsiveShellState {
+    pub fn new() -> Self {
+        Self {
+            mobile_family: MobileWorkspaceFamily::ProteinNmr,
+            protein_tab: MobileProteinTab::Contours2d,
+            dynamics_sub_tab: MobileDynamicsSubTab::RelaxationS2,
+            chem_tab: MobileChemTab::Octet2dDraw,
+            tablet_dock: TabletActiveDock::StripsRight,
+            mobile_menu_open: false,
+            last_breakpoint: None,
+            last_metrics: ResponsiveFrameMetrics::default(),
+        }
+    }
+
+    /// Map the active mobile family + tab back to the canonical `HostWorkspaceMode`.
+    pub fn target_host_mode(&self) -> HostWorkspaceMode {
+        match self.mobile_family {
+            MobileWorkspaceFamily::ProteinNmr => HostWorkspaceMode::ProteinNmr,
+            MobileWorkspaceFamily::ChemStudio => match self.chem_tab {
+                MobileChemTab::Octet2dDraw | MobileChemTab::Multiplets1dQnmr => {
+                    HostWorkspaceMode::OctetChem
+                }
+                MobileChemTab::Dosy2d => HostWorkspaceMode::Dosy,
+                MobileChemTab::Metabolomics => HostWorkspaceMode::Metabolomics,
+            },
+        }
+    }
+
+    /// Synchronize mobile family/tab when entering `CompactMobile` from a desktop/tablet mode.
+    pub fn sync_from_host_mode(&mut self, host_mode: HostWorkspaceMode) {
+        match host_mode {
+            HostWorkspaceMode::ProteinNmr => {
+                self.mobile_family = MobileWorkspaceFamily::ProteinNmr;
+            }
+            HostWorkspaceMode::OctetChem => {
+                self.mobile_family = MobileWorkspaceFamily::ChemStudio;
+                if matches!(
+                    self.chem_tab,
+                    MobileChemTab::Dosy2d | MobileChemTab::Metabolomics
+                ) {
+                    self.chem_tab = MobileChemTab::Octet2dDraw;
+                }
+            }
+            HostWorkspaceMode::Dosy => {
+                self.mobile_family = MobileWorkspaceFamily::ChemStudio;
+                self.chem_tab = MobileChemTab::Dosy2d;
+            }
+            HostWorkspaceMode::Metabolomics => {
+                self.mobile_family = MobileWorkspaceFamily::ChemStudio;
+                self.chem_tab = MobileChemTab::Metabolomics;
+            }
+        }
+    }
+}
+
+/// Host adapter implemented by `NmrWorkbenchApp` (and headless integration test harnesses) so all
+/// three responsive layout tiers share a single deterministic `egui::Panel` orchestrator.
+pub trait ResponsiveWorkbenchHost {
+    fn host_workspace_mode(&self) -> HostWorkspaceMode;
+    fn set_host_workspace_mode(&mut self, mode: HostWorkspaceMode);
+    fn workspace_readiness(&self) -> WorkspaceReadiness;
+    fn active_residue_badge(&self) -> Option<String>;
+    fn status_banner_text(&self) -> &str;
+    fn trigger_builtin_demo(&mut self);
+    fn dispatch_chrome_action(&mut self, ctx: &egui::Context, action: WorkbenchAction);
+    fn show_mol3d_dock(&self) -> bool;
+
+    fn draw_desktop_mode_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        tablet_dock: Option<&mut TabletActiveDock>,
+    );
+    fn draw_desktop_status_bar(&mut self, ui: &mut egui::Ui, now_ms: u64);
+    fn draw_protein_top_controls_and_ribbon(&mut self, ui: &mut egui::Ui);
+    fn draw_protein_desktop_central(&mut self, ui: &mut egui::Ui) -> egui::Rect;
+
+    fn draw_hsqc_2d_view(&mut self, ui: &mut egui::Ui) -> egui::Rect;
+    fn draw_strips_inspector_view(&mut self, ui: &mut egui::Ui);
+    fn draw_mol3d_structure_view(&mut self, ui: &mut egui::Ui) -> egui::Rect;
+    fn draw_relax_s2_view(&mut self, ui: &mut egui::Ui);
+    fn draw_dynamics_exchange_view(&mut self, ui: &mut egui::Ui);
+    fn draw_stack1d_view(&mut self, ui: &mut egui::Ui);
+    fn draw_mobile_seq_and_tools_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        readiness: &WorkspaceReadiness,
+    ) -> Vec<WorkbenchAction>;
+
+    fn draw_octet_desktop_or_tablet(
+        &mut self,
+        ui: &mut egui::Ui,
+        is_tablet: bool,
+    ) -> (egui::Rect, Option<egui::Rect>, Option<egui::Rect>);
+    fn draw_mobile_octet_2d_view(&mut self, ui: &mut egui::Ui) -> egui::Rect;
+    fn draw_mobile_chem_1d_qnmr_view(&mut self, ui: &mut egui::Ui);
+    fn draw_dosy_view(&mut self, ui: &mut egui::Ui);
+    fn draw_metabolomics_view(&mut self, ui: &mut egui::Ui);
+}
+
+/// Render the complete responsive workbench shell for the current frame (`CompactMobile`,
+/// `TabletSplit`, or `DesktopFull`), returning exact measured panel rectangles.
+pub fn render_responsive_workbench<H: ResponsiveWorkbenchHost>(
+    ui: &mut egui::Ui,
+    now_ms: u64,
+    shell: &mut ResponsiveShellState,
+    host: &mut H,
+) -> ResponsiveFrameMetrics {
+    let ctx = ui.ctx().clone();
+    let content_rect = ctx.content_rect();
+    let breakpoint = ResponsiveBreakpoint::from_width(content_rect.width());
+
+    if breakpoint == ResponsiveBreakpoint::CompactMobile
+        && shell.last_breakpoint != Some(ResponsiveBreakpoint::CompactMobile)
+    {
+        shell.sync_from_host_mode(host.host_workspace_mode());
+    }
+    shell.last_breakpoint = Some(breakpoint);
+
+    let metrics = match breakpoint {
+        ResponsiveBreakpoint::CompactMobile => {
+            render_compact_mobile_shell(ui, &ctx, content_rect, shell, host)
+        }
+        ResponsiveBreakpoint::TabletSplit => {
+            render_tablet_split_shell(ui, &ctx, content_rect, now_ms, shell, host)
+        }
+        ResponsiveBreakpoint::DesktopFull => {
+            render_desktop_full_shell(ui, &ctx, content_rect, now_ms, host)
+        }
+    };
+    shell.last_metrics = metrics;
+    metrics
+}
+
+fn render_compact_mobile_shell<H: ResponsiveWorkbenchHost>(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    content_rect: egui::Rect,
+    shell: &mut ResponsiveShellState,
+    host: &mut H,
+) -> ResponsiveFrameMetrics {
+    let readiness = host.workspace_readiness();
+    let mut queued_actions: Vec<WorkbenchAction> = Vec::new();
+    let mut trigger_demo = false;
+
+    // 1. Compact single-row mobile top header (`<= 44 px` tall, `>= 34 px` interact height)
+    let header_frame =
+        egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(6, 2));
+    let top_resp = egui::Panel::top("mobile_compact_header")
+        .frame(header_frame)
+        .exact_size(40.0)
+        .resizable(false)
+        .show_separator_line(true)
+        .show(ui, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt("mobile_header_hscroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        ui.spacing_mut().interact_size.y = MOBILE_TOUCH_MIN_HEIGHT;
+
+                        let menu_btn = egui::Button::new(egui::RichText::new("☰").strong())
+                            .selected(shell.mobile_menu_open)
+                            .min_size(egui::vec2(34.0, MOBILE_TOUCH_MIN_HEIGHT));
+                        if ui.add(menu_btn).clicked() {
+                            shell.mobile_menu_open = !shell.mobile_menu_open;
+                        }
+
+                        let prot_selected =
+                            shell.mobile_family == MobileWorkspaceFamily::ProteinNmr;
+                        let prot_btn = egui::Button::new(
+                            egui::RichText::new("🧬 Protein").size(12.0).strong(),
+                        )
+                        .selected(prot_selected)
+                        .min_size(egui::vec2(72.0, MOBILE_TOUCH_MIN_HEIGHT));
+                        if ui.add(prot_btn).clicked() {
+                            shell.mobile_family = MobileWorkspaceFamily::ProteinNmr;
+                            host.set_host_workspace_mode(shell.target_host_mode());
+                        }
+
+                        let chem_selected =
+                            shell.mobile_family == MobileWorkspaceFamily::ChemStudio;
+                        let chem_btn = egui::Button::new(
+                            egui::RichText::new("⚗️ ChemStudio").size(12.0).strong(),
+                        )
+                        .selected(chem_selected)
+                        .min_size(egui::vec2(88.0, MOBILE_TOUCH_MIN_HEIGHT));
+                        if ui.add(chem_btn).clicked() {
+                            shell.mobile_family = MobileWorkspaceFamily::ChemStudio;
+                            host.set_host_workspace_mode(shell.target_host_mode());
+                        }
+
+                        let demo_btn = egui::Button::new(
+                            egui::RichText::new("🚀 Demo")
+                                .size(12.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(18, 28, 22)),
+                        )
+                        .fill(egui::Color32::from_rgb(82, 224, 152))
+                        .min_size(egui::vec2(64.0, MOBILE_TOUCH_MIN_HEIGHT));
+                        if ui.add(demo_btn).clicked() {
+                            trigger_demo = true;
+                        }
+
+                        if let Some(res_badge) = host.active_residue_badge() {
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_rgb(28, 38, 54))
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    egui::Color32::from_rgb(76, 110, 156),
+                                ))
+                                .corner_radius(10.0)
+                                .inner_margin(egui::Margin::symmetric(7, 4))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(res_badge)
+                                            .size(11.0)
+                                            .monospace()
+                                            .color(egui::Color32::from_rgb(190, 226, 255)),
+                                    );
+                                });
+                        }
+
+                        if let Some(qc) = readiness.qc_badge() {
+                            let [fr, fg, fb] = qc.fill_rgb;
+                            let [sr, sg, sb] = qc.stroke_rgb;
+                            let [tr, tg, tb] = qc.text_rgb;
+                            let qc_btn = egui::Button::new(
+                                egui::RichText::new(qc.label)
+                                    .size(10.5)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(tr, tg, tb)),
+                            )
+                            .fill(egui::Color32::from_rgb(fr, fg, fb))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(sr, sg, sb)))
+                            .corner_radius(10.0)
+                            .min_size(egui::vec2(58.0, 28.0));
+                            if ui.add(qc_btn).clicked() {
+                                queued_actions.push(WorkbenchAction::InspectDatasetQcReport);
+                            }
+                        }
+                    });
+                });
+        });
+
+    if trigger_demo {
+        host.trigger_builtin_demo();
+    }
+    host.set_host_workspace_mode(shell.target_host_mode());
+
+    // Optional `☰` mobile popover drawer (clamped safely inside phone width)
+    if shell.mobile_menu_open {
+        let mut open = shell.mobile_menu_open;
+        let max_win_w = (content_rect.width() - 16.0).clamp(220.0, 340.0);
+        egui::Window::new("☰ Workbench Menu")
+            .id(egui::Id::unique("mobile_quick_drawer_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .max_width(max_win_w)
+            .default_width(max_win_w)
+            .show(ctx, |ui| {
+                ui.spacing_mut().interact_size.y = MOBILE_TOUCH_MIN_HEIGHT;
+                let quick_items = [
+                    (
+                        "📋 Paste / Export Text",
+                        WorkbenchAction::OpenPasteTextModal,
+                    ),
+                    ("🗂 Ingest Matrix", WorkbenchAction::OpenIngestMatrix),
+                    ("▶ Run Assignment", WorkbenchAction::RunBackboneAssignment),
+                    ("💾 Save NEF Session", WorkbenchAction::SaveSessionNef),
+                    (
+                        "📊 HTML Quality Report",
+                        WorkbenchAction::ExportQualityReportHtml,
+                    ),
+                    ("⌘ Command Palette", WorkbenchAction::OpenCommandPalette),
+                    (
+                        "⌨ Keyboard Shortcuts",
+                        WorkbenchAction::OpenKeyboardCheatSheet,
+                    ),
+                ];
+                for (label, act) in quick_items {
+                    if ui
+                        .add(
+                            egui::Button::new(label)
+                                .min_size(egui::vec2(max_win_w - 20.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                        )
+                        .clicked()
+                    {
+                        queued_actions.push(act);
+                        shell.mobile_menu_open = false;
+                    }
+                }
+            });
+        if !shell.mobile_menu_open {
+            open = false;
+        }
+        shell.mobile_menu_open = open;
+    }
+
+    // 2. Single-line compact bottom status bar (`19 px`)
+    let status_frame =
+        egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(6, 1));
+    let status_resp = egui::Panel::bottom("mobile_status_bar")
+        .frame(status_frame)
+        .exact_size(19.0)
+        .resizable(false)
+        .show_separator_line(true)
+        .show(ui, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt("mobile_status_hscroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let status = host.status_banner_text();
+                        let display = if status.is_empty() {
+                            "Ready — pinch to zoom, drag to pan, tap peaks to inspect"
+                        } else {
+                            status
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(display)
+                                    .size(10.5)
+                                    .color(egui::Color32::from_rgb(185, 208, 236)),
+                            )
+                            .extend(),
+                        );
+                    });
+                });
+        });
+
+    // 3. Touch-friendly Mobile Bottom Navigation Bar (`>= 40 px` tall, `>= 34 px` interact height)
+    let nav_frame =
+        egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(4, 4));
+    let nav_resp = egui::Panel::bottom("mobile_bottom_nav")
+        .frame(nav_frame)
+        .exact_size(44.0)
+        .resizable(false)
+        .show_separator_line(true)
+        .show(ui, |ui| {
+            let bar_avail_w = ui.available_width().max(200.0);
+            egui::ScrollArea::horizontal()
+                .id_salt("mobile_bottom_nav_scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.spacing_mut().interact_size.y = MOBILE_TOUCH_MIN_HEIGHT;
+                        match shell.mobile_family {
+                            MobileWorkspaceFamily::ProteinNmr => {
+                                let tab_w = ((bar_avail_w - 16.0) / 5.0).max(66.0);
+                                for tab in MobileProteinTab::ALL {
+                                    let selected = shell.protein_tab == tab;
+                                    let btn = egui::Button::new(
+                                        egui::RichText::new(tab.short_label()).size(11.5).strong(),
+                                    )
+                                    .selected(selected)
+                                    .min_size(egui::vec2(tab_w, MOBILE_TOUCH_MIN_HEIGHT));
+                                    if ui.add(btn).clicked() {
+                                        shell.protein_tab = tab;
+                                    }
+                                }
+                            }
+                            MobileWorkspaceFamily::ChemStudio => {
+                                let tab_w = ((bar_avail_w - 12.0) / 4.0).max(78.0);
+                                for tab in MobileChemTab::ALL {
+                                    let selected = shell.chem_tab == tab;
+                                    let btn = egui::Button::new(
+                                        egui::RichText::new(tab.short_label()).size(11.5).strong(),
+                                    )
+                                    .selected(selected)
+                                    .min_size(egui::vec2(tab_w, MOBILE_TOUCH_MIN_HEIGHT));
+                                    if ui.add(btn).clicked() {
+                                        shell.chem_tab = tab;
+                                        host.set_host_workspace_mode(shell.target_host_mode());
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
+        });
+
+    // 4. Full-width `CentralPanel` (0 left/right side panels!)
+    let mut active_viz_rect = egui::Rect::ZERO;
+    let central_frame =
+        egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(4, 3));
+    let central_resp =
+        egui::CentralPanel::default()
+            .frame(central_frame)
+            .show(ui, |ui| match shell.mobile_family {
+                MobileWorkspaceFamily::ProteinNmr => match shell.protein_tab {
+                    MobileProteinTab::Contours2d => {
+                        active_viz_rect = host.draw_hsqc_2d_view(ui);
+                    }
+                    MobileProteinTab::Strips => {
+                        let viewport = ui.available_rect_before_wrap();
+                        egui::ScrollArea::both()
+                            .id_salt("mobile_strips_full_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(viewport.width().max(320.0));
+                                host.draw_strips_inspector_view(ui);
+                            });
+                        active_viz_rect = viewport;
+                    }
+                    MobileProteinTab::Structure3d => {
+                        active_viz_rect = host.draw_mol3d_structure_view(ui);
+                    }
+                    MobileProteinTab::Dynamics1d => {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("mobile_dyn_subtab_scroll")
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    ui.spacing_mut().interact_size.y = MOBILE_TOUCH_MIN_HEIGHT;
+                                    for sub in MobileDynamicsSubTab::ALL {
+                                        let btn = egui::Button::new(
+                                            egui::RichText::new(sub.label()).size(11.5).strong(),
+                                        )
+                                        .selected(shell.dynamics_sub_tab == sub)
+                                        .min_size(egui::vec2(96.0, MOBILE_TOUCH_MIN_HEIGHT));
+                                        if ui.add(btn).clicked() {
+                                            shell.dynamics_sub_tab = sub;
+                                        }
+                                    }
+                                });
+                            });
+                        ui.add_space(2.0);
+                        let viewport = ui.available_rect_before_wrap();
+                        egui::ScrollArea::both()
+                            .id_salt(("mobile_dyn_body_scroll", shell.dynamics_sub_tab))
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(viewport.width().max(320.0));
+                                match shell.dynamics_sub_tab {
+                                    MobileDynamicsSubTab::RelaxationS2 => {
+                                        host.draw_relax_s2_view(ui);
+                                    }
+                                    MobileDynamicsSubTab::ExchangeCestCpmgCsp => {
+                                        host.draw_dynamics_exchange_view(ui);
+                                    }
+                                    MobileDynamicsSubTab::Stack1d => {
+                                        host.draw_stack1d_view(ui);
+                                    }
+                                }
+                            });
+                        active_viz_rect = viewport;
+                    }
+                    MobileProteinTab::SeqAndTools => {
+                        let viewport = ui.available_rect_before_wrap();
+                        egui::ScrollArea::vertical()
+                            .id_salt("mobile_seq_tools_vscroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let more = host.draw_mobile_seq_and_tools_view(ui, &readiness);
+                                queued_actions.extend(more);
+                            });
+                        active_viz_rect = viewport;
+                    }
+                },
+                MobileWorkspaceFamily::ChemStudio => match shell.chem_tab {
+                    MobileChemTab::Octet2dDraw => {
+                        active_viz_rect = host.draw_mobile_octet_2d_view(ui);
+                    }
+                    MobileChemTab::Multiplets1dQnmr => {
+                        let viewport = ui.available_rect_before_wrap();
+                        egui::ScrollArea::both()
+                            .id_salt("mobile_chem_1d_qnmr_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(viewport.width().max(320.0));
+                                host.draw_mobile_chem_1d_qnmr_view(ui);
+                            });
+                        active_viz_rect = viewport;
+                    }
+                    MobileChemTab::Dosy2d => {
+                        let viewport = ui.available_rect_before_wrap();
+                        egui::ScrollArea::both()
+                            .id_salt("mobile_chem_dosy_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(viewport.width().max(320.0));
+                                host.draw_dosy_view(ui);
+                            });
+                        active_viz_rect = viewport;
+                    }
+                    MobileChemTab::Metabolomics => {
+                        let viewport = ui.available_rect_before_wrap();
+                        egui::ScrollArea::both()
+                            .id_salt("mobile_chem_metab_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(viewport.width().max(320.0));
+                                host.draw_metabolomics_view(ui);
+                            });
+                        active_viz_rect = viewport;
+                    }
+                },
+            });
+
+    for act in queued_actions {
+        host.dispatch_chrome_action(ctx, act);
+    }
+
+    ResponsiveFrameMetrics {
+        breakpoint: ResponsiveBreakpoint::CompactMobile,
+        content_rect,
+        top_header_rect: top_resp.response.rect,
+        bottom_nav_rect: Some(nav_resp.response.rect),
+        status_bar_rect: status_resp.response.rect,
+        left_dock_rect: None,
+        right_dock_rect: None,
+        central_panel_rect: central_resp.response.rect,
+        active_viz_rect,
+    }
+}
+
+fn render_tablet_split_shell<H: ResponsiveWorkbenchHost>(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    content_rect: egui::Rect,
+    now_ms: u64,
+    shell: &mut ResponsiveShellState,
+    host: &mut H,
+) -> ResponsiveFrameMetrics {
+    let readiness = host.workspace_readiness();
+    let mut chrome_actions = Vec::new();
+    let top_resp = egui::Panel::top("workbench_phase9_chrome").show(ui, |ui| {
+        host.draw_desktop_mode_header(ui, Some(&mut shell.tablet_dock));
+        ui.add_space(2.0);
+        chrome_actions = draw_workbench_chrome(ui, &readiness);
+    });
+    for act in chrome_actions {
+        host.dispatch_chrome_action(ctx, act);
+    }
+
+    let status_resp = egui::Panel::bottom("workbench_status_bar").show(ui, |ui| {
+        host.draw_desktop_status_bar(ui, now_ms);
+    });
+
+    let mut left_dock_rect: Option<egui::Rect> = None;
+    let mut right_dock_rect: Option<egui::Rect> = None;
+    let central_panel_rect: egui::Rect;
+    let mut active_viz_rect = egui::Rect::ZERO;
+
+    // Guarantee `CentralPanel` retains `>= 420.0 px` across all `680.0..1024.0 px` tablet widths
+    let max_dock_w = (content_rect.width() - 436.0).clamp(220.0, 300.0);
+    let default_dock_w = max_dock_w.min(265.0);
+
+    match host.host_workspace_mode() {
+        HostWorkspaceMode::ProteinNmr => {
+            egui::Panel::top("top_controls_panel").show(ui, |ui| {
+                host.draw_protein_top_controls_and_ribbon(ui);
+            });
+
+            // At most ONE side dock on TabletSplit (`StripsRight` OR `Mol3dLeft`, never both!)
+            match shell.tablet_dock {
+                TabletActiveDock::StripsRight => {
+                    let r = egui::Panel::right("tablet_right_strip_inspector")
+                        .default_size(default_dock_w)
+                        .min_size(220.0)
+                        .max_size(max_dock_w)
+                        .resizable(true)
+                        .show(ui, |ui| {
+                            host.draw_strips_inspector_view(ui);
+                        });
+                    right_dock_rect = Some(r.response.rect);
+                }
+                TabletActiveDock::Mol3dLeft => {
+                    let l = egui::Panel::left("tablet_mol3d_structure_dock")
+                        .default_size(default_dock_w)
+                        .min_size(220.0)
+                        .max_size(max_dock_w)
+                        .resizable(true)
+                        .show(ui, |ui| {
+                            let _ = host.draw_mol3d_structure_view(ui);
+                        });
+                    left_dock_rect = Some(l.response.rect);
+                }
+                TabletActiveDock::Hidden => {}
+            }
+
+            let c = egui::CentralPanel::default().show(ui, |ui| {
+                active_viz_rect = host.draw_protein_desktop_central(ui);
+            });
+            central_panel_rect = c.response.rect;
+        }
+        HostWorkspaceMode::OctetChem => {
+            let (c_rect, l_rect, r_rect) = host.draw_octet_desktop_or_tablet(ui, true);
+            central_panel_rect = c_rect;
+            active_viz_rect = c_rect;
+            left_dock_rect = l_rect;
+            right_dock_rect = r_rect;
+        }
+        HostWorkspaceMode::Dosy => {
+            let c = egui::CentralPanel::default().show(ui, |ui| {
+                active_viz_rect = ui.available_rect_before_wrap();
+                host.draw_dosy_view(ui);
+            });
+            central_panel_rect = c.response.rect;
+        }
+        HostWorkspaceMode::Metabolomics => {
+            let c = egui::CentralPanel::default().show(ui, |ui| {
+                active_viz_rect = ui.available_rect_before_wrap();
+                host.draw_metabolomics_view(ui);
+            });
+            central_panel_rect = c.response.rect;
+        }
+    }
+
+    ResponsiveFrameMetrics {
+        breakpoint: ResponsiveBreakpoint::TabletSplit,
+        content_rect,
+        top_header_rect: top_resp.response.rect,
+        bottom_nav_rect: None,
+        status_bar_rect: status_resp.response.rect,
+        left_dock_rect,
+        right_dock_rect,
+        central_panel_rect,
+        active_viz_rect,
+    }
+}
+
+fn render_desktop_full_shell<H: ResponsiveWorkbenchHost>(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    content_rect: egui::Rect,
+    now_ms: u64,
+    host: &mut H,
+) -> ResponsiveFrameMetrics {
+    let readiness = host.workspace_readiness();
+    let mut chrome_actions = Vec::new();
+    let top_resp = egui::Panel::top("workbench_phase9_chrome").show(ui, |ui| {
+        host.draw_desktop_mode_header(ui, None);
+        ui.add_space(2.0);
+        chrome_actions = draw_workbench_chrome(ui, &readiness);
+    });
+    for act in chrome_actions {
+        host.dispatch_chrome_action(ctx, act);
+    }
+
+    let status_resp = egui::Panel::bottom("workbench_status_bar").show(ui, |ui| {
+        host.draw_desktop_status_bar(ui, now_ms);
+    });
+
+    let mut left_dock_rect: Option<egui::Rect> = None;
+    let mut right_dock_rect: Option<egui::Rect> = None;
+    let central_panel_rect: egui::Rect;
+    let mut active_viz_rect = egui::Rect::ZERO;
+
+    match host.host_workspace_mode() {
+        HostWorkspaceMode::ProteinNmr => {
+            egui::Panel::top("top_controls_panel").show(ui, |ui| {
+                host.draw_protein_top_controls_and_ribbon(ui);
+            });
+
+            let r_resp = egui::Panel::right("right_strip_inspector")
+                .default_size(400.0)
+                .min_size(320.0)
+                .show(ui, |ui| {
+                    host.draw_strips_inspector_view(ui);
+                });
+            right_dock_rect = Some(r_resp.response.rect);
+
+            if host.show_mol3d_dock() {
+                let l_resp = egui::Panel::left("mol3d_structure_dock")
+                    .default_size(390.0)
+                    .min_size(280.0)
+                    .max_size(680.0)
+                    .resizable(true)
+                    .show(ui, |ui| {
+                        let _ = host.draw_mol3d_structure_view(ui);
+                    });
+                left_dock_rect = Some(l_resp.response.rect);
+            }
+
+            let c_resp = egui::CentralPanel::default().show(ui, |ui| {
+                active_viz_rect = host.draw_protein_desktop_central(ui);
+            });
+            central_panel_rect = c_resp.response.rect;
+        }
+        HostWorkspaceMode::OctetChem => {
+            let (c_rect, l_rect, r_rect) = host.draw_octet_desktop_or_tablet(ui, false);
+            central_panel_rect = c_rect;
+            active_viz_rect = c_rect;
+            left_dock_rect = l_rect;
+            right_dock_rect = r_rect;
+        }
+        HostWorkspaceMode::Dosy => {
+            let c_resp = egui::CentralPanel::default().show(ui, |ui| {
+                active_viz_rect = ui.available_rect_before_wrap();
+                host.draw_dosy_view(ui);
+            });
+            central_panel_rect = c_resp.response.rect;
+        }
+        HostWorkspaceMode::Metabolomics => {
+            let c_resp = egui::CentralPanel::default().show(ui, |ui| {
+                active_viz_rect = ui.available_rect_before_wrap();
+                host.draw_metabolomics_view(ui);
+            });
+            central_panel_rect = c_resp.response.rect;
+        }
+    }
+
+    ResponsiveFrameMetrics {
+        breakpoint: ResponsiveBreakpoint::DesktopFull,
+        content_rect,
+        top_header_rect: top_resp.response.rect,
+        bottom_nav_rect: None,
+        status_bar_rect: status_resp.response.rect,
+        left_dock_rect,
+        right_dock_rect,
+        central_panel_rect,
+        active_viz_rect,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

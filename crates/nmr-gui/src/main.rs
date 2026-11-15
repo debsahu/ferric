@@ -57,7 +57,9 @@ use nmr_core::octet_mol::{
     write_sdf, ChemDocument, Molecule, SdfRecord,
 };
 use nmr_core::octet_render::{
-    render_scene_svg, DocumentStyle, RenderScene, SceneSpectrum1D, SpectrumSignal1D,
+    compile_scene_primitives, flatten_path_commands, render_scene_svg, BondOrder, BondStereo,
+    DocumentStyle, RenderScene, RgbaColor, SceneAtom, SceneBond, SceneSpectrum1D, SpectrumSignal1D,
+    VectorPrimitive,
 };
 use nmr_core::paramagnetic::{
     assign_paramagnetic_backbone, assign_paramagnetic_from_peaks, parse_metal_ligands,
@@ -115,8 +117,9 @@ use nmr_gui::session_io::{default_session_nef_filename, trigger_browser_nef_down
 use nmr_gui::{
     command_palette::CommandPalette,
     contour_painter::{
-        default_overlay_palette, ContourPipelineResource, MultiContourCallback, OverlayLayerSpec,
-        SyncCrosshair,
+        apply_pinch_zoom_and_pan_2d, clamp_view_ppm_2d, default_overlay_palette,
+        ContourPipelineResource, MultiContourCallback, OverlayLayerSpec, SyncCrosshair,
+        ViewBounds2dLimits,
     },
     demo_preset::{build_builtin_demo_suite, BUILTIN_DEMO_SUITE_SEED},
     dosy_panel::{render_dosy_panel, DosyPanelAction, DosyPanelState},
@@ -134,7 +137,11 @@ use nmr_gui::{
     },
     stack1d_panel::{build_kinetics_demo_traces, render_stack1d_panel, Stack1dState, Trace1d},
     strip_tiler::{StripSpectra3D, StripTilerAction, StripTilerContext, StripTilerPanel},
-    workflow_bar::{draw_workbench_chrome, WorkbenchAction, WorkspaceReadiness},
+    workflow_bar::{
+        draw_workflow_stepper, render_responsive_workbench, HostWorkspaceMode,
+        ResponsiveShellState, ResponsiveWorkbenchHost, TabletActiveDock, WorkbenchAction,
+        WorkspaceReadiness, MOBILE_TOUCH_MIN_HEIGHT,
+    },
 };
 use octet_canvas::{IoFormat, MolecularPropertiesSummary, OctetBackendAdapter, OctetDrawPanel};
 
@@ -1719,6 +1726,10 @@ struct NmrWorkbenchApp {
     show_text_io_modal: bool,
     paste_text_buf: String,
     export_text_buf: String,
+    responsive_shell: ResponsiveShellState,
+    wgpu_render_state: Option<egui_wgpu::RenderState>,
+    suppress_hsqc_pan_until_release: bool,
+    suppress_octet_pan_until_release: bool,
     #[cfg(target_arch = "wasm32")]
     pending_drop_outcome: Arc<std::sync::Mutex<Option<Result<IngestDropOutcome, String>>>>,
 }
@@ -1900,6 +1911,10 @@ impl NmrWorkbenchApp {
             show_text_io_modal: false,
             paste_text_buf: String::new(),
             export_text_buf: String::new(),
+            responsive_shell: ResponsiveShellState::new(),
+            wgpu_render_state: cc.wgpu_render_state.clone(),
+            suppress_hsqc_pan_until_release: false,
+            suppress_octet_pan_until_release: false,
             #[cfg(target_arch = "wasm32")]
             pending_drop_outcome: Arc::new(std::sync::Mutex::new(None)),
         };
@@ -3918,9 +3933,11 @@ impl NmrWorkbenchApp {
             return;
         }
         let mut open = self.show_text_io_modal;
+        let max_modal_w = (ctx.content_rect().width() - 16.0).max(240.0);
         egui::Window::new("Paste / In-Memory NMR-STAR & Peak TSV")
             .open(&mut open)
-            .default_width(560.0)
+            .default_width(560.0_f32.min(max_modal_w))
+            .max_width(max_modal_w)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.label(
@@ -3978,7 +3995,11 @@ impl NmrWorkbenchApp {
         self.show_text_io_modal = open;
     }
 
-    fn draw_workspace_mode_header(&mut self, ui: &mut egui::Ui) {
+    fn draw_workspace_mode_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        tablet_dock: Option<&mut TabletActiveDock>,
+    ) {
         ui.horizontal_wrapped(|ui| {
             ui.heading(
                 egui::RichText::new("nmr-assign")
@@ -4023,6 +4044,16 @@ impl NmrWorkbenchApp {
                 .clicked()
             {
                 self.load_builtin_demo_suite();
+            }
+
+            if let Some(dock) = tablet_dock {
+                if self.workspace_mode == WorkspaceMode::ProteinNmr {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Dock:").small().weak());
+                    ui.selectable_value(dock, TabletActiveDock::StripsRight, "📊 Strips");
+                    ui.selectable_value(dock, TabletActiveDock::Mol3dLeft, "🧊 3D PDB");
+                    ui.selectable_value(dock, TabletActiveDock::Hidden, "⬜ Full 2D");
+                }
             }
 
             ui.separator();
@@ -4483,70 +4514,222 @@ impl NmrWorkbenchApp {
             });
     }
 
-    fn draw_hsqc_canvas(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("2D ¹H–¹⁵N HSQC (WebGPU Multi-Layer)").strong());
-            ui.add(
-                egui::Slider::new(&mut self.contour_base, 0.5..=60.0)
-                    .logarithmic(true)
-                    .text("Base"),
-            );
-            ui.add(egui::Slider::new(&mut self.contour_factor, 1.15..=2.0).text("Step"));
-            ui.add(egui::Slider::new(&mut self.contour_levels, 4..=16).text("Levels"));
-            ui.checkbox(&mut self.show_negative, "Neg");
-            ui.checkbox(&mut self.show_peak_labels, "Labels");
-            if ui
-                .small_button(format!("⧉ Overlays ({})", 1 + self.overlay_layers.len()))
-                .clicked()
-            {
-                self.show_overlay_manager = !self.show_overlay_manager;
-            }
-            let lock_txt = if self.crosshair.locked {
-                "🔒 Crosshair"
-            } else {
-                "┼ Crosshair"
-            };
-            if ui.small_button(lock_txt).clicked() {
-                self.crosshair.toggle_lock();
-            }
-            if ui.small_button("Reset Zoom").clicked() {
-                self.reset_view_to_spec();
-            }
-        });
+    fn draw_hsqc_canvas(&mut self, ui: &mut egui::Ui) -> egui::Rect {
+        let is_compact_mobile = ui.ctx().content_rect().width() < 680.0;
+        if is_compact_mobile {
+            egui::ScrollArea::horizontal()
+                .id_salt("hsqc_mobile_toolbar_scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.spacing_mut().interact_size.y = MOBILE_TOUCH_MIN_HEIGHT;
+                        if ui
+                            .add(
+                                egui::Button::new("🎚 Levels")
+                                    .selected(self.show_contour_modal)
+                                    .min_size(egui::vec2(66.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                            )
+                            .clicked()
+                        {
+                            self.show_contour_modal = !self.show_contour_modal;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new("−Floor")
+                                    .min_size(egui::vec2(52.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                            )
+                            .clicked()
+                        {
+                            self.contour_base =
+                                (self.contour_base / CONTOUR_FLOOR_STEP_RATIO).max(1e-3);
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new("+Floor")
+                                    .min_size(egui::vec2(52.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                            )
+                            .clicked()
+                        {
+                            self.contour_base =
+                                (self.contour_base * CONTOUR_FLOOR_STEP_RATIO).min(500.0);
+                        }
+                        let lbl_btn = egui::Button::new("Labels")
+                            .selected(self.show_peak_labels)
+                            .min_size(egui::vec2(54.0, MOBILE_TOUCH_MIN_HEIGHT));
+                        if ui.add(lbl_btn).clicked() {
+                            self.show_peak_labels = !self.show_peak_labels;
+                        }
+                        let neg_btn = egui::Button::new("Neg")
+                            .selected(self.show_negative)
+                            .min_size(egui::vec2(44.0, MOBILE_TOUCH_MIN_HEIGHT));
+                        if ui.add(neg_btn).clicked() {
+                            self.show_negative = !self.show_negative;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(format!("⧉ ({})", 1 + self.overlay_layers.len()))
+                                    .min_size(egui::vec2(48.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                            )
+                            .clicked()
+                        {
+                            self.show_overlay_manager = !self.show_overlay_manager;
+                        }
+                        let lock_txt = if self.crosshair.locked {
+                            "🔒 XHair"
+                        } else {
+                            "┼ XHair"
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(lock_txt)
+                                    .selected(self.crosshair.locked)
+                                    .min_size(egui::vec2(58.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                            )
+                            .clicked()
+                        {
+                            self.crosshair.toggle_lock();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new("Fit")
+                                    .min_size(egui::vec2(42.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                            )
+                            .clicked()
+                        {
+                            self.reset_view_to_spec();
+                        }
+                    });
+                });
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("2D ¹H–¹⁵N HSQC (WebGPU Multi-Layer)").strong());
+                ui.add(
+                    egui::Slider::new(&mut self.contour_base, 0.5..=60.0)
+                        .logarithmic(true)
+                        .text("Base"),
+                );
+                ui.add(egui::Slider::new(&mut self.contour_factor, 1.15..=2.0).text("Step"));
+                ui.add(egui::Slider::new(&mut self.contour_levels, 4..=16).text("Levels"));
+                ui.checkbox(&mut self.show_negative, "Neg");
+                ui.checkbox(&mut self.show_peak_labels, "Labels");
+                if ui
+                    .small_button(format!("⧉ Overlays ({})", 1 + self.overlay_layers.len()))
+                    .clicked()
+                {
+                    self.show_overlay_manager = !self.show_overlay_manager;
+                }
+                let lock_txt = if self.crosshair.locked {
+                    "🔒 Crosshair"
+                } else {
+                    "┼ Crosshair"
+                };
+                if ui.small_button(lock_txt).clicked() {
+                    self.crosshair.toggle_lock();
+                }
+                if ui.small_button("Reset Zoom").clicked() {
+                    self.reset_view_to_spec();
+                }
+            });
+        }
 
         let avail = ui.available_size();
-        let canvas_size = egui::vec2(avail.x.max(200.0), (avail.y - 4.0).max(200.0));
+        let canvas_size = egui::vec2(avail.x.max(160.0), (avail.y - 4.0).max(160.0));
         let (rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
 
-        // Pan with drag
-        if response.dragged() {
+        let limits = self
+            .hsqc_spec
+            .as_ref()
+            .map(ViewBounds2dLimits::from_spectrum_2d)
+            .unwrap_or_else(ViewBounds2dLimits::default_hn);
+
+        if !ui.input(|i| i.pointer.any_down()) {
+            self.suppress_hsqc_pan_until_release = false;
+        }
+
+        // Two-finger multi-touch pinch-to-zoom & translation pan around gesture center
+        let multi_touch_active = if let Some(mt) = ui.ctx().input(|i| i.multi_touch()) {
+            if mt.num_touches >= 2
+                && (rect.contains(mt.start_pos)
+                    || rect.contains(mt.center_pos)
+                    || response.hovered()
+                    || response.is_pointer_button_down_on())
+            {
+                self.suppress_hsqc_pan_until_release = true;
+                let updated = apply_pinch_zoom_and_pan_2d(
+                    [
+                        self.view_h_left,
+                        self.view_h_right,
+                        self.view_n_top,
+                        self.view_n_bottom,
+                    ],
+                    rect,
+                    mt.center_pos,
+                    mt.zoom_delta,
+                    mt.translation_delta,
+                    limits,
+                );
+                self.view_h_left = updated[0];
+                self.view_h_right = updated[1];
+                self.view_n_top = updated[2];
+                self.view_n_bottom = updated[3];
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Single-finger / primary pointer pan with physical ppm clamping
+        if !multi_touch_active && !self.suppress_hsqc_pan_until_release && response.dragged() {
             let delta = response.drag_delta();
             let span_h = self.view_h_right - self.view_h_left;
             let span_n = self.view_n_bottom - self.view_n_top;
             let dh = -delta.x / rect.width().max(1.0) * span_h;
             let dn = -delta.y / rect.height().max(1.0) * span_n;
-            self.view_h_left += dh;
-            self.view_h_right += dh;
-            self.view_n_top += dn;
-            self.view_n_bottom += dn;
+            let clamped = clamp_view_ppm_2d(
+                [
+                    self.view_h_left + dh,
+                    self.view_h_right + dh,
+                    self.view_n_top + dn,
+                    self.view_n_bottom + dn,
+                ],
+                limits,
+            );
+            self.view_h_left = clamped[0];
+            self.view_h_right = clamped[1];
+            self.view_n_top = clamped[2];
+            self.view_n_bottom = clamped[3];
         }
-        if response.double_clicked() {
+        if response.double_clicked() && !multi_touch_active {
             self.reset_view_to_spec();
         }
 
-        // Scroll-wheel zoom around pointer
-        if let Some(hover_pos) = response.hover_pos() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll.abs() > 0.1 {
-                let zoom = (1.0 - scroll * 0.0025).clamp(0.75, 1.35);
-                let u = ((hover_pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                let v = ((hover_pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-                let anchor_h = self.view_h_left + u * (self.view_h_right - self.view_h_left);
-                let anchor_n = self.view_n_top + v * (self.view_n_bottom - self.view_n_top);
-                self.view_h_left = anchor_h + (self.view_h_left - anchor_h) * zoom;
-                self.view_h_right = anchor_h + (self.view_h_right - anchor_h) * zoom;
-                self.view_n_top = anchor_n + (self.view_n_top - anchor_n) * zoom;
-                self.view_n_bottom = anchor_n + (self.view_n_bottom - anchor_n) * zoom;
+        // Scroll-wheel zoom around pointer (clamped to physical ppm bounds)
+        if !multi_touch_active {
+            if let Some(hover_pos) = response.hover_pos() {
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll.abs() > 0.1 {
+                    let zoom = (1.0 - scroll * 0.0025).clamp(0.75, 1.35);
+                    let u = ((hover_pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                    let v = ((hover_pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+                    let anchor_h = self.view_h_left + u * (self.view_h_right - self.view_h_left);
+                    let anchor_n = self.view_n_top + v * (self.view_n_bottom - self.view_n_top);
+                    let clamped = clamp_view_ppm_2d(
+                        [
+                            anchor_h + (self.view_h_left - anchor_h) * zoom,
+                            anchor_h + (self.view_h_right - anchor_h) * zoom,
+                            anchor_n + (self.view_n_top - anchor_n) * zoom,
+                            anchor_n + (self.view_n_bottom - anchor_n) * zoom,
+                        ],
+                        limits,
+                    );
+                    self.view_h_left = clamped[0];
+                    self.view_h_right = clamped[1];
+                    self.view_n_top = clamped[2];
+                    self.view_n_bottom = clamped[3];
+                }
             }
         }
 
@@ -4594,14 +4777,15 @@ impl NmrWorkbenchApp {
             SyncCrosshair::ppm_to_screen_2d(view_ppm, rect, h, n)
         };
 
-        // Click to select nearest spin system
-        if response.clicked() {
+        // Tap / click to select nearest spin system or sync crosshair on touch
+        if response.clicked() && !multi_touch_active && !self.suppress_hsqc_pan_until_release {
             if let Some(click_pos) = response.interact_pointer_pos() {
+                let hit_radius = if is_compact_mobile { 24.0 } else { 18.0 };
                 let mut best: Option<(usize, f32)> = None;
                 for (s, ss) in self.systems.iter().enumerate() {
                     let pt = ppm_to_screen(ss.h, ss.n);
                     let dist = pt.distance(click_pos);
-                    if dist <= 18.0 && best.is_none_or(|(_, bd)| dist < bd) {
+                    if dist <= hit_radius && best.is_none_or(|(_, bd)| dist < bd) {
                         best = Some((s, dist));
                     }
                 }
@@ -4617,6 +4801,14 @@ impl NmrWorkbenchApp {
                             self.mol3d_panel.highlight_sequence_residue(Some(rk), true);
                         }
                     }
+                } else {
+                    let u = ((click_pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                    let v = ((click_pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+                    let tap_h =
+                        (self.view_h_left + u * (self.view_h_right - self.view_h_left)) as f64;
+                    let tap_n =
+                        (self.view_n_top + v * (self.view_n_bottom - self.view_n_top)) as f64;
+                    self.crosshair.update_from_2d_hover(tap_h, tap_n);
                 }
             }
         }
@@ -4687,11 +4879,13 @@ impl NmrWorkbenchApp {
 
         // Update & draw synchronized crosshair
         if let Some(hp) = response.hover_pos() {
-            let u = (hp.x - rect.left()) / rect.width().max(1.0);
-            let v = (hp.y - rect.top()) / rect.height().max(1.0);
-            let cur_h = (self.view_h_left + u * (self.view_h_right - self.view_h_left)) as f64;
-            let cur_n = (self.view_n_top + v * (self.view_n_bottom - self.view_n_top)) as f64;
-            self.crosshair.update_from_2d_hover(cur_h, cur_n);
+            if !multi_touch_active {
+                let u = (hp.x - rect.left()) / rect.width().max(1.0);
+                let v = (hp.y - rect.top()) / rect.height().max(1.0);
+                let cur_h = (self.view_h_left + u * (self.view_h_right - self.view_h_left)) as f64;
+                let cur_n = (self.view_n_top + v * (self.view_n_bottom - self.view_n_top)) as f64;
+                self.crosshair.update_from_2d_hover(cur_h, cur_n);
+            }
         }
         let ch_pt = ppm_to_screen(self.crosshair.h_ppm, self.crosshair.n_ppm);
         if rect.contains(ch_pt) {
@@ -4729,15 +4923,16 @@ impl NmrWorkbenchApp {
             egui::Stroke::new(1.0, egui::Color32::from_rgb(65, 80, 105)),
             egui::StrokeKind::Inside,
         );
-        for i in 0..=5 {
-            let t = (i as f32) / 5.0;
+        let tick_steps = if is_compact_mobile { 4usize } else { 5usize };
+        for i in 0..=tick_steps {
+            let t = (i as f32) / (tick_steps as f32);
             let h_val = self.view_h_left + t * (self.view_h_right - self.view_h_left);
             let x = rect.left() + t * rect.width();
             painter.text(
                 egui::pos2(x, rect.bottom() - 3.0),
                 egui::Align2::CENTER_BOTTOM,
                 format!("{h_val:.2} ¹H"),
-                egui::FontId::monospace(10.0),
+                egui::FontId::monospace(9.5),
                 egui::Color32::from_rgb(170, 188, 215),
             );
 
@@ -4747,7 +4942,7 @@ impl NmrWorkbenchApp {
                 egui::pos2(rect.left() + 4.0, y),
                 egui::Align2::LEFT_CENTER,
                 format!("{n_val:.1}"),
-                egui::FontId::monospace(10.0),
+                egui::FontId::monospace(9.5),
                 egui::Color32::from_rgb(170, 188, 215),
             );
         }
@@ -4764,9 +4959,10 @@ impl NmrWorkbenchApp {
                 "¹H {:.3} ppm | ¹⁵N {:.2} ppm{lock_tag}",
                 self.crosshair.h_ppm, self.crosshair.n_ppm
             ),
-            egui::FontId::monospace(11.0),
+            egui::FontId::monospace(if is_compact_mobile { 10.0 } else { 11.0 }),
             egui::Color32::from_rgb(220, 235, 255),
         );
+        rect
     }
 
     fn select_residue_and_sync_strip(&mut self, k: usize) {
@@ -7016,6 +7212,8 @@ impl NmrWorkbenchApp {
             self.dispatch_workbench_action(ctx, cs_act);
         }
 
+        let max_modal_w = (ctx.content_rect().width() - 16.0).max(240.0);
+
         // 4. `vt` Contour Threshold Popover
         if self.show_contour_modal {
             let mut open = self.show_contour_modal;
@@ -7023,7 +7221,8 @@ impl NmrWorkbenchApp {
                 .id(egui::Id::unique("nmr_contour_threshold_modal"))
                 .open(&mut open)
                 .collapsible(false)
-                .default_width(340.0)
+                .default_width(340.0_f32.min(max_modal_w))
+                .max_width(max_modal_w)
                 .show(ctx, |ui| {
                     ui.add(
                         egui::Slider::new(&mut self.contour_base, 0.2..=120.0)
@@ -7059,7 +7258,8 @@ impl NmrWorkbenchApp {
                 .id(egui::Id::unique("nmr_overlay_stack_manager"))
                 .open(&mut open)
                 .collapsible(false)
-                .default_width(520.0)
+                .default_width(520.0_f32.min(max_modal_w))
+                .max_width(max_modal_w)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Primary 2D HSQC Nudge (ppm):");
@@ -7148,7 +7348,8 @@ impl NmrWorkbenchApp {
                 .id(egui::Id::unique("nmr_assign_lock_popover"))
                 .open(&mut open)
                 .collapsible(false)
-                .default_width(360.0)
+                .default_width(360.0_f32.min(max_modal_w))
+                .max_width(max_modal_w)
                 .show(ctx, |ui| {
                     if let Some(ss) = self.selected_ss.filter(|&s| s < self.systems.len()) {
                         ui.label(format!(
@@ -7223,7 +7424,8 @@ impl NmrWorkbenchApp {
                 .id(egui::Id::unique("nmr_qc_report_modal"))
                 .open(&mut open)
                 .collapsible(false)
-                .default_width(440.0)
+                .default_width(440.0_f32.min(max_modal_w))
+                .max_width(max_modal_w)
                 .show(ctx, |ui| {
                     if let Some(ref qc) = self.qc_report {
                         ui.strong(format!("Verdict: {}", qc.verdict));
@@ -7249,7 +7451,8 @@ impl NmrWorkbenchApp {
                 .id(egui::Id::unique("nmr_about_modal"))
                 .open(&mut open)
                 .collapsible(false)
-                .default_width(440.0)
+                .default_width(440.0_f32.min(max_modal_w))
+                .max_width(max_modal_w)
                 .show(ctx, |ui| {
                     ui.strong(format!("nmr-assign v{}", nmr_core::VERSION));
                     ui.label(
@@ -7342,6 +7545,10 @@ impl eframe::App for NmrWorkbenchApp {
             self.dispatch_workbench_action(&ctx, act);
         }
 
+        if let Some(rs) = _frame.wgpu_render_state() {
+            self.wgpu_render_state = Some(rs.clone());
+        }
+
         // 4. Drag-and-drop + Modals + MCP Live Workbench Bridge Synchronization
         self.apply_pending_mcp_bridge_commands();
         self.sync_mcp_bridge_snapshot_and_viewport();
@@ -7350,203 +7557,664 @@ impl eframe::App for NmrWorkbenchApp {
         self.draw_phase9_modals(&ctx);
         self.draw_mcp_bridge_window(&ctx);
 
-        // 5. Top Menu Bar + 6-Stage Workflow Stepper + QC Verdict Pill + "What Next?"
-        let readiness = self.compute_workspace_readiness();
-        let mut chrome_actions = Vec::new();
-        egui::Panel::top("workbench_phase9_chrome").show(ui, |ui| {
-            self.draw_workspace_mode_header(ui);
-            ui.add_space(2.0);
-            chrome_actions = draw_workbench_chrome(ui, &readiness);
-        });
-        for act in chrome_actions {
-            self.dispatch_workbench_action(&ctx, act);
-        }
+        // 5. Responsive Workbench Shell (`CompactMobile < 680`, `TabletSplit 680..1024`, `DesktopFull >= 1024`)
+        let mut shell = std::mem::take(&mut self.responsive_shell);
+        let _ = render_responsive_workbench(ui, now_ms, &mut shell, self);
+        self.responsive_shell = shell;
+    }
+}
 
-        // 6. Bottom Status Bar (with pending `Chord: p_` badge)
-        egui::Panel::bottom("workbench_status_bar").show(ui, |ui| {
-            self.draw_bottom_status_bar(ui, now_ms);
-        });
-
-        match self.workspace_mode {
-            WorkspaceMode::ProteinNmr => {
-                egui::Panel::top("top_controls_panel").show(ui, |ui| {
-                    self.draw_top_bar(ui);
-                    if !self.axis_rescue_notices.is_empty() {
-                        ui.add_space(3.0);
-                        egui::Frame::new()
-                            .fill(egui::Color32::from_rgb(72, 46, 8))
-                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(234, 179, 8)))
-                            .corner_radius(4.0)
-                            .inner_margin(egui::Margin::symmetric(8, 4))
-                            .show(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Axis Rescue Applied:")
-                                            .strong()
-                                            .color(egui::Color32::from_rgb(254, 240, 138)),
-                                    );
-                                    for msg in &self.axis_rescue_notices {
-                                        ui.label(
-                                            egui::RichText::new(msg)
-                                                .small()
-                                                .monospace()
-                                                .color(egui::Color32::from_rgb(254, 249, 195)),
-                                        );
-                                    }
-                                    ui.checkbox(&mut self.enable_axis_rescue, "Enable Axis Rescue");
-                                    if ui.small_button("Dismiss").clicked() {
-                                        self.axis_rescue_notices.clear();
-                                    }
-                                });
-                            });
-                    }
-                    ui.add_space(4.0);
-                    self.draw_sequence_ribbon(ui);
-                });
-
-                egui::Panel::right("right_strip_inspector")
-                    .default_size(400.0)
-                    .min_size(320.0)
-                    .show(ui, |ui| {
-                        self.draw_right_inspector(ui);
-                    });
-
-                if self.show_mol3d_viewport {
-                    let mut picked_3d: Option<Mol3dSyncAction> = None;
-                    egui::Panel::left("mol3d_structure_dock")
-                        .default_size(390.0)
-                        .min_size(280.0)
-                        .max_size(680.0)
-                        .resizable(true)
-                        .show(ui, |ui| {
-                            let display_ref = self.pred_ref.as_ref().or(self.reference.as_ref());
-                            picked_3d = self.mol3d_panel.ui(
-                                ui,
-                                _frame.wgpu_render_state(),
-                                &self.sequence,
-                                &self.seq_ids,
-                                display_ref,
-                            );
-                        });
-                    if let Some(sync) = picked_3d {
-                        self.apply_mol3d_sync_action(sync);
+fn paint_mobile_octet_primitive(
+    painter: &egui::Painter,
+    pr: &VectorPrimitive,
+    pt_to_scr: &dyn Fn([f64; 2]) -> egui::Pos2,
+    pt_scale: f32,
+) {
+    let to_col = |c: RgbaColor| egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a);
+    match pr {
+        VectorPrimitive::Line {
+            p1,
+            p2,
+            width_pt,
+            color,
+            dash_pt,
+        } => {
+            let s1 = pt_to_scr(*p1);
+            let s2 = pt_to_scr(*p2);
+            let stroke = egui::Stroke::new((*width_pt as f32 * pt_scale).max(1.0), to_col(*color));
+            if let Some([d1, d2]) = dash_pt {
+                let d_on = (*d1 as f32 * pt_scale).max(2.0);
+                let d_off = (*d2 as f32 * pt_scale).max(2.0);
+                let total = s1.distance(s2);
+                if total > 0.5 {
+                    let dir = (s2 - s1) / total;
+                    let mut t = 0.0;
+                    while t < total {
+                        let e = (t + d_on).min(total);
+                        painter.line_segment([s1 + dir * t, s1 + dir * e], stroke);
+                        t += d_on + d_off;
                     }
                 }
+            } else {
+                painter.line_segment([s1, s2], stroke);
+            }
+        }
+        VectorPrimitive::Polygon {
+            points,
+            fill,
+            stroke,
+        } => {
+            let pts: Vec<egui::Pos2> = points.iter().map(|&p| pt_to_scr(p)).collect();
+            if pts.len() >= 3 {
+                let fc = fill.map(to_col).unwrap_or(egui::Color32::TRANSPARENT);
+                let st = stroke
+                    .map(|(w, c)| egui::Stroke::new((w as f32 * pt_scale).max(1.0), to_col(c)))
+                    .unwrap_or(egui::Stroke::NONE);
+                painter.add(egui::Shape::convex_polygon(pts, fc, st));
+            }
+        }
+        VectorPrimitive::Path {
+            cmds, fill, stroke, ..
+        } => {
+            let subpaths = flatten_path_commands(cmds, 14);
+            let st = stroke
+                .map(|(w, c)| egui::Stroke::new((w as f32 * pt_scale).max(1.0), to_col(c)))
+                .unwrap_or(egui::Stroke::NONE);
+            for (pts, closed) in subpaths {
+                let spts: Vec<egui::Pos2> = pts.iter().map(|&p| pt_to_scr(p)).collect();
+                if spts.len() >= 3 && (closed || fill.is_some()) {
+                    if let Some(fc) = fill {
+                        painter.add(egui::Shape::convex_polygon(
+                            spts.clone(),
+                            to_col(*fc),
+                            egui::Stroke::NONE,
+                        ));
+                    }
+                }
+                if st != egui::Stroke::NONE && spts.len() >= 2 {
+                    painter.add(egui::Shape::line(spts, st));
+                }
+            }
+        }
+        VectorPrimitive::Circle {
+            center,
+            radius_pt,
+            fill,
+            stroke,
+            ..
+        } => {
+            let c = pt_to_scr(*center);
+            let r = (*radius_pt as f32 * pt_scale).max(1.0);
+            if let Some(fc) = fill {
+                painter.circle_filled(c, r, to_col(*fc));
+            }
+            if let Some((sw, sc)) = *stroke {
+                painter.circle_stroke(
+                    c,
+                    r,
+                    egui::Stroke::new((sw as f32 * pt_scale).max(1.0), to_col(sc)),
+                );
+            }
+        }
+        VectorPrimitive::Text {
+            pos,
+            text,
+            font_size_pt,
+            color,
+            ..
+        } => {
+            let sp = pt_to_scr(*pos);
+            let fsz = (*font_size_pt as f32 * pt_scale).clamp(7.5, 42.0);
+            painter.text(
+                sp,
+                egui::Align2::LEFT_BOTTOM,
+                text,
+                egui::FontId::proportional(fsz),
+                to_col(*color),
+            );
+        }
+    }
+}
 
-                let mut relax_actions = Vec::new();
-                let mut dyn_output: Option<DynamicsStudioOutput> = None;
-                egui::CentralPanel::default().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .selectable_label(
-                                !self.show_relax_panel
-                                    && !self.show_dynamics_panel
-                                    && !self.show_stack1d_panel,
-                                "🎯 2D HSQC Contours",
-                            )
-                            .clicked()
-                        {
-                            self.show_relax_panel = false;
-                            self.show_dynamics_panel = false;
-                            self.show_stack1d_panel = false;
+impl NmrWorkbenchApp {
+    fn draw_mobile_octet_2d_canvas(&mut self, ui: &mut egui::Ui) -> egui::Rect {
+        egui::ScrollArea::horizontal()
+            .id_salt("mobile_octet_2d_toolbar")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.spacing_mut().interact_size.y = MOBILE_TOUCH_MIN_HEIGHT;
+                    if ui
+                        .add(
+                            egui::Button::new("↩ Undo")
+                                .min_size(egui::vec2(56.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                        )
+                        .clicked()
+                    {
+                        self.octet_app.undo();
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new("↪ Redo")
+                                .min_size(egui::vec2(56.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                        )
+                        .clicked()
+                    {
+                        self.octet_app.redo();
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new("✨ Clean 2D")
+                                .min_size(egui::vec2(78.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                        )
+                        .clicked()
+                    {
+                        self.octet_app.clean_2d_structure();
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new("🧬 Peptide")
+                                .min_size(egui::vec2(72.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                        )
+                        .clicked()
+                    {
+                        self.octet_app
+                            .set_loaded_protein_sequence(self.sequence.clone());
+                        self.octet_app.import_from_loaded_protein();
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new("Fit")
+                                .min_size(egui::vec2(44.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                        )
+                        .clicked()
+                    {
+                        self.octet_app.fit_camera_to_scene();
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new("🗑 Clear")
+                                .min_size(egui::vec2(58.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                        )
+                        .clicked()
+                    {
+                        self.octet_app.set_scene(RenderScene::new());
+                    }
+                });
+            });
+
+        let avail = ui.available_size();
+        let canvas_size = egui::vec2(avail.x.max(160.0), (avail.y - 4.0).max(160.0));
+        let (rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
+        let center_scr = rect.center();
+
+        let mol_to_screen = |xm: f64, ym: f64, cam_c: [f64; 2], scale: f32| -> egui::Pos2 {
+            egui::pos2(
+                center_scr.x + ((xm - cam_c[0]) as f32) * scale,
+                center_scr.y - ((ym - cam_c[1]) as f32) * scale,
+            )
+        };
+        let screen_to_mol = |pos: egui::Pos2, cam_c: [f64; 2], scale: f32| -> [f64; 2] {
+            [
+                cam_c[0] + ((pos.x - center_scr.x) / scale.max(1.0)) as f64,
+                cam_c[1] - ((pos.y - center_scr.y) / scale.max(1.0)) as f64,
+            ]
+        };
+
+        if !ui.input(|i| i.pointer.any_down()) {
+            self.suppress_octet_pan_until_release = false;
+        }
+
+        let multi_touch_active = if let Some(mt) = ui.ctx().input(|i| i.multi_touch()) {
+            if mt.num_touches >= 2
+                && (rect.contains(mt.start_pos)
+                    || rect.contains(mt.center_pos)
+                    || response.hovered()
+                    || response.is_pointer_button_down_on())
+            {
+                self.suppress_octet_pan_until_release = true;
+                let before_mol = screen_to_mol(
+                    mt.center_pos,
+                    self.octet_app.cam_center_mol,
+                    self.octet_app.pixels_per_bond,
+                );
+                if mt.zoom_delta.is_finite() && mt.zoom_delta > 1e-4 {
+                    self.octet_app.pixels_per_bond = (self.octet_app.pixels_per_bond
+                        * mt.zoom_delta.clamp(0.4, 2.5))
+                    .clamp(12.0, 110.0);
+                }
+                let after_mol = screen_to_mol(
+                    mt.center_pos,
+                    self.octet_app.cam_center_mol,
+                    self.octet_app.pixels_per_bond,
+                );
+                let ppb = self.octet_app.pixels_per_bond.max(1.0);
+                self.octet_app.cam_center_mol[0] +=
+                    (before_mol[0] - after_mol[0]) - (mt.translation_delta.x / ppb) as f64;
+                self.octet_app.cam_center_mol[1] +=
+                    (before_mol[1] - after_mol[1]) + (mt.translation_delta.y / ppb) as f64;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !multi_touch_active && !self.suppress_octet_pan_until_release {
+            if response.dragged() {
+                let delta = response.drag_delta();
+                let ppb = self.octet_app.pixels_per_bond.max(1.0);
+                self.octet_app.cam_center_mol[0] -= (delta.x / ppb) as f64;
+                self.octet_app.cam_center_mol[1] += (delta.y / ppb) as f64;
+            } else if response.clicked() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let pm = screen_to_mol(
+                        pos,
+                        self.octet_app.cam_center_mol,
+                        self.octet_app.pixels_per_bond,
+                    );
+                    let mut hit_atom: Option<(usize, f64)> = None;
+                    for (idx, a) in self.octet_app.scene.atoms.iter().enumerate() {
+                        if a.is_multi_center() {
+                            continue;
                         }
-                        if ui
-                            .selectable_label(
-                                self.show_relax_panel,
-                                "📈 Relaxation & Lipari–Szabo S²",
-                            )
-                            .clicked()
-                        {
-                            self.show_relax_panel = true;
-                            self.show_dynamics_panel = false;
-                            self.show_stack1d_panel = false;
+                        let d = (a.x - pm[0]).hypot(a.y - pm[1]);
+                        if d < 0.45 && hit_atom.is_none_or(|(_, best_d)| d < best_d) {
+                            hit_atom = Some((idx, d));
                         }
-                        if ui
-                            .selectable_label(self.show_dynamics_panel, "⚡ CEST / CPMG / CSP & Kd")
-                            .clicked()
-                        {
-                            self.show_dynamics_panel = true;
-                            self.show_relax_panel = false;
-                            self.show_stack1d_panel = false;
-                        }
-                        if ui
-                            .selectable_label(
-                                self.show_stack1d_panel,
-                                "📚 1D Stack / Overlay / Kinetics",
-                            )
-                            .clicked()
-                        {
-                            self.show_stack1d_panel = true;
-                            self.show_relax_panel = false;
-                            self.show_dynamics_panel = false;
-                            if self.stack1d_panel.traces.is_empty() {
-                                let (traces, rois) = build_kinetics_demo_traces();
-                                self.stack1d_panel = Stack1dState::with_traces(traces);
-                                self.stack1d_panel.roi_regions = rois;
-                            }
-                        }
-                    });
-                    ui.separator();
-                    if self.show_relax_panel {
-                        relax_actions = self.relax_panel.ui(
-                            ui,
-                            &self.sequence,
-                            &self.seq_ids,
-                            self.selected_res,
-                            self.loaded_pdb_text.as_deref(),
-                        );
-                    } else if self.show_dynamics_panel {
-                        if self.dynamics_panel.selected_seq_id.is_none() {
-                            if let Some(k) = self.selected_res {
-                                self.dynamics_panel.selected_seq_id =
-                                    Some(self.seq_ids.get(k).copied().unwrap_or((k + 1) as i32));
-                            }
-                        }
-                        dyn_output = Some(self.dynamics_panel.show(ui));
-                    } else if self.show_stack1d_panel {
-                        render_stack1d_panel(ui, &mut self.stack1d_panel);
+                    }
+                    self.octet_app.push_undo();
+                    if let Some((ai, _)) = hit_atom {
+                        let dir = self.octet_app.next_sprout_direction(ai);
+                        let nx = self.octet_app.scene.atoms[ai].x + dir[0];
+                        let ny = self.octet_app.scene.atoms[ai].y + dir[1];
+                        let new_a = self.octet_app.scene.add_atom(SceneAtom::carbon(nx, ny));
+                        let mut sb = SceneBond::new(ai, new_a, BondOrder::Single);
+                        sb.stereo = BondStereo::None;
+                        self.octet_app.scene.add_bond(sb);
                     } else {
-                        self.draw_hsqc_canvas(ui);
+                        let a0 = self
+                            .octet_app
+                            .scene
+                            .add_atom(SceneAtom::carbon(pm[0], pm[1]));
+                        let ang = 30.0_f64.to_radians();
+                        let a1 = self
+                            .octet_app
+                            .scene
+                            .add_atom(SceneAtom::carbon(pm[0] + ang.cos(), pm[1] + ang.sin()));
+                        self.octet_app
+                            .scene
+                            .add_bond(SceneBond::new(a0, a1, BondOrder::Single));
                     }
-                });
-                if !relax_actions.is_empty() {
-                    self.apply_relax_panel_actions(relax_actions);
                 }
-                if let Some(out) = dyn_output {
-                    self.apply_dynamics_panel_output(out);
-                }
-            }
-            WorkspaceMode::OctetChem => {
-                self.octet_app.ui(ui);
-            }
-            WorkspaceMode::Dosy => {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    for action in render_dosy_panel(ui, &mut self.dosy_panel) {
-                        match action {
-                            DosyPanelAction::SelectedPeak { index, ppm } => {
-                                self.status_msg =
-                                    format!("DOSY selected peak #{} at {:.3} ppm", index + 1, ppm);
-                            }
-                            DosyPanelAction::ToggledIlt { enabled } => {
-                                self.status_msg = format!(
-                                    "DOSY Tikhonov ILT {}",
-                                    if enabled { "enabled" } else { "disabled" }
-                                );
-                            }
-                            DosyPanelAction::LoadedDemoMixture => {
-                                self.status_msg =
-                                    "Loaded synthetic 3-species DOSY mixture".to_string();
-                            }
-                        }
-                    }
-                });
-            }
-            WorkspaceMode::Metabolomics => {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    self.metabolomics_panel.ui(ui);
-                });
             }
         }
+        if response.double_clicked() && !multi_touch_active {
+            self.octet_app.fit_camera_to_scene();
+        }
+
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(252, 253, 255));
+
+        let cur_cam = self.octet_app.cam_center_mol;
+        let cur_ppb = self.octet_app.pixels_per_bond.max(1.0);
+        let compiled = compile_scene_primitives(&self.octet_app.scene, &self.octet_app.style);
+        let bond_len_pt = self.octet_app.style.bond_length_pt.max(1.0);
+        let pt_to_scr = |pt: [f64; 2]| -> egui::Pos2 {
+            let raw_x_pt = pt[0] - compiled.shift_x_pt;
+            let raw_y_pt = pt[1] - compiled.shift_y_pt;
+            let xm = raw_x_pt / bond_len_pt;
+            let ym = -raw_y_pt / bond_len_pt;
+            mol_to_screen(xm, ym, cur_cam, cur_ppb)
+        };
+        let pt_scale = cur_ppb / (bond_len_pt as f32);
+        for pr in &compiled.primitives {
+            paint_mobile_octet_primitive(&painter, pr, &pt_to_scr, pt_scale);
+        }
+
+        painter.rect_stroke(
+            rect,
+            3.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
+            egui::StrokeKind::Inside,
+        );
+        rect
+    }
+
+    fn draw_mobile_chem_1d_qnmr(&mut self, ui: &mut egui::Ui) {
+        if self.stack1d_panel.traces.is_empty() {
+            let (traces, rois) = build_kinetics_demo_traces();
+            self.stack1d_panel = Stack1dState::with_traces(traces);
+            self.stack1d_panel.roi_regions = rois;
+        }
+        if let Some(props) = CoreOctetBackendAdapter.compute_properties(&self.octet_app.scene) {
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_rgb(20, 26, 37))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong("qNMR Structure Summary:");
+                        ui.monospace(&props.formula_hill);
+                        ui.monospace(format!("MW {:.2} g/mol", props.molecular_weight));
+                        ui.monospace(format!("Exact {:.4}", props.exact_mass));
+                    });
+                });
+            ui.add_space(4.0);
+        }
+        render_stack1d_panel(ui, &mut self.stack1d_panel);
+    }
+}
+
+impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
+    fn host_workspace_mode(&self) -> HostWorkspaceMode {
+        match self.workspace_mode {
+            WorkspaceMode::ProteinNmr => HostWorkspaceMode::ProteinNmr,
+            WorkspaceMode::OctetChem => HostWorkspaceMode::OctetChem,
+            WorkspaceMode::Dosy => HostWorkspaceMode::Dosy,
+            WorkspaceMode::Metabolomics => HostWorkspaceMode::Metabolomics,
+        }
+    }
+
+    fn set_host_workspace_mode(&mut self, mode: HostWorkspaceMode) {
+        self.workspace_mode = match mode {
+            HostWorkspaceMode::ProteinNmr => WorkspaceMode::ProteinNmr,
+            HostWorkspaceMode::OctetChem => WorkspaceMode::OctetChem,
+            HostWorkspaceMode::Dosy => WorkspaceMode::Dosy,
+            HostWorkspaceMode::Metabolomics => WorkspaceMode::Metabolomics,
+        };
+    }
+
+    fn workspace_readiness(&self) -> WorkspaceReadiness {
+        self.compute_workspace_readiness()
+    }
+
+    fn active_residue_badge(&self) -> Option<String> {
+        if let Some(k) = self.selected_res.filter(|&i| i < self.sequence.len()) {
+            let sid = self.seq_ids.get(k).copied().unwrap_or((k + 1) as i32);
+            Some(format!("{}{}", self.sequence[k], sid))
+        } else if !self.sequence.is_empty() {
+            Some(format!("{} aa", self.sequence.len()))
+        } else {
+            None
+        }
+    }
+
+    fn status_banner_text(&self) -> &str {
+        &self.status_msg
+    }
+
+    fn trigger_builtin_demo(&mut self) {
+        self.load_builtin_demo_suite();
+    }
+
+    fn dispatch_chrome_action(&mut self, ctx: &egui::Context, action: WorkbenchAction) {
+        self.dispatch_workbench_action(ctx, action);
+    }
+
+    fn show_mol3d_dock(&self) -> bool {
+        self.show_mol3d_viewport
+    }
+
+    fn draw_desktop_mode_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        tablet_dock: Option<&mut TabletActiveDock>,
+    ) {
+        self.draw_workspace_mode_header(ui, tablet_dock);
+    }
+
+    fn draw_desktop_status_bar(&mut self, ui: &mut egui::Ui, now_ms: u64) {
+        self.draw_bottom_status_bar(ui, now_ms);
+    }
+
+    fn draw_protein_top_controls_and_ribbon(&mut self, ui: &mut egui::Ui) {
+        self.draw_top_bar(ui);
+        if !self.axis_rescue_notices.is_empty() {
+            ui.add_space(3.0);
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(72, 46, 8))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(234, 179, 8)))
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new("Axis Rescue Applied:")
+                                .strong()
+                                .color(egui::Color32::from_rgb(254, 240, 138)),
+                        );
+                        for msg in &self.axis_rescue_notices {
+                            ui.label(
+                                egui::RichText::new(msg)
+                                    .small()
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(254, 249, 195)),
+                            );
+                        }
+                        ui.checkbox(&mut self.enable_axis_rescue, "Enable Axis Rescue");
+                        if ui.small_button("Dismiss").clicked() {
+                            self.axis_rescue_notices.clear();
+                        }
+                    });
+                });
+        }
+        ui.add_space(4.0);
+        self.draw_sequence_ribbon(ui);
+    }
+
+    fn draw_protein_desktop_central(&mut self, ui: &mut egui::Ui) -> egui::Rect {
+        let mut relax_actions = Vec::new();
+        let mut dyn_output: Option<DynamicsStudioOutput> = None;
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(
+                    !self.show_relax_panel && !self.show_dynamics_panel && !self.show_stack1d_panel,
+                    "🎯 2D HSQC Contours",
+                )
+                .clicked()
+            {
+                self.show_relax_panel = false;
+                self.show_dynamics_panel = false;
+                self.show_stack1d_panel = false;
+            }
+            if ui
+                .selectable_label(self.show_relax_panel, "📈 Relaxation & Lipari–Szabo S²")
+                .clicked()
+            {
+                self.show_relax_panel = true;
+                self.show_dynamics_panel = false;
+                self.show_stack1d_panel = false;
+            }
+            if ui
+                .selectable_label(self.show_dynamics_panel, "⚡ CEST / CPMG / CSP & Kd")
+                .clicked()
+            {
+                self.show_dynamics_panel = true;
+                self.show_relax_panel = false;
+                self.show_stack1d_panel = false;
+            }
+            if ui
+                .selectable_label(self.show_stack1d_panel, "📚 1D Stack / Overlay / Kinetics")
+                .clicked()
+            {
+                self.show_stack1d_panel = true;
+                self.show_relax_panel = false;
+                self.show_dynamics_panel = false;
+                if self.stack1d_panel.traces.is_empty() {
+                    let (traces, rois) = build_kinetics_demo_traces();
+                    self.stack1d_panel = Stack1dState::with_traces(traces);
+                    self.stack1d_panel.roi_regions = rois;
+                }
+            }
+        });
+        ui.separator();
+        let body_avail = ui.available_rect_before_wrap();
+        let viz_rect = if self.show_relax_panel {
+            relax_actions = self.relax_panel.ui(
+                ui,
+                &self.sequence,
+                &self.seq_ids,
+                self.selected_res,
+                self.loaded_pdb_text.as_deref(),
+            );
+            body_avail
+        } else if self.show_dynamics_panel {
+            if self.dynamics_panel.selected_seq_id.is_none() {
+                if let Some(k) = self.selected_res {
+                    self.dynamics_panel.selected_seq_id =
+                        Some(self.seq_ids.get(k).copied().unwrap_or((k + 1) as i32));
+                }
+            }
+            dyn_output = Some(self.dynamics_panel.show(ui));
+            body_avail
+        } else if self.show_stack1d_panel {
+            render_stack1d_panel(ui, &mut self.stack1d_panel);
+            body_avail
+        } else {
+            self.draw_hsqc_canvas(ui)
+        };
+        if !relax_actions.is_empty() {
+            self.apply_relax_panel_actions(relax_actions);
+        }
+        if let Some(out) = dyn_output {
+            self.apply_dynamics_panel_output(out);
+        }
+        viz_rect
+    }
+
+    fn draw_hsqc_2d_view(&mut self, ui: &mut egui::Ui) -> egui::Rect {
+        self.draw_hsqc_canvas(ui)
+    }
+
+    fn draw_strips_inspector_view(&mut self, ui: &mut egui::Ui) {
+        self.draw_right_inspector(ui);
+    }
+
+    fn draw_mol3d_structure_view(&mut self, ui: &mut egui::Ui) -> egui::Rect {
+        let display_ref = self.pred_ref.as_ref().or(self.reference.as_ref());
+        let wgpu_rs = self.wgpu_render_state.clone();
+        let picked = self.mol3d_panel.ui(
+            ui,
+            wgpu_rs.as_ref(),
+            &self.sequence,
+            &self.seq_ids,
+            display_ref,
+        );
+        if let Some(sync) = picked {
+            self.apply_mol3d_sync_action(sync);
+        }
+        self.mol3d_panel
+            .last_canvas_rect
+            .unwrap_or_else(|| ui.min_rect())
+    }
+
+    fn draw_relax_s2_view(&mut self, ui: &mut egui::Ui) {
+        let actions = self.relax_panel.ui(
+            ui,
+            &self.sequence,
+            &self.seq_ids,
+            self.selected_res,
+            self.loaded_pdb_text.as_deref(),
+        );
+        if !actions.is_empty() {
+            self.apply_relax_panel_actions(actions);
+        }
+    }
+
+    fn draw_dynamics_exchange_view(&mut self, ui: &mut egui::Ui) {
+        if self.dynamics_panel.selected_seq_id.is_none() {
+            if let Some(k) = self.selected_res {
+                self.dynamics_panel.selected_seq_id =
+                    Some(self.seq_ids.get(k).copied().unwrap_or((k + 1) as i32));
+            }
+        }
+        let out = self.dynamics_panel.show(ui);
+        self.apply_dynamics_panel_output(out);
+    }
+
+    fn draw_stack1d_view(&mut self, ui: &mut egui::Ui) {
+        if self.stack1d_panel.traces.is_empty() {
+            let (traces, rois) = build_kinetics_demo_traces();
+            self.stack1d_panel = Stack1dState::with_traces(traces);
+            self.stack1d_panel.roi_regions = rois;
+        }
+        render_stack1d_panel(ui, &mut self.stack1d_panel);
+    }
+
+    fn draw_mobile_seq_and_tools_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        readiness: &WorkspaceReadiness,
+    ) -> Vec<WorkbenchAction> {
+        let actions = draw_workflow_stepper(ui, readiness);
+        ui.add_space(4.0);
+        self.draw_sequence_ribbon(ui);
+        ui.add_space(6.0);
+        ui.separator();
+        self.draw_top_bar(ui);
+        actions
+    }
+
+    fn draw_octet_desktop_or_tablet(
+        &mut self,
+        ui: &mut egui::Ui,
+        is_tablet: bool,
+    ) -> (egui::Rect, Option<egui::Rect>, Option<egui::Rect>) {
+        if is_tablet {
+            // Keep at most 1 side dock (`octet_left_tool_palette`) open on TabletSplit
+            self.octet_app.show_right_drawer = false;
+        }
+        let outer = ui.available_rect_before_wrap();
+        self.octet_app.ui(ui);
+        let left_w = 138.0_f32.min(outer.width() * 0.35);
+        let left_rect =
+            egui::Rect::from_min_max(outer.min, egui::pos2(outer.min.x + left_w, outer.max.y));
+        let right_w = if self.octet_app.show_right_drawer {
+            315.0_f32.min(outer.width() * 0.35)
+        } else {
+            0.0
+        };
+        let right_rect = (right_w > 0.0).then(|| {
+            egui::Rect::from_min_max(egui::pos2(outer.max.x - right_w, outer.min.y), outer.max)
+        });
+        let central_rect = egui::Rect::from_min_max(
+            egui::pos2(outer.min.x + left_w, outer.min.y),
+            egui::pos2(outer.max.x - right_w, outer.max.y),
+        );
+        (central_rect, Some(left_rect), right_rect)
+    }
+
+    fn draw_mobile_octet_2d_view(&mut self, ui: &mut egui::Ui) -> egui::Rect {
+        self.draw_mobile_octet_2d_canvas(ui)
+    }
+
+    fn draw_mobile_chem_1d_qnmr_view(&mut self, ui: &mut egui::Ui) {
+        self.draw_mobile_chem_1d_qnmr(ui);
+    }
+
+    fn draw_dosy_view(&mut self, ui: &mut egui::Ui) {
+        for action in render_dosy_panel(ui, &mut self.dosy_panel) {
+            match action {
+                DosyPanelAction::SelectedPeak { index, ppm } => {
+                    self.status_msg =
+                        format!("DOSY selected peak #{} at {:.3} ppm", index + 1, ppm);
+                }
+                DosyPanelAction::ToggledIlt { enabled } => {
+                    self.status_msg = format!(
+                        "DOSY Tikhonov ILT {}",
+                        if enabled { "enabled" } else { "disabled" }
+                    );
+                }
+                DosyPanelAction::LoadedDemoMixture => {
+                    self.status_msg = "Loaded synthetic 3-species DOSY mixture".to_string();
+                }
+            }
+        }
+    }
+
+    fn draw_metabolomics_view(&mut self, ui: &mut egui::Ui) {
+        self.metabolomics_panel.ui(ui);
     }
 }
 
@@ -7782,11 +8450,13 @@ impl NmrWorkbenchApp {
             return;
         }
         let mut open = self.show_mcp_bridge_window;
+        let max_modal_w = (ctx.content_rect().width() - 16.0).max(240.0);
         let mut panel_resp = None;
         egui::Window::new("🔌 MCP Live Workbench Bridge")
             .open(&mut open)
             .resizable(true)
-            .default_width(520.0)
+            .default_width(520.0_f32.min(max_modal_w))
+            .max_width(max_modal_w)
             .show(ctx, |ui| {
                 panel_resp = Some(render_mcp_bridge_panel(ui, &mut self.mcp_bridge));
             });
@@ -7814,7 +8484,7 @@ fn main() -> eframe::Result {
                 nmr_core::VERSION
             ))
             .with_inner_size([1380.0, 860.0])
-            .with_min_inner_size([960.0, 620.0]),
+            .with_min_inner_size([360.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -8497,6 +9167,283 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             m.accuracy() >= 0.90,
             "expected >=90% GUI Bayes-SA accuracy on synthetic ubiquitin, got {:.3}",
             m.accuracy()
+        );
+    }
+
+    #[test]
+    fn test_nmr_workbench_app_responsive_mobile_tablet_desktop_and_touch() {
+        use super::*;
+        use nmr_gui::workflow_bar::{
+            MobileChemTab, MobileDynamicsSubTab, MobileProteinTab, MobileWorkspaceFamily,
+            ResponsiveBreakpoint, TabletActiveDock,
+        };
+
+        let mut octet_app = OctetDrawPanel::new();
+        octet_app.set_backend_adapter(Box::new(CoreOctetBackendAdapter));
+        let mut app = NmrWorkbenchApp {
+            workspace_mode: WorkspaceMode::ProteinNmr,
+            octet_app,
+            dosy_panel: DosyPanelState::default(),
+            metabolomics_panel: MetabolomicsStudioPanel::new(),
+            solver_kind: GuiSolverKind::default(),
+            regime_kind: GuiRegimeKind::default(),
+            metal_ligands_input: String::new(),
+            idp_temp_k: 298.15,
+            idp_ph_input: "6.5".to_string(),
+            c13_picked_dataset: None,
+            propensity_report: None,
+            show_propensity_panel: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            use_gpu: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            gpu_engine: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            bayes_gpu_solver: None,
+            use_neural_picker: true,
+            enable_axis_rescue: true,
+            axis_rescue_notices: Vec::new(),
+            axis_rescue_audits: Vec::new(),
+            adapter_label: None,
+            status_msg: String::new(),
+            last_solve_ms: None,
+            last_bayes_sa_telemetry: None,
+            priors: Priors::provisional(),
+            sidechain_priors: SidechainPriors::empirical_bmrb(),
+            reference: None,
+            sequence: Vec::new(),
+            seq_ids: Vec::new(),
+            peaks: Vec::new(),
+            truth: None,
+            systems: Vec::new(),
+            u_mat: None,
+            p_mat: None,
+            assign_res: None,
+            pred_ref: None,
+            pred_conf: BTreeMap::new(),
+            pred_ambiguity_codes: BTreeMap::new(),
+            metrics: None,
+            sidechain_ribbon_state: SequenceRibbonState::new(),
+            show_sidechain_inspector: false,
+            overwrite_curated_rings: false,
+            mol3d_panel: Mol3dViewerPanel::new(),
+            show_mol3d_viewport: true,
+            loaded_pdb_text: None,
+            relax_panel: RelaxPanelState::new(),
+            show_relax_panel: false,
+            dynamics_panel: DynamicsStudioPanel::new(),
+            show_dynamics_panel: false,
+            stack1d_panel: Stack1dState::default(),
+            show_stack1d_panel: false,
+            hsqc_spec: None,
+            hsqc_arc: Arc::new(Vec::new()),
+            hsqc_gen: 1,
+            hncacb_3d: None,
+            hnco_3d: None,
+            extra_3d_count: 0,
+            overlay_layers: Vec::new(),
+            primary_ppm_nudge: [0.0, 0.0],
+            next_layer_id: 2,
+            active_overlay_idx: 0,
+            ingest_panel: IngestPanelState::default(),
+            command_palette: CommandPalette::new(),
+            chord_dispatcher: ChordDispatcher::new(),
+            session: WorkbenchSessionController::default(),
+            crosshair: SyncCrosshair::default(),
+            strip_tiler: StripTilerPanel::new(),
+            use_match_finder_strips: true,
+            qc_report: None,
+            raw_fids_total: 0,
+            unprocessed_fids_remaining: 0,
+            has_structure_or_dynamics: false,
+            exported_in_session: false,
+            show_contour_modal: false,
+            show_overlay_manager: false,
+            show_assign_popover: false,
+            show_qc_modal: false,
+            show_about_modal: false,
+            mcp_bridge: McpBridgeState::default(),
+            show_mcp_bridge_window: false,
+            mcp_last_viewport_key: (0, 0, 0, -1),
+            assign_target_res: 0,
+            assign_lock_check: true,
+            view_h_left: 10.4,
+            view_h_right: 6.1,
+            view_n_top: 103.0,
+            view_n_bottom: 135.0,
+            contour_base: 8.5,
+            contour_factor: 1.42,
+            contour_levels: 10,
+            show_negative: true,
+            show_peak_labels: true,
+            replicas: 8,
+            steps_per_sys: 400,
+            assign_cost: 0.0,
+            sim_missing: 0.06,
+            sim_spurious: 0.04,
+            sim_seed: 0,
+            picker_snr: 5.0,
+            selected_ss: None,
+            selected_res: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            path_input: "data/fixtures/synthetic_ubiquitin.str".to_string(),
+            #[cfg(not(target_arch = "wasm32"))]
+            export_prefix: "result_gui".to_string(),
+            show_text_io_modal: false,
+            paste_text_buf: String::new(),
+            export_text_buf: String::new(),
+            responsive_shell: ResponsiveShellState::new(),
+            wgpu_render_state: None,
+            suppress_hsqc_pan_until_release: false,
+            suppress_octet_pan_until_release: false,
+            #[cfg(target_arch = "wasm32")]
+            pending_drop_outcome: Arc::new(std::sync::Mutex::new(None)),
+        };
+        app.load_builtin_demo_suite();
+        let mol_pep = nmr_core::octet_mol::build_peptide_2d("APY").expect("APY peptide");
+        app.octet_app.scene = RenderScene::from(&mol_pep);
+
+        let ctx = egui::Context::default();
+        let run_app_frame = |ctx: &egui::Context,
+                             w: f32,
+                             h: f32,
+                             events: Vec<egui::Event>,
+                             app: &mut NmrWorkbenchApp| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w, h),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut metrics_out = None;
+            let _ = ctx.run_ui(raw, |ui| {
+                let mut shell = std::mem::take(&mut app.responsive_shell);
+                metrics_out = Some(render_responsive_workbench(ui, 100, &mut shell, app));
+                app.responsive_shell = shell;
+            });
+            metrics_out.expect("frame rendered")
+        };
+
+        for (w, h) in [(375.0_f32, 667.0_f32), (390.0, 844.0), (412.0, 915.0)] {
+            app.responsive_shell.mobile_family = MobileWorkspaceFamily::ProteinNmr;
+            for tab in MobileProteinTab::ALL {
+                app.responsive_shell.protein_tab = tab;
+                if tab == MobileProteinTab::Dynamics1d {
+                    for sub in MobileDynamicsSubTab::ALL {
+                        app.responsive_shell.dynamics_sub_tab = sub;
+                        let m = run_app_frame(&ctx, w, h, Vec::new(), &mut app);
+                        assert_eq!(m.breakpoint, ResponsiveBreakpoint::CompactMobile);
+                        assert!(m.left_dock_rect.is_none() && m.right_dock_rect.is_none());
+                        assert!(m.active_viz_rect.width() >= 340.0);
+                        assert!(m.active_viz_rect.height() >= 430.0);
+                    }
+                } else {
+                    let m = run_app_frame(&ctx, w, h, Vec::new(), &mut app);
+                    assert_eq!(m.breakpoint, ResponsiveBreakpoint::CompactMobile);
+                    assert!(m.left_dock_rect.is_none() && m.right_dock_rect.is_none());
+                    assert!(m.active_viz_rect.width() >= 340.0);
+                    assert!(m.active_viz_rect.height() >= 430.0);
+                }
+            }
+
+            app.responsive_shell.mobile_family = MobileWorkspaceFamily::ChemStudio;
+            for ctab in MobileChemTab::ALL {
+                app.responsive_shell.chem_tab = ctab;
+                let m = run_app_frame(&ctx, w, h, Vec::new(), &mut app);
+                assert_eq!(m.breakpoint, ResponsiveBreakpoint::CompactMobile);
+                assert!(m.left_dock_rect.is_none() && m.right_dock_rect.is_none());
+                assert!(m.active_viz_rect.width() >= 340.0);
+                assert!(m.active_viz_rect.height() >= 430.0);
+            }
+        }
+
+        // Tablet 768x1024: single dock max + CentralPanel >= 420 px
+        app.workspace_mode = WorkspaceMode::ProteinNmr;
+        app.responsive_shell.tablet_dock = TabletActiveDock::StripsRight;
+        let mt = run_app_frame(&ctx, 768.0, 1024.0, Vec::new(), &mut app);
+        assert_eq!(mt.breakpoint, ResponsiveBreakpoint::TabletSplit);
+        assert!(mt.left_dock_rect.is_none() && mt.right_dock_rect.is_some());
+        assert!(mt.central_panel_rect.width() >= 420.0);
+
+        // Desktop 1440x900: dual docks preserved
+        let md = run_app_frame(&ctx, 1440.0, 900.0, Vec::new(), &mut app);
+        assert_eq!(md.breakpoint, ResponsiveBreakpoint::DesktopFull);
+        assert!(md.left_dock_rect.is_some() && md.right_dock_rect.is_some());
+
+        // Live 2-finger pinch zoom on NmrWorkbenchApp's own `draw_hsqc_canvas`
+        app.responsive_shell.mobile_family = MobileWorkspaceFamily::ProteinNmr;
+        app.responsive_shell.protein_tab = MobileProteinTab::Contours2d;
+        let m0 = run_app_frame(&ctx, 390.0, 844.0, Vec::new(), &mut app);
+        let c = m0.active_viz_rect.center();
+        let h_span_before = app.view_h_left - app.view_h_right;
+        let d0 = egui::TouchDeviceId(99);
+        let t1 = egui::TouchId(1);
+        let t2 = egui::TouchId(2);
+        let p1 = egui::pos2(c.x - 25.0, c.y - 25.0);
+        let p2 = egui::pos2(c.x + 25.0, c.y + 25.0);
+        let _ = run_app_frame(
+            &ctx,
+            390.0,
+            844.0,
+            vec![egui::Event::PointerMoved(p1)],
+            &mut app,
+        );
+        let _ = run_app_frame(
+            &ctx,
+            390.0,
+            844.0,
+            vec![
+                egui::Event::PointerButton {
+                    pos: p1,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Touch {
+                    device_id: d0,
+                    id: t1,
+                    phase: egui::TouchPhase::Start,
+                    pos: p1,
+                    force: None,
+                },
+                egui::Event::Touch {
+                    device_id: d0,
+                    id: t2,
+                    phase: egui::TouchPhase::Start,
+                    pos: p2,
+                    force: None,
+                },
+            ],
+            &mut app,
+        );
+        let _ = run_app_frame(
+            &ctx,
+            390.0,
+            844.0,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(c.x - 60.0, c.y - 60.0)),
+                egui::Event::Touch {
+                    device_id: d0,
+                    id: t1,
+                    phase: egui::TouchPhase::Move,
+                    pos: egui::pos2(c.x - 60.0, c.y - 60.0),
+                    force: None,
+                },
+                egui::Event::Touch {
+                    device_id: d0,
+                    id: t2,
+                    phase: egui::TouchPhase::Move,
+                    pos: egui::pos2(c.x + 60.0, c.y + 60.0),
+                    force: None,
+                },
+            ],
+            &mut app,
+        );
+        let h_span_after = app.view_h_left - app.view_h_right;
+        assert!(
+            h_span_after < h_span_before * 0.70,
+            "NmrWorkbenchApp 2D HSQC pinch zoom must zoom in (before {h_span_before:.3}, after {h_span_after:.3})"
         );
     }
 }

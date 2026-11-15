@@ -1949,6 +1949,31 @@ impl ArcballCamera {
         self.distance = (self.distance * factor).clamp(2.5, 2500.0);
     }
 
+    /// Apply a two-finger multi-touch gesture (`zoom_delta > 1.0` pinches IN / brings camera
+    /// closer, `zoom_delta < 1.0` pinches OUT / moves camera farther; `translation_delta` pans
+    /// view-space XY without rotating the Shoemake arcball).
+    pub fn apply_multi_touch(
+        &mut self,
+        zoom_delta: f32,
+        translation_delta: [f32; 2],
+        viewport_height_px: f64,
+    ) {
+        if zoom_delta.is_finite() && zoom_delta > 0.0 && (zoom_delta - 1.0).abs() > 1e-4 {
+            let factor = 1.0 / f64::from(zoom_delta.clamp(0.20, 5.0));
+            self.zoom_by(factor);
+        }
+        if translation_delta[0].is_finite()
+            && translation_delta[1].is_finite()
+            && (translation_delta[0].abs() > 1e-4 || translation_delta[1].abs() > 1e-4)
+        {
+            self.drag_pan(
+                f64::from(translation_delta[0]),
+                f64::from(translation_delta[1]),
+                viewport_height_px,
+            );
+        }
+    }
+
     #[inline]
     pub fn ortho_half_height(&self) -> f64 {
         (self.distance * (0.5 * self.fov_y_rad).tan()).max(0.5)
@@ -4315,6 +4340,9 @@ pub struct Mol3dViewerPanel {
     pub paste_restraints_buf: String,
     pub last_exported_svg: Option<String>,
     pub last_exported_png_bytes: Option<Vec<u8>>,
+    pub show_mobile_options: bool,
+    pub last_canvas_rect: Option<egui::Rect>,
+    suppress_single_drag_until_release: bool,
     next_scene_gen: u64,
     scene_dirty: bool,
     putty_only_dirty: bool,
@@ -4345,6 +4373,9 @@ impl Mol3dViewerPanel {
             paste_restraints_buf: String::new(),
             last_exported_svg: None,
             last_exported_png_bytes: None,
+            show_mobile_options: false,
+            last_canvas_rect: None,
+            suppress_single_drag_until_release: false,
             next_scene_gen: 1,
             scene_dirty: false,
             putty_only_dirty: false,
@@ -4580,236 +4611,329 @@ impl Mol3dViewerPanel {
         ref_data: Option<&Reference>,
     ) -> Option<Mol3dSyncAction> {
         let mut emitted_sync: Option<Mol3dSyncAction> = None;
+        let is_compact_mobile = ui.ctx().content_rect().width() < 680.0;
 
-        // Top compact control strip 1: Representation, Projection, Load/Paste, Fit, PNG/SVG export
-        ui.horizontal_wrapped(|ui| {
-            ui.strong("3D Structure");
-            egui::ComboBox::from_id_salt("mol3d_repr_combo")
-                .selected_text(self.scene_cfg.style.label())
-                .width(138.0)
-                .show_ui(ui, |ui| {
-                    for style in RepresentationStyle::ALL {
-                        if ui
-                            .selectable_value(&mut self.scene_cfg.style, style, style.label())
-                            .changed()
-                        {
-                            self.scene_dirty = true;
-                        }
-                    }
-                });
-
-            let proj_btn = match self.camera.projection {
-                ProjectionMode::Perspective => "Persp",
-                ProjectionMode::Orthographic => "Ortho",
-            };
-            if ui
-                .button(proj_btn)
-                .on_hover_text("Toggle Perspective / Orthographic camera projection")
-                .clicked()
-            {
-                self.camera.projection = match self.camera.projection {
-                    ProjectionMode::Perspective => ProjectionMode::Orthographic,
-                    ProjectionMode::Orthographic => ProjectionMode::Perspective,
-                };
-            }
-
-            if ui
-                .button("Fit")
-                .on_hover_text("Reset view & Z-slab around loaded structure")
-                .clicked()
-            {
-                if let Some(ens) = self.ensemble.as_ref() {
-                    self.camera.fit_ensemble(ens);
-                }
-            }
-
-            if ui
-                .button("Paste PDB/CIF")
-                .on_hover_text("Paste .pdb / .cif coordinates or NOE/PRE restraints")
-                .clicked()
-            {
-                self.show_paste_modal = !self.show_paste_modal;
-            }
-
-            #[cfg(not(target_arch = "wasm32"))]
-            if ui
-                .button("PNG")
-                .on_hover_text("Export high-DPI offscreen 4x MSAA PNG snapshot")
-                .clicked()
-            {
-                if let Some(rs) = wgpu_render_state {
-                    let mut renderer = rs.renderer.write();
-                    if let Some(res) = renderer
-                        .callback_resources
-                        .get_mut::<Mol3dPipelineResource>()
-                    {
-                        self.flush_pending_updates();
-                        let uni = self.camera.to_gpu_uniforms(1600.0, 1200.0, DEFAULT_BG_RGBA);
-                        match res.export_offscreen_png(
-                            &rs.device,
-                            &rs.queue,
-                            1600,
-                            1200,
-                            &uni,
-                            &self.scene,
-                        ) {
-                            Ok(png) => {
-                                let out_path = std::env::temp_dir().join("nmr_structure_3d.png");
-                                match write_mol3d_export_file(&out_path, &png, "PNG") {
-                                    Ok(()) => {
-                                        self.last_exported_png_bytes = Some(png);
-                                        self.status_banner = format!(
-                                            "Exported 1600x1200 PNG ({})",
-                                            out_path.display()
-                                        );
-                                    }
-                                    Err(err) => {
-                                        self.status_banner = err;
+        if is_compact_mobile {
+            egui::ScrollArea::horizontal()
+                .id_salt("mol3d_compact_mobile_bar")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(34.0);
+                        egui::ComboBox::from_id_salt("mol3d_repr_combo_mobile")
+                            .selected_text(self.scene_cfg.style.label())
+                            .width(114.0)
+                            .show_ui(ui, |ui| {
+                                for style in RepresentationStyle::ALL {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.scene_cfg.style,
+                                            style,
+                                            style.label(),
+                                        )
+                                        .changed()
+                                    {
+                                        self.scene_dirty = true;
                                     }
                                 }
+                            });
+
+                        egui::ComboBox::from_id_salt("mol3d_track_combo_mobile")
+                            .selected_text(self.track_data.active_track.label())
+                            .width(124.0)
+                            .show_ui(ui, |ui| {
+                                for trk in QuantitativeTrack::ALL {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.track_data.active_track,
+                                            trk,
+                                            trk.label(),
+                                        )
+                                        .changed()
+                                    {
+                                        self.track_data.colormap = trk.default_colormap();
+                                        self.putty_only_dirty = true;
+                                    }
+                                }
+                            });
+
+                        let putty_btn = egui::Button::new("Putty")
+                            .selected(self.track_data.putty_enabled)
+                            .min_size(egui::vec2(52.0, 34.0));
+                        if ui.add(putty_btn).clicked() {
+                            self.track_data.putty_enabled = !self.track_data.putty_enabled;
+                            self.putty_only_dirty = true;
+                        }
+
+                        let proj_btn = match self.camera.projection {
+                            ProjectionMode::Perspective => "Persp",
+                            ProjectionMode::Orthographic => "Ortho",
+                        };
+                        if ui
+                            .add(egui::Button::new(proj_btn).min_size(egui::vec2(52.0, 34.0)))
+                            .clicked()
+                        {
+                            self.camera.projection = match self.camera.projection {
+                                ProjectionMode::Perspective => ProjectionMode::Orthographic,
+                                ProjectionMode::Orthographic => ProjectionMode::Perspective,
+                            };
+                        }
+
+                        if ui
+                            .add(egui::Button::new("Fit").min_size(egui::vec2(44.0, 34.0)))
+                            .clicked()
+                        {
+                            if let Some(ens) = self.ensemble.as_ref() {
+                                self.camera.fit_ensemble(ens);
                             }
-                            Err(err) => {
-                                self.status_banner = format!("PNG export failed: {err}");
+                        }
+
+                        let more_btn = egui::Button::new("⚙")
+                            .selected(self.show_mobile_options)
+                            .min_size(egui::vec2(36.0, 34.0));
+                        if ui.add(more_btn).clicked() {
+                            self.show_mobile_options = !self.show_mobile_options;
+                        }
+                    });
+                });
+        }
+
+        // Top compact control strip 1 & 2 (always shown on Desktop/Tablet; expandable via ⚙ on CompactMobile)
+        if !is_compact_mobile || self.show_mobile_options {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("3D Structure");
+                egui::ComboBox::from_id_salt("mol3d_repr_combo")
+                    .selected_text(self.scene_cfg.style.label())
+                    .width(138.0)
+                    .show_ui(ui, |ui| {
+                        for style in RepresentationStyle::ALL {
+                            if ui
+                                .selectable_value(&mut self.scene_cfg.style, style, style.label())
+                                .changed()
+                            {
+                                self.scene_dirty = true;
                             }
+                        }
+                    });
+
+                let proj_btn = match self.camera.projection {
+                    ProjectionMode::Perspective => "Persp",
+                    ProjectionMode::Orthographic => "Ortho",
+                };
+                if ui
+                    .button(proj_btn)
+                    .on_hover_text("Toggle Perspective / Orthographic camera projection")
+                    .clicked()
+                {
+                    self.camera.projection = match self.camera.projection {
+                        ProjectionMode::Perspective => ProjectionMode::Orthographic,
+                        ProjectionMode::Orthographic => ProjectionMode::Perspective,
+                    };
+                }
+
+                if ui
+                    .button("Fit")
+                    .on_hover_text("Reset view & Z-slab around loaded structure")
+                    .clicked()
+                {
+                    if let Some(ens) = self.ensemble.as_ref() {
+                        self.camera.fit_ensemble(ens);
+                    }
+                }
+
+                if ui
+                    .button("Paste PDB/CIF")
+                    .on_hover_text("Paste .pdb / .cif coordinates or NOE/PRE restraints")
+                    .clicked()
+                {
+                    self.show_paste_modal = !self.show_paste_modal;
+                }
+
+                #[cfg(not(target_arch = "wasm32"))]
+                if ui
+                    .button("PNG")
+                    .on_hover_text("Export high-DPI offscreen 4x MSAA PNG snapshot")
+                    .clicked()
+                {
+                    if let Some(rs) = wgpu_render_state {
+                        let mut renderer = rs.renderer.write();
+                        if let Some(res) = renderer
+                            .callback_resources
+                            .get_mut::<Mol3dPipelineResource>()
+                        {
+                            self.flush_pending_updates();
+                            let uni = self.camera.to_gpu_uniforms(1600.0, 1200.0, DEFAULT_BG_RGBA);
+                            match res.export_offscreen_png(
+                                &rs.device,
+                                &rs.queue,
+                                1600,
+                                1200,
+                                &uni,
+                                &self.scene,
+                            ) {
+                                Ok(png) => {
+                                    let out_path =
+                                        std::env::temp_dir().join("nmr_structure_3d.png");
+                                    match write_mol3d_export_file(&out_path, &png, "PNG") {
+                                        Ok(()) => {
+                                            self.last_exported_png_bytes = Some(png);
+                                            self.status_banner = format!(
+                                                "Exported 1600x1200 PNG ({})",
+                                                out_path.display()
+                                            );
+                                        }
+                                        Err(err) => {
+                                            self.status_banner = err;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    self.status_banner = format!("PNG export failed: {err}");
+                                }
+                            }
+                        } else {
+                            self.status_banner =
+                                "PNG export failed: 3D GPU pipeline unavailable".to_string();
                         }
                     } else {
                         self.status_banner =
-                            "PNG export failed: 3D GPU pipeline unavailable".to_string();
-                    }
-                } else {
-                    self.status_banner =
-                        "PNG export failed: WebGPU render state unavailable".to_string();
-                }
-            }
-
-            if ui
-                .button("SVG")
-                .on_hover_text("Export deterministic XML-escaped vector SVG")
-                .clicked()
-            {
-                if let Some(ens) = self.ensemble.as_ref() {
-                    let svg = export_structure_svg(
-                        ens,
-                        &self.camera,
-                        &self.scene_cfg,
-                        &self.track_data,
-                        Some(&self.restraint_overlay),
-                        1200,
-                        900,
-                    );
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        let out_path = std::env::temp_dir().join("nmr_structure_3d.svg");
-                        match write_mol3d_export_file(&out_path, svg.as_bytes(), "SVG") {
-                            Ok(()) => {
-                                ui.ctx().copy_text(svg.clone());
-                                self.last_exported_svg = Some(svg);
-                                self.status_banner = format!(
-                                    "Exported vector SVG ({}, copied to clipboard).",
-                                    out_path.display()
-                                );
-                            }
-                            Err(err) => {
-                                self.status_banner = err;
-                            }
-                        }
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        ui.ctx().copy_text(svg.clone());
-                        self.last_exported_svg = Some(svg);
-                        self.status_banner =
-                            "Exported vector SVG (copied to clipboard).".to_string();
+                            "PNG export failed: WebGPU render state unavailable".to_string();
                     }
                 }
-            }
-        });
 
-        // Control strip 2: Quantitative Putty / Colormap Track + Ensemble & Z-Slab sliders
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Color:");
-            egui::ComboBox::from_id_salt("mol3d_track_combo")
-                .selected_text(self.track_data.active_track.label())
-                .width(150.0)
-                .show_ui(ui, |ui| {
-                    for trk in QuantitativeTrack::ALL {
-                        if ui
-                            .selectable_value(&mut self.track_data.active_track, trk, trk.label())
-                            .changed()
+                if ui
+                    .button("SVG")
+                    .on_hover_text("Export deterministic XML-escaped vector SVG")
+                    .clicked()
+                {
+                    if let Some(ens) = self.ensemble.as_ref() {
+                        let svg = export_structure_svg(
+                            ens,
+                            &self.camera,
+                            &self.scene_cfg,
+                            &self.track_data,
+                            Some(&self.restraint_overlay),
+                            1200,
+                            900,
+                        );
+                        #[cfg(not(target_arch = "wasm32"))]
                         {
-                            self.track_data.colormap = trk.default_colormap();
-                            self.putty_only_dirty = true;
+                            let out_path = std::env::temp_dir().join("nmr_structure_3d.svg");
+                            match write_mol3d_export_file(&out_path, svg.as_bytes(), "SVG") {
+                                Ok(()) => {
+                                    ui.ctx().copy_text(svg.clone());
+                                    self.last_exported_svg = Some(svg);
+                                    self.status_banner = format!(
+                                        "Exported vector SVG ({}, copied to clipboard).",
+                                        out_path.display()
+                                    );
+                                }
+                                Err(err) => {
+                                    self.status_banner = err;
+                                }
+                            }
+                        }
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            ui.ctx().copy_text(svg.clone());
+                            self.last_exported_svg = Some(svg);
+                            self.status_banner =
+                                "Exported vector SVG (copied to clipboard).".to_string();
                         }
                     }
-                });
+                }
+            });
 
-            if self.track_data.active_track != QuantitativeTrack::SecondaryStructure {
-                egui::ComboBox::from_id_salt("mol3d_cmap_combo")
-                    .selected_text(self.track_data.colormap.label())
-                    .width(112.0)
+            // Control strip 2: Quantitative Putty / Colormap Track + Ensemble & Z-Slab sliders
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Color:");
+                egui::ComboBox::from_id_salt("mol3d_track_combo")
+                    .selected_text(self.track_data.active_track.label())
+                    .width(150.0)
                     .show_ui(ui, |ui| {
-                        for cm in ColormapKind::ALL {
+                        for trk in QuantitativeTrack::ALL {
                             if ui
-                                .selectable_value(&mut self.track_data.colormap, cm, cm.label())
+                                .selectable_value(
+                                    &mut self.track_data.active_track,
+                                    trk,
+                                    trk.label(),
+                                )
                                 .changed()
                             {
+                                self.track_data.colormap = trk.default_colormap();
                                 self.putty_only_dirty = true;
                             }
                         }
                     });
-            }
 
-            if ui
-                .checkbox(&mut self.track_data.putty_enabled, "Putty")
-                .on_hover_text("Scale ribbon tube radius by the active quantitative NMR track")
-                .changed()
-            {
-                self.putty_only_dirty = true;
-            }
+                if self.track_data.active_track != QuantitativeTrack::SecondaryStructure {
+                    egui::ComboBox::from_id_salt("mol3d_cmap_combo")
+                        .selected_text(self.track_data.colormap.label())
+                        .width(112.0)
+                        .show_ui(ui, |ui| {
+                            for cm in ColormapKind::ALL {
+                                if ui
+                                    .selectable_value(&mut self.track_data.colormap, cm, cm.label())
+                                    .changed()
+                                {
+                                    self.putty_only_dirty = true;
+                                }
+                            }
+                        });
+                }
 
-            if self.ensemble.as_ref().is_some_and(|e| e.models.len() > 1) {
                 if ui
-                    .checkbox(&mut self.scene_cfg.show_all_ensemble_models, "Bundle")
+                    .checkbox(&mut self.track_data.putty_enabled, "Putty")
+                    .on_hover_text("Scale ribbon tube radius by the active quantitative NMR track")
                     .changed()
                 {
-                    self.scene_dirty = true;
+                    self.putty_only_dirty = true;
                 }
-                if self.scene_cfg.show_all_ensemble_models
-                    && ui
-                        .add(
-                            egui::Slider::new(
-                                &mut self.scene_cfg.ensemble_bundle_opacity,
-                                0.08..=0.85,
-                            )
-                            .text("α"),
-                        )
-                        .changed()
-                {
-                    self.scene_dirty = true;
-                }
-            }
 
-            ui.label("Slab:");
-            let mut near_f = self.camera.slab_near_offset as f32;
-            let mut far_f = self.camera.slab_far_offset as f32;
-            if ui
-                .add(egui::DragValue::new(&mut near_f).speed(0.5).prefix("N "))
-                .changed()
-            {
-                self.camera.slab_near_offset =
-                    (near_f as f64).min(self.camera.slab_far_offset - 1.0);
-            }
-            if ui
-                .add(egui::DragValue::new(&mut far_f).speed(0.5).prefix("F "))
-                .changed()
-            {
-                self.camera.slab_far_offset =
-                    (far_f as f64).max(self.camera.slab_near_offset + 1.0);
-            }
-        });
+                if self.ensemble.as_ref().is_some_and(|e| e.models.len() > 1) {
+                    if ui
+                        .checkbox(&mut self.scene_cfg.show_all_ensemble_models, "Bundle")
+                        .changed()
+                    {
+                        self.scene_dirty = true;
+                    }
+                    if self.scene_cfg.show_all_ensemble_models
+                        && ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut self.scene_cfg.ensemble_bundle_opacity,
+                                    0.08..=0.85,
+                                )
+                                .text("α"),
+                            )
+                            .changed()
+                    {
+                        self.scene_dirty = true;
+                    }
+                }
+
+                ui.label("Slab:");
+                let mut near_f = self.camera.slab_near_offset as f32;
+                let mut far_f = self.camera.slab_far_offset as f32;
+                if ui
+                    .add(egui::DragValue::new(&mut near_f).speed(0.5).prefix("N "))
+                    .changed()
+                {
+                    self.camera.slab_near_offset =
+                        (near_f as f64).min(self.camera.slab_far_offset - 1.0);
+                }
+                if ui
+                    .add(egui::DragValue::new(&mut far_f).speed(0.5).prefix("F "))
+                    .changed()
+                {
+                    self.camera.slab_far_offset =
+                        (far_f as f64).max(self.camera.slab_near_offset + 1.0);
+                }
+            });
+        }
 
         // Control strip 3: NOE/PRE Restraints filter bar when restraints are loaded
-        if !self.restraints.is_empty() {
+        if !self.restraints.is_empty() && (!is_compact_mobile || self.show_mobile_options) {
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .checkbox(&mut self.restraint_filter.enabled, "NOE/PRE")
@@ -4897,33 +5021,62 @@ impl Mol3dViewerPanel {
         let avail = ui.available_size();
         let canvas_size = egui::vec2(avail.x.max(120.0), (avail.y - 20.0).max(160.0));
         let (rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
+        self.last_canvas_rect = Some(rect);
 
-        // Arcball rotation (primary drag), XY pan (secondary / Shift+drag), scroll zoom
-        if response.dragged_by(egui::PointerButton::Primary) {
-            let delta = response.drag_delta();
-            let shift = ui.input(|i| i.modifiers.shift);
-            if shift {
-                self.camera
-                    .drag_pan(delta.x as f64, delta.y as f64, rect.height() as f64);
-            } else if let Some(pos) = response.interact_pointer_pos() {
-                let prev = pos - delta;
-                let to_ndc = |p: egui::Pos2| -> [f64; 2] {
-                    [
-                        (2.0 * ((p.x - rect.left()) / rect.width().max(1.0)) - 1.0) as f64,
-                        (1.0 - 2.0 * ((p.y - rect.top()) / rect.height().max(1.0))) as f64,
-                    ]
-                };
-                self.camera.drag_arcball(to_ndc(prev), to_ndc(pos));
-            }
-        } else if response.dragged_by(egui::PointerButton::Secondary)
-            || response.dragged_by(egui::PointerButton::Middle)
-        {
-            let delta = response.drag_delta();
-            self.camera
-                .drag_pan(delta.x as f64, delta.y as f64, rect.height() as f64);
+        if !ui.input(|i| i.pointer.any_down()) {
+            self.suppress_single_drag_until_release = false;
         }
 
-        if response.hovered() {
+        // Two-finger multi-touch pinch-to-zoom & translation pan (isolated from 1-finger orbit)
+        let multi_touch_active = if let Some(mt) = ui.ctx().input(|i| i.multi_touch()) {
+            if mt.num_touches >= 2
+                && (rect.contains(mt.start_pos)
+                    || rect.contains(mt.center_pos)
+                    || response.hovered()
+                    || response.is_pointer_button_down_on())
+            {
+                self.suppress_single_drag_until_release = true;
+                self.camera.apply_multi_touch(
+                    mt.zoom_delta,
+                    [mt.translation_delta.x, mt.translation_delta.y],
+                    rect.height() as f64,
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Arcball rotation (primary drag), XY pan (secondary / Shift+drag), scroll zoom
+        if !multi_touch_active && !self.suppress_single_drag_until_release {
+            if response.dragged_by(egui::PointerButton::Primary) {
+                let delta = response.drag_delta();
+                let shift = ui.input(|i| i.modifiers.shift);
+                if shift {
+                    self.camera
+                        .drag_pan(delta.x as f64, delta.y as f64, rect.height() as f64);
+                } else if let Some(pos) = response.interact_pointer_pos() {
+                    let prev = pos - delta;
+                    let to_ndc = |p: egui::Pos2| -> [f64; 2] {
+                        [
+                            (2.0 * ((p.x - rect.left()) / rect.width().max(1.0)) - 1.0) as f64,
+                            (1.0 - 2.0 * ((p.y - rect.top()) / rect.height().max(1.0))) as f64,
+                        ]
+                    };
+                    self.camera.drag_arcball(to_ndc(prev), to_ndc(pos));
+                }
+            } else if response.dragged_by(egui::PointerButton::Secondary)
+                || response.dragged_by(egui::PointerButton::Middle)
+            {
+                let delta = response.drag_delta();
+                self.camera
+                    .drag_pan(delta.x as f64, delta.y as f64, rect.height() as f64);
+            }
+        }
+
+        if response.hovered() && !multi_touch_active {
             let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll_y.abs() > 0.1 {
                 let factor = (-0.0025 * (scroll_y as f64)).exp();
@@ -4932,7 +5085,7 @@ impl Mol3dViewerPanel {
         }
 
         // Analytical 3D Ray Picking on click -> Sequence Ribbon + 2D Covalent Graph + SyncCrosshair
-        if response.clicked() {
+        if response.clicked() && !multi_touch_active && !self.suppress_single_drag_until_release {
             if let Some(click_pos) = response.interact_pointer_pos() {
                 let lx = (click_pos.x - rect.left()) as f64;
                 let ly = (click_pos.y - rect.top()) as f64;
@@ -4978,7 +5131,19 @@ impl Mol3dViewerPanel {
             egui::StrokeKind::Inside,
         );
 
-        ui.small(&self.status_banner);
+        if is_compact_mobile {
+            egui::ScrollArea::horizontal()
+                .id_salt("mol3d_mobile_status_scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .max_height(18.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&self.status_banner).small()).extend(),
+                    );
+                });
+        } else {
+            ui.small(&self.status_banner);
+        }
         emitted_sync
     }
 }
