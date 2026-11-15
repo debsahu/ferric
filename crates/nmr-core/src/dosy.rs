@@ -2278,6 +2278,14 @@ pub fn solve_tikhonov_ilt(
             "Tikhonov ILT requires matching b/intensity arrays of length >= 4, got {m}"
         )));
     }
+    if !b_s_m2.iter().all(|b| b.is_finite() && *b >= 0.0) {
+        return Err(DosyError::new(
+            "Tikhonov ILT requires finite non-negative b-values",
+        ));
+    }
+    if !intensities.iter().all(|y| y.is_finite()) {
+        return Err(DosyError::new("Tikhonov ILT requires finite intensities"));
+    }
     let n = cfg.n_grid;
     if !(16..=512).contains(&n) {
         return Err(DosyError::new(format!(

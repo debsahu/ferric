@@ -892,7 +892,9 @@ pub fn apply_phase_1d(spec: &mut Spectrum1D, phc0_deg: f64, phc1_deg: f64, pivot
     }
     let u_piv = pivot.resolve_fraction(spec);
     let denom = (n.saturating_sub(1)).max(1) as f64;
-    let im_vec = spec.imag.as_mut().expect("Hilbert imaginary present");
+    let Some(im_vec) = spec.imag.as_mut() else {
+        return;
+    };
 
     for (j, (re, im)) in spec.real.iter_mut().zip(im_vec.iter_mut()).enumerate() {
         let u_j = if n > 1 { (j as f64) / denom } else { 0.0 };
@@ -4780,5 +4782,793 @@ pub fn deconvolve_spectrum_1d(
         residual_spectrum,
         residual_rmsd,
         clusters,
+    }
+}
+
+// ============================================================================
+// 7. Validated 1D Ingest (`Bruker pdata 1r/procs`, `Bruker fid`, `JCAMP-DX`, `JSON`, `TSV`; `F15`)
+// ============================================================================
+
+/// Maximum permitted 1D trace length (`4,194,304` points = `32 MiB` `f64`) enforced **prior** to allocation.
+pub const MAX_1D_INGEST_POINTS: usize = 4_194_304;
+
+/// Maximum permitted 1D input file size (`64 MiB`) checked via `fs::metadata` prior to buffer allocation.
+pub const MAX_1D_INGEST_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Parsed 1D input payload (either complex time-domain FID or processed frequency-domain spectrum).
+#[derive(Clone, Debug)]
+pub enum Loaded1DData {
+    TimeDomain(TimeDomain1D),
+    FrequencyDomain(Spectrum1D),
+}
+
+impl TimeDomain1D {
+    /// Validate finite acquisition parameters, sample bounds (`2..=MAX_1D_INGEST_POINTS`), and finite complex FID values.
+    pub fn validate(&self) -> Result<(), String> {
+        let n = self.data.len();
+        if n < 2 {
+            return Err(format!(
+                "TimeDomain1D {:?} contains {n} complex samples (minimum 2 required)",
+                self.name
+            ));
+        }
+        if n > MAX_1D_INGEST_POINTS {
+            return Err(format!(
+                "TimeDomain1D {:?} length {n} exceeds MAX_1D_INGEST_POINTS ({MAX_1D_INGEST_POINTS})",
+                self.name
+            ));
+        }
+        if self.active_td < 2 || self.active_td > n {
+            return Err(format!(
+                "TimeDomain1D {:?} active_td={} out of valid range 2..={n}",
+                self.name, self.active_td
+            ));
+        }
+        if !self.sw_hz.is_finite() || self.sw_hz <= 0.0 {
+            return Err(format!(
+                "TimeDomain1D {:?} has invalid sw_hz={}",
+                self.name, self.sw_hz
+            ));
+        }
+        if !self.obs_mhz.is_finite() || self.obs_mhz <= 0.0 {
+            return Err(format!(
+                "TimeDomain1D {:?} has invalid obs_mhz={}",
+                self.name, self.obs_mhz
+            ));
+        }
+        if !self.carrier_ppm.is_finite() || !self.group_delay_pts.is_finite() {
+            return Err(format!(
+                "TimeDomain1D {:?} has non-finite carrier_ppm or group_delay_pts",
+                self.name
+            ));
+        }
+        for (idx, &[re, im]) in self.data.iter().enumerate() {
+            if !re.is_finite() || !im.is_finite() {
+                return Err(format!(
+                    "TimeDomain1D {:?} contains non-finite sample at index {idx}: ({re}, {im})",
+                    self.name
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Spectrum1D {
+    /// Validate finite axis metadata, `axis.size == real.len()`, optional `imag` length, and finite spectral intensities.
+    pub fn validate(&self) -> Result<(), String> {
+        let n = self.real.len();
+        if n < 2 {
+            return Err(format!(
+                "Spectrum1D {:?} contains {n} points (minimum 2 required)",
+                self.name
+            ));
+        }
+        if n > MAX_1D_INGEST_POINTS {
+            return Err(format!(
+                "Spectrum1D {:?} length {n} exceeds MAX_1D_INGEST_POINTS ({MAX_1D_INGEST_POINTS})",
+                self.name
+            ));
+        }
+        if self.axis.size != n {
+            return Err(format!(
+                "Spectrum1D {:?} axis.size ({}) disagrees with real.len() ({n})",
+                self.name, self.axis.size
+            ));
+        }
+        if !self.axis.obs_mhz.is_finite()
+            || self.axis.obs_mhz <= 0.0
+            || !self.axis.first_ppm.is_finite()
+            || !self.axis.step_ppm.is_finite()
+            || self.axis.step_ppm.abs() == 0.0
+        {
+            return Err(format!(
+                "Spectrum1D {:?} has invalid axis metadata (obs_mhz={}, first_ppm={}, step_ppm={})",
+                self.name, self.axis.obs_mhz, self.axis.first_ppm, self.axis.step_ppm
+            ));
+        }
+        if !self.phase_applied.0.is_finite()
+            || !self.phase_applied.1.is_finite()
+            || !self.phase_applied.2.is_finite()
+        {
+            return Err(format!(
+                "Spectrum1D {:?} has non-finite phase_applied metadata",
+                self.name
+            ));
+        }
+        for (idx, &v) in self.real.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(format!(
+                    "Spectrum1D {:?} contains non-finite real intensity at index {idx}: {v}",
+                    self.name
+                ));
+            }
+        }
+        if let Some(ref im) = self.imag {
+            if im.len() != n {
+                return Err(format!(
+                    "Spectrum1D {:?} imag.len() ({}) disagrees with real.len() ({n})",
+                    self.name,
+                    im.len()
+                ));
+            }
+            for (idx, &v) in im.iter().enumerate() {
+                if !v.is_finite() {
+                    return Err(format!(
+                        "Spectrum1D {:?} contains non-finite imag intensity at index {idx}: {v}",
+                        self.name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn find_jcamp_param(txt: &str, key_norm: &str) -> Option<String> {
+    for line in txt.lines() {
+        if let Some(rest) = line.strip_prefix("##") {
+            let rest = rest.strip_prefix('$').unwrap_or(rest);
+            if let Some((k, v)) = rest.split_once('=') {
+                let norm: String = k
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect();
+                if norm == key_norm {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn decode_bruker_1d_channel(
+    path: &std::path::Path,
+    si: usize,
+    word_size: usize,
+    dtype: u8,
+    big_endian: bool,
+    scale: f64,
+) -> Result<Vec<f64>, String> {
+    let expected_bytes = (si as u64)
+        .checked_mul(word_size as u64)
+        .ok_or_else(|| format!("Bruker SI={si} byte count overflow"))?;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("failed to stat Bruker binary {}: {e}", path.display()))?;
+    let file_len = meta.len();
+    if file_len < expected_bytes {
+        return Err(format!(
+            "truncated Bruker {}: file has {file_len} bytes, expected {expected_bytes} bytes for SI={si}",
+            path.display()
+        ));
+    }
+    if file_len != expected_bytes {
+        return Err(format!(
+            "Bruker procs SI={si} ({expected_bytes} bytes) disagrees with {} file length ({file_len} bytes)",
+            path.display()
+        ));
+    }
+    let raw_bytes = std::fs::read(path)
+        .map_err(|e| format!("failed to read Bruker {}: {e}", path.display()))?;
+    if raw_bytes.len() as u64 != expected_bytes {
+        return Err(format!(
+            "Bruker {} byte length changed during read ({} vs {expected_bytes})",
+            path.display(),
+            raw_bytes.len()
+        ));
+    }
+
+    let mut out = Vec::with_capacity(si);
+    for i in 0..si {
+        let val = if dtype == 2 {
+            let slice = &raw_bytes[i * 8..(i + 1) * 8];
+            let chunk: [u8; 8] = slice
+                .try_into()
+                .map_err(|_| format!("short 8-byte word at index {i}"))?;
+            let v = if big_endian {
+                f64::from_be_bytes(chunk)
+            } else {
+                f64::from_le_bytes(chunk)
+            };
+            v * scale
+        } else {
+            let slice = &raw_bytes[i * 4..(i + 1) * 4];
+            let chunk: [u8; 4] = slice
+                .try_into()
+                .map_err(|_| format!("short 4-byte word at index {i}"))?;
+            let raw = if big_endian {
+                i32::from_be_bytes(chunk)
+            } else {
+                i32::from_le_bytes(chunk)
+            };
+            (raw as f64) * scale
+        };
+        if !val.is_finite() {
+            return Err(format!(
+                "non-finite intensity in Bruker {} at point {i}: {val}",
+                path.display()
+            ));
+        }
+        out.push(val);
+    }
+    Ok(out)
+}
+
+/// Load a processed Bruker 1D `pdata` directory (`dir/procs` + `dir/1r` or `dir/pdata/1/procs` + `dir/pdata/1/1r`),
+/// validating `SI <= MAX_1D_INGEST_POINTS` and verifying exact `1r` (and optional `1i`) byte length via
+/// `fs::metadata` **before** allocating any spectrum buffer (`F15`).
+pub fn load_bruker_pdata_1d_dir(
+    dir: &std::path::Path,
+    mhz_override: Option<f64>,
+) -> Result<Option<Spectrum1D>, String> {
+    let candidates = [dir.to_path_buf(), dir.join("pdata").join("1")];
+    for pdir in &candidates {
+        let procs_path = pdir.join("procs");
+        let data_1r_path = pdir.join("1r");
+        if !procs_path.is_file() || !data_1r_path.is_file() {
+            continue;
+        }
+        let procs_len = std::fs::metadata(&procs_path)
+            .map_err(|e| format!("failed to stat {}: {e}", procs_path.display()))?
+            .len();
+        if procs_len > 4 * 1024 * 1024 {
+            return Err(format!(
+                "Bruker procs {} exceeds 4 MiB ({procs_len} bytes)",
+                procs_path.display()
+            ));
+        }
+        let procs = std::fs::read_to_string(&procs_path)
+            .map_err(|e| format!("failed to read {}: {e}", procs_path.display()))?;
+
+        let req_finite = |key: &str| -> Result<f64, String> {
+            let s = find_jcamp_param(&procs, key)
+                .ok_or_else(|| format!("Bruker procs is missing parameter {key}"))?;
+            let v = s
+                .parse::<f64>()
+                .map_err(|_| format!("Bruker procs parameter {key}={s:?} is not a number"))?;
+            if !v.is_finite() {
+                return Err(format!("Bruker procs parameter {key}={s:?} is non-finite"));
+            }
+            Ok(v)
+        };
+
+        let si_f = req_finite("SI")?;
+        if si_f < 2.0 || (si_f - si_f.round()).abs() > 1e-9 {
+            return Err(format!("Bruker procs SI={si_f} must be an integer >= 2"));
+        }
+        if si_f > (MAX_1D_INGEST_POINTS as f64) {
+            return Err(format!(
+                "Bruker procs declared SI={si_f:.0} exceeds MAX_1D_INGEST_POINTS ({MAX_1D_INGEST_POINTS})"
+            ));
+        }
+        let si = si_f.round() as usize;
+        let offset = req_finite("OFFSET")?;
+        let sw_p = req_finite("SWP")?;
+        let sf = req_finite("SF")?;
+        if sf <= 0.0 || sw_p <= 0.0 {
+            return Err(format!(
+                "Bruker procs SF ({sf}) and SW_p ({sw_p}) must be positive"
+            ));
+        }
+
+        let nc_proc = match find_jcamp_param(&procs, "NCPROC") {
+            Some(s) => {
+                let v = s
+                    .parse::<i32>()
+                    .map_err(|_| format!("Bruker procs NCPROC={s:?} is not an integer"))?;
+                if !(-128..=128).contains(&v) {
+                    return Err(format!("Bruker procs NCPROC={v} out of range [-128, 128]"));
+                }
+                v
+            }
+            None => 0,
+        };
+        let big_endian = match find_jcamp_param(&procs, "BYTORDP").as_deref() {
+            Some("1") => true,
+            Some("0") | None => false,
+            Some(other) => {
+                return Err(format!(
+                    "Bruker procs BYTORDP={other:?} must be 0 (little-endian) or 1 (big-endian)"
+                ))
+            }
+        };
+        let dtype = match find_jcamp_param(&procs, "DTYPP") {
+            Some(s) => {
+                let d = s
+                    .parse::<u8>()
+                    .map_err(|_| format!("Bruker procs DTYPP={s:?} is not an integer"))?;
+                if d != 0 && d != 2 {
+                    return Err(format!(
+                        "unsupported Bruker procs DTYPP={d} (expected 0=int32 or 2=float64)"
+                    ));
+                }
+                d
+            }
+            None => 0,
+        };
+        let word_size = if dtype == 2 { 8usize } else { 4usize };
+        let scale = 2.0_f64.powi(nc_proc);
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(format!("non-finite Bruker NCPROC={nc_proc} scale factor"));
+        }
+
+        // Pre-allocation file-size check + decode on `1r` (and `1i` if present)
+        let real =
+            decode_bruker_1d_channel(&data_1r_path, si, word_size, dtype, big_endian, scale)?;
+        let data_1i_path = pdir.join("1i");
+        let imag = if data_1i_path.is_file() {
+            Some(decode_bruker_1d_channel(
+                &data_1i_path,
+                si,
+                word_size,
+                dtype,
+                big_endian,
+                scale,
+            )?)
+        } else {
+            None
+        };
+
+        let acqus = pdir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|exp_dir| exp_dir.join("acqus"))
+            .filter(|p| p.is_file())
+            .or_else(|| {
+                let direct_acqus = dir.join("acqus");
+                direct_acqus.is_file().then_some(direct_acqus)
+            })
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+
+        let nuc_raw = find_jcamp_param(&acqus, "NUC1")
+            .or_else(|| find_jcamp_param(&procs, "AXNUC"))
+            .unwrap_or_else(|| "1H".to_string());
+        let nuc_clean = nuc_raw.trim_matches(['<', '>', '"', ' ']);
+        let pulprog = find_jcamp_param(&acqus, "PULPROG").unwrap_or_default();
+        let exp = Experiment1DKind::from_pulse_program(
+            pulprog.trim_matches(['<', '>', '"', ' ']),
+            nuc_clean,
+        );
+        let mhz = mhz_override.unwrap_or(sf);
+        if !mhz.is_finite() || mhz <= 0.0 {
+            return Err(format!("invalid observation frequency mhz={mhz}"));
+        }
+        let last_x = offset - (((si - 1) as f64) * sw_p) / sf / (si as f64);
+        let axis = AxisPpm::from_bounds(exp.nucleus().as_str(), si, offset, last_x, mhz);
+        let name = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("bruker_1d")
+            .to_string();
+        let mut spec = Spectrum1D::new(name, exp, axis, real, imag);
+        if let Some(solv) = find_jcamp_param(&acqus, "SOLVENT") {
+            let sc = solv.trim_matches(['<', '>', '"', ' ']).trim();
+            if !sc.is_empty() && !sc.eq_ignore_ascii_case("none") {
+                spec.solvent = Some(sc.to_string());
+            }
+        }
+        spec.validate()?;
+        return Ok(Some(spec));
+    }
+    Ok(None)
+}
+
+fn parse_experiment_kind_label_1d(label: &str) -> Result<Experiment1DKind, String> {
+    let norm = label
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_', '{', '}', ' '], "");
+    if norm.is_empty() {
+        return Err("empty experiment/nucleus label in 1D metadata".to_string());
+    }
+    match norm.as_str() {
+        "1h" | "h1" | "proton" | "proton1d" => Ok(Experiment1DKind::Proton1D),
+        "13c" | "c13" | "13c1h" | "carbon" | "carbon13" | "carbon13decoupled" => {
+            Ok(Experiment1DKind::Carbon13Decoupled)
+        }
+        "dept90" => Ok(Experiment1DKind::Dept90),
+        "dept135" | "deptq135" => Ok(Experiment1DKind::Dept135),
+        "19f" | "f19" | "fluorine19" => Ok(Experiment1DKind::Fluorine19),
+        "31p" | "p31" | "phosphorus31" => Ok(Experiment1DKind::Phosphorus31),
+        _ => Ok(Experiment1DKind::Custom(Nucleus1D::parse(label))),
+    }
+}
+
+fn parse_finite_meta_f64(
+    meta: &std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Result<Option<f64>, String> {
+    let Some(raw) = meta.get(key) else {
+        return Ok(None);
+    };
+    let v = raw
+        .parse::<f64>()
+        .map_err(|_| format!("invalid numeric metadata {key}={raw:?} in 1D TSV"))?;
+    if !v.is_finite() {
+        return Err(format!(
+            "non-finite numeric metadata {key}={raw:?} in 1D TSV"
+        ));
+    }
+    Ok(Some(v))
+}
+
+/// Parse a 2- or 3-column 1D TSV/CSV string (either frequency-domain `ppm\treal[\timag]` or
+/// time-domain `# domain=fid` / `t_s\tre\tim`), rejecting malformed rows, column-width mismatches,
+/// `< 2` rows, degenerate axes, and `NaN`/`Inf` values (`F15`).
+pub fn parse_tsv_1d_str(
+    text: &str,
+    name: &str,
+    mhz_override: Option<f64>,
+) -> Result<Loaded1DData, String> {
+    let mut meta: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut header_cols: Vec<String> = Vec::new();
+    let mut header_seen = false;
+    let mut expected_cols: Option<usize> = None;
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+
+    for (line_idx, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(comment) = line.strip_prefix('#') {
+            for part in comment.split([';', ',']) {
+                if let Some((k, v)) = part.split_once('=') {
+                    meta.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                }
+            }
+            continue;
+        }
+        let fields: Vec<&str> = line
+            .split(['\t', ','])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if fields.len() < 2 {
+            return Err(format!(
+                "malformed 1D TSV row at line {} (expected >= 2 tab/comma columns): {line:?}",
+                line_idx + 1
+            ));
+        }
+        let first_f64 = fields[0].parse::<f64>();
+        if rows.is_empty() && !header_seen && first_f64.is_err() {
+            header_cols = fields.iter().map(|s| s.to_ascii_lowercase()).collect();
+            header_seen = true;
+            continue;
+        }
+        if let Some(nc) = expected_cols {
+            if fields.len() != nc {
+                return Err(format!(
+                    "inconsistent column count at 1D TSV line {}: got {}, expected {nc}",
+                    line_idx + 1,
+                    fields.len()
+                ));
+            }
+        } else {
+            expected_cols = Some(fields.len());
+        }
+        if rows.len() >= MAX_1D_INGEST_POINTS {
+            return Err(format!(
+                "1D TSV exceeds MAX_1D_INGEST_POINTS ({MAX_1D_INGEST_POINTS})"
+            ));
+        }
+        let mut vals = Vec::with_capacity(fields.len());
+        for tok in &fields {
+            let v = tok.parse::<f64>().map_err(|e| {
+                format!(
+                    "invalid numeric value {tok:?} at 1D TSV line {}: {e}",
+                    line_idx + 1
+                )
+            })?;
+            if !v.is_finite() {
+                return Err(format!(
+                    "non-finite value {tok:?} at 1D TSV line {}",
+                    line_idx + 1
+                ));
+            }
+            vals.push(v);
+        }
+        rows.push(vals);
+    }
+
+    if rows.len() < 2 {
+        return Err("1D TSV input contains fewer than 2 numeric rows".to_string());
+    }
+
+    let exp = meta
+        .get("experiment")
+        .or_else(|| meta.get("nucleus"))
+        .map(|s| parse_experiment_kind_label_1d(s))
+        .transpose()?
+        .unwrap_or(Experiment1DKind::Proton1D);
+
+    let meta_mhz = match parse_finite_meta_f64(&meta, "obs_mhz")? {
+        Some(v) => Some(v),
+        None => parse_finite_meta_f64(&meta, "mhz")?,
+    };
+    let mhz = mhz_override.or(meta_mhz).unwrap_or(500.0);
+    if !mhz.is_finite() || mhz <= 0.0 {
+        return Err(format!("invalid 1D observation frequency obs_mhz={mhz}"));
+    }
+
+    let first_col_name = header_cols.first().map(String::as_str).unwrap_or("");
+    let is_fid = meta
+        .get("domain")
+        .is_some_and(|d| d.eq_ignore_ascii_case("time") || d.eq_ignore_ascii_case("fid"))
+        || matches!(first_col_name, "t" | "t_s" | "time" | "time_s" | "sample");
+
+    if is_fid {
+        let meta_sw = parse_finite_meta_f64(&meta, "sw_hz")?;
+        if let Some(sw) = meta_sw {
+            if sw <= 0.0 {
+                return Err(format!("1D FID TSV sw_hz={sw} must be > 0"));
+            }
+        }
+        let has_time_col = rows[0].len() >= 3;
+        let dt_from_col = if has_time_col {
+            let dt = rows[1][0] - rows[0][0];
+            if !dt.is_finite() || dt <= 0.0 {
+                return Err(format!(
+                    "1D FID TSV time column must be strictly increasing (dt={dt})"
+                ));
+            }
+            Some(dt)
+        } else {
+            None
+        };
+        let sw_hz = meta_sw
+            .or_else(|| dt_from_col.map(|dt| 1.0 / dt))
+            .unwrap_or(6000.0);
+        if !sw_hz.is_finite() || sw_hz <= 0.0 {
+            return Err(format!("invalid 1D FID sw_hz={sw_hz}"));
+        }
+        let carrier_ppm = parse_finite_meta_f64(&meta, "carrier_ppm")?.unwrap_or(4.70);
+        let gd = parse_finite_meta_f64(&meta, "group_delay_pts")?.unwrap_or(0.0);
+        let mut data = Vec::with_capacity(rows.len());
+        for r in &rows {
+            if r.len() >= 3 {
+                data.push([r[1], r[2]]);
+            } else {
+                data.push([r[0], r[1]]);
+            }
+        }
+        let mut td = TimeDomain1D::new(name.to_string(), exp, sw_hz, mhz, carrier_ppm, data);
+        td.group_delay_pts = gd;
+        td.validate()?;
+        return Ok(Loaded1DData::TimeDomain(td));
+    }
+
+    let mut pts: Vec<(f64, f64, Option<f64>)> = rows
+        .into_iter()
+        .map(|r| (r[0], r[1], r.get(2).copied()))
+        .collect();
+    if pts.first().map(|p| p.0).unwrap_or(0.0) < pts.last().map(|p| p.0).unwrap_or(0.0) {
+        pts.reverse();
+    }
+    let high_ppm = pts[0].0;
+    let low_ppm = pts.last().map(|p| p.0).unwrap_or(high_ppm);
+    if (high_ppm - low_ppm).abs() <= 1e-12 {
+        return Err(format!(
+            "1D TSV spectrum {name:?} has degenerate chemical-shift bounds ({high_ppm} == {low_ppm})"
+        ));
+    }
+    let real: Vec<f64> = pts.iter().map(|p| p.1).collect();
+    let has_imag = pts.iter().all(|p| p.2.is_some());
+    let imag: Option<Vec<f64>> = has_imag.then(|| pts.iter().filter_map(|p| p.2).collect());
+
+    let axis = AxisPpm::from_bounds(exp.nucleus().as_str(), real.len(), high_ppm, low_ppm, mhz);
+    let mut spec = Spectrum1D::new(name.to_string(), exp, axis, real, imag);
+    if let Some(solv) = meta.get("solvent") {
+        if !solv.is_empty() && solv != "none" {
+            spec.solvent = Some(solv.clone());
+        }
+    }
+    spec.validate()?;
+    Ok(Loaded1DData::FrequencyDomain(spec))
+}
+
+/// Parse and strictly validate a JSON-serialized `Spectrum1D` or `TimeDomain1D` (`F15`).
+pub fn parse_json_1d_str(text: &str, mhz_override: Option<f64>) -> Result<Loaded1DData, String> {
+    let val: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("malformed 1D JSON: {e}"))?;
+    let obj = val
+        .as_object()
+        .ok_or_else(|| "1D JSON root must be a JSON object".to_string())?;
+
+    // Pre-check declared sizes before typed deserialization
+    if let Some(ax) = obj.get("axis").and_then(|a| a.as_object()) {
+        if let Some(sz) = ax.get("size").and_then(|s| s.as_u64()) {
+            if sz > MAX_1D_INGEST_POINTS as u64 {
+                return Err(format!(
+                    "1D JSON declared axis.size={sz} exceeds MAX_1D_INGEST_POINTS ({MAX_1D_INGEST_POINTS})"
+                ));
+            }
+        }
+    }
+    if let Some(atd) = obj.get("active_td").and_then(|s| s.as_u64()) {
+        if atd > MAX_1D_INGEST_POINTS as u64 {
+            return Err(format!(
+                "1D JSON declared active_td={atd} exceeds MAX_1D_INGEST_POINTS ({MAX_1D_INGEST_POINTS})"
+            ));
+        }
+    }
+
+    if obj.contains_key("real") && obj.contains_key("axis") {
+        let mut spec: Spectrum1D = serde_json::from_value(val)
+            .map_err(|e| format!("invalid `Spectrum1D` JSON schema: {e}"))?;
+        if let Some(m) = mhz_override {
+            spec.axis.obs_mhz = m;
+        }
+        spec.validate()?;
+        return Ok(Loaded1DData::FrequencyDomain(spec));
+    }
+    if obj.contains_key("data") && obj.contains_key("sw_hz") {
+        let mut td: TimeDomain1D = serde_json::from_value(val)
+            .map_err(|e| format!("invalid `TimeDomain1D` JSON schema: {e}"))?;
+        if let Some(m) = mhz_override {
+            td.obs_mhz = m;
+        }
+        td.validate()?;
+        return Ok(Loaded1DData::TimeDomain(td));
+    }
+    Err("JSON object matched neither `Spectrum1D` nor `TimeDomain1D` schema".to_string())
+}
+
+/// Load a 1D time-domain FID or processed spectrum from a Bruker `fid`/`pdata` directory,
+/// `JCAMP-DX` (`.jdx`/`.dx`), JSON (`Spectrum1D`/`TimeDomain1D`), or 2-/3-column TSV file (`F15`).
+pub fn load_1d_input(
+    path: &std::path::Path,
+    mhz_override: Option<f64>,
+    prefer_fid: bool,
+) -> Result<Loaded1DData, String> {
+    if let Some(m) = mhz_override {
+        if !m.is_finite() || m <= 0.0 {
+            return Err(format!("invalid mhz_override={m} (must be finite and > 0)"));
+        }
+    }
+    let name = path
+        .file_stem()
+        .or_else(|| path.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("spectrum_1d");
+
+    if path.is_dir() {
+        let fid_file = path.join("fid");
+        if prefer_fid && fid_file.is_file() {
+            let fid1d = crate::fid::read_bruker_fid_1d(path)?;
+            let mut td = TimeDomain1D::from_fid1d(&fid1d);
+            if let Some(m) = mhz_override {
+                td.obs_mhz = m;
+            }
+            td.validate()?;
+            return Ok(Loaded1DData::TimeDomain(td));
+        }
+        if let Some(spec) = load_bruker_pdata_1d_dir(path, mhz_override)? {
+            return Ok(Loaded1DData::FrequencyDomain(spec));
+        }
+        if fid_file.is_file() {
+            let fid1d = crate::fid::read_bruker_fid_1d(path)?;
+            let mut td = TimeDomain1D::from_fid1d(&fid1d);
+            if let Some(m) = mhz_override {
+                td.obs_mhz = m;
+            }
+            td.validate()?;
+            return Ok(Loaded1DData::TimeDomain(td));
+        }
+        return Err(format!(
+            "directory {} contains neither Bruker 1D `fid`+`acqus` nor `procs`+`1r`",
+            path.display()
+        ));
+    }
+
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("failed to stat 1D input {}: {e}", path.display()))?;
+    if meta.len() > MAX_1D_INGEST_BYTES {
+        return Err(format!(
+            "1D input {} ({} bytes) exceeds MAX_1D_INGEST_BYTES ({MAX_1D_INGEST_BYTES})",
+            path.display(),
+            meta.len()
+        ));
+    }
+
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read 1D input {}: {e}", path.display()))?;
+
+    if ext == "json" {
+        return parse_json_1d_str(&text, mhz_override)
+            .map_err(|e| format!("{} ({})", e, path.display()));
+    }
+
+    if ext == "jdx" || ext == "dx" || ext == "jcamp" || text.trim_start().starts_with("##TITLE=") {
+        let blocks = crate::octet_analyt::jcamp_spec1d::read_jcamp(&text)?;
+        let first = blocks.first().ok_or_else(|| {
+            format!(
+                "JCAMP-DX file {} contained zero spectrum blocks",
+                path.display()
+            )
+        })?;
+        if first.y.len() < 2 {
+            return Err(format!(
+                "JCAMP-DX file {} contains fewer than 2 points",
+                path.display()
+            ));
+        }
+        let nuc_str = first.nucleus.as_deref().unwrap_or("1H");
+        let exp = Experiment1DKind::from_pulse_program("", nuc_str);
+        let mhz = mhz_override.or(first.mhz).unwrap_or(500.0);
+        if !mhz.is_finite() || mhz <= 0.0 {
+            return Err(format!("invalid JCAMP-DX observation frequency mhz={mhz}"));
+        }
+        let mut xs = first.x_axis();
+        let mut ys = first.y.clone();
+        if xs.first().copied().unwrap_or(0.0) < xs.last().copied().unwrap_or(0.0) {
+            xs.reverse();
+            ys.reverse();
+        }
+        let high_ppm = xs[0];
+        let low_ppm = *xs.last().unwrap_or(&high_ppm);
+        if !high_ppm.is_finite() || !low_ppm.is_finite() || (high_ppm - low_ppm).abs() <= 1e-12 {
+            return Err(format!(
+                "JCAMP-DX file {} has invalid x-axis bounds [{low_ppm}, {high_ppm}]",
+                path.display()
+            ));
+        }
+        let axis = AxisPpm::from_bounds(exp.nucleus().as_str(), ys.len(), high_ppm, low_ppm, mhz);
+        let mut spec = Spectrum1D::new(first.title.clone(), exp, axis, ys, None);
+        spec.solvent = first.solvent.clone();
+        spec.validate()?;
+        return Ok(Loaded1DData::FrequencyDomain(spec));
+    }
+
+    parse_tsv_1d_str(&text, name, mhz_override).map_err(|e| format!("{e} ({})", path.display()))
+}
+
+/// Load a processed 1D spectrum from Bruker `pdata` (`procs` + `1r`), `JCAMP-DX`, JSON, TSV, or
+/// raw time-domain FID (automatically apodizing, zero-filling, FFT-ing, and minimum-entropy
+/// autophasing when the input is time-domain; hardened per `F15`).
+pub fn load_processed_spectrum_1d(
+    path: &std::path::Path,
+    mhz_override: Option<f64>,
+) -> Result<Spectrum1D, String> {
+    match load_1d_input(path, mhz_override, false)? {
+        Loaded1DData::FrequencyDomain(spec) => Ok(spec),
+        Loaded1DData::TimeDomain(mut td) => {
+            let lb = td.experiment.default_line_broadening_hz();
+            apply_apodization_1d(&mut td, Apodization1D::Exponential { lb_hz: lb }, 0.5);
+            zero_fill_pow2_1d(&mut td, 2);
+            let mut spec = fft_1d(&td);
+            let _ = auto_phase_and_apply_1d(&mut spec, &AutoPhase1DConfig::default());
+            spec.validate()?;
+            Ok(spec)
+        }
     }
 }

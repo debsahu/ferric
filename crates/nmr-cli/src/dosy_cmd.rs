@@ -262,12 +262,13 @@ fn parse_grad_shape(s: &str) -> Result<GradientShape, String> {
         }
         _ => {
             if let Ok(f) = low.parse::<f64>() {
-                Ok(GradientShape::CustomFactor(f))
-            } else {
-                Err(format!(
-                    "invalid --shape {s:?} (expected rect, sine, smsq, or numeric factor)"
-                ))
+                if f.is_finite() && f > 0.0 {
+                    return Ok(GradientShape::CustomFactor(f));
+                }
             }
+            Err(format!(
+                "invalid --shape {s:?} (expected rect, sine, smsq, or positive numeric factor)"
+            ))
         }
     }
 }
@@ -293,7 +294,9 @@ fn parse_compactness(s: &str) -> Result<SoluteCompactnessClass, String> {
 fn parse_ppm_from_header(token: &str, fallback_idx: usize) -> f64 {
     let trimmed = token.trim();
     if let Ok(v) = trimmed.parse::<f64>() {
-        return v;
+        if v.is_finite() {
+            return v;
+        }
     }
     let cleaned = trimmed
         .trim_end_matches("ppm")
@@ -303,7 +306,9 @@ fn parse_ppm_from_header(token: &str, fallback_idx: usize) -> f64 {
         .unwrap_or(trimmed);
     cleaned
         .parse::<f64>()
-        .unwrap_or_else(|_| (fallback_idx + 1) as f64)
+        .ok()
+        .filter(|v| v.is_finite())
+        .unwrap_or_else(|| (fallback_idx + 1) as f64)
 }
 
 #[derive(Clone, Debug)]
@@ -398,7 +403,7 @@ impl DosyCliPhysArgs {
     }
 }
 
-fn build_demo_dataset() -> (Vec<f64>, Vec<DosyInputPeakRecord>) {
+fn build_demo_dataset() -> Result<(Vec<f64>, Vec<DosyInputPeakRecord>), String> {
     let grads: Vec<f64> = (0..24).map(|i| 2.0 + (i as f64) * (72.0 / 23.0)).collect();
     let b_vals = compute_b_values_s_m2(
         &grads,
@@ -409,7 +414,7 @@ fn build_demo_dataset() -> (Vec<f64>, Vec<DosyInputPeakRecord>) {
         0.0024,
         0.0002,
     )
-    .expect("valid demo BPP-LED b-values");
+    .map_err(|e| format!("failed building demo BPP-LED b-values: {e}"))?;
 
     type DemoPeakDef<'a> = (&'a str, f64, f64, &'a [(f64, f64)]);
     let d_slow = 2.0e-10_f64;
@@ -442,7 +447,49 @@ fn build_demo_dataset() -> (Vec<f64>, Vec<DosyInputPeakRecord>) {
             intensities,
         });
     }
-    (b_vals, peaks)
+    Ok((b_vals, peaks))
+}
+
+fn validate_loaded_dosy(b_vals: &[f64], peaks: &[DosyInputPeakRecord]) -> Result<(), String> {
+    if b_vals.len() < 3 {
+        return Err(format!(
+            "DOSY requires >= 3 gradient / b-factor steps, got {}",
+            b_vals.len()
+        ));
+    }
+    for (idx, &b) in b_vals.iter().enumerate() {
+        if !b.is_finite() || b < 0.0 {
+            return Err(format!("invalid b-value at step {idx}: {b}"));
+        }
+    }
+    if peaks.is_empty() {
+        return Err("DOSY dataset contains zero peaks".to_string());
+    }
+    for pk in peaks {
+        if !pk.center_ppm.is_finite() || !pk.fwhm_ppm.is_finite() || pk.fwhm_ppm < 0.0 {
+            return Err(format!(
+                "DOSY peak {:?} has invalid metadata (center_ppm={}, fwhm_ppm={})",
+                pk.label, pk.center_ppm, pk.fwhm_ppm
+            ));
+        }
+        if pk.intensities.len() != b_vals.len() {
+            return Err(format!(
+                "DOSY peak {:?} has {} intensities, expected {}",
+                pk.label,
+                pk.intensities.len(),
+                b_vals.len()
+            ));
+        }
+        for (idx, &y) in pk.intensities.iter().enumerate() {
+            if !y.is_finite() {
+                return Err(format!(
+                    "DOSY peak {:?} has non-finite intensity at step {idx}: {y}",
+                    pk.label
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn load_dosy_dataset(
@@ -451,10 +498,19 @@ fn load_dosy_dataset(
     phys: &DosyCliPhysArgs,
 ) -> Result<(Vec<f64>, Vec<DosyInputPeakRecord>), String> {
     if demo {
-        return Ok(build_demo_dataset());
+        return build_demo_dataset();
     }
     let path = in_path
         .ok_or_else(|| "missing required --in <decay.tsv|json> (or pass --demo)".to_string())?;
+    let meta = fs::metadata(path)
+        .map_err(|e| format!("failed to stat DOSY input {}: {e}", path.display()))?;
+    if meta.len() > 64 * 1024 * 1024 {
+        return Err(format!(
+            "DOSY input {} ({} bytes) exceeds 64 MiB limit",
+            path.display(),
+            meta.len()
+        ));
+    }
     let raw = fs::read_to_string(path)
         .map_err(|e| format!("failed to read DOSY input {}: {e}", path.display()))?;
     let trimmed = raw.trim();
@@ -496,16 +552,7 @@ fn load_dosy_dataset(
         } else {
             phys.resolve_b_from_dir_or_grads(None)?
         };
-        for pk in &ds.peaks {
-            if pk.intensities.len() != b_vals.len() {
-                return Err(format!(
-                    "peak {:?} has {} intensities, expected {} matching b_values_s_m2",
-                    pk.label,
-                    pk.intensities.len(),
-                    b_vals.len()
-                ));
-            }
-        }
+        validate_loaded_dosy(&b_vals, &ds.peaks)?;
         return Ok((b_vals, ds.peaks));
     }
 
@@ -606,7 +653,9 @@ fn load_dosy_dataset(
         };
         let mut peaks = Vec::with_capacity(order.len());
         for key in order {
-            let (ppm, pairs) = grouped.remove(&key).unwrap();
+            let Some((ppm, pairs)) = grouped.remove(&key) else {
+                continue;
+            };
             if pairs.len() != b_vals.len() {
                 return Err(format!(
                     "peak {key:?} has {} steps, expected {}",
@@ -621,6 +670,7 @@ fn load_dosy_dataset(
                 intensities: pairs.into_iter().map(|(_, y)| y).collect(),
             });
         }
+        validate_loaded_dosy(&b_vals, &peaks)?;
         return Ok((b_vals, peaks));
     }
 
@@ -667,7 +717,7 @@ fn load_dosy_dataset(
         } else {
             x_col
         };
-        let peaks = cols0[1..]
+        let peaks: Vec<DosyInputPeakRecord> = cols0[1..]
             .iter()
             .enumerate()
             .zip(peak_cols)
@@ -678,6 +728,7 @@ fn load_dosy_dataset(
                 intensities,
             })
             .collect();
+        validate_loaded_dosy(&b_vals, &peaks)?;
         return Ok((b_vals, peaks));
     }
 
@@ -715,6 +766,7 @@ fn load_dosy_dataset(
             intensities: ints,
         });
     }
+    validate_loaded_dosy(&b_vals, &peaks)?;
     Ok((b_vals, peaks))
 }
 

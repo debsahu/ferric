@@ -213,6 +213,18 @@ fn multinuclear_apodization_zerofill_fft_hilbert_and_dept_physics() {
     let picks = pick_peaks_1d(&spec_h1, &PeakPickConfig1D::default());
     assert!((picks[0].ppm - 7.26).abs() < 1e-3);
     assert!((picks[1].ppm - 3.65).abs() < 1e-3);
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.1",
+            "kind": "t14_1_fft_hilbert_solvent_cal",
+            "f19_area_err": (total_area_hz - 4.0).abs(),
+            "hilbert_rel_err": max_err / max_imag,
+            "lg_valley_ratio": ratio_lg,
+            "exp_valley_ratio": ratio_exp,
+            "solvent_cal_err_ppm": (applied_shift - (-misref_offset)).abs()
+        })
+    );
 }
 
 #[test]
@@ -398,6 +410,19 @@ fn chen_minimum_entropy_autophase_recovers_phc0_and_phc1_across_pivots() {
         "DEPT-135 |dPHC1| got {:.3}, expected -44.0",
         sol_dept.phc1_deg
     );
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.1",
+            "kind": "t14_1_autophase",
+            "case_a_phc0_err_deg": err_p0,
+            "case_a_phc1_err_deg": err_p1,
+            "hilbert_phc0_err_deg": err_b_p0,
+            "hilbert_phc1_err_deg": err_b_p1,
+            "dept135_phc0_err_deg": phase_diff_deg(sol_dept.phc0_deg, 31.0).abs(),
+            "dept135_phc1_err_deg": (sol_dept.phc1_deg - (-44.0)).abs()
+        })
+    );
 }
 
 #[test]
@@ -524,6 +549,16 @@ fn whittaker_and_bernstein_baseline_correction_flatten_curved_roll() {
         post_b_rms < raw_rms / 35.0,
         "Bernstein baseline RMS did not flatten enough: raw={raw_rms:.5}, post={post_b_rms:.5}"
     );
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.1",
+            "kind": "t14_1_baseline",
+            "whittaker_suppression_ratio": raw_rms / post_w_rms,
+            "bernstein_suppression_ratio": raw_rms / post_b_rms,
+            "whittaker_quartet_area_rel_err_pct": 100.0 * ((area_w - area_true) / area_true).abs()
+        })
+    );
 }
 
 #[test]
@@ -605,11 +640,13 @@ fn hsvd_water_subtraction_and_frequency_notch_preserve_nearby_solute_peaks() {
     );
 
     // Nearby solute peaks at 4.91 ppm and 4.63 ppm must retain their exact heights & integrals (< 1.5% diff)!
+    let mut max_solute_rel_err = 0.0_f64;
     for &sol_ppm in &[4.91, 4.63, 7.82, 1.42] {
         let idx = spec_ref.axis.ppm_to_index(sol_ppm).round() as usize;
         let h_ref = spec_ref.real[idx];
         let h_clean = spec_clean.real[idx];
         let rel_err = ((h_clean - h_ref) / h_ref).abs();
+        max_solute_rel_err = max_solute_rel_err.max(rel_err);
         assert!(
             rel_err < 0.015,
             "Solute peak at {sol_ppm:.2} ppm perturbed by {:.3}% after HSVD",
@@ -621,6 +658,16 @@ fn hsvd_water_subtraction_and_frequency_notch_preserve_nearby_solute_peaks() {
     spec_clean.real[idx_water] = 50.0; // inject synthetic frequency spike
     suppress_solvent_notch_1d(&mut spec_clean, &NotchConfig1D::new(4.74, 4.84));
     assert!(spec_clean.real[idx_water].abs() < 0.02);
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.1",
+            "kind": "t14_1_hsvd_solvent",
+            "water_suppression_pct": 100.0 * (1.0 - post_water_mag / raw_water_mag),
+            "max_solute_height_err_pct": 100.0 * max_solute_rel_err,
+            "subtracted_poles": hsvd_res.subtracted_poles.len()
+        })
+    );
 }
 
 #[test]
@@ -749,6 +796,8 @@ fn global_pseudo_voigt_lm_deconvolution_recovers_overlapping_multiplet_areas() {
     );
 
     // Match each ground-truth component to its nearest fitted component and assert < 2% area error!
+    let mut max_voigt_area_err_pct = 0.0_f64;
+    let mut max_voigt_pos_err_hz = 0.0_f64;
     for &(true_mu, true_g, true_eta, true_area) in &truth {
         let best = dec
             .peaks
@@ -763,6 +812,8 @@ fn global_pseudo_voigt_lm_deconvolution_recovers_overlapping_multiplet_areas() {
         let area_rel_err = ((best.area_ppm - true_area) / true_area).abs();
         let fwhm_rel_err = ((best.fwhm_ppm - true_g) / true_g).abs();
         let eta_err = (best.lorentz_fraction - true_eta).abs();
+        max_voigt_area_err_pct = max_voigt_area_err_pct.max(100.0 * area_rel_err);
+        max_voigt_pos_err_hz = max_voigt_pos_err_hz.max(pos_err_hz);
 
         assert!(
             pos_err_hz < 0.15,
@@ -840,6 +891,7 @@ fn global_pseudo_voigt_lm_deconvolution_recovers_overlapping_multiplet_areas() {
 
     let cluster = deconvolve_region_1d(&spec_fid, 2.34, 2.46, None, &DeconvolveConfig1D::default());
     assert_eq!(cluster.peaks.len(), 5);
+    let mut max_fid_voigt_err_pct = 0.0_f64;
     for line in &fid_lines {
         let fit = cluster
             .peaks
@@ -851,6 +903,7 @@ fn global_pseudo_voigt_lm_deconvolution_recovers_overlapping_multiplet_areas() {
             })
             .unwrap();
         let rel_err = ((fit.area_hz - line.amplitude) / line.amplitude).abs();
+        max_fid_voigt_err_pct = max_fid_voigt_err_pct.max(100.0 * rel_err);
         assert!(
             rel_err < 0.02,
             "FID peak at {:.3} ppm area_hz error {:.3}% >= 2.0% (got {:.4}, expected {:.4})",
@@ -860,6 +913,18 @@ fn global_pseudo_voigt_lm_deconvolution_recovers_overlapping_multiplet_areas() {
             line.amplitude
         );
     }
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.1",
+            "kind": "t14_1_voigt_deconv",
+            "n_components": dec.peaks.len(),
+            "residual_rmsd": dec.residual_rmsd,
+            "max_voigt_area_err_pct": max_voigt_area_err_pct,
+            "max_voigt_pos_err_hz": max_voigt_pos_err_hz,
+            "max_fid_e2e_area_err_pct": max_fid_voigt_err_pct
+        })
+    );
 }
 
 #[test]
@@ -1007,4 +1072,153 @@ fn dept135_biphasic_deconvolution_group_delay_serde_and_edge_cases() {
             .peaks
             .is_empty()
     );
+}
+
+#[test]
+fn test_f15_adversarial_1d_ingest_error_paths() {
+    use nmr_core::nmr1d::{
+        load_1d_input, load_bruker_pdata_1d_dir, load_processed_spectrum_1d, parse_json_1d_str,
+        parse_tsv_1d_str, MAX_1D_INGEST_POINTS,
+    };
+    use std::fs;
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "nmr_core_f15_adversarial_1d_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(&tmp_root).expect("create temp dir");
+
+    let write_pdata = |sub: &str, procs_txt: &str, bytes_1r: &[u8], bytes_1i: Option<&[u8]>| {
+        let exp_dir = tmp_root.join(sub);
+        let pdata_dir = exp_dir.join("pdata").join("1");
+        fs::create_dir_all(&pdata_dir).expect("create pdata/1");
+        fs::write(
+            exp_dir.join("acqus"),
+            "##TITLE= f15_test\n##$PULPROG= <zg30>\n##$NUC1= <1H>\n##$SOLVENT= <CDCl3>\n",
+        )
+        .expect("write acqus");
+        fs::write(pdata_dir.join("procs"), procs_txt).expect("write procs");
+        fs::write(pdata_dir.join("1r"), bytes_1r).expect("write 1r");
+        if let Some(im) = bytes_1i {
+            fs::write(pdata_dir.join("1i"), im).expect("write 1i");
+        }
+        exp_dir
+    };
+
+    // Baseline valid Bruker pdata (`SI=16`, `DTYPP=0` i32 LE, 64 bytes)
+    let mut valid_1r = Vec::with_capacity(64);
+    for i in 0..16i32 {
+        valid_1r.extend_from_slice(&(i * 100).to_le_bytes());
+    }
+    let valid_procs = "##$SI= 16\n##$SF= 500.13\n##$SW_p= 5000.0\n##$OFFSET= 10.0\n##$NC_proc= 0\n##$BYTORDP= 0\n##$DTYPP= 0\n";
+    let ok_dir = write_pdata("ok_pdata", valid_procs, &valid_1r, None);
+    let ok_spec = load_processed_spectrum_1d(&ok_dir, None).expect("valid pdata must load");
+    assert_eq!(ok_spec.len(), 16);
+
+    // 1. Truncated Bruker `1r` (`SI=64` expects 256 bytes, file has 100 bytes)
+    let trunc_procs =
+        "##$SI= 64\n##$SF= 500.13\n##$SW_p= 5000.0\n##$OFFSET= 10.0\n##$BYTORDP= 0\n##$DTYPP= 0\n";
+    let trunc_dir = write_pdata("trunc_1r", trunc_procs, &[0u8; 100], None);
+    let err_trunc =
+        load_processed_spectrum_1d(&trunc_dir, None).expect_err("truncated 1r must Err");
+    assert!(err_trunc.contains("truncated Bruker"), "got: {err_trunc}");
+
+    // 2. `SI` disagreeing with `1r` length (`SI=16` expects 64 bytes, file has 128 bytes)
+    let mismatch_dir = write_pdata("si_mismatch", valid_procs, &[0u8; 128], None);
+    let err_mismatch =
+        load_processed_spectrum_1d(&mismatch_dir, None).expect_err("SI != 1r length must Err");
+    assert!(
+        err_mismatch.contains("disagrees with"),
+        "got: {err_mismatch}"
+    );
+
+    // 3. Truncated imaginary `1i` (`SI=16`, `1r`=64 bytes, `1i`=32 bytes)
+    let bad_1i_dir = write_pdata("trunc_1i", valid_procs, &valid_1r, Some(&[0u8; 32]));
+    let err_1i = load_bruker_pdata_1d_dir(&bad_1i_dir, None).expect_err("truncated 1i must Err");
+    assert!(err_1i.contains("1i"), "got: {err_1i}");
+
+    // 4. Oversized declared `SI` (`SI = 1_073_741_824` on tiny 16-byte `1r`) rejected BEFORE allocation
+    let huge_si_procs =
+        "##$SI= 1073741824\n##$SF= 500.13\n##$SW_p= 5000.0\n##$OFFSET= 10.0\n##$DTYPP= 0\n";
+    let huge_dir = write_pdata("huge_si", huge_si_procs, &[0u8; 16], None);
+    let err_huge =
+        load_processed_spectrum_1d(&huge_dir, None).expect_err("oversized SI must Err pre-alloc");
+    assert!(
+        err_huge.contains(&MAX_1D_INGEST_POINTS.to_string()),
+        "got: {err_huge}"
+    );
+
+    // 5. `NaN` and `+Inf` in Bruker `1r` (`DTYPP=2` IEEE-754 f64) and in `procs`
+    let f64_procs =
+        "##$SI= 8\n##$SF= 500.13\n##$SW_p= 5000.0\n##$OFFSET= 10.0\n##$BYTORDP= 0\n##$DTYPP= 2\n";
+    let mut nan_1r = Vec::with_capacity(64);
+    for k in 0..8 {
+        let v = if k == 3 { f64::NAN } else { 1.0 };
+        nan_1r.extend_from_slice(&v.to_le_bytes());
+    }
+    let nan_dir = write_pdata("nan_1r", f64_procs, &nan_1r, None);
+    assert!(load_processed_spectrum_1d(&nan_dir, None).is_err());
+
+    let mut inf_1r = Vec::with_capacity(64);
+    for k in 0..8 {
+        let v = if k == 5 { f64::INFINITY } else { 1.0 };
+        inf_1r.extend_from_slice(&v.to_le_bytes());
+    }
+    let inf_dir = write_pdata("inf_1r", f64_procs, &inf_1r, None);
+    assert!(load_processed_spectrum_1d(&inf_dir, None).is_err());
+
+    let nan_sf_procs =
+        "##$SI= 16\n##$SF= NaN\n##$SW_p= 5000.0\n##$OFFSET= 10.0\n##$BYTORDP= 0\n##$DTYPP= 0\n";
+    let nan_sf_dir = write_pdata("nan_sf", nan_sf_procs, &valid_1r, None);
+    assert!(load_processed_spectrum_1d(&nan_sf_dir, None).is_err());
+
+    // 6. Adversarial TSV 1D FID & spectrum inputs
+    let bad_tsvs = [
+        "",
+        "ppm\treal\n7.26\t1.0\n",
+        "ppm\treal\n7.26\tNaN\n1.50\t2.0\n",
+        "ppm\treal\ninf\t1.0\n1.50\t2.0\n",
+        "ppm\treal\n7.26\t1.0\n5.00\t2.0\t0.5\n",
+        "5.00\t1.0\n5.00\t2.0\n",
+        "# domain=fid; sw_hz=-2000\n0.0\t1.0\t0.0\n0.001\t0.5\t0.1\n",
+        "# domain=fid\nt_s\tre\tim\n0.002\t1.0\t0.0\n0.001\t0.5\t0.1\n",
+        "# obs_mhz=NaN\n8.0\t1.0\n1.0\t2.0\n",
+    ];
+    for bad in bad_tsvs {
+        assert!(
+            parse_tsv_1d_str(bad, "bad_tsv", None).is_err(),
+            "expected Err on adversarial TSV {bad:?}"
+        );
+    }
+
+    // 7. Adversarial JSON 1D FID & spectrum inputs
+    let bad_jsons = [
+        "{not valid json",
+        "[]",
+        r#"{"foo": 123}"#,
+        // Oversized axis.size rejected pre-deserialization
+        r#"{"name":"x","experiment":"Proton1D","axis":{"label":"1H","obs_mhz":500.0,"size":99999999,"first_ppm":10.0,"step_ppm":-0.001},"real":[1.0,2.0]}"#,
+        // axis.size != real.len()
+        r#"{"name":"x","experiment":"Proton1D","axis":{"label":"1H","obs_mhz":500.0,"size":8,"first_ppm":10.0,"step_ppm":-0.1},"real":[1.0,2.0,3.0,4.0]}"#,
+        // imag.len() != real.len()
+        r#"{"name":"x","experiment":"Proton1D","axis":{"label":"1H","obs_mhz":500.0,"size":4,"first_ppm":10.0,"step_ppm":-0.1},"real":[1.0,2.0,3.0,4.0],"imag":[0.0,0.0]}"#,
+        // TimeDomain1D active_td > data.len()
+        r#"{"name":"td","experiment":"Proton1D","sw_hz":5000.0,"obs_mhz":500.0,"carrier_ppm":4.7,"data":[[1.0,0.0],[0.5,0.1]],"active_td":16,"group_delay_pts":0.0,"conjugate_for_fft":false}"#,
+        // TimeDomain1D non-positive sw_hz
+        r#"{"name":"td","experiment":"Proton1D","sw_hz":0.0,"obs_mhz":500.0,"carrier_ppm":4.7,"data":[[1.0,0.0],[0.5,0.1]],"active_td":2,"group_delay_pts":0.0,"conjugate_for_fft":false}"#,
+    ];
+    for bad in bad_jsons {
+        assert!(
+            parse_json_1d_str(bad, None).is_err(),
+            "expected Err on adversarial JSON {bad}"
+        );
+    }
+
+    // Empty directory must also return Err cleanly
+    let empty_dir = tmp_root.join("empty_dir");
+    fs::create_dir_all(&empty_dir).expect("mkdir empty");
+    assert!(load_1d_input(&empty_dir, None, false).is_err());
+
+    let _ = fs::remove_dir_all(&tmp_root);
 }

@@ -63,7 +63,9 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
     - **`T13.5` (`nmr-core::cpmg`, `nmr-gpu::cpmg_gpu`, `shaders/cpmg_fit.wgsl`, `nmrassign cpmg`)**: Multi-field (`500–1200 MHz`) `Baldwin2014` (`1.381e-11 s^-1` vs exact `2x2` matrix spin-echo propagator across `3,360` $\Delta R_2 \neq 0$ grid points), `CR72`, `LM63`, and asymmetric off-resonance `TrottPalmerR1Rho` dispersion fitting on CPU & WebGPU (`6.860e-5 s^-1 < 2e-3 s^-1` batch parity; synthetic `600 + 800 MHz` recovery within `0.01%–1.15% < 2.0%` in `0.005–0.012 s` on WebGPU) with `AICc` + nested $F$-test flat-baseline gating.
     - **`T13.6` (`nmr-core::csp`, `nmrassign csp`, `nmr-gui::dynamics_panel`)**: $O(N^3)$ Hungarian `15N-HSQC` & `13C-HMQC` titration peak tracker with exchange-broadened `slack` dropout & apo `[L]_t = 0` deduplication, dilution-corrected (`[P]_t,i`) exact quadratic $1:1$ tight-binding $K_d$ solver + MC `95%` CIs (synthetic tight `Kd = 4.965 uM` vs `5.00 uM` at `[P]_0 = 100 uM`, `0.69% < 2.0%` err vs `14.67x` naive Michaelis–Menten bias; `13C-HMQC` `11.974 uM` vs `12.00 uM`, `0.21%` err), iterative $2\sigma$ pocket calling, and `wasm32`-clean `DynamicsStudioPanel` 1-click 3D `CSP`/$S^2$/$R_{\text{ex}}$ putty projection (`0` new external crates; `Cargo.toml` / `Cargo.lock` bump workspace version `0.8.0 -> 0.9.0` only).
 
-  - **5. Mandatory `AGENTS.md` 5-Seed `--realistic` Ubiquitin & `CISD3` (`BMRB 51439`) Solver Regression Gates (`v0.9.0`):**
+  - **5. Slice `13.6` Tests & Mandatory `AGENTS.md` 5-Seed `--realistic` Ubiquitin & `CISD3` (`BMRB 51439`) Solver Regression Gates (`v0.9.0`):**
+
+    Slice 13.6 tests:
 
     | Suite Binary | Passed | Failed |
     | :--- | ---: | ---: |
@@ -75,6 +77,9 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
     | `exchange_cli_tests.rs` | `4` | `0` |
     | **Slice `13.6` Dedicated Total** | **`23`** | **`0`** |
     | **Full Workspace (`cargo test --release --workspace`)** | **`453`** | **`0`** |
+
+    Solver regression (5 seeds):
+
     | Engine | Ubiquitin `--realistic` (`5` Seeds) Acc | Ubiquitin Recall | Ubiquitin HC-Prec (`>=0.80`) | `CISD3` (`5` Seeds) Acc | `CISD3` Recall | `CISD3` HC-Prec (`>=0.80`) |
     | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
     | `evo-graph` (`CPU f64`) | `98.4% (assigned=319)` | `90.8% (assignable=346)` | `98.4% (310/315)` | `64.38%` | `40.39%` | `100.00%` (`59/59`) |

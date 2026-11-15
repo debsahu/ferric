@@ -795,3 +795,92 @@ fn test_metabolomics_oplsda_null_label_anti_overfitting_guard() {
         })
     );
 }
+
+#[test]
+fn test_adversarial_error_paths_dosy_and_metabolomics_cli() {
+    let tmp = ScopedTempDir::new("adversarial_w2_cli");
+
+    let expect_cli_err = |args: &[&str]| {
+        let out = Command::new(nmrassign_bin())
+            .args(args)
+            .output()
+            .expect("spawn nmrassign");
+        assert!(
+            !out.status.success(),
+            "expected CLI failure for args {args:?}, but exited 0"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.trim().is_empty(),
+            "expected diagnostic stderr for {args:?}"
+        );
+        assert!(
+            !stderr.contains("panicked at"),
+            "CLI panicked on {args:?}: {stderr}"
+        );
+    };
+
+    // 1. DOSY adversarial inputs: NaN intensity TSV, < 3 b-steps, unphysical Delta <= delta/3, NaN shape, bad MW
+    let nan_dosy_tsv = tmp.path.join("nan_dosy.tsv");
+    fs::write(
+        &nan_dosy_tsv,
+        "b_s_m2\tpk_7.20\n1.0e8\t100.0\n5.0e8\tNaN\n1.0e9\t40.0\n2.0e9\t15.0\n",
+    )
+    .unwrap();
+    let short_dosy_tsv = tmp.path.join("short_dosy.tsv");
+    fs::write(
+        &short_dosy_tsv,
+        "b_s_m2\tpk_7.20\n1.0e8\t100.0\n5.0e8\t60.0\n",
+    )
+    .unwrap();
+    let bad_json = tmp.path.join("corrupt.json");
+    fs::write(&bad_json, "{corrupt_json").unwrap();
+
+    expect_cli_err(&["dosy", "fit", "--in", nan_dosy_tsv.to_str().unwrap()]);
+    expect_cli_err(&["dosy", "ilt", "--in", nan_dosy_tsv.to_str().unwrap()]);
+    expect_cli_err(&["dosy", "fit", "--in", short_dosy_tsv.to_str().unwrap()]);
+    expect_cli_err(&["dosy", "fit", "--in", bad_json.to_str().unwrap()]);
+    expect_cli_err(&[
+        "dosy",
+        "fit",
+        "--in",
+        nan_dosy_tsv.to_str().unwrap(),
+        "--shape",
+        "NaN",
+    ]);
+    expect_cli_err(&["dosy", "mw", "--d", "-1.0e-10"]);
+    expect_cli_err(&["dosy", "mw", "--d", "NaN"]);
+
+    // 2. Metabolomics adversarial inputs: NaN bucket CSV, single-class OPLS-DA, min-ppm >= max-ppm, missing driver
+    let nan_buckets = tmp.path.join("nan_buckets.csv");
+    fs::write(
+        &nan_buckets,
+        "sample_id,group,dilution_factor,B0_1.330ppm,B1_4.110ppm\nS1,Control,1.0,10.0,NaN\nS2,Case,1.0,20.0,6.5\n",
+    )
+    .unwrap();
+    let one_group_buckets = tmp.path.join("one_group.csv");
+    fs::write(
+        &one_group_buckets,
+        "sample_id,group,dilution_factor,B0_1.330ppm,B1_4.110ppm\nS1,Control,1.0,10.0,3.2\nS2,Control,1.0,11.0,3.5\nS3,Control,1.0,9.5,3.1\n",
+    )
+    .unwrap();
+
+    expect_cli_err(&["metabolomics", "pca", "--in", nan_buckets.to_str().unwrap()]);
+    expect_cli_err(&[
+        "metabolomics",
+        "oplsda",
+        "--in",
+        one_group_buckets.to_str().unwrap(),
+    ]);
+    expect_cli_err(&[
+        "metabolomics",
+        "bin",
+        "--demo",
+        "--min-ppm",
+        "9.0",
+        "--max-ppm",
+        "1.0",
+    ]);
+    expect_cli_err(&["metabolomics", "stocsy", "--demo"]);
+    expect_cli_err(&["metabolomics", "pca", "--in", bad_json.to_str().unwrap()]);
+}

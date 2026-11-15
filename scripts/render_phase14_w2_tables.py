@@ -21,9 +21,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -48,8 +50,14 @@ BENCHMARK_ENGINES = [
 
 
 def sanitize_host_paths(text: str, root: Path) -> str:
+    out = text.replace("\r\n", "\n").replace("\r", "\n")
     root_s = str(root.resolve())
-    out = text.replace(root_s, "<repo_root>")
+    out = out.replace(root_s, "<repo_root>")
+    out = re.sub(
+        r"/(?:Users|home)/[A-Za-z0-9_.-]+/Workspace/nmr_software",
+        "<main_repo>",
+        out,
+    )
     return HOST_PATH_RE.sub("<user_home>", out)
 
 
@@ -91,96 +99,115 @@ def run_w2_benchmarks_and_workspace(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        check=True,
+        check=False,
     )
     (results_dir / "w2_workspace_tests.log").write_text(
         f"$ {' '.join(ws_cmd)}\n{sanitize_host_paths(ws_proc.stdout, root)}\n",
         encoding="utf-8",
     )
+    if ws_proc.returncode != 0:
+        sys.stderr.write(ws_proc.stdout[-4000:])
+        ws_proc.check_returncode()
 
     # 2. 5-seed Ubiquitin --realistic & 5-seed CISD3 (BMRB 51439)
-    for slug, _label, (solver, engine) in BENCHMARK_ENGINES:
-        ubq_cmd = [
-            "cargo",
-            "run",
-            "--release",
-            "-p",
-            "nmr-cli",
-            "--",
-            "benchmark",
-            "--star",
-            "data/fixtures/synthetic_ubiquitin.str",
-            "--realistic",
-            "--seeds",
-            "5",
-            "--solver",
-            solver,
-            "--engine",
-            engine,
-        ]
-        ubq_proc = subprocess.run(
-            ubq_cmd,
-            cwd=root_s,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=True,
-        )
-        (results_dir / f"w2_ubq_realistic_{slug}.log").write_text(
-            f"$ {' '.join(ubq_cmd)}\n{sanitize_host_paths(ubq_proc.stdout, root)}\n",
-            encoding="utf-8",
-        )
-
-        if cisd3_data_root is not None and cisd3_data_root.is_dir():
-            cisd3_json_p = results_dir / f"w2_cisd3_{slug}.json"
-            cisd3_cmd = [
+    fd, tmp_manifest_str = tempfile.mkstemp(prefix="cisd3_w2_manifest_", suffix=".tsv")
+    tmp_manifest = Path(tmp_manifest_str)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(
+                "bmrb_id\tprotein\tresidues\tfield_mhz\tvendor\texperiments\tsplit\tcohort\n"
+                "51439\tCISD3\t93\t900\tBruker\tHSQC,HNCO,HNCA,HNCOCA,CBCACONH\tdev\tdev\n"
+            )
+        for slug, _label, (solver, engine) in BENCHMARK_ENGINES:
+            ubq_cmd = [
                 "cargo",
                 "run",
                 "--release",
                 "-p",
                 "nmr-cli",
                 "--",
-                "real-benchmark",
-                "--split",
-                "dev",
-                "--cohort",
-                "cisd3",
+                "benchmark",
+                "--star",
+                "data/fixtures/synthetic_ubiquitin.str",
+                "--realistic",
+                "--seeds",
+                "5",
                 "--solver",
                 solver,
                 "--engine",
                 engine,
-                "--seeds",
-                "5",
-                "--data-root",
-                str(cisd3_data_root),
-                "--json-out",
-                str(cisd3_json_p),
             ]
-            cisd3_proc = subprocess.run(
-                cisd3_cmd,
+            ubq_proc = subprocess.run(
+                ubq_cmd,
                 cwd=root_s,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 check=True,
             )
-            display_cmd = [
-                "data/private" if a == str(cisd3_data_root) else (
-                    f"data/private/p14_w2_results/{cisd3_json_p.name}"
-                    if a == str(cisd3_json_p)
-                    else a
-                )
-                for a in cisd3_cmd
-            ]
-            (results_dir / f"w2_cisd3_{slug}.log").write_text(
-                f"$ {' '.join(display_cmd)}\n{sanitize_host_paths(cisd3_proc.stdout, root)}\n",
+            (results_dir / f"w2_ubq_realistic_{slug}.log").write_text(
+                f"$ {' '.join(ubq_cmd)}\n{sanitize_host_paths(ubq_proc.stdout, root)}\n",
                 encoding="utf-8",
             )
-            if cisd3_json_p.is_file():
-                clean_json = sanitize_host_paths(
-                    cisd3_json_p.read_text(encoding="utf-8"), root
+
+            if cisd3_data_root is not None and cisd3_data_root.is_dir():
+                cisd3_json_p = results_dir / f"w2_cisd3_{slug}.json"
+                cisd3_cmd = [
+                    "cargo",
+                    "run",
+                    "--release",
+                    "-p",
+                    "nmr-cli",
+                    "--",
+                    "real-benchmark",
+                    "--manifest",
+                    str(tmp_manifest),
+                    "--split",
+                    "dev",
+                    "--solver",
+                    solver,
+                    "--engine",
+                    engine,
+                    "--seeds",
+                    "5",
+                    "--data-root",
+                    str(cisd3_data_root),
+                    "--json-out",
+                    str(cisd3_json_p),
+                ]
+                cisd3_proc = subprocess.run(
+                    cisd3_cmd,
+                    cwd=root_s,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=True,
                 )
-                cisd3_json_p.write_text(clean_json, encoding="utf-8")
+                display_cmd = [
+                    "<cisd3_manifest.tsv>" if a == str(tmp_manifest) else (
+                        "data/private/bmrb" if a == str(cisd3_data_root) else (
+                            f"data/private/p14_w2_results/{cisd3_json_p.name}"
+                            if a == str(cisd3_json_p)
+                            else a
+                        )
+                    )
+                    for a in cisd3_cmd
+                ]
+                clean_stdout = sanitize_host_paths(cisd3_proc.stdout, root).replace(
+                    str(tmp_manifest), "<cisd3_manifest.tsv>"
+                )
+                (results_dir / f"w2_cisd3_{slug}.log").write_text(
+                    f"$ {' '.join(display_cmd)}\n{clean_stdout}\n",
+                    encoding="utf-8",
+                )
+                if cisd3_json_p.is_file():
+                    clean_json = sanitize_host_paths(
+                        cisd3_json_p.read_text(encoding="utf-8"), root
+                    ).replace(str(tmp_manifest), "<cisd3_manifest.tsv>")
+                    cisd3_json_p.write_text(clean_json, encoding="utf-8")
+    finally:
+        if tmp_manifest.exists():
+            tmp_manifest.unlink()
 
 
 def sha256_and_size(path: Path) -> tuple[int, str]:
@@ -197,14 +224,21 @@ def sha256_and_size(path: Path) -> tuple[int, str]:
 
 
 def display_rel_path(path: Path, root: Path, results_dir: Path) -> str:
+    if path.name.startswith("phase14_W2_review_pack"):
+        return "data/private/phase14_W2_review_pack.md"
     rp = path.resolve()
-    try:
-        return rp.relative_to(root.resolve()).as_posix()
-    except ValueError:
-        pass
     try:
         sub = rp.relative_to(results_dir.resolve()).as_posix()
         return f"data/private/p14_w2_results/{sub}"
+    except ValueError:
+        pass
+    try:
+        sub_priv = rp.relative_to(results_dir.resolve().parent).as_posix()
+        return f"data/private/{sub_priv}"
+    except ValueError:
+        pass
+    try:
+        return rp.relative_to(root.resolve()).as_posix()
     except ValueError:
         return path.name
 
@@ -377,7 +411,7 @@ def render_t14_4_section(records: list[dict[str, Any]]) -> str:
     lines = [
         "### Slice `14.3` (`T14.4`) — Pseudo-2D `DOSY` CPU/WebGPU Stejskal–Tanner, Opt-In Tikhonov `ILT` & Stokes–Einstein Hydrodynamics",
         "",
-        "> **Validation Scope (`Synthetic Forward-Model Self-Consistency`)**: Every quantitative `T14.4` gate below evaluates synthetic forward-model Stejskal–Tanner / Wu–Johnson multi-exponential decays and analytical viscosity/Stokes–Einstein references (`0` real deposited raw Bruker `difflist`/`ser` or Varian `fid`/`procpar` experimental `DOSY` datasets evaluated yet — tracked openly as `F15`).",
+        "> **Validation Scope (`Synthetic Forward-Model Self-Consistency`)**: Every quantitative `T14.4` gate below evaluates synthetic forward-model Stejskal–Tanner / Wu–Johnson multi-exponential decays and analytical viscosity/Stokes–Einstein references (`0` real deposited raw Bruker `difflist`/`ser` or Varian `fid`/`procpar` experimental `DOSY` datasets evaluated yet — tracked openly as `F16`).",
         "",
         "#### Discrete 1–3 Component Stejskal–Tanner / Wu–Johnson CPU (`f64`) & WebGPU (`f32`) Fitting + `BIC` Selection",
         "",
@@ -398,12 +432,12 @@ def render_t14_4_section(records: list[dict[str, Any]]) -> str:
 
     if gpu_par is not None:
         lines.append(
-            f"| Parallel column-wise WGSL `LM` (`{gpu_par['n_columns']}` cols, `K=1..2` + `BIC`) vs CPU `f64` | WebGPU `f32` (`{gpu_par['adapter']}`) | `100%` `BIC` order match; max `|dD|/D` mono `{100.0 * gpu_par['max_mono_rel_diff']:.4f}%`, bi `{100.0 * gpu_par['max_bi_rel_diff']:.4f}%` | `< 1.0%` GPU–CPU diff | {fmt_status(bool(gpu_par['passed']))} |"
+            f"| Parallel column-wise WGSL `LM` (`{gpu_par['n_columns']}` cols, `K=1..2` + `BIC`) vs CPU `f64` | WebGPU `f32` (`{gpu_par['adapter']}`) | `100%` `BIC` order match; max `abs(dD)/D` mono `{100.0 * gpu_par['max_mono_rel_diff']:.4f}%`, bi `{100.0 * gpu_par['max_bi_rel_diff']:.4f}%` | `< 1.0%` GPU–CPU diff | {fmt_status(bool(gpu_par['passed']))} |"
         )
 
     if cli_fit is not None:
         lines.append(
-            f"| `nmrassign dosy fit` CLI (`Bruker difflist/acqus` + `Varian procpar` + `--engine gpu`) | CPU `f64` + WebGPU `f32` | `K=1` err `{100.0 * cli_fit['k1_rel_err']:.3f}%`, `K=2` err `{100.0 * cli_fit['k2_rel_err_max']:.3f}%`, GPU–CPU `|d log10(D)| = {cli_fit['max_gpu_dex_diff']:.2e}` dex | `< 1.5%` / `< 0.015` dex | {fmt_status(bool(cli_fit['passed']))} |"
+            f"| `nmrassign dosy fit` CLI (`Bruker difflist/acqus` + `Varian procpar` + `--engine gpu`) | CPU `f64` + WebGPU `f32` | `K=1` err `{100.0 * cli_fit['k1_rel_err']:.3f}%`, `K=2` err `{100.0 * cli_fit['k2_rel_err_max']:.3f}%`, GPU–CPU `abs(d log10 D) = {cli_fit['max_gpu_dex_diff']:.2e}` dex | `< 1.5%` / `< 0.015` dex | {fmt_status(bool(cli_fit['passed']))} |"
         )
 
     lines.extend(
@@ -418,7 +452,7 @@ def render_t14_4_section(records: list[dict[str, Any]]) -> str:
 
     for rec in sorted(ilt_list, key=lambda r: str(r.get("strategy", ""))):
         lines.append(
-            f"| Tikhonov `ILT` (`SecondDerivative` + `NNLS`, `{rec['strategy']}`) | `alpha = {rec['selected_lambda']:.3e}` (`{rec['n_modes']}` modes) | `|d log10(D)| = ({rec['log10_err_slow']:.4f}, {rec['log10_err_fast']:.4f})` dex; areas `({100.0 * rec['area_slow']:.1f}%, {100.0 * rec['area_fast']:.1f}%)` | `< 0.08` dex, `50% +- 12%` | {fmt_status(bool(rec['passed']))} |"
+            f"| Tikhonov `ILT` (`SecondDerivative` + `NNLS`, `{rec['strategy']}`) | `alpha = {rec['selected_lambda']:.3e}` (`{rec['n_modes']}` modes) | `abs(d log10 D) = ({rec['log10_err_slow']:.4f}, {rec['log10_err_fast']:.4f})` dex; areas `({100.0 * rec['area_slow']:.1f}%, {100.0 * rec['area_fast']:.1f}%)` | `< 0.08` dex, `50% +- 12%` | {fmt_status(bool(rec['passed']))} |"
         )
 
     if hydro is not None:
@@ -441,7 +475,7 @@ def render_t14_5_section(records: list[dict[str, Any]]) -> str:
     lines = [
         "### Slice `14.4` (`T14.5`) — Untargeted 1D NMR Metabolomics (`AIB`, `PQN`, `PCA`, `OPLS-DA` & `STOCSY`, Spec `20`)",
         "",
-        "> **Validation Scope (`Synthetic Forward-Model Self-Consistency`)**: Every quantitative `T14.5` gate below evaluates synthetic biofluid cohorts with planted dilution factors, pH jitter, orthogonal within-group drift, and spiked metabolite fold changes against the built-in 28-entry CC0 `BMRB` canonical reference table (`0` deposited public MetaboLights experimental 1D cohorts such as `MTBLS1` evaluated yet — tracked openly as `F16`).",
+        "> **Validation Scope (`Synthetic Forward-Model Self-Consistency`)**: Every quantitative `T14.5` gate below evaluates synthetic biofluid cohorts with planted dilution factors, pH jitter, orthogonal within-group drift, and spiked metabolite fold changes against the built-in 28-entry CC0 `BMRB` canonical reference table (`0` deposited public MetaboLights experimental 1D cohorts such as `MTBLS1` evaluated yet — tracked openly as `F17`).",
         "",
         "#### Preprocessing (`PQN` Dilution Invariance & `De Meyer 2008` Adaptive Intelligent Binning)",
         "",
@@ -486,7 +520,7 @@ def render_t14_5_section(records: list[dict[str, Any]]) -> str:
 
     if cli_e2e is not None and cli_null is not None:
         lines.append(
-            f"| `nmrassign metabolomics bin|pca|oplsda|stocsy` CLI | `24`-sample demo + null-shuffled guard | `P = {cli_e2e['n_buckets']}`, `PC1 = {100.0 * cli_e2e['pca_pc1_var']:.1f}%`, `OPLS Q2 = {cli_e2e['opls_q2']:.4f}` (`p = {cli_e2e['opls_perm_p']:.4f}`), null `Q2 = {cli_null['null_q2']:.4f}` (`OVERFIT WARNING`), `STOCSY #1 = {cli_e2e['stocsy_top_bmrb_id']}` | End-to-end CLI parity | {fmt_status(bool(cli_e2e['passed'] and cli_null['passed']))} |"
+            f"| `nmrassign metabolomics bin / pca / oplsda / stocsy` CLI | `24`-sample demo + null-shuffled guard | `P = {cli_e2e['n_buckets']}`, `PC1 = {100.0 * cli_e2e['pca_pc1_var']:.1f}%`, `OPLS Q2 = {cli_e2e['opls_q2']:.4f}` (`p = {cli_e2e['opls_perm_p']:.4f}`), null `Q2 = {cli_null['null_q2']:.4f}` (`OVERFIT WARNING`), `STOCSY #1 = {cli_e2e['stocsy_top_bmrb_id']}` | End-to-end CLI parity | {fmt_status(bool(cli_e2e['passed'] and cli_null['passed']))} |"
         )
 
     return "\n".join(lines)

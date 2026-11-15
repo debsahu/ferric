@@ -10,6 +10,7 @@ pub mod dosy_cmd;
 pub mod exchange_cmd;
 pub mod metabolomics_cmd;
 pub mod methyl_cmd;
+pub mod nmr1d_cmd;
 pub mod relax_cmd;
 
 use std::collections::BTreeMap;
@@ -220,6 +221,7 @@ fn usage() -> String {
        nmrassign cest            --in <profiles.tsv> [--in <profiles_b2.tsv> ...] [--out <fit.tsv>] [--states 2|3] [--triangular] [--b1-quad 5] [--engine cpu|gpu|auto] [--chi2-surface] [--json-out <fit.json>]\n\
        nmrassign cpmg            (--in <cpmg.tsv> ... | --raw-planes <planes.tsv> ... | --r1rho <r1rho.tsv> --major-ppm <ppm> --larmor-mhz <mhz>) [--out <fit.tsv>] [--model baldwin2014|cr72|lm63|numerical2x2|flat] [--engine cpu|gpu|auto] [--json-out <fit.json>]\n\
        nmrassign csp             (--apo-peaks <apo.tsv> | --star <apo.str>) --step <[L]_uM[:[P]_uM]=path> ... [--out <csp.tsv>] [--experiment hsqc|hmqc] [--protein-um 100.0] [--ligand-stock-um <uM>] [--mc-trials 400] [--trajectories-out <traj.tsv>] [--json-out <csp.json>]\n\
+       nmrassign nmr1d           (process | multiplet | qnmr) [options]  (see `nmrassign nmr1d --help`)\n\
        nmrassign structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--rdc <rdcs.tsv|rdcs.nef>] [--torsion-db] [--include-chi1] [--rdc-weight 0.75] [--rdc-free-frac 0.20] [--engine auto|gpu|cpu] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
@@ -8334,6 +8336,7 @@ fn main() {
         "cest" | "dest" => exchange_cmd::run_cest_cli(&args[1..]),
         "cpmg" | "r1rho" => exchange_cmd::run_cpmg_cli(&args[1..]),
         "csp" => exchange_cmd::run_csp_cli(&args[1..]),
+        "nmr1d" => nmr1d_cmd::run_nmr1d_cli(&args[1..]),
         "structure" => cmd_structure(&args[1..]),
         "nef-import" => cmd_nef_import(&args[1..]),
         "nef-export" => cmd_nef_export(&args[1..]),

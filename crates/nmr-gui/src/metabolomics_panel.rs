@@ -1047,9 +1047,8 @@ impl MetabolomicsStudioPanel {
                     }
                 }
 
-                let (x_lbl, y_lbl) = match self.score_mode {
-                    ScorePlotMode::OplsDa if study.opls_da.is_some() => {
-                        let op = study.opls_da.as_ref().unwrap();
+                let (x_lbl, y_lbl) = match (&self.score_mode, study.opls_da.as_ref(), study.pls_da.as_ref()) {
+                    (ScorePlotMode::OplsDa, Some(op), _) => {
                         let to1 = op.orthogonal_scores.first();
                         for (k, &si) in op.active_sample_indices.iter().enumerate() {
                             let sx = op.predictive_scores[k];
@@ -1080,8 +1079,7 @@ impl MetabolomicsStudioPanel {
                             format!("to1 ({:.1}% R²Xo)", op.r2_x_orthogonal * 100.0),
                         )
                     }
-                    ScorePlotMode::PlsDa if study.pls_da.is_some() => {
-                        let pl = study.pls_da.as_ref().unwrap();
+                    (ScorePlotMode::PlsDa, _, Some(pl)) => {
                         for (k, &si) in pl.active_sample_indices.iter().enumerate() {
                             let sx = pl.scores[k].first().copied().unwrap_or(0.0);
                             let sy = pl.scores[k].get(1).copied().unwrap_or(0.0);

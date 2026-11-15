@@ -3518,37 +3518,25 @@ fn select_binary_contrast_groups(
             .find(|g| g.as_str() == c)
             .cloned()
             .unwrap_or_else(|| valid_groups[0].clone())
-    } else if valid_groups
+    } else if let Some(found) = valid_groups
         .iter()
-        .any(|g| g.eq_ignore_ascii_case("control"))
+        .find(|g| g.eq_ignore_ascii_case("control"))
     {
-        valid_groups
-            .iter()
-            .find(|g| g.eq_ignore_ascii_case("control"))
-            .unwrap()
-            .clone()
+        found.clone()
     } else {
         valid_groups[0].clone()
     };
 
     let case = if let Some(c) = case_override {
-        valid_groups
+        match valid_groups
             .iter()
             .find(|g| g.as_str() == c && g.as_str() != ctrl)
-            .cloned()
-            .unwrap_or_else(|| {
-                valid_groups
-                    .iter()
-                    .find(|g| g.as_str() != ctrl)
-                    .unwrap()
-                    .clone()
-            })
+        {
+            Some(found) => found.clone(),
+            None => valid_groups.iter().find(|g| g.as_str() != ctrl)?.clone(),
+        }
     } else {
-        valid_groups
-            .iter()
-            .find(|g| g.as_str() != ctrl)
-            .unwrap()
-            .clone()
+        valid_groups.iter().find(|g| g.as_str() != ctrl)?.clone()
     };
 
     let mut active_indices = Vec::new();

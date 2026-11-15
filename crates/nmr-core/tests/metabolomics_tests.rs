@@ -946,3 +946,89 @@ fn test_pipeline_determinism_and_csv_json_export_roundtrip() {
     assert_eq!(parsed.top_biomarkers.len(), 10);
     assert_eq!(parsed.opls_is_validated, Some(true));
 }
+
+/// [Test 13] Adversarial & degenerate inputs return `None`/`Err` cleanly without panicking.
+#[test]
+fn test_metabolomics_adversarial_and_degenerate_inputs() {
+    use nmr_core::metabolomics::compute_stocsy;
+    use nmr_core::nmr1d::{Experiment1DKind, Spectrum1D};
+    use nmr_core::spectrum::AxisPpm;
+
+    // 1. Empty cohort & single-sample cohort must never panic
+    let empty_study = run_metabolomics_pipeline(&[], &MetabolomicsPipelineConfig::default());
+    assert!(empty_study.buckets.is_empty());
+    assert!(empty_study.opls_da.is_none());
+
+    // 2. `fit_opls_da` rejects single-group cohorts, `< 2` samples per class, and group-count mismatch
+    let x4 = vec![
+        vec![1.0, 2.0, 3.0],
+        vec![1.2, 2.1, 2.9],
+        vec![2.0, 1.0, 4.0],
+        vec![2.1, 0.9, 4.2],
+    ];
+    let one_group = vec!["Control".to_string(); 4];
+    assert!(fit_opls_da(
+        &x4,
+        &one_group,
+        ScalingMethod::Pareto,
+        1,
+        5,
+        10,
+        42,
+        None,
+        None
+    )
+    .is_none());
+
+    let singleton_case = vec![
+        "Control".to_string(),
+        "Control".to_string(),
+        "Control".to_string(),
+        "Case".to_string(),
+    ];
+    assert!(fit_opls_da(
+        &x4,
+        &singleton_case,
+        ScalingMethod::Pareto,
+        1,
+        5,
+        10,
+        42,
+        None,
+        None
+    )
+    .is_none());
+
+    assert!(fit_opls_da(
+        &x4,
+        &one_group[..2],
+        ScalingMethod::Pareto,
+        1,
+        5,
+        10,
+        42,
+        None,
+        None
+    )
+    .is_none());
+
+    // 3. Out-of-bounds STOCSY driver index returns `None`
+    assert!(compute_stocsy(99, &[], &x4, None, &[]).is_none());
+
+    // 4. Corrupted `Spectrum1D` (`NaN` intensity or `axis.size != real.len()`) rejected by `validate()`
+    let ax = AxisPpm::from_bounds("1H", 16, 10.0, 0.0, 600.0);
+    let mut nan_real = vec![1.0; 16];
+    nan_real[7] = f64::NAN;
+    let bad_nan = Spectrum1D::new("nan", Experiment1DKind::Proton1D, ax, nan_real, None);
+    assert!(bad_nan.validate().is_err());
+
+    let mut bad_len = Spectrum1D::new(
+        "short",
+        Experiment1DKind::Proton1D,
+        AxisPpm::from_bounds("1H", 4, 10.0, 0.0, 600.0),
+        vec![1.0; 4],
+        None,
+    );
+    bad_len.axis.size = 16;
+    assert!(bad_len.validate().is_err());
+}

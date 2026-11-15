@@ -130,6 +130,7 @@ use nmr_gui::{
     sidechain_widget::{
         AssignedAtomInfo, SequenceRibbonState, SidechainInspectorPanel, SidechainWorkspaceInput,
     },
+    stack1d_panel::{build_kinetics_demo_traces, render_stack1d_panel, Stack1dState, Trace1d},
     strip_tiler::{StripSpectra3D, StripTilerAction, StripTilerContext, StripTilerPanel},
     workflow_bar::{draw_workbench_chrome, WorkbenchAction, WorkspaceReadiness},
 };
@@ -1647,6 +1648,8 @@ struct NmrWorkbenchApp {
     show_relax_panel: bool,
     dynamics_panel: DynamicsStudioPanel,
     show_dynamics_panel: bool,
+    stack1d_panel: Stack1dState,
+    show_stack1d_panel: bool,
 
     // Spectra for GPU contour & 3D strip visualization
     hsqc_spec: Option<Spectrum2D>,
@@ -1833,6 +1836,8 @@ impl NmrWorkbenchApp {
             show_relax_panel: false,
             dynamics_panel: DynamicsStudioPanel::new(),
             show_dynamics_panel: false,
+            stack1d_panel: Stack1dState::default(),
+            show_stack1d_panel: false,
             hsqc_spec: None,
             hsqc_arc: Arc::new(Vec::new()),
             hsqc_gen: 1,
@@ -3166,6 +3171,7 @@ impl NmrWorkbenchApp {
                     self.workspace_mode = WorkspaceMode::ProteinNmr;
                     self.show_relax_panel = true;
                     self.show_dynamics_panel = false;
+                    self.show_stack1d_panel = false;
                     self.has_structure_or_dynamics = true;
                     self.status_msg = msg;
                 }
@@ -3184,6 +3190,7 @@ impl NmrWorkbenchApp {
                     self.workspace_mode = WorkspaceMode::ProteinNmr;
                     self.show_dynamics_panel = true;
                     self.show_relax_panel = false;
+                    self.show_stack1d_panel = false;
                     self.has_structure_or_dynamics = true;
                     self.status_msg = msg;
                 }
@@ -3192,6 +3199,96 @@ impl NmrWorkbenchApp {
                 }
             }
             return;
+        }
+
+        // Check 1D JCAMP-DX (`.jdx` / `.dx` / `##TITLE=`) or 1D `ppm\treal` trace TSV for Stack1dPanel
+        if lower_label.ends_with(".jdx")
+            || lower_label.ends_with(".dx")
+            || trimmed.starts_with("##TITLE=")
+        {
+            match read_jcamp(trimmed) {
+                Ok(blocks) if !blocks.is_empty() => {
+                    let mut added = 0usize;
+                    for (b_idx, blk) in blocks.into_iter().enumerate() {
+                        if blk.y.len() >= 2 {
+                            let idx = self.stack1d_panel.traces.len();
+                            let lbl = if blk.title.trim().is_empty() {
+                                format!("{source_label}#{}", b_idx + 1)
+                            } else {
+                                blk.title.clone()
+                            };
+                            let xs = blk.x_axis();
+                            self.stack1d_panel.add_trace(Trace1d::new(
+                                format!("jcamp_{idx}"),
+                                lbl,
+                                idx as f64,
+                                xs,
+                                blk.y,
+                            ));
+                            added += 1;
+                        }
+                    }
+                    if added > 0 {
+                        self.workspace_mode = WorkspaceMode::ProteinNmr;
+                        self.show_stack1d_panel = true;
+                        self.show_relax_panel = false;
+                        self.show_dynamics_panel = false;
+                        self.status_msg = format!(
+                            "Loaded {added} 1D JCAMP-DX trace(s) from {source_label} into 1D Stack"
+                        );
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.status_msg = format!("JCAMP-DX 1D parse error ({source_label}): {e}");
+                    return;
+                }
+            }
+        }
+        if let Some(first_non_comment) = trimmed
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            let hdr_lower = first_non_comment.to_ascii_lowercase();
+            let cols: Vec<&str> = hdr_lower.split(['\t', ',']).map(str::trim).collect();
+            if cols.len() >= 2 && cols[0] == "ppm" && matches!(cols[1], "real" | "intensity" | "y")
+            {
+                let mut ppms = Vec::new();
+                let mut ys = Vec::new();
+                for line in trimmed.lines().map(str::trim) {
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let f: Vec<&str> = line.split(['\t', ',']).map(str::trim).collect();
+                    if f.len() >= 2 {
+                        if let (Ok(x), Ok(y)) = (f[0].parse::<f64>(), f[1].parse::<f64>()) {
+                            ppms.push(x);
+                            ys.push(y);
+                        }
+                    }
+                }
+                if ppms.len() >= 2 {
+                    let idx = self.stack1d_panel.traces.len();
+                    self.stack1d_panel.add_trace(Trace1d::new(
+                        format!("tsv1d_{idx}"),
+                        source_label.to_string(),
+                        idx as f64,
+                        ppms,
+                        ys,
+                    ));
+                    self.workspace_mode = WorkspaceMode::ProteinNmr;
+                    self.show_stack1d_panel = true;
+                    self.show_relax_panel = false;
+                    self.show_dynamics_panel = false;
+                    self.status_msg = format!(
+                        "Loaded 1D spectrum trace ({source_label}) into 1D Stack ({} traces total)",
+                        self.stack1d_panel.traces.len()
+                    );
+                    return;
+                }
+            }
         }
 
         // Check NEF v1.1 (`data_nef_...`, `save_nef_molecular_system`, or `_nmrassign_workbench`)
@@ -5161,6 +5258,7 @@ impl NmrWorkbenchApp {
                 self.show_relax_panel = !self.show_relax_panel;
                 if self.show_relax_panel {
                     self.show_dynamics_panel = false;
+                    self.show_stack1d_panel = false;
                 }
             }
             let dyn_btn = egui::Button::new(
@@ -5183,6 +5281,35 @@ impl NmrWorkbenchApp {
                 self.show_dynamics_panel = !self.show_dynamics_panel;
                 if self.show_dynamics_panel {
                     self.show_relax_panel = false;
+                    self.show_stack1d_panel = false;
+                }
+            }
+            let stack1d_btn = egui::Button::new(
+                egui::RichText::new("📚 1D Stack / Kinetics")
+                    .size(12.0)
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(if self.show_stack1d_panel {
+                egui::Color32::from_rgb(56, 98, 158)
+            } else {
+                egui::Color32::from_rgb(34, 42, 58)
+            });
+            if ui
+                .add(stack1d_btn)
+                .on_hover_text(
+                    "Open multi-spectrum 1D overlay, tilted stack, difference spectrum & kinetics ROI workbench",
+                )
+                .clicked()
+            {
+                self.show_stack1d_panel = !self.show_stack1d_panel;
+                if self.show_stack1d_panel {
+                    self.show_relax_panel = false;
+                    self.show_dynamics_panel = false;
+                    if self.stack1d_panel.traces.is_empty() {
+                        let (traces, rois) = build_kinetics_demo_traces();
+                        self.stack1d_panel = Stack1dState::with_traces(traces);
+                        self.stack1d_panel.roi_regions = rois;
+                    }
                 }
             }
             if ui.small_button("📌 Assign/Lock (at)").clicked() {
@@ -7174,13 +7301,16 @@ impl eframe::App for NmrWorkbenchApp {
                     ui.horizontal(|ui| {
                         if ui
                             .selectable_label(
-                                !self.show_relax_panel && !self.show_dynamics_panel,
+                                !self.show_relax_panel
+                                    && !self.show_dynamics_panel
+                                    && !self.show_stack1d_panel,
                                 "🎯 2D HSQC Contours",
                             )
                             .clicked()
                         {
                             self.show_relax_panel = false;
                             self.show_dynamics_panel = false;
+                            self.show_stack1d_panel = false;
                         }
                         if ui
                             .selectable_label(
@@ -7191,6 +7321,7 @@ impl eframe::App for NmrWorkbenchApp {
                         {
                             self.show_relax_panel = true;
                             self.show_dynamics_panel = false;
+                            self.show_stack1d_panel = false;
                         }
                         if ui
                             .selectable_label(self.show_dynamics_panel, "⚡ CEST / CPMG / CSP & Kd")
@@ -7198,6 +7329,23 @@ impl eframe::App for NmrWorkbenchApp {
                         {
                             self.show_dynamics_panel = true;
                             self.show_relax_panel = false;
+                            self.show_stack1d_panel = false;
+                        }
+                        if ui
+                            .selectable_label(
+                                self.show_stack1d_panel,
+                                "📚 1D Stack / Overlay / Kinetics",
+                            )
+                            .clicked()
+                        {
+                            self.show_stack1d_panel = true;
+                            self.show_relax_panel = false;
+                            self.show_dynamics_panel = false;
+                            if self.stack1d_panel.traces.is_empty() {
+                                let (traces, rois) = build_kinetics_demo_traces();
+                                self.stack1d_panel = Stack1dState::with_traces(traces);
+                                self.stack1d_panel.roi_regions = rois;
+                            }
                         }
                     });
                     ui.separator();
@@ -7217,6 +7365,8 @@ impl eframe::App for NmrWorkbenchApp {
                             }
                         }
                         dyn_output = Some(self.dynamics_panel.show(ui));
+                    } else if self.show_stack1d_panel {
+                        render_stack1d_panel(ui, &mut self.stack1d_panel);
                     } else {
                         self.draw_hsqc_canvas(ui);
                     }

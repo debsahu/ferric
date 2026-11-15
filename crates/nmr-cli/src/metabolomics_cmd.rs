@@ -694,13 +694,25 @@ fn parse_common_args(args: &[String]) -> Result<Option<CommonMetabCliArgs>, Stri
     Ok(Some(parsed))
 }
 
+fn read_text_capped(path: &Path, label: &str) -> Result<String, String> {
+    let meta = fs::metadata(path)
+        .map_err(|e| format!("failed to stat {label} {}: {e}", path.display()))?;
+    if meta.len() > 64 * 1024 * 1024 {
+        return Err(format!(
+            "{label} {} ({} bytes) exceeds 64 MiB limit",
+            path.display(),
+            meta.len()
+        ));
+    }
+    fs::read_to_string(path).map_err(|e| format!("failed reading {label} {}: {e}", path.display()))
+}
+
 fn load_spectrum_1d_from_path(
     path: &Path,
     sample_id: &str,
     fallback_obs_mhz: f64,
 ) -> Result<Spectrum1D, String> {
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("failed reading 1D spectrum {}: {e}", path.display()))?;
+    let raw = read_text_capped(path, "1D spectrum")?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(format!("spectrum file {} is empty", path.display()));
@@ -708,8 +720,10 @@ fn load_spectrum_1d_from_path(
 
     // 1. JSON serialized Spectrum1D
     if trimmed.starts_with('{') {
-        return serde_json::from_str::<Spectrum1D>(trimmed)
-            .map_err(|e| format!("failed parsing Spectrum1D JSON {}: {e}", path.display()));
+        let spec = serde_json::from_str::<Spectrum1D>(trimmed)
+            .map_err(|e| format!("failed parsing Spectrum1D JSON {}: {e}", path.display()))?;
+        spec.validate()?;
+        return Ok(spec);
     }
 
     // 2. JCAMP-DX 1D NMR (`##TITLE=`)
@@ -727,6 +741,12 @@ fn load_spectrum_1d_from_path(
                 xs.len()
             ));
         }
+        if !xs.iter().all(|v| v.is_finite()) || !first.y.iter().all(|v| v.is_finite()) {
+            return Err(format!(
+                "JCAMP-DX {} contains non-finite values",
+                path.display()
+            ));
+        }
         let obs = first
             .mhz
             .filter(|&v| v.is_finite() && v > 1.0)
@@ -738,6 +758,7 @@ fn load_spectrum_1d_from_path(
     let mut xs = Vec::new();
     let mut ys = Vec::new();
     let mut obs_mhz = fallback_obs_mhz;
+    let mut header_seen = false;
     for (line_no, line) in trimmed.lines().enumerate() {
         let t = line.trim();
         if t.is_empty() {
@@ -760,7 +781,11 @@ fn load_spectrum_1d_from_path(
             .filter(|s| !s.is_empty())
             .collect();
         if cols.len() < 2 {
-            continue;
+            return Err(format!(
+                "short row at {}:{}: {t:?}",
+                path.display(),
+                line_no + 1
+            ));
         }
         let x_res = cols[0].parse::<f64>();
         let y_res = cols[1].parse::<f64>();
@@ -769,13 +794,14 @@ fn load_spectrum_1d_from_path(
                 xs.push(x);
                 ys.push(y);
             }
-            _ if xs.is_empty() => {
-                // Skip leading column header line (even after `#` metadata comments)
+            (Err(_), _) if xs.is_empty() && !header_seen => {
+                // Allow a single non-numeric column header line before data rows
+                header_seen = true;
                 continue;
             }
             _ => {
                 return Err(format!(
-                    "invalid numeric (ppm, intensity) row at {}:{}: {t:?}",
+                    "invalid or non-finite numeric (ppm, intensity) row at {}:{}: {t:?}",
                     path.display(),
                     line_no + 1
                 ));
@@ -867,20 +893,21 @@ fn load_cohort_samples(cli: &CommonMetabCliArgs) -> Result<Vec<CohortSample1D>, 
     let mut samples = Vec::new();
 
     if let Some(ref cohort_path) = cli.cohort_json {
-        let txt = fs::read_to_string(cohort_path)
-            .map_err(|e| format!("failed reading --cohort {}: {e}", cohort_path.display()))?;
+        let txt = read_text_capped(cohort_path, "--cohort")?;
         let mut loaded: Vec<CohortSample1D> = serde_json::from_str(&txt).map_err(|e| {
             format!(
                 "failed parsing CohortSample1D JSON {}: {e}",
                 cohort_path.display()
             )
         })?;
+        for s in &loaded {
+            s.spectrum.validate()?;
+        }
         samples.append(&mut loaded);
     }
 
     if let Some(ref manifest_path) = cli.manifest_path {
-        let txt = fs::read_to_string(manifest_path)
-            .map_err(|e| format!("failed reading --manifest {}: {e}", manifest_path.display()))?;
+        let txt = read_text_capped(manifest_path, "--manifest")?;
         let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
         for (line_idx, line) in txt.lines().enumerate() {
             let t = line.trim();
@@ -1064,10 +1091,17 @@ fn parse_bucket_table_csv_text(
         sample_ids.push(cols[0].trim().trim_matches('"').to_string());
         sample_groups.push(cols[1].trim().trim_matches('"').to_string());
         let dil = if has_dilution_col {
-            cols[2]
+            let d = cols[2]
                 .trim()
                 .parse::<f64>()
-                .map_err(|_| format!("invalid dilution_factor at row {}", row_idx + 2))?
+                .map_err(|_| format!("invalid dilution_factor at row {}", row_idx + 2))?;
+            if !d.is_finite() || d <= 0.0 {
+                return Err(format!(
+                    "non-positive or non-finite dilution_factor at row {}: {d}",
+                    row_idx + 2
+                ));
+            }
+            d
         } else {
             1.0
         };
@@ -1082,6 +1116,14 @@ fn parse_bucket_table_csv_text(
                     j
                 )
             })?;
+            if !v.is_finite() {
+                return Err(format!(
+                    "non-finite bucket intensity {:?} at row {}, bucket {}",
+                    raw_v,
+                    row_idx + 2,
+                    j
+                ));
+            }
             row.push(v);
         }
         matrix.push(row);
@@ -1101,18 +1143,57 @@ fn parse_bucket_table_csv_text(
     })
 }
 
+fn validate_bucket_matrix_dims(
+    n_samples: usize,
+    n_groups: usize,
+    n_buckets: usize,
+    matrix: &[Vec<f64>],
+    source: &Path,
+) -> Result<(), String> {
+    if n_samples < 2 || n_groups != n_samples || n_buckets == 0 || matrix.len() != n_samples {
+        return Err(format!(
+            "invalid metabolomics dataset dimensions in {} (samples={n_samples}, groups={n_groups}, buckets={n_buckets}, rows={})",
+            source.display(),
+            matrix.len()
+        ));
+    }
+    for (r_idx, row) in matrix.iter().enumerate() {
+        if row.len() != n_buckets || !row.iter().all(|v| v.is_finite()) {
+            return Err(format!(
+                "invalid or non-finite bucket row {r_idx} in {} (len={}, expected {n_buckets})",
+                source.display(),
+                row.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn load_dataset_for_chemometrics(
     cli: &CommonMetabCliArgs,
 ) -> Result<LoadedMetabolomicsDataset, String> {
     if let Some(ref in_path) = cli.in_path {
-        let txt = fs::read_to_string(in_path)
-            .map_err(|e| format!("failed reading --in {}: {e}", in_path.display()))?;
+        let txt = read_text_capped(in_path, "--in")?;
         let trimmed = txt.trim();
         if trimmed.starts_with('{') {
             if let Ok(study) = serde_json::from_str::<MetabolomicsStudyResult>(trimmed) {
+                validate_bucket_matrix_dims(
+                    study.sample_ids.len(),
+                    study.sample_groups.len(),
+                    study.buckets.len(),
+                    &study.normalized_bucket_matrix,
+                    in_path,
+                )?;
                 return Ok(LoadedMetabolomicsDataset::Study(Box::new(study)));
             }
             if let Ok(bin_rep) = serde_json::from_str::<BinningCliReportJson>(trimmed) {
+                validate_bucket_matrix_dims(
+                    bin_rep.sample_ids.len(),
+                    bin_rep.sample_groups.len(),
+                    bin_rep.buckets.len(),
+                    &bin_rep.normalized_bucket_matrix,
+                    in_path,
+                )?;
                 let zones = bin_rep
                     .mask_zones_ppm
                     .iter()
@@ -1138,6 +1219,15 @@ fn load_dataset_for_chemometrics(
                     in_path.display()
                 )
             })?;
+            if cohort.len() < 2 {
+                return Err(format!(
+                    "CohortSample1D JSON array {} must contain >= 2 samples",
+                    in_path.display()
+                ));
+            }
+            for s in &cohort {
+                s.spectrum.validate()?;
+            }
             if cli.permute_cohort_labels {
                 let mut rng = Rng::new(cli.config.rng_seed ^ 0x9E37_79B9_7F4A_7C15);
                 let mut groups: Vec<String> = cohort.iter().map(|s| s.group.clone()).collect();

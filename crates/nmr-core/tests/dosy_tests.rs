@@ -73,7 +73,7 @@ fn ste_and_bppled_attenuation_factors_and_shapes_exact() {
 #[test]
 fn bruker_difflist_and_acqus_bppled_and_ste_parsing() {
     let difflist = "\
-# Bruker TopSpin diffusion ramp (G/cm)
+# Bruker difflist diffusion ramp (G/cm)
   2.675
  10.700
  21.400
@@ -608,4 +608,62 @@ fn stokes_einstein_hydrodynamics_lysozyme_small_molecules_and_solvents() {
             "passed": true,
         })
     );
+}
+
+#[test]
+fn adversarial_dosy_error_paths_reject_corrupted_inputs() {
+    // 1. Empty gradients, negative/NaN gradients, and unphysical timing (`Delta <= delta / 3`)
+    assert!(compute_b_values_s_m2(
+        &[],
+        DosyNucleus::H1,
+        DosySequenceType::BppLed,
+        GradientShape::SineBell,
+        0.10,
+        0.002,
+        0.0002
+    )
+    .is_err());
+    assert!(compute_b_values_s_m2(
+        &[2.0, f64::NAN, 10.0],
+        DosyNucleus::H1,
+        DosySequenceType::Ste,
+        GradientShape::Rectangular,
+        0.10,
+        0.002,
+        0.0
+    )
+    .is_err());
+    assert!(effective_diffusion_time_s(DosySequenceType::Ste, 0.0005, 0.0030, 0.0).is_err());
+
+    // 2. Malformed Bruker `difflist` and Varian `procpar`
+    assert!(parse_bruker_difflist("").is_err());
+    assert!(parse_bruker_difflist("2.0\nnot_a_float\n10.0\n").is_err());
+    assert!(parse_varian_procpar_dosy("empty procpar", &VarianDosyOverrides::default()).is_err());
+
+    // 3. Stejskal–Tanner & Tikhonov ILT dimension mismatches, too-few points, and NaN/Inf decays
+    let b_ok = vec![1e8, 3e8, 6e8, 1e9, 2e9, 4e9];
+    assert!(
+        fit_stejskal_tanner_multi(&b_ok[..2], &[100.0, 80.0], &DosyFitConfig::default()).is_err()
+    );
+    assert!(
+        fit_stejskal_tanner_multi(&b_ok, &[100.0, 80.0, 60.0], &DosyFitConfig::default()).is_err()
+    );
+    assert!(fit_stejskal_tanner_multi(
+        &b_ok,
+        &[100.0, 80.0, f64::NAN, 40.0, 20.0, 10.0],
+        &DosyFitConfig::default()
+    )
+    .is_err());
+    assert!(solve_tikhonov_ilt(
+        &b_ok,
+        &[100.0, f64::INFINITY, 60.0, 40.0, 20.0, 10.0],
+        &IltConfig::default()
+    )
+    .is_err());
+
+    // 4. Hydrodynamics & power-law calibration invalid parameters
+    assert!(stokes_einstein_radius_m(-1.0e-10, 298.15, 1.0e-3).is_err());
+    assert!(stokes_einstein_radius_m(5.0e-10, 0.0, 1.0e-3).is_err());
+    assert!(DosySolvent::D2O.viscosity_pa_s(-10.0).is_err());
+    assert!(PowerLawCalibration::fit_from_standards(&[(300.0, 4.0e-10)]).is_err());
 }
