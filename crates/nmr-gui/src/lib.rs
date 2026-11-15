@@ -14,6 +14,7 @@ pub mod dosy_panel;
 pub mod dynamics_panel;
 pub mod ingest_panel;
 pub mod keymap;
+pub mod mcp_bridge;
 pub mod metabolomics_panel;
 pub mod mol3d_overlay;
 pub mod mol3d_viewer;
