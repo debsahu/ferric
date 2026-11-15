@@ -1,0 +1,1141 @@
+{
+  "schema_version": 1,
+  "phase": "17",
+  "title": "Phase 17 Single-Shot Empirical Pre-Registration Manifest (F10, F11, F13a, F13b, F13c, F14, F16, F17)",
+  "preregistered_date": "2026-11-15",
+  "frozen_solver_baseline_tag": "v0.12.0",
+  "frozen_solver_baseline_commit": "418a20f0762fd92e67ab6d49b56033ea7b1aeb27",
+  "zero_bytes_downloaded_at_registration": true,
+  "excluded_contaminated_entries": [
+    "BMRB:53960"
+  ],
+  "excluded_contaminated_entries_disclosure": "During BMRB REST API saveframe tag-name schema probing (/v2/entry/53960), an embedded free-text Text_data block was emitted to stdout. BMRB:53960 is permanently excluded from all Phase 17 primary and backup candidate sets to preserve an uncompromisingly blind pre-registration firewall (p17_prereg_candidates.md §0.2).",
+  "disjointness_verified_against": [
+    "data/benchmark/real_manifest.tsv",
+    "data/benchmark/manifest.tsv",
+    "data/priors/bmrb_priors.json"
+  ],
+  "disjointness_provenance_doc": "data/priors/PROVENANCE.md",
+  "license_allowlist": [
+    "CC0",
+    "CC-BY-4.0",
+    "Public Domain"
+  ],
+  "protocol_rules": {
+    "rule_1_solver_and_shader_freeze": {
+      "rule_id": "P17-R1",
+      "enforced": true,
+      "summary": "Zero edits to solver/physics Rust modules or WebGPU WGSL shaders between pre-registration commit freeze and completion of single-shot empirical execution across all 8 gates, except F12(a) Kahan-summed weighted mean centering in varpro_two_param (relax_mc.wgsl) frozen in 17.W1 strictly before any F10-F17 network download.",
+      "protected_core_files": [
+        "crates/nmr-core/src/relax_io.rs",
+        "crates/nmr-core/src/relax_fit.rs",
+        "crates/nmr-core/src/modelfree.rs",
+        "crates/nmr-core/src/cest.rs",
+        "crates/nmr-core/src/cpmg.rs",
+        "crates/nmr-core/src/csp.rs",
+        "crates/nmr-core/src/nmr1d.rs",
+        "crates/nmr-core/src/multiplet.rs",
+        "crates/nmr-core/src/dosy.rs",
+        "crates/nmr-core/src/metabolomics.rs"
+      ],
+      "protected_wgsl_shaders": [
+        "crates/nmr-gpu/src/shaders/anneal.wgsl",
+        "crates/nmr-gpu/src/shaders/bayes_sa.wgsl",
+        "crates/nmr-gpu/src/shaders/bloch_cest.wgsl",
+        "crates/nmr-gpu/src/shaders/conv3d.wgsl",
+        "crates/nmr-gpu/src/shaders/cpmg_fit.wgsl",
+        "crates/nmr-gpu/src/shaders/dosy.wgsl",
+        "crates/nmr-gpu/src/shaders/idp_scoring.wgsl",
+        "crates/nmr-gpu/src/shaders/methyl_anneal.wgsl",
+        "crates/nmr-gpu/src/shaders/rdc_refine.wgsl",
+        "crates/nmr-gpu/src/shaders/relax_mc.wgsl",
+        "crates/nmr-gpu/src/shaders/scoring.wgsl"
+      ],
+      "allowed_pre_download_w1_exceptions": [
+        {
+          "file": "crates/nmr-gpu/src/shaders/relax_mc.wgsl",
+          "todo_item": "TODO.md:132 (F12a)",
+          "reason": "Kahan-summed weighted mean centering in 2-parameter varpro_two_param frozen in 17.W1 strictly prior to downloading any F10-F17 dataset."
+        }
+      ],
+      "v0120_baseline_sha256": {
+        "crates/nmr-core/src/cest.rs": {
+          "bytes": 101489,
+          "sha256": "d3e7b43b5d756bc75dc3baa69b033b843fca202272685b43b989961467bd1e75"
+        },
+        "crates/nmr-core/src/cpmg.rs": {
+          "bytes": 73757,
+          "sha256": "3695d4beafdcc0b0f70c6cb0d14aa956495337bf88cf2cdfeae689298978d620"
+        },
+        "crates/nmr-core/src/csp.rs": {
+          "bytes": 38663,
+          "sha256": "def977b23f1fd9b71517867d7dd244d7fafed3a7c85332257825ef9b3639a90b"
+        },
+        "crates/nmr-core/src/dosy.rs": {
+          "bytes": 114037,
+          "sha256": "4ee350e1b3804acea9c03cee6fd0092519748c562a3bc1e753f72f21efe9f15e"
+        },
+        "crates/nmr-core/src/metabolomics.rs": {
+          "bytes": 170113,
+          "sha256": "fef5741dcd810497b17831d07bc66a572f4f96190d531e90b64a056d2db7041d"
+        },
+        "crates/nmr-core/src/modelfree.rs": {
+          "bytes": 70734,
+          "sha256": "ad88ecd70a4a4fbba698c60e7a41410304927b8e2f2a86c225fbd4bd797c034c"
+        },
+        "crates/nmr-core/src/multiplet.rs": {
+          "bytes": 188367,
+          "sha256": "52420c08e8ce3f7243fbfc4ae5ff96dcbf12be0001f77cfcd261798ba24a073a"
+        },
+        "crates/nmr-core/src/nmr1d.rs": {
+          "bytes": 193999,
+          "sha256": "df37fde2d0bc94b53cc3b9da7f89f68e4cdfcc434aa8622b8fe223d5ae4108dc"
+        },
+        "crates/nmr-core/src/relax_fit.rs": {
+          "bytes": 54509,
+          "sha256": "5fd0d9fbd9b8dd11c3752dc97185ec779e2448683eb7edfba24984d6cfb5e772"
+        },
+        "crates/nmr-core/src/relax_io.rs": {
+          "bytes": 139474,
+          "sha256": "48f703cfc7495611bdfb870e8db97935dbf4d750da250d14ad596d534e5e4d71"
+        },
+        "crates/nmr-gpu/src/shaders/anneal.wgsl": {
+          "bytes": 28441,
+          "sha256": "ee01dc67b296942af5911f9e8d6a9539446c11e9c4f8f8ee778f8dbf18a899dc"
+        },
+        "crates/nmr-gpu/src/shaders/bayes_sa.wgsl": {
+          "bytes": 91466,
+          "sha256": "5790707d6f4127c5ad41e8dea11a3cbeaf9b08ed5bfca95713e3e6bcdc5b1c77"
+        },
+        "crates/nmr-gpu/src/shaders/bloch_cest.wgsl": {
+          "bytes": 18636,
+          "sha256": "8539df141422f3ff53879e5ac7a120490aaf21eebacd4454ad08a5bb6057672a"
+        },
+        "crates/nmr-gpu/src/shaders/conv3d.wgsl": {
+          "bytes": 11241,
+          "sha256": "36d56042fb6aa7666387333fb465b33d202d5b7f2c8bb7a2fdb5597cafc2d31b"
+        },
+        "crates/nmr-gpu/src/shaders/cpmg_fit.wgsl": {
+          "bytes": 11925,
+          "sha256": "682edbb5a8e07df08b4ff89fcb18d979b738b023e78921ae5cf43e4115fda7f1"
+        },
+        "crates/nmr-gpu/src/shaders/dosy.wgsl": {
+          "bytes": 28130,
+          "sha256": "fdd8e1a90ee3eb8c68f762fe09e1c1ce3437786ba860686dd655805c6a5b6314"
+        },
+        "crates/nmr-gpu/src/shaders/idp_scoring.wgsl": {
+          "bytes": 34235,
+          "sha256": "6b2e874da550da52a5bce6a2ff7e8bd3f6dab198ff4149af0e33492004e8a3cc"
+        },
+        "crates/nmr-gpu/src/shaders/methyl_anneal.wgsl": {
+          "bytes": 68050,
+          "sha256": "fff6a30dfcc19a0689e46f2413ad0f86a1f84dfc4c1ec958a3763f3c88e00b19"
+        },
+        "crates/nmr-gpu/src/shaders/rdc_refine.wgsl": {
+          "bytes": 11035,
+          "sha256": "b1725d7804d17a47163256c56602139b6c3c2db5a081c9d1c2e160c32d16cbd7"
+        },
+        "crates/nmr-gpu/src/shaders/relax_mc.wgsl": {
+          "bytes": 24049,
+          "sha256": "a6b9d4ecc96a044f93e1b2289195d69b2b2da7ab17dca6ba25257e26548f6807"
+        },
+        "crates/nmr-gpu/src/shaders/scoring.wgsl": {
+          "bytes": 8133,
+          "sha256": "1cd3d69e87e1e447824607c3ece4a28b39a628041fb51deb7f5929e004f18779"
+        }
+      }
+    },
+    "rule_2_a_priori_deterministic_format_conversion": {
+      "rule_id": "P17-R2",
+      "enforced": true,
+      "zero_physics_or_parameter_tuning": true,
+      "summary": "All format-adapter transformations from deposited archive syntax to CLI TSV inputs are purely syntactic or deterministic unit/header algebra fixed a priori before downloading a single byte.",
+      "fixed_conversions": [
+        {
+          "id": "relaxation_time_to_rate",
+          "applies_to": ["F10", "F11", "F13b"],
+          "formula": "R = 1.0 / T; sigma_R = sigma_T / (T * T)",
+          "trigger": "Deposited NMR-STAR or plain-text table reports longitudinal/transverse relaxation times T1, T2, or T1rho in seconds (s) instead of rates in s^-1."
+        },
+        {
+          "id": "bmrb6470_dual_field_saveframe_disambiguation",
+          "applies_to": ["F10"],
+          "formula": "median(T1_saveframe_A) > median(T1_saveframe_B) => A = 600.13 MHz, B = 360.13 MHz",
+          "trigger": "BMRB 6470 NMR-STAR 2.1->3.1 remediation stamped both Tjandra et al. (1995) static fields with Spectrometer_frequency_1H = 600; folded ubiquitin T1 increases monotonically with B0 above omega_N * tau_m ~ 1, disambiguating 600.13 vs 360.13 MHz without inspecting S^2."
+        },
+        {
+          "id": "cest_plain_text_to_11col_tsv",
+          "applies_to": ["F13a"],
+          "formula": "I_norm = I / I0; sigma_norm = (I / I0) * sqrt((sigma_I / I)^2 + (sigma_I0 / I0)^2) when reference plane I0 row is separate; major_ppm_hint = argmin_offset(I_norm)",
+          "trigger": "Plain-text saturation profile archives storing header B0/T_EX/B1_FRQ/B1_INH metadata and 3-column [offset, intensity, uncertainty] tables."
+        },
+        {
+          "id": "dosy_locked_g0_f2_box_integration",
+          "applies_to": ["F16"],
+          "formula": "1D F2 exponential apodization (1.0 Hz), 2x zero-fill, FFT, phase locked on plane m = 0 (lowest gradient g_0), peak pick SNR >= 10 on plane m = 0 excluding residual HDO [4.65, 4.95] ppm, integrate fixed +-2*FWHM ppm boxes across m = 0..M-1",
+          "trigger": "Raw Bruker ser+difflist or Varian fid+procpar pseudo-2D DOSY directories paired with nmrassign dosy --exp-dir."
+        },
+        {
+          "id": "mtbls1_isatab_cohort_manifest",
+          "applies_to": ["F17"],
+          "formula": "Join s_MTBLS1.txt (`Sample Name`, `Factor Value[Metabolic syndrome]`) 1-to-1 with a_MTBLS1_metabolite_profiling_NMR_spectroscopy.txt (`Raw Spectral Data File` .zip, ignoring duplicate .nmrML conversions)",
+          "trigger": "MetaboLights MTBLS1 N = 132 human urinary cohort (84 Control Group, 48 diabetes mellitus)."
+        }
+      ]
+    },
+    "rule_3_strict_fallback_order_without_tuning": {
+      "rule_id": "P17-R3",
+      "enforced": true,
+      "zero_parameter_tuning_on_fallback": true,
+      "fallback_chain_order": [
+        "primary",
+        "co_primary",
+        "backup_1",
+        "backup_2",
+        "backup_3",
+        "backup_4"
+      ],
+      "allowed_fallback_triggers": [
+        "http_error_or_unreachable_host",
+        "corrupted_or_truncated_archive_payload",
+        "missing_required_vendor_acquisition_headers_or_reference_saveframes"
+      ],
+      "summary": "If a primary archive URL is unreachable, corrupted/truncated, or missing required vendor headers upon first download, log the exact failure reason verbatim and step strictly in pre-registered order (primary -> co_primary -> backup_1 -> ...) using the identical frozen binary and CLI flags without parameter tuning."
+    },
+    "rule_4_candid_single_shot_reporting": {
+      "rule_id": "P17-R4",
+      "enforced": true,
+      "single_shot_max_runs_per_dataset": 1,
+      "report_both_agreements_and_discrepancies": true,
+      "forbid_selective_metric_omission": true,
+      "summary": "Execute each gate single-shot after commit freeze and report all pre-registered evaluation metrics candidly in TODO.md, README.md, and CHANGELOG.md — including both quantitative agreements and any discrepancies, model mismatches, or archive/header failures."
+    }
+  },
+  "gates": {
+    "F10": {
+      "todo_item": "TODO.md:130",
+      "gate_name": "Experimental 15N R1/R2/hetNOE & Lipari-Szabo Model-Free (S^2, tau_m, D_par/D_perp)",
+      "primary_datasets": [
+        {
+          "role": "primary",
+          "accession_id": "BMRB:6470",
+          "auxiliary_structure_ids": [
+            "PDB:1D3Z",
+            "PDB:1UBQ"
+          ],
+          "title": "Human Ubiquitin Two-Field (600 & 360 MHz) 15N T1/T2/hetNOE & Lipari-Szabo S^2 Gold Standard",
+          "license": "CC0",
+          "citation_doi": "10.1021/ja00155a020",
+          "dataset_doi": "10.13018/BMR6470",
+          "citation": "Tjandra, N., Feller, S. E., Pastor, R. W. & Bax, A. J. Am. Chem. Soc. 1995, 117(50), 12562-12566",
+          "files": [
+            {
+              "name": "bmr6470_3.str",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr6470/bmr6470_3.str",
+              "head_verified_bytes": 156973
+            },
+            {
+              "name": "1D3Z.pdb",
+              "url": "https://files.rcsb.org/download/1D3Z.pdb",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "1UBQ.pdb",
+              "url": "https://files.rcsb.org/download/1UBQ.pdb",
+              "head_verified_bytes": null
+            }
+          ]
+        },
+        {
+          "role": "co_primary",
+          "accession_id": "BMRB:18971",
+          "auxiliary_structure_ids": [],
+          "title": "Human Nedd4-1 WW3* Domain-ENaC betaP2 Complex Three-Field (600.17 / 799.857 / 899.864 MHz) Native s^-1 R1/R2/hetNOE & S^2",
+          "license": "CC0",
+          "citation_doi": "10.1016/j.bbapap.2013.04.031",
+          "dataset_doi": "10.13018/BMR18971",
+          "citation": "Bobby, R. et al. Biochim. Biophys. Acta 2013, 1834, 1632-1641",
+          "files": [
+            {
+              "name": "bmr18971_3.str",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18971/bmr18971_3.str",
+              "head_verified_bytes": 168136
+            }
+          ]
+        }
+      ],
+      "backup_datasets": [
+        {
+          "role": "backup_1",
+          "accession_id": "BMRB:5839",
+          "auxiliary_structure_ids": [
+            "PDB:1P7E"
+          ],
+          "title": "Streptococcal Protein G B3 Domain (GB3) 600 MHz 15N T1/T2/hetNOE Rotational Anisotropy Benchmark",
+          "license": "CC0",
+          "citation_doi": "10.1023/A:1025467918856",
+          "dataset_doi": "10.13018/BMR5839",
+          "citation": "Hall, J. B. & Fushman, D. J. Biomol. NMR 2003, 27, 261-275",
+          "files": [
+            {
+              "name": "bmr5839_3.str",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr5839/bmr5839_3.str",
+              "head_verified_bytes": 57797
+            },
+            {
+              "name": "1P7E.pdb",
+              "url": "https://files.rcsb.org/download/1P7E.pdb",
+              "head_verified_bytes": null
+            }
+          ]
+        },
+        {
+          "role": "backup_2",
+          "accession_id": "BMRB:6243",
+          "auxiliary_structure_ids": [],
+          "title": "Pseudomonas aeruginosa Azurin Four-Field (500 / 600 / 800 / 900 MHz) 15N Relaxation & Order Parameters",
+          "license": "CC0",
+          "citation_doi": "10.13018/BMR6243",
+          "dataset_doi": "10.13018/BMR6243",
+          "citation": "Zhuravleva, A. V., Korzhnev, D. M., Kupce, E., Arseniev, A. S., Billeter, M. & Orekhov, V. Y. J. Mol. Biol. 2004, 342, 1599-1611",
+          "files": [
+            {
+              "name": "bmr6243_3.str",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr6243/bmr6243_3.str",
+              "head_verified_bytes": 323833
+            }
+          ]
+        }
+      ],
+      "exact_cli_command_template": "nmrassign modelfree --r1 <ubq_600_r1.tsv> --r2 <ubq_600_r2.tsv> --hetnoe <ubq_600_noe.tsv> --r1 <ubq_360_r1.tsv> --r2 <ubq_360_r2.tsv> --hetnoe <ubq_360_noe.tsv> --pdb <1D3Z.pdb> --diffusion axial --criterion aic --mc-trials 200 --seed 20261303 --rsd-out <ubq_rsd.tsv> --out <ubq_modelfree.tsv>",
+      "deterministic_format_adapter_spec": {
+        "required": true,
+        "adapter_kind": "nmrstar_relaxation_loops_to_tsv",
+        "rules": [
+          "Extract _Heteronucl_T1_relaxation, _Heteronucl_T2_relaxation, and _Heteronucl_NOEs saveframe loops into `seq_id\\tres_name\\tfield_mhz\\tkind\\tvalue\\tsigma` TSV tables without reading deposited _Order_param (S2_parameters_*) saveframes until post-fit evaluation.",
+          "Convert relaxation times in seconds (`s`) to rates (`s^-1`) strictly via `R = 1.0 / T` and `sigma_R = sigma_T / (T * T)`; preserve native `s^-1` rates (`BMRB:18971`) verbatim.",
+          "On `BMRB:6470` (where legacy NMR-STAR remediation stamped both fields with `Spectrometer_frequency_1H = 600`), map the T1 saveframe with larger `median(T1)` and its paired T2/hetNOE list to `600.13` MHz and the saveframe with smaller `median(T1)` to `360.13` MHz."
+        ]
+      },
+      "evaluation_metrics_reported": [
+        "Global rotational correlation time `tau_m` (ns) vs Tjandra et al. (1995) `4.09 ns` (`BMRB:6470`) and Kay-Torchia-Bax trimmed `R2/R1` `tau_m`",
+        "Woessner axially symmetric rotational diffusion anisotropy `D_par/D_perp` on `PDB:1D3Z` and `PDB:1UBQ` vs Tjandra et al. (1995) `1.17`",
+        "Per-residue Lipari-Szabo `S^2` Pearson `r`, Spearman `rho`, MAE, RMSD, and median signed bias against deposited `_Order_param` (`N = 63` on `BMRB:6470`; 3-field `S^2` on `BMRB:18971`)",
+        "Per-residue Model-Free `M1`-`M5` selection counts (`AIC` primary) and `R_ex` conformational-exchange concordance"
+      ]
+    },
+    "F11": {
+      "todo_item": "TODO.md:131",
+      "gate_name": "Raw Bruker ser / Varian fid Pseudo-3D Relaxation Series Integration & Schedule Decoding",
+      "primary_datasets": [
+        {
+          "role": "primary",
+          "accession_id": "BMRB:18380",
+          "auxiliary_structure_ids": [],
+          "title": "NESG Target DvR115 (Desulfovibrio vulgaris) 600 MHz Raw Bruker Pseudo-3D 15N T1 (vdlist), T2 (vclist) & hetNOE Series",
+          "license": "CC0",
+          "citation_doi": "10.13018/BMR18380",
+          "dataset_doi": "10.13018/BMR18380",
+          "citation": "Aramini, J. M., Montelione, G. T. et al., NESG DvR115 BMRB 18380 (600 MHz Bruker Avance 1.7 mm micro-cryoprobe)",
+          "files": [
+            {
+              "name": "bmr18380_3.str",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/bmr18380_3.str",
+              "head_verified_bytes": 163935
+            },
+            {
+              "name": "2DN15T1_exp4/ser",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/FIDs/B600_1.7mm/DvR115.012_NC_B600_070210/2DN15T1_exp4/ser",
+              "head_verified_bytes": 9011200
+            },
+            {
+              "name": "2DN15T1_exp4/vdlist",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/FIDs/B600_1.7mm/DvR115.012_NC_B600_070210/2DN15T1_exp4/vdlist",
+              "head_verified_bytes": 45
+            },
+            {
+              "name": "2DN15T1_exp4/acqus",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/FIDs/B600_1.7mm/DvR115.012_NC_B600_070210/2DN15T1_exp4/acqus",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "2DN15T1_exp4/acqu2s",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/FIDs/B600_1.7mm/DvR115.012_NC_B600_070210/2DN15T1_exp4/acqu2s",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "2DN15T1_exp4/acqu3s",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/FIDs/B600_1.7mm/DvR115.012_NC_B600_070210/2DN15T1_exp4/acqu3s",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "2DN15T1_exp4/pulseprogram",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/FIDs/B600_1.7mm/DvR115.012_NC_B600_070210/2DN15T1_exp4/pulseprogram",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "2DN15T2_exp5/ser",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/FIDs/B600_1.7mm/DvR115.012_NC_B600_070210/2DN15T2_exp5/ser",
+              "head_verified_bytes": 9011200
+            },
+            {
+              "name": "2DN15T2_exp5/vclist",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/FIDs/B600_1.7mm/DvR115.012_NC_B600_070210/2DN15T2_exp5/vclist",
+              "head_verified_bytes": 25
+            },
+            {
+              "name": "2DN15T2_exp5/acqus",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/FIDs/B600_1.7mm/DvR115.012_NC_B600_070210/2DN15T2_exp5/acqus",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "2DN15T2_exp5/acqu2s",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/FIDs/B600_1.7mm/DvR115.012_NC_B600_070210/2DN15T2_exp5/acqu2s",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "2DN15T2_exp5/acqu3s",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/FIDs/B600_1.7mm/DvR115.012_NC_B600_070210/2DN15T2_exp5/acqu3s",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "2DN15T2_exp5/pulseprogram",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/FIDs/B600_1.7mm/DvR115.012_NC_B600_070210/2DN15T2_exp5/pulseprogram",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "hetNOE_exp3_dir",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/FIDs/B600_1.7mm/DvR115.012_NC_B600_070210/hetNOE_exp3/",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "bmrb18380_FIDs.tar",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr18380/timedomain_data/bmrb18380_FIDs.tar",
+              "head_verified_bytes": 598550427
+            }
+          ]
+        }
+      ],
+      "backup_datasets": [
+        {
+          "role": "backup_1",
+          "accession_id": "BMRB:52653",
+          "auxiliary_structure_ids": [],
+          "title": "Fawzi Lab 850 MHz Raw Bruker Pseudo-3D 15N T1/T2/hetNOE Time-Domain Archives",
+          "license": "CC0",
+          "citation_doi": "10.13018/BMR52653",
+          "dataset_doi": "10.13018/BMR52653",
+          "citation": "Fawzi, N. L. lab, BMRB 52653 (850 MHz Bruker pseudo-3D relaxation archives)",
+          "files": [
+            {
+              "name": "bmr52653_3.str",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr52653/bmr52653_3.str",
+              "head_verified_bytes": 117154
+            },
+            {
+              "name": "123_T1.zip",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr52653/timedomain_data/123_T1.zip",
+              "head_verified_bytes": 1249998363
+            },
+            {
+              "name": "124_T2.zip",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr52653/timedomain_data/124_T2.zip",
+              "head_verified_bytes": 60064068
+            },
+            {
+              "name": "125_NOE.zip",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr52653/timedomain_data/125_NOE.zip",
+              "head_verified_bytes": 57387583
+            }
+          ]
+        }
+      ],
+      "exact_cli_command_template": "nmrassign relax --series <2DN15T1_exp4_dir> --star <bmr18380_3.str> --kind r1 --engine cpu --mc-trials 500 --seed 20261302 --series-out <r1_series.tsv> --out <r1_rates.tsv> && nmrassign relax --series <2DN15T2_exp5_dir> --star <bmr18380_3.str> --kind r2 --engine cpu --mc-trials 500 --seed 20261302 --series-out <r2_series.tsv> --out <r2_rates.tsv> && nmrassign relax --series <hetNOE_exp3_dir> --star <bmr18380_3.str> --kind hetnoe --mc-trials 500 --seed 20261302 --series-out <hetnoe_series.tsv> --out <hetnoe_rates.tsv>",
+      "deterministic_format_adapter_spec": {
+        "required": false,
+        "adapter_kind": "native_bruker_pseudo3d_ser_ingest",
+        "rules": [
+          "Native `nmr_core::relax_io::read_bruker_pseudo3d` decodes raw Bruker `ser`, `acqus`/`acqu2s`/`acqu3s` interleaving order (`PlaneQueued` / `T1PlaneQuad` / `T1QuadPlane`), and `vdlist`/`vclist` schedules.",
+          "If `vclist` on `2DN15T2_exp5` stores integer CPMG loop counts without native unit scaling for that pulse sequence, compute `t_i = vclist[i] * tau_cpmg_block` strictly from `pulseprogram` and `acqus` `$D[]`/`$P[]` timing registers before inspecting fitted rates, and report both native `vclist` and `--delays` outcomes.",
+          "Convert deposited `bmr18380_3.str` relaxation times (`s`) to rates (`R = 1/T`, `sigma_R = sigma_T / T^2`) solely for post-fit benchmarking."
+        ]
+      },
+      "evaluation_metrics_reported": [
+        "Pseudo-3D interleaving mode detection & `vdlist`/`vclist` schedule decoding status on raw deposited Bruker `ser`",
+        "Raw `ser` vs deposited `bmr18380_3.str` `R1`, `R2`, and steady-state `{1H}-15N hetNOE` Pearson `r`, Spearman `rho`, MAE, and median relative difference (`|R_raw - R_str| / R_str`)",
+        "Fraction of resolved non-Proline backbone amides integrated and within `2*sigma` combined uncertainty",
+        "CPU `f64` vs WebGPU `f32` (`--engine gpu`, `relax_mc.wgsl`) rate & MC bootstrap uncertainty parity on real decay traces"
+      ]
+    },
+    "F13a": {
+      "todo_item": "TODO.md:136",
+      "gate_name": "Experimental 15N/13C CEST Bloch-McConnell Saturation Profiles",
+      "primary_datasets": [
+        {
+          "role": "primary",
+          "accession_id": "ZENODO:19186893",
+          "auxiliary_structure_ids": [],
+          "title": "Kay Lab Multi-B1 Experimental CEST Saturation Profiles (800 & 1000 MHz)",
+          "license": "CC-BY-4.0",
+          "citation_doi": "10.1101/2025.11.27.690854",
+          "dataset_doi": "10.5281/zenodo.19186893",
+          "citation": "Bonin, J. P., Lee, W., Liu, K., Kim, K. & Kay, L. E. bioRxiv 2025",
+          "files": [
+            {
+              "name": "CEST.zip",
+              "url": "https://zenodo.org/api/records/19186893/files/CEST.zip/content",
+              "head_verified_bytes": 51329
+            }
+          ]
+        },
+        {
+          "role": "co_primary",
+          "accession_id": "ZENODO:12765510",
+          "auxiliary_structure_ids": [],
+          "title": "Kay Lab Pro-IL-18 Multi-B1 (19 & 44 Hz, 40 C) 15N CEST Raw Pseudo-3D Spectral Cubes",
+          "license": "CC-BY-4.0",
+          "citation_doi": "10.5281/zenodo.12765510",
+          "dataset_doi": "10.5281/zenodo.12765510",
+          "citation": "Bonin, J. P., Aramini, J. M., Kay, L. E. et al. Zenodo 12765510",
+          "files": [
+            {
+              "name": "15N_CEST_40C_19Hz.DAT",
+              "url": "https://zenodo.org/api/records/12765510/files/15N_CEST_40C_19Hz.DAT/content",
+              "head_verified_bytes": 1758412032
+            },
+            {
+              "name": "15N_CEST_40C_44Hz.DAT",
+              "url": "https://zenodo.org/api/records/12765510/files/15N_CEST_40C_44Hz.DAT/content",
+              "head_verified_bytes": 955659648
+            }
+          ]
+        }
+      ],
+      "backup_datasets": [
+        {
+          "role": "backup_1",
+          "accession_id": "BMRB:52005",
+          "auxiliary_structure_ids": [],
+          "title": "Unbound VirB9Ct 15N-CEST at 35 C",
+          "license": "CC0",
+          "citation_doi": "10.13018/BMR52005",
+          "dataset_doi": "10.13018/BMR52005",
+          "citation": "Davalos Macias, S. et al. ACS Chem. Biol. 2024, 19, 669-686 (PMID 38486495)",
+          "files": [
+            {
+              "name": "bmr52005_3.str",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr52005/bmr52005_3.str",
+              "head_verified_bytes": 74198
+            }
+          ]
+        },
+        {
+          "role": "backup_2",
+          "accession_id": "BMRBIG:130",
+          "auxiliary_structure_ids": [],
+          "title": "Protein L 800 MHz 15N Clean TROSY-CEST Raw Dataset at 4 C",
+          "license": "CC0",
+          "citation_doi": "10.1021/acs.jpclett.5c03568",
+          "dataset_doi": "10.1021/acs.jpclett.5c03568",
+          "citation": "Protein L 13CH3 ILVMAT / 15N TROSY-CEST, J. Phys. Chem. Lett. 2025",
+          "files": [
+            {
+              "name": "20250601_ProteinL_13CH3_ILVMAT_4C_800C.zip",
+              "url": "https://bmrbig.bmrb.io/deposition/released/130/20250601_ProteinL_13CH3_ILVMAT_4C_800C.zip",
+              "head_verified_bytes": 69779557
+            }
+          ]
+        }
+      ],
+      "exact_cli_command_template": "nmrassign cest --in <cest_profiles.tsv> --states 2 --b1-quad 5 --engine cpu --chi2-surface --out <cest_fit_cpu.tsv> --json-out <cest_fit_cpu.json> && nmrassign cest --in <cest_profiles.tsv> --states 2 --b1-quad 5 --engine gpu --out <cest_fit_gpu.tsv> --json-out <cest_fit_gpu.json>",
+      "deterministic_format_adapter_spec": {
+        "required": true,
+        "adapter_kind": "plain_text_cest_profile_to_11col_tsv",
+        "rules": [
+          "Syntactically map header metadata (`B0`/`larmor_mhz`, `T_EX`, `B1_FRQ`, `B1_INH`) and 3-column `[offset, intensity, uncertainty]` profile rows from `CEST.zip` into the 11-column TSV schema (`seq_id`, `res_name`, `larmor_mhz`, `t_ex_s`, `b1_hz`, `b1_inhom_frac`, `normalization`, `major_ppm_hint`, `offset_ppm`, `intensity`, `uncertainty`).",
+          "Normalize `I / I0` with propagated uncertainty when reference `I0` rows are stored separately; set `major_ppm_hint` to the offset of minimum `I/I0` without inspecting minor-state dips."
+        ]
+      },
+      "evaluation_metrics_reported": [
+        "Global excited-state population `p_B` (%), exchange rate `k_ex` (`s^-1`), and per-residue `|dw_AB|` / signed `dw_AB` (ppm) agreement vs published reference parameters (absolute/relative error, `dw_AB` Pearson `r` & RMSD, reduced `chi^2_nu`)",
+        "CPU `f64` vs WebGPU `f32` (`bloch_cest.wgsl`) global Padé `[6/6]` LM parameter parity on experimental multi-`B1` profiles"
+      ]
+    },
+    "F13b": {
+      "todo_item": "TODO.md:136",
+      "gate_name": "Multi-Field Experimental CPMG & Off-Resonance R1rho Relaxation Dispersion",
+      "primary_datasets": [
+        {
+          "role": "primary",
+          "accession_id": "ZENODO:19186893",
+          "auxiliary_structure_ids": [],
+          "title": "Kay Lab Multi-Field (600 / 800 / 1000 MHz) Experimental CPMG Dispersion Profiles",
+          "license": "CC-BY-4.0",
+          "citation_doi": "10.1101/2025.11.27.690854",
+          "dataset_doi": "10.5281/zenodo.19186893",
+          "citation": "Bonin, J. P., Lee, W., Liu, K., Kim, K. & Kay, L. E. bioRxiv 2025",
+          "files": [
+            {
+              "name": "CPMG.zip",
+              "url": "https://zenodo.org/api/records/19186893/files/CPMG.zip/content",
+              "head_verified_bytes": 34389
+            }
+          ]
+        },
+        {
+          "role": "co_primary",
+          "accession_id": "ZENODO:6605011",
+          "auxiliary_structure_ids": [],
+          "title": "Human Thymidylate Synthase (hTS) Two-Field (600 + 850 MHz) Constant-Time CPMG & 600 MHz T1rho Intensity Planes",
+          "license": "CC0",
+          "citation_doi": "10.5061/dryad.wh70rxwqk",
+          "dataset_doi": "10.5061/dryad.wh70rxwqk",
+          "citation": "Lee, A. L. lab, Dryad / Zenodo 6605011 (hTS 600/850 MHz MQ-CPMG & 600 MHz T1rho)",
+          "files": [
+            {
+              "name": "D25_MQCPMG_600_ints",
+              "url": "https://zenodo.org/api/records/6605011/files/D25_MQCPMG_600_ints/content",
+              "head_verified_bytes": 23033
+            },
+            {
+              "name": "D25_MQCPMG_850_ints2",
+              "url": "https://zenodo.org/api/records/6605011/files/D25_MQCPMG_850_ints2/content",
+              "head_verified_bytes": 23668
+            },
+            {
+              "name": "dUMP600_T1p_full_ints",
+              "url": "https://zenodo.org/api/records/6605011/files/dUMP600_T1p_full_ints/content",
+              "head_verified_bytes": 30654
+            }
+          ]
+        }
+      ],
+      "backup_datasets": [
+        {
+          "role": "backup_1",
+          "accession_id": "BMRBIG:118",
+          "auxiliary_structure_ids": [],
+          "title": "Protein L 600 & 800 MHz 13C SQ-CPMG Raw Dataset at 298 K",
+          "license": "CC0",
+          "citation_doi": "10.1007/s10858-025-00474-x",
+          "dataset_doi": "10.1007/s10858-025-00474-x",
+          "citation": "Protein L 13CH3 ILVMAT 600/800 MHz CPMG, J. Biomol. NMR 2025",
+          "files": [
+            {
+              "name": "20250416_ProteinL_13CH3_ILVMAT_298K_600C.zip",
+              "url": "https://bmrbig.bmrb.io/deposition/released/118/20250416_ProteinL_13CH3_ILVMAT_298K_600C.zip",
+              "head_verified_bytes": 26126187
+            }
+          ]
+        },
+        {
+          "role": "backup_2",
+          "accession_id": "BMRB:16843",
+          "auxiliary_structure_ids": [],
+          "title": "Kay Lab Experimental CPMG Dispersion Saveframes (BMRB 16843)",
+          "license": "CC0",
+          "citation_doi": "10.13018/BMR16843",
+          "dataset_doi": "10.13018/BMR16843",
+          "citation": "Sanchez-Medina, C., Sekhar, A., Vallurupalli, P., Cerminara, M., Munoz, V. & Kay, L. E. (BMRB 16843)",
+          "files": [
+            {
+              "name": "bmr16843_3.str",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr16843/bmr16843_3.str",
+              "head_verified_bytes": 75334
+            }
+          ]
+        },
+        {
+          "role": "backup_3",
+          "accession_id": "BMRB:17149",
+          "auxiliary_structure_ids": [],
+          "title": "Fyn SH3 Folding Intermediate Multi-Field CPMG Dispersion (BMRB 17149)",
+          "license": "CC0",
+          "citation_doi": "10.13018/BMR17149",
+          "dataset_doi": "10.13018/BMR17149",
+          "citation": "Neudecker, P. et al. & Kay, L. E. Science 2012 (BMRB 17149)",
+          "files": [
+            {
+              "name": "bmr17149_3.str",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr17149/bmr17149_3.str",
+              "head_verified_bytes": 160579
+            }
+          ]
+        },
+        {
+          "role": "backup_4",
+          "accession_id": "BMRB:52777",
+          "auxiliary_structure_ids": [],
+          "title": "USP7 Experimental CPMG Dispersion Saveframes (BMRB 52777)",
+          "license": "CC0",
+          "citation_doi": "10.13018/BMR52777",
+          "dataset_doi": "10.13018/BMR52777",
+          "citation": "Korzhnev, D. M. & Bezsonova, I. 2025 (BMRB 52777)",
+          "files": [
+            {
+              "name": "bmr52777_3.str",
+              "url": "https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr52777/bmr52777_3.str",
+              "head_verified_bytes": 58022
+            }
+          ]
+        }
+      ],
+      "exact_cli_command_template": "nmrassign cpmg --in <cpmg_series.tsv> --model baldwin2014 --engine cpu --out <cpmg_fit_cpu.tsv> --json-out <cpmg_fit_cpu.json> && nmrassign cpmg --raw-planes <cpmg_600_planes.tsv> --raw-planes <cpmg_850_planes.tsv> --series-out <hts_r2eff.tsv> --model baldwin2014 --engine gpu --out <hts_cpmg_gpu.tsv> --json-out <hts_cpmg_gpu.json> && nmrassign cpmg --r1rho <r1rho_table.tsv> --major-ppm <varpi_A_ppm> --larmor-mhz <nu0_mhz> --out <r1rho_fit.tsv> --json-out <r1rho_fit.json>",
+      "deterministic_format_adapter_spec": {
+        "required": true,
+        "adapter_kind": "cpmg_and_r1rho_table_to_tsv",
+        "rules": [
+          "Reshape deposited `R2,eff` profiles (`CPMG.zip`) into the 7-column TSV (`seq_id`, `res_name`, `larmor_mhz`, `t_relax_s`, `nu_cpmg_hz`, `r2_eff_s_inv`, `r2_eff_err`), and raw intensity tables (`ZENODO:6605011`) into the `--raw-planes` TSV (`nu_cpmg_hz = 0` for `I0`).",
+          "Convert `dUMP600_T1p_full_ints` spin-lock series into 4-column off-resonance `R1rho` TSV (`carrier_ppm`, `spin_lock_hz`, `r1rho_s_inv`, `r1rho_err`) using `R1rho = 1/T1rho` (or mono-exponential decay rate via `nmrassign relax` when raw delay planes are tabulated)."
+        ]
+      },
+      "evaluation_metrics_reported": [
+        "Global `p_B` (%), `k_ex` (`s^-1`), and per-residue `|dw_AB|` (ppm) agreement vs published multi-field CPMG values (`Baldwin2014` primary, `CR72` comparison) and `AICc`+`F`-test exchange-gate concordance",
+        "Trott-Palmer off-resonance `R1rho` `p_B`, `k_ex`, and signed `dw_AB` recovery on `ZENODO:6605011` `dUMP600_T1p_full_ints`",
+        "CPU `f64` vs WebGPU `f32` (`cpmg_fit.wgsl`) global dispersion parameter parity"
+      ]
+    },
+    "F13c": {
+      "todo_item": "TODO.md:136",
+      "gate_name": "Experimental 2D 1H-15N HSQC Ligand Titration Tracking & Quadratic K_d",
+      "primary_datasets": [
+        {
+          "role": "primary",
+          "accession_id": "ZENODO:17228160",
+          "auxiliary_structure_ids": [],
+          "title": "DnaJB1 Chaperone + Tau 2D 1H-15N HSQC Titration with Co-Deposited Raw ITC & MST Binding Data",
+          "license": "CC-BY-4.0",
+          "citation_doi": "10.5281/zenodo.17228160",
+          "dataset_doi": "10.5281/zenodo.17228160",
+          "citation": "Wydorski, P. M., Macierzynska, P., Bali, S., Vaquer-Alicea, J. & Joachimiak, L. A. 2025",
+          "files": [
+            {
+              "name": "NMR.tar.xz",
+              "url": "https://zenodo.org/api/records/17228160/files/NMR.tar.xz/content",
+              "head_verified_bytes": 13221892
+            },
+            {
+              "name": "ITC.tar.xz",
+              "url": "https://zenodo.org/api/records/17228160/files/ITC.tar.xz/content",
+              "head_verified_bytes": 495068
+            },
+            {
+              "name": "MST.tar.xz",
+              "url": "https://zenodo.org/api/records/17228160/files/MST.tar.xz/content",
+              "head_verified_bytes": 298184
+            }
+          ]
+        },
+        {
+          "role": "co_primary",
+          "accession_id": "BMRBIG:138",
+          "auxiliary_structure_ids": [],
+          "title": "15N-eIF4E S209D (m7G-Cap) + CELF1 Peptide 2D 1H-15N HSQC Titration Series",
+          "license": "CC0",
+          "citation_doi": "10.1093/nar/gkag123",
+          "dataset_doi": "10.1093/nar/gkag123",
+          "citation": "Chaudhury, A., Kongchan, N., Ferreon, J. C., Neilson, J. R. et al. Nucleic Acids Res. 2026",
+          "files": [
+            {
+              "name": "15NEIF4E_S209D_7mG_C1L_BMRbig.zip",
+              "url": "https://bmrbig.bmrb.io/deposition/released/138/15NEIF4E_S209D_7mG_C1L_BMRbig.zip",
+              "head_verified_bytes": 178246262
+            },
+            {
+              "name": "bmrbig138.str",
+              "url": "https://bmrbig.bmrb.io/deposition/released/138/bmrbig138.str",
+              "head_verified_bytes": 4786
+            }
+          ]
+        }
+      ],
+      "backup_datasets": [
+        {
+          "role": "backup_1",
+          "accession_id": "ZENODO:7892349",
+          "auxiliary_structure_ids": [],
+          "title": "5-Fluoroindole + NS5A-D2D3 2D .ft2 HSQC & 19F/1H Small-Molecule Titration",
+          "license": "CC-BY-4.0",
+          "citation_doi": "10.5281/zenodo.7892349",
+          "dataset_doi": "10.5281/zenodo.7892349",
+          "citation": "Heller, G. T., Shukla, V. K., Figueiredo, A. M. & Hansen, D. F. 2023",
+          "files": [
+            {
+              "name": "Data.tar.gz",
+              "url": "https://zenodo.org/api/records/7892349/files/Data.tar.gz/content",
+              "head_verified_bytes": 30093298
+            }
+          ]
+        }
+      ],
+      "exact_cli_command_template": "nmrassign csp (--star <apo.str> | --apo-peaks <apo_peaks.tsv>) --step <L0_uM[:P0_uM]>=<step0_2rr_or_ft2> --step <L1_uM[:P1_uM]>=<step1_2rr_or_ft2> --experiment hsqc --protein-um <P0_uM> --mc-trials 400 --seed 20261306 --trajectories-out <tracked_csp.tsv> --json-out <csp_fit.json> --out <csp_fit.tsv>",
+      "deterministic_format_adapter_spec": {
+        "required": false,
+        "adapter_kind": "native_2d_hsqc_titration_ingest",
+        "rules": [
+          "Native `nmrassign csp` reads Bruker `pdata/1/2rr`, NMRPipe `.ft2`, Sparky `.ucsf`, or TSV peak lists directly; if only raw 2D `ser` is present, run `nmrassign process --fid <step_dir> --out <step.ft2>` uniformly across all titration points.",
+          "Extract `[P]_t` and `[L]_t` micromolar concentrations strictly from sample metadata (`title` / `README` / `bmrbig138.str`) prior to fitting; if no apo `.str` shift list is bundled, generate `apo_peaks.tsv` from the `0 uM` apo spectrum via `nmrassign pick`."
+        ]
+      },
+      "evaluation_metrics_reported": [
+        "Global quadratic tight-binding (`Morrison`/`Williamson`) `K_d` (uM) & 95% MC CI vs independent co-deposited ITC/MST `K_d` (`ZENODO:17228160`) and published NMR/biophysical `K_d` (`BMRBIG:138`: fold-ratio `K_d,NMR / K_d,ref` and `|Delta Delta G|` in `kcal/mol`)",
+        "Hungarian fast-exchange peak-tracking completion rate, exchange-broadened slack-abstention rate, and iterative `2-sigma` Williamson binding-pocket residue concordance"
+      ]
+    },
+    "F14": {
+      "todo_item": "TODO.md:144",
+      "gate_name": "Raw 1D Small-Molecule Bruker FIDs (1H, 13C{1H}, DEPT-90, DEPT-135, 19F, 31P) & Gravimetric qNMR",
+      "primary_datasets": [
+        {
+          "role": "primary",
+          "accession_id": "BMSE:bmse000036",
+          "auxiliary_structure_ids": [],
+          "title": "BMRB Metabolomics L-Fucose + 5.0 mM DSS in D2O (400 MHz Raw Bruker 1H, 13C{1H}, DEPT-90, DEPT-135 FIDs & .mol)",
+          "license": "CC0",
+          "citation_doi": "10.1093/nar/gkm957",
+          "dataset_doi": "10.13018/BMSE000036",
+          "citation": "Ulrich, E. L. et al. & Markley, J. L. Nucleic Acids Res. 2008, 36, D402-D408",
+          "files": [
+            {
+              "name": "set01/1H/fid",
+              "url": "https://bmrb.io/ftp/pub/bmrb/metabolomics/entry_directories/bmse000036/nmr/set01/1H/fid",
+              "head_verified_bytes": 131072
+            },
+            {
+              "name": "set01/1H/acqus",
+              "url": "https://bmrb.io/ftp/pub/bmrb/metabolomics/entry_directories/bmse000036/nmr/set01/1H/acqus",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "set01/13C/fid",
+              "url": "https://bmrb.io/ftp/pub/bmrb/metabolomics/entry_directories/bmse000036/nmr/set01/13C/fid",
+              "head_verified_bytes": 262144
+            },
+            {
+              "name": "set01/13C/acqus",
+              "url": "https://bmrb.io/ftp/pub/bmrb/metabolomics/entry_directories/bmse000036/nmr/set01/13C/acqus",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "set01/DEPT_90/fid",
+              "url": "https://bmrb.io/ftp/pub/bmrb/metabolomics/entry_directories/bmse000036/nmr/set01/DEPT_90/fid",
+              "head_verified_bytes": 262144
+            },
+            {
+              "name": "set01/DEPT_90/acqus",
+              "url": "https://bmrb.io/ftp/pub/bmrb/metabolomics/entry_directories/bmse000036/nmr/set01/DEPT_90/acqus",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "set01/DEPT_135/fid",
+              "url": "https://bmrb.io/ftp/pub/bmrb/metabolomics/entry_directories/bmse000036/nmr/set01/DEPT_135/fid",
+              "head_verified_bytes": 262144
+            },
+            {
+              "name": "set01/DEPT_135/acqus",
+              "url": "https://bmrb.io/ftp/pub/bmrb/metabolomics/entry_directories/bmse000036/nmr/set01/DEPT_135/acqus",
+              "head_verified_bytes": null
+            },
+            {
+              "name": "bmse000036.mol",
+              "url": "https://bmrb.io/ftp/pub/bmrb/metabolomics/entry_directories/bmse000036/bmse000036.mol",
+              "head_verified_bytes": 2195
+            },
+            {
+              "name": "bmse000036.str",
+              "url": "https://bmrb.io/ftp/pub/bmrb/metabolomics/entry_directories/bmse000036/bmse000036.str",
+              "head_verified_bytes": null
+            }
+          ]
+        },
+        {
+          "role": "primary",
+          "accession_id": "ZENODO:17368767",
+          "auxiliary_structure_ids": [],
+          "title": "Small-Molecule Raw Bruker 1H, 13C{1H}, 19F & 31P FIDs (BEHT Triflate, Cinacalcet, Chiral Amines/Acids)",
+          "license": "CC-BY-4.0",
+          "citation_doi": "10.5281/zenodo.17368767",
+          "dataset_doi": "10.5281/zenodo.17368767",
+          "citation": "Borowiecki, P. ACS Omega 2025 (Zenodo 17368767)",
+          "files": [
+            {
+              "name": "FAIR_NMR_FID.zip",
+              "url": "https://zenodo.org/api/records/17368767/files/FAIR%20data%20for%20Stereoconvergent%20Photo-Biocatalytic%20Cascade%20to%20Optically%20Enriched%20Amines%20from%20Racemic%20Carboxylic%20Acids%20%28NMR-FID%29.zip/content",
+              "head_verified_bytes": 241844132
+            }
+          ]
+        },
+        {
+          "role": "primary",
+          "accession_id": "ZENODO:15728739",
+          "auxiliary_structure_ids": [],
+          "title": "Aarhus University 950 MHz Bruker Avance III Quantitative 1H NMR (qNMR) Gravimetric Calibrations & Blind Test Samples",
+          "license": "CC-BY-4.0",
+          "citation_doi": "10.5281/zenodo.15728739",
+          "dataset_doi": "10.5281/zenodo.15728739",
+          "citation": "Heidarizadeh, M., Afrough, A., Vosegaard, T. & Eser, B. E. (Zenodo 15728739)",
+          "files": [
+            {
+              "name": "Calibrations.zip",
+              "url": "https://zenodo.org/api/records/15728739/files/Calibrations.zip/content",
+              "head_verified_bytes": 49404412
+            },
+            {
+              "name": "TestSamples.zip",
+              "url": "https://zenodo.org/api/records/15728739/files/TestSamples.zip/content",
+              "head_verified_bytes": 78917023
+            },
+            {
+              "name": "DataGuide_Calibrations.csv",
+              "url": "https://zenodo.org/api/records/15728739/files/DataGuide_Calibrations.csv/content",
+              "head_verified_bytes": 3100
+            },
+            {
+              "name": "DataGuide_TestSamples.csv",
+              "url": "https://zenodo.org/api/records/15728739/files/DataGuide_TestSamples.csv/content",
+              "head_verified_bytes": 1573
+            },
+            {
+              "name": "Readme.txt",
+              "url": "https://zenodo.org/api/records/15728739/files/Readme.txt/content",
+              "head_verified_bytes": 1486
+            }
+          ]
+        }
+      ],
+      "backup_datasets": [
+        {
+          "role": "backup_1",
+          "accession_id": "BMSE:bmse000006",
+          "auxiliary_structure_ids": [],
+          "title": "BMRB Metabolomics ATP + DSS in D2O (1H/13C/DEPT-90/DEPT-135 Raw Bruker FIDs)",
+          "license": "CC0",
+          "citation_doi": "10.13018/BMSE000006",
+          "dataset_doi": "10.13018/BMSE000006",
+          "citation": "Ulrich, E. L. et al. Nucleic Acids Res. 2008, 36, D402-D408 (BMSE000006)",
+          "files": [
+            {
+              "name": "bmse000006_root",
+              "url": "https://bmrb.io/ftp/pub/bmrb/metabolomics/entry_directories/bmse000006/",
+              "head_verified_bytes": null
+            }
+          ]
+        },
+        {
+          "role": "backup_2",
+          "accession_id": "BMSE:bmse000002",
+          "auxiliary_structure_ids": [],
+          "title": "BMRB Metabolomics 2,3-Diphosphoglycerate + DSS in D2O (1H/13C/DEPT-90/DEPT-135 Raw Bruker FIDs)",
+          "license": "CC0",
+          "citation_doi": "10.13018/BMSE000002",
+          "dataset_doi": "10.13018/BMSE000002",
+          "citation": "Ulrich, E. L. et al. Nucleic Acids Res. 2008, 36, D402-D408 (BMSE000002)",
+          "files": [
+            {
+              "name": "bmse000002_root",
+              "url": "https://bmrb.io/ftp/pub/bmrb/metabolomics/entry_directories/bmse000002/",
+              "head_verified_bytes": null
+            }
+          ]
+        },
+        {
+          "role": "backup_3",
+          "accession_id": "ZENODO:4360319",
+          "auxiliary_structure_ids": [],
+          "title": "Fluorinated Diphenoxide CVD Precursor 19F & qNMR Raw Bruker Dataset",
+          "license": "CC0",
+          "citation_doi": "10.5281/zenodo.4360319",
+          "dataset_doi": "10.5281/zenodo.4360319",
+          "citation": "Zenodo 4360319 (Octafluoro[2.2]paracyclophane precursor 19F/1H NMR)",
+          "files": [
+            {
+              "name": "Spectra.zip",
+              "url": "https://zenodo.org/api/records/4360319/files/Spectra.zip/content",
+              "head_verified_bytes": 3005215
+            }
+          ]
+        },
+        {
+          "role": "backup_4",
+          "accession_id": "ZENODO:7221753",
+          "auxiliary_structure_ids": [],
+          "title": "Quantitative NMR Interpretation Raw Bruker Dataset",
+          "license": "CC-BY-4.0",
+          "citation_doi": "10.5281/zenodo.7221753",
+          "dataset_doi": "10.5281/zenodo.7221753",
+          "citation": "de Santana, P. I. R. et al. & Junker, J. (Zenodo 7221753)",
+          "files": [
+            {
+              "name": "NMR_Data.zip",
+              "url": "https://zenodo.org/api/records/7221753/files/NMR%20Data.zip/content",
+              "head_verified_bytes": 203687713
+            }
+          ]
+        }
+      ],
+      "exact_cli_command_template": "nmrassign nmr1d process --in <bruker_fid_dir> --experiment <1h|13c|dept90|dept135|19f|31p> --zf 2 --auto-phase [--biphasic-pos <lo:hi>] --baseline whittaker [--calibrate-solvent <SOLV>] --deconvolve --peaks-out <peaks.tsv> --json-out <process_summary.json> --out <spec.json> && nmrassign nmr1d multiplet --in <spec.json> --nucleus <1H|13C|19F|31P> [--mol <bmse000036.mol>] --style acs --report-out <acs_report.txt> --json-out <multiplets.json> --out <multiplets.tsv> && nmrassign nmr1d qnmr --in <spec.json> --std-name <STD> --std-mw <MW_STD> --std-protons <N_STD> --std-mass-mg <M_STD> --std-purity <P_STD> --std-region <HI:LO> --analyte-name <AN> --analyte-mw <MW_AN> --analyte-mass-mg <M_AN> --analyte-region <HI:LO:H:LBL> --out <qnmr.tsv> --json-out <qnmr.json>",
+      "deterministic_format_adapter_spec": {
+        "required": false,
+        "adapter_kind": "native_bruker_1d_fid_and_qnmr_metadata",
+        "rules": [
+          "Zero FID format conversion: `nmrassign nmr1d process` natively decodes Bruker `fid` + `acqus` (`GRPDLY`/`DSPFVS`/`DECIM` digital filter group delay) across all 6 experiment classes (`1H`, `13C{1H}`, `DEPT-90`, `DEPT-135`, `19F`, `31P`).",
+          "Read gravimetric standard/analyte masses, molarities, and integration bounds strictly from `DataGuide_*.csv` (`ZENODO:15728739`) and `bmse000036.str` (`5.0 mM DSS` 9-proton singlet at `0.00 ppm`) without post-hoc window tuning."
+        ]
+      },
+      "evaluation_metrics_reported": [
+        "Bruker DSP `GRPDLY` removal & Chen-2002 minimum-entropy autophasing quality across `1H`, `13C{1H}`, `DEPT-90`, `DEPT-135` (biphasic `CH`/`CH3` positive vs `CH2` negative parity on `BMSE:bmse000036`), `19F`, and `31P`",
+        "Chemical-shift referencing offset error (ppm vs vendor `pdata/1/1r` and deposited `bmse000036.str`), Hoye multiplet class concordance, and `J`-coupling MAE (Hz)",
+        "`qNMR` concentration / mass-fraction purity agreement (absolute & relative % error, replicate RSD, and coverage within GUM `U(k=2)` expanded uncertainty) on `ZENODO:15728739` and `BMSE:bmse000036`"
+      ]
+    },
+    "F16": {
+      "todo_item": "TODO.md:146",
+      "gate_name": "Raw Bruker difflist/ser & Varian fid/procpar Multi-Component Experimental DOSY",
+      "primary_datasets": [
+        {
+          "role": "primary",
+          "accession_id": "ZENODO:12170718",
+          "auxiliary_structure_ids": [],
+          "title": "CoLD-CoP Multi-Component Raw Bruker DOSY Mixtures (Small-Molecule Ligands, Hen Egg-White Lysozyme 14.3 kDa & NAG)",
+          "license": "CC-BY-4.0",
+          "citation_doi": "10.5281/zenodo.12170718",
+          "dataset_doi": "10.5281/zenodo.12170718",
+          "citation": "Snyder, D. A., Patnala, S. & Robles, R. 2024 (Zenodo 12170718)",
+          "files": [
+            {
+              "name": "CompetitiveCooperative_CoLD_CoP_for_archiving.zip",
+              "url": "https://zenodo.org/api/records/12170718/files/CompetitiveCooperative_CoLD_CoP_for_archiving.zip/content",
+              "head_verified_bytes": 83045212
+            }
+          ]
+        },
+        {
+          "role": "co_primary",
+          "accession_id": "MENDELEY:d7bdxz9hsk",
+          "auxiliary_structure_ids": [],
+          "title": "Manchester NMR Methodology Group Raw Varian Doneshot (BPPSTE Oneshot) DOSY fid + procpar",
+          "license": "CC-BY-4.0",
+          "citation_doi": "10.17632/d7bdxz9hsk.1",
+          "dataset_doi": "10.17632/d7bdxz9hsk.1",
+          "citation": "Morris, G. A., University of Manchester, Mendeley Data d7bdxz9hsk v1",
+          "files": [
+            {
+              "name": "fid",
+              "url": "https://data.mendeley.com/public-files/datasets/d7bdxz9hsk/files/7bbaaf5a-c8af-416c-94ec-f425dbaf8c54/file_downloaded",
+              "head_verified_bytes": 1573232
+            },
+            {
+              "name": "procpar",
+              "url": "https://data.mendeley.com/public-files/datasets/d7bdxz9hsk/files/79aab4ed-75f4-44f0-95a0-a4e20bdbf073/file_downloaded",
+              "head_verified_bytes": 35434
+            }
+          ]
+        }
+      ],
+      "backup_datasets": [
+        {
+          "role": "backup_1",
+          "accession_id": "ZENODO:16423019",
+          "auxiliary_structure_ids": [],
+          "title": "GNAT Reference Raw Bruker Diffusion NMR Dataset (23.zip)",
+          "license": "CC-BY-4.0",
+          "citation_doi": "10.5281/zenodo.16423019",
+          "dataset_doi": "10.5281/zenodo.16423019",
+          "citation": "Cabral, T. L. G. (Zenodo 16423019)",
+          "files": [
+            {
+              "name": "23.zip",
+              "url": "https://zenodo.org/api/records/16423019/files/23.zip/content",
+              "head_verified_bytes": 1633670
+            }
+          ]
+        }
+      ],
+      "exact_cli_command_template": "nmrassign dosy fit --in <decay.tsv> --exp-dir <bruker_or_varian_dir> --engine cpu --criterion bic --max-components 3 --solvent D2O --temp-k 298.15 --out <dosy_fit_cpu.tsv> --json-out <dosy_fit_cpu.json> && nmrassign dosy fit --in <decay.tsv> --exp-dir <bruker_or_varian_dir> --engine gpu --criterion bic --max-components 3 --solvent D2O --temp-k 298.15 --out <dosy_fit_gpu.tsv> --json-out <dosy_fit_gpu.json> && nmrassign dosy ilt --in <decay.tsv> --exp-dir <bruker_or_varian_dir> --strategy gcv --solvent D2O --temp-k 298.15 --alpha-sweep-out <dosy_alpha_sweep.tsv> --out <dosy_ilt.tsv> --json-out <dosy_ilt.json>",
+      "deterministic_format_adapter_spec": {
+        "required": true,
+        "adapter_kind": "pseudo2d_f2_fft_locked_g0_peak_integrator",
+        "rules": [
+          "Stejskal-Tanner / Wu-Johnson `b`-values (`s/m^2`) are parsed natively via `--exp-dir` (`nmr_core::dosy::read_bruker_dosy_dir` on `acqus`+`pulseprogram`+`difflist` and `read_varian_dosy_dir` on `procpar` `gzlvl1 * gcal_`).",
+          "Extract per-gradient 1D peak integrals `decay.tsv` (`label\\tcenter_ppm\\tI_0\\t...\\tI_{M-1}`) by applying uniform `1.0 Hz` exponential apodization, `2x` zero-fill, F2 FFT, and phase locked strictly from lowest-gradient plane `m = 0`, picking peaks (`SNR >= 10` on `m = 0`, masking residual water `4.65..4.95 ppm`), and integrating fixed `+-2*FWHM` boxes across `m = 0..M-1` without inspecting diffusion decays."
+        ]
+      },
+      "evaluation_metrics_reported": [
+        "Native Bruker `difflist`/`acqus` and Varian `procpar` Stejskal-Tanner `b`-value parsing & physical range verification",
+        "`log10(D / m^2 s^-1)` accuracy, Stokes-Einstein hydrodynamic radius `R_h` (A) / `MW` (Da) estimates (ligands vs `14.3 kDa` Lysozyme), and multi-component `BIC` (`K = 1..3`) + `GCV` `ILT` separation of fast small-molecule vs slow protein components",
+        "CPU `f64` vs WebGPU `f32` (`dosy.wgsl`) `log10(D)` and `BIC` model-selection parity"
+      ]
+    },
+    "F17": {
+      "todo_item": "TODO.md:147",
+      "gate_name": "Public 1D Biofluid NMR Metabolomics Cohort (MetaboLights MTBLS1 Human Urinary T2DM)",
+      "primary_datasets": [
+        {
+          "role": "primary",
+          "accession_id": "METABOLIGHTS:MTBLS1",
+          "auxiliary_structure_ids": [],
+          "title": "MetaboLights MTBLS1 Human Urinary Type-2 Diabetes Mellitus 700 MHz Bruker noesypr1d Cohort (N = 132: 84 Control Group vs 48 diabetes mellitus)",
+          "license": "CC0",
+          "citation_doi": "10.1152/physiolgenomics.00194.2006",
+          "dataset_doi": "10.1152/physiolgenomics.00194.2006",
+          "citation": "Salek, R. M., Maguire, M. L., Bentley, E., Rubtsov, D. V. et al. & Griffin, J. L. Physiol. Genomics 2007, 29(2), 99-108 (PMID 17190852)",
+          "files": [
+            {
+              "name": "s_MTBLS1.txt",
+              "url": "https://ftp.ebi.ac.uk/pub/databases/metabolights/studies/public/MTBLS1/s_MTBLS1.txt",
+              "head_verified_bytes": 26206
+            },
+            {
+              "name": "a_MTBLS1_metabolite_profiling_NMR_spectroscopy.txt",
+              "url": "https://ftp.ebi.ac.uk/pub/databases/metabolights/studies/public/MTBLS1/a_MTBLS1_metabolite_profiling_NMR_spectroscopy.txt",
+              "head_verified_bytes": 120888
+            },
+            {
+              "name": "ADG10003u_007.zip",
+              "url": "https://ftp.ebi.ac.uk/pub/databases/metabolights/studies/public/MTBLS1/FILES/ADG10003u_007.zip",
+              "head_verified_bytes": 570685
+            },
+            {
+              "name": "FILES_132_bruker_sample_zips",
+              "url": "https://ftp.ebi.ac.uk/pub/databases/metabolights/studies/public/MTBLS1/FILES/",
+              "head_verified_bytes": null
+            }
+          ]
+        }
+      ],
+      "backup_datasets": [
+        {
+          "role": "backup_1",
+          "accession_id": "METABOLIGHTS:MTBLS1",
+          "auxiliary_structure_ids": [],
+          "title": "MetaboLights MTBLS1 Vendor-Processed Bruker pdata/1/1r Spectra Inside Canonical 132 Sample .zip Archives (if any raw fid header is incomplete)",
+          "license": "CC0",
+          "citation_doi": "10.1152/physiolgenomics.00194.2006",
+          "dataset_doi": "10.1152/physiolgenomics.00194.2006",
+          "citation": "Salek, R. M. et al. & Griffin, J. L. Physiol. Genomics 2007, 29(2), 99-108",
+          "files": [
+            {
+              "name": "FILES_132_bruker_pdata_1r_zips",
+              "url": "https://ftp.ebi.ac.uk/pub/databases/metabolights/studies/public/MTBLS1/FILES/",
+              "head_verified_bytes": null
+            }
+          ]
+        }
+      ],
+      "exact_cli_command_template": "nmrassign nmr1d process --in <sample_bruker_dir> --experiment 1h --zf 2 --auto-phase --baseline whittaker --out <sample_id>.tsv && nmrassign metabolomics bin --manifest <mtbls1_manifest.tsv> --min-ppm 0.50 --max-ppm 9.50 --mask urine --calibrate-tsp --method aib --norm pqn --scale pareto -o <mtbls1_buckets.csv> --study-out <mtbls1_study.json> && nmrassign metabolomics pca --in <mtbls1_study.json> --components 5 -o <mtbls1_pca.json> && nmrassign metabolomics oplsda --in <mtbls1_study.json> --ortho 1 --cv-folds 7 --permutations 200 --seed 42 --control \"Control Group\" --case \"diabetes mellitus\" --biomarkers-out <mtbls1_biomarkers.csv> -o <mtbls1_oplsda.json> && nmrassign metabolomics stocsy --in <mtbls1_study.json> --driver-ppm 5.24 -o <mtbls1_stocsy_glucose.json>",
+      "deterministic_format_adapter_spec": {
+        "required": true,
+        "adapter_kind": "isatab_sample_assay_join_to_3col_manifest",
+        "rules": [
+          "Deterministically join `s_MTBLS1.txt` (`Sample Name`, `Factor Value[Metabolic syndrome]`) 1-to-1 with `a_MTBLS1_metabolite_profiling_NMR_spectroscopy.txt` (`Raw Spectral Data File` `.zip`, ignoring the 133 `.nmrML` XML files with duplicate `ADG-19_007u_476.nmrML`) to emit the 3-column `sample_id\\tgroup\\tspectrum_path` manifest (`N = 132`: `84` `Control Group`, `48` `diabetes mellitus`).",
+          "Report both default `--mask urine --method aib` and uniform `--mask custom --exclude 4.50:6.00 --method uniform --bin-width 0.04` (and water-only `--exclude 4.50:5.00` sensitivity) without altering `cv_folds = 7` or `seed = 42`."
+        ]
+      },
+      "evaluation_metrics_reported": [
+        "`N = 132` (`84` `Control Group` vs `48` `diabetes mellitus`) ingestion completion rate, `PCA` variance explained & Hotelling `T^2` / `Q`-residual outlier count",
+        "Leak-free stratified 7-fold `OPLS-DA` cross-validated `Q^2`, `R^2_Y`, and 200-permutation `p`-value (`permutation_p_value_q2`, `is_validated`, plus `--permute-cohort-labels` null-label sanity check)",
+        "Top `VIP` / `S-plot` / `BH-FDR` Volcano and `STOCSY` urinary biomarker concordance against Salek et al. (2007) human T2DM markers (D-glucose `3.2-3.9 / 5.24 ppm`, citrate `2.54 / 2.68 ppm`, creatinine `3.05 / 4.05 ppm`, TMAO `3.27 ppm`, hippurate `7.55-7.84 ppm`, alanine `1.48 ppm`)"
+      ]
+    }
+  }
+}
