@@ -4,6 +4,73 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
+## [0.12.0] — 2026-11-15 — Phase 16: Deterministic Publication SVG Showcase Exporter (`T16.1`), Slim Visual `README.md` (`T16.2`), 9-Chapter Hostable Documentation Manual (`T16.3`), and Zero-Install Live `wasm32` WebGPU Demo (`T16.4`)
+
+- **Tag:** `v0.12.0`
+- **Architectural Summary & Candid Validation Disclosures (`T16.1`–`T16.4`, Closed `[x] F7`, `[x] F8`, `[x] F9`, `[x] F15`, Open `F5`, `F6`, `F10`, `F11`, `F12`, `F13`, `F14`, `F16`, `F17`, `F18`, `F19`, `F20`, `F21`):**
+  - **1. Validation Scope Candor & Open Follow-Up Ledger (`16.W1` Conditions 1–3):**
+    - **`T16.4` Browser WebGPU Scope Qualifier (`F21`)**: The in-browser `wasm32` WebGPU demo (`nmr-gui::demo_preset`, `docs/demo/index.html`, `scripts/build_web_demo.sh`) is verified in automated CI via headless `egui` preset invariants (`0` disk I/O, deterministic repeat) and `wasm32-unknown-unknown` + `wasm-bindgen` (`0.2.130`) compilation checks; live interactive WebGPU hardware compatibility sessions across external `Chrome`/`Edge`, `Firefox`, and `Safari` GPU drivers remain tracked openly in **`F21`**.
+    - **`F8` Single-Shot Cold RDC Holdout, Spent Cold Cohorts & Synthetic/Protocol Scope Candor**: Matching `README.md:78` (`16.2:P1-1` remediation in `de2954a`) and `docs/manual/01-quickstart-and-workflows.md:128`, on the pre-registered single-shot cold single-medium RDC target `1KHM -> 1ZZK`, adding RDCs improves NOE-only backbone RMSD on `5/5` seeds (`1.862–4.141 Å` CPU / `2.390–3.988 Å` WebGPU `lowE`), **but does not reach development-target accuracy (`0/5` seeds `< 1.80 Å`; `ByPeptidePlane Q_free < 0.55` on `3/5` CPU / `2/5` WebGPU seeds; `F8`)**. Across spent cold BMRB cohorts (`cold_p12`, `cold_p13`, `seen_p13_w2`), empirical micro HC-precision at `confidence >= 0.80` spans **`86.18%–96.31%`** (not a guaranteed `>= 94%` floor; `bayes-sa` remains experimental opt-in). `predict_homolog_free_torsions` enforces `<= 25%` sequence identity (`DEFAULT_FIREWALL_MAX_SEQ_IDENTITY = 0.25`); `NMR_MCP_BEARER_TOKEN` environment-variable auth is documented alongside `--token`; and Phases 13–15 spin relaxation/exchange (`F10`, `F11`, `F13`), analytical 1D/`qNMR`/`DOSY`/`Metabolomics` (`F14`, `F16`, `F17`), and `MCP` copilot (`F18`–`F20`, including noiseless forward-model round-trip `MCP` relaxation/CSP tests) retain explicit synthetic forward-model and in-process/subprocess protocol validation disclosures.
+    - **Open & Closed Follow-Up Ledger**: Closed follow-ups in `TODO.md`: `[x] F7`, `[x] F8`, `[x] F9`, `[x] F15`; open `[ ]` follow-ups in `TODO.md`: `F5`, `F6`, `F10`, `F11`, `F12`, `F13`, `F14`, `F16`, `F17`, `F18`, `F19`, `F20`, `F21` (`0` ID collisions).
+    - **Zero-Regression & Zero-New-Crate Dependency Freeze**: `0` new external crate dependencies (`Cargo.toml` / `Cargo.lock` bump workspace version `0.11.0 -> 0.12.0` only; `THIRD_PARTY.md`, `docs/specs/03-assignment.md`, and all `nmr-core` / `nmr-gpu` scientific solvers are untouched).
+
+  - **2. Deterministic SVG Showcase Pipeline, Slim Visual `README.md`, 9-Chapter Manual & `wasm32` WebGPU Demo (`T16.1`–`T16.4`):**
+    - **`T16.1` (`nmrassign export-fig`, `docs/assets/01..08.svg`)**: Deterministic pure-Rust vector SVG exporter (`CANONICAL_EXPORT_SEED = 42`, `BTreeMap` marching-squares contour chaining, light/dark `@media` themes, `0`-byte repeat diff) covering `2D HSQC`, `3D HNCACB` sequential strip walks, `1UBQ` Lipari–Szabo $S^2$ 3D backbone putty, `1D` Hoye multiplet `J`-trees & `qNMR`, `2D DOSY`, `OPLS-DA` / `STOCSY` metabolomics, `CEST` / `CPMG` / `CSP` exchange, and `Octet` 2D structure-shift linking (panels `03`–`07` carry explicit synthetic-showcase badges).
+    - **`T16.2` (`README.md`)**: Slim `90`-line (`<= 180` budget; `12,141 B` at `de2954a` with the `16.2:P1-1` `F8` qualifier, vs `11,952 B` in pre-remediation `8d0b2e0` `w1_tables.md`) visual overview with `2x4` SVG showcase gallery, 30-second GUI/CLI/`MCP` quickstart, `25/25` verified local links, and full validation-scope candor.
+    - **`T16.3` (`docs/manual/index.md` + `01..08`, `scripts/build_docs_manual.py`, `.github/workflows/docs.yml`)**: 9-chapter static HTML manual verified by `build_docs_manual.py --self-test --check` (`6/6` adversarial self-tests, `9` HTML pages, `132` search sections, `28` verified links + `8` bundled SVGs; deterministic site `sha256=0f06533bd624fe72` at `v0.12.0` vs `sha256=c304a490be358736` at `v0.11.0` due to dynamic `Cargo.toml` version header), with tag-gated GitHub Pages workflow (`workflow_dispatch` + `push.tags: ['v*']` only, least-privilege `contents: read` `build` job, `deploy`-scoped `pages: write` / `id-token: write`, unconditional `nmrassign-manual-and-web-demo` artifact upload, and visible `::warning::` fallback).
+    - **`T16.4` (`nmr-gui::demo_preset`, `docs/demo/index.html`, `scripts/build_web_demo.sh`)**: Zero-filesystem in-memory demo suite (`Load Built-in Demo Suite` toolbar button + automatic `wasm32` startup preload, `0` production `.unwrap()`/`.expect()`) bundling synthetic Ubiquitin 2D/3D spectra (`904` peaks, `86` spin systems), `1UBQ` coordinates, `8`-trace 1D multiplet stack, `3`-peak `DOSY` series, and `24`-sample `Metabolomics` cohort (`OPLS-DA Q2 = 0.9693`).
+
+    **Phase `16.W1` (`T16.1` + `T16.2`) — Deterministic CLI SVG Figure Exporter & Visual-First `README.md`:**
+
+    **Deterministic `nmrassign export-fig` Showcase Panels (`T16.1`):**
+
+    | Panel (`--panel`) | Committed Asset Path | Modality | Bytes (`< 250 KiB`) | SHA-256 |
+    | :--- | :--- | :--- | ---: | :--- |
+    | `hsqc` | `docs/assets/01_hsqc_contour_overlay.svg` | 2D `1H-15N` HSQC Contours & `evo-graph` Roots | 51,400 | `393b50e1d3f3bca647ca2b0b654591bdcb0373c26b234d098f20f2a4fbcee584` |
+    | `strips` | `docs/assets/02_sequential_strip_walk.svg` | 3D `HNCACB` Sequential Strip Walk (`Phe4 -> Gly10`) | 31,848 | `bbc7e4e1ca997f738f76edbff952c8b7c96f01bc838991af5fde92fb560a401c` |
+    | `pdb-s2` | `docs/assets/03_pdb_s2_dynamics_putty.svg` | `1UBQ` Lipari-Szabo `S^2` Putty & NOEs *(synthetic)* | 126,376 | `9a142ac1aac13046a71d52c9595badcaa6f75aa3cb109af81a8b181236af35ba` |
+    | `nmr1d-stack` | `docs/assets/04_nmr1d_multiplet_stack.svg` | Analytical 1D Hoye `J`-Tree, Stack & `qNMR` *(synthetic)* | 41,907 | `01832acf52578a483bb93cbe2e322567f69bbc89da453cf0c6ff3f8c0c4e95dd` |
+    | `dosy` | `docs/assets/05_dosy_2d_diffusion_map.svg` | Pseudo-2D `BPP-LED` `DOSY` Diffusion Map *(synthetic)* | 23,333 | `1b7c4c7c4115e3722bd85d564cb105aaf069748d19b3ae4c4de1c1acb930caca` |
+    | `metabolomics` | `docs/assets/06_metabolomics_oplsda_stocsy.svg` | 1D Metabolomics `PCA`, `OPLS-DA` & `STOCSY` *(synthetic)* | 39,589 | `a59a0806ac041334021065728cfef87af94fd5dbee5fdd02a110ebd5c8d12070` |
+    | `exchange` | `docs/assets/07_cest_cpmg_csp_exchange.svg` | `CEST`, `CPMG` & Tight-Binding `CSP` `Kd` *(synthetic)* | 17,654 | `2a3f9b197f3c34b6b7c1bd8f4ca7ceae335e617312293b80fc819cb0279f8330` |
+    | `octet` | `docs/assets/08_octet_structure_link.svg` | `Octet` 2D `(S)`-Ibuprofen & `1H`/`13C` Shift Link | 15,914 | `adfe49ff7b15ccd12c7d763f6dbbb59a7ec86edaf227dca169be72bf02967e4b` |
+
+    **Showcase & `README.md` Gate Verification (`T16.1`–`T16.2`):**
+
+    | Deliverable & Invariant | Measured Value | Gate | Status |
+    | :--- | :--- | :--- | :---: |
+    | `nmrassign export-fig` deterministic repeat & committed-asset parity | `8/8` panels (`15,914..126,376 B`, total `348,021 B`), `repeat_0_diff = True`, `committed_0_diff = True`, `6` `Err` paths | `8/8` valid XML/SVG, `< 250 KiB` each, `0`-byte diff | PASS |
+    | Visual-first `README.md` budget & local link/image resolution | `90` lines (`11,952 B`), `25` local links/images verified | `<= 180` lines, `0` broken links | PASS |
+
+    **Phase `16.W1` (`T16.3` + `T16.4`) — Static Documentation Manual & Zero-I/O `wasm32` WebGPU Demo:**
+
+    | Subsystem & Verification Gate | Layer | Measured Metric | Gate | Status |
+    | :--- | :--- | :--- | :--- | :---: |
+    | Static manual builder, adversarial hygiene & link/anchor/SVG check (`T16.3`) | `scripts/build_docs_manual.py` + `docs/manual/` | `9` HTML pages, `132` search sections, `28` links + `8` bundled SVGs (`sha256=c304a490be358736...`), `6/6` self-tests | `9` chapters, `0` broken links/anchors, deterministic SHA-256 | PASS |
+    | Built-in zero-I/O multi-modal demo preset & headless `egui` panels (`T16.4`) | `nmr-gui::demo_preset` | `76 aa` `1UBQ`, `904` peaks, `86` spin systems (`HSQC 512x256`, `HNCACB z=96`), `8` 1D traces, `3` `DOSY` peaks, `24` metabolomics samples (`119` buckets, `OPLS-DA Q2 = 0.9693`) | `0` disk I/O, deterministic repeat, headless `egui` clean | PASS |
+    | Browser `wasm32-unknown-unknown` target check & WebGPU landing shell (`T16.4`) | `scripts/build_web_demo.sh` + `docs/demo/index.html` | `wasm32_check_passed = True`, `docs/demo/index.html` `8,951 B` | `cargo check --target wasm32-unknown-unknown` exit `0` | PASS |
+
+  - **3. Mandatory `AGENTS.md` 5-Seed `--realistic` Ubiquitin & `CISD3` (`BMRB 51439`) Solver Regression Gates (`v0.12.0`):**
+
+    **Wave `16.W1` & Workspace Test Execution Summary:**
+
+    | Suite Binary | Passed | Failed |
+    | :--- | ---: | ---: |
+    | `nmr-cli::export_fig_cli_tests` | `3` | `0` |
+    | `nmr-gui::demo_preset_tests` | `1` | `0` |
+    | **Wave `16.W1` Dedicated Rust Total** | **`4`** | **`0`** |
+    | **Full Workspace (`cargo test --release --workspace`, `77` binaries)** | **`546`** | **`0`** |
+
+    **Mandatory 5-Seed Solver Non-Regression Gates (`Ubiquitin --realistic` & `CISD3` `BMRB 51439`):**
+
+    | Engine | Ubiquitin `--realistic` (`5` Seeds) Acc | Ubiquitin Recall | Ubiquitin HC-Prec (`>=0.80`) | `CISD3` (`5` Seeds) Acc | `CISD3` Recall | `CISD3` HC-Prec (`>=0.80`) |
+    | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+    | `evo-graph` (`CPU f64`) | `98.4% (assigned=319)` | `90.8% (assignable=346)` | `98.4% (310/315)` | `64.38%` | `40.39%` | `100.00%` (`59/59`) |
+    | `standard` (`CPU f64`) | `90.0% (assigned=279)` | `72.5% (assignable=346)` | `97.1% (170/175)` | `62.50%` | `39.22%` | `92.86%` (`52/56`) |
+    | `standard` (`WebGPU f32`) | `88.4% (assigned=275)` | `70.2% (assignable=346)` | `95.8% (181/189)` | `58.75%` | `36.86%` | `96.61%` (`57/59`) |
+
+---
+
 ## [0.11.0] — 2026-11-15 — Phase 15: Clean-Room Model Context Protocol (`MCP`) JSON-RPC 2.0 Server (`T15.1`), Live Desktop Workbench Loopback Bridge & `256`-Step Undo (`T15.2`), and Sandbox Security, Spectroscopist Prompts & Client Config Generator (`T15.3`)
 
 - **Tag:** `v0.11.0`
