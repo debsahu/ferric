@@ -5,7 +5,7 @@
 //! and open numerical analysis / spectroscopic visualization principles (zero external source
 //! code, macros, or proprietary product conventions inspected):
 //! - Savorani, F., Tomasi, G. & Engelsen, S. B. (*J. Magn. Reson.* **2010**, 202, 190–202) —
-//!   `icoshift` interval correlation shifting via fast Fourier transform (`FFT`) cross-correlation
+//!   interval correlation shifting via fast Fourier transform (`FFT`) cross-correlation
 //!   for regional peak-drift alignment across 1D NMR spectral arrays.
 //! - Cooley, J. W. & Tukey, J. W. (*Math. Comput.* **1965**, 19, 297–301) — radix-2 fast Fourier
 //!   transform (`FFT` / `IFFT`) for zero-padded linear cross-correlation.
@@ -175,14 +175,14 @@ impl Default for DifferenceAlphaMode {
     }
 }
 
-/// Scope of `icoshift`-style FFT cross-correlation peak-shift alignment (Savorani et al., 2010).
+/// Scope of interval-correlation FFT cross-correlation peak-shift alignment (Savorani et al., 2010).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AlignmentScope {
     /// Estimate sub-sample chemical-shift drift inside the first configured reference interval
     /// and apply a uniform whole-trace `shift_offset_ppm` correction.
     GlobalShiftFromRegion,
     /// Independently shift each configured `[ppm_min, ppm_max]` interval in-place using cubic
-    /// convolution resampling and endpoint boundary fill (`icoshift`, Savorani et al. 2010).
+    /// convolution resampling and endpoint boundary fill (Savorani et al., 2010).
     #[default]
     LocalIntervals,
 }
@@ -191,12 +191,12 @@ impl AlignmentScope {
     pub const fn label(self) -> &'static str {
         match self {
             Self::GlobalShiftFromRegion => "Global Shift (from Region)",
-            Self::LocalIntervals => "Local Intervals (icoshift)",
+            Self::LocalIntervals => "Local Intervals (FFT)",
         }
     }
 }
 
-/// User-defined chemical-shift interval `[ppm_min, ppm_max]` for `icoshift` FFT alignment.
+/// User-defined chemical-shift interval `[ppm_min, ppm_max]` for regional FFT alignment.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AlignmentInterval {
     pub ppm_min: f64,
@@ -800,7 +800,7 @@ impl Trace1d {
 }
 
 // ============================================================================
-// Pure `f64` Quantitative Algorithms: Integration, Normalization, OLS Difference & FFT `icoshift`
+// Pure `f64` Quantitative Algorithms: Integration, Normalization, OLS Difference & FFT Interval Alignment
 // ============================================================================
 
 /// Integrate a `Trace1d` over `[ppm_min, ppm_max]` using exact continuous piecewise-linear
@@ -1335,7 +1335,7 @@ pub fn estimate_fft_shift_points(
 }
 
 /// 4-point Catmull–Rom cubic convolution interpolator (`Keys` 1981) with endpoint clamping
-/// (`icoshift` boundary value fill, Savorani et al. 2010 §2.2).
+/// (interval boundary value fill, Savorani et al. 2010 §2.2).
 #[inline]
 pub fn cubic_catmull_rom_sample(seg: &[f64], pos: f64) -> f64 {
     let n = seg.len();
@@ -1384,9 +1384,9 @@ pub fn shift_interval_in_place(
 }
 
 /// Align all unlocked traces in `traces` (`i != ref_idx`) against `traces[ref_idx]` across
-/// `intervals` via `icoshift`-inspired FFT cross-correlation (Savorani et al., *J. Magn. Reson.*
-/// **2010**, 202, 190–202).
-pub fn align_traces_icoshift(
+/// `intervals` via interval correlation-shifting FFT cross-correlation (Savorani et al.,
+/// *J. Magn. Reson.* **2010**, 202, 190–202).
+pub fn align_traces_interval_fft(
     traces: &mut [Trace1d],
     ref_idx: usize,
     intervals: &[AlignmentInterval],
@@ -1763,7 +1763,7 @@ fn add_lorentzian(y: &mut [f64], ppm: &[f64], center: f64, fwhm_ppm: f64, area: 
 
 /// Build a deterministic 8-timepoint first-order reaction kinetics 1D `1H` array (`A -> B`,
 /// `k = 0.045 min^-1`) with an invariant internal standard (`1.20 ppm`) and slight realistic
-/// temperature/shim pH peak drift so users can test Overlay, Tilted Stack, `icoshift`, and ROI
+/// temperature/shim pH peak drift so users can test Overlay, Tilted Stack, regional FFT alignment, and ROI
 /// Kinetics TSV export in one click.
 pub fn build_kinetics_demo_traces() -> (Vec<Trace1d>, Vec<RoiRegion1d>) {
     let n_pts = 4096usize;
@@ -2116,7 +2116,7 @@ pub struct Stack1dState {
     heatmap_texture: Option<egui::TextureHandle>,
     heatmap_cache_key: Option<HeatmapCacheKey>,
 
-    // Normalization & `icoshift` regional alignment controls
+    // Normalization & regional FFT alignment controls
     pub norm_region_ppm_min: f64,
     pub norm_region_ppm_max: f64,
     pub alignment_scope: AlignmentScope,
@@ -2549,8 +2549,8 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
         }
     }
 
-    // 3. Collapsible Normalization & `icoshift` Alignment Strip
-    egui::CollapsingHeader::new("Normalization & FFT Regional Shift Alignment (icoshift)")
+    // 3. Collapsible Normalization & Regional FFT Alignment Strip
+    egui::CollapsingHeader::new("Normalization & FFT Regional Shift Alignment")
         .id_salt("stack1d_norm_align_header")
         .default_open(false)
         .show(ui, |ui| {
@@ -2682,7 +2682,8 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
                     let ref_i = state.safe_ref_trace_idx();
                     let intervals = state.alignment_intervals.clone();
                     let scope = state.alignment_scope;
-                    let recs = align_traces_icoshift(&mut state.traces, ref_i, &intervals, scope);
+                    let recs =
+                        align_traces_interval_fft(&mut state.traces, ref_i, &intervals, scope);
                     state.status_message = format!(
                         "Aligned {} trace-interval pairs against '{}'.",
                         recs.len(),
@@ -3787,10 +3788,17 @@ mod tests {
             (diff_analyte_area - expected_area).abs() < 1e-5,
             "diff_analyte_area = {diff_analyte_area} vs {expected_area}"
         );
+        println!(
+            "W1_METRIC_JSON:{{\"task\":\"T14.3\",\"kind\":\"t14_3_difference_ols\",\"gauss_alpha_err\":{:.3e},\"lorentz_alpha_err\":{:.3e},\"residual_matrix_area\":{:.3e},\"analyte_area_err\":{:.3e}}}",
+            (gdiff.alpha - true_alpha).abs(),
+            (diff.alpha - true_alpha).abs(),
+            residual_matrix_area,
+            (diff_analyte_area - expected_area).abs()
+        );
     }
 
     #[test]
-    fn test_fft_icoshift_regional_and_multi_interval_alignment() {
+    fn test_fft_interval_regional_and_multi_interval_alignment() {
         // 1. Verify FFT / IFFT roundtrip precision (< 1e-12)
         let mut buf: Vec<(f64, f64)> = (0..64)
             .map(|k| ((0.3 * k as f64).sin(), (0.17 * k as f64).cos()))
@@ -3802,7 +3810,7 @@ mod tests {
             assert!((a.0 - b.0).abs() < 1e-12 && (a.1 - b.1).abs() < 1e-12);
         }
 
-        // 2. Multi-interval `icoshift` alignment with opposite regional pH shifts (+0.032 ppm and -0.024 ppm)
+        // 2. Multi-interval correlation-shifting alignment with opposite regional pH shifts (+0.032 ppm and -0.024 ppm)
         let n = 4096usize;
         let ppm: Vec<f64> = (0..n)
             .map(|i| 9.0 - (i as f64) * (8.0 / (n - 1) as f64))
@@ -3829,16 +3837,18 @@ mod tests {
         ];
 
         let recs =
-            align_traces_icoshift(&mut traces, 0, &intervals, AlignmentScope::LocalIntervals);
+            align_traces_interval_fft(&mut traces, 0, &intervals, AlignmentScope::LocalIntervals);
         assert_eq!(recs.len(), 2);
+        let ar_err = (recs[0].shift_ppm - (-drift_ar)).abs();
+        let al_err = (recs[1].shift_ppm - (-drift_al)).abs();
         assert!(
-            (recs[0].shift_ppm - (-drift_ar)).abs() < 1e-3,
+            ar_err < 1e-3,
             "Ar shift_ppm = {}, expected {}",
             recs[0].shift_ppm,
             -drift_ar
         );
         assert!(
-            (recs[1].shift_ppm - (-drift_al)).abs() < 1e-3,
+            al_err < 1e-3,
             "Aliph shift_ppm = {}, expected {}",
             recs[1].shift_ppm,
             -drift_al
@@ -3858,17 +3868,25 @@ mod tests {
             traces[0].clone(),
             Trace1d::new("glob", "GlobalDrift", 2.0, ppm, y_global_drift),
         ];
-        let grecs = align_traces_icoshift(
+        let grecs = align_traces_interval_fft(
             &mut global_traces,
             0,
             &intervals[..1],
             AlignmentScope::GlobalShiftFromRegion,
         );
         assert_eq!(grecs.len(), 1);
+        let glob_err = (global_traces[1].shift_offset_ppm - 0.0185).abs();
         assert!(
-            (global_traces[1].shift_offset_ppm - 0.0185).abs() < 1e-3,
+            glob_err < 1e-3,
             "shift_offset_ppm = {}",
             global_traces[1].shift_offset_ppm
+        );
+        println!(
+            "W1_METRIC_JSON:{{\"task\":\"T14.3\",\"kind\":\"t14_3_interval_fft_align\",\"ar_shift_err_ppm\":{:.3e},\"aliph_shift_err_ppm\":{:.3e},\"global_shift_err_ppm\":{:.3e},\"min_corr\":{:.6}}}",
+            ar_err,
+            al_err,
+            glob_err,
+            recs[0].correlation.min(recs[1].correlation)
         );
     }
 
@@ -3909,6 +3927,13 @@ mod tests {
                 "Product conversion must increase monotonically over time"
             );
         }
+        println!(
+            "W1_METRIC_JSON:{{\"task\":\"T14.3\",\"kind\":\"t14_3_kinetics_roi_matrix\",\"quadrature_err\":{:.3e},\"n_traces\":{},\"conv_t0\":{:.6},\"conv_t100\":{:.6}}}",
+            (exact_int - analytic).abs(),
+            mat.rows.len(),
+            mat.rows[0].normalized_ratio,
+            mat.rows[7].normalized_ratio
+        );
     }
 
     #[test]
@@ -3981,5 +4006,9 @@ mod tests {
             });
         }
         assert!(state.last_exported_tsv.is_some());
+        println!(
+            "W1_METRIC_JSON:{{\"task\":\"T14.3\",\"kind\":\"t14_3_headless_gui\",\"view_modes_rendered\":{},\"lod_32x64k_ok\":true}}",
+            Stack1dViewMode::ALL.len()
+        );
     }
 }

@@ -213,6 +213,18 @@ fn multinuclear_apodization_zerofill_fft_hilbert_and_dept_physics() {
     let picks = pick_peaks_1d(&spec_h1, &PeakPickConfig1D::default());
     assert!((picks[0].ppm - 7.26).abs() < 1e-3);
     assert!((picks[1].ppm - 3.65).abs() < 1e-3);
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.1",
+            "kind": "t14_1_fft_hilbert_solvent_cal",
+            "f19_area_err": (total_area_hz - 4.0).abs(),
+            "hilbert_rel_err": max_err / max_imag,
+            "lg_valley_ratio": ratio_lg,
+            "exp_valley_ratio": ratio_exp,
+            "solvent_cal_err_ppm": (applied_shift - (-misref_offset)).abs()
+        })
+    );
 }
 
 #[test]
@@ -398,6 +410,19 @@ fn chen_minimum_entropy_autophase_recovers_phc0_and_phc1_across_pivots() {
         "DEPT-135 |dPHC1| got {:.3}, expected -44.0",
         sol_dept.phc1_deg
     );
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.1",
+            "kind": "t14_1_autophase",
+            "case_a_phc0_err_deg": err_p0,
+            "case_a_phc1_err_deg": err_p1,
+            "hilbert_phc0_err_deg": err_b_p0,
+            "hilbert_phc1_err_deg": err_b_p1,
+            "dept135_phc0_err_deg": phase_diff_deg(sol_dept.phc0_deg, 31.0).abs(),
+            "dept135_phc1_err_deg": (sol_dept.phc1_deg - (-44.0)).abs()
+        })
+    );
 }
 
 #[test]
@@ -524,6 +549,16 @@ fn whittaker_and_bernstein_baseline_correction_flatten_curved_roll() {
         post_b_rms < raw_rms / 35.0,
         "Bernstein baseline RMS did not flatten enough: raw={raw_rms:.5}, post={post_b_rms:.5}"
     );
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.1",
+            "kind": "t14_1_baseline",
+            "whittaker_suppression_ratio": raw_rms / post_w_rms,
+            "bernstein_suppression_ratio": raw_rms / post_b_rms,
+            "whittaker_quartet_area_rel_err_pct": 100.0 * ((area_w - area_true) / area_true).abs()
+        })
+    );
 }
 
 #[test]
@@ -605,11 +640,13 @@ fn hsvd_water_subtraction_and_frequency_notch_preserve_nearby_solute_peaks() {
     );
 
     // Nearby solute peaks at 4.91 ppm and 4.63 ppm must retain their exact heights & integrals (< 1.5% diff)!
+    let mut max_solute_rel_err = 0.0_f64;
     for &sol_ppm in &[4.91, 4.63, 7.82, 1.42] {
         let idx = spec_ref.axis.ppm_to_index(sol_ppm).round() as usize;
         let h_ref = spec_ref.real[idx];
         let h_clean = spec_clean.real[idx];
         let rel_err = ((h_clean - h_ref) / h_ref).abs();
+        max_solute_rel_err = max_solute_rel_err.max(rel_err);
         assert!(
             rel_err < 0.015,
             "Solute peak at {sol_ppm:.2} ppm perturbed by {:.3}% after HSVD",
@@ -621,6 +658,16 @@ fn hsvd_water_subtraction_and_frequency_notch_preserve_nearby_solute_peaks() {
     spec_clean.real[idx_water] = 50.0; // inject synthetic frequency spike
     suppress_solvent_notch_1d(&mut spec_clean, &NotchConfig1D::new(4.74, 4.84));
     assert!(spec_clean.real[idx_water].abs() < 0.02);
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.1",
+            "kind": "t14_1_hsvd_solvent",
+            "water_suppression_pct": 100.0 * (1.0 - post_water_mag / raw_water_mag),
+            "max_solute_height_err_pct": 100.0 * max_solute_rel_err,
+            "subtracted_poles": hsvd_res.subtracted_poles.len()
+        })
+    );
 }
 
 #[test]
@@ -749,6 +796,8 @@ fn global_pseudo_voigt_lm_deconvolution_recovers_overlapping_multiplet_areas() {
     );
 
     // Match each ground-truth component to its nearest fitted component and assert < 2% area error!
+    let mut max_voigt_area_err_pct = 0.0_f64;
+    let mut max_voigt_pos_err_hz = 0.0_f64;
     for &(true_mu, true_g, true_eta, true_area) in &truth {
         let best = dec
             .peaks
@@ -763,6 +812,8 @@ fn global_pseudo_voigt_lm_deconvolution_recovers_overlapping_multiplet_areas() {
         let area_rel_err = ((best.area_ppm - true_area) / true_area).abs();
         let fwhm_rel_err = ((best.fwhm_ppm - true_g) / true_g).abs();
         let eta_err = (best.lorentz_fraction - true_eta).abs();
+        max_voigt_area_err_pct = max_voigt_area_err_pct.max(100.0 * area_rel_err);
+        max_voigt_pos_err_hz = max_voigt_pos_err_hz.max(pos_err_hz);
 
         assert!(
             pos_err_hz < 0.15,
@@ -840,6 +891,7 @@ fn global_pseudo_voigt_lm_deconvolution_recovers_overlapping_multiplet_areas() {
 
     let cluster = deconvolve_region_1d(&spec_fid, 2.34, 2.46, None, &DeconvolveConfig1D::default());
     assert_eq!(cluster.peaks.len(), 5);
+    let mut max_fid_voigt_err_pct = 0.0_f64;
     for line in &fid_lines {
         let fit = cluster
             .peaks
@@ -851,6 +903,7 @@ fn global_pseudo_voigt_lm_deconvolution_recovers_overlapping_multiplet_areas() {
             })
             .unwrap();
         let rel_err = ((fit.area_hz - line.amplitude) / line.amplitude).abs();
+        max_fid_voigt_err_pct = max_fid_voigt_err_pct.max(100.0 * rel_err);
         assert!(
             rel_err < 0.02,
             "FID peak at {:.3} ppm area_hz error {:.3}% >= 2.0% (got {:.4}, expected {:.4})",
@@ -860,6 +913,18 @@ fn global_pseudo_voigt_lm_deconvolution_recovers_overlapping_multiplet_areas() {
             line.amplitude
         );
     }
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.1",
+            "kind": "t14_1_voigt_deconv",
+            "n_components": dec.peaks.len(),
+            "residual_rmsd": dec.residual_rmsd,
+            "max_voigt_area_err_pct": max_voigt_area_err_pct,
+            "max_voigt_pos_err_hz": max_voigt_pos_err_hz,
+            "max_fid_e2e_area_err_pct": max_fid_voigt_err_pct
+        })
+    );
 }
 
 #[test]

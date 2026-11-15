@@ -280,6 +280,16 @@ fn region_integration_noise_uncertainty_matches_monte_carlo_and_spectrum1d_wrapp
     )
     .unwrap();
     assert!((wrapped.regions[0].norm_integral - 2.0).abs() < 1e-12);
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.2",
+            "kind": "t14_2_integration_mc",
+            "sigma_rel_err_none_pct": 100.0 * rel_err_none,
+            "sigma_rel_err_auto_pct": 100.0 * rel_err_auto,
+            "noise_rms_rel_err_pct": 100.0 * (est_rms - true_sigma).abs() / true_sigma
+        })
+    );
 }
 
 // ============================================================================
@@ -610,6 +620,18 @@ fn strong_roofing_delta_nu_over_j_3_recovers_classes_and_couplings_analytical_an
     assert_eq!(ana_td.class, MultipletClass::TripletOfDoublets);
     assert!((ana_td.j_values_hz()[0] - 9.4).abs() < 0.15);
     assert!((ana_td.j_values_hz()[1] - 3.4).abs() < 0.10);
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.2",
+            "kind": "t14_2_roofing_qm",
+            "roofed_cases_passed": roofed_cases.len(),
+            "ab_quartet_j_err_hz": (ab_sol.j_ab_hz - 9.0).abs(),
+            "ab_zeeman_err_ppm": (ana_a.ab_zeeman_ppm - 7.054).abs(),
+            "qm_dd_j1_err_hz": (ana_dd.j_values_hz()[0] - 9.0).abs(),
+            "qm_ddd_j1_err_hz": (ana_ddd.j_values_hz()[0] - 11.0).abs()
+        })
+    );
 }
 
 // ============================================================================
@@ -940,6 +962,21 @@ fn qnmr_end_to_end_nist_internal_standard_purity_uncertainty_replicates_and_t1_g
         rsd > 0.05 && rsd < 0.25,
         "unexpected replicate RSD: {rsd:.4}%"
     );
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.2",
+            "kind": "t14_2_qnmr_nist",
+            "true_purity_pct": 98.40,
+            "est_purity_pct": qnmr_ok.purity_percent,
+            "abs_purity_err_pct": abs_pct_err,
+            "uc_pct": qnmr_ok.combined_uncertainty_percent,
+            "u_k2_pct": qnmr_ok.expanded_uncertainty_k2_percent,
+            "molar_mm": qnmr_ok.molar_concentration_mm.unwrap(),
+            "replicate_rsd_pct": rsd,
+            "short_d1_warning_triggered": qnmr_warn.t1_recycle_warning
+        })
+    );
 }
 
 // ============================================================================
@@ -1238,6 +1275,16 @@ fn noisy_28_multiplet_benchmark_sweep_recovers_all_classes_and_sub_020_hz_j() {
     }
 
     assert!(max_j_err_hz < 0.20);
+    println!(
+        "W1_METRIC_JSON:{}",
+        serde_json::json!({
+            "task": "T14.2",
+            "kind": "t14_2_multiplet_28_sweep",
+            "n_cases": cases.len(),
+            "n_correct_class": cases.len(),
+            "max_j_err_hz": max_j_err_hz
+        })
+    );
 }
 
 #[test]
