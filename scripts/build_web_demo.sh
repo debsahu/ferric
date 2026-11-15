@@ -69,7 +69,7 @@ render_demo_shell_html() {
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="theme-color" content="#0e131b" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -501,9 +501,8 @@ demo_text = Path(sys.argv[1]).read_text(encoding="utf-8")
 trunk_text = Path(sys.argv[2]).read_text(encoding="utf-8")
 
 shared_tokens = [
+    'name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"',
     "viewport-fit=cover",
-    "maximum-scale=1.0",
-    "user-scalable=no",
     'name="theme-color" content="#0e131b"',
     'name="mobile-web-app-capable" content="yes"',
     'name="apple-mobile-web-app-capable" content="yes"',
@@ -524,11 +523,19 @@ shared_tokens = [
     'id="nmr_loading"',
 ]
 
+forbidden_wcag_tokens = [
+    "user-scalable=no",
+    "maximum-scale=1.0",
+]
+
 errors = []
 for label, doc in (("docs/demo/index.html", demo_text), ("crates/nmr-gui/index.html", trunk_text)):
     for tok in shared_tokens:
         if tok not in doc:
             errors.append(f"{label}: missing required mobile WebGPU token {tok!r}")
+    for bad in forbidden_wcag_tokens:
+        if bad in doc:
+            errors.append(f"{label}: forbidden WCAG 1.4.4 zoom-blocking viewport token {bad!r}")
     if doc.find("100vh") > doc.find("100dvh"):
         errors.append(f"{label}: 100vh fallback must precede 100dvh")
 

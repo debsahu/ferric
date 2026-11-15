@@ -1088,12 +1088,9 @@ fn inspect_single_raw_fid_dir(dir: &Path, rel_path: &str) -> Option<CandidateFid
 // Bruker JCAMP-DX Acquisition Metadata Inspector
 // ============================================================================
 
-fn parse_jcamp_map(path: &Path) -> HashMap<String, String> {
+fn parse_jcamp_map(path: &Path) -> Result<HashMap<String, String>, String> {
+    let text = read_header_text_capped(path)?;
     let mut map = HashMap::new();
-    let Ok(bytes) = fs::read(path) else {
-        return map;
-    };
-    let text = String::from_utf8_lossy(&bytes);
     let mut pending_array_key: Option<String> = None;
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -1116,7 +1113,29 @@ fn parse_jcamp_map(path: &Path) -> HashMap<String, String> {
             }
         }
     }
-    map
+    Ok(map)
+}
+
+fn read_bruker_dim_params_capped(
+    dir: &Path,
+    primary: &str,
+    fallback: &str,
+) -> Result<Option<HashMap<String, String>>, String> {
+    let p1 = find_child_ci(dir, primary).filter(|p| p.is_file());
+    let p2 = find_child_ci(dir, fallback).filter(|p| p.is_file());
+    if p1.is_none() && p2.is_none() {
+        return Ok(None);
+    }
+    let mut merged = match p2 {
+        Some(p) => parse_jcamp_map(&p)?,
+        None => HashMap::new(),
+    };
+    if let Some(p) = p1 {
+        for (k, v) in parse_jcamp_map(&p)? {
+            merged.insert(k, v);
+        }
+    }
+    Ok(Some(merged))
 }
 
 fn read_bruker_dim_params(
@@ -1124,18 +1143,9 @@ fn read_bruker_dim_params(
     primary: &str,
     fallback: &str,
 ) -> Option<HashMap<String, String>> {
-    let p1 = find_child_ci(dir, primary);
-    let p2 = find_child_ci(dir, fallback);
-    if p1.is_none() && p2.is_none() {
-        return None;
-    }
-    let mut merged = p2.map(|p| parse_jcamp_map(&p)).unwrap_or_default();
-    if let Some(p) = p1 {
-        for (k, v) in parse_jcamp_map(&p) {
-            merged.insert(k, v);
-        }
-    }
-    Some(merged)
+    read_bruker_dim_params_capped(dir, primary, fallback)
+        .ok()
+        .flatten()
 }
 
 fn normalize_nucleus_code(raw: &str, sfo_mhz: f64, h_mhz: f64) -> String {
@@ -1175,8 +1185,8 @@ fn read_bruker_title_and_pp_header(dir: &Path) -> (String, String) {
     if let Some(pdata) = find_child_ci(dir, "pdata") {
         if let Some(p1) = find_child_ci(&pdata, "1") {
             if let Some(tp) = find_child_ci(&p1, "title") {
-                if let Ok(bytes) = fs::read(tp) {
-                    title = String::from_utf8_lossy(&bytes)
+                if let Ok(txt) = read_header_text_capped(&tp) {
+                    title = txt
                         .lines()
                         .map(str::trim)
                         .filter(|l| !l.is_empty())
@@ -1190,8 +1200,9 @@ fn read_bruker_title_and_pp_header(dir: &Path) -> (String, String) {
     if let Some(pp) =
         find_child_ci(dir, "pulseprogram").or_else(|| find_child_ci(dir, "pulseprogram.precomp"))
     {
-        if let Ok(bytes) = fs::read(pp) {
-            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]);
+        if let Ok(txt) = read_header_text_capped(&pp) {
+            let head_bytes = txt.as_bytes();
+            let head = String::from_utf8_lossy(&head_bytes[..head_bytes.len().min(2048)]);
             pp_comment = head
                 .lines()
                 .take(20)
@@ -1395,10 +1406,9 @@ impl VarianProcparSummary {
 
 fn parse_varian_procpar_summary(path: &Path) -> VarianProcparSummary {
     let mut out = VarianProcparSummary::default();
-    let Ok(bytes) = fs::read(path) else {
+    let Ok(text) = read_header_text_capped(path) else {
         return out;
     };
-    let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
     let mut idx = 0usize;
 
@@ -2098,7 +2108,7 @@ fn verify_bruker_pulseprogram_containment_header_only(dir: &Path) -> Result<(), 
 fn read_optional_bruker_proc_header_only(
     dir: &Path,
     proc_name: &str,
-) -> Option<HashMap<String, String>> {
+) -> Result<Option<HashMap<String, String>>, String> {
     let is_processed = |pm: &HashMap<String, String>| -> bool {
         pm.get("FT_mod")
             .and_then(|s| s.parse::<i32>().ok())
@@ -2108,21 +2118,21 @@ fn read_optional_bruker_proc_header_only(
     if let Some(pdata_dir) = find_child_ci(dir, "pdata") {
         if let Some(d1) = find_child_ci(&pdata_dir, "1") {
             if let Some(p1) = find_child_ci(&d1, proc_name).filter(|p| p.is_file()) {
-                let m = parse_jcamp_map(&p1);
+                let m = parse_jcamp_map(&p1)?;
                 if !m.is_empty() && is_processed(&m) {
-                    return Some(m);
+                    return Ok(Some(m));
                 }
-                return None;
+                return Ok(None);
             }
         }
     }
     if let Some(p_direct) = find_child_ci(dir, proc_name).filter(|p| p.is_file()) {
-        let m = parse_jcamp_map(&p_direct);
+        let m = parse_jcamp_map(&p_direct)?;
         if !m.is_empty() && is_processed(&m) {
-            return Some(m);
+            return Ok(Some(m));
         }
     }
-    None
+    Ok(None)
 }
 
 fn find_bruker_nuslist_header_only(dir: &Path, acqus: &HashMap<String, String>) -> Option<PathBuf> {
@@ -2351,13 +2361,13 @@ fn check_bruker_header_compatibility(
         Err(_) => None,
     };
 
-    let acqus = read_bruker_dim_params(dir, "acqus", "acqu").ok_or_else(|| {
+    let acqus = read_bruker_dim_params_capped(dir, "acqus", "acqu")?.ok_or_else(|| {
         format!(
             "missing Bruker parameter file acqus (or acqu) in {}",
             dir.display()
         )
     })?;
-    let acqu2s = read_bruker_dim_params(dir, "acqu2s", "acqu2").ok_or_else(|| {
+    let acqu2s = read_bruker_dim_params_capped(dir, "acqu2s", "acqu2")?.ok_or_else(|| {
         format!(
             "missing Bruker indirect parameter file acqu2s (or acqu2) in {}",
             dir.display()
@@ -2365,7 +2375,7 @@ fn check_bruker_header_compatibility(
     })?;
     let acqu3s_opt = if expected_dims >= 3 {
         Some(
-            read_bruker_dim_params(dir, "acqu3s", "acqu3").ok_or_else(|| {
+            read_bruker_dim_params_capped(dir, "acqu3s", "acqu3")?.ok_or_else(|| {
                 format!(
                     "missing Bruker 3D indirect parameter file acqu3s (or acqu3) in {}",
                     dir.display()
@@ -2469,9 +2479,9 @@ fn check_bruker_header_compatibility(
             dir.display()
         ));
     }
-    let procs_raw = read_optional_bruker_proc_header_only(dir, "procs");
-    let proc2s_raw = read_optional_bruker_proc_header_only(dir, "proc2s");
-    let proc3s_raw = read_optional_bruker_proc_header_only(dir, "proc3s");
+    let procs_raw = read_optional_bruker_proc_header_only(dir, "procs")?;
+    let proc2s_raw = read_optional_bruker_proc_header_only(dir, "proc2s")?;
+    let proc3s_raw = read_optional_bruker_proc_header_only(dir, "proc3s")?;
     let (procs, proc2s, proc3s) =
         if expected_dims >= 3 && proc2s_raw.is_some() && proc3s_raw.is_none() {
             (None, None, None)
@@ -2789,7 +2799,7 @@ fn read_varian_fid_header_only(
     let ebytes = i32::from_be_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]).max(0) as usize;
     let bbytes = i32::from_be_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]).max(0) as usize;
     let status = u16::from_be_bytes([hdr[26], hdr[27]]);
-    let nbheaders = i32::from_be_bytes([hdr[28], hdr[29], hdr[30], hdr[31]]).max(0) as usize;
+    let nbheaders = i32::from_be_bytes([hdr[28], hdr[29], hdr[30], hdr[31]]).max(1) as usize;
 
     if (status & VARIAN_S_DATA) == 0 {
         return Err(format!(
@@ -9114,7 +9124,7 @@ mod tests {
             &clean_manifest,
             "bmrb_id\tprotein\tresidues\tfield_mhz\tvendor\texperiments\tsplit\tcohort\n\
              90001\tCleanBruker\t76\t600\tBruker\tHSQC,HNCO,HNCACB\tdev\tdev\n\
-             90002\tDeepVarian7\t76\t600\tVarian\tHSQC,HNCO,HNCACB\tdev\tdev\n\
+             90002\tZR18\t91\t600\tVarian\tHSQC,HNCO,HNCACB\tdev\tdev\n\
              90006\tManLoopNus\t76\t600\tBruker\tHSQC,HNCO\tdev\tdev\n\
              90099\tAbsentEntry\t76\t600\tBruker\tHSQC,HNCO\tdev\tdev\n",
         )
@@ -9218,22 +9228,37 @@ mod tests {
         check_bruker_header_compatibility(&grpdly_zero_3d, 3, false)
             .expect("3D cube with proc3s + procs PKNL=no must bypass GRPDLY=0 DSP lookup");
 
-        // 2. GFT `RDphase` Varian entry (`90003`, modeling `15089` `array="phase2,phase,RDphase"`, `RDphase=[1,2]`)
-        let e_gft = data_root.join("90003");
-        fs::create_dir_all(&e_gft).unwrap();
-        fs::copy(&fixture_star, e_gft.join("bmr90003_3.str")).unwrap();
-        write_synthetic_varian_exp_dir(
-            &e_gft.join("nhsqc.fid"),
-            "gNhsqc",
+        // Oversized JCAMP header (`> MAX_HEADER_TEXT_BYTES`) must be rejected by `parse_jcamp_map` /
+        // `check_bruker_header_compatibility` via `read_header_text_capped`
+        let oversized_jcamp_dir = dir.join("unit_oversized_jcamp");
+        write_synthetic_bruker_exp_dir(
+            &oversized_jcamp_dir,
+            "hsqcetfpf3gpsi",
             600.13,
-            4,
-            1,
-            2000.0,
-            0.0,
-            "",
+            8,
+            32.0,
+            "15N",
+            None,
         );
+        let oversized_acqus = oversized_jcamp_dir.join("acqus");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&oversized_acqus)
+            .unwrap()
+            .set_len(MAX_HEADER_TEXT_BYTES + 1)
+            .unwrap();
+        assert!(
+            parse_jcamp_map(&oversized_acqus).is_err(),
+            "parse_jcamp_map must refuse files exceeding MAX_HEADER_TEXT_BYTES"
+        );
+        let err_cap = check_bruker_header_compatibility(&oversized_jcamp_dir, 2, false)
+            .expect_err("oversized acqus must fail closed in --discover-only");
+        assert!(err_cap.contains("exceeds"), "got: {err_cap}");
+
+        // Direct Varian GFT `RDphase` unit check (`procpar` `array="phase2,phase,RDphase"`, `RDphase=[1,2]`)
+        let unit_varian_gft = dir.join("unit_varian_gft.fid");
         write_synthetic_varian_exp_dir(
-            &e_gft.join("hncacb_gft.fid"),
+            &unit_varian_gft,
             "ghncacb",
             600.13,
             4,
@@ -9247,6 +9272,35 @@ mod tests {
              2 1 2\n\
              0\n",
         );
+        let err_var_gft = check_varian_header_compatibility(&unit_varian_gft, 3, false)
+            .expect_err("Varian GFT RDphase procpar must fail closed");
+        assert!(err_var_gft.contains("RDphase"), "got: {err_var_gft}");
+
+        // 2. GFT `RDphase` Bruker entry (`90003`, aligned with `15089` `StR65` 600 MHz `Bruker` in `real_manifest.tsv`)
+        let e_gft = data_root.join("90003");
+        fs::create_dir_all(&e_gft).unwrap();
+        fs::copy(&fixture_star, e_gft.join("bmr90003_3.str")).unwrap();
+        write_synthetic_bruker_exp_dir(
+            &e_gft.join("2"),
+            "hsqcetfpf3gpsi",
+            600.13,
+            8,
+            32.0,
+            "15N",
+            None,
+        );
+        write_synthetic_bruker_exp_dir(
+            &e_gft.join("3"),
+            "hncacbgp3d",
+            600.13,
+            8,
+            65.0,
+            "13C",
+            Some((8, 32.0, "15N")),
+        );
+        let mut gft_acqu2s = fs::read_to_string(e_gft.join("3/acqu2s")).unwrap();
+        gft_acqu2s.push_str("##$RDphase= 2\n");
+        fs::write(e_gft.join("3/acqu2s"), gft_acqu2s).unwrap();
 
         // 3. Degenerate Bruker indirect `TD=1` (`90004`) + Missing experiment (`90005`)
         let e_bad_td = data_root.join("90004");
@@ -9297,7 +9351,7 @@ mod tests {
         fs::write(
             &bad_manifest,
             "bmrb_id\tprotein\tresidues\tfield_mhz\tvendor\texperiments\tsplit\tcohort\n\
-             90003\tGftVarian\t76\t600\tVarian\tHSQC,HNCACB\tdev\tdev\n\
+             90003\tStR65\t115\t600\tBruker\tHSQC,HNCACB\tdev\tdev\n\
              90004\tBadTdBruker\t76\t600\tBruker\tHSQC,HNCO\tdev\tdev\n\
              90005\tMissingExp\t76\t600\tBruker\tHSQC,HNCO,HNCACB\tdev\tdev\n",
         )
@@ -9351,7 +9405,7 @@ mod tests {
             fs::write(
                 &m5844,
                 "bmrb_id\tprotein\tresidues\tfield_mhz\tvendor\texperiments\tsplit\tcohort\n\
-                 5844\tOP1841\t100\t750\tVarian\tHSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA\theldout\tseen_p13_w2\n",
+                 5844\tZR18\t91\t600\tVarian\tHSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA\theldout\tseen_p13_w2\n",
             )
             .unwrap();
             let cfg_5844 = parse_real_benchmark_args(&[
@@ -9374,7 +9428,7 @@ mod tests {
             fs::write(
                 &m15089,
                 "bmrb_id\tprotein\tresidues\tfield_mhz\tvendor\texperiments\tsplit\tcohort\n\
-                 15089\tStR65\t91\t600\tVarian\tHSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO\theldout\tseen_p13_w2\n",
+                 15089\tStR65\t115\t600\tBruker\tHSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO\theldout\tseen_p13_w2\n",
             )
             .unwrap();
             let cfg_15089 = parse_real_benchmark_args(&[
@@ -9536,15 +9590,133 @@ mod tests {
         assert_eq!(hsqc_stem.rel_path, "data/protA_batch2_nhsqc.fid");
 
         // Case C: Verify ZERO selection change across all 13 real `dev` entries + verify `16238` (`seen_p13_w2`)
+        // and deterministically emit `data/private/p17_w1_results/dev_hsqc_selection_diff.json` (`17.1:P1-2`).
+        let select_legacy_v0120_hsqc = |entry_dir: &Path, hint_field_mhz: Option<f64>| -> String {
+            let mut raw_dirs = Vec::new();
+            collect_raw_fid_dirs_recursive(entry_dir, 0, 6, &mut raw_dirs);
+            let mut inspections: Vec<CandidateFidInspection> = Vec::new();
+            for dpath in raw_dirs {
+                let rel = dpath
+                    .strip_prefix(entry_dir)
+                    .unwrap_or(&dpath)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let rel_clean = if rel.is_empty() { ".".to_string() } else { rel };
+                if let Some(mut insp) = inspect_single_raw_fid_dir(&dpath, &rel_clean) {
+                    // `v0.12.0` (`adf55d8`) classified 2D HSQC only when `n_sw_ppm <= 100.0`
+                    if insp.classified_exp.as_deref() == Some("HSQC")
+                        && insp.n_sw_ppm.is_some_and(|nsw| nsw > 100.0)
+                    {
+                        insp.classified_exp = None;
+                    }
+                    inspections.push(insp);
+                }
+            }
+            let mut by_exp: BTreeMap<String, Vec<CandidateFidInspection>> = BTreeMap::new();
+            for insp in &inspections {
+                if let Some(exp) = &insp.classified_exp {
+                    if insp.raw_file_bytes > 0 {
+                        by_exp.entry(exp.clone()).or_default().push(insp.clone());
+                    }
+                }
+            }
+            let mut anchor_parents = BTreeSet::new();
+            let mut triple_mhz_vals: Vec<f64> = Vec::new();
+            for (exp, cands) in &by_exp {
+                if exp != "HSQC" {
+                    for c in cands {
+                        if c.h_mhz > 100.0 {
+                            triple_mhz_vals.push(c.h_mhz);
+                        }
+                    }
+                    if cands.len() == 1 {
+                        if let Some(parent) = Path::new(&cands[0].rel_path).parent() {
+                            let ps = parent.to_string_lossy().into_owned();
+                            if !ps.is_empty() && ps != "." {
+                                anchor_parents.insert(ps);
+                            }
+                        }
+                    }
+                }
+            }
+            triple_mhz_vals.sort_by(|a, b| a.total_cmp(b));
+            let target_mhz = if !triple_mhz_vals.is_empty() {
+                Some(triple_mhz_vals[triple_mhz_vals.len() / 2])
+            } else {
+                hint_field_mhz.filter(|&m| m > 100.0)
+            };
+            let exp_order = [
+                "HSQC", "HNCO", "HNCACO", "HNCA", "HNCOCA", "HNCACB", "CBCACONH",
+            ];
+            for &exp_name in &exp_order {
+                let Some(mut cands) = by_exp.remove(exp_name) else {
+                    continue;
+                };
+                cands.sort_by(|a, b| {
+                    let sa = candidate_selection_score(a, &anchor_parents, target_mhz);
+                    let sb = candidate_selection_score(b, &anchor_parents, target_mhz);
+                    sb.cmp(&sa).then_with(|| a.rel_path.cmp(&b.rel_path))
+                });
+                let best = &cands[0];
+                if exp_name != "HSQC" {
+                    if let Some(parent) = Path::new(&best.rel_path).parent() {
+                        let ps = parent.to_string_lossy().into_owned();
+                        if !ps.is_empty() && ps != "." {
+                            anchor_parents.insert(ps);
+                        }
+                    }
+                }
+            }
+            let mut legacy_cands: Vec<CandidateFidInspection> = inspections
+                .into_iter()
+                .filter(|c| c.classified_exp.as_deref() == Some("HSQC") && c.raw_file_bytes > 0)
+                .collect();
+            legacy_cands.sort_by(|a, b| {
+                let sa = candidate_selection_score(a, &anchor_parents, target_mhz);
+                let sb = candidate_selection_score(b, &anchor_parents, target_mhz);
+                sb.cmp(&sa).then_with(|| a.rel_path.cmp(&b.rel_path))
+            });
+            legacy_cands[0].rel_path.clone()
+        };
+
+        let render_diff_row_json =
+            |entry: &RealManifestEntry, legacy_rel: &str, new_rel: &str, indent: usize| -> String {
+                let pad = " ".repeat(indent);
+                let pad2 = " ".repeat(indent + 2);
+                let changed = legacy_rel != new_rel;
+                format!(
+                    "{pad}{{\n\
+                 {pad2}\"entry_id\": \"{}\",\n\
+                 {pad2}\"protein\": \"{}\",\n\
+                 {pad2}\"split\": \"{}\",\n\
+                 {pad2}\"cohort\": \"{}\",\n\
+                 {pad2}\"legacy_hsqc_rel_path\": \"{}\",\n\
+                 {pad2}\"new_hsqc_rel_path\": \"{}\",\n\
+                 {pad2}\"changed\": {changed}\n\
+                 {pad}}}",
+                    json_escape(&entry.bmrb_id),
+                    json_escape(&entry.protein),
+                    json_escape(&entry.split),
+                    json_escape(&entry.cohort),
+                    json_escape(legacy_rel),
+                    json_escape(new_rel),
+                )
+            };
+
         let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../data/benchmark/real_manifest.tsv");
         let entries =
             parse_real_manifest_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
-        for e in entries.iter().filter(|e| e.split == "dev") {
+        let dev_manifest_entries: Vec<&RealManifestEntry> =
+            entries.iter().filter(|e| e.split == "dev").collect();
+        assert_eq!(dev_manifest_entries.len(), 13);
+
+        let mut dev_row_jsons: Vec<String> = Vec::new();
+        for e in &dev_manifest_entries {
             if let Ok(loc) =
                 resolve_local_entry_paths(&e.bmrb_id, Path::new("data/private/bmrb"), true)
             {
-                let (disc, inspections) =
+                let (disc, _) =
                     discover_entry_experiments(&loc.entry_dir, Some(e.field_mhz)).unwrap();
                 let new_hsqc = disc
                     .iter()
@@ -9552,52 +9724,25 @@ mod tests {
                     .expect("dev HSQC")
                     .rel_path
                     .clone();
-                // Compute what legacy `candidate_selection_score` selected given the same 3D anchor parents
-                let target_mhz = Some(e.field_mhz);
-                let mut anchor_parents = BTreeSet::new();
-                for d in disc.iter().filter(|d| d.exp_type != "HSQC") {
-                    let same_type_n = inspections
-                        .iter()
-                        .filter(|c| {
-                            c.classified_exp.as_deref() == Some(d.exp_type.as_str())
-                                && c.raw_file_bytes > 0
-                        })
-                        .count();
-                    if same_type_n == 1 || anchor_parents.is_empty() {
-                        if let Some(par) = Path::new(&d.rel_path).parent() {
-                            let ps = par.to_string_lossy().into_owned();
-                            if !ps.is_empty() {
-                                anchor_parents.insert(ps);
-                            }
-                        }
-                    }
-                }
-                let mut legacy_cands: Vec<CandidateFidInspection> = inspections
-                    .into_iter()
-                    .filter(|c| {
-                        c.classified_exp.as_deref() == Some("HSQC")
-                            && c.raw_file_bytes > 0
-                            && c.n_sw_ppm.is_none_or(|nsw| nsw <= 100.0)
-                    })
-                    .collect();
-                legacy_cands.sort_by(|a, b| {
-                    let sa = candidate_selection_score(a, &anchor_parents, target_mhz);
-                    let sb = candidate_selection_score(b, &anchor_parents, target_mhz);
-                    sb.cmp(&sa).then_with(|| a.rel_path.cmp(&b.rel_path))
-                });
-                let legacy_hsqc = legacy_cands[0].rel_path.clone();
+                let legacy_hsqc = select_legacy_v0120_hsqc(&loc.entry_dir, Some(e.field_mhz));
                 assert_eq!(
                     new_hsqc, legacy_hsqc,
                     "dev entry {} HSQC selection changed from {} to {}",
                     e.bmrb_id, legacy_hsqc, new_hsqc
                 );
+                dev_row_jsons.push(render_diff_row_json(e, &legacy_hsqc, &new_hsqc, 4));
             }
         }
+        let mut ref_16238_json: Option<String> = None;
         if let Ok(loc_16238) =
             resolve_local_entry_paths("16238", Path::new("data/private/bmrb"), true)
         {
+            let e_16238 = entries
+                .iter()
+                .find(|e| e.bmrb_id == "16238")
+                .expect("16238 in real_manifest.tsv");
             let (disc_16238, _) =
-                discover_entry_experiments(&loc_16238.entry_dir, Some(850.0)).unwrap();
+                discover_entry_experiments(&loc_16238.entry_dir, Some(e_16238.field_mhz)).unwrap();
             let hsqc_16238 = disc_16238
                 .iter()
                 .find(|d| d.exp_type == "HSQC")
@@ -9606,6 +9751,65 @@ mod tests {
                 hsqc_16238.rel_path,
                 "nesgVcR52_bmrb16238_pdb2khd_fids/vcr52.010_Nhsqc_swN150p_10_23_08.fid"
             );
+            let legacy_16238 =
+                select_legacy_v0120_hsqc(&loc_16238.entry_dir, Some(e_16238.field_mhz));
+            assert_ne!(
+                legacy_16238, hsqc_16238.rel_path,
+                "16238 (`seen_p13_w2`) must record changed: true between legacy and series-matched HSQC selector"
+            );
+            ref_16238_json = Some(render_diff_row_json(
+                e_16238,
+                &legacy_16238,
+                &hsqc_16238.rel_path,
+                2,
+            ));
+        }
+
+        if dev_row_jsons.len() == 13 {
+            if let Some(ref ref_16238) = ref_16238_json {
+                let diff_doc = format!(
+                    "{{\n\
+                       \"schema_version\": \"p17.w1.hsqc_selection_diff.v1\",\n\
+                       \"legacy_selector\": \"candidate_selection_score (depth<=6, n_sw_ppm<=100.0)\",\n\
+                       \"new_selector\": \"hsqc_series_selection_score (depth<=10, n_sw_ppm<=165.0)\",\n\
+                       \"dev_total\": 13,\n\
+                       \"dev_changed_count\": 0,\n\
+                       \"dev_entries\": [\n{}\n  ],\n\
+                       \"seen_p13_w2_reference\": {}\n\
+                     }}\n",
+                    dev_row_jsons.join(",\n"),
+                    ref_16238.trim_start()
+                );
+
+                // Always validate round-trip in temp dir and write to `data/private/p17_w1_results/dev_hsqc_selection_diff.json`
+                // when local `data/private/` is present (or `NMR_DEV_HSQC_DIFF_OUT` is explicitly set).
+                let tmp_check = dir.join("dev_hsqc_selection_diff.json");
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(&tmp_check, &diff_doc).unwrap();
+                assert!(diff_doc.contains("\"dev_changed_count\": 0"));
+                assert!(diff_doc.contains("\"changed\": true"));
+
+                let mut out_targets: Vec<PathBuf> = Vec::new();
+                if let Some(custom_out) = env::var_os("NMR_DEV_HSQC_DIFF_OUT") {
+                    out_targets.push(PathBuf::from(custom_out));
+                } else {
+                    let repo_root = resolve_git_main_checkout_root()
+                        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."));
+                    let priv_dir = repo_root.join("data/private");
+                    if priv_dir.is_dir() {
+                        out_targets
+                            .push(priv_dir.join("p17_w1_results/dev_hsqc_selection_diff.json"));
+                    }
+                }
+                for target in out_targets {
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent).unwrap();
+                    }
+                    let stage = target.with_extension(format!("json.tmp.{}", process::id()));
+                    fs::write(&stage, &diff_doc).unwrap();
+                    fs::rename(&stage, &target).unwrap();
+                }
+            }
         }
 
         let _ = fs::remove_dir_all(&dir);
@@ -9723,9 +9927,16 @@ mod tests {
             qc_shift.max_inter_exp_ca_drift_ppm
         );
         assert_eq!(qc_shift.verdict, nmr_core::qc::DatasetQcVerdict::Warn);
+        assert!(
+            (qc_shift.confidence_scale - 1.0).abs() < 1e-12,
+            "diagnostic-only inter_exp_c13_offset_warn must keep applied_scale == 1.0 when sole warning, got {}",
+            qc_shift.confidence_scale
+        );
+        assert!((qc_shift.confidence_cap - 1.0).abs() < 1e-12);
         let json_shift = render_qc_report_json(&qc_shift, 0);
         assert!(json_shift.contains("\"verdict\": \"WARN\""));
         assert!(json_shift.contains("\"inter_exp_c13_offset_warn\": true"));
+        assert!(json_shift.contains("\"confidence_scale\": 1.0000"));
     }
 
     #[test]

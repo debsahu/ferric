@@ -141,7 +141,8 @@ pub struct DatasetQcReport {
     #[serde(default)]
     pub truncated_fid_zero_filled: bool,
     /// True when pairwise empirical `13C` `CA` referencing across `HNCA`, `HNCACB` (positive `CA`-band),
-    /// and `CBCACONH` diverges by `>= 0.50` ppm (`F6a`), indicating multi-batch `13C` zero-point mismatch.
+    /// and `CBCACONH` diverges by `>= 0.50` ppm (`F6a`), indicating multi-batch `13C` zero-point mismatch
+    /// (emits a diagnostic-only `DatasetQcVerdict::Warn` without multiplicative `confidence_scale` damping).
     #[serde(default)]
     pub inter_exp_c13_offset_warn: bool,
     /// Maximum absolute pairwise inter-experiment `13C` `CA` referencing offset (ppm) across present
@@ -356,10 +357,12 @@ fn check_inter_experiment_c13_ca_consistency_with_roots(
                     .iter()
                     .filter_map(|r| r.height.map(f64::abs))
                     .collect();
-                hs.sort_by(|a, b| b.total_cmp(a));
-                let n_ref = ((hs.len() * 3) / 4).clamp(1, hs.len());
-                let iref = median_f64(hs[..n_ref].to_vec()).unwrap_or(1.0).max(1e-9);
-                gated.retain(|r| r.height.map(f64::abs).unwrap_or(0.0) >= 0.05 * iref);
+                if !hs.is_empty() {
+                    hs.sort_by(|a, b| b.total_cmp(a));
+                    let n_ref = ((hs.len() * 3) / 4).clamp(1, hs.len());
+                    let iref = median_f64(hs[..n_ref].to_vec()).unwrap_or(1.0).max(1e-9);
+                    gated.retain(|r| r.height.map(f64::abs).unwrap_or(0.0) >= 0.05 * iref);
+                }
             }
             gated.into_iter().map(|r| (r.h, r.n)).collect()
         } else {
@@ -1770,31 +1773,33 @@ pub fn evaluate_dataset_qc_with_gate(
                     .iter()
                     .filter_map(|r| r.height.map(f64::abs))
                     .collect();
-                hs.sort_by(|a, b| b.total_cmp(a));
-                let n_ref = (n_assignable_amides + 2 * n_asn_gln).clamp(1, hs.len());
-                let iref = median_f64(hs[..n_ref].to_vec()).unwrap_or(1.0).max(1e-9);
-                let snapshot = gated_roots.clone();
-                gated_roots.retain(|r| {
-                    let hr = r.height.map(f64::abs).unwrap_or(0.0);
-                    if hr < 0.05 * iref {
-                        return false;
-                    }
-                    // Suppress 1D indirect/direct 2D sinc sidelobes of intense parent peaks
-                    for q in &snapshot {
-                        let hq = q.height.map(f64::abs).unwrap_or(0.0);
-                        if hq <= hr || hq < 0.25 * iref {
-                            continue;
-                        }
-                        let dh = (r.h - q.h).abs();
-                        let dn = (r.n - q.n).abs();
-                        if (dh <= 0.025 && (0.20..=3.0).contains(&dn) && hr < 0.14 * hq)
-                            || (dn <= 0.22 && (0.028..=0.35).contains(&dh) && hr < 0.14 * hq)
-                        {
+                if !hs.is_empty() {
+                    hs.sort_by(|a, b| b.total_cmp(a));
+                    let n_ref = (n_assignable_amides + 2 * n_asn_gln).clamp(1, hs.len());
+                    let iref = median_f64(hs[..n_ref].to_vec()).unwrap_or(1.0).max(1e-9);
+                    let snapshot = gated_roots.clone();
+                    gated_roots.retain(|r| {
+                        let hr = r.height.map(f64::abs).unwrap_or(0.0);
+                        if hr < 0.05 * iref {
                             return false;
                         }
-                    }
-                    true
-                });
+                        // Suppress 1D indirect/direct 2D sinc sidelobes of intense parent peaks
+                        for q in &snapshot {
+                            let hq = q.height.map(f64::abs).unwrap_or(0.0);
+                            if hq <= hr || hq < 0.25 * iref {
+                                continue;
+                            }
+                            let dh = (r.h - q.h).abs();
+                            let dn = (r.n - q.n).abs();
+                            if (dh <= 0.025 && (0.20..=3.0).contains(&dn) && hr < 0.14 * hq)
+                                || (dn <= 0.22 && (0.028..=0.35).contains(&dh) && hr < 0.14 * hq)
+                            {
+                                return false;
+                            }
+                        }
+                        true
+                    });
+                }
             }
 
             // Filter low-amplitude noise floor from 3D channels before computing carrier lock shifts,
@@ -1809,7 +1814,7 @@ pub fn evaluate_dataset_qc_with_gate(
                     let mut hs: Vec<f64> =
                         list.iter().filter_map(|p| p.height.map(f64::abs)).collect();
                     hs.sort_by(|a, b| b.total_cmp(a));
-                    let k_ref = n_assignable_amides.clamp(4, hs.len().max(1));
+                    let k_ref = n_assignable_amides.max(4).min(hs.len().max(1));
                     let iref = median_f64(hs[..k_ref.min(hs.len())].to_vec())
                         .unwrap_or(1.0)
                         .max(1e-9);
@@ -2385,9 +2390,12 @@ pub fn evaluate_dataset_qc_with_gate(
     }
 
     let mut scale = 1.0_f64;
+    let mut scale_damped = false;
 
     if let Some(ref c13_msg) = c13_ca_consistency.diagnostic {
-        scale *= 0.78;
+        // Diagnostic-only WARN (`F6a` / `17.1:P1-1`): emit `DatasetQcVerdict::Warn` and record
+        // the `13C` CA referencing drift reason without uncalibrated multiplicative damping,
+        // preserving exact parity with LOPO gate-fitting objectives (`evaluate_seed_predictions_with_gate`).
         warn_reasons.push(c13_msg.clone());
     }
 
@@ -2396,6 +2404,7 @@ pub fn evaluate_dataset_qc_with_gate(
         let pen = ((hsqc_multiplicity_ratio - 1.45) * 0.20)
             .clamp(gate_cfg.multiplicity_penalty_floor, 0.22);
         scale *= 1.0 - pen;
+        scale_damped = true;
         warn_reasons.push(format!(
             "elevated 3D-backed HSQC amide multiplicity ({:.2}x > 1.45x, supported {:.2}x; possible multi-conformer crowding)",
             hsqc_multiplicity_ratio, supported_roots_per_assignable
@@ -2404,6 +2413,7 @@ pub fn evaluate_dataset_qc_with_gate(
     if hsqc_3d_support_frac < 0.55 && supported_roots_per_assignable < 0.80 {
         let pen = ((0.55 - hsqc_3d_support_frac) * 0.45).clamp(0.06, 0.18);
         scale *= 1.0 - pen;
+        scale_damped = true;
         warn_reasons.push(format!(
             "low 3D strip support ({:.1}% < 55.0%, supported/assignable {:.2}x)",
             hsqc_3d_support_frac * 100.0,
@@ -2412,6 +2422,7 @@ pub fn evaluate_dataset_qc_with_gate(
     }
     if !systems.is_empty() && aliphatic_support_frac < 0.50 {
         scale *= 0.90;
+        scale_damped = true;
         warn_reasons.push(format!(
             "sparse aliphatic (CA/CB) strip backing ({:.1}% < 50.0%)",
             aliphatic_support_frac * 100.0
@@ -2419,6 +2430,7 @@ pub fn evaluate_dataset_qc_with_gate(
     }
     if hsqc_3d_rms_dh_ppm > 0.028 || hsqc_3d_rms_dn_ppm > 0.26 {
         scale *= 0.88;
+        scale_damped = true;
         warn_reasons.push(format!(
             "elevated Voronoi HSQC-to-3D residual drift (rms dH={:.3}, dN={:.2} ppm)",
             hsqc_3d_rms_dh_ppm, hsqc_3d_rms_dn_ppm
@@ -2426,17 +2438,20 @@ pub fn evaluate_dataset_qc_with_gate(
     }
     if !offset_consistency_ok {
         scale *= 0.78;
+        scale_damped = true;
         warn_reasons.extend(offset_issues);
     }
     if let Some(ref weak_off_msg) = weak_offset_issue {
         if offset_consistency_ok {
             scale *= 0.78;
         }
+        scale_damped = true;
         warn_reasons.push(weak_off_msg.clone());
     }
     if assigned_count >= 8 && connectivity_frac < 0.38 {
         let pen = ((0.38 - connectivity_frac) * 0.55).clamp(0.06, 0.16);
         scale *= 1.0 - pen;
+        scale_damped = true;
         warn_reasons.push(format!(
             "fragmented sequential connectivity ({:.1}% < 38.0%)",
             connectivity_frac * 100.0
@@ -2446,6 +2461,7 @@ pub fn evaluate_dataset_qc_with_gate(
         && corroborated_connectivity_frac < gate_cfg.min_corroborated_connectivity
     {
         scale *= 0.90;
+        scale_damped = true;
         warn_reasons.push(format!(
             "weak corroborated multi-channel sequential connectivity ({:.1}% < {:.1}% at P >= 3.5 nats)",
             corroborated_connectivity_frac * 100.0,
@@ -2453,7 +2469,7 @@ pub fn evaluate_dataset_qc_with_gate(
         ));
     }
 
-    let applied_scale = if warn_reasons.is_empty() {
+    let applied_scale = if !scale_damped {
         1.0
     } else {
         scale.clamp(0.65, 0.92)
@@ -3706,11 +3722,27 @@ mod inter_exp_c13_tests {
         );
         assert_eq!(qc_shifted.verdict, DatasetQcVerdict::Warn);
         assert!(qc_shifted.inter_exp_c13_offset_warn);
+        assert!(
+            (qc_shifted.confidence_scale - 1.0).abs() < 1e-12,
+            "diagnostic-only inter_exp_c13_offset_warn must leave applied_scale == 1.0 when sole warning, got {}",
+            qc_shifted.confidence_scale
+        );
+        assert!((qc_shifted.confidence_cap - 1.0).abs() < 1e-12);
+        assert!(!qc_shifted.protein_hc_gate_triggered);
         assert!((qc_shifted.max_inter_exp_ca_drift_ppm - 1.83).abs() < 0.10);
         assert!(qc_shifted
             .reasons
             .iter()
             .any(|r| r.contains("inter-experiment 13C CA referencing mismatch")));
+        let mut res_applied = res.clone();
+        apply_dataset_qc_to_assignments(&mut res_applied, &qc_shifted);
+        assert!(
+            res_applied
+                .confidence
+                .iter()
+                .all(|&c| (c - 0.92).abs() < 1e-12),
+            ">= 0.80 high-confidence calls must remain untouched when inter_exp_c13_offset_warn is the sole warning"
+        );
 
         // 3. Moderate >= 0.50 ppm divergence (+0.65 ppm) also triggers WARN
         let (_, mod_peaks) = synthetic_ca_cb_chain(24, 0.65, 0.0);
@@ -3726,5 +3758,82 @@ mod inter_exp_c13_tests {
         let single_c13 = check_inter_experiment_c13_ca_consistency(&single_ca);
         assert_eq!(single_c13.n_ca_experiments, 1);
         assert!(!single_c13.warn_triggered);
+    }
+
+    #[test]
+    fn test_mixed_height_hsqc_peaks_empty_gated_heights_no_panic() {
+        // Construct a mixed-height peak list (`17.1:P1-3`):
+        // - `has_heights == true` overall because out-of-band / opposite-sign HSQC artifacts carry `Some(height)`
+        // - `gated` is non-empty (23 in-band `sign = 1` amide HSQC roots)
+        // - `0` gated peaks carry `Some(height)` (`height: None`), so `hs.is_empty()` in BOTH
+        //   `check_inter_experiment_c13_ca_consistency` (`qc.rs:360`) and `evaluate_dataset_qc` (`qc.rs:1774`).
+        let (seq, mut mixed_peaks) = synthetic_ca_cb_chain(24, 0.0, 0.0);
+        for p in &mut mixed_peaks {
+            if p.exp == "HSQC" {
+                p.height = None;
+            }
+        }
+        // Out-of-band water artifact (`h = 4.75 < 5.5`) and opposite-sign folded peak (`sign = -1`)
+        // carry `Some(height)`, making `has_heights == true` while every gated root has `height == None`.
+        mixed_peaks.push(mk_peak("HSQC", 4.75, 118.0, None, 1, 2500.0));
+        mixed_peaks.push(mk_peak("HSQC", 8.10, 120.0, None, -1, -900.0));
+        // Also strip heights on all but 2 HNCO peaks to exercise `< 4` height-bearing 3D peaks (`qc.rs:1812`).
+        let mut hnco_kept_heights = 0usize;
+        for p in &mut mixed_peaks {
+            if p.exp == "HNCO" {
+                if hnco_kept_heights < 2 {
+                    hnco_kept_heights += 1;
+                } else {
+                    p.height = None;
+                }
+            }
+        }
+
+        // Path 1: `check_inter_experiment_c13_ca_consistency` (`qc.rs:360`)
+        let c13_rep = check_inter_experiment_c13_ca_consistency(&mixed_peaks);
+        assert_eq!(c13_rep.n_ca_experiments, 3);
+        assert_eq!(c13_rep.pair_offsets.len(), 3);
+        assert!(!c13_rep.warn_triggered);
+
+        // Path 2: `evaluate_dataset_qc` (`qc.rs:1774` + `qc.rs:360` + `qc.rs:1812`)
+        let priors = Priors::bmrb();
+        let score_cfg = ScoreConfig::default();
+        let systems = build_spin_systems(&mixed_peaks, &Tolerances::default(), 4, false).unwrap();
+        let mut pos = vec![-1i32; systems.len()];
+        for (s_idx, ss) in systems.iter().enumerate() {
+            for k in 2..=24 {
+                let hk = 7.40 + 0.085 * ((k % 17) as f64) + 0.011 * ((k / 17) as f64);
+                let nk = 114.0 + 1.15 * ((k % 13) as f64) + 0.35 * ((k / 13) as f64);
+                if (ss.h - hk).abs() < 0.02 && (ss.n - nk).abs() < 0.20 {
+                    pos[s_idx] = k;
+                    break;
+                }
+            }
+        }
+        let res = AssignResult {
+            position: pos,
+            confidence: vec![0.92; systems.len()],
+            score: 120.0,
+            run_scores: vec![120.0],
+        };
+        let qc = evaluate_dataset_qc(
+            Some(&mixed_peaks),
+            &systems,
+            &seq,
+            &priors,
+            &score_cfg,
+            &res,
+            None,
+        );
+        assert_eq!(
+            qc.n_amide_hsqc_roots, 23,
+            "heightless in-band HSQC roots must be preserved when hs.is_empty()"
+        );
+        assert_eq!(
+            qc.verdict,
+            DatasetQcVerdict::Pass,
+            "reasons={:?}",
+            qc.reasons
+        );
     }
 }

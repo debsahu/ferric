@@ -17,8 +17,10 @@
 //! - Original bounded `256`-step reversible `McpUndoLog` preserving bijective
 //!   `(cluster_id <-> seq_id)` assignment invariants in 1 `Cmd/Ctrl+Z` keystroke.
 
+#[cfg(not(any(unix, windows)))]
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(not(any(unix, windows)))]
 use std::hash::{BuildHasher, Hasher};
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::{BufReader, Read, Write};
@@ -26,7 +28,10 @@ use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(any(unix, windows)))]
+use std::sync::atomic::AtomicU64;
+#[cfg(any(not(target_arch = "wasm32"), not(any(unix, windows))))]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread::{self, JoinHandle};
@@ -54,6 +59,7 @@ pub const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_MCP_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 
+#[cfg(not(any(unix, windows)))]
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // ============================================================================
@@ -1012,43 +1018,57 @@ fn fill_os_entropy(_raw: &mut [u8; 32]) -> bool {
     false
 }
 
-/// Generate a fresh `nmr_mcp_<64-hex>` loopback bearer token (`72` ASCII chars total):
-///
-/// - **Native Unix (`#[cfg(unix)]`)**: draws 256 bits (`32` non-zero-verified bytes) from the
-///   kernel CSPRNG via `/dev/urandom`.
-/// - **Native Windows (`#[cfg(windows)]`)**: draws 256 bits (`32` non-zero-verified bytes) from
-///   the Windows CNG system CSPRNG via `BCryptGenRandom(..., BCRYPT_USE_SYSTEM_PREFERRED_RNG)`
-///   (`bcrypt.dll`, checking `NTSTATUS == 0` and non-zero output bytes).
-/// - **Non-Unix / non-Windows targets (`#[cfg(not(any(unix, windows)))]`, e.g. `wasm32`, or if
-///   an OS CSPRNG read fails)**: mixes four `std::collections::hash_map::RandomState` SipHash
-///   hashers with a monotonic `AtomicU64` sequence counter. **Entropy ceiling**: `RandomState`
-///   derives from `std`'s per-thread 128-bit seed (or deterministic/address-space seed on bare
-///   `wasm32-unknown-unknown` without host OS randomness), so this fallback provides at most the
-///   entropy of `std`'s `RandomState` initialization (`<= 128` bits rather than 256 independent
-///   CSPRNG bits) and exists only for non-networked UI state on targets such as `wasm32` where
-///   `start_bridge` already disables TCP socket binding.
-pub fn generate_bearer_token() -> String {
-    let mut raw = [0u8; 32];
-    if !fill_os_entropy(&mut raw) {
-        let seq = TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
-        for (i, chunk) in raw.chunks_exact_mut(8).enumerate() {
-            let rs = RandomState::new();
-            let mut h = rs.build_hasher();
-            h.write_u64(
-                seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    .wrapping_add(i as u64),
-            );
-            chunk.copy_from_slice(&h.finish().to_le_bytes());
-        }
-    }
+fn format_bearer_token_hex(raw: &[u8; 32]) -> String {
     let mut out = String::with_capacity(8 + 64);
     out.push_str("nmr_mcp_");
-    for b in raw {
+    for &b in raw {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         out.push(HEX[(b >> 4) as usize] as char);
         out.push(HEX[(b & 0x0F) as usize] as char);
     }
     out
+}
+
+fn try_generate_bearer_token_with(fill_fn: fn(&mut [u8; 32]) -> bool) -> Result<String, String> {
+    let mut raw = [0u8; 32];
+    if !fill_fn(&mut raw) || !raw.iter().any(|&b| b != 0) {
+        return Err(
+            "OS CSPRNG (/dev/urandom or BCryptGenRandom) failed to supply 256 bits of non-zero entropy; refusing to start or authenticate TCP MCP bridge"
+                .to_string(),
+        );
+    }
+    Ok(format_bearer_token_hex(&raw))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn wasm_preview_display_token() -> String {
+    let mut raw = [0u8; 32];
+    let seq = TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    for (i, chunk) in raw.chunks_exact_mut(8).enumerate() {
+        let rs = RandomState::new();
+        let mut h = rs.build_hasher();
+        h.write_u64(
+            seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(i as u64),
+        );
+        chunk.copy_from_slice(&h.finish().to_le_bytes());
+    }
+    format_bearer_token_hex(&raw)
+}
+
+/// Generate a fresh `nmr_mcp_<64-hex>` loopback bearer token (`72` ASCII chars total), failing
+/// closed (`Err(...)`) whenever OS CSPRNG entropy is unavailable:
+///
+/// - **Native Unix (`#[cfg(unix)]`)**: draws 256 bits (`32` non-zero-verified bytes) from the
+///   kernel CSPRNG via `/dev/urandom`, returning `Err(...)` if `/dev/urandom` cannot be read.
+/// - **Native Windows (`#[cfg(windows)]`)**: draws 256 bits (`32` non-zero-verified bytes) from
+///   the Windows CNG system CSPRNG via `BCryptGenRandom(..., BCRYPT_USE_SYSTEM_PREFERRED_RNG)`
+///   (`bcrypt.dll`, checking `NTSTATUS == 0` and non-zero output bytes), returning `Err(...)` on failure.
+/// - **Non-Unix / non-Windows targets (`#[cfg(not(any(unix, windows)))]`, e.g. `wasm32`)**:
+///   returns `Err(...)` (a `RandomState` preview token is used exclusively for offline UI display on
+///   `wasm32`, where `start_bridge` unconditionally disables TCP socket binding).
+pub fn generate_bearer_token() -> Result<String, String> {
+    try_generate_bearer_token_with(fill_os_entropy)
 }
 
 /// Mask a bearer token for safe on-screen display (`nmr_mcp_abcd••••••••••••ef01`).
@@ -1207,18 +1227,28 @@ struct SharedBridgeInner {
     viewport: ViewportFrameBuffer,
     permission: McpBridgePermission,
     bearer_token: String,
+    bearer_token_csprng: bool,
     handled_requests: u64,
 }
 
 impl SharedBridgeInner {
     fn new(snapshot: WorkbenchSnapshot) -> Self {
         let xh = snapshot.crosshair_ppm;
+        #[cfg(any(unix, windows))]
+        let (bearer_token, bearer_token_csprng) = match generate_bearer_token() {
+            Ok(tok) => (tok, true),
+            Err(_) => (String::new(), false),
+        };
+        #[cfg(not(any(unix, windows)))]
+        let (bearer_token, bearer_token_csprng) = (wasm_preview_display_token(), false);
+
         Self {
             snapshot,
             undo_log: McpUndoLog::new(),
             viewport: ViewportFrameBuffer::diagnostic_card(64, 48, xh),
             permission: McpBridgePermission::ReadOnly,
-            bearer_token: generate_bearer_token(),
+            bearer_token,
+            bearer_token_csprng,
             handled_requests: 0,
         }
     }
@@ -1943,8 +1973,8 @@ fn handle_loopback_connection(
     }
 
     // Step 2: Enforce constant-time Bearer token authentication (401 Unauthorized)
-    let expected_token = match shared.lock() {
-        Ok(guard) => guard.bearer_token.clone(),
+    let (expected_token, token_csprng) = match shared.lock() {
+        Ok(guard) => (guard.bearer_token.clone(), guard.bearer_token_csprng),
         Err(_) => {
             let payload = json!({ "error": "internal lock poisoned" }).to_string();
             write_http_json_response(
@@ -1957,7 +1987,10 @@ fn handle_loopback_connection(
             return;
         }
     };
-    if !verify_bearer_authorization(req.authorization.as_deref(), &expected_token) {
+    if !token_csprng
+        || expected_token.len() < 32
+        || !verify_bearer_authorization(req.authorization.as_deref(), &expected_token)
+    {
         let payload = json!({ "error": "missing or invalid Bearer token" }).to_string();
         write_http_json_response(
             &mut stream,
@@ -2090,48 +2123,12 @@ impl McpBridgeController {
     }
 
     /// Start the authenticated loopback HTTP bridge on `bind_addr` (e.g. `"127.0.0.1:0"`).
-    /// Rejects non-`127.0.0.1` addresses on native targets and returns a descriptive error on `wasm32`.
+    /// Rejects non-`127.0.0.1` addresses on native targets, fails closed (`Err`) if OS CSPRNG
+    /// entropy is unavailable, and returns a descriptive error on `wasm32`.
     pub fn start_bridge(&mut self, bind_addr: &str) -> Result<String, String> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.stop_bridge();
-            let v4 = parse_strict_loopback_bind(bind_addr)?;
-            let listener = TcpListener::bind(SocketAddr::V4(v4))
-                .map_err(|e| format!("failed to bind loopback MCP listener on {v4}: {e}"))?;
-            let bound_addr = listener
-                .local_addr()
-                .map_err(|e| format!("failed to query bound socket address: {e}"))?;
-            let bound_port = bound_addr.port();
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let shutdown_bg = Arc::clone(&shutdown);
-            let shared_bg = Arc::clone(&self.shared);
-
-            let join_handle = thread::Builder::new()
-                .name("nmr-gui-mcp-loopback".to_string())
-                .spawn(move || {
-                    for incoming in listener.incoming() {
-                        if shutdown_bg.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let Ok(stream) = incoming else {
-                            continue;
-                        };
-                        if shutdown_bg.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        handle_loopback_connection(stream, &shared_bg, bound_port);
-                    }
-                })
-                .map_err(|e| format!("failed to spawn MCP loopback accept thread: {e}"))?;
-
-            let addr_str = bound_addr.to_string();
-            self.server = Some(LoopbackServerHandle {
-                bound_addr,
-                shutdown,
-                join_handle: Some(join_handle),
-            });
-            self.status_banner = format!("Listening on http://{addr_str}/mcp");
-            Ok(addr_str)
+            self.start_bridge_with_entropy(bind_addr, fill_os_entropy)
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -2141,6 +2138,72 @@ impl McpBridgeController {
             self.status_banner = msg.clone();
             Err(msg)
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_bridge_with_entropy(
+        &mut self,
+        bind_addr: &str,
+        fill_fn: fn(&mut [u8; 32]) -> bool,
+    ) -> Result<String, String> {
+        self.stop_bridge();
+        let needs_fresh_csprng = self
+            .shared
+            .lock()
+            .map(|g| !g.bearer_token_csprng || g.bearer_token.len() != 72)
+            .map_err(|_| "MCP bridge state lock poisoned".to_string())?;
+        if needs_fresh_csprng {
+            let fresh = match try_generate_bearer_token_with(fill_fn) {
+                Ok(t) => t,
+                Err(err) => {
+                    self.status_banner = err.clone();
+                    return Err(err);
+                }
+            };
+            let mut g = self
+                .shared
+                .lock()
+                .map_err(|_| "MCP bridge state lock poisoned".to_string())?;
+            g.bearer_token = fresh;
+            g.bearer_token_csprng = true;
+        }
+        let v4 = parse_strict_loopback_bind(bind_addr)?;
+        let listener = TcpListener::bind(SocketAddr::V4(v4))
+            .map_err(|e| format!("failed to bind loopback MCP listener on {v4}: {e}"))?;
+        let bound_addr = listener
+            .local_addr()
+            .map_err(|e| format!("failed to query bound socket address: {e}"))?;
+        let bound_port = bound_addr.port();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_bg = Arc::clone(&shutdown);
+        let shared_bg = Arc::clone(&self.shared);
+
+        let join_handle = thread::Builder::new()
+            .name("nmr-gui-mcp-loopback".to_string())
+            .spawn(move || {
+                for incoming in listener.incoming() {
+                    if shutdown_bg.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(stream) = incoming else {
+                        continue;
+                    };
+                    if shutdown_bg.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    handle_loopback_connection(stream, &shared_bg, bound_port);
+                }
+            })
+            .map_err(|e| format!("failed to spawn MCP loopback accept thread: {e}"))?;
+
+        let addr_str = bound_addr.to_string();
+        self.server = Some(LoopbackServerHandle {
+            bound_addr,
+            shutdown,
+            join_handle: Some(join_handle),
+        });
+        self.status_banner = format!("Listening on http://{addr_str}/mcp");
+        Ok(addr_str)
     }
 
     /// Stop the running loopback HTTP listener cleanly, if active.
@@ -2175,13 +2238,38 @@ impl McpBridgeController {
             .unwrap_or_default()
     }
 
-    /// Rotate the secret bearer token in-place and return the new token.
-    pub fn rotate_bearer_token(&self) -> String {
-        let fresh = generate_bearer_token();
-        if let Ok(mut g) = self.shared.lock() {
-            g.bearer_token = fresh.clone();
+    /// Rotate the secret bearer token in-place using OS CSPRNG entropy (`#[cfg(any(unix, windows))]`)
+    /// and return the new token, failing closed (`Err`) if OS CSPRNG fails.
+    pub fn rotate_bearer_token(&mut self) -> Result<String, String> {
+        #[cfg(any(unix, windows))]
+        {
+            match generate_bearer_token() {
+                Ok(fresh) => {
+                    if let Ok(mut g) = self.shared.lock() {
+                        g.bearer_token = fresh.clone();
+                        g.bearer_token_csprng = true;
+                    }
+                    Ok(fresh)
+                }
+                Err(err) => {
+                    self.stop_bridge();
+                    if let Ok(mut g) = self.shared.lock() {
+                        g.bearer_token.clear();
+                        g.bearer_token_csprng = false;
+                    }
+                    Err(err)
+                }
+            }
         }
-        fresh
+        #[cfg(not(any(unix, windows)))]
+        {
+            let fresh = wasm_preview_display_token();
+            if let Ok(mut g) = self.shared.lock() {
+                g.bearer_token = fresh.clone();
+                g.bearer_token_csprng = false;
+            }
+            Ok(fresh)
+        }
     }
 
     /// Clone the current [`WorkbenchSnapshot`].
@@ -2395,8 +2483,14 @@ pub fn render_mcp_bridge_panel(
             controller.reveal_token = !controller.reveal_token;
         }
         if ui.small_button("Rotate").clicked() {
-            let _ = controller.rotate_bearer_token();
-            controller.status_banner = "Rotated bearer token".to_string();
+            match controller.rotate_bearer_token() {
+                Ok(_) => {
+                    controller.status_banner = "Rotated bearer token".to_string();
+                }
+                Err(err) => {
+                    controller.status_banner = format!("Token rotation failed: {err}");
+                }
+            }
         }
     });
 
@@ -2831,8 +2925,8 @@ mod tests {
         assert!(!constant_time_eq(b"nmr_mcp_secret_123", b""));
         assert!(constant_time_eq(b"", b""));
 
-        let tok = generate_bearer_token();
-        let tok2 = generate_bearer_token();
+        let tok = generate_bearer_token().expect("OS CSPRNG token 1");
+        let tok2 = generate_bearer_token().expect("OS CSPRNG token 2");
         assert!(tok.starts_with("nmr_mcp_"));
         assert_eq!(tok.len(), 72);
         assert_ne!(tok, tok2);
@@ -2845,6 +2939,29 @@ mod tests {
             let mut probe = [0u8; 32];
             assert!(fill_os_entropy(&mut probe));
             assert!(probe.iter().any(|&b| b != 0));
+        }
+        // Fail-closed CSPRNG contract (`17.3` hardening): simulated OS RNG failure or all-zero
+        // output MUST return `Err(...)` and refuse to start a live TCP listener rather than
+        // falling back to `RandomState`.
+        assert!(try_generate_bearer_token_with(|_| false).is_err());
+        assert!(try_generate_bearer_token_with(|buf| {
+            buf.fill(0);
+            true
+        })
+        .is_err());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut fail_ctrl = McpBridgeController::default();
+            if let Ok(mut g) = fail_ctrl.shared.lock() {
+                g.bearer_token.clear();
+                g.bearer_token_csprng = false;
+            }
+            let err = fail_ctrl
+                .start_bridge_with_entropy("127.0.0.1:0", |_| false)
+                .expect_err("start_bridge must fail closed when OS CSPRNG fails");
+            assert!(err.contains("OS CSPRNG"), "got: {err}");
+            assert!(!fail_ctrl.is_running());
+            assert!(fail_ctrl.bound_addr_string().is_none());
         }
         let masked = mask_bearer_token(&tok);
         assert!(masked.contains("••••••••••••"));
