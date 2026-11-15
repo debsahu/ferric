@@ -121,6 +121,7 @@ use nmr_gui::{
     dynamics_panel::{DynamicsStudioOutput, DynamicsStudioPanel, DynamicsStudioTab},
     ingest_panel::{IngestAction, IngestDropOutcome, IngestExecutionPlan, IngestPanelState},
     keymap::{poll_global_modifier_shortcuts, ChordDispatcher, CONTOUR_FLOOR_STEP_RATIO},
+    metabolomics_panel::MetabolomicsStudioPanel,
     mol3d_overlay::{Mol3dSyncAction, QuantitativeTrack},
     mol3d_viewer::{Mol3dPipelineResource, Mol3dViewerPanel},
     relax_panel::{RelaxPanelAction, RelaxPanelState},
@@ -281,6 +282,7 @@ fn format_star_in_memory(
 enum WorkspaceMode {
     ProteinNmr,
     OctetChem,
+    Metabolomics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1592,6 +1594,7 @@ impl OctetBackendAdapter for CoreOctetBackendAdapter {
 struct NmrWorkbenchApp {
     workspace_mode: WorkspaceMode,
     octet_app: OctetDrawPanel,
+    metabolomics_panel: MetabolomicsStudioPanel,
     #[cfg(not(target_arch = "wasm32"))]
     gpu_engine: Option<GpuEngine>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -1778,6 +1781,7 @@ impl NmrWorkbenchApp {
         let mut app = Self {
             workspace_mode: WorkspaceMode::ProteinNmr,
             octet_app,
+            metabolomics_panel: MetabolomicsStudioPanel::new(),
             solver_kind: GuiSolverKind::default(),
             regime_kind: GuiRegimeKind::default(),
             metal_ligands_input: String::new(),
@@ -3821,6 +3825,11 @@ impl NmrWorkbenchApp {
                 &mut self.workspace_mode,
                 WorkspaceMode::OctetChem,
                 egui::RichText::new("⚗️ Octet Chemical Draw & 1D NMR").strong(),
+            );
+            ui.selectable_value(
+                &mut self.workspace_mode,
+                WorkspaceMode::Metabolomics,
+                egui::RichText::new("🧪 Metabolomics & Biomarker Studio").strong(),
             );
 
             if self.workspace_mode == WorkspaceMode::OctetChem {
@@ -7047,9 +7056,9 @@ impl eframe::App for NmrWorkbenchApp {
             self.dispatch_workbench_action(&ctx, act);
         }
 
-        // 3. Modal Two-Key NMR Chord Dispatcher (suppressed whenever ctx.egui_wants_keyboard_input() or Octet tab has focus)
+        // 3. Modal Two-Key NMR Chord Dispatcher (suppressed whenever ctx.egui_wants_keyboard_input() or non-ProteinNmr tab has focus)
         let suppress_chords = ctx.egui_wants_keyboard_input()
-            || octet_active
+            || self.workspace_mode != WorkspaceMode::ProteinNmr
             || self.command_palette.open
             || self.ingest_panel.open
             || self.show_text_io_modal
@@ -7212,6 +7221,11 @@ impl eframe::App for NmrWorkbenchApp {
             }
             WorkspaceMode::OctetChem => {
                 self.octet_app.ui(ui);
+            }
+            WorkspaceMode::Metabolomics => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.metabolomics_panel.ui(ui);
+                });
             }
         }
     }
