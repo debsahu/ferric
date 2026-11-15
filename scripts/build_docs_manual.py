@@ -1386,28 +1386,33 @@ MANUAL_CSS = r""":root {
 }
 
 *, *::before, *::after { box-sizing: border-box; }
-html { scroll-behavior: smooth; font-size: 16px; }
+html { scroll-behavior: smooth; font-size: 16px; -webkit-text-size-adjust: 100%; }
 body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   line-height: 1.65;
+  overflow-x: hidden;
 }
 
 a { color: var(--accent); text-decoration: none; }
 a:hover { color: var(--accent-strong); text-decoration: underline; }
 
+button, .menu-btn, .theme-btn, .search-trigger, .demo-btn, .copy-btn, .nav-link, .chapter-link, .toc-link, .pager-card, .search-hit {
+  touch-action: manipulation;
+}
+
 .topbar {
   position: sticky;
   top: 0;
   z-index: 40;
-  height: 3.6rem;
+  min-height: calc(3.6rem + env(safe-area-inset-top, 0px));
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  padding: 0 1.25rem;
+  padding: env(safe-area-inset-top, 0px) calc(1.25rem + env(safe-area-inset-right, 0px)) 0 calc(1.25rem + env(safe-area-inset-left, 0px));
   background: var(--bg-elev);
   border-bottom: 1px solid var(--border);
 }
@@ -1415,13 +1420,16 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 .brand-wrap { display: flex; align-items: center; gap: 0.75rem; min-width: 0; }
 .menu-btn {
   display: none;
+  min-width: 44px;
+  min-height: 44px;
   background: transparent;
   border: 1px solid var(--border);
   color: var(--fg);
-  border-radius: 6px;
+  border-radius: 8px;
   padding: 0.3rem 0.55rem;
   cursor: pointer;
-  font-size: 1rem;
+  font-size: 1.1rem;
+  line-height: 1;
 }
 .brand-link {
   font-weight: 700;
@@ -1440,7 +1448,8 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   white-space: nowrap;
 }
 
-.topbar-actions { display: flex; align-items: center; gap: 0.6rem; }
+.topbar-actions { display: flex; align-items: center; gap: 0.6rem; flex-shrink: 0; }
+.demo-label-short, .search-label-short { display: none; }
 .search-trigger {
   display: flex;
   align-items: center;
@@ -1493,16 +1502,34 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   display: grid;
   grid-template-columns: 17.5rem minmax(0, 1fr) 15.5rem;
   gap: 2rem;
-  padding: 0 1.25rem;
+  padding: 0 calc(1.25rem + env(safe-area-inset-right, 0px)) 0 calc(1.25rem + env(safe-area-inset-left, 0px));
 }
 
 .sidebar {
   position: sticky;
   top: 3.6rem;
   height: calc(100vh - 3.6rem);
+  height: calc(100dvh - 3.6rem);
   overflow-y: auto;
   padding: 1.5rem 0.75rem 2rem 0;
   border-right: 1px solid var(--border);
+}
+.sidebar-backdrop {
+  position: fixed;
+  inset: 0;
+  top: calc(3.6rem + env(safe-area-inset-top, 0px));
+  z-index: 55;
+  background: rgba(15, 23, 42, 0.52);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+.sidebar-backdrop.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+@media (min-width: 861px) {
+  .sidebar-backdrop { display: none; }
 }
 .sidebar-caption {
   font-size: 0.72rem;
@@ -1513,7 +1540,7 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   margin: 0 0 0.65rem 0.6rem;
 }
 .chapter-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.22rem; }
-.chapter-link {
+.chapter-link, .nav-link {
   display: flex;
   align-items: baseline;
   gap: 0.5rem;
@@ -1523,8 +1550,8 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   font-size: 0.9rem;
   line-height: 1.35;
 }
-.chapter-link:hover { background: var(--bg-subtle); color: var(--fg); text-decoration: none; }
-.chapter-link.active {
+.chapter-link:hover, .nav-link:hover { background: var(--bg-subtle); color: var(--fg); text-decoration: none; }
+.chapter-link.active, .nav-link.active {
   background: var(--accent-soft);
   color: var(--accent);
   font-weight: 600;
@@ -1538,8 +1565,9 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 
 .content {
   min-width: 0;
+  width: 100%;
   max-width: 54rem;
-  padding: 2rem 0 4rem 0;
+  padding: 2rem 0 calc(4rem + env(safe-area-inset-bottom, 0px)) 0;
 }
 .content h1 {
   font-size: 2rem;
@@ -1572,6 +1600,7 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 .content h3:hover .heading-anchor,
 .content h4:hover .heading-anchor { opacity: 1; text-decoration: none; }
 
+.content p, .content li, blockquote, .callout { overflow-wrap: break-word; }
 .content p { margin: 0.75rem 0; }
 .content ul, .content ol { padding-left: 1.45rem; margin: 0.65rem 0; }
 .content li { margin: 0.32rem 0; }
@@ -1585,9 +1614,14 @@ code {
   padding: 0.14rem 0.36rem;
   border-radius: 5px;
 }
+:not(pre) > code {
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
 
 .code-card {
   margin: 1rem 0;
+  max-width: 100%;
   border-radius: 10px;
   overflow: hidden;
   background: var(--bg-code);
@@ -1610,15 +1644,17 @@ code {
   color: #e2e8f0;
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 5px;
-  padding: 0.15rem 0.55rem;
-  font-size: 0.73rem;
+  padding: 0.22rem 0.6rem;
+  font-size: 0.74rem;
   cursor: pointer;
 }
 .copy-btn:hover { background: rgba(56, 189, 248, 0.25); }
 .code-card pre {
   margin: 0;
   padding: 0.9rem 1rem;
+  max-width: 100%;
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
   color: #e2e8f0;
   font-size: 0.85rem;
   line-height: 1.55;
@@ -1628,6 +1664,8 @@ code {
   color: inherit;
   padding: 0;
   font-size: inherit;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 .tok-c { color: #64748b; font-style: italic; }
 .tok-k { color: #38bdf8; font-weight: 600; }
@@ -1637,7 +1675,10 @@ code {
 
 .table-wrap {
   margin: 1.1rem 0;
+  width: 100%;
+  max-width: 100%;
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--bg-elev);
@@ -1647,8 +1688,13 @@ th, td { padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--border); vertica
 thead th { background: var(--bg-subtle); font-weight: 600; color: var(--fg); }
 tbody tr:last-child td { border-bottom: none; }
 
+img, figure svg, .manual-figure svg {
+  max-width: 100%;
+  height: auto;
+}
 .manual-figure {
   margin: 1.35rem 0;
+  max-width: 100%;
   padding: 0.85rem;
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -1685,6 +1731,7 @@ blockquote {
 
 .callout {
   margin: 1.15rem 0;
+  max-width: 100%;
   padding: 0.85rem 1.05rem;
   border-left: 4px solid var(--note-c);
   background: var(--bg-elev);
@@ -1721,8 +1768,10 @@ blockquote {
 }
 .math-block {
   margin: 1.1rem 0;
+  max-width: 100%;
   padding: 0.85rem 1.1rem;
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
   text-align: center;
   background: var(--bg-elev);
   border: 1px solid var(--border);
@@ -1751,6 +1800,7 @@ blockquote {
   position: sticky;
   top: 3.6rem;
   height: calc(100vh - 3.6rem);
+  height: calc(100dvh - 3.6rem);
   overflow-y: auto;
   padding: 1.5rem 0 2rem 0.5rem;
   font-size: 0.82rem;
@@ -1803,7 +1853,7 @@ blockquote {
   display: none;
   align-items: flex-start;
   justify-content: center;
-  padding: 4.5rem 1rem 1rem;
+  padding: calc(4.5rem + env(safe-area-inset-top, 0px)) 1rem calc(1rem + env(safe-area-inset-bottom, 0px));
 }
 .search-backdrop.open { display: flex; }
 .search-modal {
@@ -1833,6 +1883,7 @@ blockquote {
 .search-results {
   max-height: 24rem;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
   list-style: none;
   margin: 0;
   padding: 0.4rem;
@@ -1856,24 +1907,138 @@ blockquote {
   .layout { grid-template-columns: 16.5rem minmax(0, 1fr); }
   .toc-aside { display: none; }
 }
-@media (max-width: 800px) {
-  .menu-btn { display: inline-block; }
-  .version-pill { display: none; }
-  .search-trigger { min-width: auto; }
-  .layout { grid-template-columns: minmax(0, 1fr); }
+@media (max-width: 860px) {
+  .menu-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0;
+    flex-shrink: 0;
+  }
+  .version-pill,
+  .kbd-hint {
+    display: none;
+  }
+  .search-trigger {
+    min-width: auto;
+    min-height: 44px;
+    padding: 0.4rem 0.72rem;
+  }
+  .theme-btn,
+  .demo-btn {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+    padding-left: calc(1rem + env(safe-area-inset-left, 0px));
+    padding-right: calc(1rem + env(safe-area-inset-right, 0px));
+  }
   .sidebar {
     position: fixed;
     left: 0;
-    top: 3.6rem;
-    width: 17.5rem;
+    top: calc(3.6rem + env(safe-area-inset-top, 0px));
+    width: 320px;
+    max-width: min(86vw, 320px);
+    height: calc(100vh - 3.6rem);
+    height: calc(100dvh - 3.6rem - env(safe-area-inset-top, 0px));
     z-index: 60;
     background: var(--bg-elev);
-    padding: 1.2rem 1rem;
+    box-shadow: var(--shadow);
+    padding: 1.1rem 0.9rem calc(1.5rem + env(safe-area-inset-bottom, 0px)) calc(0.9rem + env(safe-area-inset-left, 0px));
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
     transform: translateX(-105%);
-    transition: transform 0.18s ease;
+    transition: transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
   }
   .sidebar.open { transform: translateX(0); }
+  .chapter-link, .nav-link {
+    min-height: 44px;
+    align-items: center;
+    padding: 0.55rem 0.75rem;
+  }
+  .copy-btn {
+    min-height: 36px;
+    min-width: 52px;
+    padding: 0.32rem 0.7rem;
+    font-size: 0.78rem;
+  }
+  .content table {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .mmatrix table {
+    display: table;
+    width: auto;
+    overflow: visible;
+  }
   .pager { grid-template-columns: 1fr; }
+  .pager-card.next { text-align: left; }
+}
+@media (max-width: 520px) {
+  .topbar {
+    gap: 0.45rem;
+    padding-left: calc(0.75rem + env(safe-area-inset-left, 0px));
+    padding-right: calc(0.75rem + env(safe-area-inset-right, 0px));
+  }
+  .brand-wrap {
+    gap: 0.45rem;
+    flex: 1 1 auto;
+  }
+  .brand-link {
+    font-size: 0.94rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .topbar-actions {
+    gap: 0.35rem;
+  }
+  .demo-label-full,
+  .search-label-full {
+    display: none;
+  }
+  .demo-label-short,
+  .search-label-short {
+    display: inline;
+  }
+  .demo-btn,
+  .search-trigger,
+  .theme-btn {
+    padding: 0.35rem 0.55rem;
+    font-size: 0.8rem;
+  }
+  .layout {
+    padding-left: calc(0.85rem + env(safe-area-inset-left, 0px));
+    padding-right: calc(0.85rem + env(safe-area-inset-right, 0px));
+  }
+  .content {
+    padding: 1.35rem 0 calc(3rem + env(safe-area-inset-bottom, 0px)) 0;
+  }
+  .content h1 { font-size: 1.55rem; }
+  .content h2 { font-size: 1.24rem; margin-top: 1.85rem; }
+  .content h3 { font-size: 1.06rem; }
+  th, td { min-width: 6.5rem; padding: 0.52rem 0.65rem; }
+  .mmatrix td { min-width: 0; padding: 0.1rem 0.35rem; }
+  .math-inline { white-space: normal; overflow-wrap: anywhere; }
+  .manual-figure { padding: 0.6rem; }
+  .search-backdrop {
+    padding: calc(1rem + env(safe-area-inset-top, 0px)) 0.65rem calc(0.65rem + env(safe-area-inset-bottom, 0px));
+  }
+  .search-input { font-size: 16px; }
+  .search-results {
+    max-height: 65vh;
+    max-height: 65dvh;
+  }
 }
 """
 
@@ -1912,9 +2077,36 @@ MANUAL_JS = r"""(function () {
 
     var menuBtn = document.getElementById("menu-toggle");
     var sidebar = document.getElementById("chapter-sidebar");
+    var sidebarBackdrop = document.getElementById("sidebar-backdrop");
+
+    function setDrawerOpen(isOpen) {
+      if (!sidebar) return;
+      if (isOpen) {
+        sidebar.classList.add("open");
+        if (sidebarBackdrop) sidebarBackdrop.classList.add("open");
+        if (menuBtn) menuBtn.setAttribute("aria-expanded", "true");
+      } else {
+        sidebar.classList.remove("open");
+        if (sidebarBackdrop) sidebarBackdrop.classList.remove("open");
+        if (menuBtn) menuBtn.setAttribute("aria-expanded", "false");
+      }
+    }
+
+    function closeDrawer() {
+      setDrawerOpen(false);
+    }
+
     if (menuBtn && sidebar) {
       menuBtn.addEventListener("click", function () {
-        sidebar.classList.toggle("open");
+        setDrawerOpen(!sidebar.classList.contains("open"));
+      });
+    }
+    if (sidebarBackdrop) {
+      sidebarBackdrop.addEventListener("click", closeDrawer);
+    }
+    if (sidebar) {
+      sidebar.querySelectorAll("a").forEach(function (a) {
+        a.addEventListener("click", closeDrawer);
       });
     }
 
@@ -1962,6 +2154,7 @@ MANUAL_JS = r"""(function () {
 
     function openSearch() {
       if (!backdrop || !input) return;
+      closeDrawer();
       backdrop.classList.add("open");
       input.focus();
       input.select();
@@ -2030,7 +2223,10 @@ MANUAL_JS = r"""(function () {
       });
       resultsEl.innerHTML = items.join("");
       resultsEl.querySelectorAll(".search-hit").forEach(function (a) {
-        a.addEventListener("click", function () { closeSearch(); });
+        a.addEventListener("click", function () {
+          closeSearch();
+          closeDrawer();
+        });
       });
     }
 
@@ -2063,6 +2259,7 @@ MANUAL_JS = r"""(function () {
           ev.preventDefault();
           var href = hits[activeIdx].getAttribute("href");
           closeSearch();
+          closeDrawer();
           if (href) window.location.href = href;
         }
       });
@@ -2077,8 +2274,13 @@ MANUAL_JS = r"""(function () {
       } else if (!editing && ev.key === "/") {
         ev.preventDefault();
         openSearch();
-      } else if (ev.key === "Escape" && backdrop && backdrop.classList.contains("open")) {
-        closeSearch();
+      } else if (ev.key === "Escape") {
+        if (backdrop && backdrop.classList.contains("open")) {
+          closeSearch();
+        }
+        if (sidebar && sidebar.classList.contains("open")) {
+          closeDrawer();
+        }
       }
     });
   });
@@ -2177,7 +2379,7 @@ def render_page_html(
     for p in all_pages:
         active_cls = " active" if p.html_name == page.html_name else ""
         nav_items.append(
-            f'<li><a class="chapter-link{active_cls}" href="{html.escape(p.html_name)}">'
+            f'<li><a class="chapter-link nav-link{active_cls}" href="{html.escape(p.html_name)}">'
             f'<span class="chap-num">{html.escape(p.chapter_badge)}</span>'
             f'<span>{html.escape(p.nav_title)}</span></a></li>'
         )
@@ -2223,7 +2425,9 @@ def render_page_html(
     )
 
     demo_action_html = (
-        '<a class="demo-btn" href="demo/index.html">Live WebGPU Demo</a>'
+        '<a class="demo-btn" href="demo/index.html">'
+        '<span class="demo-label-full">Live WebGPU Demo</span>'
+        '<span class="demo-label-short">Demo</span></a>'
         if has_demo_page
         else ""
     )
@@ -2232,7 +2436,9 @@ def render_page_html(
 <html lang="en" data-theme="light">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1120" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f8fafc" media="(prefers-color-scheme: light)">
   <title>{html.escape(full_title)}</title>
   <link rel="stylesheet" href="assets/style.css">
   <script src="assets/search-data.js" defer></script>
@@ -2241,14 +2447,15 @@ def render_page_html(
 <body>
   <header class="topbar">
     <div class="brand-wrap">
-      <button type="button" id="menu-toggle" class="menu-btn" title="Toggle chapter menu">☰</button>
+      <button type="button" id="menu-toggle" class="menu-btn" title="Toggle chapter menu" aria-label="Toggle chapter menu" aria-expanded="false" aria-controls="chapter-sidebar">☰</button>
       <a class="brand-link" href="index.html">{html.escape(SITE_TITLE)}</a>
       <span class="version-pill">{html.escape(SITE_VERSION_BADGE)}</span>
     </div>
     <div class="topbar-actions">
       {demo_action_html}
       <button type="button" id="search-open" class="search-trigger" title="Search manual">
-        <span>Search manual…</span>
+        <span class="search-label-full">Search manual…</span>
+        <span class="search-label-short">Search</span>
         <span class="kbd-hint">/ · ⌘K</span>
       </button>
       <button type="button" id="theme-toggle" class="theme-btn" title="Toggle color theme">Dark</button>
@@ -2262,6 +2469,7 @@ def render_page_html(
         {"".join(nav_items)}
       </ul>
     </nav>
+    <div id="sidebar-backdrop" class="sidebar-backdrop" aria-hidden="true"></div>
 
     <main class="content">
       <article>
@@ -2524,6 +2732,105 @@ def validate_internal_links(
     return errors
 
 
+def validate_mobile_ux(
+    site_files: Dict[str, bytes],
+    repo_root: Optional[Path] = None,
+) -> List[str]:
+    """Verify mobile/tablet responsiveness, safe-area insets, drawer UX, and scroll containment."""
+    errors: List[str] = []
+
+    manual_html_names = [
+        k for k in sorted(site_files) if k.endswith(".html") and not k.startswith("demo/")
+    ]
+    if not manual_html_names:
+        errors.append("mobile-ux: no manual HTML pages emitted")
+    for html_name in manual_html_names:
+        doc = site_files[html_name].decode("utf-8")
+        for tok in (
+            "viewport-fit=cover",
+            'id="menu-toggle"',
+            'id="chapter-sidebar"',
+            'id="sidebar-backdrop"',
+            "nav-link",
+        ):
+            if tok not in doc:
+                errors.append(f"{html_name}: missing mobile-UX HTML token {tok!r}")
+
+    css_bytes = site_files.get("assets/style.css")
+    if css_bytes is None:
+        errors.append("assets/style.css: missing stylesheet")
+    else:
+        css = css_bytes.decode("utf-8")
+        for tok in (
+            "100vh",
+            "100dvh",
+            "env(safe-area-inset-top",
+            "env(safe-area-inset-bottom",
+            "touch-action: manipulation",
+            "overflow-x: hidden",
+            "overflow-x: auto",
+            "-webkit-overflow-scrolling: touch",
+            "max-width: min(86vw, 320px)",
+            "min-width: 44px",
+            "min-height: 44px",
+            "@media (max-width: 860px)",
+            "@media (max-width: 520px)",
+            "figure svg",
+        ):
+            if tok not in css:
+                errors.append(f"assets/style.css: missing mobile-UX CSS rule {tok!r}")
+        if "100vh" in css and "100dvh" in css and css.find("100vh") > css.find("100dvh"):
+            errors.append("assets/style.css: 100vh fallback must precede 100dvh")
+
+    js_bytes = site_files.get("assets/manual.js")
+    if js_bytes is None:
+        errors.append("assets/manual.js: missing manual script")
+    else:
+        js = js_bytes.decode("utf-8")
+        for tok in (
+            "menu-toggle",
+            "chapter-sidebar",
+            "sidebar-backdrop",
+            "closeDrawer",
+            "Escape",
+        ):
+            if tok not in js:
+                errors.append(f"assets/manual.js: missing mobile drawer JS token {tok!r}")
+
+    shell_targets: List[Tuple[str, str, bool]] = []
+    if "demo/index.html" in site_files:
+        shell_targets.append(("demo/index.html", site_files["demo/index.html"].decode("utf-8"), True))
+    if repo_root is not None:
+        demo_disk = repo_root / "docs" / "demo" / "index.html"
+        trunk_disk = repo_root / "crates" / "nmr-gui" / "index.html"
+        if demo_disk.is_file() and "demo/index.html" not in site_files:
+            shell_targets.append(("docs/demo/index.html", demo_disk.read_text(encoding="utf-8"), True))
+        if trunk_disk.is_file():
+            shell_targets.append(("crates/nmr-gui/index.html", trunk_disk.read_text(encoding="utf-8"), False))
+
+    for label, shell_doc, is_demo in shell_targets:
+        for tok in (
+            "viewport-fit=cover",
+            "100vh",
+            "100dvh",
+            "touch-action: none",
+            "overscroll-behavior: none",
+            "env(safe-area-inset-top",
+            "env(safe-area-inset-bottom",
+            "#canvas-wrap",
+        ):
+            if tok not in shell_doc:
+                errors.append(f"{label}: missing mobile WebGPU shell token {tok!r}")
+        if "100vh" in shell_doc and "100dvh" in shell_doc and shell_doc.find("100vh") > shell_doc.find("100dvh"):
+            errors.append(f"{label}: 100vh fallback must precede 100dvh")
+        if is_demo:
+            for tok in ("@media (max-width: 680px)", "#fallback", "overflow-y: auto"):
+                if tok not in shell_doc:
+                    errors.append(f"{label}: missing demo mobile token {tok!r}")
+
+    return errors
+
+
 def write_site_to_disk(out_dir: Path, site_files: Dict[str, bytes]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     for rel_path, content in sorted(site_files.items()):
@@ -2543,7 +2850,8 @@ def site_digest(site_files: Dict[str, bytes]) -> str:
 
 
 def run_self_tests() -> int:
-    """Run adversarial hygiene and link-validator unit tests in an ephemeral directory."""
+    """Run adversarial hygiene, link-validator, and mobile-UX unit tests in an ephemeral directory."""
+    repo_root = Path(__file__).resolve().parent.parent
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         valid_md = root / "index.md"
@@ -2556,6 +2864,8 @@ def run_self_tests() -> int:
         site = build_site_files(pages)
         assert not validate_markdown_hygiene([valid_md], enforce_expected_roster=False)
         assert not validate_internal_links(pages, site)
+        mob_ok = validate_mobile_ux(site, repo_root=repo_root)
+        assert not mob_ok, f"expected clean mobile-UX check, got {mob_ok}"
 
         # 1. Broken anchor must fail
         bad_link = root / "01-bad-link.md"
@@ -2609,7 +2919,24 @@ def run_self_tests() -> int:
             f"expected missing SVG asset error, got {missing_fig_errs}"
         )
 
-    print("build_docs_manual.py self-tests passed (6/6 adversarial & determinism checks).")
+        # 6. Adversarial mobile-UX checks (viewport-fit=cover, 100dvh, touch-action, drawer toggle, table overflow-x: auto)
+        mut_vp = dict(site)
+        mut_vp["index.html"] = site["index.html"].replace(b"viewport-fit=cover", b"")
+        assert any("viewport-fit=cover" in e for e in validate_mobile_ux(mut_vp))
+
+        for css_tok in (b"100dvh", b"touch-action: manipulation", b"overflow-x: auto"):
+            mut_css = dict(site)
+            mut_css["assets/style.css"] = site["assets/style.css"].replace(css_tok, b"")
+            css_errs = validate_mobile_ux(mut_css)
+            assert any(css_tok.decode("utf-8") in e for e in css_errs), (
+                f"expected mobile-UX error when stripping {css_tok!r}, got {css_errs}"
+            )
+
+        mut_js = dict(site)
+        mut_js["assets/manual.js"] = site["assets/manual.js"].replace(b"closeDrawer", b"noop")
+        assert any("closeDrawer" in e for e in validate_mobile_ux(mut_js))
+
+    print("build_docs_manual.py self-tests passed (7/7 adversarial, mobile-UX & determinism checks).")
     return 0
 
 
@@ -2664,6 +2991,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enforce_expected_roster=is_default_src,
         )
         errors.extend(validate_internal_links(pages, site_files))
+        errors.extend(validate_mobile_ux(site_files, repo_root=repo_root if is_default_src else None))
         # Re-parse and re-render to guarantee 100% deterministic byte output
         pages_second = [parse_manual_page(p) for p in discover_manual_pages(args.src)]
         second_files = build_site_files(pages_second, demo_html_path=demo_html, assets_dir=assets_dir)

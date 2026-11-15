@@ -2,24 +2,51 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0e131b" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="nmr-assign" />
   <title>nmr-assign — WebGPU Protein NMR Spectrum &amp; Assignment Workbench</title>
   <link data-trunk rel="rust" data-bin="nmrassign-gui" data-wasm-opt="2" />
   <style>
+    * {
+      box-sizing: border-box;
+    }
     html, body {
       margin: 0;
       padding: 0;
       width: 100%;
-      height: 100%;
+      height: 100vh;
+      height: 100dvh;
       overflow: hidden;
-      background: #10141c;
+      background: #0e131b;
       color: #dbe7f5;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
+    html, body, #canvas-wrap, canvas#nmr_canvas {
+      touch-action: none;
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-touch-callout: none;
+      overscroll-behavior: none;
+    }
+    #canvas-wrap {
+      position: relative;
+      width: 100%;
+      height: 100vh;
+      height: 100dvh;
+      padding-top: env(safe-area-inset-top, 0px);
+      padding-right: env(safe-area-inset-right, 0px);
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+      padding-left: env(safe-area-inset-left, 0px);
+      overflow: hidden;
+    }
     canvas#nmr_canvas {
       display: block;
-      width: 100vw;
-      height: 100vh;
+      width: 100%;
+      height: 100%;
       outline: none;
     }
     #nmr_loading {
@@ -30,9 +57,12 @@
       align-items: center;
       justify-content: center;
       gap: 12px;
-      pointer-events: none;
-      background: #10141c;
+      padding: 16px;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      background: #0e131b;
       z-index: 10;
+      text-align: center;
     }
     .spinner {
       width: 34px;
@@ -48,12 +78,14 @@
   </style>
 </head>
 <body>
-  <div id="nmr_loading">
+  <div id="nmr_loading" role="status">
     <div class="spinner"></div>
     <div style="font-size: 14px; letter-spacing: 0.02em;">
       Initializing <strong>nmr-assign</strong> WebGPU Workbench&hellip;
     </div>
   </div>
-  <canvas id="nmr_canvas"></canvas>
+  <main id="canvas-wrap">
+    <canvas id="nmr_canvas"></canvas>
+  </main>
 </body>
 </html>
