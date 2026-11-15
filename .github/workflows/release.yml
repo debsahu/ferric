@@ -1,0 +1,224 @@
+name: Cross-Platform Desktop & CLI Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-release:
+    name: Build & Package (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            artifact_paths: |
+              dist/*.dmg
+              dist/*.tar.gz
+          - platform: windows-x86_64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            artifact_paths: |
+              dist/*.zip
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+            artifact_paths: |
+              dist/*.tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux X11, Wayland & Vulkan GUI build dependencies
+        if: matrix.platform == 'linux-x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libx11-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libvulkan-dev \
+            libgl1-mesa-dev
+
+      - name: Activate stable Rust toolchain (${{ matrix.rust_target }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "${{ matrix.rust_target }}"
+          rustc -vV
+          cargo -V
+
+      - name: Cache Cargo registry and release build dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: release-${{ matrix.platform }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            release-${{ matrix.platform }}-
+
+      - name: Verify tag matches Cargo.toml workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          PY_BIN="python3"
+          if ! command -v "$PY_BIN" >/dev/null 2>&1; then
+            PY_BIN="python"
+          fi
+          WS_VER="$("$PY_BIN" -c 'import pathlib, sys; sys.path.insert(0, "scripts"); import package_release as p; print(p.read_workspace_version(pathlib.Path(".")))')"
+          if [[ "v${WS_VER}" != "${TAG_NAME}" ]]; then
+            echo "ERROR: Git tag ${TAG_NAME} does not match Cargo.toml workspace version v${WS_VER}" >&2
+            exit 1
+          fi
+          echo "Verified tag ${TAG_NAME} == Cargo.toml v${WS_VER}"
+
+      - name: Run cross-platform packager & icon encoder self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY_BIN="python3"
+          if ! command -v "$PY_BIN" >/dev/null 2>&1; then
+            PY_BIN="python"
+          fi
+          "$PY_BIN" scripts/package_release.py --self-test
+
+      - name: Build workspace release binaries (nmrassign + nmrassign-gui)
+        run: cargo build --release --workspace --bins
+
+      - name: Package & verify Apple Silicon macOS release (.app + .dmg + .tar.gz)
+        if: matrix.platform == 'macos-arm64'
+        run: |
+          set -euo pipefail
+          ./target/release/nmrassign --version
+          python3 scripts/package_release.py \
+            --platform macos-arm64 \
+            --bin-dir target/release \
+            --out-dir dist
+          plutil -lint dist/nmr-assign.app/Contents/Info.plist
+          codesign --verify --deep --strict dist/nmr-assign.app
+          hdiutil imageinfo dist/nmr-assign-v*-macos-arm64.dmg >/dev/null
+
+      - name: Package & verify Windows x86_64 release (.zip)
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\target\release\nmrassign.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/package_release.py `
+            --platform windows-x86_64 `
+            --bin-dir target/release `
+            --out-dir dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package & verify Linux x86_64 release (.tar.gz + FreeDesktop launcher)
+        if: matrix.platform == 'linux-x86_64'
+        run: |
+          set -euo pipefail
+          ./target/release/nmrassign --version
+          python3 scripts/package_release.py \
+            --platform linux-x86_64 \
+            --bin-dir target/release \
+            --out-dir dist
+
+      - name: Upload platform release artifact (${{ matrix.platform }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: ${{ matrix.artifact_paths }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release & SHA256SUMS
+    needs: build-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all platform release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate and verify unified SHA256SUMS.txt
+        run: |
+          set -euo pipefail
+          WS_VER="$(python3 -c 'import pathlib, sys; sys.path.insert(0, "scripts"); import package_release as p; print(p.read_workspace_version(pathlib.Path(".")))')"
+          EXPECTED_FILES=(
+            "dist/nmr-assign-v${WS_VER}-macos-arm64.dmg"
+            "dist/nmr-assign-v${WS_VER}-macos-arm64.tar.gz"
+            "dist/nmr-assign-v${WS_VER}-windows-x86_64.zip"
+            "dist/nmr-assign-v${WS_VER}-linux-x86_64.tar.gz"
+          )
+          for f in "${EXPECTED_FILES[@]}"; do
+            if [[ ! -s "$f" ]]; then
+              echo "ERROR: Missing or empty release archive: $f" >&2
+              exit 1
+            fi
+          done
+          python3 scripts/package_release.py --checksums dist
+          python3 scripts/package_release.py --verify-checksums dist
+          test -s dist/SHA256SUMS.txt
+          ls -lh dist/
+
+      - name: Create or update GitHub Release via gh CLI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ASSETS=(
+            dist/*.dmg
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          )
+          if [[ "${#ASSETS[@]}" -ne 5 ]]; then
+            echo "ERROR: Expected 5 release assets (4 archives + SHA256SUMS.txt), found ${#ASSETS[@]}" >&2
+            exit 1
+          fi
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${ASSETS[@]}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${ASSETS[@]}" \
+              --verify-tag \
+              --title "nmr-assign ${RELEASE_TAG}" \
+              --generate-notes
+          fi
