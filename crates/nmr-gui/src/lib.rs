@@ -12,6 +12,7 @@ pub mod command_palette;
 pub mod contour_painter;
 pub mod ingest_panel;
 pub mod keymap;
+pub mod metabolomics_panel;
 pub mod mol3d_overlay;
 pub mod mol3d_viewer;
 pub mod session_io;
