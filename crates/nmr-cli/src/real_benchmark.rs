@@ -208,9 +208,9 @@ pub fn find_child_ci(dir: &Path, name_ci: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolve the main git repository checkout root when running inside a git worktree (from either
-/// the workspace root or a crate subdirectory such as `crates/nmr-cli` during `cargo test`) so
-/// gitignored `data/ubiquitin` and `data/private/` are discovered when `--data-root` uses its default.
+/// Resolve the main git repository checkout root when running inside a git worktree or a crate
+/// subdirectory (such as `crates/nmr-cli` during `cargo test`) so gitignored `data/ubiquitin`
+/// and `data/private/` are discovered when `--data-root` uses its default.
 fn resolve_git_main_checkout_root() -> Option<PathBuf> {
     let start = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     for anc in start.ancestors().take(6) {
@@ -236,7 +236,11 @@ fn resolve_git_main_checkout_root() -> Option<PathBuf> {
                 }
             }
         } else if dot_git.is_dir() {
-            return None;
+            return if anc != start {
+                Some(anc.to_path_buf())
+            } else {
+                None
+            };
         }
     }
     None

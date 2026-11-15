@@ -3,6 +3,11 @@
 //! Provenance: Original scientific GUI built on `eframe`, `wgpu`, `nmr-core`, and `nmr-gpu`
 //! (native Metal/Vulkan/DX12 and browser `wasm32-unknown-unknown` + WebGPU).
 
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 #[allow(dead_code)]
 mod octet_canvas;
 

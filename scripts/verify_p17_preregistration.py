@@ -81,9 +81,14 @@ ALLOWED_BACKUP_ROLES: Tuple[str, ...] = (
 )
 
 # Directory or file prefixes in data/private/ that indicate F10-F17 downloads.
+# Note: `p17_prereg_candidates.md` (metadata-only HEAD catalog) and `p17_w1_results` / `p17_w2_results`
+# (pre-download Wave 1 & Wave 2 benchmark/test log directories, whose children are recursively scanned
+# below against `download_basenames`, `FORBIDDEN_PRIVATE_GATE_PATTERNS`, and `specific_token_re`) are allowed.
+ALLOWED_P17_PRIVATE_RESULT_DIRS: Set[str] = {"p17_w1_results", "p17_w2_results"}
+
 FORBIDDEN_PRIVATE_GATE_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:^|[_\-])f1(?:0|1|3|3a|3b|3c|4|6|7)(?:$|[_\-])", re.IGNORECASE),
-    re.compile(r"^p17[_\-](?!prereg_candidates\.md$)", re.IGNORECASE),
+    re.compile(r"^p17[_\-](?!(?:prereg_candidates\.md|w[12]_results)$)", re.IGNORECASE),
     re.compile(r"(?:^|[_\-])mtbls\d*", re.IGNORECASE),
     re.compile(r"(?:^|[_\-])bmrbig\d+", re.IGNORECASE),
     re.compile(r"(?:^|[_\-])bmse\d+", re.IGNORECASE),
@@ -455,6 +460,7 @@ def validate_preregistration(
             wgsl_files = r1.get("protected_wgsl_shaders")
             exceptions = r1.get("allowed_pre_download_w1_exceptions")
             sha_map = r1.get("v0120_baseline_sha256")
+            w1_sha_map = r1.get("w1_enforced_sha256")
 
             if not isinstance(core_files, list) or set(core_files) != set(REQUIRED_PROTECTED_CORE_FILES):
                 errors.append(
@@ -474,7 +480,7 @@ def validate_preregistration(
                     f"protected_wgsl_shaders mismatch vs disk shaders: manifest={sorted(wgsl_files)} disk={disk_wgsl}"
                 )
 
-            exempt_files: Set[str] = set()
+            pinned_w1_exceptions: Dict[str, Tuple[int, str]] = {}
             if not isinstance(exceptions, list):
                 errors.append("allowed_pre_download_w1_exceptions must be a list")
             else:
@@ -487,30 +493,54 @@ def validate_preregistration(
                         errors.append(
                             f"unauthorized solver freeze exception {f_rel!r} (only F12(a) relax_mc.wgsl allowed)"
                         )
-                    exempt_files.add(f_rel)
+                    pin_bytes = exc_obj.get("pinned_w1_bytes")
+                    pin_sha = exc_obj.get("pinned_w1_sha256")
+                    if not _is_strict_int(pin_bytes) or pin_bytes <= 0 or not isinstance(pin_sha, str) or len(pin_sha) != 64:
+                        errors.append(
+                            f"allowed_pre_download_w1_exceptions entry for {f_rel!r} missing pinned_w1_bytes / 64-hex pinned_w1_sha256"
+                        )
+                    else:
+                        pinned_w1_exceptions[f_rel] = (pin_bytes, pin_sha)
 
             if not isinstance(sha_map, dict):
                 errors.append("rule_1_solver_and_shader_freeze.v0120_baseline_sha256 must be an object")
-            else:
+            if not isinstance(w1_sha_map, dict):
+                errors.append("rule_1_solver_and_shader_freeze.w1_enforced_sha256 must be an object")
+            elif isinstance(sha_map, dict):
                 all_protected = list(REQUIRED_PROTECTED_CORE_FILES) + (
                     wgsl_files if isinstance(wgsl_files, list) else []
                 )
                 for rel_path in all_protected:
-                    rec = sha_map.get(rel_path)
-                    if not isinstance(rec, dict) or not isinstance(rec.get("sha256"), str):
+                    v0120_rec = sha_map.get(rel_path)
+                    if not isinstance(v0120_rec, dict) or not isinstance(v0120_rec.get("sha256"), str):
                         errors.append(f"missing v0120_baseline_sha256 digest for {rel_path}")
                         continue
+                    rec = w1_sha_map.get(rel_path)
+                    if not isinstance(rec, dict) or not isinstance(rec.get("sha256"), str) or not _is_strict_int(rec.get("bytes")):
+                        errors.append(f"missing w1_enforced_sha256 digest/bytes for {rel_path}")
+                        continue
+                    if rel_path in pinned_w1_exceptions:
+                        exp_bytes, exp_sha = pinned_w1_exceptions[rel_path]
+                        if rec["sha256"] != exp_sha or rec["bytes"] != exp_bytes:
+                            errors.append(
+                                f"w1_enforced_sha256 mismatch vs pinned_w1_sha256 for {rel_path}"
+                            )
+                    else:
+                        if rec["sha256"] != v0120_rec["sha256"] or rec.get("bytes") != v0120_rec.get("bytes"):
+                            errors.append(
+                                f"non-exception file {rel_path} has w1_enforced_sha256 != v0120_baseline_sha256"
+                            )
                     abs_path = repo_root / rel_path
                     if not abs_path.is_file():
                         errors.append(f"protected solver/shader file missing on disk: {rel_path}")
                         continue
-                    if rel_path not in exempt_files:
-                        actual_sha = _sha256_file(abs_path)
-                        if actual_sha != rec["sha256"]:
-                            errors.append(
-                                f"protected solver/shader file modified vs v0.12.0 freeze: {rel_path} "
-                                f"(expected {rec['sha256']}, got {actual_sha})"
-                            )
+                    actual_bytes = abs_path.stat().st_size
+                    actual_sha = _sha256_file(abs_path)
+                    if actual_sha != rec["sha256"] or actual_bytes != rec["bytes"]:
+                        errors.append(
+                            f"protected solver/shader file modified vs 17.W1 pinned freeze: {rel_path} "
+                            f"(expected {rec['sha256']} [{rec['bytes']} B], got {actual_sha} [{actual_bytes} B])"
+                        )
 
         r2 = rules.get("rule_2_a_priori_deterministic_format_conversion")
         if (
@@ -780,27 +810,35 @@ def validate_preregistration(
         if _normalize_bmrb_token(acc) is not None
     } | contaminated_ids
 
+    def _check_private_entry(entry_path: Path) -> None:
+        ename = entry_path.name
+        elow = ename.lower()
+        if elow in download_basenames:
+            errors.append(
+                f"pre-registration zero-download violation: target file `{entry_path}` exists in data/private/"
+            )
+            return
+        if any(pat.search(ename) for pat in FORBIDDEN_PRIVATE_GATE_PATTERNS):
+            errors.append(
+                f"pre-registration zero-download violation: F10-F17 entry `{entry_path}` exists in data/private/"
+            )
+            return
+        if specific_token_re is not None and specific_token_re.search(ename):
+            errors.append(
+                f"pre-registration zero-download violation: candidate accession `{entry_path}` exists in data/private/"
+            )
+            return
+
     for priv_dir in private_dirs:
         for child in sorted(priv_dir.iterdir()):
             name = child.name
             if name in (".gitkeep", "p17_prereg_candidates.md"):
                 continue
-            low = name.lower()
-            if low in download_basenames:
-                errors.append(
-                    f"pre-registration zero-download violation: target file `{child}` exists in data/private/"
-                )
+            if name in ALLOWED_P17_PRIVATE_RESULT_DIRS and child.is_dir():
+                for nested in sorted(child.rglob("*")):
+                    _check_private_entry(nested)
                 continue
-            if any(pat.search(name) for pat in FORBIDDEN_PRIVATE_GATE_PATTERNS):
-                errors.append(
-                    f"pre-registration zero-download violation: F10-F17 entry `{child}` exists in data/private/"
-                )
-                continue
-            if specific_token_re is not None and specific_token_re.search(name):
-                errors.append(
-                    f"pre-registration zero-download violation: candidate accession `{child}` exists in data/private/"
-                )
-                continue
+            _check_private_entry(child)
 
         bmrb_subdir = priv_dir / "bmrb"
         if bmrb_subdir.is_dir():
@@ -961,22 +999,35 @@ def run_self_tests(real_repo: Path) -> int:
         shutil.rmtree(clean_root / "data" / "private" / "bmrb")
         cases_passed += 1
 
-        # Case 8: Pre-existing downloaded target archive (`data/private/CEST.zip`)
+        # Case 8: Pre-existing downloaded target archive (`data/private/CEST.zip` and nested inside `p17_w1_results/`)
+        w1_ok_dir = clean_root / "data" / "private" / "p17_w1_results"
+        w1_ok_dir.mkdir()
+        (w1_ok_dir / "w1_tables.md").write_text("# Wave 1 tables\n", encoding="utf-8")
+        errs_w1_ok, _ = validate_preregistration(clean_root)
+        assert not errs_w1_ok, f"Case 8a unexpectedly flagged clean p17_w1_results: {errs_w1_ok}"
+
+        bad_nested = w1_ok_dir / "CEST.zip"
+        bad_nested.write_bytes(b"PK\x03\x04")
+        errs_nested, _ = validate_preregistration(clean_root)
+        assert any("CEST.zip" in e for e in errs_nested), f"Case 8b failed nested check: {errs_nested}"
+        shutil.rmtree(w1_ok_dir)
+
         bad_file = clean_root / "data" / "private" / "CEST.zip"
         bad_file.write_bytes(b"PK\x03\x04")
         errs, _ = validate_preregistration(clean_root)
-        assert any("CEST.zip" in e for e in errs), f"Case 8 failed: {errs}"
+        assert any("CEST.zip" in e for e in errs), f"Case 8c failed: {errs}"
         bad_file.unlink()
         cases_passed += 1
 
-        # Case 9: Solver freeze check rejects tampered `modelfree.rs` while allowing F12(a) `relax_mc.wgsl`
+        # Case 9: All 21 solver/shader files (incl. post-F12(a) pinned `relax_mc.wgsl` and `modelfree.rs`) reject tampering
         relax_wgsl = clean_root / "crates" / "nmr-gpu" / "src" / "shaders" / "relax_mc.wgsl"
-        relax_wgsl.write_text(
-            relax_wgsl.read_text(encoding="utf-8") + "\n// F12(a) Kahan centering pre-download\n",
-            encoding="utf-8",
+        orig_relax = relax_wgsl.read_text(encoding="utf-8")
+        relax_wgsl.write_text(orig_relax + "\n// unauthorized post-W1 shader edit\n", encoding="utf-8")
+        errs_wgsl_tampered, _ = validate_preregistration(clean_root)
+        assert any("relax_mc.wgsl" in e for e in errs_wgsl_tampered), (
+            f"Case 9a failed to reject tampered relax_mc.wgsl: {errs_wgsl_tampered}"
         )
-        errs_allowed, _ = validate_preregistration(clean_root)
-        assert not errs_allowed, f"Case 9a unexpectedly rejected F12(a) relax_mc.wgsl exception: {errs_allowed}"
+        relax_wgsl.write_text(orig_relax, encoding="utf-8")
 
         mf_rs = clean_root / "crates" / "nmr-core" / "src" / "modelfree.rs"
         mf_rs.write_text(mf_rs.read_text(encoding="utf-8") + "\n// post-freeze edit\n", encoding="utf-8")

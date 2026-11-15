@@ -55,7 +55,12 @@
         {
           "file": "crates/nmr-gpu/src/shaders/relax_mc.wgsl",
           "todo_item": "TODO.md:132 (F12a)",
-          "reason": "Kahan-summed weighted mean centering in 2-parameter varpro_two_param frozen in 17.W1 strictly prior to downloading any F10-F17 dataset."
+          "w1_commit": "3b8bd48",
+          "v0120_bytes": 24049,
+          "v0120_sha256": "a6b9d4ecc96a044f93e1b2289195d69b2b2da7ab17dca6ba25257e26548f6807",
+          "pinned_w1_bytes": 30492,
+          "pinned_w1_sha256": "5c7ac1e4cd5cde95aed2ff2a44a3da696ddc6fe6d3bc9b794fd8c5c60a7903f7",
+          "reason": "Kahan-summed weighted mean centering in 2-parameter varpro_two_param frozen in 17.W1 strictly prior to downloading any F10-F17 dataset; exact post-F12(a) SHA-256 is now pinned and actively enforced alongside all 20 other solver/shader modules."
         }
       ],
       "v0120_baseline_sha256": {
@@ -138,6 +143,92 @@
         "crates/nmr-gpu/src/shaders/relax_mc.wgsl": {
           "bytes": 24049,
           "sha256": "a6b9d4ecc96a044f93e1b2289195d69b2b2da7ab17dca6ba25257e26548f6807"
+        },
+        "crates/nmr-gpu/src/shaders/scoring.wgsl": {
+          "bytes": 8133,
+          "sha256": "1cd3d69e87e1e447824607c3ece4a28b39a628041fb51deb7f5929e004f18779"
+        }
+      },
+      "w1_enforced_sha256": {
+        "crates/nmr-core/src/cest.rs": {
+          "bytes": 101489,
+          "sha256": "d3e7b43b5d756bc75dc3baa69b033b843fca202272685b43b989961467bd1e75"
+        },
+        "crates/nmr-core/src/cpmg.rs": {
+          "bytes": 73757,
+          "sha256": "3695d4beafdcc0b0f70c6cb0d14aa956495337bf88cf2cdfeae689298978d620"
+        },
+        "crates/nmr-core/src/csp.rs": {
+          "bytes": 38663,
+          "sha256": "def977b23f1fd9b71517867d7dd244d7fafed3a7c85332257825ef9b3639a90b"
+        },
+        "crates/nmr-core/src/dosy.rs": {
+          "bytes": 114037,
+          "sha256": "4ee350e1b3804acea9c03cee6fd0092519748c562a3bc1e753f72f21efe9f15e"
+        },
+        "crates/nmr-core/src/metabolomics.rs": {
+          "bytes": 170113,
+          "sha256": "fef5741dcd810497b17831d07bc66a572f4f96190d531e90b64a056d2db7041d"
+        },
+        "crates/nmr-core/src/modelfree.rs": {
+          "bytes": 70734,
+          "sha256": "ad88ecd70a4a4fbba698c60e7a41410304927b8e2f2a86c225fbd4bd797c034c"
+        },
+        "crates/nmr-core/src/multiplet.rs": {
+          "bytes": 188367,
+          "sha256": "52420c08e8ce3f7243fbfc4ae5ff96dcbf12be0001f77cfcd261798ba24a073a"
+        },
+        "crates/nmr-core/src/nmr1d.rs": {
+          "bytes": 193999,
+          "sha256": "df37fde2d0bc94b53cc3b9da7f89f68e4cdfcc434aa8622b8fe223d5ae4108dc"
+        },
+        "crates/nmr-core/src/relax_fit.rs": {
+          "bytes": 54509,
+          "sha256": "5fd0d9fbd9b8dd11c3752dc97185ec779e2448683eb7edfba24984d6cfb5e772"
+        },
+        "crates/nmr-core/src/relax_io.rs": {
+          "bytes": 139474,
+          "sha256": "48f703cfc7495611bdfb870e8db97935dbf4d750da250d14ad596d534e5e4d71"
+        },
+        "crates/nmr-gpu/src/shaders/anneal.wgsl": {
+          "bytes": 28441,
+          "sha256": "ee01dc67b296942af5911f9e8d6a9539446c11e9c4f8f8ee778f8dbf18a899dc"
+        },
+        "crates/nmr-gpu/src/shaders/bayes_sa.wgsl": {
+          "bytes": 91466,
+          "sha256": "5790707d6f4127c5ad41e8dea11a3cbeaf9b08ed5bfca95713e3e6bcdc5b1c77"
+        },
+        "crates/nmr-gpu/src/shaders/bloch_cest.wgsl": {
+          "bytes": 18636,
+          "sha256": "8539df141422f3ff53879e5ac7a120490aaf21eebacd4454ad08a5bb6057672a"
+        },
+        "crates/nmr-gpu/src/shaders/conv3d.wgsl": {
+          "bytes": 11241,
+          "sha256": "36d56042fb6aa7666387333fb465b33d202d5b7f2c8bb7a2fdb5597cafc2d31b"
+        },
+        "crates/nmr-gpu/src/shaders/cpmg_fit.wgsl": {
+          "bytes": 11925,
+          "sha256": "682edbb5a8e07df08b4ff89fcb18d979b738b023e78921ae5cf43e4115fda7f1"
+        },
+        "crates/nmr-gpu/src/shaders/dosy.wgsl": {
+          "bytes": 28130,
+          "sha256": "fdd8e1a90ee3eb8c68f762fe09e1c1ce3437786ba860686dd655805c6a5b6314"
+        },
+        "crates/nmr-gpu/src/shaders/idp_scoring.wgsl": {
+          "bytes": 34235,
+          "sha256": "6b2e874da550da52a5bce6a2ff7e8bd3f6dab198ff4149af0e33492004e8a3cc"
+        },
+        "crates/nmr-gpu/src/shaders/methyl_anneal.wgsl": {
+          "bytes": 68050,
+          "sha256": "fff6a30dfcc19a0689e46f2413ad0f86a1f84dfc4c1ec958a3763f3c88e00b19"
+        },
+        "crates/nmr-gpu/src/shaders/rdc_refine.wgsl": {
+          "bytes": 11035,
+          "sha256": "b1725d7804d17a47163256c56602139b6c3c2db5a081c9d1c2e160c32d16cbd7"
+        },
+        "crates/nmr-gpu/src/shaders/relax_mc.wgsl": {
+          "bytes": 30492,
+          "sha256": "5c7ac1e4cd5cde95aed2ff2a44a3da696ddc6fe6d3bc9b794fd8c5c60a7903f7"
         },
         "crates/nmr-gpu/src/shaders/scoring.wgsl": {
           "bytes": 8133,
