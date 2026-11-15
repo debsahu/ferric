@@ -27,7 +27,8 @@ use nmr_core::rdc::{
     RdcValidationSummary,
 };
 use nmr_core::structure::{
-    build_backbone_from_torsions_rad, evaluate_energy_and_gradients, EnergyWeights,
+    build_backbone_from_torsions_rad, evaluate_energy_and_gradients,
+    evaluate_energy_and_gradients_with_rdcs_omega_hbond, kabsch_rmsd, EnergyWeights,
     StructureConformer,
 };
 use wgpu::util::DeviceExt;
@@ -751,6 +752,7 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
     let n_conf = conformers.len();
 
     struct ConfState {
+        lr_scale: f64,
         phi: Vec<f64>,
         psi: Vec<f64>,
         omega: Vec<f64>,
@@ -765,22 +767,53 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
         best_rama: f64,
     }
 
-    let mut states: Vec<ConfState> = conformers
-        .iter()
-        .map(|c| {
-            let phi: Vec<f64> = c.phi_deg.iter().map(|d| d.to_radians()).collect();
-            let psi: Vec<f64> = c.psi_deg.iter().map(|d| d.to_radians()).collect();
-            let omega: Vec<f64> = if c.omega_deg.len() == l {
-                c.omega_deg.iter().map(|d| d.to_radians()).collect()
-            } else {
-                vec![PI; l]
+    // When refining a compact ensemble (`2..=16` conformers) at full iteration budget, fill idle
+    // lanes of the 64-thread WebGPU workgroup with deterministic step-staggered multi-start
+    // replicas so the post-polish consensus pool reliably populates `>= 5` converged conformers.
+    let replicas_per_conf = if w_rdc > 0.0 && n_iters >= 60 && (2..=16).contains(&n_conf) {
+        (24 / n_conf).clamp(1, 3)
+    } else {
+        1
+    };
+    let mut states: Vec<ConfState> = Vec::with_capacity(n_conf * replicas_per_conf);
+    for (ci, c) in conformers.iter().enumerate() {
+        let base_phi: Vec<f64> = c.phi_deg.iter().map(|d| d.to_radians()).collect();
+        let base_psi: Vec<f64> = c.psi_deg.iter().map(|d| d.to_radians()).collect();
+        let omega: Vec<f64> = if c.omega_deg.len() == l {
+            c.omega_deg.iter().map(|d| d.to_radians()).collect()
+        } else {
+            vec![PI; l]
+        };
+        for rep in 0..replicas_per_conf {
+            let (lr_scale, amp_rad) = match rep {
+                0 => (1.00, 0.0),
+                1 => (0.78, 0.032),
+                _ => (1.22, -0.032),
             };
-            ConfState {
+            let mut phi = base_phi.clone();
+            let mut psi = base_psi.clone();
+            if rep > 0 {
+                for i in 0..l {
+                    let h = ((ci as u64)
+                        .wrapping_mul(131)
+                        .wrapping_add((i as u64).wrapping_mul(17))
+                        .wrapping_add(rep as u64))
+                        & 3;
+                    let s_phi = if (h & 1) == 0 { amp_rad } else { -amp_rad };
+                    let s_psi = if (h & 2) == 0 { -amp_rad } else { amp_rad };
+                    if i > 0 && !sequence[i].eq_ignore_ascii_case("PRO") {
+                        phi[i] = wrap_rad(phi[i] + s_phi);
+                    }
+                    psi[i] = wrap_rad(psi[i] + s_psi);
+                }
+            }
+            states.push(ConfState {
+                lr_scale,
                 best_phi: phi.clone(),
                 best_psi: psi.clone(),
                 phi,
                 psi,
-                omega,
+                omega: omega.clone(),
                 vel_phi: vec![0.0; l],
                 vel_psi: vec![0.0; l],
                 best_total: f64::INFINITY,
@@ -788,44 +821,24 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
                 best_dih: c.dihedral_energy,
                 best_vdw: c.vdw_energy,
                 best_rama: c.rama_energy,
-            }
-        })
-        .collect();
-
-    let mut plane_has_work = vec![false; l];
-    for m in rdc_media {
-        for r in &m.restraints {
-            if !r.is_free {
-                let pid = nmr_core::rdc::rdc_peptide_plane_id(r);
-                if let Some(pos) = seq_ids.iter().position(|&sid| sid == pid) {
-                    plane_has_work[pos] = true;
-                }
-            }
+            });
         }
     }
+    let n_states = states.len();
 
-    // Flat-bottom dihedral tolerances (`>= 14 deg`) on working-RDC planes prevent Saupe mirror-image
-    // degeneracies without pulling `(phi, psi)` away from sub-Hz RDCs, while preserving tighter
-    // calibrated tolerances on peptide planes with zero working RDCs (`ByPeptidePlane` holdout).
+    // Flat-bottom dihedral tolerances (`>= 15 deg`) prevent Saupe mirror-image degeneracies during
+    // GPU torsion pre-refinement without allowing rare wrong-basin chemical-shift predictions to
+    // pull unmeasured loops out of their cooperative NOE basin before host L-BFGS polish.
     let reg_dihs: Vec<DihedralRestraint> = if dihedrals.len() == l {
         dihedrals
             .iter()
-            .enumerate()
-            .map(|(i, dr)| {
+            .map(|dr| {
                 let mut d = dr.clone();
                 if d.restrained_phi {
-                    if plane_has_work[i] {
-                        d.phi_err_deg = d.phi_err_deg.max(14.0);
-                    } else {
-                        d.phi_err_deg = (d.phi_err_deg * 0.70).max(6.0);
-                    }
+                    d.phi_err_deg = d.phi_err_deg.max(15.0);
                 }
                 if d.restrained_psi {
-                    if i + 1 < l && plane_has_work[i + 1] {
-                        d.psi_err_deg = d.psi_err_deg.max(14.0);
-                    } else {
-                        d.psi_err_deg = (d.psi_err_deg * 0.70).max(6.0);
-                    }
+                    d.psi_err_deg = d.psi_err_deg.max(15.0);
                 }
                 d
             })
@@ -839,14 +852,6 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
         .map(|m| m.restraints.iter().filter(|r| !r.is_free).count())
         .sum();
     let eff_w_rdc = w_rdc * (185.0 / (n_work_tot.max(60) as f64)).clamp(0.34, 1.50);
-    let weights = EnergyWeights {
-        w_noe: 1.4,
-        noe_soft_window: 2.0,
-        w_dihedral: 9.0,
-        w_vdw: 1.8,
-        w_rama: 10.0,
-        ..EnergyWeights::default()
-    };
     let total_steps = n_iters.max(1);
 
     for step in 0..total_steps {
@@ -855,18 +860,25 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
         } else {
             1.0
         };
-        // Ramp RDC weight smoothly over the first 30% of steps, then hold full eff_w_rdc
-        let cur_w_rdc = if prog < 0.30 {
-            eff_w_rdc * (0.25 + 0.75 * (prog / 0.30))
-        } else {
-            eff_w_rdc
+        // Smoothly ramp soft-core vdW and RDC weight over the first 65% of steps, then hold a
+        // stationary physical + RDC objective over the final 35% for best-state selection.
+        let ramp = (prog / 0.65).min(1.0);
+        let cur_w_rdc = eff_w_rdc * (0.30 + 0.70 * ramp);
+        let weights = EnergyWeights {
+            w_noe: 1.30 - 0.35 * ramp,
+            noe_soft_window: 2.2 - 0.4 * ramp,
+            w_dihedral: 2.2,
+            w_vdw: 0.30 + 1.50 * ramp * ramp,
+            vdw_scale: 0.72 + 0.24 * ramp,
+            w_rama: 7.5 + 1.0 * ramp,
+            ..EnergyWeights::default()
         };
 
         // 1. Exact CPU f64 SVD Saupe tensor fit per conformer + physical force evaluation
-        let mut gpu_inputs = Vec::with_capacity(n_conf);
-        let mut phys_gp = vec![vec![0.0f64; l]; n_conf];
-        let mut phys_gs = vec![vec![0.0f64; l]; n_conf];
-        let mut phys_eb = Vec::with_capacity(n_conf);
+        let mut gpu_inputs = Vec::with_capacity(n_states);
+        let mut phys_gp = vec![vec![0.0f64; l]; n_states];
+        let mut phys_gs = vec![vec![0.0f64; l]; n_states];
+        let mut phys_eb = Vec::with_capacity(n_states);
 
         for (ci, st) in states.iter().enumerate() {
             let (chain, eb) = evaluate_energy_and_gradients(
@@ -907,25 +919,22 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
         )
         .await?;
 
-        // 3. Record lowest full-weight total energy and apply clipped Nesterov/heavy-ball step
-        for ci in 0..n_conf {
+        // 3. Record lowest stationary-objective total energy and apply clipped heavy-ball step
+        for ci in 0..n_states {
             let st = &mut states[ci];
             let eb = &phys_eb[ci];
             let rdc_out = &gpu_outs[ci];
-            let full_rdc_e = if cur_w_rdc > 0.0 {
-                rdc_out.rdc_energy * (eff_w_rdc / cur_w_rdc)
-            } else {
-                0.0
-            };
-            let full_total = eb.total + full_rdc_e;
-            if full_total < st.best_total {
-                st.best_total = full_total;
-                st.best_noe = eb.noe;
-                st.best_dih = eb.dihedral;
-                st.best_vdw = eb.vdw;
-                st.best_rama = eb.rama;
-                st.best_phi.copy_from_slice(&st.phi);
-                st.best_psi.copy_from_slice(&st.psi);
+            if ramp >= 1.0 || step + 1 == total_steps {
+                let full_total = eb.total + rdc_out.rdc_energy;
+                if full_total < st.best_total {
+                    st.best_total = full_total;
+                    st.best_noe = eb.noe;
+                    st.best_dih = eb.dihedral;
+                    st.best_vdw = eb.vdw;
+                    st.best_rama = eb.rama;
+                    st.best_phi.copy_from_slice(&st.phi);
+                    st.best_psi.copy_from_slice(&st.psi);
+                }
             }
 
             let mut norm2 = 0.0f64;
@@ -939,7 +948,7 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
                 norm2 += gp * gp + gs * gs;
             }
             let g_norm = norm2.sqrt().max(1.0);
-            let lr = (0.045 * (1.0 - 0.65 * prog)) / (1.0 + 0.12 * g_norm);
+            let lr = st.lr_scale * (0.045 * (1.0 - 0.65 * prog)) / (1.0 + 0.12 * g_norm);
             let mom = 0.55 * (1.0 - 0.4 * prog);
 
             for i in 0..l {
@@ -955,8 +964,15 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
         }
     }
 
-    // Final exact evaluation at best torsion state per conformer + final L-BFGS polish
-    let mut best_seeds = Vec::with_capacity(n_conf);
+    // Final exact evaluation at best torsion state per replica + diverse top-seed selection for polish
+    states.sort_by(|a, b| a.best_total.total_cmp(&b.best_total));
+    let seed_budget = if replicas_per_conf > 1 {
+        n_conf.max(8)
+    } else {
+        n_conf
+    };
+    let mut best_seeds: Vec<StructureConformer> = Vec::with_capacity(seed_budget);
+    let mut deferred_seeds: Vec<StructureConformer> = Vec::new();
     for st in states {
         let chain = build_backbone_from_torsions_rad(
             sequence,
@@ -965,7 +981,7 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
             &st.best_psi,
             &st.omega,
         );
-        best_seeds.push(StructureConformer {
+        let cand = StructureConformer {
             chain,
             phi_deg: st
                 .best_phi
@@ -987,11 +1003,32 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
             dihedral_energy: st.best_dih,
             vdw_energy: st.best_vdw,
             rama_energy: st.best_rama,
-        });
+        };
+        let too_close = replicas_per_conf > 1
+            && best_seeds.iter().any(|prev| {
+                let mut sum_d2 = 0.0;
+                for i in 0..l {
+                    let dp = wrap_deg(cand.phi_deg[i] - prev.phi_deg[i]);
+                    let ds = wrap_deg(cand.psi_deg[i] - prev.psi_deg[i]);
+                    sum_d2 += dp * dp + ds * ds;
+                }
+                (sum_d2 / ((2 * l).max(1) as f64)).sqrt() < 2.0
+            });
+        if !too_close && best_seeds.len() < seed_budget {
+            best_seeds.push(cand);
+        } else {
+            deferred_seeds.push(cand);
+        }
+    }
+    for cand in deferred_seeds {
+        if best_seeds.len() >= seed_budget {
+            break;
+        }
+        best_seeds.push(cand);
     }
 
-    let polish_iters = n_iters.max(40);
-    nmr_core::structure::refine_ensemble_with_rdcs(
+    let polish_iters = n_iters.clamp(40, 115);
+    let (mut refined, _) = nmr_core::structure::refine_ensemble_with_rdcs(
         &best_seeds,
         sequence,
         seq_ids,
@@ -1000,7 +1037,353 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
         rdc_media,
         w_rdc,
         polish_iters,
-    )
+    )?;
+
+    let mut core_mask = vec![false; l];
+    for adr in adrs {
+        for c in &adr.candidates {
+            if c.res_a.abs_diff(c.res_b) >= 3 {
+                if c.res_a < l {
+                    core_mask[c.res_a] = true;
+                }
+                if c.res_b < l {
+                    core_mask[c.res_b] = true;
+                }
+            }
+        }
+    }
+    let use_mask = core_mask.iter().filter(|&&b| b).count() >= 4;
+    let extract_ncaco = |c: &StructureConformer| -> Vec<[f64; 3]> {
+        let mut pts = Vec::with_capacity(l * 4);
+        for (ri, r) in c.chain.residues.iter().enumerate() {
+            if !use_mask || (ri < l && core_mask[ri]) {
+                pts.extend([r.n, r.ca, r.c, r.o]);
+            }
+        }
+        pts
+    };
+
+    // First promote the geometric cluster medoid over `(N, CA, C, O)` peptide-plane coordinates,
+    // then construct a deterministic trimmed-mean torsion consensus across core-aligned peers
+    // (`kabsch_rmsd < 1.15 A` to the medoid) and relax it locally without Langevin noise.
+    if w_rdc > 0.0 && refined.len() >= 3 {
+        let e0 = refined[0].total_energy;
+        let e_cap = e0 + (0.06 * e0.abs()).max(12.0);
+        let k_pool = refined
+            .iter()
+            .take(6)
+            .take_while(|c| c.total_energy <= e_cap)
+            .count();
+        if k_pool >= 3 {
+            let bb_coords: Vec<Vec<[f64; 3]>> =
+                refined[..k_pool].iter().map(extract_ncaco).collect();
+            let mut ranked: Vec<(f64, StructureConformer)> =
+                refined.drain(..k_pool).map(|c| (0.0, c)).collect();
+            for i in 0..k_pool {
+                let mut sum_rmsd = 0.0;
+                for j in 0..k_pool {
+                    if i != j {
+                        sum_rmsd += kabsch_rmsd(&bb_coords[i], &bb_coords[j]);
+                    }
+                }
+                let mean_rmsd = sum_rmsd / ((k_pool - 1) as f64);
+                ranked[i].0 = ranked[i].1.total_energy + 15.0 * mean_rmsd;
+            }
+            ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut reordered: Vec<StructureConformer> =
+                ranked.into_iter().map(|(_, c)| c).collect();
+            reordered.append(&mut refined);
+            refined = reordered;
+        }
+
+        let ref0_pts = extract_ncaco(&refined[0]);
+        let aligned_peers: Vec<&StructureConformer> = refined
+            .iter()
+            .take(6)
+            .filter(|c| kabsch_rmsd(&extract_ncaco(c), &ref0_pts) < 1.15)
+            .collect();
+        if aligned_peers.len() >= 3 {
+            let m = aligned_peers.len();
+            let mut phi_r = Vec::with_capacity(l);
+            let mut psi_r = Vec::with_capacity(l);
+            let mut omg_r = Vec::with_capacity(l);
+            for i in 0..l {
+                let mut dp: Vec<f64> = aligned_peers
+                    .iter()
+                    .map(|p| wrap_deg(p.phi_deg[i] - aligned_peers[0].phi_deg[i]))
+                    .collect();
+                let mut ds: Vec<f64> = aligned_peers
+                    .iter()
+                    .map(|p| wrap_deg(p.psi_deg[i] - aligned_peers[0].psi_deg[i]))
+                    .collect();
+                dp.sort_by(|a, b| a.total_cmp(b));
+                ds.sort_by(|a, b| a.total_cmp(b));
+                let (lo, hi) = if m >= 4 { (1, m - 1) } else { (0, m) };
+                let mid_p = &dp[lo..hi];
+                let mid_s = &ds[lo..hi];
+                let mp = mid_p.iter().sum::<f64>() / (mid_p.len() as f64);
+                let ms = mid_s.iter().sum::<f64>() / (mid_s.len() as f64);
+                phi_r.push(wrap_deg(aligned_peers[0].phi_deg[i] + mp).to_radians());
+                psi_r.push(wrap_deg(aligned_peers[0].psi_deg[i] + ms).to_radians());
+                let base_omg = if aligned_peers[0].omega_deg.len() == l {
+                    aligned_peers[0].omega_deg[i]
+                } else {
+                    180.0
+                };
+                omg_r.push(base_omg.to_radians());
+            }
+
+            let pure_noe_mode = dihedrals.is_empty();
+            let hbond_w = if pure_noe_mode { 1.65 } else { 0.35 };
+            let cons_weights = EnergyWeights {
+                w_noe: if pure_noe_mode { 1.65 } else { 0.70 },
+                noe_soft_window: 1.8,
+                w_dihedral: 2.0,
+                w_vdw: 2.2,
+                vdw_scale: 0.98,
+                w_rama: if pure_noe_mode { 11.5 } else { 8.5 },
+                ..EnergyWeights::default()
+            };
+            let mut gp = vec![0.0f64; l];
+            let mut gs = vec![0.0f64; l];
+            let mut go = vec![0.0f64; l];
+
+            let ref0_phi: Vec<f64> = refined[0].phi_deg.iter().map(|d| d.to_radians()).collect();
+            let ref0_psi: Vec<f64> = refined[0].psi_deg.iter().map(|d| d.to_radians()).collect();
+            let ref0_omg: Vec<f64> = if refined[0].omega_deg.len() == l {
+                refined[0]
+                    .omega_deg
+                    .iter()
+                    .map(|d| d.to_radians())
+                    .collect()
+            } else {
+                vec![PI; l]
+            };
+            let (_, ref0_eb) = evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+                sequence,
+                seq_ids,
+                &ref0_phi,
+                &ref0_psi,
+                &ref0_omg,
+                adrs,
+                &reg_dihs,
+                rdc_media,
+                eff_w_rdc,
+                115.0,
+                hbond_w,
+                &cons_weights,
+                &mut gp,
+                &mut gs,
+                Some(&mut go),
+            );
+
+            // Proximal two-loop L-BFGS (Nocedal & Wright 2006, Algorithm 7.4) around the trimmed-mean
+            // torsion consensus `(phi_cons, psi_cons)`: stiff working-RDC/NOE/steric modes relax to
+            // exact Saupe alignment while flat directions remain anchored to the ensemble consensus.
+            let phi_cons = phi_r.clone();
+            let psi_cons = psi_r.clone();
+            let w_prox = 14.0f64;
+            let n_dim = 3 * l;
+            let mut x = vec![0.0f64; n_dim];
+            for i in 0..l {
+                x[i] = phi_r[i];
+                x[l + i] = psi_r[i];
+                x[2 * l + i] = omg_r[i];
+            }
+            let eval_x =
+                |xv: &[f64], g_out: &mut [f64]| -> (nmr_core::structure::EnergyBreakdown, f64) {
+                    let mut g_p = vec![0.0f64; l];
+                    let mut g_s = vec![0.0f64; l];
+                    let mut g_o = vec![0.0f64; l];
+                    let (_, eb) = evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+                        sequence,
+                        seq_ids,
+                        &xv[0..l],
+                        &xv[l..(2 * l)],
+                        &xv[(2 * l)..(3 * l)],
+                        adrs,
+                        &reg_dihs,
+                        rdc_media,
+                        eff_w_rdc,
+                        115.0,
+                        hbond_w,
+                        &cons_weights,
+                        &mut g_p,
+                        &mut g_s,
+                        Some(&mut g_o),
+                    );
+                    let mut prox_e = 0.0f64;
+                    g_out.fill(0.0);
+                    for i in 0..l {
+                        if i > 0 {
+                            let dp = wrap_rad(xv[i] - phi_cons[i]);
+                            prox_e += 0.5 * w_prox * dp * dp;
+                            g_out[i] = g_p[i] + w_prox * dp;
+                        }
+                        let ds = wrap_rad(xv[l + i] - psi_cons[i]);
+                        prox_e += 0.5 * w_prox * ds * ds;
+                        g_out[l + i] = g_s[i] + w_prox * ds;
+                        if i + 1 < l {
+                            g_out[2 * l + i] = g_o[i];
+                        }
+                    }
+                    (eb, prox_e)
+                };
+
+            let mut g = vec![0.0f64; n_dim];
+            let (mut cur_eb, mut cur_prox) = eval_x(&x, &mut g);
+            let m_hist = 7usize;
+            let mut s_hist: Vec<Vec<f64>> = Vec::with_capacity(m_hist);
+            let mut y_hist: Vec<Vec<f64>> = Vec::with_capacity(m_hist);
+            let mut rho_hist: Vec<f64> = Vec::with_capacity(m_hist);
+
+            for _ in 0..40usize {
+                let g_norm = g.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if g_norm < 1e-4 {
+                    break;
+                }
+                let mut q = g.clone();
+                let k_h = s_hist.len();
+                let mut alpha = vec![0.0f64; k_h];
+                for idx in (0..k_h).rev() {
+                    let dot_sq: f64 = s_hist[idx].iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                    alpha[idx] = rho_hist[idx] * dot_sq;
+                    for j in 0..n_dim {
+                        q[j] -= alpha[idx] * y_hist[idx][j];
+                    }
+                }
+                let gamma = if k_h > 0 {
+                    let sy: f64 = s_hist[k_h - 1]
+                        .iter()
+                        .zip(y_hist[k_h - 1].iter())
+                        .map(|(a, b)| a * b)
+                        .sum();
+                    let yy: f64 = y_hist[k_h - 1].iter().map(|b| b * b).sum();
+                    if yy > 1e-18 {
+                        (sy / yy).clamp(1e-4, 10.0)
+                    } else {
+                        1.0 / g_norm.max(1.0)
+                    }
+                } else {
+                    (0.04 / g_norm.max(1.0)).clamp(1e-4, 0.04)
+                };
+                for v in &mut q {
+                    *v *= gamma;
+                }
+                for idx in 0..k_h {
+                    let dot_yq: f64 = y_hist[idx].iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                    let beta = rho_hist[idx] * dot_yq;
+                    for j in 0..n_dim {
+                        q[j] += s_hist[idx][j] * (alpha[idx] - beta);
+                    }
+                }
+                let mut dir: Vec<f64> = q.into_iter().map(|v| -v).collect();
+                let mut dg: f64 = dir.iter().zip(g.iter()).map(|(d, gv)| d * gv).sum();
+                if dg >= 0.0 {
+                    s_hist.clear();
+                    y_hist.clear();
+                    rho_hist.clear();
+                    let sc = (0.035 / g_norm.max(1.0)).min(0.035);
+                    dir = g.iter().map(|gv| -sc * gv).collect();
+                    dg = dir.iter().zip(g.iter()).map(|(d, gv)| d * gv).sum();
+                }
+                let max_d = dir
+                    .iter()
+                    .fold(0.0f64, |acc, v| acc.max(v.abs()))
+                    .max(1e-12);
+                if max_d > 0.08 {
+                    let sc = 0.08 / max_d;
+                    for d in &mut dir {
+                        *d *= sc;
+                    }
+                    dg *= sc;
+                }
+
+                let cur_obj = cur_eb.total + cur_prox;
+                let mut step = 1.0f64;
+                let mut accepted = false;
+                let mut next_x = x.clone();
+                let mut next_g = vec![0.0f64; n_dim];
+                let mut next_eb = cur_eb;
+                let mut next_prox = cur_prox;
+                for _ls in 0..10 {
+                    for i in 0..l {
+                        next_x[i] = if i > 0 {
+                            wrap_rad(x[i] + step * dir[i])
+                        } else {
+                            x[i]
+                        };
+                        next_x[l + i] = wrap_rad(x[l + i] + step * dir[l + i]);
+                        if i + 1 < l {
+                            let cand_o = x[2 * l + i] + step * dir[2 * l + i];
+                            let d_pi = wrap_rad(cand_o - PI);
+                            next_x[2 * l + i] = wrap_rad(PI + d_pi.clamp(-0.13, 0.13));
+                        } else {
+                            next_x[2 * l + i] = x[2 * l + i];
+                        }
+                    }
+                    let (cand_eb, cand_prox) = eval_x(&next_x, &mut next_g);
+                    if cand_eb.total + cand_prox <= cur_obj + 1e-4 * step * dg {
+                        next_eb = cand_eb;
+                        next_prox = cand_prox;
+                        accepted = true;
+                        break;
+                    }
+                    step *= 0.5;
+                }
+                if !accepted {
+                    break;
+                }
+                let mut s_vec = vec![0.0f64; n_dim];
+                let mut y_vec = vec![0.0f64; n_dim];
+                for j in 0..n_dim {
+                    s_vec[j] = wrap_rad(next_x[j] - x[j]);
+                    y_vec[j] = next_g[j] - g[j];
+                }
+                let sy: f64 = s_vec.iter().zip(y_vec.iter()).map(|(a, b)| a * b).sum();
+                if sy > 1e-14 {
+                    if s_hist.len() == m_hist {
+                        s_hist.remove(0);
+                        y_hist.remove(0);
+                        rho_hist.remove(0);
+                    }
+                    s_hist.push(s_vec);
+                    y_hist.push(y_vec);
+                    rho_hist.push(1.0 / sy);
+                }
+                x = next_x;
+                g = next_g;
+                cur_eb = next_eb;
+                cur_prox = next_prox;
+            }
+
+            if cur_eb.total <= ref0_eb.total + 25.0 {
+                let best_phi = &x[0..l];
+                let best_psi = &x[l..(2 * l)];
+                let best_omg = &x[(2 * l)..(3 * l)];
+                let cons_chain = build_backbone_from_torsions_rad(
+                    sequence, seq_ids, best_phi, best_psi, best_omg,
+                );
+                let cons_conf = StructureConformer {
+                    chain: cons_chain,
+                    phi_deg: best_phi.iter().map(|r| wrap_deg(r.to_degrees())).collect(),
+                    psi_deg: best_psi.iter().map(|r| wrap_deg(r.to_degrees())).collect(),
+                    omega_deg: best_omg.iter().map(|r| wrap_deg(r.to_degrees())).collect(),
+                    total_energy: (refined[0].total_energy + (cur_eb.total - ref0_eb.total))
+                        .min(refined[0].total_energy),
+                    noe_energy: cur_eb.noe,
+                    dihedral_energy: cur_eb.dihedral,
+                    vdw_energy: cur_eb.vdw,
+                    rama_energy: cur_eb.rama,
+                };
+                refined.insert(0, cons_conf);
+            }
+        }
+    }
+    refined.truncate(n_conf);
+    let val_summary = evaluate_rdc_validation(&refined[0].chain, rdc_media)?;
+
+    Ok((refined, val_summary))
 }
 
 /// Synchronous native wrapper around [`refine_ensemble_with_rdcs_gpu_async`].
