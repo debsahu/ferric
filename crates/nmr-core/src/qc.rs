@@ -140,6 +140,14 @@ pub struct DatasetQcReport {
     /// explicit `--allow-truncated-fid` opt-in (`F2`).
     #[serde(default)]
     pub truncated_fid_zero_filled: bool,
+    /// True when pairwise empirical `13C` `CA` referencing across `HNCA`, `HNCACB` (positive `CA`-band),
+    /// and `CBCACONH` diverges by `>= 0.50` ppm (`F6a`), indicating multi-batch `13C` zero-point mismatch.
+    #[serde(default)]
+    pub inter_exp_c13_offset_warn: bool,
+    /// Maximum absolute pairwise inter-experiment `13C` `CA` referencing offset (ppm) across present
+    /// `CA`-bearing 3D experiments (`0.0` when `< 2` `CA`-bearing 3D experiments are present; `F6a`).
+    #[serde(default)]
+    pub max_inter_exp_ca_drift_ppm: f64,
     /// True under `DatasetQcVerdict::Warn` (`Q4`): explicitly marks sub-HC calls (`confidence < 0.80`)
     /// as uncalibrated under `Warn` damping rather than fitting a separate small-sample `Warn` isotonic curve.
     #[serde(default)]
@@ -230,11 +238,446 @@ impl Default for DatasetQcReport {
             hc_call_fraction: 0.0,
             protein_hc_gate_triggered: false,
             truncated_fid_zero_filled: false,
+            inter_exp_c13_offset_warn: false,
+            max_inter_exp_ca_drift_ppm: 0.0,
             warn_sub_hc_uncalibrated: false,
             confidence_calibrated: true,
             calibration_warning: None,
             reasons: Vec::new(),
         }
+    }
+}
+
+/// Pairwise inter-experiment `13C` `CA` referencing divergence threshold (ppm) that triggers
+/// `DatasetQcVerdict::Warn` (`F6a`).
+pub const INTER_EXP_CA_DRIFT_WARN_PPM: f64 = 0.50;
+
+/// Pairwise `13C` `CA` referencing offset diagnostic between two `CA`-bearing 3D experiments (`F6a`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InterExpCaPairOffset {
+    pub exp_a: String,
+    pub exp_b: String,
+    /// Estimated systematic `13C` `CA` offset `c(exp_a) - c(exp_b)` in ppm.
+    pub offset_ppm: f64,
+    /// Empirical `CA`-band median difference `median(exp_a) - median(exp_b)` in ppm.
+    pub median_diff_ppm: f64,
+    /// Number of distinct `(H, N)` strips supporting the consensus `CA` offset mode.
+    pub matched_strips: usize,
+    /// Total `(H, N)` strips co-occupied by `CA`-band peaks in both experiments.
+    pub shared_strips: usize,
+}
+
+/// Summary of per-entry inter-experiment `13C` `CA` referencing consistency across
+/// `HNCA`, `HNCACB` (positive `CA`-band peaks), and `CBCACONH` (`CA`-band peaks) (`F6a`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InterExpC13CaConsistency {
+    pub n_ca_experiments: usize,
+    pub pair_offsets: Vec<InterExpCaPairOffset>,
+    pub max_abs_drift_ppm: f64,
+    pub warn_triggered: bool,
+    pub diagnostic: Option<String>,
+}
+
+fn canonicalize_ca_bearing_3d_exp(raw: &str) -> Option<&'static str> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    match cleaned.as_str() {
+        "HNCA" => Some("HNCA"),
+        "HNCACB" | "CBCANH" => Some("HNCACB"),
+        "CBCACONH" | "HNCOCACB" | "CBCACOCANH" => Some("CBCACONH"),
+        _ => None,
+    }
+}
+
+/// Evaluate per-entry inter-experiment `13C` `CA` referencing consistency across `HNCA`,
+/// `HNCACB` (positive `CA`-band peaks), and `CBCACONH` (`CA`-band peaks) when `>= 2`
+/// `CA`-bearing 3D experiments are present (`F6a`).
+///
+/// Uses 1D strip-consensus Hough mode estimation (`±0.35` ppm inlier band refined by the
+/// median of matched-strip residuals within `±0.45` ppm) so `CB(i-1)` peaks in `CBCACONH` and
+/// intra-vs-sequential `CA(i)`/`CA(i-1)` pairs on bidirectional strips do not pull the offset
+/// estimate on clean datasets, while systematic multi-batch `13C` zero-point mismatches
+/// (e.g. TMS vs IUPAC DSS `~1.83` ppm shift) trigger `warn_triggered = true` at `>= 0.50` ppm.
+pub fn check_inter_experiment_c13_ca_consistency(peaks: &[Peak]) -> InterExpC13CaConsistency {
+    check_inter_experiment_c13_ca_consistency_with_roots(peaks, None)
+}
+
+fn check_inter_experiment_c13_ca_consistency_with_roots(
+    peaks: &[Peak],
+    roots_override: Option<&[(f64, f64)]>,
+) -> InterExpC13CaConsistency {
+    let mut raw_by_ca_exp: BTreeMap<&'static str, Vec<&Peak>> = BTreeMap::new();
+    for p in peaks {
+        if p.c.is_some() {
+            if let Some(canon) = canonicalize_ca_bearing_3d_exp(&p.exp) {
+                raw_by_ca_exp.entry(canon).or_default().push(p);
+            }
+        }
+    }
+    if raw_by_ca_exp.len() < 2 {
+        return InterExpC13CaConsistency {
+            n_ca_experiments: raw_by_ca_exp.len(),
+            ..InterExpC13CaConsistency::default()
+        };
+    }
+
+    // Build `(H, N)` strip roots from override, gated 2D HSQC roots, or clustered 3D strip centers
+    let roots: Vec<(f64, f64)> = if let Some(ov) = roots_override.filter(|r| !r.is_empty()) {
+        ov.to_vec()
+    } else {
+        let raw_hsqc: Vec<&Peak> = peaks
+            .iter()
+            .filter(|p| p.exp.trim().eq_ignore_ascii_case("HSQC"))
+            .collect();
+        if !raw_hsqc.is_empty() {
+            let n_neg = raw_hsqc.iter().filter(|r| r.sign < 0).count();
+            let maj_sign = if n_neg * 2 > raw_hsqc.len() { -1 } else { 1 };
+            let has_heights = raw_hsqc.iter().any(|r| r.height.is_some());
+            let mut gated: Vec<&Peak> = raw_hsqc
+                .into_iter()
+                .filter(|r| {
+                    let sgn = if r.sign < 0 { -1 } else { 1 };
+                    if sgn != maj_sign {
+                        return false;
+                    }
+                    if has_heights {
+                        (5.5..=11.5).contains(&r.h) && (96.0..=142.0).contains(&r.n)
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+            if has_heights && !gated.is_empty() {
+                let mut hs: Vec<f64> = gated
+                    .iter()
+                    .filter_map(|r| r.height.map(f64::abs))
+                    .collect();
+                hs.sort_by(|a, b| b.total_cmp(a));
+                let n_ref = ((hs.len() * 3) / 4).clamp(1, hs.len());
+                let iref = median_f64(hs[..n_ref].to_vec()).unwrap_or(1.0).max(1e-9);
+                gated.retain(|r| r.height.map(f64::abs).unwrap_or(0.0) >= 0.05 * iref);
+            }
+            gated.into_iter().map(|r| (r.h, r.n)).collect()
+        } else {
+            let mut centers: Vec<(f64, f64)> = Vec::new();
+            for list in raw_by_ca_exp.values() {
+                for p in list {
+                    let exists = centers
+                        .iter()
+                        .any(|&(rh, rn)| ((p.h - rh) / 0.055).hypot((p.n - rn) / 0.55) <= 1.0);
+                    if !exists {
+                        centers.push((p.h, p.n));
+                    }
+                }
+            }
+            centers
+        }
+    };
+
+    if roots.len() < 6 {
+        return InterExpC13CaConsistency::default();
+    }
+
+    let k_amp_ref = roots.len().clamp(8, 256);
+    let exp_order = ["HNCA", "HNCACB", "CBCACONH"];
+    let mut strips_by_exp: BTreeMap<&'static str, Vec<Vec<f64>>> = BTreeMap::new();
+    let mut core_ca_by_exp: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
+
+    for &ename in &exp_order {
+        let Some(raw_list) = raw_by_ca_exp.get(ename) else {
+            continue;
+        };
+        let noise_kept: Vec<&Peak> = if raw_list.iter().any(|p| p.height.is_some()) {
+            let mut hs: Vec<f64> = raw_list
+                .iter()
+                .filter_map(|p| p.height.map(f64::abs))
+                .collect();
+            hs.sort_by(|a, b| b.total_cmp(a));
+            let k_ref = k_amp_ref.min(hs.len().max(1));
+            let iref = median_f64(hs[..k_ref.min(hs.len())].to_vec())
+                .unwrap_or(1.0)
+                .max(1e-9);
+            raw_list
+                .iter()
+                .copied()
+                .filter(|p| p.height.map(f64::abs).unwrap_or(0.0) >= 0.06 * iref)
+                .collect()
+        } else {
+            raw_list.clone()
+        };
+
+        let has_neg_cb = ename == "HNCACB" && noise_kept.iter().any(|p| p.sign < 0);
+        let ca_peaks: Vec<&Peak> = noise_kept
+            .into_iter()
+            .filter(|p| {
+                let Some(c) = p.c else {
+                    return false;
+                };
+                match ename {
+                    "HNCA" => (36.0..=76.0).contains(&c),
+                    "HNCACB" => {
+                        if has_neg_cb {
+                            p.sign > 0 && (36.0..=76.0).contains(&c)
+                        } else {
+                            p.sign >= 0 && (43.5..=72.0).contains(&c)
+                        }
+                    }
+                    "CBCACONH" => (38.0..=75.0).contains(&c),
+                    _ => false,
+                }
+            })
+            .collect();
+
+        if ca_peaks.len() < 6 {
+            continue;
+        }
+
+        // Estimate uniform per-experiment `(H, N)` lock shift onto `roots`
+        let mut dhs = Vec::new();
+        let mut dns = Vec::new();
+        for &(rh, rn) in &roots {
+            let mut best: Option<(f64, f64, f64)> = None;
+            for p in &ca_peaks {
+                let dh = p.h - rh;
+                let dn = p.n - rn;
+                let d = (dh / 0.075).hypot(dn / 0.75);
+                if d <= 1.0 && best.is_none_or(|b| d < b.0) {
+                    best = Some((d, dh, dn));
+                }
+            }
+            if let Some((_, dh, dn)) = best {
+                dhs.push(dh);
+                dns.push(dn);
+            }
+        }
+        let (sh_h, sh_n) = if dhs.len() >= 6 {
+            let mh = median_f64(dhs).unwrap_or(0.0);
+            let mn = median_f64(dns).unwrap_or(0.0);
+            if mh.abs() <= 0.08 && mn.abs() <= 0.80 {
+                (mh, mn)
+            } else {
+                (0.0, 0.0)
+            }
+        } else {
+            (0.0, 0.0)
+        };
+
+        let mut per_strip = vec![Vec::new(); roots.len()];
+        let mut all_ca_vals = Vec::with_capacity(ca_peaks.len());
+        let mut core_ca_vals = Vec::new();
+        for p in &ca_peaks {
+            let Some(c) = p.c else {
+                continue;
+            };
+            all_ca_vals.push(c);
+            if (43.5..=68.5).contains(&c) {
+                core_ca_vals.push(c);
+            }
+            let ph = p.h - sh_h;
+            let pn = p.n - sh_n;
+            let mut best_root: Option<(usize, f64)> = None;
+            for (r_idx, &(rh, rn)) in roots.iter().enumerate() {
+                let d = ((ph - rh) / 0.065).hypot((pn - rn) / 0.65);
+                if d <= 1.0 && best_root.is_none_or(|b| d < b.1) {
+                    best_root = Some((r_idx, d));
+                }
+            }
+            if let Some((r_idx, _)) = best_root {
+                per_strip[r_idx].push(c);
+            }
+        }
+
+        let occupied = per_strip.iter().filter(|s| !s.is_empty()).count();
+        if occupied >= 6 {
+            let med_pool = if ename == "CBCACONH" && core_ca_vals.len() >= 6 {
+                core_ca_vals
+            } else {
+                all_ca_vals
+            };
+            strips_by_exp.insert(ename, per_strip);
+            core_ca_by_exp.insert(ename, med_pool);
+        }
+    }
+
+    let active_exps: Vec<&'static str> = exp_order
+        .iter()
+        .copied()
+        .filter(|e| strips_by_exp.contains_key(e))
+        .collect();
+    if active_exps.len() < 2 {
+        return InterExpC13CaConsistency {
+            n_ca_experiments: active_exps.len(),
+            ..InterExpC13CaConsistency::default()
+        };
+    }
+
+    let mut pair_offsets = Vec::new();
+    for i in 0..active_exps.len() {
+        for j in (i + 1)..active_exps.len() {
+            let ea = active_exps[i];
+            let eb = active_exps[j];
+            let Some(sa) = strips_by_exp.get(ea) else {
+                continue;
+            };
+            let Some(sb) = strips_by_exp.get(eb) else {
+                continue;
+            };
+            let ca_pool_a = core_ca_by_exp.get(ea).cloned().unwrap_or_default();
+            let ca_pool_b = core_ca_by_exp.get(eb).cloned().unwrap_or_default();
+            let med_a = median_f64(ca_pool_a.clone()).unwrap_or(0.0);
+            let med_b = median_f64(ca_pool_b.clone()).unwrap_or(0.0);
+            let median_diff_ppm = med_a - med_b;
+
+            // Collect per-strip pairwise differences `c_a - c_b` in `[-12.0, +12.0]` ppm
+            let mut strip_diffs: Vec<Vec<f64>> = Vec::new();
+            let mut cand_centers: Vec<f64> = Vec::new();
+            let mut n_shared = 0usize;
+            for r_idx in 0..roots.len() {
+                if sa[r_idx].is_empty() || sb[r_idx].is_empty() {
+                    continue;
+                }
+                n_shared += 1;
+                let mut diffs = Vec::new();
+                for &va in &sa[r_idx] {
+                    for &vb in &sb[r_idx] {
+                        let d = va - vb;
+                        if d.abs() <= 12.0 {
+                            diffs.push(d);
+                            cand_centers.push(d);
+                        }
+                    }
+                }
+                if !diffs.is_empty() {
+                    strip_diffs.push(diffs);
+                }
+            }
+
+            let mut best_mode: Option<(usize, f64, f64)> = None;
+            for &c0 in &cand_centers {
+                let mut sup = 0usize;
+                let mut err_sum = 0.0_f64;
+                for s_ds in &strip_diffs {
+                    let mut min_e = f64::INFINITY;
+                    for &d in s_ds {
+                        let e = (d - c0).abs();
+                        if e < min_e {
+                            min_e = e;
+                        }
+                    }
+                    if min_e <= 0.35 {
+                        sup += 1;
+                        err_sum += min_e;
+                    }
+                }
+                if sup > 0 {
+                    let better = match best_mode {
+                        None => true,
+                        Some((b_sup, b_err, b_c0)) => {
+                            sup > b_sup
+                                || (sup == b_sup
+                                    && (err_sum < b_err - 1e-9
+                                        || ((err_sum - b_err).abs() <= 1e-9
+                                            && c0.abs() < b_c0.abs())))
+                        }
+                    };
+                    if better {
+                        best_mode = Some((sup, err_sum, c0));
+                    }
+                }
+            }
+
+            let min_req = (n_shared * 28).div_ceil(100).max(6);
+            if let Some((b_sup, _, mode_c0)) = best_mode {
+                if n_shared >= 6 && b_sup >= min_req {
+                    let mut inliers = Vec::with_capacity(b_sup);
+                    for s_ds in &strip_diffs {
+                        let mut closest: Option<f64> = None;
+                        for &d in s_ds {
+                            if (d - mode_c0).abs() <= 0.45
+                                && closest
+                                    .is_none_or(|prev| (d - mode_c0).abs() < (prev - mode_c0).abs())
+                            {
+                                closest = Some(d);
+                            }
+                        }
+                        if let Some(d_in) = closest {
+                            inliers.push(d_in);
+                        }
+                    }
+                    if inliers.len() >= 6 {
+                        let offset_ppm = median_f64(inliers.clone()).unwrap_or(mode_c0);
+                        pair_offsets.push(InterExpCaPairOffset {
+                            exp_a: ea.to_string(),
+                            exp_b: eb.to_string(),
+                            offset_ppm,
+                            median_diff_ppm,
+                            matched_strips: inliers.len(),
+                            shared_strips: n_shared,
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // Fallback for extreme (> 12 ppm or unaligned-strip) pure-CA shifts (`HNCA` vs `HNCACB(+)`)
+            if ea != "CBCACONH"
+                && eb != "CBCACONH"
+                && ca_pool_a.len() >= 12
+                && ca_pool_b.len() >= 12
+                && median_diff_ppm.abs() >= 1.50
+            {
+                pair_offsets.push(InterExpCaPairOffset {
+                    exp_a: ea.to_string(),
+                    exp_b: eb.to_string(),
+                    offset_ppm: median_diff_ppm,
+                    median_diff_ppm,
+                    matched_strips: 0,
+                    shared_strips: n_shared,
+                });
+            }
+        }
+    }
+
+    let max_abs_drift_ppm = pair_offsets
+        .iter()
+        .map(|p| p.offset_ppm.abs())
+        .fold(0.0_f64, f64::max);
+    let warn_triggered = max_abs_drift_ppm >= INTER_EXP_CA_DRIFT_WARN_PPM;
+    let diagnostic = if warn_triggered {
+        let details = pair_offsets
+            .iter()
+            .filter(|p| p.offset_ppm.abs() >= INTER_EXP_CA_DRIFT_WARN_PPM)
+            .map(|p| {
+                format!(
+                    "{} vs {} dCA={:+.2} ppm ({}/{} strips, med_diff={:+.2} ppm)",
+                    p.exp_a,
+                    p.exp_b,
+                    p.offset_ppm,
+                    p.matched_strips,
+                    p.shared_strips,
+                    p.median_diff_ppm
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "inter-experiment 13C CA referencing mismatch (>= {:.2} ppm): {}",
+            INTER_EXP_CA_DRIFT_WARN_PPM, details
+        ))
+    } else {
+        None
+    };
+
+    InterExpC13CaConsistency {
+        n_ca_experiments: active_exps.len(),
+        pair_offsets,
+        max_abs_drift_ppm,
+        warn_triggered,
+        diagnostic,
     }
 }
 
@@ -1588,6 +2031,12 @@ pub fn evaluate_dataset_qc_with_gate(
     // Aliphatic (`CA` / `CB`) spin-system backing fraction among carbon-bearing spin systems (`P1-7`):
     // catches `HNCO`-only or folded-aliphatic cubes that previously earned `hsqc_3d_support_frac = 1.00`
     // (`Pass`) from `13C'` carbonyl strips alone, without penalizing unpruned zero-carbon 2D noise roots.
+    let c13_ca_consistency = peaks
+        .map(check_inter_experiment_c13_ca_consistency)
+        .unwrap_or_default();
+    let inter_exp_c13_offset_warn = c13_ca_consistency.warn_triggered;
+    let max_inter_exp_ca_drift_ppm = c13_ca_consistency.max_abs_drift_ppm;
+
     let aliphatic_support_frac = if systems.is_empty() {
         1.0
     } else {
@@ -1897,6 +2346,9 @@ pub fn evaluate_dataset_qc_with_gate(
     }
 
     if !abstain_reasons.is_empty() {
+        if let Some(ref c13_msg) = c13_ca_consistency.diagnostic {
+            abstain_reasons.push(c13_msg.clone());
+        }
         return DatasetQcReport {
             verdict: DatasetQcVerdict::Abstain,
             confidence_scale: 0.0,
@@ -1923,6 +2375,8 @@ pub fn evaluate_dataset_qc_with_gate(
             hc_call_fraction: 0.0,
             protein_hc_gate_triggered: false,
             truncated_fid_zero_filled: false,
+            inter_exp_c13_offset_warn,
+            max_inter_exp_ca_drift_ppm,
             warn_sub_hc_uncalibrated: false,
             confidence_calibrated: true,
             calibration_warning: None,
@@ -1931,6 +2385,11 @@ pub fn evaluate_dataset_qc_with_gate(
     }
 
     let mut scale = 1.0_f64;
+
+    if let Some(ref c13_msg) = c13_ca_consistency.diagnostic {
+        scale *= 0.78;
+        warn_reasons.push(c13_msg.clone());
+    }
 
     if hsqc_multiplicity_ratio > 1.45 && (peaks.is_none() || supported_roots_per_assignable > 1.35)
     {
@@ -2077,6 +2536,15 @@ pub fn evaluate_dataset_qc_with_gate(
                 solution_margin * 100.0
             ));
         }
+        if inter_exp_c13_offset_warn
+            && (max_inter_exp_ca_drift_ppm >= 1.00 || solution_margin < 0.50)
+        {
+            hc_gate_reasons.push(format!(
+                "protein_hc_gate[inter_exp_c13_mismatch]: inter-experiment 13C CA drift {:.2} ppm (margin {:.1}%)",
+                max_inter_exp_ca_drift_ppm,
+                solution_margin * 100.0
+            ));
+        }
     }
     if hc_count > 0 && assigned_count * 5 < n_assignable_amides {
         hc_gate_reasons.push(format!(
@@ -2120,6 +2588,8 @@ pub fn evaluate_dataset_qc_with_gate(
             hc_call_fraction,
             protein_hc_gate_triggered: false,
             truncated_fid_zero_filled: false,
+            inter_exp_c13_offset_warn: false,
+            max_inter_exp_ca_drift_ppm,
             warn_sub_hc_uncalibrated: false,
             confidence_calibrated: true,
             calibration_warning: None,
@@ -2152,6 +2622,8 @@ pub fn evaluate_dataset_qc_with_gate(
             hc_call_fraction,
             protein_hc_gate_triggered,
             truncated_fid_zero_filled: false,
+            inter_exp_c13_offset_warn,
+            max_inter_exp_ca_drift_ppm,
             warn_sub_hc_uncalibrated: true,
             confidence_calibrated: true,
             calibration_warning: None,
@@ -3077,4 +3549,191 @@ pub fn apply_bayes_sa_calibration_map(p_raw: f64) -> f64 {
 #[inline]
 pub fn apply_bayes_sa_gpu_calibration_map(p_raw: f64) -> f64 {
     eval_monotone_calibration_map(p_raw, BAYES_SA_GPU_CALIBRATION_KNOTS)
+}
+
+#[cfg(test)]
+mod inter_exp_c13_tests {
+    use super::*;
+    use crate::spinsystems::{build_spin_systems, Tolerances};
+
+    fn mk_peak(exp: &str, h: f64, n: f64, c: Option<f64>, sign: i32, height: f64) -> Peak {
+        Peak {
+            exp: exp.to_string(),
+            h,
+            n,
+            c,
+            h2: None,
+            sign,
+            height: Some(height),
+            volume: None,
+        }
+    }
+
+    fn synthetic_ca_cb_chain(
+        n_res: usize,
+        hnca_shift_ppm: f64,
+        cbcaconh_shift_ppm: f64,
+    ) -> (Vec<String>, Vec<Peak>) {
+        let aas = [
+            "ALA", "LEU", "THR", "VAL", "SER", "GLU", "LYS", "ASP", "ILE", "ASN",
+        ];
+        let ca_base = [52.8, 55.4, 61.8, 62.5, 58.3, 56.7, 56.2, 54.1, 61.2, 53.3];
+        let cb_base = [19.1, 42.2, 69.4, 32.4, 63.6, 30.1, 32.8, 41.0, 38.4, 38.9];
+        let co_base = [
+            177.8, 177.1, 174.6, 176.2, 174.8, 176.5, 176.9, 176.1, 176.4, 175.3,
+        ];
+
+        let mut seq = vec![String::new()];
+        for k in 1..=n_res {
+            seq.push(aas[(k - 1) % aas.len()].to_string());
+        }
+
+        let mut peaks = Vec::new();
+        for k in 2..=n_res {
+            let h = 7.40 + 0.085 * ((k % 17) as f64) + 0.011 * ((k / 17) as f64);
+            let n = 114.0 + 1.15 * ((k % 13) as f64) + 0.35 * ((k / 13) as f64);
+            let ca_i = ca_base[(k - 1) % ca_base.len()] + 0.65 * (k as f64 * 0.53).sin();
+            let cb_i = cb_base[(k - 1) % cb_base.len()] + 0.55 * (k as f64 * 0.71).cos();
+            let ca_im1 = ca_base[(k - 2) % ca_base.len()] + 0.65 * ((k - 1) as f64 * 0.53).sin();
+            let cb_im1 = cb_base[(k - 2) % cb_base.len()] + 0.55 * ((k - 1) as f64 * 0.71).cos();
+            let co_i = co_base[(k - 1) % co_base.len()] + 0.15 * (k as f64 * 0.37).sin();
+            let co_im1 = co_base[(k - 2) % co_base.len()] + 0.15 * ((k - 1) as f64 * 0.37).sin();
+
+            peaks.push(mk_peak("HSQC", h, n, None, 1, 1000.0));
+            peaks.push(mk_peak("HNCO", h, n, Some(co_im1), 1, 900.0));
+            peaks.push(mk_peak("HNCACO", h, n, Some(co_i), 1, 780.0));
+            peaks.push(mk_peak("HNCACO", h, n, Some(co_im1), 1, 380.0));
+            peaks.push(mk_peak("HNCA", h, n, Some(ca_i + hnca_shift_ppm), 1, 850.0));
+            peaks.push(mk_peak(
+                "HNCA",
+                h,
+                n,
+                Some(ca_im1 + hnca_shift_ppm),
+                1,
+                420.0,
+            ));
+            peaks.push(mk_peak("HNCACB", h, n, Some(ca_i + 0.03), 1, 700.0));
+            peaks.push(mk_peak("HNCACB", h, n, Some(ca_im1 - 0.02), 1, 340.0));
+            peaks.push(mk_peak("HNCACB", h, n, Some(cb_i), -1, -650.0));
+            peaks.push(mk_peak("HNCACB", h, n, Some(cb_im1), -1, -310.0));
+            peaks.push(mk_peak(
+                "CBCACONH",
+                h,
+                n,
+                Some(ca_im1 + cbcaconh_shift_ppm),
+                1,
+                720.0,
+            ));
+            peaks.push(mk_peak(
+                "CBCACONH",
+                h,
+                n,
+                Some(cb_im1 + cbcaconh_shift_ppm),
+                1,
+                680.0,
+            ));
+        }
+        (seq, peaks)
+    }
+
+    #[test]
+    fn test_inter_exp_c13_ca_consistency_clean_vs_shifted_batches() {
+        // 1. Clean 3-CA-experiment dataset (with Leu/Asp/Thr/Ser CB overlapping 38..70 ppm in CBCACONH)
+        let (seq, clean_peaks) = synthetic_ca_cb_chain(24, 0.0, 0.0);
+        let clean_c13 = check_inter_experiment_c13_ca_consistency(&clean_peaks);
+        assert_eq!(clean_c13.n_ca_experiments, 3);
+        assert_eq!(clean_c13.pair_offsets.len(), 3);
+        assert!(
+            !clean_c13.warn_triggered,
+            "clean dataset must not trigger C13 CA warning: {clean_c13:?}"
+        );
+        assert!(
+            clean_c13.max_abs_drift_ppm < 0.15,
+            "expected < 0.15 ppm drift on clean dataset, got {:.3}",
+            clean_c13.max_abs_drift_ppm
+        );
+
+        let priors = Priors::bmrb();
+        let score_cfg = ScoreConfig::default();
+        let systems = build_spin_systems(&clean_peaks, &Tolerances::default(), 4, false).unwrap();
+        let mut pos = vec![-1i32; systems.len()];
+        for (s_idx, ss) in systems.iter().enumerate() {
+            for k in 2..=24 {
+                let hk = 7.40 + 0.085 * ((k % 17) as f64) + 0.011 * ((k / 17) as f64);
+                let nk = 114.0 + 1.15 * ((k % 13) as f64) + 0.35 * ((k / 13) as f64);
+                if (ss.h - hk).abs() < 0.02 && (ss.n - nk).abs() < 0.20 {
+                    pos[s_idx] = k;
+                    break;
+                }
+            }
+        }
+        let res = AssignResult {
+            position: pos,
+            confidence: vec![0.92; systems.len()],
+            score: 120.0,
+            run_scores: vec![120.0],
+        };
+        let qc_clean = evaluate_dataset_qc(
+            Some(&clean_peaks),
+            &systems,
+            &seq,
+            &priors,
+            &score_cfg,
+            &res,
+            None,
+        );
+        assert_eq!(
+            qc_clean.verdict,
+            DatasetQcVerdict::Pass,
+            "clean dataset must pass QC: {:?}",
+            qc_clean.reasons
+        );
+        assert!(!qc_clean.inter_exp_c13_offset_warn);
+
+        // 2. Multi-batch TMS-vs-DSS shifted HNCA (-1.83 ppm relative to HNCACB & CBCACONH, modeling 16238)
+        let (_, shifted_peaks) = synthetic_ca_cb_chain(24, -1.83, 0.0);
+        let shifted_c13 = check_inter_experiment_c13_ca_consistency(&shifted_peaks);
+        assert!(shifted_c13.warn_triggered);
+        assert!(
+            (shifted_c13.max_abs_drift_ppm - 1.83).abs() < 0.10,
+            "expected ~1.83 ppm drift, got {:.3} ({shifted_c13:?})",
+            shifted_c13.max_abs_drift_ppm
+        );
+        assert!(shifted_c13
+            .diagnostic
+            .as_deref()
+            .is_some_and(|d| d.contains("HNCA vs HNCACB") && d.contains("HNCA vs CBCACONH")));
+
+        let qc_shifted = evaluate_dataset_qc(
+            Some(&shifted_peaks),
+            &systems,
+            &seq,
+            &priors,
+            &score_cfg,
+            &res,
+            None,
+        );
+        assert_eq!(qc_shifted.verdict, DatasetQcVerdict::Warn);
+        assert!(qc_shifted.inter_exp_c13_offset_warn);
+        assert!((qc_shifted.max_inter_exp_ca_drift_ppm - 1.83).abs() < 0.10);
+        assert!(qc_shifted
+            .reasons
+            .iter()
+            .any(|r| r.contains("inter-experiment 13C CA referencing mismatch")));
+
+        // 3. Moderate >= 0.50 ppm divergence (+0.65 ppm) also triggers WARN
+        let (_, mod_peaks) = synthetic_ca_cb_chain(24, 0.65, 0.0);
+        let mod_c13 = check_inter_experiment_c13_ca_consistency(&mod_peaks);
+        assert!(mod_c13.warn_triggered);
+        assert!((mod_c13.max_abs_drift_ppm - 0.65).abs() < 0.10);
+
+        // 4. Single CA-bearing experiment (HNCA + HNCO only) does not warn
+        let single_ca: Vec<Peak> = clean_peaks
+            .into_iter()
+            .filter(|p| p.exp == "HSQC" || p.exp == "HNCO" || p.exp == "HNCA")
+            .collect();
+        let single_c13 = check_inter_experiment_c13_ca_consistency(&single_ca);
+        assert_eq!(single_c13.n_ca_experiments, 1);
+        assert!(!single_c13.warn_triggered);
+    }
 }
