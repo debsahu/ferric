@@ -1,157 +1,90 @@
 # nmr-assign
 
-**Open-source, GPU-accelerated protein NMR resonance assignment, 3D structure folding, and interactive WebGPU + Octet chemical workbench — written in pure Rust.**
+**Open-source Rust + WebGPU workbench for automated protein NMR resonance assignment, spin dynamics, analytical 1D/qNMR, DOSY diffusion, untargeted metabolomics, 2D chemical depiction, and sandboxed AI copilot workflows.**
 
-`nmr-assign` takes processed 2D/3D NMR spectra (Bruker TopSpin `pdata`, NMRPipe `.ft2`/`.ft3`) or peak lists (`TSV`, `CCPN NEF v1.1`) and produces sequence-specific **backbone & sidechain chemical shift assignments**, **2D/3D neural CNN peak lists**, **3D NOESY torsion-angle structure ensembles**, and **self-contained HTML/SVG quality reports** — alongside a dual-mode native & browser WebGPU GUI featuring both a **Protein NMR 2D/3D Strip Workbench** and the full **Octet Chemical Draw, Reaction & 1D NMR Studio**.
+[![Licence: MIT](https://img.shields.io/badge/licence-MIT%20%2B%20Apache--2.0-blue.svg)](THIRD_PARTY.md)
+[![Rust + WebGPU](https://img.shields.io/badge/engine-Rust%20%2B%20wgpu-orange.svg)](docs/specs/00-architecture.md)
+[![User Manual](https://img.shields.io/badge/docs-User%20Manual-0284c7.svg)](docs/manual/index.md)
+[![Browser Demo](https://img.shields.io/badge/WebGPU-Live%20Demo-059669.svg)](docs/demo/)
 
-Built clean-room under the **MIT License** from peer-reviewed methods, open BMRB/wwPDB data, and Apache-2.0 open-source components, with zero proprietary or copyleft dependencies.
+`nmr-assign` (`nmrassign` CLI + `nmr-gui` desktop/WebAssembly workbench) processes raw time-domain FIDs (Bruker `ser`/`fid` + custom `pulprog`, Varian/Agilent, JEOL Delta, JCAMP-DX) and frequency-domain spectra (Bruker `pdata`, NMRPipe, Sparky `.ucsf`) end-to-end in pure clean-room Rust (`f64` reference algorithms) and cross-vendor WebGPU (`wgpu` WGSL compute & contour shaders).
 
----
+## Deterministic Scientific Showcase
 
-## Highlights
+Every panel below is generated deterministically (`seed = 42`, zero external plotting libraries) directly from `nmr-core` forward models and solvers via `nmrassign export-fig --out-dir docs/assets`:
 
-- **Cross-Platform WebGPU Compute (`wgpu` + WGSL)**:
-  - Evaluates residue-typing log-likelihood-ratio matrices $U(s, k)$, Gaussian sequential connectivity matrices $P(s, t)$, and parallel Metropolis-Hastings simulated annealing replicas directly in GPU workgroup SRAM (Apple Metal, Vulkan, DX12, WebGPU), with a deterministic multi-threaded `f64` CPU engine (`--engine cpu`).
-  - Empirical BMRB priors trained on 36 curated public BMRB depositions (`data/priors/bmrb_priors.json`) and benchmarked across a 12-protein suite spanning $\alpha$, $\beta$, $\alpha/\beta$, and intrinsically disordered proteins (`data/benchmark/manifest.tsv`).
-- **Classical & 2D/3D Neural CNN Peak Picking (`--method classical|neural`)**:
-  - Reads Bruker `pdata` (`2rr`/`3rrr`) and NMRPipe `.ft2`/`.ft3` spectra with full `ppm` referencing.
-  - Clean-room 2D & 3D separable dilated residual CNN (`nmr-core::neural_picker` + `nmr-gpu::neural_gpu` WGSL compute shaders with $< 10^{-4}$ GPU/CPU parity) with Haar-wavelet noise normalization, indirect $t_1/t_2$ ridge suppression, $3\times 3\times 3$ non-maximum suppression, and sub-voxel offset regression.
-- **Aliphatic & Aromatic Sidechain Assignment (`nmrassign sidechain`)**:
-  - Complete IUPAC / PDB CCD covalent atom & TOCSY spin-coupling topology for all 20 standard amino acids (`nmr-core::topology`).
-  - Simulates, picks, and jointly optimizes `C13HSQC`, `HCCHTOCSY`, `CCCONH`, `HCCCONH`, and aromatic experiments (`solve_joint_backbone_sidechain`), resolving pre-proline and double-proline spin systems.
-- **Dihedral Prediction, Iterative NOESY ADR & Torsion-Angle 3D Folding (`nmrassign structure`)**:
-  - Predicts $(\phi, \psi)$ torsion restraints and secondary structure from chemical shifts (`nmr-core::dihedrals`).
-  - 7-cycle ARIA/CANDID-style $r^{-6}$ ambiguous distance restraint (`ADR`) calibration & network-anchoring filter (`nmr-core::noesy`) coupled to an analytical-gradient NeRF torsion-angle simulated annealing folder, Kabsch RMSD superposer, and Ramachandran validator (`nmr-core::structure`).
-- **CCPN NEF v1.1, HTML+SVG Quality Reports & Self-Hosted Service (`nef-*`, `report`, `pipeline`, `serve`)**:
-  - Lossless `NEF v1.1` import/export across `nef_molecular_system`, `nef_chemical_shift_list`, `nef_nmr_spectrum` (including signed `HNCACB` $-\text{C}^\beta$ & `3D NOESY`), and ambiguous OR distance/dihedral restraint lists.
-  - Dependency-free single-file `HTML + inline SVG` executive reports and a zero-dependency HTTP REST job server + drag-and-drop browser dashboard (`nmrassign serve`).
-- **Integrated Octet Chemical Draw, Reaction & 1D NMR Studio (`octet_*` + `nmrassign chem`)**:
-  - Full 2D chemical structure & reaction sketcher (`🧬 Protein NMR & 3D Strips` | `⚗️ Octet Chemical Draw & 1D NMR` mode switcher in `nmr-gui` on both desktop and `wasm32-unknown-unknown`).
-  - Supports `ChemDraw CDXML`, binary `CDX` (`VjCD0100`), `.oct`, `MOL V2000/V3000`, `SDF`, `SMILES`, Reaction SMILES, `InChI` / `InChIKey`, `JCAMP-DX`, `SVG`, `PDF 1.4`, and antialiased `PNG`.
-  - Includes Clean 2D layout, CIP `(R)/(S)` & `(E)/(Z)` stereoperception, 50+ rings/amino-acids/organometallics/clipware templates, reaction stoichiometry calculator, offline bidirectional `IUPAC Name ↔ Structure`, 1-click polypeptide import from the loaded NMR protein, and live 6-sphere HOSE + additivity $^{1}\text{H}$ / $^{13}\text{C}$ 1D NMR multiplet simulation with interactive peak-to-atom highlighting.
+| Macromolecular Assignment & 3D Walk | Dynamics, 1D/qNMR, DOSY, Metabolomics, Exchange & Small Molecules |
+| :---: | :---: |
+| ![2D 1H-15N HSQC contour overlay](docs/assets/01_hsqc_contour_overlay.svg)<br>**1. 2D `1H-15N` HSQC Contours & `evo-graph` Roots** — Positive/aliased-negative marching-squares contours, F1/F2 skylines, and assigned Ubiquitin spin systems. | ![3D HNCACB sequential strip walk](docs/assets/02_sequential_strip_walk.svg)<br>**2. 3D `HNCACB` Sequential Strip Walk (`Phe4 -> Gly10`)** — Intra-residue `i` and sequential `i-1` `CA`/`CB` slices with `Thr7` `CB > CA` phase inversion and `Gly10` `CB` null. |
+| ![Ubiquitin 1UBQ Lipari-Szabo S2 putty](docs/assets/03_pdb_s2_dynamics_putty.svg)<br>**3. `1UBQ` Lipari–Szabo `S^2` Putty & NOEs** — Dual-field `M1–M5` Model-Free order-parameter ribbon (`Gly76` flexible tail + `Ile23` `R_ex`) and long-range NOE restraints *(synthetic showcase)*. | ![1D multiplet J-tree, stack & qNMR](docs/assets/04_nmr1d_multiplet_stack.svg)<br>**4. Analytical 1D `J`-Tree, Kinetics Stack & `qNMR`** — Recursive Hoye `ddd` splitting tree, 5-timepoint arrayed stack, and GUM internal-standard purity *(synthetic showcase)*. |
+| ![2D DOSY diffusion map](docs/assets/05_dosy_2d_diffusion_map.svg)<br>**5. Pseudo-2D `DOSY` Diffusion Map (`BPP-LED`)** — Discrete `K = 1..2` Stejskal–Tanner `BIC` mixture separation (`Maleate`, `Raffinose`, `Lysozyme`) and Stokes–Einstein `MW` *(synthetic showcase)*. | ![1D metabolomics PCA, OPLS-DA & STOCSY](docs/assets/06_metabolomics_oplsda_stocsy.svg)<br>**6. 1D Metabolomics (`PCA`, `OPLS-DA` & `STOCSY`)** — Adaptive intelligent bucketing, `95%` Hotelling `T^2` ellipse, Wiklund S-plot, and `L-Lactate` driver trace *(synthetic showcase)*. |
+| ![CEST, CPMG & CSP exchange kinetics](docs/assets/07_cest_cpmg_csp_exchange.svg)<br>**7. Chemical Exchange (`CEST`, `CPMG` & `CSP` `Kd`)** — Higham `[6/6]` Padé 2-state `CEST` dip, dual-field Baldwin `CPMG` dispersion, and quadratic tight-binding `Kd` *(synthetic showcase)*. | ![Octet 2D structure & shift link](docs/assets/08_octet_structure_link.svg)<br>**8. `Octet` 2D Skeletal Depiction & `1H`/`13C` Link** — ACS-styled `(S)`-Ibuprofen depiction with CIP stereochemical perception and HOSE/additivity `1H`/`13C` shift table. |
 
----
+## 30-Second Quickstart
 
-## Supported Protein NMR Experiments
+Requires a stable Rust toolchain (`rustup`, Rust 1.80+) and a Vulkan, Metal, or DX12 GPU (falls back cleanly to multi-threaded `rayon` CPU `f64` everywhere).
 
-| Category | Experiments | Observed Nuclei |
-| :--- | :--- | :--- |
-| **Backbone 2D / 3D** | `HSQC`, `HNCA`, `HNCOCA`, `HNCACB` ($+\text{C}^\alpha / -\text{C}^\beta$), `CBCACONH`, `HNCO`, `HNCACO` | $^{1}\text{H}^{\text{N}}, {}^{15}\text{N}, {}^{13}\text{C}^\alpha, {}^{13}\text{C}^\beta, {}^{13}\text{C}'$ |
-| **Sidechain 2D / 3D** | `C13HSQC`, `HCCHTOCSY`, `CCCONH`, `HCCCONH`, `HBHACONH`, `AROMHSQC` | Aliphatic & aromatic $^{1}\text{H}$ / $^{13}\text{C}$ |
-| **Through-Space NOE** | `NOESY15N`, `NOESY13C` | 3D $^{15}\text{N}$- / $^{13}\text{C}$-edited $^{1}\text{H}$–$^{1}\text{H}$ NOEs |
-
----
-
-## Quick Start & CLI Reference (`nmrassign`)
-
-Requires **Rust 1.85+** (`cargo`). Automatically uses **Metal** on macOS, **Vulkan / DX12** on Linux & Windows, **WebGPU** in browsers (`wasm32-unknown-unknown`), or multi-threaded CPU (`--engine cpu`).
+### 1. Interactive Desktop Workbench (`nmr-gui`)
 
 ```bash
-# 1. Launch the dual-mode interactive WebGPU GUI (Protein 2D/3D NMR + Octet Chemical Studio)
 cargo run --release -p nmr-gui
+```
 
-# 2. Realistic Bruker 5-seed physics benchmark & 12-protein BMRB suite
-cargo run --release -p nmr-cli -- benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5 --engine gpu -v
-cargo run --release -p nmr-cli -- benchmark-suite --manifest data/benchmark/manifest.tsv --engine gpu
+Drag and drop any Bruker experiment directory (`ser`/`fid` or `pdata/1`), NMRPipe file, `.ucsf` spectrum, `.jdx`, NMR-STAR `.str`, or NMR Exchange Format (`.nef`) project onto the canvas—or try the zero-install [**WebGPU Browser Demo**](docs/demo/) (`trunk serve` in `crates/nmr-gui/`).
 
-# 3. End-to-end blind volumetric spectra -> neural 3D CNN peak picking -> assignment benchmark
-cargo run --release -p nmr-cli -- e2e-benchmark --star data/fixtures/synthetic_ubiquitin.str
+### 2. Automated Command-Line Workflows (`nmrassign`)
 
-# 4. Pick 2D/3D spectra with the classical or WebGPU neural 3D CNN picker
-cargo run --release -p nmr-cli -- pick \
-  --hsqc path/to/bruker/10/pdata/1 \
-  --triple HNCACB=path/to/hncacb.ft3 \
-  --out peaks.tsv --method neural --engine gpu
-
-# 5. Joint backbone + sidechain assignment (C13-HSQC + HCCH-TOCSY + (H)CC(CO)NH)
-cargo run --release -p nmr-cli -- sidechain --star data/benchmark/bmr17769.str --out ubq_all_atom.str
-
-# 6. Chemical-shift (phi, psi) dihedrals + iterative NOESY ADR + 3D torsion-angle ensemble folding
-cargo run --release -p nmr-cli -- structure \
-  --star data/benchmark/bmr15536.str \
-  --pdb-ref data/pdb_refs/1enh.pdb \
-  --out-pdb 1enh_ensemble.pdb --conformers 10
-
-# 7. CCPN NEF v1.1 interchange, HTML+SVG quality reports, one-command pipeline & HTTP job service
-cargo run --release -p nmr-cli -- nef-export --star data/fixtures/synthetic_ubiquitin.str --out ubq.nef
-cargo run --release -p nmr-cli -- nef-import --in ubq.nef --out-star roundtrip.str
-cargo run --release -p nmr-cli -- report --star data/fixtures/synthetic_ubiquitin.str --out report.html
-cargo run --release -p nmr-cli -- pipeline --star data/fixtures/synthetic_ubiquitin.str --out-dir ./out_ubq
-
-#    Real 2D/3D spectra (Bruker pdata/1, NMRPipe .ft2/.ft3, or Sparky .ucsf) -> pipeline & score:
+```bash
+# End-to-end raw-FID processing -> peak picking -> evo-graph assignment -> NEF v1.1 + HTML QC report
 cargo run --release -p nmr-cli -- pipeline \
-  --seq path/to/1ubq.fasta.txt \
-  --hsqc path/to/HSQC.ucsf \
-  --triple HNCACB=path/to/HNCACB.ucsf \
-  --triple CBCACONH=path/to/CBCACONH.ucsf \
-  --triple HNCO=path/to/HNCO.ucsf \
-  --triple HNCACO=path/to/HNCACO.ucsf \
-  --solver evo-graph \
-  --out-dir ./out_assigned
-cargo run --release -p nmr-cli -- score \
-  --pred ./out_assigned/shifts.str \
-  --truth path/to/reference_shifts.str -v
+  --seq ubiquitin.fasta --fid-hsqc ./10_hsqc --fid-triple HNCACB=./20_hncacb \
+  --fid-triple CBCACONH=./21_cbcaconh --out-dir ./ubq_out --engine auto
 
-cargo run --release -p nmr-cli -- serve --bind 127.0.0.1:8080 --storage ./jobs
+# Analytical 1D processing, multiplet J-tree extraction, pseudo-2D DOSY, and 1D metabolomics demos
+cargo run --release -p nmr-cli -- nmr1d process --in ./1d_fid --out proc_1d.tsv --auto-phase
+cargo run --release -p nmr-cli -- dosy fit --demo --criterion bic -o dosy_fit.json
+cargo run --release -p nmr-cli -- metabolomics oplsda --demo -o metab_study.json
 
-# 8. Octet-Draw CLI: IUPAC Name <-> Structure, InChIKey, CDXML/CDX/MOL/SVG/PDF/JCAMP-DX & 1D NMR
-cargo run --release -p nmr-cli -- chem info --name "2-[4-(2-methylpropyl)phenyl]propanoic acid" --out ibuprofen.svg
-cargo run --release -p nmr-cli -- chem info --smiles "CC(=O)Oc1ccccc1C(=O)O" --out aspirin.cdxml
-
-# 9. Verify browser WebAssembly + WebGPU target & run the full workspace test suite
-cargo check --release -p nmr-gui --target wasm32-unknown-unknown
-cargo test --release --workspace
+# Deterministically regenerate all 8 publication SVG figures in docs/assets/
+cargo run --release -p nmr-cli -- export-fig --out-dir docs/assets --panel all
 ```
 
----
+### 3. AI Assistant Copilot (`MCP` JSON-RPC 2.0 Server)
 
-## Representative Benchmarks
+Expose read-only or workspace-sandboxed NMR tools (`inspect`, `process`, `pick`, `assign`, `relax`, `cest`, `cpmg`, `csp`, `nmr1d`, `dosy`, `metabolomics`, and live GUI loopback sync with 256-step undo) to AI coding/research clients:
 
-- **Sparse Real Bruker Spectra — Development Benchmark `CISD3` (`BMRB 51439`, 700.13 MHz, 93 aa, missing `HNCACB`, 51 deposited amides / 38 picked roots, 5-seed mean)**:
-  - **`--solver standard --engine gpu`**: **43.9%** accuracy, **31.0%** recall of deposited amides, **100.0%** high-confidence ($\ge 0.80$) precision (**5.1%** HC recall).
-  - **`--solver evo-graph` (sequence-only)**: **59.4%** accuracy (**65.7%** on 3/5 seeds), **40.8%** recall of deposited amides, **95.5%** high-confidence ($\ge 0.80$) precision (**16.5%** HC recall) in `0.31 s`. (`CISD3` now counts as a development dataset because solver retention and confidence calibration inspected it; the next untouched real protein is the true cold test.)
-- **Realistic Bruker Physics Gate (`nmrassign benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5`, TMS $-2.75\text{ ppm}$ $^{13}\text{C}$ offset, $t_1$ ridges, water bleaching, broadening & minor-form satellites)**:
-  - **`--solver standard`**: **85.4%** accuracy / **67.6%** recall / **93.2%** HC precision on CPU (`0.31 s`), and **83.0%** accuracy / **64.7%** recall / **96.6%** HC precision on WebGPU.
-  - **`--solver evo-graph`**: **98.1%** accuracy, **90.8%** recall, **98.4%** HC precision (`306/311`) in `0.74 s`.
-- **Complete 5-Spectrum 500 MHz Human Ubiquitin (Best-Case Globular Protein, `.ucsf` & Bruker `pdata`)**:
-  - **95.7%–97.1%** accuracy, **94.3%–95.7%** recall, and **97.0%–98.3%** high-confidence ($\ge 0.80$) precision on `HSQC.ucsf` + `HNCACB.ucsf` + `CBCACONH.ucsf` + `HNCO.ucsf` + `HNCACO.ucsf` (**95.2%** 5-seed mean accuracy / **98.0%** HC precision directly from `24,562` raw Bruker `pdata` classical peaks across two batches recorded 2.8 months apart on `2009-09-03` and `2009-11-25/27`).
-- **12-Protein Public BMRB Peak-List Suite (`data/benchmark/manifest.tsv`, 55–148 aa across $\alpha$, $\beta$, $\alpha/\beta$, and 140-aa IDP $\alpha$-synuclein)**:
-  - **98.9%–99.4%** mean high-confidence ($\ge 0.80$) precision and **86.1%–88.1%** overall mean accuracy.
-- **3D Neural Peak Picker (`nmrassign e2e-benchmark`) & De Novo Structure Folding (`nmrassign structure`)**:
-  - Matches WebGPU `conv3d.wgsl` logits within `< 1e-4` and folds `1ENH` (61 aa) and `1D3Z` (76 aa) from shifts + simulated 3D NOESY peaks to **< 3.0 Å** ordered backbone RMSD.
+```bash
+# Emit ready-to-paste client configuration JSON (antigravity, claude-desktop, cursor, generic)
+nmrassign mcp-config --client antigravity --root ./ubq_out --mode read-only
 
----
-
-## Workspace Architecture
-
-```text
-crates/
-  nmr-core/     f64 reference library: NMR-STAR/NEF/TSV I/O, Bruker pdata & NMRPipe readers,
-                classical & separable-CNN 2D/3D peak pickers, BMRB priors, spin-system builder,
-                LLR + intensity-aware solver, CCD topology & joint sidechain solver, CSI dihedrals,
-                iterative r^-6 NOESY ADR & torsion-angle folder, HTML/SVG reports, HTTP job server,
-                and Octet-Draw (octet_mol, octet_analyt, octet_render)
-  nmr-gpu/      Headless & shared-device WebGPU (wgpu + WGSL) compute engine for U/P scoring
-                matrices, workgroup-SRAM multi-replica annealing, and 3D CNN peak inference
-  nmr-gui/      Dual-mode eframe/egui + wgpu desktop & WebAssembly workbench:
-                  1) Protein NMR 2D GPU contour viewer, sequence ribbon & 3D sequential walk strips
-                  2) Octet Chemical Draw, Reaction, Stoichiometry & Live 1D NMR Studio
-  nmr-cli/      `nmrassign` CLI (benchmark, benchmark-suite, e2e-benchmark, assign, simulate,
-                pick, priors, sidechain, structure, nef-import, nef-export, report, pipeline,
-                serve, chem)
-docs/specs/     Module specifications & scoring equations (00-architecture.md .. 08-service.md)
-data/           BMRB priors (data/priors/), 12-protein benchmark set (data/benchmark/),
-                PDB validation references (data/pdb_refs/), and synthetic fixtures (data/fixtures/)
+# Launch sandboxed stdio MCP server directly (default --mode read-only forbids disk writes)
+nmrassign mcp --transport stdio --root ./ubq_out --mode read-only
 ```
 
----
+## Benchmark & Scientific Validation Summary
 
-## Authors & Attribution
+All macromolecular assignment solvers (`evo-graph` default, `standard` parallel-tempering SA, and opt-in `bayes-sa` Joint Bayesian Factor-Graph RJ-MCMC) are regression-gated across 5 deterministic seeds (`0..4`; `HC-Prec` = precision among assignments with calibrated confidence `>= 0.80`):
 
-- **Authors**: **Debashish Sahu** (`<debashish.sahu@gmail.com>`) and **Antigravity** (`<noreply@google.com>`).
-- **Octet-Draw Attribution**: The `octet_mol`, `octet_analyt`, `octet_render`, and `octet_canvas` chemical structure, nomenclature, analytical 1D NMR/MS, and publication rendering suite is ported and adapted from [**Octet-Draw**](https://github.com/SamChemMan/Octet-Draw) by **Sam Ellis** (Copyright (c) 2026 Sam Ellis, licensed under **Apache-2.0**).
-- **Open Scientific Data**: Empirical priors and benchmark fixtures are derived from public-domain **CC0 1.0** depositions in the [BMRB](https://bmrb.io/) (`data/priors/PROVENANCE.md`) and [wwPDB](https://www.wwpdb.org/) ([`.licenses/pdb_database_LICENSE.txt`](.licenses/pdb_database_LICENSE.txt)).
+| Dataset & Regime | `evo-graph` (`CPU f64`) | `standard` (`CPU f64`) | `standard` (`WebGPU f32`) | `bayes-sa` (`CPU f64` / `WebGPU f32`, opt-in) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Ubiquitin `--realistic`** (`5`-exp Bruker physics, `5` seeds) | **98.4% acc** / 90.8% rec<br>**98.4%** (`310/315`) HC-prec | **90.0% acc** / 72.5% rec<br>**97.1%** (`170/175`) HC-prec | **88.4% acc** / 70.2% rec<br>**95.8%** (`181/189`) HC-prec | **97.1% / 96.7% acc**, 86.1% / 85.3% rec<br>**99.3%** (`268/270`) / **99.2%** (`263/265`) HC-prec |
+| **`CISD3` (`BMRB 51439`)** (`900 MHz` raw Bruker, missing `HNCACB`, dev target, `5` seeds) | **64.38% acc** / 40.39% rec<br>**100.00%** (`59/59`) HC-prec | **62.50% acc** / 39.22% rec<br>**92.86%** (`52/56`) HC-prec | **58.75% acc** / 36.86% rec<br>**96.61%** (`57/59`) HC-prec | **65.25% / 78.07% acc**, 40.94% / 47.06% rec<br>**86.25%** (`69/80`) / **100.00%** (`60/60`) HC-prec |
+| **Heldout `N=9` Real BMRB Raw-FID Cohort** (`5` seeds, `evo-graph`) | **79.1% macro** / **80.0% micro** (`2327/2907`) acc, **71.6%** macro rec, **95.6% macro** / **94.7% micro** (`1442/1522`) HC-prec | — | — | — |
+| **Unseen Cold BMRB Cohorts** (`cold_p12` `7/7`, `cold_p13` `5/7`, `seen_p13_w2` `5/7`) | `66.88%` macro-acc on `seen_p13_w2`; unseen cold micro HC-prec **88.25%–95.30%** | `63.28%` macro-acc on `seen_p13_w2`; unseen cold micro HC-prec **89.14%–94.14%** | `61.63%` macro-acc on `seen_p13_w2`; unseen cold micro HC-prec **88.58%–96.31%** | `79.08% / 80.56%` macro-acc on `seen_p13_w2`; unseen cold micro HC-prec **86.18% / 88.03%** |
 
-## Licence
+### Scientific Scope & Calibration Candor
 
-Released under the [MIT License](LICENSE). Full third-party crate, algorithm, and dataset provenance is documented in [`THIRD_PARTY.md`](THIRD_PARTY.md). See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`AGENTS.md`](AGENTS.md) for clean-room contribution rules.
+- **Backbone Confidence Calibration & Spent Cold Cohorts (`data/benchmark/real_manifest.tsv`, 40 BMRB entries)**: Isotonic/hierarchical confidence maps achieve `94.07%–95.62%` out-of-fold micro HC-precision (`pooled_ECE_10 = 0.0222–0.0369`) on the `26`-protein non-cold LOPO pool *(in-sample with respect to `min_bidir_aliphatic_frac` feature selection)*. Across three pre-registered single-shot unseen cold cohorts—the latest `cold_p13_w2` (`5/7` runnable raw-FID entries, relabeled **`seen_p13_w2`** in `real_manifest.tsv` immediately after unblinding so spent cohorts are never reused as unseen claims; `2` entries remain newly sealed)—empirical micro HC-precision at `confidence >= 0.80` spans **`86.18%–96.31%`**, so `>= 0.80` confidence should be interpreted as an empirical `~86%–96%` range rather than a guaranteed `>= 94%` floor on arbitrary unseen proteins.
+- **Torsion Angles & Residual Dipolar Couplings**: `nmrassign torsions` (`200`-entry BMRB/PDB database under `<= 25%` sequence-identity / `TM < 0.50` `HomologFirewall`) reaches `70.0%` `Good` (`541/773`) and `phi/psi` `CircMAE = 13.79°` (`3.70%` wrong basin; in-sample wrt hyperparameter tuning). On the cold single-medium RDC target `1KHM -> 1ZZK`, adding RDCs improves NOE-only backbone RMSD on `5/5` seeds (`1.862–4.141 Å` CPU / `2.390–3.988 Å` WebGPU `lowE`).
+- **Synthetic Forward-Model & Protocol Validation Status (Phases 13–15)**: Spin relaxation & chemical exchange (`R1`/`R2`/hetNOE, Lipari–Szabo `S^2`, `CEST`/`DEST`, `CPMG`/`R1rho`, `CSP` `Kd`) and analytical 1D (`Voigt` deconvolution, Hoye `J`-trees, `qNMR`), pseudo-2D `DOSY`, and 1D `Metabolomics` (`AIB`, `PQN`, `PCA`, `OPLS-DA`, `STOCSY`) modules are currently validated on **synthetic forward-model self-consistency benchmarks** (`0` real raw 1D `fid`s, certified `qNMR` CRMs, raw 2D `ser` DOSY datasets, real `MetaboLights` cohorts, or experimental relaxation/exchange datasets evaluated yet), and `MCP` copilot tools are currently validated via in-process/subprocess protocol self-consistency tests. Pre-registered real-dataset and live-client validation is tracked openly in [`TODO.md`](TODO.md) (`F10`, `F11`, `F13`, `F14`, `F16`, `F17`, `F18`).
+
+## Documentation, Specifications & Live Demo
+
+- **User Manual (`docs/manual/`)**: [Overview](docs/manual/index.md) · [01 Quickstart & Workflows](docs/manual/01-quickstart-and-workflows.md) · [02 Custom `pulprog` & DSP](docs/manual/02-custom-pulprog-and-dsp.md) · [03 Solvers & Calibration](docs/manual/03-solvers-and-calibration.md) · [04 Dynamics & Exchange](docs/manual/04-dynamics-and-exchange.md) · [05 1D Multiplets, `qNMR` & `DOSY`](docs/manual/05-nmr1d-multiplets-and-dosy.md) · [06 `MCP` & CLI Reference](docs/manual/06-mcp-and-cli-reference.md) · [07 Clean-Room Provenance](docs/manual/07-clean-room-provenance.md) · [08 Metabolomics & Chemometrics](docs/manual/08-metabolomics-and-chemometrics.md)
+- **Technical Specifications & Interactive Demo**: [Architecture & Specs (`docs/specs/`)](docs/specs/) · [WebGPU Browser Demo (`docs/demo/`)](docs/demo/) · [Dataset Provenance (`data/benchmark/PROVENANCE.md`)](data/benchmark/PROVENANCE.md) · [Roadmap & Open Validation Gates (`TODO.md`)](TODO.md)
+
+## Clean-Room Provenance & Licence
+
+`nmr-assign` is a strict clean-room implementation derived exclusively from peer-reviewed literature and public standards (NMR-STAR v3, NEF v1.1, JCAMP-DX), with zero code, parameters, or macros from proprietary, academic-only, GPL, or AGPL NMR packages.
+
+Released under the **MIT Licence**, incorporating embedded `Octet-Draw` 2D chemical structure & analytical crates under **Apache-2.0** and public-domain (**CC0**) BMRB / wwPDB reference statistics and fixtures. Full dependency and data attribution is audited in [`THIRD_PARTY.md`](THIRD_PARTY.md) and [`data/benchmark/PROVENANCE.md`](data/benchmark/PROVENANCE.md).
