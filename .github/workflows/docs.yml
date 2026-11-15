@@ -8,8 +8,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -23,8 +21,6 @@ jobs:
   build:
     name: Build Static HTML Manual & wasm32 WebGPU Demo
     runs-on: ubuntu-latest
-    outputs:
-      pages_enabled: ${{ steps.configure_pages.outcome == 'success' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -56,13 +52,7 @@ jobs:
           name: nmrassign-manual-and-web-demo
           path: ${{ runner.temp }}/pages_site
 
-      - name: Configure GitHub Pages
-        id: configure_pages
-        continue-on-error: true
-        uses: actions/configure-pages@v5
-
       - name: Upload GitHub Pages artifact
-        if: steps.configure_pages.outcome == 'success'
         uses: actions/upload-pages-artifact@v3
         with:
           path: ${{ runner.temp }}/pages_site
@@ -70,12 +60,24 @@ jobs:
   deploy:
     name: Deploy to GitHub Pages
     needs: build
-    if: needs.build.outputs.pages_enabled == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Configure GitHub Pages
+        id: configure_pages
+        continue-on-error: true
+        uses: actions/configure-pages@v5
+
+      - name: Warn if GitHub Pages is not configured
+        if: steps.configure_pages.outcome != 'success'
+        run: echo "::warning::GitHub Pages is not enabled or configured for GitHub Actions; skipping live deployment (static bundle remains attached as workflow artifact nmrassign-manual-and-web-demo)."
+
       - name: Deploy artifact to GitHub Pages
+        if: steps.configure_pages.outcome == 'success'
         id: deployment
         uses: actions/deploy-pages@v4
