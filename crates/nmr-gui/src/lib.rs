@@ -18,5 +18,6 @@ pub mod mol3d_viewer;
 pub mod relax_panel;
 pub mod session_io;
 pub mod sidechain_widget;
+pub mod stack1d_panel;
 pub mod strip_tiler;
 pub mod workflow_bar;
