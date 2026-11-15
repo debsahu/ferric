@@ -1,6 +1,6 @@
 # Chapter 3: Backbone Solvers, Dataset QC & Honest Calibration
 
-`nmr-assign` provides three complementary, 100% clean-room backbone resonance assignment engines—**`standard`**, **`evo-graph`**, and the opt-in Bayesian statistical-mechanics solver **`bayes-sa`**—backed by unified dataset quality control (`nmr-core::qc`) and isotonic confidence calibration. Every solver outputs shifts strictly in the experimental spectrum's ppm frame and obeys the **sequence-only invariant** (zero 3D coordinates or homolog templates used during sequence-based backbone assignment).
+`nmr-assign` provides three complementary, 100% clean-room backbone resonance assignment engines—**`standard`**, **`evo-graph`**, and the opt-in experimental Bayesian statistical-mechanics solver **`bayes-sa`**—backed by unified dataset quality control (`nmr-core::qc`) and isotonic confidence calibration. Every solver outputs shifts strictly in the experimental spectrum's ppm frame and obeys the **sequence-only invariant** (zero 3D coordinates or homolog templates used during sequence-based backbone assignment).
 
 ---
 
@@ -47,7 +47,7 @@ Implemented in `crates/nmr-core/src/evo_graph.rs` (`docs/specs/10-evo-graph-solv
 
 ---
 
-## Solver 3: Opt-In `bayes-sa` (Bayesian Specific-Heat $C_v(T)$ SA)
+## Solver 3: Opt-In Experimental `bayes-sa` (Bayesian Specific-Heat $C_v(T)$ SA)
 
 ```bash
 # Opt-in Bayesian pseudo-energy + adaptive specific-heat SA on WebGPU or CPU
@@ -77,8 +77,8 @@ $$C_v(T_m) = \frac{\langle E^2 \rangle_{T_m} - \langle E \rangle_{T_m}^2}{T_m^2}
 
    Cooling automatically decelerates across the cooperative chain-nucleation phase transition at $T_{\text{crit}}$ where $C_v(T)$ peaks, and accelerates through high-$T$ disordered and low-$T$ frozen regimes (`480 aa` WebGPU benchmark completes in `3.55 s` with `< 4.6e-5` `Q27.36` fixed-point CPU/WebGPU energy parity).
 
-> [!WARNING] Why `bayes-sa` Remains Strictly Opt-In
-> While `bayes-sa` achieves outstanding speed and accuracy on large proteins (`480 aa`: `94.60%` acc / `97.40%` HCP in `3.55 s`), synthetic realistic Ubiquitin (`97.1%` CPU / `96.7%` GPU acc, `> 99%` HCP), and 26-fold non-cold LOPO (`pooled_ECE_10 = 0.0323` CPU / `0.0369` GPU), on the single-shot unseen `cold_p13_w2` cohort it exhibited higher high-confidence overconfidence (`86.18%` CPU / `88.03%` GPU micro-HCP) than `evo-graph` and `standard`. Consequently, `evo-graph` / `standard` remain the defaults, and `--solver bayes-sa` is provided as an explicit opt-in solver.
+> [!WARNING] Why `bayes-sa` Remains Opt-In Experimental
+> While `bayes-sa` achieves outstanding speed and accuracy on large proteins (`480 aa`: `94.60%` acc / `97.40%` HCP in `3.55 s`), synthetic realistic Ubiquitin (`97.1%` CPU / `96.7%` GPU acc, `> 99%` HCP), and 26-fold non-cold LOPO (`pooled_ECE_10 = 0.0323` CPU / `0.0369` GPU), on the single-shot unseen `cold_p13_w2` cohort (subsequently relabeled `seen_p13_w2` in `real_manifest.tsv`) it exhibited higher high-confidence overconfidence (`86.18%` CPU / `88.03%` GPU micro-HCP) than `evo-graph` and `standard`. Consequently, `evo-graph` / `standard` remain the defaults, and `--solver bayes-sa` is provided strictly as an **opt-in experimental** solver (`F12`).
 
 ---
 

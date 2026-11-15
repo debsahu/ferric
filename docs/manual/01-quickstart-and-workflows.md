@@ -48,6 +48,7 @@ Launch `nmr-gui` (`cargo run --release -p nmr-gui`) and drag a spectrometer fold
 1. **Experiment Selection Matrix (`nmr-gui::ingest_panel`)**: Displays every discovered dataset with auto-detected experiment role, observed nuclei (`1H`, `15N`, `13C`, `19F`, `31P`), field strength (`MHz`), quadrature/NUS badge, editable role dropdowns, include/exclude checkboxes, and a 1-click **Process, Pick & Run** button.
 2. **6-Stage *"What Next?"* Workflow Stepper (`nmr-gui::workflow_bar`)**: Tracks readiness across **1. Ingest → 2. Process FIDs → 3. Pick Peaks → 4. Assign Spins → 5. Fold / Dynamics → 6. Export & Report**, highlighting missing inputs or `DatasetQcReport` warnings alongside a single contextual action button.
 3. **Fuzzy Command Palette & Two-Key Chords**: Press **`Cmd/Ctrl+K`** to fuzzy-search every workbench operation, or use fast two-letter spectrum chords (`vt`, `ct`, `cb`, `pa`, `pd`, `pc`, `st`, `at`, `oz`, `Space`, `?` — full table in [Chapter 6](06-mcp-and-cli-reference.md#interactive-workbench-keyboard-shortcuts)). Every edit is recorded on a `256`-step Undo/Redo ring buffer (**`Cmd/Ctrl+Z`**).
+4. **Zero-I/O Built-in Multi-Modal Demo Suite (`🚀 Load Built-in Demo Suite`)**: On both native desktop and `wasm32-unknown-unknown` browser builds (`nmr_gui::demo_preset`), clicking **`🚀 Load Built-in Demo Suite`** in the top toolbar populates synthetic Ubiquitin `2D HSQC` + `3D HNCACB`/`HNCO` strips + `1UBQ` 3D coordinates + 4-mode 1D multiplet stack + `DOSY` decay series + 24-sample 2-group `Metabolomics` cohort purely in memory with zero filesystem I/O.
 
 ---
 
@@ -118,6 +119,7 @@ nmrassign structure \
 > - **Backbone assignment is strictly sequence-only**: neither `torsion_db` nor 3D PDB coordinates are ever consulted during `nmrassign assign` unless a user explicitly invokes structure-based `methyl` or `paramagnetic` `PCS` fitting.
 > - **Histidine tautomer & metal safety (`nmr-core::aromatic`)**: `His` tautomer states (`Nδ1-H`, `Nε2-H`, imidazolium) require at least one `15N` observation for `Resolved` status and abstain cleanly (`FastExchangeUncommitted` or `MetalCoordinatedCandidate`) under $\chi^2_{0.95}$ residual gates, preventing false tautomer calls on Zn-coordinated histidines.
 > - **Stereospecific prochiral commitment (`nmr-core::stereospec`)**: `HB2`/`HB3`, `HG1`/`HG2`, and `HD1`/`HD2` receive `Ambiguity_code = 1` **only** when the Student-$t(\nu=4)$ `3J` + local-NOE + tempered Lovell rotamer posterior reaches $\ge 0.90$; dynamic surface sidechains default safely to `Ambiguity_code = 2`.
+- **`RDC` & 3D folding validation scope**: `Ubiquitin` (`1D3Z`/`1UBQ`) and `GB1` (`2JSV`/`1PGB`) served as development folding targets; on the pre-registered single-shot unseen `1KHM` (`KH3` domain, `BMRB 4969` vs X-ray `1ZZK`) benchmark, multi-medium `RDC` refinement improved held-out $Q_{\text{free}}$ (`0.958 -> 0.506`) while overall backbone `CA` RMSD was `3.89 Å` under synthetic NOESY distance restraints (real deposited experimental NOESY peak-list validation is tracked openly under follow-up `F8`).
 
 ---
 
@@ -235,7 +237,7 @@ nmrassign assign \
 
 ## Small-Molecule & Mixture Workflows: 1D NMR, `Octet` & `DOSY`
 
-For synthetic organic chemistry, natural products, pharmaceutical quality control (`qNMR`), reaction monitoring, and unseparated multi-component mixtures, `nmr-assign` combines the **`Octet` 2D Chemical Studio** with the **Analytical 1D & Pseudo-2D `DOSY` Workbench** (detailed in [Chapter 5](05-nmr1d-multiplets-and-dosy.md)):
+For synthetic organic chemistry, natural products, pharmaceutical quality control (`qNMR`), reaction monitoring, unseparated multi-component mixtures, and untargeted biofluid cohorts, `nmr-assign` combines the **`Octet` 2D Chemical Studio** with the **Analytical 1D, `DOSY` & Metabolomics Studios** (detailed in [Chapter 5](05-nmr1d-multiplets-and-dosy.md) and [Chapter 8](08-metabolomics-and-chemometrics.md)):
 
 1. **Sketch or Import a 2D Molecule (`nmrassign chem` / `⚗️ Octet Chemical Draw`)**:
    ```bash
@@ -243,8 +245,9 @@ For synthetic organic chemistry, natural products, pharmaceutical quality contro
    nmrassign chem --smiles "CC(=O)Oc1ccccc1C(=O)O" --solvent CDCl3 --mhz 600 --out aspirin.svg
    nmrassign chem info --name "2-acetoxybenzoic acid" --solvent CDCl3 --mhz 600
    ```
-2. **Process & Deconvolve Experimental 1D Spectra (`1H`, `13C{1H}`, `DEPT-90/135`, `19F`, `31P`)**:
+2. **Process & Deconvolve Experimental 1D Spectra (`nmrassign nmr1d {process, multiplet, qnmr}`)**:
    - Automatic Moskau digital-filter group-delay compensation, Chen (2002) minimum-entropy autophasing, Whittaker/Bernstein baseline flattening, optional `HSVD` water pole subtraction, Fulmer (2010) residual solvent/impurity referencing, global pseudo-Voigt multiplet deconvolution, recursive Hoye `J`-tree extraction (`s`, `d`, `t`, `q`, `dd`, `ddd`, `dt`, `td`, AB quartet roofing), and lossless `ACS` / `JOC` / `RSC` / `Nature` experimental paragraph generation.
-3. **Determine Certified Molar Purity (`qNMR`) & Mixture Diffusivities (`DOSY`)**:
-   - Compute internal-standard `qNMR` mass-fraction purity `% w/w` with GUM expanded uncertainty $U_{k=2}$ against NIST/USP primary standards (`DMSO2`, Maleic acid, `TMB`, `DMT`) with automatic $d_1 < 5 T_1$ saturation warnings.
-   - Separate mixture components in situ via Bruker `difflist` (`STE` / `BPP-LED`) or Varian `gzlvl1` pseudo-2D `DOSY` using `BIC`-selected discrete 1–3 component Stejskal–Tanner fitting on CPU/WebGPU, Stokes–Einstein $R_h$/`MW` estimation, and 4-mode multi-spectrum kinetics/difference stacks.
+3. **Determine Certified Molar Purity (`qNMR`), Mixture Diffusivities (`DOSY`) & Cohort Biomarkers (`metabolomics`)**:
+   - Compute internal-standard `qNMR` mass-fraction purity `% w/w` (`nmrassign nmr1d qnmr`) with GUM expanded uncertainty $U_{k=2}$ against NIST/USP primary standards (`DMSO2`, Maleic acid, `TMB`, `DMT`) with automatic $d_1 < 5 T_1$ saturation warnings.
+   - Separate mixture components in situ via Bruker `difflist` (`STE` / `BPP-LED`) or Varian `gzlvl1` pseudo-2D `DOSY` (`nmrassign dosy fit`, `dosy ilt`, `dosy mw`) using `BIC`-selected discrete 1–3 component Stejskal–Tanner fitting on CPU/WebGPU, Stokes–Einstein $R_h$/`MW` estimation, and 4-mode multi-spectrum kinetics/difference stacks.
+   - Run untargeted 1D cohort bucketing (`AI-Binning`), `PQN` dilution normalization, `PCA` Hotelling $T^2$/$Q$ outlier screening, leak-free stratified `k`-fold `OPLS-DA`, and `STOCSY` spin-system correlation (`nmrassign metabolomics {bin, pca, oplsda, stocsy}`).

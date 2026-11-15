@@ -118,6 +118,7 @@ use nmr_gui::{
         default_overlay_palette, ContourPipelineResource, MultiContourCallback, OverlayLayerSpec,
         SyncCrosshair,
     },
+    demo_preset::{build_builtin_demo_suite, BUILTIN_DEMO_SUITE_SEED},
     dosy_panel::{render_dosy_panel, DosyPanelAction, DosyPanelState},
     dynamics_panel::{DynamicsStudioOutput, DynamicsStudioPanel, DynamicsStudioTab},
     ingest_panel::{IngestAction, IngestDropOutcome, IngestExecutionPlan, IngestPanelState},
@@ -1896,6 +1897,9 @@ impl NmrWorkbenchApp {
             pending_drop_outcome: Arc::new(std::sync::Mutex::new(None)),
         };
 
+        #[cfg(target_arch = "wasm32")]
+        app.load_builtin_demo_suite();
+        #[cfg(not(target_arch = "wasm32"))]
         app.load_demo_and_solve();
         app
     }
@@ -2360,6 +2364,72 @@ impl NmrWorkbenchApp {
         self.loaded_pdb_text = Some(DEMO_UBIQUITIN_1UBQ_PDB.to_string());
         self.has_structure_or_dynamics = true;
         self.run_assignment();
+    }
+
+    fn load_builtin_demo_suite(&mut self) {
+        let seed = BUILTIN_DEMO_SUITE_SEED.wrapping_add(self.sim_seed);
+        match build_builtin_demo_suite(seed) {
+            Ok(suite) => {
+                let banner = suite.status_summary();
+                let ref_data = suite.ubiquitin_ref;
+                self.sequence = ref_data.sequence.clone();
+                self.seq_ids = ref_data.seq_ids.clone();
+                self.octet_app
+                    .set_loaded_protein_sequence(self.sequence.clone());
+                let saved_ph = self.sidechain_ribbon_state.sample_ph;
+                self.sidechain_ribbon_state = SequenceRibbonState::new();
+                self.sidechain_ribbon_state.set_sample_ph(saved_ph);
+                self.sidechain_ribbon_state
+                    .sync_inferred_variants_from_reference(&ref_data);
+                self.reference = Some(ref_data);
+                self.c13_picked_dataset = None;
+                self.peaks = suite.peaks;
+                self.truth = Some(suite.truth);
+                self.assign_res = None;
+                self.pred_ref = None;
+                self.pred_conf.clear();
+                self.pred_ambiguity_codes.clear();
+                self.metrics = None;
+                self.qc_report = None;
+                self.raw_fids_total = 0;
+                self.unprocessed_fids_remaining = 0;
+                self.exported_in_session = false;
+
+                self.hsqc_arc = Arc::new(suite.hsqc_2d.data.clone());
+                self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+                self.hsqc_spec = Some(suite.hsqc_2d);
+                self.hncacb_3d = Some(suite.hncacb_3d);
+                self.hnco_3d = Some(suite.hnco_3d);
+                self.extra_3d_count = 0;
+                self.overlay_layers.clear();
+                self.primary_ppm_nudge = [0.0, 0.0];
+                self.reset_view_to_spec();
+
+                self.mol3d_panel = suite.mol3d_panel;
+                self.loaded_pdb_text = Some(suite.pdb_text.to_string());
+                self.stack1d_panel = suite.stack1d_panel;
+                self.dosy_panel = suite.dosy_panel;
+                self.metabolomics_panel = suite.metabolomics_panel;
+                let _ = self.relax_panel.load_demo_dynamics(
+                    &self.sequence,
+                    &self.seq_ids,
+                    Some(suite.pdb_text),
+                );
+                let _ = self
+                    .dynamics_panel
+                    .ensure_demo_exchange_and_csp(&self.sequence, &self.seq_ids);
+                self.has_structure_or_dynamics = true;
+
+                self.sync_session_from_app_fresh("Ubiquitin");
+                self.rebuild_systems_and_matrices();
+                self.refresh_propensity_report();
+                self.run_assignment();
+                self.status_msg = banner;
+            }
+            Err(err) => {
+                self.status_msg = format!("Built-in demo suite error: {err}");
+            }
+        }
     }
 
     fn load_from_reference(&mut self, ref_data: Reference) {
@@ -3937,6 +4007,16 @@ impl NmrWorkbenchApp {
                 WorkspaceMode::Metabolomics,
                 egui::RichText::new("🧪 Metabolomics & Biomarker Studio").strong(),
             );
+            ui.separator();
+            if ui
+                .button(egui::RichText::new("🚀 Load Built-in Demo Suite").strong())
+                .on_hover_text(
+                    "Populate Ubiquitin 2D HSQC + 3D HNCACB strips + 1UBQ 3D structure + 1D multiplet stack + 2D DOSY decays + 2-group Metabolomics cohort in memory (zero filesystem I/O)",
+                )
+                .clicked()
+            {
+                self.load_builtin_demo_suite();
+            }
 
             if self.workspace_mode == WorkspaceMode::OctetChem {
                 ui.separator();
@@ -7436,16 +7516,21 @@ fn main() {
     use wasm_bindgen::JsCast as _;
 
     wasm_bindgen_futures::spawn_local(async {
-        let document = web_sys::window()
-            .expect("no browser Window")
-            .document()
-            .expect("no browser Document");
+        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
 
-        let canvas = document
+        let Some(canvas) = document
             .get_element_by_id("nmr_canvas")
-            .expect("missing <canvas id=\"nmr_canvas\"> element")
-            .dyn_into::<web_sys::HtmlCanvasElement>()
-            .expect("nmr_canvas is not an HtmlCanvasElement");
+            .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+        else {
+            if let Some(loading) = document.get_element_by_id("nmr_loading") {
+                loading.set_inner_html(
+                    "<p style=\"color:#ff7b7b;max-width:520px;text-align:center\">Missing <code>&lt;canvas id=\"nmr_canvas\"&gt;</code> element in demo page.</p>",
+                );
+            }
+            return;
+        };
 
         let web_options = eframe::WebOptions::default();
         let start_result = eframe::WebRunner::new()

@@ -2,6 +2,9 @@
 
 Proteins are dynamic conformational ensembles whose biological catalysis, allostery, and ligand recognition span picoseconds to seconds. `nmr-assign` provides a complete clean-room CPU (`f64`) and WebGPU (`WGSL`) dynamics and chemical-exchange suite covering fast ps–ns bond-vector librations ($R_1$, $R_2$, hetNOE, Lipari–Szabo / Palmer `M1`–`M5` $S^2$), slow exchange with sparsely populated "invisible" excited states (`CEST` & `DEST`), $\mu\text{s–ms}$ conformational dispersion (`CPMG` & off-resonance $R_{1\rho}$), and fast-exchange ligand titration binding isotherms (`CSP` $K_d$).
 
+> [!IMPORTANT] Validation Scope (Synthetic Forward-Model Self-Consistency)
+> Quantitative accuracy and speed benchmarks reported in this chapter (`SNR = 4` locked-shape plane bias `< 1.5%`, `M1`–`M5` $S^2$ MAE `< 0.005` on synthetic axial/anisotropic tensors oriented against `1UBQ` $\text{N–H}$ bond vectors, dual-$B_1$ `CEST` $p_B$ recovery, dual-$B_0$ Baldwin `CPMG` dispersion, and quadratic `CSP` $K_d$ isotherms) are **synthetic forward-model self-consistency evaluations** (`T13.1`–`T13.5`). **`0` real deposited experimental relaxation (`BMRB` $R_1/R_2/\text{NOE}$ or raw `vdlist`/`vclist` `ser`), `CEST`, `CPMG`, or ligand `CSP` titration datasets have been evaluated end-to-end yet**; real experimental repository validation is tracked openly under follow-ups **`F10`**, **`F11`**, and **`F13`**.
+
 ---
 
 ## Timescale Map & Module Overview
@@ -10,7 +13,7 @@ Proteins are dynamic conformational ensembles whose biological catalysis, allost
 | :--- | :--- | :--- | :--- |
 | **ps – ns** (`10^-12`–`10^-8 s`) | $^{15}\text{N}$ $R_1$, $R_2$, steady-state $\{^1\text{H}\}\text{–}^{15}\text{N}$ hetNOE | `relax_io`, `relax_fit`, `modelfree`, `nmr-gpu::relax_gpu` | $R_1, R_2, \text{NOE}$, $J(0), J(\omega_N), J(0.87\omega_H)$, global $\tau_m$ / $\mathbf{D}$, $S^2, S_f^2, \tau_e, \tau_s, R_{\text{ex}}$ |
 | **ms – s** (`k_ex ~ 10–500 s^-1`) | $^{15}\text{N}$ / $^{13}\text{C}$ `CEST` & dark-state `DEST` | `cest`, `nmr-gpu::cest_gpu` | Minor population $p_B$ (`0.5–10%`), $k_{\text{ex}}$, excited-state shift $\Delta\varpi_{AB}$, $R_{2B}$ |
-| **$\mu\text{s}$ – ms** (`k_ex ~ 200–5,000 s^-1`) | Constant-time `CPMG` & off-resonance $R_{1\rho}$ | `cpmg`, `nmr-gpu::cpmg_gpu` | $p_B$, $k_{\text{ex}}$, $|\Delta\omega|$, intrinsic $R_2^0$ across dual static fields ($B_{0,1}, B_{0,2}$) |
+| **$\mu\text{s}$ – ms** (`k_ex ~ 200–5,000 s^-1`) | Constant-time `CPMG` & off-resonance $R_{1\rho}$ | `cpmg`, `nmr-gpu::cpmg_gpu` | $p_B$, $k_{\text{ex}}$, $\lvert\Delta\omega\rvert$, intrinsic $R_2^0$ across dual static fields ($B_{0,1}, B_{0,2}$) |
 | **Fast Equilibrium Binding** | 2D $^{1}\text{H}\text{–}^{15}\text{N}$ HSQC / $^{1}\text{H}\text{–}^{13}\text{C}$ HMQC titration | `csp`, `nmr-gui::dynamics_panel` | Per-residue $\Delta\delta_{\text{CSP}}$, binding-pocket callset, quadratic tight-binding $K_d$ |
 
 ---

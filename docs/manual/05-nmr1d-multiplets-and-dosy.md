@@ -2,6 +2,9 @@
 
 Beyond macromolecular multidimensional assignment, `nmr-assign` includes a complete clean-room analytical 1D NMR and diffusion studio (`nmr-core::nmr1d`, `multiplet`, `dosy`, `nmr-gpu::dosy_gpu`, `nmr-gui::stack1d_panel`, `dosy_panel`) tightly integrated with the **`Octet` 2D Chemical Structure Studio**.
 
+> [!IMPORTANT] Validation Scope (Synthetic Forward-Model Self-Consistency)
+> Quantitative accuracy numbers in this chapter (Voigt coalesced-shoulder deconvolution, roofed `AB`/`ABX` Hoye `J`-tree recovery, ISO GUM `qNMR` molar purity, and discrete `BIC` / Tikhonov `ILT` `DOSY` diffusivity recovery across `T14.1`–`T14.4`) are **synthetic forward-model self-consistency evaluations** (plus exact $2^N$ quantum spin-$1/2$ Hamiltonian cross-checks). **`0` real deposited raw small-molecule 1D `fid`s, wet-lab certified `qNMR` reference mixtures (`NIST`/`USP` CRMs), or experimental pseudo-2D `DOSY` `ser` datasets have been evaluated end-to-end yet**; external experimental repository validation is tracked openly under follow-ups **`F14`** and **`F16`**.
+
 ---
 
 ## Multi-Nuclear 1D Referencing & Global Voigt Deconvolution
@@ -79,7 +82,7 @@ The interactive **`📚 1D Stack & Kinetics`** panel (`nmr-gui::stack1d_panel`, 
 3. **Scaled Difference / Residual Trace**: Live subtraction $D_i(\delta) = S_i(\delta) - \alpha S_{\text{ref}}(\delta)$ highlighting subtle impurity appearance, `STD` saturation differences, or reaction intermediates.
 4. **Pseudo-2D Waterfall / Heatmap**: Color-mapped $(\delta \times \text{trace index / time})$ intensity matrix for large kinetic or titration arrays.
 
-Includes **`icoshift`-inspired regional FFT cross-correlation alignment** (Savorani et al. 2010) to remove small pH/temperature peak drift prior to difference or arrayed integral kinetics export (`TSV`, `SVG`, `PNG`).
+Includes **interval FFT cross-correlation peak alignment** (`align_traces_interval_fft`; Savorani, Tomasi & Engelsen 2010) to remove small pH/temperature peak drift prior to difference or arrayed integral kinetics export (`TSV`, `SVG`, `PNG`).
 
 ---
 
@@ -100,19 +103,19 @@ $$b(g) = \bigl(\gamma\, \sigma_{\text{shape}}\, g\, \delta\bigr)^2 \, \Delta_{\t
 
 ### Default Quantitative Fit: Discrete `BIC` VarPro + LM (`K = 1, 2, 3`)
 
-By default (`--fit discrete-bic`), `nmr-assign` fits discrete $K \in \{1, 2, 3\}$ multi-exponential decays via **Variable Projection + Kaufman projected Gauss–Newton + Levenberg–Marquardt** on CPU (`f64`) and massively parallel WebGPU compute shaders (`dosy.wgsl`, `< 0.5%` relative $D$ difference and `100%` `BIC` model-order parity vs CPU, chunked at `16,384` columns):
+By default (`nmrassign dosy fit --criterion bic`), `nmr-assign` fits discrete $K \in \{1, 2, 3\}$ multi-exponential decays via **Variable Projection + Kaufman projected Gauss–Newton + Levenberg–Marquardt** on CPU (`f64`) and massively parallel WebGPU compute shaders (`dosy.wgsl`, `< 0.5%` relative $D$ difference and exact `BIC` model-order parity vs CPU, chunked at `16,384` columns):
 
 $$\operatorname{BIC}(K) = M \ln\!\left(\frac{\text{RSS}_K}{M}\right) + 2K \ln M$$
 
-augmented by a Davies rate-grid look-elsewhere penalty, a $4\sigma$ component $\ell_2$-SNR resolution guard, and residual/parametric bootstrap `95%` confidence intervals $[D_{k,2.5\%}, D_{k,97.5\%}]$.
+augmented by a Davies rate-grid look-elsewhere penalty, a $4\sigma$ component $\ell_2$-SNR resolution guard, and residual/parametric bootstrap `95%` confidence intervals $[D_{k,2.5\%}, D_{k,97.5\%}]$ (resolving overlapped `K = 2` components down to $D_1 / D_2 = 1.30$ at per-component `SNR 56.3–68.8` mixed [`SNR = 40` pure], and recovering noiseless 32-point `K = 3` tri-exponential components to `9.73e-10%`).
 
 ### Opt-In Continuous Tikhonov `ILT` (`CONTIN`-Style) & Conditioning Caveats
 
-For polydisperse polymers or continuous size distributions, `solve_tikhonov_ilt` (`--fit contin-ilt`, Provencher 1982; Lawson & Hanson 1974 `NNLS`) solves the second-derivative Tikhonov-regularized non-negative inverse Laplace problem over a log-spaced diffusivity grid $\{D_q\}_{q=1}^Q$:
+For polydisperse polymers or continuous size distributions, `solve_tikhonov_ilt` (`nmrassign dosy ilt --strategy gcv|lcurve|discrepancy|fixed`, Provencher 1982; Lawson & Hanson 1974 `NNLS`) solves the second-derivative Tikhonov-regularized non-negative inverse Laplace problem over a log-spaced diffusivity grid $\{D_q\}_{q=1}^Q$:
 
 $$\min_{\mathbf{f} \ge 0} \; \|\mathbf{K}\mathbf{f} - \mathbf{y}\|_2^2 + \lambda \|\mathbf{L}_2 \mathbf{f}\|_2^2$$
 
-selecting $\lambda > 0$ via baseline-$\sigma$ `DiscrepancyPrinciple`, Generalized Cross-Validation (`GCV`), `LCurve` corner curvature, or explicit $\lambda$-sweep inspection.
+selecting $\lambda > 0$ over a 24-point logarithmic $\lambda$ sweep via Generalized Cross-Validation (`gcv`, default), Menger-curvature `lcurve` corner detection (which frequently selects the same optimal $\lambda$ grid index as `gcv` on smooth bimodal decays), baseline-$\sigma$ Morozov `discrepancy`, or an explicit `--fixed-lambda` value.
 
 > [!CAUTION] Inverse Laplace Transform (`ILT`) Conditioning Caveat
 > Real-valued continuous Laplace inversion is **exponentially ill-conditioned** (singular values of $K_{m,q} = e^{-b_m D_q}$ decay super-exponentially):
@@ -126,3 +129,24 @@ selecting $\lambda > 0$ via baseline-$\sigma$ `DiscrepancyPrinciple`, Generalize
 From fitted $D$, `nmr-core::dosy` computes temperature-compensated Stokes–Einstein hydrodynamic radii and empirical power-law molecular weights (Einstein 1905; Evans et al. *Angew. Chem. Int. Ed.* 2013) using built-in dynamic viscosities $\eta(T)$ across `D2O`, `H2O`, `CDCl3`, `DMSO-d6`, `CD3OD`, and `CD3CN`:
 
 $$R_h = \frac{k_B T}{6\pi \eta(T) D}, \qquad \widehat{\text{MW}} = \left(\frac{\alpha_{\text{solv}}}{D}\right)^{1/\beta_{\text{solv}}}$$
+
+### Headless CLI Quick Reference (`nmr1d` & `dosy`)
+
+```bash
+# 1. Process raw 1D FID (or .jdx / Bruker 1r), autophase, Whittaker baseline, HSVD & Voigt pick
+nmrassign nmr1d process --in ./data/compound_1h/1 --solvent CDCl3 --hsvd --deconvolve --out ./out/spec1d.jdx
+
+# 2. Extract Hoye J-coupling multiplet trees & ACS/JOC/RSC/Nature experimental paragraph
+nmrassign nmr1d multiplet --in ./out/spec1d.jdx --solvent CDCl3 --style acs --out ./out/multiplets.txt
+
+# 3. Compute ISO GUM internal-standard qNMR purity (% w/w, U_k=2, and 5*T1 saturation audit)
+nmrassign nmr1d qnmr --in ./out/spec1d.jdx \
+  --std-id DMSO2 --std-mass-mg 5.12 --std-purity 0.9994 \
+  --analyte-mass-mg 12.40 --analyte-mw 180.16 --analyte-protons 3 \
+  --analyte-ppm 2.28:2.42 --out ./out/qnmr_report.json
+
+# 4. Discrete BIC Stejskal-Tanner / BPP-LED DOSY fit, opt-in Tikhonov ILT & Stokes-Einstein MW
+nmrassign dosy fit --in ./data/mixture_dosy/10 --criterion bic --solvent CDCl3 --temp-k 298.15 --engine auto --out ./out/dosy_bic.tsv
+nmrassign dosy ilt --in ./data/mixture_dosy/10 --strategy gcv --out ./out/dosy_ilt.tsv
+nmrassign dosy mw --d 7.8e-10 --solvent CDCl3 --temp-k 298.15
+```

@@ -177,30 +177,43 @@ To prevent data leakage, circular self-validation, or inflated accuracy claims, 
 ### 7. Analytical 1D NMR, Hoye Multiplet Trees, `qNMR`, Chemometrics & `DOSY`
 
 - **Einstein, A.** (1905). Über die von der molekularkinetischen Theorie der Wärme geforderte Bewegung von in ruhenden Flüssigkeiten suspendierten Teilchen. *Ann. Phys.* **322**, 549–560.
+- **Hotelling, H.** (1931). The generalization of Student's ratio ($T^2$). *Ann. Math. Stat.* **2**, 360–378.
 - **Levenberg, K.** (1944). *Quart. Appl. Math.* **2**, 164–168; **Marquardt, D. W.** (1963). *J. Soc. Ind. Appl. Math.* **11**, 431–441.
 - **Pople, J. A., Schneider, W. G. & Bernstein, H. J.** (1959). *High-Resolution Nuclear Magnetic Resonance*. McGraw-Hill.
 - **Stejskal, E. O. & Tanner, J. E.** (1965). Spin diffusion measurements: spin echoes in the presence of a time-dependent field gradient. *J. Chem. Phys.* **42**, 288–292.
 - **Ernst, R. R. & Anderson, W. A.** (1966). Application of Fourier transform spectroscopy to magnetic resonance. *Rev. Sci. Instrum.* **37**, 93–102.
 - **Golub, G. H. & Pereyra, V.** (1973). The differentiation of pseudo-inverses and nonlinear least squares problems whose variables separate (`VarPro`). *SIAM J. Numer. Anal.* **10**, 413–432.
 - **Lawson, C. L. & Hanson, R. J.** (1974). *Solving Least Squares Problems* (`NNLS`). Prentice-Hall.
+- **Jackson, J. E. & Mudholkar, G. S.** (1979). Control procedures for residuals associated with principal component analysis ($Q$-statistic). *Technometrics* **21**, 341–349.
 - **Doddrell, D. M., Pegg, D. T. & Bendall, M. R.** (1982). Distortionless enhancement of NMR signals by polarization transfer (`DEPT`). *J. Magn. Reson.* **48**, 323–327.
 - **Provencher, S. W.** (1982). A constrained regularization method for inverting data represented by linear algebraic or integral equations. *Comput. Phys. Commun.* **27**, 213–227 & 229–242.
 - **Barkhuijsen, H., de Beer, R. & van Ormondt, D.** (1987). Improved algorithm for noniterative time-domain model fitting to exponentially damped magnetic resonance signals (`HSVD`). *J. Magn. Reson.* **73**, 553–557.
 - **Thompson, P., Cox, D. E. & Hastings, J. B.** (1987). Rietveld refinement of Debye–Scherrer synchrotron X-ray data from $\text{Al}_2\text{O}_3$ (pseudo-Voigt approximation). *J. Appl. Crystallogr.* **20**, 79–83.
 - **Pijnappel, W. W. F., van den Boogaart, A., de Beer, R. & van Ormondt, D.** (1992). SVD-based quantification of magnetic resonance signals. *J. Magn. Reson.* **97**, 122–134.
 - **Hoye, T. R., Hanson, P. R. & Vyvyan, J. R.** (1994). A practical guide to first-order multiplet analysis in $^{1}\text{H}$ NMR spectroscopy. *J. Org. Chem.* **59**, 4096–4103.
+- **Benjamini, Y. & Hochberg, Y.** (1995). Controlling the false discovery rate: a practical and powerful approach to multiple testing (`BH-FDR`). *J. R. Stat. Soc. B* **57**, 289–300.
 - **Wu, D. H., Chen, A. D. & Johnson, C. S. Jr.** (1995). An improved diffusion-ordered spectroscopy experiment incorporating bipolar-gradient pulses (`BPP-LED`). *J. Magn. Reson. A* **115**, 260–264.
 - **Gottlieb, H. E., Kotlyar, V. & Nudelman, A.** (1997). NMR chemical shifts of common laboratory solvents as trace impurities. *J. Org. Chem.* **62**, 7512–7515.
 - **Johnson, C. S. Jr.** (1999). Diffusion ordered nuclear magnetic resonance spectroscopy: principles and applications. *Prog. Nucl. Magn. Reson. Spectrosc.* **34**, 203–256.
 - **Hoye, T. R. & Zhao, H.** (2002). A method for easily determining coupling constant values: an addendum to "A practical guide to first-order multiplet analysis in $^{1}\text{H}$ NMR spectroscopy." *J. Org. Chem.* **67**, 4014–4016.
 - **Pelta, M. D., Morris, G. A., Stchedroff, M. J. & Hammond, S. J.** (2002). A one-shot high-resolution `DOSY` experiment. *Magn. Reson. Chem.* **40**, 147–152.
+- **Trygg, J. & Wold, S.** (2002). Orthogonal projections to latent structures (`O-PLS`). *J. Chemom.* **16**, 119–128.
 - **Eilers, P. H. C.** (2003). A perfect smoother (Whittaker penalized least squares). *Anal. Chem.* **75**, 3631–3636.
+- **Chong, I.-G. & Jun, C.-H.** (2005). Performance of some variable selection methods when multicollinearity is present (`VIP`). *Chemom. Intell. Lab. Syst.* **78**, 103–112.
+- **Cloarec, O., Dumas, M.-E., Craig, A., Barton, R. H., Trygg, J., Hudson, J., Blancher, C., Gauguier, D., Lindon, J. C., Holmes, E. & Nicholson, J.** (2005). Statistical total correlation spectroscopy (`STOCSY`): an exploratory approach for latent biomarker identification from metabolic $^{1}\text{H}$ NMR data sets. *Anal. Chem.* **77**, 1282–1289.
 - **Malz, F. & Jancke, H.** (2005). Validation of quantitative NMR (`qNMR`). *J. Pharm. Biomed. Anal.* **38**, 813–823.
 - **Cobas, J. C., Bernstein, M. A., Martín-Pastor, M. & Tahoces, P. G.** (2006). A new general-purpose fully automatic baseline-correction procedure for 1D and 2D NMR data. *J. Magn. Reson.* **183**, 145–151.
+- **Dieterle, F., Ross, A., Schlotterbeck, G. & Senn, H.** (2006). Probabilistic quotient normalization (`PQN`) as robust method to account for dilution of complex biological mixtures. *Anal. Chem.* **78**, 4281–4290.
+- **van den Berg, R. A., Hoefsloot, H. C. J., Westerhuis, J. A., Smilde, A. K. & van der Werf, M. J.** (2006). Centering, scaling, and transformations: improving the biological information content of metabolomics data. *BMC Genomics* **7**, 142.
+- **De Meyer, T., Sinnaeve, D., Van Gasse, B., Tsiporkova, E., Rietzschel, E. R., De Buyzere, M. L., Gillebert, T. C., Bekaert, S., Martins, J. C. & Van Criekinge, W.** (2008). NMR-based characterization of metabolic alterations in hypertension using an adaptive, intelligent binning algorithm (`AI-Binning`). *Anal. Chem.* **80**, 3783–3790.
+- **Westerhuis, J. A., Hoefsloot, H. C. J., Smit, S., Vis, D. J., Smilde, A. K., van Velzen, E. J. J., van Duijnhoven, J. P. M. & van Dorsten, F. A.** (2008). Assessment of PLSDA cross validation. *Metabolomics* **4**, 81–89.
+- **Wiklund, S., Johansson, E., Sjöström, L., Mellerowicz, E. J., Edlund, U., Shockcor, J. P., Gottfries, J., Moritz, T. & Trygg, J.** (2008). Visualization of GC/TOF-MS-based metabolomics data for identification of biochemically interesting compounds using `OPLS` class models (`S-plot`). *Anal. Chem.* **80**, 115–122.
 - **de Brouwer, H.** (2009). Evaluation of algorithms for automated phase correction of NMR spectra. *J. Magn. Reson.* **201**, 230–238.
 - **Fulmer, G. R., Miller, A. J. M., Sherden, N. H., Gottlieb, H. E., Nudelman, A., Stoltz, B. M., Bercaw, J. E. & Goldberg, K. I.** (2010). NMR chemical shifts of trace impurities: common laboratory solvents, organics, and gases in deuterated solvents relevant to the organometallic chemist. *Organometallics* **29**, 2176–2179.
-- **Savorani, F., Tomasi, G. & Engelsen, S. B.** (2010). `icoshift`: A versatile tool for the rapid alignment of 1D NMR spectra. *J. Magn. Reson.* **202**, 190–202.
+- **Phipson, B. & Smyth, G. K.** (2010). Permutation P-values should never be zero: calculating exact P-values when permutations are randomly drawn. *Stat. Appl. Genet. Mol. Biol.* **9**, Article 39.
+- **Savorani, F., Tomasi, G. & Engelsen, S. B.** (2010). Interval correlation-shifting FFT peak alignment of 1D NMR spectra. *J. Magn. Reson.* **202**, 190–202.
 - **Evans, R., Deng, Z., Rogerson, A. K., McLachlan, A. S., Richards, J. J., Nilsson, M. & Morris, G. A.** (2013). Quantitative interpretation of diffusion-ordered NMR spectra: can we rationalize small molecule diffusion coefficients? *Angew. Chem. Int. Ed.* **52**, 3199–3202.
+- **Golub, G. H. & Van Loan, C. F.** (2013). *Matrix Computations*, 4th ed. Johns Hopkins University Press.
 - **Pauli, G. F., Chen, S.-N., Simmler, C., Lankin, D. C., Gödecke, T., Jaki, B. U., Friesen, J. B., McAlpine, J. B. & Napolitano, J. G.** (2014). Importance of purity evaluation and the potential of quantitative $^{1}\text{H}$ NMR as a purity assay. *J. Med. Chem.* **57**, 9220–9231.
 
 ### 8. Open Archival Repositories, Interchange Formats & Protocol Standards

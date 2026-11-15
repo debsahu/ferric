@@ -15,7 +15,7 @@ Every `nmrassign` subcommand runs deterministically on macOS, Linux, and Windows
 | **Discovery & DSP** | `inspect` | Scan spectrometer folders or `.tar`/`.tgz`/`.zip` archives (`< 50 ms`) and classify experiments & regimes |
 | **Discovery & DSP** | `process` | Deterministic 2D/3D Bruker/Varian FID processing, `IST`/`FISTA` NUS reconstruction & `processing_recipe.json` export |
 | **Peak Picking** | `pick` | Classical MAD/parabolic or 2D/3D separable CNN (`--method neural`) peak picking + Pass-2 `StripBank3D` weak-peak rescue |
-| **Assignment** | `assign` | Sequence-only backbone assignment (`globular`, `idp-13c`, `paramagnetic`) across `evo-graph`, `standard`, and opt-in `bayes-sa` |
+| **Assignment** | `assign` | Sequence-only backbone assignment (`globular`, `idp-13c`, `paramagnetic`) across `evo-graph`, `standard`, and opt-in experimental `bayes-sa` |
 | **Assignment** | `sidechain` | Joint aliphatic, aromatic (`--aromatic --ph`), and Bayesian stereospecific prochiral (`--stereospec`) assignment |
 | **Assignment** | `methyl` | Supramolecular `13C`-Methyl TROSY (`ILVMAT`, `ILV-proS`/`proR`) structure-based GPU contact-graph assignment |
 | **Ensemble & Structure** | `propensity` | IDP Secondary Structure Propensity (`SSP`) and 4-state (`alpha`, `beta`, `PPII`, `coil`) HMM populations |
@@ -23,9 +23,10 @@ Every `nmrassign` subcommand runs deterministically on macOS, Linux, and Windows
 | **Ensemble & Structure** | `structure` | 7-cycle iterative ambiguous NOESY ADR + torsion-angle NeRF + multi-medium Saupe `RDC` CPU/WebGPU ensemble folding |
 | **Interchange & Reports** | `pipeline` | End-to-end single-command workflow (`FIDs/spectra/peaks + seq -> shifts.str + result.nef + report.html`) |
 | **Interchange & Reports** | `report` | Standalone `HTML+SVG` quality report (`CSI`, strip ladders, Ramachandran, `RDC` $Q$/$Q_{\text{free}}$, IDP propensities) |
+| **Interchange & Reports** | `export-fig` | Deterministic publication-ready SVG figure showcase generator across all 8 workbench modalities |
 | **Interchange & Reports** | `nef-import` / `nef-export` | Lossless conversion between `NEF v1.1` (`.nef`), `NMR-STAR v3.2` (`.str`), and 7-column Peak `TSV` |
-| **Dynamics & 1D/DOSY** | `relax` / `modelfree` / `cest` / `cpmg` / `csp` | Batched GPU $R_1$/$R_2$/hetNOE, Lipari–Szabo `M1`–`M5` $S^2$, Bloch–McConnell `CEST`, Baldwin `CPMG`, and tight-binding `CSP` $K_d$ |
-| **Dynamics & 1D/DOSY** | `nmr1d` / `dosy` / `chem` | Analytical 1D Voigt/Hoye/`qNMR`, pseudo-2D `DOSY` (`discrete-bic` & `contin-ilt`), and `Octet` 2D chemical studio I/O |
+| **Dynamics & Exchange** | `relax` / `modelfree` / `cest` / `cpmg` / `csp` | Batched GPU $R_1$/$R_2$/hetNOE, Lipari–Szabo `M1`–`M5` $S^2$, Bloch–McConnell `CEST`, Baldwin `CPMG`, and tight-binding `CSP` $K_d$ |
+| **1D, DOSY & Chemometrics** | `nmr1d` / `dosy` / `metabolomics` / `chem` | Analytical 1D (`process`/`multiplet`/`qnmr`), pseudo-2D `DOSY` (`fit`/`ilt`/`mw`), untargeted 1D `metabolomics` (`bin`/`pca`/`oplsda`/`stocsy`), and `Octet` 2D chemical studio |
 | **Services & AI** | `serve` / `mcp` / `mcp-config` | Self-hosted loopback REST job dashboard (`serve`) and sandboxed JSON-RPC 2.0 `MCP` server & client config generator |
 | **Benchmarks & Data** | `fetch-bmrb` / `priors` / `simulate` / `score` / `benchmark` / `benchmark-suite` / `real-benchmark` / `e2e-benchmark` | Rate-limited CC0 BMRB archive downloader, prior builder, volumetric physics simulator, permutation-invariant scorer, and CI benchmark suites |
 
@@ -135,59 +136,65 @@ nmrassign nef-export --star ./out/all_atom.str --peaks ./out/peaks.tsv --out ./o
 nmrassign nef-import --in ./out/project.nef --out-star ./out/reloaded.str --out-peaks ./out/reloaded.tsv
 ```
 
-#### 4. Dynamics, Chemical Exchange, 1D `qNMR` & Pseudo-2D `DOSY`
+#### 4. Dynamics, Chemical Exchange, 1D `qNMR`, `DOSY` & Metabolomics
 
-See [Chapter 4: Relaxation Dynamics, CEST, CPMG & CSP](04-dynamics-and-exchange.md) and [Chapter 5: 1D Multiplets, qNMR, Multi-Spectrum Stacks & DOSY](05-nmr1d-multiplets-and-dosy.md) for physical models and diagnostics:
+See [Chapter 4: Relaxation Dynamics, CEST, CPMG & CSP](04-dynamics-and-exchange.md), [Chapter 5: 1D Multiplets, qNMR & DOSY](05-nmr1d-multiplets-and-dosy.md), and [Chapter 8: Untargeted 1D Metabolomics & Chemometrics](08-metabolomics-and-chemometrics.md) for physical models and validation-scope notes:
 
 ```bash
-# Batched GPU R1, R2 & steady-state {1H}-15N hetNOE curve fitting + reduced J(omega)
+# Batched GPU R1, R2, R1rho or steady-state {1H}-15N hetNOE curve fitting + reduced J(omega)
 nmrassign relax \
-  --r1 ./data/r1_600.tsv \
-  --r2 ./data/r2_600.tsv \
-  --noe ./data/noe_sat.ft2,./data/noe_unsat.ft2 \
-  --mhz 600 --mc 1000 --engine gpu
+  --series ./data/ubq_r1_600 \
+  --kind r1 --field-mhz 600.0 --mc-trials 500 --engine gpu \
+  --out ./out/r1_600.tsv
 
 # Lipari-Szabo / Mandel-Akke-Palmer M1-M5 model-free & anisotropic diffusion tensor fit
 nmrassign modelfree \
-  --data ./out/relax_600.tsv \
-  --data ./out/relax_800.tsv \
-  --pdb ./data/template.pdb \
-  --criterion aic
+  --r1 ./out/r1_600.tsv --r2 ./out/r2_600.tsv --hetnoe ./out/noe_600.tsv \
+  --r1 ./out/r1_800.tsv --r2 ./out/r2_800.tsv --hetnoe ./out/noe_800.tsv \
+  --pdb ./data/template.pdb --diffusion auto --criterion aicc \
+  --out ./out/modelfree.tsv
 
 # Homogeneous Padé [6/6] Bloch-McConnell 15N/13C CEST & DEST excited-state fitting
 nmrassign cest \
-  --profiles ./data/cest_15hz.tsv,./data/cest_30hz.tsv \
-  --states 2 --global-group all --engine gpu
+  --in ./data/cest_15hz.tsv --in ./data/cest_30hz.tsv \
+  --states 2 --b1-quad 5 --engine gpu \
+  --out ./out/cest_fit.tsv
 
 # Exact Baldwin (2014) / Carver-Richards multi-field CPMG relaxation dispersion
 nmrassign cpmg \
-  --series ./data/cpmg_600.tsv,./data/cpmg_800.tsv \
-  --model baldwin2014 --global --engine gpu
+  --in ./data/cpmg_600.tsv --in ./data/cpmg_800.tsv \
+  --model baldwin2014 --engine gpu \
+  --out ./out/cpmg_fit.tsv
 
-# Fast-exchange HSQC ligand titration trajectory tracking & exact quadratic tight-binding Kd
+# Fast-exchange HSQC/HMQC ligand titration trajectory tracking & exact quadratic tight-binding Kd
 nmrassign csp \
-  --apo ./data/hsqc_0.ft2 \
-  --titration L1=0.2:./data/hsqc_1.ft2,L2=0.5:./data/hsqc_2.ft2,L3=1.0:./data/hsqc_3.ft2,L4=2.0:./data/hsqc_4.ft2 \
-  --protein-conc-um 100
+  --apo-peaks ./data/apo_hsqc.tsv \
+  --step 20=./data/hsqc_20um.tsv --step 50=./data/hsqc_50um.tsv \
+  --step 100=./data/hsqc_100um.tsv --step 250=./data/hsqc_250um.tsv \
+  --protein-um 100.0 --experiment hsqc \
+  --out ./out/csp_kd.tsv
 
-# Analytical 1D Voigt deconvolution, Hoye J-trees, journal export & NIST-traceable qNMR purity
-nmrassign nmr1d \
-  --in ./data/compound_1h/1 \
-  --molecule "CC(=O)OC1=CC=CC=C1C(=O)O" \
-  --qnmr-std "5.12:194.14:2:0.9994" \
-  --style acs \
-  -o ./out/compound_1d_report.json
+# Analytical 1D DSP, Voigt/Hoye J-trees, journal export & NIST-traceable GUM qNMR purity
+nmrassign nmr1d process --in ./data/compound_1h/1 --solvent CDCl3 --hsvd --deconvolve --out ./out/spec1d.jdx
+nmrassign nmr1d multiplet --in ./out/spec1d.jdx --solvent CDCl3 --style acs --out ./out/multiplets.txt
+nmrassign nmr1d qnmr --in ./out/spec1d.jdx \
+  --std-id DMSO2 --std-mass-mg 5.12 --std-purity 0.9994 \
+  --analyte-mass-mg 12.40 --analyte-mw 180.16 --analyte-protons 3 \
+  --analyte-ppm 2.28:2.42 --out ./out/qnmr_report.json
 
-# Pseudo-2D Stejskal-Tanner / Wu-Johnson BPP-LED DOSY (default discrete-bic; opt-in contin-ilt)
-nmrassign dosy \
-  --in ./data/mixture_dosy/10 \
-  --seq-type bppled \
-  --fit discrete-bic \
-  --solvent CDCl3 --temp-k 298.15 --engine auto \
-  -o ./out/dosy_components.tsv
+# Pseudo-2D Stejskal-Tanner / Wu-Johnson BPP-LED DOSY (default BIC fit; opt-in Tikhonov ILT & MW)
+nmrassign dosy fit --in ./data/mixture_dosy/10 --criterion bic --solvent CDCl3 --temp-k 298.15 --engine auto --out ./out/dosy_bic.tsv
+nmrassign dosy ilt --in ./data/mixture_dosy/10 --strategy gcv --out ./out/dosy_ilt.tsv
+nmrassign dosy mw --d 7.8e-10 --solvent CDCl3 --temp-k 298.15
+
+# Untargeted 1D Metabolomics: AI-Binning + PQN, PCA Hotelling T^2/Q, k-fold OPLS-DA & STOCSY
+nmrassign metabolomics bin --manifest cohort_manifest.tsv --out cohort_matrix.tsv --method aib --norm pqn --align-ppm 0.025
+nmrassign metabolomics pca --matrix cohort_matrix.tsv --out pca_report.json --components 3 --scale pareto
+nmrassign metabolomics oplsda --matrix cohort_matrix.tsv --out oplsda_biomarkers.tsv --ortho 1 --scale pareto --cv-folds 7 --permutations 200
+nmrassign metabolomics stocsy --matrix cohort_matrix.tsv --driver-ppm 1.33 --out stocsy_1p33ppm.tsv
 ```
 
-#### 5. `chem`, `serve`, `mcp`, `priors`, `simulate` & Reproducible Benchmark Suites
+#### 5. `chem`, `export-fig`, `serve`, `mcp`, `mcp-config` & Reproducible Benchmark Suites
 
 ```bash
 # Print version & embedded Git SHA
@@ -196,12 +203,16 @@ nmrassign --version
 # 2D chemical rendering, IUPAC <-> Structure, and 1D JCAMP-DX synthesis
 nmrassign chem --smiles "CN1C=NC2=C1C(=O)N(C(=O)N2C)C" --solvent CDCl3 --mhz 600 --out caffeine.svg
 
+# Deterministic publication-ready SVG figure showcase across all 8 workbench modalities
+nmrassign export-fig --out-dir docs/assets [--panel all|hsqc|strips|pdb-s2|nmr1d-stack|dosy|metabolomics|exchange|octet]
+
 # Self-hosted loopback HTTP REST job service & browser dashboard
 nmrassign serve --bind 127.0.0.1:8080 --storage ./jobs
 
-# Sandboxed JSON-RPC 2.0 MCP server (default --read-only) & client config generator
-nmrassign mcp --transport stdio --workspace ./project_dir --read-only
-nmrassign mcp-config --client antigravity --workspace ./project_dir
+# Sandboxed JSON-RPC 2.0 MCP server (default --mode read-only) & client config generator
+nmrassign mcp --transport stdio --root ./project_dir --mode read-only
+nmrassign mcp --transport http --bind 127.0.0.1:54912 --token <session-token> --root ./project_dir --mode read-only
+nmrassign mcp-config --client antigravity --root ./project_dir --mode read-only [--bridge-port 54912]
 
 # Rate-limited (<= 1 req/s) CC0 BMRB downloader writing SHA-256 PROVENANCE.md
 nmrassign fetch-bmrb --id 17769 --dest ./data/private/bmrb/17769
@@ -223,6 +234,9 @@ nmrassign real-benchmark --manifest data/benchmark/real_manifest.tsv --split dev
 ## Model Context Protocol (`MCP`) Server & Live Desktop Bridge
 
 `nmr-assign` implements the open **Model Context Protocol (`MCP`, JSON-RPC 2.0)** specification in pure safe Rust (`serde`, `serde_json`, `std::io`, `std::net`—zero external SDK or image-encoding crates) across two complementary transports:
+
+> [!IMPORTANT] MCP Validation Scope (In-Process / Subprocess Protocol Self-Consistency)
+> JSON-RPC 2.0 framing (`stdio` newline & `Content-Length` pre-allocation caps), canonicalized path sandboxing, loopback HTTP bearer-token / DNS-rebinding guards, `256`-step Undo curation reversibility, and RFC 2083 viewport `PNG` encoding are verified via deterministic Rust unit tests and `nmrassign mcp` CLI subprocess E2E tests (`0` live interactive GUI sessions against external Antigravity, Claude Desktop, or Cursor binaries are executed in automated CI; end-to-end multi-client host smoke testing is tracked openly under follow-up **`F18`**).
 
 | Transport Mode | Implementation | Ideal Use Case |
 | :--- | :--- | :--- |
@@ -248,16 +262,17 @@ Add the following block to your client's `mcpServers` configuration file (for **
         "mcp",
         "--transport",
         "stdio",
-        "--workspace",
+        "--root",
         "/path/to/nmr_workspace",
-        "--read-only"
+        "--mode",
+        "read-only"
       ]
     }
   }
 }
 ```
 
-*(To allow curated peak-list or NMR-STAR file export strictly inside `/path/to/nmr_workspace`, replace `"--read-only"` with `"--read-write"`.)*
+*(To allow curated peak-list or NMR-STAR file export strictly inside `/path/to/nmr_workspace`, replace `"read-only"` with `"read-write"`.)*
 
 #### 2. Live `nmr-gui` Desktop Loopback Bridge Mode (`HttpBridge`)
 
@@ -288,7 +303,7 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
 2. **Canonicalized Path Sandbox (`resolve_sandboxed_path`)**:
    - Rejects empty paths, embedded null bytes (`\0`), and any lexical `..` (`ParentDir`) traversal before touching the filesystem.
    - Blocks access to hidden credential and secret locations (`.ssh`, `.aws`, `.gnupg`, `.env`, `.env.*`, `.netrc`, `.kube`, `id_rsa`, `id_ed25519`).
-   - Canonicalizes every configured `allowed_root` and target path via `std::fs::canonicalize`, blocking symlinks or dangling links escaping `--workspace`, and formats responses as workspace-relative paths so host user home directories are never leaked.
+   - Canonicalizes every configured `allowed_root` and target path via `std::fs::canonicalize`, blocking symlinks or dangling links escaping `--root`, and formats responses as workspace-relative paths so host user home directories are never leaked.
 3. **Loopback-Only Binding, Constant-Time Auth & DNS-Rebinding Defense**:
    - The desktop HTTP bridge refuses non-loopback bind addresses (`0.0.0.0`, LAN IPs, `[::]`).
    - Every HTTP request must carry `Authorization: Bearer <token>` verified via non-branching constant-time byte comparison (`401 Unauthorized`), a loopback `Host` header (`127.0.0.1` or `localhost`), and **zero** cross-origin browser `Origin` headers (`403 Forbidden`), defeating local browser CSRF and DNS-rebinding attacks.
@@ -306,6 +321,11 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
 | `read_peak_list_summary` | `stdio` | `ReadOnly` | Summarize picked peak counts per experiment and assembled `SpinSystem` roots |
 | `evaluate_dataset_qc` | `stdio` | `ReadOnly` | Run `DatasetQcReport` completeness, aliphatic corroboration & referencing checks |
 | `predict_homolog_free_torsions` | `stdio` | `ReadOnly` | Predict 3/9-mer $(\phi, \psi)$ restraints under the `<= 25%` 4-layer `HomologFirewall` |
+| `fit_relaxation_or_exchange` | `stdio` | `ReadOnly` | Fit $R_1$/$R_2$/hetNOE, Lipari–Szabo `M1`–`M5` $S^2$, Bloch–McConnell `CEST`, or Baldwin `CPMG` |
+| `track_csp_titration` | `stdio` | `ReadOnly` | Track 2D `HSQC`/`HMQC` ligand titration trajectories and fit quadratic tight-binding $K_d$ |
+| `analyze_nmr1d_spectrum` | `stdio` | `ReadOnly` | Run 1D DSP, Fulmer solvent referencing, Voigt/Hoye `J`-trees, journal formatting & GUM `qNMR` |
+| `fit_dosy_diffusion` | `stdio` | `ReadOnly` | Fit discrete `BIC` Stejskal–Tanner / `BPP-LED` `DOSY` decays, opt-in `ILT`, and Stokes–Einstein `MW` |
+| `run_metabolomics_chemometrics` | `stdio` | `ReadOnly` | Run sandboxed `AI-Binning`, `PQN`, `PCA` Hotelling $T^2$/$Q$, leak-free `OPLS-DA`, and `STOCSY` |
 | `write_curated_peak_tsv` | `stdio` | `ReadWrite` | Write filtered/curated 7-column peak `TSV` strictly inside `allowed_roots` |
 | `export_nmrstar_shifts` | `stdio` | `ReadWrite` | Write `NMR-STAR v3.2` chemical shifts strictly inside `allowed_roots` |
 | `get_workbench_state` | `gui` | `ReadOnly` | Snapshot active residue, `(1H, 15N, 13C)` crosshair, ranked strip candidates, undo depth & QC |
@@ -322,6 +342,7 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
   - `resolve-ambiguous-strips`: Multi-pathway `(i, i-1)` strip ladder disambiguation and pre-Proline shift checks.
   - `deconvolve-1d-mixture-dosy`: Fulmer referencing, Voigt/Hoye multiplet trees, `qNMR` stoichiometry, and `BIC` `DOSY` vs opt-in `ILT`.
   - `fit-cest-cpmg-exchange`: Locked-shape plane integration, flat-null gate, multi-field scaling, and Bloch–McConnell `CEST` / Baldwin `CPMG`.
+  - `analyze-metabolomics-cohort`: Step-by-step `AI-Binning` + `PQN`, `PCA` Hotelling $T^2$/$Q$ outlier check, leak-free `k`-fold `OPLS-DA` ($Q^2$ & permutation $p$-value overfitting guards), and `STOCSY` spin-system annotation.
 
 #### JSON-RPC 2.0 & MCP Error Codes
 

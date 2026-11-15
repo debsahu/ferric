@@ -24,8 +24,10 @@ import hashlib
 import html
 import json
 from pathlib import Path
+import posixpath
 import re
 import sys
+import tempfile
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import unquote, urlsplit
 
@@ -33,6 +35,50 @@ from urllib.parse import unquote, urlsplit
 SITE_TITLE = "nmr-assign Manual"
 SITE_VERSION_BADGE = "v0.12.0 · Rust + WebGPU"
 SITE_TAGLINE = "Clean-Room Biomolecular & Analytical NMR Platform"
+
+EXPECTED_MANUAL_CHAPTERS: Tuple[str, ...] = (
+    "index.md",
+    "01-quickstart-and-workflows.md",
+    "02-custom-pulprog-and-dsp.md",
+    "03-solvers-and-calibration.md",
+    "04-dynamics-and-exchange.md",
+    "05-nmr1d-multiplets-and-dosy.md",
+    "06-mcp-and-cli-reference.md",
+    "07-clean-room-provenance.md",
+    "08-metabolomics-and-chemometrics.md",
+)
+
+RESTRICTED_PRODUCT_TOKENS: Tuple[str, ...] = (
+    "am" + "ix",
+    "che" + "nomx",
+    "metabo" + "analyst",
+    "nmrproc" + "flow",
+    "sim" + "ca",
+    "ico" + "shift",
+    "bar" + "asa",
+    "cy" + "ana",
+    "fl" + "ya",
+    "art" + "ina",
+    "nmr" + "tist",
+    "xp" + "lor",
+    "cc" + "pn",
+    "mn" + "ova",
+    "mestre" + "nova",
+    "che" + "mex",
+    "ca" + "tia",
+    "gl" + "ove",
+    "gua" + "rdd",
+    "ti" + "tan",
+    "ta" + "los",
+    "deep " + "picker",
+    "ar" + "ia",
+    "com" + "pass",
+    "model" + "free4",
+    "fast-model" + "free",
+    "ten" + "sor2",
+    "nes" + "sie",
+    "ring" + "nmr",
+)
 
 
 @dataclass(frozen=True)
@@ -212,6 +258,10 @@ GREEK_AND_SYMBOLS: Dict[str, str] = {
     r"\rceil": "⌉",
     r"\lfloor": "⌊",
     r"\rfloor": "⌋",
+    r"\lvert": "|",
+    r"\rvert": "|",
+    r"\lVert": "‖",
+    r"\rVert": "‖",
     r"\sum": "∑",
     r"\prod": "∏",
     r"\int": "∫",
@@ -226,6 +276,9 @@ ROMAN_OPERATORS: Tuple[str, ...] = (
     "argmin",
     "argmax",
     "atan2",
+    "median",
+    "corr",
+    "cov",
     "cosh",
     "sinh",
     "tanh",
@@ -906,7 +959,7 @@ def parse_markdown_blocks(
             )
             out_html.append(
                 f'<h{level} id="{slug}">{title_html}'
-                f'<a class="heading-anchor" href="#{slug}" aria-label="Link to section">#</a>'
+                f'<a class="heading-anchor" href="#{slug}" title="Link to section">#</a>'
                 f"</h{level}>"
             )
             if search_sections is not None and level <= 3:
@@ -1341,6 +1394,17 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   font-weight: 600;
 }
 .theme-btn:hover { border-color: var(--accent); }
+.demo-btn {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 0.36rem 0.72rem;
+  font-size: 0.84rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.demo-btn:hover { text-decoration: none; filter: brightness(1.06); }
 
 .layout {
   max-width: 92rem;
@@ -1921,13 +1985,16 @@ MANUAL_JS = r"""(function () {
 def discover_manual_pages(src_dir: Path) -> List[Path]:
     if not src_dir.is_dir():
         raise FileNotFoundError(f"manual source directory not found: {src_dir}")
-    md_files = sorted(p for p in src_dir.glob("*.md") if p.is_file())
+    md_files = {p.name: p for p in sorted(src_dir.glob("*.md")) if p.is_file()}
     if not md_files:
         raise ValueError(f"no markdown chapters found in {src_dir}")
-    # Place index.md first, followed by numbered chapters in deterministic order
-    index_files = [p for p in md_files if p.name == "index.md"]
-    other_files = [p for p in md_files if p.name != "index.md"]
-    return index_files + other_files
+    ordered: List[Path] = []
+    for expected in EXPECTED_MANUAL_CHAPTERS:
+        if expected in md_files:
+            ordered.append(md_files.pop(expected))
+    for remaining_name in sorted(md_files):
+        ordered.append(md_files[remaining_name])
+    return ordered
 
 
 def chapter_badge_and_short_title(md_name: str, h1_text: str) -> Tuple[str, str]:
@@ -1996,6 +2063,7 @@ def render_page_html(
     page: ParsedPage,
     all_pages: Sequence[ParsedPage],
     page_idx: int,
+    has_demo_page: bool = False,
 ) -> str:
     nav_items: List[str] = []
     for p in all_pages:
@@ -2046,6 +2114,12 @@ def render_page_html(
         else f"{page.page_title} | {SITE_TITLE}"
     )
 
+    demo_action_html = (
+        '<a class="demo-btn" href="demo/index.html">Live WebGPU Demo</a>'
+        if has_demo_page
+        else ""
+    )
+
     return f"""<!DOCTYPE html>
 <html lang="en" data-theme="light">
 <head>
@@ -2059,21 +2133,22 @@ def render_page_html(
 <body>
   <header class="topbar">
     <div class="brand-wrap">
-      <button type="button" id="menu-toggle" class="menu-btn" aria-label="Toggle chapter menu">☰</button>
+      <button type="button" id="menu-toggle" class="menu-btn" title="Toggle chapter menu">☰</button>
       <a class="brand-link" href="index.html">{html.escape(SITE_TITLE)}</a>
       <span class="version-pill">{html.escape(SITE_VERSION_BADGE)}</span>
     </div>
     <div class="topbar-actions">
-      <button type="button" id="search-open" class="search-trigger" aria-label="Search manual">
+      {demo_action_html}
+      <button type="button" id="search-open" class="search-trigger" title="Search manual">
         <span>Search manual…</span>
         <span class="kbd-hint">/ · ⌘K</span>
       </button>
-      <button type="button" id="theme-toggle" class="theme-btn" aria-label="Toggle color theme">Dark</button>
+      <button type="button" id="theme-toggle" class="theme-btn" title="Toggle color theme">Dark</button>
     </div>
   </header>
 
   <div class="layout">
-    <nav id="chapter-sidebar" class="sidebar" aria-label="Manual chapters">
+    <nav id="chapter-sidebar" class="sidebar" title="Manual chapters">
       <div class="sidebar-caption">Chapters</div>
       <ul class="chapter-list">
         {"".join(nav_items)}
@@ -2084,7 +2159,7 @@ def render_page_html(
       <article>
 {page.body_html}
       </article>
-      <nav class="pager" aria-label="Chapter pagination">
+      <nav class="pager" title="Chapter pagination">
         {prev_html}
         {next_html}
       </nav>
@@ -2093,12 +2168,12 @@ def render_page_html(
       </footer>
     </main>
 
-    <aside class="toc-aside" aria-label="Page outline">
+    <aside class="toc-aside" title="Page outline">
       {toc_html}
     </aside>
   </div>
 
-  <div id="search-backdrop" class="search-backdrop" role="dialog" aria-modal="true" aria-label="Search documentation">
+  <div id="search-backdrop" class="search-backdrop" role="dialog" title="Search documentation">
     <div class="search-modal">
       <div class="search-input-row">
         <input id="search-input" class="search-input" type="search" placeholder="Search chapters, CLI flags, equations, workflows…" autocomplete="off">
@@ -2112,12 +2187,19 @@ def render_page_html(
 """
 
 
-def build_site_files(pages: Sequence[ParsedPage]) -> Dict[str, bytes]:
+def build_site_files(
+    pages: Sequence[ParsedPage],
+    demo_html_path: Optional[Path] = None,
+) -> Dict[str, bytes]:
     """Assemble the complete deterministic static site in memory as relative_path -> UTF-8 bytes."""
     files: Dict[str, bytes] = {}
     files[".nojekyll"] = b""
     files["assets/style.css"] = MANUAL_CSS.encode("utf-8")
     files["assets/manual.js"] = MANUAL_JS.encode("utf-8")
+
+    has_demo = demo_html_path is not None and demo_html_path.is_file()
+    if has_demo and demo_html_path is not None:
+        files["demo/index.html"] = demo_html_path.read_bytes()
 
     search_payload = [
         {
@@ -2139,10 +2221,100 @@ def build_site_files(pages: Sequence[ParsedPage]) -> Dict[str, bytes]:
     )
 
     for idx, p in enumerate(pages):
-        html_str = render_page_html(p, pages, idx)
+        html_str = render_page_html(p, pages, idx, has_demo_page=has_demo)
         files[p.html_name] = html_str.encode("utf-8")
 
     return files
+
+
+def validate_markdown_hygiene(
+    md_paths: Sequence[Path],
+    enforce_expected_roster: bool = True,
+) -> List[str]:
+    """Verify chapter roster, clean-room token hygiene, host-path hygiene, and GFM table safety."""
+    errors: List[str] = []
+    present_names = {p.name for p in md_paths}
+    if enforce_expected_roster:
+        for req in EXPECTED_MANUAL_CHAPTERS:
+            if req not in present_names:
+                errors.append(f"missing required manual chapter '{req}'")
+
+    token_patterns = [
+        (tok, re.compile(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", re.IGNORECASE))
+        for tok in RESTRICTED_PRODUCT_TOKENS
+    ]
+    host_prefixes = ("/" + "Users/", "/" + "home/")
+
+    for md_path in md_paths:
+        raw_text = md_path.read_text(encoding="utf-8")
+        lines = raw_text.splitlines()
+        in_fence = False
+        prev_was_table = False
+        had_non_blank_since_table = True
+        expected_cols: Optional[int] = None
+        seen_sep_in_table = False
+
+        for line_no, ln in enumerate(lines, 1):
+            for hp in host_prefixes:
+                if hp in ln:
+                    errors.append(f"{md_path.name}:{line_no}: forbidden host path prefix '{hp}'")
+            for tok, pat in token_patterns:
+                if pat.search(ln):
+                    errors.append(
+                        f"{md_path.name}:{line_no}: restricted product name '{tok}' is not permitted"
+                    )
+
+            stripped = ln.strip()
+            if re.match(r"^`{3,}", stripped):
+                in_fence = not in_fence
+                prev_was_table = False
+                had_non_blank_since_table = True
+                expected_cols = None
+                seen_sep_in_table = False
+                continue
+            if in_fence:
+                continue
+
+            is_tbl_row = stripped.startswith("|") and stripped.endswith("|")
+            if is_tbl_row:
+                if not prev_was_table and not had_non_blank_since_table:
+                    errors.append(
+                        f"{md_path.name}:{line_no}: adjacent Markdown tables must be separated by a heading or caption"
+                    )
+                # GFM pipe check: even inside `...` or $...$, unescaped | breaks GitHub table cells
+                for span_m in re.finditer(r"`[^`]+`|\$[^$]+\$", stripped):
+                    if re.search(r"(?<!\\)\|", span_m.group(0)):
+                        errors.append(
+                            f"{md_path.name}:{line_no}: unescaped '|' inside table cell code/math {span_m.group(0)}"
+                        )
+                cells = split_table_row(stripped)
+                if expected_cols is None:
+                    expected_cols = len(cells)
+                    seen_sep_in_table = False
+                else:
+                    if len(cells) != expected_cols:
+                        errors.append(
+                            f"{md_path.name}:{line_no}: table column mismatch (got {len(cells)}, expected {expected_cols})"
+                        )
+                    if is_table_separator(stripped):
+                        if seen_sep_in_table:
+                            errors.append(
+                                f"{md_path.name}:{line_no}: fused table detected (duplicate separator row)"
+                            )
+                        seen_sep_in_table = True
+                prev_was_table = True
+                had_non_blank_since_table = False
+            elif stripped:
+                prev_was_table = False
+                had_non_blank_since_table = True
+                expected_cols = None
+                seen_sep_in_table = False
+            else:
+                prev_was_table = False
+                expected_cols = None
+                seen_sep_in_table = False
+
+    return errors
 
 
 def validate_internal_links(
@@ -2217,8 +2389,13 @@ def validate_internal_links(
                 continue
             rel_path = unquote(parsed.path)
             frag = unquote(parsed.fragment)
-            target_file = html_name if not rel_path else rel_path
-            if target_file not in site_files:
+            if not rel_path:
+                target_file = html_name
+            else:
+                base_dir = posixpath.dirname(html_name)
+                joined = posixpath.join(base_dir, rel_path) if base_dir else rel_path
+                target_file = posixpath.normpath(joined)
+            if target_file.startswith("../") or target_file == ".." or target_file not in site_files:
                 errors.append(f"{html_name}: broken rendered asset/page reference '{href}'")
                 continue
             if frag and target_file.endswith(".html"):
@@ -2252,9 +2429,63 @@ def site_digest(site_files: Dict[str, bytes]) -> str:
     return h.hexdigest()
 
 
+def run_self_tests() -> int:
+    """Run adversarial hygiene and link-validator unit tests in an ephemeral directory."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        valid_md = root / "index.md"
+        valid_md.write_text(
+            "# Overview\n\n## Section Alpha\n\nSee [Alpha](#section-alpha).\n\n"
+            "| A | B |\n| :--- | :--- |\n| `ok` | $\\lvert x \\rvert$ |\n",
+            encoding="utf-8",
+        )
+        pages = [parse_manual_page(valid_md)]
+        site = build_site_files(pages)
+        assert not validate_markdown_hygiene([valid_md], enforce_expected_roster=False)
+        assert not validate_internal_links(pages, site)
+
+        # 1. Broken anchor must fail
+        bad_link = root / "01-bad-link.md"
+        bad_link.write_text("# Ch1\n\nBroken [ref](index.md#missing-anchor).\n", encoding="utf-8")
+        p_bad = [parse_manual_page(valid_md), parse_manual_page(bad_link)]
+        link_errs = validate_internal_links(p_bad, build_site_files(p_bad))
+        assert any("broken anchor" in e for e in link_errs), f"expected broken anchor error, got {link_errs}"
+
+        # 2. Adjacent tables without heading/caption must fail
+        adj_tbl = root / "02-adj.md"
+        adj_tbl.write_text(
+            "# Ch2\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n\n| C | D |\n| --- | --- |\n| 3 | 4 |\n",
+            encoding="utf-8",
+        )
+        adj_errs = validate_markdown_hygiene([adj_tbl], enforce_expected_roster=False)
+        assert any("adjacent Markdown tables" in e for e in adj_errs), f"expected adjacent table error, got {adj_errs}"
+
+        # 3. Unescaped pipe inside table code/math must fail
+        pipe_tbl = root / "03-pipe.md"
+        pipe_tbl.write_text(
+            "# Ch3\n\n| Flag | Math |\n| --- | --- |\n| `a|b` | $|x|$ |\n",
+            encoding="utf-8",
+        )
+        pipe_errs = validate_markdown_hygiene([pipe_tbl], enforce_expected_roster=False)
+        assert any("unescaped '|'" in e for e in pipe_errs), f"expected unescaped pipe error, got {pipe_errs}"
+
+        # 4. Restricted token & host path must fail
+        tok_md = root / "04-tok.md"
+        bad_tok = RESTRICTED_PRODUCT_TOKENS[0]
+        bad_path = "/" + "Users/example"
+        tok_md.write_text(f"# Ch4\n\nMentions {bad_tok} at {bad_path}.\n", encoding="utf-8")
+        tok_errs = validate_markdown_hygiene([tok_md], enforce_expected_roster=False)
+        assert any("restricted product name" in e for e in tok_errs), f"expected token error, got {tok_errs}"
+        assert any("forbidden host path" in e for e in tok_errs), f"expected host path error, got {tok_errs}"
+
+    print("build_docs_manual.py self-tests passed (5/5 adversarial & determinism checks).")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     repo_root = Path(__file__).resolve().parent.parent
     default_src = repo_root / "docs" / "manual"
+    default_demo_html = repo_root / "docs" / "demo" / "index.html"
     default_out = repo_root / "target" / "manual"
 
     parser = argparse.ArgumentParser(
@@ -2275,20 +2506,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Validate internal page/anchor links and byte-for-byte build determinism",
+        help="Validate internal page/anchor links, hygiene invariants, and build determinism",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run built-in unit and adversarial validation self-tests and exit",
     )
     args = parser.parse_args(argv)
 
+    if args.self_test:
+        return run_self_tests()
+
     md_paths = discover_manual_pages(args.src)
+    demo_html = default_demo_html if args.src.resolve() == default_src.resolve() else None
     pages = [parse_manual_page(p) for p in md_paths]
-    site_files = build_site_files(pages)
+    site_files = build_site_files(pages, demo_html_path=demo_html)
     write_site_to_disk(args.out, site_files)
 
     if args.check:
-        errors = validate_internal_links(pages, site_files)
+        errors = validate_markdown_hygiene(
+            md_paths,
+            enforce_expected_roster=(args.src.resolve() == default_src.resolve()),
+        )
+        errors.extend(validate_internal_links(pages, site_files))
         # Re-parse and re-render to guarantee 100% deterministic byte output
         pages_second = [parse_manual_page(p) for p in discover_manual_pages(args.src)]
-        second_files = build_site_files(pages_second)
+        second_files = build_site_files(pages_second, demo_html_path=demo_html)
         if site_digest(site_files) != site_digest(second_files):
             errors.append("non-deterministic build output detected across consecutive renders")
 

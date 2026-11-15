@@ -131,7 +131,10 @@ $$\min_{X} \; \frac{1}{2}\bigl\| \mathcal{P}_\Omega \mathcal{F}^{-1}(X) - Y_{\te
 
 ## Analytical 1D Autophasing, Whittaker Baseline & `HSVD`
 
-For high-resolution small-molecule and biomolecular 1D NMR (`1H`, `13C{1H}`, `DEPT-90`, `DEPT-135`, `19F`, `31P`), `nmr-core::nmr1d` provides dedicated analytical DSP routines:
+For high-resolution small-molecule and biomolecular 1D NMR (`1H`, `13C{1H}`, `DEPT-90`, `DEPT-135`, `19F`, `31P`), `nmr-core::nmr1d` (`nmrassign nmr1d process`) provides dedicated analytical DSP routines:
+
+> [!NOTE] 1D DSP Validation Scope (Synthetic Forward-Model Self-Consistency)
+> Quantitative accuracy numbers reported below (`< 2°` `PHC0`, `< 5°` `PHC1`, `< 2.5%` `HSVD` solute integral bias at `35 Hz` offset) come from synthetic forward-model 1D benchmarks (`T14.1`); evaluation on real deposited raw small-molecule 1D Bruker/Varian `fid` acquisitions is tracked openly as follow-up **`F14`**.
 
 ### 1. Pivot & Minimum-Entropy 1D Autophasing (`auto_phase_1d`)
 

@@ -1,0 +1,66 @@
+name: Documentation Manual & Live WebGPU Demo
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: Build Static HTML Manual & wasm32 WebGPU Demo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain with wasm32-unknown-unknown
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry & wasm32 build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: docs-pages-wasm32
+
+      - name: Build and verify multi-chapter HTML manual
+        run: |
+          python3 scripts/build_docs_manual.py --self-test
+          python3 scripts/build_docs_manual.py --out "${{ runner.temp }}/pages_site" --check
+
+      - name: Build wasm32 WebGPU browser demo bundle
+        run: bash scripts/build_web_demo.sh --install-cli --out "${{ runner.temp }}/pages_site/demo"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/pages_site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy artifact to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
