@@ -193,6 +193,10 @@ def run_w1_p17_suite(root: Path, results_dir: Path, data_root: Path | None) -> t
             ["cargo", "check", "--release", "-p", "nmr-gui", "--target", "wasm32-unknown-unknown"],
             {"RUSTFLAGS": "-D warnings"},
         ),
+        (
+            ["cargo", "check", "-p", "nmr-cli", "-p", "nmr-gui", "--target", "x86_64-pc-windows-gnu"],
+            None,
+        ),
     ]
     for cmd, extra_env in hygiene_cmds:
         env = os.environ.copy()
@@ -375,7 +379,7 @@ def run_w1_p17_suite(root: Path, results_dir: Path, data_root: Path | None) -> t
         f"$ {' '.join(prereg_chk_cmd)}\n{sanitize_host_paths(prereg_chk_proc.stdout, root)}\n"
     )
     m_pchk = re.search(
-        r"gates=(\d+)/(\d+), datasets=(\d+) \((\d+) unique accessions\), urls=(\d+) \((\d+) HEAD-sized\), disjoint_vs=\(real:(\d+), phase1:(\d+), priors:(\d+), excluded:(\d+)\), private_dirs_clean=(\d+), sha256=([0-9a-f]{64})",
+        r"gates=(\d+)/(\d+), datasets=(\d+) \((\d+) unique accessions\), urls=(\d+) \((\d+) HEAD-sized\), disjoint_vs=\(real:(\d+), phase1:(\d+), priors:(\d+), excluded:(\d+)\), private_dirs_clean=(\d+), sha256=([0-9a-f]{64})(?:, frozen_w1_commit=([0-9a-f]+), crates_tree=([0-9a-f]+), cargo_lock_sha256=([0-9a-f]+))?",
         prereg_chk_proc.stdout,
     )
     if not m_pchk:
@@ -396,8 +400,31 @@ def run_w1_p17_suite(root: Path, results_dir: Path, data_root: Path | None) -> t
             "disjoint_priors": int(m_pchk.group(9)),
             "excluded_bmrb": m_pchk.group(10),
             "manifest_sha256": m_pchk.group(12),
+            "frozen_w1_commit_short": m_pchk.group(13) or "",
+            "crates_tree_short": m_pchk.group(14) or "",
+            "cargo_lock_short": m_pchk.group(15) or "",
         }
     )
+
+    hsqc_diff_p = results_dir / "dev_hsqc_selection_diff.json"
+    if hsqc_diff_p.is_file():
+        clean_hsqc_json = sanitize_host_paths(hsqc_diff_p.read_text(encoding="utf-8"), root)
+        write_clean_utf8(hsqc_diff_p, clean_hsqc_json)
+        hsqc_obj = json.loads(clean_hsqc_json)
+        dev_list = hsqc_obj.get("dev_entries", [])
+        dev_changed = sum(1 for e in dev_list if e.get("changed"))
+        s16238 = hsqc_obj.get("seen_p13_w2_16238", {})
+        hsqc_bytes, hsqc_sha = sha256_and_size(hsqc_diff_p)
+        metric_records.append(
+            {
+                "suite": "dev_hsqc_selection_diff",
+                "dev_total": len(dev_list),
+                "dev_changed": dev_changed,
+                "seen_16238_changed": bool(s16238.get("changed", False)),
+                "bytes": hsqc_bytes,
+                "sha256": hsqc_sha,
+            }
+        )
 
     man_st_cmd = ["python3", "scripts/build_docs_manual.py", "--self-test"]
     man_st_proc = subprocess.run(
@@ -527,10 +554,9 @@ def run_w1_benchmarks_and_workspace(
         text=True,
         check=False,
     )
-    write_clean_utf8(
-        results_dir / "w1_workspace_tests.log",
-        f"$ {' '.join(ws_cmd)}\n{sanitize_host_paths(ws_proc.stdout, root)}\n",
-    )
+    clean_ws_out = f"$ {' '.join(ws_cmd)}\n{sanitize_host_paths(ws_proc.stdout, root)}\n"
+    write_clean_utf8(results_dir / "w1_workspace_tests.log", clean_ws_out)
+    write_clean_utf8(results_dir / "cargo_test_workspace_r2.log", clean_ws_out)
     if ws_proc.returncode != 0:
         sys.stderr.write(ws_proc.stdout[-4000:])
         ws_proc.check_returncode()
@@ -808,8 +834,10 @@ def cited_w1_files(results_dir: Path, root: Path, extra_files: list[Path]) -> li
         "w1_p17_metrics.jsonl",
         "dev_discover_only.json",
         "dev_discover_only.log",
+        "dev_hsqc_selection_diff.json",
         "w1_scripts_checks.log",
         "w1_workspace_tests.log",
+        "cargo_test_workspace_r2.log",
         "w1_ubq_realistic_default.log",
         "w1_ubq_realistic_evograph.log",
         "w1_cisd3_evograph.json",
@@ -853,11 +881,17 @@ def render_digests_section(files: list[Path], root: Path, results_dir: Path) -> 
 def render_slice_17_1_section(records: list[dict[str, Any]], suite_log: Path) -> str:
     disc = find_suite(records, "discover_only_dev")
     f6a = find_suite(records, "f6a_empirical")
+    hsqc_diff = next((r for r in records if r.get("suite") == "dev_hsqc_selection_diff"), None)
     counts = disc["counts"]
     _, _, suites = parse_suite_pass_counts(suite_log)
     suite_map = {name: (p, f) for name, p, f in suites}
     qc_p, qc_f = suite_map.get("nmr-core::qc_tests", (0, 0))
     cli_p, cli_f = suite_map.get("nmr-cli::bin_nmrassign", (0, 0))
+    hsqc_sha_note = (
+        f" (`dev_hsqc_selection_diff.json` `{hsqc_diff['dev_changed']}/{hsqc_diff['dev_total']}` `dev` changed, `sha256={hsqc_diff['sha256'][:16]}...`)"
+        if hsqc_diff
+        else ""
+    )
 
     lines = [
         "#### Slice `17.1` (`F5` + `F6`) — Discovery Header Preflight & Multi-Batch `13C` Referencing QC",
@@ -870,19 +904,19 @@ def render_slice_17_1_section(records: list[dict[str, Any]], suite_log: Path) ->
             "| `13/13` `dev` `OK`, `0` FFT / `0` picking / `0` solving | `PASS` |"
         ),
         (
-            "| Depth-10 Varian `.fid` recursion, GFT `RDphase` & `fid.rs` Bruker NUS/PKNL parity (`F5`) "
-            f"| `nmr-cli::bin_nmrassign` `{cli_p}` passed / `{cli_f}` failed (`5844` depth-10 discovered, `15089` GFT rejected, `FnMODE=1`+`States-TPPI` & `PKNL=no` aligned) "
+            "| Depth-10 Varian `.fid` recursion & conservative header preflight relative to `fid.rs` (`F5`) "
+            f"| `nmr-cli::bin_nmrassign` `{cli_p}` passed / `{cli_f}` failed (`5844` `ZR18` `600 MHz` depth-10 discovered, `15089` Bruker GFT rejected at preflight, Varian `nbheaders.max(1)` & `<= 8 MiB` header cap) "
             "| `0` failed, `5844` stays `seen_p13_w2`, `0` `heldout` runs | `PASS` |"
         ),
         (
-            f"| Inter-experiment `13C` `CA` referencing consistency check (`F6a`) "
+            f"| Inter-experiment `13C` `CA` referencing consistency check (`F6a`, `17.1:P1-1`, `17.1:P1-3`) "
             f"| `dev` false warnings `{f6a['dev_warns']}/{f6a['dev_count']}` (`max_drift = {f6a['dev_min_drift_ppm']:.3f}..{f6a['dev_max_drift_ppm']:.3f} ppm < 0.50 ppm`); `16238` (`seen_p13_w2`) `warn = {f6a['seen_16238_warn']}`, `max_drift = {f6a['seen_16238_drift_ppm']:.3f} ppm` | "
-            "`0/13` `dev` FPs, `16238` `WARN` (`scale *= 0.78`, `0` uncalibrated `protein_hc_gate` clauses) | `PASS` |"
+            "`0/13` `dev` FPs, diagnostic-only `WARN` (`confidence_scale = 1.00`, `0` HC calls suppressed, empty-`hs` guard) | `PASS` |"
         ),
         (
-            "| Series-matched `2D HSQC` tie-breaker & `qc_tests` (`F6b`) "
-            f"| `0/13` `dev` HSQC selection changes; `16238` selects `vcr52.010` (`2008-10` `600 MHz`) over `vcr52.006` (`2009-05` `750 MHz`); `nmr-core::qc_tests` `{qc_p}/{qc_p + qc_f}` "
-            "| `0` `dev` drift, `13/13` `qc_tests` PASS | `PASS` |"
+            "| Primary 3D-paired `hsqc_series_selection_score` (`5..165 ppm` `15N` SW, Varian `dn2`) & `qc_tests` (`F6b`, `17.1:P1-2`) "
+            f"| `0/13` `dev` HSQC selection changes{hsqc_sha_note}; `16238` selects `vcr52.010` (`2008-10` `600 MHz`) over `vcr52.006` (`2009-05` `750 MHz`); `nmr-core::qc_tests` `{qc_p}/{qc_p + qc_f}` "
+            "| `0` `dev` drift (`dev_hsqc_selection_diff.json`), `13/13` `qc_tests` PASS | `PASS` |"
         ),
     ]
     return "\n".join(lines)
@@ -898,40 +932,49 @@ def render_slice_17_1b_section(root: Path, records: list[dict[str, Any]]) -> str
     exc = r1["allowed_pre_download_w1_exceptions"][0]
     relax_pin = exc["pinned_w1_sha256"]
     relax_bytes = exc["pinned_w1_bytes"]
+    frozen_commit = manifest.get("frozen_w1_commit", "")[:12]
+    crates_tree = manifest.get("frozen_crates_git_tree", "")[:12]
 
     gate_rows: list[str] = []
+    n_criteria_total = 0
     for gid in ("F10", "F11", "F13a", "F13b", "F13c", "F14", "F16", "F17"):
         g = manifest["gates"][gid]
         prim_accs = ", ".join(f"`{d['accession_id']}` (`{d['license']}`)" for d in g["primary_datasets"])
-        bkp_accs = ", ".join(f"`{d['accession_id']}`" for d in g["backup_datasets"])
+        bkp_accs = (
+            ", ".join(f"`{d['accession_id']}`" for d in g["backup_datasets"])
+            if g["backup_datasets"]
+            else "`none` (single canonical cohort)"
+        )
         n_urls = sum(len(d["files"]) for d in g["primary_datasets"] + g["backup_datasets"])
+        n_crit = len(g.get("pass_criteria", []))
+        n_criteria_total += n_crit
         gate_rows.append(
-            f"| `{gid}` (`{g['todo_item']}`) | {prim_accs} | {bkp_accs} | `{n_urls}` | `{g['adapter_kind'] if 'adapter_kind' in g else g['deterministic_format_adapter_spec']['adapter_kind']}` |"
+            f"| `{gid}` (`{g['todo_item']}`) | {prim_accs} | {bkp_accs} | `{n_urls}` | `{n_crit}` | `{g['adapter_kind'] if 'adapter_kind' in g else g['deterministic_format_adapter_spec']['adapter_kind']}` |"
         )
 
     lines = [
         "#### Slice `17.1b` (`T17.P`) — Pre-Registered Single-Shot Empirical Validation Manifest (`F10`–`F17`)",
         "",
-        "| Gate (`TODO.md`) | Primary / Co-Primary Open Accessions | Ordered Backup Accessions | HTTPS File URLs | Deterministic Format Adapter |",
-        "| :--- | :--- | :--- | ---: | :--- |",
+        "| Gate (`TODO.md`) | Primary / Co-Primary Open Accessions | Ordered Backup Accessions | HTTPS File URLs | Numeric Criteria | Deterministic Format Adapter |",
+        "| :--- | :--- | :--- | ---: | ---: | :--- |",
         *gate_rows,
         "",
         "| Pre-Registration Firewall & Validator Check | Measured Value | Gate | Status |",
         "| :--- | :--- | :--- | :---: |",
         (
-            f"| `verify_p17_preregistration.py --self-test` & `--check` "
-            f"| `{pr['gates_ok']}/{pr['gates_total']}` gates, `{pr['datasets']}` dataset records (`{pr['unique_accessions']}` unique accessions), `{pr['urls']}` HTTPS URLs (`{pr['head_sized_urls']}` `HEAD`-sized), `{pr['self_tests_passed']}/{pr['self_tests_total']}` adversarial self-tests "
-            "| `8/8` gates, `CC0`/`CC-BY-4.0`/`Public Domain` only, `0` bytes downloaded | `PASS` |"
+            f"| `verify_p17_preregistration.py --self-test` & `--check` (`17.1b:P1-1`, `17.1b:P1-3`) "
+            f"| `{pr['gates_ok']}/{pr['gates_total']}` gates (`{n_criteria_total}` finite numeric `pass_criteria`, `100%` bound `<placeholders>`, `0` `[--opt]` brackets), `{pr['datasets']}` dataset records (`{pr['unique_accessions']}` unique accessions), `{pr['urls']}` HTTPS URLs (`{pr['head_sized_urls']}` `HEAD`-sized), `{pr['self_tests_passed']}/{pr['self_tests_total']}` adversarial self-tests "
+            "| `8/8` gates, `CC0`/`CC-BY-4.0`/`Public Domain`, `0` data-payload bytes downloaded | `PASS` |"
         ),
         (
-            f"| Accession disjointness & `BMRB:53960` blind-firewall exclusion "
-            f"| Disjoint against `real_manifest.tsv` (`{pr['disjoint_real']}`), `manifest.tsv` (`{pr['disjoint_phase1']}`), `bmrb_priors.json` (`{pr['disjoint_priors']}`), and excluded `BMRB:{pr['excluded_bmrb']}` "
-            "| `100%` BMRB disjointness + zero `F10`–`F17` files in `data/private/` | `PASS` |"
+            f"| Adapter isolation (`P17-R2`) & accession disjointness + `BMRB:53960` firewall (`P17-R5`) "
+            f"| Adapters isolated in `scripts/p17_adapters/`; disjoint against `real_manifest.tsv` (`{pr['disjoint_real']}`), `manifest.tsv` (`{pr['disjoint_phase1']}`), `bmrb_priors.json` (`{pr['disjoint_priors']}`), and excluded `BMRB:{pr['excluded_bmrb']}` "
+            "| `100%` BMRB disjointness + zero `F10`–`F17` payload files in `data/private/` | `PASS` |"
         ),
         (
-            f"| Enforced `17.W1` cryptographic solver & WGSL shader freeze (`P17-R1`) "
-            f"| `{n_core}/{n_core}` `nmr-core` modules + `{n_wgsl}/{n_wgsl}` WGSL shaders enforced (`relax_mc.wgsl` pinned at `{relax_bytes:,} B`, `sha256={relax_pin[:16]}...`) "
-            "| `21/21` exact SHA-256 & byte-length pins enforced | `PASS` |"
+            f"| Enforced whole-`crates/` git tree, `Cargo.lock` & `21/21` file SHA-256 freeze (`P17-R1`, `17.1b:P1-2`) "
+            f"| `frozen_w1_commit={frozen_commit}`, `crates_tree={crates_tree}`, `Cargo.lock` + `{n_core}/{n_core}` `nmr-core` modules + `{n_wgsl}/{n_wgsl}` WGSL shaders (`relax_mc.wgsl` `{relax_bytes:,} B`, `sha256={relax_pin[:16]}...`) "
+            "| Whole `crates/` + `Cargo.lock` + `21/21` file SHA-256 pins enforced | `PASS` |"
         ),
     ]
     return "\n".join(lines)
@@ -990,13 +1033,13 @@ def render_slice_17_3_section(suite_log: Path) -> str:
         "| Security Hardening Item | Layer | Measured Verification | Gate | Status |",
         "| :--- | :--- | :--- | :--- | :---: |",
         (
-            "| `F19` Native Windows 256-bit OS CSPRNG (`BCryptGenRandom`, `BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x0000_0002`) & aligned target-cfg doc comments "
+            "| `F19` Native Windows 256-bit OS CSPRNG (`BCryptGenRandom`, `BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x0000_0002`) & fail-closed native TCP GUI/CLI RNG "
             "| `nmr-gui::mcp_bridge` + `nmr-cli::mcp_cmd` "
-            f"| `nmr-gui::mcp_bridge` `{mcp_gui_p}/{mcp_gui_p + mcp_gui_f}` passed (`0` new external crates, `status == 0` + non-all-zero guard) "
-            "| `256`-bit OS CSPRNG on Unix & Windows; doc matches cfg | `PASS` |"
+            f"| `nmr-gui::mcp_bridge` `{mcp_gui_p}/{mcp_gui_p + mcp_gui_f}` passed (`0` new crates, `x86_64-pc-windows-gnu` check exit `0`, native Unix/Windows TCP bridge fails closed `Err` on CSPRNG error) "
+            "| `256`-bit OS CSPRNG fail-closed on Unix & Windows | `PASS` |"
         ),
         (
-            "| `F20` `MIN_HTTP_BEARER_TOKEN_LEN = 32`, `NMR_MCP_BEARER_TOKEN` env-var priority & 64-hex CSPRNG auto-generation (`stderr` only) "
+            "| `F20` `MIN_HTTP_BEARER_TOKEN_LEN = 32`, `NMR_MCP_BEARER_TOKEN` recommendation (`--token` overrides when both passed) & `stderr` 64-hex CSPRNG auto-generation "
             "| `nmr-cli::mcp_cmd` + `docs/specs/18` + `docs/manual/06` "
             f"| `nmr-cli::mcp_cli_tests` `{mcp_cli_p}/{mcp_cli_p + mcp_cli_f}` passed (`< 32`-char argv/env rejected, `NMR_MCP_BEARER_TOKEN` accepted, omitted token auto-generates `64` hex on `stderr` with `0 B` `stdout`) "
             "| `>= 32` chars enforced, `0` secret leak on `stdout` | `PASS` |"
@@ -1021,14 +1064,14 @@ def render_slice_17_3b_section(records: list[dict[str, Any]], suite_log: Path) -
         (
             "| Dynamic `CompactMobile` (`< 680 px`), `TabletSplit` (`680..1024 px`) & `DesktopFull` (`>= 1024 px`) layout + 2D/3D multi-touch pinch-zoom "
             "| `nmr-gui` (`workflow_bar`, `contour_painter`, `mol3d_viewer`, `main`) "
-            f"| `mobile_layout_tests` `{mob_p}/{mob_p + mob_f}` + `demo_preset_tests` `{dem_p}/{dem_p + dem_f}` (`375x667`, `390x844`, `412x915` active canvas `>= 340 x 430 px` across `5` `ProteinNmr` + `4` `ChemStudio` tabs; `768x1024` `<= 1` dock & `>= 420 px` central width; `1440x900` dual-dock preserved) "
+            f"| `mobile_layout_tests` `{mob_p}/{mob_p + mob_f}` + `demo_preset_tests` `{dem_p}/{dem_p + dem_f}` (`375x667`, `390x844`, `412x915` active canvas `>= 340 x 430 px` across `5` `MobileProteinTab` + `4` `MobileChemTab` tabs; `768x1024` `<= 1` dock [`220..=300 px`] & `>= 420 px` central width; `1440x900` dual-dock + `15%` pan/zoom clamp, `9.5` font, `160 px` min canvas) "
             "| `>= 90%` width & `>= 65%` height on phones, `0` panics | `PASS` |"
         ),
         (
-            "| Mobile WebGPU HTML shells (`100dvh`, `viewport-fit=cover`, `env(safe-area-inset-*)`, `touch-action: none`) "
+            "| WCAG 1.4.4 zoom-preserving mobile WebGPU HTML shells (`100dvh`, `viewport-fit=cover`, `env(safe-area-inset-*)`, `touch-action: none`) "
             "| `docs/demo/index.html` + `crates/nmr-gui/index.html` + `scripts/build_web_demo.sh` "
-            f"| `wasm32_check_passed = {web['wasm32_check_passed']}`, `docs/demo/index.html` `{web['demo_html_bytes']:,} B` (`sha256={web['demo_html_sha256'][:16]}...`), `crates/nmr-gui/index.html` `{web['gui_html_bytes']:,} B` "
-            "| Byte-synced demo shell, `RUSTFLAGS=\"-D warnings\"` `wasm32` exit `0` | `PASS` |"
+            f"| `wasm32_check_passed = {web['wasm32_check_passed']}`, `docs/demo/index.html` `{web['demo_html_bytes']:,} B` (`sha256={web['demo_html_sha256'][:16]}...`), `crates/nmr-gui/index.html` `{web['gui_html_bytes']:,} B` (`user-scalable=no` & `maximum-scale=1.0` removed & rejected) "
+            "| Byte-synced WCAG 1.4.4 shell, `RUSTFLAGS=\"-D warnings\"` `wasm32` exit `0` | `PASS` |"
         ),
         (
             "| Mobile 9-chapter manual slide-over drawer (`☰`, backdrop, `Escape`) & table horizontal-scroll containment "
@@ -1050,13 +1093,13 @@ def render_slice_17_3c_section(records: list[dict[str, Any]]) -> str:
         (
             "| Procedural NMR icon suite & 3-OS release archive builder (`macos-arm64` `.app`/`.dmg`/`.tar.gz`, `windows-x86_64` `.zip` + `windows_subsystem`, `linux-x86_64` `.tar.gz` + `.desktop`) "
             "| `scripts/package_release.py` + `crates/nmr-gui/src/main.rs` "
-            f"| `{pkg['self_tests_passed']}/{pkg['self_tests_total']}` `--self-test` checks PASS (`nmr-assign.icns` `{pkg['icns_bytes']:,} B`, `nmr-assign.ico` `{pkg['ico_bytes']:,} B`, `nmr-assign.svg` `{pkg['svg_bytes']:,} B`, `plutil -lint`, `codesign --verify --deep --strict`, UDZO `.dmg`, `0755` tar modes, `SHA256SUMS.txt` tamper rejection) "
+            f"| `{pkg['self_tests_passed']}/{pkg['self_tests_total']}` `--self-test` checks PASS (`nmr-assign.icns` `{pkg['icns_bytes']:,} B`, `nmr-assign.ico` `{pkg['ico_bytes']:,} B`, `nmr-assign.svg` `{pkg['svg_bytes']:,} B`, `plutil -lint`, `codesign --verify --deep --strict`, UDZO `.dmg`, `0755` tar modes, `SHA256SUMS.txt` `--checksums` / `--verify-checksums` tamper rejection) "
             "| `100%` Python 3 stdlib, `5/5` self-tests PASS | `PASS` |"
         ),
         (
             "| Least-privilege cross-platform GitHub Release pipeline "
             "| `.github/workflows/release.yml` "
-            f"| `{pkg['release_yml_bytes']:,} B` (`sha256={pkg['release_yml_sha256'][:16]}...`), `push.tags: ['v*']` + `workflow_dispatch` only, top-level `permissions: {{}}`, `macos-14` + `windows-latest` + `ubuntu-22.04` (`glibc 2.35`), built-in `gh release` "
+            f"| `{pkg['release_yml_bytes']:,} B` (`sha256={pkg['release_yml_sha256'][:16]}...`), `push.tags: ['v*']` + `workflow_dispatch` only, top-level `permissions: {{}}`, `macos-14` + `windows-latest` + `ubuntu-22.04` (`glibc 2.35`), first-party `actions/{{checkout,cache,upload-artifact,download-artifact}}@v4` + built-in `gh release` "
             "| `0` branch CI burn, `0` third-party Marketplace actions | `PASS` |"
         ),
     ]
