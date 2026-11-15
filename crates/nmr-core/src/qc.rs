@@ -2536,15 +2536,6 @@ pub fn evaluate_dataset_qc_with_gate(
                 solution_margin * 100.0
             ));
         }
-        if inter_exp_c13_offset_warn
-            && (max_inter_exp_ca_drift_ppm >= 1.00 || solution_margin < 0.50)
-        {
-            hc_gate_reasons.push(format!(
-                "protein_hc_gate[inter_exp_c13_mismatch]: inter-experiment 13C CA drift {:.2} ppm (margin {:.1}%)",
-                max_inter_exp_ca_drift_ppm,
-                solution_margin * 100.0
-            ));
-        }
     }
     if hc_count > 0 && assigned_count * 5 < n_assignable_amides {
         hc_gate_reasons.push(format!(

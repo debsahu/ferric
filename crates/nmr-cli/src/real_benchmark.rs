@@ -2228,51 +2228,58 @@ fn check_bruker_indirect_axis_header_only(
             dir.display()
         ));
     }
-    let fn_mode: i32 = acqu_ind
-        .get("FnMODE")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let quad_mode = match fn_mode {
-        1 => QuadMode::Qf,
-        4 => QuadMode::States,
-        5 => QuadMode::StatesTppi,
-        6 => QuadMode::EchoAntiecho,
-        0 => {
-            if let Some(qm) = ind_phys
-                .filter(|ip| {
-                    matches!(
-                        ip.quad_source,
-                        nmr_core::pulprog::QuadSource::SynthesizedManualLoop { .. }
-                    )
-                })
-                .and_then(|ip| ip.quad_mode.to_fid_quad_mode())
-            {
+    let fnmode_opt: Option<i32> = match acqu_ind.get("FnMODE") {
+        Some(raw) => Some(raw.trim().parse::<i32>().map_err(|e| {
+            format!(
+                "invalid FnMODE {raw:?} on Bruker {dim_label} in {}: {e}",
+                dir.display()
+            )
+        })?),
+        None => None,
+    };
+    let manual_loop_quad = ind_phys
+        .filter(|ip| {
+            matches!(
+                ip.quad_source,
+                nmr_core::pulprog::QuadSource::SynthesizedManualLoop { .. }
+            )
+        })
+        .and_then(|ip| ip.quad_mode.to_fid_quad_mode());
+    let quad_mode = match fnmode_opt {
+        Some(1) => manual_loop_quad.unwrap_or(QuadMode::Qf),
+        Some(4) => QuadMode::States,
+        Some(5) => QuadMode::StatesTppi,
+        Some(6) => QuadMode::EchoAntiecho,
+        None | Some(0) => {
+            if let Some(qm) = manual_loop_quad {
                 qm
-            } else {
-                let mc2 = proc_ind
-                    .and_then(|p| p.get("MC2"))
-                    .and_then(|v| v.parse::<i32>().ok());
+            } else if let Some(mc2_raw) = proc_ind.and_then(|p| p.get("MC2")) {
+                let mc2 = mc2_raw.trim().parse::<i32>().map_err(|e| {
+                    format!(
+                        "invalid ##$MC2 {mc2_raw:?} on Bruker {dim_label} in {}: {e}",
+                        dir.display()
+                    )
+                })?;
                 match mc2 {
-                    Some(0) => QuadMode::Qf,
-                    Some(3) => QuadMode::States,
-                    Some(4) => QuadMode::StatesTppi,
-                    Some(5) => QuadMode::EchoAntiecho,
-                    Some(other) => {
+                    0 => QuadMode::Qf,
+                    3 => QuadMode::States,
+                    4 => QuadMode::StatesTppi,
+                    5 => QuadMode::EchoAntiecho,
+                    other => {
                         return Err(format!(
                             "Bruker {dim_label} FnMODE is Undefined (0) and proc*s MC2={other} is unsupported in {}",
                             dir.display()
                         ));
                     }
-                    None => {
-                        return Err(format!(
-                            "Bruker {dim_label} FnMODE is Undefined (0) and neither pulseprogram nor proc*s MC2 specifies quadrature in {}",
-                            dir.display()
-                        ));
-                    }
                 }
+            } else {
+                return Err(format!(
+                    "Bruker {dim_label} FnMODE is Undefined (0) and neither pulseprogram nor proc*s MC2 specifies quadrature in {}",
+                    dir.display()
+                ));
             }
         }
-        other => {
+        Some(other) => {
             return Err(format!(
                 "unsupported Bruker {dim_label} FnMODE={other} in {} (expected 1=QF, 4=States, 5=States-TPPI, 6=Echo-Antiecho)",
                 dir.display()
@@ -2458,19 +2465,35 @@ fn check_bruker_header_compatibility(
             dir.display()
         ));
     }
-    let grpdly = acqus
+    let procs_raw = read_optional_bruker_proc_header_only(dir, "procs");
+    let proc2s_raw = read_optional_bruker_proc_header_only(dir, "proc2s");
+    let proc3s_raw = read_optional_bruker_proc_header_only(dir, "proc3s");
+    let (procs, proc2s, proc3s) =
+        if expected_dims >= 3 && proc2s_raw.is_some() && proc3s_raw.is_none() {
+            (None, None, None)
+        } else {
+            (procs_raw, proc2s_raw, proc3s_raw)
+        };
+
+    let pknl_enabled = procs
+        .as_ref()
+        .and_then(|p| p.get("PKNL"))
+        .map(|v| !v.eq_ignore_ascii_case("no") && v != "0")
+        .unwrap_or(true);
+    let grpdly_raw = acqus
         .get("GRPDLY")
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(-1.0);
-    if !(grpdly >= 0.0 && grpdly.is_finite()) {
+    if pknl_enabled && !(grpdly_raw > 0.0 && grpdly_raw.is_finite()) {
         let dspfvs: i32 = acqus
             .get("DSPFVS")
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(0);
-        let decim: i32 = acqus.get("DECIM").and_then(|v| v.parse().ok()).unwrap_or(1);
-        if dspfvs > 0 && decim > 1 {
-            let _ = nmr_core::fid::bruker_dsp_group_delay(dspfvs, decim)?;
-        }
+        let decim: i32 = acqus
+            .get("DECIM")
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(1);
+        let _ = nmr_core::fid::bruker_dsp_group_delay(dspfvs, decim)?;
     }
 
     let ser_path = find_child_ci(dir, "ser")
@@ -2490,13 +2513,6 @@ fn check_bruker_header_compatibility(
             .filter(|&v| v > 0)
     };
 
-    let proc2s_raw = read_optional_bruker_proc_header_only(dir, "proc2s");
-    let proc3s_raw = read_optional_bruker_proc_header_only(dir, "proc3s");
-    let (proc2s, proc3s) = if expected_dims >= 3 && proc2s_raw.is_some() && proc3s_raw.is_none() {
-        (None, None)
-    } else {
-        (proc2s_raw, proc3s_raw)
-    };
     let sched_file = find_bruker_nuslist_header_only(dir, &acqus);
 
     let td_acq_y: usize = acqu2s
@@ -9011,12 +9027,91 @@ mod tests {
             "array 2 2 64 0 0 2 1 1 1 64\n1 \"phase,phase2\"\n0\n",
         );
 
+        // 1c. Bruker entry (`90006`) with `FnMODE=1` (QF) + NUS + manual `States-TPPI` `ip3`/`ip31*2`
+        //     `pulseprogram` (`QuadSource::SynthesizedManualLoop`, `q1_mult = 2`, 2 NUS points => 4 traces)
+        //     and `GRPDLY=0` + `DSPFVS=99`/`DECIM=4` bypassed by `pdata/1/procs` `##$PKNL= no`.
+        let e_manloop = data_root.join("90006");
+        fs::create_dir_all(&e_manloop).unwrap();
+        fs::copy(&fixture_star, e_manloop.join("bmr90006_3.str")).unwrap();
+        let manloop_hsqc = e_manloop.join("2");
+        fs::create_dir_all(manloop_hsqc.join("pdata/1")).unwrap();
+        fs::write(
+            manloop_hsqc.join("acqus"),
+            "##$PULPROG= <hsqcetfpf3gpsi>\n\
+             ##$NUC1= <1H>\n\
+             ##$SFO1= 600.1300\n\
+             ##$SW= 14.0\n\
+             ##$TD= 16\n\
+             ##$DTYPA= 0\n\
+             ##$AQ_mod= 3\n\
+             ##$GRPDLY= 0\n\
+             ##$DSPFVS= 99\n\
+             ##$DECIM= 4\n",
+        )
+        .unwrap();
+        fs::write(
+            manloop_hsqc.join("pdata/1/procs"),
+            "##$FT_mod= 6\n##$PKNL= no\n",
+        )
+        .unwrap();
+        fs::write(
+            manloop_hsqc.join("acqu2s"),
+            format!(
+                "##$NUC1= <15N>\n\
+                 ##$SFO1= {:.4}\n\
+                 ##$SW= 32.00\n\
+                 ##$TD= 4\n\
+                 ##$NusTD= 8\n\
+                 ##$FnTYPE= 2\n\
+                 ##$FnMODE= 1\n",
+                600.13 * 0.101329
+            ),
+        )
+        .unwrap();
+        fs::write(
+            manloop_hsqc.join("pulseprogram"),
+            "; custom HSQC with manual ip3/ip31*2 States-TPPI loop while FnMODE=1 (QF)\n\
+             1 ze\n\
+             2 d1 do:f3\n\
+             3 (p1 ph1)\n\
+               d4\n\
+               (p21 ph3):f3\n\
+               d0\n\
+               (p2 ph2)\n\
+               d0\n\
+               (p21 ph4):f3\n\
+               go=3 ph31 cpd3:f3\n\
+               d1 do:f3 wr #0 if #0 zd ip3\n\
+               lo to 3 times 2\n\
+               d1 id0 ip3*2 ip31*2\n\
+               lo to 2 times l0\n\
+             exit\n\
+             ph1=0\n\
+             ph2=0\n\
+             ph3=0 2\n\
+             ph4=0\n\
+             ph31=0 2\n",
+        )
+        .unwrap();
+        fs::write(manloop_hsqc.join("nuslist"), "0\n2\n").unwrap();
+        fs::write(manloop_hsqc.join("ser"), vec![0u8; 4 * 1024]).unwrap();
+        write_synthetic_bruker_exp_dir(
+            &e_manloop.join("3"),
+            "hncogp3d",
+            600.13,
+            8,
+            14.0,
+            "13C",
+            Some((8, 32.0, "15N")),
+        );
+
         let clean_manifest = dir.join("clean_manifest.tsv");
         fs::write(
             &clean_manifest,
             "bmrb_id\tprotein\tresidues\tfield_mhz\tvendor\texperiments\tsplit\tcohort\n\
              90001\tCleanBruker\t76\t600\tBruker\tHSQC,HNCO,HNCACB\tdev\tdev\n\
              90002\tDeepVarian7\t76\t600\tVarian\tHSQC,HNCO,HNCACB\tdev\tdev\n\
+             90006\tManLoopNus\t76\t600\tBruker\tHSQC,HNCO\tdev\tdev\n\
              90099\tAbsentEntry\t76\t600\tBruker\tHSQC,HNCO\tdev\tdev\n",
         )
         .unwrap();
@@ -9034,12 +9129,90 @@ mod tests {
             json_out.to_string_lossy().into_owned(),
         ];
         cmd_real_benchmark(&args_ok)
-            .expect("clean + skipped entries should succeed in --discover-only");
+            .expect("clean + manual-loop NUS + skipped entries should succeed in --discover-only");
         let json_txt = fs::read_to_string(&json_out).unwrap();
         assert!(json_txt.contains("\"mode\": \"discover-only\""));
-        assert!(json_txt.contains("\"ok\": 2"));
+        assert!(json_txt.contains("\"ok\": 3"));
         assert!(json_txt.contains("\"skipped\": 1"));
         assert!(json_txt.contains("\"l1/l2/l3/l4/l5/l6/ghncacb.fid\""));
+
+        // Direct parity checks for strict `FnMODE`/`MC2` parsing and `GRPDLY=0` / `PKNL` / 3D `xfb` plane guard
+        let bogus_fnmode = dir.join("unit_bogus_fnmode");
+        write_synthetic_bruker_exp_dir(
+            &bogus_fnmode,
+            "hsqcetfpf3gpsi",
+            600.13,
+            8,
+            32.0,
+            "15N",
+            None,
+        );
+        fs::write(
+            bogus_fnmode.join("acqu2s"),
+            "##$NUC1= <15N>\n##$SFO1= 60.81\n##$SW= 32.0\n##$TD= 8\n##$FnMODE= <bogus>\n",
+        )
+        .unwrap();
+        let err_fn = check_bruker_header_compatibility(&bogus_fnmode, 2, false)
+            .expect_err("malformed non-integer FnMODE must fail closed");
+        assert!(err_fn.contains("invalid FnMODE"), "got: {err_fn}");
+
+        fs::write(
+            bogus_fnmode.join("acqu2s"),
+            "##$NUC1= <15N>\n##$SFO1= 60.81\n##$SW= 32.0\n##$TD= 8\n##$FnMODE= 0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(bogus_fnmode.join("pdata/1")).unwrap();
+        fs::write(
+            bogus_fnmode.join("pdata/1/proc2s"),
+            "##$FT_mod= 6\n##$MC2= not_an_int\n",
+        )
+        .unwrap();
+        let err_mc2 = check_bruker_header_compatibility(&bogus_fnmode, 2, false)
+            .expect_err("malformed non-integer MC2 must fail closed");
+        assert!(err_mc2.contains("invalid ##$MC2"), "got: {err_mc2}");
+
+        let grpdly_zero_3d = dir.join("unit_grpdly_zero_3d");
+        write_synthetic_bruker_exp_dir(
+            &grpdly_zero_3d,
+            "hncogp3d",
+            600.13,
+            8,
+            14.0,
+            "13C",
+            Some((8, 32.0, "15N")),
+        );
+        fs::write(
+            grpdly_zero_3d.join("acqus"),
+            "##$PULPROG= <hncogp3d>\n\
+             ##$NUC1= <1H>\n\
+             ##$SFO1= 600.1300\n\
+             ##$SW= 14.0\n\
+             ##$TD= 16\n\
+             ##$DTYPA= 0\n\
+             ##$AQ_mod= 3\n\
+             ##$GRPDLY= 0\n\
+             ##$DSPFVS= 99\n\
+             ##$DECIM= 4\n",
+        )
+        .unwrap();
+        assert!(
+            check_bruker_header_compatibility(&grpdly_zero_3d, 3, false).is_err(),
+            "GRPDLY=0 with unsupported DSPFVS=99/DECIM=4 must fail closed when PKNL is enabled"
+        );
+        fs::create_dir_all(grpdly_zero_3d.join("pdata/1")).unwrap();
+        fs::write(
+            grpdly_zero_3d.join("pdata/1/procs"),
+            "##$FT_mod= 6\n##$PKNL= no\n",
+        )
+        .unwrap();
+        fs::write(grpdly_zero_3d.join("pdata/1/proc2s"), "##$FT_mod= 6\n").unwrap();
+        assert!(
+            check_bruker_header_compatibility(&grpdly_zero_3d, 3, false).is_err(),
+            "2D xfb scout plane (proc2s without proc3s on 3D) must clear procs so PKNL=no is ignored"
+        );
+        fs::write(grpdly_zero_3d.join("pdata/1/proc3s"), "##$FT_mod= 6\n").unwrap();
+        check_bruker_header_compatibility(&grpdly_zero_3d, 3, false)
+            .expect("3D cube with proc3s + procs PKNL=no must bypass GRPDLY=0 DSP lookup");
 
         // 2. GFT `RDphase` Varian entry (`90003`, modeling `15089` `array="phase2,phase,RDphase"`, `RDphase=[1,2]`)
         let e_gft = data_root.join("90003");
