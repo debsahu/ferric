@@ -3,13 +3,19 @@
   "phase": "17",
   "title": "Phase 17 Single-Shot Empirical Pre-Registration Manifest (F10, F11, F13a, F13b, F13c, F14, F16, F17)",
   "preregistered_date": "2026-11-15",
-  "frozen_solver_baseline_tag": "v0.12.0",
-  "frozen_solver_baseline_commit": "418a20f0762fd92e67ab6d49b56033ea7b1aeb27",
-  "zero_bytes_downloaded_at_registration": true,
+  "solver_v0_12_0_reference_tag": "v0.12.0",
+  "solver_v0_12_0_reference_commit": "418a20f0762fd92e67ab6d49b56033ea7b1aeb27",
+  "frozen_w1_commit": "c38448c05bce059c695651f8a03c8249c2a06504",
+  "frozen_crates_git_tree": "399c2013920a33e79a83619c47f4343dd147d8fa",
+  "cargo_lock_bytes": 82466,
+  "cargo_lock_sha256": "da9106edc758dcc7e9f81f3997a907ada659ec44e45f12a5ea4452e8a6156755",
+  "freeze_stamp_note": "Enforces whole-crates/ git tree (git rev-parse <frozen_w1_commit>:crates == git rev-parse HEAD:crates), clean git diff/status on crates/ and Cargo.lock, Cargo.lock SHA-256, and 21/21 solver/WGSL file SHA-256 pins. Run `python3 scripts/verify_p17_preregistration.py --stamp-current-freeze` right after merging final 17.W1 crate fixes to stamp the final post-remediation 17.W1 commit and HEAD:crates tree hash strictly before fetching any F10-F17 data payload.",
+  "zero_data_payload_bytes_downloaded_at_registration": true,
+  "registration_metadata_inspection_disclosure": "Zero spectral, FID, relaxation-rate, dispersion, titration, diffusion, or metabolomics data-payload bytes were downloaded at registration time. Lightweight public catalog API responses (BMRB saveframe tag schemas and row counts including the BMRB:6470 600 MHz dual-saveframe stamp, Zenodo record JSONs, Mendeley Data file listings, RCSB PDB entries), HTTP HEAD Content-Length probes (53/73 URLs), and MetaboLights MTBLS1 ISA-Tab sample/assay metadata sheets (s_MTBLS1.txt and a_MTBLS1_metabolite_profiling_NMR_spectroscopy.txt) were inspected solely to bind accession schemas and sample-to-archive joins a priori without downloading spectral or rate payloads.",
   "excluded_contaminated_entries": [
     "BMRB:53960"
   ],
-  "excluded_contaminated_entries_disclosure": "During BMRB REST API saveframe tag-name schema probing (/v2/entry/53960), an embedded free-text Text_data block was emitted to stdout. BMRB:53960 is permanently excluded from all Phase 17 primary and backup candidate sets to preserve an uncompromisingly blind pre-registration firewall (p17_prereg_candidates.md §0.2).",
+  "excluded_contaminated_entries_disclosure": "During BMRB REST API saveframe tag-name schema probing (/v2/entry/53960), an embedded free-text Text_data block was emitted to stdout. BMRB:53960 is permanently excluded from all Phase 17 primary and backup candidate sets (including F13c ZENODO:17228160, which therefore runs exclusively from unlabelled 2D HSQC apo peaks without reading BMRB:53960) to preserve an uncompromisingly blind pre-registration firewall (p17_prereg_candidates.md \u00a70.2).",
   "disjointness_verified_against": [
     "data/benchmark/real_manifest.tsv",
     "data/benchmark/manifest.tsv",
@@ -25,7 +31,15 @@
     "rule_1_solver_and_shader_freeze": {
       "rule_id": "P17-R1",
       "enforced": true,
-      "summary": "Zero edits to solver/physics Rust modules or WebGPU WGSL shaders between pre-registration commit freeze and completion of single-shot empirical execution across all 8 gates, except F12(a) Kahan-summed weighted mean centering in varpro_two_param (relax_mc.wgsl) frozen in 17.W1 strictly before any F10-F17 network download.",
+      "enforced_whole_crates_tree": true,
+      "enforced_cargo_lock": true,
+      "frozen_paths": [
+        "crates/",
+        "Cargo.lock"
+      ],
+      "adapter_isolation_dir": "scripts/p17_adapters/",
+      "mid_wave_crate_bug_policy": "Zero edits to any file inside crates/ or Cargo.lock are permitted between the stamped 17.W1 pre-registration freeze commit and completion of single-shot empirical execution across all 8 gates (F10-F17). If any crate bug in crates/ blocks a gate mid-wave, that gate MUST be reported as FAIL at the frozen crates/ tree (NOT_EVALUABLE is strictly reserved for external archive HTTP 404, payload corruption, or missing required vendor files after exhausting the entire pre-registered fallback chain); any subsequent code fix in crates/ must be executed and disclosed separately as a non-blind post-hoc run.",
+      "summary": "Cryptographic freeze of the entire crates/ git tree (`frozen_crates_git_tree`), `Cargo.lock` (`cargo_lock_sha256`), and all 21 solver/WGSL files between the 17.W1 pre-registration freeze commit (`frozen_w1_commit`) and completion of single-shot empirical execution across all 8 gates, recording F12(a) Kahan-summed weighted mean centering in varpro_two_param (`relax_mc.wgsl`) frozen in 17.W1 strictly before any F10-F17 data-payload download.",
       "protected_core_files": [
         "crates/nmr-core/src/relax_io.rs",
         "crates/nmr-core/src/relax_fit.rs",
@@ -60,7 +74,7 @@
           "v0120_sha256": "a6b9d4ecc96a044f93e1b2289195d69b2b2da7ab17dca6ba25257e26548f6807",
           "pinned_w1_bytes": 30492,
           "pinned_w1_sha256": "5c7ac1e4cd5cde95aed2ff2a44a3da696ddc6fe6d3bc9b794fd8c5c60a7903f7",
-          "reason": "Kahan-summed weighted mean centering in 2-parameter varpro_two_param frozen in 17.W1 strictly prior to downloading any F10-F17 dataset; exact post-F12(a) SHA-256 is now pinned and actively enforced alongside all 20 other solver/shader modules."
+          "reason": "Kahan-summed weighted mean centering in 2-parameter varpro_two_param frozen in 17.W1 strictly prior to downloading any F10-F17 dataset; exact post-F12(a) SHA-256 is pinned and actively enforced alongside the whole crates/ git tree and all 20 other solver/shader modules."
         }
       ],
       "v0120_baseline_sha256": {
@@ -240,35 +254,67 @@
       "rule_id": "P17-R2",
       "enforced": true,
       "zero_physics_or_parameter_tuning": true,
-      "summary": "All format-adapter transformations from deposited archive syntax to CLI TSV inputs are purely syntactic or deterministic unit/header algebra fixed a priori before downloading a single byte.",
+      "adapter_directory": "scripts/p17_adapters/",
+      "require_pre_invocation_sha256_hash": true,
+      "forbid_crates_edits": true,
+      "forbid_unregistered_numeric_constants": true,
+      "summary": "All deterministic format adapters MUST reside outside crates/ inside scripts/p17_adapters/, be committed or FIPS 180-4 SHA-256 hashed in the wave ledger strictly before the first nmrassign invocation on that gate, and contain zero tunable physics or algorithmic constants beyond literals explicitly bound in this manifest.",
       "fixed_conversions": [
         {
           "id": "relaxation_time_to_rate",
-          "applies_to": ["F10", "F11", "F13b"],
+          "applies_to": [
+            "F10",
+            "F11",
+            "F13b"
+          ],
           "formula": "R = 1.0 / T; sigma_R = sigma_T / (T * T)",
           "trigger": "Deposited NMR-STAR or plain-text table reports longitudinal/transverse relaxation times T1, T2, or T1rho in seconds (s) instead of rates in s^-1."
         },
         {
           "id": "bmrb6470_dual_field_saveframe_disambiguation",
-          "applies_to": ["F10"],
+          "applies_to": [
+            "F10"
+          ],
           "formula": "median(T1_saveframe_A) > median(T1_saveframe_B) => A = 600.13 MHz, B = 360.13 MHz",
           "trigger": "BMRB 6470 NMR-STAR 2.1->3.1 remediation stamped both Tjandra et al. (1995) static fields with Spectrometer_frequency_1H = 600; folded ubiquitin T1 increases monotonically with B0 above omega_N * tau_m ~ 1, disambiguating 600.13 vs 360.13 MHz without inspecting S^2."
         },
         {
+          "id": "bruker_hsqct2etf3gpsi3d_vclist_loop_timing",
+          "applies_to": [
+            "F11"
+          ],
+          "formula": "tau_cpmg_block_s = sum_{d_k in vc_loop} D[k] + sum_{p_m in vc_loop} (P[m] * 1.0e-6) (for standard 8-echo Bruker hsqct2etf3gpsi3d: 16.0 * D[20] + 8.0 * (P[4] * 1.0e-6), with P[4] = 2.0 * P[3] if P[4] == 0); t_i = vclist[i] * tau_cpmg_block_s",
+          "trigger": "Invoked ONLY as a disclosed diagnostic comparison if native `nmrassign relax` (which runs first with zero `--delays` override) errors on `vclist` units; both native zero-override and pulseprogram-derived `--delays` outcomes must be reported candidly."
+        },
+        {
           "id": "cest_plain_text_to_11col_tsv",
-          "applies_to": ["F13a"],
+          "applies_to": [
+            "F13a"
+          ],
           "formula": "I_norm = I / I0; sigma_norm = (I / I0) * sqrt((sigma_I / I)^2 + (sigma_I0 / I0)^2) when reference plane I0 row is separate; major_ppm_hint = argmin_offset(I_norm)",
           "trigger": "Plain-text saturation profile archives storing header B0/T_EX/B1_FRQ/B1_INH metadata and 3-column [offset, intensity, uncertainty] tables."
         },
         {
+          "id": "csp_unassigned_apo_peaks_to_4col_tsv",
+          "applies_to": [
+            "F13c"
+          ],
+          "formula": "Run `nmrassign pick --hsqc <apo_2d_spectrum> -o <raw_apo_peaks.tsv>` with zero extra flags (compiled classical 2D default `--snr 5.0`), then map row k (1..N) `exp\\tid\\th\\tn...` -> `k\\tUNK\\th\\tn` (`seq_id\\tres_name\\th_ppm\\tn_ppm`)",
+          "trigger": "Titration archives lacking a non-firewalled apo `_Atom_chem_shift` `.str` list (specifically primary `ZENODO:17228160` where `BMRB:53960` is firewalled)."
+        },
+        {
           "id": "dosy_locked_g0_f2_box_integration",
-          "applies_to": ["F16"],
+          "applies_to": [
+            "F16"
+          ],
           "formula": "1D F2 exponential apodization (1.0 Hz), 2x zero-fill, FFT, phase locked on plane m = 0 (lowest gradient g_0), peak pick SNR >= 10 on plane m = 0 excluding residual HDO [4.65, 4.95] ppm, integrate fixed +-2*FWHM ppm boxes across m = 0..M-1",
           "trigger": "Raw Bruker ser+difflist or Varian fid+procpar pseudo-2D DOSY directories paired with nmrassign dosy --exp-dir."
         },
         {
           "id": "mtbls1_isatab_cohort_manifest",
-          "applies_to": ["F17"],
+          "applies_to": [
+            "F17"
+          ],
           "formula": "Join s_MTBLS1.txt (`Sample Name`, `Factor Value[Metabolic syndrome]`) 1-to-1 with a_MTBLS1_metabolite_profiling_NMR_spectroscopy.txt (`Raw Spectral Data File` .zip, ignoring duplicate .nmrML conversions)",
           "trigger": "MetaboLights MTBLS1 N = 132 human urinary cohort (84 Control Group, 48 diabetes mellitus)."
         }
@@ -291,7 +337,7 @@
         "corrupted_or_truncated_archive_payload",
         "missing_required_vendor_acquisition_headers_or_reference_saveframes"
       ],
-      "summary": "If a primary archive URL is unreachable, corrupted/truncated, or missing required vendor headers upon first download, log the exact failure reason verbatim and step strictly in pre-registered order (primary -> co_primary -> backup_1 -> ...) using the identical frozen binary and CLI flags without parameter tuning."
+      "summary": "If a primary archive URL is unreachable, corrupted/truncated, or missing required vendor headers upon first download, log the exact failure reason verbatim and step strictly in pre-registered order (primary -> co_primary -> backup_1 -> ...) using the identical frozen binary and CLI flags without parameter tuning. Accuracy or runtime misses on valid archive files are FAIL and NEVER trigger fallback."
     },
     "rule_4_candid_single_shot_reporting": {
       "rule_id": "P17-R4",
@@ -299,13 +345,73 @@
       "single_shot_max_runs_per_dataset": 1,
       "report_both_agreements_and_discrepancies": true,
       "forbid_selective_metric_omission": true,
-      "summary": "Execute each gate single-shot after commit freeze and report all pre-registered evaluation metrics candidly in TODO.md, README.md, and CHANGELOG.md — including both quantitative agreements and any discrepancies, model mismatches, or archive/header failures."
+      "summary": "Execute each gate single-shot after commit freeze, evaluate all numeric `pass_criteria` objectively (`PASS`, `FAIL`, or `NOT_EVALUABLE`), and report both primary pass/fail outcomes and `secondary_report_only_metrics` candidly in TODO.md, README.md, and CHANGELOG.md \u2014 including any discrepancies, model mismatches, or archive/header failures."
+    },
+    "rule_5_accession_disjointness_and_zero_payload_firewall": {
+      "rule_id": "P17-R5",
+      "enforced": true,
+      "summary": "100% of pre-registered BMRB polymer accessions are verified disjoint against `data/benchmark/real_manifest.tsv` (40 entries), `data/benchmark/manifest.tsv` (12 entries), `data/priors/bmrb_priors.json` & `data/priors/PROVENANCE.md` (21 entries), and `excluded_contaminated_entries` (`BMRB:53960`), with zero F10-F17 payload archives present in `data/private/` at pre-registration time."
     }
   },
   "gates": {
     "F10": {
       "todo_item": "TODO.md:130",
       "gate_name": "Experimental 15N R1/R2/hetNOE & Lipari-Szabo Model-Free (S^2, tau_m, D_par/D_perp)",
+      "primary_endpoint": "Joint recovery of global rotational tumbling time tau_m, axially symmetric rotational diffusion anisotropy D_par/D_perp, and per-residue Lipari-Szabo amide order parameters S^2 on two-field (600.13 & 360.13 MHz) human ubiquitin 15N relaxation data (BMRB:6470 + PDB:1D3Z).",
+      "pass_criteria_conjunction": "ALL",
+      "pass_criteria": [
+        {
+          "id": "F10-C1",
+          "metric": "abs(tau_m_ns - 4.09) / 4.09",
+          "operator": "<=",
+          "threshold": 0.1,
+          "reference_value_or_source": "tau_m_ref = 4.09 ns (Tjandra et al., J. Am. Chem. Soc. 1995, 117, 12562-12566, Table 1; BMRB:6470)",
+          "rationale": "Global rotational correlation time recovery within <= 10% relative error across two-field 600.13/360.13 MHz 15N R1/R2/hetNOE data."
+        },
+        {
+          "id": "F10-C2",
+          "metric": "abs(d_par_over_d_perp - 1.17)",
+          "operator": "<=",
+          "threshold": 0.12,
+          "reference_value_or_source": "D_par/D_perp_ref = 1.17 on human ubiquitin (Tjandra et al., J. Am. Chem. Soc. 1995, 117, 12562-12566; PDB:1D3Z model-1 N-H vectors)",
+          "rationale": "Woessner axially symmetric rotational diffusion anisotropy recovery within +-0.12 of the published 1.17 ubiquitin axial ratio."
+        },
+        {
+          "id": "F10-C3",
+          "metric": "n_matched_core_residues",
+          "operator": ">=",
+          "threshold": 50,
+          "reference_value_or_source": "Deposited _Order_param loop in bmr6470_3.str (N = 63 non-Proline ubiquitin residues; fallback BMRB:18971 threshold >= 20 matched WW3* domain residues)",
+          "rationale": "Requires >= 50 matched residues on 76-aa ubiquitin (or >= 20 if BMRB:18971 fallback triggers due to archive unreachability) to prevent small-sample selection bias.",
+          "fallback_threshold_overrides": {
+            "BMRB:18971": 20
+          }
+        },
+        {
+          "id": "F10-C4",
+          "metric": "pearson_r_s2",
+          "operator": ">=",
+          "threshold": 0.8,
+          "reference_value_or_source": "Deposited per-residue Lipari-Szabo S^2 saveframe (_Order_param) in bmr6470_3.str (or bmr18971_3.str if fallback triggers)",
+          "rationale": "Requires Pearson r >= 0.80 across matched backbone amides spanning secondary-structure core and flexible loop/tail residues."
+        },
+        {
+          "id": "F10-C5",
+          "metric": "mae_s2",
+          "operator": "<=",
+          "threshold": 0.05,
+          "reference_value_or_source": "Deposited per-residue Lipari-Szabo S^2 saveframe (_Order_param) in bmr6470_3.str (fallback BMRB:18971 threshold <= 0.060)",
+          "rationale": "Accommodates the deterministic ~0.025-0.035 systematic S^2 offset between modern frozen CSA/bond constants (r_NH = 1.02 A, d_sigma = -172 ppm) and Tjandra 1995 legacy d_sigma = -160 ppm without retuning --csa-ppm.",
+          "fallback_threshold_overrides": {
+            "BMRB:18971": 0.06
+          }
+        }
+      ],
+      "verdict_definitions": {
+        "PASS": "All 5 criteria F10-C1 through F10-C5 hold simultaneously with exit_code == 0 on the frozen 17.W1 crates/ tree.",
+        "FAIL": "Any non-zero CLI exit code, runtime failure on valid NMR-STAR/PDB inputs, or violation of any numeric threshold in F10-C1..F10-C5 at the frozen crates/ tree.",
+        "NOT_EVALUABLE": "Strictly restricted to HTTP 404/unreachable host, corrupted archive payload, or missing required relaxation/S^2 saveframes after exhausting the entire pre-registered fallback chain (BMRB:6470 -> BMRB:18971 -> BMRB:5839 -> BMRB:6243)."
+      },
       "primary_datasets": [
         {
           "role": "primary",
@@ -398,26 +504,143 @@
           ]
         }
       ],
-      "exact_cli_command_template": "nmrassign modelfree --r1 <ubq_600_r1.tsv> --r2 <ubq_600_r2.tsv> --hetnoe <ubq_600_noe.tsv> --r1 <ubq_360_r1.tsv> --r2 <ubq_360_r2.tsv> --hetnoe <ubq_360_noe.tsv> --pdb <1D3Z.pdb> --diffusion axial --criterion aic --mc-trials 200 --seed 20261303 --rsd-out <ubq_rsd.tsv> --out <ubq_modelfree.tsv>",
+      "exact_cli_command_template": "nmrassign modelfree --r1 <ubq_600_r1.tsv> --r2 <ubq_600_r2.tsv> --hetnoe <ubq_600_noe.tsv> --r1 <ubq_360_r1.tsv> --r2 <ubq_360_r2.tsv> --hetnoe <ubq_360_noe.tsv> --pdb <1D3Z.pdb> --diffusion axial --criterion aic --r-nh 1.02 --csa-ppm -172.0 --mc-trials 200 --seed 20261303 --rsd-out <ubq_rsd.tsv> --out <ubq_modelfree.tsv>",
+      "bound_parameters": {
+        "ubq_600_r1.tsv": {
+          "binding_kind": "deterministic_source",
+          "source_file": "bmr6470_3.str",
+          "key_or_column": "_Heteronucl_T1_list (saveframe with larger median T1_val) :: Comp_index_ID, Comp_ID, Val, Val_err",
+          "formula": "field_mhz = 600.13; kind = R1; value = 1.0 / Val; sigma = Val_err / (Val * Val)"
+        },
+        "ubq_600_r2.tsv": {
+          "binding_kind": "deterministic_source",
+          "source_file": "bmr6470_3.str",
+          "key_or_column": "_Heteronucl_T2_list paired by saveframe order with 600.13 MHz T1 saveframe :: Comp_index_ID, Comp_ID, Val, Val_err",
+          "formula": "field_mhz = 600.13; kind = R2; value = 1.0 / Val; sigma = Val_err / (Val * Val)"
+        },
+        "ubq_600_noe.tsv": {
+          "binding_kind": "deterministic_source",
+          "source_file": "bmr6470_3.str",
+          "key_or_column": "_Heteronucl_NOE_list paired by saveframe order with 600.13 MHz T1 saveframe :: Comp_index_ID, Comp_ID, Val, Val_err",
+          "formula": "field_mhz = 600.13; kind = hetNOE; value = Val; sigma = Val_err"
+        },
+        "ubq_360_r1.tsv": {
+          "binding_kind": "deterministic_source",
+          "source_file": "bmr6470_3.str",
+          "key_or_column": "_Heteronucl_T1_list (saveframe with smaller median T1_val) :: Comp_index_ID, Comp_ID, Val, Val_err",
+          "formula": "field_mhz = 360.13; kind = R1; value = 1.0 / Val; sigma = Val_err / (Val * Val)"
+        },
+        "ubq_360_r2.tsv": {
+          "binding_kind": "deterministic_source",
+          "source_file": "bmr6470_3.str",
+          "key_or_column": "_Heteronucl_T2_list paired by saveframe order with 360.13 MHz T1 saveframe :: Comp_index_ID, Comp_ID, Val, Val_err",
+          "formula": "field_mhz = 360.13; kind = R2; value = 1.0 / Val; sigma = Val_err / (Val * Val)"
+        },
+        "ubq_360_noe.tsv": {
+          "binding_kind": "deterministic_source",
+          "source_file": "bmr6470_3.str",
+          "key_or_column": "_Heteronucl_NOE_list paired by saveframe order with 360.13 MHz T1 saveframe :: Comp_index_ID, Comp_ID, Val, Val_err",
+          "formula": "field_mhz = 360.13; kind = hetNOE; value = Val; sigma = Val_err"
+        },
+        "1D3Z.pdb": {
+          "binding_kind": "literal",
+          "value": "1D3Z.pdb",
+          "rationale": "Primary solution NMR structure of human ubiquitin (Cornilescu et al. 1998, Model 1) providing experimental N-H bond vector orientations."
+        },
+        "ubq_rsd.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f10_ubq_rsd.tsv",
+          "produced_by": "nmrassign modelfree --rsd-out"
+        },
+        "ubq_modelfree.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f10_ubq_modelfree.tsv",
+          "produced_by": "nmrassign modelfree --out"
+        }
+      },
       "deterministic_format_adapter_spec": {
         "required": true,
         "adapter_kind": "nmrstar_relaxation_loops_to_tsv",
         "rules": [
-          "Extract _Heteronucl_T1_relaxation, _Heteronucl_T2_relaxation, and _Heteronucl_NOEs saveframe loops into `seq_id\\tres_name\\tfield_mhz\\tkind\\tvalue\\tsigma` TSV tables without reading deposited _Order_param (S2_parameters_*) saveframes until post-fit evaluation.",
+          "Adapter lives strictly in `scripts/p17_adapters/f10_nmrstar_to_relax_tsv.py` (hashed before invoking `nmrassign`). Extract `_Heteronucl_T1_relaxation`, `_Heteronucl_T2_relaxation`, and `_Heteronucl_NOEs` saveframe loops into `seq_id\\tres_name\\tfield_mhz\\tkind\\tvalue\\tsigma` TSV tables without reading deposited `_Order_param` (`S2_parameters_*`) saveframes until post-fit evaluation.",
           "Convert relaxation times in seconds (`s`) to rates (`s^-1`) strictly via `R = 1.0 / T` and `sigma_R = sigma_T / (T * T)`; preserve native `s^-1` rates (`BMRB:18971`) verbatim.",
           "On `BMRB:6470` (where legacy NMR-STAR remediation stamped both fields with `Spectrometer_frequency_1H = 600`), map the T1 saveframe with larger `median(T1)` and its paired T2/hetNOE list to `600.13` MHz and the saveframe with smaller `median(T1)` to `360.13` MHz."
         ]
       },
-      "evaluation_metrics_reported": [
-        "Global rotational correlation time `tau_m` (ns) vs Tjandra et al. (1995) `4.09 ns` (`BMRB:6470`) and Kay-Torchia-Bax trimmed `R2/R1` `tau_m`",
-        "Woessner axially symmetric rotational diffusion anisotropy `D_par/D_perp` on `PDB:1D3Z` and `PDB:1UBQ` vs Tjandra et al. (1995) `1.17`",
-        "Per-residue Lipari-Szabo `S^2` Pearson `r`, Spearman `rho`, MAE, RMSD, and median signed bias against deposited `_Order_param` (`N = 63` on `BMRB:6470`; 3-field `S^2` on `BMRB:18971`)",
-        "Per-residue Model-Free `M1`-`M5` selection counts (`AIC` primary) and `R_ex` conformational-exchange concordance"
+      "secondary_report_only_metrics": [
+        "Co-primary 3-field (`600.17 / 799.857 / 899.864 MHz`) isotropic `S^2` concordance on `BMRB:18971` and comparison of `PDB:1UBQ` X-ray vs `PDB:1D3Z` NMR `D_par/D_perp` on `BMRB:6470`",
+        "Kay-Torchia-Bax trimmed `R2/R1` `tau_m`, Spearman `rho`, `S^2` RMSD, and median signed bias (quantifying the `-172 ppm` vs `-160 ppm` CSA convention shift)",
+        "Per-residue Mandel-Akke-Palmer `M1`-`M5` `AIC` model-selection counts, `R_ex` conformational-exchange concordance, and Farrow (1995) reduced spectral densities `J(0)`, `J(omega_N)`, `J(0.87*omega_H)`"
       ]
     },
     "F11": {
       "todo_item": "TODO.md:131",
       "gate_name": "Raw Bruker ser / Varian fid Pseudo-3D Relaxation Series Integration & Schedule Decoding",
+      "primary_endpoint": "End-to-end zero-override raw Bruker pseudo-3D `ser` + `vdlist`/`vclist` schedule decoding, locked-footprint plane integration, and exponential/steady-state `R1`, `R2`, and `{1H}-15N hetNOE` recovery against deposited saveframes on `BMRB:18380`.",
+      "pass_criteria_conjunction": "ALL",
+      "pass_criteria": [
+        {
+          "id": "F11-C1",
+          "metric": "min(n_matched_r1, n_matched_r2, n_matched_hetnoe)",
+          "operator": ">=",
+          "threshold": 30,
+          "reference_value_or_source": "Non-overlapped assigned backbone amides present in both bmr18380_3.str (_Atom_chem_shift) and deposited T1/T2/hetNOE saveframes on BMRB:18380",
+          "rationale": "Requires >= 30 resolved non-Proline backbone amides across all three relaxation series on NESG DvR115."
+        },
+        {
+          "id": "F11-C2",
+          "metric": "pearson_r_r1",
+          "operator": ">=",
+          "threshold": 0.85,
+          "reference_value_or_source": "Deposited 600 MHz 15N T1 saveframe in bmr18380_3.str converted via R1_ref = 1.0 / T1_ref",
+          "rationale": "Verifies accurate raw 2DN15T1_exp4/ser interleaving order and vdlist delay decoding against author-processed longitudinal rates."
+        },
+        {
+          "id": "F11-C3",
+          "metric": "median_rel_abs_err_r1",
+          "operator": "<=",
+          "threshold": 0.15,
+          "reference_value_or_source": "median(|R1_raw - R1_ref| / R1_ref) vs bmr18380_3.str",
+          "rationale": "Bounds systematic processing/integration bias on longitudinal 15N R1 within <= 15% median relative absolute error."
+        },
+        {
+          "id": "F11-C4",
+          "metric": "pearson_r_r2",
+          "operator": ">=",
+          "threshold": 0.85,
+          "reference_value_or_source": "Deposited 600 MHz 15N T2 saveframe in bmr18380_3.str converted via R2_ref = 1.0 / T2_ref",
+          "rationale": "Verifies accurate raw 2DN15T2_exp5/ser interleaving and vclist CPMG loop-counter schedule decoding."
+        },
+        {
+          "id": "F11-C5",
+          "metric": "median_rel_abs_err_r2",
+          "operator": "<=",
+          "threshold": 0.15,
+          "reference_value_or_source": "median(|R2_raw - R2_ref| / R2_ref) vs bmr18380_3.str",
+          "rationale": "Bounds systematic unit-cycle and footprint-integration error on transverse 15N R2 within <= 15% median relative absolute error."
+        },
+        {
+          "id": "F11-C6",
+          "metric": "pearson_r_hetnoe",
+          "operator": ">=",
+          "threshold": 0.7,
+          "reference_value_or_source": "Deposited 600 MHz {1H}-15N hetNOE saveframe in bmr18380_3.str",
+          "rationale": "Steady-state I_sat/I_unsat ratios have narrower dynamic range across rigid core residues and 2-plane thermal noise amplification."
+        },
+        {
+          "id": "F11-C7",
+          "metric": "median_abs_err_hetnoe",
+          "operator": "<=",
+          "threshold": 0.12,
+          "reference_value_or_source": "median(|hetNOE_raw - hetNOE_ref|) vs bmr18380_3.str",
+          "rationale": "Verifies correct saturated vs unsaturated plane polarity/order and unbiased locked-footprint amplitude ratios within 0.12 dimensionless NOE units."
+        }
+      ],
+      "verdict_definitions": {
+        "PASS": "All 7 criteria F11-C1 through F11-C7 hold simultaneously on native zero-`--delays`-override CLI execution at the frozen 17.W1 crates/ tree.",
+        "FAIL": "Any non-zero CLI exit code, vclist/vdlist unit-scaling error, interleaving mis-detection, or violation of any numeric threshold in F11-C1..F11-C7 on native zero-override execution at the frozen crates/ tree.",
+        "NOT_EVALUABLE": "Strictly restricted to HTTP 404/unreachable host, corrupted tar/zip/ser payload, or missing required Bruker acquisition/saveframe files after exhausting BMRB:18380 -> BMRB:52653."
+      },
       "primary_datasets": [
         {
           "role": "primary",
@@ -541,26 +764,124 @@
           ]
         }
       ],
-      "exact_cli_command_template": "nmrassign relax --series <2DN15T1_exp4_dir> --star <bmr18380_3.str> --kind r1 --engine cpu --mc-trials 500 --seed 20261302 --series-out <r1_series.tsv> --out <r1_rates.tsv> && nmrassign relax --series <2DN15T2_exp5_dir> --star <bmr18380_3.str> --kind r2 --engine cpu --mc-trials 500 --seed 20261302 --series-out <r2_series.tsv> --out <r2_rates.tsv> && nmrassign relax --series <hetNOE_exp3_dir> --star <bmr18380_3.str> --kind hetnoe --mc-trials 500 --seed 20261302 --series-out <hetnoe_series.tsv> --out <hetnoe_rates.tsv>",
+      "exact_cli_command_template": "nmrassign relax --series <2DN15T1_exp4_dir> --star <bmr18380_3.str> --kind r1 --engine cpu --mc-trials 500 --seed 20261302 --series-out <r1_series.tsv> --out <r1_rates.tsv> && nmrassign relax --series <2DN15T2_exp5_dir> --star <bmr18380_3.str> --kind r2 --engine cpu --mc-trials 500 --seed 20261302 --series-out <r2_series.tsv> --out <r2_rates.tsv> && nmrassign relax --series <hetNOE_exp3_dir> --star <bmr18380_3.str> --kind hetnoe --engine cpu --mc-trials 500 --seed 20261302 --series-out <hetnoe_series.tsv> --out <hetnoe_rates.tsv> && nmrassign relax --series <r1_series.tsv> --kind r1 --engine gpu --mc-trials 500 --seed 20261302 --out <r1_rates_gpu.tsv> && nmrassign relax --series <r2_series.tsv> --kind r2 --engine gpu --mc-trials 500 --seed 20261302 --out <r2_rates_gpu.tsv>",
+      "bound_parameters": {
+        "2DN15T1_exp4_dir": {
+          "binding_kind": "literal",
+          "value": "DvR115.012_NC_B600_070210/2DN15T1_exp4",
+          "rationale": "Deposited Bruker pseudo-3D 15N T1 directory inside bmrb18380_FIDs.tar (zero --delays override)."
+        },
+        "2DN15T2_exp5_dir": {
+          "binding_kind": "literal",
+          "value": "DvR115.012_NC_B600_070210/2DN15T2_exp5",
+          "rationale": "Deposited Bruker pseudo-3D 15N T2 directory inside bmrb18380_FIDs.tar (zero --delays override on primary execution)."
+        },
+        "hetNOE_exp3_dir": {
+          "binding_kind": "literal",
+          "value": "DvR115.012_NC_B600_070210/hetNOE_exp3",
+          "rationale": "Deposited Bruker interleaved steady-state {1H}-15N hetNOE directory inside bmrb18380_FIDs.tar."
+        },
+        "bmr18380_3.str": {
+          "binding_kind": "literal",
+          "value": "bmr18380_3.str",
+          "rationale": "Deposited BMRB 18380 NMR-STAR file supplying assigned (1H, 15N) crosspeak seeds for locked-footprint integration."
+        },
+        "r1_series.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f11_r1_series.tsv",
+          "produced_by": "nmrassign relax --kind r1 --series-out"
+        },
+        "r1_rates.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f11_r1_rates_cpu.tsv",
+          "produced_by": "nmrassign relax --kind r1 --engine cpu --out"
+        },
+        "r2_series.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f11_r2_series.tsv",
+          "produced_by": "nmrassign relax --kind r2 --series-out"
+        },
+        "r2_rates.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f11_r2_rates_cpu.tsv",
+          "produced_by": "nmrassign relax --kind r2 --engine cpu --out"
+        },
+        "hetnoe_series.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f11_hetnoe_series.tsv",
+          "produced_by": "nmrassign relax --kind hetnoe --series-out"
+        },
+        "hetnoe_rates.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f11_hetnoe_rates.tsv",
+          "produced_by": "nmrassign relax --kind hetnoe --out"
+        },
+        "r1_rates_gpu.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f11_r1_rates_gpu.tsv",
+          "produced_by": "nmrassign relax --kind r1 --engine gpu --out"
+        },
+        "r2_rates_gpu.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f11_r2_rates_gpu.tsv",
+          "produced_by": "nmrassign relax --kind r2 --engine gpu --out"
+        }
+      },
       "deterministic_format_adapter_spec": {
         "required": false,
         "adapter_kind": "native_bruker_pseudo3d_ser_ingest",
         "rules": [
-          "Native `nmr_core::relax_io::read_bruker_pseudo3d` decodes raw Bruker `ser`, `acqus`/`acqu2s`/`acqu3s` interleaving order (`PlaneQueued` / `T1PlaneQuad` / `T1QuadPlane`), and `vdlist`/`vclist` schedules.",
-          "If `vclist` on `2DN15T2_exp5` stores integer CPMG loop counts without native unit scaling for that pulse sequence, compute `t_i = vclist[i] * tau_cpmg_block` strictly from `pulseprogram` and `acqus` `$D[]`/`$P[]` timing registers before inspecting fitted rates, and report both native `vclist` and `--delays` outcomes.",
-          "Convert deposited `bmr18380_3.str` relaxation times (`s`) to rates (`R = 1/T`, `sigma_R = sigma_T / T^2`) solely for post-fit benchmarking."
+          "First run native `nmrassign relax --series <exp_dir> --star bmr18380_3.str --kind r1|r2|hetnoe --seed 20261302 --out <out.tsv>` with ZERO `--delays` override (`nmr_core::relax_io::read_bruker_pseudo3d` decodes `ser`, `acqus`/`acqu2s`/`acqu3s` interleaving, and `vdlist`/`vclist`).",
+          "If and only if native `relax_io` errors on `vclist` loop units in `2DN15T2_exp5`, compute the exact Bruker `hsqct2etf3gpsi3d` loop timing from `2DN15T2_exp5/pulseprogram` and `2DN15T2_exp5/acqus` (`##$D=`, `##$P=`) via `tau_cpmg_block_s = sum_{d_k in vc_loop} D[k] + sum_{p_m in vc_loop} (P[m] * 1.0e-6)` (`= 16.0 * D[20] + 8.0 * P[4] * 1.0e-6`, with `P[4] = 2.0 * P[3]` when `P[4] == 0`), `t_i = vclist[i] * tau_cpmg_block_s`, and report BOTH the native zero-override outcome and the formula `--delays` outcome candidly.",
+          "Convert deposited `bmr18380_3.str` relaxation times (`s`) to rates (`R = 1.0 / T`, `sigma_R = sigma_T / (T * T)`) in `scripts/p17_adapters/` solely for post-fit benchmarking."
         ]
       },
-      "evaluation_metrics_reported": [
-        "Pseudo-3D interleaving mode detection & `vdlist`/`vclist` schedule decoding status on raw deposited Bruker `ser`",
-        "Raw `ser` vs deposited `bmr18380_3.str` `R1`, `R2`, and steady-state `{1H}-15N hetNOE` Pearson `r`, Spearman `rho`, MAE, and median relative difference (`|R_raw - R_str| / R_str`)",
-        "Fraction of resolved non-Proline backbone amides integrated and within `2*sigma` combined uncertainty",
-        "CPU `f64` vs WebGPU `f32` (`--engine gpu`, `relax_mc.wgsl`) rate & MC bootstrap uncertainty parity on real decay traces"
+      "secondary_report_only_metrics": [
+        "Pseudo-3D interleaving mode classification (`PlaneQueued` / `T1PlaneQuad` / `T1QuadPlane`) and native `D[20]` vs `pulseprogram` `16*D[20] + 8*P[4]*1e-6` `vclist` timing diagnostic",
+        "Spearman `rho`, MAE (`s^-1`), and fraction of resolved non-Proline backbone amides within `2*sigma` combined uncertainty",
+        "CPU `f64` vs WebGPU `f32` (`--engine gpu`, `relax_mc.wgsl`) rate and 500-trial MC bootstrap uncertainty parity on empirical decay traces"
       ]
     },
     "F13a": {
       "todo_item": "TODO.md:136",
       "gate_name": "Experimental 15N/13C CEST Bloch-McConnell Saturation Profiles",
+      "primary_endpoint": "Global two-state Bloch-McConnell Pad\u00e9 [6/6] Levenberg-Marquardt recovery of excited-state population `p_B`, exchange rate `k_ex`, and per-site chemical-shift differences `|dw_AB|` on experimental multi-`B1` CEST saturation profiles (`ZENODO:19186893`).",
+      "pass_criteria_conjunction": "ALL",
+      "pass_criteria": [
+        {
+          "id": "F13a-C1",
+          "metric": "pb_rel_err_or_low_pb_scaled_abs_err",
+          "operator": "<=",
+          "threshold": 0.3,
+          "reference_value_or_source": "Published excited-state population p_B in Bonin et al. bioRxiv 2025 (DOI 10.1101/2025.11.27.690854; ZENODO:19186893, or fallback citation): |p_B_fit - p_B_ref| / p_B_ref <= 0.30 (or |p_B_fit - p_B_ref| <= 0.005 when p_B_ref < 0.02, evaluated as min(rel_err, (abs_err / 0.005) * 0.30) <= 0.30)",
+          "rationale": "Bounds global minor-state population recovery within <= 30% relative error (with a 0.5% absolute population floor when p_B_ref < 2.0%)."
+        },
+        {
+          "id": "F13a-C2",
+          "metric": "abs(k_ex_fit - k_ex_ref) / k_ex_ref",
+          "operator": "<=",
+          "threshold": 0.35,
+          "reference_value_or_source": "Published two-state chemical exchange rate k_ex = k_AB + k_BA (s^-1) in Bonin et al. 2025 (ZENODO:19186893, or fallback citation)",
+          "rationale": "Multi-B1 CEST linewidth sensitivity bounds global k_ex within <= 35% relative error across slow-to-intermediate exchange regimes."
+        },
+        {
+          "id": "F13a-C3",
+          "metric": "median_abs_dw_err_ppm",
+          "operator": "<=",
+          "threshold": 0.35,
+          "reference_value_or_source": "Published minor-state chemical shift differences dw_AB (ppm) across exchanging sites in ZENODO:19186893 (<= 0.35 ppm for 15N CEST; <= 0.25 ppm if a 13C CEST dataset is evaluated)",
+          "rationale": "Matches experimental B1 saturation step spacing (~15-25 Hz = 0.18-0.30 ppm at 800-1000 MHz 15N).",
+          "nucleus_specific_thresholds": {
+            "15N": 0.35,
+            "13C": 0.25
+          }
+        }
+      ],
+      "verdict_definitions": {
+        "PASS": "All 3 criteria F13a-C1 through F13a-C3 hold simultaneously with exit_code == 0 on the frozen 17.W1 crates/ tree.",
+        "FAIL": "Any non-zero CLI exit code, global LM non-convergence, or violation of any numeric threshold in F13a-C1..F13a-C3 on valid profile data at the frozen crates/ tree.",
+        "NOT_EVALUABLE": "Strictly restricted to HTTP 404/unreachable host, corrupted archive payload, or missing saturation profile/reference parameter tables after exhausting ZENODO:19186893 -> ZENODO:12765510 -> BMRB:52005 -> BMRBIG:130."
+      },
       "primary_datasets": [
         {
           "role": "primary",
@@ -638,23 +959,90 @@
           ]
         }
       ],
-      "exact_cli_command_template": "nmrassign cest --in <cest_profiles.tsv> --states 2 --b1-quad 5 --engine cpu --chi2-surface --out <cest_fit_cpu.tsv> --json-out <cest_fit_cpu.json> && nmrassign cest --in <cest_profiles.tsv> --states 2 --b1-quad 5 --engine gpu --out <cest_fit_gpu.tsv> --json-out <cest_fit_gpu.json>",
+      "exact_cli_command_template": "nmrassign cest --in <cest_profiles.tsv> --states 2 --b1-quad 5 --max-iters 45 --engine cpu --chi2-surface --out <cest_fit_cpu.tsv> --json-out <cest_fit_cpu.json> && nmrassign cest --in <cest_profiles.tsv> --states 2 --b1-quad 5 --max-iters 45 --engine gpu --out <cest_fit_gpu.tsv> --json-out <cest_fit_gpu.json>",
+      "bound_parameters": {
+        "cest_profiles.tsv": {
+          "binding_kind": "deterministic_source",
+          "source_file": "CEST.zip",
+          "key_or_column": "Header keys B0/larmor_mhz, T_EX, B1_FRQ, B1_INH + 3-column [offset, intensity, uncertainty] rows",
+          "formula": "11-column TSV: I_norm = I / I0 with propagated uncertainty; major_ppm_hint = argmin_offset(I_norm)"
+        },
+        "cest_fit_cpu.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f13a_cest_fit_cpu.tsv",
+          "produced_by": "nmrassign cest --engine cpu --out"
+        },
+        "cest_fit_cpu.json": {
+          "binding_kind": "output_artifact",
+          "value": "f13a_cest_fit_cpu.json",
+          "produced_by": "nmrassign cest --engine cpu --json-out"
+        },
+        "cest_fit_gpu.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f13a_cest_fit_gpu.tsv",
+          "produced_by": "nmrassign cest --engine gpu --out"
+        },
+        "cest_fit_gpu.json": {
+          "binding_kind": "output_artifact",
+          "value": "f13a_cest_fit_gpu.json",
+          "produced_by": "nmrassign cest --engine gpu --json-out"
+        }
+      },
       "deterministic_format_adapter_spec": {
         "required": true,
         "adapter_kind": "plain_text_cest_profile_to_11col_tsv",
         "rules": [
-          "Syntactically map header metadata (`B0`/`larmor_mhz`, `T_EX`, `B1_FRQ`, `B1_INH`) and 3-column `[offset, intensity, uncertainty]` profile rows from `CEST.zip` into the 11-column TSV schema (`seq_id`, `res_name`, `larmor_mhz`, `t_ex_s`, `b1_hz`, `b1_inhom_frac`, `normalization`, `major_ppm_hint`, `offset_ppm`, `intensity`, `uncertainty`).",
-          "Normalize `I / I0` with propagated uncertainty when reference `I0` rows are stored separately; set `major_ppm_hint` to the offset of minimum `I/I0` without inspecting minor-state dips."
+          "Adapter lives strictly in `scripts/p17_adapters/f13a_cest_to_tsv.py` (hashed before invoking `nmrassign`). Syntactically map header metadata (`B0`/`larmor_mhz`, `T_EX`, `B1_FRQ`, `B1_INH`) and 3-column `[offset, intensity, uncertainty]` profile rows from `CEST.zip` into the 11-column TSV schema (`seq_id`, `res_name`, `larmor_mhz`, `t_ex_s`, `b1_hz`, `b1_inhom_frac`, `normalization`, `major_ppm_hint`, `offset_ppm`, `intensity`, `uncertainty`).",
+          "Normalize `I / I0` with propagated uncertainty when reference `I0` rows are stored separately; set `major_ppm_hint` strictly to `argmin_offset(I / I0)` without inspecting minor-state dips."
         ]
       },
-      "evaluation_metrics_reported": [
-        "Global excited-state population `p_B` (%), exchange rate `k_ex` (`s^-1`), and per-residue `|dw_AB|` / signed `dw_AB` (ppm) agreement vs published reference parameters (absolute/relative error, `dw_AB` Pearson `r` & RMSD, reduced `chi^2_nu`)",
-        "CPU `f64` vs WebGPU `f32` (`bloch_cest.wgsl`) global Padé `[6/6]` LM parameter parity on experimental multi-`B1` profiles"
+      "secondary_report_only_metrics": [
+        "Signed `dw_AB` Pearson `r`, RMSD (ppm), reduced `chi^2_nu`, and 1D/2D `(p_B, k_ex)` profile `chi^2` confidence surface coverage",
+        "CPU `f64` vs WebGPU `f32` (`bloch_cest.wgsl`) global Pad\u00e9 `[6/6]` LM parameter parity (`|Delta p_B|`, `|Delta k_ex|`, `max |Delta dw_AB|`)"
       ]
     },
     "F13b": {
       "todo_item": "TODO.md:136",
       "gate_name": "Multi-Field Experimental CPMG & Off-Resonance R1rho Relaxation Dispersion",
+      "primary_endpoint": "Multi-field global `baldwin2014` CPMG relaxation-dispersion recovery of `p_B`, `k_ex`, and per-site `|dw_AB|` across static magnetic fields (`ZENODO:19186893` / `ZENODO:6605011`).",
+      "pass_criteria_conjunction": "ALL",
+      "pass_criteria": [
+        {
+          "id": "F13b-C1",
+          "metric": "abs(p_B_fit - p_B_ref) / p_B_ref",
+          "operator": "<=",
+          "threshold": 0.3,
+          "reference_value_or_source": "Published multi-field CPMG excited-state population p_B in Bonin et al. 2025 (ZENODO:19186893; or Lee lab Dryad/ZENODO:6605011 on co-primary)",
+          "rationale": "Global multi-field Baldwin (2014) exact two-state CPMG dispersion population recovery within <= 30% relative error."
+        },
+        {
+          "id": "F13b-C2",
+          "metric": "abs(k_ex_fit - k_ex_ref) / k_ex_ref",
+          "operator": "<=",
+          "threshold": 0.35,
+          "reference_value_or_source": "Published multi-field CPMG exchange rate k_ex (s^-1) in Bonin et al. 2025 (ZENODO:19186893; or ZENODO:6605011)",
+          "rationale": "Global multi-field CPMG exchange rate recovery within <= 35% relative error across millisecond exchange regimes."
+        },
+        {
+          "id": "F13b-C3",
+          "metric": "median_abs_dw_err_ppm",
+          "operator": "<=",
+          "threshold": 0.4,
+          "reference_value_or_source": "Published per-residue |dw_AB| (ppm) across gated exchanging sites in ZENODO:19186893 (disjunctive multi-site clause when n_sites >= 5: median_abs_dw_err_ppm <= 0.40 OR pearson_r_abs_dw >= 0.85)",
+          "rationale": "Accounts for p_B * dw^2 covariance near intermediate exchange while requiring tight per-site |dw_AB| magnitude or linear correlation.",
+          "disjunctive_clause_when_n_sites_ge_5": {
+            "min_n_sites": 5,
+            "metric": "pearson_r_abs_dw",
+            "operator": ">=",
+            "threshold": 0.85
+          }
+        }
+      ],
+      "verdict_definitions": {
+        "PASS": "All 3 primary CPMG criteria F13b-C1 through F13b-C3 hold simultaneously with exit_code == 0 on the frozen 17.W1 crates/ tree.",
+        "FAIL": "Any non-zero CLI exit code on primary CPMG execution or violation of any numeric threshold in F13b-C1..F13b-C3 on valid dispersion tables at the frozen crates/ tree.",
+        "NOT_EVALUABLE": "Strictly restricted to HTTP 404/unreachable host, corrupted archive payload, or missing dispersion/reference parameter files after exhausting ZENODO:19186893 -> ZENODO:6605011 -> BMRBIG:118 -> BMRB:16843 -> BMRB:17149 -> BMRB:52777."
+      },
       "primary_datasets": [
         {
           "role": "primary",
@@ -771,24 +1159,104 @@
           ]
         }
       ],
-      "exact_cli_command_template": "nmrassign cpmg --in <cpmg_series.tsv> --model baldwin2014 --engine cpu --out <cpmg_fit_cpu.tsv> --json-out <cpmg_fit_cpu.json> && nmrassign cpmg --raw-planes <cpmg_600_planes.tsv> --raw-planes <cpmg_850_planes.tsv> --series-out <hts_r2eff.tsv> --model baldwin2014 --engine gpu --out <hts_cpmg_gpu.tsv> --json-out <hts_cpmg_gpu.json> && nmrassign cpmg --r1rho <r1rho_table.tsv> --major-ppm <varpi_A_ppm> --larmor-mhz <nu0_mhz> --out <r1rho_fit.tsv> --json-out <r1rho_fit.json>",
+      "exact_cli_command_template": "nmrassign cpmg --in <cpmg_series.tsv> --model baldwin2014 --min-rex 2.0 --min-daic 2.0 --max-fp 0.05 --engine cpu --out <cpmg_fit_cpu.tsv> --json-out <cpmg_fit_cpu.json> && nmrassign cpmg --in <cpmg_series.tsv> --model baldwin2014 --min-rex 2.0 --min-daic 2.0 --max-fp 0.05 --engine gpu --out <cpmg_fit_gpu.tsv> --json-out <cpmg_fit_gpu.json> && nmrassign cpmg --raw-planes <cpmg_600_planes.tsv> --raw-planes <cpmg_850_planes.tsv> --series-out <hts_r2eff.tsv> --model baldwin2014 --min-rex 2.0 --min-daic 2.0 --max-fp 0.05 --engine cpu --out <hts_cpmg_cpu.tsv> --json-out <hts_cpmg_cpu.json>",
+      "bound_parameters": {
+        "cpmg_series.tsv": {
+          "binding_kind": "deterministic_source",
+          "source_file": "CPMG.zip",
+          "key_or_column": "Per-residue multi-field R2,eff tables :: residue, B0_MHz, T_relax, nu_CPMG_Hz, R2_eff, sigma_R2_eff",
+          "formula": "7-column TSV: seq_id, res_name, larmor_mhz, t_relax_s, nu_cpmg_hz, r2_eff_s_inv, r2_eff_err (--major-ppm is NOT used)"
+        },
+        "cpmg_fit_cpu.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f13b_cpmg_fit_cpu.tsv",
+          "produced_by": "nmrassign cpmg --engine cpu --out"
+        },
+        "cpmg_fit_cpu.json": {
+          "binding_kind": "output_artifact",
+          "value": "f13b_cpmg_fit_cpu.json",
+          "produced_by": "nmrassign cpmg --engine cpu --json-out"
+        },
+        "cpmg_fit_gpu.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f13b_cpmg_fit_gpu.tsv",
+          "produced_by": "nmrassign cpmg --engine gpu --out"
+        },
+        "cpmg_fit_gpu.json": {
+          "binding_kind": "output_artifact",
+          "value": "f13b_cpmg_fit_gpu.json",
+          "produced_by": "nmrassign cpmg --engine gpu --json-out"
+        },
+        "cpmg_600_planes.tsv": {
+          "binding_kind": "deterministic_source",
+          "source_file": "D25_MQCPMG_600_ints",
+          "key_or_column": "Residue ID, CPMG frequency / ncyc header, plane intensity, baseline noise",
+          "formula": "Raw-planes TSV at 600 MHz heteronuclear Larmor frequency with nu_cpmg_hz = 0 for reference I0 plane"
+        },
+        "cpmg_850_planes.tsv": {
+          "binding_kind": "deterministic_source",
+          "source_file": "D25_MQCPMG_850_ints2",
+          "key_or_column": "Residue ID, CPMG frequency / ncyc header, plane intensity, baseline noise",
+          "formula": "Raw-planes TSV at 850 MHz heteronuclear Larmor frequency with nu_cpmg_hz = 0 for reference I0 plane"
+        },
+        "hts_r2eff.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f13b_hts_r2eff.tsv",
+          "produced_by": "nmrassign cpmg --raw-planes --series-out"
+        },
+        "hts_cpmg_cpu.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f13b_hts_cpmg_cpu.tsv",
+          "produced_by": "nmrassign cpmg --raw-planes --out"
+        },
+        "hts_cpmg_cpu.json": {
+          "binding_kind": "output_artifact",
+          "value": "f13b_hts_cpmg_cpu.json",
+          "produced_by": "nmrassign cpmg --raw-planes --json-out"
+        }
+      },
       "deterministic_format_adapter_spec": {
         "required": true,
         "adapter_kind": "cpmg_and_r1rho_table_to_tsv",
         "rules": [
-          "Reshape deposited `R2,eff` profiles (`CPMG.zip`) into the 7-column TSV (`seq_id`, `res_name`, `larmor_mhz`, `t_relax_s`, `nu_cpmg_hz`, `r2_eff_s_inv`, `r2_eff_err`), and raw intensity tables (`ZENODO:6605011`) into the `--raw-planes` TSV (`nu_cpmg_hz = 0` for `I0`).",
-          "Convert `dUMP600_T1p_full_ints` spin-lock series into 4-column off-resonance `R1rho` TSV (`carrier_ppm`, `spin_lock_hz`, `r1rho_s_inv`, `r1rho_err`) using `R1rho = 1/T1rho` (or mono-exponential decay rate via `nmrassign relax` when raw delay planes are tabulated)."
+          "Adapter lives strictly in `scripts/p17_adapters/f13b_cpmg_to_tsv.py` (hashed before invoking `nmrassign`). Reshape deposited `R2,eff` profiles (`CPMG.zip`) into the 7-column TSV (`seq_id`, `res_name`, `larmor_mhz`, `t_relax_s`, `nu_cpmg_hz`, `r2_eff_s_inv`, `r2_eff_err`), and raw intensity tables (`ZENODO:6605011` `D25_MQCPMG_*`) into `--raw-planes` TSV (`nu_cpmg_hz = 0` for `I0`). `--major-ppm` is NOT used on primary CPMG.",
+          "For the secondary report-only off-resonance `R1rho` evaluation on `dUMP600_T1p_full_ints` (`nmrassign cpmg --r1rho <r1rho_table.tsv> --major-ppm <varpi_A_ppm> --larmor-mhz <nu0_mhz>`), bind `--major-ppm` strictly to each residue's ground-state isotropic chemical shift column in the entry's deposited chemical-shift table/header (and skip off-resonance `R1rho` as report-only N/A if no ground-state isotropic shift is deposited)."
         ]
       },
-      "evaluation_metrics_reported": [
-        "Global `p_B` (%), `k_ex` (`s^-1`), and per-residue `|dw_AB|` (ppm) agreement vs published multi-field CPMG values (`Baldwin2014` primary, `CR72` comparison) and `AICc`+`F`-test exchange-gate concordance",
-        "Trott-Palmer off-resonance `R1rho` `p_B`, `k_ex`, and signed `dw_AB` recovery on `ZENODO:6605011` `dUMP600_T1p_full_ints`",
+      "secondary_report_only_metrics": [
+        "`CR72` vs `Baldwin2014` global model comparison and `AICc`+`F`-test (`--min-rex 2.0 --min-daic 2.0 --max-fp 0.05`) exchange-gate concordance",
+        "Secondary report-only Trott-Palmer off-resonance `R1rho` (`p_B`, `k_ex`, signed `dw_AB`) on `ZENODO:6605011` `dUMP600_T1p_full_ints` with `--major-ppm` bound strictly to the entry's deposited ground-state shift column",
         "CPU `f64` vs WebGPU `f32` (`cpmg_fit.wgsl`) global dispersion parameter parity"
       ]
     },
     "F13c": {
       "todo_item": "TODO.md:136",
       "gate_name": "Experimental 2D 1H-15N HSQC Ligand Titration Tracking & Quadratic K_d",
+      "primary_endpoint": "Hungarian fast-exchange 2D 1H-15N HSQC crosspeak tracking across ligand titration steps, iterative 2-sigma binding-pocket identification, and global quadratic 1:1 Morrison/Williamson dissociation constant `K_d` recovery (`ZENODO:17228160` / `BMRBIG:138`).",
+      "pass_criteria_conjunction": "ALL",
+      "pass_criteria": [
+        {
+          "id": "F13c-C1",
+          "metric": "n_pocket_residues",
+          "operator": ">=",
+          "threshold": 5,
+          "reference_value_or_source": "Tracked fast-exchange binding-pocket crosspeaks passing Williamson iterative 2-sigma CSP threshold in csp_fit.json",
+          "rationale": "Requires >= 5 tracked binding-site trajectories to constrain global 1:1 quadratic binding isotherm reliably."
+        },
+        {
+          "id": "F13c-C2",
+          "metric": "abs(log10(kd_um / kd_ref_um))",
+          "operator": "<=",
+          "threshold": 0.4,
+          "reference_value_or_source": "Independent co-deposited ITC/MST K_d (uM) in ZENODO:17228160 (ITC.tar.xz / MST.tar.xz; or published NMR/biophysical K_d on BMRBIG:138 DOI 10.1093/nar/gkag123)",
+          "rationale": "0.40 dex (<= 2.51x factor, |Delta Delta G| <= 0.55 kcal/mol at 298 K) matches standard cross-technique NMR CSP vs ITC/MST affinity concordance."
+        }
+      ],
+      "verdict_definitions": {
+        "PASS": "Both criteria F13c-C1 and F13c-C2 hold simultaneously with exit_code == 0 on the frozen 17.W1 crates/ tree.",
+        "FAIL": "Any non-zero CLI exit code, failure to track >= 5 pocket trajectories, or |log10(kd_um / kd_ref_um)| > 0.40 on valid 2D titration spectra at the frozen crates/ tree.",
+        "NOT_EVALUABLE": "Strictly restricted to HTTP 404/unreachable host, corrupted tar.xz/zip/gz payload, or missing titration concentration/Kd reference metadata after exhausting ZENODO:17228160 -> BMRBIG:138 -> ZENODO:7892349."
+      },
       "primary_datasets": [
         {
           "role": "primary",
@@ -859,23 +1327,115 @@
           ]
         }
       ],
-      "exact_cli_command_template": "nmrassign csp (--star <apo.str> | --apo-peaks <apo_peaks.tsv>) --step <L0_uM[:P0_uM]>=<step0_2rr_or_ft2> --step <L1_uM[:P1_uM]>=<step1_2rr_or_ft2> --experiment hsqc --protein-um <P0_uM> --mc-trials 400 --seed 20261306 --trajectories-out <tracked_csp.tsv> --json-out <csp_fit.json> --out <csp_fit.tsv>",
+      "exact_cli_command_template": "nmrassign pick --hsqc <apo_2d_spectrum> -o <raw_apo_peaks.tsv> && nmrassign csp --apo-peaks <apo_peaks.tsv> --protein-um <P0_uM> --step <step_0_spec> --step <step_1_spec> --step <step_n_spec> --experiment hsqc --snr 5.0 --max-step-csp 0.45 --csp-sigma 0.004 --mc-trials 400 --seed 20261306 --trajectories-out <tracked_csp.tsv> --json-out <csp_fit.json> --out <csp_fit.tsv>",
+      "bound_parameters": {
+        "apo_2d_spectrum": {
+          "binding_kind": "deterministic_source",
+          "source_file": "NMR.tar.xz",
+          "key_or_column": "Titration directory with [L]_t == 0 uM (pdata/1/2rr, .ft2, or .ucsf; if raw 2D ser only, processed via `nmrassign process --in <dir> --out <apo.ft2>` with zero extra flags)",
+          "formula": "Path to lowest/zero-ligand apo 2D 1H-15N HSQC spectrum"
+        },
+        "raw_apo_peaks.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f13c_raw_apo_peaks.tsv",
+          "produced_by": "nmrassign pick --hsqc (zero extra flags; compiled classical 2D picker default --snr 5.0)"
+        },
+        "apo_peaks.tsv": {
+          "binding_kind": "deterministic_source",
+          "source_file": "f13c_raw_apo_peaks.tsv",
+          "key_or_column": "Columns `id`, `h`, `n` from `nmrassign pick` output",
+          "formula": "4-column TSV `seq_id\\tres_name\\th_ppm\\tn_ppm` = `k\\tUNK\\th\\tn` for row k = 1..N (BMRB:53960 never read)"
+        },
+        "P0_uM": {
+          "binding_kind": "deterministic_source",
+          "source_file": "NMR.tar.xz / ITC.tar.xz sample metadata (title, README, or sample sheet)",
+          "key_or_column": "Initial apo total 15N-protein concentration [P]_0",
+          "formula": "Convert deposited molarity (mM or uM) to micromolar: P0_uM = [P]_0_mM * 1000.0"
+        },
+        "step_0_spec": {
+          "binding_kind": "deterministic_source",
+          "source_file": "NMR.tar.xz sample metadata table / Bruker `pdata/1/title`",
+          "key_or_column": "Step 0 (apo, [L]_0 = 0 uM) ligand & protein micromolar concentrations + 2D spectrum path",
+          "formula": "Format string `{L_0_uM}:{P_0_uM}={step_0_2d_path}`"
+        },
+        "step_1_spec": {
+          "binding_kind": "deterministic_source",
+          "source_file": "NMR.tar.xz sample metadata table / Bruker `pdata/1/title`",
+          "key_or_column": "Step 1 ([L]_1 > 0 uM) ligand & dilution-corrected protein micromolar concentrations + 2D spectrum path",
+          "formula": "Format string `{L_1_uM}:{P_1_uM}={step_1_2d_path}`"
+        },
+        "step_n_spec": {
+          "binding_kind": "deterministic_source",
+          "source_file": "NMR.tar.xz sample metadata table / Bruker `pdata/1/title`",
+          "key_or_column": "All remaining sorted titration steps k = 2..K-1 ([L]_k, [P]_k, spectrum path)",
+          "formula": "Repeated `--step {L_k_uM}:{P_k_uM}={step_k_2d_path}` arguments in strictly ascending [L]_k order"
+        },
+        "tracked_csp.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f13c_tracked_csp.tsv",
+          "produced_by": "nmrassign csp --trajectories-out"
+        },
+        "csp_fit.json": {
+          "binding_kind": "output_artifact",
+          "value": "f13c_csp_fit.json",
+          "produced_by": "nmrassign csp --json-out"
+        },
+        "csp_fit.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f13c_csp_fit.tsv",
+          "produced_by": "nmrassign csp --out"
+        }
+      },
       "deterministic_format_adapter_spec": {
-        "required": false,
+        "required": true,
         "adapter_kind": "native_2d_hsqc_titration_ingest",
         "rules": [
-          "Native `nmrassign csp` reads Bruker `pdata/1/2rr`, NMRPipe `.ft2`, Sparky `.ucsf`, or TSV peak lists directly; if only raw 2D `ser` is present, run `nmrassign process --fid <step_dir> --out <step.ft2>` uniformly across all titration points.",
-          "Extract `[P]_t` and `[L]_t` micromolar concentrations strictly from sample metadata (`title` / `README` / `bmrbig138.str`) prior to fitting; if no apo `.str` shift list is bundled, generate `apo_peaks.tsv` from the `0 uM` apo spectrum via `nmrassign pick`."
+          "Native `nmrassign csp` reads Bruker `pdata/1/2rr`, NMRPipe `.ft2`, Sparky `.ucsf`, or TSV peak lists directly; if only raw 2D `ser` is present without processed 2D matrices, run `nmrassign process --in <step_dir> --out <step.ft2>` (zero extra flags) uniformly across all titration points.",
+          "When no non-firewalled apo `.str` shift list is bundled (including `ZENODO:17228160`, where `BMRB:53960` is excluded), run `nmrassign pick --hsqc <apo_2d_spectrum> -o <raw_apo_peaks.tsv>` with zero extra flags (compiled classical 2D picker default `--snr 5.0`; note 1D `nmr1d process` uses `--min-snr 6.0` whereas 2D `pick` defaults to `--snr 5.0`) and syntactically reshape `id,h,n` -> `k\\tUNK\\th\\tn` in `scripts/p17_adapters/f13c_apo_peaks_to_tsv.py`; if a fallback/co-primary archive bundles an `_Atom_chem_shift` `.str` file, `--star <apo.str>` may be reported alongside `--apo-peaks`.",
+          "Extract `[P]_k` and `[L]_k` micromolar concentrations strictly from the archive's deposited sample/ITC metadata table prior to fitting."
         ]
       },
-      "evaluation_metrics_reported": [
-        "Global quadratic tight-binding (`Morrison`/`Williamson`) `K_d` (uM) & 95% MC CI vs independent co-deposited ITC/MST `K_d` (`ZENODO:17228160`) and published NMR/biophysical `K_d` (`BMRBIG:138`: fold-ratio `K_d,NMR / K_d,ref` and `|Delta Delta G|` in `kcal/mol`)",
-        "Hungarian fast-exchange peak-tracking completion rate, exchange-broadened slack-abstention rate, and iterative `2-sigma` Williamson binding-pocket residue concordance"
+      "secondary_report_only_metrics": [
+        "95% parametric MC `K_d` confidence interval coverage, fold-ratio `K_d,NMR / K_d,ref`, and `|Delta Delta G|` (`kcal/mol`) across both `ZENODO:17228160` and co-primary `BMRBIG:138`",
+        "Hungarian fast-exchange peak-tracking completion rate and intermediate-exchange slack-abstention rate"
       ]
     },
     "F14": {
       "todo_item": "TODO.md:144",
       "gate_name": "Raw 1D Small-Molecule Bruker FIDs (1H, 13C{1H}, DEPT-90, DEPT-135, 19F, 31P) & Gravimetric qNMR",
+      "primary_endpoint": "Zero-tuning raw 1D Bruker `fid` digital signal processing across all 5 nuclear/experiment classes (`1h`, `13c`, `dept90`/`dept135`, `19f`, `31p`) including native `DEPT-135` carbon multiplicity phase parity on L-fucose (`BMSE:bmse000036` + `ZENODO:17368767`) and certified gravimetric internal-standard `1H qNMR` molarity/purity recovery (`ZENODO:15728739`).",
+      "pass_criteria_conjunction": "ALL",
+      "pass_criteria": [
+        {
+          "id": "F14-C1",
+          "metric": "n_processed_1d_experiment_classes_exit0_snr_ge_10",
+          "operator": "==",
+          "threshold": 5,
+          "reference_value_or_source": "All 5 nuclear/experiment classes (`1h`, `13c`, `dept90`+`dept135`, `19f`, `31p`) processed directly from raw Bruker `fid` + `acqus` (`BMSE:bmse000036` for 1h/13c/dept90/dept135; `ZENODO:17368767` for 19f/31p)",
+          "rationale": "Requires exit_code == 0 and principal analyte peak SNR >= 10.0 across 5/5 heteronuclear and polarization-transfer experiment families."
+        },
+        {
+          "id": "F14-C2",
+          "metric": "bmse000036_dept135_fucose_positive_site_fraction",
+          "operator": "==",
+          "threshold": 1.0,
+          "reference_value_or_source": "L-fucose (6-deoxy-L-galactose, C6H12O5: 5 CH methines C1..C5 + 1 CH3 methyl C6 = 6 positive carbon sites, 0 negative CH2 carbons in bmse000036.mol / bmse000036.str; if fallback BMSE:bmse000006 ATP or BMSE:bmse000002 2,3-DPG runs, positive CH vs inverted negative C5'/C3 CH2 multiplicity sign)",
+          "rationale": "Verifies native `--experiment dept135` biphasic phasing without `--biphasic-pos`: 6/6 major-anomer L-fucose carbons (5 CH + 1 CH3) must exhibit positive intensity (`sign > 0`) with 0 falsely inverted L-fucose carbons (and any SNR >= 6.0 CH2 resonance inverted negative)."
+        },
+        {
+          "id": "F14-C3",
+          "metric": "median_qnmr_rel_abs_err",
+          "operator": "<=",
+          "threshold": 0.03,
+          "reference_value_or_source": "Certified/gravimetric reference molarity or purity in DataGuide_TestSamples.csv / DataGuide_Calibrations.csv (ZENODO:15728739)",
+          "rationale": "<= 3.0% relative absolute error is the canonical metrological accuracy gate for single-pulse internal-standard 1H qNMR (Malz & Jancke 2005; Pauli et al. 2014)."
+        }
+      ],
+      "verdict_definitions": {
+        "PASS": "All 3 criteria F14-C1 through F14-C3 hold simultaneously with exit_code == 0 across all bound experiment commands at the frozen 17.W1 crates/ tree.",
+        "FAIL": "Any non-zero CLI exit code, principal analyte SNR < 10.0, inverted DEPT-135 carbon multiplicity sign, or median qNMR relative error > 0.030 on valid raw FIDs at the frozen crates/ tree.",
+        "NOT_EVALUABLE": "Strictly restricted to HTTP 404/unreachable host, corrupted archive payload, or missing raw Bruker fid/acqus/gravimetric reference tables after exhausting BMSE:bmse000036 / ZENODO:17368767 / ZENODO:15728739 -> BMSE:bmse000006 -> BMSE:bmse000002 -> ZENODO:4360319 -> ZENODO:7221753."
+      },
       "primary_datasets": [
         {
           "role": "primary",
@@ -1064,24 +1624,336 @@
           ]
         }
       ],
-      "exact_cli_command_template": "nmrassign nmr1d process --in <bruker_fid_dir> --experiment <1h|13c|dept90|dept135|19f|31p> --zf 2 --auto-phase [--biphasic-pos <lo:hi>] --baseline whittaker [--calibrate-solvent <SOLV>] --deconvolve --peaks-out <peaks.tsv> --json-out <process_summary.json> --out <spec.json> && nmrassign nmr1d multiplet --in <spec.json> --nucleus <1H|13C|19F|31P> [--mol <bmse000036.mol>] --style acs --report-out <acs_report.txt> --json-out <multiplets.json> --out <multiplets.tsv> && nmrassign nmr1d qnmr --in <spec.json> --std-name <STD> --std-mw <MW_STD> --std-protons <N_STD> --std-mass-mg <M_STD> --std-purity <P_STD> --std-region <HI:LO> --analyte-name <AN> --analyte-mw <MW_AN> --analyte-mass-mg <M_AN> --analyte-region <HI:LO:H:LBL> --out <qnmr.tsv> --json-out <qnmr.json>",
+      "exact_cli_command_template": "nmrassign nmr1d process --in <bmse_1h_fid_dir> --experiment 1h --solvent D2O --zf 2 --auto-phase --baseline whittaker --deconvolve --peaks-out <bmse_1h_peaks.tsv> --json-out <bmse_1h_summary.json> --out <bmse_1h_spec.json> && nmrassign nmr1d multiplet --in <bmse_1h_spec.json> --solvent D2O --nucleus 1H --mol <bmse000036.mol> --style acs --report-out <bmse_1h_acs.txt> --json-out <bmse_1h_mult.json> --out <bmse_1h_mult.tsv> && nmrassign nmr1d process --in <bmse_13c_fid_dir> --experiment 13c --solvent D2O --zf 2 --auto-phase --baseline whittaker --peaks-out <bmse_13c_peaks.tsv> --json-out <bmse_13c_summary.json> --out <bmse_13c_spec.json> && nmrassign nmr1d multiplet --in <bmse_13c_spec.json> --solvent D2O --nucleus 13C --proton-decoupled --mol <bmse000036.mol> --style acs --report-out <bmse_13c_acs.txt> --json-out <bmse_13c_mult.json> --out <bmse_13c_mult.tsv> && nmrassign nmr1d process --in <bmse_dept90_fid_dir> --experiment dept90 --solvent D2O --zf 2 --auto-phase --baseline whittaker --peaks-out <bmse_dept90_peaks.tsv> --json-out <bmse_dept90_summary.json> --out <bmse_dept90_spec.json> && nmrassign nmr1d process --in <bmse_dept135_fid_dir> --experiment dept135 --solvent D2O --zf 2 --auto-phase --baseline whittaker --peaks-out <bmse_dept135_peaks.tsv> --json-out <bmse_dept135_summary.json> --out <bmse_dept135_spec.json> && nmrassign nmr1d process --in <zenodo_19f_fid_dir> --experiment 19f --zf 2 --auto-phase --baseline whittaker --peaks-out <zenodo_19f_peaks.tsv> --json-out <zenodo_19f_summary.json> --out <zenodo_19f_spec.json> && nmrassign nmr1d multiplet --in <zenodo_19f_spec.json> --nucleus 19F --proton-decoupled --style acs --report-out <zenodo_19f_acs.txt> --json-out <zenodo_19f_mult.json> --out <zenodo_19f_mult.tsv> && nmrassign nmr1d process --in <zenodo_31p_fid_dir> --experiment 31p --zf 2 --auto-phase --baseline whittaker --peaks-out <zenodo_31p_peaks.tsv> --json-out <zenodo_31p_summary.json> --out <zenodo_31p_spec.json> && nmrassign nmr1d multiplet --in <zenodo_31p_spec.json> --nucleus 31P --proton-decoupled --style acs --report-out <zenodo_31p_acs.txt> --json-out <zenodo_31p_mult.json> --out <zenodo_31p_mult.tsv> && nmrassign nmr1d process --in <qnmr_1h_fid_dir> --experiment 1h --zf 2 --auto-phase --baseline whittaker --out <qnmr_1h_spec.json> && nmrassign nmr1d qnmr --in <qnmr_1h_spec.json> --std-name <STD_NAME> --std-mw <MW_STD> --std-protons <N_STD> --std-mass-mg <M_STD> --std-purity <P_STD> --std-region <STD_REGION_HI_LO> --analyte-name <AN_NAME> --analyte-mw <MW_AN> --analyte-mass-mg <M_AN> --analyte-region <AN_REGION_HI_LO_H_LBL> --out <qnmr.tsv> --json-out <qnmr.json>",
+      "bound_parameters": {
+        "bmse_1h_fid_dir": {
+          "binding_kind": "literal",
+          "value": "bmse000036/nmr/set01/1H",
+          "rationale": "Deposited BMSE000036 400 MHz raw Bruker 1H FID directory."
+        },
+        "bmse_1h_peaks.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_1h_peaks.tsv",
+          "produced_by": "nmrassign nmr1d process --experiment 1h --peaks-out"
+        },
+        "bmse_1h_summary.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_1h_summary.json",
+          "produced_by": "nmrassign nmr1d process --experiment 1h --json-out"
+        },
+        "bmse_1h_spec.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_1h_spec.json",
+          "produced_by": "nmrassign nmr1d process --experiment 1h --out"
+        },
+        "bmse000036.mol": {
+          "binding_kind": "literal",
+          "value": "bmse000036.mol",
+          "rationale": "Deposited MDL V2000 molecular graph bundled with BMSE000036 (passed iff .mol/.sdf is present in archive)."
+        },
+        "bmse_1h_acs.txt": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_1h_acs.txt",
+          "produced_by": "nmrassign nmr1d multiplet --nucleus 1H --report-out"
+        },
+        "bmse_1h_mult.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_1h_mult.json",
+          "produced_by": "nmrassign nmr1d multiplet --nucleus 1H --json-out"
+        },
+        "bmse_1h_mult.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_1h_mult.tsv",
+          "produced_by": "nmrassign nmr1d multiplet --nucleus 1H --out"
+        },
+        "bmse_13c_fid_dir": {
+          "binding_kind": "literal",
+          "value": "bmse000036/nmr/set01/13C",
+          "rationale": "Deposited BMSE000036 raw Bruker 13C{1H} FID directory."
+        },
+        "bmse_13c_peaks.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_13c_peaks.tsv",
+          "produced_by": "nmrassign nmr1d process --experiment 13c --peaks-out"
+        },
+        "bmse_13c_summary.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_13c_summary.json",
+          "produced_by": "nmrassign nmr1d process --experiment 13c --json-out"
+        },
+        "bmse_13c_spec.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_13c_spec.json",
+          "produced_by": "nmrassign nmr1d process --experiment 13c --out"
+        },
+        "bmse_13c_acs.txt": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_13c_acs.txt",
+          "produced_by": "nmrassign nmr1d multiplet --nucleus 13C --report-out"
+        },
+        "bmse_13c_mult.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_13c_mult.json",
+          "produced_by": "nmrassign nmr1d multiplet --nucleus 13C --json-out"
+        },
+        "bmse_13c_mult.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_13c_mult.tsv",
+          "produced_by": "nmrassign nmr1d multiplet --nucleus 13C --out"
+        },
+        "bmse_dept90_fid_dir": {
+          "binding_kind": "literal",
+          "value": "bmse000036/nmr/set01/DEPT_90",
+          "rationale": "Deposited BMSE000036 raw Bruker DEPT-90 FID directory."
+        },
+        "bmse_dept90_peaks.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_dept90_peaks.tsv",
+          "produced_by": "nmrassign nmr1d process --experiment dept90 --peaks-out"
+        },
+        "bmse_dept90_summary.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_dept90_summary.json",
+          "produced_by": "nmrassign nmr1d process --experiment dept90 --json-out"
+        },
+        "bmse_dept90_spec.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_dept90_spec.json",
+          "produced_by": "nmrassign nmr1d process --experiment dept90 --out"
+        },
+        "bmse_dept135_fid_dir": {
+          "binding_kind": "literal",
+          "value": "bmse000036/nmr/set01/DEPT_135",
+          "rationale": "Deposited BMSE000036 raw Bruker DEPT-135 FID directory (--biphasic-pos is NOT used; --experiment dept135 handles biphasic phasing natively)."
+        },
+        "bmse_dept135_peaks.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_dept135_peaks.tsv",
+          "produced_by": "nmrassign nmr1d process --experiment dept135 --peaks-out"
+        },
+        "bmse_dept135_summary.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_dept135_summary.json",
+          "produced_by": "nmrassign nmr1d process --experiment dept135 --json-out"
+        },
+        "bmse_dept135_spec.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_bmse_dept135_spec.json",
+          "produced_by": "nmrassign nmr1d process --experiment dept135 --out"
+        },
+        "zenodo_19f_fid_dir": {
+          "binding_kind": "deterministic_source",
+          "source_file": "FAIR_NMR_FID.zip",
+          "key_or_column": "acqus :: ##$NUC1= <19F>",
+          "formula": "Lexicographically first Bruker raw `fid`+`acqus` directory in FAIR_NMR_FID.zip with ##$NUC1= <19F>"
+        },
+        "zenodo_19f_peaks.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f14_zenodo_19f_peaks.tsv",
+          "produced_by": "nmrassign nmr1d process --experiment 19f --peaks-out"
+        },
+        "zenodo_19f_summary.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_zenodo_19f_summary.json",
+          "produced_by": "nmrassign nmr1d process --experiment 19f --json-out"
+        },
+        "zenodo_19f_spec.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_zenodo_19f_spec.json",
+          "produced_by": "nmrassign nmr1d process --experiment 19f --out"
+        },
+        "zenodo_19f_acs.txt": {
+          "binding_kind": "output_artifact",
+          "value": "f14_zenodo_19f_acs.txt",
+          "produced_by": "nmrassign nmr1d multiplet --nucleus 19F --report-out"
+        },
+        "zenodo_19f_mult.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_zenodo_19f_mult.json",
+          "produced_by": "nmrassign nmr1d multiplet --nucleus 19F --json-out"
+        },
+        "zenodo_19f_mult.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f14_zenodo_19f_mult.tsv",
+          "produced_by": "nmrassign nmr1d multiplet --nucleus 19F --out"
+        },
+        "zenodo_31p_fid_dir": {
+          "binding_kind": "deterministic_source",
+          "source_file": "FAIR_NMR_FID.zip",
+          "key_or_column": "acqus :: ##$NUC1= <31P>",
+          "formula": "Lexicographically first Bruker raw `fid`+`acqus` directory in FAIR_NMR_FID.zip with ##$NUC1= <31P>"
+        },
+        "zenodo_31p_peaks.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f14_zenodo_31p_peaks.tsv",
+          "produced_by": "nmrassign nmr1d process --experiment 31p --peaks-out"
+        },
+        "zenodo_31p_summary.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_zenodo_31p_summary.json",
+          "produced_by": "nmrassign nmr1d process --experiment 31p --json-out"
+        },
+        "zenodo_31p_spec.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_zenodo_31p_spec.json",
+          "produced_by": "nmrassign nmr1d process --experiment 31p --out"
+        },
+        "zenodo_31p_acs.txt": {
+          "binding_kind": "output_artifact",
+          "value": "f14_zenodo_31p_acs.txt",
+          "produced_by": "nmrassign nmr1d multiplet --nucleus 31P --report-out"
+        },
+        "zenodo_31p_mult.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_zenodo_31p_mult.json",
+          "produced_by": "nmrassign nmr1d multiplet --nucleus 31P --json-out"
+        },
+        "zenodo_31p_mult.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f14_zenodo_31p_mult.tsv",
+          "produced_by": "nmrassign nmr1d multiplet --nucleus 31P --out"
+        },
+        "qnmr_1h_fid_dir": {
+          "binding_kind": "deterministic_source",
+          "source_file": "TestSamples.zip / DataGuide_TestSamples.csv",
+          "key_or_column": "Sample experiment folder column in DataGuide_TestSamples.csv",
+          "formula": "Each Bruker 1H qNMR FID directory enumerated in DataGuide_TestSamples.csv"
+        },
+        "qnmr_1h_spec.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_qnmr_1h_spec.json",
+          "produced_by": "nmrassign nmr1d process --experiment 1h --out"
+        },
+        "STD_NAME": {
+          "binding_kind": "deterministic_source",
+          "source_file": "DataGuide_TestSamples.csv / DataGuide_Calibrations.csv / Readme.txt",
+          "key_or_column": "Internal standard compound name column",
+          "formula": "Verbatim internal calibrant name string from DataGuide CSV"
+        },
+        "MW_STD": {
+          "binding_kind": "deterministic_source",
+          "source_file": "DataGuide_TestSamples.csv / DataGuide_Calibrations.csv / Readme.txt",
+          "key_or_column": "Internal standard molecular weight (g/mol)",
+          "formula": "Exact IUPAC/deposited molar mass of internal standard in g/mol"
+        },
+        "N_STD": {
+          "binding_kind": "deterministic_source",
+          "source_file": "DataGuide_TestSamples.csv / Readme.txt",
+          "key_or_column": "Number of equivalent 1H nuclei in internal standard reference resonance",
+          "formula": "Integer proton count N_H of the internal standard singlet/multiplet"
+        },
+        "M_STD": {
+          "binding_kind": "deterministic_source",
+          "source_file": "DataGuide_TestSamples.csv",
+          "key_or_column": "Internal standard gravimetric mass (mg) or stock molarity * volume * MW_STD",
+          "formula": "m_std_mg from DataGuide_TestSamples.csv (or C_std_mol_L * V_L * MW_STD * 1000.0 when molarity is tabulated)"
+        },
+        "P_STD": {
+          "binding_kind": "deterministic_source",
+          "source_file": "DataGuide_TestSamples.csv / Readme.txt",
+          "key_or_column": "Certified internal standard mass-fraction purity (0..1)",
+          "formula": "Certified purity fraction in [0, 1] (default 1.0 when molarity is pre-corrected for CRM purity in DataGuide)"
+        },
+        "STD_REGION_HI_LO": {
+          "binding_kind": "deterministic_source",
+          "source_file": "DataGuide_TestSamples.csv / Readme.txt",
+          "key_or_column": "Deposited internal standard integration window (or peak centroid +- 0.08 ppm if only centroid is listed)",
+          "formula": "Format `{ppm_hi}:{ppm_lo}` from DataGuide CSV / Readme.txt without post-hoc window tuning"
+        },
+        "AN_NAME": {
+          "binding_kind": "deterministic_source",
+          "source_file": "DataGuide_TestSamples.csv",
+          "key_or_column": "Analyte compound name column",
+          "formula": "Verbatim analyte identifier string from DataGuide_TestSamples.csv"
+        },
+        "MW_AN": {
+          "binding_kind": "deterministic_source",
+          "source_file": "DataGuide_TestSamples.csv / Readme.txt",
+          "key_or_column": "Analyte molecular weight (g/mol)",
+          "formula": "Exact IUPAC/deposited molar mass of analyte in g/mol"
+        },
+        "M_AN": {
+          "binding_kind": "deterministic_source",
+          "source_file": "DataGuide_TestSamples.csv",
+          "key_or_column": "Analyte gravimetric mass (mg) or nominal concentration * volume * MW_AN",
+          "formula": "m_analyte_mg from DataGuide_TestSamples.csv"
+        },
+        "AN_REGION_HI_LO_H_LBL": {
+          "binding_kind": "deterministic_source",
+          "source_file": "DataGuide_TestSamples.csv / Readme.txt",
+          "key_or_column": "Deposited non-overlapping analyte reporter resonance window and equivalent proton count H",
+          "formula": "Format `{ppm_hi}:{ppm_lo}:{H}:{label}` from DataGuide CSV / Readme.txt without post-hoc window tuning"
+        },
+        "qnmr.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f14_qnmr_results.tsv",
+          "produced_by": "nmrassign nmr1d qnmr --out"
+        },
+        "qnmr.json": {
+          "binding_kind": "output_artifact",
+          "value": "f14_qnmr_results.json",
+          "produced_by": "nmrassign nmr1d qnmr --json-out"
+        }
+      },
       "deterministic_format_adapter_spec": {
         "required": false,
         "adapter_kind": "native_bruker_1d_fid_and_qnmr_metadata",
         "rules": [
-          "Zero FID format conversion: `nmrassign nmr1d process` natively decodes Bruker `fid` + `acqus` (`GRPDLY`/`DSPFVS`/`DECIM` digital filter group delay) across all 6 experiment classes (`1H`, `13C{1H}`, `DEPT-90`, `DEPT-135`, `19F`, `31P`).",
-          "Read gravimetric standard/analyte masses, molarities, and integration bounds strictly from `DataGuide_*.csv` (`ZENODO:15728739`) and `bmse000036.str` (`5.0 mM DSS` 9-proton singlet at `0.00 ppm`) without post-hoc window tuning."
+          "Zero FID format conversion: `nmrassign nmr1d process` natively decodes Bruker `fid` + `acqus` (`GRPDLY`/`DSPFVS`/`DECIM` digital filter group delay and `SFO1`/`BF1` chemical-shift referencing) across all experiment classes (`1h`, `13c`, `dept90`, `dept135`, `19f`, `31p`).",
+          "`--biphasic-pos` is NOT used (`--experiment dept135` handles biphasic `CH`/`CH3` positive vs `CH2` negative minimum-entropy phasing natively). `--calibrate-solvent` is NOT used on `BMSE:bmse000036` or `ZENODO:17368767` because `nmr1d::auto_calibrate_solvent_1d` indexes Fulmer-2010 deuterated residual solvent multiplets (`CDCl3..toluene-d8`, rejecting `DSS`), whereas Bruker `acqus` `BF1`/`SFO1` already anchors aqueous `5.0 mM DSS` at `0.00 ppm` natively (`--solvent D2O` records the aqueous solvent on `BMSE:bmse000036`).",
+          "`nmr1d multiplet` binds `--nucleus` strictly to `acqus` `##$NUC1=`, passes `--proton-decoupled` iff nucleus is in `{13C, 19F, 31P}`, and passes `--mol` iff a `.mol`/`.sdf` structure file is bundled in the archive (`bmse000036.mol`). Read gravimetric standard/analyte parameters strictly from `DataGuide_*.csv` / `Readme.txt` (`ZENODO:15728739`)."
         ]
       },
-      "evaluation_metrics_reported": [
-        "Bruker DSP `GRPDLY` removal & Chen-2002 minimum-entropy autophasing quality across `1H`, `13C{1H}`, `DEPT-90`, `DEPT-135` (biphasic `CH`/`CH3` positive vs `CH2` negative parity on `BMSE:bmse000036`), `19F`, and `31P`",
-        "Chemical-shift referencing offset error (ppm vs vendor `pdata/1/1r` and deposited `bmse000036.str`), Hoye multiplet class concordance, and `J`-coupling MAE (Hz)",
-        "`qNMR` concentration / mass-fraction purity agreement (absolute & relative % error, replicate RSD, and coverage within GUM `U(k=2)` expanded uncertainty) on `ZENODO:15728739` and `BMSE:bmse000036`"
+      "secondary_report_only_metrics": [
+        "Bruker DSP `GRPDLY` removal and Chen-2002 minimum-entropy `PHC0`/`PHC1` phase values vs vendor `pdata/1/procs`",
+        "Chemical-shift referencing offset error (ppm vs vendor `pdata/1/1r` and `bmse000036.str`), Hoye multiplet class concordance, and `J`-coupling MAE (Hz)",
+        "Replicate RSD, coverage within GUM `U(k=2)` expanded uncertainty, and secondary `5.0 mM DSS` internal-standard concentration check on `BMSE:bmse000036`"
       ]
     },
     "F16": {
       "todo_item": "TODO.md:146",
       "gate_name": "Raw Bruker difflist/ser & Varian fid/procpar Multi-Component Experimental DOSY",
+      "primary_endpoint": "Vendor-native Bruker (`ser`+`difflist`+`acqus`) and Varian (`fid`+`procpar` `gzlvl1*gcal_`) Stejskal-Tanner / Wu-Johnson `b`-factor decoding, decay fitting, mixture diffusivity ordering, and quantitative `log10(D)` accuracy (`ZENODO:12170718` & `MENDELEY:d7bdxz9hsk`).",
+      "pass_criteria_conjunction": "ALL",
+      "pass_criteria": [
+        {
+          "id": "F16-C1",
+          "metric": "vendor_formats_ingested_exit0",
+          "operator": "==",
+          "threshold": 2,
+          "reference_value_or_source": "Both raw vendor pseudo-2D DOSY formats: Bruker ser+difflist+acqus (ZENODO:12170718) and Varian fid+procpar (MENDELEY:d7bdxz9hsk)",
+          "rationale": "Verifies dual-vendor Stejskal-Tanner / Wu-Johnson b-value header parsing and decay fitting with exit_code == 0."
+        },
+        {
+          "id": "F16-C2",
+          "metric": "min_principal_decay_fit_r2",
+          "operator": ">=",
+          "threshold": 0.95,
+          "reference_value_or_source": "Principal analyte Stejskal-Tanner / Wu-Johnson attenuation curve R^2 across both Bruker and Varian datasets",
+          "rationale": "Confirms physically scaled gradient-squared b-factors and clean mono-/multi-exponential attenuation."
+        },
+        {
+          "id": "F16-C3",
+          "metric": "mixture_diffusivity_ordering_concordance",
+          "operator": "==",
+          "threshold": 1.0,
+          "reference_value_or_source": "Known molecular-weight / hydrodynamic ordering in multi-component mixtures (D_small_ligand > D_lysozyme_14.3kDa on ZENODO:12170718; D_small > D_large across resolved mixture components on MENDELEY:d7bdxz9hsk)",
+          "rationale": "100% concordance on physical diffusivity ordering across resolved small-molecule and macromolecular mixture species."
+        },
+        {
+          "id": "F16-C4",
+          "metric": "max_principal_abs_log10_d_err_dex",
+          "operator": "<=",
+          "threshold": 0.12,
+          "reference_value_or_source": "abs(log10(D_fit / D_ref)) against published diffusivity or Stokes-Einstein reference at experimental solvent/temperature",
+          "rationale": "0.12 dex (<= 31.8% factor) accounts for probe gradient calibration (`gcal_` / `SMSQ10.100`), convection, and solvation-shell hydrodynamics."
+        }
+      ],
+      "verdict_definitions": {
+        "PASS": "All 4 criteria F16-C1 through F16-C4 hold simultaneously across both Bruker and Varian DOSY datasets at the frozen 17.W1 crates/ tree.",
+        "FAIL": "Any non-zero CLI exit code, b-factor unit/gradient scaling bug, principal decay R^2 < 0.95, inverted mixture D ordering, or |log10(D_fit / D_ref)| > 0.12 dex on valid vendor files at the frozen crates/ tree.",
+        "NOT_EVALUABLE": "Strictly restricted to HTTP 404/unreachable host, corrupted archive payload, or missing ser/difflist/fid/procpar vendor files after exhausting ZENODO:12170718 / MENDELEY:d7bdxz9hsk -> ZENODO:16423019."
+      },
       "primary_datasets": [
         {
           "role": "primary",
@@ -1142,24 +2014,126 @@
           ]
         }
       ],
-      "exact_cli_command_template": "nmrassign dosy fit --in <decay.tsv> --exp-dir <bruker_or_varian_dir> --engine cpu --criterion bic --max-components 3 --solvent D2O --temp-k 298.15 --out <dosy_fit_cpu.tsv> --json-out <dosy_fit_cpu.json> && nmrassign dosy fit --in <decay.tsv> --exp-dir <bruker_or_varian_dir> --engine gpu --criterion bic --max-components 3 --solvent D2O --temp-k 298.15 --out <dosy_fit_gpu.tsv> --json-out <dosy_fit_gpu.json> && nmrassign dosy ilt --in <decay.tsv> --exp-dir <bruker_or_varian_dir> --strategy gcv --solvent D2O --temp-k 298.15 --alpha-sweep-out <dosy_alpha_sweep.tsv> --out <dosy_ilt.tsv> --json-out <dosy_ilt.json>",
+      "exact_cli_command_template": "nmrassign dosy fit --in <decay.tsv> --exp-dir <bruker_or_varian_dir> --engine cpu --criterion bic --max-components 3 --bootstrap 200 --seed 20261404 --solvent <header_solvent> --temp-k <header_temp_k> --out <dosy_fit_cpu.tsv> --json-out <dosy_fit_cpu.json> && nmrassign dosy fit --in <decay.tsv> --exp-dir <bruker_or_varian_dir> --engine gpu --criterion bic --max-components 3 --bootstrap 200 --seed 20261404 --solvent <header_solvent> --temp-k <header_temp_k> --out <dosy_fit_gpu.tsv> --json-out <dosy_fit_gpu.json> && nmrassign dosy ilt --in <decay.tsv> --exp-dir <bruker_or_varian_dir> --strategy gcv --solvent <header_solvent> --temp-k <header_temp_k> --alpha-sweep-out <dosy_alpha_sweep.tsv> --out <dosy_ilt.tsv> --json-out <dosy_ilt.json>",
+      "bound_parameters": {
+        "decay.tsv": {
+          "binding_kind": "deterministic_source",
+          "source_file": "ser (Bruker ZENODO:12170718) or fid (Varian MENDELEY:d7bdxz9hsk)",
+          "key_or_column": "Pseudo-2D F2 gradient planes m = 0..M-1",
+          "formula": "1.0 Hz exponential apodization, 2x zero-fill, F2 FFT, phase locked on plane m = 0, pick peaks SNR >= 10 on m = 0 excluding [4.65, 4.95] ppm, integrate fixed +-2*FWHM boxes across m = 0..M-1"
+        },
+        "bruker_or_varian_dir": {
+          "binding_kind": "deterministic_source",
+          "source_file": "CompetitiveCooperative_CoLD_CoP_for_archiving.zip and MENDELEY:d7bdxz9hsk directory",
+          "key_or_column": "Directory containing `acqus`+`difflist`+`ser` (Bruker) or `procpar`+`fid` (Varian)",
+          "formula": "Extracted pseudo-2D experiment directory path passed to `--exp-dir`"
+        },
+        "header_solvent": {
+          "binding_kind": "deterministic_source",
+          "source_file": "acqus (Bruker) or procpar (Varian)",
+          "key_or_column": "acqus :: ##$SOLVENT= or procpar :: solvent",
+          "formula": "Canonicalize header solvent token into `{D2O, H2O, CDCl3, DMSO-d6, CD3OD, CD3CN}` (fallback `D2O` if header token is absent/other)"
+        },
+        "header_temp_k": {
+          "binding_kind": "deterministic_source",
+          "source_file": "acqus (Bruker) or procpar (Varian)",
+          "key_or_column": "acqus :: ##$TE= or procpar :: temp",
+          "formula": "TE in Kelvin if >= 150.0 else temp_C + 273.15 (fallback 298.15 if absent)"
+        },
+        "dosy_fit_cpu.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f16_dosy_fit_cpu.tsv",
+          "produced_by": "nmrassign dosy fit --engine cpu --out"
+        },
+        "dosy_fit_cpu.json": {
+          "binding_kind": "output_artifact",
+          "value": "f16_dosy_fit_cpu.json",
+          "produced_by": "nmrassign dosy fit --engine cpu --json-out"
+        },
+        "dosy_fit_gpu.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f16_dosy_fit_gpu.tsv",
+          "produced_by": "nmrassign dosy fit --engine gpu --out"
+        },
+        "dosy_fit_gpu.json": {
+          "binding_kind": "output_artifact",
+          "value": "f16_dosy_fit_gpu.json",
+          "produced_by": "nmrassign dosy fit --engine gpu --json-out"
+        },
+        "dosy_alpha_sweep.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f16_dosy_alpha_sweep.tsv",
+          "produced_by": "nmrassign dosy ilt --alpha-sweep-out"
+        },
+        "dosy_ilt.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f16_dosy_ilt.tsv",
+          "produced_by": "nmrassign dosy ilt --out"
+        },
+        "dosy_ilt.json": {
+          "binding_kind": "output_artifact",
+          "value": "f16_dosy_ilt.json",
+          "produced_by": "nmrassign dosy ilt --json-out"
+        }
+      },
       "deterministic_format_adapter_spec": {
         "required": true,
         "adapter_kind": "pseudo2d_f2_fft_locked_g0_peak_integrator",
         "rules": [
           "Stejskal-Tanner / Wu-Johnson `b`-values (`s/m^2`) are parsed natively via `--exp-dir` (`nmr_core::dosy::read_bruker_dosy_dir` on `acqus`+`pulseprogram`+`difflist` and `read_varian_dosy_dir` on `procpar` `gzlvl1 * gcal_`).",
-          "Extract per-gradient 1D peak integrals `decay.tsv` (`label\\tcenter_ppm\\tI_0\\t...\\tI_{M-1}`) by applying uniform `1.0 Hz` exponential apodization, `2x` zero-fill, F2 FFT, and phase locked strictly from lowest-gradient plane `m = 0`, picking peaks (`SNR >= 10` on `m = 0`, masking residual water `4.65..4.95 ppm`), and integrating fixed `+-2*FWHM` boxes across `m = 0..M-1` without inspecting diffusion decays."
+          "Adapter `scripts/p17_adapters/f16_dosy_plane_integrator.py` (hashed before invoking `nmrassign`) extracts per-gradient 1D peak integrals `decay.tsv` (`label\\tcenter_ppm\\tI_0\\t...\\tI_{M-1}`) by applying uniform `1.0 Hz` exponential apodization, `2x` zero-fill, F2 FFT, and phase locked strictly from lowest-gradient plane `m = 0`, picking peaks (`SNR >= 10` on `m = 0`, masking residual water `4.65..4.95 ppm`), and integrating fixed `+-2*FWHM` boxes across `m = 0..M-1` without inspecting diffusion decays."
         ]
       },
-      "evaluation_metrics_reported": [
-        "Native Bruker `difflist`/`acqus` and Varian `procpar` Stejskal-Tanner `b`-value parsing & physical range verification",
-        "`log10(D / m^2 s^-1)` accuracy, Stokes-Einstein hydrodynamic radius `R_h` (A) / `MW` (Da) estimates (ligands vs `14.3 kDa` Lysozyme), and multi-component `BIC` (`K = 1..3`) + `GCV` `ILT` separation of fast small-molecule vs slow protein components",
+      "secondary_report_only_metrics": [
+        "Stokes-Einstein hydrodynamic radius `R_h` (A) and empirical power-law `MW` (Da) estimates (small-molecule ligands vs `14.3 kDa` Lysozyme)",
+        "Multi-component `BIC` (`K = 1..3`) vs CONTIN-style second-derivative Tikhonov `GCV` `ILT` diffusivity spectrum resolution",
         "CPU `f64` vs WebGPU `f32` (`dosy.wgsl`) `log10(D)` and `BIC` model-selection parity"
       ]
     },
     "F17": {
       "todo_item": "TODO.md:147",
       "gate_name": "Public 1D Biofluid NMR Metabolomics Cohort (MetaboLights MTBLS1 Human Urinary T2DM)",
+      "primary_endpoint": "Cohort-scale raw 1D Bruker urinary spectrum processing, PQN normalization, leak-free stratified 7-fold cross-validated `OPLS-DA` Type-2 diabetes discrimination (`Q^2`, permutation `p`), and `VIP`/`STOCSY` urinary D-glucose biomarker recovery on `METABOLIGHTS:MTBLS1` (`N = 132`).",
+      "pass_criteria_conjunction": "ALL",
+      "pass_criteria": [
+        {
+          "id": "F17-C1",
+          "metric": "n_clean_processed_pqn_samples",
+          "operator": ">=",
+          "threshold": 126,
+          "reference_value_or_source": ">= 126/132 (>= 95.45%) raw Bruker sample .zip archives joined 1-to-1 from s_MTBLS1.txt and a_MTBLS1_metabolite_profiling_NMR_spectroscopy.txt on METABOLIGHTS:MTBLS1",
+          "rationale": "Verifies robust unattended Bruker `noesypr1d` FID processing, TSP alignment, AIB bucketing, and PQN dilution normalization across >= 95% of the N = 132 clinical cohort."
+        },
+        {
+          "id": "F17-C2",
+          "metric": "oplsda_cv_q2",
+          "operator": ">=",
+          "threshold": 0.25,
+          "reference_value_or_source": "Leak-free stratified 7-fold cross-validated OPLS-DA predictive Q^2 (`Control Group` vs `diabetes mellitus`, Salek et al. Physiol. Genomics 2007, 29, 99-108)",
+          "rationale": "Confirms genuine out-of-fold chemometric discrimination of human urinary Type-2 diabetes mellitus without fold-leakage."
+        },
+        {
+          "id": "F17-C3",
+          "metric": "oplsda_perm_p_q2",
+          "operator": "<=",
+          "threshold": 0.02,
+          "reference_value_or_source": "100-trial class-label permutation p-value (`--permutations 100 --seed 20261717`) on OPLS-DA cross-validated Q^2",
+          "rationale": "Rejects high-dimensional PLS overfitting at alpha = 0.02 under deterministic PRNG seed 20261717."
+        },
+        {
+          "id": "F17-C4",
+          "metric": "glucose_glycosuria_buckets_in_top15",
+          "operator": ">=",
+          "threshold": 1,
+          "reference_value_or_source": "Top-15 ranked OPLS-DA VIP buckets or 5.24 ppm STOCSY top-15 correlated buckets overlapping canonical urinary D-glucose glycosuria chemical-shift regions ([3.20, 3.95] ppm C2-C6 ring protons or [5.20, 5.28] ppm alpha-anomeric H1; Salek et al. 2007)",
+          "rationale": "Verifies biologically grounded biomarker recovery of hallmark T2DM glycosuria in unlabelled 1H urinary spectra."
+        }
+      ],
+      "verdict_definitions": {
+        "PASS": "All 4 criteria F17-C1 through F17-C4 hold simultaneously with exit_code == 0 on the frozen 17.W1 crates/ tree.",
+        "FAIL": "Fewer than 126/132 samples processed cleanly, OPLS-DA Q^2 < 0.25, permutation p > 0.02, or zero D-glucose glycosuria buckets in top-15 VIP/STOCSY on valid MTBLS1 archives at the frozen crates/ tree.",
+        "NOT_EVALUABLE": "Strictly restricted to EBI FTP/HTTPS host outage (HTTP 404/5xx), archive corruption across > 6 sample .zip files, or missing ISA-Tab metadata sheets on METABOLIGHTS:MTBLS1 (single canonical cohort; no backup dataset)."
+      },
       "primary_datasets": [
         {
           "role": "primary",
@@ -1194,38 +2168,70 @@
           ]
         }
       ],
-      "backup_datasets": [
-        {
-          "role": "backup_1",
-          "accession_id": "METABOLIGHTS:MTBLS1",
-          "auxiliary_structure_ids": [],
-          "title": "MetaboLights MTBLS1 Vendor-Processed Bruker pdata/1/1r Spectra Inside Canonical 132 Sample .zip Archives (if any raw fid header is incomplete)",
-          "license": "CC0",
-          "citation_doi": "10.1152/physiolgenomics.00194.2006",
-          "dataset_doi": "10.1152/physiolgenomics.00194.2006",
-          "citation": "Salek, R. M. et al. & Griffin, J. L. Physiol. Genomics 2007, 29(2), 99-108",
-          "files": [
-            {
-              "name": "FILES_132_bruker_pdata_1r_zips",
-              "url": "https://ftp.ebi.ac.uk/pub/databases/metabolights/studies/public/MTBLS1/FILES/",
-              "head_verified_bytes": null
-            }
-          ]
+      "backup_datasets": [],
+      "fallback_note": "none \u2014 single canonical MetaboLights MTBLS1 urinary T2DM cohort",
+      "exact_cli_command_template": "nmrassign nmr1d process --in <sample_bruker_dir> --experiment 1h --zf 2 --auto-phase --baseline whittaker --out <sample_spectrum.tsv> && nmrassign metabolomics bin --manifest <mtbls1_manifest.tsv> --min-ppm 0.50 --max-ppm 9.50 --mask urine --calibrate-tsp --method aib --norm pqn --scale pareto -o <mtbls1_buckets.csv> --study-out <mtbls1_study.json> && nmrassign metabolomics pca --in <mtbls1_study.json> --components 5 -o <mtbls1_pca.json> && nmrassign metabolomics oplsda --in <mtbls1_study.json> --ortho 1 --cv-folds 7 --permutations 100 --seed 20261717 --control \"Control Group\" --case \"diabetes mellitus\" --biomarkers-out <mtbls1_biomarkers.csv> -o <mtbls1_oplsda.json> && nmrassign metabolomics stocsy --in <mtbls1_study.json> --driver-ppm 5.24 -o <mtbls1_stocsy_glucose.json>",
+      "bound_parameters": {
+        "sample_bruker_dir": {
+          "binding_kind": "deterministic_source",
+          "source_file": "a_MTBLS1_metabolite_profiling_NMR_spectroscopy.txt + FILES/<Raw Spectral Data File>.zip",
+          "key_or_column": "Raw Spectral Data File (.zip)",
+          "formula": "Extracted Bruker experiment directory containing `fid`+`acqus` for each of the N = 132 `.zip` archives"
+        },
+        "sample_spectrum.tsv": {
+          "binding_kind": "output_artifact",
+          "value": "f17_spectra/<sample_id>.tsv",
+          "produced_by": "nmrassign nmr1d process --experiment 1h --out"
+        },
+        "mtbls1_manifest.tsv": {
+          "binding_kind": "deterministic_source",
+          "source_file": "s_MTBLS1.txt + a_MTBLS1_metabolite_profiling_NMR_spectroscopy.txt",
+          "key_or_column": "s_MTBLS1.txt :: (`Sample Name`, `Factor Value[Metabolic syndrome]`) INNER JOIN a_MTBLS1 :: (`Sample Name`, `Raw Spectral Data File` matching `*.zip`)",
+          "formula": "3-column TSV `sample_id\\tgroup\\tspectrum_path` sorted lexicographically by `sample_id` (N = 132: 84 `Control Group`, 48 `diabetes mellitus`)"
+        },
+        "mtbls1_buckets.csv": {
+          "binding_kind": "output_artifact",
+          "value": "f17_mtbls1_buckets.csv",
+          "produced_by": "nmrassign metabolomics bin -o"
+        },
+        "mtbls1_study.json": {
+          "binding_kind": "output_artifact",
+          "value": "f17_mtbls1_study.json",
+          "produced_by": "nmrassign metabolomics bin --study-out"
+        },
+        "mtbls1_pca.json": {
+          "binding_kind": "output_artifact",
+          "value": "f17_mtbls1_pca.json",
+          "produced_by": "nmrassign metabolomics pca -o"
+        },
+        "mtbls1_biomarkers.csv": {
+          "binding_kind": "output_artifact",
+          "value": "f17_mtbls1_biomarkers.csv",
+          "produced_by": "nmrassign metabolomics oplsda --biomarkers-out"
+        },
+        "mtbls1_oplsda.json": {
+          "binding_kind": "output_artifact",
+          "value": "f17_mtbls1_oplsda.json",
+          "produced_by": "nmrassign metabolomics oplsda -o"
+        },
+        "mtbls1_stocsy_glucose.json": {
+          "binding_kind": "output_artifact",
+          "value": "f17_mtbls1_stocsy_glucose.json",
+          "produced_by": "nmrassign metabolomics stocsy -o"
         }
-      ],
-      "exact_cli_command_template": "nmrassign nmr1d process --in <sample_bruker_dir> --experiment 1h --zf 2 --auto-phase --baseline whittaker --out <sample_id>.tsv && nmrassign metabolomics bin --manifest <mtbls1_manifest.tsv> --min-ppm 0.50 --max-ppm 9.50 --mask urine --calibrate-tsp --method aib --norm pqn --scale pareto -o <mtbls1_buckets.csv> --study-out <mtbls1_study.json> && nmrassign metabolomics pca --in <mtbls1_study.json> --components 5 -o <mtbls1_pca.json> && nmrassign metabolomics oplsda --in <mtbls1_study.json> --ortho 1 --cv-folds 7 --permutations 200 --seed 42 --control \"Control Group\" --case \"diabetes mellitus\" --biomarkers-out <mtbls1_biomarkers.csv> -o <mtbls1_oplsda.json> && nmrassign metabolomics stocsy --in <mtbls1_study.json> --driver-ppm 5.24 -o <mtbls1_stocsy_glucose.json>",
+      },
       "deterministic_format_adapter_spec": {
         "required": true,
         "adapter_kind": "isatab_sample_assay_join_to_3col_manifest",
         "rules": [
-          "Deterministically join `s_MTBLS1.txt` (`Sample Name`, `Factor Value[Metabolic syndrome]`) 1-to-1 with `a_MTBLS1_metabolite_profiling_NMR_spectroscopy.txt` (`Raw Spectral Data File` `.zip`, ignoring the 133 `.nmrML` XML files with duplicate `ADG-19_007u_476.nmrML`) to emit the 3-column `sample_id\\tgroup\\tspectrum_path` manifest (`N = 132`: `84` `Control Group`, `48` `diabetes mellitus`).",
-          "Report both default `--mask urine --method aib` and uniform `--mask custom --exclude 4.50:6.00 --method uniform --bin-width 0.04` (and water-only `--exclude 4.50:5.00` sensitivity) without altering `cv_folds = 7` or `seed = 42`."
+          "Adapter `scripts/p17_adapters/f17_mtbls1_manifest.py` (hashed before invoking `nmrassign`) deterministically joins `s_MTBLS1.txt` (`Sample Name`, `Factor Value[Metabolic syndrome]`) 1-to-1 with `a_MTBLS1_metabolite_profiling_NMR_spectroscopy.txt` (`Raw Spectral Data File` `.zip`, ignoring the 133 `.nmrML` XML files with duplicate `ADG-19_007u_476.nmrML`) to emit the 3-column `sample_id\\tgroup\\tspectrum_path` manifest (`N = 132`: `84` `Control Group`, `48` `diabetes mellitus`).",
+          "Primary `pass_criteria` evaluate the bound `--mask urine --method aib --norm pqn --scale pareto` + `--cv-folds 7 --permutations 100 --seed 20261717` pipeline; secondary sensitivity runs (`--mask custom --exclude 4.50:6.00 --method uniform --bin-width 0.04` and `--permute-cohort-labels` null-label sanity check) are strictly report-only."
         ]
       },
-      "evaluation_metrics_reported": [
-        "`N = 132` (`84` `Control Group` vs `48` `diabetes mellitus`) ingestion completion rate, `PCA` variance explained & Hotelling `T^2` / `Q`-residual outlier count",
-        "Leak-free stratified 7-fold `OPLS-DA` cross-validated `Q^2`, `R^2_Y`, and 200-permutation `p`-value (`permutation_p_value_q2`, `is_validated`, plus `--permute-cohort-labels` null-label sanity check)",
-        "Top `VIP` / `S-plot` / `BH-FDR` Volcano and `STOCSY` urinary biomarker concordance against Salek et al. (2007) human T2DM markers (D-glucose `3.2-3.9 / 5.24 ppm`, citrate `2.54 / 2.68 ppm`, creatinine `3.05 / 4.05 ppm`, TMAO `3.27 ppm`, hippurate `7.55-7.84 ppm`, alanine `1.48 ppm`)"
+      "secondary_report_only_metrics": [
+        "`PCA` 5-component variance explained, Hotelling `T^2` / `Q`-residual outlier count, `OPLS-DA` `R^2_Y`, and `--permute-cohort-labels` null-label `Q^2` control",
+        "Secondary sensitivity comparison between `--mask urine --method aib` (excludes urea + `3.20..3.95 ppm` glucose core if masked by preset vs `5.24 ppm` alpha-glucose anomeric) and `--mask custom --exclude 4.50:6.00 --method uniform --bin-width 0.04`",
+        "Non-glucose Salek et al. (2007) urinary T2DM marker concordance (citrate `2.54 / 2.68 ppm`, creatinine `3.05 / 4.05 ppm`, TMAO `3.27 ppm`, hippurate `7.55-7.84 ppm`, alanine `1.48 ppm`)"
       ]
     }
   }

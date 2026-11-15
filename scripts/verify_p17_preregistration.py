@@ -2,20 +2,31 @@
 """Zero-dependency validator for Phase 17 single-shot empirical pre-registration.
 
 Validates ``data/benchmark/p17_empirical_preregistration.json`` against:
-1. Schema version, baseline tag (``v0.12.0``), protocol rules (solver/WGSL freeze
-   with ``F12(a)`` pre-download exception, deterministic format-conversion algebra,
-   strict fallback chain without tuning, candid single-shot reporting), and full
-   completeness across all 8 empirical validation gates:
+1. Schema version, ``v0.12.0`` reference provenance, whole-``crates/`` git tree +
+   ``Cargo.lock`` freeze (``frozen_w1_commit``, ``frozen_crates_git_tree``,
+   ``cargo_lock_sha256``, clean ``git diff``/``git status``, and 21/21 solver/WGSL
+   file SHA-256 pins with the pre-download ``F12(a)`` ``relax_mc.wgsl`` exception),
+   adapter isolation in ``scripts/p17_adapters/``, strict fallback chain without
+   tuning, and candid single-shot reporting.
+2. Explicit ``primary_endpoint``, numeric ``pass_criteria`` (``metric``, ``operator``,
+   ``threshold``, ``reference_value_or_source``, ``rationale``), strict
+   ``verdict_definitions`` (``PASS``, ``FAIL``, ``NOT_EVALUABLE``), 100% bound CLI
+   command templates (zero ``[--opt]`` brackets, every ``<var>`` bound in
+   ``bound_parameters``), and ``secondary_report_only_metrics`` across all 8 gates:
    ``F10``, ``F11``, ``F13a``, ``F13b``, ``F13c``, ``F14``, ``F16``, ``F17``.
-2. Strict open-data license allowlist: ``CC0``, ``CC-BY-4.0``, ``Public Domain``.
-3. 100% accession disjointness against:
+3. Strict open-data license allowlist: ``CC0``, ``CC-BY-4.0``, ``Public Domain``.
+4. 100% accession disjointness against:
    - ``data/benchmark/real_manifest.tsv`` (40 backbone FID benchmark entries),
    - ``data/benchmark/manifest.tsv`` (12 Phase-1 benchmark entries),
    - ``data/priors/PROVENANCE.md`` & ``data/priors/bmrb_priors.json`` (21 prior entries),
    - ``excluded_contaminated_entries`` (``BMRB:53960`` blind-firewall exclusion).
-4. Zero ``F10``-``F17`` download directories or target archive files present in
+5. Zero ``F10``-``F17`` download directories or target data-payload files present in
    ``data/private/`` (checked in both the active checkout and any linked git main
    worktree) at pre-registration time.
+
+Also provides ``--stamp-current-freeze`` so ``p17-w1-shepherd`` can deterministically
+stamp ``HEAD``, ``HEAD:crates``, ``Cargo.lock`` SHA-256, and all 21 solver/WGSL file
+SHA-256 pins in one command after merging final ``17.W1`` fixes.
 
 Provenance: Original clean-room Python 3 standard-library validator (MIT License).
 Zero network calls are performed by this script.
@@ -27,9 +38,11 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -80,6 +93,14 @@ ALLOWED_BACKUP_ROLES: Tuple[str, ...] = (
     "backup_5",
 )
 
+ALLOWED_PASS_OPERATORS: Set[str] = {"<=", ">=", "==", "<", ">"}
+ALLOWED_VERDICT_KEYS: Set[str] = {"PASS", "FAIL", "NOT_EVALUABLE"}
+ALLOWED_BINDING_KINDS: Set[str] = {"literal", "deterministic_source", "output_artifact"}
+
+HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+PLACEHOLDER_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
 # Directory or file prefixes in data/private/ that indicate F10-F17 downloads.
 # Note: `p17_prereg_candidates.md` (metadata-only HEAD catalog) and `p17_w1_results` / `p17_w2_results`
 # (pre-download Wave 1 & Wave 2 benchmark/test log directories, whose children are recursively scanned
@@ -118,6 +139,14 @@ def _is_strict_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _is_strict_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -127,6 +156,16 @@ def _sha256_file(path: Path) -> str:
                 break
             h.update(chunk)
     return h.hexdigest()
+
+
+def _run_git(repo_root: Path, args: Sequence[str]) -> Tuple[int, str, str]:
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
 def _normalize_bmrb_token(raw: str) -> Optional[str]:
@@ -280,11 +319,11 @@ def _validate_dataset_entry(
     candidate_accessions: List[Tuple[str, str]],
     download_tokens: Set[str],
     download_basenames: Set[str],
-) -> Optional[str]:
+) -> Tuple[Optional[str], Optional[str]]:
     label = f"gates.{gate_id}.{'primary_datasets' if is_primary else 'backup_datasets'}[{idx}]"
     if not isinstance(ds, dict):
         errors.append(f"{label}: dataset entry must be a JSON object")
-        return None
+        return None, None
 
     role = ds.get("role")
     if not isinstance(role, str) or not role.strip():
@@ -301,6 +340,7 @@ def _validate_dataset_entry(
                 f"{label}: invalid backup role {role_str!r} (expected one of {list(ALLOWED_BACKUP_ROLES)})"
             )
 
+    acc_clean_opt: Optional[str] = None
     acc = ds.get("accession_id")
     if not isinstance(acc, str) or ":" not in acc or not acc.strip():
         errors.append(f"{label}: `accession_id` must be `<NAMESPACE>:<ID>`, got {acc!r}")
@@ -310,6 +350,7 @@ def _validate_dataset_entry(
         if not ns or not bare_id:
             errors.append(f"{label}: malformed `accession_id` {acc_clean!r}")
         else:
+            acc_clean_opt = acc_clean
             candidate_accessions.append((gate_id, acc_clean))
             ns_low = ns.lower()
             id_low = bare_id.lower()
@@ -377,7 +418,240 @@ def _validate_dataset_entry(
                     f"{flabel}: `head_verified_bytes` must be a positive integer or null, got {fbytes!r}"
                 )
 
-    return role_str
+    return role_str, acc_clean_opt
+
+
+def _validate_pass_criteria_and_verdicts(gate_id: str, g: Dict[str, Any], errors: List[str]) -> None:
+    label = f"gates.{gate_id}"
+    endpoint = g.get("primary_endpoint")
+    if not isinstance(endpoint, str) or len(endpoint.strip()) < 16:
+        errors.append(f"{label}.primary_endpoint must be a descriptive string (>= 16 chars)")
+
+    if g.get("pass_criteria_conjunction") != "ALL":
+        errors.append(
+            f"{label}.pass_criteria_conjunction must be 'ALL', got {g.get('pass_criteria_conjunction')!r}"
+        )
+
+    criteria = g.get("pass_criteria")
+    if not isinstance(criteria, list) or len(criteria) < 2:
+        errors.append(f"{label}.pass_criteria must be a non-empty list of >= 2 numeric criteria")
+    else:
+        seen_ids: Set[str] = set()
+        for c_idx, c_obj in enumerate(criteria):
+            clabel = f"{label}.pass_criteria[{c_idx}]"
+            if not isinstance(c_obj, dict):
+                errors.append(f"{clabel}: criterion must be a JSON object")
+                continue
+            cid = c_obj.get("id")
+            if not isinstance(cid, str) or not cid.startswith(f"{gate_id}-"):
+                errors.append(f"{clabel}.id must start with '{gate_id}-', got {cid!r}")
+            elif cid in seen_ids:
+                errors.append(f"{clabel}.id duplicate criterion id {cid!r}")
+            else:
+                seen_ids.add(cid)
+
+            metric = c_obj.get("metric")
+            if not isinstance(metric, str) or not metric.strip():
+                errors.append(f"{clabel}.metric must be a non-empty string")
+
+            op = c_obj.get("operator")
+            if not isinstance(op, str) or op not in ALLOWED_PASS_OPERATORS:
+                errors.append(
+                    f"{clabel}.operator must be one of {sorted(ALLOWED_PASS_OPERATORS)}, got {op!r}"
+                )
+
+            thresh = c_obj.get("threshold")
+            if not _is_strict_number(thresh):
+                errors.append(
+                    f"{clabel}.threshold must be a finite int/float (not bool/string), got {thresh!r}"
+                )
+
+            ref_src = c_obj.get("reference_value_or_source")
+            if not isinstance(ref_src, str) or len(ref_src.strip()) < 8:
+                errors.append(
+                    f"{clabel}.reference_value_or_source must be a descriptive string (>= 8 chars)"
+                )
+
+            rationale = c_obj.get("rationale")
+            if not isinstance(rationale, str) or len(rationale.strip()) < 8:
+                errors.append(f"{clabel}.rationale must be a descriptive string (>= 8 chars)")
+
+            overrides = c_obj.get("fallback_threshold_overrides")
+            if overrides is not None:
+                if not isinstance(overrides, dict) or not overrides:
+                    errors.append(f"{clabel}.fallback_threshold_overrides must be a non-empty object")
+                else:
+                    for ov_acc, ov_val in overrides.items():
+                        if not isinstance(ov_acc, str) or ":" not in ov_acc:
+                            errors.append(
+                                f"{clabel}.fallback_threshold_overrides key {ov_acc!r} must be <NS>:<ID>"
+                            )
+                        if not _is_strict_number(ov_val):
+                            errors.append(
+                                f"{clabel}.fallback_threshold_overrides[{ov_acc!r}] must be numeric, got {ov_val!r}"
+                            )
+
+    verdicts = g.get("verdict_definitions")
+    if not isinstance(verdicts, dict) or set(verdicts.keys()) != ALLOWED_VERDICT_KEYS:
+        errors.append(
+            f"{label}.verdict_definitions must contain exact keys {sorted(ALLOWED_VERDICT_KEYS)}"
+        )
+    else:
+        for v_key in sorted(ALLOWED_VERDICT_KEYS):
+            v_desc = verdicts.get(v_key)
+            if not isinstance(v_desc, str) or len(v_desc.strip()) < 16:
+                errors.append(f"{label}.verdict_definitions.{v_key} must be a descriptive string")
+        not_eval = str(verdicts.get("NOT_EVALUABLE", "")).lower()
+        if "strictly restricted" not in not_eval or (
+            "404" not in not_eval and "corrupt" not in not_eval and "unreachable" not in not_eval
+        ):
+            errors.append(
+                f"{label}.verdict_definitions.NOT_EVALUABLE must be strictly restricted to archive 404/unreachable/corruption/missing vendor files"
+            )
+
+
+def _validate_cli_and_bound_parameters(gate_id: str, g: Dict[str, Any], errors: List[str]) -> None:
+    label = f"gates.{gate_id}"
+    cli = g.get("exact_cli_command_template")
+    if not isinstance(cli, str) or not cli.strip().startswith("nmrassign "):
+        errors.append(f"{label}.exact_cli_command_template must start with `nmrassign `")
+        return
+
+    if "[" in cli or "]" in cli:
+        errors.append(
+            f"{label}.exact_cli_command_template contains forbidden optional `[--opt ...]` brackets"
+        )
+
+    raw_placeholders = re.findall(r"<([^<>]*)>", cli)
+    if cli.count("<") != len(raw_placeholders) or cli.count(">") != len(raw_placeholders):
+        errors.append(f"{label}.exact_cli_command_template contains unmatched `<` or `>` brackets")
+
+    for ph in raw_placeholders:
+        if not PLACEHOLDER_NAME_RE.match(ph):
+            errors.append(
+                f"{label}.exact_cli_command_template placeholder <{ph}> must match {PLACEHOLDER_NAME_RE.pattern} (no `|` alternations or spaces)"
+            )
+
+    bound = g.get("bound_parameters")
+    if not isinstance(bound, dict):
+        errors.append(f"{label}.bound_parameters must be a JSON object mapping every <placeholder>")
+        return
+
+    cli_placeholder_set = set(raw_placeholders)
+    bound_key_set = set(bound.keys())
+    missing_bindings = sorted(cli_placeholder_set - bound_key_set)
+    unused_bindings = sorted(bound_key_set - cli_placeholder_set)
+    if missing_bindings:
+        errors.append(
+            f"{label}.bound_parameters missing entries for CLI placeholders: {missing_bindings}"
+        )
+    if unused_bindings:
+        errors.append(
+            f"{label}.bound_parameters contains unused keys absent from exact_cli_command_template: {unused_bindings}"
+        )
+
+    for b_key, b_val in bound.items():
+        blabel = f"{label}.bound_parameters[{b_key!r}]"
+        if not isinstance(b_val, dict):
+            errors.append(f"{blabel}: binding entry must be a JSON object")
+            continue
+        b_kind = b_val.get("binding_kind")
+        if not isinstance(b_kind, str) or b_kind not in ALLOWED_BINDING_KINDS:
+            errors.append(
+                f"{blabel}.binding_kind must be one of {sorted(ALLOWED_BINDING_KINDS)}, got {b_kind!r}"
+            )
+            continue
+        if b_kind == "literal":
+            if not isinstance(b_val.get("value"), str) or not b_val["value"].strip():
+                errors.append(f"{blabel}: literal binding requires non-empty string `value`")
+            if not isinstance(b_val.get("rationale"), str) or len(b_val["rationale"].strip()) < 6:
+                errors.append(f"{blabel}: literal binding requires descriptive `rationale`")
+        elif b_kind == "deterministic_source":
+            for req_field in ("source_file", "key_or_column", "formula"):
+                f_val = b_val.get(req_field)
+                if not isinstance(f_val, str) or not f_val.strip():
+                    errors.append(
+                        f"{blabel}: deterministic_source binding requires non-empty `{req_field}`"
+                    )
+        elif b_kind == "output_artifact":
+            for req_field in ("value", "produced_by"):
+                f_val = b_val.get(req_field)
+                if not isinstance(f_val, str) or not f_val.strip():
+                    errors.append(
+                        f"{blabel}: output_artifact binding requires non-empty `{req_field}`"
+                    )
+
+
+def stamp_current_freeze(
+    repo_root: Path,
+    manifest_path: Optional[Path] = None,
+) -> Tuple[List[str], Dict[str, Any]]:
+    """Deterministically stamp ``HEAD``, ``HEAD:crates``, ``Cargo.lock``, and all 21 solver/WGSL SHA-256s."""
+    mpath = manifest_path or (repo_root / "data" / "benchmark" / "p17_empirical_preregistration.json")
+    if not mpath.is_file():
+        return [f"missing pre-registration manifest: {mpath}"], {}
+    if not (repo_root / ".git").exists():
+        return [f"cannot stamp git freeze: {repo_root} has no .git directory/file"], {}
+
+    rc_status, status_out, status_err = _run_git(
+        repo_root, ["status", "--porcelain", "--", "crates/", "Cargo.lock"]
+    )
+    if rc_status != 0:
+        return [f"git status failed: {status_err}"], {}
+    if status_out:
+        return [
+            f"refusing to stamp freeze: dirty working tree or untracked files in crates/ or Cargo.lock:\n{status_out}"
+        ], {}
+
+    rc_head, head_commit, head_err = _run_git(repo_root, ["rev-parse", "HEAD"])
+    if rc_head != 0 or not HEX40_RE.match(head_commit):
+        return [f"git rev-parse HEAD failed: {head_err or head_commit}"], {}
+
+    rc_tree, crates_tree, tree_err = _run_git(repo_root, ["rev-parse", "HEAD:crates"])
+    if rc_tree != 0 or not HEX40_RE.match(crates_tree):
+        return [f"git rev-parse HEAD:crates failed: {tree_err or crates_tree}"], {}
+
+    cargo_lock = repo_root / "Cargo.lock"
+    if not cargo_lock.is_file():
+        return [f"missing Cargo.lock at {cargo_lock}"], {}
+    cargo_lock_bytes = cargo_lock.stat().st_size
+    cargo_lock_sha = _sha256_file(cargo_lock)
+
+    try:
+        manifest = json.loads(mpath.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return [f"{mpath}: invalid JSON: {exc}"], {}
+
+    manifest["frozen_w1_commit"] = head_commit
+    manifest["frozen_crates_git_tree"] = crates_tree
+    manifest["cargo_lock_bytes"] = cargo_lock_bytes
+    manifest["cargo_lock_sha256"] = cargo_lock_sha
+
+    r1 = manifest.get("protocol_rules", {}).get("rule_1_solver_and_shader_freeze", {})
+    shader_dir = repo_root / "crates" / "nmr-gpu" / "src" / "shaders"
+    disk_wgsl = sorted(p.relative_to(repo_root).as_posix() for p in shader_dir.glob("*.wgsl"))
+    r1["protected_wgsl_shaders"] = disk_wgsl
+
+    all_protected = sorted(set(REQUIRED_PROTECTED_CORE_FILES) | set(disk_wgsl))
+    w1_enforced: Dict[str, Dict[str, Any]] = {}
+    for rel_path in all_protected:
+        abs_path = repo_root / rel_path
+        if not abs_path.is_file():
+            return [f"protected solver/shader file missing while stamping: {rel_path}"], {}
+        w1_enforced[rel_path] = {
+            "bytes": abs_path.stat().st_size,
+            "sha256": _sha256_file(abs_path),
+        }
+    r1["w1_enforced_sha256"] = w1_enforced
+
+    for exc_obj in r1.get("allowed_pre_download_w1_exceptions", []):
+        if isinstance(exc_obj, dict) and exc_obj.get("file") in w1_enforced:
+            pin = w1_enforced[exc_obj["file"]]
+            exc_obj["pinned_w1_bytes"] = pin["bytes"]
+            exc_obj["pinned_w1_sha256"] = pin["sha256"]
+
+    mpath.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return validate_preregistration(repo_root, mpath)
 
 
 def validate_preregistration(
@@ -401,17 +675,128 @@ def validate_preregistration(
     if not isinstance(manifest, dict):
         return [f"{mpath}: top-level JSON value must be an object"], stats
 
-    # 1. Top-level metadata & protocol invariants
+    # 1. Top-level metadata, whole-crates/ + Cargo.lock freeze & protocol invariants
     if not _is_strict_int(manifest.get("schema_version")) or manifest["schema_version"] != 1:
         errors.append(f"schema_version must be integer 1, got {manifest.get('schema_version')!r}")
     if manifest.get("phase") != "17":
         errors.append(f"phase must be '17', got {manifest.get('phase')!r}")
-    if manifest.get("frozen_solver_baseline_tag") != "v0.12.0":
+
+    for legacy_key in (
+        "frozen_solver_baseline_tag",
+        "frozen_solver_baseline_commit",
+        "zero_bytes_downloaded_at_registration",
+    ):
+        if legacy_key in manifest:
+            errors.append(f"deprecated ambiguous top-level field `{legacy_key}` must not be present")
+
+    if manifest.get("solver_v0_12_0_reference_tag") != "v0.12.0":
         errors.append(
-            f"frozen_solver_baseline_tag must be 'v0.12.0', got {manifest.get('frozen_solver_baseline_tag')!r}"
+            f"solver_v0_12_0_reference_tag must be 'v0.12.0', got {manifest.get('solver_v0_12_0_reference_tag')!r}"
         )
-    if manifest.get("zero_bytes_downloaded_at_registration") is not True:
-        errors.append("zero_bytes_downloaded_at_registration must be strictly `true`")
+    v0120_commit = manifest.get("solver_v0_12_0_reference_commit")
+    if not isinstance(v0120_commit, str) or not HEX40_RE.match(v0120_commit):
+        errors.append(
+            f"solver_v0_12_0_reference_commit must be a 40-hex SHA-1, got {v0120_commit!r}"
+        )
+
+    frozen_w1_commit = manifest.get("frozen_w1_commit")
+    if not isinstance(frozen_w1_commit, str) or not HEX40_RE.match(frozen_w1_commit):
+        errors.append(f"frozen_w1_commit must be a 40-hex git commit SHA, got {frozen_w1_commit!r}")
+        frozen_w1_commit = ""
+
+    frozen_crates_tree = manifest.get("frozen_crates_git_tree")
+    if not isinstance(frozen_crates_tree, str) or not HEX40_RE.match(frozen_crates_tree):
+        errors.append(
+            f"frozen_crates_git_tree must be a 40-hex git tree SHA, got {frozen_crates_tree!r}"
+        )
+        frozen_crates_tree = ""
+
+    cargo_lock_bytes = manifest.get("cargo_lock_bytes")
+    cargo_lock_sha = manifest.get("cargo_lock_sha256")
+    if not _is_strict_int(cargo_lock_bytes) or cargo_lock_bytes <= 0:
+        errors.append(f"cargo_lock_bytes must be a positive integer, got {cargo_lock_bytes!r}")
+    if not isinstance(cargo_lock_sha, str) or not HEX64_RE.match(cargo_lock_sha):
+        errors.append(f"cargo_lock_sha256 must be a 64-hex SHA-256, got {cargo_lock_sha!r}")
+        cargo_lock_sha = ""
+
+    cargo_lock_path = repo_root / "Cargo.lock"
+    if not cargo_lock_path.is_file():
+        errors.append(f"missing Cargo.lock at {cargo_lock_path}")
+    elif _is_strict_int(cargo_lock_bytes) and cargo_lock_sha:
+        actual_lock_bytes = cargo_lock_path.stat().st_size
+        actual_lock_sha = _sha256_file(cargo_lock_path)
+        if actual_lock_sha != cargo_lock_sha or actual_lock_bytes != cargo_lock_bytes:
+            errors.append(
+                f"Cargo.lock modified vs pinned 17.W1 freeze "
+                f"(expected {cargo_lock_sha} [{cargo_lock_bytes} B], got {actual_lock_sha} [{actual_lock_bytes} B])"
+            )
+
+    if not (repo_root / ".git").exists():
+        errors.append(f"missing .git repository metadata at {repo_root} for whole-crates/ tree check")
+    elif frozen_w1_commit and frozen_crates_tree:
+        rc_ver, _, err_ver = _run_git(
+            repo_root, ["rev-parse", "--verify", f"{frozen_w1_commit}^{{commit}}"]
+        )
+        if rc_ver != 0:
+            errors.append(
+                f"frozen_w1_commit {frozen_w1_commit} does not exist in git repository: {err_ver}"
+            )
+        else:
+            rc_anc, _, _ = _run_git(
+                repo_root, ["merge-base", "--is-ancestor", frozen_w1_commit, "HEAD"]
+            )
+            if rc_anc != 0:
+                errors.append(
+                    f"frozen_w1_commit {frozen_w1_commit} is not an ancestor of current HEAD"
+                )
+
+            rc_w1_tree, w1_tree, err_w1_tree = _run_git(
+                repo_root, ["rev-parse", f"{frozen_w1_commit}:crates"]
+            )
+            rc_head_tree, head_tree, err_head_tree = _run_git(
+                repo_root, ["rev-parse", "HEAD:crates"]
+            )
+            if rc_w1_tree != 0 or rc_head_tree != 0:
+                errors.append(
+                    f"git rev-parse :crates failed: w1={err_w1_tree!r}, head={err_head_tree!r}"
+                )
+            else:
+                if w1_tree != frozen_crates_tree:
+                    errors.append(
+                        f"frozen_crates_git_tree mismatch vs `{frozen_w1_commit}:crates`: "
+                        f"manifest={frozen_crates_tree}, git={w1_tree}"
+                    )
+                if head_tree != w1_tree:
+                    errors.append(
+                        f"whole-crates/ git tree freeze violation: `HEAD:crates` ({head_tree}) != "
+                        f"`{frozen_w1_commit[:12]}:crates` ({w1_tree})"
+                    )
+
+            rc_diff, _, _ = _run_git(
+                repo_root, ["diff", "--quiet", frozen_w1_commit, "--", "crates/", "Cargo.lock"]
+            )
+            if rc_diff != 0:
+                errors.append(
+                    f"git diff violation against {frozen_w1_commit[:12]} in `crates/` or `Cargo.lock`"
+                )
+
+        rc_stat, stat_out, stat_err = _run_git(
+            repo_root, ["status", "--porcelain", "--", "crates/", "Cargo.lock"]
+        )
+        if rc_stat != 0:
+            errors.append(f"git status --porcelain failed: {stat_err}")
+        elif stat_out:
+            errors.append(
+                f"unclean git status in `crates/` or `Cargo.lock`: {stat_out.splitlines()[0]!r}"
+            )
+
+    if manifest.get("zero_data_payload_bytes_downloaded_at_registration") is not True:
+        errors.append("zero_data_payload_bytes_downloaded_at_registration must be strictly `true`")
+    reg_disc = manifest.get("registration_metadata_inspection_disclosure")
+    if not isinstance(reg_disc, str) or len(reg_disc.strip()) < 32:
+        errors.append(
+            "registration_metadata_inspection_disclosure must explicitly document metadata-only inspection"
+        )
 
     manifest_allowlist = manifest.get("license_allowlist")
     if not isinstance(manifest_allowlist, list) or not manifest_allowlist:
@@ -447,14 +832,25 @@ def validate_preregistration(
         if "BMRB:53960" not in excluded_raw or not MANDATORY_EXCLUDED_BMRB_IDS.issubset(excluded_bmrb_ids):
             errors.append("excluded_contaminated_entries must explicitly include 'BMRB:53960'")
 
-    # 2. Protocol rules (P17-R1 .. P17-R4) & frozen solver file SHA-256 verification
+    # 2. Protocol rules (P17-R1 .. P17-R5) & frozen solver file SHA-256 verification
     rules = manifest.get("protocol_rules")
     if not isinstance(rules, dict):
         errors.append("protocol_rules must be a JSON object")
     else:
         r1 = rules.get("rule_1_solver_and_shader_freeze")
-        if not isinstance(r1, dict) or r1.get("enforced") is not True:
-            errors.append("protocol_rules.rule_1_solver_and_shader_freeze must be enforced=true")
+        if (
+            not isinstance(r1, dict)
+            or r1.get("enforced") is not True
+            or r1.get("enforced_whole_crates_tree") is not True
+            or r1.get("enforced_cargo_lock") is not True
+            or r1.get("frozen_paths") != ["crates/", "Cargo.lock"]
+            or r1.get("adapter_isolation_dir") != "scripts/p17_adapters/"
+            or not isinstance(r1.get("mid_wave_crate_bug_policy"), str)
+            or "FAIL" not in r1["mid_wave_crate_bug_policy"]
+        ):
+            errors.append(
+                "protocol_rules.rule_1_solver_and_shader_freeze missing whole-crates/, Cargo.lock, or mid-wave bug policy fields"
+            )
         else:
             core_files = r1.get("protected_core_files")
             wgsl_files = r1.get("protected_wgsl_shaders")
@@ -495,7 +891,12 @@ def validate_preregistration(
                         )
                     pin_bytes = exc_obj.get("pinned_w1_bytes")
                     pin_sha = exc_obj.get("pinned_w1_sha256")
-                    if not _is_strict_int(pin_bytes) or pin_bytes <= 0 or not isinstance(pin_sha, str) or len(pin_sha) != 64:
+                    if (
+                        not _is_strict_int(pin_bytes)
+                        or pin_bytes <= 0
+                        or not isinstance(pin_sha, str)
+                        or not HEX64_RE.match(pin_sha)
+                    ):
                         errors.append(
                             f"allowed_pre_download_w1_exceptions entry for {f_rel!r} missing pinned_w1_bytes / 64-hex pinned_w1_sha256"
                         )
@@ -516,7 +917,11 @@ def validate_preregistration(
                         errors.append(f"missing v0120_baseline_sha256 digest for {rel_path}")
                         continue
                     rec = w1_sha_map.get(rel_path)
-                    if not isinstance(rec, dict) or not isinstance(rec.get("sha256"), str) or not _is_strict_int(rec.get("bytes")):
+                    if (
+                        not isinstance(rec, dict)
+                        or not isinstance(rec.get("sha256"), str)
+                        or not _is_strict_int(rec.get("bytes"))
+                    ):
                         errors.append(f"missing w1_enforced_sha256 digest/bytes for {rel_path}")
                         continue
                     if rel_path in pinned_w1_exceptions:
@@ -547,8 +952,12 @@ def validate_preregistration(
             not isinstance(r2, dict)
             or r2.get("enforced") is not True
             or r2.get("zero_physics_or_parameter_tuning") is not True
+            or r2.get("adapter_directory") != "scripts/p17_adapters/"
+            or r2.get("require_pre_invocation_sha256_hash") is not True
+            or r2.get("forbid_crates_edits") is not True
+            or r2.get("forbid_unregistered_numeric_constants") is not True
             or not isinstance(r2.get("fixed_conversions"), list)
-            or len(r2["fixed_conversions"]) < 3
+            or len(r2["fixed_conversions"]) < 5
         ):
             errors.append(
                 "protocol_rules.rule_2_a_priori_deterministic_format_conversion is incomplete"
@@ -560,6 +969,7 @@ def validate_preregistration(
             for req_id in (
                 "relaxation_time_to_rate",
                 "bmrb6470_dual_field_saveframe_disambiguation",
+                "bruker_hsqct2etf3gpsi3d_vclist_loop_timing",
             ):
                 if req_id not in conv_ids:
                     errors.append(f"rule_2 missing required fixed conversion {req_id!r}")
@@ -583,8 +993,13 @@ def validate_preregistration(
         ):
             errors.append("protocol_rules.rule_4_candid_single_shot_reporting is invalid")
 
+        r5 = rules.get("rule_5_accession_disjointness_and_zero_payload_firewall")
+        if not isinstance(r5, dict) or r5.get("enforced") is not True:
+            errors.append(
+                "protocol_rules.rule_5_accession_disjointness_and_zero_payload_firewall is invalid"
+            )
+
     # 3. Validate all 8 gates
-    todo_text = ""
     todo_path = repo_root / "TODO.md"
     if todo_path.is_file():
         todo_lines = todo_path.read_text(encoding="utf-8").splitlines()
@@ -629,13 +1044,16 @@ def validate_preregistration(
                             f"gates.{gate_id}.todo_item {todo_item} does not reference `{base_gate}`"
                         )
 
+            _validate_pass_criteria_and_verdicts(gate_id, g, errors)
+
             prim = g.get("primary_datasets")
+            prim_acc_set: Set[str] = set()
             if not isinstance(prim, list) or not prim:
                 errors.append(f"gates.{gate_id}.primary_datasets must be a non-empty list")
             else:
                 roles = []
                 for idx, ds in enumerate(prim):
-                    r = _validate_dataset_entry(
+                    r, acc_id = _validate_dataset_entry(
                         gate_id,
                         ds,
                         idx,
@@ -647,6 +1065,12 @@ def validate_preregistration(
                     )
                     if r:
                         roles.append(r)
+                    if acc_id:
+                        if acc_id in prim_acc_set:
+                            errors.append(
+                                f"gates.{gate_id}.primary_datasets contains duplicate accession {acc_id!r}"
+                            )
+                        prim_acc_set.add(acc_id)
                     if isinstance(ds, dict) and isinstance(ds.get("files"), list):
                         for f in ds["files"]:
                             if isinstance(f, dict):
@@ -657,13 +1081,20 @@ def validate_preregistration(
                     errors.append(f"gates.{gate_id}.primary_datasets[0].role must be 'primary'")
 
             bkp = g.get("backup_datasets")
-            if not isinstance(bkp, list) or not bkp:
-                errors.append(f"gates.{gate_id}.backup_datasets must be a non-empty list")
+            if not isinstance(bkp, list):
+                errors.append(f"gates.{gate_id}.backup_datasets must be a list")
+            elif len(bkp) == 0:
+                fb_note = g.get("fallback_note")
+                if not isinstance(fb_note, str) or not fb_note.strip().lower().startswith("none"):
+                    errors.append(
+                        f"gates.{gate_id}.backup_datasets is empty without `fallback_note: 'none — ...'`"
+                    )
             else:
                 expected_bkp_roles = list(ALLOWED_BACKUP_ROLES[: len(bkp)])
                 actual_bkp_roles: List[str] = []
+                bkp_acc_set: Set[str] = set()
                 for idx, ds in enumerate(bkp):
-                    r = _validate_dataset_entry(
+                    r, acc_id = _validate_dataset_entry(
                         gate_id,
                         ds,
                         idx,
@@ -675,6 +1106,16 @@ def validate_preregistration(
                     )
                     if r:
                         actual_bkp_roles.append(r)
+                    if acc_id:
+                        if acc_id in prim_acc_set:
+                            errors.append(
+                                f"gates.{gate_id}.backup_datasets[{idx}] self-duplicates primary accession {acc_id!r}"
+                            )
+                        if acc_id in bkp_acc_set:
+                            errors.append(
+                                f"gates.{gate_id}.backup_datasets[{idx}] duplicates backup accession {acc_id!r}"
+                            )
+                        bkp_acc_set.add(acc_id)
                     if isinstance(ds, dict) and isinstance(ds.get("files"), list):
                         for f in ds["files"]:
                             if isinstance(f, dict):
@@ -687,11 +1128,7 @@ def validate_preregistration(
                         f"got {actual_bkp_roles}"
                     )
 
-            cli = g.get("exact_cli_command_template")
-            if not isinstance(cli, str) or not cli.strip().startswith("nmrassign "):
-                errors.append(
-                    f"gates.{gate_id}.exact_cli_command_template must start with `nmrassign `"
-                )
+            _validate_cli_and_bound_parameters(gate_id, g, errors)
 
             adapter = g.get("deterministic_format_adapter_spec")
             if (
@@ -705,13 +1142,19 @@ def validate_preregistration(
             ):
                 errors.append(f"gates.{gate_id}.deterministic_format_adapter_spec is invalid")
 
-            metrics = g.get("evaluation_metrics_reported")
+            if "evaluation_metrics_reported" in g:
+                errors.append(
+                    f"gates.{gate_id}.evaluation_metrics_reported is deprecated; use `secondary_report_only_metrics`"
+                )
+            sec_metrics = g.get("secondary_report_only_metrics")
             if (
-                not isinstance(metrics, list)
-                or not metrics
-                or not all(isinstance(m, str) and len(m.strip()) >= 8 for m in metrics)
+                not isinstance(sec_metrics, list)
+                or not sec_metrics
+                or not all(isinstance(m, str) and len(m.strip()) >= 8 for m in sec_metrics)
             ):
-                errors.append(f"gates.{gate_id}.evaluation_metrics_reported must be a non-empty string list")
+                errors.append(
+                    f"gates.{gate_id}.secondary_report_only_metrics must be a non-empty string list"
+                )
 
         # Gate-specific coverage invariants
         f14 = gates.get("F14")
@@ -720,6 +1163,10 @@ def validate_preregistration(
             for req_tok in ("1h", "13c", "dept90", "dept135", "19f", "31p", "qnmr"):
                 if req_tok not in f14_cli:
                     errors.append(f"gates.F14.exact_cli_command_template missing {req_tok!r} coverage")
+            if "--biphasic-pos" in f14_cli or "--calibrate-solvent" in f14_cli:
+                errors.append(
+                    "gates.F14.exact_cli_command_template must not invoke --biphasic-pos or --calibrate-solvent"
+                )
 
         f16 = gates.get("F16")
         if isinstance(f16, dict):
@@ -742,6 +1189,10 @@ def validate_preregistration(
             }
             if "METABOLIGHTS:MTBLS1" not in f17_accs:
                 errors.append("gates.F17.primary_datasets must include METABOLIGHTS:MTBLS1")
+            if f17.get("backup_datasets") != []:
+                errors.append(
+                    "gates.F17.backup_datasets must be `[]` (single canonical MetaboLights MTBLS1 cohort)"
+                )
             f17_cli = str(f17.get("exact_cli_command_template", ""))
             for subcmd in ("metabolomics bin", "metabolomics pca", "metabolomics oplsda", "metabolomics stocsy"):
                 if subcmd not in f17_cli:
@@ -853,6 +1304,9 @@ def validate_preregistration(
     stats = {
         "manifest_path": str(mpath),
         "manifest_sha256": _sha256_file(mpath),
+        "frozen_w1_commit": frozen_w1_commit,
+        "frozen_crates_git_tree": frozen_crates_tree,
+        "cargo_lock_sha256": cargo_lock_sha,
         "gates_verified": len(EXPECTED_GATES),
         "unique_candidate_accessions": len(unique_accessions),
         "total_dataset_entries": len(candidate_accessions),
@@ -867,8 +1321,10 @@ def validate_preregistration(
 
 
 def _build_minimal_fixture_repo(tmp_root: Path, real_repo: Path) -> Tuple[Path, Dict[str, Any]]:
-    """Create an isolated temporary repo layout mirroring the real manifest & benchmark tables."""
+    """Create an isolated temporary git repo mirroring ``crates/``, ``Cargo.lock``, and benchmark tables."""
+    shutil.copytree(real_repo / "crates", tmp_root / "crates")
     for rel in (
+        "Cargo.lock",
         "TODO.md",
         "data/benchmark/p17_empirical_preregistration.json",
         "data/benchmark/real_manifest.tsv",
@@ -881,23 +1337,34 @@ def _build_minimal_fixture_repo(tmp_root: Path, real_repo: Path) -> Tuple[Path, 
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
 
-    for rel in REQUIRED_PROTECTED_CORE_FILES:
-        src = real_repo / rel
-        dst = tmp_root / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-
-    for src in sorted((real_repo / "crates" / "nmr-gpu" / "src" / "shaders").glob("*.wgsl")):
-        rel = src.relative_to(real_repo)
-        dst = tmp_root / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-
+    (tmp_root / ".gitignore").write_text("data/private/\n", encoding="utf-8")
     (tmp_root / "data" / "private").mkdir(parents=True, exist_ok=True)
     (tmp_root / "data" / "private" / ".gitkeep").write_text("", encoding="utf-8")
     (tmp_root / "data" / "private" / "p17_prereg_candidates.md").write_text(
         "# Metadata only\n", encoding="utf-8"
     )
+
+    for git_args in (
+        ["init", "-q"],
+        ["config", "user.name", "p17-selftest"],
+        ["config", "user.email", "p17-selftest@localhost"],
+        ["add", "."],
+        ["commit", "-q", "--no-gpg-sign", "-m", "fixture w1 freeze"],
+    ):
+        rc, _, err = _run_git(tmp_root, git_args)
+        if rc != 0:
+            raise RuntimeError(f"fixture git {git_args} failed: {err}")
+
+    stamp_errs, _ = stamp_current_freeze(tmp_root)
+    if stamp_errs:
+        raise RuntimeError(f"fixture stamp_current_freeze failed: {stamp_errs}")
+    for git_args in (
+        ["add", "data/benchmark/p17_empirical_preregistration.json"],
+        ["commit", "-q", "--no-gpg-sign", "-m", "stamp manifest"],
+    ):
+        rc, _, err = _run_git(tmp_root, git_args)
+        if rc != 0:
+            raise RuntimeError(f"fixture post-stamp git {git_args} failed: {err}")
 
     manifest_obj = json.loads(
         (tmp_root / "data" / "benchmark" / "p17_empirical_preregistration.json").read_text(
@@ -908,16 +1375,16 @@ def _build_minimal_fixture_repo(tmp_root: Path, real_repo: Path) -> Tuple[Path, 
 
 
 def run_self_tests(real_repo: Path) -> int:
-    """Execute live repository check plus 9 adversarial mutation unit tests."""
+    """Execute live repository check plus 14 adversarial mutation unit tests."""
     live_errors, live_stats = validate_preregistration(real_repo)
     if live_errors:
-        print("FAIL [self-test 0/9: live repository check]:", file=sys.stderr)
+        print("FAIL [self-test 0/14: live repository check]:", file=sys.stderr)
         for err in live_errors:
             print(f"  - {err}", file=sys.stderr)
         return 1
 
     cases_passed = 0
-    total_cases = 9
+    total_cases = 14
 
     def _write_manifest(root: Path, obj: Dict[str, Any]) -> Path:
         p = root / "data" / "benchmark" / "p17_empirical_preregistration.json"
@@ -927,7 +1394,7 @@ def run_self_tests(real_repo: Path) -> int:
     with tempfile.TemporaryDirectory(prefix="p17_prereg_selftest_") as tmp_str:
         base_tmp = Path(tmp_str)
 
-        # Baseline clean fixture check
+        # Baseline clean fixture check (verifies post-stamp commit outside crates/ passes!)
         clean_root, base_manifest = _build_minimal_fixture_repo(base_tmp / "clean", real_repo)
         errs, _ = validate_preregistration(clean_root)
         if errs:
@@ -1019,7 +1486,7 @@ def run_self_tests(real_repo: Path) -> int:
         bad_file.unlink()
         cases_passed += 1
 
-        # Case 9: All 21 solver/shader files (incl. post-F12(a) pinned `relax_mc.wgsl` and `modelfree.rs`) reject tampering
+        # Case 9: All 21 pinned solver/shader files (`relax_mc.wgsl` and `modelfree.rs`) reject tampering
         relax_wgsl = clean_root / "crates" / "nmr-gpu" / "src" / "shaders" / "relax_mc.wgsl"
         orig_relax = relax_wgsl.read_text(encoding="utf-8")
         relax_wgsl.write_text(orig_relax + "\n// unauthorized post-W1 shader edit\n", encoding="utf-8")
@@ -1030,9 +1497,107 @@ def run_self_tests(real_repo: Path) -> int:
         relax_wgsl.write_text(orig_relax, encoding="utf-8")
 
         mf_rs = clean_root / "crates" / "nmr-core" / "src" / "modelfree.rs"
-        mf_rs.write_text(mf_rs.read_text(encoding="utf-8") + "\n// post-freeze edit\n", encoding="utf-8")
+        orig_mf = mf_rs.read_text(encoding="utf-8")
+        mf_rs.write_text(orig_mf + "\n// post-freeze edit\n", encoding="utf-8")
         errs_tampered, _ = validate_preregistration(clean_root)
         assert any("modelfree.rs" in e for e in errs_tampered), f"Case 9b failed: {errs_tampered}"
+        mf_rs.write_text(orig_mf, encoding="utf-8")
+        cases_passed += 1
+
+        # Case 10: Mutating unpinned files inside `crates/` (`picker.rs` uncommitted, untracked helper,
+        # and `relax_cmd.rs` committed) MUST fail whole-`crates/` tree & git diff/status checks!
+        picker_rs = clean_root / "crates" / "nmr-core" / "src" / "picker.rs"
+        orig_picker = picker_rs.read_text(encoding="utf-8")
+        picker_rs.write_text(orig_picker + "\n// sneaky unpinned picker edit\n", encoding="utf-8")
+        errs_picker, _ = validate_preregistration(clean_root)
+        assert any("crates/" in e for e in errs_picker), (
+            f"Case 10a failed to reject unpinned picker.rs edit: {errs_picker}"
+        )
+        picker_rs.write_text(orig_picker, encoding="utf-8")
+
+        untracked_rs = clean_root / "crates" / "nmr-core" / "src" / "sneaky_adapter.rs"
+        untracked_rs.write_text("// untracked file inside crates/\n", encoding="utf-8")
+        errs_untracked, _ = validate_preregistration(clean_root)
+        assert any("unclean git status" in e for e in errs_untracked), (
+            f"Case 10b failed to reject untracked file in crates/: {errs_untracked}"
+        )
+        untracked_rs.unlink()
+
+        _, saved_head, _ = _run_git(clean_root, ["rev-parse", "HEAD"])
+        relax_cmd_rs = clean_root / "crates" / "nmr-cli" / "src" / "relax_cmd.rs"
+        relax_cmd_rs.write_text(
+            relax_cmd_rs.read_text(encoding="utf-8") + "\n// sneaky committed CLI edit\n",
+            encoding="utf-8",
+        )
+        _run_git(clean_root, ["add", "crates/nmr-cli/src/relax_cmd.rs"])
+        _run_git(clean_root, ["commit", "-q", "--no-gpg-sign", "-m", "post-freeze cli tweak"])
+        errs_committed_crate, _ = validate_preregistration(clean_root)
+        assert any("whole-crates/ git tree freeze violation" in e for e in errs_committed_crate), (
+            f"Case 10c failed to reject committed edit to unpinned relax_cmd.rs: {errs_committed_crate}"
+        )
+        _run_git(clean_root, ["reset", "--hard", "-q", saved_head])
+        cases_passed += 1
+
+        # Case 11: Mutating `Cargo.lock` fails `--check` AND refuses `--stamp-current-freeze`
+        lock_file = clean_root / "Cargo.lock"
+        orig_lock = lock_file.read_text(encoding="utf-8")
+        lock_file.write_text(orig_lock + "\n# unauthorized lockfile edit\n", encoding="utf-8")
+        errs_lock, _ = validate_preregistration(clean_root)
+        assert any("Cargo.lock modified" in e for e in errs_lock), (
+            f"Case 11a failed to reject Cargo.lock mutation: {errs_lock}"
+        )
+        stamp_dirty_errs, _ = stamp_current_freeze(clean_root)
+        assert any("refusing to stamp freeze" in e for e in stamp_dirty_errs), (
+            f"Case 11b failed to refuse stamping dirty Cargo.lock: {stamp_dirty_errs}"
+        )
+        lock_file.write_text(orig_lock, encoding="utf-8")
+        cases_passed += 1
+
+        # Case 12: Omitting `pass_criteria`, non-numeric threshold, or omitting `verdict_definitions`
+        m12 = copy.deepcopy(base_manifest)
+        del m12["gates"]["F10"]["pass_criteria"]
+        m12["gates"]["F11"]["pass_criteria"][0]["threshold"] = ">= 0.85"
+        del m12["gates"]["F13c"]["verdict_definitions"]
+        m12["gates"]["F16"]["evaluation_metrics_reported"] = ["legacy field"]
+        _write_manifest(clean_root, m12)
+        errs_p1_1, _ = validate_preregistration(clean_root)
+        assert any("F10.pass_criteria" in e for e in errs_p1_1), f"Case 12a failed: {errs_p1_1}"
+        assert any("F11.pass_criteria[0].threshold" in e for e in errs_p1_1), f"Case 12b failed: {errs_p1_1}"
+        assert any("F13c.verdict_definitions" in e for e in errs_p1_1), f"Case 12c failed: {errs_p1_1}"
+        assert any("evaluation_metrics_reported" in e for e in errs_p1_1), f"Case 12d failed: {errs_p1_1}"
+        cases_passed += 1
+
+        # Case 13: Unbound `[--opt]` bracket, `<1h|13c>` pipe alternation, or `<placeholder>` missing `bound_parameters`
+        m13 = copy.deepcopy(base_manifest)
+        m13["gates"]["F11"]["exact_cli_command_template"] += " [--delays <t1,t2>]"
+        m13["gates"]["F13a"]["exact_cli_command_template"] += " --extra <unbound_var>"
+        m13["gates"]["F14"]["exact_cli_command_template"] = (
+            "nmrassign nmr1d process --in <fid_dir> --experiment <1h|13c> --out <spec.json>"
+        )
+        _write_manifest(clean_root, m13)
+        errs_p1_3, _ = validate_preregistration(clean_root)
+        assert any("forbidden optional `[--opt ...]` brackets" in e for e in errs_p1_3), (
+            f"Case 13a failed: {errs_p1_3}"
+        )
+        assert any("unbound_var" in e for e in errs_p1_3), f"Case 13b failed: {errs_p1_3}"
+        assert any("<1h|13c>" in e for e in errs_p1_3), f"Case 13c failed: {errs_p1_3}"
+        cases_passed += 1
+
+        # Case 14: Self-duplicate backup dataset (`MTBLS1 -> MTBLS1`) or empty backup without `fallback_note`
+        m14 = copy.deepcopy(base_manifest)
+        dup_mtbls = copy.deepcopy(m14["gates"]["F17"]["primary_datasets"][0])
+        dup_mtbls["role"] = "backup_1"
+        m14["gates"]["F17"]["backup_datasets"] = [dup_mtbls]
+        m14["gates"]["F10"]["backup_datasets"] = []
+        _write_manifest(clean_root, m14)
+        errs_bkp, _ = validate_preregistration(clean_root)
+        assert any("self-duplicates primary accession" in e for e in errs_bkp), (
+            f"Case 14a failed: {errs_bkp}"
+        )
+        assert any("F10.backup_datasets is empty without" in e for e in errs_bkp), (
+            f"Case 14b failed: {errs_bkp}"
+        )
+        _write_manifest(clean_root, base_manifest)
         cases_passed += 1
 
     print(
@@ -1044,7 +1609,7 @@ def run_self_tests(real_repo: Path) -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Verify Phase 17 empirical pre-registration manifest schema, licenses, disjointness, and zero-download firewall."
+        description="Verify Phase 17 empirical pre-registration manifest schema, whole-crates/ freeze, pass criteria, CLI bindings, licenses, disjointness, and zero-download firewall."
     )
     parser.add_argument(
         "--check",
@@ -1054,7 +1619,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="Run live validation plus 9 isolated adversarial rejection unit tests.",
+        help="Run live validation plus 14 isolated adversarial rejection unit tests.",
+    )
+    parser.add_argument(
+        "--stamp-current-freeze",
+        action="store_true",
+        help="Deterministically stamp HEAD, HEAD:crates, Cargo.lock SHA-256, and all 21 solver/WGSL file SHA-256s into the manifest.",
     )
     parser.add_argument(
         "--repo-root",
@@ -1070,10 +1640,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if not args.check and not args.self_test:
+    if not args.check and not args.self_test and not args.stamp_current_freeze:
         args.check = True
 
     repo_root = args.repo_root.resolve()
+
+    if args.stamp_current_freeze:
+        stamp_errors, stamp_stats = stamp_current_freeze(repo_root, args.manifest)
+        if stamp_errors:
+            print("FAIL [stamp-current-freeze]:", file=sys.stderr)
+            for err in stamp_errors:
+                print(f"  - {err}", file=sys.stderr)
+            return 1
+        print(
+            "OK [stamp-current-freeze]: "
+            f"frozen_w1_commit={stamp_stats['frozen_w1_commit']}, "
+            f"frozen_crates_git_tree={stamp_stats['frozen_crates_git_tree']}, "
+            f"cargo_lock_sha256={stamp_stats['cargo_lock_sha256']}, "
+            f"files_pinned=21/21, "
+            f"manifest_sha256={stamp_stats['manifest_sha256']}"
+        )
 
     if args.self_test:
         rc = run_self_tests(repo_root)
@@ -1096,7 +1682,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"phase1:{stats['disjoint_phase1_manifest_count']}, "
             f"priors:{stats['disjoint_priors_count']}, excluded:53960), "
             f"private_dirs_clean={len(stats['private_dirs_checked'])}, "
-            f"sha256={stats['manifest_sha256']}"
+            f"sha256={stats['manifest_sha256']}, "
+            f"frozen_w1_commit={stats['frozen_w1_commit'][:12]}, "
+            f"crates_tree={stats['frozen_crates_git_tree'][:12]}, "
+            f"cargo_lock_sha256={stats['cargo_lock_sha256'][:12]}"
         )
     return 0
 
