@@ -17,6 +17,7 @@ use std::task::{Context, Poll, Waker};
 pub mod bayes_sa_gpu;
 pub mod cest_gpu;
 pub mod cpmg_gpu;
+pub mod dosy_gpu;
 pub mod methyl_gpu;
 pub mod neural_gpu;
 pub mod rdc_gpu;

@@ -19,6 +19,7 @@ pub mod classify;
 pub mod cpmg;
 pub mod csp;
 pub mod dihedrals;
+pub mod dosy;
 pub mod evaluate;
 pub mod evo_graph;
 pub mod fid;
