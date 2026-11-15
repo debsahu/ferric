@@ -313,45 +313,67 @@ fn fit_two_param(
     return vec3<f32>(vp_fin.x, r_cur, vp_fin.y);
 }
 
-// Returns vec3<f32>(i0_t, c_t, chi2) for 3-parameter VarPro at fixed `r_t`.
+fn kahan_add(acc: vec2<f32>, val: f32) -> vec2<f32> {
+    let v = val - acc.y;
+    let nxt = acc.x + v;
+    let c = (nxt - acc.x) - v;
+    return vec2<f32>(nxt, c);
+}
+
+// Returns vec3<f32>(i0_t, c_t, chi2) for 3-parameter VarPro at fixed `r_t`
+// using weighted mean centering (`de_i = e_i - e_bar`, `dy_i = y_i - y_bar`) and Kahan summation
+// to eliminate catastrophic cancellation in `2x2` normal equations on non-FMA `f32` backends.
 fn varpro_three_param(
     pt_off: u32,
     n_pts: u32,
     y_arr: ptr<function, array<f32, 64>>,
     r_t: f32,
 ) -> vec3<f32> {
-    var s_ee: f32 = 0.0;
-    var s_e1: f32 = 0.0;
-    var s_11: f32 = 0.0;
-    var s_ey: f32 = 0.0;
-    var s_1y: f32 = 0.0;
+    var sw_acc = vec2<f32>(0.0, 0.0);
+    var swe_acc = vec2<f32>(0.0, 0.0);
+    var swy_acc = vec2<f32>(0.0, 0.0);
 
     for (var i: u32 = 0u; i < n_pts; i = i + 1u) {
         let pt = points[pt_off + i];
         let e = exp(-r_t * pt.u);
         let yi = (*y_arr)[i];
-        s_ee = s_ee + pt.w * e * e;
-        s_e1 = s_e1 + pt.w * e;
-        s_11 = s_11 + pt.w;
-        s_ey = s_ey + pt.w * e * yi;
-        s_1y = s_1y + pt.w * yi;
+        sw_acc = kahan_add(sw_acc, pt.w);
+        swe_acc = kahan_add(swe_acc, pt.w * e);
+        swy_acc = kahan_add(swy_acc, pt.w * yi);
     }
-    let det = s_ee * s_11 - s_e1 * s_e1;
-    var i0_t: f32 = 0.0;
-    var c_t: f32 = 0.0;
-    if (det > 1.0e-20) {
-        i0_t = (s_11 * s_ey - s_e1 * s_1y) / det;
-        c_t = (s_ee * s_1y - s_e1 * s_ey) / det;
-    } else if (s_ee > 1.0e-20) {
-        i0_t = s_ey / s_ee;
+    let s_w = sw_acc.x;
+    if (s_w <= 1.0e-28) {
+        return vec3<f32>(0.0, 0.0, 1.0e38);
     }
-    var chi2: f32 = 0.0;
+    let e_bar = swe_acc.x / s_w;
+    let y_bar = swy_acc.x / s_w;
+
+    var sde2_acc = vec2<f32>(0.0, 0.0);
+    var sdey_acc = vec2<f32>(0.0, 0.0);
     for (var i: u32 = 0u; i < n_pts; i = i + 1u) {
         let pt = points[pt_off + i];
-        let d = (*y_arr)[i] - (i0_t * exp(-r_t * pt.u) + c_t);
-        chi2 = chi2 + pt.w * d * d;
+        let de = exp(-r_t * pt.u) - e_bar;
+        let dy = (*y_arr)[i] - y_bar;
+        sde2_acc = kahan_add(sde2_acc, pt.w * de * de);
+        sdey_acc = kahan_add(sdey_acc, pt.w * de * dy);
     }
-    return vec3<f32>(i0_t, c_t, chi2);
+
+    var i0_t: f32 = 0.0;
+    var c_t: f32 = y_bar;
+    if (sde2_acc.x > 1.0e-24) {
+        i0_t = sdey_acc.x / sde2_acc.x;
+        c_t = y_bar - i0_t * e_bar;
+    }
+
+    var chi2_acc = vec2<f32>(0.0, 0.0);
+    for (var i: u32 = 0u; i < n_pts; i = i + 1u) {
+        let pt = points[pt_off + i];
+        let de = exp(-r_t * pt.u) - e_bar;
+        let dy = (*y_arr)[i] - y_bar;
+        let res = dy - i0_t * de;
+        chi2_acc = kahan_add(chi2_acc, pt.w * res * res);
+    }
+    return vec3<f32>(i0_t, c_t, chi2_acc.x);
 }
 
 // Returns vec4<f32>(i0_t, r_t, c_t, chi2) matching `fit_three_param_normalized` on CPU.
@@ -477,36 +499,87 @@ fn fit_three_param(
         }
     }
 
-    // 1D VarPro secant score polish on `phi3(r) = sum_i w_i u_i e^{-r u_i} (y_i - i0(r) e^{-r u_i} - c(r)) = 0`
-    var h_sec: f32 = 2.0e-4;
-    for (var p_it: u32 = 0u; p_it < 6u; p_it = p_it + 1u) {
-        if (r_cur <= h_sec || r_cur + h_sec >= r_tilde_max) {
-            break;
-        }
-        let vp_m = varpro_three_param(pt_off, n_pts, y_arr, r_cur);
-        var phi0: f32 = 0.0;
-        for (var i: u32 = 0u; i < n_pts; i = i + 1u) {
-            let pt = points[pt_off + i];
-            let e = exp(-r_cur * pt.u);
-            phi0 = phi0 + pt.w * pt.u * e * ((*y_arr)[i] - (vp_m.x * e + vp_m.y));
-        }
-        let r_p = r_cur + h_sec;
-        let vp_p = varpro_three_param(pt_off, n_pts, y_arr, r_p);
-        var phip: f32 = 0.0;
-        for (var i: u32 = 0u; i < n_pts; i = i + 1u) {
-            let pt = points[pt_off + i];
-            let e = exp(-r_p * pt.u);
-            phip = phip + pt.w * pt.u * e * ((*y_arr)[i] - (vp_p.x * e + vp_p.y));
-        }
-        let dphi = (phip - phi0) / h_sec;
-        if (abs(dphi) <= 1.0e-20 || vp_m.x * dphi <= 0.0) {
-            break;
-        }
-        let dr = clamp(-phi0 / dphi, -0.05, 0.05);
-        r_cur = clamp(r_cur + dr, 0.0, r_tilde_max);
-        h_sec = max(abs(dr) * 0.25, 2.0e-5);
-        if (abs(dr) < 1.0e-7) {
-            break;
+    // Exact analytical 1D Variable-Projection Newton score polish on centered variables:
+    // Eliminating `c(r) = y_bar - i0(r) * e_bar` reduces 3-param VarPro to `min_r sum w_i (dy_i - i0(r) de_i)^2`
+    // where `de_i = e_i - e_bar`, `g_i = -dde_i/dr = u_i e_i - ue_bar`, `h_i = d^2(de_i)/dr^2 = u_i^2 e_i - u2e_bar`,
+    // and score `phi(r) = sum_i w_i g_i (dy_i - i0(r) de_i) = 0` with analytical derivative `dphi/dr`.
+    var sw_acc = vec2<f32>(0.0, 0.0);
+    var swy_acc = vec2<f32>(0.0, 0.0);
+    for (var i: u32 = 0u; i < n_pts; i = i + 1u) {
+        let pt = points[pt_off + i];
+        sw_acc = kahan_add(sw_acc, pt.w);
+        swy_acc = kahan_add(swy_acc, pt.w * (*y_arr)[i]);
+    }
+    if (sw_acc.x > 1.0e-28) {
+        let s_w = sw_acc.x;
+        let y_bar = swy_acc.x / s_w;
+        for (var p_it: u32 = 0u; p_it < 8u; p_it = p_it + 1u) {
+            if (r_cur <= 0.0 || r_cur >= r_tilde_max) {
+                break;
+            }
+            var swe_acc = vec2<f32>(0.0, 0.0);
+            var sue_acc = vec2<f32>(0.0, 0.0);
+            var su2e_acc = vec2<f32>(0.0, 0.0);
+            for (var i: u32 = 0u; i < n_pts; i = i + 1u) {
+                let pt = points[pt_off + i];
+                let e = exp(-r_cur * pt.u);
+                let we = pt.w * e;
+                let wue = we * pt.u;
+                swe_acc = kahan_add(swe_acc, we);
+                sue_acc = kahan_add(sue_acc, wue);
+                su2e_acc = kahan_add(su2e_acc, wue * pt.u);
+            }
+            let e_bar = swe_acc.x / s_w;
+            let ue_bar = sue_acc.x / s_w;
+            let u2e_bar = su2e_acc.x / s_w;
+
+            var s1_acc = vec2<f32>(0.0, 0.0);
+            var s2_acc = vec2<f32>(0.0, 0.0);
+            var t2_acc = vec2<f32>(0.0, 0.0);
+            var q2_acc = vec2<f32>(0.0, 0.0);
+            for (var i: u32 = 0u; i < n_pts; i = i + 1u) {
+                let pt = points[pt_off + i];
+                let e = exp(-r_cur * pt.u);
+                let de = e - e_bar;
+                let dy = (*y_arr)[i] - y_bar;
+                let g = pt.u * e - ue_bar;
+                s1_acc = kahan_add(s1_acc, pt.w * de * dy);
+                s2_acc = kahan_add(s2_acc, pt.w * de * de);
+                t2_acc = kahan_add(t2_acc, pt.w * de * g);
+                q2_acc = kahan_add(q2_acc, pt.w * g * g);
+            }
+            let s2 = s2_acc.x;
+            if (s2 <= 1.0e-24) {
+                break;
+            }
+            let i0_hat = s1_acc.x / s2;
+            let t2 = t2_acc.x;
+            let q2 = q2_acc.x;
+
+            var phi_acc = vec2<f32>(0.0, 0.0);
+            var qres_acc = vec2<f32>(0.0, 0.0);
+            for (var i: u32 = 0u; i < n_pts; i = i + 1u) {
+                let pt = points[pt_off + i];
+                let e = exp(-r_cur * pt.u);
+                let de = e - e_bar;
+                let dy = (*y_arr)[i] - y_bar;
+                let res_i = dy - i0_hat * de;
+                let g = pt.u * e - ue_bar;
+                let h = pt.u * pt.u * e - u2e_bar;
+                phi_acc = kahan_add(phi_acc, pt.w * g * res_i);
+                qres_acc = kahan_add(qres_acc, pt.w * h * res_i);
+            }
+            let phi = phi_acc.x;
+            let q_res = qres_acc.x;
+            let dphi = i0_hat * (q2 - (t2 * t2) / s2) - q_res + (phi * t2) / s2;
+            if (abs(dphi) <= 1.0e-20 || i0_hat * dphi <= 0.0) {
+                break;
+            }
+            let dr = clamp(-phi / dphi, -0.05, 0.05);
+            r_cur = clamp(r_cur + dr, 0.0, r_tilde_max);
+            if (abs(dr) < 5.0e-8) {
+                break;
+            }
         }
     }
     let vp3_fin = varpro_three_param(pt_off, n_pts, y_arr, r_cur);
