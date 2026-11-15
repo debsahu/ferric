@@ -122,6 +122,7 @@ use nmr_gui::{
     dynamics_panel::{DynamicsStudioOutput, DynamicsStudioPanel, DynamicsStudioTab},
     ingest_panel::{IngestAction, IngestDropOutcome, IngestExecutionPlan, IngestPanelState},
     keymap::{poll_global_modifier_shortcuts, ChordDispatcher, CONTOUR_FLOOR_STEP_RATIO},
+    mcp_bridge::{render_mcp_bridge_panel, McpBridgeState, McpUiCommand, ViewportFrameBuffer},
     metabolomics_panel::MetabolomicsStudioPanel,
     mol3d_overlay::{Mol3dSyncAction, QuantitativeTrack},
     mol3d_viewer::{Mol3dPipelineResource, Mol3dViewerPanel},
@@ -1681,6 +1682,9 @@ struct NmrWorkbenchApp {
     show_assign_popover: bool,
     show_qc_modal: bool,
     show_about_modal: bool,
+    mcp_bridge: McpBridgeState,
+    show_mcp_bridge_window: bool,
+    mcp_last_viewport_key: (u64, i32, i32, i32),
     assign_target_res: usize,
     assign_lock_check: bool,
 
@@ -1865,6 +1869,9 @@ impl NmrWorkbenchApp {
             show_assign_popover: false,
             show_qc_modal: false,
             show_about_modal: false,
+            mcp_bridge: McpBridgeState::default(),
+            show_mcp_bridge_window: false,
+            mcp_last_viewport_key: (0, 0, 0, -1),
             assign_target_res: 0,
             assign_lock_check: true,
             view_h_left: 10.4,
@@ -3937,6 +3944,47 @@ impl NmrWorkbenchApp {
                 WorkspaceMode::Metabolomics,
                 egui::RichText::new("🧪 Metabolomics & Biomarker Studio").strong(),
             );
+
+            ui.separator();
+            let bridge_running = self.mcp_bridge.is_running();
+            let mcp_label = if bridge_running {
+                "🔌 MCP Bridge ●"
+            } else {
+                "🔌 MCP Bridge"
+            };
+            let mcp_btn = egui::Button::new(
+                egui::RichText::new(mcp_label)
+                    .size(12.0)
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(if bridge_running {
+                egui::Color32::from_rgb(28, 118, 76)
+            } else if self.show_mcp_bridge_window {
+                egui::Color32::from_rgb(48, 86, 148)
+            } else {
+                egui::Color32::from_rgb(34, 42, 58)
+            });
+            if ui
+                .add(mcp_btn)
+                .on_hover_text(
+                    "Open authenticated 127.0.0.1 loopback MCP live workbench bridge, undo log & client config",
+                )
+                .clicked()
+            {
+                self.show_mcp_bridge_window = !self.show_mcp_bridge_window;
+            }
+            if ui
+                .small_button("📋 Copy MCP Config")
+                .on_hover_text("Copy ready-to-paste MCP client configuration JSON to clipboard")
+                .clicked()
+            {
+                let cfg_json = self.mcp_bridge.build_client_config_json();
+                ui.ctx().copy_text(cfg_json);
+                self.status_msg = format!(
+                    "Copied {} MCP configuration JSON to clipboard",
+                    self.mcp_bridge.selected_client.label()
+                );
+            }
 
             if self.workspace_mode == WorkspaceMode::OctetChem {
                 ui.separator();
@@ -6642,7 +6690,10 @@ impl NmrWorkbenchApp {
                 self.show_qc_modal = !self.show_qc_modal;
             }
             WorkbenchAction::UndoLastCommand => {
-                if let Some(msg) = self.session.undo() {
+                if let Some(cmd) = self.mcp_bridge.undo_last() {
+                    let summary = cmd.summary();
+                    self.sync_app_from_mcp_snapshot(&format!("Undid AI action: {summary}"));
+                } else if let Some(msg) = self.session.undo() {
                     self.sync_app_from_session();
                     self.status_msg = msg;
                 } else {
@@ -6650,7 +6701,10 @@ impl NmrWorkbenchApp {
                 }
             }
             WorkbenchAction::RedoLastCommand => {
-                if let Some(msg) = self.session.redo() {
+                if let Some(cmd) = self.mcp_bridge.redo_last() {
+                    let summary = cmd.summary();
+                    self.sync_app_from_mcp_snapshot(&format!("Redid AI action: {summary}"));
+                } else if let Some(msg) = self.session.redo() {
                     self.sync_app_from_session();
                     self.status_msg = msg;
                 } else {
@@ -7199,7 +7253,8 @@ impl eframe::App for NmrWorkbenchApp {
             || self.ingest_panel.open
             || self.show_text_io_modal
             || self.show_assign_popover
-            || self.show_contour_modal;
+            || self.show_contour_modal
+            || self.show_mcp_bridge_window;
         let chord_actions = self
             .chord_dispatcher
             .handle_egui_input(&ctx, suppress_chords);
@@ -7207,10 +7262,13 @@ impl eframe::App for NmrWorkbenchApp {
             self.dispatch_workbench_action(&ctx, act);
         }
 
-        // 4. Drag-and-drop + Modals
+        // 4. Drag-and-drop + Modals + MCP Live Workbench Bridge Synchronization
+        self.apply_pending_mcp_bridge_commands();
+        self.sync_mcp_bridge_snapshot_and_viewport();
         self.handle_dropped_files(&ctx);
         self.draw_text_io_window(&ctx);
         self.draw_phase9_modals(&ctx);
+        self.draw_mcp_bridge_window(&ctx);
 
         // 5. Top Menu Bar + 6-Stage Workflow Stepper + QC Verdict Pill + "What Next?"
         let readiness = self.compute_workspace_readiness();
@@ -7407,6 +7465,261 @@ impl eframe::App for NmrWorkbenchApp {
                 egui::CentralPanel::default().show(ui, |ui| {
                     self.metabolomics_panel.ui(ui);
                 });
+            }
+        }
+    }
+}
+
+impl NmrWorkbenchApp {
+    fn resolve_seq_idx_by_id(&self, seq_id: i32) -> Option<usize> {
+        self.seq_ids
+            .iter()
+            .position(|&sid| sid == seq_id)
+            .or_else(|| {
+                let idx = (seq_id - 1).max(0) as usize;
+                (idx < self.sequence.len()).then_some(idx)
+            })
+    }
+
+    fn apply_pending_mcp_bridge_commands(&mut self) {
+        let pending = self.mcp_bridge.drain_pending_ui_commands();
+        if pending.is_empty() {
+            return;
+        }
+        for cmd in pending {
+            match cmd {
+                McpUiCommand::JumpToResidue { seq_id } => {
+                    if let Some(res_idx) = self.resolve_seq_idx_by_id(seq_id) {
+                        self.selected_res = Some(res_idx);
+                        if let Some(ar) = &self.assign_res {
+                            if let Some(ss_idx) =
+                                ar.position.iter().position(|&pos| pos == res_idx as i32)
+                            {
+                                self.selected_ss = Some(ss_idx);
+                                if let Some(sys) = self.systems.get(ss_idx) {
+                                    self.crosshair.h_ppm = sys.h;
+                                    self.crosshair.n_ppm = sys.n;
+                                }
+                            }
+                        }
+                    }
+                    self.status_msg = format!("MCP jumped to residue Seq_ID {seq_id}");
+                }
+                McpUiCommand::SetCrosshairPpm {
+                    h_ppm,
+                    n_ppm,
+                    c_ppm,
+                } => {
+                    self.crosshair.h_ppm = h_ppm;
+                    self.crosshair.n_ppm = n_ppm;
+                    self.crosshair.c_ppm = c_ppm;
+                    self.status_msg =
+                        format!("MCP moved crosshair to ({h_ppm:.3}, {n_ppm:.2}) ppm");
+                }
+                McpUiCommand::AssignSpinSystemToResidue {
+                    cluster_id,
+                    seq_id,
+                    ref reason,
+                } => {
+                    if let Some(res_idx) = self.resolve_seq_idx_by_id(seq_id) {
+                        if cluster_id < self.systems.len() {
+                            let _ = self.session.execute(WorkbenchCommand::AssignSpinSystem {
+                                spin_system: cluster_id,
+                                residue_seq_idx: res_idx,
+                            });
+                            self.sync_app_from_session();
+                        }
+                    }
+                    self.status_msg =
+                        format!("MCP assigned cluster #{cluster_id} -> Seq_ID {seq_id} ({reason})");
+                }
+                McpUiCommand::UnassignResidue { seq_id, ref reason } => {
+                    if let Some(res_idx) = self.resolve_seq_idx_by_id(seq_id) {
+                        let _ = self.session.execute(WorkbenchCommand::UnassignResidue {
+                            residue_seq_idx: res_idx,
+                        });
+                        self.sync_app_from_session();
+                    }
+                    self.status_msg = format!("MCP unassigned Seq_ID {seq_id} ({reason})");
+                }
+                McpUiCommand::TogglePeakExclusion { peak_id, excluded } => {
+                    self.status_msg = format!(
+                        "MCP {} peak #{peak_id}",
+                        if excluded { "excluded" } else { "restored" }
+                    );
+                }
+                McpUiCommand::HighlightResidues3d { ref seq_ids } => {
+                    if let Some(&first_id) = seq_ids.first() {
+                        if let Some(res_idx) = self.resolve_seq_idx_by_id(first_id) {
+                            self.selected_res = Some(res_idx);
+                        }
+                    }
+                    self.status_msg = format!("MCP highlighted {} 3D residues", seq_ids.len());
+                }
+            }
+        }
+    }
+
+    fn sync_app_from_mcp_snapshot(&mut self, banner_msg: &str) {
+        let snap = self.mcp_bridge.snapshot();
+        self.crosshair = snap.to_sync_crosshair();
+        if let Some(seq_id) = snap.active_residue_seq {
+            if let Some(res_idx) = self.resolve_seq_idx_by_id(seq_id) {
+                self.selected_res = Some(res_idx);
+            }
+        }
+        self.status_msg = banner_msg.to_string();
+    }
+
+    fn sync_mcp_bridge_snapshot_and_viewport(&mut self) {
+        let active_seq = self
+            .selected_res
+            .map(|idx| self.seq_ids.get(idx).copied().unwrap_or((idx + 1) as i32));
+        let xh = self.crosshair;
+        let qc_badge = self
+            .qc_report
+            .as_ref()
+            .map(|r| format!("{:?}", r.verdict).to_ascii_uppercase())
+            .unwrap_or_else(|| "UNRUN".to_string());
+        let active_exp = match self.workspace_mode {
+            WorkspaceMode::ProteinNmr => {
+                if self.show_relax_panel {
+                    "RELAX".to_string()
+                } else if self.show_dynamics_panel {
+                    "EXCHANGE".to_string()
+                } else if self.show_stack1d_panel {
+                    "NMR1D_STACK".to_string()
+                } else {
+                    "HSQC".to_string()
+                }
+            }
+            WorkspaceMode::OctetChem => "OCTET_1D".to_string(),
+            WorkspaceMode::Dosy => "DOSY_2D".to_string(),
+            WorkspaceMode::Metabolomics => "METABOLOMICS_1D".to_string(),
+        };
+
+        self.mcp_bridge.update_snapshot(|snap| {
+            snap.active_residue_seq = active_seq;
+            snap.crosshair_ppm = (xh.h_ppm, xh.n_ppm, xh.c_ppm);
+            snap.active_experiment = active_exp;
+            snap.qc_status = qc_badge;
+        });
+
+        let vp_key = (
+            self.hsqc_gen,
+            (xh.h_ppm * 1000.0) as i32,
+            (xh.n_ppm * 100.0) as i32,
+            active_seq.unwrap_or(-1),
+        );
+        if vp_key != self.mcp_last_viewport_key {
+            self.mcp_last_viewport_key = vp_key;
+            let (w, h, rgba, label) = self.rasterize_mcp_viewport_rgba(192, 144);
+            self.mcp_bridge.update_viewport_rgba(w, h, rgba, label);
+        }
+    }
+
+    fn rasterize_mcp_viewport_rgba(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> (u32, u32, Vec<u8>, &'static str) {
+        let w = width.max(16);
+        let h = height.max(16);
+        let xh_tuple = (
+            self.crosshair.h_ppm,
+            self.crosshair.n_ppm,
+            self.crosshair.c_ppm,
+        );
+        let Some(spec) = &self.hsqc_spec else {
+            let card = ViewportFrameBuffer::diagnostic_card(w, h, xh_tuple);
+            return (card.width, card.height, card.rgba, "diagnostic_contour_2d");
+        };
+        let nx = spec.nx();
+        let ny = spec.ny();
+        if nx == 0 || ny == 0 || spec.data.len() < nx.saturating_mul(ny) {
+            let card = ViewportFrameBuffer::diagnostic_card(w, h, xh_tuple);
+            return (card.width, card.height, card.rgba, "diagnostic_contour_2d");
+        }
+
+        let h_left = f64::from(self.view_h_left);
+        let h_right = f64::from(self.view_h_right);
+        let n_top = f64::from(self.view_n_top);
+        let n_bottom = f64::from(self.view_n_bottom);
+        let h_span = (h_left - h_right).abs().max(1e-6);
+        let n_span = (n_bottom - n_top).abs().max(1e-6);
+        let base_thr = f64::from(self.contour_base.abs().max(1e-6));
+
+        let xh_px = (((h_left - self.crosshair.h_ppm) / h_span).clamp(0.0, 1.0) * f64::from(w - 1))
+            .round() as u32;
+        let xh_py = (((self.crosshair.n_ppm - n_top) / n_span).clamp(0.0, 1.0) * f64::from(h - 1))
+            .round() as u32;
+
+        let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+        for py in 0..h {
+            let n_ppm = n_top + (f64::from(py) / f64::from((h - 1).max(1))) * (n_bottom - n_top);
+            let sy_f = if spec.axis_y.step_ppm.abs() > 1e-12 {
+                (n_ppm - spec.axis_y.first_ppm) / spec.axis_y.step_ppm
+            } else {
+                0.0
+            };
+            let sy = sy_f.round().clamp(0.0, (ny - 1) as f64) as usize;
+
+            for px in 0..w {
+                let h_ppm =
+                    h_left - (f64::from(px) / f64::from((w - 1).max(1))) * (h_left - h_right);
+                let sx_f = if spec.axis_x.step_ppm.abs() > 1e-12 {
+                    (h_ppm - spec.axis_x.first_ppm) / spec.axis_x.step_ppm
+                } else {
+                    0.0
+                };
+                let sx = sx_f.round().clamp(0.0, (nx - 1) as f64) as usize;
+                let val = f64::from(spec.data[sy * nx + sx]);
+
+                let on_border = px == 0 || py == 0 || px + 1 == w || py + 1 == h;
+                let on_crosshair = px == xh_px || py == xh_py;
+                let pixel = if on_border {
+                    [58, 72, 96, 255]
+                } else if on_crosshair {
+                    [245, 194, 66, 255]
+                } else if val >= base_thr {
+                    let lvl = ((val / base_thr).ln().max(0.0) * 42.0).min(115.0) as u8;
+                    [36, 140u8.saturating_add(lvl), 250, 255]
+                } else if self.show_negative && val <= -base_thr {
+                    let lvl = (((-val) / base_thr).ln().max(0.0) * 42.0).min(115.0) as u8;
+                    [235, 75u8.saturating_add(lvl / 2), 95, 255]
+                } else {
+                    [16, 20, 28, 255]
+                };
+                let out_idx = ((py * w + px) as usize) * 4;
+                rgba[out_idx..out_idx + 4].copy_from_slice(&pixel);
+            }
+        }
+        (w, h, rgba, "contour_2d")
+    }
+
+    fn draw_mcp_bridge_window(&mut self, ctx: &egui::Context) {
+        if !self.show_mcp_bridge_window {
+            return;
+        }
+        let mut open = self.show_mcp_bridge_window;
+        let mut panel_resp = None;
+        egui::Window::new("🔌 MCP Live Workbench Bridge")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                panel_resp = Some(render_mcp_bridge_panel(ui, &mut self.mcp_bridge));
+            });
+        self.show_mcp_bridge_window = open;
+
+        if let Some(resp) = panel_resp {
+            if let Some(cmd) = resp.undone_command {
+                let summary = cmd.summary();
+                self.sync_app_from_mcp_snapshot(&format!("Undid AI action: {summary}"));
+            }
+            if let Some(cmd) = resp.redone_command {
+                let summary = cmd.summary();
+                self.sync_app_from_mcp_snapshot(&format!("Redid AI action: {summary}"));
             }
         }
     }

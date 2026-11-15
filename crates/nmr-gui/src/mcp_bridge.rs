@@ -21,7 +21,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 #[cfg(not(target_arch = "wasm32"))]
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 #[cfg(not(target_arch = "wasm32"))]
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 #[cfg(not(target_arch = "wasm32"))]
@@ -1747,16 +1747,24 @@ struct ParsedHttpRequest {
 fn read_loopback_http_request(
     stream: &mut TcpStream,
 ) -> Result<Option<ParsedHttpRequest>, (u16, String)> {
+    use nmr_core::mcp::{
+        parse_bounded_content_length, read_bounded_line, ContentLengthError, MAX_MCP_HEADER_COUNT,
+        MAX_MCP_HEADER_LINE_BYTES,
+    };
+
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
     let mut reader = BufReader::new(stream);
     let mut req_line = String::new();
-    let n = reader
-        .read_line(&mut req_line)
-        .map_err(|e| (400, format!("failed reading HTTP request line: {e}")))?;
+    let (n, req_exceeded) =
+        read_bounded_line(&mut reader, &mut req_line, MAX_MCP_HEADER_LINE_BYTES)
+            .map_err(|e| (400, format!("failed reading HTTP request line: {e}")))?;
     if n == 0 || req_line.trim().is_empty() {
         return Ok(None);
+    }
+    if req_exceeded {
+        return Err((413, "HTTP request line exceeds maximum length".to_string()));
     }
 
     let mut parts = req_line.split_whitespace();
@@ -1770,25 +1778,35 @@ fn read_loopback_http_request(
     let mut duplicate_host = false;
     let mut origin = None;
     let mut authorization = None;
+    let mut header_count = 0usize;
 
     loop {
+        header_count += 1;
+        if header_count > MAX_MCP_HEADER_COUNT {
+            return Err((400, "too many HTTP header lines".to_string()));
+        }
         let mut line = String::new();
-        let bytes = reader
-            .read_line(&mut line)
-            .map_err(|e| (400, format!("failed reading HTTP header: {e}")))?;
+        let (bytes, hdr_exceeded) =
+            read_bounded_line(&mut reader, &mut line, MAX_MCP_HEADER_LINE_BYTES)
+                .map_err(|e| (400, format!("failed reading HTTP header: {e}")))?;
         if bytes == 0 || line == "\r\n" || line == "\n" {
             break;
+        }
+        if hdr_exceeded {
+            return Err((413, "HTTP header line exceeds maximum length".to_string()));
         }
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim();
             if key.eq_ignore_ascii_case("content-length") {
-                content_length = v
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| (400, "invalid Content-Length".to_string()))?;
-                if content_length > MAX_MCP_HTTP_BODY_BYTES {
-                    return Err((413, "MCP HTTP payload exceeds 4 MiB limit".to_string()));
-                }
+                content_length = match parse_bounded_content_length(v, MAX_MCP_HTTP_BODY_BYTES) {
+                    Ok(len) => len,
+                    Err(ContentLengthError::Malformed) => {
+                        return Err((400, "invalid Content-Length".to_string()));
+                    }
+                    Err(ContentLengthError::ExceedsLimit { .. }) => {
+                        return Err((413, "MCP HTTP payload exceeds 4 MiB limit".to_string()));
+                    }
+                };
             } else if key.eq_ignore_ascii_case("host") {
                 if seen_host {
                     duplicate_host = true;
@@ -1973,6 +1991,9 @@ pub struct McpBridgeController {
     /// Last informational or error banner message displayed in the panel.
     pub status_banner: String,
 }
+
+/// Alias matching the workbench state naming in `NmrWorkbenchApp`.
+pub type McpBridgeState = McpBridgeController;
 
 impl Default for McpBridgeController {
     fn default() -> Self {
@@ -2422,6 +2443,8 @@ pub fn render_mcp_bridge_panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::io::BufRead;
 
     /// Parse an RFC 2083 PNG stream and verify its signature, `IHDR`, `IDAT` ZLIB/DEFLATE stored
     /// blocks + Adler-32, `IEND`, every chunk's IEEE CRC-32, and lossless RGBA pixel equality.
@@ -3133,6 +3156,57 @@ mod tests {
             verify_and_decode_png(&png_bytes).expect("valid PNG magic/CRC-32/Adler-32");
         assert_eq!((pw, ph), (16, 12));
         assert_eq!(decoded_rgba, custom_rgba);
+
+        // 7. Adversarial pre-allocation Content-Length cap (oversized 64 MiB and usize overflow -> 413)
+        for adv_len in ["67108864", "999999999999999999999999999999"] {
+            let mut sock = TcpStream::connect(&addr).expect("connect loopback for 413 test");
+            let req_413 = format!(
+                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {bearer}\r\nContent-Length: {adv_len}\r\nConnection: close\r\n\r\n{{}}"
+            );
+            sock.write_all(req_413.as_bytes()).expect("send 413 header");
+            let _ = sock.flush();
+            let mut resp_buf = String::new();
+            let mut rdr = BufReader::new(sock);
+            let _ = rdr.read_line(&mut resp_buf);
+            assert!(
+                resp_buf.contains(" 413 "),
+                "expected 413 Payload Too Large before allocation for Content-Length={adv_len}, got {resp_buf:?}"
+            );
+        }
+
+        // Negative / non-numeric Content-Length -> 400 Bad Request
+        {
+            let mut sock = TcpStream::connect(&addr).expect("connect loopback for 400 test");
+            let req_400 = format!(
+                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {bearer}\r\nContent-Length: -42\r\nConnection: close\r\n\r\n"
+            );
+            sock.write_all(req_400.as_bytes()).expect("send 400 header");
+            let _ = sock.flush();
+            let mut resp_buf = String::new();
+            let mut rdr = BufReader::new(sock);
+            let _ = rdr.read_line(&mut resp_buf);
+            assert!(
+                resp_buf.contains(" 400 "),
+                "expected 400 Bad Request for negative Content-Length, got {resp_buf:?}"
+            );
+        }
+
+        println!(
+            "MCP_METRIC_JSON:{}",
+            json!({
+                "suite": "nmr_gui_mcp_bridge",
+                "undo_cap_depth": MAX_MCP_UNDO_DEPTH,
+                "max_http_body_bytes": MAX_MCP_HTTP_BODY_BYTES,
+                "png_width": pw,
+                "png_height": ph,
+                "png_bytes": png_bytes.len(),
+                "http_auth_401_verified": true,
+                "http_rebind_403_verified": true,
+                "http_prealloc_413_verified": true,
+                "readonly_write_blocked_verified": true,
+                "undo_roundtrip_verified": true
+            })
+        );
 
         ctrl.stop_bridge();
         assert!(!ctrl.is_running());

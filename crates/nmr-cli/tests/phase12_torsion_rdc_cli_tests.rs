@@ -25,7 +25,7 @@ fn workspace_root() -> PathBuf {
 }
 
 #[test]
-fn test_phase12_cli_version_is_0_8_0_and_help_lists_torsions_and_rdc() {
+fn test_cli_version_matches_workspace_and_help_lists_torsions_and_rdc() {
     let bin = nmrassign_bin();
 
     let ver_out = Command::new(&bin)
@@ -34,11 +34,12 @@ fn test_phase12_cli_version_is_0_8_0_and_help_lists_torsions_and_rdc() {
         .expect("run nmrassign --version");
     assert!(ver_out.status.success());
     let ver_stdout = String::from_utf8_lossy(&ver_out.stdout);
+    let expected_prefix = format!("nmrassign {} (", env!("CARGO_PKG_VERSION"));
     assert!(
-        ver_stdout.starts_with("nmrassign 0.10.0 ("),
-        "expected version 0.10.0, got: {ver_stdout}"
+        ver_stdout.starts_with(&expected_prefix),
+        "expected version prefix '{expected_prefix}', got: {ver_stdout}"
     );
-    assert_eq!(nmr_core::VERSION, "0.10.0");
+    assert_eq!(nmr_core::VERSION, env!("CARGO_PKG_VERSION"));
 
     let help_out = Command::new(&bin)
         .arg("--help")

@@ -18,17 +18,54 @@
 //!   chemical-shift torsion prediction.
 //! - Guo, C. et al. (*ICML* 2017, 70, 1321–1330) & Chow, C. K. (*IEEE Trans. Inf. Theory* 1970,
 //!   16, 41–46) — `DatasetQcReport` calibration and selective abstention.
+//! - Kay, L. E., Torchia, D. A. & Bax, A. (*Biochemistry* 1989, 28, 8972–8979); Vallurupalli, P.,
+//!   Hansen, D. F. & Kay, L. E. (*Proc. Natl. Acad. Sci. U.S.A.* 2012, 109, 11177–11182); Baldwin,
+//!   A. J. (*J. Magn. Reson.* 2014, 244, 114–124); Williamson, M. P. (*Prog. Nucl. Magn. Reson.
+//!   Spectrosc.* 2013, 73, 1–16) — Phase 13 relaxation, `CEST`/`CPMG` exchange, and `CSP` tracking.
+//! - Fulmer, G. R. et al. (*Organometallics* 2010, 29, 2176–2179); Hoye, T. R., Hanson, P. R. &
+//!   Vyvyan, J. R. (*J. Org. Chem.* 1994, 59, 4096–4103); Stejskal, E. O. & Tanner, J. E. (*J.
+//!   Chem. Phys.* 1965, 42, 288–292); Wu, D. H., Chen, A. D. & Johnson, C. S. Jr. (*J. Magn.
+//!   Reson. A* 1995, 115, 260–264) — Phase 14 1D deconvolution, multiplet trees, and `DOSY`.
+//! - De Meyer, T. et al. (*Anal. Chem.* 2008, 80, 3783–3790); Dieterle, F. et al. (*Anal. Chem.*
+//!   2006, 78, 4281–4290); Trygg, J. & Wold, S. (*J. Chemom.* 2002, 16, 119–128); Westerhuis,
+//!   J. A. et al. (*Metabolomics* 2008, 4, 81–89); Cloarec, O. et al. (*Anal. Chem.* 2005, 77,
+//!   1282–1289) — Phase 14 `AI-Binning`, `PQN`, `PCA`, `OPLS-DA`, and `STOCSY` chemometrics.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::cest::{fit_cest_global_cpu, read_cest_profiles_tsv, CestFitConfig};
 use crate::classify::classify_nmr_workspace;
+use crate::cpmg::{fit_cpmg_global_cpu, read_cpmg_series_tsv, CpmgFitConfig, CpmgModel};
+use crate::csp::{
+    fit_csp_global_kd, track_methyl_hmqc_trajectories, track_titration_trajectories,
+    AssignedAmidePeak, CspAnalysisConfig, UnassignedHsqcPeak, UnassignedTitrationStep,
+};
+use crate::dosy::{
+    compute_b_values_s_m2, estimate_hydrodynamics, fit_stejskal_tanner_multi, read_bruker_dosy_dir,
+    read_varian_dosy_dir, solve_tikhonov_ilt, BrukerDosyOverrides, DosyFitConfig, DosyNucleus,
+    DosySequenceType, DosySolvent, GradientShape, IltConfig, ModelSelectionCriterion,
+    SoluteCompactnessClass, VarianDosyOverrides, ILT_ARTIFACT_CAVEAT,
+};
+use crate::metabolomics::{
+    compute_stocsy_at_ppm, run_metabolomics_pipeline, BiofluidMaskPreset, BucketingMethod,
+    CohortSample1D, MetabolomicsPipelineConfig, NormalizationMethod, ScalingMethod,
+};
+use crate::multiplet::{
+    analyze_multiplet_region, format_journal_nmr_report, JournalNmrReport, MultipletConfig,
+    PublicationStyle, ReportNucleus, ReportedSignal, TextEncoding,
+};
+use crate::nmr1d::{
+    auto_calibrate_solvent_1d, deconvolve_spectrum_1d, estimate_noise_sigma_1d,
+    load_processed_spectrum_1d, match_trace_impurities, pick_peaks_1d, DeconvolveConfig1D,
+    PeakPickConfig1D,
+};
 use crate::nmrstar::{read_star_all_atoms, write_star_with_header, Reference};
 use crate::peaks::{
     experiment_rules, read_peaks, read_peaks_str, write_peaks, Peak, ALL_EXPERIMENT_NAMES,
@@ -40,6 +77,8 @@ use crate::priors::{
 };
 use crate::pulprog::interpret_experiment_dir;
 use crate::qc::{apply_dataset_qc_to_assignments, evaluate_dataset_qc};
+use crate::relax_fit::{decay_inputs_from_series, fit_decay_batch_cpu, ExpFitConfig};
+use crate::relax_io::{parse_relax_series_nef_str, parse_relax_series_tsv_str};
 use crate::solver::{assign, prepare_scoring_priors, AnnealConfig, ScoreConfig};
 use crate::spinsystems::{build_spin_systems, Tolerances};
 use crate::torsion_db::{
@@ -1304,6 +1343,11 @@ impl McpServer {
             "read_peak_list_summary" => self.tool_read_peak_list_summary(&args_map),
             "evaluate_dataset_qc" => self.tool_evaluate_dataset_qc(&args_map),
             "predict_homolog_free_torsions" => self.tool_predict_homolog_free_torsions(&args_map),
+            "fit_relaxation_or_exchange" => self.tool_fit_relaxation_or_exchange(&args_map),
+            "track_csp_titration" => self.tool_track_csp_titration(&args_map),
+            "analyze_nmr1d_spectrum" => self.tool_analyze_nmr1d_spectrum(&args_map),
+            "fit_dosy_diffusion" => self.tool_fit_dosy_diffusion(&args_map),
+            "run_metabolomics_chemometrics" => self.tool_run_metabolomics_chemometrics(&args_map),
             "write_curated_peak_tsv" => self.tool_write_curated_peak_tsv(&args_map),
             "export_nmrstar_shifts" => self.tool_export_nmrstar_shifts(&args_map),
             _ => {
@@ -2288,6 +2332,1326 @@ impl McpServer {
             "sha256": sha256_hex(&written_bytes),
         }))
     }
+
+    fn collect_sandboxed_input_paths(
+        &self,
+        args: &Map<String, Value>,
+    ) -> Result<Vec<PathBuf>, McpCallToolResult> {
+        let mut raw_paths: Vec<String> = Vec::new();
+        if let Some(p) = args.get("path").and_then(Value::as_str) {
+            if !p.trim().is_empty() {
+                raw_paths.push(p.to_string());
+            }
+        }
+        if let Some(arr) = args.get("paths").and_then(Value::as_array) {
+            for item in arr {
+                let Some(s) = item.as_str() else {
+                    return Err(McpCallToolResult::domain_error(
+                        "invalid_arguments",
+                        "every entry in 'paths' must be a string",
+                    ));
+                };
+                if !s.trim().is_empty() {
+                    raw_paths.push(s.to_string());
+                }
+            }
+        }
+        if raw_paths.is_empty() {
+            return Err(McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "requires non-empty string 'path' or array 'paths'",
+            ));
+        }
+        let mut resolved = Vec::with_capacity(raw_paths.len());
+        for raw in &raw_paths {
+            match self.policy.resolve_sandboxed_path(raw) {
+                Ok(p) => resolved.push(p),
+                Err(sec) => return Err(sec.to_tool_error_result()),
+            }
+        }
+        Ok(resolved)
+    }
+
+    fn tool_fit_relaxation_or_exchange(&self, args: &Map<String, Value>) -> McpCallToolResult {
+        let Some(mode_raw) = args.get("mode").and_then(Value::as_str) else {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "missing required string argument 'mode' ('relaxation', 'cest', or 'cpmg')",
+            );
+        };
+        let resolved_paths = match self.collect_sandboxed_input_paths(args) {
+            Ok(p) => p,
+            Err(err_res) => return err_res,
+        };
+        let display_paths: Vec<String> = resolved_paths
+            .iter()
+            .map(|p| self.policy.relativize_display_path(p))
+            .collect();
+
+        let mode = mode_raw.trim().to_ascii_lowercase();
+        match mode.as_str() {
+            "relaxation" | "r1" | "r2" => {
+                let first = &resolved_paths[0];
+                let text = match fs::read_to_string(first) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "io_error",
+                            format!("failed to read relaxation series: {e}"),
+                        );
+                    }
+                };
+                let is_nef = first
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("nef"));
+                let ds = if is_nef {
+                    match parse_relax_series_nef_str(&text) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            return McpCallToolResult::domain_error("relax_parse_error", e);
+                        }
+                    }
+                } else {
+                    match parse_relax_series_tsv_str(&text) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            return McpCallToolResult::domain_error("relax_parse_error", e);
+                        }
+                    }
+                };
+                let mc_replicates = args
+                    .get("mc_replicates")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(200)
+                    .min(2000) as usize;
+                let seed = args
+                    .get("seed")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20_261_302);
+                let cfg = ExpFitConfig {
+                    mc_replicates,
+                    seed,
+                    ..ExpFitConfig::default()
+                };
+                let inputs = decay_inputs_from_series(&ds);
+                let fits = match fit_decay_batch_cpu(&inputs, &cfg) {
+                    Ok(f) => f,
+                    Err(e) => return McpCallToolResult::domain_error("relax_fit_error", e),
+                };
+                let mean_rate = if fits.is_empty() {
+                    0.0
+                } else {
+                    fits.iter().map(|f| f.rate).sum::<f64>() / (fits.len() as f64)
+                };
+                let residue_rows: Vec<Value> = fits
+                    .iter()
+                    .map(|f| {
+                        json!({
+                            "seq_id": f.seq_id,
+                            "res_name": f.res_name,
+                            "rate_s_inv": f.rate,
+                            "sigma_rate_fisher": f.sigma_rate_fisher,
+                            "sigma_rate_mc": f.sigma_rate_mc,
+                            "rate_ci95": f.rate_ci95,
+                            "i0": f.i0,
+                            "chi2": f.chi2,
+                            "dof": f.dof,
+                            "used_three_param": f.used_three_param,
+                        })
+                    })
+                    .collect();
+
+                McpCallToolResult::ok_json(&json!({
+                    "mode": "relaxation",
+                    "paths": display_paths,
+                    "experiment_kind": format!("{:?}", ds.experiment_kind),
+                    "field_mhz": ds.field_mhz,
+                    "n_residues": fits.len(),
+                    "mean_rate_s_inv": mean_rate,
+                    "mc_replicates": mc_replicates,
+                    "residues": residue_rows,
+                }))
+            }
+            "cest" | "dest" => {
+                let mut profiles = Vec::new();
+                for p in &resolved_paths {
+                    let text = match fs::read_to_string(p) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            return McpCallToolResult::domain_error(
+                                "io_error",
+                                format!("failed to read CEST profile TSV: {e}"),
+                            );
+                        }
+                    };
+                    match read_cest_profiles_tsv(&text) {
+                        Ok(mut parsed) => profiles.append(&mut parsed),
+                        Err(e) => return McpCallToolResult::domain_error("cest_parse_error", e),
+                    }
+                }
+                let compute_chi2_surface = args
+                    .get("compute_chi2_surface")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let cfg = CestFitConfig {
+                    compute_chi2_surface,
+                    ..CestFitConfig::default()
+                };
+                let fit = match fit_cest_global_cpu(&profiles, &cfg) {
+                    Ok(r) => r,
+                    Err(e) => return McpCallToolResult::domain_error("cest_fit_error", e),
+                };
+                McpCallToolResult::ok_json(&json!({
+                    "mode": "cest",
+                    "paths": display_paths,
+                    "n_profiles": profiles.len(),
+                    "n_residues": fit.residues.len(),
+                    "p_b": fit.p_b,
+                    "p_b_err": fit.p_b_err,
+                    "k_ex_s_inv": fit.k_ex_s_inv,
+                    "k_ex_err": fit.k_ex_err,
+                    "k_ab_s_inv": fit.k_ab_s_inv,
+                    "k_ba_s_inv": fit.k_ba_s_inv,
+                    "total_chi2": fit.total_chi2,
+                    "reduced_chi2": fit.reduced_chi2,
+                    "dof": fit.dof,
+                    "converged": fit.converged,
+                    "residues": fit.residues,
+                }))
+            }
+            "cpmg" => {
+                let mut series = Vec::new();
+                for p in &resolved_paths {
+                    let text = match fs::read_to_string(p) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            return McpCallToolResult::domain_error(
+                                "io_error",
+                                format!("failed to read CPMG series TSV: {e}"),
+                            );
+                        }
+                    };
+                    match read_cpmg_series_tsv(&text) {
+                        Ok(mut parsed) => series.append(&mut parsed),
+                        Err(e) => return McpCallToolResult::domain_error("cpmg_parse_error", e),
+                    }
+                }
+                let model = match args.get("cpmg_model").and_then(Value::as_str) {
+                    Some(lbl) => match CpmgModel::from_str_label(lbl) {
+                        Ok(m) => m,
+                        Err(e) => return McpCallToolResult::domain_error("invalid_arguments", e),
+                    },
+                    None => CpmgModel::Baldwin2014,
+                };
+                let cfg = CpmgFitConfig {
+                    model,
+                    ..CpmgFitConfig::default()
+                };
+                let fit = match fit_cpmg_global_cpu(&series, &cfg) {
+                    Ok(r) => r,
+                    Err(e) => return McpCallToolResult::domain_error("cpmg_fit_error", e),
+                };
+                McpCallToolResult::ok_json(&json!({
+                    "mode": "cpmg",
+                    "model": fit.model.as_str(),
+                    "paths": display_paths,
+                    "n_series": series.len(),
+                    "n_residues": fit.residues.len(),
+                    "p_b": fit.p_b,
+                    "p_b_err": fit.p_b_err,
+                    "k_ex_s_inv": fit.k_ex_s_inv,
+                    "k_ex_err": fit.k_ex_err,
+                    "k_ab_s_inv": fit.k_ab_s_inv,
+                    "k_ba_s_inv": fit.k_ba_s_inv,
+                    "total_chi2": fit.total_chi2,
+                    "reduced_chi2": fit.reduced_chi2,
+                    "dof": fit.dof,
+                    "converged": fit.converged,
+                    "residues": fit.residues,
+                }))
+            }
+            other => McpCallToolResult::domain_error(
+                "invalid_arguments",
+                format!("unsupported mode '{other}' (expected 'relaxation', 'cest', or 'cpmg')"),
+            ),
+        }
+    }
+
+    fn tool_track_csp_titration(&self, args: &Map<String, Value>) -> McpCallToolResult {
+        let nucleus_mode = args
+            .get("nucleus_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("amide")
+            .trim()
+            .to_ascii_lowercase();
+        if nucleus_mode != "amide" && nucleus_mode != "methyl" {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                format!("unsupported nucleus_mode '{nucleus_mode}' (expected 'amide' or 'methyl')"),
+            );
+        }
+
+        let apo_peaks: Vec<AssignedAmidePeak> =
+            if let Some(raw_star) = args.get("apo_star_path").and_then(Value::as_str) {
+                let resolved_star = match self.policy.resolve_sandboxed_path(raw_star) {
+                    Ok(p) => p,
+                    Err(sec) => return sec.to_tool_error_result(),
+                };
+                let ref_data = match read_star_all_atoms(&resolved_star, None) {
+                    Ok(r) => r,
+                    Err(e) => return McpCallToolResult::domain_error("nmrstar_parse_error", e),
+                };
+                let mut out = Vec::new();
+                for (res_idx, res_name) in ref_data.sequence.iter().enumerate() {
+                    if nucleus_mode == "amide" && res_name == "PRO" {
+                        continue;
+                    }
+                    let seq_id = ref_data
+                        .seq_ids
+                        .get(res_idx)
+                        .copied()
+                        .unwrap_or((res_idx + 1) as i32);
+                    let h_opt = ref_data
+                        .shifts
+                        .get(&(res_idx, "H".to_string()))
+                        .or_else(|| ref_data.shifts.get(&(res_idx, "HN".to_string())))
+                        .copied();
+                    let het_opt = if nucleus_mode == "methyl" {
+                        ref_data
+                            .shifts
+                            .get(&(res_idx, "CD1".to_string()))
+                            .or_else(|| ref_data.shifts.get(&(res_idx, "CG1".to_string())))
+                            .or_else(|| ref_data.shifts.get(&(res_idx, "CB".to_string())))
+                            .copied()
+                    } else {
+                        ref_data.shifts.get(&(res_idx, "N".to_string())).copied()
+                    };
+                    if let (Some(h_ppm), Some(n_ppm)) = (h_opt, het_opt) {
+                        out.push(AssignedAmidePeak {
+                            seq_index: res_idx,
+                            seq_id,
+                            res_name: res_name.clone(),
+                            h_ppm,
+                            n_ppm,
+                        });
+                    }
+                }
+                out
+            } else if let Some(raw_apo_tsv) = args.get("apo_peaks_path").and_then(Value::as_str) {
+                let resolved_apo = match self.policy.resolve_sandboxed_path(raw_apo_tsv) {
+                    Ok(p) => p,
+                    Err(sec) => return sec.to_tool_error_result(),
+                };
+                let text = match fs::read_to_string(&resolved_apo) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "io_error",
+                            format!("failed to read apo peaks TSV: {e}"),
+                        );
+                    }
+                };
+                match parse_assigned_apo_peaks_tsv(&text) {
+                    Ok(p) => p,
+                    Err(e) => return McpCallToolResult::domain_error("apo_parse_error", e),
+                }
+            } else {
+                return McpCallToolResult::domain_error(
+                    "invalid_arguments",
+                    "track_csp_titration requires either 'apo_star_path' or 'apo_peaks_path'",
+                );
+            };
+
+        if apo_peaks.is_empty() {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "zero assigned apo peaks extracted from reference file",
+            );
+        }
+
+        let Some(steps_arr) = args.get("steps").and_then(Value::as_array) else {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "track_csp_titration requires non-empty array 'steps'",
+            );
+        };
+        if steps_arr.is_empty() {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "track_csp_titration 'steps' array must contain at least one titration point",
+            );
+        }
+
+        let mut steps = Vec::with_capacity(steps_arr.len());
+        for (idx, item) in steps_arr.iter().enumerate() {
+            let Some(obj) = item.as_object() else {
+                return McpCallToolResult::domain_error(
+                    "invalid_arguments",
+                    format!("steps[{idx}] must be a JSON object"),
+                );
+            };
+            let Some(raw_step_path) = obj.get("peaks_path").and_then(Value::as_str) else {
+                return McpCallToolResult::domain_error(
+                    "invalid_arguments",
+                    format!("steps[{idx}] requires string 'peaks_path'"),
+                );
+            };
+            let resolved_step = match self.policy.resolve_sandboxed_path(raw_step_path) {
+                Ok(p) => p,
+                Err(sec) => return sec.to_tool_error_result(),
+            };
+            let Some(protein_conc_um) = obj
+                .get("protein_conc_um")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite() && *v > 0.0)
+            else {
+                return McpCallToolResult::domain_error(
+                    "invalid_arguments",
+                    format!("steps[{idx}] requires positive finite 'protein_conc_um'"),
+                );
+            };
+            let Some(ligand_conc_um) = obj
+                .get("ligand_conc_um")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite() && *v >= 0.0)
+            else {
+                return McpCallToolResult::domain_error(
+                    "invalid_arguments",
+                    format!("steps[{idx}] requires non-negative finite 'ligand_conc_um'"),
+                );
+            };
+            let label = obj
+                .get("label")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("step_{}", idx + 1));
+
+            let step_peaks_raw = match read_peaks(&resolved_step) {
+                Ok(pk) => pk,
+                Err(e) => return McpCallToolResult::domain_error("peak_parse_error", e),
+            };
+            let step_peaks: Vec<UnassignedHsqcPeak> = step_peaks_raw
+                .iter()
+                .map(|p| UnassignedHsqcPeak {
+                    h_ppm: p.h,
+                    n_ppm: p.c.unwrap_or(p.n),
+                })
+                .collect();
+            steps.push(UnassignedTitrationStep {
+                label,
+                protein_conc_um,
+                ligand_conc_um,
+                peaks: step_peaks,
+            });
+        }
+
+        let max_step_csp_ppm = args
+            .get("max_step_csp_ppm")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.45);
+        let n_mc = args
+            .get("n_mc")
+            .and_then(Value::as_u64)
+            .unwrap_or(200)
+            .min(2000) as usize;
+        let mc_seed = args
+            .get("seed")
+            .and_then(Value::as_u64)
+            .unwrap_or(20_261_306);
+        let cfg = CspAnalysisConfig {
+            max_step_csp_ppm,
+            n_mc,
+            mc_seed,
+            ..CspAnalysisConfig::default()
+        };
+
+        let trajectories = if nucleus_mode == "methyl" {
+            match track_methyl_hmqc_trajectories(&apo_peaks, &steps, &cfg) {
+                Ok(t) => t,
+                Err(e) => return McpCallToolResult::domain_error("csp_track_error", e),
+            }
+        } else {
+            match track_titration_trajectories(&apo_peaks, &steps, &cfg) {
+                Ok(t) => t,
+                Err(e) => return McpCallToolResult::domain_error("csp_track_error", e),
+            }
+        };
+
+        let fit = match fit_csp_global_kd(&trajectories, &cfg) {
+            Ok(f) => f,
+            Err(e) => return McpCallToolResult::domain_error("csp_fit_error", e),
+        };
+
+        McpCallToolResult::ok_json(&json!({
+            "nucleus_mode": nucleus_mode,
+            "n_apo_peaks": apo_peaks.len(),
+            "n_steps": steps.len(),
+            "global_kd_um": fit.global_kd_um,
+            "global_kd_sd_um": fit.global_kd_sd_um,
+            "global_kd_ci95_um": [fit.global_kd_ci95_low_um, fit.global_kd_ci95_high_um],
+            "global_naive_mm_kd_um": fit.global_naive_mm_kd_um,
+            "global_reduced_chi2": fit.global_reduced_chi2,
+            "thresholds": fit.thresholds,
+            "residue_fits": fit.residue_fits,
+        }))
+    }
+
+    fn tool_analyze_nmr1d_spectrum(&self, args: &Map<String, Value>) -> McpCallToolResult {
+        let Some(raw_path) = args.get("path").and_then(Value::as_str) else {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "missing required string argument 'path'",
+            );
+        };
+        let resolved = match self.policy.resolve_sandboxed_path(raw_path) {
+            Ok(p) => p,
+            Err(sec) => return sec.to_tool_error_result(),
+        };
+        let mhz_override = args
+            .get("mhz")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0);
+        let mut spec = match load_processed_spectrum_1d(&resolved, mhz_override) {
+            Ok(s) => s,
+            Err(e) => return McpCallToolResult::domain_error("nmr1d_load_error", e),
+        };
+
+        let solvent_opt = args
+            .get("solvent")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| spec.solvent.clone());
+        let mut calibration_offset_ppm: Option<f64> = None;
+        if args
+            .get("calibrate_solvent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            if let Some(ref solv) = solvent_opt {
+                match auto_calibrate_solvent_1d(&mut spec, solv, 0.25) {
+                    Ok(off) => calibration_offset_ppm = Some(off),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error("solvent_calibration_error", e);
+                    }
+                }
+            }
+        }
+
+        let noise_sigma = estimate_noise_sigma_1d(&spec);
+        let min_snr = args
+            .get("min_snr")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(6.0);
+        let pick_cfg = PeakPickConfig1D {
+            min_snr,
+            ..PeakPickConfig1D::default()
+        };
+        let picked = pick_peaks_1d(&spec, &pick_cfg);
+
+        let deconvolve = args
+            .get("deconvolve")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let deconv_opt = if deconvolve {
+            let dcfg = DeconvolveConfig1D {
+                pick_config: pick_cfg,
+                ..DeconvolveConfig1D::default()
+            };
+            Some(deconvolve_spectrum_1d(&spec, &dcfg))
+        } else {
+            None
+        };
+
+        let match_imp = args
+            .get("match_impurities")
+            .and_then(Value::as_bool)
+            .unwrap_or(solvent_opt.is_some());
+        let mut impurity_hits = Vec::new();
+        if match_imp {
+            if let Some(ref solv) = solvent_opt {
+                let nuc = spec.experiment.nucleus();
+                for pk in picked.iter().take(64) {
+                    for m in match_trace_impurities(solv, &nuc, pk.ppm, 0.03) {
+                        impurity_hits.push(json!({
+                            "observed_ppm": pk.ppm,
+                            "compound": m.entry.compound,
+                            "site": m.entry.site,
+                            "reference_ppm": m.entry.ppm,
+                            "delta_ppm": m.delta_ppm,
+                        }));
+                    }
+                }
+            }
+        }
+
+        let mut multiplet_reports = Vec::new();
+        let mut reported_signals = Vec::new();
+        if let Some(reg_arr) = args.get("multiplet_regions").and_then(Value::as_array) {
+            let ppm_vec: Vec<f64> = (0..spec.len()).map(|i| spec.ppm_at(i)).collect();
+            let mcfg = MultipletConfig::default();
+            for (idx, item) in reg_arr.iter().enumerate() {
+                let Some(obj) = item.as_object() else {
+                    return McpCallToolResult::domain_error(
+                        "invalid_arguments",
+                        format!("multiplet_regions[{idx}] must be a JSON object"),
+                    );
+                };
+                let (Some(lo), Some(hi)) = (
+                    obj.get("low_ppm")
+                        .and_then(Value::as_f64)
+                        .filter(|v| v.is_finite()),
+                    obj.get("high_ppm")
+                        .and_then(Value::as_f64)
+                        .filter(|v| v.is_finite()),
+                ) else {
+                    return McpCallToolResult::domain_error(
+                        "invalid_arguments",
+                        format!(
+                            "multiplet_regions[{idx}] requires finite 'low_ppm' and 'high_ppm'"
+                        ),
+                    );
+                };
+                let proton_count = obj
+                    .get("proton_count")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize);
+                let label = obj.get("label").and_then(Value::as_str).map(str::to_string);
+                match analyze_multiplet_region(
+                    &ppm_vec,
+                    &spec.real,
+                    lo,
+                    hi,
+                    spec.axis.obs_mhz,
+                    &mcfg,
+                ) {
+                    Ok(ana) => {
+                        reported_signals.push(ReportedSignal::from_analysis(
+                            &ana,
+                            proton_count,
+                            label.clone(),
+                        ));
+                        multiplet_reports.push(json!({
+                            "label": label,
+                            "center_ppm": ana.center_ppm,
+                            "range_ppm": [ana.range_ppm.0, ana.range_ppm.1],
+                            "class": format!("{:?}", ana.class),
+                            "couplings_hz": ana.couplings.iter().map(|c| c.j_hz).collect::<Vec<_>>(),
+                            "proton_count": proton_count,
+                        }));
+                    }
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "multiplet_analysis_error",
+                            format!("{e}"),
+                        );
+                    }
+                }
+            }
+        }
+
+        let journal_report = if !reported_signals.is_empty() {
+            let style = match args
+                .get("journal_style")
+                .and_then(Value::as_str)
+                .unwrap_or("acs")
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "joc" => PublicationStyle::Joc,
+                "rsc" => PublicationStyle::Rsc,
+                "nature" => PublicationStyle::Nature,
+                _ => PublicationStyle::Acs,
+            };
+            let report_nuc = ReportNucleus::from_ascii_token(spec.experiment.nucleus().as_str())
+                .unwrap_or(ReportNucleus::H1);
+            let jrep = JournalNmrReport {
+                nucleus: report_nuc,
+                proton_decoupled: matches!(
+                    spec.experiment,
+                    crate::nmr1d::Experiment1DKind::Carbon13Decoupled
+                ),
+                mhz: spec.axis.obs_mhz,
+                solvent: solvent_opt.clone().unwrap_or_else(|| "CDCl3".to_string()),
+                signals: reported_signals,
+            };
+            Some(format_journal_nmr_report(&jrep, style, TextEncoding::Ascii))
+        } else {
+            None
+        };
+
+        McpCallToolResult::ok_json(&json!({
+            "path": self.policy.relativize_display_path(&resolved),
+            "name": spec.name,
+            "nucleus": spec.experiment.nucleus().as_str(),
+            "obs_mhz": spec.axis.obs_mhz,
+            "n_points": spec.len(),
+            "solvent": solvent_opt,
+            "calibration_offset_ppm": calibration_offset_ppm,
+            "noise_sigma": noise_sigma,
+            "picked_peak_count": picked.len(),
+            "deconvolved_peak_count": deconv_opt.as_ref().map(|d| d.peaks.len()),
+            "deconvolved_peaks": deconv_opt.as_ref().map(|d| &d.peaks),
+            "residual_rmsd": deconv_opt.as_ref().map(|d| d.residual_rmsd),
+            "impurity_matches": impurity_hits,
+            "multiplets": multiplet_reports,
+            "journal_report_ascii": journal_report,
+        }))
+    }
+
+    fn tool_fit_dosy_diffusion(&self, args: &Map<String, Value>) -> McpCallToolResult {
+        let Some(raw_path) = args.get("path").and_then(Value::as_str) else {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "missing required string argument 'path'",
+            );
+        };
+        let resolved = match self.policy.resolve_sandboxed_path(raw_path) {
+            Ok(p) => p,
+            Err(sec) => return sec.to_tool_error_result(),
+        };
+
+        let solvent = match parse_dosy_solvent_arg(
+            args.get("solvent").and_then(Value::as_str).unwrap_or("D2O"),
+        ) {
+            Ok(s) => s,
+            Err(e) => return McpCallToolResult::domain_error("invalid_arguments", e),
+        };
+        let temperature_k = args
+            .get("temperature_k")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 150.0 && *v < 450.0)
+            .unwrap_or(298.15);
+        let compactness = match parse_dosy_compactness_arg(
+            args.get("compactness_class")
+                .and_then(Value::as_str)
+                .unwrap_or("small-molecule"),
+        ) {
+            Ok(c) => c,
+            Err(e) => return McpCallToolResult::domain_error("invalid_arguments", e),
+        };
+
+        if resolved.is_dir() {
+            let exp_params = match read_bruker_dosy_dir(&resolved, &BrukerDosyOverrides::default())
+                .or_else(|_| read_varian_dosy_dir(&resolved, &VarianDosyOverrides::default()))
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    return McpCallToolResult::domain_error("dosy_parse_error", format!("{e}"));
+                }
+            };
+            return McpCallToolResult::ok_json(&json!({
+                "path": self.policy.relativize_display_path(&resolved),
+                "mode": "directory_schedule",
+                "n_gradient_steps": exp_params.b_values_s_m2.len(),
+                "b_values_s_m2": exp_params.b_values_s_m2,
+                "experiment_params": exp_params,
+            }));
+        }
+
+        let text = match fs::read_to_string(&resolved) {
+            Ok(t) => t,
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "io_error",
+                    format!("failed to read DOSY dataset JSON: {e}"),
+                );
+            }
+        };
+        let parsed: McpDosyInputJson = match serde_json::from_str(&text) {
+            Ok(d) => d,
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "dosy_parse_error",
+                    format!("invalid DOSY JSON payload: {e}"),
+                );
+            }
+        };
+        let b_values = match parsed.resolve_b_values() {
+            Ok(b) => b,
+            Err(e) => return McpCallToolResult::domain_error("dosy_physics_error", e),
+        };
+        if parsed.peaks.is_empty() {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "DOSY JSON dataset contains zero peak decay traces",
+            );
+        }
+
+        let max_components = args
+            .get("max_components")
+            .and_then(Value::as_u64)
+            .unwrap_or(2)
+            .clamp(1, 3) as usize;
+        let criterion = match args
+            .get("criterion")
+            .and_then(Value::as_str)
+            .unwrap_or("bic")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "aic" => ModelSelectionCriterion::Aic,
+            "bic" => ModelSelectionCriterion::Bic,
+            other => {
+                return McpCallToolResult::domain_error(
+                    "invalid_arguments",
+                    format!("unsupported DOSY criterion '{other}' (expected 'bic' or 'aic')"),
+                );
+            }
+        };
+        let bootstrap_samples = args
+            .get("bootstrap_samples")
+            .and_then(Value::as_u64)
+            .unwrap_or(64)
+            .min(500) as usize;
+        let rng_seed = args
+            .get("seed")
+            .and_then(Value::as_u64)
+            .unwrap_or(20_261_404);
+        let include_ilt = args
+            .get("include_ilt")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let fit_cfg = DosyFitConfig {
+            max_components,
+            criterion,
+            bootstrap_samples,
+            rng_seed,
+            ..DosyFitConfig::default()
+        };
+        let ilt_cfg = IltConfig::default();
+
+        let mut peak_reports = Vec::with_capacity(parsed.peaks.len());
+        for pk in &parsed.peaks {
+            let sel = match fit_stejskal_tanner_multi(&b_values, &pk.intensities, &fit_cfg) {
+                Ok(s) => s,
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "dosy_fit_error",
+                        format!("peak '{}': {e}", pk.label),
+                    );
+                }
+            };
+            let mut comps = Vec::with_capacity(sel.best_fit.components.len());
+            for (c_idx, comp) in sel.best_fit.components.iter().enumerate() {
+                let hydro =
+                    estimate_hydrodynamics(comp.d_m2_s, solvent, temperature_k, compactness).ok();
+                comps.push(json!({
+                    "component_index": c_idx,
+                    "amplitude": comp.amplitude,
+                    "fraction": comp.fraction,
+                    "d_m2_s": comp.d_m2_s,
+                    "log10_d": comp.log10_d,
+                    "ci95_d_m2_s": comp.ci95_d_m2_s,
+                    "r_h_angstrom": hydro.as_ref().map(|h| h.r_h_angstrom),
+                    "estimated_mw_da": hydro.as_ref().map(|h| h.estimated_mw_da),
+                }));
+            }
+            let ilt_summary = if include_ilt {
+                match solve_tikhonov_ilt(&b_values, &pk.intensities, &ilt_cfg) {
+                    Ok(ilt) => Some(json!({
+                        "selected_lambda": ilt.selected_lambda,
+                        "modes": ilt.modes,
+                        "caveat": ilt.caveat,
+                    })),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "dosy_ilt_error",
+                            format!("peak '{}': {e}", pk.label),
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+            peak_reports.push(json!({
+                "label": pk.label,
+                "center_ppm": pk.center_ppm,
+                "selected_k": sel.selected_k,
+                "bic": sel.best_fit.bic,
+                "aic": sel.best_fit.aic,
+                "rmse": sel.best_fit.rmse,
+                "components": comps,
+                "ilt": ilt_summary,
+            }));
+        }
+
+        McpCallToolResult::ok_json(&json!({
+            "path": self.policy.relativize_display_path(&resolved),
+            "solvent": solvent.label(),
+            "temperature_k": temperature_k,
+            "compactness_class": compactness.label(),
+            "n_gradient_steps": b_values.len(),
+            "n_peaks": peak_reports.len(),
+            "ilt_caveat": include_ilt.then_some(ILT_ARTIFACT_CAVEAT),
+            "peaks": peak_reports,
+        }))
+    }
+
+    fn tool_run_metabolomics_chemometrics(&self, args: &Map<String, Value>) -> McpCallToolResult {
+        let Some(raw_path) = args.get("path").and_then(Value::as_str) else {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "missing required string argument 'path'",
+            );
+        };
+        let resolved = match self.policy.resolve_sandboxed_path(raw_path) {
+            Ok(p) => p,
+            Err(sec) => return sec.to_tool_error_result(),
+        };
+
+        let samples = match self.load_sandboxed_metabolomics_cohort(&resolved) {
+            Ok(s) => s,
+            Err(err_res) => return err_res,
+        };
+        if samples.len() < 4 {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                format!(
+                    "metabolomics cohort requires at least 4 samples for PCA/OPLS-DA, got {}",
+                    samples.len()
+                ),
+            );
+        }
+
+        let mask_preset = match args
+            .get("mask_preset")
+            .and_then(Value::as_str)
+            .unwrap_or("urine")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "none" => BiofluidMaskPreset::None,
+            "aqueous-minimal" | "aqueous" => BiofluidMaskPreset::AqueousMinimal,
+            "serum-plasma" | "serum" | "plasma" => BiofluidMaskPreset::SerumPlasma,
+            "urine" => BiofluidMaskPreset::Urine,
+            other => {
+                return McpCallToolResult::domain_error(
+                    "invalid_arguments",
+                    format!(
+                        "unsupported mask_preset '{other}' (expected 'urine', 'serum-plasma', 'aqueous-minimal', or 'none')"
+                    ),
+                );
+            }
+        };
+
+        let bucketing = match args
+            .get("bucketing")
+            .and_then(Value::as_str)
+            .unwrap_or("adaptive-intelligent")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "adaptive-intelligent" | "aib" | "ai-binning" => BucketingMethod::default(),
+            "uniform" => {
+                let w = args
+                    .get("bin_width_ppm")
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite() && *v >= 0.002 && *v <= 0.5)
+                    .unwrap_or(0.04);
+                BucketingMethod::Uniform {
+                    bin_width_ppm: w,
+                    min_bucket_snr: 0.0,
+                }
+            }
+            other => {
+                return McpCallToolResult::domain_error(
+                    "invalid_arguments",
+                    format!(
+                        "unsupported bucketing '{other}' (expected 'adaptive-intelligent' or 'uniform')"
+                    ),
+                );
+            }
+        };
+
+        let normalization = match args
+            .get("normalization")
+            .and_then(Value::as_str)
+            .unwrap_or("pqn")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "pqn" | "probabilistic-quotient" => NormalizationMethod::ProbabilisticQuotient,
+            "tsa" | "total-area" => NormalizationMethod::TotalSpectralArea,
+            "internal-standard" | "tsp" | "dss" => NormalizationMethod::InternalStandard {
+                target_ppm: 0.0,
+                half_window_ppm: 0.08,
+            },
+            "none" => NormalizationMethod::None,
+            other => {
+                return McpCallToolResult::domain_error(
+                    "invalid_arguments",
+                    format!(
+                        "unsupported normalization '{other}' (expected 'pqn', 'tsa', 'internal-standard', or 'none')"
+                    ),
+                );
+            }
+        };
+
+        let scaling = match args
+            .get("scaling")
+            .and_then(Value::as_str)
+            .unwrap_or("pareto")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "pareto" => ScalingMethod::Pareto,
+            "uv" | "unit-variance" => ScalingMethod::UnitVariance,
+            "mean" | "mean-center" => ScalingMethod::MeanCenter,
+            "none" => ScalingMethod::None,
+            other => {
+                return McpCallToolResult::domain_error(
+                    "invalid_arguments",
+                    format!(
+                        "unsupported scaling '{other}' (expected 'pareto', 'uv', 'mean', or 'none')"
+                    ),
+                );
+            }
+        };
+
+        let pca_components = args
+            .get("pca_components")
+            .and_then(Value::as_u64)
+            .unwrap_or(3)
+            .clamp(1, 10) as usize;
+        let opls_orthogonal_components = args
+            .get("opls_orthogonal_components")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .clamp(1, 5) as usize;
+        let cv_folds = args
+            .get("cv_folds")
+            .and_then(Value::as_u64)
+            .unwrap_or(5)
+            .clamp(2, 10) as usize;
+        let n_permutations = args
+            .get("permutations")
+            .and_then(Value::as_u64)
+            .unwrap_or(40)
+            .clamp(5, 500) as usize;
+        let rng_seed = args
+            .get("seed")
+            .and_then(Value::as_u64)
+            .unwrap_or(20_261_405);
+        let top_k = args
+            .get("top_k_biomarkers")
+            .and_then(Value::as_u64)
+            .unwrap_or(10)
+            .clamp(1, 50) as usize;
+
+        let cfg = MetabolomicsPipelineConfig {
+            mask_preset,
+            bucketing,
+            normalization,
+            scaling,
+            pca_components,
+            opls_orthogonal_components,
+            cv_folds,
+            n_permutations,
+            rng_seed,
+            ..MetabolomicsPipelineConfig::default()
+        };
+
+        let study = run_metabolomics_pipeline(&samples, &cfg);
+        let driver_ppm_opt = args
+            .get("stocsy_driver_ppm")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite())
+            .or_else(|| study.biomarkers.first().map(|b| b.center_ppm))
+            .or_else(|| study.buckets.first().map(|b| b.center_ppm));
+
+        let stocsy_summary = driver_ppm_opt
+            .and_then(|drv| compute_stocsy_at_ppm(drv, &study))
+            .map(|st| {
+                let mut hits: Vec<Value> = study
+                    .buckets
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, b)| {
+                        let r2 = st.bucket_r2.get(i).copied().unwrap_or(0.0);
+                        (r2 >= 0.50).then(|| {
+                            json!({
+                                "bucket_index": i,
+                                "center_ppm": b.center_ppm,
+                                "correlation": st.bucket_correlation.get(i).copied().unwrap_or(0.0),
+                                "r2": r2,
+                                "covariance": st.bucket_covariance.get(i).copied().unwrap_or(0.0),
+                            })
+                        })
+                    })
+                    .collect();
+                hits.truncate(20);
+                json!({
+                    "driver_bucket_index": st.driver_bucket_index,
+                    "driver_ppm": st.driver_ppm,
+                    "covarying_buckets_r2_ge_0_50": hits,
+                    "bmrb_metabolite_matches": st.metabolite_matches.iter().take(5).collect::<Vec<_>>(),
+                })
+            });
+
+        let top_biomarkers: Vec<_> = study.biomarkers.iter().take(top_k).cloned().collect();
+
+        McpCallToolResult::ok_json(&json!({
+            "path": self.policy.relativize_display_path(&resolved),
+            "n_samples": study.sample_ids.len(),
+            "n_buckets": study.buckets.len(),
+            "pca": {
+                "explained_variance_ratio": study.pca.explained_variance_ratio,
+                "hotelling_t2_limit_95": study.pca.hotelling_t2_limit_95,
+                "q_residual_limit_95": study.pca.q_residual_limit_95,
+            },
+            "opls_da": study.opls_da.as_ref().map(|o| json!({
+                "control_group": o.control_group,
+                "case_group": o.case_group,
+                "r2_x_predictive": o.r2_x_predictive,
+                "r2_x_orthogonal": o.r2_x_orthogonal,
+                "r2_y": o.r2_y,
+                "q2": o.q2,
+                "permutation_p_value_q2": o.permutation.p_value_q2,
+                "is_validated": o.permutation.is_validated,
+            })),
+            "top_biomarkers": top_biomarkers,
+            "stocsy": stocsy_summary,
+        }))
+    }
+
+    fn load_sandboxed_metabolomics_cohort(
+        &self,
+        resolved: &Path,
+    ) -> Result<Vec<CohortSample1D>, McpCallToolResult> {
+        let text = fs::read_to_string(resolved).map_err(|e| {
+            McpCallToolResult::domain_error(
+                "io_error",
+                format!("failed to read metabolomics cohort file: {e}"),
+            )
+        })?;
+        let is_json = resolved
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            || text.trim_start().starts_with('[')
+            || text.trim_start().starts_with('{');
+        if is_json {
+            if let Ok(samples) = serde_json::from_str::<Vec<CohortSample1D>>(&text) {
+                return Ok(samples);
+            }
+            let val: Value = serde_json::from_str(&text).map_err(|e| {
+                McpCallToolResult::domain_error(
+                    "metabolomics_parse_error",
+                    format!("invalid metabolomics cohort JSON: {e}"),
+                )
+            })?;
+            if let Some(arr) = val.get("samples") {
+                let samples: Vec<CohortSample1D> =
+                    serde_json::from_value(arr.clone()).map_err(|e| {
+                        McpCallToolResult::domain_error(
+                            "metabolomics_parse_error",
+                            format!("invalid 'samples' array in cohort JSON: {e}"),
+                        )
+                    })?;
+                return Ok(samples);
+            }
+            return Err(McpCallToolResult::domain_error(
+                "metabolomics_parse_error",
+                "JSON cohort file must be an array of CohortSample1D or contain a 'samples' array",
+            ));
+        }
+
+        // Manifest TSV: `sample_id\tgroup\tpath` — every referenced path MUST pass sandbox resolution!
+        let parent_dir = resolved.parent();
+        let mut samples = Vec::new();
+        for (line_idx, raw_line) in text.lines().enumerate() {
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let cols: Vec<&str> = trimmed.split('\t').map(str::trim).collect();
+            if line_idx == 0
+                && cols.len() >= 3
+                && (cols[0].eq_ignore_ascii_case("sample_id") || cols[0].eq_ignore_ascii_case("id"))
+            {
+                continue;
+            }
+            if cols.len() < 3 {
+                return Err(McpCallToolResult::domain_error(
+                    "metabolomics_parse_error",
+                    format!(
+                        "manifest line {} requires 3 tab-separated columns (sample_id, group, path)",
+                        line_idx + 1
+                    ),
+                ));
+            }
+            let sample_id = cols[0];
+            let group = cols[1];
+            let raw_spec_path = cols[2];
+
+            // Validate lexical components directly on the manifest entry first so `..` or credential
+            // segments inside a manifest are always caught even when joined with `parent_dir`.
+            if let Err(sec) = validate_lexical_components(Path::new(raw_spec_path)) {
+                return Err(sec.to_tool_error_result());
+            }
+            let candidate_str = if Path::new(raw_spec_path).is_absolute() {
+                raw_spec_path.to_string()
+            } else if let Some(pdir) = parent_dir {
+                pdir.join(raw_spec_path).to_string_lossy().into_owned()
+            } else {
+                raw_spec_path.to_string()
+            };
+            let resolved_spec = match self.policy.resolve_sandboxed_path(&candidate_str) {
+                Ok(p) => p,
+                Err(sec) => return Err(sec.to_tool_error_result()),
+            };
+            let spec = load_processed_spectrum_1d(&resolved_spec, None).map_err(|e| {
+                McpCallToolResult::domain_error(
+                    "nmr1d_load_error",
+                    format!("sample '{sample_id}': {e}"),
+                )
+            })?;
+            samples.push(CohortSample1D::new(sample_id, group, spec));
+        }
+        Ok(samples)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct McpDosyPeakJson {
+    label: String,
+    center_ppm: f64,
+    intensities: Vec<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct McpDosyInputJson {
+    #[serde(default)]
+    b_values_s_m2: Vec<f64>,
+    #[serde(default)]
+    gradients_g_per_cm: Vec<f64>,
+    #[serde(default)]
+    big_delta_s: Option<f64>,
+    #[serde(default)]
+    little_delta_s: Option<f64>,
+    #[serde(default)]
+    tau_s: Option<f64>,
+    peaks: Vec<McpDosyPeakJson>,
+}
+
+impl McpDosyInputJson {
+    fn resolve_b_values(&self) -> Result<Vec<f64>, String> {
+        if !self.b_values_s_m2.is_empty() {
+            return Ok(self.b_values_s_m2.clone());
+        }
+        if self.gradients_g_per_cm.is_empty() {
+            return Err(
+                "DOSY JSON requires non-empty 'b_values_s_m2' or 'gradients_g_per_cm'".to_string(),
+            );
+        }
+        let big_delta_s = self
+            .big_delta_s
+            .ok_or_else(|| "missing 'big_delta_s' when computing b-values".to_string())?;
+        let little_delta_s = self
+            .little_delta_s
+            .ok_or_else(|| "missing 'little_delta_s' when computing b-values".to_string())?;
+        compute_b_values_s_m2(
+            &self.gradients_g_per_cm,
+            DosyNucleus::H1,
+            DosySequenceType::Ste,
+            GradientShape::Rectangular,
+            big_delta_s,
+            little_delta_s,
+            self.tau_s.unwrap_or(0.0),
+        )
+        .map_err(|e| format!("{e}"))
+    }
+}
+
+fn parse_dosy_solvent_arg(raw: &str) -> Result<DosySolvent, String> {
+    match raw
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_'], "")
+        .as_str()
+    {
+        "d2o" => Ok(DosySolvent::D2O),
+        "h2o" => Ok(DosySolvent::H2O),
+        "cdcl3" => Ok(DosySolvent::CDCl3),
+        "dmsod6" | "dmso" => Ok(DosySolvent::DmsoD6),
+        "cd3od" | "meod" => Ok(DosySolvent::CD3OD),
+        "cd3cn" => Ok(DosySolvent::CD3CN),
+        _ => Err(format!(
+            "unsupported DOSY solvent '{raw}' (expected D2O, H2O, CDCl3, DMSO-d6, CD3OD, or CD3CN)"
+        )),
+    }
+}
+
+fn parse_dosy_compactness_arg(raw: &str) -> Result<SoluteCompactnessClass, String> {
+    match raw
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_', ' '], "")
+        .as_str()
+    {
+        "smallmolecule" | "small" => Ok(SoluteCompactnessClass::SmallMolecule),
+        "globularprotein" | "globular" | "protein" => Ok(SoluteCompactnessClass::GlobularProtein),
+        "expandedpolymer" | "polymer" | "idp" => Ok(SoluteCompactnessClass::ExpandedPolymer),
+        _ => Err(format!(
+            "unsupported compactness_class '{raw}' (expected 'small-molecule', 'globular-protein', or 'expanded-polymer')"
+        )),
+    }
+}
+
+fn parse_assigned_apo_peaks_tsv(text: &str) -> Result<Vec<AssignedAmidePeak>, String> {
+    let mut out = Vec::new();
+    for (line_idx, raw_line) in text.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed.split('\t').map(str::trim).collect();
+        if line_idx == 0
+            && cols.first().is_some_and(|c| {
+                c.eq_ignore_ascii_case("seq_id") || c.eq_ignore_ascii_case("residue")
+            })
+        {
+            continue;
+        }
+        if cols.len() < 4 {
+            return Err(format!(
+                "apo_peaks_path line {} requires 4 tab columns (seq_id, res_name, h_ppm, n_ppm)",
+                line_idx + 1
+            ));
+        }
+        let seq_id: i32 = cols[0]
+            .parse()
+            .map_err(|_| format!("invalid seq_id '{}' on line {}", cols[0], line_idx + 1))?;
+        let res_name = cols[1].to_ascii_uppercase();
+        let h_ppm: f64 = cols[2]
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| format!("invalid h_ppm '{}' on line {}", cols[2], line_idx + 1))?;
+        let n_ppm: f64 = cols[3]
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| format!("invalid n_ppm '{}' on line {}", cols[3], line_idx + 1))?;
+        out.push(AssignedAmidePeak {
+            seq_index: out.len(),
+            seq_id,
+            res_name,
+            h_ppm,
+            n_ppm,
+        });
+    }
+    Ok(out)
 }
 
 /// Top-level synchronous JSON-RPC 2.0 MCP request dispatcher (`T15.1`).
@@ -2297,8 +3661,75 @@ pub fn handle_mcp_json_request(server: &mut McpServer, raw_json: &str) -> Option
     server.handle_json_request(raw_json)
 }
 
+/// Maximum single HTTP header or request line length (`16 KiB`) read prior to rejection.
+pub const MAX_MCP_HEADER_LINE_BYTES: usize = 16 * 1024;
+/// Maximum number of HTTP or MIME header lines accepted per request (`128`).
+pub const MAX_MCP_HEADER_COUNT: usize = 128;
+
+/// Classification of an HTTP or `stdio` `Content-Length` header value evaluated strictly
+/// before any payload buffer allocation (`0` panics, immune to `usize` overflow).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentLengthError {
+    Malformed,
+    ExceedsLimit { max_bytes: usize },
+}
+
+/// Parse a decimal `Content-Length` string digit-by-digit and enforce `<= max_bytes`
+/// strictly before allocating any payload buffer, distinguishing malformed/negative values
+/// (`Malformed`) from oversized or `usize`-overflowing values (`ExceedsLimit`).
+pub fn parse_bounded_content_length(
+    raw: &str,
+    max_bytes: usize,
+) -> Result<usize, ContentLengthError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ContentLengthError::Malformed);
+    }
+    let mut acc: usize = 0;
+    for b in trimmed.bytes() {
+        let digit = (b - b'0') as usize;
+        acc = acc
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(digit))
+            .ok_or(ContentLengthError::ExceedsLimit { max_bytes })?;
+        if acc > max_bytes {
+            return Err(ContentLengthError::ExceedsLimit { max_bytes });
+        }
+    }
+    Ok(acc)
+}
+
+/// Read at most `max_bytes + 1` bytes up to `\n` so an unterminated or oversized line
+/// cannot trigger unbounded memory growth before size validation.
+pub fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+    max_bytes: usize,
+) -> io::Result<(usize, bool)> {
+    buf.clear();
+    let cap = (max_bytes as u64).saturating_add(1);
+    let n = reader.take(cap).read_line(buf)?;
+    let exceeded = buf.len() > max_bytes;
+    if exceeded && !buf.ends_with('\n') {
+        loop {
+            let avail = reader.fill_buf()?;
+            if avail.is_empty() {
+                break;
+            }
+            if let Some(nl_pos) = avail.iter().position(|&b| b == b'\n') {
+                reader.consume(nl_pos + 1);
+                break;
+            }
+            let take_len = avail.len();
+            reader.consume(take_len);
+        }
+    }
+    Ok((n, exceeded))
+}
+
 /// Run the MCP `stdio` message loop over any `BufRead` + `Write` pair, transparently supporting
-/// both newline-delimited JSON-RPC (`{...}\n`) and `Content-Length: <N>\r\n\r\n{...}` framing.
+/// both newline-delimited JSON-RPC (`{...}\n`) and `Content-Length: <N>\r\n\r\n{...}` framing
+/// with strict pre-allocation frame size enforcement (`MAX_MCP_FRAME_BYTES`).
 pub fn run_mcp_stdio_loop<R: BufRead, W: Write>(
     server: &mut McpServer,
     mut reader: R,
@@ -2308,12 +3739,11 @@ pub fn run_mcp_stdio_loop<R: BufRead, W: Write>(
     let mut line_buf = String::new();
 
     loop {
-        line_buf.clear();
-        let n = reader.read_line(&mut line_buf)?;
+        let (n, exceeded) = read_bounded_line(&mut reader, &mut line_buf, MAX_MCP_FRAME_BYTES)?;
         if n == 0 {
             break; // Clean EOF
         }
-        if line_buf.len() > MAX_MCP_FRAME_BYTES {
+        if exceeded {
             let err_resp = JsonRpcResponse::error(
                 Value::Null,
                 ERR_INVALID_REQUEST,
@@ -2333,28 +3763,42 @@ pub fn run_mcp_stdio_loop<R: BufRead, W: Write>(
         }
 
         if let Some(len_str) = strip_ascii_prefix_ignore_case(trimmed, "content-length:") {
-            let content_len = len_str.trim().parse::<usize>().map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid Content-Length header '{trimmed}': {e}"),
-                )
-            })?;
-            if content_len > MAX_MCP_FRAME_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Content-Length {content_len} exceeds MAX_MCP_FRAME_BYTES ({MAX_MCP_FRAME_BYTES})"
-                    ),
-                ));
-            }
+            let content_len =
+                parse_bounded_content_length(len_str, MAX_MCP_FRAME_BYTES).map_err(|err| {
+                    let detail = match err {
+                        ContentLengthError::Malformed => {
+                            format!("invalid Content-Length header '{trimmed}'")
+                        }
+                        ContentLengthError::ExceedsLimit { max_bytes } => format!(
+                            "Content-Length header '{trimmed}' exceeds MAX_MCP_FRAME_BYTES ({max_bytes})"
+                        ),
+                    };
+                    io::Error::new(io::ErrorKind::InvalidData, detail)
+                })?;
+
             // Consume remaining MIME headers up to the blank `\r\n` / `\n` separator line.
+            let mut hdr_count = 0usize;
             loop {
+                hdr_count += 1;
+                if hdr_count > MAX_MCP_HEADER_COUNT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "too many MIME headers in Content-Length stdio frame",
+                    ));
+                }
                 let mut hdr_line = String::new();
-                let hn = reader.read_line(&mut hdr_line)?;
+                let (hn, hdr_exceeded) =
+                    read_bounded_line(&mut reader, &mut hdr_line, MAX_MCP_HEADER_LINE_BYTES)?;
                 if hn == 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "unexpected EOF before end of Content-Length headers",
+                    ));
+                }
+                if hdr_exceeded {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Content-Length MIME header line exceeds maximum length",
                     ));
                 }
                 if hdr_line.trim().is_empty() {
@@ -2426,8 +3870,52 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-/// Validate HTTP headers for a local loopback MCP endpoint (`127.0.0.1` / `localhost` `Host`,
-/// no cross-origin `Origin`, and constant-time `Authorization: Bearer <token>`).
+fn extract_host_without_port(raw_host: &str) -> &str {
+    let trimmed = raw_host.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some((ipv6, _tail)) = rest.split_once(']') {
+            return ipv6;
+        }
+    }
+    trimmed.split(':').next().unwrap_or("")
+}
+
+/// Validate a `--bind <addr:port>` specification and require a strict loopback IP
+/// (`127.0.0.0/8`, `[::1]`, or `localhost:<port>` -> `127.0.0.1:<port>`).
+/// Rejects `0.0.0.0`, `[::]`, LAN/WAN IPs, and external hostnames with `PermissionDenied`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn parse_loopback_bind_addr(bind: &str) -> io::Result<std::net::SocketAddr> {
+    let trimmed = bind.trim();
+    if let Some(port_str) = strip_ascii_prefix_ignore_case(trimmed, "localhost:") {
+        let port = port_str.trim().parse::<u16>().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid port in loopback bind '{trimmed}': {e}"),
+            )
+        })?;
+        return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    let addr: std::net::SocketAddr = trimmed.parse().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "invalid or non-IP bind '{trimmed}' (only loopback IPs such as 127.0.0.1:<port> or [::1]:<port> are permitted): {e}"
+            ),
+        )
+    })?;
+    if !addr.ip().is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing non-loopback HTTP bind '{addr}': MCP HTTP server must bind exclusively to loopback (127.0.0.1 or [::1])"
+            ),
+        ));
+    }
+    Ok(addr)
+}
+
+/// Validate HTTP headers for a local loopback MCP endpoint (`127.0.0.1` / `localhost` / `[::1]`
+/// `Host`, no cross-origin `Origin`, and constant-time `Authorization: Bearer <token>`).
 /// Returns `Ok(())` or `Err((http_status_code, reason))`.
 pub fn validate_loopback_http_headers(
     headers: &BTreeMap<String, String>,
@@ -2437,13 +3925,8 @@ pub fn validate_loopback_http_headers(
     let Some(host_val) = headers.get("host") else {
         return Err((403, "missing required Host header".to_string()));
     };
-    let host_only = host_val
-        .trim()
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if host_only != "127.0.0.1" && host_only != "localhost" {
+    let host_only = extract_host_without_port(host_val).to_ascii_lowercase();
+    if host_only != "127.0.0.1" && host_only != "localhost" && host_only != "::1" {
         return Err((
             403,
             format!("non-loopback Host header '{host_val}' rejected (DNS-rebinding protection)"),
@@ -2456,7 +3939,9 @@ pub fn validate_loopback_http_headers(
         let is_loopback_origin = orig_trim.starts_with("http://127.0.0.1:")
             || orig_trim == "http://127.0.0.1"
             || orig_trim.starts_with("http://localhost:")
-            || orig_trim == "http://localhost";
+            || orig_trim == "http://localhost"
+            || orig_trim.starts_with("http://[::1]:")
+            || orig_trim == "http://[::1]";
         if !is_loopback_origin {
             return Err((
                 403,
@@ -2488,15 +3973,14 @@ pub fn validate_loopback_http_headers(
     Ok(())
 }
 
-/// Handle a single synchronous HTTP connection on a loopback `127.0.0.1` `TcpStream` (`T15.1`).
+/// Handle a single synchronous HTTP connection on a loopback `TcpStream` (`T15.1`), capping header
+/// and `Content-Length` sizes strictly before any payload buffer allocation (`0` panics).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn handle_mcp_http_stream(
     server: &mut McpServer,
     mut stream: std::net::TcpStream,
     expected_bearer_token: &str,
 ) -> io::Result<()> {
-    use std::io::Read;
-
     if let Ok(peer) = stream.peer_addr() {
         if !peer.ip().is_loopback() {
             return Err(io::Error::new(
@@ -2508,7 +3992,18 @@ pub fn handle_mcp_http_stream(
 
     let mut reader = io::BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
+    let (req_bytes, req_exceeded) =
+        read_bounded_line(&mut reader, &mut request_line, MAX_MCP_HEADER_LINE_BYTES)?;
+    if req_bytes == 0 {
+        return Ok(());
+    }
+    if req_exceeded {
+        write_http_response(
+            &mut stream,
+            413,
+            "Payload Too Large",
+            r#"{"error":"request line exceeds maximum length"}"#,
+        )?;
         return Ok(());
     }
     let parts: Vec<&str> = request_line.split_whitespace().collect();
@@ -2524,14 +4019,51 @@ pub fn handle_mcp_http_stream(
     let method = parts[0];
 
     let mut headers = BTreeMap::new();
+    let mut duplicate_host = false;
+    let mut header_count = 0usize;
     loop {
+        header_count += 1;
+        if header_count > MAX_MCP_HEADER_COUNT {
+            write_http_response(
+                &mut stream,
+                400,
+                "Bad Request",
+                r#"{"error":"too many HTTP headers"}"#,
+            )?;
+            return Ok(());
+        }
         let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 || line.trim().is_empty() {
+        let (hb, h_exceeded) =
+            read_bounded_line(&mut reader, &mut line, MAX_MCP_HEADER_LINE_BYTES)?;
+        if hb == 0 || line.trim().is_empty() {
             break;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        if h_exceeded {
+            write_http_response(
+                &mut stream,
+                413,
+                "Payload Too Large",
+                r#"{"error":"HTTP header line exceeds maximum length"}"#,
+            )?;
+            return Ok(());
         }
+        if let Some((k, v)) = line.split_once(':') {
+            let key_lower = k.trim().to_ascii_lowercase();
+            if key_lower == "host" && headers.contains_key("host") {
+                duplicate_host = true;
+            }
+            headers.insert(key_lower, v.trim().to_string());
+        }
+    }
+
+    if duplicate_host {
+        write_http_response(
+            &mut stream,
+            403,
+            "Forbidden",
+            r#"{"error":"duplicate Host header rejected"}"#,
+        )?;
+        return Ok(());
     }
 
     if let Err((status, reason)) = validate_loopback_http_headers(&headers, expected_bearer_token) {
@@ -2555,19 +4087,30 @@ pub fn handle_mcp_http_stream(
         return Ok(());
     }
 
-    let content_len = headers
-        .get("content-length")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-    if content_len > MAX_MCP_FRAME_BYTES {
-        write_http_response(
-            &mut stream,
-            413,
-            "Payload Too Large",
-            r#"{"error":"payload exceeds MAX_MCP_FRAME_BYTES"}"#,
-        )?;
-        return Ok(());
-    }
+    let content_len = match headers.get("content-length") {
+        None => 0usize,
+        Some(raw_len) => match parse_bounded_content_length(raw_len, MAX_MCP_FRAME_BYTES) {
+            Ok(n) => n,
+            Err(ContentLengthError::Malformed) => {
+                write_http_response(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    r#"{"error":"invalid Content-Length header"}"#,
+                )?;
+                return Ok(());
+            }
+            Err(ContentLengthError::ExceedsLimit { .. }) => {
+                write_http_response(
+                    &mut stream,
+                    413,
+                    "Payload Too Large",
+                    r#"{"error":"payload exceeds MAX_MCP_FRAME_BYTES"}"#,
+                )?;
+                return Ok(());
+            }
+        },
+    };
 
     let mut body = vec![0u8; content_len];
     reader.read_exact(&mut body)?;
@@ -2589,6 +4132,44 @@ pub fn handle_mcp_http_stream(
         None => write_http_response(&mut stream, 202, "Accepted", "")?,
     }
     Ok(())
+}
+
+/// Bind a synchronous loopback MCP Streamable HTTP server on `bind_spec` (`127.0.0.1:<port>` or
+/// `[::1]:<port>`), enforcing non-empty bearer-token authentication and optionally stopping after
+/// `max_requests` connections (for deterministic CLI/integration tests).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run_mcp_http_server(
+    server: &mut McpServer,
+    bind_spec: &str,
+    expected_bearer_token: &str,
+    max_requests: Option<usize>,
+) -> io::Result<std::net::SocketAddr> {
+    if expected_bearer_token.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MCP HTTP transport requires a non-empty --token <bearer>",
+        ));
+    }
+    let bind_addr = parse_loopback_bind_addr(bind_spec)?;
+    let listener = std::net::TcpListener::bind(bind_addr)?;
+    let local_addr = listener.local_addr()?;
+
+    let mut served = 0usize;
+    if max_requests == Some(0) {
+        return Ok(local_addr);
+    }
+    for stream in listener.incoming().flatten() {
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
+        let _ = handle_mcp_http_stream(server, stream, expected_bearer_token);
+        served += 1;
+        if let Some(limit) = max_requests {
+            if served >= limit {
+                break;
+            }
+        }
+    }
+    Ok(local_addr)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2706,6 +4287,32 @@ fn builtin_prompt_descriptors() -> Vec<McpPromptDescriptor> {
                 },
             ],
         },
+        McpPromptDescriptor {
+            name: "analyze-metabolomics-cohort".to_string(),
+            description: "Guided untargeted 1D NMR biofluid metabolomics workflow covering solvent/urea masking, AI-Binning, PQN normalization, PCA outlier screening, leak-free OPLS-DA permutation validation, and STOCSY CC0 BMRB matching.".to_string(),
+            arguments: vec![
+                McpPromptArgument {
+                    name: "workspace_path".to_string(),
+                    description: "Workspace directory containing cohort JSON/TSV manifest and 1D spectra.".to_string(),
+                    required: true,
+                },
+                McpPromptArgument {
+                    name: "cohort_path".to_string(),
+                    description: "Relative path to the cohort JSON or manifest TSV (default: 'cohort.json').".to_string(),
+                    required: false,
+                },
+                McpPromptArgument {
+                    name: "biofluid".to_string(),
+                    description: "Biofluid exclusion mask preset ('urine', 'serum-plasma', or 'aqueous-minimal').".to_string(),
+                    required: false,
+                },
+                McpPromptArgument {
+                    name: "driver_ppm".to_string(),
+                    description: "Optional 1H chemical shift in ppm for STOCSY spin-system structural correlation.".to_string(),
+                    required: false,
+                },
+            ],
+        },
     ]
 }
 
@@ -2811,6 +4418,27 @@ fn build_spectroscopist_prompt(
                         2. Verify locked-shape plane integration uncertainties from per-plane MAD noise and duplicate-delay/offset replicates.\n\
                         3. For `CPMG`, screen each residue against the flat null model (`AIC`/`BIC` and $\\Delta R_{{2,\\text{{eff}}}} \\ge 2.0\\text{{ s}}^{{-1}}$) before global Baldwin-2014 fitting across static fields ({fields} MHz) to resolve slow-vs-fast exchange $\\alpha$-scaling.\n\
                         4. For `CEST`/`DEST`, integrate the homogeneous Bloch-McConnell matrix exponential across dual $B_1$ nutation fields, inspect `(p_B, k_ex)` $\\chi^2$ surface identifiability, and compare excited-state shifts $\\Delta\\varpi_{{AB}}$ against homolog-firewalled torsion/random-coil hypotheses (`predict_homolog_free_torsions`)."
+                    )),
+                }],
+            })
+        }
+        "analyze-metabolomics-cohort" => {
+            let ws = require_workspace()?;
+            let cohort = get_opt("cohort_path", "cohort.json");
+            let biofluid = get_opt("biofluid", "urine");
+            let driver = get_opt("driver_ppm", "top VIP biomarker apex");
+            Ok(McpGetPromptResult {
+                description: format!(
+                    "Untargeted 1D NMR metabolomics & STOCSY workflow for '{ws}' ({biofluid}, '{cohort}')"
+                ),
+                messages: vec![McpPromptMessage {
+                    role: "user".to_string(),
+                    content: McpContentBlock::text(format!(
+                        "Conduct a reproducible untargeted 1D NMR metabolomics and chemometric analysis in workspace '{ws}' on cohort '{cohort}' (`mask_preset: '{biofluid}'`, `STOCSY` driver: {driver}).\n\
+                        1. Inspect '{ws}' with `inspect_nmr_directory` and run `run_metabolomics_chemometrics` on '{cohort}' with `mask_preset: '{biofluid}'`, `bucketing: 'adaptive-intelligent'` (De Meyer 2008 valley-seeking `AI-Binning`), `normalization: 'pqn'` (Dieterle 2006 Probabilistic Quotient Normalization), and `scaling: 'pareto'`.\n\
+                        2. Screen unsupervised `PCA` scores against the 95% Hotelling $T^2$ ellipse and Jackson-Mudholkar $Q$-residual threshold before interpreting supervised models.\n\
+                        3. Verify leak-free stratified $k$-fold `OPLS-DA` cross-validated $Q^2$ and Westerhuis (2008) label-permutation $p$-value (`is_validated == true`) so small-$N$/large-$P$ class separation is never overclaimed.\n\
+                        4. Cross-check top `VIP` / Wiklund `S-plot` / Benjamini-Hochberg `FDR` biomarkers with Cloarec (2005) `STOCSY` covarying intra-metabolite multiplets (`stocsy_driver_ppm`) matched against the CC0 `BMRB` biofluid reference library, noting matrix/pH shift caveats."
                     )),
                 }],
             })
@@ -2929,7 +4557,10 @@ pub fn generate_mcp_client_config(
                 || lower.starts_with("http://127.0.0.1/")
                 || lower.starts_with("http://localhost:")
                 || lower == "http://localhost"
-                || lower.starts_with("http://localhost/");
+                || lower.starts_with("http://localhost/")
+                || lower.starts_with("http://[::1]:")
+                || lower == "http://[::1]"
+                || lower.starts_with("http://[::1]/");
             if !is_loopback {
                 return Err(format!(
                     "HTTP bridge URL '{url}' must target loopback (http://127.0.0.1 or http://localhost)"
@@ -3140,6 +4771,308 @@ fn builtin_tool_descriptors() -> Vec<McpToolDescriptor> {
             }),
             annotations: McpToolAnnotations {
                 title: "Predict Homolog-Firewalled Torsion Restraints".to_string(),
+                read_only_hint: true,
+                destructive_hint: false,
+                idempotent_hint: true,
+                open_world_hint: false,
+            },
+        },
+        McpToolDescriptor {
+            name: "fit_relaxation_or_exchange".to_string(),
+            description: "Fit sandboxed Phase 13 15N/13C exponential R1/R2 relaxation series, 2-state Bloch-McConnell CEST/DEST profiles, or multi-field Baldwin-2014 CPMG dispersion curves.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["relaxation", "cest", "cpmg"],
+                        "description": "Kinetic or relaxation fitting family ('relaxation', 'cest', or 'cpmg')."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Sandboxed path to a relaxation TSV/NEF, CEST profile TSV, or CPMG series TSV."
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of sandboxed TSV paths for multi-field CPMG or multi-B1 CEST global fits."
+                    },
+                    "mc_replicates": {
+                        "type": "integer",
+                        "description": "Monte Carlo replicates for R1/R2 confidence intervals (default: 200)."
+                    },
+                    "cpmg_model": {
+                        "type": "string",
+                        "description": "CPMG dispersion model ('baldwin2014' default, 'cr72', 'lm63', 'numerical', or 'flat')."
+                    },
+                    "compute_chi2_surface": {
+                        "type": "boolean",
+                        "description": "Compute 2D (p_B, k_ex) chi2 profile grid for CEST (default: false)."
+                    },
+                    "seed": {
+                        "type": "integer",
+                        "description": "Deterministic PRNG seed."
+                    }
+                },
+                "required": ["mode"],
+                "additionalProperties": false
+            }),
+            annotations: McpToolAnnotations {
+                title: "Fit R1/R2 Relaxation or CEST/CPMG Exchange".to_string(),
+                read_only_hint: true,
+                destructive_hint: false,
+                idempotent_hint: true,
+                open_world_hint: false,
+            },
+        },
+        McpToolDescriptor {
+            name: "track_csp_titration".to_string(),
+            description: "Track fast-exchange 2D HSQC/HMQC chemical-shift perturbation trajectories via Kuhn-Munkres assignment and fit global 1:1 tight-binding quadratic K_d.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "apo_star_path": {
+                        "type": "string",
+                        "description": "Sandboxed NMR-STAR (.str) file providing assigned apo amide/methyl shifts."
+                    },
+                    "apo_peaks_path": {
+                        "type": "string",
+                        "description": "Alternative sandboxed 4-column assigned apo TSV (seq_id, res_name, h_ppm, n_ppm)."
+                    },
+                    "nucleus_mode": {
+                        "type": "string",
+                        "enum": ["amide", "methyl"],
+                        "description": "Heteronuclear scaling mode ('amide' 1H-15N default or 'methyl' 1H-13C)."
+                    },
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": { "type": "string" },
+                                "protein_conc_um": { "type": "number" },
+                                "ligand_conc_um": { "type": "number" },
+                                "peaks_path": { "type": "string" }
+                            },
+                            "required": ["protein_conc_um", "ligand_conc_um", "peaks_path"],
+                            "additionalProperties": false
+                        },
+                        "description": "Ordered ligand titration steps referencing sandboxed 2D peak TSV files."
+                    },
+                    "max_step_csp_ppm": {
+                        "type": "number",
+                        "description": "Maximum single-step combined shift jump in ppm (default: 0.45)."
+                    },
+                    "n_mc": {
+                        "type": "integer",
+                        "description": "Monte Carlo replicates for 95% K_d confidence intervals (default: 200)."
+                    },
+                    "seed": {
+                        "type": "integer",
+                        "description": "Deterministic PRNG seed."
+                    }
+                },
+                "required": ["steps"],
+                "additionalProperties": false
+            }),
+            annotations: McpToolAnnotations {
+                title: "Track CSP Titration & Fit Global K_d".to_string(),
+                read_only_hint: true,
+                destructive_hint: false,
+                idempotent_hint: true,
+                open_world_hint: false,
+            },
+        },
+        McpToolDescriptor {
+            name: "analyze_nmr1d_spectrum".to_string(),
+            description: "Analyze a sandboxed 1D NMR spectrum or FID (Bruker pdata/fid, JCAMP-DX, TSV, JSON): Fulmer-2010 solvent/impurity matching, pseudo-Voigt deconvolution, and Hoye J-coupling multiplet trees.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Sandboxed path to the 1D spectrum or FID directory/file."
+                    },
+                    "mhz": {
+                        "type": "number",
+                        "description": "Optional spectrometer observe frequency override in MHz."
+                    },
+                    "solvent": {
+                        "type": "string",
+                        "description": "Optional deuterated solvent ('CDCl3', 'D2O', 'DMSO-d6', 'CD3OD', etc.)."
+                    },
+                    "calibrate_solvent": {
+                        "type": "boolean",
+                        "description": "Auto-lock chemical-shift axis to residual solvent peak (default: false)."
+                    },
+                    "match_impurities": {
+                        "type": "boolean",
+                        "description": "Screen picked peaks against Fulmer-2010 trace impurities."
+                    },
+                    "deconvolve": {
+                        "type": "boolean",
+                        "description": "Run pseudo-Voigt lineshape deconvolution (default: true)."
+                    },
+                    "min_snr": {
+                        "type": "number",
+                        "description": "Minimum peak-picking SNR threshold (default: 6.0)."
+                    },
+                    "multiplet_regions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "low_ppm": { "type": "number" },
+                                "high_ppm": { "type": "number" },
+                                "proton_count": { "type": "integer" },
+                                "label": { "type": "string" }
+                            },
+                            "required": ["low_ppm", "high_ppm"],
+                            "additionalProperties": false
+                        },
+                        "description": "Optional 1H chemical-shift windows for recursive J-coupling tree extraction."
+                    },
+                    "journal_style": {
+                        "type": "string",
+                        "enum": ["acs", "joc", "rsc", "nature"],
+                        "description": "Publication report style when multiplet_regions is provided (default: 'acs')."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            annotations: McpToolAnnotations {
+                title: "Analyze 1D NMR Spectrum & Multiplets".to_string(),
+                read_only_hint: true,
+                destructive_hint: false,
+                idempotent_hint: true,
+                open_world_hint: false,
+            },
+        },
+        McpToolDescriptor {
+            name: "fit_dosy_diffusion".to_string(),
+            description: "Fit sandboxed pulsed-field-gradient DOSY diffusion decays via BIC/AIC discrete Stejskal-Tanner multi-exponential models, Stokes-Einstein R_h / MW, and opt-in Tikhonov ILT.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Sandboxed path to a Bruker/Varian DOSY directory or DOSY decay JSON file."
+                    },
+                    "solvent": {
+                        "type": "string",
+                        "description": "Solvent viscosity preset ('D2O' default, 'H2O', 'CDCl3', 'DMSO-d6', 'CD3OD', 'CD3CN')."
+                    },
+                    "temperature_k": {
+                        "type": "number",
+                        "description": "Sample temperature in Kelvin (default: 298.15)."
+                    },
+                    "compactness_class": {
+                        "type": "string",
+                        "enum": ["small-molecule", "globular-protein", "expanded-polymer"],
+                        "description": "Empirical power-law MW compactness regime (default: 'small-molecule')."
+                    },
+                    "max_components": {
+                        "type": "integer",
+                        "description": "Maximum discrete exponential components K_max in 1..=3 (default: 2)."
+                    },
+                    "criterion": {
+                        "type": "string",
+                        "enum": ["bic", "aic"],
+                        "description": "Model selection criterion (default: 'bic')."
+                    },
+                    "bootstrap_samples": {
+                        "type": "integer",
+                        "description": "Bootstrap replicates for 95% D confidence intervals (default: 64)."
+                    },
+                    "include_ilt": {
+                        "type": "boolean",
+                        "description": "Include opt-in second-derivative Tikhonov NNLS ILT distribution (default: false)."
+                    },
+                    "seed": {
+                        "type": "integer",
+                        "description": "Deterministic PRNG seed."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            annotations: McpToolAnnotations {
+                title: "Fit DOSY Diffusion & Hydrodynamic Radius".to_string(),
+                read_only_hint: true,
+                destructive_hint: false,
+                idempotent_hint: true,
+                open_world_hint: false,
+            },
+        },
+        McpToolDescriptor {
+            name: "run_metabolomics_chemometrics".to_string(),
+            description: "Run untargeted 1D NMR metabolomics chemometrics on a sandboxed cohort JSON or manifest TSV: AI-Binning, PQN normalization, Pareto PCA, leak-free OPLS-DA permutation validation, and STOCSY CC0 BMRB matching.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Sandboxed path to a cohort JSON file or 3-column manifest TSV (sample_id, group, path)."
+                    },
+                    "mask_preset": {
+                        "type": "string",
+                        "enum": ["urine", "serum-plasma", "aqueous-minimal", "none"],
+                        "description": "Biofluid solvent/water/urea exclusion mask (default: 'urine')."
+                    },
+                    "bucketing": {
+                        "type": "string",
+                        "enum": ["adaptive-intelligent", "uniform"],
+                        "description": "Spectral bucketing method ('adaptive-intelligent' AI-Binning default or 'uniform')."
+                    },
+                    "bin_width_ppm": {
+                        "type": "number",
+                        "description": "Uniform bucket width in ppm when bucketing='uniform' (default: 0.04)."
+                    },
+                    "normalization": {
+                        "type": "string",
+                        "enum": ["pqn", "tsa", "internal-standard", "none"],
+                        "description": "Sample dilution normalization ('pqn' default)."
+                    },
+                    "scaling": {
+                        "type": "string",
+                        "enum": ["pareto", "uv", "mean", "none"],
+                        "description": "Feature scaling ('pareto' default)."
+                    },
+                    "pca_components": {
+                        "type": "integer",
+                        "description": "Number of PCA components (default: 3)."
+                    },
+                    "opls_orthogonal_components": {
+                        "type": "integer",
+                        "description": "Number of orthogonal OPLS-DA components (default: 1)."
+                    },
+                    "cv_folds": {
+                        "type": "integer",
+                        "description": "Stratified cross-validation folds (default: 5)."
+                    },
+                    "permutations": {
+                        "type": "integer",
+                        "description": "Label permutation count for OPLS-DA validation (default: 40)."
+                    },
+                    "stocsy_driver_ppm": {
+                        "type": "number",
+                        "description": "Optional driver chemical shift in ppm for STOCSY covariance/correlation."
+                    },
+                    "top_k_biomarkers": {
+                        "type": "integer",
+                        "description": "Number of ranked VIP/S-plot/BH-FDR biomarkers to return (default: 10)."
+                    },
+                    "seed": {
+                        "type": "integer",
+                        "description": "Deterministic PRNG seed."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            annotations: McpToolAnnotations {
+                title: "Run 1D Metabolomics Chemometrics & STOCSY".to_string(),
                 read_only_hint: true,
                 destructive_hint: false,
                 idempotent_hint: true,

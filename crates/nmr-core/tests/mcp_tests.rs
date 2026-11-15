@@ -283,7 +283,7 @@ fn test_e2e_stdio_newline_lifecycle_and_all_read_tools() {
 
     // Response 2 (id=3): tools/list
     let tools = lines[2]["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 7);
+    assert_eq!(tools.len(), 12);
     for t in tools {
         let tname = t["name"].as_str().unwrap();
         let ro = t["annotations"]["readOnlyHint"].as_bool().unwrap();
@@ -323,7 +323,8 @@ fn test_e2e_stdio_newline_lifecycle_and_all_read_tools() {
             "triage-qc",
             "resolve-ambiguous-strips",
             "deconvolve-1d-mixture-dosy",
-            "fit-cest-cpmg-exchange"
+            "fit-cest-cpmg-exchange",
+            "analyze-metabolomics-cohort"
         ]
     );
     let triage_msg = lines[6]["result"]["messages"][0]["content"]["text"]
@@ -400,6 +401,10 @@ fn test_e2e_stdio_newline_lifecycle_and_all_read_tools() {
         (
             "fit-cest-cpmg-exchange",
             json!({"workspace_path": "cest_ws", "experiment_type": "CEST", "field_mhz": "600,800", "states": "3"}),
+        ),
+        (
+            "analyze-metabolomics-cohort",
+            json!({"workspace_path": "metab_ws", "cohort_path": "manifest.tsv", "biofluid": "urine"}),
         ),
     ] {
         let raw = handle_mcp_json_request(
@@ -718,7 +723,7 @@ fn test_read_only_denial_vs_read_write_sandboxed_mutation_success() {
     .unwrap();
     let list_val: Value = serde_json::from_str(&list_raw).unwrap();
     let visible_tools = list_val["result"]["tools"].as_array().unwrap();
-    assert_eq!(visible_tools.len(), 5);
+    assert_eq!(visible_tools.len(), 10);
     assert!(visible_tools
         .iter()
         .all(|t| t["annotations"]["readOnlyHint"] == true));
@@ -1187,4 +1192,668 @@ fn test_multi_root_sandbox_and_multiblock_png_encoding() {
     assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n");
     assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
     assert!(png.len() > 76_800);
+}
+
+#[test]
+fn test_phase13_dynamics_and_csp_mcp_tools_and_sandbox_guards() {
+    use nmr_core::cest::{
+        simulate_cest_2state_profile, write_cest_profiles_tsv, Cest2StateParams, CestNormalization,
+        CestProfileDataset,
+    };
+    use nmr_core::cpmg::{r2eff_baldwin2014, write_cpmg_series_tsv, CpmgSeriesDataset};
+    use nmr_core::peaks::Peak;
+
+    let sb = TempTestSandbox::new("phase13_mcp");
+
+    // 1. Write synthetic R1 relaxation series TSV (2 residues, true R1 = 1.65 & 2.15 s^-1)
+    let delays = [0.02, 0.06, 0.12, 0.25, 0.45, 0.70, 1.00, 1.40];
+    let mut r1_tsv = String::from(
+        "# name: r1_600\n\
+         # experiment_kind: R1\n\
+         # field_mhz: 600.130000\n\
+         # schedule_kind: vdlist\n\
+         # duplicate_variance_scale: 1.000000\n\
+         # duplicate_dof: 0\n\
+         seq_id\tres_name\tatom_h\tatom_x\tdelta_h_ppm\tdelta_x_ppm\tsigma_h_ppm\tsigma_x_ppm\teta_h\teta_x\toverlap_cluster_id\tplane_idx\tx_value\tx_extra\tintensity\tsigma_intensity\tvolume\tplane_mad\tis_duplicate\n",
+    );
+    for (seq_id, res_name, h_ppm, n_ppm, true_r1) in [
+        (10, "VAL", 8.22, 120.5, 1.65_f64),
+        (24, "GLU", 8.58, 123.1, 2.15_f64),
+    ] {
+        for (p_idx, &t) in delays.iter().enumerate() {
+            let inten = 1000.0 * (-true_r1 * t).exp();
+            r1_tsv.push_str(&format!(
+                "{seq_id}\t{res_name}\tH\tN\t{h_ppm:.5}\t{n_ppm:.5}\t0.01800\t0.14000\t0.30000\t0.30000\t0\t{p_idx}\t{t:.9}\t.\t{inten:.6e}\t5.000000e0\t{inten:.6e}\t3.000000e0\tfalse\n"
+            ));
+        }
+    }
+    fs::write(sb.workspace.join("r1_600.tsv"), &r1_tsv).unwrap();
+
+    // 2. Write synthetic dual-B1 15N CEST profiles TSV (true p_B = 0.030, k_ex = 180 s^-1, dw = +3.5 ppm)
+    let offsets_ppm: Vec<f64> = (-20..=25).map(|i| 118.0 + 0.25 * (i as f64)).collect();
+    let mut cest_profiles = Vec::new();
+    for b1_hz in [15.0, 30.0] {
+        let params = Cest2StateParams {
+            p_b: 0.030,
+            k_ex_s_inv: 180.0,
+            major_ppm: 118.0,
+            dw_ab_ppm: 3.5,
+            r1a_s_inv: 1.5,
+            r2a_s_inv: 12.0,
+            r1b_s_inv: 1.5,
+            r2b_s_inv: 18.0,
+            larmor_mhz: 60.8106,
+            t_ex_s: 0.40,
+            b1_hz,
+            b1_inhomogeneity_frac: 0.0,
+            n_b1_quad: 1,
+            normalization: CestNormalization::ZeroTimePhaseCycled,
+        };
+        let intensities = simulate_cest_2state_profile(&params, &offsets_ppm).unwrap();
+        cest_profiles.push(CestProfileDataset {
+            seq_id: 42,
+            res_name: "LEU".to_string(),
+            larmor_mhz: 60.8106,
+            t_ex_s: 0.40,
+            b1_hz,
+            b1_inhomogeneity_frac: 0.0,
+            normalization: CestNormalization::ZeroTimePhaseCycled,
+            major_ppm_hint: Some(118.0),
+            offsets_ppm: offsets_ppm.clone(),
+            uncertainties: vec![0.002; offsets_ppm.len()],
+            intensities,
+        });
+    }
+    fs::write(
+        sb.workspace.join("cest_dual_b1.tsv"),
+        write_cest_profiles_tsv(&cest_profiles),
+    )
+    .unwrap();
+
+    // 3. Write synthetic dual-field 15N CPMG dispersion TSV (true p_B = 0.040, k_ex = 900 s^-1, dw = 3.2 ppm)
+    let nu_cpmg: Vec<f64> = vec![
+        50.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0, 650.0, 800.0, 1000.0,
+    ];
+    let mut cpmg_series = Vec::new();
+    for (larmor_mhz, r20) in [(60.8106_f64, 11.5_f64), (81.0808_f64, 13.5_f64)] {
+        let dw_rad_s = 2.0 * std::f64::consts::PI * larmor_mhz * 3.2;
+        let r2_eff: Vec<f64> = nu_cpmg
+            .iter()
+            .map(|&nu| r2eff_baldwin2014(r20, r20, 0.040, 900.0, dw_rad_s, 0.040, nu))
+            .collect();
+        cpmg_series.push(CpmgSeriesDataset {
+            seq_id: 55,
+            res_name: "ALA".to_string(),
+            larmor_mhz,
+            t_relax_s: 0.040,
+            nu_cpmg_hz: nu_cpmg.clone(),
+            r2_eff_err: vec![0.12; nu_cpmg.len()],
+            r2_eff_s_inv: r2_eff,
+        });
+    }
+    fs::write(
+        sb.workspace.join("cpmg_dual_field.tsv"),
+        write_cpmg_series_tsv(&cpmg_series),
+    )
+    .unwrap();
+
+    // 4. Write synthetic 2D HSQC CSP titration series (true global K_d = 30.0 uM, [P]_T = 50.0 uM)
+    let apo_rows = [
+        (12, "ILE", 8.10_f64, 119.0_f64, 0.24_f64, 1.40_f64),
+        (18, "PHE", 8.65_f64, 122.8_f64, -0.18_f64, -1.10_f64),
+        (31, "GLY", 7.82_f64, 109.4_f64, 0.01_f64, 0.04_f64),
+        (44, "TYR", 9.05_f64, 126.2_f64, 0.21_f64, -0.95_f64),
+    ];
+    let mut apo_tsv = String::from("seq_id\tres_name\th_ppm\tn_ppm\n");
+    for (sid, rname, h0, n0, _, _) in apo_rows {
+        apo_tsv.push_str(&format!("{sid}\t{rname}\t{h0:.5}\t{n0:.5}\n"));
+    }
+    fs::write(sb.workspace.join("apo_hsqc.tsv"), &apo_tsv).unwrap();
+
+    let p_tot = 50.0_f64;
+    let true_kd = 30.0_f64;
+    let lig_concs = [0.0_f64, 15.0, 35.0, 70.0, 140.0, 280.0];
+    let mut step_specs = Vec::new();
+    for (idx, &l_tot) in lig_concs.iter().enumerate() {
+        let sum = p_tot + l_tot + true_kd;
+        let fb = if l_tot <= 0.0 {
+            0.0
+        } else {
+            (sum - (sum * sum - 4.0 * p_tot * l_tot).max(0.0).sqrt()) / (2.0 * p_tot)
+        };
+        let step_peaks: Vec<Peak> = apo_rows
+            .iter()
+            .map(|&(_, _, h0, n0, dh, dn)| Peak::hsqc(h0 + fb * dh, n0 + fb * dn))
+            .collect();
+        let fname = format!("titration_step_{idx}.tsv");
+        write_peaks(sb.workspace.join(&fname), &step_peaks).unwrap();
+        step_specs.push(json!({
+            "label": format!("L_{l_tot:.0}uM"),
+            "peaks_path": fname,
+            "protein_conc_um": p_tot,
+            "ligand_conc_um": l_tot
+        }));
+    }
+
+    let policy = McpSecurityPolicy::read_only([&sb.workspace]).unwrap();
+    let mut server = McpServer::new(policy);
+
+    let call_tool = |srv: &mut McpServer, name: &str, args: Value| -> Value {
+        let raw = handle_mcp_json_request(
+            srv,
+            &serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    };
+
+    // Verify relaxation fit
+    let r1_resp = call_tool(
+        &mut server,
+        "fit_relaxation_or_exchange",
+        json!({ "mode": "relaxation", "path": "r1_600.tsv", "mc_replicates": 100 }),
+    );
+    assert_eq!(r1_resp["result"]["isError"], false, "got: {r1_resp}");
+    let r1_rows = r1_resp["result"]["structuredContent"]["residues"]
+        .as_array()
+        .unwrap();
+    assert_eq!(r1_rows.len(), 2);
+    let r1_first = r1_rows[0]["rate_s_inv"].as_f64().unwrap();
+    assert!((r1_first - 1.65).abs() < 0.02, "r1_first={r1_first}");
+
+    // Verify CEST fit
+    let cest_resp = call_tool(
+        &mut server,
+        "fit_relaxation_or_exchange",
+        json!({ "mode": "cest", "path": "cest_dual_b1.tsv" }),
+    );
+    assert_eq!(cest_resp["result"]["isError"], false, "got: {cest_resp}");
+    let cest_sc = &cest_resp["result"]["structuredContent"];
+    assert!(
+        cest_sc["reduced_chi2"].as_f64().unwrap() < 1.0,
+        "cest reduced_chi2={}",
+        cest_sc["reduced_chi2"]
+    );
+    let cest_pb = cest_sc["p_b"].as_f64().unwrap();
+    let cest_kex = cest_sc["k_ex_s_inv"].as_f64().unwrap();
+    assert!((cest_pb - 0.030).abs() < 0.005, "cest_pb={cest_pb}");
+    assert!((cest_kex - 180.0).abs() < 25.0, "cest_kex={cest_kex}");
+
+    // Verify CPMG fit
+    let cpmg_resp = call_tool(
+        &mut server,
+        "fit_relaxation_or_exchange",
+        json!({ "mode": "cpmg", "path": "cpmg_dual_field.tsv", "cpmg_model": "baldwin2014" }),
+    );
+    assert_eq!(cpmg_resp["result"]["isError"], false, "got: {cpmg_resp}");
+    let cpmg_sc = &cpmg_resp["result"]["structuredContent"];
+    assert!(
+        cpmg_sc["reduced_chi2"].as_f64().unwrap() < 1.0,
+        "cpmg reduced_chi2={}",
+        cpmg_sc["reduced_chi2"]
+    );
+    let cpmg_pb = cpmg_sc["p_b"].as_f64().unwrap();
+    let cpmg_kex = cpmg_sc["k_ex_s_inv"].as_f64().unwrap();
+    assert!((cpmg_pb - 0.040).abs() < 0.008, "cpmg_pb={cpmg_pb}");
+    assert!((cpmg_kex - 900.0).abs() < 90.0, "cpmg_kex={cpmg_kex}");
+
+    // Verify CSP global K_d fit
+    let csp_resp = call_tool(
+        &mut server,
+        "track_csp_titration",
+        json!({
+            "apo_peaks_path": "apo_hsqc.tsv",
+            "steps": step_specs,
+            "n_mc": 100
+        }),
+    );
+    assert_eq!(csp_resp["result"]["isError"], false, "got: {csp_resp}");
+    let csp_kd = csp_resp["result"]["structuredContent"]["global_kd_um"]
+        .as_f64()
+        .unwrap();
+    assert!((csp_kd - 30.0).abs() < 2.0, "csp_kd={csp_kd}");
+
+    // Adversarial sandbox checks on Phase 13 tools
+    let bad_relax = call_tool(
+        &mut server,
+        "fit_relaxation_or_exchange",
+        json!({ "mode": "cest", "paths": ["cest_dual_b1.tsv", "../outside/evil.tsv"] }),
+    );
+    assert_eq!(bad_relax["result"]["isError"], true);
+    assert_eq!(
+        bad_relax["result"]["structuredContent"]["error"]["code"],
+        ERR_SECURITY_VIOLATION
+    );
+
+    let bad_csp = call_tool(
+        &mut server,
+        "track_csp_titration",
+        json!({
+            "apo_peaks_path": "apo_hsqc.tsv",
+            "steps": [{ "peaks_path": "../outside/evil_step.tsv", "protein_conc_um": 50.0, "ligand_conc_um": 20.0 }]
+        }),
+    );
+    assert_eq!(bad_csp["result"]["isError"], true);
+    assert_eq!(
+        bad_csp["result"]["structuredContent"]["error"]["code"],
+        ERR_SECURITY_VIOLATION
+    );
+
+    println!(
+        "MCP_METRIC_JSON:{}",
+        json!({
+            "suite": "nmr_core_mcp_phase13_tools",
+            "r1_rate_s_inv": r1_first,
+            "cest_pb": cest_pb,
+            "cest_kex_s_inv": cest_kex,
+            "cpmg_pb": cpmg_pb,
+            "cpmg_kex_s_inv": cpmg_kex,
+            "csp_global_kd_um": csp_kd
+        })
+    );
+}
+
+#[test]
+fn test_phase14_nmr1d_dosy_and_metabolomics_mcp_tools_and_manifest_sandbox() {
+    let sb = TempTestSandbox::new("phase14_mcp");
+
+    // 1. Synthesize 500 MHz 1H 1D spectrum in CDCl3: CHCl3 singlet (7.26 ppm) + quartet (4.12 ppm, J=7.1 Hz) + triplet (1.26 ppm, J=7.1 Hz)
+    let n_pts = 4096usize;
+    let mhz = 500.0_f64;
+    let j_ppm = 7.1 / mhz;
+    let hwhm_ppm = 0.9 / mhz;
+    let lorentz = |x: f64, x0: f64, amp: f64| -> f64 {
+        let dx = (x - x0) / hwhm_ppm;
+        amp / (1.0 + dx * dx)
+    };
+    let mut spec1d_tsv = String::from("# mhz=500.0, solvent=CDCl3\nppm\treal\n");
+    for i in 0..n_pts {
+        let ppm = 8.5 - 8.0 * (i as f64) / ((n_pts - 1) as f64);
+        let mut y = 0.002 * ((i as f64 * 1.37).sin());
+        // Residual CHCl3 trace impurity at 7.26 ppm
+        y += lorentz(ppm, 7.26, 12.0);
+        // Quartet at 4.12 ppm (1:3:3:1)
+        for (k, w) in [(-1.5, 25.0), (-0.5, 75.0), (0.5, 75.0), (1.5, 25.0)] {
+            y += lorentz(ppm, 4.12 + k * j_ppm, w);
+        }
+        // Triplet at 1.26 ppm (1:2:1)
+        for (k, w) in [(-1.0, 50.0), (0.0, 100.0), (1.0, 50.0)] {
+            y += lorentz(ppm, 1.26 + k * j_ppm, w);
+        }
+        spec1d_tsv.push_str(&format!("{ppm:.6}\t{y:.6}\n"));
+    }
+    fs::write(sb.workspace.join("ethyl_cdcl3.tsv"), &spec1d_tsv).unwrap();
+
+    // 2. Synthesize 16-point DOSY dataset JSON (bi-exponential 50:50 mixture + pure monomer)
+    let b_vals: Vec<f64> = (0..16)
+        .map(|i| 1.0e7 + (3.2e9 - 1.0e7) * ((i as f64) / 15.0).powi(2))
+        .collect();
+    let mix_intensities: Vec<f64> = b_vals
+        .iter()
+        .map(|&b| 50.0 * (-b * 2.0e-10).exp() + 50.0 * (-b * 1.3e-9).exp())
+        .collect();
+    let pure_intensities: Vec<f64> = b_vals
+        .iter()
+        .map(|&b| 100.0 * (-b * 6.0e-10).exp())
+        .collect();
+    let dosy_json = json!({
+        "b_values_s_m2": b_vals,
+        "peaks": [
+            { "label": "overlapped_3_65ppm", "center_ppm": 3.65, "intensities": mix_intensities },
+            { "label": "pure_2_10ppm", "center_ppm": 2.10, "intensities": pure_intensities }
+        ]
+    });
+    fs::write(
+        sb.workspace.join("dosy_mixture.json"),
+        serde_json::to_string_pretty(&dosy_json).unwrap(),
+    )
+    .unwrap();
+
+    // 3. Synthesize 8-sample 1D metabolomics cohort (4 Control + 4 Case) + manifest TSV inside `metab/`
+    let metab_dir = sb.workspace.join("metab");
+    fs::create_dir_all(&metab_dir).unwrap();
+    let mut manifest = String::from("sample_id\tgroup\tpath\n");
+    let n_metab_pts = 1024usize;
+    let w_ppm = 0.004_f64;
+    let peak = |x: f64, x0: f64, amp: f64| -> f64 {
+        let d = (x - x0) / w_ppm;
+        amp / (1.0 + d * d)
+    };
+    for s_idx in 0..8usize {
+        let is_case = s_idx >= 4;
+        let group = if is_case { "Case" } else { "Control" };
+        let sample_id = format!("S{:02}", s_idx + 1);
+        let dilution = if s_idx % 2 == 0 { 1.0 } else { 1.75 };
+        let bio_level = if is_case {
+            85.0 + 6.0 * ((s_idx - 4) as f64)
+        } else {
+            15.0 + 3.0 * (s_idx as f64)
+        };
+        let mut tsv = String::from("# mhz=600.0, solvent=D2O\nppm\treal\n");
+        for i in 0..n_metab_pts {
+            let ppm = 9.0 - 8.5 * (i as f64) / ((n_metab_pts - 1) as f64);
+            let mut y = 0.02 * (((i + s_idx * 17) as f64 * 0.71).sin());
+            // Housekeeping endogenous metabolites (scaled by sample dilution -> normalized by PQN)
+            for (c_ppm, c_amp) in [
+                (3.04, 120.0),
+                (4.05, 80.0),
+                (2.55, 65.0),
+                (2.69, 65.0),
+                (7.55, 50.0),
+                (7.84, 50.0),
+                (3.26, 70.0),
+                (3.92, 55.0),
+            ] {
+                y += dilution * peak(ppm, c_ppm, c_amp);
+            }
+            // Case-elevated covarying spin-system pair at 1.33 ppm & 4.11 ppm (lactate-like)
+            y += dilution * peak(ppm, 1.33, bio_level);
+            y += dilution * peak(ppm, 4.11, 0.34 * bio_level);
+            tsv.push_str(&format!("{ppm:.5}\t{y:.5}\n"));
+        }
+        let rel_file = format!("{sample_id}.tsv");
+        fs::write(metab_dir.join(&rel_file), &tsv).unwrap();
+        manifest.push_str(&format!("{sample_id}\t{group}\t{rel_file}\n"));
+    }
+    fs::write(metab_dir.join("manifest.tsv"), &manifest).unwrap();
+
+    // Adversarial manifests attempting path traversal and `.env` exfiltration
+    fs::write(sb.outside.join("secret_spec.tsv"), "ppm\treal\n1.0\t1.0\n").unwrap();
+    fs::write(sb.workspace.join(".env"), "SECRET_TOKEN=123").unwrap();
+    fs::write(
+        metab_dir.join("evil_traversal_manifest.tsv"),
+        "sample_id\tgroup\tpath\nS01\tControl\t../../outside/secret_spec.tsv\n",
+    )
+    .unwrap();
+    fs::write(
+        metab_dir.join("evil_dotenv_manifest.tsv"),
+        "sample_id\tgroup\tpath\nS01\tControl\t../.env\n",
+    )
+    .unwrap();
+
+    let policy = McpSecurityPolicy::read_only([&sb.workspace]).unwrap();
+    let mut server = McpServer::new(policy);
+
+    let call_tool = |srv: &mut McpServer, name: &str, args: Value| -> Value {
+        let raw = handle_mcp_json_request(
+            srv,
+            &serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    };
+
+    // Verify 1D NMR analysis + multiplet + ACS report
+    let nmr1d_resp = call_tool(
+        &mut server,
+        "analyze_nmr1d_spectrum",
+        json!({
+            "path": "ethyl_cdcl3.tsv",
+            "solvent": "CDCl3",
+            "deconvolve": true,
+            "match_impurities": true,
+            "journal_style": "acs",
+            "multiplet_regions": [
+                { "low_ppm": 4.05, "high_ppm": 4.19, "proton_count": 2, "label": "OCH2" },
+                { "low_ppm": 1.20, "high_ppm": 1.32, "proton_count": 3, "label": "CH3" }
+            ]
+        }),
+    );
+    assert_eq!(nmr1d_resp["result"]["isError"], false, "got: {nmr1d_resp}");
+    let sc1d = &nmr1d_resp["result"]["structuredContent"];
+    assert!(sc1d["picked_peak_count"].as_u64().unwrap() >= 8);
+    assert!(sc1d["deconvolved_peak_count"].as_u64().unwrap() >= 8);
+    assert!(!sc1d["impurity_matches"].as_array().unwrap().is_empty());
+    let mults = sc1d["multiplets"].as_array().unwrap();
+    assert_eq!(mults.len(), 2);
+    assert_eq!(mults[0]["class"], "Quartet");
+    assert_eq!(mults[1]["class"], "Triplet");
+    let j_q = mults[0]["couplings_hz"][0].as_f64().unwrap();
+    assert!((j_q - 7.1).abs() < 0.25, "quartet J={j_q}");
+    let acs_str = sc1d["journal_report_ascii"].as_str().unwrap();
+    assert!(
+        acs_str.contains("1H NMR (500 MHz, CDCl3)"),
+        "got: {acs_str}"
+    );
+
+    // Verify DOSY BIC model selection + hydrodynamics + opt-in ILT caveat
+    let dosy_resp = call_tool(
+        &mut server,
+        "fit_dosy_diffusion",
+        json!({
+            "path": "dosy_mixture.json",
+            "solvent": "D2O",
+            "max_components": 3,
+            "bootstrap_samples": 24,
+            "include_ilt": true
+        }),
+    );
+    assert_eq!(dosy_resp["result"]["isError"], false, "got: {dosy_resp}");
+    let sc_dosy = &dosy_resp["result"]["structuredContent"];
+    let d_peaks = sc_dosy["peaks"].as_array().unwrap();
+    assert_eq!(d_peaks[0]["selected_k"], 2);
+    assert_eq!(d_peaks[1]["selected_k"], 1);
+    assert!(
+        d_peaks[0]["components"][0]["r_h_angstrom"]
+            .as_f64()
+            .unwrap()
+            > 0.5
+    );
+    assert!(sc_dosy["ilt_caveat"]
+        .as_str()
+        .unwrap()
+        .contains("ill-posed"));
+
+    // Verify Metabolomics Chemometrics (AI-Binning + PQN + PCA + OPLS-DA + STOCSY)
+    let metab_resp = call_tool(
+        &mut server,
+        "run_metabolomics_chemometrics",
+        json!({
+            "path": "metab/manifest.tsv",
+            "mask_preset": "urine",
+            "bucketing": "adaptive-intelligent",
+            "normalization": "pqn",
+            "scaling": "pareto",
+            "cv_folds": 4,
+            "permutations": 40,
+            "stocsy_driver_ppm": 1.33
+        }),
+    );
+    assert_eq!(metab_resp["result"]["isError"], false, "got: {metab_resp}");
+    let sc_metab = &metab_resp["result"]["structuredContent"];
+    assert_eq!(sc_metab["n_samples"], 8);
+    let q2 = sc_metab["opls_da"]["q2"].as_f64().unwrap();
+    assert!(q2 > 0.75, "expected high OPLS-DA Q2, got {q2}");
+    assert_eq!(sc_metab["opls_da"]["is_validated"], true);
+    let top_ppm = sc_metab["top_biomarkers"][0]["center_ppm"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (top_ppm - 1.33).abs() < 0.05 || (top_ppm - 4.11).abs() < 0.05,
+        "expected top biomarker near 1.33 or 4.11 ppm, got {top_ppm}"
+    );
+    let stocsy_hits = sc_metab["stocsy"]["covarying_buckets_r2_ge_0_50"]
+        .as_array()
+        .unwrap();
+    assert!(
+        stocsy_hits
+            .iter()
+            .any(|h| (h["center_ppm"].as_f64().unwrap() - 4.11).abs() < 0.05
+                && h["r2"].as_f64().unwrap() > 0.90),
+        "expected STOCSY correlation between 1.33 and 4.11 ppm, got {stocsy_hits:?}"
+    );
+
+    // Verify adversarial manifest traversal & `.env` exfiltration are blocked by sandbox!
+    for evil_manifest in [
+        "metab/evil_traversal_manifest.tsv",
+        "metab/evil_dotenv_manifest.tsv",
+    ] {
+        let evil_resp = call_tool(
+            &mut server,
+            "run_metabolomics_chemometrics",
+            json!({ "path": evil_manifest }),
+        );
+        assert_eq!(evil_resp["result"]["isError"], true, "got: {evil_resp}");
+        assert_eq!(
+            evil_resp["result"]["structuredContent"]["error"]["code"],
+            ERR_SECURITY_VIOLATION
+        );
+    }
+
+    let stocsy_411_r2 = stocsy_hits
+        .iter()
+        .find(|h| (h["center_ppm"].as_f64().unwrap() - 4.11).abs() < 0.05)
+        .and_then(|h| h["r2"].as_f64())
+        .unwrap_or(0.0);
+    println!(
+        "MCP_METRIC_JSON:{}",
+        json!({
+            "suite": "nmr_core_mcp_phase14_tools",
+            "nmr1d_quartet_j_hz": j_q,
+            "dosy_mix_selected_k": d_peaks[0]["selected_k"].as_u64().unwrap(),
+            "dosy_pure_selected_k": d_peaks[1]["selected_k"].as_u64().unwrap(),
+            "metab_n_samples": sc_metab["n_samples"].as_u64().unwrap(),
+            "metab_opls_q2": q2,
+            "metab_top_biomarker_ppm": top_ppm,
+            "metab_stocsy_r2": stocsy_411_r2
+        })
+    );
+}
+
+#[test]
+fn test_adversarial_prealloc_content_length_413_and_non_loopback_bind_rejection() {
+    use nmr_core::mcp::{
+        parse_bounded_content_length, parse_loopback_bind_addr, ContentLengthError,
+        MAX_MCP_FRAME_BYTES,
+    };
+
+    // 1. Pre-allocation `Content-Length` parser rejects negative/malformed and `usize` overflow
+    assert_eq!(
+        parse_bounded_content_length("-42", MAX_MCP_FRAME_BYTES),
+        Err(ContentLengthError::Malformed)
+    );
+    assert_eq!(
+        parse_bounded_content_length("12abc", MAX_MCP_FRAME_BYTES),
+        Err(ContentLengthError::Malformed)
+    );
+    assert_eq!(
+        parse_bounded_content_length("999999999999999999999999999999999999", MAX_MCP_FRAME_BYTES),
+        Err(ContentLengthError::ExceedsLimit {
+            max_bytes: MAX_MCP_FRAME_BYTES
+        })
+    );
+    assert_eq!(
+        parse_bounded_content_length(&(MAX_MCP_FRAME_BYTES + 1).to_string(), MAX_MCP_FRAME_BYTES),
+        Err(ContentLengthError::ExceedsLimit {
+            max_bytes: MAX_MCP_FRAME_BYTES
+        })
+    );
+
+    // 2. `run_mcp_stdio_loop` rejects oversized/overflowing `Content-Length` strictly before allocating
+    let mut server = McpServer::new(McpSecurityPolicy::empty_read_only());
+    let mut out = Vec::new();
+    let stdio_err = run_mcp_stdio_loop(
+        &mut server,
+        Cursor::new(b"Content-Length: 999999999999999999999999999999\r\n\r\n{}".to_vec()),
+        &mut out,
+    )
+    .expect_err("oversized stdio Content-Length must fail before allocation");
+    assert_eq!(stdio_err.kind(), std::io::ErrorKind::InvalidData);
+
+    // 3. `parse_loopback_bind_addr` rejects non-loopback binds (`0.0.0.0`, `[::]`, LAN/WAN IPs)
+    for forbidden_bind in [
+        "0.0.0.0:8765",
+        "[::]:8765",
+        "192.168.1.25:8765",
+        "10.0.0.12:8765",
+        "8.8.8.8:8765",
+        "evil.example.com:8765",
+    ] {
+        assert!(
+            parse_loopback_bind_addr(forbidden_bind).is_err(),
+            "expected non-loopback bind '{forbidden_bind}' to be rejected"
+        );
+    }
+    assert!(parse_loopback_bind_addr("127.0.0.1:0").is_ok());
+    assert!(parse_loopback_bind_addr("[::1]:0").is_ok());
+    assert!(parse_loopback_bind_addr("localhost:8765").is_ok());
+
+    // 4. Loopback HTTP stream returns 413 on oversized/overflowing Content-Length, 400 on negative, 403 on duplicate Host
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use nmr_core::mcp::handle_mcp_http_stream;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        let send_raw = |raw_req: &str| -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let req_owned = raw_req.to_string();
+            let client = std::thread::spawn(move || {
+                let mut s = TcpStream::connect(addr).unwrap();
+                s.write_all(req_owned.as_bytes()).unwrap();
+                s.flush().unwrap();
+                let mut resp = String::new();
+                s.read_to_string(&mut resp).unwrap();
+                resp
+            });
+            let (stream, _) = listener.accept().unwrap();
+            let mut srv = McpServer::new(McpSecurityPolicy::empty_read_only());
+            handle_mcp_http_stream(&mut srv, stream, "tok-413").unwrap();
+            client.join().unwrap()
+        };
+
+        let r413 = send_raw(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer tok-413\r\nContent-Length: 999999999999999999999999999999\r\n\r\n{}",
+        );
+        assert!(
+            r413.starts_with("HTTP/1.1 413"),
+            "expected 413, got: {r413}"
+        );
+
+        let r400 = send_raw(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer tok-413\r\nContent-Length: -5\r\n\r\n{}",
+        );
+        assert!(
+            r400.starts_with("HTTP/1.1 400"),
+            "expected 400, got: {r400}"
+        );
+
+        let r403_dup = send_raw(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: attacker.example\r\nAuthorization: Bearer tok-413\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        assert!(
+            r403_dup.starts_with("HTTP/1.1 403"),
+            "expected 403 on duplicate Host, got: {r403_dup}"
+        );
+    }
+
+    println!(
+        "MCP_METRIC_JSON:{}",
+        json!({
+            "suite": "nmr_core_mcp_tests",
+            "protocol_version": MCP_PROTOCOL_VERSION,
+            "core_tools_total": 12,
+            "core_tools_read_only": 10,
+            "core_tools_mutating": 2,
+            "guided_prompts_total": 5,
+            "max_stdio_frame_bytes": MAX_MCP_FRAME_BYTES,
+            "max_http_body_bytes": MAX_MCP_FRAME_BYTES,
+            "http_413_prealloc_verified": true,
+            "non_loopback_bind_rejected": true,
+            "sandbox_escape_vectors_blocked": 9
+        })
+    );
 }

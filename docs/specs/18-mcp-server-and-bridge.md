@@ -1,29 +1,33 @@
 # 18. Clean-Room Model Context Protocol (`MCP`) Server & Live Desktop Workbench Bridge
 
-Status: implemented in `crates/nmr-core/src/mcp.rs` (`T15.1` & `T15.3`), `crates/nmr-core/tests/mcp_tests.rs`, and `crates/nmr-gui/src/mcp_bridge.rs` (`T15.2`). Built strictly on the Rust standard library (`std::io`, `std::fs`, `std::path`, `std::net`) plus `serde` and `serde_json` with zero external SDK, HTTP, or image-encoding crates, maintaining full `wasm32-unknown-unknown` compilation parity.
+Status: implemented in `crates/nmr-core/src/mcp.rs` (`T15.1` & `T15.3`), `crates/nmr-cli/src/mcp_cmd.rs` (`nmrassign mcp` & `nmrassign mcp-config`), `crates/nmr-gui/src/mcp_bridge.rs` + `crates/nmr-gui/src/main.rs` (`T15.2`), `crates/nmr-core/tests/mcp_tests.rs`, and `crates/nmr-cli/tests/mcp_cli_tests.rs`. Built strictly on the Rust standard library (`std::io`, `std::fs`, `std::path`, `std::net`) plus `serde` and `serde_json` with zero external SDK, HTTP, or image-encoding crates, maintaining full `wasm32-unknown-unknown` compilation parity.
+
+> [!IMPORTANT]
+> **Validation Scope (In-Process / Subprocess Protocol Self-Consistency)**: All MCP JSON-RPC 2.0 framing (`NewlineDelimited` & `Content-Length`), pre-allocation payload caps (`413 Payload Too Large`), canonicalized workspace path sandboxing, loopback HTTP `Bearer` / `Host` / `Origin` enforcement, `256`-step reversible UI Undo/Redo curation, client configuration generation (`Antigravity`, `Claude Desktop`, `Cursor`), and RFC 2083 `image/png` viewport encoding are verified via deterministic in-process Rust unit tests and `nmrassign mcp` / `nmrassign mcp-config` subprocess E2E tests (`0` live interactive sessions against external `Antigravity`, `Claude Desktop`, or `Cursor` desktop binaries are executed in automated CI; tracked as open follow-up `F18`).
 
 ## 1. Provenance, Standards, and Clean-Room Scope
 
 Every protocol handler, transport framing parser, security sandbox validator, image encoder, and spectroscopist workflow in this module is implemented clean-room from public open specifications and peer-reviewed NMR literature:
 
 1. **Model Context Protocol (`MCP`) Specification** (Open Specification, Protocol Revisions `2024-11-05` & `2025-03-26`) and **JSON-RPC 2.0 Specification** — lifecycle negotiation (`initialize`, `notifications/initialized`, `ping`), capability discovery and invocation (`tools/list`, `tools/call`, `resources/list`, `resources/read`, `prompts/list`, `prompts/get`), tool safety annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), and multimodal `{ "type": "image", "mimeType": "image/png" }` content blocks.
-2. **Bray, T. (Ed.)** (RFC 8259, December 2017) — The JavaScript Object Notation (JSON) Data Interchange Format; **Fielding, R., Nottingham, M. & Reschke, J.** (RFC 9110, June 2022) — HTTP Semantics (`Authorization: Bearer`, `Host`, and `Origin` header validation).
+2. **Bray, T. (Ed.)** (RFC 8259, December 2017) — The JavaScript Object Notation (JSON) Data Interchange Format; **Fielding, R., Nottingham, M. & Reschke, J.** (RFC 9110, June 2022) — HTTP Semantics (`Authorization: Bearer`, `Host`, `Origin`, and `413` payload limits).
 3. **Boutell, T. et al.** (RFC 2083, March 1997) — PNG (Portable Network Graphics) Specification v1.0; **Deutsch, P. & Gailly, J.-L.** (RFC 1950 & RFC 1951, May 1996) — ZLIB Compressed Data Format (`Adler-32` checksum & stored uncompressed `DEFLATE` blocks) and IEEE 802.3 `CRC-32`; **Josefsson, S.** (RFC 4648, October 2006) — Base64 Data Encoding.
 4. **Scientific NMR Engines Exposed via MCP**:
    - Spectrometer & pulse-program physics (`nmr_core::classify`, `nmr_core::pulprog`): Kay, Ikura, Tschudin & Bax (*J. Magn. Reson.* 1990, **89**, 496–514); Grzesiek & Bax (*J. Am. Chem. Soc.* 1992, **114**, 6291–6293); Cavanagh et al. (*Protein NMR Spectroscopy*, 2nd ed., 2007).
    - Unlabelled dataset quality control & confidence calibration (`nmr_core::qc`): Guo, Pleiss, Sun & Weinberger (*ICML* 2017, **70**, 1321–1330); Chow (*IEEE Trans. Inf. Theory* 1970, **16**, 41–46); Zhang, Neal & Wishart (*J. Biomol. NMR* 2003, **25**, 173–195).
    - Post-assignment homolog-firewalled torsion prediction (`nmr_core::torsion_db`): Shen, Vernon, Baker & Bax (*Proc. Natl. Acad. Sci. U.S.A.* 2008, **105**, 4685–4690); Shen & Bax (*J. Biomol. NMR* 2013, **56**, 227–241); Berjanskii & Wishart (*J. Am. Chem. Soc.* 2005, **127**, 14970–14971).
-   - Chemical exchange & diffusion workflows (`T13.4`–`T13.5`, `T14.1`–`T14.4`): Vallurupalli, Bouvignies & Kay (*J. Am. Chem. Soc.* 2012, **134**, 8148–8161); Baldwin (*J. Magn. Reson.* 2014, **244**, 114–124); Hoye, Hanson & Vyvyan (*J. Org. Chem.* 1994, **59**, 4096–4103); Stejskal & Tanner (*J. Chem. Phys.* 1965, **42**, 288–292); Provencher (*Comput. Phys. Commun.* 1982, **27**, 213–227).
+   - Spin relaxation, chemical exchange & ligand titration (`nmr_core::relax_io`, `nmr_core::relax_fit`, `nmr_core::cest`, `nmr_core::cpmg`, `nmr_core::csp`): Farrow et al. (*Biochemistry* 1994, **33**, 5984–6003); Vallurupalli, Bouvignies & Kay (*J. Am. Chem. Soc.* 2012, **134**, 8148–8161); Baldwin (*J. Magn. Reson.* 2014, **244**, 114–124); Williamson (*Prog. Nucl. Magn. Reson. Spectrosc.* 2013, **73**, 1–16).
+   - Analytical 1D NMR, `DOSY` & 1D metabolomics chemometrics (`nmr_core::nmr1d`, `nmr_core::multiplet`, `nmr_core::dosy`, `nmr_core::metabolomics`): Fulmer et al. (*Organometallics* 2010, **29**, 2176–2179); Hoye, Hanson & Vyvyan (*J. Org. Chem.* 1994, **59**, 4096–4103); Stejskal & Tanner (*J. Chem. Phys.* 1965, **42**, 288–292); Provencher (*Comput. Phys. Commun.* 1982, **27**, 213–227); De Meyer et al. (*Anal. Chem.* 2008, **80**, 3783–3790); Dieterle et al. (*Anal. Chem.* 2006, **78**, 4281–4290); Trygg & Wold (*J. Chemom.* 2002, **16**, 119–128); Westerhuis et al. (*Metabolomics* 2008, **4**, 81–89); Cloarec et al. (*Anal. Chem.* 2005, **77**, 1282–1289).
 
-## 2. Core JSON-RPC 2.0 MCP Server Engine (`T15.1`, `nmr_core::mcp`)
+## 2. Core JSON-RPC 2.0 MCP Server Engine (`T15.1`, `nmr_core::mcp` & `nmrassign mcp`)
 
-### 2.1 Framing & Transport Layer
+### 2.1 Framing, Pre-Allocation Bounds & Loopback HTTP Transport
 
-`nmr_core::mcp` decouples synchronous JSON-RPC 2.0 request dispatch (`handle_mcp_json_request`) from byte-stream I/O (`run_mcp_stdio_loop<R: BufRead, W: Write>` and native loopback HTTP):
+`nmr_core::mcp` decouples synchronous JSON-RPC 2.0 request dispatch (`handle_mcp_json_request`) from byte-stream I/O (`run_mcp_stdio_loop<R: BufRead, W: Write>` and `run_mcp_http_server`):
 
-1. **Line-Delimited `stdio` JSON-RPC (`McpFramingMode::NewlineDelimited`)**: Each JSON-RPC 2.0 request or notification is read as a UTF-8 line terminated by `\n` (or `\r\n`), bounded by `MAX_MCP_FRAME_BYTES` (`16 MiB`). Responses are serialized onto a single compact UTF-8 JSON line terminated by `\n` and flushed immediately. JSON-RPC notifications (messages omitting the `"id"` member, such as `notifications/initialized`) never emit a response frame.
-2. **`Content-Length` Header Framing (`McpFramingMode::ContentLength`)**: `run_mcp_stdio_loop` transparently auto-detects `Content-Length: <N>\r\n\r\n<payload>` headers on incoming streams, enforces `N <= MAX_MCP_FRAME_BYTES`, reads exact byte payloads, and replies using matching `Content-Length` headers.
-3. **Loopback HTTP Transport (`#[cfg(not(target_arch = "wasm32"))]`)**: Binds strictly to `127.0.0.1` (`rejects` `0.0.0.0` or external interfaces), enforces constant-time `Authorization: Bearer <token>` comparison, validates `Host` (`127.0.0.1` or `localhost`), and rejects cross-origin `Origin` headers (`403 Forbidden`) to prevent browser CSRF and DNS-rebinding attacks.
+1. **Line-Delimited `stdio` JSON-RPC (`McpFramingMode::NewlineDelimited`)**: Each JSON-RPC 2.0 request or notification is read via bounded `reader.take(...)` chunks capped at `MAX_MCP_FRAME_BYTES` (`16 MiB`) prior to heap growth. JSON-RPC notifications (messages omitting `"id"`, such as `notifications/initialized`) never emit a response frame.
+2. **`Content-Length` Header Framing (`McpFramingMode::ContentLength`)**: `parse_bounded_content_length` parses decimal digits one byte at a time via checked arithmetic (`checked_mul` / `checked_add`) and enforces `<= MAX_MCP_FRAME_BYTES` **strictly before allocating any payload buffer** (`Err`, zero panics, immune to `usize` overflow).
+3. **Loopback HTTP Transport (`#[cfg(not(target_arch = "wasm32"))]`)**: `parse_loopback_bind_addr` restricts `--bind` exclusively to `127.0.0.1:<port>`, `[::1]:<port>`, or `localhost:<port>`, unconditionally rejecting `0.0.0.0`, `[::]`, and LAN/WAN interfaces (`Err`). Incoming HTTP requests enforce pre-allocation `Content-Length` bounds (`413 Payload Too Large` on `ExceedsLimit`, `400 Bad Request` on negative/malformed values), constant-time `Authorization: Bearer <token>` verification (`401 Unauthorized`), loopback `Host` header validation (`127.0.0.1`, `[::1]`, `localhost`, rejecting duplicate or external `Host` headers with `403 Forbidden`), and cross-origin `Origin` rejection (`403 Forbidden`).
 
 ### 2.2 JSON-RPC 2.0 Error Taxonomy
 
@@ -40,7 +44,7 @@ Every protocol handler, transport framing parser, security sandbox validator, im
 
 In accordance with the MCP `tools/call` specification, protocol-level parameter mistakes (missing `"name"`, unknown tool name, non-object `"arguments"`) return JSON-RPC `-32602`, whereas tool-level security/permission denials and domain validation errors return a structured `McpCallToolResult` with `isError: true` and machine-readable `structuredContent` carrying the error code and kind so an AI assistant can observe and respect the boundary without dropping the session. Resource read violations (`resources/read`) return JSON-RPC error objects (`-32001` / `-32003`).
 
-### 2.3 Built-In NMR Tools & Resources
+### 2.3 Built-In Core NMR Tools (`12` Total: `10` Read-Only + `2` Mutating) & Resources
 
 | Tool Name | Mode | `readOnlyHint` | `destructiveHint` | Underlying `nmr-core` Engine |
 | :--- | :--- | :---: | :---: | :--- |
@@ -48,7 +52,12 @@ In accordance with the MCP `tools/call` specification, protocol-level parameter 
 | `read_nmrstar_summary` | Read | `true` | `false` | `nmrstar::read_star_all_atoms` (sequence, backbone/sidechain shift & ambiguity counts) |
 | `read_peak_list_summary` | Read | `true` | `false` | `peaks::read_peaks` + `spinsystems::build_spin_systems` |
 | `evaluate_dataset_qc` | Read | `true` | `false` | `solver::assign` + `qc::evaluate_dataset_qc` (`DatasetQcReport`, SNR, root-3D drift, gates) |
-| `predict_homolog_free_torsions` | Read | `true` | `false` | `torsion_db::HomologFirewall` (`<= 25%` seq-id, `L1`–`L4` audit SHA-256) |
+| `predict_homolog_free_torsions` | Read | `true` | `false` | `torsion_db::HomologFirewall` (`<= 25%` seq-id ceiling, `L1`–`L4` audit SHA-256) |
+| `fit_relaxation_or_exchange` | Read | `true` | `false` | `relax_fit::fit_decay_batch_cpu`, `cest::fit_cest_global_cpu`, `cpmg::fit_cpmg_global_cpu` |
+| `track_csp_titration` | Read | `true` | `false` | `csp::track_titration_trajectories` / `track_methyl_hmqc_trajectories` + `fit_csp_global_kd` |
+| `analyze_nmr1d_spectrum` | Read | `true` | `false` | `nmr1d` (`pick_peaks_1d`, `deconvolve_spectrum_1d`, Fulmer impurities) + `multiplet` (`ACS`/`JOC`/`RSC`/`Nature`) |
+| `fit_dosy_diffusion` | Read | `true` | `false` | `dosy::fit_stejskal_tanner_multi` (`BIC`/`AIC`), `estimate_hydrodynamics`, opt-in `solve_tikhonov_ilt` |
+| `run_metabolomics_chemometrics` | Read | `true` | `false` | `metabolomics::run_metabolomics_pipeline` (`AI-Binning`, `PQN`, `PCA`, `OPLS-DA`) + `compute_stocsy_at_ppm` |
 | `write_curated_peak_tsv` | Write | `false` | `true` | `peaks::write_peaks` (requires `McpAccessMode::ReadWrite` + sandboxed output path) |
 | `export_nmrstar_shifts` | Write | `false` | `true` | `nmrstar::write_star_with_header` (requires `McpAccessMode::ReadWrite` + sandboxed path) |
 
@@ -60,38 +69,58 @@ Built-in `resources/list` & `resources/read` URIs:
 
 ## 3. Live Bidirectional `nmr-gui` Desktop Bridge (`T15.2`, `nmr_gui::mcp_bridge`)
 
-### 3.1 `WorkbenchSnapshot` & Reversible `McpUndoLog`
+### 3.1 `WorkbenchSnapshot`, `McpBridgeState` & Reversible `McpUndoLog`
 
-The desktop workbench exposes a thread-safe `WorkbenchSnapshot` (`active_residue_seq`, `crosshair_ppm`, `active_experiment`, `strip_candidates`, `selected_pdb_chain_res`, `undo_depth`, `redo_depth`, `qc_status`) and processes AI actions exclusively through reversible `McpUiCommand` entries (`JumpToResidue`, `SetCrosshairPpm`, `AssignSpinSystemToResidue`, `UnassignResidue`, `TogglePeakExclusion`, `HighlightResidues3d`) recorded in a bounded `256`-step `McpUndoLog` (`apply_command`, `undo_last`, `redo_last`). Every AI-initiated curation edit can be reverted cleanly in a single `Cmd/Ctrl+Z` step or via the `undo_last_ai_edit` MCP tool.
+The desktop workbench wires `McpBridgeState` (`McpBridgeController`) into the top `nmr-gui` toolbar (*"🔌 MCP Bridge"* control window + 1-click *"📋 Copy MCP Config"* button), publishing a thread-safe `WorkbenchSnapshot` (`active_residue_seq`, `crosshair_ppm`, `active_experiment`, `strip_candidates`, `selected_pdb_chain_res`, `undo_depth`, `redo_depth`, `qc_status`) and processing AI actions exclusively through reversible `McpUiCommand` entries recorded in a bounded `256`-step `McpUndoLog` (`apply_command`, `undo_last`, `redo_last`):
 
-### 3.2 Authenticated Loopback Security & Multimodal `image/png` Capture
+| Bridge Tool Name | Mutates UI State | Description |
+| :--- | :---: | :--- |
+| `get_workbench_state` | `false` | Read live `WorkbenchSnapshot` (`active_residue_seq`, `crosshair_ppm`, `strip_candidates`, `qc_status`, Undo/Redo depths) |
+| `jump_to_residue` | `true` (Undoable) | Focus sequence ribbon, strip walk, and 3D structure selection on `seq_id` |
+| `set_crosshair_ppm` | `true` (Undoable) | Move synchronized 2D/3D cursor crosshair (`h_ppm`, `n_ppm`, optional `c_ppm`) |
+| `assign_spin_system_to_residue` | `true` (Undoable) | Bijectively assign `cluster_id` to `seq_id`, preserving any displaced occupant for 1-step Undo |
+| `unassign_residue` | `true` (Undoable) | Clear residue assignment while recording prior spin-system mapping on Undo stack |
+| `toggle_peak_exclusion` | `true` (Undoable) | Mark or unmark an artifact peak index as excluded |
+| `highlight_residues_3d` | `true` (Undoable) | Highlight target residues (`seq_ids`, `label`) in the `wgpu` 3D structure viewer |
+| `undo_last_ai_edit` | `true` | Revert the most recent AI or interactive `McpUiCommand` (`Cmd/Ctrl+Z` equivalent) |
+| `capture_viewport_png` | `false` | Return active workbench contour/strip/ribbon viewport as RFC 2083 `{ "type": "image", "mimeType": "image/png" }` |
 
-1. **Loopback-Only Binding**: The desktop HTTP bridge binds strictly to `127.0.0.1:0` (ephemeral port by default) and refuses non-loopback addresses.
-2. **Bearer Token & DNS-Rebinding Defense**: Every HTTP request must supply `Authorization: Bearer <token>` verified in constant time alongside a loopback `Host` header (`127.0.0.1` or `localhost`) and no cross-origin `Origin` header (`401 Unauthorized` / `403 Forbidden`).
-3. **Zero-Dependency `image/png` Encoder**: `encode_rgba_to_png` / `encode_rgba_png` serializes 8-bit RGBA framebuffers into RFC 2083 PNG streams (`\x89PNG\r\n\x1a\n` magic, `IHDR`, scanline filter `0`, RFC 1950 ZLIB stored blocks with `Adler-32`, IEEE `CRC-32`, and `IEND`) encoded via RFC 4648 Base64 into MCP `{ "type": "image", "mimeType": "image/png", "data": "<base64>" }` blocks.
+### 3.2 Authenticated Loopback Security, `wasm32` Guarding & Multimodal `image/png` Capture
 
-## 4. Security Policy, Domain Prompts & Client Configs (`T15.3`)
+1. **Loopback-Only Binding & `wasm32` Parity**: Desktop socket code is gated behind `#[cfg(not(target_arch = "wasm32"))]`, binding strictly to `127.0.0.1:0` (ephemeral port by default) while compiling cleanly with `0` warnings on `wasm32-unknown-unknown` (where `start_loopback_http` returns a descriptive unsupported-platform `Err`).
+2. **Pre-Allocation Body Cap, Bearer Token & DNS-Rebinding Defense**: `read_loopback_http_request` caps header lines at `16 KiB` and checks `Content-Length <= MAX_MCP_HTTP_BODY_BYTES` (`4 MiB`) before buffer allocation (`413 Payload Too Large`), verifies `Authorization: Bearer <token>` in constant time (`401 Unauthorized`), enforces loopback `Host` (`127.0.0.1` or `localhost`), and rejects cross-origin `Origin` headers (`403 Forbidden`).
+3. **Zero-Dependency `image/png` Encoder**: `encode_rgba_to_png` / `encode_rgba_png` serializes 8-bit RGBA framebuffers into RFC 2083 PNG streams (`\x89PNG\r\n\x1a\n` magic, `IHDR`, scanline filter `0`, RFC 1950 ZLIB stored blocks with `Adler-32`, IEEE `CRC-32`, and `IEND`) encoded via RFC 4648 Base64.
+
+## 4. Security Policy, Domain Prompts & CLI Subcommands (`T15.3`)
 
 ### 4.1 Path Sandboxing & `ReadOnly` / `ReadWrite` Guardrails (`McpSecurityPolicy`)
 
-1. **Default-Safe Access Mode**: `McpAccessMode` defaults to `ReadOnly`. Mutating tools (`write_curated_peak_tsv`, `export_nmrstar_shifts`) carry `annotations: { readOnlyHint: false, destructiveHint: true }`, can optionally be hidden from `tools/list`, and are unconditionally blocked at execution time whenever `access_mode == McpAccessMode::ReadOnly`.
+1. **Default-Safe Access Mode**: `McpAccessMode` defaults to `ReadOnly`. Mutating tools (`write_curated_peak_tsv`, `export_nmrstar_shifts`) carry `annotations: { readOnlyHint: false, destructiveHint: true }`, are hidden from `tools/list` by default in `nmrassign mcp --mode read-only` (unless `--expose-blocked-write-tools` is passed), and are unconditionally denied (`ERR_READ_ONLY_DENIED`) whenever `access_mode == McpAccessMode::ReadOnly`.
 2. **Canonicalized Sandbox Verification (`resolve_sandboxed_path` / `resolve_sandboxed_write_path`)**:
    - Rejects empty strings and embedded null bytes (`\0`).
-   - Rejects any lexical `Component::ParentDir` (`..`) segment prior to filesystem access.
+   - Rejects any lexical `Component::ParentDir` (`..`) segment prior to filesystem access (including nested per-sample paths inside metabolomics cohort manifests and multi-step CSP titration manifests).
    - Rejects hidden credential and secret paths (`.ssh`, `.aws`, `.gnupg`, `.env`, `.env.*`, `.netrc`, `.kube`, `id_rsa`, `id_ed25519`) across both input components and canonicalized workspace-relative components.
-   - Canonicalizes every configured `allowed_root` via `std::fs::canonicalize` and verifies that the canonicalized target path (for existing paths) or canonicalized deepest existing ancestor plus symlink-free normal tail (for new output files) resides strictly within at least one canonicalized `allowed_root`, blocking symlink directory escapes and dangling symlinks.
+   - Canonicalizes every configured `allowed_root` via `std::fs::canonicalize` and verifies that the canonicalized target path (for existing paths) or canonicalized deepest existing ancestor plus symlink-free normal tail (for new output files) resides strictly within at least one canonicalized `allowed_root`, blocking sibling-prefix bypasses (`workspace_evil` vs `workspace`), symlink directory escapes, and dangling symlinks.
    - Sanitizes workspace-relative paths in responses so host user home paths are never leaked.
 
-### 4.2 Guided Spectroscopist Prompts
+### 4.2 Guided Spectroscopist Prompts (`5` Built-In Workflows)
 
-`prompts/list` and `prompts/get` provide four parameterized multi-step spectroscopist workflows:
+`prompts/list` and `prompts/get` provide five parameterized multi-step spectroscopist workflows:
 - `triage-qc`: Unlabelled referencing check, `DatasetQcReport` completeness/aliphatic/connectivity gate audit, and `PASS` / `WARN` / `ABSTAIN` confidence interpretation (preserving cold high-confidence precision caveats).
 - `resolve-ambiguous-strips`: Multi-pathway `(i, i-1)` strip ladder disambiguation (`HNCACB`/`CBCACONH`, `HNCO`/`HNCACO`), pre-Proline covalent shift checks, and Undo-safe curation.
-- `deconvolve-1d-mixture-dosy`: 1D phase/baseline/Fulmer-2010 referencing, global pseudo-Voigt multiplet deconvolution, `qNMR` purity stoichiometry, and `BIC`-selected discrete Stejskal–Tanner / `BPP-LED` `DOSY` vs opt-in `CONTIN` `ILT`.
+- `deconvolve-1d-mixture-dosy`: 1D phase/baseline/Fulmer-2010 referencing, global pseudo-Voigt multiplet deconvolution, `qNMR` purity stoichiometry, and `BIC`-selected discrete Stejskal–Tanner / `BPP-LED` `DOSY` vs opt-in Tikhonov `ILT`.
 - `fit-cest-cpmg-exchange`: Locked-shape pseudo-3D plane integration, flat-null vs exchange model selection (`AIC`/`BIC`, $\Delta R_{2,\text{eff}} \ge 2.0\text{ s}^{-1}$), multi-field $\alpha$-scaling, and 2-/3-state Bloch–McConnell `CEST` or Baldwin-2014 `CPMG` fitting.
+- `analyze-metabolomics-cohort`: Biofluid residual water/urea/TSP region masking, De Meyer (2008) `AI-Binning`, Dieterle (2006) `PQN` dilution normalization, Pareto-scaled `PCA` Hotelling $T^2$ / $Q$-residual outlier screening, leak-free stratified $k$-fold `OPLS-DA` with Westerhuis (2008) permutation $Q^2$ anti-overfitting checks, and Cloarec (2005) `STOCSY` spin-system covariance verification.
 
-### 4.3 Client Configuration Generator (`generate_mcp_client_config`)
+### 4.3 CLI Interface (`nmrassign mcp` & `nmrassign mcp-config`)
 
-Generates validated client configuration JSON objects for `McpClientTarget::{Antigravity, ClaudeDesktop, Cursor}` across two transport profiles:
-- **`StdioCli`**: Launches `nmrassign mcp --transport stdio --workspace <root>` with explicit `--read-only` (default) or `--read-write` flags.
-- **`HttpBridge`**: Connects to a loopback `http://127.0.0.1:<port>/mcp` desktop workbench endpoint (rejecting non-loopback URLs or empty tokens) with `Authorization: Bearer <token>` headers formatted for each client's `mcpServers` schema.
+- **`nmrassign mcp`**:
+  `nmrassign mcp [--transport stdio|http] [--root <dir> ...] [--mode read-only|read-write] [--bind 127.0.0.1:<port>] [--token <bearer>] [--max-requests <N>]`
+- **`nmrassign mcp-config`**:
+  `nmrassign mcp-config --client <antigravity|claude-desktop|cursor> [--root <dir> ...] [--mode read-only|read-write] [--bridge-port <port> [--token <bearer>]] [-o <mcp_config.json>]`
+
+## 5. Validation Scope (In-Process / Subprocess Protocol Self-Consistency)
+
+All Phase 15 verification gates (`crates/nmr-core/tests/mcp_tests.rs`, `crates/nmr-gui/src/mcp_bridge.rs` unit tests, and `crates/nmr-cli/tests/mcp_cli_tests.rs`) evaluate deterministic in-process and OS-subprocess JSON-RPC 2.0 / loopback HTTP client harnesses against synthetic and public fixture workspaces:
+- **Verified Automatically**: `NewlineDelimited` & `Content-Length` `stdio` framing, pre-allocation `Content-Length` overflow/cap rejection (`413 Payload Too Large` on `stdio` and HTTP without buffer allocation), non-loopback bind rejection (`0.0.0.0`, `[::]`, LAN/WAN IPs), HTTP `401` Bearer / `403` DNS-rebinding `Host` & `Origin` defenses, `ReadOnly` vs `ReadWrite` enforcement, `9` sandbox escape classes (`..`, nested `..`, sibling-prefix dirs, `\0`, file/dir/dangling symlinks, `.ssh`/`.aws`/`.gnupg`/`.env` paths, and manifest-embedded path escapes), `256`-step bijective Undo/Redo state restoration, RFC 2083 `image/png` encoding, and `mcp-config` JSON schema export for `Antigravity`, `Claude Desktop`, and `Cursor`.
+- **Not Yet Executed in Automated CI (`F18`)**: `0` live interactive sessions against external `Antigravity`, `Claude Desktop`, or `Cursor` host binaries have been recorded in automated CI; manual/scripted external-client smoke verification is tracked as open follow-up `F18`.
