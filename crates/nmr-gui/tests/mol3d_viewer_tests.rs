@@ -1060,8 +1060,9 @@ fn test_headless_wgpu_20_conformer_150aa_48k_atoms_sustains_60fps() {
 
     let (warmup_frames, n_frames, max_frame_ms) = if is_software_cpu {
         // Software CPU rasterizers (e.g. Mesa llvmpipe / SwiftShader on headless Linux CI):
-        // verify full offscreen 3D pipeline execution without applying a hardware-GPU 60 fps gate.
-        (2usize, 5usize, 500.0f64)
+        // verify full offscreen 3D pipeline execution without applying a hardware-GPU 60 fps gate
+        // (256-bit AVX2 llvmpipe GitHub Actions VMs measure ~660 ms/frame on 51,000 atoms).
+        (2usize, 5usize, 1500.0f64)
     } else {
         // Hardware / virtual GPU (Metal, Vulkan GPU, DX12): enforce >= 60 fps (<= 16.67 ms/frame).
         (5usize, 30usize, 16.67f64)
