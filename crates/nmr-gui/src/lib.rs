@@ -10,6 +10,7 @@
 
 pub mod command_palette;
 pub mod contour_painter;
+pub mod demo_preset;
 pub mod dosy_panel;
 pub mod dynamics_panel;
 pub mod ingest_panel;

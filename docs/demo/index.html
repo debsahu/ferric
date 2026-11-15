@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>nmr-assign — Live WebGPU Browser Workbench Demo</title>
+  <style>
+    :root {
+      --bg: #0e131b;
+      --bar-bg: #141c27;
+      --bar-border: #253347;
+      --text: #dce7f5;
+      --muted: #93a8c4;
+      --accent: #5fd4ff;
+      --ok-bg: rgba(46, 204, 113, 0.16);
+      --ok-fg: #6ee7a8;
+      --warn-bg: rgba(245, 158, 11, 0.16);
+      --warn-fg: #fbbf24;
+      --err-bg: rgba(239, 68, 68, 0.16);
+      --err-fg: #fca5a5;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    header.demo-bar {
+      height: 38px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 14px;
+      background: var(--bar-bg);
+      border-bottom: 1px solid var(--bar-border);
+      font-size: 13px;
+      z-index: 20;
+      position: relative;
+    }
+    .demo-brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .demo-brand strong {
+      color: #ffffff;
+      letter-spacing: 0.01em;
+    }
+    .preset-note {
+      color: var(--muted);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .demo-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    .cap-badge {
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      background: rgba(95, 212, 255, 0.14);
+      color: var(--accent);
+      border: 1px solid rgba(95, 212, 255, 0.28);
+    }
+    .cap-badge.ok {
+      background: var(--ok-bg);
+      color: var(--ok-fg);
+      border-color: rgba(110, 231, 168, 0.32);
+    }
+    .cap-badge.warn {
+      background: var(--warn-bg);
+      color: var(--warn-fg);
+      border-color: rgba(251, 191, 36, 0.34);
+    }
+    .cap-badge.err {
+      background: var(--err-bg);
+      color: var(--err-fg);
+      border-color: rgba(252, 165, 165, 0.34);
+    }
+    a.manual-link {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid rgba(95, 212, 255, 0.32);
+      background: rgba(95, 212, 255, 0.08);
+    }
+    a.manual-link:hover {
+      background: rgba(95, 212, 255, 0.18);
+    }
+    main.canvas-stage {
+      position: relative;
+      width: 100vw;
+      height: calc(100vh - 38px);
+    }
+    canvas#nmr_canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      outline: none;
+    }
+    #nmr_loading {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      padding: 24px;
+      background: var(--bg);
+      z-index: 10;
+      text-align: center;
+    }
+    .spinner {
+      width: 36px;
+      height: 36px;
+      border: 3px solid rgba(95, 212, 255, 0.22);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.85s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    .status-card {
+      max-width: 600px;
+      background: #151e2b;
+      border: 1px solid var(--bar-border);
+      border-radius: 10px;
+      padding: 18px 22px;
+      line-height: 1.55;
+      font-size: 13.5px;
+      color: var(--text);
+    }
+    .status-card h2 {
+      margin: 0 0 8px 0;
+      font-size: 16px;
+      color: #ffffff;
+    }
+    .status-card code {
+      background: rgba(255, 255, 255, 0.08);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12.5px;
+    }
+    .status-card p {
+      margin: 8px 0;
+      color: var(--muted);
+    }
+    @media (max-width: 820px) {
+      .preset-note {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="demo-bar">
+    <div class="demo-brand">
+      <strong>nmr-assign · Live WebGPU Demo</strong>
+      <span class="preset-note">
+        Preloaded in-memory: Ubiquitin 2D HSQC + 3D HNCACB + 1UBQ 3D + 1D Stack + DOSY + Metabolomics
+      </span>
+    </div>
+    <div class="demo-actions">
+      <span id="gpu_cap_badge" class="cap-badge">Checking GPU&hellip;</span>
+      <a class="manual-link" href="../index.html">&larr; Documentation Manual</a>
+    </div>
+  </header>
+
+  <main class="canvas-stage">
+    <div id="nmr_loading" role="status">
+      <div id="nmr_spinner" class="spinner"></div>
+      <div id="nmr_status_box" style="font-size: 14px; letter-spacing: 0.01em;">
+        Initializing <strong>nmr-assign</strong> WebAssembly + WebGPU Workbench&hellip;
+      </div>
+    </div>
+    <canvas id="nmr_canvas"></canvas>
+  </main>
+
+  <script type="module">
+    const badgeEl = document.getElementById("gpu_cap_badge");
+    const loadingEl = document.getElementById("nmr_loading");
+    const spinnerEl = document.getElementById("nmr_spinner");
+    const statusBoxEl = document.getElementById("nmr_status_box");
+
+    function hasWebGL2() {
+      try {
+        const probe = document.createElement("canvas");
+        return Boolean(probe.getContext("webgl2"));
+      } catch (_) {
+        return false;
+      }
+    }
+
+    async function detectCapabilities() {
+      const webgl2 = hasWebGL2();
+      if (typeof navigator !== "undefined" && "gpu" in navigator && navigator.gpu) {
+        try {
+          const adapter = await navigator.gpu.requestAdapter();
+          if (adapter) {
+            return { webgpu: true, webgl2, detail: "WebGPU Ready" };
+          }
+          return { webgpu: false, webgl2, detail: "No WebGPU Adapter" };
+        } catch (_) {
+          return { webgpu: false, webgl2, detail: "WebGPU Blocked" };
+        }
+      }
+      return { webgpu: false, webgl2, detail: webgl2 ? "WebGL2 Only (No WebGPU)" : "No WebGPU / WebGL2" };
+    }
+
+    function showBanner(title, paragraphsHtml, badgeText, badgeClass) {
+      if (badgeEl) {
+        badgeEl.textContent = badgeText;
+        badgeEl.className = "cap-badge " + badgeClass;
+      }
+      if (spinnerEl) {
+        spinnerEl.style.display = "none";
+      }
+      if (statusBoxEl) {
+        statusBoxEl.innerHTML =
+          '<div class="status-card">' +
+          "<h2>" + title + "</h2>" +
+          paragraphsHtml +
+          '<p style="margin-top:14px"><a class="manual-link" href="../index.html">&larr; Return to Documentation Manual</a></p>' +
+          "</div>";
+      }
+    }
+
+    async function bootDemo() {
+      const caps = await detectCapabilities();
+      if (!caps.webgpu) {
+        const glNote = caps.webgl2
+          ? "Your browser supports <code>WebGL2</code>, whereas <code>nmr-assign</code>'s zero-install GPU contour and 3D ribbon shaders use the modern <code>WebGPU</code> (<code>navigator.gpu</code>) API."
+          : "Neither <code>WebGPU</code> (<code>navigator.gpu</code>) nor <code>WebGL2</code> could be initialized in this browser context.";
+        showBanner(
+          "WebGPU Adapter Required for Live Browser Workbench",
+          "<p>" + glNote + "</p>" +
+          "<p>Open this page in <strong>Chrome / Edge 113+</strong>, <strong>Safari 18+</strong>, or <strong>Firefox 130+</strong> with hardware acceleration enabled, or run the native desktop workbench via <code>cargo run --release -p nmr-gui</code>.</p>",
+          caps.detail,
+          caps.webgl2 ? "warn" : "err"
+        );
+        return;
+      }
+
+      if (badgeEl) {
+        badgeEl.textContent = "WebGPU Ready";
+        badgeEl.className = "cap-badge ok";
+      }
+
+      const bundlePath = "./nmrassign" + "_gui.js";
+      try {
+        const wasmModule = await import(bundlePath);
+        if (typeof wasmModule.default === "function") {
+          await wasmModule.default();
+        }
+      } catch (err) {
+        const msg = err && err.message ? String(err.message) : String(err);
+        showBanner(
+          "WebAssembly Demo Bundle Not Found or Failed to Load",
+          "<p>WebGPU is available in your browser, but <code>nmrassign_gui.js</code> / <code>nmrassign_gui_bg.wasm</code> has not been built into this directory yet.</p>" +
+          "<p>Build the release <code>wasm32-unknown-unknown</code> bundle locally with:</p>" +
+          "<p><code>bash scripts/build_web_demo.sh --out target/manual/demo</code></p>" +
+          "<p style=\"font-size:12px\">Detail: <code>" + msg.replace(/[<>&]/g, "") + "</code></p>",
+          "Bundle Missing",
+          "warn"
+        );
+      }
+    }
+
+    if (loadingEl) {
+      bootDemo();
+    }
+  </script>
+</body>
+</html>
