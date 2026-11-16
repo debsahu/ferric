@@ -4,6 +4,21 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
+## [0.15.0] — 2026-11-16
+
+### Interactive 8-Module Video Showcase (`ferric export-tour`), `F30` In-Crate Icon & Scheduled `nmrassign` Alias Removal
+
+- **Interactive 8-Module Video Showcase (`ferric export-tour` + `scripts/build_interactive_tours.py`)**:
+  - Added deterministic `1280×720` tour exporter (`ferric export-tour --out-dir <dir> --module 01..08|all [--render-videos] [--keyframes-only]`, schema `ferric-tour-v1`) generating `.tour.json` metadata, byte-identical PNG keyframes, and optional H.264 `.mp4` / VP9 `.webm` clips via external `ffmpeg` subprocess (`THIRD_PARTY.md`).
+  - Added `60 fps` HTML5 `<canvas>` live parameter explorer + pre-rendered `<video>` showcase deployed to `https://debsahu.github.io/ferric/tours/`, linked from `README.md` and User Manual Chapters `01`–`08` with candid `fid_ingest_synthetic_nus` (Module `01`), `cold_gate_failed_withdrawn` (Module `02`, `13.1:P1-2`), `F8` cold holdout (Module `03`), and `SYNTHETIC FORWARD-MODEL SHOWCASE` / `PROTOCOL SHOWCASE` (Modules `04`–`08`) disclosures.
+- **Closed `[x] F30` (`crates/nmr-gui/assets/ferric-icon-64.rgba`)**: Moved the `16,384`-byte single-source-of-truth `64×64` RGBA8 icon inside `crates/nmr-gui` (`include_bytes!("../assets/ferric-icon-64.rgba")`), verified byte-for-byte against `docs/assets/brand/ferric-icon-64.rgba` by both Rust unit tests and `scripts/render_ferric_brand.py --self-test`.
+- **Removed: `nmrassign` compatibility alias** (as scheduled in `v0.14.0`): Removed `[[bin]] name = "nmrassign"`, the `argv[0]` deprecation branch, and `nmrassign[.exe]` from `release.yml` / `package_release.py` archives; Linux `install-desktop.sh` removes any legacy `v0.14.x` `bin/nmrassign` on upgrade. Use `ferric`.
+- **Benchmark & Workspace Non-Regression (`AGENTS.md` DoD)**:
+  - 5-seed Ubiquitin `--realistic` (`ferric benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5`): `evo-graph` CPU `98.4%` acc / `98.4%` (`310/315`) HC prec; `standard` CPU `90.0%` acc / `97.1%` (`170/175`) HC prec; `standard` WebGPU `88.4%` acc / `95.8%` (`181/189`) HC prec.
+  - 5-seed `CISD3` (`BMRB 51439`, `ferric real-benchmark --manifest data/benchmark/real_manifest.tsv --split dev --seeds 5`): `evo-graph` CPU `64.4%` acc / `100.0%` (`59/59`) HC prec; `standard` CPU `62.5%` acc / `92.9%` (`52/56`) HC prec; `standard` WebGPU `58.8%` acc / `96.6%` (`57/59`) HC prec.
+
+---
+
 ## [0.14.0] — 2026-11-16
 
 ### Renamed to FERRIC

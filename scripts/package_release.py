@@ -831,8 +831,8 @@ if [[ "${UNINSTALL}" -eq 1 ]]; then
   exit 0
 fi
 
-# Clean up legacy v0.13.0 launcher/icons/GUI binary if upgrading in place
-rm -f "${BIN_DIR}/nmrassign-gui"
+# Clean up legacy v0.13.0/v0.14.x launcher/icons/deprecated alias binaries if upgrading in place
+rm -f "${BIN_DIR}/nmrassign" "${BIN_DIR}/nmrassign-gui"
 rm -f "${APP_DIR}/nmr-assign.desktop"
 rm -f "${ICON_SVG_DIR}/nmr-assign.svg"
 rm -f "${DATA_DIR}"/icons/hicolor/*/apps/nmr-assign.png
@@ -840,7 +840,6 @@ rm -f "${DATA_DIR}"/icons/hicolor/*/apps/nmr-assign.png
 mkdir -p "${BIN_DIR}" "${APP_DIR}" "${ICON_SVG_DIR}" "${ICON_PNG_DIR}"
 install -m 0755 "${SCRIPT_DIR}/bin/ferric-gui" "${BIN_DIR}/ferric-gui"
 install -m 0755 "${SCRIPT_DIR}/bin/ferric" "${BIN_DIR}/ferric"
-install -m 0755 "${SCRIPT_DIR}/bin/nmrassign" "${BIN_DIR}/nmrassign"
 install -m 0644 "${SCRIPT_DIR}/share/icons/hicolor/scalable/apps/ferric.svg" "${ICON_SVG_DIR}/ferric.svg"
 install -m 0644 "${SCRIPT_DIR}/share/icons/hicolor/256x256/apps/ferric.png" "${ICON_PNG_DIR}/ferric.png"
 
@@ -961,10 +960,8 @@ def _codesign_macos_app(app_dir: Path) -> None:
     if sys.platform != "darwin" or not shutil.which("codesign"):
         return
     cli_bin = app_dir / "Contents" / "MacOS" / CLI_BIN
-    alias_bin = app_dir / "Contents" / "MacOS" / CLI_ALIAS_BIN
     gui_bin = app_dir / "Contents" / "MacOS" / GUI_BIN
     subprocess.run(["codesign", "--force", "--sign", "-", str(cli_bin)], check=True, capture_output=True, text=True)
-    subprocess.run(["codesign", "--force", "--sign", "-", str(alias_bin)], check=True, capture_output=True, text=True)
     subprocess.run(["codesign", "--force", "--sign", "-", str(gui_bin)], check=True, capture_output=True, text=True)
     subprocess.run(
         ["codesign", "--force", "--deep", "--sign", "-", str(app_dir)],
@@ -1027,7 +1024,6 @@ def package_macos_arm64(
     """Build ``FERRIC.app``, ``.dmg``, and ``.tar.gz`` for ``macos-arm64``."""
     gui_src = _require_binary(bin_dir, GUI_BIN)
     cli_src = _require_binary(bin_dir, CLI_BIN)
-    alias_src = _require_binary(bin_dir, CLI_ALIAS_BIN)
     readme_src = repo_root / "README.md"
     third_party_src = repo_root / "THIRD_PARTY.md"
 
@@ -1057,13 +1053,10 @@ def package_macos_arm64(
 
         gui_dst = macos_dir / GUI_BIN
         cli_dst = macos_dir / CLI_BIN
-        alias_dst = macos_dir / CLI_ALIAS_BIN
         shutil.copy2(gui_src, gui_dst)
         shutil.copy2(cli_src, cli_dst)
-        shutil.copy2(alias_src, alias_dst)
         os.chmod(gui_dst, 0o755)
         os.chmod(cli_dst, 0o755)
-        os.chmod(alias_dst, 0o755)
 
         _codesign_macos_app(app_dir)
 
@@ -1073,17 +1066,13 @@ def package_macos_arm64(
             shutil.rmtree(out_app_dir)
         shutil.copytree(app_dir, out_app_dir, symlinks=True)
 
-        # Top-level bin/{ferric,nmrassign} + docs inside .tar.gz staging root
+        # Top-level bin/ferric + docs inside .tar.gz staging root
         top_bin = tar_stage / "bin"
         top_bin.mkdir(parents=True, exist_ok=True)
         top_cli = top_bin / CLI_BIN
-        top_alias = top_bin / CLI_ALIAS_BIN
         shutil.copy2(cli_src, top_cli)
-        shutil.copy2(alias_src, top_alias)
         os.chmod(top_cli, 0o755)
-        os.chmod(top_alias, 0o755)
         _codesign_macos_binary(top_cli)
-        _codesign_macos_binary(top_alias)
 
         shutil.copyfile(readme_src, tar_stage / "README.md")
         shutil.copyfile(third_party_src, tar_stage / "THIRD_PARTY.md")
@@ -1096,9 +1085,7 @@ def package_macos_arm64(
             executable_relpaths=(
                 f"{APP_NAME}.app/Contents/MacOS/{GUI_BIN}",
                 f"{APP_NAME}.app/Contents/MacOS/{CLI_BIN}",
-                f"{APP_NAME}.app/Contents/MacOS/{CLI_ALIAS_BIN}",
                 f"bin/{CLI_BIN}",
-                f"bin/{CLI_ALIAS_BIN}",
             ),
         )
         outputs.append(tar_gz_path)
@@ -1134,7 +1121,6 @@ def package_windows_x86_64(
     """Build deterministic ``.zip`` release bundle for ``windows-x86_64``."""
     gui_src = _require_binary(bin_dir, f"{GUI_BIN}.exe")
     cli_src = _require_binary(bin_dir, f"{CLI_BIN}.exe")
-    alias_src = _require_binary(bin_dir, f"{CLI_ALIAS_BIN}.exe")
     readme_src = repo_root / "README.md"
     third_party_src = repo_root / "THIRD_PARTY.md"
 
@@ -1150,7 +1136,6 @@ def package_windows_x86_64(
         stage.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(gui_src, stage / f"{GUI_BIN}.exe")
         shutil.copyfile(cli_src, stage / f"{CLI_BIN}.exe")
-        shutil.copyfile(alias_src, stage / f"{CLI_ALIAS_BIN}.exe")
         (stage / f"{APP_SLUG}.ico").write_bytes(ico_bytes)
         (stage / "Launch-NMR-Workbench.bat").write_bytes(render_windows_launcher_bat())
         shutil.copyfile(readme_src, stage / "README.md")
@@ -1163,7 +1148,6 @@ def package_windows_x86_64(
             executable_relpaths=(
                 f"{GUI_BIN}.exe",
                 f"{CLI_BIN}.exe",
-                f"{CLI_ALIAS_BIN}.exe",
                 "Launch-NMR-Workbench.bat",
             ),
         )
@@ -1180,7 +1164,6 @@ def package_linux_x86_64(
     """Build deterministic ``.tar.gz`` FreeDesktop bundle for ``linux-x86_64``."""
     gui_src = _require_binary(bin_dir, GUI_BIN)
     cli_src = _require_binary(bin_dir, CLI_BIN)
-    alias_src = _require_binary(bin_dir, CLI_ALIAS_BIN)
     readme_src = repo_root / "README.md"
     third_party_src = repo_root / "THIRD_PARTY.md"
 
@@ -1205,10 +1188,8 @@ def package_linux_x86_64(
 
         shutil.copyfile(gui_src, bin_stage / GUI_BIN)
         shutil.copyfile(cli_src, bin_stage / CLI_BIN)
-        shutil.copyfile(alias_src, bin_stage / CLI_ALIAS_BIN)
         os.chmod(bin_stage / GUI_BIN, 0o755)
         os.chmod(bin_stage / CLI_BIN, 0o755)
-        os.chmod(bin_stage / CLI_ALIAS_BIN, 0o755)
 
         (app_stage / f"{APP_SLUG}.desktop").write_text(desktop_text, encoding="utf-8", newline="\n")
         (svg_stage / f"{APP_SLUG}.svg").write_text(svg_text, encoding="utf-8", newline="\n")
@@ -1228,7 +1209,6 @@ def package_linux_x86_64(
             executable_relpaths=(
                 f"bin/{GUI_BIN}",
                 f"bin/{CLI_BIN}",
-                f"bin/{CLI_ALIAS_BIN}",
                 "install-desktop.sh",
             ),
         )
@@ -1378,14 +1358,18 @@ def run_self_test(repo_root: Path) -> int:
             for req_exec in (
                 f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/{GUI_BIN}",
                 f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/{CLI_BIN}",
-                f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/{CLI_ALIAS_BIN}",
                 f"{mac_prefix}/bin/{CLI_BIN}",
-                f"{mac_prefix}/bin/{CLI_ALIAS_BIN}",
             ):
                 if req_exec not in members:
                     raise AssertionError(f"Missing {req_exec} in macOS .tar.gz")
                 if (members[req_exec].mode & 0o777) != 0o755:
                     raise AssertionError(f"Expected 0755 on {req_exec}, got {oct(members[req_exec].mode)}")
+            for absent_alias in (
+                f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/{CLI_ALIAS_BIN}",
+                f"{mac_prefix}/bin/{CLI_ALIAS_BIN}",
+            ):
+                if absent_alias in members:
+                    raise AssertionError(f"Deprecated alias {absent_alias} must not ship in v0.15.0")
             for req_doc in (
                 f"{mac_prefix}/{APP_NAME}.app/Contents/Info.plist",
                 f"{mac_prefix}/{APP_NAME}.app/Contents/PkgInfo",
@@ -1416,7 +1400,6 @@ def run_self_test(repo_root: Path) -> int:
             for req_win in (
                 f"{win_prefix}/{GUI_BIN}.exe",
                 f"{win_prefix}/{CLI_BIN}.exe",
-                f"{win_prefix}/{CLI_ALIAS_BIN}.exe",
                 f"{win_prefix}/{APP_SLUG}.ico",
                 f"{win_prefix}/Launch-NMR-Workbench.bat",
                 f"{win_prefix}/README.md",
@@ -1424,6 +1407,8 @@ def run_self_test(repo_root: Path) -> int:
             ):
                 if req_win not in names:
                     raise AssertionError(f"Missing {req_win} in Windows .zip")
+            if f"{win_prefix}/{CLI_ALIAS_BIN}.exe" in names:
+                raise AssertionError("Deprecated nmrassign.exe alias must not ship in v0.15.0")
             validate_ico_bytes(zf.read(f"{win_prefix}/{APP_SLUG}.ico"), ICO_SIZES)
         win_repeat_dir = tmp_path / "win_repeat"
         win_repeat = package_windows_x86_64(repo_root, mock_bins, win_repeat_dir, version)[0]
@@ -1440,13 +1425,14 @@ def run_self_test(repo_root: Path) -> int:
             for req_exec in (
                 f"{lin_prefix}/bin/{GUI_BIN}",
                 f"{lin_prefix}/bin/{CLI_BIN}",
-                f"{lin_prefix}/bin/{CLI_ALIAS_BIN}",
                 f"{lin_prefix}/install-desktop.sh",
             ):
                 if req_exec not in members:
                     raise AssertionError(f"Missing {req_exec} in Linux .tar.gz")
                 if (members[req_exec].mode & 0o777) != 0o755:
                     raise AssertionError(f"Expected 0755 on {req_exec}, got {oct(members[req_exec].mode)}")
+            if f"{lin_prefix}/bin/{CLI_ALIAS_BIN}" in members:
+                raise AssertionError("Deprecated nmrassign alias must not ship in Linux v0.15.0 archive")
             for req_file in (
                 f"{lin_prefix}/share/applications/{APP_SLUG}.desktop",
                 f"{lin_prefix}/share/icons/hicolor/scalable/apps/{APP_SLUG}.svg",
@@ -1467,15 +1453,16 @@ def run_self_test(repo_root: Path) -> int:
                 else:
                     tf.extractall(extract_dir)
                 xdg_prefix = tmp_path / "xdg_local"
-                # Stage a legacy v0.13.0 layout to verify upgrade cleanup (18.2:P2-2)
+                # Stage a legacy v0.13.0/v0.14.x layout to verify upgrade cleanup
+                legacy_alias = xdg_prefix / "bin" / CLI_ALIAS_BIN
                 legacy_bin = xdg_prefix / "bin" / "nmrassign-gui"
                 legacy_desktop = xdg_prefix / "share" / "applications" / "nmr-assign.desktop"
                 legacy_svg = xdg_prefix / "share" / "icons" / "hicolor" / "scalable" / "apps" / "nmr-assign.svg"
                 legacy_png_256 = xdg_prefix / "share" / "icons" / "hicolor" / "256x256" / "apps" / "nmr-assign.png"
                 legacy_png_128 = xdg_prefix / "share" / "icons" / "hicolor" / "128x128" / "apps" / "nmr-assign.png"
-                for lp in (legacy_bin, legacy_desktop, legacy_svg, legacy_png_256, legacy_png_128):
+                for lp in (legacy_alias, legacy_bin, legacy_desktop, legacy_svg, legacy_png_256, legacy_png_128):
                     lp.parent.mkdir(parents=True, exist_ok=True)
-                    lp.write_text("legacy-v0.13.0\n", encoding="utf-8")
+                    lp.write_text("legacy-v0.13-v0.14\n", encoding="utf-8")
 
                 subprocess.run(
                     ["bash", str(extract_dir / lin_prefix / "install-desktop.sh"), "--prefix", str(xdg_prefix)],
@@ -1483,14 +1470,13 @@ def run_self_test(repo_root: Path) -> int:
                     capture_output=True,
                     text=True,
                 )
-                for lp in (legacy_bin, legacy_desktop, legacy_svg, legacy_png_256, legacy_png_128):
+                for lp in (legacy_alias, legacy_bin, legacy_desktop, legacy_svg, legacy_png_256, legacy_png_128):
                     if lp.exists():
-                        raise AssertionError(f"Legacy v0.13.0 file not removed on upgrade: {lp}")
+                        raise AssertionError(f"Legacy file not removed on upgrade: {lp}")
                 installed_desktop = xdg_prefix / "share" / "applications" / f"{APP_SLUG}.desktop"
                 if (
                     not (xdg_prefix / "bin" / GUI_BIN).is_file()
                     or not (xdg_prefix / "bin" / CLI_BIN).is_file()
-                    or not (xdg_prefix / "bin" / CLI_ALIAS_BIN).is_file()
                     or not installed_desktop.is_file()
                 ):
                     raise AssertionError("install-desktop.sh failed to populate XDG prefix")

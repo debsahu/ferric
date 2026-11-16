@@ -8309,20 +8309,7 @@ fn cmd_chem(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn maybe_warn_deprecated_binary_alias() {
-    if let Some(arg0) = env::args_os().next() {
-        if let Some(stem) = Path::new(&arg0).file_stem().and_then(|s| s.to_str()) {
-            if stem.eq_ignore_ascii_case("nmrassign") {
-                eprintln!(
-                    "warning: 'nmrassign' is deprecated; use 'ferric' (alias removed in v0.15.0)"
-                );
-            }
-        }
-    }
-}
-
 fn main() {
-    maybe_warn_deprecated_binary_alias();
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         print!("{}", usage());

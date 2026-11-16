@@ -66,3 +66,9 @@ All empirical chemical-shift priors, topology tables, and real-protein benchmark
 ## 5. Brand Assets & Wordmark Provenance
 
 - **FERRIC Brand Suite (`docs/assets/brand/`)**: All icons (`ferric-icon.svg`, `ferric-icon-mono.svg`, `favicon.svg`, `favicon-32.png`), header lockups (`ferric-logo-light.svg`, `ferric-logo-dark.svg`), social preview (`ferric-social-preview.png`), and the `"FERRIC"` geometric `<path>` wordmark (`ferric-wordmark.svg`) are original works generated deterministically by `scripts/render_ferric_brand.py` under the project's **MIT License** (`LICENSE`). Zero external or proprietary OS fonts are referenced or embedded.
+
+---
+
+## External Optional Subprocess Tools (Not Linked or Distributed)
+
+- **`ffmpeg` / `ffprobe` (`docs.yml` CI & optional `--render-videos`)**: Never linked into or distributed with FERRIC binaries. Invoked strictly as an external OS subprocess (`Command::new("ffmpeg")` stdin raw RGB24 pipe) only when the user passes `--render-videos` to `ferric export-tour`, and installed on CI runners via `apt-get` in `.github/workflows/docs.yml`. Standard system `ffmpeg` packages combine `FFmpeg` (LGPL-2.1+ or GPL-2.0+ depending on distributor build flags), `libvpx` (BSD-3-Clause, `.webm` VP9), and `libx264` (GPL-2.0+, `.mp4` H.264). Without `ffmpeg` on `PATH`, `ferric export-tour` still exports `.tour.json` and deterministic `1280×720` PNG keyframes cleanly.

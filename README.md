@@ -46,7 +46,7 @@ Drag and drop any Bruker experiment directory (`ser`/`fid` or `pdata/1`), NMRPip
 
 ### 2. Automated Command-Line Workflows (`ferric`)
 
-*(In `v0.14.x`, `nmrassign` remains available as a deprecated compatibility alias with a stderr warning and identical stdout; removed in `v0.15.0`.)*
+*(The `nmrassign` compatibility alias from `v0.14.x` was removed in `v0.15.0`; use `ferric`.)*
 
 ```bash
 # End-to-end raw-FID processing -> peak picking -> evo-graph assignment -> NEF v1.1 + HTML QC report

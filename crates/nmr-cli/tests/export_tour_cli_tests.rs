@@ -60,10 +60,6 @@ fn ferric_bin() -> &'static str {
     env!("CARGO_BIN_EXE_ferric")
 }
 
-fn nmrassign_compat_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_nmrassign")
-}
-
 fn run_ferric(args: &[&str]) -> Result<String, String> {
     let out = Command::new(ferric_bin())
         .args(args)
@@ -161,10 +157,12 @@ fn test_export_tour_keyframes_deterministic_and_schema_valid() {
         let badge_json = parsed["validation_badge"].to_string();
         match idx + 1 {
             2 => assert!(
-                badge_json.contains("86")
-                    && badge_json.contains("96")
-                    && badge_json.contains("CISD3"),
-                "module 02 must disclose cold BMRB range and CISD3"
+                badge_json.contains("88.25")
+                    && badge_json.contains("95.30")
+                    && badge_json.contains("CISD3")
+                    && badge_json.contains("FAIL")
+                    && badge_json.contains("withdrawn"),
+                "module 02 must disclose evo-graph cold BMRB range (88.25-95.30% FAIL/withdrawn) and CISD3"
             ),
             3 => assert!(
                 badge_json.contains("F8") && badge_json.contains("1KHM"),
@@ -277,77 +275,73 @@ fn test_export_tour_single_module_and_adversarial_failures() {
 }
 
 #[test]
-fn test_nmrassign_compat_alias_export_tour_emits_deprecation_and_matches_ferric() {
-    let ferric_dir = ScopedTempDir::new("compat_ferric");
-    let alias_dir = ScopedTempDir::new("compat_alias");
-    let ferric_str = ferric_dir.path.to_string_lossy().into_owned();
-    let alias_str = alias_dir.path.to_string_lossy().into_owned();
-
+fn test_module_01_and_02_validation_badges_candor() {
+    let out_dir = ScopedTempDir::new("badge_candor");
+    let out_str = out_dir.path.to_string_lossy().into_owned();
     run_ferric(&[
         "export-tour",
         "--out-dir",
-        &ferric_str,
+        &out_str,
         "--module",
         "01",
         "--keyframes-only",
     ])
-    .expect("ferric export-tour --module 01 must succeed");
+    .expect("export-tour module 01");
+    run_ferric(&[
+        "export-tour",
+        "--out-dir",
+        &out_str,
+        "--module",
+        "02",
+        "--keyframes-only",
+    ])
+    .expect("export-tour module 02");
 
-    let alias_out = Command::new(nmrassign_compat_bin())
-        .args([
-            "export-tour",
-            "--out-dir",
-            &alias_str,
-            "--module",
-            "01",
-            "--keyframes-only",
-        ])
-        .output()
-        .expect("spawn nmrassign compatibility alias");
+    let m1_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(out_dir.path.join("data/01_fid_pulprog_nus.tour.json"))
+            .expect("read m1 json"),
+    )
+    .expect("parse m1 json");
+    let m1_kind = m1_json["validation_badge"]["kind"]
+        .as_str()
+        .unwrap_or_default();
+    assert_ne!(m1_kind, "empirical_calibrated");
+    assert_eq!(m1_kind, "fid_ingest_synthetic_nus");
+    let m1_detail = m1_json["validation_badge"]["detail"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
-        alias_out.status.success(),
-        "nmrassign export-tour alias must succeed, stderr: {}",
-        String::from_utf8_lossy(&alias_out.stderr)
+        m1_detail.to_ascii_lowercase().contains("synthetic"),
+        "Module 01 badge detail must disclose synthetic NUS demo: {m1_detail}"
     );
 
-    let stderr = String::from_utf8_lossy(&alias_out.stderr);
-    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert_eq!(
-        lines.len(),
-        1,
-        "expected single deprecation warning line on stderr, got: {stderr:?}"
+    let m2_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(out_dir.path.join("data/02_hsqc_strips_solvers.tour.json"))
+            .expect("read m2 json"),
+    )
+    .expect("parse m2 json");
+    let m2_kind = m2_json["validation_badge"]["kind"]
+        .as_str()
+        .unwrap_or_default();
+    assert_ne!(m2_kind, "empirical_calibrated");
+    assert_eq!(m2_kind, "cold_gate_failed_withdrawn");
+    let m2_label = m2_json["validation_badge"]["label"]
+        .as_str()
+        .unwrap_or_default();
+    let m2_detail = m2_json["validation_badge"]["detail"]
+        .as_str()
+        .unwrap_or_default();
+    let combined = format!("{m2_label} {m2_detail}");
+    assert!(
+        combined.to_ascii_lowercase().contains("synthetic"),
+        "Module 02 badge must label Ubiquitin as synthetic: {combined}"
     );
     assert!(
-        lines[0].to_ascii_lowercase().contains("deprecated") && lines[0].contains("ferric"),
-        "expected deprecation warning mentioning ferric, got: {:?}",
-        lines[0]
+        combined.to_ascii_lowercase().contains("dev"),
+        "Module 02 badge must label CISD3 as dev: {combined}"
     );
-
-    let f_json = fs::read_to_string(ferric_dir.path.join("data/01_fid_pulprog_nus.tour.json"))
-        .expect("read ferric tour json");
-    let a_json = fs::read_to_string(alias_dir.path.join("data/01_fid_pulprog_nus.tour.json"))
-        .expect("read alias tour json");
-    assert_eq!(
-        f_json, a_json,
-        "nmrassign alias must produce identical tour JSON to ferric"
+    assert!(
+        combined.contains("FAIL") && combined.to_ascii_lowercase().contains("withdrawn"),
+        "Module 02 badge must disclose cold gate FAIL and 13.1:P1-2 withdrawal: {combined}"
     );
-
-    for ch in 1..=4 {
-        let f_png = fs::read(
-            ferric_dir
-                .path
-                .join(format!("keyframes/01_fid_pulprog_nus_ch{ch}.png")),
-        )
-        .expect("read ferric png");
-        let a_png = fs::read(
-            alias_dir
-                .path
-                .join(format!("keyframes/01_fid_pulprog_nus_ch{ch}.png")),
-        )
-        .expect("read alias png");
-        assert_eq!(
-            f_png, a_png,
-            "nmrassign alias must produce identical keyframe ch{ch}.png to ferric"
-        );
-    }
 }

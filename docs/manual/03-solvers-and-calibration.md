@@ -2,8 +2,8 @@
 
 FERRIC provides three complementary, 100% clean-room backbone resonance assignment engines—**`standard`**, **`evo-graph`**, and the opt-in experimental Bayesian statistical-mechanics solver **`bayes-sa`**—backed by unified dataset quality control (`nmr-core::qc`) and isotonic confidence calibration. Every solver outputs shifts strictly in the experimental spectrum's ppm frame and obeys the **sequence-only invariant** (zero 3D coordinates or homolog templates used during sequence-based backbone assignment).
 
-> [!TIP] Interactive Tour & HD Video (5-Seed Calibrated · `~86%–96%` Cold HC-Prec)
-> Launch **[Module 02: HSQC Strips & Backbone Solvers](tours/02_hsqc_strips_solvers.html)** (interactive residue-focus strip walk + `1280×720` HD video), or browse **[All 8 Module Tours](tours/index.html)**.
+> [!TIP] Interactive Tour & HD Video (Synthetic / Dev · Cold HCP Gate Failed & Withdrawn)
+> Launch **[Module 02: HSQC Strips & Backbone Solvers](tours/02_hsqc_strips_solvers.html)** — **synthetic** Ubiquitin (`--realistic` `98.4%`, `310/315`), **dev** `CISD3` (`BMRB 51439`: `64.38%`, `59/59` HC); default `evo-graph` unseen cold micro HC-prec `88.25%–95.30%` (latest single-shot cold cohort scored `88.25%`, which **FAILS** the `>= 94%` gate; cold HCP claim formally **withdrawn** under `13.1:P1-2`). Or browse **[All 8 Module Tours](tours/index.html)**.
 
 ---
 

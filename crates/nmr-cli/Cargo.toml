@@ -12,10 +12,6 @@ description = "Command-line interface for NMR backbone resonance assignment, pea
 name = "ferric"
 path = "src/main.rs"
 
-[[bin]]
-name = "nmrassign"
-path = "src/main.rs"
-
 [dependencies]
 nmr-core = { path = "../nmr-core" }
 nmr-gpu = { path = "../nmr-gpu" }

@@ -17,7 +17,7 @@ Every algorithm in FERRIC is implemented first as an audited `f64` reference eng
 | `crates/nmr-core` | Deterministic `f64` reference DSP, `pulseprogram` physics interpreter, hypercomplex `IST`/`FISTA` NUS, classical & 3D CNN peak pickers, multi-regime backbone/sidechain/methyl solvers, `DatasetQcReport` isotonic calibration, 3D NOESY/torsion/`RDC` folding, $R_1$/$R_2$/Model-Free/`CEST`/`CPMG`/`CSP` kinetics, 1D Voigt/Hoye/`qNMR`/`DOSY`, untargeted 1D `metabolomics` (`AI-Binning`/`PQN`/`PCA`/`OPLS-DA`/`STOCSY`), `Octet` 2D cheminformatics, and JSON-RPC 2.0 `MCP` engine | Native (`x86_64`, `aarch64`) & `wasm32` |
 | `crates/nmr-gpu` | Portable `@group(0)` `WGSL` compute shaders (`16 KiB` workgroup-SRAM multi-replica simulated annealing, `Q27.36` fixed-point energy parity, 3D separable CNN inference, Saupe `RDC` gradient batches, Monte Carlo relaxation, Bloch–McConnell `CEST`, `CPMG`, and `DOSY` VarPro+LM) with upfront `wgpu::Limits` & TDR chunking guards | Native GPU & Browser WebGPU |
 | `crates/nmr-gui` | Immediate-mode `eframe` / `egui` + `wgpu` scientific workbench: 60+ fps GPU 2D contour overlays, synchronized 3D strip walks, sequence ribbon & 2D covalent sidechain graph, 1300+ fps 3D cartoon ribbon / putty / restraint-cylinder viewer, Dynamics Studio, 4-mode 1D Stack, 2D `DOSY` & 4-quadrant `Metabolomics` studios, `Octet` Chemical Studio, built-in zero-I/O Demo Suite, and loopback `MCP` bridge | Desktop App & Zero-Install Browser WASM |
-| `crates/nmr-cli` | Unified `ferric` command-line binary (plus deprecated `nmrassign` compatibility alias for `v0.14.x`) exposing headless processing, assignment, structure folding, dynamics, 1D/`DOSY`/`metabolomics`, self-hosted REST job server (`serve`), `MCP` server (`mcp` / `mcp-config`), deterministic publication SVG figure export (`export-fig`), and reproducible BMRB benchmark suites | Native CLI (`macOS`, `Linux`, `Windows`) |
+| `crates/nmr-cli` | Unified `ferric` command-line binary (the `nmrassign` alias was removed in `v0.15.0`) exposing headless processing, assignment, structure folding, dynamics, 1D/`DOSY`/`metabolomics`, self-hosted REST job server (`serve`), `MCP` server (`mcp` / `mcp-config`), deterministic publication SVG figure export (`export-fig`), interactive tour export (`export-tour`), and reproducible BMRB benchmark suites | Native CLI (`macOS`, `Linux`, `Windows`) |
 
 ---
 
@@ -42,8 +42,8 @@ Launch the **[Interactive Showcase Cinema Gallery](tours/index.html)** (`60 fps`
 
 | Module | Interactive Tour & HD Video | Validation Scope |
 | :--- | :--- | :--- |
-| **01** | **[Raw-FID DSP & Pulprog Engine](tours/01_fid_pulprog_nus.html)** | Empirical + LOPO Calibrated (`25%` Poisson-gap NUS & IST) |
-| **02** | **[HSQC Strips & Backbone Solvers](tours/02_hsqc_strips_solvers.html)** | 5-Seed Calibrated (`~86%–96%` cold HC-prec; Ubiquitin `98.4%`, `CISD3` `64.38%`) |
+| **01** | **[Raw-FID DSP & Pulprog Engine](tours/01_fid_pulprog_nus.html)** | Raw Bruker/Varian FID & `pulprog` AST ingest; `25%` Poisson-gap NUS IST/FISTA demo is **synthetic** |
+| **02** | **[HSQC Strips & Backbone Solvers](tours/02_hsqc_strips_solvers.html)** | **Synthetic** Ubiquitin (`--realistic` `98.4%`, `310/315`), **dev** `CISD3` (`BMRB 51439`: `64.38%`, `59/59` HC); default `evo-graph` unseen cold micro HC-prec `88.25%–95.30%` (latest `88.25%` **FAILS** `>= 94%` gate; cold HCP claim formally **withdrawn** under `13.1:P1-2`) |
 | **03** | **[3D Structure, NOE & RDC](tours/03_structure_noe_rdc.html)** | **Cold Holdout Disclosed (`F8`)**: unseen `1KHM -> 1ZZK` (`1.86–4.14 Å`, `0/5 < 1.80 Å`) |
 | **04** | **[Relaxation & Lipari-Szabo](tours/04_relax_modelfree.html)** | `SYNTHETIC FORWARD-MODEL SHOWCASE` (`F10`/`F11` open) |
 | **05** | **[CEST, CPMG & Tight-Binding CSP](tours/05_exchange_cest_cpmg_csp.html)** | `SYNTHETIC FORWARD-MODEL SHOWCASE` (`F13` open) |

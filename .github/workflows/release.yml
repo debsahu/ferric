@@ -112,7 +112,7 @@ jobs:
           fi
           "$PY_BIN" scripts/package_release.py --self-test
 
-      - name: Build workspace release binaries (ferric, ferric-gui, and nmrassign alias)
+      - name: Build workspace release binaries (ferric and ferric-gui)
         run: cargo build --release --workspace --bins
 
       - name: Package & verify Apple Silicon macOS release (.app + .dmg + .tar.gz)
@@ -150,7 +150,7 @@ jobs:
           python3 - <<'PY'
           import re, subprocess, sys
           max_ver = (0, 0)
-          for b in ("target/release/ferric", "target/release/ferric-gui", "target/release/nmrassign"):
+          for b in ("target/release/ferric", "target/release/ferric-gui"):
               out = subprocess.check_output(["objdump", "-T", b], text=True)
               for m in re.finditer(r"GLIBC_(\d+)\.(\d+)", out):
                   v = (int(m.group(1)), int(m.group(2)))

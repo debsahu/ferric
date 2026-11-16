@@ -9,7 +9,7 @@ This chapter serves as the complete reference for the `ferric` command-line inte
 
 ## `ferric` CLI Subcommand Reference
 
-Every `ferric` subcommand (with `nmrassign` retained as a deprecated `v0.14.x` compatibility alias emitting one stderr warning; removed in `v0.15.0`) runs deterministically on macOS, Linux, and Windows (`--version` / `-V` prints the semantic version and embedded short Git SHA). Engine flags accept `--engine gpu` (WebGPU: Metal/Vulkan/DX12), `--engine cpu` (`f64` multi-threaded CPU), or `--engine auto` (hardware WebGPU with graceful CPU fallback).
+Every `ferric` subcommand (the deprecated `v0.14.x` `nmrassign` compatibility alias was removed in `v0.15.0`) runs deterministically on macOS, Linux, and Windows (`--version` / `-V` prints the semantic version and embedded short Git SHA). Engine flags accept `--engine gpu` (WebGPU: Metal/Vulkan/DX12), `--engine cpu` (`f64` multi-threaded CPU), or `--engine auto` (hardware WebGPU with graceful CPU fallback).
 
 ### Summary of Subcommands
 
@@ -401,3 +401,20 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
 | **`Cmd/Ctrl+Shift+S`** | File & Session | Save lossless `NEF v1.1` session to a new path |
 | **`Cmd/Ctrl+E`** | File & Session | Export assigned chemical shifts (`NMR-STAR v3.2` `.str`) |
 | **`Cmd/Ctrl+Enter`** | Assignment | Run automated backbone resonance assignment |
+
+---
+
+## Interactive Showcase Tours (`ferric export-tour`)
+
+Generate deterministic `1280×720` tour bundles (`.tour.json` + PNG keyframes, plus optional H.264 `.mp4` and VP9 `.webm` HD videos) for all `8` showcase modules:
+
+```bash
+# JSON + deterministic 1280x720 PNG keyframes (no external tools required)
+ferric export-tour --out-dir ./tours_out --module all --keyframes-only
+
+# Full bundle including H.264 .mp4 and VP9 .webm videos (requires ffmpeg on PATH)
+ferric export-tour --out-dir ./tours_out --module all --render-videos --keyframes-only
+```
+
+- **Flags**: `--out-dir <dir>`, `--module 01..08|all`, `--render-videos`, `--keyframes-only`.
+- **External `ffmpeg` dependency**: `--render-videos` invokes `ffmpeg` (`libx264` + `libvpx-vp9`) as an external subprocess on `PATH`; without `ffmpeg`, `--keyframes-only` / JSON export still succeeds.

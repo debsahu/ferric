@@ -93,6 +93,8 @@ RESTRICTED_PRODUCT_TOKENS: Tuple[str, ...] = (
 
 BADGE_KIND_CLASSES: Dict[str, str] = {
     "empirical_calibrated": "badge-empirical",
+    "fid_ingest_synthetic_nus": "badge-empirical",
+    "cold_gate_failed_withdrawn": "badge-holdout",
     "cold_holdout_disclosed": "badge-holdout",
     "synthetic_showcase": "badge-synthetic",
     "synthetic_and_protocol_showcase": "badge-protocol",
@@ -439,8 +441,12 @@ def render_gallery_html(bundles: Sequence[NormalizedBundle]) -> str:
       </div>
       <div class="scope-legend" aria-label="Validation Scope Legend">
         <div class="legend-item">
-          <span class="val-badge badge-empirical">Empirical + LOPO Calibrated</span>
-          <span>Modules 01&ndash;02 calibrated on public BMRB + realistic Bruker physics</span>
+          <span class="val-badge badge-empirical">Raw Bruker/Varian FID Ingest &middot; Synthetic NUS Demo</span>
+          <span>Module 01 real Bruker/Varian raw-FID &amp; pulseprogram AST ingest; 25% Poisson-gap NUS IST/FISTA demo is synthetic</span>
+        </div>
+        <div class="legend-item">
+          <span class="val-badge badge-holdout">Synthetic / Dev &middot; Cold HCP Gate Failed (Withdrawn)</span>
+          <span>Module 02 synthetic Ubiquitin (98.4%), dev CISD3 (64.38% / 100% HC); default evo-graph cold HCP 88.25&ndash;95.30% (latest 88.25% FAILS &ge; 94%; withdrawn 13.1:P1-2)</span>
         </div>
         <div class="legend-item">
           <span class="val-badge badge-holdout">Cold Holdout Disclosed (F8)</span>
@@ -1925,7 +1931,7 @@ TOURS_PLAYER_JS = r"""(function () {
           ctx.fillText(stripNames[rIdx], sx, padY + ph + 14);
         }
       } else if (chIdx === 2) {
-        drawCardTitle(ctx, padX, padY - 12, "evo-graph vs standard SA vs bayes-sa Convergence", "Ubiquitin 98.4% · CISD3 64.38% (100% HC-prec) · Cold BMRB ~86-96%", pal);
+        drawCardTitle(ctx, padX, padY - 12, "evo-graph vs standard SA vs bayes-sa Convergence", "Synthetic UBQ 98.4% · Dev CISD3 64.38% (100% HC) · Cold evo-graph 88.25-95.30% (FAILS >=94%; withdrawn)", pal);
         drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Annealing Progress (1/T)", "Assignment Accuracy / Cv(T)", pal);
         var curves = [
           { col: pal.green, lbl: "evo-graph", finalV: 0.96 },
@@ -3060,8 +3066,8 @@ def validate_tour_site(
 def _make_mock_bundles(data_dir: Path) -> None:
     """Create minimal synthetic 01..08 *.tour.json fixtures for --self-test."""
     specs = [
-        (1, "01_fid_pulprog_nus", "Raw-FID DSP & Pulprog Engine", "02-custom-pulprog-and-dsp.html", "empirical_calibrated", "EMPIRICAL + LOPO CALIBRATED", "25% Poisson-gap NUS & IST", "nus_iter", 0, 20, 1, 20, "iter"),
-        (2, "02_hsqc_strips_solvers", "HSQC Strips & Backbone Solvers", "03-solvers-and-calibration.html", "empirical_calibrated", "5-SEED CALIBRATED (~86-96% COLD HC-PREC)", "Ubiquitin 98.4%, CISD3 64.38% (100% HC-prec)", "focus_res", 1, 10, 1, 7, "res"),
+        (1, "01_fid_pulprog_nus", "Raw-FID DSP & Pulprog Engine", "02-custom-pulprog-and-dsp.html", "fid_ingest_synthetic_nus", "RAW BRUKER/VARIAN FID INGEST · SYNTHETIC NUS DEMO", "25% Poisson-gap NUS & IST (synthetic demo)", "nus_iter", 0, 20, 1, 20, "iter"),
+        (2, "02_hsqc_strips_solvers", "HSQC Strips & Backbone Solvers", "03-solvers-and-calibration.html", "cold_gate_failed_withdrawn", "SYNTHETIC / DEV · COLD HCP GATE FAILED (WITHDRAWN)", "Synthetic UBQ 98.4%, dev CISD3 64.38%; cold evo-graph 88.25-95.30% (FAILS >=94%; withdrawn)", "focus_res", 1, 10, 1, 7, "res"),
         (3, "03_structure_noe_rdc", "3D Structure, NOE & RDC", "01-quickstart-and-workflows.html", "cold_holdout_disclosed", "COLD HOLDOUT DISCLOSED (F8)", "Unseen 1KHM->1ZZK 1.86-4.14 A (0/5 < 1.80 A)", "orbit_deg", 0, 360, 5, 45, "deg"),
         (4, "04_relax_modelfree", "Relaxation & Lipari-Szabo", "04-dynamics-and-exchange.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F10/F11 OPEN)", "Dual-field R1/R2/hetNOE & M1-M5 S^2", "residue_seq", 1, 76, 1, 23, "res"),
         (5, "05_exchange_cest_cpmg_csp", "CEST, CPMG & Tight-Binding CSP", "04-dynamics-and-exchange.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F13 OPEN)", "Pade CEST, Baldwin CPMG & Morrison Kd", "ligand_um", 0, 300, 5, 100, "uM"),

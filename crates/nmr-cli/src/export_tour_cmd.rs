@@ -1357,8 +1357,10 @@ impl FrameCanvas {
 
         // Prominent color-coded Validation Scope Badge
         let (badge_bg, badge_border, badge_ink) = match bundle.validation_badge.kind.as_str() {
-            "empirical_calibrated" => ([6, 78, 59, 245], [52, 211, 153, 255], [209, 250, 229, 255]),
-            "cold_holdout_disclosed" => (
+            "empirical_calibrated" | "fid_ingest_synthetic_nus" => {
+                ([6, 78, 59, 245], [52, 211, 153, 255], [209, 250, 229, 255])
+            }
+            "cold_gate_failed_withdrawn" | "cold_holdout_disclosed" => (
                 [120, 53, 15, 245],
                 [251, 191, 36, 255],
                 [254, 243, 199, 255],
@@ -1945,9 +1947,9 @@ exit\n";
         subtitle: "Bruker pulseprogram physics · Sine-bell FFT + Chen phase · Hypercomplex IST/FISTA".to_string(),
         manual_chapter: "02-custom-pulprog-and-dsp.html".to_string(),
         validation_badge: ValidationBadge {
-            kind: "empirical_calibrated".to_string(),
-            label: "RAW-FID DSP & PULPROG ENGINE".to_string(),
-            detail: "Empirical + LOPO calibrated Bruker/Varian pulseprogram AST, DSP group-delay removal, and hypercomplex IST/FISTA NUS reconstruction.".to_string(),
+            kind: "fid_ingest_synthetic_nus".to_string(),
+            label: "RAW BRUKER/VARIAN FID INGEST · SYNTHETIC NUS DEMO".to_string(),
+            detail: "Real Bruker/Varian raw-FID & pulseprogram AST ingest; 25% Poisson-gap NUS IST/FISTA reconstruction demo is synthetic.".to_string(),
         },
         duration_sec: TOUR_DURATION_SEC,
         fps: 30,
@@ -2310,12 +2312,12 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
         module_index: 2,
         slug: TourModuleId::M02HsqcStripsSolvers.slug().to_string(),
         title: "2D HSQC, 3D HNCACB Strips & Backbone Solvers".to_string(),
-        subtitle: "98.4% Ubiquitin (--realistic) · 64.38% / 100% HC CISD3 · 86.18%-96.31% cold BMRB HC-prec".to_string(),
+        subtitle: "Synthetic UBQ (--realistic) 98.4% · Dev CISD3 64.38%/100% HC · Cold BMRB evo-graph 88.25-95.30% (FAILS >=94%; withdrawn)".to_string(),
         manual_chapter: "03-solvers-and-calibration.html".to_string(),
         validation_badge: ValidationBadge {
-            kind: "empirical_calibrated".to_string(),
-            label: "5-SEED CALIBRATED (~86-96% COLD HC-PREC)".to_string(),
-            detail: "5-seed calibrated: 98.4% Ubiquitin (--realistic), 64.38% acc / 100% HC-prec CISD3 (BMRB 51439), and 86.18%-96.31% unseen cold BMRB HC-precision.".to_string(),
+            kind: "cold_gate_failed_withdrawn".to_string(),
+            label: "SYNTHETIC / DEV · COLD HCP GATE FAILED (WITHDRAWN)".to_string(),
+            detail: "Synthetic Ubiquitin (--realistic) 98.4% (310/315); dev CISD3 (BMRB 51439) 64.38% acc / 100% (59/59) HC; default evo-graph unseen cold micro HC-prec 88.25-95.30% (latest single-shot cold cohort 88.25% FAILS >= 94% gate; cold HCP claim formally withdrawn under 13.1:P1-2).".to_string(),
         },
         duration_sec: TOUR_DURATION_SEC,
         fps: 30,
@@ -2342,7 +2344,7 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
                 start_sec: 8.0,
                 end_sec: 12.0,
                 title: "Solver Cv(T) & Benchmark Range".to_string(),
-                caption: "bayes-sa specific-heat peak Cv(T) alongside 98.4% UBQ, 64.38%/100% HC CISD3, and 86.18-96.31% cold BMRB.".to_string(),
+                caption: "bayes-sa Cv(T) alongside synthetic UBQ (98.4%), dev CISD3 (64.38%/100% HC), and cold BMRB evo-graph 88.25-95.30% (FAILS >=94%; withdrawn).".to_string(),
                 metric_pill: format!("T_crit={:.2}, max Cv={:.1}", bayes_rep.t_crit, bayes_rep.max_cv),
             },
             TourChapter {
