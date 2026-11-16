@@ -3773,7 +3773,7 @@ fn render_m02_frame(
             let n_s = subset.len().max(1);
             let strip_w = ((right_x - left_x) - gap * ((n_s - 1) as f64)) / (n_s as f64);
             let map_cy =
-                |c_ppm: f64| -> f64 { top_y + (c_ppm - 15.0) / (73.0 - 15.0) * (bot_y - top_y) };
+                |c_ppm: f64| -> f64 { top_y + (c_ppm - 14.0) / (76.0 - 14.0) * (bot_y - top_y) };
 
             for ct in [20.0, 30.0, 40.0, 50.0, 60.0, 70.0] {
                 let y = map_cy(ct);
@@ -3837,24 +3837,42 @@ fn render_m02_frame(
                     [251, 113, 133, if active { 245 } else { 110 }],
                 );
 
+                // Sequential predecessor peaks (i-1): hollow rings (weaker in HNCACB)
+                if let Some(ca_prev) = st.ca_im1 {
+                    let cy = map_cy(ca_prev);
+                    c.fill_circle(scx, cy, 4.2, [15, 23, 42, 255]);
+                    c.stroke_circle(scx, cy, 4.6, 1.8, [56, 189, 248, 225]);
+                }
+                if let Some(cb_prev) = st.cb_im1 {
+                    let cy = map_cy(cb_prev);
+                    c.fill_circle(scx, cy, 4.2, [15, 23, 42, 255]);
+                    c.stroke_circle(scx, cy, 4.6, 1.8, [251, 113, 133, 225]);
+                }
+                // Intra-residue peaks (i): double-contour solid markers (strong in HNCACB)
                 if let Some(ca) = st.ca_i {
-                    c.fill_circle(scx, map_cy(ca), 4.5, [56, 189, 248, 255]);
+                    let cy = map_cy(ca);
+                    c.stroke_circle(scx, cy, 6.4, 1.4, [56, 189, 248, 175]);
+                    c.fill_circle(scx, cy, 4.0, [56, 189, 248, 255]);
                 }
                 if let Some(cb) = st.cb_i {
-                    c.fill_circle(scx, map_cy(cb), 4.5, [251, 113, 133, 255]);
+                    let cy = map_cy(cb);
+                    c.stroke_circle(scx, cy, 6.4, 1.4, [251, 113, 133, 175]);
+                    c.fill_circle(scx, cy, 4.0, [251, 113, 133, 255]);
                 }
             }
 
-            // Dashed sequential walk links up to focus_idx
+            // Dashed sequential walk links up to focus_idx (intra i -> seq i-1 on next strip)
             for col in 0..focus_idx {
                 let st = &subset[col];
+                let next_st = &subset[col + 1];
                 if let Some(ca) = st.ca_i {
-                    let y = map_cy(ca);
+                    let y0 = map_cy(ca);
+                    let y1 = map_cy(next_st.ca_im1.unwrap_or(ca));
                     c.draw_dashed_line(
                         centers_x[col],
-                        y,
+                        y0,
                         centers_x[col + 1],
-                        y,
+                        y1,
                         6.0,
                         4.0,
                         2.0,
@@ -3862,12 +3880,13 @@ fn render_m02_frame(
                     );
                 }
                 if let Some(cb) = st.cb_i {
-                    let y = map_cy(cb);
+                    let y0 = map_cy(cb);
+                    let y1 = map_cy(next_st.cb_im1.unwrap_or(cb));
                     c.draw_dashed_line(
                         centers_x[col],
-                        y,
+                        y0,
                         centers_x[col + 1],
-                        y,
+                        y1,
                         6.0,
                         4.0,
                         2.0,
@@ -3875,6 +3894,13 @@ fn render_m02_frame(
                     );
                 }
             }
+            c.draw_text(
+                left_x,
+                bot_y + 10.0 * sy,
+                "Solid = intra (i)   Hollow ring = seq (i-1)   Cyan (+) = CA   Coral (-) = CB",
+                1.15 * sx,
+                [148, 163, 184, 255],
+            );
             let cur_st = &subset[focus_idx];
             let spot_y = cur_st.ca_i.map(map_cy).unwrap_or(0.5 * (top_y + bot_y));
             c.draw_spotlight_cursor(centers_x[focus_idx], spot_y, t_sec, 1.0);
@@ -4873,5 +4899,26 @@ mod tests {
             "05".into()
         ])
         .is_err());
+    }
+
+    #[test]
+    fn test_mod02_hncacb_strips_have_all_4_peaks_and_gly10_3_peaks() {
+        let state = build_core_tour_state(TourModuleId::M02HsqcStripsSolvers, CANONICAL_TOUR_SEED)
+            .expect("Mod02 should build");
+        let v: serde_json::Value =
+            serde_json::to_value(&state.bundle.payload).expect("payload serialize");
+        let strips = v["strips"].as_array().expect("strips array");
+        assert!(strips.len() >= 10, "expected >= 10 strips");
+        for (idx, st) in strips.iter().enumerate().take(9).skip(3) {
+            assert!(st["ca_i"].is_number(), "strip {idx} missing ca_i");
+            assert!(st["cb_i"].is_number(), "strip {idx} missing cb_i");
+            assert!(st["ca_im1"].is_number(), "strip {idx} missing ca_im1");
+            assert!(st["cb_im1"].is_number(), "strip {idx} missing cb_im1");
+        }
+        let gly10 = &strips[9];
+        assert!(gly10["ca_i"].is_number(), "Gly10 missing ca_i");
+        assert!(gly10["cb_i"].is_null(), "Gly10 cb_i must be null");
+        assert!(gly10["ca_im1"].is_number(), "Gly10 missing ca_im1");
+        assert!(gly10["cb_im1"].is_number(), "Gly10 missing cb_im1");
     }
 }

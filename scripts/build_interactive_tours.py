@@ -1244,20 +1244,26 @@ body.is-embed .player-topbar { min-height: 2.9rem; padding-top: 0.25rem; }
   background: #000000;
 }
 
+#canvas-wrap { position: relative; overflow: hidden; }
 .stage-overlay-pill {
   position: absolute;
   top: 10px;
-  right: 14px;
+  right: 16px;
   left: auto;
+  max-width: calc(100% - 32px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  z-index: 3;
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
-  padding: 0.24rem 0.6rem;
+  padding: 4px 10px;
   border-radius: 999px;
   background: rgba(7, 13, 25, 0.78);
   color: #cbd5e1;
   border: 1px solid rgba(148, 163, 184, 0.28);
-  font-size: 0.74rem;
+  font-size: 11px;
   font-weight: 600;
   pointer-events: none;
 }
@@ -1724,7 +1730,7 @@ TOURS_PLAYER_JS = r"""(function () {
     var chIdx = Math.min(3, Math.max(0, Math.floor(tSec / 4.0)));
     var localT = (tSec - chIdx * 4.0) / 4.0;
     var padX = Math.max(24, w * 0.06);
-    var padY = Math.max(36, h * 0.13);
+    var padY = Math.max(46, h * 0.14);
     var pw = Math.max(120, w - padX * 2);
     var ph = Math.max(100, h - padY - 34);
 
@@ -1974,63 +1980,293 @@ TOURS_PLAYER_JS = r"""(function () {
       var focusRes = Math.round(clamp(ctrlVal, 1, 10));
       var stripNames = ["Met1", "Gln2", "Ile3", "Phe4", "Val5", "Lys6", "Thr7", "Leu8", "Thr9", "Gly10"];
       if (chIdx === 0) {
-        drawCardTitle(ctx, padX, padY - 12, "2D 1H-15N HSQC Contours & Picked Backbone Roots", "Ubiquitin · 1H 6.5-10.0 ppm · 15N 106-130 ppm", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm)", "15N (ppm)", pal);
-        var pts = (payload && Array.isArray(payload.hsqc_peaks) && payload.hsqc_peaks.length) ? payload.hsqc_peaks : null;
-        for (var i = 0; i < 24; i++) {
-          var hPpm = pts && pts[i] ? (pts[i].h_ppm || pts[i].h || 8.0) : (6.9 + ((i * 37) % 28) * 0.1);
-          var nPpm = pts && pts[i] ? (pts[i].n_ppm || pts[i].n || 118.0) : (107 + ((i * 53) % 22));
-          var cx = padX + ((10.2 - hPpm) / 3.8) * pw;
-          var cy = padY + 12 + ((nPpm - 105) / 26) * (ph - 24);
-          var isSel = (i % 10) + 1 === focusRes;
+        drawCardTitle(ctx, padX, padY - 12, "2D 1H-15N HSQC Contours & Picked Backbone Roots", "Cyan: +1 backbone N-H · Coral: -1 aliased Arg Ne-He", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm, 10.2 -> 6.2)", "15N (ppm, 104 -> 132)", pal);
+        var negSegs = (payload && Array.isArray(payload.hsqc_neg_contours)) ? payload.hsqc_neg_contours : null;
+        if (negSegs && negSegs.length) {
+          ctx.strokeStyle = pal.coral;
+          ctx.lineWidth = 1.4;
+          for (var ns = 0; ns < negSegs.length; ns++) {
+            var seg = negSegs[ns];
+            if (!Array.isArray(seg) || seg.length < 2) continue;
+            ctx.beginPath();
+            for (var k = 0; k < seg.length; k++) {
+              var nx = padX + clamp((10.2 - seg[k][0]) / 4.0, 0.02, 0.98) * pw;
+              var ny = padY + 12 + clamp((seg[k][1] - 104.0) / 28.0, 0.02, 0.98) * (ph - 24);
+              if (k === 0) ctx.moveTo(nx, ny);
+              else ctx.lineTo(nx, ny);
+            }
+            ctx.stroke();
+          }
+          var s0 = negSegs[0][0];
+          addSpot(
+            padX + clamp((10.2 - s0[0]) / 4.0, 0.02, 0.98) * pw,
+            padY + 12 + clamp((s0[1] - 104.0) / 28.0, 0.02, 0.98) * (ph - 24),
+            14,
+            "Aliased Arg Ne-He (-1)",
+            ["1H: " + s0[0].toFixed(2) + " ppm", "15N: " + s0[1].toFixed(1) + " ppm (folded negative)"]
+          );
+        }
+        var roots = (payload && Array.isArray(payload.hsqc_roots) && payload.hsqc_roots.length) ? payload.hsqc_roots : null;
+        var count = roots ? roots.length : 24;
+        for (var i = 0; i < count; i++) {
+          var hPpm = roots ? (roots[i].h || 8.0) : (6.9 + ((i * 37) % 28) * 0.1);
+          var nPpm = roots ? (roots[i].n || 118.0) : (107 + ((i * 53) % 22));
+          var lbl = roots && roots[i].label ? roots[i].label : stripNames[i % 10];
+          var seqNum = parseInt(String(lbl).replace(/\D+/g, ""), 10) || ((i % 10) + 1);
+          var cx = padX + clamp((10.2 - hPpm) / 4.0, 0.03, 0.97) * pw;
+          var cy = padY + 12 + clamp((nPpm - 104.0) / 28.0, 0.04, 0.96) * (ph - 24);
+          var isSel = seqNum === focusRes;
           ctx.strokeStyle = isSel ? pal.amber : pal.cyan;
           ctx.lineWidth = isSel ? 2.2 : 1.3;
           ctx.beginPath();
-          ctx.ellipse(cx, cy, 10, 6, 0, 0, Math.PI * 2);
+          ctx.ellipse(cx, cy, 8, 5, 0, 0, Math.PI * 2);
           ctx.stroke();
           ctx.beginPath();
-          ctx.ellipse(cx, cy, 5, 3, 0, 0, Math.PI * 2);
+          ctx.ellipse(cx, cy, 3.8, 2.3, 0, 0, Math.PI * 2);
           ctx.stroke();
-          addSpot(cx, cy, 14, stripNames[i % 10] + " HSQC Root", ["1H: " + hPpm.toFixed(2) + " ppm", "15N: " + nPpm.toFixed(1) + " ppm"], (i % 10) + 1);
+          addSpot(cx, cy, 12, lbl + " HSQC Root", ["1H: " + hPpm.toFixed(2) + " ppm", "15N: " + nPpm.toFixed(1) + " ppm"], Math.min(10, Math.max(1, seqNum)));
         }
       } else if (chIdx === 1) {
-        drawCardTitle(ctx, padX, padY - 12, "3D HNCACB Sequential Strip Walk (Phe4 -> Gly10)", "Thr7 CB>CA inversion · Gly10 CB null · Focus: " + stripNames[focusRes - 1], pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue Strip", "13C Shift (20 - 70 ppm)", pal);
-        var caVals = [55.2, 54.8, 60.4, 56.8, 61.9, 55.1, 61.2, 54.0, 60.8, 45.2];
-        var cbVals = [32.1, 29.0, 38.2, 39.6, 32.8, 33.1, 69.5, 42.1, 69.1, null];
-        var cols = 7;
-        for (var s = 0; s < cols; s++) {
-          var rIdx = s + 3; // Phe4..Gly10
-          var sx = padX + ((s + 0.5) / cols) * pw;
-          var isFoc = (rIdx + 1) === focusRes;
-          if (isFoc) {
-            ctx.fillStyle = "rgba(56, 189, 248, 0.14)";
-            ctx.fillRect(sx - pw / (cols * 2.3), padY + 10, pw / (cols * 1.15), ph - 16);
-          }
-          var caY = padY + 14 + ((75 - caVals[rIdx]) / 60) * (ph - 26);
-          ctx.fillStyle = pal.cyan;
+        drawCardTitle(
+          ctx,
+          padX,
+          padY - 14,
+          "3D HNCACB Sequential Strip Walk (Phe4 -> Gly10)",
+          "Solid = intra (i) · Hollow ring = seq (i-1) · Cyan (+) CA · Coral (-) CB · Focus: " + stripNames[focusRes - 1],
+          pal
+        );
+        var fallbackStrips = [
+          { seq_id: 4, label: "Phe4", h_ppm: 7.80, n_ppm: 119.2, ca_i: 56.8, cb_i: 41.2, ca_im1: 62.4, cb_im1: 38.7 },
+          { seq_id: 5, label: "Val5", h_ppm: 9.29, n_ppm: 121.3, ca_i: 61.8, cb_i: 32.7, ca_im1: 56.8, cb_im1: 41.2 },
+          { seq_id: 6, label: "Lys6", h_ppm: 8.92, n_ppm: 127.8, ca_i: 50.9, cb_i: 29.4, ca_im1: 61.8, cb_im1: 32.7 },
+          { seq_id: 7, label: "Thr7", h_ppm: 8.75, n_ppm: 115.3, ca_i: 62.8, cb_i: 73.3, ca_im1: 50.9, cb_im1: 29.4 },
+          { seq_id: 8, label: "Leu8", h_ppm: 9.11, n_ppm: 121.1, ca_i: 57.0, cb_i: 43.6, ca_im1: 62.8, cb_im1: 73.3 },
+          { seq_id: 9, label: "Thr9", h_ppm: 7.64, n_ppm: 105.8, ca_i: 62.5, cb_i: 67.6, ca_im1: 57.0, cb_im1: 43.6 },
+          { seq_id: 10, label: "Gly10", h_ppm: 8.03, n_ppm: 109.7, ca_i: 45.3, cb_i: null, ca_im1: 62.5, cb_im1: 67.6 }
+        ];
+        var rawStrips = (payload && Array.isArray(payload.strips) && payload.strips.length >= 10)
+          ? payload.strips.slice(3, 10)
+          : fallbackStrips;
+        var prevLabels = ["Ile3", "Phe4", "Val5", "Lys6", "Thr7", "Leu8", "Thr9"];
+        var dispLabels = ["Phe4", "Val5", "Lys6", "Thr7", "Leu8", "Thr9", "Gly10"];
+        var stripLeft = padX + 38;
+        var stripRight = padX + pw - 4;
+        var stripTop = padY + 26;
+        var stripBot = padY + ph - 6;
+        var cols = rawStrips.length;
+        var gap = Math.max(6, pw * 0.014);
+        var stripW = (stripRight - stripLeft - gap * (cols - 1)) / cols;
+        function mapCy(cPpm) {
+          return stripTop + ((cPpm - 14.0) / (76.0 - 14.0)) * (stripBot - stripTop);
+        }
+
+        // Left 13C ppm axis title + numeric ticks (standard NMR downfield-bottom 14 -> 76 ppm)
+        ctx.save();
+        ctx.fillStyle = pal.cyan;
+        ctx.font = "600 10.5px ui-monospace, SFMono-Regular, Menlo, monospace";
+        ctx.textAlign = "left";
+        ctx.fillText("13C ppm", padX, stripTop - 8);
+        var cTicks = [20, 30, 40, 50, 60, 70];
+        for (var ti = 0; ti < cTicks.length; ti++) {
+          var ty = mapCy(cTicks[ti]);
+          ctx.strokeStyle = pal.grid;
+          ctx.lineWidth = 1;
           ctx.beginPath();
-          ctx.arc(sx, caY, isFoc ? 7 : 5, 0, Math.PI * 2);
+          ctx.moveTo(stripLeft - 4, ty);
+          ctx.lineTo(stripRight, ty);
+          ctx.stroke();
+          ctx.fillStyle = pal.muted;
+          ctx.textAlign = "right";
+          ctx.fillText(String(cTicks[ti]), stripLeft - 7, ty + 3.5);
+        }
+        ctx.restore();
+
+        var centersX = [];
+        for (var s = 0; s < cols; s++) {
+          var sx0 = stripLeft + s * (stripW + gap);
+          var scx = sx0 + stripW * 0.5;
+          centersX.push(scx);
+          var rIdx = s + 3; // Phe4..Gly10 (seq_id 4..10)
+          var isFoc = (rIdx + 1) === focusRes;
+          var st = rawStrips[s];
+
+          // Strip card box
+          ctx.fillStyle = isFoc ? "rgba(56, 189, 248, 0.10)" : pal.panel;
+          ctx.strokeStyle = isFoc ? pal.amber : pal.border;
+          ctx.lineWidth = isFoc ? 1.8 : 1.1;
+          drawRoundRect(ctx, sx0, stripTop, stripW, stripBot - stripTop, 7);
           ctx.fill();
-          addSpot(sx, caY, 14, stripNames[rIdx] + " CA", ["13CA: " + caVals[rIdx].toFixed(1) + " ppm (positive)"], rIdx + 1);
-          if (cbVals[rIdx] !== null) {
-            var cbY = padY + 14 + ((75 - cbVals[rIdx]) / 60) * (ph - 26);
+          ctx.stroke();
+
+          // Top strip header: Residue label above box + amide H/N ppm inside top margin
+          ctx.save();
+          ctx.textAlign = "center";
+          ctx.fillStyle = isFoc ? pal.amber : pal.text;
+          ctx.font = "700 11.5px ui-monospace, SFMono-Regular, Menlo, monospace";
+          ctx.fillText(dispLabels[s], scx, stripTop - 6);
+          if (typeof st.h_ppm === "number" && typeof st.n_ppm === "number") {
+            ctx.fillStyle = pal.muted;
+            ctx.font = "9.5px ui-monospace, SFMono-Regular, Menlo, monospace";
+            ctx.fillText(st.h_ppm.toFixed(2) + "/" + st.n_ppm.toFixed(0), scx, stripTop + 11);
+          }
+          ctx.restore();
+
+          // Subtle 1D 13C slice profiles (pos_pts right, neg_pts left) when present
+          if (Array.isArray(st.pos_pts) && st.pos_pts.length > 4) {
+            ctx.strokeStyle = isFoc ? "rgba(56, 189, 248, 0.55)" : "rgba(56, 189, 248, 0.30)";
+            ctx.lineWidth = 1.2;
+            ctx.beginPath();
+            for (var p = 0; p < st.pos_pts.length; p++) {
+              var px = scx + st.pos_pts[p][1] * stripW * 0.36;
+              var py = mapCy(st.pos_pts[p][0]);
+              if (p === 0) ctx.moveTo(px, py);
+              else ctx.lineTo(px, py);
+            }
+            ctx.stroke();
+          }
+          if (Array.isArray(st.neg_pts) && st.neg_pts.length > 4) {
+            ctx.strokeStyle = isFoc ? "rgba(251, 113, 133, 0.55)" : "rgba(251, 113, 133, 0.30)";
+            ctx.lineWidth = 1.2;
+            ctx.beginPath();
+            for (var p = 0; p < st.neg_pts.length; p++) {
+              var nx = scx - st.neg_pts[p][1] * stripW * 0.36;
+              var ny = mapCy(st.neg_pts[p][0]);
+              if (p === 0) ctx.moveTo(nx, ny);
+              else ctx.lineTo(nx, ny);
+            }
+            ctx.stroke();
+          }
+        }
+
+        // Horizontal dashed sequential walk staircase lines: intra (s-1) -> seq (s)
+        ctx.save();
+        ctx.setLineDash([5, 3]);
+        ctx.lineWidth = 1.4;
+        for (var s = 1; s < cols; s++) {
+          var prevSt = rawStrips[s - 1];
+          var curSt = rawStrips[s];
+          if (typeof prevSt.ca_i === "number" && typeof curSt.ca_im1 === "number") {
+            ctx.strokeStyle = "rgba(56, 189, 248, 0.72)";
+            ctx.beginPath();
+            ctx.moveTo(centersX[s - 1], mapCy(prevSt.ca_i));
+            ctx.lineTo(centersX[s], mapCy(curSt.ca_im1));
+            ctx.stroke();
+          }
+          if (typeof prevSt.cb_i === "number" && typeof curSt.cb_im1 === "number") {
+            ctx.strokeStyle = "rgba(251, 113, 133, 0.72)";
+            ctx.beginPath();
+            ctx.moveTo(centersX[s - 1], mapCy(prevSt.cb_i));
+            ctx.lineTo(centersX[s], mapCy(curSt.cb_im1));
+            ctx.stroke();
+          }
+        }
+        ctx.restore();
+
+        // Draw all 4 HNCACB cross-peaks per strip (3 on Gly10 where cb_i === null)
+        for (var s = 0; s < cols; s++) {
+          var scx = centersX[s];
+          var rIdx = s + 3;
+          var st = rawStrips[s];
+          var dLbl = dispLabels[s];
+          var pLbl = prevLabels[s];
+
+          // 1. CA(i-1): sequential predecessor (+, hollow dashed cyan ring)
+          if (typeof st.ca_im1 === "number") {
+            var yCaPrev = mapCy(st.ca_im1);
+            ctx.save();
+            ctx.fillStyle = pal.panel;
+            ctx.beginPath();
+            ctx.ellipse(scx, yCaPrev, 8.5, 4.5, 0, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = pal.cyan;
+            ctx.lineWidth = 1.6;
+            ctx.setLineDash([3, 2]);
+            ctx.stroke();
+            ctx.restore();
+            addSpot(scx, yCaPrev, 11, dLbl + " CA(i-1) [" + pLbl + "]: " + st.ca_im1.toFixed(1) + " ppm (+, seq)", ["Phase: +1 (cyan hollow ring)", "Sequential link from " + pLbl + " CA(i)"], rIdx + 1);
+          }
+
+          // 2. CB(i-1): sequential predecessor (-, hollow dashed coral ring)
+          if (typeof st.cb_im1 === "number") {
+            var yCbPrev = mapCy(st.cb_im1);
+            ctx.save();
+            ctx.fillStyle = pal.panel;
+            ctx.beginPath();
+            ctx.ellipse(scx, yCbPrev, 8.5, 4.5, 0, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = pal.coral;
+            ctx.lineWidth = 1.6;
+            ctx.setLineDash([3, 2]);
+            ctx.stroke();
+            ctx.restore();
+            addSpot(scx, yCbPrev, 11, dLbl + " CB(i-1) [" + pLbl + "]: " + st.cb_im1.toFixed(1) + " ppm (-, seq)", ["Phase: -1 (coral hollow ring)", "Sequential link from " + pLbl + " CB(i)"], rIdx + 1);
+          }
+
+          // 3. CA(i): intra-residue (+, strong solid double-ellipse cyan + filled dot)
+          if (typeof st.ca_i === "number") {
+            var yCa = mapCy(st.ca_i);
+            ctx.strokeStyle = pal.cyan;
+            ctx.lineWidth = 1.8;
+            ctx.beginPath();
+            ctx.ellipse(scx, yCa, 11, 5.5, 0, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.ellipse(scx, yCa, 6, 3.0, 0, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.fillStyle = pal.cyan;
+            ctx.beginPath();
+            ctx.arc(scx, yCa, 2.8, 0, Math.PI * 2);
+            ctx.fill();
+            addSpot(scx, yCa, 12, dLbl + " CA(i): " + st.ca_i.toFixed(1) + " ppm (+, intra)", ["Phase: +1 (cyan solid contour)", dLbl === "Gly10" ? "Gly10 intra CA (no CB peak)" : "Strong intra-residue CA"], rIdx + 1);
+          }
+
+          // 4. CB(i): intra-residue (-, strong solid double-ellipse coral + filled dot; absent on Gly10)
+          if (typeof st.cb_i === "number") {
+            var yCb = mapCy(st.cb_i);
+            var invNote = (typeof st.ca_i === "number" && st.cb_i > st.ca_i) ? ", CB>CA" : "";
+            ctx.strokeStyle = pal.coral;
+            ctx.lineWidth = 1.8;
+            ctx.beginPath();
+            ctx.ellipse(scx, yCb, 11, 5.5, 0, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.ellipse(scx, yCb, 6, 3.0, 0, 0, Math.PI * 2);
+            ctx.stroke();
             ctx.fillStyle = pal.coral;
             ctx.beginPath();
-            ctx.arc(sx, cbY, isFoc ? 7 : 5, 0, Math.PI * 2);
+            ctx.arc(scx, yCb, 2.8, 0, Math.PI * 2);
             ctx.fill();
-            addSpot(sx, cbY, 14, stripNames[rIdx] + " CB", ["13CB: " + cbVals[rIdx].toFixed(1) + " ppm (negative)"], rIdx + 1);
+            addSpot(scx, yCb, 12, dLbl + " CB(i): " + st.cb_i.toFixed(1) + " ppm (-, intra" + invNote + ")", ["Phase: -1 (coral solid contour)", invNote ? "Thr/Ser hydroxyl downfield CB > CA" : "Strong intra-residue CB"], rIdx + 1);
           }
-          ctx.fillStyle = isFoc ? pal.amber : pal.muted;
-          ctx.font = "600 11px ui-monospace, monospace";
-          ctx.textAlign = "center";
-          ctx.fillText(stripNames[rIdx], sx, padY + ph + 14);
         }
       } else if (chIdx === 2) {
-        drawCardTitle(ctx, padX, padY - 12, "evo-graph vs standard SA vs bayes-sa Convergence", "Synthetic UBQ 98.4% · Dev CISD3 64.38% (100% HC) · Cold evo-graph 88.25-95.30% (FAILS >=94%; withdrawn)", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Annealing Progress (1/T)", "Assignment Accuracy / Cv(T)", pal);
+        drawCardTitle(ctx, padX, padY - 12, "evo-graph vs standard SA vs bayes-sa Convergence & Cv(T)", "Synthetic UBQ 98.4% · Dev CISD3 64.38% (100% HC) · Cold evo-graph 88.25-95.30% (FAILS >=94%; withdrawn)", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Annealing Progress (1/T)", "Accuracy / Normalized Cv(T)", pal);
+        var cvVals = (payload && Array.isArray(payload.cv_vals) && payload.cv_vals.length > 3) ? payload.cv_vals : null;
+        var cvTemps = (payload && Array.isArray(payload.cv_temps) && payload.cv_temps.length === (cvVals ? cvVals.length : 0)) ? payload.cv_temps : null;
+        if (cvVals) {
+          var maxCv = 1e-9;
+          for (var ci = 0; ci < cvVals.length; ci++) maxCv = Math.max(maxCv, cvVals[ci]);
+          ctx.strokeStyle = pal.violet;
+          ctx.lineWidth = 1.8;
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          for (var ci = 0; ci < cvVals.length; ci++) {
+            var u = ci / (cvVals.length - 1);
+            var sx = padX + u * pw;
+            var sy = padY + ph - 10 - (cvVals[ci] / maxCv) * 0.85 * (ph - 28);
+            if (ci === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+            if (cvVals[ci] === maxCv && cvTemps) {
+              addSpot(sx, sy, 14, "Heat-Capacity Peak Cv(T_crit)", ["T_crit: " + cvTemps[ci].toFixed(2), "Cv: " + cvVals[ci].toFixed(1)]);
+            }
+          }
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
         var curves = [
-          { col: pal.green, lbl: "evo-graph", finalV: 0.96 },
+          { col: pal.green, lbl: "evo-graph (withdrawn on cold)", finalV: 0.96 },
           { col: pal.cyan, lbl: "bayes-sa", finalV: 0.91 },
           { col: pal.amber, lbl: "standard SA", finalV: 0.85 }
         ];
@@ -2060,11 +2296,12 @@ TOURS_PLAYER_JS = r"""(function () {
         ctx.lineTo(padX + pw, threshY);
         ctx.stroke();
         ctx.setLineDash([]);
+        var confArr = (payload && Array.isArray(payload.res_confidences) && payload.res_confidences.length >= 76) ? payload.res_confidences : null;
         for (var r = 1; r <= 76; r++) {
-          var conf = (r === 24 || r === 53) ? 0.64 : (0.86 + 0.13 * Math.abs(Math.sin(r * 0.43)));
+          var conf = confArr ? confArr[r - 1] : ((r === 24 || r === 53) ? 0.64 : (0.86 + 0.13 * Math.abs(Math.sin(r * 0.43))));
           var bx = padX + ((r - 1) / 76) * pw;
           var bw = Math.max(2, pw / 86);
-          var bh = conf * (ph - 24);
+          var bh = Math.max(2, conf * (ph - 24));
           var by = padY + ph - 12 - bh;
           ctx.fillStyle = (r === focusRes) ? pal.amber : (conf >= 0.8 ? pal.green : pal.coral);
           ctx.fillRect(bx, by, bw, bh);
@@ -2081,17 +2318,49 @@ TOURS_PLAYER_JS = r"""(function () {
       var orbitDeg = clamp(ctrlVal, 0, 360);
       var yaw = (orbitDeg * Math.PI) / 180.0;
       var pitch = (state && typeof state.pitchRad === "number") ? state.pitchRad : 0.35;
-      var nRes = 48;
+      var rawCa = (payload && Array.isArray(payload.ca_coords) && payload.ca_coords.length >= 10) ? payload.ca_coords : null;
+      var rawSs = (payload && Array.isArray(payload.ss_classes)) ? payload.ss_classes : null;
+      var rawS2 = (payload && Array.isArray(payload.s2_vals)) ? payload.s2_vals : null;
       var coords = [];
-      for (var i = 0; i < nRes; i++) {
-        var u = i / (nRes - 1);
-        var ang = u * Math.PI * 5.2;
-        var rad = 0.55 + 0.35 * Math.sin(u * Math.PI * 2);
-        var x = rad * Math.cos(ang);
-        var y = (u - 0.5) * 2.1;
-        var z = rad * Math.sin(ang);
-        coords.push({ x: x, y: y, z: z, ss: i < 16 ? "sheet" : (i < 32 ? "helix" : "coil"), s2: 0.86 - (i > 41 ? (i - 41) * 0.08 : 0) });
+      if (rawCa) {
+        var cx0 = 0, cy0 = 0, cz0 = 0;
+        for (var i = 0; i < rawCa.length; i++) {
+          cx0 += rawCa[i][0]; cy0 += rawCa[i][1]; cz0 += rawCa[i][2];
+        }
+        cx0 /= rawCa.length; cy0 /= rawCa.length; cz0 /= rawCa.length;
+        var maxR = 1e-6;
+        for (var i = 0; i < rawCa.length; i++) {
+          var dx = rawCa[i][0] - cx0, dy = rawCa[i][1] - cy0, dz = rawCa[i][2] - cz0;
+          maxR = Math.max(maxR, Math.sqrt(dx * dx + dy * dy + dz * dz));
+        }
+        for (var i = 0; i < rawCa.length; i++) {
+          var ssCode = rawSs && rawSs[i] !== undefined ? rawSs[i] : 0;
+          var ssName = ssCode === 1 ? "helix" : (ssCode === 2 ? "sheet" : "coil");
+          var s2Val = rawS2 && typeof rawS2[i] === "number" ? rawS2[i] : 0.84;
+          coords.push({
+            x: (rawCa[i][0] - cx0) / maxR,
+            y: (rawCa[i][1] - cy0) / maxR,
+            z: (rawCa[i][2] - cz0) / maxR,
+            ss: ssName,
+            s2: s2Val
+          });
+        }
+      } else {
+        var nMock = 48;
+        for (var i = 0; i < nMock; i++) {
+          var u = i / (nMock - 1);
+          var ang = u * Math.PI * 5.2;
+          var rad = 0.55 + 0.35 * Math.sin(u * Math.PI * 2);
+          coords.push({
+            x: rad * Math.cos(ang),
+            y: (u - 0.5) * 2.1,
+            z: rad * Math.sin(ang),
+            ss: i < 16 ? "sheet" : (i < 32 ? "helix" : "coil"),
+            s2: 0.86 - (i > 41 ? (i - 41) * 0.08 : 0)
+          });
+        }
       }
+      var nRes = coords.length;
       function proj(pt) {
         var cx = Math.cos(yaw), sx = Math.sin(yaw);
         var cp = Math.cos(pitch), sp = Math.sin(pitch);
@@ -2099,12 +2368,13 @@ TOURS_PLAYER_JS = r"""(function () {
         var z1 = pt.x * sx + pt.z * cx;
         var y2 = pt.y * cp - z1 * sp;
         var z2 = pt.y * sp + z1 * cp;
-        var scale = Math.min(pw, ph) * 0.42 / (2.8 - z2 * 0.35);
-        return { x: w * 0.5 + x1 * scale, y: padY + ph * 0.48 + y2 * scale, z: z2 };
+        var scale = Math.min(pw, ph) * (rawCa ? 0.98 : 0.42) / (2.8 - z2 * 0.35);
+        return { x: w * 0.5 + x1 * scale, y: padY + ph * 0.50 + y2 * scale, z: z2 };
       }
 
       if (chIdx === 2) {
-        drawCardTitle(ctx, padX, padY - 12, "Saupe Alignment Tensor & N-H RDC D_obs vs D_calc", "F8 Disclosed: Unseen 1KHM->1ZZK 1.86-4.14 A (0/5 < 1.80 A)", pal);
+        var qfTxt = (payload && typeof payload.q_free === "number") ? ("Q_free=" + payload.q_free.toFixed(3) + " · ") : "";
+        drawCardTitle(ctx, padX, padY - 12, "Saupe Alignment Tensor & N-H RDC D_obs vs D_calc", qfTxt + "F8 Disclosed: Unseen 1KHM->1ZZK 1.86-4.14 A (0/5 < 1.80 A)", pal);
         drawAxes(ctx, padX, padY + 8, pw, ph - 12, "D_calc (Hz)", "D_obs (Hz)", pal);
         ctx.strokeStyle = pal.amber;
         ctx.setLineDash([5, 4]);
@@ -2113,22 +2383,42 @@ TOURS_PLAYER_JS = r"""(function () {
         ctx.lineTo(padX + pw - 12, padY + 18);
         ctx.stroke();
         ctx.setLineDash([]);
-        for (var i = 0; i < 28; i++) {
-          var dc = -14 + i * 1.05;
-          var dobs = dc + Math.sin(i * 1.7) * 1.6;
-          var sx = padX + ((dc + 16) / 32) * pw;
-          var sy = padY + ph - 12 - ((dobs + 16) / 32) * (ph - 24);
-          ctx.fillStyle = (i % 5 === 0) ? pal.coral : pal.cyan;
-          ctx.beginPath();
-          ctx.arc(sx, sy, 4.5, 0, Math.PI * 2);
-          ctx.fill();
-          addSpot(sx, sy, 12, "RDC #" + (i + 1), ["D_calc: " + dc.toFixed(1) + " Hz", "D_obs: " + dobs.toFixed(1) + " Hz"]);
+        var rdcPts = (payload && Array.isArray(payload.rdc_points) && payload.rdc_points.length > 4) ? payload.rdc_points : null;
+        if (rdcPts) {
+          var maxD = 16.0;
+          for (var i = 0; i < rdcPts.length; i++) {
+            maxD = Math.max(maxD, Math.abs(rdcPts[i].d_calc || 0), Math.abs(rdcPts[i].d_obs || 0));
+          }
+          var stepRdc = Math.max(1, Math.floor(rdcPts.length / 72));
+          for (var i = 0; i < rdcPts.length; i += stepRdc) {
+            var rp = rdcPts[i];
+            var sx = padX + clamp((rp.d_calc + maxD) / (2 * maxD), 0.03, 0.97) * pw;
+            var sy = padY + ph - 12 - clamp((rp.d_obs + maxD) / (2 * maxD), 0.03, 0.97) * (ph - 24);
+            ctx.fillStyle = rp.is_free ? pal.coral : pal.cyan;
+            ctx.beginPath();
+            ctx.arc(sx, sy, rp.is_free ? 4.8 : 3.8, 0, Math.PI * 2);
+            ctx.fill();
+            addSpot(sx, sy, 10, (rp.is_free ? "Q_free" : "Q_work") + " Res #" + rp.seq_id, ["D_calc: " + rp.d_calc.toFixed(1) + " Hz", "D_obs: " + rp.d_obs.toFixed(1) + " Hz"]);
+          }
+        } else {
+          for (var i = 0; i < 28; i++) {
+            var dc = -14 + i * 1.05;
+            var dobs = dc + Math.sin(i * 1.7) * 1.6;
+            var sx = padX + ((dc + 16) / 32) * pw;
+            var sy = padY + ph - 12 - ((dobs + 16) / 32) * (ph - 24);
+            ctx.fillStyle = (i % 5 === 0) ? pal.coral : pal.cyan;
+            ctx.beginPath();
+            ctx.arc(sx, sy, 4.5, 0, Math.PI * 2);
+            ctx.fill();
+            addSpot(sx, sy, 12, "RDC #" + (i + 1), ["D_calc: " + dc.toFixed(1) + " Hz", "D_obs: " + dobs.toFixed(1) + " Hz"]);
+          }
         }
       } else {
         var titleStr = chIdx === 0
           ? "1UBQ 3D Backbone CA Trace (Drag Canvas to Orbit · " + Math.round(orbitDeg) + " deg)"
           : (chIdx === 1 ? "Long-Range 1H-1H NOE Cylinders + Homolog-Free Torsions (<=25%)" : "1UBQ S^2 Putty Projection · 360 deg Orbit (" + Math.round(orbitDeg) + " deg)");
-        drawCardTitle(ctx, padX, padY - 12, titleStr, "F8 Unseen 1KHM->1ZZK holdout disclosed (0/5 < 1.80 A)", pal);
+        var f8Sub = (payload && payload.f8_holdout_note) ? payload.f8_holdout_note : "F8 Unseen 1KHM->1ZZK holdout disclosed (0/5 < 1.80 A)";
+        drawCardTitle(ctx, padX, padY - 12, titleStr, f8Sub, pal);
         var projected = coords.map(function (c, idx) {
           var p = proj(c);
           return { x: p.x, y: p.y, z: p.z, ss: c.ss, s2: c.s2, idx: idx + 1 };
@@ -2137,13 +2427,26 @@ TOURS_PLAYER_JS = r"""(function () {
           ctx.strokeStyle = "rgba(251, 191, 36, 0.55)";
           ctx.setLineDash([4, 3]);
           ctx.lineWidth = 1.5;
-          for (var k = 0; k < 10; k++) {
-            var a = projected[(k * 3) % nRes];
-            var b = projected[(k * 3 + 19) % nRes];
-            ctx.beginPath();
-            ctx.moveTo(a.x, a.y);
-            ctx.lineTo(b.x, b.y);
-            ctx.stroke();
+          var noePairs = (payload && Array.isArray(payload.noe_pairs) && payload.noe_pairs.length) ? payload.noe_pairs : null;
+          if (noePairs) {
+            for (var k = 0; k < noePairs.length; k++) {
+              var np = noePairs[k];
+              var pa = projected[clamp(np.a || 0, 0, nRes - 1)];
+              var pb = projected[clamp(np.b || 0, 0, nRes - 1)];
+              ctx.beginPath();
+              ctx.moveTo(pa.x, pa.y);
+              ctx.lineTo(pb.x, pb.y);
+              ctx.stroke();
+            }
+          } else {
+            for (var k = 0; k < 10; k++) {
+              var a = projected[(k * 3) % nRes];
+              var b = projected[(k * 3 + 19) % nRes];
+              ctx.beginPath();
+              ctx.moveTo(a.x, a.y);
+              ctx.lineTo(b.x, b.y);
+              ctx.stroke();
+            }
           }
           ctx.setLineDash([]);
         }
@@ -2161,10 +2464,10 @@ TOURS_PLAYER_JS = r"""(function () {
           var pt = sorted[i];
           ctx.fillStyle = pt.ss === "helix" ? pal.coral : (pt.ss === "sheet" ? pal.cyan : pal.green);
           ctx.beginPath();
-          ctx.arc(pt.x, pt.y, 4.2, 0, Math.PI * 2);
+          ctx.arc(pt.x, pt.y, 4.0, 0, Math.PI * 2);
           ctx.fill();
-          if (pt.idx % 3 === 1) {
-            addSpot(pt.x, pt.y, 12, "1UBQ CA #" + pt.idx, ["Secondary: " + pt.ss, "S^2: " + pt.s2.toFixed(2)]);
+          if (pt.idx % 2 === 1) {
+            addSpot(pt.x, pt.y, 11, "1UBQ CA #" + pt.idx, ["Secondary: " + pt.ss, "S^2: " + pt.s2.toFixed(2)]);
           }
         }
       }
@@ -3105,6 +3408,7 @@ TOURS_PLAYER_JS = r"""(function () {
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         state.hotspots = [];
         renderModuleScene(ctx, cssW, cssH, bundle.module_index, bundle.payload || {}, state.tSec, state.ctrlVal, state, state.hotspots);
+        canvas._lastHotspots = state.hotspots;
       }
       requestAnimationFrame(frameLoop);
     }
@@ -3525,6 +3829,19 @@ for (const file of htmlFiles) {
       const mEl = elements["drawer-metric"];
       if (!mEl || mEl.hidden || !mEl.textContent) {
         throw new Error(file + " ?ch=" + ch + " failed to populate drawer-metric");
+      }
+    }
+    if (file.startsWith("02_") && ch === 2) {
+      const spots = (elements["tour-canvas"] && elements["tour-canvas"]._lastHotspots) || [];
+      for (const rName of ["Phe4", "Val5", "Lys6", "Thr7", "Leu8", "Thr9"]) {
+        const nPeaks = spots.filter(s => s.title.startsWith(rName + " C")).length;
+        if (nPeaks !== 4) {
+          throw new Error("Expected 4 HNCACB peak hotspots on " + rName + ", got " + nPeaks);
+        }
+      }
+      const nGly = spots.filter(s => s.title.startsWith("Gly10 C")).length;
+      if (nGly !== 3) {
+        throw new Error("Expected 3 HNCACB peak hotspots on Gly10, got " + nGly);
       }
     }
     pairs++;
