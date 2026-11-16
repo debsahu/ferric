@@ -1247,7 +1247,8 @@ body.is-embed .player-topbar { min-height: 2.9rem; padding-top: 0.25rem; }
 .stage-overlay-pill {
   position: absolute;
   top: 10px;
-  left: 10px;
+  right: 14px;
+  left: auto;
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
@@ -1533,7 +1534,12 @@ body.is-embed .player-topbar { min-height: 2.9rem; padding-top: 0.25rem; }
   overflow-x: auto;
   white-space: nowrap;
   max-width: 28rem;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.3) transparent;
 }
+.cli-box code::-webkit-scrollbar { height: 4px; }
+.cli-box code::-webkit-scrollbar-track { background: transparent; }
+.cli-box code::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.3); border-radius: 2px; }
 .drawer-links {
   display: flex;
   align-items: center;
