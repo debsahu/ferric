@@ -11,8 +11,8 @@
 
 [![Licence: MIT](https://img.shields.io/badge/licence-MIT%20%2B%20Apache--2.0-blue.svg)](THIRD_PARTY.md)
 [![Rust + WebGPU](https://img.shields.io/badge/engine-Rust%20%2B%20wgpu-orange.svg)](docs/specs/00-architecture.md)
-[![User Manual](https://img.shields.io/badge/docs-User%20Manual-0284c7.svg)](https://debsahu.github.io/nmr-assign/)
-[![Browser Demo](https://img.shields.io/badge/WebGPU-Live%20Demo-059669.svg)](https://debsahu.github.io/nmr-assign/demo/)
+[![User Manual](https://img.shields.io/badge/docs-User%20Manual-0284c7.svg)](https://debsahu.github.io/ferric/)
+[![Browser Demo](https://img.shields.io/badge/WebGPU-Live%20Demo-059669.svg)](https://debsahu.github.io/ferric/demo/)
 
 **FERRIC** (`ferric` CLI + `ferric-gui` desktop/WebAssembly workbench) processes raw time-domain FIDs (Bruker `ser`/`fid` + custom `pulprog`, Varian/Agilent, JEOL Delta, JCAMP-DX) and frequency-domain spectra (Bruker `pdata`, NMRPipe, Sparky `.ucsf`) end-to-end in pure clean-room Rust (`f64` reference algorithms) and cross-vendor WebGPU (`wgpu` WGSL compute & contour shaders).
 
@@ -35,13 +35,13 @@ Requires a stable Rust toolchain (`rustup`, Rust 1.80+) and a Vulkan, Metal, or 
 
 ### 1. Interactive Desktop Workbench (`ferric-gui`)
 
-Download pre-built desktop + CLI archives (`macos-arm64` `.dmg`/`FERRIC.app`/`.tar.gz`, `windows-x86_64` `.zip`, `linux-x86_64` `.tar.gz`) from [**GitHub Releases**](https://github.com/debsahu/nmr-assign/releases), or build from source:
+Download pre-built desktop + CLI archives (`macos-arm64` `.dmg`/`FERRIC.app`/`.tar.gz`, `windows-x86_64` `.zip`, `linux-x86_64` `.tar.gz`) from [**GitHub Releases**](https://github.com/debsahu/ferric/releases), or build from source:
 
 ```bash
 cargo run --release -p nmr-gui --bin ferric-gui
 ```
 
-Drag and drop any Bruker experiment directory (`ser`/`fid` or `pdata/1`), NMRPipe file, `.ucsf` spectrum, `.jdx`, NMR-STAR `.str`, or NMR Exchange Format (`.nef`) project onto the canvas—or launch the mobile/tablet-responsive, zero-install [**Live WebGPU Browser Demo**](https://debsahu.github.io/nmr-assign/demo/) (local build: `bash scripts/build_web_demo.sh`).
+Drag and drop any Bruker experiment directory (`ser`/`fid` or `pdata/1`), NMRPipe file, `.ucsf` spectrum, `.jdx`, NMR-STAR `.str`, or NMR Exchange Format (`.nef`) project onto the canvas—or launch the mobile/tablet-responsive, zero-install [**Live WebGPU Browser Demo**](https://debsahu.github.io/ferric/demo/) (local build: `bash scripts/build_web_demo.sh`).
 
 ### 2. Automated Command-Line Workflows (`ferric`)
 
@@ -93,8 +93,8 @@ All macromolecular assignment solvers (`evo-graph` default, `standard` parallel-
 
 ## Documentation, Specifications & Live Demo
 
-- **User Manual ([Hosted Site](https://debsahu.github.io/nmr-assign/) · `docs/manual/`)**: [Overview](docs/manual/index.md) · [01 Quickstart & Workflows](docs/manual/01-quickstart-and-workflows.md) · [02 Custom `pulprog` & DSP](docs/manual/02-custom-pulprog-and-dsp.md) · [03 Solvers & Calibration](docs/manual/03-solvers-and-calibration.md) · [04 Dynamics & Exchange](docs/manual/04-dynamics-and-exchange.md) · [05 1D Multiplets, `qNMR` & `DOSY`](docs/manual/05-nmr1d-multiplets-and-dosy.md) · [06 `MCP` & CLI Reference](docs/manual/06-mcp-and-cli-reference.md) · [07 Clean-Room Provenance](docs/manual/07-clean-room-provenance.md) · [08 Metabolomics & Chemometrics](docs/manual/08-metabolomics-and-chemometrics.md)
-- **Technical Specifications & Interactive Demo**: [Architecture & Specs (`docs/specs/`)](docs/specs/) · [**Live WebGPU Browser Demo**](https://debsahu.github.io/nmr-assign/demo/) ([source](docs/demo/)) · [Dataset Provenance (`data/benchmark/PROVENANCE.md`)](data/benchmark/PROVENANCE.md) · [Roadmap & Open Validation Gates (`TODO.md`)](TODO.md)
+- **User Manual ([Hosted Site](https://debsahu.github.io/ferric/) · `docs/manual/`)**: [Overview](docs/manual/index.md) · [01 Quickstart & Workflows](docs/manual/01-quickstart-and-workflows.md) · [02 Custom `pulprog` & DSP](docs/manual/02-custom-pulprog-and-dsp.md) · [03 Solvers & Calibration](docs/manual/03-solvers-and-calibration.md) · [04 Dynamics & Exchange](docs/manual/04-dynamics-and-exchange.md) · [05 1D Multiplets, `qNMR` & `DOSY`](docs/manual/05-nmr1d-multiplets-and-dosy.md) · [06 `MCP` & CLI Reference](docs/manual/06-mcp-and-cli-reference.md) · [07 Clean-Room Provenance](docs/manual/07-clean-room-provenance.md) · [08 Metabolomics & Chemometrics](docs/manual/08-metabolomics-and-chemometrics.md)
+- **Technical Specifications & Interactive Demo**: [Architecture & Specs (`docs/specs/`)](docs/specs/) · [**Live WebGPU Browser Demo**](https://debsahu.github.io/ferric/demo/) ([source](docs/demo/)) · [Dataset Provenance (`data/benchmark/PROVENANCE.md`)](data/benchmark/PROVENANCE.md) · [Roadmap & Open Validation Gates (`TODO.md`)](TODO.md)
 
 ## Clean-Room Provenance & Licence
 

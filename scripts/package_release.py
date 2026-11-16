@@ -716,8 +716,8 @@ Generate ready-to-paste client configuration JSON (read-only sandbox by default)
   /Applications/FERRIC.app/Contents/MacOS/ferric mcp-config \\
     --client claude-desktop --root ~/nmr_projects --mode read-only
 
-Documentation & Browser Demo: https://debsahu.github.io/nmr-assign/
-Repository & Source Code:     https://github.com/debsahu/nmr-assign
+Documentation & Browser Demo: https://debsahu.github.io/ferric/
+Repository & Source Code:     https://github.com/debsahu/ferric
 """
 
 

@@ -4500,7 +4500,7 @@ fn export_builtin_mol_v2000(scene: &RenderScene, as_sdf: bool) -> String {
         .collect();
 
     let mut out = String::new();
-    out.push_str("Octet-Draw / FERRIC\n  FERRIC  02002600002D\n\n");
+    out.push_str("Octet-Draw / FERRIC\n  FERRIC  01012600002D\n\n");
     out.push_str(&format!(
         "{:>3}{:>3}  0  0  0  0  0  0  0  0999 V2000\n",
         real_atoms.len(),
@@ -4853,7 +4853,12 @@ mod tests {
         );
         assert_eq!(&line2[0..2], "  ");
         assert_eq!(&line2[2..10], "FERRIC  ");
-        assert_eq!(&line2[10..20], "0200260000");
+        let date_field = &line2[10..20];
+        assert_eq!(date_field, "0101260000");
+        let mm: u32 = date_field[0..2].parse().expect("valid month digits");
+        let dd: u32 = date_field[2..4].parse().expect("valid day digits");
+        assert!((1..=12).contains(&mm), "month out of range: {mm}");
+        assert!((1..=31).contains(&dd), "day out of range: {dd}");
         assert_eq!(&line2[20..22], "2D");
     }
 }

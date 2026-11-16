@@ -977,6 +977,25 @@ def generate_all_brand_files() -> Tuple[Dict[str, bytes], Dict[str, Tuple[int, i
     return svgs, pngs
 
 
+def build_packager_icon_64_rgba() -> bytes:
+    """Return raw 64x64 RGBA8 bytes directly from package_release.render_icon_scanlines(64)."""
+    import sys
+
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import package_release  # type: ignore
+
+    scans = package_release.render_icon_scanlines(64)
+    stride = 1 + 64 * 4
+    if len(scans) != 64 * stride:
+        raise AssertionError(f"Unexpected scanline buffer length: {len(scans)}")
+    raw = b"".join(scans[y * stride + 1 : (y + 1) * stride] for y in range(64))
+    if len(raw) != 64 * 64 * 4:
+        raise AssertionError(f"Unexpected RGBA64 byte length: {len(raw)}")
+    return raw
+
+
 def run_self_test(brand_dir: Path) -> None:
     svgs_1, pngs_1 = generate_all_brand_files()
     svgs_2, pngs_2 = generate_all_brand_files()
@@ -1018,8 +1037,15 @@ def run_self_test(brand_dir: Path) -> None:
         if disk.exists() and disk.read_bytes() != data:
             raise AssertionError(f"Stale PNG on disk: {disk}")
 
+    rgba64 = build_packager_icon_64_rgba()
+    rgba64_disk = brand_dir / "ferric-icon-64.rgba"
+    if not rgba64_disk.exists():
+        raise AssertionError(f"Missing 64x64 RGBA asset: {rgba64_disk}")
+    if rgba64_disk.read_bytes() != rgba64:
+        raise AssertionError(f"Stale 64x64 RGBA asset on disk: {rgba64_disk}")
+
     print(
-        f"SELF-TEST PASS: {len(svgs_1)} SVGs + {len(pngs_1)} PNGs verified "
+        f"SELF-TEST PASS: {len(svgs_1)} SVGs + {len(pngs_1)} PNGs + ferric-icon-64.rgba verified "
         f"(byte-identical across 2 runs, zero <text>/external refs, valid PNG CRCs, 32x32 & 1280x640)"
     )
 
@@ -1042,6 +1068,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p = args.out_dir / fname
         p.write_bytes(data)
         written.append(p)
+    rgba64_path = args.out_dir / "ferric-icon-64.rgba"
+    rgba64_path.write_bytes(build_packager_icon_64_rgba())
+    written.append(rgba64_path)
 
     if args.dump_icon_previews is not None:
         written.extend(dump_packager_icon_previews(args.dump_icon_previews))

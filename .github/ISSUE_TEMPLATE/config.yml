@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: Documentation Manual
-    url: https://debsahu.github.io/nmr-assign/
+    url: https://debsahu.github.io/ferric/
     about: Browse the 9-chapter user and spectroscopy manual before opening an issue.
   - name: Live WebGPU Browser Demo
-    url: https://debsahu.github.io/nmr-assign/demo/
+    url: https://debsahu.github.io/ferric/demo/
     about: Try the zero-install WebAssembly + WebGPU workbench in your browser.
