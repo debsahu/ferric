@@ -45,7 +45,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux X11, Wayland & Vulkan GUI build dependencies
         if: matrix.platform == 'linux-x86_64'
@@ -73,7 +73,7 @@ jobs:
           cargo -V
 
       - name: Cache Cargo registry and release build dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry/index/
@@ -152,7 +152,7 @@ jobs:
             --out-dir dist
 
       - name: Upload platform release artifact (${{ matrix.platform }})
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.platform }}
           path: ${{ matrix.artifact_paths }}
@@ -167,10 +167,10 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Download all platform release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
           merge-multiple: true
@@ -200,7 +200,7 @@ jobs:
       - name: Create or update GitHub Release via gh CLI
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -214,11 +214,48 @@ jobs:
             echo "ERROR: Expected 5 release assets (4 archives + SHA256SUMS.txt), found ${#ASSETS[@]}" >&2
             exit 1
           fi
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" "${ASSETS[@]}" --clobber
-          else
-            gh release create "${RELEASE_TAG}" "${ASSETS[@]}" \
+          set +e
+          RELEASE_VIEW_OUT="$(gh release view "$TAG_NAME" --json isDraft,assets 2>&1)"
+          RELEASE_VIEW_RC=$?
+          set -e
+          if [[ "${RELEASE_VIEW_RC}" -eq 0 ]]; then
+            UPLOAD_MODE="$(
+              TAG_NAME="$TAG_NAME" RELEASE_JSON="$RELEASE_VIEW_OUT" python3 - "${ASSETS[@]}" <<'PY'
+          import json, os, sys
+
+          tag = os.environ["TAG_NAME"]
+          data = json.loads(os.environ["RELEASE_JSON"])
+          is_draft = bool(data.get("isDraft", False))
+          existing_assets = {
+              item["name"]
+              for item in data.get("assets", [])
+              if isinstance(item, dict) and isinstance(item.get("name"), str)
+          }
+          incoming_assets = [os.path.basename(path) for path in sys.argv[1:]]
+          collisions = sorted(name for name in incoming_assets if name in existing_assets)
+          if not is_draft and collisions:
+              print(
+                  f"ERROR: Release {tag} already exists and is published (isDraft=false) "
+                  f"with colliding asset(s): {', '.join(collisions)}. "
+                  f"Refusing to overwrite published release binaries.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          print("draft-clobber" if (is_draft and collisions) else "upload-no-clobber")
+          PY
+            )"
+            if [[ "${UPLOAD_MODE}" == "draft-clobber" ]]; then
+              gh release upload "$TAG_NAME" "${ASSETS[@]}" --clobber
+            else
+              gh release upload "$TAG_NAME" "${ASSETS[@]}"
+            fi
+          elif grep -qi "release not found" <<<"${RELEASE_VIEW_OUT}"; then
+            gh release create "$TAG_NAME" "${ASSETS[@]}" \
               --verify-tag \
-              --title "nmr-assign ${RELEASE_TAG}" \
+              --title "nmr-assign ${TAG_NAME}" \
               --generate-notes
+          else
+            echo "ERROR: Failed to inspect GitHub Release ${TAG_NAME} via gh release view:" >&2
+            echo "${RELEASE_VIEW_OUT}" >&2
+            exit "${RELEASE_VIEW_RC}"
           fi

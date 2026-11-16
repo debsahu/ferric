@@ -100,3 +100,30 @@ jobs:
 
       - name: Check nmr-gui for wasm32-unknown-unknown
         run: cargo check --release -p nmr-gui --target wasm32-unknown-unknown
+
+  windows-check:
+    name: Windows Cross-Target Check (x86_64-pc-windows-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 cross-toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+
+      - name: Install Rust stable toolchain with x86_64-pc-windows-gnu
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache Cargo registry & Windows GNU target artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-gnu
+
+      - name: Check nmr-cli & nmr-gui for x86_64-pc-windows-gnu (dev + release)
+        run: |
+          RUSTFLAGS="-D warnings" cargo check --locked -p nmr-cli -p nmr-gui --target x86_64-pc-windows-gnu
+          RUSTFLAGS="-D warnings" cargo check --release --locked -p nmr-cli -p nmr-gui --target x86_64-pc-windows-gnu
