@@ -32,7 +32,9 @@ use nmr_core::c13_detected::{
     C13PickedDataset, C13PickerConfig, C13Strip3DPeak, Caco2DPeak, CacoPeakKind, Con2DPeak,
     IdpCubeSimConfig,
 };
-use nmr_core::classify::{DataState, ExperimentDimensionality, ExperimentVendor};
+use nmr_core::classify::{
+    DataState, ExperimentDimensionality, ExperimentVendor, ProblemRegime, PulseSequenceClass,
+};
 use nmr_core::evaluate::{score, to_reference, Metrics};
 use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
 use nmr_core::fid::read_bruker_fid_2d_from_bytes;
@@ -102,7 +104,7 @@ use nmr_core::solver::{
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_core::spectrum::{
     read_bruker_pdata_2d, read_bruker_pdata_3d, read_nmrpipe_2d, read_nmrpipe_3d, read_ucsf_2d,
-    read_ucsf_3d,
+    read_ucsf_3d, resolve_bruker_pdata_dir,
 };
 use nmr_core::spectrum::{
     read_bruker_pdata_2d_from_bytes, read_bruker_pdata_3d_from_bytes, read_nmrpipe_2d_from_bytes,
@@ -138,8 +140,8 @@ use nmr_gui::{
     dynamics_panel::{DynamicsStudioOutput, DynamicsStudioPanel, DynamicsStudioTab},
     ingest_panel::{
         ingest_dropped_payloads, install_browser_folder_drop_hook, poll_browser_drop_error,
-        poll_browser_dropped_payloads, IngestAction, IngestDropOutcome, IngestExecutionPlan,
-        IngestPanelState,
+        poll_browser_dropped_payloads, try_load_1d_ucsf_or_pipe_bytes, IngestAction,
+        IngestDropOutcome, IngestExecutionPlan, IngestPanelState,
     },
     keymap::{poll_global_modifier_shortcuts, ChordDispatcher, CONTOUR_FLOOR_STEP_RATIO},
     mcp_bridge::{render_mcp_bridge_panel, McpBridgeState, McpUiCommand, ViewportFrameBuffer},
@@ -1690,6 +1692,8 @@ struct NmrWorkbenchApp {
     hnco_3d: Option<Spectrum3D>,
     extra_3d_count: usize,
     overlay_layers: Vec<(String, OverlayLayerSpec)>,
+    primary_2d_label: String,
+    primary_2d_visible: bool,
     primary_ppm_nudge: [f32; 2],
     next_layer_id: u64,
     active_overlay_idx: usize,
@@ -1718,16 +1722,19 @@ struct NmrWorkbenchApp {
     assign_target_res: usize,
     assign_lock_check: bool,
 
-    // 2D HSQC viewport & contour settings
+    // 2D viewport & contour settings
     view_h_left: f32,
     view_h_right: f32,
     view_n_top: f32,
     view_n_bottom: f32,
     contour_base: f32,
+    contour_noise_ref: f32,
     contour_factor: f32,
     contour_levels: u32,
     show_negative: bool,
     show_peak_labels: bool,
+    box_zoom_2d_mode: bool,
+    box_zoom_2d_anchor: Option<[f32; 2]>,
 
     // Solver & simulator controls
     replicas: usize,
@@ -1888,6 +1895,8 @@ impl NmrWorkbenchApp {
             hnco_3d: None,
             extra_3d_count: 0,
             overlay_layers: Vec::new(),
+            primary_2d_label: "15N-HSQC".to_string(),
+            primary_2d_visible: true,
             primary_ppm_nudge: [0.0, 0.0],
             next_layer_id: 2,
             active_overlay_idx: 0,
@@ -1918,10 +1927,13 @@ impl NmrWorkbenchApp {
             view_n_top: 103.0,
             view_n_bottom: 135.0,
             contour_base: 8.5,
+            contour_noise_ref: 1.8,
             contour_factor: 1.42,
             contour_levels: 10,
             show_negative: true,
             show_peak_labels: true,
+            box_zoom_2d_mode: false,
+            box_zoom_2d_anchor: None,
             replicas: default_replicas,
             steps_per_sys: 1500,
             assign_cost: 0.0,
@@ -1953,14 +1965,223 @@ impl NmrWorkbenchApp {
         app
     }
 
-    fn reset_view_to_spec(&mut self) {
+    fn estimate_2d_contour_base(data: &[f32]) -> (f32, f32) {
+        let mad = estimate_noise_mad(data);
+        let max_abs = data.iter().fold(0.0_f32, |m, &v| m.max(v.abs()));
+        if mad.is_finite() && mad > 1e-12 {
+            let base = if max_abs > mad * 5.0 {
+                (mad * 4.8).clamp((max_abs * 0.001).max(1e-6), (max_abs * 0.45).max(1e-5))
+            } else {
+                (mad * 4.8).max(1e-6)
+            };
+            (base, mad.max(1e-6))
+        } else if max_abs.is_finite() && max_abs > 1e-12 {
+            let base = (max_abs * 0.05).max(1e-6);
+            (base, (base / 4.8).max(1e-6))
+        } else {
+            (1.0, 1.0)
+        }
+    }
+
+    fn canonical_2d_axis_nucleus(raw_label: &str, min_ppm: f64, max_ppm: f64) -> &'static str {
+        let up = raw_label
+            .trim()
+            .trim_matches(|c: char| c == '<' || c == '>' || c == '"' || c == '\'')
+            .trim()
+            .to_ascii_uppercase();
+        match up.as_str() {
+            "1H" | "H1" | "H" | "HN" | "HA" | "HB" | "PROTON" => "1H",
+            "15N" | "N15" | "N" | "NH" => "15N",
+            "13C" | "C13" | "C" | "CA" | "CB" | "CO" | "CACB" => "13C",
+            "19F" | "F19" | "F" => "19F",
+            "31P" | "P31" | "P" => "31P",
+            "2H" | "H2" | "D" => "2H",
+            "11B" | "B11" => "11B",
+            "29SI" | "SI29" => "29Si",
+            _ => {
+                if max_ppm <= 19.0 && min_ppm >= -6.0 {
+                    "1H"
+                } else if min_ppm >= 88.0 && max_ppm <= 152.0 && (max_ppm - min_ppm) <= 65.0 {
+                    "15N"
+                } else if max_ppm > 19.0 {
+                    "13C"
+                } else {
+                    "1H"
+                }
+            }
+        }
+    }
+
+    fn pretty_nucleus_unicode(nuc: &str) -> &'static str {
+        match nuc {
+            "1H" => "¹H",
+            "15N" => "¹⁵N",
+            "13C" => "¹³C",
+            "19F" => "¹⁹F",
+            "31P" => "³¹P",
+            "2H" => "²H",
+            "11B" => "¹¹B",
+            "29Si" => "²⁹Si",
+            _ => "X",
+        }
+    }
+
+    fn active_2d_nuclei(&self) -> (&'static str, &'static str) {
         if let Some(spec) = &self.hsqc_spec {
-            self.view_h_left = spec.axis_x.max_ppm() as f32;
-            self.view_h_right = spec.axis_x.min_ppm() as f32;
-            self.view_n_top = spec.axis_y.min_ppm() as f32;
-            self.view_n_bottom = spec.axis_y.max_ppm() as f32;
-            let noise = estimate_noise_mad(&spec.data);
-            self.contour_base = (noise * 4.8).max(1.0);
+            let nx = Self::canonical_2d_axis_nucleus(
+                &spec.axis_x.label,
+                spec.axis_x.min_ppm(),
+                spec.axis_x.max_ppm(),
+            );
+            let ny = Self::canonical_2d_axis_nucleus(
+                &spec.axis_y.label,
+                spec.axis_y.min_ppm(),
+                spec.axis_y.max_ppm(),
+            );
+            (nx, ny)
+        } else {
+            ("1H", "15N")
+        }
+    }
+
+    fn view_limits_for_active_2d(&self) -> ViewBounds2dLimits {
+        let Some(spec) = &self.hsqc_spec else {
+            return ViewBounds2dLimits::default_hn();
+        };
+        let mut x_lo = spec.axis_x.min_ppm() as f32;
+        let mut x_hi = spec.axis_x.max_ppm() as f32;
+        let mut y_lo = spec.axis_y.min_ppm() as f32;
+        let mut y_hi = spec.axis_y.max_ppm() as f32;
+
+        for (_, ov) in &self.overlay_layers {
+            if !ov.visible || ov.dims[0] == 0 || ov.dims[1] == 0 {
+                continue;
+            }
+            let ox0 = ov.axis_ppm[0];
+            let ox1 = ox0 + ov.axis_ppm[1] * ((ov.dims[0].saturating_sub(1)) as f32);
+            let oy0 = ov.axis_ppm[2];
+            let oy1 = oy0 + ov.axis_ppm[3] * ((ov.dims[1].saturating_sub(1)) as f32);
+            let ov_x_lo = ox0.min(ox1);
+            let ov_x_hi = ox0.max(ox1);
+            let ov_y_lo = oy0.min(oy1);
+            let ov_y_hi = oy0.max(oy1);
+            // Union bounds when overlay shares a compatible ppm scale (e.g. NOESY + TOCSY or HSQC + HMBC)
+            if (ov_x_hi - ov_x_lo).is_finite()
+                && (ov_y_hi - ov_y_lo).is_finite()
+                && (ov_x_lo <= x_hi + 25.0 && ov_x_hi >= x_lo - 25.0)
+                && (ov_y_lo <= y_hi + 80.0 && ov_y_hi >= y_lo - 80.0)
+            {
+                x_lo = x_lo.min(ov_x_lo);
+                x_hi = x_hi.max(ov_x_hi);
+                y_lo = y_lo.min(ov_y_lo);
+                y_hi = y_hi.max(ov_y_hi);
+            }
+        }
+
+        if !x_lo.is_finite()
+            || !x_hi.is_finite()
+            || !y_lo.is_finite()
+            || !y_hi.is_finite()
+            || (x_hi - x_lo).abs() < 1e-4
+            || (y_hi - y_lo).abs() < 1e-4
+        {
+            return ViewBounds2dLimits::default_hn();
+        }
+        let x_span = (x_hi - x_lo).abs();
+        let y_span = (y_hi - y_lo).abs();
+        let x_pad = (x_span * 0.15).max(0.20);
+        let y_pad = (y_span * 0.15).max(0.20);
+        ViewBounds2dLimits {
+            x_min_ppm: x_lo - x_pad,
+            x_max_ppm: x_hi + x_pad,
+            y_min_ppm: y_lo - y_pad,
+            y_max_ppm: y_hi + y_pad,
+            min_x_span_ppm: (x_span * 0.008).clamp(0.03, 0.35),
+            min_y_span_ppm: (y_span * 0.008).clamp(0.03, 1.50),
+        }
+    }
+
+    fn reset_view_to_spec(&mut self) {
+        self.box_zoom_2d_anchor = None;
+        if let Some(spec) = &self.hsqc_spec {
+            let mut x_lo = spec.axis_x.min_ppm() as f32;
+            let mut x_hi = spec.axis_x.max_ppm() as f32;
+            let mut y_lo = spec.axis_y.min_ppm() as f32;
+            let mut y_hi = spec.axis_y.max_ppm() as f32;
+
+            for (_, ov) in &self.overlay_layers {
+                if !ov.visible || ov.dims[0] == 0 || ov.dims[1] == 0 {
+                    continue;
+                }
+                let ox0 = ov.axis_ppm[0];
+                let ox1 = ox0 + ov.axis_ppm[1] * ((ov.dims[0].saturating_sub(1)) as f32);
+                let oy0 = ov.axis_ppm[2];
+                let oy1 = oy0 + ov.axis_ppm[3] * ((ov.dims[1].saturating_sub(1)) as f32);
+                let (ov_x_lo, ov_x_hi) = (ox0.min(ox1), ox0.max(ox1));
+                let (ov_y_lo, ov_y_hi) = (oy0.min(oy1), oy0.max(oy1));
+                if ov_x_lo <= x_hi + 25.0
+                    && ov_x_hi >= x_lo - 25.0
+                    && ov_y_lo <= y_hi + 80.0
+                    && ov_y_hi >= y_lo - 80.0
+                {
+                    x_lo = x_lo.min(ov_x_lo);
+                    x_hi = x_hi.max(ov_x_hi);
+                    y_lo = y_lo.min(ov_y_lo);
+                    y_hi = y_hi.max(ov_y_hi);
+                }
+            }
+
+            self.view_h_left = x_hi;
+            self.view_h_right = x_lo;
+            self.view_n_top = y_lo;
+            self.view_n_bottom = y_hi;
+            let (base, nref) = Self::estimate_2d_contour_base(&spec.data);
+            self.contour_base = base;
+            self.contour_noise_ref = nref;
+            self.crosshair.snap_to(
+                0.5 * (x_lo as f64 + x_hi as f64),
+                0.5 * (y_lo as f64 + y_hi as f64),
+                None,
+            );
+        }
+    }
+
+    fn clear_stale_protein_demo_state(&mut self, keep_sequence: bool, keep_3d_cubes: bool) {
+        if !keep_sequence {
+            self.sequence.clear();
+            self.seq_ids.clear();
+            self.octet_app.set_loaded_protein_sequence(Vec::new());
+            let saved_ph = self.sidechain_ribbon_state.sample_ph;
+            self.sidechain_ribbon_state = SequenceRibbonState::new();
+            self.sidechain_ribbon_state.set_sample_ph(saved_ph);
+        }
+        self.reference = None;
+        self.peaks.clear();
+        self.truth = None;
+        self.systems.clear();
+        self.u_mat = None;
+        self.p_mat = None;
+        self.assign_res = None;
+        self.pred_ref = None;
+        self.pred_conf.clear();
+        self.pred_ambiguity_codes.clear();
+        self.c13_picked_dataset = None;
+        self.propensity_report = None;
+        self.metrics = None;
+        self.qc_report = None;
+        self.last_bayes_sa_telemetry = None;
+        self.selected_ss = None;
+        self.selected_res = None;
+        self.loaded_pdb_text = None;
+        self.mol3d_panel = Mol3dViewerPanel::new();
+        self.has_structure_or_dynamics = false;
+        if !keep_3d_cubes {
+            self.hncacb_3d = None;
+            self.hnco_3d = None;
+            self.extra_3d_count = 0;
+            self.show_mol3d_viewport = false;
+            self.show_strips_dock = false;
+            self.responsive_shell.tablet_dock = TabletActiveDock::Hidden;
         }
     }
 
@@ -2025,6 +2246,8 @@ impl NmrWorkbenchApp {
         self.hnco_3d = Some(render_triple_3d("HNCO", &self.peaks, &rcfg));
         self.extra_3d_count = 0;
         self.overlay_layers.clear();
+        self.primary_2d_label = "15N-HSQC".to_string();
+        self.primary_2d_visible = true;
         self.primary_ppm_nudge = [0.0, 0.0];
         self.reset_view_to_spec();
     }
@@ -2451,6 +2674,8 @@ impl NmrWorkbenchApp {
                 self.hnco_3d = Some(suite.hnco_3d);
                 self.extra_3d_count = 0;
                 self.overlay_layers.clear();
+                self.primary_2d_label = "15N-HSQC".to_string();
+                self.primary_2d_visible = true;
                 self.primary_ppm_nudge = [0.0, 0.0];
                 self.reset_view_to_spec();
 
@@ -3527,6 +3752,88 @@ impl NmrWorkbenchApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn install_single_2d_spectrum(&mut self, spec: Spectrum2D, label: String, status: String) {
+        self.clear_stale_protein_demo_state(false, false);
+        self.overlay_layers.clear();
+        self.primary_2d_label = label.clone();
+        self.primary_2d_visible = true;
+        self.primary_ppm_nudge = [0.0, 0.0];
+        self.hsqc_arc = Arc::new(spec.data.clone());
+        self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+        self.hsqc_spec = Some(spec);
+        self.reset_view_to_spec();
+        self.workspace_mode = WorkspaceMode::ProteinNmr;
+        self.show_stack1d_panel = false;
+        self.show_relax_panel = false;
+        self.show_dynamics_panel = false;
+        if self.active_2d_nuclei() == ("13C", "15N") {
+            self.regime_kind = GuiRegimeKind::Idp13C;
+            if let Some(ref sp) = self.hsqc_spec {
+                let pcfg = C13PickerConfig {
+                    snr_2d: self.picker_snr,
+                    ..C13PickerConfig::default()
+                };
+                let con_roots = pick_con_2d(sp, &pcfg);
+                self.c13_picked_dataset = Some(C13PickedDataset {
+                    con_roots,
+                    ..C13PickedDataset::default()
+                });
+            }
+        } else {
+            self.regime_kind = GuiRegimeKind::Globular;
+        }
+        self.sync_session_from_app_fresh(&label);
+        self.status_msg = status;
+    }
+
+    fn pick_generic_2d_crosspeaks(spec: &Spectrum2D, snr_threshold: f32) -> Vec<Peak> {
+        let nx = spec.nx();
+        let ny = spec.ny();
+        if nx < 3 || ny < 3 || spec.data.len() < nx * ny {
+            return Vec::new();
+        }
+        let noise = estimate_noise_mad(&spec.data).max(1e-12);
+        let floor = snr_threshold.max(3.0) * noise;
+        let mut peaks = Vec::new();
+        for iy in 1..(ny - 1) {
+            for ix in 1..(nx - 1) {
+                let v = spec.get(ix, iy);
+                if v < floor {
+                    continue;
+                }
+                let mut is_max = true;
+                'nbr: for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let nv = spec.get((ix as i32 + dx) as usize, (iy as i32 + dy) as usize);
+                        if nv > v {
+                            is_max = false;
+                            break 'nbr;
+                        }
+                    }
+                }
+                if is_max {
+                    let x_ppm = spec.axis_x.index_to_ppm(ix as f64);
+                    let y_ppm = spec.axis_y.index_to_ppm(iy as f64);
+                    peaks.push(Peak {
+                        exp: spec.name.clone(),
+                        h: x_ppm,
+                        n: y_ppm,
+                        c: None,
+                        h2: None,
+                        sign: 1,
+                        height: Some(v as f64),
+                        volume: Some(v as f64),
+                    });
+                }
+            }
+        }
+        peaks
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_path_auto(&mut self) {
         let path_str = self.path_input.trim().to_string();
         let p = Path::new(&path_str);
@@ -3557,13 +3864,12 @@ impl NmrWorkbenchApp {
             if p.is_dir() && p.join("2rr").exists() {
                 match read_bruker_pdata_2d(p) {
                     Ok(spec) => {
-                        self.hsqc_arc = Arc::new(spec.data.clone());
-                        self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
-                        self.hsqc_spec = Some(spec);
-                        self.reset_view_to_spec();
-                        self.workspace_mode = WorkspaceMode::ProteinNmr;
-                        self.show_stack1d_panel = false;
-                        self.status_msg = format!("Loaded Bruker 2D pdata from {}", p.display());
+                        let lbl = spec.name.clone();
+                        self.install_single_2d_spectrum(
+                            spec,
+                            lbl,
+                            format!("Loaded Bruker 2D pdata from {}", p.display()),
+                        );
                     }
                     Err(e) => self.status_msg = format!("Bruker load error: {e}"),
                 }
@@ -3580,12 +3886,12 @@ impl NmrWorkbenchApp {
             let dir = p.parent().unwrap_or(p);
             match read_bruker_pdata_2d(dir) {
                 Ok(spec) => {
-                    self.hsqc_arc = Arc::new(spec.data.clone());
-                    self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
-                    self.hsqc_spec = Some(spec);
-                    self.reset_view_to_spec();
-                    self.workspace_mode = WorkspaceMode::ProteinNmr;
-                    self.status_msg = format!("Loaded Bruker 2D pdata from {}", dir.display());
+                    let lbl = spec.name.clone();
+                    self.install_single_2d_spectrum(
+                        spec,
+                        lbl,
+                        format!("Loaded Bruker 2D pdata from {}", dir.display()),
+                    );
                 }
                 Err(e) => self.status_msg = format!("Bruker load error: {e}"),
             }
@@ -3667,14 +3973,18 @@ impl NmrWorkbenchApp {
                     self.status_msg = format!("Peak TSV error: {e}");
                 }
             },
-            "ucsf" => match read_ucsf_2d(p) {
+            "ucsf" | "usf" | "sp2" => match read_ucsf_2d(p) {
                 Ok(spec) => {
-                    self.hsqc_arc = Arc::new(spec.data.clone());
-                    self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
-                    self.hsqc_spec = Some(spec);
-                    self.reset_view_to_spec();
-                    self.workspace_mode = WorkspaceMode::ProteinNmr;
-                    self.status_msg = format!("Loaded UCSF 2D spectrum {}", p.display());
+                    let lbl = p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| spec.name.clone());
+                    self.install_single_2d_spectrum(
+                        spec,
+                        lbl,
+                        format!("Loaded Sparky/UCSF 2D spectrum {}", p.display()),
+                    );
                 }
                 Err(_) => match read_ucsf_3d(p, "HNCACB") {
                     Ok(spec3d) => {
@@ -3682,17 +3992,38 @@ impl NmrWorkbenchApp {
                         self.workspace_mode = WorkspaceMode::ProteinNmr;
                         self.status_msg = format!("Loaded UCSF 3D spectrum {}", p.display());
                     }
-                    Err(e) => self.status_msg = format!("UCSF load error: {e}"),
+                    Err(e) => {
+                        if let Ok(bytes) = std::fs::read(p) {
+                            let stem = p
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("spectrum_1d");
+                            if let Some(sp1d) = try_load_1d_ucsf_or_pipe_bytes(stem, &bytes) {
+                                self.stack1d_panel.load_user_spectra(vec![sp1d]);
+                                self.activate_1d_studio_mode();
+                                self.status_msg = format!(
+                                    "Loaded 1D UCSF spectrum {} into 1D Studio",
+                                    p.display()
+                                );
+                                return;
+                            }
+                        }
+                        self.status_msg = format!("UCSF load error: {e}");
+                    }
                 },
             },
-            "ft2" | "dat" | "pipe" => match read_nmrpipe_2d(p) {
+            "ft2" | "dat" | "pipe" | "ft" => match read_nmrpipe_2d(p) {
                 Ok(spec) => {
-                    self.hsqc_arc = Arc::new(spec.data.clone());
-                    self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
-                    self.hsqc_spec = Some(spec);
-                    self.reset_view_to_spec();
-                    self.workspace_mode = WorkspaceMode::ProteinNmr;
-                    self.status_msg = format!("Loaded NMRPipe 2D spectrum {}", p.display());
+                    let lbl = p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| spec.name.clone());
+                    self.install_single_2d_spectrum(
+                        spec,
+                        lbl,
+                        format!("Loaded NMRPipe 2D spectrum {}", p.display()),
+                    );
                 }
                 Err(e) => self.status_msg = format!("NMRPipe load error: {e}"),
             },
@@ -3748,19 +4079,88 @@ impl NmrWorkbenchApp {
                 }
             }
             _ => {
+                if let Ok(bytes) = std::fs::read(p) {
+                    if bytes.len() >= 180 && &bytes[0..8] == b"UCSF NMR" {
+                        if let Ok(spec) = read_ucsf_2d_from_bytes(&fname_low, &bytes) {
+                            let lbl = p
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| spec.name.clone());
+                            self.install_single_2d_spectrum(
+                                spec,
+                                lbl,
+                                format!("Loaded Sparky/UCSF 2D spectrum {}", p.display()),
+                            );
+                            return;
+                        }
+                        if let Some(sp1d) = try_load_1d_ucsf_or_pipe_bytes(&fname_low, &bytes) {
+                            self.stack1d_panel.load_user_spectra(vec![sp1d]);
+                            self.activate_1d_studio_mode();
+                            self.status_msg =
+                                format!("Loaded 1D UCSF spectrum {} into 1D Studio", p.display());
+                            return;
+                        }
+                    }
+                }
                 self.status_msg = format!(
-                    "Unrecognized file extension .{ext} (expected folder, .tar.gz, .ucsf, .str, .nef, .fasta, .tsv, .ft2, .ft3)"
+                    "Unrecognized file extension .{ext} (expected folder, .tar.gz, .ucsf/.usf, .str, .nef, .fasta, .tsv, .ft2, .ft3)"
                 );
             }
         }
     }
 
     fn pick_2d_roots(&mut self) {
+        let (nuc_x, nuc_y) = self.active_2d_nuclei();
         let Some(spec) = &self.hsqc_spec else {
-            self.status_msg = "No 2D HSQC spectrum loaded".to_string();
+            self.status_msg = "No 2D spectrum loaded".to_string();
             return;
         };
-        let (picked, method_label) = if self.use_neural_picker {
+        if nuc_x == "13C" && nuc_y == "15N" {
+            let pcfg = C13PickerConfig {
+                snr_2d: self.picker_snr,
+                ..C13PickerConfig::default()
+            };
+            let con_roots = pick_con_2d(spec, &pcfg);
+            let n_picked = con_roots.len();
+            let n_pro = con_roots
+                .iter()
+                .filter(|r| r.is_proline_imino_region)
+                .count();
+            let mut ds = self.c13_picked_dataset.take().unwrap_or_default();
+            ds.con_roots = con_roots;
+            self.c13_picked_dataset = Some(ds);
+            self.regime_kind = GuiRegimeKind::Idp13C;
+            self.status_msg = format!(
+                "13C-IDP CON picker found {n_picked} peptide-bond roots ({n_pro} Pro imino 132–142 ppm)"
+            );
+            return;
+        }
+        if !(nuc_x == "1H" && (nuc_y == "15N" || nuc_y == "13C")) {
+            let picked = Self::pick_generic_2d_crosspeaks(spec, self.picker_snr);
+            let n_picked = picked.len();
+            self.peaks = picked;
+            self.session.state.peaks = self.peaks.clone();
+            self.systems.clear();
+            self.status_msg = format!(
+                "2D peak picker found {n_picked} {}–{} cross-peaks",
+                Self::pretty_nucleus_unicode(nuc_x),
+                Self::pretty_nucleus_unicode(nuc_y)
+            );
+            return;
+        }
+        let (picked, method_label) = if nuc_y == "13C" {
+            (
+                pick_c13_hsqc_2d(
+                    spec,
+                    &PickerConfig {
+                        snr_threshold: self.picker_snr,
+                        ..PickerConfig::default()
+                    },
+                ),
+                "Classical 13C-HSQC picker",
+            )
+        } else if self.use_neural_picker {
             (
                 pick_hsqc_2d_neural(
                     spec,
@@ -3793,7 +4193,7 @@ impl NmrWorkbenchApp {
         self.metrics = None;
         self.rebuild_systems_and_matrices();
         self.status_msg = format!(
-            "{method_label} found {n_picked} HSQC roots -> rebuilt {} spin systems",
+            "{method_label} found {n_picked} 2D roots -> rebuilt {} spin systems",
             self.systems.len()
         );
     }
@@ -3907,13 +4307,28 @@ impl NmrWorkbenchApp {
             IngestDropOutcome::Workspace(panel) => {
                 let n_exp = panel.inventory.experiments.len();
                 let root = panel.inventory.root_name.clone();
+                let single_direct_2d = n_exp == 1
+                    && panel.inventory.auxiliary_files.is_empty()
+                    && panel.inventory.experiments[0].dimensionality
+                        == ExperimentDimensionality::Dim2D
+                    && panel.inventory.experiments[0].data_state == DataState::Processed
+                    && matches!(
+                        panel.inventory.experiments[0].vendor,
+                        ExperimentVendor::SparkyUcsf | ExperimentVendor::NmrPipe
+                    );
                 self.ingest_panel = *panel;
-                self.ingest_panel.open = true;
                 self.workspace_mode = WorkspaceMode::ProteinNmr;
                 self.show_stack1d_panel = false;
-                self.status_msg = format!(
-                    "Classified '{root}' ({n_exp} experiment(s)) — review selection matrix"
-                );
+                if single_direct_2d {
+                    self.ingest_panel.open = false;
+                    let plan = self.ingest_panel.build_execution_plan();
+                    self.execute_ingest_plan(plan, false);
+                } else {
+                    self.ingest_panel.open = true;
+                    self.status_msg = format!(
+                        "Classified '{root}' ({n_exp} experiment(s)) — review selection matrix"
+                    );
+                }
             }
         }
     }
@@ -4273,11 +4688,23 @@ impl NmrWorkbenchApp {
     fn draw_top_bar(&mut self, ui: &mut egui::Ui) {
         let mut menu_actions: Vec<WorkbenchAction> = Vec::new();
         ui.horizontal_wrapped(|ui| {
-            // 1. Sub-view pills inside 2D/3D Protein Studio
+            // 1. Sub-view pills inside 2D/3D NMR Studio
             let on_hsqc = !self.show_relax_panel && !self.show_dynamics_panel;
+            let (nx_lbl, ny_lbl) = self.active_2d_nuclei();
+            let pill_2d = match (nx_lbl, ny_lbl) {
+                ("1H", "15N") => "🎯 2D HSQC".to_string(),
+                ("13C", "15N") => "🎯 2D ¹³C–¹⁵N CON".to_string(),
+                (x, y) => format!(
+                    "🎯 2D {}–{} Contours",
+                    Self::pretty_nucleus_unicode(x),
+                    Self::pretty_nucleus_unicode(y)
+                ),
+            };
             if ui
-                .selectable_label(on_hsqc, "🎯 2D HSQC")
-                .on_hover_text("2D 1H-15N / 1H-13C HSQC contour viewport")
+                .selectable_label(on_hsqc, pill_2d)
+                .on_hover_text(
+                    "2D homonuclear / heteronuclear multi-layer WebGPU contour viewport",
+                )
                 .clicked()
             {
                 self.show_relax_panel = false;
@@ -4691,6 +5118,14 @@ impl NmrWorkbenchApp {
 
     fn draw_hsqc_canvas(&mut self, ui: &mut egui::Ui) -> egui::Rect {
         let is_compact_mobile = ui.ctx().content_rect().width() < 680.0;
+        let (nuc_x, nuc_y) = self.active_2d_nuclei();
+        let pretty_x = Self::pretty_nucleus_unicode(nuc_x);
+        let pretty_y = Self::pretty_nucleus_unicode(nuc_y);
+        let base_lo = (self.contour_noise_ref * 0.20).max(1e-6);
+        let base_hi = (self.contour_noise_ref * 250.0)
+            .max(self.contour_base * 4.0)
+            .max(60.0);
+
         if is_compact_mobile {
             egui::ScrollArea::horizontal()
                 .id_salt("hsqc_mobile_toolbar_scroll")
@@ -4717,7 +5152,7 @@ impl NmrWorkbenchApp {
                             .clicked()
                         {
                             self.contour_base =
-                                (self.contour_base / CONTOUR_FLOOR_STEP_RATIO).max(1e-3);
+                                (self.contour_base / CONTOUR_FLOOR_STEP_RATIO).max(1e-6);
                         }
                         if ui
                             .add(
@@ -4726,8 +5161,8 @@ impl NmrWorkbenchApp {
                             )
                             .clicked()
                         {
-                            self.contour_base =
-                                (self.contour_base * CONTOUR_FLOOR_STEP_RATIO).min(500.0);
+                            self.contour_base = (self.contour_base * CONTOUR_FLOOR_STEP_RATIO)
+                                .min((self.contour_noise_ref * 1e4).max(1e9));
                         }
                         let lbl_btn = egui::Button::new("Labels")
                             .selected(self.show_peak_labels)
@@ -4778,9 +5213,20 @@ impl NmrWorkbenchApp {
                 });
         } else {
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("2D ¹H–¹⁵N HSQC (WebGPU Multi-Layer)").strong());
+                let canvas_title = if nuc_x == "13C" && nuc_y == "15N" {
+                    format!("2D ¹³C–¹⁵N CON ({})", self.primary_2d_label)
+                } else if nuc_x == "1H"
+                    && nuc_y == "15N"
+                    && self.primary_2d_label == "15N-HSQC"
+                    && self.overlay_layers.is_empty()
+                {
+                    "2D ¹H–¹⁵N HSQC (WebGPU Multi-Layer)".to_string()
+                } else {
+                    format!("2D {pretty_x}–{pretty_y} ({})", self.primary_2d_label)
+                };
+                ui.label(egui::RichText::new(canvas_title).strong());
                 ui.add(
-                    egui::Slider::new(&mut self.contour_base, 0.5..=60.0)
+                    egui::Slider::new(&mut self.contour_base, base_lo..=base_hi)
                         .logarithmic(true)
                         .text("Base"),
                 );
@@ -4794,6 +5240,16 @@ impl NmrWorkbenchApp {
                 {
                     self.show_overlay_manager = !self.show_overlay_manager;
                 }
+                if ui
+                    .toggle_value(&mut self.box_zoom_2d_mode, "🔍 Box Zoom")
+                    .on_hover_text(
+                        "Click 2 corners (or hold Shift + drag anywhere) to zoom into a 2D cross-peak region",
+                    )
+                    .changed()
+                    && !self.box_zoom_2d_mode
+                {
+                    self.box_zoom_2d_anchor = None;
+                }
                 let lock_txt = if self.crosshair.locked {
                     "🔒 Crosshair"
                 } else {
@@ -4802,8 +5258,52 @@ impl NmrWorkbenchApp {
                 if ui.small_button(lock_txt).clicked() {
                     self.crosshair.toggle_lock();
                 }
-                if ui.small_button("Reset Zoom").clicked() {
+                if ui
+                    .small_button("⛶ Full 2D")
+                    .on_hover_text("Reset 2D zoom to full spectral sweep (or double-click canvas)")
+                    .clicked()
+                {
                     self.reset_view_to_spec();
+                }
+            });
+        }
+
+        // Quick 1-click Overlay Layer visibility checkboxes whenever multiple 2D spectra are loaded
+        if !self.overlay_layers.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(
+                    egui::RichText::new("Layers:")
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(165, 185, 215)),
+                );
+                let (p_pos, _) = default_overlay_palette(0);
+                let p_col = egui::Color32::from_rgb(
+                    (p_pos[0] * 255.0) as u8,
+                    (p_pos[1] * 255.0) as u8,
+                    (p_pos[2] * 255.0) as u8,
+                );
+                ui.checkbox(
+                    &mut self.primary_2d_visible,
+                    egui::RichText::new(format!("● {}", self.primary_2d_label))
+                        .small()
+                        .strong()
+                        .color(p_col),
+                );
+                for (lbl, ov) in &mut self.overlay_layers {
+                    let c = egui::Color32::from_rgb(
+                        (ov.pos_rgba[0] * 255.0) as u8,
+                        (ov.pos_rgba[1] * 255.0) as u8,
+                        (ov.pos_rgba[2] * 255.0) as u8,
+                    );
+                    ui.checkbox(
+                        &mut ov.visible,
+                        egui::RichText::new(format!("● {lbl}"))
+                            .small()
+                            .strong()
+                            .color(c),
+                    );
                 }
             });
         }
@@ -4812,15 +5312,37 @@ impl NmrWorkbenchApp {
         let canvas_size = egui::vec2(avail.x.max(160.0), (avail.y - 4.0).max(160.0));
         let (rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
 
-        let limits = self
-            .hsqc_spec
-            .as_ref()
-            .map(ViewBounds2dLimits::from_spectrum_2d)
-            .unwrap_or_else(ViewBounds2dLimits::default_hn);
+        let limits = self.view_limits_for_active_2d();
 
-        if !ui.input(|i| i.pointer.any_down()) {
-            self.suppress_hsqc_pan_until_release = false;
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.box_zoom_2d_anchor = None;
+            self.box_zoom_2d_mode = false;
         }
+
+        let apply_box_zoom = |app: &mut Self, p0: egui::Pos2, p1: egui::Pos2| -> bool {
+            let x0 = p0.x.min(p1.x).clamp(rect.left(), rect.right());
+            let x1 = p0.x.max(p1.x).clamp(rect.left(), rect.right());
+            let y0 = p0.y.min(p1.y).clamp(rect.top(), rect.bottom());
+            let y1 = p0.y.max(p1.y).clamp(rect.top(), rect.bottom());
+            if (x1 - x0) >= 6.0 && (y1 - y0) >= 6.0 {
+                let u0 = (x0 - rect.left()) / rect.width().max(1.0);
+                let u1 = (x1 - rect.left()) / rect.width().max(1.0);
+                let v0 = (y0 - rect.top()) / rect.height().max(1.0);
+                let v1 = (y1 - rect.top()) / rect.height().max(1.0);
+                let nh_left = app.view_h_left + u0 * (app.view_h_right - app.view_h_left);
+                let nh_right = app.view_h_left + u1 * (app.view_h_right - app.view_h_left);
+                let nn_top = app.view_n_top + v0 * (app.view_n_bottom - app.view_n_top);
+                let nn_bottom = app.view_n_top + v1 * (app.view_n_bottom - app.view_n_top);
+                let clamped = clamp_view_ppm_2d([nh_left, nh_right, nn_top, nn_bottom], limits);
+                app.view_h_left = clamped[0];
+                app.view_h_right = clamped[1];
+                app.view_n_top = clamped[2];
+                app.view_n_bottom = clamped[3];
+                true
+            } else {
+                false
+            }
+        };
 
         // Two-finger multi-touch pinch-to-zoom & translation pan around gesture center
         let multi_touch_active = if let Some(mt) = ui.ctx().input(|i| i.multi_touch()) {
@@ -4856,8 +5378,44 @@ impl NmrWorkbenchApp {
             false
         };
 
+        let shift_or_right_drag = !multi_touch_active
+            && (response.dragged_by(egui::PointerButton::Secondary)
+                || (response.dragged_by(egui::PointerButton::Primary)
+                    && ui.input(|i| i.modifiers.shift)));
+        if shift_or_right_drag {
+            self.suppress_hsqc_pan_until_release = true;
+            if self.box_zoom_2d_anchor.is_none() {
+                if let Some(origin) = ui
+                    .input(|i| i.pointer.press_origin())
+                    .or_else(|| response.interact_pointer_pos())
+                {
+                    if rect.contains(origin) {
+                        self.box_zoom_2d_anchor = Some([origin.x, origin.y]);
+                    }
+                }
+            }
+        }
+
+        if !ui.input(|i| i.pointer.any_down()) {
+            if !self.box_zoom_2d_mode {
+                if let (Some(p0), Some(p1)) = (
+                    self.box_zoom_2d_anchor.take(),
+                    response
+                        .interact_pointer_pos()
+                        .or_else(|| ui.input(|i| i.pointer.latest_pos())),
+                ) {
+                    let _ = apply_box_zoom(self, egui::pos2(p0[0], p0[1]), p1);
+                }
+            }
+            self.suppress_hsqc_pan_until_release = false;
+        }
+
         // Single-finger / primary pointer pan with physical ppm clamping
-        if !multi_touch_active && !self.suppress_hsqc_pan_until_release && response.dragged() {
+        if !multi_touch_active
+            && !self.suppress_hsqc_pan_until_release
+            && !self.box_zoom_2d_mode
+            && response.dragged_by(egui::PointerButton::Primary)
+        {
             let delta = response.drag_delta();
             let span_h = self.view_h_right - self.view_h_left;
             let span_n = self.view_n_bottom - self.view_n_top;
@@ -4917,20 +5475,22 @@ impl NmrWorkbenchApp {
 
         let painter = ui.painter_at(rect);
         let mut gpu_layers: Vec<OverlayLayerSpec> = Vec::new();
-        if let Some(spec) = &self.hsqc_spec {
-            let mut base_layer = OverlayLayerSpec::from_spectrum_2d(
-                1,
-                self.hsqc_gen,
-                spec,
-                Arc::clone(&self.hsqc_arc),
-                self.contour_base,
-                0,
-            );
-            base_layer.level_factor = self.contour_factor;
-            base_layer.num_levels = self.contour_levels;
-            base_layer.show_negative = self.show_negative;
-            base_layer.ppm_nudge = self.primary_ppm_nudge;
-            gpu_layers.push(base_layer);
+        if self.primary_2d_visible {
+            if let Some(spec) = &self.hsqc_spec {
+                let mut base_layer = OverlayLayerSpec::from_spectrum_2d(
+                    1,
+                    self.hsqc_gen,
+                    spec,
+                    Arc::clone(&self.hsqc_arc),
+                    self.contour_base,
+                    0,
+                );
+                base_layer.level_factor = self.contour_factor;
+                base_layer.num_levels = self.contour_levels;
+                base_layer.show_negative = self.show_negative;
+                base_layer.ppm_nudge = self.primary_ppm_nudge;
+                gpu_layers.push(base_layer);
+            }
         }
         for (_, ov) in &self.overlay_layers {
             if ov.visible {
@@ -4952,38 +5512,182 @@ impl NmrWorkbenchApp {
             SyncCrosshair::ppm_to_screen_2d(view_ppm, rect, h, n)
         };
 
-        // Tap / click to select nearest spin system or sync crosshair on touch
-        if response.clicked() && !multi_touch_active && !self.suppress_hsqc_pan_until_release {
-            if let Some(click_pos) = response.interact_pointer_pos() {
-                let hit_radius = if is_compact_mobile { 24.0 } else { 18.0 };
-                let mut best: Option<(usize, f32)> = None;
-                for (s, ss) in self.systems.iter().enumerate() {
-                    let pt = ppm_to_screen(ss.h, ss.n);
-                    let dist = pt.distance(click_pos);
-                    if dist <= hit_radius && best.is_none_or(|(_, bd)| dist < bd) {
-                        best = Some((s, dist));
+        // Crisp subtle dashed δ₁ = δ₂ homonuclear diagonal when direct & indirect nuclei match
+        if nuc_x == nuc_y {
+            let x_lo = self.view_h_left.min(self.view_h_right) as f64;
+            let x_hi = self.view_h_left.max(self.view_h_right) as f64;
+            let y_lo = self.view_n_top.min(self.view_n_bottom) as f64;
+            let y_hi = self.view_n_top.max(self.view_n_bottom) as f64;
+            let d_lo = x_lo.max(y_lo);
+            let d_hi = x_hi.min(y_hi);
+            if d_hi > d_lo {
+                let p_start = ppm_to_screen(d_hi, d_hi);
+                let p_end = ppm_to_screen(d_lo, d_lo);
+                let total_len = p_start.distance(p_end);
+                if total_len >= 2.0 {
+                    let dir = (p_end - p_start) / total_len;
+                    let dash = 6.0_f32;
+                    let gap = 5.0_f32;
+                    let diag_stroke = egui::Stroke::new(
+                        1.15,
+                        egui::Color32::from_rgba_unmultiplied(195, 215, 245, 115),
+                    );
+                    let mut s = 0.0_f32;
+                    while s < total_len {
+                        let e = (s + dash).min(total_len);
+                        painter.line_segment([p_start + dir * s, p_start + dir * e], diag_stroke);
+                        s += dash + gap;
+                    }
+                    let lbl_pt = p_start + dir * (total_len * 0.12).clamp(18.0, total_len - 4.0);
+                    if rect.shrink(14.0).contains(lbl_pt) {
+                        painter.text(
+                            egui::pos2(lbl_pt.x + 5.0, lbl_pt.y + 4.0),
+                            egui::Align2::LEFT_TOP,
+                            "δ₁ = δ₂",
+                            egui::FontId::monospace(9.5),
+                            egui::Color32::from_rgba_unmultiplied(205, 225, 250, 155),
+                        );
                     }
                 }
-                if let Some((s, _)) = best {
-                    self.selected_ss = Some(s);
-                    let ss = &self.systems[s];
-                    self.crosshair.snap_to(ss.h, ss.n, None);
-                    if let Some(res) = &self.assign_res {
-                        if res.position.get(s).copied().unwrap_or(-1) >= 0 {
-                            let rk = res.position[s] as usize;
-                            self.selected_res = Some(rk);
-                            self.assign_target_res = rk;
-                            self.mol3d_panel.highlight_sequence_residue(Some(rk), true);
+            }
+        }
+
+        // Tap / click: 2-click box zoom mode OR select nearest peak/spin system
+        if response.clicked() && !multi_touch_active && !self.suppress_hsqc_pan_until_release {
+            if let Some(click_pos) = response.interact_pointer_pos() {
+                if self.box_zoom_2d_mode {
+                    if let Some(anchor) = self.box_zoom_2d_anchor.take() {
+                        if apply_box_zoom(self, egui::pos2(anchor[0], anchor[1]), click_pos) {
+                            self.box_zoom_2d_mode = false;
+                        } else {
+                            self.box_zoom_2d_anchor = Some([click_pos.x, click_pos.y]);
                         }
+                    } else {
+                        self.box_zoom_2d_anchor = Some([click_pos.x, click_pos.y]);
                     }
                 } else {
-                    let u = ((click_pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                    let v = ((click_pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
-                    let tap_h =
-                        (self.view_h_left + u * (self.view_h_right - self.view_h_left)) as f64;
-                    let tap_n =
-                        (self.view_n_top + v * (self.view_n_bottom - self.view_n_top)) as f64;
-                    self.crosshair.update_from_2d_hover(tap_h, tap_n);
+                    let hit_radius = if is_compact_mobile { 24.0 } else { 18.0 };
+                    let mut snapped_con = false;
+                    if nuc_x == "13C" && nuc_y == "15N" {
+                        if let Some(ref ds) = self.c13_picked_dataset {
+                            if let Some(best_con) = ds
+                                .con_roots
+                                .iter()
+                                .map(|pk| {
+                                    let pt = ppm_to_screen(pk.c_prev_ppm, pk.n_curr_ppm);
+                                    (pk, pt.distance(click_pos))
+                                })
+                                .filter(|(_, d)| *d <= hit_radius)
+                                .min_by(|a, b| a.1.total_cmp(&b.1))
+                                .map(|(pk, _)| (pk.c_prev_ppm, pk.n_curr_ppm))
+                            {
+                                self.crosshair.snap_to(best_con.0, best_con.1, None);
+                                snapped_con = true;
+                            }
+                        }
+                    }
+                    if !snapped_con {
+                        let mut best: Option<(usize, f32)> = None;
+                        for (s, ss) in self.systems.iter().enumerate() {
+                            let pt = ppm_to_screen(ss.h, ss.n);
+                            let dist = pt.distance(click_pos);
+                            if dist <= hit_radius && best.is_none_or(|(_, bd)| dist < bd) {
+                                best = Some((s, dist));
+                            }
+                        }
+                        if let Some((s, _)) = best {
+                            self.selected_ss = Some(s);
+                            let ss = &self.systems[s];
+                            self.crosshair.snap_to(ss.h, ss.n, None);
+                            if let Some(res) = &self.assign_res {
+                                if res.position.get(s).copied().unwrap_or(-1) >= 0 {
+                                    let rk = res.position[s] as usize;
+                                    self.selected_res = Some(rk);
+                                    self.assign_target_res = rk;
+                                    self.mol3d_panel.highlight_sequence_residue(Some(rk), true);
+                                }
+                            }
+                        } else {
+                            let u = ((click_pos.x - rect.left()) / rect.width().max(1.0))
+                                .clamp(0.0, 1.0);
+                            let v = ((click_pos.y - rect.top()) / rect.height().max(1.0))
+                                .clamp(0.0, 1.0);
+                            let tap_h = (self.view_h_left
+                                + u * (self.view_h_right - self.view_h_left))
+                                as f64;
+                            let tap_n = (self.view_n_top
+                                + v * (self.view_n_bottom - self.view_n_top))
+                                as f64;
+                            self.crosshair.update_from_2d_hover(tap_h, tap_n);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Draw 2D CON peptide-bond roots (including Pro imino 132–142 ppm) when active
+        if nuc_x == "13C" && nuc_y == "15N" {
+            if let Some(ref ds) = self.c13_picked_dataset {
+                for (idx, pk) in ds.con_roots.iter().enumerate() {
+                    let pt = ppm_to_screen(pk.c_prev_ppm, pk.n_curr_ppm);
+                    if !rect.contains(pt) {
+                        continue;
+                    }
+                    let marker_col = if pk.is_proline_imino_region {
+                        egui::Color32::from_rgb(255, 205, 88)
+                    } else {
+                        egui::Color32::from_rgb(95, 240, 175)
+                    };
+                    let sz = 4.2;
+                    painter.line_segment(
+                        [egui::pos2(pt.x - sz, pt.y), egui::pos2(pt.x + sz, pt.y)],
+                        egui::Stroke::new(1.3, marker_col),
+                    );
+                    painter.line_segment(
+                        [egui::pos2(pt.x, pt.y - sz), egui::pos2(pt.x, pt.y + sz)],
+                        egui::Stroke::new(1.3, marker_col),
+                    );
+                    if self.show_peak_labels {
+                        let lbl = if pk.is_proline_imino_region {
+                            format!("Pro#{idx}")
+                        } else {
+                            format!("#{idx}")
+                        };
+                        painter.text(
+                            egui::pos2(pt.x + 5.0, pt.y - 5.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            lbl,
+                            egui::FontId::monospace(10.0),
+                            marker_col,
+                        );
+                    }
+                }
+            }
+        } else if self.systems.is_empty() && !self.peaks.is_empty() {
+            // Draw unclustered 2D cross-peak markers (e.g. 1H-1H NOESY/TOCSY/COSY or 13C-HSQC/HMBC)
+            for (idx, pk) in self.peaks.iter().take(400).enumerate() {
+                let pt = ppm_to_screen(pk.h, pk.n);
+                if !rect.contains(pt) {
+                    continue;
+                }
+                let marker_col = egui::Color32::from_rgb(135, 215, 255);
+                let sz = 3.5;
+                painter.line_segment(
+                    [egui::pos2(pt.x - sz, pt.y), egui::pos2(pt.x + sz, pt.y)],
+                    egui::Stroke::new(1.1, marker_col),
+                );
+                painter.line_segment(
+                    [egui::pos2(pt.x, pt.y - sz), egui::pos2(pt.x, pt.y + sz)],
+                    egui::Stroke::new(1.1, marker_col),
+                );
+                if self.show_peak_labels && self.peaks.len() <= 120 {
+                    painter.text(
+                        egui::pos2(pt.x + 5.0, pt.y - 5.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        format!("#{idx}"),
+                        egui::FontId::monospace(9.5),
+                        marker_col,
+                    );
                 }
             }
         }
@@ -5091,6 +5795,52 @@ impl NmrWorkbenchApp {
             );
         }
 
+        // Draw rubber-band 2D box zoom preview rectangle when anchored
+        if let Some(anchor) = self.box_zoom_2d_anchor {
+            if let Some(cur_pos) = response
+                .hover_pos()
+                .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+            {
+                let box_rect = egui::Rect::from_two_pos(
+                    egui::pos2(
+                        anchor[0].clamp(rect.left(), rect.right()),
+                        anchor[1].clamp(rect.top(), rect.bottom()),
+                    ),
+                    egui::pos2(
+                        cur_pos.x.clamp(rect.left(), rect.right()),
+                        cur_pos.y.clamp(rect.top(), rect.bottom()),
+                    ),
+                );
+                painter.rect_filled(
+                    box_rect,
+                    1.5,
+                    egui::Color32::from_rgba_unmultiplied(80, 210, 255, 36),
+                );
+                painter.rect_stroke(
+                    box_rect,
+                    1.5,
+                    egui::Stroke::new(1.4, egui::Color32::from_rgb(110, 230, 255)),
+                    egui::StrokeKind::Inside,
+                );
+                let dh_ppm = ((box_rect.width() / rect.width().max(1.0))
+                    * (self.view_h_left - self.view_h_right).abs())
+                .abs();
+                let dn_ppm = ((box_rect.height() / rect.height().max(1.0))
+                    * (self.view_n_bottom - self.view_n_top).abs())
+                .abs();
+                painter.text(
+                    egui::pos2(
+                        box_rect.left() + 4.0,
+                        (box_rect.top() - 4.0).max(rect.top() + 14.0),
+                    ),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("Δ{pretty_x} {dh_ppm:.2} × Δ{pretty_y} {dn_ppm:.2} ppm"),
+                    egui::FontId::monospace(9.5),
+                    egui::Color32::from_rgb(160, 240, 255),
+                );
+            }
+        }
+
         // Draw axis ticks and live cursor ppm readout
         painter.rect_stroke(
             rect,
@@ -5099,6 +5849,22 @@ impl NmrWorkbenchApp {
             egui::StrokeKind::Inside,
         );
         let tick_steps = if is_compact_mobile { 4usize } else { 5usize };
+        let x_span_abs = (self.view_h_left - self.view_h_right).abs();
+        let y_span_abs = (self.view_n_bottom - self.view_n_top).abs();
+        let x_tick_dec = if x_span_abs < 0.5 {
+            3usize
+        } else if x_span_abs < 40.0 {
+            2usize
+        } else {
+            1usize
+        };
+        let y_tick_dec = if y_span_abs < 0.5 {
+            3usize
+        } else if y_span_abs < 25.0 {
+            2usize
+        } else {
+            1usize
+        };
         for i in 0..=tick_steps {
             let t = (i as f32) / (tick_steps as f32);
             let h_val = self.view_h_left + t * (self.view_h_right - self.view_h_left);
@@ -5106,17 +5872,22 @@ impl NmrWorkbenchApp {
             painter.text(
                 egui::pos2(x, rect.bottom() - 3.0),
                 egui::Align2::CENTER_BOTTOM,
-                format!("{h_val:.2} ¹H"),
+                format!("{h_val:.x_tick_dec$} {pretty_x}"),
                 egui::FontId::monospace(9.5),
                 egui::Color32::from_rgb(170, 188, 215),
             );
 
             let n_val = self.view_n_top + t * (self.view_n_bottom - self.view_n_top);
             let y = rect.top() + t * rect.height();
+            let y_lbl = if i == 0 {
+                format!("{n_val:.y_tick_dec$} {pretty_y}")
+            } else {
+                format!("{n_val:.y_tick_dec$}")
+            };
             painter.text(
                 egui::pos2(rect.left() + 4.0, y),
                 egui::Align2::LEFT_CENTER,
-                format!("{n_val:.1}"),
+                y_lbl,
                 egui::FontId::monospace(9.5),
                 egui::Color32::from_rgb(170, 188, 215),
             );
@@ -5124,14 +5895,18 @@ impl NmrWorkbenchApp {
 
         let lock_tag = if self.crosshair.locked {
             " [LOCKED]"
+        } else if self.box_zoom_2d_mode {
+            " [BOX ZOOM]"
         } else {
             ""
         };
+        let x_cur_dec = if x_span_abs < 30.0 { 3usize } else { 2usize };
+        let y_cur_dec = if y_span_abs < 30.0 { 3usize } else { 2usize };
         painter.text(
             egui::pos2(rect.right() - 8.0, rect.top() + 6.0),
             egui::Align2::RIGHT_TOP,
             format!(
-                "¹H {:.3} ppm | ¹⁵N {:.2} ppm{lock_tag}",
+                "F2 {pretty_x} {:.x_cur_dec$} ppm | F1 {pretty_y} {:.y_cur_dec$} ppm{lock_tag}",
                 self.crosshair.h_ppm, self.crosshair.n_ppm
             ),
             egui::FontId::monospace(if is_compact_mobile { 10.0 } else { 11.0 }),
@@ -6493,14 +7268,18 @@ impl NmrWorkbenchApp {
 
     fn execute_ingest_plan(&mut self, plan: IngestExecutionPlan, run_full_pipeline: bool) {
         self.workspace_mode = WorkspaceMode::ProteinNmr;
-        if !plan.sequence_three_letter.is_empty() {
+        self.show_stack1d_panel = false;
+        self.show_relax_panel = false;
+        self.show_dynamics_panel = false;
+
+        let has_user_seq = !plan.sequence_three_letter.is_empty();
+        self.clear_stale_protein_demo_state(has_user_seq, false);
+        if has_user_seq {
             self.sequence = plan.sequence_three_letter.clone();
             self.seq_ids = (1..=(self.sequence.len() as i32)).collect();
             self.octet_app
                 .set_loaded_protein_sequence(self.sequence.clone());
         }
-        self.truth = None;
-        self.metrics = None;
         self.raw_fids_total = plan
             .selected_experiments
             .iter()
@@ -6512,10 +7291,16 @@ impl NmrWorkbenchApp {
         self.axis_rescue_audits.clear();
 
         let mut ingested_recipes: BTreeMap<String, ProcessingRecipe> = BTreeMap::new();
+        let mut load_errors: Vec<String> = Vec::new();
+        let mut primary_cls: Option<PulseSequenceClass> = None;
         {
-            let mut primary_2d: Option<Spectrum2D> = None;
-            let mut overlays_2d: Vec<(String, Spectrum2D)> = Vec::new();
-            let mut cubes_3d: Vec<(String, Spectrum3D)> = Vec::new();
+            let mut loaded_2d_list: Vec<(
+                String,
+                PulseSequenceClass,
+                Option<&'static str>,
+                Spectrum2D,
+            )> = Vec::new();
+            let mut cubes_3d: Vec<(String, PulseSequenceClass, Spectrum3D)> = Vec::new();
             let mut processed_fids = 0usize;
 
             let find_mem_file = |exp_rel: &str, child: &str| -> Option<&[u8]> {
@@ -6555,56 +7340,132 @@ impl NmrWorkbenchApp {
                     .map(|(_, v)| v.as_slice())
             };
 
+            // Discover all Bruker `pdata/<procno>` sub-prefixes present in `in_memory_files` (`1` first, then numeric ascending)
+            let find_mem_pdata_prefixes = |exp_rel: &str, bin_file: &str| -> Vec<String> {
+                let exp_clean = exp_rel.trim_matches('/').trim_start_matches("./");
+                let mut procnos: Vec<(u32, String)> = Vec::new();
+                let mut has_direct = false;
+                let suffix_bin = format!("/{bin_file}").to_ascii_lowercase();
+                for key in plan.in_memory_files.keys() {
+                    let k_clean = key.trim_matches('/').trim_start_matches("./");
+                    let tail_opt = if exp_clean.is_empty() || exp_clean == "." {
+                        Some(k_clean)
+                    } else if let Some(rest) = k_clean.strip_prefix(&format!("{exp_clean}/")) {
+                        Some(rest)
+                    } else {
+                        let marker = format!("/{exp_clean}/");
+                        k_clean
+                            .find(&marker)
+                            .map(|idx| &k_clean[idx + marker.len()..])
+                    };
+                    let Some(tail) = tail_opt else {
+                        continue;
+                    };
+                    if tail.eq_ignore_ascii_case(bin_file) {
+                        has_direct = true;
+                        continue;
+                    }
+                    let tail_low = tail.to_ascii_lowercase();
+                    if tail_low.starts_with("pdata/") && tail_low.ends_with(&suffix_bin) {
+                        let mid = &tail[6..tail.len() - suffix_bin.len()];
+                        if !mid.contains('/') {
+                            let rank = if mid == "1" {
+                                0
+                            } else {
+                                mid.parse::<u32>().unwrap_or(u32::MAX - 1).saturating_add(1)
+                            };
+                            let pfx = format!("pdata/{mid}");
+                            if !procnos.iter().any(|(_, existing)| existing == &pfx) {
+                                procnos.push((rank, pfx));
+                            }
+                        }
+                    }
+                }
+                procnos.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                let mut out: Vec<String> = procnos.into_iter().map(|(_, p)| p).collect();
+                if out.is_empty() {
+                    out.push("pdata/1".to_string());
+                }
+                if has_direct || !out.iter().any(|p| p.is_empty()) {
+                    out.push(String::new());
+                }
+                out
+            };
+
             for item in &plan.selected_experiments {
                 let exp_token = item.solver_exp_name.unwrap_or("HNCACB");
+                let cls = item.effective_class;
                 let rel = &item.experiment.relative_path;
                 let disp = &item.experiment.display_name;
 
                 match item.experiment.dimensionality {
                     ExperimentDimensionality::Dim2D => {
                         let mut loaded_2d: Option<Spectrum2D> = None;
+                        let mut item_err: Option<String> = None;
                         #[cfg(not(target_arch = "wasm32"))]
                         if let Some(ref path) = item.resolved_path {
                             if path.exists() {
-                                loaded_2d = if item.experiment.data_state == DataState::RawFid {
+                                if item.experiment.data_state == DataState::RawFid {
                                     match process_fid_dir_2d(path, false, false) {
                                         Ok((s2, mut recipe)) => {
                                             recipe.enable_axis_rescue = self.enable_axis_rescue;
                                             processed_fids += 1;
                                             ingested_recipes.insert(disp.clone(), recipe);
-                                            Some(s2)
+                                            loaded_2d = Some(s2);
                                         }
-                                        Err(_) => None,
+                                        Err(e) => item_err = Some(e),
                                     }
                                 } else {
-                                    match item.experiment.vendor {
-                                        ExperimentVendor::SparkyUcsf => read_ucsf_2d(path).ok(),
-                                        ExperimentVendor::NmrPipe => read_nmrpipe_2d(path).ok(),
+                                    let res_2d = match item.experiment.vendor {
+                                        ExperimentVendor::SparkyUcsf => read_ucsf_2d(path),
+                                        ExperimentVendor::NmrPipe => read_nmrpipe_2d(path),
                                         ExperimentVendor::Bruker => {
-                                            let pdata = path.join("pdata").join("1");
-                                            read_bruker_pdata_2d(if pdata.exists() {
-                                                &pdata
-                                            } else {
-                                                path
-                                            })
-                                            .ok()
+                                            let pdata = resolve_bruker_pdata_dir(path, "2rr");
+                                            read_bruker_pdata_2d(&pdata)
                                         }
-                                        _ => None,
+                                        _ => Err("Unsupported 2D vendor format".to_string()),
+                                    };
+                                    match res_2d {
+                                        Ok(s2) => loaded_2d = Some(s2),
+                                        Err(e) => {
+                                            if item.experiment.data_state == DataState::Both
+                                                && item.experiment.vendor
+                                                    == ExperimentVendor::Bruker
+                                            {
+                                                match process_fid_dir_2d(path, false, false) {
+                                                    Ok((s2, mut recipe)) => {
+                                                        recipe.enable_axis_rescue =
+                                                            self.enable_axis_rescue;
+                                                        processed_fids += 1;
+                                                        ingested_recipes
+                                                            .insert(disp.clone(), recipe);
+                                                        loaded_2d = Some(s2);
+                                                    }
+                                                    Err(_) => item_err = Some(e),
+                                                }
+                                            } else {
+                                                item_err = Some(e);
+                                            }
+                                        }
                                     }
-                                };
+                                }
                             }
                         }
 
                         // Cross-platform in-memory loader (`wasm32` browser + `.zip`/`.tar.gz` archives)
                         if loaded_2d.is_none() && !plan.in_memory_files.is_empty() {
-                            if item.experiment.data_state == DataState::RawFid {
-                                if let (Some(acqus_b), Some(acqu2s_b), Some(ser_b)) = (
-                                    find_mem_file(rel, "acqus")
-                                        .or_else(|| find_mem_file(rel, "acqu")),
-                                    find_mem_file(rel, "acqu2s")
-                                        .or_else(|| find_mem_file(rel, "acqu2")),
-                                    find_mem_file(rel, "ser"),
-                                ) {
+                            let try_fid_mem =
+                                |ingested_recipes: &mut BTreeMap<String, ProcessingRecipe>,
+                                 processed_fids: &mut usize|
+                                 -> Result<Spectrum2D, String> {
+                                    let acqus_b = find_mem_file(rel, "acqus")
+                                        .or_else(|| find_mem_file(rel, "acqu"))
+                                        .ok_or_else(|| "missing acqus".to_string())?;
+                                    let acqu2s_b = find_mem_file(rel, "acqu2s")
+                                        .or_else(|| find_mem_file(rel, "acqu2"))
+                                        .ok_or_else(|| "missing acqu2s".to_string())?;
+                                    let ser_b = find_mem_file(rel, "ser")
+                                        .ok_or_else(|| "missing ser".to_string())?;
                                     let acqus_s = String::from_utf8_lossy(acqus_b);
                                     let acqu_s = find_mem_file(rel, "acqu")
                                         .map(|b| String::from_utf8_lossy(b).into_owned());
@@ -6622,7 +7483,7 @@ impl NmrWorkbenchApp {
                                         .map(|b| String::from_utf8_lossy(b).into_owned());
                                     let nl_s = find_mem_file(rel, "nuslist")
                                         .map(|b| String::from_utf8_lossy(b).into_owned());
-                                    if let Ok(fid2d) = read_bruker_fid_2d_from_bytes(
+                                    let fid2d = read_bruker_fid_2d_from_bytes(
                                         disp,
                                         &acqus_s,
                                         acqu_s.as_deref(),
@@ -6634,131 +7495,233 @@ impl NmrWorkbenchApp {
                                         nl_s.as_deref(),
                                         ser_b,
                                         false,
-                                    ) {
-                                        let mut recipe = ProcessingRecipe::from_fid_2d(&fid2d);
-                                        recipe.enable_axis_rescue = self.enable_axis_rescue;
-                                        if let Ok(s2) = process_fid_2d_mut(&fid2d, &mut recipe) {
-                                            processed_fids += 1;
-                                            ingested_recipes.insert(disp.clone(), recipe);
-                                            loaded_2d = Some(s2);
+                                    )?;
+                                    let mut recipe = ProcessingRecipe::from_fid_2d(&fid2d);
+                                    recipe.enable_axis_rescue = self.enable_axis_rescue;
+                                    let s2 = process_fid_2d_mut(&fid2d, &mut recipe)?;
+                                    *processed_fids += 1;
+                                    ingested_recipes.insert(disp.clone(), recipe);
+                                    Ok(s2)
+                                };
+
+                            if item.experiment.data_state == DataState::RawFid {
+                                match try_fid_mem(&mut ingested_recipes, &mut processed_fids) {
+                                    Ok(s2) => loaded_2d = Some(s2),
+                                    Err(e) => item_err = Some(e),
+                                }
+                            } else {
+                                let mem_res: Result<Spectrum2D, String> =
+                                    match item.experiment.vendor {
+                                        ExperimentVendor::SparkyUcsf => find_mem_exact(rel)
+                                            .ok_or_else(|| format!("missing bytes for '{rel}'"))
+                                            .and_then(|b| read_ucsf_2d_from_bytes(disp, b)),
+                                        ExperimentVendor::NmrPipe => find_mem_exact(rel)
+                                            .ok_or_else(|| format!("missing bytes for '{rel}'"))
+                                            .and_then(|b| read_nmrpipe_2d_from_bytes(disp, b)),
+                                        ExperimentVendor::Bruker => {
+                                            let mut last_e =
+                                                "missing Bruker 2D pdata (procs/proc2s/2rr)"
+                                                    .to_string();
+                                            let mut found_s2 = None;
+                                            for pfx in find_mem_pdata_prefixes(rel, "2rr") {
+                                                let k_p1 = if pfx.is_empty() {
+                                                    "procs".to_string()
+                                                } else {
+                                                    format!("{pfx}/procs")
+                                                };
+                                                let k_p2 = if pfx.is_empty() {
+                                                    "proc2s".to_string()
+                                                } else {
+                                                    format!("{pfx}/proc2s")
+                                                };
+                                                let k_rr = if pfx.is_empty() {
+                                                    "2rr".to_string()
+                                                } else {
+                                                    format!("{pfx}/2rr")
+                                                };
+                                                if let (Some(p1), Some(p2), Some(rr)) = (
+                                                    find_mem_file(rel, &k_p1),
+                                                    find_mem_file(rel, &k_p2),
+                                                    find_mem_file(rel, &k_rr),
+                                                ) {
+                                                    match read_bruker_pdata_2d_from_bytes(
+                                                        disp,
+                                                        &String::from_utf8_lossy(p1),
+                                                        &String::from_utf8_lossy(p2),
+                                                        rr,
+                                                    ) {
+                                                        Ok(s2) => {
+                                                            found_s2 = Some(s2);
+                                                            break;
+                                                        }
+                                                        Err(e) => last_e = e,
+                                                    }
+                                                }
+                                            }
+                                            found_s2.ok_or(last_e)
+                                        }
+                                        _ => Err("Unsupported 2D vendor format".to_string()),
+                                    };
+                                match mem_res {
+                                    Ok(s2) => loaded_2d = Some(s2),
+                                    Err(e) => {
+                                        if item.experiment.data_state == DataState::Both
+                                            && item.experiment.vendor == ExperimentVendor::Bruker
+                                        {
+                                            if let Ok(s2) = try_fid_mem(
+                                                &mut ingested_recipes,
+                                                &mut processed_fids,
+                                            ) {
+                                                loaded_2d = Some(s2);
+                                            } else {
+                                                item_err = Some(e);
+                                            }
+                                        } else {
+                                            item_err = Some(e);
                                         }
                                     }
                                 }
-                            } else {
-                                loaded_2d = match item.experiment.vendor {
-                                    ExperimentVendor::SparkyUcsf => find_mem_exact(rel)
-                                        .and_then(|b| read_ucsf_2d_from_bytes(disp, b).ok()),
-                                    ExperimentVendor::NmrPipe => find_mem_exact(rel)
-                                        .and_then(|b| read_nmrpipe_2d_from_bytes(disp, b).ok()),
-                                    ExperimentVendor::Bruker => {
-                                        let procs_b = find_mem_file(rel, "pdata/1/procs")
-                                            .or_else(|| find_mem_file(rel, "procs"));
-                                        let proc2s_b = find_mem_file(rel, "pdata/1/proc2s")
-                                            .or_else(|| find_mem_file(rel, "proc2s"));
-                                        let rr_b = find_mem_file(rel, "pdata/1/2rr")
-                                            .or_else(|| find_mem_file(rel, "2rr"));
-                                        if let (Some(p1), Some(p2), Some(rr)) =
-                                            (procs_b, proc2s_b, rr_b)
-                                        {
-                                            read_bruker_pdata_2d_from_bytes(
-                                                disp,
-                                                &String::from_utf8_lossy(p1),
-                                                &String::from_utf8_lossy(p2),
-                                                rr,
-                                            )
-                                            .ok()
-                                        } else {
-                                            None
-                                        }
-                                    }
-                                    _ => None,
-                                };
                             }
                         }
 
                         if let Some(s2) = loaded_2d {
-                            if primary_2d.is_none() && exp_token == "HSQC" {
-                                primary_2d = Some(s2);
-                            } else {
-                                overlays_2d.push((disp.clone(), s2));
-                            }
+                            loaded_2d_list.push((disp.clone(), cls, item.solver_exp_name, s2));
+                        } else if let Some(e) = item_err {
+                            load_errors.push(format!("{disp}: {e}"));
+                        } else {
+                            load_errors.push(format!("{disp}: spectrum binary not found"));
                         }
                     }
                     ExperimentDimensionality::Dim3D => {
                         let mut loaded_3d: Option<Spectrum3D> = None;
+                        let mut item_err: Option<String> = None;
                         #[cfg(not(target_arch = "wasm32"))]
                         if let Some(ref path) = item.resolved_path {
                             if path.exists() {
-                                loaded_3d = if item.experiment.data_state == DataState::RawFid {
+                                if item.experiment.data_state == DataState::RawFid {
                                     match process_fid_dir_3d(path, exp_token, false, false) {
                                         Ok((s3, mut recipe)) => {
                                             recipe.enable_axis_rescue = self.enable_axis_rescue;
                                             processed_fids += 1;
                                             ingested_recipes.insert(disp.clone(), recipe);
-                                            Some(s3)
+                                            loaded_3d = Some(s3);
                                         }
-                                        Err(_) => None,
+                                        Err(e) => item_err = Some(e),
                                     }
                                 } else {
-                                    match item.experiment.vendor {
+                                    let res_3d = match item.experiment.vendor {
                                         ExperimentVendor::SparkyUcsf => {
-                                            read_ucsf_3d(path, exp_token).ok()
+                                            read_ucsf_3d(path, exp_token)
                                         }
                                         ExperimentVendor::NmrPipe => {
-                                            read_nmrpipe_3d(path, exp_token).ok()
+                                            read_nmrpipe_3d(path, exp_token)
                                         }
                                         ExperimentVendor::Bruker => {
-                                            let pdata = path.join("pdata").join("1");
-                                            read_bruker_pdata_3d(
-                                                if pdata.exists() { &pdata } else { path },
-                                                exp_token,
-                                            )
-                                            .ok()
+                                            let pdata = resolve_bruker_pdata_dir(path, "3rrr");
+                                            read_bruker_pdata_3d(&pdata, exp_token)
                                         }
-                                        _ => None,
+                                        _ => Err("Unsupported 3D vendor format".to_string()),
+                                    };
+                                    match res_3d {
+                                        Ok(s3) => loaded_3d = Some(s3),
+                                        Err(e) => {
+                                            if item.experiment.data_state == DataState::Both
+                                                && item.experiment.vendor
+                                                    == ExperimentVendor::Bruker
+                                            {
+                                                if let Ok((s3, mut recipe)) = process_fid_dir_3d(
+                                                    path, exp_token, false, false,
+                                                ) {
+                                                    recipe.enable_axis_rescue =
+                                                        self.enable_axis_rescue;
+                                                    processed_fids += 1;
+                                                    ingested_recipes.insert(disp.clone(), recipe);
+                                                    loaded_3d = Some(s3);
+                                                } else {
+                                                    item_err = Some(e);
+                                                }
+                                            } else {
+                                                item_err = Some(e);
+                                            }
+                                        }
                                     }
-                                };
+                                }
                             }
                         }
 
                         if loaded_3d.is_none() && !plan.in_memory_files.is_empty() {
-                            loaded_3d = match item.experiment.vendor {
+                            let mem_res3: Result<Spectrum3D, String> = match item.experiment.vendor
+                            {
                                 ExperimentVendor::SparkyUcsf => find_mem_exact(rel)
-                                    .and_then(|b| read_ucsf_3d_from_bytes(disp, exp_token, b).ok()),
-                                ExperimentVendor::NmrPipe => find_mem_exact(rel).and_then(|b| {
-                                    read_nmrpipe_3d_from_bytes(disp, exp_token, b).ok()
-                                }),
+                                    .ok_or_else(|| format!("missing bytes for '{rel}'"))
+                                    .and_then(|b| read_ucsf_3d_from_bytes(disp, exp_token, b)),
+                                ExperimentVendor::NmrPipe => find_mem_exact(rel)
+                                    .ok_or_else(|| format!("missing bytes for '{rel}'"))
+                                    .and_then(|b| read_nmrpipe_3d_from_bytes(disp, exp_token, b)),
                                 ExperimentVendor::Bruker => {
-                                    let p1 = find_mem_file(rel, "pdata/1/procs")
-                                        .or_else(|| find_mem_file(rel, "procs"));
-                                    let p2 = find_mem_file(rel, "pdata/1/proc2s")
-                                        .or_else(|| find_mem_file(rel, "proc2s"));
-                                    let p3 = find_mem_file(rel, "pdata/1/proc3s")
-                                        .or_else(|| find_mem_file(rel, "proc3s"));
-                                    let rrr = find_mem_file(rel, "pdata/1/3rrr")
-                                        .or_else(|| find_mem_file(rel, "3rrr"));
-                                    if let (Some(b1), Some(b2), Some(b3), Some(br)) =
-                                        (p1, p2, p3, rrr)
-                                    {
-                                        read_bruker_pdata_3d_from_bytes(
-                                            disp,
-                                            exp_token,
-                                            &String::from_utf8_lossy(b1),
-                                            &String::from_utf8_lossy(b2),
-                                            &String::from_utf8_lossy(b3),
-                                            br,
-                                        )
-                                        .ok()
-                                    } else {
-                                        None
+                                    let mut last_e =
+                                        "missing Bruker 3D pdata (procs/proc2s/proc3s/3rrr)"
+                                            .to_string();
+                                    let mut found_s3 = None;
+                                    for pfx in find_mem_pdata_prefixes(rel, "3rrr") {
+                                        let k1 = if pfx.is_empty() {
+                                            "procs".to_string()
+                                        } else {
+                                            format!("{pfx}/procs")
+                                        };
+                                        let k2 = if pfx.is_empty() {
+                                            "proc2s".to_string()
+                                        } else {
+                                            format!("{pfx}/proc2s")
+                                        };
+                                        let k3 = if pfx.is_empty() {
+                                            "proc3s".to_string()
+                                        } else {
+                                            format!("{pfx}/proc3s")
+                                        };
+                                        let kr = if pfx.is_empty() {
+                                            "3rrr".to_string()
+                                        } else {
+                                            format!("{pfx}/3rrr")
+                                        };
+                                        if let (Some(b1), Some(b2), Some(b3), Some(br)) = (
+                                            find_mem_file(rel, &k1),
+                                            find_mem_file(rel, &k2),
+                                            find_mem_file(rel, &k3),
+                                            find_mem_file(rel, &kr),
+                                        ) {
+                                            match read_bruker_pdata_3d_from_bytes(
+                                                disp,
+                                                exp_token,
+                                                &String::from_utf8_lossy(b1),
+                                                &String::from_utf8_lossy(b2),
+                                                &String::from_utf8_lossy(b3),
+                                                br,
+                                            ) {
+                                                Ok(s3) => {
+                                                    found_s3 = Some(s3);
+                                                    break;
+                                                }
+                                                Err(e) => last_e = e,
+                                            }
+                                        }
                                     }
+                                    found_s3.ok_or(last_e)
                                 }
-                                _ => None,
+                                _ => Err("Unsupported 3D vendor format".to_string()),
                             };
+                            match mem_res3 {
+                                Ok(s3) => loaded_3d = Some(s3),
+                                Err(e) => item_err = Some(e),
+                            }
                         }
 
                         if let Some(s3) = loaded_3d {
-                            cubes_3d.push((disp.clone(), s3));
+                            cubes_3d.push((disp.clone(), cls, s3));
+                        } else if let Some(e) = item_err {
+                            load_errors.push(format!("{disp}: {e}"));
+                        } else {
+                            load_errors.push(format!("{disp}: 3D cube binary not found"));
                         }
                     }
                     _ => {}
@@ -6767,60 +7730,174 @@ impl NmrWorkbenchApp {
 
             self.unprocessed_fids_remaining = self.raw_fids_total.saturating_sub(processed_fids);
 
-            if primary_2d.is_none() && !overlays_2d.is_empty() {
-                primary_2d = Some(overlays_2d.remove(0).1);
-            }
-            if let Some(hsqc) = primary_2d {
-                for (disp_name, s3) in &mut cubes_3d {
-                    let rescue_flag = ingested_recipes
-                        .get(disp_name)
-                        .map(|r| r.enable_axis_rescue)
-                        .unwrap_or(self.enable_axis_rescue);
-                    let (_, _, audit_opt) =
-                        register_3d_hn_to_hsqc_2d_with_audit(s3, &hsqc, 0.08, 0.60, rescue_flag);
-                    if let Some(audit) = audit_opt {
-                        if let Some(warn) = audit.warning_message() {
-                            self.axis_rescue_notices.push(warn);
+            // Promote primary_2d by priority: N15Hsqc -> Con2D -> C13Hsqc/C13Hmqc -> first loaded Dim2D
+            let mut caco_2d_specs: Vec<Spectrum2D> = Vec::new();
+            if !loaded_2d_list.is_empty() {
+                let rank_2d = |cls: PulseSequenceClass, tok: Option<&'static str>| -> u8 {
+                    if cls == PulseSequenceClass::N15Hsqc || tok == Some("HSQC") {
+                        0
+                    } else if cls == PulseSequenceClass::Con2D {
+                        1
+                    } else if matches!(
+                        cls,
+                        PulseSequenceClass::C13Hsqc | PulseSequenceClass::C13Hmqc
+                    ) {
+                        2
+                    } else {
+                        3
+                    }
+                };
+                let best_idx = loaded_2d_list
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(idx, (_, cls, tok, _))| (rank_2d(*cls, *tok), idx))
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0);
+                let (prim_lbl, prim_c, _, hsqc) = loaded_2d_list.remove(best_idx);
+                primary_cls = Some(prim_c);
+
+                let prim_nx = Self::canonical_2d_axis_nucleus(
+                    &hsqc.axis_x.label,
+                    hsqc.axis_x.min_ppm(),
+                    hsqc.axis_x.max_ppm(),
+                );
+                let prim_ny = Self::canonical_2d_axis_nucleus(
+                    &hsqc.axis_y.label,
+                    hsqc.axis_y.min_ppm(),
+                    hsqc.axis_y.max_ppm(),
+                );
+                if prim_nx == "1H" && prim_ny == "15N" {
+                    for (disp_name, _, s3) in &mut cubes_3d {
+                        let rescue_flag = ingested_recipes
+                            .get(disp_name)
+                            .map(|r| r.enable_axis_rescue)
+                            .unwrap_or(self.enable_axis_rescue);
+                        let (_, _, audit_opt) = register_3d_hn_to_hsqc_2d_with_audit(
+                            s3,
+                            &hsqc,
+                            0.08,
+                            0.60,
+                            rescue_flag,
+                        );
+                        if let Some(audit) = audit_opt {
+                            if let Some(warn) = audit.warning_message() {
+                                self.axis_rescue_notices.push(warn);
+                            }
+                            if let Some(rec) = ingested_recipes.get_mut(disp_name) {
+                                rec.axis_rescue_audit = Some(audit.clone());
+                            }
+                            self.axis_rescue_audits.push(audit);
                         }
-                        if let Some(rec) = ingested_recipes.get_mut(disp_name) {
-                            rec.axis_rescue_audit = Some(audit.clone());
-                        }
-                        self.axis_rescue_audits.push(audit);
                     }
                 }
+                if prim_c == PulseSequenceClass::Caco2D {
+                    caco_2d_specs.push(hsqc.clone());
+                }
+                self.primary_2d_label = prim_lbl;
+                self.primary_2d_visible = true;
+                self.primary_ppm_nudge = [0.0, 0.0];
                 self.hsqc_arc = Arc::new(hsqc.data.clone());
                 self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
                 self.hsqc_spec = Some(hsqc);
-                self.reset_view_to_spec();
+            } else {
+                self.hsqc_spec = None;
+                self.hsqc_arc = Arc::new(Vec::new());
             }
 
             self.overlay_layers.clear();
-            for (idx, (lbl, s2)) in overlays_2d.into_iter().enumerate() {
+            for (idx, (lbl, cls_ov, _, s2)) in loaded_2d_list.into_iter().enumerate() {
+                if cls_ov == PulseSequenceClass::Caco2D {
+                    caco_2d_specs.push(s2.clone());
+                }
                 let lid = self.next_layer_id;
                 self.next_layer_id += 1;
-                let base = (estimate_noise_mad(&s2.data) * 4.8).max(1.0);
+                let (base, _) = Self::estimate_2d_contour_base(&s2.data);
                 let arc = Arc::new(s2.data.clone());
-                let ov = OverlayLayerSpec::from_spectrum_2d(lid, 1, &s2, arc, base, idx + 1);
+                let mut ov = OverlayLayerSpec::from_spectrum_2d(lid, 1, &s2, arc, base, idx + 1);
+                ov.visible = true;
+                let (pos, neg) = default_overlay_palette(idx + 1);
+                ov.pos_rgba = pos;
+                ov.neg_rgba = neg;
                 self.overlay_layers.push((lbl, ov));
             }
 
+            if self.hsqc_spec.is_some() {
+                self.reset_view_to_spec();
+            }
+
+            // Regime auto-selection & 13C-IDP CON/CACO/3D root picking
+            let is_idp_13c = plan.problem_regime == ProblemRegime::Idp13cDetected
+                || primary_cls == Some(PulseSequenceClass::Con2D)
+                || self.active_2d_nuclei() == ("13C", "15N");
+            if is_idp_13c {
+                self.regime_kind = GuiRegimeKind::Idp13C;
+                let c13_cfg = C13PickerConfig {
+                    snr_2d: self.picker_snr,
+                    ..C13PickerConfig::default()
+                };
+                let con_roots = if self.active_2d_nuclei() == ("13C", "15N") {
+                    self.hsqc_spec
+                        .as_ref()
+                        .map(|sp| pick_con_2d(sp, &c13_cfg))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let mut caco_peaks = Vec::new();
+                for caco_sp in &caco_2d_specs {
+                    caco_peaks.extend(pick_caco_2d(caco_sp, &c13_cfg));
+                }
+                let mut strip_peaks = Vec::new();
+                if !con_roots.is_empty() {
+                    for (_, cls3, ref sp3) in &cubes_3d {
+                        let exp_opt = match cls3 {
+                            PulseSequenceClass::Canco3D => Some(C13DetectedExp::Canco3D),
+                            PulseSequenceClass::Cbcaco3D => Some(C13DetectedExp::Cbcaco3D),
+                            _ => C13DetectedExp::from_name(&sp3.exp),
+                        };
+                        if let Some(c13_exp) = exp_opt {
+                            strip_peaks
+                                .extend(pick_con_anchored_3d(sp3, c13_exp, &con_roots, &c13_cfg));
+                        }
+                    }
+                }
+                self.c13_picked_dataset = Some(C13PickedDataset {
+                    con_roots,
+                    caco_peaks,
+                    strip_peaks,
+                });
+            } else if plan.problem_regime == ProblemRegime::Paramagnetic {
+                self.regime_kind = GuiRegimeKind::Paramagnetic;
+            } else {
+                self.regime_kind = GuiRegimeKind::Globular;
+            }
+
             let n_3d_loaded = cubes_3d.len();
-            if run_full_pipeline {
+            if n_3d_loaded > 0 {
+                self.show_strips_dock = true;
+            }
+
+            if run_full_pipeline && !is_idp_13c {
                 let pcfg = PickerConfig {
                     snr_threshold: self.picker_snr,
                     ..PickerConfig::default()
                 };
                 let mut all_peaks = Vec::new();
                 if let Some(ref hsqc) = self.hsqc_spec {
-                    let roots = if hsqc.axis_y.max_ppm() < 90.0 {
+                    let (nx, ny) = self.active_2d_nuclei();
+                    let roots = if nx == "1H" && ny == "13C" {
                         pick_c13_hsqc_2d(hsqc, &pcfg)
-                    } else if self.use_neural_picker {
-                        pick_hsqc_2d_neural(hsqc, &NeuralPickerConfig::default())
+                    } else if nx == "1H" && ny == "15N" {
+                        if self.use_neural_picker {
+                            pick_hsqc_2d_neural(hsqc, &NeuralPickerConfig::default())
+                        } else {
+                            pick_hsqc_2d(hsqc, &pcfg)
+                        }
                     } else {
-                        pick_hsqc_2d(hsqc, &pcfg)
+                        Self::pick_generic_2d_crosspeaks(hsqc, self.picker_snr)
                     };
-                    let c_refs: Vec<&Spectrum3D> = cubes_3d.iter().map(|(_, s)| s).collect();
-                    if !c_refs.is_empty() && !roots.is_empty() {
+                    let c_refs: Vec<&Spectrum3D> = cubes_3d.iter().map(|(_, _, s)| s).collect();
+                    if !c_refs.is_empty() && !roots.is_empty() && nx == "1H" && ny == "15N" {
                         let p3 = pick_triple_3d_two_pass(
                             &c_refs,
                             &roots,
@@ -6840,7 +7917,7 @@ impl NmrWorkbenchApp {
 
             self.hncacb_3d = None;
             self.hnco_3d = None;
-            for (_, s3) in cubes_3d {
+            for (_, _, s3) in cubes_3d {
                 if s3.exp == "HNCO" || s3.exp == "HNCACO" {
                     if self.hnco_3d.is_none() {
                         self.hnco_3d = Some(s3);
@@ -6854,18 +7931,83 @@ impl NmrWorkbenchApp {
             self.extra_3d_count = n_3d_loaded.saturating_sub(stored_3d);
         }
 
+        let n_3d_total = usize::from(self.hncacb_3d.is_some())
+            + usize::from(self.hnco_3d.is_some())
+            + self.extra_3d_count;
         self.sync_session_from_app_fresh(&plan.root_name);
         self.session.state.processing_recipes = ingested_recipes;
         self.rebuild_systems_and_matrices();
-        if run_full_pipeline && !self.sequence.is_empty() && !self.peaks.is_empty() {
+
+        if self.hsqc_spec.is_none() && n_3d_total == 0 {
+            if !load_errors.is_empty() {
+                self.status_msg = format!(
+                    "Failed to load selected spectra from '{}': {}",
+                    plan.root_name,
+                    load_errors.join(" | ")
+                );
+            } else {
+                self.status_msg = format!(
+                    "No 2D/3D spectra selected or loaded from '{}'",
+                    plan.root_name
+                );
+            }
+            return;
+        }
+
+        let can_run_idp = self.regime_kind == GuiRegimeKind::Idp13C
+            && !self.sequence.is_empty()
+            && self
+                .c13_picked_dataset
+                .as_ref()
+                .is_some_and(|ds| !ds.con_roots.is_empty());
+        let can_run_hn = self.regime_kind != GuiRegimeKind::Idp13C
+            && !self.sequence.is_empty()
+            && !self.peaks.is_empty();
+
+        if run_full_pipeline && (can_run_idp || can_run_hn) {
             self.run_assignment();
         } else if let Some(first_warn) = self.axis_rescue_notices.first() {
             self.status_msg = first_warn.clone();
-        } else {
+        } else if self.regime_kind == GuiRegimeKind::Idp13C {
+            let (n_con, n_pro) = self
+                .c13_picked_dataset
+                .as_ref()
+                .map(|ds| {
+                    (
+                        ds.con_roots.len(),
+                        ds.con_roots
+                            .iter()
+                            .filter(|r| r.is_proline_imino_region)
+                            .count(),
+                    )
+                })
+                .unwrap_or((0, 0));
+            let warn_suffix = if load_errors.is_empty() {
+                String::new()
+            } else {
+                format!(" [warn: {}]", load_errors.join("; "))
+            };
             self.status_msg = format!(
-                "Loaded '{}' ({} selected experiment(s), {} peaks, {} aa)",
+                "Loaded 13C-IDP '{}' ({} + {} overlay(s), {n_con} CON roots incl. {n_pro} Pro){warn_suffix}",
                 plan.root_name,
-                plan.selected_experiments.len(),
+                self.primary_2d_label,
+                self.overlay_layers.len()
+            );
+        } else {
+            let warn_suffix = if load_errors.is_empty() {
+                String::new()
+            } else {
+                format!(" [warn: {}]", load_errors.join("; "))
+            };
+            self.status_msg = format!(
+                "Loaded '{}' (primary: {}{}, {} peaks, {} aa){warn_suffix}",
+                plan.root_name,
+                self.primary_2d_label,
+                if self.overlay_layers.is_empty() {
+                    String::new()
+                } else {
+                    format!(" + {} 2D overlay(s)", self.overlay_layers.len())
+                },
                 self.peaks.len(),
                 self.sequence.len()
             );
@@ -6988,6 +8130,10 @@ impl NmrWorkbenchApp {
                 self.qc_report = None;
                 self.last_bayes_sa_telemetry = None;
                 self.overlay_layers.clear();
+                self.primary_2d_label = "15N-HSQC".to_string();
+                self.primary_2d_visible = true;
+                self.box_zoom_2d_mode = false;
+                self.box_zoom_2d_anchor = None;
                 self.hsqc_spec = None;
                 self.hncacb_3d = None;
                 self.hnco_3d = None;
@@ -7091,9 +8237,10 @@ impl NmrWorkbenchApp {
             }
             WorkbenchAction::RaiseContourFloor | WorkbenchAction::LowerContourFloor => {
                 let new_base = if action == WorkbenchAction::RaiseContourFloor {
-                    (self.contour_base * CONTOUR_FLOOR_STEP_RATIO).min(500.0)
+                    (self.contour_base * CONTOUR_FLOOR_STEP_RATIO)
+                        .min((self.contour_noise_ref * 1e4).max(1e9))
                 } else {
-                    (self.contour_base / CONTOUR_FLOOR_STEP_RATIO).max(1e-3)
+                    (self.contour_base / CONTOUR_FLOOR_STEP_RATIO).max(1e-6)
                 };
                 self.contour_base = new_base;
                 let mut params = SessionContourParams::new("HSQC");
@@ -7572,6 +8719,15 @@ impl NmrWorkbenchApp {
                                         nmr_core::nmr1d::prepare_loaded_1d_for_studio(loaded)
                                     {
                                         spectra.push(sp);
+                                        continue;
+                                    }
+                                }
+                                if let Ok(bytes) = std::fs::read(p) {
+                                    if let Some(sp) = try_load_1d_ucsf_or_pipe_bytes(
+                                        &item.experiment.display_name,
+                                        &bytes,
+                                    ) {
+                                        spectra.push(sp);
                                     }
                                 }
                             }
@@ -7618,6 +8774,13 @@ impl NmrWorkbenchApp {
                                 }
                             }
                         }
+                        if spectra.is_empty() {
+                            for (k, v) in &refs {
+                                if let Some(sp) = try_load_1d_ucsf_or_pipe_bytes(k, v) {
+                                    spectra.push(sp);
+                                }
+                            }
+                        }
                     }
                     if !spectra.is_empty() {
                         let n = spectra.len();
@@ -7655,8 +8818,12 @@ impl NmrWorkbenchApp {
                 .default_width(340.0_f32.min(max_modal_w))
                 .max_width(max_modal_w)
                 .show(ctx, |ui| {
+                    let lo = (self.contour_noise_ref * 0.15).max(1e-6);
+                    let hi = (self.contour_noise_ref * 400.0)
+                        .max(self.contour_base * 4.0)
+                        .max(120.0);
                     ui.add(
-                        egui::Slider::new(&mut self.contour_base, 0.2..=120.0)
+                        egui::Slider::new(&mut self.contour_base, lo..=hi)
                             .logarithmic(true)
                             .text("Base Floor"),
                     );
@@ -7692,17 +8859,24 @@ impl NmrWorkbenchApp {
                 .default_width(520.0_f32.min(max_modal_w))
                 .max_width(max_modal_w)
                 .show(ctx, |ui| {
+                    let (nx_m, ny_m) = self.active_2d_nuclei();
+                    let px_m = Self::pretty_nucleus_unicode(nx_m);
+                    let py_m = Self::pretty_nucleus_unicode(ny_m);
                     ui.horizontal(|ui| {
-                        ui.label("Primary 2D HSQC Nudge (ppm):");
+                        ui.checkbox(&mut self.primary_2d_visible, "");
+                        ui.label(format!(
+                            "Primary 2D ({}) Nudge (ppm):",
+                            self.primary_2d_label
+                        ));
                         ui.add(
                             egui::DragValue::new(&mut self.primary_ppm_nudge[0])
                                 .speed(0.002)
-                                .prefix("Δ¹H "),
+                                .prefix(format!("Δ{px_m} ")),
                         );
                         ui.add(
                             egui::DragValue::new(&mut self.primary_ppm_nudge[1])
-                                .speed(0.02)
-                                .prefix("Δ¹⁵N "),
+                                .speed(0.01)
+                                .prefix(format!("Δ{py_m} ")),
                         );
                         if ui.small_button("Zero").clicked() {
                             self.primary_ppm_nudge = [0.0, 0.0];
@@ -7750,21 +8924,22 @@ impl NmrWorkbenchApp {
                                 ov.pos_rgba[3] = alpha;
                                 ov.neg_rgba[3] = alpha;
                             }
+                            let spd = (ov.base_level * 0.05).max(0.01);
                             ui.add(
                                 egui::DragValue::new(&mut ov.base_level)
-                                    .speed(0.2)
-                                    .range(0.1..=200.0)
+                                    .speed(spd)
+                                    .range(1e-6..=1e12)
                                     .prefix("Base "),
                             );
                             ui.add(
                                 egui::DragValue::new(&mut ov.ppm_nudge[0])
                                     .speed(0.002)
-                                    .prefix("ΔH "),
+                                    .prefix(format!("Δ{px_m} ")),
                             );
                             ui.add(
                                 egui::DragValue::new(&mut ov.ppm_nudge[1])
-                                    .speed(0.02)
-                                    .prefix("ΔN "),
+                                    .speed(0.01)
+                                    .prefix(format!("Δ{py_m} ")),
                             );
                         });
                     }
@@ -9675,7 +10850,12 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             hnco_3d: None,
             extra_3d_count: 0,
             overlay_layers: Vec::new(),
+            primary_2d_label: "15N-HSQC".to_string(),
+            primary_2d_visible: true,
             primary_ppm_nudge: [0.0, 0.0],
+            contour_noise_ref: 1.8,
+            box_zoom_2d_mode: false,
+            box_zoom_2d_anchor: None,
             next_layer_id: 2,
             active_overlay_idx: 0,
             ingest_panel: IngestPanelState::default(),
@@ -9887,6 +11067,364 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         assert!(
             h_span_after < h_span_before * 0.70,
             "NmrWorkbenchApp 2D HSQC pinch zoom must zoom in (before {h_span_before:.3}, after {h_span_after:.3})"
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_synthetic_ucsf_2d_test_bytes(
+        nuc_0: &str,
+        n_0: usize,
+        tile_0: usize,
+        obs_0: f32,
+        sw_hz_0: f32,
+        ref_ppm_0: f32,
+        nuc_1: &str,
+        n_1: usize,
+        tile_1: usize,
+        obs_1: f32,
+        sw_hz_1: f32,
+        ref_ppm_1: f32,
+        peaks_01_idx: &[(usize, usize, f32)],
+    ) -> Vec<u8> {
+        let mut out = vec![0u8; 180 + 2 * 128];
+        out[0..8].copy_from_slice(b"UCSF NMR");
+        out[10] = 2; // ndim = 2
+        out[11] = 1; // ncomponents = 1
+        out[13] = 2; // version = 2
+        let write_axis =
+            |buf: &mut [u8], nuc: &str, n: usize, tile: usize, obs: f32, sw: f32, rppm: f32| {
+                let nb = nuc.as_bytes();
+                let clen = nb.len().min(6);
+                buf[0..clen].copy_from_slice(&nb[..clen]);
+                buf[8..12].copy_from_slice(&(n as u32).to_be_bytes());
+                buf[16..20].copy_from_slice(&(tile as u32).to_be_bytes());
+                buf[20..24].copy_from_slice(&obs.to_be_bytes());
+                buf[24..28].copy_from_slice(&sw.to_be_bytes());
+                buf[28..32].copy_from_slice(&rppm.to_be_bytes());
+            };
+        write_axis(
+            &mut out[180..308],
+            nuc_0,
+            n_0,
+            tile_0,
+            obs_0,
+            sw_hz_0,
+            ref_ppm_0,
+        );
+        write_axis(
+            &mut out[308..436],
+            nuc_1,
+            n_1,
+            tile_1,
+            obs_1,
+            sw_hz_1,
+            ref_ppm_1,
+        );
+
+        let nt0 = n_0.div_ceil(tile_0);
+        let nt1 = n_1.div_ceil(tile_1);
+        let mut grid = vec![0.02_f32; n_0 * n_1];
+        for (i, slot) in grid.iter_mut().enumerate() {
+            *slot = ((i as u32).wrapping_mul(2654435761) % 97) as f32 * 0.001;
+        }
+        for &(c0, c1, amp) in peaks_01_idx {
+            for d0 in -3i32..=3 {
+                for d1 in -3i32..=3 {
+                    let p0 = c0 as i32 + d0;
+                    let p1 = c1 as i32 + d1;
+                    if p0 >= 0 && (p0 as usize) < n_0 && p1 >= 0 && (p1 as usize) < n_1 {
+                        let g = (-0.45 * ((d0 * d0 + d1 * d1) as f32)).exp();
+                        grid[(p0 as usize) * n_1 + (p1 as usize)] += amp * g;
+                    }
+                }
+            }
+        }
+        for t0 in 0..nt0 {
+            for t1 in 0..nt1 {
+                for l0 in 0..tile_0 {
+                    for l1 in 0..tile_1 {
+                        let i0 = t0 * tile_0 + l0;
+                        let i1 = t1 * tile_1 + l1;
+                        let v = if i0 < n_0 && i1 < n_1 {
+                            grid[i0 * n_1 + i1]
+                        } else {
+                            0.0
+                        };
+                        out.extend_from_slice(&v.to_be_bytes());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_execute_ingest_plan_2d_con_and_homonuclear_noesy_tocsy_overlay() {
+        use super::*;
+        use nmr_gui::ingest_panel::{ingest_dropped_payloads, DroppedPayload, IngestDropOutcome};
+
+        let mut octet_app = OctetDrawPanel::new();
+        octet_app.set_backend_adapter(Box::new(CoreOctetBackendAdapter));
+        let mut app = NmrWorkbenchApp {
+            workspace_mode: WorkspaceMode::ProteinNmr,
+            octet_app,
+            dosy_panel: DosyPanelState::default(),
+            metabolomics_panel: MetabolomicsStudioPanel::new(),
+            solver_kind: GuiSolverKind::default(),
+            regime_kind: GuiRegimeKind::default(),
+            metal_ligands_input: String::new(),
+            idp_temp_k: 298.15,
+            idp_ph_input: "6.5".to_string(),
+            c13_picked_dataset: None,
+            propensity_report: None,
+            show_propensity_panel: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            use_gpu: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            gpu_engine: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            bayes_gpu_solver: None,
+            use_neural_picker: false,
+            enable_axis_rescue: true,
+            axis_rescue_notices: Vec::new(),
+            axis_rescue_audits: Vec::new(),
+            adapter_label: None,
+            status_msg: String::new(),
+            last_solve_ms: None,
+            last_bayes_sa_telemetry: None,
+            priors: Priors::provisional(),
+            sidechain_priors: SidechainPriors::empirical_bmrb(),
+            reference: None,
+            sequence: Vec::new(),
+            seq_ids: Vec::new(),
+            peaks: Vec::new(),
+            truth: None,
+            systems: Vec::new(),
+            u_mat: None,
+            p_mat: None,
+            assign_res: None,
+            pred_ref: None,
+            pred_conf: BTreeMap::new(),
+            pred_ambiguity_codes: BTreeMap::new(),
+            metrics: None,
+            sidechain_ribbon_state: SequenceRibbonState::new(),
+            show_sidechain_inspector: false,
+            overwrite_curated_rings: false,
+            mol3d_panel: Mol3dViewerPanel::new(),
+            show_mol3d_viewport: true,
+            loaded_pdb_text: None,
+            relax_panel: RelaxPanelState::new(),
+            show_relax_panel: false,
+            dynamics_panel: DynamicsStudioPanel::new(),
+            show_dynamics_panel: false,
+            stack1d_panel: Stack1dState::default(),
+            show_stack1d_panel: false,
+            show_strips_dock: true,
+            show_workflow_guide: false,
+            show_advanced_protein_bar: false,
+            show_sequence_ribbon: true,
+            show_native_global_open_bar: false,
+            hsqc_spec: None,
+            hsqc_arc: Arc::new(Vec::new()),
+            hsqc_gen: 1,
+            hncacb_3d: None,
+            hnco_3d: None,
+            extra_3d_count: 0,
+            overlay_layers: Vec::new(),
+            primary_2d_label: "15N-HSQC".to_string(),
+            primary_2d_visible: true,
+            primary_ppm_nudge: [0.0, 0.0],
+            contour_noise_ref: 1.8,
+            box_zoom_2d_mode: false,
+            box_zoom_2d_anchor: None,
+            next_layer_id: 2,
+            active_overlay_idx: 0,
+            ingest_panel: IngestPanelState::default(),
+            command_palette: CommandPalette::new(),
+            chord_dispatcher: ChordDispatcher::new(),
+            session: WorkbenchSessionController::default(),
+            crosshair: SyncCrosshair::default(),
+            strip_tiler: StripTilerPanel::new(),
+            use_match_finder_strips: true,
+            qc_report: None,
+            raw_fids_total: 0,
+            unprocessed_fids_remaining: 0,
+            has_structure_or_dynamics: false,
+            exported_in_session: false,
+            show_contour_modal: false,
+            show_overlay_manager: false,
+            show_assign_popover: false,
+            show_qc_modal: false,
+            show_about_modal: false,
+            mcp_bridge: McpBridgeState::default(),
+            show_mcp_bridge_window: false,
+            mcp_last_viewport_key: (0, 0, 0, -1),
+            assign_target_res: 0,
+            assign_lock_check: true,
+            view_h_left: 10.4,
+            view_h_right: 6.1,
+            view_n_top: 103.0,
+            view_n_bottom: 135.0,
+            contour_base: 8.5,
+            contour_factor: 1.42,
+            contour_levels: 10,
+            show_negative: true,
+            show_peak_labels: true,
+            replicas: 8,
+            steps_per_sys: 400,
+            assign_cost: 0.0,
+            sim_missing: 0.06,
+            sim_spurious: 0.04,
+            sim_seed: 0,
+            picker_snr: 5.0,
+            selected_ss: None,
+            selected_res: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            path_input: "data/fixtures/synthetic_ubiquitin.str".to_string(),
+            #[cfg(not(target_arch = "wasm32"))]
+            export_prefix: "result_gui".to_string(),
+            show_text_io_modal: false,
+            paste_text_buf: String::new(),
+            export_text_buf: String::new(),
+            responsive_shell: ResponsiveShellState::new(),
+            wgpu_render_state: None,
+            suppress_hsqc_pan_until_release: false,
+            suppress_octet_pan_until_release: false,
+            #[cfg(target_arch = "wasm32")]
+            pending_drop_outcome: Arc::new(std::sync::Mutex::new(None)),
+        };
+        app.load_builtin_demo_suite();
+        assert_eq!(app.sequence.len(), 76, "demo starts with 76-aa Ubiquitin");
+
+        // 1. Homonuclear 2D `.usf` multi-overlay (`sample_noesy.usf` + `sample_tocsy.usf`)
+        let noesy_usf = build_synthetic_ucsf_2d_test_bytes(
+            "1H",
+            32,
+            16,
+            600.0,
+            6000.0,
+            10.0,
+            "1H",
+            32,
+            16,
+            600.0,
+            6000.0,
+            10.0,
+            &[(8, 22, 50.0), (22, 8, 50.0), (8, 8, 90.0)],
+        );
+        let tocsy_usf = build_synthetic_ucsf_2d_test_bytes(
+            "1H",
+            32,
+            16,
+            600.0,
+            6000.0,
+            10.0,
+            "1H",
+            32,
+            16,
+            600.0,
+            6000.0,
+            10.0,
+            &[(10, 18, 45.0), (18, 10, 45.0), (10, 10, 85.0)],
+        );
+        let out_homo = ingest_dropped_payloads(&[
+            DroppedPayload::new("sample_noesy.usf", noesy_usf),
+            DroppedPayload::new("sample_tocsy.usf", tocsy_usf),
+        ])
+        .expect("2D NOESY + TOCSY .usf ingest");
+        app.apply_drop_outcome(out_homo);
+        assert!(app.ingest_panel.open);
+        assert_eq!(
+            app.ingest_panel.inventory.problem_regime,
+            ProblemRegime::SmallMolecule2D
+        );
+        let plan_homo = app.ingest_panel.build_execution_plan();
+        app.execute_ingest_plan(plan_homo, false);
+
+        assert!(app.hsqc_spec.is_some(), "primary_2d must be promoted");
+        assert_eq!(app.active_2d_nuclei(), ("1H", "1H"));
+        assert_eq!(
+            app.overlay_layers.len(),
+            1,
+            "second 2D spectrum must be overlaid"
+        );
+        assert!(app.overlay_layers[0].1.visible);
+        assert!(
+            app.sequence.is_empty() && app.peaks.is_empty() && app.hncacb_3d.is_none(),
+            "stale Ubiquitin sequence/peaks/3D cubes must be cleared"
+        );
+        assert!(!app.show_mol3d_viewport && !app.show_strips_dock);
+
+        // 2. Bruker `pdata/2` (non-`pdata/1` procno!) + `AXNUC = <off>` `2D CON` (`13C'` x `15N`, incl. Pro 137 ppm)
+        let nx = 64usize;
+        let ny = 64usize;
+        let procs_con = format!(
+            "##TITLE= c_con_iasq\n##$SI= {nx}\n##$OFFSET= 182.0\n##$SW_p= 2414.4\n##$SF= 150.90\n##$XDIM= 64\n##$BYTORDP= 0\n##$NC_proc= 0\n##$AXNUC= <off>\n##END=\n"
+        );
+        let proc2s_con = format!(
+            "##TITLE= c_con_iasq\n##$SI= {ny}\n##$OFFSET= 142.0\n##$SW_p= 2431.9\n##$SF= 60.81\n##$XDIM= 64\n##$BYTORDP= 0\n##$NC_proc= 0\n##$AXNUC= <off>\n##END=\n"
+        );
+        let acqus_con = "##TITLE= con\n##$PULPROG= <c_con_iasq>\n##$NUC1= <13C>\n##END=\n";
+        let acqu2s_con = "##TITLE= con\n##$NUC1= <15N>\n##END=\n";
+        let mut rr_bytes = Vec::with_capacity(nx * ny * 4);
+        // Place one amide root (~175 ppm C', ~120 ppm N) and one Pro imino root (~174 ppm C', ~137 ppm N)
+        // OFFSET=182, step = -16/63 = -0.25397 -> ix=28 => ~174.9 ppm
+        // OFFSET=142, step = -40/63 = -0.63492 -> iy=8 => ~136.9 ppm (Pro!), iy=34 => ~120.4 ppm
+        for iy in 0..ny {
+            for ix in 0..nx {
+                let mut val: f64 = (((ix * 31 + iy * 17) % 19) as f64) * 5.0;
+                for &(px, py, amp) in &[(28i32, 34i32, 85_000.0_f64), (30i32, 8i32, 92_000.0_f64)] {
+                    let dx = (ix as i32 - px) as f64;
+                    let dy = (iy as i32 - py) as f64;
+                    if dx.abs() <= 4.0 && dy.abs() <= 4.0 {
+                        val += amp * (-0.35 * (dx * dx + dy * dy)).exp();
+                    }
+                }
+                rr_bytes.extend_from_slice(&(val as i32).to_le_bytes());
+            }
+        }
+        let out_con = ingest_dropped_payloads(&[
+            DroppedPayload::new("idp_study/12/acqus", acqus_con.as_bytes().to_vec()),
+            DroppedPayload::new("idp_study/12/acqu2s", acqu2s_con.as_bytes().to_vec()),
+            DroppedPayload::new("idp_study/12/pdata/2/procs", procs_con.as_bytes().to_vec()),
+            DroppedPayload::new(
+                "idp_study/12/pdata/2/proc2s",
+                proc2s_con.as_bytes().to_vec(),
+            ),
+            DroppedPayload::new("idp_study/12/pdata/2/2rr", rr_bytes),
+        ])
+        .expect("Bruker pdata/2 2D CON ingest");
+        let panel_con = match out_con {
+            IngestDropOutcome::Workspace(p) => p,
+            other => panic!("expected Workspace for 2D CON, got {other:?}"),
+        };
+        assert_eq!(
+            panel_con.inventory.problem_regime,
+            ProblemRegime::Idp13cDetected
+        );
+        assert_eq!(
+            panel_con.inventory.experiments[0].pulse_class,
+            PulseSequenceClass::Con2D
+        );
+        let plan_con = panel_con.build_execution_plan();
+        app.execute_ingest_plan(plan_con, false);
+
+        assert_eq!(app.regime_kind, GuiRegimeKind::Idp13C);
+        assert_eq!(app.active_2d_nuclei(), ("13C", "15N"));
+        assert!(app.view_h_left > 180.0 && app.view_h_right < 168.0);
+        assert!(app.view_n_top < 105.0 && app.view_n_bottom > 140.0);
+        let ds = app
+            .c13_picked_dataset
+            .as_ref()
+            .expect("2D CON roots must be picked automatically");
+        assert!(
+            ds.con_roots.len() >= 2,
+            "expected >= 2 picked CON roots, got {}",
+            ds.con_roots.len()
+        );
+        assert!(
+            ds.con_roots.iter().any(|r| r.is_proline_imino_region),
+            "must detect Proline imino peak at ~137 ppm"
         );
     }
 }

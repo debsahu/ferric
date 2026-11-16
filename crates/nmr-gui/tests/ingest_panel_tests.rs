@@ -366,3 +366,172 @@ fn test_1d_only_folder_routes_to_spectra1d_and_bare_1r_gives_actionable_error() 
         "{bare_err}"
     );
 }
+
+#[allow(clippy::too_many_arguments)]
+fn build_ucsf_header_and_tiles_2d(
+    nuc0: &str,
+    n0: u32,
+    obs0: f32,
+    sw0_hz: f32,
+    ref0_ppm: f32,
+    nuc1: &str,
+    n1: u32,
+    obs1: f32,
+    sw1_hz: f32,
+    ref1_ppm: f32,
+) -> Vec<u8> {
+    let mut b = vec![0u8; 180 + 2 * 128 + (n0 as usize) * (n1 as usize) * 4];
+    b[0..8].copy_from_slice(b"UCSF NMR");
+    b[10] = 2;
+    b[11] = 1;
+    b[13] = 2;
+    let put_ax = |slot: &mut [u8], nuc: &str, n: u32, obs: f32, sw: f32, rppm: f32| {
+        let nb = nuc.as_bytes();
+        slot[0..nb.len().min(6)].copy_from_slice(&nb[..nb.len().min(6)]);
+        slot[8..12].copy_from_slice(&n.to_be_bytes());
+        slot[16..20].copy_from_slice(&n.to_be_bytes());
+        slot[20..24].copy_from_slice(&obs.to_be_bytes());
+        slot[24..28].copy_from_slice(&sw.to_be_bytes());
+        slot[28..32].copy_from_slice(&rppm.to_be_bytes());
+    };
+    put_ax(&mut b[180..308], nuc0, n0, obs0, sw0_hz, ref0_ppm);
+    put_ax(&mut b[308..436], nuc1, n1, obs1, sw1_hz, ref1_ppm);
+    b
+}
+
+#[test]
+fn test_usf_ucsf_homonuclear_and_heteronuclear_2d_small_molecule_regime_and_1d_usf() {
+    let noesy_usf = build_ucsf_header_and_tiles_2d(
+        "1H", 16, 600.0, 6000.0, 10.0, "1H", 16, 600.0, 6000.0, 10.0,
+    );
+    let tocsy_usf = build_ucsf_header_and_tiles_2d(
+        "1H", 16, 600.0, 6000.0, 10.0, "1H", 16, 600.0, 6000.0, 10.0,
+    );
+    let cosy_ucsf = build_ucsf_header_and_tiles_2d(
+        "1H", 16, 600.0, 6000.0, 10.0, "1H", 16, 600.0, 6000.0, 10.0,
+    );
+    let roesy_sp2 = build_ucsf_header_and_tiles_2d(
+        "1H", 16, 600.0, 6000.0, 10.0, "1H", 16, 600.0, 6000.0, 10.0,
+    );
+    let hmbc_usf = build_ucsf_header_and_tiles_2d(
+        "13C", 16, 150.9, 33_200.0, 220.0, "1H", 16, 600.0, 6000.0, 10.0,
+    );
+    let con_usf = build_ucsf_header_and_tiles_2d(
+        "15N", 16, 60.8, 2432.0, 142.0, "13C", 16, 150.9, 2414.0, 182.0,
+    );
+
+    // 1. Multi-file `.usf`/`.ucsf`/`.sp2` small-molecule correlation suite -> SmallMolecule2D, 0 sequence warning!
+    let outcome = ingest_dropped_payloads(&[
+        DroppedPayload::new("sample_noesy.usf", noesy_usf),
+        DroppedPayload::new("sample_tocsy.usf", tocsy_usf),
+        DroppedPayload::new("dqfcosy.ucsf", cosy_ucsf),
+        DroppedPayload::new("troesy.sp2", roesy_sp2),
+        DroppedPayload::new("c13_hmbc.usf", hmbc_usf),
+    ])
+    .expect("2D small-molecule .usf/.ucsf/.sp2 suite ingest");
+
+    let panel = match outcome {
+        IngestDropOutcome::Workspace(p) => p,
+        other => panic!("expected Workspace for 2D .usf suite, got {other:?}"),
+    };
+    assert_eq!(
+        panel.inventory.problem_regime,
+        ProblemRegime::SmallMolecule2D
+    );
+    assert!(panel.is_sequence_free_regime());
+    assert!(
+        panel.dynamic_missing_hints().is_empty(),
+        "SmallMolecule2D must NOT warn about missing polymer sequence, got {:?}",
+        panel.dynamic_missing_hints()
+    );
+    assert_eq!(panel.inventory.experiments.len(), 5);
+    assert_eq!(panel.selected_count(), 5);
+
+    let classes: Vec<PulseSequenceClass> = panel
+        .inventory
+        .experiments
+        .iter()
+        .map(|e| e.pulse_class)
+        .collect();
+    assert!(classes.contains(&PulseSequenceClass::Noesy2D));
+    assert!(classes.contains(&PulseSequenceClass::Tocsy2D));
+    assert!(classes.contains(&PulseSequenceClass::Cosy2D));
+    assert!(classes.contains(&PulseSequenceClass::Roesy2D));
+    assert!(classes.contains(&PulseSequenceClass::C13Hmbc));
+
+    // Verify `.usf` stem stripping (`sample_noesy.usf` -> `"sample_noesy"`)
+    assert!(panel
+        .inventory
+        .experiments
+        .iter()
+        .any(|e| nmr_core::classify::strip_ucsf_extension(&e.display_name) == "sample_noesy"));
+    assert!(panel
+        .inventory
+        .experiments
+        .iter()
+        .any(|e| nmr_core::classify::strip_ucsf_extension(&e.display_name) == "sample_tocsy"));
+
+    // 2. Pseudo-2D DOSY standalone drop -> selected_by_default = true, sequence-free!
+    let dosy_acqus = "##TITLE= dosy\n##$PULPROG= <ledbpgp2s>\n##$NUC1= <1H>\n##$SFO1= 500.0\n##$SW_h= 6000.0\n##$TD= 1024\n##END=\n";
+    let dosy_acqu2s = "##TITLE= dosy\n##$TD= 16\n##$SW_h= 100.0\n##$SFO1= 500.0\n##END=\n";
+    let dosy_out = ingest_dropped_payloads(&[
+        DroppedPayload::new("dosy_run/1/acqus", dosy_acqus.as_bytes().to_vec()),
+        DroppedPayload::new("dosy_run/1/acqu2s", dosy_acqu2s.as_bytes().to_vec()),
+        DroppedPayload::new("dosy_run/1/difflist", b"0.02\n0.10\n0.50\n".to_vec()),
+        DroppedPayload::new("dosy_run/1/ser", vec![0u8; 256]),
+    ])
+    .expect("DOSY ingest");
+    let panel_dosy = match dosy_out {
+        IngestDropOutcome::Workspace(p) => p,
+        other => panic!("expected Workspace for DOSY, got {other:?}"),
+    };
+    assert_eq!(
+        panel_dosy.inventory.experiments[0].pulse_class,
+        PulseSequenceClass::Dosy2D
+    );
+    assert!(panel_dosy.selected[0]);
+    assert!(panel_dosy.is_sequence_free_regime());
+    assert!(panel_dosy.dynamic_missing_hints().is_empty());
+
+    // 3. `2D CON` `.usf` drop -> `Con2D` + `Idp13cDetected`
+    let con_out = ingest_dropped_payloads(&[DroppedPayload::new("asyn_con.usf", con_usf)])
+        .expect("2D CON .usf ingest");
+    let panel_con = match con_out {
+        IngestDropOutcome::Workspace(p) => p,
+        other => panic!("expected Workspace for 2D CON .usf, got {other:?}"),
+    };
+    assert_eq!(
+        panel_con.inventory.experiments[0].pulse_class,
+        PulseSequenceClass::Con2D
+    );
+    assert_eq!(
+        panel_con.inventory.problem_regime,
+        ProblemRegime::Idp13cDetected
+    );
+
+    // 4. 1D `.usf` (`ndim = 1`) drop -> routes directly to `IngestDropOutcome::Spectra1D`!
+    let mut ucsf_1d = vec![0u8; 180 + 128 + 32 * 4];
+    ucsf_1d[0..8].copy_from_slice(b"UCSF NMR");
+    ucsf_1d[10] = 1; // ndim = 1
+    ucsf_1d[11] = 1;
+    ucsf_1d[13] = 2;
+    ucsf_1d[180..182].copy_from_slice(b"1H");
+    ucsf_1d[188..192].copy_from_slice(&32u32.to_be_bytes());
+    ucsf_1d[196..200].copy_from_slice(&32u32.to_be_bytes());
+    ucsf_1d[200..204].copy_from_slice(&500.0f32.to_be_bytes());
+    ucsf_1d[204..208].copy_from_slice(&5000.0f32.to_be_bytes());
+    ucsf_1d[208..212].copy_from_slice(&10.0f32.to_be_bytes());
+    for i in 0..32usize {
+        let v = if i == 12 { 100.0f32 } else { 0.5f32 };
+        ucsf_1d[308 + i * 4..308 + (i + 1) * 4].copy_from_slice(&v.to_be_bytes());
+    }
+    let out_1d_usf = ingest_dropped_payloads(&[DroppedPayload::new("proton_1d.usf", ucsf_1d)])
+        .expect("1D .usf ingest");
+    match out_1d_usf {
+        IngestDropOutcome::Spectra1D { spectra, .. } => {
+            assert_eq!(spectra.len(), 1);
+            assert_eq!(spectra[0].len(), 32);
+        }
+        other => panic!("expected Spectra1D for 1D .usf, got {other:?}"),
+    }
+}

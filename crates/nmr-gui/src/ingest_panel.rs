@@ -22,18 +22,24 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use eframe::egui;
-#[cfg(not(target_arch = "wasm32"))]
-use nmr_core::classify::classify_nmr_workspace;
 use nmr_core::classify::{
     classify_nmr_entries, extract_archive_full_entries_bounded, extract_archive_virtual_entries,
-    is_zip_magic, is_zip_path_lower, ClassifiedExperiment, DataState, ExperimentDimensionality,
-    ProblemRegime, PulseSequenceClass, VirtualEntry, WorkspaceInventory,
+    is_nmrpipe_magic, is_ucsf_magic, is_zip_magic, is_zip_path_lower, ClassifiedExperiment,
+    DataState, ExperimentDimensionality, ProblemRegime, PulseSequenceClass, VirtualEntry,
+    WorkspaceInventory,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_core::classify::{
+    classify_nmr_workspace, is_ucsf_extension_lower, recompute_workspace_regime,
 };
 use nmr_core::nef::read_nef_str;
-use nmr_core::nmr1d::{load_1d_from_virtual_entries, prepare_loaded_1d_for_studio, Spectrum1D};
+use nmr_core::nmr1d::{
+    load_1d_from_virtual_entries, prepare_loaded_1d_for_studio, Experiment1DKind, Spectrum1D,
+};
 use nmr_core::nmrstar::read_star_str;
 use nmr_core::priors::{one_to_three, three_to_one};
 use nmr_core::session::read_session_nef_str;
+use nmr_core::spectrum::AxisPpm;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_folder_bridge {
@@ -341,7 +347,7 @@ pub fn poll_browser_drop_error() -> Option<String> {
     }
 }
 
-/// Ordered catalog of all 25 [`PulseSequenceClass`] options exposed in the per-row override dropdown.
+/// Ordered catalog of all [`PulseSequenceClass`] options exposed in the per-row override dropdown.
 pub const ALL_PULSE_CLASSES: &[PulseSequenceClass] = &[
     PulseSequenceClass::N15Hsqc,
     PulseSequenceClass::Hncacb,
@@ -352,6 +358,17 @@ pub const ALL_PULSE_CLASSES: &[PulseSequenceClass] = &[
     PulseSequenceClass::Hncaco,
     PulseSequenceClass::C13Hsqc,
     PulseSequenceClass::C13Hmqc,
+    PulseSequenceClass::Cosy2D,
+    PulseSequenceClass::Tocsy2D,
+    PulseSequenceClass::Noesy2D,
+    PulseSequenceClass::Roesy2D,
+    PulseSequenceClass::JRes2D,
+    PulseSequenceClass::C13Hmbc,
+    PulseSequenceClass::N15Hmbc,
+    PulseSequenceClass::HsqcTocsy2D,
+    PulseSequenceClass::Inadequate2D,
+    PulseSequenceClass::Dosy2D,
+    PulseSequenceClass::Hetero2D,
     PulseSequenceClass::Ccconh,
     PulseSequenceClass::Hccconh,
     PulseSequenceClass::HcchTocsy,
@@ -367,6 +384,13 @@ pub const ALL_PULSE_CLASSES: &[PulseSequenceClass] = &[
     PulseSequenceClass::Cpmg,
     PulseSequenceClass::Cest,
     PulseSequenceClass::TitrationSeries,
+    PulseSequenceClass::Proton1D,
+    PulseSequenceClass::Carbon13_1D,
+    PulseSequenceClass::Dept1D,
+    PulseSequenceClass::Fluorine19_1D,
+    PulseSequenceClass::Phosphorus31_1D,
+    PulseSequenceClass::StdWaterLogsy1D,
+    PulseSequenceClass::Hetero1D,
     PulseSequenceClass::Unknown,
 ];
 
@@ -376,6 +400,17 @@ pub fn pulse_class_display_label(cls: PulseSequenceClass) -> &'static str {
         PulseSequenceClass::N15Hsqc => "2D 15N-HSQC / TROSY",
         PulseSequenceClass::C13Hsqc => "2D 13C-HSQC",
         PulseSequenceClass::C13Hmqc => "2D 13C-Methyl HMQC",
+        PulseSequenceClass::Cosy2D => "2D 1H-1H COSY / DQF-COSY",
+        PulseSequenceClass::Tocsy2D => "2D 1H-1H TOCSY / DIPSI",
+        PulseSequenceClass::Noesy2D => "2D 1H-1H NOESY",
+        PulseSequenceClass::Roesy2D => "2D 1H-1H ROESY / T-ROESY",
+        PulseSequenceClass::JRes2D => "2D 1H J-Resolved",
+        PulseSequenceClass::C13Hmbc => "2D 1H-13C HMBC / H2BC",
+        PulseSequenceClass::N15Hmbc => "2D 1H-15N HMBC",
+        PulseSequenceClass::HsqcTocsy2D => "2D 1H-13C HSQC-TOCSY",
+        PulseSequenceClass::Inadequate2D => "2D 13C-13C INADEQUATE / ADEQUATE",
+        PulseSequenceClass::Dosy2D => "Pseudo-2D DOSY Diffusion",
+        PulseSequenceClass::Hetero2D => "2D Heteronuclear (19F/31P/X)",
         PulseSequenceClass::Hnco => "3D HNCO",
         PulseSequenceClass::Hncaco => "3D HN(CA)CO",
         PulseSequenceClass::Hnca => "3D HNCA",
@@ -397,6 +432,13 @@ pub fn pulse_class_display_label(cls: PulseSequenceClass) -> &'static str {
         PulseSequenceClass::Cpmg => "CPMG Dispersion",
         PulseSequenceClass::Cest => "CEST Exchange",
         PulseSequenceClass::TitrationSeries => "Titration CSP Series",
+        PulseSequenceClass::Proton1D => "1D 1H",
+        PulseSequenceClass::Carbon13_1D => "1D 13C{1H}",
+        PulseSequenceClass::Dept1D => "1D DEPT-90/135/DEPTQ",
+        PulseSequenceClass::Fluorine19_1D => "1D 19F",
+        PulseSequenceClass::Phosphorus31_1D => "1D 31P",
+        PulseSequenceClass::StdWaterLogsy1D => "1D STD / WaterLOGSY",
+        PulseSequenceClass::Hetero1D => "1D Heteronuclear",
         PulseSequenceClass::Unknown => "Unknown / 1D Decoy",
     }
 }
@@ -411,6 +453,7 @@ pub fn problem_regime_display_label(regime: ProblemRegime) -> &'static str {
         ProblemRegime::Paramagnetic => "Paramagnetic PCS / PRE Suite",
         ProblemRegime::RelaxationDynamics => "Spin Relaxation & Exchange Dynamics",
         ProblemRegime::TitrationCsp => "Ligand Titration CSP Series",
+        ProblemRegime::SmallMolecule2D => "2D Homonuclear & Small-Molecule Correlation Suite",
     }
 }
 
@@ -659,10 +702,20 @@ impl IngestPanelState {
     /// Initialize an editable Experiment Selection Matrix from a [`WorkspaceInventory`].
     pub fn from_inventory(inventory: WorkspaceInventory) -> Self {
         let n = inventory.experiments.len();
+        let has_2d_plus = inventory
+            .experiments
+            .iter()
+            .any(|e| e.dimensionality != ExperimentDimensionality::Dim1D);
         let selected: Vec<bool> = inventory
             .experiments
             .iter()
-            .map(should_select_experiment_by_default)
+            .map(|e| {
+                if has_2d_plus {
+                    should_select_experiment_by_default(e)
+                } else {
+                    e.pulse_class != PulseSequenceClass::Unknown && e.selected_by_default
+                }
+            })
             .collect();
         let effective_classes: Vec<PulseSequenceClass> = inventory
             .experiments
@@ -821,17 +874,43 @@ impl IngestPanelState {
         parse_sequence_three_letter(&self.sequence_text)
     }
 
-    /// Compute live missing-input hints, clearing the sequence hint once `sequence_text` is populated,
-    /// and never penalizing multi-day or multi-magnet acquisitions on stable proteins.
+    /// True when the active workspace or selected experiments represent small-molecule / homonuclear
+    /// 2D correlations, DOSY diffusion, or 1D spectra that do not require a polymer sequence.
+    pub fn is_sequence_free_regime(&self) -> bool {
+        if self.inventory.problem_regime == ProblemRegime::SmallMolecule2D {
+            return true;
+        }
+        let any_protein_backbone = self.effective_classes.iter().any(|c| {
+            c.is_1h_backbone_triple() || c.is_13c_detected() || *c == PulseSequenceClass::N15Hsqc
+        });
+        if any_protein_backbone {
+            return false;
+        }
+        let sel_classes: Vec<PulseSequenceClass> = self
+            .effective_classes
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| self.selected.get(i).copied().unwrap_or(false))
+            .map(|(_, &c)| c)
+            .collect();
+        !sel_classes.is_empty()
+            && sel_classes
+                .iter()
+                .all(|c| c.is_small_molecule_2d() || c.is_1d_experiment())
+    }
+
+    /// Compute live missing-input hints, clearing the sequence hint once `sequence_text` is populated
+    /// or when in `SmallMolecule2D` / `Dosy2D` regime, and never penalizing multi-magnet acquisitions.
     pub fn dynamic_missing_hints(&self) -> Vec<String> {
         let has_seq = !self.parsed_sequence_three_letter().is_empty();
+        let seq_free = self.is_sequence_free_regime();
         let mut hints: Vec<String> = self
             .inventory
             .missing_input_hints
             .iter()
             .filter(|h| {
                 let low = h.to_ascii_lowercase();
-                if has_seq && (low.contains("sequence") || low.contains("fasta")) {
+                if (has_seq || seq_free) && (low.contains("sequence") || low.contains("fasta")) {
                     return false;
                 }
                 true
@@ -840,6 +919,7 @@ impl IngestPanelState {
             .collect();
 
         if !has_seq
+            && !seq_free
             && !hints
                 .iter()
                 .any(|h| h.to_ascii_lowercase().contains("sequence"))
@@ -917,7 +997,158 @@ fn looks_like_nef_bytes(name: &str, bytes: &[u8]) -> bool {
     }
 }
 
-/// Cross-platform (`native` + `wasm32`) byte-payload ingestion pipeline:
+/// Decode a 1D UCSF Sparky (`ndim == 1`, `.ucsf`/`.usf`/`.sp2`) or 1D NMRPipe (`FDDIMCOUNT == 1`, `.ft1`)
+/// processed byte buffer directly into a [`Spectrum1D`] for `1D Array Studio`.
+pub fn try_load_1d_ucsf_or_pipe_bytes(name: &str, bytes: &[u8]) -> Option<Spectrum1D> {
+    let short_name = Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name)
+        .to_string();
+
+    // 1. 1D UCSF Sparky v2 (`180`-byte global header + `128`-byte axis header + big-endian `f32` tiles)
+    if is_ucsf_magic(bytes) && bytes.len() >= 308 && bytes[10] == 1 {
+        let ax_hdr = &bytes[180..308];
+        let nuc_end = ax_hdr[..6].iter().position(|&b| b == 0).unwrap_or(6);
+        let raw_lbl = String::from_utf8_lossy(&ax_hdr[..nuc_end])
+            .trim()
+            .to_string();
+        let label = if raw_lbl.is_empty() {
+            "1H".to_string()
+        } else {
+            raw_lbl
+        };
+        let npts_i32 = i32::from_be_bytes([ax_hdr[8], ax_hdr[9], ax_hdr[10], ax_hdr[11]]);
+        let tile_i32 = i32::from_be_bytes([ax_hdr[16], ax_hdr[17], ax_hdr[18], ax_hdr[19]]);
+        if npts_i32 <= 0 || tile_i32 <= 0 {
+            return None;
+        }
+        let npoints = npts_i32 as usize;
+        let tile_size = tile_i32 as usize;
+        let obs_mhz = f32::from_be_bytes([ax_hdr[20], ax_hdr[21], ax_hdr[22], ax_hdr[23]]) as f64;
+        let sw_hz = f32::from_be_bytes([ax_hdr[24], ax_hdr[25], ax_hdr[26], ax_hdr[27]]) as f64;
+        let xmtr_ppm = f32::from_be_bytes([ax_hdr[28], ax_hdr[29], ax_hdr[30], ax_hdr[31]]) as f64;
+        if !obs_mhz.is_finite()
+            || obs_mhz <= 0.0
+            || !sw_hz.is_finite()
+            || sw_hz <= 0.0
+            || !xmtr_ppm.is_finite()
+        {
+            return None;
+        }
+        let nt0 = npoints.div_ceil(tile_size);
+        let needed_bytes = 308usize.checked_add(nt0.checked_mul(tile_size)?.checked_mul(4)?)?;
+        if bytes.len() < needed_bytes {
+            return None;
+        }
+        let mut real = Vec::with_capacity(npoints);
+        let body = &bytes[308..];
+        for bt in 0..nt0 {
+            let base = bt * tile_size;
+            let valid = (npoints - base).min(tile_size);
+            let off = bt * tile_size * 4;
+            for chunk in body[off..off + valid * 4].chunks_exact(4) {
+                let v = f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64;
+                real.push(if v.is_finite() { v } else { 0.0 });
+            }
+        }
+        let sw_ppm = sw_hz / obs_mhz;
+        let axis_x = AxisPpm {
+            label: label.clone(),
+            size: npoints,
+            first_ppm: xmtr_ppm + 0.5 * sw_ppm,
+            step_ppm: -sw_ppm / (npoints as f64),
+            obs_mhz,
+        };
+        let exp = Experiment1DKind::from_pulse_program(&short_name, &label);
+        return Some(Spectrum1D::new(short_name, exp, axis_x, real, None));
+    }
+
+    // 2. 1D NMRPipe (`.ft1`, `2048`-byte header + `f32` body)
+    if is_nmrpipe_magic(bytes) && bytes.len() >= 2048 {
+        let le_magic = f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let big_endian = (le_magic - 2.345).abs() >= 1e-2;
+        let read_hdr_f32 = |idx: usize| -> f32 {
+            let o = idx * 4;
+            let arr = [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]];
+            if big_endian {
+                f32::from_be_bytes(arr)
+            } else {
+                f32::from_le_bytes(arr)
+            }
+        };
+        let ndim = read_hdr_f32(9).round() as isize;
+        let ny = read_hdr_f32(219).round() as isize;
+        if ndim != 1 && !(ndim <= 2 && ny <= 1) {
+            return None;
+        }
+        let nx = (read_hdr_f32(99).round() as isize).max(1) as usize;
+        let code0 = read_hdr_f32(24).round() as isize;
+        let slot = match code0 {
+            2 => 0usize,
+            1 => 1usize,
+            3 => 2usize,
+            4 => 3usize,
+            _ => 0usize,
+        };
+        const SW_IDX: [usize; 4] = [100, 229, 11, 29];
+        const ORIG_IDX: [usize; 4] = [101, 249, 12, 30];
+        const OBS_IDX: [usize; 4] = [119, 218, 10, 28];
+        const LBL_IDX: [usize; 4] = [16, 18, 20, 22];
+
+        let sw_hz = (read_hdr_f32(SW_IDX[slot]) as f64).max(1e-3);
+        let orig_hz = read_hdr_f32(ORIG_IDX[slot]) as f64;
+        let obs_mhz = (read_hdr_f32(OBS_IDX[slot]) as f64).max(1e-3);
+        let lbl_off = LBL_IDX[slot] * 4;
+        let lbl_slice = &bytes[lbl_off..lbl_off + 8];
+        let lbl_end = lbl_slice.iter().position(|&b| b == 0).unwrap_or(8);
+        let raw_lbl = String::from_utf8_lossy(&lbl_slice[..lbl_end])
+            .trim()
+            .to_string();
+        let label = if raw_lbl.is_empty() {
+            "1H".to_string()
+        } else {
+            raw_lbl
+        };
+
+        let is_complex = (read_hdr_f32(56).round() as i32) == 0
+            && bytes.len() >= 2048usize.saturating_add(nx.saturating_mul(8));
+        let needed_floats = if is_complex { nx * 2 } else { nx };
+        if bytes.len() < 2048usize.saturating_add(needed_floats.saturating_mul(4)) {
+            return None;
+        }
+        let decode_vec = |raw: &[u8], count: usize| -> Vec<f64> {
+            let mut out = Vec::with_capacity(count);
+            for chunk in raw[..count * 4].chunks_exact(4) {
+                let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                let v = if big_endian {
+                    f32::from_be_bytes(arr) as f64
+                } else {
+                    f32::from_le_bytes(arr) as f64
+                };
+                out.push(if v.is_finite() { v } else { 0.0 });
+            }
+            out
+        };
+        let body = &bytes[2048..];
+        let real = decode_vec(body, nx);
+        let imag = is_complex.then(|| decode_vec(&body[nx * 4..], nx));
+
+        let n_f = nx as f64;
+        let first_hz = orig_hz + sw_hz * ((n_f - 1.0) / n_f);
+        let axis_x = AxisPpm {
+            label: label.clone(),
+            size: nx,
+            first_ppm: first_hz / obs_mhz,
+            step_ppm: -sw_hz / (obs_mhz * n_f),
+            obs_mhz,
+        };
+        let exp = Experiment1DKind::from_pulse_program(&short_name, &label);
+        return Some(Spectrum1D::new(short_name, exp, axis_x, real, imag));
+    }
+
+    None
+}
 /// - Single `.nef` drop -> [`IngestDropOutcome::NefSession`]
 /// - Single `.str` / `.tsv` text table -> [`IngestDropOutcome::TextTable`]
 /// - `.tar` / `.tar.gz` / `.tgz` archive or multi-file spectrometer bundle ->
@@ -1067,6 +1298,19 @@ pub fn ingest_dropped_payloads(payloads: &[DroppedPayload]) -> Result<IngestDrop
             }
             _ => {}
         }
+        // Also support 1D `.ucsf`/`.usf`/`.sp2` (`ndim == 1`) and 1D `.ft1` byte payloads directly!
+        let mut ucsf_pipe_1d = Vec::new();
+        for (rel, bytes) in &mem_map {
+            if let Some(sp) = try_load_1d_ucsf_or_pipe_bytes(rel, bytes) {
+                ucsf_pipe_1d.push(sp);
+            }
+        }
+        if !ucsf_pipe_1d.is_empty() {
+            return Ok(IngestDropOutcome::Spectra1D {
+                source_name: inv.root_name.clone(),
+                spectra: ucsf_pipe_1d,
+            });
+        }
     }
 
     let mut panel = IngestPanelState::from_inventory(inv);
@@ -1088,7 +1332,7 @@ pub fn load_native_path_1d_or_workspace(path: &Path) -> Result<IngestDropOutcome
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // Bare Bruker sibling resolution on native desktop: dropping `1r`, `1i`, `fid`, `procs`, `acqus`, or `ser`
+    // Bare Bruker sibling resolution on native desktop: dropping `1r`, `1i`, `fid`, `procs`, `acqus`, `2rr`, `3rrr`, or `ser`
     // automatically inspects `path.parent()` on disk so users never hit a missing-sibling error!
     if path.is_file() {
         if matches!(fname_low.as_str(), "1r" | "1i" | "procs") {
@@ -1100,7 +1344,37 @@ pub fn load_native_path_1d_or_workspace(path: &Path) -> Result<IngestDropOutcome
                         source_name: parent.display().to_string(),
                         spectra: vec![spec],
                     });
+                } else {
+                    let exp_root = parent
+                        .parent()
+                        .filter(|p| {
+                            p.file_name()
+                                .and_then(|s| s.to_str())
+                                .is_some_and(|n| n.eq_ignore_ascii_case("pdata"))
+                        })
+                        .and_then(|p| p.parent())
+                        .unwrap_or(parent);
+                    let panel = IngestPanelState::from_native_path(exp_root)?;
+                    return Ok(IngestDropOutcome::Workspace(Box::new(panel)));
                 }
+            }
+        }
+        if matches!(
+            fname_low.as_str(),
+            "2rr" | "3rrr" | "4rrrr" | "proc2s" | "proc3s"
+        ) {
+            if let Some(parent) = path.parent() {
+                let exp_root = parent
+                    .parent()
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|n| n.eq_ignore_ascii_case("pdata"))
+                    })
+                    .and_then(|p| p.parent())
+                    .unwrap_or(parent);
+                let panel = IngestPanelState::from_native_path(exp_root)?;
+                return Ok(IngestDropOutcome::Workspace(Box::new(panel)));
             }
         }
         if matches!(fname_low.as_str(), "fid" | "acqus" | "acqu") {
@@ -1115,6 +1389,9 @@ pub fn load_native_path_1d_or_workspace(path: &Path) -> Result<IngestDropOutcome
                         source_name: parent.display().to_string(),
                         spectra: vec![spec],
                     });
+                } else {
+                    let panel = IngestPanelState::from_native_path(parent)?;
+                    return Ok(IngestDropOutcome::Workspace(Box::new(panel)));
                 }
             }
         }
@@ -1122,6 +1399,16 @@ pub fn load_native_path_1d_or_workspace(path: &Path) -> Result<IngestDropOutcome
             if let Some(parent) = path.parent() {
                 let panel = IngestPanelState::from_native_path(parent)?;
                 return Ok(IngestDropOutcome::Workspace(Box::new(panel)));
+            }
+        }
+        if is_ucsf_extension_lower(&lower) {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Some(spec) = try_load_1d_ucsf_or_pipe_bytes(&p_str, &bytes) {
+                    return Ok(IngestDropOutcome::Spectra1D {
+                        source_name: p_str,
+                        spectra: vec![spec],
+                    });
+                }
             }
         }
         if lower.ends_with(".jdx")
@@ -1338,7 +1625,7 @@ pub fn ingest_dropped_files_native(
             }
         }
 
-        let inv = WorkspaceInventory {
+        let mut inv = WorkspaceInventory {
             root_name: format!("{} dropped items", files.len()),
             experiments: combined_exps,
             auxiliary_files: combined_aux,
@@ -1347,6 +1634,7 @@ pub fn ingest_dropped_files_native(
             missing_input_hints: Vec::new(),
             elapsed_ms: 0.0,
         };
+        recompute_workspace_regime(&mut inv);
         let mut panel = IngestPanelState::from_inventory(inv);
         panel.row_resolved_paths = row_paths;
         if let Some((lbl, seq1)) = seq_found {
@@ -1417,6 +1705,10 @@ fn regime_badge_colors(regime: ProblemRegime) -> (egui::Color32, egui::Color32) 
         ProblemRegime::RelaxationDynamics | ProblemRegime::TitrationCsp => (
             egui::Color32::from_rgb(28, 56, 70),
             egui::Color32::from_rgb(135, 230, 240),
+        ),
+        ProblemRegime::SmallMolecule2D => (
+            egui::Color32::from_rgb(18, 60, 56),
+            egui::Color32::from_rgb(115, 245, 205),
         ),
     }
 }
@@ -1553,35 +1845,48 @@ impl IngestPanelState {
                         });
                 }
 
-                // 4. Inline Polymer Sequence Box
+                // 4. Inline Polymer Sequence Box (hidden / collapsed when in sequence-free SmallMolecule2D / DOSY regime)
+                let seq_free = self.is_sequence_free_regime();
                 let parsed_seq = self.parsed_sequence_three_letter();
-                ui.horizontal(|ui| {
+                if seq_free && parsed_seq.is_empty() {
                     ui.label(
-                        egui::RichText::new(format!(
-                            "Polymer Sequence ({} aa):",
-                            parsed_seq.len()
-                        ))
-                        .strong(),
+                        egui::RichText::new(
+                            "✓ 2D Correlation / Diffusion suite ready — no polymer sequence required. Click '📂 Load Selected Spectra' below to inspect & overlay!",
+                        )
+                        .small()
+                        .color(egui::Color32::from_rgb(125, 235, 185)),
                     );
-                    if let Some(src) = &self.sequence_source_label {
+                } else {
+                    ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(format!("Auto-discovered from {src}"))
-                                .small()
-                                .color(egui::Color32::from_rgb(115, 235, 175)),
+                            egui::RichText::new(format!(
+                                "Polymer Sequence ({} aa):",
+                                parsed_seq.len()
+                            ))
+                            .strong(),
                         );
-                    }
-                    if ui.small_button("Clear Sequence").clicked() {
-                        self.sequence_text.clear();
-                        self.sequence_source_label = None;
-                    }
-                });
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.sequence_text)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Paste FASTA, 1-letter (MQIFVKTL…), or 3-letter sequence here…"),
-                );
+                        if let Some(src) = &self.sequence_source_label {
+                            ui.label(
+                                egui::RichText::new(format!("Auto-discovered from {src}"))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(115, 235, 175)),
+                            );
+                        }
+                        if ui.small_button("Clear Sequence").clicked() {
+                            self.sequence_text.clear();
+                            self.sequence_source_label = None;
+                        }
+                    });
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.sequence_text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(
+                                "Paste FASTA, 1-letter (MQIFVKTL…), or 3-letter sequence here…",
+                            ),
+                    );
+                }
 
                 // 5. Matrix Selection Toolbar & Scrollable Editable Experiment Grid
                 ui.horizontal(|ui| {
@@ -1712,26 +2017,48 @@ impl IngestPanelState {
                 ui.separator();
                 ui.horizontal(|ui| {
                     let has_sel = self.selected_count() > 0;
-                    let run_btn = egui::Button::new(
-                        egui::RichText::new("▶ Process, Pick & Run")
-                            .strong()
-                            .color(egui::Color32::from_rgb(15, 25, 20)),
-                    )
-                    .fill(egui::Color32::from_rgb(82, 224, 152));
-
-                    if ui.add_enabled(has_sel, run_btn).clicked() {
-                        emitted = Some(IngestAction::ProcessPickAndRun(
-                            self.build_execution_plan(),
-                        ));
-                    }
-
-                    if ui
-                        .add_enabled(has_sel, egui::Button::new("📂 Load Selected Spectra"))
-                        .clicked()
-                    {
-                        emitted = Some(IngestAction::LoadSelectedSpectra(
-                            self.build_execution_plan(),
-                        ));
+                    let primary_green = egui::Color32::from_rgb(82, 224, 152);
+                    let primary_fg = egui::Color32::from_rgb(15, 25, 20);
+                    if self.is_sequence_free_regime() {
+                        let load_cta = egui::Button::new(
+                            egui::RichText::new("📂 Load Selected Spectra")
+                                .strong()
+                                .color(primary_fg),
+                        )
+                        .fill(primary_green);
+                        if ui.add_enabled(has_sel, load_cta).clicked() {
+                            emitted = Some(IngestAction::LoadSelectedSpectra(
+                                self.build_execution_plan(),
+                            ));
+                        }
+                        if ui
+                            .add_enabled(has_sel, egui::Button::new("▶ Process, Pick & Run"))
+                            .clicked()
+                        {
+                            emitted = Some(IngestAction::ProcessPickAndRun(
+                                self.build_execution_plan(),
+                            ));
+                        }
+                    } else {
+                        let run_btn = egui::Button::new(
+                            egui::RichText::new("▶ Process, Pick & Run")
+                                .strong()
+                                .color(primary_fg),
+                        )
+                        .fill(primary_green);
+                        if ui.add_enabled(has_sel, run_btn).clicked() {
+                            emitted = Some(IngestAction::ProcessPickAndRun(
+                                self.build_execution_plan(),
+                            ));
+                        }
+                        if ui
+                            .add_enabled(has_sel, egui::Button::new("📂 Load Selected Spectra"))
+                            .clicked()
+                        {
+                            emitted = Some(IngestAction::LoadSelectedSpectra(
+                                self.build_execution_plan(),
+                            ));
+                        }
                     }
 
                     let has_sel_1d = self

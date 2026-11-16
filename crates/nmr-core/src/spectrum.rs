@@ -353,6 +353,181 @@ fn decode_bruker_words(
     }
 }
 
+fn has_explicit_bruker_axnuc(params: &HashMap<String, String>) -> bool {
+    params
+        .get("AXNUC")
+        .is_some_and(|s| !s.is_empty() && !s.eq_ignore_ascii_case("off"))
+}
+
+fn proton_equiv_mhz(nuc: &str, sf_mhz: f64) -> Option<f64> {
+    if !sf_mhz.is_finite() || sf_mhz <= 1.0 {
+        return None;
+    }
+    match nuc.to_ascii_uppercase().as_str() {
+        "1H" | "H1" | "H" | "HN" => Some(sf_mhz),
+        "13C" | "C13" | "C" | "CA" | "CB" | "CO" => Some(sf_mhz * 3.976_933),
+        "15N" | "N15" | "N" | "NH" => Some(sf_mhz * 9.869_062),
+        "31P" | "P31" | "P" => Some(sf_mhz * 2.470_376),
+        "19F" | "F19" | "F" => Some(sf_mhz * 1.062_918),
+        _ => None,
+    }
+}
+
+fn infer_bruker_2d_axis_nuclei(
+    p1: &HashMap<String, String>,
+    p2: &HashMap<String, String>,
+    axis_x: &mut AxisPpm,
+    axis_y: &mut AxisPpm,
+    acqu_nuc_x: Option<&str>,
+    acqu_nuc_y: Option<&str>,
+) {
+    let mut x_known = has_explicit_bruker_axnuc(p1);
+    let mut y_known = has_explicit_bruker_axnuc(p2);
+    if !x_known {
+        if let Some(nx) = acqu_nuc_x.filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("off")) {
+            axis_x.label = nx.to_string();
+            x_known = true;
+        }
+    }
+    if !y_known {
+        if let Some(ny) = acqu_nuc_y.filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("off")) {
+            axis_y.label = ny.to_string();
+            y_known = true;
+        }
+    }
+    if x_known && y_known {
+        return;
+    }
+
+    let sf_x = axis_x.obs_mhz;
+    let sf_y = axis_y.obs_mhz;
+    let ratio = sf_y / sf_x.max(1e-6);
+
+    if !x_known && !y_known {
+        if (ratio - 0.40298).abs() < 0.025 {
+            axis_x.label = "13C".to_string();
+            axis_y.label = "15N".to_string();
+        } else if (ratio - 2.4815).abs() < 0.12 {
+            axis_x.label = "15N".to_string();
+            axis_y.label = "13C".to_string();
+        } else if (ratio - 1.0).abs() < 0.03 {
+            let iso = if axis_x.max_ppm() > 35.0 || axis_y.max_ppm() > 35.0 {
+                "13C"
+            } else {
+                "1H"
+            };
+            axis_x.label = iso.to_string();
+            axis_y.label = iso.to_string();
+        } else if (ratio - 0.10133).abs() < 0.015 {
+            axis_x.label = "1H".to_string();
+            axis_y.label = "15N".to_string();
+        } else if (ratio - 0.25145).abs() < 0.02 {
+            axis_x.label = "1H".to_string();
+            axis_y.label = "13C".to_string();
+        } else if (ratio - 0.4048).abs() < 0.025 {
+            axis_x.label = "1H".to_string();
+            axis_y.label = "31P".to_string();
+        } else if (ratio - 0.9408).abs() < 0.025 {
+            axis_x.label = "1H".to_string();
+            axis_y.label = "19F".to_string();
+        } else if axis_x.max_ppm() > 140.0 && sf_x < 320.0 {
+            axis_x.label = "13C".to_string();
+        }
+    } else if !x_known {
+        if let Some(bmhz) = proton_equiv_mhz(&axis_y.label, sf_y) {
+            let rx = sf_x / bmhz;
+            if (rx - 1.0).abs() < 0.04 {
+                axis_x.label = "1H".to_string();
+            } else if (rx - 0.25145).abs() < 0.025 {
+                axis_x.label = "13C".to_string();
+            } else if (rx - 0.10133).abs() < 0.02 {
+                axis_x.label = "15N".to_string();
+            }
+        }
+    } else if !y_known {
+        if let Some(bmhz) = proton_equiv_mhz(&axis_x.label, sf_x) {
+            let ry = sf_y / bmhz;
+            if (ry - 1.0).abs() < 0.04 {
+                axis_y.label = "1H".to_string();
+            } else if (ry - 0.25145).abs() < 0.025 {
+                axis_y.label = "13C".to_string();
+            } else if (ry - 0.10133).abs() < 0.02 {
+                axis_y.label = "15N".to_string();
+            } else if (ry - 0.4048).abs() < 0.025 {
+                axis_y.label = "31P".to_string();
+            } else if (ry - 0.9408).abs() < 0.025 {
+                axis_y.label = "19F".to_string();
+            }
+        }
+    }
+}
+
+/// Resolve a Bruker processed directory (`dir` itself when `bin_name` is present, or the lowest
+/// numeric `pdata/<procno>` subdirectory containing `bin_name`).
+pub fn resolve_bruker_pdata_dir(base: &Path, bin_name: &str) -> std::path::PathBuf {
+    if base.join(bin_name).is_file() && base.join("procs").is_file() {
+        return base.to_path_buf();
+    }
+    let pdata_container = if base
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("pdata"))
+    {
+        base.to_path_buf()
+    } else {
+        base.join("pdata")
+    };
+    if pdata_container.is_dir() {
+        let mut procnos: Vec<(usize, std::path::PathBuf)> = fs::read_dir(&pdata_container)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let s = e.file_name().into_string().ok()?;
+                let n = s.parse::<usize>().ok()?;
+                e.file_type().ok()?.is_dir().then_some((n, e.path()))
+            })
+            .collect();
+        procnos.sort_by_key(|(n, _)| *n);
+        if let Some((_, p)) = procnos
+            .iter()
+            .find(|(_, p)| p.join(bin_name).is_file() && p.join("procs").is_file())
+        {
+            return p.clone();
+        }
+        if let Some((_, p)) = procnos.into_iter().next() {
+            return p;
+        }
+    }
+    base.to_path_buf()
+}
+
+fn read_sibling_bruker_acqu_nuc1(pdata_dir: &Path, acqu_filename: &str) -> Option<String> {
+    let candidates = [
+        pdata_dir.join(acqu_filename),
+        pdata_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join(acqu_filename))
+            .unwrap_or_default(),
+    ];
+    for cand in candidates {
+        if !cand.as_os_str().is_empty() && cand.is_file() {
+            if let Ok(txt) = fs::read_to_string(&cand) {
+                let map = parse_jcamp_params(&txt);
+                if let Some(nuc) = map
+                    .get("NUC1")
+                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("off"))
+                {
+                    return Some(nuc.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Decode a Bruker TopSpin 2D processed dataset directly from in-memory `procs`, `proc2s`, and `2rr` byte slices.
 pub fn read_bruker_pdata_2d_from_bytes(
     name: &str,
@@ -362,8 +537,9 @@ pub fn read_bruker_pdata_2d_from_bytes(
 ) -> Result<Spectrum2D, String> {
     let p1 = parse_jcamp_params(procs_txt);
     let p2 = parse_jcamp_params(proc2s_txt);
-    let (axis_x, xdim_x, bytordp, dtypp, nc_proc) = parse_bruker_axis(&p1, "1H")?;
-    let (axis_y, xdim_y, ..) = parse_bruker_axis(&p2, "15N")?;
+    let (mut axis_x, xdim_x, bytordp, dtypp, nc_proc) = parse_bruker_axis(&p1, "1H")?;
+    let (mut axis_y, xdim_y, ..) = parse_bruker_axis(&p2, "15N")?;
+    infer_bruker_2d_axis_nuclei(&p1, &p2, &mut axis_x, &mut axis_y, None, None);
 
     let nx = axis_x.size;
     let ny = axis_y.size;
@@ -401,17 +577,38 @@ pub fn read_bruker_pdata_2d_from_bytes(
     })
 }
 
-/// Read a Bruker TopSpin 2D processed directory (containing `procs`, `proc2s`, and `2rr`).
+/// Read a Bruker TopSpin 2D processed directory (containing `procs`, `proc2s`, and `2rr`, or its parent `<expno>`).
 pub fn read_bruker_pdata_2d(pdata_dir: impl AsRef<Path>) -> Result<Spectrum2D, String> {
-    let dir = pdata_dir.as_ref();
+    let dir = resolve_bruker_pdata_dir(pdata_dir.as_ref(), "2rr");
     let procs_txt = fs::read_to_string(dir.join("procs"))
         .map_err(|e| format!("failed to read {}: {e}", dir.join("procs").display()))?;
     let proc2s_txt = fs::read_to_string(dir.join("proc2s"))
         .map_err(|e| format!("failed to read {}: {e}", dir.join("proc2s").display()))?;
     let raw_bytes = fs::read(dir.join("2rr"))
         .map_err(|e| format!("failed to read {}: {e}", dir.join("2rr").display()))?;
-    let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("2rr");
-    read_bruker_pdata_2d_from_bytes(name, &procs_txt, &proc2s_txt, &raw_bytes)
+    let name = pdata_dir
+        .as_ref()
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("2rr");
+    let mut spec = read_bruker_pdata_2d_from_bytes(name, &procs_txt, &proc2s_txt, &raw_bytes)?;
+    let p1 = parse_jcamp_params(&procs_txt);
+    let p2 = parse_jcamp_params(&proc2s_txt);
+    if !has_explicit_bruker_axnuc(&p1) || !has_explicit_bruker_axnuc(&p2) {
+        let acq1 = read_sibling_bruker_acqu_nuc1(&dir, "acqus")
+            .or_else(|| read_sibling_bruker_acqu_nuc1(&dir, "acqu"));
+        let acq2 = read_sibling_bruker_acqu_nuc1(&dir, "acqu2s")
+            .or_else(|| read_sibling_bruker_acqu_nuc1(&dir, "acqu2"));
+        infer_bruker_2d_axis_nuclei(
+            &p1,
+            &p2,
+            &mut spec.axis_x,
+            &mut spec.axis_y,
+            acq1.as_deref(),
+            acq2.as_deref(),
+        );
+    }
+    Ok(spec)
 }
 
 /// Write a Bruker TopSpin 2D processed directory (`procs`, `proc2s`, `2rr`) for round-trip testing and export.
@@ -518,9 +715,9 @@ pub fn read_bruker_pdata_3d_from_bytes(
     })
 }
 
-/// Read a Bruker TopSpin 3D processed directory (`procs`, `proc2s`, `proc3s`, and `3rrr`).
+/// Read a Bruker TopSpin 3D processed directory (`procs`, `proc2s`, `proc3s`, and `3rrr`, or its parent `<expno>`).
 pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, String> {
-    let dir = pdata_dir.as_ref();
+    let dir = resolve_bruker_pdata_dir(pdata_dir.as_ref(), "3rrr");
     let procs_txt =
         fs::read_to_string(dir.join("procs")).map_err(|e| format!("failed to read procs: {e}"))?;
     let proc2s_txt = fs::read_to_string(dir.join("proc2s"))
@@ -528,7 +725,11 @@ pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Sp
     let proc3s_txt = fs::read_to_string(dir.join("proc3s"))
         .map_err(|e| format!("failed to read proc3s: {e}"))?;
     let raw_bytes = fs::read(dir.join("3rrr")).map_err(|e| format!("failed to read 3rrr: {e}"))?;
-    let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("3rrr");
+    let name = pdata_dir
+        .as_ref()
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("3rrr");
     read_bruker_pdata_3d_from_bytes(name, exp, &procs_txt, &proc2s_txt, &proc3s_txt, &raw_bytes)
 }
 
@@ -934,9 +1135,11 @@ pub fn is_ucsf_file(path: impl AsRef<Path>) -> bool {
             return is_ucsf_bytes(&magic);
         }
     }
-    p.extension()
-        .and_then(|s| s.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("ucsf"))
+    p.extension().and_then(|s| s.to_str()).is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("ucsf")
+            || ext.eq_ignore_ascii_case("usf")
+            || ext.eq_ignore_ascii_case("sp2")
+    })
 }
 
 fn classify_ucsf_nucleus(ax: &AxisPpm) -> UcsfNuc {
@@ -1122,8 +1325,14 @@ fn read_ucsf_2d_from_reader<R: Read>(name: &str, mut reader: R) -> Result<Spectr
     let nt0 = n0.div_ceil(t0);
     let nt1 = n1.div_ceil(t1);
 
-    let transpose =
-        classify_ucsf_nucleus(&ax0) == UcsfNuc::H && classify_ucsf_nucleus(&ax1) != UcsfNuc::H;
+    let nuc0 = classify_ucsf_nucleus(&ax0);
+    let nuc1 = classify_ucsf_nucleus(&ax1);
+    let transpose = (nuc0 == UcsfNuc::H && nuc1 != UcsfNuc::H)
+        || (nuc0 == UcsfNuc::C && nuc1 == UcsfNuc::N)
+        || (nuc0 == UcsfNuc::C
+            && nuc1 == UcsfNuc::C
+            && ax0.min_ppm() > 150.0
+            && ax1.max_ppm() < 120.0);
     let (axis_x, axis_y) = if transpose { (ax0, ax1) } else { (ax1, ax0) };
     let nx = axis_x.size;
     let ny = axis_y.size;
