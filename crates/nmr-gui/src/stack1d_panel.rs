@@ -32,10 +32,113 @@ use nmr_core::multiplet::{
 };
 use nmr_core::nmr1d::{
     apply_phase_1d, auto_calibrate_solvent_1d, auto_phase_and_apply_1d, correct_baseline_1d,
-    hilbert_reconstruct_imaginary_1d, pick_peaks_1d, AutoPhase1DConfig, BaselineConfig1D,
-    Experiment1DKind, PeakPickConfig1D, Pivot1D, Spectrum1D,
+    estimate_noise_sigma_1d, hilbert_reconstruct_imaginary_1d, lookup_deuterated_solvent,
+    match_trace_impurities, pick_peaks_1d, solvent_residual_shifts, AutoPhase1DConfig,
+    BaselineConfig1D, BaselineMethod1D, Experiment1DKind, Nucleus1D, PeakPickConfig1D, Pivot1D,
+    Spectrum1D,
 };
+use nmr_core::ops::fft_arbitrary_in_place;
 use nmr_core::spectrum::AxisPpm;
+
+/// Primary mouse tool mode on the interactive 1D NMR canvas.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ToolMode1d {
+    /// Two-click (`Click 1 -> Click 2`) or click-and-drag horizontal chemical-shift zoom.
+    #[default]
+    Zoom,
+    /// Left-drag horizontal chemical-shift pan.
+    Pan,
+    /// Left-drag region-of-interest (`ROI`) integral bracket creation (`Shift + Drag` works in any mode).
+    IntegrateRoi,
+}
+
+impl ToolMode1d {
+    pub const ALL: [Self; 3] = [Self::Zoom, Self::Pan, Self::IntegrateRoi];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Zoom => "🔍 Zoom",
+            Self::Pan => "✋ Pan",
+            Self::IntegrateRoi => "∫ Integrate ROI",
+        }
+    }
+
+    pub const fn tooltip(self) -> &'static str {
+        match self {
+            Self::Zoom => {
+                "Click 1st point -> Click 2nd point (or Click-Drag) to zoom horizontally; Scroll wheel scales vertical peak intensity"
+            }
+            Self::Pan => {
+                "Drag horizontally to pan across chemical shift (Right-drag, Middle-drag, or Space+Drag also pan in Zoom mode)"
+            }
+            Self::IntegrateRoi => {
+                "Drag across a multiplet or region to add an integrated ROI bracket (Shift+Drag also integrates in Zoom mode)"
+            }
+        }
+    }
+}
+
+/// Active analytical tab in the 4-tab 1D workstation bottom dock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum InspectorTab1d {
+    #[default]
+    Peaks,
+    Multiplets,
+    PhaseBaseline,
+    MultiTraceStack,
+}
+
+/// Selectable automatic baseline correction model for the 1D Phase & Baseline tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BaselineModelChoice1d {
+    #[default]
+    Whittaker,
+    AsymmetricWhittaker,
+    Bernstein,
+}
+
+impl BaselineModelChoice1d {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Whittaker => "Whittaker (Wavelet)",
+            Self::AsymmetricWhittaker => "Asymmetric Whittaker",
+            Self::Bernstein => "Bernstein Polynomial",
+        }
+    }
+}
+
+/// First-order phase (`PHC1`) pivot selection rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PivotMode1d {
+    #[default]
+    MaxPeak,
+    AtPpm,
+}
+
+/// Picked 1D resonance peak entry with frequency, SNR, linewidth, and solvent/impurity annotation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Peak1dEntry {
+    pub ppm: f64,
+    pub hz: f64,
+    pub height: f64,
+    pub snr: f64,
+    pub fwhm_hz: f64,
+    pub note: String,
+    pub is_solvent_or_impurity: bool,
+}
+
+/// Format a 0-based multiplet index into spreadsheet-style uppercase letters (`0 -> "A"`, `26 -> "AA"`).
+pub fn multiplet_letter_id(mut idx: usize) -> String {
+    let mut chars = Vec::new();
+    loop {
+        chars.push((b'A' + (idx % 26) as u8) as char);
+        if idx < 26 {
+            break;
+        }
+        idx = idx / 26 - 1;
+    }
+    chars.into_iter().rev().collect()
+}
 
 /// Curated dark-workbench color palette (`[r, g, b, a]`) for overlaid & stacked 1D NMR traces.
 pub const STACK1D_TRACE_PALETTE: [[u8; 4]; 8] = [
@@ -2210,6 +2313,36 @@ pub struct Stack1dState {
     pub detected_multiplets: Vec<MultipletAnalysis>,
     pub detected_multiplet_integrals: Vec<f64>,
     pub formatted_journal_report: String,
+
+    // Spectroscopist 1D Workstation Navigation, Peak Table & Referencing controls
+    pub tool_mode: ToolMode1d,
+    pub zoom_anchor_ppm: Option<f64>,
+    pub active_zoom_drag_start_ppm: Option<f64>,
+    active_zoom_drag_start_pos: Option<egui::Pos2>,
+    pub zoom_history: Vec<(f64, f64)>,
+    pub zoom_redo_stack: Vec<(f64, f64)>,
+    pub baseline_y_frac: f32,
+    pub selected_inspector_tab: InspectorTab1d,
+    pub picked_peaks: Vec<Peak1dEntry>,
+    pub selected_peak_idx: Option<usize>,
+    pub selected_multiplet_idx: Option<usize>,
+    pub picker_min_snr: f64,
+    pub estimated_noise_sigma: f64,
+    pub show_peak_labels: bool,
+    pub peak_labels_in_hz: bool,
+    pub show_j_trees: bool,
+    pub show_multiplet_boxes: bool,
+    pub show_threshold_bar: bool,
+    dragging_threshold_bar: bool,
+    pub custom_ref_target_ppm: f64,
+    pub phase_pivot_mode: PivotMode1d,
+    pub phase_pivot_ppm: f64,
+    pub phase_pivot_pick_armed: bool,
+    pub baseline_model_choice: BaselineModelChoice1d,
+    pub baseline_lambda_log10: f64,
+    pub baseline_bernstein_deg: usize,
+    pub reprocess_lb_hz: f64,
+    pub reprocess_zf_factor: usize,
 }
 
 impl std::fmt::Debug for Stack1dState {
@@ -2220,6 +2353,7 @@ impl std::fmt::Debug for Stack1dState {
             .field("view_ppm_min", &self.view_ppm_min)
             .field("view_ppm_max", &self.view_ppm_max)
             .field("n_rois", &self.roi_regions.len())
+            .field("n_peaks", &self.picked_peaks.len())
             .finish()
     }
 }
@@ -2277,7 +2411,7 @@ impl Default for Stack1dState {
             last_exported_svg: None,
             show_tsv_preview: false,
             status_message: String::new(),
-            show_1d_analysis_drawer: false,
+            show_1d_analysis_drawer: true,
             show_native_open_bar: false,
             native_open_path_input: String::new(),
             pending_open_native_path: None,
@@ -2290,14 +2424,351 @@ impl Default for Stack1dState {
             detected_multiplets: Vec::new(),
             detected_multiplet_integrals: Vec::new(),
             formatted_journal_report: String::new(),
+            tool_mode: ToolMode1d::Zoom,
+            zoom_anchor_ppm: None,
+            active_zoom_drag_start_ppm: None,
+            active_zoom_drag_start_pos: None,
+            zoom_history: Vec::new(),
+            zoom_redo_stack: Vec::new(),
+            baseline_y_frac: 0.82,
+            selected_inspector_tab: InspectorTab1d::Peaks,
+            picked_peaks: Vec::new(),
+            selected_peak_idx: None,
+            selected_multiplet_idx: None,
+            picker_min_snr: 6.0,
+            estimated_noise_sigma: 1e-6,
+            show_peak_labels: true,
+            peak_labels_in_hz: false,
+            show_j_trees: true,
+            show_multiplet_boxes: true,
+            show_threshold_bar: false,
+            dragging_threshold_bar: false,
+            custom_ref_target_ppm: 0.0,
+            phase_pivot_mode: PivotMode1d::MaxPeak,
+            phase_pivot_ppm: 7.26,
+            phase_pivot_pick_armed: false,
+            baseline_model_choice: BaselineModelChoice1d::Whittaker,
+            baseline_lambda_log10: 6.0,
+            baseline_bernstein_deg: 6,
+            reprocess_lb_hz: 0.3,
+            reprocess_zf_factor: 2,
         }
     }
 }
 
 impl Stack1dState {
+    /// Active reference spectrometer observe frequency in MHz (fallback `500.0 MHz`).
+    pub fn active_obs_mhz(&self) -> f64 {
+        if self.traces.is_empty() {
+            return 500.0;
+        }
+        let idx = self.safe_ref_trace_idx();
+        self.traces
+            .get(idx)
+            .and_then(|t| t.raw_spec.as_ref())
+            .map(|att| att.0.axis.obs_mhz.max(60.0))
+            .unwrap_or(500.0)
+    }
+
+    /// Active reference nucleus (`1H` fallback when unannotated).
+    pub fn active_nucleus(&self) -> Nucleus1D {
+        if self.traces.is_empty() {
+            return Nucleus1D::H1;
+        }
+        let idx = self.safe_ref_trace_idx();
+        self.traces
+            .get(idx)
+            .and_then(|t| t.raw_spec.as_ref())
+            .map(|att| att.0.experiment.nucleus())
+            .unwrap_or(Nucleus1D::H1)
+    }
+
+    /// Push the current `[view_ppm_min, view_ppm_max]` onto `zoom_history` and zoom horizontally into `[ppm_a, ppm_b]`.
+    pub fn push_zoom_window(&mut self, ppm_a: f64, ppm_b: f64) {
+        let new_lo = ppm_a.min(ppm_b);
+        let new_hi = ppm_a.max(ppm_b);
+        if !new_lo.is_finite() || !new_hi.is_finite() || (new_hi - new_lo) < 1e-4 {
+            return;
+        }
+        let cur_lo = self.view_ppm_min.min(self.view_ppm_max);
+        let cur_hi = self.view_ppm_min.max(self.view_ppm_max);
+        if (cur_lo - new_lo).abs() > 1e-6 || (cur_hi - new_hi).abs() > 1e-6 {
+            if self.zoom_history.len() >= 64 {
+                self.zoom_history.remove(0);
+            }
+            self.zoom_history.push((cur_lo, cur_hi));
+            self.zoom_redo_stack.clear();
+        }
+        self.view_ppm_min = new_lo;
+        self.view_ppm_max = new_hi;
+        self.zoom_anchor_ppm = None;
+        self.active_zoom_drag_start_ppm = None;
+        self.active_zoom_drag_start_pos = None;
+    }
+
+    /// Handle two-click spectroscopist zoom (`Click 1` sets `zoom_anchor_ppm`; `Click 2` zooms into `[p1, p2]`).
+    /// Returns `true` when the second click completes a zoom transition.
+    pub fn handle_canvas_zoom_click(&mut self, click_ppm: f64) -> bool {
+        if !click_ppm.is_finite() {
+            return false;
+        }
+        match self.zoom_anchor_ppm {
+            None => {
+                self.zoom_anchor_ppm = Some(click_ppm);
+                false
+            }
+            Some(p1) => {
+                if (click_ppm - p1).abs() >= 1e-4 {
+                    self.push_zoom_window(p1, click_ppm);
+                    true
+                } else {
+                    self.zoom_anchor_ppm = None;
+                    false
+                }
+            }
+        }
+    }
+
+    /// Cancel an active 1st-click zoom anchor (`Esc` or Right-Click).
+    pub fn cancel_zoom_anchor(&mut self) {
+        self.zoom_anchor_ppm = None;
+        self.active_zoom_drag_start_ppm = None;
+        self.active_zoom_drag_start_pos = None;
+    }
+
+    /// Pop the previous horizontal chemical-shift window from `zoom_history`.
+    pub fn undo_zoom(&mut self) -> bool {
+        if let Some((prev_lo, prev_hi)) = self.zoom_history.pop() {
+            let cur_lo = self.view_ppm_min.min(self.view_ppm_max);
+            let cur_hi = self.view_ppm_min.max(self.view_ppm_max);
+            self.zoom_redo_stack.push((cur_lo, cur_hi));
+            self.view_ppm_min = prev_lo;
+            self.view_ppm_max = prev_hi;
+            self.zoom_anchor_ppm = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Re-apply an undone horizontal chemical-shift window from `zoom_redo_stack`.
+    pub fn redo_zoom(&mut self) -> bool {
+        if let Some((next_lo, next_hi)) = self.zoom_redo_stack.pop() {
+            let cur_lo = self.view_ppm_min.min(self.view_ppm_max);
+            let cur_hi = self.view_ppm_min.max(self.view_ppm_max);
+            self.zoom_history.push((cur_lo, cur_hi));
+            self.view_ppm_min = next_lo;
+            self.view_ppm_max = next_hi;
+            self.zoom_anchor_ppm = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reset horizontal `[view_ppm_min, view_ppm_max]` to full trace bounds while preserving `y_gain`.
+    pub fn fit_full_x_only(&mut self) {
+        if let Some((lo, hi)) = self.global_ppm_bounds() {
+            let pad = 0.015 * (hi - lo).max(0.1);
+            self.push_zoom_window(lo - pad, hi + pad);
+        }
+    }
+
+    /// Auto-scale `y_gain` (`0.001..=100_000.0`) so the tallest visible peak inside `[ppm_a, ppm_b]`
+    /// sits cleanly at ~75% of the plot headroom above `baseline_y_frac`.
+    pub fn fit_y_to_region(&mut self, ppm_a: f64, ppm_b: f64) {
+        if self.traces.is_empty() {
+            return;
+        }
+        let lo = ppm_a.min(ppm_b);
+        let hi = ppm_a.max(ppm_b);
+        let global_ceil = self.reference_intensity_ceiling();
+        let mut local_max = 0.0_f64;
+        for tr in self.traces.iter().filter(|t| t.visible) {
+            if let Some((i0, i1)) = tr.index_range_for_ppm(lo, hi) {
+                if i1 - i0 <= 4096 {
+                    for idx in i0..=i1 {
+                        let p = tr.effective_ppm(idx);
+                        if p >= lo && p <= hi {
+                            local_max = local_max.max(tr.effective_intensity(idx).abs());
+                        }
+                    }
+                } else {
+                    for &(_, v) in &tr.decimate_for_viewport(lo, hi, 512) {
+                        local_max = local_max.max(v.abs());
+                    }
+                }
+            }
+        }
+        if local_max > 1e-18 {
+            let target_frac = (0.75 * (self.baseline_y_frac as f64)).clamp(0.18, 0.72);
+            let gain = (target_frac / 0.70) * (global_ceil / local_max);
+            self.y_gain = gain.clamp(0.001, 100_000.0);
+        }
+    }
+
+    /// Auto-scale `y_gain` to fit the tallest peak inside the current `[view_ppm_min, view_ppm_max]`.
+    pub fn fit_y_to_visible_window(&mut self) {
+        self.fit_y_to_region(self.view_ppm_min, self.view_ppm_max);
+    }
+
+    /// Spectroscopist vertical scroll rule: plain vertical wheel scales `y_gain` (`0.001..=100_000×`)
+    /// without altering `view_ppm_min..view_ppm_max`; `Shift + Scroll` shifts `baseline_y_frac`.
+    pub fn apply_vertical_scroll_gain(&mut self, scroll_y: f32, shift_down: bool) {
+        if !scroll_y.is_finite() || scroll_y.abs() <= 1e-5 {
+            return;
+        }
+        if shift_down {
+            self.baseline_y_frac = (self.baseline_y_frac - scroll_y * 0.0015).clamp(0.12, 0.94);
+        } else {
+            let g_factor = (scroll_y as f64 * 0.0045).exp().clamp(0.25, 4.0);
+            self.y_gain = (self.y_gain * g_factor).clamp(0.001, 100_000.0);
+        }
+    }
+
+    /// Zoom horizontally to picked peak `peak_idx` and auto-scale `y_gain` so its apex sits at ~75% height.
+    pub fn zoom_to_peak(&mut self, peak_idx: usize) {
+        let Some(pk) = self.picked_peaks.get(peak_idx).cloned() else {
+            return;
+        };
+        self.selected_peak_idx = Some(peak_idx);
+        self.phase_pivot_ppm = pk.ppm;
+        let pad = match self.active_nucleus() {
+            Nucleus1D::H1 => 0.12,
+            _ => 2.0,
+        };
+        self.push_zoom_window(pk.ppm - pad, pk.ppm + pad);
+        self.fit_y_to_region(pk.ppm - 0.5 * pad, pk.ppm + 0.5 * pad);
+    }
+
+    /// Zoom horizontally to detected multiplet `mult_idx` and auto-scale `y_gain` to fit its lines.
+    pub fn zoom_to_multiplet(&mut self, mult_idx: usize) {
+        let Some(m) = self.detected_multiplets.get(mult_idx).cloned() else {
+            return;
+        };
+        self.selected_multiplet_idx = Some(mult_idx);
+        let m_lo = m.range_ppm.0.min(m.range_ppm.1);
+        let m_hi = m.range_ppm.0.max(m.range_ppm.1);
+        let margin = (m_hi - m_lo).max(0.06) * 0.8;
+        self.push_zoom_window(m_lo - margin, m_hi + margin);
+        self.fit_y_to_region(m_lo - 0.02, m_hi + 0.02);
+    }
+
+    /// Normalize multiplet `mult_idx` to `target_protons` (e.g. `1.0`, `2.0`, `3.0` H), rescaling
+    /// all multiplet integrals and regenerating the journal characterization report.
+    pub fn normalize_multiplet_integral_to(&mut self, mult_idx: usize, target_protons: f64) {
+        if target_protons <= 0.0 || mult_idx >= self.detected_multiplet_integrals.len() {
+            return;
+        }
+        let cur = self.detected_multiplet_integrals[mult_idx];
+        if cur <= 1e-12 {
+            return;
+        }
+        let factor = target_protons / cur;
+        let mut sum_h = 0.0_f64;
+        for (an, integ) in self
+            .detected_multiplets
+            .iter_mut()
+            .zip(self.detected_multiplet_integrals.iter_mut())
+        {
+            *integ *= factor;
+            sum_h += *integ;
+            an.proton_count = Some((*integ).round().max(1.0) as usize);
+        }
+        self.target_total_protons = sum_h;
+        self.reformat_journal_report();
+        self.status_message = format!(
+            "Normalized multiplet {} ({:.2} ppm) to {:.2} H (total = {:.1} H).",
+            multiplet_letter_id(mult_idx),
+            self.detected_multiplets[mult_idx].center_ppm,
+            target_protons,
+            sum_h
+        );
+    }
+
+    /// Reference picked peak `peak_idx` to `target_ppm`, shifting the active trace (and unlocked sibling
+    /// traces), viewport bounds, ROI brackets, picked peaks, and multiplets consistently.
+    pub fn reference_selected_peak_to_ppm(&mut self, peak_idx: usize, target_ppm: f64) {
+        let Some(obs_ppm) = self.picked_peaks.get(peak_idx).map(|p| p.ppm) else {
+            return;
+        };
+        if !target_ppm.is_finite() {
+            return;
+        }
+        let Some(ref_i) = self.ensure_active_raw_spec() else {
+            return;
+        };
+        let delta = target_ppm - obs_ppm;
+        if let Some(ref mut att) = self.traces[ref_i].raw_spec {
+            let _ = att.0.calibrate_reference_peak(obs_ppm, target_ppm);
+            let updated = att.0.clone();
+            self.traces[ref_i].sync_from_spectrum1d(&updated);
+        }
+        for (i, tr) in self.traces.iter_mut().enumerate() {
+            if i != ref_i && !tr.locked {
+                if let Some(ref mut att) = tr.raw_spec {
+                    att.0.axis.first_ppm += delta;
+                    let updated = att.0.clone();
+                    tr.sync_from_spectrum1d(&updated);
+                } else {
+                    tr.shift_offset_ppm += delta;
+                    tr.generation = tr.generation.wrapping_add(1);
+                }
+            }
+        }
+        self.view_ppm_min += delta;
+        self.view_ppm_max += delta;
+        self.phase_pivot_ppm += delta;
+        if let Some(ref mut anc) = self.zoom_anchor_ppm {
+            *anc += delta;
+        }
+        for (lo, hi) in &mut self.zoom_history {
+            *lo += delta;
+            *hi += delta;
+        }
+        for roi in &mut self.roi_regions {
+            roi.ppm_min += delta;
+            roi.ppm_max += delta;
+        }
+        self.refresh_active_trace_peaks_and_multiplets();
+        self.selected_peak_idx = self
+            .picked_peaks
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (a.ppm - target_ppm)
+                    .abs()
+                    .total_cmp(&(b.ppm - target_ppm).abs())
+            })
+            .map(|(k, _)| k);
+        self.status_message = format!(
+            "Referenced peak {:.4} -> {:.4} ppm (Δδ = {:+.4} ppm).",
+            obs_ppm, target_ppm, delta
+        );
+    }
+
+    /// Format `self.picked_peaks` as a clean TSV table for clipboard export.
+    pub fn export_peaks_tsv(&self) -> String {
+        let mut out = String::from("index\tppm\thz\tintensity\tsnr\tfwhm_hz\tnote\n");
+        for (i, pk) in self.picked_peaks.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "{}\t{:.4}\t{:.2}\t{:.6e}\t{:.1}\t{:.2}\t{}",
+                i + 1,
+                pk.ppm,
+                pk.hz,
+                pk.height,
+                pk.snr,
+                pk.fwhm_hz,
+                pk.note
+            );
+        }
+        out
+    }
+
     /// Load real user 1D [`Spectrum1D`] traces into `Stack1dState` (automatically replacing any
     /// synthetic demo traces so user drops start on a clean slate, opening the 1D analysis drawer,
-    /// and running automatic multiplet & journal characterization on `1H` spectra).
+    /// and running automatic peak picking, multiplet & journal characterization).
     pub fn load_user_spectra(&mut self, spectra: Vec<Spectrum1D>) {
         if spectra.is_empty() {
             return;
@@ -2325,24 +2796,18 @@ impl Stack1dState {
         self.phc0_deg = 0.0;
         self.phc1_deg = 0.0;
         self.show_1d_analysis_drawer = true;
+        self.zoom_history.clear();
+        self.zoom_redo_stack.clear();
+        self.zoom_anchor_ppm = None;
         if self.traces.len() >= 2 && self.view_mode == Stack1dViewMode::SuperimposedOverlay {
             self.view_mode = Stack1dViewMode::StackedOffset;
+            self.selected_inspector_tab = InspectorTab1d::MultiTraceStack;
+        } else {
+            self.selected_inspector_tab = InspectorTab1d::Peaks;
         }
         self.fit_full_ppm_bounds();
         self.y_gain = 1.0;
-
-        let is_proton = self
-            .traces
-            .get(self.ref_trace_idx)
-            .and_then(|t| t.raw_spec.as_ref())
-            .is_some_and(|s| matches!(s.0.experiment, Experiment1DKind::Proton1D));
-        if is_proton {
-            self.analyze_active_trace_multiplets();
-        } else {
-            self.detected_multiplets.clear();
-            self.detected_multiplet_integrals.clear();
-            self.formatted_journal_report.clear();
-        }
+        self.refresh_active_trace_peaks_and_multiplets();
     }
 
     fn ensure_active_raw_spec(&mut self) -> Option<usize> {
@@ -2354,8 +2819,8 @@ impl Stack1dState {
         if self.traces[idx].raw_spec.is_none() {
             let tr = &self.traces[idx];
             if tr.ppm.len() >= 2 {
-                let first = tr.ppm[0];
-                let last = *tr.ppm.last().unwrap_or(&first);
+                let first = tr.ppm[0] + tr.shift_offset_ppm;
+                let last = *tr.ppm.last().unwrap_or(&tr.ppm[0]) + tr.shift_offset_ppm;
                 let axis = AxisPpm::from_bounds("1H", tr.ppm.len(), first, last, 500.0);
                 let mut sp = Spectrum1D::new(
                     tr.label.clone(),
@@ -2375,6 +2840,13 @@ impl Stack1dState {
         Some(idx)
     }
 
+    fn current_pivot(&self) -> Pivot1D {
+        match self.phase_pivot_mode {
+            PivotMode1d::MaxPeak => Pivot1D::MaxPeak,
+            PivotMode1d::AtPpm => Pivot1D::Ppm(self.phase_pivot_ppm),
+        }
+    }
+
     /// Apply `(self.phc0_deg, self.phc1_deg)` relative to the stored `raw_spec` on the active reference trace.
     pub fn apply_live_phase_to_active_trace(&mut self) {
         let Some(idx) = self.ensure_active_raw_spec() else {
@@ -2382,11 +2854,30 @@ impl Stack1dState {
         };
         let ph0 = self.phc0_deg;
         let ph1 = self.phc1_deg;
+        let piv = self.current_pivot();
         if let Some(ref att) = self.traces[idx].raw_spec {
             let mut phased = att.0.clone();
-            apply_phase_1d(&mut phased, ph0, ph1, Pivot1D::MaxPeak);
+            apply_phase_1d(&mut phased, ph0, ph1, piv);
             self.traces[idx].sync_from_spectrum1d(&phased);
         }
+    }
+
+    /// Commit live `(phc0_deg, phc1_deg)` permanently into `raw_spec` and refresh peaks/multiplets.
+    pub fn commit_live_phase_active_trace(&mut self) {
+        let Some(idx) = self.ensure_active_raw_spec() else {
+            return;
+        };
+        let ph0 = self.phc0_deg;
+        let ph1 = self.phc1_deg;
+        let piv = self.current_pivot();
+        if let Some(ref mut att) = self.traces[idx].raw_spec {
+            apply_phase_1d(&mut att.0, ph0, ph1, piv);
+            let updated = att.0.clone();
+            self.traces[idx].sync_from_spectrum1d(&updated);
+            self.phc0_deg = 0.0;
+            self.phc1_deg = 0.0;
+        }
+        self.refresh_active_trace_peaks_and_multiplets();
     }
 
     /// Run minimum-entropy automatic phase correction on the active reference trace and commit it.
@@ -2394,42 +2885,152 @@ impl Stack1dState {
         let Some(idx) = self.ensure_active_raw_spec() else {
             return;
         };
+        let mut msg = String::new();
         if let Some(ref mut att) = self.traces[idx].raw_spec {
             let res = auto_phase_and_apply_1d(&mut att.0, &AutoPhase1DConfig::default());
             let updated = att.0.clone();
             self.traces[idx].sync_from_spectrum1d(&updated);
             self.phc0_deg = 0.0;
             self.phc1_deg = 0.0;
-            self.status_message = format!(
+            msg = format!(
                 "Auto-phased '{}' (ΔPHC0 = {:.1}°, ΔPHC1 = {:.1}°).",
                 self.traces[idx].label, res.phc0_deg, res.phc1_deg
             );
         }
+        self.refresh_active_trace_peaks_and_multiplets();
+        if !msg.is_empty() {
+            self.status_message = msg;
+        }
     }
 
-    /// Run Whittaker penalized-least-squares baseline flattening on the active reference trace.
+    /// Run automatic baseline flattening (`Whittaker`, `AsymmetricWhittaker`, or `Bernstein`) on the active trace.
     pub fn baseline_correct_active_trace(&mut self) {
         let Some(idx) = self.ensure_active_raw_spec() else {
             return;
         };
         let ph0 = self.phc0_deg;
         let ph1 = self.phc1_deg;
+        let piv = self.current_pivot();
+        let lambda = 10.0_f64.powf(self.baseline_lambda_log10.clamp(2.0, 9.0));
+        let method = match self.baseline_model_choice {
+            BaselineModelChoice1d::Whittaker => BaselineMethod1D::Whittaker { lambda },
+            BaselineModelChoice1d::AsymmetricWhittaker => BaselineMethod1D::AsymmetricWhittaker {
+                lambda,
+                asymmetry_p: 0.002,
+            },
+            BaselineModelChoice1d::Bernstein => BaselineMethod1D::Bernstein {
+                degree: self.baseline_bernstein_deg.clamp(2, 12),
+            },
+        };
+        let model_lbl = self.baseline_model_choice.label();
+        let mut lbl_trace = String::new();
         if let Some(ref mut att) = self.traces[idx].raw_spec {
             if ph0.abs() > 1e-6 || ph1.abs() > 1e-6 {
-                apply_phase_1d(&mut att.0, ph0, ph1, Pivot1D::MaxPeak);
+                apply_phase_1d(&mut att.0, ph0, ph1, piv);
                 self.phc0_deg = 0.0;
                 self.phc1_deg = 0.0;
             }
-            let _ = correct_baseline_1d(&mut att.0, &BaselineConfig1D::default());
+            let cfg = BaselineConfig1D {
+                method,
+                ..BaselineConfig1D::default()
+            };
+            let _ = correct_baseline_1d(&mut att.0, &cfg);
             if att.0.imag.is_some() {
                 hilbert_reconstruct_imaginary_1d(&mut att.0);
             }
             let updated = att.0.clone();
             self.traces[idx].sync_from_spectrum1d(&updated);
-            self.status_message = format!(
-                "Applied Whittaker baseline correction to '{}'.",
-                self.traces[idx].label
-            );
+            lbl_trace = self.traces[idx].label.clone();
+        }
+        self.refresh_active_trace_peaks_and_multiplets();
+        if !lbl_trace.is_empty() {
+            self.status_message =
+                format!("Applied {model_lbl} baseline correction to '{lbl_trace}'.");
+        }
+    }
+
+    /// Reprocess active trace via causal pseudo-FID reconstruction, exponential line broadening (`reprocess_lb_hz`),
+    /// and optional zero-filling (`reprocess_zf_factor`).
+    pub fn reprocess_active_trace_lb_zf(&mut self) {
+        let Some(idx) = self.ensure_active_raw_spec() else {
+            return;
+        };
+        let lb = self.reprocess_lb_hz.clamp(0.0, 30.0);
+        let zf = self.reprocess_zf_factor.clamp(1, 4);
+        let mut msg = String::new();
+        if let Some(ref mut att) = self.traces[idx].raw_spec {
+            let n = att.0.len();
+            if n >= 8 {
+                let half = n / 2;
+                let mut work = vec![[0.0, 0.0]; n];
+                for (m, dst) in work.iter_mut().enumerate() {
+                    let j = (half + n - (m % n)) % n;
+                    *dst = [att.0.real[j], 0.0];
+                }
+                fft_arbitrary_in_place(&mut work, true);
+                if n.is_multiple_of(2) {
+                    for c in work.iter_mut().take(half).skip(1) {
+                        c[0] *= 2.0;
+                        c[1] *= 2.0;
+                    }
+                    for c in work.iter_mut().skip(half + 1) {
+                        *c = [0.0, 0.0];
+                    }
+                } else {
+                    for c in work.iter_mut().take(half + 1).skip(1) {
+                        c[0] *= 2.0;
+                        c[1] *= 2.0;
+                    }
+                    for c in work.iter_mut().skip(half + 1) {
+                        *c = [0.0, 0.0];
+                    }
+                }
+                let sw_hz = ((n as f64) * att.0.bin_width_hz()).max(1.0);
+                let dt = 1.0 / sw_hz;
+                if lb > 0.0 {
+                    for (k, c) in work.iter_mut().enumerate().take(half + 1) {
+                        let w = (-PI * lb * (k as f64) * dt).exp();
+                        c[0] *= w;
+                        c[1] *= w;
+                    }
+                }
+                let n_zf = (n * zf).min(131_072).max(n);
+                let mut work_zf = vec![[0.0, 0.0]; n_zf];
+                let copy_len = (half + 1).min(n_zf);
+                work_zf[..copy_len].copy_from_slice(&work[..copy_len]);
+                fft_arbitrary_in_place(&mut work_zf, false);
+
+                let half_zf = n_zf / 2;
+                let mut real = Vec::with_capacity(n_zf);
+                let mut imag = Vec::with_capacity(n_zf);
+                for j in 0..n_zf {
+                    let m = (half_zf + n_zf - (j % n_zf)) % n_zf;
+                    real.push(work_zf[m][0]);
+                    imag.push(work_zf[m][1]);
+                }
+                let first_ppm = att.0.axis.first_ppm;
+                let last_ppm = att.0.ppm_at(n - 1);
+                let new_axis = AxisPpm::from_bounds(
+                    &att.0.axis.label,
+                    n_zf,
+                    first_ppm,
+                    last_ppm,
+                    att.0.axis.obs_mhz,
+                );
+                att.0.axis = new_axis;
+                att.0.real = real;
+                att.0.imag = Some(imag);
+                let updated = att.0.clone();
+                self.traces[idx].sync_from_spectrum1d(&updated);
+                msg = format!(
+                    "Applied LB = {:.2} Hz, ZF = {}× ({} pts) to '{}'.",
+                    lb, zf, n_zf, self.traces[idx].label
+                );
+            }
+        }
+        self.refresh_active_trace_peaks_and_multiplets();
+        if !msg.is_empty() {
+            self.status_message = msg;
         }
     }
 
@@ -2439,61 +3040,163 @@ impl Stack1dState {
             return;
         };
         let solv = self.solvent_choice.trim().to_string();
+        let mut ok_delta = None;
+        let mut err_msg = None;
         if let Some(ref mut att) = self.traces[idx].raw_spec {
             match auto_calibrate_solvent_1d(&mut att.0, &solv, 0.35) {
                 Ok(delta_ppm) => {
                     att.0.solvent = Some(solv.clone());
                     let updated = att.0.clone();
                     self.traces[idx].sync_from_spectrum1d(&updated);
-                    self.fit_full_ppm_bounds();
-                    self.status_message = format!(
-                        "Calibrated '{}' to {} residual peak (Δδ = {:+.4} ppm).",
-                        self.traces[idx].label, solv, delta_ppm
-                    );
+                    ok_delta = Some(delta_ppm);
                 }
                 Err(e) => {
-                    self.status_message = format!("Solvent calibration note: {e}");
+                    err_msg = Some(e);
                 }
             }
         }
+        if let Some(delta_ppm) = ok_delta {
+            self.fit_full_ppm_bounds();
+            self.refresh_active_trace_peaks_and_multiplets();
+            self.status_message = format!(
+                "Calibrated '{}' to {} residual peak (Δδ = {:+.4} ppm).",
+                self.traces[idx].label, solv, delta_ppm
+            );
+        } else if let Some(e) = err_msg {
+            self.status_message = format!("Solvent calibration note: {e}");
+        }
     }
 
-    /// Pick 1D peaks, cluster into multiplets, deconvolve coupling trees (`Hoye`), and format the
-    /// publication characterization line (`ACS` / `JOC` / `RSC` / `Nature`).
-    pub fn analyze_active_trace_multiplets(&mut self) {
+    /// Pick 1D peaks on the active reference trace, annotate residual solvents & trace laboratory
+    /// impurities, cluster `1H` peaks into multiplets (`Hoye`), and format the journal report.
+    pub fn refresh_active_trace_peaks_and_multiplets(&mut self) {
         let Some(idx) = self.ensure_active_raw_spec() else {
+            self.picked_peaks.clear();
+            self.detected_multiplets.clear();
+            self.detected_multiplet_integrals.clear();
+            self.formatted_journal_report.clear();
             return;
         };
         let ph0 = self.phc0_deg;
         let ph1 = self.phc1_deg;
+        let piv = self.current_pivot();
         let Some(ref att) = self.traces[idx].raw_spec else {
             return;
         };
         let mut working = att.0.clone();
         if ph0.abs() > 1e-6 || ph1.abs() > 1e-6 {
-            apply_phase_1d(&mut working, ph0, ph1, Pivot1D::MaxPeak);
+            apply_phase_1d(&mut working, ph0, ph1, piv);
         }
 
         let mhz = working.axis.obs_mhz.max(60.0);
-        let picked = pick_peaks_1d(&working, &PeakPickConfig1D::default());
-        if picked.is_empty() {
+        let nuc = working.experiment.nucleus();
+        let solv_name = working
+            .solvent
+            .clone()
+            .unwrap_or_else(|| self.solvent_choice.clone());
+        let max_abs = working
+            .real
+            .iter()
+            .fold(0.0_f64, |m, &v| m.max(v.abs()))
+            .max(1e-12);
+        let est_sigma = estimate_noise_sigma_1d(&working)
+            .max(max_abs * 1e-4)
+            .max(1e-12);
+        self.estimated_noise_sigma = est_sigma;
+
+        let pcfg = PeakPickConfig1D {
+            min_snr: self.picker_min_snr.clamp(1.5, 5000.0),
+            min_rel_height: 0.0005,
+            ..PeakPickConfig1D::default()
+        };
+        let mut raw_peaks = pick_peaks_1d(&working, &pcfg);
+        if raw_peaks.len() > 256 {
+            raw_peaks.sort_by(|a, b| b.height.abs().total_cmp(&a.height.abs()));
+            raw_peaks.truncate(256);
+        }
+        raw_peaks.sort_by(|a, b| b.ppm.total_cmp(&a.ppm));
+
+        let solv_tol = match nuc {
+            Nucleus1D::H1 => 0.018,
+            _ => 0.40,
+        };
+        let solv_entry = lookup_deuterated_solvent(&solv_name);
+        let solv_refs = solvent_residual_shifts(&solv_name, &nuc).unwrap_or(&[]);
+
+        let mut entries = Vec::with_capacity(raw_peaks.len());
+        for pk in &raw_peaks {
+            let mut note = String::new();
+            let mut is_solv = false;
+            if pk.ppm.abs() <= solv_tol {
+                note = "TMS / DSS".to_string();
+                is_solv = true;
+            } else if let Some(r) = solv_refs
+                .iter()
+                .find(|r| (pk.ppm - r.ppm).abs() <= solv_tol)
+            {
+                note = format!("{} ({})", solv_name, r.site_label);
+                is_solv = true;
+            } else if nuc == Nucleus1D::H1
+                && solv_entry.is_some_and(|se| (pk.ppm - se.h2o_h1_ppm).abs() <= 0.025)
+            {
+                note = "H2O / HDO".to_string();
+                is_solv = true;
+            } else if let Some(imp) =
+                match_trace_impurities(&solv_name, &nuc, pk.ppm, 0.012).first()
+            {
+                // Annotate possible trace laboratory impurities in the Peak Table without excluding
+                // genuine analyte aliphatic/aromatic multiplets from multiplet clustering.
+                note = format!("Possible {} ({})", imp.entry.compound, imp.entry.site);
+            }
+            let snr_eff = if pk.snr.is_finite() && pk.snr > 0.0 {
+                pk.snr.min(99_999.0)
+            } else {
+                (pk.height.abs() / est_sigma).min(99_999.0)
+            };
+            entries.push(Peak1dEntry {
+                ppm: pk.ppm,
+                hz: pk.ppm * mhz,
+                height: pk.height,
+                snr: snr_eff,
+                fwhm_hz: pk.est_fwhm_hz.max(0.5),
+                note,
+                is_solvent_or_impurity: is_solv,
+            });
+        }
+        self.picked_peaks = entries;
+        if self
+            .selected_peak_idx
+            .is_some_and(|s| s >= self.picked_peaks.len())
+        {
+            self.selected_peak_idx = None;
+        }
+
+        if raw_peaks.is_empty() {
             self.detected_multiplets.clear();
             self.detected_multiplet_integrals.clear();
             self.formatted_journal_report.clear();
-            self.status_message =
-                "No 1D peaks above SNR threshold found on active trace.".to_string();
             return;
         }
 
-        // Sort picked peaks descending in ppm and group peaks separated by <= 28 Hz into multiplet clusters.
-        let mut sorted = picked;
-        sorted.sort_by(|a, b| b.ppm.total_cmp(&a.ppm));
-        let gap_ppm = (28.0 / mhz).max(0.035);
+        // Cluster positive non-TMS/non-solvent peaks (falling back to all positive peaks if all matched)
+        let non_solv_pos: Vec<_> = raw_peaks
+            .iter()
+            .zip(self.picked_peaks.iter())
+            .filter(|(pk, ent)| pk.height > 0.0 && !ent.is_solvent_or_impurity)
+            .map(|(pk, _)| *pk)
+            .collect();
+        let cluster_source: Vec<_> = if non_solv_pos.is_empty() {
+            raw_peaks.into_iter().filter(|pk| pk.height > 0.0).collect()
+        } else {
+            non_solv_pos
+        };
+
+        let gap_ppm = match nuc {
+            Nucleus1D::H1 => (28.0 / mhz).max(0.035),
+            _ => (6.0 / mhz).max(0.02),
+        };
         let mut clusters: Vec<Vec<MultipletSubPeak>> = Vec::new();
-        for pk in sorted {
-            if pk.height <= 0.0 {
-                continue;
-            }
+        for pk in cluster_source {
             let sub =
                 MultipletSubPeak::new(pk.ppm, pk.height).with_fwhm_hz(pk.est_fwhm_hz.max(0.8));
             if let Some(last_cluster) = clusters.last_mut() {
@@ -2533,12 +3236,30 @@ impl Stack1dState {
 
         self.detected_multiplets = analyses;
         self.detected_multiplet_integrals = norm_integrals;
+        if self
+            .selected_multiplet_idx
+            .is_some_and(|s| s >= self.detected_multiplets.len())
+        {
+            self.selected_multiplet_idx = None;
+        }
         self.reformat_journal_report();
-        self.status_message = format!(
-            "Analyzed {} multiplet(s) on '{}'.",
-            self.detected_multiplets.len(),
-            self.traces[idx].label
-        );
+    }
+
+    /// Pick 1D peaks, cluster into multiplets, deconvolve coupling trees (`Hoye`), and format the
+    /// publication characterization line (`ACS` / `JOC` / `RSC` / `Nature`).
+    pub fn analyze_active_trace_multiplets(&mut self) {
+        self.refresh_active_trace_peaks_and_multiplets();
+        if self.picked_peaks.is_empty() {
+            self.status_message =
+                "No 1D peaks above SNR threshold found on active trace.".to_string();
+        } else if let Some(tr) = self.traces.get(self.safe_ref_trace_idx()) {
+            self.status_message = format!(
+                "Picked {} peak(s) and analyzed {} multiplet(s) on '{}'.",
+                self.picked_peaks.len(),
+                self.detected_multiplets.len(),
+                tr.label
+            );
+        }
     }
 
     /// Regenerate `self.formatted_journal_report` from `self.detected_multiplets` under `self.journal_style`.
@@ -2630,14 +3351,16 @@ impl Stack1dState {
             })
             .collect()
     }
-    /// Create a fresh [`Stack1dState`] pre-populated with `traces` and fitted to their chemical
-    /// shift envelope.
+
+    /// Create a fresh [`Stack1dState`] pre-populated with `traces`, fitted to their chemical
+    /// shift envelope, and auto-picked for immediate peak & multiplet inspection.
     pub fn with_traces(traces: Vec<Trace1d>) -> Self {
         let mut s = Self {
             traces,
             ..Self::default()
         };
         s.fit_full_ppm_bounds();
+        s.refresh_active_trace_peaks_and_multiplets();
         s
     }
 
@@ -2650,6 +3373,7 @@ impl Stack1dState {
         self.traces.push(trace);
         if was_empty {
             self.fit_full_ppm_bounds();
+            self.refresh_active_trace_peaks_and_multiplets();
         }
     }
 
@@ -2670,7 +3394,7 @@ impl Stack1dState {
         }
     }
 
-    /// Reset `(view_ppm_min, view_ppm_max)` and `y_gain` to fit all loaded traces.
+    /// Reset `(view_ppm_min, view_ppm_max)`, `y_gain`, and `baseline_y_frac` to fit all loaded traces.
     pub fn fit_full_ppm_bounds(&mut self) {
         if let Some((lo, hi)) = self.global_ppm_bounds() {
             let pad = 0.015 * (hi - lo).max(0.1);
@@ -2678,6 +3402,8 @@ impl Stack1dState {
             self.view_ppm_max = hi + pad;
         }
         self.y_gain = 1.0;
+        self.baseline_y_frac = 0.82;
+        self.zoom_anchor_ppm = None;
     }
 
     #[inline]
@@ -2772,9 +3498,14 @@ impl Stack1dState {
 /// Render the self-contained Interactive Multi-Spectrum 1D Comparison, Overlay, Stack, Difference
 /// & Kinetics Array Studio inside `ui`.
 pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
-    // 1. Primary Mode & Action Toolbar
+    // Keep legacy `draw_roi_drag_mode` synced if set programmatically
+    if state.draw_roi_drag_mode && state.tool_mode == ToolMode1d::Zoom {
+        state.tool_mode = ToolMode1d::IntegrateRoi;
+    }
+
+    // 1. Primary File, View-Mode & Demo Toolbar
     ui.horizontal_wrapped(|ui| {
-        ui.strong("1D Array Studio");
+        ui.strong("1D NMR Studio");
         ui.separator();
         if ui
             .button("📂 Open Bruker Folder")
@@ -2790,7 +3521,9 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
         }
         if ui
             .button("📄 Open 1D Files")
-            .on_hover_text("Open .jdx, .zip/.tar.gz Bruker archive, .tsv, or 1r + procs / fid + acqus")
+            .on_hover_text(
+                "Open .jdx, .ucsf/.usf, .ft1, .zip/.tar.gz Bruker archive, .tsv, or 1r+procs / fid+acqus",
+            )
             .clicked()
         {
             #[cfg(target_arch = "wasm32")]
@@ -2800,26 +3533,43 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
                 state.show_native_open_bar = !state.show_native_open_bar;
             }
         }
-        if !state.traces.is_empty() && ui.button("🗑 Clear").on_hover_text("Clear all 1D traces").clicked() {
+        if !state.traces.is_empty()
+            && ui
+                .button("🗑 Clear")
+                .on_hover_text("Clear all 1D traces")
+                .clicked()
+        {
             state.traces.clear();
             state.roi_regions.clear();
+            state.picked_peaks.clear();
             state.detected_multiplets.clear();
             state.detected_multiplet_integrals.clear();
             state.formatted_journal_report.clear();
+            state.zoom_history.clear();
+            state.zoom_redo_stack.clear();
+            state.zoom_anchor_ppm = None;
             state.status_message = "Cleared 1D traces.".to_string();
         }
         ui.separator();
         for mode in Stack1dViewMode::ALL {
-            ui.selectable_value(&mut state.view_mode, mode, mode.label());
+            if ui
+                .selectable_value(&mut state.view_mode, mode, mode.label())
+                .changed()
+                && mode != Stack1dViewMode::SuperimposedOverlay
+            {
+                state.selected_inspector_tab = InspectorTab1d::MultiTraceStack;
+                state.show_1d_analysis_drawer = true;
+            }
         }
-        ui.separator();
 
-        if !state.traces.is_empty() {
+        if !state.traces.is_empty() && state.traces.len() > 1 {
+            ui.separator();
             let safe_ref = state.safe_ref_trace_idx();
+            let prev_ref = state.ref_trace_idx;
             state.ref_trace_idx = safe_ref;
             egui::ComboBox::from_id_salt("stack1d_ref_trace_combo")
                 .selected_text(format!("Ref: {}", state.traces[safe_ref].label))
-                .width(155.0)
+                .width(145.0)
                 .show_ui(ui, |ui| {
                     for (idx, tr) in state.traces.iter().enumerate() {
                         ui.selectable_value(
@@ -2829,29 +3579,10 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
                         );
                     }
                 });
+            if state.ref_trace_idx != prev_ref {
+                state.refresh_active_trace_peaks_and_multiplets();
+            }
         }
-
-        if ui
-            .button("Reset View")
-            .on_hover_text("Fit chemical-shift bounds and reset vertical gain (or double-click plot)")
-            .clicked()
-        {
-            state.fit_full_ppm_bounds();
-        }
-
-        ui.label("Gain:");
-        ui.add(
-            egui::DragValue::new(&mut state.y_gain)
-                .range(0.05..=250.0)
-                .speed(0.05)
-                .fixed_decimals(2)
-                .suffix("×"),
-        );
-
-        ui.checkbox(&mut state.draw_roi_drag_mode, "Drag ROI")
-            .on_hover_text("Drag horizontally on the spectrum (or hold Shift + Drag) to integrate a [ppm_min, ppm_max] region");
-
-        ui.checkbox(&mut state.show_integral_curves, "Integrals");
 
         ui.separator();
         if ui
@@ -2864,7 +3595,10 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
             state.roi_regions = rois;
             state.covariate_kind = CovariateKind::TimeMinutes;
             state.ref_trace_idx = 0;
+            state.zoom_history.clear();
+            state.zoom_redo_stack.clear();
             state.fit_full_ppm_bounds();
+            state.refresh_active_trace_peaks_and_multiplets();
             state.status_message = "Loaded 8-trace reaction kinetics 1D array.".to_string();
         }
         if ui
@@ -2878,6 +3612,7 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
             state.covariate_kind = CovariateKind::TimeSeconds;
             state.ref_trace_idx = 0;
             state.view_mode = Stack1dViewMode::DifferenceSpectrum;
+            state.selected_inspector_tab = InspectorTab1d::MultiTraceStack;
             state.diff_ref_ppm_min = 1.05;
             state.diff_ref_ppm_max = 1.35;
             state.diff_alpha_mode = DifferenceAlphaMode::LeastSquaresRegion {
@@ -2885,28 +3620,17 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
                 ppm_max: 1.35,
                 fit_intercept: false,
             };
+            state.zoom_history.clear();
+            state.zoom_redo_stack.clear();
             state.fit_full_ppm_bounds();
             state.y_gain = 3.2;
+            state.refresh_active_trace_peaks_and_multiplets();
             state.status_message =
                 "Loaded 5-trace STD-NMR difference array (OLS α matched on [1.05, 1.35] ppm)."
                     .to_string();
         }
 
         if !state.traces.is_empty() {
-            if ui
-                .button("Copy ROI TSV")
-                .on_hover_text("Compute multi-trace ROI matrix and copy TSV to clipboard")
-                .clicked()
-            {
-                let tsv = state.export_roi_tsv();
-                ui.ctx().copy_text(tsv);
-                state.show_tsv_preview = true;
-                state.status_message = format!(
-                    "Copied {}×{} ROI matrix TSV to clipboard.",
-                    state.traces.len(),
-                    state.roi_regions.len()
-                );
-            }
             if ui
                 .button("Copy SVG")
                 .on_hover_text("Export vector SVG of the current 1D viewport to clipboard")
@@ -2920,18 +3644,108 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
             if state.traces.len() >= 3
                 && ui
                     .button("🧪 Send to Metabolomics")
-                    .on_hover_text("Transfer loaded 1D spectra directly into Metabolomics PCA / OPLS-DA / STOCSY Studio")
+                    .on_hover_text(
+                        "Transfer loaded 1D spectra directly into Metabolomics PCA / OPLS-DA / STOCSY Studio",
+                    )
                     .clicked()
             {
                 state.pending_send_to_metabolomics = true;
             }
-            ui.toggle_value(
-                &mut state.show_1d_analysis_drawer,
-                "🔬 Phase & Multiplets",
-            )
-            .on_hover_text("Toggle interactive 1D phase, Whittaker baseline, solvent calibration & ACS/JOC multiplet report");
         }
     });
+
+    // 2. Spectroscopist Navigation, Zoom History & Vertical Intensity (`y_gain`) Bar
+    if !state.traces.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            for tm in ToolMode1d::ALL {
+                if ui
+                    .selectable_value(&mut state.tool_mode, tm, tm.label())
+                    .on_hover_text(tm.tooltip())
+                    .changed()
+                {
+                    state.draw_roi_drag_mode = tm == ToolMode1d::IntegrateRoi;
+                    if tm != ToolMode1d::Zoom {
+                        state.cancel_zoom_anchor();
+                    }
+                }
+            }
+            ui.separator();
+
+            if ui
+                .add_enabled(!state.zoom_history.is_empty(), egui::Button::new("⬅ Undo"))
+                .on_hover_text("Undo last horizontal zoom (or press Backspace / Z over plot)")
+                .clicked()
+            {
+                state.undo_zoom();
+            }
+            if ui
+                .add_enabled(
+                    !state.zoom_redo_stack.is_empty(),
+                    egui::Button::new("➡ Redo"),
+                )
+                .on_hover_text("Redo horizontal zoom")
+                .clicked()
+            {
+                state.redo_zoom();
+            }
+            if ui
+                .button("Full X")
+                .on_hover_text("Reset chemical-shift axis to full bounds while keeping vertical gain")
+                .clicked()
+            {
+                state.fit_full_x_only();
+            }
+            if ui
+                .button("Fit Y")
+                .on_hover_text("Auto-scale vertical intensity so the tallest peak in view sits at ~75% height")
+                .clicked()
+            {
+                state.fit_y_to_visible_window();
+            }
+            if ui
+                .button("Full View")
+                .on_hover_text("Reset full ppm bounds, vertical gain = 1×, and baseline (Double-Click or press F over plot)")
+                .clicked()
+            {
+                state.fit_full_ppm_bounds();
+            }
+
+            ui.separator();
+            ui.label("Intensity:");
+            ui.add(
+                egui::DragValue::new(&mut state.y_gain)
+                    .range(0.001..=100_000.0)
+                    .speed(0.08)
+                    .max_decimals(3)
+                    .suffix("×"),
+            )
+            .on_hover_text("Vertical peak gain (Scroll wheel over spectrum scales up/down; Shift+Scroll moves baseline)");
+            if ui
+                .button("×2")
+                .on_hover_text("Double vertical peak height (×2)")
+                .clicked()
+            {
+                state.y_gain = (state.y_gain * 2.0).clamp(0.001, 100_000.0);
+            }
+            if ui
+                .button("÷2")
+                .on_hover_text("Halve vertical peak height (÷2)")
+                .clicked()
+            {
+                state.y_gain = (state.y_gain * 0.5).clamp(0.001, 100_000.0);
+            }
+
+            ui.separator();
+            ui.toggle_value(&mut state.show_peak_labels, "🏷 Peaks")
+                .on_hover_text("Show picked peak chemical-shift labels on the spectrum");
+            ui.toggle_value(&mut state.show_j_trees, "🌳 J-Trees")
+                .on_hover_text("Show multiplet splitting J-trees & clickable multiplet header pills");
+            ui.toggle_value(&mut state.show_integral_curves, "∫ Integrals")
+                .on_hover_text("Show cumulative integral S-curves & normalized proton counts");
+            ui.toggle_value(&mut state.show_threshold_bar, "📏 Threshold")
+                .on_hover_text("Show draggable horizontal peak-picking SNR threshold bar on the plot");
+        });
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     if state.show_native_open_bar {
@@ -2939,7 +3753,7 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
             ui.label(egui::RichText::new("1D Folder / File Path:").strong());
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut state.native_open_path_input)
-                    .hint_text("Enter Bruker folder, pdata/1, 1r, fid, .jdx, or .zip path (or drag & drop onto window)…")
+                    .hint_text("Enter Bruker folder, pdata/1, 1r, fid, .jdx, .ucsf/.usf, or .zip path (or drag & drop onto window)…")
                     .desired_width(440.0),
             );
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -2955,156 +3769,634 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
         });
     }
 
-    if state.show_1d_analysis_drawer && !state.traces.is_empty() {
-        egui::Frame::group(ui.style())
-            .fill(egui::Color32::from_rgb(16, 23, 36))
-            .stroke(egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgb(56, 189, 248),
-            ))
-            .inner_margin(egui::Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong("🔬 1D Processing & Multiplet Analysis");
-                    ui.separator();
-                    let p0_changed = ui
-                        .add(
-                            egui::Slider::new(&mut state.phc0_deg, -180.0..=180.0)
-                                .text("PHC0 (°)")
-                                .fixed_decimals(1),
-                        )
-                        .changed();
-                    let p1_changed = ui
-                        .add(
-                            egui::Slider::new(&mut state.phc1_deg, -180.0..=180.0)
-                                .text("PHC1 (°)")
-                                .fixed_decimals(1),
-                        )
-                        .changed();
-                    if p0_changed || p1_changed {
-                        state.apply_live_phase_to_active_trace();
-                    }
-                    if ui.button("Auto-Phase").clicked() {
-                        state.auto_phase_active_trace();
-                    }
-                    if ui.button("Whittaker Baseline").clicked() {
-                        state.baseline_correct_active_trace();
-                    }
-                    egui::ComboBox::from_id_salt("stack1d_solvent_combo")
-                        .selected_text(format!("Solvent: {}", state.solvent_choice))
-                        .width(120.0)
-                        .show_ui(ui, |ui| {
-                            for s in ["CDCl3", "DMSO-d6", "D2O", "CD3OD", "Acetone-d6", "C6D6"] {
-                                ui.selectable_value(&mut state.solvent_choice, s.to_string(), s);
-                            }
-                        });
-                    if ui.button("Calibrate δ").clicked() {
-                        state.calibrate_solvent_active_trace();
-                    }
-                });
-
-                ui.add_space(3.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("🔍 Analyze Multiplets").clicked() {
-                        state.analyze_active_trace_multiplets();
-                    }
-                    ui.label("Total H:");
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut state.target_total_protons)
-                                .range(0.0..=500.0)
-                                .speed(0.5)
-                                .fixed_decimals(1),
-                        )
-                        .changed()
-                    {
-                        state.analyze_active_trace_multiplets();
-                    }
-                    let mut style_changed = false;
-                    for (st, lbl) in [
-                        (PublicationStyle::Acs, "ACS"),
-                        (PublicationStyle::Joc, "JOC"),
-                        (PublicationStyle::Rsc, "RSC"),
-                        (PublicationStyle::Nature, "Nature"),
-                    ] {
-                        if ui
-                            .selectable_value(&mut state.journal_style, st, lbl)
-                            .changed()
-                        {
-                            style_changed = true;
-                        }
-                    }
-                    if style_changed {
-                        state.reformat_journal_report();
-                    }
-                    if !state.formatted_journal_report.is_empty()
-                        && ui.button("📋 Copy Journal Report").clicked()
-                    {
-                        ui.ctx().copy_text(state.formatted_journal_report.clone());
-                        state.status_message =
-                            "Copied journal NMR characterization report to clipboard.".to_string();
-                    }
-                });
-
-                if !state.formatted_journal_report.is_empty() {
-                    ui.add_space(2.0);
-                    ui.monospace(
-                        egui::RichText::new(&state.formatted_journal_report)
-                            .size(11.5)
-                            .color(egui::Color32::from_rgb(185, 245, 215)),
-                    );
-                }
-
-                if !state.detected_multiplets.is_empty() {
-                    ui.add_space(3.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("stack1d_multiplet_table_scroll")
-                        .max_height(115.0)
-                        .show(ui, |ui| {
-                            egui::Grid::new("stack1d_multiplet_grid")
-                                .striped(true)
-                                .spacing([14.0, 3.0])
-                                .show(ui, |ui| {
-                                    ui.strong("δ (ppm)");
-                                    ui.strong("Mult");
-                                    ui.strong("J (Hz)");
-                                    ui.strong("Integral (H)");
-                                    ui.strong("Peaks");
-                                    ui.end_row();
-                                    for (mi, m) in state.detected_multiplets.iter().enumerate() {
-                                        ui.monospace(format!("{:.2}", m.center_ppm));
-                                        ui.monospace(m.class.as_str());
-                                        let js = m
-                                            .j_values_hz()
-                                            .into_iter()
-                                            .map(|j| format!("{j:.1}"))
-                                            .collect::<Vec<_>>()
-                                            .join(", ");
-                                        ui.monospace(if js.is_empty() {
-                                            "-".to_string()
-                                        } else {
-                                            js
-                                        });
-                                        let integ = state
-                                            .detected_multiplet_integrals
-                                            .get(mi)
-                                            .copied()
-                                            .unwrap_or(0.0);
-                                        let h_txt = match m.proton_count {
-                                            Some(pc) => format!("{integ:.2} ({pc}H)"),
-                                            None => format!("{integ:.2e}"),
-                                        };
-                                        ui.monospace(h_txt);
-                                        ui.monospace(format!("{}", m.peaks.len()));
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                }
-            });
+    if !state.status_message.is_empty() {
+        ui.label(
+            egui::RichText::new(&state.status_message)
+                .size(11.5)
+                .color(egui::Color32::from_rgb(125, 211, 252)),
+        );
     }
 
-    // 2. Contextual View-Mode Parameter Strip
+    if state.traces.is_empty() {
+        ui.add_space(10.0);
+        ui.label(
+            "No 1D traces loaded yet. Drop a Bruker folder / .zip / .jdx / .usf onto the window, or click 'Kinetics Demo' / 'STD Demo' above.",
+        );
+        return;
+    }
+
+    // Ensure picked peaks exist on first render if traces were populated directly into `state.traces`
+    if state.picked_peaks.is_empty() && state.detected_multiplets.is_empty() {
+        state.refresh_active_trace_peaks_and_multiplets();
+    }
+
+    // Keep `last_exported_tsv` synced when `show_tsv_preview` is enabled
+    if state.show_tsv_preview && !state.roi_regions.is_empty() {
+        state.last_exported_tsv = Some(state.evaluate_roi_matrix().to_tsv_string());
+    }
+
+    // 3. Interactive 1D NMR Canvas + Full-Spectrum Overview Minimap
+    paint_interactive_1d_canvas(ui, state);
+
+    // 4. Clean 4-Tab Analytical Bottom Workstation Dock
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        let pk_lbl = format!("📌 Peaks ({})", state.picked_peaks.len());
+        let mp_lbl = format!(
+            "🌳 Multiplets & Report ({})",
+            state.detected_multiplets.len()
+        );
+        let st_lbl = format!("📚 Multi-Trace Stack ({})", state.traces.len());
+        for (tab, label) in [
+            (InspectorTab1d::Peaks, pk_lbl.as_str()),
+            (InspectorTab1d::Multiplets, mp_lbl.as_str()),
+            (InspectorTab1d::PhaseBaseline, "🎛 Phase & Baseline"),
+            (InspectorTab1d::MultiTraceStack, st_lbl.as_str()),
+        ] {
+            if ui
+                .selectable_label(
+                    state.show_1d_analysis_drawer && state.selected_inspector_tab == tab,
+                    label,
+                )
+                .clicked()
+            {
+                if state.show_1d_analysis_drawer && state.selected_inspector_tab == tab {
+                    state.show_1d_analysis_drawer = false;
+                } else {
+                    state.selected_inspector_tab = tab;
+                    state.show_1d_analysis_drawer = true;
+                }
+            }
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let toggle_txt = if state.show_1d_analysis_drawer {
+                "▾ Collapse Dock"
+            } else {
+                "▸ Expand Dock"
+            };
+            if ui.small_button(toggle_txt).clicked() {
+                state.show_1d_analysis_drawer = !state.show_1d_analysis_drawer;
+            }
+        });
+    });
+
+    if !state.show_1d_analysis_drawer {
+        return;
+    }
+
+    egui::Frame::group(ui.style())
+        .fill(egui::Color32::from_rgb(15, 21, 32))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 58, 78)))
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| match state.selected_inspector_tab {
+            InspectorTab1d::Peaks => render_peaks_inspector_tab(ui, state),
+            InspectorTab1d::Multiplets => render_multiplets_inspector_tab(ui, state),
+            InspectorTab1d::PhaseBaseline => render_phase_baseline_inspector_tab(ui, state),
+            InspectorTab1d::MultiTraceStack => render_multitrace_stack_inspector_tab(ui, state),
+        });
+}
+
+fn render_peaks_inspector_tab(ui: &mut egui::Ui, state: &mut Stack1dState) {
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("Peak Picker:");
+        ui.label("Min SNR:");
+        if ui
+            .add(
+                egui::DragValue::new(&mut state.picker_min_snr)
+                    .range(1.5..=5000.0)
+                    .speed(0.2)
+                    .fixed_decimals(1),
+            )
+            .changed()
+        {
+            state.refresh_active_trace_peaks_and_multiplets();
+        }
+        if ui.button("🔄 Re-Pick Peaks").clicked() {
+            state.refresh_active_trace_peaks_and_multiplets();
+        }
+        ui.checkbox(&mut state.show_threshold_bar, "Drag Threshold Line");
+        ui.checkbox(&mut state.show_peak_labels, "Show Labels");
+        ui.checkbox(&mut state.peak_labels_in_hz, "Labels in Hz");
+        if !state.picked_peaks.is_empty() && ui.button("📋 Copy Peaks TSV").clicked() {
+            let tsv = state.export_peaks_tsv();
+            ui.ctx().copy_text(tsv);
+            state.status_message = format!(
+                "Copied {} picked peaks (TSV) to clipboard.",
+                state.picked_peaks.len()
+            );
+        }
+        ui.label(
+            egui::RichText::new("💡 Click any peak row to zoom & auto-scale vertical gain")
+                .weak()
+                .size(11.0),
+        );
+    });
+
+    // 1-Click Chemical Shift Referencing bar on selected peak
+    if let Some(sel_idx) = state.selected_peak_idx {
+        if let Some(sel_pk) = state.picked_peaks.get(sel_idx).cloned() {
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "🎯 Reference Peak #{} ({:.4} ppm) ->",
+                        sel_idx + 1,
+                        sel_pk.ppm
+                    ))
+                    .color(egui::Color32::from_rgb(125, 211, 252))
+                    .strong(),
+                );
+                let mut ref_target: Option<f64> = None;
+                let nuc = state.active_nucleus();
+                let presets: &[(&str, f64)] = match nuc {
+                    Nucleus1D::C13 => &[
+                        ("TMS (0.00)", 0.00),
+                        ("CDCl3 (77.16)", 77.16),
+                        ("DMSO-d6 (39.52)", 39.52),
+                        ("CD3OD (49.00)", 49.00),
+                        ("Acetone (29.84)", 29.84),
+                    ],
+                    _ => &[
+                        ("TMS (0.00)", 0.00),
+                        ("CDCl3 (7.26)", 7.26),
+                        ("DMSO-d6 (2.50)", 2.50),
+                        ("D2O (4.79)", 4.79),
+                        ("CD3OD (3.31)", 3.31),
+                    ],
+                };
+                for &(lbl, tgt) in presets {
+                    if ui.small_button(lbl).clicked() {
+                        ref_target = Some(tgt);
+                    }
+                }
+                ui.separator();
+                ui.label("Custom δ:");
+                ui.add(
+                    egui::DragValue::new(&mut state.custom_ref_target_ppm)
+                        .speed(0.01)
+                        .fixed_decimals(4),
+                );
+                if ui.small_button("Set δ").clicked() {
+                    ref_target = Some(state.custom_ref_target_ppm);
+                }
+                if let Some(tgt) = ref_target {
+                    state.reference_selected_peak_to_ppm(sel_idx, tgt);
+                }
+            });
+        }
+    }
+
+    if state.picked_peaks.is_empty() {
+        ui.label(
+            egui::RichText::new("No peaks above current SNR threshold. Lower 'Min SNR' or drag the Threshold line down.")
+                .weak(),
+        );
+        return;
+    }
+
+    let mut zoom_req: Option<usize> = None;
+    let mut delete_req: Option<usize> = None;
+    egui::ScrollArea::vertical()
+        .id_salt("stack1d_peaks_table_scroll")
+        .max_height(155.0)
+        .show(ui, |ui| {
+            egui::Grid::new("stack1d_peaks_grid")
+                .striped(true)
+                .spacing([14.0, 3.0])
+                .show(ui, |ui| {
+                    ui.strong("#");
+                    ui.strong("δ (ppm)");
+                    ui.strong("ν (Hz)");
+                    ui.strong("Intensity");
+                    ui.strong("SNR");
+                    ui.strong("FWHM (Hz)");
+                    ui.strong("Annotation / Solvent");
+                    ui.strong("");
+                    ui.end_row();
+
+                    for (i, pk) in state.picked_peaks.iter().enumerate() {
+                        let is_sel = state.selected_peak_idx == Some(i);
+                        let row_col = if is_sel {
+                            egui::Color32::from_rgb(56, 189, 248)
+                        } else if pk.is_solvent_or_impurity {
+                            egui::Color32::from_rgb(251, 191, 36)
+                        } else {
+                            egui::Color32::from_rgb(226, 232, 240)
+                        };
+                        if ui
+                            .selectable_label(is_sel, format!("{}", i + 1))
+                            .on_hover_text("Click to zoom to peak & auto-fit Y")
+                            .clicked()
+                        {
+                            zoom_req = Some(i);
+                        }
+                        if ui
+                            .selectable_label(
+                                is_sel,
+                                egui::RichText::new(format!("{:.4}", pk.ppm))
+                                    .monospace()
+                                    .color(row_col),
+                            )
+                            .on_hover_text("Click to zoom to peak & auto-fit Y")
+                            .clicked()
+                        {
+                            zoom_req = Some(i);
+                        }
+                        if ui
+                            .selectable_label(
+                                is_sel,
+                                egui::RichText::new(format!("{:.1}", pk.hz)).monospace(),
+                            )
+                            .clicked()
+                        {
+                            zoom_req = Some(i);
+                        }
+                        if ui
+                            .selectable_label(
+                                is_sel,
+                                egui::RichText::new(format!("{:.3e}", pk.height)).monospace(),
+                            )
+                            .clicked()
+                        {
+                            zoom_req = Some(i);
+                        }
+                        ui.monospace(format!("{:.1}", pk.snr));
+                        ui.monospace(format!("{:.2}", pk.fwhm_hz));
+                        ui.label(
+                            egui::RichText::new(if pk.note.is_empty() {
+                                "—"
+                            } else {
+                                pk.note.as_str()
+                            })
+                            .color(if pk.is_solvent_or_impurity {
+                                egui::Color32::from_rgb(251, 191, 36)
+                            } else {
+                                egui::Color32::from_rgb(148, 163, 184)
+                            }),
+                        );
+                        if ui
+                            .small_button("✕")
+                            .on_hover_text("Remove peak from list")
+                            .clicked()
+                        {
+                            delete_req = Some(i);
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+
+    if let Some(rm) = delete_req {
+        if rm < state.picked_peaks.len() {
+            state.picked_peaks.remove(rm);
+            if state.selected_peak_idx == Some(rm) {
+                state.selected_peak_idx = None;
+            }
+        }
+    } else if let Some(zi) = zoom_req {
+        state.custom_ref_target_ppm = state.picked_peaks.get(zi).map(|p| p.ppm).unwrap_or(0.0);
+        state.zoom_to_peak(zi);
+    }
+}
+
+fn render_multiplets_inspector_tab(ui: &mut egui::Ui, state: &mut Stack1dState) {
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("🔍 Analyze Multiplets").clicked() {
+            state.analyze_active_trace_multiplets();
+        }
+        ui.label("Total H:");
+        if ui
+            .add(
+                egui::DragValue::new(&mut state.target_total_protons)
+                    .range(0.0..=500.0)
+                    .speed(0.5)
+                    .fixed_decimals(1),
+            )
+            .changed()
+        {
+            state.refresh_active_trace_peaks_and_multiplets();
+        }
+        ui.checkbox(&mut state.show_multiplet_boxes, "Header Boxes");
+        ui.checkbox(&mut state.show_j_trees, "Splitting J-Trees");
+        ui.checkbox(&mut state.show_integral_curves, "Integrals");
+        ui.separator();
+        let mut style_changed = false;
+        for (st, lbl) in [
+            (PublicationStyle::Acs, "ACS"),
+            (PublicationStyle::Joc, "JOC"),
+            (PublicationStyle::Rsc, "RSC"),
+            (PublicationStyle::Nature, "Nature"),
+        ] {
+            if ui
+                .selectable_value(&mut state.journal_style, st, lbl)
+                .changed()
+            {
+                style_changed = true;
+            }
+        }
+        if style_changed {
+            state.reformat_journal_report();
+        }
+        if !state.formatted_journal_report.is_empty()
+            && ui.button("📋 Copy Journal Report").clicked()
+        {
+            ui.ctx().copy_text(state.formatted_journal_report.clone());
+            state.status_message =
+                "Copied journal NMR characterization report to clipboard.".to_string();
+        }
+    });
+
+    if !state.formatted_journal_report.is_empty() {
+        ui.add_space(2.0);
+        ui.monospace(
+            egui::RichText::new(&state.formatted_journal_report)
+                .size(11.5)
+                .color(egui::Color32::from_rgb(185, 245, 215)),
+        );
+    }
+
+    if state.detected_multiplets.is_empty() {
+        ui.label(
+            egui::RichText::new("No multiplets detected yet. Click 'Analyze Multiplets' above.")
+                .weak(),
+        );
+        return;
+    }
+
+    let mut zoom_mult: Option<usize> = None;
+    let mut norm_req: Option<(usize, f64)> = None;
+    let mut del_mult: Option<usize> = None;
+    ui.add_space(3.0);
+    egui::ScrollArea::vertical()
+        .id_salt("stack1d_multiplet_table_scroll")
+        .max_height(145.0)
+        .show(ui, |ui| {
+            egui::Grid::new("stack1d_multiplet_grid")
+                .striped(true)
+                .spacing([12.0, 3.0])
+                .show(ui, |ui| {
+                    ui.strong("ID");
+                    ui.strong("Range (ppm)");
+                    ui.strong("δ (ppm)");
+                    ui.strong("Class");
+                    ui.strong("J (Hz)");
+                    ui.strong("Integral (H)");
+                    ui.strong("Normalize");
+                    ui.strong("");
+                    ui.end_row();
+                    for (mi, m) in state.detected_multiplets.iter().enumerate() {
+                        let is_sel = state.selected_multiplet_idx == Some(mi);
+                        let id_str = multiplet_letter_id(mi);
+                        let m_lo = m.range_ppm.0.min(m.range_ppm.1);
+                        let m_hi = m.range_ppm.0.max(m.range_ppm.1);
+                        if ui
+                            .selectable_label(is_sel, egui::RichText::new(&id_str).strong())
+                            .on_hover_text("Click to zoom into multiplet & auto-fit Y")
+                            .clicked()
+                        {
+                            zoom_mult = Some(mi);
+                        }
+                        if ui
+                            .selectable_label(
+                                is_sel,
+                                egui::RichText::new(format!("{m_hi:.3}..{m_lo:.3}")).monospace(),
+                            )
+                            .clicked()
+                        {
+                            zoom_mult = Some(mi);
+                        }
+                        if ui
+                            .selectable_label(
+                                is_sel,
+                                egui::RichText::new(format!("{:.3}", m.center_ppm)).monospace(),
+                            )
+                            .clicked()
+                        {
+                            zoom_mult = Some(mi);
+                        }
+                        if ui
+                            .selectable_label(
+                                is_sel,
+                                egui::RichText::new(m.class.as_str()).monospace(),
+                            )
+                            .clicked()
+                        {
+                            zoom_mult = Some(mi);
+                        }
+                        let js = m
+                            .j_values_hz()
+                            .into_iter()
+                            .map(|j| format!("{j:.1}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        ui.monospace(if js.is_empty() { "—".to_string() } else { js });
+                        let integ = state
+                            .detected_multiplet_integrals
+                            .get(mi)
+                            .copied()
+                            .unwrap_or(0.0);
+                        let h_txt = match m.proton_count {
+                            Some(pc) => format!("{integ:.2} ({pc}H)"),
+                            None => format!("{integ:.2e}"),
+                        };
+                        ui.monospace(h_txt);
+                        ui.horizontal(|ui| {
+                            for (lbl, nh) in [("1H", 1.0), ("2H", 2.0), ("3H", 3.0)] {
+                                if ui
+                                    .small_button(lbl)
+                                    .on_hover_text(format!(
+                                        "Normalize all multiplet integrals so {id_str} = {lbl}"
+                                    ))
+                                    .clicked()
+                                {
+                                    norm_req = Some((mi, nh));
+                                }
+                            }
+                        });
+                        if ui.small_button("✕").clicked() {
+                            del_mult = Some(mi);
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+
+    if let Some((mi, nh)) = norm_req {
+        state.normalize_multiplet_integral_to(mi, nh);
+    } else if let Some(rm) = del_mult {
+        if rm < state.detected_multiplets.len() {
+            state.detected_multiplets.remove(rm);
+            if rm < state.detected_multiplet_integrals.len() {
+                state.detected_multiplet_integrals.remove(rm);
+            }
+            if state.selected_multiplet_idx == Some(rm) {
+                state.selected_multiplet_idx = None;
+            }
+            state.reformat_journal_report();
+        }
+    } else if let Some(mi) = zoom_mult {
+        state.zoom_to_multiplet(mi);
+    }
+}
+
+fn render_phase_baseline_inspector_tab(ui: &mut egui::Ui, state: &mut Stack1dState) {
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("Interactive Phase:");
+        let mut p_changed = false;
+        p_changed |= ui
+            .add(
+                egui::Slider::new(&mut state.phc0_deg, -180.0..=180.0)
+                    .text("PHC0 (°)")
+                    .fixed_decimals(1),
+            )
+            .changed();
+        for (lbl, d0) in [("-1°", -1.0), ("-0.1°", -0.1), ("+0.1°", 0.1), ("+1°", 1.0)] {
+            if ui.small_button(lbl).clicked() {
+                state.phc0_deg = (state.phc0_deg + d0).clamp(-180.0, 180.0);
+                p_changed = true;
+            }
+        }
+        ui.separator();
+        p_changed |= ui
+            .add(
+                egui::Slider::new(&mut state.phc1_deg, -180.0..=180.0)
+                    .text("PHC1 (°)")
+                    .fixed_decimals(1),
+            )
+            .changed();
+        for (lbl, d1) in [("-1°", -1.0), ("+1°", 1.0)] {
+            if ui.small_button(lbl).clicked() {
+                state.phc1_deg = (state.phc1_deg + d1).clamp(-180.0, 180.0);
+                p_changed = true;
+            }
+        }
+        if p_changed {
+            state.apply_live_phase_to_active_trace();
+        }
+        if ui
+            .button("Commit Phase")
+            .on_hover_text("Bake current PHC0/PHC1 into spectrum and update peaks/multiplets")
+            .clicked()
+        {
+            state.commit_live_phase_active_trace();
+        }
+        if ui.button("Auto-Phase").clicked() {
+            state.auto_phase_active_trace();
+        }
+    });
+
+    ui.add_space(2.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label("PHC1 Pivot:");
+        let p_mode_changed_a = ui
+            .selectable_value(
+                &mut state.phase_pivot_mode,
+                PivotMode1d::MaxPeak,
+                "Max Peak",
+            )
+            .changed();
+        let p_mode_changed_b = ui
+            .selectable_value(
+                &mut state.phase_pivot_mode,
+                PivotMode1d::AtPpm,
+                "At δ (ppm)",
+            )
+            .changed();
+        let piv_drag = ui
+            .add_enabled(
+                state.phase_pivot_mode == PivotMode1d::AtPpm,
+                egui::DragValue::new(&mut state.phase_pivot_ppm)
+                    .speed(0.01)
+                    .fixed_decimals(3)
+                    .suffix(" ppm"),
+            )
+            .changed();
+        if ui
+            .toggle_value(&mut state.phase_pivot_pick_armed, "🎯 Click Pivot on Plot")
+            .on_hover_text("Click any peak on the 1D plot to place the first-order phase pivot")
+            .clicked()
+            && state.phase_pivot_pick_armed
+        {
+            state.phase_pivot_mode = PivotMode1d::AtPpm;
+        }
+        if p_mode_changed_a || p_mode_changed_b || piv_drag {
+            state.apply_live_phase_to_active_trace();
+        }
+
+        ui.separator();
+        ui.strong("Baseline:");
+        egui::ComboBox::from_id_salt("stack1d_baseline_model_combo")
+            .selected_text(state.baseline_model_choice.label())
+            .width(155.0)
+            .show_ui(ui, |ui| {
+                for m in [
+                    BaselineModelChoice1d::Whittaker,
+                    BaselineModelChoice1d::AsymmetricWhittaker,
+                    BaselineModelChoice1d::Bernstein,
+                ] {
+                    ui.selectable_value(&mut state.baseline_model_choice, m, m.label());
+                }
+            });
+        if state.baseline_model_choice == BaselineModelChoice1d::Bernstein {
+            ui.add(
+                egui::DragValue::new(&mut state.baseline_bernstein_deg)
+                    .range(2..=12)
+                    .prefix("deg "),
+            );
+        } else {
+            ui.add(
+                egui::DragValue::new(&mut state.baseline_lambda_log10)
+                    .range(2.0..=9.0)
+                    .speed(0.1)
+                    .fixed_decimals(1)
+                    .prefix("log₁₀λ "),
+            );
+        }
+        if ui.button("Apply Baseline").clicked() {
+            state.baseline_correct_active_trace();
+        }
+    });
+
+    ui.add_space(2.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("Solvent Ref:");
+        egui::ComboBox::from_id_salt("stack1d_solvent_combo")
+            .selected_text(&state.solvent_choice)
+            .width(105.0)
+            .show_ui(ui, |ui| {
+                for s in ["CDCl3", "DMSO-d6", "D2O", "CD3OD", "Acetone-d6", "C6D6"] {
+                    ui.selectable_value(&mut state.solvent_choice, s.to_string(), s);
+                }
+            });
+        if ui.button("Auto-Calibrate δ").clicked() {
+            state.calibrate_solvent_active_trace();
+        }
+        ui.separator();
+        ui.strong("Apodization & Zero-Fill:");
+        ui.add(
+            egui::DragValue::new(&mut state.reprocess_lb_hz)
+                .range(0.0..=30.0)
+                .speed(0.05)
+                .fixed_decimals(2)
+                .prefix("LB ")
+                .suffix(" Hz"),
+        );
+        for zf in [1usize, 2, 4] {
+            ui.selectable_value(&mut state.reprocess_zf_factor, zf, format!("{zf}× ZF"));
+        }
+        if ui
+            .button("Apply LB / ZF")
+            .on_hover_text(
+                "Apply exponential line broadening & zero-filling via causal pseudo-FID FFT",
+            )
+            .clicked()
+        {
+            state.reprocess_active_trace_lb_zf();
+        }
+    });
+}
+
+fn render_multitrace_stack_inspector_tab(ui: &mut egui::Ui, state: &mut Stack1dState) {
     match state.view_mode {
         Stack1dViewMode::SuperimposedOverlay => {}
         Stack1dViewMode::StackedOffset => {
@@ -3186,345 +4478,191 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
         }
     }
 
-    // 3. Collapsible Normalization & Regional FFT Alignment Strip
-    egui::CollapsingHeader::new("Normalization & FFT Regional Shift Alignment")
-        .id_salt("stack1d_norm_align_header")
-        .default_open(false)
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.strong("Normalize:");
-                if ui.button("Total Area").clicked() {
-                    normalize_traces(&mut state.traces, NormalizationMode::TotalArea);
-                    state.status_message =
-                        "Applied total-area normalization across unlocked traces.".to_string();
-                }
-                if ui
-                    .button("Total |Area|")
-                    .on_hover_text("Normalize by integral of |S(δ)| (ideal for DEPT-135)")
-                    .clicked()
-                {
-                    normalize_traces(&mut state.traces, NormalizationMode::TotalAbsArea);
-                    state.status_message =
-                        "Applied absolute total-area normalization.".to_string();
-                }
-                ui.separator();
-                ui.label("Ref [ppm]:");
-                ui.add(
-                    egui::DragValue::new(&mut state.norm_region_ppm_min)
-                        .speed(0.01)
-                        .fixed_decimals(3),
-                );
-                ui.label("..");
-                ui.add(
-                    egui::DragValue::new(&mut state.norm_region_ppm_max)
-                        .speed(0.01)
-                        .fixed_decimals(3),
-                );
-                if ui.button("Ref Peak Height").clicked() {
-                    normalize_traces(
-                        &mut state.traces,
-                        NormalizationMode::ReferencePeakHeight {
-                            ppm_min: state.norm_region_ppm_min,
-                            ppm_max: state.norm_region_ppm_max,
-                        },
-                    );
-                    state.status_message = format!(
-                        "Normalized peak apex to 1.0 in [{:.3}, {:.3}] ppm.",
-                        state.norm_region_ppm_min.min(state.norm_region_ppm_max),
-                        state.norm_region_ppm_min.max(state.norm_region_ppm_max)
-                    );
-                }
-                if ui.button("Ref Integral").clicked() {
-                    normalize_traces(
-                        &mut state.traces,
-                        NormalizationMode::ReferenceRegionIntegral {
-                            ppm_min: state.norm_region_ppm_min,
-                            ppm_max: state.norm_region_ppm_max,
-                        },
-                    );
-                    state.status_message = format!(
-                        "Normalized reference integral to 1.0 in [{:.3}, {:.3}] ppm.",
-                        state.norm_region_ppm_min.min(state.norm_region_ppm_max),
-                        state.norm_region_ppm_min.max(state.norm_region_ppm_max)
-                    );
-                }
-                if ui
-                    .button("Reset Raw")
-                    .on_hover_text("Restore raw intensities, scale = 1.0, and Δδ = 0.0 on unlocked traces")
-                    .clicked()
-                {
-                    for tr in &mut state.traces {
-                        tr.reset_to_raw();
-                    }
-                    state.last_alignment_records.clear();
-                    state.status_message = "Reset unlocked traces to raw data.".to_string();
-                }
-            });
-
-            ui.horizontal_wrapped(|ui| {
-                ui.strong("FFT Align:");
-                for sc in [
-                    AlignmentScope::LocalIntervals,
-                    AlignmentScope::GlobalShiftFromRegion,
-                ] {
-                    ui.selectable_value(&mut state.alignment_scope, sc, sc.label());
-                }
-                ui.label("Interval [ppm]:");
-                ui.add(
-                    egui::DragValue::new(&mut state.draft_align_ppm_min)
-                        .speed(0.01)
-                        .fixed_decimals(3),
-                );
-                ui.label("..");
-                ui.add(
-                    egui::DragValue::new(&mut state.draft_align_ppm_max)
-                        .speed(0.01)
-                        .fixed_decimals(3),
-                );
-                ui.label("Max ±ppm:");
-                ui.add(
-                    egui::DragValue::new(&mut state.draft_align_max_shift_ppm)
-                        .range(0.001..=1.0)
-                        .speed(0.005)
-                        .fixed_decimals(3),
-                );
-                if ui.button("+ Add Interval").clicked() {
-                    state.alignment_intervals.push(AlignmentInterval::new(
-                        state.draft_align_ppm_min,
-                        state.draft_align_ppm_max,
-                        state.draft_align_max_shift_ppm,
-                    ));
-                }
-                if ui.button("Use Current View").clicked() {
-                    state.draft_align_ppm_min = state.view_ppm_min.min(state.view_ppm_max);
-                    state.draft_align_ppm_max = state.view_ppm_min.max(state.view_ppm_max);
-                }
-                if !state.alignment_intervals.is_empty() && ui.button("Clear Intervals").clicked() {
-                    state.alignment_intervals.clear();
-                }
-                if ui
-                    .button("Run FFT Alignment")
-                    .on_hover_text(
-                        "Align unlocked traces to reference trace via FFT cross-correlation (Savorani et al., JMR 2010)",
-                    )
-                    .clicked()
-                {
-                    if state.alignment_intervals.is_empty() {
-                        state.alignment_intervals.push(AlignmentInterval::new(
-                            state.draft_align_ppm_min,
-                            state.draft_align_ppm_max,
-                            state.draft_align_max_shift_ppm,
-                        ));
-                    }
-                    let ref_i = state.safe_ref_trace_idx();
-                    let intervals = state.alignment_intervals.clone();
-                    let scope = state.alignment_scope;
-                    let recs =
-                        align_traces_interval_fft(&mut state.traces, ref_i, &intervals, scope);
-                    state.status_message = format!(
-                        "Aligned {} trace-interval pairs against '{}'.",
-                        recs.len(),
-                        state
-                            .traces
-                            .get(ref_i)
-                            .map(|t| t.label.as_str())
-                            .unwrap_or("ref")
-                    );
-                    state.last_alignment_records = recs;
-                }
-            });
-
-            if !state.alignment_intervals.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("Active intervals:").weak().size(11.0));
-                    let mut remove_iv = None;
-                    for (k, iv) in state.alignment_intervals.iter().enumerate() {
-                        if ui
-                            .small_button(format!(
-                                "[{:.2}..{:.2} ±{:.3}] ✕",
-                                iv.ppm_min, iv.ppm_max, iv.max_shift_ppm
-                            ))
-                            .clicked()
-                        {
-                            remove_iv = Some(k);
-                        }
-                    }
-                    if let Some(rm) = remove_iv {
-                        state.alignment_intervals.remove(rm);
-                    }
-                });
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("Normalize:");
+        if ui.button("Total Area").clicked() {
+            normalize_traces(&mut state.traces, NormalizationMode::TotalArea);
+            state.status_message =
+                "Applied total-area normalization across unlocked traces.".to_string();
+        }
+        if ui
+            .button("Total |Area|")
+            .on_hover_text("Normalize by integral of |S(δ)| (ideal for DEPT-135)")
+            .clicked()
+        {
+            normalize_traces(&mut state.traces, NormalizationMode::TotalAbsArea);
+            state.status_message = "Applied absolute total-area normalization.".to_string();
+        }
+        ui.label("Ref [ppm]:");
+        ui.add(
+            egui::DragValue::new(&mut state.norm_region_ppm_min)
+                .speed(0.01)
+                .fixed_decimals(3),
+        );
+        ui.label("..");
+        ui.add(
+            egui::DragValue::new(&mut state.norm_region_ppm_max)
+                .speed(0.01)
+                .fixed_decimals(3),
+        );
+        if ui.button("Ref Peak").clicked() {
+            normalize_traces(
+                &mut state.traces,
+                NormalizationMode::ReferencePeakHeight {
+                    ppm_min: state.norm_region_ppm_min,
+                    ppm_max: state.norm_region_ppm_max,
+                },
+            );
+        }
+        if ui.button("Ref Integral").clicked() {
+            normalize_traces(
+                &mut state.traces,
+                NormalizationMode::ReferenceRegionIntegral {
+                    ppm_min: state.norm_region_ppm_min,
+                    ppm_max: state.norm_region_ppm_max,
+                },
+            );
+        }
+        if ui.button("Reset Raw").clicked() {
+            for tr in &mut state.traces {
+                tr.reset_to_raw();
             }
-        });
+            state.last_alignment_records.clear();
+        }
+        ui.separator();
+        if ui
+            .button("Run FFT Alignment")
+            .on_hover_text("Align unlocked traces to reference trace via FFT cross-correlation")
+            .clicked()
+        {
+            if state.alignment_intervals.is_empty() {
+                state.alignment_intervals.push(AlignmentInterval::new(
+                    state.draft_align_ppm_min,
+                    state.draft_align_ppm_max,
+                    state.draft_align_max_shift_ppm,
+                ));
+            }
+            let ref_i = state.safe_ref_trace_idx();
+            let intervals = state.alignment_intervals.clone();
+            let scope = state.alignment_scope;
+            let recs = align_traces_interval_fft(&mut state.traces, ref_i, &intervals, scope);
+            state.last_alignment_records = recs;
+        }
+        if ui.button("Copy ROI TSV").clicked() {
+            let tsv = state.export_roi_tsv();
+            ui.ctx().copy_text(tsv);
+            state.show_tsv_preview = true;
+        }
+        ui.checkbox(&mut state.show_tsv_preview, "TSV Preview");
+    });
 
-    if !state.status_message.is_empty() {
-        ui.label(
-            egui::RichText::new(&state.status_message)
-                .size(11.5)
-                .color(egui::Color32::from_rgb(125, 211, 252)),
-        );
-    }
-
-    if state.traces.is_empty() {
-        ui.add_space(10.0);
-        ui.label(
-            "No 1D traces loaded yet. Click 'Kinetics Demo' or 'STD Demo' above, or push Trace1d spectra into Stack1dState.",
-        );
-        return;
-    }
-
-    // 4. Interactive 1D NMR Canvas (Inverted ppm axis: high ppm left -> low ppm right)
-    paint_interactive_1d_canvas(ui, state);
-
-    // 5. Trace Control Table (Visibility, Lock, Scale, Vertical Offset, Shift Offset, OLS Alpha)
-    egui::CollapsingHeader::new(format!(
-        "Traces & Per-Trace Controls ({})",
-        state.traces.len()
-    ))
-    .id_salt("stack1d_trace_table_header")
-    .default_open(true)
-    .show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label("Covariate Axis:");
-            egui::ComboBox::from_id_salt("stack1d_cov_kind_combo")
-                .selected_text(state.covariate_kind.label())
-                .show_ui(ui, |ui| {
-                    for ck in CovariateKind::ALL {
-                        ui.selectable_value(&mut state.covariate_kind, ck, ck.label());
-                    }
-                });
-        });
-
-        let ref_idx = state.safe_ref_trace_idx();
-        let ref_clone = if state.view_mode == Stack1dViewMode::DifferenceSpectrum {
-            state.traces.get(ref_idx).cloned()
-        } else {
-            None
-        };
-
-        egui::ScrollArea::vertical()
-            .id_salt("stack1d_trace_table_scroll")
-            .max_height(155.0)
-            .show(ui, |ui| {
-                egui::Grid::new("stack1d_trace_grid")
-                    .striped(true)
-                    .spacing([10.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.strong("Vis");
-                        ui.strong("Lock");
-                        ui.strong("Color");
-                        ui.strong("Trace");
-                        ui.strong(state.covariate_kind.label());
-                        ui.strong("Scale");
-                        ui.strong("V-Offset");
-                        ui.strong("Δδ (ppm)");
-                        if state.view_mode == Stack1dViewMode::DifferenceSpectrum {
-                            ui.strong("α (Diff)");
-                        }
-                        ui.end_row();
-
-                        for (idx, tr) in state.traces.iter_mut().enumerate() {
-                            ui.checkbox(&mut tr.visible, "");
-                            ui.checkbox(&mut tr.locked, "");
-                            let (swatch_rect, swatch_resp) = ui
-                                .allocate_exact_size(egui::vec2(16.0, 14.0), egui::Sense::click());
-                            let [r, g, b, a] = tr.color_rgba;
-                            ui.painter().rect_filled(
-                                swatch_rect,
-                                3.0,
-                                egui::Color32::from_rgba_unmultiplied(r, g, b, a),
-                            );
-                            if swatch_resp
-                                .on_hover_text("Click to cycle trace color")
-                                .clicked()
-                            {
-                                let next_p = STACK1D_TRACE_PALETTE
-                                    .iter()
-                                    .position(|&c| c == tr.color_rgba)
-                                    .map(|p| (p + 1) % STACK1D_TRACE_PALETTE.len())
-                                    .unwrap_or(0);
-                                tr.color_rgba = STACK1D_TRACE_PALETTE[next_p];
-                            }
-
-                            let badge = if idx == ref_idx {
-                                format!("★ {}", tr.label)
-                            } else {
-                                tr.label.clone()
-                            };
-                            ui.label(badge);
-
-                            ui.add_enabled(
-                                !tr.locked,
-                                egui::DragValue::new(&mut tr.covariate)
-                                    .speed(0.1)
-                                    .fixed_decimals(2),
-                            );
-                            if ui
-                                .add_enabled(
-                                    !tr.locked,
-                                    egui::DragValue::new(&mut tr.scale)
-                                        .speed(0.02)
-                                        .fixed_decimals(4),
-                                )
-                                .changed()
-                            {
-                                tr.generation = tr.generation.wrapping_add(1);
-                            }
-                            ui.add_enabled(
-                                !tr.locked,
-                                egui::DragValue::new(&mut tr.vertical_offset)
-                                    .speed(0.01)
-                                    .fixed_decimals(3),
-                            );
-                            if ui
-                                .add_enabled(
-                                    !tr.locked,
-                                    egui::DragValue::new(&mut tr.shift_offset_ppm)
-                                        .speed(0.001)
-                                        .fixed_decimals(4),
-                                )
-                                .changed()
-                            {
-                                tr.generation = tr.generation.wrapping_add(1);
-                            }
-
-                            if let Some(ref ref_tr) = ref_clone {
-                                let (est_a, _, _) = match state.diff_alpha_mode {
-                                    DifferenceAlphaMode::Manual => {
-                                        (tr.alpha_override.unwrap_or(state.manual_alpha), 0.0, 0.0)
-                                    }
-                                    DifferenceAlphaMode::LeastSquaresRegion {
-                                        ppm_min,
-                                        ppm_max,
-                                        fit_intercept,
-                                    } => {
-                                        if let Some(ov) = tr.alpha_override {
-                                            (ov, 0.0, 0.0)
-                                        } else {
-                                            estimate_difference_alpha_ols(
-                                                tr,
-                                                ref_tr,
-                                                ppm_min,
-                                                ppm_max,
-                                                fit_intercept,
-                                            )
-                                        }
-                                    }
-                                };
-                                ui.monospace(format!("{est_a:.4}"));
-                            }
-                            ui.end_row();
+    egui::CollapsingHeader::new(format!("Traces & Covariates ({})", state.traces.len()))
+        .id_salt("stack1d_trace_table_header")
+        .default_open(state.traces.len() > 1)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Covariate Axis:");
+                egui::ComboBox::from_id_salt("stack1d_cov_kind_combo")
+                    .selected_text(state.covariate_kind.label())
+                    .show_ui(ui, |ui| {
+                        for ck in CovariateKind::ALL {
+                            ui.selectable_value(&mut state.covariate_kind, ck, ck.label());
                         }
                     });
             });
-    });
 
-    // 6. Multi-Trace ROI Integration & Kinetics Matrix Table + TSV Exporter
+            let ref_idx = state.safe_ref_trace_idx();
+            egui::ScrollArea::vertical()
+                .id_salt("stack1d_trace_table_scroll")
+                .max_height(125.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("stack1d_trace_grid")
+                        .striped(true)
+                        .spacing([10.0, 3.0])
+                        .show(ui, |ui| {
+                            ui.strong("Vis");
+                            ui.strong("Lock");
+                            ui.strong("Color");
+                            ui.strong("Trace");
+                            ui.strong(state.covariate_kind.label());
+                            ui.strong("Scale");
+                            ui.strong("V-Offset");
+                            ui.strong("Δδ (ppm)");
+                            ui.end_row();
+
+                            for (idx, tr) in state.traces.iter_mut().enumerate() {
+                                ui.checkbox(&mut tr.visible, "");
+                                ui.checkbox(&mut tr.locked, "");
+                                let (swatch_rect, swatch_resp) = ui.allocate_exact_size(
+                                    egui::vec2(16.0, 14.0),
+                                    egui::Sense::click(),
+                                );
+                                let [r, g, b, a] = tr.color_rgba;
+                                ui.painter().rect_filled(
+                                    swatch_rect,
+                                    3.0,
+                                    egui::Color32::from_rgba_unmultiplied(r, g, b, a),
+                                );
+                                if swatch_resp.clicked() {
+                                    let next_p = STACK1D_TRACE_PALETTE
+                                        .iter()
+                                        .position(|&c| c == tr.color_rgba)
+                                        .map(|p| (p + 1) % STACK1D_TRACE_PALETTE.len())
+                                        .unwrap_or(0);
+                                    tr.color_rgba = STACK1D_TRACE_PALETTE[next_p];
+                                }
+                                let badge = if idx == ref_idx {
+                                    format!("★ {}", tr.label)
+                                } else {
+                                    tr.label.clone()
+                                };
+                                ui.label(badge);
+                                ui.add_enabled(
+                                    !tr.locked,
+                                    egui::DragValue::new(&mut tr.covariate)
+                                        .speed(0.1)
+                                        .fixed_decimals(2),
+                                );
+                                if ui
+                                    .add_enabled(
+                                        !tr.locked,
+                                        egui::DragValue::new(&mut tr.scale)
+                                            .speed(0.02)
+                                            .fixed_decimals(4),
+                                    )
+                                    .changed()
+                                {
+                                    tr.generation = tr.generation.wrapping_add(1);
+                                }
+                                ui.add_enabled(
+                                    !tr.locked,
+                                    egui::DragValue::new(&mut tr.vertical_offset)
+                                        .speed(0.01)
+                                        .fixed_decimals(3),
+                                );
+                                if ui
+                                    .add_enabled(
+                                        !tr.locked,
+                                        egui::DragValue::new(&mut tr.shift_offset_ppm)
+                                            .speed(0.001)
+                                            .fixed_decimals(4),
+                                    )
+                                    .changed()
+                                {
+                                    tr.generation = tr.generation.wrapping_add(1);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+
     egui::CollapsingHeader::new(format!(
-        "Multi-Trace ROI Integration & Kinetics Matrix ({} ROIs)",
+        "Multi-Trace ROI Kinetics Matrix ({} ROIs)",
         state.roi_regions.len()
     ))
     .id_salt("stack1d_roi_matrix_header")
-    .default_open(true)
+    .default_open(!state.roi_regions.is_empty() && state.traces.len() > 1)
     .show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label("New ROI:");
@@ -3556,100 +4694,17 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
             if !state.roi_regions.is_empty() && ui.button("Clear ROIs").clicked() {
                 state.roi_regions.clear();
             }
-
-            ui.separator();
-            ui.label("Ratio:");
-            for rf in [
-                RoiRatioFormula::AutoReactionOrDecay,
-                RoiRatioFormula::FirstOverSum,
-                RoiRatioFormula::TargetOverRefRegion {
-                    target_idx: 0,
-                    ref_idx: 1,
-                },
-                RoiRatioFormula::RelativeToRefTrace { region_idx: 0 },
-            ] {
-                ui.selectable_value(&mut state.roi_ratio_formula, rf, rf.label());
-            }
-
-            if ui.button("Export / Copy TSV").clicked() {
-                let tsv = state.export_roi_tsv();
-                ui.ctx().copy_text(tsv);
-                state.show_tsv_preview = true;
-            }
-            ui.checkbox(&mut state.show_tsv_preview, "TSV Preview");
         });
 
         if !state.roi_regions.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                let mut remove_idx = None;
-                for (j, reg) in state.roi_regions.iter_mut().enumerate() {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.strong(format!("R{}: {}", j + 1, reg.label));
-                            ui.add(
-                                egui::DragValue::new(&mut reg.ppm_min)
-                                    .speed(0.005)
-                                    .fixed_decimals(3),
-                            );
-                            ui.label("..");
-                            ui.add(
-                                egui::DragValue::new(&mut reg.ppm_max)
-                                    .speed(0.005)
-                                    .fixed_decimals(3),
-                            );
-                            ui.checkbox(&mut reg.edge_baseline_correction, "Slope")
-                                .on_hover_text("Subtract straight-line edge chord baseline");
-                            if ui.small_button("✕").clicked() {
-                                remove_idx = Some(j);
-                            }
-                        });
-                    });
-                }
-                if let Some(rm) = remove_idx {
-                    state.roi_regions.remove(rm);
-                }
-            });
-
             let matrix = state.evaluate_roi_matrix();
-            egui::ScrollArea::vertical()
-                .id_salt("stack1d_roi_table_scroll")
-                .max_height(150.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("stack1d_roi_matrix_grid")
-                        .striped(true)
-                        .spacing([12.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.strong("trace_id");
-                            ui.strong("covariate");
-                            for (j, reg) in matrix.regions.iter().enumerate() {
-                                ui.strong(format!("area_region_{} ({})", j + 1, reg.label));
-                            }
-                            ui.strong("normalized_ratio");
-                            ui.end_row();
-
-                            for row in &matrix.rows {
-                                ui.monospace(&row.trace_id);
-                                ui.monospace(format!(
-                                    "{:.3}{}",
-                                    row.covariate,
-                                    state.covariate_kind.unit_suffix()
-                                ));
-                                for &a in &row.areas {
-                                    ui.monospace(format!("{a:.5}"));
-                                }
-                                ui.monospace(format!("{:.5}", row.normalized_ratio));
-                                ui.end_row();
-                            }
-                        });
-                });
-
             if state.show_tsv_preview {
                 let mut tsv = matrix.to_tsv_string();
                 state.last_exported_tsv = Some(tsv.clone());
                 ui.add(
                     egui::TextEdit::multiline(&mut tsv)
                         .font(egui::TextStyle::Monospace)
-                        .desired_rows(5)
+                        .desired_rows(4)
                         .desired_width(f32::INFINITY),
                 );
             }
@@ -3659,21 +4714,39 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
 
 fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
     let avail_w = ui.available_width().max(320.0);
-    let canvas_h = (ui.available_height() * 0.56).clamp(250.0, 460.0);
+    let target_frac = if state.show_1d_analysis_drawer {
+        0.60
+    } else {
+        0.86
+    };
+    let canvas_h = (ui.available_height() * target_frac).clamp(340.0, 680.0);
     let (canvas_rect, resp) =
         ui.allocate_exact_size(egui::vec2(avail_w, canvas_h), egui::Sense::click_and_drag());
 
     let pad_l = 14.0_f32;
     let pad_r = 14.0_f32;
-    let pad_t = 12.0_f32;
-    let pad_b = 30.0_f32;
+    let pad_t = 10.0_f32;
+    let ruler_h = 22.0_f32;
+    let minimap_h = 36.0_f32;
+    let bottom_reserve = ruler_h + minimap_h + 10.0;
+
     let plot_rect = egui::Rect::from_min_max(
         egui::pos2(canvas_rect.left() + pad_l, canvas_rect.top() + pad_t),
         egui::pos2(
             (canvas_rect.right() - pad_r).max(canvas_rect.left() + pad_l + 40.0),
-            (canvas_rect.bottom() - pad_b).max(canvas_rect.top() + pad_t + 40.0),
+            (canvas_rect.bottom() - bottom_reserve).max(canvas_rect.top() + pad_t + 80.0),
         ),
     );
+    let minimap_rect = egui::Rect::from_min_max(
+        egui::pos2(plot_rect.left(), canvas_rect.bottom() - minimap_h - 4.0),
+        egui::pos2(plot_rect.right(), canvas_rect.bottom() - 4.0),
+    );
+
+    let (g_lo_raw, g_hi_raw) = state.global_ppm_bounds().unwrap_or((0.0, 10.0));
+    let g_pad = 0.015 * (g_hi_raw - g_lo_raw).max(0.1);
+    let g_lo = g_lo_raw - g_pad;
+    let g_hi = g_hi_raw + g_pad;
+    let g_span = (g_hi - g_lo).max(1e-6);
 
     let mut lo = state.view_ppm_min.min(state.view_ppm_max);
     let mut hi = state.view_ppm_min.max(state.view_ppm_max);
@@ -3685,23 +4758,101 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
         let frac = ((sx - plot_rect.left()) / plot_rect.width().max(1.0)) as f64;
         cur_hi - frac * (cur_hi - cur_lo)
     };
+    let minimap_x_to_ppm = |sx: f32| -> f64 {
+        let frac =
+            ((sx - minimap_rect.left()) / minimap_rect.width().max(1.0)).clamp(0.0, 1.0) as f64;
+        g_hi - frac * g_span
+    };
 
-    // Double-click resets full NMR view
-    if resp.double_clicked() {
+    // Keyboard shortcuts (Esc cancels zoom anchor; Backspace/Z undoes zoom; F/R resets full view)
+    let wants_kb = ui.ctx().egui_wants_keyboard_input();
+    if !wants_kb {
+        let (esc, undo_key, full_key) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Z),
+                i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::R),
+            )
+        });
+        if esc {
+            state.cancel_zoom_anchor();
+            state.phase_pivot_pick_armed = false;
+        }
+        if resp.hovered() {
+            if undo_key && state.undo_zoom() {
+                lo = state.view_ppm_min.min(state.view_ppm_max);
+                hi = state.view_ppm_min.max(state.view_ppm_max);
+            } else if full_key {
+                state.fit_full_ppm_bounds();
+                lo = state.view_ppm_min.min(state.view_ppm_max);
+                hi = state.view_ppm_min.max(state.view_ppm_max);
+            }
+        }
+    }
+
+    // Right-click cancels active 1st-click zoom anchor
+    if resp.secondary_clicked() {
+        state.cancel_zoom_anchor();
+        state.phase_pivot_pick_armed = false;
+    }
+
+    // Double-click inside plot resets full NMR view
+    if resp.double_clicked()
+        && resp
+            .interact_pointer_pos()
+            .is_none_or(|p| plot_rect.contains(p))
+    {
         state.fit_full_ppm_bounds();
         lo = state.view_ppm_min.min(state.view_ppm_max);
         hi = state.view_ppm_min.max(state.view_ppm_max);
     }
 
-    // Hover & scroll zoom (Shift + Scroll adjusts vertical intensity gain; plain Scroll zooms ppm around cursor)
+    // Hover & Wheel: plain vertical scroll scales `y_gain` (`0.001..=100_000×`), Shift+Scroll shifts baseline,
+    // Ctrl/Cmd+Scroll or pinch zooms horizontally, and vertical scroll is ALWAYS consumed so outer ScrollAreas never hijack it.
     if let Some(hover_pos) = resp.hover_pos() {
         if plot_rect.contains(hover_pos) {
             let anchor_ppm = screen_x_to_ppm(hover_pos.x, lo, hi);
             state.cursor_ppm = Some(anchor_ppm);
+        } else {
+            state.cursor_ppm = None;
+        }
 
-            let (scroll_y, zoom_delta, shift_down) =
-                ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta(), i.modifiers.shift));
+        if canvas_rect.contains(hover_pos) {
+            let (wheel_sy, smooth_sy, scroll_x, zoom_delta, shift_down, cmd_or_ctrl) =
+                ui.input(|i| {
+                    let wy: f32 = i
+                        .events
+                        .iter()
+                        .filter_map(|ev| match ev {
+                            egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                            _ => None,
+                        })
+                        .sum();
+                    (
+                        wy,
+                        i.smooth_scroll_delta.y,
+                        i.smooth_scroll_delta.x,
+                        i.zoom_delta(),
+                        i.modifiers.shift,
+                        i.modifiers.command || i.modifiers.ctrl,
+                    )
+                });
+            let sy = if smooth_sy.abs() >= wheel_sy.abs() {
+                smooth_sy
+            } else {
+                wheel_sy * 16.0
+            };
+            if smooth_sy.abs() > 0.0 || wheel_sy.abs() > 0.0 {
+                ui.input_mut(|i| {
+                    i.smooth_scroll_delta.y = 0.0;
+                });
+            }
 
+            let anchor_ppm = screen_x_to_ppm(
+                hover_pos.x.clamp(plot_rect.left(), plot_rect.right()),
+                lo,
+                hi,
+            );
             if (zoom_delta - 1.0).abs() > 1e-4 {
                 let factor = (1.0 / (zoom_delta as f64)).clamp(0.25, 4.0);
                 let new_lo = anchor_ppm - (anchor_ppm - lo) * factor;
@@ -3712,73 +4863,224 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
                     state.view_ppm_min = lo;
                     state.view_ppm_max = hi;
                 }
-            } else if scroll_y.abs() > 0.1 {
-                if shift_down {
-                    let g_factor = (scroll_y as f64 * 0.004).exp();
-                    state.y_gain = (state.y_gain * g_factor).clamp(0.05, 250.0);
-                } else {
-                    let z_factor = (-scroll_y as f64 * 0.003).exp().clamp(0.5, 2.0);
-                    let new_lo = anchor_ppm - (anchor_ppm - lo) * z_factor;
-                    let new_hi = anchor_ppm + (hi - anchor_ppm) * z_factor;
-                    if (new_hi - new_lo) >= 1e-4 && (new_hi - new_lo) <= 1000.0 {
-                        lo = new_lo;
-                        hi = new_hi;
-                        state.view_ppm_min = lo;
-                        state.view_ppm_max = hi;
-                    }
+            } else if cmd_or_ctrl && sy.abs() > 0.05 {
+                let z_factor = (-sy as f64 * 0.0035).exp().clamp(0.4, 2.5);
+                let new_lo = anchor_ppm - (anchor_ppm - lo) * z_factor;
+                let new_hi = anchor_ppm + (hi - anchor_ppm) * z_factor;
+                if (new_hi - new_lo) >= 1e-4 && (new_hi - new_lo) <= 1000.0 {
+                    lo = new_lo;
+                    hi = new_hi;
+                    state.view_ppm_min = lo;
+                    state.view_ppm_max = hi;
                 }
+            } else if sy.abs() > 0.05 {
+                state.apply_vertical_scroll_gain(sy, shift_down);
             }
-        } else {
-            state.cursor_ppm = None;
+
+            if scroll_x.abs() > 0.1 {
+                let d_ppm = (scroll_x / plot_rect.width().max(1.0)) as f64 * (hi - lo);
+                lo += d_ppm;
+                hi += d_ppm;
+                state.view_ppm_min = lo;
+                state.view_ppm_max = hi;
+            }
         }
     } else {
         state.cursor_ppm = None;
     }
 
-    // Drag interaction: either ROI bracket selection (when `draw_roi_drag_mode` or Shift is held) or horizontal ppm pan
-    let shift_held = ui.input(|i| i.modifiers.shift);
-    let roi_drag_wanted = state.draw_roi_drag_mode || shift_held;
+    let max_int = state.reference_intensity_ceiling();
+    let y_base = plot_rect.top() + plot_rect.height() * state.baseline_y_frac;
+    let y_px_per_unit = ((plot_rect.height() as f64) * 0.70 * state.y_gain) / max_int;
+    let thr_int = state.picker_min_snr * state.estimated_noise_sigma;
+    let thr_y = (y_base - (thr_int * y_px_per_unit) as f32)
+        .clamp(plot_rect.top() + 8.0, plot_rect.bottom() - 8.0);
 
-    if resp.drag_started() {
-        if let Some(pos) = resp.interact_pointer_pos() {
-            if roi_drag_wanted && plot_rect.contains(pos) {
-                state.active_roi_drag_start_ppm = Some(screen_x_to_ppm(pos.x, lo, hi));
-            } else {
-                state.active_roi_drag_start_ppm = None;
+    // Precompute clickable multiplet header pill rectangles across `plot_rect`
+    let cur_span = (hi - lo).max(1e-6);
+    let mut multiplet_pill_rects: Vec<(usize, egui::Rect)> = Vec::new();
+    if state.show_multiplet_boxes && state.view_mode != Stack1dViewMode::Pseudo2dHeatmap {
+        let mut last_pill_right = plot_rect.left() - 10.0;
+        for (mi, m) in state.detected_multiplets.iter().enumerate() {
+            let m_lo = m.range_ppm.0.min(m.range_ppm.1);
+            let m_hi = m.range_ppm.0.max(m.range_ppm.1);
+            if m_hi < lo || m_lo > hi {
+                continue;
             }
+            let cx =
+                plot_rect.left() + (((hi - m.center_ppm) / cur_span) as f32) * plot_rect.width();
+            if cx < plot_rect.left() + 18.0 || cx > plot_rect.right() - 18.0 {
+                continue;
+            }
+            let pill_w = 88.0_f32;
+            let pill_h = 16.0_f32;
+            let x0 = (cx - 0.5 * pill_w).max(last_pill_right + 4.0);
+            if x0 + pill_w > plot_rect.right() - 4.0 {
+                continue;
+            }
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(x0, plot_rect.top() + 24.0),
+                egui::vec2(pill_w, pill_h),
+            );
+            last_pill_right = rect.right();
+            multiplet_pill_rects.push((mi, rect));
         }
     }
 
-    if resp.dragged() && state.active_roi_drag_start_ppm.is_none() {
-        let dx = resp.drag_delta().x;
-        if dx.abs() > 0.0 {
-            // Dragging right (dx > 0) pulls higher ppm from the left into view -> shifts window upfield (+d_ppm)
-            let d_ppm = (dx / plot_rect.width().max(1.0)) as f64 * (hi - lo);
-            lo += d_ppm;
-            hi += d_ppm;
+    let (shift_held, space_held, sec_or_mid_down) = ui.input(|i| {
+        (
+            i.modifiers.shift,
+            i.key_down(egui::Key::Space),
+            i.pointer.secondary_down() || i.pointer.middle_down(),
+        )
+    });
+    let roi_drag_wanted = state.tool_mode == ToolMode1d::IntegrateRoi || shift_held;
+    let pan_drag_wanted = state.tool_mode == ToolMode1d::Pan || space_held || sec_or_mid_down;
+
+    // Minimap click / drag jump
+    let ptr_pos = resp.interact_pointer_pos();
+    if (resp.clicked() || resp.dragged())
+        && ptr_pos.is_some_and(|p| minimap_rect.contains(p))
+        && !state.dragging_threshold_bar
+        && state.active_roi_drag_start_ppm.is_none()
+        && state.active_zoom_drag_start_ppm.is_none()
+    {
+        if let Some(p) = ptr_pos {
+            let center = minimap_x_to_ppm(p.x);
+            let cur_w = (hi - lo).min(g_span);
+            let mut new_lo = center - 0.5 * cur_w;
+            let mut new_hi = center + 0.5 * cur_w;
+            if new_lo < g_lo {
+                new_hi += g_lo - new_lo;
+                new_lo = g_lo;
+            }
+            if new_hi > g_hi {
+                new_lo -= new_hi - g_hi;
+                new_hi = g_hi;
+            }
+            lo = new_lo;
+            hi = new_hi;
             state.view_ppm_min = lo;
             state.view_ppm_max = hi;
         }
-    }
+    } else {
+        // Primary single click inside `plot_rect`: multiplet pill click, phase pivot pick, or 2-click zoom
+        if resp.clicked_by(egui::PointerButton::Primary) && !resp.double_clicked() {
+            if let Some(pos) = ptr_pos {
+                if let Some(&(mi, _)) = multiplet_pill_rects.iter().find(|(_, r)| r.contains(pos)) {
+                    state.zoom_to_multiplet(mi);
+                    lo = state.view_ppm_min.min(state.view_ppm_max);
+                    hi = state.view_ppm_min.max(state.view_ppm_max);
+                } else if plot_rect.contains(pos) {
+                    let click_ppm = screen_x_to_ppm(pos.x, lo, hi);
+                    if state.phase_pivot_pick_armed {
+                        state.phase_pivot_ppm = click_ppm;
+                        state.phase_pivot_mode = PivotMode1d::AtPpm;
+                        state.phase_pivot_pick_armed = false;
+                        state.apply_live_phase_to_active_trace();
+                        state.status_message =
+                            format!("Set PHC1 phase pivot at δ = {click_ppm:.4} ppm.");
+                    } else if state.tool_mode == ToolMode1d::Zoom
+                        && !shift_held
+                        && !space_held
+                        && state.handle_canvas_zoom_click(click_ppm)
+                    {
+                        lo = state.view_ppm_min.min(state.view_ppm_max);
+                        hi = state.view_ppm_min.max(state.view_ppm_max);
+                    }
+                }
+            }
+        }
 
-    if resp.drag_stopped() {
-        if let (Some(start_ppm), Some(end_pos)) = (
-            state.active_roi_drag_start_ppm.take(),
-            resp.interact_pointer_pos(),
-        ) {
-            let end_ppm = screen_x_to_ppm(end_pos.x, lo, hi);
-            if (end_ppm - start_ppm).abs() >= 1e-3 {
-                let idx = state.roi_regions.len() + 1;
-                state.roi_regions.push(RoiRegion1d::new(
-                    format!("region_{idx}"),
-                    start_ppm,
-                    end_ppm,
-                ));
-                state.status_message = format!(
-                    "Added ROI region_{idx} [{:.3}, {:.3}] ppm.",
-                    start_ppm.min(end_ppm),
-                    start_ppm.max(end_ppm)
-                );
+        // Drag start inside `plot_rect`
+        if resp.drag_started() {
+            if let Some(pos) = ptr_pos {
+                if plot_rect.contains(pos) {
+                    if state.show_threshold_bar && (pos.y - thr_y).abs() <= 8.5 {
+                        state.dragging_threshold_bar = true;
+                        state.active_roi_drag_start_ppm = None;
+                        state.active_zoom_drag_start_ppm = None;
+                        state.active_zoom_drag_start_pos = None;
+                    } else if roi_drag_wanted {
+                        state.active_roi_drag_start_ppm = Some(screen_x_to_ppm(pos.x, lo, hi));
+                        state.active_zoom_drag_start_ppm = None;
+                        state.active_zoom_drag_start_pos = None;
+                    } else if !pan_drag_wanted && state.tool_mode == ToolMode1d::Zoom {
+                        state.active_zoom_drag_start_ppm = Some(screen_x_to_ppm(pos.x, lo, hi));
+                        state.active_zoom_drag_start_pos = Some(pos);
+                        state.active_roi_drag_start_ppm = None;
+                    }
+                }
+            }
+        }
+
+        // Active drag motion
+        if resp.dragged() {
+            if state.dragging_threshold_bar {
+                if let Some(pos) = ptr_pos {
+                    let new_int = ((y_base - pos.y) as f64 / y_px_per_unit.max(1e-18))
+                        .max(state.estimated_noise_sigma * 1.5);
+                    state.picker_min_snr =
+                        (new_int / state.estimated_noise_sigma.max(1e-18)).clamp(1.5, 5000.0);
+                    state.refresh_active_trace_peaks_and_multiplets();
+                }
+            } else if state.active_roi_drag_start_ppm.is_none()
+                && state.active_zoom_drag_start_ppm.is_none()
+                && pan_drag_wanted
+            {
+                let dx = resp.drag_delta().x;
+                if dx.abs() > 0.0 {
+                    let d_ppm = (dx / plot_rect.width().max(1.0)) as f64 * (hi - lo);
+                    lo += d_ppm;
+                    hi += d_ppm;
+                    state.view_ppm_min = lo;
+                    state.view_ppm_max = hi;
+                }
+            } else if let (Some(s_pos), Some(cur_pos)) = (state.active_zoom_drag_start_pos, ptr_pos)
+            {
+                if (cur_pos.x - s_pos.x).abs() >= 6.0 {
+                    state.zoom_anchor_ppm = None;
+                }
+            }
+        }
+
+        // Drag completion
+        if resp.drag_stopped() {
+            state.dragging_threshold_bar = false;
+            if let (Some(start_ppm), Some(end_pos)) =
+                (state.active_roi_drag_start_ppm.take(), ptr_pos)
+            {
+                let end_ppm = screen_x_to_ppm(end_pos.x, lo, hi);
+                if (end_ppm - start_ppm).abs() >= 1e-3 {
+                    let idx = state.roi_regions.len() + 1;
+                    state.roi_regions.push(RoiRegion1d::new(
+                        format!("region_{idx}"),
+                        start_ppm,
+                        end_ppm,
+                    ));
+                    state.status_message = format!(
+                        "Added ROI region_{idx} [{:.3}, {:.3}] ppm.",
+                        start_ppm.min(end_ppm),
+                        start_ppm.max(end_ppm)
+                    );
+                }
+            }
+            if let (Some(start_ppm), Some(s_pos), Some(end_pos)) = (
+                state.active_zoom_drag_start_ppm.take(),
+                state.active_zoom_drag_start_pos.take(),
+                ptr_pos,
+            ) {
+                if (end_pos.x - s_pos.x).abs() >= 6.0 {
+                    let end_ppm = screen_x_to_ppm(end_pos.x, lo, hi);
+                    if (end_ppm - start_ppm).abs() >= 1e-4 {
+                        state.push_zoom_window(start_ppm, end_ppm);
+                        lo = state.view_ppm_min.min(state.view_ppm_max);
+                        hi = state.view_ppm_min.max(state.view_ppm_max);
+                    }
+                }
+            } else {
+                state.active_zoom_drag_start_ppm = None;
+                state.active_zoom_drag_start_pos = None;
             }
         }
     }
@@ -3791,7 +5093,7 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
     painter.rect(
         canvas_rect,
         6.0,
-        egui::Color32::from_rgb(14, 18, 26),
+        egui::Color32::from_rgb(12, 16, 24),
         egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 55, 72)),
         egui::StrokeKind::Inside,
     );
@@ -3810,7 +5112,7 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
                 egui::pos2(sx, plot_rect.top()),
                 egui::pos2(sx, plot_rect.bottom()),
             ],
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(51, 65, 85, 85)),
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(51, 65, 85, 75)),
         );
     }
 
@@ -3834,7 +5136,7 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
                     egui::Color32::from_rgba_unmultiplied(251, 191, 36, 22),
                 );
                 plot_painter.text(
-                    egui::pos2(0.5 * (x0 + x1), plot_rect.top() + 10.0),
+                    egui::pos2(0.5 * (x0 + x1), plot_rect.top() + 8.0),
                     egui::Align2::CENTER_TOP,
                     "OLS α Ref",
                     egui::FontId::monospace(10.0),
@@ -3845,6 +5147,8 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
     }
 
     let ref_idx = state.safe_ref_trace_idx();
+    let y_base = plot_rect.top() + plot_rect.height() * state.baseline_y_frac;
+    let y_px_per_unit = ((plot_rect.height() as f64) * 0.70 * state.y_gain) / max_int;
 
     // Render Mode Body
     if state.view_mode == Stack1dViewMode::Pseudo2dHeatmap {
@@ -3894,10 +5198,6 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
             );
         }
     } else {
-        let y_base = plot_rect.top() + plot_rect.height() * 0.84;
-        let max_int = state.reference_intensity_ceiling();
-        let y_px_per_unit = ((plot_rect.height() as f64) * 0.70 * state.y_gain) / max_int;
-
         // Zero baseline reference line
         plot_painter.line_segment(
             [
@@ -4021,6 +5321,300 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
         }
     }
 
+    // Draggable horizontal peak-picking SNR threshold line
+    if state.show_threshold_bar && state.view_mode != Stack1dViewMode::Pseudo2dHeatmap {
+        let thr_y_live = (y_base
+            - (state.picker_min_snr * state.estimated_noise_sigma * y_px_per_unit) as f32)
+            .clamp(plot_rect.top() + 8.0, plot_rect.bottom() - 8.0);
+        let dash_w = 6.0_f32;
+        let gap_w = 4.0_f32;
+        let mut x_cur = plot_rect.left();
+        let thr_col = egui::Color32::from_rgb(251, 146, 60);
+        while x_cur < plot_rect.right() {
+            let x_end = (x_cur + dash_w).min(plot_rect.right());
+            plot_painter.line_segment(
+                [egui::pos2(x_cur, thr_y_live), egui::pos2(x_end, thr_y_live)],
+                egui::Stroke::new(1.3, thr_col),
+            );
+            x_cur += dash_w + gap_w;
+        }
+        plot_painter.text(
+            egui::pos2(
+                plot_rect.right() - 8.0,
+                (thr_y_live - 3.0).max(plot_rect.top() + 12.0),
+            ),
+            egui::Align2::RIGHT_BOTTOM,
+            format!("Threshold SNR ≥ {:.1} (drag ↕)", state.picker_min_snr),
+            egui::FontId::monospace(10.0),
+            thr_col,
+        );
+    }
+
+    // Phase pivot vertical marker when `PivotMode1d::AtPpm` is active on Phase & Baseline tab
+    if state.selected_inspector_tab == InspectorTab1d::PhaseBaseline
+        && state.phase_pivot_mode == PivotMode1d::AtPpm
+    {
+        let px = ppm_to_screen_x(state.phase_pivot_ppm);
+        if px >= plot_rect.left() && px <= plot_rect.right() {
+            plot_painter.line_segment(
+                [
+                    egui::pos2(px, plot_rect.top()),
+                    egui::pos2(px, plot_rect.bottom()),
+                ],
+                egui::Stroke::new(1.1, egui::Color32::from_rgb(192, 132, 252)),
+            );
+            plot_painter.text(
+                egui::pos2(px + 4.0, plot_rect.bottom() - 16.0),
+                egui::Align2::LEFT_BOTTOM,
+                format!("Pivot {:.3}", state.phase_pivot_ppm),
+                egui::FontId::monospace(9.5),
+                egui::Color32::from_rgb(216, 180, 254),
+            );
+        }
+    }
+
+    // On-Canvas Picked Peak Leader Ticks & Collision-Avoided Chemical Shift Flags
+    if state.show_peak_labels && state.view_mode != Stack1dViewMode::Pseudo2dHeatmap {
+        let mut vis_peaks: Vec<(usize, &Peak1dEntry)> = state
+            .picked_peaks
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.ppm >= lo && p.ppm <= hi)
+            .collect();
+        // Tallest / selected peaks claim horizontal label slots first when zoomed out
+        vis_peaks.sort_by(|&(ia, a), &(ib, b)| {
+            let sel_a = state.selected_peak_idx == Some(ia);
+            let sel_b = state.selected_peak_idx == Some(ib);
+            sel_b
+                .cmp(&sel_a)
+                .then_with(|| b.height.abs().total_cmp(&a.height.abs()))
+        });
+
+        let mut occupied_tiers: [Vec<(f32, f32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let ref_scale = state.traces[ref_idx].scale;
+        for (p_idx, pk) in vis_peaks {
+            let sx = ppm_to_screen_x(pk.ppm);
+            if sx < plot_rect.left() + 14.0 || sx > plot_rect.right() - 14.0 {
+                continue;
+            }
+            let txt = if state.peak_labels_in_hz {
+                format!("{:.1}", pk.hz)
+            } else if span <= 1.5 {
+                format!("{:.4}", pk.ppm)
+            } else {
+                format!("{:.3}", pk.ppm)
+            };
+            let half_w = (txt.len() as f32) * 3.4 + 6.0;
+            let mut chosen_tier: Option<usize> = None;
+            for (t_idx, intervals) in occupied_tiers.iter_mut().enumerate() {
+                let overlaps = intervals
+                    .iter()
+                    .any(|&(a, b)| (sx - half_w) < b && (sx + half_w) > a);
+                if !overlaps {
+                    intervals.push((sx - half_w, sx + half_w));
+                    chosen_tier = Some(t_idx);
+                    break;
+                }
+            }
+            let Some(tier) = chosen_tier else {
+                continue;
+            };
+
+            let apex_y = (y_base - (pk.height * ref_scale * y_px_per_unit) as f32)
+                .clamp(plot_rect.top() + 44.0, y_base - 4.0);
+            let flag_y = (apex_y - 12.0 - (tier as f32) * 12.0).max(plot_rect.top() + 42.0);
+            let is_sel = state.selected_peak_idx == Some(p_idx);
+            let (tick_col, txt_col) = if is_sel {
+                (
+                    egui::Color32::from_rgb(56, 189, 248),
+                    egui::Color32::from_rgb(125, 211, 252),
+                )
+            } else if pk.is_solvent_or_impurity {
+                (
+                    egui::Color32::from_rgba_unmultiplied(251, 191, 36, 185),
+                    egui::Color32::from_rgb(252, 211, 77),
+                )
+            } else {
+                (
+                    egui::Color32::from_rgba_unmultiplied(148, 163, 184, 155),
+                    egui::Color32::from_rgb(226, 232, 240),
+                )
+            };
+
+            plot_painter.line_segment(
+                [egui::pos2(sx, apex_y - 2.0), egui::pos2(sx, flag_y + 2.0)],
+                egui::Stroke::new(if is_sel { 1.5 } else { 1.0 }, tick_col),
+            );
+            let full_lbl = if pk.is_solvent_or_impurity && !pk.note.is_empty() && span <= 4.0 {
+                let short_solv = pk.note.split_whitespace().next().unwrap_or(&pk.note);
+                format!("{txt} ({short_solv})")
+            } else {
+                txt
+            };
+            plot_painter.text(
+                egui::pos2(sx, flag_y),
+                egui::Align2::CENTER_BOTTOM,
+                full_lbl,
+                egui::FontId::monospace(if is_sel { 10.5 } else { 9.5 }),
+                txt_col,
+            );
+        }
+    }
+
+    // On-Canvas Multiplet Header Pills, Recursive J-Splitting Trees & Pedestal S-Curve Integrals
+    if state.view_mode != Stack1dViewMode::Pseudo2dHeatmap {
+        for &(mi, pill_rect) in &multiplet_pill_rects {
+            let Some(m) = state.detected_multiplets.get(mi) else {
+                continue;
+            };
+            let is_sel = state.selected_multiplet_idx == Some(mi);
+            let id_str = multiplet_letter_id(mi);
+            let fill = if is_sel {
+                egui::Color32::from_rgba_unmultiplied(14, 116, 144, 220)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(30, 41, 59, 210)
+            };
+            let stroke_col = if is_sel {
+                egui::Color32::from_rgb(56, 189, 248)
+            } else {
+                egui::Color32::from_rgb(100, 116, 139)
+            };
+            plot_painter.rect(
+                pill_rect,
+                3.0,
+                fill,
+                egui::Stroke::new(1.0, stroke_col),
+                egui::StrokeKind::Inside,
+            );
+            plot_painter.text(
+                pill_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("{id_str} ({}) {:.2}", m.class.as_str(), m.center_ppm),
+                egui::FontId::monospace(9.5),
+                egui::Color32::from_rgb(241, 245, 249),
+            );
+        }
+
+        for (mi, m) in state.detected_multiplets.iter().enumerate() {
+            let m_lo = m.range_ppm.0.min(m.range_ppm.1) - 0.012;
+            let m_hi = m.range_ppm.0.max(m.range_ppm.1) + 0.012;
+            if m_hi < lo || m_lo > hi {
+                continue;
+            }
+            let x0 = ppm_to_screen_x(m_hi).clamp(plot_rect.left(), plot_rect.right());
+            let x1 = ppm_to_screen_x(m_lo).clamp(plot_rect.left(), plot_rect.right());
+
+            // Recursive J-coupling splitting tree rungs when zoomed in (`span <= 2.2 ppm` or selected)
+            if state.show_j_trees
+                && !m.couplings.is_empty()
+                && m.tree_levels.len() >= 2
+                && (span <= 2.2 || state.selected_multiplet_idx == Some(mi))
+            {
+                let mhz = m.spectrometer_mhz.max(60.0);
+                let top_y = plot_rect.top() + 44.0;
+                let step_y = 13.0_f32;
+                let tree_col = egui::Color32::from_rgb(192, 132, 252);
+                for d in 0..(m.tree_levels.len() - 1) {
+                    let parent_lvl = &m.tree_levels[d];
+                    let child_lvl = &m.tree_levels[d + 1];
+                    let Some(j_hz) = child_lvl.applied_j_hz else {
+                        continue;
+                    };
+                    let n_eq = child_lvl.equivalent_partners.max(1);
+                    let y_p = top_y + (d as f32) * step_y;
+                    let y_c = top_y + ((d + 1) as f32) * step_y;
+                    for &(nu_p, _) in &parent_lvl.nodes_hz {
+                        let sx_p = ppm_to_screen_x(nu_p / mhz);
+                        for k in 0..=n_eq {
+                            let offset_hz = (0.5 * (n_eq as f64) - (k as f64)) * j_hz;
+                            let sx_c = ppm_to_screen_x((nu_p + offset_hz) / mhz);
+                            plot_painter.line_segment(
+                                [egui::pos2(sx_p, y_p), egui::pos2(sx_c, y_c)],
+                                egui::Stroke::new(1.15, tree_col),
+                            );
+                        }
+                    }
+                    if let Some(&(nu_first, _)) = parent_lvl.nodes_hz.first() {
+                        let lbl_x = ppm_to_screen_x(nu_first / mhz);
+                        plot_painter.text(
+                            egui::pos2(lbl_x, y_p - 1.0),
+                            egui::Align2::CENTER_BOTTOM,
+                            format!("J={j_hz:.1}Hz"),
+                            egui::FontId::monospace(9.0),
+                            egui::Color32::from_rgb(233, 213, 255),
+                        );
+                    }
+                }
+            }
+
+            // Multiplet S-curve cumulative integral + pedestal numeric proton label (`1.00 H`)
+            if state.show_integral_curves && (x1 - x0) >= 8.0 {
+                let steps = ((x1 - x0).ceil() as usize).clamp(8, 72);
+                let mut cum_pts = Vec::with_capacity(steps + 1);
+                let mut running = 0.0_f64;
+                let dp = (m_hi - m_lo) / (steps as f64);
+                let ref_tr = &state.traces[ref_idx];
+                let mut prev_val = ref_tr.sample_at_ppm(m_hi);
+                cum_pts.push((m_hi, 0.0_f64));
+                for s in 1..=steps {
+                    let cur_p = m_hi - (s as f64) * dp;
+                    let cur_val = ref_tr.sample_at_ppm(cur_p);
+                    running += 0.5 * (prev_val + cur_val) * dp;
+                    prev_val = cur_val;
+                    cum_pts.push((cur_p, running));
+                }
+                let max_cum = cum_pts
+                    .iter()
+                    .fold(0.0_f64, |acc, &(_, c)| acc.max(c.abs()))
+                    .max(1e-18);
+                let base_int_y = (y_base - plot_rect.height() * 0.14).max(plot_rect.top() + 55.0);
+                let int_h = (plot_rect.height() * 0.18).min(64.0);
+                let curve_pos: Vec<egui::Pos2> = cum_pts
+                    .into_iter()
+                    .map(|(p, c)| {
+                        egui::pos2(
+                            ppm_to_screen_x(p),
+                            base_int_y - ((c / max_cum) as f32) * int_h,
+                        )
+                    })
+                    .collect();
+                plot_painter.add(egui::Shape::line(
+                    curve_pos,
+                    egui::Stroke::new(
+                        1.15,
+                        egui::Color32::from_rgba_unmultiplied(52, 211, 153, 185),
+                    ),
+                ));
+
+                if let Some(&h_val) = state.detected_multiplet_integrals.get(mi) {
+                    let ped_y = (y_base + 5.0).min(plot_rect.bottom() - 13.0);
+                    let ped_col = egui::Color32::from_rgb(110, 231, 183);
+                    plot_painter.line_segment(
+                        [egui::pos2(x0, ped_y - 3.0), egui::pos2(x0, ped_y)],
+                        egui::Stroke::new(1.1, ped_col),
+                    );
+                    plot_painter.line_segment(
+                        [egui::pos2(x0, ped_y), egui::pos2(x1, ped_y)],
+                        egui::Stroke::new(1.1, ped_col),
+                    );
+                    plot_painter.line_segment(
+                        [egui::pos2(x1, ped_y - 3.0), egui::pos2(x1, ped_y)],
+                        egui::Stroke::new(1.1, ped_col),
+                    );
+                    if (x1 - x0) >= 24.0 {
+                        plot_painter.text(
+                            egui::pos2(0.5 * (x0 + x1), ped_y + 1.5),
+                            egui::Align2::CENTER_TOP,
+                            format!("{h_val:.2} H"),
+                            egui::FontId::monospace(9.5),
+                            ped_col,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // ROI Integral Bracket Overlays + Cumulative Integral Curves on Reference Trace
     for (j, roi) in state.roi_regions.iter().enumerate() {
         let (r_lo, r_hi) = roi.ordered_bounds();
@@ -4036,21 +5630,21 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
                     egui::pos2(x1, plot_rect.bottom()),
                 ),
                 0.0,
-                egui::Color32::from_rgba_unmultiplied(56, 189, 248, 24),
+                egui::Color32::from_rgba_unmultiplied(56, 189, 248, 20),
             );
             let bracket_col = egui::Color32::from_rgb(125, 211, 252);
-            let by = plot_rect.bottom() - 6.0;
+            let by = plot_rect.bottom() - 4.0;
             plot_painter.line_segment(
-                [egui::pos2(x0, by - 6.0), egui::pos2(x0, by)],
-                egui::Stroke::new(1.4, bracket_col),
+                [egui::pos2(x0, by - 5.0), egui::pos2(x0, by)],
+                egui::Stroke::new(1.3, bracket_col),
             );
             plot_painter.line_segment(
                 [egui::pos2(x0, by), egui::pos2(x1, by)],
-                egui::Stroke::new(1.4, bracket_col),
+                egui::Stroke::new(1.3, bracket_col),
             );
             plot_painter.line_segment(
-                [egui::pos2(x1, by - 6.0), egui::pos2(x1, by)],
-                egui::Stroke::new(1.4, bracket_col),
+                [egui::pos2(x1, by - 5.0), egui::pos2(x1, by)],
+                egui::Stroke::new(1.3, bracket_col),
             );
 
             let ref_area = integrate_trace_region_f64(
@@ -4063,52 +5657,9 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
                 egui::pos2(0.5 * (x0 + x1), plot_rect.top() + 4.0),
                 egui::Align2::CENTER_TOP,
                 format!("R{} {}: {:.3}", j + 1, roi.label, ref_area),
-                egui::FontId::monospace(10.5),
+                egui::FontId::monospace(10.0),
                 bracket_col,
             );
-
-            // Sigmoidal cumulative integral curve on reference trace
-            if state.show_integral_curves
-                && state.view_mode != Stack1dViewMode::Pseudo2dHeatmap
-                && (x1 - x0) >= 6.0
-            {
-                let steps = ((x1 - x0).ceil() as usize).clamp(8, 96);
-                let mut cum_pts = Vec::with_capacity(steps + 1);
-                let mut running = 0.0_f64;
-                let dp = (r_hi - r_lo) / (steps as f64);
-                let ref_tr = &state.traces[ref_idx];
-                let mut prev_val = ref_tr.sample_at_ppm(r_hi);
-                cum_pts.push((r_hi, 0.0_f64));
-                for s in 1..=steps {
-                    let cur_p = r_hi - (s as f64) * dp;
-                    let cur_val = ref_tr.sample_at_ppm(cur_p);
-                    running += 0.5 * (prev_val + cur_val) * dp;
-                    prev_val = cur_val;
-                    cum_pts.push((cur_p, running));
-                }
-                let max_cum = cum_pts
-                    .iter()
-                    .fold(0.0_f64, |acc, &(_, c)| acc.max(c.abs()))
-                    .max(1e-18);
-                let base_int_y = plot_rect.top() + plot_rect.height() * 0.42;
-                let int_h = plot_rect.height() * 0.22;
-                let curve_pos: Vec<egui::Pos2> = cum_pts
-                    .into_iter()
-                    .map(|(p, c)| {
-                        egui::pos2(
-                            ppm_to_screen_x(p),
-                            base_int_y - ((c / max_cum) as f32) * int_h,
-                        )
-                    })
-                    .collect();
-                plot_painter.add(egui::Shape::line(
-                    curve_pos,
-                    egui::Stroke::new(
-                        1.25,
-                        egui::Color32::from_rgba_unmultiplied(167, 243, 208, 210),
-                    ),
-                ));
-            }
         }
     }
 
@@ -4131,7 +5682,87 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
         );
     }
 
-    // Crosshair Cursor & Multi-Trace Readout Overlay
+    // Active 2-Click Zoom Anchor OR Click-Drag Horizontal Zoom Band + Live Δδ / Δν Caliper Pill
+    let zoom_band: Option<(f64, Option<f64>, bool)> =
+        if let (Some(s_ppm), Some(s_pos), Some(c_pos)) = (
+            state.active_zoom_drag_start_ppm,
+            state.active_zoom_drag_start_pos,
+            resp.interact_pointer_pos(),
+        ) {
+            if (c_pos.x - s_pos.x).abs() >= 6.0 {
+                Some((s_ppm, Some(screen_x_to_ppm(c_pos.x, lo, hi)), true))
+            } else {
+                state
+                    .zoom_anchor_ppm
+                    .map(|p1| (p1, state.cursor_ppm, false))
+            }
+        } else {
+            state
+                .zoom_anchor_ppm
+                .map(|p1| (p1, state.cursor_ppm, false))
+        };
+
+    if let Some((p1, maybe_p2, is_drag)) = zoom_band {
+        let sx1 = ppm_to_screen_x(p1).clamp(plot_rect.left(), plot_rect.right());
+        let z_col = egui::Color32::from_rgb(250, 204, 21);
+        plot_painter.line_segment(
+            [
+                egui::pos2(sx1, plot_rect.top()),
+                egui::pos2(sx1, plot_rect.bottom()),
+            ],
+            egui::Stroke::new(1.8, z_col),
+        );
+        if let Some(p2) = maybe_p2 {
+            let sx2 = ppm_to_screen_x(p2).clamp(plot_rect.left(), plot_rect.right());
+            let bx0 = sx1.min(sx2);
+            let bx1 = sx1.max(sx2);
+            if bx1 > bx0 {
+                plot_painter.rect(
+                    egui::Rect::from_min_max(
+                        egui::pos2(bx0, plot_rect.top()),
+                        egui::pos2(bx1, plot_rect.bottom()),
+                    ),
+                    2.0,
+                    egui::Color32::from_rgba_unmultiplied(250, 204, 21, 36),
+                    egui::Stroke::new(1.4, z_col),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            let dp = (p2 - p1).abs();
+            let dhz = dp * state.active_obs_mhz();
+            let hint = if is_drag {
+                "Release to zoom"
+            } else {
+                "Click 2nd point to zoom · Esc/Right-click cancel"
+            };
+            let z_txt = format!(
+                "🔍 {p1:.3} -> {p2:.3} ppm  (Δδ = {dp:.4} ppm | Δν = {dhz:.2} Hz)  · {hint}"
+            );
+            let galley = painter.layout_no_wrap(
+                z_txt,
+                egui::FontId::monospace(10.5),
+                egui::Color32::from_rgb(254, 240, 138),
+            );
+            let z_rect = egui::Rect::from_min_size(
+                egui::pos2(plot_rect.left() + 8.0, plot_rect.top() + 26.0),
+                galley.size() + egui::vec2(12.0, 6.0),
+            );
+            plot_painter.rect(
+                z_rect,
+                4.0,
+                egui::Color32::from_rgba_unmultiplied(23, 23, 34, 238),
+                egui::Stroke::new(1.0, z_col),
+                egui::StrokeKind::Inside,
+            );
+            plot_painter.galley(
+                z_rect.min + egui::vec2(6.0, 3.0),
+                galley,
+                egui::Color32::WHITE,
+            );
+        }
+    }
+
+    // Crosshair Cursor & Live δ (ppm) / ν (Hz) / Intensity Readout Overlay
     if let Some(c_ppm) = state.cursor_ppm {
         let cx = ppm_to_screen_x(c_ppm);
         if cx >= plot_rect.left() && cx <= plot_rect.right() {
@@ -4142,11 +5773,12 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
                 ],
                 egui::Stroke::new(
                     1.0,
-                    egui::Color32::from_rgba_unmultiplied(226, 232, 240, 175),
+                    egui::Color32::from_rgba_unmultiplied(226, 232, 240, 165),
                 ),
             );
 
-            let mut hud = format!("δ = {c_ppm:.4} ppm");
+            let obs_mhz = state.active_obs_mhz();
+            let mut hud = format!("δ = {c_ppm:.4} ppm ({:.1} Hz)", c_ppm * obs_mhz);
             let mut shown = 0usize;
             for (idx, tr) in state.traces.iter().enumerate() {
                 if !tr.visible {
@@ -4178,31 +5810,31 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
                 } else {
                     tr.sample_at_ppm(c_ppm)
                 };
-                if shown < 6 {
+                if shown < 4 {
                     let _ = write!(hud, " | {}: {:.3}", tr.label, val);
                 }
                 shown += 1;
             }
-            if shown > 6 {
-                let _ = write!(hud, " (+{} more)", shown - 6);
+            if shown > 4 {
+                let _ = write!(hud, " (+{} more)", shown - 4);
             }
 
             let galley = painter.layout_no_wrap(
                 hud,
-                egui::FontId::monospace(10.5),
+                egui::FontId::monospace(10.0),
                 egui::Color32::from_rgb(241, 245, 249),
             );
             let hud_rect = egui::Rect::from_min_size(
-                egui::pos2(plot_rect.left() + 8.0, plot_rect.top() + 6.0),
-                galley.size() + egui::vec2(10.0, 6.0),
+                egui::pos2(plot_rect.left() + 8.0, plot_rect.top() + 4.0),
+                galley.size() + egui::vec2(10.0, 4.0),
             );
             plot_painter.rect_filled(
                 hud_rect,
                 4.0,
-                egui::Color32::from_rgba_unmultiplied(15, 23, 42, 220),
+                egui::Color32::from_rgba_unmultiplied(15, 23, 42, 225),
             );
             plot_painter.galley(
-                hud_rect.min + egui::vec2(5.0, 3.0),
+                hud_rect.min + egui::vec2(5.0, 2.0),
                 galley,
                 egui::Color32::WHITE,
             );
@@ -4222,24 +5854,90 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState) {
         let sx = ppm_to_screen_x(p);
         if sx >= plot_rect.left() && sx <= plot_rect.right() {
             painter.line_segment(
-                [egui::pos2(sx, axis_y), egui::pos2(sx, axis_y + 4.5)],
+                [egui::pos2(sx, axis_y), egui::pos2(sx, axis_y + 4.0)],
                 egui::Stroke::new(1.0, egui::Color32::from_rgb(148, 163, 184)),
             );
             painter.text(
-                egui::pos2(sx, axis_y + 6.0),
+                egui::pos2(sx, axis_y + 5.0),
                 egui::Align2::CENTER_TOP,
-                format!("{p:.2}"),
-                egui::FontId::monospace(10.5),
+                if span <= 0.8 {
+                    format!("{p:.3}")
+                } else {
+                    format!("{p:.2}")
+                },
+                egui::FontId::monospace(10.0),
                 egui::Color32::from_rgb(203, 213, 225),
             );
         }
     }
     painter.text(
-        egui::pos2(plot_rect.right() - 2.0, axis_y + 17.0),
+        egui::pos2(plot_rect.right() - 2.0, axis_y + 5.0),
         egui::Align2::RIGHT_TOP,
         "δ (ppm)",
-        egui::FontId::proportional(10.5),
+        egui::FontId::proportional(10.0),
         egui::Color32::from_rgb(148, 163, 184),
+    );
+
+    // 36 px Full-Spectrum Overview Minimap Strip (click or drag to jump anywhere in 1 click)
+    let mm_painter = painter.with_clip_rect(minimap_rect);
+    mm_painter.rect(
+        minimap_rect,
+        3.0,
+        egui::Color32::from_rgb(17, 24, 39),
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(51, 65, 85)),
+        egui::StrokeKind::Inside,
+    );
+    let ref_tr = &state.traces[ref_idx];
+    let mm_cols = (minimap_rect.width().ceil() as usize).clamp(48, 512);
+    let mm_pts = ref_tr.decimate_for_viewport(g_lo, g_hi, mm_cols);
+    let mm_ceil = ref_tr.max_abs_effective().max(1e-12);
+    if mm_pts.len() >= 2 {
+        let mm_base = minimap_rect.top() + minimap_rect.height() * 0.84;
+        let mm_scale = (minimap_rect.height() as f64 * 0.72) / mm_ceil;
+        let line_pts: Vec<egui::Pos2> = mm_pts
+            .into_iter()
+            .map(|(p, v)| {
+                let x = minimap_rect.left() + (((g_hi - p) / g_span) as f32) * minimap_rect.width();
+                let y = (mm_base - (v * mm_scale) as f32)
+                    .clamp(minimap_rect.top() + 2.0, minimap_rect.bottom() - 2.0);
+                egui::pos2(x, y)
+            })
+            .collect();
+        mm_painter.add(egui::Shape::line(
+            line_pts,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 180, 230)),
+        ));
+    }
+
+    let vx0 = (minimap_rect.left() + (((g_hi - hi) / g_span) as f32) * minimap_rect.width())
+        .clamp(minimap_rect.left(), minimap_rect.right());
+    let vx1 = (minimap_rect.left() + (((g_hi - lo) / g_span) as f32) * minimap_rect.width())
+        .clamp(minimap_rect.left(), minimap_rect.right());
+    let win_x0 = vx0.min(vx1);
+    let win_x1 = vx0.max(vx1).max(win_x0 + 4.0);
+    if win_x0 > minimap_rect.left() {
+        mm_painter.rect_filled(
+            egui::Rect::from_min_max(minimap_rect.min, egui::pos2(win_x0, minimap_rect.bottom())),
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(8, 12, 20, 145),
+        );
+    }
+    if win_x1 < minimap_rect.right() {
+        mm_painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(win_x1, minimap_rect.top()), minimap_rect.max),
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(8, 12, 20, 145),
+        );
+    }
+    mm_painter.rect(
+        egui::Rect::from_min_max(
+            egui::pos2(win_x0, minimap_rect.top() + 1.0),
+            egui::pos2(win_x1, minimap_rect.bottom() - 1.0),
+        ),
+        2.0,
+        egui::Color32::from_rgba_unmultiplied(56, 189, 248, 32),
+        egui::Stroke::new(1.4, egui::Color32::from_rgb(56, 189, 248)),
+        egui::StrokeKind::Inside,
     );
 }
 
@@ -4685,5 +6383,195 @@ mod tests {
         state.journal_style = PublicationStyle::Nature;
         state.reformat_journal_report();
         assert!(state.formatted_journal_report.contains("500 MHz"));
+    }
+
+    #[test]
+    fn test_peak_and_multiplet_click_zoom_and_auto_y_gain() {
+        let n = 4096usize;
+        let axis = AxisPpm::from_bounds("1H", n, 9.0, 0.0, 500.0);
+        let ppm: Vec<f64> = (0..n).map(|i| axis.index_to_ppm(i as f64)).collect();
+        let mut y = vec![0.0_f64; n];
+        // Giant methyl singlet (area 30) at 1.20 ppm + weak aromatic doublet (area 1 each) at 7.80 ppm
+        let dj = 8.0 / 500.0;
+        add_lorentzian(&mut y, &ppm, 7.80 + 0.5 * dj, 0.004, 1.0);
+        add_lorentzian(&mut y, &ppm, 7.80 - 0.5 * dj, 0.004, 1.0);
+        add_lorentzian(&mut y, &ppm, 1.20, 0.004, 30.0);
+        let spec = Spectrum1D::new(
+            "dynamic_range_1d",
+            Experiment1DKind::Proton1D,
+            axis,
+            y,
+            None,
+        );
+
+        let mut state = Stack1dState::default();
+        state.load_user_spectra(vec![spec]);
+        assert!(state.picked_peaks.len() >= 3);
+        assert!(state.detected_multiplets.len() >= 2);
+        assert!((state.y_gain - 1.0).abs() < 1e-9);
+
+        // 1. Click weak aromatic peak (~7.808 ppm) -> zooms to [pk - 0.12, pk + 0.12] and boosts y_gain >> 10x!
+        let ar_pk_idx = state
+            .picked_peaks
+            .iter()
+            .position(|p| (p.ppm - 7.80).abs() < 0.05)
+            .expect("aromatic peak picked");
+        let ar_ppm = state.picked_peaks[ar_pk_idx].ppm;
+        state.zoom_to_peak(ar_pk_idx);
+        assert_eq!(state.selected_peak_idx, Some(ar_pk_idx));
+        assert!((state.view_ppm_min - (ar_ppm - 0.12)).abs() < 1e-6);
+        assert!((state.view_ppm_max - (ar_ppm + 0.12)).abs() < 1e-6);
+        assert!(
+            state.y_gain > 15.0,
+            "expected y_gain boosted for weak aromatic peak, got {}",
+            state.y_gain
+        );
+        assert_eq!(state.zoom_history.len(), 1);
+
+        // 2. Click aromatic multiplet row -> zooms around multiplet range + auto-fits y_gain
+        let ar_mult_idx = state
+            .detected_multiplets
+            .iter()
+            .position(|m| (m.center_ppm - 7.80).abs() < 0.05)
+            .expect("aromatic multiplet detected");
+        state.zoom_to_multiplet(ar_mult_idx);
+        assert_eq!(state.selected_multiplet_idx, Some(ar_mult_idx));
+        assert!(state.view_ppm_min > 7.60 && state.view_ppm_max < 8.00);
+        assert!(state.y_gain > 15.0);
+
+        // Quick 2H integral normalization on aromatic doublet makes aliphatic singlet ~30H
+        state.normalize_multiplet_integral_to(ar_mult_idx, 2.0);
+        assert!((state.detected_multiplet_integrals[ar_mult_idx] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_two_click_zoom_history_and_undo_redo() {
+        let (traces, _) = build_kinetics_demo_traces();
+        let mut state = Stack1dState::with_traces(traces);
+        let full_lo = state.view_ppm_min;
+        let full_hi = state.view_ppm_max;
+
+        // 1st click sets zoom_anchor_ppm without changing view bounds
+        assert!(!state.handle_canvas_zoom_click(7.80));
+        assert_eq!(state.zoom_anchor_ppm, Some(7.80));
+        assert!((state.view_ppm_min - full_lo).abs() < 1e-9);
+        assert!((state.view_ppm_max - full_hi).abs() < 1e-9);
+
+        // Esc / cancel clears anchor cleanly
+        state.cancel_zoom_anchor();
+        assert!(state.zoom_anchor_ppm.is_none());
+
+        // 1st click -> 2nd click zooms to [7.10, 7.80] and records full bounds in zoom_history
+        assert!(!state.handle_canvas_zoom_click(7.80));
+        assert!(state.handle_canvas_zoom_click(7.10));
+        assert!(state.zoom_anchor_ppm.is_none());
+        assert!((state.view_ppm_min - 7.10).abs() < 1e-9);
+        assert!((state.view_ppm_max - 7.80).abs() < 1e-9);
+        assert_eq!(state.zoom_history.len(), 1);
+
+        // Undo restores full bounds; Redo re-applies [7.10, 7.80]
+        assert!(state.undo_zoom());
+        assert!((state.view_ppm_min - full_lo).abs() < 1e-9);
+        assert!((state.view_ppm_max - full_hi).abs() < 1e-9);
+        assert!(state.redo_zoom());
+        assert!((state.view_ppm_min - 7.10).abs() < 1e-9);
+        assert!((state.view_ppm_max - 7.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_plain_vertical_scroll_scales_y_gain_without_changing_ppm_bounds() {
+        let (traces, _) = build_kinetics_demo_traces();
+        let mut state = Stack1dState::with_traces(traces);
+        state.push_zoom_window(7.10, 7.80);
+        let lo_before = state.view_ppm_min;
+        let hi_before = state.view_ppm_max;
+        let base_before = state.baseline_y_frac;
+
+        // Plain scroll up increases y_gain well past 250x up toward 100,000x while keeping ppm bounds identical
+        for _ in 0..40 {
+            state.apply_vertical_scroll_gain(120.0, false);
+        }
+        assert!(
+            state.y_gain > 1_000.0 && state.y_gain <= 100_000.0,
+            "y_gain = {}",
+            state.y_gain
+        );
+        assert_eq!(state.view_ppm_min, lo_before);
+        assert_eq!(state.view_ppm_max, hi_before);
+        assert_eq!(state.baseline_y_frac, base_before);
+
+        // Shift + Scroll adjusts baseline_y_frac without changing ppm bounds or y_gain
+        let gain_locked = state.y_gain;
+        state.apply_vertical_scroll_gain(60.0, true);
+        assert!(state.baseline_y_frac < base_before);
+        assert_eq!(state.y_gain, gain_locked);
+        assert_eq!(state.view_ppm_min, lo_before);
+        assert_eq!(state.view_ppm_max, hi_before);
+    }
+
+    #[test]
+    fn test_single_peak_chemical_shift_referencing_shifts_trace_peaks_and_multiplets() {
+        let n = 4096usize;
+        let axis = AxisPpm::from_bounds("1H", n, 9.0, -0.5, 500.0);
+        let ppm: Vec<f64> = (0..n).map(|i| axis.index_to_ppm(i as f64)).collect();
+        let mut y = vec![0.0_f64; n];
+        // Uncalibrated TMS sitting at +0.140 ppm and CDCl3 residual at 7.400 ppm (+0.14 ppm offset)
+        let dj = 7.5 / 500.0;
+        add_lorentzian(&mut y, &ppm, 7.400, 0.004, 1.0);
+        add_lorentzian(&mut y, &ppm, 4.260 + 0.5 * dj, 0.004, 2.0);
+        add_lorentzian(&mut y, &ppm, 4.260 - 0.5 * dj, 0.004, 2.0);
+        add_lorentzian(&mut y, &ppm, 0.140, 0.004, 3.0);
+        let mut spec = Spectrum1D::new("uncal_1h", Experiment1DKind::Proton1D, axis, y, None);
+        spec.solvent = Some("CDCl3".to_string());
+
+        let mut state = Stack1dState::default();
+        state.load_user_spectra(vec![spec]);
+
+        let tms_idx = state
+            .picked_peaks
+            .iter()
+            .position(|p| (p.ppm - 0.140).abs() < 0.01)
+            .expect("uncalibrated TMS peak");
+        state.reference_selected_peak_to_ppm(tms_idx, 0.000);
+
+        // Verify TMS is now at 0.000 ppm, CDCl3 residual is at 7.260 ppm (annotated as CDCl3!), and doublet is at 4.120 ppm
+        let new_tms = state
+            .picked_peaks
+            .iter()
+            .find(|p| p.ppm.abs() < 0.005)
+            .expect("referenced TMS at 0.00 ppm");
+        assert!(new_tms.is_solvent_or_impurity);
+
+        let cdcl3_pk = state
+            .picked_peaks
+            .iter()
+            .find(|p| (p.ppm - 7.260).abs() < 0.01)
+            .expect("CDCl3 peak at 7.26 ppm");
+        assert!(cdcl3_pk.is_solvent_or_impurity);
+        assert!(cdcl3_pk.note.contains("CDCl3"));
+
+        let dbl = state
+            .detected_multiplets
+            .iter()
+            .find(|m| (m.center_ppm - 4.120).abs() < 0.01)
+            .expect("doublet shifted to 4.120 ppm");
+        assert_eq!(dbl.class.as_str(), "d");
+
+        // Exercise headless egui rendering across all 4 bottom-dock tabs + threshold bar + J-trees
+        let egui_ctx = egui::Context::default();
+        state.show_threshold_bar = true;
+        state.zoom_anchor_ppm = Some(4.20);
+        state.cursor_ppm = Some(4.05);
+        for tab in [
+            InspectorTab1d::Peaks,
+            InspectorTab1d::Multiplets,
+            InspectorTab1d::PhaseBaseline,
+            InspectorTab1d::MultiTraceStack,
+        ] {
+            state.selected_inspector_tab = tab;
+            let _ = egui_ctx.run_ui(egui::RawInput::default(), |ui| {
+                render_stack1d_panel(ui, &mut state);
+            });
+        }
     }
 }
