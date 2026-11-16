@@ -1,4 +1,4 @@
-//! CLI subcommands `nmrassign mcp` and `nmrassign mcp-config` (`T15.1` & `T15.3`):
+//! CLI subcommands `ferric mcp` and `ferric mcp-config` (`T15.1` & `T15.3`):
 //! clean-room Model Context Protocol (`MCP`) JSON-RPC 2.0 server over `stdio` or authenticated
 //! loopback `127.0.0.1` / `[::1]` Streamable HTTP, plus 1-command client configuration export
 //! for `Antigravity`, `Claude Desktop`, and `Cursor`.
@@ -23,7 +23,7 @@ use nmr_core::mcp::{
 };
 
 /// Minimum required trimmed byte/character length for a user-supplied HTTP `Bearer` token
-/// (`nmrassign mcp --transport http` and `nmrassign mcp-config --bridge-port`).
+/// (`ferric mcp --transport http` and `ferric mcp-config --bridge-port`).
 pub const MIN_HTTP_BEARER_TOKEN_LEN: usize = 32;
 
 #[cfg(unix)]
@@ -90,7 +90,7 @@ fn validate_http_bearer_token(raw: &str, source: &str) -> Result<String, String>
     if trimmed.len() < MIN_HTTP_BEARER_TOKEN_LEN {
         return Err(format!(
             "MCP HTTP bearer token from {source} is too short ({} chars; minimum is {MIN_HTTP_BEARER_TOKEN_LEN} characters). \
-             Prefer setting NMR_MCP_BEARER_TOKEN to >= {MIN_HTTP_BEARER_TOKEN_LEN} random characters (or omit both NMR_MCP_BEARER_TOKEN and --token on `nmrassign mcp --transport http` to auto-generate a 256-bit OS CSPRNG token).",
+             Prefer setting NMR_MCP_BEARER_TOKEN to >= {MIN_HTTP_BEARER_TOKEN_LEN} random characters (or omit both NMR_MCP_BEARER_TOKEN and --token on `ferric mcp --transport http` to auto-generate a 256-bit OS CSPRNG token).",
             trimmed.len()
         ));
     }
@@ -136,12 +136,12 @@ fn parse_client_target(raw: &str) -> Result<McpClientTarget, String> {
     }
 }
 
-/// Usage text for `nmrassign mcp`.
+/// Usage text for `ferric mcp`.
 pub fn mcp_usage() -> &'static str {
     "\
 Usage:
-  nmrassign mcp [--transport stdio|http] [--root <dir> ...] [--mode read-only|read-write]
-                [--bind 127.0.0.1:<port>] [--token <bearer>] [--max-requests <N>]
+  ferric mcp [--transport stdio|http] [--root <dir> ...] [--mode read-only|read-write]
+             [--bind 127.0.0.1:<port>] [--token <bearer>] [--max-requests <N>]
 
 Options:
   --transport <stdio|http>       MCP transport framing (default: stdio).
@@ -161,14 +161,14 @@ Environment:
 "
 }
 
-/// Usage text for `nmrassign mcp-config`.
+/// Usage text for `ferric mcp-config`.
 pub fn mcp_config_usage() -> &'static str {
     "\
 Usage:
-  nmrassign mcp-config --client <antigravity|claude-desktop|cursor|generic>
-                       [--root <dir> ...] [--mode read-only|read-write]
-                       [--bridge-port <port> [--token <bearer>]]
-                       [--command <nmrassign_bin>] [-o <mcp_config.json>]
+  ferric mcp-config --client <antigravity|claude-desktop|cursor|generic>
+                    [--root <dir> ...] [--mode read-only|read-write]
+                    [--bridge-port <port> [--token <bearer>]]
+                    [--command <ferric_bin>] [-o <mcp_config.json>]
 
 Notes:
   For --bridge-port <port>, any supplied --token or NMR_MCP_BEARER_TOKEN must be >= 32 characters;
@@ -332,7 +332,7 @@ pub fn run_mcp_cli(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// Execute `nmrassign mcp-config`.
+/// Execute `ferric mcp-config`.
 pub fn run_mcp_config_cli(args: &[String]) -> Result<(), String> {
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{}", mcp_config_usage());
@@ -344,7 +344,7 @@ pub fn run_mcp_config_cli(args: &[String]) -> Result<(), String> {
     let mut mode = McpAccessMode::ReadOnly;
     let mut bridge_port: Option<u16> = None;
     let mut bearer_token: Option<String> = None;
-    let mut command = "nmrassign".to_string();
+    let mut command = "ferric".to_string();
     let mut out_path: Option<PathBuf> = None;
 
     let mut i = 0usize;

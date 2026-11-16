@@ -1,4 +1,4 @@
-//! Deterministic publication SVG figure showcase pipeline (`T16.1`: `nmrassign export-fig`).
+//! Deterministic publication SVG figure showcase pipeline (`T16.1`: `ferric export-fig`).
 //!
 //! Provenance: Original clean-room vector SVG rendering engine driving audited `nmr-core`
 //! physical simulation and optimization modules with fixed deterministic seed (`42`), zero
@@ -79,7 +79,7 @@ use nmr_core::simulate::{
     render_hsqc_2d, render_triple_3d, simulate, SimConfig, SpectrumRenderConfig,
 };
 
-/// Canonical deterministic PRNG seed for `nmrassign export-fig`.
+/// Canonical deterministic PRNG seed for `ferric export-fig`.
 pub const CANONICAL_EXPORT_SEED: u64 = 42;
 
 const UBIQUITIN_STAR_FIXTURE: &str = include_str!("../../../data/fixtures/synthetic_ubiquitin.str");
@@ -173,7 +173,7 @@ impl PanelSelection {
 
 pub fn export_fig_usage() -> &'static str {
     "Usage:\n\
-       nmrassign export-fig --out-dir <dir> [--panel all|hsqc|strips|pdb-s2|nmr1d-stack|dosy|metabolomics|exchange|octet]\n\
+       ferric export-fig --out-dir <dir> [--panel all|hsqc|strips|pdb-s2|nmr1d-stack|dosy|metabolomics|exchange|octet]\n\
      \n\
      Deterministic publication SVG showcase exporter (fixed seed 42, zero external image tools):\n\
        01_hsqc_contour_overlay.svg      2D 1H-15N HSQC positive/negative contours + assigned labels\n\

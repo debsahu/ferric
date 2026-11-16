@@ -2643,7 +2643,7 @@ pub fn write_methyl_star_assignments(
             roots.len()
         ),
         String::new(),
-        "data_nmr_assign_methyl_output".to_string(),
+        "data_ferric_methyl_output".to_string(),
         String::new(),
         "save_entity_1".to_string(),
         "   _Entity.Sf_category  entity".to_string(),

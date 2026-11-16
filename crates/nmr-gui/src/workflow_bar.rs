@@ -1041,7 +1041,7 @@ impl WorkbenchAction {
                 action: self,
                 menu: TopMenu::Help,
                 category: "Help & Shortcuts",
-                title: "About nmr-assign & Clean-Room Provenance",
+                title: "About FERRIC & Clean-Room Provenance",
                 description: "Display release version, WebGPU adapter status, and peer-reviewed algorithm citations",
                 modifier_shortcut: None,
                 chord_badge: None,

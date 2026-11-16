@@ -3458,7 +3458,7 @@ pub fn write_relax_series_nef_str(ds: &RelaxSeriesDataset) -> String {
     s.push_str("   _nef_nmr_meta_data.sf_framecode     nef_nmr_meta_data\n");
     s.push_str("   _nef_nmr_meta_data.format_name      nmr_exchange_format\n");
     s.push_str("   _nef_nmr_meta_data.format_version   1.1\n");
-    s.push_str("   _nef_nmr_meta_data.program_name     nmr_assign\n");
+    s.push_str("   _nef_nmr_meta_data.program_name     FERRIC\n");
     s.push_str(&format!(
         "   _nef_nmr_meta_data.program_version  {}\n",
         crate::VERSION

@@ -1,4 +1,4 @@
-//! Frozen real-protein raw time-domain (FID) benchmark runner (`nmrassign real-benchmark`).
+//! Frozen real-protein raw time-domain (FID) benchmark runner (`ferric real-benchmark`).
 //!
 //! Provenance: Original clean-room implementation of `docs/specs/05-benchmark.md` and
 //! `docs/specs/11-fid-processing.md` sections 5.2–5.3, citing:
@@ -2010,7 +2010,7 @@ pub struct RealBenchmarkConfig {
 // Header-Only Discovery & Compatibility Preflight (`--discover-only`, `F5`)
 // ============================================================================
 
-/// Structured per-entry status emitted by `nmrassign real-benchmark --discover-only` (`F5`).
+/// Structured per-entry status emitted by `ferric real-benchmark --discover-only` (`F5`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiscoverOnlyStatus {
     Ok,

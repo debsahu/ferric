@@ -234,7 +234,7 @@ fn format_star_in_memory(
     confidence: Option<&BTreeMap<usize, f64>>,
 ) -> String {
     let mut lines = vec![
-        "data_nmr_assign_output".to_string(),
+        "data_ferric_output".to_string(),
         String::new(),
         "save_assigned_chem_shift_list_1".to_string(),
         "   _Assigned_chem_shift_list.Sf_category  assigned_chemical_shifts".to_string(),
@@ -4007,7 +4007,7 @@ impl NmrWorkbenchApp {
     ) {
         ui.horizontal_wrapped(|ui| {
             ui.heading(
-                egui::RichText::new("nmr-assign")
+                egui::RichText::new("FERRIC")
                     .strong()
                     .color(egui::Color32::from_rgb(110, 220, 255)),
             );
@@ -7452,14 +7452,14 @@ impl NmrWorkbenchApp {
         // 8. About & Clean-Room Provenance Modal
         if self.show_about_modal {
             let mut open = self.show_about_modal;
-            egui::Window::new("About nmr-assign")
+            egui::Window::new("About FERRIC")
                 .id(egui::Id::unique("nmr_about_modal"))
                 .open(&mut open)
                 .collapsible(false)
                 .default_width(440.0_f32.min(max_modal_w))
                 .max_width(max_modal_w)
                 .show(ctx, |ui| {
-                    ui.strong(format!("nmr-assign v{}", nmr_core::VERSION));
+                    ui.strong(format!("FERRIC v{}", nmr_core::VERSION));
                     ui.label(
                         "Clean-room open-source WebGPU protein NMR resonance assignment, raw FID/NUS DSP, and Octet 2D chemical studio (MIT License).",
                     );
@@ -8485,7 +8485,7 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!(
-                "nmr-assign v{} — WebGPU Protein NMR & Octet Chemical Studio",
+                "FERRIC v{} — WebGPU Protein NMR & Octet Chemical Studio",
                 nmr_core::VERSION
             ))
             .with_inner_size([1380.0, 860.0])
@@ -8493,7 +8493,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "nmr-assign",
+        "FERRIC",
         native_options,
         Box::new(|cc| Ok(Box::new(NmrWorkbenchApp::new(cc)))),
     )

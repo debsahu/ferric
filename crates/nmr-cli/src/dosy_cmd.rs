@@ -1,4 +1,4 @@
-//! CLI subcommands `nmrassign dosy fit`, `nmrassign dosy ilt`, and `nmrassign dosy mw` (`T14.4`):
+//! CLI subcommands `ferric dosy fit`, `ferric dosy ilt`, and `ferric dosy mw` (`T14.4`):
 //! pseudo-2D pulsed-field-gradient `DOSY` ingestion (Bruker `difflist`/`acqus` `STE` & `BPP-LED`,
 //! Varian `procpar` `gzlvl1`, and tabular decay matrices), default reproducible 1–3 component
 //! Stejskal–Tanner / Wu–Johnson Levenberg–Marquardt fitting on CPU (`f64`) and WebGPU (`f32`) with
@@ -194,11 +194,11 @@ pub struct DosyMwCliReport {
 }
 
 pub fn dosy_usage() -> &'static str {
-    "nmrassign dosy — Pseudo-2D Diffusion-Ordered Spectroscopy (DOSY) solver & hydrodynamics (T14.4)\n\
+    "ferric dosy — Pseudo-2D Diffusion-Ordered Spectroscopy (DOSY) solver & hydrodynamics (T14.4)\n\
      Usage:\n\
-       nmrassign dosy fit (--in <decay.tsv|json> | --demo) [--exp-dir <dir>] [--engine cpu|gpu|auto] [-o <out.tsv|json>]\n\
-       nmrassign dosy ilt (--in <decay.tsv|json> | --demo) [--strategy gcv|lcurve|discrepancy|fixed] [-o <out.tsv|json>]\n\
-       nmrassign dosy mw  --d <m2_s> [--d <m2_s> ...] [--solvent D2O] [--temp-k 298.15] [-o <out.tsv|json>]\n\n\
+       ferric dosy fit (--in <decay.tsv|json> | --demo) [--exp-dir <dir>] [--engine cpu|gpu|auto] [-o <out.tsv|json>]\n\
+       ferric dosy ilt (--in <decay.tsv|json> | --demo) [--strategy gcv|lcurve|discrepancy|fixed] [-o <out.tsv|json>]\n\
+       ferric dosy mw  --d <m2_s> [--d <m2_s> ...] [--solvent D2O] [--temp-k 298.15] [-o <out.tsv|json>]\n\n\
      Subcommands:\n\
        fit   Discrete 1-3 component Stejskal-Tanner / Wu-Johnson CPU/WebGPU LM + BIC/AIC + bootstrap CIs [default]\n\
        ilt   Opt-in CONTIN-style second-derivative Tikhonov non-negative ILT + discrepancy/GCV/L-curve alpha-sweep\n\
@@ -1020,7 +1020,7 @@ fn run_dosy_fit(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown `nmrassign dosy fit` option {other:?}\n\n{}",
+                    "unknown `ferric dosy fit` option {other:?}\n\n{}",
                     dosy_usage()
                 ))
             }
@@ -1461,7 +1461,7 @@ fn run_dosy_ilt(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown `nmrassign dosy ilt` option {other:?}\n\n{}",
+                    "unknown `ferric dosy ilt` option {other:?}\n\n{}",
                     dosy_usage()
                 ))
             }
@@ -1660,7 +1660,7 @@ fn run_dosy_mw(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown `nmrassign dosy mw` option {other:?}\n\n{}",
+                    "unknown `ferric dosy mw` option {other:?}\n\n{}",
                     dosy_usage()
                 ))
             }
@@ -1669,7 +1669,7 @@ fn run_dosy_mw(args: &[String]) -> Result<(), String> {
     }
 
     if d_list.is_empty() {
-        return Err("`nmrassign dosy mw` requires at least one `--d <m2_s>` value".to_string());
+        return Err("`ferric dosy mw` requires at least one `--d <m2_s>` value".to_string());
     }
     let eta = solvent.viscosity_pa_s(temp_k).map_err(|e| e.to_string())?;
     let calibrated = !standards.is_empty();
@@ -1734,7 +1734,7 @@ pub fn run_dosy_cli(args: &[String]) -> Result<(), String> {
         "ilt" => run_dosy_ilt(&args[1..]),
         "mw" | "hydro" => run_dosy_mw(&args[1..]),
         first if first.starts_with('-') => {
-            // Allow `nmrassign dosy --in ... [--fit contin-ilt]` shorthand per roadmap
+            // Allow `ferric dosy --in ... [--fit contin-ilt]` shorthand per roadmap
             let wants_ilt = args.windows(2).any(|w| {
                 w[0] == "--fit"
                     && matches!(
@@ -1749,7 +1749,7 @@ pub fn run_dosy_cli(args: &[String]) -> Result<(), String> {
             }
         }
         other => Err(format!(
-            "unknown `nmrassign dosy` subcommand {other:?} (expected fit, ilt, or mw)\n\n{}",
+            "unknown `ferric dosy` subcommand {other:?} (expected fit, ilt, or mw)\n\n{}",
             dosy_usage()
         )),
     }

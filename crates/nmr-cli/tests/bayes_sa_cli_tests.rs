@@ -17,7 +17,7 @@ use nmr_core::peaks::write_peaks;
 use nmr_core::simulate::{simulate, SimConfig};
 
 fn nmrassign_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_nmrassign"))
+    PathBuf::from(env!("CARGO_BIN_EXE_ferric"))
 }
 
 fn fixture_star_path() -> PathBuf {

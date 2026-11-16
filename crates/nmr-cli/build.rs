@@ -1,4 +1,4 @@
-//! Embeds the short git commit SHA (`NMRASSIGN_GIT_SHA`) into `nmrassign` at compile time
+//! Embeds the short git commit SHA (`FERRIC_GIT_SHA`) into `ferric` at compile time
 //! without external build dependencies.
 
 use std::path::Path;
@@ -25,5 +25,5 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
 
-    println!("cargo:rustc-env=NMRASSIGN_GIT_SHA={git_sha}");
+    println!("cargo:rustc-env=FERRIC_GIT_SHA={git_sha}");
 }

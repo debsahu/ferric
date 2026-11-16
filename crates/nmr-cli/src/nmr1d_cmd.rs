@@ -1,4 +1,4 @@
-//! CLI subcommands (`nmrassign nmr1d process`, `nmrassign nmr1d multiplet`, `nmrassign nmr1d qnmr`)
+//! CLI subcommands (`ferric nmr1d process`, `ferric nmr1d multiplet`, `ferric nmr1d qnmr`)
 //! for analytical 1D small-molecule & biomolecular NMR digital signal processing, recursive
 //! multiplet `J`-coupling tree analysis, publication journal characterization formatting,
 //! `Octet` 2D chemical-structure atom-assignment linking, and internal-standard quantitative
@@ -47,10 +47,10 @@ use nmr_core::nmr1d::{
 };
 use nmr_core::octet_mol::{parse_smiles, read_mol, read_sdf, Molecule};
 
-/// Usage text for `nmrassign nmr1d`.
+/// Usage text for `ferric nmr1d`.
 pub fn nmr1d_usage() -> &'static str {
     "Usage:\n\
-     \x20 nmrassign nmr1d process   --in <fid_dir|pdata_dir|spec.jdx|spec.tsv|spec.json> --out <spec.tsv|spec.json>\n\
+     \x20 ferric nmr1d process   --in <fid_dir|pdata_dir|spec.jdx|spec.tsv|spec.json> --out <spec.tsv|spec.json>\n\
      \x20                           [--experiment 1h|13c|dept90|dept135|19f|31p] [--mhz <f64>] [--solvent <SOLV>]\n\
      \x20                           [--hsvd [<lo:hi,...>]] [--hsvd-rank 24] [--apod em|gm|lg|cos|cos2|ssb|none]\n\
      \x20                           [--lb <hz>] [--gb <hz>] [--lg-center 0.0] [--first-point 0.5] [--zf 2 | --zf-points <N>]\n\
@@ -60,14 +60,14 @@ pub fn nmr1d_usage() -> &'static str {
      \x20                           [--calibrate-solvent <SOLV>] [--cal-window 0.25] [--ref-offset <ppm>]\n\
      \x20                           [--min-snr 6.0] [--shoulders] [--match-impurities] [--deconvolve] [--deconv-region <lo:hi>]\n\
      \x20                           [--peaks-out <peaks.tsv>] [--json-out <summary.json>]\n\
-     \x20 nmrassign nmr1d multiplet --in <spec.tsv|spec.jdx|spec.json|pdata_dir> [--out <multiplets.tsv>]\n\
+     \x20 ferric nmr1d multiplet --in <spec.tsv|spec.jdx|spec.json|pdata_dir> [--out <multiplets.tsv>]\n\
      \x20                           [--mhz <f64>] [--solvent CDCl3] [--nucleus 1H|13C|19F|31P|15N] [--proton-decoupled]\n\
      \x20                           [--region <hi:lo[:label]> ...] [--regions <hi1:lo1[:lbl],...>]\n\
      \x20                           [--norm-ref <idx:protons> | --total-protons <H> | --norm-scale <factor>]\n\
      \x20                           [--region-baseline auto|none|<bias:slope>] [--style acs|joc|rsc|nature]\n\
      \x20                           [--encoding unicode|ascii|latex] [--mol <file.mol|file.sdf> | --smiles <SMILES>]\n\
      \x20                           [--links-out <links.tsv|links.json>] [--report-out <report.txt>] [--json-out <out.json>]\n\
-     \x20 nmrassign nmr1d qnmr      [--in <spec.tsv|spec.jdx|spec.json|pdata_dir> --std-region <hi:lo> --analyte-region <hi:lo:H[:lbl][:t1]> ...]\n\
+     \x20 ferric nmr1d qnmr      [--in <spec.tsv|spec.jdx|spec.json|pdata_dir> --std-region <hi:lo> --analyte-region <hi:lo:H[:lbl][:t1]> ...]\n\
      \x20                           [--std-crm DMSO2|MA|TMB|DMT|BA|DNBA | --std-name <name> --std-mw <g_mol> --std-protons <N>]\n\
      \x20                           [--std-mass-mg <mg>] [--std-mass-sigma-mg 0.0] [--std-purity <0..1> | --std-purity-pct <0..100>]\n\
      \x20                           [--std-purity-sigma <0..1> | --std-purity-sigma-pct <0..100>] [--std-mw-sigma 0.0] [--std-t1 <s>]\n\

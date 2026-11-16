@@ -147,7 +147,7 @@ impl ResponsiveWorkbenchHost for DemoWorkbenchHost {
         tablet_dock: Option<&mut TabletActiveDock>,
     ) {
         ui.horizontal_wrapped(|ui| {
-            ui.strong("nmr-assign");
+            ui.strong("FERRIC");
             ui.selectable_value(&mut self.mode, HostWorkspaceMode::ProteinNmr, "Protein");
             ui.selectable_value(&mut self.mode, HostWorkspaceMode::OctetChem, "Octet");
             ui.selectable_value(&mut self.mode, HostWorkspaceMode::Dosy, "DOSY");

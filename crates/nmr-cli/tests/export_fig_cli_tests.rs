@@ -50,7 +50,7 @@ impl Drop for ScopedTempDir {
 }
 
 fn nmrassign_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_nmrassign")
+    env!("CARGO_BIN_EXE_ferric")
 }
 
 fn repo_assets_dir() -> PathBuf {

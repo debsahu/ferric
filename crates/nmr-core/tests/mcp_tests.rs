@@ -275,7 +275,7 @@ fn test_e2e_stdio_newline_lifecycle_and_all_read_tools() {
     // Response 0 (id=1): initialize
     assert_eq!(lines[0]["id"], 1);
     assert_eq!(lines[0]["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
-    assert_eq!(lines[0]["result"]["serverInfo"]["name"], "nmr-assign-mcp");
+    assert_eq!(lines[0]["result"]["serverInfo"]["name"], "ferric-mcp");
 
     // Response 1 (id=2): ping
     assert_eq!(lines[1]["id"], 2);
@@ -908,12 +908,12 @@ fn test_jsonrpc_error_codes_and_batch_semantics() {
 #[test]
 fn test_client_config_generator_schemas_for_antigravity_claude_and_cursor() {
     let stdio_ro = McpClientMode::Stdio {
-        command: "nmrassign".to_string(),
+        command: "ferric".to_string(),
         workspace_roots: vec!["/data/nmr_project".to_string()],
         access_mode: McpAccessMode::ReadOnly,
     };
     let stdio_rw = McpClientMode::Stdio {
-        command: "nmrassign".to_string(),
+        command: "ferric".to_string(),
         workspace_roots: vec!["/data/nmr_project".to_string()],
         access_mode: McpAccessMode::ReadWrite,
     };
@@ -929,8 +929,8 @@ fn test_client_config_generator_schemas_for_antigravity_claude_and_cursor() {
         McpClientTarget::Cursor,
     ] {
         let cfg_ro = generate_mcp_client_config(target, &stdio_ro).expect("stdio ro config");
-        let entry = &cfg_ro["mcpServers"]["nmr-assign"];
-        assert_eq!(entry["command"], "nmrassign");
+        let entry = &cfg_ro["mcpServers"]["ferric"];
+        assert_eq!(entry["command"], "ferric");
         let args: Vec<&str> = entry["args"]
             .as_array()
             .unwrap()
@@ -950,7 +950,7 @@ fn test_client_config_generator_schemas_for_antigravity_claude_and_cursor() {
         );
 
         let cfg_rw = generate_mcp_client_config(target, &stdio_rw).expect("stdio rw config");
-        assert!(cfg_rw["mcpServers"]["nmr-assign"]["args"]
+        assert!(cfg_rw["mcpServers"]["ferric"]["args"]
             .as_array()
             .unwrap()
             .iter()
@@ -959,7 +959,7 @@ fn test_client_config_generator_schemas_for_antigravity_claude_and_cursor() {
         let pretty_http =
             generate_mcp_client_config_pretty(target, &bridge_mode).expect("http bridge config");
         let cfg_http: Value = serde_json::from_str(&pretty_http).unwrap();
-        let wb = &cfg_http["mcpServers"]["nmr-assign-workbench"];
+        let wb = &cfg_http["mcpServers"]["ferric-workbench"];
         assert_eq!(
             wb["headers"]["Authorization"],
             "Bearer tok_secret_987654321"

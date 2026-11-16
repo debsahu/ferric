@@ -146,19 +146,19 @@ fn methyl_cli_end_to_end_tsv_and_ucsf_spectra() {
     methyl_cmd::run_methyl_cli(&cli_args_tsv).expect("methyl CLI on TSV peak lists");
     assert!(out_cpu_star.exists());
 
-    // 3. Exercise the compiled `nmrassign methyl` subcommand binary end-to-end
-    let bin = env!("CARGO_BIN_EXE_nmrassign");
+    // 3. Exercise the compiled `ferric methyl` subcommand binary end-to-end
+    let bin = env!("CARGO_BIN_EXE_ferric");
     let help_out = process::Command::new(bin)
         .args(["methyl", "--help"])
         .output()
-        .expect("spawn nmrassign methyl --help");
+        .expect("spawn ferric methyl --help");
     assert!(
         help_out.status.success(),
-        "nmrassign methyl --help failed: {}",
+        "ferric methyl --help failed: {}",
         String::from_utf8_lossy(&help_out.stderr)
     );
     let help_stdout = String::from_utf8_lossy(&help_out.stdout);
-    assert!(help_stdout.contains("Usage: nmrassign methyl"));
+    assert!(help_stdout.contains("Usage: ferric methyl"));
 
     let out_bin_star = dir.join("ubq_bin_out.str");
     let bin_run = process::Command::new(bin)

@@ -378,7 +378,7 @@ pub fn write_star_with_header(
         lines.push(String::new());
     }
     lines.extend([
-        "data_nmr_assign_output".to_string(),
+        "data_ferric_output".to_string(),
         String::new(),
         "save_entity_1".to_string(),
         "   _Entity.Sf_category  entity".to_string(),

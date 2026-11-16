@@ -1,4 +1,4 @@
-//! CLI subcommands `nmrassign relax` and `nmrassign modelfree` for Slice `13.5` (`T13.1`–`T13.3`):
+//! CLI subcommands `ferric relax` and `ferric modelfree` for Slice `13.5` (`T13.1`–`T13.3`):
 //! pseudo-3D relaxation series integration, batched CPU/WebGPU $R_1$, $R_2$, $R_{1\rho}$ &
 //! steady-state $\{^1\text{H}\}\text{–}^{15}\text{N}$ hetNOE exponential fitting, and
 //! Lipari–Szabo / Mandel–Akke–Palmer Model-Free (`M1`–`M5`) + anisotropic rotational diffusion.
@@ -69,9 +69,9 @@ impl RelaxEngineChoice {
 }
 
 pub fn relax_usage() -> &'static str {
-    "nmrassign relax — Pseudo-3D relaxation series integration & CPU/WebGPU R1/R2/hetNOE curve fitting\n\
+    "ferric relax — Pseudo-3D relaxation series integration & CPU/WebGPU R1/R2/hetNOE curve fitting\n\
      Usage:\n\
-       nmrassign relax (--series <series.tsv|series.nef|dir> | --planes <p1,p2,...>) --out <rates.tsv> [options]\n\n\
+       ferric relax (--series <series.tsv|series.nef|dir> | --planes <p1,p2,...>) --out <rates.tsv> [options]\n\n\
      Inputs & Integration:\n\
        --series | --in <path>   Relaxation series TSV/NEF, Bruker/Varian pseudo-3D folder, or 2D plane folder\n\
        --planes <p1,p2,...>     Comma-separated 2D spectrum paths (.ft2, .ucsf, or Bruker pdata dir)\n\
@@ -93,13 +93,13 @@ pub fn relax_usage() -> &'static str {
 }
 
 pub fn modelfree_usage() -> &'static str {
-    "nmrassign modelfree — Lipari-Szabo / Mandel-Akke-Palmer M1-M5 & anisotropic rotational diffusion\n\
+    "ferric modelfree — Lipari-Szabo / Mandel-Akke-Palmer M1-M5 & anisotropic rotational diffusion\n\
      Usage:\n\
-       nmrassign modelfree (--r1 <r1.tsv> --r2 <r2.tsv> [--hetnoe <noe.tsv>] ... | --rates <combined.tsv> ...) --out <modelfree.tsv> [options]\n\n\
+       ferric modelfree (--r1 <r1.tsv> --r2 <r2.tsv> [--hetnoe <noe.tsv>] ... | --rates <combined.tsv> ...) --out <modelfree.tsv> [options]\n\n\
      Inputs (repeatable for multi-field 600 + 800 + 900 MHz datasets):\n\
-       --r1 <r1.tsv>            R1 rate table from `nmrassign relax` (repeatable per static B0 field)\n\
-       --r2 <r2.tsv>            R2 rate table from `nmrassign relax` (repeatable per static B0 field)\n\
-       --hetnoe | --noe <tsv>   Steady-state {1H}-15N hetNOE table from `nmrassign relax` (repeatable)\n\
+       --r1 <r1.tsv>            R1 rate table from `ferric relax` (repeatable per static B0 field)\n\
+       --r2 <r2.tsv>            R2 rate table from `ferric relax` (repeatable per static B0 field)\n\
+       --hetnoe | --noe <tsv>   Steady-state {1H}-15N hetNOE table from `ferric relax` (repeatable)\n\
        --rates <rates.tsv>      Single-kind or combined multi-column rate table (repeatable)\n\
        --pdb <model.pdb>        Optional 3D PDB structure for N-H unit vectors & axial/anisotropic tensor\n\n\
      Model Selection & Physics:\n\
@@ -646,7 +646,7 @@ fn median_f64(mut vals: Vec<f64>) -> f64 {
     }
 }
 
-/// Entry point for `nmrassign relax`.
+/// Entry point for `ferric relax`.
 pub fn run_relax_cli(args: &[String]) -> Result<(), String> {
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{}", relax_usage());
@@ -777,7 +777,7 @@ pub fn run_relax_cli(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown `nmrassign relax` argument {other:?}\n\n{}",
+                    "unknown `ferric relax` argument {other:?}\n\n{}",
                     relax_usage()
                 ));
             }
@@ -872,7 +872,7 @@ pub fn run_relax_cli(args: &[String]) -> Result<(), String> {
         RelaxExperimentKind::R1 | RelaxExperimentKind::R2 | RelaxExperimentKind::R1rho
     ) {
         return Err(format!(
-            "`nmrassign relax` expects R1, R2, R1rho, or hetNOE (got {}); pass --kind r1|r2|r1rho|hetnoe",
+            "`ferric relax` expects R1, R2, R1rho, or hetNOE (got {}); pass --kind r1|r2|r1rho|hetnoe",
             ds.experiment_kind.as_str()
         ));
     }
@@ -1206,7 +1206,7 @@ fn describe_diffusion_tensor(tensor: &DiffusionTensor) -> String {
     }
 }
 
-/// Entry point for `nmrassign modelfree`.
+/// Entry point for `ferric modelfree`.
 pub fn run_modelfree_cli(args: &[String]) -> Result<(), String> {
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{}", modelfree_usage());
@@ -1320,7 +1320,7 @@ pub fn run_modelfree_cli(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown `nmrassign modelfree` argument {other:?}\n\n{}",
+                    "unknown `ferric modelfree` argument {other:?}\n\n{}",
                     modelfree_usage()
                 ));
             }

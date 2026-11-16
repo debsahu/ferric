@@ -21,7 +21,7 @@ use nmr_core::peaks::{write_peaks, Peak};
 static CLI_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn nmrassign_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_nmrassign"))
+    PathBuf::from(env!("CARGO_BIN_EXE_ferric"))
 }
 
 struct CliSandbox {
@@ -589,10 +589,7 @@ fn test_cli_mcp_config_all_clients_and_adversarial_flag_errors() {
         assert!(out_stdio.status.success());
         let parsed_stdio: Value =
             serde_json::from_slice(&out_stdio.stdout).expect("valid mcp-config JSON");
-        assert_eq!(
-            parsed_stdio["mcpServers"]["nmr-assign"]["command"],
-            "nmrassign"
-        );
+        assert_eq!(parsed_stdio["mcpServers"]["ferric"]["command"], "ferric");
 
         // Bridge config via preferred `NMR_MCP_BEARER_TOKEN` environment injection (>= 32 chars)
         let out_bridge_env = Command::new(nmrassign_bin())
@@ -604,7 +601,7 @@ fn test_cli_mcp_config_all_clients_and_adversarial_flag_errors() {
         let parsed_bridge_env: Value = serde_json::from_slice(&out_bridge_env.stdout)
             .expect("valid bridge env mcp-config JSON");
         assert_eq!(
-            parsed_bridge_env["mcpServers"]["nmr-assign-workbench"]["headers"]["Authorization"],
+            parsed_bridge_env["mcpServers"]["ferric-workbench"]["headers"]["Authorization"],
             format!("Bearer {bridge_env_token}")
         );
 
@@ -626,7 +623,7 @@ fn test_cli_mcp_config_all_clients_and_adversarial_flag_errors() {
         let parsed_bridge: Value =
             serde_json::from_slice(&out_bridge.stdout).expect("valid bridge mcp-config JSON");
         assert_eq!(
-            parsed_bridge["mcpServers"]["nmr-assign-workbench"]["headers"]["Authorization"],
+            parsed_bridge["mcpServers"]["ferric-workbench"]["headers"]["Authorization"],
             format!("Bearer {bridge_cli_token}")
         );
     }
@@ -678,10 +675,10 @@ fn test_cli_mcp_config_all_clients_and_adversarial_flag_errors() {
     let help_out = Command::new(nmrassign_bin())
         .arg("--help")
         .output()
-        .expect("nmrassign --help");
+        .expect("ferric --help");
     let help_str = String::from_utf8_lossy(&help_out.stdout);
-    assert!(help_str.contains("nmrassign mcp"));
-    assert!(help_str.contains("nmrassign mcp-config"));
+    assert!(help_str.contains("ferric mcp"));
+    assert!(help_str.contains("ferric mcp-config"));
 
     println!(
         "MCP_METRIC_JSON:{}",

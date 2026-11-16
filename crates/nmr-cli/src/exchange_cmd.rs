@@ -1,4 +1,4 @@
-//! CLI subcommands `nmrassign cest`, `nmrassign cpmg`, and `nmrassign csp` for Slice `13.6`
+//! CLI subcommands `ferric cest`, `ferric cpmg`, and `ferric csp` for Slice `13.6`
 //! (`T13.4`–`T13.6`): 2-/3-state Bloch–McConnell `CEST`/`DEST` matrix-exponential fitting,
 //! Carver–Richards / Baldwin `CPMG` & Trott–Palmer off-resonance $R_{1\rho}$ relaxation
 //! dispersion, and Hungarian fast-exchange `HSQC`/`HMQC` ligand titration `CSP` + quadratic
@@ -91,9 +91,9 @@ impl TitrationExperimentKind {
 }
 
 pub fn cest_usage() -> &'static str {
-    "nmrassign cest — 2-/3-state Bloch-McConnell CEST & DEST Padé [6/6] matrix-exponential solver\n\
+    "ferric cest — 2-/3-state Bloch-McConnell CEST & DEST Padé [6/6] matrix-exponential solver\n\
      Usage:\n\
-       nmrassign cest --in <profiles.tsv> [--in <profiles_b2.tsv> ...] [--out <fit.tsv>] [options]\n\n\
+       ferric cest --in <profiles.tsv> [--in <profiles_b2.tsv> ...] [--out <fit.tsv>] [options]\n\n\
      Inputs & Physics:\n\
        --in | --profiles <tsv>  CEST/DEST saturation profile TSV (repeatable across B1 fields)\n\
        --states <2|3>           Chemical exchange topology: 2 (global A<->B) or 3 (A<->B<->C) [default: 2]\n\
@@ -108,9 +108,9 @@ pub fn cest_usage() -> &'static str {
 }
 
 pub fn cpmg_usage() -> &'static str {
-    "nmrassign cpmg — Multi-field CPMG (LM63 / CR72 / Baldwin2014) & Trott-Palmer off-resonance R1rho solver\n\
+    "ferric cpmg — Multi-field CPMG (LM63 / CR72 / Baldwin2014) & Trott-Palmer off-resonance R1rho solver\n\
      Usage:\n\
-       nmrassign cpmg (--in <cpmg.tsv> ... | --raw-planes <planes.tsv> ... | --r1rho <r1rho.tsv> --major-ppm <ppm> --larmor-mhz <mhz>) [--out <fit.tsv>] [options]\n\n\
+       ferric cpmg (--in <cpmg.tsv> ... | --raw-planes <planes.tsv> ... | --r1rho <r1rho.tsv> --major-ppm <ppm> --larmor-mhz <mhz>) [--out <fit.tsv>] [options]\n\n\
      CPMG Inputs & Dispersion Models:\n\
        --in | --series <tsv>    Processed R2,eff(nu_CPMG) series TSV (repeatable for 600+800+900 MHz)\n\
        --raw-planes <tsv>       Raw constant-time CPMG intensity plane TSV (nu_cpmg_hz=0 for I0)\n\
@@ -132,10 +132,10 @@ pub fn cpmg_usage() -> &'static str {
 }
 
 pub fn csp_usage() -> &'static str {
-    "nmrassign csp — Hungarian HSQC/HMQC titration peak tracking, Williamson 2-sigma pocket & quadratic 1:1 Kd\n\
+    "ferric csp — Hungarian HSQC/HMQC titration peak tracking, Williamson 2-sigma pocket & quadratic 1:1 Kd\n\
      Usage:\n\
-       nmrassign csp (--apo-peaks <apo.tsv> | --star <apo.str>) --step <[L]_uM[:[P]_uM]=path> ... [--out <csp.tsv>] [options]\n\
-       nmrassign csp --trajectories <tracked.tsv> [--out <csp.tsv>] [options]\n\n\
+       ferric csp (--apo-peaks <apo.tsv> | --star <apo.str>) --step <[L]_uM[:[P]_uM]=path> ... [--out <csp.tsv>] [options]\n\
+       ferric csp --trajectories <tracked.tsv> [--out <csp.tsv>] [options]\n\n\
      Inputs & Titration Tracking:\n\
        --apo-peaks <apo.tsv>    Assigned apo crosspeak TSV (seq_id, res_name, h_ppm, n_or_c_ppm)\n\
        --star | --apo-star <p>  Assigned apo NMR-STAR (.str) chemical shift list\n\
@@ -274,7 +274,7 @@ pub fn run_cest_cli(args: &[String]) -> Result<(), String> {
     }
 
     if in_paths.is_empty() {
-        return Err("nmrassign cest requires at least one --in <profiles.tsv>".to_string());
+        return Err("ferric cest requires at least one --in <profiles.tsv>".to_string());
     }
 
     let mut profiles: Vec<CestProfileDataset> = Vec::new();
@@ -707,7 +707,7 @@ pub fn run_cpmg_cli(args: &[String]) -> Result<(), String> {
 
     if series_paths.is_empty() && raw_plane_paths.is_empty() {
         return Err(
-            "nmrassign cpmg requires --in <cpmg.tsv>, --raw-planes <planes.tsv>, or --r1rho <r1rho.tsv>"
+            "ferric cpmg requires --in <cpmg.tsv>, --raw-planes <planes.tsv>, or --r1rho <r1rho.tsv>"
                 .to_string(),
         );
     }
@@ -1017,7 +1017,7 @@ fn load_unassigned_step_peaks(
         )
     })?;
 
-    // Try standard `nmrassign` peak TSV first if it carries an `exp` header or known experiment column
+    // Try standard `ferric` peak TSV first if it carries an `exp` header or known experiment column
     if let Ok(std_peaks) = read_peaks(path) {
         if !std_peaks.is_empty() {
             return Ok(std_peaks
@@ -1346,14 +1346,13 @@ pub fn run_csp_cli(args: &[String]) -> Result<(), String> {
             load_apo_peaks_from_star(sp, exp_kind)?
         } else {
             return Err(
-                "nmrassign csp requires --apo-peaks <apo.tsv>, --star <apo.str>, or --trajectories <traj.tsv>"
+                "ferric csp requires --apo-peaks <apo.tsv>, --star <apo.str>, or --trajectories <traj.tsv>"
                     .to_string(),
             );
         };
         if step_specs.is_empty() {
             return Err(
-                "nmrassign csp requires at least 3 --step <[L]_uM=path> titration points"
-                    .to_string(),
+                "ferric csp requires at least 3 --step <[L]_uM=path> titration points".to_string(),
             );
         }
         let mut steps = Vec::with_capacity(step_specs.len() + 1);

@@ -1,4 +1,4 @@
-//! Clean-room BMRB NMR-STAR and raw time-domain (FID) archive fetcher (`nmrassign fetch-bmrb`).
+//! Clean-room BMRB NMR-STAR and raw time-domain (FID) archive fetcher (`ferric fetch-bmrb`).
 //!
 //! Provenance: Original clean-room implementation of `docs/specs/11-fid-processing.md` section 5.1
 //! with zero external Cargo dependencies, citing:
@@ -23,7 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Required User-Agent header sent on all BMRB HTTP/HTTPS requests.
-pub const BMRB_USER_AGENT: &str = "nmrassign-fetch";
+pub const BMRB_USER_AGENT: &str = "ferric-fetch";
 
 /// Minimum delay between consecutive HTTP requests (`>= 1000 ms`, enforcing `<= 1 req/s`).
 pub const MIN_HTTP_INTERVAL_MS: u64 = 1050;
@@ -1681,7 +1681,7 @@ pub fn render_provenance_markdown(
          - **BMRB Accession**: `{bmrb_id}` (`bmr{bmrb_id}`)\n\
          - **Time-Domain Directory**: `{td_dir_url}`\n\
          - **Downloaded At (UTC)**: `{utc_timestamp}`\n\
-         - **Downloader**: `nmrassign fetch-bmrb` (`User-Agent: {BMRB_USER_AGENT}`, `<= 1 req/s`)\n\
+         - **Downloader**: `ferric fetch-bmrb` (`User-Agent: {BMRB_USER_AGENT}`, `<= 1 req/s`)\n\
          - **Total Downloaded Size**: `{total_bytes}` bytes ({:.2} MiB)\n\
          - **License / Data Usage Terms**: Biological Magnetic Resonance Data Bank (BMRB) entries \
            and time-domain archives are distributed in the **public domain / CC0 1.0 Universal** \

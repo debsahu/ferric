@@ -1,4 +1,4 @@
-//! `nmrassign methyl` command implementation for supramolecular `13C`-methyl TROSY (`ILVMAT`)
+//! `ferric methyl` command implementation for supramolecular `13C`-methyl TROSY (`ILVMAT`)
 //! peak picking and WebGPU/CPU structure-based NOE contact-graph assignment
 //! (`docs/specs/13-methyl-trosy.md` §3.4).
 //!
@@ -42,7 +42,7 @@ enum ComputeBackend {
 
 fn print_methyl_usage() {
     println!(
-        "Usage: nmrassign methyl --pdb <model.pdb> --hmqc <2d_or_tsv> --noesy <3d_or_tsv> \\\n  \
+        "Usage: ferric methyl --pdb <model.pdb> --hmqc <2d_or_tsv> --noesy <3d_or_tsv> \\\n  \
          [--labeling ILV-proS|ILV-proR|ILV-racemic|ILVMAT|<RES:ATOM,...>] \\\n  \
          [--hmcmcbca <hmcm.tsv>] [--engine auto|gpu|cpu] [--seeds <N>] [-o <out.str>]"
     );
@@ -252,7 +252,7 @@ where
             }
             other => {
                 return Err(format!(
-                    "unrecognized `nmrassign methyl` flag `{other}` (use `--help` for usage)"
+                    "unrecognized `ferric methyl` flag `{other}` (use `--help` for usage)"
                 ));
             }
         }

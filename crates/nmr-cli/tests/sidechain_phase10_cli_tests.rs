@@ -252,7 +252,7 @@ fn sidechain_cli_aromatic_and_stereospecific_ambiguity_gating() {
 
     // 3. Execute `nmrassign sidechain` with aromatic + stereospecific flags
     let out_star = dir.join("ubiquitin_phase10_all_atom.str");
-    let bin = env!("CARGO_BIN_EXE_nmrassign");
+    let bin = env!("CARGO_BIN_EXE_ferric");
     let run = process::Command::new(bin)
         .args([
             "sidechain",
@@ -465,7 +465,7 @@ fn sidechain_cli_real_star_without_peaks_preserves_shifts_and_resolves_stereospe
 
     // 1. Run `nmrassign sidechain` with NO `--peaks`: must preserve exact input shifts up to stereospec swaps!
     let out_star = dir.join("out_stereospec_no_peaks.str");
-    let bin = env!("CARGO_BIN_EXE_nmrassign");
+    let bin = env!("CARGO_BIN_EXE_ferric");
     let run = process::Command::new(bin)
         .args([
             "sidechain",
@@ -600,7 +600,7 @@ fn sidechain_cli_real_star_without_peaks_preserves_shifts_and_resolves_stereospe
 fn sidechain_cli_p0_1_rejects_implicit_simulation_and_invalid_stereo_threshold() {
     let root = repo_root();
     let star_in = root.join("data/fixtures/synthetic_ubiquitin.str");
-    let bin = env!("CARGO_BIN_EXE_nmrassign");
+    let bin = env!("CARGO_BIN_EXE_ferric");
 
     let dir = env::temp_dir().join(format!("nmr_sidechain_p0_1_err_test_{}", process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -700,7 +700,7 @@ fn sidechain_cli_p0_1_real_aromatic_and_stereospec_roundtrip_preserves_untouched
     let star_bb = root.join("data/fixtures/synthetic_ubiquitin.str");
     let pdb_in = root.join("data/pdb_refs/1d3z.pdb");
     let seed = 2026u64;
-    let bin = env!("CARGO_BIN_EXE_nmrassign");
+    let bin = env!("CARGO_BIN_EXE_ferric");
 
     let dir = env::temp_dir().join(format!(
         "nmr_sidechain_p0_1_roundtrip_test_{}",

@@ -17,7 +17,7 @@ use nmr_core::nmrstar::read_star_all_atoms;
 use nmr_core::rdc::read_rdc_tsv;
 
 fn nmrassign_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_nmrassign"))
+    PathBuf::from(env!("CARGO_BIN_EXE_ferric"))
 }
 
 fn workspace_root() -> PathBuf {
@@ -31,23 +31,27 @@ fn test_cli_version_matches_workspace_and_help_lists_torsions_and_rdc() {
     let ver_out = Command::new(&bin)
         .arg("--version")
         .output()
-        .expect("run nmrassign --version");
+        .expect("run ferric --version");
     assert!(ver_out.status.success());
     let ver_stdout = String::from_utf8_lossy(&ver_out.stdout);
-    let expected_prefix = format!("nmrassign {} (", env!("CARGO_PKG_VERSION"));
+    let expected_prefix = format!("ferric {} (", env!("CARGO_PKG_VERSION"));
     assert!(
         ver_stdout.starts_with(&expected_prefix),
         "expected version prefix '{expected_prefix}', got: {ver_stdout}"
+    );
+    assert!(
+        ver_stdout.trim_end().ends_with(") — Rust + WebGPU"),
+        "expected '— Rust + WebGPU' suffix, got: {ver_stdout}"
     );
     assert_eq!(nmr_core::VERSION, env!("CARGO_PKG_VERSION"));
 
     let help_out = Command::new(&bin)
         .arg("--help")
         .output()
-        .expect("run nmrassign --help");
+        .expect("run ferric --help");
     assert!(help_out.status.success());
     let help_stdout = String::from_utf8_lossy(&help_out.stdout);
-    assert!(help_stdout.contains("nmrassign torsions"));
+    assert!(help_stdout.contains("ferric torsions"));
     assert!(help_stdout.contains("--rdc <rdcs.tsv|rdcs.nef>"));
     assert!(help_stdout.contains("--torsion-db"));
 }
@@ -434,7 +438,7 @@ fn test_phase12_cli_strict_cross_command_and_flag_guards() {
                 "--rdc",
                 rdc.to_str().unwrap(),
             ],
-            "not supported in `nmrassign pipeline`",
+            "not supported in `ferric pipeline`",
         ),
         // 3. `--rdc` on `report` without `--pdb` must fail hard
         (
@@ -558,7 +562,7 @@ fn test_phase12_cli_strict_cross_command_and_flag_guards() {
                 dummy_out.to_str().unwrap(),
                 "--include-chi1",
             ],
-            "not supported in `nmrassign pipeline`",
+            "not supported in `ferric pipeline`",
         ),
         // 9. `--ph` bounds on `sidechain` (`0.0..=14.0`) and rejection on `torsions` / `structure`
         (

@@ -1,4 +1,4 @@
-//! Spectrometer folder & archive auto-classifier (`nmrassign inspect`, `/api/v1/inspect`,
+//! Spectrometer folder & archive auto-classifier (`ferric inspect`, `/api/v1/inspect`,
 //! and `wasm32`-compatible drag-and-drop inventory engine).
 //!
 //! Provenance: Clean-room original implementation of `docs/specs/12-workbench-ux.md` §1,
@@ -310,7 +310,7 @@ impl PulseSequenceClass {
         }
     }
 
-    /// Canonical `nmrassign` solver experiment token when directly supported by the peak/assignment pipeline.
+    /// Canonical `ferric` solver experiment token when directly supported by the peak/assignment pipeline.
     pub fn canonical_solver_exp(self) -> Option<&'static str> {
         match self {
             Self::N15Hsqc => Some("HSQC"),

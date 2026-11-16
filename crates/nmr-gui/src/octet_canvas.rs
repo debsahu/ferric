@@ -4500,7 +4500,7 @@ fn export_builtin_mol_v2000(scene: &RenderScene, as_sdf: bool) -> String {
         .collect();
 
     let mut out = String::new();
-    out.push_str("Octet-Draw / nmr-assign\n  nmr-gui 0200262D\n\n");
+    out.push_str("Octet-Draw / FERRIC\n  ferric-gui 0200262D\n\n");
     out.push_str(&format!(
         "{:>3}{:>3}  0  0  0  0  0  0  0  0999 V2000\n",
         real_atoms.len(),
@@ -4768,7 +4768,7 @@ fn export_builtin_jcamp_dx(
     formula: &str,
 ) -> String {
     let mut jdx = String::new();
-    jdx.push_str("##TITLE=Octet-Draw / nmr-assign Predicted 1D 1H NMR\n");
+    jdx.push_str("##TITLE=Octet-Draw / FERRIC Predicted 1D 1H NMR\n");
     jdx.push_str("##JCAMP-DX=5.01\n");
     jdx.push_str("##DATA TYPE=NMR SPECTRUM\n");
     jdx.push_str(&format!("##MOLFORM={formula}\n"));

@@ -1291,7 +1291,7 @@ impl McpServer {
                 "prompts": { "listChanged": false }
             },
             "serverInfo": {
-                "name": "nmr-assign-mcp",
+                "name": "ferric-mcp",
                 "version": crate::VERSION
             },
             "instructions": format!(
@@ -4478,7 +4478,7 @@ impl McpClientTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
 pub enum McpClientMode {
-    /// Launch `nmrassign mcp` over `stdio` confined to `workspace_roots`.
+    /// Launch `ferric mcp` over `stdio` confined to `workspace_roots`.
     Stdio {
         command: String,
         workspace_roots: Vec<String>,
@@ -4541,7 +4541,7 @@ pub fn generate_mcp_client_config(
 
             Ok(json!({
                 "mcpServers": {
-                    "nmr-assign": server_entry
+                    "ferric": server_entry
                 }
             }))
         }
@@ -4596,7 +4596,7 @@ pub fn generate_mcp_client_config(
 
             Ok(json!({
                 "mcpServers": {
-                    "nmr-assign-workbench": server_entry
+                    "ferric-workbench": server_entry
                 }
             }))
         }

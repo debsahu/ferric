@@ -54,17 +54,17 @@ impl Drop for ScopedTempDir {
 }
 
 fn nmrassign_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_nmrassign")
+    env!("CARGO_BIN_EXE_ferric")
 }
 
 #[test]
 fn test_dosy_and_metabolomics_cli_help_and_error_handling() {
     let top = Command::new(nmrassign_bin())
         .output()
-        .expect("run top-level nmrassign");
+        .expect("run top-level ferric");
     let top_stdout = String::from_utf8_lossy(&top.stdout);
-    assert!(top_stdout.contains("nmrassign dosy"));
-    assert!(top_stdout.contains("nmrassign metabolomics"));
+    assert!(top_stdout.contains("ferric dosy"));
+    assert!(top_stdout.contains("ferric metabolomics"));
 
     for args in [
         vec!["dosy", "--help"],

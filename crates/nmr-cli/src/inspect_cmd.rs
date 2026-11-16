@@ -1,4 +1,4 @@
-//! `nmrassign inspect <path> [--json]` command implementation (`docs/specs/12-workbench-ux.md` §1.5).
+//! `ferric inspect <path> [--json]` command implementation (`docs/specs/12-workbench-ux.md` §1.5).
 //!
 //! Provenance: Clean-room original CLI wrapper around `nmr_core::classify::classify_nmr_workspace`.
 
@@ -108,7 +108,7 @@ fn truncate_middle(s: &str, max_chars: usize) -> String {
     format!("{left}...{right}")
 }
 
-/// Execute `nmrassign inspect <path> [--json]`.
+/// Execute `ferric inspect <path> [--json]`.
 pub fn cmd_inspect(args: &[String]) -> Result<(), String> {
     let mut target_path: Option<PathBuf> = None;
     let mut json_output = false;
@@ -118,7 +118,7 @@ pub fn cmd_inspect(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: nmrassign inspect <path> [--json]\n\n\
+                    "Usage: ferric inspect <path> [--json]\n\n\
                      Inspect a spectrometer folder, single spectrum, or .tar/.tar.gz/.tgz archive\n\
                      without reading bulk binary FID or cube payloads."
                 );
@@ -152,7 +152,7 @@ pub fn cmd_inspect(args: &[String]) -> Result<(), String> {
     }
 
     let path = target_path.ok_or_else(|| {
-        "missing workspace or archive path; usage: nmrassign inspect <path> [--json]".to_string()
+        "missing workspace or archive path; usage: ferric inspect <path> [--json]".to_string()
     })?;
 
     let inv = classify_nmr_workspace(&path)?;

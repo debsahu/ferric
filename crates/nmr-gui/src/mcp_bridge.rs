@@ -1134,7 +1134,7 @@ pub fn build_mcp_client_config_json(
     };
     let doc = json!({
         "mcpServers": {
-            "nmrassign-workbench": server_entry,
+            "ferric-workbench": server_entry,
         }
     });
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
@@ -1545,7 +1545,7 @@ fn dispatch_mcp_jsonrpc(inner: &mut SharedBridgeInner, raw_body: &[u8]) -> Optio
                     "tools": { "listChanged": false }
                 },
                 "serverInfo": {
-                    "name": "nmrassign-gui-mcp-bridge",
+                    "name": "ferric-gui-mcp-bridge",
                     "version": nmr_core::VERSION,
                 }
             }),
@@ -2974,7 +2974,7 @@ mod tests {
                 "nmr_mcp_testtoken",
             );
             let parsed: Value = serde_json::from_str(&cfg_str).expect("valid client config JSON");
-            let entry = &parsed["mcpServers"]["nmrassign-workbench"];
+            let entry = &parsed["mcpServers"]["ferric-workbench"];
             assert_eq!(
                 entry["headers"]["Authorization"],
                 "Bearer nmr_mcp_testtoken"

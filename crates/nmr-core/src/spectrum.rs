@@ -421,7 +421,7 @@ pub fn write_bruker_pdata_2d(pdata_dir: impl AsRef<Path>, spec: &Spectrum2D) -> 
     let write_proc = |path: &Path, ax: &AxisPpm| -> Result<(), String> {
         let sw_hz = ax.sw_ppm() * ax.obs_mhz;
         let content = format!(
-            "##TITLE= nmrassign pdata\n\
+            "##TITLE= ferric pdata\n\
              ##$SI= {}\n\
              ##$XDIM= {}\n\
              ##$SW_p= {:.6}\n\
@@ -532,7 +532,7 @@ pub fn write_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, spec: &Spectrum3D) -> 
     let write_proc = |path: &Path, ax: &AxisPpm| -> Result<(), String> {
         let sw_hz = ax.sw_ppm() * ax.obs_mhz;
         let content = format!(
-            "##TITLE= nmrassign pdata\n\
+            "##TITLE= ferric pdata\n\
              ##$SI= {}\n\
              ##$XDIM= {}\n\
              ##$SW_p= {:.6}\n\
@@ -1044,7 +1044,7 @@ fn encode_ucsf_file_header(ndim: u8) -> [u8; UCSF_FILE_HEADER_BYTES] {
     hdr[11] = 1; // ncomponents = 1 (real)
     hdr[12] = 0; // encoding = 0 (IEEE 754 float32)
     hdr[13] = 2; // format version = 2
-    let comment = b"nmrassign UCSF v2 spectrum";
+    let comment = b"ferric UCSF v2 spectrum";
     hdr[46..46 + comment.len()].copy_from_slice(comment);
     hdr
 }

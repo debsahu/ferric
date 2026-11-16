@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Interactive WebGPU + egui NMR spectrum & backbone resonance assignment workbench"
 
 [[bin]]
-name = "nmrassign-gui"
+name = "ferric-gui"
 path = "src/main.rs"
 
 [dependencies]

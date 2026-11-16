@@ -141,7 +141,7 @@ pub struct ServiceOptions {
     /// Optional canonicalized root directory inside which `POST /api/v1/inspect` may inspect
     /// server-side paths. When `None` (the default), server-side `path` inspection over HTTP is
     /// disabled (`403 Forbidden`) and callers must upload `entries` or archive bytes (or use the
-    /// local CLI `nmrassign inspect <path>`).
+    /// local CLI `ferric inspect <path>`).
     pub inspect_root: Option<PathBuf>,
     /// Explicit cross-origin allow-list (e.g. `["http://localhost:5173"]`). Empty by default
     /// (strict same-origin only; `Access-Control-Allow-Origin: *` is never emitted).
@@ -1404,7 +1404,7 @@ fn format_star_with_sequence(
         format!(
             "data_{}",
             if clean_proj.is_empty() {
-                "nmr_assign_output"
+                "ferric_output"
             } else {
                 &clean_proj
             }
@@ -1564,7 +1564,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>nmr-assign — Automated NMR Resonance Assignment Workbench</title>
+<title>FERRIC — Automated NMR Resonance Assignment Workbench</title>
 <style>
   :root {
     --bg: #0b1120;
@@ -1675,7 +1675,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <body>
 <header>
   <div class="brand">
-    <span class="brand-badge">NMR v__NMR_VERSION__</span>
+    <span class="brand-badge">FERRIC v__NMR_VERSION__</span>
     <h1>Automated Protein NMR Backbone Assignment &amp; NEF Pipeline</h1>
   </div>
   <button class="demo-btn" id="btn-demo" type="button">Load Synthetic Ubiquitin Demo</button>

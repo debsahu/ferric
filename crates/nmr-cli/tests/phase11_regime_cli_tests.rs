@@ -51,7 +51,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn nmrassign_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_nmrassign"))
+    PathBuf::from(env!("CARGO_BIN_EXE_ferric"))
 }
 
 fn make_temp_dir(tag: &str) -> PathBuf {

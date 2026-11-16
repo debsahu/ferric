@@ -1,4 +1,4 @@
-//! Command-line interface (`nmrassign`) for GPU/CPU NMR backbone & sidechain resonance assignment,
+//! Command-line interface (`ferric`) for GPU/CPU NMR backbone & sidechain resonance assignment,
 //! 2D/3D classical & neural CNN peak picking, multi-protein benchmarking, 3D NOESY + torsion-angle
 //! structure folding, CCPN NEF v1.1 interchange, HTML quality reporting, self-hosted HTTP service,
 //! and Octet-Draw 2D chemical structure / IUPAC / 1D NMR analytics.
@@ -191,51 +191,51 @@ impl Default for ReportOptions {
 
 pub(crate) fn version_string() -> String {
     format!(
-        "nmrassign {} ({})",
+        "ferric {} ({}) — Rust + WebGPU",
         nmr_core::VERSION,
-        env!("NMRASSIGN_GIT_SHA")
+        env!("FERRIC_GIT_SHA")
     )
 }
 
 fn usage() -> String {
     format!(
-        "{} — Rust + WebGPU\n\
+        "{}\n\
      Usage:\n\
-       nmrassign --version | -V | version\n\
-       nmrassign inspect         <path> [--json]\n\
-       nmrassign benchmark       --star <ref.str> [--realistic] [--seeds 1] [--solver standard|evo-graph|bayes-sa] [--engine gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--no-auto-ref] [--locks <SPEC>] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
-       nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|evo-graph|bayes-sa] [--engine gpu|cpu] [--runs 16] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
-       nmrassign real-benchmark  [--manifest data/benchmark/real_manifest.tsv] --split dev|heldout [--cohort <name>] [--discover-only] [--solver evo-graph|standard|bayes-sa] [--engine gpu|cpu] [--seeds 5] [--data-root data/private/bmrb] [--no-crop] [--lp] [--json-out <path>]\n\
-       nmrassign fetch-bmrb      --id <bmrb_id> [--dest <dir>] [--dry-run] [--all-archives] [--max-bytes <bytes>]\n\
-       nmrassign process         --in <fid_dir> --out <path_or_dir> [--exp <EXP>] [--recipe <json>] [--crop-h 5.5:11.5] [--no-crop] [--lp] [--auto-phase] [--phase-x P0:P1] [--phase-y P0:P1] [--phase-z P0:P1] [--hilbert] [--nus-method fista|ist]\n\
-       nmrassign e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
-       nmrassign assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--r-bleach 11.0] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--solver evo-graph|standard|bayes-sa] [--engine auto|gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--no-auto-ref] [--locks <SPEC>] [--json-out <path>] [--nef-out <path>] [--report-out <path>] [--priors priors.json] [-v]\n\
-       nmrassign propensity      --shifts <assigned.str|assigned.nef> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]\n\
-       nmrassign torsions        --shifts <assigned.str|assigned.nef> -o <out.tsv|out.nef|out.json> [--include-chi1] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>]\n\
-       nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [--no-auto-offset] [-v]\n\
-       nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--realistic] [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
-       nmrassign pick            (--hsqc <path> [--triple EXP=path ...] | --fid <dir> [--exp <EXP>] | --fid-hsqc <dir> [--fid-triple EXP=dir ...]) --out <peaks.tsv> [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
-       nmrassign priors          --stars <dir_or_file> --out <priors.json>\n\
-       nmrassign sidechain       --star <ref.str> [--peaks <peaks.tsv>] [--aromatic] [--ph <f64>] [--arom-c13hsqc <path>] [--hbcbgcdhd <path>] [--hbcbgcdce <path>] [--aromatic-tocsy <path>] [--aromatic-noesy <path>] [--his-hmqc <path>] [--trp-hsqc <path>] [--stereospec] [--j-couplings <j.tsv>] [--intra-noes <noes.tsv>] [--pdb <model.pdb>] [--out <all_atom.str>] [--runs 16] [--steps 2500] [--seed 2026]\n\
-       nmrassign methyl          --pdb <model.pdb> --hmqc <2d_or_tsv> --noesy <3d_or_tsv> [--labeling ILV-proS|ILV-proR|ILV-racemic|ILVMAT|<RES:ATOM,...>] [--hmcmcbca <hmcm.tsv>] [--engine gpu|cpu] [--seeds <N>] [-o <out.str>]\n\
-       nmrassign relax           (--series <series.tsv|series.nef|dir> | --planes <p1,p2,...>) --out <rates.tsv> [--kind r1|r2|r1rho|hetnoe] [--peaks <peaks.tsv> | --star <shifts.str>] [--vdlist <file> | --delays <csv>] [--engine cpu|gpu|auto] [--mc-trials 500]\n\
-       nmrassign modelfree       (--r1 <r1.tsv> --r2 <r2.tsv> [--hetnoe <noe.tsv>] ... | --rates <rates.tsv> ...) --out <modelfree.tsv> [--pdb <opt.pdb>] [--diffusion auto|isotropic|axial|anisotropic] [--criterion aic|aicc|bic|ftest]\n\
-       nmrassign cest            --in <profiles.tsv> [--in <profiles_b2.tsv> ...] [--out <fit.tsv>] [--states 2|3] [--triangular] [--b1-quad 5] [--engine cpu|gpu|auto] [--chi2-surface] [--json-out <fit.json>]\n\
-       nmrassign cpmg            (--in <cpmg.tsv> ... | --raw-planes <planes.tsv> ... | --r1rho <r1rho.tsv> --major-ppm <ppm> --larmor-mhz <mhz>) [--out <fit.tsv>] [--model baldwin2014|cr72|lm63|numerical2x2|flat] [--engine cpu|gpu|auto] [--json-out <fit.json>]\n\
-       nmrassign csp             (--apo-peaks <apo.tsv> | --star <apo.str>) --step <[L]_uM[:[P]_uM]=path> ... [--out <csp.tsv>] [--experiment hsqc|hmqc] [--protein-um 100.0] [--ligand-stock-um <uM>] [--mc-trials 400] [--trajectories-out <traj.tsv>] [--json-out <csp.json>]\n\
-       nmrassign nmr1d           (process | multiplet | qnmr) [options]  (see `nmrassign nmr1d --help`)\n\
-       nmrassign structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--rdc <rdcs.tsv|rdcs.nef>] [--torsion-db] [--include-chi1] [--rdc-weight 0.75] [--rdc-free-frac 0.20] [--engine auto|gpu|cpu] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
-       nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
-       nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
-       nmrassign report          --star|--shifts <shifts.str|shifts.nef> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--rdc <rdcs.tsv|rdcs.nef>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]\n\
-       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--idp-propensity] [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard|bayes-sa] [--no-auto-ref] [--locks <SPEC>] [--method classical|neural] [--engine auto|gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
-       nmrassign serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
-       nmrassign mcp             [--transport stdio|http] [--root <dir> ...] [--mode read-only|read-write] [--bind 127.0.0.1:<port>] [--token <bearer>]\n\
-       nmrassign mcp-config      --client antigravity|claude-desktop|cursor [--root <dir> ...] [--mode read-only|read-write] [--bridge-port <port>] [-o <out.json>]\n\
-       nmrassign dosy            fit|ilt|mw [--in <decay.tsv|json> | --exp-dir <bruker_or_varian_dir> | --demo] [--engine cpu|gpu|auto] [--criterion bic|aic] [--max-components 3] [-o <out.tsv|json>]\n\
-       nmrassign metabolomics    bin|pca|oplsda|stocsy [--in <study.json|buckets.csv> | --cohort <json> | --manifest <tsv> | --demo] [-o <out>]\n\
-       nmrassign export-fig      --out-dir <dir> [--panel all|hsqc|strips|pdb-s2|nmr1d-stack|dosy|metabolomics|exchange|octet]\n\
-       nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}}>] [--solvent CDCl3] [--mhz 400]\n",
+       ferric --version | -V | version\n\
+       ferric inspect         <path> [--json]\n\
+       ferric benchmark       --star <ref.str> [--realistic] [--seeds 1] [--solver standard|evo-graph|bayes-sa] [--engine gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--no-auto-ref] [--locks <SPEC>] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
+       ferric benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|evo-graph|bayes-sa] [--engine gpu|cpu] [--runs 16] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
+       ferric real-benchmark  [--manifest data/benchmark/real_manifest.tsv] --split dev|heldout [--cohort <name>] [--discover-only] [--solver evo-graph|standard|bayes-sa] [--engine gpu|cpu] [--seeds 5] [--data-root data/private/bmrb] [--no-crop] [--lp] [--json-out <path>]\n\
+       ferric fetch-bmrb      --id <bmrb_id> [--dest <dir>] [--dry-run] [--all-archives] [--max-bytes <bytes>]\n\
+       ferric process         --in <fid_dir> --out <path_or_dir> [--exp <EXP>] [--recipe <json>] [--crop-h 5.5:11.5] [--no-crop] [--lp] [--auto-phase] [--phase-x P0:P1] [--phase-y P0:P1] [--phase-z P0:P1] [--hilbert] [--nus-method fista|ist]\n\
+       ferric e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
+       ferric assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--r-bleach 11.0] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--solver evo-graph|standard|bayes-sa] [--engine auto|gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--no-auto-ref] [--locks <SPEC>] [--json-out <path>] [--nef-out <path>] [--report-out <path>] [--priors priors.json] [-v]\n\
+       ferric propensity      --shifts <assigned.str|assigned.nef> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]\n\
+       ferric torsions        --shifts <assigned.str|assigned.nef> -o <out.tsv|out.nef|out.json> [--include-chi1] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>]\n\
+       ferric score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [--no-auto-offset] [-v]\n\
+       ferric simulate        --star <ref.str> --out <peaks.tsv> [--realistic] [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
+       ferric pick            (--hsqc <path> [--triple EXP=path ...] | --fid <dir> [--exp <EXP>] | --fid-hsqc <dir> [--fid-triple EXP=dir ...]) --out <peaks.tsv> [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
+       ferric priors          --stars <dir_or_file> --out <priors.json>\n\
+       ferric sidechain       --star <ref.str> [--peaks <peaks.tsv>] [--aromatic] [--ph <f64>] [--arom-c13hsqc <path>] [--hbcbgcdhd <path>] [--hbcbgcdce <path>] [--aromatic-tocsy <path>] [--aromatic-noesy <path>] [--his-hmqc <path>] [--trp-hsqc <path>] [--stereospec] [--j-couplings <j.tsv>] [--intra-noes <noes.tsv>] [--pdb <model.pdb>] [--out <all_atom.str>] [--runs 16] [--steps 2500] [--seed 2026]\n\
+       ferric methyl          --pdb <model.pdb> --hmqc <2d_or_tsv> --noesy <3d_or_tsv> [--labeling ILV-proS|ILV-proR|ILV-racemic|ILVMAT|<RES:ATOM,...>] [--hmcmcbca <hmcm.tsv>] [--engine gpu|cpu] [--seeds <N>] [-o <out.str>]\n\
+       ferric relax           (--series <series.tsv|series.nef|dir> | --planes <p1,p2,...>) --out <rates.tsv> [--kind r1|r2|r1rho|hetnoe] [--peaks <peaks.tsv> | --star <shifts.str>] [--vdlist <file> | --delays <csv>] [--engine cpu|gpu|auto] [--mc-trials 500]\n\
+       ferric modelfree       (--r1 <r1.tsv> --r2 <r2.tsv> [--hetnoe <noe.tsv>] ... | --rates <rates.tsv> ...) --out <modelfree.tsv> [--pdb <opt.pdb>] [--diffusion auto|isotropic|axial|anisotropic] [--criterion aic|aicc|bic|ftest]\n\
+       ferric cest            --in <profiles.tsv> [--in <profiles_b2.tsv> ...] [--out <fit.tsv>] [--states 2|3] [--triangular] [--b1-quad 5] [--engine cpu|gpu|auto] [--chi2-surface] [--json-out <fit.json>]\n\
+       ferric cpmg            (--in <cpmg.tsv> ... | --raw-planes <planes.tsv> ... | --r1rho <r1rho.tsv> --major-ppm <ppm> --larmor-mhz <mhz>) [--out <fit.tsv>] [--model baldwin2014|cr72|lm63|numerical2x2|flat] [--engine cpu|gpu|auto] [--json-out <fit.json>]\n\
+       ferric csp             (--apo-peaks <apo.tsv> | --star <apo.str>) --step <[L]_uM[:[P]_uM]=path> ... [--out <csp.tsv>] [--experiment hsqc|hmqc] [--protein-um 100.0] [--ligand-stock-um <uM>] [--mc-trials 400] [--trajectories-out <traj.tsv>] [--json-out <csp.json>]\n\
+       ferric nmr1d           (process | multiplet | qnmr) [options]  (see `ferric nmr1d --help`)\n\
+       ferric structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--rdc <rdcs.tsv|rdcs.nef>] [--torsion-db] [--include-chi1] [--rdc-weight 0.75] [--rdc-free-frac 0.20] [--engine auto|gpu|cpu] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
+       ferric nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
+       ferric nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
+       ferric report          --star|--shifts <shifts.str|shifts.nef> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--rdc <rdcs.tsv|rdcs.nef>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]\n\
+       ferric pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--idp-propensity] [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard|bayes-sa] [--no-auto-ref] [--locks <SPEC>] [--method classical|neural] [--engine auto|gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
+       ferric serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
+       ferric mcp             [--transport stdio|http] [--root <dir> ...] [--mode read-only|read-write] [--bind 127.0.0.1:<port>] [--token <bearer>]\n\
+       ferric mcp-config      --client antigravity|claude-desktop|cursor [--root <dir> ...] [--mode read-only|read-write] [--bridge-port <port>] [-o <out.json>]\n\
+       ferric dosy            fit|ilt|mw [--in <decay.tsv|json> | --exp-dir <bruker_or_varian_dir> | --demo] [--engine cpu|gpu|auto] [--criterion bic|aic] [--max-components 3] [-o <out.tsv|json>]\n\
+       ferric metabolomics    bin|pca|oplsda|stocsy [--in <study.json|buckets.csv> | --cohort <json> | --manifest <tsv> | --demo] [-o <out>]\n\
+       ferric export-fig      --out-dir <dir> [--panel all|hsqc|strips|pdb-s2|nmr1d-stack|dosy|metabolomics|exchange|octet]\n\
+       ferric chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}}>] [--solvent CDCl3] [--mhz 400]\n",
         version_string()
     )
 }
@@ -2154,7 +2154,7 @@ pub(crate) fn execute_idp_13c_workflow(
         })
         .count();
     let star_header = format!(
-        "# nmrassign solver: {engine_label}\n\
+        "# ferric solver: {engine_label}\n\
          # regime: idp-13c (temp_k={temp_k:.2}, ph={:.2}, pro_transitions={n_pro_assigned}/{n_pro_total})\n\
          # qc_verdict: {}\n\
          # fitted_offsets (peak_ppm - BMRB_prior_ppm): dCA={:+.3}, dCB={:+.3}, dC={:+.3}, dN={:+.3} ppm",
@@ -2975,7 +2975,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             "-v" | "--verbose" => verbose = true,
             "--rdc" | "--torsion-db" | "--include-chi1" | "--rdc-weight" | "--rdc-free-frac" => {
                 return Err(format!(
-                    "{} is a post-assignment structure/report flag (backbone assignment is strictly structure-free; use `nmrassign structure`, `nmrassign torsions`, or `nmrassign report`)",
+                    "{} is a post-assignment structure/report flag (backbone assignment is strictly structure-free; use `ferric structure`, `ferric torsions`, or `ferric report`)",
                     args[i]
                 ))
             }
@@ -3017,13 +3017,12 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
         }
         if temp_k_explicit {
             return Err(
-                "--temp-k is only supported with --regime idp-13c in `nmrassign assign`"
-                    .to_string(),
+                "--temp-k is only supported with --regime idp-13c in `ferric assign`".to_string(),
             );
         }
         if ph_opt.is_some() {
             return Err(
-                "--ph is only supported with --regime idp-13c in `nmrassign assign`".to_string(),
+                "--ph is only supported with --regime idp-13c in `ferric assign`".to_string(),
             );
         }
     } else {
@@ -3151,7 +3150,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 Some(&eff_priors),
             );
             let mut hdr = format!(
-                "# nmrassign solver: {engine_label}\n\
+                "# ferric solver: {engine_label}\n\
                  # regime: paramagnetic (clusters={}, blind_zone_residues={}, abstentions={})",
                 para_rep.detected_clusters.len(),
                 para_rep.blind_zone_residues.len(),
@@ -3265,7 +3264,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 let entry_name = out_prefix
                     .file_stem()
                     .and_then(|s| s.to_str())
-                    .unwrap_or("nmr_assign_project");
+                    .unwrap_or("ferric_project");
                 let nef_doc =
                     NefDocument::from_reference_and_peaks(entry_name, &pred, Some(&conf), &peaks);
                 write_nef_with_optional_header(np, &nef_doc, star_hdr.as_deref())?;
@@ -3279,7 +3278,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 let proj_name = out_prefix
                     .file_stem()
                     .and_then(|s| s.to_str())
-                    .unwrap_or("nmr_assign_project")
+                    .unwrap_or("ferric_project")
                     .to_string();
                 let mut rep_in = ReportInput::new(proj_name, pred.clone(), conf.clone());
                 rep_in.n_peaks = Some(peaks.len());
@@ -3792,7 +3791,7 @@ fn cmd_process(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         RawFid::Dim1(_) => Err(format!(
-            "input {} is a 1D FID; nmrassign process expects a 2D or 3D FID directory",
+            "input {} is a 1D FID; ferric process expects a 2D or 3D FID directory",
             in_p.display()
         )),
     }
@@ -4775,7 +4774,7 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: nmrassign sidechain --star <ref.str> [--peaks <peaks.tsv>] [--simulate] \\\n  \
+                    "Usage: ferric sidechain --star <ref.str> [--peaks <peaks.tsv>] [--simulate] \\\n  \
                      [--aromatic] [--ph <f64>] [--arom-c13hsqc <path>] [--hbcbgcdhd <path>] [--hbcbgcdce <path>] \\\n  \
                      [--aromatic-tocsy <path>] [--aromatic-noesy <path>] [--his-hmqc <path>] [--trp-hsqc <path>] \\\n  \
                      [--stereospec] [--j-couplings <j.tsv>] [--intra-noes <noes.tsv>] [--pdb <model.pdb>] \\\n  \
@@ -5358,7 +5357,7 @@ fn cmd_structure(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: nmrassign structure --star <shifts.str|shifts.nef> [--noesy-peaks <noesy.tsv>] [--rdc <rdcs.tsv|rdcs.nef>] [--torsion-db] [--include-chi1] [--rdc-weight 0.75] [--rdc-free-frac 0.20] [--engine auto|gpu|cpu] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]"
+                    "Usage: ferric structure --star <shifts.str|shifts.nef> [--noesy-peaks <noesy.tsv>] [--rdc <rdcs.tsv|rdcs.nef>] [--torsion-db] [--include-chi1] [--rdc-weight 0.75] [--rdc-free-frac 0.20] [--engine auto|gpu|cpu] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]"
                 );
                 return Ok(());
             }
@@ -5454,29 +5453,28 @@ fn cmd_structure(args: &[String]) -> Result<(), String> {
     if rdc_path.is_none() {
         if rdc_weight_opt.is_some() {
             return Err(
-                "--rdc-weight requires --rdc <rdcs.tsv|rdcs.nef> in `nmrassign structure`"
-                    .to_string(),
+                "--rdc-weight requires --rdc <rdcs.tsv|rdcs.nef> in `ferric structure`".to_string(),
             );
         }
         if rdc_free_frac_opt.is_some() {
             return Err(
-                "--rdc-free-frac requires --rdc <rdcs.tsv|rdcs.nef> in `nmrassign structure`"
+                "--rdc-free-frac requires --rdc <rdcs.tsv|rdcs.nef> in `ferric structure`"
                     .to_string(),
             );
         }
         if engine_req_opt == Some(EngineRequest::Gpu) {
             return Err(
-                "--engine gpu in `nmrassign structure` requires --rdc <rdcs.tsv|rdcs.nef> (NOE-only torsion folding is CPU-only; use --engine cpu or --engine auto)"
+                "--engine gpu in `ferric structure` requires --rdc <rdcs.tsv|rdcs.nef> (NOE-only torsion folding is CPU-only; use --engine cpu or --engine auto)"
                     .to_string(),
             );
         }
     }
     if include_chi1 && !use_torsion_db {
-        return Err("--include-chi1 requires --torsion-db in `nmrassign structure`".to_string());
+        return Err("--include-chi1 requires --torsion-db in `ferric structure`".to_string());
     }
     if dihedrals_only && (rdc_path.is_some() || engine_req_opt.is_some()) {
         return Err(
-            "--dihedrals-only cannot be combined with --rdc or --engine in `nmrassign structure`"
+            "--dihedrals-only cannot be combined with --rdc or --engine in `ferric structure`"
                 .to_string(),
         );
     }
@@ -5740,7 +5738,7 @@ fn cmd_structure(args: &[String]) -> Result<(), String> {
                 fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
             }
         }
-        write_pdb_ensemble(&out_p, &ens.conformers, "NMRASSIGN TORSION ENSEMBLE")?;
+        write_pdb_ensemble(&out_p, &ens.conformers, "FERRIC TORSION ENSEMBLE")?;
         println!(
             "Wrote {}-model PDB ensemble to {}",
             ens.conformers.len(),
@@ -5810,7 +5808,7 @@ fn cmd_nef_export(args: &[String]) -> Result<(), String> {
     let mut star_path: Option<PathBuf> = None;
     let mut peaks_path: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
-    let mut entry_name = "nmr_assign_project".to_string();
+    let mut entry_name = "ferric_project".to_string();
 
     let mut i = 0;
     while i < args.len() {
@@ -5887,7 +5885,7 @@ fn cmd_propensity(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: nmrassign propensity --shifts <shifts.str|shifts.nef> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]"
+                    "Usage: ferric propensity --shifts <shifts.str|shifts.nef> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]"
                 );
                 return Ok(());
             }
@@ -5994,7 +5992,7 @@ fn cmd_torsions(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: nmrassign torsions --shifts <assigned.str|assigned.nef> -o <out.tsv|out.nef|out.json> [--include-chi1] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>]"
+                    "Usage: ferric torsions --shifts <assigned.str|assigned.nef> -o <out.tsv|out.nef|out.json> [--include-chi1] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>]"
                 );
                 return Ok(());
             }
@@ -6149,7 +6147,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: nmrassign report --star|--shifts <shifts.str|shifts.nef> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--rdc <rdcs.tsv|rdcs.nef>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]"
+                    "Usage: ferric report --star|--shifts <shifts.str|shifts.nef> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--rdc <rdcs.tsv|rdcs.nef>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]"
                 );
                 return Ok(());
             }
@@ -6208,19 +6206,18 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     if !report_opts.include_idp_propensity_track {
         if temp_k_explicit {
             return Err(
-                "--temp-k requires --idp-propensity (or --propensity) in `nmrassign report`"
+                "--temp-k requires --idp-propensity (or --propensity) in `ferric report`"
                     .to_string(),
             );
         }
         if report_opts.ph.is_some() {
             return Err(
-                "--ph requires --idp-propensity (or --propensity) in `nmrassign report`"
-                    .to_string(),
+                "--ph requires --idp-propensity (or --propensity) in `ferric report`".to_string(),
             );
         }
     }
     if rdc_path.is_some() && pdb_path.is_none() {
-        return Err("--rdc requires --pdb <ensemble.pdb> in `nmrassign report`".to_string());
+        return Err("--rdc requires --pdb <ensemble.pdb> in `ferric report`".to_string());
     }
 
     let star_p = star_path.ok_or("report requires --star <shifts.str>")?;
@@ -6613,7 +6610,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             "-v" | "--verbose" => verbose = true,
             "--rdc" | "--torsion-db" | "--include-chi1" | "--rdc-weight" | "--rdc-free-frac" => {
                 return Err(format!(
-                    "{} is not supported in `nmrassign pipeline` (use post-assignment `nmrassign structure --rdc ...` or `nmrassign report --pdb ... --rdc ...`)",
+                    "{} is not supported in `ferric pipeline` (use post-assignment `ferric structure --rdc ...` or `ferric report --pdb ... --rdc ...`)",
                     args[i]
                 ))
             }
@@ -6658,13 +6655,13 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         if !report_opts.include_idp_propensity_track {
             if temp_k_explicit {
                 return Err(
-                    "--temp-k in `nmrassign pipeline` requires --regime idp-13c or --idp-propensity"
+                    "--temp-k in `ferric pipeline` requires --regime idp-13c or --idp-propensity"
                         .to_string(),
                 );
             }
             if report_opts.ph.is_some() {
                 return Err(
-                    "--ph in `nmrassign pipeline` requires --regime idp-13c or --idp-propensity"
+                    "--ph in `ferric pipeline` requires --regime idp-13c or --idp-propensity"
                         .to_string(),
                 );
             }
@@ -6703,7 +6700,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         }
         if nef_path.is_some() {
             return Err(
-                "--nef input is not supported with --regime idp-13c in `nmrassign pipeline` (use --seq or --star)"
+                "--nef input is not supported with --regime idp-13c in `ferric pipeline` (use --seq or --star)"
                     .to_string(),
             );
         }
@@ -7140,7 +7137,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             Some(&eff_priors),
         );
         let mut hdr = format!(
-                "# nmrassign solver: {elbl}\n# regime: paramagnetic (clusters={}, blind_zone_residues={}, abstentions={})",
+                "# ferric solver: {elbl}\n# regime: paramagnetic (clusters={}, blind_zone_residues={}, abstentions={})",
                 para_rep.detected_clusters.len(),
                 para_rep.blind_zone_residues.len(),
                 para_rep.n_blind_zone_abstentions,
@@ -8032,7 +8029,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     }
 
     println!(
-        "Starting nmrassign HTTP service & browser dashboard at http://{bind_addr} (storage: {})",
+        "Starting ferric HTTP service & browser dashboard at http://{bind_addr} (storage: {})",
         storage.display()
     );
     start_server_with_options(&bind_addr, storage, options)
@@ -8309,7 +8306,20 @@ fn cmd_chem(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn maybe_warn_deprecated_binary_alias() {
+    if let Some(arg0) = env::args_os().next() {
+        if let Some(stem) = Path::new(&arg0).file_stem().and_then(|s| s.to_str()) {
+            if stem.eq_ignore_ascii_case("nmrassign") {
+                eprintln!(
+                    "warning: 'nmrassign' is deprecated; use 'ferric' (alias removed in v0.15.0)"
+                );
+            }
+        }
+    }
+}
+
 fn main() {
+    maybe_warn_deprecated_binary_alias();
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         print!("{}", usage());
@@ -8693,7 +8703,7 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         let default_content = fs::read_to_string(&out_default).unwrap();
         assert!(
             default_content.contains("solver=CPU (f64, evo-graph)"),
-            "expected default `nmrassign assign` solver to be `evo-graph`, got header:\n{}",
+            "expected default `ferric assign` solver to be `evo-graph`, got header:\n{}",
             default_content.lines().next().unwrap_or("")
         );
 
@@ -8720,7 +8730,7 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
             cmd_assign(&args).unwrap();
             let content = fs::read_to_string(&out_str).unwrap();
             assert!(
-                content.starts_with("# nmrassign ")
+                content.starts_with("# ferric ")
                     && content.contains("fitted_prior_reference_offsets"),
                 "expected # fitted_prior_reference_offsets header for {tag}, got:\n{}",
                 content.lines().next().unwrap_or("")
@@ -8881,10 +8891,13 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
     fn test_version_string_matches_workspace_semver() {
         let v = version_string();
         assert!(
-            v.starts_with(&format!("nmrassign {} (", nmr_core::VERSION)),
+            v.starts_with(&format!("ferric {} (", nmr_core::VERSION)),
             "unexpected version_string: {v}"
         );
-        assert!(v.ends_with(')'), "missing git sha suffix in {v}");
+        assert!(
+            v.ends_with(") — Rust + WebGPU"),
+            "missing git sha / Rust + WebGPU suffix in {v}"
+        );
     }
 
     fn write_synthetic_bruker_hsqc_2d(dir: &Path, peaks_hn: &[(f64, f64)]) {

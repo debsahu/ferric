@@ -4023,7 +4023,7 @@ pub fn format_stereospec_nmrstar(
         lines.push(String::new());
     }
     lines.extend([
-        "data_nmr_assign_output".to_string(),
+        "data_ferric_output".to_string(),
         String::new(),
         "save_entity_1".to_string(),
         "   _Entity.Sf_category  entity".to_string(),
@@ -4657,7 +4657,7 @@ pub struct IntraNoeTsvRow {
     pub intensity_b: f64,
 }
 
-/// Input bundle for dataset-wide stereospecific assignment (`nmrassign sidechain --stereospec`).
+/// Input bundle for dataset-wide stereospecific assignment (`ferric sidechain --stereospec`).
 pub struct StereospecDatasetInput<'a> {
     pub reference: &'a Reference,
     pub j_couplings_tsv: Option<&'a Path>,
@@ -5219,7 +5219,7 @@ pub fn format_nmrstar_with_ambiguity(
         lines.push(String::new());
     }
     lines.extend([
-        "data_nmr_assign_output".to_string(),
+        "data_ferric_output".to_string(),
         String::new(),
         "save_entity_1".to_string(),
         "   _Entity.Sf_category  entity".to_string(),

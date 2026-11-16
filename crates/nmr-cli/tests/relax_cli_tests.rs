@@ -59,7 +59,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn nmrassign_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_nmrassign")
+    env!("CARGO_BIN_EXE_ferric")
 }
 
 fn build_synthetic_series_tsv(
@@ -121,16 +121,16 @@ fn cli_relax_and_modelfree_help_and_validation_guards() {
         .expect("spawn nmrassign relax --help");
     assert!(out_relax.status.success(), "relax --help must exit 0");
     let stdout_relax = String::from_utf8_lossy(&out_relax.stdout);
-    assert!(stdout_relax.contains("nmrassign relax"));
+    assert!(stdout_relax.contains("ferric relax"));
     assert!(stdout_relax.contains("--mc-trials"));
 
     let out_mf = Command::new(nmrassign_bin())
         .args(["modelfree", "--help"])
         .output()
-        .expect("spawn nmrassign modelfree --help");
+        .expect("spawn ferric modelfree --help");
     assert!(out_mf.status.success(), "modelfree --help must exit 0");
     let stdout_mf = String::from_utf8_lossy(&out_mf.stdout);
-    assert!(stdout_mf.contains("nmrassign modelfree"));
+    assert!(stdout_mf.contains("ferric modelfree"));
     assert!(stdout_mf.contains("--criterion"));
 
     let bad_relax = Command::new(nmrassign_bin())

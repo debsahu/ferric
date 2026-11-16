@@ -1,5 +1,5 @@
-//! CLI subcommands `nmrassign metabolomics bin`, `nmrassign metabolomics pca`,
-//! `nmrassign metabolomics oplsda`, and `nmrassign metabolomics stocsy` (`T14.5`):
+//! CLI subcommands `ferric metabolomics bin`, `ferric metabolomics pca`,
+//! `ferric metabolomics oplsda`, and `ferric metabolomics stocsy` (`T14.5`):
 //! untargeted 1D NMR biofluid cohort ingestion, solvent/water/urea masking, interval FFT local
 //! alignment, Adaptive Intelligent Binning (`AIB`) & uniform bucketing, Probabilistic Quotient
 //! Normalization (`PQN`), Pareto/UV/Mean scaling, PCA Hotelling $T^2$ & $Q$-residual outlier
@@ -170,13 +170,13 @@ pub struct Stocsy2dMatrixJson {
 
 pub fn metabolomics_usage() -> &'static str {
     "\
-nmrassign metabolomics — 1D NMR Untargeted Metabolomics, Chemometrics & STOCSY (T14.5)
+ferric metabolomics — 1D NMR Untargeted Metabolomics, Chemometrics & STOCSY (T14.5)
 
 USAGE:
-  nmrassign metabolomics bin     [COHORT_INPUTS] [PREPROCESS_OPTIONS] [-o buckets.csv] [--study-out study.json]
-  nmrassign metabolomics pca     [--in study.json|buckets.csv | COHORT_INPUTS] [--components 5] [-o pca.json]
-  nmrassign metabolomics oplsda  [--in study.json|buckets.csv | COHORT_INPUTS] [--ortho 1] [--cv-folds 7] [--permutations 100] [-o oplsda.json]
-  nmrassign metabolomics stocsy  [--in study.json|buckets.csv | COHORT_INPUTS] --driver-ppm <PPM> [-o stocsy.json]
+  ferric metabolomics bin     [COHORT_INPUTS] [PREPROCESS_OPTIONS] [-o buckets.csv] [--study-out study.json]
+  ferric metabolomics pca     [--in study.json|buckets.csv | COHORT_INPUTS] [--components 5] [-o pca.json]
+  ferric metabolomics oplsda  [--in study.json|buckets.csv | COHORT_INPUTS] [--ortho 1] [--cv-folds 7] [--permutations 100] [-o oplsda.json]
+  ferric metabolomics stocsy  [--in study.json|buckets.csv | COHORT_INPUTS] --driver-ppm <PPM> [-o stocsy.json]
 
 COHORT INPUTS (for bin, or direct on-the-fly cohort execution in pca/oplsda/stocsy):
   --cohort <PATH.json>         JSON array of CohortSample1D records
@@ -1830,7 +1830,7 @@ fn cmd_stocsy(args: &[String]) -> Result<(), String> {
     };
     let Some(driver_ppm) = cli.driver_ppm else {
         return Err(
-            "missing required --driver-ppm <PPM> for `nmrassign metabolomics stocsy`".to_string(),
+            "missing required --driver-ppm <PPM> for `ferric metabolomics stocsy`".to_string(),
         );
     };
     let ds = load_dataset_for_chemometrics(&cli)?;
@@ -2017,7 +2017,7 @@ pub fn run_metabolomics_cli(args: &[String]) -> Result<(), String> {
         "oplsda" | "opls-da" | "opls" => cmd_oplsda(&args[1..]),
         "stocsy" => cmd_stocsy(&args[1..]),
         other => Err(format!(
-            "unknown `nmrassign metabolomics` subcommand {other:?} (expected bin, pca, oplsda, or stocsy)\n\n{}",
+            "unknown `ferric metabolomics` subcommand {other:?} (expected bin, pca, oplsda, or stocsy)\n\n{}",
             metabolomics_usage()
         )),
     }

@@ -60,7 +60,7 @@ impl Drop for ScopedTempDir {
 }
 
 fn nmrassign_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_nmrassign")
+    env!("CARGO_BIN_EXE_ferric")
 }
 
 fn workspace_root() -> PathBuf {
@@ -75,11 +75,11 @@ fn test_exchange_cli_help_and_error_handling() {
     // 1. Top-level usage advertises `cest`, `cpmg`, and `csp`
     let top = Command::new(nmrassign_bin())
         .output()
-        .expect("run nmrassign usage");
+        .expect("run ferric usage");
     let top_stdout = String::from_utf8_lossy(&top.stdout);
-    assert!(top_stdout.contains("nmrassign cest"));
-    assert!(top_stdout.contains("nmrassign cpmg"));
-    assert!(top_stdout.contains("nmrassign csp"));
+    assert!(top_stdout.contains("ferric cest"));
+    assert!(top_stdout.contains("ferric cpmg"));
+    assert!(top_stdout.contains("ferric csp"));
 
     // 2. Subcommand `--help` exits cleanly with code 0
     for sub in ["cest", "cpmg", "csp"] {
@@ -89,7 +89,7 @@ fn test_exchange_cli_help_and_error_handling() {
             .expect("run subcommand --help");
         assert!(out.status.success(), "{sub} --help failed");
         let s = String::from_utf8_lossy(&out.stdout);
-        assert!(s.contains(&format!("nmrassign {sub}")));
+        assert!(s.contains(&format!("ferric {sub}")));
     }
 
     // 3. Invalid flags and missing inputs return clean non-zero exits
