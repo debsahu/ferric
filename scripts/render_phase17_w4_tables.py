@@ -182,6 +182,7 @@ def cited_w4_files(results_dir: Path, root: Path, extra_files: list[Path]) -> li
         "f16/f16_bruker_z16423019_dosy_fit_gpu.json",
         "f16/f16_bruker_z16423019_dosy_ilt.tsv",
         "f16/f16_bruker_z16423019_dosy_mw.json",
+        "f16/superseded_r1_f16_evaluation.json",
         "f16/f16_evaluation.json",
         "f17/f17_preflight_freeze_check.txt",
         "f17/f17_preflight_adapter_and_binary_sha256.txt",
@@ -527,11 +528,20 @@ def render_f16_section(results_dir: Path) -> str:
     oneshot_diag = ph["bruker_zenodo16423019_oneshot_pulprog_diagnostic"]
     var_diag = ph["varian_mendeley_unregistered_dosy_in_posthoc_diagnostic"]
 
+    r1_disc = ev["superseded_round1_evaluation_disclosure"]
+    r1_p = results_dir / "f16" / "superseded_r1_f16_evaluation.json"
+    r1_disk_bytes, r1_disk_sha = sha256_and_size(r1_p)
+    if r1_disk_bytes != int(r1_disc["bytes"]) or r1_disk_sha != r1_disc["sha256"]:
+        raise RuntimeError("superseded_r1_f16_evaluation.json drifted vs f16_evaluation.json disclosure!")
+    r1_crit_map = {c["id"]: c for c in r1_disc["superseded_criteria_results"]}
+    r1_sm = r1_disc["superseded_secondary_metrics"]
+
     crit_rows = []
     for c_prim, c_bkp in zip(ev["criteria_results"], bkp_ev["criteria_results"]):
+        c_r1 = r1_crit_map[c_prim["id"]]
         crit_rows.append(
             f"| `{c_prim['id']}` | `{c_prim['metric']}` | `{fmt_num(c_prim['value'], 5)}` | `{fmt_num(c_bkp['value'], 5)}` | "
-            f"`{c_prim['operator']} {fmt_num(c_prim['threshold'], 3)}` | **`{'PASS' if c_prim['passed'] else 'FAIL'}`** |"
+            f"`{fmt_num(c_r1['value'], 5)}` (withdrawn `{r1_disc['superseded_verdict']}`) | `{c_prim['operator']} {fmt_num(c_prim['threshold'], 3)}` | **`{'PASS' if c_prim['passed'] else 'FAIL'}`** |"
         )
 
     ds_labels = [
@@ -553,9 +563,28 @@ def render_f16_section(results_dir: Path) -> str:
     lines = [
         "#### Gate `F16` (`TODO.md:146`) — Experimental Raw Bruker & Varian Pseudo-2D `DOSY` (`FAIL`, `1/4` Criteria Under Strict `bbc770a` Blind Evaluator)",
         "",
-        "| Criterion ID | Metric | Primary (`ZENODO:12170718` + `MENDELEY:d7bdxz9hsk`) | `backup_1` (`ZENODO:16423019` + `MENDELEY:d7bdxz9hsk`) | Threshold | Blind Verdict |",
-        "| :--- | :--- | ---: | ---: | :--- | :---: |",
+        "| Criterion ID | Metric | Standing Primary (`ZENODO:12170718` + `MENDELEY:d7bdxz9hsk`) | Standing `backup_1` (`ZENODO:16423019` + `MENDELEY:d7bdxz9hsk`) | Superseded Round-1 (`NOT a Gate Result`) | Threshold | Standing Blind Verdict |",
+        "| :--- | :--- | ---: | ---: | ---: | :--- | :---: |",
         *crit_rows,
+        "",
+        "| Superseded Round-1 `F16` Evaluation Disclosure (`17.6b:P1-1` / `P17-R4` — **NOT a Gate Result**) | Exact Provenance & Input Comparison vs Standing Strict `bbc770a` Run |",
+        "| :--- | :--- |",
+        (
+            "| Original path, archived path, bytes, SHA-256 & timestamps | "
+            f"Original `{r1_disc['original_staging_path']}` -> archived `{r1_disc['archived_copy_path']}` (`{r1_disk_bytes:,} B`, `sha256={r1_disk_sha}`, `mtime = {r1_disc['original_mtime_iso8601']}`) vs standing strict run `data/private/w4_empirical_results/f16/f16_evaluation.json` (`mtime = {r1_disc['strict_r2_mtime_iso8601']}`) |"
+        ),
+        (
+            "| Superseded Round-1 verdict & per-criterion values (**NOT a gate result**) | "
+            f"Reported `verdict = {r1_disc['superseded_verdict']}` (`4/4` criteria: `F16-C1 = {fmt_num(r1_crit_map['F16-C1']['value'], 1)}`, `F16-C2 = {r1_crit_map['F16-C2']['value']:.5f}`, `F16-C3 = {r1_crit_map['F16-C3']['value']:.1f}` across `{r1_sm['n_ordering_pairs_evaluated']}` ordering pairs, `F16-C4 = {r1_crit_map['F16-C4']['value']:.5f} dex` across `{r1_sm['n_principal_peaks_evaluated']}` principal peaks) — **withdrawn prior to `17.W4` submission; standing gate verdict is `FAIL` (`1/4`)** |"
+        ),
+        (
+            "| Differing inputs (1): `principal_references` & `D_ref` source | "
+            "Round 1 passed `7` hand-selected peaks (`3.658, 1.972 ppm` on `bruker_lth` from uncommitted MAT5 OLS on `TyrosinaseHCCA_pfg_data.mat` `SPECTRA` with `0.81` `SMSQ10.100`, plus `3.399, 2.483, -0.091, 3.877, 8.657 ppm` on Varian from uncommitted OLS on unregistered VnmrJ `dosy_in`), masking Varian `2.858/2.810 ppm` shoulders (`R^2 = 0.9080/0.9240 < 0.95`) and `LigandsOnly` `4.56..4.59 ppm` water ripples (`min R^2 = -0.4080`); standing strict run passes `principal_references = []` |"
+        ),
+        (
+            "| Differing inputs (2): `ordering_pairs`, unregistered Mendeley UUID files & `backup_1` | "
+            "Round 1 passed `8` hand-constructed `ordering_pairs` (substituting `4.647 ppm` residual HDO wing > `3.658` > `1.972 ppm` where `LysozymeNAG/*` lacked `ser` and `~120 kDa` tyrosinase was T2-broadened, plus `6` Varian pairs), read `3` unregistered Mendeley UUID files (`MENDELEY_d7bdxz9hsk_aux/{Contents.txt,text,dosy_in}`), and did not run `backup_1` `ZENODO:16423019` (`23.zip`); standing strict run passes `ordering_pairs = []`, uses `0` unregistered files, and executes `23.zip` |"
+        ),
         "",
         "| Evaluated Raw Vendor `DOSY` Series (`0` Unregistered Auxiliary Files) | Vendor (`Planes`) | Peaks `R^2 >= 0.95` | Uncurated `min` / `median R^2` | CPU `f64` vs Metal `f32` `BIC` `K` | Max `abs(d log10 D)` (`K=1`) |",
         "| :--- | :---: | :---: | :---: | :---: | ---: |",
