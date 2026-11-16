@@ -5,6 +5,9 @@ FERRIC includes a clean-room untargeted 1D biofluid and mixture metabolomics eng
 > [!IMPORTANT] Validation Scope (Synthetic Forward-Model Self-Consistency)
 > All `T14.5` metabolomics and chemometrics benchmarks reported in this chapter are **synthetic forward-model self-consistency evaluations** constructed from multi-multiplet biofluid cohorts (28-metabolite `CC0 1.0` BMRB chemical shift library, `3x` biological urine dilution factors, `±0.025 ppm` ionic-strength/pH peak drift, injected biomarker fold changes, and pure-noise null cohorts). **`0` real clinical or `MetaboLights` (`MTBLS1` / human urine or serum) raw cohort datasets have been evaluated end-to-end yet**; external repository cohort benchmarking is tracked openly as follow-up **`F17`**.
 
+> [!TIP] Interactive Tour & HD Video (SYNTHETIC & PROTOCOL SHOWCASE · `F17`/`F18` Open)
+> Launch **[Module 08: Metabolomics, STOCSY & MCP](tours/08_metabolomics_mcp.html)** (`60 fps` live `STOCSY` driver-bucket explorer + `1280×720` HD video; synthetic & protocol showcase), or browse **[All 8 Module Tours](tours/index.html)**.
+
 ---
 
 ## Preprocessing: Alignment, Solvent Masking & Adaptive Intelligent Binning

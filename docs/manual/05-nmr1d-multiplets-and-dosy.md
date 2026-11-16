@@ -5,6 +5,9 @@ Beyond macromolecular multidimensional assignment, FERRIC includes a complete cl
 > [!IMPORTANT] Validation Scope (Synthetic Forward-Model Self-Consistency)
 > Quantitative accuracy numbers in this chapter (Voigt coalesced-shoulder deconvolution, roofed `AB`/`ABX` Hoye `J`-tree recovery, ISO GUM `qNMR` molar purity, and discrete `BIC` / Tikhonov `ILT` `DOSY` diffusivity recovery across `T14.1`–`T14.4`) are **synthetic forward-model self-consistency evaluations** (plus exact $2^N$ quantum spin-$1/2$ Hamiltonian cross-checks). **`0` real deposited raw small-molecule 1D `fid`s, wet-lab certified `qNMR` reference mixtures (`NIST`/`USP` CRMs), or experimental pseudo-2D `DOSY` `ser` datasets have been evaluated end-to-end yet**; external experimental repository validation is tracked openly under follow-ups **`F14`** and **`F16`**.
 
+> [!TIP] Interactive Tours & HD Video (SYNTHETIC SHOWCASE · `F14`/`F16` Open)
+> Explore **[Module 06: 1D Multiplets, qNMR & Octet](tours/06_nmr1d_multiplet_qnmr_octet.html)** and **[Module 07: DOSY Diffusion & Rh Sizing](tours/07_dosy_diffusion.html)** (`60 fps` live parameter sliders + `1280×720` HD video; synthetic forward-model demonstrations), or browse **[All 8 Module Tours](tours/index.html)**.
+
 ---
 
 ## Multi-Nuclear 1D Referencing & Global Voigt Deconvolution

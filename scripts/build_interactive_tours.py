@@ -1,0 +1,3238 @@
+#!/usr/bin/env python3
+"""Deterministic, zero-dependency static HTML5 Interactive Tour & Cinema builder.
+
+Builds a self-contained, offline-first GitHub Pages Interactive Showcase Cinema
+from ``ferric export-tour`` JSON bundles (schema ``"ferric-tour-v1"``):
+- Responsive gallery index (``index.html``) with 2x4 desktop/tablet and 1x8 mobile
+  card grid, validation-scope legend, live animated mini-canvas previews, and
+  links back to the User Manual (``../index.html``) and Live WebGPU Workbench
+  (``../demo/index.html``).
+- Per-module dual-mode player pages (``<slug>.html``) supporting ``?embed=1``
+  for seamless iframe embedding inside ``docs/manual/01..08.html``:
+  1. Interactive Live Player (60fps HiDPI HTML5 <canvas>, hover/tap tooltips,
+     scrubbable timeline with Chapter 1-4 markers, 0.5x-2x speed, loop,
+     per-module interactive scientific controls, and MediaRecorder .webm export)
+  2. Pre-Rendered HD Video (<video controls playsinline> with .webm + .mp4
+     sources, chapter jump buttons, and direct download pills)
+- Shared dark/light theme toggle synchronized with the User Manual via
+  ``localStorage.getItem("nmr_manual_theme")`` and ``[data-theme="dark"]``.
+- Strict ``--check`` and ``--self-test`` modes verifying determinism, zero
+  external CDN URLs, WCAG 1.4.4 zoom-preserving viewport meta, explicit
+  SYNTHETIC showcase disclosures on modules 04-08, clean-room token hygiene,
+  and valid ES2020 JS syntax.
+
+Provenance: Original clean-room Python 3 standard-library build script (MIT License).
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import html
+import json
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+
+def _read_workspace_version() -> str:
+    cargo_toml = Path(__file__).resolve().parent.parent / "Cargo.toml"
+    if cargo_toml.is_file():
+        in_ws_pkg = False
+        for raw_line in cargo_toml.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith("["):
+                in_ws_pkg = stripped == "[workspace.package]"
+                continue
+            if in_ws_pkg:
+                m = re.match(r'^version\s*=\s*"([^"]+)"', stripped)
+                if m:
+                    return m.group(1)
+    return "0.14.0"
+
+
+SITE_VERSION = _read_workspace_version()
+EXPECTED_SCHEMA_VERSION = "ferric-tour-v1"
+
+RESTRICTED_PRODUCT_TOKENS: Tuple[str, ...] = (
+    "am" + "ix",
+    "che" + "nomx",
+    "metabo" + "analyst",
+    "nmrproc" + "flow",
+    "sim" + "ca",
+    "ico" + "shift",
+    "bar" + "asa",
+    "cy" + "ana",
+    "fl" + "ya",
+    "art" + "ina",
+    "nmr" + "tist",
+    "xp" + "lor",
+    "cc" + "pn",
+    "mn" + "ova",
+    "mestre" + "nova",
+    "che" + "mex",
+    "ca" + "tia",
+    "gl" + "ove",
+    "gua" + "rdd",
+    "ti" + "tan",
+    "ta" + "los",
+    "deep " + "picker",
+    "ar" + "ia",
+    "com" + "pass",
+    "model" + "free4",
+    "fast-model" + "free",
+    "ten" + "sor2",
+    "nes" + "sie",
+    "ring" + "nmr",
+)
+
+BADGE_KIND_CLASSES: Dict[str, str] = {
+    "empirical_calibrated": "badge-empirical",
+    "cold_holdout_disclosed": "badge-holdout",
+    "synthetic_showcase": "badge-synthetic",
+    "synthetic_and_protocol_showcase": "badge-protocol",
+    "protocol_showcase": "badge-protocol",
+}
+
+
+@dataclass(frozen=True)
+class NormalizedBundle:
+    module_index: int
+    slug: str
+    title: str
+    subtitle: str
+    manual_chapter: str
+    badge_kind: str
+    badge_label: str
+    badge_detail: str
+    duration_sec: float
+    fps: int
+    cli_command: str
+    chapters: List[Dict[str, Any]]
+    interactive_control: Dict[str, Any]
+    raw_json: Dict[str, Any]
+
+
+def safe_json_for_script_tag(obj: Any) -> str:
+    """Serialize JSON deterministically and escape HTML script-closing sequences."""
+    raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return raw.replace("</", "<\\/").replace("<!--", "\\u003c!--")
+
+
+def normalize_bundle(data: Dict[str, Any], source_name: str) -> NormalizedBundle:
+    """Validate and normalize a ``ferric-tour-v1`` JSON payload."""
+    schema = data.get("schema_version")
+    if schema != EXPECTED_SCHEMA_VERSION:
+        raise ValueError(
+            f"{source_name}: expected schema_version={EXPECTED_SCHEMA_VERSION!r}, got {schema!r}"
+        )
+
+    module_index = int(data.get("module_index", 0))
+    if module_index < 1 or module_index > 8:
+        raise ValueError(f"{source_name}: module_index must be in 1..8, got {module_index}")
+
+    slug = str(data.get("slug", "")).strip()
+    if not slug or not re.match(r"^[a-z0-9_]+$", slug):
+        raise ValueError(f"{source_name}: invalid slug {slug!r}")
+
+    title = str(data.get("title", f"Module {module_index:02d}")).strip()
+    subtitle = str(data.get("subtitle", "")).strip()
+    manual_chapter = str(data.get("manual_chapter", "index.html")).strip() or "index.html"
+    duration_sec = float(data.get("duration_sec", 16.0))
+    if duration_sec <= 0.0:
+        duration_sec = 16.0
+    fps = int(data.get("fps", 30))
+    if fps <= 0:
+        fps = 30
+    cli_command = str(data.get("cli_command", f"ferric export-tour --module {module_index:02d}")).strip()
+
+    raw_badge = data.get("validation_badge")
+    if not isinstance(raw_badge, dict):
+        raw_badge = {}
+    badge_kind = str(raw_badge.get("kind", "synthetic_showcase" if module_index >= 4 else "empirical_calibrated")).strip()
+    badge_label = str(raw_badge.get("label", "VALIDATION SCOPE")).strip()
+    badge_detail = str(raw_badge.get("detail", "")).strip()
+
+    # Enforce candid synthetic showcase disclosure for modules 04-08
+    if module_index >= 4 and "SYNTHETIC" not in (badge_label + " " + badge_detail).upper():
+        prefix = "SYNTHETIC FORWARD-MODEL SHOWCASE"
+        if module_index == 8:
+            prefix = "SYNTHETIC & PROTOCOL SHOWCASE"
+        badge_label = f"{prefix} — {badge_label}" if badge_label else prefix
+        if not badge_detail:
+            badge_detail = (
+                "SYNTHETIC forward-model showcase; Phase 17 blind real-data gates "
+                "F10-F18 remain open in TODO.md."
+            )
+        else:
+            badge_detail = f"SYNTHETIC forward-model showcase: {badge_detail}"
+
+    raw_chapters = data.get("chapters")
+    if not isinstance(raw_chapters, list) or len(raw_chapters) == 0:
+        raise ValueError(f"{source_name}: chapters must be a non-empty list")
+
+    chapters: List[Dict[str, Any]] = []
+    seg = duration_sec / float(len(raw_chapters))
+    for i, ch in enumerate(raw_chapters):
+        if not isinstance(ch, dict):
+            raise ValueError(f"{source_name}: chapter {i} must be an object")
+        start_sec = float(ch.get("start_sec", ch.get("start", i * seg)))
+        end_sec = float(ch.get("end_sec", ch.get("end", (i + 1) * seg)))
+        ch_title = str(ch.get("title", ch.get("name", f"Chapter {i + 1}"))).strip()
+        ch_caption = str(
+            ch.get("caption", ch.get("narrative", ch.get("description", "")))
+        ).strip()
+        ch_metric = str(
+            ch.get("metric", ch.get("metric_pill", ch.get("equation", ch.get("highlight", ""))))
+        ).strip()
+        chapters.append(
+            {
+                "index": i + 1,
+                "start_sec": start_sec,
+                "end_sec": end_sec,
+                "title": ch_title,
+                "caption": ch_caption,
+                "metric": ch_metric,
+            }
+        )
+
+    raw_ctrl = data.get("interactive_control")
+    if not isinstance(raw_ctrl, dict):
+        raw_ctrl = {}
+    ctrl_min = float(raw_ctrl.get("min", 0.0))
+    ctrl_max = float(raw_ctrl.get("max", 10.0))
+    ctrl_step = float(raw_ctrl.get("step", 1.0))
+    if ctrl_step <= 0.0:
+        ctrl_step = 1.0
+    ctrl_def = float(raw_ctrl.get("default_val", raw_ctrl.get("default", ctrl_min)))
+    ctrl = {
+        "id": str(raw_ctrl.get("id", f"param_{module_index}")).strip(),
+        "label": str(raw_ctrl.get("label", "Parameter")).strip(),
+        "min": ctrl_min,
+        "max": ctrl_max,
+        "step": ctrl_step,
+        "default_val": ctrl_def,
+        "unit": str(raw_ctrl.get("unit", "")).strip(),
+    }
+
+    normalized_json = dict(data)
+    normalized_json["schema_version"] = EXPECTED_SCHEMA_VERSION
+    normalized_json["module_index"] = module_index
+    normalized_json["slug"] = slug
+    normalized_json["title"] = title
+    normalized_json["subtitle"] = subtitle
+    normalized_json["manual_chapter"] = manual_chapter
+    normalized_json["duration_sec"] = duration_sec
+    normalized_json["fps"] = fps
+    normalized_json["cli_command"] = cli_command
+    normalized_json["validation_badge"] = {
+        "kind": badge_kind,
+        "label": badge_label,
+        "detail": badge_detail,
+    }
+    normalized_json["chapters"] = chapters
+    normalized_json["interactive_control"] = ctrl
+
+    return NormalizedBundle(
+        module_index=module_index,
+        slug=slug,
+        title=title,
+        subtitle=subtitle,
+        manual_chapter=manual_chapter,
+        badge_kind=badge_kind,
+        badge_label=badge_label,
+        badge_detail=badge_detail,
+        duration_sec=duration_sec,
+        fps=fps,
+        cli_command=cli_command,
+        chapters=chapters,
+        interactive_control=ctrl,
+        raw_json=normalized_json,
+    )
+
+
+def load_tour_bundles(data_dir: Path) -> List[NormalizedBundle]:
+    """Load and deterministically sort ``*.tour.json`` bundles from ``data_dir``."""
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"data directory does not exist: {data_dir}")
+    paths = sorted(data_dir.glob("*.tour.json"))
+    if not paths:
+        raise FileNotFoundError(f"no *.tour.json files found in {data_dir}")
+    bundles: List[NormalizedBundle] = []
+    for p in paths:
+        parsed = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{p.name}: root JSON must be an object")
+        bundles.append(normalize_bundle(parsed, p.name))
+    bundles.sort(key=lambda b: (b.module_index, b.slug))
+    return bundles
+
+
+def format_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    mins, secs = divmod(total, 60)
+    return f"{mins}:{secs:02d}"
+
+
+def badge_css_class(kind: str) -> str:
+    return BADGE_KIND_CLASSES.get(kind, "badge-synthetic")
+
+
+def render_poster_svg(bundle: NormalizedBundle) -> str:
+    """Build a crisp deterministic fallback poster SVG for gallery cards."""
+    idx = bundle.module_index
+    accent_map = {
+        1: "#38bdf8",
+        2: "#22d3ee",
+        3: "#60a5fa",
+        4: "#f59e0b",
+        5: "#fb923c",
+        6: "#a78bfa",
+        7: "#34d399",
+        8: "#f472b6",
+    }
+    col = accent_map.get(idx, "#38bdf8")
+    waves: List[str] = []
+    for k in range(5):
+        y = 32 + k * 24
+        pts = []
+        for step in range(17):
+            x = 18 + step * 20
+            amp = 14.0 if k == 2 else 8.0
+            dy = amp * (((idx * 7 + step * 3 + k * 5) % 11) - 5) / 5.0
+            pts.append(f"{x},{y + dy:.1f}")
+        opacity = "0.85" if k == 2 else "0.32"
+        waves.append(
+            f'<polyline fill="none" stroke="{col}" stroke-opacity="{opacity}" '
+            f'stroke-width="2" points="{" ".join(pts)}" />'
+        )
+    return (
+        f'<svg class="mini-poster" viewBox="0 0 360 180" width="360" height="180" '
+        f'aria-hidden="true" xmlns="http://www.w3.org/2000/svg">'
+        f'<rect width="360" height="180" rx="8" fill="#0b1120" />'
+        f'{"".join(waves)}'
+        f'<text x="16" y="24" fill="#94a3b8" font-family="ui-monospace,monospace" '
+        f'font-size="11">MOD {idx:02d} · {html.escape(bundle.slug)}</text>'
+        f'</svg>'
+    )
+
+
+def render_gallery_html(bundles: Sequence[NormalizedBundle]) -> str:
+    """Render the responsive Gallery Index (``index.html``)."""
+    cards_html: List[str] = []
+    gallery_manifest: List[Dict[str, Any]] = []
+
+    for b in bundles:
+        b_cls = badge_css_class(b.badge_kind)
+        dur = format_duration(b.duration_sec)
+        chapter_pills = "".join(
+            f'<a class="ch-pill" href="{html.escape(b.slug)}.html?ch={ch["index"]}" '
+            f'title="{html.escape(ch["title"])}">Ch {ch["index"]}: {html.escape(ch["title"])}</a>'
+            for ch in b.chapters
+        )
+        synth_note = ""
+        if b.module_index >= 4:
+            synth_note = (
+                '<p class="card-disclosure">'
+                '<strong>SYNTHETIC SHOWCASE:</strong> Deterministic forward-model physics; '
+                'Phase 17 real-data gates open.'
+                "</p>"
+            )
+        elif b.module_index == 3:
+            synth_note = (
+                '<p class="card-disclosure card-disclosure-holdout">'
+                '<strong>F8 HOLDOUT DISCLOSED:</strong> Unseen 1KHM &rarr; 1ZZK '
+                '1.86&ndash;4.14 &Aring; (0/5 &lt; 1.80 &Aring;).'
+                "</p>"
+            )
+
+        cards_html.append(
+            f'<article class="tour-card" data-module="{b.module_index}">'
+            f'  <a class="card-stage-link" href="{html.escape(b.slug)}.html" '
+            f'     aria-label="Open {html.escape(b.title)} interactive tour">'
+            f'    <div class="card-stage">'
+            f'      {render_poster_svg(b)}'
+            f'      <canvas class="mini-canvas" data-module-index="{b.module_index}" '
+            f'              width="360" height="180" aria-hidden="true"></canvas>'
+            f'      <span class="card-mod-pill">Module {b.module_index:02d}</span>'
+            f'      <span class="card-dur-pill">{html.escape(dur)}</span>'
+            f"    </div>"
+            f"  </a>"
+            f'  <div class="card-body">'
+            f'    <div class="card-badge-row">'
+            f'      <span class="val-badge {b_cls}">{html.escape(b.badge_label)}</span>'
+            f"    </div>"
+            f'    <h2 class="card-title"><a href="{html.escape(b.slug)}.html">{html.escape(b.title)}</a></h2>'
+            f'    <p class="card-subtitle">{html.escape(b.subtitle)}</p>'
+            f"    {synth_note}"
+            f'    <div class="ch-pills">{chapter_pills}</div>'
+            f'    <div class="card-actions">'
+            f'      <a class="btn-primary" href="{html.escape(b.slug)}.html">&#127918; Launch Interactive Tour</a>'
+            f'      <a class="btn-secondary" href="{html.escape(b.slug)}.html?mode=video">&#127916; Watch MP4 / WebM</a>'
+            f"    </div>"
+            f"  </div>"
+            f"</article>"
+        )
+
+        gallery_manifest.append(
+            {
+                "module_index": b.module_index,
+                "slug": b.slug,
+                "title": b.title,
+                "badge_kind": b.badge_kind,
+                "payload": b.raw_json.get("payload", {}),
+                "interactive_control": b.interactive_control,
+            }
+        )
+
+    manifest_json = safe_json_for_script_tag(gallery_manifest)
+
+    return f"""<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>FERRIC — Interactive Showcase Cinema &amp; Video Tours</title>
+  <link rel="icon" type="image/svg+xml" href="../favicon.svg" />
+  <link rel="icon" type="image/png" sizes="32x32" href="../favicon-32.png" />
+  <link rel="stylesheet" href="tours.css" />
+</head>
+<body class="gallery-body">
+  <header class="topbar">
+    <div class="brand-wrap">
+      <a class="brand-link" href="../index.html">
+        <svg class="brand-icon" viewBox="0 0 512 512" width="22" height="22" aria-hidden="true">
+          <rect x="32" y="32" width="448" height="448" rx="104" ry="104" fill="#16202A" stroke="#B7410E" stroke-width="24"/>
+          <line x1="152" y1="124" x2="152" y2="388" stroke="#E05A2B" stroke-width="44" stroke-linecap="round"/>
+          <line x1="152" y1="124" x2="376" y2="124" stroke="#E05A2B" stroke-width="44" stroke-linecap="round"/>
+          <line x1="152" y1="248" x2="316" y2="248" stroke="#E05A2B" stroke-width="36" stroke-linecap="round"/>
+          <path d="M 168 128 Q 205 318 242 248 T 316 268 T 414 256" fill="none" stroke="#FB923C" stroke-width="30" stroke-linecap="round"/>
+          <circle cx="152" cy="124" r="20" fill="#FED7AA"/>
+        </svg>
+        <span>FERRIC</span>
+      </a>
+      <span class="version-pill">v{html.escape(SITE_VERSION)} &middot; Interactive Tours</span>
+    </div>
+    <nav class="topbar-actions" aria-label="Primary navigation">
+      <a class="nav-pill" href="../index.html">User Manual</a>
+      <a class="nav-pill nav-pill-accent" href="../demo/index.html">Live WebGPU Workbench</a>
+      <button id="theme-toggle" class="theme-btn" type="button" aria-label="Toggle dark or light theme">Light</button>
+    </nav>
+  </header>
+
+  <main class="gallery-main">
+    <section class="hero-card">
+      <div class="hero-copy">
+        <p class="hero-eyebrow">Deterministic Clean-Room NMR Showcase &middot; Seed 20261801</p>
+        <h1>Interactive Module Showcase Cinema</h1>
+        <p class="hero-lead">
+          Every tour below is generated directly from deterministic <code>nmr-core</code> outputs.
+          Launch the <strong>60 fps HTML5 Interactive Live Player</strong> to scrub timelines, drag 3D
+          backbones, inspect coordinates, and tweak live parameters &mdash; or switch instantly to
+          pre-rendered <strong>1280&times;720 MP4 / WebM</strong> video.
+        </p>
+      </div>
+      <div class="scope-legend" aria-label="Validation Scope Legend">
+        <div class="legend-item">
+          <span class="val-badge badge-empirical">Empirical + LOPO Calibrated</span>
+          <span>Modules 01&ndash;02 calibrated on public BMRB + realistic Bruker physics</span>
+        </div>
+        <div class="legend-item">
+          <span class="val-badge badge-holdout">Cold Holdout Disclosed (F8)</span>
+          <span>Module 03 unseen 1KHM &rarr; 1ZZK disclosed (1.86&ndash;4.14 &Aring;, 0/5 &lt; 1.80 &Aring;)</span>
+        </div>
+        <div class="legend-item">
+          <span class="val-badge badge-synthetic">Synthetic Forward-Model Showcase &mdash; F10..F17 open</span>
+          <span>Modules 04&ndash;08 synthetic forward-model demonstrations; empirical gates open</span>
+        </div>
+        <div class="legend-item">
+          <span class="val-badge badge-protocol">Protocol Showcase &mdash; F18 open</span>
+          <span>Module 08 sandboxed MCP JSON-RPC 2.0 &amp; Undo bridge showcase</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="tour-grid" aria-label="Interactive module tours">
+      {"".join(cards_html)}
+    </section>
+  </main>
+
+  <footer class="tours-footer">
+    <span><strong>FERRIC</strong> v{html.escape(SITE_VERSION)} &middot; Clean-Room Rust + WebGPU NMR Workbench</span>
+    <span class="tours-footer-links">
+      <a href="../index.html">User Manual</a>
+      <a href="../demo/index.html">Live WebGPU Workbench</a>
+      <a href="https://github.com/debsahu/ferric" target="_blank" rel="noopener">GitHub</a>
+    </span>
+  </footer>
+
+  <script type="application/json" id="tour-gallery-data">{manifest_json}</script>
+  <script src="tours_player.js" defer></script>
+</body>
+</html>
+"""
+
+
+def render_module_html(
+    bundle: NormalizedBundle,
+    bundles: Sequence[NormalizedBundle],
+    videos_rel: str,
+) -> str:
+    """Render a per-module dual-mode Interactive Cinema Player page."""
+    b_cls = badge_css_class(bundle.badge_kind)
+    ctrl = bundle.interactive_control
+    embedded_json = safe_json_for_script_tag(bundle.raw_json)
+    v_rel = videos_rel.rstrip("/")
+    webm_src = f"{v_rel}/{bundle.slug}.webm"
+    mp4_src = f"{v_rel}/{bundle.slug}.mp4"
+
+    # Explicit scientific candor disclosure block
+    disclosure_extra = ""
+    if bundle.module_index >= 4:
+        disclosure_extra = (
+            " <strong>SYNTHETIC FORWARD-MODEL SHOWCASE:</strong> Outputs reflect deterministic "
+            "forward-model physics in <code>nmr-core</code>; Phase 17 blind real-data empirical "
+            "gates (<code>F10</code>&ndash;<code>F17</code>) remain open in <code>TODO.md</code>."
+        )
+        if bundle.module_index == 8:
+            disclosure_extra += " Includes <strong>PROTOCOL SHOWCASE (F18 open)</strong> for MCP JSON-RPC 2.0."
+    elif bundle.module_index == 3:
+        disclosure_extra = (
+            " <strong>F8 COLD HOLDOUT DISCLOSED:</strong> Dev 1D3Z + unseen 1KHM &rarr; 1ZZK "
+            "improves NOE-only on 5/5 seeds (1.86&ndash;4.14 &Aring;, 0/5 &lt; 1.80 &Aring;)."
+        )
+
+    # Chapter timeline markers & video jump buttons
+    chapter_markers_html: List[str] = []
+    video_jumps_html: List[str] = []
+    for ch in bundle.chapters:
+        idx = ch["index"]
+        start_s = ch["start_sec"]
+        chapter_markers_html.append(
+            f'<button class="ch-marker" type="button" data-ch="{idx}" data-start="{start_s:.3f}" '
+            f'title="Key {idx}: {html.escape(ch["title"])}">'
+            f'<span class="ch-num">{idx}</span>'
+            f'<span class="ch-lbl">{html.escape(ch["title"])}</span>'
+            f"</button>"
+        )
+        video_jumps_html.append(
+            f'<button class="vid-jump-btn" type="button" data-ch="{idx}" data-start="{start_s:.3f}">'
+            f'Ch {idx} ({format_duration(start_s)}): {html.escape(ch["title"])}'
+            f"</button>"
+        )
+
+    # Module-specific quick preset chips
+    preset_chips: List[Tuple[str, float]] = []
+    if bundle.module_index == 1:
+        preset_chips = [("Zero-Fill (0)", 0), ("IST 5", 5), ("IST 12", 12), ("Converged (20)", 20)]
+    elif bundle.module_index == 2:
+        preset_chips = [("Phe4", 4), ("Lys6", 6), ("Thr7 (Inv)", 7), ("Gly10 (Null)", 10)]
+    elif bundle.module_index == 3:
+        preset_chips = [("0° Front", 0), ("90° Side", 90), ("180° Back", 180), ("270°", 270)]
+    elif bundle.module_index == 4:
+        preset_chips = [("Ile23 (Rex)", 23), ("Core Res 45", 45), ("Tail Gly75", 75)]
+    elif bundle.module_index == 5:
+        preset_chips = [("0 uM", 0), ("50 uM", 50), ("100 uM (Equiv)", 100), ("250 uM", 250)]
+    elif bundle.module_index == 6:
+        preset_chips = [("COOH (0)", 0), ("Chiral CH (3)", 3), ("Aryl (6)", 6), ("iBu (11)", 11)]
+    elif bundle.module_index == 7:
+        preset_chips = [("g1 (Low)", 0), ("g6 (Mid)", 5), ("g12", 11), ("g16 (High)", 15)]
+    elif bundle.module_index == 8:
+        preset_chips = [("1.33 ppm Lactate", 4), ("3.04 ppm Creatine", 10), ("3.56 ppm Glycine", 14)]
+
+    chips_html = "".join(
+        f'<button class="preset-chip" type="button" data-val="{val}">{html.escape(label)}</button>'
+        for label, val in preset_chips
+    )
+
+    mcp_tab_html = ""
+    if bundle.module_index == 8:
+        mcp_tab_html = (
+            '<div class="mcp-inspector-wrap">'
+            '  <button id="btn-mcp-toggle" class="btn-outline" type="button" aria-expanded="false">'
+            "    &#128268; MCP JSON-RPC Packet"
+            "  </button>"
+            '  <pre id="mcp-packet-drawer" class="mcp-packet-drawer" hidden></pre>'
+            "</div>"
+        )
+
+    # Prev / Next navigation
+    pos = next((i for i, item in enumerate(bundles) if item.slug == bundle.slug), 0)
+    prev_link = (
+        f'<a class="nav-adj" href="{html.escape(bundles[pos - 1].slug)}.html">&larr; {bundles[pos - 1].module_index:02d}</a>'
+        if pos > 0
+        else '<span class="nav-adj disabled">&larr; Start</span>'
+    )
+    next_link = (
+        f'<a class="nav-adj" href="{html.escape(bundles[pos + 1].slug)}.html">{bundles[pos + 1].module_index:02d} &rarr;</a>'
+        if pos + 1 < len(bundles)
+        else '<span class="nav-adj disabled">End &rarr;</span>'
+    )
+
+    ch0 = bundle.chapters[0]
+    stage_hint = (
+        "Drag to 3D Orbit · Hover/Tap Atoms"
+        if bundle.module_index == 3
+        else "Hover or Tap Canvas Features to Inspect"
+    )
+    canvas_cls = "tour-canvas is-orbit-canvas" if bundle.module_index == 3 else "tour-canvas"
+
+    return f"""<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Module {bundle.module_index:02d}: {html.escape(bundle.title)} — FERRIC Tour</title>
+  <link rel="icon" type="image/svg+xml" href="../favicon.svg" />
+  <link rel="icon" type="image/png" sizes="32x32" href="../favicon-32.png" />
+  <link rel="stylesheet" href="tours.css" />
+</head>
+<body class="player-body" data-module="{bundle.module_index}">
+  <header class="topbar player-topbar">
+    <div class="brand-wrap">
+      <a class="brand-link" href="../index.html" title="FERRIC User Manual">
+        <svg class="brand-icon" viewBox="0 0 512 512" width="20" height="20" aria-hidden="true">
+          <rect x="32" y="32" width="448" height="448" rx="104" ry="104" fill="#16202A" stroke="#B7410E" stroke-width="24"/>
+          <line x1="152" y1="124" x2="152" y2="388" stroke="#E05A2B" stroke-width="44" stroke-linecap="round"/>
+          <line x1="152" y1="124" x2="376" y2="124" stroke="#E05A2B" stroke-width="44" stroke-linecap="round"/>
+          <line x1="152" y1="248" x2="316" y2="248" stroke="#E05A2B" stroke-width="36" stroke-linecap="round"/>
+          <path d="M 168 128 Q 205 318 242 248 T 316 268 T 414 256" fill="none" stroke="#FB923C" stroke-width="30" stroke-linecap="round"/>
+          <circle cx="152" cy="124" r="20" fill="#FED7AA"/>
+        </svg>
+      </a>
+      <a class="nav-pill" href="index.html">&larr; All Tours</a>
+      <a class="nav-pill hide-compact" href="../index.html">Manual</a>
+      <a class="nav-pill nav-pill-accent hide-compact" href="../demo/index.html">WebGPU Demo</a>
+      <span class="player-title-inline">
+        <strong>{bundle.module_index:02d}</strong> {html.escape(bundle.title)}
+      </span>
+    </div>
+
+    <div class="mode-switcher" role="tablist" aria-label="Tour playback mode">
+      <button id="mode-interactive" class="mode-tab is-active" type="button" role="tab" aria-selected="true">
+        &#127918; Interactive Live Player
+      </button>
+      <button id="mode-video" class="mode-tab" type="button" role="tab" aria-selected="false">
+        &#127916; Pre-Rendered HD Video
+      </button>
+    </div>
+
+    <div class="topbar-actions">
+      <button id="theme-toggle" class="theme-btn" type="button" aria-label="Toggle dark or light theme">Light</button>
+    </div>
+  </header>
+
+  <div class="validation-banner {b_cls}" role="region" aria-label="Validation scope disclosure">
+    <span class="val-badge {b_cls}">{html.escape(bundle.badge_label)}</span>
+    <span class="val-detail">{html.escape(bundle.badge_detail)}{disclosure_extra}</span>
+  </div>
+
+  <main class="cinema-shell">
+    <section id="panel-interactive" class="player-panel" role="tabpanel" aria-labelledby="mode-interactive">
+      <div id="canvas-wrap" class="stage-wrap">
+        <canvas id="tour-canvas" class="{canvas_cls}" aria-label="Interactive simulation canvas for {html.escape(bundle.title)}"></canvas>
+        <div id="stage-overlay-pill" class="stage-overlay-pill">
+          <span id="overlay-ch-label">Ch 1/4</span>
+          <span class="overlay-sep">&middot;</span>
+          <span>{html.escape(stage_hint)}</span>
+        </div>
+        <div id="hud-tooltip" class="hud-tooltip" hidden></div>
+      </div>
+
+      <div class="control-strip">
+        <div class="ctrl-primary">
+          <label class="ctrl-label" for="ctrl-slider">
+            <span id="ctrl-name">{html.escape(ctrl["label"])}</span>:
+            <strong id="ctrl-readout">{ctrl["default_val"]:g}</strong>
+            <span class="ctrl-unit">{html.escape(ctrl["unit"])}</span>
+          </label>
+          <div class="ctrl-slider-row">
+            <button id="ctrl-dec" class="step-btn" type="button" aria-label="Decrease parameter">&minus;</button>
+            <input id="ctrl-slider" type="range"
+                   min="{ctrl["min"]:g}" max="{ctrl["max"]:g}"
+                   step="{ctrl["step"]:g}" value="{ctrl["default_val"]:g}" />
+            <button id="ctrl-inc" class="step-btn" type="button" aria-label="Increase parameter">+</button>
+            <button id="ctrl-resume" class="btn-outline" type="button" hidden>Resume Auto</button>
+          </div>
+        </div>
+        <div class="ctrl-presets">
+          {chips_html}
+          {mcp_tab_html}
+        </div>
+      </div>
+
+      <div class="transport-bar" aria-label="Cinema playback transport">
+        <div class="transport-left">
+          <button id="btn-play" class="play-btn" type="button" aria-label="Play or pause">
+            &#9654; Play
+          </button>
+          <span id="time-readout" class="time-readout">0:00.0 / {format_duration(bundle.duration_sec)}.0</span>
+        </div>
+
+        <div class="timeline-wrap">
+          <input id="timeline-range" class="timeline-range" type="range"
+                 min="0" max="{bundle.duration_sec:.3f}" step="0.033" value="0"
+                 aria-label="Timeline scrubber" />
+          <div class="ch-markers">
+            {"".join(chapter_markers_html)}
+          </div>
+        </div>
+
+        <div class="transport-right">
+          <div class="speed-group" role="group" aria-label="Playback speed">
+            <button class="speed-btn" type="button" data-speed="0.5">0.5&times;</button>
+            <button class="speed-btn is-active" type="button" data-speed="1">1&times;</button>
+            <button class="speed-btn" type="button" data-speed="1.5">1.5&times;</button>
+            <button class="speed-btn" type="button" data-speed="2">2&times;</button>
+          </div>
+          <button id="btn-loop" class="btn-outline is-active" type="button" aria-pressed="true">Loop</button>
+          <button id="btn-export-webm" class="btn-outline" type="button">&#127909; Export .webm</button>
+          <span id="export-status" class="export-status" aria-live="polite"></span>
+        </div>
+      </div>
+    </section>
+
+    <section id="panel-video" class="player-panel" role="tabpanel" aria-labelledby="mode-video" hidden>
+      <div class="video-stage-wrap">
+        <video id="tour-video" class="tour-video" controls playsinline preload="metadata">
+          <source src="{html.escape(webm_src)}" type="video/webm" />
+          <source src="{html.escape(mp4_src)}" type="video/mp4" />
+          Your browser does not support HTML5 video playback.
+        </video>
+      </div>
+      <div class="video-controls-bar">
+        <div class="video-jumps" aria-label="Jump to video chapter">
+          {"".join(video_jumps_html)}
+        </div>
+        <div class="video-downloads">
+          <a class="btn-primary" href="{html.escape(mp4_src)}" download="{html.escape(bundle.slug)}.mp4">&#11015; Download MP4</a>
+          <a class="btn-secondary" href="{html.escape(webm_src)}" download="{html.escape(bundle.slug)}.webm">&#11015; Download WebM</a>
+        </div>
+      </div>
+    </section>
+
+    <footer class="bottom-drawer">
+      <div class="drawer-narrative">
+        <div class="drawer-title-row">
+          <span id="drawer-ch-badge" class="drawer-ch-badge">Chapter 1 / {len(bundle.chapters)}</span>
+          <h1 id="drawer-ch-title" class="drawer-ch-title">{html.escape(ch0["title"])}</h1>
+          <span id="drawer-metric" class="drawer-metric">{html.escape(ch0["metric"])}</span>
+        </div>
+        <p id="drawer-caption" class="drawer-caption">{html.escape(ch0["caption"])}</p>
+      </div>
+
+      <div class="drawer-actions">
+        <div class="cli-box">
+          <code id="cli-cmd">{html.escape(bundle.cli_command)}</code>
+          <button id="btn-copy-cli" class="copy-btn" type="button">Copy CLI</button>
+        </div>
+        <div class="drawer-links">
+          <a class="nav-pill" href="../{html.escape(bundle.manual_chapter)}">Open Manual Chapter &rarr;</a>
+          <a class="nav-pill" href="https://github.com/debsahu/ferric" target="_blank" rel="noopener">GitHub</a>
+          <div class="adj-wrap">{prev_link}{next_link}</div>
+        </div>
+      </div>
+    </footer>
+  </main>
+
+  <script type="application/json" id="tour-bundle-data">{embedded_json}</script>
+  <script src="tours_player.js" defer></script>
+</body>
+</html>
+"""
+
+
+TOURS_CSS = r""":root {
+  --bg: #f8fafc;
+  --bg-elev: #ffffff;
+  --bg-subtle: #f1f5f9;
+  --bg-stage: #09111f;
+  --fg: #0f172a;
+  --fg-muted: #475569;
+  --fg-soft: #64748b;
+  --border: #cbd5e1;
+  --accent: #B7410E;
+  --accent-soft: rgba(183, 65, 14, 0.12);
+  --accent-strong: #9A3412;
+  --ok-bg: rgba(16, 185, 129, 0.14);
+  --ok-fg: #047857;
+  --ok-bd: rgba(16, 185, 129, 0.38);
+  --warn-bg: rgba(217, 119, 6, 0.14);
+  --warn-fg: #b45309;
+  --warn-bd: rgba(217, 119, 6, 0.42);
+  --synth-bg: rgba(234, 88, 12, 0.14);
+  --synth-fg: #c2410c;
+  --synth-bd: rgba(234, 88, 12, 0.42);
+  --proto-bg: rgba(124, 58, 237, 0.14);
+  --proto-fg: #6d28d9;
+  --proto-bd: rgba(124, 58, 237, 0.42);
+  --shadow: 0 6px 24px rgba(15, 23, 42, 0.08);
+}
+
+[data-theme="dark"] {
+  --bg: #0b1120;
+  --bg-elev: #111827;
+  --bg-subtle: #1e293b;
+  --bg-stage: #070d19;
+  --fg: #e2e8f0;
+  --fg-muted: #94a3b8;
+  --fg-soft: #64748b;
+  --border: #253347;
+  --accent: #FB923C;
+  --accent-soft: rgba(251, 146, 60, 0.14);
+  --accent-strong: #FDBA74;
+  --ok-bg: rgba(16, 185, 129, 0.16);
+  --ok-fg: #6ee7b7;
+  --ok-bd: rgba(110, 231, 183, 0.34);
+  --warn-bg: rgba(245, 158, 11, 0.16);
+  --warn-fg: #fbbf24;
+  --warn-bd: rgba(251, 191, 36, 0.36);
+  --synth-bg: rgba(251, 146, 60, 0.16);
+  --synth-fg: #fdba74;
+  --synth-bd: rgba(251, 146, 60, 0.36);
+  --proto-bg: rgba(167, 139, 250, 0.16);
+  --proto-fg: #c4b5fd;
+  --proto-bd: rgba(167, 139, 250, 0.36);
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html {
+  font-size: 16px;
+  -webkit-text-size-adjust: 100%;
+  scroll-behavior: smooth;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  line-height: 1.5;
+  overflow-x: hidden;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { color: var(--accent-strong); text-decoration: underline; }
+button, a, input { touch-action: manipulation; }
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  min-height: calc(3.4rem + env(safe-area-inset-top, 0px));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  padding: env(safe-area-inset-top, 0px) calc(1rem + env(safe-area-inset-right, 0px)) 0.35rem calc(1rem + env(safe-area-inset-left, 0px));
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+}
+.brand-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.brand-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-weight: 800;
+  font-size: 1.05rem;
+  color: var(--fg);
+  white-space: nowrap;
+}
+.brand-icon { flex-shrink: 0; border-radius: 5px; }
+.brand-link:hover { text-decoration: none; color: var(--accent); }
+.tours-footer {
+  max-width: 1240px;
+  margin: 0 auto 1.5rem;
+  padding: 0.9rem 1.25rem;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+}
+.tours-footer-links { display: inline-flex; gap: 1rem; flex-wrap: wrap; }
+.version-pill {
+  font-size: 0.74rem;
+  font-weight: 600;
+  padding: 0.16rem 0.55rem;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  white-space: nowrap;
+}
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.nav-pill, .theme-btn, .btn-primary, .btn-secondary, .btn-outline, .copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  min-height: 38px;
+  padding: 0.38rem 0.75rem;
+  border-radius: 8px;
+  font-size: 0.84rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--fg);
+  white-space: nowrap;
+  text-decoration: none;
+}
+.nav-pill:hover, .theme-btn:hover, .btn-outline:hover, .copy-btn:hover {
+  border-color: var(--accent);
+  text-decoration: none;
+}
+.nav-pill-accent, .btn-primary {
+  background: var(--accent);
+  color: #06101f;
+  border-color: var(--accent);
+}
+.nav-pill-accent:hover, .btn-primary:hover {
+  filter: brightness(1.08);
+  color: #06101f;
+  text-decoration: none;
+}
+.btn-secondary {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.btn-secondary:hover {
+  filter: brightness(1.08);
+  text-decoration: none;
+}
+.btn-outline.is-active, .speed-btn.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Validation Badges */
+.val-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.18rem 0.58rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  border: 1px solid transparent;
+  line-height: 1.3;
+}
+.badge-empirical.val-badge { background: var(--ok-bg); color: var(--ok-fg); border-color: var(--ok-bd); }
+.badge-holdout.val-badge { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-bd); }
+.badge-synthetic.val-badge { background: var(--synth-bg); color: var(--synth-fg); border-color: var(--synth-bd); }
+.badge-protocol.val-badge { background: var(--proto-bg); color: var(--proto-fg); border-color: var(--proto-bd); }
+
+/* Gallery Layout */
+.gallery-main {
+  max-width: 92rem;
+  margin: 0 auto;
+  padding: 1.25rem calc(1.1rem + env(safe-area-inset-right, 0px)) calc(2.5rem + env(safe-area-inset-bottom, 0px)) calc(1.1rem + env(safe-area-inset-left, 0px));
+}
+.hero-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 1.35rem 1.45rem;
+  box-shadow: var(--shadow);
+  margin-bottom: 1.35rem;
+  display: grid;
+  grid-template-columns: 1.25fr 1fr;
+  gap: 1.25rem;
+  align-items: center;
+}
+.hero-eyebrow {
+  margin: 0 0 0.25rem;
+  font-size: 0.76rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+}
+.hero-card h1 {
+  margin: 0 0 0.5rem;
+  font-size: clamp(1.35rem, 2.5vw, 1.95rem);
+  line-height: 1.2;
+}
+.hero-lead {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: 0.94rem;
+}
+.scope-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 0.52rem;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.85rem 0.95rem;
+}
+.legend-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.16rem;
+  font-size: 0.79rem;
+  color: var(--fg-muted);
+}
+
+/* Responsive 2x4 (desktop), 2x4 (tablet), 1x8 (mobile) Card Grid */
+.tour-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1rem;
+}
+@media (max-width: 1023px) and (min-width: 680px) {
+  .hero-card { grid-template-columns: 1fr; }
+  .tour-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 679px) {
+  .hero-card { grid-template-columns: 1fr; padding: 1rem; }
+  .tour-grid { grid-template-columns: 1fr; }
+}
+
+.tour-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--shadow);
+  transition: transform 0.15s ease, border-color 0.15s ease;
+}
+.tour-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--accent);
+}
+.card-stage {
+  position: relative;
+  aspect-ratio: 2 / 1;
+  background: var(--bg-stage);
+  overflow: hidden;
+}
+.mini-poster, .mini-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.card-mod-pill, .card-dur-pill {
+  position: absolute;
+  bottom: 8px;
+  padding: 0.14rem 0.48rem;
+  border-radius: 6px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  background: rgba(7, 13, 25, 0.82);
+  color: #e2e8f0;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+}
+.card-mod-pill { left: 8px; }
+.card-dur-pill { right: 8px; font-variant-numeric: tabular-nums; }
+.card-body {
+  padding: 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  flex: 1 1 auto;
+}
+.card-title {
+  margin: 0;
+  font-size: 1.02rem;
+  line-height: 1.28;
+}
+.card-title a { color: var(--fg); }
+.card-title a:hover { color: var(--accent); }
+.card-subtitle {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--fg-muted);
+}
+.card-disclosure {
+  margin: 0;
+  font-size: 0.74rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: 6px;
+  background: var(--synth-bg);
+  color: var(--synth-fg);
+  border: 1px solid var(--synth-bd);
+}
+.card-disclosure-holdout {
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  border-color: var(--warn-bd);
+}
+.ch-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.32rem;
+  margin-top: auto;
+}
+.ch-pill {
+  font-size: 0.72rem;
+  padding: 0.16rem 0.44rem;
+  border-radius: 6px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ch-pill:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  text-decoration: none;
+}
+.card-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.45rem;
+  padding-top: 0.25rem;
+}
+.card-actions .btn-primary, .card-actions .btn-secondary {
+  font-size: 0.78rem;
+  padding: 0.42rem 0.45rem;
+}
+
+/* Per-Module Dual-Mode Cinema Player */
+.player-body {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+}
+body.is-embed .hide-compact { display: none; }
+body.is-embed .player-topbar { min-height: 2.9rem; padding-top: 0.25rem; }
+
+.player-title-inline {
+  font-size: 0.92rem;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 24rem;
+}
+.mode-switcher {
+  display: inline-flex;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 3px;
+  gap: 3px;
+}
+.mode-tab {
+  min-height: 34px;
+  padding: 0.3rem 0.75rem;
+  border-radius: 7px;
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.mode-tab.is-active {
+  background: var(--accent);
+  color: #06101f;
+}
+
+.validation-banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  padding: 0.45rem calc(1rem + env(safe-area-inset-right, 0px)) 0.45rem calc(1rem + env(safe-area-inset-left, 0px));
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+  font-size: 0.8rem;
+  flex-shrink: 0;
+}
+.validation-banner.badge-synthetic, .validation-banner.badge-protocol {
+  background: var(--synth-bg);
+  border-bottom-color: var(--synth-bd);
+}
+.validation-banner.badge-holdout {
+  background: var(--warn-bg);
+  border-bottom-color: var(--warn-bd);
+}
+.validation-banner.badge-empirical {
+  background: var(--ok-bg);
+  border-bottom-color: var(--ok-bd);
+}
+.val-detail {
+  color: var(--fg);
+  font-size: 0.79rem;
+}
+
+.cinema-shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  max-width: 96rem;
+  width: 100%;
+  margin: 0 auto;
+  padding: 0.65rem calc(0.85rem + env(safe-area-inset-right, 0px)) calc(0.65rem + env(safe-area-inset-bottom, 0px)) calc(0.85rem + env(safe-area-inset-left, 0px));
+  gap: 0.6rem;
+}
+.player-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+.player-panel[hidden] { display: none; }
+
+.stage-wrap, .video-stage-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 240px;
+  background: var(--bg-stage);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.tour-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+}
+.tour-canvas.is-orbit-canvas {
+  touch-action: none;
+  cursor: grab;
+}
+.tour-canvas.is-orbit-canvas:active { cursor: grabbing; }
+.tour-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000000;
+}
+
+.stage-overlay-pill {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.24rem 0.6rem;
+  border-radius: 999px;
+  background: rgba(7, 13, 25, 0.78);
+  color: #cbd5e1;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  font-size: 0.74rem;
+  font-weight: 600;
+  pointer-events: none;
+}
+.hud-tooltip {
+  position: absolute;
+  z-index: 20;
+  pointer-events: none;
+  min-width: 165px;
+  max-width: 270px;
+  padding: 0.48rem 0.65rem;
+  border-radius: 8px;
+  background: rgba(9, 16, 30, 0.94);
+  color: #f1f5f9;
+  border: 1px solid #38bdf8;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  font-size: 0.76rem;
+  line-height: 1.38;
+}
+.hud-tooltip strong {
+  display: block;
+  color: #38bdf8;
+  margin-bottom: 0.15rem;
+}
+
+/* Interactive Control Strip */
+.control-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.5rem 0.8rem;
+  flex-shrink: 0;
+}
+.ctrl-primary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  flex: 1 1 280px;
+}
+.ctrl-label {
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+.ctrl-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex: 1 1 180px;
+}
+.ctrl-slider-row input[type="range"] {
+  flex: 1 1 auto;
+  min-width: 110px;
+  accent-color: var(--accent);
+}
+.step-btn {
+  min-width: 36px;
+  min-height: 36px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--fg);
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.ctrl-presets {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.preset-chip {
+  min-height: 32px;
+  padding: 0.22rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--fg);
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.preset-chip:hover { border-color: var(--accent); color: var(--accent); }
+.mcp-inspector-wrap { position: relative; }
+.mcp-packet-drawer {
+  margin: 0.45rem 0 0;
+  padding: 0.6rem;
+  max-height: 150px;
+  overflow: auto;
+  border-radius: 8px;
+  background: #070d19;
+  color: #7dd3fc;
+  border: 1px solid var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+}
+
+/* Transport Bar */
+.transport-bar, .video-controls-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.55rem 0.8rem;
+  flex-shrink: 0;
+}
+.transport-left, .transport-right, .video-jumps, .video-downloads {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+.play-btn {
+  min-height: 44px;
+  min-width: 90px;
+  padding: 0.4rem 0.9rem;
+  border-radius: 8px;
+  border: 0;
+  background: var(--accent);
+  color: #06101f;
+  font-weight: 800;
+  font-size: 0.86rem;
+  cursor: pointer;
+}
+.time-readout {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+.timeline-wrap {
+  flex: 1 1 260px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.timeline-range {
+  width: 100%;
+  accent-color: var(--accent);
+}
+.ch-markers {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.3rem;
+}
+.ch-marker, .vid-jump-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-height: 32px;
+  padding: 0.2rem 0.45rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--fg-muted);
+  font-size: 0.74rem;
+  font-weight: 600;
+  cursor: pointer;
+  overflow: hidden;
+}
+.ch-marker.is-active, .vid-jump-btn.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.ch-num {
+  font-weight: 800;
+  flex-shrink: 0;
+}
+.ch-lbl {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.speed-group {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.speed-btn {
+  min-height: 36px;
+  padding: 0.25rem 0.5rem;
+  border: 0;
+  border-right: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--fg);
+  font-size: 0.76rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.speed-btn:last-child { border-right: 0; }
+.export-status {
+  font-size: 0.75rem;
+  color: var(--accent);
+}
+
+/* Bottom Drawer */
+.bottom-drawer {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.65rem 0.85rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-shrink: 0;
+}
+.drawer-narrative { flex: 1 1 340px; min-width: 0; }
+.drawer-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  margin-bottom: 0.2rem;
+}
+.drawer-ch-badge {
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 0.12rem 0.48rem;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.drawer-ch-title {
+  margin: 0;
+  font-size: 0.98rem;
+}
+.drawer-metric {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.74rem;
+  padding: 0.12rem 0.48rem;
+  border-radius: 6px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+}
+.drawer-caption {
+  margin: 0;
+  font-size: 0.84rem;
+  color: var(--fg-muted);
+}
+.drawer-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.45rem;
+  flex: 0 1 auto;
+}
+.cli-box {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.22rem 0.35rem 0.22rem 0.6rem;
+  max-width: 100%;
+}
+.cli-box code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.76rem;
+  overflow-x: auto;
+  white-space: nowrap;
+  max-width: 28rem;
+}
+.drawer-links {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+.adj-wrap { display: inline-flex; gap: 0.3rem; }
+.nav-adj {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 0.25rem 0.58rem;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--fg);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+.nav-adj.disabled { opacity: 0.45; pointer-events: none; }
+
+@media (max-width: 1023px) {
+  .player-body { height: auto; min-height: 100vh; min-height: 100dvh; }
+  .stage-wrap, .video-stage-wrap { min-height: 300px; aspect-ratio: 16 / 9; }
+  .drawer-actions { align-items: stretch; width: 100%; }
+}
+
+@media (max-width: 679px) {
+  .player-title-inline { display: none; }
+  .mode-tab { font-size: 0.76rem; padding: 0.28rem 0.55rem; }
+  .ch-markers { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cli-box code { max-width: 12rem; }
+  .stage-wrap, .video-stage-wrap { min-height: 220px; }
+}
+"""
+
+
+TOURS_PLAYER_JS = r"""(function () {
+  "use strict";
+
+  var root = document.documentElement;
+  var savedTheme = null;
+  try { savedTheme = localStorage.getItem("nmr_manual_theme"); } catch (_) {}
+  if (savedTheme === "dark" || savedTheme === "light") {
+    root.setAttribute("data-theme", savedTheme);
+  } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
+    root.setAttribute("data-theme", "light");
+  } else {
+    root.setAttribute("data-theme", "dark");
+  }
+
+  function syncThemeBtn() {
+    var btn = document.getElementById("theme-toggle");
+    if (!btn) return;
+    var cur = root.getAttribute("data-theme") === "dark" ? "dark" : "light";
+    btn.textContent = cur === "dark" ? "Light" : "Dark";
+  }
+
+  function isDark() {
+    return root.getAttribute("data-theme") !== "light";
+  }
+
+  function palette() {
+    if (isDark()) {
+      return {
+        bg: "#070d19",
+        panel: "#0f172a",
+        grid: "rgba(148, 163, 184, 0.14)",
+        axis: "#64748b",
+        text: "#e2e8f0",
+        muted: "#94a3b8",
+        cyan: "#38bdf8",
+        teal: "#2dd4bf",
+        green: "#34d399",
+        amber: "#fbbf24",
+        coral: "#fb7185",
+        violet: "#a78bfa"
+      };
+    }
+    return {
+      bg: "#0b1324",
+      panel: "#131e33",
+      grid: "rgba(148, 163, 184, 0.16)",
+      axis: "#94a3b8",
+      text: "#f1f5f9",
+      muted: "#cbd5e1",
+      cyan: "#38bdf8",
+      teal: "#2dd4bf",
+      green: "#34d399",
+      amber: "#fbbf24",
+      coral: "#fb7185",
+      violet: "#c4b5fd"
+    };
+  }
+
+  function clamp(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  function formatTime(sec) {
+    var s = Math.max(0, sec);
+    var m = Math.floor(s / 60);
+    var rem = (s - m * 60).toFixed(1);
+    if (rem.length < 4) rem = "0" + rem;
+    return m + ":" + rem;
+  }
+
+  function activeChapterIndex(bundle, tSec) {
+    var chs = bundle.chapters || [];
+    for (var i = 0; i < chs.length; i++) {
+      if (tSec >= chs[i].start_sec && tSec < chs[i].end_sec) return i;
+    }
+    return Math.max(0, chs.length - 1);
+  }
+
+  function drawAxes(ctx, x0, y0, pw, ph, xLbl, yLbl, pal) {
+    ctx.save();
+    ctx.strokeStyle = pal.grid;
+    ctx.lineWidth = 1;
+    for (var gx = 1; gx < 5; gx++) {
+      var xx = x0 + (pw * gx) / 5;
+      ctx.beginPath();
+      ctx.moveTo(xx, y0);
+      ctx.lineTo(xx, y0 + ph);
+      ctx.stroke();
+    }
+    for (var gy = 1; gy < 4; gy++) {
+      var yy = y0 + (ph * gy) / 4;
+      ctx.beginPath();
+      ctx.moveTo(x0, yy);
+      ctx.lineTo(x0 + pw, yy);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = pal.axis;
+    ctx.lineWidth = 1.4;
+    ctx.strokeRect(x0, y0, pw, ph);
+    ctx.fillStyle = pal.muted;
+    ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+    if (xLbl) {
+      ctx.textAlign = "right";
+      ctx.fillText(xLbl, x0 + pw - 6, y0 + ph + 16);
+    }
+    if (yLbl) {
+      ctx.textAlign = "left";
+      ctx.fillText(yLbl, x0 + 6, y0 + 14);
+    }
+    ctx.restore();
+  }
+
+  function drawRoundRect(ctx, x, y, w, h, r) {
+    var rr = Math.min(r, w * 0.5, h * 0.5);
+    ctx.beginPath();
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
+    ctx.closePath();
+  }
+
+  function drawCardTitle(ctx, x, y, title, sub, pal) {
+    ctx.save();
+    ctx.fillStyle = pal.text;
+    ctx.font = "600 13px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText(title, x, y);
+    if (sub) {
+      ctx.fillStyle = pal.muted;
+      ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.fillText(sub, x, y + 16);
+    }
+    ctx.restore();
+  }
+
+  function renderModuleScene(ctx, w, h, modIdx, payload, tSec, ctrlVal, state, hotspots) {
+    var pal = palette();
+    ctx.fillStyle = pal.bg;
+    ctx.fillRect(0, 0, w, h);
+
+    var chIdx = Math.min(3, Math.max(0, Math.floor(tSec / 4.0)));
+    var localT = (tSec - chIdx * 4.0) / 4.0;
+    var padX = Math.max(24, w * 0.06);
+    var padY = Math.max(36, h * 0.13);
+    var pw = Math.max(120, w - padX * 2);
+    var ph = Math.max(100, h - padY - 34);
+
+    function addSpot(x, y, r, title, lines, val) {
+      if (hotspots) {
+        hotspots.push({ x: x, y: y, r: r, title: title, lines: lines, val: val });
+      }
+    }
+
+    if (modIdx === 1) {
+      // Module 01: FID / Pulprog / NUS / IST
+      if (chIdx === 0) {
+        drawCardTitle(ctx, padX, padY - 12, "Sandboxed Bruker Pulseprogram AST · Echo-Antiecho vs States-TPPI", "AQSEQ 321 · igrad EA · zero unsafe eval", pal);
+        var rows = [
+          ["1  d1 pl11:f1", "Recycle delay & power lock"],
+          ["2  p1 ph1", "90 deg 1H excitation pulse"],
+          ["3  igrad EA", "Rance-Kay Echo-Antiecho gradient pair"],
+          ["4  go=2 ph31", "Phase-cycled FID acquisition (AQSEQ 321)"]
+        ];
+        for (var i = 0; i < rows.length; i++) {
+          var ry = padY + 14 + i * (ph * 0.22);
+          var active = i === Math.floor(localT * 4) % 4;
+          ctx.fillStyle = active ? "rgba(56, 189, 248, 0.16)" : pal.panel;
+          ctx.strokeStyle = active ? pal.cyan : pal.grid;
+          ctx.lineWidth = active ? 1.8 : 1;
+          drawRoundRect(ctx, padX, ry, pw, ph * 0.18, 8);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = pal.cyan;
+          ctx.font = "600 12px ui-monospace, monospace";
+          ctx.fillText(rows[i][0], padX + 12, ry + ph * 0.11);
+          ctx.fillStyle = pal.muted;
+          ctx.font = "12px -apple-system, sans-serif";
+          ctx.fillText(rows[i][1], padX + Math.min(220, pw * 0.42), ry + ph * 0.11);
+          addSpot(padX + pw * 0.5, ry + ph * 0.09, 24, rows[i][0], [rows[i][1], "Sandboxed AST line #" + (i + 1)]);
+        }
+      } else if (chIdx === 1) {
+        drawCardTitle(ctx, padX, padY - 12, "1D/2D Raw FID Decay -> Sine-Bell Apodization -> Calibrated FFT", "Zero-fill 2x · Phase PH0/PH1", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Time / Chemical Shift (ppm)", "Signal", pal);
+        ctx.strokeStyle = pal.teal;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        var nPts = 90;
+        for (var i = 0; i < nPts; i++) {
+          var u = i / (nPts - 1);
+          var x = padX + u * pw;
+          var env = Math.exp(-3.2 * u) * Math.sin(Math.PI * u);
+          var sig = env * Math.cos(u * 42 + localT * 6.28);
+          var y = padY + ph * 0.34 - sig * ph * 0.22;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        // FFT spectrum bottom half
+        var specSrc = (payload && Array.isArray(payload.spectrum) && payload.spectrum.length > 4) ? payload.spectrum : null;
+        var peaks = specSrc || [
+          { ppm: 8.42, amp: 0.92 }, { ppm: 7.81, amp: 0.74 },
+          { ppm: 4.18, amp: 0.65 }, { ppm: 2.08, amp: 0.85 }, { ppm: 0.92, amp: 0.95 }
+        ];
+        ctx.strokeStyle = pal.cyan;
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        for (var i = 0; i <= 140; i++) {
+          var u = i / 140;
+          var ppm = 10.0 - u * 10.0;
+          var val = 0;
+          for (var p = 0; p < peaks.length; p++) {
+            var pk = peaks[p];
+            var pp = pk.ppm !== undefined ? pk.ppm : (9.0 - p * 1.8);
+            var aa = pk.amp !== undefined ? pk.amp : 0.7;
+            var d = (ppm - pp) / 0.14;
+            val += aa / (1 + d * d);
+          }
+          var sx = padX + u * pw;
+          var sy = padY + ph * 0.92 - val * ph * 0.32;
+          if (i === 0) ctx.moveTo(sx, sy);
+          else ctx.lineTo(sx, sy);
+        }
+        ctx.stroke();
+        for (var p = 0; p < peaks.length; p++) {
+          var pp = peaks[p].ppm !== undefined ? peaks[p].ppm : (9.0 - p * 1.8);
+          var aa = peaks[p].amp !== undefined ? peaks[p].amp : 0.7;
+          var px = padX + ((10.0 - pp) / 10.0) * pw;
+          var py = padY + ph * 0.92 - aa * ph * 0.32;
+          ctx.fillStyle = pal.amber;
+          ctx.beginPath();
+          ctx.arc(px, py, 4, 0, Math.PI * 2);
+          ctx.fill();
+          addSpot(px, py, 14, "FFT Peak " + pp.toFixed(2) + " ppm", ["Intensity: " + aa.toFixed(2), "Sine-bell apodized"]);
+        }
+      } else if (chIdx === 2) {
+        drawCardTitle(ctx, padX, padY - 12, "25% Poisson-Gap NUS Schedule & Zero-Fill PSF Artifacts", "64 / 256 increments acquired", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Indirect Increment t1", "Sampling Mask / PSF", pal);
+        var mask = (payload && Array.isArray(payload.nus_mask)) ? payload.nus_mask : null;
+        for (var i = 0; i < 64; i++) {
+          var acquired = mask ? Boolean(mask[i % mask.length]) : ((i * 17 + 3) % 4 === 0);
+          var bx = padX + (i / 64) * pw;
+          if (acquired) {
+            ctx.fillStyle = pal.cyan;
+            ctx.fillRect(bx, padY + 18, Math.max(2, pw / 80), ph * 0.28);
+            addSpot(bx + 2, padY + 18 + ph * 0.14, 10, "NUS Sample #" + i, ["Status: Acquired (25% Poisson-gap)"]);
+          } else {
+            ctx.fillStyle = "rgba(148,163,184,0.16)";
+            ctx.fillRect(bx, padY + 18, Math.max(2, pw / 80), ph * 0.1);
+          }
+        }
+        ctx.strokeStyle = pal.coral;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (var i = 0; i <= 120; i++) {
+          var u = i / 120;
+          var d = (u - 0.5) * 14;
+          var mainLobe = Math.exp(-d * d * 2.0);
+          var ridge = 0.24 * Math.abs(Math.sin(u * 48 + localT * 3)) * (1 - mainLobe);
+          var sy = padY + ph * 0.9 - (mainLobe * 0.42 + ridge) * ph;
+          var sx = padX + u * pw;
+          if (i === 0) ctx.moveTo(sx, sy);
+          else ctx.lineTo(sx, sy);
+        }
+        ctx.stroke();
+      } else {
+        var iter = Math.round(clamp(ctrlVal, 0, 20));
+        var ridgeFactor = Math.exp(-0.21 * iter);
+        drawCardTitle(ctx, padX, padY - 12, "Hypercomplex IST/FISTA Threshold Shrinkage (iter = " + iter + " / 20)", "Residual NUS ridge: " + (ridgeFactor * 100).toFixed(1) + "%", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "15N / 1H Frequency", "Reconstructed Amplitude", pal);
+        var peakPos = [0.22, 0.48, 0.74];
+        ctx.strokeStyle = pal.green;
+        ctx.lineWidth = 2.4;
+        ctx.beginPath();
+        for (var i = 0; i <= 160; i++) {
+          var u = i / 160;
+          var yVal = 0;
+          for (var p = 0; p < peakPos.length; p++) {
+            var d = (u - peakPos[p]) / 0.025;
+            yVal += (0.85 - p * 0.1) / (1 + d * d);
+          }
+          yVal += 0.22 * ridgeFactor * Math.sin(u * 65 + 1.1) * Math.cos(u * 23);
+          var sx = padX + u * pw;
+          var sy = padY + ph * 0.88 - Math.max(-0.15, yVal) * ph * 0.72;
+          if (i === 0) ctx.moveTo(sx, sy);
+          else ctx.lineTo(sx, sy);
+        }
+        ctx.stroke();
+        for (var p = 0; p < peakPos.length; p++) {
+          var px = padX + peakPos[p] * pw;
+          var py = padY + ph * 0.88 - (0.85 - p * 0.1) * ph * 0.72;
+          ctx.fillStyle = pal.amber;
+          ctx.beginPath();
+          ctx.arc(px, py, 5, 0, Math.PI * 2);
+          ctx.fill();
+          addSpot(px, py, 16, "IST Peak #" + (p + 1), ["IST Iteration: " + iter, "Ridge suppression: " + ((1 - ridgeFactor) * 100).toFixed(1) + "%"]);
+        }
+      }
+      return;
+    }
+
+    if (modIdx === 2) {
+      // Module 02: HSQC, 3D HNCACB strips, Cv(T), Confidence ribbon
+      var focusRes = Math.round(clamp(ctrlVal, 1, 10));
+      var stripNames = ["Met1", "Gln2", "Ile3", "Phe4", "Val5", "Lys6", "Thr7", "Leu8", "Thr9", "Gly10"];
+      if (chIdx === 0) {
+        drawCardTitle(ctx, padX, padY - 12, "2D 1H-15N HSQC Contours & Picked Backbone Roots", "Ubiquitin · 1H 6.5-10.0 ppm · 15N 106-130 ppm", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm)", "15N (ppm)", pal);
+        var pts = (payload && Array.isArray(payload.hsqc_peaks) && payload.hsqc_peaks.length) ? payload.hsqc_peaks : null;
+        for (var i = 0; i < 24; i++) {
+          var hPpm = pts && pts[i] ? (pts[i].h_ppm || pts[i].h || 8.0) : (6.9 + ((i * 37) % 28) * 0.1);
+          var nPpm = pts && pts[i] ? (pts[i].n_ppm || pts[i].n || 118.0) : (107 + ((i * 53) % 22));
+          var cx = padX + ((10.2 - hPpm) / 3.8) * pw;
+          var cy = padY + 12 + ((nPpm - 105) / 26) * (ph - 24);
+          var isSel = (i % 10) + 1 === focusRes;
+          ctx.strokeStyle = isSel ? pal.amber : pal.cyan;
+          ctx.lineWidth = isSel ? 2.2 : 1.3;
+          ctx.beginPath();
+          ctx.ellipse(cx, cy, 10, 6, 0, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.ellipse(cx, cy, 5, 3, 0, 0, Math.PI * 2);
+          ctx.stroke();
+          addSpot(cx, cy, 14, stripNames[i % 10] + " HSQC Root", ["1H: " + hPpm.toFixed(2) + " ppm", "15N: " + nPpm.toFixed(1) + " ppm"], (i % 10) + 1);
+        }
+      } else if (chIdx === 1) {
+        drawCardTitle(ctx, padX, padY - 12, "3D HNCACB Sequential Strip Walk (Phe4 -> Gly10)", "Thr7 CB>CA inversion · Gly10 CB null · Focus: " + stripNames[focusRes - 1], pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue Strip", "13C Shift (20 - 70 ppm)", pal);
+        var caVals = [55.2, 54.8, 60.4, 56.8, 61.9, 55.1, 61.2, 54.0, 60.8, 45.2];
+        var cbVals = [32.1, 29.0, 38.2, 39.6, 32.8, 33.1, 69.5, 42.1, 69.1, null];
+        var cols = 7;
+        for (var s = 0; s < cols; s++) {
+          var rIdx = s + 3; // Phe4..Gly10
+          var sx = padX + ((s + 0.5) / cols) * pw;
+          var isFoc = (rIdx + 1) === focusRes;
+          if (isFoc) {
+            ctx.fillStyle = "rgba(56, 189, 248, 0.14)";
+            ctx.fillRect(sx - pw / (cols * 2.3), padY + 10, pw / (cols * 1.15), ph - 16);
+          }
+          var caY = padY + 14 + ((75 - caVals[rIdx]) / 60) * (ph - 26);
+          ctx.fillStyle = pal.cyan;
+          ctx.beginPath();
+          ctx.arc(sx, caY, isFoc ? 7 : 5, 0, Math.PI * 2);
+          ctx.fill();
+          addSpot(sx, caY, 14, stripNames[rIdx] + " CA", ["13CA: " + caVals[rIdx].toFixed(1) + " ppm (positive)"], rIdx + 1);
+          if (cbVals[rIdx] !== null) {
+            var cbY = padY + 14 + ((75 - cbVals[rIdx]) / 60) * (ph - 26);
+            ctx.fillStyle = pal.coral;
+            ctx.beginPath();
+            ctx.arc(sx, cbY, isFoc ? 7 : 5, 0, Math.PI * 2);
+            ctx.fill();
+            addSpot(sx, cbY, 14, stripNames[rIdx] + " CB", ["13CB: " + cbVals[rIdx].toFixed(1) + " ppm (negative)"], rIdx + 1);
+          }
+          ctx.fillStyle = isFoc ? pal.amber : pal.muted;
+          ctx.font = "600 11px ui-monospace, monospace";
+          ctx.textAlign = "center";
+          ctx.fillText(stripNames[rIdx], sx, padY + ph + 14);
+        }
+      } else if (chIdx === 2) {
+        drawCardTitle(ctx, padX, padY - 12, "evo-graph vs standard SA vs bayes-sa Convergence", "Ubiquitin 98.4% · CISD3 64.38% (100% HC-prec) · Cold BMRB ~86-96%", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Annealing Progress (1/T)", "Assignment Accuracy / Cv(T)", pal);
+        var curves = [
+          { col: pal.green, lbl: "evo-graph", finalV: 0.96 },
+          { col: pal.cyan, lbl: "bayes-sa", finalV: 0.91 },
+          { col: pal.amber, lbl: "standard SA", finalV: 0.85 }
+        ];
+        for (var c = 0; c < curves.length; c++) {
+          ctx.strokeStyle = curves[c].col;
+          ctx.lineWidth = 2.4;
+          ctx.beginPath();
+          for (var i = 0; i <= 60; i++) {
+            var u = i / 60;
+            var acc = curves[c].finalV * (1 - Math.exp(-4.5 * u));
+            var sx = padX + u * pw;
+            var sy = padY + ph - 10 - acc * (ph - 28);
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+            if (i === 60) addSpot(sx - 6, sy, 16, curves[c].lbl, ["Final accuracy: " + (curves[c].finalV * 100).toFixed(1) + "%"]);
+          }
+          ctx.stroke();
+        }
+      } else {
+        drawCardTitle(ctx, padX, padY - 12, "76-Residue Ubiquitin Confidence Ribbon (>= 0.80 HC Tier)", "Focus residue #" + focusRes, pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue 1..76", "Posterior Confidence", pal);
+        var threshY = padY + 12 + (1 - 0.8) * (ph - 24);
+        ctx.strokeStyle = pal.amber;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(padX, threshY);
+        ctx.lineTo(padX + pw, threshY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        for (var r = 1; r <= 76; r++) {
+          var conf = (r === 24 || r === 53) ? 0.64 : (0.86 + 0.13 * Math.abs(Math.sin(r * 0.43)));
+          var bx = padX + ((r - 1) / 76) * pw;
+          var bw = Math.max(2, pw / 86);
+          var bh = conf * (ph - 24);
+          var by = padY + ph - 12 - bh;
+          ctx.fillStyle = (r === focusRes) ? pal.amber : (conf >= 0.8 ? pal.green : pal.coral);
+          ctx.fillRect(bx, by, bw, bh);
+          if (r % 5 === 0 || r === focusRes) {
+            addSpot(bx + bw / 2, by, 10, "Residue " + r, ["Confidence: " + (conf * 100).toFixed(1) + "%"], r <= 10 ? r : focusRes);
+          }
+        }
+      }
+      return;
+    }
+
+    if (modIdx === 3) {
+      // Module 03: 1UBQ 3D Backbone, NOEs, RDC, S^2 orbit
+      var orbitDeg = clamp(ctrlVal, 0, 360);
+      var yaw = (orbitDeg * Math.PI) / 180.0;
+      var pitch = (state && typeof state.pitchRad === "number") ? state.pitchRad : 0.35;
+      var nRes = 48;
+      var coords = [];
+      for (var i = 0; i < nRes; i++) {
+        var u = i / (nRes - 1);
+        var ang = u * Math.PI * 5.2;
+        var rad = 0.55 + 0.35 * Math.sin(u * Math.PI * 2);
+        var x = rad * Math.cos(ang);
+        var y = (u - 0.5) * 2.1;
+        var z = rad * Math.sin(ang);
+        coords.push({ x: x, y: y, z: z, ss: i < 16 ? "sheet" : (i < 32 ? "helix" : "coil"), s2: 0.86 - (i > 41 ? (i - 41) * 0.08 : 0) });
+      }
+      function proj(pt) {
+        var cx = Math.cos(yaw), sx = Math.sin(yaw);
+        var cp = Math.cos(pitch), sp = Math.sin(pitch);
+        var x1 = pt.x * cx - pt.z * sx;
+        var z1 = pt.x * sx + pt.z * cx;
+        var y2 = pt.y * cp - z1 * sp;
+        var z2 = pt.y * sp + z1 * cp;
+        var scale = Math.min(pw, ph) * 0.42 / (2.8 - z2 * 0.35);
+        return { x: w * 0.5 + x1 * scale, y: padY + ph * 0.48 + y2 * scale, z: z2 };
+      }
+
+      if (chIdx === 2) {
+        drawCardTitle(ctx, padX, padY - 12, "Saupe Alignment Tensor & N-H RDC D_obs vs D_calc", "F8 Disclosed: Unseen 1KHM->1ZZK 1.86-4.14 A (0/5 < 1.80 A)", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "D_calc (Hz)", "D_obs (Hz)", pal);
+        ctx.strokeStyle = pal.amber;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(padX + 12, padY + ph - 14);
+        ctx.lineTo(padX + pw - 12, padY + 18);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        for (var i = 0; i < 28; i++) {
+          var dc = -14 + i * 1.05;
+          var dobs = dc + Math.sin(i * 1.7) * 1.6;
+          var sx = padX + ((dc + 16) / 32) * pw;
+          var sy = padY + ph - 12 - ((dobs + 16) / 32) * (ph - 24);
+          ctx.fillStyle = (i % 5 === 0) ? pal.coral : pal.cyan;
+          ctx.beginPath();
+          ctx.arc(sx, sy, 4.5, 0, Math.PI * 2);
+          ctx.fill();
+          addSpot(sx, sy, 12, "RDC #" + (i + 1), ["D_calc: " + dc.toFixed(1) + " Hz", "D_obs: " + dobs.toFixed(1) + " Hz"]);
+        }
+      } else {
+        var titleStr = chIdx === 0
+          ? "1UBQ 3D Backbone CA Trace (Drag Canvas to Orbit · " + Math.round(orbitDeg) + " deg)"
+          : (chIdx === 1 ? "Long-Range 1H-1H NOE Cylinders + Homolog-Free Torsions (<=25%)" : "1UBQ S^2 Putty Projection · 360 deg Orbit (" + Math.round(orbitDeg) + " deg)");
+        drawCardTitle(ctx, padX, padY - 12, titleStr, "F8 Unseen 1KHM->1ZZK holdout disclosed (0/5 < 1.80 A)", pal);
+        var projected = coords.map(function (c, idx) {
+          var p = proj(c);
+          return { x: p.x, y: p.y, z: p.z, ss: c.ss, s2: c.s2, idx: idx + 1 };
+        });
+        if (chIdx === 1) {
+          ctx.strokeStyle = "rgba(251, 191, 36, 0.55)";
+          ctx.setLineDash([4, 3]);
+          ctx.lineWidth = 1.5;
+          for (var k = 0; k < 10; k++) {
+            var a = projected[(k * 3) % nRes];
+            var b = projected[(k * 3 + 19) % nRes];
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+            ctx.stroke();
+          }
+          ctx.setLineDash([]);
+        }
+        for (var i = 1; i < projected.length; i++) {
+          var p0 = projected[i - 1], p1 = projected[i];
+          ctx.strokeStyle = p1.ss === "helix" ? pal.coral : (p1.ss === "sheet" ? pal.cyan : pal.teal);
+          ctx.lineWidth = chIdx === 3 ? (2 + (1 - p1.s2) * 14) : 3.2;
+          ctx.beginPath();
+          ctx.moveTo(p0.x, p0.y);
+          ctx.lineTo(p1.x, p1.y);
+          ctx.stroke();
+        }
+        var sorted = projected.slice().sort(function (a, b) { return a.z - b.z; });
+        for (var i = 0; i < sorted.length; i++) {
+          var pt = sorted[i];
+          ctx.fillStyle = pt.ss === "helix" ? pal.coral : (pt.ss === "sheet" ? pal.cyan : pal.green);
+          ctx.beginPath();
+          ctx.arc(pt.x, pt.y, 4.2, 0, Math.PI * 2);
+          ctx.fill();
+          if (pt.idx % 3 === 1) {
+            addSpot(pt.x, pt.y, 12, "1UBQ CA #" + pt.idx, ["Secondary: " + pt.ss, "S^2: " + pt.s2.toFixed(2)]);
+          }
+        }
+      }
+      return;
+    }
+
+    if (modIdx === 4) {
+      // Module 04: Pseudo-3D, Dual-field R1/R2, R2/R1 tau_m, Lipari-Szabo S^2
+      var resSeq = Math.round(clamp(ctrlVal, 1, 76));
+      if (chIdx === 0) {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Pseudo-3D Locked-Footprint Integration (SNR 80 -> 4)", "Unbiased Linear LS vs Naive Local-Max Bias", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "SNR (80 -> 4)", "Relative Bias (%)", pal);
+        for (var i = 0; i < 6; i++) {
+          var bx = padX + (i + 0.5) * (pw / 6);
+          var biasMax = 2.0 + i * 4.8;
+          var biasLs = 0.4 + i * 0.35;
+          ctx.fillStyle = pal.coral;
+          ctx.fillRect(bx - 14, padY + ph - 12 - (biasMax / 32) * (ph - 24), 12, (biasMax / 32) * (ph - 24));
+          ctx.fillStyle = pal.green;
+          ctx.fillRect(bx + 2, padY + ph - 12 - (biasLs / 32) * (ph - 24), 12, (biasLs / 32) * (ph - 24));
+          addSpot(bx, padY + ph * 0.5, 20, "SNR Tier #" + (i + 1), ["Local-Max bias: +" + biasMax.toFixed(1) + "%", "Locked-Footprint LS: +" + biasLs.toFixed(1) + "%"]);
+        }
+      } else if (chIdx === 1) {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Dual-Field 600 & 800 MHz R1/R2 Decay (Res #" + resSeq + ")", "MC bootstrap 1000x error bars", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Relaxation Delay (ms)", "I(t) / I(0)", pal);
+        var r2 = resSeq === 23 ? 16.5 : (resSeq > 70 ? 4.2 : 9.8);
+        var fields = [{ col: pal.cyan, f: 1.0, lbl: "600 MHz" }, { col: pal.amber, f: 1.18, lbl: "800 MHz" }];
+        for (var fi = 0; fi < fields.length; fi++) {
+          ctx.strokeStyle = fields[fi].col;
+          ctx.lineWidth = 2.2;
+          ctx.beginPath();
+          for (var j = 0; j <= 40; j++) {
+            var tMs = j * 4;
+            var val = Math.exp(-r2 * fields[fi].f * tMs * 0.001);
+            var sx = padX + (j / 40) * pw;
+            var sy = padY + 14 + (1 - val) * (ph - 28);
+            if (j === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+            if (j % 8 === 0) {
+              ctx.fillStyle = fields[fi].col;
+              ctx.fillRect(sx - 3, sy - 3, 6, 6);
+              addSpot(sx, sy, 12, fields[fi].lbl + " @ " + tMs + " ms", ["I/I0: " + val.toFixed(3), "Res #" + resSeq]);
+            }
+          }
+          ctx.stroke();
+        }
+      } else {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Lipari-Szabo M1-M5 S^2 Profile (Res #" + resSeq + ")", "Ile23 Rex exchange · C-term 72-76 flexible tail", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue 1..76", "Order Parameter S^2", pal);
+        for (var r = 1; r <= 76; r++) {
+          var s2 = r >= 72 ? Math.max(0.22, 0.85 - (r - 71) * 0.14) : (0.83 + 0.09 * Math.sin(r * 0.31));
+          var sx = padX + ((r - 0.5) / 76) * pw;
+          var sy = padY + 14 + (1 - s2) * (ph - 28);
+          var isSel = r === resSeq;
+          ctx.fillStyle = isSel ? pal.amber : (r === 23 ? pal.coral : pal.cyan);
+          ctx.beginPath();
+          ctx.arc(sx, sy, isSel ? 6 : 3.2, 0, Math.PI * 2);
+          ctx.fill();
+          if (r % 4 === 0 || isSel || r === 23) {
+            addSpot(sx, sy, 10, "Res #" + r, ["S^2: " + s2.toFixed(3), r === 23 ? "Model M3 (Rex)" : "Model M1/M2"], r);
+          }
+        }
+      }
+      return;
+    }
+
+    if (modIdx === 5) {
+      // Module 05: CEST, CPMG, HSQC titration, Morrison vs MM isotherm
+      var ligUm = clamp(ctrlVal, 0, 300);
+      if (chIdx === 0) {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Higham [6/6] Pade CEST Saturation Sweep (B1 = 15 & 30 Hz)", "pB = 1.5%, k_ex = 150 s^-1", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Offset (ppm)", "I / I0", pal);
+        var b1s = [{ col: pal.cyan, w: 0.55 }, { col: pal.amber, w: 0.95 }];
+        for (var b = 0; b < b1s.length; b++) {
+          ctx.strokeStyle = b1s[b].col;
+          ctx.lineWidth = 2.2;
+          ctx.beginPath();
+          for (var i = 0; i <= 100; i++) {
+            var u = i / 100;
+            var ppm = -12 + u * 24;
+            var dipMain = 0.88 / (1 + Math.pow((ppm - 0.0) / b1s[b].w, 2));
+            var dipMin = 0.42 / (1 + Math.pow((ppm + 4.5) / (b1s[b].w * 0.7), 2));
+            var val = 1.0 - Math.min(0.95, dipMain + dipMin);
+            var sx = padX + u * pw;
+            var sy = padY + 14 + (1 - val) * (ph - 28);
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+            if (i === 31) addSpot(sx, sy, 16, "Minor State Dip (-4.5 ppm)", ["I/I0: " + val.toFixed(2), "pB = 1.5%"]);
+          }
+          ctx.stroke();
+        }
+      } else if (chIdx === 1) {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Dual-Field Baldwin Exact CPMG Dispersion & AICc Gate", "600 vs 800 MHz R2,eff(nu_CPMG)", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "nu_CPMG (Hz)", "R2,eff (s^-1)", pal);
+        var fields = [{ col: pal.cyan, amp: 14 }, { col: pal.coral, amp: 22 }];
+        for (var f = 0; f < fields.length; f++) {
+          ctx.strokeStyle = fields[f].col;
+          ctx.lineWidth = 2.4;
+          ctx.beginPath();
+          for (var i = 0; i <= 40; i++) {
+            var nu = 25 + i * 25;
+            var r2e = 10.5 + fields[f].amp / (1 + Math.pow(nu / 220, 2));
+            var sx = padX + (i / 40) * pw;
+            var sy = padY + ph - 12 - ((r2e - 8) / 28) * (ph - 24);
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+            if (i % 8 === 0) addSpot(sx, sy, 12, (f === 0 ? "600" : "800") + " MHz @ " + nu + " Hz", ["R2,eff: " + r2e.toFixed(1) + " s^-1"]);
+          }
+          ctx.stroke();
+        }
+      } else {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Morrison Quadratic (Kd=5 uM, [P]0=100 uM) vs Naive MM", "Cursor [L] = " + ligUm.toFixed(0) + " uM", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "[L] total (uM)", "Fraction Bound", pal);
+        var P0 = 100.0, Kd = 5.0;
+        function quadFrac(L) {
+          var b = P0 + L + Kd;
+          return (b - Math.sqrt(Math.max(0, b * b - 4 * P0 * L))) / (2 * P0);
+        }
+        function mmFrac(L) {
+          return L / (Kd + L);
+        }
+        ctx.strokeStyle = pal.green;
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        for (var i = 0; i <= 60; i++) {
+          var L = i * 5;
+          var sx = padX + (L / 300) * pw;
+          var sy = padY + ph - 12 - quadFrac(L) * (ph - 24);
+          if (i === 0) ctx.moveTo(sx, sy);
+          else ctx.lineTo(sx, sy);
+        }
+        ctx.stroke();
+        ctx.strokeStyle = pal.coral;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        for (var i = 0; i <= 60; i++) {
+          var L = i * 5;
+          var sx = padX + (L / 300) * pw;
+          var sy = padY + ph - 12 - mmFrac(L) * (ph - 24);
+          if (i === 0) ctx.moveTo(sx, sy);
+          else ctx.lineTo(sx, sy);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+        var cx = padX + (ligUm / 300) * pw;
+        var cyQ = padY + ph - 12 - quadFrac(ligUm) * (ph - 24);
+        ctx.strokeStyle = pal.amber;
+        ctx.beginPath();
+        ctx.moveTo(cx, padY + 8);
+        ctx.lineTo(cx, padY + ph - 4);
+        ctx.stroke();
+        ctx.fillStyle = pal.amber;
+        ctx.beginPath();
+        ctx.arc(cx, cyQ, 6, 0, Math.PI * 2);
+        ctx.fill();
+        addSpot(cx, cyQ, 18, "Morrison Fit @ " + ligUm.toFixed(0) + " uM", ["Bound: " + (quadFrac(ligUm) * 100).toFixed(1) + "%", "Naive MM: " + (mmFrac(ligUm) * 100).toFixed(1) + "%"]);
+      }
+      return;
+    }
+
+    if (modIdx === 6) {
+      // Module 06: 1D HSVD/Whittaker, Hoye ddd, GUM qNMR, Octet (S)-Ibuprofen <-> peak
+      var atomIdx = Math.round(clamp(ctrlVal, 0, 14));
+      if (chIdx === 0 || chIdx === 1) {
+        drawCardTitle(ctx, padX, padY - 12, chIdx === 0 ? "SYNTHETIC: 1D HSVD Water Suppression + Whittaker Baseline" : "SYNTHETIC: Hoye ddd Multiplet Tree (J = 14.2, 7.1, 2.4 Hz)", "Voigt deconvolution · ACS report", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H Chemical Shift (ppm)", "Intensity", pal);
+        ctx.strokeStyle = pal.cyan;
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        var subPeaks = [0.28, 0.34, 0.41, 0.47, 0.53, 0.59, 0.66, 0.72];
+        for (var i = 0; i <= 160; i++) {
+          var u = i / 160;
+          var val = 0;
+          for (var s = 0; s < subPeaks.length; s++) {
+            var d = (u - subPeaks[s]) / 0.015;
+            val += 0.7 / (1 + d * d);
+          }
+          var sx = padX + u * pw;
+          var sy = padY + ph - 14 - val * (ph * 0.62);
+          if (i === 0) ctx.moveTo(sx, sy);
+          else ctx.lineTo(sx, sy);
+        }
+        ctx.stroke();
+        for (var s = 0; s < subPeaks.length; s++) {
+          var px = padX + subPeaks[s] * pw;
+          var py = padY + ph - 14 - 0.7 * (ph * 0.62);
+          addSpot(px, py, 14, "ddd Subpeak #" + (s + 1), ["J1=14.2 Hz, J2=7.1 Hz, J3=2.4 Hz"]);
+        }
+      } else if (chIdx === 2) {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: GUM Internal-Standard qNMR Purity (98.40% +- 0.14%, k=2)", "5*T1 relaxation guard verified", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Uncertainty Budget", "Purity (%)", pal);
+        var bars = [["Purity", 98.4, pal.green], ["IS Mass", 99.1, pal.cyan], ["5*T1 Guard", 99.8, pal.teal]];
+        for (var b = 0; b < bars.length; b++) {
+          var bx = padX + (b + 0.5) * (pw / 3) - 24;
+          var bh = ((bars[b][1] - 90) / 10) * (ph - 30);
+          ctx.fillStyle = bars[b][2];
+          ctx.fillRect(bx, padY + ph - 12 - bh, 48, bh);
+          ctx.fillStyle = pal.text;
+          ctx.font = "600 12px ui-monospace, monospace";
+          ctx.fillText(bars[b][1].toFixed(2) + "%", bx, padY + ph - 18 - bh);
+          addSpot(bx + 24, padY + ph - 12 - bh / 2, 24, bars[b][0], ["Value: " + bars[b][1].toFixed(2) + "%", "GUM k=2"]);
+        }
+      } else {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Octet (S)-Ibuprofen 2D Structure <-> 1H/13C Peak (Atom #" + atomIdx + ")", "CIP (S) stereocenter · Click atom or peak", pal);
+        var halfW = pw * 0.46;
+        // Left: 2D (S)-Ibuprofen skeleton
+        var atoms = [
+          [0.18, 0.25, "O"], [0.26, 0.36, "C"], [0.18, 0.49, "OH"], [0.35, 0.42, "C*"],
+          [0.37, 0.24, "CH3"], [0.46, 0.48, "C"], [0.56, 0.38, "CH"], [0.68, 0.44, "CH"],
+          [0.70, 0.60, "C"], [0.60, 0.70, "CH"], [0.48, 0.64, "CH"], [0.82, 0.66, "CH2"],
+          [0.91, 0.54, "CH"], [0.97, 0.40, "CH3"], [0.95, 0.70, "CH3"]
+        ];
+        var bonds = [[0,1],[1,2],[1,3],[3,4],[3,5],[5,6],[6,7],[7,8],[8,9],[9,10],[10,5],[8,11],[11,12],[12,13],[12,14]];
+        ctx.strokeStyle = pal.muted;
+        ctx.lineWidth = 2;
+        for (var b = 0; b < bonds.length; b++) {
+          var a0 = atoms[bonds[b][0]], a1 = atoms[bonds[b][1]];
+          ctx.beginPath();
+          ctx.moveTo(padX + a0[0] * halfW, padY + a0[1] * ph);
+          ctx.lineTo(padX + a1[0] * halfW, padY + a1[1] * ph);
+          ctx.stroke();
+        }
+        for (var a = 0; a < atoms.length; a++) {
+          var ax = padX + atoms[a][0] * halfW;
+          var ay = padY + atoms[a][1] * ph;
+          var isSel = a === atomIdx;
+          ctx.fillStyle = isSel ? pal.amber : pal.cyan;
+          ctx.beginPath();
+          ctx.arc(ax, ay, isSel ? 9 : 5, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = pal.text;
+          ctx.font = "600 10px ui-monospace, monospace";
+          ctx.fillText(atoms[a][2], ax + 7, ay - 5);
+          addSpot(ax, ay, 14, "(S)-Ibuprofen Atom #" + a + " (" + atoms[a][2] + ")", ["1H shift: " + (11.5 - a * 0.7).toFixed(2) + " ppm"], a);
+        }
+        // Right: Correlated 1H spectrum
+        var rx0 = padX + pw * 0.52;
+        var rw = pw * 0.48;
+        drawAxes(ctx, rx0, padY + 8, rw, ph - 12, "1H (ppm)", "Linked Peak", pal);
+        for (var a = 0; a < atoms.length; a++) {
+          var px = rx0 + (a / 15) * (rw - 20) + 10;
+          var hgt = (a === atomIdx ? 0.85 : 0.42) * (ph - 36);
+          var py = padY + ph - 14 - hgt;
+          ctx.strokeStyle = a === atomIdx ? pal.amber : pal.teal;
+          ctx.lineWidth = a === atomIdx ? 3.2 : 1.6;
+          ctx.beginPath();
+          ctx.moveTo(px, padY + ph - 14);
+          ctx.lineTo(px, py);
+          ctx.stroke();
+          addSpot(px, py, 12, "1H Peak <-> Atom #" + a, ["Group: " + atoms[a][2], "Shift: " + (11.5 - a * 0.7).toFixed(2) + " ppm"], a);
+        }
+      }
+      return;
+    }
+
+    if (modIdx === 7) {
+      // Module 07: BPP-LED stack, Stejskal-Tanner, 2D DOSY, Stokes-Einstein Rh
+      var gradStep = Math.round(clamp(ctrlVal, 0, 15));
+      if (chIdx === 0) {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: BPP-LED Gradient Stack (Step g" + (gradStep + 1) + " / g16)", "SINE.100 2/pi shape factor", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm)", "Gradient Plane g1..g16", pal);
+        for (var g = 0; g < 16; g += 2) {
+          var baseLine = padY + ph - 18 - (g / 16) * (ph * 0.72);
+          var att = Math.exp(-0.14 * g);
+          ctx.strokeStyle = (g === gradStep || g + 1 === gradStep) ? pal.amber : pal.cyan;
+          ctx.lineWidth = (g === gradStep || g + 1 === gradStep) ? 2.4 : 1.2;
+          ctx.beginPath();
+          for (var i = 0; i <= 80; i++) {
+            var u = i / 80;
+            var pk = att * (Math.exp(-Math.pow((u - 0.3) * 18, 2)) + 0.7 * Math.exp(-Math.pow((u - 0.68) * 14, 2)));
+            var sx = padX + u * pw;
+            var sy = baseLine - pk * 36;
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+          }
+          ctx.stroke();
+          addSpot(padX + pw * 0.3, baseLine - att * 25, 14, "Gradient Step g" + (g + 1), ["Attenuation: " + (att * 100).toFixed(1) + "%"], g);
+        }
+      } else if (chIdx === 1) {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Stejskal-Tanner Decay & BIC K=1 vs K=2 (g" + (gradStep + 1) + ")", "Overlapped mixture resolved", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "b-value (10^9 s/m^2)", "ln(I / I0)", pal);
+        for (var g = 0; g < 16; g++) {
+          var b = g * 0.25;
+          var yVal = Math.exp(-0.42 * b);
+          var sx = padX + (g / 15) * pw;
+          var sy = padY + 14 + (1 - yVal) * (ph - 28);
+          ctx.fillStyle = g === gradStep ? pal.amber : pal.cyan;
+          ctx.beginPath();
+          ctx.arc(sx, sy, g === gradStep ? 6.5 : 4, 0, Math.PI * 2);
+          ctx.fill();
+          addSpot(sx, sy, 12, "b-point g" + (g + 1), ["b = " + b.toFixed(2) + "e9 s/m^2", "I/I0 = " + yVal.toFixed(3)], g);
+        }
+      } else {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: 2D DOSY (ppm x log10 D) & Evans Stokes-Einstein Rh", "Maleate (0.28 nm) · Raffinose (0.58 nm) · Lysozyme (1.92 nm)", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm)", "log10 D (m^2/s)", pal);
+        var species = [
+          { name: "Maleate", x: 0.24, y: 0.22, rh: "0.28 nm", mw: "116 Da", col: pal.cyan },
+          { name: "Raffinose", x: 0.52, y: 0.48, rh: "0.58 nm", mw: "504 Da", col: pal.green },
+          { name: "Lysozyme", x: 0.78, y: 0.80, rh: "1.92 nm", mw: "14.3 kDa", col: pal.amber }
+        ];
+        for (var s = 0; s < species.length; s++) {
+          var sp = species[s];
+          var sx = padX + sp.x * pw;
+          var sy = padY + 14 + sp.y * (ph - 28);
+          ctx.strokeStyle = sp.col;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.ellipse(sx, sy, 22, 12, 0, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.fillStyle = sp.col;
+          ctx.font = "600 12px -apple-system, sans-serif";
+          ctx.fillText(sp.name + " (" + sp.rh + ")", sx + 26, sy + 4);
+          addSpot(sx, sy, 22, sp.name, ["Rh: " + sp.rh, "MW: " + sp.mw]);
+        }
+      }
+      return;
+    }
+
+    // Module 08: Metabolomics (AI-Binning/PQN, PCA/OPLS-DA, STOCSY, MCP)
+    var driverIdx = Math.round(clamp(ctrlVal, 0, 20));
+    if (chIdx === 0) {
+      drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: 24-Sample Control vs Case Cohort (AI-Binning + PQN)", "De Meyer valley-seeking bins · PQN vs TSA", pal);
+      drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Bucket ppm", "PQN Normalized Intensity", pal);
+      for (var c = 0; c < 2; c++) {
+        ctx.strokeStyle = c === 0 ? pal.cyan : pal.coral;
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        for (var i = 0; i <= 20; i++) {
+          var v = 0.25 + 0.55 * Math.abs(Math.sin(i * 0.7 + c * 0.9));
+          var sx = padX + (i / 20) * pw;
+          var sy = padY + ph - 12 - v * (ph - 24);
+          if (i === 0) ctx.moveTo(sx, sy);
+          else ctx.lineTo(sx, sy);
+          if (c === 1 && i % 4 === 0) addSpot(sx, sy, 14, "Bucket #" + i, ["Case/Ctrl fold: " + (1.2 + (i % 3) * 0.4).toFixed(2) + "x"], i);
+        }
+        ctx.stroke();
+      }
+    } else if (chIdx === 1) {
+      drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: PCA 95% Hotelling T^2 & OPLS-DA Q^2=0.969 (100-Perm)", "Leak-free stratified k-fold CV", pal);
+      drawAxes(ctx, padX, padY + 8, pw, ph - 12, "t[1] Predictive Score", "to[1] Orthogonal Score", pal);
+      ctx.strokeStyle = pal.amber;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.ellipse(padX + pw * 0.5, padY + ph * 0.5, pw * 0.4, ph * 0.36, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      for (var i = 0; i < 24; i++) {
+        var isCase = i >= 12;
+        var sx = padX + pw * (isCase ? 0.68 : 0.32) + Math.sin(i * 2.3) * pw * 0.11;
+        var sy = padY + ph * 0.5 + Math.cos(i * 1.9) * ph * 0.22;
+        ctx.fillStyle = isCase ? pal.coral : pal.cyan;
+        ctx.beginPath();
+        ctx.arc(sx, sy, 5, 0, Math.PI * 2);
+        ctx.fill();
+        addSpot(sx, sy, 12, (isCase ? "Case" : "Control") + " Sample #" + ((i % 12) + 1), ["OPLS-DA Q^2 = 0.969", "Hotelling T^2 95% inside"]);
+      }
+    } else if (chIdx === 2) {
+      drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: STOCSY Correlation (Driver Bucket #" + driverIdx + " -> L-Lactate)", "r^2 = 1.00 · 3:1 stoichiometry", pal);
+      drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Metabolite Bucket (0..20)", "Intensity (colored by |r|)", pal);
+      for (var b = 0; b <= 20; b++) {
+        var isLactate = b === 4 || b === 15;
+        var corr = (b === driverIdx) ? 1.0 : (isLactate && (driverIdx === 4 || driverIdx === 15) ? 0.99 : Math.max(0.1, 0.6 - Math.abs(b - driverIdx) * 0.08));
+        var bx = padX + (b / 20) * (pw - 20) + 10;
+        var bh = (0.25 + 0.65 * corr) * (ph - 30);
+        ctx.fillStyle = corr > 0.9 ? pal.coral : (corr > 0.5 ? pal.amber : pal.cyan);
+        ctx.fillRect(bx - 5, padY + ph - 12 - bh, 10, bh);
+        addSpot(bx, padY + ph - 12 - bh, 12, "STOCSY Bucket #" + b, ["|r| = " + corr.toFixed(2), isLactate ? "L-Lactate multiplet" : "Background metabolite"], b);
+      }
+    } else {
+      drawCardTitle(ctx, padX, padY - 12, "PROTOCOL SHOWCASE (F18 OPEN): MCP JSON-RPC 2.0 ReadOnly + Undo(256)", "Open MCP Packet button below for live JSON", pal);
+      var steps = ["Client -> MCP: tools/call", "Sandbox: ReadOnly Guard", "nmr-core: Execute Tool", "Workbench: 256-Step Undo Stack"];
+      for (var s = 0; s < steps.length; s++) {
+        var bx = padX + (s / 4) * pw + 6;
+        var bw = pw / 4 - 14;
+        var active = s === Math.floor(localT * 4) % 4;
+        ctx.fillStyle = active ? "rgba(167, 139, 250, 0.22)" : pal.panel;
+        ctx.strokeStyle = active ? pal.violet : pal.border;
+        ctx.lineWidth = active ? 2 : 1.2;
+        drawRoundRect(ctx, bx, padY + ph * 0.28, bw, ph * 0.38, 8);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = pal.text;
+        ctx.font = "600 11px -apple-system, sans-serif";
+        ctx.fillText(steps[s], bx + 8, padY + ph * 0.48, bw - 16);
+        addSpot(bx + bw / 2, padY + ph * 0.47, 24, steps[s], ["MCP JSON-RPC 2.0", "256-step reversible Undo"]);
+      }
+    }
+  }
+
+  function initGallery() {
+    var dataEl = document.getElementById("tour-gallery-data");
+    if (!dataEl) return;
+    var items = [];
+    try { items = JSON.parse(dataEl.textContent || "[]"); } catch (_) {}
+    var canvases = document.querySelectorAll("canvas.mini-canvas");
+    if (!canvases.length) return;
+
+    var startTs = performance.now();
+    function tick(now) {
+      var elapsed = ((now - startTs) * 0.001) % 16.0;
+      for (var i = 0; i < canvases.length; i++) {
+        var cvs = canvases[i];
+        var modIdx = parseInt(cvs.getAttribute("data-module-index") || "1", 10);
+        var item = items.find(function (x) { return x.module_index === modIdx; }) || {};
+        var defVal = item.interactive_control ? item.interactive_control.default_val : 0;
+        var ctx = cvs.getContext("2d");
+        if (ctx) {
+          renderModuleScene(ctx, cvs.width, cvs.height, modIdx, item.payload || {}, (elapsed + modIdx * 2.0) % 16.0, defVal, {}, null);
+        }
+      }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  }
+
+  function initPlayer() {
+    var bundleEl = document.getElementById("tour-bundle-data");
+    if (!bundleEl) return;
+    var bundle = JSON.parse(bundleEl.textContent || "{}");
+    var params = new URLSearchParams(window.location.search);
+
+    if (params.get("embed") === "1") {
+      document.body.classList.add("is-embed");
+    }
+
+    var modeIntBtn = document.getElementById("mode-interactive");
+    var modeVidBtn = document.getElementById("mode-video");
+    var panelInt = document.getElementById("panel-interactive");
+    var panelVid = document.getElementById("panel-video");
+    var canvas = document.getElementById("tour-canvas");
+    var tooltip = document.getElementById("hud-tooltip");
+    var btnPlay = document.getElementById("btn-play");
+    var timeReadout = document.getElementById("time-readout");
+    var timeline = document.getElementById("timeline-range");
+    var chMarkers = document.querySelectorAll(".ch-marker");
+    var speedBtns = document.querySelectorAll(".speed-btn");
+    var btnLoop = document.getElementById("btn-loop");
+    var btnExport = document.getElementById("btn-export-webm");
+    var exportStatus = document.getElementById("export-status");
+    var ctrlSlider = document.getElementById("ctrl-slider");
+    var ctrlReadout = document.getElementById("ctrl-readout");
+    var ctrlDec = document.getElementById("ctrl-dec");
+    var ctrlInc = document.getElementById("ctrl-inc");
+    var ctrlResume = document.getElementById("ctrl-resume");
+    var presetChips = document.querySelectorAll(".preset-chip");
+    var drawerChBadge = document.getElementById("drawer-ch-badge");
+    var drawerChTitle = document.getElementById("drawer-ch-title");
+    var drawerMetric = document.getElementById("drawer-metric");
+    var drawerCaption = document.getElementById("drawer-caption");
+    var overlayChLabel = document.getElementById("overlay-ch-label");
+    var tourVideo = document.getElementById("tour-video");
+    var vidJumpBtns = document.querySelectorAll(".vid-jump-btn");
+    var btnCopyCli = document.getElementById("btn-copy-cli");
+    var cliCmd = document.getElementById("cli-cmd");
+
+    var duration = bundle.duration_sec || 16.0;
+    var state = {
+      tSec: 0,
+      playing: params.get("autoplay") === "1",
+      speed: 1.0,
+      loop: true,
+      ctrlVal: bundle.interactive_control ? bundle.interactive_control.default_val : 0,
+      manualOverride: false,
+      pitchRad: 0.35,
+      hotspots: [],
+      dragging: false,
+      lastX: 0,
+      lastY: 0,
+      lastFrameTs: performance.now()
+    };
+
+    var initCh = parseInt(params.get("ch") || "0", 10);
+    if (initCh >= 1 && initCh <= (bundle.chapters || []).length) {
+      state.tSec = bundle.chapters[initCh - 1].start_sec;
+    } else if (params.has("t")) {
+      state.tSec = clamp(parseFloat(params.get("t") || "0") || 0, 0, duration);
+    }
+
+    function setMode(mode) {
+      var isVid = mode === "video";
+      panelInt.hidden = isVid;
+      panelVid.hidden = !isVid;
+      modeIntBtn.classList.toggle("is-active", !isVid);
+      modeVidBtn.classList.toggle("is-active", isVid);
+      modeIntBtn.setAttribute("aria-selected", String(!isVid));
+      modeVidBtn.setAttribute("aria-selected", String(isVid));
+      if (isVid) {
+        state.playing = false;
+        syncTransportUI();
+      } else if (tourVideo && !tourVideo.paused) {
+        tourVideo.pause();
+      }
+      resizeCanvas();
+    }
+
+    if (params.get("mode") === "video") {
+      setMode("video");
+    }
+    modeIntBtn.addEventListener("click", function () { setMode("interactive"); });
+    modeVidBtn.addEventListener("click", function () { setMode("video"); });
+
+    function syncDrawerForTime(t) {
+      var idx = activeChapterIndex(bundle, t);
+      var ch = (bundle.chapters || [])[idx];
+      if (!ch) return;
+      drawerChBadge.textContent = "Chapter " + (idx + 1) + " / " + bundle.chapters.length;
+      drawerChTitle.textContent = ch.title;
+      drawerMetric.textContent = ch.metric || "";
+      drawerMetric.hidden = !ch.metric;
+      drawerCaption.textContent = ch.caption;
+      if (overlayChLabel) overlayChLabel.textContent = "Ch " + (idx + 1) + "/" + bundle.chapters.length;
+      for (var i = 0; i < chMarkers.length; i++) {
+        chMarkers[i].classList.toggle("is-active", i === idx);
+      }
+    }
+
+    function syncTransportUI() {
+      btnPlay.innerHTML = state.playing ? "&#10074;&#10074; Pause" : "&#9654; Play";
+      timeReadout.textContent = formatTime(state.tSec) + " / " + formatTime(duration);
+      timeline.value = String(state.tSec);
+      syncDrawerForTime(state.tSec);
+    }
+
+    function applyControl(val, pausePlayback) {
+      var min = parseFloat(ctrlSlider.min);
+      var max = parseFloat(ctrlSlider.max);
+      var clamped = clamp(val, min, max);
+      state.ctrlVal = clamped;
+      ctrlSlider.value = String(clamped);
+      ctrlReadout.textContent = Number.isInteger(clamped) ? String(clamped) : clamped.toFixed(1);
+      if (pausePlayback) {
+        state.manualOverride = true;
+        state.playing = false;
+        if (ctrlResume) ctrlResume.hidden = false;
+        syncTransportUI();
+      }
+    }
+
+    ctrlSlider.addEventListener("input", function () {
+      applyControl(parseFloat(ctrlSlider.value), true);
+    });
+    if (ctrlDec) {
+      ctrlDec.addEventListener("click", function () {
+        applyControl(state.ctrlVal - parseFloat(ctrlSlider.step || "1"), true);
+      });
+    }
+    if (ctrlInc) {
+      ctrlInc.addEventListener("click", function () {
+        applyControl(state.ctrlVal + parseFloat(ctrlSlider.step || "1"), true);
+      });
+    }
+    if (ctrlResume) {
+      ctrlResume.addEventListener("click", function () {
+        state.manualOverride = false;
+        state.playing = true;
+        ctrlResume.hidden = true;
+        syncTransportUI();
+      });
+    }
+    for (var i = 0; i < presetChips.length; i++) {
+      presetChips[i].addEventListener("click", function (ev) {
+        var v = parseFloat(ev.currentTarget.getAttribute("data-val") || "0");
+        applyControl(v, true);
+      });
+    }
+
+    btnPlay.addEventListener("click", function () {
+      state.playing = !state.playing;
+      if (state.playing) state.manualOverride = false;
+      if (ctrlResume) ctrlResume.hidden = true;
+      syncTransportUI();
+    });
+
+    timeline.addEventListener("input", function () {
+      state.tSec = clamp(parseFloat(timeline.value) || 0, 0, duration);
+      syncTransportUI();
+    });
+
+    for (var i = 0; i < chMarkers.length; i++) {
+      chMarkers[i].addEventListener("click", function (ev) {
+        var s = parseFloat(ev.currentTarget.getAttribute("data-start") || "0");
+        state.tSec = clamp(s, 0, duration);
+        syncTransportUI();
+      });
+    }
+
+    for (var i = 0; i < speedBtns.length; i++) {
+      speedBtns[i].addEventListener("click", function (ev) {
+        state.speed = parseFloat(ev.currentTarget.getAttribute("data-speed") || "1");
+        for (var j = 0; j < speedBtns.length; j++) {
+          speedBtns[j].classList.toggle("is-active", speedBtns[j] === ev.currentTarget);
+        }
+      });
+    }
+
+    btnLoop.addEventListener("click", function () {
+      state.loop = !state.loop;
+      btnLoop.classList.toggle("is-active", state.loop);
+      btnLoop.setAttribute("aria-pressed", String(state.loop));
+    });
+
+    // Keyboard shortcuts: Space (play/pause), 1-4 (chapters)
+    document.addEventListener("keydown", function (ev) {
+      if (ev.target && (ev.target.tagName === "INPUT" || ev.target.tagName === "TEXTAREA")) return;
+      if (ev.code === "Space") {
+        ev.preventDefault();
+        btnPlay.click();
+      } else if (ev.key >= "1" && ev.key <= "4") {
+        var idx = parseInt(ev.key, 10) - 1;
+        if (bundle.chapters && bundle.chapters[idx]) {
+          state.tSec = bundle.chapters[idx].start_sec;
+          syncTransportUI();
+        }
+      }
+    });
+
+    // Video chapter jumps
+    for (var i = 0; i < vidJumpBtns.length; i++) {
+      vidJumpBtns[i].addEventListener("click", function (ev) {
+        var s = parseFloat(ev.currentTarget.getAttribute("data-start") || "0");
+        if (tourVideo) {
+          tourVideo.currentTime = s;
+          tourVideo.play().catch(function () {});
+        }
+      });
+    }
+    if (tourVideo) {
+      tourVideo.addEventListener("timeupdate", function () {
+        var idx = activeChapterIndex(bundle, tourVideo.currentTime || 0);
+        for (var i = 0; i < vidJumpBtns.length; i++) {
+          vidJumpBtns[i].classList.toggle("is-active", i === idx);
+        }
+        syncDrawerForTime(tourVideo.currentTime || 0);
+      });
+    }
+
+    // Copy CLI button
+    if (btnCopyCli && cliCmd) {
+      btnCopyCli.addEventListener("click", function () {
+        var text = cliCmd.textContent || "";
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () {
+            btnCopyCli.textContent = "Copied!";
+            setTimeout(function () { btnCopyCli.textContent = "Copy CLI"; }, 1400);
+          }).catch(function () {});
+        }
+      });
+    }
+
+    // Module 08 MCP packet inspector
+    var mcpBtn = document.getElementById("btn-mcp-toggle");
+    var mcpDrawer = document.getElementById("mcp-packet-drawer");
+    if (mcpBtn && mcpDrawer) {
+      var pkt = (bundle.payload && bundle.payload.mcp) ? bundle.payload.mcp : {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "run_metabolomics_chemometrics",
+          arguments: { normalization: "pqn", cv_folds: 5, permutations: 100 }
+        },
+        result: { status: "ok", mode: "ReadOnly", q2: 0.969, undo_depth: 256 }
+      };
+      mcpDrawer.textContent = JSON.stringify(pkt, null, 2);
+      mcpBtn.addEventListener("click", function () {
+        var open = mcpDrawer.hidden;
+        mcpDrawer.hidden = !open;
+        mcpBtn.setAttribute("aria-expanded", String(open));
+      });
+    }
+
+    // Export .webm via captureStream + MediaRecorder
+    if (btnExport) {
+      btnExport.addEventListener("click", function () {
+        if (!canvas.captureStream || typeof MediaRecorder === "undefined") {
+          exportStatus.textContent = "MediaRecorder unsupported in this browser.";
+          return;
+        }
+        try {
+          var mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
+            ? "video/webm;codecs=vp9"
+            : "video/webm";
+          var stream = canvas.captureStream(30);
+          var recorder = new MediaRecorder(stream, { mimeType: mime });
+          var chunks = [];
+          recorder.ondataavailable = function (e) { if (e.data && e.data.size > 0) chunks.push(e.data); };
+          recorder.onstop = function () {
+            var blob = new Blob(chunks, { type: "video/webm" });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement("a");
+            a.href = url;
+            a.download = "ferric-tour-" + (bundle.slug || "module") + "_clip.webm";
+            a.click();
+            setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+            exportStatus.textContent = "Clip exported.";
+          };
+          exportStatus.textContent = "Recording 4s clip...";
+          state.playing = true;
+          recorder.start();
+          setTimeout(function () {
+            if (recorder.state === "recording") recorder.stop();
+          }, 4000);
+        } catch (err) {
+          exportStatus.textContent = "Export unavailable: " + err.message;
+        }
+      });
+    }
+
+    // Hover / Tap tooltip + Module 03 3D Drag-to-Orbit
+    function showTooltip(cx, cy, spot) {
+      if (!tooltip) return;
+      tooltip.innerHTML = "<strong>" + spot.title + "</strong>" + (spot.lines || []).join("<br/>");
+      tooltip.hidden = false;
+      var rect = canvas.getBoundingClientRect();
+      var tx = clamp(cx + 14, 8, Math.max(8, rect.width - 240));
+      var ty = clamp(cy - 18, 8, Math.max(8, rect.height - 80));
+      tooltip.style.left = tx + "px";
+      tooltip.style.top = ty + "px";
+    }
+
+    function hideTooltip() {
+      if (tooltip) tooltip.hidden = true;
+    }
+
+    function inspectPointer(clientX, clientY, commitSelection) {
+      var rect = canvas.getBoundingClientRect();
+      var px = clientX - rect.left;
+      var py = clientY - rect.top;
+      var best = null;
+      var bestDist = Infinity;
+      for (var i = 0; i < state.hotspots.length; i++) {
+        var h = state.hotspots[i];
+        var d = Math.hypot(px - h.x, py - h.y);
+        var hitR = Math.max(h.r + 8, 20);
+        if (d <= hitR && d < bestDist) {
+          bestDist = d;
+          best = h;
+        }
+      }
+      if (best) {
+        showTooltip(px, py, best);
+        if (commitSelection && best.val !== undefined) {
+          applyControl(best.val, true);
+        }
+      } else {
+        hideTooltip();
+      }
+    }
+
+    canvas.addEventListener("pointerdown", function (ev) {
+      state.dragging = true;
+      state.lastX = ev.clientX;
+      state.lastY = ev.clientY;
+      inspectPointer(ev.clientX, ev.clientY, true);
+    });
+    canvas.addEventListener("pointermove", function (ev) {
+      if (state.dragging && bundle.module_index === 3) {
+        var dx = ev.clientX - state.lastX;
+        var dy = ev.clientY - state.lastY;
+        state.lastX = ev.clientX;
+        state.lastY = ev.clientY;
+        var nextYaw = (state.ctrlVal + dx * 0.7 + 360) % 360;
+        state.pitchRad = clamp(state.pitchRad + dy * 0.01, -1.2, 1.2);
+        applyControl(nextYaw, true);
+      } else {
+        inspectPointer(ev.clientX, ev.clientY, false);
+      }
+    });
+    window.addEventListener("pointerup", function () { state.dragging = false; });
+    canvas.addEventListener("pointerleave", hideTooltip);
+
+    // HiDPI ResizeObserver
+    var cssW = 800, cssH = 450;
+    function resizeCanvas() {
+      var wrap = document.getElementById("canvas-wrap");
+      if (!wrap) return;
+      var rect = wrap.getBoundingClientRect();
+      cssW = Math.max(240, rect.width);
+      cssH = Math.max(180, rect.height);
+      var dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(cssW * dpr);
+      canvas.height = Math.round(cssH * dpr);
+    }
+    if (typeof ResizeObserver !== "undefined") {
+      new ResizeObserver(resizeCanvas).observe(document.getElementById("canvas-wrap"));
+    }
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+    syncTransportUI();
+
+    function frameLoop(now) {
+      var dt = Math.min(0.1, (now - state.lastFrameTs) * 0.001);
+      state.lastFrameTs = now;
+      if (state.playing && !panelInt.hidden) {
+        state.tSec += dt * state.speed;
+        if (state.tSec >= duration) {
+          if (state.loop) state.tSec = state.tSec % duration;
+          else {
+            state.tSec = duration;
+            state.playing = false;
+          }
+        }
+        // Auto-orbit Module 03 smoothly during Ch 4 unless manually overridden
+        if (bundle.module_index === 3 && !state.manualOverride && state.tSec >= 12.0) {
+          applyControl(((state.tSec - 12.0) / 4.0) * 360.0, false);
+        }
+        syncTransportUI();
+      }
+      var ctx = canvas.getContext("2d");
+      if (ctx && !panelInt.hidden) {
+        var dpr = window.devicePixelRatio || 1;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        state.hotspots = [];
+        renderModuleScene(ctx, cssW, cssH, bundle.module_index, bundle.raw_json.payload || {}, state.tSec, state.ctrlVal, state, state.hotspots);
+      }
+      requestAnimationFrame(frameLoop);
+    }
+    requestAnimationFrame(frameLoop);
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    syncThemeBtn();
+    var themeBtn = document.getElementById("theme-toggle");
+    if (themeBtn) {
+      themeBtn.addEventListener("click", function () {
+        var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+        root.setAttribute("data-theme", next);
+        try { localStorage.setItem("nmr_manual_theme", next); } catch (_) {}
+        syncThemeBtn();
+      });
+    }
+    initGallery();
+    initPlayer();
+  });
+})();
+"""
+
+
+def build_tour_site_files(
+    bundles: Sequence[NormalizedBundle],
+    videos_rel: str = "videos",
+) -> Dict[str, bytes]:
+    """Generate all deterministic static files for the tour showcase site."""
+    files: Dict[str, bytes] = {
+        "tours.css": TOURS_CSS.encode("utf-8"),
+        "tours_player.js": TOURS_PLAYER_JS.encode("utf-8"),
+        "index.html": render_gallery_html(bundles).encode("utf-8"),
+    }
+    for b in bundles:
+        files[f"{b.slug}.html"] = render_module_html(b, bundles, videos_rel).encode("utf-8")
+    return files
+
+
+def write_site_to_disk(out_dir: Path, site_files: Dict[str, bytes]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for rel_path, content in sorted(site_files.items()):
+        dest = out_dir / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(content)
+
+
+def site_digest(site_files: Dict[str, bytes]) -> str:
+    h = hashlib.sha256()
+    for rel_path in sorted(site_files):
+        h.update(rel_path.encode("utf-8"))
+        h.update(b"\0")
+        h.update(site_files[rel_path])
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def validate_js_syntax(js_text: str) -> List[str]:
+    """Check balanced delimiters and run ``node --check`` if ``node`` is available."""
+    errors: List[str] = []
+    # Python structural balance check (ignoring strings & comments)
+    stack: List[str] = []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    closing = {")": "(", "]": "[", "}": "{"}
+    i = 0
+    n = len(js_text)
+    in_str: Optional[str] = None
+    in_line_comment = False
+    in_block_comment = False
+    while i < n:
+        ch = js_text[i]
+        nxt = js_text[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+        elif in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 1
+        elif in_str is not None:
+            if ch == "\\":
+                i += 1
+            elif ch == in_str:
+                in_str = None
+        else:
+            if ch == "/" and nxt == "/":
+                in_line_comment = True
+                i += 1
+            elif ch == "/" and nxt == "*":
+                in_block_comment = True
+                i += 1
+            elif ch in ('"', "'", "`"):
+                in_str = ch
+            elif ch in pairs:
+                stack.append(ch)
+            elif ch in closing:
+                if not stack or stack[-1] != closing[ch]:
+                    errors.append(f"unbalanced JS delimiter {ch!r} at offset {i}")
+                    break
+                stack.pop()
+        i += 1
+    if stack:
+        errors.append(f"unclosed JS delimiters at EOF: {stack}")
+
+    node_bin = shutil.which("node")
+    if node_bin:
+        with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=True) as tf:
+            tf.write(js_text)
+            tf.flush()
+            proc = subprocess.run(
+                [node_bin, "--check", tf.name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                errors.append(f"node --check failed: {proc.stderr.strip()}")
+    return errors
+
+
+def validate_tour_site(
+    site_files: Dict[str, bytes],
+    bundles: Sequence[NormalizedBundle],
+    videos_rel: str = "videos",
+) -> List[str]:
+    """Validate offline CSP, WCAG 1.4.4 viewport, synthetic disclosures, clean-room hygiene, and JS syntax."""
+    errors: List[str] = []
+    expected_names = {"index.html", "tours.css", "tours_player.js"} | {
+        f"{b.slug}.html" for b in bundles
+    }
+    missing = sorted(expected_names - set(site_files.keys()))
+    if missing:
+        errors.append(f"missing expected output files: {missing}")
+
+    cdn_re = re.compile(r'<(?:script|link|img|source)\b[^>]+(?:src|href)\s*=\s*["\']https?://', re.I)
+    forbidden_vp_re = re.compile(r"user-scalable\s*=\s*no|maximum-scale\s*=\s*1(\.0)?", re.I)
+    v_rel = videos_rel.rstrip("/")
+
+    for name, raw in sorted(site_files.items()):
+        text = raw.decode("utf-8")
+        # Strip standard WAI-ARIA HTML/JS attribute names (aria-label, aria-hidden, etc.)
+        # before clean-room product token checks so ARIA accessibility attributes do not false-trigger.
+        sanitized_low = re.sub(r"\baria-[a-z]+\b", " ", text.lower())
+        for tok in RESTRICTED_PRODUCT_TOKENS:
+            if re.search(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", sanitized_low):
+                errors.append(f"{name}: contains forbidden NMR product token {tok!r}")
+
+        if name.endswith(".html"):
+            if cdn_re.search(text):
+                errors.append(f"{name}: external http:// or https:// CDN resource reference detected")
+            if 'content="width=device-width, initial-scale=1.0, viewport-fit=cover"' not in text:
+                errors.append(f"{name}: missing WCAG 1.4.4 viewport-fit=cover meta")
+            if forbidden_vp_re.search(text):
+                errors.append(f"{name}: forbidden zoom-disabling viewport attribute detected")
+
+    for b in bundles:
+        page_name = f"{b.slug}.html"
+        if page_name not in site_files:
+            continue
+        page_text = site_files[page_name].decode("utf-8")
+        if b.module_index >= 4 and "SYNTHETIC" not in page_text:
+            errors.append(f"{page_name}: missing explicit SYNTHETIC showcase disclosure text")
+        if "<video" not in page_text:
+            errors.append(f"{page_name}: missing <video> element")
+        if f'src="{v_rel}/{b.slug}.webm"' not in page_text:
+            errors.append(f"{page_name}: missing .webm <source> tag")
+        if f'src="{v_rel}/{b.slug}.mp4"' not in page_text:
+            errors.append(f"{page_name}: missing .mp4 <source> tag")
+
+    if "tours_player.js" in site_files:
+        errors.extend(validate_js_syntax(site_files["tours_player.js"].decode("utf-8")))
+
+    # Verify build determinism
+    second = build_tour_site_files(bundles, videos_rel=videos_rel)
+    if site_digest(site_files) != site_digest(second):
+        errors.append("non-deterministic tour build output detected across consecutive renders")
+
+    return errors
+
+
+def _make_mock_bundles(data_dir: Path) -> None:
+    """Create minimal synthetic 01..08 *.tour.json fixtures for --self-test."""
+    specs = [
+        (1, "01_fid_pulprog_nus", "Raw-FID DSP & Pulprog Engine", "02-custom-pulprog-and-dsp.html", "empirical_calibrated", "EMPIRICAL + LOPO CALIBRATED", "25% Poisson-gap NUS & IST", "nus_iter", 0, 20, 1, 20, "iter"),
+        (2, "02_hsqc_strips_solvers", "HSQC Strips & Backbone Solvers", "03-solvers-and-calibration.html", "empirical_calibrated", "5-SEED CALIBRATED (~86-96% COLD HC-PREC)", "Ubiquitin 98.4%, CISD3 64.38% (100% HC-prec)", "focus_res", 1, 10, 1, 7, "res"),
+        (3, "03_structure_noe_rdc", "3D Structure, NOE & RDC", "01-quickstart-and-workflows.html", "cold_holdout_disclosed", "COLD HOLDOUT DISCLOSED (F8)", "Unseen 1KHM->1ZZK 1.86-4.14 A (0/5 < 1.80 A)", "orbit_deg", 0, 360, 5, 45, "deg"),
+        (4, "04_relax_modelfree", "Relaxation & Lipari-Szabo", "04-dynamics-and-exchange.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F10/F11 OPEN)", "Dual-field R1/R2/hetNOE & M1-M5 S^2", "residue_seq", 1, 76, 1, 23, "res"),
+        (5, "05_exchange_cest_cpmg_csp", "CEST, CPMG & Tight-Binding CSP", "04-dynamics-and-exchange.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F13 OPEN)", "Pade CEST, Baldwin CPMG & Morrison Kd", "ligand_um", 0, 300, 5, 100, "uM"),
+        (6, "06_nmr1d_multiplet_qnmr_octet", "1D Multiplets, qNMR & Octet", "05-nmr1d-multiplets-and-dosy.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F14 OPEN)", "(S)-Ibuprofen Hoye ddd, GUM qNMR & Octet", "atom_idx", 0, 14, 1, 3, "atom"),
+        (7, "07_dosy_diffusion", "DOSY Diffusion & Rh Sizing", "05-nmr1d-multiplets-and-dosy.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F16 OPEN)", "BPP-LED Stejskal-Tanner, 2D DOSY & Rh", "grad_step", 0, 15, 1, 4, "step"),
+        (8, "08_metabolomics_mcp", "Metabolomics, STOCSY & MCP", "08-metabolomics-and-chemometrics.html", "synthetic_and_protocol_showcase", "SYNTHETIC & PROTOCOL SHOWCASE (F17/F18 OPEN)", "AI-Binning, PQN, OPLS-DA, STOCSY & MCP JSON-RPC", "driver_bucket", 0, 20, 1, 4, "bucket"),
+    ]
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for idx, slug, title, man_ch, b_kind, b_lbl, b_det, cid, cmin, cmax, cstep, cdef, cunit in specs:
+        doc = {
+            "schema_version": EXPECTED_SCHEMA_VERSION,
+            "module_index": idx,
+            "slug": slug,
+            "title": title,
+            "subtitle": f"Deterministic nmr-core showcase for {title}",
+            "manual_chapter": man_ch,
+            "validation_badge": {"kind": b_kind, "label": b_lbl, "detail": b_det},
+            "duration_sec": 16.0,
+            "fps": 30,
+            "cli_command": f"ferric export-tour --module {idx:02d} --out-dir docs/tours",
+            "chapters": [
+                {"index": 1, "start_sec": 0.0, "end_sec": 4.0, "title": "Stage One", "caption": "Chapter 1 physics", "metric": "Ch1"},
+                {"index": 2, "start_sec": 4.0, "end_sec": 8.0, "title": "Stage Two", "caption": "Chapter 2 physics", "metric": "Ch2"},
+                {"index": 3, "start_sec": 8.0, "end_sec": 12.0, "title": "Stage Three", "caption": "Chapter 3 physics", "metric": "Ch3"},
+                {"index": 4, "start_sec": 12.0, "end_sec": 16.0, "title": "Stage Four", "caption": "Chapter 4 physics", "metric": "Ch4"},
+            ],
+            "interactive_control": {
+                "id": cid,
+                "label": cid,
+                "min": cmin,
+                "max": cmax,
+                "step": cstep,
+                "default_val": cdef,
+                "unit": cunit,
+            },
+            "payload": {"seed": 20261801, "module": idx},
+        }
+        (data_dir / f"{slug}.tour.json").write_text(
+            json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8"
+        )
+
+
+def run_self_tests() -> int:
+    """Run deterministic, offline-CSP, WCAG, synthetic-disclosure, and JS syntax self-tests."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        data_dir = root / "data"
+        out_a = root / "out_a"
+        out_b = root / "out_b"
+        _make_mock_bundles(data_dir)
+
+        bundles = load_tour_bundles(data_dir)
+        assert len(bundles) == 8, f"expected 8 bundles, got {len(bundles)}"
+
+        files_a = build_tour_site_files(bundles, videos_rel="videos")
+        files_b = build_tour_site_files(bundles, videos_rel="videos")
+        write_site_to_disk(out_a, files_a)
+        write_site_to_disk(out_b, files_b)
+
+        # 1. Determinism & 11 expected artifacts (9 HTML + CSS + JS)
+        assert len(files_a) == 11, f"expected 11 output files, got {len(files_a)}"
+        assert site_digest(files_a) == site_digest(files_b), "build is non-deterministic"
+
+        # 2. Full validator pass
+        errs = validate_tour_site(files_a, bundles, videos_rel="videos")
+        assert not errs, f"unexpected validation errors: {errs}"
+
+        # 3. Adversarial checks: external CDN must fail
+        mut_cdn = dict(files_a)
+        mut_cdn["index.html"] = files_a["index.html"].replace(
+            b"</head>", b'<script src="https://cdn.example.com/x.js"></script></head>'
+        )
+        assert any("CDN" in e for e in validate_tour_site(mut_cdn, bundles))
+
+        # 4. Adversarial check: user-scalable=no must fail WCAG 1.4.4
+        mut_wcag = dict(files_a)
+        mut_wcag["index.html"] = files_a["index.html"].replace(
+            b"viewport-fit=cover", b"viewport-fit=cover, user-scalable=no"
+        )
+        assert any("zoom-disabling" in e for e in validate_tour_site(mut_wcag, bundles))
+
+        # 5. Adversarial check: missing SYNTHETIC disclosure on module 04 must fail
+        mut_synth = dict(files_a)
+        mut_synth["04_relax_modelfree.html"] = files_a["04_relax_modelfree.html"].replace(
+            b"SYNTHETIC", b"HIDDEN"
+        )
+        assert any("SYNTHETIC" in e for e in validate_tour_site(mut_synth, bundles))
+
+        # 6. Adversarial check: restricted product token must fail
+        mut_tok = dict(files_a)
+        mut_tok["index.html"] = files_a["index.html"] + f"<!-- {RESTRICTED_PRODUCT_TOKENS[0]} -->".encode("utf-8")
+        assert any("forbidden NMR product token" in e for e in validate_tour_site(mut_tok, bundles))
+
+        # 7. CLI --check end-to-end verification
+        check_out = root / "out_cli_check"
+        rc = main(["--data-dir", str(data_dir), "--out", str(check_out), "--videos-rel", "videos", "--check"])
+        assert rc == 0, f"expected --check rc=0, got {rc}"
+        assert (check_out / "index.html").is_file()
+        assert (check_out / "tours.css").is_file()
+        assert (check_out / "tours_player.js").is_file()
+
+        digest = site_digest(files_a)[:16]
+        print(
+            f"build_interactive_tours.py self-tests passed (7/7 checks: 11 files, "
+            f"zero-CDN, WCAG 1.4.4, 04..08 SYNTHETIC+video, clean-room, JS syntax, --check CLI; sha256={digest})."
+        )
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    repo_root = Path(__file__).resolve().parent.parent
+    parser = argparse.ArgumentParser(
+        description="Build offline static HTML5 Interactive Tour Gallery & Player from *.tour.json"
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=repo_root / "docs" / "tours" / "data",
+        help="Directory containing 01..08_*.tour.json files",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=repo_root / "target" / "tours",
+        help="Output directory for generated static HTML/CSS/JS tour site",
+    )
+    parser.add_argument(
+        "--videos-rel",
+        type=str,
+        default="videos",
+        help="Relative directory path for .mp4 and .webm pre-rendered videos (default: videos)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Validate determinism, zero CDN, WCAG 1.4.4, synthetic disclosures, and JS syntax",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run built-in mock fixture & adversarial validation self-tests and exit",
+    )
+    args = parser.parse_args(argv)
+
+    if args.self_test:
+        return run_self_tests()
+
+    bundles = load_tour_bundles(args.data_dir)
+    site_files = build_tour_site_files(bundles, videos_rel=args.videos_rel)
+    write_site_to_disk(args.out, site_files)
+    brand_dir = repo_root / "docs" / "assets" / "brand"
+    for fav_name in ("favicon.svg", "favicon-32.png"):
+        fav_src = brand_dir / fav_name
+        if fav_src.is_file():
+            (args.out / fav_name).write_bytes(fav_src.read_bytes())
+
+    if args.check:
+        errors = validate_tour_site(site_files, bundles, videos_rel=args.videos_rel)
+        if errors:
+            for err in errors:
+                print(f"error: {err}", file=sys.stderr)
+            print(f"tour site check FAILED with {len(errors)} error(s).", file=sys.stderr)
+            return 1
+
+    digest = site_digest(site_files)[:16]
+    print(
+        f"Built {len(bundles)} interactive tour pages + gallery ({len(site_files)} files, "
+        f"sha256={digest}) -> {args.out}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -13,6 +13,7 @@
 [![Rust + WebGPU](https://img.shields.io/badge/engine-Rust%20%2B%20wgpu-orange.svg)](docs/specs/00-architecture.md)
 [![User Manual](https://img.shields.io/badge/docs-User%20Manual-0284c7.svg)](https://debsahu.github.io/ferric/)
 [![Browser Demo](https://img.shields.io/badge/WebGPU-Live%20Demo-059669.svg)](https://debsahu.github.io/ferric/demo/)
+[![Interactive Video Tours](https://img.shields.io/badge/tours-Interactive%20Cinema-B7410E.svg)](https://debsahu.github.io/ferric/tours/)
 
 **FERRIC** (`ferric` CLI + `ferric-gui` desktop/WebAssembly workbench) processes raw time-domain FIDs (Bruker `ser`/`fid` + custom `pulprog`, Varian/Agilent, JEOL Delta, JCAMP-DX) and frequency-domain spectra (Bruker `pdata`, NMRPipe, Sparky `.ucsf`) end-to-end in pure clean-room Rust (`f64` reference algorithms) and cross-vendor WebGPU (`wgpu` WGSL compute & contour shaders).
 
@@ -94,7 +95,7 @@ All macromolecular assignment solvers (`evo-graph` default, `standard` parallel-
 ## Documentation, Specifications & Live Demo
 
 - **User Manual ([Hosted Site](https://debsahu.github.io/ferric/) · `docs/manual/`)**: [Overview](docs/manual/index.md) · [01 Quickstart & Workflows](docs/manual/01-quickstart-and-workflows.md) · [02 Custom `pulprog` & DSP](docs/manual/02-custom-pulprog-and-dsp.md) · [03 Solvers & Calibration](docs/manual/03-solvers-and-calibration.md) · [04 Dynamics & Exchange](docs/manual/04-dynamics-and-exchange.md) · [05 1D Multiplets, `qNMR` & `DOSY`](docs/manual/05-nmr1d-multiplets-and-dosy.md) · [06 `MCP` & CLI Reference](docs/manual/06-mcp-and-cli-reference.md) · [07 Clean-Room Provenance](docs/manual/07-clean-room-provenance.md) · [08 Metabolomics & Chemometrics](docs/manual/08-metabolomics-and-chemometrics.md)
-- **Technical Specifications & Interactive Demo**: [Architecture & Specs (`docs/specs/`)](docs/specs/) · [**Live WebGPU Browser Demo**](https://debsahu.github.io/ferric/demo/) ([source](docs/demo/)) · [Dataset Provenance (`data/benchmark/PROVENANCE.md`)](data/benchmark/PROVENANCE.md) · [Roadmap & Open Validation Gates (`TODO.md`)](TODO.md)
+- **Technical Specifications, Interactive Tours & Demo**: [Architecture & Specs (`docs/specs/`)](docs/specs/) · [**Interactive Video Tours**](https://debsahu.github.io/ferric/tours/) · [**Live WebGPU Browser Demo**](https://debsahu.github.io/ferric/demo/) ([source](docs/demo/)) · [Dataset Provenance (`data/benchmark/PROVENANCE.md`)](data/benchmark/PROVENANCE.md) · [Roadmap & Open Validation Gates (`TODO.md`)](TODO.md)
 
 ## Clean-Room Provenance & Licence
 

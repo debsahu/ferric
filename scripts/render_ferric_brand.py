@@ -1044,6 +1044,10 @@ def run_self_test(brand_dir: Path) -> None:
     if rgba64_disk.read_bytes() != rgba64:
         raise AssertionError(f"Stale 64x64 RGBA asset on disk: {rgba64_disk}")
 
+    gui_rgba64_disk = Path(__file__).resolve().parent.parent / "crates" / "nmr-gui" / "assets" / "ferric-icon-64.rgba"
+    if gui_rgba64_disk.is_file() and gui_rgba64_disk.read_bytes() != rgba64:
+        raise AssertionError(f"Stale GUI 64x64 RGBA asset on disk (F30 sync): {gui_rgba64_disk}")
+
     print(
         f"SELF-TEST PASS: {len(svgs_1)} SVGs + {len(pngs_1)} PNGs + ferric-icon-64.rgba verified "
         f"(byte-identical across 2 runs, zero <text>/external refs, valid PNG CRCs, 32x32 & 1280x640)"

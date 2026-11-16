@@ -2,6 +2,9 @@
 
 Real experimental NMR repositories rarely conform to textbook defaults: laboratories rename pulse programs (`custom_tr_seq_v2`, `my_t1_trosy_interleaved`), synthesize manual `States-TPPI` phase loops inside `FnMODE = QF`, transpose `F1`/`F2` acquisition loops (`AQSEQ = 312`), interleave relaxation delays inside $t_1$, write 0-based or 1-based `nuslist` schedules, or leave unprocessed indirect `REVERSE` flags unset. FERRIC resolves these ambiguities directly from acquisition physics (`nmr-core::pulprog`, `fid`, `process`, `ops`, and `nmr1d`).
 
+> [!TIP] Interactive Tour & HD Video
+> Explore **[Module 01: Raw-FID DSP & Pulprog Engine](tours/01_fid_pulprog_nus.html)** (`25%` Poisson-gap NUS & IST interactive iteration slider + `1280×720` HD video), or browse **[All 8 Module Tours](tours/index.html)**.
+
 ---
 
 ## Sandboxed Executed `pulseprogram` & `procpar` Interpreter

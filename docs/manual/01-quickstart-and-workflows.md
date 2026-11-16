@@ -2,6 +2,9 @@
 
 FERRIC is designed around **zero-friction ingest** and **problem-regime specialization**. Rather than forcing globular triple-resonance assumptions onto intrinsically disordered proteins, supramolecular methyl-labeled complexes, paramagnetic metalloproteins, or small-molecule mixtures, the workspace classifier (`nmr-core::classify`) inspects acquisition headers and executed pulse programs in under `50 ms` to configure the right processing, peak-picking, and solver pipeline automatically.
 
+> [!TIP] Interactive Tour & HD Video (Cold Holdout Disclosed `F8`)
+> Watch or scrub the **[Module 03: 3D Structure, NOE & RDC Interactive Tour](tours/03_structure_noe_rdc.html)** (`60 fps` live 3D orbit canvas + `1280×720` MP4/WebM; discloses unseen `1KHM -> 1ZZK` `F8` cold holdout `1.86–4.14 Å`, `0/5 < 1.80 Å`), or browse **[All 8 Module Tours](tours/index.html)**.
+
 ---
 
 ## 60-Second End-to-End Quickstart

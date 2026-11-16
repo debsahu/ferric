@@ -2,6 +2,9 @@
 
 FERRIC is engineered from the ground up as a **100% clean-room, permissively licensed (`MIT`) scientific platform**. Every mathematical model, binary spectrometer reader, statistical calibrator, GPU shader, and graphical studio traces directly to peer-reviewed literature, public open specifications, and public-domain (`CC0 1.0`) archival data.
 
+> [!TIP] Interactive Tour & HD Video Showcase
+> Every panel in the **[Interactive Showcase Cinema Gallery](tours/index.html)** is generated deterministically from clean-room `nmr-core` outputs (`ferric export-tour`, zero external CDN dependencies) with explicit per-module validation scope badges.
+
 ---
 
 ## Clean-Room Engineering Rules

@@ -2,6 +2,9 @@
 
 This chapter serves as the complete reference for the `ferric` command-line interface, the clean-room **Model Context Protocol (`MCP`)** server and authenticated desktop workbench bridge (`nmr-core::mcp`, `nmr-gui::mcp_bridge`), and interactive keyboard accelerators (`nmr-gui::keymap`).
 
+> [!TIP] Interactive Tour & HD Video (PROTOCOL SHOWCASE · `F18` Open)
+> Inspect the interactive JSON-RPC 2.0 packet drawer and `ferric mcp` workflow in **[Module 08: Metabolomics, STOCSY & MCP](tours/08_metabolomics_mcp.html)** (`60 fps` live canvas + `1280×720` HD video; protocol showcase), or browse **[All 8 Module Tours](tours/index.html)**.
+
 ---
 
 ## `ferric` CLI Subcommand Reference

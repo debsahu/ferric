@@ -5,6 +5,9 @@ Proteins are dynamic conformational ensembles whose biological catalysis, allost
 > [!IMPORTANT] Validation Scope (Synthetic Forward-Model Self-Consistency)
 > Quantitative accuracy and speed benchmarks reported in this chapter (`SNR = 4` locked-shape plane bias `< 1.5%`, `M1`–`M5` $S^2$ MAE `< 0.005` on synthetic axial/anisotropic tensors oriented against `1UBQ` $\text{N–H}$ bond vectors, dual-$B_1$ `CEST` $p_B$ recovery, dual-$B_0$ Baldwin `CPMG` dispersion, and quadratic `CSP` $K_d$ isotherms) are **synthetic forward-model self-consistency evaluations** (`T13.1`–`T13.5`). **`0` real deposited experimental relaxation (`BMRB` $R_1/R_2/\text{NOE}$ or raw `vdlist`/`vclist` `ser`), `CEST`, `CPMG`, or ligand `CSP` titration datasets have been evaluated end-to-end yet**; real experimental repository validation is tracked openly under follow-ups **`F10`**, **`F11`**, and **`F13`**.
 
+> [!TIP] Interactive Tours & HD Video (SYNTHETIC SHOWCASE · `F10`/`F11`/`F13` Open)
+> Explore **[Module 04: Relaxation & Lipari-Szabo](tours/04_relax_modelfree.html)** and **[Module 05: CEST, CPMG & Tight-Binding CSP](tours/05_exchange_cest_cpmg_csp.html)** (`60 fps` live parameter sliders + `1280×720` HD video; synthetic forward-model demonstrations), or browse **[All 8 Module Tours](tours/index.html)**.
+
 ---
 
 ## Timescale Map & Module Overview

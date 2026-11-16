@@ -36,6 +36,23 @@ Every algorithm in FERRIC is implemented first as an audited `f64` reference eng
 
 ---
 
+## Interactive Module Video Tours (`/tours/`)
+
+Launch the **[Interactive Showcase Cinema Gallery](tours/index.html)** (`60 fps` HTML5 `<canvas>` live parameter explorer + pre-rendered `1280×720` `.mp4` / `.webm` HD videos generated deterministically from `ferric export-tour`):
+
+| Module | Interactive Tour & HD Video | Validation Scope |
+| :--- | :--- | :--- |
+| **01** | **[Raw-FID DSP & Pulprog Engine](tours/01_fid_pulprog_nus.html)** | Empirical + LOPO Calibrated (`25%` Poisson-gap NUS & IST) |
+| **02** | **[HSQC Strips & Backbone Solvers](tours/02_hsqc_strips_solvers.html)** | 5-Seed Calibrated (`~86%–96%` cold HC-prec; Ubiquitin `98.4%`, `CISD3` `64.38%`) |
+| **03** | **[3D Structure, NOE & RDC](tours/03_structure_noe_rdc.html)** | **Cold Holdout Disclosed (`F8`)**: unseen `1KHM -> 1ZZK` (`1.86–4.14 Å`, `0/5 < 1.80 Å`) |
+| **04** | **[Relaxation & Lipari-Szabo](tours/04_relax_modelfree.html)** | `SYNTHETIC FORWARD-MODEL SHOWCASE` (`F10`/`F11` open) |
+| **05** | **[CEST, CPMG & Tight-Binding CSP](tours/05_exchange_cest_cpmg_csp.html)** | `SYNTHETIC FORWARD-MODEL SHOWCASE` (`F13` open) |
+| **06** | **[1D Multiplets, qNMR & Octet](tours/06_nmr1d_multiplet_qnmr_octet.html)** | `SYNTHETIC FORWARD-MODEL SHOWCASE` (`F14` open) |
+| **07** | **[DOSY Diffusion & Rh Sizing](tours/07_dosy_diffusion.html)** | `SYNTHETIC FORWARD-MODEL SHOWCASE` (`F16` open) |
+| **08** | **[Metabolomics, STOCSY & MCP](tours/08_metabolomics_mcp.html)** | `SYNTHETIC & PROTOCOL SHOWCASE` (`F17`/`F18` open) |
+
+---
+
 ## Installation & Building from Source
 
 ### Prerequisites

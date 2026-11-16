@@ -64,6 +64,18 @@ EXPECTED_MANUAL_CHAPTERS: Tuple[str, ...] = (
     "08-metabolomics-and-chemometrics.md",
 )
 
+KNOWN_TOUR_PAGES: Set[str] = {
+    "tours/index.html",
+    "tours/01_fid_pulprog_nus.html",
+    "tours/02_hsqc_strips_solvers.html",
+    "tours/03_structure_noe_rdc.html",
+    "tours/04_relax_modelfree.html",
+    "tours/05_exchange_cest_cpmg_csp.html",
+    "tours/06_nmr1d_multiplet_qnmr_octet.html",
+    "tours/07_dosy_diffusion.html",
+    "tours/08_metabolomics_mcp.html",
+}
+
 RESTRICTED_PRODUCT_TOKENS: Tuple[str, ...] = (
     "am" + "ix",
     "che" + "nomx",
@@ -719,6 +731,12 @@ def rewrite_internal_href(raw_href: str) -> str:
             path_part = f"assets/{rel_asset}"
     elif path_part in ("../demo", "../demo/", "../demo/index.html"):
         path_part = "demo/index.html"
+    elif path_part in ("../tours", "../tours/", "../tours/index.html", "tours", "tours/"):
+        path_part = "tours/index.html"
+    elif path_part.startswith("../tours/"):
+        rel_tour = path_part[len("../tours/") :]
+        if rel_tour and ".." not in Path(rel_tour).parts and not rel_tour.startswith("/"):
+            path_part = f"tours/{rel_tour}"
     elif path_part.endswith(".md"):
         path_part = path_part[:-3] + ".html"
     if parsed.fragment:
@@ -2687,7 +2705,7 @@ def validate_internal_links(
                 continue
 
             target_html = page.html_name if not rel_path else rel_path
-            if target_html not in site_files:
+            if target_html not in site_files and target_html not in KNOWN_TOUR_PAGES:
                 errors.append(
                     f"{ref.source_md}:{ref.line_no}: broken internal link target '{ref.raw_target}' "
                     f"(resolved '{target_html}' does not exist)"
@@ -2733,7 +2751,11 @@ def validate_internal_links(
                 base_dir = posixpath.dirname(html_name)
                 joined = posixpath.join(base_dir, rel_path) if base_dir else rel_path
                 target_file = posixpath.normpath(joined)
-            if target_file.startswith("../") or target_file == ".." or target_file not in site_files:
+            if (
+                target_file.startswith("../")
+                or target_file == ".."
+                or (target_file not in site_files and target_file not in KNOWN_TOUR_PAGES)
+            ):
                 errors.append(f"{html_name}: broken rendered asset/page reference '{href}'")
                 continue
             if frag and target_file.endswith(".html"):
