@@ -1,3 +1,10 @@
+<p align="left">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/ferric-logo-dark.svg">
+    <img src="docs/assets/brand/ferric-logo-light.svg" alt="FERRIC — FID-to-structure Engine for Relaxation, Resonance assignment, Integration & Chemometrics" width="520">
+  </picture>
+</p>
+
 # FERRIC
 
 **F**ID-to-structure **E**ngine for **R**elaxation, **R**esonance assignment, **I**ntegration & **C**hemometrics — an open-source Rust + WebGPU workbench for automated protein NMR resonance assignment, spin dynamics, analytical 1D/qNMR, DOSY diffusion, untargeted metabolomics, 2D chemical depiction, and sandboxed AI copilot workflows.

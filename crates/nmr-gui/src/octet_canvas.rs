@@ -4500,7 +4500,7 @@ fn export_builtin_mol_v2000(scene: &RenderScene, as_sdf: bool) -> String {
         .collect();
 
     let mut out = String::new();
-    out.push_str("Octet-Draw / FERRIC\n  ferric-gui 0200262D\n\n");
+    out.push_str("Octet-Draw / FERRIC\n  FERRIC  02002600002D\n\n");
     out.push_str(&format!(
         "{:>3}{:>3}  0  0  0  0  0  0  0  0999 V2000\n",
         real_atoms.len(),
@@ -4835,4 +4835,25 @@ fn import_builtin_jcamp_dx(jdx: &str, current_scene: &RenderScene) -> Result<Ren
         custom_trace: Vec::new(),
     });
     Ok(next_scene)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mdl_v2000_header_line2_has_strict_22_column_layout() {
+        let scene = RenderScene::new();
+        let mol = export_builtin_mol_v2000(&scene, false);
+        let line2 = mol.lines().nth(1).expect("V2000 header line 2 present");
+        assert_eq!(
+            line2.len(),
+            22,
+            "V2000 line 2 must be 22 columns: {line2:?}"
+        );
+        assert_eq!(&line2[0..2], "  ");
+        assert_eq!(&line2[2..10], "FERRIC  ");
+        assert_eq!(&line2[10..20], "0200260000");
+        assert_eq!(&line2[20..22], "2D");
+    }
 }

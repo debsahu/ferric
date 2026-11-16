@@ -8488,6 +8488,8 @@ fn main() -> eframe::Result {
                 "FERRIC v{} — WebGPU Protein NMR & Octet Chemical Studio",
                 nmr_core::VERSION
             ))
+            .with_icon(Arc::new(nmr_gui::brand_icon::build_ferric_window_icon()))
+            .with_app_id("ferric-gui")
             .with_inner_size([1380.0, 860.0])
             .with_min_inner_size([360.0, 560.0]),
         ..Default::default()

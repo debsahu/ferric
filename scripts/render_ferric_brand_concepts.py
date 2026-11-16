@@ -35,13 +35,16 @@ DARK_BG_HEX = "#0B1120"
 
 LIGHT_BG_RGB = (248, 250, 252)
 DARK_BG_RGB = (11, 17, 32)
-MONO_INK_HEX = "#0F172A"
-MONO_INK_RGB = (15, 23, 42)
+MONO_INK_HEX = "currentColor"
+MONO_LIGHT_RGB = (15, 23, 42)
+MONO_DARK_RGB = (248, 250, 252)
 
 PREVIEW_SIZES: Tuple[int, ...] = (512, 64, 16)
 
 
-def _hex_to_rgb(color: str) -> Tuple[int, int, int]:
+def _hex_to_rgb(color: str, current_color_rgb: Tuple[int, int, int] = MONO_LIGHT_RGB) -> Tuple[int, int, int]:
+    if color == "currentColor":
+        return current_color_rgb
     c = color.lstrip("#")
     if len(c) != 6:
         raise ValueError(f"Expected #RRGGBB color, got {color!r}")
@@ -519,26 +522,29 @@ class _CompiledLayer:
     bbox: Tuple[float, float, float, float]
 
 
-def _compile_layers(shapes: Sequence[Shape]) -> List[_CompiledLayer]:
+def _compile_layers(
+    shapes: Sequence[Shape],
+    current_color_rgb: Tuple[int, int, int] = MONO_LIGHT_RGB,
+) -> List[_CompiledLayer]:
     layers: List[_CompiledLayer] = []
     for sh in shapes:
         bb = sh.bbox()
         if isinstance(sh, RoundedRect):
             if sh.fill is not None:
-                layers.append(_CompiledLayer("rect_fill", sh, _hex_to_rgb(sh.fill), bb))
+                layers.append(_CompiledLayer("rect_fill", sh, _hex_to_rgb(sh.fill, current_color_rgb), bb))
             if sh.stroke is not None and sh.stroke_width > 0.0:
-                layers.append(_CompiledLayer("rect_stroke", sh, _hex_to_rgb(sh.stroke), bb))
+                layers.append(_CompiledLayer("rect_stroke", sh, _hex_to_rgb(sh.stroke, current_color_rgb), bb))
         elif isinstance(sh, Circle):
             if sh.fill is not None:
-                layers.append(_CompiledLayer("circle_fill", sh, _hex_to_rgb(sh.fill), bb))
+                layers.append(_CompiledLayer("circle_fill", sh, _hex_to_rgb(sh.fill, current_color_rgb), bb))
             if sh.stroke is not None and sh.stroke_width > 0.0:
-                layers.append(_CompiledLayer("circle_stroke", sh, _hex_to_rgb(sh.stroke), bb))
+                layers.append(_CompiledLayer("circle_stroke", sh, _hex_to_rgb(sh.stroke, current_color_rgb), bb))
         elif isinstance(sh, LineSegment):
-            layers.append(_CompiledLayer("line", sh, _hex_to_rgb(sh.stroke), bb))
+            layers.append(_CompiledLayer("line", sh, _hex_to_rgb(sh.stroke, current_color_rgb), bb))
         elif isinstance(sh, Polyline):
-            layers.append(_CompiledLayer("poly", sh, _hex_to_rgb(sh.stroke), bb))
+            layers.append(_CompiledLayer("poly", sh, _hex_to_rgb(sh.stroke, current_color_rgb), bb))
         elif isinstance(sh, Polygon):
-            layers.append(_CompiledLayer("polygon", sh, _hex_to_rgb(sh.fill), bb))
+            layers.append(_CompiledLayer("polygon", sh, _hex_to_rgb(sh.fill, current_color_rgb), bb))
     return layers
 
 
@@ -569,11 +575,15 @@ def _layer_sdf(layer: _CompiledLayer, vx: float, vy: float) -> float:
     raise ValueError(kind)
 
 
-def rasterize_rgba_4x4(shapes: Sequence[Shape], size: int) -> bytearray:
+def rasterize_rgba_4x4(
+    shapes: Sequence[Shape],
+    size: int,
+    current_color_rgb: Tuple[int, int, int] = MONO_LIGHT_RGB,
+) -> bytearray:
     """Rasterize shapes on transparent background with exact 4x4 stratified supersampling."""
     if size <= 0 or size > 2048:
         raise ValueError(f"Unsupported dimension: {size}")
-    layers = _compile_layers(shapes)
+    layers = _compile_layers(shapes, current_color_rgb=current_color_rgb)
     scale = VIEWBOX_SIZE / size
     edge_thresh = 0.78 * scale
     sub_offsets = (0.125, 0.375, 0.625, 0.875)
@@ -912,7 +922,7 @@ def build_comparison_sheet(
     box_h = 264  # Fits 256px downscaled 512 + padding, or 64 + 16 + 128 loupe
 
     width = row_lbl_w + 3 * col_w + 4 * pad
-    height = header_h + sub_h + 4 * (box_h + pad) + pad
+    height = header_h + sub_h + 6 * (box_h + pad) + pad
     canvas = _Canvas(width, height, (241, 245, 249))
     canvas.fill_rect(0, 0, width, header_h, (15, 23, 42))
     canvas.draw_text(24, 22, "FERRIC BRAND CONCEPTS - 512 / 64 / 16 PX + 8X LOUPE", (248, 250, 252), scale=2)
@@ -949,6 +959,8 @@ def build_comparison_sheet(
         ("512PX DARK", "dark", "hero"),
         ("64/16/LOUPE LIGHT", "light", "small"),
         ("64/16/LOUPE DARK", "dark", "small"),
+        ("MONO LIGHT", "light", "mono"),
+        ("MONO DARK", "dark", "mono"),
     )
 
     for ri, (rtitle, bg_key, mode) in enumerate(row_specs):
@@ -970,8 +982,9 @@ def build_comparison_sheet(
                 canvas.blit_scanlines(cx + (col_w - 256) // 2, ry + 4, 256, 256, half)
             else:
                 # 64px native + 16px native + 128x128 loupe side-by-side
-                s64 = scanlines[(ck, 64, bg_key)]
-                s16 = scanlines[(ck, 16, bg_key)]
+                scan_key = f"{ck}-mono" if mode == "mono" else ck
+                s64 = scanlines[(scan_key, 64, bg_key)]
+                s16 = scanlines[(scan_key, 16, bg_key)]
                 canvas.blit_scanlines(cx + 20, ry + 64, 64, 64, s64)
                 canvas.blit_scanlines(cx + 44, ry + 152, 16, 16, s16)
                 canvas.blit_scaled_nn(cx + 128, ry + 68, 16, 16, s16, scale=8, grid_rgb=grid)
@@ -1000,9 +1013,16 @@ def generate_all_bytes() -> Tuple[Dict[str, bytes], Dict[str, Tuple[int, int, by
     loupe_16: Dict[Tuple[str, str], bytes] = {}
 
     for key, stem, _, is_mono in CONCEPT_SPECS:
-        if is_mono:
-            continue
         shapes = get_concept_shapes(key)
+        if is_mono:
+            for sz in (64, 16):
+                for bg_key, bg_rgb, ink_rgb in (
+                    ("light", LIGHT_BG_RGB, MONO_LIGHT_RGB),
+                    ("dark", DARK_BG_RGB, MONO_DARK_RGB),
+                ):
+                    rgba = rasterize_rgba_4x4(shapes, sz, current_color_rgb=ink_rgb)
+                    all_scanlines[(key, sz, bg_key)] = composite_over_bg(rgba, sz, bg_rgb)
+            continue
         for sz in PREVIEW_SIZES:
             rgba = rasterize_rgba_4x4(shapes, sz)
             for bg_key, bg_rgb in (("light", LIGHT_BG_RGB), ("dark", DARK_BG_RGB)):
@@ -1064,6 +1084,11 @@ def run_self_test(svg_dir: Path, out_dir: Path) -> None:
         stripped = text.replace('xmlns="http://www.w3.org/2000/svg"', "")
         if url_re.search(stripped):
             raise AssertionError(f"{fname}: unexpected external URL or url() reference")
+        if fname.endswith("-mono.svg"):
+            if "currentColor" not in text:
+                raise AssertionError(f"{fname}: mono SVG must use currentColor")
+            if "#0F172A" in text:
+                raise AssertionError(f"{fname}: mono SVG must not hardcode #0F172A")
 
     # Verify all PNGs and 16x16 contrast & legibility
     raw_16_by_key: Dict[str, bytes] = {}

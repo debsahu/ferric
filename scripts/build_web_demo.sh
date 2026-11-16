@@ -75,6 +75,8 @@ render_demo_shell_html() {
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="FERRIC" />
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png" />
   <title>FERRIC — Live WebGPU Browser Workbench Demo</title>
   <style>
     :root {
@@ -626,6 +628,8 @@ wasm-bindgen \
   "$WASM_BIN"
 
 render_demo_shell_html > "$OUT_DIR/index.html"
+cp "$REPO_ROOT/docs/assets/brand/favicon.svg" "$OUT_DIR/favicon.svg"
+cp "$REPO_ROOT/docs/assets/brand/favicon-32.png" "$OUT_DIR/favicon-32.png"
 touch "$OUT_DIR/.nojekyll"
 
 for expected in "index.html" "ferric_gui.js" "ferric_gui_bg.wasm"; do

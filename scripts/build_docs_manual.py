@@ -2440,6 +2440,8 @@ def render_page_html(
   <meta name="theme-color" content="#0b1120" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#f8fafc" media="(prefers-color-scheme: light)">
   <title>{html.escape(full_title)}</title>
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
   <link rel="stylesheet" href="assets/style.css">
   <script src="assets/search-data.js" defer></script>
   <script src="assets/manual.js" defer></script>
@@ -2517,10 +2519,23 @@ def build_site_files(
     if assets_dir is not None and assets_dir.is_dir():
         for svg_path in sorted(assets_dir.glob("*.svg")):
             files[f"assets/{svg_path.name}"] = svg_path.read_bytes()
+    brand_dir = (
+        assets_dir / "brand"
+        if assets_dir is not None and (assets_dir / "brand").is_dir()
+        else Path(__file__).resolve().parent.parent / "docs" / "assets" / "brand"
+    )
+    for fav_name in ("favicon.svg", "favicon-32.png"):
+        fav_path = brand_dir / fav_name
+        if fav_path.is_file():
+            files[f"assets/{fav_name}"] = fav_path.read_bytes()
 
     has_demo = demo_html_path is not None and demo_html_path.is_file()
     if has_demo and demo_html_path is not None:
         files["demo/index.html"] = demo_html_path.read_bytes()
+        for fav_name in ("favicon.svg", "favicon-32.png"):
+            fav_path = brand_dir / fav_name
+            if fav_path.is_file():
+                files[f"demo/{fav_name}"] = fav_path.read_bytes()
 
     search_payload = [
         {

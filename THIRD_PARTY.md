@@ -60,3 +60,9 @@ All empirical chemical-shift priors, topology tables, and real-protein benchmark
 ## 4. Adapted Open-Source Algorithm Attribution
 
 - **Octet-Draw** (<https://github.com/SamChemMan/Octet-Draw>, Copyright (c) 2026 Sam Ellis, **Apache-2.0**): Chemical graph/stereochemistry layout (`octet_mol`), 1D ¹H/¹³C NMR & exact-mass/IUPAC analytical engines (`octet_analyt`), publication-quality ACS/RSC/JOC/Angewandte vector & raster 2D chemical rendering (`octet_render`), and interactive `egui` canvas workflows (`octet_canvas`) are adapted into pure Rust under the permissive Apache License 2.0.
+
+---
+
+## 5. Brand Assets & Wordmark Provenance
+
+- **FERRIC Brand Suite (`docs/assets/brand/`)**: All icons (`ferric-icon.svg`, `ferric-icon-mono.svg`, `favicon.svg`, `favicon-32.png`), header lockups (`ferric-logo-light.svg`, `ferric-logo-dark.svg`), social preview (`ferric-social-preview.png`), and the `"FERRIC"` geometric `<path>` wordmark (`ferric-wordmark.svg`) are original works generated deterministically by `scripts/render_ferric_brand.py` under the project's **MIT License** (`LICENSE`). Zero external or proprietary OS fonts are referenced or embedded.

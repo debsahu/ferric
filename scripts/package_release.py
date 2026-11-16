@@ -50,7 +50,7 @@ APP_SLUG = "ferric"
 CLI_BIN = "ferric"
 CLI_ALIAS_BIN = "nmrassign"
 GUI_BIN = "ferric-gui"
-BUNDLE_ID = "org.ferric-nmr.desktop"
+BUNDLE_ID = "io.github.debsahu.ferric"
 MACOS_MIN_SYSTEM_VERSION = "13.0"
 DETERMINISTIC_MTIME = 1700000000  # 2023-11-14T22:13:20Z
 DETERMINISTIC_ZIP_DT = (2026, 1, 1, 0, 0, 0)
@@ -242,112 +242,140 @@ def _draw_contour_family(
                 _blend_pixel(buf, size, px, py, core_color[0], core_color[1], core_color[2], 0.96 * cov)
 
 
+def _sdf_rounded_rect(px: float, py: float, x: float, y: float, w: float, h: float, rx: float) -> float:
+    cx = x + 0.5 * w
+    cy = y + 0.5 * h
+    hx = max(0.0, 0.5 * w - rx)
+    hy = max(0.0, 0.5 * h - rx)
+    qx = abs(px - cx) - hx
+    qy = abs(py - cy) - hy
+    return math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - rx
+
+
+def _sdf_segment(px: float, py: float, x1: float, y1: float, x2: float, y2: float, width: float) -> float:
+    bax = x2 - x1
+    bay = y2 - y1
+    denom = bax * bax + bay * bay
+    if denom <= 1e-12:
+        return math.hypot(px - x1, py - y1) - 0.5 * width
+    h = ((px - x1) * bax + (py - y1) * bay) / denom
+    h = 0.0 if h < 0.0 else (1.0 if h > 1.0 else h)
+    return math.hypot((px - x1) - bax * h, (py - y1) - bay * h) - 0.5 * width
+
+
+def _sample_concept_a_fid_pts() -> Tuple[Tuple[float, float], ...]:
+    pts: List[Tuple[float, float]] = []
+    samples = 120
+    for i in range(samples + 1):
+        u = i / samples
+        x = 168.0 + (414.0 - 168.0) * u
+        y = 248.0 - 120.0 * math.exp(-2.7 * u) * math.cos(2.0 * math.pi * 2.5 * u)
+        pts.append((x, y))
+    return tuple(pts)
+
+
 def render_icon_scanlines(size: int) -> bytes:
-    """Deterministically rasterize the ``FERRIC`` icon at ``size x size`` RGBA."""
+    """Deterministically rasterize the canonical Concept A ``FERRIC`` icon at ``size x size`` RGBA."""
     if size <= 0 or size > 2048:
         raise ValueError(f"Unsupported icon dimension: {size}")
 
+    fid_pts = _sample_concept_a_fid_pts()
+    fid_segs = [
+        (
+            fid_pts[i][0],
+            fid_pts[i][1],
+            fid_pts[i + 1][0],
+            fid_pts[i + 1][1],
+            min(fid_pts[i][0], fid_pts[i + 1][0]) - 14.0,
+            max(fid_pts[i][0], fid_pts[i + 1][0]) + 14.0,
+            min(fid_pts[i][1], fid_pts[i + 1][1]) - 14.0,
+            max(fid_pts[i][1], fid_pts[i + 1][1]) + 14.0,
+        )
+        for i in range(len(fid_pts) - 1)
+    ]
+
+    # Colors matching docs/assets/brand/ferric-icon.svg 1-to-1
+    col_bg = (22, 32, 42)          # #16202A
+    col_frame_outer = (183, 65, 14)  # #B7410E
+    col_frame_inner = (217, 91, 38)  # #D95B26
+    col_axis = (71, 85, 105)       # #475569
+    col_f_outer = (183, 65, 14)    # #B7410E
+    col_f_inner = (224, 90, 43)    # #E05A2B
+    col_fid = (251, 146, 60)       # #FB923C
+    col_cap = (254, 215, 170)      # #FED7AA
+
+    def _eval_sample(vx: float, vy: float) -> Optional[Tuple[int, int, int]]:
+        # Top-down layer evaluation (first hit wins)
+        if (vx - 152.0) ** 2 + (vy - 124.0) ** 2 <= 256.0:
+            return col_cap
+
+        if 154.0 <= vx <= 428.0 and 114.0 <= vy <= 333.0:
+            for ax, ay, bx, by, x0, x1, y0, y1 in fid_segs:
+                if x0 <= vx <= x1 and y0 <= vy <= y1:
+                    if _sdf_segment(vx, vy, ax, ay, bx, by, 28.0) <= 0.0:
+                        return col_fid
+
+        if (
+            _sdf_segment(vx, vy, 152.0, 124.0, 152.0, 388.0, 34.0) <= 0.0
+            or _sdf_segment(vx, vy, 152.0, 124.0, 376.0, 124.0, 34.0) <= 0.0
+            or _sdf_segment(vx, vy, 152.0, 248.0, 316.0, 248.0, 28.0) <= 0.0
+        ):
+            return col_f_inner
+
+        if (
+            _sdf_segment(vx, vy, 152.0, 124.0, 152.0, 388.0, 56.0) <= 0.0
+            or _sdf_segment(vx, vy, 152.0, 124.0, 376.0, 124.0, 56.0) <= 0.0
+            or _sdf_segment(vx, vy, 152.0, 248.0, 316.0, 248.0, 48.0) <= 0.0
+        ):
+            return col_f_outer
+
+        if _sdf_segment(vx, vy, 174.0, 248.0, 416.0, 248.0, 10.0) <= 0.0:
+            return col_axis
+
+        d_inner = _sdf_rounded_rect(vx, vy, 44.0, 44.0, 424.0, 424.0, 92.0)
+        if abs(d_inner) <= 4.0:
+            return col_frame_inner
+
+        d_outer = _sdf_rounded_rect(vx, vy, 32.0, 32.0, 448.0, 448.0, 104.0)
+        if abs(d_outer) <= 12.0:
+            return col_frame_outer
+        if d_outer <= 0.0:
+            return col_bg
+        return None
+
+    scale = 512.0 / size
+    edge_pad = 14.0 * scale
+    sub_offsets = (0.125, 0.375, 0.625, 0.875)
     row_stride = 1 + size * 4
     buf = bytearray(size * row_stride)
 
-    margin = 0.0625 * size
-    radius = 0.225 * size
-    inner_lo = margin + radius
-    inner_hi = size - margin - radius
-    border_w = max(0.85, size * 0.018)
-
-    # Precompute 1D corner offsets for fast rounded-rectangle distance field
-    x_corner_dx = [0.0] * size
-    x_norm = [0.0] * size
-    for px in range(size):
-        xc = px + 0.5
-        x_norm[px] = xc / size
-        if xc < inner_lo:
-            x_corner_dx[px] = inner_lo - xc
-        elif xc > inner_hi:
-            x_corner_dx[px] = xc - inner_hi
-
     for py in range(size):
-        yc = py + 0.5
-        yn = yc / size
-        if yc < inner_lo:
-            dy_c = inner_lo - yc
-        elif yc > inner_hi:
-            dy_c = yc - inner_hi
-        else:
-            dy_c = 0.0
-
+        vy_c = (py + 0.5) * scale
         row_off = py * row_stride
-        buf[row_off] = 0  # PNG filter type 0 (None)
-        p_off = row_off + 1
-
+        buf[row_off] = 0
         for px in range(size):
-            dx_c = x_corner_dx[px]
-            if dx_c > 0.0 and dy_c > 0.0:
-                sdf = math.hypot(dx_c, dy_c) - radius
-            else:
-                xc = px + 0.5
-                sdf = max(margin - xc, xc - (size - margin), margin - yc, yc - (size - margin))
-
-            if sdf >= 0.65:
-                p_off += 4
+            vx_c = (px + 0.5) * scale
+            p_off = row_off + 1 + px * 4
+            d_outer_c = _sdf_rounded_rect(vx_c, vy_c, 32.0, 32.0, 448.0, 448.0, 104.0)
+            if d_outer_c > 12.0 + edge_pad:
                 continue
 
-            alpha = 1.0 if sdf <= -0.55 else (0.65 - sdf) / 1.20
-            xn = x_norm[px]
-            diag = 0.55 * xn + 0.45 * yn
-            # Deep midnight-slate to marine-indigo scientific background
-            r = 10.0 + 14.0 * diag
-            g = 17.0 + 24.0 * diag
-            b = 34.0 + 48.0 * diag
-
-            # Subtle inner rim highlight
-            rim_dist = -sdf
-            if 0.0 <= rim_dist <= border_w + 0.8:
-                rim_cov = 1.0 - min(1.0, abs(rim_dist - 0.5 * border_w) / (0.5 * border_w + 0.8))
-                rim_strength = 0.42 * rim_cov
-                r = r * (1.0 - rim_strength) + 56.0 * rim_strength
-                g = g * (1.0 - rim_strength) + 189.0 * rim_strength
-                b = b * (1.0 - rim_strength) + 248.0 * rim_strength
-
-            buf[p_off] = _clamp_u8(r)
-            buf[p_off + 1] = _clamp_u8(g)
-            buf[p_off + 2] = _clamp_u8(b)
-            buf[p_off + 3] = _clamp_u8(alpha * 255.0)
-            p_off += 4
-
-    # Spectral chemical-shift reference grid (F2 1H / F1 15N-13C) for >= 32 px
-    if size >= 32:
-        grid_hw = max(0.004, 0.55 / size)
-        for pos in (0.34, 0.505, 0.67):
-            _draw_segment_aa(buf, size, 0.17, pos, 0.83, pos, grid_hw, (51, 92, 138), 0.30)
-            _draw_segment_aa(buf, size, pos, 0.17, pos, 0.83, grid_hw, (51, 92, 138), 0.30)
-
-    # Sequential backbone spin-walk connectivity pathway: (0.34, 0.66) -> (0.34, 0.35) -> (0.67, 0.35) -> (0.67, 0.66)
-    walk_hw = max(0.016, 0.85 / size)
-    _draw_segment_aa(buf, size, 0.34, 0.66, 0.34, 0.35, walk_hw, (52, 211, 153), 0.88)
-    _draw_segment_aa(buf, size, 0.34, 0.35, 0.67, 0.35, walk_hw, (52, 211, 153), 0.88)
-    _draw_segment_aa(buf, size, 0.67, 0.35, 0.67, 0.66, walk_hw * 0.78, (45, 212, 191), 0.58)
-
-    pos_rings: Tuple[Tuple[float, Tuple[int, int, int], float], ...] = (
-        (1.00, (14, 165, 233), 0.82),
-        (0.66, (56, 189, 248), 0.92),
-        (0.36, (186, 230, 253), 0.96),
-    )
-    neg_rings: Tuple[Tuple[float, Tuple[int, int, int], float], ...] = (
-        (1.00, (234, 88, 12), 0.86),
-        (0.60, (251, 146, 60), 0.94),
-    )
-    sat_rings: Tuple[Tuple[float, Tuple[int, int, int], float], ...] = (
-        (1.00, (6, 182, 212), 0.80),
-        (0.58, (103, 232, 249), 0.92),
-    )
-
-    # Four 2D NMR spin-system cross-peaks (positive cyan + phase-inverted coral)
-    _draw_contour_family(buf, size, 0.34, 0.66, 0.145, 0.105, -22.0, pos_rings, (240, 249, 255))
-    _draw_contour_family(buf, size, 0.67, 0.35, 0.145, 0.105, -22.0, pos_rings, (240, 249, 255))
-    _draw_contour_family(buf, size, 0.34, 0.35, 0.120, 0.090, 20.0, neg_rings, (255, 237, 213))
-    _draw_contour_family(buf, size, 0.67, 0.66, 0.112, 0.086, -18.0, sat_rings, (236, 254, 255))
+            acc_r = acc_g = acc_b = acc_a = 0.0
+            for oy in sub_offsets:
+                vy = (py + oy) * scale
+                for ox in sub_offsets:
+                    vx = (px + ox) * scale
+                    hit = _eval_sample(vx, vy)
+                    if hit is not None:
+                        acc_r += hit[0]
+                        acc_g += hit[1]
+                        acc_b += hit[2]
+                        acc_a += 1.0
+            if acc_a > 0.0:
+                buf[p_off] = _clamp_u8(acc_r / acc_a)
+                buf[p_off + 1] = _clamp_u8(acc_g / acc_a)
+                buf[p_off + 2] = _clamp_u8(acc_b / acc_a)
+                buf[p_off + 3] = _clamp_u8((acc_a / 16.0) * 255.0)
 
     return bytes(buf)
 
@@ -415,67 +443,31 @@ def build_ico(png_by_size: Dict[int, bytes], sizes: Sequence[int] = ICO_SIZES) -
 
 
 def render_icon_svg() -> str:
-    """Render the matching scalable vector ``ferric.svg`` FreeDesktop launcher icon."""
-    return """<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
-  <defs>
-    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#0a1122"/>
-      <stop offset="55%" stop-color="#111d38"/>
-      <stop offset="100%" stop-color="#182952"/>
-    </linearGradient>
-    <radialGradient id="cyanGlow" cx="50%" cy="50%" r="50%">
-      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.34"/>
-      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
-    </radialGradient>
-    <radialGradient id="coralGlow" cx="50%" cy="50%" r="50%">
-      <stop offset="0%" stop-color="#fb923c" stop-opacity="0.30"/>
-      <stop offset="100%" stop-color="#fb923c" stop-opacity="0"/>
-    </radialGradient>
-  </defs>
-  <rect x="32" y="32" width="448" height="448" rx="115" ry="115"
-        fill="url(#bgGrad)" stroke="#38bdf8" stroke-opacity="0.42" stroke-width="8"/>
-  <g stroke="#335c8a" stroke-opacity="0.34" stroke-width="3">
-    <line x1="87" y1="174" x2="425" y2="174"/>
-    <line x1="87" y1="258" x2="425" y2="258"/>
-    <line x1="87" y1="343" x2="425" y2="343"/>
-    <line x1="174" y1="87" x2="174" y2="425"/>
-    <line x1="258" y1="87" x2="258" y2="425"/>
-    <line x1="343" y1="87" x2="343" y2="425"/>
-  </g>
-  <polyline points="174,338 174,179 343,179"
-            fill="none" stroke="#34d399" stroke-width="15"
-            stroke-linecap="round" stroke-linejoin="round" stroke-opacity="0.90"/>
-  <line x1="343" y1="179" x2="343" y2="338"
-        stroke="#2dd4bf" stroke-width="11" stroke-dasharray="16 12"
-        stroke-linecap="round" stroke-opacity="0.65"/>
-  <g transform="translate(174 338) rotate(-22)">
-    <circle cx="0" cy="0" r="82" fill="url(#cyanGlow)"/>
-    <ellipse cx="0" cy="0" rx="74" ry="54" fill="none" stroke="#0ea5e9" stroke-width="7"/>
-    <ellipse cx="0" cy="0" rx="49" ry="36" fill="none" stroke="#38bdf8" stroke-width="7"/>
-    <ellipse cx="0" cy="0" rx="27" ry="19" fill="none" stroke="#bae6fd" stroke-width="7"/>
-    <circle cx="0" cy="0" r="11" fill="#f0f9ff"/>
-  </g>
-  <g transform="translate(343 179) rotate(-22)">
-    <circle cx="0" cy="0" r="82" fill="url(#cyanGlow)"/>
-    <ellipse cx="0" cy="0" rx="74" ry="54" fill="none" stroke="#0ea5e9" stroke-width="7"/>
-    <ellipse cx="0" cy="0" rx="49" ry="36" fill="none" stroke="#38bdf8" stroke-width="7"/>
-    <ellipse cx="0" cy="0" rx="27" ry="19" fill="none" stroke="#bae6fd" stroke-width="7"/>
-    <circle cx="0" cy="0" r="11" fill="#f0f9ff"/>
-  </g>
-  <g transform="translate(174 179) rotate(20)">
-    <circle cx="0" cy="0" r="68" fill="url(#coralGlow)"/>
-    <ellipse cx="0" cy="0" rx="61" ry="46" fill="none" stroke="#ea580c" stroke-width="7"/>
-    <ellipse cx="0" cy="0" rx="37" ry="28" fill="none" stroke="#fb923c" stroke-width="7"/>
-    <circle cx="0" cy="0" r="10" fill="#ffedd5"/>
-  </g>
-  <g transform="translate(343 338) rotate(-18)">
-    <ellipse cx="0" cy="0" rx="57" ry="44" fill="none" stroke="#06b6d4" stroke-width="6.5"/>
-    <ellipse cx="0" cy="0" rx="33" ry="25" fill="none" stroke="#67e8f9" stroke-width="6.5"/>
-    <circle cx="0" cy="0" r="9.5" fill="#ecfeff"/>
-  </g>
-</svg>
-"""
+    """Render the matching scalable vector ``ferric.svg`` FreeDesktop launcher icon (Concept A)."""
+    pts = _sample_concept_a_fid_pts()
+    cmd_parts = [f"M {pts[0][0]:.2f}".rstrip("0").rstrip(".") + f" {pts[0][1]:.2f}".rstrip("0").rstrip(".")]
+    for px, py in pts[1:]:
+        sx = f"{px:.2f}".rstrip("0").rstrip(".")
+        sy = f"{py:.2f}".rstrip("0").rstrip(".")
+        cmd_parts.append(f"L {sx} {sy}")
+    d_str = " ".join(cmd_parts)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img">\n'
+        "  <title>FERRIC Icon</title>\n"
+        '  <rect x="32" y="32" width="448" height="448" rx="104" ry="104" fill="#16202A" stroke="#B7410E" stroke-width="24"/>\n'
+        '  <rect x="44" y="44" width="424" height="424" rx="92" ry="92" fill="none" stroke="#D95B26" stroke-width="8"/>\n'
+        '  <line x1="174" y1="248" x2="416" y2="248" stroke="#475569" stroke-width="10" stroke-linecap="round"/>\n'
+        '  <line x1="152" y1="124" x2="152" y2="388" stroke="#B7410E" stroke-width="56" stroke-linecap="round"/>\n'
+        '  <line x1="152" y1="124" x2="376" y2="124" stroke="#B7410E" stroke-width="56" stroke-linecap="round"/>\n'
+        '  <line x1="152" y1="248" x2="316" y2="248" stroke="#B7410E" stroke-width="48" stroke-linecap="round"/>\n'
+        '  <line x1="152" y1="124" x2="152" y2="388" stroke="#E05A2B" stroke-width="34" stroke-linecap="round"/>\n'
+        '  <line x1="152" y1="124" x2="376" y2="124" stroke="#E05A2B" stroke-width="34" stroke-linecap="round"/>\n'
+        '  <line x1="152" y1="248" x2="316" y2="248" stroke="#E05A2B" stroke-width="28" stroke-linecap="round"/>\n'
+        f'  <path d="{d_str}" fill="none" stroke="#FB923C" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>\n'
+        '  <circle cx="152" cy="124" r="16" fill="#FED7AA"/>\n'
+        "</svg>\n"
+    )
 
 
 def validate_png_bytes(data: bytes, expected_size: int) -> None:
@@ -831,12 +823,19 @@ ICON_SVG_DIR="${DATA_DIR}/icons/hicolor/scalable/apps"
 ICON_PNG_DIR="${DATA_DIR}/icons/hicolor/256x256/apps"
 
 if [[ "${UNINSTALL}" -eq 1 ]]; then
-  rm -f "${BIN_DIR}/ferric-gui" "${BIN_DIR}/ferric" "${BIN_DIR}/nmrassign"
-  rm -f "${APP_DIR}/ferric.desktop"
-  rm -f "${ICON_SVG_DIR}/ferric.svg" "${ICON_PNG_DIR}/ferric.png"
+  rm -f "${BIN_DIR}/ferric-gui" "${BIN_DIR}/ferric" "${BIN_DIR}/nmrassign" "${BIN_DIR}/nmrassign-gui"
+  rm -f "${APP_DIR}/ferric.desktop" "${APP_DIR}/nmr-assign.desktop"
+  rm -f "${ICON_SVG_DIR}/ferric.svg" "${ICON_SVG_DIR}/nmr-assign.svg"
+  rm -f "${ICON_PNG_DIR}/ferric.png" "${DATA_DIR}"/icons/hicolor/*/apps/nmr-assign.png
   echo "Uninstalled FERRIC from ${PREFIX_DIR}"
   exit 0
 fi
+
+# Clean up legacy v0.13.0 launcher/icons/GUI binary if upgrading in place
+rm -f "${BIN_DIR}/nmrassign-gui"
+rm -f "${APP_DIR}/nmr-assign.desktop"
+rm -f "${ICON_SVG_DIR}/nmr-assign.svg"
+rm -f "${DATA_DIR}"/icons/hicolor/*/apps/nmr-assign.png
 
 mkdir -p "${BIN_DIR}" "${APP_DIR}" "${ICON_SVG_DIR}" "${ICON_PNG_DIR}"
 install -m 0755 "${SCRIPT_DIR}/bin/ferric-gui" "${BIN_DIR}/ferric-gui"
@@ -1339,7 +1338,9 @@ def run_self_test(repo_root: Path) -> int:
         tmp_path = Path(tmp)
         icons_dir = tmp_path / "icons"
         emitted = emit_icon_suite(icons_dir)
-        # Verify deterministic byte-identical icon generation
+        # Verify deterministic byte-identical icon generation & explicit 512px scanline determinism
+        if render_icon_scanlines(512) != render_icon_scanlines(512):
+            raise AssertionError("Non-deterministic 512px scanline raster")
         icons_dir_2 = tmp_path / "icons_repeat"
         emitted_2 = emit_icon_suite(icons_dir_2)
         for key, p1 in emitted.items():
@@ -1466,12 +1467,25 @@ def run_self_test(repo_root: Path) -> int:
                 else:
                     tf.extractall(extract_dir)
                 xdg_prefix = tmp_path / "xdg_local"
+                # Stage a legacy v0.13.0 layout to verify upgrade cleanup (18.2:P2-2)
+                legacy_bin = xdg_prefix / "bin" / "nmrassign-gui"
+                legacy_desktop = xdg_prefix / "share" / "applications" / "nmr-assign.desktop"
+                legacy_svg = xdg_prefix / "share" / "icons" / "hicolor" / "scalable" / "apps" / "nmr-assign.svg"
+                legacy_png_256 = xdg_prefix / "share" / "icons" / "hicolor" / "256x256" / "apps" / "nmr-assign.png"
+                legacy_png_128 = xdg_prefix / "share" / "icons" / "hicolor" / "128x128" / "apps" / "nmr-assign.png"
+                for lp in (legacy_bin, legacy_desktop, legacy_svg, legacy_png_256, legacy_png_128):
+                    lp.parent.mkdir(parents=True, exist_ok=True)
+                    lp.write_text("legacy-v0.13.0\n", encoding="utf-8")
+
                 subprocess.run(
                     ["bash", str(extract_dir / lin_prefix / "install-desktop.sh"), "--prefix", str(xdg_prefix)],
                     check=True,
                     capture_output=True,
                     text=True,
                 )
+                for lp in (legacy_bin, legacy_desktop, legacy_svg, legacy_png_256, legacy_png_128):
+                    if lp.exists():
+                        raise AssertionError(f"Legacy v0.13.0 file not removed on upgrade: {lp}")
                 installed_desktop = xdg_prefix / "share" / "applications" / f"{APP_SLUG}.desktop"
                 if (
                     not (xdg_prefix / "bin" / GUI_BIN).is_file()
