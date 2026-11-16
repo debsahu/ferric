@@ -1,12 +1,12 @@
 # Chapter 6: MCP Integration, CLI & Keyboard Reference
 
-This chapter serves as the complete reference for the `nmrassign` command-line interface, the clean-room **Model Context Protocol (`MCP`)** server and authenticated desktop workbench bridge (`nmr-core::mcp`, `nmr-gui::mcp_bridge`), and interactive keyboard accelerators (`nmr-gui::keymap`).
+This chapter serves as the complete reference for the `ferric` command-line interface, the clean-room **Model Context Protocol (`MCP`)** server and authenticated desktop workbench bridge (`nmr-core::mcp`, `nmr-gui::mcp_bridge`), and interactive keyboard accelerators (`nmr-gui::keymap`).
 
 ---
 
-## `nmrassign` CLI Subcommand Reference
+## `ferric` CLI Subcommand Reference
 
-Every `nmrassign` subcommand runs deterministically on macOS, Linux, and Windows (`--version` / `-V` prints the semantic version and embedded short Git SHA). Engine flags accept `--engine gpu` (WebGPU: Metal/Vulkan/DX12), `--engine cpu` (`f64` multi-threaded CPU), or `--engine auto` (hardware WebGPU with graceful CPU fallback).
+Every `ferric` subcommand (with `nmrassign` retained as a deprecated `v0.14.x` compatibility alias emitting one stderr warning; removed in `v0.15.0`) runs deterministically on macOS, Linux, and Windows (`--version` / `-V` prints the semantic version and embedded short Git SHA). Engine flags accept `--engine gpu` (WebGPU: Metal/Vulkan/DX12), `--engine cpu` (`f64` multi-threaded CPU), or `--engine auto` (hardware WebGPU with graceful CPU fallback).
 
 ### Summary of Subcommands
 
@@ -36,10 +36,10 @@ Every `nmrassign` subcommand runs deterministically on macOS, Linux, and Windows
 
 ```bash
 # Classify all nested Bruker / Varian experiments as human-readable table or JSON
-nmrassign inspect ./data/study_dir [--json]
+ferric inspect ./data/study_dir [--json]
 
 # Process uniform or NUS 2D/3D raw FIDs into .ft2 / .ft3 or Bruker pdata
-nmrassign process \
+ferric process \
   --in ./data/study_dir/3 \
   --out ./out/hncacb.ft3 \
   --exp HNCACB \
@@ -47,7 +47,7 @@ nmrassign process \
   [--lp] [--auto-phase] [--phase-x 0:0] [--hilbert] [--nus-method fista|ist]
 
 # Pick peaks from processed spectra OR directly from raw FID directories
-nmrassign pick \
+ferric pick \
   --fid-hsqc ./data/study_dir/2 \
   --fid-triple HNCACB=./data/study_dir/3 \
   --fid-triple CBCACONH=./data/study_dir/4 \
@@ -60,7 +60,7 @@ nmrassign pick \
 
 ```bash
 # Multi-regime backbone assignment (globular | idp-13c | paramagnetic)
-nmrassign assign \
+ferric assign \
   --peaks ./out/peaks.tsv \
   --seq ./data/protein.fasta \
   --out ./out/assigned \
@@ -71,7 +71,7 @@ nmrassign assign \
   [--nef-out ./out/session.nef] [--report-out ./out/report.html] [--json-out ./out/qc.json]
 
 # Aliphatic, aromatic, and stereospecific prochiral sidechain assignment
-nmrassign sidechain \
+ferric sidechain \
   --star ./out/assigned.str \
   --peaks ./out/sidechain_peaks.tsv \
   [--aromatic] [--ph 6.8] [--his-hmqc ./data/his.ft2] \
@@ -80,7 +80,7 @@ nmrassign sidechain \
   --out ./out/all_atom.str
 
 # Supramolecular 13C-Methyl TROSY contact-graph assignment
-nmrassign methyl \
+ferric methyl \
   --pdb ./data/template.pdb \
   --hmqc ./data/methyl_hmqc.ft2 \
   --noesy ./data/methyl_noesy_3d.ft3 \
@@ -89,7 +89,7 @@ nmrassign methyl \
   -o ./out/methyl_assigned.str
 
 # IDP Secondary Structure Propensity (SSP + 4-state delta2D populations)
-nmrassign propensity \
+ferric propensity \
   --shifts ./out/idp_assigned.str \
   --temp-k 298.15 --ph 7.0 --format tsv \
   -o ./out/propensity.tsv
@@ -99,13 +99,13 @@ nmrassign propensity \
 
 ```bash
 # Post-assignment 3/9-mer torsion prediction (chi1 omitted unless --include-chi1)
-nmrassign torsions \
+ferric torsions \
   --shifts ./out/all_atom.str \
   -o ./out/torsions.tsv \
   [--include-chi1] [--exclude-pdb 1UBQ,1D3Z] [--exclude-bmrb 17769]
 
 # 3D NOESY + torsion + multi-medium Saupe RDC folding (default 20% RdcFree holdout)
-nmrassign structure \
+ferric structure \
   --star ./out/all_atom.str \
   --noesy-peaks ./data/noesy_3d.tsv \
   --rdc ./data/rdcs.tsv \
@@ -115,7 +115,7 @@ nmrassign structure \
   --out-pdb ./out/ensemble.pdb
 
 # Generate standalone HTML+SVG quality report
-nmrassign report \
+ferric report \
   --shifts ./out/all_atom.str \
   --peaks ./out/peaks.tsv \
   --pdb ./out/ensemble.pdb \
@@ -123,7 +123,7 @@ nmrassign report \
   --out ./out/quality_report.html
 
 # Single-command end-to-end workflow (raw FIDs/spectra/peaks + sequence -> STAR + NEF + HTML report)
-nmrassign pipeline \
+ferric pipeline \
   --seq ./data/protein.fasta \
   --fid-hsqc ./data/study_dir/2 \
   --fid-triple HNCACB=./data/study_dir/3 \
@@ -132,8 +132,8 @@ nmrassign pipeline \
   [--solver evo-graph] [--engine auto] [--fold]
 
 # Lossless NEF v1.1 round-trip interchange
-nmrassign nef-export --star ./out/all_atom.str --peaks ./out/peaks.tsv --out ./out/project.nef
-nmrassign nef-import --in ./out/project.nef --out-star ./out/reloaded.str --out-peaks ./out/reloaded.tsv
+ferric nef-export --star ./out/all_atom.str --peaks ./out/peaks.tsv --out ./out/project.nef
+ferric nef-import --in ./out/project.nef --out-star ./out/reloaded.str --out-peaks ./out/reloaded.tsv
 ```
 
 #### 4. Dynamics, Chemical Exchange, 1D `qNMR`, `DOSY` & Metabolomics
@@ -142,32 +142,32 @@ See [Chapter 4: Relaxation Dynamics, CEST, CPMG & CSP](04-dynamics-and-exchange.
 
 ```bash
 # Batched GPU R1, R2, R1rho or steady-state {1H}-15N hetNOE curve fitting + reduced J(omega)
-nmrassign relax \
+ferric relax \
   --series ./data/ubq_r1_600 \
   --kind r1 --field-mhz 600.0 --mc-trials 500 --engine gpu \
   --out ./out/r1_600.tsv
 
 # Lipari-Szabo / Mandel-Akke-Palmer M1-M5 model-free & anisotropic diffusion tensor fit
-nmrassign modelfree \
+ferric modelfree \
   --r1 ./out/r1_600.tsv --r2 ./out/r2_600.tsv --hetnoe ./out/noe_600.tsv \
   --r1 ./out/r1_800.tsv --r2 ./out/r2_800.tsv --hetnoe ./out/noe_800.tsv \
   --pdb ./data/template.pdb --diffusion auto --criterion aicc \
   --out ./out/modelfree.tsv
 
 # Homogeneous Padé [6/6] Bloch-McConnell 15N/13C CEST & DEST excited-state fitting
-nmrassign cest \
+ferric cest \
   --in ./data/cest_15hz.tsv --in ./data/cest_30hz.tsv \
   --states 2 --b1-quad 5 --engine gpu \
   --out ./out/cest_fit.tsv
 
 # Exact Baldwin (2014) / Carver-Richards multi-field CPMG relaxation dispersion
-nmrassign cpmg \
+ferric cpmg \
   --in ./data/cpmg_600.tsv --in ./data/cpmg_800.tsv \
   --model baldwin2014 --engine gpu \
   --out ./out/cpmg_fit.tsv
 
 # Fast-exchange HSQC/HMQC ligand titration trajectory tracking & exact quadratic tight-binding Kd
-nmrassign csp \
+ferric csp \
   --apo-peaks ./data/apo_hsqc.tsv \
   --step 20=./data/hsqc_20um.tsv --step 50=./data/hsqc_50um.tsv \
   --step 100=./data/hsqc_100um.tsv --step 250=./data/hsqc_250um.tsv \
@@ -175,82 +175,82 @@ nmrassign csp \
   --out ./out/csp_kd.tsv
 
 # Analytical 1D DSP, Voigt/Hoye J-trees, journal export & NIST-traceable GUM qNMR purity
-nmrassign nmr1d process --in ./data/compound_1h/1 --solvent CDCl3 --hsvd --deconvolve --out ./out/spec1d.tsv
-nmrassign nmr1d multiplet --in ./out/spec1d.tsv --solvent CDCl3 --style acs --out ./out/multiplets.tsv --report-out ./out/multiplets.txt
-nmrassign nmr1d qnmr --in ./out/spec1d.tsv \
+ferric nmr1d process --in ./data/compound_1h/1 --solvent CDCl3 --hsvd --deconvolve --out ./out/spec1d.tsv
+ferric nmr1d multiplet --in ./out/spec1d.tsv --solvent CDCl3 --style acs --out ./out/multiplets.tsv --report-out ./out/multiplets.txt
+ferric nmr1d qnmr --in ./out/spec1d.tsv \
   --std-crm DMSO2 --std-mass-mg 5.12 --std-purity 0.9994 --std-region 3.05:2.95 \
   --analyte-mass-mg 12.40 --analyte-mw 180.16 --analyte-region 2.42:2.28:3:Ac \
   --out ./out/qnmr.tsv --json-out ./out/qnmr_report.json
 
 # Pseudo-2D Stejskal-Tanner / Wu-Johnson BPP-LED DOSY (default BIC fit; opt-in Tikhonov ILT & MW)
-nmrassign dosy fit --in ./data/mixture_decay.tsv --exp-dir ./data/mixture_dosy/10 --criterion bic --solvent CDCl3 --temp-k 298.15 --engine auto --out ./out/dosy_bic.tsv
-nmrassign dosy ilt --in ./data/mixture_decay.tsv --exp-dir ./data/mixture_dosy/10 --strategy gcv --out ./out/dosy_ilt.tsv
-nmrassign dosy mw --d 7.8e-10 --solvent CDCl3 --temp-k 298.15
+ferric dosy fit --in ./data/mixture_decay.tsv --exp-dir ./data/mixture_dosy/10 --criterion bic --solvent CDCl3 --temp-k 298.15 --engine auto --out ./out/dosy_bic.tsv
+ferric dosy ilt --in ./data/mixture_decay.tsv --exp-dir ./data/mixture_dosy/10 --strategy gcv --out ./out/dosy_ilt.tsv
+ferric dosy mw --d 7.8e-10 --solvent CDCl3 --temp-k 298.15
 
 # Untargeted 1D Metabolomics: AI-Binning + PQN, PCA Hotelling T^2/Q, k-fold OPLS-DA & STOCSY
-nmrassign metabolomics bin --manifest cohort_manifest.tsv -o cohort_buckets.csv --study-out cohort_study.json --method aib --norm pqn --align auto --max-shift 0.025 --mask urine
-nmrassign metabolomics pca --in cohort_buckets.csv -o pca_report.json --components 3 --scale pareto
-nmrassign metabolomics oplsda --in cohort_buckets.csv --biomarkers-out oplsda_biomarkers.csv -o oplsda_summary.json --ortho 1 --scale pareto --cv-folds 7 --permutations 200
-nmrassign metabolomics stocsy --in cohort_buckets.csv --driver-ppm 1.33 --min-r2 0.80 -o stocsy_1p33ppm.json
+ferric metabolomics bin --manifest cohort_manifest.tsv -o cohort_buckets.csv --study-out cohort_study.json --method aib --norm pqn --align auto --max-shift 0.025 --mask urine
+ferric metabolomics pca --in cohort_buckets.csv -o pca_report.json --components 3 --scale pareto
+ferric metabolomics oplsda --in cohort_buckets.csv --biomarkers-out oplsda_biomarkers.csv -o oplsda_summary.json --ortho 1 --scale pareto --cv-folds 7 --permutations 200
+ferric metabolomics stocsy --in cohort_buckets.csv --driver-ppm 1.33 --min-r2 0.80 -o stocsy_1p33ppm.json
 ```
 
 #### 5. `chem`, `export-fig`, `serve`, `mcp`, `mcp-config` & Reproducible Benchmark Suites
 
 ```bash
 # Print version & embedded Git SHA
-nmrassign --version
+ferric --version
 
 # 2D chemical rendering, IUPAC <-> Structure, and 1D JCAMP-DX synthesis
-nmrassign chem --smiles "CN1C=NC2=C1C(=O)N(C(=O)N2C)C" --solvent CDCl3 --mhz 600 --out caffeine.svg
+ferric chem --smiles "CN1C=NC2=C1C(=O)N(C(=O)N2C)C" --solvent CDCl3 --mhz 600 --out caffeine.svg
 
 # Deterministic publication-ready SVG figure showcase across all 8 workbench modalities
-nmrassign export-fig --out-dir docs/assets [--panel all|hsqc|strips|pdb-s2|nmr1d-stack|dosy|metabolomics|exchange|octet]
+ferric export-fig --out-dir docs/assets [--panel all|hsqc|strips|pdb-s2|nmr1d-stack|dosy|metabolomics|exchange|octet]
 
 # Self-hosted loopback HTTP REST job service & browser dashboard
-nmrassign serve --bind 127.0.0.1:8080 --storage ./jobs
+ferric serve --bind 127.0.0.1:8080 --storage ./jobs
 
 # Sandboxed JSON-RPC 2.0 MCP server (default --mode read-only; prefer NMR_MCP_BEARER_TOKEN >= 32 chars over ps-visible --token argv;
 # omitting both on --transport http auto-generates a 256-bit 64-hex-char OS CSPRNG token emitted on stderr) & client config generator
-nmrassign mcp --transport stdio --root ./project_dir --mode read-only
-NMR_MCP_BEARER_TOKEN="<32+-char-session-token>" nmrassign mcp --transport http --bind 127.0.0.1:54912 --root ./project_dir --mode read-only
-nmrassign mcp --transport http --bind 127.0.0.1:0 --root ./project_dir --mode read-only
-NMR_MCP_BEARER_TOKEN="<32+-char-session-token>" nmrassign mcp-config --client antigravity --bridge-port 54912 --mode read-only
-nmrassign mcp-config --client antigravity --root ./project_dir --mode read-only
+ferric mcp --transport stdio --root ./project_dir --mode read-only
+NMR_MCP_BEARER_TOKEN="<32+-char-session-token>" ferric mcp --transport http --bind 127.0.0.1:54912 --root ./project_dir --mode read-only
+ferric mcp --transport http --bind 127.0.0.1:0 --root ./project_dir --mode read-only
+NMR_MCP_BEARER_TOKEN="<32+-char-session-token>" ferric mcp-config --client antigravity --bridge-port 54912 --mode read-only
+ferric mcp-config --client antigravity --root ./project_dir --mode read-only
 
 # Rate-limited (<= 1 req/s) CC0 BMRB downloader writing SHA-256 PROVENANCE.md
-nmrassign fetch-bmrb --id 17769 --dest ./data/private/bmrb/17769
+ferric fetch-bmrb --id 17769 --dest ./data/private/bmrb/17769
 
 # Recompute amino-acid chemical shift priors JSON & run realistic Bruker 3D physics simulation
-nmrassign priors --stars ./data/reference_stars --out ./out/custom_priors.json
-nmrassign simulate --star data/fixtures/synthetic_ubiquitin.str --realistic --spectra-dir ./out/sim_cubes --out ./out/sim_peaks.tsv --seed 0
+ferric priors --stars ./data/reference_stars --out ./out/custom_priors.json
+ferric simulate --star data/fixtures/synthetic_ubiquitin.str --realistic --spectra-dir ./out/sim_cubes --out ./out/sim_peaks.tsv --seed 0
 
 # Permutation-invariant shift scoring, 5-seed realistic gate, multi-protein suite, E2E CNN gate & real-FID evaluation
-nmrassign score --pred ./out/assigned.str --truth ./data/ref.str --hc 0.80
-nmrassign benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5
-nmrassign benchmark-suite --manifest data/benchmark/manifest.tsv --solver evo-graph --seed 0
-nmrassign e2e-benchmark --star data/fixtures/synthetic_ubiquitin.str --noise 1.0 --seed 42
-nmrassign real-benchmark --manifest data/benchmark/real_manifest.tsv --split dev --solver evo-graph --seeds 5
+ferric score --pred ./out/assigned.str --truth ./data/ref.str --hc 0.80
+ferric benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5
+ferric benchmark-suite --manifest data/benchmark/manifest.tsv --solver evo-graph --seed 0
+ferric e2e-benchmark --star data/fixtures/synthetic_ubiquitin.str --noise 1.0 --seed 42
+ferric real-benchmark --manifest data/benchmark/real_manifest.tsv --split dev --solver evo-graph --seeds 5
 ```
 
 ---
 
 ## Model Context Protocol (`MCP`) Server & Live Desktop Bridge
 
-`nmr-assign` implements the open **Model Context Protocol (`MCP`, JSON-RPC 2.0)** specification in pure safe Rust (`serde`, `serde_json`, `std::io`, `std::net`—zero external SDK or image-encoding crates) across two complementary transports:
+FERRIC implements the open **Model Context Protocol (`MCP`, JSON-RPC 2.0)** specification in pure safe Rust (`serde`, `serde_json`, `std::io`, `std::net`—zero external SDK or image-encoding crates) across two complementary transports:
 
 > [!IMPORTANT] MCP Validation Scope (In-Process / Subprocess Protocol Self-Consistency)
-> JSON-RPC 2.0 framing (`stdio` newline & `Content-Length` pre-allocation caps), canonicalized path sandboxing, loopback HTTP bearer-token (`>= 32`-character floor, `NMR_MCP_BEARER_TOKEN` environment injection, and 256-bit OS CSPRNG auto-generation on Unix `/dev/urandom` & Windows `BCryptGenRandom`) / DNS-rebinding guards, `256`-step Undo curation reversibility, and RFC 2083 viewport `PNG` encoding are verified via deterministic Rust unit tests and `nmrassign mcp` CLI subprocess E2E tests (`0` live interactive GUI sessions against external Antigravity, Claude Desktop, or Cursor binaries are executed in automated CI; live external client smoke testing is tracked openly under follow-up **`F18`**).
+> JSON-RPC 2.0 framing (`stdio` newline & `Content-Length` pre-allocation caps), canonicalized path sandboxing, loopback HTTP bearer-token (`>= 32`-character floor, `NMR_MCP_BEARER_TOKEN` environment injection, and 256-bit OS CSPRNG auto-generation on Unix `/dev/urandom` & Windows `BCryptGenRandom`) / DNS-rebinding guards, `256`-step Undo curation reversibility, and RFC 2083 viewport `PNG` encoding are verified via deterministic Rust unit tests and `ferric mcp` CLI subprocess E2E tests (`0` live interactive GUI sessions against external Antigravity, Claude Desktop, or Cursor binaries are executed in automated CI; live external client smoke testing is tracked openly under follow-up **`F18`**).
 
 | Transport Mode | Implementation | Ideal Use Case |
 | :--- | :--- | :--- |
 | **Headless `stdio` Server** (`StdioCli`) | `nmr-core::mcp` (`run_mcp_stdio_loop`) | Autonomous workspace inspection, QC triage, peak/NMR-STAR analysis, and homolog-firewalled torsion prediction inside CLI/IDE coding agents. Auto-detects both newline-delimited JSON-RPC and `Content-Length` framing (`<= 16 MiB` frame cap). |
-| **Live Desktop HTTP Bridge** (`HttpBridge`) | `nmr-gui::mcp_bridge` (`127.0.0.1:<port>`) | Interactive human-in-the-loop spectroscopist pairing with the running `nmr-gui` desktop workbench: inspect active strip crosshairs, navigate to ambiguous residues, propose **Undo-safe (`Cmd/Ctrl+Z`)** curation edits, and stream live `image/png` viewport snapshots. |
+| **Live Desktop HTTP Bridge** (`HttpBridge`) | `nmr-gui::mcp_bridge` (`127.0.0.1:<port>`) | Interactive human-in-the-loop spectroscopist pairing with the running `ferric-gui` desktop workbench: inspect active strip crosshairs, navigate to ambiguous residues, propose **Undo-safe (`Cmd/Ctrl+Z`)** curation edits, and stream live `image/png` viewport snapshots. |
 
 ---
 
 ### Setting Up Antigravity, Claude Desktop & Cursor
 
-Client JSON configurations can be generated programmatically via `generate_mcp_client_config` (`nmrassign mcp-config`) or copied in one click from the **`🔌 MCP Bridge`** panel inside `nmr-gui`.
+Client JSON configurations can be generated programmatically via `generate_mcp_client_config` (`ferric mcp-config`) or copied in one click from the **`🔌 MCP Bridge`** panel inside `nmr-gui`.
 
 #### 1. Headless `stdio` Mode (`ReadOnly` Default)
 
@@ -259,8 +259,8 @@ Add the following block to your client's `mcpServers` configuration file (for **
 ```json
 {
   "mcpServers": {
-    "nmr-assign": {
-      "command": "/opt/nmr-assign/bin/nmrassign",
+    "ferric": {
+      "command": "/opt/ferric/bin/ferric",
       "args": [
         "mcp",
         "--transport",
@@ -279,14 +279,14 @@ Add the following block to your client's `mcpServers` configuration file (for **
 
 #### 2. Live `nmr-gui` Desktop Loopback Bridge Mode (`HttpBridge`)
 
-1. Open `nmr-gui` on your desktop, navigate to the **`🔌 MCP Bridge`** panel, choose **`ReadOnly`** (default) or **`ReadWrite`**, and click **Start Local Bridge**.
+1. Open `ferric-gui` on your desktop, navigate to the **`🔌 MCP Bridge`** panel, choose **`ReadOnly`** (default) or **`ReadWrite`**, and click **Start Local Bridge**.
 2. `nmr-gui` binds strictly to `127.0.0.1:<port>` (ephemeral loopback port by default) and generates a fresh 256-bit OS CSPRNG session bearer token (`nmr_mcp_<64-hex>`, drawn from `/dev/urandom` on Unix and Windows CNG `BCryptGenRandom` on Windows).
 3. Click **Copy MCP Config** for **Antigravity**, **Claude Desktop**, or **Cursor**, which produces:
 
 ```json
 {
   "mcpServers": {
-    "nmrassign-workbench": {
+    "ferric-workbench": {
       "url": "http://127.0.0.1:54912/mcp",
       "headers": {
         "Authorization": "Bearer <session-bearer-token>"
@@ -308,9 +308,9 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
    - Blocks access to hidden credential and secret locations (`.ssh`, `.aws`, `.gnupg`, `.env`, `.env.*`, `.netrc`, `.kube`, `id_rsa`, `id_ed25519`).
    - Canonicalizes every configured `allowed_root` and target path via `std::fs::canonicalize`, blocking symlinks or dangling links escaping `--root`, and formats responses as workspace-relative paths so host user home directories are never leaked.
 3. **Loopback-Only Binding, 256-Bit CSPRNG / `>= 32`-Char Bearer Floor & DNS-Rebinding Defense**:
-   - Both `nmr-gui` and `nmrassign mcp --transport http` refuse non-loopback bind addresses (`0.0.0.0`, LAN IPs, `[::]`).
+   - Both `ferric-gui` and `ferric mcp --transport http` refuse non-loopback bind addresses (`0.0.0.0`, LAN IPs, `[::]`).
    - Every HTTP request must carry `Authorization: Bearer <token>` verified via non-branching constant-time byte comparison (`401 Unauthorized`), a loopback `Host` header (`127.0.0.1`, `[::1]`, or `localhost`), and **zero** cross-origin browser `Origin` headers (`403 Forbidden`), defeating local browser CSRF and DNS-rebinding attacks.
-   - For headless `nmrassign mcp --transport http` and `nmrassign mcp-config --bridge-port`, strongly prefer injecting `NMR_MCP_BEARER_TOKEN` via environment variables rather than passing `--token <bearer>` in `ps`-visible process `argv`. Any user-supplied token (`NMR_MCP_BEARER_TOKEN` or `--token`) must be at least **`32` trimmed characters** (`MIN_HTTP_BEARER_TOKEN_LEN = 32`, returning an error on shorter secrets); omitting both `NMR_MCP_BEARER_TOKEN` and `--token` on `nmrassign mcp --transport http` automatically generates a fresh 256-bit (`64`-hex-char) OS CSPRNG bearer token (`/dev/urandom` on Unix, Windows CNG `BCryptGenRandom` on Windows) and emits `MCP_HTTP_BEARER_TOKEN <hex64>` on `stderr` while keeping `stdout` clean.
+   - For headless `ferric mcp --transport http` and `ferric mcp-config --bridge-port`, strongly prefer injecting `NMR_MCP_BEARER_TOKEN` via environment variables rather than passing `--token <bearer>` in `ps`-visible process `argv`. Any user-supplied token (`NMR_MCP_BEARER_TOKEN` or `--token`) must be at least **`32` trimmed characters** (`MIN_HTTP_BEARER_TOKEN_LEN = 32`, returning an error on shorter secrets); omitting both `NMR_MCP_BEARER_TOKEN` and `--token` on `ferric mcp --transport http` automatically generates a fresh 256-bit (`64`-hex-char) OS CSPRNG bearer token (`/dev/urandom` on Unix, Windows CNG `BCryptGenRandom` on Windows) and emits `MCP_HTTP_BEARER_TOKEN <hex64>` on `stderr` while keeping `stdout` clean.
 4. **100% Reversible AI Curation (`256`-Step `McpUndoLog`)**:
    - In `nmr-gui`, all 9 live workbench operations (`get_workbench_state`, `capture_viewport_png`, `undo_last_ai_edit`, plus the 3 `navigate_workbench` actions and 3 `propose_curation_edit` actions) synchronize safely with the render thread; mutating commands (`AssignSpinSystemToResidue`, `UnassignResidue`, `TogglePeakExclusion`, `JumpToResidue`, `SetCrosshairPpm`, `HighlightResidues3d`) execute exclusively through `McpUndoLog` (`MAX_MCP_UNDO_DEPTH = 256`), preserving bijective `(cluster_id <-> seq_id)` displacements so pressing **`Cmd/Ctrl+Z`** (or calling `undo_last_ai_edit`) restores the exact prior state in one step.
 
@@ -365,7 +365,7 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
 
 ## Interactive Workbench Keyboard Shortcuts
 
-`nmr-gui` features a deterministic finite-state two-key NMR chord dispatcher (`450 ms` inter-key timeout; press `Esc` to cancel a pending prefix). Single- and two-key chords automatically stand down whenever a text input field or the `Octet` 2D Chemical Studio canvas holds focus.
+`ferric-gui` features a deterministic finite-state two-key NMR chord dispatcher (`450 ms` inter-key timeout; press `Esc` to cancel a pending prefix). Single- and two-key chords automatically stand down whenever a text input field or the `Octet` 2D Chemical Studio canvas holds focus.
 
 ### Two-Key & Single-Key NMR Spectrum Accelerators
 

@@ -1,19 +1,19 @@
-# nmr-assign
+# FERRIC
 
-**Open-source Rust + WebGPU workbench for automated protein NMR resonance assignment, spin dynamics, analytical 1D/qNMR, DOSY diffusion, untargeted metabolomics, 2D chemical depiction, and sandboxed AI copilot workflows.**
+**F**ID-to-structure **E**ngine for **R**elaxation, **R**esonance assignment, **I**ntegration & **C**hemometrics — an open-source Rust + WebGPU workbench for automated protein NMR resonance assignment, spin dynamics, analytical 1D/qNMR, DOSY diffusion, untargeted metabolomics, 2D chemical depiction, and sandboxed AI copilot workflows.
 
 [![Licence: MIT](https://img.shields.io/badge/licence-MIT%20%2B%20Apache--2.0-blue.svg)](THIRD_PARTY.md)
 [![Rust + WebGPU](https://img.shields.io/badge/engine-Rust%20%2B%20wgpu-orange.svg)](docs/specs/00-architecture.md)
 [![User Manual](https://img.shields.io/badge/docs-User%20Manual-0284c7.svg)](https://debsahu.github.io/nmr-assign/)
 [![Browser Demo](https://img.shields.io/badge/WebGPU-Live%20Demo-059669.svg)](https://debsahu.github.io/nmr-assign/demo/)
 
-`nmr-assign` (`nmrassign` CLI + `nmr-gui` desktop/WebAssembly workbench) processes raw time-domain FIDs (Bruker `ser`/`fid` + custom `pulprog`, Varian/Agilent, JEOL Delta, JCAMP-DX) and frequency-domain spectra (Bruker `pdata`, NMRPipe, Sparky `.ucsf`) end-to-end in pure clean-room Rust (`f64` reference algorithms) and cross-vendor WebGPU (`wgpu` WGSL compute & contour shaders).
+**FERRIC** (`ferric` CLI + `ferric-gui` desktop/WebAssembly workbench) processes raw time-domain FIDs (Bruker `ser`/`fid` + custom `pulprog`, Varian/Agilent, JEOL Delta, JCAMP-DX) and frequency-domain spectra (Bruker `pdata`, NMRPipe, Sparky `.ucsf`) end-to-end in pure clean-room Rust (`f64` reference algorithms) and cross-vendor WebGPU (`wgpu` WGSL compute & contour shaders).
 
-> **Human-in-the-Loop Development & Acknowledgements:** `nmr-assign` is developed with a human NMR scientist ([`@debsahu`](https://github.com/debsahu)) in the loop throughout the entire process—owning the scientific specifications, spin-physics and scoring rules, benchmark validation, and release governance. Development was supported by compute credits generously given by Google under [**Google Gemini for Science**](https://ai.google/gemini-for-science/), and [`@debsahu`](https://github.com/debsahu)'s personal Claude ([Anthropic](https://www.anthropic.com/)) was used for independent code and scientific review.
+> **Human-in-the-Loop Development & Acknowledgements:** FERRIC is developed with a human NMR scientist ([`@debsahu`](https://github.com/debsahu)) in the loop throughout the entire process—owning the scientific specifications, spin-physics and scoring rules, benchmark validation, and release governance. Development was supported by compute credits generously given by Google under [**Google Gemini for Science**](https://ai.google/gemini-for-science/), and [`@debsahu`](https://github.com/debsahu)'s personal Claude ([Anthropic](https://www.anthropic.com/)) was used for independent code and scientific review.
 
 ## Deterministic Scientific Showcase
 
-Every panel below is generated deterministically (`seed = 42`, zero external plotting libraries) directly from `nmr-core` forward models and solvers via `nmrassign export-fig --out-dir docs/assets`:
+Every panel below is generated deterministically (`seed = 42`, zero external plotting libraries) directly from `nmr-core` forward models and solvers via `ferric export-fig --out-dir docs/assets`:
 
 | Macromolecular Assignment & 3D Walk | Dynamics, 1D/qNMR, DOSY, Metabolomics, Exchange & Small Molecules |
 | :---: | :---: |
@@ -26,43 +26,45 @@ Every panel below is generated deterministically (`seed = 42`, zero external plo
 
 Requires a stable Rust toolchain (`rustup`, Rust 1.80+) and a Vulkan, Metal, or DX12 GPU (falls back cleanly to multi-threaded `rayon` CPU `f64` everywhere).
 
-### 1. Interactive Desktop Workbench (`nmr-gui`)
+### 1. Interactive Desktop Workbench (`ferric-gui`)
 
-Download pre-built desktop + CLI archives (`macos-arm64` `.dmg`/`.app`/`.tar.gz`, `windows-x86_64` `.zip`, `linux-x86_64` `.tar.gz`) from [**GitHub Releases**](https://github.com/debsahu/nmr-assign/releases), or build from source:
+Download pre-built desktop + CLI archives (`macos-arm64` `.dmg`/`FERRIC.app`/`.tar.gz`, `windows-x86_64` `.zip`, `linux-x86_64` `.tar.gz`) from [**GitHub Releases**](https://github.com/debsahu/nmr-assign/releases), or build from source:
 
 ```bash
-cargo run --release -p nmr-gui
+cargo run --release -p nmr-gui --bin ferric-gui
 ```
 
 Drag and drop any Bruker experiment directory (`ser`/`fid` or `pdata/1`), NMRPipe file, `.ucsf` spectrum, `.jdx`, NMR-STAR `.str`, or NMR Exchange Format (`.nef`) project onto the canvas—or launch the mobile/tablet-responsive, zero-install [**Live WebGPU Browser Demo**](https://debsahu.github.io/nmr-assign/demo/) (local build: `bash scripts/build_web_demo.sh`).
 
-### 2. Automated Command-Line Workflows (`nmrassign`)
+### 2. Automated Command-Line Workflows (`ferric`)
+
+*(In `v0.14.x`, `nmrassign` remains available as a deprecated compatibility alias with a stderr warning and identical stdout; removed in `v0.15.0`.)*
 
 ```bash
 # End-to-end raw-FID processing -> peak picking -> evo-graph assignment -> NEF v1.1 + HTML QC report
-cargo run --release -p nmr-cli -- pipeline \
+cargo run --release -p nmr-cli --bin ferric -- pipeline \
   --seq ubiquitin.fasta --fid-hsqc ./10_hsqc --fid-triple HNCACB=./20_hncacb \
   --fid-triple CBCACONH=./21_cbcaconh --out-dir ./ubq_out --engine auto
 
 # Analytical 1D processing, multiplet J-tree extraction, pseudo-2D DOSY, and 1D metabolomics demos
-cargo run --release -p nmr-cli -- nmr1d process --in ./1d_fid --out proc_1d.tsv --auto-phase
-cargo run --release -p nmr-cli -- dosy fit --demo --criterion bic -o dosy_fit.json
-cargo run --release -p nmr-cli -- metabolomics oplsda --demo -o metab_study.json
+cargo run --release -p nmr-cli --bin ferric -- nmr1d process --in ./1d_fid --out proc_1d.tsv --auto-phase
+cargo run --release -p nmr-cli --bin ferric -- dosy fit --demo --criterion bic -o dosy_fit.json
+cargo run --release -p nmr-cli --bin ferric -- metabolomics oplsda --demo -o metab_study.json
 
 # Deterministically regenerate all 8 publication SVG figures in docs/assets/
-cargo run --release -p nmr-cli -- export-fig --out-dir docs/assets --panel all
+cargo run --release -p nmr-cli --bin ferric -- export-fig --out-dir docs/assets --panel all
 ```
 
 ### 3. AI Assistant Copilot (`MCP` JSON-RPC 2.0 Server)
 
-Expose 12 workspace-sandboxed core MCP tools (`inspect_nmr_directory`, `read_nmrstar_summary`, `read_peak_list_summary`, `evaluate_dataset_qc`, `predict_homolog_free_torsions` under `<= 25%` sequence-identity firewall, `fit_relaxation_or_exchange`, `track_csp_titration`, `analyze_nmr1d_spectrum`, `fit_dosy_diffusion`, `run_metabolomics_chemometrics`, plus `--mode read-write` `write_curated_peak_tsv` / `export_nmrstar_shifts`), 5 guided spectroscopist prompts, and live `nmr-gui` loopback bridge tools (`256`-step undo + viewport PNG capture) to AI research clients:
+Expose 12 workspace-sandboxed core MCP tools (`inspect_nmr_directory`, `read_nmrstar_summary`, `read_peak_list_summary`, `evaluate_dataset_qc`, `predict_homolog_free_torsions` under `<= 25%` sequence-identity firewall, `fit_relaxation_or_exchange`, `track_csp_titration`, `analyze_nmr1d_spectrum`, `fit_dosy_diffusion`, `run_metabolomics_chemometrics`, plus `--mode read-write` `write_curated_peak_tsv` / `export_nmrstar_shifts`), 5 guided spectroscopist prompts, and live `ferric-gui` loopback bridge tools (`256`-step undo + viewport PNG capture) to AI research clients:
 
 ```bash
 # Emit ready-to-paste client configuration JSON (antigravity, claude-desktop, cursor, generic)
-nmrassign mcp-config --client antigravity --root ./ubq_out --mode read-only
+ferric mcp-config --client antigravity --root ./ubq_out --mode read-only
 
 # Launch sandboxed stdio MCP server directly (default --mode read-only forbids disk writes)
-nmrassign mcp --transport stdio --root ./ubq_out --mode read-only
+ferric mcp --transport stdio --root ./ubq_out --mode read-only
 ```
 
 ## Benchmark & Scientific Validation Summary
@@ -79,7 +81,7 @@ All macromolecular assignment solvers (`evo-graph` default, `standard` parallel-
 ### Scientific Scope & Calibration Candor
 
 - **Backbone Confidence Calibration & Spent Cold Cohorts (`data/benchmark/real_manifest.tsv`, 40 BMRB entries)**: Isotonic/hierarchical confidence maps achieve `94.07%–95.62%` out-of-fold micro HC-precision (`pooled_ECE_10 = 0.0222–0.0369`) on the `26`-protein non-cold LOPO pool *(in-sample with respect to `min_bidir_aliphatic_frac` feature selection)*. Across three pre-registered single-shot unseen cold cohorts—the latest `cold_p13_w2` (`5/7` runnable raw-FID entries, relabeled **`seen_p13_w2`** in `real_manifest.tsv` immediately after unblinding so spent cohorts are never reused as unseen claims; `2` entries remain newly sealed)—empirical micro HC-precision at `confidence >= 0.80` spans **`86.18%–96.31%`**, so `>= 0.80` confidence should be interpreted as an empirical `~86%–96%` range rather than a guaranteed `>= 94%` floor on arbitrary unseen proteins.
-- **Torsion Angles & Residual Dipolar Couplings**: `nmrassign torsions` (`200`-entry BMRB/PDB database under `<= 25%` sequence-identity / `TM < 0.50` `HomologFirewall`) reaches `70.0%` `Good` (`541/773`) and `phi/psi` `CircMAE = 13.79°` (`3.70%` wrong basin; in-sample wrt hyperparameter tuning). On the cold single-medium RDC target `1KHM -> 1ZZK`, adding RDCs improves NOE-only backbone RMSD on `5/5` seeds (`1.862–4.141 Å` CPU / `2.390–3.988 Å` WebGPU `lowE`), but the pre-registered single-shot holdout does **not** reach development-target accuracy (`0/5` seeds `< 1.80 Å`; `ByPeptidePlane Q_free < 0.55` on `3/5` CPU / `2/5` WebGPU seeds; `F8`).
+- **Torsion Angles & Residual Dipolar Couplings**: `ferric torsions` (`200`-entry BMRB/PDB database under `<= 25%` sequence-identity / `TM < 0.50` `HomologFirewall`) reaches `70.0%` `Good` (`541/773`) and `phi/psi` `CircMAE = 13.79°` (`3.70%` wrong basin; in-sample wrt hyperparameter tuning). On the cold single-medium RDC target `1KHM -> 1ZZK`, adding RDCs improves NOE-only backbone RMSD on `5/5` seeds (`1.862–4.141 Å` CPU / `2.390–3.988 Å` WebGPU `lowE`), but the pre-registered single-shot holdout does **not** reach development-target accuracy (`0/5` seeds `< 1.80 Å`; `ByPeptidePlane Q_free < 0.55` on `3/5` CPU / `2/5` WebGPU seeds; `F8`).
 - **Synthetic Forward-Model, Blind Empirical Scorecard, Protocol & Browser Validation Status (Phases 13–17)**: Spin relaxation & chemical exchange (`R1`/`R2`/hetNOE, Lipari–Szabo `S^2`, `CEST`/`DEST`, `CPMG`/`R1rho`, `CSP` `Kd`), analytical 1D (`Voigt` deconvolution, Hoye `J`-trees, `qNMR`), pseudo-2D `DOSY`, and 1D `Metabolomics` (`AIB`, `PQN`, `PCA`, `OPLS-DA`, `STOCSY`) modules are validated strictly on **synthetic forward-model self-consistency benchmarks** and make **no real-data accuracy claims**: across all `8` pre-registered Phase 17 blind single-shot empirical gates (`data/benchmark/p17_empirical_preregistration.json`, frozen `crates/` `02c6246a3cb2` & pre-download `bbc770a` adapters), the standing tally is **`0 PASS`, `5 FAIL` (`F10`, `F11`, `F14`, `F16`, `F17`), and `3 NOT_EVALUABLE` (`F13a`, `F13b`, `F13c`)**, with uncovered vendor/convention/scaling gaps tracked in `F28`–`F29`. `MCP` copilot (`F18`) and `wasm32` WebGPU browser compatibility (`F21`) are verified via automated protocol/headless tests plus single-host Apple Silicon smoke runs (`stdio`/loopback HTTP & headless `Chrome 157` `Metal`), while live multi-IDE (`Antigravity`/`Claude Desktop`/`Cursor` GUI), `D3D12`/`Vulkan`, `Safari`/`Firefox`, and physical mobile-device sessions remain `[ ]` open in [`TODO.md`](TODO.md) (`F10`, `F11`, `F13`, `F14`, `F16`–`F18`, `F21`, `F24`–`F29`).
 
 ## Documentation, Specifications & Live Demo
@@ -89,6 +91,6 @@ All macromolecular assignment solvers (`evo-graph` default, `standard` parallel-
 
 ## Clean-Room Provenance & Licence
 
-`nmr-assign` is a strict clean-room implementation derived exclusively from peer-reviewed literature and public standards (NMR-STAR v3, NEF v1.1, JCAMP-DX), with zero code, parameters, or macros from proprietary, academic-only, GPL, or AGPL NMR packages.
+FERRIC is a strict clean-room implementation derived exclusively from peer-reviewed literature and public standards (NMR-STAR v3, NEF v1.1, JCAMP-DX), with zero code, parameters, or macros from proprietary, academic-only, GPL, or AGPL NMR packages.
 
 Released under the **MIT Licence**, incorporating embedded `Octet-Draw` 2D chemical structure & analytical crates under **Apache-2.0** and public-domain (**CC0**) BMRB / wwPDB reference statistics and fixtures. Full dependency and data attribution is audited in [`THIRD_PARTY.md`](THIRD_PARTY.md) and [`data/benchmark/PROVENANCE.md`](data/benchmark/PROVENANCE.md).

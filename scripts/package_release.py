@@ -2,18 +2,20 @@
 """Zero-dependency cross-platform desktop release packager and icon generator.
 
 Builds reproducible release bundles and procedural vector/raster desktop icons
-for ``nmr-assign`` across:
-- ``macos-arm64``: ``nmr-assign.app`` bundle (``nmrassign-gui`` + ``nmrassign``
-  CLI/MCP, ``Info.plist``, ``PkgInfo``, ``nmr-assign.icns``, ad-hoc Apple Silicon
-  ``codesign``), compressed drag-and-drop ``.dmg`` (with ``/Applications``
-  symlink and quickstart guide), and ``.tar.gz`` archive.
+for ``FERRIC`` across:
+- ``macos-arm64``: ``FERRIC.app`` bundle (``ferric-gui`` + ``ferric`` CLI/MCP
+  + deprecated ``nmrassign`` alias for ``v0.14.x``, ``Info.plist``, ``PkgInfo``,
+  ``FERRIC.icns``, ad-hoc Apple Silicon ``codesign``), compressed drag-and-drop
+  ``.dmg`` (with ``/Applications`` symlink and quickstart guide), and ``.tar.gz``
+  archive.
 - ``windows-x86_64``: deterministic ``.zip`` archive containing
-  ``nmrassign-gui.exe``, ``nmrassign.exe``, multi-resolution ``nmr-assign.ico``,
-  ``Launch-NMR-Workbench.bat``, ``README.md``, and ``THIRD_PARTY.md``.
+  ``ferric-gui.exe``, ``ferric.exe``, ``nmrassign.exe`` (``v0.14.x`` alias),
+  multi-resolution ``ferric.ico``, ``Launch-NMR-Workbench.bat``, ``README.md``,
+  and ``THIRD_PARTY.md``.
 - ``linux-x86_64``: deterministic ``.tar.gz`` archive containing ``bin/``
-  executables (``0755``), FreeDesktop ``nmr-assign.desktop``, scalable SVG +
-  ``256x256`` PNG hicolor icons, user-level ``install-desktop.sh`` XDG
-  installer, ``README.md``, and ``THIRD_PARTY.md``.
+  executables (``ferric-gui``, ``ferric``, ``nmrassign``, ``0755``), FreeDesktop
+  ``ferric.desktop``, scalable SVG + ``256x256`` PNG hicolor icons, user-level
+  ``install-desktop.sh`` XDG installer, ``README.md``, and ``THIRD_PARTY.md``.
 - ``--checksums <dir>``: deterministic ``SHA256SUMS.txt`` generator and verifier.
 
 Provenance: Original clean-room Python 3 standard-library release packaging and
@@ -43,8 +45,12 @@ import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 
-APP_NAME = "nmr-assign"
-BUNDLE_ID = "io.github.debsahu.nmr-assign"
+APP_NAME = "FERRIC"
+APP_SLUG = "ferric"
+CLI_BIN = "ferric"
+CLI_ALIAS_BIN = "nmrassign"
+GUI_BIN = "ferric-gui"
+BUNDLE_ID = "org.ferric-nmr.desktop"
 MACOS_MIN_SYSTEM_VERSION = "13.0"
 DETERMINISTIC_MTIME = 1700000000  # 2023-11-14T22:13:20Z
 DETERMINISTIC_ZIP_DT = (2026, 1, 1, 0, 0, 0)
@@ -237,7 +243,7 @@ def _draw_contour_family(
 
 
 def render_icon_scanlines(size: int) -> bytes:
-    """Deterministically rasterize the ``nmr-assign`` icon at ``size x size`` RGBA."""
+    """Deterministically rasterize the ``FERRIC`` icon at ``size x size`` RGBA."""
     if size <= 0 or size > 2048:
         raise ValueError(f"Unsupported icon dimension: {size}")
 
@@ -409,7 +415,7 @@ def build_ico(png_by_size: Dict[int, bytes], sizes: Sequence[int] = ICO_SIZES) -
 
 
 def render_icon_svg() -> str:
-    """Render the matching scalable vector ``nmr-assign.svg`` FreeDesktop launcher icon."""
+    """Render the matching scalable vector ``ferric.svg`` FreeDesktop launcher icon."""
     return """<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
@@ -611,7 +617,7 @@ def emit_icon_suite(out_dir: Path) -> Dict[str, Path]:
     written: Dict[str, Path] = {}
     for sz in (16, 32, 48, 64, 128, 256, 512):
         validate_png_bytes(pngs[sz], sz)
-        p = out_dir / f"{APP_NAME}-{sz}.png"
+        p = out_dir / f"{APP_SLUG}-{sz}.png"
         p.write_bytes(pngs[sz])
         written[f"png_{sz}"] = p
 
@@ -623,13 +629,13 @@ def emit_icon_suite(out_dir: Path) -> Dict[str, Path]:
 
     ico_bytes = build_ico(pngs, ICO_SIZES)
     validate_ico_bytes(ico_bytes, ICO_SIZES)
-    ico_path = out_dir / f"{APP_NAME}.ico"
+    ico_path = out_dir / f"{APP_SLUG}.ico"
     ico_path.write_bytes(ico_bytes)
     written["ico"] = ico_path
 
     svg_text = render_icon_svg()
     validate_svg_text(svg_text)
-    svg_path = out_dir / f"{APP_NAME}.svg"
+    svg_path = out_dir / f"{APP_SLUG}.svg"
     svg_path.write_text(svg_text, encoding="utf-8", newline="\n")
     written["svg"] = svg_path
     return written
@@ -640,7 +646,7 @@ def build_macos_info_plist_bytes(version: str) -> bytes:
     info = {
         "CFBundleDevelopmentRegion": "en",
         "CFBundleDisplayName": APP_NAME,
-        "CFBundleExecutable": "nmrassign-gui",
+        "CFBundleExecutable": GUI_BIN,
         "CFBundleIconFile": f"{APP_NAME}.icns",
         "CFBundleIdentifier": BUNDLE_ID,
         "CFBundleInfoDictionaryVersion": "6.0",
@@ -662,7 +668,7 @@ def validate_info_plist(plist_path: Path, expected_version: str) -> None:
         "CFBundleName": APP_NAME,
         "CFBundleDisplayName": APP_NAME,
         "CFBundleIdentifier": BUNDLE_ID,
-        "CFBundleExecutable": "nmrassign-gui",
+        "CFBundleExecutable": GUI_BIN,
         "CFBundleIconFile": f"{APP_NAME}.icns",
         "CFBundlePackageType": "APPL",
         "CFBundleShortVersionString": expected_version,
@@ -683,27 +689,28 @@ def validate_info_plist(plist_path: Path, expected_version: str) -> None:
 
 def render_cli_and_mcp_quickstart(version: str) -> str:
     """Render plain-text macOS quickstart bundled inside the ``.dmg`` volume."""
-    return f"""nmr-assign v{version} — Apple Silicon Desktop, CLI & MCP Quickstart
-====================================================================
+    return f"""FERRIC v{version} — Apple Silicon Desktop, CLI & MCP Quickstart
+================================================================
 
-1. Install the Desktop Workbench (`nmr-assign.app`)
----------------------------------------------------
-Drag `nmr-assign.app` onto the `Applications` folder shortcut in this disk image.
-Double-click `nmr-assign` in `/Applications` to launch the interactive WebGPU
+1. Install the Desktop Workbench (`FERRIC.app`)
+-----------------------------------------------
+Drag `FERRIC.app` onto the `Applications` folder shortcut in this disk image.
+Double-click `FERRIC` in `/Applications` to launch the interactive WebGPU
 2D/3D NMR spectrum workbench (`Metal` GPU backend with multi-threaded CPU `f64`
 fallback).
 
-2. Command-Line Interface (`nmrassign`)
----------------------------------------
-Both `nmrassign-gui` and the `nmrassign` CLI / MCP server ship directly inside
-`nmr-assign.app/Contents/MacOS/`. To add `nmrassign` to your `zsh` PATH:
+2. Command-Line Interface (`ferric`)
+------------------------------------
+`ferric-gui`, the `ferric` CLI / MCP server, and the `v0.14.x` deprecated
+`nmrassign` compatibility alias ship directly inside `FERRIC.app/Contents/MacOS/`.
+To add `ferric` to your `zsh` PATH:
 
-  export PATH="/Applications/nmr-assign.app/Contents/MacOS:$PATH"
-  nmrassign --version
+  export PATH="/Applications/FERRIC.app/Contents/MacOS:$PATH"
+  ferric --version
 
 Example end-to-end raw-FID backbone assignment pipeline:
 
-  nmrassign pipeline \\
+  ferric pipeline \\
     --seq ubiquitin.fasta \\
     --fid-hsqc ./10_hsqc \\
     --fid-triple HNCACB=./20_hncacb \\
@@ -714,7 +721,7 @@ Example end-to-end raw-FID backbone assignment pipeline:
 ------------------------------------------------------------
 Generate ready-to-paste client configuration JSON (read-only sandbox by default):
 
-  /Applications/nmr-assign.app/Contents/MacOS/nmrassign mcp-config \\
+  /Applications/FERRIC.app/Contents/MacOS/ferric mcp-config \\
     --client claude-desktop --root ~/nmr_projects --mode read-only
 
 Documentation & Browser Demo: https://debsahu.github.io/nmr-assign/
@@ -728,30 +735,30 @@ def render_windows_launcher_bat() -> bytes:
         "@echo off",
         "setlocal",
         'if "%~1"=="--cli-help" (',
-        '  "%~dp0nmrassign.exe" --help',
+        f'  "%~dp0{CLI_BIN}.exe" --help',
         "  exit /b %ERRORLEVEL%",
         ")",
-        'start "" "%~dp0nmrassign-gui.exe" %*',
+        f'start "" "%~dp0{GUI_BIN}.exe" %*',
         "",
     ]
     return "\r\n".join(lines).encode("utf-8")
 
 
 def render_linux_desktop_entry() -> str:
-    """Render FreeDesktop ``nmr-assign.desktop`` specification entry."""
-    return """[Desktop Entry]
+    """Render FreeDesktop ``ferric.desktop`` specification entry."""
+    return f"""[Desktop Entry]
 Type=Application
 Version=1.5
-Name=nmr-assign
+Name={APP_NAME}
 GenericName=NMR Resonance Assignment & Spectrum Workbench
 Comment=Open-source GPU-accelerated protein and analytical NMR spectrum workbench
-Exec=nmrassign-gui %F
-TryExec=nmrassign-gui
-Icon=nmr-assign
+Exec={GUI_BIN} %F
+TryExec={GUI_BIN}
+Icon={APP_SLUG}
 Terminal=false
 Categories=Science;Chemistry;Biology;DataVisualization;
 Keywords=NMR;Spectroscopy;Protein;ChemicalShift;Metabolomics;DOSY;WebGPU;
-StartupWMClass=nmrassign-gui
+StartupWMClass={GUI_BIN}
 StartupNotify=true
 """
 
@@ -770,9 +777,9 @@ def validate_desktop_entry(desktop_text: str) -> None:
     required = {
         "Type": "Application",
         "Name": APP_NAME,
-        "Exec": "nmrassign-gui %F",
-        "TryExec": "nmrassign-gui",
-        "Icon": APP_NAME,
+        "Exec": f"{GUI_BIN} %F",
+        "TryExec": GUI_BIN,
+        "Icon": APP_SLUG,
         "Terminal": "false",
     }
     for k, exp in required.items():
@@ -824,24 +831,25 @@ ICON_SVG_DIR="${DATA_DIR}/icons/hicolor/scalable/apps"
 ICON_PNG_DIR="${DATA_DIR}/icons/hicolor/256x256/apps"
 
 if [[ "${UNINSTALL}" -eq 1 ]]; then
-  rm -f "${BIN_DIR}/nmrassign-gui" "${BIN_DIR}/nmrassign"
-  rm -f "${APP_DIR}/nmr-assign.desktop"
-  rm -f "${ICON_SVG_DIR}/nmr-assign.svg" "${ICON_PNG_DIR}/nmr-assign.png"
-  echo "Uninstalled nmr-assign from ${PREFIX_DIR}"
+  rm -f "${BIN_DIR}/ferric-gui" "${BIN_DIR}/ferric" "${BIN_DIR}/nmrassign"
+  rm -f "${APP_DIR}/ferric.desktop"
+  rm -f "${ICON_SVG_DIR}/ferric.svg" "${ICON_PNG_DIR}/ferric.png"
+  echo "Uninstalled FERRIC from ${PREFIX_DIR}"
   exit 0
 fi
 
 mkdir -p "${BIN_DIR}" "${APP_DIR}" "${ICON_SVG_DIR}" "${ICON_PNG_DIR}"
-install -m 0755 "${SCRIPT_DIR}/bin/nmrassign-gui" "${BIN_DIR}/nmrassign-gui"
+install -m 0755 "${SCRIPT_DIR}/bin/ferric-gui" "${BIN_DIR}/ferric-gui"
+install -m 0755 "${SCRIPT_DIR}/bin/ferric" "${BIN_DIR}/ferric"
 install -m 0755 "${SCRIPT_DIR}/bin/nmrassign" "${BIN_DIR}/nmrassign"
-install -m 0644 "${SCRIPT_DIR}/share/icons/hicolor/scalable/apps/nmr-assign.svg" "${ICON_SVG_DIR}/nmr-assign.svg"
-install -m 0644 "${SCRIPT_DIR}/share/icons/hicolor/256x256/apps/nmr-assign.png" "${ICON_PNG_DIR}/nmr-assign.png"
+install -m 0644 "${SCRIPT_DIR}/share/icons/hicolor/scalable/apps/ferric.svg" "${ICON_SVG_DIR}/ferric.svg"
+install -m 0644 "${SCRIPT_DIR}/share/icons/hicolor/256x256/apps/ferric.png" "${ICON_PNG_DIR}/ferric.png"
 
 sed \\
-  -e "s|^Exec=nmrassign-gui|Exec=${BIN_DIR}/nmrassign-gui|" \\
-  -e "s|^TryExec=nmrassign-gui|TryExec=${BIN_DIR}/nmrassign-gui|" \\
-  "${SCRIPT_DIR}/share/applications/nmr-assign.desktop" > "${APP_DIR}/nmr-assign.desktop"
-chmod 0644 "${APP_DIR}/nmr-assign.desktop"
+  -e "s|^Exec=ferric-gui|Exec=${BIN_DIR}/ferric-gui|" \\
+  -e "s|^TryExec=ferric-gui|TryExec=${BIN_DIR}/ferric-gui|" \\
+  "${SCRIPT_DIR}/share/applications/ferric.desktop" > "${APP_DIR}/ferric.desktop"
+chmod 0644 "${APP_DIR}/ferric.desktop"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "${APP_DIR}" >/dev/null 2>&1 || true
@@ -850,7 +858,7 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
   gtk-update-icon-cache -f -t "${DATA_DIR}/icons/hicolor" >/dev/null 2>&1 || true
 fi
 
-echo "Installed nmr-assign desktop launcher and CLI to ${PREFIX_DIR}"
+echo "Installed FERRIC desktop launcher and CLI to ${PREFIX_DIR}"
 """
 
 
@@ -953,9 +961,11 @@ def _codesign_macos_app(app_dir: Path) -> None:
     """Apply ad-hoc Apple Silicon code signature and strict verification on macOS."""
     if sys.platform != "darwin" or not shutil.which("codesign"):
         return
-    cli_bin = app_dir / "Contents" / "MacOS" / "nmrassign"
-    gui_bin = app_dir / "Contents" / "MacOS" / "nmrassign-gui"
+    cli_bin = app_dir / "Contents" / "MacOS" / CLI_BIN
+    alias_bin = app_dir / "Contents" / "MacOS" / CLI_ALIAS_BIN
+    gui_bin = app_dir / "Contents" / "MacOS" / GUI_BIN
     subprocess.run(["codesign", "--force", "--sign", "-", str(cli_bin)], check=True, capture_output=True, text=True)
+    subprocess.run(["codesign", "--force", "--sign", "-", str(alias_bin)], check=True, capture_output=True, text=True)
     subprocess.run(["codesign", "--force", "--sign", "-", str(gui_bin)], check=True, capture_output=True, text=True)
     subprocess.run(
         ["codesign", "--force", "--deep", "--sign", "-", str(app_dir)],
@@ -1015,9 +1025,10 @@ def package_macos_arm64(
     version: str,
     skip_dmg: bool = False,
 ) -> List[Path]:
-    """Build ``nmr-assign.app``, ``.dmg``, and ``.tar.gz`` for ``macos-arm64``."""
-    gui_src = _require_binary(bin_dir, "nmrassign-gui")
-    cli_src = _require_binary(bin_dir, "nmrassign")
+    """Build ``FERRIC.app``, ``.dmg``, and ``.tar.gz`` for ``macos-arm64``."""
+    gui_src = _require_binary(bin_dir, GUI_BIN)
+    cli_src = _require_binary(bin_dir, CLI_BIN)
+    alias_src = _require_binary(bin_dir, CLI_ALIAS_BIN)
     readme_src = repo_root / "README.md"
     third_party_src = repo_root / "THIRD_PARTY.md"
 
@@ -1026,7 +1037,7 @@ def package_macos_arm64(
     icns_bytes = build_icns(pngs)
     validate_icns_bytes(icns_bytes)
 
-    prefix = f"{APP_NAME}-v{version}-macos-arm64"
+    prefix = f"{APP_SLUG}-v{version}-macos-arm64"
     outputs: List[Path] = []
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1045,12 +1056,15 @@ def package_macos_arm64(
         (app_dir / "Contents" / "PkgInfo").write_bytes(b"APPL????")
         (res_dir / f"{APP_NAME}.icns").write_bytes(icns_bytes)
 
-        gui_dst = macos_dir / "nmrassign-gui"
-        cli_dst = macos_dir / "nmrassign"
+        gui_dst = macos_dir / GUI_BIN
+        cli_dst = macos_dir / CLI_BIN
+        alias_dst = macos_dir / CLI_ALIAS_BIN
         shutil.copy2(gui_src, gui_dst)
         shutil.copy2(cli_src, cli_dst)
+        shutil.copy2(alias_src, alias_dst)
         os.chmod(gui_dst, 0o755)
         os.chmod(cli_dst, 0o755)
+        os.chmod(alias_dst, 0o755)
 
         _codesign_macos_app(app_dir)
 
@@ -1060,13 +1074,17 @@ def package_macos_arm64(
             shutil.rmtree(out_app_dir)
         shutil.copytree(app_dir, out_app_dir, symlinks=True)
 
-        # Top-level bin/nmrassign + docs inside .tar.gz staging root
+        # Top-level bin/{ferric,nmrassign} + docs inside .tar.gz staging root
         top_bin = tar_stage / "bin"
         top_bin.mkdir(parents=True, exist_ok=True)
-        top_cli = top_bin / "nmrassign"
+        top_cli = top_bin / CLI_BIN
+        top_alias = top_bin / CLI_ALIAS_BIN
         shutil.copy2(cli_src, top_cli)
+        shutil.copy2(alias_src, top_alias)
         os.chmod(top_cli, 0o755)
+        os.chmod(top_alias, 0o755)
         _codesign_macos_binary(top_cli)
+        _codesign_macos_binary(top_alias)
 
         shutil.copyfile(readme_src, tar_stage / "README.md")
         shutil.copyfile(third_party_src, tar_stage / "THIRD_PARTY.md")
@@ -1077,9 +1095,11 @@ def package_macos_arm64(
             archive_prefix=prefix,
             out_tar_gz=tar_gz_path,
             executable_relpaths=(
-                f"{APP_NAME}.app/Contents/MacOS/nmrassign-gui",
-                f"{APP_NAME}.app/Contents/MacOS/nmrassign",
-                "bin/nmrassign",
+                f"{APP_NAME}.app/Contents/MacOS/{GUI_BIN}",
+                f"{APP_NAME}.app/Contents/MacOS/{CLI_BIN}",
+                f"{APP_NAME}.app/Contents/MacOS/{CLI_ALIAS_BIN}",
+                f"bin/{CLI_BIN}",
+                f"bin/{CLI_ALIAS_BIN}",
             ),
         )
         outputs.append(tar_gz_path)
@@ -1113,8 +1133,9 @@ def package_windows_x86_64(
     version: str,
 ) -> List[Path]:
     """Build deterministic ``.zip`` release bundle for ``windows-x86_64``."""
-    gui_src = _require_binary(bin_dir, "nmrassign-gui.exe")
-    cli_src = _require_binary(bin_dir, "nmrassign.exe")
+    gui_src = _require_binary(bin_dir, f"{GUI_BIN}.exe")
+    cli_src = _require_binary(bin_dir, f"{CLI_BIN}.exe")
+    alias_src = _require_binary(bin_dir, f"{CLI_ALIAS_BIN}.exe")
     readme_src = repo_root / "README.md"
     third_party_src = repo_root / "THIRD_PARTY.md"
 
@@ -1122,15 +1143,16 @@ def package_windows_x86_64(
     ico_bytes = build_ico(pngs, ICO_SIZES)
     validate_ico_bytes(ico_bytes, ICO_SIZES)
 
-    prefix = f"{APP_NAME}-v{version}-windows-x86_64"
+    prefix = f"{APP_SLUG}-v{version}-windows-x86_64"
     out_zip = out_dir / f"{prefix}.zip"
 
     with tempfile.TemporaryDirectory() as tmp:
         stage = Path(tmp) / prefix
         stage.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(gui_src, stage / "nmrassign-gui.exe")
-        shutil.copyfile(cli_src, stage / "nmrassign.exe")
-        (stage / f"{APP_NAME}.ico").write_bytes(ico_bytes)
+        shutil.copyfile(gui_src, stage / f"{GUI_BIN}.exe")
+        shutil.copyfile(cli_src, stage / f"{CLI_BIN}.exe")
+        shutil.copyfile(alias_src, stage / f"{CLI_ALIAS_BIN}.exe")
+        (stage / f"{APP_SLUG}.ico").write_bytes(ico_bytes)
         (stage / "Launch-NMR-Workbench.bat").write_bytes(render_windows_launcher_bat())
         shutil.copyfile(readme_src, stage / "README.md")
         shutil.copyfile(third_party_src, stage / "THIRD_PARTY.md")
@@ -1140,8 +1162,9 @@ def package_windows_x86_64(
             archive_prefix=prefix,
             out_zip=out_zip,
             executable_relpaths=(
-                "nmrassign-gui.exe",
-                "nmrassign.exe",
+                f"{GUI_BIN}.exe",
+                f"{CLI_BIN}.exe",
+                f"{CLI_ALIAS_BIN}.exe",
                 "Launch-NMR-Workbench.bat",
             ),
         )
@@ -1156,8 +1179,9 @@ def package_linux_x86_64(
     version: str,
 ) -> List[Path]:
     """Build deterministic ``.tar.gz`` FreeDesktop bundle for ``linux-x86_64``."""
-    gui_src = _require_binary(bin_dir, "nmrassign-gui")
-    cli_src = _require_binary(bin_dir, "nmrassign")
+    gui_src = _require_binary(bin_dir, GUI_BIN)
+    cli_src = _require_binary(bin_dir, CLI_BIN)
+    alias_src = _require_binary(bin_dir, CLI_ALIAS_BIN)
     readme_src = repo_root / "README.md"
     third_party_src = repo_root / "THIRD_PARTY.md"
 
@@ -1168,7 +1192,7 @@ def package_linux_x86_64(
     desktop_text = render_linux_desktop_entry()
     validate_desktop_entry(desktop_text)
 
-    prefix = f"{APP_NAME}-v{version}-linux-x86_64"
+    prefix = f"{APP_SLUG}-v{version}-linux-x86_64"
     out_tar_gz = out_dir / f"{prefix}.tar.gz"
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1180,14 +1204,16 @@ def package_linux_x86_64(
         for d in (bin_stage, app_stage, svg_stage, png_stage):
             d.mkdir(parents=True, exist_ok=True)
 
-        shutil.copyfile(gui_src, bin_stage / "nmrassign-gui")
-        shutil.copyfile(cli_src, bin_stage / "nmrassign")
-        os.chmod(bin_stage / "nmrassign-gui", 0o755)
-        os.chmod(bin_stage / "nmrassign", 0o755)
+        shutil.copyfile(gui_src, bin_stage / GUI_BIN)
+        shutil.copyfile(cli_src, bin_stage / CLI_BIN)
+        shutil.copyfile(alias_src, bin_stage / CLI_ALIAS_BIN)
+        os.chmod(bin_stage / GUI_BIN, 0o755)
+        os.chmod(bin_stage / CLI_BIN, 0o755)
+        os.chmod(bin_stage / CLI_ALIAS_BIN, 0o755)
 
-        (app_stage / f"{APP_NAME}.desktop").write_text(desktop_text, encoding="utf-8", newline="\n")
-        (svg_stage / f"{APP_NAME}.svg").write_text(svg_text, encoding="utf-8", newline="\n")
-        (png_stage / f"{APP_NAME}.png").write_bytes(png_256)
+        (app_stage / f"{APP_SLUG}.desktop").write_text(desktop_text, encoding="utf-8", newline="\n")
+        (svg_stage / f"{APP_SLUG}.svg").write_text(svg_text, encoding="utf-8", newline="\n")
+        (png_stage / f"{APP_SLUG}.png").write_bytes(png_256)
 
         installer_path = stage / "install-desktop.sh"
         installer_path.write_text(render_linux_install_desktop_sh(), encoding="utf-8", newline="\n")
@@ -1201,8 +1227,9 @@ def package_linux_x86_64(
             archive_prefix=prefix,
             out_tar_gz=out_tar_gz,
             executable_relpaths=(
-                "bin/nmrassign-gui",
-                "bin/nmrassign",
+                f"bin/{GUI_BIN}",
+                f"bin/{CLI_BIN}",
+                f"bin/{CLI_ALIAS_BIN}",
                 "install-desktop.sh",
             ),
         )
@@ -1290,16 +1317,16 @@ def _build_mock_binaries(mock_bin_dir: Path) -> None:
         out_macho.unlink(missing_ok=True)
 
     if unix_stub is None:
-        unix_stub = b"#!/bin/sh\necho 'nmrassign mock 0.0.0'\n"
+        unix_stub = b"#!/bin/sh\necho 'ferric mock 0.0.0'\n"
 
-    for unix_name in ("nmrassign-gui", "nmrassign"):
+    for unix_name in (GUI_BIN, CLI_BIN, CLI_ALIAS_BIN):
         p = mock_bin_dir / unix_name
         p.write_bytes(unix_stub)
         os.chmod(p, 0o755)
 
     # Minimal PE/MZ stub header + deterministic payload for Windows .exe packaging tests
-    pe_stub = b"MZ" + b"\x00" * 58 + struct.pack("<I", 64) + b"PE\x00\x00nmrassign-mock-win64"
-    for win_name in ("nmrassign-gui.exe", "nmrassign.exe"):
+    pe_stub = b"MZ" + b"\x00" * 58 + struct.pack("<I", 64) + b"PE\x00\x00ferric-mock-win64"
+    for win_name in (f"{GUI_BIN}.exe", f"{CLI_BIN}.exe", f"{CLI_ALIAS_BIN}.exe"):
         (mock_bin_dir / win_name).write_bytes(pe_stub)
 
 
@@ -1343,14 +1370,16 @@ def run_self_test(repo_root: Path) -> int:
             raise AssertionError("Invalid Contents/PkgInfo bytes")
         validate_icns_bytes((app_bundle / "Contents" / "Resources" / f"{APP_NAME}.icns").read_bytes())
 
-        mac_prefix = f"{APP_NAME}-v{version}-macos-arm64"
+        mac_prefix = f"{APP_SLUG}-v{version}-macos-arm64"
         mac_tar = dist_dir / f"{mac_prefix}.tar.gz"
         with tarfile.open(mac_tar, "r:gz") as tf:
             members = {m.name: m for m in tf.getmembers()}
             for req_exec in (
-                f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/nmrassign-gui",
-                f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/nmrassign",
-                f"{mac_prefix}/bin/nmrassign",
+                f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/{GUI_BIN}",
+                f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/{CLI_BIN}",
+                f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/{CLI_ALIAS_BIN}",
+                f"{mac_prefix}/bin/{CLI_BIN}",
+                f"{mac_prefix}/bin/{CLI_ALIAS_BIN}",
             ):
                 if req_exec not in members:
                     raise AssertionError(f"Missing {req_exec} in macOS .tar.gz")
@@ -1379,21 +1408,22 @@ def run_self_test(repo_root: Path) -> int:
 
         # 2. Windows x86_64 .zip
         win_outputs = package_windows_x86_64(repo_root, mock_bins, dist_dir, version)
-        win_prefix = f"{APP_NAME}-v{version}-windows-x86_64"
+        win_prefix = f"{APP_SLUG}-v{version}-windows-x86_64"
         win_zip = win_outputs[0]
         with zipfile.ZipFile(win_zip, "r") as zf:
             names = set(zf.namelist())
             for req_win in (
-                f"{win_prefix}/nmrassign-gui.exe",
-                f"{win_prefix}/nmrassign.exe",
-                f"{win_prefix}/{APP_NAME}.ico",
+                f"{win_prefix}/{GUI_BIN}.exe",
+                f"{win_prefix}/{CLI_BIN}.exe",
+                f"{win_prefix}/{CLI_ALIAS_BIN}.exe",
+                f"{win_prefix}/{APP_SLUG}.ico",
                 f"{win_prefix}/Launch-NMR-Workbench.bat",
                 f"{win_prefix}/README.md",
                 f"{win_prefix}/THIRD_PARTY.md",
             ):
                 if req_win not in names:
                     raise AssertionError(f"Missing {req_win} in Windows .zip")
-            validate_ico_bytes(zf.read(f"{win_prefix}/{APP_NAME}.ico"), ICO_SIZES)
+            validate_ico_bytes(zf.read(f"{win_prefix}/{APP_SLUG}.ico"), ICO_SIZES)
         win_repeat_dir = tmp_path / "win_repeat"
         win_repeat = package_windows_x86_64(repo_root, mock_bins, win_repeat_dir, version)[0]
         if win_zip.read_bytes() != win_repeat.read_bytes():
@@ -1402,13 +1432,14 @@ def run_self_test(repo_root: Path) -> int:
 
         # 3. Linux x86_64 .tar.gz + XDG desktop installer test
         lin_outputs = package_linux_x86_64(repo_root, mock_bins, dist_dir, version)
-        lin_prefix = f"{APP_NAME}-v{version}-linux-x86_64"
+        lin_prefix = f"{APP_SLUG}-v{version}-linux-x86_64"
         lin_tar = lin_outputs[0]
         with tarfile.open(lin_tar, "r:gz") as tf:
             members = {m.name: m for m in tf.getmembers()}
             for req_exec in (
-                f"{lin_prefix}/bin/nmrassign-gui",
-                f"{lin_prefix}/bin/nmrassign",
+                f"{lin_prefix}/bin/{GUI_BIN}",
+                f"{lin_prefix}/bin/{CLI_BIN}",
+                f"{lin_prefix}/bin/{CLI_ALIAS_BIN}",
                 f"{lin_prefix}/install-desktop.sh",
             ):
                 if req_exec not in members:
@@ -1416,15 +1447,15 @@ def run_self_test(repo_root: Path) -> int:
                 if (members[req_exec].mode & 0o777) != 0o755:
                     raise AssertionError(f"Expected 0755 on {req_exec}, got {oct(members[req_exec].mode)}")
             for req_file in (
-                f"{lin_prefix}/share/applications/{APP_NAME}.desktop",
-                f"{lin_prefix}/share/icons/hicolor/scalable/apps/{APP_NAME}.svg",
-                f"{lin_prefix}/share/icons/hicolor/256x256/apps/{APP_NAME}.png",
+                f"{lin_prefix}/share/applications/{APP_SLUG}.desktop",
+                f"{lin_prefix}/share/icons/hicolor/scalable/apps/{APP_SLUG}.svg",
+                f"{lin_prefix}/share/icons/hicolor/256x256/apps/{APP_SLUG}.png",
                 f"{lin_prefix}/README.md",
                 f"{lin_prefix}/THIRD_PARTY.md",
             ):
                 if req_file not in members:
                     raise AssertionError(f"Missing {req_file} in Linux .tar.gz")
-            desktop_member = tf.extractfile(members[f"{lin_prefix}/share/applications/{APP_NAME}.desktop"])
+            desktop_member = tf.extractfile(members[f"{lin_prefix}/share/applications/{APP_SLUG}.desktop"])
             assert desktop_member is not None
             validate_desktop_entry(desktop_member.read().decode("utf-8"))
 
@@ -1441,8 +1472,13 @@ def run_self_test(repo_root: Path) -> int:
                     capture_output=True,
                     text=True,
                 )
-                installed_desktop = xdg_prefix / "share" / "applications" / f"{APP_NAME}.desktop"
-                if not (xdg_prefix / "bin" / "nmrassign-gui").is_file() or not installed_desktop.is_file():
+                installed_desktop = xdg_prefix / "share" / "applications" / f"{APP_SLUG}.desktop"
+                if (
+                    not (xdg_prefix / "bin" / GUI_BIN).is_file()
+                    or not (xdg_prefix / "bin" / CLI_BIN).is_file()
+                    or not (xdg_prefix / "bin" / CLI_ALIAS_BIN).is_file()
+                    or not installed_desktop.is_file()
+                ):
                     raise AssertionError("install-desktop.sh failed to populate XDG prefix")
 
         lin_repeat_dir = tmp_path / "lin_repeat"
@@ -1476,13 +1512,13 @@ def run_self_test(repo_root: Path) -> int:
             f"({sums_file.stat().st_size} B) + tamper rejection confirmed"
         )
 
-    print(f"ALL SELF-TESTS PASSED (nmr-assign v{version})")
+    print(f"ALL SELF-TESTS PASSED ({APP_NAME} v{version})")
     return 0
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Package cross-platform nmr-assign desktop/CLI release archives and icons."
+        description="Package cross-platform FERRIC desktop/CLI release archives and icons."
     )
     parser.add_argument(
         "--platform",
@@ -1510,7 +1546,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--repo-root",
         type=Path,
         default=Path(__file__).resolve().parent.parent,
-        help="Path to the nmr-assign repository root.",
+        help="Path to the FERRIC repository root.",
     )
     parser.add_argument(
         "--skip-dmg",

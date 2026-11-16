@@ -1,6 +1,6 @@
-# Contributing to `nmr-assign`
+# Contributing to `FERRIC`
 
-Thank you for contributing to `nmr-assign`! Because this project is built strictly clean-room under the **MIT License**, please review and follow the guidelines in [`AGENTS.md`](AGENTS.md) before opening a pull request.
+Thank you for contributing to **FERRIC**! Because this project is built strictly clean-room under the **MIT License**, please review and follow the guidelines in [`AGENTS.md`](AGENTS.md) before opening a pull request.
 
 ## 1. Clean-Room & Provenance Policy (Non-Negotiable)
 
@@ -32,6 +32,6 @@ cargo check --release -p nmr-gui --target wasm32-unknown-unknown
 cargo test --release --workspace
 
 # 4. Non-regression benchmark on synthetic ubiquitin (GPU & CPU)
-cargo run --release -p nmr-cli -- benchmark --star data/fixtures/synthetic_ubiquitin.str --engine gpu -v
-cargo run --release -p nmr-cli -- benchmark --star data/fixtures/synthetic_ubiquitin.str --engine cpu -v
+cargo run --release -p nmr-cli --bin ferric -- benchmark --star data/fixtures/synthetic_ubiquitin.str --engine gpu -v
+cargo run --release -p nmr-cli --bin ferric -- benchmark --star data/fixtures/synthetic_ubiquitin.str --engine cpu -v
 ```

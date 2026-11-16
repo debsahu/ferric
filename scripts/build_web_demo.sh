@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
 Usage: bash scripts/build_web_demo.sh [--out <dir>] [--install-cli] [--check-only]
 
 Options:
-  --out <dir>      Destination folder for index.html + nmrassign_gui.{js,wasm} (default: target/web-demo)
+  --out <dir>      Destination folder for index.html + ferric_gui.{js,wasm} (default: target/web-demo)
   --install-cli    Install matching wasm-bindgen-cli version from Cargo.lock if missing/mismatched
   --check-only     Run cargo check for wasm32-unknown-unknown and validate docs/demo/index.html
 EOF
@@ -74,8 +74,8 @@ render_demo_shell_html() {
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="apple-mobile-web-app-title" content="nmr-assign" />
-  <title>nmr-assign — Live WebGPU Browser Workbench Demo</title>
+  <meta name="apple-mobile-web-app-title" content="FERRIC" />
+  <title>FERRIC — Live WebGPU Browser Workbench Demo</title>
   <style>
     :root {
       --bg: #0e131b;
@@ -357,7 +357,7 @@ render_demo_shell_html() {
 <body>
   <header class="demo-bar">
     <div class="demo-brand">
-      <strong>nmr-assign<span class="brand-sub"> &middot; Live WebGPU Demo</span></strong>
+      <strong>FERRIC<span class="brand-sub"> &middot; Live WebGPU Demo</span></strong>
       <span class="preset-note">
         Preloaded in-memory: Ubiquitin 2D HSQC + 3D HNCACB + 1UBQ 3D + 1D Stack + DOSY + Metabolomics
       </span>
@@ -373,7 +373,7 @@ render_demo_shell_html() {
     <div id="nmr_loading" role="status">
       <div id="nmr_spinner" class="spinner"></div>
       <div id="nmr_status_box" style="font-size: 14px; letter-spacing: 0.01em;">
-        Initializing <strong>nmr-assign</strong> WebAssembly + WebGPU Workbench&hellip;
+        Initializing <strong>FERRIC</strong> WebAssembly + WebGPU Workbench&hellip;
       </div>
     </div>
     <div id="fallback" role="alert" hidden></div>
@@ -433,14 +433,14 @@ render_demo_shell_html() {
       const caps = await detectCapabilities();
       if (!caps.webgpu) {
         const glNote = caps.webgl2
-          ? "Your browser supports <code>WebGL2</code>, whereas <code>nmr-assign</code>'s zero-install GPU contour and 3D ribbon shaders use <code>WebGPU</code> (<code>navigator.gpu</code>)."
+          ? "Your browser supports <code>WebGL2</code>, whereas <code>FERRIC</code>'s zero-install GPU contour and 3D ribbon shaders use <code>WebGPU</code> (<code>navigator.gpu</code>)."
           : "Neither <code>WebGPU</code> (<code>navigator.gpu</code>) nor <code>WebGL2</code> could be initialized in this browser context.";
         showBanner(
           "WebGPU Adapter Required for Live Browser Workbench",
           "<p>" + glNote + "</p>" +
           '<p class="hint-line"><strong>iOS / iPadOS 18+ Safari:</strong> Settings &rarr; Apps &rarr; Safari &rarr; Advanced &rarr; Feature Flags &rarr; enable <code>WebGPU</code>.</p>' +
           '<p class="hint-line"><strong>Android 12+ Chrome 121+:</strong> Enabled by default on supported GPUs (or toggle <code>chrome://flags/#enable-unsafe-webgpu</code>).</p>' +
-          '<p class="hint-line"><strong>Desktop:</strong> Chrome / Edge 113+, Safari 18+, or Firefox 130+ with hardware acceleration, or run <code>cargo run --release -p nmr-gui</code>.</p>',
+          '<p class="hint-line"><strong>Desktop:</strong> Chrome / Edge 113+, Safari 18+, or Firefox 130+ with hardware acceleration, or run <code>cargo run --release -p nmr-gui --bin ferric-gui</code>.</p>',
           caps.detail,
           caps.webgl2 ? "warn" : "err"
         );
@@ -452,7 +452,7 @@ render_demo_shell_html() {
         badgeEl.className = "cap-badge ok";
       }
 
-      const bundlePath = "./nmrassign" + "_gui.js";
+      const bundlePath = "./ferric" + "_gui.js";
       try {
         const wasmModule = await import(bundlePath);
         if (typeof wasmModule.default === "function") {
@@ -462,7 +462,7 @@ render_demo_shell_html() {
         const msg = err && err.message ? String(err.message) : String(err);
         showBanner(
           "WebAssembly Demo Bundle Not Found or Failed to Load",
-          "<p>WebGPU is available in your browser, but <code>nmrassign_gui.js</code> / <code>nmrassign_gui_bg.wasm</code> has not been built into this directory yet.</p>" +
+          "<p>WebGPU is available in your browser, but <code>ferric_gui.js</code> / <code>ferric_gui_bg.wasm</code> has not been built into this directory yet.</p>" +
           "<p>Build the release <code>wasm32-unknown-unknown</code> bundle locally with:</p>" +
           "<p><code>bash scripts/build_web_demo.sh --out target/manual/demo</code></p>" +
           "<p style=\"font-size:12px\">Detail: <code>" + msg.replace(/[<>&]/g, "") + "</code></p>",
@@ -607,9 +607,12 @@ ensure_wasm_bindgen_cli
 echo "[web-demo] Building nmr-gui (release, wasm32-unknown-unknown)..."
 cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --release -p nmr-gui --target wasm32-unknown-unknown
 
-WASM_BIN="$REPO_ROOT/target/wasm32-unknown-unknown/release/nmrassign-gui.wasm"
+WASM_BIN="$REPO_ROOT/target/wasm32-unknown-unknown/release/ferric-gui.wasm"
 if [[ ! -f "$WASM_BIN" ]]; then
-  echo "error: expected compiled WASM binary at nmrassign-gui.wasm" >&2
+  WASM_BIN="$REPO_ROOT/target/wasm32-unknown-unknown/release/nmrassign-gui.wasm"
+fi
+if [[ ! -f "$WASM_BIN" ]]; then
+  echo "error: expected compiled WASM binary at ferric-gui.wasm (or fallback nmrassign-gui.wasm)" >&2
   exit 1
 fi
 
@@ -619,13 +622,13 @@ wasm-bindgen \
   --target web \
   --no-typescript \
   --out-dir "$OUT_DIR" \
-  --out-name nmrassign_gui \
+  --out-name ferric_gui \
   "$WASM_BIN"
 
 render_demo_shell_html > "$OUT_DIR/index.html"
 touch "$OUT_DIR/.nojekyll"
 
-for expected in "index.html" "nmrassign_gui.js" "nmrassign_gui_bg.wasm"; do
+for expected in "index.html" "ferric_gui.js" "ferric_gui_bg.wasm"; do
   if [[ ! -s "$OUT_DIR/$expected" ]]; then
     echo "error: missing or empty output artifact $expected" >&2
     exit 1

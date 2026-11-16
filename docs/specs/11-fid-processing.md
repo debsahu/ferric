@@ -203,11 +203,11 @@ Direct `${}^{1}\text{H}$ (`dim 0`) is processed first (steps 1–9 below). When 
 
 ## 3. CLI & Interchange Integration (`crates/nmr-cli`)
 
-1. `nmrassign process --in <fid_dir> --out <out_path_or_dir> [--exp <EXP>] [--recipe <json>] [--no-crop] [--lp]`:
+1. `ferric process --in <fid_dir> --out <out_path_or_dir> [--exp <EXP>] [--recipe <json>] [--no-crop] [--lp]`:
    - Processes a 2D or 3D Bruker/Varian raw FID directory (uniform or NUS) into NMRPipe (`.ft2` / `.ft3`) or Bruker `pdata` directory (readable unchanged by `nmr_core::spectrum`) and writes `processing_recipe.json` alongside it.
 2. `--fid` support in `pick` and `pipeline`:
-   - `nmrassign pick --fid <dir> --exp <EXP> -o peaks.tsv`
-   - `nmrassign pipeline --sequence seq.fasta --fid-hsqc <dir> --fid-triple EXP=<dir> ... --out-dir <dir>` (processes FIDs in memory using `ProcessingRecipe`, writes `processing_recipe.json` to `--out-dir`, and runs the existing picker + solver unchanged).
+   - `ferric pick --fid <dir> --exp <EXP> -o peaks.tsv`
+   - `ferric pipeline --sequence seq.fasta --fid-hsqc <dir> --fid-triple EXP=<dir> ... --out-dir <dir>` (processes FIDs in memory using `ProcessingRecipe`, writes `processing_recipe.json` to `--out-dir`, and runs the existing picker + solver unchanged).
 
 ---
 
@@ -226,8 +226,8 @@ Direct `${}^{1}\text{H}$ (`dim 0`) is processed first (steps 1–9 below). When 
 
 ## 5. Public Archive Fetcher & Frozen Real-Protein Benchmark (Parts 4 & 5)
 
-### 5.1 Fetcher (`nmrassign fetch-bmrb`)
-- `nmrassign fetch-bmrb --id <bmrb_id> --dest data/private/bmrb/<id>/`:
+### 5.1 Fetcher (`ferric fetch-bmrb`)
+- `ferric fetch-bmrb --id <bmrb_id> --dest data/private/bmrb/<id>/`:
   - Queries BMRB REST/HTTP (`https://api.bmrb.io/v2/entry/<id>` and `https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr<id>/` `bmr<id>_3.str` + `timedomain_data/`, with legacy `/biomolecules/` and `/timedomain/` fallbacks), enforcing `User-Agent: nmrassign-fetch` and $\le 1\text{ request/s}$ rate limiting.
   - Downloads the NMR-STAR entry (`bmr<id>_3.str`) and time-domain archive(s), extracts archives safely (preventing path traversal), and writes `PROVENANCE.md` with source URLs, CC0/BMRB public-domain license notice, UTC download timestamp, byte sizes, and SHA-256 digests of every downloaded file.
 
@@ -236,7 +236,7 @@ Columns: `bmrb_id`, `protein`, `residues`, `field_mhz`, `vendor`, `experiments`,
 - `split` is frozen as `dev` (~1/3, including `ubiquitin_local` and `51439` `CISD3`) or `heldout` (~2/3).
 - Selection criteria for new entries (10–15 total): 50–150 residues, uniform or NUS raw time-domain data with complete schedule metadata, `HSQC` + `HNCO` + (`HNCACB` or `HNCA`) + (`CBCACONH` or `HNCOCA`), $\ge 80\%$ deposited backbone completeness, spanning $\alpha$, $\beta$, and $\alpha+\beta$ folds, multiple field strengths, and both Bruker and Varian/Agilent spectrometers.
 
-### 5.3 Runner (`nmrassign real-benchmark`)
-- `nmrassign real-benchmark --manifest data/benchmark/real_manifest.tsv --split dev|heldout [--solver standard|evo-graph] [--seeds 5] [--json-out results.json]`:
+### 5.3 Runner (`ferric real-benchmark`)
+- `ferric real-benchmark --manifest data/benchmark/real_manifest.tsv --split dev|heldout [--solver standard|evo-graph] [--seeds 5] [--json-out results.json]`:
   - Discovers raw FID experiments in `data/private/bmrb/<id>/` (and existing local dev paths for Ubiquitin / CISD3), runs `process -> pick -> assign -> score` (including automatic NUS `IST`/`FISTA` reconstruction when `nus_mask` is active) using unlabelled global per-atom reference offset fitting (`fit_unlabelled_global_offsets`), and prints per-entry metrics, macro/micro averages, skipped missing-data entries (non-fatal for CI), and exact failure diagnostics for any missing-schedule NUS or unsupported quadrature dataset.
   - **Strict holdout governance**: `heldout` is evaluated once for reporting; no code, default, or threshold may be modified in response to `heldout` output.

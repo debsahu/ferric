@@ -1,6 +1,6 @@
 # Chapter 5: Analytical 1D Multiplets, Hoye J-Trees, qNMR & Pseudo-2D DOSY
 
-Beyond macromolecular multidimensional assignment, `nmr-assign` includes a complete clean-room analytical 1D NMR and diffusion studio (`nmr-core::nmr1d`, `multiplet`, `dosy`, `nmr-gpu::dosy_gpu`, `nmr-gui::stack1d_panel`, `dosy_panel`) tightly integrated with the **`Octet` 2D Chemical Structure Studio**.
+Beyond macromolecular multidimensional assignment, FERRIC includes a complete clean-room analytical 1D NMR and diffusion studio (`nmr-core::nmr1d`, `multiplet`, `dosy`, `nmr-gpu::dosy_gpu`, `nmr-gui::stack1d_panel`, `dosy_panel`) tightly integrated with the **`Octet` 2D Chemical Structure Studio**.
 
 > [!IMPORTANT] Validation Scope (Synthetic Forward-Model Self-Consistency)
 > Quantitative accuracy numbers in this chapter (Voigt coalesced-shoulder deconvolution, roofed `AB`/`ABX` Hoye `J`-tree recovery, ISO GUM `qNMR` molar purity, and discrete `BIC` / Tikhonov `ILT` `DOSY` diffusivity recovery across `T14.1`–`T14.4`) are **synthetic forward-model self-consistency evaluations** (plus exact $2^N$ quantum spin-$1/2$ Hamiltonian cross-checks). **`0` real deposited raw small-molecule 1D `fid`s, wet-lab certified `qNMR` reference mixtures (`NIST`/`USP` CRMs), or experimental pseudo-2D `DOSY` `ser` datasets have been evaluated end-to-end yet**; external experimental repository validation is tracked openly under follow-ups **`F14`** and **`F16`**.
@@ -55,7 +55,7 @@ Each integral region supports three baseline modes (`None`, `Explicit { bias, sl
 ### Bidirectional `Octet` 2D Structure ↔ Multiplet Assignment
 
 Multiplet regions link directly to 0-based `Octet` atom indices, 1-based `MOL`/`SDF` V2000 atom numbers, and `SMILES` `[atom:map]` tags (`MultipletAssignmentTable`, `auto_assign_1h_multiplets`):
-- Hovering a multiplet in `nmr-gui` illuminates matching symmetry-equivalent atoms with color-coded `RenderScene` halos on the 2D `Octet` chemical drawing (and vice versa).
+- Hovering a multiplet in `ferric-gui` illuminates matching symmetry-equivalent atoms with color-coded `RenderScene` halos on the 2D `Octet` chemical drawing (and vice versa).
 - Round-trips cleanly via `SDF` `<NMR_ASSIGNMENT>` property tags and structured `TSV`.
 
 ---
@@ -85,7 +85,7 @@ The interactive **`📚 1D Stack & Kinetics`** panel (`nmr-gui::stack1d_panel`, 
 Includes **interval FFT cross-correlation peak alignment** (`align_traces_interval_fft`; Savorani, Tomasi & Engelsen 2010) to remove small pH/temperature peak drift prior to difference or arrayed integral kinetics export (`TSV`, `SVG`, `PNG`).
 
 ![Analytical 1D multiplet J-tree, kinetics stack and qNMR](../assets/04_nmr1d_multiplet_stack.svg)
-*Figure 5.1: Deterministic `nmrassign export-fig --panel nmr1d-stack` showcase of recursive Hoye `ddd` `J`-coupling splitting trees, a 5-timepoint arrayed reaction stack, and ISO GUM internal-standard `qNMR` purity metrology (synthetic forward-model showcase).*
+*Figure 5.1: Deterministic `ferric export-fig --panel nmr1d-stack` showcase of recursive Hoye `ddd` `J`-coupling splitting trees, a 5-timepoint arrayed reaction stack, and ISO GUM internal-standard `qNMR` purity metrology (synthetic forward-model showcase).*
 
 ---
 
@@ -106,7 +106,7 @@ $$b(g) = \bigl(\gamma\, \sigma_{\text{shape}}\, g\, \delta\bigr)^2 \, \Delta_{\t
 
 ### Default Quantitative Fit: Discrete `BIC` VarPro + LM (`K = 1, 2, 3`)
 
-By default (`nmrassign dosy fit --criterion bic`), `nmr-assign` fits discrete $K \in \{1, 2, 3\}$ multi-exponential decays via **Variable Projection + Kaufman projected Gauss–Newton + Levenberg–Marquardt** on CPU (`f64`) and massively parallel WebGPU compute shaders (`dosy.wgsl`, `< 0.5%` relative $D$ difference and exact `BIC` model-order parity vs CPU, chunked at `16,384` columns):
+By default (`ferric dosy fit --criterion bic`), FERRIC fits discrete $K \in \{1, 2, 3\}$ multi-exponential decays via **Variable Projection + Kaufman projected Gauss–Newton + Levenberg–Marquardt** on CPU (`f64`) and massively parallel WebGPU compute shaders (`dosy.wgsl`, `< 0.5%` relative $D$ difference and exact `BIC` model-order parity vs CPU, chunked at `16,384` columns):
 
 $$\operatorname{BIC}(K) = M \ln\!\left(\frac{\text{RSS}_K}{M}\right) + 2K \ln M$$
 
@@ -114,7 +114,7 @@ augmented by a Davies rate-grid look-elsewhere penalty, a $4\sigma$ component $\
 
 ### Opt-In Continuous Tikhonov `ILT` (`CONTIN`-Style) & Conditioning Caveats
 
-For polydisperse polymers or continuous size distributions, `solve_tikhonov_ilt` (`nmrassign dosy ilt --strategy gcv|lcurve|discrepancy|fixed`, Provencher 1982; Lawson & Hanson 1974 `NNLS`) solves the second-derivative Tikhonov-regularized non-negative inverse Laplace problem over a log-spaced diffusivity grid $\{D_q\}_{q=1}^Q$:
+For polydisperse polymers or continuous size distributions, `solve_tikhonov_ilt` (`ferric dosy ilt --strategy gcv|lcurve|discrepancy|fixed`, Provencher 1982; Lawson & Hanson 1974 `NNLS`) solves the second-derivative Tikhonov-regularized non-negative inverse Laplace problem over a log-spaced diffusivity grid $\{D_q\}_{q=1}^Q$:
 
 $$\min_{\mathbf{f} \ge 0} \; \|\mathbf{K}\mathbf{f} - \mathbf{y}\|_2^2 + \lambda \|\mathbf{L}_2 \mathbf{f}\|_2^2$$
 
@@ -134,28 +134,28 @@ From fitted $D$, `nmr-core::dosy` computes temperature-compensated Stokes–Eins
 $$R_h = \frac{k_B T}{6\pi \eta(T) D}, \qquad \widehat{\text{MW}} = \left(\frac{\alpha_{\text{solv}}}{D}\right)^{1/\beta_{\text{solv}}}$$
 
 ![Pseudo-2D BPP-LED DOSY diffusion map](../assets/05_dosy_2d_diffusion_map.svg)
-*Figure 5.2: Deterministic `nmrassign export-fig --panel dosy` pseudo-2D `BPP-LED` `DOSY` diffusivity map separating a three-component mixture (`Maleate`, `Raffinose`, `Lysozyme`) via `BIC`-selected Stejskal–Tanner fitting alongside Stokes–Einstein hydrodynamic `MW` calibration (synthetic forward-model showcase).*
+*Figure 5.2: Deterministic `ferric export-fig --panel dosy` pseudo-2D `BPP-LED` `DOSY` diffusivity map separating a three-component mixture (`Maleate`, `Raffinose`, `Lysozyme`) via `BIC`-selected Stejskal–Tanner fitting alongside Stokes–Einstein hydrodynamic `MW` calibration (synthetic forward-model showcase).*
 
 ### Headless CLI Quick Reference (`nmr1d` & `dosy`)
 
 ```bash
 # 1. Process raw 1D FID (or .jdx / Bruker 1r), autophase, Whittaker baseline, HSVD & Voigt pick
-nmrassign nmr1d process --in ./data/compound_1h/1 --solvent CDCl3 --hsvd --deconvolve --out ./out/spec1d.tsv
+ferric nmr1d process --in ./data/compound_1h/1 --solvent CDCl3 --hsvd --deconvolve --out ./out/spec1d.tsv
 
 # 2. Extract Hoye J-coupling multiplet trees & ACS/JOC/RSC/Nature experimental paragraph
-nmrassign nmr1d multiplet --in ./out/spec1d.tsv --solvent CDCl3 --style acs \
+ferric nmr1d multiplet --in ./out/spec1d.tsv --solvent CDCl3 --style acs \
   --out ./out/multiplets.tsv --report-out ./out/multiplets.txt
 
 # 3. Compute ISO GUM internal-standard qNMR purity (% w/w, U_k=2, and 5*T1 saturation audit)
-nmrassign nmr1d qnmr --in ./out/spec1d.tsv \
+ferric nmr1d qnmr --in ./out/spec1d.tsv \
   --std-crm DMSO2 --std-mass-mg 5.12 --std-purity 0.9994 --std-region 3.05:2.95 \
   --analyte-mass-mg 12.40 --analyte-mw 180.16 --analyte-region 2.42:2.28:3:Ac \
   --out ./out/qnmr.tsv --json-out ./out/qnmr_report.json
 
 # 4. Discrete BIC Stejskal-Tanner / BPP-LED DOSY fit, opt-in Tikhonov ILT & Stokes-Einstein MW
-nmrassign dosy fit --in ./data/mixture_decay.tsv --exp-dir ./data/mixture_dosy/10 \
+ferric dosy fit --in ./data/mixture_decay.tsv --exp-dir ./data/mixture_dosy/10 \
   --criterion bic --solvent CDCl3 --temp-k 298.15 --engine auto --out ./out/dosy_bic.tsv
-nmrassign dosy ilt --in ./data/mixture_decay.tsv --exp-dir ./data/mixture_dosy/10 \
+ferric dosy ilt --in ./data/mixture_decay.tsv --exp-dir ./data/mixture_dosy/10 \
   --strategy gcv --out ./out/dosy_ilt.tsv
-nmrassign dosy mw --d 7.8e-10 --solvent CDCl3 --temp-k 298.15
+ferric dosy mw --d 7.8e-10 --solvent CDCl3 --temp-k 298.15
 ```

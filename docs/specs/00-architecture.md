@@ -11,20 +11,20 @@ Feature parity target, mapped to modules:
 
 | Capability | Crate / Module | Spec | Status |
 |---|---|---|---|
-| Raw time-domain FID, hypercomplex IST/FISTA NUS & multidimensional DSP operators | `fid`, `process`, `ops` | 11 | Working (`nmrassign process`, `--fid`) |
+| Raw time-domain FID, hypercomplex IST/FISTA NUS & multidimensional DSP operators | `fid`, `process`, `ops` | 11 | Working (`ferric process`, `--fid`) |
 | Zero-friction spectrometer folder/archive classifier & `.nef` undo/redo session state | `classify`, `session`, `nmr-gui` | 06, 12 | Working (`< 50 ms` classify, `Cmd/Ctrl+Z`) |
-| Upload sequence + processed spectra, run locally or via HTTP service | `nmr-gui`, `nmr-core::service`, `nmr-cli` | 06, 08 | Working (`nmrassign pipeline` & `serve`) |
+| Upload sequence + processed spectra, run locally or via HTTP service | `nmr-gui`, `nmr-core::service`, `nmr-cli` | 06, 08 | Working (`ferric pipeline` & `serve`) |
 | Automated 2D/3D peak picking (classical MAD + separable residual CNN on CPU & WebGPU) | `picker`, `neural_picker`, `nmr-gpu::neural_gpu` | 02 | Working (`--method classical\|neural`) |
 | Backbone chemical shift assignment (CPU `f64`, `evo-graph` & WebGPU `16 KiB` SRAM, per-engine `qc` calibration) | `solver`, `evo_graph`, `qc`, `nmr-gpu` | 03, 06, 10 | Working (12-protein BMRB + 26-entry real suite) |
 | Problem-regime solvers: protonless `13C`-detected IDPs, `SSP`/`δ2D` propensity & paramagnetic `PRE`/`Δχ` `PCS` | `c13_detected`, `idp_solver`, `idp_propensity`, `paramagnetic`, `nmr-gpu::idp_gpu` | 14 | Working (`--regime idp-13c\|paramagnetic`, `propensity`) |
 | Interactive 2D GPU contours, sequence ribbon, 2D covalent sidechain inspector & 3D walk strips | `nmr-gui`, `sidechain_widget` (Desktop + WASM) | 06, 07, 12 | Working |
 | Built-in `wgpu` 3D biomolecular `.pdb`/`.cif` ribbon viewer, putty tracks, 3D-to-strip picking & NOE/PRE cylinders | `mol3d_viewer`, `mol3d_overlay`, `shaders/mol3d.wgsl` (Desktop + WASM) | 15 | Working (`nmr-gui` 3D viewport) |
-| Aliphatic, aromatic (`Phe`/`Tyr`/`Trp`/`His`) & Bayesian stereospecific prochiral assignment | `topology`, `sidechain`, `aromatic`, `stereospec` | 07, 07b | Working (`nmrassign sidechain [--aromatic] [--stereospec]`) |
-| Supramolecular `13C`-Methyl TROSY (`ILVMAT`) 2D/3D/4D picker & WebGPU/CPU contact-graph solver | `methyl_trosy`, `methyl_solver`, `nmr-gpu::methyl_gpu` | 13 | Working (`nmrassign methyl`) |
-| Post-assignment 3/9-mer `(phi, psi[, chi1])` `TorsionDb` (4-layer `HomologFirewall`), iterative NOESY ADR & Saupe `RDC` CPU/WebGPU folding | `dihedrals`, `torsion_db`, `noesy`, `rdc`, `structure`, `nmr-gpu::rdc_gpu` | 04, 15 | Working (`nmrassign torsions [--include-chi1]`, `structure [--rdc] [--torsion-db]`) |
-| Self-contained HTML + inline SVG quality, Ramachandran, `CSI`, `RDC` (`D_calc` vs `D_obs` + Cornilescu `Q`) & IDP `SSP`/`δ2D` reports | `nmr-core::report` | 04, 08, 14 | Working (`nmrassign report [--rdc] [--idp-propensity]`) |
+| Aliphatic, aromatic (`Phe`/`Tyr`/`Trp`/`His`) & Bayesian stereospecific prochiral assignment | `topology`, `sidechain`, `aromatic`, `stereospec` | 07, 07b | Working (`ferric sidechain [--aromatic] [--stereospec]`) |
+| Supramolecular `13C`-Methyl TROSY (`ILVMAT`) 2D/3D/4D picker & WebGPU/CPU contact-graph solver | `methyl_trosy`, `methyl_solver`, `nmr-gpu::methyl_gpu` | 13 | Working (`ferric methyl`) |
+| Post-assignment 3/9-mer `(phi, psi[, chi1])` `TorsionDb` (4-layer `HomologFirewall`), iterative NOESY ADR & Saupe `RDC` CPU/WebGPU folding | `dihedrals`, `torsion_db`, `noesy`, `rdc`, `structure`, `nmr-gpu::rdc_gpu` | 04, 15 | Working (`ferric torsions [--include-chi1]`, `structure [--rdc] [--torsion-db]`) |
+| Self-contained HTML + inline SVG quality, Ramachandran, `CSI`, `RDC` (`D_calc` vs `D_obs` + Cornilescu `Q`) & IDP `SSP`/`δ2D` reports | `nmr-core::report` | 04, 08, 14 | Working (`ferric report [--rdc] [--idp-propensity]`) |
 | Standards-compliant export (`NMR-STAR v3.2`, `CCPN NEF v1.1` incl. `dihedral` & `rdc` lists, `TSV`, multi-model `PDB`/`.cif`) | `nmrstar`, `nef`, `peaks`, `structure` | 01, 04 | Working |
-| 2D Chemical Structure, Reaction, Stoichiometry, IUPAC Naming & 1D ¹H/¹³C NMR Studio | `octet_mol`, `octet_analyt`, `octet_render`, `octet_canvas` | — | Working (GUI tab + `nmrassign chem`) |
+| 2D Chemical Structure, Reaction, Stoichiometry, IUPAC Naming & 1D ¹H/¹³C NMR Studio | `octet_mol`, `octet_analyt`, `octet_render`, `octet_canvas` | — | Working (GUI tab + `ferric chem`) |
 | Custom `pulseprogram` physics interpreter, Bayesian pseudo-energy + $C_v(T)$ adaptive SA backbone solver (`--solver bayes-sa`), GPU spin relaxation ($R_1/R_2/\text{NOE}$), Palmer Model-Free ($S^2$), `CEST`, `CPMG` & ligand `CSP` $K_d$ | `pulprog`, `bayes_sa`, `relax_io`, `relax_fit`, `modelfree`, `cest`, `cpmg`, `csp`, `nmr-gpu` | 11, 16, 19 | Planned (`Phase 13`, `T13.0`, `T13.0b`, `T13.1`–`T13.6`) |
 | Analytical 1D NMR Voigt deconvolution, Hoye multiplet `J`-trees, `qNMR`, multi-trace stack/overlay & pseudo-2D `DOSY` studio (discrete `BIC`/`AIC` default + opt-in `CONTIN` `ILT`) | `nmr1d`, `multiplet`, `dosy`, `nmr-gpu`, `stack1d_panel`, `dosy_panel` | 17 | Planned (`Phase 14`, `T14.1`–`T14.4`) |
 | Clean-room Model Context Protocol (`MCP`) server (`stdio` & Streamable HTTP) & live Undo/Redo `nmr-gui` desktop bridge | `mcp`, `mcp_workflows`, `nmr-gui::mcp_bridge`, `nmr-cli` | 18 | Planned (`Phase 15`, `T15.1`–`T15.3`) |

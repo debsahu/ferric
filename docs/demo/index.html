@@ -7,8 +7,8 @@
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="apple-mobile-web-app-title" content="nmr-assign" />
-  <title>nmr-assign — Live WebGPU Browser Workbench Demo</title>
+  <meta name="apple-mobile-web-app-title" content="FERRIC" />
+  <title>FERRIC — Live WebGPU Browser Workbench Demo</title>
   <style>
     :root {
       --bg: #0e131b;
@@ -290,7 +290,7 @@
 <body>
   <header class="demo-bar">
     <div class="demo-brand">
-      <strong>nmr-assign<span class="brand-sub"> &middot; Live WebGPU Demo</span></strong>
+      <strong>FERRIC<span class="brand-sub"> &middot; Live WebGPU Demo</span></strong>
       <span class="preset-note">
         Preloaded in-memory: Ubiquitin 2D HSQC + 3D HNCACB + 1UBQ 3D + 1D Stack + DOSY + Metabolomics
       </span>
@@ -306,7 +306,7 @@
     <div id="nmr_loading" role="status">
       <div id="nmr_spinner" class="spinner"></div>
       <div id="nmr_status_box" style="font-size: 14px; letter-spacing: 0.01em;">
-        Initializing <strong>nmr-assign</strong> WebAssembly + WebGPU Workbench&hellip;
+        Initializing <strong>FERRIC</strong> WebAssembly + WebGPU Workbench&hellip;
       </div>
     </div>
     <div id="fallback" role="alert" hidden></div>
@@ -366,14 +366,14 @@
       const caps = await detectCapabilities();
       if (!caps.webgpu) {
         const glNote = caps.webgl2
-          ? "Your browser supports <code>WebGL2</code>, whereas <code>nmr-assign</code>'s zero-install GPU contour and 3D ribbon shaders use <code>WebGPU</code> (<code>navigator.gpu</code>)."
+          ? "Your browser supports <code>WebGL2</code>, whereas <code>FERRIC</code>'s zero-install GPU contour and 3D ribbon shaders use <code>WebGPU</code> (<code>navigator.gpu</code>)."
           : "Neither <code>WebGPU</code> (<code>navigator.gpu</code>) nor <code>WebGL2</code> could be initialized in this browser context.";
         showBanner(
           "WebGPU Adapter Required for Live Browser Workbench",
           "<p>" + glNote + "</p>" +
           '<p class="hint-line"><strong>iOS / iPadOS 18+ Safari:</strong> Settings &rarr; Apps &rarr; Safari &rarr; Advanced &rarr; Feature Flags &rarr; enable <code>WebGPU</code>.</p>' +
           '<p class="hint-line"><strong>Android 12+ Chrome 121+:</strong> Enabled by default on supported GPUs (or toggle <code>chrome://flags/#enable-unsafe-webgpu</code>).</p>' +
-          '<p class="hint-line"><strong>Desktop:</strong> Chrome / Edge 113+, Safari 18+, or Firefox 130+ with hardware acceleration, or run <code>cargo run --release -p nmr-gui</code>.</p>',
+          '<p class="hint-line"><strong>Desktop:</strong> Chrome / Edge 113+, Safari 18+, or Firefox 130+ with hardware acceleration, or run <code>cargo run --release -p nmr-gui --bin ferric-gui</code>.</p>',
           caps.detail,
           caps.webgl2 ? "warn" : "err"
         );
@@ -385,7 +385,7 @@
         badgeEl.className = "cap-badge ok";
       }
 
-      const bundlePath = "./nmrassign" + "_gui.js";
+      const bundlePath = "./ferric" + "_gui.js";
       try {
         const wasmModule = await import(bundlePath);
         if (typeof wasmModule.default === "function") {
@@ -395,7 +395,7 @@
         const msg = err && err.message ? String(err.message) : String(err);
         showBanner(
           "WebAssembly Demo Bundle Not Found or Failed to Load",
-          "<p>WebGPU is available in your browser, but <code>nmrassign_gui.js</code> / <code>nmrassign_gui_bg.wasm</code> has not been built into this directory yet.</p>" +
+          "<p>WebGPU is available in your browser, but <code>ferric_gui.js</code> / <code>ferric_gui_bg.wasm</code> has not been built into this directory yet.</p>" +
           "<p>Build the release <code>wasm32-unknown-unknown</code> bundle locally with:</p>" +
           "<p><code>bash scripts/build_web_demo.sh --out target/manual/demo</code></p>" +
           "<p style=\"font-size:12px\">Detail: <code>" + msg.replace(/[<>&]/g, "") + "</code></p>",

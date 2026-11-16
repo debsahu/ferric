@@ -1,6 +1,6 @@
 # Chapter 2: Custom Pulse-Program Physics & Multidimensional DSP
 
-Real experimental NMR repositories rarely conform to textbook defaults: laboratories rename pulse programs (`custom_tr_seq_v2`, `my_t1_trosy_interleaved`), synthesize manual `States-TPPI` phase loops inside `FnMODE = QF`, transpose `F1`/`F2` acquisition loops (`AQSEQ = 312`), interleave relaxation delays inside $t_1$, write 0-based or 1-based `nuslist` schedules, or leave unprocessed indirect `REVERSE` flags unset. `nmr-assign` resolves these ambiguities directly from acquisition physics (`nmr-core::pulprog`, `fid`, `process`, `ops`, and `nmr1d`).
+Real experimental NMR repositories rarely conform to textbook defaults: laboratories rename pulse programs (`custom_tr_seq_v2`, `my_t1_trosy_interleaved`), synthesize manual `States-TPPI` phase loops inside `FnMODE = QF`, transpose `F1`/`F2` acquisition loops (`AQSEQ = 312`), interleave relaxation delays inside $t_1$, write 0-based or 1-based `nuslist` schedules, or leave unprocessed indirect `REVERSE` flags unset. FERRIC resolves these ambiguities directly from acquisition physics (`nmr-core::pulprog`, `fid`, `process`, `ops`, and `nmr1d`).
 
 ---
 
@@ -86,12 +86,12 @@ Both Bruker (`FnTYPE = 2`, `NusTD`, `nuslist`) and Varian (`sampling = 'sparse'`
 
 ## Empirical `{sign, fold}` Verification Against `2D HSQC`
 
-Even after header and `pulseprogram` decoding, archived public depositions occasionally contain mis-recorded `REVERSE` flags or post-acquisition script edits that flip indirect axis orientation or shift a 3D cube by half a spectral width. At Step 0 of 3D registration (`register_3d_hn_to_hsqc_2d_with_audit`), `nmr-assign` evaluates all $4 \times 4 = 16$ Klein four-group ($\mathbb{Z}_2 \times \mathbb{Z}_2$) indirect-axis hypotheses $(\text{op}_N, \text{op}_C) \in \{\text{Canonical}, \text{SignFlip}, \text{HalfSwShift}, \text{MirrorFold}\}^2$:
+Even after header and `pulseprogram` decoding, archived public depositions occasionally contain mis-recorded `REVERSE` flags or post-acquisition script edits that flip indirect axis orientation or shift a 3D cube by half a spectral width. At Step 0 of 3D registration (`register_3d_hn_to_hsqc_2d_with_audit`), FERRIC evaluates all $4 \times 4 = 16$ Klein four-group ($\mathbb{Z}_2 \times \mathbb{Z}_2$) indirect-axis hypotheses $(\text{op}_N, \text{op}_C) \in \{\text{Canonical}, \text{SignFlip}, \text{HalfSwShift}, \text{MirrorFold}\}^2$:
 
 1. **`15N` Root-Strip Likelihood $\ln L_N(\text{op}_N)$**: Measures max-abs `(1H, 15N)` sky-projection SNR concentration at picked `2D 15N-HSQC` roots (allowing small cross-experiment carrier drift $(\delta_H, \delta_N) \in [-0.12, +0.12] \times [-0.60, +0.60]\text{ ppm}$).
 2. **`13C` Band & Polarity Prior $\ln L_C(\text{op}_C \mid \text{op}_N)$**: Scores 1D `13C` strip extrema against BMRB carbonyl (`175.8 ± 2.35 ppm`), `CA`-only (`41.5..68.0 ppm`), or biphasic `HNCACB` (`CA > 0`, `CB < 0`) envelopes.
 3. **Dual Bayesian + Physical-Violation Gate**: Because dense amide projections can produce large raw log-Bayes factors on already-valid spectra, overriding `Canonical` requires **both** $\Delta \ln P \ge 12.0\text{ nats}$ **and** strict physical-envelope violation gates (`>= 5` matched roots, `matched_hsqc_fraction >= 0.40` with `>= +0.20` improvement for `op_N != Canonical`, and genuine out-of-envelope / Nyquist-pileup evidence for `op_C != Canonical`). Across a post-hoc audit of `79` real 3D BMRB cubes (`24` cold + `55` dev), `0/79` false rescues fired while `10/10` corrupted cubes and a mis-flagged experimental `CISD3` `HNCO` (`10.26% -> 94.87%`) were rescued cleanly.
-4. **Full Audit Trail**: Any applied rescue emits `warning: [axis-rescue]` on `stderr`, a banner in `nmr-gui`, and an `AxisRescueAuditRecord` in `processing_recipe.json`, `.nef`, and `report.html` (disable with `--no-axis-rescue`).
+4. **Full Audit Trail**: Any applied rescue emits `warning: [axis-rescue]` on `stderr`, a banner in `ferric-gui`, and an `AxisRescueAuditRecord` in `processing_recipe.json`, `.nef`, and `report.html` (disable with `--no-axis-rescue`).
 
 ---
 
@@ -101,7 +101,7 @@ Even after header and `pulseprogram` decoding, archived public depositions occas
 
 ```bash
 # Reconstruct a 3D NUS Bruker directory into NMRPipe .ft3 + processing_recipe.json
-nmrassign process \
+ferric process \
   --in ./data/cisd3/cbcaconh_nus \
   --out ./out/cbcaconh.ft3 \
   --exp CBCACONH \
@@ -131,7 +131,7 @@ $$\min_{X} \; \frac{1}{2}\bigl\| \mathcal{P}_\Omega \mathcal{F}^{-1}(X) - Y_{\te
 
 ## Analytical 1D Autophasing, Whittaker Baseline & `HSVD`
 
-For high-resolution small-molecule and biomolecular 1D NMR (`1H`, `13C{1H}`, `DEPT-90`, `DEPT-135`, `19F`, `31P`), `nmr-core::nmr1d` (`nmrassign nmr1d process`) provides dedicated analytical DSP routines:
+For high-resolution small-molecule and biomolecular 1D NMR (`1H`, `13C{1H}`, `DEPT-90`, `DEPT-135`, `19F`, `31P`), `nmr-core::nmr1d` (`ferric nmr1d process`) provides dedicated analytical DSP routines:
 
 > [!NOTE] 1D DSP Validation Scope (Synthetic Forward-Model Self-Consistency)
 > Quantitative accuracy numbers reported below (`< 2°` `PHC0`, `< 5°` `PHC1`, `< 2.5%` `HSVD` solute integral bias at `35 Hz` offset) come from synthetic forward-model 1D benchmarks (`T14.1`); evaluation on real deposited raw small-molecule 1D Bruker/Varian `fid` acquisitions is tracked openly as follow-up **`F14`**.

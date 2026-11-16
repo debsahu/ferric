@@ -1,6 +1,6 @@
 # Chapter 3: Backbone Solvers, Dataset QC & Honest Calibration
 
-`nmr-assign` provides three complementary, 100% clean-room backbone resonance assignment engines—**`standard`**, **`evo-graph`**, and the opt-in experimental Bayesian statistical-mechanics solver **`bayes-sa`**—backed by unified dataset quality control (`nmr-core::qc`) and isotonic confidence calibration. Every solver outputs shifts strictly in the experimental spectrum's ppm frame and obeys the **sequence-only invariant** (zero 3D coordinates or homolog templates used during sequence-based backbone assignment).
+FERRIC provides three complementary, 100% clean-room backbone resonance assignment engines—**`standard`**, **`evo-graph`**, and the opt-in experimental Bayesian statistical-mechanics solver **`bayes-sa`**—backed by unified dataset quality control (`nmr-core::qc`) and isotonic confidence calibration. Every solver outputs shifts strictly in the experimental spectrum's ppm frame and obeys the **sequence-only invariant** (zero 3D coordinates or homolog templates used during sequence-based backbone assignment).
 
 ---
 
@@ -19,7 +19,7 @@ Before comparing optimization strategies, all three engines share four essential
 
 ```bash
 # Run standard multi-replica simulated annealing on WebGPU (or --engine cpu)
-nmrassign assign --peaks peaks.tsv --seq protein.fasta --solver standard --engine gpu --out out/std
+ferric assign --peaks peaks.tsv --seq protein.fasta --solver standard --engine gpu --out out/std
 ```
 
 Implemented in `crates/nmr-core/src/solver.rs` and `crates/nmr-gpu/` (`docs/specs/03-assignment.md`):
@@ -34,7 +34,7 @@ Implemented in `crates/nmr-core/src/solver.rs` and `crates/nmr-gpu/` (`docs/spec
 
 ```bash
 # Default high-robustness CPU solver for raw picked peak tables
-nmrassign assign --peaks peaks.tsv --seq protein.fasta --solver evo-graph --out out/evograph
+ferric assign --peaks peaks.tsv --seq protein.fasta --solver evo-graph --out out/evograph
 ```
 
 Implemented in `crates/nmr-core/src/evo_graph.rs` (`docs/specs/10-evo-graph-solver.md`; Schmidt & Güntert 2012; Klukowski, Riek & Güntert 2022):
@@ -51,7 +51,7 @@ Implemented in `crates/nmr-core/src/evo_graph.rs` (`docs/specs/10-evo-graph-solv
 
 ```bash
 # Opt-in Bayesian pseudo-energy + adaptive specific-heat SA on WebGPU or CPU
-nmrassign assign --peaks peaks.tsv --seq protein.fasta --solver bayes-sa --engine gpu --out out/bayes
+ferric assign --peaks peaks.tsv --seq protein.fasta --solver bayes-sa --engine gpu --out out/bayes
 ```
 
 Implemented 100% clean-room in `crates/nmr-core/src/bayes_sa.rs` and `crates/nmr-gpu/src/bayes_sa_gpu.rs` (`docs/specs/19-bayesian-sa-solver.md`), citing **Bishop, Torres-Montalvo, Kotaru, Mimun & Wand (*Nature Communications* 2023, 14, 1556; DOI: `10.1038/s41467-023-37219-z`)** and **Kirkpatrick, Gelatt & Vecchi (*Science* 1983, 220, 671–680)**, using exclusively our CC0 BMRB prior corpus (`data/priors/bmrb_priors.json`).
@@ -126,7 +126,7 @@ On the **26-protein non-cold development/seen pool** (`13 dev + 7 seen_p12 + 6 s
 ## Honest Unseen-Protein (Cold-Cohort) Empirical Precision Caveats
 
 > [!IMPORTANT] Unseen-Protein High-Confidence Precision (`conf >= 0.80`) Caveat
-> **`nmr-assign` does NOT claim that `confidence >= 0.80` guarantees `>= 94%` precision on arbitrary unseen experimental proteins.**
+> **FERRIC does NOT claim that `confidence >= 0.80` guarantees `>= 94%` precision on arbitrary unseen experimental proteins.**
 >
 > Real public archival depositions exhibit failure modes that out-of-fold cross-validation on previously inspected cohorts cannot fully anticipate—such as mixed-batch/multi-year referencing mismatches between `2D HSQC` and 3D cubes (e.g., `bmr16238`), unannotated post-acquisition preprocessing, or extreme missing-pathway sparsity (`bmr15819`). Across three strictly pre-registered, single-shot unseen BMRB cohorts (`cold_p12`, `cold_p13`, and `cold_p13_w2` [subsequently relabeled `seen_p13_w2` after single-shot evaluation]), the empirically observed unseen-protein micro high-confidence (`>= 0.80`) precision spans **`86.18%–96.31%`** depending on engine and dataset quality:
 
@@ -141,5 +141,5 @@ On the **26-protein non-cold development/seen pool** (`13 dev + 7 seen_p12 + 6 s
 ### Best-Practice Curation Checklist for Experimentalists
 
 1. **Always inspect `DatasetQcReport` first**: Check inter-experiment `(1H, 15N, 13C)` referencing offsets (`detailed_offsets`)—if `HNCA`, `HNCACB`, and `CBCACONH` come from different spectrometer sessions or years, align carrier offsets before trusting automated `HC` calls.
-2. **Treat `0.80+` as ~88–95% empirical confidence, not 100% ground truth**: Verify sequential `CA`/`CB`/`C'` strip walk junctions in `nmr-gui` (press `st` on boundary residues flanking Prolines, Glycines, or `Warn`-flagged stretches) and lock verified anchor residues (`at` popover or `--locks`) before re-annealing ambiguous regions.
+2. **Treat `0.80+` as ~88–95% empirical confidence, not 100% ground truth**: Verify sequential `CA`/`CB`/`C'` strip walk junctions in `ferric-gui` (press `st` on boundary residues flanking Prolines, Glycines, or `Warn`-flagged stretches) and lock verified anchor residues (`at` popover or `--locks`) before re-annealing ambiguous regions.
 3. **Never treat `< 0.80` calls under `Warn` as calibrated probabilities**: Sub-HC assignments are candidate hypotheses intended to guide interactive strip inspection.

@@ -112,7 +112,7 @@ jobs:
           fi
           "$PY_BIN" scripts/package_release.py --self-test
 
-      - name: Build workspace release binaries (nmrassign + nmrassign-gui)
+      - name: Build workspace release binaries (ferric, ferric-gui, and nmrassign alias)
         run: cargo build --release --workspace --bins
 
       - name: Package & verify Apple Silicon macOS release (.app + .dmg + .tar.gz)
@@ -120,21 +120,21 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = "arm64"
-          ./target/release/nmrassign --version
+          ./target/release/ferric --version
           python3 scripts/package_release.py \
             --platform macos-arm64 \
             --bin-dir target/release \
             --out-dir dist
-          plutil -lint dist/nmr-assign.app/Contents/Info.plist
-          codesign --verify --deep --strict dist/nmr-assign.app
-          hdiutil imageinfo dist/nmr-assign-v*-macos-arm64.dmg >/dev/null
+          plutil -lint dist/FERRIC.app/Contents/Info.plist
+          codesign --verify --deep --strict dist/FERRIC.app
+          hdiutil imageinfo dist/ferric-v*-macos-arm64.dmg >/dev/null
 
       - name: Package & verify Windows x86_64 release (.zip)
         if: matrix.platform == 'windows-x86_64'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          .\target\release\nmrassign.exe --version
+          .\target\release\ferric.exe --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/package_release.py `
             --platform windows-x86_64 `
@@ -142,11 +142,25 @@ jobs:
             --out-dir dist
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Package & verify Linux x86_64 release (.tar.gz + FreeDesktop launcher)
+      - name: Package & verify Linux x86_64 release (.tar.gz + FreeDesktop launcher + glibc <= 2.35)
         if: matrix.platform == 'linux-x86_64'
         run: |
           set -euo pipefail
-          ./target/release/nmrassign --version
+          ./target/release/ferric --version
+          python3 - <<'PY'
+          import re, subprocess, sys
+          max_ver = (0, 0)
+          for b in ("target/release/ferric", "target/release/ferric-gui", "target/release/nmrassign"):
+              out = subprocess.check_output(["objdump", "-T", b], text=True)
+              for m in re.finditer(r"GLIBC_(\d+)\.(\d+)", out):
+                  v = (int(m.group(1)), int(m.group(2)))
+                  if v > max_ver:
+                      max_ver = v
+          print(f"Detected max GLIBC symbol version: GLIBC_{max_ver[0]}.{max_ver[1]}")
+          if max_ver > (2, 35):
+              print(f"ERROR: GLIBC_{max_ver[0]}.{max_ver[1]} exceeds Ubuntu 22.04 baseline (2.35)", file=sys.stderr)
+              sys.exit(1)
+          PY
           python3 scripts/package_release.py \
             --platform linux-x86_64 \
             --bin-dir target/release \
@@ -182,10 +196,10 @@ jobs:
           set -euo pipefail
           WS_VER="$(python3 -c 'import pathlib, sys; sys.path.insert(0, "scripts"); import package_release as p; print(p.read_workspace_version(pathlib.Path(".")))')"
           EXPECTED_FILES=(
-            "dist/nmr-assign-v${WS_VER}-macos-arm64.dmg"
-            "dist/nmr-assign-v${WS_VER}-macos-arm64.tar.gz"
-            "dist/nmr-assign-v${WS_VER}-windows-x86_64.zip"
-            "dist/nmr-assign-v${WS_VER}-linux-x86_64.tar.gz"
+            "dist/ferric-v${WS_VER}-macos-arm64.dmg"
+            "dist/ferric-v${WS_VER}-macos-arm64.tar.gz"
+            "dist/ferric-v${WS_VER}-windows-x86_64.zip"
+            "dist/ferric-v${WS_VER}-linux-x86_64.tar.gz"
           )
           for f in "${EXPECTED_FILES[@]}"; do
             if [[ ! -s "$f" ]]; then
@@ -253,7 +267,8 @@ jobs:
           elif grep -qi "release not found" <<<"${RELEASE_VIEW_OUT}"; then
             gh release create "$TAG_NAME" "${ASSETS[@]}" \
               --verify-tag \
-              --title "nmr-assign ${TAG_NAME}" \
+              --title "FERRIC ${TAG_NAME}" \
+              --notes "Linux x86_64 binaries target Ubuntu 22.04 (minimum \`glibc >= 2.35\`)." \
               --generate-notes
           else
             echo "ERROR: Failed to inspect GitHub Release ${TAG_NAME} via gh release view:" >&2

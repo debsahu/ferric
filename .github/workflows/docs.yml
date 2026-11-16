@@ -49,7 +49,7 @@ jobs:
       - name: Upload built manual & WebGPU demo artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nmrassign-manual-and-web-demo
+          name: ferric-manual-and-web-demo
           path: ${{ runner.temp }}/pages_site
 
       - name: Upload GitHub Pages artifact
@@ -75,7 +75,7 @@ jobs:
 
       - name: Warn if GitHub Pages is not configured
         if: steps.configure_pages.outcome != 'success'
-        run: echo "::warning::GitHub Pages is not enabled or configured for GitHub Actions; skipping live deployment (static bundle remains attached as workflow artifact nmrassign-manual-and-web-demo)."
+        run: echo "::warning::GitHub Pages is not enabled or configured for GitHub Actions; skipping live deployment (static bundle remains attached as workflow artifact ferric-manual-and-web-demo)."
 
       - name: Deploy artifact to GitHub Pages
         if: steps.configure_pages.outcome == 'success'

@@ -209,7 +209,7 @@ For a `STOCSY` driver at $\delta_{k^*}$, candidate metabolites containing a reso
 - **Quadrant D (Bottom-Right)**: Ranked candidate biomarker & BMRB metabolite identification table.
 
 ### 9.3 Command-Line Interface (`crates/nmr-cli/src/metabolomics_cmd.rs`)
-- `nmrassign metabolomics bin`: cohort preprocessing, water/urea/TSP region exclusion, optional interval FFT peak alignment, Adaptive Intelligent Binning (`AIB`, default) or fixed-width Uniform binning, `PQN` / `TSA` / `TSP` dilution normalization, and `Pareto` / `UV` / `MeanCenter` scaling to CSV/TSV & reusable study JSON.
-- `nmrassign metabolomics pca`: deterministic cyclic Jacobi SVD `PCA`, explained variance ratios, 95% Hotelling $T^2$ leverage limits, and Jackson–Mudholkar $Q$-residual (`SPE`) outlier diagnostics.
-- `nmrassign metabolomics oplsda`: NIPALS `OPLS-DA` (`1` predictive + $A_o$ orthogonal components), leak-free stratified $k$-fold cross-validated $Q^2$, deterministic $N$-permutation $p$-value (`OverfitWarning` / `is_validated`), `VIP`, Wiklund `S-plot`, and `BH-FDR` Welch Volcano biomarker ranking.
-- `nmrassign metabolomics stocsy`: 1D/2D `STOCSY` covariance & correlation ($r, r^2$) trace from a user-selected driver chemical shift (`--driver-ppm`) plus CC0 `BMRB` biofluid library marker matching.
+- `ferric metabolomics bin`: cohort preprocessing, water/urea/TSP region exclusion, optional interval FFT peak alignment, Adaptive Intelligent Binning (`AIB`, default) or fixed-width Uniform binning, `PQN` / `TSA` / `TSP` dilution normalization, and `Pareto` / `UV` / `MeanCenter` scaling to CSV/TSV & reusable study JSON.
+- `ferric metabolomics pca`: deterministic cyclic Jacobi SVD `PCA`, explained variance ratios, 95% Hotelling $T^2$ leverage limits, and Jackson–Mudholkar $Q$-residual (`SPE`) outlier diagnostics.
+- `ferric metabolomics oplsda`: NIPALS `OPLS-DA` (`1` predictive + $A_o$ orthogonal components), leak-free stratified $k$-fold cross-validated $Q^2$, deterministic $N$-permutation $p$-value (`OverfitWarning` / `is_validated`), `VIP`, Wiklund `S-plot`, and `BH-FDR` Welch Volcano biomarker ranking.
+- `ferric metabolomics stocsy`: 1D/2D `STOCSY` covariance & correlation ($r, r^2$) trace from a user-selected driver chemical shift (`--driver-ppm`) plus CC0 `BMRB` biofluid library marker matching.

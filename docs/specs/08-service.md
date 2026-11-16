@@ -8,20 +8,20 @@ assignments (`NMR-STAR v3`, `TSV`, `NEF v1.1`), optional 3D structures, and a
 self-contained HTML+SVG quality report.
 
 ## Components
-- Job & Inspection API (`nmrassign serve [--bind <addr>] [--storage <dir>] [--inspect-root <dir>] [--cors-origin <origin>]`):
+- Job & Inspection API (`ferric serve [--bind <addr>] [--storage <dir>] [--inspect-root <dir>] [--cors-origin <origin>]`):
   - Upload, validate (format, referencing, experiment type), queue, status, results download, and header-only workspace classification (`POST /api/v1/inspect`).
   - **Browser Security, Loopback `Host` Validation & Archive Bounds**:
     - **DNS-Rebinding & Origin Protection (`N3`, `P1-5`)**: Every HTTP request validates the `Host` header before evaluating same-origin rules; requests with a missing or duplicate `Host` or a hostname outside loopback (`localhost`, `127.0.0.1`, or `[::1]` with `:port` matching the bound listener port, omitting `:port` only on default ports `80`/`443`) are rejected (`403 Forbidden`) unless `http(s)://{Host}` matches an explicitly configured `--cors-origin` entry. Same-origin `Origin == http(s)://{Host}` is accepted strictly after `Host` passes this loopback/allow-list check (`Access-Control-Allow-Origin` is omitted unless `Origin` matches `--cors-origin` or validated same-origin `Host`, and untrusted cross-origin requests return `403 Forbidden`), with `X-Content-Type-Options: nosniff`.
-    - **CSRF & Path Traversal Protection**: JSON `POST` routes require `Content-Type: application/json` (`415 Unsupported Media Type` on `text/plain` or form payloads to block preflight-free browser CSRF). Server-side `"path"` inspection on `POST /api/v1/inspect` is disabled (`403 Forbidden`) unless `--inspect-root <dir>` is explicitly supplied and the canonicalized target resides under `--inspect-root`; arbitrary local folder or archive inspection uses `nmrassign inspect <path>` (`< 50 ms` header-only metadata scan on unpacked directories and seekable `.tar` archives; sequential inflation on `.tar.gz`/`.tgz` archives with trailing zero-padding tolerance `N2`, bounded at `128 MiB` inflated / `32 MiB` retained headers on untrusted HTTP uploads).
+    - **CSRF & Path Traversal Protection**: JSON `POST` routes require `Content-Type: application/json` (`415 Unsupported Media Type` on `text/plain` or form payloads to block preflight-free browser CSRF). Server-side `"path"` inspection on `POST /api/v1/inspect` is disabled (`403 Forbidden`) unless `--inspect-root <dir>` is explicitly supplied and the canonicalized target resides under `--inspect-root`; arbitrary local folder or archive inspection uses `ferric inspect <path>` (`< 50 ms` header-only metadata scan on unpacked directories and seekable `.tar` archives; sequential inflation on `.tar.gz`/`.tgz` archives with trailing zero-padding tolerance `N2`, bounded at `128 MiB` inflated / `32 MiB` retained headers on untrusted HTTP uploads).
 - Workers: run pipeline stages 2 to 5 on CPU/GPU.
-- Report (`nmrassign report`): per-stage metrics, confidence plots, strip plots
+- Report (`ferric report`): per-stage metrics, confidence plots, strip plots
   for checking assignments, structure validation summary.
-- Local mode (`nmrassign pipeline`): runs the complete pipeline in a single CLI
+- Local mode (`ferric pipeline`): runs the complete pipeline in a single CLI
   command with no server needed, emitting `peaks.tsv`, `shifts.str`,
   `shifts.tsv`, `result.nef`, and `report.html` into `--out-dir <dir>`:
 
 ```bash
-nmrassign pipeline \
+ferric pipeline \
   --seq path/to/1ubq.fasta.txt \
   --hsqc path/to/HSQC.ucsf \
   --triple HNCACB=path/to/HNCACB.ucsf \
@@ -31,7 +31,7 @@ nmrassign pipeline \
   --solver evo-graph \
   --out-dir ./out_assigned
 
-nmrassign score \
+ferric score \
   --pred ./out_assigned/shifts.str \
   --truth path/to/reference.str -v
 ```

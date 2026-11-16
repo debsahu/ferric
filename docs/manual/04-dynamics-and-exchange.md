@@ -1,6 +1,6 @@
 # Chapter 4: Spin Relaxation, Model-Free Dynamics ($S^2$), CEST, CPMG & Ligand CSP $K_d$
 
-Proteins are dynamic conformational ensembles whose biological catalysis, allostery, and ligand recognition span picoseconds to seconds. `nmr-assign` provides a complete clean-room CPU (`f64`) and WebGPU (`WGSL`) dynamics and chemical-exchange suite covering fast ps–ns bond-vector librations ($R_1$, $R_2$, hetNOE, Lipari–Szabo / Palmer `M1`–`M5` $S^2$), slow exchange with sparsely populated "invisible" excited states (`CEST` & `DEST`), $\mu\text{s–ms}$ conformational dispersion (`CPMG` & off-resonance $R_{1\rho}$), and fast-exchange ligand titration binding isotherms (`CSP` $K_d$).
+Proteins are dynamic conformational ensembles whose biological catalysis, allostery, and ligand recognition span picoseconds to seconds. FERRIC provides a complete clean-room CPU (`f64`) and WebGPU (`WGSL`) dynamics and chemical-exchange suite covering fast ps–ns bond-vector librations ($R_1$, $R_2$, hetNOE, Lipari–Szabo / Palmer `M1`–`M5` $S^2$), slow exchange with sparsely populated "invisible" excited states (`CEST` & `DEST`), $\mu\text{s–ms}$ conformational dispersion (`CPMG` & off-resonance $R_{1\rho}$), and fast-exchange ligand titration binding isotherms (`CSP` $K_d$).
 
 > [!IMPORTANT] Validation Scope (Synthetic Forward-Model Self-Consistency)
 > Quantitative accuracy and speed benchmarks reported in this chapter (`SNR = 4` locked-shape plane bias `< 1.5%`, `M1`–`M5` $S^2$ MAE `< 0.005` on synthetic axial/anisotropic tensors oriented against `1UBQ` $\text{N–H}$ bond vectors, dual-$B_1$ `CEST` $p_B$ recovery, dual-$B_0$ Baldwin `CPMG` dispersion, and quadratic `CSP` $K_d$ isotherms) are **synthetic forward-model self-consistency evaluations** (`T13.1`–`T13.5`). **`0` real deposited experimental relaxation (`BMRB` $R_1/R_2/\text{NOE}$ or raw `vdlist`/`vclist` `ser`), `CEST`, `CPMG`, or ligand `CSP` titration datasets have been evaluated end-to-end yet**; real experimental repository validation is tracked openly under follow-ups **`F10`**, **`F11`**, and **`F13`**.
@@ -77,7 +77,7 @@ Before ranking candidate models at each residue, `enable_model_elimination` enfo
 Profiled alternating optimization decouples global diffusion tensor updates from fast per-residue local parameters, achieving $S^2$ MAE `< 0.005`, $\tau_m$ error `< 0.5%`, and `97–100%` model-class recovery across dual-field (`600 + 800 MHz`) benchmarks.
 
 ![Ubiquitin 1UBQ Lipari-Szabo S2 dynamics putty and NOEs](../assets/03_pdb_s2_dynamics_putty.svg)
-*Figure 4.1: Deterministic `nmrassign export-fig --panel pdb-s2` projection of Lipari–Szabo `M1`–`M5` order parameters ($S^2$) onto the `1UBQ` backbone putty ribbon (highlighting the flexible C-terminal `Gly76` tail, `Ile23` $R_{\text{ex}}$ exchange marker, and long-range NOE restraints; synthetic forward-model showcase).*
+*Figure 4.1: Deterministic `ferric export-fig --panel pdb-s2` projection of Lipari–Szabo `M1`–`M5` order parameters ($S^2$) onto the `1UBQ` backbone putty ribbon (highlighting the flexible C-terminal `Gly76` tail, `Ile23` $R_{\text{ex}}$ exchange marker, and long-range NOE restraints; synthetic forward-model showcase).*
 
 ---
 
@@ -139,4 +139,4 @@ recovering both weak ($K_d = 500\text{ \mu M}$) and tight ($K_d = 5\text{–}12\
 In the **`📈 Dynamics & Titration Studio`** tab (`nmr-gui::dynamics_panel`), clicking **Project to 3D Structure** streams Lipari–Szabo $S^2$, conformational exchange $R_{\text{ex}}$, or ligand $\Delta\delta_{\text{CSP}}$ directly onto the `wgpu` 3D cartoon ribbon (`nmr-gui::mol3d_overlay`) in `< 0.5 ms` as quantitative putty radii and perceptually uniform `Viridis` / `Cividis` / `Blue-White-Red` color maps.
 
 ![CEST, CPMG and ligand CSP exchange kinetics](../assets/07_cest_cpmg_csp_exchange.svg)
-*Figure 4.2: Deterministic `nmrassign export-fig --panel exchange` three-panel showcase of Higham `[6/6]` Padé 2-state Bloch–McConnell `CEST` saturation dips, dual-field (`600 + 800 MHz`) Baldwin (2014) `CPMG` dispersion, and exact quadratic tight-binding ligand `CSP` $K_d$ isotherms (synthetic forward-model showcase).*
+*Figure 4.2: Deterministic `ferric export-fig --panel exchange` three-panel showcase of Higham `[6/6]` Padé 2-state Bloch–McConnell `CEST` saturation dips, dual-field (`600 + 800 MHz`) Baldwin (2014) `CPMG` dispersion, and exact quadratic tight-binding ligand `CSP` $K_d$ isotherms (synthetic forward-model showcase).*

@@ -178,6 +178,6 @@ Specs: `docs/specs/`. Agent rules: `AGENTS.md`.
 ## Housekeeping
 - [x] (A) CCPN NEF v1.1 lossless import/export (`nmr-core::nef`, `nmrassign nef-import` / `nef-export`)
 - [x] (A) Single-source SemVer versioning (`v0.13.0`, `nmr_core::VERSION`, `nmrassign --version` with short git SHA, NEF/HTML/API provenance, annotated `vX.Y.Z` git tags)
-- [ ] (M) Choose a public project name (avoid commercial product names)
+- [x] (M) Choose a public project name -> FERRIC (maintainer sign-off 2026-11-16, `data/private/PHASE18_FERRIC_RENAME_BRIEF.md`)
 - [ ] (M) Patent search on deep-learning peak picking and automated assignment
 - [x] (A) Add `CONTRIBUTING.md`, `THIRD_PARTY.md`, author metadata, and CI workflow

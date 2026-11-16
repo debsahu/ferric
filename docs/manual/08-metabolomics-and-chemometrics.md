@@ -1,6 +1,6 @@
 # Chapter 8: Untargeted 1D Metabolomics, OPLS-DA & STOCSY Chemometrics
 
-`nmr-assign` includes a clean-room untargeted 1D biofluid and mixture metabolomics engine (`nmr-core::metabolomics`, `nmrassign metabolomics`, MCP tool `run_metabolomics_chemometrics`, and the 4-quadrant **`🧪 Metabolomics`** workbench studio in `nmr-gui::metabolomics_panel`). Every stage—from interval FFT peak alignment and Adaptive Intelligent Binning (`AI-Binning`) through Probabilistic Quotient Normalization (`PQN`), unsupervised `PCA` outlier diagnostics, leak-free stratified `k`-fold `OPLS-DA`, and Statistical Total Correlation Spectroscopy (`STOCSY`)—runs deterministically in pure `f64` Rust on both desktop and `wasm32-unknown-unknown`.
+FERRIC includes a clean-room untargeted 1D biofluid and mixture metabolomics engine (`nmr-core::metabolomics`, `ferric metabolomics`, MCP tool `run_metabolomics_chemometrics`, and the 4-quadrant **`🧪 Metabolomics`** workbench studio in `nmr-gui::metabolomics_panel`). Every stage—from interval FFT peak alignment and Adaptive Intelligent Binning (`AI-Binning`) through Probabilistic Quotient Normalization (`PQN`), unsupervised `PCA` outlier diagnostics, leak-free stratified `k`-fold `OPLS-DA`, and Statistical Total Correlation Spectroscopy (`STOCSY`)—runs deterministically in pure `f64` Rust on both desktop and `wasm32-unknown-unknown`.
 
 > [!IMPORTANT] Validation Scope (Synthetic Forward-Model Self-Consistency)
 > All `T14.5` metabolomics and chemometrics benchmarks reported in this chapter are **synthetic forward-model self-consistency evaluations** constructed from multi-multiplet biofluid cohorts (28-metabolite `CC0 1.0` BMRB chemical shift library, `3x` biological urine dilution factors, `±0.025 ppm` ionic-strength/pH peak drift, injected biomarker fold changes, and pure-noise null cohorts). **`0` real clinical or `MetaboLights` (`MTBLS1` / human urine or serum) raw cohort datasets have been evaluated end-to-end yet**; external repository cohort benchmarking is tracked openly as follow-up **`F17`**.
@@ -100,7 +100,7 @@ With `M = 100` permutations, a cohort whose observed $Q^2_{\text{obs}}$ exceeds 
 > [!CAUTION] Supervised `OPLS-DA` Overfitting Caveat (`Westerhuis et al. 2008`)
 > In untargeted metabolomics where spectral buckets far outnumber biological samples ($P \gg N$, e.g., $P = 250..1000$ bins vs $N = 20..50$ subjects), **apparent in-sample training fit $R^2 Y$ approaches `0.85–0.99` even on pure Gaussian noise with randomly shuffled class labels!**
 > - **Never judge an `OPLS-DA` score plot by visual cluster separation or $R^2 Y$ alone.** Because $\mathbf{t}_p$ is supervised, training scores *always* appear separated when $P \gg N$.
-> - Require **both** positive out-of-fold predictive $Q^2 \ge 0.40$ (`>= 0.50` preferred for robust biological separation) **and** label-permutation significance $p_{\text{perm}} \le 0.05$. Whenever $Q^2 < 0.40$ or $p_{\text{perm}} > 0.05$, both `nmrassign metabolomics oplsda` and `MetabolomicsStudioPanel` raise an explicit overfitting warning banner.
+> - Require **both** positive out-of-fold predictive $Q^2 \ge 0.40$ (`>= 0.50` preferred for robust biological separation) **and** label-permutation significance $p_{\text{perm}} \le 0.05$. Whenever $Q^2 < 0.40$ or $p_{\text{perm}} > 0.05$, both `ferric metabolomics oplsda` and `MetabolomicsStudioPanel` raise an explicit overfitting warning banner.
 
 ### Biomarker Ranking: `VIP`, Wiklund `S-Plot` & `BH-FDR` Volcano
 
@@ -130,7 +130,7 @@ Plotting covariance $c_j$ as trace height (preserving authentic NMR multiplet sh
 
 ---
 
-## Headless CLI (`nmrassign metabolomics`) & Interactive Studio
+## Headless CLI (`ferric metabolomics`) & Interactive Studio
 
 ### Command-Line Cohort Pipeline
 
@@ -138,7 +138,7 @@ Cohort manifests are plain tab-separated or comma-separated files (`sample_id`, 
 
 ```bash
 # 1. Interval-align, mask water/urea/DSS, AI-Bin, and PQN-normalize a cohort into buckets CSV + study JSON
-nmrassign metabolomics bin \
+ferric metabolomics bin \
   --manifest cohort_manifest.tsv \
   -o cohort_buckets.csv \
   --study-out cohort_study.json \
@@ -149,14 +149,14 @@ nmrassign metabolomics bin \
   --mask urine
 
 # 2. Unsupervised Pareto-scaled PCA with Hotelling T^2 (95%/99%) & Q-residual outlier report
-nmrassign metabolomics pca \
+ferric metabolomics pca \
   --in cohort_buckets.csv \
   -o pca_report.json \
   --components 3 \
   --scale pareto
 
 # 3. Leak-free 7-fold cross-validated NIPALS OPLS-DA + 200 label permutations + VIP/S-plot/Volcano
-nmrassign metabolomics oplsda \
+ferric metabolomics oplsda \
   --in cohort_buckets.csv \
   --biomarkers-out oplsda_biomarkers.csv \
   -o oplsda_summary.json \
@@ -167,22 +167,22 @@ nmrassign metabolomics oplsda \
   --seed 42
 
 # 4. Driver-peak STOCSY connectivity + CC0 BMRB candidate annotation around 1.33 ppm
-nmrassign metabolomics stocsy \
+ferric metabolomics stocsy \
   --in cohort_buckets.csv \
   --driver-ppm 1.33 \
   --min-r2 0.80 \
   -o stocsy_1p33ppm.json
 ```
 
-AI coding and research assistants connected via `nmrassign mcp` ([Chapter 6](06-mcp-and-cli-reference.md)) can also invoke the read-only `run_metabolomics_chemometrics` tool or the guided `analyze-metabolomics-cohort` workflow prompt directly on any sandboxed cohort manifest or binned matrix.
+AI coding and research assistants connected via `ferric mcp` ([Chapter 6](06-mcp-and-cli-reference.md)) can also invoke the read-only `run_metabolomics_chemometrics` tool or the guided `analyze-metabolomics-cohort` workflow prompt directly on any sandboxed cohort manifest or binned matrix.
 
 ### Interactive 4-Quadrant `MetabolomicsStudioPanel` (`nmr-gui`)
 
-Switch to the **`🧪 Metabolomics`** tab in `nmr-gui` (or click **`🚀 Load Built-in Demo Suite`** in the native desktop or browser WebGPU demo) to explore all four linked chemometric views simultaneously:
+Switch to the **`🧪 Metabolomics`** tab in `ferric-gui` (or click **`🚀 Load Built-in Demo Suite`** in the native desktop or browser WebGPU demo) to explore all four linked chemometric views simultaneously:
 1. **Top-Left — `PCA` Scores & Hotelling's $T^2$ Ellipse**: Group-colored `PC1` vs `PC2` scatter plot with interactive `95%` confidence ellipse and hoverable sample outlier diagnostics ($T^2_i$, $Q_i$).
 2. **Top-Right — `OPLS-DA` Predictive vs Orthogonal Scores ($t_p$ vs $t_{o1}$)**: Displays out-of-fold $Q^2$, $R^2 Y$, $R^2 X$, label-permutation $p_{\text{perm}}$ histogram, and an automatic overfitting guard banner whenever $Q^2 < 0.40$ or $p_{\text{perm}} > 0.05$.
 3. **Bottom-Left — Interactive Wiklund `S-Plot` / `BH-FDR` Volcano Toggle**: Click any biomarker point in the `S-plot` ($p(\text{cov})$ vs $p(\text{corr})$) or Volcano ($\log_2 \text{FC}$ vs $-\log_{10} q_{\text{BH}}$) to lock that chemical shift as the active **`STOCSY` driver peak**.
 4. **Bottom-Right — Live `STOCSY` Covariance Spectrum & `CC0` BMRB Tag Drawer**: Renders covariance $c(\delta)$ colored continuously from gray ($r^2 = 0$) through cyan/gold to crimson ($r^2 \to 1.0$), listing ranked `CC0 1.0` BMRB biofluid metabolite candidates matching the correlated multiplet cluster.
 
 ![Untargeted 1D metabolomics PCA, OPLS-DA S-plot and STOCSY showcase](../assets/06_metabolomics_oplsda_stocsy.svg)
-*Figure 8.1: Deterministic `nmrassign export-fig --panel metabolomics` 4-panel cohort showcase displaying `AI-Binning`/`PQN` `PCA` scores with `95%` Hotelling $T^2$ ellipse, leak-free `OPLS-DA` Wiklund `S-plot`, and `L-Lactate` `1.33 ppm` driver `STOCSY` covariance trace (synthetic forward-model showcase).*
+*Figure 8.1: Deterministic `ferric export-fig --panel metabolomics` 4-panel cohort showcase displaying `AI-Binning`/`PQN` `PCA` scores with `95%` Hotelling $T^2$ ellipse, leak-free `OPLS-DA` Wiklund `S-plot`, and `L-Lactate` `1.33 ppm` driver `STOCSY` covariance trace (synthetic forward-model showcase).*

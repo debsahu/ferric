@@ -1,6 +1,6 @@
-# nmr-assign Documentation Manual
+# FERRIC Documentation Manual
 
-**`nmr-assign`** is an open-source, 100% clean-room biomolecular and analytical NMR platform written in pure **Rust** and **WebGPU** (`wgpu` / `WGSL`). Starting from raw Bruker (`fid`/`ser` + executed `pulseprogram`) or Varian/Agilent (`fid` + `procpar`) time-domain acquisitions, processed 2D/3D/4D spectra, or picked peak tables, `nmr-assign` delivers automated resonance assignments with honest empirical confidence calibration, 3D macromolecular ensembles, quantitative spin relaxation and chemical exchange kinetics, small-molecule 1D multiplet / `qNMR` / `DOSY` analytics, untargeted 1D metabolomics (`AI-Binning`, `PQN`, `PCA`, `OPLS-DA`, `STOCSY`), an integrated 2D chemical structure studio (`Octet-Draw`), and a sandboxed Model Context Protocol (`MCP`) server + live desktop bridge.
+**FERRIC** (**F**ID-to-structure **E**ngine for **R**elaxation, **R**esonance assignment, **I**ntegration & **C**hemometrics) is an open-source, 100% clean-room biomolecular and analytical NMR platform written in pure **Rust** and **WebGPU** (`wgpu` / `WGSL`). Starting from raw Bruker (`fid`/`ser` + executed `pulseprogram`) or Varian/Agilent (`fid` + `procpar`) time-domain acquisitions, processed 2D/3D/4D spectra, or picked peak tables, FERRIC delivers automated resonance assignments with honest empirical confidence calibration, 3D macromolecular ensembles, quantitative spin relaxation and chemical exchange kinetics, small-molecule 1D multiplet / `qNMR` / `DOSY` analytics, untargeted 1D metabolomics (`AI-Binning`, `PQN`, `PCA`, `OPLS-DA`, `STOCSY`), an integrated 2D chemical structure studio (`Octet-Draw`), and a sandboxed Model Context Protocol (`MCP`) server + live desktop bridge.
 
 > [!TIP] Quick Navigation & Zero-Install Live Browser Demo
 > - Press **`/`** or **`Cmd/Ctrl+K`** anywhere in this manual to search across all chapters, equations, CLI flags, MCP tools, and keyboard shortcuts. Toggle **Dark / Light** mode in the top-right header.
@@ -10,14 +10,14 @@
 
 ## Architecture & Workspace Crates
 
-Every algorithm in `nmr-assign` is implemented first as an audited `f64` reference engine in `nmr-core`, paired with portable `wgpu` compute kernels in `nmr-gpu` that execute identically across Apple Metal, Vulkan, DirectX 12, and browser WebGPU (`wasm32-unknown-unknown`):
+Every algorithm in FERRIC is implemented first as an audited `f64` reference engine in `nmr-core`, paired with portable `wgpu` compute kernels in `nmr-gpu` that execute identically across Apple Metal, Vulkan, DirectX 12, and browser WebGPU (`wasm32-unknown-unknown`):
 
 | Workspace Crate | Primary Responsibility | Targets |
 | :--- | :--- | :--- |
 | `crates/nmr-core` | Deterministic `f64` reference DSP, `pulseprogram` physics interpreter, hypercomplex `IST`/`FISTA` NUS, classical & 3D CNN peak pickers, multi-regime backbone/sidechain/methyl solvers, `DatasetQcReport` isotonic calibration, 3D NOESY/torsion/`RDC` folding, $R_1$/$R_2$/Model-Free/`CEST`/`CPMG`/`CSP` kinetics, 1D Voigt/Hoye/`qNMR`/`DOSY`, untargeted 1D `metabolomics` (`AI-Binning`/`PQN`/`PCA`/`OPLS-DA`/`STOCSY`), `Octet` 2D cheminformatics, and JSON-RPC 2.0 `MCP` engine | Native (`x86_64`, `aarch64`) & `wasm32` |
 | `crates/nmr-gpu` | Portable `@group(0)` `WGSL` compute shaders (`16 KiB` workgroup-SRAM multi-replica simulated annealing, `Q27.36` fixed-point energy parity, 3D separable CNN inference, Saupe `RDC` gradient batches, Monte Carlo relaxation, Bloch–McConnell `CEST`, `CPMG`, and `DOSY` VarPro+LM) with upfront `wgpu::Limits` & TDR chunking guards | Native GPU & Browser WebGPU |
 | `crates/nmr-gui` | Immediate-mode `eframe` / `egui` + `wgpu` scientific workbench: 60+ fps GPU 2D contour overlays, synchronized 3D strip walks, sequence ribbon & 2D covalent sidechain graph, 1300+ fps 3D cartoon ribbon / putty / restraint-cylinder viewer, Dynamics Studio, 4-mode 1D Stack, 2D `DOSY` & 4-quadrant `Metabolomics` studios, `Octet` Chemical Studio, built-in zero-I/O Demo Suite, and loopback `MCP` bridge | Desktop App & Zero-Install Browser WASM |
-| `crates/nmr-cli` | Unified `nmrassign` command-line binary exposing headless processing, assignment, structure folding, dynamics, 1D/`DOSY`/`metabolomics`, self-hosted REST job server (`serve`), `MCP` server (`mcp` / `mcp-config`), deterministic publication SVG figure export (`export-fig`), and reproducible BMRB benchmark suites | Native CLI (`macOS`, `Linux`, `Windows`) |
+| `crates/nmr-cli` | Unified `ferric` command-line binary (plus deprecated `nmrassign` compatibility alias for `v0.14.x`) exposing headless processing, assignment, structure folding, dynamics, 1D/`DOSY`/`metabolomics`, self-hosted REST job server (`serve`), `MCP` server (`mcp` / `mcp-config`), deterministic publication SVG figure export (`export-fig`), and reproducible BMRB benchmark suites | Native CLI (`macOS`, `Linux`, `Windows`) |
 
 ---
 
@@ -30,7 +30,7 @@ Every algorithm in `nmr-assign` is implemented first as an audited `f64` referen
 | **[03 · Backbone Solvers, QC & Calibration](03-solvers-and-calibration.md)** | Mathematical guide to `standard` (CPU/WebGPU SA), `evo-graph` (stoichiometric evolutionary + factor-graph BP), and opt-in `bayes-sa` (Bishop et al. 2023 specific-heat $C_v(T)$ SA), plus `DatasetQcReport` gating, 10-bin PAV isotonic calibration, and **honest unseen-protein empirical precision caveats**. |
 | **[04 · Dynamics, Exchange & Ligand CSP](04-dynamics-and-exchange.md)** | Locked-shape pseudo-3D plane integration (`SNR = 4`), GPU $R_1$/$R_2$/hetNOE & spectral density mapping, Lipari–Szabo / Mandel–Akke–Palmer `M1`–`M5` ($S^2, \tau_e, R_{\text{ex}}, S_f^2, \tau_s$) with anisotropic diffusion, 2-/3-state Bloch–McConnell `CEST`/`DEST`, Carver–Richards & Baldwin `CPMG` / $R_{1\rho}$, and tight-binding quadratic ligand `CSP` $K_d$ isotherms. |
 | **[05 · Analytical 1D Multiplets, qNMR & DOSY](05-nmr1d-multiplets-and-dosy.md)** | Multi-nuclear (`1H`, `13C{1H}`, `DEPT-90/135`, `19F`, `31P`) Voigt deconvolution, recursive Hoye `J`-coupling trees & AB roofing, `ACS`/`JOC`/`RSC`/`Nature` journal round-trips, NIST-traceable GUM `qNMR` molar purity, 4-mode multi-spectrum overlay/stack/difference/heatmap, and `DOSY` discrete `BIC` Stejskal–Tanner vs opt-in Tikhonov `ILT` caveats. |
-| **[06 · MCP Integration, CLI & Keyboard Reference](06-mcp-and-cli-reference.md)** | Complete `nmrassign` subcommand & flag dictionary (including `nmr1d`, `dosy`, `metabolomics`, `export-fig`, `mcp`, `mcp-config`), `MCP` `stdio` & authenticated loopback desktop bridge setup for **Antigravity**, **Claude Desktop**, and **Cursor**, `ReadOnly`/`ReadWrite` & path-sandbox guardrails, Undo-backed AI curation, and the two-key NMR spectrum chord cheat-sheet. |
+| **[06 · MCP Integration, CLI & Keyboard Reference](06-mcp-and-cli-reference.md)** | Complete `ferric` subcommand & flag dictionary (including `nmr1d`, `dosy`, `metabolomics`, `export-fig`, `mcp`, `mcp-config`), `MCP` `stdio` & authenticated loopback desktop bridge setup for **Antigravity**, **Claude Desktop**, and **Cursor**, `ReadOnly`/`ReadWrite` & path-sandbox guardrails, Undo-backed AI curation, and the two-key NMR spectrum chord cheat-sheet. |
 | **[07 · Clean-Room Provenance & Bibliography](07-clean-room-provenance.md)** | Non-negotiable clean-room engineering rules, sequence-only & `HomologFirewall` scientific governance, `CC0 1.0` BMRB/wwPDB open-data chain of custody, `MIT`/`Apache-2.0` dependency audit, and the master peer-reviewed bibliography across every module. |
 | **[08 · Untargeted 1D Metabolomics & Chemometrics](08-metabolomics-and-chemometrics.md)** | Interval FFT cohort alignment, recursive valley-seeking `AI-Binning`, `PQN` dilution normalization, `Pareto`/`UV` scaling, `PCA` Hotelling $T^2$ / $Q$-residual outlier diagnostics, leak-free `k`-fold `NIPALS` `OPLS-DA` ($Q^2$, permutation $p$-value, Westerhuis $P \gg N$ overfitting guards, `VIP`, Wiklund `S-plot`, `BH-FDR` Volcano), `STOCSY` driver-peak spin-system connectivity, and `MetabolomicsStudioPanel`. |
 
@@ -47,18 +47,18 @@ Every algorithm in `nmr-assign` is implemented first as an audited `f64` referen
 ### Build Commands
 
 ```bash
-# Build the release CLI binary (target/release/nmrassign)
+# Build the release CLI binary (target/release/ferric)
 cargo build --release -p nmr-cli
 
 # Verify version, embedded short Git SHA, and hardware WebGPU adapter
-./target/release/nmrassign --version
+./target/release/ferric --version
 
-# Launch the native desktop WebGPU NMR & Chemical Studio workbench
-cargo run --release -p nmr-gui
+# Launch the native desktop WebGPU NMR & Chemical Studio workbench (ferric-gui)
+cargo run --release -p nmr-gui --bin ferric-gui
 
 # Run the release workspace test suite and 5-seed realistic physics gate
 cargo test --release --workspace
-cargo run --release -p nmr-cli -- benchmark \
+cargo run --release -p nmr-cli --bin ferric -- benchmark \
   --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5
 ```
 
@@ -79,7 +79,7 @@ Passing `--check` validates every cross-chapter link, `#anchor` fragment, static
 
 ## Open Interchange Formats
 
-`nmr-assign` reads and writes open, documented scientific formats throughout every stage of the pipeline—never locking user projects into opaque binary blobs:
+FERRIC reads and writes open, documented scientific formats throughout every stage of the pipeline—never locking user projects into opaque binary blobs:
 
 | Domain | Supported Input Formats | Supported Output / Session Formats |
 | :--- | :--- | :--- |

@@ -1,6 +1,6 @@
 # Third-Party Dependencies & Data Provenance
 
-`nmr-assign` is released under the **MIT License** (`LICENSE`). Every dependency in the workspace is audited via `cargo metadata --format-version 1` and `Cargo.lock` against the `AGENTS.md` licence allowlist:
+**FERRIC** is released under the **MIT License** (`LICENSE`). Every dependency in the workspace is audited via `cargo metadata --format-version 1` and `Cargo.lock` against the `AGENTS.md` licence allowlist:
 
 - **Allowed**: `MIT`, `BSD-2-Clause`, `BSD-3-Clause`, `Apache-2.0`, `ISC`, `Zlib`.
 - **Forbidden**: `GPL`, `AGPL`, non-commercial licences, unlicensed code (`LGPL` / `MPL-2.0` / `EPL` require explicit maintainer approval; **none** are used).

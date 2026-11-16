@@ -48,7 +48,7 @@ def _read_workspace_version() -> str:
     return "0.11.0"
 
 
-SITE_TITLE = "nmr-assign Manual"
+SITE_TITLE = "FERRIC Manual"
 SITE_VERSION_BADGE = f"v{_read_workspace_version()} · Rust + WebGPU"
 SITE_TAGLINE = "Clean-Room Biomolecular & Analytical NMR Platform"
 
@@ -617,7 +617,7 @@ RUST_KW = {
 }
 
 SH_KW = {
-    "cargo", "nmrassign", "python3", "git", "curl", "export", "cd", "mkdir",
+    "cargo", "ferric", "nmrassign", "python3", "git", "curl", "export", "cd", "mkdir",
 }
 
 

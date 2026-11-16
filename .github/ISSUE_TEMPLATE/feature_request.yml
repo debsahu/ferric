@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        **Clean-Room Policy:** Every algorithm in `nmr-assign` is implemented from peer-reviewed literature, public specifications (NMR-STAR v3, NEF v1.1, JCAMP-DX), or original derivations. Please cite papers/DOIs rather than referencing internals or code of restricted, proprietary, GPL, or AGPL packages.
+        **Clean-Room Policy:** Every algorithm in **FERRIC** is implemented from peer-reviewed literature, public specifications (NMR-STAR v3, NEF v1.1, JCAMP-DX), or original derivations. Please cite papers/DOIs rather than referencing internals or code of restricted, proprietary, GPL, or AGPL packages.
 
   - type: dropdown
     id: area

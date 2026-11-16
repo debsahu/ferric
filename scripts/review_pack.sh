@@ -1,5 +1,5 @@
 #!/bin/sh
-# Clean-room external review bundle generator for nmr-assign (POSIX sh).
+# Clean-room external review bundle generator for FERRIC (POSIX sh).
 # Packages: (1) adversarial review prompt for Claude, (2) Task card from
 # docs/roadmap/MASTER_ROADMAP.md, (3) AGENTS.md clean-room & scientific audit
 # checklist + automated pre-flight scan, and (4) git log --stat + git diff.
@@ -146,8 +146,8 @@ if [ -n "$TASK_ID" ]; then
     fi
 fi
 
-TMP_OUT=$(mktemp "${TMPDIR:-/tmp}/nmrassign_review_pack.XXXXXX")
-TMP_DIFF=$(mktemp "${TMPDIR:-/tmp}/nmrassign_review_diff.XXXXXX")
+TMP_OUT=$(mktemp "${TMPDIR:-/tmp}/ferric_review_pack.XXXXXX")
+TMP_DIFF=$(mktemp "${TMPDIR:-/tmp}/ferric_review_diff.XXXXXX")
 trap 'rm -f "$TMP_OUT" "$TMP_DIFF"' EXIT HUP INT TERM
 
 git -C "$REPO_ROOT" diff --no-color "$GIT_RANGE" > "$TMP_DIFF"
@@ -185,7 +185,7 @@ fi
 
 {
     cat <<EOF
-# nmr-assign External Adversarial Review Bundle
+# FERRIC External Adversarial Review Bundle
 
 - **Generated (UTC)**: \`$UTC_NOW\`
 - **Branch / HEAD**: \`$BRANCH_NAME\` @ \`$HEAD_SHA\`
@@ -203,7 +203,7 @@ EOF
 
 ## 1. Adversarial Review Prompt (Paste Directly into Claude)
 
-You are an independent **biomolecular NMR spectroscopist, numerical scientific-computing engineer (Rust + WebGPU/WGSL), and clean-room IP auditor** performing an adversarial code review on `nmr-assign`.
+You are an independent **biomolecular NMR spectroscopist, numerical scientific-computing engineer (Rust + WebGPU/WGSL), and clean-room IP auditor** performing an adversarial code review on **FERRIC**.
 
 Do **not** rubber-stamp this change. Assume subtle bugs exist until proven otherwise from the equations, types, and tests in the diff below. Specifically audit:
 

@@ -1,6 +1,6 @@
 # Chapter 7: Clean-Room Provenance, Open Data Policy & Bibliography
 
-`nmr-assign` is engineered from the ground up as a **100% clean-room, permissively licensed (`MIT`) scientific platform**. Every mathematical model, binary spectrometer reader, statistical calibrator, GPU shader, and graphical studio traces directly to peer-reviewed literature, public open specifications, and public-domain (`CC0 1.0`) archival data.
+FERRIC is engineered from the ground up as a **100% clean-room, permissively licensed (`MIT`) scientific platform**. Every mathematical model, binary spectrometer reader, statistical calibrator, GPU shader, and graphical studio traces directly to peer-reviewed literature, public open specifications, and public-domain (`CC0 1.0`) archival data.
 
 ---
 
@@ -23,10 +23,10 @@
 
 ## Scientific Governance & Benchmark Integrity
 
-To prevent data leakage, circular self-validation, or inflated accuracy claims, `nmr-assign` enforces four structural invariants in code and CI:
+To prevent data leakage, circular self-validation, or inflated accuracy claims, FERRIC enforces four structural invariants in code and CI:
 
-1. **Sequence-Only Backbone Assignment**: `nmrassign assign` uses only the 1D amino-acid sequence, experimental peak tables/spectra, and fixed BMRB chemical-shift priors (`data/priors/bmrb_priors.json`, derived from `36` public BMRB entries disjoint from all benchmark manifests).
-2. **Unlabelled Reference-Offset Estimation**: Global per-nucleus chemical-shift offsets (`estimate_reference_offsets_detailed` and `nmrassign score`) are estimated strictly without ground-truth assignment labels (`< 1e-12` permutation-invariant).
+1. **Sequence-Only Backbone Assignment**: `ferric assign` uses only the 1D amino-acid sequence, experimental peak tables/spectra, and fixed BMRB chemical-shift priors (`data/priors/bmrb_priors.json`, derived from `36` public BMRB entries disjoint from all benchmark manifests).
+2. **Unlabelled Reference-Offset Estimation**: Global per-nucleus chemical-shift offsets (`estimate_reference_offsets_detailed` and `ferric score`) are estimated strictly without ground-truth assignment labels (`< 1e-12` permutation-invariant).
 3. **4-Layer `HomologFirewall` (`nmr-core::torsion_db`)**: Post-assignment 3/9-mer $(\phi, \psi, \chi_1)$ prediction runs strictly *after* assignment and excludes homologous templates across `L1` (PDB/BMRB/UniProt/family IDs), `L2` (CATH/ECOD fold topology), `L3` (global Needleman–Wunsch & local Smith–Waterman `<= 25%` sequence identity at `>= 50%` coverage under both `BLOSUM62` and exact-identity scoring + `6/7` k-mer filter), and `L4` (Zhang–Skolnick `TM-score < 0.50`), emitting a deterministic `exclusion_list_sha256` audit digest.
 4. **Pre-Registered Single-Shot Cold Cohort Rotation**: Real-spectrum BMRB entries (`data/benchmark/real_manifest.tsv`) are partitioned into development/seen cohorts and pre-registered unseen (`cold_*`) cohorts. Each cold cohort is evaluated **once** after code freeze, its exact empirical accuracy and high-confidence precision are recorded verbatim ([Chapter 3](03-solvers-and-calibration.md#honest-unseen-protein-cold-cohort-empirical-precision-caveats)), and spent cold cohorts are immediately relabeled `seen_*` so they are never reused as unseen evidence.
 
@@ -42,7 +42,7 @@ To prevent data leakage, circular self-validation, or inflated accuracy claims, 
 
 ## Permissive Licensing (`MIT` & `Apache-2.0`)
 
-`nmr-assign` is distributed under the **MIT License** (`LICENSE`). All `327` transitive packages in `Cargo.lock` are audited via `cargo metadata` against the workspace allowlist (`MIT`, `BSD-2-Clause`, `BSD-3-Clause`, `Apache-2.0`, `ISC`, `Zlib`; zero `GPL` or `AGPL` crates):
+FERRIC is distributed under the **MIT License** (`LICENSE`). All `327` transitive packages in `Cargo.lock` are audited via `cargo metadata` against the workspace allowlist (`MIT`, `BSD-2-Clause`, `BSD-3-Clause`, `Apache-2.0`, `ISC`, `Zlib`; zero `GPL` or `AGPL` crates):
 
 | Direct Dependency | SPDX License | Role in Workspace |
 | :--- | :--- | :--- |

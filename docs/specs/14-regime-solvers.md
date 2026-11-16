@@ -155,7 +155,7 @@ Motivated by Camilloni et al.'s 4-state `δ2D` decomposition (*Biochemistry* 201
    $$p_\alpha(i) + p_\beta(i) + p_{\text{PPII}}(i) + p_{\text{coil}}(i) = 1.0 \quad (\text{exact within } \pm 10^{-9}\text{ for every residue } i)$$
 
 ### 3.4 Reporting & Quantitative Validation (`T11.3` + `P2` Hardening)
-- **Exporters & HTML Track**: `format_propensity_tsv`, `format_propensity_json`, and `render_idp_propensity_svg` (embedded automatically in `nmr-core::report` section `3b` when `ReportInput.propensity_report` is supplied via `nmrassign report --idp-propensity` / `--propensity` or `nmrassign pipeline --regime idp-13c`).
+- **Exporters & HTML Track**: `format_propensity_tsv`, `format_propensity_json`, and `render_idp_propensity_svg` (embedded automatically in `nmr-core::report` section `3b` when `ReportInput.propensity_report` is supplied via `ferric report --idp-propensity` / `--propensity` or `ferric pipeline --regime idp-13c`).
 - **Verified Benchmarks (`crates/nmr-core/tests/idp_propensity_tests.rs`)**:
   - **All-76-residue folded control (`bmr17769` Human Ubiquitin vs `PDB 1D3Z`, clean-room Kabsch–Sander `E < -0.5 kcal/mol` DSSP across all `76` residues with zero `HELIX`/`SHEET` header greps)**: **`38/43 = 88.37%` structured recall (`H+E`)** (`15/18` DSSP-`H`, `23/25` DSSP-`E`) and **`1/18 = 5.56%` non-adjacent loop false-positive rate** (`9/33 = 27.27%` across all `33` DSSP-`C` residues including 1-residue cap junctions).
   - **Dev disordered BMRB controls**: `bmr6968` ($\alpha$-synuclein) yields `mean(p_coil + p_ppii) = 0.974` (`0` rigid `>= 4` stretches); `bmr4375` (`8 M` urea-unfolded Human Ubiquitin at `pH 2.0`) yields `mean(p_coil + p_ppii) = 0.944` (`0` rigid `>= 4` stretches).
@@ -254,29 +254,29 @@ $$\Delta\delta^{\text{PCS}}(\mathbf{r}) = \frac{10^{4}}{4\pi r^5}\Big[(x^2 - z^2
 
 ## 5. CLI & Interactive Workbench Contracts (`crates/nmr-cli`, `crates/nmr-gui`)
 
-### 5.1 Command-Line Interface (`nmrassign`)
+### 5.1 Command-Line Interface (`ferric`)
 ```text
 # 1. Problem-regime backbone assignment (globular default, 13C-detected IDP, or paramagnetic):
-nmrassign assign (--seq <SEQ|seq.fasta> | --star <ref.str>) [--peaks <peaks.tsv>] \
+ferric assign (--seq <SEQ|seq.fasta> | --star <ref.str>) [--peaks <peaks.tsv>] \
   [--regime globular|idp-13c|paramagnetic] [--solver evo-graph|standard] [--engine auto|gpu|cpu] \
   [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] \
   [--metal-ligands CYS42,CYS44,CYS51,HIS54] [--pdb <model.pdb>] [--pcs <pcs.tsv>] \
   [--temp-k 298.15] [--ph 6.5] --out <prefix>
 
 # 2. One-command end-to-end pipeline (supports --regime globular|idp-13c|paramagnetic):
-nmrassign pipeline (--seq <SEQ|seq.fasta> (--hsqc <path> | --fid <dir> | --con <path> | --peaks <peaks.tsv>) | --star <entry.str>) \
+ferric pipeline (--seq <SEQ|seq.fasta> (--hsqc <path> | --fid <dir> | --con <path> | --peaks <peaks.tsv>) | --star <entry.str>) \
   [--regime globular|idp-13c|paramagnetic] [--engine auto|gpu|cpu] --out-dir <out/>
 
 # 3. Standalone IDP secondary structure propensity (Marsh-inspired SSP + Camilloni-inspired 4-state HMM):
-nmrassign propensity --shifts <shifts.str|shifts.nef> [--temp-k 298.15] [--ph 6.5] \
+ferric propensity --shifts <shifts.str|shifts.nef> [--temp-k 298.15] [--ph 6.5] \
   [--format tsv|json] [-o propensity.tsv]
 
 # 4. HTML + inline SVG quality report with stacked 4-state d2D + SSP track:
-nmrassign report --star|--shifts <shifts.str> [--peaks <peaks.tsv>] [--pdb <model.pdb>] \
+ferric report --star|--shifts <shifts.str> [--peaks <peaks.tsv>] [--pdb <model.pdb>] \
   [--idp-propensity|--propensity] [--temp-k 298.15] [--ph 6.5] --out <report.html>
 ```
 - `--regime globular` (default) preserves exact backwards-compatible `1H–15N` triple-resonance behavior (`03-assignment.md`).
-- `--regime idp-13c` accepts pre-picked `TSV` peak lists or volumetric `13C`-detected spectra (`--con`, `--caco`, `--canco`, `--cbcacon`, `--cccon`, `--ncaco` or auto-classified folders via `pick_c13_idp_dataset`) and dispatches `nmr_gpu::idp_gpu::assign_idp_13c_gpu` / `assign_idp_13c_cpu`: **`--engine gpu` fails with an explicit hard error (zero silent CPU fallback)** if no WebGPU adapter is available or GPU execution errors, `--engine auto` (default) attempts WebGPU and falls back to `assign_idp_13c_cpu` with a loud `stderr` warning, and `--engine cpu` runs directly on CPU, writing continuous through-Proline NMR-STAR v3 / NEF v1.1 shifts and confidences (and automatically embedding the `SSP`/`δ2D` track in `nmrassign pipeline --regime idp-13c`).
+- `--regime idp-13c` accepts pre-picked `TSV` peak lists or volumetric `13C`-detected spectra (`--con`, `--caco`, `--canco`, `--cbcacon`, `--cccon`, `--ncaco` or auto-classified folders via `pick_c13_idp_dataset`) and dispatches `nmr_gpu::idp_gpu::assign_idp_13c_gpu` / `assign_idp_13c_cpu`: **`--engine gpu` fails with an explicit hard error (zero silent CPU fallback)** if no WebGPU adapter is available or GPU execution errors, `--engine auto` (default) attempts WebGPU and falls back to `assign_idp_13c_cpu` with a loud `stderr` warning, and `--engine cpu` runs directly on CPU, writing continuous through-Proline NMR-STAR v3 / NEF v1.1 shifts and confidences (and automatically embedding the `SSP`/`δ2D` track in `ferric pipeline --regime idp-13c`).
 - `--regime paramagnetic` dispatches `assign_paramagnetic_from_peaks` (`--solver standard|evo-graph`) with sequence-motif / `--metal-ligands` / `--pdb` Solomon $r_{\text{M}}^{-6}$ `PRE` bleaching, and when `--pcs <pcs.tsv>` and `--pdb <model.pdb>` are supplied, fits and prints the 5-parameter traceless $\Delta\boldsymbol{\chi}$ tensor ($\Delta\chi_{\text{ax}}$, $\Delta\chi_{\text{rh}}$, `ZYZ` Euler angles, and Cornilescu $Q$-factor).
 
 ### 5.2 Interactive WebGPU Workbench (`nmr-gui`)

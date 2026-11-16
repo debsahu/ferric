@@ -1,6 +1,6 @@
 # Chapter 1: Quickstart & Multi-Regime NMR Workflows
 
-`nmr-assign` is designed around **zero-friction ingest** and **problem-regime specialization**. Rather than forcing globular triple-resonance assumptions onto intrinsically disordered proteins, supramolecular methyl-labeled complexes, paramagnetic metalloproteins, or small-molecule mixtures, the workspace classifier (`nmr-core::classify`) inspects acquisition headers and executed pulse programs in under `50 ms` to configure the right processing, peak-picking, and solver pipeline automatically.
+FERRIC is designed around **zero-friction ingest** and **problem-regime specialization**. Rather than forcing globular triple-resonance assumptions onto intrinsically disordered proteins, supramolecular methyl-labeled complexes, paramagnetic metalloproteins, or small-molecule mixtures, the workspace classifier (`nmr-core::classify`) inspects acquisition headers and executed pulse programs in under `50 ms` to configure the right processing, peak-picking, and solver pipeline automatically.
 
 ---
 
@@ -8,22 +8,22 @@
 
 ### 1. Inspect Any Spectrometer Folder or Archive
 
-Point `nmrassign inspect` at a parent directory (or `.tar` / `.tar.gz` / `.tgz` / `.zip` archive) containing raw Bruker experiment numbers or Varian `.fid` directories:
+Point `ferric inspect` at a parent directory (or `.tar` / `.tar.gz` / `.tgz` / `.zip` archive) containing raw Bruker experiment numbers or Varian `.fid` directories:
 
 ```bash
 # Scan headers and executed pulse programs in < 50 ms without reading bulk FID bytes
-nmrassign inspect ./workspace/ubiquitin_study
-nmrassign inspect ./workspace/ubiquitin_study --json > inventory.json
+ferric inspect ./workspace/ubiquitin_study
+ferric inspect ./workspace/ubiquitin_study --json > inventory.json
 ```
 
 `inspect` reports each experiment's vendor, dimensionality (`1D`, `2D`, `3D`, `Pseudo3D`, `4D`), raw-FID vs processed state, quadrature mode, NUS sparsity (`nuslist` / `sampling.sch`), classified experiment type (`15N-HSQC`, `HNCACB`, `CBCACONH`, `HNCO`, `CON`, `13C-HMQC`, `R1`, `CEST`, `CPMG`, `DOSY`), and recommended problem regime.
 
-### 2. One-Command Headless Pipeline (`nmrassign pipeline`)
+### 2. One-Command Headless Pipeline (`ferric pipeline`)
 
 Run raw FID processing (including `IST`/`FISTA` NUS reconstruction and empirical `{sign, fold}` `2D HSQC` registration), two-pass `StripBank3D` corroborated peak picking, backbone assignment, `DatasetQcReport` calibration, lossless `NEF v1.1` export, and self-contained `HTML+SVG` quality reporting in one command:
 
 ```bash
-nmrassign pipeline \
+ferric pipeline \
   --seq ./workspace/ubiquitin.fasta \
   --fid-hsqc ./workspace/ubiquitin_study/2 \
   --fid-triple HNCACB=./workspace/ubiquitin_study/3 \
@@ -43,7 +43,7 @@ Output artifacts written to `./workspace/ubq_results`:
 
 ### 3. Drag-and-Drop Interactive Desktop & Browser Workbench
 
-Launch `nmr-gui` (`cargo run --release -p nmr-gui`) and drag a spectrometer folder, `.tar.gz` archive, `.fasta` sequence, or `.nef` session onto the window:
+Launch `ferric-gui` (`cargo run --release -p nmr-gui --bin ferric-gui`) and drag a spectrometer folder, `.tar.gz` archive, `.fasta` sequence, or `.nef` session onto the window:
 
 1. **Experiment Selection Matrix (`nmr-gui::ingest_panel`)**: Displays every discovered dataset with auto-detected experiment role, observed nuclei (`1H`, `15N`, `13C`, `19F`, `31P`), field strength (`MHz`), quadrature/NUS badge, editable role dropdowns, include/exclude checkboxes, and a 1-click **Process, Pick & Run** button.
 2. **6-Stage *"What Next?"* Workflow Stepper (`nmr-gui::workflow_bar`)**: Tracks readiness across **1. Ingest → 2. Process FIDs → 3. Pick Peaks → 4. Assign Spins → 5. Fold / Dynamics → 6. Export & Report**, highlighting missing inputs or `DatasetQcReport` warnings alongside a single contextual action button.
@@ -56,7 +56,7 @@ Launch `nmr-gui` (`cargo run --release -p nmr-gui`) and drag a spectrometer fold
 
 ### Recommended Experiment Set
 
-| Role | Canonical Experiments | Key Physics Used by `nmr-assign` |
+| Role | Canonical Experiments | Key Physics Used by FERRIC |
 | :--- | :--- | :--- |
 | **2D Amide Root** | `2D 1H-15N HSQC` (or `TROSY-HSQC`) | Defines backbone `(H, N)` root coordinates; filters `Asn`/`Gln` `NH2` sidechain doublets and `t1` sinc ridges |
 | **`CA` / `CB` Walk** | `3D HNCACB` (`CA > 0`, `CB < 0`) + `3D CBCA(CO)NH` (`i-1` only) | Primary sequential connectivity & `Gly`/`Ala`/`Ser`/`Thr` amino-acid typing; intensity-aware `1J`/`2J` `i` vs `i-1` disambiguation when `CBCA(CO)NH` is absent |
@@ -65,16 +65,16 @@ Launch `nmr-gui` (`cargo run --release -p nmr-gui`) and drag a spectrometer fold
 | **Aliphatic & Aromatic Sidechains** | `13C-HSQC`, `3D HCCH-TOCSY`, `CC(CO)NH`, `H(CC)(CO)NH`, `2D (HB)CB(CGCD)HD/HE`, `His 15N-HMQC` | Completes `CHn` rotamers, `Phe`/`Tyr`/`Trp`/`His` rings, and `His` protonation/tautomer states |
 
 ![2D 1H-15N HSQC contour overlay and spin-system roots](../assets/01_hsqc_contour_overlay.svg)
-*Figure 1.1: Deterministic `nmrassign export-fig --panel hsqc` output showing positive and aliased-negative 2D `1H-15N` HSQC marching-squares contours, 1D F1/F2 skyline projections, and `evo-graph` assigned Ubiquitin spin-system roots (`seed = 42`).*
+*Figure 1.1: Deterministic `ferric export-fig --panel hsqc` output showing positive and aliased-negative 2D `1H-15N` HSQC marching-squares contours, 1D F1/F2 skyline projections, and `evo-graph` assigned Ubiquitin spin-system roots (`seed = 42`).*
 
 ![3D HNCACB sequential strip walk Phe4 to Gly10](../assets/02_sequential_strip_walk.svg)
-*Figure 1.2: Deterministic `nmrassign export-fig --panel strips` 3D `HNCACB` sequential strip walk across Ubiquitin `Phe4 -> Gly10`, illustrating intra-residue `i` and sequential `i-1` `CA`/`CB` ladders, `Thr7` `CB > CA` phase inversion, and `Gly10` `CB` absence (`seed = 42`).*
+*Figure 1.2: Deterministic `ferric export-fig --panel strips` 3D `HNCACB` sequential strip walk across Ubiquitin `Phe4 -> Gly10`, illustrating intra-residue `i` and sequential `i-1` `CA`/`CB` ladders, `Thr7` `CB > CA` phase inversion, and `Gly10` `CB` absence (`seed = 42`).*
 
 ### Step-by-Step Globular CLI Workflow
 
 ```bash
 # 1. Pick 2D + 3D spectra (automatically runs Pass-2 StripBank3D weak-peak rescue)
-nmrassign pick \
+ferric pick \
   --fid-hsqc ./data/ubq/2 \
   --fid-triple HNCACB=./data/ubq/3 \
   --fid-triple CBCACONH=./data/ubq/4 \
@@ -84,7 +84,7 @@ nmrassign pick \
   --out ./out/ubq_peaks.tsv
 
 # 2. Run backbone resonance assignment (unlabelled reference offset alignment enabled by default)
-nmrassign assign \
+ferric assign \
   --peaks ./out/ubq_peaks.tsv \
   --seq ./data/ubq/ubiquitin.fasta \
   --solver evo-graph \
@@ -93,7 +93,7 @@ nmrassign assign \
   --out ./out/ubq_backbone
 
 # 3. Extend to aliphatic, aromatic (--ph), and Bayesian stereospecific prochiral sidechains
-nmrassign sidechain \
+ferric sidechain \
   --star ./out/ubq_backbone.str \
   --peaks ./out/ubq_sidechain_peaks.tsv \
   --aromatic --ph 6.5 \
@@ -106,11 +106,11 @@ nmrassign sidechain \
   --out ./out/ubq_all_atom.str
 
 # 4. Predict post-assignment torsions (4-layer HomologFirewall) & fold 3D ensemble with NOEs + RDCs
-nmrassign torsions \
+ferric torsions \
   --shifts ./out/ubq_all_atom.str \
   -o ./out/ubq_torsions.tsv
 
-nmrassign structure \
+ferric structure \
   --star ./out/ubq_all_atom.str \
   --noesy-peaks ./data/ubq/noesy_3d.tsv \
   --rdc ./data/ubq/bicelle_rdcs.tsv \
@@ -122,7 +122,7 @@ nmrassign structure \
 ```
 
 > [!NOTE] Strict Sequence-Only & Stereospecific Safety Guarantees
-> - **Backbone assignment is strictly sequence-only**: neither `torsion_db` nor 3D PDB coordinates are ever consulted during `nmrassign assign` unless a user explicitly invokes structure-based `methyl` or `paramagnetic` `PCS` fitting.
+> - **Backbone assignment is strictly sequence-only**: neither `torsion_db` nor 3D PDB coordinates are ever consulted during `ferric assign` unless a user explicitly invokes structure-based `methyl` or `paramagnetic` `PCS` fitting.
 > - **Histidine tautomer & metal safety (`nmr-core::aromatic`)**: `His` tautomer states (`Nδ1-H`, `Nε2-H`, imidazolium) require at least one `15N` observation for `Resolved` status and abstain cleanly (`FastExchangeUncommitted` or `MetalCoordinatedCandidate`) under $\chi^2_{0.95}$ residual gates, preventing false tautomer calls on Zn-coordinated histidines.
 > - **Stereospecific prochiral commitment (`nmr-core::stereospec`)**: `HB2`/`HB3`, `HG1`/`HG2`, and `HD1`/`HD2` receive `Ambiguity_code = 1` **only** when the Student-$t(\nu=4)$ `3J` + local-NOE + tempered Lovell rotamer posterior reaches $\ge 0.90$; dynamic surface sidechains default safely to `Ambiguity_code = 2`.
 > - **`RDC` & 3D folding validation scope (`F8`)**: `Ubiquitin` (`1D3Z`/`1UBQ`) and `GB1` (`2JSV`/`1PGB`) served as development folding targets; on the cold experimental unseen target `1KHM` (`KH3` domain, `89 aa`, experimental NOEs + single-medium bicelle `RDC`s + firewalled `BMRB 4405` shifts evaluated against `0.95 Å` apo X-ray `1ZZK`), adding `RDC`s improves NOE-only backbone RMSD (`3.824–4.798 Å`) on `5/5` seeds to `1.862–4.141 Å` (`CPU`) / `2.390–3.988 Å` (`WebGPU` `lowE`) and improves `ByPeptidePlane` $Q_{\text{free}}$ on `4/5` seeds, while `< 1.80 Å` development-target accuracy is not reached on an unseen protein.
@@ -131,7 +131,7 @@ nmrassign structure \
 
 ## Protein Workflow 2: Large / Perdeuterated Complexes & `13C`-Methyl TROSY (`30–100+ kDa`)
 
-Above `~35 kDa`, rapid transverse relaxation broadens protonated backbone `HNCACB` pathways unless samples are perdeuterated (`2H, 15N, 13C`) and selectively protonated at methyl positions (`Ile-δ1`, `Leu-δ1/δ2`, `Val-γ1/γ2`, `Met-ε`, `Ala-β`, `Thr-γ2`; Tugarinov & Kay 2003). `nmr-assign` provides dedicated 2D/3D/4D methyl-TROSY peak picking (`nmr-core::methyl_trosy`) and a WebGPU multi-replica Metropolis–Hastings NOE contact-graph assignment solver (`nmr-core::methyl_solver`, `nmr-gpu::methyl_gpu`).
+Above `~35 kDa`, rapid transverse relaxation broadens protonated backbone `HNCACB` pathways unless samples are perdeuterated (`2H, 15N, 13C`) and selectively protonated at methyl positions (`Ile-δ1`, `Leu-δ1/δ2`, `Val-γ1/γ2`, `Met-ε`, `Ala-β`, `Thr-γ2`; Tugarinov & Kay 2003). FERRIC provides dedicated 2D/3D/4D methyl-TROSY peak picking (`nmr-core::methyl_trosy`) and a WebGPU multi-replica Metropolis–Hastings NOE contact-graph assignment solver (`nmr-core::methyl_solver`, `nmr-gpu::methyl_gpu`).
 
 ### Supported Precursor Labeling Schemes
 
@@ -143,7 +143,7 @@ Above `~35 kDa`, rapid transverse relaxation broadens protonated backbone `HNCAC
 ### Running Structure-Based Methyl-TROSY Assignment
 
 ```bash
-nmrassign methyl \
+ferric methyl \
   --pdb ./data/maltose_bp/1ezp_apo.pdb \
   --hmqc ./data/maltose_bp/methyl_hmqc_2d.ft2 \
   --noesy ./data/maltose_bp/hmqc_noesy_3d.ft3 \
@@ -164,7 +164,7 @@ Key capabilities:
 
 Intrinsically disordered proteins (`IDPs`) and low-complexity domains suffer from severe `1H^N` chemical-shift collapse (`7.8–8.6 ppm`), rapid base-catalyzed amide proton exchange with bulk water at physiological pH (`pH 7.0–7.5`, `298–310 K`), and abundant **Proline** residues (`15–30%`) that lack amide protons altogether and shatter conventional `1H`-detected sequential walks into disconnected islands.
 
-`nmr-assign` solves this directly with protonless `13C`-detected experiment models (`nmr-core::c13_detected`) and a continuous **through-Proline** CPU/WebGPU dipeptide solver (`nmr-core::idp_solver`, `nmr-gpu::idp_gpu`; Bermel et al. 2006–2009).
+FERRIC solves this directly with protonless `13C`-detected experiment models (`nmr-core::c13_detected`) and a continuous **through-Proline** CPU/WebGPU dipeptide solver (`nmr-core::idp_solver`, `nmr-gpu::idp_gpu`; Bermel et al. 2006–2009).
 
 ### Protonless `13C`-Detected Experiment Suite
 
@@ -181,7 +181,7 @@ Intrinsically disordered proteins (`IDPs`) and low-complexity domains suffer fro
 
 ```bash
 # 1. Assign unbroken backbone chains directly through Prolines using T/pH-adjusted ncIDP coil priors
-nmrassign assign \
+ferric assign \
   --regime idp-13c \
   --seq ./data/alpha_synuclein.fasta \
   --con ./data/idp/con_2d.ft2 \
@@ -197,7 +197,7 @@ nmrassign assign \
   --out ./out/idp_assigned
 
 # 2. Compute transient Secondary Structure Propensity (SSP) & 4-state (alpha, beta, PPII, coil) populations
-nmrassign propensity \
+ferric propensity \
   --shifts ./out/idp_assigned.str \
   --temp-k 298.15 \
   --ph 7.4 \
@@ -223,7 +223,7 @@ where $(x, y, z)$ are nuclear coordinates in the principal frame of the traceles
 ### Running Paramagnetic Backbone Assignment & $\Delta\chi$-Tensor Fitting
 
 ```bash
-nmrassign assign \
+ferric assign \
   --regime paramagnetic \
   --peaks ./data/cisd3/picked_peaks.tsv \
   --seq ./data/cisd3/cisd3.fasta \
@@ -243,20 +243,20 @@ nmrassign assign \
 
 ## Small-Molecule & Mixture Workflows: 1D NMR, `Octet` & `DOSY`
 
-For synthetic organic chemistry, natural products, pharmaceutical quality control (`qNMR`), reaction monitoring, unseparated multi-component mixtures, and untargeted biofluid cohorts, `nmr-assign` combines the **`Octet` 2D Chemical Studio** with the **Analytical 1D, `DOSY` & Metabolomics Studios** (detailed in [Chapter 5](05-nmr1d-multiplets-and-dosy.md) and [Chapter 8](08-metabolomics-and-chemometrics.md)):
+For synthetic organic chemistry, natural products, pharmaceutical quality control (`qNMR`), reaction monitoring, unseparated multi-component mixtures, and untargeted biofluid cohorts, FERRIC combines the **`Octet` 2D Chemical Studio** with the **Analytical 1D, `DOSY` & Metabolomics Studios** (detailed in [Chapter 5](05-nmr1d-multiplets-and-dosy.md) and [Chapter 8](08-metabolomics-and-chemometrics.md)):
 
-1. **Sketch or Import a 2D Molecule (`nmrassign chem` / `⚗️ Octet Chemical Draw`)**:
+1. **Sketch or Import a 2D Molecule (`ferric chem` / `⚗️ Octet Chemical Draw`)**:
    ```bash
    # Convert IUPAC name or SMILES to publication ACS 1996 SVG + predicted 1H/13C JCAMP-DX spectrum
-   nmrassign chem --smiles "CC(=O)Oc1ccccc1C(=O)O" --solvent CDCl3 --mhz 600 --out aspirin.svg
-   nmrassign chem info --name "2-acetoxybenzoic acid" --solvent CDCl3 --mhz 600
+   ferric chem --smiles "CC(=O)Oc1ccccc1C(=O)O" --solvent CDCl3 --mhz 600 --out aspirin.svg
+   ferric chem info --name "2-acetoxybenzoic acid" --solvent CDCl3 --mhz 600
    ```
-2. **Process & Deconvolve Experimental 1D Spectra (`nmrassign nmr1d {process, multiplet, qnmr}`)**:
+2. **Process & Deconvolve Experimental 1D Spectra (`ferric nmr1d {process, multiplet, qnmr}`)**:
    - Automatic Moskau digital-filter group-delay compensation, Chen (2002) minimum-entropy autophasing, Whittaker/Bernstein baseline flattening, optional `HSVD` water pole subtraction, Fulmer (2010) residual solvent/impurity referencing, global pseudo-Voigt multiplet deconvolution, recursive Hoye `J`-tree extraction (`s`, `d`, `t`, `q`, `dd`, `ddd`, `dt`, `td`, AB quartet roofing), and lossless `ACS` / `JOC` / `RSC` / `Nature` experimental paragraph generation.
 3. **Determine Certified Molar Purity (`qNMR`), Mixture Diffusivities (`DOSY`) & Cohort Biomarkers (`metabolomics`)**:
-   - Compute internal-standard `qNMR` mass-fraction purity `% w/w` (`nmrassign nmr1d qnmr`) with GUM expanded uncertainty $U_{k=2}$ against NIST/USP primary standards (`DMSO2`, Maleic acid, `TMB`, `DMT`) with automatic $d_1 < 5 T_1$ saturation warnings.
-   - Separate mixture components in situ via Bruker `difflist` (`STE` / `BPP-LED`) or Varian `gzlvl1` pseudo-2D `DOSY` (`nmrassign dosy fit`, `dosy ilt`, `dosy mw`) using `BIC`-selected discrete 1–3 component Stejskal–Tanner fitting on CPU/WebGPU, Stokes–Einstein $R_h$/`MW` estimation, and 4-mode multi-spectrum kinetics/difference stacks.
-   - Run untargeted 1D cohort bucketing (`AI-Binning`), `PQN` dilution normalization, `PCA` Hotelling $T^2$/$Q$ outlier screening, leak-free stratified `k`-fold `OPLS-DA`, and `STOCSY` spin-system correlation (`nmrassign metabolomics {bin, pca, oplsda, stocsy}`).
+   - Compute internal-standard `qNMR` mass-fraction purity `% w/w` (`ferric nmr1d qnmr`) with GUM expanded uncertainty $U_{k=2}$ against NIST/USP primary standards (`DMSO2`, Maleic acid, `TMB`, `DMT`) with automatic $d_1 < 5 T_1$ saturation warnings.
+   - Separate mixture components in situ via Bruker `difflist` (`STE` / `BPP-LED`) or Varian `gzlvl1` pseudo-2D `DOSY` (`ferric dosy fit`, `dosy ilt`, `dosy mw`) using `BIC`-selected discrete 1–3 component Stejskal–Tanner fitting on CPU/WebGPU, Stokes–Einstein $R_h$/`MW` estimation, and 4-mode multi-spectrum kinetics/difference stacks.
+   - Run untargeted 1D cohort bucketing (`AI-Binning`), `PQN` dilution normalization, `PCA` Hotelling $T^2$/$Q$ outlier screening, leak-free stratified `k`-fold `OPLS-DA`, and `STOCSY` spin-system correlation (`ferric metabolomics {bin, pca, oplsda, stocsy}`).
 
 ![Octet 2D chemical depiction and 1H/13C chemical shift linking](../assets/08_octet_structure_link.svg)
-*Figure 1.3: Deterministic `nmrassign export-fig --panel octet` output rendering ACS-styled `(S)`-Ibuprofen 2D skeletal depiction with Cahn–Ingold–Prelog stereochemical perception and linked `1H`/`13C` chemical-shift table.*
+*Figure 1.3: Deterministic `ferric export-fig --panel octet` output rendering ACS-styled `(S)`-Ibuprofen 2D skeletal depiction with Cahn–Ingold–Prelog stereochemical perception and linked `1H`/`13C` chemical-shift table.*

@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thank you for reporting an issue in `nmr-assign`!
+        Thank you for reporting an issue in **FERRIC**!
         **Clean-Room & Privacy Policy:** Please cite public **BMRB / PDB accessions** or minimal synthetic inputs only. Never paste or attach unpublished private spectra or source code, macros, parameter tables, or output files from proprietary, academic-only, GPL, or AGPL NMR software.
 
   - type: dropdown
@@ -14,8 +14,8 @@ body:
     attributes:
       label: Component / Surface
       options:
-        - "CLI (nmrassign)"
-        - "Desktop GUI (nmr-gui native)"
+        - "CLI (ferric)"
+        - "Desktop GUI (ferric-gui native)"
         - "Browser WebGPU Demo (wasm32)"
         - "Raw FID / Custom pulprog / Composable DSP (nmr-core)"
         - "Macromolecular Assignment Solvers (evo-graph / standard / bayes-sa / IDP / Methyl-TROSY)"
@@ -30,9 +30,9 @@ body:
   - type: input
     id: version
     attributes:
-      label: nmrassign Version & Git Commit
-      description: Output of `nmrassign --version` (or release tag)
-      placeholder: "nmrassign 0.13.0"
+      label: ferric Version & Git Commit
+      description: Output of `ferric --version` (or release tag)
+      placeholder: "ferric 0.14.0"
     validations:
       required: true
 
@@ -65,7 +65,7 @@ body:
       label: Steps to Reproduce, Expected Physics/Output & Actual Behavior
       description: Provide exact CLI commands or GUI actions and a public BMRB ID (e.g., BMRB 17769) if applicable.
       placeholder: |
-        1. Run `nmrassign ...`
+        1. Run `ferric ...`
         2. Expected: ...
         3. Observed: ...
     validations:

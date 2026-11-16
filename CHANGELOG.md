@@ -4,6 +4,19 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
+## [0.14.0] — 2026-11-16
+
+### Renamed to FERRIC
+
+- **Public Brand & Binary Rename (`nmr-assign` / `nmrassign` → `FERRIC` / `ferric`)**:
+  - Product & project name: **FERRIC** (**F**ID-to-structure **E**ngine for **R**elaxation, **R**esonance assignment, **I**ntegration & **C**hemometrics).
+  - User-facing executables: CLI binary `ferric` (formerly `nmrassign`), desktop/WebAssembly GUI binary `ferric-gui` (formerly `nmrassign-gui`), macOS bundle `FERRIC.app` (`CFBundleName = "FERRIC"`, `CFBundleExecutable = "ferric-gui"`, `CFBundleIdentifier = "org.ferric-nmr.desktop"`), cross-platform release archives `ferric-v<version>-<platform>.{dmg,tar.gz,zip}`, GitHub release title `FERRIC vX.Y.Z`, and Pages workflow artifact `ferric-manual-and-web-demo`.
+  - **Cargo workspace package names unchanged**: `nmr-core`, `nmr-gpu`, `nmr-cli`, and `nmr-gui` remain unchanged internally (`ferric` / `ferric-core` already exist on external registries).
+  - **Backward-Compatibility Alias Policy (`v0.14.x`, removed in `v0.15.0`)**: For the `v0.14.x` minor release series, `nmrassign` ships alongside `ferric` (both in Cargo workspace builds and inside all cross-platform release archives) as a deprecated compatibility alias pointing at the same CLI entry point. When invoked as `nmrassign`, it emits a single warning line to `stderr` (`warning: 'nmrassign' is deprecated; use 'ferric' (alias removed in v0.15.0)`) while keeping `stdout` byte-identical so existing scripts and MCP configurations continue working uninterrupted. The `nmrassign` compatibility alias will be **removed in `v0.15.0`**.
+  - **Pure-Rename Scope & URL Policy**: Zero algorithm, parameter, scoring, or numerical changes relative to `v0.13.0`; existing `github.com/debsahu/nmr-assign` and `debsahu.github.io/nmr-assign` links are preserved until repository/site migration (`Slice 18.4`).
+
+---
+
 ## [0.13.0] — 2026-11-15 — Phase 17: Engineering Hardening (`F5`, `F6`, `F12`, `F19`, `F20`, `F22`, `F23`), Mobile/Tablet WebGPU UX (`T17.M`), Cross-Platform Release Packaging (`T17.R`), and Cryptographic Blind Single-Shot Empirical Audit (`T17.P`, `T17.A`, `F10`–`F17`)
 
 - **Tag:** `v0.13.0`

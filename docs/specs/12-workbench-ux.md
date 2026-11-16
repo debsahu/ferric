@@ -18,7 +18,7 @@ No source code, keytables, parameter libraries, or binaries from restricted acad
 ### 1.1 Design Goals
 Experimentalists organize protein NMR projects as nested directories or `.tar` / `.tar.gz` / `.tgz` archives containing raw spectrometer acquisitions alongside optional processed planes, polymer sequences (`.fasta`), and shift/restraint tables (`.str`, `.nef`). Experiment folder names are frequently numeric (`1/`, `2/`, `10/`, `10003/`) or abbreviated (`b8/NHSQC`, `v6/CBCAcoNH`, `030804.3g51030/11`), making filename-only heuristics brittle.
 
-`nmr_core::classify` provides a single zero-dependency classification engine shared across native CLI (`nmrassign inspect`), HTTP service (`POST /api/v1/inspect`), native desktop GUI (`nmr-gui`), and browser WebAssembly (`wasm32-unknown-unknown` drag-and-drop):
+`nmr_core::classify` provides a single zero-dependency classification engine shared across native CLI (`ferric inspect`), HTTP service (`POST /api/v1/inspect`), native desktop GUI (`nmr-gui`), and browser WebAssembly (`wasm32-unknown-unknown` drag-and-drop):
 
 - `classify_nmr_workspace(path: &Path) -> Result<WorkspaceInventory, String>` (native filesystem directory, single spectrum/table file, or `.tar` / `.tar.gz` / `.tgz` archive).
 - `classify_nmr_entries(entries: &[VirtualEntry]) -> WorkspaceInventory` (`wasm32`-compatible slice of `(relative_path, header_bytes, total_bytes)`).
@@ -64,10 +64,10 @@ Missing-input hints notify the user when:
 - Only `RawFid` time-domain data is present (prompting Stage 2 batch FID processing);
 - Only `Cα`/`C'` triple-resonance experiments (`HNCA`/`HNCOCA`/`HNCO`) are present without `Cβ` (`HNCACB`/`CBCACONH`), noting reduced amino-acid type discrimination (`CA`-only sparse regime).
 
-### 1.5 CLI (`nmrassign inspect`) & HTTP API (`POST /api/v1/inspect`)
-- **CLI**: `nmrassign inspect <path> [--json]` prints either a human-readable experiment matrix + regime + hints table or pretty-printed `WorkspaceInventory` JSON (`--json`).
+### 1.5 CLI (`ferric inspect`) & HTTP API (`POST /api/v1/inspect`)
+- **CLI**: `ferric inspect <path> [--json]` prints either a human-readable experiment matrix + regime + hints table or pretty-printed `WorkspaceInventory` JSON (`--json`).
 - **HTTP Service**: `POST /api/v1/inspect` validates the HTTP `Host` header against loopback (`localhost`, `127.0.0.1`, or `[::1]` on the bound listener port) or an explicit `--cors-origin` entry before accepting same-origin `Origin == http(s)://{Host}` (`403 Forbidden` otherwise, blocking DNS-rebinding attacks against `127.0.0.1`; `N3`) and enforces strict `Content-Type` validation (`415` on `text/plain`), accepting either:
-  1. `Content-Type: application/json` with `{ "entries": [VirtualEntry, ...] }` (or `{ "path": "<dir_or_archive>" }` **only** when `--inspect-root <dir>` is configured on `nmrassign serve` and the canonicalized target lies inside `--inspect-root`; disabled `403` by default), or
+  1. `Content-Type: application/json` with `{ "entries": [VirtualEntry, ...] }` (or `{ "path": "<dir_or_archive>" }` **only** when `--inspect-root <dir>` is configured on `ferric serve` and the canonicalized target lies inside `--inspect-root`; disabled `403` by default), or
   2. Raw `.tar` / `.tar.gz` / `.tgz` binary request body (`application/x-tar`, `application/gzip`, or `application/octet-stream`, bounded at `128 MiB` inflated and `32 MiB` retained header bytes, with trailing zero-padding tolerance on `.tgz`),
   returning `200 OK` with serialized `WorkspaceInventory` JSON.
 - **Ingest Modal (`T09.2`)**: Renders an editable experiment selection matrix (checkbox include/exclude, dropdown override of `PulseSequenceClass`, NUS/quadrature/state badges, and sequence paste/upload box) with a single **Process & Load Selected** primary action.
