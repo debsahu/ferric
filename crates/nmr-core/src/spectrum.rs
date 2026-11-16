@@ -353,24 +353,21 @@ fn decode_bruker_words(
     }
 }
 
-/// Read a Bruker TopSpin 2D processed directory (containing `procs`, `proc2s`, and `2rr`).
-pub fn read_bruker_pdata_2d(pdata_dir: impl AsRef<Path>) -> Result<Spectrum2D, String> {
-    let dir = pdata_dir.as_ref();
-    let procs_txt = fs::read_to_string(dir.join("procs"))
-        .map_err(|e| format!("failed to read {}: {e}", dir.join("procs").display()))?;
-    let proc2s_txt = fs::read_to_string(dir.join("proc2s"))
-        .map_err(|e| format!("failed to read {}: {e}", dir.join("proc2s").display()))?;
-
-    let p1 = parse_jcamp_params(&procs_txt);
-    let p2 = parse_jcamp_params(&proc2s_txt);
+/// Decode a Bruker TopSpin 2D processed dataset directly from in-memory `procs`, `proc2s`, and `2rr` byte slices.
+pub fn read_bruker_pdata_2d_from_bytes(
+    name: &str,
+    procs_txt: &str,
+    proc2s_txt: &str,
+    raw_bytes: &[u8],
+) -> Result<Spectrum2D, String> {
+    let p1 = parse_jcamp_params(procs_txt);
+    let p2 = parse_jcamp_params(proc2s_txt);
     let (axis_x, xdim_x, bytordp, dtypp, nc_proc) = parse_bruker_axis(&p1, "1H")?;
     let (axis_y, xdim_y, ..) = parse_bruker_axis(&p2, "15N")?;
 
     let nx = axis_x.size;
     let ny = axis_y.size;
-    let raw_bytes = fs::read(dir.join("2rr"))
-        .map_err(|e| format!("failed to read {}: {e}", dir.join("2rr").display()))?;
-    let raw = decode_bruker_words(&raw_bytes, bytordp, dtypp, nc_proc, nx * ny)?;
+    let raw = decode_bruker_words(raw_bytes, bytordp, dtypp, nc_proc, nx * ny)?;
 
     let tx = xdim_x.min(nx).max(1);
     let ty = xdim_y.min(ny).max(1);
@@ -397,15 +394,24 @@ pub fn read_bruker_pdata_2d(pdata_dir: impl AsRef<Path>) -> Result<Spectrum2D, S
     }
 
     Ok(Spectrum2D {
-        name: dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("2rr")
-            .to_string(),
+        name: name.to_string(),
         axis_x,
         axis_y,
         data,
     })
+}
+
+/// Read a Bruker TopSpin 2D processed directory (containing `procs`, `proc2s`, and `2rr`).
+pub fn read_bruker_pdata_2d(pdata_dir: impl AsRef<Path>) -> Result<Spectrum2D, String> {
+    let dir = pdata_dir.as_ref();
+    let procs_txt = fs::read_to_string(dir.join("procs"))
+        .map_err(|e| format!("failed to read {}: {e}", dir.join("procs").display()))?;
+    let proc2s_txt = fs::read_to_string(dir.join("proc2s"))
+        .map_err(|e| format!("failed to read {}: {e}", dir.join("proc2s").display()))?;
+    let raw_bytes = fs::read(dir.join("2rr"))
+        .map_err(|e| format!("failed to read {}: {e}", dir.join("2rr").display()))?;
+    let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("2rr");
+    read_bruker_pdata_2d_from_bytes(name, &procs_txt, &proc2s_txt, &raw_bytes)
 }
 
 /// Write a Bruker TopSpin 2D processed directory (`procs`, `proc2s`, `2rr`) for round-trip testing and export.
@@ -451,28 +457,25 @@ pub fn write_bruker_pdata_2d(pdata_dir: impl AsRef<Path>, spec: &Spectrum2D) -> 
     fs::write(dir.join("2rr"), bytes).map_err(|e| format!("failed to write 2rr: {e}"))
 }
 
-/// Read a Bruker TopSpin 3D processed directory (`procs`, `proc2s`, `proc3s`, and `3rrr`).
-pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, String> {
-    let dir = pdata_dir.as_ref();
-    let p1 = parse_jcamp_params(
-        &fs::read_to_string(dir.join("procs")).map_err(|e| format!("failed to read procs: {e}"))?,
-    );
-    let p2 = parse_jcamp_params(
-        &fs::read_to_string(dir.join("proc2s"))
-            .map_err(|e| format!("failed to read proc2s: {e}"))?,
-    );
-    let p3 = parse_jcamp_params(
-        &fs::read_to_string(dir.join("proc3s"))
-            .map_err(|e| format!("failed to read proc3s: {e}"))?,
-    );
+/// Decode a Bruker TopSpin 3D processed dataset directly from in-memory `procs`, `proc2s`, `proc3s`, and `3rrr` byte slices.
+pub fn read_bruker_pdata_3d_from_bytes(
+    name: &str,
+    exp: &str,
+    procs_txt: &str,
+    proc2s_txt: &str,
+    proc3s_txt: &str,
+    raw_bytes: &[u8],
+) -> Result<Spectrum3D, String> {
+    let p1 = parse_jcamp_params(procs_txt);
+    let p2 = parse_jcamp_params(proc2s_txt);
+    let p3 = parse_jcamp_params(proc3s_txt);
 
     let (axis_x, xdim_x, bytordp, dtypp, nc_proc) = parse_bruker_axis(&p1, "1H")?;
     let (axis_y, xdim_y, ..) = parse_bruker_axis(&p2, "15N")?;
     let (axis_z, xdim_z, ..) = parse_bruker_axis(&p3, "13C")?;
 
     let (nx, ny, nz) = (axis_x.size, axis_y.size, axis_z.size);
-    let raw_bytes = fs::read(dir.join("3rrr")).map_err(|e| format!("failed to read 3rrr: {e}"))?;
-    let raw = decode_bruker_words(&raw_bytes, bytordp, dtypp, nc_proc, nx * ny * nz)?;
+    let raw = decode_bruker_words(raw_bytes, bytordp, dtypp, nc_proc, nx * ny * nz)?;
 
     let tx = xdim_x.min(nx).max(1);
     let ty = xdim_y.min(ny).max(1);
@@ -506,17 +509,27 @@ pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Sp
     }
 
     Ok(Spectrum3D {
-        name: dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("3rrr")
-            .to_string(),
+        name: name.to_string(),
         exp: exp.to_string(),
         axis_x,
         axis_y,
         axis_z,
         data,
     })
+}
+
+/// Read a Bruker TopSpin 3D processed directory (`procs`, `proc2s`, `proc3s`, and `3rrr`).
+pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, String> {
+    let dir = pdata_dir.as_ref();
+    let procs_txt =
+        fs::read_to_string(dir.join("procs")).map_err(|e| format!("failed to read procs: {e}"))?;
+    let proc2s_txt = fs::read_to_string(dir.join("proc2s"))
+        .map_err(|e| format!("failed to read proc2s: {e}"))?;
+    let proc3s_txt = fs::read_to_string(dir.join("proc3s"))
+        .map_err(|e| format!("failed to read proc3s: {e}"))?;
+    let raw_bytes = fs::read(dir.join("3rrr")).map_err(|e| format!("failed to read 3rrr: {e}"))?;
+    let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("3rrr");
+    read_bruker_pdata_3d_from_bytes(name, exp, &procs_txt, &proc2s_txt, &proc3s_txt, &raw_bytes)
 }
 
 /// Write a Bruker TopSpin 3D processed directory (`procs`, `proc2s`, `proc3s`, `3rrr`) for round-trip export.
@@ -652,11 +665,9 @@ fn pipe_slot_for_dim(hdr: &[f32], dim_idx: usize) -> usize {
     }
 }
 
-/// Read an NMRPipe 2D spectrum (`.ft2` / `.dat`).
-pub fn read_nmrpipe_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
-    let bytes = fs::read(path.as_ref())
-        .map_err(|e| format!("failed to read {}: {e}", path.as_ref().display()))?;
-    let (hdr, big_endian) = decode_pipe_header(&bytes)?;
+/// Decode an NMRPipe 2D spectrum (`.ft2` / `.dat`) directly from an in-memory byte slice.
+pub fn read_nmrpipe_2d_from_bytes(name: &str, bytes: &[u8]) -> Result<Spectrum2D, String> {
+    let (hdr, big_endian) = decode_pipe_header(bytes)?;
 
     let nx = (hdr[99].round() as usize).max(1);
     let ny = (hdr[219].round() as usize).max(1);
@@ -687,16 +698,22 @@ pub fn read_nmrpipe_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
     }
 
     Ok(Spectrum2D {
-        name: path
-            .as_ref()
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("nmrpipe.ft2")
-            .to_string(),
+        name: name.to_string(),
         axis_x,
         axis_y,
         data,
     })
+}
+
+/// Read an NMRPipe 2D spectrum (`.ft2` / `.dat`).
+pub fn read_nmrpipe_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
+    let p = path.as_ref();
+    let bytes = fs::read(p).map_err(|e| format!("failed to read {}: {e}", p.display()))?;
+    let name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("nmrpipe.ft2");
+    read_nmrpipe_2d_from_bytes(name, &bytes)
 }
 
 /// Write an NMRPipe 2D spectrum (`.ft2`) with complete frequency referencing.
@@ -751,11 +768,13 @@ pub fn write_nmrpipe_2d(path: impl AsRef<Path>, spec: &Spectrum2D) -> Result<(),
         .map_err(|e| format!("failed to write {}: {e}", path.as_ref().display()))
 }
 
-/// Read a single-stream NMRPipe 3D file (`.ft3`).
-pub fn read_nmrpipe_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, String> {
-    let bytes = fs::read(path.as_ref())
-        .map_err(|e| format!("failed to read {}: {e}", path.as_ref().display()))?;
-    let (hdr, big_endian) = decode_pipe_header(&bytes)?;
+/// Decode a single-stream NMRPipe 3D file (`.ft3`) directly from an in-memory byte slice.
+pub fn read_nmrpipe_3d_from_bytes(
+    name: &str,
+    exp: &str,
+    bytes: &[u8],
+) -> Result<Spectrum3D, String> {
+    let (hdr, big_endian) = decode_pipe_header(bytes)?;
 
     let nx = (hdr[99].round() as usize).max(1);
     let ny = (hdr[219].round() as usize).max(1);
@@ -790,18 +809,24 @@ pub fn read_nmrpipe_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, 
     }
 
     Ok(Spectrum3D {
-        name: path
-            .as_ref()
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("nmrpipe.ft3")
-            .to_string(),
+        name: name.to_string(),
         exp: exp.to_string(),
         axis_x,
         axis_y,
         axis_z,
         data,
     })
+}
+
+/// Read a single-stream NMRPipe 3D file (`.ft3`).
+pub fn read_nmrpipe_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, String> {
+    let p = path.as_ref();
+    let bytes = fs::read(p).map_err(|e| format!("failed to read {}: {e}", p.display()))?;
+    let name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("nmrpipe.ft3");
+    read_nmrpipe_3d_from_bytes(name, exp, &bytes)
 }
 
 /// Write a single-stream NMRPipe 3D file (`.ft3`) with complete frequency referencing.
@@ -1073,15 +1098,16 @@ fn encode_ucsf_axis_header(ax: &AxisPpm, tile_size: usize) -> [u8; UCSF_AXIS_HEA
 
 /// Read a 2D UCSF Sparky spectrum (`.ucsf`), mapping `1H` to `axis_x` and the indirect
 /// heteronucleus (`15N` / `13C`) to `axis_y`.
-pub fn read_ucsf_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
-    let p = path.as_ref();
-    let file = File::open(p).map_err(|e| format!("failed to open {}: {e}", p.display()))?;
-    let mut reader = BufReader::with_capacity(256 * 1024, file);
+/// Decode a 2D UCSF Sparky spectrum (`.ucsf`) from an in-memory byte slice.
+pub fn read_ucsf_2d_from_bytes(name: &str, bytes: &[u8]) -> Result<Spectrum2D, String> {
+    read_ucsf_2d_from_reader(name, std::io::Cursor::new(bytes))
+}
 
+fn read_ucsf_2d_from_reader<R: Read>(name: &str, mut reader: R) -> Result<Spectrum2D, String> {
     let mut hdr = [0u8; UCSF_FILE_HEADER_BYTES + 2 * UCSF_AXIS_HEADER_BYTES];
     reader
         .read_exact(&mut hdr)
-        .map_err(|e| format!("failed to read UCSF 2D header from {}: {e}", p.display()))?;
+        .map_err(|e| format!("failed to read UCSF 2D header from {name}: {e}"))?;
     parse_ucsf_file_header(&hdr[..UCSF_FILE_HEADER_BYTES], 2)?;
 
     let (ax0, t0) = parse_ucsf_axis_header(
@@ -1096,8 +1122,6 @@ pub fn read_ucsf_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
     let nt0 = n0.div_ceil(t0);
     let nt1 = n1.div_ceil(t1);
 
-    // Standard Sparky 2D layout has axis[0] = indirect (15N/13C) and axis[1] = direct (1H).
-    // Transpose into Spectrum2D(X=1H, Y=indirect) if axis[0] is 1H and axis[1] is heteronuclear.
     let transpose =
         classify_ucsf_nucleus(&ax0) == UcsfNuc::H && classify_ucsf_nucleus(&ax1) != UcsfNuc::H;
     let (axis_x, axis_y) = if transpose { (ax0, ax1) } else { (ax1, ax0) };
@@ -1113,12 +1137,9 @@ pub fn read_ucsf_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
         for bt1 in 0..nt1 {
             let base1 = bt1 * t1;
             let valid1 = (n1 - base1).min(t1);
-            reader.read_exact(&mut tile_bytes).map_err(|e| {
-                format!(
-                    "UCSF 2D tile ({bt0},{bt1}) truncated in {}: {e}",
-                    p.display()
-                )
-            })?;
+            reader
+                .read_exact(&mut tile_bytes)
+                .map_err(|e| format!("UCSF 2D tile ({bt0},{bt1}) truncated in {name}: {e}"))?;
             if !transpose {
                 for l0 in 0..valid0 {
                     let gy = base0 + l0;
@@ -1144,15 +1165,22 @@ pub fn read_ucsf_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
     }
 
     Ok(Spectrum2D {
-        name: p
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("spectrum.ucsf")
-            .to_string(),
+        name: name.to_string(),
         axis_x,
         axis_y,
         data,
     })
+}
+
+pub fn read_ucsf_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
+    let p = path.as_ref();
+    let file = File::open(p).map_err(|e| format!("failed to open {}: {e}", p.display()))?;
+    let reader = BufReader::with_capacity(256 * 1024, file);
+    let name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("spectrum.ucsf");
+    read_ucsf_2d_from_reader(name, reader)
 }
 
 /// Write a 2D UCSF Sparky spectrum (`.ucsf`) using standard tile sizes (`64 x 256` capped to axis size).
@@ -1255,15 +1283,20 @@ fn choose_ucsf_3d_axis_perm(axes: &[AxisPpm; 3]) -> (usize, usize, usize) {
 
 /// Read a 3D UCSF Sparky spectrum (`.ucsf`), assembling big-endian `f32` tiles (including
 /// zero-padded partial boundary tiles) and ordering dimensions into `Spectrum3D(X=1H, Y=15N, Z=13C)`.
-pub fn read_ucsf_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, String> {
-    let p = path.as_ref();
-    let file = File::open(p).map_err(|e| format!("failed to open {}: {e}", p.display()))?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+/// Decode a 3D UCSF Sparky spectrum (`.ucsf`) from an in-memory byte slice.
+pub fn read_ucsf_3d_from_bytes(name: &str, exp: &str, bytes: &[u8]) -> Result<Spectrum3D, String> {
+    read_ucsf_3d_from_reader(name, exp, std::io::Cursor::new(bytes))
+}
 
+fn read_ucsf_3d_from_reader<R: Read>(
+    name: &str,
+    exp: &str,
+    mut reader: R,
+) -> Result<Spectrum3D, String> {
     let mut hdr = [0u8; UCSF_FILE_HEADER_BYTES + 3 * UCSF_AXIS_HEADER_BYTES];
     reader
         .read_exact(&mut hdr)
-        .map_err(|e| format!("failed to read UCSF 3D header from {}: {e}", p.display()))?;
+        .map_err(|e| format!("failed to read UCSF 3D header from {name}: {e}"))?;
     parse_ucsf_file_header(&hdr[..UCSF_FILE_HEADER_BYTES], 3)?;
 
     let (ax0, t0) = parse_ucsf_axis_header(
@@ -1304,10 +1337,7 @@ pub fn read_ucsf_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, Str
                 let base2 = bt2 * t2;
                 let valid2 = (n2 - base2).min(t2);
                 reader.read_exact(&mut tile_bytes).map_err(|e| {
-                    format!(
-                        "UCSF 3D tile ({bt0},{bt1},{bt2}) truncated in {}: {e}",
-                        p.display()
-                    )
+                    format!("UCSF 3D tile ({bt0},{bt1},{bt2}) truncated in {name}: {e}")
                 })?;
 
                 if direct_zyx {
@@ -1347,17 +1377,24 @@ pub fn read_ucsf_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, Str
     }
 
     Ok(Spectrum3D {
-        name: p
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("spectrum3d.ucsf")
-            .to_string(),
+        name: name.to_string(),
         exp: exp.to_string(),
         axis_x,
         axis_y,
         axis_z,
         data,
     })
+}
+
+pub fn read_ucsf_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, String> {
+    let p = path.as_ref();
+    let file = File::open(p).map_err(|e| format!("failed to open {}: {e}", p.display()))?;
+    let reader = BufReader::with_capacity(1024 * 1024, file);
+    let name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("spectrum3d.ucsf");
+    read_ucsf_3d_from_reader(name, exp, reader)
 }
 
 /// Write a 3D UCSF Sparky spectrum (`.ucsf`) using standard tile sizes (`32 x 8 x 128` capped to axis size).

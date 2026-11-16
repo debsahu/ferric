@@ -1447,6 +1447,293 @@ fn scale_complex_slice(dst: &mut [Complex64], scale: f64) {
 }
 
 /// Read a Bruker 1D `fid` directory (`acqus` + `fid`).
+/// Decode a Bruker 1D FID directly from in-memory `acqus` (+ optional `acqu`, `procs`) and `fid` bytes (`wasm32`-compatible).
+pub fn read_bruker_fid_1d_from_bytes(
+    name: &str,
+    acqus_txt: &str,
+    acqu_txt: Option<&str>,
+    procs_txt: Option<&str>,
+    bytes: &[u8],
+) -> Result<Fid1D, String> {
+    let mut acqus = HashMap::new();
+    if let Some(fb) = acqu_txt {
+        acqus.extend(parse_jcamp_str(fb));
+    }
+    acqus.extend(parse_jcamp_str(acqus_txt));
+    if acqus.is_empty() {
+        return Err(format!("empty Bruker acqus parameter map for '{name}'"));
+    }
+    validate_bruker_fntype(Path::new(name), &acqus, &[])?;
+    let procs = procs_txt.map(parse_jcamp_str).filter(|m| !m.is_empty());
+    let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
+
+    let word_bytes = if dtypa == 2 { 8 } else { 4 };
+    let needed = (axis_x.complex_points * 2) * word_bytes;
+    if bytes.len() < needed {
+        return Err(format!(
+            "Bruker 1D fid '{name}' truncated: need {needed} bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let data = decode_bruker_trace(
+        &bytes[..needed],
+        axis_x.complex_points * 2,
+        bytorda != 0,
+        dtypa,
+    );
+    let pulse_program = acqus.get("PULPROG").cloned().unwrap_or_default();
+
+    Ok(Fid1D {
+        name: name.to_string(),
+        vendor: FidVendor::Bruker,
+        pulse_program,
+        axis_x,
+        data,
+    })
+}
+
+/// Decode a Bruker 2D `ser` dataset directly from in-memory `acqus`, `acqu2s`, optional `procs`/`proc2s`/`pulseprogram`/`nuslist`, and `ser` bytes (`wasm32`-compatible).
+#[allow(clippy::too_many_arguments)]
+pub fn read_bruker_fid_2d_from_bytes(
+    name: &str,
+    acqus_txt: &str,
+    acqu_txt: Option<&str>,
+    acqu2s_txt: &str,
+    acqu2_txt: Option<&str>,
+    procs_txt: Option<&str>,
+    proc2s_txt: Option<&str>,
+    pulseprogram_txt: Option<&str>,
+    nuslist_txt: Option<&str>,
+    bytes: &[u8],
+    allow_truncated_fid: bool,
+) -> Result<Fid2D, String> {
+    let mut acqus = HashMap::new();
+    if let Some(fb) = acqu_txt {
+        acqus.extend(parse_jcamp_str(fb));
+    }
+    acqus.extend(parse_jcamp_str(acqus_txt));
+    let mut acqu2s = HashMap::new();
+    if let Some(fb) = acqu2_txt {
+        acqu2s.extend(parse_jcamp_str(fb));
+    }
+    acqu2s.extend(parse_jcamp_str(acqu2s_txt));
+    if acqus.is_empty() || acqu2s.is_empty() {
+        return Err(format!(
+            "missing Bruker acqus / acqu2s parameters for 2D dataset '{name}'"
+        ));
+    }
+    let vdir = Path::new(name);
+    let is_fntype_nus = validate_bruker_fntype(vdir, &acqus, &[&acqu2s])?;
+    let procs = procs_txt.map(parse_jcamp_str).filter(|m| !m.is_empty());
+    let proc2s = proc2s_txt.map(parse_jcamp_str).filter(|m| !m.is_empty());
+
+    let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
+    let word_bytes = if dtypa == 2 { 8 } else { 4 };
+    let raw_stride_1024 = (axis_x.td_raw * word_bytes).div_ceil(1024) * 1024;
+
+    let td_acq_y: usize = acqu2s
+        .get("TD")
+        .ok_or("missing ##$TD in Bruker acqu2s")?
+        .parse()
+        .map_err(|e| format!("invalid TD in acqu2s: {e}"))?;
+
+    let has_nuslist = nuslist_txt.is_some_and(|s| !s.trim().is_empty());
+    let nus_td_opt = acqu2s
+        .get("NusTD")
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .or_else(|| parse_td_indirect_entry(&acqus, 1));
+    let implicit_nus = !is_fntype_nus
+        && has_nuslist
+        && (nus_td_opt.is_some_and(|ntd| ntd > td_acq_y)
+            || bytes.len() < td_acq_y * raw_stride_1024);
+    let is_nus = is_fntype_nus || implicit_nus;
+
+    let td_full_y = if is_nus {
+        let unflat = (bytes.len() < td_acq_y * raw_stride_1024).then_some(td_acq_y);
+        resolve_bruker_nus_full_td(&acqu2s, &acqus, 1, unflat, "F1 (acqu2s)", vdir)?
+    } else {
+        td_acq_y
+    };
+
+    let mut axis_y = parse_bruker_indirect_axis(
+        &acqus,
+        &acqu2s,
+        proc2s.as_ref(),
+        "15N",
+        Some(td_full_y),
+        None,
+    )?;
+    if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
+        let pulprog = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
+        axis_y.stored_proc.reverse =
+            infer_bruker_raw_indirect_reverse(pulseprogram_txt, pulprog, 1, axis_y.quad_mode);
+    }
+
+    let q1_mult = if axis_y.quad_mode == QuadMode::Qf {
+        1
+    } else {
+        2
+    };
+    let n0 = axis_x.complex_points;
+    let n1 = axis_y.complex_points;
+    let big_endian = bytorda != 0;
+    let trace_byte_len = n0 * 2 * word_bytes;
+    let mut data = vec![[0.0, 0.0]; n1 * 2 * n0];
+    let mut truncated_traces: Option<(usize, usize)> = None;
+
+    let nus_mask = if is_nus {
+        let nl = nuslist_txt
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                format!("Bruker 2D NUS dataset '{name}' is missing a non-empty nuslist schedule")
+            })?;
+        let decoded =
+            crate::pulprog::decode_nuslist_str(nl, &[n1], crate::pulprog::AcquisitionOrder::Dim2D)
+                .map_err(|e| format!("invalid 2D NUS schedule in '{name}': {e}"))?;
+        let coords: Vec<usize> = decoded.points.into_iter().map(|r| r[0]).collect();
+        let n_acq_traces = coords.len() * q1_mult;
+        if td_acq_y != n_acq_traces && td_acq_y != td_full_y {
+            return Err(format!(
+                "Bruker 2D NUS trace count mismatch in '{name}': acqu2s.TD={td_acq_y}, nuslist has {} points ({n_acq_traces} traces)",
+                coords.len()
+            ));
+        }
+        let (stride, observed) = determine_bruker_ser_stride_opts(
+            bytes.len(),
+            n_acq_traces,
+            axis_x.td_raw,
+            word_bytes,
+            false,
+            allow_truncated_fid,
+            vdir,
+        )?;
+        if observed < n_acq_traces {
+            truncated_traces = Some((observed, n_acq_traces));
+        }
+        let zero_tr = vec![[0.0, 0.0]; n0];
+        let mut counts = vec![0usize; n1];
+        let mut tmp_cos = vec![[0.0, 0.0]; n0];
+        let mut tmp_sin = vec![[0.0, 0.0]; n0];
+        for (row_idx, &k1) in coords.iter().enumerate() {
+            if axis_y.quad_mode == QuadMode::Qf {
+                if row_idx >= observed {
+                    break;
+                }
+                let off = row_idx * stride;
+                let tr = decode_bruker_trace(
+                    &bytes[off..off + trace_byte_len],
+                    n0 * 2,
+                    big_endian,
+                    dtypa,
+                );
+                add_complex_slice(&mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0], &tr);
+            } else {
+                if 2 * row_idx >= observed {
+                    break;
+                }
+                let off0 = (2 * row_idx) * stride;
+                let z0 = decode_bruker_trace(
+                    &bytes[off0..off0 + trace_byte_len],
+                    n0 * 2,
+                    big_endian,
+                    dtypa,
+                );
+                let z1 = if 2 * row_idx + 1 < observed {
+                    let off1 = (2 * row_idx + 1) * stride;
+                    decode_bruker_trace(
+                        &bytes[off1..off1 + trace_byte_len],
+                        n0 * 2,
+                        big_endian,
+                        dtypa,
+                    )
+                } else {
+                    zero_tr.clone()
+                };
+                recombine_quad_pair(axis_y.quad_mode, k1, &z0, &z1, &mut tmp_cos, &mut tmp_sin);
+                add_complex_slice(&mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0], &tmp_cos);
+                add_complex_slice(&mut data[(k1 * 2 + 1) * n0..(k1 * 2 + 2) * n0], &tmp_sin);
+            }
+            counts[k1] += 1;
+        }
+        for (k1, &cnt) in counts.iter().enumerate() {
+            if cnt > 1 {
+                scale_complex_slice(
+                    &mut data[(k1 * 2) * n0..(k1 * 2 + 2) * n0],
+                    1.0 / (cnt as f64),
+                );
+            }
+        }
+        Some(counts.into_iter().map(|c| c > 0).collect())
+    } else {
+        let (stride, observed) = determine_bruker_ser_stride_opts(
+            bytes.len(),
+            td_acq_y,
+            axis_x.td_raw,
+            word_bytes,
+            true,
+            allow_truncated_fid,
+            vdir,
+        )?;
+        if observed < td_acq_y {
+            truncated_traces = Some((observed, td_acq_y));
+        }
+        let zero_tr = vec![[0.0, 0.0]; n0];
+        if axis_y.quad_mode == QuadMode::Qf {
+            for k1 in 0..n1.min(observed) {
+                let off = k1 * stride;
+                let tr = decode_bruker_trace(
+                    &bytes[off..off + trace_byte_len],
+                    n0 * 2,
+                    big_endian,
+                    dtypa,
+                );
+                data[(k1 * 2) * n0..(k1 * 2 + 1) * n0].copy_from_slice(&tr);
+            }
+        } else {
+            for k1 in 0..n1 {
+                if 2 * k1 >= observed {
+                    break;
+                }
+                let off0 = (2 * k1) * stride;
+                let z0 = decode_bruker_trace(
+                    &bytes[off0..off0 + trace_byte_len],
+                    n0 * 2,
+                    big_endian,
+                    dtypa,
+                );
+                let z1 = if 2 * k1 + 1 < observed {
+                    let off1 = (2 * k1 + 1) * stride;
+                    decode_bruker_trace(
+                        &bytes[off1..off1 + trace_byte_len],
+                        n0 * 2,
+                        big_endian,
+                        dtypa,
+                    )
+                } else {
+                    zero_tr.clone()
+                };
+                let (cos_slice, sin_slice) =
+                    data[(k1 * 2) * n0..(k1 * 2 + 2) * n0].split_at_mut(n0);
+                recombine_quad_pair(axis_y.quad_mode, k1, &z0, &z1, cos_slice, sin_slice);
+            }
+        }
+        None
+    };
+
+    let pulse_program = acqus.get("PULPROG").cloned().unwrap_or_default();
+    Ok(Fid2D {
+        name: name.to_string(),
+        vendor: FidVendor::Bruker,
+        pulse_program,
+        axis_x,
+        axis_y,
+        nus_mask,
+        truncated_traces,
+        data,
+    })
+}
+
 pub fn read_bruker_fid_1d(dir: impl AsRef<Path>) -> Result<Fid1D, String> {
     let dir = resolve_fid_dir(dir.as_ref())?;
     let _ = interpret_bruker_dir_checked(&dir)?;

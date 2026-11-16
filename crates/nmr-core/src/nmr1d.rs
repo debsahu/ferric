@@ -4944,6 +4944,196 @@ fn find_jcamp_param(txt: &str, key_norm: &str) -> Option<String> {
     None
 }
 
+fn decode_bruker_1d_channel_bytes(
+    label: &str,
+    raw_bytes: &[u8],
+    si: usize,
+    word_size: usize,
+    dtype: u8,
+    big_endian: bool,
+    scale: f64,
+) -> Result<Vec<f64>, String> {
+    let expected_bytes = (si as u64)
+        .checked_mul(word_size as u64)
+        .ok_or_else(|| format!("Bruker SI={si} byte count overflow"))?;
+    let file_len = raw_bytes.len() as u64;
+    if file_len < expected_bytes {
+        return Err(format!(
+            "truncated Bruker {label}: has {file_len} bytes, expected {expected_bytes} bytes for SI={si}"
+        ));
+    }
+    if file_len != expected_bytes {
+        return Err(format!(
+            "Bruker procs SI={si} ({expected_bytes} bytes) disagrees with {label} length ({file_len} bytes)"
+        ));
+    }
+    let mut out = Vec::with_capacity(si);
+    for i in 0..si {
+        let val = if dtype == 2 {
+            let slice = &raw_bytes[i * 8..(i + 1) * 8];
+            let chunk: [u8; 8] = slice
+                .try_into()
+                .map_err(|_| format!("short 8-byte word at index {i}"))?;
+            let v = if big_endian {
+                f64::from_be_bytes(chunk)
+            } else {
+                f64::from_le_bytes(chunk)
+            };
+            v * scale
+        } else {
+            let slice = &raw_bytes[i * 4..(i + 1) * 4];
+            let chunk: [u8; 4] = slice
+                .try_into()
+                .map_err(|_| format!("short 4-byte word at index {i}"))?;
+            let raw = if big_endian {
+                i32::from_be_bytes(chunk)
+            } else {
+                i32::from_le_bytes(chunk)
+            };
+            (raw as f64) * scale
+        };
+        if !val.is_finite() {
+            return Err(format!(
+                "non-finite intensity in Bruker {label} at point {i}: {val}"
+            ));
+        }
+        out.push(val);
+    }
+    Ok(out)
+}
+
+/// Decode a processed Bruker 1D `pdata` spectrum directly from in-memory `procs`, `1r`, optional `1i`, and optional `acqus` (`wasm32`-compatible).
+pub fn decode_bruker_pdata_1d_bytes(
+    name: &str,
+    procs: &str,
+    bytes_1r: &[u8],
+    bytes_1i: Option<&[u8]>,
+    acqus_opt: Option<&str>,
+    mhz_override: Option<f64>,
+) -> Result<Spectrum1D, String> {
+    if procs.len() > 4 * 1024 * 1024 {
+        return Err(format!(
+            "Bruker procs for '{name}' exceeds 4 MiB ({} bytes)",
+            procs.len()
+        ));
+    }
+    let req_finite = |key: &str| -> Result<f64, String> {
+        let s = find_jcamp_param(procs, key)
+            .ok_or_else(|| format!("Bruker procs is missing parameter {key}"))?;
+        let v = s
+            .parse::<f64>()
+            .map_err(|_| format!("Bruker procs parameter {key}={s:?} is not a number"))?;
+        if !v.is_finite() {
+            return Err(format!("Bruker procs parameter {key}={s:?} is non-finite"));
+        }
+        Ok(v)
+    };
+    let si_f = req_finite("SI")?;
+    if si_f < 2.0 || (si_f - si_f.round()).abs() > 1e-9 {
+        return Err(format!("Bruker procs SI={si_f} must be an integer >= 2"));
+    }
+    if si_f > (MAX_1D_INGEST_POINTS as f64) {
+        return Err(format!(
+            "Bruker procs declared SI={si_f:.0} exceeds MAX_1D_INGEST_POINTS ({MAX_1D_INGEST_POINTS})"
+        ));
+    }
+    let si = si_f.round() as usize;
+    let offset = req_finite("OFFSET")?;
+    let sw_p = req_finite("SWP")?;
+    let sf = req_finite("SF")?;
+    if sf <= 0.0 || sw_p <= 0.0 {
+        return Err(format!(
+            "Bruker procs SF ({sf}) and SW_p ({sw_p}) must be positive"
+        ));
+    }
+    let nc_proc = match find_jcamp_param(procs, "NCPROC") {
+        Some(s) => {
+            let v = s
+                .parse::<i32>()
+                .map_err(|_| format!("Bruker procs NCPROC={s:?} is not an integer"))?;
+            if !(-128..=128).contains(&v) {
+                return Err(format!("Bruker procs NCPROC={v} out of range [-128, 128]"));
+            }
+            v
+        }
+        None => 0,
+    };
+    let big_endian = match find_jcamp_param(procs, "BYTORDP").as_deref() {
+        Some("1") => true,
+        Some("0") | None => false,
+        Some(other) => {
+            return Err(format!(
+                "Bruker procs BYTORDP={other:?} must be 0 (little-endian) or 1 (big-endian)"
+            ))
+        }
+    };
+    let dtype = match find_jcamp_param(procs, "DTYPP") {
+        Some(s) => {
+            let d = s
+                .parse::<u8>()
+                .map_err(|_| format!("Bruker procs DTYPP={s:?} is not an integer"))?;
+            if d != 0 && d != 2 {
+                return Err(format!(
+                    "unsupported Bruker procs DTYPP={d} (expected 0=int32 or 2=float64)"
+                ));
+            }
+            d
+        }
+        None => 0,
+    };
+    let word_size = if dtype == 2 { 8usize } else { 4usize };
+    let scale = 2.0_f64.powi(nc_proc);
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(format!("non-finite Bruker NCPROC={nc_proc} scale factor"));
+    }
+
+    let real = decode_bruker_1d_channel_bytes(
+        &format!("{name}/1r"),
+        bytes_1r,
+        si,
+        word_size,
+        dtype,
+        big_endian,
+        scale,
+    )?;
+    let imag = match bytes_1i {
+        Some(b1i) => Some(decode_bruker_1d_channel_bytes(
+            &format!("{name}/1i"),
+            b1i,
+            si,
+            word_size,
+            dtype,
+            big_endian,
+            scale,
+        )?),
+        None => None,
+    };
+
+    let acqus = acqus_opt.unwrap_or("");
+    let nuc_raw = find_jcamp_param(acqus, "NUC1")
+        .or_else(|| find_jcamp_param(procs, "AXNUC"))
+        .unwrap_or_else(|| "1H".to_string());
+    let nuc_clean = nuc_raw.trim_matches(['<', '>', '"', ' ']);
+    let pulprog = find_jcamp_param(acqus, "PULPROG").unwrap_or_default();
+    let exp =
+        Experiment1DKind::from_pulse_program(pulprog.trim_matches(['<', '>', '"', ' ']), nuc_clean);
+    let mhz = mhz_override.unwrap_or(sf);
+    if !mhz.is_finite() || mhz <= 0.0 {
+        return Err(format!("invalid observation frequency mhz={mhz}"));
+    }
+    let last_x = offset - (((si - 1) as f64) * sw_p) / sf / (si as f64);
+    let axis = AxisPpm::from_bounds(exp.nucleus().as_str(), si, offset, last_x, mhz);
+    let mut spec = Spectrum1D::new(name.to_string(), exp, axis, real, imag);
+    if let Some(solv) = find_jcamp_param(acqus, "SOLVENT") {
+        let sc = solv.trim_matches(['<', '>', '"', ' ']).trim();
+        if !sc.is_empty() && !sc.eq_ignore_ascii_case("none") {
+            spec.solvent = Some(sc.to_string());
+        }
+    }
+    spec.validate()?;
+    Ok(spec)
+}
+
 fn decode_bruker_1d_channel(
     path: &std::path::Path,
     si: usize,
@@ -5555,6 +5745,477 @@ pub fn load_1d_input(
 /// Load a processed 1D spectrum from Bruker `pdata` (`procs` + `1r`), `JCAMP-DX`, JSON, TSV, or
 /// raw time-domain FID (automatically apodizing, zero-filling, FFT-ing, and minimum-entropy
 /// autophasing when the input is time-domain; hardened per `F15`).
+/// Prepare a [`Loaded1DData`] item for interactive studio inspection (`wasm32` + native):
+/// preserves `FrequencyDomain` spectra as-is; for raw `TimeDomain` FIDs, applies matched exponential
+/// apodization (`first_point_scale = 0.5`), power-of-two zero-filling (capped at `131_072` points),
+/// digital-filter-compensated `fft_1d`, minimum-entropy `auto_phase_and_apply_1d`, Whittaker
+/// `correct_baseline_1d`, and optional solvent reference calibration when `solvent` metadata is present.
+pub fn prepare_loaded_1d_for_studio(loaded: Loaded1DData) -> Result<Spectrum1D, String> {
+    match loaded {
+        Loaded1DData::FrequencyDomain(spec) => {
+            spec.validate()?;
+            Ok(spec)
+        }
+        Loaded1DData::TimeDomain(mut td) => {
+            let lb = td.experiment.default_line_broadening_hz();
+            apply_apodization_1d(&mut td, Apodization1D::Exponential { lb_hz: lb }, 0.5);
+            let target_zf = (td.data.len().saturating_mul(2))
+                .next_power_of_two()
+                .min(131_072);
+            if target_zf > td.data.len() {
+                zero_fill_1d(&mut td, target_zf);
+            }
+            let mut spec = fft_1d(&td);
+            let _ = auto_phase_and_apply_1d(&mut spec, &AutoPhase1DConfig::default());
+            let _ = correct_baseline_1d(&mut spec, &BaselineConfig1D::default());
+            if let Some(solv) = spec.solvent.clone() {
+                let _ = auto_calibrate_solvent_1d(&mut spec, &solv, 0.25);
+            }
+            spec.validate()?;
+            Ok(spec)
+        }
+    }
+}
+
+/// Load one or more 1D NMR datasets directly from in-memory `(relative_path, bytes)` entries
+/// (`wasm32` browser folder/file drop & picker + native multi-file/archive drop).
+///
+/// Supports:
+/// - Multi-experiment Bruker study folders (`study/1/...`, `study/10/...`), single expno folders
+///   (`10/fid`+`acqus` and/or `10/pdata/1/1r`+`procs`), `pdata/1` folders, or flat sibling file
+///   selections (`1r` + `procs` [+ `1i`, `acqus`], or `fid` + `acqus` [+ `acqu`, `procs`]).
+/// - Embedded `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives (expanded automatically).
+/// - Standalone `.jdx` / `.dx` / `.jcamp` JCAMP-DX files, 1D `.json`, and 1D `ppm\treal` `.tsv`/`.csv`.
+/// - Clear, actionable guidance when a bare Bruker binary (`1r`, `1i`, `fid`, `2rr`, `ser`) is dropped
+///   without its sibling parameter file (`procs` / `acqus`).
+pub fn load_1d_from_virtual_entries(
+    entries: &[(&str, &[u8])],
+    mhz_override: Option<f64>,
+    prefer_fid: bool,
+) -> Result<Vec<Loaded1DData>, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    if entries.is_empty() {
+        return Err("No files provided for 1D NMR loading.".to_string());
+    }
+
+    // 1. Normalize paths, discard OS/VCS junk, and expand any `.zip`/`.tar`/`.tar.gz` archives.
+    let mut owned_archive_items: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut flat_refs: Vec<(String, usize, bool)> = Vec::new();
+    for (idx, &(raw_path, bytes)) in entries.iter().enumerate() {
+        let norm = raw_path
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string();
+        if norm.is_empty() {
+            continue;
+        }
+        if norm.split('/').any(|seg| {
+            seg.is_empty()
+                || seg == "."
+                || seg == ".."
+                || seg == ".git"
+                || seg == "__MACOSX"
+                || seg.eq_ignore_ascii_case(".ds_store")
+                || seg.eq_ignore_ascii_case("thumbs.db")
+                || seg.starts_with("._")
+        }) {
+            continue;
+        }
+        let low = norm.to_ascii_lowercase();
+        let is_arch = low.ends_with(".zip")
+            || low.ends_with(".tar")
+            || low.ends_with(".tar.gz")
+            || low.ends_with(".tgz")
+            || crate::classify::is_zip_magic(bytes)
+            || (bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b);
+        if is_arch {
+            let unpacked = crate::classify::extract_archive_full_entries_bounded(
+                &norm,
+                bytes,
+                512 * 1024 * 1024,
+                256 * 1024 * 1024,
+            )?;
+            for (sub_rel, sub_bytes) in unpacked {
+                let slot = owned_archive_items.len();
+                owned_archive_items.push((sub_rel.clone(), sub_bytes));
+                flat_refs.push((sub_rel, slot, true));
+            }
+        } else {
+            flat_refs.push((norm, idx, false));
+        }
+    }
+
+    let get_bytes = |slot: usize, from_arch: bool| -> &[u8] {
+        if from_arch {
+            &owned_archive_items[slot].1
+        } else {
+            entries[slot].1
+        }
+    };
+
+    // Map `dir -> filename_lower -> (orig_rel_path, slot, from_arch)`
+    let mut dir_map: BTreeMap<String, BTreeMap<String, (String, usize, bool)>> = BTreeMap::new();
+    for (rel, slot, from_arch) in &flat_refs {
+        let (dir, fname) = match rel.rsplit_once('/') {
+            Some((d, f)) => (d.to_string(), f.to_string()),
+            None => (String::new(), rel.clone()),
+        };
+        dir_map
+            .entry(dir)
+            .or_default()
+            .insert(fname.to_ascii_lowercase(), (rel.clone(), *slot, *from_arch));
+    }
+
+    let parent_dir = |d: &str| -> Option<String> {
+        if d.is_empty() {
+            None
+        } else {
+            match d.rsplit_once('/') {
+                Some((p, _)) => Some(p.to_string()),
+                None => Some(String::new()),
+            }
+        }
+    };
+
+    let exp_dir_for_pdata = |pdir: &str| -> String {
+        if let Some(p1) = parent_dir(pdir) {
+            let p1_name = p1.rsplit_once('/').map(|(_, n)| n).unwrap_or(&p1);
+            if p1_name.eq_ignore_ascii_case("pdata") {
+                if let Some(exp) = parent_dir(&p1) {
+                    return exp;
+                }
+            }
+        }
+        pdir.to_string()
+    };
+
+    let label_for_dir = |exp_dir: &str, fallback: &str| -> String {
+        if exp_dir.is_empty() {
+            fallback.to_string()
+        } else {
+            exp_dir.to_string()
+        }
+    };
+
+    // Identify 2D/3D directories so we skip them cleanly for 1D extraction.
+    let mut non_1d_exp_dirs: BTreeSet<String> = BTreeSet::new();
+    let mut bare_1r_seen = false;
+    let mut bare_fid_seen = false;
+    let mut bare_2rr_seen = false;
+    let mut bare_ser_seen = false;
+
+    for (dir, files) in &dir_map {
+        if files.contains_key("2rr") || files.contains_key("3rrr") {
+            non_1d_exp_dirs.insert(exp_dir_for_pdata(dir));
+            if files.contains_key("2rr")
+                && (!files.contains_key("procs") || !files.contains_key("proc2s"))
+            {
+                bare_2rr_seen = true;
+            }
+        }
+        if files.contains_key("ser")
+            || files.contains_key("acqu2s")
+            || files.contains_key("acqu3s")
+            || files.contains_key("acqu2")
+            || files.contains_key("acqu3")
+        {
+            non_1d_exp_dirs.insert(dir.clone());
+            if files.contains_key("ser")
+                && (!files.contains_key("acqus") || !files.contains_key("acqu2s"))
+            {
+                bare_ser_seen = true;
+            }
+        }
+        if (files.contains_key("1r") || files.contains_key("1i")) && !files.contains_key("procs") {
+            bare_1r_seen = true;
+        }
+        if files.contains_key("fid") && !files.contains_key("acqus") && !files.contains_key("acqu")
+        {
+            bare_fid_seen = true;
+        }
+    }
+
+    // Collect candidate Bruker 1D `pdata` dirs grouped by `exp_dir` (choosing lowest procno per exp_dir)
+    let mut pdata_by_exp: BTreeMap<String, (u32, String)> = BTreeMap::new();
+    for (dir, files) in &dir_map {
+        if files.contains_key("2rr") || files.contains_key("3rrr") {
+            continue;
+        }
+        if files.contains_key("1r") && files.contains_key("procs") {
+            let exp_d = exp_dir_for_pdata(dir);
+            if non_1d_exp_dirs.contains(&exp_d) {
+                continue;
+            }
+            let procno: u32 = dir
+                .rsplit_once('/')
+                .map(|(_, last)| last)
+                .unwrap_or(dir)
+                .parse::<u32>()
+                .unwrap_or(u32::MAX - 1);
+            let replace = match pdata_by_exp.get(&exp_d) {
+                None => true,
+                Some((best_p, _)) => procno < *best_p,
+            };
+            if replace {
+                pdata_by_exp.insert(exp_d, (procno, dir.clone()));
+            }
+        }
+    }
+
+    // Collect candidate Bruker 1D `fid` dirs
+    let mut fid_by_exp: BTreeSet<String> = BTreeSet::new();
+    for (dir, files) in &dir_map {
+        if non_1d_exp_dirs.contains(dir) {
+            continue;
+        }
+        if files.contains_key("fid") && (files.contains_key("acqus") || files.contains_key("acqu"))
+        {
+            fid_by_exp.insert(dir.clone());
+        }
+    }
+
+    let mut all_bruker_exps: Vec<String> = pdata_by_exp
+        .keys()
+        .chain(fid_by_exp.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    // Sort numeric expnos naturally (`1`, `2`, `10` instead of `1`, `10`, `2`)
+    all_bruker_exps.sort_by(|a, b| {
+        let last_a = a.rsplit_once('/').map(|(_, n)| n).unwrap_or(a);
+        let last_b = b.rsplit_once('/').map(|(_, n)| n).unwrap_or(b);
+        match (last_a.parse::<u64>(), last_b.parse::<u64>()) {
+            (Ok(na), Ok(nb)) => a
+                .rsplit_once('/')
+                .map(|(p, _)| p)
+                .cmp(&b.rsplit_once('/').map(|(p, _)| p))
+                .then(na.cmp(&nb)),
+            _ => a.cmp(b),
+        }
+    });
+
+    let mut results: Vec<Loaded1DData> = Vec::new();
+    let mut consumed_files: BTreeSet<String> = BTreeSet::new();
+
+    for exp_d in &all_bruker_exps {
+        let has_pdata = pdata_by_exp.contains_key(exp_d);
+        let has_fid = fid_by_exp.contains(exp_d);
+
+        let load_pdata = |pdir: &str| -> Result<Loaded1DData, String> {
+            let pfiles = &dir_map[pdir];
+            let (r_rel, r_slot, r_arch) = &pfiles["1r"];
+            let (p_rel, p_slot, p_arch) = &pfiles["procs"];
+            let procs_txt = String::from_utf8_lossy(get_bytes(*p_slot, *p_arch));
+            let bytes_1r = get_bytes(*r_slot, *r_arch);
+            let bytes_1i = pfiles.get("1i").map(|(_, s, a)| get_bytes(*s, *a));
+            let acqus_txt = dir_map
+                .get(exp_d)
+                .and_then(|ef| ef.get("acqus").or_else(|| ef.get("acqu")))
+                .or_else(|| pfiles.get("acqus").or_else(|| pfiles.get("acqu")))
+                .map(|(_, s, a)| String::from_utf8_lossy(get_bytes(*s, *a)).into_owned());
+            let disp = label_for_dir(exp_d, if pdir.is_empty() { "bruker_1d" } else { pdir });
+            let spec = decode_bruker_pdata_1d_bytes(
+                &disp,
+                &procs_txt,
+                bytes_1r,
+                bytes_1i,
+                acqus_txt.as_deref(),
+                mhz_override,
+            )?;
+            let _ = (r_rel, p_rel);
+            Ok(Loaded1DData::FrequencyDomain(spec))
+        };
+
+        let load_fid = |edir: &str| -> Result<Loaded1DData, String> {
+            let efiles = &dir_map[edir];
+            let (_, f_slot, f_arch) = &efiles["fid"];
+            let fid_bytes = get_bytes(*f_slot, *f_arch);
+            let acqus_txt = efiles
+                .get("acqus")
+                .or_else(|| efiles.get("acqu"))
+                .map(|(_, s, a)| String::from_utf8_lossy(get_bytes(*s, *a)).into_owned())
+                .unwrap_or_default();
+            let acqu_txt = efiles
+                .get("acqu")
+                .map(|(_, s, a)| String::from_utf8_lossy(get_bytes(*s, *a)).into_owned());
+            let procs_txt = pdata_by_exp
+                .get(edir)
+                .and_then(|(_, pd)| dir_map.get(pd)?.get("procs"))
+                .or_else(|| efiles.get("procs"))
+                .map(|(_, s, a)| String::from_utf8_lossy(get_bytes(*s, *a)).into_owned());
+            let disp = label_for_dir(edir, "bruker_fid_1d");
+            let fid1d = crate::fid::read_bruker_fid_1d_from_bytes(
+                &disp,
+                &acqus_txt,
+                acqu_txt.as_deref(),
+                procs_txt.as_deref(),
+                fid_bytes,
+            )?;
+            let mut td = TimeDomain1D::from_fid1d(&fid1d);
+            if let Some(m) = mhz_override {
+                td.obs_mhz = m;
+            }
+            if let Some(solv) = find_jcamp_param(&acqus_txt, "SOLVENT") {
+                let sc = solv.trim_matches(['<', '>', '"', ' ']).trim();
+                if !sc.is_empty() && !sc.eq_ignore_ascii_case("none") {
+                    // Carry solvent tag onto spectrum during studio preparation via name/metadata if needed
+                    let _ = sc;
+                }
+            }
+            td.validate()?;
+            Ok(Loaded1DData::TimeDomain(td))
+        };
+
+        let item = if prefer_fid && has_fid {
+            load_fid(exp_d)?
+        } else if has_pdata {
+            let (_, ref pdir) = pdata_by_exp[exp_d];
+            load_pdata(pdir)?
+        } else {
+            load_fid(exp_d)?
+        };
+        if let Some((_, pdir)) = pdata_by_exp.get(exp_d) {
+            for (rel, _, _) in dir_map[pdir].values() {
+                consumed_files.insert(rel.clone());
+            }
+        }
+        if let Some(efiles) = dir_map.get(exp_d) {
+            for (rel, _, _) in efiles.values() {
+                consumed_files.insert(rel.clone());
+            }
+        }
+        results.push(item);
+    }
+
+    // 3. Standalone 1D files (`.jdx`/`.dx`/`.jcamp`, 1D `.json`, 1D `.tsv`/`.csv`)
+    for (rel, slot, from_arch) in &flat_refs {
+        if consumed_files.contains(rel) {
+            continue;
+        }
+        let fname = rel.rsplit_once('/').map(|(_, f)| f).unwrap_or(rel);
+        let low = fname.to_ascii_lowercase();
+        let bytes = get_bytes(*slot, *from_arch);
+        if bytes.len() as u64 > MAX_1D_INGEST_BYTES {
+            continue;
+        }
+        let ext = fname
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let is_candidate_text = matches!(
+            ext.as_str(),
+            "jdx" | "dx" | "jcamp" | "json" | "tsv" | "csv" | "txt"
+        );
+        if !is_candidate_text {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        if ext == "json" {
+            if let Ok(loaded) = parse_json_1d_str(text, mhz_override) {
+                results.push(loaded);
+            }
+            continue;
+        }
+        if ext == "jdx"
+            || ext == "dx"
+            || ext == "jcamp"
+            || (low != "acqus"
+                && low != "acqu"
+                && low != "procs"
+                && low != "proc"
+                && text.trim_start().starts_with("##TITLE=")
+                && text.contains("##XYDATA="))
+        {
+            let blocks = crate::octet_analyt::jcamp_spec1d::read_jcamp(text)?;
+            let first = blocks
+                .first()
+                .ok_or_else(|| format!("JCAMP-DX file '{rel}' contained zero spectrum blocks"))?;
+            if first.y.len() < 2 {
+                return Err(format!(
+                    "JCAMP-DX file '{rel}' contains fewer than 2 points"
+                ));
+            }
+            let nuc_str = first.nucleus.as_deref().unwrap_or("1H");
+            let exp = Experiment1DKind::from_pulse_program("", nuc_str);
+            let mhz = mhz_override.or(first.mhz).unwrap_or(500.0);
+            if !mhz.is_finite() || mhz <= 0.0 {
+                return Err(format!("invalid JCAMP-DX observation frequency mhz={mhz}"));
+            }
+            let mut xs = first.x_axis();
+            let mut ys = first.y.clone();
+            if xs.first().copied().unwrap_or(0.0) < xs.last().copied().unwrap_or(0.0) {
+                xs.reverse();
+                ys.reverse();
+            }
+            let high_ppm = xs[0];
+            let low_ppm = *xs.last().unwrap_or(&high_ppm);
+            if !high_ppm.is_finite() || !low_ppm.is_finite() || (high_ppm - low_ppm).abs() <= 1e-12
+            {
+                return Err(format!(
+                    "JCAMP-DX file '{rel}' has invalid x-axis bounds [{low_ppm}, {high_ppm}]"
+                ));
+            }
+            let axis =
+                AxisPpm::from_bounds(exp.nucleus().as_str(), ys.len(), high_ppm, low_ppm, mhz);
+            let title = if first.title.trim().is_empty() {
+                fname.to_string()
+            } else {
+                first.title.clone()
+            };
+            let mut spec = Spectrum1D::new(title, exp, axis, ys, None);
+            spec.solvent = first.solvent.clone();
+            spec.validate()?;
+            results.push(Loaded1DData::FrequencyDomain(spec));
+            continue;
+        }
+        if matches!(ext.as_str(), "tsv" | "csv" | "txt") {
+            let stem = fname.rsplit_once('.').map(|(s, _)| s).unwrap_or(fname);
+            if let Ok(loaded) = parse_tsv_1d_str(text, stem, mhz_override) {
+                results.push(loaded);
+            }
+        }
+    }
+
+    if !results.is_empty() {
+        return Ok(results);
+    }
+
+    // 4. Actionable bare-file guidance when no complete 1D dataset could be assembled.
+    if bare_1r_seen {
+        return Err(
+            "Bruker '1r' requires its sibling 'procs' file — drop the whole Bruker experiment or 'pdata/1' folder (or select '1r' + 'procs' together)."
+                .to_string(),
+        );
+    }
+    if bare_fid_seen {
+        return Err(
+            "Bruker 'fid' requires its sibling 'acqus' file — drop the whole Bruker experiment folder (or select 'fid' + 'acqus' together)."
+                .to_string(),
+        );
+    }
+    if bare_2rr_seen {
+        return Err(
+            "Bruker '2rr' requires its sibling 'procs' and 'proc2s' files — drop the whole Bruker experiment or 'pdata/1' folder."
+                .to_string(),
+        );
+    }
+    if bare_ser_seen {
+        return Err(
+            "Bruker 'ser' requires its sibling 'acqus' and 'acqu2s' files — drop the whole Bruker experiment folder."
+                .to_string(),
+        );
+    }
+
+    Err("No 1D NMR datasets found in dropped items.".to_string())
+}
+
 pub fn load_processed_spectrum_1d(
     path: &std::path::Path,
     mhz_override: Option<f64>,
@@ -5570,5 +6231,203 @@ pub fn load_processed_spectrum_1d(
             spec.validate()?;
             Ok(spec)
         }
+    }
+}
+
+#[cfg(test)]
+mod virtual_ingest_1d_tests {
+    use super::*;
+
+    fn crc32_ieee(bytes: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in bytes {
+            let mut x = (crc ^ (b as u32)) & 0xFF;
+            for _ in 0..8 {
+                x = if x & 1 != 0 {
+                    (x >> 1) ^ 0xEDB8_8320
+                } else {
+                    x >> 1
+                };
+            }
+            crc = (crc >> 8) ^ x;
+        }
+        !crc
+    }
+
+    /// Build a PKZIP archive with optional bit-3 streaming data descriptor (`local_sizes_zero = true`)
+    /// and either method `0` (Store) or method `8` (RFC 1951 stored-block DEFLATE).
+    fn build_test_zip(files: &[(&str, &[u8], u16)], local_sizes_zero: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut cd = Vec::new();
+
+        for &(name, raw, method) in files {
+            let crc = crc32_ieee(raw);
+            let comp: Vec<u8> = if method == 8 {
+                // RFC 1951 BFINAL=1, BTYPE=00 (stored block): 0x01 + u16 LEN + u16 !LEN + raw
+                let len = raw.len() as u16;
+                let nlen = !len;
+                let mut d = Vec::with_capacity(5 + raw.len());
+                d.push(0x01);
+                d.extend_from_slice(&len.to_le_bytes());
+                d.extend_from_slice(&nlen.to_le_bytes());
+                d.extend_from_slice(raw);
+                d
+            } else {
+                raw.to_vec()
+            };
+
+            let local_off = out.len() as u32;
+            let flags: u16 = if local_sizes_zero { 0x0008 } else { 0x0000 };
+            out.extend_from_slice(b"PK\x03\x04");
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&flags.to_le_bytes());
+            out.extend_from_slice(&method.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            if local_sizes_zero {
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+            } else {
+                out.extend_from_slice(&crc.to_le_bytes());
+                out.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            }
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&comp);
+            if local_sizes_zero {
+                out.extend_from_slice(b"PK\x07\x08");
+                out.extend_from_slice(&crc.to_le_bytes());
+                out.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            }
+
+            cd.extend_from_slice(b"PK\x01\x02");
+            cd.extend_from_slice(&20u16.to_le_bytes());
+            cd.extend_from_slice(&20u16.to_le_bytes());
+            cd.extend_from_slice(&flags.to_le_bytes());
+            cd.extend_from_slice(&method.to_le_bytes());
+            cd.extend_from_slice(&0u32.to_le_bytes());
+            cd.extend_from_slice(&crc.to_le_bytes());
+            cd.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+            cd.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            cd.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            cd.extend_from_slice(&0u16.to_le_bytes());
+            cd.extend_from_slice(&0u16.to_le_bytes());
+            cd.extend_from_slice(&0u16.to_le_bytes());
+            cd.extend_from_slice(&0u16.to_le_bytes());
+            cd.extend_from_slice(&0u32.to_le_bytes());
+            cd.extend_from_slice(&local_off.to_le_bytes());
+            cd.extend_from_slice(name.as_bytes());
+        }
+
+        let cd_off = out.len() as u32;
+        let cd_len = cd.len() as u32;
+        out.extend_from_slice(&cd);
+        out.extend_from_slice(b"PK\x05\x06");
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_len.to_le_bytes());
+        out.extend_from_slice(&cd_off.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn test_virtual_bruker_pdata_1d_and_zip_streaming_descriptor() {
+        let si = 64usize;
+        let procs = format!(
+            "##TITLE= test\n##$SI= {si}\n##$OFFSET= 10.0\n##$SW_p= 5000.0\n##$SF= 500.0\n##$NC_proc= 0\n##$BYTORDP= 0\n##$DTYPP= 0\n##$AXNUC= <1H>\n##END=\n"
+        );
+        let acqus =
+            "##TITLE= acqus\n##$PULPROG= <zg30>\n##$NUC1= <1H>\n##$SOLVENT= <CDCl3>\n##END=\n";
+        let mut bytes_1r = Vec::with_capacity(si * 4);
+        for i in 0..si {
+            let v: i32 = if i == 18 { 120_000 } else { (i as i32) * 10 };
+            bytes_1r.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // 1. Direct virtual entries (multi-expno folder `study/10` and `study/2` sorted `2` then `10`)
+        let entries = [
+            ("study/10/acqus", acqus.as_bytes()),
+            ("study/10/pdata/1/procs", procs.as_bytes()),
+            ("study/10/pdata/1/1r", bytes_1r.as_slice()),
+            ("study/2/pdata/1/procs", procs.as_bytes()),
+            ("study/2/pdata/1/1r", bytes_1r.as_slice()),
+            ("study/__MACOSX/._1r", b"junk"),
+        ];
+        let loaded = load_1d_from_virtual_entries(&entries, None, false).expect("pdata 1D load");
+        assert_eq!(loaded.len(), 2);
+        let s0 = prepare_loaded_1d_for_studio(loaded.into_iter().next().unwrap()).unwrap();
+        assert_eq!(s0.name, "study/2");
+        assert_eq!(s0.len(), si);
+
+        // 2. Same dataset inside a macOS-style streaming bit-3 `.zip` (method 8 Deflate + method 0 Store)
+        let zip_bytes = build_test_zip(
+            &[
+                ("exp1/acqus", acqus.as_bytes(), 0),
+                ("exp1/pdata/1/procs", procs.as_bytes(), 8),
+                ("exp1/pdata/1/1r", bytes_1r.as_slice(), 8),
+            ],
+            true,
+        );
+        let z_loaded =
+            load_1d_from_virtual_entries(&[("sample_1d.zip", zip_bytes.as_slice())], None, false)
+                .expect("ZIP 1D load");
+        assert_eq!(z_loaded.len(), 1);
+        let zs = prepare_loaded_1d_for_studio(z_loaded.into_iter().next().unwrap()).unwrap();
+        assert_eq!(zs.len(), si);
+        assert_eq!(zs.solvent.as_deref(), Some("CDCl3"));
+    }
+
+    #[test]
+    fn test_virtual_bruker_fid_1d_auto_fft_and_bare_file_errors() {
+        // Bare `1r` without `procs` -> clear actionable error
+        let err_1r = load_1d_from_virtual_entries(&[("pdata/1/1r", &[0u8; 128])], None, false)
+            .expect_err("bare 1r must error");
+        assert!(err_1r.contains("requires its sibling 'procs'"), "{err_1r}");
+
+        // Bare `fid` without `acqus` -> clear actionable error
+        let err_fid = load_1d_from_virtual_entries(&[("1/fid", &[0u8; 256])], None, false)
+            .expect_err("bare fid must error");
+        assert!(
+            err_fid.contains("requires its sibling 'acqus'"),
+            "{err_fid}"
+        );
+
+        // Complete `fid` + `acqus` -> TimeDomain -> prepare_loaded_1d_for_studio -> phased Spectrum1D
+        let n_cplx = 64usize;
+        let acqus = format!(
+            "##TITLE= acqus\n##$TD= {}\n##$SW_h= 5000.0\n##$SFO1= 500.0\n##$BF1= 500.0\n##$BYTORDA= 0\n##$DTYPA= 0\n##$AQ_mod= 3\n##$GRPDLY= 0\n##$NUC1= <1H>\n##$PULPROG= <zg30>\n##END=\n",
+            n_cplx * 2
+        );
+        let mut fid_bytes = Vec::with_capacity(n_cplx * 2 * 4);
+        for k in 0..n_cplx {
+            let t = (k as f64) / 5000.0;
+            let env = (-t * 15.0).exp();
+            let re = (env * (2.0 * std::f64::consts::PI * 420.0 * t).cos() * 50_000.0) as i32;
+            let im = (env * (2.0 * std::f64::consts::PI * 420.0 * t).sin() * 50_000.0) as i32;
+            fid_bytes.extend_from_slice(&re.to_le_bytes());
+            fid_bytes.extend_from_slice(&im.to_le_bytes());
+        }
+        let loaded = load_1d_from_virtual_entries(
+            &[
+                ("ibuprofen/1/acqus", acqus.as_bytes()),
+                ("ibuprofen/1/fid", fid_bytes.as_slice()),
+            ],
+            None,
+            true,
+        )
+        .expect("fid 1D load");
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(loaded[0], Loaded1DData::TimeDomain(_)));
+        let spec = prepare_loaded_1d_for_studio(loaded.into_iter().next().unwrap())
+            .expect("studio FFT/phase");
+        assert!(spec.len() >= 128);
+        let max_real = spec.real.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(max_real > 0.0);
     }
 }

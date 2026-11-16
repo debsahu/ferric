@@ -639,6 +639,7 @@ struct GzipStreamDecoder<R: Read> {
     member_out_bytes: u64,
     total_out_bytes: u64,
     max_inflate_bytes: u64,
+    raw_deflate: bool,
     phase: DeflatePhase,
     final_block_pending: bool,
     lit_table: HuffTable,
@@ -658,11 +659,37 @@ impl<R: Read> GzipStreamDecoder<R> {
             member_out_bytes: 0,
             total_out_bytes: 0,
             max_inflate_bytes,
+            raw_deflate: false,
             phase: DeflatePhase::NeedGzipHeader,
             final_block_pending: false,
             lit_table: HuffTable::fixed_lit_len(),
             dist_table: HuffTable::fixed_dist(),
         }
+    }
+
+    fn new_raw_deflate(reader: R, max_inflate_bytes: u64) -> Self {
+        Self {
+            inner: BufReader::with_capacity(32 * 1024, reader),
+            bit_buf: 0,
+            bit_cnt: 0,
+            pending_id1: None,
+            window: [0u8; 32768],
+            win_pos: 0,
+            crc32_state: 0xFFFF_FFFF,
+            member_out_bytes: 0,
+            total_out_bytes: 0,
+            max_inflate_bytes,
+            raw_deflate: true,
+            phase: DeflatePhase::NeedBlockHeader,
+            final_block_pending: false,
+            lit_table: HuffTable::fixed_lit_len(),
+            dist_table: HuffTable::fixed_dist(),
+        }
+    }
+
+    #[inline]
+    fn crc32(&self) -> u32 {
+        !self.crc32_state
     }
 
     #[inline]
@@ -1077,7 +1104,11 @@ impl<R: Read> Read for GzipStreamDecoder<R> {
                     }
                     if remaining == 0 {
                         self.phase = if self.final_block_pending {
-                            DeflatePhase::NeedGzipTrailer
+                            if self.raw_deflate {
+                                DeflatePhase::Done
+                            } else {
+                                DeflatePhase::NeedGzipTrailer
+                            }
                         } else {
                             DeflatePhase::NeedBlockHeader
                         };
@@ -1112,7 +1143,11 @@ impl<R: Read> Read for GzipStreamDecoder<R> {
                         self.push_out_byte(out, &mut written, sym as u8)?;
                     } else if sym == 256 {
                         self.phase = if final_block {
-                            DeflatePhase::NeedGzipTrailer
+                            if self.raw_deflate {
+                                DeflatePhase::Done
+                            } else {
+                                DeflatePhase::NeedGzipTrailer
+                            }
                         } else {
                             DeflatePhase::NeedBlockHeader
                         };
@@ -1314,6 +1349,16 @@ fn is_targz_path_lower(lower: &str) -> bool {
     lower.ends_with(".tar.gz") || lower.ends_with(".tgz")
 }
 
+/// True when a lowercase path ends with `.zip`.
+pub fn is_zip_path_lower(lower: &str) -> bool {
+    lower.ends_with(".zip")
+}
+
+/// True when `bytes` begins with a PKZIP local-file (`PK\x03\x04`) or empty-archive (`PK\x05\x06`) signature.
+pub fn is_zip_magic(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && (&bytes[..4] == b"PK\x03\x04" || &bytes[..4] == b"PK\x05\x06")
+}
+
 fn parse_tar_size(field: &[u8]) -> u64 {
     if field.is_empty() {
         return 0;
@@ -1398,6 +1443,7 @@ fn scan_tar_with_skipper<R, S>(
     reader: &mut R,
     mut skip_fn: S,
     max_retained_header_bytes: usize,
+    retain_full_payloads: bool,
     out: &mut Vec<VirtualEntry>,
 ) -> Result<(), String>
 where
@@ -1513,6 +1559,38 @@ where
         }
 
         let rel = normalize_rel_path(&name);
+        if retain_full_payloads {
+            if is_macos_or_vcs_junk(&rel) {
+                if padded_size > 0 {
+                    skip_fn(reader, padded_size).map_err(|e| format!("tar skip error: {e}"))?;
+                }
+                continue;
+            }
+            if raw_size > (max_retained_header_bytes as u64) {
+                return Err(format!(
+                    "archive entry '{rel}' ({raw_size} bytes) exceeds maximum retained byte limit ({max_retained_header_bytes} bytes)"
+                ));
+            }
+            let to_read = raw_size as usize;
+            let next_retained = retained_header_bytes.saturating_add(to_read);
+            if next_retained > max_retained_header_bytes {
+                return Err(format!(
+                    "archive exceeded maximum retained byte limit ({max_retained_header_bytes} bytes)"
+                ));
+            }
+            let mut full_bytes = vec![0u8; to_read];
+            if to_read > 0 {
+                read_exact_or_eof(reader, &mut full_bytes)
+                    .map_err(|e| format!("tar entry read error: {e}"))?;
+            }
+            let rem = padded_size.saturating_sub(to_read as u64);
+            if rem > 0 {
+                skip_fn(reader, rem).map_err(|e| format!("tar skip error: {e}"))?;
+            }
+            retained_header_bytes = next_retained;
+            out.push(VirtualEntry::header_only(rel, full_bytes, raw_size));
+            continue;
+        }
         match classify_file_read_action(&rel) {
             FileReadAction::Ignore => {
                 if padded_size > 0 {
@@ -1550,6 +1628,345 @@ where
     Ok(())
 }
 
+fn is_macos_or_vcs_junk(rel: &str) -> bool {
+    if rel.is_empty() || rel.ends_with('/') {
+        return true;
+    }
+    for seg in rel.split('/') {
+        if seg.is_empty()
+            || seg == "."
+            || seg == ".."
+            || seg == ".git"
+            || seg == "__MACOSX"
+            || seg.eq_ignore_ascii_case(".ds_store")
+            || seg.eq_ignore_ascii_case("thumbs.db")
+            || seg.starts_with("._")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn scan_zip_seekable_internal<R: Read + Seek>(
+    reader: &mut R,
+    max_inflate_bytes: u64,
+    max_retained_bytes: usize,
+    retain_full_payloads: bool,
+    out: &mut Vec<VirtualEntry>,
+) -> Result<(), String> {
+    let file_len = reader
+        .seek(SeekFrom::End(0))
+        .map_err(|e| format!("ZIP seek error: {e}"))?;
+    if file_len < 22 {
+        return Err("truncated ZIP archive (< 22 bytes)".to_string());
+    }
+    let tail_len = file_len.min(65_557) as usize;
+    reader
+        .seek(SeekFrom::End(-(tail_len as i64)))
+        .map_err(|e| format!("ZIP EOCD seek error: {e}"))?;
+    let mut tail = vec![0u8; tail_len];
+    reader
+        .read_exact(&mut tail)
+        .map_err(|e| format!("ZIP EOCD read error: {e}"))?;
+
+    let mut eocd_pos: Option<usize> = None;
+    for i in (0..=tail_len.saturating_sub(22)).rev() {
+        if &tail[i..i + 4] == b"PK\x05\x06" {
+            let comment_len = u16::from_le_bytes([tail[i + 20], tail[i + 21]]) as usize;
+            if i + 22 + comment_len <= tail_len {
+                eocd_pos = Some(i);
+                break;
+            }
+        }
+    }
+    let eocd = eocd_pos.ok_or_else(|| {
+        "invalid or unsupported ZIP archive: missing PKZIP End-of-Central-Directory record"
+            .to_string()
+    })?;
+    let total_entries = u16::from_le_bytes([tail[eocd + 10], tail[eocd + 11]]) as usize;
+    let cd_size = u32::from_le_bytes([
+        tail[eocd + 12],
+        tail[eocd + 13],
+        tail[eocd + 14],
+        tail[eocd + 15],
+    ]) as u64;
+    let cd_offset = u32::from_le_bytes([
+        tail[eocd + 16],
+        tail[eocd + 17],
+        tail[eocd + 18],
+        tail[eocd + 19],
+    ]) as u64;
+    if total_entries == 0xFFFF || cd_offset == 0xFFFF_FFFF {
+        return Err("ZIP64 (>4 GiB) archives are not supported in in-memory ingest".to_string());
+    }
+    if cd_offset.saturating_add(cd_size) > file_len {
+        return Err("corrupt ZIP Central Directory bounds".to_string());
+    }
+
+    reader
+        .seek(SeekFrom::Start(cd_offset))
+        .map_err(|e| format!("ZIP Central Directory seek error: {e}"))?;
+    let mut cd_buf = vec![0u8; cd_size as usize];
+    reader
+        .read_exact(&mut cd_buf)
+        .map_err(|e| format!("ZIP Central Directory read error: {e}"))?;
+
+    struct ZipCdItem {
+        rel: String,
+        method: u16,
+        crc32: u32,
+        comp_size: u64,
+        uncomp_size: u64,
+        local_offset: u64,
+    }
+
+    let mut items = Vec::with_capacity(total_entries.min(4096));
+    let mut pos = 0usize;
+    for _ in 0..total_entries {
+        if pos + 46 > cd_buf.len() {
+            break;
+        }
+        if &cd_buf[pos..pos + 4] != b"PK\x01\x02" {
+            return Err("corrupt ZIP Central Directory entry signature".to_string());
+        }
+        let flags = u16::from_le_bytes([cd_buf[pos + 8], cd_buf[pos + 9]]);
+        if flags & 0x0001 != 0 {
+            return Err("encrypted ZIP archives are not supported".to_string());
+        }
+        let method = u16::from_le_bytes([cd_buf[pos + 10], cd_buf[pos + 11]]);
+        let crc32 = u32::from_le_bytes([
+            cd_buf[pos + 16],
+            cd_buf[pos + 17],
+            cd_buf[pos + 18],
+            cd_buf[pos + 19],
+        ]);
+        let comp_size = u32::from_le_bytes([
+            cd_buf[pos + 20],
+            cd_buf[pos + 21],
+            cd_buf[pos + 22],
+            cd_buf[pos + 23],
+        ]) as u64;
+        let uncomp_size = u32::from_le_bytes([
+            cd_buf[pos + 24],
+            cd_buf[pos + 25],
+            cd_buf[pos + 26],
+            cd_buf[pos + 27],
+        ]) as u64;
+        let name_len = u16::from_le_bytes([cd_buf[pos + 28], cd_buf[pos + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([cd_buf[pos + 30], cd_buf[pos + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([cd_buf[pos + 32], cd_buf[pos + 33]]) as usize;
+        let local_offset = u32::from_le_bytes([
+            cd_buf[pos + 42],
+            cd_buf[pos + 43],
+            cd_buf[pos + 44],
+            cd_buf[pos + 45],
+        ]) as u64;
+        let hdr_end = pos
+            .saturating_add(46)
+            .saturating_add(name_len)
+            .saturating_add(extra_len)
+            .saturating_add(comment_len);
+        if hdr_end > cd_buf.len() {
+            return Err("truncated ZIP Central Directory filename/extra field".to_string());
+        }
+        let raw_name = String::from_utf8_lossy(&cd_buf[pos + 46..pos + 46 + name_len]);
+        pos = hdr_end;
+        if raw_name.ends_with('/') || raw_name.ends_with('\\') {
+            continue;
+        }
+        if raw_name
+            .replace('\\', "/")
+            .split('/')
+            .any(|seg| seg == "..")
+        {
+            return Err(format!("unsafe path traversal in ZIP entry '{raw_name}'"));
+        }
+        let rel = normalize_rel_path(&raw_name);
+        if is_macos_or_vcs_junk(&rel) {
+            continue;
+        }
+        items.push(ZipCdItem {
+            rel,
+            method,
+            crc32,
+            comp_size,
+            uncomp_size,
+            local_offset,
+        });
+    }
+
+    let mut total_inflated: u64 = 0;
+    let mut retained_bytes: usize = out.iter().map(|e| e.header_bytes.len()).sum();
+
+    for it in items {
+        let read_limit: usize = if retain_full_payloads {
+            if it.uncomp_size > (max_retained_bytes as u64) {
+                return Err(format!(
+                    "ZIP entry '{}' ({} bytes) exceeds maximum retained byte limit ({max_retained_bytes} bytes)",
+                    it.rel, it.uncomp_size
+                ));
+            }
+            it.uncomp_size as usize
+        } else {
+            match classify_file_read_action(&it.rel) {
+                FileReadAction::Ignore => continue,
+                FileReadAction::MetadataOnlySignal => {
+                    out.push(VirtualEntry::header_only(
+                        it.rel,
+                        Vec::new(),
+                        it.uncomp_size,
+                    ));
+                    continue;
+                }
+                FileReadAction::BoundedBinary(lim) | FileReadAction::BoundedText(lim) => {
+                    (it.uncomp_size.min(lim as u64)) as usize
+                }
+            }
+        };
+
+        total_inflated = total_inflated.saturating_add(read_limit as u64);
+        if total_inflated > max_inflate_bytes {
+            return Err(format!(
+                "ZIP archive exceeded maximum uncompressed byte limit ({max_inflate_bytes} bytes)"
+            ));
+        }
+        let next_retained = retained_bytes.saturating_add(read_limit);
+        if next_retained > max_retained_bytes {
+            return Err(format!(
+                "ZIP archive exceeded maximum retained byte limit ({max_retained_bytes} bytes)"
+            ));
+        }
+
+        if it.local_offset.saturating_add(30) > file_len {
+            return Err(format!(
+                "corrupt local header offset for ZIP entry '{}'",
+                it.rel
+            ));
+        }
+        reader
+            .seek(SeekFrom::Start(it.local_offset))
+            .map_err(|e| format!("ZIP local header seek error: {e}"))?;
+        let mut lhdr = [0u8; 30];
+        reader
+            .read_exact(&mut lhdr)
+            .map_err(|e| format!("ZIP local header read error: {e}"))?;
+        if &lhdr[..4] != b"PK\x03\x04" {
+            return Err(format!(
+                "invalid ZIP local header signature for '{}'",
+                it.rel
+            ));
+        }
+        let l_name_len = u16::from_le_bytes([lhdr[26], lhdr[27]]) as u64;
+        let l_extra_len = u16::from_le_bytes([lhdr[28], lhdr[29]]) as u64;
+        let data_start = it
+            .local_offset
+            .saturating_add(30)
+            .saturating_add(l_name_len)
+            .saturating_add(l_extra_len);
+        if data_start.saturating_add(it.comp_size) > file_len {
+            return Err(format!(
+                "truncated compressed data for ZIP entry '{}'",
+                it.rel
+            ));
+        }
+        reader
+            .seek(SeekFrom::Start(data_start))
+            .map_err(|e| format!("ZIP data seek error: {e}"))?;
+
+        let mut buf = vec![0u8; read_limit];
+        let verify_full_crc = (read_limit as u64) == it.uncomp_size;
+        match it.method {
+            0 => {
+                if (read_limit as u64) > it.comp_size {
+                    return Err(format!(
+                        "ZIP stored entry '{}' size mismatch (comp={} < uncomp={})",
+                        it.rel, it.comp_size, it.uncomp_size
+                    ));
+                }
+                if read_limit > 0 {
+                    reader
+                        .read_exact(&mut buf)
+                        .map_err(|e| format!("ZIP stored read error in '{}': {e}", it.rel))?;
+                }
+                if verify_full_crc {
+                    let mut crc: u32 = 0xFFFF_FFFF;
+                    for &b in &buf {
+                        let idx = ((crc ^ (b as u32)) & 0xFF) as usize;
+                        crc = (crc >> 8) ^ CRC32_TABLE[idx];
+                    }
+                    if !crc != it.crc32 {
+                        return Err(format!("ZIP CRC-32 mismatch in stored entry '{}'", it.rel));
+                    }
+                }
+            }
+            8 => {
+                let comp_slice = reader.by_ref().take(it.comp_size);
+                let mut dec = GzipStreamDecoder::new_raw_deflate(comp_slice, read_limit as u64 + 1);
+                let mut pos_out = 0usize;
+                while pos_out < read_limit {
+                    let n = dec
+                        .read(&mut buf[pos_out..])
+                        .map_err(|e| format!("ZIP DEFLATE error in '{}': {e}", it.rel))?;
+                    if n == 0 {
+                        break;
+                    }
+                    pos_out += n;
+                }
+                if pos_out != read_limit {
+                    return Err(format!(
+                        "ZIP entry '{}' inflated {} bytes, expected {}",
+                        it.rel, pos_out, read_limit
+                    ));
+                }
+                if verify_full_crc && dec.crc32() != it.crc32 {
+                    return Err(format!(
+                        "ZIP CRC-32 mismatch in deflated entry '{}'",
+                        it.rel
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unsupported ZIP compression method {other} in '{}' (expected 0=Store or 8=Deflate)",
+                    it.rel
+                ));
+            }
+        }
+
+        retained_bytes = next_retained;
+        out.push(VirtualEntry::header_only(it.rel, buf, it.uncomp_size));
+    }
+    Ok(())
+}
+
+fn scan_zip_seekable_bounded<R: Read + Seek>(
+    reader: &mut R,
+    max_inflate_bytes: u64,
+    max_retained_header_bytes: usize,
+    out: &mut Vec<VirtualEntry>,
+) -> Result<(), String> {
+    scan_zip_seekable_internal(
+        reader,
+        max_inflate_bytes,
+        max_retained_header_bytes,
+        false,
+        out,
+    )
+}
+
+fn scan_zip_seekable<R: Read + Seek>(
+    reader: &mut R,
+    out: &mut Vec<VirtualEntry>,
+) -> Result<(), String> {
+    scan_zip_seekable_bounded(
+        reader,
+        MAX_DISK_INFLATE_BYTES,
+        MAX_RETAINED_HEADER_BYTES,
+        out,
+    )
+}
+
 fn scan_tar_seekable_bounded<R: Read + Seek>(
     reader: &mut R,
     max_retained_header_bytes: usize,
@@ -1563,6 +1980,7 @@ fn scan_tar_seekable_bounded<R: Read + Seek>(
             r.seek(SeekFrom::Current(step)).map(|_| ())
         },
         max_retained_header_bytes,
+        false,
         out,
     )
 }
@@ -1581,7 +1999,13 @@ fn scan_targz_reader_bounded<R: Read>(
     out: &mut Vec<VirtualEntry>,
 ) -> Result<(), String> {
     let mut gz = GzipStreamDecoder::new(reader, max_inflate_bytes);
-    scan_tar_with_skipper(&mut gz, discard_bytes_read, max_retained_header_bytes, out)?;
+    scan_tar_with_skipper(
+        &mut gz,
+        discard_bytes_read,
+        max_retained_header_bytes,
+        false,
+        out,
+    )?;
     let mut scratch = [0u8; 4096];
     while gz
         .read(&mut scratch)
@@ -1599,7 +2023,7 @@ fn scan_targz_reader<R: Read>(
     scan_targz_reader_bounded(reader, max_inflate_bytes, MAX_RETAINED_HEADER_BYTES, out)
 }
 
-/// Inspect an in-memory `.tar` or `.tar.gz` / `.tgz` byte buffer into `VirtualEntry` headers
+/// Inspect an in-memory `.zip`, `.tar`, or `.tar.gz` / `.tgz` byte buffer into `VirtualEntry` headers
 /// with explicit upper bounds on total decompressed stream bytes (`max_inflate_bytes`) and
 /// total retained header memory (`max_retained_header_bytes`).
 pub fn extract_archive_virtual_entries_bounded(
@@ -1609,10 +2033,20 @@ pub fn extract_archive_virtual_entries_bounded(
     max_retained_header_bytes: usize,
 ) -> Result<Vec<VirtualEntry>, String> {
     let lower = archive_name.to_ascii_lowercase();
-    let is_gz = is_targz_path_lower(&lower)
-        || (archive_bytes.len() >= 2 && archive_bytes[0] == 0x1f && archive_bytes[1] == 0x8b);
+    let is_zip = is_zip_path_lower(&lower) || is_zip_magic(archive_bytes);
+    let is_gz = !is_zip
+        && (is_targz_path_lower(&lower)
+            || (archive_bytes.len() >= 2 && archive_bytes[0] == 0x1f && archive_bytes[1] == 0x8b));
     let mut entries = Vec::new();
-    if is_gz {
+    if is_zip {
+        let mut cur = Cursor::new(archive_bytes);
+        scan_zip_seekable_bounded(
+            &mut cur,
+            max_inflate_bytes,
+            max_retained_header_bytes,
+            &mut entries,
+        )?;
+    } else if is_gz {
         scan_targz_reader_bounded(
             Cursor::new(archive_bytes),
             max_inflate_bytes,
@@ -1629,6 +2063,65 @@ pub fn extract_archive_virtual_entries_bounded(
         scan_tar_seekable_bounded(&mut cur, max_retained_header_bytes, &mut entries)?;
     }
     Ok(entries)
+}
+
+/// Extract full file payloads `(relative_path, bytes)` from an in-memory `.zip`, `.tar`, or `.tar.gz`/`.tgz`
+/// archive with strict upper bounds (`max_inflate_bytes` and `max_retained_bytes`), suitable for
+/// in-memory `wasm32` 1D/2D/3D spectrum & FID loading.
+pub fn extract_archive_full_entries_bounded(
+    archive_name: &str,
+    archive_bytes: &[u8],
+    max_inflate_bytes: u64,
+    max_retained_bytes: usize,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let lower = archive_name.to_ascii_lowercase();
+    let is_zip = is_zip_path_lower(&lower) || is_zip_magic(archive_bytes);
+    let is_gz = !is_zip
+        && (is_targz_path_lower(&lower)
+            || (archive_bytes.len() >= 2 && archive_bytes[0] == 0x1f && archive_bytes[1] == 0x8b));
+    let mut entries = Vec::new();
+    if is_zip {
+        let mut cur = Cursor::new(archive_bytes);
+        scan_zip_seekable_internal(
+            &mut cur,
+            max_inflate_bytes,
+            max_retained_bytes,
+            true,
+            &mut entries,
+        )?;
+    } else if is_gz {
+        let mut gz = GzipStreamDecoder::new(Cursor::new(archive_bytes), max_inflate_bytes);
+        scan_tar_with_skipper(
+            &mut gz,
+            discard_bytes_read,
+            max_retained_bytes,
+            true,
+            &mut entries,
+        )?;
+    } else {
+        if (archive_bytes.len() as u64) > max_inflate_bytes {
+            return Err(format!(
+                "archive exceeded maximum uncompressed byte limit ({max_inflate_bytes} bytes)"
+            ));
+        }
+        let mut cur = Cursor::new(archive_bytes);
+        scan_tar_with_skipper(
+            &mut cur,
+            |r, n| {
+                let step = i64::try_from(n).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "tar entry > i64::MAX")
+                })?;
+                r.seek(SeekFrom::Current(step)).map(|_| ())
+            },
+            max_retained_bytes,
+            true,
+            &mut entries,
+        )?;
+    }
+    Ok(entries
+        .into_iter()
+        .map(|ve| (ve.relative_path, ve.header_bytes))
+        .collect())
 }
 
 /// Inspect an in-memory `.tar` or `.tar.gz` / `.tgz` byte buffer into `VirtualEntry` headers
@@ -1861,7 +2354,7 @@ fn collect_virtual_entries_from_dir(
             continue;
         }
         let path = entry.path();
-        if is_tar_path_lower(&lower) || is_targz_path_lower(&lower) {
+        if is_tar_path_lower(&lower) || is_targz_path_lower(&lower) || is_zip_path_lower(&lower) {
             deferred_archives.push(path);
             continue;
         }
@@ -4089,7 +4582,7 @@ fn infer_regime_and_hints(
 fn expand_inline_archives(entries: &[VirtualEntry]) -> Vec<VirtualEntry> {
     let has_unpacked = entries.iter().any(|e| {
         let low = e.relative_path.to_ascii_lowercase();
-        !is_tar_path_lower(&low) && !is_targz_path_lower(&low)
+        !is_tar_path_lower(&low) && !is_targz_path_lower(&low) && !is_zip_path_lower(&low)
     });
     if has_unpacked {
         return entries.to_vec();
@@ -4097,7 +4590,9 @@ fn expand_inline_archives(entries: &[VirtualEntry]) -> Vec<VirtualEntry> {
     let mut expanded = Vec::new();
     for e in entries {
         let low = e.relative_path.to_ascii_lowercase();
-        if (is_tar_path_lower(&low) || is_targz_path_lower(&low)) && !e.header_bytes.is_empty() {
+        if (is_tar_path_lower(&low) || is_targz_path_lower(&low) || is_zip_path_lower(&low))
+            && !e.header_bytes.is_empty()
+        {
             if let Ok(sub) = extract_archive_virtual_entries(&e.relative_path, &e.header_bytes) {
                 expanded.extend(sub);
                 continue;
@@ -4530,7 +5025,7 @@ fn collect_virtual_entries_root(
         }
         let lower = fname.to_ascii_lowercase();
         let path = entry.path();
-        if is_tar_path_lower(&lower) || is_targz_path_lower(&lower) {
+        if is_tar_path_lower(&lower) || is_targz_path_lower(&lower) || is_zip_path_lower(&lower) {
             deferred_archives.push(path);
             continue;
         }
@@ -4600,7 +5095,10 @@ fn collect_virtual_entries_root(
             } else if ft.is_file() {
                 let lower = fname.to_ascii_lowercase();
                 let path = entry.path();
-                if is_tar_path_lower(&lower) || is_targz_path_lower(&lower) {
+                if is_tar_path_lower(&lower)
+                    || is_targz_path_lower(&lower)
+                    || is_zip_path_lower(&lower)
+                {
                     deferred_archives.push(path);
                     continue;
                 }
@@ -4728,6 +5226,10 @@ pub fn classify_nmr_workspace(path: &Path) -> Result<WorkspaceInventory, String>
                         let mut f = File::open(&arch)
                             .map_err(|e| format!("failed to open {}: {e}", arch.display()))?;
                         scan_tar_seekable(&mut f, &mut entries)?;
+                    } else if is_zip_path_lower(&alow) {
+                        let mut f = File::open(&arch)
+                            .map_err(|e| format!("failed to open {}: {e}", arch.display()))?;
+                        scan_zip_seekable(&mut f, &mut entries)?;
                     }
                 }
             }
@@ -4741,6 +5243,10 @@ pub fn classify_nmr_workspace(path: &Path) -> Result<WorkspaceInventory, String>
                 let mut f = File::open(path)
                     .map_err(|e| format!("failed to open archive {}: {e}", path.display()))?;
                 scan_tar_seekable(&mut f, &mut entries)?;
+            } else if is_zip_path_lower(&lower) {
+                let mut f = File::open(path)
+                    .map_err(|e| format!("failed to open archive {}: {e}", path.display()))?;
+                scan_zip_seekable(&mut f, &mut entries)?;
             } else {
                 match classify_file_read_action(&root_name) {
                     FileReadAction::BoundedBinary(lim) | FileReadAction::BoundedText(lim) => {
