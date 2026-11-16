@@ -1610,7 +1610,8 @@ TOURS_PLAYER_JS = r"""(function () {
         green: "#34d399",
         amber: "#fbbf24",
         coral: "#fb7185",
-        violet: "#a78bfa"
+        violet: "#a78bfa",
+        border: "rgba(148, 163, 184, 0.28)"
       };
     }
     return {
@@ -1625,7 +1626,8 @@ TOURS_PLAYER_JS = r"""(function () {
       green: "#34d399",
       amber: "#fbbf24",
       coral: "#fb7185",
-      violet: "#c4b5fd"
+      violet: "#c4b5fd",
+      border: "rgba(148, 163, 184, 0.28)"
     };
   }
 
@@ -1756,56 +1758,112 @@ TOURS_PLAYER_JS = r"""(function () {
       } else if (chIdx === 1) {
         drawCardTitle(ctx, padX, padY - 12, "1D/2D Raw FID Decay -> Sine-Bell Apodization -> Calibrated FFT", "Zero-fill 2x · Phase PH0/PH1", pal);
         drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Time / Chemical Shift (ppm)", "Signal", pal);
+        var fidSrc = (payload && Array.isArray(payload.fid_real) && payload.fid_real.length > 4 && typeof payload.fid_real[0] === "number") ? payload.fid_real : null;
         ctx.strokeStyle = pal.teal;
         ctx.lineWidth = 2;
         ctx.beginPath();
-        var nPts = 90;
-        for (var i = 0; i < nPts; i++) {
-          var u = i / (nPts - 1);
-          var x = padX + u * pw;
-          var env = Math.exp(-3.2 * u) * Math.sin(Math.PI * u);
-          var sig = env * Math.cos(u * 42 + localT * 6.28);
-          var y = padY + ph * 0.34 - sig * ph * 0.22;
-          if (i === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        }
-        ctx.stroke();
-        // FFT spectrum bottom half
-        var specSrc = (payload && Array.isArray(payload.spectrum) && payload.spectrum.length > 4) ? payload.spectrum : null;
-        var peaks = specSrc || [
-          { ppm: 8.42, amp: 0.92 }, { ppm: 7.81, amp: 0.74 },
-          { ppm: 4.18, amp: 0.65 }, { ppm: 2.08, amp: 0.85 }, { ppm: 0.92, amp: 0.95 }
-        ];
-        ctx.strokeStyle = pal.cyan;
-        ctx.lineWidth = 2.2;
-        ctx.beginPath();
-        for (var i = 0; i <= 140; i++) {
-          var u = i / 140;
-          var ppm = 10.0 - u * 10.0;
-          var val = 0;
-          for (var p = 0; p < peaks.length; p++) {
-            var pk = peaks[p];
-            var pp = pk.ppm !== undefined ? pk.ppm : (9.0 - p * 1.8);
-            var aa = pk.amp !== undefined ? pk.amp : 0.7;
-            var d = (ppm - pp) / 0.14;
-            val += aa / (1 + d * d);
+        if (fidSrc) {
+          var maxFid = 1e-9;
+          for (var i = 0; i < fidSrc.length; i++) maxFid = Math.max(maxFid, Math.abs(fidSrc[i]));
+          for (var i = 0; i < fidSrc.length; i++) {
+            var x = padX + (i / (fidSrc.length - 1)) * pw;
+            var y = padY + ph * 0.34 - (fidSrc[i] / maxFid) * ph * 0.22;
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
           }
-          var sx = padX + u * pw;
-          var sy = padY + ph * 0.92 - val * ph * 0.32;
-          if (i === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
+        } else {
+          var nPts = 90;
+          for (var i = 0; i < nPts; i++) {
+            var u = i / (nPts - 1);
+            var x = padX + u * pw;
+            var env = Math.exp(-3.2 * u) * Math.sin(Math.PI * u);
+            var sig = env * Math.cos(u * 42 + localT * 6.28);
+            var y = padY + ph * 0.34 - sig * ph * 0.22;
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
         }
         ctx.stroke();
-        for (var p = 0; p < peaks.length; p++) {
-          var pp = peaks[p].ppm !== undefined ? peaks[p].ppm : (9.0 - p * 1.8);
-          var aa = peaks[p].amp !== undefined ? peaks[p].amp : 0.7;
-          var px = padX + ((10.0 - pp) / 10.0) * pw;
-          var py = padY + ph * 0.92 - aa * ph * 0.32;
-          ctx.fillStyle = pal.amber;
+        // FFT spectrum bottom half: use payload.fft_phased + payload.fft_unphased when present
+        var fftPhased = (payload && Array.isArray(payload.fft_phased) && payload.fft_phased.length > 4 && typeof payload.fft_phased[0] === "number") ? payload.fft_phased : null;
+        var fftUnphased = (payload && Array.isArray(payload.fft_unphased) && payload.fft_unphased.length === (fftPhased ? fftPhased.length : 0)) ? payload.fft_unphased : null;
+        if (fftPhased) {
+          var maxSpec = 1e-9;
+          for (var i = 0; i < fftPhased.length; i++) maxSpec = Math.max(maxSpec, Math.abs(fftPhased[i]));
+          if (fftUnphased) {
+            for (var i = 0; i < fftUnphased.length; i++) maxSpec = Math.max(maxSpec, Math.abs(fftUnphased[i]));
+            ctx.strokeStyle = pal.coral;
+            ctx.lineWidth = 1.4;
+            ctx.setLineDash([4, 3]);
+            ctx.beginPath();
+            for (var i = 0; i < fftUnphased.length; i++) {
+              var sx = padX + (i / (fftUnphased.length - 1)) * pw;
+              var sy = padY + ph * 0.88 - (fftUnphased[i] / maxSpec) * ph * 0.30;
+              if (i === 0) ctx.moveTo(sx, sy);
+              else ctx.lineTo(sx, sy);
+            }
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+          ctx.strokeStyle = pal.cyan;
+          ctx.lineWidth = 2.2;
           ctx.beginPath();
-          ctx.arc(px, py, 4, 0, Math.PI * 2);
-          ctx.fill();
-          addSpot(px, py, 14, "FFT Peak " + pp.toFixed(2) + " ppm", ["Intensity: " + aa.toFixed(2), "Sine-bell apodized"]);
+          for (var i = 0; i < fftPhased.length; i++) {
+            var sx = padX + (i / (fftPhased.length - 1)) * pw;
+            var sy = padY + ph * 0.88 - (fftPhased[i] / maxSpec) * ph * 0.30;
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+          }
+          ctx.stroke();
+          for (var i = 1; i < fftPhased.length - 1; i++) {
+            if (fftPhased[i] > fftPhased[i - 1] && fftPhased[i] > fftPhased[i + 1] && fftPhased[i] > maxSpec * 0.35) {
+              var px = padX + (i / (fftPhased.length - 1)) * pw;
+              var py = padY + ph * 0.88 - (fftPhased[i] / maxSpec) * ph * 0.30;
+              var pp = 10.0 - (i / (fftPhased.length - 1)) * 10.0;
+              ctx.fillStyle = pal.amber;
+              ctx.beginPath();
+              ctx.arc(px, py, 4, 0, Math.PI * 2);
+              ctx.fill();
+              addSpot(px, py, 14, "FFT Peak " + pp.toFixed(2) + " ppm", ["Intensity: " + fftPhased[i].toFixed(2), "Phased vs unphased overlay"]);
+            }
+          }
+        } else {
+          var specSrc = (payload && Array.isArray(payload.spectrum) && payload.spectrum.length > 4) ? payload.spectrum : null;
+          var peaks = specSrc || [
+            { ppm: 8.42, amp: 0.92 }, { ppm: 7.81, amp: 0.74 },
+            { ppm: 4.18, amp: 0.65 }, { ppm: 2.08, amp: 0.85 }, { ppm: 0.92, amp: 0.95 }
+          ];
+          ctx.strokeStyle = pal.cyan;
+          ctx.lineWidth = 2.2;
+          ctx.beginPath();
+          for (var i = 0; i <= 140; i++) {
+            var u = i / 140;
+            var ppm = 10.0 - u * 10.0;
+            var val = 0;
+            for (var p = 0; p < peaks.length; p++) {
+              var pk = peaks[p];
+              var pp = pk.ppm !== undefined ? pk.ppm : (9.0 - p * 1.8);
+              var aa = pk.amp !== undefined ? pk.amp : 0.7;
+              var d = (ppm - pp) / 0.14;
+              val += aa / (1 + d * d);
+            }
+            var sx = padX + u * pw;
+            var sy = padY + ph * 0.92 - val * ph * 0.32;
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+          }
+          ctx.stroke();
+          for (var p = 0; p < peaks.length; p++) {
+            var pp = peaks[p].ppm !== undefined ? peaks[p].ppm : (9.0 - p * 1.8);
+            var aa = peaks[p].amp !== undefined ? peaks[p].amp : 0.7;
+            var px = padX + ((10.0 - pp) / 10.0) * pw;
+            var py = padY + ph * 0.92 - aa * ph * 0.32;
+            ctx.fillStyle = pal.amber;
+            ctx.beginPath();
+            ctx.arc(px, py, 4, 0, Math.PI * 2);
+            ctx.fill();
+            addSpot(px, py, 14, "FFT Peak " + pp.toFixed(2) + " ppm", ["Intensity: " + aa.toFixed(2), "Sine-bell apodized"]);
+          }
         }
       } else if (chIdx === 2) {
         drawCardTitle(ctx, padX, padY - 12, "25% Poisson-Gap NUS Schedule & Zero-Fill PSF Artifacts", "64 / 256 increments acquired", pal);
@@ -1839,35 +1897,67 @@ TOURS_PLAYER_JS = r"""(function () {
         ctx.stroke();
       } else {
         var iter = Math.round(clamp(ctrlVal, 0, 20));
+        var fistaIters = (payload && Array.isArray(payload.nus_fista_iters) && payload.nus_fista_iters.length > 0) ? payload.nus_fista_iters : null;
+        var resArr = (payload && Array.isArray(payload.nus_residual_l1)) ? payload.nus_residual_l1 : null;
         var ridgeFactor = Math.exp(-0.21 * iter);
-        drawCardTitle(ctx, padX, padY - 12, "Hypercomplex IST/FISTA Threshold Shrinkage (iter = " + iter + " / 20)", "Residual NUS ridge: " + (ridgeFactor * 100).toFixed(1) + "%", pal);
+        var resText = (resArr && resArr.length > 0)
+          ? ("Residual L1: " + Number(resArr[Math.min(iter, resArr.length - 1)]).toFixed(3))
+          : ("Residual NUS ridge: " + (ridgeFactor * 100).toFixed(1) + "%");
+        drawCardTitle(ctx, padX, padY - 12, "Hypercomplex IST/FISTA Threshold Shrinkage (iter = " + iter + " / 20)", resText, pal);
         drawAxes(ctx, padX, padY + 8, pw, ph - 12, "15N / 1H Frequency", "Reconstructed Amplitude", pal);
-        var peakPos = [0.22, 0.48, 0.74];
-        ctx.strokeStyle = pal.green;
-        ctx.lineWidth = 2.4;
-        ctx.beginPath();
-        for (var i = 0; i <= 160; i++) {
-          var u = i / 160;
-          var yVal = 0;
-          for (var p = 0; p < peakPos.length; p++) {
-            var d = (u - peakPos[p]) / 0.025;
-            yVal += (0.85 - p * 0.1) / (1 + d * d);
-          }
-          yVal += 0.22 * ridgeFactor * Math.sin(u * 65 + 1.1) * Math.cos(u * 23);
-          var sx = padX + u * pw;
-          var sy = padY + ph * 0.88 - Math.max(-0.15, yVal) * ph * 0.72;
-          if (i === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
-        }
-        ctx.stroke();
-        for (var p = 0; p < peakPos.length; p++) {
-          var px = padX + peakPos[p] * pw;
-          var py = padY + ph * 0.88 - (0.85 - p * 0.1) * ph * 0.72;
-          ctx.fillStyle = pal.amber;
+        var specIter = fistaIters ? fistaIters[Math.min(iter, fistaIters.length - 1)] : null;
+        if (Array.isArray(specIter) && specIter.length > 4) {
+          var maxFista = 1e-9;
+          for (var i = 0; i < specIter.length; i++) maxFista = Math.max(maxFista, Math.abs(specIter[i]));
+          ctx.strokeStyle = pal.green;
+          ctx.lineWidth = 2.4;
           ctx.beginPath();
-          ctx.arc(px, py, 5, 0, Math.PI * 2);
-          ctx.fill();
-          addSpot(px, py, 16, "IST Peak #" + (p + 1), ["IST Iteration: " + iter, "Ridge suppression: " + ((1 - ridgeFactor) * 100).toFixed(1) + "%"]);
+          for (var i = 0; i < specIter.length; i++) {
+            var sx = padX + (i / (specIter.length - 1)) * pw;
+            var sy = padY + ph * 0.88 - (specIter[i] / maxFista) * ph * 0.72;
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+          }
+          ctx.stroke();
+          for (var i = 1; i < specIter.length - 1; i++) {
+            if (specIter[i] > specIter[i - 1] && specIter[i] > specIter[i + 1] && specIter[i] > maxFista * 0.45) {
+              var px = padX + (i / (specIter.length - 1)) * pw;
+              var py = padY + ph * 0.88 - (specIter[i] / maxFista) * ph * 0.72;
+              ctx.fillStyle = pal.amber;
+              ctx.beginPath();
+              ctx.arc(px, py, 5, 0, Math.PI * 2);
+              ctx.fill();
+              addSpot(px, py, 16, "IST Peak bin #" + i, ["IST Iteration: " + iter, resText]);
+            }
+          }
+        } else {
+          var peakPos = [0.22, 0.48, 0.74];
+          ctx.strokeStyle = pal.green;
+          ctx.lineWidth = 2.4;
+          ctx.beginPath();
+          for (var i = 0; i <= 160; i++) {
+            var u = i / 160;
+            var yVal = 0;
+            for (var p = 0; p < peakPos.length; p++) {
+              var d = (u - peakPos[p]) / 0.025;
+              yVal += (0.85 - p * 0.1) / (1 + d * d);
+            }
+            yVal += 0.22 * ridgeFactor * Math.sin(u * 65 + 1.1) * Math.cos(u * 23);
+            var sx = padX + u * pw;
+            var sy = padY + ph * 0.88 - Math.max(-0.15, yVal) * ph * 0.72;
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+          }
+          ctx.stroke();
+          for (var p = 0; p < peakPos.length; p++) {
+            var px = padX + peakPos[p] * pw;
+            var py = padY + ph * 0.88 - (0.85 - p * 0.1) * ph * 0.72;
+            ctx.fillStyle = pal.amber;
+            ctx.beginPath();
+            ctx.arc(px, py, 5, 0, Math.PI * 2);
+            ctx.fill();
+            addSpot(px, py, 16, "IST Peak #" + (p + 1), ["IST Iteration: " + iter, "Ridge suppression: " + ((1 - ridgeFactor) * 100).toFixed(1) + "%"]);
+          }
         }
       }
       return;
@@ -2115,6 +2205,30 @@ TOURS_PLAYER_JS = r"""(function () {
           }
           ctx.stroke();
         }
+      } else if (chIdx === 2) {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: R2/R1 Global Tumbling tau_m = 8.1 ns (Res #" + resSeq + ")", "Rigid-core 10% trimmed median · Ile23 Rex & C-term outliers", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue 1..76", "R2 / R1 Ratio", pal);
+        var coreY = padY + 14 + (1 - 7.8 / 16.0) * (ph - 28);
+        ctx.strokeStyle = pal.teal;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(padX, coreY);
+        ctx.lineTo(padX + pw, coreY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        for (var r = 1; r <= 76; r++) {
+          var ratio = r === 23 ? 13.8 : (r >= 72 ? Math.max(2.1, 7.2 - (r - 71) * 1.1) : (7.8 + 0.65 * Math.sin(r * 0.42)));
+          var sx = padX + ((r - 0.5) / 76) * pw;
+          var sy = padY + 14 + (1 - ratio / 16.0) * (ph - 28);
+          var isSel = r === resSeq;
+          ctx.fillStyle = isSel ? pal.amber : (r === 23 ? pal.coral : (r >= 72 ? pal.violet : pal.teal));
+          ctx.beginPath();
+          ctx.arc(sx, sy, isSel ? 6 : 3.2, 0, Math.PI * 2);
+          ctx.fill();
+          if (r % 4 === 0 || isSel || r === 23) {
+            addSpot(sx, sy, 10, "Res #" + r, ["R2/R1: " + ratio.toFixed(2), "tau_m = 8.1 ns"], r);
+          }
+        }
       } else {
         drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Lipari-Szabo M1-M5 S^2 Profile (Res #" + resSeq + ")", "Ile23 Rex exchange · C-term 72-76 flexible tail", pal);
         drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue 1..76", "Order Parameter S^2", pal);
@@ -2179,6 +2293,36 @@ TOURS_PLAYER_JS = r"""(function () {
           }
           ctx.stroke();
         }
+      } else if (chIdx === 2) {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: 2D 1H-15N HSQC Titration CSP Trajectories ([L] = " + ligUm.toFixed(0) + " uM)", "Fast-exchange linear vectors -> Kd ~ 5 uM", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm)", "15N (ppm)", pal);
+        var frac = ligUm / (ligUm + 28.0);
+        var traj = [
+          { lbl: "Phe4", x0: 0.25, y0: 0.30, dx: 0.14, dy: -0.10, col: pal.cyan },
+          { lbl: "Ile23", x0: 0.52, y0: 0.48, dx: 0.18, dy: 0.14, col: pal.green },
+          { lbl: "His68", x0: 0.72, y0: 0.68, dx: -0.12, dy: -0.15, col: pal.amber }
+        ];
+        for (var t = 0; t < traj.length; t++) {
+          var tr = traj[t];
+          var xA = padX + tr.x0 * pw, yA = padY + 14 + tr.y0 * (ph - 28);
+          var xB = padX + (tr.x0 + tr.dx) * pw, yB = padY + 14 + (tr.y0 + tr.dy) * (ph - 28);
+          ctx.strokeStyle = tr.col;
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          ctx.moveTo(xA, yA);
+          ctx.lineTo(xB, yB);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          var xC = xA + (xB - xA) * frac, yC = yA + (yB - yA) * frac;
+          ctx.fillStyle = tr.col;
+          ctx.beginPath();
+          ctx.arc(xC, yC, 6, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = pal.text;
+          ctx.font = "600 11px -apple-system, sans-serif";
+          ctx.fillText(tr.lbl, xC + 8, yC + 4);
+          addSpot(xC, yC, 16, tr.lbl + " CSP Trajectory", ["[L] = " + ligUm.toFixed(0) + " uM", "Shift progress: " + (frac * 100).toFixed(0) + "%"]);
+        }
       } else {
         drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Morrison Quadratic (Kd=5 uM, [P]0=100 uM) vs Naive MM", "Cursor [L] = " + ligUm.toFixed(0) + " uM", pal);
         drawAxes(ctx, padX, padY + 8, pw, ph - 12, "[L] total (uM)", "Fraction Bound", pal);
@@ -2232,8 +2376,47 @@ TOURS_PLAYER_JS = r"""(function () {
     if (modIdx === 6) {
       // Module 06: 1D HSVD/Whittaker, Hoye ddd, GUM qNMR, Octet (S)-Ibuprofen <-> peak
       var atomIdx = Math.round(clamp(ctrlVal, 0, 14));
-      if (chIdx === 0 || chIdx === 1) {
-        drawCardTitle(ctx, padX, padY - 12, chIdx === 0 ? "SYNTHETIC: 1D HSVD Water Suppression + Whittaker Baseline" : "SYNTHETIC: Hoye ddd Multiplet Tree (J = 14.2, 7.1, 2.4 Hz)", "Voigt deconvolution · ACS report", pal);
+      if (chIdx === 0) {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: 1D HSVD Water Suppression + Whittaker Baseline", "4.70 ppm HDO SVD pole removal · Asymmetric least-squares baseline", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H Chemical Shift (ppm)", "Intensity", pal);
+        ctx.strokeStyle = pal.coral;
+        ctx.lineWidth = 1.6;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        for (var i = 0; i <= 160; i++) {
+          var u = i / 160;
+          var hdo = 0.85 / (1 + Math.pow((u - 0.50) / 0.035, 2));
+          var base = 0.14 * Math.sin(u * Math.PI);
+          var sx = padX + u * pw;
+          var sy = padY + ph - 14 - (hdo + base) * (ph * 0.72);
+          if (i === 0) ctx.moveTo(sx, sy);
+          else ctx.lineTo(sx, sy);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+        var solPeaks = [0.22, 0.34, 0.68, 0.78];
+        ctx.strokeStyle = pal.cyan;
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        for (var i = 0; i <= 160; i++) {
+          var u = i / 160;
+          var val = 0;
+          for (var p = 0; p < solPeaks.length; p++) {
+            var d = (u - solPeaks[p]) / 0.018;
+            val += 0.55 / (1 + d * d);
+          }
+          var sx = padX + u * pw;
+          var sy = padY + ph - 14 - val * (ph * 0.68);
+          if (i === 0) ctx.moveTo(sx, sy);
+          else ctx.lineTo(sx, sy);
+        }
+        ctx.stroke();
+        addSpot(padX + pw * 0.50, padY + ph * 0.25, 20, "4.70 ppm HDO Suppressed", ["HSVD Hankel rank-12 pole removed", "Whittaker baseline flat"]);
+        for (var p = 0; p < solPeaks.length; p++) {
+          addSpot(padX + solPeaks[p] * pw, padY + ph - 14 - 0.55 * (ph * 0.68), 14, "Solute Peak #" + (p + 1), ["Recovered after HSVD + Whittaker"]);
+        }
+      } else if (chIdx === 1) {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Hoye ddd Multiplet Tree (J = 14.2, 7.1, 2.4 Hz)", "Voigt deconvolution · ACS report", pal);
         drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H Chemical Shift (ppm)", "Intensity", pal);
         ctx.strokeStyle = pal.cyan;
         ctx.lineWidth = 2.2;
@@ -2255,6 +2438,10 @@ TOURS_PLAYER_JS = r"""(function () {
         for (var s = 0; s < subPeaks.length; s++) {
           var px = padX + subPeaks[s] * pw;
           var py = padY + ph - 14 - 0.7 * (ph * 0.62);
+          ctx.fillStyle = pal.amber;
+          ctx.beginPath();
+          ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+          ctx.fill();
           addSpot(px, py, 14, "ddd Subpeak #" + (s + 1), ["J1=14.2 Hz, J2=7.1 Hz, J3=2.4 Hz"]);
         }
       } else if (chIdx === 2) {
@@ -2361,8 +2548,8 @@ TOURS_PLAYER_JS = r"""(function () {
           ctx.fill();
           addSpot(sx, sy, 12, "b-point g" + (g + 1), ["b = " + b.toFixed(2) + "e9 s/m^2", "I/I0 = " + yVal.toFixed(3)], g);
         }
-      } else {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: 2D DOSY (ppm x log10 D) & Evans Stokes-Einstein Rh", "Maleate (0.28 nm) · Raffinose (0.58 nm) · Lysozyme (1.92 nm)", pal);
+      } else if (chIdx === 2) {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: 2D DOSY (ppm x log10 D) Contour Map", "Maleate (0.28 nm) · Raffinose (0.58 nm) · Lysozyme (1.92 nm)", pal);
         drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm)", "log10 D (m^2/s)", pal);
         var species = [
           { name: "Maleate", x: 0.24, y: 0.22, rh: "0.28 nm", mw: "116 Da", col: pal.cyan },
@@ -2382,6 +2569,34 @@ TOURS_PLAYER_JS = r"""(function () {
           ctx.font = "600 12px -apple-system, sans-serif";
           ctx.fillText(sp.name + " (" + sp.rh + ")", sx + 26, sy + 4);
           addSpot(sx, sy, 22, sp.name, ["Rh: " + sp.rh, "MW: " + sp.mw]);
+        }
+      } else {
+        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Evans Stokes-Einstein log10 D vs log10 MW Scaling", "Slope = -0.34 (globular compact fold)", pal);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "log10 MW (Da)", "log10 D (m^2/s)", pal);
+        ctx.strokeStyle = pal.teal;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(padX + pw * 0.12, padY + ph * 0.22);
+        ctx.lineTo(padX + pw * 0.88, padY + ph * 0.82);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        var pts = [
+          { name: "Maleate", x: 0.18, y: 0.27, rh: "0.28 nm", mw: "116 Da", col: pal.cyan },
+          { name: "Raffinose", x: 0.44, y: 0.47, rh: "0.58 nm", mw: "504 Da", col: pal.green },
+          { name: "Lysozyme", x: 0.82, y: 0.77, rh: "1.92 nm", mw: "14.3 kDa", col: pal.amber }
+        ];
+        for (var s = 0; s < pts.length; s++) {
+          var pt = pts[s];
+          var sx = padX + pt.x * pw;
+          var sy = padY + pt.y * ph;
+          ctx.fillStyle = pt.col;
+          ctx.beginPath();
+          ctx.arc(sx, sy, 6, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = pal.text;
+          ctx.font = "600 12px -apple-system, sans-serif";
+          ctx.fillText(pt.name + " · Rh=" + pt.rh, sx + 10, sy - 6);
+          addSpot(sx, sy, 18, pt.name + " Stokes-Einstein", ["MW: " + pt.mw, "Rh: " + pt.rh]);
         }
       }
       return;
@@ -2576,8 +2791,9 @@ TOURS_PLAYER_JS = r"""(function () {
       if (!ch) return;
       drawerChBadge.textContent = "Chapter " + (idx + 1) + " / " + bundle.chapters.length;
       drawerChTitle.textContent = ch.title;
-      drawerMetric.textContent = ch.metric || "";
-      drawerMetric.hidden = !ch.metric;
+      var metricText = ch.metric_pill || ch.metric || "";
+      drawerMetric.textContent = metricText;
+      drawerMetric.hidden = !metricText;
       drawerCaption.textContent = ch.caption;
       if (overlayChLabel) overlayChLabel.textContent = "Ch " + (idx + 1) + "/" + bundle.chapters.length;
       for (var i = 0; i < chMarkers.length; i++) {
@@ -3172,10 +3388,157 @@ def run_self_tests() -> int:
         assert (check_out / "tours.css").is_file()
         assert (check_out / "tours_player.js").is_file()
 
+        # 8. Hard JS runtime execution test via Node vm across all 8 modules x ?ch=1..4 (32 pairs)
+        node_bin = shutil.which("node")
+        if node_bin is not None:
+            node_harness = r"""
+const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
+
+const outDir = process.argv[1];
+const jsCode = fs.readFileSync(path.join(outDir, "tours_player.js"), "utf8");
+const htmlFiles = fs.readdirSync(outDir).filter(f => /^\d{2}_.*\.html$/.test(f)).sort();
+if (htmlFiles.length !== 8) {
+  throw new Error("Expected 8 module HTML files, got " + htmlFiles.length);
+}
+
+let pairs = 0;
+for (const file of htmlFiles) {
+  const html = fs.readFileSync(path.join(outDir, file), "utf8");
+  const m = html.match(/<script[^>]*id="tour-bundle-data"[^>]*>([\s\S]*?)<\/script>/);
+  if (!m) throw new Error("Missing tour-bundle-data in " + file);
+  const jsonText = m[1].replace(/\\u003c/gi, "<");
+  const parsed = JSON.parse(jsonText);
+
+  for (const ch of [1, 2, 3, 4]) {
+    let drawCalls = 0;
+    const ctx = {
+      _fillStyle: "#000",
+      _strokeStyle: "#000",
+      get fillStyle() { return this._fillStyle; },
+      set fillStyle(v) {
+        if (v === undefined || v === null) throw new Error("undefined fillStyle in " + file + " ch=" + ch);
+        this._fillStyle = v;
+      },
+      get strokeStyle() { return this._strokeStyle; },
+      set strokeStyle(v) {
+        if (v === undefined || v === null) throw new Error("undefined strokeStyle in " + file + " ch=" + ch);
+        this._strokeStyle = v;
+      },
+      lineWidth: 1, font: "12px sans-serif", textAlign: "left", textBaseline: "alphabetic", globalAlpha: 1,
+      setTransform() {}, save() {}, restore() {}, translate() {}, rotate() {}, scale() {},
+      beginPath() {}, closePath() {}, moveTo() {}, lineTo() {}, arc() {}, arcTo() {}, ellipse() {},
+      rect() {}, roundRect() {}, clip() {}, setLineDash() {}, clearRect() {},
+      quadraticCurveTo() {}, bezierCurveTo() {},
+      fillRect() { drawCalls++; },
+      strokeRect() { drawCalls++; },
+      fill() { drawCalls++; },
+      stroke() { drawCalls++; },
+      fillText() { drawCalls++; }
+    };
+
+    const makeEl = (id) => ({
+      id,
+      textContent: "",
+      innerHTML: "",
+      value: "0",
+      min: "0",
+      max: "20",
+      step: "1",
+      hidden: false,
+      paused: true,
+      width: 960,
+      height: 540,
+      style: {},
+      classList: { toggle() {}, add() {}, remove() {} },
+      setAttribute() {},
+      getAttribute() { return ""; },
+      addEventListener() {},
+      getBoundingClientRect() { return { width: 960, height: 540, left: 0, top: 0 }; },
+      getContext(kind) { return kind === "2d" ? ctx : null; }
+    });
+
+    const elements = {};
+    const domListeners = [];
+    const doc = {
+      documentElement: {
+        _attrs: {},
+        setAttribute(k, v) { this._attrs[k] = String(v); },
+        getAttribute(k) { return this._attrs[k] || "dark"; }
+      },
+      body: { classList: { add() {}, remove() {}, toggle() {} } },
+      getElementById(id) {
+        if (!elements[id]) elements[id] = makeEl(id);
+        if (id === "tour-bundle-data") elements[id].textContent = jsonText;
+        return elements[id];
+      },
+      querySelectorAll() { return []; },
+      addEventListener(ev, fn) { if (ev === "DOMContentLoaded") domListeners.push(fn); }
+    };
+
+    let rafCount = 0;
+    const sandbox = {
+      console,
+      Math,
+      Number,
+      String,
+      Boolean,
+      Array,
+      Object,
+      JSON,
+      parseInt,
+      parseFloat,
+      isNaN,
+      URLSearchParams,
+      document: doc,
+      localStorage: { getItem() { return null; }, setItem() {} },
+      navigator: { clipboard: { writeText() { return Promise.resolve(); } } },
+      performance: { now() { return 1000; } },
+      requestAnimationFrame(fn) {
+        rafCount++;
+        if (rafCount <= 1) fn(1016);
+      },
+      window: null
+    };
+    sandbox.window = {
+      location: { search: "?ch=" + ch },
+      devicePixelRatio: 1,
+      matchMedia() { return { matches: true, addEventListener() {} }; },
+      addEventListener() {}
+    };
+
+    vm.runInNewContext(jsCode, sandbox, { filename: "tours_player.js" });
+    for (const fn of domListeners) fn();
+
+    if (drawCalls < 15) {
+      throw new Error(file + " ?ch=" + ch + " drew only " + drawCalls + " canvas calls (< 15)");
+    }
+    const chObj = (parsed.chapters || [])[ch - 1];
+    if (chObj && (chObj.metric_pill || chObj.metric)) {
+      const mEl = elements["drawer-metric"];
+      if (!mEl || mEl.hidden || !mEl.textContent) {
+        throw new Error(file + " ?ch=" + ch + " failed to populate drawer-metric");
+      }
+    }
+    pairs++;
+  }
+}
+console.log("NODE_VM_OK pairs=" + pairs);
+"""
+            proc = subprocess.run(
+                [node_bin, "-e", node_harness, str(check_out)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert proc.returncode == 0, f"Node JS runtime self-test failed:\n{proc.stdout}\n{proc.stderr}"
+            assert "NODE_VM_OK pairs=32" in proc.stdout, f"Unexpected node output: {proc.stdout}"
+
         digest = site_digest(files_a)[:16]
         print(
-            f"build_interactive_tours.py self-tests passed (7/7 checks: 11 files, "
-            f"zero-CDN, WCAG 1.4.4, 04..08 SYNTHETIC+video, clean-room, JS syntax, --check CLI; sha256={digest})."
+            f"build_interactive_tours.py self-tests passed (8/8 checks: 11 files, "
+            f"zero-CDN, WCAG 1.4.4, 04..08 SYNTHETIC+video, clean-room, JS syntax, --check CLI, Node vm 32/32; sha256={digest})."
         )
     return 0
 
