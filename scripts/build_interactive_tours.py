@@ -2882,7 +2882,7 @@ TOURS_PLAYER_JS = r"""(function () {
         var dpr = window.devicePixelRatio || 1;
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         state.hotspots = [];
-        renderModuleScene(ctx, cssW, cssH, bundle.module_index, bundle.raw_json.payload || {}, state.tSec, state.ctrlVal, state, state.hotspots);
+        renderModuleScene(ctx, cssW, cssH, bundle.module_index, bundle.payload || {}, state.tSec, state.ctrlVal, state, state.hotspots);
       }
       requestAnimationFrame(frameLoop);
     }
@@ -3131,9 +3131,12 @@ def run_self_tests() -> int:
         assert len(files_a) == 11, f"expected 11 output files, got {len(files_a)}"
         assert site_digest(files_a) == site_digest(files_b), "build is non-deterministic"
 
-        # 2. Full validator pass
+        # 2. Full validator pass & no Python-only raw_json wrapper in generated JS
         errs = validate_tour_site(files_a, bundles, videos_rel="videos")
         assert not errs, f"unexpected validation errors: {errs}"
+        assert b"raw_json" not in files_a["tours_player.js"], (
+            "generated tours_player.js must not reference Python raw_json wrapper"
+        )
 
         # 3. Adversarial checks: external CDN must fail
         mut_cdn = dict(files_a)
