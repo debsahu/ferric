@@ -110,6 +110,11 @@ def fmt_num(val: Any, digits: int = 5) -> str:
     return str(val)
 
 
+def clean_cell(s: str) -> str:
+    s = re.sub(r"\|([^|\s]+)\|", r"abs(\1)", s)
+    return s.replace("|", "/")
+
+
 def run_w3_checks(root: Path, results_dir: Path) -> Path:
     results_dir.mkdir(parents=True, exist_ok=True)
     root_s = str(root.resolve())
@@ -157,19 +162,29 @@ def cited_w3_files(results_dir: Path, root: Path, extra_files: list[Path]) -> li
         "f10_f11/f11_r2_rates_formula_delays_cpu.tsv",
         "f10_f11/f11_evaluation.json",
         "f13abc/SHA256SUMS.txt",
+        "f13abc/SHA256SUMS_r2.txt",
         "f13abc/pre_execution_freeze_check.txt",
         "f13abc/pre_execution_sha256.txt",
         "f13abc/post_execution_freeze_check.txt",
         "f13abc/download_manifest.json",
+        "f13abc/f13c_r2_download_manifest.json",
         "f13abc/f13a_adapter_logs.json",
         "f13abc/f13a_evaluation.json",
         "f13abc/f13b_adapter_logs.json",
         "f13abc/f13b_evaluation.json",
+        "f13abc/f13c_adapter_logs.json",
+        "f13abc/zenodo_17228160_frozen_extractor.log",
+        "f13abc/zenodo_7892349_frozen_extractor.log",
+        "f13abc/posthoc_zenodo17228160_mst_curve_diagnostic.json",
         "f13abc/f13c_raw_apo_peaks.tsv",
         "f13abc/f13c_apo_peaks.tsv",
         "f13abc/f13c_tracked_csp.tsv",
         "f13abc/f13c_csp_fit.tsv",
         "f13abc/f13c_csp_fit.json",
+        "f13abc/z7892349_raw_apo_peaks.tsv",
+        "f13abc/z7892349_apo_peaks.tsv",
+        "f13abc/z7892349_tracked_csp.tsv",
+        "f13abc/z7892349_csp_stdout.log",
         "f13abc/f13c_evaluation.json",
     ]
     seen: set[Path] = set()
@@ -179,8 +194,11 @@ def cited_w3_files(results_dir: Path, root: Path, extra_files: list[Path]) -> li
         if p.is_file() and p.resolve() not in seen:
             seen.add(p.resolve())
             out.append(p)
-    prereg_p = root / "data" / "benchmark" / "p17_empirical_preregistration.json"
-    for p in [prereg_p, *extra_files]:
+    repo_cited = [
+        root / "data" / "benchmark" / "p17_empirical_preregistration.json",
+        root / "scripts" / "posthoc_diagnostics" / "posthoc_zenodo17228160_mst_curve_diagnostic.py",
+    ]
+    for p in [*repo_cited, *extra_files]:
         if p.is_file() and p.resolve() not in seen:
             seen.add(p.resolve())
             out.append(p)
@@ -305,14 +323,19 @@ def render_verdict_overview_section(results_dir: Path) -> str:
         ok = sum(1 for c in cr if c.get("passed"))
         return f"`{ok}/{len(cr)}`"
 
+    verdicts = [x["verdict"] for x in (f10, f11, f13a, f13b, f13c)]
+    n_pass = sum(1 for v in verdicts if v == "PASS")
+    n_fail = sum(1 for v in verdicts if v == "FAIL")
+    n_ne = sum(1 for v in verdicts if v == "NOT_EVALUABLE")
+
     lines = [
-        "### Wave `17.W3` Single-Shot Empirical Gate Verdicts (`1 PASS`, `2 FAIL`, `2 NOT_EVALUABLE`)",
+        f"### Wave `17.W3` Single-Shot Empirical Gate Verdicts (`{n_pass} PASS`, `{n_fail} FAIL`, `{n_ne} NOT_EVALUABLE`)",
         "",
         "| Gate (`TODO.md`) | Evaluated Accession Chain | Criteria Passed | Single-Shot Verdict | `TODO.md` Checkbox | Primary Outcome / Root Cause |",
         "| :--- | :--- | :---: | :---: | :---: | :--- |",
         (
             f"| `F10` (`TODO.md:130`) | `BMRB:6470` (`NOT_EVALUABLE`) -> `BMRB:18971` | {crit_ratio(f10)} | **`{f10['verdict']}`** | `[ ]` open | "
-            "`BMRB:6470` has `0/68` non-null `Val_err`; `BMRB:18971` passes `tau_m` (`4.156 ns`), `n=33`, `S^2` `r=0.894`, fails `D_par/D_perp` (`1.000` isotropic without PDB) & `S^2` `MAE=0.0993 > 0.060` |"
+            "`BMRB:6470` has `6` saveframes with `0/68` non-null `Val_err` (null-sigma adapter interpretation `17.5b:P2-1`); `BMRB:18971` passes `n=33` & `S^2` `r=0.894`, fails `S^2` `MAE=0.0993 > 0.060` & un-overridden ubiquitin `D_par/D_perp=1.17` (`F10-C1` `4.156 vs 4.09 ns` ubiquitin constant NOT cited as `tau_m` accuracy, `17.5b:P2-2`) |"
         ),
         (
             f"| `F11` (`TODO.md:131`) | `{f11['accession_id']}` (`DvR115` raw Bruker `ser`) | {crit_ratio(f11)} | **`{f11['verdict']}`** | `[ ]` open | "
@@ -320,15 +343,15 @@ def render_verdict_overview_section(results_dir: Path) -> str:
         ),
         (
             f"| `F13a` (`TODO.md:136`) | `{f13a['accession_id']}` | {crit_ratio(f13a)} | **`{f13a['verdict']}`** | `[ ]` open | "
-            "All `4` pre-registered archives omit required CW-`CEST` headers (`B0`, `T_EX`, `B1`), offset schedules, raw data (`Raw_data_flag=no`), or 2-state exchange (`p_B=0` Protein L) |"
+            "All `4` pre-registered archives omit required CW-`CEST` headers (`B0`, `T_EX`, `B1`), offset schedules (`ZENODO:12765510` via listing + `4096 B` HTTP `206` probe), raw data (`Raw_data_flag=no`), or 2-state exchange (`p_B=0` Protein L) |"
         ),
         (
             f"| `F13b` (`TODO.md:136`) | `{f13b['accession_id']}` | {crit_ratio(f13b)} | **`{f13b['verdict']}`** | `[ ]` open | "
             "All `6` pre-registered archives omit `B0`/`T_relax`/`nu_CPMG` headers, represent 1-state `p_B=0` controls, or deposit shift-only/empty `.str` stubs |"
         ),
         (
-            f"| `F13c` (`TODO.md:136`) | `{f13c['accession_id']}` (`tau1-243 + DnaJB1` 2D `HSQC`) | {crit_ratio(f13c)} | **`{f13c['verdict']}`** | `[ ]` open (with `F13a`/`b`) | "
-            "`63 >= 5` binding-pocket crosspeaks tracked across `9` steps (`98.1%` completion) & global quadratic `Kd = 119.78 uM` vs MST `226.83 uM` (`0.277 <= 0.40` dex) |"
+            f"| `F13c` (`TODO.md:136`) | `{f13c['accession_id']}` | {crit_ratio(f13c)} | **`{f13c['verdict']}`** | `[ ]` open | "
+            "All `3` archives fail frozen `bbc770a` `extract_f13c_reference_kd_um`: `ZENODO:17228160` deposits zero literal scalar `K_d` (`MST`/`SuppFig3BC` titrates `2N4R` tau `<= 100 uM`, not `tau1-243`), `BMRBIG:138` lacks stock molarity, & `ZENODO:7892349` lacks `K_d`/conc tables and has only `3 < 4` HSQC steps (`rc=1`) |"
         ),
     ]
     return "\n".join(lines)
@@ -338,6 +361,12 @@ def render_downloads_section(results_dir: Path) -> str:
     f10_dl = json.loads((results_dir / "f10_f11" / "f10_download_manifest.json").read_text(encoding="utf-8"))
     f11_dl = json.loads((results_dir / "f10_f11" / "f11_download_manifest.json").read_text(encoding="utf-8"))
     f13_dl = json.loads((results_dir / "f13abc" / "download_manifest.json").read_text(encoding="utf-8"))
+    f13c_r2_dl_p = results_dir / "f13abc" / "f13c_r2_download_manifest.json"
+    f13c_r2_files = (
+        json.loads(f13c_r2_dl_p.read_text(encoding="utf-8"))["files"]
+        if f13c_r2_dl_p.is_file()
+        else []
+    )
 
     f11_files = f11_dl["files"]
     f11_tot_bytes = sum(int(x["bytes"]) for x in f11_files)
@@ -356,7 +385,7 @@ def render_downloads_section(results_dir: Path) -> str:
     lines = [
         "### Wave `17.W3` Downloaded Empirical Payloads (`/tmp/p17_empirical_downloads/w3/` — `BMRB:53960` Untouched)",
         "",
-        f"*(Note: `F11` `BMRB:18380` fetched `{len(f11_files)}` raw Bruker directory files totaling `{f11_tot_bytes:,} B` recorded in full in `f10_f11/f11_download_manifest.json`; key `ser`/`acqus`/schedule/`.str` files are listed below alongside all `F10` and `F13a`–`c` downloads.)*",
+        f"*(Note: `F11` `BMRB:18380` fetched `{len(f11_files)}` raw Bruker directory files totaling `{f11_tot_bytes:,} B` recorded in full in `f10_f11/f11_download_manifest.json`; key `ser`/`acqus`/schedule/`.str` files are listed below alongside all `F10`, `F13a`–`c` Round-1, and `F13c` `ZENODO:7892349` `backup_1` downloads.)*",
         "",
         "| Gate | Accession | Role | File / Relative Path | HTTP | Bytes | FIPS 180-4 SHA-256 |",
         "| :--- | :--- | :--- | :--- | ---: | ---: | :--- |",
@@ -370,7 +399,7 @@ def render_downloads_section(results_dir: Path) -> str:
             lines.append(
                 f"| `F11` | `{rec['accession_id']}` | `primary` | `{rec['name']}` | `{rec['http_status']}` | {int(rec['bytes']):,} | `{rec['sha256']}` |"
             )
-    for rec in f13_dl["files"]:
+    for rec in [*f13_dl["files"], *f13c_r2_files]:
         lines.append(
             f"| `{rec['gate']}` | `{rec['accession_id']}` | `{rec['role']}` | `{rec['name']}` | `{rec['http_status']}` | {int(rec['bytes']):,} | `{rec['sha256']}` |"
         )
@@ -384,8 +413,12 @@ def render_f10_section(results_dir: Path) -> str:
     ktb = sm["kay_torchia_bax_trimmed_tau_m_by_field_mhz"]
     mc = sm["model_counts"]
 
+    crit_notes = {
+        "F10-C1": " (`17.5b:P2-2`: `4.09 ns` is ubiquitin reference; NOT `tau_m` accuracy on `BMRB:18971`)",
+        "F10-C2": " (`17.5b:P2-2`: `1.17` is ubiquitin axial ratio; isotropic without PDB)",
+    }
     crit_rows = [
-        f"| `{c['id']}` | `{c['metric']}` | `{fmt_num(c['value'], 5)}` | `{c['operator']} {fmt_num(c['threshold'], 3)}` (`{c['threshold_source']}`) | **`{'PASS' if c['passed'] else 'FAIL'}`** |"
+        f"| `{c['id']}` | `{c['metric']}` | `{fmt_num(c['value'], 5)}` | `{c['operator']} {fmt_num(c['threshold'], 3)}` (`{c['threshold_source']}`){crit_notes.get(c['id'], '')} | **`{'PASS' if c['passed'] else 'FAIL'}`** |"
         for c in ev["criteria_results"]
     ]
 
@@ -401,15 +434,17 @@ def render_f10_section(results_dir: Path) -> str:
     )
 
     lines = [
-        "#### Gate `F10` (`TODO.md:130`) — `BMRB:6470` (`NOT_EVALUABLE`) -> Co-Primary `BMRB:18971` (`FAIL`, `3/5` Criteria)",
+        "#### Gate `F10` (`TODO.md:130`) — `BMRB:6470` (`NOT_EVALUABLE` Adapter Interpretation) -> Co-Primary `BMRB:18971` (`FAIL`, `3/5` Criteria)",
         "",
-        "| Criterion ID | Metric | Measured (`BMRB:18971`) | Threshold (Source) | Verdict |",
+        "| Criterion ID | Metric | Measured (`BMRB:18971`) | Threshold (Source & `17.5b:P2-2` Note) | Verdict |",
         "| :--- | :--- | ---: | :--- | :---: |",
         *crit_rows,
         "",
-        "| Secondary Report-Only Metric (`BMRB:18971`, `3` Fields) | Value |",
+        "| Secondary Report-Only Metric / Provenance Note (`BMRB:6470` & `BMRB:18971`) | Value |",
         "| :--- | :--- |",
-        f"| Kay–Torchia–Bax trimmed `R2/R1` `tau_m` by field | {ktb_str} |",
+        "| Primary `BMRB:6470` fallback interpretation (`17.5b:P2-1`) | All `6` relaxation saveframes exist (`68` rows each) with `0/68` non-null `Val_err`; treating null uncertainties as missing required saveframe data -> `NOT_EVALUABLE` is an explicit `bbc770a` adapter interpretation (verdict is `FAIL` either way) |",
+        "| Manifest reference-override flaw (`17.5b:P2-2`, tracked in `F28`) | `F10-C1` (`4.09 ns`) and `F10-C2` (`1.17`) were ubiquitin values left un-overridden on `BMRB:18971` (`WW3*`–`ENaC`); `4.1557 vs 4.09 ns` compares against the wrong protein and is **not** cited as `tau_m` accuracy |",
+        f"| Kay–Torchia–Bax trimmed `R2/R1` `tau_m` by field (`BMRB:18971`) | {ktb_str} |",
         f"| Per-residue `S^2` Spearman `rho` / `RMSE` / median signed bias | `rho = {sm['spearman_rho_s2']:.4f}`, `RMSE = {sm['rmse_s2']:.4f}`, `median_bias = +{sm['median_signed_bias_s2']:.4f}` |",
         f"| `AIC` Model-Free `M1`–`M5` selection counts (`34` residues) | `M1: 0`, `M2: {mc.get('M2', 0)}`, `M3: {mc.get('M3', 0)}`, `M4: {mc.get('M4', 0)}`, `M5: {mc.get('M5', 0)}` (`9` `M3`/`M4` `R_ex` sites; `0` deposited `R_ex` rows in `bmr18971_3.str`) |",
         "",
@@ -424,7 +459,9 @@ def render_f11_section(results_dir: Path) -> str:
     ev = json.loads((results_dir / "f10_f11" / "f11_evaluation.json").read_text(encoding="utf-8"))
     sm = ev["secondary_metrics"]
     diag = sm["pseudo3d_interleaving_and_schedule_diagnosis"]
-    f3_reg = diag["2DN15T2_exp5"]["actual_3ch_f3_registers"]
+    exp5_diag = diag["2DN15T2_exp5"]
+    f3_reg = exp5_diag["actual_3ch_f3_registers"]
+    d20_us = float(exp5_diag["native_d20_sec"]) * 1.0e6
     vc_diag = ev["vclist_loop_timing_diagnostic"]
     vc_rescaled = vc_diag["formula_rescaled_r2_run"]["evaluation"]["secondary_metrics"]
 
@@ -450,7 +487,7 @@ def render_f11_section(results_dir: Path) -> str:
         (
             f"| `2DN15T2_exp5` (`hsqct2etf3gpsi3d`, `vclist` `[1..20]`, native zero-override CPU & Metal GPU) "
             f"| `0` | `{sm['n_matched']['R2']}` | `unit_cycle_sec = {vc_diag['native_unit_cycle_sec']:.6f} s` (`10 us`), `MAE = {sm['mae']['R2']:.2f} s^-1`, CPU–GPU `max_abs_diff = {sm['cpu_gpu_r2_max_abs_diff']:.4f} s^-1` | "
-            f"`extract_bruker_delays` read `D[20] = {f3_reg['note'].split('whereas ')[1]}` while 3-ch `f3` (`15N`) stores `D[21] = {f3_reg['d21_echo_delay_sec']*1e6:.0f} us` & `D[31] = {f3_reg['d31_cpmg_block_header_sec']:.3f} s` (`16..320 ms`); `--delays` on `ser` dir ignored (`relax_cmd.rs:475`) |"
+            f"`extract_bruker_delays` read `D[20] = {d20_us:.0f} us` while 3-ch `f3` (`15N`) stores `D[21] = {f3_reg['d21_echo_delay_sec']*1e6:.0f} us` & `D[31] = {f3_reg['d31_cpmg_block_header_sec']:.3f} s` (`16..320 ms`); `--delays` on `ser` dir ignored (`relax_cmd.rs:475`) |"
         ),
         (
             "| `2DN15T2_exp5` (bound 2-ch `16*D[20]+8*P[4]` formula diagnostic TSV, `tau_block = 0.336 ms`) "
@@ -470,14 +507,14 @@ def render_f13a_f13b_section(results_dir: Path) -> str:
     f13a = json.loads((results_dir / "f13abc" / "f13a_evaluation.json").read_text(encoding="utf-8"))
     f13b = json.loads((results_dir / "f13abc" / "f13b_evaluation.json").read_text(encoding="utf-8"))
 
-    def clean_cell(s: str) -> str:
-        s = re.sub(r"\|([^|\s]+)\|", r"abs(\1)", s)
-        return s.replace("|", "/")
-
-    rows_a = [
-        f"| `{step['role']}` | `{step['accession_id']}` | `{Path(step['file']).name}` | `{step['exit_code']}` | {clean_cell(step['diagnosis'])} |"
-        for step in f13a["fallback_chain_inspected"]
-    ]
+    rows_a = []
+    for step in f13a["fallback_chain_inspected"]:
+        diag_s = clean_cell(step["diagnosis"])
+        if step.get("assessment_method"):
+            diag_s += f" (`assessment_method = {step['assessment_method']}`)"
+        rows_a.append(
+            f"| `{step['role']}` | `{step['accession_id']}` | `{Path(step['file']).name}` | `{step['exit_code']}` | {diag_s} |"
+        )
     rows_b = [
         f"| `{step['role']}` | `{step['accession_id']}` | `{Path(step['file']).name}` | `{step['exit_code']}` | {clean_cell(step['diagnosis'])} |"
         for step in f13b["fallback_chain_inspected"]
@@ -502,26 +539,45 @@ def render_f13a_f13b_section(results_dir: Path) -> str:
 def render_f13c_section(results_dir: Path) -> str:
     ev = json.loads((results_dir / "f13abc" / "f13c_evaluation.json").read_text(encoding="utf-8"))
     sm = ev["secondary_metrics"]
-    ci_lo, ci_hi = sm["global_kd_ci95_um"]
+    prim_nmr = sm["primary_zenodo_17228160_blind_nmr_report_only"]
+    bkp_nmr = sm["backup_1_zenodo_7892349_report_only"]
+    ci_lo, ci_hi = prim_nmr["global_kd_ci95_um"]
 
-    crit_rows = [
-        f"| `{c['id']}` | `{c['metric']}` | `{fmt_num(c['value'], 5)}` | `{c['operator']} {fmt_num(c['threshold'], 3)}` | **`{'PASS' if c['passed'] else 'FAIL'}`** |"
-        for c in ev["criteria_results"]
+    ph_path = results_dir / "f13abc" / "posthoc_zenodo17228160_mst_curve_diagnostic.json"
+    ph = json.loads(ph_path.read_text(encoding="utf-8"))
+    mo = ph["mo_affinity_100pt_curve_backsolve"]
+    sf = ph["suppfig3bc_wt_fits_curve_backsolve"]
+    disc = ph["disclosures_17_5e_p1_1_and_p1_2"]
+
+    chain_rows = [
+        f"| `{step['role']}` | `{step['accession_id']}` | `{Path(step['file']).name}` | `{step['exit_code']}` | {clean_cell(step['diagnosis'])} |"
+        for step in ev["fallback_chain_inspected"]
     ]
 
     lines = [
-        "#### Gate `F13c` (`TODO.md:136`) — 2D `HSQC` Ligand Titration `CSP` & Quadratic $K_d$ (`ZENODO:17228160` `tau1-243 + DnaJB1`, **`PASS`**, `2/2` Criteria)",
+        f"#### Gate `F13c` (`TODO.md:136`) — 2D `HSQC` Ligand Titration `CSP` & Quadratic $K_d$ (`{ev['accession_id']}`, **`{ev['verdict']}`** Across All `3` Pre-Registered Accessions)",
         "",
-        "| Criterion ID | Metric | Measured (`ZENODO:17228160`) | Threshold | Verdict |",
-        "| :--- | :--- | ---: | :--- | :---: |",
-        *crit_rows,
+        "| Chain Step | Accession | Inspected Archive | Frozen `bbc770a` Extractor Exit | Blind Archive Completeness & `17.5e:P1-1`/`P1-2` Diagnosis |",
+        "| :--- | :--- | :--- | ---: | :--- |",
+        *chain_rows,
         "",
-        "| Secondary Report-Only Metric (`ZENODO:17228160` & `BMRBIG:138`) | Measured Value |",
+        "| Secondary / Post-Hoc Report-Only Diagnostic (`Excluded from Gate Verdict`) | Measured Value & Explicit Provenance Disclosure |",
         "| :--- | :--- |",
-        f"| Global `VarPro` quadratic `1:1` $K_d$ (`400` MC trials, `95% CI`) | `{sm['global_kd_um']:.2f} uM` (`95% CI`: `[{ci_lo:.2f}, {ci_hi:.2f}] uM`; `ci95_covers_kd_ref = {sm['ci95_covers_kd_ref']}`; naive Michaelis–Menten `{sm['global_naive_mm_kd_um']:.2f} uM`) |",
-        f"| Reference $K_d$ (`MST.tar.xz` `C_target = 100 nM` quadratic fit & `Source_Data.xlsx :: SuppFig3BC`) | `226.83 uM` (`fold = {sm['kd_fold_ratio']:.3f}x`, `0.27732 <= 0.40` dex) & `221.05 uM` (`0.26613 <= 0.40` dex); `abs(ddG)` = `{sm['abs_delta_delta_g_278_35K_kcal_mol']:.3f} kcal/mol` (`278.35 K`) / `{sm['abs_delta_delta_g_298_15K_kcal_mol']:.3f} kcal/mol` (`298.15 K`) |",
-        f"| Unassigned `nmrassign pick --hsqc` + Hungarian `9`-step trajectory tracking | `{sm['n_apo_peaks_picked']}` apo peaks picked (`BMRB:53960` untouched); `{100.0*sm['hungarian_non_apo_step_tracking_completion_rate']:.2f}%` non-apo step tracking (`{100.0*sm['hungarian_intermediate_exchange_slack_abstention_rate']:.2f}%` intermediate-exchange slack abstention); `{sm['n_trajectories_complete_all_9_steps']}/{sm['n_apo_peaks_picked']}` (`{100.0*sm['full_trajectory_9_step_completion_rate']:.2f}%`) complete all `9` steps (`{sm['n_pocket_trajectories_complete_all_9_steps']}` in `2-sigma` pocket `>= {sm['williamson_2sigma_threshold_ppm']:.4f} ppm`) |",
-        f"| Co-primary `BMRBIG:138` (`eIF4E S209D + C1L`, report-only) | `{sm['co_primary_bmrbig138_report_only']['status']}`: microliter additions (`10..170 uL`) without `C1L` stock molarity or initial sample volume |",
+        (
+            f"| Blind unassigned `nmrassign pick --hsqc` + `nmrassign csp` on `ZENODO:17228160` (`{prim_nmr['construct_nmr']}`) | "
+            f"`{prim_nmr['n_apo_peaks_picked']}` apo crosspeaks picked (`BMRB:53960` untouched); `{prim_nmr['n_pocket_residues']}` `2-sigma` pocket crosspeaks (`>= {prim_nmr['williamson_2sigma_threshold_ppm']:.4f} ppm`); "
+            f"`{100.0*prim_nmr['hungarian_non_apo_step_tracking_completion_rate']:.2f}%` non-apo Hungarian tracking (`{prim_nmr['n_trajectories_complete_all_9_steps']}/{prim_nmr['n_apo_peaks_picked']}` complete all `9` steps); "
+            f"global `VarPro` quadratic `1:1` $K_d = {prim_nmr['global_kd_um']:.2f}\\text{{ \\mu M}}$ (`95% MC CI`: `[{ci_lo:.2f}, {ci_hi:.2f}] uM`; naive MM `{prim_nmr['global_naive_mm_kd_um']:.2f} uM`; `reference_kd_status = UNAVAILABLE_UNDER_FROZEN_EXTRACTOR`) |"
+        ),
+        (
+            f"| Blind unassigned `nmrassign pick --hsqc` + `nmrassign csp` on `backup_1` `ZENODO:7892349` (`40 uM NS5A-D2D3` + `0, 160, 320 uM` `5-FI`) | "
+            f"`{bkp_nmr['n_apo_peaks_picked']}` apo crosspeaks picked across `{bkp_nmr['n_hsqc_titration_steps_in_archive']}` deposited `.ft2` spectra; `nmrassign csp` exits `rc = {bkp_nmr['manual_filename_bound_csp_cli_exit_code']}` (`{bkp_nmr['manual_filename_bound_csp_cli_stderr']}`) |"
+        ),
+        (
+            "| Post-hoc construct-mismatched curve audit (`scripts/posthoc_diagnostics/posthoc_zenodo17228160_mst_curve_diagnostic.py`, `excluded_from_gate_verdict = true`) | "
+            f"`{ph['diagnostic_classification']}`: `MST/B1_labeled_WT_tau_titrated.dat` `100`-pt curve back-solve = `{mo['kd_um']:.2f} uM` (`max_abs_err = {mo['max_abs_err']:.3e}`) and `SuppFig3BC` `Fits` curve back-solve = `{sf['kd_um']:.2f} uM` (`max_abs_err = {sf['max_abs_err']:.3e}`), "
+            f"both titrating `{disc['mst_titrated_construct']}` up to `max [tau] = {disc['max_experimental_mst_tau_um']:.1f} uM` (`is_extrapolated_above_max_titration_point = {disc['is_extrapolated_above_max_titration_point']}`) — **neither is a deposited scalar or a matched-construct `tau1-243` reference** |"
+        ),
     ]
     return "\n".join(lines)
 
