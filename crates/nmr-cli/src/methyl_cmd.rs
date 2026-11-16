@@ -159,12 +159,12 @@ pub fn format_methyl_summary(
     )
 }
 
-/// Execute `nmrassign methyl` from command-line arguments (excluding `argv[0]` and subcommand token).
+/// Execute `ferric methyl` from command-line arguments (excluding `argv[0]` and subcommand token).
 pub fn run_methyl_cli(args: &[String]) -> Result<(), String> {
     run_methyl_cli_with_gpu_init(args, GpuEngine::new_headless).map(|_| ())
 }
 
-/// Execute `nmrassign methyl` with an injectable WebGPU initializer (used to unit-test headless
+/// Execute `ferric methyl` with an injectable WebGPU initializer (used to unit-test headless
 /// CPU fallback when no GPU adapter is available). Returns any emitted fallback warning string.
 pub fn run_methyl_cli_with_gpu_init<F>(
     args: &[String],

@@ -176,7 +176,7 @@ Notes:
 "
 }
 
-/// Execute `nmrassign mcp`.
+/// Execute `ferric mcp`.
 pub fn run_mcp_cli(args: &[String]) -> Result<(), String> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{}", mcp_usage());

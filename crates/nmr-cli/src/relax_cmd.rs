@@ -1067,7 +1067,7 @@ fn ingest_rate_tsv_file(
             continue;
         }
 
-        // Single-observable `nmrassign relax` TSV (`value`/`rate`, `sigma`)
+        // Single-observable `ferric relax` TSV (`value`/`rate`, `sigma`)
         let val = get_f64("value")
             .or_else(|| get_f64("rate"))
             .or_else(|| get_f64("noe"))

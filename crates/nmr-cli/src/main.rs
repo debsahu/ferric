@@ -9091,7 +9091,7 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         write_synthetic_bruker_hsqc_2d(&hsqc_fid, &peaks_hn);
         write_synthetic_bruker_hnco_3d(&hnco_fid, &peaks_hnc);
 
-        // 1. `nmrassign process` 2D -> `.ft2` + `processing_recipe.json` + `--recipe` replay into `pdata`
+        // 1. `ferric process` 2D -> `.ft2` + `processing_recipe.json` + `--recipe` replay into `pdata`
         let out_2d_dir = dir.join("proc_2d");
         fs::create_dir_all(&out_2d_dir).unwrap();
         let ft2_path = out_2d_dir.join("hsqc.ft2");
@@ -9120,7 +9120,7 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         assert!(pdata_2d_dir.join("2rr").exists());
         assert!(pdata_2d_dir.join("processing_recipe.json").exists());
 
-        // 2. `nmrassign process` 3D -> `.ft3` + `processing_recipe.json`
+        // 2. `ferric process` 3D -> `.ft3` + `processing_recipe.json`
         let out_3d_dir = dir.join("proc_3d");
         fs::create_dir_all(&out_3d_dir).unwrap();
         let ft3_path = out_3d_dir.join("hnco.ft3");
@@ -9134,7 +9134,7 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         assert!(ft3_path.exists());
         assert!(out_3d_dir.join("processing_recipe.json").exists());
 
-        // 3. `nmrassign pick --fid <single_2d_dir>` and `nmrassign pick --fid <bundle_dir>`
+        // 3. `ferric pick --fid <single_2d_dir>` and `ferric pick --fid <bundle_dir>`
         let picked_2d_tsv = dir.join("picked_2d.tsv");
         cmd_pick(&[
             "--fid".into(),
@@ -9174,7 +9174,7 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         assert!(pks_bundle.iter().any(|p| p.exp == "HSQC"));
         assert!(pks_bundle.iter().any(|p| p.exp == "HNCO"));
 
-        // 4. `nmrassign pipeline --fid-hsqc ... --fid-triple HNCO=...` AND `nmrassign pipeline --fid <bundle>`
+        // 4. `ferric pipeline --fid-hsqc ... --fid-triple HNCO=...` AND `ferric pipeline --fid <bundle>`
         let out_pipe_explicit = dir.join("pipe_explicit");
         cmd_pipeline(&[
             "--seq".into(),
@@ -9381,7 +9381,7 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         let unphased_hsqc = dir.join("unphased_hsqc");
         write_synthetic_unphased_bruker_hsqc_2d(&unphased_hsqc, &peaks_hn, 68.0, -34.0);
 
-        // 1. `nmrassign process --auto-phase --hilbert --nus-method fista`
+        // 1. `ferric process --auto-phase --hilbert --nus-method fista`
         let auto_dir = dir.join("proc_auto");
         fs::create_dir_all(&auto_dir).unwrap();
         let auto_ft2 = auto_dir.join("hsqc_auto.ft2");
@@ -9458,7 +9458,7 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
             "expected --phase-z on a 2D FID to return an error"
         );
 
-        // 3. End-to-end two-pass corroborated 3D re-picking via `nmrassign pick --auto-phase`:
+        // 3. End-to-end two-pass corroborated 3D re-picking via `ferric pick --auto-phase`:
         //    First pick 2D roots via `cmd_pick --fid <unphased_hsqc> --auto-phase` so the 3D cubes
         //    share the exact root coordinates produced by `cmd_pick --auto-phase`.
         let roots_tsv = dir.join("roots_2d.tsv");

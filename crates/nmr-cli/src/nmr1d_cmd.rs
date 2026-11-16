@@ -78,7 +78,7 @@ pub fn nmr1d_usage() -> &'static str {
      \x20                           [--replicates-json <tubes.json>] [--out <qnmr.tsv>] [--json-out <qnmr.json>]\n"
 }
 
-/// Top-level dispatcher for `nmrassign nmr1d <subcommand>`.
+/// Top-level dispatcher for `ferric nmr1d <subcommand>`.
 pub fn run_nmr1d_cli(args: &[String]) -> Result<(), String> {
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         print!("{}", nmr1d_usage());
@@ -227,7 +227,7 @@ fn parse_pivot(spec: &str) -> Result<Pivot1D, String> {
 }
 
 // ============================================================================
-// Subcommand 1: `nmrassign nmr1d process`
+// Subcommand 1: `ferric nmr1d process`
 // ============================================================================
 
 /// Owned JSON-serializable laboratory trace-impurity match (Fulmer et al. 2010).
@@ -243,7 +243,7 @@ pub struct CliImpurityMatch {
     pub delta_ppm: f64,
 }
 
-/// Structured JSON summary emitted by `nmrassign nmr1d process --json-out`.
+/// Structured JSON summary emitted by `ferric nmr1d process --json-out`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Process1dCliReport {
     pub name: String,
@@ -879,10 +879,10 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
 }
 
 // ============================================================================
-// Subcommand 2: `nmrassign nmr1d multiplet`
+// Subcommand 2: `ferric nmr1d multiplet`
 // ============================================================================
 
-/// Structured JSON output of `nmrassign nmr1d multiplet --json-out`.
+/// Structured JSON output of `ferric nmr1d multiplet --json-out`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultipletCliReport {
     pub spectrum_name: String,
@@ -1422,10 +1422,10 @@ fn run_nmr1d_multiplet(args: &[String]) -> Result<(), String> {
 }
 
 // ============================================================================
-// Subcommand 3: `nmrassign nmr1d qnmr`
+// Subcommand 3: `ferric nmr1d qnmr`
 // ============================================================================
 
-/// Multi-tube replicate schema accepted by `nmrassign nmr1d qnmr --replicates-json`.
+/// Multi-tube replicate schema accepted by `ferric nmr1d qnmr --replicates-json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QnmrReplicateTubeInput {
     pub analyte: QnmrAnalyteSpec,

@@ -32,7 +32,7 @@ body:
     attributes:
       label: ferric Version & Git Commit
       description: Output of `ferric --version` (or release tag)
-      placeholder: "ferric 0.14.0"
+      placeholder: "ferric 0.15.0"
     validations:
       required: true
 

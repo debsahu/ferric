@@ -230,7 +230,7 @@ fn now_utc_iso8601() -> String {
 }
 
 // ============================================================================
-// Rate-Limited Curl Client (`User-Agent: nmrassign-fetch`, `<= 1 req/s`)
+// Rate-Limited Curl Client (`User-Agent: ferric-fetch`, `<= 1 req/s`)
 // ============================================================================
 
 pub struct RateLimitedCurl {
@@ -256,7 +256,7 @@ impl RateLimitedCurl {
         self.last_request = Some(Instant::now());
     }
 
-    /// Fetch text/bytes from `url` using `curl -fsSL -A nmrassign-fetch`.
+    /// Fetch text/bytes from `url` using `curl -fsSL -A ferric-fetch`.
     pub fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>, String> {
         self.throttle();
         let out = Command::new("curl")
@@ -274,7 +274,7 @@ impl RateLimitedCurl {
         Ok(out.stdout)
     }
 
-    /// Query HTTP `HEAD` (`curl -fsSLI -A nmrassign-fetch`) and return optional `Content-Length`.
+    /// Query HTTP `HEAD` (`curl -fsSLI -A ferric-fetch`) and return optional `Content-Length`.
     pub fn head_content_length(&mut self, url: &str) -> Result<Option<u64>, String> {
         if let Some(local_path) = url.strip_prefix("file://") {
             let p = Path::new(local_path);
@@ -299,7 +299,7 @@ impl RateLimitedCurl {
         Ok(parse_last_content_length(&headers))
     }
 
-    /// Fetch up to the first `max_bytes` of `url` (`curl -fsSL -A nmrassign-fetch -r 0-<end>`)
+    /// Fetch up to the first `max_bytes` of `url` (`curl -fsSL -A ferric-fetch -r 0-<end>`)
     /// to inspect POSIX `ustar` 512-byte header blocks prior to downloading multi-hundred-MiB `.tar` files.
     pub fn get_prefix_bytes(&mut self, url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
         let cap = max_bytes.max(512);
@@ -341,7 +341,7 @@ impl RateLimitedCurl {
         Ok(bytes)
     }
 
-    /// Stream `url` directly to `dest_file` via `curl -fsSL -A nmrassign-fetch --max-filesize <limit> -o <dest>`.
+    /// Stream `url` directly to `dest_file` via `curl -fsSL -A ferric-fetch --max-filesize <limit> -o <dest>`.
     pub fn download_to_file(
         &mut self,
         url: &str,
