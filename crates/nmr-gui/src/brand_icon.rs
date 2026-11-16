@@ -1,7 +1,8 @@
 //! Deterministic 64x64 RGBA8 window icon loader for `ferric-gui` (Concept A: `FID-F` squircle).
 //!
 //! Provenance: Original clean-room brand asset (MIT/Apache-2.0) embedded directly from
-//! `docs/assets/brand/ferric-icon-64.rgba`, which is generated deterministically from
+//! `crates/nmr-gui/assets/ferric-icon-64.rgba` (byte-identical to
+//! `docs/assets/brand/ferric-icon-64.rgba`), which is generated deterministically from
 //! `scripts/package_release.py::render_icon_scanlines(64)` via `scripts/render_ferric_brand.py`
 //! so the desktop window icon, macOS `.icns`, Windows `.ico`, and Linux hicolor PNGs share a
 //! single pixel-identical source of truth.
@@ -14,7 +15,7 @@ pub const ICON_WIDTH: u32 = 64;
 pub const ICON_HEIGHT: u32 = 64;
 
 /// Single-source-of-truth 64x64 RGBA8 pixels emitted by `scripts/render_ferric_brand.py`.
-const ICON_64_RGBA: &[u8] = include_bytes!("../../../docs/assets/brand/ferric-icon-64.rgba");
+const ICON_64_RGBA: &[u8] = include_bytes!("../assets/ferric-icon-64.rgba");
 
 /// Builds the deterministic 64x64 RGBA8 `FERRIC` window icon (`Concept A: FID-F`).
 pub fn build_ferric_window_icon() -> egui::IconData {
@@ -69,6 +70,16 @@ mod tests {
         assert!(
             pixels.contains(&[0, 0, 0, 0]),
             "expected transparent squircle corner pixels"
+        );
+    }
+
+    #[test]
+    fn ferric_in_crate_icon_matches_docs_brand_asset_byte_for_byte() {
+        let docs_bytes = include_bytes!("../../../docs/assets/brand/ferric-icon-64.rgba");
+        assert_eq!(ICON_64_RGBA.len(), 16_384);
+        assert_eq!(
+            ICON_64_RGBA, docs_bytes,
+            "crates/nmr-gui/assets/ferric-icon-64.rgba must be byte-identical to docs/assets/brand/ferric-icon-64.rgba"
         );
     }
 }

@@ -9,6 +9,8 @@
 pub mod dosy_cmd;
 pub mod exchange_cmd;
 pub mod export_fig_cmd;
+pub mod export_tour_chem;
+pub mod export_tour_cmd;
 pub mod mcp_cmd;
 pub mod metabolomics_cmd;
 pub mod methyl_cmd;
@@ -235,6 +237,7 @@ fn usage() -> String {
        ferric dosy            fit|ilt|mw [--in <decay.tsv|json> | --exp-dir <bruker_or_varian_dir> | --demo] [--engine cpu|gpu|auto] [--criterion bic|aic] [--max-components 3] [-o <out.tsv|json>]\n\
        ferric metabolomics    bin|pca|oplsda|stocsy [--in <study.json|buckets.csv> | --cohort <json> | --manifest <tsv> | --demo] [-o <out>]\n\
        ferric export-fig      --out-dir <dir> [--panel all|hsqc|strips|pdb-s2|nmr1d-stack|dosy|metabolomics|exchange|octet]\n\
+       ferric export-tour     --out-dir <dir> [--module all|01..08|<slug>] [--render-videos] [--keyframes-only] [--width 1280] [--height 720] [--fps 30]\n\
        ferric chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}}>] [--solvent CDCl3] [--mhz 400]\n",
         version_string()
     )
@@ -8363,6 +8366,11 @@ fn main() {
         "dosy" => dosy_cmd::run_dosy_cli(&args[1..]),
         "metabolomics" | "metab" => metabolomics_cmd::run_metabolomics_cli(&args[1..]),
         "export-fig" => export_fig_cmd::run_export_fig_cli(&args[1..]),
+        "export-tour" => export_tour_cmd::run_export_tour_cli_with_chem(
+            &args[1..],
+            Some(export_tour_chem::build_chem_tour_bundle_with_seed),
+            Some(export_tour_chem::render_chem_tour_frame),
+        ),
         "chem" => cmd_chem(&args[1..]),
         other => Err(format!("unknown subcommand {other:?}\n\n{}", usage())),
     };
