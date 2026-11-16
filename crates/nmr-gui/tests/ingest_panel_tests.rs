@@ -322,3 +322,47 @@ fn test_wasm_compatible_tar_and_targz_bundle_byte_ingestion() {
         .iter()
         .any(|e| e.pulse_class == PulseSequenceClass::Hncacb && e.nus.is_nus));
 }
+
+#[test]
+fn test_1d_only_folder_routes_to_spectra1d_and_bare_1r_gives_actionable_error() {
+    let si = 64usize;
+    let procs = format!(
+        "##TITLE= test\n##$SI= {si}\n##$OFFSET= 10.0\n##$SW_p= 5000.0\n##$SF= 500.0\n##$NC_proc= 0\n##$BYTORDP= 0\n##$DTYPP= 0\n##$AXNUC= <1H>\n##END=\n"
+    );
+    let acqus = "##TITLE= acqus\n##$PULPROG= <zg30>\n##$NUC1= <1H>\n##END=\n";
+    let mut bytes_1r = Vec::with_capacity(si * 4);
+    for i in 0..si {
+        let v: i32 = if i == 20 { 100_000 } else { 50 };
+        bytes_1r.extend_from_slice(&v.to_le_bytes());
+    }
+
+    // 1. Multi-expno 1D Bruker folder -> IngestDropOutcome::Spectra1D directly
+    let payloads_1d = vec![
+        DroppedPayload::new("study/1/acqus", acqus.as_bytes().to_vec()),
+        DroppedPayload::new("study/1/pdata/1/procs", procs.as_bytes().to_vec()),
+        DroppedPayload::new("study/1/pdata/1/1r", bytes_1r.clone()),
+        DroppedPayload::new("study/2/acqus", acqus.as_bytes().to_vec()),
+        DroppedPayload::new("study/2/pdata/1/procs", procs.as_bytes().to_vec()),
+        DroppedPayload::new("study/2/pdata/1/1r", bytes_1r.clone()),
+    ];
+    let out_1d = ingest_dropped_payloads(&payloads_1d).expect("1D multi-expno folder");
+    match out_1d {
+        IngestDropOutcome::Spectra1D {
+            source_name,
+            spectra,
+        } => {
+            assert_eq!(source_name, "study");
+            assert_eq!(spectra.len(), 2);
+            assert_eq!(spectra[0].len(), si);
+        }
+        other => panic!("expected Spectra1D for 1D-only folder, got {other:?}"),
+    }
+
+    // 2. Bare `1r` without `procs` -> friendly actionable error instead of empty 0-experiment matrix
+    let bare_err = ingest_dropped_payloads(&[DroppedPayload::new("1r", bytes_1r)])
+        .expect_err("bare 1r must surface actionable guidance");
+    assert!(
+        bare_err.contains("requires its sibling 'procs'"),
+        "{bare_err}"
+    );
+}

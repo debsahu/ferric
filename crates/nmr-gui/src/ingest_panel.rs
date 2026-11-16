@@ -15,6 +15,7 @@
 //! - Gutmanas, A., et al. (*Nat. Struct. Mol. Biol.* 2015, 22, 433–434) — NMR Exchange Format
 //!   (`NEF v1.1`) session and shift/peak interchange.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 #[cfg(target_arch = "wasm32")]
 use std::pin::Pin;
@@ -24,13 +25,321 @@ use eframe::egui;
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_core::classify::classify_nmr_workspace;
 use nmr_core::classify::{
-    classify_nmr_entries, extract_archive_virtual_entries, ClassifiedExperiment, DataState,
-    ExperimentDimensionality, ProblemRegime, PulseSequenceClass, VirtualEntry, WorkspaceInventory,
+    classify_nmr_entries, extract_archive_full_entries_bounded, extract_archive_virtual_entries,
+    is_zip_magic, is_zip_path_lower, ClassifiedExperiment, DataState, ExperimentDimensionality,
+    ProblemRegime, PulseSequenceClass, VirtualEntry, WorkspaceInventory,
 };
 use nmr_core::nef::read_nef_str;
+use nmr_core::nmr1d::{load_1d_from_virtual_entries, prepare_loaded_1d_for_studio, Spectrum1D};
 use nmr_core::nmrstar::read_star_str;
 use nmr_core::priors::{one_to_three, three_to_one};
 use nmr_core::session::read_session_nef_str;
+
+#[cfg(target_arch = "wasm32")]
+mod wasm_folder_bridge {
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen(inline_js = r#"
+const STATE = {
+  installed: false,
+  batches: [],
+  errors: [],
+};
+const MAX_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_TOTAL_BYTES = 256 * 1024 * 1024;
+
+function readFileEntry(fileEntry, relPath, acc) {
+  return new Promise((resolve) => {
+    fileEntry.file(
+      async (file) => {
+        try {
+          if (file.size > MAX_FILE_BYTES) {
+            STATE.errors.push(`Skipped '${relPath}' (${(file.size / 1048576).toFixed(1)} MiB exceeds 64 MiB per-file browser cap).`);
+            resolve();
+            return;
+          }
+          if (acc.totalBytes + file.size > MAX_TOTAL_BYTES) {
+            acc.capped = true;
+            resolve();
+            return;
+          }
+          const buf = await file.arrayBuffer();
+          acc.totalBytes += buf.byteLength;
+          acc.files.push([relPath, new Uint8Array(buf)]);
+        } catch (err) {
+          STATE.errors.push(`Failed reading '${relPath}': ${err}`);
+        }
+        resolve();
+      },
+      (err) => {
+        STATE.errors.push(`Browser file entry error on '${relPath}': ${err}`);
+        resolve();
+      }
+    );
+  });
+}
+
+function readAllDirEntries(reader) {
+  return new Promise((resolve, reject) => {
+    const all = [];
+    function step() {
+      reader.readEntries(
+        (batch) => {
+          if (!batch || batch.length === 0) {
+            resolve(all);
+          } else {
+            for (let i = 0; i < batch.length; i++) all.push(batch[i]);
+            step();
+          }
+        },
+        (err) => reject(err)
+      );
+    }
+    step();
+  });
+}
+
+async function walkEntry(entry, prefix, acc) {
+  if (!entry || acc.capped) return;
+  const name = entry.name || "";
+  if (name === ".git" || name === "__MACOSX" || name === ".DS_Store" || name.startsWith("._")) {
+    return;
+  }
+  const rel = prefix ? `${prefix}/${name}` : name;
+  if (entry.isFile) {
+    await readFileEntry(entry, rel, acc);
+  } else if (entry.isDirectory) {
+    try {
+      const reader = entry.createReader();
+      const children = await readAllDirEntries(reader);
+      for (let i = 0; i < children.length; i++) {
+        await walkEntry(children[i], rel, acc);
+      }
+    } catch (err) {
+      STATE.errors.push(`Failed reading directory '${rel}': ${err}`);
+    }
+  }
+}
+
+async function ingestFileList(fileList) {
+  const acc = { files: [], totalBytes: 0, capped: false };
+  for (let i = 0; i < fileList.length; i++) {
+    const f = fileList[i];
+    const rel = (f.webkitRelativePath && f.webkitRelativePath.length > 0) ? f.webkitRelativePath : f.name;
+    if (!rel || rel.includes("__MACOSX") || rel.endsWith(".DS_Store")) continue;
+    if (f.size > MAX_FILE_BYTES) {
+      STATE.errors.push(`Skipped '${rel}' (> 64 MiB browser per-file limit).`);
+      continue;
+    }
+    if (acc.totalBytes + f.size > MAX_TOTAL_BYTES) {
+      acc.capped = true;
+      break;
+    }
+    try {
+      const buf = await f.arrayBuffer();
+      acc.totalBytes += buf.byteLength;
+      acc.files.push([rel, new Uint8Array(buf)]);
+    } catch (err) {
+      STATE.errors.push(`Failed reading '${rel}': ${err}`);
+    }
+  }
+  if (acc.capped) {
+    STATE.errors.push("Reached 256 MiB browser drop memory cap; some trailing files were omitted.");
+  }
+  if (acc.files.length > 0) {
+    STATE.batches.push(acc.files);
+  }
+}
+
+export function js_install_folder_drop_listener() {
+  if (STATE.installed || typeof window === "undefined") return;
+  STATE.installed = true;
+
+  window.addEventListener(
+    "dragover",
+    (ev) => {
+      if (ev.dataTransfer) {
+        ev.preventDefault();
+      }
+    },
+    true
+  );
+
+  window.addEventListener(
+    "drop",
+    (ev) => {
+      if (!ev.dataTransfer || !ev.dataTransfer.items) return;
+      const items = ev.dataTransfer.items;
+      const entries = [];
+      let hasDir = false;
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (it.kind === "file" && typeof it.webkitGetAsEntry === "function") {
+          const entry = it.webkitGetAsEntry();
+          if (entry) {
+            if (entry.isDirectory) hasDir = true;
+            entries.push(entry);
+          }
+        }
+      }
+      if (!hasDir) return;
+
+      // Intercept directory drop BEFORE winit's FileReader throws NotFoundError on a directory!
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (typeof ev.stopImmediatePropagation === "function") {
+        ev.stopImmediatePropagation();
+      }
+
+      (async () => {
+        const acc = { files: [], totalBytes: 0, capped: false };
+        for (let i = 0; i < entries.length; i++) {
+          await walkEntry(entries[i], "", acc);
+        }
+        if (acc.capped) {
+          STATE.errors.push("Reached 256 MiB browser folder memory cap; some trailing files were omitted.");
+        }
+        if (acc.files.length > 0) {
+          STATE.batches.push(acc.files);
+        } else if (STATE.errors.length === 0) {
+          STATE.errors.push("Dropped folder contained no readable NMR files.");
+        }
+      })();
+    },
+    true
+  );
+}
+
+export function js_open_folder_picker() {
+  if (typeof document === "undefined") return;
+  const input = document.createElement("input");
+  input.type = "file";
+  input.multiple = true;
+  input.setAttribute("webkitdirectory", "");
+  input.setAttribute("directory", "");
+  input.style.display = "none";
+  input.addEventListener("change", async () => {
+    if (input.files && input.files.length > 0) {
+      await ingestFileList(input.files);
+    }
+    input.remove();
+  });
+  document.body.appendChild(input);
+  input.click();
+}
+
+export function js_open_files_picker() {
+  if (typeof document === "undefined") return;
+  const input = document.createElement("input");
+  input.type = "file";
+  input.multiple = true;
+  input.style.display = "none";
+  input.addEventListener("change", async () => {
+    if (input.files && input.files.length > 0) {
+      await ingestFileList(input.files);
+    }
+    input.remove();
+  });
+  document.body.appendChild(input);
+  input.click();
+}
+
+export function js_has_pending_batch() {
+  return STATE.batches.length > 0;
+}
+
+export function js_pop_batch_len() {
+  if (STATE.batches.length === 0) return 0;
+  STATE.active = STATE.batches.shift();
+  return STATE.active.length;
+}
+
+export function js_active_item_path(idx) {
+  return STATE.active && STATE.active[idx] ? STATE.active[idx][0] : "";
+}
+
+export function js_active_item_bytes(idx) {
+  return STATE.active && STATE.active[idx] ? STATE.active[idx][1] : new Uint8Array(0);
+}
+
+export function js_clear_active_batch() {
+  STATE.active = null;
+}
+
+export function js_pop_error() {
+  return STATE.errors.length > 0 ? STATE.errors.shift() : "";
+}
+"#)]
+    extern "C" {
+        pub fn js_install_folder_drop_listener();
+        pub fn js_open_folder_picker();
+        pub fn js_open_files_picker();
+        pub fn js_has_pending_batch() -> bool;
+        pub fn js_pop_batch_len() -> usize;
+        pub fn js_active_item_path(idx: usize) -> String;
+        pub fn js_active_item_bytes(idx: usize) -> Vec<u8>;
+        pub fn js_clear_active_batch();
+        pub fn js_pop_error() -> String;
+    }
+}
+
+/// Install the capture-phase browser directory drop listener (`wasm32` only; no-op on native).
+pub fn install_browser_folder_drop_hook() {
+    #[cfg(target_arch = "wasm32")]
+    wasm_folder_bridge::js_install_folder_drop_listener();
+}
+
+/// Open a browser `<input webkitdirectory>` Bruker/spectrometer folder picker (`wasm32` only).
+pub fn trigger_browser_folder_picker() {
+    #[cfg(target_arch = "wasm32")]
+    wasm_folder_bridge::js_open_folder_picker();
+}
+
+/// Open a browser `<input type="file" multiple>` multi-file picker (`wasm32` only).
+pub fn trigger_browser_files_picker() {
+    #[cfg(target_arch = "wasm32")]
+    wasm_folder_bridge::js_open_files_picker();
+}
+
+/// Poll any completed browser folder/picker batch of [`DroppedPayload`] items (`wasm32` only).
+pub fn poll_browser_dropped_payloads() -> Option<Vec<DroppedPayload>> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if !wasm_folder_bridge::js_has_pending_batch() {
+            return None;
+        }
+        let n = wasm_folder_bridge::js_pop_batch_len();
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let path = wasm_folder_bridge::js_active_item_path(i);
+            let bytes = wasm_folder_bridge::js_active_item_bytes(i);
+            out.push(DroppedPayload::new(path, bytes));
+        }
+        wasm_folder_bridge::js_clear_active_batch();
+        Some(out)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
+/// Poll any asynchronous browser directory/file reader warning or error (`wasm32` only).
+pub fn poll_browser_drop_error() -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let s = wasm_folder_bridge::js_pop_error();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
 
 /// Ordered catalog of all 25 [`PulseSequenceClass`] options exposed in the per-row override dropdown.
 pub const ALL_PULSE_CLASSES: &[PulseSequenceClass] = &[
@@ -271,17 +580,21 @@ pub struct IngestExecutionPlan {
     pub problem_regime: ProblemRegime,
     pub sequence_three_letter: Vec<String>,
     pub selected_experiments: Vec<SelectedExperimentSpec>,
+    /// Retained normalized `(rel_path, bytes)` map for in-memory / browser `wasm32` 1D/2D/3D loading.
+    pub in_memory_files: Arc<BTreeMap<String, Vec<u8>>>,
 }
 
 /// User action emitted by [`IngestPanelState::show`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum IngestAction {
-    /// Re-scan a folder or `.tar` / `.tar.gz` path typed into the path bar (native desktop).
+    /// Re-scan a folder or `.zip` / `.tar` / `.tar.gz` path typed into the path bar (native desktop).
     ScanNativePath(String),
     /// Load selected spectra + sequence into the workbench without running automated solving.
     LoadSelectedSpectra(IngestExecutionPlan),
     /// One-click pipeline: load/process selected experiments, corroborated 2D/3D pick, QC, and solve.
     ProcessPickAndRun(IngestExecutionPlan),
+    /// Open checked 1D rows directly inside `1D Array Studio` (`stack1d_panel`).
+    OpenSelected1dInStudio(IngestExecutionPlan),
 }
 
 /// Result of inspecting one or more dropped files/folders/archives.
@@ -294,7 +607,12 @@ pub enum IngestDropOutcome {
     },
     /// A single standalone `.str` or `.tsv` text table was dropped.
     TextTable { source_name: String, text: String },
-    /// A spectrometer folder, `.tar`/`.tar.gz` archive, or spectrum set was classified for the Ingest Matrix.
+    /// One or more 1D NMR spectra (`Bruker fid/1r`, `.jdx`, `.json`, `.tsv`, or 1D folder/archive) ready for `1D Array Studio`.
+    Spectra1D {
+        source_name: String,
+        spectra: Vec<Spectrum1D>,
+    },
+    /// A spectrometer folder, `.zip`/`.tar`/`.tar.gz` archive, or 2D/3D spectrum set was classified for the Ingest Matrix.
     Workspace(Box<IngestPanelState>),
 }
 
@@ -313,6 +631,8 @@ pub struct IngestPanelState {
     pub user_overridden: Vec<bool>,
     /// Optional native filesystem path per row when classified from disk.
     pub row_resolved_paths: Vec<Option<PathBuf>>,
+    /// Retained normalized `(rel_path, bytes)` map for browser `wasm32` / archive 1D/2D/3D loading.
+    pub in_memory_files: Arc<BTreeMap<String, Vec<u8>>>,
     /// Editable polymer sequence box (1-letter FASTA or 3-letter residue codes).
     pub sequence_text: String,
     /// Provenance note when `sequence_text` was auto-populated from `.fasta`/`.str`/`.nef`.
@@ -359,6 +679,7 @@ impl IngestPanelState {
             effective_classes,
             user_overridden: vec![false; n],
             row_resolved_paths: vec![None; n],
+            in_memory_files: Arc::new(BTreeMap::new()),
             sequence_text: String::new(),
             sequence_source_label: None,
             status_error: None,
@@ -559,18 +880,22 @@ impl IngestPanelState {
             problem_regime: self.inventory.problem_regime,
             sequence_three_letter: self.parsed_sequence_three_letter(),
             selected_experiments: self.selected_experiments(),
+            in_memory_files: Arc::clone(&self.in_memory_files),
         }
     }
 }
 
 fn is_archive_name_lower(lower: &str) -> bool {
-    lower.ends_with(".tar") || lower.ends_with(".tar.gz") || lower.ends_with(".tgz")
+    lower.ends_with(".tar")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".tgz")
+        || is_zip_path_lower(lower)
 }
 
-/// Check whether a filename or leading magic bytes represent a `.tar` / `.tar.gz` / `.tgz` archive.
+/// Check whether a filename or leading magic bytes represent a `.zip` / `.tar` / `.tar.gz` / `.tgz` archive.
 pub fn is_archive_filename_or_magic(name: &str, bytes: &[u8]) -> bool {
     let lower = name.to_ascii_lowercase();
-    if is_archive_name_lower(&lower) {
+    if is_archive_name_lower(&lower) || is_zip_magic(bytes) {
         return true;
     }
     if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
@@ -597,6 +922,17 @@ fn looks_like_nef_bytes(name: &str, bytes: &[u8]) -> bool {
 /// - Single `.str` / `.tsv` text table -> [`IngestDropOutcome::TextTable`]
 /// - `.tar` / `.tar.gz` / `.tgz` archive or multi-file spectrometer bundle ->
 ///   `extract_archive_virtual_entries` / `VirtualEntry` -> `classify_nmr_entries` -> [`IngestPanelState`].
+fn normalize_mem_rel(raw: &str) -> String {
+    let norm = raw
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_string();
+    // Strip common single top-level wrapper prefix only when looking up relative paths later; keep canonical slash form here.
+    norm
+}
+
 pub fn ingest_dropped_payloads(payloads: &[DroppedPayload]) -> Result<IngestDropOutcome, String> {
     if payloads.is_empty() {
         return Err("No dropped files provided".to_string());
@@ -611,30 +947,78 @@ pub fn ingest_dropped_payloads(payloads: &[DroppedPayload]) -> Result<IngestDrop
                 nef_bytes: p.bytes.clone(),
             });
         }
-        if !is_archive_filename_or_magic(&p.name, &p.bytes)
-            && (lower.ends_with(".str") || lower.ends_with(".star") || lower.ends_with(".tsv"))
-        {
-            if let Ok(text) = std::str::from_utf8(&p.bytes) {
-                return Ok(IngestDropOutcome::TextTable {
+        if !is_archive_filename_or_magic(&p.name, &p.bytes) {
+            if lower.ends_with(".jdx") || lower.ends_with(".dx") || lower.ends_with(".jcamp") {
+                let loaded =
+                    load_1d_from_virtual_entries(&[(&p.name, p.bytes.as_slice())], None, false)?;
+                let mut spectra = Vec::with_capacity(loaded.len());
+                for item in loaded {
+                    spectra.push(prepare_loaded_1d_for_studio(item)?);
+                }
+                return Ok(IngestDropOutcome::Spectra1D {
                     source_name: p.name.clone(),
-                    text: text.to_string(),
+                    spectra,
                 });
+            }
+            if lower.ends_with(".json") {
+                if let Ok(loaded) =
+                    load_1d_from_virtual_entries(&[(&p.name, p.bytes.as_slice())], None, false)
+                {
+                    let mut spectra = Vec::with_capacity(loaded.len());
+                    for item in loaded {
+                        spectra.push(prepare_loaded_1d_for_studio(item)?);
+                    }
+                    return Ok(IngestDropOutcome::Spectra1D {
+                        source_name: p.name.clone(),
+                        spectra,
+                    });
+                }
+            }
+            if lower.ends_with(".str") || lower.ends_with(".star") || lower.ends_with(".tsv") {
+                if let Ok(text) = std::str::from_utf8(&p.bytes) {
+                    return Ok(IngestDropOutcome::TextTable {
+                        source_name: p.name.clone(),
+                        text: text.to_string(),
+                    });
+                }
             }
         }
     }
 
+    const MAX_BROWSER_RETAINED_BYTES: usize = 256 * 1024 * 1024;
     let mut virtual_entries: Vec<VirtualEntry> = Vec::new();
+    let mut mem_map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut mem_total = 0usize;
+
     for p in payloads {
         if is_archive_filename_or_magic(&p.name, &p.bytes) {
             let extracted = extract_archive_virtual_entries(&p.name, &p.bytes)?;
             virtual_entries.extend(extracted);
+            if let Ok(full_items) = extract_archive_full_entries_bounded(
+                &p.name,
+                &p.bytes,
+                512 * 1024 * 1024,
+                MAX_BROWSER_RETAINED_BYTES.saturating_sub(mem_total),
+            ) {
+                for (rel, b) in full_items {
+                    if mem_total + b.len() <= MAX_BROWSER_RETAINED_BYTES {
+                        mem_total += b.len();
+                        mem_map.insert(normalize_mem_rel(&rel), b);
+                    }
+                }
+            }
         } else {
+            let rel = normalize_mem_rel(&p.name);
             let cap = p.bytes.len().min(256 * 1024);
             virtual_entries.push(VirtualEntry::header_only(
-                p.name.replace('\\', "/"),
+                rel.clone(),
                 p.bytes[..cap].to_vec(),
                 p.bytes.len() as u64,
             ));
+            if mem_total + p.bytes.len() <= MAX_BROWSER_RETAINED_BYTES {
+                mem_total += p.bytes.len();
+                mem_map.insert(rel, p.bytes.clone());
+            }
         }
     }
 
@@ -647,10 +1031,199 @@ pub fn ingest_dropped_payloads(payloads: &[DroppedPayload]) -> Result<IngestDrop
         if !fname.is_empty() {
             inv.root_name = fname.to_string();
         }
+    } else if let Some(first) = mem_map.keys().next() {
+        if let Some((top, _)) = first.split_once('/') {
+            if !top.is_empty() && mem_map.keys().all(|k| k.starts_with(&format!("{top}/"))) {
+                inv.root_name = top.to_string();
+            }
+        }
+    }
+
+    let has_2d_plus = inv
+        .experiments
+        .iter()
+        .any(|e| !matches!(e.dimensionality, ExperimentDimensionality::Dim1D));
+
+    // When the drop contains NO 2D/3D/4D protein experiments, attempt direct 1D loading
+    // (or surface actionable bare-file `1r`/`fid`/`2rr`/`ser` errors instead of an empty matrix!).
+    if !has_2d_plus {
+        let refs: Vec<(&str, &[u8])> = mem_map
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect();
+        match load_1d_from_virtual_entries(&refs, None, false) {
+            Ok(loaded) if !loaded.is_empty() => {
+                let mut spectra = Vec::with_capacity(loaded.len());
+                for item in loaded {
+                    spectra.push(prepare_loaded_1d_for_studio(item)?);
+                }
+                return Ok(IngestDropOutcome::Spectra1D {
+                    source_name: inv.root_name.clone(),
+                    spectra,
+                });
+            }
+            Err(err) if inv.experiments.is_empty() && err.starts_with("Bruker '") => {
+                return Err(err);
+            }
+            _ => {}
+        }
     }
 
     let mut panel = IngestPanelState::from_inventory(inv);
+    panel.in_memory_files = Arc::new(mem_map);
     panel.populate_sequence_from_virtual_entries(&virtual_entries);
+    Ok(IngestDropOutcome::Workspace(Box::new(panel)))
+}
+
+/// Native helper: inspect a disk path (directory, archive, single file, or bare Bruker `1r`/`fid`/`2rr`/`ser`)
+/// and route 1D-only datasets directly to [`IngestDropOutcome::Spectra1D`] while preserving
+/// [`IngestDropOutcome::Workspace`] for 2D/3D/4D multi-experiment workspaces.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_native_path_1d_or_workspace(path: &Path) -> Result<IngestDropOutcome, String> {
+    let p_str = path.display().to_string();
+    let lower = p_str.to_ascii_lowercase();
+    let fname_low = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // Bare Bruker sibling resolution on native desktop: dropping `1r`, `1i`, `fid`, `procs`, `acqus`, or `ser`
+    // automatically inspects `path.parent()` on disk so users never hit a missing-sibling error!
+    if path.is_file() {
+        if matches!(fname_low.as_str(), "1r" | "1i" | "procs") {
+            if let Some(parent) = path.parent() {
+                if !parent.join("2rr").exists() && !parent.join("3rrr").exists() {
+                    let loaded = nmr_core::nmr1d::load_1d_input(parent, None, false)?;
+                    let spec = prepare_loaded_1d_for_studio(loaded)?;
+                    return Ok(IngestDropOutcome::Spectra1D {
+                        source_name: parent.display().to_string(),
+                        spectra: vec![spec],
+                    });
+                }
+            }
+        }
+        if matches!(fname_low.as_str(), "fid" | "acqus" | "acqu") {
+            if let Some(parent) = path.parent() {
+                if !parent.join("ser").exists()
+                    && !parent.join("acqu2s").exists()
+                    && !parent.join("acqu3s").exists()
+                {
+                    let loaded = nmr_core::nmr1d::load_1d_input(parent, None, false)?;
+                    let spec = prepare_loaded_1d_for_studio(loaded)?;
+                    return Ok(IngestDropOutcome::Spectra1D {
+                        source_name: parent.display().to_string(),
+                        spectra: vec![spec],
+                    });
+                }
+            }
+        }
+        if matches!(fname_low.as_str(), "ser" | "acqu2s" | "acqu3s") {
+            if let Some(parent) = path.parent() {
+                let panel = IngestPanelState::from_native_path(parent)?;
+                return Ok(IngestDropOutcome::Workspace(Box::new(panel)));
+            }
+        }
+        if lower.ends_with(".jdx")
+            || lower.ends_with(".dx")
+            || lower.ends_with(".jcamp")
+            || lower.ends_with(".ft1")
+        {
+            let spec = if lower.ends_with(".ft1") {
+                let ft1 = nmr_core::ops::read_ft1_1d(path)?;
+                let exp =
+                    nmr_core::nmr1d::Experiment1DKind::from_pulse_program("", &ft1.axis_x.label);
+                let real: Vec<f64> = ft1.data.iter().map(|&v| v as f64).collect();
+                let imag = ft1
+                    .imag
+                    .map(|im| im.into_iter().map(|v| v as f64).collect());
+                Spectrum1D::new(ft1.name, exp, ft1.axis_x, real, imag)
+            } else {
+                nmr_core::nmr1d::load_processed_spectrum_1d(path, None)?
+            };
+            return Ok(IngestDropOutcome::Spectra1D {
+                source_name: p_str,
+                spectra: vec![spec],
+            });
+        }
+        if lower.ends_with(".json") {
+            if let Ok(loaded) = nmr_core::nmr1d::load_1d_input(path, None, false) {
+                let spec = prepare_loaded_1d_for_studio(loaded)?;
+                return Ok(IngestDropOutcome::Spectra1D {
+                    source_name: p_str,
+                    spectra: vec![spec],
+                });
+            }
+        }
+        if is_archive_name_lower(&lower) {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+            return ingest_dropped_payloads(&[DroppedPayload::new(p_str, bytes)]);
+        }
+    }
+
+    let panel = IngestPanelState::from_native_path(path)?;
+    let has_2d_plus = panel
+        .inventory
+        .experiments
+        .iter()
+        .any(|e| !matches!(e.dimensionality, ExperimentDimensionality::Dim1D));
+
+    if !has_2d_plus {
+        let mut spectra = Vec::new();
+        // 1. Direct directory 1D check (e.g. `pdata/1` or single `expno` folder)
+        if path.is_dir() {
+            if let Ok(loaded) = nmr_core::nmr1d::load_1d_input(path, None, false) {
+                if let Ok(spec) = prepare_loaded_1d_for_studio(loaded) {
+                    spectra.push(spec);
+                }
+            }
+            if spectra.is_empty() {
+                for (idx, exp) in panel.inventory.experiments.iter().enumerate() {
+                    if matches!(exp.dimensionality, ExperimentDimensionality::Dim1D) {
+                        if let Some(Some(ref rp)) = panel.row_resolved_paths.get(idx) {
+                            if let Ok(loaded) = nmr_core::nmr1d::load_1d_input(rp, None, false) {
+                                if let Ok(mut spec) = prepare_loaded_1d_for_studio(loaded) {
+                                    if !exp.relative_path.is_empty() && exp.relative_path != "." {
+                                        spec.name = exp.relative_path.clone();
+                                    }
+                                    spectra.push(spec);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Also pick up any standalone `.jdx`/`.dx`/`.jcamp` files directly inside `path`
+            if spectra.is_empty() {
+                if let Ok(rd) = std::fs::read_dir(path) {
+                    let mut children: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+                    children.sort();
+                    for ch in children {
+                        let cl = ch.to_string_lossy().to_ascii_lowercase();
+                        if cl.ends_with(".jdx") || cl.ends_with(".dx") || cl.ends_with(".jcamp") {
+                            if let Ok(s) = nmr_core::nmr1d::load_processed_spectrum_1d(&ch, None) {
+                                spectra.push(s);
+                            }
+                        } else if ch.is_dir() {
+                            if let Ok(loaded) = nmr_core::nmr1d::load_1d_input(&ch, None, false) {
+                                if let Ok(s) = prepare_loaded_1d_for_studio(loaded) {
+                                    spectra.push(s);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !spectra.is_empty() {
+            return Ok(IngestDropOutcome::Spectra1D {
+                source_name: panel.inventory.root_name.clone(),
+                spectra,
+            });
+        }
+    }
+
     Ok(IngestDropOutcome::Workspace(Box::new(panel)))
 }
 
@@ -694,8 +1267,32 @@ pub fn ingest_dropped_files_native(
                     text,
                 });
             }
-            let panel = IngestPanelState::from_native_path(p)?;
-            return Ok(IngestDropOutcome::Workspace(Box::new(panel)));
+            return load_native_path_1d_or_workspace(p);
+        }
+    }
+
+    // Multi-file native drop on disk: if all dropped items are files inside the same 1D folder (e.g. `1r` + `procs`),
+    // try 1D payload ingest before falling back to 2D/3D workspace classification!
+    if files.iter().all(|f| f.path().is_file()) {
+        let mut payloads = Vec::new();
+        let mut ok_all = true;
+        for f in files {
+            match std::fs::read(f.path()) {
+                Ok(b) if b.len() <= 64 * 1024 * 1024 => {
+                    payloads.push(DroppedPayload::new(f.path().display().to_string(), b));
+                }
+                _ => {
+                    ok_all = false;
+                    break;
+                }
+            }
+        }
+        if ok_all {
+            if let Ok(out @ IngestDropOutcome::Spectra1D { .. }) =
+                ingest_dropped_payloads(&payloads)
+            {
+                return Ok(out);
+            }
         }
     }
 
@@ -781,7 +1378,15 @@ pub async fn ingest_dropped_files_wasm(
     let mut payloads = Vec::with_capacity(files.len());
     for f in files {
         let name = f.path().display().to_string();
-        let bytes = f.bytes_async().await?;
+        let bytes = f.bytes_async().await.map_err(|e| {
+            if e.contains("NotFoundError") || e.contains("The object can not be found") {
+                format!(
+                    "Cannot read folder '{name}' as a single file — click '📂 Open Folder' in the toolbar or drop a .zip/.tar.gz archive (or drop the folder directly onto the canvas)."
+                )
+            } else {
+                e
+            }
+        })?;
         payloads.push(DroppedPayload::new(name, bytes));
     }
     ingest_dropped_payloads(&payloads)
@@ -866,6 +1471,24 @@ impl IngestPanelState {
                                 .monospace()
                                 .weak(),
                         );
+                    }
+                });
+
+                #[cfg(target_arch = "wasm32")]
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("📂 Open Bruker / Spectrometer Folder…")
+                        .on_hover_text("Select an entire Bruker study/expno/pdata folder from disk")
+                        .clicked()
+                    {
+                        trigger_browser_folder_picker();
+                    }
+                    if ui
+                        .button("📄 Open Files / .zip / .tar.gz…")
+                        .on_hover_text("Select .zip/.tar.gz archives, .ucsf/.ft2/.jdx spectra, or sibling Bruker files")
+                        .clicked()
+                    {
+                        trigger_browser_files_picker();
                     }
                 });
 
@@ -1111,6 +1734,26 @@ impl IngestPanelState {
                         ));
                     }
 
+                    let has_sel_1d = self
+                        .inventory
+                        .experiments
+                        .iter()
+                        .enumerate()
+                        .any(|(idx, e)| {
+                            self.selected.get(idx).copied().unwrap_or(false)
+                                && matches!(e.dimensionality, ExperimentDimensionality::Dim1D)
+                        });
+                    if has_sel_1d
+                        && ui
+                            .button("📉 Open Checked 1D in 1D Studio")
+                            .on_hover_text("Send checked 1D experiments directly into 1D Array & Multiplet Studio")
+                            .clicked()
+                    {
+                        emitted = Some(IngestAction::OpenSelected1dInStudio(
+                            self.build_execution_plan(),
+                        ));
+                    }
+
                     if ui.button("Cancel").clicked() {
                         self.open = false;
                     }
@@ -1122,7 +1765,11 @@ impl IngestPanelState {
         }
         if matches!(
             emitted,
-            Some(IngestAction::LoadSelectedSpectra(_) | IngestAction::ProcessPickAndRun(_))
+            Some(
+                IngestAction::LoadSelectedSpectra(_)
+                    | IngestAction::ProcessPickAndRun(_)
+                    | IngestAction::OpenSelected1dInStudio(_)
+            )
         ) {
             self.open = false;
         }

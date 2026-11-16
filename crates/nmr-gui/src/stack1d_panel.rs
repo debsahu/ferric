@@ -24,6 +24,17 @@ use std::f64::consts::PI;
 use std::fmt::Write as _;
 
 use eframe::egui;
+use nmr_core::metabolomics::CohortSample1D;
+use nmr_core::multiplet::{
+    analyze_multiplet_peaks, format_journal_nmr_report, JournalNmrReport, MultipletAnalysis,
+    MultipletConfig, MultipletSubPeak, PublicationStyle, ReportNucleus, ReportedSignal,
+    TextEncoding,
+};
+use nmr_core::nmr1d::{
+    apply_phase_1d, auto_calibrate_solvent_1d, auto_phase_and_apply_1d, correct_baseline_1d,
+    hilbert_reconstruct_imaginary_1d, pick_peaks_1d, AutoPhase1DConfig, BaselineConfig1D,
+    Experiment1DKind, PeakPickConfig1D, Pivot1D, Spectrum1D,
+};
 use nmr_core::spectrum::AxisPpm;
 
 /// Curated dark-workbench color palette (`[r, g, b, a]`) for overlaid & stacked 1D NMR traces.
@@ -435,6 +446,11 @@ impl LodPyramid1d {
     }
 }
 
+/// Equality-preserving wrapper attaching a full [`Spectrum1D`] (real + optional imaginary + axis/solvent metadata)
+/// to a [`Trace1d`] for live interactive phasing, baseline correction, solvent calibration, and multiplet analysis.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AttachedSpectrum1d(pub Spectrum1D);
+
 /// Single 1D NMR spectrum trace inside [`Stack1dState`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Trace1d {
@@ -454,6 +470,10 @@ pub struct Trace1d {
     pub alpha_override: Option<f64>,
     pub visible: bool,
     pub locked: bool,
+    /// True when populated by a built-in synthetic demo so real user drops replace demo traces cleanly.
+    pub is_demo: bool,
+    /// Optional underlying [`Spectrum1D`] enabling live interactive `PHC0`/`PHC1` phasing & multiplet analysis.
+    pub raw_spec: Option<AttachedSpectrum1d>,
     generation: u64,
     lod: LodPyramid1d,
 }
@@ -515,8 +535,43 @@ impl Trace1d {
             alpha_override: None,
             visible: true,
             locked: false,
+            is_demo: false,
+            raw_spec: None,
             generation: 1,
             lod,
+        }
+    }
+
+    /// Construct a [`Trace1d`] from a full [`Spectrum1D`], retaining `raw_spec` for live interactive
+    /// phasing (`PHC0`/`PHC1`), Whittaker baseline correction, solvent calibration, and multiplet reporting.
+    pub fn from_spectrum1d(id: impl Into<String>, covariate: f64, spec: Spectrum1D) -> Self {
+        let ppm: Vec<f64> = (0..spec.len()).map(|i| spec.ppm_at(i)).collect();
+        let y = spec.real.clone();
+        let lbl = spec.name.clone();
+        let mut tr = Self::new(id, lbl, covariate, ppm, y);
+        tr.raw_spec = Some(AttachedSpectrum1d(spec));
+        tr
+    }
+
+    /// Mark whether this trace belongs to a synthetic demo preset.
+    #[inline]
+    pub fn with_demo(mut self, is_demo: bool) -> Self {
+        self.is_demo = is_demo;
+        self
+    }
+
+    /// Synchronize `ppm` and working `intensities` after mutating an attached [`Spectrum1D`].
+    pub fn sync_from_spectrum1d(&mut self, spec: &Spectrum1D) {
+        if self.locked {
+            return;
+        }
+        let ppm_vec: Vec<f64> = (0..spec.len()).map(|i| spec.ppm_at(i)).collect();
+        if ppm_vec.len() == spec.real.len() && ppm_vec.len() >= 2 {
+            self.ppm = ppm_vec;
+            self.is_descending = self.ppm.windows(2).all(|w| w[0] > w[1]);
+            self.intensities = spec.real.clone();
+            self.lod = LodPyramid1d::build(&self.intensities);
+            self.generation = self.generation.wrapping_add(1);
         }
     }
 
@@ -1810,7 +1865,8 @@ pub fn build_kinetics_demo_traces() -> (Vec<Trace1d>, Vec<RoiRegion1d>) {
             ppm.clone(),
             y,
         )
-        .with_color(default_trace_color(idx));
+        .with_color(default_trace_color(idx))
+        .with_demo(true);
         traces.push(tr);
     }
 
@@ -1856,7 +1912,8 @@ pub fn build_std_difference_demo_traces() -> (Vec<Trace1d>, Vec<RoiRegion1d>) {
         };
         traces.push(
             Trace1d::new(format!("std_{idx}"), lbl, t_sat, ppm.clone(), y)
-                .with_color(default_trace_color(idx)),
+                .with_color(default_trace_color(idx))
+                .with_demo(true),
         );
     }
 
@@ -2138,6 +2195,21 @@ pub struct Stack1dState {
     pub last_exported_svg: Option<String>,
     pub show_tsv_preview: bool,
     pub status_message: String,
+
+    // Interactive 1D Phase, Baseline, Multiplet & Journal Report controls
+    pub show_1d_analysis_drawer: bool,
+    pub show_native_open_bar: bool,
+    pub native_open_path_input: String,
+    pub pending_open_native_path: Option<String>,
+    pub pending_send_to_metabolomics: bool,
+    pub phc0_deg: f64,
+    pub phc1_deg: f64,
+    pub solvent_choice: String,
+    pub target_total_protons: f64,
+    pub journal_style: PublicationStyle,
+    pub detected_multiplets: Vec<MultipletAnalysis>,
+    pub detected_multiplet_integrals: Vec<f64>,
+    pub formatted_journal_report: String,
 }
 
 impl std::fmt::Debug for Stack1dState {
@@ -2205,11 +2277,359 @@ impl Default for Stack1dState {
             last_exported_svg: None,
             show_tsv_preview: false,
             status_message: String::new(),
+            show_1d_analysis_drawer: false,
+            show_native_open_bar: false,
+            native_open_path_input: String::new(),
+            pending_open_native_path: None,
+            pending_send_to_metabolomics: false,
+            phc0_deg: 0.0,
+            phc1_deg: 0.0,
+            solvent_choice: "CDCl3".to_string(),
+            target_total_protons: 10.0,
+            journal_style: PublicationStyle::Acs,
+            detected_multiplets: Vec::new(),
+            detected_multiplet_integrals: Vec::new(),
+            formatted_journal_report: String::new(),
         }
     }
 }
 
 impl Stack1dState {
+    /// Load real user 1D [`Spectrum1D`] traces into `Stack1dState` (automatically replacing any
+    /// synthetic demo traces so user drops start on a clean slate, opening the 1D analysis drawer,
+    /// and running automatic multiplet & journal characterization on `1H` spectra).
+    pub fn load_user_spectra(&mut self, spectra: Vec<Spectrum1D>) {
+        if spectra.is_empty() {
+            return;
+        }
+        if self.traces.iter().all(|t| t.is_demo) {
+            self.traces.clear();
+            self.roi_regions.clear();
+        }
+        let base_idx = self.traces.len();
+        for (k, mut spec) in spectra.into_iter().enumerate() {
+            if spec.imag.is_none() {
+                hilbert_reconstruct_imaginary_1d(&mut spec);
+            }
+            if k == 0 {
+                if let Some(ref s) = spec.solvent {
+                    self.solvent_choice = s.clone();
+                }
+            }
+            let idx = base_idx + k;
+            let tr = Trace1d::from_spectrum1d(format!("user_1d_{idx}"), idx as f64, spec)
+                .with_color(default_trace_color(idx));
+            self.traces.push(tr);
+        }
+        self.ref_trace_idx = base_idx.min(self.traces.len().saturating_sub(1));
+        self.phc0_deg = 0.0;
+        self.phc1_deg = 0.0;
+        self.show_1d_analysis_drawer = true;
+        if self.traces.len() >= 2 && self.view_mode == Stack1dViewMode::SuperimposedOverlay {
+            self.view_mode = Stack1dViewMode::StackedOffset;
+        }
+        self.fit_full_ppm_bounds();
+        self.y_gain = 1.0;
+
+        let is_proton = self
+            .traces
+            .get(self.ref_trace_idx)
+            .and_then(|t| t.raw_spec.as_ref())
+            .is_some_and(|s| matches!(s.0.experiment, Experiment1DKind::Proton1D));
+        if is_proton {
+            self.analyze_active_trace_multiplets();
+        } else {
+            self.detected_multiplets.clear();
+            self.detected_multiplet_integrals.clear();
+            self.formatted_journal_report.clear();
+        }
+    }
+
+    fn ensure_active_raw_spec(&mut self) -> Option<usize> {
+        if self.traces.is_empty() {
+            return None;
+        }
+        let idx = self.safe_ref_trace_idx();
+        self.ref_trace_idx = idx;
+        if self.traces[idx].raw_spec.is_none() {
+            let tr = &self.traces[idx];
+            if tr.ppm.len() >= 2 {
+                let first = tr.ppm[0];
+                let last = *tr.ppm.last().unwrap_or(&first);
+                let axis = AxisPpm::from_bounds("1H", tr.ppm.len(), first, last, 500.0);
+                let mut sp = Spectrum1D::new(
+                    tr.label.clone(),
+                    Experiment1DKind::Proton1D,
+                    axis,
+                    tr.intensities.clone(),
+                    None,
+                );
+                hilbert_reconstruct_imaginary_1d(&mut sp);
+                self.traces[idx].raw_spec = Some(AttachedSpectrum1d(sp));
+            }
+        } else if let Some(ref mut att) = self.traces[idx].raw_spec {
+            if att.0.imag.is_none() {
+                hilbert_reconstruct_imaginary_1d(&mut att.0);
+            }
+        }
+        Some(idx)
+    }
+
+    /// Apply `(self.phc0_deg, self.phc1_deg)` relative to the stored `raw_spec` on the active reference trace.
+    pub fn apply_live_phase_to_active_trace(&mut self) {
+        let Some(idx) = self.ensure_active_raw_spec() else {
+            return;
+        };
+        let ph0 = self.phc0_deg;
+        let ph1 = self.phc1_deg;
+        if let Some(ref att) = self.traces[idx].raw_spec {
+            let mut phased = att.0.clone();
+            apply_phase_1d(&mut phased, ph0, ph1, Pivot1D::MaxPeak);
+            self.traces[idx].sync_from_spectrum1d(&phased);
+        }
+    }
+
+    /// Run minimum-entropy automatic phase correction on the active reference trace and commit it.
+    pub fn auto_phase_active_trace(&mut self) {
+        let Some(idx) = self.ensure_active_raw_spec() else {
+            return;
+        };
+        if let Some(ref mut att) = self.traces[idx].raw_spec {
+            let res = auto_phase_and_apply_1d(&mut att.0, &AutoPhase1DConfig::default());
+            let updated = att.0.clone();
+            self.traces[idx].sync_from_spectrum1d(&updated);
+            self.phc0_deg = 0.0;
+            self.phc1_deg = 0.0;
+            self.status_message = format!(
+                "Auto-phased '{}' (ΔPHC0 = {:.1}°, ΔPHC1 = {:.1}°).",
+                self.traces[idx].label, res.phc0_deg, res.phc1_deg
+            );
+        }
+    }
+
+    /// Run Whittaker penalized-least-squares baseline flattening on the active reference trace.
+    pub fn baseline_correct_active_trace(&mut self) {
+        let Some(idx) = self.ensure_active_raw_spec() else {
+            return;
+        };
+        let ph0 = self.phc0_deg;
+        let ph1 = self.phc1_deg;
+        if let Some(ref mut att) = self.traces[idx].raw_spec {
+            if ph0.abs() > 1e-6 || ph1.abs() > 1e-6 {
+                apply_phase_1d(&mut att.0, ph0, ph1, Pivot1D::MaxPeak);
+                self.phc0_deg = 0.0;
+                self.phc1_deg = 0.0;
+            }
+            let _ = correct_baseline_1d(&mut att.0, &BaselineConfig1D::default());
+            if att.0.imag.is_some() {
+                hilbert_reconstruct_imaginary_1d(&mut att.0);
+            }
+            let updated = att.0.clone();
+            self.traces[idx].sync_from_spectrum1d(&updated);
+            self.status_message = format!(
+                "Applied Whittaker baseline correction to '{}'.",
+                self.traces[idx].label
+            );
+        }
+    }
+
+    /// Calibrate the chemical-shift axis of the active trace against residual `self.solvent_choice`.
+    pub fn calibrate_solvent_active_trace(&mut self) {
+        let Some(idx) = self.ensure_active_raw_spec() else {
+            return;
+        };
+        let solv = self.solvent_choice.trim().to_string();
+        if let Some(ref mut att) = self.traces[idx].raw_spec {
+            match auto_calibrate_solvent_1d(&mut att.0, &solv, 0.35) {
+                Ok(delta_ppm) => {
+                    att.0.solvent = Some(solv.clone());
+                    let updated = att.0.clone();
+                    self.traces[idx].sync_from_spectrum1d(&updated);
+                    self.fit_full_ppm_bounds();
+                    self.status_message = format!(
+                        "Calibrated '{}' to {} residual peak (Δδ = {:+.4} ppm).",
+                        self.traces[idx].label, solv, delta_ppm
+                    );
+                }
+                Err(e) => {
+                    self.status_message = format!("Solvent calibration note: {e}");
+                }
+            }
+        }
+    }
+
+    /// Pick 1D peaks, cluster into multiplets, deconvolve coupling trees (`Hoye`), and format the
+    /// publication characterization line (`ACS` / `JOC` / `RSC` / `Nature`).
+    pub fn analyze_active_trace_multiplets(&mut self) {
+        let Some(idx) = self.ensure_active_raw_spec() else {
+            return;
+        };
+        let ph0 = self.phc0_deg;
+        let ph1 = self.phc1_deg;
+        let Some(ref att) = self.traces[idx].raw_spec else {
+            return;
+        };
+        let mut working = att.0.clone();
+        if ph0.abs() > 1e-6 || ph1.abs() > 1e-6 {
+            apply_phase_1d(&mut working, ph0, ph1, Pivot1D::MaxPeak);
+        }
+
+        let mhz = working.axis.obs_mhz.max(60.0);
+        let picked = pick_peaks_1d(&working, &PeakPickConfig1D::default());
+        if picked.is_empty() {
+            self.detected_multiplets.clear();
+            self.detected_multiplet_integrals.clear();
+            self.formatted_journal_report.clear();
+            self.status_message =
+                "No 1D peaks above SNR threshold found on active trace.".to_string();
+            return;
+        }
+
+        // Sort picked peaks descending in ppm and group peaks separated by <= 28 Hz into multiplet clusters.
+        let mut sorted = picked;
+        sorted.sort_by(|a, b| b.ppm.total_cmp(&a.ppm));
+        let gap_ppm = (28.0 / mhz).max(0.035);
+        let mut clusters: Vec<Vec<MultipletSubPeak>> = Vec::new();
+        for pk in sorted {
+            if pk.height <= 0.0 {
+                continue;
+            }
+            let sub =
+                MultipletSubPeak::new(pk.ppm, pk.height).with_fwhm_hz(pk.est_fwhm_hz.max(0.8));
+            if let Some(last_cluster) = clusters.last_mut() {
+                let prev_ppm = last_cluster.last().map(|s| s.ppm).unwrap_or(pk.ppm);
+                if (prev_ppm - pk.ppm).abs() <= gap_ppm && last_cluster.len() < 24 {
+                    last_cluster.push(sub);
+                    continue;
+                }
+            }
+            clusters.push(vec![sub]);
+        }
+
+        let mcfg = MultipletConfig::default();
+        let mut analyses: Vec<MultipletAnalysis> = Vec::new();
+        let mut areas: Vec<f64> = Vec::new();
+        for cl in clusters.into_iter().take(48) {
+            if let Ok(an) = analyze_multiplet_peaks(&cl, mhz, &mcfg) {
+                let lo = an.range_ppm.0.min(an.range_ppm.1) - 0.015;
+                let hi = an.range_ppm.0.max(an.range_ppm.1) + 0.015;
+                let area = integrate_trace_region_f64(&self.traces[idx], lo, hi, true).max(0.0);
+                areas.push(area);
+                analyses.push(an);
+            }
+        }
+
+        let total_area: f64 = areas.iter().sum();
+        let mut norm_integrals = Vec::with_capacity(areas.len());
+        if self.target_total_protons > 0.0 && total_area > 1e-12 {
+            for (an, &area) in analyses.iter_mut().zip(&areas) {
+                let h_est = (area / total_area) * self.target_total_protons;
+                an.proton_count = Some(h_est.round().max(1.0) as usize);
+                norm_integrals.push(h_est);
+            }
+        } else {
+            norm_integrals.extend_from_slice(&areas);
+        }
+
+        self.detected_multiplets = analyses;
+        self.detected_multiplet_integrals = norm_integrals;
+        self.reformat_journal_report();
+        self.status_message = format!(
+            "Analyzed {} multiplet(s) on '{}'.",
+            self.detected_multiplets.len(),
+            self.traces[idx].label
+        );
+    }
+
+    /// Regenerate `self.formatted_journal_report` from `self.detected_multiplets` under `self.journal_style`.
+    pub fn reformat_journal_report(&mut self) {
+        if self.detected_multiplets.is_empty() {
+            self.formatted_journal_report.clear();
+            return;
+        }
+        let idx = self.safe_ref_trace_idx();
+        let (nuc, decoupled, mhz, solv) = self
+            .traces
+            .get(idx)
+            .and_then(|t| t.raw_spec.as_ref())
+            .map(|att| {
+                let rn = match att.0.experiment {
+                    Experiment1DKind::Proton1D => ReportNucleus::H1,
+                    Experiment1DKind::Carbon13Decoupled
+                    | Experiment1DKind::Dept90
+                    | Experiment1DKind::Dept135 => ReportNucleus::C13,
+                    Experiment1DKind::Fluorine19 => ReportNucleus::F19,
+                    Experiment1DKind::Phosphorus31 => ReportNucleus::P31,
+                    Experiment1DKind::Custom(_) => ReportNucleus::H1,
+                };
+                let dec = matches!(att.0.experiment, Experiment1DKind::Carbon13Decoupled);
+                let s = att
+                    .0
+                    .solvent
+                    .clone()
+                    .unwrap_or_else(|| self.solvent_choice.clone());
+                (rn, dec, att.0.axis.obs_mhz.max(60.0), s)
+            })
+            .unwrap_or((ReportNucleus::H1, false, 500.0, self.solvent_choice.clone()));
+
+        let signals: Vec<ReportedSignal> = self
+            .detected_multiplets
+            .iter()
+            .map(|an| {
+                if decoupled {
+                    ReportedSignal::new_decoupled(an.center_ppm)
+                } else {
+                    ReportedSignal::from_analysis(an, an.proton_count, None)
+                }
+            })
+            .collect();
+
+        let rep = JournalNmrReport {
+            nucleus: nuc,
+            proton_decoupled: decoupled,
+            mhz,
+            solvent: solv,
+            signals,
+        };
+        self.formatted_journal_report =
+            format_journal_nmr_report(&rep, self.journal_style, TextEncoding::Unicode);
+    }
+
+    /// Convert visible traces (`>= 3`) into [`CohortSample1D`] records for one-click Metabolomics handoff.
+    pub fn build_metabolomics_cohort_samples(&self) -> Vec<CohortSample1D> {
+        let vis: Vec<&Trace1d> = self.traces.iter().filter(|t| t.visible).collect();
+        let half = vis.len() / 2;
+        vis.into_iter()
+            .enumerate()
+            .map(|(i, tr)| {
+                let spec = if let Some(ref att) = tr.raw_spec {
+                    att.0.clone()
+                } else {
+                    let first = tr.ppm.first().copied().unwrap_or(10.0);
+                    let last = tr.ppm.last().copied().unwrap_or(0.0);
+                    let axis = AxisPpm::from_bounds("1H", tr.ppm.len(), first, last, 600.0);
+                    Spectrum1D::new(
+                        tr.label.clone(),
+                        Experiment1DKind::Proton1D,
+                        axis,
+                        tr.intensities.clone(),
+                        None,
+                    )
+                };
+                let group = if i < half.max(1) {
+                    "Group A"
+                } else {
+                    "Group B"
+                };
+                CohortSample1D {
+                    id: tr.label.clone(),
+                    group: group.to_string(),
+                    spectrum: spec,
+                    covariates: std::collections::BTreeMap::new(),
+                }
+            })
+            .collect()
+    }
     /// Create a fresh [`Stack1dState`] pre-populated with `traces` and fitted to their chemical
     /// shift envelope.
     pub fn with_traces(traces: Vec<Trace1d>) -> Self {
@@ -2356,6 +2776,39 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
     ui.horizontal_wrapped(|ui| {
         ui.strong("1D Array Studio");
         ui.separator();
+        if ui
+            .button("📂 Open Bruker Folder")
+            .on_hover_text("Open a Bruker study / expno / pdata folder (1r+procs or fid+acqus)")
+            .clicked()
+        {
+            #[cfg(target_arch = "wasm32")]
+            crate::ingest_panel::trigger_browser_folder_picker();
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                state.show_native_open_bar = !state.show_native_open_bar;
+            }
+        }
+        if ui
+            .button("📄 Open 1D Files")
+            .on_hover_text("Open .jdx, .zip/.tar.gz Bruker archive, .tsv, or 1r + procs / fid + acqus")
+            .clicked()
+        {
+            #[cfg(target_arch = "wasm32")]
+            crate::ingest_panel::trigger_browser_files_picker();
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                state.show_native_open_bar = !state.show_native_open_bar;
+            }
+        }
+        if !state.traces.is_empty() && ui.button("🗑 Clear").on_hover_text("Clear all 1D traces").clicked() {
+            state.traces.clear();
+            state.roi_regions.clear();
+            state.detected_multiplets.clear();
+            state.detected_multiplet_integrals.clear();
+            state.formatted_journal_report.clear();
+            state.status_message = "Cleared 1D traces.".to_string();
+        }
+        ui.separator();
         for mode in Stack1dViewMode::ALL {
             ui.selectable_value(&mut state.view_mode, mode, mode.label());
         }
@@ -2464,8 +2917,192 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
                 state.last_exported_svg = Some(svg);
                 state.status_message = "Copied 1200×640 vector SVG to clipboard.".to_string();
             }
+            if state.traces.len() >= 3
+                && ui
+                    .button("🧪 Send to Metabolomics")
+                    .on_hover_text("Transfer loaded 1D spectra directly into Metabolomics PCA / OPLS-DA / STOCSY Studio")
+                    .clicked()
+            {
+                state.pending_send_to_metabolomics = true;
+            }
+            ui.toggle_value(
+                &mut state.show_1d_analysis_drawer,
+                "🔬 Phase & Multiplets",
+            )
+            .on_hover_text("Toggle interactive 1D phase, Whittaker baseline, solvent calibration & ACS/JOC multiplet report");
         }
     });
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if state.show_native_open_bar {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("1D Folder / File Path:").strong());
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut state.native_open_path_input)
+                    .hint_text("Enter Bruker folder, pdata/1, 1r, fid, .jdx, or .zip path (or drag & drop onto window)…")
+                    .desired_width(440.0),
+            );
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Load 1D Path").clicked() || enter)
+                && !state.native_open_path_input.trim().is_empty()
+            {
+                state.pending_open_native_path =
+                    Some(state.native_open_path_input.trim().to_string());
+            }
+            if ui.small_button("✕").clicked() {
+                state.show_native_open_bar = false;
+            }
+        });
+    }
+
+    if state.show_1d_analysis_drawer && !state.traces.is_empty() {
+        egui::Frame::group(ui.style())
+            .fill(egui::Color32::from_rgb(16, 23, 36))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(56, 189, 248),
+            ))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("🔬 1D Processing & Multiplet Analysis");
+                    ui.separator();
+                    let p0_changed = ui
+                        .add(
+                            egui::Slider::new(&mut state.phc0_deg, -180.0..=180.0)
+                                .text("PHC0 (°)")
+                                .fixed_decimals(1),
+                        )
+                        .changed();
+                    let p1_changed = ui
+                        .add(
+                            egui::Slider::new(&mut state.phc1_deg, -180.0..=180.0)
+                                .text("PHC1 (°)")
+                                .fixed_decimals(1),
+                        )
+                        .changed();
+                    if p0_changed || p1_changed {
+                        state.apply_live_phase_to_active_trace();
+                    }
+                    if ui.button("Auto-Phase").clicked() {
+                        state.auto_phase_active_trace();
+                    }
+                    if ui.button("Whittaker Baseline").clicked() {
+                        state.baseline_correct_active_trace();
+                    }
+                    egui::ComboBox::from_id_salt("stack1d_solvent_combo")
+                        .selected_text(format!("Solvent: {}", state.solvent_choice))
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for s in ["CDCl3", "DMSO-d6", "D2O", "CD3OD", "Acetone-d6", "C6D6"] {
+                                ui.selectable_value(&mut state.solvent_choice, s.to_string(), s);
+                            }
+                        });
+                    if ui.button("Calibrate δ").clicked() {
+                        state.calibrate_solvent_active_trace();
+                    }
+                });
+
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("🔍 Analyze Multiplets").clicked() {
+                        state.analyze_active_trace_multiplets();
+                    }
+                    ui.label("Total H:");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut state.target_total_protons)
+                                .range(0.0..=500.0)
+                                .speed(0.5)
+                                .fixed_decimals(1),
+                        )
+                        .changed()
+                    {
+                        state.analyze_active_trace_multiplets();
+                    }
+                    let mut style_changed = false;
+                    for (st, lbl) in [
+                        (PublicationStyle::Acs, "ACS"),
+                        (PublicationStyle::Joc, "JOC"),
+                        (PublicationStyle::Rsc, "RSC"),
+                        (PublicationStyle::Nature, "Nature"),
+                    ] {
+                        if ui
+                            .selectable_value(&mut state.journal_style, st, lbl)
+                            .changed()
+                        {
+                            style_changed = true;
+                        }
+                    }
+                    if style_changed {
+                        state.reformat_journal_report();
+                    }
+                    if !state.formatted_journal_report.is_empty()
+                        && ui.button("📋 Copy Journal Report").clicked()
+                    {
+                        ui.ctx().copy_text(state.formatted_journal_report.clone());
+                        state.status_message =
+                            "Copied journal NMR characterization report to clipboard.".to_string();
+                    }
+                });
+
+                if !state.formatted_journal_report.is_empty() {
+                    ui.add_space(2.0);
+                    ui.monospace(
+                        egui::RichText::new(&state.formatted_journal_report)
+                            .size(11.5)
+                            .color(egui::Color32::from_rgb(185, 245, 215)),
+                    );
+                }
+
+                if !state.detected_multiplets.is_empty() {
+                    ui.add_space(3.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("stack1d_multiplet_table_scroll")
+                        .max_height(115.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("stack1d_multiplet_grid")
+                                .striped(true)
+                                .spacing([14.0, 3.0])
+                                .show(ui, |ui| {
+                                    ui.strong("δ (ppm)");
+                                    ui.strong("Mult");
+                                    ui.strong("J (Hz)");
+                                    ui.strong("Integral (H)");
+                                    ui.strong("Peaks");
+                                    ui.end_row();
+                                    for (mi, m) in state.detected_multiplets.iter().enumerate() {
+                                        ui.monospace(format!("{:.2}", m.center_ppm));
+                                        ui.monospace(m.class.as_str());
+                                        let js = m
+                                            .j_values_hz()
+                                            .into_iter()
+                                            .map(|j| format!("{j:.1}"))
+                                            .collect::<Vec<_>>()
+                                            .join(", ");
+                                        ui.monospace(if js.is_empty() {
+                                            "-".to_string()
+                                        } else {
+                                            js
+                                        });
+                                        let integ = state
+                                            .detected_multiplet_integrals
+                                            .get(mi)
+                                            .copied()
+                                            .unwrap_or(0.0);
+                                        let h_txt = match m.proton_count {
+                                            Some(pc) => format!("{integ:.2} ({pc}H)"),
+                                            None => format!("{integ:.2e}"),
+                                        };
+                                        ui.monospace(h_txt);
+                                        ui.monospace(format!("{}", m.peaks.len()));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+            });
+    }
 
     // 2. Contextual View-Mode Parameter Strip
     match state.view_mode {
@@ -4010,5 +4647,43 @@ mod tests {
             "W1_METRIC_JSON:{{\"task\":\"T14.3\",\"kind\":\"t14_3_headless_gui\",\"view_modes_rendered\":{},\"lod_32x64k_ok\":true}}",
             Stack1dViewMode::ALL.len()
         );
+    }
+
+    #[test]
+    fn test_user_spectrum1d_live_phase_and_multiplet_journal_report() {
+        let mut state = Stack1dState::default();
+        let (demo_traces, _) = build_kinetics_demo_traces();
+        state.traces = demo_traces;
+        assert!(state.traces.iter().all(|t| t.is_demo));
+
+        // Build a synthetic 500 MHz 1H Spectrum1D with an aromatic doublet (7.40 ppm, J = 8.0 Hz) + methyl singlet (1.25 ppm)
+        let n = 4096usize;
+        let axis = AxisPpm::from_bounds("1H", n, 9.0, 0.0, 500.0);
+        let ppm: Vec<f64> = (0..n).map(|i| axis.index_to_ppm(i as f64)).collect();
+        let mut y = vec![0.0_f64; n];
+        let dj = 8.0 / 500.0;
+        add_lorentzian(&mut y, &ppm, 7.40 + 0.5 * dj, 0.004, 1.0);
+        add_lorentzian(&mut y, &ppm, 7.40 - 0.5 * dj, 0.004, 1.0);
+        add_lorentzian(&mut y, &ppm, 1.25, 0.004, 3.0);
+        let mut spec = Spectrum1D::new("ibuprofen_test", Experiment1DKind::Proton1D, axis, y, None);
+        spec.solvent = Some("CDCl3".to_string());
+
+        state.target_total_protons = 5.0;
+        state.load_user_spectra(vec![spec]);
+
+        // Demo traces were replaced cleanly by the real user spectrum
+        assert_eq!(state.traces.len(), 1);
+        assert!(!state.traces[0].is_demo);
+        assert!(state.show_1d_analysis_drawer);
+        assert!(state.detected_multiplets.len() >= 2);
+        assert!(state.formatted_journal_report.contains("NMR (500 MHz"));
+
+        // Live phase adjustment + auto-phase recovery
+        state.phc0_deg = 35.0;
+        state.apply_live_phase_to_active_trace();
+        state.auto_phase_active_trace();
+        state.journal_style = PublicationStyle::Nature;
+        state.reformat_journal_report();
+        assert!(state.formatted_journal_report.contains("500 MHz"));
     }
 }

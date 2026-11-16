@@ -386,6 +386,23 @@ pub fn render_dosy_panel(ui: &mut egui::Ui, state: &mut DosyPanelState) -> Vec<D
             *state = DosyPanelState::with_synthetic_demo();
             actions.push(DosyPanelAction::LoadedDemoMixture);
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            if ui
+                .button("📂 Open Folder")
+                .on_hover_text("Select a Bruker pseudo-2D DOSY folder from disk")
+                .clicked()
+            {
+                crate::ingest_panel::trigger_browser_folder_picker();
+            }
+            if ui
+                .button("📄 Open Files")
+                .on_hover_text("Select DOSY .zip/.tar.gz archive or files")
+                .clicked()
+            {
+                crate::ingest_panel::trigger_browser_files_picker();
+            }
+        }
         if ui.button("Reset Zoom").clicked() {
             state.reset_viewport();
         }

@@ -2118,6 +2118,15 @@ pub trait ResponsiveWorkbenchHost {
     fn trigger_builtin_demo(&mut self);
     fn dispatch_chrome_action(&mut self, ctx: &egui::Context, action: WorkbenchAction);
     fn show_mol3d_dock(&self) -> bool;
+    fn show_strips_dock(&self) -> bool {
+        true
+    }
+    fn show_workflow_guide(&self) -> bool {
+        false
+    }
+    fn is_1d_full_canvas(&self) -> bool {
+        false
+    }
 
     fn draw_desktop_mode_header(
         &mut self,
@@ -2586,8 +2595,10 @@ fn render_tablet_split_shell<H: ResponsiveWorkbenchHost>(
     let mut chrome_actions = Vec::new();
     let top_resp = egui::Panel::top("workbench_phase9_chrome").show(ui, |ui| {
         host.draw_desktop_mode_header(ui, Some(&mut shell.tablet_dock));
-        ui.add_space(2.0);
-        chrome_actions = draw_workbench_chrome(ui, &readiness);
+        if host.show_workflow_guide() {
+            ui.add_space(2.0);
+            chrome_actions = draw_workbench_chrome(ui, &readiness);
+        }
     });
     for act in chrome_actions {
         host.dispatch_chrome_action(ctx, act);
@@ -2608,35 +2619,37 @@ fn render_tablet_split_shell<H: ResponsiveWorkbenchHost>(
 
     match host.host_workspace_mode() {
         HostWorkspaceMode::ProteinNmr => {
-            egui::Panel::top("top_controls_panel").show(ui, |ui| {
-                host.draw_protein_top_controls_and_ribbon(ui);
-            });
+            if !host.is_1d_full_canvas() {
+                egui::Panel::top("top_controls_panel").show(ui, |ui| {
+                    host.draw_protein_top_controls_and_ribbon(ui);
+                });
 
-            // At most ONE side dock on TabletSplit (`StripsRight` OR `Mol3dLeft`, never both!)
-            match shell.tablet_dock {
-                TabletActiveDock::StripsRight => {
-                    let r = egui::Panel::right("tablet_right_strip_inspector")
-                        .default_size(default_dock_w)
-                        .min_size(220.0)
-                        .max_size(max_dock_w)
-                        .resizable(true)
-                        .show(ui, |ui| {
-                            host.draw_strips_inspector_view(ui);
-                        });
-                    right_dock_rect = Some(r.response.rect);
+                // At most ONE side dock on TabletSplit (`StripsRight` OR `Mol3dLeft`, never both!)
+                match shell.tablet_dock {
+                    TabletActiveDock::StripsRight if host.show_strips_dock() => {
+                        let r = egui::Panel::right("tablet_right_strip_inspector")
+                            .default_size(default_dock_w)
+                            .min_size(220.0)
+                            .max_size(max_dock_w)
+                            .resizable(true)
+                            .show(ui, |ui| {
+                                host.draw_strips_inspector_view(ui);
+                            });
+                        right_dock_rect = Some(r.response.rect);
+                    }
+                    TabletActiveDock::Mol3dLeft if host.show_mol3d_dock() => {
+                        let l = egui::Panel::left("tablet_mol3d_structure_dock")
+                            .default_size(default_dock_w)
+                            .min_size(220.0)
+                            .max_size(max_dock_w)
+                            .resizable(true)
+                            .show(ui, |ui| {
+                                let _ = host.draw_mol3d_structure_view(ui);
+                            });
+                        left_dock_rect = Some(l.response.rect);
+                    }
+                    _ => {}
                 }
-                TabletActiveDock::Mol3dLeft => {
-                    let l = egui::Panel::left("tablet_mol3d_structure_dock")
-                        .default_size(default_dock_w)
-                        .min_size(220.0)
-                        .max_size(max_dock_w)
-                        .resizable(true)
-                        .show(ui, |ui| {
-                            let _ = host.draw_mol3d_structure_view(ui);
-                        });
-                    left_dock_rect = Some(l.response.rect);
-                }
-                TabletActiveDock::Hidden => {}
             }
 
             let c = egui::CentralPanel::default().show(ui, |ui| {
@@ -2691,8 +2704,10 @@ fn render_desktop_full_shell<H: ResponsiveWorkbenchHost>(
     let mut chrome_actions = Vec::new();
     let top_resp = egui::Panel::top("workbench_phase9_chrome").show(ui, |ui| {
         host.draw_desktop_mode_header(ui, None);
-        ui.add_space(2.0);
-        chrome_actions = draw_workbench_chrome(ui, &readiness);
+        if host.show_workflow_guide() {
+            ui.add_space(2.0);
+            chrome_actions = draw_workbench_chrome(ui, &readiness);
+        }
     });
     for act in chrome_actions {
         host.dispatch_chrome_action(ctx, act);
@@ -2709,19 +2724,23 @@ fn render_desktop_full_shell<H: ResponsiveWorkbenchHost>(
 
     match host.host_workspace_mode() {
         HostWorkspaceMode::ProteinNmr => {
-            egui::Panel::top("top_controls_panel").show(ui, |ui| {
-                host.draw_protein_top_controls_and_ribbon(ui);
-            });
-
-            let r_resp = egui::Panel::right("right_strip_inspector")
-                .default_size(400.0)
-                .min_size(320.0)
-                .show(ui, |ui| {
-                    host.draw_strips_inspector_view(ui);
+            if !host.is_1d_full_canvas() {
+                egui::Panel::top("top_controls_panel").show(ui, |ui| {
+                    host.draw_protein_top_controls_and_ribbon(ui);
                 });
-            right_dock_rect = Some(r_resp.response.rect);
+            }
 
-            if host.show_mol3d_dock() {
+            if host.show_strips_dock() && !host.is_1d_full_canvas() {
+                let r_resp = egui::Panel::right("right_strip_inspector")
+                    .default_size(400.0)
+                    .min_size(320.0)
+                    .show(ui, |ui| {
+                        host.draw_strips_inspector_view(ui);
+                    });
+                right_dock_rect = Some(r_resp.response.rect);
+            }
+
+            if host.show_mol3d_dock() && !host.is_1d_full_canvas() {
                 let l_resp = egui::Panel::left("mol3d_structure_dock")
                     .default_size(390.0)
                     .min_size(280.0)

@@ -327,6 +327,23 @@ impl MetabolomicsStudioPanel {
                         self.demo_seed = self.demo_seed.wrapping_add(1);
                         self.load_demo_cohort();
                     }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        if ui
+                            .button("📂 Open Study Folder")
+                            .on_hover_text("Select a multi-sample Bruker 1D cohort folder from disk")
+                            .clicked()
+                        {
+                            crate::ingest_panel::trigger_browser_folder_picker();
+                        }
+                        if ui
+                            .button("📄 Open Cohort .zip / Files")
+                            .on_hover_text("Select a .zip/.tar.gz archive or multiple .jdx/.tsv 1D spectra")
+                            .clicked()
+                        {
+                            crate::ingest_panel::trigger_browser_files_picker();
+                        }
+                    }
 
                     ui.separator();
 

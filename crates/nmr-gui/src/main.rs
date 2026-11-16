@@ -32,11 +32,10 @@ use nmr_core::c13_detected::{
     C13PickedDataset, C13PickerConfig, C13Strip3DPeak, Caco2DPeak, CacoPeakKind, Con2DPeak,
     IdpCubeSimConfig,
 };
-use nmr_core::classify::DataState;
-#[cfg(not(target_arch = "wasm32"))]
-use nmr_core::classify::{ExperimentDimensionality, ExperimentVendor};
+use nmr_core::classify::{DataState, ExperimentDimensionality, ExperimentVendor};
 use nmr_core::evaluate::{score, to_reference, Metrics};
 use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
+use nmr_core::fid::read_bruker_fid_2d_from_bytes;
 use nmr_core::idp_propensity::{compute_idp_propensity, PropensityConfig, PropensityReport};
 use nmr_core::idp_solver::{
     assign_idp_13c_cpu, idp_to_reference, register_and_build_con_dipeptide_systems, IdpSolverConfig,
@@ -73,15 +72,17 @@ use nmr_core::paramagnetic::{
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_core::peaks::read_peaks;
 use nmr_core::peaks::{read_peaks_str, Peak, EXPERIMENT_NAMES};
-use nmr_core::picker::{estimate_noise_mad, pick_hsqc_2d, PickerConfig};
-#[cfg(not(target_arch = "wasm32"))]
-use nmr_core::picker::{pick_c13_hsqc_2d, pick_triple_3d_two_pass, CorroboratedRepickConfig};
-use nmr_core::priors::{one_to_three, three_to_one, Priors, ATOMS};
-use nmr_core::process::AxisRescueAuditRecord;
-#[cfg(not(target_arch = "wasm32"))]
-use nmr_core::process::{
-    process_fid_dir_2d, process_fid_dir_3d, register_3d_hn_to_hsqc_2d_with_audit,
+use nmr_core::picker::{
+    estimate_noise_mad, pick_c13_hsqc_2d, pick_hsqc_2d, pick_triple_3d_two_pass,
+    CorroboratedRepickConfig, PickerConfig,
 };
+use nmr_core::priors::{one_to_three, three_to_one, Priors, ATOMS};
+use nmr_core::process::{
+    process_fid_2d_mut, register_3d_hn_to_hsqc_2d_with_audit, AxisRescueAuditRecord,
+    ProcessingRecipe,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_core::process::{process_fid_dir_2d, process_fid_dir_3d};
 use nmr_core::qc::{evaluate_dataset_qc, DatasetQcReport};
 use nmr_core::report::{generate_quality_report_html, predict_csi_dihedrals, ReportInput};
 use nmr_core::rng::Rng;
@@ -103,7 +104,11 @@ use nmr_core::spectrum::{
     read_bruker_pdata_2d, read_bruker_pdata_3d, read_nmrpipe_2d, read_nmrpipe_3d, read_ucsf_2d,
     read_ucsf_3d,
 };
-use nmr_core::spectrum::{Spectrum2D, Spectrum3D};
+use nmr_core::spectrum::{
+    read_bruker_pdata_2d_from_bytes, read_bruker_pdata_3d_from_bytes, read_nmrpipe_2d_from_bytes,
+    read_nmrpipe_3d_from_bytes, read_ucsf_2d_from_bytes, read_ucsf_3d_from_bytes, Spectrum2D,
+    Spectrum3D,
+};
 use nmr_core::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
 use nmr_core::stereospec::{
     assign_stereospecific_dataset, StereospecConfig, StereospecDatasetInput,
@@ -114,9 +119,11 @@ use nmr_gpu::bayes_sa_gpu::BayesSaGpuSolver;
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_gpu::GpuEngine;
 #[cfg(not(target_arch = "wasm32"))]
-use nmr_gui::ingest_panel::ingest_dropped_files_native;
+use nmr_gui::ingest_panel::{ingest_dropped_files_native, load_native_path_1d_or_workspace};
 #[cfg(target_arch = "wasm32")]
-use nmr_gui::ingest_panel::ingest_dropped_files_wasm;
+use nmr_gui::ingest_panel::{
+    ingest_dropped_files_wasm, trigger_browser_files_picker, trigger_browser_folder_picker,
+};
 #[cfg(target_arch = "wasm32")]
 use nmr_gui::session_io::{default_session_nef_filename, trigger_browser_nef_download};
 use nmr_gui::{
@@ -129,7 +136,11 @@ use nmr_gui::{
     demo_preset::{build_builtin_demo_suite, BUILTIN_DEMO_SUITE_SEED},
     dosy_panel::{render_dosy_panel, DosyPanelAction, DosyPanelState},
     dynamics_panel::{DynamicsStudioOutput, DynamicsStudioPanel, DynamicsStudioTab},
-    ingest_panel::{IngestAction, IngestDropOutcome, IngestExecutionPlan, IngestPanelState},
+    ingest_panel::{
+        ingest_dropped_payloads, install_browser_folder_drop_hook, poll_browser_drop_error,
+        poll_browser_dropped_payloads, IngestAction, IngestDropOutcome, IngestExecutionPlan,
+        IngestPanelState,
+    },
     keymap::{poll_global_modifier_shortcuts, ChordDispatcher, CONTOUR_FLOOR_STEP_RATIO},
     mcp_bridge::{render_mcp_bridge_panel, McpBridgeState, McpUiCommand, ViewportFrameBuffer},
     metabolomics_panel::MetabolomicsStudioPanel,
@@ -143,9 +154,9 @@ use nmr_gui::{
     stack1d_panel::{build_kinetics_demo_traces, render_stack1d_panel, Stack1dState, Trace1d},
     strip_tiler::{StripSpectra3D, StripTilerAction, StripTilerContext, StripTilerPanel},
     workflow_bar::{
-        draw_workflow_stepper, render_responsive_workbench, HostWorkspaceMode,
-        ResponsiveShellState, ResponsiveWorkbenchHost, TabletActiveDock, WorkbenchAction,
-        WorkspaceReadiness, MOBILE_TOUCH_MIN_HEIGHT,
+        draw_top_menu_bar, draw_workflow_stepper, render_responsive_workbench, HostWorkspaceMode,
+        MobileChemTab, MobileWorkspaceFamily, ResponsiveShellState, ResponsiveWorkbenchHost,
+        TabletActiveDock, WorkbenchAction, WorkspaceReadiness, MOBILE_TOUCH_MIN_HEIGHT,
     },
 };
 use octet_canvas::{IoFormat, MolecularPropertiesSummary, OctetBackendAdapter, OctetDrawPanel};
@@ -1664,6 +1675,12 @@ struct NmrWorkbenchApp {
     show_dynamics_panel: bool,
     stack1d_panel: Stack1dState,
     show_stack1d_panel: bool,
+    show_strips_dock: bool,
+    show_workflow_guide: bool,
+    show_advanced_protein_bar: bool,
+    show_sequence_ribbon: bool,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    show_native_global_open_bar: bool,
 
     // Spectra for GPU contour & 3D strip visualization
     hsqc_spec: Option<Spectrum2D>,
@@ -1851,7 +1868,7 @@ impl NmrWorkbenchApp {
             show_sidechain_inspector: false,
             overwrite_curated_rings: false,
             mol3d_panel: Mol3dViewerPanel::new(),
-            show_mol3d_viewport: true,
+            show_mol3d_viewport: false,
             loaded_pdb_text: None,
             relax_panel: RelaxPanelState::new(),
             show_relax_panel: false,
@@ -1859,6 +1876,11 @@ impl NmrWorkbenchApp {
             show_dynamics_panel: false,
             stack1d_panel: Stack1dState::default(),
             show_stack1d_panel: false,
+            show_strips_dock: true,
+            show_workflow_guide: false,
+            show_advanced_protein_bar: false,
+            show_sequence_ribbon: true,
+            show_native_global_open_bar: false,
             hsqc_spec: None,
             hsqc_arc: Arc::new(Vec::new()),
             hsqc_gen: 1,
@@ -3326,12 +3348,9 @@ impl NmrWorkbenchApp {
                         }
                     }
                     if added > 0 {
-                        self.workspace_mode = WorkspaceMode::ProteinNmr;
-                        self.show_stack1d_panel = true;
-                        self.show_relax_panel = false;
-                        self.show_dynamics_panel = false;
+                        self.activate_1d_studio_mode();
                         self.status_msg = format!(
-                            "Loaded {added} 1D JCAMP-DX trace(s) from {source_label} into 1D Stack"
+                            "Loaded {added} 1D JCAMP-DX trace(s) from {source_label} into 1D Studio"
                         );
                         return;
                     }
@@ -3367,20 +3386,26 @@ impl NmrWorkbenchApp {
                     }
                 }
                 if ppms.len() >= 2 {
-                    let idx = self.stack1d_panel.traces.len();
-                    self.stack1d_panel.add_trace(Trace1d::new(
-                        format!("tsv1d_{idx}"),
+                    let first = ppms[0];
+                    let last = *ppms.last().unwrap_or(&first);
+                    let axis = nmr_core::spectrum::AxisPpm::from_bounds(
+                        "1H",
+                        ppms.len(),
+                        first,
+                        last,
+                        500.0,
+                    );
+                    let spec = nmr_core::nmr1d::Spectrum1D::new(
                         source_label.to_string(),
-                        idx as f64,
-                        ppms,
+                        nmr_core::nmr1d::Experiment1DKind::Proton1D,
+                        axis,
                         ys,
-                    ));
-                    self.workspace_mode = WorkspaceMode::ProteinNmr;
-                    self.show_stack1d_panel = true;
-                    self.show_relax_panel = false;
-                    self.show_dynamics_panel = false;
+                        None,
+                    );
+                    self.stack1d_panel.load_user_spectra(vec![spec]);
+                    self.activate_1d_studio_mode();
                     self.status_msg = format!(
-                        "Loaded 1D spectrum trace ({source_label}) into 1D Stack ({} traces total)",
+                        "Loaded 1D spectrum '{source_label}' into 1D Studio ({} traces total)",
                         self.stack1d_panel.traces.len()
                     );
                     return;
@@ -3510,10 +3535,24 @@ impl NmrWorkbenchApp {
             return;
         }
         let lower_full = path_str.to_ascii_lowercase();
+        let fname_low = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
         if p.is_dir()
+            || lower_full.ends_with(".zip")
             || lower_full.ends_with(".tar")
             || lower_full.ends_with(".tar.gz")
             || lower_full.ends_with(".tgz")
+            || lower_full.ends_with(".jdx")
+            || lower_full.ends_with(".dx")
+            || lower_full.ends_with(".jcamp")
+            || lower_full.ends_with(".ft1")
+            || matches!(
+                fname_low.as_str(),
+                "1r" | "1i" | "procs" | "fid" | "acqus" | "acqu" | "ser"
+            )
         {
             if p.is_dir() && p.join("2rr").exists() {
                 match read_bruker_pdata_2d(p) {
@@ -3523,22 +3562,16 @@ impl NmrWorkbenchApp {
                         self.hsqc_spec = Some(spec);
                         self.reset_view_to_spec();
                         self.workspace_mode = WorkspaceMode::ProteinNmr;
+                        self.show_stack1d_panel = false;
                         self.status_msg = format!("Loaded Bruker 2D pdata from {}", p.display());
                     }
                     Err(e) => self.status_msg = format!("Bruker load error: {e}"),
                 }
                 return;
             }
-            match IngestPanelState::from_native_path(p) {
-                Ok(panel) => {
-                    let n_exp = panel.inventory.experiments.len();
-                    self.ingest_panel = panel;
-                    self.ingest_panel.open = true;
-                    self.workspace_mode = WorkspaceMode::ProteinNmr;
-                    self.status_msg =
-                        format!("Classified {n_exp} experiment(s) in {}", p.display());
-                }
-                Err(e) => self.status_msg = format!("Workspace classification error: {e}"),
+            match load_native_path_1d_or_workspace(p) {
+                Ok(outcome) => self.apply_drop_outcome(outcome),
+                Err(e) => self.status_msg = format!("Load error: {e}"),
             }
             return;
         }
@@ -3811,6 +3844,44 @@ impl NmrWorkbenchApp {
         }
     }
 
+    fn is_1d_studio_active(&self) -> bool {
+        self.workspace_mode == WorkspaceMode::ProteinNmr && self.show_stack1d_panel
+    }
+
+    fn activate_1d_studio_mode(&mut self) {
+        self.workspace_mode = WorkspaceMode::ProteinNmr;
+        self.show_stack1d_panel = true;
+        self.show_relax_panel = false;
+        self.show_dynamics_panel = false;
+        self.show_mol3d_viewport = false;
+        self.show_strips_dock = false;
+        self.responsive_shell.tablet_dock = TabletActiveDock::Hidden;
+        self.responsive_shell.mobile_family = MobileWorkspaceFamily::ChemStudio;
+        self.responsive_shell.chem_tab = MobileChemTab::Multiplets1dQnmr;
+    }
+
+    fn render_and_sync_stack1d_panel(&mut self, ui: &mut egui::Ui) {
+        render_stack1d_panel(ui, &mut self.stack1d_panel);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(p_str) = self.stack1d_panel.pending_open_native_path.take() {
+            self.path_input = p_str;
+            self.load_path_auto();
+        }
+        if self.stack1d_panel.pending_send_to_metabolomics {
+            self.stack1d_panel.pending_send_to_metabolomics = false;
+            let cohort = self.stack1d_panel.build_metabolomics_cohort_samples();
+            if cohort.len() >= 3 {
+                let n = cohort.len();
+                self.metabolomics_panel.set_cohort_and_run(cohort);
+                self.workspace_mode = WorkspaceMode::Metabolomics;
+                self.responsive_shell.mobile_family = MobileWorkspaceFamily::ChemStudio;
+                self.responsive_shell.chem_tab = MobileChemTab::Metabolomics;
+                self.status_msg =
+                    format!("Sent {n} 1D spectra into Metabolomics PCA / OPLS-DA / STOCSY Studio");
+            }
+        }
+    }
+
     fn apply_drop_outcome(&mut self, outcome: IngestDropOutcome) {
         match outcome {
             IngestDropOutcome::NefSession {
@@ -3823,12 +3894,23 @@ impl NmrWorkbenchApp {
             IngestDropOutcome::TextTable { source_name, text } => {
                 self.load_text_in_memory(&text, &source_name);
             }
+            IngestDropOutcome::Spectra1D {
+                source_name,
+                spectra,
+            } => {
+                let n = spectra.len();
+                self.stack1d_panel.load_user_spectra(spectra);
+                self.activate_1d_studio_mode();
+                self.status_msg =
+                    format!("Loaded {n} 1D spectrum(a) from '{source_name}' into 1D NMR Studio");
+            }
             IngestDropOutcome::Workspace(panel) => {
                 let n_exp = panel.inventory.experiments.len();
                 let root = panel.inventory.root_name.clone();
                 self.ingest_panel = *panel;
                 self.ingest_panel.open = true;
                 self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.show_stack1d_panel = false;
                 self.status_msg = format!(
                     "Classified '{root}' ({n_exp} experiment(s)) — review selection matrix"
                 );
@@ -3837,6 +3919,18 @@ impl NmrWorkbenchApp {
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        install_browser_folder_drop_hook();
+        if let Some(err) = poll_browser_drop_error() {
+            self.status_msg = format!("Browser ingest: {err}");
+        }
+        if let Some(batch) = poll_browser_dropped_payloads() {
+            match ingest_dropped_payloads(&batch) {
+                Ok(outcome) => self.apply_drop_outcome(outcome),
+                Err(e) => self.status_msg = format!("Ingest error: {e}"),
+            }
+            ctx.request_repaint();
+        }
+
         #[cfg(target_arch = "wasm32")]
         {
             let ready = self
@@ -4020,176 +4114,202 @@ impl NmrWorkbenchApp {
             }
             ui.separator();
 
-            ui.selectable_value(
-                &mut self.workspace_mode,
-                WorkspaceMode::ProteinNmr,
-                egui::RichText::new("🧬 Protein NMR & 3D Strips").strong(),
-            );
-            ui.selectable_value(
-                &mut self.workspace_mode,
-                WorkspaceMode::OctetChem,
-                egui::RichText::new("⚗️ Octet Chemical Draw & 1D NMR").strong(),
-            );
-            ui.selectable_value(
-                &mut self.workspace_mode,
-                WorkspaceMode::Dosy,
-                egui::RichText::new("🌊 2D DOSY Studio").strong(),
-            );
-            ui.selectable_value(
-                &mut self.workspace_mode,
-                WorkspaceMode::Metabolomics,
-                egui::RichText::new("🧪 Metabolomics & Biomarker Studio").strong(),
-            );
+            // 5 concise top-level Studio Tabs (1D NMR promoted to first-class tab)
+            let is_1d_tab = self.is_1d_studio_active();
+            let is_prot_tab =
+                self.workspace_mode == WorkspaceMode::ProteinNmr && !self.show_stack1d_panel;
+            if ui
+                .selectable_label(is_1d_tab, egui::RichText::new("📈 1D NMR").strong())
+                .on_hover_text("Full-width 1D NMR Studio: Bruker fid/1r, JCAMP, phase, baseline, multiplets & ACS/JOC report")
+                .clicked()
+            {
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.show_stack1d_panel = true;
+                self.show_relax_panel = false;
+                self.show_dynamics_panel = false;
+                if self.stack1d_panel.traces.is_empty() {
+                    let (traces, rois) = build_kinetics_demo_traces();
+                    self.stack1d_panel = Stack1dState::with_traces(traces);
+                    self.stack1d_panel.roi_regions = rois;
+                }
+            }
+            if ui
+                .selectable_label(
+                    is_prot_tab,
+                    egui::RichText::new("🧬 2D/3D Protein").strong(),
+                )
+                .on_hover_text("2D HSQC contours, 3D HNCACB/HNCO strips, automated assignment & 3D structure")
+                .clicked()
+            {
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.show_stack1d_panel = false;
+            }
+            if ui
+                .selectable_value(
+                    &mut self.workspace_mode,
+                    WorkspaceMode::OctetChem,
+                    egui::RichText::new("⚗️ Chemical Draw").strong(),
+                )
+                .clicked()
+            {
+                self.show_stack1d_panel = false;
+            }
+            if ui
+                .selectable_value(
+                    &mut self.workspace_mode,
+                    WorkspaceMode::Dosy,
+                    egui::RichText::new("🌊 DOSY").strong(),
+                )
+                .clicked()
+            {
+                self.show_stack1d_panel = false;
+            }
+            if ui
+                .selectable_value(
+                    &mut self.workspace_mode,
+                    WorkspaceMode::Metabolomics,
+                    egui::RichText::new("🧪 Metabolomics").strong(),
+                )
+                .clicked()
+            {
+                self.show_stack1d_panel = false;
+            }
+
+            if let Some(dock) = tablet_dock {
+                if is_prot_tab {
+                    ui.separator();
+                    ui.selectable_value(dock, TabletActiveDock::StripsRight, "📊 Strips");
+                    ui.selectable_value(dock, TabletActiveDock::Mol3dLeft, "🧊 3D");
+                    ui.selectable_value(dock, TabletActiveDock::Hidden, "⬜ Full");
+                }
+            }
+
             ui.separator();
             if ui
-                .button(egui::RichText::new("🚀 Load Built-in Demo Suite").strong())
-                .on_hover_text(
-                    "Populate Ubiquitin 2D HSQC + 3D HNCACB strips + 1UBQ 3D structure + 1D multiplet stack + 2D DOSY decays + 2-group Metabolomics cohort in memory (zero filesystem I/O)",
-                )
+                .button("📂 Open Folder")
+                .on_hover_text("Open a Bruker study / expno / pdata folder (1D, 2D, or 3D)")
+                .clicked()
+            {
+                #[cfg(target_arch = "wasm32")]
+                trigger_browser_folder_picker();
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.show_native_global_open_bar = !self.show_native_global_open_bar;
+                }
+            }
+            if ui
+                .button("📄 Open Files")
+                .on_hover_text("Open .zip/.tar.gz archive, .str/.nef/.tsv, .jdx, .ucsf/.ft2, .pdb/.cif, or .mol/.sdf")
+                .clicked()
+            {
+                #[cfg(target_arch = "wasm32")]
+                trigger_browser_files_picker();
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.show_native_global_open_bar = !self.show_native_global_open_bar;
+                }
+            }
+            if ui
+                .button("🚀 Demo")
+                .on_hover_text("Load built-in Ubiquitin 2D/3D + 1UBQ + 1D + DOSY + Metabolomics demo suite")
                 .clicked()
             {
                 self.load_builtin_demo_suite();
             }
-
-            if let Some(dock) = tablet_dock {
-                if self.workspace_mode == WorkspaceMode::ProteinNmr {
-                    ui.separator();
-                    ui.label(egui::RichText::new("Dock:").small().weak());
-                    ui.selectable_value(dock, TabletActiveDock::StripsRight, "📊 Strips");
-                    ui.selectable_value(dock, TabletActiveDock::Mol3dLeft, "🧊 3D PDB");
-                    ui.selectable_value(dock, TabletActiveDock::Hidden, "⬜ Full 2D");
-                }
-            }
-
-            ui.separator();
-            let bridge_running = self.mcp_bridge.is_running();
-            let mcp_label = if bridge_running {
-                "🔌 MCP Bridge ●"
-            } else {
-                "🔌 MCP Bridge"
-            };
-            let mcp_btn = egui::Button::new(
-                egui::RichText::new(mcp_label)
-                    .size(12.0)
-                    .color(egui::Color32::WHITE),
-            )
-            .fill(if bridge_running {
-                egui::Color32::from_rgb(28, 118, 76)
-            } else if self.show_mcp_bridge_window {
-                egui::Color32::from_rgb(48, 86, 148)
-            } else {
-                egui::Color32::from_rgb(34, 42, 58)
-            });
+            ui.toggle_value(&mut self.show_workflow_guide, "🧭 Guide")
+                .on_hover_text("Toggle step-by-step workflow bar & File/Edit/View menus");
             if ui
-                .add(mcp_btn)
-                .on_hover_text(
-                    "Open authenticated 127.0.0.1 loopback MCP live workbench bridge, undo log & client config",
-                )
+                .button("⌘K")
+                .on_hover_text("Open Command Palette (Cmd/Ctrl+K)")
                 .clicked()
             {
-                self.show_mcp_bridge_window = !self.show_mcp_bridge_window;
+                self.command_palette.open = !self.command_palette.open;
             }
             if ui
-                .small_button("📋 Copy MCP Config")
-                .on_hover_text("Copy ready-to-paste MCP client configuration JSON to clipboard")
+                .button("?")
+                .on_hover_text("About FERRIC & Keyboard Shortcuts")
                 .clicked()
             {
-                let cfg_json = self.mcp_bridge.build_client_config_json();
-                ui.ctx().copy_text(cfg_json);
-                self.status_msg = format!(
-                    "Copied {} MCP configuration JSON to clipboard",
-                    self.mcp_bridge.selected_client.label()
-                );
-            }
-
-            if self.workspace_mode == WorkspaceMode::OctetChem {
-                ui.separator();
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    ui.label("Path:");
-                    ui.add(egui::TextEdit::singleline(&mut self.path_input).desired_width(185.0));
-                    if ui.button("📂 Load (.cdxml/.cdx/.mol/.sdf/.jdx)").clicked() {
-                        self.load_path_auto();
-                    }
-                }
-                ui.label(
-                    egui::RichText::new(&self.octet_app.status_msg)
-                        .small()
-                        .color(egui::Color32::from_rgb(190, 210, 235)),
-                );
-            }
-        });
-    }
-
-    fn draw_top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("🧬 Ubiquitin Demo").clicked() {
-                self.load_demo_and_solve();
+                self.show_about_modal = !self.show_about_modal;
             }
 
             #[cfg(not(target_arch = "wasm32"))]
             {
-                ui.label("Path:");
-                ui.add(egui::TextEdit::singleline(&mut self.path_input).desired_width(200.0));
+                let bridge_running = self.mcp_bridge.is_running();
+                let mcp_lbl = if bridge_running { "🔌 MCP ●" } else { "🔌 MCP" };
                 if ui
-                    .button("📂 Load (.str / .nef / .tsv / pdata / .ft2)")
+                    .selectable_label(self.show_mcp_bridge_window || bridge_running, mcp_lbl)
+                    .on_hover_text("Local 127.0.0.1 MCP live workbench bridge & client config")
                     .clicked()
                 {
-                    self.load_path_auto();
+                    self.show_mcp_bridge_window = !self.show_mcp_bridge_window;
                 }
             }
+        });
 
-            if ui.button("📋 Paste .str / .nef / .tsv").clicked() {
-                self.show_text_io_modal = !self.show_text_io_modal;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.show_native_global_open_bar {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Path:").strong());
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.path_input)
+                        .hint_text("Enter Bruker folder, .zip/.tar.gz, .str/.nef, .jdx, .ucsf/.ft2, .pdb, or .mol path…")
+                        .desired_width(460.0),
+                );
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Load").clicked() || enter {
+                    self.load_path_auto();
+                }
+                if ui.button("📋 Paste Text…").clicked() {
+                    self.show_text_io_modal = true;
+                }
+                if ui.small_button("✕").clicked() {
+                    self.show_native_global_open_bar = false;
+                }
+            });
+        }
+    }
+
+    fn draw_top_bar(&mut self, ui: &mut egui::Ui) {
+        let mut menu_actions: Vec<WorkbenchAction> = Vec::new();
+        ui.horizontal_wrapped(|ui| {
+            // 1. Sub-view pills inside 2D/3D Protein Studio
+            let on_hsqc = !self.show_relax_panel && !self.show_dynamics_panel;
+            if ui
+                .selectable_label(on_hsqc, "🎯 2D HSQC")
+                .on_hover_text("2D 1H-15N / 1H-13C HSQC contour viewport")
+                .clicked()
+            {
+                self.show_relax_panel = false;
+                self.show_dynamics_panel = false;
+                self.show_stack1d_panel = false;
+            }
+            if ui
+                .selectable_label(self.show_relax_panel, "📈 Relaxation S²")
+                .on_hover_text("R1, R2, hetNOE & Lipari-Szabo model-free S^2 dynamics")
+                .clicked()
+            {
+                self.show_relax_panel = true;
+                self.show_dynamics_panel = false;
+                self.show_stack1d_panel = false;
+            }
+            if ui
+                .selectable_label(self.show_dynamics_panel, "⚡ CEST / CPMG")
+                .on_hover_text("CEST minor-state saturation, CPMG dispersion & HSQC titration Kd")
+                .clicked()
+            {
+                self.show_dynamics_panel = true;
+                self.show_relax_panel = false;
+                self.show_stack1d_panel = false;
             }
 
             ui.separator();
-            egui::ComboBox::from_id_salt("gui_regime_kind")
-                .selected_text(format!("Regime: {}", self.regime_kind.label()))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.regime_kind,
-                        GuiRegimeKind::Globular,
-                        "Globular (¹H–¹⁵N HSQC + 3D)",
-                    );
-                    ui.selectable_value(
-                        &mut self.regime_kind,
-                        GuiRegimeKind::Idp13C,
-                        "13C-IDP (CON / CACO / CANCO + Pro)",
-                    );
-                    ui.selectable_value(
-                        &mut self.regime_kind,
-                        GuiRegimeKind::Paramagnetic,
-                        "Paramagnetic (PRE Blind-Zone + Metal)",
-                    );
-                });
-            if self.regime_kind == GuiRegimeKind::Paramagnetic {
-                ui.label(egui::RichText::new("Ligands:").small());
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.metal_ligands_input)
-                        .hint_text("auto motif or CYS26,HIS41")
-                        .desired_width(135.0),
-                );
-            } else if self.regime_kind == GuiRegimeKind::Idp13C {
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut self.idp_temp_k)
-                            .speed(0.5)
-                            .range(265.0..=335.0)
-                            .prefix("T ")
-                            .suffix(" K"),
-                    )
-                    .changed()
-                {
-                    self.refresh_propensity_report();
-                }
-                ui.label(egui::RichText::new("pH:").small());
-                if ui
-                    .add(egui::TextEdit::singleline(&mut self.idp_ph_input).desired_width(38.0))
-                    .changed()
-                {
-                    self.refresh_propensity_report();
-                }
+            if ui
+                .button("🔍 Pick Peaks")
+                .on_hover_text("Pick 2D HSQC root cross-peaks on the active spectrum")
+                .clicked()
+            {
+                self.pick_2d_roots();
             }
             if self.regime_kind != GuiRegimeKind::Idp13C {
                 egui::ComboBox::from_id_salt("gui_solver_kind")
@@ -4212,46 +4332,6 @@ impl NmrWorkbenchApp {
                         );
                     });
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let gpu_supported = (self.regime_kind == GuiRegimeKind::Globular
-                    && matches!(
-                        self.solver_kind,
-                        GuiSolverKind::Standard | GuiSolverKind::BayesSa
-                    ))
-                    || self.regime_kind == GuiRegimeKind::Idp13C;
-                ui.add_enabled(
-                    gpu_supported,
-                    egui::Checkbox::new(&mut self.use_gpu, "WebGPU Compute"),
-                )
-                .on_disabled_hover_text(
-                    "WebGPU Compute accelerates Standard SA, Bayesian SA (Cv Adaptive), and 13C-IDP multi-replica annealing; Evo-Graph and Paramagnetic run in f64 on CPU",
-                );
-            }
-            ui.add(egui::Slider::new(&mut self.replicas, 8..=256).text("Replicas"));
-            ui.add(egui::Slider::new(&mut self.steps_per_sys, 400..=4000).text("Steps/SS"));
-            if ui
-                .add(
-                    egui::Slider::new(&mut self.assign_cost, 0.0..=4.0)
-                        .text("Assign cost")
-                        .fixed_decimals(2),
-                )
-                .changed()
-                && !self.systems.is_empty()
-                && !self.sequence.is_empty()
-            {
-                let scfg = ScoreConfig {
-                    assign_cost: self.assign_cost,
-                    ..ScoreConfig::default()
-                };
-                self.u_mat = Some(unary_matrix(
-                    &self.systems,
-                    &self.sequence,
-                    &self.priors,
-                    &scfg,
-                ));
-            }
-
             let solve_btn = egui::Button::new(
                 egui::RichText::new("▶ Run Assignment")
                     .strong()
@@ -4261,55 +4341,145 @@ impl NmrWorkbenchApp {
             if ui.add(solve_btn).clicked() {
                 self.run_assignment();
             }
-
-            if ui.button("💾 Export").clicked() {
+            if ui
+                .button("💾 Export")
+                .on_hover_text("Save lossless NEF v1.1 session & assignments")
+                .clicked()
+            {
                 let ctx = ui.ctx().clone();
                 self.export_results(&ctx);
             }
+
+            ui.separator();
+            ui.toggle_value(&mut self.show_mol3d_viewport, "🧊 3D")
+                .on_hover_text("Show/hide left 3D Biomolecular Structure & Putty dock");
+            ui.toggle_value(&mut self.show_strips_dock, "📊 Strips")
+                .on_hover_text("Show/hide right 3D Sequential Strip Inspector dock");
+            if on_hsqc && !self.sequence.is_empty() {
+                ui.toggle_value(&mut self.show_sequence_ribbon, "🧬 Ribbon")
+                    .on_hover_text("Show/hide sequence assignment confidence ribbon");
+            }
+            ui.toggle_value(&mut self.show_advanced_protein_bar, "⚙ Tuning & Menus")
+                .on_hover_text("Expand File/Edit/View menus, Regime, SA replicas/steps, Picker SNR & Simulator");
         });
 
-        ui.add_space(3.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Simulator / Picker:").small().weak());
-            let mut changed_sim = false;
-            changed_sim |= ui
-                .add(
-                    egui::Slider::new(&mut self.sim_missing, 0.0..=0.25)
-                        .text("Missing")
-                        .fixed_decimals(2),
-                )
-                .changed();
-            changed_sim |= ui
-                .add(
-                    egui::Slider::new(&mut self.sim_spurious, 0.0..=0.20)
-                        .text("Spurious")
-                        .fixed_decimals(2),
-                )
-                .changed();
-            let _ = changed_sim;
-            if ui.small_button("🎲 Re-simulate & Solve").clicked() {
-                self.sim_seed = self.sim_seed.wrapping_add(1);
-                if let Some(r) = self.reference.clone() {
-                    self.load_from_reference(r);
-                    self.run_assignment();
+        if self.show_advanced_protein_bar {
+            ui.add_space(2.0);
+            let readiness = self.workspace_readiness();
+            menu_actions = draw_top_menu_bar(ui, &readiness);
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("📋 Paste .str / .nef / .tsv").clicked() {
+                    self.show_text_io_modal = !self.show_text_io_modal;
                 }
-            }
-            ui.separator();
-            ui.checkbox(&mut self.use_neural_picker, "Neural CNN")
-                .on_hover_text(
-                    "Toggle 2D separable residual CNN peak picker vs classical MAD picker",
+                egui::ComboBox::from_id_salt("gui_regime_kind")
+                    .selected_text(format!("Regime: {}", self.regime_kind.label()))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.regime_kind,
+                            GuiRegimeKind::Globular,
+                            "Globular (¹H–¹⁵N HSQC + 3D)",
+                        );
+                        ui.selectable_value(
+                            &mut self.regime_kind,
+                            GuiRegimeKind::Idp13C,
+                            "13C-IDP (CON / CACO / CANCO + Pro)",
+                        );
+                        ui.selectable_value(
+                            &mut self.regime_kind,
+                            GuiRegimeKind::Paramagnetic,
+                            "Paramagnetic (PRE Blind-Zone + Metal)",
+                        );
+                    });
+                if self.regime_kind == GuiRegimeKind::Paramagnetic {
+                    ui.label(egui::RichText::new("Ligands:").small());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.metal_ligands_input)
+                            .hint_text("auto motif or CYS26,HIS41")
+                            .desired_width(135.0),
+                    );
+                } else if self.regime_kind == GuiRegimeKind::Idp13C {
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut self.idp_temp_k)
+                                .speed(0.5)
+                                .range(265.0..=335.0)
+                                .prefix("T ")
+                                .suffix(" K"),
+                        )
+                        .changed()
+                    {
+                        self.refresh_propensity_report();
+                    }
+                    ui.label(egui::RichText::new("pH:").small());
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut self.idp_ph_input).desired_width(38.0))
+                        .changed()
+                    {
+                        self.refresh_propensity_report();
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let gpu_supported = (self.regime_kind == GuiRegimeKind::Globular
+                        && matches!(
+                            self.solver_kind,
+                            GuiSolverKind::Standard | GuiSolverKind::BayesSa
+                        ))
+                        || self.regime_kind == GuiRegimeKind::Idp13C;
+                    ui.add_enabled(
+                        gpu_supported,
+                        egui::Checkbox::new(&mut self.use_gpu, "WebGPU Compute"),
+                    );
+                }
+                ui.add(egui::Slider::new(&mut self.replicas, 8..=256).text("Replicas"));
+                ui.add(egui::Slider::new(&mut self.steps_per_sys, 400..=4000).text("Steps/SS"));
+                if ui
+                    .add(
+                        egui::Slider::new(&mut self.assign_cost, 0.0..=4.0)
+                            .text("Assign cost")
+                            .fixed_decimals(2),
+                    )
+                    .changed()
+                    && !self.systems.is_empty()
+                    && !self.sequence.is_empty()
+                {
+                    let scfg = ScoreConfig {
+                        assign_cost: self.assign_cost,
+                        ..ScoreConfig::default()
+                    };
+                    self.u_mat = Some(unary_matrix(
+                        &self.systems,
+                        &self.sequence,
+                        &self.priors,
+                        &scfg,
+                    ));
+                }
+                ui.separator();
+                ui.checkbox(&mut self.use_neural_picker, "Neural CNN");
+                ui.add(egui::Slider::new(&mut self.picker_snr, 3.0..=12.0).text("Pick SNR"));
+                ui.add(
+                    egui::Slider::new(&mut self.sim_missing, 0.0..=0.25)
+                        .text("Sim Missing")
+                        .fixed_decimals(2),
                 );
-            ui.add(egui::Slider::new(&mut self.picker_snr, 3.0..=12.0).text("Pick SNR"));
-            if ui.small_button("🔍 Pick 2D HSQC Peaks").clicked() {
-                self.pick_2d_roots();
-            }
-            ui.separator();
-            ui.label(
-                egui::RichText::new(&self.status_msg)
-                    .small()
-                    .color(egui::Color32::from_rgb(190, 210, 235)),
-            );
-        });
+                ui.add(
+                    egui::Slider::new(&mut self.sim_spurious, 0.0..=0.20)
+                        .text("Sim Spurious")
+                        .fixed_decimals(2),
+                );
+                if ui.small_button("🎲 Re-simulate & Solve").clicked() {
+                    self.sim_seed = self.sim_seed.wrapping_add(1);
+                    if let Some(r) = self.reference.clone() {
+                        self.load_from_reference(r);
+                        self.run_assignment();
+                    }
+                }
+            });
+        }
+        let ctx = ui.ctx().clone();
+        for act in menu_actions {
+            self.dispatch_workbench_action(&ctx, act);
+        }
     }
 
     fn draw_sequence_ribbon(&mut self, ui: &mut egui::Ui) {
@@ -5465,6 +5635,23 @@ impl NmrWorkbenchApp {
     }
 
     fn draw_right_inspector(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("📊 3D Strip Inspector");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("✕ Hide")
+                    .on_hover_text(
+                        "Hide Right Strip Inspector dock (reopen anytime via '📊 Strips')",
+                    )
+                    .clicked()
+                {
+                    self.show_strips_dock = false;
+                    self.responsive_shell.tablet_dock = TabletActiveDock::Hidden;
+                }
+            });
+        });
+        ui.separator();
+
         // 1. Metrics summary card if reference truth is present
         if let Some(m) = &self.metrics {
             egui::Frame::group(ui.style())
@@ -6324,84 +6511,254 @@ impl NmrWorkbenchApp {
         self.axis_rescue_notices.clear();
         self.axis_rescue_audits.clear();
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut ingested_recipes: BTreeMap<String, nmr_core::process::ProcessingRecipe> =
-            BTreeMap::new();
-
-        #[cfg(not(target_arch = "wasm32"))]
+        let mut ingested_recipes: BTreeMap<String, ProcessingRecipe> = BTreeMap::new();
         {
             let mut primary_2d: Option<Spectrum2D> = None;
             let mut overlays_2d: Vec<(String, Spectrum2D)> = Vec::new();
             let mut cubes_3d: Vec<(String, Spectrum3D)> = Vec::new();
             let mut processed_fids = 0usize;
 
-            for item in &plan.selected_experiments {
-                let Some(ref path) = item.resolved_path else {
-                    continue;
+            let find_mem_file = |exp_rel: &str, child: &str| -> Option<&[u8]> {
+                let prefix = exp_rel.trim_matches('/').trim_start_matches("./");
+                let target = if prefix.is_empty() || prefix == "." {
+                    child.to_string()
+                } else {
+                    format!("{prefix}/{child}")
                 };
+                if let Some(b) = plan.in_memory_files.get(&target) {
+                    return Some(b.as_slice());
+                }
+                let suffix = format!("/{target}");
+                plan.in_memory_files
+                    .iter()
+                    .find(|(k, _)| {
+                        k.eq_ignore_ascii_case(&target)
+                            || k.to_ascii_lowercase()
+                                .ends_with(&suffix.to_ascii_lowercase())
+                    })
+                    .map(|(_, v)| v.as_slice())
+            };
+
+            let find_mem_exact = |rel_path: &str| -> Option<&[u8]> {
+                let clean = rel_path.trim_matches('/').trim_start_matches("./");
+                if let Some(b) = plan.in_memory_files.get(clean) {
+                    return Some(b.as_slice());
+                }
+                let suffix = format!("/{clean}");
+                plan.in_memory_files
+                    .iter()
+                    .find(|(k, _)| {
+                        k.eq_ignore_ascii_case(clean)
+                            || k.to_ascii_lowercase()
+                                .ends_with(&suffix.to_ascii_lowercase())
+                    })
+                    .map(|(_, v)| v.as_slice())
+            };
+
+            for item in &plan.selected_experiments {
                 let exp_token = item.solver_exp_name.unwrap_or("HNCACB");
+                let rel = &item.experiment.relative_path;
+                let disp = &item.experiment.display_name;
+
                 match item.experiment.dimensionality {
                     ExperimentDimensionality::Dim2D => {
-                        let loaded_2d = if item.experiment.data_state == DataState::RawFid {
-                            match process_fid_dir_2d(path, false, false) {
-                                Ok((s2, mut recipe)) => {
-                                    recipe.enable_axis_rescue = self.enable_axis_rescue;
-                                    processed_fids += 1;
-                                    ingested_recipes
-                                        .insert(item.experiment.display_name.clone(), recipe);
-                                    Some(s2)
-                                }
-                                Err(_) => None,
+                        let mut loaded_2d: Option<Spectrum2D> = None;
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if let Some(ref path) = item.resolved_path {
+                            if path.exists() {
+                                loaded_2d = if item.experiment.data_state == DataState::RawFid {
+                                    match process_fid_dir_2d(path, false, false) {
+                                        Ok((s2, mut recipe)) => {
+                                            recipe.enable_axis_rescue = self.enable_axis_rescue;
+                                            processed_fids += 1;
+                                            ingested_recipes.insert(disp.clone(), recipe);
+                                            Some(s2)
+                                        }
+                                        Err(_) => None,
+                                    }
+                                } else {
+                                    match item.experiment.vendor {
+                                        ExperimentVendor::SparkyUcsf => read_ucsf_2d(path).ok(),
+                                        ExperimentVendor::NmrPipe => read_nmrpipe_2d(path).ok(),
+                                        ExperimentVendor::Bruker => {
+                                            let pdata = path.join("pdata").join("1");
+                                            read_bruker_pdata_2d(if pdata.exists() {
+                                                &pdata
+                                            } else {
+                                                path
+                                            })
+                                            .ok()
+                                        }
+                                        _ => None,
+                                    }
+                                };
                             }
-                        } else {
-                            match item.experiment.vendor {
-                                ExperimentVendor::SparkyUcsf => read_ucsf_2d(path).ok(),
-                                ExperimentVendor::NmrPipe => read_nmrpipe_2d(path).ok(),
-                                ExperimentVendor::Bruker => {
-                                    let pdata = path.join("pdata").join("1");
-                                    read_bruker_pdata_2d(if pdata.exists() { &pdata } else { path })
-                                        .ok()
+                        }
+
+                        // Cross-platform in-memory loader (`wasm32` browser + `.zip`/`.tar.gz` archives)
+                        if loaded_2d.is_none() && !plan.in_memory_files.is_empty() {
+                            if item.experiment.data_state == DataState::RawFid {
+                                if let (Some(acqus_b), Some(acqu2s_b), Some(ser_b)) = (
+                                    find_mem_file(rel, "acqus")
+                                        .or_else(|| find_mem_file(rel, "acqu")),
+                                    find_mem_file(rel, "acqu2s")
+                                        .or_else(|| find_mem_file(rel, "acqu2")),
+                                    find_mem_file(rel, "ser"),
+                                ) {
+                                    let acqus_s = String::from_utf8_lossy(acqus_b);
+                                    let acqu_s = find_mem_file(rel, "acqu")
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    let acqu2s_s = String::from_utf8_lossy(acqu2s_b);
+                                    let acqu2_s = find_mem_file(rel, "acqu2")
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    let procs_s = find_mem_file(rel, "pdata/1/procs")
+                                        .or_else(|| find_mem_file(rel, "procs"))
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    let proc2s_s = find_mem_file(rel, "pdata/1/proc2s")
+                                        .or_else(|| find_mem_file(rel, "proc2s"))
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    let pp_s = find_mem_file(rel, "pulseprogram")
+                                        .or_else(|| find_mem_file(rel, "pulseprogram.precomp"))
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    let nl_s = find_mem_file(rel, "nuslist")
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    if let Ok(fid2d) = read_bruker_fid_2d_from_bytes(
+                                        disp,
+                                        &acqus_s,
+                                        acqu_s.as_deref(),
+                                        &acqu2s_s,
+                                        acqu2_s.as_deref(),
+                                        procs_s.as_deref(),
+                                        proc2s_s.as_deref(),
+                                        pp_s.as_deref(),
+                                        nl_s.as_deref(),
+                                        ser_b,
+                                        false,
+                                    ) {
+                                        let mut recipe = ProcessingRecipe::from_fid_2d(&fid2d);
+                                        recipe.enable_axis_rescue = self.enable_axis_rescue;
+                                        if let Ok(s2) = process_fid_2d_mut(&fid2d, &mut recipe) {
+                                            processed_fids += 1;
+                                            ingested_recipes.insert(disp.clone(), recipe);
+                                            loaded_2d = Some(s2);
+                                        }
+                                    }
                                 }
-                                _ => None,
+                            } else {
+                                loaded_2d = match item.experiment.vendor {
+                                    ExperimentVendor::SparkyUcsf => find_mem_exact(rel)
+                                        .and_then(|b| read_ucsf_2d_from_bytes(disp, b).ok()),
+                                    ExperimentVendor::NmrPipe => find_mem_exact(rel)
+                                        .and_then(|b| read_nmrpipe_2d_from_bytes(disp, b).ok()),
+                                    ExperimentVendor::Bruker => {
+                                        let procs_b = find_mem_file(rel, "pdata/1/procs")
+                                            .or_else(|| find_mem_file(rel, "procs"));
+                                        let proc2s_b = find_mem_file(rel, "pdata/1/proc2s")
+                                            .or_else(|| find_mem_file(rel, "proc2s"));
+                                        let rr_b = find_mem_file(rel, "pdata/1/2rr")
+                                            .or_else(|| find_mem_file(rel, "2rr"));
+                                        if let (Some(p1), Some(p2), Some(rr)) =
+                                            (procs_b, proc2s_b, rr_b)
+                                        {
+                                            read_bruker_pdata_2d_from_bytes(
+                                                disp,
+                                                &String::from_utf8_lossy(p1),
+                                                &String::from_utf8_lossy(p2),
+                                                rr,
+                                            )
+                                            .ok()
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                };
                             }
-                        };
+                        }
+
                         if let Some(s2) = loaded_2d {
                             if primary_2d.is_none() && exp_token == "HSQC" {
                                 primary_2d = Some(s2);
                             } else {
-                                overlays_2d.push((item.experiment.display_name.clone(), s2));
+                                overlays_2d.push((disp.clone(), s2));
                             }
                         }
                     }
                     ExperimentDimensionality::Dim3D => {
-                        let loaded_3d = if item.experiment.data_state == DataState::RawFid {
-                            match process_fid_dir_3d(path, exp_token, false, false) {
-                                Ok((s3, mut recipe)) => {
-                                    recipe.enable_axis_rescue = self.enable_axis_rescue;
-                                    processed_fids += 1;
-                                    ingested_recipes
-                                        .insert(item.experiment.display_name.clone(), recipe);
-                                    Some(s3)
-                                }
-                                Err(_) => None,
+                        let mut loaded_3d: Option<Spectrum3D> = None;
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if let Some(ref path) = item.resolved_path {
+                            if path.exists() {
+                                loaded_3d = if item.experiment.data_state == DataState::RawFid {
+                                    match process_fid_dir_3d(path, exp_token, false, false) {
+                                        Ok((s3, mut recipe)) => {
+                                            recipe.enable_axis_rescue = self.enable_axis_rescue;
+                                            processed_fids += 1;
+                                            ingested_recipes.insert(disp.clone(), recipe);
+                                            Some(s3)
+                                        }
+                                        Err(_) => None,
+                                    }
+                                } else {
+                                    match item.experiment.vendor {
+                                        ExperimentVendor::SparkyUcsf => {
+                                            read_ucsf_3d(path, exp_token).ok()
+                                        }
+                                        ExperimentVendor::NmrPipe => {
+                                            read_nmrpipe_3d(path, exp_token).ok()
+                                        }
+                                        ExperimentVendor::Bruker => {
+                                            let pdata = path.join("pdata").join("1");
+                                            read_bruker_pdata_3d(
+                                                if pdata.exists() { &pdata } else { path },
+                                                exp_token,
+                                            )
+                                            .ok()
+                                        }
+                                        _ => None,
+                                    }
+                                };
                             }
-                        } else {
-                            match item.experiment.vendor {
-                                ExperimentVendor::SparkyUcsf => read_ucsf_3d(path, exp_token).ok(),
-                                ExperimentVendor::NmrPipe => read_nmrpipe_3d(path, exp_token).ok(),
+                        }
+
+                        if loaded_3d.is_none() && !plan.in_memory_files.is_empty() {
+                            loaded_3d = match item.experiment.vendor {
+                                ExperimentVendor::SparkyUcsf => find_mem_exact(rel)
+                                    .and_then(|b| read_ucsf_3d_from_bytes(disp, exp_token, b).ok()),
+                                ExperimentVendor::NmrPipe => find_mem_exact(rel).and_then(|b| {
+                                    read_nmrpipe_3d_from_bytes(disp, exp_token, b).ok()
+                                }),
                                 ExperimentVendor::Bruker => {
-                                    let pdata = path.join("pdata").join("1");
-                                    read_bruker_pdata_3d(
-                                        if pdata.exists() { &pdata } else { path },
-                                        exp_token,
-                                    )
-                                    .ok()
+                                    let p1 = find_mem_file(rel, "pdata/1/procs")
+                                        .or_else(|| find_mem_file(rel, "procs"));
+                                    let p2 = find_mem_file(rel, "pdata/1/proc2s")
+                                        .or_else(|| find_mem_file(rel, "proc2s"));
+                                    let p3 = find_mem_file(rel, "pdata/1/proc3s")
+                                        .or_else(|| find_mem_file(rel, "proc3s"));
+                                    let rrr = find_mem_file(rel, "pdata/1/3rrr")
+                                        .or_else(|| find_mem_file(rel, "3rrr"));
+                                    if let (Some(b1), Some(b2), Some(b3), Some(br)) =
+                                        (p1, p2, p3, rrr)
+                                    {
+                                        read_bruker_pdata_3d_from_bytes(
+                                            disp,
+                                            exp_token,
+                                            &String::from_utf8_lossy(b1),
+                                            &String::from_utf8_lossy(b2),
+                                            &String::from_utf8_lossy(b3),
+                                            br,
+                                        )
+                                        .ok()
+                                    } else {
+                                        None
+                                    }
                                 }
                                 _ => None,
-                            }
-                        };
+                            };
+                        }
+
                         if let Some(s3) = loaded_3d {
-                            cubes_3d.push((item.experiment.display_name.clone(), s3));
+                            cubes_3d.push((disp.clone(), s3));
                         }
                     }
                     _ => {}
@@ -6498,10 +6855,7 @@ impl NmrWorkbenchApp {
         }
 
         self.sync_session_from_app_fresh(&plan.root_name);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.session.state.processing_recipes = ingested_recipes;
-        }
+        self.session.state.processing_recipes = ingested_recipes;
         self.rebuild_systems_and_matrices();
         if run_full_pipeline && !self.sequence.is_empty() && !self.peaks.is_empty() {
             self.run_assignment();
@@ -7203,6 +7557,78 @@ impl NmrWorkbenchApp {
                 }
                 IngestAction::ProcessPickAndRun(plan) => {
                     self.execute_ingest_plan(plan, true);
+                }
+                IngestAction::OpenSelected1dInStudio(plan) => {
+                    let mut spectra = Vec::new();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    for item in &plan.selected_experiments {
+                        if matches!(
+                            item.experiment.dimensionality,
+                            ExperimentDimensionality::Dim1D
+                        ) {
+                            if let Some(ref p) = item.resolved_path {
+                                if let Ok(loaded) = nmr_core::nmr1d::load_1d_input(p, None, false) {
+                                    if let Ok(sp) =
+                                        nmr_core::nmr1d::prepare_loaded_1d_for_studio(loaded)
+                                    {
+                                        spectra.push(sp);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if spectra.is_empty() && !plan.in_memory_files.is_empty() {
+                        let sel_prefixes: Vec<String> = plan
+                            .selected_experiments
+                            .iter()
+                            .filter(|s| {
+                                matches!(
+                                    s.experiment.dimensionality,
+                                    ExperimentDimensionality::Dim1D
+                                )
+                            })
+                            .map(|s| {
+                                s.experiment
+                                    .relative_path
+                                    .trim_matches('/')
+                                    .trim_start_matches("./")
+                                    .to_string()
+                            })
+                            .collect();
+                        let refs: Vec<(&str, &[u8])> = plan
+                            .in_memory_files
+                            .iter()
+                            .filter(|(k, _)| {
+                                sel_prefixes.iter().any(|pr| {
+                                    pr.is_empty()
+                                        || pr == "."
+                                        || k.as_str() == pr
+                                        || k.starts_with(&format!("{pr}/"))
+                                        || k.contains(&format!("/{pr}/"))
+                                })
+                            })
+                            .map(|(k, v)| (k.as_str(), v.as_slice()))
+                            .collect();
+                        if let Ok(loaded) =
+                            nmr_core::nmr1d::load_1d_from_virtual_entries(&refs, None, false)
+                        {
+                            for it in loaded {
+                                if let Ok(sp) = nmr_core::nmr1d::prepare_loaded_1d_for_studio(it) {
+                                    spectra.push(sp);
+                                }
+                            }
+                        }
+                    }
+                    if !spectra.is_empty() {
+                        let n = spectra.len();
+                        self.stack1d_panel.load_user_spectra(spectra);
+                        self.activate_1d_studio_mode();
+                        self.status_msg =
+                            format!("Opened {n} checked 1D experiment(s) in 1D NMR Studio");
+                    } else {
+                        self.status_msg =
+                            "Could not load checked 1D rows — select valid 1D Bruker/JCAMP experiments.".to_string();
+                    }
                 }
             }
         }
@@ -7907,7 +8333,7 @@ impl NmrWorkbenchApp {
                 });
             ui.add_space(4.0);
         }
-        render_stack1d_panel(ui, &mut self.stack1d_panel);
+        self.render_and_sync_stack1d_panel(ui);
     }
 }
 
@@ -7958,7 +8384,19 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
     }
 
     fn show_mol3d_dock(&self) -> bool {
-        self.show_mol3d_viewport
+        self.show_mol3d_viewport && !self.is_1d_studio_active()
+    }
+
+    fn show_strips_dock(&self) -> bool {
+        self.show_strips_dock && !self.is_1d_studio_active()
+    }
+
+    fn show_workflow_guide(&self) -> bool {
+        self.show_workflow_guide
+    }
+
+    fn is_1d_full_canvas(&self) -> bool {
+        self.is_1d_studio_active()
     }
 
     fn draw_desktop_mode_header(
@@ -8004,56 +8442,17 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
                     });
                 });
         }
-        ui.add_space(4.0);
-        self.draw_sequence_ribbon(ui);
+        let on_hsqc =
+            !self.show_relax_panel && !self.show_dynamics_panel && !self.show_stack1d_panel;
+        if on_hsqc && self.show_sequence_ribbon {
+            ui.add_space(3.0);
+            self.draw_sequence_ribbon(ui);
+        }
     }
 
     fn draw_protein_desktop_central(&mut self, ui: &mut egui::Ui) -> egui::Rect {
         let mut relax_actions = Vec::new();
         let mut dyn_output: Option<DynamicsStudioOutput> = None;
-        ui.horizontal(|ui| {
-            if ui
-                .selectable_label(
-                    !self.show_relax_panel && !self.show_dynamics_panel && !self.show_stack1d_panel,
-                    "🎯 2D HSQC Contours",
-                )
-                .clicked()
-            {
-                self.show_relax_panel = false;
-                self.show_dynamics_panel = false;
-                self.show_stack1d_panel = false;
-            }
-            if ui
-                .selectable_label(self.show_relax_panel, "📈 Relaxation & Lipari–Szabo S²")
-                .clicked()
-            {
-                self.show_relax_panel = true;
-                self.show_dynamics_panel = false;
-                self.show_stack1d_panel = false;
-            }
-            if ui
-                .selectable_label(self.show_dynamics_panel, "⚡ CEST / CPMG / CSP & Kd")
-                .clicked()
-            {
-                self.show_dynamics_panel = true;
-                self.show_relax_panel = false;
-                self.show_stack1d_panel = false;
-            }
-            if ui
-                .selectable_label(self.show_stack1d_panel, "📚 1D Stack / Overlay / Kinetics")
-                .clicked()
-            {
-                self.show_stack1d_panel = true;
-                self.show_relax_panel = false;
-                self.show_dynamics_panel = false;
-                if self.stack1d_panel.traces.is_empty() {
-                    let (traces, rois) = build_kinetics_demo_traces();
-                    self.stack1d_panel = Stack1dState::with_traces(traces);
-                    self.stack1d_panel.roi_regions = rois;
-                }
-            }
-        });
-        ui.separator();
         let body_avail = ui.available_rect_before_wrap();
         let viz_rect = if self.show_relax_panel {
             relax_actions = self.relax_panel.ui(
@@ -8074,7 +8473,7 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
             dyn_output = Some(self.dynamics_panel.show(ui));
             body_avail
         } else if self.show_stack1d_panel {
-            render_stack1d_panel(ui, &mut self.stack1d_panel);
+            self.render_and_sync_stack1d_panel(ui);
             body_avail
         } else {
             self.draw_hsqc_canvas(ui)
@@ -8097,6 +8496,30 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
     }
 
     fn draw_mol3d_structure_view(&mut self, ui: &mut egui::Ui) -> egui::Rect {
+        ui.horizontal(|ui| {
+            ui.strong("🧊 3D Structure");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("✕ Hide")
+                    .on_hover_text("Close 3D Structure dock (reopen anytime via '🧊 3D')")
+                    .clicked()
+                {
+                    self.show_mol3d_viewport = false;
+                    self.responsive_shell.tablet_dock = TabletActiveDock::Hidden;
+                }
+                if (self.loaded_pdb_text.is_some() || self.mol3d_panel.ensemble.is_some())
+                    && ui
+                        .small_button("Unload")
+                        .on_hover_text("Clear currently loaded 3D PDB/mmCIF structure")
+                        .clicked()
+                {
+                    self.loaded_pdb_text = None;
+                    self.mol3d_panel = Mol3dViewerPanel::new();
+                    self.status_msg = "Unloaded 3D structure.".to_string();
+                }
+            });
+        });
+        ui.separator();
         let display_ref = self.pred_ref.as_ref().or(self.reference.as_ref());
         let wgpu_rs = self.wgpu_render_state.clone();
         let picked = self.mol3d_panel.ui(
@@ -8144,7 +8567,7 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
             self.stack1d_panel = Stack1dState::with_traces(traces);
             self.stack1d_panel.roi_regions = rois;
         }
-        render_stack1d_panel(ui, &mut self.stack1d_panel);
+        self.render_and_sync_stack1d_panel(ui);
     }
 
     fn draw_mobile_seq_and_tools_view(
@@ -9181,8 +9604,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
     fn test_nmr_workbench_app_responsive_mobile_tablet_desktop_and_touch() {
         use super::*;
         use nmr_gui::workflow_bar::{
-            MobileChemTab, MobileDynamicsSubTab, MobileProteinTab, MobileWorkspaceFamily,
-            ResponsiveBreakpoint, TabletActiveDock,
+            MobileDynamicsSubTab, MobileProteinTab, ResponsiveBreakpoint, TabletActiveDock,
         };
 
         let mut octet_app = OctetDrawPanel::new();
@@ -9233,7 +9655,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             show_sidechain_inspector: false,
             overwrite_curated_rings: false,
             mol3d_panel: Mol3dViewerPanel::new(),
-            show_mol3d_viewport: true,
+            show_mol3d_viewport: false,
             loaded_pdb_text: None,
             relax_panel: RelaxPanelState::new(),
             show_relax_panel: false,
@@ -9241,6 +9663,11 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             show_dynamics_panel: false,
             stack1d_panel: Stack1dState::default(),
             show_stack1d_panel: false,
+            show_strips_dock: true,
+            show_workflow_guide: false,
+            show_advanced_protein_bar: false,
+            show_sequence_ribbon: true,
+            show_native_global_open_bar: false,
             hsqc_spec: None,
             hsqc_arc: Arc::new(Vec::new()),
             hsqc_gen: 1,
@@ -9373,10 +9800,19 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         assert!(mt.left_dock_rect.is_none() && mt.right_dock_rect.is_some());
         assert!(mt.central_panel_rect.width() >= 420.0);
 
-        // Desktop 1440x900: dual docks preserved
+        // Desktop 1440x900: dual docks preserved when both docks are enabled
+        app.show_mol3d_viewport = true;
+        app.show_strips_dock = true;
         let md = run_app_frame(&ctx, 1440.0, 900.0, Vec::new(), &mut app);
         assert_eq!(md.breakpoint, ResponsiveBreakpoint::DesktopFull);
         assert!(md.left_dock_rect.is_some() && md.right_dock_rect.is_some());
+
+        // 1D Studio full-canvas mode hides both side docks automatically
+        app.activate_1d_studio_mode();
+        let md_1d = run_app_frame(&ctx, 1440.0, 900.0, Vec::new(), &mut app);
+        assert!(md_1d.left_dock_rect.is_none() && md_1d.right_dock_rect.is_none());
+        app.show_stack1d_panel = false;
+        app.show_strips_dock = true;
 
         // Live 2-finger pinch zoom on NmrWorkbenchApp's own `draw_hsqc_canvas`
         app.responsive_shell.mobile_family = MobileWorkspaceFamily::ProteinNmr;
