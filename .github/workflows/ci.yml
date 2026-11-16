@@ -51,6 +51,14 @@ jobs:
       - name: Run workspace release test suite (nmr-core + nmr-gpu parity)
         run: cargo test --release --workspace
 
+      - name: Run Python brand, packager & docs self-tests
+        run: |
+          python3 scripts/render_ferric_brand.py --out-dir docs/assets/brand --self-test
+          python3 scripts/render_ferric_brand_concepts.py --out-dir docs/assets/brand/concepts/previews --self-test
+          python3 scripts/package_release.py --self-test
+          python3 scripts/build_docs_manual.py --self-test
+          git diff --exit-code -- docs/assets/brand/
+
       - name: Realistic Bruker 5-Seed Benchmark Gate (standard >= 82% Acc / >= 90% HC Prec; evo-graph >= 95% Acc / >= 96% HC Prec)
         shell: bash
         run: |

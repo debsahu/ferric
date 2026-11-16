@@ -2527,7 +2527,9 @@ def build_site_files(
     for fav_name in ("favicon.svg", "favicon-32.png"):
         fav_path = brand_dir / fav_name
         if fav_path.is_file():
-            files[f"assets/{fav_name}"] = fav_path.read_bytes()
+            fav_bytes = fav_path.read_bytes()
+            files[f"assets/{fav_name}"] = fav_bytes
+            files[fav_name] = fav_bytes
 
     has_demo = demo_html_path is not None and demo_html_path.is_file()
     if has_demo and demo_html_path is not None:
