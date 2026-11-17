@@ -14,6 +14,10 @@
 //! - Bruker digital filter group delay: Moskau, *Concepts Magn. Reson.* 2002, 15, 164–176;
 //!   Westler & Abildgaard (1996, NMRFAM technical note) `(DSPFVS, DECIM)` lookup table.
 //! - IUPAC indirect chemical shift referencing: Wishart et al., *J. Biomol. NMR* 1995, 6, 135–140.
+//! - Protonless `13C`-detected `2D CON` / `(HCa)CON` IPAP virtual homonuclear $J_{C'C\alpha}$
+//!   time-domain spin-state recombination: Bermel, W., Bertini, I., Felli, I. C., Peruzzini, R.,
+//!   & Pierattelli, R., *ChemPhysChem* **2010**, 11, 689–695; Duma, L., Hediger, S., Lesage, A.,
+//!   & Emsley, L., *J. Magn. Reson.* **2003**, 162, 90–101.
 //! - Public file formats: Bruker JCAMP-DX v5.0 (`acqus`/`acqu2s`/`acqu3s`, `procs`, `nuslist`,
 //!   `fid`/`ser`) and Varian/Agilent VnmrJ Data File Reference (`datafilehead`, `datablockhead`,
 //!   `procpar`, `sampling.sch`).
@@ -625,6 +629,46 @@ fn bruker_proc_is_processed(pm: &HashMap<String, String>) -> bool {
         .unwrap_or(true)
 }
 
+/// Guard against stale un-transformed `pdata/1/procs` (`proc2s`/`proc3s`) templates copied by TopSpin `edc`
+/// from an unrelated parent experiment (where `FT_mod != 0` was inherited from the parent, yet `SW_p` still
+/// reflects the parent experiment's sweep width rather than the current `acqus`/`acqu2s` `SW_h`).
+fn bruker_proc_matches_acqu_sw(
+    proc_map: Option<&HashMap<String, String>>,
+    acqu_sw_hz: f64,
+) -> bool {
+    let Some(pm) = proc_map else {
+        return false;
+    };
+    let Some(sw_p) = pm
+        .get("SW_p")
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&v| v > 0.0 && v.is_finite())
+    else {
+        return true;
+    };
+    if acqu_sw_hz <= 0.0 || !acqu_sw_hz.is_finite() {
+        return true;
+    }
+    if (sw_p - acqu_sw_hz).abs() / acqu_sw_hz <= 0.025 {
+        return true;
+    }
+    let si = pm
+        .get("SI")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let ftsize = pm
+        .get("FTSIZE")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    if ftsize > si && si > 0 {
+        let full_sw_p = sw_p * (ftsize as f64) / (si as f64);
+        if (full_sw_p - acqu_sw_hz).abs() / acqu_sw_hz <= 0.025 {
+            return true;
+        }
+    }
+    false
+}
+
 fn read_optional_bruker_proc(dir: &Path, proc_name: &str) -> Option<HashMap<String, String>> {
     if let Some(pdata_dir) = find_dir_ci(dir, "pdata") {
         if let Some(d1) = find_dir_ci(&pdata_dir, "1") {
@@ -922,9 +966,10 @@ fn parse_bruker_direct_axis(
         .or_else(|| sw_ppm_acq.map(|sw| sw * sfo1))
         .ok_or("missing ##$SW_h / ##$SW in Bruker acqus")?;
 
-    let proc_sf = bruker_proc_valid_sf(procs, bf1);
+    let procs_cal = procs.filter(|p| bruker_proc_matches_acqu_sw(Some(p), sw_hz));
+    let proc_sf = bruker_proc_valid_sf(procs_cal, bf1);
     let obs_mhz = proc_sf.unwrap_or(bf1);
-    let first_ppm = bruker_proc_first_ppm(procs, sfo1, obs_mhz, bf1, sw_hz);
+    let first_ppm = bruker_proc_first_ppm(procs_cal, sfo1, obs_mhz, bf1, sw_hz);
 
     let grpdly_raw = acqus
         .get("GRPDLY")
@@ -939,7 +984,7 @@ fn parse_bruker_direct_axis(
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(1);
 
-    let pknl_enabled = procs
+    let pknl_enabled = procs_cal
         .and_then(|p| p.get("PKNL"))
         .map(|v| !v.eq_ignore_ascii_case("no") && v != "0")
         .unwrap_or(true);
@@ -954,11 +999,11 @@ fn parse_bruker_direct_axis(
     let raw_nuc = acqus
         .get("NUC1")
         .map(String::as_str)
-        .or_else(|| procs.and_then(|p| p.get("AXNUC").map(String::as_str)))
+        .or_else(|| procs_cal.and_then(|p| p.get("AXNUC").map(String::as_str)))
         .unwrap_or("1H");
     let label = normalize_nucleus_label(raw_nuc, "1H");
 
-    let mut stored_proc = extract_bruker_stored_proc(procs);
+    let mut stored_proc = extract_bruker_stored_proc(procs_cal);
     if let Some(ref mut td_eff) = stored_proc.td_eff {
         // Convert TopSpin scalar word count TDeff to complex points
         *td_eff = (*td_eff / 2).min(td / 2).max(1);
@@ -1145,31 +1190,6 @@ fn parse_bruker_indirect_axis(
         .get("BF1")
         .and_then(|v| v.parse().ok())
         .unwrap_or(sfo1_raw);
-    let mut sfo1 = resolve_bruker_indirect_sfo1(acqus, proc_ind, &label, sfo1_raw, bf1);
-
-    let proc_sf = bruker_proc_valid_sf(proc_ind, bf1);
-    let obs_mhz = proc_sf.unwrap_or(bf1);
-
-    // When `proc_ind` lacks a valid calibrated `(SF, OFFSET)` and `pulprog` resolved an active
-    // intra-scan `fq*list` carrier (e.g. XWIN-NMR 2.x `hncof.s` switching `O3 = 45 ppm` -> `176 ppm`
-    // for `d0` CO evolution), honor that hardware synthesizer carrier!
-    let has_valid_proc_offset = proc_ind.is_some_and(|p| {
-        let sf_ok = p.get("SF").is_none() || proc_sf.is_some();
-        let off_ok = p
-            .get("OFFSET")
-            .and_then(|v| v.parse::<f64>().ok())
-            .is_some_and(|o| o.is_finite() && o.abs() <= 1000.0);
-        sf_ok && off_ok
-    });
-    if !has_valid_proc_offset {
-        if let Some(ip) = ind_phys {
-            let raw_ppm = (sfo1 - bf1) * 1.0e6 / bf1.max(1e-6);
-            if (ip.carrier_ppm - raw_ppm).abs() > 1.0 && ip.obs_mhz > 0.0 {
-                sfo1 = ip.obs_mhz * (1.0 + ip.carrier_ppm * 1.0e-6);
-            }
-        }
-    }
-
     // In TopSpin 2.x/3.x/4.x indirect acqu2s/acqu3s, SW (ppm) * SFO1 (MHz) is authoritative
     // because SW_h may retain a default 1D template value or be omitted.
     let sw_ppm_acq = acqu_ind
@@ -1186,14 +1206,40 @@ fn parse_bruker_indirect_axis(
         })
         .ok_or_else(|| format!("missing ##$SW / ##$SW_h in Bruker indirect ({fallback_label})"))?;
 
-    let first_ppm = bruker_proc_first_ppm(proc_ind, sfo1, obs_mhz, bf1, sw_hz);
+    let proc_cal = proc_ind.filter(|p| bruker_proc_matches_acqu_sw(Some(p), sw_hz));
+    let mut sfo1 = resolve_bruker_indirect_sfo1(acqus, proc_cal, &label, sfo1_raw, bf1);
+
+    let proc_sf = bruker_proc_valid_sf(proc_cal, bf1);
+    let obs_mhz = proc_sf.unwrap_or(bf1);
+
+    // When `proc_ind` lacks a valid calibrated `(SF, OFFSET)` and `pulprog` resolved an active
+    // intra-scan `fq*list` carrier (e.g. XWIN-NMR 2.x `hncof.s` switching `O3 = 45 ppm` -> `176 ppm`
+    // for `d0` CO evolution), honor that hardware synthesizer carrier!
+    let has_valid_proc_offset = proc_cal.is_some_and(|p| {
+        let sf_ok = p.get("SF").is_none() || proc_sf.is_some();
+        let off_ok = p
+            .get("OFFSET")
+            .and_then(|v| v.parse::<f64>().ok())
+            .is_some_and(|o| o.is_finite() && o.abs() <= 1000.0);
+        sf_ok && off_ok
+    });
+    if !has_valid_proc_offset {
+        if let Some(ip) = ind_phys {
+            let raw_ppm = (sfo1 - bf1) * 1.0e6 / bf1.max(1e-6);
+            if (ip.carrier_ppm - raw_ppm).abs() > 1.0 && ip.obs_mhz > 0.0 {
+                sfo1 = ip.obs_mhz * (1.0 + ip.carrier_ppm * 1.0e-6);
+            }
+        }
+    }
+
+    let first_ppm = bruker_proc_first_ppm(proc_cal, sfo1, obs_mhz, bf1, sw_hz);
 
     let complex_points = if quad_mode == QuadMode::Qf {
         td
     } else {
         td / 2
     };
-    let mut stored_proc = extract_bruker_stored_proc(proc_ind);
+    let mut stored_proc = extract_bruker_stored_proc(proc_cal);
     if let Some(ref mut td_eff) = stored_proc.td_eff {
         *td_eff = if quad_mode == QuadMode::Qf {
             (*td_eff).min(complex_points).max(1)
@@ -1201,7 +1247,7 @@ fn parse_bruker_indirect_axis(
             (*td_eff / 2).min(complex_points).max(1)
         };
     }
-    if proc_ind.and_then(|p| p.get("FCOR")).is_none()
+    if proc_cal.and_then(|p| p.get("FCOR")).is_none()
         && ind_phys.is_some_and(|ip| ip.half_dwell_sampling || ip.predicted_phc1_deg.abs() >= 360.0)
     {
         stored_proc.fcor = Some(1.0);
@@ -1446,6 +1492,222 @@ fn scale_complex_slice(dst: &mut [Complex64], scale: f64) {
     }
 }
 
+/// Default virtual homonuclear ${}^1J_{C'C\alpha}$ scalar coupling in Hz (`53.0 Hz`) for
+/// `13C`-detected IPAP `2D CON` / `(HCa)CON` / `CACO` virtual decoupling
+/// (Bermel et al., *ChemPhysChem* **2010**, 11, 689–695; Duma et al., *J. Magn. Reson.* **2003**, 162, 90–101).
+pub const DEFAULT_IPAP_J_CACO_HZ: f64 = 53.0;
+
+/// True when a Bruker `13C`-detected 2D pulse program uses IPAP virtual decoupling
+/// (`c_hcacon_ia`, `c_con_ia`, `c_caco_ia`, `ipap`, or `pulseprogram` body containing
+/// `splitcomb [ipap` / `using IPAP scheme`).
+pub fn is_bruker_2d_ipap_sequence(pulprog: &str, pp_text: Option<&str>) -> bool {
+    let mut base = pulprog
+        .trim()
+        .trim_matches(|c| c == '<' || c == '>')
+        .trim()
+        .to_ascii_lowercase();
+    for ext in [
+        ".sas", ".sct", ".fp2", ".bv", ".fp", ".fa", ".be", ".1", ".2", ".3",
+    ] {
+        if let Some(stripped) = base.strip_suffix(ext) {
+            base = stripped.to_string();
+        }
+    }
+    if base.ends_with("_ia")
+        || base.ends_with("_iasq")
+        || base.ends_with("_ipap")
+        || base.contains("ipap")
+        || base.starts_with("conia")
+        || base.starts_with("cacoia")
+    {
+        return true;
+    }
+    if let Some(txt) = pp_text {
+        let low = txt.to_ascii_lowercase();
+        if low.contains("splitcomb [ipap")
+            || low.contains("splitcomb ipap")
+            || low.contains("using ipap scheme")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolve virtual ${}^1J_{C'C\alpha}$ coupling in Hz (`40.0..=68.0 Hz`) from `acqus` / `pulseprogram`
+/// `CNST` definitions when explicitly documented as `J(COCa)` / `J(CaCO)`, defaulting to `53.0 Hz`
+/// (Bermel et al., *ChemPhysChem* **2010**, 11, 689–695).
+pub fn resolve_bruker_ipap_j_caco_hz(
+    acqus: &HashMap<String, String>,
+    pp_text: Option<&str>,
+) -> f64 {
+    for key in ["JCACO", "JCOCA", "J_CACO"] {
+        if let Some(val) = acqus
+            .get(key)
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| (40.0..=68.0).contains(v))
+        {
+            return val;
+        }
+    }
+    if let Some(txt) = pp_text {
+        let cnst_vals: Vec<f64> = acqus
+            .get("CNST")
+            .map(|s| {
+                s.split_whitespace()
+                    .filter_map(|t| t.parse::<f64>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !cnst_vals.is_empty() {
+            for raw_line in txt.lines() {
+                let low = raw_line.trim().to_ascii_lowercase();
+                let mentions_j_caco = low.contains("j(coca)")
+                    || low.contains("j(caco)")
+                    || low.contains("jcoca")
+                    || low.contains("jcaco")
+                    || low.contains("j_caco");
+                if !mentions_j_caco {
+                    continue;
+                }
+                if let Some(pos) = low.find("cnst") {
+                    let digits: String = low[pos + 4..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if let Ok(idx) = digits.parse::<usize>() {
+                        if let Some(&v) = cnst_vals.get(idx) {
+                            if (40.0..=68.0).contains(&v) {
+                                return v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    DEFAULT_IPAP_J_CACO_HZ
+}
+
+/// Clean-room time-domain IPAP spin-state virtual decoupling of an In-Phase (`ip`) and Antiphase (`ap`)
+/// `13C'` FID pair (Bermel, Bertini, Felli, Peruzzini & Pierattelli, *ChemPhysChem* **2010**, 11, 689–695;
+/// Duma, Hediger, Lesage & Emsley, *J. Magn. Reson.* **2003**, 162, 90–101):
+/// $$s_{\text{dec}}(t_2) = 2\Bigl(s_{\text{IP}}(t_2)\cos(\pi J_{C'C\alpha} t_2) + i\,s_{\text{AP}}(t_2)\sin(\pi J_{C'C\alpha} t_2)\Bigr),$$
+/// with $t_2 = (k - \text{group\_delay\_pts}) / \text{sw\_hz}$, collapsing antiphase/in-phase
+/// $\pm \tfrac{1}{2} J_{C'C\alpha}$ doublets into sharp singlets at the unshifted chemical shift $\omega_{C'}$.
+pub fn recombine_ipap_trace_pair_1d(
+    ip: &[Complex64],
+    ap: &[Complex64],
+    sw_hz: f64,
+    group_delay_pts: f64,
+    j_caco_hz: f64,
+    out: &mut [Complex64],
+) {
+    let n = ip.len().min(ap.len()).min(out.len());
+    let inv_sw = 1.0 / sw_hz.max(1e-6);
+    let gd = group_delay_pts.max(0.0);
+    let omega_j = std::f64::consts::PI * j_caco_hz;
+    for k in 0..n {
+        let t = ((k as f64) - gd) * inv_sw;
+        let (sin_j, cos_j) = (omega_j * t).sin_cos();
+        let (re_ip, im_ip) = (ip[k][0], ip[k][1]);
+        let (re_ap, im_ap) = (ap[k][0], ap[k][1]);
+        // i * (re_ap + i im_ap) = -im_ap + i re_ap
+        out[k] = [
+            2.0 * (re_ip * cos_j - im_ap * sin_j),
+            2.0 * (im_ip * cos_j + re_ap * sin_j),
+        ];
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn is_bruker_ipap_ser_unsplit(
+    axis_x_label: &str,
+    pulprog: &str,
+    pp_text: Option<&str>,
+    acqu2s: &HashMap<String, String>,
+    acqu2s_raw_txt: Option<&str>,
+    bytes_len: usize,
+    n_post_ipap_traces: usize,
+    td_words: usize,
+    word_bytes: usize,
+) -> bool {
+    if axis_x_label != "13C"
+        || n_post_ipap_traces == 0
+        || !is_bruker_2d_ipap_sequence(pulprog, pp_text)
+    {
+        return false;
+    }
+    if acqu2s_raw_txt.is_some_and(|t| t.to_ascii_lowercase().contains("splitcomb")) {
+        return false;
+    }
+    let fn_iloop = acqu2s
+        .get("FnILOOP")
+        .and_then(|s| s.trim().parse::<usize>().ok());
+    if fn_iloop == Some(1) {
+        return false;
+    }
+    if fn_iloop == Some(2) {
+        return true;
+    }
+    let raw_trace_bytes = td_words * word_bytes;
+    let stride_1024 = raw_trace_bytes.div_ceil(1024) * 1024;
+    let stride_256w = td_words.div_ceil(256) * 256 * word_bytes;
+    let two_n = 2 * n_post_ipap_traces;
+    bytes_len == two_n * stride_1024 || bytes_len == two_n * stride_256w
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn decode_bruker_2d_logical_trace(
+    bytes: &[u8],
+    logical_idx: usize,
+    observed_raw: usize,
+    stride: usize,
+    trace_byte_len: usize,
+    n0: usize,
+    big_endian: bool,
+    dtypa: i32,
+    ipap_interleaved: bool,
+    sw_hz: f64,
+    group_delay_pts: f64,
+    j_caco_hz: f64,
+) -> Vec<Complex64> {
+    if !ipap_interleaved {
+        if logical_idx >= observed_raw {
+            return vec![[0.0, 0.0]; n0];
+        }
+        let off = logical_idx * stride;
+        return decode_bruker_trace(&bytes[off..off + trace_byte_len], n0 * 2, big_endian, dtypa);
+    }
+    let ip_raw = 2 * logical_idx;
+    if ip_raw >= observed_raw {
+        return vec![[0.0, 0.0]; n0];
+    }
+    let off_ip = ip_raw * stride;
+    let ip_tr = decode_bruker_trace(
+        &bytes[off_ip..off_ip + trace_byte_len],
+        n0 * 2,
+        big_endian,
+        dtypa,
+    );
+    let ap_raw = ip_raw + 1;
+    let ap_tr = if ap_raw < observed_raw {
+        let off_ap = ap_raw * stride;
+        decode_bruker_trace(
+            &bytes[off_ap..off_ap + trace_byte_len],
+            n0 * 2,
+            big_endian,
+            dtypa,
+        )
+    } else {
+        vec![[0.0, 0.0]; n0]
+    };
+    let mut out = vec![[0.0, 0.0]; n0];
+    recombine_ipap_trace_pair_1d(&ip_tr, &ap_tr, sw_hz, group_delay_pts, j_caco_hz, &mut out);
+    out
+}
+
 /// Read a Bruker 1D `fid` directory (`acqus` + `fid`).
 /// Decode a Bruker 1D FID directly from in-memory `acqus` (+ optional `acqu`, `procs`) and `fid` bytes (`wasm32`-compatible).
 pub fn read_bruker_fid_1d_from_bytes(
@@ -1524,8 +1786,14 @@ pub fn read_bruker_fid_2d_from_bytes(
     }
     let vdir = Path::new(name);
     let is_fntype_nus = validate_bruker_fntype(vdir, &acqus, &[&acqu2s])?;
-    let procs = procs_txt.map(parse_jcamp_str).filter(|m| !m.is_empty());
-    let proc2s = proc2s_txt.map(parse_jcamp_str).filter(|m| !m.is_empty());
+    let procs = procs_txt
+        .map(parse_jcamp_str)
+        .filter(|m| !m.is_empty())
+        .filter(bruker_proc_is_processed);
+    let proc2s = proc2s_txt
+        .map(parse_jcamp_str)
+        .filter(|m| !m.is_empty())
+        .filter(bruker_proc_is_processed);
 
     let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
     let word_bytes = if dtypa == 2 { 8 } else { 4 };
@@ -1564,10 +1832,13 @@ pub fn read_bruker_fid_2d_from_bytes(
         Some(td_full_y),
         None,
     )?;
-    if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
-        let pulprog = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
+    let proc2s_cal = proc2s
+        .as_ref()
+        .filter(|p| bruker_proc_matches_acqu_sw(Some(p), axis_y.sw_hz));
+    let pulprog_str = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
+    if proc2s_cal.and_then(|p| p.get("REVERSE")).is_none() {
         axis_y.stored_proc.reverse =
-            infer_bruker_raw_indirect_reverse(pulseprogram_txt, pulprog, 1, axis_y.quad_mode);
+            infer_bruker_raw_indirect_reverse(pulseprogram_txt, pulprog_str, 1, axis_y.quad_mode);
     }
 
     let q1_mult = if axis_y.quad_mode == QuadMode::Qf {
@@ -1581,6 +1852,7 @@ pub fn read_bruker_fid_2d_from_bytes(
     let trace_byte_len = n0 * 2 * word_bytes;
     let mut data = vec![[0.0, 0.0]; n1 * 2 * n0];
     let mut truncated_traces: Option<(usize, usize)> = None;
+    let j_caco_hz = resolve_bruker_ipap_j_caco_hz(&acqus, pulseprogram_txt);
 
     let nus_mask = if is_nus {
         let nl = nuslist_txt
@@ -1599,57 +1871,94 @@ pub fn read_bruker_fid_2d_from_bytes(
                 coords.len()
             ));
         }
-        let (stride, observed) = determine_bruker_ser_stride_opts(
+        let ipap_interleaved = is_bruker_ipap_ser_unsplit(
+            &axis_x.label,
+            pulprog_str,
+            pulseprogram_txt,
+            &acqu2s,
+            Some(acqu2s_txt),
             bytes.len(),
             n_acq_traces,
+            axis_x.td_raw,
+            word_bytes,
+        );
+        let expected_raw_traces = if ipap_interleaved {
+            2 * n_acq_traces
+        } else {
+            n_acq_traces
+        };
+        let (stride, observed) = determine_bruker_ser_stride_opts(
+            bytes.len(),
+            expected_raw_traces,
             axis_x.td_raw,
             word_bytes,
             false,
             allow_truncated_fid,
             vdir,
         )?;
-        if observed < n_acq_traces {
-            truncated_traces = Some((observed, n_acq_traces));
+        if observed < expected_raw_traces {
+            truncated_traces = Some((observed, expected_raw_traces));
         }
-        let zero_tr = vec![[0.0, 0.0]; n0];
+        let obs_logical = if ipap_interleaved {
+            observed.div_ceil(2)
+        } else {
+            observed
+        };
         let mut counts = vec![0usize; n1];
         let mut tmp_cos = vec![[0.0, 0.0]; n0];
         let mut tmp_sin = vec![[0.0, 0.0]; n0];
         for (row_idx, &k1) in coords.iter().enumerate() {
             if axis_y.quad_mode == QuadMode::Qf {
-                if row_idx >= observed {
+                if row_idx >= obs_logical {
                     break;
                 }
-                let off = row_idx * stride;
-                let tr = decode_bruker_trace(
-                    &bytes[off..off + trace_byte_len],
-                    n0 * 2,
+                let tr = decode_bruker_2d_logical_trace(
+                    bytes,
+                    row_idx,
+                    observed,
+                    stride,
+                    trace_byte_len,
+                    n0,
                     big_endian,
                     dtypa,
+                    ipap_interleaved,
+                    axis_x.sw_hz,
+                    axis_x.group_delay,
+                    j_caco_hz,
                 );
                 add_complex_slice(&mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0], &tr);
             } else {
-                if 2 * row_idx >= observed {
+                if 2 * row_idx >= obs_logical {
                     break;
                 }
-                let off0 = (2 * row_idx) * stride;
-                let z0 = decode_bruker_trace(
-                    &bytes[off0..off0 + trace_byte_len],
-                    n0 * 2,
+                let z0 = decode_bruker_2d_logical_trace(
+                    bytes,
+                    2 * row_idx,
+                    observed,
+                    stride,
+                    trace_byte_len,
+                    n0,
                     big_endian,
                     dtypa,
+                    ipap_interleaved,
+                    axis_x.sw_hz,
+                    axis_x.group_delay,
+                    j_caco_hz,
                 );
-                let z1 = if 2 * row_idx + 1 < observed {
-                    let off1 = (2 * row_idx + 1) * stride;
-                    decode_bruker_trace(
-                        &bytes[off1..off1 + trace_byte_len],
-                        n0 * 2,
-                        big_endian,
-                        dtypa,
-                    )
-                } else {
-                    zero_tr.clone()
-                };
+                let z1 = decode_bruker_2d_logical_trace(
+                    bytes,
+                    2 * row_idx + 1,
+                    observed,
+                    stride,
+                    trace_byte_len,
+                    n0,
+                    big_endian,
+                    dtypa,
+                    ipap_interleaved,
+                    axis_x.sw_hz,
+                    axis_x.group_delay,
+                    j_caco_hz,
+                );
                 recombine_quad_pair(axis_y.quad_mode, k1, &z0, &z1, &mut tmp_cos, &mut tmp_sin);
                 add_complex_slice(&mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0], &tmp_cos);
                 add_complex_slice(&mut data[(k1 * 2 + 1) * n0..(k1 * 2 + 2) * n0], &tmp_sin);
@@ -1666,53 +1975,90 @@ pub fn read_bruker_fid_2d_from_bytes(
         }
         Some(counts.into_iter().map(|c| c > 0).collect())
     } else {
-        let (stride, observed) = determine_bruker_ser_stride_opts(
+        let ipap_interleaved = is_bruker_ipap_ser_unsplit(
+            &axis_x.label,
+            pulprog_str,
+            pulseprogram_txt,
+            &acqu2s,
+            Some(acqu2s_txt),
             bytes.len(),
             td_acq_y,
+            axis_x.td_raw,
+            word_bytes,
+        );
+        let expected_raw_traces = if ipap_interleaved {
+            2 * td_acq_y
+        } else {
+            td_acq_y
+        };
+        let (stride, observed) = determine_bruker_ser_stride_opts(
+            bytes.len(),
+            expected_raw_traces,
             axis_x.td_raw,
             word_bytes,
             true,
             allow_truncated_fid,
             vdir,
         )?;
-        if observed < td_acq_y {
-            truncated_traces = Some((observed, td_acq_y));
+        if observed < expected_raw_traces {
+            truncated_traces = Some((observed, expected_raw_traces));
         }
-        let zero_tr = vec![[0.0, 0.0]; n0];
+        let obs_logical = if ipap_interleaved {
+            observed.div_ceil(2)
+        } else {
+            observed
+        };
         if axis_y.quad_mode == QuadMode::Qf {
-            for k1 in 0..n1.min(observed) {
-                let off = k1 * stride;
-                let tr = decode_bruker_trace(
-                    &bytes[off..off + trace_byte_len],
-                    n0 * 2,
+            for k1 in 0..n1.min(obs_logical) {
+                let tr = decode_bruker_2d_logical_trace(
+                    bytes,
+                    k1,
+                    observed,
+                    stride,
+                    trace_byte_len,
+                    n0,
                     big_endian,
                     dtypa,
+                    ipap_interleaved,
+                    axis_x.sw_hz,
+                    axis_x.group_delay,
+                    j_caco_hz,
                 );
                 data[(k1 * 2) * n0..(k1 * 2 + 1) * n0].copy_from_slice(&tr);
             }
         } else {
             for k1 in 0..n1 {
-                if 2 * k1 >= observed {
+                if 2 * k1 >= obs_logical {
                     break;
                 }
-                let off0 = (2 * k1) * stride;
-                let z0 = decode_bruker_trace(
-                    &bytes[off0..off0 + trace_byte_len],
-                    n0 * 2,
+                let z0 = decode_bruker_2d_logical_trace(
+                    bytes,
+                    2 * k1,
+                    observed,
+                    stride,
+                    trace_byte_len,
+                    n0,
                     big_endian,
                     dtypa,
+                    ipap_interleaved,
+                    axis_x.sw_hz,
+                    axis_x.group_delay,
+                    j_caco_hz,
                 );
-                let z1 = if 2 * k1 + 1 < observed {
-                    let off1 = (2 * k1 + 1) * stride;
-                    decode_bruker_trace(
-                        &bytes[off1..off1 + trace_byte_len],
-                        n0 * 2,
-                        big_endian,
-                        dtypa,
-                    )
-                } else {
-                    zero_tr.clone()
-                };
+                let z1 = decode_bruker_2d_logical_trace(
+                    bytes,
+                    2 * k1 + 1,
+                    observed,
+                    stride,
+                    trace_byte_len,
+                    n0,
+                    big_endian,
+                    dtypa,
+                    ipap_interleaved,
+                    axis_x.sw_hz,
+                    axis_x.group_delay,
+                    j_caco_hz,
+                );
                 let (cos_slice, sin_slice) =
                     data[(k1 * 2) * n0..(k1 * 2 + 2) * n0].split_at_mut(n0);
                 recombine_quad_pair(axis_y.quad_mode, k1, &z0, &z1, cos_slice, sin_slice);
@@ -2176,15 +2522,22 @@ pub fn read_bruker_fid_2d_opts(
         Some(td_full_y),
         ind_phys_y,
     )?;
-    if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
+    let pp_txt = read_optional_bruker_pulseprogram(&dir)?;
+    let pulprog_str = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
+    let proc2s_cal = proc2s
+        .as_ref()
+        .filter(|p| bruker_proc_matches_acqu_sw(Some(p), axis_y.sw_hz));
+    if proc2s_cal.and_then(|p| p.get("REVERSE")).is_none() {
         axis_y.stored_proc.reverse = if let Some(ip) = ind_phys_y {
             ip.reverse_frequency
         } else {
-            let pp_txt = read_optional_bruker_pulseprogram(&dir)?;
-            let pulprog = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
-            infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog, 1, axis_y.quad_mode)
+            infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog_str, 1, axis_y.quad_mode)
         };
     }
+    let acqu2s_raw_txt = find_file_ci(&dir, "acqu2s")
+        .or_else(|| find_file_ci(&dir, "acqu2"))
+        .and_then(|p| read_text_lossy_capped(&p).ok());
+    let j_caco_hz = resolve_bruker_ipap_j_caco_hz(&acqus, pp_txt.as_deref());
     let q1_mult = if axis_y.quad_mode == QuadMode::Qf {
         1
     } else {
@@ -2213,59 +2566,96 @@ pub fn read_bruker_fid_2d_opts(
                 coords.len()
             ));
         }
-        let (stride, observed) = determine_bruker_ser_stride_opts(
+        let ipap_interleaved = is_bruker_ipap_ser_unsplit(
+            &axis_x.label,
+            pulprog_str,
+            pp_txt.as_deref(),
+            &acqu2s,
+            acqu2s_raw_txt.as_deref(),
             bytes.len(),
             n_acq_traces,
+            axis_x.td_raw,
+            word_bytes,
+        );
+        let expected_raw_traces = if ipap_interleaved {
+            2 * n_acq_traces
+        } else {
+            n_acq_traces
+        };
+        let (stride, observed) = determine_bruker_ser_stride_opts(
+            bytes.len(),
+            expected_raw_traces,
             axis_x.td_raw,
             word_bytes,
             false,
             allow_truncated_fid,
             &dir,
         )?;
-        if observed < n_acq_traces {
-            truncated_traces = Some((observed, n_acq_traces));
-            warn_truncated_fid(&dir, observed, n_acq_traces);
+        if observed < expected_raw_traces {
+            truncated_traces = Some((observed, expected_raw_traces));
+            warn_truncated_fid(&dir, observed, expected_raw_traces);
         }
-        let zero_tr = vec![[0.0, 0.0]; n0];
+        let obs_logical = if ipap_interleaved {
+            observed.div_ceil(2)
+        } else {
+            observed
+        };
         let mut counts = vec![0usize; n1];
         let mut tmp_cos = vec![[0.0, 0.0]; n0];
         let mut tmp_sin = vec![[0.0, 0.0]; n0];
 
         for (row_idx, &k1) in coords.iter().enumerate() {
             if axis_y.quad_mode == QuadMode::Qf {
-                if row_idx >= observed {
+                if row_idx >= obs_logical {
                     break;
                 }
-                let off = row_idx * stride;
-                let tr = decode_bruker_trace(
-                    &bytes[off..off + trace_byte_len],
-                    n0 * 2,
+                let tr = decode_bruker_2d_logical_trace(
+                    &bytes,
+                    row_idx,
+                    observed,
+                    stride,
+                    trace_byte_len,
+                    n0,
                     big_endian,
                     dtypa,
+                    ipap_interleaved,
+                    axis_x.sw_hz,
+                    axis_x.group_delay,
+                    j_caco_hz,
                 );
                 add_complex_slice(&mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0], &tr);
             } else {
-                if 2 * row_idx >= observed {
+                if 2 * row_idx >= obs_logical {
                     break;
                 }
-                let off0 = (2 * row_idx) * stride;
-                let z0 = decode_bruker_trace(
-                    &bytes[off0..off0 + trace_byte_len],
-                    n0 * 2,
+                let z0 = decode_bruker_2d_logical_trace(
+                    &bytes,
+                    2 * row_idx,
+                    observed,
+                    stride,
+                    trace_byte_len,
+                    n0,
                     big_endian,
                     dtypa,
+                    ipap_interleaved,
+                    axis_x.sw_hz,
+                    axis_x.group_delay,
+                    j_caco_hz,
                 );
-                let z1 = if 2 * row_idx + 1 < observed {
-                    let off1 = (2 * row_idx + 1) * stride;
-                    decode_bruker_trace(
-                        &bytes[off1..off1 + trace_byte_len],
-                        n0 * 2,
-                        big_endian,
-                        dtypa,
-                    )
-                } else {
-                    zero_tr.clone()
-                };
+                let z1 = decode_bruker_2d_logical_trace(
+                    &bytes,
+                    2 * row_idx + 1,
+                    observed,
+                    stride,
+                    trace_byte_len,
+                    n0,
+                    big_endian,
+                    dtypa,
+                    ipap_interleaved,
+                    axis_x.sw_hz,
+                    axis_x.group_delay,
+                    j_caco_hz,
+                );
                 recombine_quad_pair(axis_y.quad_mode, k1, &z0, &z1, &mut tmp_cos, &mut tmp_sin);
                 add_complex_slice(&mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0], &tmp_cos);
                 add_complex_slice(&mut data[(k1 * 2 + 1) * n0..(k1 * 2 + 2) * n0], &tmp_sin);
@@ -2282,54 +2672,91 @@ pub fn read_bruker_fid_2d_opts(
         }
         Some(counts.into_iter().map(|c| c > 0).collect())
     } else {
-        let (stride, observed) = determine_bruker_ser_stride_opts(
+        let ipap_interleaved = is_bruker_ipap_ser_unsplit(
+            &axis_x.label,
+            pulprog_str,
+            pp_txt.as_deref(),
+            &acqu2s,
+            acqu2s_raw_txt.as_deref(),
             bytes.len(),
             td_acq_y,
+            axis_x.td_raw,
+            word_bytes,
+        );
+        let expected_raw_traces = if ipap_interleaved {
+            2 * td_acq_y
+        } else {
+            td_acq_y
+        };
+        let (stride, observed) = determine_bruker_ser_stride_opts(
+            bytes.len(),
+            expected_raw_traces,
             axis_x.td_raw,
             word_bytes,
             true,
             allow_truncated_fid,
             &dir,
         )?;
-        if observed < td_acq_y {
-            truncated_traces = Some((observed, td_acq_y));
-            warn_truncated_fid(&dir, observed, td_acq_y);
+        if observed < expected_raw_traces {
+            truncated_traces = Some((observed, expected_raw_traces));
+            warn_truncated_fid(&dir, observed, expected_raw_traces);
         }
-        let zero_tr = vec![[0.0, 0.0]; n0];
+        let obs_logical = if ipap_interleaved {
+            observed.div_ceil(2)
+        } else {
+            observed
+        };
         if axis_y.quad_mode == QuadMode::Qf {
-            for k1 in 0..n1.min(observed) {
-                let off = k1 * stride;
-                let tr = decode_bruker_trace(
-                    &bytes[off..off + trace_byte_len],
-                    n0 * 2,
+            for k1 in 0..n1.min(obs_logical) {
+                let tr = decode_bruker_2d_logical_trace(
+                    &bytes,
+                    k1,
+                    observed,
+                    stride,
+                    trace_byte_len,
+                    n0,
                     big_endian,
                     dtypa,
+                    ipap_interleaved,
+                    axis_x.sw_hz,
+                    axis_x.group_delay,
+                    j_caco_hz,
                 );
                 data[(k1 * 2) * n0..(k1 * 2 + 1) * n0].copy_from_slice(&tr);
             }
         } else {
             for k1 in 0..n1 {
-                if 2 * k1 >= observed {
+                if 2 * k1 >= obs_logical {
                     break;
                 }
-                let off0 = (2 * k1) * stride;
-                let z0 = decode_bruker_trace(
-                    &bytes[off0..off0 + trace_byte_len],
-                    n0 * 2,
+                let z0 = decode_bruker_2d_logical_trace(
+                    &bytes,
+                    2 * k1,
+                    observed,
+                    stride,
+                    trace_byte_len,
+                    n0,
                     big_endian,
                     dtypa,
+                    ipap_interleaved,
+                    axis_x.sw_hz,
+                    axis_x.group_delay,
+                    j_caco_hz,
                 );
-                let z1 = if 2 * k1 + 1 < observed {
-                    let off1 = (2 * k1 + 1) * stride;
-                    decode_bruker_trace(
-                        &bytes[off1..off1 + trace_byte_len],
-                        n0 * 2,
-                        big_endian,
-                        dtypa,
-                    )
-                } else {
-                    zero_tr.clone()
-                };
+                let z1 = decode_bruker_2d_logical_trace(
+                    &bytes,
+                    2 * k1 + 1,
+                    observed,
+                    stride,
+                    trace_byte_len,
+                    n0,
+                    big_endian,
+                    dtypa,
+                    ipap_interleaved,
+                    axis_x.sw_hz,
+                    axis_x.group_delay,
+                    j_caco_hz,
+                );
                 let (cos_slice, sin_slice) =
                     data[(k1 * 2) * n0..(k1 * 2 + 2) * n0].split_at_mut(n0);
                 recombine_quad_pair(axis_y.quad_mode, k1, &z0, &z1, cos_slice, sin_slice);

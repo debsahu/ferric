@@ -63,6 +63,7 @@ pub mod stereospec;
 pub mod structure;
 pub mod topology;
 pub mod torsion_db;
+pub mod water;
 
 // ============================================================================
 // Seamless Interoperability Bridges: `octet_mol` <-> `octet_analyt` <-> `octet_render`

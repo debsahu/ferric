@@ -3236,11 +3236,16 @@ fn classify_pulse_token(
         if !compact.contains("cbcaconh")
             && !compact.contains("conh")
             && (compact.contains("hcacon")
+                || base.starts_with("c_hcacon")
+                || base.starts_with("hcacon")
                 || base.starts_with("c_con")
                 || base.starts_with("con_")
+                || base.starts_with("con_ia")
+                || base.starts_with("ipap_con")
                 || base.ends_with("_con")
                 || compact == "con"
                 || compact == "2dcon"
+                || compact.starts_with("conia")
                 || compact.starts_with("conias")
                 || compact.starts_with("conipap")
                 || compact.starts_with("ipapcon")
@@ -3824,6 +3829,113 @@ fn display_name_from_rel(rel_path: &str, root_name: &str) -> String {
     }
 }
 
+/// True when a Bruker 2D experiment (`no acqu3s`) actually references the variable delay (`vd`),
+/// variable counter/pulse (`vc`/`vp`/`va`), or frequency-offset (`fq1`..`fq8`) hardware list in its
+/// `PULPROG` name, `acqus` list parameter, or non-comment `pulseprogram` body (preventing TopSpin's
+/// default unused `fq1list`/`vdlist`/`vclist`/`vplist` template files from promoting 2D spectra to `Pseudo3D`).
+fn bruker_2d_references_schedule(
+    kind: &str,
+    pulprog: Option<&str>,
+    a1: &BTreeMap<String, String>,
+    pulseprogram_bytes: Option<&[u8]>,
+) -> bool {
+    let pp_name_low = pulprog.unwrap_or("").trim().to_ascii_lowercase();
+    let has_word = |text: &str, word: &str| -> bool {
+        let bytes = text.as_bytes();
+        let wb = word.as_bytes();
+        if wb.is_empty() || bytes.len() < wb.len() {
+            return false;
+        }
+        let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut pos = 0usize;
+        while pos + wb.len() <= bytes.len() {
+            if let Some(rel) = text[pos..].find(word) {
+                let s = pos + rel;
+                let e = s + wb.len();
+                let l_ok = s == 0 || !is_id(bytes[s - 1]);
+                let r_ok = e == bytes.len() || !is_id(bytes[e]);
+                if l_ok && r_ok {
+                    return true;
+                }
+                pos = s + 1;
+            } else {
+                break;
+            }
+        }
+        false
+    };
+    let code_text: Option<String> = pulseprogram_bytes.map(|b| {
+        String::from_utf8_lossy(b)
+            .lines()
+            .map(|l| l.split(';').next().unwrap_or("").trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase()
+    });
+    let acqus_list_active = |keys: &[&str]| -> bool {
+        keys.iter().any(|k| {
+            jcamp_str(a1, k).is_some_and(|v| {
+                let low = v.trim().to_ascii_lowercase();
+                !low.is_empty() && low != "none" && low != "off"
+            })
+        })
+    };
+
+    match kind {
+        "vd" => {
+            if acqus_list_active(&["VDLIST"]) {
+                return true;
+            }
+            if let Some(ref code) = code_text {
+                has_word(code, "vd") || has_word(code, "ivd")
+            } else {
+                has_word(&pp_name_low, "vd")
+                    || pp_name_low.contains("t1")
+                    || pp_name_low.contains("r1")
+                    || pp_name_low.contains("t2")
+                    || pp_name_low.contains("r2")
+            }
+        }
+        "vc" => {
+            if acqus_list_active(&["VCLIST", "VPLIST", "VALIST"]) {
+                return true;
+            }
+            if let Some(ref code) = code_text {
+                has_word(code, "vc")
+                    || has_word(code, "ivc")
+                    || has_word(code, "vp")
+                    || has_word(code, "ivp")
+                    || has_word(code, "va")
+                    || has_word(code, "iva")
+            } else {
+                has_word(&pp_name_low, "vc")
+                    || has_word(&pp_name_low, "vp")
+                    || pp_name_low.contains("cpmg")
+            }
+        }
+        "fq" => {
+            if acqus_list_active(&[
+                "FQ1LIST", "FQ2LIST", "FQ3LIST", "FQ4LIST", "FQ5LIST", "FQ6LIST", "FQ7LIST",
+                "FQ8LIST",
+            ]) && pp_name_low.contains("cest")
+            {
+                return true;
+            }
+            if let Some(ref code) = code_text {
+                [
+                    "fq1", "fq2", "fq3", "fq4", "fq5", "fq6", "fq7", "fq8", "fqlist",
+                ]
+                .iter()
+                .any(|tok| has_word(code, tok))
+            } else {
+                has_word(&pp_name_low, "fq1") || pp_name_low.contains("cest")
+            }
+        }
+        _ => false,
+    }
+}
+
 fn build_bruker_experiment(
     rel_root: &str,
     root_name: &str,
@@ -4145,22 +4257,26 @@ fn build_bruker_experiment(
         3 => ExperimentDimensionality::Dim3D,
         _ => ExperimentDimensionality::Dim4D,
     };
-    let prelim_pulprog_known = pulprog
+    let prelim_pulse_class = pulprog
         .as_deref()
-        .and_then(|pp| classify_pulse_token(pp, prelim_dim, &axes))
-        .is_some_and(|c| c != PulseSequenceClass::Unknown);
+        .and_then(|pp| classify_pulse_token(pp, prelim_dim, &axes));
+    let prelim_pulprog_known = prelim_pulse_class.is_some_and(|c| c != PulseSequenceClass::Unknown);
+    let prelim_is_dynamics = prelim_pulse_class.is_some_and(PulseSequenceClass::is_dynamics);
     let has_qf_or_unknown_indirect = axes
         .iter()
         .skip(1)
         .any(|a| matches!(a.quadrature, QuadratureKind::Qf | QuadratureKind::Unknown));
+    let has_candidate_schedule = (vd_len > 0 || vc_len > 0 || fq_len > 0)
+        && (ndim_raw >= 3
+            || !prelim_pulprog_known
+            || prelim_is_dynamics
+            || has_qf_or_unknown_indirect);
     let needs_pulprog_interp = grp.acqus.is_some()
         && (grp.difflist.is_some()
             || (grp.pulseprogram.is_some()
                 && ((!prelim_pulprog_known && ndim_raw >= 2)
                     || has_qf_or_unknown_indirect
-                    || vd_len > 0
-                    || vc_len > 0
-                    || fq_len > 0
+                    || has_candidate_schedule
                     || jcamp_usize(&a1, "AQSEQ") == Some(1)
                     || ndim_raw >= 3)));
 
@@ -4291,18 +4407,62 @@ fn build_bruker_experiment(
         if pi.aqseq == crate::pulprog::AcquisitionOrder::Aqseq312 {
             notes.push("AQSEQ=312 transposed indirect acquisition order".to_string());
         }
-        match pi.pseudo_3d_order {
-            crate::pulprog::Pseudo3DStorageOrder::T1Interleaved => {
-                notes.push("pseudo-3D t1-interleaved storage".to_string());
-            }
-            crate::pulprog::Pseudo3DStorageOrder::PlaneQueued if !is_dosy => {
-                notes.push("pseudo-3D plane-queued storage".to_string());
-            }
-            _ => {}
-        }
     } else if jcamp_usize(&a1, "AQSEQ") == Some(1) && ndim_raw == 3 {
         notes.push("AQSEQ=312 transposed indirect acquisition order".to_string());
     }
+
+    let is_genuine_dynamics = prelim_is_dynamics
+        || pulprog_interp.as_ref().is_some_and(|pi| {
+            pi.transfer_graph
+                .deduced_family
+                .to_pulse_sequence_class()
+                .is_dynamics()
+        });
+    let allow_2d_vd_pseudo = ndim_raw == 2
+        && vd_len > 1
+        && is_genuine_dynamics
+        && bruker_2d_references_schedule(
+            "vd",
+            pulprog.as_deref(),
+            &a1,
+            grp.pulseprogram.as_deref(),
+        );
+    let allow_2d_vc_pseudo = ndim_raw == 2
+        && vc_len > 1
+        && is_genuine_dynamics
+        && bruker_2d_references_schedule(
+            "vc",
+            pulprog.as_deref(),
+            &a1,
+            grp.pulseprogram.as_deref(),
+        );
+    let allow_2d_fq_pseudo = ndim_raw == 2
+        && fq_len >= 4
+        && is_genuine_dynamics
+        && bruker_2d_references_schedule(
+            "fq",
+            pulprog.as_deref(),
+            &a1,
+            grp.pulseprogram.as_deref(),
+        );
+    let allow_3d_vd_pseudo = ndim_raw >= 3
+        && vd_len > 0
+        && (d3_is_qf
+            || d2_inner_is_qf_in_3d
+            || any_indirect_qf_matches(vd_len)
+            || (vd_len > 1 && is_genuine_dynamics));
+    let allow_3d_vc_pseudo = ndim_raw >= 3
+        && vc_len > 0
+        && (d3_is_qf
+            || d2_inner_is_qf_in_3d
+            || any_indirect_qf_matches(vc_len)
+            || (vc_len > 1 && is_genuine_dynamics));
+    let allow_3d_fq_pseudo = ndim_raw >= 3
+        && fq_len >= 4
+        && (d3_is_qf
+            || d2_inner_is_qf_in_3d
+            || any_indirect_qf_matches(fq_len)
+            || is_genuine_dynamics);
 
     let mut pseudo_kind: Option<&'static str> = None;
     let dimensionality = if is_dosy {
@@ -4312,15 +4472,15 @@ fn build_bruker_experiment(
             2 => ExperimentDimensionality::Dim2D,
             _ => ExperimentDimensionality::Pseudo3D,
         }
-    } else if vd_len > 1 || (vd_len > 0 && (d3_is_qf || any_indirect_qf_matches(vd_len))) {
+    } else if allow_2d_vd_pseudo || allow_3d_vd_pseudo {
         pseudo_kind = Some("vdlist");
         notes.push(format!("pseudo-3D variable delay list ({vd_len} planes)"));
         ExperimentDimensionality::Pseudo3D
-    } else if vc_len > 1 || (vc_len > 0 && (d3_is_qf || any_indirect_qf_matches(vc_len))) {
+    } else if allow_2d_vc_pseudo || allow_3d_vc_pseudo {
         pseudo_kind = Some("vclist");
         notes.push(format!("pseudo-3D variable counter list ({vc_len} planes)"));
         ExperimentDimensionality::Pseudo3D
-    } else if fq_len >= 4 && (ndim_raw == 2 || d3_is_qf || any_indirect_qf_matches(fq_len)) {
+    } else if allow_2d_fq_pseudo || allow_3d_fq_pseudo {
         pseudo_kind = Some("fqlist");
         notes.push(format!(
             "pseudo-3D frequency offset list ({fq_len} offsets)"
@@ -4338,6 +4498,20 @@ fn build_bruker_experiment(
             _ => ExperimentDimensionality::Dim4D,
         }
     };
+
+    if dimensionality == ExperimentDimensionality::Pseudo3D {
+        if let Some(ref pi) = pulprog_interp {
+            match pi.pseudo_3d_order {
+                crate::pulprog::Pseudo3DStorageOrder::T1Interleaved => {
+                    notes.push("pseudo-3D t1-interleaved storage".to_string());
+                }
+                crate::pulprog::Pseudo3DStorageOrder::PlaneQueued if !is_dosy => {
+                    notes.push("pseudo-3D plane-queued storage".to_string());
+                }
+                _ => {}
+            }
+        }
+    }
 
     // NUS detection: strictly `FnTYPE == 2` or `nuslist` present (avoids TopSpin `FnTYPE=0` template false positives!)
     let fn_type = jcamp_usize(&a1, "FnTYPE").unwrap_or(0);
@@ -6183,5 +6357,154 @@ mod tests {
             PulseSequenceClass::Con2D
         );
         assert_eq!(inv_con_usf.problem_regime, ProblemRegime::Idp13cDetected);
+    }
+
+    #[test]
+    fn test_unused_topspin_template_lists_never_promote_2d_con_tocsy_noesy_roesy_to_pseudo3d() {
+        let stale_fq1list = b"bf ppm\n105.0\n110.0\n115.0\n120.0\n125.0\n130.0\n135.0\n140.0\n";
+        let stale_vdlist = b"0.01\n0.05\n0.10\n0.25\n0.50\n1.00\n";
+        let stale_vclist = b"2\n4\n8\n16\n32\n64\n";
+
+        // 1. 2D 13C-detected CON variants (`c_hcacon_ia`, `hcacon_ia`, `c_con_ia`, `con_ia`, `ipap_con`)
+        //    carrying unused TopSpin template `fq1list`/`vdlist`/`vclist` files on disk.
+        let mut con_entries = Vec::new();
+        for (idx, pp) in ["c_hcacon_ia", "hcacon_ia", "c_con_ia", "con_ia", "ipap_con"]
+            .iter()
+            .enumerate()
+        {
+            let dir = format!("exp_{idx}");
+            con_entries.push(VirtualEntry::new(
+                format!("{dir}/acqus"),
+                format!(
+                    "##$PULPROG= <{pp}>\n##$NUC1= <13C>\n##$SFO1= 201.258\n##$BF1= 201.223\n##$SW= 11.83\n##$TD= 1024\n##$FQ1LIST= <>\n##$VDLIST= <>\n##$VCLIST= <>\n"
+                )
+                .into_bytes(),
+            ));
+            con_entries.push(VirtualEntry::new(
+                format!("{dir}/acqu2s"),
+                b"##$NUC1= <15N>\n##$SFO1= 81.098\n##$BF1= 81.088\n##$SW= 35.99\n##$TD= 128\n##$FnMODE= 5\n##$FnILOOP= 2\n"
+                    .to_vec(),
+            ));
+            con_entries.push(VirtualEntry::new(
+                format!("{dir}/pulseprogram"),
+                b";c_hcacon_ia\n;using IPAP scheme for virtual decoupling\nd16 fq=cnst21(bf ppm):f1\ngo=2 ph31\n"
+                    .to_vec(),
+            ));
+            con_entries.push(VirtualEntry::new(
+                format!("{dir}/fq1list"),
+                stale_fq1list.to_vec(),
+            ));
+            con_entries.push(VirtualEntry::new(
+                format!("{dir}/vdlist"),
+                stale_vdlist.to_vec(),
+            ));
+            con_entries.push(VirtualEntry::new(
+                format!("{dir}/vclist"),
+                stale_vclist.to_vec(),
+            ));
+            con_entries.push(VirtualEntry::header_only(
+                format!("{dir}/ser"),
+                Vec::new(),
+                1_048_576,
+            ));
+        }
+        let inv_con = classify_nmr_entries(&con_entries);
+        assert_eq!(inv_con.problem_regime, ProblemRegime::Idp13cDetected);
+        assert_eq!(inv_con.experiments.len(), 5);
+        for exp in &inv_con.experiments {
+            assert_eq!(exp.dimensionality, ExperimentDimensionality::Dim2D);
+            assert_eq!(exp.pulse_class, PulseSequenceClass::Con2D);
+        }
+
+        // 2. Homonuclear 2D `mlevph` (`Tocsy2D`), `noesyph` (`Noesy2D`), and `roesyph` (`Roesy2D`)
+        //    carrying unused TopSpin template `fq1list`/`vplist` files on disk.
+        let mut hh_entries = Vec::new();
+        for (dir, pp) in [("20", "mlevph"), ("21", "noesyph"), ("22", "roesyph")] {
+            hh_entries.push(VirtualEntry::new(
+                format!("{dir}/acqus"),
+                format!(
+                    "##$PULPROG= <{pp}>\n##$NUC1= <1H>\n##$SFO1= 500.13\n##$BF1= 500.13\n##$SW= 12.0\n##$TD= 2048\n##$FQ1LIST= <>\n##$VPLIST= <>\n"
+                )
+                .into_bytes(),
+            ));
+            hh_entries.push(VirtualEntry::new(
+                format!("{dir}/acqu2s"),
+                b"##$NUC1= <1H>\n##$SFO1= 500.13\n##$BF1= 500.13\n##$SW= 12.0\n##$TD= 512\n##$FnMODE= 5\n"
+                    .to_vec(),
+            ));
+            hh_entries.push(VirtualEntry::new(
+                format!("{dir}/pulseprogram"),
+                format!(";{pp}\np1 ph1\nd0\ngo=2 ph31\n").into_bytes(),
+            ));
+            hh_entries.push(VirtualEntry::new(
+                format!("{dir}/fq1list"),
+                stale_fq1list.to_vec(),
+            ));
+            hh_entries.push(VirtualEntry::new(
+                format!("{dir}/vplist"),
+                stale_vclist.to_vec(),
+            ));
+            hh_entries.push(VirtualEntry::header_only(
+                format!("{dir}/ser"),
+                Vec::new(),
+                4_194_304,
+            ));
+        }
+        let inv_hh = classify_nmr_entries(&hh_entries);
+        assert_eq!(inv_hh.problem_regime, ProblemRegime::SmallMolecule2D);
+        assert_eq!(inv_hh.experiments.len(), 3);
+        assert_eq!(
+            inv_hh.experiments[0].dimensionality,
+            ExperimentDimensionality::Dim2D
+        );
+        assert_eq!(
+            inv_hh.experiments[0].pulse_class,
+            PulseSequenceClass::Tocsy2D
+        );
+        assert_eq!(
+            inv_hh.experiments[1].dimensionality,
+            ExperimentDimensionality::Dim2D
+        );
+        assert_eq!(
+            inv_hh.experiments[1].pulse_class,
+            PulseSequenceClass::Noesy2D
+        );
+        assert_eq!(
+            inv_hh.experiments[2].dimensionality,
+            ExperimentDimensionality::Dim2D
+        );
+        assert_eq!(
+            inv_hh.experiments[2].pulse_class,
+            PulseSequenceClass::Roesy2D
+        );
+
+        // 3. Genuine 2D interleaved CEST (`PULPROG = <hsqc_cest_2d>`, `pulseprogram` referencing `fq1`)
+        //    still upgrades to `Pseudo3D` `Cest`.
+        let inv_cest2d = classify_nmr_entries(&[
+            VirtualEntry::new(
+                "30/acqus",
+                b"##$PULPROG= <hsqc_cest_2d>\n##$NUC1= <1H>\n##$SFO1= 600.13\n##$SW= 14.0\n##$TD= 2048\n"
+                    .to_vec(),
+            ),
+            VirtualEntry::new(
+                "30/acqu2s",
+                b"##$NUC1= <15N>\n##$SFO1= 60.81\n##$SW= 32.0\n##$TD= 128\n##$FnMODE= 6\n"
+                    .to_vec(),
+            ),
+            VirtualEntry::new(
+                "30/pulseprogram",
+                b";hsqc_cest_2d\nd1 fq1:f3\np1 ph1\ngo=2 ph31\n".to_vec(),
+            ),
+            VirtualEntry::new("30/fq1list", stale_fq1list.to_vec()),
+            VirtualEntry::header_only("30/ser", Vec::new(), 2_097_152),
+        ]);
+        assert_eq!(
+            inv_cest2d.experiments[0].dimensionality,
+            ExperimentDimensionality::Pseudo3D
+        );
+        assert_eq!(
+            inv_cest2d.experiments[0].pulse_class,
+            PulseSequenceClass::Cest
+        );
     }
 }
