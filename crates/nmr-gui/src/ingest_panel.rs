@@ -54,6 +54,24 @@ const STATE = {
 const MAX_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 256 * 1024 * 1024;
 
+function wakeEguiCanvas() {
+  if (typeof window === "undefined") return;
+  const kick = () => {
+    try {
+      window.dispatchEvent(new Event("resize"));
+      if (typeof document !== "undefined") {
+        const c = document.getElementById("nmr_canvas");
+        if (c && typeof PointerEvent !== "undefined") {
+          c.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: 8, clientY: 8 }));
+        }
+      }
+    } catch (_) {}
+  };
+  kick();
+  setTimeout(kick, 35);
+  setTimeout(kick, 160);
+}
+
 function readFileEntry(fileEntry, relPath, acc) {
   return new Promise((resolve) => {
     fileEntry.file(
@@ -155,6 +173,7 @@ async function ingestFileList(fileList) {
   if (acc.files.length > 0) {
     STATE.batches.push(acc.files);
   }
+  wakeEguiCanvas();
 }
 
 export function js_install_folder_drop_listener() {
@@ -210,6 +229,7 @@ export function js_install_folder_drop_listener() {
         } else if (STATE.errors.length === 0) {
           STATE.errors.push("Dropped folder contained no readable NMR files.");
         }
+        wakeEguiCanvas();
       })();
     },
     true
@@ -345,6 +365,51 @@ pub fn poll_browser_drop_error() -> Option<String> {
     {
         None
     }
+}
+
+/// Sanitize a user-pasted filesystem path (macOS Finder/Terminal drag-paste quotes, `\ ` shell
+/// escapes like `My\ Drive`, and leading `~/`) while preserving Windows `C:\...` path separators.
+pub fn sanitize_user_path_input(raw: &str) -> String {
+    let mut s = raw.trim();
+    while s.len() >= 2
+        && ((s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')))
+    {
+        s = s[1..s.len() - 1].trim();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next) = chars.peek() {
+                if matches!(
+                    next,
+                    ' ' | '(' | ')' | '[' | ']' | '\'' | '"' | '&' | '!' | '$' | '@' | ','
+                ) {
+                    out.push(next);
+                    let _ = chars.next();
+                    continue;
+                }
+            }
+        }
+        out.push(ch);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(rest) = out.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            let mut full = PathBuf::from(home);
+            full.push(rest);
+            return full.display().to_string();
+        }
+    }
+    out
+}
+
+/// Return true when an ingest error indicates that a bare Bruker file (`2rr`, `1r`, `fid`, `ser`, ...)
+/// was picked without its sibling parameter files so the UI can surface a 1-click `[Open Folder]` CTA.
+pub fn is_bare_bruker_file_error(msg: &str) -> bool {
+    msg.contains("Bruker '")
+        || msg.contains("requires its sibling")
+        || msg.contains("Cannot read folder")
 }
 
 /// Ordered catalog of all [`PulseSequenceClass`] options exposed in the per-row override dropdown.
@@ -1311,6 +1376,41 @@ pub fn ingest_dropped_payloads(payloads: &[DroppedPayload]) -> Result<IngestDrop
                 spectra: ucsf_pipe_1d,
             });
         }
+        if inv.experiments.is_empty() {
+            for p in payloads {
+                let bname = Path::new(&p.name)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&p.name)
+                    .to_ascii_lowercase();
+                if matches!(
+                    bname.as_str(),
+                    "2rr" | "2ii" | "2ir" | "2ri" | "proc2s" | "proc2" | "clevels"
+                ) {
+                    return Err(format!(
+                        "Bruker '{bname}' requires its sibling 'procs' and 'proc2s' parameter files in the same folder. Click 'Open Folder' and select the 'pdata/1' (or experiment '10003') directory, or select '2rr', 'procs', and 'proc2s' together."
+                    ));
+                }
+                if matches!(bname.as_str(), "3rrr" | "4rrrr" | "proc3s" | "proc3") {
+                    return Err(format!(
+                        "Bruker '{bname}' requires its sibling 'procs', 'proc2s', and 'proc3s' parameter files. Click 'Open Folder' and select the 'pdata/1' directory."
+                    ));
+                }
+                if matches!(bname.as_str(), "ser" | "acqu2s" | "acqu2" | "acqu3s") {
+                    return Err(format!(
+                        "Bruker '{bname}' requires its sibling 'acqus' and 'acqu2s' parameter files. Click 'Open Folder' and select the experiment directory (e.g. '3' or '10003')."
+                    ));
+                }
+                if matches!(
+                    bname.as_str(),
+                    "1r" | "1i" | "procs" | "fid" | "acqus" | "acqu"
+                ) {
+                    return Err(format!(
+                        "Bruker '{bname}' requires its sibling parameter/binary files in the same folder. Click 'Open Folder' and select the Bruker experiment or 'pdata/1' directory."
+                    ));
+                }
+            }
+        }
     }
 
     let mut panel = IngestPanelState::from_inventory(inv);
@@ -1669,7 +1769,7 @@ pub async fn ingest_dropped_files_wasm(
         let bytes = f.bytes_async().await.map_err(|e| {
             if e.contains("NotFoundError") || e.contains("The object can not be found") {
                 format!(
-                    "Cannot read folder '{name}' as a single file — click '📂 Open Folder' in the toolbar or drop a .zip/.tar.gz archive (or drop the folder directly onto the canvas)."
+                    "Cannot read folder '{name}' as a single file — click 'Open Folder' in the toolbar or drop a .zip/.tar.gz archive (or drop the folder directly onto the canvas)."
                 )
             } else {
                 e
@@ -1731,7 +1831,7 @@ impl IngestPanelState {
         let mut window_open = self.open;
         let mut emitted: Option<IngestAction> = None;
 
-        egui::Window::new("📂 Spectrometer Folder & Archive Ingest Matrix")
+        egui::Window::new("Spectrometer Folder & Archive Ingest Matrix")
             .id(egui::Id::unique("nmr_ingest_selection_matrix_modal"))
             .open(&mut window_open)
             .collapsible(false)
@@ -1750,10 +1850,11 @@ impl IngestPanelState {
                     );
                     let enter_scan =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.button("🔍 Scan Folder / Archive").clicked() || enter_scan {
-                        let trimmed = self.workspace_path_input.trim().to_string();
-                        if !trimmed.is_empty() {
-                            emitted = Some(IngestAction::ScanNativePath(trimmed));
+                    if ui.button("Scan Folder / Archive").clicked() || enter_scan {
+                        let cleaned = sanitize_user_path_input(&self.workspace_path_input);
+                        if !cleaned.is_empty() {
+                            self.workspace_path_input = cleaned.clone();
+                            emitted = Some(IngestAction::ScanNativePath(cleaned));
                         }
                     }
                     if self.inventory.elapsed_ms > 0.0 {
@@ -1769,14 +1870,14 @@ impl IngestPanelState {
                 #[cfg(target_arch = "wasm32")]
                 ui.horizontal(|ui| {
                     if ui
-                        .button("📂 Open Bruker / Spectrometer Folder…")
+                        .button("Open Bruker / Spectrometer Folder…")
                         .on_hover_text("Select an entire Bruker study/expno/pdata folder from disk")
                         .clicked()
                     {
                         trigger_browser_folder_picker();
                     }
                     if ui
-                        .button("📄 Open Files / .zip / .tar.gz…")
+                        .button("Open Files / .zip / .tar.gz…")
                         .on_hover_text("Select .zip/.tar.gz archives, .ucsf/.ft2/.jdx spectra, or sibling Bruker files")
                         .clicked()
                     {
@@ -1837,7 +1938,7 @@ impl IngestPanelState {
                         .show(ui, |ui| {
                             for h in &hints {
                                 ui.label(
-                                    egui::RichText::new(format!("⚠ {h}"))
+                                    egui::RichText::new(format!("Note: {h}"))
                                         .small()
                                         .color(egui::Color32::from_rgb(255, 218, 130)),
                                 );
@@ -1851,7 +1952,7 @@ impl IngestPanelState {
                 if seq_free && parsed_seq.is_empty() {
                     ui.label(
                         egui::RichText::new(
-                            "✓ 2D Correlation / Diffusion suite ready — no polymer sequence required. Click '📂 Load Selected Spectra' below to inspect & overlay!",
+                            "2D Correlation / Diffusion suite ready — no polymer sequence required. Click 'Load Selected Spectra' below to inspect & overlay.",
                         )
                         .small()
                         .color(egui::Color32::from_rgb(125, 235, 185)),
@@ -1963,7 +2064,7 @@ impl IngestPanelState {
                                     let cur_cls = self.effective_classes[i];
                                     let overridden = self.user_overridden[i];
                                     let combo_lbl = if overridden {
-                                        format!("✎ {}", pulse_class_display_label(cur_cls))
+                                        format!("* {}", pulse_class_display_label(cur_cls))
                                     } else {
                                         pulse_class_display_label(cur_cls).to_string()
                                     };
@@ -2021,7 +2122,7 @@ impl IngestPanelState {
                     let primary_fg = egui::Color32::from_rgb(15, 25, 20);
                     if self.is_sequence_free_regime() {
                         let load_cta = egui::Button::new(
-                            egui::RichText::new("📂 Load Selected Spectra")
+                            egui::RichText::new("Load Selected Spectra")
                                 .strong()
                                 .color(primary_fg),
                         )
@@ -2032,7 +2133,7 @@ impl IngestPanelState {
                             ));
                         }
                         if ui
-                            .add_enabled(has_sel, egui::Button::new("▶ Process, Pick & Run"))
+                            .add_enabled(has_sel, egui::Button::new("Process, Pick & Run"))
                             .clicked()
                         {
                             emitted = Some(IngestAction::ProcessPickAndRun(
@@ -2041,7 +2142,7 @@ impl IngestPanelState {
                         }
                     } else {
                         let run_btn = egui::Button::new(
-                            egui::RichText::new("▶ Process, Pick & Run")
+                            egui::RichText::new("Process, Pick & Run")
                                 .strong()
                                 .color(primary_fg),
                         )
@@ -2052,7 +2153,7 @@ impl IngestPanelState {
                             ));
                         }
                         if ui
-                            .add_enabled(has_sel, egui::Button::new("📂 Load Selected Spectra"))
+                            .add_enabled(has_sel, egui::Button::new("Load Selected Spectra"))
                             .clicked()
                         {
                             emitted = Some(IngestAction::LoadSelectedSpectra(
@@ -2072,7 +2173,7 @@ impl IngestPanelState {
                         });
                     if has_sel_1d
                         && ui
-                            .button("📉 Open Checked 1D in 1D Studio")
+                            .button("Open Checked 1D in 1D Studio")
                             .on_hover_text("Send checked 1D experiments directly into 1D Array & Multiplet Studio")
                             .clicked()
                     {

@@ -121,7 +121,9 @@ use nmr_gpu::bayes_sa_gpu::BayesSaGpuSolver;
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_gpu::GpuEngine;
 #[cfg(not(target_arch = "wasm32"))]
-use nmr_gui::ingest_panel::{ingest_dropped_files_native, load_native_path_1d_or_workspace};
+use nmr_gui::ingest_panel::{
+    ingest_dropped_files_native, load_native_path_1d_or_workspace, sanitize_user_path_input,
+};
 #[cfg(target_arch = "wasm32")]
 use nmr_gui::ingest_panel::{
     ingest_dropped_files_wasm, trigger_browser_files_picker, trigger_browser_folder_picker,
@@ -139,9 +141,9 @@ use nmr_gui::{
     dosy_panel::{render_dosy_panel, DosyPanelAction, DosyPanelState},
     dynamics_panel::{DynamicsStudioOutput, DynamicsStudioPanel, DynamicsStudioTab},
     ingest_panel::{
-        ingest_dropped_payloads, install_browser_folder_drop_hook, poll_browser_drop_error,
-        poll_browser_dropped_payloads, try_load_1d_ucsf_or_pipe_bytes, IngestAction,
-        IngestDropOutcome, IngestExecutionPlan, IngestPanelState,
+        ingest_dropped_payloads, install_browser_folder_drop_hook, is_bare_bruker_file_error,
+        poll_browser_drop_error, poll_browser_dropped_payloads, try_load_1d_ucsf_or_pipe_bytes,
+        IngestAction, IngestDropOutcome, IngestExecutionPlan, IngestPanelState,
     },
     keymap::{poll_global_modifier_shortcuts, ChordDispatcher, CONTOUR_FLOOR_STEP_RATIO},
     mcp_bridge::{render_mcp_bridge_panel, McpBridgeState, McpUiCommand, ViewportFrameBuffer},
@@ -154,18 +156,18 @@ use nmr_gui::{
         AssignedAtomInfo, SequenceRibbonState, SidechainInspectorPanel, SidechainWorkspaceInput,
     },
     stack1d_panel::{
-        build_kinetics_demo_traces, export_stack1d_svg, render_stack1d_panel, InspectorTab1d,
-        Stack1dState, Stack1dViewMode, ToolMode1d, Trace1d,
+        build_kinetics_demo_traces, export_stack1d_svg, render_stack1d_panel, AttachedSpectrum1d,
+        InspectorTab1d, Stack1dState, Stack1dViewMode, ToolMode1d, Trace1d,
     },
     strip_tiler::{StripSpectra3D, StripTilerAction, StripTilerContext, StripTilerPanel},
     workbook::{
         build_showcase_small_molecule_13c_trace, build_showcase_small_molecule_1h_trace,
         build_showcase_small_molecule_cosy_2d, chrome_icon_button, contour_palette_for_theme,
-        evaluate_2d_marginals, f1_ppm_to_screen_y, f2_ppm_to_screen_x, paint_f1_marginal_strip,
-        paint_f2_marginal_strip, paint_icon, rail_tool_button, render_workbook_sidebar,
-        ActiveWorkbookSelection, CanvasTheme2D, ToolMode2d, WorkbookIcon, WorkbookSidebarAction,
-        WorkbookState, WorkbookStudioKind, CANVAS_TOOL_RAIL_WIDTH, CONTOUR_SCROLL_STEP_RATIO,
-        MARGINAL_2D_STRIP_PX,
+        estimate_contour_base_and_noise, evaluate_2d_marginals, f1_ppm_to_screen_y,
+        f2_ppm_to_screen_x, paint_f1_marginal_strip, paint_f2_marginal_strip, paint_icon,
+        rail_tool_button, render_workbook_sidebar, ActiveWorkbookSelection, CanvasTheme2D,
+        ToolMode2d, WorkbookIcon, WorkbookSidebarAction, WorkbookState, WorkbookStudioKind,
+        CANVAS_TOOL_RAIL_WIDTH, CONTOUR_SCROLL_STEP_RATIO, MARGINAL_2D_STRIP_PX,
     },
     workflow_bar::{
         draw_top_menu_bar, draw_workflow_stepper, render_responsive_workbench, HostWorkspaceMode,
@@ -1762,6 +1764,12 @@ struct NmrWorkbenchApp {
     // Selection & File / In-Memory Text I/O
     selected_ss: Option<usize>,
     selected_res: Option<usize>,
+    peak_2d_labels: BTreeMap<(i64, i64), String>,
+    context_menu_2d_ppm: Option<[f64; 2]>,
+    secondary_drag_accum_2d: f32,
+    bare_bruker_hint: Option<String>,
+    picker_wakeup_until_ms: u64,
+    water_undo_2d: Option<(Spectrum2D, Option<Spectrum3D>, Option<Spectrum3D>)>,
     #[cfg(not(target_arch = "wasm32"))]
     path_input: String,
     #[cfg(not(target_arch = "wasm32"))]
@@ -1775,6 +1783,312 @@ struct NmrWorkbenchApp {
     suppress_octet_pan_until_release: bool,
     #[cfg(target_arch = "wasm32")]
     pending_drop_outcome: Arc<std::sync::Mutex<Option<Result<IngestDropOutcome, String>>>>,
+}
+
+#[inline]
+pub(crate) fn peak_label_key_2d(h: f64, n: f64) -> (i64, i64) {
+    ((h * 10_000.0).round() as i64, (n * 10_000.0).round() as i64)
+}
+
+fn fast_median_f32(vals: &mut [f32]) -> f32 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    let mid = vals.len() / 2;
+    let (_, m, _) = vals.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    *m
+}
+
+fn trimmed_slice_med_mad_max(
+    vals: &[f32],
+    scratch: &mut Vec<f32>,
+    fallback_sigma: f32,
+) -> (f32, f32, f32) {
+    let mut max_abs = 0.0_f32;
+    for &v in vals {
+        let a = v.abs();
+        if a > max_abs {
+            max_abs = a;
+        }
+    }
+    if vals.len() < 8 {
+        return (0.0, fallback_sigma, max_abs);
+    }
+    scratch.clear();
+    scratch.extend_from_slice(vals);
+    let med0 = fast_median_f32(scratch);
+    for x in scratch.iter_mut() {
+        *x = (*x - med0).abs();
+    }
+    let mad0 = (1.4826 * fast_median_f32(scratch)).max(1e-12);
+    if vals.len() < 24 {
+        return (med0, mad0.max(fallback_sigma), max_abs);
+    }
+    scratch.clear();
+    for &v in vals {
+        if (v - med0).abs() <= 3.5 * mad0 {
+            scratch.push(v);
+        }
+    }
+    if scratch.len() < 12 {
+        return (med0, mad0.max(fallback_sigma), max_abs);
+    }
+    let med1 = fast_median_f32(scratch);
+    for x in scratch.iter_mut() {
+        *x = (*x - med1).abs();
+    }
+    let mad1 = (1.4826 * fast_median_f32(scratch)).max(fallback_sigma);
+    (med1, mad1, max_abs)
+}
+
+/// Ridge-safe 2D cross-peak picker for homonuclear (`NOESY`, `TOCSY`, `COSY`, `ROESY`) and
+/// heteronuclear (`HMBC`, `19F-X`, ...) 2D spectra:
+/// 1. Estimates global thermal noise `sigma0` from the 25th-percentile of `64×64` non-zero tile MADs
+///    (immune to diagonal ridges, `4.70 ppm` water stripes, and zero-padded margins).
+/// 2. Computes per-column (`F1` `t1`-ridge) and per-row (`F2` `t2`-baseline/water) outlier-trimmed
+///    median & MAD so intense water ridges spawn zero false cross-peaks.
+/// 3. Enforces `|v| >= max(snr * sigma0, contour_base)` so invisible sub-contour noise is never picked.
+/// 4. Optionally excludes homonuclear diagonal self-peaks (`|x_ppm - y_ppm| < 0.045 ppm`), applies
+///    `±4×±4` 2D non-maximum suppression + 3-point parabolic sub-bin interpolation, and returns up to
+///    `3,000` cross-peaks sorted descending by `|height|`.
+pub(crate) fn pick_2d_crosspeaks_ridge_safe(
+    spec: &Spectrum2D,
+    snr_threshold: f32,
+    contour_base: f32,
+    is_homonuclear: bool,
+    allow_diagonal: bool,
+    allow_negative: bool,
+) -> Vec<Peak> {
+    let nx = spec.nx();
+    let ny = spec.ny();
+    if nx < 5 || ny < 5 || spec.data.len() < nx * ny {
+        return Vec::new();
+    }
+
+    // 1. 25th-percentile of 64x64 non-zero tile MADs
+    let tile_w = 64usize.min(nx);
+    let tile_h = 64usize.min(ny);
+    let step_in_tile = if nx * ny > 1_048_576 { 2usize } else { 1usize };
+    let mut tile_mads: Vec<f32> = Vec::new();
+    let mut scratch: Vec<f32> = Vec::with_capacity(tile_w * tile_h);
+    let mut ty0 = 0usize;
+    while ty0 < ny {
+        let ty1 = (ty0 + tile_h).min(ny);
+        let mut tx0 = 0usize;
+        while tx0 < nx {
+            let tx1 = (tx0 + tile_w).min(nx);
+            scratch.clear();
+            let mut tile_max = 0.0_f32;
+            let mut iy = ty0;
+            while iy < ty1 {
+                let row = &spec.data[iy * nx..iy * nx + tx1];
+                let mut ix = tx0;
+                while ix < tx1 {
+                    let v = row[ix];
+                    if v.is_finite() {
+                        tile_max = tile_max.max(v.abs());
+                        scratch.push(v);
+                    }
+                    ix += step_in_tile;
+                }
+                iy += step_in_tile;
+            }
+            if tile_max > 1e-12 && scratch.len() >= 16 {
+                let med = fast_median_f32(&mut scratch);
+                for x in &mut scratch {
+                    *x = (*x - med).abs();
+                }
+                let mad = 1.4826 * fast_median_f32(&mut scratch);
+                if mad.is_finite() && mad > 1e-12 {
+                    tile_mads.push(mad);
+                }
+            }
+            tx0 += tile_w;
+        }
+        ty0 += tile_h;
+    }
+
+    let sigma0 = if tile_mads.len() >= 4 {
+        let q25 = tile_mads.len() / 4;
+        let (_, s, _) = tile_mads.select_nth_unstable_by(q25, |a, b| a.total_cmp(b));
+        (*s).max(1e-12)
+    } else {
+        estimate_contour_base_and_noise(&spec.data).1.max(1e-12)
+    };
+
+    // 2. Per-row (F2) and per-column (F1) median, MAD & max_abs
+    let col_stride = (ny / 512).max(1);
+    let row_stride = (nx / 512).max(1);
+    let mut line_buf: Vec<f32> = Vec::with_capacity(520);
+    let mut col_med = vec![0.0_f32; nx];
+    let mut col_sigma = vec![sigma0; nx];
+    let mut col_max_abs = vec![0.0_f32; nx];
+    for ix in 0..nx {
+        line_buf.clear();
+        let mut iy = 0usize;
+        while iy < ny {
+            let v = spec.data[iy * nx + ix];
+            if v.is_finite() {
+                line_buf.push(v);
+            }
+            iy += col_stride;
+        }
+        let (m, s, mx) = trimmed_slice_med_mad_max(&line_buf, &mut scratch, sigma0);
+        col_med[ix] = m;
+        col_sigma[ix] = s;
+        col_max_abs[ix] = mx;
+    }
+
+    let mut row_med = vec![0.0_f32; ny];
+    let mut row_sigma = vec![sigma0; ny];
+    if is_homonuclear {
+        for iy in 0..ny {
+            line_buf.clear();
+            let row = &spec.data[iy * nx..(iy + 1) * nx];
+            let mut ix = 0usize;
+            while ix < nx {
+                let v = row[ix];
+                if v.is_finite() {
+                    line_buf.push(v);
+                }
+                ix += row_stride;
+            }
+            let (m, s, _) = trimmed_slice_med_mad_max(&line_buf, &mut scratch, sigma0);
+            row_med[iy] = m;
+            row_sigma[iy] = s;
+        }
+    }
+
+    // 3. Local-ridge + contour-floor gated 2D NMS + parabolic sub-bin refinement
+    let snr = snr_threshold.max(3.0);
+    let abs_floor = (snr * sigma0).max(contour_base.max(0.0));
+    let rx = if nx >= 256 {
+        4isize
+    } else if nx >= 96 {
+        2isize
+    } else {
+        1isize
+    };
+    let ry = if ny >= 256 {
+        4isize
+    } else if ny >= 96 {
+        2isize
+    } else {
+        1isize
+    };
+    let margin_x = (rx as usize).max(1);
+    let margin_y = (ry as usize).max(1);
+    if nx <= 2 * margin_x || ny <= 2 * margin_y {
+        return Vec::new();
+    }
+
+    let mut peaks = Vec::new();
+    for iy in margin_y..(ny - margin_y) {
+        let r_med = row_med[iy];
+        let r_sig = row_sigma[iy].max(sigma0);
+        let y_approx = spec.axis_y.index_to_ppm(iy as f64);
+        for ix in margin_x..(nx - margin_x) {
+            let v = spec.data[iy * nx + ix];
+            if !v.is_finite() {
+                continue;
+            }
+            let sign = if v >= abs_floor {
+                1i32
+            } else if allow_negative && -v >= abs_floor {
+                -1i32
+            } else {
+                continue;
+            };
+            let av = v.abs();
+            let c_sig = col_sigma[ix].max(sigma0);
+            if (v - col_med[ix]).abs() < snr * c_sig {
+                continue;
+            }
+            if col_max_abs[ix] > 40.0 * sigma0 && av < 0.018 * col_max_abs[ix] {
+                continue;
+            }
+            if is_homonuclear {
+                if (v - r_med).abs() < snr * r_sig {
+                    continue;
+                }
+                if !allow_diagonal {
+                    let x_approx = spec.axis_x.index_to_ppm(ix as f64);
+                    if (x_approx - y_approx).abs() < 0.045 {
+                        continue;
+                    }
+                }
+            }
+
+            let mut is_max = true;
+            'nms: for dy in -ry..=ry {
+                let ny_i = (iy as isize + dy) as usize;
+                let nrow = &spec.data[ny_i * nx..(ny_i + 1) * nx];
+                for dx in -rx..=rx {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nv = nrow[(ix as isize + dx) as usize];
+                    let nav = if allow_negative {
+                        nv.abs()
+                    } else {
+                        nv.max(0.0)
+                    };
+                    if nav > av || (nav == av && (dy < 0 || (dy == 0 && dx < 0))) {
+                        is_max = false;
+                        break 'nms;
+                    }
+                }
+            }
+            if !is_max {
+                continue;
+            }
+
+            let sgn = sign as f64;
+            let xm = (spec.data[iy * nx + (ix - 1)] as f64) * sgn;
+            let x0 = (v as f64) * sgn;
+            let xp = (spec.data[iy * nx + (ix + 1)] as f64) * sgn;
+            let denom_x = xm - 2.0 * x0 + xp;
+            let sub_x = if denom_x < -1e-9 {
+                (0.5 * (xm - xp) / denom_x).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            };
+
+            let ym = (spec.data[(iy - 1) * nx + ix] as f64) * sgn;
+            let yp = (spec.data[(iy + 1) * nx + ix] as f64) * sgn;
+            let denom_y = ym - 2.0 * x0 + yp;
+            let sub_y = if denom_y < -1e-9 {
+                (0.5 * (ym - yp) / denom_y).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            };
+
+            let x_ppm = spec.axis_x.index_to_ppm(ix as f64 + sub_x);
+            let y_ppm = spec.axis_y.index_to_ppm(iy as f64 + sub_y);
+            if is_homonuclear && !allow_diagonal && (x_ppm - y_ppm).abs() < 0.045 {
+                continue;
+            }
+            peaks.push(Peak {
+                exp: spec.name.clone(),
+                h: x_ppm,
+                n: y_ppm,
+                c: None,
+                h2: None,
+                sign,
+                height: Some(v as f64),
+                volume: Some(v as f64),
+            });
+        }
+    }
+
+    peaks.sort_by(|a, b| {
+        b.height
+            .unwrap_or(0.0)
+            .abs()
+            .total_cmp(&a.height.unwrap_or(0.0).abs())
+    });
+    peaks.truncate(3_000);
+    peaks
 }
 
 impl NmrWorkbenchApp {
@@ -1959,6 +2273,12 @@ impl NmrWorkbenchApp {
             picker_snr: 5.0,
             selected_ss: None,
             selected_res: None,
+            peak_2d_labels: BTreeMap::new(),
+            context_menu_2d_ppm: None,
+            secondary_drag_accum_2d: 0.0,
+            bare_bruker_hint: None,
+            picker_wakeup_until_ms: 0,
+            water_undo_2d: None,
             #[cfg(not(target_arch = "wasm32"))]
             path_input: "data/fixtures/synthetic_ubiquitin.str".to_string(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -1979,21 +2299,11 @@ impl NmrWorkbenchApp {
     }
 
     fn estimate_2d_contour_base(data: &[f32]) -> (f32, f32) {
-        let mad = estimate_noise_mad(data);
-        let max_abs = data.iter().fold(0.0_f32, |m, &v| m.max(v.abs()));
-        if mad.is_finite() && mad > 1e-12 {
-            let base = if max_abs > mad * 5.0 {
-                (mad * 4.8).clamp((max_abs * 0.001).max(1e-6), (max_abs * 0.45).max(1e-5))
-            } else {
-                (mad * 4.8).max(1e-6)
-            };
-            (base, mad.max(1e-6))
-        } else if max_abs.is_finite() && max_abs > 1e-12 {
-            let base = (max_abs * 0.05).max(1e-6);
-            (base, (base / 4.8).max(1e-6))
-        } else {
-            (1.0, 1.0)
-        }
+        estimate_contour_base_and_noise(data)
+    }
+
+    fn arm_browser_picker_wakeup(&mut self) {
+        self.picker_wakeup_until_ms = u64::MAX - 1;
     }
 
     fn canonical_2d_axis_nucleus(raw_label: &str, min_ppm: f64, max_ppm: f64) -> &'static str {
@@ -2375,6 +2685,10 @@ impl NmrWorkbenchApp {
             self.show_negative = hsqc_layer.show_negative;
             self.primary_ppm_nudge = hsqc_layer.ppm_nudge;
         }
+        if let Some(ref spec) = self.hsqc_spec {
+            let (_, nref) = Self::estimate_2d_contour_base(&spec.data);
+            self.contour_noise_ref = nref.max(self.contour_base / 6.0).max(1e-6);
+        }
 
         let n_sys = self.systems.len();
         let mut position = vec![-1i32; n_sys];
@@ -2732,11 +3046,14 @@ impl NmrWorkbenchApp {
         self.view_n_top = pg.view_ppm[2];
         self.view_n_bottom = pg.view_ppm[3];
         self.contour_base = pg.base_level;
-        self.contour_noise_ref = pg.noise_ref;
+        self.contour_noise_ref = pg.noise_ref.max(pg.base_level / 6.0).max(1e-6);
         self.contour_factor = pg.level_factor;
         self.contour_levels = pg.num_levels;
         self.show_negative = pg.show_negative;
         self.workbook.two_d.zoom_history.clear();
+        self.workbook.two_d.selected_peak_idx = None;
+        self.workbook.two_d.dragging_peak_idx = None;
+        self.workbook.two_d.pick_box_start_pos = None;
         self.box_zoom_2d_anchor = None;
         self.crosshair.snap_to(
             0.5 * (self.view_h_left as f64 + self.view_h_right as f64),
@@ -3935,6 +4252,11 @@ impl NmrWorkbenchApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn install_single_2d_spectrum(&mut self, spec: Spectrum2D, label: String, status: String) {
+        self.bare_bruker_hint = None;
+        self.water_undo_2d = None;
+        self.peak_2d_labels.clear();
+        self.workbook.two_d.selected_peak_idx = None;
+        self.workbook.two_d.dragging_peak_idx = None;
         self.clear_stale_protein_demo_state(false, false);
         self.overlay_layers.clear();
         self.primary_2d_label = label.clone();
@@ -3963,6 +4285,7 @@ impl NmrWorkbenchApp {
                     con_roots,
                     ..C13PickedDataset::default()
                 });
+                self.sync_con_roots_to_peaks();
             }
         } else {
             self.regime_kind = GuiRegimeKind::Globular;
@@ -3971,56 +4294,22 @@ impl NmrWorkbenchApp {
         self.status_msg = status;
     }
 
-    fn pick_generic_2d_crosspeaks(spec: &Spectrum2D, snr_threshold: f32) -> Vec<Peak> {
-        let nx = spec.nx();
-        let ny = spec.ny();
-        if nx < 3 || ny < 3 || spec.data.len() < nx * ny {
-            return Vec::new();
-        }
-        let noise = estimate_noise_mad(&spec.data).max(1e-12);
-        let floor = snr_threshold.max(3.0) * noise;
-        let mut peaks = Vec::new();
-        for iy in 1..(ny - 1) {
-            for ix in 1..(nx - 1) {
-                let v = spec.get(ix, iy);
-                if v < floor {
-                    continue;
-                }
-                let mut is_max = true;
-                'nbr: for dy in -1i32..=1 {
-                    for dx in -1i32..=1 {
-                        if dx == 0 && dy == 0 {
-                            continue;
-                        }
-                        let nv = spec.get((ix as i32 + dx) as usize, (iy as i32 + dy) as usize);
-                        if nv > v {
-                            is_max = false;
-                            break 'nbr;
-                        }
-                    }
-                }
-                if is_max {
-                    let x_ppm = spec.axis_x.index_to_ppm(ix as f64);
-                    let y_ppm = spec.axis_y.index_to_ppm(iy as f64);
-                    peaks.push(Peak {
-                        exp: spec.name.clone(),
-                        h: x_ppm,
-                        n: y_ppm,
-                        c: None,
-                        h2: None,
-                        sign: 1,
-                        height: Some(v as f64),
-                        volume: Some(v as f64),
-                    });
-                }
-            }
-        }
-        peaks
+    fn pick_generic_2d_crosspeaks(&self, spec: &Spectrum2D, snr_threshold: f32) -> Vec<Peak> {
+        let (nx, ny) = self.active_2d_nuclei();
+        pick_2d_crosspeaks_ridge_safe(
+            spec,
+            snr_threshold,
+            self.contour_base,
+            nx == ny,
+            self.workbook.two_d.pick_diagonal,
+            self.show_negative,
+        )
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn load_path_auto(&mut self) {
-        let path_str = self.path_input.trim().to_string();
+        let path_str = sanitize_user_path_input(&self.path_input);
+        self.path_input = path_str.clone();
         let p = Path::new(&path_str);
         if !p.exists() {
             self.status_msg = format!("Path not found: {}", p.display());
@@ -4297,7 +4586,7 @@ impl NmrWorkbenchApp {
 
     fn pick_2d_roots(&mut self) {
         let (nuc_x, nuc_y) = self.active_2d_nuclei();
-        let Some(spec) = &self.hsqc_spec else {
+        let Some(spec) = self.hsqc_spec.clone() else {
             self.status_msg = "No 2D spectrum loaded".to_string();
             return;
         };
@@ -4306,7 +4595,11 @@ impl NmrWorkbenchApp {
                 snr_2d: self.picker_snr,
                 ..C13PickerConfig::default()
             };
-            let con_roots = pick_con_2d(spec, &pcfg);
+            let mut con_roots = pick_con_2d(&spec, &pcfg);
+            let min_vis = self.contour_base.max(0.0) as f64;
+            if min_vis > 0.0 {
+                con_roots.retain(|r| r.height.abs() >= min_vis * 0.85);
+            }
             let n_picked = con_roots.len();
             let n_pro = con_roots
                 .iter()
@@ -4315,6 +4608,8 @@ impl NmrWorkbenchApp {
             let mut ds = self.c13_picked_dataset.take().unwrap_or_default();
             ds.con_roots = con_roots;
             self.c13_picked_dataset = Some(ds);
+            self.sync_con_roots_to_peaks();
+            self.workbook.two_d.show_peak_table = true;
             self.regime_kind = GuiRegimeKind::Idp13C;
             self.status_msg = format!(
                 "13C-IDP CON picker found {n_picked} peptide-bond roots ({n_pro} Pro imino 132–142 ppm)"
@@ -4322,22 +4617,29 @@ impl NmrWorkbenchApp {
             return;
         }
         if !(nuc_x == "1H" && (nuc_y == "15N" || nuc_y == "13C")) {
-            let picked = Self::pick_generic_2d_crosspeaks(spec, self.picker_snr);
+            let picked = self.pick_generic_2d_crosspeaks(&spec, self.picker_snr);
             let n_picked = picked.len();
             self.peaks = picked;
             self.session.state.peaks = self.peaks.clone();
+            self.workbook.two_d.selected_peak_idx = None;
+            self.workbook.two_d.show_peak_table = true;
             self.systems.clear();
             self.status_msg = format!(
-                "2D peak picker found {n_picked} {}–{} cross-peaks",
+                "2D peak picker found {n_picked} {}–{} cross-peaks{}",
                 Self::pretty_nucleus_unicode(nuc_x),
-                Self::pretty_nucleus_unicode(nuc_y)
+                Self::pretty_nucleus_unicode(nuc_y),
+                if nuc_x == nuc_y && !self.workbook.two_d.pick_diagonal {
+                    " (diagonal excluded)"
+                } else {
+                    ""
+                }
             );
             return;
         }
-        let (picked, method_label) = if nuc_y == "13C" {
+        let (mut picked, method_label) = if nuc_y == "13C" {
             (
                 pick_c13_hsqc_2d(
-                    spec,
+                    &spec,
                     &PickerConfig {
                         snr_threshold: self.picker_snr,
                         ..PickerConfig::default()
@@ -4348,7 +4650,7 @@ impl NmrWorkbenchApp {
         } else if self.use_neural_picker {
             (
                 pick_hsqc_2d_neural(
-                    spec,
+                    &spec,
                     &NeuralPickerConfig {
                         prob_threshold: (0.25 + 0.035 * (self.picker_snr - 3.0)).clamp(0.20, 0.85),
                         ..NeuralPickerConfig::default()
@@ -4359,7 +4661,7 @@ impl NmrWorkbenchApp {
         } else {
             (
                 pick_hsqc_2d(
-                    spec,
+                    &spec,
                     &PickerConfig {
                         snr_threshold: self.picker_snr,
                         ..PickerConfig::default()
@@ -4368,19 +4670,695 @@ impl NmrWorkbenchApp {
                 "Classical picker",
             )
         };
+        picked.sort_by(|a, b| {
+            b.height
+                .unwrap_or(0.0)
+                .abs()
+                .total_cmp(&a.height.unwrap_or(0.0).abs())
+        });
         let n_picked = picked.len();
-        // Keep existing triple-resonance peaks while replacing HSQC roots
+        // Keep existing triple-resonance peaks while replacing 2D roots
+        let root_exp = if nuc_y == "13C" { "C13HSQC" } else { "HSQC" };
         let mut combined = picked;
-        combined.extend(self.peaks.iter().filter(|p| p.exp != "HSQC").cloned());
+        combined.extend(
+            self.peaks
+                .iter()
+                .filter(|p| p.exp != root_exp && p.c.is_some())
+                .cloned(),
+        );
         self.peaks = combined;
         self.session.state.peaks = self.peaks.clone();
+        self.workbook.two_d.selected_peak_idx = None;
+        self.workbook.two_d.show_peak_table = true;
         self.truth = None;
         self.metrics = None;
-        self.rebuild_systems_and_matrices();
+        if nuc_y == "15N" {
+            self.rebuild_systems_and_matrices();
+            self.status_msg = format!(
+                "{method_label} found {n_picked} 2D roots -> rebuilt {} spin systems",
+                self.systems.len()
+            );
+        } else {
+            self.systems.clear();
+            self.status_msg = format!("{method_label} found {n_picked} ¹H–¹³C cross-peaks");
+        }
+    }
+
+    fn sync_con_roots_to_peaks(&mut self) {
+        let Some(ref ds) = self.c13_picked_dataset else {
+            return;
+        };
+        let mut out: Vec<Peak> = ds
+            .con_roots
+            .iter()
+            .map(|r| Peak {
+                exp: "CON".to_string(),
+                h: r.c_prev_ppm,
+                n: r.n_curr_ppm,
+                c: None,
+                h2: None,
+                sign: if r.height < 0.0 { -1 } else { 1 },
+                height: Some(r.height),
+                volume: Some(r.volume),
+            })
+            .collect();
+        out.extend(self.peaks.iter().filter(|p| p.c.is_some()).cloned());
+        self.peaks = out;
+        self.session.state.peaks = self.peaks.clone();
+    }
+
+    fn sync_2d_peaks_after_edit(&mut self) {
+        self.session.state.peaks = self.peaks.clone();
+        let (nx, ny) = self.active_2d_nuclei();
+        if nx == "13C" && ny == "15N" {
+            let new_con: Vec<Con2DPeak> = self
+                .peaks
+                .iter()
+                .filter(|p| p.c.is_none())
+                .map(|p| {
+                    let hgt = p.height.unwrap_or(100.0);
+                    Con2DPeak {
+                        c_prev_ppm: p.h,
+                        n_curr_ppm: p.n,
+                        height: hgt,
+                        volume: p.volume.unwrap_or(hgt),
+                        is_proline_imino_region: p.n >= 131.5,
+                        deconvolved_from_cluster: false,
+                    }
+                })
+                .collect();
+            let mut ds = self.c13_picked_dataset.take().unwrap_or_default();
+            for sp in &mut ds.strip_peaks {
+                sp.anchor_root_idx = new_con
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| {
+                        (r.c_prev_ppm - sp.c_prime_ppm).abs() <= 0.18
+                            && (r.n_curr_ppm - sp.n_ppm).abs() <= 0.55
+                    })
+                    .min_by(|(_, a), (_, b)| {
+                        let da = ((a.c_prev_ppm - sp.c_prime_ppm) / 0.08).powi(2)
+                            + ((a.n_curr_ppm - sp.n_ppm) / 0.35).powi(2);
+                        let db = ((b.c_prev_ppm - sp.c_prime_ppm) / 0.08).powi(2)
+                            + ((b.n_curr_ppm - sp.n_ppm) / 0.35).powi(2);
+                        da.total_cmp(&db)
+                    })
+                    .map(|(i, _)| i);
+            }
+            ds.con_roots = new_con;
+            self.c13_picked_dataset = Some(ds);
+        } else if nx == "1H" && ny == "15N" {
+            self.rebuild_systems_and_matrices();
+        }
+    }
+
+    fn default_2d_peak_exp_name(&self) -> String {
+        let (nx, ny) = self.active_2d_nuclei();
+        if nx == "13C" && ny == "15N" {
+            "CON".to_string()
+        } else if nx == "1H" && ny == "15N" {
+            "HSQC".to_string()
+        } else if nx == "1H" && ny == "13C" {
+            "C13HSQC".to_string()
+        } else {
+            self.hsqc_spec
+                .as_ref()
+                .map(|s| s.name.clone())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "2D".to_string())
+        }
+    }
+
+    fn sample_2d_extremum_or_exact(
+        &self,
+        f2_ppm: f64,
+        f1_ppm: f64,
+        snap_radius_ppm: Option<(f64, f64)>,
+    ) -> (f64, f64, f64, i32) {
+        let Some(ref spec) = self.hsqc_spec else {
+            return (f2_ppm, f1_ppm, 100.0, 1);
+        };
+        let nx = spec.nx();
+        let ny = spec.ny();
+        if nx < 3 || ny < 3 || spec.data.len() < nx * ny {
+            return (f2_ppm, f1_ppm, 100.0, 1);
+        }
+        if let Some((rx_ppm, ry_ppm)) = snap_radius_ppm {
+            let cx = spec
+                .axis_x
+                .ppm_to_index(f2_ppm)
+                .round()
+                .clamp(1.0, (nx - 2) as f64) as isize;
+            let cy = spec
+                .axis_y
+                .ppm_to_index(f1_ppm)
+                .round()
+                .clamp(1.0, (ny - 2) as f64) as isize;
+            let rx = ((rx_ppm / spec.axis_x.step_ppm.abs().max(1e-6)).ceil() as isize).clamp(1, 8);
+            let ry = ((ry_ppm / spec.axis_y.step_ppm.abs().max(1e-6)).ceil() as isize).clamp(1, 8);
+            let mut best_ix = cx as usize;
+            let mut best_iy = cy as usize;
+            let mut best_score = -1.0_f32;
+            for dy in -ry..=ry {
+                let iy = (cy + dy).clamp(1, (ny - 2) as isize) as usize;
+                for dx in -rx..=rx {
+                    let ix = (cx + dx).clamp(1, (nx - 2) as isize) as usize;
+                    let v = spec.get(ix, iy);
+                    let score = if self.show_negative { v.abs() } else { v };
+                    if score > best_score {
+                        best_score = score;
+                        best_ix = ix;
+                        best_iy = iy;
+                    }
+                }
+            }
+            let v0 = spec.get(best_ix, best_iy) as f64;
+            let sign = if v0 < 0.0 && self.show_negative {
+                -1
+            } else {
+                1
+            };
+            let sgn = sign as f64;
+            let xm = (spec.get(best_ix - 1, best_iy) as f64) * sgn;
+            let xc = v0 * sgn;
+            let xp = (spec.get(best_ix + 1, best_iy) as f64) * sgn;
+            let denom_x = xm - 2.0 * xc + xp;
+            let sub_x = if denom_x < -1e-9 {
+                (0.5 * (xm - xp) / denom_x).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            };
+            let ym = (spec.get(best_ix, best_iy - 1) as f64) * sgn;
+            let yp = (spec.get(best_ix, best_iy + 1) as f64) * sgn;
+            let denom_y = ym - 2.0 * xc + yp;
+            let sub_y = if denom_y < -1e-9 {
+                (0.5 * (ym - yp) / denom_y).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            };
+            (
+                spec.axis_x.index_to_ppm(best_ix as f64 + sub_x),
+                spec.axis_y.index_to_ppm(best_iy as f64 + sub_y),
+                v0,
+                sign,
+            )
+        } else {
+            let ix_f = spec.axis_x.ppm_to_index(f2_ppm).clamp(0.0, (nx - 1) as f64);
+            let iy_f = spec.axis_y.ppm_to_index(f1_ppm).clamp(0.0, (ny - 1) as f64);
+            let ix0 = (ix_f.floor() as usize).min(nx - 1);
+            let ix1 = (ix0 + 1).min(nx - 1);
+            let iy0 = (iy_f.floor() as usize).min(ny - 1);
+            let iy1 = (iy0 + 1).min(ny - 1);
+            let tx = (ix_f - ix0 as f64) as f32;
+            let ty = (iy_f - iy0 as f64) as f32;
+            let r0 = spec.get(ix0, iy0) * (1.0 - tx) + spec.get(ix1, iy0) * tx;
+            let r1 = spec.get(ix0, iy1) * (1.0 - tx) + spec.get(ix1, iy1) * tx;
+            let amp = (r0 * (1.0 - ty) + r1 * ty) as f64;
+            let sign = if amp < 0.0 && self.show_negative {
+                -1
+            } else {
+                1
+            };
+            (f2_ppm, f1_ppm, amp, sign)
+        }
+    }
+
+    fn add_manual_2d_peak(
+        &mut self,
+        f2_ppm: f64,
+        f1_ppm: f64,
+        snap_radius_ppm: Option<(f64, f64)>,
+    ) -> usize {
+        let (h, n, amp, sign) = self.sample_2d_extremum_or_exact(f2_ppm, f1_ppm, snap_radius_ppm);
+        let pk = Peak {
+            exp: self.default_2d_peak_exp_name(),
+            h,
+            n,
+            c: None,
+            h2: None,
+            sign,
+            height: Some(amp),
+            volume: Some(amp),
+        };
+        let _ = self.session.execute(WorkbenchCommand::AddPeak(pk));
+        self.peaks = self.session.state.peaks.clone();
+        let new_idx = self.peaks.len().saturating_sub(1);
+        self.workbook.two_d.selected_peak_idx = Some(new_idx);
+        self.crosshair.snap_to(h, n, self.crosshair.c_ppm);
+        self.sync_2d_peaks_after_edit();
+        let (nx, ny) = self.active_2d_nuclei();
         self.status_msg = format!(
-            "{method_label} found {n_picked} 2D roots -> rebuilt {} spin systems",
-            self.systems.len()
+            "Added 2D peak #{} at {} {:.3}, {} {:.3} ppm",
+            new_idx + 1,
+            Self::pretty_nucleus_unicode(nx),
+            h,
+            Self::pretty_nucleus_unicode(ny),
+            n
         );
+        new_idx
+    }
+
+    fn box_pick_2d_region(&mut self, f2_a: f64, f2_b: f64, f1_a: f64, f1_b: f64) -> usize {
+        let Some(spec) = self.hsqc_spec.clone() else {
+            return 0;
+        };
+        let f2_lo = f2_a.min(f2_b);
+        let f2_hi = f2_a.max(f2_b);
+        let f1_lo = f1_a.min(f1_b);
+        let f1_hi = f1_a.max(f1_b);
+        let (nx_lbl, ny_lbl) = self.active_2d_nuclei();
+        let cands = pick_2d_crosspeaks_ridge_safe(
+            &spec,
+            (self.picker_snr * 0.85).max(2.5),
+            self.contour_base,
+            nx_lbl == ny_lbl,
+            true,
+            self.show_negative,
+        );
+        let tol_x = (spec.axis_x.step_ppm.abs() * 2.2).max(0.008);
+        let tol_y = (spec.axis_y.step_ppm.abs() * 2.2).max(0.015);
+        let exp_name = self.default_2d_peak_exp_name();
+        let mut added = 0usize;
+        for mut cand in cands {
+            if cand.h < f2_lo || cand.h > f2_hi || cand.n < f1_lo || cand.n > f1_hi {
+                continue;
+            }
+            let dup = self.peaks.iter().any(|p| {
+                p.c.is_none() && (p.h - cand.h).abs() <= tol_x && (p.n - cand.n).abs() <= tol_y
+            });
+            if !dup {
+                cand.exp = exp_name.clone();
+                self.peaks.push(cand);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.workbook.two_d.selected_peak_idx = Some(self.peaks.len() - 1);
+            self.workbook.two_d.show_peak_table = true;
+            self.sync_2d_peaks_after_edit();
+            self.status_msg = format!("Box-picked {added} 2D cross-peak(s) in region");
+        } else {
+            self.status_msg =
+                "No additional cross-peaks above contour floor inside box (lower contour floor or click directly to add)".to_string();
+        }
+        added
+    }
+
+    fn move_2d_peak_live(&mut self, peak_idx: usize, new_f2: f64, new_f1: f64, finalize: bool) {
+        if peak_idx >= self.peaks.len() || !new_f2.is_finite() || !new_f1.is_finite() {
+            return;
+        }
+        let old_key = peak_label_key_2d(self.peaks[peak_idx].h, self.peaks[peak_idx].n);
+        let (h, n, amp, sign) = self.sample_2d_extremum_or_exact(new_f2, new_f1, None);
+        self.peaks[peak_idx].h = h;
+        self.peaks[peak_idx].n = n;
+        self.peaks[peak_idx].height = Some(amp);
+        self.peaks[peak_idx].sign = sign;
+        let new_key = peak_label_key_2d(h, n);
+        if old_key != new_key {
+            if let Some(lbl) = self.peak_2d_labels.remove(&old_key) {
+                self.peak_2d_labels.insert(new_key, lbl);
+            }
+        }
+        self.crosshair.snap_to(h, n, self.crosshair.c_ppm);
+        if finalize {
+            self.sync_2d_peaks_after_edit();
+            self.status_msg = format!("Moved 2D peak #{} to ({h:.3}, {n:.3}) ppm", peak_idx + 1);
+        }
+    }
+
+    fn snap_2d_peak_by_index(&mut self, peak_idx: usize) {
+        if peak_idx >= self.peaks.len() {
+            return;
+        }
+        let (cur_h, cur_n) = (self.peaks[peak_idx].h, self.peaks[peak_idx].n);
+        let (rx_ppm, ry_ppm) = if let Some(ref sp) = self.hsqc_spec {
+            (
+                (sp.axis_x.step_ppm.abs() * 4.0).max(0.015),
+                (sp.axis_y.step_ppm.abs() * 4.0).max(0.04),
+            )
+        } else {
+            (0.03, 0.25)
+        };
+        let old_key = peak_label_key_2d(cur_h, cur_n);
+        let (h, n, amp, sign) =
+            self.sample_2d_extremum_or_exact(cur_h, cur_n, Some((rx_ppm, ry_ppm)));
+        self.peaks[peak_idx].h = h;
+        self.peaks[peak_idx].n = n;
+        self.peaks[peak_idx].height = Some(amp);
+        self.peaks[peak_idx].sign = sign;
+        let new_key = peak_label_key_2d(h, n);
+        if old_key != new_key {
+            if let Some(lbl) = self.peak_2d_labels.remove(&old_key) {
+                self.peak_2d_labels.insert(new_key, lbl);
+            }
+        }
+        self.crosshair.snap_to(h, n, self.crosshair.c_ppm);
+        self.sync_2d_peaks_after_edit();
+        self.status_msg = format!("Snapped 2D peak #{} to ({h:.3}, {n:.3}) ppm", peak_idx + 1);
+    }
+
+    fn delete_2d_peak(&mut self, peak_idx: usize) {
+        if peak_idx >= self.peaks.len() {
+            return;
+        }
+        let removed = self.peaks[peak_idx].clone();
+        self.peak_2d_labels
+            .remove(&peak_label_key_2d(removed.h, removed.n));
+        self.session.state.peaks = self.peaks.clone();
+        let _ = self
+            .session
+            .execute(WorkbenchCommand::DeletePeaks(vec![peak_idx]));
+        self.peaks = self.session.state.peaks.clone();
+        self.workbook.two_d.dragging_peak_idx = None;
+        if self.workbook.two_d.selected_peak_idx == Some(peak_idx) {
+            self.workbook.two_d.selected_peak_idx = None;
+        } else if let Some(sel) = self.workbook.two_d.selected_peak_idx {
+            if sel > peak_idx {
+                self.workbook.two_d.selected_peak_idx = Some(sel - 1);
+            }
+        }
+        self.sync_2d_peaks_after_edit();
+        self.status_msg = format!(
+            "Deleted 2D peak at ({:.3}, {:.3}) ppm",
+            removed.h, removed.n
+        );
+    }
+
+    fn zoom_to_2d_peak(&mut self, peak_idx: usize) {
+        let Some(pk) = self.peaks.get(peak_idx).cloned() else {
+            return;
+        };
+        let prev = [
+            self.view_h_left,
+            self.view_h_right,
+            self.view_n_top,
+            self.view_n_bottom,
+        ];
+        self.workbook.two_d.push_zoom(prev);
+        let (nx, ny) = self.active_2d_nuclei();
+        let half_x = if nx == "1H" { 0.35_f32 } else { 2.2_f32 };
+        let half_y = if ny == "1H" { 0.35_f32 } else { 3.2_f32 };
+        let limits = self.view_limits_for_active_2d();
+        let clamped = clamp_view_ppm_2d(
+            [
+                pk.h as f32 + half_x,
+                pk.h as f32 - half_x,
+                pk.n as f32 - half_y,
+                pk.n as f32 + half_y,
+            ],
+            limits,
+        );
+        self.view_h_left = clamped[0];
+        self.view_h_right = clamped[1];
+        self.view_n_top = clamped[2];
+        self.view_n_bottom = clamped[3];
+        self.workbook.two_d.selected_peak_idx = Some(peak_idx);
+        self.crosshair.snap_to(pk.h, pk.n, self.crosshair.c_ppm);
+    }
+
+    fn export_2d_peaks_tsv(&self) -> String {
+        let (nx, ny) = self.active_2d_nuclei();
+        let mut rows = vec![format!(
+            "index\texp\tf2_{nx}_ppm\tf1_{ny}_ppm\theight\tsign\tlabel"
+        )];
+        for (idx, pk) in self.peaks.iter().filter(|p| p.c.is_none()).enumerate() {
+            let ord = idx + 1;
+            let lbl = self
+                .peak_2d_labels
+                .get(&peak_label_key_2d(pk.h, pk.n))
+                .map(String::as_str)
+                .unwrap_or("");
+            rows.push(format!(
+                "{ord}\t{}\t{:.4}\t{:.4}\t{:.4e}\t{}\t{}",
+                pk.exp,
+                pk.h,
+                pk.n,
+                pk.height.unwrap_or(0.0),
+                pk.sign,
+                lbl
+            ));
+        }
+        rows.join("\n") + "\n"
+    }
+
+    fn draw_2d_peaks_bottom_table(&mut self, ui: &mut egui::Ui) {
+        let indices: Vec<usize> = self
+            .peaks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.c.is_none().then_some(i))
+            .collect();
+        let (nx, ny) = self.active_2d_nuclei();
+        let px = Self::pretty_nucleus_unicode(nx);
+        let py = Self::pretty_nucleus_unicode(ny);
+
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            let tab_lbl = format!("2D Peaks ({})", indices.len());
+            if ui
+                .selectable_label(self.workbook.two_d.show_peak_table, &tab_lbl)
+                .on_hover_text("Show / hide interactive 2D Cross-Peak Curation Table")
+                .clicked()
+            {
+                self.workbook.two_d.show_peak_table = !self.workbook.two_d.show_peak_table;
+            }
+            if ui
+                .small_button("+ Add Peak")
+                .on_hover_text("Add a 2D peak at current crosshair (or Left-Click in [K] mode / Right-Click anywhere on 2D plot)")
+                .clicked()
+            {
+                let rx = self
+                    .hsqc_spec
+                    .as_ref()
+                    .map(|s| (s.axis_x.step_ppm.abs() * 3.0).max(0.01))
+                    .unwrap_or(0.02);
+                let ry = self
+                    .hsqc_spec
+                    .as_ref()
+                    .map(|s| (s.axis_y.step_ppm.abs() * 3.0).max(0.02))
+                    .unwrap_or(0.10);
+                let _ = self.add_manual_2d_peak(
+                    self.crosshair.h_ppm,
+                    self.crosshair.n_ppm,
+                    Some((rx, ry)),
+                );
+                self.workbook.two_d.show_peak_table = true;
+            }
+            if ui
+                .small_button("Auto-Pick")
+                .on_hover_text("Run ridge-safe 2D cross-peak picker above current contour floor")
+                .clicked()
+            {
+                self.pick_2d_roots();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let toggle_lbl = if self.workbook.two_d.show_peak_table {
+                    "Hide Table"
+                } else {
+                    "Show Table"
+                };
+                if ui.small_button(toggle_lbl).clicked() {
+                    self.workbook.two_d.show_peak_table = !self.workbook.two_d.show_peak_table;
+                }
+            });
+        });
+
+        if !self.workbook.two_d.show_peak_table {
+            return;
+        }
+
+        egui::Frame::group(ui.style())
+            .fill(egui::Color32::from_rgb(15, 21, 32))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 58, 78)))
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                let mut repick = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("2D Peak Picker:");
+                    ui.label("Min SNR:");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut self.picker_snr)
+                                .range(2.0..=50.0)
+                                .speed(0.2)
+                                .fixed_decimals(1),
+                        )
+                        .changed()
+                    {
+                        repick = true;
+                    }
+                    if ui.button("Re-Pick 2D").clicked() {
+                        repick = true;
+                    }
+                    if nx == ny
+                        && ui
+                            .checkbox(&mut self.workbook.two_d.pick_diagonal, "Pick Diagonal")
+                            .on_hover_text("Include δ₁ ≈ δ₂ homonuclear diagonal self-peaks")
+                            .changed()
+                    {
+                        repick = true;
+                    }
+                    if ui
+                        .checkbox(&mut self.show_negative, "Neg Contours / Peaks")
+                        .changed()
+                    {
+                        repick = true;
+                    }
+                    ui.checkbox(&mut self.show_peak_labels, "Peak Labels");
+                    if !indices.is_empty() && ui.button("Copy TSV").clicked() {
+                        ui.ctx().copy_text(self.export_2d_peaks_tsv());
+                        self.status_msg =
+                            format!("Copied {} 2D peaks (TSV) to clipboard", indices.len());
+                    }
+                    if !indices.is_empty() && ui.button("Clear All Peaks").clicked() {
+                        self.peaks.retain(|p| p.c.is_some());
+                        self.peak_2d_labels.clear();
+                        self.workbook.two_d.selected_peak_idx = None;
+                        self.sync_2d_peaks_after_edit();
+                        self.status_msg = "Cleared all 2D peaks".to_string();
+                    }
+                });
+                if repick {
+                    self.pick_2d_roots();
+                }
+
+                if indices.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "No 2D peaks picked yet. Click 'Auto-Pick', use [K] on the left tool rail to click/box-pick on the spectrum, or Right-Click anywhere on the 2D plot.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                    return;
+                }
+
+                let mut jump_req: Option<usize> = None;
+                let mut snap_req: Option<usize> = None;
+                let mut del_req: Option<usize> = None;
+                let mut move_req: Option<(usize, f64, f64)> = None;
+
+                egui::ScrollArea::vertical()
+                    .id_salt("two_d_peaks_table_scroll")
+                    .max_height(132.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("two_d_peaks_grid")
+                            .striped(true)
+                            .spacing([12.0, 3.0])
+                            .show(ui, |ui| {
+                                ui.strong("#");
+                                ui.strong(format!("F2 ({px} ppm)"));
+                                ui.strong(format!("F1 ({py} ppm)"));
+                                ui.strong("Height");
+                                ui.strong("Sign");
+                                ui.strong("Label / Assignment");
+                                ui.strong("Actions");
+                                ui.end_row();
+
+                                for (disp_ord, &pk_idx) in indices.iter().take(500).enumerate() {
+                                    let Some(pk) = self.peaks.get(pk_idx).cloned() else {
+                                        continue;
+                                    };
+                                    let is_sel =
+                                        self.workbook.two_d.selected_peak_idx == Some(pk_idx);
+                                    if ui
+                                        .selectable_label(is_sel, format!("{}", disp_ord + 1))
+                                        .on_hover_text("Click to center & zoom 2D viewport onto peak")
+                                        .clicked()
+                                    {
+                                        jump_req = Some(pk_idx);
+                                    }
+                                    let mut f2_edit = pk.h;
+                                    let mut f1_edit = pk.n;
+                                    let spd_x = if nx == "1H" { 0.001 } else { 0.01 };
+                                    let spd_y = if ny == "1H" { 0.001 } else { 0.01 };
+                                    let c_x = ui
+                                        .add(
+                                            egui::DragValue::new(&mut f2_edit)
+                                                .speed(spd_x)
+                                                .fixed_decimals(3),
+                                        )
+                                        .changed();
+                                    let c_y = ui
+                                        .add(
+                                            egui::DragValue::new(&mut f1_edit)
+                                                .speed(spd_y)
+                                                .fixed_decimals(3),
+                                        )
+                                        .changed();
+                                    if c_x || c_y {
+                                        move_req = Some((pk_idx, f2_edit, f1_edit));
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            is_sel,
+                                            egui::RichText::new(format!(
+                                                "{:.3e}",
+                                                pk.height.unwrap_or(0.0)
+                                            ))
+                                            .monospace(),
+                                        )
+                                        .clicked()
+                                    {
+                                        jump_req = Some(pk_idx);
+                                    }
+                                    ui.monospace(if pk.sign < 0 { "-" } else { "+" });
+                                    let key = peak_label_key_2d(pk.h, pk.n);
+                                    let mut lbl_buf =
+                                        self.peak_2d_labels.get(&key).cloned().unwrap_or_default();
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut lbl_buf)
+                                                .desired_width(135.0)
+                                                .hint_text("label / residue"),
+                                        )
+                                        .changed()
+                                    {
+                                        if lbl_buf.trim().is_empty() {
+                                            self.peak_2d_labels.remove(&key);
+                                        } else {
+                                            self.peak_2d_labels.insert(key, lbl_buf);
+                                        }
+                                    }
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .small_button("Jump")
+                                            .on_hover_text("Zoom 2D canvas onto peak")
+                                            .clicked()
+                                        {
+                                            jump_req = Some(pk_idx);
+                                        }
+                                        if ui
+                                            .small_button("Snap")
+                                            .on_hover_text("Snap peak to local 2D parabolic extremum")
+                                            .clicked()
+                                        {
+                                            snap_req = Some(pk_idx);
+                                        }
+                                        if ui
+                                            .small_button("×")
+                                            .on_hover_text("Delete peak")
+                                            .clicked()
+                                        {
+                                            del_req = Some(pk_idx);
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+                            });
+                    });
+
+                if let Some(di) = del_req {
+                    self.delete_2d_peak(di);
+                } else if let Some((mi, nf2, nf1)) = move_req {
+                    self.move_2d_peak_live(mi, nf2, nf1, true);
+                } else if let Some(si) = snap_req {
+                    self.snap_2d_peak_by_index(si);
+                } else if let Some(ji) = jump_req {
+                    self.zoom_to_2d_peak(ji);
+                }
+            });
     }
 
     fn format_shifts_tsv(&self, pred: &Reference) -> String {
@@ -4615,6 +5593,7 @@ impl NmrWorkbenchApp {
                     }
                 },
                 WorkbookSidebarAction::TriggerOpenFiles => {
+                    self.arm_browser_picker_wakeup();
                     #[cfg(target_arch = "wasm32")]
                     trigger_browser_files_picker();
                     #[cfg(not(target_arch = "wasm32"))]
@@ -4634,6 +5613,10 @@ impl NmrWorkbenchApp {
             );
         });
         render_stack1d_panel(ui, &mut self.stack1d_panel);
+        if self.stack1d_panel.pending_water_suppress_1d {
+            self.stack1d_panel.pending_water_suppress_1d = false;
+            self.suppress_water_active_1d();
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(p_str) = self.stack1d_panel.pending_open_native_path.take() {
             self.path_input = p_str;
@@ -4655,6 +5638,8 @@ impl NmrWorkbenchApp {
     }
 
     fn apply_drop_outcome(&mut self, outcome: IngestDropOutcome) {
+        self.bare_bruker_hint = None;
+        self.picker_wakeup_until_ms = 0;
         match outcome {
             IngestDropOutcome::NefSession {
                 source_name,
@@ -4681,12 +5666,9 @@ impl NmrWorkbenchApp {
                 let root = panel.inventory.root_name.clone();
                 let single_direct_2d = n_exp == 1
                     && panel.inventory.auxiliary_files.is_empty()
-                    && panel.inventory.experiments[0].dimensionality
-                        == ExperimentDimensionality::Dim2D
-                    && panel.inventory.experiments[0].data_state == DataState::Processed
                     && matches!(
-                        panel.inventory.experiments[0].vendor,
-                        ExperimentVendor::SparkyUcsf | ExperimentVendor::NmrPipe
+                        panel.inventory.experiments[0].dimensionality,
+                        ExperimentDimensionality::Dim2D | ExperimentDimensionality::Pseudo3D
                     );
                 self.ingest_panel = *panel;
                 self.workspace_mode = WorkspaceMode::ProteinNmr;
@@ -4705,15 +5687,23 @@ impl NmrWorkbenchApp {
         }
     }
 
+    fn record_ingest_error(&mut self, prefix: &str, err: String) {
+        if is_bare_bruker_file_error(&err) {
+            self.bare_bruker_hint = Some(err.clone());
+        }
+        self.status_msg = format!("{prefix}: {err}");
+    }
+
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         install_browser_folder_drop_hook();
         if let Some(err) = poll_browser_drop_error() {
-            self.status_msg = format!("Browser ingest: {err}");
+            self.record_ingest_error("Browser ingest", err);
+            ctx.request_repaint();
         }
         if let Some(batch) = poll_browser_dropped_payloads() {
             match ingest_dropped_payloads(&batch) {
                 Ok(outcome) => self.apply_drop_outcome(outcome),
-                Err(e) => self.status_msg = format!("Ingest error: {e}"),
+                Err(e) => self.record_ingest_error("Ingest error", e),
             }
             ctx.request_repaint();
         }
@@ -4728,8 +5718,9 @@ impl NmrWorkbenchApp {
             if let Some(res) = ready {
                 match res {
                     Ok(outcome) => self.apply_drop_outcome(outcome),
-                    Err(e) => self.status_msg = format!("Drop ingest error: {e}"),
+                    Err(e) => self.record_ingest_error("Drop ingest error", e),
                 }
+                ctx.request_repaint();
             }
         }
 
@@ -4774,7 +5765,7 @@ impl NmrWorkbenchApp {
                 if !remaining.is_empty() {
                     match ingest_dropped_files_native(&remaining) {
                         Ok(outcome) => self.apply_drop_outcome(outcome),
-                        Err(e) => self.status_msg = format!("Drop ingest error: {e}"),
+                        Err(e) => self.record_ingest_error("Drop ingest error", e),
                     }
                 }
             }
@@ -4966,6 +5957,7 @@ impl NmrWorkbenchApp {
                 ui.set_min_width(220.0);
                 if ui.button("Open Folder…").clicked() {
                     ui.close();
+                    self.arm_browser_picker_wakeup();
                     #[cfg(target_arch = "wasm32")]
                     trigger_browser_folder_picker();
                     #[cfg(not(target_arch = "wasm32"))]
@@ -4975,6 +5967,7 @@ impl NmrWorkbenchApp {
                 }
                 if ui.button("Open Files / Archive…").clicked() {
                     ui.close();
+                    self.arm_browser_picker_wakeup();
                     #[cfg(target_arch = "wasm32")]
                     trigger_browser_files_picker();
                     #[cfg(not(target_arch = "wasm32"))]
@@ -5090,6 +6083,23 @@ impl NmrWorkbenchApp {
                     } else {
                         self.show_overlay_manager = true;
                     }
+                }
+                ui.separator();
+                if ui.button("Suppress Water Peak").clicked() {
+                    ui.close();
+                    self.suppress_water_active_spectrum();
+                }
+                let has_water_undo = if self.is_1d_studio_active() {
+                    self.stack1d_panel.water_undo_snapshot.is_some()
+                } else {
+                    self.water_undo_2d.is_some()
+                };
+                if ui
+                    .add_enabled(has_water_undo, egui::Button::new("Undo Water Suppression"))
+                    .clicked()
+                {
+                    ui.close();
+                    self.undo_water_suppression_active();
                 }
             });
 
@@ -5209,7 +6219,11 @@ impl NmrWorkbenchApp {
                     self.stack1d_panel.show_j_trees = mult_j;
                 }
                 ui.checkbox(&mut self.workbook.two_d.show_params_card, "Parameters Card");
-                ui.checkbox(&mut self.stack1d_panel.show_1d_analysis_drawer, "Bottom Table");
+                if self.is_1d_studio_active() {
+                    ui.checkbox(&mut self.stack1d_panel.show_1d_analysis_drawer, "Bottom Table");
+                } else {
+                    ui.checkbox(&mut self.workbook.two_d.show_peak_table, "Bottom Table");
+                }
                 ui.checkbox(
                     &mut self.workbook.two_d.show_projections,
                     "2D F2/F1 Projections",
@@ -5306,6 +6320,7 @@ impl NmrWorkbenchApp {
                 )
                 .clicked()
                 {
+                    self.arm_browser_picker_wakeup();
                     #[cfg(target_arch = "wasm32")]
                     trigger_browser_files_picker();
                     #[cfg(not(target_arch = "wasm32"))]
@@ -5324,6 +6339,7 @@ impl NmrWorkbenchApp {
                 )
                 .clicked()
                 {
+                    self.arm_browser_picker_wakeup();
                     #[cfg(target_arch = "wasm32")]
                     trigger_browser_folder_picker();
                     #[cfg(not(target_arch = "wasm32"))]
@@ -5351,7 +6367,7 @@ impl NmrWorkbenchApp {
                 if ui.button("Paste Text…").clicked() {
                     self.show_text_io_modal = true;
                 }
-                if ui.small_button("✕").clicked() {
+                if ui.small_button("×").clicked() {
                     self.show_native_global_open_bar = false;
                 }
             });
@@ -5817,7 +6833,19 @@ impl NmrWorkbenchApp {
             .max(self.contour_base * 6.0)
             .max(60.0);
 
-        // Single-key 2D tool shortcuts (`Z` ZoomBox, `H` Pan, `X` Slice, `K` Pick, `F` Full 2D)
+        if nuc_x == "13C"
+            && nuc_y == "15N"
+            && !self.peaks.iter().any(|p| p.c.is_none())
+            && self
+                .c13_picked_dataset
+                .as_ref()
+                .is_some_and(|ds| !ds.con_roots.is_empty())
+        {
+            self.sync_con_roots_to_peaks();
+        }
+
+        // Single-key 2D tool shortcuts (`Z` ZoomBox, `H` Pan, `X` Slice, `K` Pick, `F` Full 2D, `Del`/`Backspace` delete selected peak)
+        let mut key_delete_peak: Option<usize> = None;
         if !is_compact_mobile && !ui.ctx().egui_wants_keyboard_input() {
             ui.input(|i| {
                 let plain = !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.alt;
@@ -5828,10 +6856,12 @@ impl NmrWorkbenchApp {
                         self.workbook.two_d.tool_mode = ToolMode2d::Pan;
                         self.box_zoom_2d_anchor = None;
                         self.workbook.two_d.drag_box_start_pos = None;
+                        self.workbook.two_d.pick_box_start_pos = None;
                     } else if i.key_pressed(egui::Key::X) {
                         self.workbook.two_d.tool_mode = ToolMode2d::CrosshairSlice;
                         self.box_zoom_2d_anchor = None;
                         self.workbook.two_d.drag_box_start_pos = None;
+                        self.workbook.two_d.pick_box_start_pos = None;
                     } else if i.key_pressed(egui::Key::K) {
                         self.workbook.two_d.tool_mode = ToolMode2d::PickPeaks;
                     } else if i.key_pressed(egui::Key::F) {
@@ -5843,14 +6873,23 @@ impl NmrWorkbenchApp {
                         ];
                         self.workbook.two_d.push_zoom(cur);
                         self.reset_view_to_spec();
+                    } else if i.key_pressed(egui::Key::Delete)
+                        || i.key_pressed(egui::Key::Backspace)
+                    {
+                        key_delete_peak = self.workbook.two_d.selected_peak_idx;
                     }
                 }
                 if i.key_pressed(egui::Key::Escape) {
                     self.box_zoom_2d_anchor = None;
                     self.box_zoom_2d_mode = false;
                     self.workbook.two_d.drag_box_start_pos = None;
+                    self.workbook.two_d.pick_box_start_pos = None;
+                    self.workbook.two_d.dragging_peak_idx = None;
                 }
             });
+        }
+        if let Some(di) = key_delete_peak {
+            self.delete_2d_peak(di);
         }
 
         if is_compact_mobile {
@@ -5890,6 +6929,25 @@ impl NmrWorkbenchApp {
                         {
                             self.contour_base =
                                 (self.contour_base * CONTOUR_SCROLL_STEP_RATIO).min(base_hi);
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new("Pick")
+                                    .min_size(egui::vec2(46.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                            )
+                            .clicked()
+                        {
+                            self.pick_2d_roots();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new("Water")
+                                    .selected(self.water_undo_2d.is_some())
+                                    .min_size(egui::vec2(50.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                            )
+                            .clicked()
+                        {
+                            self.suppress_water_active_spectrum();
                         }
                         let lbl_btn = egui::Button::new("Labels")
                             .selected(self.show_peak_labels)
@@ -5944,7 +7002,17 @@ impl NmrWorkbenchApp {
         }
 
         let outer_avail = ui.available_size();
-        let outer_size = egui::vec2(outer_avail.x.max(160.0), (outer_avail.y - 2.0).max(160.0));
+        let table_reserve = if is_compact_mobile {
+            2.0
+        } else if self.workbook.two_d.show_peak_table {
+            226.0_f32.min((outer_avail.y - 180.0).max(28.0))
+        } else {
+            28.0
+        };
+        let outer_size = egui::vec2(
+            outer_avail.x.max(160.0),
+            (outer_avail.y - table_reserve).max(160.0),
+        );
         let (outer_rect, _) = ui.allocate_exact_size(outer_size, egui::Sense::hover());
 
         // 1. Slim `38 px` Left Vertical Tool Rail on Desktop & Tablet
@@ -6012,7 +7080,7 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::PeakPick,
                 tm == ToolMode2d::PickPeaks,
-                "Pick 2D Peaks [K]: Auto-pick 2D cross-peaks or click to snap/inspect",
+                "Pick 2D Peaks [K]: Enter Peak-Pick mode (Left-Click adds peak, Left-Drag box-picks, Drag peak moves; click again to Auto-Pick all)",
             )
             .clicked()
             {
@@ -6109,6 +7177,26 @@ impl NmrWorkbenchApp {
             .clicked()
             {
                 self.show_contour_modal = !self.show_contour_modal;
+            }
+            if rail_tool_button(
+                &mut rail_ui,
+                WorkbookIcon::TableGrid,
+                self.workbook.two_d.show_peak_table,
+                "Toggle Bottom 2D Cross-Peak Curation Table (Add, Edit ppm/Label, Snap, Delete, Copy TSV)",
+            )
+            .clicked()
+            {
+                self.workbook.two_d.show_peak_table = !self.workbook.two_d.show_peak_table;
+            }
+            if rail_tool_button(
+                &mut rail_ui,
+                WorkbookIcon::WaterSuppress,
+                self.water_undo_2d.is_some(),
+                "Suppress Residual Water Ridge (~4.7 ppm ¹H band; Process -> Undo Water Suppression restores)",
+            )
+            .clicked()
+            {
+                self.suppress_water_active_spectrum();
             }
 
             egui::Rect::from_min_max(
@@ -6234,11 +7322,134 @@ impl NmrWorkbenchApp {
 
         let tool_mode = self.workbook.two_d.tool_mode;
         let space_down = ui.input(|i| i.key_down(egui::Key::Space));
-        let primary_pans = is_compact_mobile || tool_mode == ToolMode2d::Pan || space_down;
+        let shift_down = ui.input(|i| i.modifiers.shift);
+        let hit_radius_px = if is_compact_mobile { 22.0 } else { 12.0 };
+        let peak_edit_bar_rect = (!is_compact_mobile
+            && rect.width() >= 360.0
+            && rect.height() >= 160.0
+            && self
+                .workbook
+                .two_d
+                .selected_peak_idx
+                .is_some_and(|i| i < self.peaks.len() && self.peaks[i].c.is_none()))
+        .then(|| {
+            let bw = (rect.width() - 16.0).min(548.0);
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 8.0, rect.bottom() - 36.0),
+                egui::vec2(bw, 28.0),
+            )
+        });
+        let in_peak_edit_bar = |p: egui::Pos2| peak_edit_bar_rect.is_some_and(|r| r.contains(p));
+
+        let screen_to_ppm_cur = |p: egui::Pos2, vh: [f32; 4]| -> (f64, f64) {
+            let u = ((p.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+            let v = ((p.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+            (
+                (vh[0] + u * (vh[1] - vh[0])) as f64,
+                (vh[2] + v * (vh[3] - vh[2])) as f64,
+            )
+        };
+        let nearest_2d_peak =
+            |peaks: &[Peak], p: egui::Pos2, vh: [f32; 4], rad: f32| -> Option<(usize, f32)> {
+                let mut best: Option<(usize, f32)> = None;
+                for (idx, pk) in peaks.iter().enumerate() {
+                    if pk.c.is_some() {
+                        continue;
+                    }
+                    let pt = SyncCrosshair::ppm_to_screen_2d(vh, rect, pk.h, pk.n);
+                    if !rect.contains(pt) {
+                        continue;
+                    }
+                    let d = pt.distance(p);
+                    if d <= rad && best.is_none_or(|(_, bd)| d < bd) {
+                        best = Some((idx, d));
+                    }
+                }
+                best
+            };
+
+        // Track stationary right-click vs right-drag pan
+        if ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)) {
+            if let Some(p) = ui
+                .input(|i| i.pointer.interact_pos())
+                .or_else(|| response.hover_pos())
+                .filter(|p| rect.contains(*p))
+            {
+                self.secondary_drag_accum_2d = 0.0;
+                let (ch, cn) = screen_to_ppm_cur(
+                    p,
+                    [
+                        self.view_h_left,
+                        self.view_h_right,
+                        self.view_n_top,
+                        self.view_n_bottom,
+                    ],
+                );
+                self.context_menu_2d_ppm = Some([ch, cn]);
+            }
+        }
+        if response.dragged_by(egui::PointerButton::Secondary) {
+            self.secondary_drag_accum_2d += response.drag_delta().length();
+        }
+
+        // Start dragging an existing 2D peak marker if primary drag originates on a peak
+        if !multi_touch_active
+            && !space_down
+            && !shift_down
+            && self.workbook.two_d.dragging_peak_idx.is_none()
+            && self.workbook.two_d.drag_box_start_pos.is_none()
+            && self.workbook.two_d.pick_box_start_pos.is_none()
+            && response.dragged_by(egui::PointerButton::Primary)
+        {
+            if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
+                if rect.contains(origin) && !in_peak_edit_bar(origin) {
+                    let cur_v = [
+                        self.view_h_left,
+                        self.view_h_right,
+                        self.view_n_top,
+                        self.view_n_bottom,
+                    ];
+                    if let Some((pk_idx, _)) =
+                        nearest_2d_peak(&self.peaks, origin, cur_v, hit_radius_px)
+                    {
+                        self.workbook.two_d.dragging_peak_idx = Some(pk_idx);
+                        self.workbook.two_d.selected_peak_idx = Some(pk_idx);
+                        self.box_zoom_2d_anchor = None;
+                    }
+                }
+            }
+        }
+
+        if let Some(drag_idx) = self.workbook.two_d.dragging_peak_idx {
+            if let Some(cur_pos) = response
+                .interact_pointer_pos()
+                .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+            {
+                let (nh, nn) = screen_to_ppm_cur(
+                    cur_pos,
+                    [
+                        self.view_h_left,
+                        self.view_h_right,
+                        self.view_n_top,
+                        self.view_n_bottom,
+                    ],
+                );
+                self.move_2d_peak_live(drag_idx, nh, nn, false);
+            }
+        }
+
+        let peak_drag_active = self.workbook.two_d.dragging_peak_idx.is_some();
+        let primary_pans =
+            !peak_drag_active && (is_compact_mobile || tool_mode == ToolMode2d::Pan || space_down);
         let pan_dragged = !multi_touch_active
+            && !peak_drag_active
             && (response.dragged_by(egui::PointerButton::Secondary)
                 || response.dragged_by(egui::PointerButton::Middle)
-                || (primary_pans && response.dragged_by(egui::PointerButton::Primary)));
+                || (primary_pans
+                    && response.dragged_by(egui::PointerButton::Primary)
+                    && !ui
+                        .input(|i| i.pointer.press_origin())
+                        .is_some_and(in_peak_edit_bar)));
 
         if pan_dragged && !self.suppress_hsqc_pan_until_release {
             let delta = response.drag_delta();
@@ -6261,24 +7472,48 @@ impl NmrWorkbenchApp {
             self.view_n_bottom = clamped[3];
         }
 
-        // Rubber-band 2D Zoom Box on Left-Click-Drag (`ZoomBox` mode or `Shift+Drag`)
+        // Rubber-band 2D Zoom Box (`ZoomBox` mode or `Shift+Drag`) & Box-Pick (`PickPeaks` mode)
         let zoom_drag_active = !multi_touch_active
             && !is_compact_mobile
             && !primary_pans
+            && !peak_drag_active
             && response.dragged_by(egui::PointerButton::Primary)
-            && (tool_mode == ToolMode2d::ZoomBox || ui.input(|i| i.modifiers.shift));
+            && (tool_mode == ToolMode2d::ZoomBox || shift_down);
         if zoom_drag_active && self.workbook.two_d.drag_box_start_pos.is_none() {
             if let Some(origin) = ui
                 .input(|i| i.pointer.press_origin())
                 .or_else(|| response.interact_pointer_pos())
             {
-                if rect.contains(origin) {
+                if rect.contains(origin) && !in_peak_edit_bar(origin) {
                     self.workbook.two_d.drag_box_start_pos = Some(origin);
                 }
             }
         }
 
+        let pick_box_drag_active = !multi_touch_active
+            && !is_compact_mobile
+            && !primary_pans
+            && !peak_drag_active
+            && !shift_down
+            && tool_mode == ToolMode2d::PickPeaks
+            && response.dragged_by(egui::PointerButton::Primary);
+        if pick_box_drag_active && self.workbook.two_d.pick_box_start_pos.is_none() {
+            if let Some(origin) = ui
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| response.interact_pointer_pos())
+            {
+                if rect.contains(origin) && !in_peak_edit_bar(origin) {
+                    self.workbook.two_d.pick_box_start_pos = Some(origin);
+                }
+            }
+        }
+
         if !ui.input(|i| i.pointer.any_down()) {
+            if let Some(drag_idx) = self.workbook.two_d.dragging_peak_idx.take() {
+                if let Some(pk) = self.peaks.get(drag_idx).cloned() {
+                    self.move_2d_peak_live(drag_idx, pk.h, pk.n, true);
+                }
+            }
             if let Some(p0) = self.workbook.two_d.drag_box_start_pos.take() {
                 if let Some(p1) = response
                     .interact_pointer_pos()
@@ -6289,10 +7524,37 @@ impl NmrWorkbenchApp {
                     }
                 }
             }
+            if let Some(p0) = self.workbook.two_d.pick_box_start_pos.take() {
+                if let Some(p1) = response
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+                {
+                    let x0 = p0.x.min(p1.x).clamp(rect.left(), rect.right());
+                    let x1 = p0.x.max(p1.x).clamp(rect.left(), rect.right());
+                    let y0 = p0.y.min(p1.y).clamp(rect.top(), rect.bottom());
+                    let y1 = p0.y.max(p1.y).clamp(rect.top(), rect.bottom());
+                    if (x1 - x0) >= 6.0 && (y1 - y0) >= 6.0 {
+                        let cur_v = [
+                            self.view_h_left,
+                            self.view_h_right,
+                            self.view_n_top,
+                            self.view_n_bottom,
+                        ];
+                        let (h0, n0) = screen_to_ppm_cur(egui::pos2(x0, y0), cur_v);
+                        let (h1, n1) = screen_to_ppm_cur(egui::pos2(x1, y1), cur_v);
+                        let _ = self.box_pick_2d_region(h0, h1, n0, n1);
+                    }
+                }
+            }
             self.suppress_hsqc_pan_until_release = false;
         }
 
-        if response.double_clicked() && !multi_touch_active {
+        if response.double_clicked()
+            && !multi_touch_active
+            && !response
+                .interact_pointer_pos()
+                .is_some_and(in_peak_edit_bar)
+        {
             let cur = [
                 self.view_h_left,
                 self.view_h_right,
@@ -6353,6 +7615,94 @@ impl NmrWorkbenchApp {
             self.view_n_top,
             self.view_n_bottom,
         ];
+
+        // Stationary Right-Click Context Menu on 2D Canvas
+        let snap_rx_ppm =
+            ((4.0 / rect.width().max(1.0) * (view_ppm[1] - view_ppm[0]).abs()) as f64).max(
+                self.hsqc_spec
+                    .as_ref()
+                    .map(|s| s.axis_x.step_ppm.abs() * 2.0)
+                    .unwrap_or(0.01),
+            );
+        let snap_ry_ppm =
+            ((4.0 / rect.height().max(1.0) * (view_ppm[3] - view_ppm[2]).abs()) as f64).max(
+                self.hsqc_spec
+                    .as_ref()
+                    .map(|s| s.axis_y.step_ppm.abs() * 2.0)
+                    .unwrap_or(0.02),
+            );
+        response.context_menu(|ui| {
+            if self.secondary_drag_accum_2d >= 5.0 {
+                ui.close();
+                return;
+            }
+            ui.set_min_width(225.0);
+            let [th, tn] = self
+                .context_menu_2d_ppm
+                .unwrap_or([self.crosshair.h_ppm, self.crosshair.n_ppm]);
+            ui.label(
+                egui::RichText::new(format!("F2 {pretty_x} {th:.3} | F1 {pretty_y} {tn:.3} ppm"))
+                    .small()
+                    .monospace()
+                    .weak(),
+            );
+            ui.separator();
+            if ui.button("+ Add Peak (Snap to Apex)").clicked() {
+                let _ = self.add_manual_2d_peak(th, tn, Some((snap_rx_ppm, snap_ry_ppm)));
+                self.workbook.two_d.show_peak_table = true;
+                ui.close();
+            }
+            if ui.button("+ Add Peak (Exact Cursor)").clicked() {
+                let _ = self.add_manual_2d_peak(th, tn, None);
+                self.workbook.two_d.show_peak_table = true;
+                ui.close();
+            }
+            if let Some(sel) = self
+                .workbook
+                .two_d
+                .selected_peak_idx
+                .filter(|&i| i < self.peaks.len() && self.peaks[i].c.is_none())
+            {
+                ui.separator();
+                if ui
+                    .button(format!("Snap Peak #{} to Extremum", sel + 1))
+                    .clicked()
+                {
+                    self.snap_2d_peak_by_index(sel);
+                    ui.close();
+                }
+                if ui.button(format!("Delete Peak #{}", sel + 1)).clicked() {
+                    self.delete_2d_peak(sel);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("Auto-Pick All 2D Peaks").clicked() {
+                self.pick_2d_roots();
+                ui.close();
+            }
+            let tbl_txt = if self.workbook.two_d.show_peak_table {
+                "Hide 2D Peak Table"
+            } else {
+                "Show 2D Peak Table"
+            };
+            if ui.button(tbl_txt).clicked() {
+                self.workbook.two_d.show_peak_table = !self.workbook.two_d.show_peak_table;
+                ui.close();
+            }
+            if ui.button("Suppress Water Band").clicked() {
+                self.suppress_water_active_spectrum();
+                ui.close();
+            }
+            if self.water_undo_2d.is_some() && ui.button("Undo Water Suppression").clicked() {
+                self.undo_water_suppression_active();
+                ui.close();
+            }
+            if ui.button("Reset Full View (F)").clicked() {
+                self.reset_view_to_spec();
+                ui.close();
+            }
+        });
 
         // 3. Render Top F2 & Left F1 1D Marginal Strips (pixel-aligned with `rect`)
         if let (Some(r_f2), Some(r_f1), Some(r_corner)) = (f2_rect, f1_rect, corner_rect) {
@@ -6597,160 +7947,113 @@ impl NmrWorkbenchApp {
         let is_prot_2d = self.is_protein_2d_context();
 
         // Tap / Click handling:
-        // - Select nearest spin-system / CON root if clicked directly within hit radius (and no 2-click zoom anchor is pending)
-        // - Otherwise in ZoomBox mode: 2-click zoom anchor -> zoom box!
+        // - `Ctrl/Cmd + Click` quick-adds a 2D peak in ANY mode (`Alt` disables snap)
+        // - Clicking an existing peak within `hit_radius_px` selects it (and syncs spin-system / residue on protein 2D)
+        // - Left-Click in `PickPeaks [K]` mode adds a 2D peak (`Alt` disables snap)
+        // - Otherwise in `ZoomBox` mode: 2-click zoom anchor -> zoom box!
         if response.clicked() && !multi_touch_active && !self.suppress_hsqc_pan_until_release {
             if let Some(click_pos) = response.interact_pointer_pos() {
-                if let Some(anchor) = self.box_zoom_2d_anchor.take() {
-                    if !apply_box_zoom(self, egui::pos2(anchor[0], anchor[1]), click_pos) {
-                        self.box_zoom_2d_anchor = Some([click_pos.x, click_pos.y]);
-                    }
-                } else {
-                    let hit_radius = if is_compact_mobile { 24.0 } else { 15.0 };
-                    let mut hit_peak = false;
-                    if nuc_x == "13C" && nuc_y == "15N" {
-                        if let Some(ref ds) = self.c13_picked_dataset {
-                            if let Some(best_con) = ds
-                                .con_roots
-                                .iter()
-                                .map(|pk| {
-                                    let pt = ppm_to_screen(pk.c_prev_ppm, pk.n_curr_ppm);
-                                    (pk, pt.distance(click_pos))
-                                })
-                                .filter(|(_, d)| *d <= hit_radius)
-                                .min_by(|a, b| a.1.total_cmp(&b.1))
-                                .map(|(pk, _)| (pk.c_prev_ppm, pk.n_curr_ppm))
-                            {
-                                self.crosshair.snap_to(best_con.0, best_con.1, None);
-                                hit_peak = true;
-                            }
+                if !in_peak_edit_bar(click_pos) {
+                    let (ctrl_or_cmd, alt_down) =
+                        ui.input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.alt));
+                    let (tap_h, tap_n) = screen_to_ppm_cur(click_pos, view_ppm);
+                    let snap_opt = (!alt_down).then_some((snap_rx_ppm, snap_ry_ppm));
+
+                    if let Some(anchor) = self.box_zoom_2d_anchor.take() {
+                        if !apply_box_zoom(self, egui::pos2(anchor[0], anchor[1]), click_pos) {
+                            self.box_zoom_2d_anchor = Some([click_pos.x, click_pos.y]);
                         }
-                    } else if is_prot_2d {
-                        let mut best: Option<(usize, f32)> = None;
-                        for (s, ss) in self.systems.iter().enumerate() {
-                            let pt = ppm_to_screen(ss.h, ss.n);
-                            let dist = pt.distance(click_pos);
-                            if dist <= hit_radius && best.is_none_or(|(_, bd)| dist < bd) {
-                                best = Some((s, dist));
-                            }
+                    } else if ctrl_or_cmd {
+                        let _ = self.add_manual_2d_peak(tap_h, tap_n, snap_opt);
+                        self.workbook.two_d.show_peak_table = true;
+                    } else {
+                        let hit_pk =
+                            nearest_2d_peak(&self.peaks, click_pos, view_ppm, hit_radius_px);
+                        let mut hit_any = false;
+
+                        if let Some((pk_idx, _)) = hit_pk {
+                            self.workbook.two_d.selected_peak_idx = Some(pk_idx);
+                            let pk = &self.peaks[pk_idx];
+                            self.crosshair.snap_to(pk.h, pk.n, self.crosshair.c_ppm);
+                            hit_any = true;
                         }
-                        if let Some((s, _)) = best {
-                            self.selected_ss = Some(s);
-                            let ss = &self.systems[s];
-                            self.crosshair.snap_to(ss.h, ss.n, None);
-                            if let Some(res) = &self.assign_res {
-                                if res.position.get(s).copied().unwrap_or(-1) >= 0 {
-                                    let rk = res.position[s] as usize;
-                                    self.selected_res = Some(rk);
-                                    self.assign_target_res = rk;
-                                    self.mol3d_panel.highlight_sequence_residue(Some(rk), true);
+
+                        if is_prot_2d {
+                            let mut best_ss: Option<(usize, f32)> = None;
+                            for (s, ss) in self.systems.iter().enumerate() {
+                                let pt = ppm_to_screen(ss.h, ss.n);
+                                let dist = pt.distance(click_pos);
+                                if dist <= hit_radius_px && best_ss.is_none_or(|(_, bd)| dist < bd)
+                                {
+                                    best_ss = Some((s, dist));
                                 }
                             }
-                            hit_peak = true;
+                            if let Some((s, _)) = best_ss {
+                                self.selected_ss = Some(s);
+                                let ss = &self.systems[s];
+                                self.crosshair.snap_to(ss.h, ss.n, None);
+                                if let Some(res) = &self.assign_res {
+                                    if res.position.get(s).copied().unwrap_or(-1) >= 0 {
+                                        let rk = res.position[s] as usize;
+                                        self.selected_res = Some(rk);
+                                        self.assign_target_res = rk;
+                                        self.mol3d_panel.highlight_sequence_residue(Some(rk), true);
+                                    }
+                                }
+                                hit_any = true;
+                            }
                         }
-                    }
 
-                    if !hit_peak {
-                        if !is_compact_mobile
-                            && (tool_mode == ToolMode2d::ZoomBox || self.box_zoom_2d_mode)
-                        {
-                            self.box_zoom_2d_anchor = Some([click_pos.x, click_pos.y]);
-                        } else {
-                            let u = ((click_pos.x - rect.left()) / rect.width().max(1.0))
-                                .clamp(0.0, 1.0);
-                            let v = ((click_pos.y - rect.top()) / rect.height().max(1.0))
-                                .clamp(0.0, 1.0);
-                            let tap_h = (self.view_h_left
-                                + u * (self.view_h_right - self.view_h_left))
-                                as f64;
-                            let tap_n = (self.view_n_top
-                                + v * (self.view_n_bottom - self.view_n_top))
-                                as f64;
-                            self.crosshair.update_from_2d_hover(tap_h, tap_n);
+                        if !hit_any {
+                            self.workbook.two_d.selected_peak_idx = None;
+                            if tool_mode == ToolMode2d::PickPeaks {
+                                let _ = self.add_manual_2d_peak(tap_h, tap_n, snap_opt);
+                                self.workbook.two_d.show_peak_table = true;
+                            } else if !is_compact_mobile
+                                && (tool_mode == ToolMode2d::ZoomBox || self.box_zoom_2d_mode)
+                            {
+                                self.box_zoom_2d_anchor = Some([click_pos.x, click_pos.y]);
+                            } else {
+                                self.crosshair.update_from_2d_hover(tap_h, tap_n);
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Draw 2D CON peptide-bond roots (including Pro imino 132–142 ppm) when active
-        if nuc_x == "13C" && nuc_y == "15N" {
-            if let Some(ref ds) = self.c13_picked_dataset {
-                for (idx, pk) in ds.con_roots.iter().enumerate() {
-                    let pt = ppm_to_screen(pk.c_prev_ppm, pk.n_curr_ppm);
-                    if !rect.contains(pt) {
-                        continue;
-                    }
-                    let marker_col = if pk.is_proline_imino_region {
-                        theme.peak_med_conf
-                    } else {
-                        theme.peak_hi_conf
-                    };
-                    let sz = 4.2;
-                    painter.line_segment(
-                        [egui::pos2(pt.x - sz, pt.y), egui::pos2(pt.x + sz, pt.y)],
-                        egui::Stroke::new(1.3, marker_col),
-                    );
-                    painter.line_segment(
-                        [egui::pos2(pt.x, pt.y - sz), egui::pos2(pt.x, pt.y + sz)],
-                        egui::Stroke::new(1.3, marker_col),
-                    );
-                    if self.show_peak_labels {
-                        let lbl = if pk.is_proline_imino_region {
-                            format!("Pro#{idx}")
-                        } else {
-                            format!("#{idx}")
-                        };
-                        painter.text(
-                            egui::pos2(pt.x + 5.0, pt.y - 5.0),
-                            egui::Align2::LEFT_BOTTOM,
-                            lbl,
-                            egui::FontId::monospace(10.0),
-                            marker_col,
-                        );
-                    }
-                }
-            }
-        } else if !is_prot_2d && !self.peaks.is_empty() {
-            // Draw unclustered 2D cross-peak markers when picked on small-molecule 2D
-            for (idx, pk) in self
-                .peaks
-                .iter()
-                .filter(|p| p.c.is_none())
-                .take(400)
-                .enumerate()
-            {
-                let pt = ppm_to_screen(pk.h, pk.n);
-                if !rect.contains(pt) {
-                    continue;
-                }
-                let sz = 3.5;
-                painter.line_segment(
-                    [egui::pos2(pt.x - sz, pt.y), egui::pos2(pt.x + sz, pt.y)],
-                    egui::Stroke::new(1.1, theme.peak_unassigned),
-                );
-                painter.line_segment(
-                    [egui::pos2(pt.x, pt.y - sz), egui::pos2(pt.x, pt.y + sz)],
-                    egui::Stroke::new(1.1, theme.peak_unassigned),
-                );
-                if self.show_peak_labels && self.peaks.len() <= 120 {
-                    painter.text(
-                        egui::pos2(pt.x + 5.0, pt.y - 5.0),
-                        egui::Align2::LEFT_BOTTOM,
-                        format!("#{idx}"),
-                        egui::FontId::monospace(9.5),
-                        theme.peak_unassigned,
-                    );
-                }
-            }
-        } else if is_prot_2d {
-            // Draw protein spin system peak markers and residue labels
+        // Draw up to `3,000` 2D cross-peak / CON / protein spin-system markers + labels
+        let draw_selection_diamond = |pt: egui::Pos2| {
+            let r = 8.5_f32;
+            let pts = vec![
+                egui::pos2(pt.x, pt.y - r),
+                egui::pos2(pt.x + r, pt.y),
+                egui::pos2(pt.x, pt.y + r),
+                egui::pos2(pt.x - r, pt.y),
+                egui::pos2(pt.x, pt.y - r),
+            ];
+            painter.add(egui::Shape::line(
+                pts,
+                egui::Stroke::new(1.8, theme.zoom_box_stroke),
+            ));
+        };
+
+        if is_prot_2d && !self.systems.is_empty() && !(nuc_x == "13C" && nuc_y == "15N") {
+            // Draw protein spin system peak markers and residue / custom labels
             for (s, ss) in self.systems.iter().enumerate() {
                 let pt = ppm_to_screen(ss.h, ss.n);
                 if !rect.contains(pt) {
                     continue;
                 }
-                let is_sel = self.selected_ss == Some(s);
+                let matched_pk_sel = self
+                    .workbook
+                    .two_d
+                    .selected_peak_idx
+                    .and_then(|pi| self.peaks.get(pi))
+                    .is_some_and(|pk| {
+                        pk.c.is_none() && (pk.h - ss.h).abs() < 0.025 && (pk.n - ss.n).abs() < 0.25
+                    });
+                let is_sel = self.selected_ss == Some(s) || matched_pk_sel;
                 let is_locked = self.session.state.is_spin_system_locked(s);
                 let (assigned_k, conf) = self
                     .assign_res
@@ -6780,11 +8083,17 @@ impl NmrWorkbenchApp {
                     egui::Stroke::new(if is_sel { 2.0 } else { 1.2 }, marker_col),
                 );
                 if is_sel {
-                    painter.circle_stroke(pt, 10.5, egui::Stroke::new(2.0, theme.zoom_box_stroke));
+                    draw_selection_diamond(pt);
                 }
 
-                if self.show_peak_labels {
-                    let text = if assigned_k >= 0 && (assigned_k as usize) < self.sequence.len() {
+                let custom_lbl = self
+                    .peak_2d_labels
+                    .get(&peak_label_key_2d(ss.h, ss.n))
+                    .cloned();
+                if self.show_peak_labels || custom_lbl.is_some() {
+                    let text = if let Some(cl) = custom_lbl {
+                        cl
+                    } else if assigned_k >= 0 && (assigned_k as usize) < self.sequence.len() {
                         let k = assigned_k as usize;
                         if is_locked {
                             format!("*{}{}", three_to_one(&self.sequence[k]), self.seq_ids[k])
@@ -6799,6 +8108,81 @@ impl NmrWorkbenchApp {
                         egui::Align2::LEFT_BOTTOM,
                         text,
                         egui::FontId::monospace(10.5),
+                        marker_col,
+                    );
+                }
+            }
+        } else {
+            let visible_count = self
+                .peaks
+                .iter()
+                .filter(|p| p.c.is_none())
+                .take(3_000)
+                .filter(|p| rect.contains(ppm_to_screen(p.h, p.n)))
+                .count();
+            let is_con_view = nuc_x == "13C" && nuc_y == "15N";
+            for (ord, (pk_idx, pk)) in self
+                .peaks
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.c.is_none())
+                .take(3_000)
+                .enumerate()
+            {
+                let pt = ppm_to_screen(pk.h, pk.n);
+                if !rect.contains(pt) {
+                    continue;
+                }
+                let is_sel = self.workbook.two_d.selected_peak_idx == Some(pk_idx);
+                let marker_col = if is_sel {
+                    theme.zoom_box_stroke
+                } else if is_con_view {
+                    if pk.n >= 131.5 {
+                        theme.peak_med_conf
+                    } else {
+                        theme.peak_hi_conf
+                    }
+                } else if pk.sign < 0 {
+                    egui::Color32::from_rgb(244, 63, 94)
+                } else {
+                    theme.peak_hi_conf
+                };
+                let sz = if is_sel { 5.8 } else { 3.8 };
+                let sw = if is_sel { 1.9 } else { 1.25 };
+                painter.line_segment(
+                    [egui::pos2(pt.x - sz, pt.y), egui::pos2(pt.x + sz, pt.y)],
+                    egui::Stroke::new(sw, marker_col),
+                );
+                painter.line_segment(
+                    [egui::pos2(pt.x, pt.y - sz), egui::pos2(pt.x, pt.y + sz)],
+                    egui::Stroke::new(sw, marker_col),
+                );
+                if is_sel {
+                    draw_selection_diamond(pt);
+                }
+                let custom_lbl = self
+                    .peak_2d_labels
+                    .get(&peak_label_key_2d(pk.h, pk.n))
+                    .cloned();
+                if let Some(cl) = custom_lbl {
+                    painter.text(
+                        egui::pos2(pt.x + 5.0, pt.y - 5.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        cl,
+                        egui::FontId::monospace(10.0),
+                        marker_col,
+                    );
+                } else if (self.show_peak_labels && visible_count <= 260) || is_sel {
+                    let lbl = if is_con_view && pk.n >= 131.5 {
+                        format!("Pro#{}", ord + 1)
+                    } else {
+                        format!("#{}", ord + 1)
+                    };
+                    painter.text(
+                        egui::pos2(pt.x + 5.0, pt.y - 5.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        lbl,
+                        egui::FontId::monospace(9.5),
                         marker_col,
                     );
                 }
@@ -6838,13 +8222,18 @@ impl NmrWorkbenchApp {
             );
         }
 
-        // Draw live rubber-band 2D Zoom Box preview (`ΔF2 ppm × ΔF1 ppm`)
+        // Draw live rubber-band 2D Zoom Box OR Box-Pick preview (`ΔF2 ppm × ΔF1 ppm`)
         let active_box_start = self
             .workbook
             .two_d
             .drag_box_start_pos
-            .or_else(|| self.box_zoom_2d_anchor.map(|a| egui::pos2(a[0], a[1])));
-        if let Some(anchor_pt) = active_box_start {
+            .map(|p| (p, false))
+            .or_else(|| self.workbook.two_d.pick_box_start_pos.map(|p| (p, true)))
+            .or_else(|| {
+                self.box_zoom_2d_anchor
+                    .map(|a| (egui::pos2(a[0], a[1]), false))
+            });
+        if let Some((anchor_pt, is_pick_box)) = active_box_start {
             if let Some(cur_pos) = response
                 .hover_pos()
                 .or_else(|| ui.input(|i| i.pointer.latest_pos()))
@@ -6859,11 +8248,20 @@ impl NmrWorkbenchApp {
                         cur_pos.y.clamp(rect.top(), rect.bottom()),
                     ),
                 );
-                painter.rect_filled(box_rect, 1.5, theme.zoom_box_fill);
+                let (fill_c, stroke_c, pfx) = if is_pick_box {
+                    (
+                        egui::Color32::from_rgba_unmultiplied(16, 185, 129, 34),
+                        egui::Color32::from_rgb(16, 185, 129),
+                        "Box-Pick ",
+                    )
+                } else {
+                    (theme.zoom_box_fill, theme.zoom_box_stroke, "")
+                };
+                painter.rect_filled(box_rect, 1.5, fill_c);
                 painter.rect_stroke(
                     box_rect,
                     1.5,
-                    egui::Stroke::new(1.35, theme.zoom_box_stroke),
+                    egui::Stroke::new(1.35, stroke_c),
                     egui::StrokeKind::Inside,
                 );
                 let dh_ppm = ((box_rect.width() / rect.width().max(1.0))
@@ -6878,9 +8276,9 @@ impl NmrWorkbenchApp {
                         (box_rect.top() - 4.0).max(rect.top() + 14.0),
                     ),
                     egui::Align2::LEFT_BOTTOM,
-                    format!("ΔF2 {dh_ppm:.2} {pretty_x} | ΔF1 {dn_ppm:.2} {pretty_y}"),
+                    format!("{pfx}ΔF2 {dh_ppm:.2} {pretty_x} | ΔF1 {dn_ppm:.2} {pretty_y}"),
                     egui::FontId::monospace(9.5),
-                    theme.zoom_box_stroke,
+                    stroke_c,
                 );
             }
         }
@@ -7115,6 +8513,118 @@ impl NmrWorkbenchApp {
             );
         }
 
+        // 7. Floating Selected-Peak Inline Edit Bar (Bottom-Left of `rect`)
+        if let (Some(bar_r), Some(sel_idx)) = (
+            peak_edit_bar_rect,
+            self.workbook
+                .two_d
+                .selected_peak_idx
+                .filter(|&i| i < self.peaks.len() && self.peaks[i].c.is_none()),
+        ) {
+            painter.rect_filled(bar_r, 4.0, theme.card_bg);
+            painter.rect_stroke(
+                bar_r,
+                4.0,
+                egui::Stroke::new(1.1, theme.zoom_box_stroke),
+                egui::StrokeKind::Inside,
+            );
+            let pk_cur = self.peaks[sel_idx].clone();
+            let mut f2_val = pk_cur.h;
+            let mut f1_val = pk_cur.n;
+            let spd_x = if nuc_x == "1H" { 0.001 } else { 0.01 };
+            let spd_y = if nuc_y == "1H" { 0.001 } else { 0.01 };
+            let lbl_key = peak_label_key_2d(pk_cur.h, pk_cur.n);
+            let mut lbl_buf = self
+                .peak_2d_labels
+                .get(&lbl_key)
+                .cloned()
+                .unwrap_or_default();
+            let mut do_move = false;
+            let mut do_snap = false;
+            let mut do_del = false;
+            let mut do_desel = false;
+
+            let mut bar_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(bar_r.shrink2(egui::vec2(6.0, 3.0)))
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            bar_ui.spacing_mut().item_spacing.x = 5.0;
+            bar_ui.label(
+                egui::RichText::new(format!("Peak #{}", sel_idx + 1))
+                    .size(10.5)
+                    .strong()
+                    .color(theme.card_title),
+            );
+            if bar_ui
+                .add(
+                    egui::DragValue::new(&mut f2_val)
+                        .speed(spd_x)
+                        .fixed_decimals(3)
+                        .prefix(format!("{pretty_x} ")),
+                )
+                .changed()
+            {
+                do_move = true;
+            }
+            if bar_ui
+                .add(
+                    egui::DragValue::new(&mut f1_val)
+                        .speed(spd_y)
+                        .fixed_decimals(3)
+                        .prefix(format!("{pretty_y} ")),
+                )
+                .changed()
+            {
+                do_move = true;
+            }
+            if bar_ui
+                .add(
+                    egui::TextEdit::singleline(&mut lbl_buf)
+                        .desired_width(110.0)
+                        .hint_text("label / residue"),
+                )
+                .changed()
+            {
+                if lbl_buf.trim().is_empty() {
+                    self.peak_2d_labels.remove(&lbl_key);
+                } else {
+                    self.peak_2d_labels.insert(lbl_key, lbl_buf);
+                }
+            }
+            if bar_ui
+                .small_button("Snap")
+                .on_hover_text("Snap peak to local 2D parabolic extremum")
+                .clicked()
+            {
+                do_snap = true;
+            }
+            if bar_ui
+                .small_button("Delete")
+                .on_hover_text("Delete selected peak (Del / Backspace)")
+                .clicked()
+            {
+                do_del = true;
+            }
+            if bar_ui
+                .small_button("×")
+                .on_hover_text("Deselect peak")
+                .clicked()
+            {
+                do_desel = true;
+            }
+
+            if do_del {
+                self.delete_2d_peak(sel_idx);
+            } else if do_move {
+                self.move_2d_peak_live(sel_idx, f2_val, f1_val, true);
+            } else if do_snap {
+                self.snap_2d_peak_by_index(sel_idx);
+            } else if do_desel {
+                self.workbook.two_d.selected_peak_idx = None;
+            }
+        }
+
         if is_compact_mobile {
             rect
         } else {
@@ -7318,7 +8828,7 @@ impl NmrWorkbenchApp {
         let mut trigger_sidechain_solve = false;
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(cur_k > 0, egui::Button::new("◀").small())
+                .add_enabled(cur_k > 0, egui::Button::new("Prev").small())
                 .on_hover_text("Previous residue")
                 .clicked()
             {
@@ -7327,7 +8837,7 @@ impl NmrWorkbenchApp {
             if ui
                 .add_enabled(
                     cur_k + 1 < self.sequence.len(),
-                    egui::Button::new("▶").small(),
+                    egui::Button::new("Next").small(),
                 )
                 .on_hover_text("Next residue")
                 .clicked()
@@ -7335,7 +8845,7 @@ impl NmrWorkbenchApp {
                 self.select_residue_and_sync_strip(cur_k + 1);
             }
             if ui
-                .small_button("▶ Assign Sidechains")
+                .small_button("Assign Sidechains")
                 .on_hover_text(
                     "Run joint aliphatic, aromatic (Pelton His tautomer), and stereospecific assignment",
                 )
@@ -7352,7 +8862,7 @@ impl NmrWorkbenchApp {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .small_button("✕")
+                    .small_button("×")
                     .on_hover_text("Hide 2D covalent sidechain inspector")
                     .clicked()
                 {
@@ -7459,14 +8969,14 @@ impl NmrWorkbenchApp {
                     ui.label(egui::RichText::new(badge.0).small().color(badge.1));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .small_button("✕")
+                            .small_button("×")
                             .on_hover_text("Hide SSP / δ2D propensity drawer")
                             .clicked()
                         {
                             self.show_propensity_panel = false;
                         }
                         if ui
-                            .small_button("↻")
+                            .small_button("Recompute")
                             .on_hover_text("Recompute SSP / δ2D with current T(K) & pH")
                             .clicked()
                         {
@@ -7621,9 +9131,9 @@ impl NmrWorkbenchApp {
             ui.strong("3D Strip Inspector");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .small_button("✕ Hide")
+                    .small_button("× Hide")
                     .on_hover_text(
-                        "Hide Right Strip Inspector dock (reopen via View ▸ 3D Strips Dock)",
+                        "Hide Right Strip Inspector dock (reopen via View -> 3D Strips Dock)",
                     )
                     .clicked()
                 {
@@ -8496,6 +10006,9 @@ impl NmrWorkbenchApp {
 
         self.axis_rescue_notices.clear();
         self.axis_rescue_audits.clear();
+        self.peak_2d_labels.clear();
+        self.water_undo_2d = None;
+        self.bare_bruker_hint = None;
 
         let mut ingested_recipes: BTreeMap<String, ProcessingRecipe> = BTreeMap::new();
         let mut load_errors: Vec<String> = Vec::new();
@@ -8606,7 +10119,7 @@ impl NmrWorkbenchApp {
                 let disp = &item.experiment.display_name;
 
                 match item.experiment.dimensionality {
-                    ExperimentDimensionality::Dim2D => {
+                    ExperimentDimensionality::Dim2D | ExperimentDimensionality::Pseudo3D => {
                         let mut loaded_2d: Option<Spectrum2D> = None;
                         let mut item_err: Option<String> = None;
                         #[cfg(not(target_arch = "wasm32"))]
@@ -8793,10 +10306,14 @@ impl NmrWorkbenchApp {
 
                         if let Some(s2) = loaded_2d {
                             loaded_2d_list.push((disp.clone(), cls, item.solver_exp_name, s2));
-                        } else if let Some(e) = item_err {
-                            load_errors.push(format!("{disp}: {e}"));
-                        } else {
-                            load_errors.push(format!("{disp}: spectrum binary not found"));
+                        } else if item.experiment.dimensionality == ExperimentDimensionality::Dim2D
+                            || plan.selected_experiments.len() == 1
+                        {
+                            if let Some(e) = item_err {
+                                load_errors.push(format!("{disp}: {e}"));
+                            } else {
+                                load_errors.push(format!("{disp}: spectrum binary not found"));
+                            }
                         }
                     }
                     ExperimentDimensionality::Dim3D => {
@@ -9080,6 +10597,7 @@ impl NmrWorkbenchApp {
                     caco_peaks,
                     strip_peaks,
                 });
+                self.sync_con_roots_to_peaks();
             } else if plan.problem_regime == ProblemRegime::Paramagnetic {
                 self.regime_kind = GuiRegimeKind::Paramagnetic;
             } else {
@@ -9108,7 +10626,7 @@ impl NmrWorkbenchApp {
                             pick_hsqc_2d(hsqc, &pcfg)
                         }
                     } else {
-                        Self::pick_generic_2d_crosspeaks(hsqc, self.picker_snr)
+                        self.pick_generic_2d_crosspeaks(hsqc, self.picker_snr)
                     };
                     let c_refs: Vec<&Spectrum3D> = cubes_3d.iter().map(|(_, _, s)| s).collect();
                     if !c_refs.is_empty() && !roots.is_empty() && nx == "1H" && ny == "15N" {
@@ -9898,7 +11416,8 @@ impl NmrWorkbenchApp {
                 IngestAction::ScanNativePath(path_str) => {
                     #[cfg(not(target_arch = "wasm32"))]
                     {
-                        match IngestPanelState::from_native_path(Path::new(&path_str)) {
+                        let cleaned = sanitize_user_path_input(&path_str);
+                        match IngestPanelState::from_native_path(Path::new(&cleaned)) {
                             Ok(panel) => {
                                 self.ingest_panel = panel;
                                 self.ingest_panel.open = true;
@@ -10283,6 +11802,126 @@ impl NmrWorkbenchApp {
         }
     }
 
+    fn suppress_water_active_1d(&mut self) {
+        if self.stack1d_panel.traces.is_empty() {
+            self.status_msg = "No 1D trace loaded for water suppression".to_string();
+            return;
+        }
+        let idx = self
+            .stack1d_panel
+            .ref_trace_idx
+            .min(self.stack1d_panel.traces.len() - 1);
+        let Some(orig_spec) = self.stack1d_panel.traces[idx]
+            .raw_spec
+            .as_ref()
+            .map(|a| a.0.clone())
+        else {
+            self.status_msg =
+                "Active 1D trace is synthetic/table-only; load a 1D NMR spectrum to suppress water"
+                    .to_string();
+            return;
+        };
+        let mut spec = orig_spec.clone();
+        if spec.len() < 8 {
+            return;
+        }
+        let cfg = nmr_core::water::WaterSuppressionConfig::default();
+        let center_ppm = nmr_core::water::suppress_water_spectrum_1d(&mut spec, &cfg);
+        self.stack1d_panel.water_undo_snapshot = Some((idx, orig_spec));
+        self.stack1d_panel.traces[idx].raw_spec = Some(AttachedSpectrum1d(spec.clone()));
+        self.stack1d_panel.traces[idx].sync_from_spectrum1d(&spec);
+        self.stack1d_panel
+            .refresh_active_trace_peaks_and_multiplets();
+        let msg = format!(
+            "Suppressed residual water resonance at {center_ppm:.3} ppm on '{}' (Process -> Undo Water Suppression restores)",
+            self.stack1d_panel.traces[idx].label
+        );
+        self.stack1d_panel.status_message = msg.clone();
+        self.status_msg = msg;
+    }
+
+    fn suppress_water_active_spectrum(&mut self) {
+        if self.is_1d_studio_active() {
+            self.suppress_water_active_1d();
+            return;
+        }
+        let Some(orig_2d) = self.hsqc_spec.clone() else {
+            if !self.stack1d_panel.traces.is_empty() {
+                self.suppress_water_active_1d();
+            } else {
+                self.status_msg = "No active 2D or 1D spectrum loaded".to_string();
+            }
+            return;
+        };
+        let (nx_lbl, ny_lbl) = self.active_2d_nuclei();
+        if nx_lbl != "1H" && ny_lbl != "1H" {
+            self.status_msg = format!(
+                "Active 2D spectrum is {}–{} (no ¹H water axis to suppress)",
+                Self::pretty_nucleus_unicode(nx_lbl),
+                Self::pretty_nucleus_unicode(ny_lbl)
+            );
+            return;
+        }
+        let orig_cb = self.hncacb_3d.clone();
+        let orig_co = self.hnco_3d.clone();
+        let mut s2 = orig_2d.clone();
+        let cfg = nmr_core::water::WaterSuppressionConfig::default();
+        let reported_ppm = nmr_core::water::suppress_water_spectrum_2d(&mut s2, &cfg);
+        if let Some(ref mut cb3) = self.hncacb_3d {
+            let _ = nmr_core::water::suppress_water_spectrum_3d(cb3, &cfg);
+        }
+        if let Some(ref mut co3) = self.hnco_3d {
+            let _ = nmr_core::water::suppress_water_spectrum_3d(co3, &cfg);
+        }
+
+        self.water_undo_2d = Some((orig_2d, orig_cb, orig_co));
+        let (base, nref) = Self::estimate_2d_contour_base(&s2.data);
+        self.contour_noise_ref = nref;
+        self.contour_base = base;
+        self.hsqc_arc = Arc::new(s2.data.clone());
+        self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+        self.workbook.update_active_2d_spectrum(s2.clone());
+        self.hsqc_spec = Some(s2);
+        self.save_live_2d_into_workbook();
+        self.status_msg = format!(
+            "Suppressed residual ¹H water & t₁ ridge at {reported_ppm:.3} ppm on '{}' (Process -> Undo Water Suppression restores)",
+            self.primary_2d_label
+        );
+    }
+
+    fn undo_water_suppression_active(&mut self) {
+        if self.is_1d_studio_active() {
+            if self.stack1d_panel.undo_water_suppression_active_trace() {
+                self.status_msg = self.stack1d_panel.status_message.clone();
+            } else {
+                self.status_msg = "No 1D water suppression snapshot to undo".to_string();
+            }
+            return;
+        }
+        let Some((orig_2d, orig_cb, orig_co)) = self.water_undo_2d.take() else {
+            if self.stack1d_panel.undo_water_suppression_active_trace() {
+                self.status_msg = self.stack1d_panel.status_message.clone();
+            } else {
+                self.status_msg = "No water suppression snapshot to undo".to_string();
+            }
+            return;
+        };
+        let (base, nref) = Self::estimate_2d_contour_base(&orig_2d.data);
+        self.contour_noise_ref = nref;
+        self.contour_base = base;
+        self.hsqc_arc = Arc::new(orig_2d.data.clone());
+        self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+        self.workbook.update_active_2d_spectrum(orig_2d.clone());
+        self.hsqc_spec = Some(orig_2d);
+        self.hncacb_3d = orig_cb;
+        self.hnco_3d = orig_co;
+        self.save_live_2d_into_workbook();
+        self.status_msg = format!(
+            "Restored pre-water-suppression 2D spectrum on '{}'",
+            self.primary_2d_label
+        );
+    }
+
     fn draw_bottom_status_bar(&mut self, ui: &mut egui::Ui, now_ms: u64) {
         ui.horizontal(|ui| {
             self.chord_dispatcher.draw_status_bar_indicator(ui, now_ms);
@@ -10337,6 +11976,12 @@ impl eframe::App for NmrWorkbenchApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now_ms = ctx.input(|i| (i.time.max(0.0) * 1000.0).round() as u64);
+        if self.picker_wakeup_until_ms == u64::MAX - 1 {
+            self.picker_wakeup_until_ms = now_ms.saturating_add(5_500);
+        }
+        if now_ms < self.picker_wakeup_until_ms {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         // 1. Global Cmd/Ctrl+K Command Palette toggle
         let toggle_palette = ctx.input_mut(|i| {
@@ -10833,6 +12478,44 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
 
     fn draw_protein_top_controls_and_ribbon(&mut self, ui: &mut egui::Ui) {
         self.draw_top_bar(ui);
+        if let Some(hint_msg) = self.bare_bruker_hint.clone() {
+            ui.add_space(3.0);
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(68, 36, 10))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgb(245, 158, 11),
+                ))
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(8, 5))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new("Bruker Folder Required:")
+                                .strong()
+                                .color(egui::Color32::from_rgb(254, 240, 138)),
+                        );
+                        ui.label(
+                            egui::RichText::new(&hint_msg)
+                                .small()
+                                .color(egui::Color32::from_rgb(254, 249, 195)),
+                        );
+                        if ui.button("Open Folder").clicked() {
+                            self.bare_bruker_hint = None;
+                            self.arm_browser_picker_wakeup();
+                            #[cfg(target_arch = "wasm32")]
+                            trigger_browser_folder_picker();
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                self.show_native_global_open_bar = true;
+                            }
+                        }
+                        if ui.small_button("Dismiss").clicked() {
+                            self.bare_bruker_hint = None;
+                        }
+                    });
+                });
+        }
         if !self.axis_rescue_notices.is_empty() {
             ui.add_space(3.0);
             egui::Frame::new()
@@ -10896,7 +12579,9 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
             self.render_and_sync_stack1d_panel(ui);
             body_avail
         } else {
-            self.draw_hsqc_canvas(ui)
+            let r = self.draw_hsqc_canvas(ui);
+            self.draw_2d_peaks_bottom_table(ui);
+            r
         };
         if !relax_actions.is_empty() {
             self.apply_relax_panel_actions(relax_actions);
@@ -10920,8 +12605,8 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
             ui.strong("3D Structure");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .small_button("✕ Hide")
-                    .on_hover_text("Close 3D Structure dock (reopen via View ▸ 3D Structure Dock)")
+                    .small_button("× Hide")
+                    .on_hover_text("Close 3D Structure dock (reopen via View -> 3D Structure Dock)")
                     .clicked()
                 {
                     self.show_mol3d_viewport = false;
@@ -12145,6 +13830,12 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             picker_snr: 5.0,
             selected_ss: None,
             selected_res: None,
+            peak_2d_labels: BTreeMap::new(),
+            context_menu_2d_ppm: None,
+            secondary_drag_accum_2d: 0.0,
+            bare_bruker_hint: None,
+            picker_wakeup_until_ms: 0,
+            water_undo_2d: None,
             #[cfg(not(target_arch = "wasm32"))]
             path_input: "data/fixtures/synthetic_ubiquitin.str".to_string(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -12546,6 +14237,12 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             picker_snr: 5.0,
             selected_ss: None,
             selected_res: None,
+            peak_2d_labels: BTreeMap::new(),
+            context_menu_2d_ppm: None,
+            secondary_drag_accum_2d: 0.0,
+            bare_bruker_hint: None,
+            picker_wakeup_until_ms: 0,
+            water_undo_2d: None,
             #[cfg(not(target_arch = "wasm32"))]
             path_input: "data/fixtures/synthetic_ubiquitin.str".to_string(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -12693,5 +14390,455 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             ds.con_roots.iter().any(|r| r.is_proline_imino_region),
             "must detect Proline imino peak at ~137 ppm"
         );
+    }
+
+    fn make_headless_test_app() -> super::NmrWorkbenchApp {
+        use super::*;
+        let mut octet_app = OctetDrawPanel::new();
+        octet_app.set_backend_adapter(Box::new(CoreOctetBackendAdapter));
+        NmrWorkbenchApp {
+            workspace_mode: WorkspaceMode::ProteinNmr,
+            octet_app,
+            dosy_panel: DosyPanelState::default(),
+            metabolomics_panel: MetabolomicsStudioPanel::new(),
+            solver_kind: GuiSolverKind::default(),
+            regime_kind: GuiRegimeKind::default(),
+            metal_ligands_input: String::new(),
+            idp_temp_k: 298.15,
+            idp_ph_input: "6.5".to_string(),
+            c13_picked_dataset: None,
+            propensity_report: None,
+            show_propensity_panel: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            use_gpu: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            gpu_engine: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            bayes_gpu_solver: None,
+            use_neural_picker: false,
+            enable_axis_rescue: true,
+            axis_rescue_notices: Vec::new(),
+            axis_rescue_audits: Vec::new(),
+            adapter_label: None,
+            status_msg: String::new(),
+            last_solve_ms: None,
+            last_bayes_sa_telemetry: None,
+            priors: Priors::provisional(),
+            sidechain_priors: SidechainPriors::empirical_bmrb(),
+            reference: None,
+            sequence: Vec::new(),
+            seq_ids: Vec::new(),
+            peaks: Vec::new(),
+            truth: None,
+            systems: Vec::new(),
+            u_mat: None,
+            p_mat: None,
+            assign_res: None,
+            pred_ref: None,
+            pred_conf: BTreeMap::new(),
+            pred_ambiguity_codes: BTreeMap::new(),
+            metrics: None,
+            sidechain_ribbon_state: SequenceRibbonState::new(),
+            show_sidechain_inspector: false,
+            overwrite_curated_rings: false,
+            mol3d_panel: Mol3dViewerPanel::new(),
+            show_mol3d_viewport: true,
+            loaded_pdb_text: None,
+            relax_panel: RelaxPanelState::new(),
+            show_relax_panel: false,
+            dynamics_panel: DynamicsStudioPanel::new(),
+            show_dynamics_panel: false,
+            stack1d_panel: Stack1dState::default(),
+            show_stack1d_panel: false,
+            show_strips_dock: false,
+            show_workflow_guide: false,
+            show_advanced_protein_bar: false,
+            show_sequence_ribbon: true,
+            paper_white_canvas: true,
+            workbook: WorkbookState::default(),
+            show_native_global_open_bar: false,
+            hsqc_spec: None,
+            hsqc_arc: Arc::new(Vec::new()),
+            hsqc_gen: 1,
+            hncacb_3d: None,
+            hnco_3d: None,
+            extra_3d_count: 0,
+            overlay_layers: Vec::new(),
+            primary_2d_label: "15N-HSQC".to_string(),
+            primary_2d_visible: true,
+            primary_ppm_nudge: [0.0, 0.0],
+            contour_noise_ref: 1.8,
+            box_zoom_2d_mode: false,
+            box_zoom_2d_anchor: None,
+            next_layer_id: 2,
+            active_overlay_idx: 0,
+            ingest_panel: IngestPanelState::default(),
+            command_palette: CommandPalette::new(),
+            chord_dispatcher: ChordDispatcher::new(),
+            session: WorkbenchSessionController::default(),
+            crosshair: SyncCrosshair::default(),
+            strip_tiler: StripTilerPanel::new(),
+            use_match_finder_strips: true,
+            qc_report: None,
+            raw_fids_total: 0,
+            unprocessed_fids_remaining: 0,
+            has_structure_or_dynamics: false,
+            exported_in_session: false,
+            show_contour_modal: false,
+            show_overlay_manager: false,
+            show_assign_popover: false,
+            show_qc_modal: false,
+            show_about_modal: false,
+            mcp_bridge: McpBridgeState::default(),
+            show_mcp_bridge_window: false,
+            mcp_last_viewport_key: (0, 0, 0, -1),
+            assign_target_res: 0,
+            assign_lock_check: true,
+            view_h_left: 10.4,
+            view_h_right: 6.1,
+            view_n_top: 103.0,
+            view_n_bottom: 135.0,
+            contour_base: 8.5,
+            contour_factor: 1.42,
+            contour_levels: 10,
+            show_negative: true,
+            show_peak_labels: true,
+            replicas: 8,
+            steps_per_sys: 400,
+            assign_cost: 0.0,
+            sim_missing: 0.06,
+            sim_spurious: 0.04,
+            sim_seed: 0,
+            picker_snr: 5.0,
+            selected_ss: None,
+            selected_res: None,
+            peak_2d_labels: BTreeMap::new(),
+            context_menu_2d_ppm: None,
+            secondary_drag_accum_2d: 0.0,
+            bare_bruker_hint: None,
+            picker_wakeup_until_ms: 0,
+            water_undo_2d: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            path_input: "data/fixtures/synthetic_ubiquitin.str".to_string(),
+            #[cfg(not(target_arch = "wasm32"))]
+            export_prefix: "result_gui".to_string(),
+            show_text_io_modal: false,
+            paste_text_buf: String::new(),
+            export_text_buf: String::new(),
+            responsive_shell: ResponsiveShellState::new(),
+            wgpu_render_state: None,
+            suppress_hsqc_pan_until_release: false,
+            suppress_octet_pan_until_release: false,
+            #[cfg(target_arch = "wasm32")]
+            pending_drop_outcome: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn test_path_sanitization_bare_2rr_error_and_single_con_auto_open() {
+        use super::*;
+        use nmr_gui::ingest_panel::{ingest_dropped_payloads, DroppedPayload};
+
+        // 1. Path sanitization: quotes + macOS terminal backslash-escaped spaces + Windows paths
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            assert_eq!(
+                sanitize_user_path_input("'/Users/test/My\\ Drive/nmrdata/10003/pdata/1'"),
+                "/Users/test/My Drive/nmrdata/10003/pdata/1"
+            );
+            assert_eq!(
+                sanitize_user_path_input("\"C:\\nmrdata\\10003\\pdata\\1\""),
+                "C:\\nmrdata\\10003\\pdata\\1"
+            );
+        }
+
+        // 2. Bare `2rr` selection returns actionable folder hint instead of silent 0-experiment modal
+        let bare_err = ingest_dropped_payloads(&[DroppedPayload::new("2rr", vec![0u8; 4096])])
+            .expect_err("bare 2rr without procs/proc2s must return actionable error");
+        assert!(
+            is_bare_bruker_file_error(&bare_err),
+            "unexpected bare 2rr message: {bare_err}"
+        );
+        let mut app = make_headless_test_app();
+        app.record_ingest_error("Open error", bare_err);
+        assert!(
+            app.bare_bruker_hint.is_some(),
+            "bare Bruker file error must arm prominent Open Folder banner"
+        );
+
+        // 3. High-NC_proc (`2.5e9`) + >60% zero-padded 2D array produces finite, non-blackout contour_base & noise_ref
+        let mut high_nc = vec![0.0_f32; 128 * 128];
+        for (i, cell) in high_nc.iter_mut().enumerate().take(4_500) {
+            let sign = if i % 2 == 0 { 1.0_f32 } else { -1.0_f32 };
+            *cell = sign * (1.2e7_f32 + ((i * 37) % 1000) as f32 * 8.0e4_f32);
+        }
+        high_nc[6_200] = 2.5e9_f32;
+        let (base_nc, nref_nc) = estimate_contour_base_and_noise(&high_nc);
+        assert!(base_nc.is_finite() && base_nc > 1.0e7 && base_nc < 5.0e8);
+        assert!(nref_nc.is_finite() && nref_nc >= base_nc / 6.1);
+
+        // 4. Single Bruker `2D CON` folder auto-opens directly onto the 2D canvas without blocking modal
+        let nx = 48usize;
+        let ny = 48usize;
+        let procs = format!(
+            "##TITLE= c_hcacon_ia\n##$SI= {nx}\n##$OFFSET= 182.0\n##$SW_p= 2414.4\n##$SF= 201.26\n##$XDIM= 48\n##$BYTORDP= 0\n##$NC_proc= 3\n##END=\n"
+        );
+        let proc2s = format!(
+            "##TITLE= c_hcacon_ia\n##$SI= {ny}\n##$OFFSET= 142.0\n##$SW_p= 3244.0\n##$SF= 81.10\n##$XDIM= 48\n##$BYTORDP= 0\n##$NC_proc= 3\n##END=\n"
+        );
+        let mut rr = Vec::with_capacity(nx * ny * 4);
+        for iy in 0..ny {
+            for ix in 0..nx {
+                let mut v = (((ix * 19 + iy * 11) % 17) as i32 - 8) * 1_500;
+                let dx = ix as f64 - 22.0;
+                let dy = iy as f64 - 24.0;
+                if dx.abs() <= 3.0 && dy.abs() <= 3.0 {
+                    v += (650_000.0 * (-0.45 * (dx * dx + dy * dy)).exp()) as i32;
+                }
+                rr.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let out_single = ingest_dropped_payloads(&[
+            DroppedPayload::new("10003/pdata/1/procs", procs.into_bytes()),
+            DroppedPayload::new("10003/pdata/1/proc2s", proc2s.into_bytes()),
+            DroppedPayload::new("10003/pdata/1/2rr", rr),
+        ])
+        .expect("single pdata/1 CON ingest");
+        app.apply_drop_outcome(out_single);
+        assert!(
+            !app.ingest_panel.open,
+            "single 2D CON drop without sequence must open directly onto 2D canvas"
+        );
+        assert!(app.hsqc_spec.is_some());
+        assert!(app.contour_noise_ref > 100.0);
+        assert!(
+            app.peaks.iter().any(|p| p.c.is_none()),
+            "CON roots must be synced into editable 2D peaks"
+        );
+    }
+
+    #[test]
+    fn test_ridge_safe_homonuclear_2d_picker_and_interactive_2d_curation_plus_water_undo() {
+        use super::*;
+        use eframe::egui;
+
+        let nx = 128usize;
+        let ny = 128usize;
+        let axis_x = nmr_core::spectrum::AxisPpm {
+            label: "1H".to_string(),
+            first_ppm: 10.7,
+            step_ppm: -12.0 / (nx - 1) as f64,
+            obs_mhz: 500.13,
+            size: nx,
+        };
+        let axis_y = axis_x.clone();
+        let mut data = vec![0.0_f32; nx * ny];
+        let mut rng_state = 0x9E37_79B9_7F4A_7C15_u64;
+        for cell in &mut data {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u = ((rng_state >> 32) as f32 / (u32::MAX as f32)) - 0.5;
+            *cell = u * 20.0;
+        }
+        // Inject massive H2O t1 + t2 ridge at 4.70 ppm + diagonal ridge
+        let w_idx = axis_x.ppm_to_index(4.70).round() as isize;
+        for iy in 0..ny {
+            let py = axis_y.index_to_ppm(iy as f64);
+            for ix in 0..nx {
+                let px = axis_x.index_to_ppm(ix as f64);
+                let dwx = (ix as isize - w_idx) as f32;
+                let dwy = (iy as isize - w_idx) as f32;
+                if dwx.abs() <= 2.0 {
+                    data[iy * nx + ix] += 55_000.0 * (-0.7 * dwx * dwx).exp();
+                }
+                if dwy.abs() <= 2.0 {
+                    data[iy * nx + ix] += 42_000.0 * (-0.7 * dwy * dwy).exp();
+                }
+                let d_diag = ((px - py) / 0.03) as f32;
+                if d_diag.abs() <= 2.5 {
+                    data[iy * nx + ix] += 80_000.0 * (-0.8 * d_diag * d_diag).exp();
+                }
+            }
+        }
+        // Inject 4 genuine off-diagonal cross-peaks
+        let true_crosspeaks = [
+            (8.20_f64, 4.15_f64, 8_500.0_f32),
+            (4.15_f64, 8.20_f64, 8_200.0_f32),
+            (7.35_f64, 2.85_f64, 6_400.0_f32),
+            (2.85_f64, 7.35_f64, 6_100.0_f32),
+        ];
+        for &(cx_ppm, cy_ppm, amp) in &true_crosspeaks {
+            let cxi = axis_x.ppm_to_index(cx_ppm);
+            let cyi = axis_y.ppm_to_index(cy_ppm);
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    let dx = (ix as f64 - cxi) as f32;
+                    let dy = (iy as f64 - cyi) as f32;
+                    if dx.abs() <= 4.0 && dy.abs() <= 4.0 {
+                        data[iy * nx + ix] += amp * (-0.55 * (dx * dx + dy * dy)).exp();
+                    }
+                }
+            }
+        }
+        let noesy = Spectrum2D {
+            name: "NOESY_70".to_string(),
+            axis_x,
+            axis_y,
+            data,
+        };
+
+        let (c_base, _) = estimate_contour_base_and_noise(&noesy.data);
+        let picked =
+            pick_2d_crosspeaks_ridge_safe(&noesy, 5.0, c_base.min(800.0), true, false, false);
+        assert_eq!(
+            picked.len(),
+            4,
+            "ridge-safe NOESY picker must recover all 4 cross-peaks with zero water-stripe or diagonal artifacts, got {:?}",
+            picked
+                .iter()
+                .map(|p| (p.h, p.n, p.height))
+                .collect::<Vec<_>>()
+        );
+        assert!(picked[0].height.unwrap_or(0.0) >= picked[1].height.unwrap_or(0.0));
+        for &(tx, ty, _) in &true_crosspeaks {
+            assert!(
+                picked
+                    .iter()
+                    .any(|p| (p.h - tx).abs() < 0.08 && (p.n - ty).abs() < 0.08),
+                "missing cross-peak ({tx}, {ty})"
+            );
+        }
+
+        // Interactive 2D peak add, move, label, snap, TSV export, delete & water suppression + undo
+        let mut app = make_headless_test_app();
+        app.install_single_2d_spectrum(
+            noesy,
+            "NOESY_70.ucsf".to_string(),
+            "Loaded NOESY".to_string(),
+        );
+        app.contour_base = 500.0;
+        app.pick_2d_roots();
+        assert_eq!(app.peaks.len(), 4);
+
+        let man_idx = app.add_manual_2d_peak(6.50, 1.95, None);
+        assert_eq!(app.peaks.len(), 5);
+        app.peak_2d_labels.insert(
+            peak_label_key_2d(app.peaks[man_idx].h, app.peaks[man_idx].n),
+            "Val12-HG".to_string(),
+        );
+        app.move_2d_peak_live(man_idx, 8.18, 4.17, true);
+        app.snap_2d_peak_by_index(man_idx);
+        assert!((app.peaks[man_idx].h - 8.20).abs() < 0.08);
+        assert!((app.peaks[man_idx].n - 4.15).abs() < 0.08);
+        assert!(app.export_2d_peaks_tsv().contains("Val12-HG"));
+        app.delete_2d_peak(man_idx);
+        assert_eq!(app.peaks.len(), 4);
+
+        // Suppress water ridge on 2D NOESY -> verify >85% attenuation along 4.70 ppm & exact undo
+        let w_col = app
+            .hsqc_spec
+            .as_ref()
+            .map(|s| s.axis_x.ppm_to_index(4.70).round() as usize)
+            .unwrap_or(0);
+        let pre_water_amp = app
+            .hsqc_spec
+            .as_ref()
+            .map(|s| s.get(w_col, 10).abs())
+            .unwrap_or(0.0);
+        assert!(pre_water_amp > 20_000.0);
+        app.suppress_water_active_spectrum();
+        assert!(app.water_undo_2d.is_some());
+        let post_water_amp = app
+            .hsqc_spec
+            .as_ref()
+            .map(|s| s.get(w_col, 10).abs())
+            .unwrap_or(pre_water_amp);
+        assert!(
+            post_water_amp < pre_water_amp * 0.15,
+            "expected >85% water ridge suppression, got {pre_water_amp} -> {post_water_amp}"
+        );
+        app.undo_water_suppression_active();
+        assert!(app.water_undo_2d.is_none());
+        let restored_amp = app
+            .hsqc_spec
+            .as_ref()
+            .map(|s| s.get(w_col, 10).abs())
+            .unwrap_or(0.0);
+        assert!((restored_amp - pre_water_amp).abs() < 1e-3);
+
+        // Headless egui render pass over 2D canvas + bottom 2D peak table
+        app.workbook.two_d.selected_peak_idx = Some(0);
+        let egui_ctx = egui::Context::default();
+        let _ = egui_ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = app.draw_hsqc_canvas(ui);
+            app.draw_2d_peaks_bottom_table(ui);
+        });
+    }
+
+    #[test]
+    fn test_env_driven_readonly_dataset_verification() {
+        use super::*;
+        let Ok(spec_list) = std::env::var("FERRIC_READONLY_VERIFY_PATHS") else {
+            return;
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        for raw_p in spec_list
+            .split('|')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let p = Path::new(raw_p);
+            assert!(p.exists(), "verification path missing: {}", p.display());
+            let mut app = make_headless_test_app();
+            let outcome = load_native_path_1d_or_workspace(p)
+                .unwrap_or_else(|e| panic!("failed to classify {}: {e}", p.display()));
+            app.apply_drop_outcome(outcome);
+            if app.is_1d_studio_active() {
+                assert!(!app.stack1d_panel.traces.is_empty());
+                app.suppress_water_active_spectrum();
+                assert!(app.stack1d_panel.water_undo_snapshot.is_some());
+                app.undo_water_suppression_active();
+                println!(
+                    "[VERIFY-1D] {} -> traces={} peaks={}",
+                    p.display(),
+                    app.stack1d_panel.traces.len(),
+                    app.stack1d_panel.picked_peaks.len()
+                );
+            } else {
+                assert!(
+                    !app.ingest_panel.open && app.hsqc_spec.is_some(),
+                    "single 2D dataset {} must auto-open directly onto canvas (status: {})",
+                    p.display(),
+                    app.status_msg
+                );
+                app.pick_2d_roots();
+                let (nx, ny) = app.active_2d_nuclei();
+                let total_2d = app.peaks.iter().filter(|pk| pk.c.is_none()).count();
+                let water_band_hits = app
+                    .peaks
+                    .iter()
+                    .filter(|pk| {
+                        pk.c.is_none()
+                            && ((4.67..=4.73).contains(&pk.h) || (4.67..=4.73).contains(&pk.n))
+                    })
+                    .count();
+                let water_note = if nx == "1H" || ny == "1H" {
+                    app.suppress_water_active_spectrum();
+                    assert!(app.water_undo_2d.is_some());
+                    let m = app.status_msg.clone();
+                    app.undo_water_suppression_active();
+                    assert!(app.water_undo_2d.is_none());
+                    m
+                } else {
+                    "n/a".to_string()
+                };
+                println!(
+                    "[VERIFY-2D] {} -> nuclei=({nx},{ny}) base={:.3e} nref={:.3e} peaks={total_2d} water_band_hits={water_band_hits} status='{}' water='{water_note}'",
+                    p.display(),
+                    app.contour_base,
+                    app.contour_noise_ref,
+                    app.status_msg
+                );
+            }
+        }
     }
 }

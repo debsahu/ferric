@@ -78,6 +78,8 @@ pub enum WorkbookIcon {
     LockClosed,
     PlayRun,
     DownloadSave,
+    WaterSuppress,
+    TableGrid,
     ChevronRight,
     ChevronDown,
 }
@@ -443,6 +445,30 @@ pub fn paint_icon(
                 stroke,
             ));
             painter.line_segment([pt(0.20, 0.84), pt(0.80, 0.84)], stroke);
+        }
+        WorkbookIcon::WaterSuppress => {
+            // Crisp droplet contour + horizontal solvent-suppression notch bar
+            let mut drop_pts = Vec::with_capacity(15);
+            drop_pts.push(pt(0.50, 0.12));
+            drop_pts.push(pt(0.76, 0.52));
+            for k in 0..=8 {
+                let a = (k as f32 / 8.0) * std::f32::consts::PI;
+                drop_pts.push(egui::pos2(
+                    c.x + a.cos() * (s * 0.26),
+                    pt(0.50, 0.58).y + a.sin() * (s * 0.26),
+                ));
+            }
+            drop_pts.push(pt(0.24, 0.52));
+            drop_pts.push(pt(0.50, 0.12));
+            painter.add(egui::Shape::line(drop_pts, stroke));
+            painter.line_segment([pt(0.14, 0.54), pt(0.86, 0.54)], stroke);
+        }
+        WorkbookIcon::TableGrid => {
+            let box_r = r.shrink(s * 0.12);
+            painter.rect_stroke(box_r, 1.8, stroke, egui::StrokeKind::Inside);
+            painter.line_segment([pt(0.12, 0.38), pt(0.88, 0.38)], stroke);
+            painter.line_segment([pt(0.12, 0.63), pt(0.88, 0.63)], stroke);
+            painter.line_segment([pt(0.42, 0.38), pt(0.42, 0.88)], stroke);
         }
         WorkbookIcon::ChevronRight => {
             painter.add(egui::Shape::line(
@@ -1052,19 +1078,43 @@ pub fn describe_1d_trace_card(trace: &Trace1d, idx: usize) -> (String, String) {
     (title, subtitle)
 }
 
-fn estimate_contour_base_and_noise(data: &[f32]) -> (f32, f32) {
-    let mad = estimate_noise_mad(data);
-    let max_abs = data.iter().fold(0.0_f32, |m, &v| m.max(v.abs()));
+/// Estimate `(contour_base, noise_ref)` robustly even when >50% of 2D spectral bins are zero-padded/masked
+/// or when spectrometer `NC_proc` scaling produces `10^8`–`10^9` integer-scaled intensities.
+pub fn estimate_contour_base_and_noise(data: &[f32]) -> (f32, f32) {
+    let max_abs = data
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(0.0_f32, |m, v| m.max(v.abs()));
+    let mut mad = estimate_noise_mad(data);
+    // Rescue >50% exact-zero-padded / NUS-masked arrays while preserving extreme-dynamic-range
+    // homonuclear 2D spectra (e.g. NOESY/TOCSY where diagonal/water max_abs can be ~6e5 * sigma0).
+    if (!mad.is_finite() || mad <= max_abs * 1.0e-9) && max_abs > 1e-12 {
+        let stride = ((data.len() / 65_536).max(1)) | 1;
+        let nz: Vec<f32> = data
+            .iter()
+            .step_by(stride)
+            .copied()
+            .filter(|&v| v.is_finite() && v.abs() > max_abs * 1e-11)
+            .collect();
+        if nz.len() >= 16 {
+            let nz_mad = estimate_noise_mad(&nz);
+            if nz_mad.is_finite() && nz_mad > mad {
+                mad = nz_mad;
+            }
+        }
+    }
     if mad.is_finite() && mad > 1e-12 {
-        let base = if max_abs > mad * 5.0 {
-            (mad * 4.8).clamp((max_abs * 0.001).max(1e-6), (max_abs * 0.45).max(1e-5))
+        let nref = mad.max(max_abs * 1.0e-7).max(1e-6);
+        let base = if max_abs > nref * 5.5 {
+            (nref * 5.5).min((max_abs * 0.45).max(1e-5)).max(1e-6)
         } else {
-            (mad * 4.8).max(1e-6)
+            (nref * 4.8).max(1e-6)
         };
-        (base, mad.max(1e-6))
+        (base, nref)
     } else if max_abs.is_finite() && max_abs > 1e-12 {
-        let base = (max_abs * 0.05).max(1e-6);
-        (base, (base / 4.8).max(1e-6))
+        let base = (max_abs * 0.02).max(1e-6);
+        (base, (base / 5.5).max(1e-6))
     } else {
         (1.0, 1.0)
     }
@@ -1321,6 +1371,11 @@ pub struct TwoDCanvasState {
     pub tool_mode: ToolMode2d,
     pub show_projections: bool,
     pub show_params_card: bool,
+    pub show_peak_table: bool,
+    pub pick_diagonal: bool,
+    pub selected_peak_idx: Option<usize>,
+    pub dragging_peak_idx: Option<usize>,
+    pub pick_box_start_pos: Option<egui::Pos2>,
     pub marginal_mode: MarginalSourceMode,
     pub f2_gain: f32,
     pub f1_gain: f32,
@@ -1338,6 +1393,11 @@ impl Default for TwoDCanvasState {
             tool_mode: ToolMode2d::ZoomBox,
             show_projections: true,
             show_params_card: true,
+            show_peak_table: false,
+            pick_diagonal: false,
+            selected_peak_idx: None,
+            dragging_peak_idx: None,
+            pick_box_start_pos: None,
             marginal_mode: MarginalSourceMode::AutoExternalOrSkyline,
             f2_gain: 1.0,
             f1_gain: 1.0,
@@ -1445,6 +1505,22 @@ impl WorkbookState {
         p.overlay_enabled = overlay_enabled;
         self.pages_2d.push(p);
         self.pages_2d.len() - 1
+    }
+
+    /// Replace `spec` + `data_arc` + `mini_dots` on the currently active 2D page (e.g. after Water Suppression or Undo).
+    pub fn update_active_2d_spectrum(&mut self, spec: Spectrum2D) {
+        if let Some(pg) = self.pages_2d.get_mut(self.active_2d_idx) {
+            let (base_est, noise_est) = estimate_contour_base_and_noise(&spec.data);
+            pg.mini_dots = build_mini_2d_preview_dots(&spec, 42);
+            pg.data_arc = Arc::new(spec.data.clone());
+            pg.spec = spec;
+            pg.spec_gen = pg.spec_gen.wrapping_add(1);
+            pg.noise_ref = noise_est;
+            if pg.base_level <= 0.0 || !pg.base_level.is_finite() {
+                pg.base_level = base_est;
+            }
+            self.two_d.skyline_cache_key = None;
+        }
     }
 
     /// Build `OverlayLayerSpec` entries for all non-active compatible `pages_2d` that have `overlay_enabled == true`.
