@@ -74,25 +74,25 @@ impl ToolMode1d {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Zoom => "Zoom (Z)",
-            Self::Pan => "Pan (H)",
-            Self::Phase => "Phase (P)",
-            Self::Reference => "Reference (R)",
-            Self::IntegrateRoi => "Integrate (I)",
-            Self::Multiplet => "Multiplet (M)",
-            Self::PeakPick => "Peaks (K)",
+            Self::Zoom => "Zoom Box (zm)",
+            Self::Pan => "Pan (mv)",
+            Self::Phase => "Phase (ph)",
+            Self::Reference => "Reference (rf)",
+            Self::IntegrateRoi => "Integrate (pi)",
+            Self::Multiplet => "Multiplet (mp)",
+            Self::PeakPick => "Peaks (kr)",
         }
     }
 
     pub const fn short_code(self) -> &'static str {
         match self {
-            Self::Zoom => "Z",
-            Self::Pan => "H",
-            Self::Phase => "P",
-            Self::Reference => "R",
-            Self::IntegrateRoi => "I",
-            Self::Multiplet => "M",
-            Self::PeakPick => "K",
+            Self::Zoom => "zm",
+            Self::Pan => "mv",
+            Self::Phase => "ph",
+            Self::Reference => "rf",
+            Self::IntegrateRoi => "pi",
+            Self::Multiplet => "mp",
+            Self::PeakPick => "kr",
         }
     }
 
@@ -6193,34 +6193,15 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState, pape
         g_hi - frac * g_span
     };
 
-    // Keyboard shortcuts when no TextEdit has focus
+    // Keyboard shortcuts when no TextEdit has focus (two-letter chords are dispatched globally by ChordDispatcher)
     let wants_kb = ui.ctx().egui_wants_keyboard_input();
     if !wants_kb {
-        let (esc, del_key, back_key, z_key, full_key, space_pressed, tool_key) = ui.input(|i| {
-            let plain = !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.alt;
-            let tk = if plain && i.key_pressed(egui::Key::K) {
-                Some(ToolMode1d::PeakPick)
-            } else if plain && i.key_pressed(egui::Key::H) {
-                Some(ToolMode1d::Pan)
-            } else if plain && i.key_pressed(egui::Key::I) {
-                Some(ToolMode1d::IntegrateRoi)
-            } else if plain && i.key_pressed(egui::Key::M) {
-                Some(ToolMode1d::Multiplet)
-            } else if plain && i.key_pressed(egui::Key::R) {
-                Some(ToolMode1d::Reference)
-            } else if plain && i.key_pressed(egui::Key::P) {
-                Some(ToolMode1d::Phase)
-            } else {
-                None
-            };
+        let (esc, del_key, back_key, space_pressed) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Delete),
                 i.key_pressed(egui::Key::Backspace),
-                plain && i.key_pressed(egui::Key::Z),
-                plain && i.key_pressed(egui::Key::F),
                 i.key_pressed(egui::Key::Space),
-                tk,
             )
         });
         if esc {
@@ -6238,30 +6219,13 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState, pape
             if let Some(sel) = state.selected_peak_idx {
                 let _ = state.delete_picked_peak(sel);
             }
-        } else if let Some(next_tm) = tool_key {
-            if resp.hovered() {
-                state.select_tool_mode(next_tm);
-            }
-        } else if resp.hovered() {
-            if space_pressed && state.tool_mode == ToolMode1d::Phase {
-                if let Some(c_ppm) = state.cursor_ppm {
-                    state.phase_pivot_ppm = state.nearest_peak_or_apex_ppm(c_ppm, 0.08);
-                    state.phase_pivot_mode = PivotMode1d::AtPpm;
-                    state.apply_live_phase_to_active_trace();
-                    state.status_message =
-                        format!("Set phase pivot to {:.4} ppm.", state.phase_pivot_ppm);
-                }
-            } else if back_key || z_key {
-                if state.tool_mode != ToolMode1d::Zoom {
-                    state.select_tool_mode(ToolMode1d::Zoom);
-                } else if state.undo_zoom() {
-                    lo = state.view_ppm_min.min(state.view_ppm_max);
-                    hi = state.view_ppm_min.max(state.view_ppm_max);
-                }
-            } else if full_key {
-                state.fit_full_ppm_bounds();
-                lo = state.view_ppm_min.min(state.view_ppm_max);
-                hi = state.view_ppm_min.max(state.view_ppm_max);
+        } else if resp.hovered() && space_pressed && state.tool_mode == ToolMode1d::Phase {
+            if let Some(c_ppm) = state.cursor_ppm {
+                state.phase_pivot_ppm = state.nearest_peak_or_apex_ppm(c_ppm, 0.08);
+                state.phase_pivot_mode = PivotMode1d::AtPpm;
+                state.apply_live_phase_to_active_trace();
+                state.status_message =
+                    format!("Set phase pivot to {:.4} ppm.", state.phase_pivot_ppm);
             }
         }
     }

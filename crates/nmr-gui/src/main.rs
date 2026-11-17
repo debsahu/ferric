@@ -6287,6 +6287,9 @@ impl NmrWorkbenchApp {
                 }
             }
 
+            let now_ms = ctx.input(|i| (i.time.max(0.0) * 1000.0).round() as u64);
+            self.chord_dispatcher.draw_status_bar_indicator(ui, now_ms);
+
             // --- Right Side Segmented Instrument Controls ---
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 5.0;
@@ -6888,40 +6891,15 @@ impl NmrWorkbenchApp {
             self.sync_con_roots_to_peaks();
         }
 
-        // Single-key 2D tool shortcuts (`Z` ZoomBox, `H` Pan, `X` Slice, `K` Pick, `F` Full 2D, `Del`/`Backspace` delete selected peak)
+        // `Del`/`Backspace` delete selected peak and `Escape` cancels drag boxes (two-letter chords are handled globally by ChordDispatcher)
         let mut key_delete_peak: Option<usize> = None;
         if !is_compact_mobile && !ui.ctx().egui_wants_keyboard_input() {
             ui.input(|i| {
                 let plain = !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.alt;
-                if plain {
-                    if i.key_pressed(egui::Key::Z) {
-                        self.workbook.two_d.tool_mode = ToolMode2d::ZoomBox;
-                    } else if i.key_pressed(egui::Key::H) {
-                        self.workbook.two_d.tool_mode = ToolMode2d::Pan;
-                        self.box_zoom_2d_anchor = None;
-                        self.workbook.two_d.drag_box_start_pos = None;
-                        self.workbook.two_d.pick_box_start_pos = None;
-                    } else if i.key_pressed(egui::Key::X) {
-                        self.workbook.two_d.tool_mode = ToolMode2d::CrosshairSlice;
-                        self.box_zoom_2d_anchor = None;
-                        self.workbook.two_d.drag_box_start_pos = None;
-                        self.workbook.two_d.pick_box_start_pos = None;
-                    } else if i.key_pressed(egui::Key::K) {
-                        self.workbook.two_d.tool_mode = ToolMode2d::PickPeaks;
-                    } else if i.key_pressed(egui::Key::F) {
-                        let cur = [
-                            self.view_h_left,
-                            self.view_h_right,
-                            self.view_n_top,
-                            self.view_n_bottom,
-                        ];
-                        self.workbook.two_d.push_zoom(cur);
-                        self.reset_view_to_spec();
-                    } else if i.key_pressed(egui::Key::Delete)
-                        || i.key_pressed(egui::Key::Backspace)
-                    {
-                        key_delete_peak = self.workbook.two_d.selected_peak_idx;
-                    }
+                if plain
+                    && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
+                {
+                    key_delete_peak = self.workbook.two_d.selected_peak_idx;
                 }
                 if i.key_pressed(egui::Key::Escape) {
                     self.box_zoom_2d_anchor = None;
@@ -7091,7 +7069,7 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::ZoomBox,
                 tm == ToolMode2d::ZoomBox,
-                "Zoom Box [Z]: Drag or 2-click to zoom into a 2D cross-peak region (Right-drag pans)",
+                "Zoom Box (zm) · Prev Zoom (zp) · Full (zf): Drag or 2-click to zoom (Right-drag pans)",
             )
             .clicked()
             {
@@ -7101,7 +7079,7 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::PanMove,
                 tm == ToolMode2d::Pan,
-                "Pan 2D [H]: Drag anywhere to translate (F2, F1) chemical-shift window",
+                "Pan 2D (mv): Drag anywhere to translate (F2, F1) chemical-shift window",
             )
             .clicked()
             {
@@ -7113,7 +7091,7 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::CrosshairSlice,
                 tm == ToolMode2d::CrosshairSlice,
-                "Crosshair & Live 1D Slice [X]: Inspect orthogonal F2 row & F1 column traces at cursor",
+                "Crosshair & Live 1D Slice (xh): Inspect orthogonal F2 row & F1 column traces at cursor",
             )
             .clicked()
             {
@@ -7124,7 +7102,7 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::PeakPick,
                 tm == ToolMode2d::PickPeaks,
-                "Pick 2D Peaks [K]: Enter Peak-Pick mode (Left-Click adds peak, Left-Drag box-picks, Drag peak moves; click again to Auto-Pick all)",
+                "Pick 2D Peaks (kr): Click to add, drag box to pick; click again to Auto-Pick all",
             )
             .clicked()
             {
@@ -7141,7 +7119,7 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::FullSweep,
                 false,
-                "Full 2D Sweep [F]: Reset (F2, F1) viewport to full spectral bounds",
+                "Full 2D Sweep (zf / ze / oz): Reset (F2, F1) viewport to full spectral bounds",
             )
             .clicked()
             {
@@ -7158,7 +7136,7 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::UndoBack,
                 !self.workbook.two_d.zoom_history.is_empty(),
-                "Undo 2D Zoom: Restore previous (F2, F1) zoom window",
+                "Zoom Previous (zp): Restore previous (F2, F1) zoom window",
             )
             .clicked()
             {
@@ -7173,7 +7151,7 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::Plus,
                 false,
-                "Lower Contour Floor (÷1.18): Reveal weaker cross-peaks (or scroll wheel up)",
+                "Lower Contour Floor (cb / -): Reveal weaker cross-peaks (or scroll wheel up)",
             )
             .clicked()
             {
@@ -7183,7 +7161,7 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::Minus,
                 false,
-                "Raise Contour Floor (×1.18): Suppress baseline noise (or scroll wheel down)",
+                "Raise Contour Floor (ci / +): Suppress baseline noise (or scroll wheel down)",
             )
             .clicked()
             {
@@ -7196,7 +7174,7 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::Projections2D,
                 self.workbook.two_d.show_projections,
-                "Toggle aligned Top F2 & Left F1 1D marginal projections",
+                "Toggle aligned Top F2 & Left F1 1D marginal projections (v1 / v2)",
             )
             .clicked()
             {
@@ -7216,7 +7194,7 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::SlidersTune,
                 self.show_contour_modal,
-                "Contour Threshold, Step Factor, Levels & Negative Contours",
+                "Contour Levels & Threshold Dialog (ct / vt)",
             )
             .clicked()
             {
@@ -7226,7 +7204,7 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::TableGrid,
                 self.workbook.two_d.show_peak_table,
-                "Toggle Bottom 2D Cross-Peak Curation Table (Add, Edit ppm/Label, Snap, Delete, Copy TSV)",
+                "Toggle Bottom 2D Peak List Table (lt)",
             )
             .clicked()
             {
@@ -7236,7 +7214,7 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::WaterSuppress,
                 self.water_undo_2d.is_some(),
-                "Suppress Residual Water Ridge (~4.7 ppm ¹H band; Process -> Undo Water Suppression restores)",
+                "Suppress Water Peak (ws) / Undo Water Suppression (wu)",
             )
             .clicked()
             {
@@ -10982,11 +10960,67 @@ impl NmrWorkbenchApp {
                     self.status_msg = "Exported ProcessingRecipe JSON".to_string();
                 }
             }
-            WorkbenchAction::AutoPhaseDirect1D
-            | WorkbenchAction::AutoPhaseIndirectBiphasic
-            | WorkbenchAction::ToggleLinearPrediction
-            | WorkbenchAction::ApplyMedianBaseline => {
+            WorkbenchAction::AutoPhaseDirect1D => {
+                if self.is_1d_studio_active() && !self.stack1d_panel.traces.is_empty() {
+                    self.stack1d_panel.auto_phase_active_trace();
+                    self.status_msg = self.stack1d_panel.status_message.clone();
+                } else {
+                    self.status_msg = "Configured DSP action: Auto-Phase Direct 1D".to_string();
+                }
+            }
+            WorkbenchAction::ApplyMedianBaseline => {
+                if self.is_1d_studio_active() && !self.stack1d_panel.traces.is_empty() {
+                    self.stack1d_panel.baseline_correct_active_trace();
+                    self.status_msg = self.stack1d_panel.status_message.clone();
+                } else {
+                    self.status_msg = "Configured DSP action: Baseline Correction".to_string();
+                }
+            }
+            WorkbenchAction::AutoPhaseIndirectBiphasic
+            | WorkbenchAction::ToggleLinearPrediction => {
                 self.status_msg = format!("Configured DSP action: {}", action.metadata().title);
+            }
+            WorkbenchAction::SelectPhase1dMode => {
+                if !self.stack1d_panel.traces.is_empty() {
+                    self.activate_1d_studio_mode();
+                    self.stack1d_panel.select_tool_mode(ToolMode1d::Phase);
+                    self.stack1d_panel.show_1d_analysis_drawer = true;
+                    self.stack1d_panel.selected_inspector_tab = InspectorTab1d::PhaseBaseline;
+                    self.status_msg = "1D Live Phase Mode (`ph`)".to_string();
+                }
+            }
+            WorkbenchAction::SelectIntegrate1dMode => {
+                if !self.stack1d_panel.traces.is_empty() {
+                    self.activate_1d_studio_mode();
+                    self.stack1d_panel
+                        .select_tool_mode(ToolMode1d::IntegrateRoi);
+                    self.stack1d_panel.show_integral_curves = true;
+                    self.status_msg = "1D Peak Integration Mode (`pi` / `it`)".to_string();
+                }
+            }
+            WorkbenchAction::SelectMultiplet1dMode => {
+                if !self.stack1d_panel.traces.is_empty() {
+                    self.activate_1d_studio_mode();
+                    self.stack1d_panel.select_tool_mode(ToolMode1d::Multiplet);
+                    self.stack1d_panel.show_multiplet_boxes = true;
+                    self.stack1d_panel.show_j_trees = true;
+                    self.status_msg = "1D Multiplet Analysis Mode (`mp`)".to_string();
+                }
+            }
+            WorkbenchAction::SelectReferenceOrAlignMode => {
+                if self.is_1d_studio_active() {
+                    self.stack1d_panel.select_tool_mode(ToolMode1d::Reference);
+                    self.status_msg = "1D Chemical Shift Referencing Mode (`rf`)".to_string();
+                } else {
+                    self.show_overlay_manager = true;
+                    self.status_msg = "2D Reference / Overlay Alignment (`rf`)".to_string();
+                }
+            }
+            WorkbenchAction::SuppressWaterPeak => {
+                self.suppress_water_active_spectrum();
+            }
+            WorkbenchAction::UndoWaterSuppression => {
+                self.undo_water_suppression_active();
             }
 
             // --- 3. Spectrum View & Contours ---
@@ -10994,40 +11028,175 @@ impl NmrWorkbenchApp {
                 self.show_contour_modal = !self.show_contour_modal;
             }
             WorkbenchAction::ZoomFullSweep => {
-                self.reset_view_to_spec();
+                if self.is_1d_studio_active() {
+                    self.stack1d_panel.fit_full_ppm_bounds();
+                    self.status_msg = "1D Full Sweep (`zf`)".to_string();
+                } else {
+                    let cur = [
+                        self.view_h_left,
+                        self.view_h_right,
+                        self.view_n_top,
+                        self.view_n_bottom,
+                    ];
+                    self.workbook.two_d.push_zoom(cur);
+                    self.reset_view_to_spec();
+                }
+            }
+            WorkbenchAction::ZoomPrevious => {
+                if self.is_1d_studio_active() {
+                    if self.stack1d_panel.undo_zoom() {
+                        self.status_msg = "1D Zoom Previous (`zp`)".to_string();
+                    }
+                } else if let Some(prev) = self.workbook.two_d.pop_zoom() {
+                    self.view_h_left = prev[0];
+                    self.view_h_right = prev[1];
+                    self.view_n_top = prev[2];
+                    self.view_n_bottom = prev[3];
+                    self.status_msg = "2D Zoom Previous (`zp`)".to_string();
+                }
             }
             WorkbenchAction::ZoomIn | WorkbenchAction::ZoomOut => {
                 let factor = if action == WorkbenchAction::ZoomIn {
-                    0.75f32
+                    0.80f32
                 } else {
-                    1.0 / 0.75f32
+                    1.25f32
                 };
-                let ah = self.crosshair.h_ppm as f32;
-                let an = self.crosshair.n_ppm as f32;
-                self.view_h_left = ah + (self.view_h_left - ah) * factor;
-                self.view_h_right = ah + (self.view_h_right - ah) * factor;
-                self.view_n_top = an + (self.view_n_top - an) * factor;
-                self.view_n_bottom = an + (self.view_n_bottom - an) * factor;
+                if self.is_1d_studio_active() {
+                    let lo = self.stack1d_panel.view_ppm_min;
+                    let hi = self.stack1d_panel.view_ppm_max;
+                    let anchor = self.stack1d_panel.cursor_ppm.unwrap_or(0.5 * (lo + hi));
+                    let f64_f = factor as f64;
+                    self.stack1d_panel.push_zoom_window(
+                        anchor + (lo - anchor) * f64_f,
+                        anchor + (hi - anchor) * f64_f,
+                    );
+                } else {
+                    let cur = [
+                        self.view_h_left,
+                        self.view_h_right,
+                        self.view_n_top,
+                        self.view_n_bottom,
+                    ];
+                    self.workbook.two_d.push_zoom(cur);
+                    let ah = self.crosshair.h_ppm as f32;
+                    let an = self.crosshair.n_ppm as f32;
+                    self.view_h_left = ah + (self.view_h_left - ah) * factor;
+                    self.view_h_right = ah + (self.view_h_right - ah) * factor;
+                    self.view_n_top = an + (self.view_n_top - an) * factor;
+                    self.view_n_bottom = an + (self.view_n_bottom - an) * factor;
+                }
+            }
+            WorkbenchAction::SelectZoomBoxMode => {
+                if self.is_1d_studio_active() {
+                    self.stack1d_panel.select_tool_mode(ToolMode1d::Zoom);
+                } else {
+                    self.workbook.two_d.tool_mode = ToolMode2d::ZoomBox;
+                }
+            }
+            WorkbenchAction::SelectPanMoveMode => {
+                if self.is_1d_studio_active() {
+                    self.stack1d_panel.select_tool_mode(ToolMode1d::Pan);
+                } else {
+                    self.workbook.two_d.tool_mode = ToolMode2d::Pan;
+                    self.box_zoom_2d_anchor = None;
+                    self.workbook.two_d.drag_box_start_pos = None;
+                    self.workbook.two_d.pick_box_start_pos = None;
+                }
+            }
+            WorkbenchAction::SelectCrosshairSliceMode => {
+                if self.is_1d_studio_active() {
+                    let _ = self.crosshair.toggle_lock();
+                } else {
+                    self.workbook.two_d.tool_mode = ToolMode2d::CrosshairSlice;
+                    self.workbook.two_d.show_projections = true;
+                }
+            }
+            WorkbenchAction::SelectPickPeaksMode => {
+                if self.is_1d_studio_active() {
+                    self.stack1d_panel.select_tool_mode(ToolMode1d::PeakPick);
+                } else {
+                    self.workbook.two_d.tool_mode = ToolMode2d::PickPeaks;
+                }
+            }
+            WorkbenchAction::SelectPointerMode => {
+                if self.is_1d_studio_active() {
+                    self.stack1d_panel.select_tool_mode(ToolMode1d::Zoom);
+                } else {
+                    self.workbook.two_d.tool_mode = ToolMode2d::ZoomBox;
+                }
+            }
+            WorkbenchAction::ToggleMarginalProjections => {
+                if !self.is_1d_studio_active() {
+                    self.workbook.two_d.show_projections = !self.workbook.two_d.show_projections;
+                }
+            }
+            WorkbenchAction::TogglePeakListTable => {
+                if self.is_1d_studio_active() {
+                    self.stack1d_panel.show_1d_analysis_drawer =
+                        !self.stack1d_panel.show_1d_analysis_drawer
+                            || self.stack1d_panel.selected_inspector_tab != InspectorTab1d::Peaks;
+                    self.stack1d_panel.selected_inspector_tab = InspectorTab1d::Peaks;
+                } else {
+                    self.workbook.two_d.show_peak_table = !self.workbook.two_d.show_peak_table;
+                }
+            }
+            WorkbenchAction::NextWorkbookPage | WorkbenchAction::PrevWorkbookPage => {
+                let n1 = self.stack1d_panel.traces.len();
+                let n2 = self.workbook.pages_2d.len();
+                let total = n1 + n2;
+                if total > 1 {
+                    let cur = if self.show_stack1d_panel && n1 > 0 {
+                        self.stack1d_panel.ref_trace_idx.min(n1 - 1)
+                    } else if n2 > 0 {
+                        n1 + self.workbook.active_2d_idx.min(n2 - 1)
+                    } else {
+                        0
+                    };
+                    let next = if action == WorkbenchAction::NextWorkbookPage {
+                        (cur + 1) % total
+                    } else {
+                        (cur + total - 1) % total
+                    };
+                    if next < n1 {
+                        self.activate_1d_workbook_page(next);
+                    } else {
+                        self.activate_2d_workbook_page(next - n1);
+                    }
+                }
+            }
+            WorkbenchAction::ToggleCanvasTheme => {
+                self.paper_white_canvas = !self.paper_white_canvas;
+                self.sync_overlay_layers_from_workbook();
             }
             WorkbenchAction::RaiseContourFloor | WorkbenchAction::LowerContourFloor => {
-                let new_base = if action == WorkbenchAction::RaiseContourFloor {
-                    (self.contour_base * CONTOUR_FLOOR_STEP_RATIO)
-                        .min((self.contour_noise_ref * 1e4).max(1e9))
+                if self.is_1d_studio_active() {
+                    let g_mul = if action == WorkbenchAction::RaiseContourFloor {
+                        1.25_f64
+                    } else {
+                        0.80_f64
+                    };
+                    self.stack1d_panel.y_gain =
+                        (self.stack1d_panel.y_gain * g_mul).clamp(0.001, 100_000.0);
                 } else {
-                    (self.contour_base / CONTOUR_FLOOR_STEP_RATIO).max(1e-6)
-                };
-                self.contour_base = new_base;
-                let mut params = SessionContourParams::new("HSQC");
-                params.base_level = self.contour_base;
-                params.level_factor = self.contour_factor;
-                params.num_levels = self.contour_levels;
-                params.show_negative = self.show_negative;
-                params.ppm_nudge = self.primary_ppm_nudge;
-                let msg = self.session.execute(WorkbenchCommand::SetContourParams {
-                    layer_id: "HSQC".to_string(),
-                    params,
-                });
-                self.status_msg = msg;
+                    let new_base = if action == WorkbenchAction::RaiseContourFloor {
+                        (self.contour_base * CONTOUR_FLOOR_STEP_RATIO)
+                            .min((self.contour_noise_ref * 1e4).max(1e9))
+                    } else {
+                        (self.contour_base / CONTOUR_FLOOR_STEP_RATIO).max(1e-6)
+                    };
+                    self.contour_base = new_base;
+                    let mut params = SessionContourParams::new("HSQC");
+                    params.base_level = self.contour_base;
+                    params.level_factor = self.contour_factor;
+                    params.num_levels = self.contour_levels;
+                    params.show_negative = self.show_negative;
+                    params.ppm_nudge = self.primary_ppm_nudge;
+                    let msg = self.session.execute(WorkbenchCommand::SetContourParams {
+                        layer_id: "HSQC".to_string(),
+                        params,
+                    });
+                    self.status_msg = msg;
+                }
             }
             WorkbenchAction::ToggleNegativeContours => {
                 self.show_negative = !self.show_negative;
@@ -11112,37 +11281,41 @@ impl NmrWorkbenchApp {
                 );
             }
             WorkbenchAction::AddPeakAtCrosshair => {
-                let amp = self.hsqc_spec.as_ref().map(|spec| {
-                    let ix = spec
-                        .axis_x
-                        .ppm_to_index(self.crosshair.h_ppm)
-                        .round()
-                        .clamp(0.0, (spec.nx().saturating_sub(1)) as f64)
-                        as usize;
-                    let iy = spec
-                        .axis_y
-                        .ppm_to_index(self.crosshair.n_ppm)
-                        .round()
-                        .clamp(0.0, (spec.ny().saturating_sub(1)) as f64)
-                        as usize;
-                    spec.get(ix, iy) as f64
-                });
-                let pk = Peak {
-                    exp: "HSQC".to_string(),
-                    h: self.crosshair.h_ppm,
-                    n: self.crosshair.n_ppm,
-                    c: None,
-                    sign: if amp.is_some_and(|a| a < 0.0) { -1 } else { 1 },
-                    height: amp,
-                    volume: None,
-                    h2: None,
-                };
-                let msg = self.session.execute(WorkbenchCommand::AddPeak(pk));
-                self.sync_app_from_session();
-                self.status_msg = msg;
+                if self.is_1d_studio_active() {
+                    let target = self.stack1d_panel.cursor_ppm.unwrap_or(
+                        0.5 * (self.stack1d_panel.view_ppm_min + self.stack1d_panel.view_ppm_max),
+                    );
+                    let _ = self
+                        .stack1d_panel
+                        .add_manual_peak_at_or_near_ppm(target, true);
+                    self.status_msg = self.stack1d_panel.status_message.clone();
+                } else {
+                    let rx = self
+                        .hsqc_spec
+                        .as_ref()
+                        .map(|s| (s.axis_x.step_ppm.abs() * 3.0).max(0.01))
+                        .unwrap_or(0.02);
+                    let ry = self
+                        .hsqc_spec
+                        .as_ref()
+                        .map(|s| (s.axis_y.step_ppm.abs() * 3.0).max(0.02))
+                        .unwrap_or(0.10);
+                    let _ = self.add_manual_2d_peak(
+                        self.crosshair.h_ppm,
+                        self.crosshair.n_ppm,
+                        Some((rx, ry)),
+                    );
+                }
             }
             WorkbenchAction::DeleteSelectedPeaks => {
-                if let Some(sel_s) = self.selected_ss.filter(|&s| s < self.systems.len()) {
+                if self.is_1d_studio_active() {
+                    if let Some(sel) = self.stack1d_panel.selected_peak_idx {
+                        let _ = self.stack1d_panel.delete_picked_peak(sel);
+                        self.status_msg = self.stack1d_panel.status_message.clone();
+                    }
+                } else if let Some(sel_2d) = self.workbook.two_d.selected_peak_idx {
+                    self.delete_2d_peak(sel_2d);
+                } else if let Some(sel_s) = self.selected_ss.filter(|&s| s < self.systems.len()) {
                     let ss = &self.systems[sel_s];
                     let idxs: Vec<usize> = self
                         .peaks
@@ -11161,10 +11334,23 @@ impl NmrWorkbenchApp {
                 }
             }
             WorkbenchAction::SnapPeakParabolicCenter => {
-                self.snap_selected_peak_parabolic();
+                if self.is_1d_studio_active() {
+                    if let Some(sel) = self.stack1d_panel.selected_peak_idx {
+                        let _ = self.stack1d_panel.snap_picked_peak_to_apex(sel);
+                        self.status_msg = self.stack1d_panel.status_message.clone();
+                    }
+                } else if let Some(sel_2d) = self.workbook.two_d.selected_peak_idx {
+                    self.snap_2d_peak_by_index(sel_2d);
+                } else {
+                    self.snap_selected_peak_parabolic();
+                }
             }
             WorkbenchAction::TogglePeakLabels => {
-                self.show_peak_labels = !self.show_peak_labels;
+                if self.is_1d_studio_active() {
+                    self.stack1d_panel.show_peak_labels = !self.stack1d_panel.show_peak_labels;
+                } else {
+                    self.show_peak_labels = !self.show_peak_labels;
+                }
             }
             WorkbenchAction::FilterArtifactAndFoldedPeaks => {
                 self.rebuild_systems_and_matrices();
@@ -12044,10 +12230,9 @@ impl eframe::App for NmrWorkbenchApp {
             self.dispatch_workbench_action(&ctx, act);
         }
 
-        // 3. Modal Two-Key NMR Chord Dispatcher (suppressed whenever ctx.egui_wants_keyboard_input(), 1D canvas, or non-ProteinNmr tab has focus)
+        // 3. Modal Two-Key NMR Chord Dispatcher (runs across BOTH 2D and 1D views; suppressed in text inputs & Octet)
         let suppress_chords = ctx.egui_wants_keyboard_input()
             || self.workspace_mode != WorkspaceMode::ProteinNmr
-            || self.show_stack1d_panel
             || self.command_palette.open
             || self.ingest_panel.open
             || self.show_text_io_modal

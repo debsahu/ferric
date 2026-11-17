@@ -17,6 +17,11 @@ use nmr_gui::workflow_bar::{draw_workbench_chrome, WorkbenchAction, WorkspaceRea
 
 const EXPECTED_TWO_KEY_CHORDS: &[((char, char), &str, WorkbenchAction)] = &[
     (
+        ('c', 't'),
+        "Chord: c_",
+        WorkbenchAction::OpenContourThresholdPopup,
+    ),
+    (
         ('v', 't'),
         "Chord: v_",
         WorkbenchAction::OpenContourThresholdPopup,
@@ -33,11 +38,55 @@ const EXPECTED_TWO_KEY_CHORDS: &[((char, char), &str, WorkbenchAction)] = &[
         WorkbenchAction::SnapPeakParabolicCenter,
     ),
     (('p', 'l'), "Chord: p_", WorkbenchAction::TogglePeakLabels),
+    (('z', 'f'), "Chord: z_", WorkbenchAction::ZoomFullSweep),
+    (('z', 'p'), "Chord: z_", WorkbenchAction::ZoomPrevious),
     (('o', 'z'), "Chord: o_", WorkbenchAction::ZoomFullSweep),
     (('z', 'i'), "Chord: z_", WorkbenchAction::ZoomIn),
     (('z', 'o'), "Chord: z_", WorkbenchAction::ZoomOut),
-    (('c', 't'), "Chord: c_", WorkbenchAction::RaiseContourFloor),
+    (('z', 'm'), "Chord: z_", WorkbenchAction::SelectZoomBoxMode),
+    (('m', 'v'), "Chord: m_", WorkbenchAction::SelectPanMoveMode),
+    (
+        ('x', 'h'),
+        "Chord: x_",
+        WorkbenchAction::SelectCrosshairSliceMode,
+    ),
+    (('c', 'i'), "Chord: c_", WorkbenchAction::RaiseContourFloor),
     (('c', 'b'), "Chord: c_", WorkbenchAction::LowerContourFloor),
+    (
+        ('k', 'r'),
+        "Chord: k_",
+        WorkbenchAction::SelectPickPeaksMode,
+    ),
+    (
+        ('l', 't'),
+        "Chord: l_",
+        WorkbenchAction::TogglePeakListTable,
+    ),
+    (('n', 't'), "Chord: n_", WorkbenchAction::NextWorkbookPage),
+    (('p', 't'), "Chord: p_", WorkbenchAction::PrevWorkbookPage),
+    (('w', 't'), "Chord: w_", WorkbenchAction::ToggleCanvasTheme),
+    (('p', 'h'), "Chord: p_", WorkbenchAction::SelectPhase1dMode),
+    (
+        ('b', 'c'),
+        "Chord: b_",
+        WorkbenchAction::ApplyMedianBaseline,
+    ),
+    (('w', 's'), "Chord: w_", WorkbenchAction::SuppressWaterPeak),
+    (
+        ('p', 'i'),
+        "Chord: p_",
+        WorkbenchAction::SelectIntegrate1dMode,
+    ),
+    (
+        ('m', 'p'),
+        "Chord: m_",
+        WorkbenchAction::SelectMultiplet1dMode,
+    ),
+    (
+        ('r', 'f'),
+        "Chord: r_",
+        WorkbenchAction::SelectReferenceOrAlignMode,
+    ),
     (
         ('s', 't'),
         "Chord: s_",
@@ -326,8 +375,11 @@ fn test_egui_question_mark_deduplication_and_cheat_sheet_search_parity() {
     let extracted = nmr_gui::keymap::extract_egui_chord_inputs(&events);
     assert_eq!(extracted, vec![KeyChordInput::question_mark()]);
 
-    // Verify cheat-sheet filtering and 1-to-1 parity with CommandPalette chord badges
-    assert_eq!(ChordDispatcher::filter_accelerators("").len(), 14);
+    // Verify cheat-sheet filtering and CommandPalette chord badge parity
+    assert_eq!(
+        ChordDispatcher::filter_accelerators("").len(),
+        SPECTRUM_ACCELERATORS.len()
+    );
     let para = ChordDispatcher::filter_accelerators("parabolic");
     assert_eq!(para.len(), 1);
     assert_eq!(para[0].keys_label, "pc");
@@ -335,17 +387,14 @@ fn test_egui_question_mark_deduplication_and_cheat_sheet_search_parity() {
     let palette = CommandPalette::new();
     for binding in SPECTRUM_ACCELERATORS {
         let meta = binding.action.metadata();
-        assert_eq!(
-            meta.chord_badge,
-            Some(binding.keys_label),
-            "Mismatch on chord badge for {:?}",
-            binding.action
-        );
-        let hits = palette.search(binding.keys_label);
+        let primary_badge = meta.chord_badge.unwrap_or_else(|| {
+            panic!("Missing chord_badge on {:?}", binding.action);
+        });
+        let hits = palette.search(primary_badge);
         assert!(
             hits.iter().any(|h| h.command.action == binding.action),
             "CommandPalette search('{}') did not find {:?}",
-            binding.keys_label,
+            primary_badge,
             binding.action
         );
     }

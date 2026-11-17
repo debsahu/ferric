@@ -795,16 +795,21 @@ mod tests {
 
         // 1. Exact two-key chord lookup ranks that exact accelerator #1
         for (chord, expected) in [
-            ("vt", WorkbenchAction::OpenContourThresholdPopup),
+            ("ct", WorkbenchAction::OpenContourThresholdPopup),
             ("pa", WorkbenchAction::AddPeakAtCrosshair),
             ("pd", WorkbenchAction::DeleteSelectedPeaks),
             ("pc", WorkbenchAction::SnapPeakParabolicCenter),
             ("pl", WorkbenchAction::TogglePeakLabels),
-            ("oz", WorkbenchAction::ZoomFullSweep),
-            ("ct", WorkbenchAction::RaiseContourFloor),
+            ("zf", WorkbenchAction::ZoomFullSweep),
+            ("ci", WorkbenchAction::RaiseContourFloor),
             ("cb", WorkbenchAction::LowerContourFloor),
             ("st", WorkbenchAction::TileSequentialStrips),
             ("at", WorkbenchAction::OpenResidueAssignmentPopover),
+            ("zp", WorkbenchAction::ZoomPrevious),
+            ("kr", WorkbenchAction::SelectPickPeaksMode),
+            ("lt", WorkbenchAction::TogglePeakListTable),
+            ("ph", WorkbenchAction::SelectPhase1dMode),
+            ("ws", WorkbenchAction::SuppressWaterPeak),
         ] {
             let hits = palette.search(chord);
             assert!(!hits.is_empty(), "No hits for chord {chord}");

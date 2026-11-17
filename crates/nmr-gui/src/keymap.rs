@@ -2,10 +2,15 @@
 //! keyboard cheat-sheet modal (`T09.4`).
 //!
 //! Provenance: Original clean-room finite-state chord input architecture implementing interactive
-//! two-key and single-key NMR spectrum accelerators (`docs/specs/12-workbench-ux.md` §3). Zero
-//! external source code or keytable files consulted. Fully deterministic across native desktop
-//! and `wasm32-unknown-unknown` (driven by explicit monotonic millisecond timestamps rather than
-//! `std::time::Instant`).
+//! two-key and single-key NMR spectrum accelerators (`docs/specs/12-workbench-ux.md` §3). Standard
+//! two-letter NMR spectroscopy mnemonics (`zp`, `zf`, `zi`, `zo`, `zm`, `ct`, `ci`, `cb`, `kr`,
+//! `pa`, `pd`, `pc`, `pl`, `lt`, `ph`, `bc`, `pi`, `mp`, `rf`, `ws`, `nt`, `pt`, etc.) follow
+//! published peer-reviewed NMR interactive assignment conventions:
+//! - Lee, W., Tonelli, M., & Markley, J. L. (*Bioinformatics* **2015**, 31, 1325–1327).
+//! - Lee, W., Rahimi, M., Lee, Y., & Chiu, A. (*Bioinformatics* **2021**, 37, 3041–3042).
+//!
+//! Zero external source code or keytable files consulted. Fully deterministic across native
+//! desktop and `wasm32-unknown-unknown` (driven by explicit monotonic millisecond timestamps).
 
 use eframe::egui;
 
@@ -89,6 +94,8 @@ pub enum ChordKey {
     Letter(char),
     Space,
     QuestionMark,
+    Plus,
+    Minus,
     Escape,
     Other,
 }
@@ -166,39 +173,39 @@ pub struct AcceleratorBinding {
     pub action: WorkbenchAction,
 }
 
-/// Canonical table of all 14 required two-key and single-key NMR spectrum accelerators (`T09.4`).
+/// Canonical table of all two-key and single-key NMR spectrum accelerators (`T09.4`).
 pub const SPECTRUM_ACCELERATORS: &[AcceleratorBinding] = &[
-    // View & Contours
+    // Zoom, Navigation & Tool Modes
     AcceleratorBinding {
-        keys_label: "vt",
-        chord_pair: Some(('v', 't')),
-        category: "Spectrum & Contours",
-        title: "View / Contour Threshold Popup",
-        description: "Open interactive contour base threshold, geometric step, and level count popover",
-        action: WorkbenchAction::OpenContourThresholdPopup,
+        keys_label: "zp",
+        chord_pair: Some(('z', 'p')),
+        category: "Zoom & Navigation",
+        title: "Zoom Previous",
+        description: "Pop previous 2D or 1D zoom window from zoom history",
+        action: WorkbenchAction::ZoomPrevious,
     },
     AcceleratorBinding {
-        keys_label: "ct",
-        chord_pair: Some(('c', 't')),
-        category: "Spectrum & Contours",
-        title: "Raise Contour Floor (×1.25)",
-        description: "Multiply positive/negative contour floor by 1.25x to suppress thermal baseline noise",
-        action: WorkbenchAction::RaiseContourFloor,
+        keys_label: "zf",
+        chord_pair: Some(('z', 'f')),
+        category: "Zoom & Navigation",
+        title: "Zoom Full Sweep",
+        description: "Reset active 2D or 1D viewport bounds to full spectral sweep width",
+        action: WorkbenchAction::ZoomFullSweep,
     },
     AcceleratorBinding {
-        keys_label: "cb",
-        chord_pair: Some(('c', 'b')),
-        category: "Spectrum & Contours",
-        title: "Lower Contour Floor (÷1.25)",
-        description: "Divide positive/negative contour floor by 1.25x to reveal weak cross-peaks",
-        action: WorkbenchAction::LowerContourFloor,
+        keys_label: "ze",
+        chord_pair: Some(('z', 'e')),
+        category: "Zoom & Navigation",
+        title: "Zoom Entire Spectrum",
+        description: "Alias for Zoom Full Sweep across active 2D or 1D spectrum",
+        action: WorkbenchAction::ZoomFullSweep,
     },
     AcceleratorBinding {
         keys_label: "oz",
         chord_pair: Some(('o', 'z')),
         category: "Zoom & Navigation",
         title: "Zoom Out to Full Sweep",
-        description: "Reset 2D viewport bounds to the full spectral sweep width of the active spectrum",
+        description: "Reset 2D or 1D viewport bounds to the full spectral sweep width",
         action: WorkbenchAction::ZoomFullSweep,
     },
     AcceleratorBinding {
@@ -206,7 +213,7 @@ pub const SPECTRUM_ACCELERATORS: &[AcceleratorBinding] = &[
         chord_pair: Some(('z', 'i')),
         category: "Zoom & Navigation",
         title: "Zoom In Viewport",
-        description: "Zoom into the active 2D/strip spectral region by 1.25x",
+        description: "Zoom into the active 2D/1D spectral region by 1.25x",
         action: WorkbenchAction::ZoomIn,
     },
     AcceleratorBinding {
@@ -214,24 +221,156 @@ pub const SPECTRUM_ACCELERATORS: &[AcceleratorBinding] = &[
         chord_pair: Some(('z', 'o')),
         category: "Zoom & Navigation",
         title: "Zoom Out Viewport",
-        description: "Zoom out of the active 2D/strip spectral region by 1.25x",
+        description: "Zoom out of the active 2D/1D spectral region by 1.25x",
         action: WorkbenchAction::ZoomOut,
+    },
+    AcceleratorBinding {
+        keys_label: "zm",
+        chord_pair: Some(('z', 'm')),
+        category: "Zoom & Navigation",
+        title: "Zoom Box Tool Mode",
+        description: "Switch pointer to rubber-band Zoom Box mode on active 2D or 1D canvas",
+        action: WorkbenchAction::SelectZoomBoxMode,
+    },
+    AcceleratorBinding {
+        keys_label: "mv",
+        chord_pair: Some(('m', 'v')),
+        category: "Zoom & Navigation",
+        title: "Move / Pan Tool Mode",
+        description: "Switch pointer to drag-pan mode on active 2D or 1D canvas",
+        action: WorkbenchAction::SelectPanMoveMode,
+    },
+    AcceleratorBinding {
+        keys_label: "xh",
+        chord_pair: Some(('x', 'h')),
+        category: "Zoom & Navigation",
+        title: "Crosshair & 1D Slice Mode",
+        description: "Toggle live orthogonal F2/F1 slice inspection (2D) or caliper crosshair (1D)",
+        action: WorkbenchAction::SelectCrosshairSliceMode,
     },
     AcceleratorBinding {
         keys_label: "Space",
         chord_pair: None,
         category: "Zoom & Navigation",
         title: "Toggle Crosshair Lock",
-        description: "Pin or unpin the synchronized (1H, 15N, 13C) frequency crosshair across views",
+        description:
+            "Pin or unpin the synchronized (1H, 15N, 13C) frequency crosshair across views",
         action: WorkbenchAction::ToggleCrosshairLock,
     },
-    // Peak Editing
+    // Contour Levels, Views & Pages
+    AcceleratorBinding {
+        keys_label: "ct",
+        chord_pair: Some(('c', 't')),
+        category: "Spectrum & Contours",
+        title: "Contour Levels & Threshold Dialog",
+        description: "Open contour base threshold, geometric step, and level count dialog",
+        action: WorkbenchAction::OpenContourThresholdPopup,
+    },
+    AcceleratorBinding {
+        keys_label: "vt",
+        chord_pair: Some(('v', 't')),
+        category: "Spectrum & Contours",
+        title: "View / Contour Threshold Dialog",
+        description:
+            "Open interactive contour base threshold, geometric step, and level count dialog",
+        action: WorkbenchAction::OpenContourThresholdPopup,
+    },
+    AcceleratorBinding {
+        keys_label: "ci",
+        chord_pair: Some(('c', 'i')),
+        category: "Spectrum & Contours",
+        title: "Raise Contour Floor / 1D Gain (×1.25)",
+        description: "Multiply contour threshold or 1D vertical gain by 1.25x (or press +)",
+        action: WorkbenchAction::RaiseContourFloor,
+    },
+    AcceleratorBinding {
+        keys_label: "cu",
+        chord_pair: Some(('c', 'u')),
+        category: "Spectrum & Contours",
+        title: "Contour Up / Raise Floor (×1.25)",
+        description: "Raise contour threshold or 1D vertical gain by 1.25x",
+        action: WorkbenchAction::RaiseContourFloor,
+    },
+    AcceleratorBinding {
+        keys_label: "cb",
+        chord_pair: Some(('c', 'b')),
+        category: "Spectrum & Contours",
+        title: "Lower Contour Floor / 1D Gain (÷1.25)",
+        description: "Divide contour threshold or 1D vertical gain by 1.25x (or press -)",
+        action: WorkbenchAction::LowerContourFloor,
+    },
+    AcceleratorBinding {
+        keys_label: "cd",
+        chord_pair: Some(('c', 'd')),
+        category: "Spectrum & Contours",
+        title: "Contour Down / Lower Floor (÷1.25)",
+        description: "Lower contour threshold or 1D vertical gain by 1.25x",
+        action: WorkbenchAction::LowerContourFloor,
+    },
+    AcceleratorBinding {
+        keys_label: "v1",
+        chord_pair: Some(('v', '1')),
+        category: "Spectrum & Contours",
+        title: "Toggle 1D Marginal Projections",
+        description: "Show or hide Top F2 and Left F1 1D marginal projection strips on 2D canvas",
+        action: WorkbenchAction::ToggleMarginalProjections,
+    },
+    AcceleratorBinding {
+        keys_label: "v2",
+        chord_pair: Some(('v', '2')),
+        category: "Spectrum & Contours",
+        title: "Cycle 2D Projection / Slice Source",
+        description: "Toggle 2D marginal projection strips / slice mode",
+        action: WorkbenchAction::ToggleMarginalProjections,
+    },
+    AcceleratorBinding {
+        keys_label: "ol",
+        chord_pair: Some(('o', 'l')),
+        category: "Spectrum & Contours",
+        title: "Overlay Views Dialog",
+        description: "Open multi-spectrum 2D contour overlay stack & ppm nudge manager",
+        action: WorkbenchAction::OpenOverlayStackManager,
+    },
+    AcceleratorBinding {
+        keys_label: "nt",
+        chord_pair: Some(('n', 't')),
+        category: "Workbook Navigation",
+        title: "Next Spectrum Page",
+        description: "Switch forward to the next open 1D or 2D spectrum page",
+        action: WorkbenchAction::NextWorkbookPage,
+    },
+    AcceleratorBinding {
+        keys_label: "pt",
+        chord_pair: Some(('p', 't')),
+        category: "Workbook Navigation",
+        title: "Previous Spectrum Page",
+        description: "Switch backward to the previous open 1D or 2D spectrum page",
+        action: WorkbenchAction::PrevWorkbookPage,
+    },
+    AcceleratorBinding {
+        keys_label: "wt",
+        chord_pair: Some(('w', 't')),
+        category: "Spectrum & Contours",
+        title: "Toggle Paper White / Dark Theme",
+        description: "Switch between publication Paper White and Dark Oscilloscope canvas",
+        action: WorkbenchAction::ToggleCanvasTheme,
+    },
+    // Peak Picking, Editing & Lists
+    AcceleratorBinding {
+        keys_label: "kr",
+        chord_pair: Some(('k', 'r')),
+        category: "Peak Editing",
+        title: "Restricted Peak-Pick Tool Mode",
+        description: "Switch to interactive Peak-Pick mode (click to add, drag box to pick)",
+        action: WorkbenchAction::SelectPickPeaksMode,
+    },
     AcceleratorBinding {
         keys_label: "pa",
         chord_pair: Some(('p', 'a')),
         category: "Peak Editing",
         title: "Add Peak at Crosshair",
-        description: "Insert a new cross-peak at the active cursor or locked crosshair position",
+        description:
+            "Insert a new peak at the active cursor or locked crosshair position (2D & 1D)",
         action: WorkbenchAction::AddPeakAtCrosshair,
     },
     AcceleratorBinding {
@@ -239,15 +378,15 @@ pub const SPECTRUM_ACCELERATORS: &[AcceleratorBinding] = &[
         chord_pair: Some(('p', 'd')),
         category: "Peak Editing",
         title: "Delete Selected Peak(s)",
-        description: "Delete currently selected cross-peak(s) (reversible via Cmd/Ctrl+Z)",
+        description: "Delete currently selected peak in active 2D or 1D view (also Del/Backspace)",
         action: WorkbenchAction::DeleteSelectedPeaks,
     },
     AcceleratorBinding {
         keys_label: "pc",
         chord_pair: Some(('p', 'c')),
         category: "Peak Editing",
-        title: "Parabolic Sub-Voxel Peak Center Snap",
-        description: "Snap selected peak(s) to the local 3-point log-parabolic intensity extremum",
+        title: "Center / Parabolic Snap Selected Peak",
+        description: "Snap selected peak to local parabolic intensity extremum (2D & 1D)",
         action: WorkbenchAction::SnapPeakParabolicCenter,
     },
     AcceleratorBinding {
@@ -255,25 +394,123 @@ pub const SPECTRUM_ACCELERATORS: &[AcceleratorBinding] = &[
         chord_pair: Some(('p', 'l')),
         category: "Peak Editing",
         title: "Toggle Peak Labels",
-        description: "Show or hide spin-system numbers and assigned residue annotations on canvas",
+        description:
+            "Show or hide peak numbers, notes, and residue annotations on canvas (2D & 1D)",
         action: WorkbenchAction::TogglePeakLabels,
     },
-    // Strips & Backbone Assignment
+    AcceleratorBinding {
+        keys_label: "lt",
+        chord_pair: Some(('l', 't')),
+        category: "Peak Editing",
+        title: "Peak List Table",
+        description: "Toggle interactive 2D Peak Table or 1D Peaks inspector tab",
+        action: WorkbenchAction::TogglePeakListTable,
+    },
+    AcceleratorBinding {
+        keys_label: "se",
+        chord_pair: Some(('s', 'e')),
+        category: "Peak Editing",
+        title: "Pointer / Select Tool",
+        description: "Return pointer to selection / zoom mode",
+        action: WorkbenchAction::SelectPointerMode,
+    },
     AcceleratorBinding {
         keys_label: "st",
         chord_pair: Some(('s', 't')),
         category: "Strips & Assignment",
         title: "Tile Sequential i-1 / i / i+1 Strips",
-        description: "Tile predecessor (i-1), active root (i), and successor (i+1) 3D match-finder strips",
+        description:
+            "Tile predecessor (i-1), active root (i), and successor (i+1) 3D match-finder strips",
         action: WorkbenchAction::TileSequentialStrips,
     },
     AcceleratorBinding {
         keys_label: "at",
         chord_pair: Some(('a', 't')),
         category: "Strips & Assignment",
-        title: "Open Residue Assignment Popover",
-        description: "Open interactive residue typing U(s,k) & hard-lock assignment popover for selected root",
+        title: "Assignment / Peak Label Editor",
+        description: "Open residue assignment popover (protein) or peak label editor (2D/1D)",
         action: WorkbenchAction::OpenResidueAssignmentPopover,
+    },
+    // 1D & 2D Processing & Analysis
+    AcceleratorBinding {
+        keys_label: "ph",
+        chord_pair: Some(('p', 'h')),
+        category: "1D & 2D Processing",
+        title: "Interactive Live Phase Mode",
+        description: "Enter live mouse-drag PHC0 / PHC1 phasing mode in 1D Studio",
+        action: WorkbenchAction::SelectPhase1dMode,
+    },
+    AcceleratorBinding {
+        keys_label: "ap",
+        chord_pair: Some(('a', 'p')),
+        category: "1D & 2D Processing",
+        title: "Auto-Phase Active 1D Spectrum",
+        description: "Run automatic minimum-entropy PH0/PH1 phasing on active 1D trace",
+        action: WorkbenchAction::AutoPhaseDirect1D,
+    },
+    AcceleratorBinding {
+        keys_label: "bc",
+        chord_pair: Some(('b', 'c')),
+        category: "1D & 2D Processing",
+        title: "Baseline Correction (Whittaker)",
+        description: "Subtract Whittaker / median baseline from active 1D or 2D spectrum",
+        action: WorkbenchAction::ApplyMedianBaseline,
+    },
+    AcceleratorBinding {
+        keys_label: "pi",
+        chord_pair: Some(('p', 'i')),
+        category: "1D & 2D Processing",
+        title: "Peak Integration Mode",
+        description: "Enter ROI drag-to-integrate mode in 1D Studio",
+        action: WorkbenchAction::SelectIntegrate1dMode,
+    },
+    AcceleratorBinding {
+        keys_label: "it",
+        chord_pair: Some(('i', 't')),
+        category: "1D & 2D Processing",
+        title: "Integrate Regions Mode",
+        description: "Alias for 1D ROI Peak Integration mode",
+        action: WorkbenchAction::SelectIntegrate1dMode,
+    },
+    AcceleratorBinding {
+        keys_label: "mp",
+        chord_pair: Some(('m', 'p')),
+        category: "1D & 2D Processing",
+        title: "Multiplet Analysis Mode",
+        description: "Enter drag-to-multiplet & J-tree analysis mode in 1D Studio",
+        action: WorkbenchAction::SelectMultiplet1dMode,
+    },
+    AcceleratorBinding {
+        keys_label: "rf",
+        chord_pair: Some(('r', 'f')),
+        category: "1D & 2D Processing",
+        title: "Chemical Shift Reference / Align",
+        description: "Enter 1D solvent referencing mode or open 2D ppm alignment",
+        action: WorkbenchAction::SelectReferenceOrAlignMode,
+    },
+    AcceleratorBinding {
+        keys_label: "ws",
+        chord_pair: Some(('w', 's')),
+        category: "1D & 2D Processing",
+        title: "Suppress Water Peak",
+        description: "Attenuate residual H2O/HDO peak & t1 ridge on active 1D/2D/3D spectrum",
+        action: WorkbenchAction::SuppressWaterPeak,
+    },
+    AcceleratorBinding {
+        keys_label: "wu",
+        chord_pair: Some(('w', 'u')),
+        category: "1D & 2D Processing",
+        title: "Undo Water Suppression",
+        description: "Restore pre-water-suppression 1D or 2D spectrum snapshot",
+        action: WorkbenchAction::UndoWaterSuppression,
+    },
+    AcceleratorBinding {
+        keys_label: "op",
+        chord_pair: Some(('o', 'p')),
+        category: "File & Ingest",
+        title: "Open Spectrometer Folder / Files",
+        description: "Open spectrometer dataset ingest panel",
+        action: WorkbenchAction::OpenIngestMatrix,
     },
     // Help
     AcceleratorBinding {
@@ -281,7 +518,8 @@ pub const SPECTRUM_ACCELERATORS: &[AcceleratorBinding] = &[
         chord_pair: None,
         category: "Help & Reference",
         title: "Keyboard Cheat-Sheet Modal",
-        description: "Open or filter this searchable reference of two-key chords and modifier shortcuts",
+        description:
+            "Open or filter this searchable reference of two-key chords and modifier shortcuts",
         action: WorkbenchAction::OpenKeyboardCheatSheet,
     },
 ];
@@ -340,24 +578,66 @@ pub const GLOBAL_MODIFIER_SHORTCUTS: &[(&str, &str, &str, WorkbenchAction)] = &[
 
 #[inline]
 fn is_valid_chord_prefix(ch: char) -> bool {
-    matches!(ch, 'v' | 'p' | 'o' | 'z' | 'c' | 's' | 'a')
+    matches!(
+        ch,
+        'a' | 'b'
+            | 'c'
+            | 'i'
+            | 'k'
+            | 'l'
+            | 'm'
+            | 'n'
+            | 'o'
+            | 'p'
+            | 'r'
+            | 's'
+            | 'v'
+            | 'w'
+            | 'x'
+            | 'z'
+    )
 }
 
 #[inline]
 fn lookup_two_key_chord(prefix: char, second: char) -> Option<WorkbenchAction> {
     match (prefix, second) {
-        ('v', 't') => Some(WorkbenchAction::OpenContourThresholdPopup),
+        // Zoom & Viewport
+        ('z', 'p') => Some(WorkbenchAction::ZoomPrevious),
+        ('z', 'f') | ('z', 'e') | ('o', 'z') => Some(WorkbenchAction::ZoomFullSweep),
+        ('z', 'i') => Some(WorkbenchAction::ZoomIn),
+        ('z', 'o') => Some(WorkbenchAction::ZoomOut),
+        ('z', 'm') => Some(WorkbenchAction::SelectZoomBoxMode),
+        ('m', 'v') => Some(WorkbenchAction::SelectPanMoveMode),
+        ('x', 'h') => Some(WorkbenchAction::SelectCrosshairSliceMode),
+        // Contour Levels, Views, Projections & Pages
+        ('c', 't') | ('v', 't') => Some(WorkbenchAction::OpenContourThresholdPopup),
+        ('c', 'i') | ('c', 'u') => Some(WorkbenchAction::RaiseContourFloor),
+        ('c', 'b') | ('c', 'd') => Some(WorkbenchAction::LowerContourFloor),
+        ('v', '1') | ('v', '2') => Some(WorkbenchAction::ToggleMarginalProjections),
+        ('o', 'l') => Some(WorkbenchAction::OpenOverlayStackManager),
+        ('n', 't') => Some(WorkbenchAction::NextWorkbookPage),
+        ('p', 't') => Some(WorkbenchAction::PrevWorkbookPage),
+        ('w', 't') => Some(WorkbenchAction::ToggleCanvasTheme),
+        // Peak Picking, Editing, Lists & Assignment
+        ('k', 'r') => Some(WorkbenchAction::SelectPickPeaksMode),
         ('p', 'a') => Some(WorkbenchAction::AddPeakAtCrosshair),
         ('p', 'd') => Some(WorkbenchAction::DeleteSelectedPeaks),
         ('p', 'c') => Some(WorkbenchAction::SnapPeakParabolicCenter),
         ('p', 'l') => Some(WorkbenchAction::TogglePeakLabels),
-        ('o', 'z') => Some(WorkbenchAction::ZoomFullSweep),
-        ('z', 'i') => Some(WorkbenchAction::ZoomIn),
-        ('z', 'o') => Some(WorkbenchAction::ZoomOut),
-        ('c', 't') => Some(WorkbenchAction::RaiseContourFloor),
-        ('c', 'b') => Some(WorkbenchAction::LowerContourFloor),
-        ('s', 't') => Some(WorkbenchAction::TileSequentialStrips),
+        ('l', 't') => Some(WorkbenchAction::TogglePeakListTable),
+        ('s', 'e') => Some(WorkbenchAction::SelectPointerMode),
         ('a', 't') => Some(WorkbenchAction::OpenResidueAssignmentPopover),
+        ('s', 't') => Some(WorkbenchAction::TileSequentialStrips),
+        // 1D & 2D Processing & Analysis
+        ('p', 'h') => Some(WorkbenchAction::SelectPhase1dMode),
+        ('a', 'p') => Some(WorkbenchAction::AutoPhaseDirect1D),
+        ('b', 'c') => Some(WorkbenchAction::ApplyMedianBaseline),
+        ('p', 'i') | ('i', 't') => Some(WorkbenchAction::SelectIntegrate1dMode),
+        ('m', 'p') => Some(WorkbenchAction::SelectMultiplet1dMode),
+        ('r', 'f') => Some(WorkbenchAction::SelectReferenceOrAlignMode),
+        ('w', 's') => Some(WorkbenchAction::SuppressWaterPeak),
+        ('w', 'u') => Some(WorkbenchAction::UndoWaterSuppression),
+        ('o', 'p') => Some(WorkbenchAction::OpenIngestMatrix),
         _ => None,
     }
 }
@@ -537,6 +817,17 @@ impl ChordDispatcher {
                         second: '?',
                     }
                 }
+                ChordKey::Plus | ChordKey::Minus => {
+                    self.state = ChordState::Idle;
+                    ChordOutcome::InvalidChord {
+                        prefix,
+                        second: if input.key == ChordKey::Plus {
+                            '+'
+                        } else {
+                            '-'
+                        },
+                    }
+                }
                 ChordKey::Other | ChordKey::Escape => {
                     self.state = ChordState::Idle;
                     ChordOutcome::InvalidChord {
@@ -564,6 +855,10 @@ impl ChordDispatcher {
                 }
                 ChordKey::Space if !input.shift => {
                     ChordOutcome::Dispatched(WorkbenchAction::ToggleCrosshairLock)
+                }
+                ChordKey::Plus => ChordOutcome::Dispatched(WorkbenchAction::RaiseContourFloor),
+                ChordKey::Minus if !input.shift => {
+                    ChordOutcome::Dispatched(WorkbenchAction::LowerContourFloor)
                 }
                 ChordKey::QuestionMark => {
                     self.cheat_sheet_open = !self.cheat_sheet_open;
@@ -859,6 +1154,8 @@ fn egui_key_to_ascii_letter(key: egui::Key) -> Option<char> {
         egui::Key::X => Some('x'),
         egui::Key::Y => Some('y'),
         egui::Key::Z => Some('z'),
+        egui::Key::Num1 => Some('1'),
+        egui::Key::Num2 => Some('2'),
         _ => None,
     }
 }
@@ -894,6 +1191,10 @@ pub fn extract_egui_chord_inputs(events: &[egui::Event]) -> Vec<KeyChordInput> {
 
                 let mapped = if let Some(ch) = egui_key_to_ascii_letter(*key) {
                     ChordKey::Letter(ch)
+                } else if *key == egui::Key::Plus || (*key == egui::Key::Equals && !ctrl_or_cmd) {
+                    ChordKey::Plus
+                } else if *key == egui::Key::Minus && !ctrl_or_cmd {
+                    ChordKey::Minus
                 } else if *key == egui::Key::Space {
                     ChordKey::Space
                 } else if *key == egui::Key::Escape {
