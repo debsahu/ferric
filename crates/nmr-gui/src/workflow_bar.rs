@@ -1706,7 +1706,7 @@ pub fn draw_workflow_stepper(
                             egui::Color32::WHITE,
                         ),
                         StageStatus::Blocked => (
-                            "⚠",
+                            "!",
                             egui::Color32::from_rgb(96, 46, 28),
                             egui::Stroke::new(1.4, egui::Color32::from_rgb(245, 152, 76)),
                             egui::Color32::from_rgb(255, 222, 185),
@@ -1784,7 +1784,7 @@ pub fn draw_workflow_stepper(
                     };
                     let all_missing_hover = missing.join("\n• ");
                     ui.label(
-                        egui::RichText::new(format!("⚠ {first_missing}{extra}"))
+                        egui::RichText::new(format!("! {first_missing}{extra}"))
                             .size(11.0)
                             .color(egui::Color32::from_rgb(255, 198, 112)),
                     )
@@ -1925,11 +1925,11 @@ impl MobileProteinTab {
 
     pub const fn short_label(self) -> &'static str {
         match self {
-            Self::Contours2d => "🎯 2D",
-            Self::Strips => "📊 Strips",
-            Self::Structure3d => "🧊 3D PDB",
-            Self::Dynamics1d => "📈 Dyn / 1D",
-            Self::SeqAndTools => "🧬 Seq & Tools",
+            Self::Contours2d => "2D Contours",
+            Self::Strips => "3D Strips",
+            Self::Structure3d => "3D PDB",
+            Self::Dynamics1d => "Dyn / 1D",
+            Self::SeqAndTools => "Seq & Tools",
         }
     }
 }
@@ -1947,9 +1947,9 @@ impl MobileDynamicsSubTab {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::RelaxationS2 => "📈 Relax & S²",
-            Self::ExchangeCestCpmgCsp => "⚡ CEST / CPMG / CSP",
-            Self::Stack1d => "📚 1D Stack",
+            Self::RelaxationS2 => "Relax & S²",
+            Self::ExchangeCestCpmgCsp => "CEST / CPMG / CSP",
+            Self::Stack1d => "1D Stack",
         }
     }
 }
@@ -1977,10 +1977,10 @@ impl MobileChemTab {
 
     pub const fn short_label(self) -> &'static str {
         match self {
-            Self::Octet2dDraw => "✏️ Octet 2D",
-            Self::Multiplets1dQnmr => "📉 1D / qNMR",
-            Self::Dosy2d => "🌊 DOSY",
-            Self::Metabolomics => "🧪 Metab.",
+            Self::Octet2dDraw => "Structure 2D",
+            Self::Multiplets1dQnmr => "1D / qNMR",
+            Self::Dosy2d => "DOSY",
+            Self::Metabolomics => "Metabolomics",
         }
     }
 }
@@ -2127,6 +2127,10 @@ pub trait ResponsiveWorkbenchHost {
     fn is_1d_full_canvas(&self) -> bool {
         false
     }
+    fn show_workbook_sidebar(&self) -> bool {
+        false
+    }
+    fn draw_workbook_sidebar(&mut self, _ui: &mut egui::Ui) {}
 
     fn draw_desktop_mode_header(
         &mut self,
@@ -2222,20 +2226,20 @@ fn render_compact_mobile_shell<H: ResponsiveWorkbenchHost>(
                         ui.spacing_mut().item_spacing.x = 5.0;
                         ui.spacing_mut().interact_size.y = MOBILE_TOUCH_MIN_HEIGHT;
 
-                        let menu_btn = egui::Button::new(egui::RichText::new("☰").strong())
-                            .selected(shell.mobile_menu_open)
-                            .min_size(egui::vec2(34.0, MOBILE_TOUCH_MIN_HEIGHT));
+                        let menu_btn =
+                            egui::Button::new(egui::RichText::new("Menu").size(11.5).strong())
+                                .selected(shell.mobile_menu_open)
+                                .min_size(egui::vec2(48.0, MOBILE_TOUCH_MIN_HEIGHT));
                         if ui.add(menu_btn).clicked() {
                             shell.mobile_menu_open = !shell.mobile_menu_open;
                         }
 
                         let prot_selected =
                             shell.mobile_family == MobileWorkspaceFamily::ProteinNmr;
-                        let prot_btn = egui::Button::new(
-                            egui::RichText::new("🧬 Protein").size(12.0).strong(),
-                        )
-                        .selected(prot_selected)
-                        .min_size(egui::vec2(72.0, MOBILE_TOUCH_MIN_HEIGHT));
+                        let prot_btn =
+                            egui::Button::new(egui::RichText::new("Protein").size(12.0).strong())
+                                .selected(prot_selected)
+                                .min_size(egui::vec2(68.0, MOBILE_TOUCH_MIN_HEIGHT));
                         if ui.add(prot_btn).clicked() {
                             shell.mobile_family = MobileWorkspaceFamily::ProteinNmr;
                             host.set_host_workspace_mode(shell.target_host_mode());
@@ -2244,23 +2248,23 @@ fn render_compact_mobile_shell<H: ResponsiveWorkbenchHost>(
                         let chem_selected =
                             shell.mobile_family == MobileWorkspaceFamily::ChemStudio;
                         let chem_btn = egui::Button::new(
-                            egui::RichText::new("⚗️ ChemStudio").size(12.0).strong(),
+                            egui::RichText::new("Small Mol / 1D").size(12.0).strong(),
                         )
                         .selected(chem_selected)
-                        .min_size(egui::vec2(88.0, MOBILE_TOUCH_MIN_HEIGHT));
+                        .min_size(egui::vec2(96.0, MOBILE_TOUCH_MIN_HEIGHT));
                         if ui.add(chem_btn).clicked() {
                             shell.mobile_family = MobileWorkspaceFamily::ChemStudio;
                             host.set_host_workspace_mode(shell.target_host_mode());
                         }
 
                         let demo_btn = egui::Button::new(
-                            egui::RichText::new("🚀 Demo")
+                            egui::RichText::new("Samples")
                                 .size(12.0)
                                 .strong()
                                 .color(egui::Color32::from_rgb(18, 28, 22)),
                         )
                         .fill(egui::Color32::from_rgb(82, 224, 152))
-                        .min_size(egui::vec2(64.0, MOBILE_TOUCH_MIN_HEIGHT));
+                        .min_size(egui::vec2(66.0, MOBILE_TOUCH_MIN_HEIGHT));
                         if ui.add(demo_btn).clicked() {
                             trigger_demo = true;
                         }
@@ -2311,11 +2315,11 @@ fn render_compact_mobile_shell<H: ResponsiveWorkbenchHost>(
     }
     host.set_host_workspace_mode(shell.target_host_mode());
 
-    // Optional `☰` mobile popover drawer (clamped safely inside phone width)
+    // Optional mobile popover drawer (clamped safely inside phone width)
     if shell.mobile_menu_open {
         let mut open = shell.mobile_menu_open;
         let max_win_w = (content_rect.width() - 16.0).clamp(220.0, 340.0);
-        egui::Window::new("☰ Workbench Menu")
+        egui::Window::new("Workbench Menu")
             .id(egui::Id::unique("mobile_quick_drawer_window"))
             .open(&mut open)
             .collapsible(false)
@@ -2325,20 +2329,17 @@ fn render_compact_mobile_shell<H: ResponsiveWorkbenchHost>(
             .show(ctx, |ui| {
                 ui.spacing_mut().interact_size.y = MOBILE_TOUCH_MIN_HEIGHT;
                 let quick_items = [
-                    (
-                        "📋 Paste / Export Text",
-                        WorkbenchAction::OpenPasteTextModal,
-                    ),
-                    ("🗂 Ingest Matrix", WorkbenchAction::OpenIngestMatrix),
+                    ("Paste / Export Text", WorkbenchAction::OpenPasteTextModal),
+                    ("Ingest Matrix", WorkbenchAction::OpenIngestMatrix),
                     ("▶ Run Assignment", WorkbenchAction::RunBackboneAssignment),
-                    ("💾 Save NEF Session", WorkbenchAction::SaveSessionNef),
+                    ("Save NEF Session", WorkbenchAction::SaveSessionNef),
                     (
-                        "📊 HTML Quality Report",
+                        "HTML Quality Report",
                         WorkbenchAction::ExportQualityReportHtml,
                     ),
                     ("⌘ Command Palette", WorkbenchAction::OpenCommandPalette),
                     (
-                        "⌨ Keyboard Shortcuts",
+                        "Keyboard Shortcuts",
                         WorkbenchAction::OpenKeyboardCheatSheet,
                     ),
                 ];
@@ -2702,13 +2703,18 @@ fn render_desktop_full_shell<H: ResponsiveWorkbenchHost>(
 ) -> ResponsiveFrameMetrics {
     let readiness = host.workspace_readiness();
     let mut chrome_actions = Vec::new();
-    let top_resp = egui::Panel::top("workbench_phase9_chrome").show(ui, |ui| {
-        host.draw_desktop_mode_header(ui, None);
-        if host.show_workflow_guide() {
-            ui.add_space(2.0);
-            chrome_actions = draw_workbench_chrome(ui, &readiness);
-        }
-    });
+    let top_frame = egui::Frame::side_top_panel(ui.style())
+        .fill(egui::Color32::from_rgb(15, 21, 30))
+        .inner_margin(egui::Margin::symmetric(8, 4));
+    let top_resp = egui::Panel::top("workbench_phase9_chrome")
+        .frame(top_frame)
+        .show(ui, |ui| {
+            host.draw_desktop_mode_header(ui, None);
+            if host.show_workflow_guide() {
+                ui.add_space(2.0);
+                chrome_actions = draw_workbench_chrome(ui, &readiness);
+            }
+        });
     for act in chrome_actions {
         host.dispatch_chrome_action(ctx, act);
     }
@@ -2716,6 +2722,21 @@ fn render_desktop_full_shell<H: ResponsiveWorkbenchHost>(
     let status_resp = egui::Panel::bottom("workbench_status_bar").show(ui, |ui| {
         host.draw_desktop_status_bar(ui, now_ms);
     });
+
+    if host.show_workbook_sidebar() {
+        let sb_frame = egui::Frame::side_top_panel(ui.style())
+            .fill(egui::Color32::from_rgb(14, 19, 28))
+            .inner_margin(egui::Margin::symmetric(7, 6));
+        egui::Panel::left("workbook_spectra_sidebar")
+            .frame(sb_frame)
+            .default_size(crate::workbook::WORKBOOK_SIDEBAR_DEFAULT_WIDTH)
+            .min_size(168.0)
+            .max_size(272.0)
+            .resizable(true)
+            .show(ui, |ui| {
+                host.draw_workbook_sidebar(ui);
+            });
+    }
 
     let mut left_dock_rect: Option<egui::Rect> = None;
     let mut right_dock_rect: Option<egui::Rect> = None;
@@ -2730,10 +2751,11 @@ fn render_desktop_full_shell<H: ResponsiveWorkbenchHost>(
                 });
             }
 
+            let sb_open = host.show_workbook_sidebar();
             if host.show_strips_dock() && !host.is_1d_full_canvas() {
                 let r_resp = egui::Panel::right("right_strip_inspector")
-                    .default_size(400.0)
-                    .min_size(320.0)
+                    .default_size(if sb_open { 336.0 } else { 400.0 })
+                    .min_size(if sb_open { 276.0 } else { 320.0 })
                     .show(ui, |ui| {
                         host.draw_strips_inspector_view(ui);
                     });
@@ -2742,8 +2764,8 @@ fn render_desktop_full_shell<H: ResponsiveWorkbenchHost>(
 
             if host.show_mol3d_dock() && !host.is_1d_full_canvas() {
                 let l_resp = egui::Panel::left("mol3d_structure_dock")
-                    .default_size(390.0)
-                    .min_size(280.0)
+                    .default_size(if sb_open { 324.0 } else { 390.0 })
+                    .min_size(if sb_open { 248.0 } else { 280.0 })
                     .max_size(680.0)
                     .resizable(true)
                     .show(ui, |ui| {

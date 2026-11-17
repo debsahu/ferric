@@ -153,8 +153,20 @@ use nmr_gui::{
     sidechain_widget::{
         AssignedAtomInfo, SequenceRibbonState, SidechainInspectorPanel, SidechainWorkspaceInput,
     },
-    stack1d_panel::{build_kinetics_demo_traces, render_stack1d_panel, Stack1dState, Trace1d},
+    stack1d_panel::{
+        build_kinetics_demo_traces, export_stack1d_svg, render_stack1d_panel, InspectorTab1d,
+        Stack1dState, Stack1dViewMode, ToolMode1d, Trace1d,
+    },
     strip_tiler::{StripSpectra3D, StripTilerAction, StripTilerContext, StripTilerPanel},
+    workbook::{
+        build_showcase_small_molecule_13c_trace, build_showcase_small_molecule_1h_trace,
+        build_showcase_small_molecule_cosy_2d, chrome_icon_button, contour_palette_for_theme,
+        evaluate_2d_marginals, f1_ppm_to_screen_y, f2_ppm_to_screen_x, paint_f1_marginal_strip,
+        paint_f2_marginal_strip, paint_icon, rail_tool_button, render_workbook_sidebar,
+        ActiveWorkbookSelection, CanvasTheme2D, ToolMode2d, WorkbookIcon, WorkbookSidebarAction,
+        WorkbookState, WorkbookStudioKind, CANVAS_TOOL_RAIL_WIDTH, CONTOUR_SCROLL_STEP_RATIO,
+        MARGINAL_2D_STRIP_PX,
+    },
     workflow_bar::{
         draw_top_menu_bar, draw_workflow_stepper, render_responsive_workbench, HostWorkspaceMode,
         MobileChemTab, MobileWorkspaceFamily, ResponsiveShellState, ResponsiveWorkbenchHost,
@@ -1681,6 +1693,8 @@ struct NmrWorkbenchApp {
     show_workflow_guide: bool,
     show_advanced_protein_bar: bool,
     show_sequence_ribbon: bool,
+    paper_white_canvas: bool,
+    workbook: WorkbookState,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     show_native_global_open_bar: bool,
 
@@ -1882,11 +1896,13 @@ impl NmrWorkbenchApp {
             dynamics_panel: DynamicsStudioPanel::new(),
             show_dynamics_panel: false,
             stack1d_panel: Stack1dState::default(),
-            show_stack1d_panel: false,
-            show_strips_dock: true,
+            show_stack1d_panel: true,
+            show_strips_dock: false,
             show_workflow_guide: false,
             show_advanced_protein_bar: false,
             show_sequence_ribbon: true,
+            paper_white_canvas: true,
+            workbook: WorkbookState::default(),
             show_native_global_open_bar: false,
             hsqc_spec: None,
             hsqc_arc: Arc::new(Vec::new()),
@@ -1958,10 +1974,7 @@ impl NmrWorkbenchApp {
             pending_drop_outcome: Arc::new(std::sync::Mutex::new(None)),
         };
 
-        #[cfg(target_arch = "wasm32")]
         app.load_builtin_demo_suite();
-        #[cfg(not(target_arch = "wasm32"))]
-        app.load_demo_and_solve();
         app
     }
 
@@ -2241,6 +2254,8 @@ impl NmrWorkbenchApp {
         let hsqc = render_hsqc_2d(&self.peaks, &rcfg);
         self.hsqc_arc = Arc::new(hsqc.data.clone());
         self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+        self.workbook
+            .set_single_2d_page("15N-HSQC", hsqc.clone(), true);
         self.hsqc_spec = Some(hsqc);
         self.hncacb_3d = Some(render_triple_3d("HNCACB", &self.peaks, &rcfg));
         self.hnco_3d = Some(render_triple_3d("HNCO", &self.peaks, &rcfg));
@@ -2635,7 +2650,132 @@ impl NmrWorkbenchApp {
         );
         self.loaded_pdb_text = Some(DEMO_UBIQUITIN_1UBQ_PDB.to_string());
         self.has_structure_or_dynamics = true;
+        self.workspace_mode = WorkspaceMode::ProteinNmr;
+        self.show_stack1d_panel = false;
+        self.show_strips_dock = true;
         self.run_assignment();
+    }
+
+    fn load_small_molecule_1h_sample(&mut self) {
+        let (tr_1h, rois_1h) = build_showcase_small_molecule_1h_trace();
+        let mut tr_13c = build_showcase_small_molecule_13c_trace();
+        tr_13c.visible = false;
+        let mut stack = Stack1dState::with_traces(vec![tr_1h, tr_13c]);
+        stack.ref_trace_idx = 0;
+        stack.view_mode = Stack1dViewMode::SuperimposedOverlay;
+        stack.roi_regions = rois_1h;
+        stack.target_total_protons = 12.0;
+        stack.fit_full_ppm_bounds();
+        stack.refresh_active_trace_peaks_and_multiplets();
+        if !stack.detected_multiplet_integrals.is_empty() {
+            stack.normalize_multiplet_integral_to(0, 1.0);
+        }
+        self.stack1d_panel = stack;
+        self.activate_1d_studio_mode();
+        self.status_msg =
+            "Loaded small-molecule showcase: 600 MHz ¹H + 151 MHz ¹³C{¹H} (CDCl₃)".to_string();
+    }
+
+    fn load_kinetics_stack_sample(&mut self) {
+        let (traces, rois) = build_kinetics_demo_traces();
+        let mut stack = Stack1dState::with_traces(traces);
+        stack.view_mode = Stack1dViewMode::StackedOffset;
+        stack.roi_regions = rois;
+        stack.selected_inspector_tab = InspectorTab1d::MultiTraceStack;
+        stack.fit_full_ppm_bounds();
+        stack.refresh_active_trace_peaks_and_multiplets();
+        self.stack1d_panel = stack;
+        self.activate_1d_studio_mode();
+        self.status_msg = "Loaded 8-trace reaction kinetics 1D stack (A → B)".to_string();
+    }
+
+    fn save_live_2d_into_workbook(&mut self) {
+        if let Some(pg) = self.workbook.pages_2d.get_mut(self.workbook.active_2d_idx) {
+            pg.view_ppm = [
+                self.view_h_left,
+                self.view_h_right,
+                self.view_n_top,
+                self.view_n_bottom,
+            ];
+            pg.base_level = self.contour_base;
+            pg.noise_ref = self.contour_noise_ref;
+            pg.level_factor = self.contour_factor;
+            pg.num_levels = self.contour_levels;
+            pg.show_negative = self.show_negative;
+            pg.ppm_nudge = self.primary_ppm_nudge;
+        }
+    }
+
+    fn sync_overlay_layers_from_workbook(&mut self) {
+        self.overlay_layers = self
+            .workbook
+            .build_compatible_overlay_layers(self.paper_white_canvas);
+    }
+
+    fn activate_2d_workbook_page(&mut self, idx: usize) {
+        if idx >= self.workbook.pages_2d.len() {
+            return;
+        }
+        if !self.show_stack1d_panel && self.workspace_mode == WorkspaceMode::ProteinNmr {
+            self.save_live_2d_into_workbook();
+        }
+        self.workbook.active_2d_idx = idx;
+        let pg = self.workbook.pages_2d[idx].clone();
+        self.primary_2d_label = pg.title.clone();
+        self.primary_2d_visible = true;
+        self.primary_ppm_nudge = pg.ppm_nudge;
+        self.hsqc_arc = Arc::clone(&pg.data_arc);
+        self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+        self.hsqc_spec = Some(pg.spec);
+        self.view_h_left = pg.view_ppm[0];
+        self.view_h_right = pg.view_ppm[1];
+        self.view_n_top = pg.view_ppm[2];
+        self.view_n_bottom = pg.view_ppm[3];
+        self.contour_base = pg.base_level;
+        self.contour_noise_ref = pg.noise_ref;
+        self.contour_factor = pg.level_factor;
+        self.contour_levels = pg.num_levels;
+        self.show_negative = pg.show_negative;
+        self.workbook.two_d.zoom_history.clear();
+        self.box_zoom_2d_anchor = None;
+        self.crosshair.snap_to(
+            0.5 * (self.view_h_left as f64 + self.view_h_right as f64),
+            0.5 * (self.view_n_top as f64 + self.view_n_bottom as f64),
+            self.crosshair.c_ppm,
+        );
+        self.sync_overlay_layers_from_workbook();
+        self.workspace_mode = WorkspaceMode::ProteinNmr;
+        self.show_stack1d_panel = false;
+        self.show_relax_panel = false;
+        self.show_dynamics_panel = false;
+        let has_3d = self.hncacb_3d.is_some() || self.hnco_3d.is_some();
+        self.show_strips_dock = pg.has_3d_strips && has_3d;
+        if !pg.has_3d_strips {
+            self.show_mol3d_viewport = false;
+            self.responsive_shell.tablet_dock = TabletActiveDock::Hidden;
+        }
+        self.status_msg = format!("Viewing {}", pg.title);
+    }
+
+    fn activate_1d_workbook_page(&mut self, idx: usize) {
+        if idx >= self.stack1d_panel.traces.len() {
+            return;
+        }
+        if !self.show_stack1d_panel && self.workspace_mode == WorkspaceMode::ProteinNmr {
+            self.save_live_2d_into_workbook();
+        }
+        for (k, tr) in self.stack1d_panel.traces.iter_mut().enumerate() {
+            tr.visible = k == idx;
+        }
+        self.stack1d_panel.ref_trace_idx = idx;
+        self.stack1d_panel.view_mode = Stack1dViewMode::SuperimposedOverlay;
+        self.stack1d_panel.fit_full_ppm_bounds();
+        self.stack1d_panel.y_gain = 1.0;
+        self.stack1d_panel
+            .refresh_active_trace_peaks_and_multiplets();
+        let lbl = self.stack1d_panel.traces[idx].label.clone();
+        self.activate_1d_studio_mode();
+        self.status_msg = format!("Viewing {lbl}");
     }
 
     fn load_builtin_demo_suite(&mut self) {
@@ -2667,21 +2807,55 @@ impl NmrWorkbenchApp {
                 self.unprocessed_fids_remaining = 0;
                 self.exported_in_session = false;
 
-                self.hsqc_arc = Arc::new(suite.hsqc_2d.data.clone());
+                let ubiq_hsqc = suite.hsqc_2d;
+                self.hsqc_arc = Arc::new(ubiq_hsqc.data.clone());
                 self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
-                self.hsqc_spec = Some(suite.hsqc_2d);
+                self.hsqc_spec = Some(ubiq_hsqc.clone());
                 self.hncacb_3d = Some(suite.hncacb_3d);
                 self.hnco_3d = Some(suite.hnco_3d);
                 self.extra_3d_count = 0;
                 self.overlay_layers.clear();
-                self.primary_2d_label = "15N-HSQC".to_string();
+                self.primary_2d_label = "20 · Ubiquitin 2D ¹H–¹⁵N HSQC".to_string();
                 self.primary_2d_visible = true;
                 self.primary_ppm_nudge = [0.0, 0.0];
                 self.reset_view_to_spec();
 
+                // Register clean multi-page 2D workbook entries:
+                // 0: Small-molecule 2D 1H-1H COSY (paired with Page 1 1D 1H)
+                // 1: Ubiquitin 2D 1H-15N HSQC (+ 3D HNCACB/HNCO strips)
+                self.workbook.clear_2d_pages();
+                let cosy_2d = build_showcase_small_molecule_cosy_2d();
+                let _ = self
+                    .workbook
+                    .add_2d_page("12 · 2D ¹H–¹H COSY", cosy_2d, false, false);
+                let hsqc_page_idx = self.workbook.add_2d_page(
+                    "20 · Ubiquitin 2D ¹H–¹⁵N HSQC",
+                    ubiq_hsqc,
+                    false,
+                    true,
+                );
+                self.workbook.active_2d_idx = hsqc_page_idx;
+                self.save_live_2d_into_workbook();
+
                 self.mol3d_panel = suite.mol3d_panel;
                 self.loaded_pdb_text = Some(suite.pdb_text.to_string());
-                self.stack1d_panel = suite.stack1d_panel;
+
+                // Prepend clean small-molecule 1D 1H (Page 1) & 1D 13C (Page 2) for calm default launch
+                let (tr_1h, rois_1h) = build_showcase_small_molecule_1h_trace();
+                let mut tr_13c = build_showcase_small_molecule_13c_trace();
+                tr_13c.visible = false;
+                let mut stack = Stack1dState::with_traces(vec![tr_1h, tr_13c]);
+                stack.ref_trace_idx = 0;
+                stack.view_mode = Stack1dViewMode::SuperimposedOverlay;
+                stack.roi_regions = rois_1h;
+                stack.target_total_protons = 12.0;
+                stack.fit_full_ppm_bounds();
+                stack.refresh_active_trace_peaks_and_multiplets();
+                if !stack.detected_multiplet_integrals.is_empty() {
+                    stack.normalize_multiplet_integral_to(0, 1.0);
+                }
+                self.stack1d_panel = stack;
+
                 self.dosy_panel = suite.dosy_panel;
                 self.metabolomics_panel = suite.metabolomics_panel;
                 let _ = self.relax_panel.load_demo_dynamics(
@@ -2698,6 +2872,14 @@ impl NmrWorkbenchApp {
                 self.rebuild_systems_and_matrices();
                 self.refresh_propensity_report();
                 self.run_assignment();
+
+                // Calm Default Startup: open cleanly onto Page 1 (1D 1H Small Molecule) with side docks tucked away
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.show_stack1d_panel = true;
+                self.show_mol3d_viewport = false;
+                self.show_strips_dock = false;
+                self.show_relax_panel = false;
+                self.show_dynamics_panel = false;
                 self.status_msg = banner;
             }
             Err(err) => {
@@ -3760,8 +3942,11 @@ impl NmrWorkbenchApp {
         self.primary_ppm_nudge = [0.0, 0.0];
         self.hsqc_arc = Arc::new(spec.data.clone());
         self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+        self.workbook
+            .set_single_2d_page(label.clone(), spec.clone(), false);
         self.hsqc_spec = Some(spec);
         self.reset_view_to_spec();
+        self.save_live_2d_into_workbook();
         self.workspace_mode = WorkspaceMode::ProteinNmr;
         self.show_stack1d_panel = false;
         self.show_relax_panel = false;
@@ -4260,7 +4445,194 @@ impl NmrWorkbenchApp {
         self.responsive_shell.chem_tab = MobileChemTab::Multiplets1dQnmr;
     }
 
+    fn current_workbook_selection(&self) -> ActiveWorkbookSelection {
+        match self.workspace_mode {
+            WorkspaceMode::OctetChem => {
+                ActiveWorkbookSelection::Studio(WorkbookStudioKind::ChemicalStructure)
+            }
+            WorkspaceMode::Dosy => {
+                ActiveWorkbookSelection::Studio(WorkbookStudioKind::DosyDiffusion)
+            }
+            WorkspaceMode::Metabolomics => {
+                ActiveWorkbookSelection::Studio(WorkbookStudioKind::MetabolomicsCohort)
+            }
+            WorkspaceMode::ProteinNmr => {
+                if self.show_relax_panel || self.show_dynamics_panel {
+                    ActiveWorkbookSelection::Studio(WorkbookStudioKind::RelaxationDynamics)
+                } else if self.show_stack1d_panel {
+                    let idx = self
+                        .stack1d_panel
+                        .ref_trace_idx
+                        .min(self.stack1d_panel.traces.len().saturating_sub(1));
+                    ActiveWorkbookSelection::Trace1D(idx)
+                } else {
+                    ActiveWorkbookSelection::Spectrum2D(self.workbook.active_2d_idx)
+                }
+            }
+        }
+    }
+
+    fn handle_workbook_sidebar_actions(&mut self, actions: Vec<WorkbookSidebarAction>) {
+        for action in actions {
+            match action {
+                WorkbookSidebarAction::Select1dPage(idx) => {
+                    self.activate_1d_workbook_page(idx);
+                }
+                WorkbookSidebarAction::Toggle1dOverlay(idx) => {
+                    if let Some(tr) = self.stack1d_panel.traces.get_mut(idx) {
+                        tr.visible = !tr.visible;
+                        let now_vis = tr.visible;
+                        let lbl = tr.label.clone();
+                        let vis_count = self
+                            .stack1d_panel
+                            .traces
+                            .iter()
+                            .filter(|t| t.visible)
+                            .count();
+                        self.status_msg = if now_vis {
+                            format!("Superimposed '{lbl}' ({vis_count} visible 1D traces)")
+                        } else {
+                            format!("Hid '{lbl}' from 1D overlay")
+                        };
+                    }
+                }
+                WorkbookSidebarAction::Remove1dPage(idx) => {
+                    if idx < self.stack1d_panel.traces.len() {
+                        let removed = self.stack1d_panel.traces.remove(idx);
+                        if self.stack1d_panel.traces.is_empty() {
+                            self.stack1d_panel.ref_trace_idx = 0;
+                            if !self.workbook.pages_2d.is_empty() {
+                                self.activate_2d_workbook_page(
+                                    self.workbook
+                                        .active_2d_idx
+                                        .min(self.workbook.pages_2d.len() - 1),
+                                );
+                            }
+                        } else {
+                            let next_idx = self
+                                .stack1d_panel
+                                .ref_trace_idx
+                                .min(self.stack1d_panel.traces.len() - 1);
+                            self.activate_1d_workbook_page(next_idx);
+                        }
+                        self.status_msg = format!("Closed 1D page '{}'", removed.label);
+                    }
+                }
+                WorkbookSidebarAction::Select2dPage(idx) => {
+                    self.activate_2d_workbook_page(idx);
+                }
+                WorkbookSidebarAction::Toggle2dOverlay(idx) => {
+                    if let Some(pg) = self.workbook.pages_2d.get_mut(idx) {
+                        pg.overlay_enabled = !pg.overlay_enabled;
+                        let enabled = pg.overlay_enabled;
+                        let title = pg.title.clone();
+                        self.sync_overlay_layers_from_workbook();
+                        self.status_msg = if enabled {
+                            format!("Enabled 2D GPU contour overlay: '{title}'")
+                        } else {
+                            format!("Hid 2D contour overlay: '{title}'")
+                        };
+                    }
+                }
+                WorkbookSidebarAction::Remove2dPage(idx) => {
+                    if idx < self.workbook.pages_2d.len() {
+                        let removed = self.workbook.pages_2d.remove(idx);
+                        if self.workbook.pages_2d.is_empty() {
+                            self.hsqc_spec = None;
+                            self.hsqc_arc = Arc::new(Vec::new());
+                            self.overlay_layers.clear();
+                            if !self.stack1d_panel.traces.is_empty() {
+                                self.activate_1d_workbook_page(0);
+                            }
+                        } else {
+                            let next = self
+                                .workbook
+                                .active_2d_idx
+                                .min(self.workbook.pages_2d.len() - 1);
+                            self.activate_2d_workbook_page(next);
+                        }
+                        self.status_msg = format!("Closed 2D page '{}'", removed.title);
+                    }
+                }
+                WorkbookSidebarAction::OpenStudio(kind) => match kind {
+                    WorkbookStudioKind::ChemicalStructure => {
+                        self.workspace_mode = WorkspaceMode::OctetChem;
+                        self.show_stack1d_panel = false;
+                    }
+                    WorkbookStudioKind::Protein3dStrips => {
+                        let protein_idx = self
+                            .workbook
+                            .pages_2d
+                            .iter()
+                            .position(|p| p.has_3d_strips)
+                            .unwrap_or(self.workbook.active_2d_idx);
+                        if !self.workbook.pages_2d.is_empty() {
+                            self.activate_2d_workbook_page(protein_idx);
+                        } else {
+                            self.workspace_mode = WorkspaceMode::ProteinNmr;
+                            self.show_stack1d_panel = false;
+                        }
+                        self.show_strips_dock = !self.show_strips_dock;
+                    }
+                    WorkbookStudioKind::Biomolecular3dPdb => {
+                        if self.show_stack1d_panel
+                            || self.workspace_mode != WorkspaceMode::ProteinNmr
+                        {
+                            let protein_idx = self
+                                .workbook
+                                .pages_2d
+                                .iter()
+                                .position(|p| p.has_3d_strips)
+                                .unwrap_or(self.workbook.active_2d_idx);
+                            if !self.workbook.pages_2d.is_empty() {
+                                self.activate_2d_workbook_page(protein_idx);
+                            } else {
+                                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                                self.show_stack1d_panel = false;
+                            }
+                        }
+                        self.show_mol3d_viewport = !self.show_mol3d_viewport;
+                    }
+                    WorkbookStudioKind::RelaxationDynamics => {
+                        self.workspace_mode = WorkspaceMode::ProteinNmr;
+                        self.show_stack1d_panel = false;
+                        self.show_relax_panel = true;
+                        self.show_dynamics_panel = false;
+                    }
+                    WorkbookStudioKind::DosyDiffusion => {
+                        if self.dosy_panel.peaks.is_empty() {
+                            self.dosy_panel = DosyPanelState::with_synthetic_demo();
+                        }
+                        self.workspace_mode = WorkspaceMode::Dosy;
+                        self.show_stack1d_panel = false;
+                    }
+                    WorkbookStudioKind::MetabolomicsCohort => {
+                        if self.metabolomics_panel.samples.is_empty() {
+                            self.metabolomics_panel.load_demo_cohort();
+                        }
+                        self.workspace_mode = WorkspaceMode::Metabolomics;
+                        self.show_stack1d_panel = false;
+                    }
+                },
+                WorkbookSidebarAction::TriggerOpenFiles => {
+                    #[cfg(target_arch = "wasm32")]
+                    trigger_browser_files_picker();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        self.show_native_global_open_bar = true;
+                    }
+                }
+            }
+        }
+    }
+
     fn render_and_sync_stack1d_panel(&mut self, ui: &mut egui::Ui) {
+        ui.ctx().data_mut(|d| {
+            d.insert_temp::<(bool, bool)>(
+                egui::Id::unique("ferric_wb_cfg"),
+                (true, self.paper_white_canvas),
+            );
+        });
         render_stack1d_panel(ui, &mut self.stack1d_panel);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(p_str) = self.stack1d_panel.pending_open_native_path.take() {
@@ -4509,161 +4881,462 @@ impl NmrWorkbenchApp {
         self.show_text_io_modal = open;
     }
 
+    fn is_protein_2d_context(&self) -> bool {
+        if self.show_stack1d_panel || self.workspace_mode != WorkspaceMode::ProteinNmr {
+            return false;
+        }
+        if self.show_relax_panel || self.show_dynamics_panel {
+            return true;
+        }
+        let (nx, ny) = self.active_2d_nuclei();
+        let page_has_3d = self
+            .workbook
+            .pages_2d
+            .get(self.workbook.active_2d_idx)
+            .is_some_and(|p| p.has_3d_strips);
+        page_has_3d || (nx == "1H" && ny == "15N") || (nx == "13C" && ny == "15N")
+    }
+
+    fn export_active_svg_action(&mut self, ctx: &egui::Context) {
+        if self.is_1d_studio_active() && !self.stack1d_panel.traces.is_empty() {
+            let svg = export_stack1d_svg(&self.stack1d_panel, 1280, 680);
+            self.stack1d_panel.last_exported_svg = Some(svg.clone());
+            self.export_text_buf = svg.clone();
+            ctx.copy_text(svg);
+            self.show_text_io_modal = true;
+            self.status_msg =
+                "Exported 1D publication vector SVG (copied to clipboard)".to_string();
+        } else if self.workspace_mode == WorkspaceMode::OctetChem {
+            let svg = render_scene_svg(&self.octet_app.scene, &self.octet_app.style);
+            self.export_text_buf = svg.clone();
+            ctx.copy_text(svg);
+            self.show_text_io_modal = true;
+            self.status_msg = "Exported chemical structure vector SVG".to_string();
+        } else {
+            self.export_results(ctx);
+        }
+    }
+
+    fn clear_workbook_all(&mut self) {
+        self.stack1d_panel = Stack1dState::default();
+        self.workbook.clear_2d_pages();
+        self.hsqc_spec = None;
+        self.hsqc_arc = Arc::new(Vec::new());
+        self.overlay_layers.clear();
+        self.clear_stale_protein_demo_state(false, false);
+        self.workspace_mode = WorkspaceMode::ProteinNmr;
+        self.show_stack1d_panel = true;
+        self.status_msg = "Cleared workbook — open or drop spectra to begin".to_string();
+    }
+
     fn draw_workspace_mode_header(
         &mut self,
         ui: &mut egui::Ui,
         tablet_dock: Option<&mut TabletActiveDock>,
     ) {
-        ui.horizontal_wrapped(|ui| {
-            ui.heading(
+        let ctx = ui.ctx().clone();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+
+            // Left: Collapsible Spectra Sidebar Toggle | FERRIC Wordmark | Classic Menus
+            if chrome_icon_button(
+                ui,
+                WorkbookIcon::SidebarToggle,
+                None,
+                self.workbook.show_sidebar,
+                "Show / hide left Spectra workbook pages sidebar",
+                26.0,
+            )
+            .clicked()
+            {
+                self.workbook.show_sidebar = !self.workbook.show_sidebar;
+            }
+
+            ui.add_space(2.0);
+            ui.label(
                 egui::RichText::new("FERRIC")
+                    .size(13.5)
                     .strong()
-                    .color(egui::Color32::from_rgb(110, 220, 255)),
+                    .color(egui::Color32::from_rgb(241, 245, 249)),
             );
-            if let Some(label) = &self.adapter_label {
-                ui.label(
-                    egui::RichText::new(format!("⚡ {label}"))
-                        .small()
-                        .color(egui::Color32::from_rgb(130, 230, 175)),
-                );
-            }
             ui.separator();
 
-            // 5 concise top-level Studio Tabs (1D NMR promoted to first-class tab)
-            let is_1d_tab = self.is_1d_studio_active();
-            let is_prot_tab =
-                self.workspace_mode == WorkspaceMode::ProteinNmr && !self.show_stack1d_panel;
-            if ui
-                .selectable_label(is_1d_tab, egui::RichText::new("📈 1D NMR").strong())
-                .on_hover_text("Full-width 1D NMR Studio: Bruker fid/1r, JCAMP, phase, baseline, multiplets & ACS/JOC report")
-                .clicked()
-            {
-                self.workspace_mode = WorkspaceMode::ProteinNmr;
-                self.show_stack1d_panel = true;
-                self.show_relax_panel = false;
-                self.show_dynamics_panel = false;
-                if self.stack1d_panel.traces.is_empty() {
-                    let (traces, rois) = build_kinetics_demo_traces();
-                    self.stack1d_panel = Stack1dState::with_traces(traces);
-                    self.stack1d_panel.roi_regions = rois;
+            // --- Classic Clean Top Dropdown Menus: File | Process | Analyze | View ---
+            ui.menu_button("File", |ui| {
+                ui.set_min_width(220.0);
+                if ui.button("Open Folder…").clicked() {
+                    ui.close();
+                    #[cfg(target_arch = "wasm32")]
+                    trigger_browser_folder_picker();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        self.show_native_global_open_bar = true;
+                    }
                 }
-            }
-            if ui
-                .selectable_label(
-                    is_prot_tab,
-                    egui::RichText::new("🧬 2D/3D Protein").strong(),
-                )
-                .on_hover_text("2D HSQC contours, 3D HNCACB/HNCO strips, automated assignment & 3D structure")
-                .clicked()
-            {
-                self.workspace_mode = WorkspaceMode::ProteinNmr;
-                self.show_stack1d_panel = false;
-            }
-            if ui
-                .selectable_value(
-                    &mut self.workspace_mode,
-                    WorkspaceMode::OctetChem,
-                    egui::RichText::new("⚗️ Chemical Draw").strong(),
-                )
-                .clicked()
-            {
-                self.show_stack1d_panel = false;
-            }
-            if ui
-                .selectable_value(
-                    &mut self.workspace_mode,
-                    WorkspaceMode::Dosy,
-                    egui::RichText::new("🌊 DOSY").strong(),
-                )
-                .clicked()
-            {
-                self.show_stack1d_panel = false;
-            }
-            if ui
-                .selectable_value(
-                    &mut self.workspace_mode,
-                    WorkspaceMode::Metabolomics,
-                    egui::RichText::new("🧪 Metabolomics").strong(),
-                )
-                .clicked()
-            {
-                self.show_stack1d_panel = false;
-            }
+                if ui.button("Open Files / Archive…").clicked() {
+                    ui.close();
+                    #[cfg(target_arch = "wasm32")]
+                    trigger_browser_files_picker();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        self.show_native_global_open_bar = true;
+                    }
+                }
+                if ui.button("Experiment Selection Matrix…").clicked() {
+                    ui.close();
+                    self.ingest_panel.open = true;
+                }
+                ui.separator();
+                ui.menu_button("Samples", |ui| {
+                    ui.set_min_width(235.0);
+                    if ui.button("1D ¹H Small Molecule (600 MHz)").clicked() {
+                        ui.close();
+                        self.load_small_molecule_1h_sample();
+                    }
+                    if ui.button("1D Reaction Kinetics Stack").clicked() {
+                        ui.close();
+                        self.load_kinetics_stack_sample();
+                    }
+                    if ui.button("2D Ubiquitin HSQC + 3D HNCACB").clicked() {
+                        ui.close();
+                        self.load_builtin_demo_suite();
+                        let hsqc_idx = self
+                            .workbook
+                            .pages_2d
+                            .iter()
+                            .position(|p| p.has_3d_strips)
+                            .unwrap_or(0);
+                        self.activate_2d_workbook_page(hsqc_idx);
+                    }
+                    if ui.button("2D DOSY Diffusion Mixture").clicked() {
+                        ui.close();
+                        if self.dosy_panel.peaks.is_empty() {
+                            self.dosy_panel = DosyPanelState::with_synthetic_demo();
+                        }
+                        self.workspace_mode = WorkspaceMode::Dosy;
+                        self.show_stack1d_panel = false;
+                    }
+                    if ui.button("Metabolomics Cohort (PCA / OPLS-DA)").clicked() {
+                        ui.close();
+                        if self.metabolomics_panel.samples.is_empty() {
+                            self.metabolomics_panel.load_demo_cohort();
+                        }
+                        self.workspace_mode = WorkspaceMode::Metabolomics;
+                        self.show_stack1d_panel = false;
+                    }
+                });
+                ui.separator();
+                if ui.button("Paste NMR-STAR / TSV…").clicked() {
+                    ui.close();
+                    self.show_text_io_modal = true;
+                }
+                if ui.button("Save Session (.nef)").clicked() {
+                    ui.close();
+                    self.save_session_nef_action(&ctx);
+                }
+                if ui.button("Export Vector SVG").clicked() {
+                    ui.close();
+                    self.export_active_svg_action(&ctx);
+                }
+                ui.separator();
+                if ui.button("Clear Workbook").clicked() {
+                    ui.close();
+                    self.clear_workbook_all();
+                }
+            });
 
-            if let Some(dock) = tablet_dock {
-                if is_prot_tab {
-                    ui.separator();
-                    ui.selectable_value(dock, TabletActiveDock::StripsRight, "📊 Strips");
-                    ui.selectable_value(dock, TabletActiveDock::Mol3dLeft, "🧊 3D");
-                    ui.selectable_value(dock, TabletActiveDock::Hidden, "⬜ Full");
+            ui.menu_button("Process", |ui| {
+                ui.set_min_width(220.0);
+                if ui.button("Auto-Phase").clicked() {
+                    ui.close();
+                    if self.is_1d_studio_active() && !self.stack1d_panel.traces.is_empty() {
+                        self.stack1d_panel.auto_phase_active_trace();
+                        self.status_msg = self.stack1d_panel.status_message.clone();
+                    } else {
+                        self.dispatch_workbench_action(&ctx, WorkbenchAction::AutoPhaseDirect1D);
+                    }
                 }
-            }
+                if ui.button("Interactive Phase (P)").clicked() {
+                    ui.close();
+                    if !self.stack1d_panel.traces.is_empty() {
+                        self.activate_1d_studio_mode();
+                        self.stack1d_panel.show_1d_analysis_drawer = true;
+                        self.stack1d_panel.selected_inspector_tab = InspectorTab1d::PhaseBaseline;
+                        ctx.input_mut(|i| {
+                            i.events.push(egui::Event::Key {
+                                key: egui::Key::P,
+                                physical_key: Some(egui::Key::P),
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            });
+                        });
+                    }
+                }
+                if ui.button("Baseline Correction (Whittaker)").clicked() {
+                    ui.close();
+                    if self.is_1d_studio_active() && !self.stack1d_panel.traces.is_empty() {
+                        self.stack1d_panel.baseline_correct_active_trace();
+                        self.status_msg = self.stack1d_panel.status_message.clone();
+                    } else {
+                        self.dispatch_workbench_action(&ctx, WorkbenchAction::ApplyMedianBaseline);
+                    }
+                }
+                if ui.button("Solvent Reference…").clicked() {
+                    ui.close();
+                    if self.is_1d_studio_active() && !self.stack1d_panel.traces.is_empty() {
+                        self.stack1d_panel.calibrate_solvent_active_trace();
+                        self.status_msg = self.stack1d_panel.status_message.clone();
+                    } else {
+                        self.show_overlay_manager = true;
+                    }
+                }
+            });
 
-            ui.separator();
-            if ui
-                .button("📂 Open Folder")
-                .on_hover_text("Open a Bruker study / expno / pdata folder (1D, 2D, or 3D)")
-                .clicked()
-            {
-                #[cfg(target_arch = "wasm32")]
-                trigger_browser_folder_picker();
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    self.show_native_global_open_bar = !self.show_native_global_open_bar;
+            ui.menu_button("Analyze", |ui| {
+                ui.set_min_width(230.0);
+                if ui.button("Auto-Pick Peaks").clicked() {
+                    ui.close();
+                    if self.is_1d_studio_active() {
+                        self.stack1d_panel.refresh_active_trace_peaks_and_multiplets();
+                        self.status_msg = format!(
+                            "Picked {} 1D peaks",
+                            self.stack1d_panel.picked_peaks.len()
+                        );
+                    } else {
+                        self.pick_2d_roots();
+                    }
                 }
-            }
-            if ui
-                .button("📄 Open Files")
-                .on_hover_text("Open .zip/.tar.gz archive, .str/.nef/.tsv, .jdx, .ucsf/.ft2, .pdb/.cif, or .mol/.sdf")
-                .clicked()
-            {
-                #[cfg(target_arch = "wasm32")]
-                trigger_browser_files_picker();
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    self.show_native_global_open_bar = !self.show_native_global_open_bar;
+                if ui.button("Multiplet & J-Tree Analysis").clicked() {
+                    ui.close();
+                    if !self.stack1d_panel.traces.is_empty() {
+                        self.activate_1d_studio_mode();
+                        self.stack1d_panel.show_multiplet_boxes = true;
+                        self.stack1d_panel.show_j_trees = true;
+                        self.stack1d_panel.show_1d_analysis_drawer = true;
+                        self.stack1d_panel.selected_inspector_tab = InspectorTab1d::Multiplets;
+                        self.stack1d_panel.refresh_active_trace_peaks_and_multiplets();
+                    }
                 }
-            }
-            if ui
-                .button("🚀 Demo")
-                .on_hover_text("Load built-in Ubiquitin 2D/3D + 1UBQ + 1D + DOSY + Metabolomics demo suite")
-                .clicked()
-            {
-                self.load_builtin_demo_suite();
-            }
-            ui.toggle_value(&mut self.show_workflow_guide, "🧭 Guide")
-                .on_hover_text("Toggle step-by-step workflow bar & File/Edit/View menus");
-            if ui
-                .button("⌘K")
-                .on_hover_text("Open Command Palette (Cmd/Ctrl+K)")
-                .clicked()
-            {
-                self.command_palette.open = !self.command_palette.open;
-            }
-            if ui
-                .button("?")
-                .on_hover_text("About FERRIC & Keyboard Shortcuts")
-                .clicked()
-            {
-                self.show_about_modal = !self.show_about_modal;
-            }
+                if ui.button("Integrate Regions").clicked() {
+                    ui.close();
+                    if !self.stack1d_panel.traces.is_empty() {
+                        self.activate_1d_studio_mode();
+                        self.stack1d_panel.tool_mode = ToolMode1d::IntegrateRoi;
+                        self.stack1d_panel.show_integral_curves = true;
+                    }
+                }
+                ui.separator();
+                if ui.button("Run 3D Backbone Assignment").clicked() {
+                    ui.close();
+                    let hsqc_idx = self
+                        .workbook
+                        .pages_2d
+                        .iter()
+                        .position(|p| p.has_3d_strips)
+                        .unwrap_or(self.workbook.active_2d_idx);
+                    if !self.workbook.pages_2d.is_empty() {
+                        self.activate_2d_workbook_page(hsqc_idx);
+                    } else {
+                        self.workspace_mode = WorkspaceMode::ProteinNmr;
+                        self.show_stack1d_panel = false;
+                    }
+                    self.run_assignment();
+                }
+                ui.separator();
+                if ui.button("Open Chemical Structure").clicked() {
+                    ui.close();
+                    self.workspace_mode = WorkspaceMode::OctetChem;
+                    self.show_stack1d_panel = false;
+                }
+                if ui.button("Open DOSY Studio").clicked() {
+                    ui.close();
+                    if self.dosy_panel.peaks.is_empty() {
+                        self.dosy_panel = DosyPanelState::with_synthetic_demo();
+                    }
+                    self.workspace_mode = WorkspaceMode::Dosy;
+                    self.show_stack1d_panel = false;
+                }
+                if ui.button("Open Metabolomics Studio").clicked() {
+                    ui.close();
+                    if self.metabolomics_panel.samples.is_empty() {
+                        self.metabolomics_panel.load_demo_cohort();
+                    }
+                    self.workspace_mode = WorkspaceMode::Metabolomics;
+                    self.show_stack1d_panel = false;
+                }
+            });
 
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let bridge_running = self.mcp_bridge.is_running();
-                let mcp_lbl = if bridge_running { "🔌 MCP ●" } else { "🔌 MCP" };
+            ui.menu_button("View", |ui| {
+                ui.set_min_width(225.0);
                 if ui
-                    .selectable_label(self.show_mcp_bridge_window || bridge_running, mcp_lbl)
-                    .on_hover_text("Local 127.0.0.1 MCP live workbench bridge & client config")
+                    .radio_value(
+                        &mut self.paper_white_canvas,
+                        true,
+                        "Paper White Canvas",
+                    )
                     .clicked()
                 {
-                    self.show_mcp_bridge_window = !self.show_mcp_bridge_window;
+                    self.sync_overlay_layers_from_workbook();
+                    ui.close();
+                }
+                if ui
+                    .radio_value(
+                        &mut self.paper_white_canvas,
+                        false,
+                        "Dark Oscilloscope Canvas",
+                    )
+                    .clicked()
+                {
+                    self.sync_overlay_layers_from_workbook();
+                    ui.close();
+                }
+                ui.separator();
+                ui.checkbox(&mut self.workbook.show_sidebar, "Spectra Sidebar");
+                if self.is_1d_studio_active() {
+                    ui.checkbox(&mut self.stack1d_panel.show_peak_labels, "Peak Labels");
+                } else {
+                    ui.checkbox(&mut self.show_peak_labels, "Peak Labels");
+                }
+                ui.checkbox(&mut self.stack1d_panel.show_integral_curves, "Integrals");
+                let mut mult_j =
+                    self.stack1d_panel.show_multiplet_boxes && self.stack1d_panel.show_j_trees;
+                if ui
+                    .checkbox(&mut mult_j, "Multiplet Boxes & J-Trees")
+                    .changed()
+                {
+                    self.stack1d_panel.show_multiplet_boxes = mult_j;
+                    self.stack1d_panel.show_j_trees = mult_j;
+                }
+                ui.checkbox(&mut self.workbook.two_d.show_params_card, "Parameters Card");
+                ui.checkbox(&mut self.stack1d_panel.show_1d_analysis_drawer, "Bottom Table");
+                ui.checkbox(
+                    &mut self.workbook.two_d.show_projections,
+                    "2D F2/F1 Projections",
+                );
+                ui.separator();
+                ui.checkbox(&mut self.show_mol3d_viewport, "3D Structure Dock");
+                ui.checkbox(&mut self.show_strips_dock, "3D Strips Dock");
+                ui.checkbox(&mut self.show_workflow_guide, "Workflow Stepper");
+            });
+
+            if let Some(dock) = tablet_dock {
+                if self.is_protein_2d_context() {
+                    ui.separator();
+                    ui.selectable_value(dock, TabletActiveDock::StripsRight, "Strips");
+                    ui.selectable_value(dock, TabletActiveDock::Mol3dLeft, "3D");
+                    ui.selectable_value(dock, TabletActiveDock::Hidden, "Full");
                 }
             }
+
+            // --- Right Side Segmented Instrument Controls ---
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+
+                if chrome_icon_button(
+                    ui,
+                    WorkbookIcon::HelpQuestion,
+                    None,
+                    self.show_about_modal,
+                    "About FERRIC & Keyboard Shortcuts (?)",
+                    26.0,
+                )
+                .clicked()
+                {
+                    self.show_about_modal = !self.show_about_modal;
+                }
+
+                if chrome_icon_button(
+                    ui,
+                    WorkbookIcon::CommandKey,
+                    Some("Cmd+K"),
+                    self.command_palette.open,
+                    "Open Fuzzy Command Palette (Cmd/Ctrl+K)",
+                    26.0,
+                )
+                .clicked()
+                {
+                    self.command_palette.open = !self.command_palette.open;
+                }
+
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let bridge_running = self.mcp_bridge.is_running();
+                    let mcp_lbl = if bridge_running { "MCP ●" } else { "MCP" };
+                    if chrome_icon_button(
+                        ui,
+                        WorkbookIcon::SlidersTune,
+                        Some(mcp_lbl),
+                        self.show_mcp_bridge_window || bridge_running,
+                        "Local 127.0.0.1 MCP live workbench bridge",
+                        26.0,
+                    )
+                    .clicked()
+                    {
+                        self.show_mcp_bridge_window = !self.show_mcp_bridge_window;
+                    }
+                }
+
+                let (theme_icon, theme_lbl) = if self.paper_white_canvas {
+                    (WorkbookIcon::SunPaper, "Paper")
+                } else {
+                    (WorkbookIcon::MoonDark, "Dark")
+                };
+                if chrome_icon_button(
+                    ui,
+                    theme_icon,
+                    Some(theme_lbl),
+                    false,
+                    "Toggle spectrum canvas between Publication Paper White and Dark Oscilloscope",
+                    26.0,
+                )
+                .clicked()
+                {
+                    self.paper_white_canvas = !self.paper_white_canvas;
+                    self.sync_overlay_layers_from_workbook();
+                }
+
+                if chrome_icon_button(
+                    ui,
+                    WorkbookIcon::FileDoc,
+                    Some("Open Files"),
+                    false,
+                    "Open .zip/.tar.gz archive, .str/.nef/.tsv, .jdx, .ucsf/.ft2, .pdb/.cif, or .mol/.sdf",
+                    26.0,
+                )
+                .clicked()
+                {
+                    #[cfg(target_arch = "wasm32")]
+                    trigger_browser_files_picker();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        self.show_native_global_open_bar = !self.show_native_global_open_bar;
+                    }
+                }
+
+                if chrome_icon_button(
+                    ui,
+                    WorkbookIcon::Folder,
+                    Some("Open Folder"),
+                    false,
+                    "Open a Bruker study / expno / pdata folder (1D, 2D, or 3D)",
+                    26.0,
+                )
+                .clicked()
+                {
+                    #[cfg(target_arch = "wasm32")]
+                    trigger_browser_folder_picker();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        self.show_native_global_open_bar = !self.show_native_global_open_bar;
+                    }
+                }
+            });
         });
 
         #[cfg(not(target_arch = "wasm32"))]
         if self.show_native_global_open_bar {
+            ui.add_space(3.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Path:").strong());
                 let resp = ui.add(
@@ -4675,7 +5348,7 @@ impl NmrWorkbenchApp {
                 if ui.button("Load").clicked() || enter {
                     self.load_path_auto();
                 }
-                if ui.button("📋 Paste Text…").clicked() {
+                if ui.button("Paste Text…").clicked() {
                     self.show_text_io_modal = true;
                 }
                 if ui.small_button("✕").clicked() {
@@ -4688,42 +5361,55 @@ impl NmrWorkbenchApp {
     fn draw_top_bar(&mut self, ui: &mut egui::Ui) {
         let mut menu_actions: Vec<WorkbenchAction> = Vec::new();
         ui.horizontal_wrapped(|ui| {
-            // 1. Sub-view pills inside 2D/3D NMR Studio
+            ui.spacing_mut().item_spacing.x = 5.0;
             let on_hsqc = !self.show_relax_panel && !self.show_dynamics_panel;
             let (nx_lbl, ny_lbl) = self.active_2d_nuclei();
             let pill_2d = match (nx_lbl, ny_lbl) {
-                ("1H", "15N") => "🎯 2D HSQC".to_string(),
-                ("13C", "15N") => "🎯 2D ¹³C–¹⁵N CON".to_string(),
+                ("1H", "15N") => "2D HSQC".to_string(),
+                ("13C", "15N") => "2D ¹³C–¹⁵N CON".to_string(),
                 (x, y) => format!(
-                    "🎯 2D {}–{} Contours",
+                    "2D {}–{}",
                     Self::pretty_nucleus_unicode(x),
                     Self::pretty_nucleus_unicode(y)
                 ),
             };
-            if ui
-                .selectable_label(on_hsqc, pill_2d)
-                .on_hover_text(
-                    "2D homonuclear / heteronuclear multi-layer WebGPU contour viewport",
-                )
-                .clicked()
+            if chrome_icon_button(
+                ui,
+                WorkbookIcon::Contour2D,
+                Some(&pill_2d),
+                on_hsqc,
+                "2D multi-layer WebGPU contour viewport",
+                25.0,
+            )
+            .clicked()
             {
                 self.show_relax_panel = false;
                 self.show_dynamics_panel = false;
                 self.show_stack1d_panel = false;
             }
-            if ui
-                .selectable_label(self.show_relax_panel, "📈 Relaxation S²")
-                .on_hover_text("R1, R2, hetNOE & Lipari-Szabo model-free S^2 dynamics")
-                .clicked()
+            if chrome_icon_button(
+                ui,
+                WorkbookIcon::RelaxDynamics,
+                Some("Relaxation S²"),
+                self.show_relax_panel,
+                "R1, R2, hetNOE & Lipari-Szabo model-free S² dynamics",
+                25.0,
+            )
+            .clicked()
             {
                 self.show_relax_panel = true;
                 self.show_dynamics_panel = false;
                 self.show_stack1d_panel = false;
             }
-            if ui
-                .selectable_label(self.show_dynamics_panel, "⚡ CEST / CPMG")
-                .on_hover_text("CEST minor-state saturation, CPMG dispersion & HSQC titration Kd")
-                .clicked()
+            if chrome_icon_button(
+                ui,
+                WorkbookIcon::SlidersTune,
+                Some("CEST / CPMG"),
+                self.show_dynamics_panel,
+                "CEST minor-state saturation, CPMG dispersion & HSQC titration Kd",
+                25.0,
+            )
+            .clicked()
             {
                 self.show_dynamics_panel = true;
                 self.show_relax_panel = false;
@@ -4731,10 +5417,15 @@ impl NmrWorkbenchApp {
             }
 
             ui.separator();
-            if ui
-                .button("🔍 Pick Peaks")
-                .on_hover_text("Pick 2D HSQC root cross-peaks on the active spectrum")
-                .clicked()
+            if chrome_icon_button(
+                ui,
+                WorkbookIcon::PeakPick,
+                Some("Pick Peaks"),
+                false,
+                "Pick 2D root cross-peaks on the active spectrum",
+                25.0,
+            )
+            .clicked()
             {
                 self.pick_2d_roots();
             }
@@ -4760,34 +5451,81 @@ impl NmrWorkbenchApp {
                     });
             }
             let solve_btn = egui::Button::new(
-                egui::RichText::new("▶ Run Assignment")
+                egui::RichText::new("Run Assignment")
+                    .size(11.5)
                     .strong()
-                    .color(egui::Color32::from_rgb(15, 25, 20)),
+                    .color(egui::Color32::from_rgb(12, 24, 18)),
             )
+            .corner_radius(4.0)
             .fill(egui::Color32::from_rgb(82, 224, 152));
-            if ui.add(solve_btn).clicked() {
+            if ui.add_sized([108.0, 25.0], solve_btn).clicked() {
                 self.run_assignment();
             }
-            if ui
-                .button("💾 Export")
-                .on_hover_text("Save lossless NEF v1.1 session & assignments")
-                .clicked()
+            if chrome_icon_button(
+                ui,
+                WorkbookIcon::DownloadSave,
+                Some("Export"),
+                false,
+                "Export NMR-STAR v3 & shift TSV",
+                25.0,
+            )
+            .clicked()
             {
                 let ctx = ui.ctx().clone();
                 self.export_results(&ctx);
             }
 
             ui.separator();
-            ui.toggle_value(&mut self.show_mol3d_viewport, "🧊 3D")
-                .on_hover_text("Show/hide left 3D Biomolecular Structure & Putty dock");
-            ui.toggle_value(&mut self.show_strips_dock, "📊 Strips")
-                .on_hover_text("Show/hide right 3D Sequential Strip Inspector dock");
-            if on_hsqc && !self.sequence.is_empty() {
-                ui.toggle_value(&mut self.show_sequence_ribbon, "🧬 Ribbon")
-                    .on_hover_text("Show/hide sequence assignment confidence ribbon");
+            if chrome_icon_button(
+                ui,
+                WorkbookIcon::Cube3D,
+                Some("3D PDB"),
+                self.show_mol3d_viewport,
+                "Show / hide 3D Biomolecular Structure & Putty dock",
+                25.0,
+            )
+            .clicked()
+            {
+                self.show_mol3d_viewport = !self.show_mol3d_viewport;
             }
-            ui.toggle_value(&mut self.show_advanced_protein_bar, "⚙ Tuning & Menus")
-                .on_hover_text("Expand File/Edit/View menus, Regime, SA replicas/steps, Picker SNR & Simulator");
+            if chrome_icon_button(
+                ui,
+                WorkbookIcon::Strips3D,
+                Some("3D Strips"),
+                self.show_strips_dock,
+                "Show / hide right 3D Sequential Strip Inspector dock",
+                25.0,
+            )
+            .clicked()
+            {
+                self.show_strips_dock = !self.show_strips_dock;
+            }
+            if on_hsqc
+                && !self.sequence.is_empty()
+                && chrome_icon_button(
+                    ui,
+                    WorkbookIcon::Trace1D,
+                    Some("Sequence"),
+                    self.show_sequence_ribbon,
+                    "Show / hide sequence assignment confidence ribbon",
+                    25.0,
+                )
+                .clicked()
+            {
+                self.show_sequence_ribbon = !self.show_sequence_ribbon;
+            }
+            if chrome_icon_button(
+                ui,
+                WorkbookIcon::SlidersTune,
+                Some("Tuning"),
+                self.show_advanced_protein_bar,
+                "Expand Regime, SA replicas/steps, Picker SNR & Simulator",
+                25.0,
+            )
+            .clicked()
+            {
+                self.show_advanced_protein_bar = !self.show_advanced_protein_bar;
+            }
         });
 
         if self.show_advanced_protein_bar {
@@ -4795,7 +5533,7 @@ impl NmrWorkbenchApp {
             let readiness = self.workspace_readiness();
             menu_actions = draw_top_menu_bar(ui, &readiness);
             ui.horizontal_wrapped(|ui| {
-                if ui.small_button("📋 Paste .str / .nef / .tsv").clicked() {
+                if ui.small_button("Paste .str / .nef / .tsv").clicked() {
                     self.show_text_io_modal = !self.show_text_io_modal;
                 }
                 egui::ComboBox::from_id_salt("gui_regime_kind")
@@ -4894,7 +5632,7 @@ impl NmrWorkbenchApp {
                         .text("Sim Spurious")
                         .fixed_decimals(2),
                 );
-                if ui.small_button("🎲 Re-simulate & Solve").clicked() {
+                if ui.small_button("Re-simulate & Solve").clicked() {
                     self.sim_seed = self.sim_seed.wrapping_add(1);
                     if let Some(r) = self.reference.clone() {
                         self.load_from_reference(r);
@@ -4928,62 +5666,30 @@ impl NmrWorkbenchApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
-                    let toggle_btn = egui::Button::new(
-                        egui::RichText::new("🔬 2D Graph")
-                            .size(11.0)
-                            .color(egui::Color32::WHITE),
+                    if chrome_icon_button(
+                        ui,
+                        WorkbookIcon::StructureChem,
+                        Some("Sidechain 2D"),
+                        self.show_sidechain_inspector,
+                        "Toggle live 2D IUPAC covalent sidechain Z-score inspector",
+                        28.0,
                     )
-                    .fill(if self.show_sidechain_inspector {
-                        egui::Color32::from_rgb(20, 108, 130)
-                    } else {
-                        egui::Color32::from_rgb(32, 42, 58)
-                    })
-                    .stroke(egui::Stroke::new(
-                        1.2,
-                        if self.show_sidechain_inspector {
-                            egui::Color32::from_rgb(120, 235, 255)
-                        } else {
-                            egui::Color32::from_rgb(76, 92, 118)
-                        },
-                    ))
-                    .min_size(egui::vec2(68.0, 28.0));
-                    if ui
-                        .add(toggle_btn)
-                        .on_hover_text(
-                            "Toggle live 2D IUPAC covalent sidechain Z-score inspector & atom crosshair jump",
-                        )
-                        .clicked()
+                    .clicked()
                     {
                         self.show_sidechain_inspector = !self.show_sidechain_inspector;
                         if self.show_sidechain_inspector && self.selected_res.is_none() {
                             self.selected_res = Some(0);
                         }
                     }
-                    let prop_btn = egui::Button::new(
-                        egui::RichText::new("📊 SSP / δ2D")
-                            .size(11.0)
-                            .color(egui::Color32::WHITE),
+                    if chrome_icon_button(
+                        ui,
+                        WorkbookIcon::Trace1D,
+                        Some("SSP / δ2D"),
+                        self.show_propensity_panel,
+                        "Toggle per-residue Marsh SSP & Camilloni 4-state δ2D ensemble track",
+                        28.0,
                     )
-                    .fill(if self.show_propensity_panel {
-                        egui::Color32::from_rgb(104, 48, 136)
-                    } else {
-                        egui::Color32::from_rgb(32, 42, 58)
-                    })
-                    .stroke(egui::Stroke::new(
-                        1.2,
-                        if self.show_propensity_panel {
-                            egui::Color32::from_rgb(214, 165, 255)
-                        } else {
-                            egui::Color32::from_rgb(76, 92, 118)
-                        },
-                    ))
-                    .min_size(egui::vec2(78.0, 28.0));
-                    if ui
-                        .add(prop_btn)
-                        .on_hover_text(
-                            "Toggle per-residue Marsh SSP & Camilloni 4-state δ2D (α / β / PPII / coil) ensemble track",
-                        )
-                        .clicked()
+                    .clicked()
                     {
                         self.show_propensity_panel = !self.show_propensity_panel;
                         if self.show_propensity_panel {
@@ -4993,31 +5699,15 @@ impl NmrWorkbenchApp {
                             }
                         }
                     }
-                    let mol3d_btn = egui::Button::new(
-                        egui::RichText::new("🧬 3D Structure")
-                            .size(11.0)
-                            .color(egui::Color32::WHITE),
+                    if chrome_icon_button(
+                        ui,
+                        WorkbookIcon::Cube3D,
+                        Some("3D Structure"),
+                        self.show_mol3d_viewport,
+                        "Toggle dockable WebGPU 3D biomolecular structure & putty viewport",
+                        28.0,
                     )
-                    .fill(if self.show_mol3d_viewport {
-                        egui::Color32::from_rgb(24, 96, 118)
-                    } else {
-                        egui::Color32::from_rgb(32, 42, 58)
-                    })
-                    .stroke(egui::Stroke::new(
-                        1.2,
-                        if self.show_mol3d_viewport {
-                            egui::Color32::from_rgb(120, 235, 255)
-                        } else {
-                            egui::Color32::from_rgb(76, 92, 118)
-                        },
-                    ))
-                    .min_size(egui::vec2(86.0, 28.0));
-                    if ui
-                        .add(mol3d_btn)
-                        .on_hover_text(
-                            "Toggle dockable WebGPU 3D biomolecular structure, NMR putty & NOE/PRE restraint viewport",
-                        )
-                        .clicked()
+                    .clicked()
                     {
                         self.show_mol3d_viewport = !self.show_mol3d_viewport;
                     }
@@ -5056,7 +5746,7 @@ impl NmrWorkbenchApp {
                         };
 
                         let label = if is_locked {
-                            format!("🔒{one}{seq_id}")
+                            format!("*{one}{seq_id}")
                         } else {
                             format!("{one}{seq_id}")
                         };
@@ -5121,10 +5811,47 @@ impl NmrWorkbenchApp {
         let (nuc_x, nuc_y) = self.active_2d_nuclei();
         let pretty_x = Self::pretty_nucleus_unicode(nuc_x);
         let pretty_y = Self::pretty_nucleus_unicode(nuc_y);
-        let base_lo = (self.contour_noise_ref * 0.20).max(1e-6);
-        let base_hi = (self.contour_noise_ref * 250.0)
-            .max(self.contour_base * 4.0)
+        let theme = CanvasTheme2D::for_mode(self.paper_white_canvas);
+        let base_lo = (self.contour_noise_ref * 0.15).max(1e-6);
+        let base_hi = (self.contour_noise_ref * 400.0)
+            .max(self.contour_base * 6.0)
             .max(60.0);
+
+        // Single-key 2D tool shortcuts (`Z` ZoomBox, `H` Pan, `X` Slice, `K` Pick, `F` Full 2D)
+        if !is_compact_mobile && !ui.ctx().egui_wants_keyboard_input() {
+            ui.input(|i| {
+                let plain = !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.alt;
+                if plain {
+                    if i.key_pressed(egui::Key::Z) {
+                        self.workbook.two_d.tool_mode = ToolMode2d::ZoomBox;
+                    } else if i.key_pressed(egui::Key::H) {
+                        self.workbook.two_d.tool_mode = ToolMode2d::Pan;
+                        self.box_zoom_2d_anchor = None;
+                        self.workbook.two_d.drag_box_start_pos = None;
+                    } else if i.key_pressed(egui::Key::X) {
+                        self.workbook.two_d.tool_mode = ToolMode2d::CrosshairSlice;
+                        self.box_zoom_2d_anchor = None;
+                        self.workbook.two_d.drag_box_start_pos = None;
+                    } else if i.key_pressed(egui::Key::K) {
+                        self.workbook.two_d.tool_mode = ToolMode2d::PickPeaks;
+                    } else if i.key_pressed(egui::Key::F) {
+                        let cur = [
+                            self.view_h_left,
+                            self.view_h_right,
+                            self.view_n_top,
+                            self.view_n_bottom,
+                        ];
+                        self.workbook.two_d.push_zoom(cur);
+                        self.reset_view_to_spec();
+                    }
+                }
+                if i.key_pressed(egui::Key::Escape) {
+                    self.box_zoom_2d_anchor = None;
+                    self.box_zoom_2d_mode = false;
+                    self.workbook.two_d.drag_box_start_pos = None;
+                }
+            });
+        }
 
         if is_compact_mobile {
             egui::ScrollArea::horizontal()
@@ -5136,9 +5863,9 @@ impl NmrWorkbenchApp {
                         ui.spacing_mut().interact_size.y = MOBILE_TOUCH_MIN_HEIGHT;
                         if ui
                             .add(
-                                egui::Button::new("🎚 Levels")
+                                egui::Button::new("Levels")
                                     .selected(self.show_contour_modal)
-                                    .min_size(egui::vec2(66.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                                    .min_size(egui::vec2(58.0, MOBILE_TOUCH_MIN_HEIGHT)),
                             )
                             .clicked()
                         {
@@ -5152,7 +5879,7 @@ impl NmrWorkbenchApp {
                             .clicked()
                         {
                             self.contour_base =
-                                (self.contour_base / CONTOUR_FLOOR_STEP_RATIO).max(1e-6);
+                                (self.contour_base / CONTOUR_SCROLL_STEP_RATIO).max(1e-6);
                         }
                         if ui
                             .add(
@@ -5161,8 +5888,8 @@ impl NmrWorkbenchApp {
                             )
                             .clicked()
                         {
-                            self.contour_base = (self.contour_base * CONTOUR_FLOOR_STEP_RATIO)
-                                .min((self.contour_noise_ref * 1e4).max(1e9));
+                            self.contour_base =
+                                (self.contour_base * CONTOUR_SCROLL_STEP_RATIO).min(base_hi);
                         }
                         let lbl_btn = egui::Button::new("Labels")
                             .selected(self.show_peak_labels)
@@ -5178,23 +5905,26 @@ impl NmrWorkbenchApp {
                         }
                         if ui
                             .add(
-                                egui::Button::new(format!("⧉ ({})", 1 + self.overlay_layers.len()))
-                                    .min_size(egui::vec2(48.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                                egui::Button::new(format!(
+                                    "Layers ({})",
+                                    1 + self.overlay_layers.len()
+                                ))
+                                .min_size(egui::vec2(66.0, MOBILE_TOUCH_MIN_HEIGHT)),
                             )
                             .clicked()
                         {
                             self.show_overlay_manager = !self.show_overlay_manager;
                         }
                         let lock_txt = if self.crosshair.locked {
-                            "🔒 XHair"
+                            "Locked"
                         } else {
-                            "┼ XHair"
+                            "XHair"
                         };
                         if ui
                             .add(
                                 egui::Button::new(lock_txt)
                                     .selected(self.crosshair.locked)
-                                    .min_size(egui::vec2(58.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                                    .min_size(egui::vec2(54.0, MOBILE_TOUCH_MIN_HEIGHT)),
                             )
                             .clicked()
                         {
@@ -5202,8 +5932,8 @@ impl NmrWorkbenchApp {
                         }
                         if ui
                             .add(
-                                egui::Button::new("Fit")
-                                    .min_size(egui::vec2(42.0, MOBILE_TOUCH_MIN_HEIGHT)),
+                                egui::Button::new("Full")
+                                    .min_size(egui::vec2(44.0, MOBILE_TOUCH_MIN_HEIGHT)),
                             )
                             .clicked()
                         {
@@ -5211,113 +5941,230 @@ impl NmrWorkbenchApp {
                         }
                     });
                 });
+        }
+
+        let outer_avail = ui.available_size();
+        let outer_size = egui::vec2(outer_avail.x.max(160.0), (outer_avail.y - 2.0).max(160.0));
+        let (outer_rect, _) = ui.allocate_exact_size(outer_size, egui::Sense::hover());
+
+        // 1. Slim `38 px` Left Vertical Tool Rail on Desktop & Tablet
+        let stage_rect = if is_compact_mobile {
+            outer_rect
         } else {
-            ui.horizontal_wrapped(|ui| {
-                let canvas_title = if nuc_x == "13C" && nuc_y == "15N" {
-                    format!("2D ¹³C–¹⁵N CON ({})", self.primary_2d_label)
-                } else if nuc_x == "1H"
-                    && nuc_y == "15N"
-                    && self.primary_2d_label == "15N-HSQC"
-                    && self.overlay_layers.is_empty()
-                {
-                    "2D ¹H–¹⁵N HSQC (WebGPU Multi-Layer)".to_string()
+            let rail_rect = egui::Rect::from_min_max(
+                outer_rect.min,
+                egui::pos2(
+                    outer_rect.left() + CANVAS_TOOL_RAIL_WIDTH,
+                    outer_rect.bottom(),
+                ),
+            );
+            ui.painter()
+                .rect_filled(rail_rect, 3.0, egui::Color32::from_rgb(15, 20, 29));
+            ui.painter().rect_stroke(
+                rail_rect,
+                3.0,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(36, 46, 62)),
+                egui::StrokeKind::Inside,
+            );
+
+            let mut rail_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rail_rect.shrink2(egui::vec2(4.0, 6.0)))
+                    .layout(egui::Layout::top_down_justified(egui::Align::Center)),
+            );
+            rail_ui.spacing_mut().item_spacing.y = 4.0;
+
+            let tm = self.workbook.two_d.tool_mode;
+            if rail_tool_button(
+                &mut rail_ui,
+                WorkbookIcon::ZoomBox,
+                tm == ToolMode2d::ZoomBox,
+                "Zoom Box [Z]: Drag or 2-click to zoom into a 2D cross-peak region (Right-drag pans)",
+            )
+            .clicked()
+            {
+                self.workbook.two_d.tool_mode = ToolMode2d::ZoomBox;
+            }
+            if rail_tool_button(
+                &mut rail_ui,
+                WorkbookIcon::PanMove,
+                tm == ToolMode2d::Pan,
+                "Pan 2D [H]: Drag anywhere to translate (F2, F1) chemical-shift window",
+            )
+            .clicked()
+            {
+                self.workbook.two_d.tool_mode = ToolMode2d::Pan;
+                self.box_zoom_2d_anchor = None;
+                self.workbook.two_d.drag_box_start_pos = None;
+            }
+            if rail_tool_button(
+                &mut rail_ui,
+                WorkbookIcon::CrosshairSlice,
+                tm == ToolMode2d::CrosshairSlice,
+                "Crosshair & Live 1D Slice [X]: Inspect orthogonal F2 row & F1 column traces at cursor",
+            )
+            .clicked()
+            {
+                self.workbook.two_d.tool_mode = ToolMode2d::CrosshairSlice;
+                self.workbook.two_d.show_projections = true;
+            }
+            if rail_tool_button(
+                &mut rail_ui,
+                WorkbookIcon::PeakPick,
+                tm == ToolMode2d::PickPeaks,
+                "Pick 2D Peaks [K]: Auto-pick 2D cross-peaks or click to snap/inspect",
+            )
+            .clicked()
+            {
+                if tm == ToolMode2d::PickPeaks {
+                    self.pick_2d_roots();
                 } else {
-                    format!("2D {pretty_x}–{pretty_y} ({})", self.primary_2d_label)
-                };
-                ui.label(egui::RichText::new(canvas_title).strong());
-                ui.add(
-                    egui::Slider::new(&mut self.contour_base, base_lo..=base_hi)
-                        .logarithmic(true)
-                        .text("Base"),
-                );
-                ui.add(egui::Slider::new(&mut self.contour_factor, 1.15..=2.0).text("Step"));
-                ui.add(egui::Slider::new(&mut self.contour_levels, 4..=16).text("Levels"));
-                ui.checkbox(&mut self.show_negative, "Neg");
-                ui.checkbox(&mut self.show_peak_labels, "Labels");
-                if ui
-                    .small_button(format!("⧉ Overlays ({})", 1 + self.overlay_layers.len()))
-                    .clicked()
-                {
-                    self.show_overlay_manager = !self.show_overlay_manager;
+                    self.workbook.two_d.tool_mode = ToolMode2d::PickPeaks;
                 }
-                if ui
-                    .toggle_value(&mut self.box_zoom_2d_mode, "🔍 Box Zoom")
-                    .on_hover_text(
-                        "Click 2 corners (or hold Shift + drag anywhere) to zoom into a 2D cross-peak region",
-                    )
-                    .changed()
-                    && !self.box_zoom_2d_mode
-                {
-                    self.box_zoom_2d_anchor = None;
-                }
-                let lock_txt = if self.crosshair.locked {
-                    "🔒 Crosshair"
-                } else {
-                    "┼ Crosshair"
-                };
-                if ui.small_button(lock_txt).clicked() {
-                    self.crosshair.toggle_lock();
-                }
-                if ui
-                    .small_button("⛶ Full 2D")
-                    .on_hover_text("Reset 2D zoom to full spectral sweep (or double-click canvas)")
-                    .clicked()
-                {
-                    self.reset_view_to_spec();
-                }
-            });
-        }
+            }
 
-        // Quick 1-click Overlay Layer visibility checkboxes whenever multiple 2D spectra are loaded
-        if !self.overlay_layers.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(
-                    egui::RichText::new("Layers:")
-                        .small()
-                        .strong()
-                        .color(egui::Color32::from_rgb(165, 185, 215)),
-                );
-                let (p_pos, _) = default_overlay_palette(0);
-                let p_col = egui::Color32::from_rgb(
-                    (p_pos[0] * 255.0) as u8,
-                    (p_pos[1] * 255.0) as u8,
-                    (p_pos[2] * 255.0) as u8,
-                );
-                ui.checkbox(
-                    &mut self.primary_2d_visible,
-                    egui::RichText::new(format!("● {}", self.primary_2d_label))
-                        .small()
-                        .strong()
-                        .color(p_col),
-                );
-                for (lbl, ov) in &mut self.overlay_layers {
-                    let c = egui::Color32::from_rgb(
-                        (ov.pos_rgba[0] * 255.0) as u8,
-                        (ov.pos_rgba[1] * 255.0) as u8,
-                        (ov.pos_rgba[2] * 255.0) as u8,
-                    );
-                    ui.checkbox(
-                        &mut ov.visible,
-                        egui::RichText::new(format!("● {lbl}"))
-                            .small()
-                            .strong()
-                            .color(c),
-                    );
+            rail_ui.separator();
+
+            if rail_tool_button(
+                &mut rail_ui,
+                WorkbookIcon::FullSweep,
+                false,
+                "Full 2D Sweep [F]: Reset (F2, F1) viewport to full spectral bounds",
+            )
+            .clicked()
+            {
+                let cur = [
+                    self.view_h_left,
+                    self.view_h_right,
+                    self.view_n_top,
+                    self.view_n_bottom,
+                ];
+                self.workbook.two_d.push_zoom(cur);
+                self.reset_view_to_spec();
+            }
+            if rail_tool_button(
+                &mut rail_ui,
+                WorkbookIcon::UndoBack,
+                !self.workbook.two_d.zoom_history.is_empty(),
+                "Undo 2D Zoom: Restore previous (F2, F1) zoom window",
+            )
+            .clicked()
+            {
+                if let Some(prev) = self.workbook.two_d.pop_zoom() {
+                    self.view_h_left = prev[0];
+                    self.view_h_right = prev[1];
+                    self.view_n_top = prev[2];
+                    self.view_n_bottom = prev[3];
                 }
-            });
-        }
+            }
+            if rail_tool_button(
+                &mut rail_ui,
+                WorkbookIcon::Plus,
+                false,
+                "Lower Contour Floor (÷1.18): Reveal weaker cross-peaks (or scroll wheel up)",
+            )
+            .clicked()
+            {
+                self.contour_base = (self.contour_base / CONTOUR_SCROLL_STEP_RATIO).max(base_lo);
+            }
+            if rail_tool_button(
+                &mut rail_ui,
+                WorkbookIcon::Minus,
+                false,
+                "Raise Contour Floor (×1.18): Suppress baseline noise (or scroll wheel down)",
+            )
+            .clicked()
+            {
+                self.contour_base = (self.contour_base * CONTOUR_SCROLL_STEP_RATIO).min(base_hi);
+            }
 
-        let avail = ui.available_size();
-        let canvas_size = egui::vec2(avail.x.max(160.0), (avail.y - 4.0).max(160.0));
-        let (rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
+            rail_ui.separator();
 
+            if rail_tool_button(
+                &mut rail_ui,
+                WorkbookIcon::Projections2D,
+                self.workbook.two_d.show_projections,
+                "Toggle aligned Top F2 & Left F1 1D marginal projections",
+            )
+            .clicked()
+            {
+                self.workbook.two_d.show_projections = !self.workbook.two_d.show_projections;
+            }
+            if rail_tool_button(
+                &mut rail_ui,
+                WorkbookIcon::ParamsCard,
+                self.workbook.two_d.show_params_card,
+                "Toggle floating 2D Parameters & Active Overlay Layers card",
+            )
+            .clicked()
+            {
+                self.workbook.two_d.show_params_card = !self.workbook.two_d.show_params_card;
+            }
+            if rail_tool_button(
+                &mut rail_ui,
+                WorkbookIcon::SlidersTune,
+                self.show_contour_modal,
+                "Contour Threshold, Step Factor, Levels & Negative Contours",
+            )
+            .clicked()
+            {
+                self.show_contour_modal = !self.show_contour_modal;
+            }
+
+            egui::Rect::from_min_max(
+                egui::pos2(rail_rect.right() + 4.0, outer_rect.top()),
+                outer_rect.max,
+            )
+        };
+
+        // 2. Partition `stage_rect` into aligned Top F2 (`64 px`), Left F1 (`64 px`), Plot, and Rulers
+        let show_proj = !is_compact_mobile
+            && self.workbook.two_d.show_projections
+            && stage_rect.width() >= 280.0
+            && stage_rect.height() >= 240.0;
+        let ruler_bottom_h = if is_compact_mobile { 0.0 } else { 22.0 };
+        let ruler_right_w = if is_compact_mobile { 0.0 } else { 44.0 };
+        let gap = if show_proj { 4.0 } else { 0.0 };
+        let marg_sz = if show_proj { MARGINAL_2D_STRIP_PX } else { 0.0 };
+
+        let plot_left = stage_rect.left() + marg_sz + gap;
+        let plot_right = (stage_rect.right() - ruler_right_w).max(plot_left + 80.0);
+        let plot_top = stage_rect.top() + marg_sz + gap;
+        let plot_bottom = (stage_rect.bottom() - ruler_bottom_h).max(plot_top + 80.0);
+
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(plot_left, plot_top),
+            egui::pos2(plot_right, plot_bottom),
+        );
+        let f2_rect = show_proj.then(|| {
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left(), stage_rect.top()),
+                egui::pos2(rect.right(), stage_rect.top() + MARGINAL_2D_STRIP_PX),
+            )
+        });
+        let f1_rect = show_proj.then(|| {
+            egui::Rect::from_min_max(
+                egui::pos2(stage_rect.left(), rect.top()),
+                egui::pos2(stage_rect.left() + MARGINAL_2D_STRIP_PX, rect.bottom()),
+            )
+        });
+        let corner_rect = show_proj.then(|| {
+            egui::Rect::from_min_max(
+                stage_rect.min,
+                egui::pos2(
+                    stage_rect.left() + MARGINAL_2D_STRIP_PX,
+                    stage_rect.top() + MARGINAL_2D_STRIP_PX,
+                ),
+            )
+        });
+
+        // Interact on main 2D plot rect
+        let response = ui.interact(
+            rect,
+            ui.scope_id().with("nmr_2d_contour_plot_sense"),
+            egui::Sense::click_and_drag(),
+        );
         let limits = self.view_limits_for_active_2d();
-
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.box_zoom_2d_anchor = None;
-            self.box_zoom_2d_mode = false;
-        }
 
         let apply_box_zoom = |app: &mut Self, p0: egui::Pos2, p1: egui::Pos2| -> bool {
             let x0 = p0.x.min(p1.x).clamp(rect.left(), rect.right());
@@ -5325,6 +6172,12 @@ impl NmrWorkbenchApp {
             let y0 = p0.y.min(p1.y).clamp(rect.top(), rect.bottom());
             let y1 = p0.y.max(p1.y).clamp(rect.top(), rect.bottom());
             if (x1 - x0) >= 6.0 && (y1 - y0) >= 6.0 {
+                let prev = [
+                    app.view_h_left,
+                    app.view_h_right,
+                    app.view_n_top,
+                    app.view_n_bottom,
+                ];
                 let u0 = (x0 - rect.left()) / rect.width().max(1.0);
                 let u1 = (x1 - rect.left()) / rect.width().max(1.0);
                 let v0 = (y0 - rect.top()) / rect.height().max(1.0);
@@ -5334,6 +6187,7 @@ impl NmrWorkbenchApp {
                 let nn_top = app.view_n_top + v0 * (app.view_n_bottom - app.view_n_top);
                 let nn_bottom = app.view_n_top + v1 * (app.view_n_bottom - app.view_n_top);
                 let clamped = clamp_view_ppm_2d([nh_left, nh_right, nn_top, nn_bottom], limits);
+                app.workbook.two_d.push_zoom(prev);
                 app.view_h_left = clamped[0];
                 app.view_h_right = clamped[1];
                 app.view_n_top = clamped[2];
@@ -5378,44 +6232,15 @@ impl NmrWorkbenchApp {
             false
         };
 
-        let shift_or_right_drag = !multi_touch_active
+        let tool_mode = self.workbook.two_d.tool_mode;
+        let space_down = ui.input(|i| i.key_down(egui::Key::Space));
+        let primary_pans = is_compact_mobile || tool_mode == ToolMode2d::Pan || space_down;
+        let pan_dragged = !multi_touch_active
             && (response.dragged_by(egui::PointerButton::Secondary)
-                || (response.dragged_by(egui::PointerButton::Primary)
-                    && ui.input(|i| i.modifiers.shift)));
-        if shift_or_right_drag {
-            self.suppress_hsqc_pan_until_release = true;
-            if self.box_zoom_2d_anchor.is_none() {
-                if let Some(origin) = ui
-                    .input(|i| i.pointer.press_origin())
-                    .or_else(|| response.interact_pointer_pos())
-                {
-                    if rect.contains(origin) {
-                        self.box_zoom_2d_anchor = Some([origin.x, origin.y]);
-                    }
-                }
-            }
-        }
+                || response.dragged_by(egui::PointerButton::Middle)
+                || (primary_pans && response.dragged_by(egui::PointerButton::Primary)));
 
-        if !ui.input(|i| i.pointer.any_down()) {
-            if !self.box_zoom_2d_mode {
-                if let (Some(p0), Some(p1)) = (
-                    self.box_zoom_2d_anchor.take(),
-                    response
-                        .interact_pointer_pos()
-                        .or_else(|| ui.input(|i| i.pointer.latest_pos())),
-                ) {
-                    let _ = apply_box_zoom(self, egui::pos2(p0[0], p0[1]), p1);
-                }
-            }
-            self.suppress_hsqc_pan_until_release = false;
-        }
-
-        // Single-finger / primary pointer pan with physical ppm clamping
-        if !multi_touch_active
-            && !self.suppress_hsqc_pan_until_release
-            && !self.box_zoom_2d_mode
-            && response.dragged_by(egui::PointerButton::Primary)
-        {
+        if pan_dragged && !self.suppress_hsqc_pan_until_release {
             let delta = response.drag_delta();
             let span_h = self.view_h_right - self.view_h_left;
             let span_n = self.view_n_bottom - self.view_n_top;
@@ -5435,33 +6260,89 @@ impl NmrWorkbenchApp {
             self.view_n_top = clamped[2];
             self.view_n_bottom = clamped[3];
         }
+
+        // Rubber-band 2D Zoom Box on Left-Click-Drag (`ZoomBox` mode or `Shift+Drag`)
+        let zoom_drag_active = !multi_touch_active
+            && !is_compact_mobile
+            && !primary_pans
+            && response.dragged_by(egui::PointerButton::Primary)
+            && (tool_mode == ToolMode2d::ZoomBox || ui.input(|i| i.modifiers.shift));
+        if zoom_drag_active && self.workbook.two_d.drag_box_start_pos.is_none() {
+            if let Some(origin) = ui
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| response.interact_pointer_pos())
+            {
+                if rect.contains(origin) {
+                    self.workbook.two_d.drag_box_start_pos = Some(origin);
+                }
+            }
+        }
+
+        if !ui.input(|i| i.pointer.any_down()) {
+            if let Some(p0) = self.workbook.two_d.drag_box_start_pos.take() {
+                if let Some(p1) = response
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+                {
+                    if apply_box_zoom(self, p0, p1) {
+                        self.box_zoom_2d_anchor = None;
+                    }
+                }
+            }
+            self.suppress_hsqc_pan_until_release = false;
+        }
+
         if response.double_clicked() && !multi_touch_active {
+            let cur = [
+                self.view_h_left,
+                self.view_h_right,
+                self.view_n_top,
+                self.view_n_bottom,
+            ];
+            self.workbook.two_d.push_zoom(cur);
             self.reset_view_to_spec();
         }
 
-        // Scroll-wheel zoom around pointer (clamped to physical ppm bounds)
+        // Scroll Wheel over 2D Plot:
+        // - Plain Scroll = Contour Threshold (`contour_base` up/down, `×1.18` / `÷1.18`, consuming scroll delta!)
+        // - `Ctrl` / `Cmd` + Scroll = 2D Zoom around cursor (consuming scroll delta!)
         if !multi_touch_active {
             if let Some(hover_pos) = response.hover_pos() {
-                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                if scroll.abs() > 0.1 {
-                    let zoom = (1.0 - scroll * 0.0025).clamp(0.75, 1.35);
-                    let u = ((hover_pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                    let v = ((hover_pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
-                    let anchor_h = self.view_h_left + u * (self.view_h_right - self.view_h_left);
-                    let anchor_n = self.view_n_top + v * (self.view_n_bottom - self.view_n_top);
-                    let clamped = clamp_view_ppm_2d(
-                        [
-                            anchor_h + (self.view_h_left - anchor_h) * zoom,
-                            anchor_h + (self.view_h_right - anchor_h) * zoom,
-                            anchor_n + (self.view_n_top - anchor_n) * zoom,
-                            anchor_n + (self.view_n_bottom - anchor_n) * zoom,
-                        ],
-                        limits,
-                    );
-                    self.view_h_left = clamped[0];
-                    self.view_h_right = clamped[1];
-                    self.view_n_top = clamped[2];
-                    self.view_n_bottom = clamped[3];
+                let (scroll_y, ctrl_or_cmd) = ui.ctx().input_mut(|i| {
+                    let sy = i.smooth_scroll_delta.y;
+                    if sy.abs() > 0.05 {
+                        i.smooth_scroll_delta = egui::Vec2::ZERO;
+                    }
+                    (sy, i.modifiers.command || i.modifiers.ctrl)
+                });
+                if scroll_y.abs() > 0.05 {
+                    if ctrl_or_cmd {
+                        let zoom = (1.0_f32 - scroll_y * 0.003).clamp(0.72, 1.38);
+                        let u =
+                            ((hover_pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                        let v =
+                            ((hover_pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+                        let anchor_h =
+                            self.view_h_left + u * (self.view_h_right - self.view_h_left);
+                        let anchor_n = self.view_n_top + v * (self.view_n_bottom - self.view_n_top);
+                        let clamped = clamp_view_ppm_2d(
+                            [
+                                anchor_h + (self.view_h_left - anchor_h) * zoom,
+                                anchor_h + (self.view_h_right - anchor_h) * zoom,
+                                anchor_n + (self.view_n_top - anchor_n) * zoom,
+                                anchor_n + (self.view_n_bottom - anchor_n) * zoom,
+                            ],
+                            limits,
+                        );
+                        self.view_h_left = clamped[0];
+                        self.view_h_right = clamped[1];
+                        self.view_n_top = clamped[2];
+                        self.view_n_bottom = clamped[3];
+                    } else {
+                        let notches = (scroll_y / 36.0).clamp(-3.0, 3.0);
+                        let factor = CONTOUR_SCROLL_STEP_RATIO.powf(-notches);
+                        self.contour_base = (self.contour_base * factor).clamp(base_lo, base_hi);
+                    }
                 }
             }
         }
@@ -5473,7 +6354,163 @@ impl NmrWorkbenchApp {
             self.view_n_bottom,
         ];
 
+        // 3. Render Top F2 & Left F1 1D Marginal Strips (pixel-aligned with `rect`)
+        if let (Some(r_f2), Some(r_f1), Some(r_corner)) = (f2_rect, f1_rect, corner_rect) {
+            // Corner mode pill (`Auto 1D` | `Skyline` | `Slice`)
+            let c_resp = ui.interact(
+                r_corner,
+                ui.scope_id().with("wb_2d_marginal_corner_btn"),
+                egui::Sense::click(),
+            );
+            if c_resp.clicked() {
+                if self.workbook.two_d.tool_mode == ToolMode2d::CrosshairSlice {
+                    self.workbook.two_d.tool_mode = ToolMode2d::ZoomBox;
+                }
+                self.workbook.two_d.marginal_mode = self.workbook.two_d.marginal_mode.cycle_next();
+            }
+            let cp = ui.painter_at(r_corner);
+            cp.rect_filled(r_corner, 2.0, theme.marginal_bg);
+            cp.rect_stroke(
+                r_corner,
+                2.0,
+                egui::Stroke::new(1.0, theme.marginal_border),
+                egui::StrokeKind::Inside,
+            );
+            cp.text(
+                egui::pos2(r_corner.center().x, r_corner.top() + 18.0),
+                egui::Align2::CENTER_CENTER,
+                format!("{pretty_x} / {pretty_y}"),
+                egui::FontId::proportional(10.5),
+                theme.axis_text,
+            );
+            let mode_badge = self.workbook.two_d.effective_marginal_mode().short_badge();
+            cp.text(
+                egui::pos2(r_corner.center().x, r_corner.bottom() - 15.0),
+                egui::Align2::CENTER_CENTER,
+                mode_badge,
+                egui::FontId::monospace(9.0),
+                theme.marginal_trace_ext,
+            );
+            c_resp.on_hover_text(
+                "Click to cycle 2D marginal source: Auto (External 1D / Skyline) -> Skyline Only -> Live Crosshair Slice",
+            );
+
+            // Interact on F2 & F1 marginal strips (scroll = vertical marginal gain, drag/click = move crosshair)
+            let f2_resp = ui.interact(
+                r_f2,
+                ui.scope_id().with("wb_2d_f2_marginal_sense"),
+                egui::Sense::click_and_drag(),
+            );
+            if f2_resp.hovered() {
+                let sy = ui.ctx().input_mut(|i| {
+                    let s = i.smooth_scroll_delta.y;
+                    if s.abs() > 0.05 {
+                        i.smooth_scroll_delta = egui::Vec2::ZERO;
+                    }
+                    s
+                });
+                if sy.abs() > 0.05 {
+                    let notches = (sy / 36.0).clamp(-3.0, 3.0);
+                    self.workbook.two_d.f2_gain = (self.workbook.two_d.f2_gain
+                        * CONTOUR_SCROLL_STEP_RATIO.powf(notches))
+                    .clamp(0.08, 64.0);
+                }
+            }
+            if f2_resp.clicked() || f2_resp.dragged() {
+                if let Some(p) = f2_resp.interact_pointer_pos() {
+                    let u = ((p.x - r_f2.left()) / r_f2.width().max(1.0)).clamp(0.0, 1.0);
+                    let h_ppm =
+                        (self.view_h_left + u * (self.view_h_right - self.view_h_left)) as f64;
+                    self.crosshair.h_ppm = h_ppm;
+                }
+            }
+
+            let f1_resp = ui.interact(
+                r_f1,
+                ui.scope_id().with("wb_2d_f1_marginal_sense"),
+                egui::Sense::click_and_drag(),
+            );
+            if f1_resp.hovered() {
+                let sy = ui.ctx().input_mut(|i| {
+                    let s = i.smooth_scroll_delta.y;
+                    if s.abs() > 0.05 {
+                        i.smooth_scroll_delta = egui::Vec2::ZERO;
+                    }
+                    s
+                });
+                if sy.abs() > 0.05 {
+                    let notches = (sy / 36.0).clamp(-3.0, 3.0);
+                    self.workbook.two_d.f1_gain = (self.workbook.two_d.f1_gain
+                        * CONTOUR_SCROLL_STEP_RATIO.powf(notches))
+                    .clamp(0.08, 64.0);
+                }
+            }
+            if f1_resp.clicked() || f1_resp.dragged() {
+                if let Some(p) = f1_resp.interact_pointer_pos() {
+                    let v = ((p.y - r_f1.top()) / r_f1.height().max(1.0)).clamp(0.0, 1.0);
+                    let n_ppm =
+                        (self.view_n_top + v * (self.view_n_bottom - self.view_n_top)) as f64;
+                    self.crosshair.n_ppm = n_ppm;
+                }
+            }
+
+            if let Some(ref spec) = self.hsqc_spec {
+                let (f2_curve, f1_curve) = evaluate_2d_marginals(
+                    &mut self.workbook.two_d,
+                    spec,
+                    self.hsqc_gen,
+                    nuc_x,
+                    nuc_y,
+                    view_ppm,
+                    &self.crosshair,
+                    &self.stack1d_panel,
+                    rect.width(),
+                    rect.height(),
+                );
+                paint_f2_marginal_strip(
+                    ui.painter(),
+                    r_f2,
+                    view_ppm,
+                    &f2_curve,
+                    self.workbook.two_d.f2_gain,
+                    self.crosshair.h_ppm,
+                    &theme,
+                );
+                paint_f1_marginal_strip(
+                    ui.painter(),
+                    r_f1,
+                    view_ppm,
+                    &f1_curve,
+                    self.workbook.two_d.f1_gain,
+                    self.crosshair.n_ppm,
+                    &theme,
+                );
+            } else {
+                ui.painter().rect_filled(r_f2, 2.0, theme.marginal_bg);
+                ui.painter().rect_filled(r_f1, 2.0, theme.marginal_bg);
+            }
+        }
+
+        // 4. Render Main 2D WebGPU Contour Canvas (Paper White OR Dark Oscilloscope)
         let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, theme.canvas_bg);
+
+        // Subtle major-tick grid lines on Paper White (and Dark fallback when GPU callback has transparent bg)
+        let tick_steps = if is_compact_mobile { 4usize } else { 6usize };
+        for i in 1..tick_steps {
+            let t = (i as f32) / (tick_steps as f32);
+            let gx = rect.left() + t * rect.width();
+            let gy = rect.top() + t * rect.height();
+            painter.line_segment(
+                [egui::pos2(gx, rect.top()), egui::pos2(gx, rect.bottom())],
+                egui::Stroke::new(0.8, theme.grid_line),
+            );
+            painter.line_segment(
+                [egui::pos2(rect.left(), gy), egui::pos2(rect.right(), gy)],
+                egui::Stroke::new(0.8, theme.grid_line),
+            );
+        }
+
         let mut gpu_layers: Vec<OverlayLayerSpec> = Vec::new();
         if self.primary_2d_visible {
             if let Some(spec) = &self.hsqc_spec {
@@ -5485,6 +6522,9 @@ impl NmrWorkbenchApp {
                     self.contour_base,
                     0,
                 );
+                let (pos_c, neg_c) = contour_palette_for_theme(0, self.paper_white_canvas);
+                base_layer.pos_rgba = pos_c;
+                base_layer.neg_rgba = neg_c;
                 base_layer.level_factor = self.contour_factor;
                 base_layer.num_levels = self.contour_levels;
                 base_layer.show_negative = self.show_negative;
@@ -5492,20 +6532,25 @@ impl NmrWorkbenchApp {
                 gpu_layers.push(base_layer);
             }
         }
-        for (_, ov) in &self.overlay_layers {
+        for (idx, (_, ov)) in self.overlay_layers.iter().enumerate() {
             if ov.visible {
-                gpu_layers.push(ov.clone());
+                let mut layer = ov.clone();
+                if self.paper_white_canvas {
+                    let (pos_c, neg_c) = contour_palette_for_theme(idx + 1, true);
+                    layer.pos_rgba = [pos_c[0], pos_c[1], pos_c[2], ov.pos_rgba[3]];
+                    layer.neg_rgba = [neg_c[0], neg_c[1], neg_c[2], ov.neg_rgba[3]];
+                }
+                gpu_layers.push(layer);
             }
         }
 
         if !gpu_layers.is_empty() {
             let cb = egui_wgpu::Callback::new_paint_callback(
                 rect,
-                MultiContourCallback::new(view_ppm, [rect.width(), rect.height()], gpu_layers),
+                MultiContourCallback::new(view_ppm, [rect.width(), rect.height()], gpu_layers)
+                    .with_opaque_background(!self.paper_white_canvas),
             );
             painter.add(cb);
-        } else {
-            painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(14, 18, 25));
         }
 
         let ppm_to_screen = |h: f64, n: f64| -> egui::Pos2 {
@@ -5527,16 +6572,13 @@ impl NmrWorkbenchApp {
                 if total_len >= 2.0 {
                     let dir = (p_end - p_start) / total_len;
                     let dash = 6.0_f32;
-                    let gap = 5.0_f32;
-                    let diag_stroke = egui::Stroke::new(
-                        1.15,
-                        egui::Color32::from_rgba_unmultiplied(195, 215, 245, 115),
-                    );
+                    let gap_d = 5.0_f32;
+                    let diag_stroke = egui::Stroke::new(1.15, theme.diagonal_stroke);
                     let mut s = 0.0_f32;
                     while s < total_len {
                         let e = (s + dash).min(total_len);
                         painter.line_segment([p_start + dir * s, p_start + dir * e], diag_stroke);
-                        s += dash + gap;
+                        s += dash + gap_d;
                     }
                     let lbl_pt = p_start + dir * (total_len * 0.12).clamp(18.0, total_len - 4.0);
                     if rect.shrink(14.0).contains(lbl_pt) {
@@ -5545,29 +6587,27 @@ impl NmrWorkbenchApp {
                             egui::Align2::LEFT_TOP,
                             "δ₁ = δ₂",
                             egui::FontId::monospace(9.5),
-                            egui::Color32::from_rgba_unmultiplied(205, 225, 250, 155),
+                            theme.axis_muted,
                         );
                     }
                 }
             }
         }
 
-        // Tap / click: 2-click box zoom mode OR select nearest peak/spin system
+        let is_prot_2d = self.is_protein_2d_context();
+
+        // Tap / Click handling:
+        // - Select nearest spin-system / CON root if clicked directly within hit radius (and no 2-click zoom anchor is pending)
+        // - Otherwise in ZoomBox mode: 2-click zoom anchor -> zoom box!
         if response.clicked() && !multi_touch_active && !self.suppress_hsqc_pan_until_release {
             if let Some(click_pos) = response.interact_pointer_pos() {
-                if self.box_zoom_2d_mode {
-                    if let Some(anchor) = self.box_zoom_2d_anchor.take() {
-                        if apply_box_zoom(self, egui::pos2(anchor[0], anchor[1]), click_pos) {
-                            self.box_zoom_2d_mode = false;
-                        } else {
-                            self.box_zoom_2d_anchor = Some([click_pos.x, click_pos.y]);
-                        }
-                    } else {
+                if let Some(anchor) = self.box_zoom_2d_anchor.take() {
+                    if !apply_box_zoom(self, egui::pos2(anchor[0], anchor[1]), click_pos) {
                         self.box_zoom_2d_anchor = Some([click_pos.x, click_pos.y]);
                     }
                 } else {
-                    let hit_radius = if is_compact_mobile { 24.0 } else { 18.0 };
-                    let mut snapped_con = false;
+                    let hit_radius = if is_compact_mobile { 24.0 } else { 15.0 };
+                    let mut hit_peak = false;
                     if nuc_x == "13C" && nuc_y == "15N" {
                         if let Some(ref ds) = self.c13_picked_dataset {
                             if let Some(best_con) = ds
@@ -5582,11 +6622,10 @@ impl NmrWorkbenchApp {
                                 .map(|(pk, _)| (pk.c_prev_ppm, pk.n_curr_ppm))
                             {
                                 self.crosshair.snap_to(best_con.0, best_con.1, None);
-                                snapped_con = true;
+                                hit_peak = true;
                             }
                         }
-                    }
-                    if !snapped_con {
+                    } else if is_prot_2d {
                         let mut best: Option<(usize, f32)> = None;
                         for (s, ss) in self.systems.iter().enumerate() {
                             let pt = ppm_to_screen(ss.h, ss.n);
@@ -5607,6 +6646,15 @@ impl NmrWorkbenchApp {
                                     self.mol3d_panel.highlight_sequence_residue(Some(rk), true);
                                 }
                             }
+                            hit_peak = true;
+                        }
+                    }
+
+                    if !hit_peak {
+                        if !is_compact_mobile
+                            && (tool_mode == ToolMode2d::ZoomBox || self.box_zoom_2d_mode)
+                        {
+                            self.box_zoom_2d_anchor = Some([click_pos.x, click_pos.y]);
                         } else {
                             let u = ((click_pos.x - rect.left()) / rect.width().max(1.0))
                                 .clamp(0.0, 1.0);
@@ -5634,9 +6682,9 @@ impl NmrWorkbenchApp {
                         continue;
                     }
                     let marker_col = if pk.is_proline_imino_region {
-                        egui::Color32::from_rgb(255, 205, 88)
+                        theme.peak_med_conf
                     } else {
-                        egui::Color32::from_rgb(95, 240, 175)
+                        theme.peak_hi_conf
                     };
                     let sz = 4.2;
                     painter.line_segment(
@@ -5663,22 +6711,27 @@ impl NmrWorkbenchApp {
                     }
                 }
             }
-        } else if self.systems.is_empty() && !self.peaks.is_empty() {
-            // Draw unclustered 2D cross-peak markers (e.g. 1H-1H NOESY/TOCSY/COSY or 13C-HSQC/HMBC)
-            for (idx, pk) in self.peaks.iter().take(400).enumerate() {
+        } else if !is_prot_2d && !self.peaks.is_empty() {
+            // Draw unclustered 2D cross-peak markers when picked on small-molecule 2D
+            for (idx, pk) in self
+                .peaks
+                .iter()
+                .filter(|p| p.c.is_none())
+                .take(400)
+                .enumerate()
+            {
                 let pt = ppm_to_screen(pk.h, pk.n);
                 if !rect.contains(pt) {
                     continue;
                 }
-                let marker_col = egui::Color32::from_rgb(135, 215, 255);
                 let sz = 3.5;
                 painter.line_segment(
                     [egui::pos2(pt.x - sz, pt.y), egui::pos2(pt.x + sz, pt.y)],
-                    egui::Stroke::new(1.1, marker_col),
+                    egui::Stroke::new(1.1, theme.peak_unassigned),
                 );
                 painter.line_segment(
                     [egui::pos2(pt.x, pt.y - sz), egui::pos2(pt.x, pt.y + sz)],
-                    egui::Stroke::new(1.1, marker_col),
+                    egui::Stroke::new(1.1, theme.peak_unassigned),
                 );
                 if self.show_peak_labels && self.peaks.len() <= 120 {
                     painter.text(
@@ -5686,73 +6739,69 @@ impl NmrWorkbenchApp {
                         egui::Align2::LEFT_BOTTOM,
                         format!("#{idx}"),
                         egui::FontId::monospace(9.5),
-                        marker_col,
+                        theme.peak_unassigned,
                     );
                 }
             }
-        }
-
-        // Draw spin system peak markers and residue labels
-        for (s, ss) in self.systems.iter().enumerate() {
-            let pt = ppm_to_screen(ss.h, ss.n);
-            if !rect.contains(pt) {
-                continue;
-            }
-            let is_sel = self.selected_ss == Some(s);
-            let is_locked = self.session.state.is_spin_system_locked(s);
-            let (assigned_k, conf) = self
-                .assign_res
-                .as_ref()
-                .and_then(|r| Some((*r.position.get(s)?, *r.confidence.get(s)?)))
-                .unwrap_or((-1, 0.0));
-
-            let marker_col = if is_locked {
-                egui::Color32::from_rgb(255, 222, 92)
-            } else if assigned_k >= 0 {
-                if conf >= 0.80 {
-                    egui::Color32::from_rgb(95, 245, 165)
-                } else {
-                    egui::Color32::from_rgb(255, 205, 95)
+        } else if is_prot_2d {
+            // Draw protein spin system peak markers and residue labels
+            for (s, ss) in self.systems.iter().enumerate() {
+                let pt = ppm_to_screen(ss.h, ss.n);
+                if !rect.contains(pt) {
+                    continue;
                 }
-            } else {
-                egui::Color32::from_rgb(155, 175, 205)
-            };
+                let is_sel = self.selected_ss == Some(s);
+                let is_locked = self.session.state.is_spin_system_locked(s);
+                let (assigned_k, conf) = self
+                    .assign_res
+                    .as_ref()
+                    .and_then(|r| Some((*r.position.get(s)?, *r.confidence.get(s)?)))
+                    .unwrap_or((-1, 0.0));
 
-            let sz = if is_sel { 6.5 } else { 3.8 };
-            painter.line_segment(
-                [egui::pos2(pt.x - sz, pt.y), egui::pos2(pt.x + sz, pt.y)],
-                egui::Stroke::new(if is_sel { 2.0 } else { 1.2 }, marker_col),
-            );
-            painter.line_segment(
-                [egui::pos2(pt.x, pt.y - sz), egui::pos2(pt.x, pt.y + sz)],
-                egui::Stroke::new(if is_sel { 2.0 } else { 1.2 }, marker_col),
-            );
-            if is_sel {
-                painter.circle_stroke(
-                    pt,
-                    10.5,
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 240, 120)),
-                );
-            }
-
-            if self.show_peak_labels {
-                let text = if assigned_k >= 0 && (assigned_k as usize) < self.sequence.len() {
-                    let k = assigned_k as usize;
-                    if is_locked {
-                        format!("🔒{}{}", three_to_one(&self.sequence[k]), self.seq_ids[k])
+                let marker_col = if is_locked {
+                    theme.peak_locked
+                } else if assigned_k >= 0 {
+                    if conf >= 0.80 {
+                        theme.peak_hi_conf
                     } else {
-                        format!("{}{}", three_to_one(&self.sequence[k]), self.seq_ids[k])
+                        theme.peak_med_conf
                     }
                 } else {
-                    format!("#{s}")
+                    theme.peak_unassigned
                 };
-                painter.text(
-                    egui::pos2(pt.x + 6.0, pt.y - 6.0),
-                    egui::Align2::LEFT_BOTTOM,
-                    text,
-                    egui::FontId::monospace(10.5),
-                    marker_col,
+
+                let sz = if is_sel { 6.5 } else { 3.8 };
+                painter.line_segment(
+                    [egui::pos2(pt.x - sz, pt.y), egui::pos2(pt.x + sz, pt.y)],
+                    egui::Stroke::new(if is_sel { 2.0 } else { 1.2 }, marker_col),
                 );
+                painter.line_segment(
+                    [egui::pos2(pt.x, pt.y - sz), egui::pos2(pt.x, pt.y + sz)],
+                    egui::Stroke::new(if is_sel { 2.0 } else { 1.2 }, marker_col),
+                );
+                if is_sel {
+                    painter.circle_stroke(pt, 10.5, egui::Stroke::new(2.0, theme.zoom_box_stroke));
+                }
+
+                if self.show_peak_labels {
+                    let text = if assigned_k >= 0 && (assigned_k as usize) < self.sequence.len() {
+                        let k = assigned_k as usize;
+                        if is_locked {
+                            format!("*{}{}", three_to_one(&self.sequence[k]), self.seq_ids[k])
+                        } else {
+                            format!("{}{}", three_to_one(&self.sequence[k]), self.seq_ids[k])
+                        }
+                    } else {
+                        format!("#{s}")
+                    };
+                    painter.text(
+                        egui::pos2(pt.x + 6.0, pt.y - 6.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        text,
+                        egui::FontId::monospace(10.5),
+                        marker_col,
+                    );
+                }
             }
         }
 
@@ -5769,15 +6818,9 @@ impl NmrWorkbenchApp {
         let ch_pt = ppm_to_screen(self.crosshair.h_ppm, self.crosshair.n_ppm);
         if rect.contains(ch_pt) {
             let ch_stroke = if self.crosshair.locked {
-                egui::Stroke::new(
-                    1.1,
-                    egui::Color32::from_rgba_unmultiplied(255, 215, 90, 175),
-                )
+                egui::Stroke::new(1.15, theme.crosshair_locked)
             } else {
-                egui::Stroke::new(
-                    0.8,
-                    egui::Color32::from_rgba_unmultiplied(110, 215, 255, 105),
-                )
+                egui::Stroke::new(0.85, theme.crosshair_unlocked)
             };
             painter.line_segment(
                 [
@@ -5795,31 +6838,32 @@ impl NmrWorkbenchApp {
             );
         }
 
-        // Draw rubber-band 2D box zoom preview rectangle when anchored
-        if let Some(anchor) = self.box_zoom_2d_anchor {
+        // Draw live rubber-band 2D Zoom Box preview (`ΔF2 ppm × ΔF1 ppm`)
+        let active_box_start = self
+            .workbook
+            .two_d
+            .drag_box_start_pos
+            .or_else(|| self.box_zoom_2d_anchor.map(|a| egui::pos2(a[0], a[1])));
+        if let Some(anchor_pt) = active_box_start {
             if let Some(cur_pos) = response
                 .hover_pos()
                 .or_else(|| ui.input(|i| i.pointer.latest_pos()))
             {
                 let box_rect = egui::Rect::from_two_pos(
                     egui::pos2(
-                        anchor[0].clamp(rect.left(), rect.right()),
-                        anchor[1].clamp(rect.top(), rect.bottom()),
+                        anchor_pt.x.clamp(rect.left(), rect.right()),
+                        anchor_pt.y.clamp(rect.top(), rect.bottom()),
                     ),
                     egui::pos2(
                         cur_pos.x.clamp(rect.left(), rect.right()),
                         cur_pos.y.clamp(rect.top(), rect.bottom()),
                     ),
                 );
-                painter.rect_filled(
-                    box_rect,
-                    1.5,
-                    egui::Color32::from_rgba_unmultiplied(80, 210, 255, 36),
-                );
+                painter.rect_filled(box_rect, 1.5, theme.zoom_box_fill);
                 painter.rect_stroke(
                     box_rect,
                     1.5,
-                    egui::Stroke::new(1.4, egui::Color32::from_rgb(110, 230, 255)),
+                    egui::Stroke::new(1.35, theme.zoom_box_stroke),
                     egui::StrokeKind::Inside,
                 );
                 let dh_ppm = ((box_rect.width() / rect.width().max(1.0))
@@ -5834,21 +6878,22 @@ impl NmrWorkbenchApp {
                         (box_rect.top() - 4.0).max(rect.top() + 14.0),
                     ),
                     egui::Align2::LEFT_BOTTOM,
-                    format!("Δ{pretty_x} {dh_ppm:.2} × Δ{pretty_y} {dn_ppm:.2} ppm"),
+                    format!("ΔF2 {dh_ppm:.2} {pretty_x} | ΔF1 {dn_ppm:.2} {pretty_y}"),
                     egui::FontId::monospace(9.5),
-                    egui::Color32::from_rgb(160, 240, 255),
+                    theme.zoom_box_stroke,
                 );
             }
         }
 
-        // Draw axis ticks and live cursor ppm readout
+        // 5. Crisp Plot Frame + Bottom F2 & Right F1 Chemical-Shift Rulers
         painter.rect_stroke(
             rect,
             2.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(65, 80, 105)),
+            egui::Stroke::new(1.0, theme.axis_border),
             egui::StrokeKind::Inside,
         );
-        let tick_steps = if is_compact_mobile { 4usize } else { 5usize };
+
+        let full_painter = ui.painter();
         let x_span_abs = (self.view_h_left - self.view_h_right).abs();
         let y_span_abs = (self.view_n_bottom - self.view_n_top).abs();
         let x_tick_dec = if x_span_abs < 0.5 {
@@ -5865,54 +6910,216 @@ impl NmrWorkbenchApp {
         } else {
             1usize
         };
-        for i in 0..=tick_steps {
-            let t = (i as f32) / (tick_steps as f32);
-            let h_val = self.view_h_left + t * (self.view_h_right - self.view_h_left);
-            let x = rect.left() + t * rect.width();
-            painter.text(
-                egui::pos2(x, rect.bottom() - 3.0),
-                egui::Align2::CENTER_BOTTOM,
-                format!("{h_val:.x_tick_dec$} {pretty_x}"),
-                egui::FontId::monospace(9.5),
-                egui::Color32::from_rgb(170, 188, 215),
+
+        if is_compact_mobile {
+            for i in 0..=tick_steps {
+                let t = (i as f32) / (tick_steps as f32);
+                let h_val = self.view_h_left + t * (self.view_h_right - self.view_h_left);
+                let x = rect.left() + t * rect.width();
+                painter.text(
+                    egui::pos2(x, rect.bottom() - 3.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    format!("{h_val:.x_tick_dec$}"),
+                    egui::FontId::monospace(9.5),
+                    theme.axis_muted,
+                );
+                let n_val = self.view_n_top + t * (self.view_n_bottom - self.view_n_top);
+                let y = rect.top() + t * rect.height();
+                painter.text(
+                    egui::pos2(rect.left() + 4.0, y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{n_val:.y_tick_dec$}"),
+                    egui::FontId::monospace(9.5),
+                    theme.axis_muted,
+                );
+            }
+        } else {
+            let ruler_col = egui::Color32::from_rgb(203, 213, 225);
+            let tick_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 116, 139));
+            for i in 0..=tick_steps {
+                let t = (i as f32) / (tick_steps as f32);
+                let h_val = self.view_h_left + t * (self.view_h_right - self.view_h_left);
+                let x = f2_ppm_to_screen_x(view_ppm, rect, h_val as f64);
+                full_painter.line_segment(
+                    [
+                        egui::pos2(x, rect.bottom()),
+                        egui::pos2(x, rect.bottom() + 4.0),
+                    ],
+                    tick_stroke,
+                );
+                let x_lbl = if i == tick_steps / 2 {
+                    format!("{h_val:.x_tick_dec$}  f2 ({pretty_x} ppm)")
+                } else {
+                    format!("{h_val:.x_tick_dec$}")
+                };
+                let align_x = if i == 0 {
+                    egui::Align2::LEFT_TOP
+                } else if i == tick_steps {
+                    egui::Align2::RIGHT_TOP
+                } else {
+                    egui::Align2::CENTER_TOP
+                };
+                full_painter.text(
+                    egui::pos2(x, rect.bottom() + 5.0),
+                    align_x,
+                    x_lbl,
+                    egui::FontId::monospace(9.5),
+                    ruler_col,
+                );
+
+                let n_val = self.view_n_top + t * (self.view_n_bottom - self.view_n_top);
+                let y = f1_ppm_to_screen_y(view_ppm, rect, n_val as f64);
+                full_painter.line_segment(
+                    [
+                        egui::pos2(rect.right(), y),
+                        egui::pos2(rect.right() + 4.0, y),
+                    ],
+                    tick_stroke,
+                );
+                let y_lbl = if i == 0 {
+                    format!("{n_val:.y_tick_dec$} {pretty_y}")
+                } else {
+                    format!("{n_val:.y_tick_dec$}")
+                };
+                let align_y = if i == 0 {
+                    egui::Align2::LEFT_TOP
+                } else if i == tick_steps {
+                    egui::Align2::LEFT_BOTTOM
+                } else {
+                    egui::Align2::LEFT_CENTER
+                };
+                full_painter.text(
+                    egui::pos2(rect.right() + 6.0, y),
+                    align_y,
+                    y_lbl,
+                    egui::FontId::monospace(9.5),
+                    ruler_col,
+                );
+            }
+        }
+
+        // 6. Floating Compact 2D Parameters & Active Layers Card (Top-Right of `rect`)
+        if !is_compact_mobile
+            && self.workbook.two_d.show_params_card
+            && rect.width() >= 280.0
+            && rect.height() >= 180.0
+        {
+            let n_ov = self.overlay_layers.len();
+            let card_h = 84.0 + (n_ov.min(4) as f32) * 18.0;
+            let card_w = 214.0_f32.min(rect.width() * 0.46);
+            let card_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.right() - card_w - 8.0, rect.top() + 8.0),
+                egui::vec2(card_w, card_h),
+            );
+            painter.rect_filled(card_rect, 4.0, theme.card_bg);
+            painter.rect_stroke(
+                card_rect,
+                4.0,
+                egui::Stroke::new(1.0, theme.card_border),
+                egui::StrokeKind::Inside,
             );
 
-            let n_val = self.view_n_top + t * (self.view_n_bottom - self.view_n_top);
-            let y = rect.top() + t * rect.height();
-            let y_lbl = if i == 0 {
-                format!("{n_val:.y_tick_dec$} {pretty_y}")
+            let mut card_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(card_rect.shrink(6.0))
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            card_ui.spacing_mut().item_spacing.y = 2.5;
+
+            card_ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(&self.primary_2d_label)
+                        .size(10.5)
+                        .strong()
+                        .color(theme.card_title),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let close_r =
+                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                    paint_icon(
+                        ui.painter(),
+                        close_r.0.shrink(2.0),
+                        WorkbookIcon::CloseX,
+                        theme.card_body,
+                    );
+                    if close_r.1.on_hover_text("Hide 2D Parameters card").clicked() {
+                        self.workbook.two_d.show_params_card = false;
+                    }
+                });
+            });
+
+            if let Some(ref spec) = self.hsqc_spec {
+                card_ui.label(
+                    egui::RichText::new(format!(
+                        "{}×{}  ·  {:.0}/{:.0} MHz",
+                        spec.nx(),
+                        spec.ny(),
+                        spec.axis_x.obs_mhz,
+                        spec.axis_y.obs_mhz
+                    ))
+                    .size(9.5)
+                    .monospace()
+                    .color(theme.card_body),
+                );
+            }
+            let snr_floor = if self.contour_noise_ref > 1e-9 {
+                self.contour_base / self.contour_noise_ref
             } else {
-                format!("{n_val:.y_tick_dec$}")
+                0.0
             };
+            card_ui.label(
+                egui::RichText::new(format!(
+                    "Base {:.2} ({snr_floor:.1}σ) · {} lvls",
+                    self.contour_base, self.contour_levels
+                ))
+                .size(9.5)
+                .monospace()
+                .color(theme.card_body),
+            );
+            let x_cur_dec = if x_span_abs < 30.0 { 3usize } else { 2usize };
+            let y_cur_dec = if y_span_abs < 30.0 { 3usize } else { 2usize };
+            card_ui.label(
+                egui::RichText::new(format!(
+                    "F2 {:.x_cur_dec$} | F1 {:.y_cur_dec$} ppm{}",
+                    self.crosshair.h_ppm,
+                    self.crosshair.n_ppm,
+                    if self.crosshair.locked { " *" } else { "" }
+                ))
+                .size(9.5)
+                .monospace()
+                .color(theme.card_title),
+            );
+
+            for (lbl, ov) in self.overlay_layers.iter_mut().take(4) {
+                card_ui.horizontal(|ui| {
+                    ui.checkbox(&mut ov.visible, "");
+                    ui.label(
+                        egui::RichText::new(lbl.as_str())
+                            .size(9.5)
+                            .color(theme.card_body),
+                    );
+                });
+            }
+        } else {
+            let x_cur_dec = if x_span_abs < 30.0 { 3usize } else { 2usize };
+            let y_cur_dec = if y_span_abs < 30.0 { 3usize } else { 2usize };
             painter.text(
-                egui::pos2(rect.left() + 4.0, y),
-                egui::Align2::LEFT_CENTER,
-                y_lbl,
-                egui::FontId::monospace(9.5),
-                egui::Color32::from_rgb(170, 188, 215),
+                egui::pos2(rect.right() - 8.0, rect.top() + 6.0),
+                egui::Align2::RIGHT_TOP,
+                format!(
+                    "F2 {pretty_x} {:.x_cur_dec$} | F1 {pretty_y} {:.y_cur_dec$} ppm",
+                    self.crosshair.h_ppm, self.crosshair.n_ppm
+                ),
+                egui::FontId::monospace(10.0),
+                theme.axis_text,
             );
         }
 
-        let lock_tag = if self.crosshair.locked {
-            " [LOCKED]"
-        } else if self.box_zoom_2d_mode {
-            " [BOX ZOOM]"
+        if is_compact_mobile {
+            rect
         } else {
-            ""
-        };
-        let x_cur_dec = if x_span_abs < 30.0 { 3usize } else { 2usize };
-        let y_cur_dec = if y_span_abs < 30.0 { 3usize } else { 2usize };
-        painter.text(
-            egui::pos2(rect.right() - 8.0, rect.top() + 6.0),
-            egui::Align2::RIGHT_TOP,
-            format!(
-                "F2 {pretty_x} {:.x_cur_dec$} ppm | F1 {pretty_y} {:.y_cur_dec$} ppm{lock_tag}",
-                self.crosshair.h_ppm, self.crosshair.n_ppm
-            ),
-            egui::FontId::monospace(if is_compact_mobile { 10.0 } else { 11.0 }),
-            egui::Color32::from_rgb(220, 235, 255),
-        );
-        rect
+            outer_rect
+        }
     }
 
     fn select_residue_and_sync_strip(&mut self, k: usize) {
@@ -6411,12 +7618,12 @@ impl NmrWorkbenchApp {
 
     fn draw_right_inspector(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.strong("📊 3D Strip Inspector");
+            ui.strong("3D Strip Inspector");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("✕ Hide")
                     .on_hover_text(
-                        "Hide Right Strip Inspector dock (reopen anytime via '📊 Strips')",
+                        "Hide Right Strip Inspector dock (reopen via View ▸ 3D Strips Dock)",
                     )
                     .clicked()
                 {
@@ -6483,11 +7690,11 @@ impl NmrWorkbenchApp {
             ui.selectable_value(
                 &mut self.use_match_finder_strips,
                 true,
-                "🎯 Match-Finder (i−1/i/i+1)",
+                "Match-Finder (i−1/i/i+1)",
             );
-            ui.selectable_value(&mut self.use_match_finder_strips, false, "🧬 Walk & LLR");
+            ui.selectable_value(&mut self.use_match_finder_strips, false, "Walk & LLR");
             let sc_btn = egui::Button::new(
-                egui::RichText::new("🔬 Sidechain 2D")
+                egui::RichText::new("Sidechain 2D")
                     .size(12.0)
                     .color(egui::Color32::WHITE),
             )
@@ -6507,7 +7714,7 @@ impl NmrWorkbenchApp {
                 }
             }
             let prop_btn = egui::Button::new(
-                egui::RichText::new("📊 SSP / δ2D")
+                egui::RichText::new("SSP / δ2D")
                     .size(12.0)
                     .color(egui::Color32::WHITE),
             )
@@ -6530,7 +7737,7 @@ impl NmrWorkbenchApp {
                 }
             }
             let relax_btn = egui::Button::new(
-                egui::RichText::new("📈 Relax / S²")
+                egui::RichText::new("Relax / S²")
                     .size(12.0)
                     .color(egui::Color32::WHITE),
             )
@@ -6553,7 +7760,7 @@ impl NmrWorkbenchApp {
                 }
             }
             let dyn_btn = egui::Button::new(
-                egui::RichText::new("⚡ CEST / CPMG / CSP")
+                egui::RichText::new("CEST / CPMG / CSP")
                     .size(12.0)
                     .color(egui::Color32::WHITE),
             )
@@ -6576,7 +7783,7 @@ impl NmrWorkbenchApp {
                 }
             }
             let stack1d_btn = egui::Button::new(
-                egui::RichText::new("📚 1D Stack / Kinetics")
+                egui::RichText::new("1D Stack / Kinetics")
                     .size(12.0)
                     .color(egui::Color32::WHITE),
             )
@@ -6603,7 +7810,7 @@ impl NmrWorkbenchApp {
                     }
                 }
             }
-            if ui.small_button("📌 Assign/Lock (at)").clicked() {
+            if ui.small_button("Assign/Lock (at)").clicked() {
                 self.show_assign_popover = true;
             }
         });
@@ -7793,15 +9000,18 @@ impl NmrWorkbenchApp {
                 if prim_c == PulseSequenceClass::Caco2D {
                     caco_2d_specs.push(hsqc.clone());
                 }
-                self.primary_2d_label = prim_lbl;
+                self.primary_2d_label = prim_lbl.clone();
                 self.primary_2d_visible = true;
                 self.primary_ppm_nudge = [0.0, 0.0];
                 self.hsqc_arc = Arc::new(hsqc.data.clone());
                 self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+                self.workbook
+                    .set_single_2d_page(prim_lbl, hsqc.clone(), !cubes_3d.is_empty());
                 self.hsqc_spec = Some(hsqc);
             } else {
                 self.hsqc_spec = None;
                 self.hsqc_arc = Arc::new(Vec::new());
+                self.workbook.clear_2d_pages();
             }
 
             self.overlay_layers.clear();
@@ -7809,13 +9019,16 @@ impl NmrWorkbenchApp {
                 if cls_ov == PulseSequenceClass::Caco2D {
                     caco_2d_specs.push(s2.clone());
                 }
+                let _ = self
+                    .workbook
+                    .add_2d_page(lbl.clone(), s2.clone(), true, false);
                 let lid = self.next_layer_id;
                 self.next_layer_id += 1;
                 let (base, _) = Self::estimate_2d_contour_base(&s2.data);
                 let arc = Arc::new(s2.data.clone());
                 let mut ov = OverlayLayerSpec::from_spectrum_2d(lid, 1, &s2, arc, base, idx + 1);
                 ov.visible = true;
-                let (pos, neg) = default_overlay_palette(idx + 1);
+                let (pos, neg) = contour_palette_for_theme(idx + 1, self.paper_white_canvas);
                 ov.pos_rgba = pos;
                 ov.neg_rgba = neg;
                 self.overlay_layers.push((lbl, ov));
@@ -7823,6 +9036,7 @@ impl NmrWorkbenchApp {
 
             if self.hsqc_spec.is_some() {
                 self.reset_view_to_spec();
+                self.save_live_2d_into_workbook();
             }
 
             // Regime auto-selection & 13C-IDP CON/CACO/3D root picking
@@ -8811,7 +10025,7 @@ impl NmrWorkbenchApp {
         // 4. `vt` Contour Threshold Popover
         if self.show_contour_modal {
             let mut open = self.show_contour_modal;
-            egui::Window::new("🎚 Contour Threshold & Levels (vt)")
+            egui::Window::new("Contour Threshold & Levels (vt)")
                 .id(egui::Id::unique("nmr_contour_threshold_modal"))
                 .open(&mut open)
                 .collapsible(false)
@@ -8852,7 +10066,7 @@ impl NmrWorkbenchApp {
         // 5. Multi-Spectrum Overlay Stack Manager (`T09.5`)
         if self.show_overlay_manager {
             let mut open = self.show_overlay_manager;
-            egui::Window::new("⧉ Multi-Spectrum GPU Contour Overlays")
+            egui::Window::new("Multi-Spectrum GPU Contour Overlays")
                 .id(egui::Id::unique("nmr_overlay_stack_manager"))
                 .open(&mut open)
                 .collapsible(false)
@@ -8950,7 +10164,7 @@ impl NmrWorkbenchApp {
         // 6. `at` Residue Assignment & Lock Popover (`T09.6` / `T09.7`)
         if self.show_assign_popover {
             let mut open = self.show_assign_popover;
-            egui::Window::new("📌 Assign & Lock Spin System (at)")
+            egui::Window::new("Assign & Lock Spin System (at)")
                 .id(egui::Id::unique("nmr_assign_lock_popover"))
                 .open(&mut open)
                 .collapsible(false)
@@ -8984,10 +10198,7 @@ impl NmrWorkbenchApp {
                                         );
                                     }
                                 });
-                            ui.checkbox(
-                                &mut self.assign_lock_check,
-                                "Pin as hard solver lock (🔒)",
-                            );
+                            ui.checkbox(&mut self.assign_lock_check, "Pin as hard solver lock");
                             ui.horizontal(|ui| {
                                 if ui.button("Apply Assignment").clicked() {
                                     let target_k = self.assign_target_res;
@@ -9026,7 +10237,7 @@ impl NmrWorkbenchApp {
         // 7. Dataset QC Report Modal
         if self.show_qc_modal {
             let mut open = self.show_qc_modal;
-            egui::Window::new("🛡 Calibrated Dataset QC Gate")
+            egui::Window::new("Calibrated Dataset QC Gate")
                 .id(egui::Id::unique("nmr_qc_report_modal"))
                 .open(&mut open)
                 .collapsible(false)
@@ -9061,6 +10272,9 @@ impl NmrWorkbenchApp {
                 .max_width(max_modal_w)
                 .show(ctx, |ui| {
                     ui.strong(format!("FERRIC v{}", nmr_core::VERSION));
+                    if let Some(ref gpu_lbl) = self.adapter_label {
+                        ui.monospace(format!("GPU Adapter: {gpu_lbl}"));
+                    }
                     ui.label(
                         "Clean-room open-source WebGPU protein NMR resonance assignment, raw FID/NUS DSP, and Octet 2D chemical studio (MIT License).",
                     );
@@ -9072,12 +10286,19 @@ impl NmrWorkbenchApp {
     fn draw_bottom_status_bar(&mut self, ui: &mut egui::Ui, now_ms: u64) {
         ui.horizontal(|ui| {
             self.chord_dispatcher.draw_status_bar_indicator(ui, now_ms);
+            let (nx, ny) = self.active_2d_nuclei();
+            let px = Self::pretty_nucleus_unicode(nx);
+            let py = Self::pretty_nucleus_unicode(ny);
             ui.label(
                 egui::RichText::new(format!(
-                    "Crosshair: ¹H {:.3} | ¹⁵N {:.2}{}",
+                    "Crosshair: {px} {:.3} | {py} {:.2}{}",
                     self.crosshair.h_ppm,
                     self.crosshair.n_ppm,
-                    if self.crosshair.locked { " 🔒" } else { "" }
+                    if self.crosshair.locked {
+                        " [Locked]"
+                    } else {
+                        ""
+                    }
                 ))
                 .small()
                 .monospace(),
@@ -9135,9 +10356,10 @@ impl eframe::App for NmrWorkbenchApp {
             self.dispatch_workbench_action(&ctx, act);
         }
 
-        // 3. Modal Two-Key NMR Chord Dispatcher (suppressed whenever ctx.egui_wants_keyboard_input() or non-ProteinNmr tab has focus)
+        // 3. Modal Two-Key NMR Chord Dispatcher (suppressed whenever ctx.egui_wants_keyboard_input(), 1D canvas, or non-ProteinNmr tab has focus)
         let suppress_chords = ctx.egui_wants_keyboard_input()
             || self.workspace_mode != WorkspaceMode::ProteinNmr
+            || self.show_stack1d_panel
             || self.command_palette.open
             || self.ingest_panel.open
             || self.show_text_io_modal
@@ -9311,7 +10533,7 @@ impl NmrWorkbenchApp {
                     }
                     if ui
                         .add(
-                            egui::Button::new("✨ Clean 2D")
+                            egui::Button::new("Clean 2D")
                                 .min_size(egui::vec2(78.0, MOBILE_TOUCH_MIN_HEIGHT)),
                         )
                         .clicked()
@@ -9320,7 +10542,7 @@ impl NmrWorkbenchApp {
                     }
                     if ui
                         .add(
-                            egui::Button::new("🧬 Peptide")
+                            egui::Button::new("Peptide")
                                 .min_size(egui::vec2(72.0, MOBILE_TOUCH_MIN_HEIGHT)),
                         )
                         .clicked()
@@ -9340,7 +10562,7 @@ impl NmrWorkbenchApp {
                     }
                     if ui
                         .add(
-                            egui::Button::new("🗑 Clear")
+                            egui::Button::new("Clear")
                                 .min_size(egui::vec2(58.0, MOBILE_TOUCH_MIN_HEIGHT)),
                         )
                         .clicked()
@@ -9559,11 +10781,11 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
     }
 
     fn show_mol3d_dock(&self) -> bool {
-        self.show_mol3d_viewport && !self.is_1d_studio_active()
+        self.show_mol3d_viewport && self.is_protein_2d_context()
     }
 
     fn show_strips_dock(&self) -> bool {
-        self.show_strips_dock && !self.is_1d_studio_active()
+        self.show_strips_dock && self.is_protein_2d_context()
     }
 
     fn show_workflow_guide(&self) -> bool {
@@ -9571,7 +10793,30 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
     }
 
     fn is_1d_full_canvas(&self) -> bool {
-        self.is_1d_studio_active()
+        self.is_1d_studio_active() || !self.is_protein_2d_context()
+    }
+
+    fn show_workbook_sidebar(&self) -> bool {
+        self.workbook.show_sidebar
+    }
+
+    fn draw_workbook_sidebar(&mut self, ui: &mut egui::Ui) {
+        let sel = self.current_workbook_selection();
+        let has_3d = self.hncacb_3d.is_some() || self.hnco_3d.is_some();
+        let has_pdb = self.loaded_pdb_text.is_some() || self.mol3d_panel.ensemble.is_some();
+        let show_strips = self.show_strips_dock && self.is_protein_2d_context();
+        let show_mol3d = self.show_mol3d_viewport && self.is_protein_2d_context();
+        let actions = render_workbook_sidebar(
+            ui,
+            &mut self.workbook,
+            &self.stack1d_panel,
+            sel,
+            has_3d,
+            has_pdb,
+            show_strips,
+            show_mol3d,
+        );
+        self.handle_workbook_sidebar_actions(actions);
     }
 
     fn draw_desktop_mode_header(
@@ -9672,11 +10917,11 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
 
     fn draw_mol3d_structure_view(&mut self, ui: &mut egui::Ui) -> egui::Rect {
         ui.horizontal(|ui| {
-            ui.strong("🧊 3D Structure");
+            ui.strong("3D Structure");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("✕ Hide")
-                    .on_hover_text("Close 3D Structure dock (reopen anytime via '🧊 3D')")
+                    .on_hover_text("Close 3D Structure dock (reopen via View ▸ 3D Structure Dock)")
                     .clicked()
                 {
                     self.show_mol3d_viewport = false;
@@ -10055,7 +11300,7 @@ impl NmrWorkbenchApp {
         let mut open = self.show_mcp_bridge_window;
         let max_modal_w = (ctx.content_rect().width() - 16.0).max(240.0);
         let mut panel_resp = None;
-        egui::Window::new("🔌 MCP Live Workbench Bridge")
+        egui::Window::new("MCP Live Workbench Bridge")
             .open(&mut open)
             .resizable(true)
             .default_width(520.0_f32.min(max_modal_w))
@@ -10837,11 +12082,13 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             dynamics_panel: DynamicsStudioPanel::new(),
             show_dynamics_panel: false,
             stack1d_panel: Stack1dState::default(),
-            show_stack1d_panel: false,
-            show_strips_dock: true,
+            show_stack1d_panel: true,
+            show_strips_dock: false,
             show_workflow_guide: false,
             show_advanced_protein_bar: false,
             show_sequence_ribbon: true,
+            paper_white_canvas: true,
+            workbook: WorkbookState::default(),
             show_native_global_open_bar: false,
             hsqc_spec: None,
             hsqc_arc: Arc::new(Vec::new()),
@@ -10913,6 +12160,15 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             pending_drop_outcome: Arc::new(std::sync::Mutex::new(None)),
         };
         app.load_builtin_demo_suite();
+        assert!(
+            app.paper_white_canvas
+                && app.show_stack1d_panel
+                && !app.show_mol3d_viewport
+                && !app.show_strips_dock,
+            "Calm default startup must open Page 1 (1D 1H) on Paper White with side docks hidden"
+        );
+        assert_eq!(app.stack1d_panel.traces.len(), 2);
+        assert_eq!(app.workbook.pages_2d.len(), 2);
         let mol_pep = nmr_core::octet_mol::build_peptide_2d("APY").expect("APY peptide");
         app.octet_app.scene = RenderScene::from(&mol_pep);
 
@@ -10972,6 +12228,16 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             }
         }
 
+        // Switching to small-molecule 2D COSY page (index 0) keeps protein docks tucked away
+        app.activate_2d_workbook_page(0);
+        assert!(!app.show_stack1d_panel && !app.show_strips_dock);
+        let md_cosy = run_app_frame(&ctx, 1440.0, 900.0, Vec::new(), &mut app);
+        assert!(md_cosy.left_dock_rect.is_none() && md_cosy.right_dock_rect.is_none());
+
+        // Switching to Ubiquitin 2D HSQC page (index 1) enables 3D Strips dock automatically
+        app.activate_2d_workbook_page(1);
+        assert!(!app.show_stack1d_panel && app.show_strips_dock);
+
         // Tablet 768x1024: single dock max + CentralPanel >= 420 px
         app.workspace_mode = WorkspaceMode::ProteinNmr;
         app.responsive_shell.tablet_dock = TabletActiveDock::StripsRight;
@@ -10988,11 +12254,10 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         assert!(md.left_dock_rect.is_some() && md.right_dock_rect.is_some());
 
         // 1D Studio full-canvas mode hides both side docks automatically
-        app.activate_1d_studio_mode();
+        app.activate_1d_workbook_page(0);
         let md_1d = run_app_frame(&ctx, 1440.0, 900.0, Vec::new(), &mut app);
         assert!(md_1d.left_dock_rect.is_none() && md_1d.right_dock_rect.is_none());
-        app.show_stack1d_panel = false;
-        app.show_strips_dock = true;
+        app.activate_2d_workbook_page(1);
 
         // Live 2-finger pinch zoom on NmrWorkbenchApp's own `draw_hsqc_canvas`
         app.responsive_shell.mobile_family = MobileWorkspaceFamily::ProteinNmr;
@@ -11218,11 +12483,13 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             dynamics_panel: DynamicsStudioPanel::new(),
             show_dynamics_panel: false,
             stack1d_panel: Stack1dState::default(),
-            show_stack1d_panel: false,
-            show_strips_dock: true,
+            show_stack1d_panel: true,
+            show_strips_dock: false,
             show_workflow_guide: false,
             show_advanced_protein_bar: false,
             show_sequence_ribbon: true,
+            paper_white_canvas: true,
+            workbook: WorkbookState::default(),
             show_native_global_open_bar: false,
             hsqc_spec: None,
             hsqc_arc: Arc::new(Vec::new()),

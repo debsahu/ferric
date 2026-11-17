@@ -52,19 +52,19 @@
       overscroll-behavior: none;
     }
     header.demo-bar {
-      min-height: calc(38px + env(safe-area-inset-top, 0px));
+      min-height: calc(28px + env(safe-area-inset-top, 0px));
       flex-shrink: 0;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
+      gap: 10px;
       padding-top: env(safe-area-inset-top, 0px);
-      padding-right: calc(14px + env(safe-area-inset-right, 0px));
+      padding-right: calc(10px + env(safe-area-inset-right, 0px));
       padding-bottom: 0;
-      padding-left: calc(14px + env(safe-area-inset-left, 0px));
-      background: var(--bar-bg);
-      border-bottom: 1px solid var(--bar-border);
-      font-size: 13px;
+      padding-left: calc(10px + env(safe-area-inset-left, 0px));
+      background: #0f151e;
+      border-bottom: 1px solid #1e293b;
+      font-size: 11.5px;
       z-index: 20;
       position: relative;
       touch-action: manipulation;
@@ -72,86 +72,83 @@
     .demo-brand {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
       min-width: 0;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
     .demo-brand strong {
-      color: #ffffff;
-      letter-spacing: 0.01em;
-    }
-    .preset-note {
-      color: var(--muted);
+      color: #f8fafc;
       font-size: 12px;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      font-weight: 700;
+      letter-spacing: 0.08em;
     }
     .demo-actions {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       flex-shrink: 0;
     }
     .cap-badge {
-      padding: 2px 8px;
-      border-radius: 999px;
-      font-size: 11px;
+      padding: 1px 7px;
+      border-radius: 4px;
+      font-size: 10.5px;
       font-weight: 600;
       white-space: nowrap;
-      background: rgba(95, 212, 255, 0.14);
+      background: rgba(95, 212, 255, 0.12);
       color: var(--accent);
-      border: 1px solid rgba(95, 212, 255, 0.28);
+      border: 1px solid rgba(95, 212, 255, 0.25);
     }
     .cap-badge.ok {
       background: var(--ok-bg);
       color: var(--ok-fg);
-      border-color: rgba(110, 231, 168, 0.32);
+      border-color: rgba(110, 231, 168, 0.28);
     }
     .cap-badge.warn {
       background: var(--warn-bg);
       color: var(--warn-fg);
-      border-color: rgba(251, 191, 36, 0.34);
+      border-color: rgba(251, 191, 36, 0.30);
     }
     .cap-badge.err {
       background: var(--err-bg);
       color: var(--err-fg);
-      border-color: rgba(252, 165, 165, 0.34);
+      border-color: rgba(252, 165, 165, 0.30);
     }
     a.manual-link {
-      color: var(--accent);
+      color: #cbd5e1;
       text-decoration: none;
-      font-weight: 600;
-      padding: 4px 10px;
-      border-radius: 6px;
-      border: 1px solid rgba(95, 212, 255, 0.32);
-      background: rgba(95, 212, 255, 0.08);
+      font-weight: 500;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      border: 1px solid #263449;
+      background: rgba(255, 255, 255, 0.03);
       white-space: nowrap;
       touch-action: manipulation;
     }
     a.manual-link:hover {
-      background: rgba(95, 212, 255, 0.18);
-    }
-    a.manual-link.github-link {
-      color: var(--text);
-      border-color: var(--bar-border);
-      background: rgba(255, 255, 255, 0.05);
-    }
-    a.manual-link.github-link:hover {
-      border-color: rgba(95, 212, 255, 0.36);
+      color: #ffffff;
+      border-color: rgba(95, 212, 255, 0.38);
       background: rgba(95, 212, 255, 0.12);
     }
-    .label-mobile {
-      display: none;
+    a.manual-link.github-link {
+      color: #cbd5e1;
+      border-color: #263449;
+      background: rgba(255, 255, 255, 0.03);
+    }
+    a.manual-link.github-link:hover {
+      color: #ffffff;
+      border-color: rgba(95, 212, 255, 0.38);
+      background: rgba(95, 212, 255, 0.12);
     }
     #canvas-wrap {
       position: relative;
       flex: 1 1 auto;
       min-height: 0;
       width: 100%;
-      height: calc(100vh - 38px);
-      height: calc(100dvh - 38px - env(safe-area-inset-top, 0px));
+      height: calc(100vh - 28px);
+      height: calc(100dvh - 28px - env(safe-area-inset-top, 0px));
       padding-right: env(safe-area-inset-right, 0px);
       padding-bottom: env(safe-area-inset-bottom, 0px);
       padding-left: env(safe-area-inset-left, 0px);
@@ -243,30 +240,17 @@
       font-size: 12.5px;
       color: var(--text);
     }
-    @media (max-width: 960px) {
-      .preset-note {
-        display: none;
-      }
-    }
     @media (max-width: 680px) {
       header.demo-bar {
-        min-height: calc(36px + env(safe-area-inset-top, 0px));
+        min-height: calc(28px + env(safe-area-inset-top, 0px));
         gap: 6px;
         padding-right: calc(8px + env(safe-area-inset-right, 0px));
         padding-left: calc(8px + env(safe-area-inset-left, 0px));
-        font-size: 12px;
+        font-size: 11px;
       }
       #canvas-wrap {
-        height: calc(100vh - 36px);
-        height: calc(100dvh - 36px - env(safe-area-inset-top, 0px));
-      }
-      .preset-note,
-      .brand-sub,
-      .label-desktop {
-        display: none;
-      }
-      .label-mobile {
-        display: inline;
+        height: calc(100vh - 28px);
+        height: calc(100dvh - 28px - env(safe-area-inset-top, 0px));
       }
       .demo-brand {
         gap: 6px;
@@ -275,12 +259,12 @@
         gap: 5px;
       }
       .cap-badge {
-        padding: 2px 6px;
-        font-size: 10.5px;
+        padding: 1px 6px;
+        font-size: 10px;
       }
       a.manual-link {
-        padding: 3px 7px;
-        font-size: 11.5px;
+        padding: 2px 7px;
+        font-size: 11px;
       }
       .status-card {
         padding: 14px 16px;
@@ -292,14 +276,11 @@
 <body>
   <header class="demo-bar">
     <div class="demo-brand">
-      <strong>FERRIC<span class="brand-sub"> &middot; Live WebGPU Demo</span></strong>
-      <span class="preset-note">
-        Preloaded in-memory: Ubiquitin 2D HSQC + 3D HNCACB + 1UBQ 3D + 1D Stack + DOSY + Metabolomics
-      </span>
+      <strong>FERRIC</strong>
     </div>
     <div class="demo-actions">
       <span id="gpu_cap_badge" class="cap-badge">Checking GPU&hellip;</span>
-      <a class="manual-link" href="../index.html"><span class="label-desktop">&larr; Documentation Manual</span><span class="label-mobile">Manual</span></a>
+      <a class="manual-link" href="../index.html">Manual</a>
       <a class="manual-link github-link" href="https://github.com/debsahu/ferric" target="_blank" rel="noopener noreferrer">GitHub</a>
     </div>
   </header>

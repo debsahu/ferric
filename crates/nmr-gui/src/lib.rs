@@ -25,4 +25,5 @@ pub mod session_io;
 pub mod sidechain_widget;
 pub mod stack1d_panel;
 pub mod strip_tiler;
+pub mod workbook;
 pub mod workflow_bar;
