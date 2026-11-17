@@ -680,6 +680,23 @@ impl StripTilerPanel {
                 let eff_col_w =
                     ((canvas_rect.width() - left_axis_w - 6.0) / (columns.len() as f32)).max(col_w);
 
+                let ali_is_1h = ctx
+                    .spectra_3d
+                    .aliphatic_3d
+                    .is_some_and(|s| s.axis_z.label.to_ascii_uppercase().contains('H'));
+                let ali_range = if let Some(s3) = ctx.spectra_3d.aliphatic_3d.filter(|_| ali_is_1h)
+                {
+                    let lo = s3.axis_z.min_ppm().max(-3.0);
+                    let hi = s3.axis_z.max_ppm().min(12.0);
+                    if hi > lo {
+                        (lo, hi)
+                    } else {
+                        (-2.0, 10.0)
+                    }
+                } else {
+                    self.c_aliphatic_range
+                };
+
                 let co_to_y = |ppm: f64| -> f32 {
                     SyncCrosshair::ppm_to_strip_y(
                         self.c_carbonyl_range.0,
@@ -690,13 +707,7 @@ impl StripTilerPanel {
                     )
                 };
                 let ali_to_y = |ppm: f64| -> f32 {
-                    SyncCrosshair::ppm_to_strip_y(
-                        self.c_aliphatic_range.0,
-                        self.c_aliphatic_range.1,
-                        ali_top,
-                        ali_bot,
-                        ppm,
-                    )
+                    SyncCrosshair::ppm_to_strip_y(ali_range.0, ali_range.1, ali_top, ali_bot, ppm)
                 };
 
                 // Draw 13C' and 13CA/CB axis ticks
@@ -717,7 +728,15 @@ impl StripTilerPanel {
                         egui::Stroke::new(0.5, egui::Color32::from_rgb(26, 36, 46)),
                     );
                 }
-                for c_tick in [15.0, 25.0, 35.0, 45.0, 55.0, 65.0] {
+                let ali_ticks: &[f64] = if ali_is_1h {
+                    &[-2.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0]
+                } else {
+                    &[15.0, 25.0, 35.0, 45.0, 55.0, 65.0]
+                };
+                for &c_tick in ali_ticks {
+                    if c_tick < ali_range.0 || c_tick > ali_range.1 {
+                        continue;
+                    }
                     let y = ali_to_y(c_tick);
                     painter.text(
                         egui::pos2(canvas_rect.left() + 3.0, y),
@@ -912,7 +931,7 @@ impl StripTilerPanel {
                         ali_box,
                         ss,
                         ctx.spectra_3d.aliphatic_3d,
-                        self.c_aliphatic_range,
+                        ali_range,
                         &ali_to_y,
                     );
 
@@ -935,8 +954,8 @@ impl StripTilerPanel {
                                 }
                             } else if ali_box.contains(hp) {
                                 let c_ppm = SyncCrosshair::strip_y_to_ppm(
-                                    self.c_aliphatic_range.0,
-                                    self.c_aliphatic_range.1,
+                                    ali_range.0,
+                                    ali_range.1,
                                     ali_top,
                                     ali_bot,
                                     hp.y,
@@ -984,12 +1003,9 @@ impl StripTilerPanel {
                             egui::Stroke::new(1.0, line_col),
                         );
                     }
-                    if let Some(y_ali) = xh.project_c_to_strip_y(
-                        self.c_aliphatic_range.0,
-                        self.c_aliphatic_range.1,
-                        ali_top,
-                        ali_bot,
-                    ) {
+                    if let Some(y_ali) =
+                        xh.project_c_to_strip_y(ali_range.0, ali_range.1, ali_top, ali_bot)
+                    {
                         painter.line_segment(
                             [
                                 egui::pos2(x_pred_left, y_ali),

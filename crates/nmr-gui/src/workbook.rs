@@ -1203,6 +1203,65 @@ pub struct Stored2dPage {
     pub zoom_history: Vec<[f32; 4]>,
     pub pick_diagonal: bool,
     pub mini_dots: Vec<([f32; 2], bool)>,
+    pub source_cube_idx: Option<usize>,
+}
+
+/// Extract a signed max-abs 2D `(F3, F2)` skyline projection from a `Spectrum3D` cube.
+pub fn extract_3d_skyline_f3_f2(s3: &Spectrum3D) -> Spectrum2D {
+    let (nx, ny, nz) = (s3.nx(), s3.ny(), s3.nz());
+    let mut data = vec![0.0_f32; ny * nx];
+    for gz in 0..nz {
+        let plane = &s3.data[gz * ny * nx..(gz + 1) * ny * nx];
+        for (dst, &val) in data.iter_mut().zip(plane.iter()) {
+            if val.abs() > dst.abs() {
+                *dst = val;
+            }
+        }
+    }
+    Spectrum2D {
+        name: s3.name.clone(),
+        axis_x: s3.axis_x.clone(),
+        axis_y: s3.axis_y.clone(),
+        data,
+    }
+}
+
+/// Extract a 2D `(F3, F2)` plane at fixed F1 (`iz`) from a `Spectrum3D` cube.
+pub fn extract_3d_plane_f1(s3: &Spectrum3D, iz: usize) -> Spectrum2D {
+    let (nx, ny, nz) = (s3.nx(), s3.ny(), s3.nz());
+    let z = iz.min(nz.saturating_sub(1));
+    let off = z * ny * nx;
+    let data = if off + ny * nx <= s3.data.len() {
+        s3.data[off..off + ny * nx].to_vec()
+    } else {
+        vec![0.0_f32; ny * nx]
+    };
+    Spectrum2D {
+        name: s3.name.clone(),
+        axis_x: s3.axis_x.clone(),
+        axis_y: s3.axis_y.clone(),
+        data,
+    }
+}
+
+/// Extract a 2D `(F3, F1)` plane at fixed F2 (`iy`) from a `Spectrum3D` cube.
+pub fn extract_3d_plane_f2(s3: &Spectrum3D, iy: usize) -> Spectrum2D {
+    let (nx, ny, nz) = (s3.nx(), s3.ny(), s3.nz());
+    let y = iy.min(ny.saturating_sub(1));
+    let mut data = vec![0.0_f32; nz * nx];
+    for gz in 0..nz {
+        let src = (gz * ny + y) * nx;
+        let dst = gz * nx;
+        if src + nx <= s3.data.len() {
+            data[dst..dst + nx].copy_from_slice(&s3.data[src..src + nx]);
+        }
+    }
+    Spectrum2D {
+        name: s3.name.clone(),
+        axis_x: s3.axis_x.clone(),
+        axis_y: s3.axis_z.clone(),
+        data,
+    }
 }
 
 impl Stored2dPage {
@@ -1267,7 +1326,47 @@ impl Stored2dPage {
             zoom_history: Vec::new(),
             pick_diagonal: false,
             mini_dots,
+            source_cube_idx: None,
         }
+    }
+
+    pub fn from_3d_cube(
+        id: u64,
+        cube_idx: usize,
+        label: impl Into<String>,
+        spec3d: &Spectrum3D,
+    ) -> Self {
+        let skyline = extract_3d_skyline_f3_f2(spec3d);
+        let raw_lbl = label.into();
+        let title = if raw_lbl.trim().is_empty() {
+            format!("3D {}", spec3d.exp)
+        } else if raw_lbl
+            .to_ascii_uppercase()
+            .contains(&spec3d.exp.to_ascii_uppercase())
+        {
+            raw_lbl
+        } else {
+            format!("{raw_lbl} · 3D {}", spec3d.exp)
+        };
+        let px = pretty_nucleus(canonical_axis_nucleus(
+            &spec3d.axis_x.label,
+            spec3d.axis_x.min_ppm(),
+            spec3d.axis_x.max_ppm(),
+        ));
+        let py = pretty_nucleus(canonical_axis_nucleus(
+            &spec3d.axis_y.label,
+            spec3d.axis_y.min_ppm(),
+            spec3d.axis_y.max_ppm(),
+        ));
+        let pz = pretty_nucleus(canonical_axis_nucleus(
+            &spec3d.axis_z.label,
+            spec3d.axis_z.min_ppm(),
+            spec3d.axis_z.max_ppm(),
+        ));
+        let mut page = Self::from_spectrum_2d(id, title, skyline, true);
+        page.subtitle = format!("3D {px}×{py}×{pz} · {} planes", spec3d.nz());
+        page.source_cube_idx = Some(cube_idx);
+        page
     }
 
     #[inline]
@@ -1508,6 +1607,18 @@ impl WorkbookState {
         ));
         self.active_2d_idx = 0;
         self.two_d.zoom_history.clear();
+    }
+
+    pub fn add_3d_cube_page(
+        &mut self,
+        cube_idx: usize,
+        label: impl Into<String>,
+        spec3d: &Spectrum3D,
+    ) -> usize {
+        let id = self.alloc_page_id();
+        self.pages_2d
+            .push(Stored2dPage::from_3d_cube(id, cube_idx, label, spec3d));
+        self.pages_2d.len() - 1
     }
 
     pub fn add_2d_page(
@@ -2708,15 +2819,22 @@ pub fn render_workbook_sidebar(
                     );
                     paint_mini_2d_preview(painter, thumb_r, pg, is_active);
 
-                    // Page number badge
+                    // Page number badge (tinted violet for 3D cubes)
+                    let is_3d_cube = pg.source_cube_idx.is_some();
                     let badge_r = egui::Rect::from_min_size(
                         egui::pos2(rect.left() + 7.0, rect.top() + 5.0),
-                        egui::vec2(17.0, 15.0),
+                        egui::vec2(if is_3d_cube { 23.0 } else { 17.0 }, 15.0),
                     );
                     painter.rect_filled(
                         badge_r,
                         3.0,
-                        if is_active {
+                        if is_3d_cube {
+                            if is_active {
+                                egui::Color32::from_rgb(109, 40, 217)
+                            } else {
+                                egui::Color32::from_rgb(76, 29, 149)
+                            }
+                        } else if is_active {
                             egui::Color32::from_rgb(38, 94, 150)
                         } else {
                             egui::Color32::from_rgb(30, 41, 59)
@@ -2725,7 +2843,11 @@ pub fn render_workbook_sidebar(
                     painter.text(
                         badge_r.center(),
                         egui::Align2::CENTER_CENTER,
-                        format!("{page_num}"),
+                        if is_3d_cube {
+                            "3D".to_string()
+                        } else {
+                            format!("{page_num}")
+                        },
                         egui::FontId::monospace(9.5),
                         egui::Color32::from_rgb(226, 232, 240),
                     );

@@ -663,6 +663,53 @@ pub fn read_bruker_pdata_3d_from_bytes(
     proc3s_txt: &str,
     raw_bytes: &[u8],
 ) -> Result<Spectrum3D, String> {
+    read_bruker_pdata_3d_from_reader(
+        name,
+        exp,
+        procs_txt,
+        proc2s_txt,
+        proc3s_txt,
+        std::io::Cursor::new(raw_bytes),
+    )
+}
+
+fn decode_bruker_word(buf: &[u8], bytordp: i32, dtypp: i32, scale: f64) -> f32 {
+    let big_endian = bytordp != 0;
+    if dtypp == 2 {
+        let arr: [u8; 8] = buf[..8].try_into().unwrap_or([0; 8]);
+        let v = if big_endian {
+            f64::from_be_bytes(arr)
+        } else {
+            f64::from_le_bytes(arr)
+        };
+        (v * scale) as f32
+    } else if dtypp == 1 {
+        let arr: [u8; 4] = buf[..4].try_into().unwrap_or([0; 4]);
+        let v = if big_endian {
+            f32::from_be_bytes(arr)
+        } else {
+            f32::from_le_bytes(arr)
+        };
+        (v as f64 * scale) as f32
+    } else {
+        let arr: [u8; 4] = buf[..4].try_into().unwrap_or([0; 4]);
+        let v = if big_endian {
+            i32::from_be_bytes(arr)
+        } else {
+            i32::from_le_bytes(arr)
+        };
+        (v as f64 * scale) as f32
+    }
+}
+
+fn read_bruker_pdata_3d_from_reader<R: Read>(
+    name: &str,
+    exp: &str,
+    procs_txt: &str,
+    proc2s_txt: &str,
+    proc3s_txt: &str,
+    mut reader: R,
+) -> Result<Spectrum3D, String> {
     let p1 = parse_jcamp_params(procs_txt);
     let p2 = parse_jcamp_params(proc2s_txt);
     let p3 = parse_jcamp_params(proc3s_txt);
@@ -672,8 +719,6 @@ pub fn read_bruker_pdata_3d_from_bytes(
     let (axis_z, xdim_z, ..) = parse_bruker_axis(&p3, "13C")?;
 
     let (nx, ny, nz) = (axis_x.size, axis_y.size, axis_z.size);
-    let raw = decode_bruker_words(raw_bytes, bytordp, dtypp, nc_proc, nx * ny * nz)?;
-
     let tx = xdim_x.min(nx).max(1);
     let ty = xdim_y.min(ny).max(1);
     let tz = xdim_z.min(nz).max(1);
@@ -681,22 +726,33 @@ pub fn read_bruker_pdata_3d_from_bytes(
     let nby = ny.div_ceil(ty);
     let nbz = nz.div_ceil(tz);
 
+    let word_bytes = if dtypp == 2 { 8 } else { 4 };
+    let scale = 2.0_f64.powi(nc_proc);
+    let mut row_buf = vec![0u8; tx * word_bytes];
     let mut data = vec![0.0f32; nz * ny * nx];
-    let mut idx = 0usize;
+
     for bz in 0..nbz {
         for by in 0..nby {
             for bx in 0..nbx {
                 for lz in 0..tz {
+                    let gz = bz * tz + lz;
                     for ly in 0..ty {
-                        for lx in 0..tx {
-                            let gx = bx * tx + lx;
-                            let gy = by * ty + ly;
-                            let gz = bz * tz + lz;
-                            if idx < raw.len() {
-                                if gx < nx && gy < ny && gz < nz {
-                                    data[(gz * ny + gy) * nx + gx] = raw[idx];
+                        let gy = by * ty + ly;
+                        reader.read_exact(&mut row_buf).map_err(|e| {
+                            format!(
+                                "Bruker 3rrr data truncated (expected {}x{}x{}): {e}",
+                                nx, ny, nz
+                            )
+                        })?;
+                        if gz < nz && gy < ny {
+                            let row_off = (gz * ny + gy) * nx;
+                            for lx in 0..tx {
+                                let gx = bx * tx + lx;
+                                if gx < nx {
+                                    let off = lx * word_bytes;
+                                    data[row_off + gx] =
+                                        decode_bruker_word(&row_buf[off..], bytordp, dtypp, scale);
                                 }
-                                idx += 1;
                             }
                         }
                     }
@@ -724,13 +780,14 @@ pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Sp
         .map_err(|e| format!("failed to read proc2s: {e}"))?;
     let proc3s_txt = fs::read_to_string(dir.join("proc3s"))
         .map_err(|e| format!("failed to read proc3s: {e}"))?;
-    let raw_bytes = fs::read(dir.join("3rrr")).map_err(|e| format!("failed to read 3rrr: {e}"))?;
+    let file = File::open(dir.join("3rrr")).map_err(|e| format!("failed to open 3rrr: {e}"))?;
+    let reader = BufReader::with_capacity(1024 * 1024, file);
     let name = pdata_dir
         .as_ref()
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("3rrr");
-    read_bruker_pdata_3d_from_bytes(name, exp, &procs_txt, &proc2s_txt, &proc3s_txt, &raw_bytes)
+    read_bruker_pdata_3d_from_reader(name, exp, &procs_txt, &proc2s_txt, &proc3s_txt, reader)
 }
 
 /// Write a Bruker TopSpin 3D processed directory (`procs`, `proc2s`, `proc3s`, `3rrr`) for round-trip export.

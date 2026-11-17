@@ -2869,22 +2869,165 @@ pub fn read_bruker_fid_3d_opts(
     let acqus = read_merged_bruker_params(&dir, "acqus", "acqu")?;
     let acqu2s = read_merged_bruker_params(&dir, "acqu2s", "acqu2")?;
     let acqu3s = read_merged_bruker_params(&dir, "acqu3s", "acqu3")?;
-    let is_fntype_nus = validate_bruker_fntype(&dir, &acqus, &[&acqu2s, &acqu3s])?;
 
     let procs_raw = read_optional_bruker_proc(&dir, "procs");
     let proc2s_raw = read_optional_bruker_proc(&dir, "proc2s");
     let proc3s_raw = read_optional_bruker_proc(&dir, "proc3s");
-    // If `pdata/1` contains `proc2s` without `proc3s`, only a 2D `xfb` scout plane was transformed
-    // rather than the 3D cube — ignore its 2D plane phase/reverse metadata.
     let (procs, proc2s, proc3s) = if proc2s_raw.is_some() && proc3s_raw.is_none() {
         (None, None, None)
     } else {
         (procs_raw, proc2s_raw, proc3s_raw)
     };
 
-    let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
-
     let pulprog_interp = interpret_bruker_dir_checked(&dir)?;
+    let pp_txt = read_optional_bruker_pulseprogram(&dir)?;
+    let nuslist_txt = find_bruker_nuslist_file(&dir, &acqus)
+        .map(|p| {
+            read_text_lossy_capped(&p)
+                .map_err(|e| format!("failed to read 3D NUS schedule {}: {e}", p.display()))
+        })
+        .transpose()?;
+
+    let ser_path = find_file_ci(&dir, "ser")
+        .ok_or_else(|| format!("missing 3D ser binary file in {}", dir.display()))?;
+    let bytes =
+        fs::read(&ser_path).map_err(|e| format!("failed to read {}: {e}", ser_path.display()))?;
+    let name = dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("ser")
+        .to_string();
+
+    read_bruker_fid_3d_from_params(
+        &name,
+        &dir,
+        &acqus,
+        &acqu2s,
+        &acqu3s,
+        procs.as_ref(),
+        proc2s.as_ref(),
+        proc3s.as_ref(),
+        pulprog_interp,
+        pp_txt.as_deref(),
+        nuslist_txt.as_deref(),
+        &bytes,
+        allow_truncated_fid,
+    )
+}
+
+/// Read a Bruker 3D `ser` dataset from in-memory parameter texts and raw `ser` bytes (WASM/archive safe).
+#[allow(clippy::too_many_arguments)]
+pub fn read_bruker_fid_3d_from_bytes(
+    name: &str,
+    acqus_txt: &str,
+    acqu_txt: Option<&str>,
+    acqu2s_txt: &str,
+    acqu2_txt: Option<&str>,
+    acqu3s_txt: &str,
+    acqu3_txt: Option<&str>,
+    procs_txt: Option<&str>,
+    proc2s_txt: Option<&str>,
+    proc3s_txt: Option<&str>,
+    pulseprogram_txt: Option<&str>,
+    nuslist_txt: Option<&str>,
+    bytes: &[u8],
+    allow_truncated_fid: bool,
+) -> Result<Fid3D, String> {
+    let mut acqus = HashMap::new();
+    if let Some(fb) = acqu_txt {
+        acqus.extend(parse_jcamp_str(fb));
+    }
+    acqus.extend(parse_jcamp_str(acqus_txt));
+    let mut acqu2s = HashMap::new();
+    if let Some(fb) = acqu2_txt {
+        acqu2s.extend(parse_jcamp_str(fb));
+    }
+    acqu2s.extend(parse_jcamp_str(acqu2s_txt));
+    let mut acqu3s = HashMap::new();
+    if let Some(fb) = acqu3_txt {
+        acqu3s.extend(parse_jcamp_str(fb));
+    }
+    acqu3s.extend(parse_jcamp_str(acqu3s_txt));
+    if acqus.is_empty() || acqu2s.is_empty() || acqu3s.is_empty() {
+        return Err(format!(
+            "missing Bruker acqus / acqu2s / acqu3s parameters for 3D dataset '{name}'"
+        ));
+    }
+
+    let procs_raw = procs_txt
+        .map(parse_jcamp_str)
+        .filter(|m| !m.is_empty())
+        .filter(bruker_proc_is_processed);
+    let proc2s_raw = proc2s_txt
+        .map(parse_jcamp_str)
+        .filter(|m| !m.is_empty())
+        .filter(bruker_proc_is_processed);
+    let proc3s_raw = proc3s_txt
+        .map(parse_jcamp_str)
+        .filter(|m| !m.is_empty())
+        .filter(bruker_proc_is_processed);
+    let (procs, proc2s, proc3s) = if proc2s_raw.is_some() && proc3s_raw.is_none() {
+        (None, None, None)
+    } else {
+        (procs_raw, proc2s_raw, proc3s_raw)
+    };
+
+    let pulprog_interp = if pulseprogram_txt.is_some() {
+        let inp = crate::pulprog::BrukerExperimentInputs {
+            acqus_text: acqus_txt,
+            acqu2s_text: Some(acqu2s_txt),
+            acqu3s_text: Some(acqu3s_txt),
+            acqu4s_text: None,
+            pulseprogram_text: pulseprogram_txt,
+            nuslist_text: nuslist_txt,
+            vdlist_text: None,
+            vclist_text: None,
+            fqlist_text: None,
+            difflist_text: None,
+            local_includes: HashMap::new(),
+        };
+        crate::pulprog::interpret_bruker_experiment(&inp).ok()
+    } else {
+        None
+    };
+
+    read_bruker_fid_3d_from_params(
+        name,
+        Path::new(name),
+        &acqus,
+        &acqu2s,
+        &acqu3s,
+        procs.as_ref(),
+        proc2s.as_ref(),
+        proc3s.as_ref(),
+        pulprog_interp,
+        pulseprogram_txt,
+        nuslist_txt,
+        bytes,
+        allow_truncated_fid,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_bruker_fid_3d_from_params(
+    name: &str,
+    dir: &Path,
+    acqus: &HashMap<String, String>,
+    acqu2s: &HashMap<String, String>,
+    acqu3s: &HashMap<String, String>,
+    procs: Option<&HashMap<String, String>>,
+    proc2s: Option<&HashMap<String, String>>,
+    proc3s: Option<&HashMap<String, String>>,
+    pulprog_interp: Option<crate::pulprog::PulprogInterpretation>,
+    pp_txt: Option<&str>,
+    nuslist_txt: Option<&str>,
+    bytes: &[u8],
+    allow_truncated_fid: bool,
+) -> Result<Fid3D, String> {
+    let is_fntype_nus = validate_bruker_fntype(dir, acqus, &[acqu2s, acqu3s])?;
+
+    let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(acqus, procs)?;
+
     let header_aqseq: i32 = match acqus.get("AQSEQ") {
         Some(v) => v.trim().parse::<i32>().unwrap_or(-1),
         None => 0,
@@ -2901,10 +3044,6 @@ pub fn read_bruker_fid_3d_opts(
         _ => header_aqseq,
     };
 
-    let ser_path = find_file_ci(&dir, "ser")
-        .ok_or_else(|| format!("missing 3D ser binary file in {}", dir.display()))?;
-    let bytes =
-        fs::read(&ser_path).map_err(|e| format!("failed to read {}: {e}", ser_path.display()))?;
     let word_bytes = if dtypa == 2 { 8 } else { 4 };
     let raw_stride_1024 = (axis_x.td_raw * word_bytes).div_ceil(1024) * 1024;
 
@@ -2920,23 +3059,23 @@ pub fn read_bruker_fid_3d_opts(
         .map_err(|e| format!("invalid TD in acqu3s: {e}"))?;
     let total_acq_param = td_acq_y * td_acq_z;
 
-    let sched_file = find_bruker_nuslist_file(&dir, &acqus);
+    let has_nuslist = nuslist_txt.is_some_and(|s| !s.trim().is_empty());
     let nus_td_y_opt = acqu2s
         .get("NusTD")
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .or_else(|| parse_td_indirect_entry(&acqus, 2));
+        .or_else(|| parse_td_indirect_entry(acqus, 2));
     let nus_td_z_opt = acqu3s
         .get("NusTD")
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .or_else(|| parse_td_indirect_entry(&acqus, 1));
+        .or_else(|| parse_td_indirect_entry(acqus, 1));
 
     // TopSpin 4 uniform guard: FnTYPE == 0 (e.g. CISD3_HNCA with NUSLIST=<automatic>, NusAMOUNT=100,
     // TD=40x80, NusTD=40x80) is uniform when ser matches the uniform grid!
     let full_grid_est = nus_td_y_opt.unwrap_or(td_acq_y) * nus_td_z_opt.unwrap_or(td_acq_z);
     let implicit_nus = !is_fntype_nus
-        && sched_file.is_some()
+        && has_nuslist
         && (full_grid_est > total_acq_param || bytes.len() < full_grid_est * raw_stride_1024);
     let is_nus = is_fntype_nus || implicit_nus;
 
@@ -2944,20 +3083,20 @@ pub fn read_bruker_fid_3d_opts(
         let unflat = td_acq_y > 1 && td_acq_z > 1;
         (
             resolve_bruker_nus_full_td(
-                &acqu2s,
-                &acqus,
+                acqu2s,
+                acqus,
                 2,
                 unflat.then_some(td_acq_y),
                 "F2 (acqu2s)",
-                &dir,
+                dir,
             )?,
             resolve_bruker_nus_full_td(
-                &acqu3s,
-                &acqus,
+                acqu3s,
+                acqus,
                 1,
                 unflat.then_some(td_acq_z),
                 "F1 (acqu3s)",
-                &dir,
+                dir,
             )?,
         )
     } else {
@@ -2971,39 +3110,26 @@ pub fn read_bruker_fid_3d_opts(
         .as_ref()
         .and_then(|pi| pi.indirect_dims.get(1));
 
-    let mut axis_y = parse_bruker_indirect_axis(
-        &acqus,
-        &acqu2s,
-        proc2s.as_ref(),
-        "15N",
-        Some(td_full_y),
-        ind_phys_y,
-    )?;
-    let mut axis_z = parse_bruker_indirect_axis(
-        &acqus,
-        &acqu3s,
-        proc3s.as_ref(),
-        "13C",
-        Some(td_full_z),
-        ind_phys_z,
-    )?;
-    if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none()
-        || proc3s.as_ref().and_then(|p| p.get("REVERSE")).is_none()
+    let mut axis_y =
+        parse_bruker_indirect_axis(acqus, acqu2s, proc2s, "15N", Some(td_full_y), ind_phys_y)?;
+    let mut axis_z =
+        parse_bruker_indirect_axis(acqus, acqu3s, proc3s, "13C", Some(td_full_z), ind_phys_z)?;
+    if proc2s.and_then(|p| p.get("REVERSE")).is_none()
+        || proc3s.and_then(|p| p.get("REVERSE")).is_none()
     {
-        let pp_txt = read_optional_bruker_pulseprogram(&dir)?;
         let pulprog = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
-        if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
+        if proc2s.and_then(|p| p.get("REVERSE")).is_none() {
             axis_y.stored_proc.reverse = if let Some(ip) = ind_phys_y {
                 ip.reverse_frequency
             } else {
-                infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog, 2, axis_y.quad_mode)
+                infer_bruker_raw_indirect_reverse(pp_txt, pulprog, 2, axis_y.quad_mode)
             };
         }
-        if proc3s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
+        if proc3s.and_then(|p| p.get("REVERSE")).is_none() {
             axis_z.stored_proc.reverse = if let Some(ip) = ind_phys_z {
                 ip.reverse_frequency
             } else {
-                infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog, 1, axis_z.quad_mode)
+                infer_bruker_raw_indirect_reverse(pp_txt, pulprog, 1, axis_z.quad_mode)
             };
         }
     }
@@ -3035,7 +3161,7 @@ pub fn read_bruker_fid_3d_opts(
     let mut out_c2_sin = vec![[0.0, 0.0]; n0];
 
     let nus_mask = if is_nus {
-        let sched_path = sched_file.ok_or_else(|| {
+        let sched_text = nuslist_txt.ok_or_else(|| {
             format!(
                 "Bruker 3D NUS dataset in {} is missing a non-empty nuslist schedule file",
                 dir.display()
@@ -3043,7 +3169,15 @@ pub fn read_bruker_fid_3d_opts(
         })?;
         // AQSEQ == 0 (3-2-1): col 0 is F2 (acqu2s), col 1 is F1 (acqu3s).
         // AQSEQ == 1 (3-1-2): col 0 is F1 (acqu3s), col 1 is F2 (acqu2s).
-        let coords = parse_nus_schedule_2d(&sched_path, n1, n2, aqseq == 0)?;
+        let aqseq_ord = if aqseq == 0 {
+            crate::pulprog::AcquisitionOrder::Aqseq321
+        } else {
+            crate::pulprog::AcquisitionOrder::Aqseq312
+        };
+        let decoded = crate::pulprog::decode_nuslist_str(sched_text, &[n1, n2], aqseq_ord)
+            .map_err(|e| format!("invalid 3D NUS schedule in {}: {e}", dir.display()))?;
+        let coords: Vec<(usize, usize)> =
+            decoded.points.into_iter().map(|r| (r[0], r[1])).collect();
         let traces_per_row = q1_mult * q2_mult;
         let expected_acq_traces = coords.len() * traces_per_row;
         if total_acq_param != expected_acq_traces && total_acq_param != td_full_y * td_full_z {
@@ -3060,11 +3194,11 @@ pub fn read_bruker_fid_3d_opts(
             word_bytes,
             false,
             allow_truncated_fid,
-            &dir,
+            dir,
         )?;
         if observed < expected_acq_traces {
             truncated_traces = Some((observed, expected_acq_traces));
-            warn_truncated_fid(&dir, observed, expected_acq_traces);
+            warn_truncated_fid(dir, observed, expected_acq_traces);
         }
         let mut counts = vec![0usize; n2 * n1];
 
@@ -3128,11 +3262,11 @@ pub fn read_bruker_fid_3d_opts(
             word_bytes,
             true,
             allow_truncated_fid,
-            &dir,
+            dir,
         )?;
         if observed < total_acq_param {
             truncated_traces = Some((observed, total_acq_param));
-            warn_truncated_fid(&dir, observed, total_acq_param);
+            warn_truncated_fid(dir, observed, total_acq_param);
         }
         for k2 in 0..n2 {
             for k1 in 0..n1 {
@@ -3185,14 +3319,9 @@ pub fn read_bruker_fid_3d_opts(
     };
 
     let pulse_program = acqus.get("PULPROG").cloned().unwrap_or_default();
-    let name = dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("ser")
-        .to_string();
 
     Ok(Fid3D {
-        name,
+        name: name.to_string(),
         vendor: FidVendor::Bruker,
         pulse_program,
         axis_x,

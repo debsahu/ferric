@@ -51,8 +51,20 @@ const STATE = {
   batches: [],
   errors: [],
 };
-const MAX_FILE_BYTES = 64 * 1024 * 1024;
-const MAX_TOTAL_BYTES = 256 * 1024 * 1024;
+const MAX_FILE_BYTES = 384 * 1024 * 1024;
+const MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+
+function isUnusedBrukerImaginary(relPath) {
+  const base = (relPath.split("/").pop() || "").toLowerCase();
+  return base === "2ri" || base === "2ir" || base === "2ii"
+    || base === "3rri" || base === "3iri" || base === "3iir" || base === "3iii"
+    || base === "3rii";
+}
+
+function isBrukerRealCube(relPath) {
+  const base = (relPath.split("/").pop() || "").toLowerCase();
+  return base === "3rrr" || base === "2rr";
+}
 
 function wakeEguiCanvas() {
   if (typeof window === "undefined") return;
@@ -77,8 +89,14 @@ function readFileEntry(fileEntry, relPath, acc) {
     fileEntry.file(
       async (file) => {
         try {
+          if (isUnusedBrukerImaginary(relPath)) {
+            resolve();
+            return;
+          }
           if (file.size > MAX_FILE_BYTES) {
-            STATE.errors.push(`Skipped '${relPath}' (${(file.size / 1048576).toFixed(1)} MiB exceeds 64 MiB per-file browser cap).`);
+            if (!isBrukerRealCube(relPath)) {
+              STATE.errors.push(`Skipped '${relPath}' (${(file.size / 1048576).toFixed(1)} MiB exceeds 384 MiB per-file browser cap).`);
+            }
             resolve();
             return;
           }
@@ -150,9 +168,11 @@ async function ingestFileList(fileList) {
   for (let i = 0; i < fileList.length; i++) {
     const f = fileList[i];
     const rel = (f.webkitRelativePath && f.webkitRelativePath.length > 0) ? f.webkitRelativePath : f.name;
-    if (!rel || rel.includes("__MACOSX") || rel.endsWith(".DS_Store")) continue;
+    if (!rel || rel.includes("__MACOSX") || rel.endsWith(".DS_Store") || isUnusedBrukerImaginary(rel)) continue;
     if (f.size > MAX_FILE_BYTES) {
-      STATE.errors.push(`Skipped '${rel}' (> 64 MiB browser per-file limit).`);
+      if (!isBrukerRealCube(rel)) {
+        STATE.errors.push(`Skipped '${rel}' (> 384 MiB browser per-file limit).`);
+      }
       continue;
     }
     if (acc.totalBytes + f.size > MAX_TOTAL_BYTES) {
@@ -168,7 +188,7 @@ async function ingestFileList(fileList) {
     }
   }
   if (acc.capped) {
-    STATE.errors.push("Reached 256 MiB browser drop memory cap; some trailing files were omitted.");
+    STATE.errors.push("Reached 512 MiB browser drop memory cap; some trailing files were omitted.");
   }
   if (acc.files.length > 0) {
     STATE.batches.push(acc.files);
@@ -1281,7 +1301,14 @@ pub fn ingest_dropped_payloads(payloads: &[DroppedPayload]) -> Result<IngestDrop
         }
     }
 
-    const MAX_BROWSER_RETAINED_BYTES: usize = 256 * 1024 * 1024;
+    const MAX_BROWSER_RETAINED_BYTES: usize = 512 * 1024 * 1024;
+    let is_unused_imaginary = |rel: &str| -> bool {
+        let base = rel.rsplit('/').next().unwrap_or(rel);
+        matches!(
+            base.to_ascii_lowercase().as_str(),
+            "2ri" | "2ir" | "2ii" | "3rri" | "3iri" | "3iir" | "3iii" | "3rii"
+        )
+    };
     let mut virtual_entries: Vec<VirtualEntry> = Vec::new();
     let mut mem_map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut mem_total = 0usize;
@@ -1297,7 +1324,9 @@ pub fn ingest_dropped_payloads(payloads: &[DroppedPayload]) -> Result<IngestDrop
                 MAX_BROWSER_RETAINED_BYTES.saturating_sub(mem_total),
             ) {
                 for (rel, b) in full_items {
-                    if mem_total + b.len() <= MAX_BROWSER_RETAINED_BYTES {
+                    if !is_unused_imaginary(&rel)
+                        && mem_total + b.len() <= MAX_BROWSER_RETAINED_BYTES
+                    {
                         mem_total += b.len();
                         mem_map.insert(normalize_mem_rel(&rel), b);
                     }
@@ -1311,7 +1340,8 @@ pub fn ingest_dropped_payloads(payloads: &[DroppedPayload]) -> Result<IngestDrop
                 p.bytes[..cap].to_vec(),
                 p.bytes.len() as u64,
             ));
-            if mem_total + p.bytes.len() <= MAX_BROWSER_RETAINED_BYTES {
+            if !is_unused_imaginary(&rel) && mem_total + p.bytes.len() <= MAX_BROWSER_RETAINED_BYTES
+            {
                 mem_total += p.bytes.len();
                 mem_map.insert(rel, p.bytes.clone());
             }
