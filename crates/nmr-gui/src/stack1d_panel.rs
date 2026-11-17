@@ -979,6 +979,21 @@ impl LodPyramid1d {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AttachedSpectrum1d(pub Spectrum1D);
 
+/// Per-page interactive curation state stored on each [`Trace1d`] so switching between 1D workbook
+/// pages or appending new 1D/2D pages preserves curated peaks, labels, integral ROIs, phase, and undo.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SavedTraceCuration1d {
+    pub initialized: bool,
+    pub picked_peaks: Vec<Peak1dEntry>,
+    pub user_rois: Vec<RoiRegion1d>,
+    pub integral_norm_scale: f64,
+    pub phc0_deg: f64,
+    pub phc1_deg: f64,
+    pub phase_pivot_ppm: f64,
+    pub water_undo_spec: Option<AttachedSpectrum1d>,
+    pub view_bounds: Option<(f64, f64, f64)>,
+}
+
 /// Single 1D NMR spectrum trace inside [`Stack1dState`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Trace1d {
@@ -997,11 +1012,15 @@ pub struct Trace1d {
     /// Optional per-trace manual $\alpha$ override in `DifferenceSpectrum` mode.
     pub alpha_override: Option<f64>,
     pub visible: bool,
+    /// True when the user explicitly pinned this trace on via the sidebar overlay toggle.
+    pub overlay_pinned: bool,
     pub locked: bool,
     /// True when populated by a built-in synthetic demo so real user drops replace demo traces cleanly.
     pub is_demo: bool,
     /// Optional underlying [`Spectrum1D`] enabling live interactive `PHC0`/`PHC1` phasing & multiplet analysis.
     pub raw_spec: Option<AttachedSpectrum1d>,
+    /// Per-page saved peak/ROI/phase/water-undo/view state for multi-page workbook switching.
+    pub curation: SavedTraceCuration1d,
     generation: u64,
     lod: LodPyramid1d,
 }
@@ -1062,9 +1081,11 @@ impl Trace1d {
             shift_offset_ppm: 0.0,
             alpha_override: None,
             visible: true,
+            overlay_pinned: false,
             locked: false,
             is_demo: false,
             raw_spec: None,
+            curation: SavedTraceCuration1d::default(),
             generation: 1,
             lod,
         }
@@ -3747,16 +3768,124 @@ impl Stack1dState {
         out
     }
 
-    /// Load real user 1D [`Spectrum1D`] traces into `Stack1dState` (automatically replacing any
-    /// synthetic demo traces so user drops start on a clean slate, opening the 1D analysis drawer,
-    /// and running automatic peak picking, multiplet & journal characterization).
+    /// Save the active 1D trace's curated peaks, integral ROIs, live phase, water-undo snapshot,
+    /// and viewport window onto `self.traces[self.ref_trace_idx].curation`.
+    pub fn save_active_trace_curation_state(&mut self) {
+        if self.traces.is_empty() {
+            return;
+        }
+        let idx = self.safe_ref_trace_idx();
+        let water_undo_spec = self
+            .water_undo_snapshot
+            .as_ref()
+            .filter(|(i, _)| *i == idx)
+            .map(|(_, sp)| AttachedSpectrum1d(sp.clone()));
+        self.traces[idx].curation = SavedTraceCuration1d {
+            initialized: true,
+            picked_peaks: self.picked_peaks.clone(),
+            user_rois: self.roi_regions.clone(),
+            integral_norm_scale: self.integral_norm_scale,
+            phc0_deg: self.phc0_deg,
+            phc1_deg: self.phc1_deg,
+            phase_pivot_ppm: self.phase_pivot_ppm,
+            water_undo_spec,
+            view_bounds: Some((self.view_ppm_min, self.view_ppm_max, self.y_gain)),
+        };
+    }
+
+    /// Restore `self.traces[idx].curation` (or initialize fresh peaks/multiplets on first visit)
+    /// without saving the outgoing trace (used after `remove` or after saving outgoing state).
+    pub fn restore_or_init_trace_page_without_saving(&mut self, idx: usize) {
+        if idx >= self.traces.len() {
+            return;
+        }
+        for (k, tr) in self.traces.iter_mut().enumerate() {
+            tr.visible = k == idx || tr.overlay_pinned;
+        }
+        self.ref_trace_idx = idx;
+        self.view_mode = Stack1dViewMode::SuperimposedOverlay;
+        self.selected_peak_idx = None;
+        self.dragging_peak_idx = None;
+        self.zoom_history.clear();
+        self.zoom_redo_stack.clear();
+        self.zoom_anchor_ppm = None;
+
+        let saved = self.traces[idx].curation.clone();
+        if saved.initialized {
+            self.phc0_deg = saved.phc0_deg;
+            self.phc1_deg = saved.phc1_deg;
+            self.phase_pivot_ppm = saved.phase_pivot_ppm;
+            self.water_undo_snapshot = saved.water_undo_spec.map(|a| (idx, a.0));
+            if self.phc0_deg.abs() > 1e-6 || self.phc1_deg.abs() > 1e-6 {
+                self.apply_live_phase_to_active_trace();
+            }
+            self.refresh_active_trace_peaks_and_multiplets();
+            self.picked_peaks = saved.picked_peaks;
+            self.roi_regions = saved.user_rois;
+            self.integral_norm_scale = saved.integral_norm_scale;
+            if let Some((vmin, vmax, yg)) = saved.view_bounds {
+                self.view_ppm_min = vmin;
+                self.view_ppm_max = vmax;
+                self.y_gain = yg;
+            } else {
+                self.fit_full_ppm_bounds();
+                self.y_gain = 1.0;
+            }
+        } else {
+            self.phc0_deg = 0.0;
+            self.phc1_deg = 0.0;
+            self.roi_regions.clear();
+            self.integral_norm_scale = 0.0;
+            self.water_undo_snapshot = None;
+            self.fit_full_ppm_bounds();
+            self.y_gain = 1.0;
+            self.refresh_active_trace_peaks_and_multiplets();
+            self.save_active_trace_curation_state();
+        }
+    }
+
+    /// Switch the active 1D workbook page to `idx`, saving outgoing curation state and restoring `idx`.
+    pub fn activate_trace_page(&mut self, idx: usize) {
+        if idx >= self.traces.len() {
+            return;
+        }
+        self.save_active_trace_curation_state();
+        self.restore_or_init_trace_page_without_saving(idx);
+    }
+
+    /// Evict built-in synthetic demo 1D traces (`is_demo == true`) while keeping any user traces intact.
+    pub fn evict_demo_traces(&mut self) {
+        if self.traces.iter().any(|t| t.is_demo) {
+            let all_demo = self.traces.iter().all(|t| t.is_demo);
+            self.traces.retain(|t| !t.is_demo);
+            if all_demo || self.traces.is_empty() {
+                self.ref_trace_idx = 0;
+                self.roi_regions.clear();
+                self.picked_peaks.clear();
+                self.water_undo_snapshot = None;
+                self.integral_norm_scale = 0.0;
+            } else if self.ref_trace_idx >= self.traces.len() {
+                self.ref_trace_idx = self.traces.len() - 1;
+            }
+        }
+    }
+
+    /// Load real user 1D [`Spectrum1D`] traces into `Stack1dState` (evicting built-in demo traces on
+    /// first user load, strictly appending to existing user traces while preserving their per-trace
+    /// curated peaks/ROIs/phase, and auto-picking the newly added active trace).
     pub fn load_user_spectra(&mut self, spectra: Vec<Spectrum1D>) {
         if spectra.is_empty() {
             return;
         }
+        let batch_count = spectra.len();
         if self.traces.iter().all(|t| t.is_demo) {
             self.traces.clear();
             self.roi_regions.clear();
+            self.picked_peaks.clear();
+            self.water_undo_snapshot = None;
+            self.integral_norm_scale = 0.0;
+        } else {
+            self.save_active_trace_curation_state();
         }
         let base_idx = self.traces.len();
         for (k, mut spec) in spectra.into_iter().enumerate() {
@@ -3773,22 +3902,34 @@ impl Stack1dState {
                 .with_color(default_trace_color(idx));
             self.traces.push(tr);
         }
+        for (k, tr) in self.traces.iter_mut().enumerate() {
+            if batch_count == 1 {
+                tr.visible = k == base_idx || tr.overlay_pinned;
+            } else {
+                tr.visible = k >= base_idx || tr.overlay_pinned;
+            }
+        }
         self.ref_trace_idx = base_idx.min(self.traces.len().saturating_sub(1));
         self.phc0_deg = 0.0;
         self.phc1_deg = 0.0;
+        self.roi_regions.clear();
+        self.integral_norm_scale = 0.0;
+        self.water_undo_snapshot = None;
         self.show_1d_analysis_drawer = true;
         self.zoom_history.clear();
         self.zoom_redo_stack.clear();
         self.zoom_anchor_ppm = None;
-        if self.traces.len() >= 2 && self.view_mode == Stack1dViewMode::SuperimposedOverlay {
+        if batch_count >= 2 {
             self.view_mode = Stack1dViewMode::StackedOffset;
             self.selected_inspector_tab = InspectorTab1d::MultiTraceStack;
         } else {
+            self.view_mode = Stack1dViewMode::SuperimposedOverlay;
             self.selected_inspector_tab = InspectorTab1d::Peaks;
         }
         self.fit_full_ppm_bounds();
         self.y_gain = 1.0;
         self.refresh_active_trace_peaks_and_multiplets();
+        self.save_active_trace_curation_state();
     }
 
     fn ensure_active_raw_spec(&mut self) -> Option<usize> {

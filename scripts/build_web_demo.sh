@@ -343,6 +343,7 @@ render_demo_shell_html() {
 <body>
   <header class="demo-bar">
     <div class="demo-brand">
+      <img src="favicon.svg" alt="" width="18" height="18" style="border-radius:4px;flex-shrink:0" />
       <strong>FERRIC</strong>
     </div>
     <div class="demo-actions">

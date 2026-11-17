@@ -2226,6 +2226,9 @@ fn render_compact_mobile_shell<H: ResponsiveWorkbenchHost>(
                         ui.spacing_mut().item_spacing.x = 5.0;
                         ui.spacing_mut().interact_size.y = MOBILE_TOUCH_MIN_HEIGHT;
 
+                        crate::brand_icon::paint_ferric_brand_logo(ui, 22.0)
+                            .on_hover_text("FERRIC");
+
                         let menu_btn =
                             egui::Button::new(egui::RichText::new("Menu").size(11.5).strong())
                                 .selected(shell.mobile_menu_open)

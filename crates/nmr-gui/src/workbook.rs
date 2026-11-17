@@ -15,13 +15,16 @@
 //! - Fulmer, G. R. et al. (*Organometallics* **2010**, 29, 2176–2179) — residual deuterated
 //!   solvent chemical shifts (`CDCl3` `δH 7.26`, `δC 77.16`; `TMS` `0.00 ppm`).
 
+use std::collections::BTreeMap;
 use std::f64::consts::PI;
 use std::sync::Arc;
 
 use eframe::egui;
+use nmr_core::c13_detected::C13PickedDataset;
 use nmr_core::nmr1d::{Experiment1DKind, Nucleus1D, Spectrum1D};
+use nmr_core::peaks::Peak;
 use nmr_core::picker::estimate_noise_mad;
-use nmr_core::spectrum::{AxisPpm, Spectrum2D};
+use nmr_core::spectrum::{AxisPpm, Spectrum2D, Spectrum3D};
 
 use crate::contour_painter::{default_overlay_palette, OverlayLayerSpec, SyncCrosshair};
 use crate::stack1d_panel::{default_trace_color, RoiRegion1d, Stack1dState, Trace1d};
@@ -1192,6 +1195,13 @@ pub struct Stored2dPage {
     pub view_ppm: [f32; 4],
     pub overlay_enabled: bool,
     pub has_3d_strips: bool,
+    pub is_demo: bool,
+    pub peaks: Vec<Peak>,
+    pub peak_2d_labels: BTreeMap<(i64, i64), String>,
+    pub c13_picked_dataset: Option<C13PickedDataset>,
+    pub water_undo_2d: Option<(Spectrum2D, Option<Spectrum3D>, Option<Spectrum3D>)>,
+    pub zoom_history: Vec<[f32; 4]>,
+    pub pick_diagonal: bool,
     pub mini_dots: Vec<([f32; 2], bool)>,
 }
 
@@ -1249,6 +1259,13 @@ impl Stored2dPage {
             view_ppm,
             overlay_enabled: false,
             has_3d_strips,
+            is_demo: false,
+            peaks: Vec::new(),
+            peak_2d_labels: BTreeMap::new(),
+            c13_picked_dataset: None,
+            water_undo_2d: None,
+            zoom_history: Vec::new(),
+            pick_diagonal: false,
             mini_dots,
         }
     }
@@ -1505,6 +1522,25 @@ impl WorkbookState {
         p.overlay_enabled = overlay_enabled;
         self.pages_2d.push(p);
         self.pages_2d.len() - 1
+    }
+
+    pub fn add_demo_2d_page(
+        &mut self,
+        label: impl Into<String>,
+        spec: Spectrum2D,
+        overlay_enabled: bool,
+        has_3d_strips: bool,
+    ) -> usize {
+        let idx = self.add_2d_page(label, spec, overlay_enabled, has_3d_strips);
+        self.pages_2d[idx].is_demo = true;
+        idx
+    }
+
+    pub fn evict_demo_2d_pages(&mut self) {
+        self.pages_2d.retain(|p| !p.is_demo);
+        if self.active_2d_idx >= self.pages_2d.len() {
+            self.active_2d_idx = self.pages_2d.len().saturating_sub(1);
+        }
     }
 
     /// Replace `spec` + `data_arc` + `mini_dots` on the currently active 2D page (e.g. after Water Suppression or Undo).

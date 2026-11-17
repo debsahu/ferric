@@ -27,6 +27,44 @@ pub fn build_ferric_window_icon() -> egui::IconData {
     }
 }
 
+/// Lazily upload `ferric-icon-64.rgba` (`Concept A: FID-F`) into `egui` texture memory and paint
+/// a crisp `size_px × size_px` rounded-square brand mark in the top-left workbook header.
+pub fn paint_ferric_brand_logo(ui: &mut egui::Ui, size_px: f32) -> egui::Response {
+    let tex_id = egui::Id::unique("ferric_brand_logo_tex_v1");
+    let tex_opt: Option<egui::TextureHandle> =
+        ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(tex_id));
+    let tex: egui::TextureHandle = if let Some(existing) = tex_opt {
+        existing
+    } else {
+        let img = egui::ColorImage::from_rgba_unmultiplied(
+            [ICON_WIDTH as usize, ICON_HEIGHT as usize],
+            ICON_64_RGBA,
+        );
+        let handle =
+            ui.ctx()
+                .load_texture("ferric_brand_logo_64", img, egui::TextureOptions::LINEAR);
+        ui.ctx().data_mut(|d| d.insert_temp(tex_id, handle.clone()));
+        handle
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size_px, size_px), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let mut mesh = egui::Mesh::with_texture(tex.id());
+        mesh.add_rect_with_uv(
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        ui.painter().add(egui::Shape::mesh(mesh));
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(0.8, egui::Color32::from_rgb(71, 85, 105)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    resp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

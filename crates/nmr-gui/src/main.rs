@@ -3017,7 +3017,27 @@ impl NmrWorkbenchApp {
             pg.num_levels = self.contour_levels;
             pg.show_negative = self.show_negative;
             pg.ppm_nudge = self.primary_ppm_nudge;
+            pg.peaks = self.peaks.clone();
+            pg.peak_2d_labels = self.peak_2d_labels.clone();
+            pg.c13_picked_dataset = self.c13_picked_dataset.clone();
+            pg.water_undo_2d = self.water_undo_2d.clone();
+            pg.zoom_history = self.workbook.two_d.zoom_history.clone();
+            pg.pick_diagonal = self.workbook.two_d.pick_diagonal;
         }
+    }
+
+    fn prepare_workbook_for_user_append(&mut self) {
+        if !self.show_stack1d_panel
+            && self.workspace_mode == WorkspaceMode::ProteinNmr
+            && !self.workbook.pages_2d.is_empty()
+        {
+            self.save_live_2d_into_workbook();
+        }
+        if !self.stack1d_panel.traces.is_empty() {
+            self.stack1d_panel.save_active_trace_curation_state();
+        }
+        self.workbook.evict_demo_2d_pages();
+        self.stack1d_panel.evict_demo_traces();
     }
 
     fn sync_overlay_layers_from_workbook(&mut self) {
@@ -3030,8 +3050,13 @@ impl NmrWorkbenchApp {
         if idx >= self.workbook.pages_2d.len() {
             return;
         }
-        if !self.show_stack1d_panel && self.workspace_mode == WorkspaceMode::ProteinNmr {
+        if !self.show_stack1d_panel
+            && self.workspace_mode == WorkspaceMode::ProteinNmr
+            && !self.workbook.pages_2d.is_empty()
+        {
             self.save_live_2d_into_workbook();
+        } else if self.show_stack1d_panel && !self.stack1d_panel.traces.is_empty() {
+            self.stack1d_panel.save_active_trace_curation_state();
         }
         self.workbook.active_2d_idx = idx;
         let pg = self.workbook.pages_2d[idx].clone();
@@ -3050,7 +3075,12 @@ impl NmrWorkbenchApp {
         self.contour_factor = pg.level_factor;
         self.contour_levels = pg.num_levels;
         self.show_negative = pg.show_negative;
-        self.workbook.two_d.zoom_history.clear();
+        self.peaks = pg.peaks;
+        self.peak_2d_labels = pg.peak_2d_labels;
+        self.c13_picked_dataset = pg.c13_picked_dataset;
+        self.water_undo_2d = pg.water_undo_2d;
+        self.workbook.two_d.zoom_history = pg.zoom_history;
+        self.workbook.two_d.pick_diagonal = pg.pick_diagonal;
         self.workbook.two_d.selected_peak_idx = None;
         self.workbook.two_d.dragging_peak_idx = None;
         self.workbook.two_d.pick_box_start_pos = None;
@@ -3065,6 +3095,17 @@ impl NmrWorkbenchApp {
         self.show_stack1d_panel = false;
         self.show_relax_panel = false;
         self.show_dynamics_panel = false;
+        if self.active_2d_nuclei() == ("13C", "15N") {
+            self.regime_kind = GuiRegimeKind::Idp13C;
+            self.systems.clear();
+        } else {
+            self.regime_kind = GuiRegimeKind::Globular;
+            if self.active_2d_nuclei() == ("1H", "15N") && !self.peaks.is_empty() {
+                self.rebuild_systems_and_matrices();
+            } else {
+                self.systems.clear();
+            }
+        }
         let has_3d = self.hncacb_3d.is_some() || self.hnco_3d.is_some();
         self.show_strips_dock = pg.has_3d_strips && has_3d;
         if !pg.has_3d_strips {
@@ -3081,15 +3122,7 @@ impl NmrWorkbenchApp {
         if !self.show_stack1d_panel && self.workspace_mode == WorkspaceMode::ProteinNmr {
             self.save_live_2d_into_workbook();
         }
-        for (k, tr) in self.stack1d_panel.traces.iter_mut().enumerate() {
-            tr.visible = k == idx;
-        }
-        self.stack1d_panel.ref_trace_idx = idx;
-        self.stack1d_panel.view_mode = Stack1dViewMode::SuperimposedOverlay;
-        self.stack1d_panel.fit_full_ppm_bounds();
-        self.stack1d_panel.y_gain = 1.0;
-        self.stack1d_panel
-            .refresh_active_trace_peaks_and_multiplets();
+        self.stack1d_panel.activate_trace_page(idx);
         let lbl = self.stack1d_panel.traces[idx].label.clone();
         self.activate_1d_studio_mode();
         self.status_msg = format!("Viewing {lbl}");
@@ -3144,8 +3177,8 @@ impl NmrWorkbenchApp {
                 let cosy_2d = build_showcase_small_molecule_cosy_2d();
                 let _ = self
                     .workbook
-                    .add_2d_page("12 · 2D ¹H–¹H COSY", cosy_2d, false, false);
-                let hsqc_page_idx = self.workbook.add_2d_page(
+                    .add_demo_2d_page("12 · 2D ¹H–¹H COSY", cosy_2d, false, false);
+                let hsqc_page_idx = self.workbook.add_demo_2d_page(
                     "20 · Ubiquitin 2D ¹H–¹⁵N HSQC",
                     ubiq_hsqc,
                     false,
@@ -4126,6 +4159,7 @@ impl NmrWorkbenchApp {
                         ys,
                         None,
                     );
+                    self.prepare_workbook_for_user_append();
                     self.stack1d_panel.load_user_spectra(vec![spec]);
                     self.activate_1d_studio_mode();
                     self.status_msg = format!(
@@ -4253,22 +4287,25 @@ impl NmrWorkbenchApp {
     #[cfg(not(target_arch = "wasm32"))]
     fn install_single_2d_spectrum(&mut self, spec: Spectrum2D, label: String, status: String) {
         self.bare_bruker_hint = None;
+        self.prepare_workbook_for_user_append();
         self.water_undo_2d = None;
         self.peak_2d_labels.clear();
         self.workbook.two_d.selected_peak_idx = None;
         self.workbook.two_d.dragging_peak_idx = None;
+        self.workbook.two_d.zoom_history.clear();
         self.clear_stale_protein_demo_state(false, false);
-        self.overlay_layers.clear();
         self.primary_2d_label = label.clone();
         self.primary_2d_visible = true;
         self.primary_ppm_nudge = [0.0, 0.0];
         self.hsqc_arc = Arc::new(spec.data.clone());
         self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
-        self.workbook
-            .set_single_2d_page(label.clone(), spec.clone(), false);
+        let new_idx = self
+            .workbook
+            .add_2d_page(label.clone(), spec.clone(), false, false);
+        self.workbook.active_2d_idx = new_idx;
         self.hsqc_spec = Some(spec);
+        self.sync_overlay_layers_from_workbook();
         self.reset_view_to_spec();
-        self.save_live_2d_into_workbook();
         self.workspace_mode = WorkspaceMode::ProteinNmr;
         self.show_stack1d_panel = false;
         self.show_relax_panel = false;
@@ -4290,6 +4327,7 @@ impl NmrWorkbenchApp {
         } else {
             self.regime_kind = GuiRegimeKind::Globular;
         }
+        self.save_live_2d_into_workbook();
         self.sync_session_from_app_fresh(&label);
         self.status_msg = status;
     }
@@ -5458,7 +5496,8 @@ impl NmrWorkbenchApp {
                 }
                 WorkbookSidebarAction::Toggle1dOverlay(idx) => {
                     if let Some(tr) = self.stack1d_panel.traces.get_mut(idx) {
-                        tr.visible = !tr.visible;
+                        tr.overlay_pinned = !tr.overlay_pinned;
+                        tr.visible = tr.overlay_pinned || idx == self.stack1d_panel.ref_trace_idx;
                         let now_vis = tr.visible;
                         let lbl = tr.label.clone();
                         let vis_count = self
@@ -5491,7 +5530,9 @@ impl NmrWorkbenchApp {
                                 .stack1d_panel
                                 .ref_trace_idx
                                 .min(self.stack1d_panel.traces.len() - 1);
-                            self.activate_1d_workbook_page(next_idx);
+                            self.stack1d_panel
+                                .restore_or_init_trace_page_without_saving(next_idx);
+                            self.activate_1d_studio_mode();
                         }
                         self.status_msg = format!("Closed 1D page '{}'", removed.label);
                     }
@@ -5656,6 +5697,7 @@ impl NmrWorkbenchApp {
                 spectra,
             } => {
                 let n = spectra.len();
+                self.prepare_workbook_for_user_append();
                 self.stack1d_panel.load_user_spectra(spectra);
                 self.activate_1d_studio_mode();
                 self.status_msg =
@@ -5944,6 +5986,8 @@ impl NmrWorkbenchApp {
             }
 
             ui.add_space(2.0);
+            nmr_gui::brand_icon::paint_ferric_brand_logo(ui, 22.0)
+                .on_hover_text("FERRIC");
             ui.label(
                 egui::RichText::new("FERRIC")
                     .size(13.5)
@@ -9984,6 +10028,7 @@ impl NmrWorkbenchApp {
     }
 
     fn execute_ingest_plan(&mut self, plan: IngestExecutionPlan, run_full_pipeline: bool) {
+        self.prepare_workbook_for_user_append();
         self.workspace_mode = WorkspaceMode::ProteinNmr;
         self.show_stack1d_panel = false;
         self.show_relax_panel = false;
@@ -10522,33 +10567,27 @@ impl NmrWorkbenchApp {
                 self.primary_ppm_nudge = [0.0, 0.0];
                 self.hsqc_arc = Arc::new(hsqc.data.clone());
                 self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
-                self.workbook
-                    .set_single_2d_page(prim_lbl, hsqc.clone(), !cubes_3d.is_empty());
+                let prim_idx =
+                    self.workbook
+                        .add_2d_page(prim_lbl, hsqc.clone(), false, !cubes_3d.is_empty());
+                self.workbook.active_2d_idx = prim_idx;
+                self.workbook.two_d.zoom_history.clear();
                 self.hsqc_spec = Some(hsqc);
-            } else {
+            } else if self.workbook.pages_2d.is_empty() {
                 self.hsqc_spec = None;
                 self.hsqc_arc = Arc::new(Vec::new());
-                self.workbook.clear_2d_pages();
             }
 
-            self.overlay_layers.clear();
-            for (idx, (lbl, cls_ov, _, s2)) in loaded_2d_list.into_iter().enumerate() {
+            let mut any_extra_2d = false;
+            for (lbl, cls_ov, _, s2) in loaded_2d_list {
                 if cls_ov == PulseSequenceClass::Caco2D {
                     caco_2d_specs.push(s2.clone());
                 }
-                let _ = self
-                    .workbook
-                    .add_2d_page(lbl.clone(), s2.clone(), true, false);
-                let lid = self.next_layer_id;
-                self.next_layer_id += 1;
-                let (base, _) = Self::estimate_2d_contour_base(&s2.data);
-                let arc = Arc::new(s2.data.clone());
-                let mut ov = OverlayLayerSpec::from_spectrum_2d(lid, 1, &s2, arc, base, idx + 1);
-                ov.visible = true;
-                let (pos, neg) = contour_palette_for_theme(idx + 1, self.paper_white_canvas);
-                ov.pos_rgba = pos;
-                ov.neg_rgba = neg;
-                self.overlay_layers.push((lbl, ov));
+                let _ = self.workbook.add_2d_page(lbl, s2, true, false);
+                any_extra_2d = true;
+            }
+            if any_extra_2d || self.hsqc_spec.is_some() {
+                self.sync_overlay_layers_from_workbook();
             }
 
             if self.hsqc_spec.is_some() {
@@ -10661,6 +10700,9 @@ impl NmrWorkbenchApp {
             let stored_3d =
                 usize::from(self.hncacb_3d.is_some()) + usize::from(self.hnco_3d.is_some());
             self.extra_3d_count = n_3d_loaded.saturating_sub(stored_3d);
+            if self.hsqc_spec.is_some() {
+                self.save_live_2d_into_workbook();
+            }
         }
 
         let n_3d_total = usize::from(self.hncacb_3d.is_some())
@@ -11517,6 +11559,7 @@ impl NmrWorkbenchApp {
                     }
                     if !spectra.is_empty() {
                         let n = spectra.len();
+                        self.prepare_workbook_for_user_append();
                         self.stack1d_panel.load_user_spectra(spectra);
                         self.activate_1d_studio_mode();
                         self.status_msg =
@@ -14840,5 +14883,187 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_workbook_append_preserves_5_open_pages_on_new_drop() {
+        use super::*;
+        use nmr_core::nmr1d::{Experiment1DKind, Spectrum1D};
+        use nmr_gui::ingest_panel::{ingest_dropped_payloads, DroppedPayload};
+
+        let mut app = make_headless_test_app();
+        app.load_builtin_demo_suite();
+        assert_eq!(app.stack1d_panel.traces.len(), 2);
+        assert_eq!(app.workbook.pages_2d.len(), 2);
+
+        // 1. Drop 3 user 1D spectra (built-in demo 1D + 2D pages are evicted once on first user drop)
+        let mk_1d = |name: &str, center_ppm: f64| -> Spectrum1D {
+            let n = 128usize;
+            let axis = nmr_core::spectrum::AxisPpm::from_bounds("1H", n, 10.0, 0.0, 500.0);
+            let mut real = vec![0.0_f64; n];
+            for (i, y) in real.iter_mut().enumerate() {
+                let p = axis.index_to_ppm(i as f64);
+                let d = (p - center_ppm) / 0.08;
+                *y = 1_000.0 * (-d * d).exp();
+            }
+            Spectrum1D::new(
+                name.to_string(),
+                Experiment1DKind::Proton1D,
+                axis,
+                real,
+                None,
+            )
+        };
+        app.apply_drop_outcome(IngestDropOutcome::Spectra1D {
+            source_name: "user_1d_batch".to_string(),
+            spectra: vec![
+                mk_1d("1D-A", 7.50),
+                mk_1d("1D-B", 3.80),
+                mk_1d("1D-C", 1.25),
+            ],
+        });
+        assert_eq!(app.stack1d_panel.traces.len(), 3);
+        assert_eq!(app.workbook.pages_2d.len(), 0);
+
+        // Curate a custom peak on 1D Page #0, switch to Page #1, switch back -> Page #0 preserves peak
+        let _ = app
+            .stack1d_panel
+            .add_manual_peak_at_or_near_ppm(7.50, false);
+        let p0_count = app.stack1d_panel.picked_peaks.len();
+        app.activate_1d_workbook_page(1);
+        app.activate_1d_workbook_page(0);
+        assert_eq!(app.stack1d_panel.picked_peaks.len(), p0_count);
+
+        // 2. Append 2 user 2D spectra (Pages #4 & #5 in workbook) with curated peaks & zoomed views
+        let usf4 = build_synthetic_ucsf_2d_test_bytes(
+            "1H",
+            32,
+            16,
+            500.0,
+            5000.0,
+            10.0,
+            "1H",
+            32,
+            16,
+            500.0,
+            5000.0,
+            10.0,
+            &[(8, 20, 60.0), (20, 8, 60.0)],
+        );
+        let out4 = ingest_dropped_payloads(&[DroppedPayload::new("NOESY_user.ucsf", usf4)])
+            .expect("NOESY_user.ucsf");
+        app.apply_drop_outcome(out4);
+        let p4_idx = app.add_manual_2d_peak(7.10, 2.90, None);
+        app.peak_2d_labels.insert(
+            peak_label_key_2d(app.peaks[p4_idx].h, app.peaks[p4_idx].n),
+            "Page4-Peak".to_string(),
+        );
+        app.view_h_left = 8.8;
+        app.view_h_right = 1.4;
+        app.save_live_2d_into_workbook();
+
+        let usf5 = build_synthetic_ucsf_2d_test_bytes(
+            "1H",
+            32,
+            16,
+            500.0,
+            5000.0,
+            10.0,
+            "1H",
+            32,
+            16,
+            500.0,
+            5000.0,
+            10.0,
+            &[(6, 24, 55.0), (24, 6, 55.0)],
+        );
+        let out5 = ingest_dropped_payloads(&[DroppedPayload::new("TOCSY_user.ucsf", usf5)])
+            .expect("TOCSY_user.ucsf");
+        app.apply_drop_outcome(out5);
+        let p5_idx = app.add_manual_2d_peak(6.40, 2.20, None);
+        app.peak_2d_labels.insert(
+            peak_label_key_2d(app.peaks[p5_idx].h, app.peaks[p5_idx].n),
+            "Page5-Peak".to_string(),
+        );
+        app.view_h_left = 8.2;
+        app.view_h_right = 0.9;
+        app.save_live_2d_into_workbook();
+
+        assert_eq!(app.stack1d_panel.traces.len(), 3);
+        assert_eq!(app.workbook.pages_2d.len(), 2);
+
+        // 3. Now drop a single 2D Bruker CON folder "3" — MUST append (6 pages total: 3 1D + 3 2D)!
+        let nx = 48usize;
+        let ny = 48usize;
+        let procs = format!(
+            "##TITLE= c_hcacon_ia\n##$SI= {nx}\n##$OFFSET= 182.0\n##$SW_p= 2414.4\n##$SF= 201.26\n##$XDIM= 48\n##$BYTORDP= 0\n##$NC_proc= 3\n##END=\n"
+        );
+        let proc2s = format!(
+            "##TITLE= c_hcacon_ia\n##$SI= {ny}\n##$OFFSET= 142.0\n##$SW_p= 3244.0\n##$SF= 81.10\n##$XDIM= 48\n##$BYTORDP= 0\n##$NC_proc= 3\n##END=\n"
+        );
+        let mut rr = Vec::with_capacity(nx * ny * 4);
+        for iy in 0..ny {
+            for ix in 0..nx {
+                let mut v = (((ix * 19 + iy * 11) % 17) as i32 - 8) * 1_500;
+                let dx = ix as f64 - 22.0;
+                let dy = iy as f64 - 24.0;
+                if dx.abs() <= 3.0 && dy.abs() <= 3.0 {
+                    v += (650_000.0 * (-0.45 * (dx * dx + dy * dy)).exp()) as i32;
+                }
+                rr.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let out_con = ingest_dropped_payloads(&[
+            DroppedPayload::new("3/pdata/1/procs", procs.into_bytes()),
+            DroppedPayload::new("3/pdata/1/proc2s", proc2s.into_bytes()),
+            DroppedPayload::new("3/pdata/1/2rr", rr),
+        ])
+        .expect("single Bruker 2D CON folder 3");
+        app.apply_drop_outcome(out_con);
+
+        assert_eq!(
+            app.stack1d_panel.traces.len(),
+            3,
+            "3 user 1D pages must remain open"
+        );
+        assert_eq!(
+            app.workbook.pages_2d.len(),
+            3,
+            "2 existing user 2D pages + 1 newly dropped CON folder = 3 2D pages (6 total)"
+        );
+        assert_eq!(app.active_2d_nuclei(), ("13C", "15N"));
+        assert!(
+            app.overlay_layers.is_empty(),
+            "incompatible 1H-1H pages must NOT overlay onto 13C-15N CON"
+        );
+
+        // 4. Switch back to Page #4 (index 0) and Page #5 (index 1) and verify full state restoration
+        app.activate_2d_workbook_page(0);
+        assert_eq!(app.primary_2d_label, "NOESY_user.ucsf");
+        assert!((app.view_h_left - 8.8).abs() < 1e-4 && (app.view_h_right - 1.4).abs() < 1e-4);
+        assert!(app
+            .peaks
+            .iter()
+            .any(|p| (p.h - 7.10).abs() < 1e-3 && (p.n - 2.90).abs() < 1e-3));
+        assert_eq!(
+            app.peak_2d_labels
+                .get(&peak_label_key_2d(7.10, 2.90))
+                .map(String::as_str),
+            Some("Page4-Peak")
+        );
+
+        app.activate_2d_workbook_page(1);
+        assert_eq!(app.primary_2d_label, "TOCSY_user.ucsf");
+        assert!((app.view_h_left - 8.2).abs() < 1e-4 && (app.view_h_right - 0.9).abs() < 1e-4);
+        assert!(app
+            .peaks
+            .iter()
+            .any(|p| (p.h - 6.40).abs() < 1e-3 && (p.n - 2.20).abs() < 1e-3));
+        assert_eq!(
+            app.peak_2d_labels
+                .get(&peak_label_key_2d(6.40, 2.20))
+                .map(String::as_str),
+            Some("Page5-Peak")
+        );
     }
 }
