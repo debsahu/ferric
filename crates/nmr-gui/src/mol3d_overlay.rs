@@ -13,6 +13,11 @@
 //! - Nuñez, J. R., Anderton, C. R. & Renslow, R. S. (*PLOS ONE* 2018, 13(8), e0199239 — `Cividis`
 //!   color-vision-deficiency-safe perceptually uniform colormap) & Moreland, K. (*ISVC* 2009,
 //!   LNCS 5876, 92–103 — diverging cool-warm scientific colormaps).
+//! - Jumper, J. et al. (*Nature* 2021, 596, 583–589), Varadi, M. et al. (*Nucleic Acids Res.*
+//!   2022, 50, D439–D444 — canonical 4-band AlphaFold `pLDDT` palette), Adzhubei, A. A. et al.
+//!   (*J. Mol. Biol.* 2013, 425, 2100–2132 — `PPII` basin), and Fowler, N. J., Sljoka, A. &
+//!   Williamson, M. P. (*Nat. Commun.* 2020, 11, 5982; *Structure* 2022, 30, 925–933 — `pLDDT`
+//!   vs solution NMR `RCI-S^2` / `S^2` structural concordance & discordance modes, `T21.3`).
 
 use std::collections::BTreeMap;
 
@@ -165,6 +170,228 @@ impl ColormapKind {
 // 2. Quantitative Putty Radius & Scalar Track Engine
 // ============================================================================
 
+/// Four-state secondary-structure taxonomy (`Helix`, `Sheet`, `Ppii`, `Coil`) shared by the
+/// 3-track vector secondary-structure ribbon (`ss_ribbon_widget`) and 3D coordinate viewer
+/// (`docs/specs/21-alphafold-integrative-nmr.md` §1.2 & §3.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SsState4 {
+    /// Right-handed alpha-helix, 3_10-helix, or pi-helix (`H` / `G` / `I`).
+    Helix,
+    /// Extended beta-strand or isolated beta-bridge (`E` / `B`).
+    Sheet,
+    /// Left-handed polyproline II extended helix (`P`, Adzhubei et al. *J. Mol. Biol.* 2013).
+    Ppii,
+    /// Non-regular loop, turn, bend, or random coil (`C`).
+    #[default]
+    Coil,
+}
+
+impl SsState4 {
+    pub const ALL: [Self; 4] = [Self::Helix, Self::Sheet, Self::Ppii, Self::Coil];
+
+    #[inline]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Helix => "H",
+            Self::Sheet => "E",
+            Self::Ppii => "P",
+            Self::Coil => "C",
+        }
+    }
+
+    #[inline]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Helix => "Helix (H)",
+            Self::Sheet => "Beta-Sheet (E)",
+            Self::Ppii => "Polyproline II (P)",
+            Self::Coil => "Coil (C)",
+        }
+    }
+
+    /// Canonical Track-1 vector RGB tuple (`#E05A47` coral, `#2A9D8F` teal, `#7B61FF` violet,
+    /// `#64748B` slate baseline).
+    #[inline]
+    pub const fn rgb_u8(self) -> [u8; 3] {
+        match self {
+            Self::Helix => [0xE0, 0x5A, 0x47],
+            Self::Sheet => [0x2A, 0x9D, 0x8F],
+            Self::Ppii => [0x7B, 0x61, 0xFF],
+            Self::Coil => [0x64, 0x74, 0x8B],
+        }
+    }
+
+    #[inline]
+    pub const fn hex_color(self) -> &'static str {
+        match self {
+            Self::Helix => "#E05A47",
+            Self::Sheet => "#2A9D8F",
+            Self::Ppii => "#7B61FF",
+            Self::Coil => "#64748B",
+        }
+    }
+}
+
+/// Per-residue structural concordance vs discordance regime between a 3D coordinate model
+/// (AlphaFold `pLDDT` / crystal structure) and solution NMR rigidity (`RCI-S^2` / Lipari-Szabo
+/// `S^2` & `SSP`/`delta2D`; `docs/specs/21-alphafold-integrative-nmr.md` §1.3 & §3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ConcordanceTrackClass {
+    /// Ordered in both 3D (`pLDDT >= 70`) and solution NMR (`S^2 >= 0.65`) without SS inversion (`#16A34A`).
+    ConcordantOrdered,
+    /// Disordered / flexible in both 3D (`pLDDT < 70`) and solution NMR (`S^2 < 0.65`) (`#64748B`).
+    ConcordantDisordered,
+    /// Confidently folded in 3D (`pLDDT >= 70`, `Helix`/`Sheet`) yet disordered in solution
+    /// (`S^2 < 0.60`, coil+PPII `>= 0.65`), flagging conditional folding (MoRF) or crystal packing (`#D97706`).
+    ConditionalFoldingOrCrystalArtifact,
+    /// Conformational switch (`Helix <-> Sheet` / large dihedral shift) or rigid solution fold in
+    /// low-`pLDDT` region (`#DC2626`).
+    DynamicHingeOrAltState,
+    /// Insufficient experimental NMR backbone shifts (`< 2` nuclei and no `S^2`) to score concordance.
+    #[default]
+    UnassignedNmr,
+}
+
+/// Spec-matching type alias (`docs/specs/21-alphafold-integrative-nmr.md` §1.3 & §3.2).
+pub type AfNmrConcordanceClass = ConcordanceTrackClass;
+
+impl ConcordanceTrackClass {
+    pub const ALL: [Self; 5] = [
+        Self::ConcordantOrdered,
+        Self::ConcordantDisordered,
+        Self::ConditionalFoldingOrCrystalArtifact,
+        Self::DynamicHingeOrAltState,
+        Self::UnassignedNmr,
+    ];
+
+    #[inline]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ConcordantOrdered => "Concordant Ordered",
+            Self::ConcordantDisordered => "Concordant Disordered",
+            Self::ConditionalFoldingOrCrystalArtifact => "Conditional Folding / Crystal Artifact",
+            Self::DynamicHingeOrAltState => "Dynamic Hinge / Alt State",
+            Self::UnassignedNmr => "Unassigned NMR",
+        }
+    }
+
+    #[inline]
+    pub const fn short_code(self) -> &'static str {
+        match self {
+            Self::ConcordantOrdered => "ORD",
+            Self::ConcordantDisordered => "DIS",
+            Self::ConditionalFoldingOrCrystalArtifact => "MORF/XTAL",
+            Self::DynamicHingeOrAltState => "HINGE/ALT",
+            Self::UnassignedNmr => "UNASG",
+        }
+    }
+
+    #[inline]
+    pub const fn hex_color(self) -> &'static str {
+        match self {
+            Self::ConcordantOrdered => "#16A34A",
+            Self::ConcordantDisordered => "#64748B",
+            Self::ConditionalFoldingOrCrystalArtifact => "#D97706",
+            Self::DynamicHingeOrAltState => "#DC2626",
+            Self::UnassignedNmr => "#6B7B91",
+        }
+    }
+
+    #[inline]
+    pub const fn rgb_u8(self) -> [u8; 3] {
+        match self {
+            Self::ConcordantOrdered => [0x16, 0xA3, 0x4A],
+            Self::ConcordantDisordered => [0x64, 0x74, 0x8B],
+            Self::ConditionalFoldingOrCrystalArtifact => [0xD9, 0x77, 0x06],
+            Self::DynamicHingeOrAltState => [0xDC, 0x26, 0x26],
+            Self::UnassignedNmr => [0x6B, 0x7B, 0x91],
+        }
+    }
+
+    #[inline]
+    pub fn rgba_3d(self, alpha: f32) -> [f32; 4] {
+        let a = alpha.clamp(0.0, 1.0);
+        match self {
+            Self::UnassignedNmr => [
+                UNASSIGNED_PUTTY_RGBA[0],
+                UNASSIGNED_PUTTY_RGBA[1],
+                UNASSIGNED_PUTTY_RGBA[2],
+                a,
+            ],
+            other => {
+                let [r, g, b] = other.rgb_u8();
+                [
+                    (r as f32) / 255.0,
+                    (g as f32) / 255.0,
+                    (b as f32) / 255.0,
+                    a,
+                ]
+            }
+        }
+    }
+
+    #[inline]
+    pub const fn is_discrepant(self) -> bool {
+        matches!(
+            self,
+            Self::ConditionalFoldingOrCrystalArtifact | Self::DynamicHingeOrAltState
+        )
+    }
+
+    /// Normalized `[0.0, 1.0]` putty swelling factor emphasizing discordant MoRFs, crystal
+    /// artifacts, and dynamic hinges in 3D putty mode.
+    #[inline]
+    pub const fn discrepancy_putty_t(self) -> f32 {
+        match self {
+            Self::ConcordantOrdered => 0.0,
+            Self::ConcordantDisordered => 0.30,
+            Self::ConditionalFoldingOrCrystalArtifact => 0.85,
+            Self::DynamicHingeOrAltState => 1.00,
+            Self::UnassignedNmr => 0.0,
+        }
+    }
+}
+
+/// Canonical 4-band AlphaFold `pLDDT` RGBA color (Varadi et al. *Nucleic Acids Res.* 2022, 50,
+/// D439–D444):
+/// - `pLDDT >= 90.0`: `#0053D6` (Very High)
+/// - `70.0 <= pLDDT < 90.0`: `#65CBF3` (Confident)
+/// - `50.0 <= pLDDT < 70.0`: `#FFDB13` (Low)
+/// - `pLDDT < 50.0`: `#FF7D45` (Very Low)
+#[inline]
+pub fn alphafold_plddt_rgba(plddt: f64, alpha: f32) -> [f32; 4] {
+    let a = alpha.clamp(0.0, 1.0);
+    let [r, g, b]: [u8; 3] = if plddt >= 90.0 {
+        [0x00, 0x53, 0xD6]
+    } else if plddt >= 70.0 {
+        [0x65, 0xCB, 0xF3]
+    } else if plddt >= 50.0 {
+        [0xFF, 0xDB, 0x13]
+    } else {
+        [0xFF, 0x7D, 0x45]
+    };
+    [
+        (r as f32) / 255.0,
+        (g as f32) / 255.0,
+        (b as f32) / 255.0,
+        a,
+    ]
+}
+
+/// Human-readable Varadi (2022) confidence band name for `pLDDT` in `[0, 100]`.
+#[inline]
+pub fn alphafold_plddt_band_label(plddt: f64) -> &'static str {
+    if plddt >= 90.0 {
+        "Very High (>=90)"
+    } else if plddt >= 70.0 {
+        "Confident (70..90)"
+    } else if plddt >= 50.0 {
+        "Low (50..70)"
+    } else {
+        "Very Low (<50)"
+    }
+}
+
 /// Active per-residue color and putty-radius track projected onto the 3D structure.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum QuantitativeTrack {
@@ -183,11 +410,19 @@ pub enum QuantitativeTrack {
     ChemicalExchangeRex,
     /// Combined amide ligand titration shift perturbation `Delta_delta_comb` (`ppm`).
     LigandCsp,
+    /// Canonical 4-band AlphaFold `pLDDT` confidence (`[0, 100]`, Varadi et al. 2022) with optional
+    /// disorder putty radius scaling `r_k = r_min + (1 - pLDDT_k / 100) * (r_max - r_min)`.
+    AlphaFoldPlddt,
+    /// Four-class AlphaFold vs solution NMR concordance (`ConcordantOrdered`, `ConcordantDisordered`,
+    /// `ConditionalFoldingOrCrystalArtifact`, `DynamicHingeOrAltState`) swelling discordant regions.
+    AfNmrConcordance,
 }
 
 impl QuantitativeTrack {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::SecondaryStructure,
+        Self::AlphaFoldPlddt,
+        Self::AfNmrConcordance,
         Self::EnsembleRmsd,
         Self::AssignmentConfidence,
         Self::ChemicalShiftIndex,
@@ -205,6 +440,8 @@ impl QuantitativeTrack {
             Self::LipariSzaboS2 => "Lipari-Szabo S²",
             Self::ChemicalExchangeRex => "Exchange R_ex (s⁻¹)",
             Self::LigandCsp => "Ligand CSP Δδ_comb (ppm)",
+            Self::AlphaFoldPlddt => "AlphaFold pLDDT",
+            Self::AfNmrConcordance => "AF vs NMR Concordance",
         }
     }
 
@@ -214,20 +451,34 @@ impl QuantitativeTrack {
             Self::AssignmentConfidence | Self::EnsembleRmsd | Self::LigandCsp => {
                 ColormapKind::Viridis
             }
-            Self::LipariSzaboS2 | Self::ChemicalExchangeRex => ColormapKind::Cividis,
+            Self::LipariSzaboS2
+            | Self::ChemicalExchangeRex
+            | Self::AlphaFoldPlddt
+            | Self::AfNmrConcordance => ColormapKind::Cividis,
             Self::SecondaryStructure => ColormapKind::Viridis,
         }
     }
 
+    /// Returns `true` when the track uses a fixed domain-standard discrete palette rather than a
+    /// user-selectable continuous [`ColormapKind`].
+    #[inline]
+    pub const fn uses_semantic_palette(self) -> bool {
+        matches!(
+            self,
+            Self::SecondaryStructure | Self::AlphaFoldPlddt | Self::AfNmrConcordance
+        )
+    }
+
     pub const fn units(self) -> &'static str {
         match self {
-            Self::SecondaryStructure => "",
+            Self::SecondaryStructure | Self::AfNmrConcordance => "",
             Self::EnsembleRmsd => "Å",
             Self::AssignmentConfidence => "",
             Self::ChemicalShiftIndex => "CSI",
             Self::LipariSzaboS2 => "S²",
             Self::ChemicalExchangeRex => "s⁻¹",
             Self::LigandCsp => "ppm",
+            Self::AlphaFoldPlddt => "pLDDT",
         }
     }
 }
@@ -260,6 +511,10 @@ pub struct QuantitativeTrackData {
     pub rex_s_inv: BTreeMap<usize, f64>,
     /// `0`-based polymer residue index -> combined ligand `CSP` `Delta_delta_comb` (`ppm`, `>= 0`).
     pub csp_ppm: BTreeMap<usize, f64>,
+    /// `0`-based polymer residue index -> AlphaFold `pLDDT` in `[0.0, 100.0]`.
+    pub plddt: BTreeMap<usize, f64>,
+    /// `0`-based polymer residue index -> AlphaFold vs solution NMR concordance classification.
+    pub concordance: BTreeMap<usize, ConcordanceTrackClass>,
     /// Upper display clamp for `R_ex` (`s^-1`, auto-scaled when `<= 0`).
     pub rex_max_s_inv: f64,
     /// Upper display clamp for `CSP` (`ppm`, auto-scaled when `<= 0`).
@@ -281,6 +536,8 @@ impl Default for QuantitativeTrackData {
             lipari_szabo_s2: BTreeMap::new(),
             rex_s_inv: BTreeMap::new(),
             csp_ppm: BTreeMap::new(),
+            plddt: BTreeMap::new(),
+            concordance: BTreeMap::new(),
             rex_max_s_inv: 15.0,
             csp_max_ppm: 0.50,
             rmsd_max_angstrom: 2.50,
@@ -289,6 +546,33 @@ impl Default for QuantitativeTrackData {
 }
 
 impl QuantitativeTrackData {
+    /// Populate `plddt` (`0`-based sequence index -> `[0.0, 100.0]`) from a dense slice.
+    pub fn set_plddt_dense(&mut self, values: &[f64]) {
+        self.plddt.clear();
+        for (k, &v) in values.iter().enumerate() {
+            if v.is_finite() {
+                self.plddt.insert(k, v.clamp(0.0, 100.0));
+            }
+        }
+    }
+
+    /// Populate `plddt` (`0`-based sequence index -> `[0.0, 100.0]`) from an optional per-residue slice.
+    pub fn set_plddt_slice(&mut self, values: &[Option<f64>]) {
+        self.plddt.clear();
+        for (k, v_opt) in values.iter().enumerate() {
+            if let Some(v) = v_opt.filter(|v| v.is_finite()) {
+                self.plddt.insert(k, v.clamp(0.0, 100.0));
+            }
+        }
+    }
+
+    /// Populate `concordance` (`0`-based sequence index -> [`ConcordanceTrackClass`]) from a slice.
+    pub fn set_concordance_slice(&mut self, classes: &[ConcordanceTrackClass]) {
+        self.concordance.clear();
+        for (k, &cls) in classes.iter().enumerate() {
+            self.concordance.insert(k, cls);
+        }
+    }
     /// Compute per-residue Wishart-style continuous `CSI` secondary-shift scores (`[-1.0, +1.0]`,
     /// positive = alpha-helical downfield `CA` / upfield `CB`, negative = beta-strand upfield `CA` /
     /// downfield `CB`) from an assigned [`Reference`] and empirical [`Priors`].
@@ -587,6 +871,64 @@ impl QuantitativeTrackData {
                     radius_angstrom: r,
                     normalized_t: Some(t),
                     raw_value: Some(csp),
+                }
+            }
+            QuantitativeTrack::AlphaFoldPlddt => {
+                let Some(plddt_raw) = seq_idx
+                    .and_then(|k| self.plddt.get(&k).copied())
+                    .filter(|v| v.is_finite())
+                else {
+                    let mut c = UNASSIGNED_PUTTY_RGBA;
+                    c[3] = alpha;
+                    return ResiduePuttyStyle {
+                        rgba: c,
+                        radius_angstrom: if self.putty_enabled {
+                            min_r
+                        } else {
+                            base_coil_radius
+                        },
+                        normalized_t: None,
+                        raw_value: None,
+                    };
+                };
+                let plddt = plddt_raw.clamp(0.0, 100.0);
+                let norm_conf = (plddt / 100.0) as f32;
+                // Disorder putty scaling (`docs/specs/21-alphafold-integrative-nmr.md` §3.2):
+                // r_k = r_min + (1 - pLDDT_k / 100) * (r_max - r_min)
+                let r = if self.putty_enabled {
+                    min_r + (1.0 - norm_conf) * (max_r - min_r)
+                } else {
+                    base_coil_radius
+                };
+                ResiduePuttyStyle {
+                    rgba: alphafold_plddt_rgba(plddt, alpha),
+                    radius_angstrom: r,
+                    normalized_t: Some(norm_conf),
+                    raw_value: Some(plddt),
+                }
+            }
+            QuantitativeTrack::AfNmrConcordance => {
+                let cls = seq_idx
+                    .and_then(|k| self.concordance.get(&k).copied())
+                    .unwrap_or(ConcordanceTrackClass::UnassignedNmr);
+                let swell_t = cls.discrepancy_putty_t();
+                let r = if self.putty_enabled {
+                    min_r + swell_t * (max_r - min_r)
+                } else {
+                    base_coil_radius
+                };
+                let raw_code = match cls {
+                    ConcordanceTrackClass::ConcordantOrdered => Some(1.0),
+                    ConcordanceTrackClass::ConcordantDisordered => Some(2.0),
+                    ConcordanceTrackClass::ConditionalFoldingOrCrystalArtifact => Some(3.0),
+                    ConcordanceTrackClass::DynamicHingeOrAltState => Some(4.0),
+                    ConcordanceTrackClass::UnassignedNmr => None,
+                };
+                ResiduePuttyStyle {
+                    rgba: cls.rgba_3d(alpha),
+                    radius_angstrom: r,
+                    normalized_t: raw_code.map(|_| swell_t),
+                    raw_value: raw_code,
                 }
             }
         }

@@ -39,7 +39,7 @@ use nmr_core::evaluate::{score, to_reference, Metrics};
 use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
 use nmr_core::fid::read_bruker_fid_2d_from_bytes;
 use nmr_core::fid::read_bruker_fid_3d_from_bytes;
-use nmr_core::idp_propensity::{compute_idp_propensity, PropensityConfig, PropensityReport};
+use nmr_core::idp_propensity::{PropensityConfig, PropensityReport};
 use nmr_core::idp_solver::{
     assign_idp_13c_cpu, idp_to_reference, register_and_build_con_dipeptide_systems, IdpSolverConfig,
 };
@@ -156,6 +156,7 @@ use nmr_gui::{
     sidechain_widget::{
         AssignedAtomInfo, SequenceRibbonState, SidechainInspectorPanel, SidechainWorkspaceInput,
     },
+    ss_ribbon_widget::{SsRibbonPanel, SsRibbonState, SsRibbonWorkspaceInput},
     stack1d_panel::{
         build_kinetics_demo_traces, export_stack1d_svg, render_stack1d_panel, AttachedSpectrum1d,
         InspectorTab1d, Stack1dState, Stack1dViewMode, ToolMode1d, Trace1d,
@@ -1686,6 +1687,8 @@ struct NmrWorkbenchApp {
     pred_ambiguity_codes: BTreeMap<(usize, String), u8>,
     metrics: Option<Metrics>,
     sidechain_ribbon_state: SequenceRibbonState,
+    ss_ribbon_state: SsRibbonState,
+    show_ss_ribbon: bool,
     show_sidechain_inspector: bool,
     overwrite_curated_rings: bool,
     mol3d_panel: Mol3dViewerPanel,
@@ -2212,6 +2215,8 @@ impl NmrWorkbenchApp {
             pred_ambiguity_codes: BTreeMap::new(),
             metrics: None,
             sidechain_ribbon_state: SequenceRibbonState::new(),
+            ss_ribbon_state: SsRibbonState::new(),
+            show_ss_ribbon: true,
             show_sidechain_inspector: false,
             overwrite_curated_rings: false,
             mol3d_panel: Mol3dViewerPanel::new(),
@@ -2485,6 +2490,7 @@ impl NmrWorkbenchApp {
             let saved_ph = self.sidechain_ribbon_state.sample_ph;
             self.sidechain_ribbon_state = SequenceRibbonState::new();
             self.sidechain_ribbon_state.set_sample_ph(saved_ph);
+            self.ss_ribbon_state = SsRibbonState::new();
         }
         self.reference = None;
         self.peaks.clear();
@@ -2505,6 +2511,7 @@ impl NmrWorkbenchApp {
         self.selected_res = None;
         self.loaded_pdb_text = None;
         self.mol3d_panel = Mol3dViewerPanel::new();
+        self.sync_ss_ribbon_and_concordance();
         self.has_structure_or_dynamics = false;
         if !keep_3d_cubes {
             self.hncacb_3d = None;
@@ -2743,12 +2750,27 @@ impl NmrWorkbenchApp {
         self.sync_mol3d_from_app();
     }
 
+    fn sync_ss_ribbon_and_concordance(&mut self) {
+        let exp_s2 = (!self.mol3d_panel.track_data.lipari_szabo_s2.is_empty())
+            .then_some(&self.mol3d_panel.track_data.lipari_szabo_s2);
+        self.ss_ribbon_state.sync_with_cached_propensity(
+            self.sequence.len(),
+            self.mol3d_panel.ensemble.as_ref(),
+            self.propensity_report.as_ref(),
+            exp_s2,
+        );
+        self.ss_ribbon_state.selected_residue = self.selected_res;
+        self.mol3d_panel
+            .set_concordance_classes(&self.ss_ribbon_state.concordance_summary.classes);
+    }
+
     fn sync_mol3d_from_app(&mut self) {
         let src_ref = self.pred_ref.as_ref().or(self.reference.as_ref());
         self.mol3d_panel
             .sync_nmr_tracks(&self.pred_conf, src_ref, Some(&self.priors));
         self.mol3d_panel
             .highlight_sequence_residue(self.selected_res, false);
+        self.sync_ss_ribbon_and_concordance();
         self.mol3d_panel.flush_pending_updates();
     }
 
@@ -2814,6 +2836,7 @@ impl NmrWorkbenchApp {
                     self.mol3d_panel.track_data.putty_enabled = true;
                     self.show_mol3d_viewport = true;
                     self.has_structure_or_dynamics = true;
+                    self.sync_ss_ribbon_and_concordance();
                     self.mol3d_panel.rebuild_for_test();
                     let track_label = match track {
                         QuantitativeTrack::LipariSzaboS2 => "Lipari–Szabo S²",
@@ -2856,6 +2879,7 @@ impl NmrWorkbenchApp {
             proj.apply_to(&mut self.mol3d_panel.track_data, &self.seq_ids);
             self.show_mol3d_viewport = true;
             self.has_structure_or_dynamics = true;
+            self.sync_ss_ribbon_and_concordance();
             self.mol3d_panel.rebuild_for_test();
             self.status_msg =
                 format!("Mapped {track_label} ({count} residues) onto 3D structure putty");
@@ -2912,10 +2936,14 @@ impl NmrWorkbenchApp {
     fn refresh_propensity_report(&mut self) {
         let Some(src_ref) = self.pred_ref.as_ref().or(self.reference.as_ref()) else {
             self.propensity_report = None;
+            self.sync_ss_ribbon_and_concordance();
+            self.mol3d_panel.flush_pending_updates();
             return;
         };
         if src_ref.sequence.is_empty() {
             self.propensity_report = None;
+            self.sync_ss_ribbon_and_concordance();
+            self.mol3d_panel.flush_pending_updates();
             return;
         }
         let temp_k = self.idp_temp_k.clamp(250.0, 360.0);
@@ -2925,7 +2953,10 @@ impl NmrWorkbenchApp {
                 cfg = cfg.with_sample_ph(ph);
             }
         }
-        self.propensity_report = Some(compute_idp_propensity(src_ref, &cfg));
+        let _ = self.ss_ribbon_state.sync_nmr_shifts(Some(src_ref), &cfg);
+        self.propensity_report = self.ss_ribbon_state.cached_propensity.clone();
+        self.sync_ss_ribbon_and_concordance();
+        self.mol3d_panel.flush_pending_updates();
     }
 
     fn raw_hsqc_locks_for_peaks(&self) -> Vec<(usize, usize)> {
@@ -7447,6 +7478,8 @@ impl NmrWorkbenchApp {
             }
         }
 
+        let mut clicked_seq_res: Option<(usize, Option<usize>)> = None;
+
         egui::ScrollArea::horizontal()
             .id_salt("seq_ribbon_scroll")
             .max_height(52.0)
@@ -7484,6 +7517,21 @@ impl NmrWorkbenchApp {
                             if self.selected_res.is_none() {
                                 self.selected_res = Some(0);
                             }
+                        }
+                    }
+                    if chrome_icon_button(
+                        ui,
+                        WorkbookIcon::Trace1D,
+                        Some("3D/NMR SS"),
+                        self.show_ss_ribbon,
+                        "Toggle 3-track vector secondary structure & AlphaFold-vs-NMR concordance ribbon",
+                        28.0,
+                    )
+                    .clicked()
+                    {
+                        self.show_ss_ribbon = !self.show_ss_ribbon;
+                        if self.show_ss_ribbon {
+                            self.refresh_propensity_report();
                         }
                     }
                     if chrome_icon_button(
@@ -7549,16 +7597,7 @@ impl NmrWorkbenchApp {
 
                         let resp = ui.add(btn);
                         if resp.clicked() {
-                            self.selected_res = Some(k);
-                            self.sidechain_ribbon_state.selected_residue = k;
-                            self.assign_target_res = k;
-                            if let Some((ss_idx, _)) = assigned {
-                                self.selected_ss = Some(ss_idx);
-                                if let Some(ss) = self.systems.get(ss_idx) {
-                                    self.crosshair.snap_to(ss.h, ss.n, None);
-                                }
-                            }
-                            self.mol3d_panel.highlight_sequence_residue(Some(k), true);
+                            clicked_seq_res = Some((k, assigned.map(|(ss_idx, _)| ss_idx)));
                         }
                         resp.on_hover_ui(|ui| {
                             ui.label(egui::RichText::new(format!("{three} {seq_id}")).strong());
@@ -7591,6 +7630,31 @@ impl NmrWorkbenchApp {
                     }
                 });
             });
+
+        if let Some((k, ss_opt)) = clicked_seq_res {
+            if let Some(ss_idx) = ss_opt {
+                self.selected_ss = Some(ss_idx);
+            }
+            self.select_residue_and_sync_strip(k);
+        }
+
+        if self.show_ss_ribbon {
+            ui.add_space(2.0);
+            self.ss_ribbon_state.selected_residue = self.selected_res;
+            let ss_out = SsRibbonPanel::show(
+                ui,
+                &mut self.ss_ribbon_state,
+                &SsRibbonWorkspaceInput {
+                    sequence: &self.sequence,
+                    seq_ids: &self.seq_ids,
+                    paper_white: self.paper_white_canvas,
+                    has_3d_structure: self.mol3d_panel.ensemble.is_some(),
+                },
+            );
+            if let Some(clicked_k) = ss_out.clicked_residue {
+                self.select_residue_and_sync_strip(clicked_k);
+            }
+        }
     }
 
     fn draw_3d_cube_plane_bar(&mut self, ui: &mut egui::Ui) {
@@ -9993,16 +10057,54 @@ impl NmrWorkbenchApp {
         }
         self.selected_res = Some(k);
         self.sidechain_ribbon_state.selected_residue = k;
+        self.ss_ribbon_state.selected_residue = Some(k);
         self.assign_target_res = k;
         self.mol3d_panel.highlight_sequence_residue(Some(k), true);
+
+        let mut snapped_from_ss = false;
         if let Some(res) = &self.assign_res {
             for (s, &pos) in res.position.iter().enumerate() {
                 if pos >= 0 && (pos as usize) == k {
                     self.selected_ss = Some(s);
                     if let Some(ss) = self.systems.get(s) {
-                        self.crosshair.snap_to(ss.h, ss.n, self.crosshair.c_ppm);
+                        let ca_ppm = self
+                            .pred_ref
+                            .as_ref()
+                            .or(self.reference.as_ref())
+                            .and_then(|r| r.shifts.get(&(k, "CA".to_string())).copied())
+                            .filter(|v| v.is_finite())
+                            .or(self.crosshair.c_ppm);
+                        self.crosshair.snap_to(ss.h, ss.n, ca_ppm);
+                        snapped_from_ss = true;
                     }
                     break;
+                }
+            }
+        }
+        if !snapped_from_ss {
+            if let Some(r) = self.pred_ref.as_ref().or(self.reference.as_ref()) {
+                let h_opt = r
+                    .shifts
+                    .get(&(k, "H".to_string()))
+                    .or_else(|| r.shifts.get(&(k, "HN".to_string())))
+                    .copied()
+                    .filter(|v| v.is_finite());
+                let n_opt = r
+                    .shifts
+                    .get(&(k, "N".to_string()))
+                    .copied()
+                    .filter(|v| v.is_finite());
+                let ca_opt = r
+                    .shifts
+                    .get(&(k, "CA".to_string()))
+                    .copied()
+                    .filter(|v| v.is_finite());
+                if h_opt.is_some() || n_opt.is_some() || ca_opt.is_some() {
+                    self.crosshair.snap_to(
+                        h_opt.unwrap_or(self.crosshair.h_ppm),
+                        n_opt.unwrap_or(self.crosshair.n_ppm),
+                        ca_opt.or(self.crosshair.c_ppm),
+                    );
                 }
             }
         }
@@ -12510,6 +12612,7 @@ impl NmrWorkbenchApp {
                 let saved_ph = self.sidechain_ribbon_state.sample_ph;
                 self.sidechain_ribbon_state = SequenceRibbonState::new();
                 self.sidechain_ribbon_state.set_sample_ph(saved_ph);
+                self.ss_ribbon_state = SsRibbonState::new();
                 self.c13_picked_dataset = None;
                 self.propensity_report = None;
                 self.metrics = None;
@@ -14639,6 +14742,7 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
                 {
                     self.loaded_pdb_text = None;
                     self.mol3d_panel = Mol3dViewerPanel::new();
+                    self.sync_ss_ribbon_and_concordance();
                     self.status_msg = "Unloaded 3D structure.".to_string();
                 }
             });
@@ -15776,6 +15880,8 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             pred_ambiguity_codes: BTreeMap::new(),
             metrics: None,
             sidechain_ribbon_state: SequenceRibbonState::new(),
+            ss_ribbon_state: SsRibbonState::new(),
+            show_ss_ribbon: true,
             show_sidechain_inspector: false,
             overwrite_curated_rings: false,
             mol3d_panel: Mol3dViewerPanel::new(),
@@ -16189,6 +16295,8 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             pred_ambiguity_codes: BTreeMap::new(),
             metrics: None,
             sidechain_ribbon_state: SequenceRibbonState::new(),
+            ss_ribbon_state: SsRibbonState::new(),
+            show_ss_ribbon: true,
             show_sidechain_inspector: false,
             overwrite_curated_rings: false,
             mol3d_panel: Mol3dViewerPanel::new(),
@@ -16470,6 +16578,8 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             pred_ambiguity_codes: BTreeMap::new(),
             metrics: None,
             sidechain_ribbon_state: SequenceRibbonState::new(),
+            ss_ribbon_state: SsRibbonState::new(),
+            show_ss_ribbon: true,
             show_sidechain_inspector: false,
             overwrite_curated_rings: false,
             mol3d_panel: Mol3dViewerPanel::new(),

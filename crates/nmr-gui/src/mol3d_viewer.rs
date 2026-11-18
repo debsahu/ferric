@@ -23,11 +23,15 @@ use nmr_core::priors::Priors;
 use wgpu::util::DeviceExt;
 
 use crate::mol3d_overlay::{
-    pick_scene_analytical, resolve_3d_pick_sync, AtomCoordLookup, ColormapKind, CylinderInstance,
-    DistanceRestraint3d, Mol3dSyncAction, PickableRestraint3d, PickableRibbonSegment3d,
-    PickableSphere3d, Picked3dHit, QuantitativeTrack, QuantitativeTrackData, RestraintFilterConfig,
-    RestraintOverlayBuild,
+    pick_scene_analytical, resolve_3d_pick_sync, AtomCoordLookup, ColormapKind,
+    ConcordanceTrackClass, CylinderInstance, DistanceRestraint3d, Mol3dSyncAction,
+    PickableRestraint3d, PickableRibbonSegment3d, PickableSphere3d, Picked3dHit, QuantitativeTrack,
+    QuantitativeTrackData, ResiduePuttyStyle, RestraintFilterConfig, RestraintOverlayBuild,
+    SsState4,
 };
+
+/// Maximum coordinate input text size (`64 MiB`) accepted before allocation (`docs/specs/21` §1.1).
+pub const MAX_STRUCTURE_TEXT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Hardware MSAA sample count for crisp silhouette anti-aliasing in the offscreen 3D pass.
 pub const MOL3D_MSAA_SAMPLES: u32 = 4;
@@ -182,6 +186,22 @@ pub struct StructureAtom3d {
     pub is_metal: bool,
 }
 
+/// Provenance of coordinate uncertainty / `pLDDT` metadata (`docs/specs/21-alphafold-integrative-nmr.md` §1.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CoordinateProvenance {
+    /// Explicit ModelArchive `_ma_qa_metric_local` per-residue `pLDDT` table.
+    ModelArchiveQaMetric,
+    /// Computational structure (`AlphaFold` / `Boltz` / `ColabFold` or unannotated `[0, 100]` `B_iso`)
+    /// where `CA` / backbone `B_iso_or_equiv` encodes `pLDDT`.
+    ComputationalBFactor,
+    /// Experimental structure (`X-RAY DIFFRACTION`, `SOLUTION NMR`, `ELECTRON MICROSCOPY`) where
+    /// `B_iso_or_equiv` encodes thermal displacement (`Å^2`) and MUST NOT be treated as `pLDDT`.
+    Experimental,
+    /// Unclassified coordinate source without `pLDDT`.
+    #[default]
+    Unknown,
+}
+
 /// Polymer amino-acid residue within a single chain and conformer.
 #[derive(Clone, Debug)]
 pub struct PolymerResidue3d {
@@ -192,6 +212,8 @@ pub struct PolymerResidue3d {
     /// Optional `0`-based index into the primary polymer sequence for NMR shift/track coupling.
     pub sequence_idx: Option<usize>,
     pub ss: SecondaryStructureKind,
+    /// Four-state Kabsch–Sander + Adzhubei `PPII` classification (`Helix`, `Sheet`, `Ppii`, `Coil`).
+    pub ss4: SsState4,
     pub atoms: Vec<StructureAtom3d>,
 }
 
@@ -246,6 +268,15 @@ pub struct StructureEnsemble3d {
     pub primary_sequence: Vec<String>,
     /// Primary polymer chain author `seq_id`s matching `primary_sequence`.
     pub primary_seq_ids: Vec<i32>,
+    /// Primary polymer chain 4-state secondary structure (`Helix`, `Sheet`, `Ppii`, `Coil`) on conformer `0`.
+    pub primary_ss4: Vec<SsState4>,
+    /// Per-residue AlphaFold `pLDDT` (`[0.0, 100.0]`) aligned to conformer `0` `chains[0].residues`,
+    /// or `None` when experimental coordinates (`X-RAY DIFFRACTION`, `SOLUTION NMR`, etc.) are loaded.
+    pub per_residue_plddt: Option<Vec<f64>>,
+    /// `true` when `[0.0, 1.0]` fractional `pLDDT` values were automatically rescaled to `[0.0, 100.0]`.
+    pub plddt_rescaled_from_unit: bool,
+    /// Detected coordinate provenance (`ModelArchiveQaMetric`, `ComputationalBFactor`, `Experimental`).
+    pub provenance: CoordinateProvenance,
     /// Per-residue `CA` spatial RMSD (`Å`) across superposed conformers for `0..primary_sequence.len()`.
     pub per_residue_ca_rmsd: Vec<f64>,
     /// Mean ensemble `CA` RMSD (`Å`) across `per_residue_ca_rmsd` (`0.0` for a single conformer;
@@ -521,6 +552,86 @@ struct SsSpan {
     kind: SecondaryStructureKind,
 }
 
+#[derive(Clone, Debug)]
+struct QaMetricDef {
+    name: String,
+    mode: String,
+    metric_type: String,
+}
+
+#[derive(Clone, Debug)]
+struct QaLocalMetricRow {
+    model_id: usize,
+    chain_id: char,
+    seq_id: i32,
+    metric_id: String,
+    value: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PlddtIngestHints {
+    qa_defs: HashMap<String, QaMetricDef>,
+    qa_local_rows: Vec<QaLocalMetricRow>,
+    saw_qa_local_loop: bool,
+    is_experimental_method: bool,
+    is_computational_hint: bool,
+    force_bfactor_plddt: bool,
+}
+
+#[inline]
+fn text_declares_experimental_method(raw: &str) -> bool {
+    let up = raw.to_ascii_uppercase();
+    up.contains("X-RAY")
+        || up.contains("DIFFRACTION")
+        || up.contains("SOLUTION NMR")
+        || up.contains("SOLID-STATE NMR")
+        || up.contains("ELECTRON MICROSCOPY")
+        || up.contains("CRYO-EM")
+        || up.contains("NMR ENSEMBLE")
+}
+
+#[inline]
+fn text_declares_computational_model(raw: &str) -> bool {
+    let up = raw.to_ascii_uppercase();
+    up.contains("ALPHAFOLD")
+        || up.contains("BOLTZ")
+        || up.contains("COLABFOLD")
+        || up.contains("ESMFOLD")
+        || up.contains("ROSETTAFOLD")
+        || up.contains("MODELARCHIVE")
+        || up.contains("THEORETICAL MODEL")
+}
+
+fn normalize_plddt_vec_if_unit_scale(vals: &mut [f64]) -> bool {
+    if vals.is_empty() {
+        return false;
+    }
+    let all_in_unit = vals.iter().all(|&v| (0.0..=1.0).contains(&v));
+    if !all_in_unit {
+        for v in vals.iter_mut() {
+            *v = v.clamp(0.0, 100.0);
+        }
+        return false;
+    }
+    let mut sorted = vals.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mid = sorted.len() / 2;
+    let median = if sorted.len().is_multiple_of(2) {
+        0.5 * (sorted[mid - 1] + sorted[mid])
+    } else {
+        sorted[mid]
+    };
+    let max_v = sorted.last().copied().unwrap_or(0.0);
+    if median > 0.15 && max_v <= 1.0 {
+        for v in vals.iter_mut() {
+            *v = (*v * 100.0).clamp(0.0, 100.0);
+        }
+        true
+    } else {
+        false
+    }
+}
+
 // ============================================================================
 // 4. Safe `.pdb` & `.cif`/`.mmcif` Parsers
 // ============================================================================
@@ -528,20 +639,49 @@ struct SsSpan {
 /// Auto-detect `.cif`/`.mmcif` vs `.pdb` format from text content and parse into a superposed
 /// [`StructureEnsemble3d`].
 pub fn parse_structure_auto(text: &str) -> Result<StructureEnsemble3d, String> {
+    parse_structure_with_options(text, false)
+}
+
+/// Auto-detect `.cif`/`.mmcif` vs `.pdb` format and parse with explicit control over whether
+/// experimental `B_iso` / `tempFactor` columns are forced into `pLDDT` (`force_bfactor_plddt`).
+pub fn parse_structure_with_options(
+    text: &str,
+    force_bfactor_plddt: bool,
+) -> Result<StructureEnsemble3d, String> {
+    if text.len() > MAX_STRUCTURE_TEXT_BYTES {
+        return Err(format!(
+            "Coordinate input size ({} bytes) exceeds 64 MiB limit",
+            text.len()
+        ));
+    }
     let looks_like_cif = text.lines().any(|line| {
         let t = line.trim_start();
-        t.starts_with("data_") || t.starts_with("_atom_site.")
+        t.starts_with("data_") || t.starts_with("_atom_site.") || t.starts_with("_ma_qa_metric")
     });
     if looks_like_cif {
-        parse_mmcif_ensemble(text)
+        parse_mmcif_ensemble_with_options(text, force_bfactor_plddt)
     } else {
-        parse_pdb_ensemble(text)
+        parse_pdb_ensemble_with_options(text, force_bfactor_plddt)
     }
 }
 
 /// Parse a Protein Data Bank (`.pdb` / `.ent`) single structure or multi-`MODEL` NMR ensemble
 /// using strictly byte-safe ASCII column access (zero `&str` byte-offset slicing).
 pub fn parse_pdb_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
+    parse_pdb_ensemble_with_options(text, false)
+}
+
+/// Parse a `.pdb` coordinate text with optional `force_bfactor_plddt` override.
+pub fn parse_pdb_ensemble_with_options(
+    text: &str,
+    force_bfactor_plddt: bool,
+) -> Result<StructureEnsemble3d, String> {
+    if text.len() > MAX_STRUCTURE_TEXT_BYTES {
+        return Err(format!(
+            "PDB input size ({} bytes) exceeds 64 MiB limit",
+            text.len()
+        ));
+    }
     let mut title_parts: Vec<String> = Vec::new();
     let mut header_fallback = String::new();
     let mut ss_spans: Vec<SsSpan> = Vec::new();
@@ -549,6 +689,10 @@ pub fn parse_pdb_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
     let mut current_model: usize = 1;
     let mut saw_explicit_model = false;
     let mut auto_model_counter = 0usize;
+    let mut hints = PlddtIngestHints {
+        force_bfactor_plddt,
+        ..PlddtIngestHints::default()
+    };
 
     for (line_idx, line) in text.lines().enumerate() {
         let bytes = line.as_bytes();
@@ -558,6 +702,9 @@ pub fn parse_pdb_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
             let body: String = line.chars().skip(10).collect();
             let trimmed = body.trim();
             if !trimmed.is_empty() {
+                if text_declares_computational_model(trimmed) {
+                    hints.is_computational_hint = true;
+                }
                 title_parts.push(trimmed.to_string());
             }
             continue;
@@ -565,8 +712,32 @@ pub fn parse_pdb_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
         if rec_prefix.starts_with(b"HEADER") {
             let body: String = line.chars().skip(10).take(56).collect();
             let trimmed = body.trim();
-            if !trimmed.is_empty() && header_fallback.is_empty() {
-                header_fallback = trimmed.to_string();
+            if !trimmed.is_empty() {
+                if text_declares_computational_model(trimmed) {
+                    hints.is_computational_hint = true;
+                } else if text_declares_experimental_method(trimmed) {
+                    hints.is_experimental_method = true;
+                }
+                if header_fallback.is_empty() {
+                    header_fallback = trimmed.to_string();
+                }
+            }
+            continue;
+        }
+        if rec_prefix.starts_with(b"EXPDTA") {
+            let body: String = line.chars().skip(6).collect();
+            let trimmed = body.trim();
+            if text_declares_experimental_method(trimmed) {
+                hints.is_experimental_method = true;
+            }
+            if text_declares_computational_model(trimmed) {
+                hints.is_computational_hint = true;
+            }
+            continue;
+        }
+        if rec_prefix.starts_with(b"REMARK") {
+            if text_declares_computational_model(line) {
+                hints.is_computational_hint = true;
             }
             continue;
         }
@@ -673,11 +844,18 @@ pub fn parse_pdb_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
             .and_then(|s| s.trim().parse::<f32>().ok())
             .filter(|v| v.is_finite())
             .unwrap_or(1.0);
-        let b_factor = pdb_ascii_col(bytes, 60, 66)
-            .ok()
-            .and_then(|s| s.trim().parse::<f32>().ok())
-            .filter(|v| v.is_finite())
-            .unwrap_or(0.0);
+        let b_factor = match pdb_ascii_col(bytes, 60, 66).ok().map(str::trim) {
+            Some(s) if !s.is_empty() => {
+                let bf: f32 = s
+                    .parse()
+                    .map_err(|_| format!("Malformed tempFactor '{s}' at {ctx}"))?;
+                if !bf.is_finite() {
+                    return Err(format!("Non-finite tempFactor '{s}' at {ctx}"));
+                }
+                bf
+            }
+            _ => 0.0,
+        };
         let raw_elem = pdb_ascii_col(bytes, 76, 78).unwrap_or("");
         let element = infer_clean_element(raw_elem, &atom_name, &res_name, is_hetatm);
 
@@ -714,7 +892,7 @@ pub fn parse_pdb_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
         "PDB Structure".to_string()
     };
 
-    finalize_structure_ensemble(title, raw_atoms, &ss_spans)
+    finalize_structure_ensemble(title, raw_atoms, &ss_spans, &hints)
 }
 
 #[derive(Clone, Debug)]
@@ -780,6 +958,21 @@ fn tokenize_cif_line(line: &str, out: &mut Vec<CifToken>) {
 /// Parse a Macromolecular Crystallographic Information File (`.cif` / `.mmcif`) `_atom_site` loop
 /// into a superposed [`StructureEnsemble3d`] using safe Unicode tokenization.
 pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
+    parse_mmcif_ensemble_with_options(text, false)
+}
+
+/// Parse an `.mmcif`/`.cif` coordinate file with explicit `force_bfactor_plddt` control,
+/// extracting ModelArchive `_ma_qa_metric_local` `pLDDT` and `_exptl.method` provenance.
+pub fn parse_mmcif_ensemble_with_options(
+    text: &str,
+    force_bfactor_plddt: bool,
+) -> Result<StructureEnsemble3d, String> {
+    if text.len() > MAX_STRUCTURE_TEXT_BYTES {
+        return Err(format!(
+            "mmCIF input size ({} bytes) exceeds 64 MiB limit",
+            text.len()
+        ));
+    }
     let mut tokens: Vec<CifToken> = Vec::new();
     let mut in_semicolon_block = false;
     let mut semi_buf = String::new();
@@ -814,22 +1007,82 @@ pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
 
     let mut title = String::new();
     let mut raw_atoms: Vec<RawAtomRecord> = Vec::new();
+    let mut hints = PlddtIngestHints {
+        force_bfactor_plddt,
+        ..PlddtIngestHints::default()
+    };
+    let mut single_qa_id = String::new();
+    let mut single_qa_name = String::new();
+    let mut single_qa_mode = String::new();
+    let mut single_qa_type = String::new();
     let mut idx = 0usize;
 
     while idx < tokens.len() {
         let tok = &tokens[idx];
         if !tok.is_quoted && title.is_empty() && tok.text.starts_with("data_") {
             title = tok.text.chars().skip(5).collect();
+            if text_declares_computational_model(&title) || title.starts_with("AF-") {
+                hints.is_computational_hint = true;
+            }
             idx += 1;
             continue;
         }
-        if !tok.is_quoted && tok.text == "_struct.title" && idx + 1 < tokens.len() {
-            let t = tokens[idx + 1].text.trim();
-            if !t.is_empty() && (tokens[idx + 1].is_quoted || (t != "." && t != "?")) {
-                title = t.to_string();
+        if !tok.is_quoted && idx + 1 < tokens.len() && tok.text.starts_with('_') {
+            let tag_low = tok.text.to_ascii_lowercase();
+            if tag_low == "_struct.title" {
+                let t = tokens[idx + 1].text.trim();
+                if !t.is_empty() && (tokens[idx + 1].is_quoted || (t != "." && t != "?")) {
+                    if text_declares_computational_model(t) {
+                        hints.is_computational_hint = true;
+                    }
+                    title = t.to_string();
+                }
+                idx += 2;
+                continue;
             }
-            idx += 2;
-            continue;
+            if tag_low == "_exptl.method" {
+                let val = tokens[idx + 1].text.trim();
+                if text_declares_experimental_method(val) {
+                    hints.is_experimental_method = true;
+                }
+                if text_declares_computational_model(val) {
+                    hints.is_computational_hint = true;
+                }
+                idx += 2;
+                continue;
+            }
+            if tag_low.starts_with("_ma_protocol_step.") || tag_low.starts_with("_ma_model_list.") {
+                hints.is_computational_hint = true;
+                idx += 2;
+                continue;
+            }
+            if tag_low == "_software.name" {
+                if text_declares_computational_model(&tokens[idx + 1].text) {
+                    hints.is_computational_hint = true;
+                }
+                idx += 2;
+                continue;
+            }
+            if tag_low == "_ma_qa_metric.id" {
+                single_qa_id = tokens[idx + 1].text.trim().to_string();
+                idx += 2;
+                continue;
+            }
+            if tag_low == "_ma_qa_metric.name" {
+                single_qa_name = tokens[idx + 1].text.trim().to_string();
+                idx += 2;
+                continue;
+            }
+            if tag_low == "_ma_qa_metric.mode" {
+                single_qa_mode = tokens[idx + 1].text.trim().to_string();
+                idx += 2;
+                continue;
+            }
+            if tag_low == "_ma_qa_metric.type" {
+                single_qa_type = tokens[idx + 1].text.trim().to_string();
+                idx += 2;
+                continue;
+            }
         }
         if !tok.is_quoted && tok.text.eq_ignore_ascii_case("loop_") {
             idx += 1;
@@ -843,7 +1096,26 @@ pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
             if ncols == 0 {
                 continue;
             }
+            if headers
+                .iter()
+                .any(|h| h.starts_with("_ma_protocol_step.") || h.starts_with("_ma_model_list."))
+            {
+                hints.is_computational_hint = true;
+            }
+
+            let col_of = |names: &[&str]| -> Option<usize> {
+                names
+                    .iter()
+                    .find_map(|target| headers.iter().position(|h| h == target))
+            };
+
             let is_atom_site = headers.iter().any(|h| h.starts_with("_atom_site."));
+            let is_exptl = headers.iter().any(|h| h.starts_with("_exptl."));
+            let is_qa_metric = headers.iter().any(|h| h.starts_with("_ma_qa_metric."));
+            let is_qa_local = headers
+                .iter()
+                .any(|h| h.starts_with("_ma_qa_metric_local."));
+
             if !is_atom_site {
                 let loop_start = idx;
                 while idx < tokens.len() && !is_cif_control_token(&tokens[idx]) {
@@ -856,14 +1128,94 @@ pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
                         headers[0], n_vals
                     ));
                 }
+                let loop_vals = &tokens[loop_start..idx];
+                if is_exptl {
+                    if let Some(cm) = col_of(&["_exptl.method"]) {
+                        for row in loop_vals.chunks_exact(ncols) {
+                            let m = row[cm].text.trim();
+                            if text_declares_experimental_method(m) {
+                                hints.is_experimental_method = true;
+                            }
+                            if text_declares_computational_model(m) {
+                                hints.is_computational_hint = true;
+                            }
+                        }
+                    }
+                } else if is_qa_metric {
+                    let c_id = col_of(&["_ma_qa_metric.id"]);
+                    let c_name = col_of(&["_ma_qa_metric.name"]);
+                    let c_mode = col_of(&["_ma_qa_metric.mode"]);
+                    let c_type = col_of(&["_ma_qa_metric.type"]);
+                    if let Some(ci) = c_id {
+                        for row in loop_vals.chunks_exact(ncols) {
+                            let id_s = row[ci].text.trim().to_string();
+                            hints.qa_defs.insert(
+                                id_s,
+                                QaMetricDef {
+                                    name: c_name
+                                        .map(|c| row[c].text.trim().to_string())
+                                        .unwrap_or_default(),
+                                    mode: c_mode
+                                        .map(|c| row[c].text.trim().to_string())
+                                        .unwrap_or_default(),
+                                    metric_type: c_type
+                                        .map(|c| row[c].text.trim().to_string())
+                                        .unwrap_or_default(),
+                                },
+                            );
+                        }
+                    }
+                } else if is_qa_local {
+                    hints.saw_qa_local_loop = true;
+                    hints.is_computational_hint = true;
+                    let c_asym = col_of(&[
+                        "_ma_qa_metric_local.label_asym_id",
+                        "_ma_qa_metric_local.auth_asym_id",
+                    ]);
+                    let c_seq = col_of(&[
+                        "_ma_qa_metric_local.label_seq_id",
+                        "_ma_qa_metric_local.auth_seq_id",
+                    ])
+                    .ok_or_else(|| {
+                        "mmCIF _ma_qa_metric_local missing label_seq_id column".to_string()
+                    })?;
+                    let c_mid = col_of(&["_ma_qa_metric_local.metric_id"]);
+                    let c_val = col_of(&["_ma_qa_metric_local.metric_value"]).ok_or_else(|| {
+                        "mmCIF _ma_qa_metric_local missing metric_value column".to_string()
+                    })?;
+                    let c_mod = col_of(&["_ma_qa_metric_local.model_id"]);
+
+                    for (r_idx, row) in loop_vals.chunks_exact(ncols).enumerate() {
+                        let ctx = format!("mmCIF _ma_qa_metric_local row {}", r_idx + 1);
+                        let chain_id = c_asym
+                            .and_then(|c| row[c].text.chars().next())
+                            .filter(|&ch| ch != '.' && ch != '?')
+                            .unwrap_or('A');
+                        let seq_id: i32 = row[c_seq].text.trim().parse().map_err(|_| {
+                            format!(
+                                "Malformed label_seq_id '{}' at {ctx}",
+                                row[c_seq].text.trim()
+                            )
+                        })?;
+                        let metric_id = c_mid
+                            .map(|c| row[c].text.trim().to_string())
+                            .unwrap_or_else(|| "1".to_string());
+                        let value = parse_finite_f64_token(&row[c_val].text, "metric_value", &ctx)?;
+                        let model_id = c_mod
+                            .and_then(|c| row[c].text.trim().parse::<usize>().ok())
+                            .filter(|&m| m > 0)
+                            .unwrap_or(1);
+                        hints.qa_local_rows.push(QaLocalMetricRow {
+                            model_id,
+                            chain_id,
+                            seq_id,
+                            metric_id,
+                            value,
+                        });
+                    }
+                }
                 continue;
             }
-
-            let col_of = |names: &[&str]| -> Option<usize> {
-                names
-                    .iter()
-                    .find_map(|target| headers.iter().position(|h| h == target))
-            };
 
             let c_group = col_of(&["_atom_site.group_pdb"]);
             let c_serial = col_of(&["_atom_site.id"]);
@@ -948,10 +1300,18 @@ pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
                     .and_then(|c| row[c].text.parse::<f32>().ok())
                     .filter(|v| v.is_finite())
                     .unwrap_or(1.0);
-                let b_factor = c_bfac
-                    .and_then(|c| row[c].text.parse::<f32>().ok())
-                    .filter(|v| v.is_finite())
-                    .unwrap_or(0.0);
+                let b_factor = match c_bfac.map(|c| row[c].text.trim()) {
+                    Some(s) if !s.is_empty() && s != "." && s != "?" => {
+                        let bf: f32 = s
+                            .parse()
+                            .map_err(|_| format!("Malformed B_iso_or_equiv '{s}' at {ctx}"))?;
+                        if !bf.is_finite() {
+                            return Err(format!("Non-finite B_iso_or_equiv '{s}' at {ctx}"));
+                        }
+                        bf
+                    }
+                    _ => 0.0,
+                };
                 let model_num = c_model
                     .and_then(|c| row[c].text.parse::<usize>().ok())
                     .filter(|&m| m > 0)
@@ -987,6 +1347,14 @@ pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
         idx += 1;
     }
 
+    if !single_qa_id.is_empty() {
+        hints.qa_defs.entry(single_qa_id).or_insert(QaMetricDef {
+            name: single_qa_name,
+            mode: single_qa_mode,
+            metric_type: single_qa_type,
+        });
+    }
+
     if raw_atoms.is_empty() {
         return Err("No valid _atom_site coordinates found in mmCIF input".to_string());
     }
@@ -994,13 +1362,150 @@ pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
         title = "mmCIF Structure".to_string();
     }
 
-    finalize_structure_ensemble(title, raw_atoms, &[])
+    finalize_structure_ensemble(title, raw_atoms, &[], &hints)
+}
+
+fn extract_ensemble_plddt(
+    models: &[StructureModel3d],
+    hints: &PlddtIngestHints,
+) -> (Option<Vec<f64>>, bool, CoordinateProvenance) {
+    let Some(c0) = models.first().and_then(|m| m.chains.first()) else {
+        return (None, false, CoordinateProvenance::Unknown);
+    };
+    let n_res = c0.residues.len();
+    if n_res == 0 {
+        return (None, false, CoordinateProvenance::Unknown);
+    }
+    let first_model_num = models.first().map(|m| m.model_number).unwrap_or(1);
+
+    // 1. Primary path: ModelArchive `_ma_qa_metric_local` cross-referenced with `_ma_qa_metric`
+    if !hints.qa_local_rows.is_empty() {
+        let is_plddt_metric_id = |mid: &str| -> bool {
+            if hints.qa_defs.is_empty() {
+                return true;
+            }
+            if let Some(def) = hints.qa_defs.get(mid) {
+                let nm = def.name.to_ascii_lowercase();
+                let tp = def.metric_type.to_ascii_lowercase();
+                let md = def.mode.to_ascii_lowercase();
+                if nm.contains("plddt") || tp.contains("plddt") {
+                    return true;
+                }
+                // Accept sole local metric when no explicit pLDDT-named metric is declared
+                let any_explicit_plddt = hints.qa_defs.values().any(|d| {
+                    d.name.to_ascii_lowercase().contains("plddt")
+                        || d.metric_type.to_ascii_lowercase().contains("plddt")
+                });
+                !any_explicit_plddt && (md == "local" || hints.qa_defs.len() == 1)
+            } else {
+                true
+            }
+        };
+
+        let mut by_chain_seq: HashMap<(char, i32), f64> = HashMap::new();
+        for row in &hints.qa_local_rows {
+            if !is_plddt_metric_id(&row.metric_id) {
+                continue;
+            }
+            if row.model_id == first_model_num
+                || !by_chain_seq.contains_key(&(row.chain_id, row.seq_id))
+            {
+                by_chain_seq.insert((row.chain_id, row.seq_id), row.value);
+            }
+        }
+
+        if !by_chain_seq.is_empty() {
+            let mut vals = Vec::with_capacity(n_res);
+            let mut matched = 0usize;
+            for (r_idx, res) in c0.residues.iter().enumerate() {
+                let v = by_chain_seq
+                    .get(&(c0.chain_id, res.seq_id))
+                    .or_else(|| by_chain_seq.get(&(c0.chain_id, (r_idx + 1) as i32)))
+                    .or_else(|| by_chain_seq.get(&('A', res.seq_id)))
+                    .copied();
+                if let Some(pv) = v {
+                    vals.push(pv);
+                    matched += 1;
+                } else {
+                    vals.push(50.0);
+                }
+            }
+            if matched > 0 {
+                let rescaled = normalize_plddt_vec_if_unit_scale(&mut vals);
+                return (
+                    Some(vals),
+                    rescaled,
+                    CoordinateProvenance::ModelArchiveQaMetric,
+                );
+            }
+        }
+    }
+
+    // 2. Experimental `B_iso_or_equiv` / `tempFactor` guard (`X-RAY DIFFRACTION`, `SOLUTION NMR`, `EM`)
+    if hints.is_experimental_method && !hints.force_bfactor_plddt && !hints.is_computational_hint {
+        return (None, false, CoordinateProvenance::Experimental);
+    }
+
+    // 3. Computational `B_iso_or_equiv` / `tempFactor` fallback (`CA` or mean backbone heavy-atom)
+    let mut b_vals = Vec::with_capacity(n_res);
+    let mut max_b = 0.0f64;
+    let mut all_in_0_100 = true;
+    for res in &c0.residues {
+        let b_opt = res
+            .atoms
+            .iter()
+            .find(|a| a.atom_name == "CA")
+            .map(|a| a.b_factor as f64)
+            .or_else(|| {
+                let mut sum = 0.0f64;
+                let mut cnt = 0usize;
+                for a in &res.atoms {
+                    if matches!(a.atom_name.as_str(), "N" | "CA" | "C" | "O") {
+                        sum += a.b_factor as f64;
+                        cnt += 1;
+                    }
+                }
+                (cnt > 0).then(|| sum / (cnt as f64))
+            });
+        let Some(bv) = b_opt.filter(|v| v.is_finite()) else {
+            all_in_0_100 = false;
+            break;
+        };
+        if !(0.0..=100.0).contains(&bv) {
+            all_in_0_100 = false;
+            break;
+        }
+        max_b = max_b.max(bv);
+        b_vals.push(bv);
+    }
+
+    if all_in_0_100
+        && b_vals.len() == n_res
+        && (hints.force_bfactor_plddt
+            || hints.is_computational_hint
+            || (models.len() == 1 && max_b > 0.0))
+    {
+        let rescaled = normalize_plddt_vec_if_unit_scale(&mut b_vals);
+        return (
+            Some(b_vals),
+            rescaled,
+            CoordinateProvenance::ComputationalBFactor,
+        );
+    }
+
+    let prov = if hints.is_experimental_method {
+        CoordinateProvenance::Experimental
+    } else {
+        CoordinateProvenance::Unknown
+    };
+    (None, false, prov)
 }
 
 fn finalize_structure_ensemble(
     title: String,
     raw_atoms: Vec<RawAtomRecord>,
     explicit_ss: &[SsSpan],
+    hints: &PlddtIngestHints,
 ) -> Result<StructureEnsemble3d, String> {
     // Group raw records by `model_num` preserving encounter order
     let mut model_order: Vec<usize> = Vec::new();
@@ -1088,6 +1593,7 @@ fn finalize_structure_ensemble(
                             res_name: rec.res_name,
                             sequence_idx: None,
                             ss: SecondaryStructureKind::Coil,
+                            ss4: SsState4::Coil,
                             atoms: Vec::new(),
                         });
                         chain.residues.len() - 1
@@ -1099,7 +1605,7 @@ fn finalize_structure_ensemble(
         }
 
         // Assign secondary structure: Kabsch–Sander H-bonds + Ramachandran basins first,
-        // overridden by explicit PDB HELIX/SHEET spans when present.
+        // overridden by explicit PDB HELIX/SHEET spans when present (preserving PPII on Coil).
         for chain in &mut chains {
             compute_kabsch_sander_secondary_structure(&mut chain.residues);
             if !explicit_ss.is_empty() {
@@ -1110,6 +1616,11 @@ fn finalize_structure_ensemble(
                             && res.seq_id <= span.end_seq
                         {
                             res.ss = span.kind;
+                            res.ss4 = match span.kind {
+                                SecondaryStructureKind::Helix => SsState4::Helix,
+                                SecondaryStructureKind::Sheet => SsState4::Sheet,
+                                SecondaryStructureKind::Coil => res.ss4,
+                            };
                         }
                     }
                 }
@@ -1132,12 +1643,14 @@ fn finalize_structure_ensemble(
     // Bind `sequence_idx` on primary chain (`chain 0`) across all conformers in O(residues)
     let mut primary_sequence = Vec::new();
     let mut primary_seq_ids = Vec::new();
+    let mut primary_ss4 = Vec::new();
     let mut primary_seq_ins_map: HashMap<(i32, char), usize> = HashMap::new();
     let mut primary_seq_id_map: HashMap<i32, usize> = HashMap::new();
     if let Some(c0) = models[0].chains.first() {
         for (k, r) in c0.residues.iter().enumerate() {
             primary_sequence.push(r.res_name.clone());
             primary_seq_ids.push(r.seq_id);
+            primary_ss4.push(r.ss4);
             primary_seq_ins_map
                 .entry((r.seq_id, r.ins_code))
                 .or_insert(k);
@@ -1158,6 +1671,9 @@ fn finalize_structure_ensemble(
         }
     }
 
+    let (per_residue_plddt, plddt_rescaled_from_unit, provenance) =
+        extract_ensemble_plddt(&models, hints);
+
     // Kabsch-superpose conformers `1..M` onto conformer `0` and compute per-residue `CA` RMSD
     let (per_residue_ca_rmsd, mean_ensemble_ca_rmsd, mean_ensemble_ca_rmsd_opt) =
         superpose_ensemble_kabsch(&mut models, primary_sequence.len());
@@ -1170,6 +1686,10 @@ fn finalize_structure_ensemble(
         models,
         primary_sequence,
         primary_seq_ids,
+        primary_ss4,
+        per_residue_plddt,
+        plddt_rescaled_from_unit,
+        provenance,
         per_residue_ca_rmsd,
         mean_ensemble_ca_rmsd,
         mean_ensemble_ca_rmsd_opt,
@@ -1369,8 +1889,18 @@ pub fn compute_kabsch_sander_secondary_structure(residues: &mut [PolymerResidue3
 
     let any_carbonyl = o_pos.iter().filter(|o| o.is_some()).count() >= n / 2;
     let mut assigned = vec![SecondaryStructureKind::Coil; n];
+    let mut has_backbone_hb = vec![false; n];
 
     if any_carbonyl {
+        for i in 0..n {
+            for j in 0..n {
+                if has_hbond(i, j) {
+                    has_backbone_hb[i] = true;
+                    has_backbone_hb[j] = true;
+                }
+            }
+        }
+
         // 1. Beta-bridges (parallel and antiparallel, Kabsch & Sander 1983, p. 2584)
         let mut is_bridge = vec![false; n];
         for i in 1..n.saturating_sub(1) {
@@ -1433,7 +1963,7 @@ pub fn compute_kabsch_sander_secondary_structure(residues: &mut [PolymerResidue3
                 let psi = dihedral_deg(n_cur, ca_cur, c_cur, n_next);
                 if (-105.0..=-32.0).contains(&phi) && (-75.0..=-10.0).contains(&psi) {
                     raw_rama[i] = SecondaryStructureKind::Helix;
-                } else if (-175.0..=-75.0).contains(&phi)
+                } else if (-175.0..=-95.0).contains(&phi)
                     && ((90.0..=180.0).contains(&psi) || (-180.0..=-145.0).contains(&psi))
                 {
                     raw_rama[i] = SecondaryStructureKind::Sheet;
@@ -1475,8 +2005,49 @@ pub fn compute_kabsch_sander_secondary_structure(residues: &mut [PolymerResidue3
         }
     }
 
-    for (res, ss) in residues.iter_mut().zip(assigned) {
-        res.ss = ss;
+    // 4. Left-handed polyproline II (`PPII`) detection on non-H-bonded coil segments
+    //    (Adzhubei, Sternberg & Makarov, J. Mol. Biol. 2013, 425, 2100-2132:
+    //     phi in [-105, -45] deg, psi in [+115, +175] deg across >= 2 consecutive residues
+    //     or adjacent to PRO).
+    let mut in_ppii_basin = vec![false; n];
+    for i in 1..n.saturating_sub(1) {
+        if assigned[i] != SecondaryStructureKind::Coil || has_backbone_hb[i] {
+            continue;
+        }
+        if let (Some(c_prev), Some(n_cur), Some(ca_cur), Some(c_cur), Some(n_next)) = (
+            residues[i - 1].atom_pos("C"),
+            residues[i].atom_pos("N"),
+            residues[i].atom_pos("CA"),
+            residues[i].atom_pos("C"),
+            residues[i + 1].atom_pos("N"),
+        ) {
+            let phi = dihedral_deg(c_prev, n_cur, ca_cur, c_cur);
+            let psi = dihedral_deg(n_cur, ca_cur, c_cur, n_next);
+            if (-105.0..=-45.0).contains(&phi) && (115.0..=175.0).contains(&psi) {
+                in_ppii_basin[i] = true;
+            }
+        }
+    }
+
+    for i in 0..n {
+        let ss = assigned[i];
+        residues[i].ss = ss;
+        residues[i].ss4 = match ss {
+            SecondaryStructureKind::Helix => SsState4::Helix,
+            SecondaryStructureKind::Sheet => SsState4::Sheet,
+            SecondaryStructureKind::Coil => {
+                let adj_pro = residues[i].res_name == "PRO"
+                    || (i > 0 && residues[i - 1].res_name == "PRO")
+                    || (i + 1 < n && residues[i + 1].res_name == "PRO");
+                let consec_ppii =
+                    (i > 0 && in_ppii_basin[i - 1]) || (i + 1 < n && in_ppii_basin[i + 1]);
+                if in_ppii_basin[i] && (consec_ppii || adj_pro) {
+                    SsState4::Ppii
+                } else {
+                    SsState4::Coil
+                }
+            }
+        };
     }
 }
 
@@ -2354,25 +2925,44 @@ fn catmull_rom_pos_tan(
     (pos, vec3_norm(tan))
 }
 
+/// Precomputed `(sin(theta), cos(theta))` for `RIBBON_RING_VERTS = 8` (`k * pi / 4`),
+/// eliminating `96,000` per-vertex transcendental calls on `20 x 150 aa` putty updates.
+const RING_SIN_COS_8: [(f32, f32); RIBBON_RING_VERTS] = [
+    (0.0, 1.0),
+    (
+        std::f32::consts::FRAC_1_SQRT_2,
+        std::f32::consts::FRAC_1_SQRT_2,
+    ),
+    (1.0, 0.0),
+    (
+        std::f32::consts::FRAC_1_SQRT_2,
+        -std::f32::consts::FRAC_1_SQRT_2,
+    ),
+    (0.0, -1.0),
+    (
+        -std::f32::consts::FRAC_1_SQRT_2,
+        -std::f32::consts::FRAC_1_SQRT_2,
+    ),
+    (-1.0, 0.0),
+    (
+        -std::f32::consts::FRAC_1_SQRT_2,
+        std::f32::consts::FRAC_1_SQRT_2,
+    ),
+];
+
 #[inline]
-fn write_ring_vertices(
+fn write_ring_vertices_with_style(
     verts: &mut [RibbonVertex],
     ring: &CachedRibbonRing,
-    track_data: &QuantitativeTrackData,
+    style: ResiduePuttyStyle,
+    putty_enabled: bool,
 ) {
-    let style = track_data.evaluate_residue_style(
-        ring.seq_idx,
-        ring.ss.default_rgba(),
-        0.28,
-        ring.ensemble_rmsd,
-        ring.alpha,
-    );
     let rgba = if ring.is_highlighted {
         [1.0, 0.92, 0.32, 1.0]
     } else {
         style.rgba
     };
-    let (hw, ht) = if track_data.putty_enabled {
+    let (hw, ht) = if putty_enabled {
         (style.radius_angstrom, style.radius_angstrom)
     } else {
         let scale = if ring.is_highlighted { 1.18 } else { 1.0 };
@@ -2382,16 +2972,15 @@ fn write_ring_vertices(
         )
     };
 
-    for k in 0..RIBBON_RING_VERTS {
-        let theta = (k as f32) * std::f32::consts::TAU / (RIBBON_RING_VERTS as f32);
-        let (st, ct) = theta.sin_cos();
+    let inv_w = 1.0 / hw.max(0.04);
+    let inv_t = 1.0 / ht.max(0.04);
+
+    for (k, &(st, ct)) in RING_SIN_COS_8.iter().enumerate() {
         let px = ring.center[0] + hw * ct * ring.binormal_v[0] + ht * st * ring.normal_u[0];
         let py = ring.center[1] + hw * ct * ring.binormal_v[1] + ht * st * ring.normal_u[1];
         let pz = ring.center[2] + hw * ct * ring.binormal_v[2] + ht * st * ring.normal_u[2];
 
         // Elliptical outward normal `(ct / hw) * v + (st / ht) * u`
-        let inv_w = 1.0 / hw.max(0.04);
-        let inv_t = 1.0 / ht.max(0.04);
         let nx_raw = ct * inv_w * ring.binormal_v[0] + st * inv_t * ring.normal_u[0];
         let ny_raw = ct * inv_w * ring.binormal_v[1] + st * inv_t * ring.normal_u[1];
         let nz_raw = ct * inv_w * ring.binormal_v[2] + st * inv_t * ring.normal_u[2];
@@ -2405,6 +2994,22 @@ fn write_ring_vertices(
             color: rgba,
         };
     }
+}
+
+#[inline]
+fn write_ring_vertices(
+    verts: &mut [RibbonVertex],
+    ring: &CachedRibbonRing,
+    track_data: &QuantitativeTrackData,
+) {
+    let style = track_data.evaluate_residue_style(
+        ring.seq_idx,
+        ring.ss.default_rgba(),
+        0.28,
+        ring.ensemble_rmsd,
+        ring.alpha,
+    );
+    write_ring_vertices_with_style(verts, ring, style, track_data.putty_enabled);
 }
 
 /// Configuration controlling how a [`StructureEnsemble3d`] is compiled into [`Mol3dSceneBuffers`].
@@ -2439,6 +3044,66 @@ impl Mol3dSceneBuffers {
     /// Update ribbon putty cross-section radii and colormap RGBA values in-place in `< 0.5 ms`
     /// using cached Carson–Bugg spine frames (`zero` spline/bond recomputation!).
     pub fn update_quantitative_putty(&mut self, track_data: &QuantitativeTrackData) {
+        let can_cache_by_seq_idx = !matches!(
+            track_data.active_track,
+            QuantitativeTrack::SecondaryStructure | QuantitativeTrack::EnsembleRmsd
+        );
+        if can_cache_by_seq_idx {
+            let max_seq_idx = self
+                .opaque_rings
+                .iter()
+                .chain(self.blend_rings.iter())
+                .filter_map(|r| r.seq_idx)
+                .max();
+            if let Some(max_k) = max_seq_idx.filter(|&m| m <= 16_384) {
+                let mut dense_styles = Vec::with_capacity(max_k + 1);
+                for k in 0..=max_k {
+                    dense_styles.push(track_data.evaluate_residue_style(
+                        Some(k),
+                        [0.68, 0.75, 0.84, 1.0],
+                        0.28,
+                        None,
+                        1.0,
+                    ));
+                }
+                let unmapped_style = track_data.evaluate_residue_style(
+                    None,
+                    [0.68, 0.75, 0.84, 1.0],
+                    0.28,
+                    None,
+                    1.0,
+                );
+                for ring in &self.opaque_rings {
+                    let mut st = ring
+                        .seq_idx
+                        .and_then(|k| dense_styles.get(k).copied())
+                        .unwrap_or(unmapped_style);
+                    st.rgba[3] = ring.alpha;
+                    write_ring_vertices_with_style(
+                        &mut self.opaque_ribbon_verts,
+                        ring,
+                        st,
+                        track_data.putty_enabled,
+                    );
+                }
+                for ring in &self.blend_rings {
+                    let mut st = ring
+                        .seq_idx
+                        .and_then(|k| dense_styles.get(k).copied())
+                        .unwrap_or(unmapped_style);
+                    st.rgba[3] = ring.alpha;
+                    write_ring_vertices_with_style(
+                        &mut self.blend_ribbon_verts,
+                        ring,
+                        st,
+                        track_data.putty_enabled,
+                    );
+                }
+                self.scene_gen = self.scene_gen.wrapping_add(1);
+                return;
+            }
+        }
+
         for ring in &self.opaque_rings {
             write_ring_vertices(&mut self.opaque_ribbon_verts, ring, track_data);
         }
@@ -4387,6 +5052,33 @@ impl Mol3dViewerPanel {
         }
     }
 
+    fn sync_plddt_from_ensemble(&mut self) {
+        self.track_data.plddt.clear();
+        let Some(ens) = self.ensemble.as_ref() else {
+            return;
+        };
+        let Some(ref plddt_vals) = ens.per_residue_plddt else {
+            return;
+        };
+        if let Some(c0) = ens.models.first().and_then(|m| m.chains.first()) {
+            for (r_idx, res) in c0.residues.iter().enumerate() {
+                if let (Some(seq_k), Some(&pv)) = (res.sequence_idx, plddt_vals.get(r_idx)) {
+                    if pv.is_finite() {
+                        self.track_data.plddt.insert(seq_k, pv.clamp(0.0, 100.0));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Update per-residue `AfNmrConcordance` classes (`0..L`) and mark the `< 2.0 ms` putty fast-path dirty.
+    pub fn set_concordance_classes(&mut self, classes: &[ConcordanceTrackClass]) {
+        self.track_data.set_concordance_slice(classes);
+        if self.track_data.active_track == QuantitativeTrack::AfNmrConcordance {
+            self.putty_only_dirty = true;
+        }
+    }
+
     /// Parse `.pdb` or `.cif`/`.mmcif` text, Kabsch-superpose conformers, fit camera, and rebuild
     /// GPU scene buffers.
     pub fn load_structure_text(
@@ -4400,6 +5092,7 @@ impl Mol3dViewerPanel {
         self.camera.fit_ensemble(&ens);
         self.status_banner = format_ensemble_status_banner(&ens);
         self.ensemble = Some(ens);
+        self.sync_plddt_from_ensemble();
         self.recompute_restraints_now();
         self.rebuild_scene_now();
         Ok(())
@@ -4416,6 +5109,7 @@ impl Mol3dViewerPanel {
         self.camera.fit_ensemble(&ens);
         self.status_banner = format_ensemble_status_banner(&ens);
         self.ensemble = Some(ens);
+        self.sync_plddt_from_ensemble();
         self.recompute_restraints_now();
         self.rebuild_scene_now();
     }
@@ -4692,9 +5386,9 @@ impl Mol3dViewerPanel {
                             }
                         }
 
-                        let more_btn = egui::Button::new("⚙")
+                        let more_btn = egui::Button::new("Opts")
                             .selected(self.show_mobile_options)
-                            .min_size(egui::vec2(36.0, 34.0));
+                            .min_size(egui::vec2(42.0, 34.0));
                         if ui.add(more_btn).clicked() {
                             self.show_mobile_options = !self.show_mobile_options;
                         }
@@ -4702,7 +5396,7 @@ impl Mol3dViewerPanel {
                 });
         }
 
-        // Top compact control strip 1 & 2 (always shown on Desktop/Tablet; expandable via ⚙ on CompactMobile)
+        // Top compact control strip 1 & 2 (always shown on Desktop/Tablet; expandable via Opts on CompactMobile)
         if !is_compact_mobile || self.show_mobile_options {
             ui.horizontal_wrapped(|ui| {
                 ui.strong("3D Structure");
@@ -4901,7 +5595,7 @@ impl Mol3dViewerPanel {
                         }
                     });
 
-                if self.track_data.active_track != QuantitativeTrack::SecondaryStructure {
+                if !self.track_data.active_track.uses_semantic_palette() {
                     egui::ComboBox::from_id_salt("mol3d_cmap_combo")
                         .selected_text(self.track_data.colormap.label())
                         .width(112.0)
