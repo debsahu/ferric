@@ -1222,3 +1222,513 @@ fn test_f15_adversarial_1d_ingest_error_paths() {
 
     let _ = fs::remove_dir_all(&tmp_root);
 }
+
+#[test]
+fn f29_dept135_ch2_free_vs_ch2_containing_hdo_mask_and_iupac_c13_dss_tms() {
+    use nmr_core::nmr1d::{
+        convert_c13_ppm_reference, convert_c13_ppm_xi_ratio, convert_c13_spectrum_reference_1d,
+        ReferenceStandard, C13_DSS_VS_TMS_OFFSET_PPM, XI_C13_DSS, XI_C13_TMS,
+    };
+
+    // 1. CH2-free DEPT-135 (L-fucose equilibrium pattern: all positive CH at 96.6, 92.5, 73.3..66.7 ppm
+    //    and CH3 at 15.9 ppm, zero CH2 carbons, no `biphasic_positive_ppm` hint!)
+    let fucose_lines = [
+        SyntheticLine1D::lorentzian(96.57, 1.0, 1.4),
+        SyntheticLine1D::lorentzian(92.55, 0.5, 1.4),
+        SyntheticLine1D::lorentzian(73.26, 1.0, 1.4),
+        SyntheticLine1D::lorentzian(72.23, 0.5, 1.4),
+        SyntheticLine1D::lorentzian(71.99, 1.0, 1.4),
+        SyntheticLine1D::lorentzian(71.78, 1.0, 1.4),
+        SyntheticLine1D::lorentzian(71.22, 1.0, 1.5),
+        SyntheticLine1D::lorentzian(69.60, 0.5, 1.4),
+        SyntheticLine1D::lorentzian(68.41, 0.5, 1.5),
+        SyntheticLine1D::lorentzian(66.66, 0.5, 1.5),
+        SyntheticLine1D::lorentzian(15.85, 1.2, 2.0),
+    ];
+    let mut fid_fuc = synthesize_fid_1d(
+        "fucose_dept135",
+        Experiment1DKind::Dept135,
+        8192,
+        15_151.5,
+        100.612_729,
+        75.0,
+        &fucose_lines,
+    );
+    add_complex_gaussian_noise(&mut fid_fuc, 1.5e-3, 20261117);
+    apply_apodization_1d(&mut fid_fuc, Apodization1D::Exponential { lb_hz: 1.0 }, 0.5);
+    zero_fill_pow2_1d(&mut fid_fuc, 2);
+    let mut spec_fuc = fft_1d(&fid_fuc);
+    // Corrupt with vendor-like phase (-57.15 deg, +18.20 deg correction needed)
+    apply_phase_1d(&mut spec_fuc, 57.15, -18.20, Pivot1D::Fraction(0.5));
+
+    let sol_fuc = auto_phase_and_apply_1d(&mut spec_fuc, &AutoPhase1DConfig::default());
+    assert!(
+        sol_fuc.phc1_deg.abs() < 40.0,
+        "CH2-free DEPT-135 must NOT trap at PHC1 = +-180 deg, got {:.2}",
+        sol_fuc.phc1_deg
+    );
+    assert!(
+        phase_diff_deg(sol_fuc.phc0_deg, -57.15).abs() < 3.0,
+        "CH2-free DEPT-135 |dPHC0| too large: got {:.2}, expected -57.15",
+        sol_fuc.phc0_deg
+    );
+    assert!(
+        (sol_fuc.phc1_deg - 18.20).abs() < 5.0,
+        "CH2-free DEPT-135 |dPHC1| too large: got {:.2}, expected +18.20",
+        sol_fuc.phc1_deg
+    );
+    let picked_fuc = pick_peaks_1d(&spec_fuc, &PeakPickConfig1D::default());
+    assert!(picked_fuc.len() >= 10);
+    assert!(
+        picked_fuc.iter().all(|p| p.height > 0.0),
+        "CH2-free DEPT-135 must have 0 inverted CH2 peaks, got {picked_fuc:?}"
+    );
+
+    // 2. Genuine CH2-containing DEPT-135 WITHOUT `biphasic_positive_ppm` must still keep CH/CH3 > 0 and CH2 < 0!
+    let mixed_dept_lines = [
+        SyntheticLine1D::lorentzian(129.4, 1.4, 1.8), // aromatic CH (+)
+        SyntheticLine1D::lorentzian(71.8, 1.1, 1.8),  // CH-OH (+)
+        SyntheticLine1D {
+            ppm: 43.2,
+            amplitude: 1.5,
+            fwhm_hz: 1.8,
+            gauss_fwhm_hz: 0.0,
+            phase_deg: 180.0, // CH2 (-)
+        },
+        SyntheticLine1D {
+            ppm: 31.5,
+            amplitude: 1.4,
+            fwhm_hz: 1.8,
+            gauss_fwhm_hz: 0.0,
+            phase_deg: 180.0, // CH2 (-)
+        },
+        SyntheticLine1D::lorentzian(14.1, 1.6, 1.8), // CH3 (+)
+    ];
+    let mut fid_mix = synthesize_fid_1d(
+        "mixed_dept135",
+        Experiment1DKind::Dept135,
+        4096,
+        24_000.0,
+        125.76,
+        90.0,
+        &mixed_dept_lines,
+    );
+    apply_apodization_1d(&mut fid_mix, Apodization1D::Exponential { lb_hz: 1.0 }, 0.5);
+    zero_fill_pow2_1d(&mut fid_mix, 2);
+    let mut spec_mix = fft_1d(&fid_mix);
+    apply_phase_1d(&mut spec_mix, 42.0, -35.0, Pivot1D::Fraction(0.5));
+    let sol_mix = auto_phase_and_apply_1d(&mut spec_mix, &AutoPhase1DConfig::default());
+    assert!(phase_diff_deg(sol_mix.phc0_deg, -42.0).abs() < 3.0);
+    assert!((sol_mix.phc1_deg - 35.0).abs() < 5.0);
+    // Verify CH/CH3 positive and CH2 negative
+    let idx_ch = spec_mix.axis.ppm_to_index(129.4).round() as usize;
+    let idx_ch2 = spec_mix.axis.ppm_to_index(43.2).round() as usize;
+    let idx_ch3 = spec_mix.axis.ppm_to_index(14.1).round() as usize;
+    assert!(spec_mix.real[idx_ch] > 0.0 && spec_mix.real[idx_ch3] > 0.0);
+    assert!(spec_mix.real[idx_ch2] < 0.0);
+
+    // 3. Aqueous 1H HDO mask (`4.60..4.90 ppm`): massive out-of-phase radiation-damped HDO singlet
+    //    at `4.76 ppm` (`50x` solute height, twisted by `+55 deg` radiation damping) must NOT corrupt
+    //    solute autophasing even when `solvent` is mislabeled `<CDCl3>`!
+    let h1_aq_lines = [
+        SyntheticLine1D {
+            ppm: 4.76,
+            amplitude: 120.0,
+            fwhm_hz: 4.5,
+            gauss_fwhm_hz: 0.0,
+            phase_deg: 55.0, // radiation-damped HDO phase anomaly!
+        },
+        SyntheticLine1D::lorentzian(5.20, 1.5, 1.3),
+        SyntheticLine1D::lorentzian(4.55, 1.2, 1.3), // beta-anomeric H1 right at 4.55 ppm outside [4.60, 4.90]!
+        SyntheticLine1D::lorentzian(3.80, 3.0, 1.3),
+        SyntheticLine1D::lorentzian(1.22, 4.5, 1.4),
+    ];
+    let mut fid_aq = synthesize_fid_1d(
+        "aq_1h",
+        Experiment1DKind::Proton1D,
+        4096,
+        4800.0,
+        400.13,
+        4.70,
+        &h1_aq_lines,
+    );
+    add_complex_gaussian_noise(&mut fid_aq, 1.0e-3, 9911);
+    apply_apodization_1d(&mut fid_aq, Apodization1D::Exponential { lb_hz: 0.3 }, 0.5);
+    zero_fill_pow2_1d(&mut fid_aq, 2);
+    let mut spec_aq = fft_1d(&fid_aq);
+    spec_aq.solvent = Some("CDCl3".to_string()); // deliberately mislabeled solvent!
+    apply_phase_1d(&mut spec_aq, -33.0, 24.0, Pivot1D::Fraction(0.5));
+    let sol_aq = auto_phase_and_apply_1d(&mut spec_aq, &AutoPhase1DConfig::default());
+    assert!(
+        phase_diff_deg(sol_aq.phc0_deg, 33.0).abs() < 3.0,
+        "Solute 1H PHC0 corrupted by radiation-damped HDO: got {:.2}, expected 33.0",
+        sol_aq.phc0_deg
+    );
+    assert!(
+        (sol_aq.phc1_deg - (-24.0)).abs() < 5.0,
+        "Solute 1H PHC1 corrupted by radiation-damped HDO: got {:.2}, expected -24.0",
+        sol_aq.phc1_deg
+    );
+
+    // 4. IUPAC 2001/2008 13C DSS-vs-TMS ReferenceStandard exact round-trip & -2.371 ppm offset
+    assert!((XI_C13_TMS - 0.251_450_20).abs() < 1e-10);
+    assert!((XI_C13_DSS - 0.251_449_53).abs() < 1e-10);
+    assert!((C13_DSS_VS_TMS_OFFSET_PPM - (-2.371)).abs() < 1e-12);
+    let dss_zero_in_tms =
+        convert_c13_ppm_reference(0.0, ReferenceStandard::Dss, ReferenceStandard::Tms);
+    assert!((dss_zero_in_tms - (-2.371)).abs() < 1e-12);
+    let anomeric_dss =
+        convert_c13_ppm_reference(96.5678, ReferenceStandard::Tms, ReferenceStandard::Dss);
+    assert!((anomeric_dss - 98.939).abs() < 0.005);
+    let roundtrip =
+        convert_c13_ppm_reference(anomeric_dss, ReferenceStandard::Dss, ReferenceStandard::Tms);
+    assert!((roundtrip - 96.5678).abs() < 1e-11);
+    let xi_rt = convert_c13_ppm_xi_ratio(
+        convert_c13_ppm_xi_ratio(100.0, ReferenceStandard::Tms, ReferenceStandard::Dss),
+        ReferenceStandard::Dss,
+        ReferenceStandard::Tms,
+    );
+    assert!((xi_rt - 100.0).abs() < 1e-11);
+
+    let delta_spec = convert_c13_spectrum_reference_1d(
+        &mut spec_fuc,
+        ReferenceStandard::Tms,
+        ReferenceStandard::Dss,
+    )
+    .expect("13C TMS -> DSS");
+    assert!((delta_spec - 2.371).abs() < 0.01);
+    assert!(
+        convert_c13_spectrum_reference_1d(
+            &mut spec_aq,
+            ReferenceStandard::Tms,
+            ReferenceStandard::Dss
+        )
+        .is_err(),
+        "1H spectrum must reject 13C reference conversion"
+    );
+}
+
+#[test]
+fn f29_clean_room_jeol_jdf_1d_big_and_little_endian_multinuclear_and_f15_adversarial() {
+    use nmr_core::nmr1d::{
+        compute_jeol_fir_group_delay, load_1d_from_bytes, load_1d_from_virtual_entries,
+        load_1d_input, parse_jeol_jdf_1d_bytes, prepare_loaded_1d_for_studio, Loaded1DData,
+        MAX_1D_INGEST_POINTS,
+    };
+
+    // Verify exact multi-stage FIR decimation group-delay algebra
+    let gd_4_2 = compute_jeol_fir_group_delay("2 28 73", "4 2").expect("FIR group delay");
+    assert!((gd_4_2 - 19.6875).abs() < 1e-12);
+    let gd_6_2 = compute_jeol_fir_group_delay("2 41 74", "6 2").expect("FIR group delay");
+    assert!((gd_6_2 - (40.0 / 24.0 + 73.0 / 4.0)).abs() < 1e-12);
+
+    // Helper to synthesize a clean-room binary JEOL `.jdf` 1D buffer (`1296`-byte BE header + param table + data)
+    #[allow(clippy::too_many_arguments)]
+    fn build_synth_jdf(
+        little_endian: bool,
+        data_format: u8,
+        axis_type: u8,
+        axis_unit_base: u8,
+        n_pts: u32,
+        off_start: u32,
+        off_stop: u32,
+        ax_start: f64,
+        ax_stop: f64,
+        base_freq_mhz: f64,
+        params: &[(&str, u32, f64, &str, u8)],
+        re: &[f64],
+        im: &[f64],
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; 1296];
+        buf[0..8].copy_from_slice(b"JEOL.NMR");
+        buf[8] = if little_endian { 1 } else { 0 };
+        buf[9] = 1; // Major_Version = 1
+        buf[12] = 1; // Data_Dimension_Number = 1
+        buf[13] = 0x01;
+        buf[14] = data_format;
+        buf[24] = axis_type;
+        buf[32] = 1; // unit prefix nibble 0 -> 10^0
+        buf[33] = axis_unit_base;
+        buf[176..180].copy_from_slice(&n_pts.to_be_bytes());
+        buf[208..212].copy_from_slice(&off_start.to_be_bytes());
+        buf[240..244].copy_from_slice(&off_stop.to_be_bytes());
+        buf[272..280].copy_from_slice(&ax_start.to_be_bytes());
+        buf[336..344].copy_from_slice(&ax_stop.to_be_bytes());
+        buf[1064..1072].copy_from_slice(&base_freq_mhz.to_be_bytes());
+
+        let param_start = 1296u32;
+        let put_u32 = |dst: &mut [u8], v: u32| {
+            let b = if little_endian {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            };
+            dst[0..4].copy_from_slice(&b);
+        };
+        let put_f64 = |dst: &mut [u8], v: f64| {
+            let b = if little_endian {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            };
+            dst[0..8].copy_from_slice(&b);
+        };
+        let put_i32 = |dst: &mut [u8], v: i32| {
+            let b = if little_endian {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            };
+            dst[0..4].copy_from_slice(&b);
+        };
+
+        let mut psec = vec![0u8; 16 + params.len() * 64];
+        put_u32(&mut psec[0..4], 64);
+        put_u32(&mut psec[4..8], 0);
+        put_u32(&mut psec[8..12], params.len().saturating_sub(1) as u32);
+        put_u32(&mut psec[12..16], params.len() as u32);
+        for (idx, &(pname, vtype, fval, sval, ubase)) in params.iter().enumerate() {
+            let rec = &mut psec[16 + idx * 64..16 + (idx + 1) * 64];
+            rec[6] = if ubase == 0 { 0 } else { 1 };
+            rec[7] = ubase;
+            put_u32(&mut rec[32..36], vtype);
+            match vtype {
+                0 => {
+                    let sb = sval.as_bytes();
+                    let l = sb.len().min(16);
+                    rec[16..16 + l].copy_from_slice(&sb[..l]);
+                }
+                1 => put_i32(&mut rec[16..20], fval as i32),
+                2 => put_f64(&mut rec[16..24], fval),
+                _ => {}
+            }
+            let nb = pname.as_bytes();
+            let nl = nb.len().min(27);
+            rec[36..36 + nl].copy_from_slice(&nb[..nl]);
+        }
+
+        let param_len = psec.len() as u32;
+        let data_start = param_start + param_len;
+        let push_scalar = |out: &mut Vec<u8>, v: f64| match data_format {
+            1 => {
+                let b = if little_endian {
+                    v.to_le_bytes()
+                } else {
+                    v.to_be_bytes()
+                };
+                out.extend_from_slice(&b);
+            }
+            2 => {
+                let vf = v as f32;
+                let b = if little_endian {
+                    vf.to_le_bytes()
+                } else {
+                    vf.to_be_bytes()
+                };
+                out.extend_from_slice(&b);
+            }
+            _ => {
+                let vi = v.round() as i32;
+                let b = if little_endian {
+                    vi.to_le_bytes()
+                } else {
+                    vi.to_be_bytes()
+                };
+                out.extend_from_slice(&b);
+            }
+        };
+
+        let mut dsec = Vec::new();
+        if axis_type == 1 {
+            for &r in re {
+                push_scalar(&mut dsec, r);
+            }
+        } else if axis_type == 4 {
+            for (&r, &m) in re.iter().zip(im.iter()) {
+                push_scalar(&mut dsec, r);
+                push_scalar(&mut dsec, m);
+            }
+        } else {
+            for &r in re {
+                push_scalar(&mut dsec, r);
+            }
+            for &m in im {
+                push_scalar(&mut dsec, m);
+            }
+        }
+        let data_len = dsec.len() as u32;
+        buf[1212..1216].copy_from_slice(&param_start.to_be_bytes());
+        buf[1216..1220].copy_from_slice(&param_len.to_be_bytes());
+        buf[1284..1288].copy_from_slice(&data_start.to_be_bytes());
+        buf[1292..1296].copy_from_slice(&data_len.to_be_bytes());
+        buf.extend_from_slice(&psec);
+        buf.extend_from_slice(&dsec);
+        buf
+    }
+
+    // 1. Little-endian `f64` split-complex `19F` processed spectrum `.jdf` (peak at -62.5 ppm)
+    let n_f19 = 516usize;
+    let (os, oe) = (2usize, 513usize); // 512 active points
+    let mut re_f19 = vec![0.0; n_f19];
+    let im_f19 = vec![0.0; n_f19];
+    for (idx, slot) in re_f19[os..=oe].iter_mut().enumerate() {
+        let u = (idx as f64) / ((oe - os) as f64);
+        let ppm = 0.0 - 200.0 * u;
+        let d = (ppm - (-62.5)) / 0.25;
+        *slot = 10.0 / (1.0 + d * d);
+    }
+    let jdf_f19 = build_synth_jdf(
+        true,
+        1,
+        3,
+        26, // PPM
+        n_f19 as u32,
+        os as u32,
+        oe as u32,
+        0.0,
+        -200.0,
+        564.726,
+        &[
+            ("X_DOMAIN", 0, 0.0, "Fluorine19", 0),
+            ("X_OFFSET", 2, -100.0, "", 26),
+            ("solvent", 0, 0.0, "CHLOROFORM-D", 0),
+        ],
+        &re_f19,
+        &im_f19,
+    );
+    let loaded_f19 =
+        load_1d_from_bytes("cf3_sample.jdf", &jdf_f19, None, false).expect("parse LE f64 19F JDF");
+    match loaded_f19 {
+        Loaded1DData::FrequencyDomain(sp) => {
+            assert_eq!(sp.experiment, Experiment1DKind::Fluorine19);
+            assert_eq!(sp.len(), 512);
+            assert_eq!(sp.solvent.as_deref(), Some("CHLOROFORM-D"));
+            let pks = pick_peaks_1d(&sp, &PeakPickConfig1D::default());
+            assert_eq!(pks.len(), 1);
+            assert!((pks[0].ppm - (-62.5)).abs() < 0.15);
+        }
+        other => panic!("expected FrequencyDomain, got {other:?}"),
+    }
+
+    // 2. Big-endian `f32` interleaved-complex `31P` processed spectrum `.jdf` (peak at +18.4 ppm)
+    let n_p31 = 256usize;
+    let mut re_p31 = vec![0.0; n_p31];
+    let im_p31 = vec![0.0; n_p31];
+    for (k, slot) in re_p31.iter_mut().enumerate() {
+        let ppm = 80.0 - 120.0 * (k as f64) / ((n_p31 - 1) as f64);
+        let d = (ppm - 18.4) / 0.30;
+        *slot = 25.0 / (1.0 + d * d);
+    }
+    let jdf_p31 = build_synth_jdf(
+        false, // BIG-ENDIAN!
+        2,     // f32
+        4,     // interleaved Real_Complex
+        26,    // PPM
+        n_p31 as u32,
+        0,
+        (n_p31 - 1) as u32,
+        80.0,
+        -40.0,
+        242.95,
+        &[
+            ("X_DOMAIN", 0, 0.0, "Phosphorus31", 0),
+            ("solvent", 0, 0.0, "DMSO-D6", 0),
+        ],
+        &re_p31,
+        &im_p31,
+    );
+    let virt = load_1d_from_virtual_entries(&[("ar_p31.jdf", jdf_p31.as_slice())], None, false)
+        .expect("virtual entry BE f32 31P JDF");
+    assert_eq!(virt.len(), 1);
+    let sp_p31 = prepare_loaded_1d_for_studio(virt.into_iter().next().unwrap()).unwrap();
+    assert_eq!(sp_p31.experiment, Experiment1DKind::Phosphorus31);
+    let pks_p31 = pick_peaks_1d(&sp_p31, &PeakPickConfig1D::default());
+    assert!((pks_p31[0].ppm - 18.4).abs() < 0.25);
+
+    // 3. Big-endian `f64` time-domain `1H` FID `.jdf` (`Sec` = 28) with FIR `orders`/`factors` group delay
+    //    written to disk and loaded via `load_1d_input`!
+    let n_fid = 1024usize;
+    let sw_hz = 6000.0;
+    let obs_h = 500.0;
+    let carrier = 5.0;
+    let target_ppm = 7.26; // CHCl3 downfield of 5.0 ppm carrier
+    let df_hz = (target_ppm - carrier) * obs_h;
+    let gd_samples = 4usize; // orders="1 9", factors="1" -> gd = (9 - 1) / (2 * 1) = 4.0 samples!
+    let mut re_h = vec![0.0; n_fid];
+    let mut im_h = vec![0.0; n_fid];
+    for (idx, (rh, ih)) in re_h[gd_samples..]
+        .iter_mut()
+        .zip(im_h[gd_samples..].iter_mut())
+        .enumerate()
+    {
+        let t = (idx as f64) / sw_hz;
+        let env = 20.0 * (-std::f64::consts::PI * 1.5 * t).exp();
+        let ang = 2.0 * std::f64::consts::PI * df_hz * t;
+        // JEOL clockwise quadrature (`re - i*im` conjugated during FFT)
+        *rh = env * ang.cos();
+        *ih = -env * ang.sin();
+    }
+    let jdf_h_fid = build_synth_jdf(
+        false,
+        1,
+        3,
+        28, // Sec -> TimeDomain FID!
+        n_fid as u32,
+        0,
+        (n_fid - 1) as u32,
+        0.0,
+        ((n_fid - 1) as f64) / sw_hz,
+        obs_h,
+        &[
+            ("X_DOMAIN", 0, 0.0, "Proton", 0),
+            ("X_SWEEP", 2, sw_hz, "", 13),
+            ("X_OFFSET", 2, carrier, "", 26),
+            ("DIGITAL_FILTER", 0, 0.0, "TRUE", 0),
+            ("orders", 0, 0.0, "1 9", 0),
+            ("factors", 0, 0.0, "1", 0),
+            ("solvent", 0, 0.0, "CDCl3", 0),
+        ],
+        &re_h,
+        &im_h,
+    );
+    let tmp_jdf_path = std::env::temp_dir().join("f29_test_proton_fid.jdf");
+    std::fs::write(&tmp_jdf_path, &jdf_h_fid).expect("write temp jdf");
+    let loaded_h = load_1d_input(&tmp_jdf_path, None, true).expect("load_1d_input JDF FID");
+    let _ = std::fs::remove_file(&tmp_jdf_path);
+    assert!(matches!(loaded_h, Loaded1DData::TimeDomain(_)));
+    let sp_h = prepare_loaded_1d_for_studio(loaded_h).expect("studio process JDF FID");
+    let pks_h = pick_peaks_1d(&sp_h, &PeakPickConfig1D::default());
+    let main_pk_h = pks_h
+        .iter()
+        .max_by(|a, b| a.height.total_cmp(&b.height))
+        .expect("picked CHCl3 peak from JEOL FID");
+    assert!(
+        (main_pk_h.ppm - 7.26).abs() < 0.02,
+        "expected 7.26 ppm CHCl3 from JEOL FID, got {:.4}",
+        main_pk_h.ppm
+    );
+
+    // 4. Adversarial `F15` `.jdf` inputs (truncated header, bad magic, 2D dim=2, oversized n_pts,
+    //    truncated data body, and `NaN` scalar) must all return `Err` cleanly with zero panics!
+    assert!(parse_jeol_jdf_1d_bytes("short", &jdf_f19[..200], None).is_err());
+
+    let mut bad_magic = jdf_f19.clone();
+    bad_magic[0..8].copy_from_slice(b"NOT_JEOL");
+    assert!(parse_jeol_jdf_1d_bytes("bad_magic", &bad_magic, None).is_err());
+
+    let mut bad_2d = jdf_f19.clone();
+    bad_2d[12] = 2; // 2D JDF
+    assert!(parse_jeol_jdf_1d_bytes("dim2", &bad_2d, None).is_err());
+
+    let mut huge_pts = jdf_f19.clone();
+    let over_pts = (MAX_1D_INGEST_POINTS as u32) + 100;
+    huge_pts[176..180].copy_from_slice(&over_pts.to_be_bytes());
+    assert!(parse_jeol_jdf_1d_bytes("oversized", &huge_pts, None).is_err());
+
+    assert!(parse_jeol_jdf_1d_bytes("trunc_body", &jdf_f19[..jdf_f19.len() - 32], None).is_err());
+
+    let mut nan_jdf = jdf_f19.clone();
+    let d_off = u32::from_be_bytes(nan_jdf[1284..1288].try_into().unwrap()) as usize + 8 * 10;
+    nan_jdf[d_off..d_off + 8].copy_from_slice(&f64::NAN.to_le_bytes());
+    assert!(parse_jeol_jdf_1d_bytes("nan_body", &nan_jdf, None).is_err());
+}

@@ -234,6 +234,19 @@ pub enum NormalizationMethod {
     ProbabilisticQuotient,
 }
 
+/// Pre-scaling variance-stabilizing intensity transform (`F29`, van den Berg et al.,
+/// *BMC Genomics* **2006**, 7, 142; Rocke & Durbin, *J. Comput. Biol.* **2001**, 8, 557–570).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VarianceTransform {
+    /// Leave normalized bucket intensities untransformed (exact `T14.5` default).
+    #[default]
+    None,
+    /// Apply $T(x) = \log_{10}(\max(x, 0) + \epsilon_{\text{train}})$, estimating the positive
+    /// pseudocount $\epsilon_{\text{train}} > 0$ strictly from training-split bucket intensities
+    /// inside each cross-validation fold so zero held-out information leaks.
+    Log10Pseudocount,
+}
+
 /// Variable-wise centering & variance scaling (`X_norm -> X_scaled`, van den Berg et al. 2006).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScalingMethod {
@@ -247,6 +260,9 @@ pub enum ScalingMethod {
     /// Unit-variance (autoscaling): $\tilde{X}_{i,j} = (X_{i,j} - \bar{X}_j) / s_j$.
     UnitVariance,
 }
+
+/// Feature-scaling alias matching `F29` public API (`FeatureScaling::{MeanCenter, Pareto, UnitVariance}`).
+pub type FeatureScaling = ScalingMethod;
 
 /// End-to-end configuration for an untargeted 1D NMR metabolomics study.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -269,6 +285,9 @@ pub struct MetabolomicsPipelineConfig {
     pub bucketing: BucketingMethod,
     /// Dilution normalization strategy (`PQN`, `TSA`, `InternalStandard`, `None`).
     pub normalization: NormalizationMethod,
+    /// Opt-in pre-scaling variance-stabilizing transform (`None` default, or `Log10Pseudocount`, `F29`).
+    #[serde(default)]
+    pub variance_transform: VarianceTransform,
     /// Variable scaling strategy (`Pareto`, `UnitVariance`, `MeanCenter`, `None`).
     pub scaling: ScalingMethod,
     /// Number of principal components to extract in PCA (`default = 5`).
@@ -277,6 +296,11 @@ pub struct MetabolomicsPipelineConfig {
     pub pls_components: usize,
     /// Number of orthogonal components $A_o$ in `OPLS-DA` (`1` predictive + `A_o` orthogonal; `default = 1`).
     pub opls_orthogonal_components: usize,
+    /// Optional upper bound `max_ortho` (`--max-ortho`) for leak-free CV-selected `1..=max_ortho`
+    /// orthogonal components in `OPLS-DA` (`None` uses fixed `opls_orthogonal_components`, preserving
+    /// exact `T14.5` parity, `F29`).
+    #[serde(default)]
+    pub max_opls_orthogonal_components: Option<usize>,
     /// Number of stratified cross-validation folds (`default = 7`).
     pub cv_folds: usize,
     /// Number of random label permutations for `Westerhuis et al. (2008)` overfitting validation (`default = 100`).
@@ -301,10 +325,12 @@ impl Default for MetabolomicsPipelineConfig {
             alignment: AlignmentMode::default(),
             bucketing: BucketingMethod::default(),
             normalization: NormalizationMethod::ProbabilisticQuotient,
+            variance_transform: VarianceTransform::None,
             scaling: ScalingMethod::Pareto,
             pca_components: 5,
             pls_components: 2,
             opls_orthogonal_components: 1,
+            max_opls_orthogonal_components: None,
             cv_folds: 7,
             n_permutations: 100,
             rng_seed: 20261115,
@@ -2836,32 +2862,77 @@ pub fn normalize_bucket_matrix(
     (norm, factors)
 }
 
-/// Fitted column centering & scaling parameters (strictly estimated on training rows to prevent CV leakage).
+/// Fitted pre-scaling variance transform + column centering & scaling parameters
+/// (strictly estimated on training rows to prevent CV leakage).
 #[derive(Clone, Debug)]
 pub struct FittedScaler {
+    pub transform: VarianceTransform,
+    pub pseudocount: f64,
     pub method: ScalingMethod,
     pub means: Vec<f64>,
     pub scales: Vec<f64>,
 }
 
 impl FittedScaler {
-    /// Fit column means and scaling denominators on `matrix[train_rows]`.
+    /// Fit column means and scaling denominators on `matrix[train_rows]` without pre-transform.
     pub fn fit_rows(matrix: &[Vec<f64>], train_rows: &[usize], method: ScalingMethod) -> Self {
+        Self::fit_rows_with_transform(matrix, train_rows, VarianceTransform::None, method)
+    }
+
+    /// Fit variance-stabilizing pseudocount, column means, and scaling denominators strictly on
+    /// `matrix[train_rows]` (`F29`).
+    pub fn fit_rows_with_transform(
+        matrix: &[Vec<f64>],
+        train_rows: &[usize],
+        transform: VarianceTransform,
+        method: ScalingMethod,
+    ) -> Self {
         let p = matrix.first().map(|r| r.len()).unwrap_or(0);
         let n = train_rows.len();
         if n == 0 || p == 0 {
             return Self {
+                transform,
+                pseudocount: 1.0e-6,
                 method,
                 means: vec![0.0; p],
                 scales: vec![1.0; p],
             };
         }
+
+        let pseudocount = match transform {
+            VarianceTransform::None => 0.0,
+            VarianceTransform::Log10Pseudocount => {
+                let mut pos: Vec<f64> = Vec::with_capacity(n * p);
+                for &r in train_rows {
+                    for &v in &matrix[r] {
+                        if v.is_finite() && v > 1.0e-15 {
+                            pos.push(v);
+                        }
+                    }
+                }
+                if pos.is_empty() {
+                    1.0e-6
+                } else {
+                    pos.sort_by(|a, b| a.total_cmp(b));
+                    let q02_idx = ((pos.len() - 1) * 2) / 100;
+                    (0.5 * pos[q02_idx]).max(1.0e-12)
+                }
+            }
+        };
+
+        let apply_val = |v: f64| -> f64 {
+            match transform {
+                VarianceTransform::None => v,
+                VarianceTransform::Log10Pseudocount => (v.max(0.0) + pseudocount).log10(),
+            }
+        };
+
         let mut means = vec![0.0; p];
         if method != ScalingMethod::None {
             let inv_n = 1.0 / (n as f64);
             for &r in train_rows {
                 for (j, &v) in matrix[r].iter().enumerate() {
-                    means[j] += v;
+                    means[j] += apply_val(v);
                 }
             }
             for m in &mut means {
@@ -2876,7 +2947,7 @@ impl FittedScaler {
                 let mu = means[j];
                 let mut var = 0.0;
                 for &r in train_rows {
-                    let d = matrix[r][j] - mu;
+                    let d = apply_val(matrix[r][j]) - mu;
                     var += d * d;
                 }
                 let sd = (var * inv_dof).sqrt();
@@ -2889,6 +2960,8 @@ impl FittedScaler {
         }
 
         Self {
+            transform,
+            pseudocount,
             method,
             means,
             scales,
@@ -2899,15 +2972,23 @@ impl FittedScaler {
     pub fn transform_row(&self, row: &[f64]) -> Vec<f64> {
         row.iter()
             .enumerate()
-            .map(|(j, &v)| match self.method {
-                ScalingMethod::None => v,
-                ScalingMethod::MeanCenter => v - self.means[j],
-                ScalingMethod::Pareto | ScalingMethod::UnitVariance => {
-                    let sc = self.scales[j];
-                    if sc > 1e-14 {
-                        (v - self.means[j]) / sc
-                    } else {
-                        0.0
+            .map(|(j, &raw_v)| {
+                let v = match self.transform {
+                    VarianceTransform::None => raw_v,
+                    VarianceTransform::Log10Pseudocount => {
+                        (raw_v.max(0.0) + self.pseudocount).log10()
+                    }
+                };
+                match self.method {
+                    ScalingMethod::None => v,
+                    ScalingMethod::MeanCenter => v - self.means[j],
+                    ScalingMethod::Pareto | ScalingMethod::UnitVariance => {
+                        let sc = self.scales[j];
+                        if sc > 1e-14 {
+                            (v - self.means[j]) / sc
+                        } else {
+                            0.0
+                        }
                     }
                 }
             })
@@ -2920,10 +3001,21 @@ impl FittedScaler {
     }
 }
 
-/// Fit and apply `method` across all rows of `matrix`.
+/// Fit and apply `method` across all rows of `matrix` (without pre-scaling variance transform).
 pub fn scale_bucket_matrix(matrix: &[Vec<f64>], method: ScalingMethod) -> Vec<Vec<f64>> {
     let all_rows: Vec<usize> = (0..matrix.len()).collect();
     FittedScaler::fit_rows(matrix, &all_rows, method).transform_matrix(matrix)
+}
+
+/// Fit and apply `transform` followed by `method` across all rows of `matrix` (`F29`).
+pub fn transform_and_scale_bucket_matrix(
+    matrix: &[Vec<f64>],
+    transform: VarianceTransform,
+    method: ScalingMethod,
+) -> Vec<Vec<f64>> {
+    let all_rows: Vec<usize> = (0..matrix.len()).collect();
+    FittedScaler::fit_rows_with_transform(matrix, &all_rows, transform, method)
+        .transform_matrix(matrix)
 }
 
 // ============================================================================
@@ -3717,6 +3809,30 @@ pub fn fit_pls_da(
     control_override: Option<&str>,
     case_override: Option<&str>,
 ) -> Option<PlsDaResult> {
+    fit_pls_da_with_transform(
+        norm_matrix,
+        sample_groups,
+        VarianceTransform::None,
+        scaling,
+        n_components,
+        cv_folds,
+        control_override,
+        case_override,
+    )
+}
+
+/// Fit multi-component NIPALS `PLS-DA` with opt-in leak-free `VarianceTransform` (`F29`).
+#[allow(clippy::too_many_arguments)]
+pub fn fit_pls_da_with_transform(
+    norm_matrix: &[Vec<f64>],
+    sample_groups: &[String],
+    transform: VarianceTransform,
+    scaling: ScalingMethod,
+    n_components: usize,
+    cv_folds: usize,
+    control_override: Option<&str>,
+    case_override: Option<&str>,
+) -> Option<PlsDaResult> {
     let (ctrl, case, active_idx, y_bin) =
         select_binary_contrast_groups(sample_groups, control_override, case_override)?;
     let n_act = active_idx.len();
@@ -3727,7 +3843,7 @@ pub fn fit_pls_da(
 
     let sub_x: Vec<Vec<f64>> = active_idx.iter().map(|&i| norm_matrix[i].clone()).collect();
     let all_rows: Vec<usize> = (0..n_act).collect();
-    let full_scaler = FittedScaler::fit_rows(&sub_x, &all_rows, scaling);
+    let full_scaler = FittedScaler::fit_rows_with_transform(&sub_x, &all_rows, transform, scaling);
     let scaled_full = full_scaler.transform_matrix(&sub_x);
     let core = fit_pls_core(&scaled_full, &y_bin, n_components);
     let a_used = core.y_loadings.len();
@@ -3741,7 +3857,8 @@ pub fn fit_pls_da(
             is_val[vi] = true;
         }
         let train_indices: Vec<usize> = (0..n_act).filter(|&i| !is_val[i]).collect();
-        let fold_scaler = FittedScaler::fit_rows(&sub_x, &train_indices, scaling);
+        let fold_scaler =
+            FittedScaler::fit_rows_with_transform(&sub_x, &train_indices, transform, scaling);
         let x_tr: Vec<Vec<f64>> = train_indices
             .iter()
             .map(|&i| fold_scaler.transform_row(&sub_x[i]))
@@ -4032,6 +4149,7 @@ fn fit_opls_core(scaled_x: &[Vec<f64>], y: &[f64], n_orthogonal: usize) -> OplsC
 fn eval_opls_stratified_cv(
     sub_x: &[Vec<f64>],
     y_bin: &[f64],
+    transform: VarianceTransform,
     scaling: ScalingMethod,
     n_orthogonal: usize,
     cv_folds: usize,
@@ -4052,7 +4170,8 @@ fn eval_opls_stratified_cv(
             is_val[vi] = true;
         }
         let train_indices: Vec<usize> = (0..n).filter(|&i| !is_val[i]).collect();
-        let fold_scaler = FittedScaler::fit_rows(sub_x, &train_indices, scaling);
+        let fold_scaler =
+            FittedScaler::fit_rows_with_transform(sub_x, &train_indices, transform, scaling);
         let x_tr: Vec<Vec<f64>> = train_indices
             .iter()
             .map(|&i| fold_scaler.transform_row(&sub_x[i]))
@@ -4071,6 +4190,107 @@ fn eval_opls_stratified_cv(
         .map(|(&y, &yh)| (y - yh) * (y - yh))
         .sum();
     (1.0 - press / tss, y_cv)
+}
+
+/// Parsimoniously select optimal orthogonal component count $A_o^\star \in 1..=max\_ortho$ via
+/// stratified CV on `(sub_x, y_bin)` (`Wold's R` / `0.015` incremental $Q^2$ parsimony rule so
+/// random noise components are rejected).
+fn select_parsimonious_opls_ortho(
+    sub_x: &[Vec<f64>],
+    y_bin: &[f64],
+    transform: VarianceTransform,
+    scaling: ScalingMethod,
+    max_ortho: usize,
+    cv_folds: usize,
+) -> usize {
+    let n = sub_x.len();
+    let p = sub_x.first().map(|r| r.len()).unwrap_or(0);
+    let cap = max_ortho
+        .max(1)
+        .min(n.saturating_sub(3).max(1))
+        .min(p.saturating_sub(1).max(1));
+    if cap <= 1 {
+        return 1;
+    }
+    let (mut best_q2, _) = eval_opls_stratified_cv(sub_x, y_bin, transform, scaling, 1, cv_folds);
+    let mut best_ao = 1usize;
+    for ao in 2..=cap {
+        let (q2_ao, _) = eval_opls_stratified_cv(sub_x, y_bin, transform, scaling, ao, cv_folds);
+        if q2_ao >= best_q2 + 0.015 {
+            best_q2 = q2_ao;
+            best_ao = ao;
+        } else {
+            break;
+        }
+    }
+    best_ao
+}
+
+/// Nested leak-free stratified $k$-fold CV when `max_ortho >= 2`: inside each outer training split,
+/// inner stratified CV selects $A_{o,\text{fold}}^\star \in 1..=max\_ortho$ strictly on `train_indices`
+/// before predicting held-out `val_indices`, eliminating model-selection bias on null labels (`F29`).
+fn eval_opls_nested_stratified_cv(
+    sub_x: &[Vec<f64>],
+    y_bin: &[f64],
+    transform: VarianceTransform,
+    scaling: ScalingMethod,
+    max_ortho: usize,
+    cv_folds: usize,
+) -> (f64, Vec<f64>, usize) {
+    let best_ao_full =
+        select_parsimonious_opls_ortho(sub_x, y_bin, transform, scaling, max_ortho, cv_folds);
+    if max_ortho <= 1 {
+        let (q2, y_cv) = eval_opls_stratified_cv(sub_x, y_bin, transform, scaling, 1, cv_folds);
+        return (q2, y_cv, 1);
+    }
+
+    let n = sub_x.len();
+    let y_mean = y_bin.iter().sum::<f64>() / (n.max(1) as f64);
+    let tss: f64 = y_bin
+        .iter()
+        .map(|&y| (y - y_mean) * (y - y_mean))
+        .sum::<f64>()
+        .max(1e-30);
+    let folds = build_stratified_folds(y_bin, cv_folds);
+    let inner_k = cv_folds.clamp(2, 5);
+    let mut y_cv = vec![y_mean; n];
+
+    for val_indices in &folds {
+        let mut is_val = vec![false; n];
+        for &vi in val_indices {
+            is_val[vi] = true;
+        }
+        let train_indices: Vec<usize> = (0..n).filter(|&i| !is_val[i]).collect();
+        let x_train_raw: Vec<Vec<f64>> = train_indices.iter().map(|&i| sub_x[i].clone()).collect();
+        let y_tr: Vec<f64> = train_indices.iter().map(|&i| y_bin[i]).collect();
+
+        let fold_ao = select_parsimonious_opls_ortho(
+            &x_train_raw,
+            &y_tr,
+            transform,
+            scaling,
+            max_ortho,
+            inner_k,
+        );
+        let fold_scaler =
+            FittedScaler::fit_rows_with_transform(sub_x, &train_indices, transform, scaling);
+        let x_tr_scaled: Vec<Vec<f64>> = train_indices
+            .iter()
+            .map(|&i| fold_scaler.transform_row(&sub_x[i]))
+            .collect();
+        let fold_fit = fit_opls_core(&x_tr_scaled, &y_tr, fold_ao);
+        for &vi in val_indices {
+            let x_val = fold_scaler.transform_row(&sub_x[vi]);
+            y_cv[vi] = fold_fit.predict_scaled_row(&x_val);
+        }
+    }
+
+    let press: f64 = y_bin
+        .iter()
+        .zip(y_cv.iter())
+        .map(|(&y, &yh)| (y - yh) * (y - yh))
+        .sum();
+    (1.0 - press / tss, y_cv, best_ao_full)
 }
 
 fn pearson_corr_slices(a: &[f64], b: &[f64]) -> f64 {
@@ -4112,6 +4332,37 @@ pub fn fit_opls_da(
     control_override: Option<&str>,
     case_override: Option<&str>,
 ) -> Option<OplsDaResult> {
+    fit_opls_da_with_options(
+        norm_matrix,
+        sample_groups,
+        VarianceTransform::None,
+        scaling,
+        n_orthogonal,
+        None,
+        cv_folds,
+        n_permutations,
+        rng_seed,
+        control_override,
+        case_override,
+    )
+}
+
+/// Fit `OPLS-DA` with opt-in leak-free `VarianceTransform` (`None` or `Log10Pseudocount`) and
+/// optional nested-CV-selected `1..=max_orthogonal` orthogonal components (`F29`).
+#[allow(clippy::too_many_arguments)]
+pub fn fit_opls_da_with_options(
+    norm_matrix: &[Vec<f64>],
+    sample_groups: &[String],
+    transform: VarianceTransform,
+    scaling: ScalingMethod,
+    n_orthogonal: usize,
+    max_orthogonal: Option<usize>,
+    cv_folds: usize,
+    n_permutations: usize,
+    rng_seed: u64,
+    control_override: Option<&str>,
+    case_override: Option<&str>,
+) -> Option<OplsDaResult> {
     let (ctrl, case, active_idx, y_bin) =
         select_binary_contrast_groups(sample_groups, control_override, case_override)?;
     let n_act = active_idx.len();
@@ -4122,12 +4373,24 @@ pub fn fit_opls_da(
 
     let sub_x: Vec<Vec<f64>> = active_idx.iter().map(|&i| norm_matrix[i].clone()).collect();
     let all_rows: Vec<usize> = (0..n_act).collect();
-    let full_scaler = FittedScaler::fit_rows(&sub_x, &all_rows, scaling);
+    let full_scaler = FittedScaler::fit_rows_with_transform(&sub_x, &all_rows, transform, scaling);
     let scaled_full = full_scaler.transform_matrix(&sub_x);
 
-    let core = fit_opls_core(&scaled_full, &y_bin, n_orthogonal);
-    let a_ortho_used = core.w_ortho.len();
-    let (obs_q2, y_cv) = eval_opls_stratified_cv(&sub_x, &y_bin, scaling, a_ortho_used, cv_folds);
+    let cv_select_max = max_orthogonal.filter(|&m| m >= 2);
+    let (core, a_ortho_used, obs_q2, y_cv) = if let Some(max_ao) = cv_select_max {
+        let (q2_nested, y_cv_nested, selected_ao) =
+            eval_opls_nested_stratified_cv(&sub_x, &y_bin, transform, scaling, max_ao, cv_folds);
+        let c = fit_opls_core(&scaled_full, &y_bin, selected_ao);
+        let ao = c.w_ortho.len();
+        (c, ao, q2_nested, y_cv_nested)
+    } else {
+        let target_ao = max_orthogonal.unwrap_or(n_orthogonal);
+        let c = fit_opls_core(&scaled_full, &y_bin, target_ao);
+        let ao = c.w_ortho.len();
+        let (q2_std, y_cv_std) =
+            eval_opls_stratified_cv(&sub_x, &y_bin, transform, scaling, ao, cv_folds);
+        (c, ao, q2_std, y_cv_std)
+    };
 
     // Wiklund et al. (2008) S-plot: Cov(t_p, X_tilde_j) vs Corr(t_p, X_tilde_j)
     let dof = (n_act.saturating_sub(1)).max(1) as f64;
@@ -4217,18 +4480,33 @@ pub fn fit_opls_da(
     for _ in 0..n_permutations {
         rng.shuffle(&mut y_perm);
         let abs_corr = pearson_corr_slices(&y_bin, &y_perm).abs();
-        let perm_core = fit_opls_core(&scaled_full, &y_perm, a_ortho_used);
-        let (perm_q2, _) =
-            eval_opls_stratified_cv(&sub_x, &y_perm, scaling, a_ortho_used, cv_folds);
+        let (perm_r2_y, perm_q2) = if let Some(max_ao) = cv_select_max {
+            let (pq2, _, p_ao) = eval_opls_nested_stratified_cv(
+                &sub_x, &y_perm, transform, scaling, max_ao, cv_folds,
+            );
+            let p_core = fit_opls_core(&scaled_full, &y_perm, p_ao);
+            (p_core.r2_y, pq2)
+        } else {
+            let perm_core = fit_opls_core(&scaled_full, &y_perm, a_ortho_used);
+            let (pq2, _) = eval_opls_stratified_cv(
+                &sub_x,
+                &y_perm,
+                transform,
+                scaling,
+                a_ortho_used,
+                cv_folds,
+            );
+            (perm_core.r2_y, pq2)
+        };
         if perm_q2 >= obs_q2 - 1e-12 {
             ge_q2 += 1;
         }
-        if perm_core.r2_y >= core.r2_y - 1e-12 {
+        if perm_r2_y >= core.r2_y - 1e-12 {
             ge_r2y += 1;
         }
         trials.push(PermutationTrial {
             abs_label_corr: abs_corr,
-            r2_y: perm_core.r2_y,
+            r2_y: perm_r2_y,
             q2: perm_q2,
         });
     }
@@ -4805,13 +5083,18 @@ pub fn run_metabolomics_pipeline(
     let (normalized_bucket_matrix, dilution_factors) =
         normalize_bucket_matrix(&raw_bucket_matrix, &is_areas, config.normalization);
 
-    let scaled_bucket_matrix = scale_bucket_matrix(&normalized_bucket_matrix, config.scaling);
+    let scaled_bucket_matrix = transform_and_scale_bucket_matrix(
+        &normalized_bucket_matrix,
+        config.variance_transform,
+        config.scaling,
+    );
 
     let pca = fit_pca(&scaled_bucket_matrix, &sample_groups, config.pca_components);
 
-    let pls_da = fit_pls_da(
+    let pls_da = fit_pls_da_with_transform(
         &normalized_bucket_matrix,
         &sample_groups,
+        config.variance_transform,
         config.scaling,
         config.pls_components,
         config.cv_folds,
@@ -4819,11 +5102,13 @@ pub fn run_metabolomics_pipeline(
         config.case_group.as_deref(),
     );
 
-    let opls_da = fit_opls_da(
+    let opls_da = fit_opls_da_with_options(
         &normalized_bucket_matrix,
         &sample_groups,
+        config.variance_transform,
         config.scaling,
         config.opls_orthogonal_components,
+        config.max_opls_orthogonal_components,
         config.cv_folds,
         config.n_permutations,
         config.rng_seed,

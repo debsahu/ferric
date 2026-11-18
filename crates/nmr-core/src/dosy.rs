@@ -27,6 +27,11 @@
 //!   McLachlan, A. S., Richards, J. J., Nilsson, M. & Morris, G. A. (*Angew. Chem. Int. Ed.*
 //!   2013, 52, 3199–3202 — Stokes–Einstein diffusivity-to-molecular-weight estimation across
 //!   deuterated NMR solvents).
+//! - Published PFG-STE self-diffusion calibration standards (`D_ref` at $298.15\text{ K}$):
+//!   Longsworth, L. G. (*J. Phys. Chem.* 1960, 64, 1914–1917);
+//!   Holz, M. & Weingärtner, H. (*J. Magn. Reson.* 1991, 92, 115–125);
+//!   Holz, M., Heil, S. R. & Sacco, A. (*Phys. Chem. Chem. Phys.* 2000, 2, 4740–4742);
+//!   Wilkins, D. K. et al. (*Biochemistry* 1999, 38, 16424–16431).
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -250,6 +255,10 @@ pub struct DosyExperimentParams {
     pub b_values_s_m2: Vec<f64>,
     /// Optional source pulse-program identifier (`PULPROG` or `seqfil`).
     pub pulse_program: Option<String>,
+    /// Pelta et al. (2002) Oneshot bipolar gradient unbalancing factor $\alpha \in [0, 1)$
+    /// (`0.0` for standard balanced `STE` / `BPP-LED`, typically `0.2` for `Oneshot` sequences).
+    #[serde(default)]
+    pub oneshot_alpha: f64,
 }
 
 impl DosyExperimentParams {
@@ -263,6 +272,33 @@ impl DosyExperimentParams {
         big_delta_s: f64,
         little_delta_s: f64,
         tau_s: f64,
+        gradients_g_per_cm: Vec<f64>,
+        pulse_program: Option<String>,
+    ) -> Result<Self, DosyError> {
+        Self::build_with_oneshot_alpha(
+            nucleus,
+            sequence_type,
+            gradient_shape,
+            big_delta_s,
+            little_delta_s,
+            tau_s,
+            0.0,
+            gradients_g_per_cm,
+            pulse_program,
+        )
+    }
+
+    /// Construct and validate [`DosyExperimentParams`] with optional Pelta et al. (2002) Oneshot
+    /// bipolar unbalancing factor $\alpha \in [0, 1)$ (`F29`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_oneshot_alpha(
+        nucleus: DosyNucleus,
+        sequence_type: DosySequenceType,
+        gradient_shape: GradientShape,
+        big_delta_s: f64,
+        little_delta_s: f64,
+        tau_s: f64,
+        oneshot_alpha: f64,
         gradients_g_per_cm: Vec<f64>,
         pulse_program: Option<String>,
     ) -> Result<Self, DosyError> {
@@ -290,6 +326,11 @@ impl DosyExperimentParams {
                 "invalid bipolar delay tau = {tau_s} s (must be >= 0)"
             )));
         }
+        if !oneshot_alpha.is_finite() || !(0.0..1.0).contains(&oneshot_alpha) {
+            return Err(DosyError::new(format!(
+                "invalid Oneshot unbalancing factor alpha = {oneshot_alpha} (must be in [0.0, 1.0))"
+            )));
+        }
         let shape_factor = gradient_shape.effective_factor();
         if !shape_factor.is_finite() || shape_factor <= 0.0 {
             return Err(DosyError::new(format!(
@@ -297,8 +338,17 @@ impl DosyExperimentParams {
             )));
         }
 
-        let delta_eff =
-            effective_diffusion_time_s(sequence_type, big_delta_s, little_delta_s, tau_s)?;
+        let delta_eff = if oneshot_alpha > 0.0 && sequence_type == DosySequenceType::BppLed {
+            effective_diffusion_time_oneshot_s(
+                gradient_shape,
+                big_delta_s,
+                little_delta_s,
+                tau_s,
+                oneshot_alpha,
+            )?
+        } else {
+            effective_diffusion_time_s(sequence_type, big_delta_s, little_delta_s, tau_s)?
+        };
 
         let mut effective_gradients_t_per_m = Vec::with_capacity(gradients_g_per_cm.len());
         let mut b_values_s_m2 = Vec::with_capacity(gradients_g_per_cm.len());
@@ -328,18 +378,71 @@ impl DosyExperimentParams {
             effective_gradients_t_per_m,
             b_values_s_m2,
             pulse_program,
+            oneshot_alpha,
         })
     }
 
     /// Effective diffusion delay $\Delta_{\text{eff}}$ (`s`).
     pub fn effective_diffusion_time_s(&self) -> Result<f64, DosyError> {
-        effective_diffusion_time_s(
-            self.sequence_type,
-            self.big_delta_s,
-            self.little_delta_s,
-            self.tau_s,
-        )
+        if self.oneshot_alpha > 0.0 && self.sequence_type == DosySequenceType::BppLed {
+            effective_diffusion_time_oneshot_s(
+                self.gradient_shape,
+                self.big_delta_s,
+                self.little_delta_s,
+                self.tau_s,
+                self.oneshot_alpha,
+            )
+        } else {
+            effective_diffusion_time_s(
+                self.sequence_type,
+                self.big_delta_s,
+                self.little_delta_s,
+                self.tau_s,
+            )
+        }
     }
+}
+
+/// Compute Pelta et al. (*Magn. Reson. Chem.* **2002**, 40, S147–S152) effective diffusion delay
+/// $\Delta_{\text{eff}}(\alpha)$ (`s`) for unbalanced bipolar `Oneshot` sequences (`0 <= alpha < 1`):
+/// - Rectangular gradient lobes: $\Delta - \delta (2 - \alpha^2) / 6 - \tau (1 - \alpha^2) / 2$
+/// - Half-sine (`SineBell`) / smoothed lobes: $\Delta - \delta (5 - 3\alpha^2) / 16 - \tau (1 - \alpha^2) / 2$
+///   (reduces cleanly to balanced `BPP-LED` $\Delta - \delta / 3 - \tau / 2$ when $\alpha = 0$).
+pub fn effective_diffusion_time_oneshot_s(
+    gradient_shape: GradientShape,
+    big_delta_s: f64,
+    little_delta_s: f64,
+    tau_s: f64,
+    alpha: f64,
+) -> Result<f64, DosyError> {
+    if !alpha.is_finite() || !(0.0..1.0).contains(&alpha) {
+        return Err(DosyError::new(format!(
+            "invalid Oneshot alpha = {alpha} (expected 0.0 <= alpha < 1.0)"
+        )));
+    }
+    if alpha == 0.0 {
+        return effective_diffusion_time_s(
+            DosySequenceType::BppLed,
+            big_delta_s,
+            little_delta_s,
+            tau_s,
+        );
+    }
+    let a2 = alpha * alpha;
+    let lobe_coeff = match gradient_shape {
+        GradientShape::SineBell => (5.0 - 3.0 * a2) / 16.0,
+        GradientShape::Rectangular
+        | GradientShape::SmoothedSquare { .. }
+        | GradientShape::CustomFactor(_) => (2.0 - a2) / 6.0,
+    };
+    let delta_eff = big_delta_s - little_delta_s * lobe_coeff - 0.5 * tau_s * (1.0 - a2);
+    if !delta_eff.is_finite() || delta_eff <= 0.0 {
+        return Err(DosyError::new(format!(
+            "non-positive Oneshot effective diffusion delay Delta_eff = {delta_eff:.6e} s \
+             (Delta = {big_delta_s:.6e} s, delta = {little_delta_s:.6e} s, tau = {tau_s:.6e} s, alpha = {alpha})"
+        )));
+    }
+    Ok(delta_eff)
 }
 
 /// Compute effective diffusion delay $\Delta_{\text{eff}}$ (`s`) for `STE` or `BPP-LED`:
@@ -401,6 +504,9 @@ pub struct BrukerDosyOverrides {
     /// Index in Bruker `GPNAM` array for the diffusion gradient pulse (defaults to `6` when non-empty,
     /// falling back to the first non-empty diffusion `GPNAM` entry).
     pub gpnam_index: Option<usize>,
+    /// Optional Pelta et al. (2002) Oneshot bipolar gradient unbalancing factor $\alpha \in [0, 1)$.
+    #[serde(default)]
+    pub oneshot_alpha: Option<f64>,
 }
 
 /// Parse a Bruker `difflist` file containing gradient strengths in `G / cm`.
@@ -534,9 +640,12 @@ pub fn parse_bruker_dosy(
         DosyNucleus::H1
     };
 
+    let is_oneshot = pulprog_low.contains("oneshot");
+
     let sequence_type = if let Some(seq) = overrides.sequence_type {
         seq
-    } else if pulprog_low.contains("bpp")
+    } else if is_oneshot
+        || pulprog_low.contains("bpp")
         || (pulprog_low.contains("bpgp") && pulprog_low.contains("led"))
         || pulprog_low.contains("dstebpgp")
     {
@@ -587,7 +696,7 @@ pub fn parse_bruker_dosy(
             BrukerP30Mode::HalfDeltaBipolar => true,
             BrukerP30Mode::FullDeltaMonopolar => false,
             BrukerP30Mode::Auto => {
-                if pulprog_low.contains("bp") {
+                if pulprog_low.contains("bp") || is_oneshot {
                     true
                 } else if !pulprog_low.is_empty() {
                     false
@@ -603,11 +712,60 @@ pub fn parse_bruker_dosy(
         }
     };
 
-    // Extract bipolar inter-pulse delay tau (defaults to D16 for BPP-LED when present, else 0.0)
+    // Extract Pelta et al. (2002) Oneshot bipolar unbalancing factor `alpha` (`0 <= alpha < 1`).
+    // Supports Manchester Oneshot (`CNST[14] = alpha` with `CNST[15] = 1 + alpha`, `CNST[16] = 1 - alpha`)
+    // and Bruker `CNST[19]` (`0 < CNST[19] < 1`, ignoring Bruker's unused `1.0` default fill),
+    // falling back cleanly to `alpha = 0.0` (standard balanced bipolar `2 * P30`).
+    let get_cnst = |idx: usize| -> Option<f64> {
+        jc.num_arrays
+            .get("CNST")
+            .and_then(|arr| arr.get(idx))
+            .copied()
+            .or_else(|| {
+                let k1 = format!("CNST{idx}");
+                let k2 = format!("CNST[{idx}]");
+                jc.scalars
+                    .get(&k1)
+                    .or_else(|| jc.scalars.get(&k2))
+                    .and_then(|s| s.parse::<f64>().ok())
+            })
+            .filter(|v| v.is_finite())
+    };
+    let oneshot_alpha = if let Some(a) = overrides.oneshot_alpha {
+        a
+    } else if is_oneshot {
+        let c14 = get_cnst(14);
+        let c15 = get_cnst(15);
+        let c16 = get_cnst(16);
+        let c19 = get_cnst(19);
+        if let (Some(a), Some(p), Some(m)) = (c14, c15, c16) {
+            if (0.0..1.0).contains(&a)
+                && (p - (1.0 + a)).abs() <= 1.0e-3
+                && (m - (1.0 - a)).abs() <= 1.0e-3
+            {
+                a
+            } else if let Some(a19) = c19.filter(|&v| v > 0.0 && v < 1.0) {
+                a19
+            } else if (0.0..1.0).contains(&a) {
+                a
+            } else {
+                0.0
+            }
+        } else if let Some(a19) = c19.filter(|&v| v > 0.0 && v < 1.0) {
+            a19
+        } else {
+            c14.filter(|&v| v > 0.0 && v < 1.0).unwrap_or(0.0)
+        }
+    } else {
+        0.0
+    };
+
+    // Extract bipolar inter-pulse delay tau (for Oneshot, `CNST[17] = 2*P1 + D16` when present, else `D16`).
     let tau_s = if let Some(t) = overrides.tau_s {
         t
     } else if sequence_type == DosySequenceType::BppLed {
-        jc.num_arrays
+        let d16_s = jc
+            .num_arrays
             .get("D")
             .and_then(|arr| arr.get(16))
             .copied()
@@ -617,19 +775,49 @@ pub fn parse_bruker_dosy(
                     .or_else(|| jc.scalars.get("D[16]"))
                     .and_then(|s| s.parse::<f64>().ok())
             })
-            .unwrap_or(0.0)
+            .unwrap_or(0.0);
+        if is_oneshot {
+            let p1_s = jc
+                .num_arrays
+                .get("P")
+                .and_then(|arr| arr.get(1))
+                .copied()
+                .or_else(|| {
+                    jc.scalars
+                        .get("P1")
+                        .or_else(|| jc.scalars.get("P[1]"))
+                        .and_then(|s| s.parse::<f64>().ok())
+                })
+                .map(|us| us.max(0.0) * 1.0e-6)
+                .unwrap_or(0.0);
+            if let Some(c17) = get_cnst(17).filter(|&v| v > 0.0 && v < 0.05) {
+                if p1_s > 0.0 && (c17 - (2.0 * p1_s + d16_s)).abs() <= 1.0e-4 {
+                    c17
+                } else {
+                    2.0 * p1_s + d16_s
+                }
+            } else {
+                2.0 * p1_s + d16_s
+            }
+        } else {
+            d16_s
+        }
     } else {
         0.0
     };
 
-    // Extract gradient shape from GPNAM
+    // Extract gradient shape from GPNAM (for Oneshot, diffusion pulses use `GP1` -> `GPNAM[1]`,
+    // falling back to `GPNAM[6]` or first non-empty shape).
     let gradient_shape = if let Some(sh) = overrides.gradient_shape {
         sh
     } else {
         let gpnam_str = if let Some(arr) = jc.str_arrays.get("GPNAM") {
-            let pref_idx = overrides.gpnam_index.unwrap_or(6);
+            let pref_idx = overrides
+                .gpnam_index
+                .unwrap_or(if is_oneshot { 1 } else { 6 });
             arr.get(pref_idx)
                 .filter(|s| !s.is_empty())
+                .or_else(|| arr.get(6).filter(|s| !s.is_empty()))
                 .or_else(|| arr.get(1).filter(|s| !s.is_empty()))
                 .or_else(|| arr.iter().find(|s| !s.is_empty()))
                 .cloned()
@@ -638,6 +826,7 @@ pub fn parse_bruker_dosy(
                 .get("GPNAM6")
                 .or_else(|| jc.scalars.get("GPNAM[6]"))
                 .or_else(|| jc.scalars.get("GPNAM1"))
+                .or_else(|| jc.scalars.get("GPNAM[1]"))
                 .or_else(|| jc.scalars.get("GPNAM"))
                 .cloned()
         };
@@ -647,13 +836,14 @@ pub fn parse_bruker_dosy(
             .unwrap_or(GradientShape::Rectangular)
     };
 
-    DosyExperimentParams::build(
+    DosyExperimentParams::build_with_oneshot_alpha(
         nucleus,
         sequence_type,
         gradient_shape,
         big_delta_s,
         little_delta_s,
         tau_s,
+        oneshot_alpha,
         gradients_g_per_cm,
         pulprog,
     )
@@ -3125,5 +3315,297 @@ pub fn estimate_hydrodynamics(
         r_h_angstrom: r_h_m * 1.0e10,
         r_h_nm: r_h_m * 1.0e9,
         estimated_mw_da,
+    })
+}
+
+// ============================================================================
+// 6. Widened D2O Water-Skirt Exclusion & Published PFG-STE D_ref Corpus (`F29`)
+// ============================================================================
+
+/// Default `D2O` residual `HDO` + radiation-damped water-skirt exclusion band `[4.50, 4.98] ppm`
+/// for `${}^{1}\text{H}$ `DOSY` reference-plane peak picking (`F29`, widened from `[4.65, 4.95]`
+/// so `4.56..4.59 ppm` water-skirt phase/truncation ripples are suppressed).
+pub const DEFAULT_DOSY_D2O_WATER_EXCLUSION_PPM: (f64, f64) = (4.50, 4.98);
+
+/// Configuration for 1D `DOSY` reference-plane peak picking (`F29`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DosyPeakPickConfig {
+    /// Minimum peak signal-to-noise ratio (`default = 10.0`).
+    pub min_snr: f64,
+    /// Excluded chemical-shift windows `(ppm_min, ppm_max)` (defaults to `[DEFAULT_DOSY_D2O_WATER_EXCLUSION_PPM]`).
+    pub excluded_ppm_regions: Vec<(f64, f64)>,
+}
+
+impl Default for DosyPeakPickConfig {
+    fn default() -> Self {
+        Self {
+            min_snr: 10.0,
+            excluded_ppm_regions: vec![DEFAULT_DOSY_D2O_WATER_EXCLUSION_PPM],
+        }
+    }
+}
+
+/// Returns `true` if `ppm` falls inside the default `DOSY` `D2O` water-skirt exclusion band `[4.50, 4.98] ppm`.
+#[inline]
+pub fn is_in_dosy_d2o_water_skirt(ppm: f64) -> bool {
+    let (lo, hi) = DEFAULT_DOSY_D2O_WATER_EXCLUSION_PPM;
+    ppm >= lo && ppm <= hi
+}
+
+/// Pick solute resonances on a lowest-gradient 1D `DOSY` reference plane (`Spectrum1D`),
+/// suppressing residual `HDO` and water-skirt ripples inside `cfg.excluded_ppm_regions`
+/// (`[4.50, 4.98] ppm` by default, `F29`).
+pub fn pick_dosy_peaks_1d(
+    ref_plane: &crate::nmr1d::Spectrum1D,
+    cfg: &DosyPeakPickConfig,
+) -> Vec<crate::nmr1d::Peak1DPicked> {
+    let raw = crate::nmr1d::pick_peaks_1d(
+        ref_plane,
+        &crate::nmr1d::PeakPickConfig1D {
+            min_snr: cfg.min_snr.max(1.0),
+            detect_shoulders: false,
+            ..crate::nmr1d::PeakPickConfig1D::default()
+        },
+    );
+    raw.into_iter()
+        .filter(|pk| {
+            pk.snr.abs() >= cfg.min_snr
+                && !cfg.excluded_ppm_regions.iter().any(|&(a, b)| {
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    pk.ppm >= lo && pk.ppm <= hi
+                })
+        })
+        .collect()
+}
+
+/// Clean-room published literature PFG-STE self-diffusion calibration standard (`D_ref` at $298.15\text{ K}$).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct DosyPublishedStandard {
+    /// Canonical solute name.
+    pub solute: &'static str,
+    /// Case-insensitive lookup aliases.
+    pub aliases: &'static [&'static str],
+    /// Deuterated or protonated NMR solvent (`D2O`, `H2O`, `CDCl3`, `DMSO-d6`).
+    pub solvent: DosySolvent,
+    /// Reference temperature in Kelvin (`298.15 K`).
+    pub temp_k: f64,
+    /// Solute molecular weight (`Da` = `g / mol`).
+    pub mw_da: f64,
+    /// Published translational self-diffusion coefficient $D_{\text{ref}}$ (`m^2 / s`).
+    pub d_ref_m2_s: f64,
+    /// Published `1 sigma` experimental uncertainty $\sigma_D$ (`m^2 / s`).
+    pub d_uncertainty_m2_s: f64,
+    /// Representative `${}^{1}\text{H}$ chemical shift (`ppm`) for peak matching.
+    pub representative_h1_ppm: f64,
+    /// Peer-reviewed literature provenance citation.
+    pub citation: &'static str,
+}
+
+const PUBLISHED_DOSY_D_REF_CORPUS: &[DosyPublishedStandard] = &[
+    DosyPublishedStandard {
+        solute: "HDO",
+        aliases: &["hdo", "residual hdo", "trace hdo"],
+        solvent: DosySolvent::D2O,
+        temp_k: 298.15,
+        mw_da: 19.021,
+        d_ref_m2_s: 1.902e-9,
+        d_uncertainty_m2_s: 0.004e-9,
+        representative_h1_ppm: 4.79,
+        citation: "Holz, Heil & Sacco, Phys. Chem. Chem. Phys. 2000, 2, 4740-4742; Longsworth, J. Phys. Chem. 1960, 64, 1914-1917",
+    },
+    DosyPublishedStandard {
+        solute: "H2O",
+        aliases: &["h2o", "water", "neat water"],
+        solvent: DosySolvent::H2O,
+        temp_k: 298.15,
+        mw_da: 18.015,
+        d_ref_m2_s: 2.299e-9,
+        d_uncertainty_m2_s: 0.005e-9,
+        representative_h1_ppm: 4.79,
+        citation: "Holz, Heil & Sacco, Phys. Chem. Chem. Phys. 2000, 2, 4740-4742; Holz & Weingartner, J. Magn. Reson. 1991, 92, 115-125",
+    },
+    DosyPublishedStandard {
+        solute: "Glycine",
+        aliases: &["glycine", "gly"],
+        solvent: DosySolvent::D2O,
+        temp_k: 298.15,
+        mw_da: 75.067,
+        d_ref_m2_s: 8.55e-10,
+        d_uncertainty_m2_s: 0.15e-10,
+        representative_h1_ppm: 3.55,
+        citation: "Longsworth, J. Phys. Chem. 1960, 64, 1914-1917 (D2O viscosity-corrected at 298.15 K)",
+    },
+    DosyPublishedStandard {
+        solute: "L-Alanine",
+        aliases: &["l-alanine", "alanine", "ala"],
+        solvent: DosySolvent::D2O,
+        temp_k: 298.15,
+        mw_da: 89.093,
+        d_ref_m2_s: 7.37e-10,
+        d_uncertainty_m2_s: 0.15e-10,
+        representative_h1_ppm: 1.48,
+        citation: "Longsworth, J. Phys. Chem. 1960, 64, 1914-1917 (D2O viscosity-corrected at 298.15 K)",
+    },
+    DosyPublishedStandard {
+        solute: "DSS",
+        aliases: &["dss", "trimethylsilylpropanesulfonate"],
+        solvent: DosySolvent::D2O,
+        temp_k: 298.15,
+        mw_da: 218.32,
+        d_ref_m2_s: 5.58e-10,
+        d_uncertainty_m2_s: 0.12e-10,
+        representative_h1_ppm: 0.00,
+        citation: "Wilkins et al., Biochemistry 1999, 38, 16424-16431; Evans et al., Angew. Chem. Int. Ed. 2013, 52, 3199-3202",
+    },
+    DosyPublishedStandard {
+        solute: "D-Glucose",
+        aliases: &["d-glucose", "glucose", "glc"],
+        solvent: DosySolvent::D2O,
+        temp_k: 298.15,
+        mw_da: 180.156,
+        d_ref_m2_s: 5.45e-10,
+        d_uncertainty_m2_s: 0.12e-10,
+        representative_h1_ppm: 5.23,
+        citation: "Longsworth, J. Phys. Chem. 1960, 64, 1914-1917 (D2O viscosity-corrected at 298.15 K)",
+    },
+    DosyPublishedStandard {
+        solute: "Sucrose",
+        aliases: &["sucrose", "saccharose"],
+        solvent: DosySolvent::D2O,
+        temp_k: 298.15,
+        mw_da: 342.297,
+        d_ref_m2_s: 4.23e-10,
+        d_uncertainty_m2_s: 0.10e-10,
+        representative_h1_ppm: 5.41,
+        citation: "Longsworth, J. Phys. Chem. 1960, 64, 1914-1917; Holz & Weingartner, J. Magn. Reson. 1991, 92, 115-125",
+    },
+    DosyPublishedStandard {
+        solute: "beta-Cyclodextrin",
+        aliases: &["beta-cyclodextrin", "b-cd", "cyclodextrin"],
+        solvent: DosySolvent::D2O,
+        temp_k: 298.15,
+        mw_da: 1134.98,
+        d_ref_m2_s: 2.62e-10,
+        d_uncertainty_m2_s: 0.08e-10,
+        representative_h1_ppm: 5.08,
+        citation: "Longsworth, J. Phys. Chem. 1960, 64, 1914-1917; Pelta et al., Magn. Reson. Chem. 2002, 40, S147-S152",
+    },
+    DosyPublishedStandard {
+        solute: "Lysozyme",
+        aliases: &["lysozyme", "hewl", "hen egg-white lysozyme"],
+        solvent: DosySolvent::D2O,
+        temp_k: 298.15,
+        mw_da: 14307.0,
+        d_ref_m2_s: 1.08e-10,
+        d_uncertainty_m2_s: 0.04e-10,
+        representative_h1_ppm: 7.20,
+        citation: "Wilkins et al., Biochemistry 1999, 38, 16424-16431; Evans et al., Angew. Chem. Int. Ed. 2013, 52, 3199-3202",
+    },
+    DosyPublishedStandard {
+        solute: "TMS",
+        aliases: &["tms", "tetramethylsilane", "me4si"],
+        solvent: DosySolvent::CDCl3,
+        temp_k: 298.15,
+        mw_da: 88.224,
+        d_ref_m2_s: 2.25e-9,
+        d_uncertainty_m2_s: 0.06e-9,
+        representative_h1_ppm: 0.00,
+        citation: "Evans et al., Angew. Chem. Int. Ed. 2013, 52, 3199-3202",
+    },
+    DosyPublishedStandard {
+        solute: "CHCl3",
+        aliases: &["chcl3", "chloroform", "residual chcl3"],
+        solvent: DosySolvent::CDCl3,
+        temp_k: 298.15,
+        mw_da: 119.378,
+        d_ref_m2_s: 2.35e-9,
+        d_uncertainty_m2_s: 0.06e-9,
+        representative_h1_ppm: 7.26,
+        citation: "Holz & Weingartner, J. Magn. Reson. 1991, 92, 115-125; Evans et al., Angew. Chem. Int. Ed. 2013, 52, 3199-3202",
+    },
+    DosyPublishedStandard {
+        solute: "Toluene",
+        aliases: &["toluene", "methylbenzene"],
+        solvent: DosySolvent::CDCl3,
+        temp_k: 298.15,
+        mw_da: 92.141,
+        d_ref_m2_s: 2.01e-9,
+        d_uncertainty_m2_s: 0.05e-9,
+        representative_h1_ppm: 2.36,
+        citation: "Evans et al., Angew. Chem. Int. Ed. 2013, 52, 3199-3202",
+    },
+    DosyPublishedStandard {
+        solute: "Naphthalene",
+        aliases: &["naphthalene"],
+        solvent: DosySolvent::CDCl3,
+        temp_k: 298.15,
+        mw_da: 128.174,
+        d_ref_m2_s: 1.62e-9,
+        d_uncertainty_m2_s: 0.04e-9,
+        representative_h1_ppm: 7.84,
+        citation: "Evans et al., Angew. Chem. Int. Ed. 2013, 52, 3199-3202",
+    },
+    DosyPublishedStandard {
+        solute: "TMSS",
+        aliases: &["tmss", "tetrakis(trimethylsilyl)silane"],
+        solvent: DosySolvent::CDCl3,
+        temp_k: 298.15,
+        mw_da: 320.84,
+        d_ref_m2_s: 1.02e-9,
+        d_uncertainty_m2_s: 0.03e-9,
+        representative_h1_ppm: 0.25,
+        citation: "Evans et al., Angew. Chem. Int. Ed. 2013, 52, 3199-3202",
+    },
+    DosyPublishedStandard {
+        solute: "DMSO-d5",
+        aliases: &["dmso-d5", "chd2socd3", "residual dmso"],
+        solvent: DosySolvent::DmsoD6,
+        temp_k: 298.15,
+        mw_da: 83.164,
+        d_ref_m2_s: 6.80e-10,
+        d_uncertainty_m2_s: 0.20e-10,
+        representative_h1_ppm: 2.50,
+        citation: "Holz & Weingartner, J. Magn. Reson. 1991, 92, 115-125; Evans et al., Angew. Chem. Int. Ed. 2013, 52, 3199-3202",
+    },
+    DosyPublishedStandard {
+        solute: "Caffeine",
+        aliases: &["caffeine"],
+        solvent: DosySolvent::DmsoD6,
+        temp_k: 298.15,
+        mw_da: 194.194,
+        d_ref_m2_s: 3.48e-10,
+        d_uncertainty_m2_s: 0.12e-10,
+        representative_h1_ppm: 3.87,
+        citation: "Evans et al., Angew. Chem. Int. Ed. 2013, 52, 3199-3202",
+    },
+    DosyPublishedStandard {
+        solute: "Quinine",
+        aliases: &["quinine"],
+        solvent: DosySolvent::DmsoD6,
+        temp_k: 298.15,
+        mw_da: 324.424,
+        d_ref_m2_s: 2.28e-10,
+        d_uncertainty_m2_s: 0.08e-10,
+        representative_h1_ppm: 8.73,
+        citation: "Pelta et al., Magn. Reson. Chem. 2002, 40, S147-S152; Evans et al., Angew. Chem. Int. Ed. 2013, 52, 3199-3202",
+    },
+];
+
+/// Return the built-in clean-room published literature PFG-STE `D_ref` calibration corpus (`F29`).
+pub fn published_dosy_d_ref_corpus() -> &'static [DosyPublishedStandard] {
+    PUBLISHED_DOSY_D_REF_CORPUS
+}
+
+/// Look up a published PFG-STE `D_ref` standard by solute name/alias and optional solvent.
+pub fn lookup_published_dosy_d_ref(
+    solute_name: &str,
+    solvent: Option<DosySolvent>,
+) -> Option<&'static DosyPublishedStandard> {
+    let q = solute_name.trim().to_ascii_lowercase();
+    PUBLISHED_DOSY_D_REF_CORPUS.iter().find(|entry| {
+        let solv_ok = solvent.is_none_or(|s| entry.solvent == s);
+        let name_ok = entry.solute.eq_ignore_ascii_case(&q)
+            || entry.aliases.iter().any(|a| a.eq_ignore_ascii_case(&q));
+        solv_ok && name_ok
     })
 }

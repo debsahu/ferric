@@ -33,12 +33,13 @@ use serde::{Deserialize, Serialize};
 
 use nmr_core::metabolomics::{
     align_cohort_interval_fft, bucket_cohort_spectra, compute_stocsy, compute_stocsy_at_ppm,
-    export_biomarker_ranking_csv, export_bucket_table_csv, fit_opls_da, fit_pca, fit_pls_da,
-    generate_demo_biofluid_cohort, normalize_bucket_matrix, preprocess_cohort_1d, rank_biomarkers,
-    run_metabolomics_pipeline, scale_bucket_matrix, AlignmentMode, AlignmentReference,
-    BiofluidMaskPreset, BiomarkerCandidate, BucketingMethod, CohortSample1D, ConfidenceEllipse2D,
-    ExclusionZonePpm, MetaboliteMatchScore, MetabolomicsPipelineConfig, MetabolomicsStudyResult,
-    NormalizationMethod, OplsDaResult, PcaResult, ScalingMethod, SpectralBucket,
+    export_biomarker_ranking_csv, export_bucket_table_csv, fit_opls_da_with_options, fit_pca,
+    fit_pls_da_with_transform, generate_demo_biofluid_cohort, normalize_bucket_matrix,
+    preprocess_cohort_1d, rank_biomarkers, run_metabolomics_pipeline,
+    transform_and_scale_bucket_matrix, AlignmentMode, AlignmentReference, BiofluidMaskPreset,
+    BiomarkerCandidate, BucketingMethod, CohortSample1D, ConfidenceEllipse2D, ExclusionZonePpm,
+    MetaboliteMatchScore, MetabolomicsPipelineConfig, MetabolomicsStudyResult, NormalizationMethod,
+    OplsDaResult, PcaResult, ScalingMethod, SpectralBucket, VarianceTransform,
 };
 use nmr_core::nmr1d::{Experiment1DKind, Spectrum1D};
 use nmr_core::octet_analyt::jcamp_spec1d::read_jcamp;
@@ -206,12 +207,14 @@ PREPROCESS & BINNING OPTIONS:
   --norm <NORM>                Dilution normalization: pqn (default), tsa, tsp, none
   --tsp-ppm <PPM>              Internal standard target ppm when --norm tsp (default: 0.00)
   --tsp-half-window <PPM>      Internal standard integration half-window (default: 0.05)
+  --transform <MODE>           Pre-scaling variance transform: none (default) or log10
   --scale <SCALE>              Variable scaling: pareto (default), uv, mean, none
 
 CHEMOMETRICS & STOCSY OPTIONS:
   -i, --in <PATH>              Load exported study.json or buckets.csv from `metabolomics bin`
   --components <A>             Number of PCA components (default: 5)
   --ortho <A_O>                Number of OPLS-DA orthogonal components (default: 1)
+  --max-ortho <MAX_A_O>        CV-selected OPLS-DA orthogonal components in 1..=MAX_A_O (default: 1)
   --cv-folds <K>               Stratified cross-validation folds (default: 7)
   --permutations <N>           Label permutation trials for OPLS-DA validation (default: 100)
   --seed <U64>                 Deterministic PRNG seed (default: 20261115)
@@ -266,6 +269,18 @@ fn parse_scaling(raw: &str) -> Result<ScalingMethod, String> {
         "none" | "raw" => Ok(ScalingMethod::None),
         other => Err(format!(
             "invalid --scale {other:?} (expected pareto, uv, mean, or none)"
+        )),
+    }
+}
+
+fn parse_variance_transform(raw: &str) -> Result<VarianceTransform, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" | "raw" | "identity" => Ok(VarianceTransform::None),
+        "log10" | "log10-pseudocount" | "log10_pseudocount" | "log" => {
+            Ok(VarianceTransform::Log10Pseudocount)
+        }
+        other => Err(format!(
+            "invalid --transform {other:?} (expected none or log10)"
         )),
     }
 }
@@ -331,9 +346,11 @@ struct CommonMetabCliArgs {
     permute_cohort_labels: bool,
     fallback_obs_mhz: f64,
     config: MetabolomicsPipelineConfig,
+    transform_override: Option<VarianceTransform>,
     scale_override: Option<ScalingMethod>,
     pca_components_override: Option<usize>,
     ortho_override: Option<usize>,
+    max_ortho_override: Option<usize>,
     cv_folds_override: Option<usize>,
     permutations_override: Option<usize>,
     seed_override: Option<u64>,
@@ -359,9 +376,11 @@ impl Default for CommonMetabCliArgs {
             permute_cohort_labels: false,
             fallback_obs_mhz: 600.0,
             config: MetabolomicsPipelineConfig::default(),
+            transform_override: None,
             scale_override: None,
             pca_components_override: None,
             ortho_override: None,
+            max_ortho_override: None,
             cv_folds_override: None,
             permutations_override: None,
             seed_override: None,
@@ -526,6 +545,11 @@ fn parse_common_args(args: &[String]) -> Result<Option<CommonMetabCliArgs>, Stri
                     "--tsp-half-window",
                 )?;
             }
+            "--transform" | "--variance-transform" => {
+                let vt = parse_variance_transform(next_arg(args, &mut i, "--transform")?)?;
+                parsed.config.variance_transform = vt;
+                parsed.transform_override = Some(vt);
+            }
             "--scale" | "--scaling" => {
                 let sc = parse_scaling(next_arg(args, &mut i, "--scale")?)?;
                 parsed.config.scaling = sc;
@@ -543,6 +567,14 @@ fn parse_common_args(args: &[String]) -> Result<Option<CommonMetabCliArgs>, Stri
                 let k = parse_usize_flag(next_arg(args, &mut i, "--ortho")?, "--ortho")?;
                 parsed.config.opls_orthogonal_components = k;
                 parsed.ortho_override = Some(k);
+            }
+            "--max-ortho" | "--max-orthogonal" => {
+                let k = parse_usize_flag(next_arg(args, &mut i, "--max-ortho")?, "--max-ortho")?;
+                if k == 0 {
+                    return Err("--max-ortho must be >= 1".to_string());
+                }
+                parsed.config.max_opls_orthogonal_components = Some(k);
+                parsed.max_ortho_override = Some(k);
             }
             "--cv-folds" | "--folds" => {
                 let k = parse_usize_flag(next_arg(args, &mut i, "--cv-folds")?, "--cv-folds")?;
@@ -1372,14 +1404,21 @@ fn cmd_pca(args: &[String]) -> Result<(), String> {
         PcaResult,
     ) = match ds {
         LoadedMetabolomicsDataset::Study(study) => {
+            let vt = cli
+                .transform_override
+                .unwrap_or(study.config.variance_transform);
             let sc = cli.scale_override.unwrap_or(study.config.scaling);
             let n_comp = cli
                 .pca_components_override
                 .unwrap_or(study.config.pca_components);
-            let pca_res = if cli.scale_override.is_none() && cli.pca_components_override.is_none() {
+            let pca_res = if cli.transform_override.is_none()
+                && cli.scale_override.is_none()
+                && cli.pca_components_override.is_none()
+            {
                 study.pca
             } else {
-                let scaled = scale_bucket_matrix(&study.normalized_bucket_matrix, sc);
+                let scaled =
+                    transform_and_scale_bucket_matrix(&study.normalized_bucket_matrix, vt, sc);
                 fit_pca(&scaled, &study.sample_groups, n_comp)
             };
             (
@@ -1397,8 +1436,9 @@ fn cmd_pca(args: &[String]) -> Result<(), String> {
             normalized_bucket_matrix,
             ..
         } => {
+            let vt = cli.config.variance_transform;
             let sc = cli.config.scaling;
-            let scaled = scale_bucket_matrix(&normalized_bucket_matrix, sc);
+            let scaled = transform_and_scale_bucket_matrix(&normalized_bucket_matrix, vt, sc);
             let pca_res = fit_pca(&scaled, &sample_groups, cli.config.pca_components);
             (sample_ids, sample_groups, buckets.len(), sc, pca_res)
         }
@@ -1537,10 +1577,16 @@ fn cmd_oplsda(args: &[String]) -> Result<(), String> {
         full_study_opt,
     ): OplsUnpacked = match ds {
         LoadedMetabolomicsDataset::Study(study) => {
+            let vt = cli
+                .transform_override
+                .unwrap_or(study.config.variance_transform);
             let sc = cli.scale_override.unwrap_or(study.config.scaling);
             let n_ortho = cli
                 .ortho_override
                 .unwrap_or(study.config.opls_orthogonal_components);
+            let max_ortho = cli
+                .max_ortho_override
+                .or(study.config.max_opls_orthogonal_components);
             let folds = cli.cv_folds_override.unwrap_or(study.config.cv_folds);
             let n_perm = cli
                 .permutations_override
@@ -1555,8 +1601,10 @@ fn cmd_oplsda(args: &[String]) -> Result<(), String> {
                 .as_deref()
                 .or(study.config.case_group.as_deref());
 
-            let no_overrides = cli.scale_override.is_none()
+            let no_overrides = cli.transform_override.is_none()
+                && cli.scale_override.is_none()
                 && cli.ortho_override.is_none()
+                && cli.max_ortho_override.is_none()
                 && cli.cv_folds_override.is_none()
                 && cli.permutations_override.is_none()
                 && cli.seed_override.is_none()
@@ -1576,11 +1624,13 @@ fn cmd_oplsda(args: &[String]) -> Result<(), String> {
                 let bks = study.buckets.clone();
                 (s_ids, s_grps, bks, existing_opls, bm, folds, Some(study))
             } else {
-                let opls_res = fit_opls_da(
+                let opls_res = fit_opls_da_with_options(
                     &study.normalized_bucket_matrix,
                     &study.sample_groups,
+                    vt,
                     sc,
                     n_ortho,
+                    max_ortho,
                     folds,
                     n_perm,
                     seed,
@@ -1590,9 +1640,10 @@ fn cmd_oplsda(args: &[String]) -> Result<(), String> {
                 .ok_or_else(|| {
                     "OPLS-DA requires at least 2 sample groups with >= 2 samples each".to_string()
                 })?;
-                let pls_res = fit_pls_da(
+                let pls_res = fit_pls_da_with_transform(
                     &study.normalized_bucket_matrix,
                     &study.sample_groups,
+                    vt,
                     sc,
                     study.config.pls_components,
                     folds,
@@ -1625,11 +1676,13 @@ fn cmd_oplsda(args: &[String]) -> Result<(), String> {
             ..
         } => {
             let folds = cli.config.cv_folds;
-            let opls_res = fit_opls_da(
+            let opls_res = fit_opls_da_with_options(
                 &normalized_bucket_matrix,
                 &sample_groups,
+                cli.config.variance_transform,
                 cli.config.scaling,
                 cli.config.opls_orthogonal_components,
+                cli.config.max_opls_orthogonal_components,
                 folds,
                 cli.config.n_permutations,
                 cli.config.rng_seed,
@@ -1639,9 +1692,10 @@ fn cmd_oplsda(args: &[String]) -> Result<(), String> {
             .ok_or_else(|| {
                 "OPLS-DA requires at least 2 sample groups with >= 2 samples each".to_string()
             })?;
-            let pls_res = fit_pls_da(
+            let pls_res = fit_pls_da_with_transform(
                 &normalized_bucket_matrix,
                 &sample_groups,
+                cli.config.variance_transform,
                 cli.config.scaling,
                 cli.config.pls_components,
                 folds,

@@ -884,3 +884,147 @@ fn test_adversarial_error_paths_dosy_and_metabolomics_cli() {
     expect_cli_err(&["metabolomics", "stocsy", "--demo"]);
     expect_cli_err(&["metabolomics", "pca", "--in", bad_json.to_str().unwrap()]);
 }
+
+#[test]
+fn test_f29_cli_bruker_oneshot_water_skirt_and_metabolomics_log10_uv_max_ortho() {
+    let tmp = ScopedTempDir::new("f29_dosy_metab_cli");
+
+    // 1. Bruker `<gdp_dosyoneshot_tlg>` CLI DOSY fit + `--exclude-water` (`[4.50, 4.98] ppm`)
+    let os_dir = tmp.path.join("bruker_oneshot");
+    fs::create_dir_all(&os_dir).unwrap();
+    let grads = [5.0_f64, 15.0, 28.0, 42.0, 55.0, 68.0];
+    let dl: String = grads.iter().map(|g| format!("{g:.3}\n")).collect();
+    fs::write(os_dir.join("difflist"), dl).unwrap();
+
+    let mut d_arr = ["0.0"; 32];
+    d_arr[16] = "0.0002";
+    d_arr[20] = "0.08";
+    let mut p_arr = ["0.0"; 32];
+    p_arr[1] = "8.5";
+    p_arr[30] = "1100.0";
+    let mut cnst_arr = ["1.0"; 32];
+    cnst_arr[14] = "0.2";
+    cnst_arr[15] = "1.2";
+    cnst_arr[16] = "0.8";
+    let acqus = format!(
+        "##$PULPROG= <gdp_dosyoneshot_tlg>\n##$NUC1= <1H>\n##$CNST= (0..31)\n{}\n##$D= (0..31)\n{}\n##$P= (0..31)\n{}\n##$GPNAM= (0..7)\n<> <SINE.100> <SINE.100> <> <> <> <SINE.100> <>\n",
+        cnst_arr.join(" "),
+        d_arr.join(" "),
+        p_arr.join(" "),
+    );
+    fs::write(os_dir.join("acqus"), acqus).unwrap();
+
+    let os_params = nmr_core::dosy::read_bruker_dosy_dir(
+        &os_dir,
+        &nmr_core::dosy::BrukerDosyOverrides::default(),
+    )
+    .unwrap();
+    let d_true = 4.23e-10_f64; // Sucrose in D2O at 298.15 K
+    let mut tsv = String::from("label\tppm\tI0\tI1\tI2\tI3\tI4\tI5\n");
+    // Include a spurious water-skirt ripple at 4.57 ppm that `--exclude-water` (`[4.50, 4.98]`) must drop!
+    let mut row_skirt = String::from("WaterSkirt_4.57\t4.570");
+    let mut row_suc = String::from("Sucrose_5.41\t5.410");
+    for &b in &os_params.b_values_s_m2 {
+        row_skirt.push_str(&format!("\t{:.6}", 50.0 * (-b * 1.90e-9).exp()));
+        row_suc.push_str(&format!("\t{:.6}", 100.0 * (-b * d_true).exp()));
+    }
+    tsv.push_str(&row_skirt);
+    tsv.push('\n');
+    tsv.push_str(&row_suc);
+    tsv.push('\n');
+    let decay_path = tmp.path.join("oneshot_decay.tsv");
+    fs::write(&decay_path, tsv).unwrap();
+
+    let os_json = tmp.path.join("oneshot_fit.json");
+    let out_os = Command::new(nmrassign_bin())
+        .args([
+            "dosy",
+            "fit",
+            "--in",
+            decay_path.to_str().unwrap(),
+            "--exp-dir",
+            os_dir.to_str().unwrap(),
+            "--exclude-water",
+            "--bootstrap",
+            "0",
+            "--json-out",
+            os_json.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run dosy fit on oneshot");
+    assert!(
+        out_os.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_os.stderr)
+    );
+    let os_rep: Value = serde_json::from_str(&fs::read_to_string(&os_json).unwrap()).unwrap();
+    let os_pks = os_rep["peaks"].as_array().unwrap();
+    assert_eq!(
+        os_pks.len(),
+        1,
+        "expected 4.57 ppm water-skirt peak excluded"
+    );
+    assert_eq!(os_pks[0]["label"].as_str(), Some("Sucrose_5.41"));
+    let d_est = os_pks[0]["components"][0]["d_m2_s"].as_f64().unwrap();
+    assert!(
+        (d_est - d_true).abs() / d_true < 0.01,
+        "Oneshot D recovery error too large: got {d_est:e}, expected {d_true:e}"
+    );
+
+    // 2. Metabolomics CLI `--transform log10 --scale uv --max-ortho 3` positive & null-label guard
+    let pos_json = tmp.path.join("opls_f29_pos.json");
+    let out_pos = Command::new(nmrassign_bin())
+        .args([
+            "metabolomics",
+            "oplsda",
+            "--demo",
+            "--seed",
+            "20261115",
+            "--transform",
+            "log10",
+            "--scale",
+            "uv",
+            "--max-ortho",
+            "3",
+            "--permutations",
+            "60",
+            "-o",
+            pos_json.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run metabolomics oplsda --transform log10 --scale uv --max-ortho 3");
+    assert!(
+        out_pos.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_pos.stderr)
+    );
+    let pos_val: Value = serde_json::from_str(&fs::read_to_string(&pos_json).unwrap()).unwrap();
+    assert!(pos_val["q2"].as_f64().unwrap() > 0.70);
+    assert_eq!(pos_val["is_validated"].as_bool(), Some(true));
+
+    let null_json = tmp.path.join("opls_f29_null.json");
+    let out_null = Command::new(nmrassign_bin())
+        .args([
+            "metabolomics",
+            "oplsda",
+            "--demo",
+            "--seed",
+            "20261115",
+            "--permute-cohort-labels",
+            "--transform",
+            "log10",
+            "--scale",
+            "uv",
+            "--max-ortho",
+            "3",
+            "--permutations",
+            "50",
+            "-o",
+            null_json.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run null metabolomics oplsda --max-ortho 3");
+    assert!(out_null.status.success());
+    let null_val: Value = serde_json::from_str(&fs::read_to_string(&null_json).unwrap()).unwrap();
+    assert_eq!(null_val["is_validated"].as_bool(), Some(false));
+}

@@ -37,20 +37,21 @@ use nmr_core::multiplet::{
 };
 use nmr_core::nmr1d::{
     apply_apodization_1d, apply_phase_1d, auto_calibrate_solvent_1d, auto_phase_and_apply_1d,
-    correct_baseline_1d, deconvolve_region_1d, deconvolve_spectrum_1d, estimate_noise_sigma_1d,
-    eval_pseudo_voigt_sum_1d, fft_1d, load_1d_input, load_processed_spectrum_1d,
-    match_trace_impurities, pick_peaks_1d, subtract_solvent_hsvd_1d, suppress_solvent_notch_1d,
-    zero_fill_1d, zero_fill_pow2_1d, Apodization1D, AutoPhase1DConfig, BaselineConfig1D,
-    BaselineMethod1D, DeconvolutionResult1D, DeconvolveConfig1D, Experiment1DKind, HsvdConfig,
-    HsvdPole, Loaded1DData, NotchConfig1D, Nucleus1D, Peak1DPicked, PeakPickConfig1D,
-    PhaseResult1D, Pivot1D, Spectrum1D, VoigtPeak1D,
+    convert_c13_spectrum_reference_1d, correct_baseline_1d, deconvolve_region_1d,
+    deconvolve_spectrum_1d, estimate_noise_sigma_1d, eval_pseudo_voigt_sum_1d, fft_1d,
+    load_1d_input, load_processed_spectrum_1d, match_trace_impurities, pick_peaks_1d,
+    subtract_solvent_hsvd_1d, suppress_solvent_notch_1d, zero_fill_1d, zero_fill_pow2_1d,
+    Apodization1D, AutoPhase1DConfig, BaselineConfig1D, BaselineMethod1D, DeconvolutionResult1D,
+    DeconvolveConfig1D, Experiment1DKind, HsvdConfig, HsvdPole, Loaded1DData, NotchConfig1D,
+    Nucleus1D, Peak1DPicked, PeakPickConfig1D, PhaseResult1D, Pivot1D, ReferenceStandard,
+    Spectrum1D, VoigtPeak1D,
 };
 use nmr_core::octet_mol::{parse_smiles, read_mol, read_sdf, Molecule};
 
 /// Usage text for `ferric nmr1d`.
 pub fn nmr1d_usage() -> &'static str {
     "Usage:\n\
-     \x20 ferric nmr1d process   --in <fid_dir|pdata_dir|spec.jdx|spec.tsv|spec.json> --out <spec.tsv|spec.json>\n\
+     \x20 ferric nmr1d process   --in <fid_dir|pdata_dir|spec.jdf|spec.jdx|spec.tsv|spec.json> --out <spec.tsv|spec.json>\n\
      \x20                           [--experiment 1h|13c|dept90|dept135|19f|31p] [--mhz <f64>] [--solvent <SOLV>]\n\
      \x20                           [--hsvd [<lo:hi,...>]] [--hsvd-rank 24] [--apod em|gm|lg|cos|cos2|ssb|none]\n\
      \x20                           [--lb <hz>] [--gb <hz>] [--lg-center 0.0] [--first-point 0.5] [--zf 2 | --zf-points <N>]\n\
@@ -58,9 +59,10 @@ pub fn nmr1d_usage() -> &'static str {
      \x20                           [--exclude-ppm <lo:hi,...>] [--biphasic-pos <lo:hi>] [--notch <lo:hi,...>]\n\
      \x20                           [--baseline whittaker|asymmetric-whittaker|bernstein|none] [--lambda 1e6] [--bernstein-degree 6]\n\
      \x20                           [--calibrate-solvent <SOLV>] [--cal-window 0.25] [--ref-offset <ppm>]\n\
+     \x20                           [--c13-ref dss|tms] [--c13-source-ref dss|tms]\n\
      \x20                           [--min-snr 6.0] [--shoulders] [--match-impurities] [--deconvolve] [--deconv-region <lo:hi>]\n\
      \x20                           [--peaks-out <peaks.tsv>] [--json-out <summary.json>]\n\
-     \x20 ferric nmr1d multiplet --in <spec.tsv|spec.jdx|spec.json|pdata_dir> [--out <multiplets.tsv>]\n\
+     \x20 ferric nmr1d multiplet --in <spec.tsv|spec.jdf|spec.jdx|spec.json|pdata_dir> [--out <multiplets.tsv>]\n\
      \x20                           [--mhz <f64>] [--solvent CDCl3] [--nucleus 1H|13C|19F|31P|15N] [--proton-decoupled]\n\
      \x20                           [--region <hi:lo[:label]> ...] [--regions <hi1:lo1[:lbl],...>]\n\
      \x20                           [--norm-ref <idx:protons> | --total-protons <H> | --norm-scale <factor>]\n\
@@ -259,6 +261,10 @@ pub struct Process1dCliReport {
     pub auto_phase: Option<PhaseResult1D>,
     pub baseline_noise_sigma: f64,
     pub solvent_calibration_delta_ppm: Option<f64>,
+    #[serde(default)]
+    pub c13_reference_standard: Option<String>,
+    #[serde(default)]
+    pub c13_reference_delta_ppm: Option<f64>,
     pub picked_peaks: Vec<Peak1DPicked>,
     pub impurity_matches: Vec<CliImpurityMatch>,
     pub deconvolved_peaks: Vec<VoigtPeak1D>,
@@ -306,6 +312,8 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
     let mut calibrate_solvent: Option<String> = None;
     let mut cal_window_ppm: f64 = 0.25;
     let mut ref_offset_ppm: Option<f64> = None;
+    let mut c13_target_ref: Option<ReferenceStandard> = None;
+    let mut c13_source_ref: Option<ReferenceStandard> = None;
 
     let mut min_snr: f64 = 6.0;
     let mut detect_shoulders = false;
@@ -517,6 +525,16 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
                         .map_err(|_| format!("invalid `--ref-offset` {v:?}"))?,
                 );
             }
+            "--c13-ref" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for `--c13-ref`")?;
+                c13_target_ref = Some(ReferenceStandard::parse(v)?);
+            }
+            "--c13-source-ref" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for `--c13-source-ref`")?;
+                c13_source_ref = Some(ReferenceStandard::parse(v)?);
+            }
             "--min-snr" => {
                 i += 1;
                 let v = args.get(i).ok_or("missing value for `--min-snr`")?;
@@ -702,6 +720,16 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
         solvent_cal_delta = Some(solvent_cal_delta.unwrap_or(0.0) + off);
     }
 
+    let mut c13_ref_delta_ppm: Option<f64> = None;
+    if let Some(target_ref) = c13_target_ref {
+        let source_ref = c13_source_ref.unwrap_or(match target_ref {
+            ReferenceStandard::Dss => ReferenceStandard::Tms,
+            ReferenceStandard::Tms => ReferenceStandard::Dss,
+        });
+        let delta = convert_c13_spectrum_reference_1d(&mut spec, source_ref, target_ref)?;
+        c13_ref_delta_ppm = Some(delta);
+    }
+
     let pick_cfg = PeakPickConfig1D {
         min_snr,
         detect_shoulders,
@@ -842,6 +870,8 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
         auto_phase: auto_phase_res,
         baseline_noise_sigma,
         solvent_calibration_delta_ppm: solvent_cal_delta,
+        c13_reference_standard: c13_target_ref.map(|r| r.as_str().to_string()),
+        c13_reference_delta_ppm: c13_ref_delta_ppm,
         picked_peaks,
         impurity_matches,
         deconvolved_peaks: deconv_res

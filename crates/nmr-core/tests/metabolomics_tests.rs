@@ -1032,3 +1032,133 @@ fn test_metabolomics_adversarial_and_degenerate_inputs() {
     bad_len.axis.size = 16;
     assert!(bad_len.validate().is_err());
 }
+
+/// [Test 14 — `F29`] Leak-free `VarianceTransform::Log10Pseudocount`, `FeatureScaling::UnitVariance`,
+/// and nested-CV-selected `1..=max_ortho` `OPLS-DA` rescue multi-orthogonal heteroscedastic urinary
+/// cohorts (50x glycosuria dynamic range + 3 orthogonal confounders) while passing the Westerhuis
+/// `P = 200 >> N = 24` shuffled-label `Q^2 < 0.10` anti-overfitting guard.
+#[test]
+fn test_f29_log10_uv_multi_ortho_oplsda_and_null_label_guard() {
+    use nmr_core::metabolomics::{fit_opls_da_with_options, FeatureScaling, VarianceTransform};
+
+    let mut rng = Rng::new(202629);
+    let n = 40usize;
+    let p = 90usize;
+    let mut x_urine = vec![vec![0.0; p]; n];
+    let mut groups = Vec::with_capacity(n);
+
+    // Build realistic urinary cohort:
+    // - 3 strong independent orthogonal factors (pH/hippurate/dietary log-normal spikes)
+    // - Heteroscedastic 60x dynamic-range outlier spikes on non-predictive columns 0..6
+    // - Multiplicative class biomarker fold-change (columns 20..28, +2.4x in Case)
+    for (i, row) in x_urine.iter_mut().enumerate() {
+        let is_case = i >= 20;
+        groups.push(if is_case { "T2DM" } else { "Control" }.to_string());
+        let z_o1 = if i % 2 == 0 { 1.3 } else { -1.3 } + rng.normal(0.0, 0.25);
+        let z_o2 = if (i / 2) % 2 == 0 { 1.1 } else { -1.1 } + rng.normal(0.0, 0.25);
+        let z_o3 = ((i as f64) * 0.7).sin() * 1.2;
+
+        for (j, slot) in row.iter_mut().enumerate() {
+            let o1 = ((j as f64) * 0.19).cos() * 0.55;
+            let o2 = ((j as f64) * 0.31).sin() * 0.50;
+            let o3 = ((j as f64) * 0.47).cos() * 0.45;
+            let log_conc = z_o1 * o1 + z_o2 * o2 + z_o3 * o3 + rng.normal(0.0, 0.18);
+            let mut val = log_conc.exp();
+            if j < 6 {
+                // Massive 60x heteroscedastic urinary dynamic-range columns unrelated to class
+                val *= 60.0 * (1.0 + 0.8 * z_o1.exp());
+            }
+            if (20..28).contains(&j) && is_case {
+                val *= 2.4;
+            }
+            *slot = val;
+        }
+    }
+
+    // Baseline untransformed 1-ortho Pareto model is degraded by the 60x heteroscedastic columns + 3 ortho axes
+    let base_opls = fit_opls_da(
+        &x_urine,
+        &groups,
+        FeatureScaling::Pareto,
+        1,
+        7,
+        60,
+        202601,
+        Some("Control"),
+        Some("T2DM"),
+    )
+    .expect("baseline OPLS-DA");
+
+    // Log10Pseudocount + UnitVariance + CV-selected `1..=4` orthogonal components cleanly isolates
+    // the multi-orthogonal urinary variation and boosts out-of-fold Q^2!
+    let f29_opls = fit_opls_da_with_options(
+        &x_urine,
+        &groups,
+        VarianceTransform::Log10Pseudocount,
+        FeatureScaling::UnitVariance,
+        1,
+        Some(4),
+        7,
+        80,
+        202601,
+        Some("Control"),
+        Some("T2DM"),
+    )
+    .expect("F29 log10+UV+max_ortho OPLS-DA");
+
+    assert!(
+        f29_opls.n_orthogonal >= 2,
+        "expected CV to select >= 2 orthogonal components on 3-factor cohort, got {}",
+        f29_opls.n_orthogonal
+    );
+    assert!(
+        f29_opls.q2 > base_opls.q2 + 0.15 && f29_opls.q2 > 0.65,
+        "expected Log10+UV+max_ortho Q^2 ({:.3}) >> baseline Q^2 ({:.3})",
+        f29_opls.q2,
+        base_opls.q2
+    );
+    assert!(f29_opls.permutation.p_value_q2 <= 0.02 && f29_opls.permutation.is_validated);
+
+    // Westerhuis et al. (2008) anti-overfitting check on P = 200 >> N = 24 pure null labels
+    // WITH `Log10Pseudocount + UnitVariance + max_ortho = 4`: nested leak-free CV must STILL yield `Q^2 < 0.10`!
+    let mut rng_null = Rng::new(707707);
+    let n_null = 24usize;
+    let p_null = 200usize;
+    let mut x_null = vec![vec![0.0; p_null]; n_null];
+    for row in &mut x_null {
+        let lat1 = rng_null.normal(0.0, 0.8);
+        let lat2 = rng_null.normal(0.0, 0.7);
+        for (j, slot) in row.iter_mut().enumerate() {
+            let l = lat1 * ((j as f64) * 0.13).sin()
+                + lat2 * ((j as f64) * 0.29).cos()
+                + rng_null.normal(0.0, 0.5);
+            *slot = l.exp();
+        }
+    }
+    let mut null_groups: Vec<String> = (0..n_null)
+        .map(|i| if i < 12 { "Control" } else { "T2DM" }.to_string())
+        .collect();
+    rng_null.shuffle(&mut null_groups);
+
+    let null_opls = fit_opls_da_with_options(
+        &x_null,
+        &null_groups,
+        VarianceTransform::Log10Pseudocount,
+        FeatureScaling::UnitVariance,
+        1,
+        Some(4),
+        6,
+        80,
+        20260707,
+        Some("Control"),
+        Some("T2DM"),
+    )
+    .expect("null-label multi-ortho OPLS-DA");
+
+    assert!(
+        null_opls.q2 < 0.10,
+        "Westerhuis null-label Q^2 under Log10+UV+max_ortho=4 must remain < 0.10, got {:.4}",
+        null_opls.q2
+    );
+    assert!(!null_opls.permutation.is_validated);
+}

@@ -861,3 +861,140 @@ fn cli_f15_adversarial_1d_ingest_error_paths() {
         .expect("invoke nmr1d qnmr on mismatched json");
     assert!(!out_qnmr.status.success());
 }
+
+#[test]
+fn cli_f29_nmr1d_process_c13_dss_ref_and_jeol_jdf_ingest() {
+    let tmp = ScopedTempDir::new("f29_c13_jdf");
+
+    // 1. Verify `--c13-ref dss` shifts TMS-referenced 13C peaks by +2.371 ppm onto BMRB DSS scale
+    let lines_c13 = [
+        SyntheticLine1D::lorentzian(96.568, 10.0, 1.5),
+        SyntheticLine1D::lorentzian(15.853, 12.0, 1.8),
+    ];
+    let td_c13 = synthesize_fid_1d(
+        "fucose_13c",
+        Experiment1DKind::Carbon13Decoupled,
+        4096,
+        22_000.0,
+        100.612_729,
+        100.0,
+        &lines_c13,
+    );
+    let c13_in = tmp.path.join("c13_fid.json");
+    fs::write(&c13_in, serde_json::to_string(&td_c13).unwrap()).unwrap();
+    let c13_out = tmp.path.join("c13_dss.tsv");
+    let c13_sum = tmp.path.join("c13_dss_summary.json");
+
+    let res_c13 = Command::new(nmrassign_bin())
+        .args([
+            "nmr1d",
+            "process",
+            "--in",
+            c13_in.to_str().unwrap(),
+            "--out",
+            c13_out.to_str().unwrap(),
+            "--c13-ref",
+            "dss",
+            "--json-out",
+            c13_sum.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run nmr1d process --c13-ref dss");
+    assert!(
+        res_c13.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&res_c13.stderr)
+    );
+    let rep: Value = serde_json::from_str(&fs::read_to_string(&c13_sum).unwrap()).unwrap();
+    assert_eq!(rep["c13_reference_standard"].as_str(), Some("dss"));
+    let mut pks: Vec<&Value> = rep["picked_peaks"].as_array().unwrap().iter().collect();
+    pks.sort_by(|a, b| {
+        b["height"]
+            .as_f64()
+            .unwrap()
+            .total_cmp(&a["height"].as_f64().unwrap())
+    });
+    let mut top2_ppms = [
+        pks[0]["ppm"].as_f64().unwrap(),
+        pks[1]["ppm"].as_f64().unwrap(),
+    ];
+    top2_ppms.sort_by(|a, b| b.total_cmp(a));
+    assert!((top2_ppms[0] - 98.939).abs() < 0.02);
+    assert!((top2_ppms[1] - 18.224).abs() < 0.02);
+
+    // 2. Verify CLI `nmr1d process` ingests `.jdf` cleanly and rejects corrupted `.jdf` without panic
+    let mut jdf = vec![0u8; 1296 + 256 * 16];
+    jdf[0..8].copy_from_slice(b"JEOL.NMR");
+    jdf[8] = 1; // LE
+    jdf[9] = 1;
+    jdf[12] = 1; // 1D
+    jdf[14] = 1; // f64
+    jdf[24] = 3; // split complex
+    jdf[32] = 1;
+    jdf[33] = 26; // PPM
+    jdf[176..180].copy_from_slice(&256u32.to_be_bytes());
+    jdf[208..212].copy_from_slice(&0u32.to_be_bytes());
+    jdf[240..244].copy_from_slice(&255u32.to_be_bytes());
+    jdf[272..280].copy_from_slice(&10.0f64.to_be_bytes());
+    jdf[336..344].copy_from_slice(&0.0f64.to_be_bytes());
+    jdf[1064..1072].copy_from_slice(&500.0f64.to_be_bytes());
+    jdf[1284..1288].copy_from_slice(&1296u32.to_be_bytes());
+    jdf[1292..1296].copy_from_slice(&(256u32 * 16).to_be_bytes());
+    for k in 0..256usize {
+        let ppm = 10.0 - 10.0 * (k as f64) / 255.0;
+        let v = 30.0 / (1.0 + ((ppm - 3.65) / 0.08).powi(2));
+        let off = 1296 + k * 8;
+        jdf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let jdf_path = tmp.path.join("sample.jdf");
+    fs::write(&jdf_path, &jdf).unwrap();
+    let jdf_out = tmp.path.join("jdf_out.tsv");
+    let jdf_sum = tmp.path.join("jdf_sum.json");
+    let out_jdf = Command::new(nmrassign_bin())
+        .args([
+            "nmr1d",
+            "process",
+            "--in",
+            jdf_path.to_str().unwrap(),
+            "--out",
+            jdf_out.to_str().unwrap(),
+            "--json-out",
+            jdf_sum.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run nmr1d process on .jdf");
+    assert!(
+        out_jdf.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_jdf.stderr)
+    );
+    let jrep: Value = serde_json::from_str(&fs::read_to_string(&jdf_sum).unwrap()).unwrap();
+    let jpks = jrep["picked_peaks"].as_array().unwrap();
+    let jmain = jpks
+        .iter()
+        .max_by(|a, b| {
+            a["height"]
+                .as_f64()
+                .unwrap()
+                .total_cmp(&b["height"].as_f64().unwrap())
+        })
+        .unwrap();
+    assert!((jmain["ppm"].as_f64().unwrap() - 3.65).abs() < 0.05);
+
+    // Truncated `.jdf` must fail cleanly without panic
+    let trunc_jdf = tmp.path.join("trunc.jdf");
+    fs::write(&trunc_jdf, &jdf[..512]).unwrap();
+    let bad_out = Command::new(nmrassign_bin())
+        .args([
+            "nmr1d",
+            "process",
+            "--in",
+            trunc_jdf.to_str().unwrap(),
+            "--out",
+            tmp.path.join("unused.tsv").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!bad_out.status.success());
+    assert!(!String::from_utf8_lossy(&bad_out.stderr).contains("panicked at"));
+}

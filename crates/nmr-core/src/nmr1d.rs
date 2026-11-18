@@ -38,6 +38,17 @@
 //!   Wertheim, G. K., Butler, M. A., West, K. W. & Buchanan, D. N. E.,
 //!   *Rev. Sci. Instrum.* **1974**, 45, 1369–1371;
 //!   Thompson, P., Cox, D. E. & Hastings, J. B., *J. Appl. Crystallogr.* **1987**, 20, 79–83.
+//! - IUPAC unified indirect chemical-shift $\Xi$ scale & aqueous `DSS` vs organic `TMS` `${}^{13}\text{C}$ referencing:
+//!   Wishart, D. S., Bigam, C. G., Yao, J., Abildgaard, F., Dyson, H. J., Oldfield, E.,
+//!   Markley, J. L. & Sykes, B. D., *J. Biomol. NMR* **1995**, 6, 135–140;
+//!   Markley, J. L. et al., *Pure Appl. Chem.* **1998**, 70, 117–142;
+//!   Harris, R. K., Becker, E. D., Cabral de Menezes, S. M., Goodfellow, R. & Granger, P.,
+//!   *Pure Appl. Chem.* **2001**, 73, 1795–1818;
+//!   Harris, R. K., Becker, E. D., Cabral de Menezes, S. M., Granger, P., Hoffman, R. E. &
+//!   Zilm, K. W., *Pure Appl. Chem.* **2008**, 80, 59–84.
+//! - Clean-room JEOL Delta `.jdf` 1D binary header, parameter table, and multi-stage FIR decimation
+//!   group-delay format: implemented strictly from the public JEOL Delta NMR File Format
+//!   documentation (`"JEOL.NMR"` 1296-byte header + 64-byte parameter table records).
 
 use std::f64::consts::PI;
 
@@ -288,6 +299,9 @@ pub struct TimeDomain1D {
     pub group_delay_pts: f64,
     /// Whether time-domain samples must be complex-conjugated prior to `-i` forward DFT.
     pub conjugate_for_fft: bool,
+    /// Optional deuterated or aqueous solvent identifier propagated from acquisition metadata.
+    #[serde(default)]
+    pub solvent: Option<String>,
     /// Complex `(re, im)` samples (length `>= active_td` after zero-filling).
     pub data: Vec<Complex64>,
 }
@@ -312,6 +326,7 @@ impl TimeDomain1D {
             active_td,
             group_delay_pts: 0.0,
             conjugate_for_fft: false,
+            solvent: None,
             data,
         }
     }
@@ -334,6 +349,7 @@ impl TimeDomain1D {
             active_td: fid.data.len(),
             group_delay_pts: fid.axis_x.group_delay,
             conjugate_for_fft: !fid.axis_x.conjugate_for_fft,
+            solvent: None,
             data: fid.data.clone(),
         };
         compensate_group_delay_1d(&mut td);
@@ -739,13 +755,15 @@ pub fn fft_1d(fid: &TimeDomain1D) -> Spectrum1D {
         obs_mhz: fid.obs_mhz,
     };
 
-    Spectrum1D::new(
+    let mut spec = Spectrum1D::new(
         fid.name.clone(),
         fid.experiment.clone(),
         axis,
         real,
         Some(imag),
-    )
+    );
+    spec.solvent = fid.solvent.clone();
+    spec
 }
 
 /// Reconstruct the causal imaginary dispersion channel of a descending-ppm `Spectrum1D` from its
@@ -915,6 +933,38 @@ pub fn apply_phase_1d(spec: &mut Spectrum1D, phc0_deg: f64, phc1_deg: f64, pivot
     );
 }
 
+fn default_auto_mask_aqueous_hdo() -> bool {
+    true
+}
+
+fn default_biphasic_phc1_prior_weight() -> f64 {
+    0.06
+}
+
+/// Returns `true` when `solvent` names an aqueous $\text{D}_2\text{O}$ / $\text{H}_2\text{O}$ sample
+/// whose residual `~4.70–4.79 ppm` $\text{HDO}$ singlet can dominate `${}^{1}\text{H}$ dynamic range.
+pub fn is_aqueous_solvent_label(solvent: &str) -> bool {
+    let clean = solvent
+        .trim_matches(['<', '>', '"', '\'', ' '])
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        clean.as_str(),
+        "d2o"
+            | "h2o"
+            | "h2o+d2o"
+            | "d2o+h2o"
+            | "90% h2o+10% d2o"
+            | "90%h2o+10%d2o"
+            | "deuterium oxide"
+            | "water"
+            | "water-d2"
+            | "pbs"
+    ) || clean.starts_with("h2o+")
+        || clean.starts_with("d2o+")
+        || clean.contains("90% h2o")
+}
+
 /// Configuration for automatic 1D minimum-entropy phase correction
 /// (Chen et al., *J. Magn. Reson.* **2002**, 158, 164–168; de Brouwer, *J. Magn. Reson.* **2009**, 201, 230–238).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -938,6 +988,16 @@ pub struct AutoPhase1DConfig {
     /// Optional positive reference chemical-shift window `(ppm_min, ppm_max)` used to disambiguate
     /// global $0^\circ$ vs $180^\circ$ sign in `Polarity1D::Biphasic` (`DEPT-135`).
     pub biphasic_positive_ppm: Option<(f64, f64)>,
+    /// Automatically mask dominant residual `HDO` / water (`4.60..4.90 ppm`) during `${}^{1}\text{H}$
+    /// minimum-entropy autophasing when aqueous `D2O`/`H2O` solvent is detected or an overwhelming
+    /// dynamic-range singlet sits in `4.60..4.90 ppm` alongside valid solute peaks (`F29`, default `true`).
+    #[serde(default = "default_auto_mask_aqueous_hdo")]
+    pub auto_mask_aqueous_hdo: bool,
+    /// Gentle quadratic `PHC1` regularization weight $\gamma_{\text{phc1}} (\text{PHC1} / 180^\circ)^2$
+    /// in `Polarity1D::Biphasic` (`DEPT-135`) preventing CH2-free unimodal `DEPT-135` spectra from
+    /// trapping at `PHC1 = ±180°` boundaries (`F29`, default `0.06`).
+    #[serde(default = "default_biphasic_phc1_prior_weight")]
+    pub biphasic_phc1_prior_weight: f64,
 }
 
 impl Default for AutoPhase1DConfig {
@@ -952,6 +1012,8 @@ impl Default for AutoPhase1DConfig {
             dispersion_penalty_weight: 1.5,
             excluded_ppm_regions: Vec::new(),
             biphasic_positive_ppm: None,
+            auto_mask_aqueous_hdo: true,
+            biphasic_phc1_prior_weight: 0.06,
         }
     }
 }
@@ -1010,7 +1072,7 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
 
     // Obtain complex bins (reconstructing imaginary via Hilbert if real-only).
     let imag_owned: Vec<f64>;
-    let imag_ref: &[f64] = if let Some(ref im) = spec.imag {
+    let imag_orig: &[f64] = if let Some(ref im) = spec.imag {
         im.as_slice()
     } else {
         let mut tmp = spec.clone();
@@ -1042,17 +1104,214 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
         active.fill(true);
     }
 
-    // Estimate thermal noise floor from complex first-difference MAD.
+    // Estimate thermal noise floor from complex first-difference MAD (preferring non-HDO bins on 1H).
     let mut diffs = Vec::with_capacity(n - 1);
+    let is_proton = spec.experiment == Experiment1DKind::Proton1D;
     for j in 0..(n - 1) {
         if active[j] && active[j + 1] {
+            if is_proton {
+                let p = spec.ppm_at(j);
+                if (4.55..=4.95).contains(&p) {
+                    continue;
+                }
+            }
             let dr = spec.real[j + 1] - spec.real[j];
-            let di = imag_ref[j + 1] - imag_ref[j];
+            let di = imag_orig[j + 1] - imag_orig[j];
             diffs.push((0.5 * (dr * dr + di * di)).sqrt());
+        }
+    }
+    if diffs.len() < 8 {
+        diffs.clear();
+        for j in 0..(n - 1) {
+            if active[j] && active[j + 1] {
+                let dr = spec.real[j + 1] - spec.real[j];
+                let di = imag_orig[j + 1] - imag_orig[j];
+                diffs.push((0.5 * (dr * dr + di * di)).sqrt());
+            }
         }
     }
     let sigma_noise = 1.4826 * median_in_place(&mut diffs);
     let tau_neg = 2.5 * sigma_noise;
+
+    // Working references for autophasing (never mutating `spec`; allocated only when a dominant
+    // radiation-damped 1H HDO Cauchy pole wing is stripped internally).
+    let real_hdo_stripped: Vec<f64>;
+    let imag_hdo_stripped: Vec<f64>;
+    let mut real_ref: &[f64] = spec.real.as_slice();
+    let mut imag_ref: &[f64] = imag_orig;
+
+    // Automatic aqueous HDO / residual water mask (`4.60..4.90 ppm`) + 1-pole Cauchy dispersive-wing
+    // stripping on internal phase-evaluation buffers for 1H autophasing (`F29`):
+    // triggered when sample solvent is aqueous (`D2O` / `H2O`) OR a high dynamic-range singlet
+    // (`>= 8x` max solute envelope and `SNR >= 50`) sits inside `4.60..4.90 ppm`, provided
+    // genuine solute signals exist outside the water band so radiation-damped HDO `1/Δω` wings
+    // cannot hijack minimum-entropy or negative-excursion phase optimization.
+    if config.auto_mask_aqueous_hdo && is_proton {
+        let solv_is_aq = spec
+            .solvent
+            .as_deref()
+            .is_some_and(is_aqueous_solvent_label);
+        let mut max_env_hdo = 0.0_f64;
+        let mut j_hdo = 0usize;
+        let mut hdo_band_bins = 0usize;
+        let mut max_env_solute = 0.0_f64;
+        let mut non_hdo_active = 0usize;
+        for (j, &is_act) in active.iter().enumerate() {
+            if !is_act {
+                continue;
+            }
+            let ppm = spec.ppm_at(j);
+            let ej = (spec.real[j] * spec.real[j] + imag_orig[j] * imag_orig[j]).sqrt();
+            if (4.60..=4.90).contains(&ppm) {
+                hdo_band_bins += 1;
+                if ej > max_env_hdo {
+                    max_env_hdo = ej;
+                    j_hdo = j;
+                }
+            } else {
+                non_hdo_active += 1;
+                if !(4.45..=5.05).contains(&ppm) {
+                    max_env_solute = max_env_solute.max(ej);
+                }
+            }
+        }
+        let high_dr_hdo = max_env_hdo >= 8.0 * max_env_solute.max(1e-30)
+            && max_env_hdo >= 50.0 * sigma_noise.max(1e-30);
+        let has_solute = non_hdo_active >= 16 && max_env_solute >= (6.0 * sigma_noise).max(1e-24);
+        if (solv_is_aq || high_dr_hdo) && has_solute {
+            for (j, flag) in active.iter_mut().enumerate() {
+                let ppm = spec.ppm_at(j);
+                if (4.60..=4.90).contains(&ppm) {
+                    *flag = false;
+                }
+            }
+            // When a prominent water peak (`>= 3x` max solute and `SNR >= 20`) sits in `4.60..4.90 ppm`,
+            // fit and subtract its single complex Cauchy/Lorentzian pole `S_hdo(x) = C / (x - dz)` from
+            // internal `(real_ref, imag_ref)` buffers so long-range `1/Δω` dispersive skirts outside
+            // `[4.60, 4.90] ppm` do not bias solute `PHC0`/`PHC1` (preserving nearby `4.55 ppm` solutes).
+            if max_env_hdo >= 3.0 * max_env_solute.max(1e-30)
+                && max_env_hdo >= 20.0 * sigma_noise.max(1e-30)
+                && hdo_band_bins >= 3
+            {
+                let mut fit_bins: Vec<usize> = Vec::new();
+                let core_floor = 0.15 * max_env_hdo;
+                let lo_b = j_hdo.saturating_sub(64);
+                let hi_b = (j_hdo + 64).min(n - 1);
+                for (j, (&sr, &si)) in spec.real[lo_b..=hi_b]
+                    .iter()
+                    .zip(&imag_orig[lo_b..=hi_b])
+                    .enumerate()
+                {
+                    let idx = lo_b + j;
+                    let ppm = spec.ppm_at(idx);
+                    if (4.60..=4.90).contains(&ppm) && (sr * sr + si * si).sqrt() >= core_floor {
+                        fit_bins.push(idx);
+                    }
+                }
+                if fit_bins.len() < 3 {
+                    fit_bins.clear();
+                    for j in j_hdo.saturating_sub(2)..=(j_hdo + 2).min(n - 1) {
+                        if (4.60..=4.90).contains(&spec.ppm_at(j)) {
+                            fit_bins.push(j);
+                        }
+                    }
+                }
+                if fit_bins.len() >= 3 {
+                    let mut g00 = 0.0_f64;
+                    let mut g01_r = 0.0_f64;
+                    let mut g01_i = 0.0_f64;
+                    let mut r0 = 0.0_f64;
+                    let mut r1_r = 0.0_f64;
+                    let mut r1_i = 0.0_f64;
+                    for &jk in &fit_bins {
+                        let x = (jk as f64) - (j_hdo as f64);
+                        let sr = spec.real[jk];
+                        let si = imag_orig[jk];
+                        let e2 = sr * sr + si * si;
+                        g00 += e2;
+                        g01_r += sr;
+                        g01_i -= si;
+                        r0 += x * e2;
+                        r1_r += x * sr;
+                        r1_i += x * si;
+                    }
+                    let g11 = fit_bins.len() as f64;
+                    let det = g00 * g11 - (g01_r * g01_r + g01_i * g01_i);
+                    if det > 1e-24 * g00 * g11 {
+                        let dz_r = (g11 * r0 - (g01_r * r1_r - g01_i * r1_i)) / det;
+                        let dz_i = -(g01_r * r1_i + g01_i * r1_r) / det;
+                        let c_r = (-g01_r * r0 + g00 * r1_r) / det;
+                        let c_i = (g01_i * r0 + g00 * r1_i) / det;
+                        let max_hw = (hdo_band_bins as f64).max(4.0);
+                        if dz_r.is_finite()
+                            && dz_i.is_finite()
+                            && c_r.is_finite()
+                            && c_i.is_finite()
+                            && dz_r.abs() <= 4.0
+                            && dz_i.abs() >= 0.10
+                            && dz_i.abs() <= max_hw
+                        {
+                            let mut resid_e2 = 0.0_f64;
+                            for &jk in &fit_bins {
+                                let x = (jk as f64) - (j_hdo as f64);
+                                let dr = x - dz_r;
+                                let di = -dz_i;
+                                let den2 = dr * dr + di * di;
+                                let hat_r = (c_r * dr + c_i * di) / den2;
+                                let hat_i = (c_i * dr - c_r * di) / den2;
+                                let er = spec.real[jk] - hat_r;
+                                let ei = imag_orig[jk] - hat_i;
+                                resid_e2 += er * er + ei * ei;
+                            }
+                            if resid_e2 <= 0.25 * g00 {
+                                let mut rw = spec.real.clone();
+                                let mut iw = imag_orig.to_vec();
+                                // Evaluate the exact N-periodic discrete-Fourier cotangent pole kernel
+                                // `K_N(z) = (pi / N) * cot((pi / N) * z)` so Nyquist wrap-around ramp
+                                // (`cot(u) - 1/u = -u/3`) cannot mimic first-order phase `PHC1`, then
+                                // remove the residual `i * beta * C` DC offset via baseline median.
+                                let pi_over_n = PI / (n as f64);
+                                let mut base_re: Vec<f64> = Vec::with_capacity(n);
+                                let mut base_im: Vec<f64> = Vec::with_capacity(n);
+                                for (j, ((r_slot, i_slot), &is_act)) in rw
+                                    .iter_mut()
+                                    .zip(iw.iter_mut())
+                                    .zip(active.iter())
+                                    .enumerate()
+                                {
+                                    let x = (j as f64) - (j_hdo as f64);
+                                    let u = pi_over_n * (x - dz_r);
+                                    let v = -pi_over_n * dz_i;
+                                    let den_cot = ((2.0 * v).cosh() - (2.0 * u).cos()).max(1e-30);
+                                    let k_r = pi_over_n * (2.0 * u).sin() / den_cot;
+                                    let k_i = -pi_over_n * (2.0 * v).sinh() / den_cot;
+                                    *r_slot -= c_r * k_r - c_i * k_i;
+                                    *i_slot -= c_r * k_i + c_i * k_r;
+                                    let ppm = spec.ppm_at(j);
+                                    if is_act && !(4.45..=5.05).contains(&ppm) {
+                                        base_re.push(*r_slot);
+                                        base_im.push(*i_slot);
+                                    }
+                                }
+                                if base_re.len() >= 16 {
+                                    let dc_r = median_in_place(&mut base_re);
+                                    let dc_i = median_in_place(&mut base_im);
+                                    for (r_slot, i_slot) in rw.iter_mut().zip(iw.iter_mut()) {
+                                        *r_slot -= dc_r;
+                                        *i_slot -= dc_i;
+                                    }
+                                }
+                                real_hdo_stripped = rw;
+                                imag_hdo_stripped = iw;
+                                real_ref = real_hdo_stripped.as_slice();
+                                imag_ref = imag_hdo_stripped.as_slice();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Spectral energy centroid `u_c` and phase-invariant complex envelope `|S[j]|`.
     let mut e_sum = 0.0_f64;
@@ -1060,7 +1319,7 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
     let mut env = vec![0.0_f64; n];
     let mut env_max = 0.0_f64;
     for j in 0..n {
-        let e = spec.real[j] * spec.real[j] + imag_ref[j] * imag_ref[j];
+        let e = real_ref[j] * real_ref[j] + imag_ref[j] * imag_ref[j];
         let ej = e.sqrt();
         env[j] = ej;
         if active[j] {
@@ -1121,6 +1380,42 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
     }
 
     let env_strong_thresh = (8.0 * sigma_noise).max(0.04 * env_max);
+    let refine_subbin_peak = |j: usize, wing_p: usize| -> (f64, f64, f64, f64) {
+        let bg_re = 0.5 * (real_ref[j - wing_p] + real_ref[j + wing_p]);
+        let bg_im = 0.5 * (imag_ref[j - wing_p] + imag_ref[j + wing_p]);
+        let loc_e2 = |idx: usize| -> f64 {
+            let dr = real_ref[idx] - bg_re;
+            let di = imag_ref[idx] - bg_im;
+            (dr * dr + di * di).max(1e-60)
+        };
+        let mut jc = j;
+        if loc_e2(j - 1) > loc_e2(jc) {
+            jc = j - 1;
+        }
+        if loc_e2(j + 1) > loc_e2(jc) {
+            jc = j + 1;
+        }
+        let (e2_l, e2_c, e2_r) = (loc_e2(jc - 1), loc_e2(jc), loc_e2(jc + 1));
+        let (el, ec, er) = (e2_l.sqrt(), e2_c.sqrt(), e2_r.sqrt());
+        let sub = if el > 0.15 * ec && er > 0.15 * ec {
+            let (ql, qc, qr) = (1.0 / e2_l, 1.0 / e2_c, 1.0 / e2_r);
+            let den_q = ql - 2.0 * qc + qr;
+            if den_q > 1e-30 {
+                (0.5 * (ql - qr) / den_q).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            }
+        } else {
+            let den = el - 2.0 * ec + er;
+            if den.abs() > 1e-18 && ec >= el && ec >= er {
+                (0.5 * (el - er) / den).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            }
+        };
+        ((jc as f64) + sub, ec, bg_re, bg_im)
+    };
+
     // `(sub_bin_center, wing_bins)`
     let mut raw_sym_peaks: Vec<(f64, usize, f64)> = Vec::new();
     for (idx_m, &j) in all_env_maxima.iter().enumerate() {
@@ -1152,42 +1447,50 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
         if has_neighbor {
             continue;
         }
-        // Subtract symmetric collar complex average `0.5 * (S[j - wing_p] + S[j + wing_p])` to cancel
-        // long-range `1 / Delta_omega` dispersive tails from distant resonances before locating the
-        // reciprocal-power Lorentzian sub-bin center `q[m] = 1 / |S_loc[m]|^2`.
-        let bg_re = 0.5 * (spec.real[j - wing_p] + spec.real[j + wing_p]);
-        let bg_im = 0.5 * (imag_ref[j - wing_p] + imag_ref[j + wing_p]);
-        let loc_e2 = |idx: usize| -> f64 {
-            let dr = spec.real[idx] - bg_re;
-            let di = imag_ref[idx] - bg_im;
-            (dr * dr + di * di).max(1e-60)
-        };
-        let mut jc = j;
-        if loc_e2(j - 1) > loc_e2(jc) {
-            jc = j - 1;
-        }
-        if loc_e2(j + 1) > loc_e2(jc) {
-            jc = j + 1;
-        }
-        let (e2_l, e2_c, e2_r) = (loc_e2(jc - 1), loc_e2(jc), loc_e2(jc + 1));
-        let (el, ec, er) = (e2_l.sqrt(), e2_c.sqrt(), e2_r.sqrt());
-        let sub = if el > 0.15 * ec && er > 0.15 * ec {
-            let (ql, qc, qr) = (1.0 / e2_l, 1.0 / e2_c, 1.0 / e2_r);
-            let den_q = ql - 2.0 * qc + qr;
-            if den_q > 1e-30 {
-                (0.5 * (ql - qr) / den_q).clamp(-0.5, 0.5)
-            } else {
-                0.0
+        let (c_pos, ec, _, _) = refine_subbin_peak(j, wing_p);
+        raw_sym_peaks.push((c_pos, wing_p, ec));
+    }
+    // In `Polarity1D::Biphasic` (`DEPT-135`), crowded methine/methylene regions (e.g. carbohydrate
+    // ring `CH` carbons in `66..74 ppm`) may leave `< 4` strictly isolated singlets; include
+    // moderately separated narrow `13C` lines with tighter wings so intermediate chemical shifts
+    // also lock dispersive symmetry.
+    if polarity == Polarity1D::Biphasic && raw_sym_peaks.len() < 6 {
+        for (idx_m, &j) in all_env_maxima.iter().enumerate() {
+            if env[j] < env_strong_thresh {
+                continue;
             }
-        } else {
-            let den = el - 2.0 * ec + er;
-            if den.abs() > 1e-18 && ec >= el && ec >= er {
-                (0.5 * (el - er) / den).clamp(-0.5, 0.5)
-            } else {
-                0.0
+            if raw_sym_peaks
+                .iter()
+                .any(|&(c, _, _)| ((j as f64) - c).abs() < 4.0)
+            {
+                continue;
             }
-        };
-        raw_sym_peaks.push(((jc as f64) + sub, wing_p, ec));
+            let half_e = 0.5 * env_s[j];
+            let mut hw = 1usize;
+            for d in 1..=16 {
+                if j >= d && j + d < n && (env_s[j - d] <= half_e || env_s[j + d] <= half_e) {
+                    hw = d;
+                    break;
+                }
+            }
+            let wing_p = (hw + 2).clamp(3, 10);
+            if j <= wing_p + 2 || j + wing_p + 3 >= n {
+                continue;
+            }
+            if env_s[j - wing_p] > 0.50 * env_s[j] || env_s[j + wing_p] > 0.50 * env_s[j] {
+                continue;
+            }
+            let iso_dist = (wing_p + 2).max(5);
+            let has_close_neighbor = all_env_maxima
+                .iter()
+                .enumerate()
+                .any(|(k_m, &other_j)| k_m != idx_m && j.abs_diff(other_j) <= iso_dist);
+            if has_close_neighbor {
+                continue;
+            }
+            let (c_pos, ec, _, _) = refine_subbin_peak(j, wing_p);
+            raw_sym_peaks.push((c_pos, wing_p, ec));
+        }
     }
     raw_sym_peaks.sort_by(|a, b| b.2.total_cmp(&a.2));
     let sym_peaks: Vec<(f64, usize)> = raw_sym_peaks
@@ -1198,12 +1501,12 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
 
     // Lanczos-3 (`a = 3`) windowed-sinc complex interpolator so narrow (`~1 bin` FWHM) `13C`/`DEPT`
     // peaks suffer zero linear-interpolation chord asymmetry.
-    let sample_phase_at = |pos: f64, phi0_rad: f64, step_rad: f64| -> f64 {
+    let sample_complex_at = |pos: f64| -> (f64, f64) {
         let base = pos.floor() as isize;
         let frac = pos - (base as f64);
-        let (re, im) = if frac.abs() <= 1e-12 {
+        if frac.abs() <= 1e-12 {
             let idx = (base.clamp(0, (n - 1) as isize)) as usize;
-            (spec.real[idx], imag_ref[idx])
+            (real_ref[idx], imag_ref[idx])
         } else {
             let mut sum_re = 0.0_f64;
             let mut sum_im = 0.0_f64;
@@ -1220,16 +1523,58 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
                     let px3 = px / 3.0;
                     (px.sin() / px) * (px3.sin() / px3)
                 };
-                sum_re += w * spec.real[idx];
+                sum_re += w * real_ref[idx];
                 sum_im += w * imag_ref[idx];
                 sum_w += w;
             }
             let inv = 1.0 / sum_w.max(1e-30);
             (sum_re * inv, sum_im * inv)
-        };
+        }
+    };
+
+    let sample_phase_at = |pos: f64, phi0_rad: f64, step_rad: f64| -> f64 {
+        let (re, im) = sample_complex_at(pos);
         let phi = phi0_rad + pos * step_rad;
         let (sp, cp) = phi.sin_cos();
         re * cp - im * sp
+    };
+
+    // For `Polarity1D::Biphasic` (`DEPT-135`), precompute collar-subtracted complex apex vectors
+    // `(c_pos, re_loc, im_loc)` at up to 24 strong envelope maxima. Because a pure absorption
+    // Lorentzian of EITHER sign (`+1` `CH`/`CH3` or `-1` `CH2`) has zero imaginary dispersion
+    // (`Im(S_loc * exp(i*phi)) == 0`) at its sub-bin envelope center while a dispersive peak has
+    // `|Im| == |S_loc|`, this sign-invariant penalty prevents `PHC1 = ±180°` boundary wraps on
+    // CH2-free `DEPT-135` spectra (`F29`) without penalizing genuine inverted `CH2` lines.
+    let biphasic_apex_peaks: Vec<(f64, f64, f64)> = if polarity == Polarity1D::Biphasic {
+        let mut cands: Vec<(f64, f64, f64, f64)> = Vec::new();
+        for &j in &all_env_maxima {
+            if env[j] < env_strong_thresh {
+                continue;
+            }
+            let half_e = 0.5 * env_s[j];
+            let mut hw = 1usize;
+            for d in 1..=16 {
+                if j >= d && j + d < n && (env_s[j - d] <= half_e || env_s[j + d] <= half_e) {
+                    hw = d;
+                    break;
+                }
+            }
+            let w_col = (hw + 2).clamp(3, 8);
+            if j <= w_col + 2 || j + w_col + 3 >= n {
+                continue;
+            }
+            let (c_pos, ec, bg_re, bg_im) = refine_subbin_peak(j, w_col);
+            let (re_c, im_c) = sample_complex_at(c_pos);
+            cands.push((c_pos, re_c - bg_re, im_c - bg_im, ec));
+        }
+        cands.sort_by(|a, b| b.3.total_cmp(&a.3));
+        cands
+            .into_iter()
+            .take(24)
+            .map(|(p, r, m, _)| (p, r, m))
+            .collect()
+    } else {
+        Vec::new()
     };
 
     // Objective evaluator parameterized by `(phi_c_deg, phc1_deg)`.
@@ -1250,7 +1595,7 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
             for &j in &sig_indices {
                 let phi = phi0_rad + (j as f64) * step_rad;
                 let (sp, cp) = phi.sin_cos();
-                let rj = spec.real[j] * cp - imag_ref[j] * sp;
+                let rj = real_ref[j] * cp - imag_ref[j] * sp;
                 r_out[j] = rj;
                 r2_sum += rj * rj;
                 if polarity == Polarity1D::AllPositive && rj < -tau_neg {
@@ -1267,7 +1612,7 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
             for j in 0..n {
                 let phi = phi0_rad + (j as f64) * step_rad;
                 let (sp, cp) = phi.sin_cos();
-                let rj = spec.real[j] * cp - imag_ref[j] * sp;
+                let rj = real_ref[j] * cp - imag_ref[j] * sp;
                 r_out[j] = rj;
                 if active[j] {
                     r2_sum += rj * rj;
@@ -1327,7 +1672,11 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
                 let rc = sample_phase_at(c_pos, phi0_rad, step_rad);
                 let mut pk_num = 0.0_f64;
                 let mut pk_den = rc * rc;
-                let d_start = if wing_p <= 4 { 2 } else { 1 };
+                let d_start = if polarity == Polarity1D::Biphasic || wing_p > 4 {
+                    1
+                } else {
+                    2
+                };
                 for d in d_start..=wing_p {
                     let df = d as f64;
                     let rl = sample_phase_at(c_pos - df, phi0_rad, step_rad);
@@ -1343,7 +1692,29 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
             0.0
         };
 
-        h1_norm + p_neg + p_disp
+        let p_biphasic_reg = if polarity == Polarity1D::Biphasic {
+            let apex_disp = if !biphasic_apex_peaks.is_empty() {
+                let mut acc = 0.0_f64;
+                for &(c_pos, re_loc, im_loc) in &biphasic_apex_peaks {
+                    let phi = phi0_rad + c_pos * step_rad;
+                    let (sp, cp) = phi.sin_cos();
+                    let im_rot = re_loc * sp + im_loc * cp;
+                    let e2 = re_loc * re_loc + im_loc * im_loc + 1e-30;
+                    acc += (im_rot * im_rot) / e2;
+                }
+                0.75 * config.dispersion_penalty_weight * (acc / (biphasic_apex_peaks.len() as f64))
+            } else {
+                0.0
+            };
+            let phc1_scale = config.max_abs_phc1_deg.max(180.0);
+            let prior =
+                config.biphasic_phc1_prior_weight.max(0.0) * (phc1_deg / phc1_scale).powi(2);
+            apex_disp + prior
+        } else {
+            0.0
+        };
+
+        h1_norm + p_neg + p_disp + p_biphasic_reg
     };
 
     // Stage 1: Coarse 2D grid scan over `(phi_c, phc1)` keeping top 6 distinct basins.
@@ -1450,7 +1821,7 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
     let step_final_rad = p1_final_rad / denom;
     for (j, dst) in r_buf.iter_mut().enumerate() {
         let (sp, cp) = (phi0_final_rad + (j as f64) * step_final_rad).sin_cos();
-        *dst = spec.real[j] * cp - imag_ref[j] * sp;
+        *dst = real_ref[j] * cp - imag_ref[j] * sp;
     }
     match polarity {
         Polarity1D::AllPositive => {
@@ -1478,6 +1849,48 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
                     }
                 }
                 if band_sum < 0.0 {
+                    best_pc = wrap_deg_180(best_pc + 180.0);
+                    best_obj = eval_objective(best_pc, best_p1, &mut r_buf);
+                }
+            } else {
+                // Automatic `DEPT-135` `0° vs 180°` sign disambiguation (`F29`, Doddrell et al. 1982):
+                // methines (`CH`, `68..220 ppm` outside terminal `=CH2` `108..122 ppm`) and primary
+                // methyls (`CH3`, `-5..22.5 ppm`) carry positive polarization, while aliphatic
+                // methylenes (`CH2`, `24..62 ppm`) carry negative polarization.
+                let sig_cut = (4.0 * sigma_noise).max(tau_neg);
+                let mut ch_ch3_signed = 0.0_f64;
+                let mut ch2_signed = 0.0_f64;
+                let mut pos_e2 = 0.0_f64;
+                let mut neg_e2 = 0.0_f64;
+                for (j, &rj) in r_buf.iter().enumerate() {
+                    if !active[j] || rj.abs() <= sig_cut {
+                        continue;
+                    }
+                    let e2 = rj * rj;
+                    let s_e2 = rj * rj.abs();
+                    if rj >= 0.0 {
+                        pos_e2 += e2;
+                    } else {
+                        neg_e2 += e2;
+                    }
+                    let ppm = spec.ppm_at(j);
+                    let in_ch_band =
+                        (68.0..=220.0).contains(&ppm) && !(108.0..=122.0).contains(&ppm);
+                    let in_ch3_band = (-5.0..=22.5).contains(&ppm);
+                    if in_ch_band || in_ch3_band {
+                        ch_ch3_signed += s_e2;
+                    } else if (24.0..=62.0).contains(&ppm) {
+                        ch2_signed += s_e2;
+                    }
+                }
+                let tot_e2 = pos_e2 + neg_e2;
+                let dept_score = ch_ch3_signed - 0.5 * ch2_signed;
+                let should_flip = if tot_e2 > 0.0 && dept_score.abs() > 0.05 * tot_e2 {
+                    dept_score < 0.0
+                } else {
+                    neg_e2 > pos_e2
+                };
+                if should_flip {
                     best_pc = wrap_deg_180(best_pc + 180.0);
                     best_obj = eval_objective(best_pc, best_p1, &mut r_buf);
                 }
@@ -3768,6 +4181,125 @@ pub fn auto_calibrate_solvent_1d(
     Ok(spec.calibrate_reference_peak(obs_ppm, primary.ppm))
 }
 
+/// IUPAC 2001/2008 primary organic `${}^{13}\text{C}$ unified frequency ratio
+/// $\Xi({}^{13}\text{C}, \text{Me}_4\text{Si } 1\%\text{ in CDCl}_3) = 0.251\,450\,20$
+/// (Harris et al., *Pure Appl. Chem.* **2001**, 73, 1795–1818; **2008**, 80, 59–84).
+pub const XI_C13_TMS: f64 = 0.251_450_20;
+
+/// IUPAC / biomolecular aqueous `${}^{13}\text{C}$ unified frequency ratio
+/// $\Xi({}^{13}\text{C}, \text{DSS in D}_2\text{O}) = 0.251\,449\,53$
+/// (Wishart et al., *J. Biomol. NMR* **1995**, 6, 135–140; Markley et al.,
+/// *Pure Appl. Chem.* **1998**, 70, 117–142; Harris et al. **2001**).
+pub const XI_C13_DSS: f64 = 0.251_449_53;
+
+/// Chemical shift of aqueous $\text{DSS}$ `${}^{13}\text{C}$ methyls ($\delta_{\text{DSS}} \equiv 0\text{ ppm}$)
+/// when measured on a spectrometer `BF1`/`SF` locked to the organic $\text{TMS}$ `${}^{13}\text{C}$ scale
+/// in $\text{D}_2\text{O}$ at $298\text{ K}$ ($\delta_{\text{TMS}}(\text{DSS}) = -2.371\text{ ppm}$,
+/// $\nu_{\text{ref,DSS}} / \nu_{\text{ref,TMS}} = 1 - 2.371 \times 10^{-6}$;
+/// Harris et al. 2001/2008; Wishart et al. 1995).
+pub const C13_DSS_VS_TMS_OFFSET_PPM: f64 = -2.371;
+
+/// Chemical-shift zero-point standard (`TMS` organic vs `DSS` aqueous biomolecular) for `${}^{13}\text{C}$
+/// scale conversion (`F29`, Harris et al. 2001/2008; Wishart et al. 1995).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReferenceStandard {
+    /// Tetramethylsilane (`1% TMS in CDCl3`, organic chemistry primary standard).
+    Tms,
+    /// Sodium 3-(trimethylsilyl)-1-propanesulfonate (`DSS in D2O`, aqueous/BMRB standard).
+    Dss,
+}
+
+impl ReferenceStandard {
+    /// Parse `"tms"` or `"dss"` (case-insensitive).
+    pub fn parse(label: &str) -> Result<Self, String> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "tms" | "me4si" => Ok(Self::Tms),
+            "dss" | "tsp-dss" => Ok(Self::Dss),
+            other => Err(format!(
+                "unknown 13C reference standard {other:?} (expected `dss` or `tms`)"
+            )),
+        }
+    }
+
+    /// Canonical lowercase label (`"tms"` or `"dss"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tms => "tms",
+            Self::Dss => "dss",
+        }
+    }
+
+    /// IUPAC unified `${}^{13}\text{C}$ $\Xi$ ratio for this standard.
+    pub fn xi_c13(&self) -> f64 {
+        match self {
+            Self::Tms => XI_C13_TMS,
+            Self::Dss => XI_C13_DSS,
+        }
+    }
+}
+
+/// Convert a `${}^{13}\text{C}$ chemical shift `ppm` between organic `TMS` (`BF1`/`SF` lock) and
+/// aqueous `DSS` (`BMRB`) zero-point scales using the exact spectrometer reference-frequency ratio
+/// $\nu_{\text{ref}}(\text{DSS}) / \nu_{\text{ref}}(\text{TMS}) = 1 + \text{C13\_DSS\_VS\_TMS\_OFFSET\_PPM} \times 10^{-6}$
+/// (`-2.371 ppm` when converting `DSS -> TMS`, `+2.371 ppm` when converting `TMS -> DSS`).
+#[inline]
+pub fn convert_c13_ppm_reference(ppm: f64, from: ReferenceStandard, to: ReferenceStandard) -> f64 {
+    if from == to {
+        return ppm;
+    }
+    let eps_ppm = match (from, to) {
+        (ReferenceStandard::Dss, ReferenceStandard::Tms) => C13_DSS_VS_TMS_OFFSET_PPM,
+        (ReferenceStandard::Tms, ReferenceStandard::Dss) => {
+            -C13_DSS_VS_TMS_OFFSET_PPM / (1.0 + C13_DSS_VS_TMS_OFFSET_PPM * 1.0e-6)
+        }
+        _ => 0.0,
+    };
+    ppm + (1.0 + ppm * 1.0e-6) * eps_ppm
+}
+
+/// Convert a `${}^{13}\text{C}$ chemical shift `ppm` using the pure lock-free IUPAC unified
+/// $\Xi({}^{13}\text{C})$ ratio (`0.25145020` vs `0.25144953`, Harris et al. 2001/2008).
+#[inline]
+pub fn convert_c13_ppm_xi_ratio(ppm: f64, from: ReferenceStandard, to: ReferenceStandard) -> f64 {
+    if from == to {
+        return ppm;
+    }
+    let eps_ppm = ((from.xi_c13() - to.xi_c13()) / to.xi_c13()) * 1.0e6;
+    ppm + (1.0 + ppm * 1.0e-6) * eps_ppm
+}
+
+/// Convert a `${}^{13}\text{C}$ `Spectrum1D` (`Carbon13Decoupled`, `Dept90`, or `Dept135`) in place
+/// from `from` reference standard to `to` reference standard (`F29`), updating `first_ppm`, `step_ppm`,
+/// and `obs_mhz` consistently and returning the chemical-shift offset $\Delta\delta$ applied at the
+/// spectrum midpoint.
+pub fn convert_c13_spectrum_reference_1d(
+    spec: &mut Spectrum1D,
+    from: ReferenceStandard,
+    to: ReferenceStandard,
+) -> Result<f64, String> {
+    if spec.experiment.nucleus() != Nucleus1D::C13 {
+        return Err(format!(
+            "13C DSS/TMS reference conversion requires a 13C spectrum, got nucleus '{}'",
+            spec.experiment.nucleus().as_str()
+        ));
+    }
+    if from == to {
+        return Ok(0.0);
+    }
+    let sf_dss_over_tms = 1.0 + C13_DSS_VS_TMS_OFFSET_PPM * 1.0e-6;
+    let rho = match (from, to) {
+        (ReferenceStandard::Dss, ReferenceStandard::Tms) => sf_dss_over_tms,
+        (ReferenceStandard::Tms, ReferenceStandard::Dss) => 1.0 / sf_dss_over_tms,
+        _ => 1.0,
+    };
+    let mid_before = 0.5 * (spec.axis.first_ppm + spec.axis.last_ppm());
+    spec.axis.first_ppm = convert_c13_ppm_reference(spec.axis.first_ppm, from, to);
+    spec.axis.step_ppm *= rho;
+    spec.axis.obs_mhz /= rho;
+    let mid_after = 0.5 * (spec.axis.first_ppm + spec.axis.last_ppm());
+    Ok(mid_after - mid_before)
+}
+
 // ============================================================================
 // 6. Global 1D Peak Picking & Levenberg–Marquardt Pseudo-Voigt Deconvolution
 // ============================================================================
@@ -5627,8 +6159,771 @@ pub fn parse_json_1d_str(text: &str, mhz_override: Option<f64>) -> Result<Loaded
     Err("JSON object matched neither `Spectrum1D` nor `TimeDomain1D` schema".to_string())
 }
 
+/// Returns `true` if `bytes` begins with the 8-byte JEOL Delta NMR file magic `"JEOL.NMR"`.
+#[inline]
+pub fn is_jeol_jdf_magic(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && &bytes[0..8] == b"JEOL.NMR"
+}
+
+/// Compute the multi-stage FIR digital decimation group delay (in final decimated complex samples)
+/// from JEOL Delta `orders` (`"S o_1 ... o_S"` or `"o_1 ... o_S"`) and `factors` (`"f_1 ... f_S"`):
+/// $$\tau_{\text{gd}} = \sum_{s=0}^{S-1} \frac{o_s - 1}{2 \prod_{k=s}^{S-1} f_k}.$$
+pub fn compute_jeol_fir_group_delay(orders_str: &str, factors_str: &str) -> Option<f64> {
+    let factors: Vec<u64> = factors_str
+        .split_whitespace()
+        .map(|t| t.parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if factors.is_empty() || factors.iter().any(|&f| f == 0 || f > 65_536) {
+        return None;
+    }
+    let raw_orders: Vec<u64> = orders_str
+        .split_whitespace()
+        .map(|t| t.parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let orders: &[u64] =
+        if raw_orders.len() == factors.len() + 1 && (raw_orders[0] as usize) == factors.len() {
+            &raw_orders[1..]
+        } else if raw_orders.len() == factors.len() {
+            raw_orders.as_slice()
+        } else {
+            return None;
+        };
+    if orders.iter().any(|&o| o == 0 || o > 1_000_000) {
+        return None;
+    }
+
+    let s_cnt = factors.len();
+    let mut gd = 0.0_f64;
+    for s in 0..s_cnt {
+        let mut prod = 1.0_f64;
+        for &fk in &factors[s..s_cnt] {
+            prod *= fk as f64;
+        }
+        gd += ((orders[s] - 1) as f64) / (2.0 * prod);
+    }
+    gd.is_finite().then_some(gd)
+}
+
+/// Clean-room JEOL Delta `.jdf` 1D FID / processed-spectrum parser (`F29` & `F15`).
+///
+/// Parses the 1296-byte big-endian `"JEOL.NMR"` header and 64-byte parameter table records
+/// (`Endian`, `Major_Version`, `Data_Dimension_Number == 1`, `Data_Format`, `Data_Axis_Type`,
+/// `Data_Axis_Units`, `Data_Points`, `Data_Offset_Start`/`Stop`, `Data_Axis_Start`/`Stop`,
+/// `Base_Freq`, `X_DOMAIN`, `X_FREQ`, `X_SWEEP`, `X_OFFSET`, `DIGITAL_FILTER`, `orders`,
+/// `factors`, `Trapezoid`, `solvent`), enforcing pre-allocation `MAX_1D_INGEST_BYTES`,
+/// `MAX_1D_INGEST_POINTS`, truncation, and `NaN`/`Inf` validation.
+pub fn parse_jeol_jdf_1d_bytes(
+    name: &str,
+    bytes: &[u8],
+    mhz_override: Option<f64>,
+) -> Result<Loaded1DData, String> {
+    const JEOL_HEADER_BYTES: usize = 1296;
+    if let Some(m) = mhz_override {
+        if !m.is_finite() || m <= 0.0 {
+            return Err(format!("invalid mhz_override={m} (must be finite and > 0)"));
+        }
+    }
+    if (bytes.len() as u64) > MAX_1D_INGEST_BYTES {
+        return Err(format!(
+            "JEOL .jdf {name:?} ({} bytes) exceeds MAX_1D_INGEST_BYTES ({MAX_1D_INGEST_BYTES})",
+            bytes.len()
+        ));
+    }
+    if bytes.len() < JEOL_HEADER_BYTES {
+        return Err(format!(
+            "truncated JEOL .jdf {name:?}: {} bytes < {JEOL_HEADER_BYTES}-byte header",
+            bytes.len()
+        ));
+    }
+    if !is_jeol_jdf_magic(bytes) {
+        return Err(format!(
+            "invalid JEOL .jdf {name:?}: missing \"JEOL.NMR\" 8-byte header magic"
+        ));
+    }
+
+    let read_be_u32 = |off: usize| -> Result<u32, String> {
+        let s = bytes
+            .get(off..off + 4)
+            .ok_or_else(|| format!("JEOL .jdf header u32 out of bounds at {off}"))?;
+        let arr: [u8; 4] = s
+            .try_into()
+            .map_err(|_| format!("JEOL .jdf header u32 slice error at {off}"))?;
+        Ok(u32::from_be_bytes(arr))
+    };
+    let read_be_f64 = |off: usize| -> Result<f64, String> {
+        let s = bytes
+            .get(off..off + 8)
+            .ok_or_else(|| format!("JEOL .jdf header f64 out of bounds at {off}"))?;
+        let arr: [u8; 8] = s
+            .try_into()
+            .map_err(|_| format!("JEOL .jdf header f64 slice error at {off}"))?;
+        Ok(f64::from_be_bytes(arr))
+    };
+
+    let endian_flag = bytes[8];
+    let little_endian = match endian_flag {
+        0 => false,
+        1 => true,
+        other => {
+            return Err(format!(
+                "invalid JEOL .jdf {name:?}: Endian byte={other} (expected 0=BE or 1=LE)"
+            ))
+        }
+    };
+    let major_ver = bytes[9];
+    if major_ver == 0 {
+        return Err(format!(
+            "invalid JEOL .jdf {name:?}: Major_Version=0 is unsupported"
+        ));
+    }
+    let dim_num = bytes[12];
+    if dim_num != 1 {
+        return Err(format!(
+            "unsupported JEOL .jdf {name:?}: Data_Dimension_Number={dim_num} (expected 1D)"
+        ));
+    }
+
+    let data_format = bytes[14] & 0x3F;
+    let word_bytes: usize = match data_format {
+        1 => 8,     // 64Bit_Float
+        2 => 4,     // 32Bit_Float
+        3 | 4 => 4, // 32Bit_Integer
+        other => {
+            return Err(format!(
+            "unsupported JEOL .jdf {name:?}: Data_Format={other} (expected 1=f64, 2=f32, or 3=i32)"
+        ))
+        }
+    };
+
+    let axis_type = bytes[24];
+    let (channels, is_interleaved) = match axis_type {
+        1 => (1usize, false), // Real only
+        3 => (2usize, false), // Split Complex (Real[0..N], then Imag[0..N])
+        4 => (2usize, true),  // Interleaved Real_Complex ([re0, im0, re1, im1, ...])
+        other => {
+            return Err(format!(
+                "unsupported JEOL .jdf {name:?}: Data_Axis_Type[0]={other} (expected 1=Real, 3=Complex, or 4=Real_Complex)"
+            ))
+        }
+    };
+
+    let axis_unit_prefix_nib = ((bytes[32] as i8) >> 4) as i32;
+    let axis_unit_base = bytes[33];
+
+    let n_pts_u32 = read_be_u32(176)?;
+    let n_pts = n_pts_u32 as usize;
+    if n_pts < 2 {
+        return Err(format!(
+            "JEOL .jdf {name:?} has Data_Points[0]={n_pts} (minimum 2 required)"
+        ));
+    }
+    if n_pts > MAX_1D_INGEST_POINTS {
+        return Err(format!(
+            "JEOL .jdf {name:?} declared Data_Points[0]={n_pts} exceeds MAX_1D_INGEST_POINTS ({MAX_1D_INGEST_POINTS})"
+        ));
+    }
+
+    let off_start_u32 = read_be_u32(208)?;
+    let off_stop_u32 = read_be_u32(240)?;
+    let (off_start, off_stop) = if off_start_u32 == 0 && off_stop_u32 == 0 {
+        (0usize, n_pts - 1)
+    } else {
+        let s = off_start_u32 as usize;
+        let e = off_stop_u32 as usize;
+        if s > e || e >= n_pts {
+            return Err(format!(
+                "JEOL .jdf {name:?} invalid Data_Offset range [{s}..={e}] for Data_Points={n_pts}"
+            ));
+        }
+        (s, e)
+    };
+    let valid_len = off_stop - off_start + 1;
+    if valid_len < 2 {
+        return Err(format!(
+            "JEOL .jdf {name:?} active slice [{off_start}..={off_stop}] has fewer than 2 points"
+        ));
+    }
+
+    let ax_start_raw = read_be_f64(272)?;
+    let ax_stop_raw = read_be_f64(336)?;
+    let base_freq_mhz = read_be_f64(1064)?;
+    if !ax_start_raw.is_finite() || !ax_stop_raw.is_finite() || !base_freq_mhz.is_finite() {
+        return Err(format!(
+            "JEOL .jdf {name:?} contains non-finite header axis bounds or Base_Freq"
+        ));
+    }
+
+    let param_start = read_be_u32(1212)? as usize;
+    let param_length = read_be_u32(1216)? as usize;
+    let data_start = read_be_u32(1284)? as usize;
+    let data_length = read_be_u32(1292)? as usize;
+
+    let expected_data_bytes = n_pts
+        .checked_mul(channels)
+        .and_then(|v| v.checked_mul(word_bytes))
+        .ok_or_else(|| format!("JEOL .jdf {name:?} data byte count overflow"))?;
+    if data_start < JEOL_HEADER_BYTES {
+        return Err(format!(
+            "JEOL .jdf {name:?} invalid Data_Start={data_start} (< {JEOL_HEADER_BYTES})"
+        ));
+    }
+    if data_length > 0 && data_length < expected_data_bytes {
+        return Err(format!(
+            "JEOL .jdf {name:?} Data_Length={data_length} smaller than expected {expected_data_bytes} bytes"
+        ));
+    }
+    let data_end = data_start
+        .checked_add(expected_data_bytes)
+        .ok_or_else(|| format!("JEOL .jdf {name:?} Data_Start + size overflow"))?;
+    if data_end > bytes.len() {
+        return Err(format!(
+            "truncated JEOL .jdf {name:?}: file has {} bytes, data section requires {data_end} bytes",
+            bytes.len()
+        ));
+    }
+
+    // Parse optional 64-byte parameter table records.
+    let read_endian_u32 = |buf: &[u8]| -> Result<u32, String> {
+        let a: [u8; 4] = buf
+            .get(0..4)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| "short JEOL u32".to_string())?;
+        Ok(if little_endian {
+            u32::from_le_bytes(a)
+        } else {
+            u32::from_be_bytes(a)
+        })
+    };
+    let read_endian_i32 = |buf: &[u8]| -> Result<i32, String> {
+        let a: [u8; 4] = buf
+            .get(0..4)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| "short JEOL i32".to_string())?;
+        Ok(if little_endian {
+            i32::from_le_bytes(a)
+        } else {
+            i32::from_be_bytes(a)
+        })
+    };
+    let read_endian_i16 = |buf: &[u8]| -> Result<i16, String> {
+        let a: [u8; 2] = buf
+            .get(0..2)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| "short JEOL i16".to_string())?;
+        Ok(if little_endian {
+            i16::from_le_bytes(a)
+        } else {
+            i16::from_be_bytes(a)
+        })
+    };
+    let read_endian_f64 = |buf: &[u8]| -> Result<f64, String> {
+        let a: [u8; 8] = buf
+            .get(0..8)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| "short JEOL f64".to_string())?;
+        Ok(if little_endian {
+            f64::from_le_bytes(a)
+        } else {
+            f64::from_be_bytes(a)
+        })
+    };
+
+    let mut x_domain: Option<String> = None;
+    let mut x_freq_hz: Option<f64> = None;
+    let mut x_sweep_hz: Option<f64> = None;
+    let mut x_sweep_clipped_hz: Option<f64> = None;
+    let mut x_offset_val: Option<(f64, u8, i32)> = None;
+    let mut x_points_param: Option<usize> = None;
+    let mut digital_filter_enabled = false;
+    let mut digital_filter_compensated = false;
+    let mut orders_str: Option<String> = None;
+    let mut factors_str: Option<String> = None;
+    let mut trapezoid_gd: Option<f64> = None;
+    let mut solvent: Option<String> = None;
+    let mut pulprog_hint = String::new();
+
+    if param_start >= JEOL_HEADER_BYTES && param_length >= 16 && param_start + 16 <= bytes.len() {
+        let param_end = param_start.saturating_add(param_length).min(bytes.len());
+        if param_end >= param_start + 16 {
+            let hdr_p = &bytes[param_start..param_start + 16];
+            let rec_size = (read_endian_u32(&hdr_p[0..4])? as usize).max(64);
+            let low_idx = read_endian_u32(&hdr_p[4..8])? as usize;
+            let high_idx = read_endian_u32(&hdr_p[8..12])? as usize;
+            let avail_recs = (param_end - (param_start + 16)) / rec_size;
+            let n_recs = if high_idx >= low_idx {
+                (high_idx - low_idx + 1).min(avail_recs).min(16_384)
+            } else {
+                avail_recs.min(16_384)
+            };
+            for r_i in 0..n_recs {
+                let off = param_start + 16 + r_i * rec_size;
+                if off + 64 > param_end {
+                    break;
+                }
+                let rec = &bytes[off..off + 64];
+                let _scaler = read_endian_i16(&rec[4..6])?;
+                let unit_nib = ((rec[6] as i8) >> 4) as i32;
+                let unit_base = rec[7];
+                let vtype = read_endian_u32(&rec[32..36])?;
+                let raw_name = &rec[36..64];
+                let name_end = raw_name
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(raw_name.len());
+                let pname = String::from_utf8_lossy(&raw_name[..name_end])
+                    .trim()
+                    .to_string();
+                if pname.is_empty() {
+                    continue;
+                }
+                let pkey = pname.to_ascii_lowercase();
+
+                let si_scale = if (-8..=8).contains(&unit_nib) {
+                    10.0_f64.powi(-3 * unit_nib)
+                } else {
+                    1.0
+                };
+
+                let as_str_val = || -> Option<String> {
+                    if vtype != 0 {
+                        return None;
+                    }
+                    let vb = &rec[16..32];
+                    let ve = vb.iter().position(|&b| b == 0).unwrap_or(vb.len());
+                    let s = String::from_utf8_lossy(&vb[..ve]).trim().to_string();
+                    (!s.is_empty()).then_some(s)
+                };
+                let as_f64_val = || -> Option<f64> {
+                    let v = match vtype {
+                        1 => read_endian_i32(&rec[16..20]).ok()? as f64,
+                        2 => read_endian_f64(&rec[16..24]).ok()?,
+                        _ => return None,
+                    };
+                    v.is_finite().then_some(v)
+                };
+
+                match pkey.as_str() {
+                    "x_domain" => {
+                        if let Some(s) = as_str_val() {
+                            x_domain = Some(s);
+                        }
+                    }
+                    "x_freq" => {
+                        if let Some(v) = as_f64_val() {
+                            let hz = if unit_base == 13 { v * si_scale } else { v };
+                            if hz.is_finite() && hz > 0.0 {
+                                x_freq_hz = Some(hz);
+                            }
+                        }
+                    }
+                    "x_sweep" => {
+                        if let Some(v) = as_f64_val() {
+                            let hz = if unit_base == 13 { v * si_scale } else { v };
+                            if hz.is_finite() && hz > 0.0 {
+                                x_sweep_hz = Some(hz);
+                            }
+                        }
+                    }
+                    "x_sweep_clipped" => {
+                        if let Some(v) = as_f64_val() {
+                            let hz = if unit_base == 13 { v * si_scale } else { v };
+                            if hz.is_finite() && hz > 0.0 {
+                                x_sweep_clipped_hz = Some(hz);
+                            }
+                        }
+                    }
+                    "x_offset" => {
+                        if let Some(v) = as_f64_val() {
+                            x_offset_val = Some((v, unit_base, unit_nib));
+                        }
+                    }
+                    "x_points" => {
+                        if let Some(v) = as_f64_val() {
+                            if v >= 2.0 && v <= (MAX_1D_INGEST_POINTS as f64) {
+                                x_points_param = Some(v.round() as usize);
+                            }
+                        }
+                    }
+                    "digital_filter" => {
+                        if let Some(s) = as_str_val() {
+                            digital_filter_enabled =
+                                s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("on");
+                        } else if let Some(v) = as_f64_val() {
+                            digital_filter_enabled = v != 0.0;
+                        }
+                    }
+                    "digital_filter_status" => {
+                        if let Some(s) = as_str_val() {
+                            let sl = s.to_ascii_lowercase();
+                            if sl.contains("comp") || sl == "done" || sl == "cp" {
+                                digital_filter_compensated = true;
+                            }
+                        }
+                    }
+                    "orders" => {
+                        orders_str = as_str_val();
+                    }
+                    "factors" => {
+                        factors_str = as_str_val();
+                    }
+                    "trapezoid" => {
+                        if let Some(v) = as_f64_val() {
+                            if v >= 0.0 {
+                                trapezoid_gd = Some(v);
+                            }
+                        } else if let Some(s) = as_str_val() {
+                            if let Some(tok) = s.split_whitespace().next() {
+                                if let Ok(v) = tok.parse::<f64>() {
+                                    if v.is_finite() && v >= 0.0 {
+                                        trapezoid_gd = Some(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "solvent" => {
+                        if let Some(s) = as_str_val() {
+                            if !s.eq_ignore_ascii_case("none") {
+                                solvent = Some(s);
+                            }
+                        }
+                    }
+                    "experiment" | "x_title" | "x_pulse" => {
+                        if let Some(s) = as_str_val() {
+                            if !pulprog_hint.is_empty() {
+                                pulprog_hint.push(' ');
+                            }
+                            pulprog_hint.push_str(&s);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Resolve nucleus & experiment kind (`1H`, `13C`, `19F`, `31P`, `15N`, `DEPT-90`, `DEPT-135`).
+    let x_domain_low = x_domain.as_deref().map(|s| s.to_ascii_lowercase());
+    let nuc_str = match x_domain_low.as_deref() {
+        Some(d) if d.contains("proton") || d == "1h" || d == "h1" => "1H",
+        Some(d) if d.contains("carbon") || d == "13c" || d == "c13" => "13C",
+        Some(d) if d.contains("fluor") || d == "19f" || d == "f19" => "19F",
+        Some(d) if d.contains("phosph") || d == "31p" || d == "p31" => "31P",
+        Some(d) if d.contains("nitro") || d == "15n" || d == "n15" => "15N",
+        Some(other) => other,
+        None => "1H",
+    };
+    let exp = Experiment1DKind::from_pulse_program(&pulprog_hint, nuc_str);
+
+    let obs_mhz = mhz_override
+        .or_else(|| (base_freq_mhz > 0.0).then_some(base_freq_mhz))
+        .or_else(|| x_freq_hz.map(|hz| hz * 1.0e-6))
+        .ok_or_else(|| {
+            format!(
+                "JEOL .jdf {name:?} has missing or non-positive observation frequency (Base_Freq={base_freq_mhz})"
+            )
+        })?;
+    if !obs_mhz.is_finite() || obs_mhz <= 0.0 {
+        return Err(format!(
+            "JEOL .jdf {name:?} resolved invalid observation frequency obs_mhz={obs_mhz}"
+        ));
+    }
+
+    let carrier_ppm = match x_offset_val {
+        Some((v, 26, _)) => v, // PPM
+        Some((v, 13, nib)) => {
+            let mult = if (-8..=8).contains(&nib) {
+                10.0_f64.powi(-3 * nib)
+            } else {
+                1.0
+            };
+            (v * mult) / obs_mhz
+        }
+        Some((v, _, _)) => v,
+        None => {
+            let (lo_d, hi_d) = exp.nucleus().default_ppm_bounds();
+            0.5 * (lo_d + hi_d)
+        }
+    };
+    if !carrier_ppm.is_finite() {
+        return Err(format!(
+            "JEOL .jdf {name:?} has non-finite X_OFFSET carrier_ppm={carrier_ppm}"
+        ));
+    }
+
+    // Decode data section scalars with strict finite checks.
+    let decode_scalar = |byte_off: usize| -> Result<f64, String> {
+        let v = match data_format {
+            1 => {
+                let a: [u8; 8] = bytes
+                    .get(byte_off..byte_off + 8)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| format!("JEOL .jdf f64 read out of bounds at {byte_off}"))?;
+                if little_endian {
+                    f64::from_le_bytes(a)
+                } else {
+                    f64::from_be_bytes(a)
+                }
+            }
+            2 => {
+                let a: [u8; 4] = bytes
+                    .get(byte_off..byte_off + 4)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| format!("JEOL .jdf f32 read out of bounds at {byte_off}"))?;
+                let vf = if little_endian {
+                    f32::from_le_bytes(a)
+                } else {
+                    f32::from_be_bytes(a)
+                };
+                vf as f64
+            }
+            _ => {
+                let a: [u8; 4] = bytes
+                    .get(byte_off..byte_off + 4)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| format!("JEOL .jdf i32 read out of bounds at {byte_off}"))?;
+                let vi = if little_endian {
+                    i32::from_le_bytes(a)
+                } else {
+                    i32::from_be_bytes(a)
+                };
+                vi as f64
+            }
+        };
+        if !v.is_finite() {
+            return Err(format!(
+                "JEOL .jdf {name:?} contains non-finite data value ({v}) at byte offset {byte_off}"
+            ));
+        }
+        Ok(v)
+    };
+
+    let mut re_vec = Vec::with_capacity(valid_len);
+    let mut im_vec = if channels == 2 {
+        Some(Vec::with_capacity(valid_len))
+    } else {
+        None
+    };
+
+    if channels == 1 {
+        for idx in off_start..=off_stop {
+            re_vec.push(decode_scalar(data_start + idx * word_bytes)?);
+        }
+    } else if is_interleaved {
+        for idx in off_start..=off_stop {
+            let base = data_start + idx * 2 * word_bytes;
+            re_vec.push(decode_scalar(base)?);
+            if let Some(ref mut im) = im_vec {
+                im.push(decode_scalar(base + word_bytes)?);
+            }
+        }
+    } else {
+        let imag_base = data_start + n_pts * word_bytes;
+        for idx in off_start..=off_stop {
+            re_vec.push(decode_scalar(data_start + idx * word_bytes)?);
+            if let Some(ref mut im) = im_vec {
+                im.push(decode_scalar(imag_base + idx * word_bytes)?);
+            }
+        }
+    }
+
+    let axis_si = if (-8..=8).contains(&axis_unit_prefix_nib) {
+        10.0_f64.powi(-3 * axis_unit_prefix_nib)
+    } else {
+        1.0
+    };
+    let ax_start = ax_start_raw * axis_si;
+    let ax_stop = ax_stop_raw * axis_si;
+
+    let is_time_domain = match axis_unit_base {
+        28 => true,       // Sec
+        26 | 13 => false, // PPM or Hz
+        _ => ax_start >= 0.0 && ax_stop > ax_start && x_sweep_hz.is_some(),
+    };
+
+    if is_time_domain {
+        let sw_hz = x_sweep_hz
+            .or_else(|| {
+                let dur = ax_stop - ax_start;
+                (dur > 1.0e-12).then(|| ((valid_len - 1) as f64) / dur)
+            })
+            .ok_or_else(|| {
+                format!("JEOL .jdf FID {name:?} missing positive X_SWEEP and valid time duration")
+            })?;
+        if !sw_hz.is_finite() || sw_hz <= 0.0 {
+            return Err(format!(
+                "JEOL .jdf FID {name:?} has invalid spectral width sw_hz={sw_hz}"
+            ));
+        }
+        let mut cplx = Vec::with_capacity(valid_len);
+        if let Some(ref im) = im_vec {
+            for (&r, &m) in re_vec.iter().zip(im.iter()) {
+                cplx.push([r, m]);
+            }
+        } else {
+            for &r in &re_vec {
+                cplx.push([r, 0.0]);
+            }
+        }
+
+        let mut td = TimeDomain1D::new(name.to_string(), exp, sw_hz, obs_mhz, carrier_ppm, cplx);
+        if let Some(xp) = x_points_param {
+            let eff_xp = xp.saturating_sub(off_start).clamp(2, td.data.len());
+            td.active_td = eff_xp;
+        }
+        td.conjugate_for_fft = true;
+        td.solvent = solvent;
+
+        let gd = if digital_filter_enabled && !digital_filter_compensated {
+            match (orders_str.as_deref(), factors_str.as_deref()) {
+                (Some(os), Some(fs)) => compute_jeol_fir_group_delay(os, fs).or(trapezoid_gd),
+                _ => trapezoid_gd,
+            }
+            .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        td.group_delay_pts = gd;
+        compensate_group_delay_1d(&mut td);
+        td.validate()?;
+        Ok(Loaded1DData::TimeDomain(td))
+    } else {
+        // Frequency-domain JEOL `.jdf` (`PPM` = 26 or `Hz` = 13).
+        // Negate JEOL's dispersion `imag` channel so causal Hilbert sign matches `fft_1d`.
+        if let Some(ref mut im) = im_vec {
+            for v in im.iter_mut() {
+                *v = -*v;
+            }
+        }
+        let (mut p_first, mut p_last) = if axis_unit_base == 13 {
+            (
+                carrier_ppm + ax_start / obs_mhz,
+                carrier_ppm + ax_stop / obs_mhz,
+            )
+        } else if (ax_start_raw - ax_stop_raw).abs() > 1.0e-12 {
+            (ax_start_raw, ax_stop_raw)
+        } else if let Some(sw) = x_sweep_clipped_hz.or(x_sweep_hz) {
+            let sw_ppm = sw / obs_mhz;
+            (carrier_ppm + 0.5 * sw_ppm, carrier_ppm - 0.5 * sw_ppm)
+        } else {
+            return Err(format!(
+                "JEOL .jdf spectrum {name:?} has degenerate frequency axis bounds [{ax_start_raw}, {ax_stop_raw}]"
+            ));
+        };
+
+        if !p_first.is_finite() || !p_last.is_finite() || (p_first - p_last).abs() <= 1.0e-12 {
+            return Err(format!(
+                "JEOL .jdf spectrum {name:?} has invalid chemical-shift bounds [{p_first}, {p_last}]"
+            ));
+        }
+        if p_first < p_last {
+            std::mem::swap(&mut p_first, &mut p_last);
+            re_vec.reverse();
+            if let Some(ref mut im) = im_vec {
+                im.reverse();
+            }
+        }
+        let axis = AxisPpm::from_bounds(
+            exp.nucleus().as_str(),
+            re_vec.len(),
+            p_first,
+            p_last,
+            obs_mhz,
+        );
+        let mut spec = Spectrum1D::new(name.to_string(), exp, axis, re_vec, im_vec);
+        spec.solvent = solvent;
+        spec.validate()?;
+        Ok(Loaded1DData::FrequencyDomain(spec))
+    }
+}
+
+/// Load a standalone 1D NMR dataset from an in-memory byte slice (`JEOL .jdf`, `JCAMP-DX`,
+/// `JSON`, or 2-/3-column `TSV`/`CSV`, hardened per `F15` & `F29`).
+pub fn load_1d_from_bytes(
+    name: &str,
+    bytes: &[u8],
+    mhz_override: Option<f64>,
+    _prefer_fid: bool,
+) -> Result<Loaded1DData, String> {
+    if let Some(m) = mhz_override {
+        if !m.is_finite() || m <= 0.0 {
+            return Err(format!("invalid mhz_override={m} (must be finite and > 0)"));
+        }
+    }
+    if (bytes.len() as u64) > MAX_1D_INGEST_BYTES {
+        return Err(format!(
+            "1D input {name:?} ({} bytes) exceeds MAX_1D_INGEST_BYTES ({MAX_1D_INGEST_BYTES})",
+            bytes.len()
+        ));
+    }
+
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let stem = name.rsplit_once('/').map(|(_, f)| f).unwrap_or(name);
+    let stem = stem.rsplit_once('.').map(|(s, _)| s).unwrap_or(stem);
+
+    if ext == "jdf" || is_jeol_jdf_magic(bytes) {
+        return parse_jeol_jdf_1d_bytes(stem, bytes, mhz_override);
+    }
+
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| format!("failed to decode 1D text input {name:?} as UTF-8: {e}"))?;
+
+    if ext == "json" {
+        return parse_json_1d_str(text, mhz_override).map_err(|e| format!("{e} ({name})"));
+    }
+
+    if ext == "jdx" || ext == "dx" || ext == "jcamp" || text.trim_start().starts_with("##TITLE=") {
+        let blocks = crate::octet_analyt::jcamp_spec1d::read_jcamp(text)?;
+        let first = blocks
+            .first()
+            .ok_or_else(|| format!("JCAMP-DX file {name:?} contained zero spectrum blocks"))?;
+        if first.y.len() < 2 {
+            return Err(format!(
+                "JCAMP-DX file {name:?} contains fewer than 2 points"
+            ));
+        }
+        let nuc_str = first.nucleus.as_deref().unwrap_or("1H");
+        let exp = Experiment1DKind::from_pulse_program("", nuc_str);
+        let mhz = mhz_override.or(first.mhz).unwrap_or(500.0);
+        if !mhz.is_finite() || mhz <= 0.0 {
+            return Err(format!("invalid JCAMP-DX observation frequency mhz={mhz}"));
+        }
+        let mut xs = first.x_axis();
+        let mut ys = first.y.clone();
+        if xs.first().copied().unwrap_or(0.0) < xs.last().copied().unwrap_or(0.0) {
+            xs.reverse();
+            ys.reverse();
+        }
+        let high_ppm = xs[0];
+        let low_ppm = *xs.last().unwrap_or(&high_ppm);
+        if !high_ppm.is_finite() || !low_ppm.is_finite() || (high_ppm - low_ppm).abs() <= 1e-12 {
+            return Err(format!(
+                "JCAMP-DX file {name:?} has invalid x-axis bounds [{low_ppm}, {high_ppm}]"
+            ));
+        }
+        let axis = AxisPpm::from_bounds(exp.nucleus().as_str(), ys.len(), high_ppm, low_ppm, mhz);
+        let title = if first.title.trim().is_empty() {
+            stem.to_string()
+        } else {
+            first.title.clone()
+        };
+        let mut spec = Spectrum1D::new(title, exp, axis, ys, None);
+        spec.solvent = first.solvent.clone();
+        spec.validate()?;
+        return Ok(Loaded1DData::FrequencyDomain(spec));
+    }
+
+    parse_tsv_1d_str(text, stem, mhz_override).map_err(|e| format!("{e} ({name})"))
+}
+
 /// Load a 1D time-domain FID or processed spectrum from a Bruker `fid`/`pdata` directory,
-/// `JCAMP-DX` (`.jdx`/`.dx`), JSON (`Spectrum1D`/`TimeDomain1D`), or 2-/3-column TSV file (`F15`).
+/// JEOL Delta `.jdf` file, `JCAMP-DX` (`.jdx`/`.dx`), JSON (`Spectrum1D`/`TimeDomain1D`),
+/// or 2-/3-column TSV file (`F15` & `F29`).
 pub fn load_1d_input(
     path: &std::path::Path,
     mhz_override: Option<f64>,
@@ -5646,6 +6941,14 @@ pub fn load_1d_input(
         .unwrap_or("spectrum_1d");
 
     if path.is_dir() {
+        let read_bruker_solvent_opt = |d: &std::path::Path| -> Option<String> {
+            let acqus_txt = std::fs::read_to_string(d.join("acqus"))
+                .or_else(|_| std::fs::read_to_string(d.join("acqu")))
+                .ok()?;
+            let solv = find_jcamp_param(&acqus_txt, "SOLVENT")?;
+            let sc = solv.trim_matches(['<', '>', '"', ' ']).trim();
+            (!sc.is_empty() && !sc.eq_ignore_ascii_case("none")).then(|| sc.to_string())
+        };
         let fid_file = path.join("fid");
         if prefer_fid && fid_file.is_file() {
             let fid1d = crate::fid::read_bruker_fid_1d(path)?;
@@ -5653,6 +6956,7 @@ pub fn load_1d_input(
             if let Some(m) = mhz_override {
                 td.obs_mhz = m;
             }
+            td.solvent = read_bruker_solvent_opt(path);
             td.validate()?;
             return Ok(Loaded1DData::TimeDomain(td));
         }
@@ -5665,6 +6969,7 @@ pub fn load_1d_input(
             if let Some(m) = mhz_override {
                 td.obs_mhz = m;
             }
+            td.solvent = read_bruker_solvent_opt(path);
             td.validate()?;
             return Ok(Loaded1DData::TimeDomain(td));
         }
@@ -5684,62 +6989,11 @@ pub fn load_1d_input(
         ));
     }
 
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    let text = std::fs::read_to_string(path)
+    let bytes = std::fs::read(path)
         .map_err(|e| format!("failed to read 1D input {}: {e}", path.display()))?;
-
-    if ext == "json" {
-        return parse_json_1d_str(&text, mhz_override)
-            .map_err(|e| format!("{} ({})", e, path.display()));
-    }
-
-    if ext == "jdx" || ext == "dx" || ext == "jcamp" || text.trim_start().starts_with("##TITLE=") {
-        let blocks = crate::octet_analyt::jcamp_spec1d::read_jcamp(&text)?;
-        let first = blocks.first().ok_or_else(|| {
-            format!(
-                "JCAMP-DX file {} contained zero spectrum blocks",
-                path.display()
-            )
-        })?;
-        if first.y.len() < 2 {
-            return Err(format!(
-                "JCAMP-DX file {} contains fewer than 2 points",
-                path.display()
-            ));
-        }
-        let nuc_str = first.nucleus.as_deref().unwrap_or("1H");
-        let exp = Experiment1DKind::from_pulse_program("", nuc_str);
-        let mhz = mhz_override.or(first.mhz).unwrap_or(500.0);
-        if !mhz.is_finite() || mhz <= 0.0 {
-            return Err(format!("invalid JCAMP-DX observation frequency mhz={mhz}"));
-        }
-        let mut xs = first.x_axis();
-        let mut ys = first.y.clone();
-        if xs.first().copied().unwrap_or(0.0) < xs.last().copied().unwrap_or(0.0) {
-            xs.reverse();
-            ys.reverse();
-        }
-        let high_ppm = xs[0];
-        let low_ppm = *xs.last().unwrap_or(&high_ppm);
-        if !high_ppm.is_finite() || !low_ppm.is_finite() || (high_ppm - low_ppm).abs() <= 1e-12 {
-            return Err(format!(
-                "JCAMP-DX file {} has invalid x-axis bounds [{low_ppm}, {high_ppm}]",
-                path.display()
-            ));
-        }
-        let axis = AxisPpm::from_bounds(exp.nucleus().as_str(), ys.len(), high_ppm, low_ppm, mhz);
-        let mut spec = Spectrum1D::new(first.title.clone(), exp, axis, ys, None);
-        spec.solvent = first.solvent.clone();
-        spec.validate()?;
-        return Ok(Loaded1DData::FrequencyDomain(spec));
-    }
-
-    parse_tsv_1d_str(&text, name, mhz_override).map_err(|e| format!("{e} ({})", path.display()))
+    let disp_name = path.file_name().and_then(|s| s.to_str()).unwrap_or(name);
+    load_1d_from_bytes(disp_name, &bytes, mhz_override, prefer_fid)
+        .map_err(|e| format!("{e} ({})", path.display()))
 }
 
 /// Load a processed 1D spectrum from Bruker `pdata` (`procs` + `1r`), `JCAMP-DX`, JSON, TSV, or
@@ -6062,8 +7316,7 @@ pub fn load_1d_from_virtual_entries(
             if let Some(solv) = find_jcamp_param(&acqus_txt, "SOLVENT") {
                 let sc = solv.trim_matches(['<', '>', '"', ' ']).trim();
                 if !sc.is_empty() && !sc.eq_ignore_ascii_case("none") {
-                    // Carry solvent tag onto spectrum during studio preparation via name/metadata if needed
-                    let _ = sc;
+                    td.solvent = Some(sc.to_string());
                 }
             }
             td.validate()?;
@@ -6091,7 +7344,7 @@ pub fn load_1d_from_virtual_entries(
         results.push(item);
     }
 
-    // 3. Standalone 1D files (`.jdx`/`.dx`/`.jcamp`, 1D `.json`, 1D `.tsv`/`.csv`)
+    // 3. Standalone 1D files (JEOL `.jdf`, `.jdx`/`.dx`/`.jcamp`, 1D `.json`, 1D `.tsv`/`.csv`)
     for (rel, slot, from_arch) in &flat_refs {
         if consumed_files.contains(rel) {
             continue;
@@ -6106,6 +7359,13 @@ pub fn load_1d_from_virtual_entries(
             .rsplit_once('.')
             .map(|(_, e)| e.to_ascii_lowercase())
             .unwrap_or_default();
+
+        if ext == "jdf" || is_jeol_jdf_magic(bytes) {
+            let stem = fname.rsplit_once('.').map(|(s, _)| s).unwrap_or(fname);
+            let loaded = parse_jeol_jdf_1d_bytes(stem, bytes, mhz_override)?;
+            results.push(loaded);
+            continue;
+        }
 
         let is_candidate_text = matches!(
             ext.as_str(),

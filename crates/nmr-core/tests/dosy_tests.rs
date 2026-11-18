@@ -667,3 +667,149 @@ fn adversarial_dosy_error_paths_reject_corrupted_inputs() {
     assert!(DosySolvent::D2O.viscosity_pa_s(-10.0).is_err());
     assert!(PowerLawCalibration::fit_from_standards(&[(300.0, 4.0e-10)]).is_err());
 }
+
+#[test]
+fn f29_bruker_oneshot_b_factor_water_skirt_mask_and_published_d_ref_corpus() {
+    use nmr_core::dosy::{
+        effective_diffusion_time_oneshot_s, is_in_dosy_d2o_water_skirt,
+        lookup_published_dosy_d_ref, pick_dosy_peaks_1d, published_dosy_d_ref_corpus,
+        DosyPeakPickConfig, DEFAULT_DOSY_D2O_WATER_EXCLUSION_PPM,
+    };
+    use nmr_core::nmr1d::{
+        apply_apodization_1d, fft_1d, synthesize_fid_1d, zero_fill_pow2_1d, Apodization1D,
+        Experiment1DKind, SyntheticLine1D,
+    };
+
+    // 1. Bruker Pelta et al. (2002) `<gdp_dosyoneshot_tlg>` Oneshot recognition (`2 * P30` bipolar + alpha = 0.2)
+    let difflist = "5.35\n15.0\n28.5\n42.8\n53.5\n";
+    let mut d_arr = ["0.0"; 32];
+    d_arr[16] = "0.0002";
+    d_arr[20] = "0.08";
+    let mut p_arr = ["0.0"; 32];
+    p_arr[1] = "8.58";
+    p_arr[30] = "1100.0"; // half-bipolar lobe -> little_delta = 2.2 ms (NOT monopolar 1.1 ms!)
+    let mut cnst_arr = ["1.0"; 32]; // Bruker fills unused CNST slots with 1.0!
+    cnst_arr[14] = "0.2";
+    cnst_arr[15] = "1.2";
+    cnst_arr[16] = "0.8";
+    cnst_arr[17] = "0.00021716";
+    let mut gpnam_arr = ["<SINE.100>"; 8];
+    gpnam_arr[0] = "<>";
+
+    let acqus_oneshot = format!(
+        "##TITLE= Oneshot DOSY\n\
+         ##$PULPROG= <gdp_dosyoneshot_tlg>\n\
+         ##$NUC1= <1H>\n\
+         ##$CNST= (0..31)\n{}\n\
+         ##$D= (0..31)\n{}\n\
+         ##$P= (0..31)\n{}\n\
+         ##$GPNAM= (0..7)\n{}\n\
+         ##END=\n",
+        cnst_arr.join(" "),
+        d_arr.join(" "),
+        p_arr.join(" "),
+        gpnam_arr.join(" "),
+    );
+
+    let os_params = parse_bruker_dosy(&acqus_oneshot, difflist, &BrukerDosyOverrides::default())
+        .expect("parse Oneshot DOSY");
+    assert_eq!(os_params.sequence_type, DosySequenceType::BppLed);
+    assert_eq!(os_params.gradient_shape, GradientShape::SineBell);
+    assert!(
+        (os_params.little_delta_s - 0.0022).abs() < 1e-12,
+        "Oneshot must use bipolar 2 * P30 = 2.2 ms, got {}",
+        os_params.little_delta_s
+    );
+    assert!((os_params.oneshot_alpha - 0.2).abs() < 1e-12);
+    assert!((os_params.tau_s - 0.000_217_16).abs() < 1e-10);
+
+    // Compare against the buggy monopolar STE b-values (`4x` under-scaled!)
+    let monopolar_b = compute_b_values_s_m2(
+        &os_params.gradients_g_per_cm,
+        DosyNucleus::H1,
+        DosySequenceType::Ste,
+        GradientShape::SineBell,
+        0.08,
+        0.0011,
+        0.0,
+    )
+    .unwrap();
+    let ratio = os_params.b_values_s_m2[4] / monopolar_b[4];
+    assert!(
+        (ratio - 3.98).abs() < 0.05,
+        "Oneshot bipolar b-factor must fix ~4x monopolar under-scaling, got ratio {ratio:.4}"
+    );
+
+    // Also check Bruker pulse-program `CNST[19] = 0.2` Oneshot variant and `alpha = 0` fallback
+    let mut cnst19_arr = ["1.0"; 32];
+    cnst19_arr[19] = "0.2";
+    let acqus_c19 = format!(
+        "##$PULPROG= <stebpgp1s19_oneshot>\n##$NUC1= <1H>\n##$CNST= (0..31)\n{}\n##$D= (0..31)\n{}\n##$P= (0..31)\n{}\n##$GPNAM= (0..7)\n{}\n",
+        cnst19_arr.join(" "),
+        d_arr.join(" "),
+        p_arr.join(" "),
+        gpnam_arr.join(" ")
+    );
+    let c19_params =
+        parse_bruker_dosy(&acqus_c19, difflist, &BrukerDosyOverrides::default()).unwrap();
+    assert!((c19_params.oneshot_alpha - 0.2).abs() < 1e-12);
+
+    let alpha0_deff =
+        effective_diffusion_time_oneshot_s(GradientShape::SineBell, 0.08, 0.0022, 0.0002, 0.0)
+            .unwrap();
+    let bppled_deff =
+        effective_diffusion_time_s(DosySequenceType::BppLed, 0.08, 0.0022, 0.0002).unwrap();
+    assert!((alpha0_deff - bppled_deff).abs() < 1e-15);
+    assert!(
+        effective_diffusion_time_oneshot_s(GradientShape::SineBell, 0.08, 0.0022, 0.0002, 1.0)
+            .is_err()
+    );
+
+    // 2. Widened `[4.50, 4.98] ppm` D2O water-skirt exclusion suppresses `4.56..4.59 ppm` ripples
+    assert_eq!(DEFAULT_DOSY_D2O_WATER_EXCLUSION_PPM, (4.50, 4.98));
+    assert!(is_in_dosy_d2o_water_skirt(4.57));
+    assert!(is_in_dosy_d2o_water_skirt(4.96));
+    assert!(!is_in_dosy_d2o_water_skirt(4.45));
+
+    let plane_lines = [
+        SyntheticLine1D::lorentzian(4.79, 80.0, 2.5), // HDO center
+        SyntheticLine1D::lorentzian(4.57, 4.0, 1.5),  // 4.57 ppm water-skirt ripple!
+        SyntheticLine1D::lorentzian(3.65, 12.0, 1.4), // Solute peak A
+        SyntheticLine1D::lorentzian(1.48, 15.0, 1.4), // Solute peak B
+    ];
+    let mut fid_plane = synthesize_fid_1d(
+        "dosy_plane0",
+        Experiment1DKind::Proton1D,
+        4096,
+        5000.0,
+        500.0,
+        4.70,
+        &plane_lines,
+    );
+    apply_apodization_1d(
+        &mut fid_plane,
+        Apodization1D::Exponential { lb_hz: 1.0 },
+        0.5,
+    );
+    zero_fill_pow2_1d(&mut fid_plane, 2);
+    let spec_plane = fft_1d(&fid_plane);
+    let picked = pick_dosy_peaks_1d(&spec_plane, &DosyPeakPickConfig::default());
+    assert_eq!(
+        picked.len(),
+        2,
+        "expected only 2 solute peaks outside [4.50, 4.98], got {picked:?}"
+    );
+    assert!(picked.iter().all(|p| !(4.50..=4.98).contains(&p.ppm)));
+
+    // 3. Clean-room published literature `D_ref` corpus check
+    let corpus = published_dosy_d_ref_corpus();
+    assert!(corpus.len() >= 16);
+    let hdo = lookup_published_dosy_d_ref("HDO", Some(DosySolvent::D2O)).unwrap();
+    let glc = lookup_published_dosy_d_ref("D-Glucose", Some(DosySolvent::D2O)).unwrap();
+    let tms = lookup_published_dosy_d_ref("TMS", Some(DosySolvent::CDCl3)).unwrap();
+    let quin = lookup_published_dosy_d_ref("Quinine", Some(DosySolvent::DmsoD6)).unwrap();
+    assert!((hdo.d_ref_m2_s - 1.902e-9).abs() < 1e-12);
+    assert!((glc.d_ref_m2_s - 5.45e-10).abs() < 1e-12);
+    assert!((tms.d_ref_m2_s - 2.25e-9).abs() < 1e-12);
+    assert!((quin.d_ref_m2_s - 2.28e-10).abs() < 1e-12);
+}

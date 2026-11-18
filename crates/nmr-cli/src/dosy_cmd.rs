@@ -34,7 +34,7 @@ use nmr_core::dosy::{
     DosyFitConfig, DosyNucleus, DosySequenceType, DosySolvent, GradientShape, HydrodynamicEstimate,
     IltConfig, IltLambdaStrategy, IltModePeak, IltSweepPoint, ModelSelectionCriterion,
     PowerLawCalibration, SoluteCompactnessClass, TikhonovRegularizer, VarianDosyOverrides,
-    ILT_ARTIFACT_CAVEAT,
+    DEFAULT_DOSY_D2O_WATER_EXCLUSION_PPM, ILT_ARTIFACT_CAVEAT,
 };
 use nmr_core::rng::Rng;
 use nmr_gpu::dosy_gpu::{fit_dosy_columns_gpu, DosyGpuColumnFit};
@@ -322,6 +322,7 @@ struct DosyCliPhysArgs {
     little_delta_s: Option<f64>,
     tau_s: Option<f64>,
     dac_to_gcm: Option<f64>,
+    oneshot_alpha: Option<f64>,
 }
 
 impl Default for DosyCliPhysArgs {
@@ -336,6 +337,7 @@ impl Default for DosyCliPhysArgs {
             little_delta_s: None,
             tau_s: None,
             dac_to_gcm: None,
+            oneshot_alpha: None,
         }
     }
 }
@@ -369,6 +371,7 @@ impl DosyCliPhysArgs {
                 little_delta_s: self.little_delta_s,
                 tau_s: self.tau_s,
                 gpnam_index: None,
+                oneshot_alpha: self.oneshot_alpha,
             };
             return read_bruker_dosy_dir(dir, &ovr)
                 .map(|p| p.b_values_s_m2)
@@ -815,6 +818,7 @@ fn run_dosy_fit(args: &[String]) -> Result<(), String> {
     let mut solvent = DosySolvent::D2O;
     let mut temp_k = 298.15_f64;
     let mut comp_class = SoluteCompactnessClass::SmallMolecule;
+    let mut exclude_ppm_regions: Vec<(f64, f64)> = Vec::new();
 
     let mut i = 0usize;
     while i < args.len() {
@@ -903,6 +907,39 @@ fn run_dosy_fit(args: &[String]) -> Result<(), String> {
                         .parse()
                         .map_err(|_| "invalid --dac-to-gcm")?,
                 );
+            }
+            "--oneshot-alpha" => {
+                i += 1;
+                phys.oneshot_alpha = Some(
+                    args.get(i)
+                        .ok_or("missing --oneshot-alpha")?
+                        .parse()
+                        .map_err(|_| "invalid --oneshot-alpha")?,
+                );
+            }
+            "--exclude-water" => {
+                exclude_ppm_regions.push(DEFAULT_DOSY_D2O_WATER_EXCLUSION_PPM);
+            }
+            "--exclude-ppm" => {
+                i += 1;
+                let spec = args.get(i).ok_or("missing --exclude-ppm")?;
+                for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let (a_s, b_s) = item.split_once(':').ok_or_else(|| {
+                        format!("--exclude-ppm expects `<lo>:<hi>`, got {item:?}")
+                    })?;
+                    let a: f64 = a_s
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("invalid ppm bound in --exclude-ppm {item:?}"))?;
+                    let b: f64 = b_s
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("invalid ppm bound in --exclude-ppm {item:?}"))?;
+                    if !a.is_finite() || !b.is_finite() {
+                        return Err("--exclude-ppm bounds must be finite".to_string());
+                    }
+                    exclude_ppm_regions.push((a.min(b), a.max(b)));
+                }
             }
             "--engine" => {
                 i += 1;
@@ -1028,7 +1065,20 @@ fn run_dosy_fit(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
-    let (b_vals, peaks) = load_dosy_dataset(in_path.as_deref(), demo, &phys)?;
+    let (b_vals, mut peaks) = load_dosy_dataset(in_path.as_deref(), demo, &phys)?;
+    if !exclude_ppm_regions.is_empty() {
+        peaks.retain(|pk| {
+            !exclude_ppm_regions
+                .iter()
+                .any(|&(lo, hi)| pk.center_ppm >= lo && pk.center_ppm <= hi)
+        });
+        if peaks.is_empty() {
+            return Err(
+                "zero DOSY peaks remained after applying --exclude-water / --exclude-ppm"
+                    .to_string(),
+            );
+        }
+    }
     let viscosity_pa_s = solvent.viscosity_pa_s(temp_k).map_err(|e| e.to_string())?;
 
     // Optional WebGPU parallel K=1..2 column solver
@@ -1259,6 +1309,7 @@ fn run_dosy_ilt(args: &[String]) -> Result<(), String> {
     let mut solvent = DosySolvent::D2O;
     let mut temp_k = 298.15_f64;
     let mut comp_class = SoluteCompactnessClass::SmallMolecule;
+    let mut exclude_ppm_regions: Vec<(f64, f64)> = Vec::new();
 
     let mut i = 0usize;
     while i < args.len() {
@@ -1344,6 +1395,39 @@ fn run_dosy_ilt(args: &[String]) -> Result<(), String> {
                         .parse()
                         .map_err(|_| "invalid --tau-s")?,
                 );
+            }
+            "--oneshot-alpha" => {
+                i += 1;
+                phys.oneshot_alpha = Some(
+                    args.get(i)
+                        .ok_or("missing --oneshot-alpha")?
+                        .parse()
+                        .map_err(|_| "invalid --oneshot-alpha")?,
+                );
+            }
+            "--exclude-water" => {
+                exclude_ppm_regions.push(DEFAULT_DOSY_D2O_WATER_EXCLUSION_PPM);
+            }
+            "--exclude-ppm" => {
+                i += 1;
+                let spec = args.get(i).ok_or("missing --exclude-ppm")?;
+                for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let (a_s, b_s) = item.split_once(':').ok_or_else(|| {
+                        format!("--exclude-ppm expects `<lo>:<hi>`, got {item:?}")
+                    })?;
+                    let a: f64 = a_s
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("invalid ppm bound in --exclude-ppm {item:?}"))?;
+                    let b: f64 = b_s
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("invalid ppm bound in --exclude-ppm {item:?}"))?;
+                    if !a.is_finite() || !b.is_finite() {
+                        return Err("--exclude-ppm bounds must be finite".to_string());
+                    }
+                    exclude_ppm_regions.push((a.min(b), a.max(b)));
+                }
             }
             "--strategy" => {
                 i += 1;
@@ -1488,7 +1572,20 @@ fn run_dosy_ilt(args: &[String]) -> Result<(), String> {
         }
     };
 
-    let (b_vals, peaks) = load_dosy_dataset(in_path.as_deref(), demo, &phys)?;
+    let (b_vals, mut peaks) = load_dosy_dataset(in_path.as_deref(), demo, &phys)?;
+    if !exclude_ppm_regions.is_empty() {
+        peaks.retain(|pk| {
+            !exclude_ppm_regions
+                .iter()
+                .any(|&(lo, hi)| pk.center_ppm >= lo && pk.center_ppm <= hi)
+        });
+        if peaks.is_empty() {
+            return Err(
+                "zero DOSY peaks remained after applying --exclude-water / --exclude-ppm"
+                    .to_string(),
+            );
+        }
+    }
     eprintln!("note: [dosy-ilt] {ILT_ARTIFACT_CAVEAT}");
 
     let mut tsv = format!(
