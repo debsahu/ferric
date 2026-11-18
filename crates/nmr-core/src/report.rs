@@ -101,6 +101,9 @@ pub struct ReportInput {
     /// Optional multi-medium Residual Dipolar Coupling (`RDC`) Saupe tensor fit and
     /// Cornilescu `Q` / `Q_free` `D_calc` vs `D_obs` validation report.
     pub rdc_report: Option<crate::rdc::RdcValidationSummary>,
+    /// Optional AlphaFold vs Solution NMR secondary-structure & Fowler–Sljoka–Williamson rigidity
+    /// concordance report (`T21.1`, rendered as `#section-af-concordance` when `Some`).
+    pub af_concordance_report: Option<crate::af_concordance::AfConcordanceReport>,
     /// Optional 3D `{sign, fold}` indirect-axis likelihood verification provenance records (`13.3:P1-1`).
     pub axis_rescue_records: Vec<crate::process::AxisRescueAuditRecord>,
 }
@@ -129,6 +132,7 @@ impl ReportInput {
             structure_summary: None,
             propensity_report: None,
             rdc_report: None,
+            af_concordance_report: None,
             axis_rescue_records: Vec::new(),
         }
     }
@@ -143,6 +147,14 @@ impl ReportInput {
 
     pub fn with_rdc_report(mut self, report: crate::rdc::RdcValidationSummary) -> Self {
         self.rdc_report = Some(report);
+        self
+    }
+
+    pub fn with_af_concordance_report(
+        mut self,
+        report: crate::af_concordance::AfConcordanceReport,
+    ) -> Self {
+        self.af_concordance_report = Some(report);
         self
     }
 }
@@ -856,6 +868,43 @@ pub fn generate_quality_report_html(input: &ReportInput) -> String {
             html.push_str("</tbody>\n</table>\n</div>\n");
         }
         html.push_str("</section>\n");
+    }
+
+    if let Some(ref af_rep) = input.af_concordance_report {
+        let svg_af = render_af_concordance_svg(af_rep);
+        html.push_str("<section class=\"panel\" id=\"section-af-concordance\">\n");
+        html.push_str(
+            "<h2>4c. AlphaFold 3D Secondary Structure &amp; Solution NMR Rigidity Concordance</h2>\n",
+        );
+        let summary_caption = match &af_rep.summary {
+            crate::af_concordance::ConcordanceSummary::Evaluated {
+                n_eval,
+                spearman_rho_s,
+                c_corr_score,
+                rmsd_rigidity,
+                c_rmsd_score,
+            } => format!(
+                "Fowler&ndash;Sljoka&ndash;Williamson solution rigidity validation (n = {n_eval}) &bull; Spearman <strong>&rho;<sub>s</sub> = {spearman_rho_s:.3}</strong> (C<sub>corr</sub> = {c_corr_score:.1}) &bull; Rigidity <strong>RMSD = {rmsd_rigidity:.3}</strong> (C<sub>rmsd</sub> = {c_rmsd_score:.1}) &bull; Ordered = {}, Disordered = {}, Conditional/Artifact = {}, Hinge/Alt = {} &bull; HomologFirewall SHA-256 = <code>{}</code>.",
+                af_rep.n_concordant_ordered,
+                af_rep.n_concordant_disordered,
+                af_rep.n_conditional_folding,
+                af_rep.n_dynamic_hinge_or_alt,
+                escape_xml(&af_rep.exclusion_list_sha256[..af_rep.exclusion_list_sha256.len().min(12)]),
+            ),
+            crate::af_concordance::ConcordanceSummary::InsufficientCoverage { n_eval, reason } => {
+                format!(
+                    "Insufficient quantitative rigidity coverage (n = {n_eval}): {} &bull; HomologFirewall SHA-256 = <code>{}</code>.",
+                    escape_xml(reason),
+                    escape_xml(&af_rep.exclusion_list_sha256[..af_rep.exclusion_list_sha256.len().min(12)]),
+                )
+            }
+        };
+        html.push_str(&format!(
+            "<p class=\"panel-caption\">{summary_caption}</p>\n"
+        ));
+        html.push_str("<div class=\"svg-wrap\">");
+        html.push_str(&svg_af);
+        html.push_str("</div>\n</section>\n");
     }
 
     // 7. Chemical Shift Summary Table
@@ -2118,6 +2167,247 @@ pub fn render_rdc_validation_svg(summary: &crate::rdc::RdcValidationSummary) -> 
         pad_t + 0.5 * plot_h,
         pad_t + 0.5 * plot_h
     ));
+    svg.push_str("</svg>\n");
+    svg
+}
+
+/// Render a zero-emoji inline vector SVG panel displaying:
+/// 1. 3D Kabsch–Sander 4-state secondary structure (`Helix`, `Sheet`, `Ppii`, `Coil`),
+/// 2. Dual rigidity profile ($\hat{S}^2_{\text{AF}}$ from `pLDDT` vs experimental $S^2_{\text{exp}}$), and
+/// 3. 4-class color-vision-safe per-residue concordance strip (`AfNmrConcordanceClass`).
+pub fn render_af_concordance_svg(rep: &crate::af_concordance::AfConcordanceReport) -> String {
+    use crate::af_concordance::AfNmrConcordanceClass;
+    use crate::kabsch_sander_ss::SecondaryStructure4;
+
+    let n = rep.residues.len().max(1);
+    let pad_l = 56.0_f64;
+    let pad_r = 24.0_f64;
+    let cell_w = (820.0_f64 / (n as f64)).clamp(4.5, 16.0);
+    let plot_w = cell_w * (n as f64);
+    let width = pad_l + plot_w + pad_r;
+    let height = 258.0_f64;
+
+    let y_ss_top = 34.0_f64;
+    let ss_h = 20.0_f64;
+    let y_rig_top = 68.0_f64;
+    let rig_h = 122.0_f64;
+    let y_conc_top = 204.0_f64;
+    let conc_h = 20.0_f64;
+
+    let mut svg = String::with_capacity(12_288);
+    svg.push_str(&format!(
+        "<svg id=\"svg-af-concordance\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width:.0} {height:.0}\" width=\"100%\" role=\"img\" aria-label=\"AlphaFold versus solution NMR rigidity concordance\">\n"
+    ));
+
+    // Legend bar (strictly ASCII / HTML-escaped, zero emojis)
+    let legend = [
+        ("#16A34A", "ConcordantOrdered"),
+        ("#64748B", "ConcordantDisordered"),
+        ("#D97706", "ConditionalFolding/Artifact"),
+        ("#DC2626", "DynamicHinge/AltState"),
+        ("#0053D6", "S2_AF(pLDDT)"),
+        ("#0F172A", "S2_exp(NMR)"),
+    ];
+    let mut lx = pad_l;
+    for (col, lbl) in legend {
+        svg.push_str(&format!(
+            "<rect x=\"{lx:.1}\" y=\"8\" width=\"10\" height=\"10\" rx=\"2\" fill=\"{col}\"/>\n\
+             <text x=\"{:.1}\" y=\"17\" font-size=\"9.5\" fill=\"#334155\">{}</text>\n",
+            lx + 13.0,
+            escape_xml(lbl)
+        ));
+        lx += 136.0;
+    }
+
+    // Track 1: 3D Kabsch-Sander 4-State Ribbon
+    svg.push_str(&format!(
+        "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"9.5\" font-weight=\"600\" fill=\"#334155\" text-anchor=\"end\">3D SS</text>\n\
+         <line x1=\"{pad_l:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"#94A3B8\" stroke-width=\"1.4\"/>\n",
+        pad_l - 6.0,
+        y_ss_top + 13.5,
+        y_ss_top + 0.5 * ss_h,
+        pad_l + plot_w,
+        y_ss_top + 0.5 * ss_h
+    ));
+    for (i, r) in rep.residues.iter().enumerate() {
+        let x = pad_l + (i as f64) * cell_w;
+        match r.state4_af {
+            SecondaryStructure4::Helix => {
+                svg.push_str(&format!(
+                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"3\" fill=\"#E05A47\"/>\n",
+                    x + 0.3,
+                    y_ss_top + 2.0,
+                    (cell_w - 0.6).max(1.0),
+                    ss_h - 4.0
+                ));
+            }
+            SecondaryStructure4::Sheet => {
+                let is_c_term = rep
+                    .residues
+                    .get(i + 1)
+                    .is_none_or(|nx| nx.state4_af != SecondaryStructure4::Sheet);
+                if is_c_term && cell_w >= 4.0 {
+                    let x0 = x + 0.2;
+                    let x_tip = x + cell_w - 0.2;
+                    let xm = x0 + 0.55 * (x_tip - x0);
+                    let ym = y_ss_top + 0.5 * ss_h;
+                    svg.push_str(&format!(
+                        "<polygon points=\"{x0:.1},{:.1} {xm:.1},{:.1} {xm:.1},{:.1} {x_tip:.1},{ym:.1} {xm:.1},{:.1} {xm:.1},{:.1} {x0:.1},{:.1}\" fill=\"#2A9D8F\"/>\n",
+                        y_ss_top + 5.0,
+                        y_ss_top + 5.0,
+                        y_ss_top + 1.5,
+                        y_ss_top + ss_h - 1.5,
+                        y_ss_top + ss_h - 5.0,
+                        y_ss_top + ss_h - 5.0
+                    ));
+                } else {
+                    svg.push_str(&format!(
+                        "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"#2A9D8F\"/>\n",
+                        x + 0.2,
+                        y_ss_top + 5.0,
+                        (cell_w - 0.4).max(1.0),
+                        ss_h - 10.0
+                    ));
+                }
+            }
+            SecondaryStructure4::Ppii => {
+                let cx = x + 0.5 * cell_w;
+                let cy = y_ss_top + 0.5 * ss_h;
+                let d = (0.42 * cell_w).clamp(2.2, 5.0);
+                svg.push_str(&format!(
+                    "<polygon points=\"{cx:.1},{:.1} {:.1},{cy:.1} {cx:.1},{:.1} {:.1},{cy:.1}\" fill=\"#7B61FF\"/>\n",
+                    cy - d,
+                    cx + d,
+                    cy + d,
+                    cx - d
+                ));
+            }
+            SecondaryStructure4::Coil => {}
+        }
+    }
+
+    // Track 2: Dual Rigidity Curves (`S2_AF` vs `S2_exp` in `[0, 1]`)
+    svg.push_str(&format!(
+        "<rect x=\"{pad_l:.1}\" y=\"{y_rig_top:.1}\" width=\"{plot_w:.1}\" height=\"{rig_h:.1}\" fill=\"#F8FAFC\" stroke=\"#CBD5E1\" stroke-width=\"1\"/>\n"
+    ));
+    for tick in [0.0_f64, 0.5, 0.65, 1.0] {
+        let ty = y_rig_top + (1.0 - tick) * rig_h;
+        let dash = if (tick - 0.65).abs() < 1.0e-3 {
+            " stroke-dasharray=\"4,3\""
+        } else {
+            ""
+        };
+        svg.push_str(&format!(
+            "<line x1=\"{pad_l:.1}\" y1=\"{ty:.1}\" x2=\"{:.1}\" y2=\"{ty:.1}\" stroke=\"#E2E8F0\" stroke-width=\"1\"{dash}/>\n\
+             <text x=\"{:.1}\" y=\"{:.1}\" font-size=\"9\" fill=\"#64748B\" text-anchor=\"end\">{tick:.2}</text>\n",
+            pad_l + plot_w,
+            pad_l - 6.0,
+            ty + 3.0
+        ));
+    }
+
+    let build_polyline = |vals: &[Option<f64>], stroke: &str, width_px: f64| -> String {
+        let mut path = String::new();
+        let mut seg = String::new();
+        for (i, v_opt) in vals.iter().enumerate() {
+            if let Some(v) = v_opt.filter(|x| x.is_finite()) {
+                let px = pad_l + ((i as f64) + 0.5) * cell_w;
+                let py = y_rig_top + (1.0 - v.clamp(0.0, 1.0)) * rig_h;
+                if !seg.is_empty() {
+                    seg.push(' ');
+                }
+                seg.push_str(&format!("{px:.1},{py:.1}"));
+            } else if !seg.is_empty() {
+                path.push_str(&format!(
+                    "<polyline points=\"{seg}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{width_px:.1}\"/>\n"
+                ));
+                seg.clear();
+            }
+        }
+        if !seg.is_empty() {
+            path.push_str(&format!(
+                "<polyline points=\"{seg}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{width_px:.1}\"/>\n"
+            ));
+        }
+        path
+    };
+
+    let af_s2_track: Vec<Option<f64>> = rep.residues.iter().map(|r| r.s2_af_hat).collect();
+    let exp_s2_track: Vec<Option<f64>> = rep.residues.iter().map(|r| r.s2_exp).collect();
+    svg.push_str(&build_polyline(&af_s2_track, "#0053D6", 1.8));
+    svg.push_str(&build_polyline(&exp_s2_track, "#0F172A", 1.8));
+
+    // Track 3: 4-Class Concordance Strip + X-axis sequence ticks
+    svg.push_str(&format!(
+        "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"9.5\" font-weight=\"600\" fill=\"#334155\" text-anchor=\"end\">AF vs NMR</text>\n",
+        pad_l - 6.0,
+        y_conc_top + 13.5
+    ));
+    let tick_step = if n > 120 {
+        20
+    } else if n > 50 {
+        10
+    } else {
+        5
+    };
+    for (i, r) in rep.residues.iter().enumerate() {
+        let x = pad_l + (i as f64) * cell_w;
+        let w = (cell_w - 0.6).max(1.0);
+        let fill = r.concordance_class.hex_color();
+        let tip = format!(
+            "{}{} | class={} | 3D={}({}) | pLDDT={} | S2_exp={}",
+            r.res_name,
+            r.seq_id,
+            r.concordance_class.as_str(),
+            r.state4_af.as_str(),
+            r.state8_af.as_str(),
+            r.plddt
+                .map(|p| format!("{p:.1}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            r.s2_exp
+                .map(|s| format!("{s:.3}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+        );
+        if r.concordance_class == AfNmrConcordanceClass::UnassignedNmr {
+            svg.push_str(&format!(
+                "<rect x=\"{:.1}\" y=\"{y_conc_top:.1}\" width=\"{w:.1}\" height=\"{conc_h:.1}\" rx=\"2\" fill=\"none\" stroke=\"#94A3B8\" stroke-width=\"1\"><title>{}</title></rect>\n",
+                x + 0.3,
+                escape_xml(&tip)
+            ));
+        } else {
+            let stroke = if r.concordance_class == AfNmrConcordanceClass::DynamicHingeOrAltState {
+                " stroke=\"#7F1D1D\" stroke-width=\"1.4\""
+            } else {
+                ""
+            };
+            svg.push_str(&format!(
+                "<rect x=\"{:.1}\" y=\"{y_conc_top:.1}\" width=\"{w:.1}\" height=\"{conc_h:.1}\" rx=\"2\" fill=\"{fill}\"{stroke}><title>{}</title></rect>\n",
+                x + 0.3,
+                escape_xml(&tip)
+            ));
+            if r.concordance_class == AfNmrConcordanceClass::ConditionalFoldingOrCrystalArtifact
+                && w >= 3.0
+            {
+                svg.push_str(&format!(
+                    "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"#FFFFFF\" stroke-width=\"1.1\"/>\n",
+                    x + 0.8,
+                    y_conc_top + conc_h - 1.5,
+                    x + w - 0.5,
+                    y_conc_top + 1.5
+                ));
+            }
+        }
+
+        if i == 0 || (i + 1) % tick_step == 0 {
+            svg.push_str(&format!(
+                "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"9\" fill=\"#64748B\" text-anchor=\"middle\">{}</text>\n",
+                x + 0.5 * cell_w,
+                y_conc_top + conc_h + 14.0,
+                r.seq_id
+            ));
+        }
+    }
+
     svg.push_str("</svg>\n");
     svg
 }
