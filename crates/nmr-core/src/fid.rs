@@ -745,6 +745,27 @@ fn bruker_proc_matches_acqu_sw(
     false
 }
 
+fn bruker_proc_matches_acqu_axis(
+    proc_map: Option<&HashMap<String, String>>,
+    acqu_sw_hz: f64,
+    expected_label: &str,
+) -> bool {
+    if !bruker_proc_matches_acqu_sw(proc_map, acqu_sw_hz) {
+        return false;
+    }
+    if let Some(axnuc) = proc_map.and_then(|p| p.get("AXNUC")) {
+        let norm = normalize_nucleus_label(axnuc, "");
+        if !norm.is_empty()
+            && !norm.eq_ignore_ascii_case("off")
+            && !expected_label.is_empty()
+            && norm != expected_label
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn read_optional_bruker_proc(dir: &Path, proc_name: &str) -> Option<HashMap<String, String>> {
     if let Some(pdata_dir) = find_dir_ci(dir, "pdata") {
         if let Some(d1) = find_dir_ci(&pdata_dir, "1") {
@@ -1049,7 +1070,9 @@ fn parse_bruker_direct_axis(
         .or_else(|| sw_ppm_acq.map(|sw| sw * sfo1))
         .ok_or("missing ##$SW_h / ##$SW in Bruker acqus")?;
 
-    let procs_cal = procs.filter(|p| bruker_proc_matches_acqu_sw(Some(p), sw_hz));
+    let raw_nuc = acqus.get("NUC1").map(String::as_str).unwrap_or("1H");
+    let prelim_label = normalize_nucleus_label(raw_nuc, "1H");
+    let procs_cal = procs.filter(|p| bruker_proc_matches_acqu_axis(Some(p), sw_hz, &prelim_label));
     let proc_sf = bruker_proc_valid_sf(procs_cal, bf1);
     let obs_mhz = proc_sf.unwrap_or(bf1);
     let first_ppm = bruker_proc_first_ppm(procs_cal, sfo1, obs_mhz, bf1, sw_hz);
@@ -1291,7 +1314,7 @@ fn parse_bruker_indirect_axis(
         })
         .ok_or_else(|| format!("missing ##$SW / ##$SW_h in Bruker indirect ({fallback_label})"))?;
 
-    let proc_cal = proc_ind.filter(|p| bruker_proc_matches_acqu_sw(Some(p), sw_hz));
+    let proc_cal = proc_ind.filter(|p| bruker_proc_matches_acqu_axis(Some(p), sw_hz, &label));
     let mut sfo1 = resolve_bruker_indirect_sfo1(acqus, proc_cal, &label, sfo1_raw, bf1);
 
     let proc_sf = bruker_proc_valid_sf(proc_cal, bf1);
@@ -2945,30 +2968,6 @@ fn read_optional_bruker_pdata1_text(dir: &Path, filename: &str) -> Option<String
     read_text_lossy_capped(&path).ok()
 }
 
-fn find_bruker_splitcomb_sibling_dir(dir: &Path) -> Option<PathBuf> {
-    let expno: usize = dir.file_name()?.to_str()?.parse().ok()?;
-    if expno >= 10_000 {
-        return None;
-    }
-    let parent = dir.parent()?;
-    for cand in [10_000 + expno, 10_100 + expno] {
-        let sib = parent.join(cand.to_string());
-        if !fs::symlink_metadata(&sib).is_ok_and(|m| m.is_dir()) {
-            continue;
-        }
-        let has_splitcomb = ["audita.txt", "acqu2s", "acqus"]
-            .into_iter()
-            .filter_map(|f| find_file_ci(&sib, f))
-            .filter_map(|p| read_text_lossy_capped(&p).ok())
-            .chain(read_optional_bruker_pdata1_text(&sib, "auditp.txt"))
-            .any(|t| t.to_ascii_lowercase().contains("splitcomb"));
-        if has_splitcomb {
-            return Some(sib);
-        }
-    }
-    None
-}
-
 /// Read a Bruker 2D `ser` directory (`acqus`, `acqu2s`, and `ser`), automatically detecting uniform vs NUS.
 pub fn read_bruker_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
     read_bruker_fid_2d_opts(dir, false)
@@ -2997,16 +2996,16 @@ pub fn read_bruker_fid_2d_with_ipap(
     let acqu2s = read_merged_bruker_params(&dir, "acqu2s", "acqu2")?;
     let is_fntype_nus = validate_bruker_fntype(&dir, &acqus, &[&acqu2s])?;
 
-    let mut procs = read_optional_bruker_proc(&dir, "procs");
-    let mut proc2s = read_optional_bruker_proc(&dir, "proc2s");
+    let procs = read_optional_bruker_proc(&dir, "procs");
+    let proc2s = read_optional_bruker_proc(&dir, "proc2s");
 
-    let (mut axis_x, mut bytorda, mut dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
+    let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
 
     let ser_path = find_file_ci(&dir, "ser")
         .ok_or_else(|| format!("missing 2D ser binary file in {}", dir.display()))?;
     let bytes =
         fs::read(&ser_path).map_err(|e| format!("failed to read {}: {e}", ser_path.display()))?;
-    let mut word_bytes = if dtypa == 2 { 8 } else { 4 };
+    let word_bytes = if dtypa == 2 { 8 } else { 4 };
     let raw_stride_1024 = axis_x
         .td_raw
         .checked_mul(word_bytes)
@@ -3079,44 +3078,6 @@ pub fn read_bruker_fid_2d_with_ipap(
         word_bytes,
     );
 
-    let mut splitcomb_meta_strings = own_meta_strings.clone();
-    if ipap_mode.is_some() {
-        if let Some(sib) = find_bruker_splitcomb_sibling_dir(&dir) {
-            if let Some(aud) =
-                find_file_ci(&sib, "audita.txt").and_then(|p| read_text_lossy_capped(&p).ok())
-            {
-                splitcomb_meta_strings.push(aud);
-            }
-            if let Some(audp) = read_optional_bruker_pdata1_text(&sib, "auditp.txt") {
-                splitcomb_meta_strings.push(audp);
-            }
-            if !bruker_proc_matches_acqu_sw(procs.as_ref(), axis_x.sw_hz) {
-                if let Some(sp) = read_optional_bruker_proc(&sib, "procs") {
-                    if bruker_proc_matches_acqu_sw(Some(&sp), axis_x.sw_hz) {
-                        procs = Some(sp);
-                        (axis_x, bytorda, dtypa) =
-                            parse_bruker_direct_axis(&acqus, procs.as_ref())?;
-                        word_bytes = if dtypa == 2 { 8 } else { 4 };
-                    }
-                }
-            }
-            if let Some(sp2) = read_optional_bruker_proc(&sib, "proc2s") {
-                let sw_y_est = acqu2s
-                    .get("SW")
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .zip(acqu2s.get("SFO1").and_then(|v| v.parse::<f64>().ok()))
-                    .map(|(sw, sfo)| sw * sfo)
-                    .or_else(|| acqu2s.get("SW_h").and_then(|v| v.parse::<f64>().ok()))
-                    .unwrap_or(0.0);
-                if !bruker_proc_matches_acqu_sw(proc2s.as_ref(), sw_y_est)
-                    && bruker_proc_matches_acqu_sw(Some(&sp2), sw_y_est)
-                {
-                    proc2s = Some(sp2);
-                }
-            }
-        }
-    }
-
     let manual_loop_quad = ind_phys_y.and_then(|ip| match ip.quad_source {
         crate::pulprog::QuadSource::SynthesizedManualLoop { .. } => ip.quad_mode.to_fid_quad_mode(),
         _ => None,
@@ -3155,7 +3116,7 @@ pub fn read_bruker_fid_2d_with_ipap(
     )?;
     let proc2s_cal = proc2s
         .as_ref()
-        .filter(|p| bruker_proc_matches_acqu_sw(Some(p), axis_y.sw_hz));
+        .filter(|p| bruker_proc_matches_acqu_axis(Some(p), axis_y.sw_hz, &axis_y.label));
     if proc2s_cal.and_then(|p| p.get("REVERSE")).is_none() {
         axis_y.stored_proc.reverse = if let Some(ip) = ind_phys_y {
             ip.reverse_frequency
@@ -3164,10 +3125,9 @@ pub fn read_bruker_fid_2d_with_ipap(
         };
     }
 
-    let splitcomb_refs: Vec<&str> = splitcomb_meta_strings.iter().map(String::as_str).collect();
     let ipap_cfg = ipap_mode.map(|_| {
         let mut cfg =
-            resolve_bruker_ipap_config(&acqus, Some(&acqu2s), pp_txt.as_deref(), &splitcomb_refs);
+            resolve_bruker_ipap_config(&acqus, Some(&acqu2s), pp_txt.as_deref(), &own_meta_refs);
         if let Some(j) = ipap_j_caco_hz.filter(|v| v.is_finite() && *v > 0.0) {
             cfg.j_caco_hz = j;
         }

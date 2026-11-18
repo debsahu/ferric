@@ -1,6 +1,6 @@
 use std::f64::consts::PI;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use nmr_core::fid::{
     bruker_dsp_group_delay, find_child_ci, read_bruker_fid_1d, read_bruker_fid_2d,
@@ -8,9 +8,23 @@ use nmr_core::fid::{
     read_fid_auto, Complex64, FidVendor, QuadMode, RawFid,
 };
 use nmr_core::process::{
-    process_fid_dir_2d, process_fid_dir_2d_opts, process_fid_dir_3d, process_fid_dir_3d_opts,
+    process_fid_2d_mut, process_fid_dir_2d, process_fid_dir_2d_opts, process_fid_dir_3d,
+    process_fid_dir_3d_opts,
 };
 use nmr_core::spectrum::{read_bruker_pdata_2d, read_bruker_pdata_3d};
+
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).expect("create dst dir");
+    for entry in fs::read_dir(src).expect("read src dir").flatten() {
+        let path = entry.path();
+        let target = dst.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir_recursive(&path, &target);
+        } else if path.is_file() {
+            fs::copy(&path, &target).expect("copy file");
+        }
+    }
+}
 
 fn temp_test_dir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("nmrassign_fid_test_{tag}_{}", std::process::id()));
@@ -2318,24 +2332,71 @@ fn v0150_p0_1_and_p1_4_real_bruker_ipap_2d_con_splitcomb_parity_and_l0_order() {
         );
     }
 
-    // 2. Real Bruker TopSpin ubiquitin IPAP raw vs `splitcomb` pairs (`r >= 0.999`, `n1 = 64`):
+    // 2. Real Bruker TopSpin ubiquitin IPAP raw vs `splitcomb` pairs (`r >= 0.999`, `n1 = 64`),
+    //    copied into an isolated temp directory with NO `<10000 + expno>` sibling directory!
     if let Some(ubi_root) = discover_ubiquitin_data_root() {
         let pairs = [
-            ("ubiquitin_08212009/2", "ubiquitin_08212009/10002", 64usize),
-            ("ubiquitin_08212009/4", "ubiquitin_08212009/10004", 64usize),
-            ("Ubiquitin_111909/3", "Ubiquitin_111909/10003", 64usize),
-            ("Ubiquitin_111909/4", "Ubiquitin_111909/10004", 64usize),
-            ("Ubiquitin_111909/5", "Ubiquitin_111909/10005", 64usize),
-            ("Ubiquitin_111909/6", "Ubiquitin_111909/10006", 64usize),
+            (
+                "ubiquitin_08212009/2",
+                "ubiquitin_08212009/10002",
+                64usize,
+                "15N",
+                (95.0_f64, 142.0_f64),
+            ),
+            (
+                "ubiquitin_08212009/4",
+                "ubiquitin_08212009/10004",
+                64usize,
+                "13C",
+                (145.0_f64, 200.0_f64),
+            ),
+            (
+                "Ubiquitin_111909/3",
+                "Ubiquitin_111909/10003",
+                64usize,
+                "15N",
+                (95.0_f64, 142.0_f64),
+            ),
+            (
+                "Ubiquitin_111909/4",
+                "Ubiquitin_111909/10004",
+                64usize,
+                "15N",
+                (95.0_f64, 142.0_f64),
+            ),
+            (
+                "Ubiquitin_111909/5",
+                "Ubiquitin_111909/10005",
+                64usize,
+                "15N",
+                (95.0_f64, 142.0_f64),
+            ),
+            (
+                "Ubiquitin_111909/6",
+                "Ubiquitin_111909/10006",
+                64usize,
+                "15N",
+                (95.0_f64, 142.0_f64),
+            ),
         ];
-        for (raw_rel, sc_rel, expected_n1) in pairs {
+        for (idx, (raw_rel, sc_rel, expected_n1, expected_y_label, (y_lo, y_hi))) in
+            pairs.into_iter().enumerate()
+        {
             let raw_dir = ubi_root.join(raw_rel);
             let sc_dir = ubi_root.join(sc_rel);
             if !raw_dir.join("ser").is_file() || !sc_dir.join("ser").is_file() {
                 continue;
             }
-            let fid_raw = read_bruker_fid_2d(&raw_dir)
-                .unwrap_or_else(|e| panic!("failed to read raw IPAP {raw_rel}: {e}"));
+            let iso_root = temp_test_dir(&format!("isolated_ipap_{idx}"));
+            let exp_name = raw_dir.file_name().and_then(|s| s.to_str()).unwrap_or("2");
+            let isolated_raw_dir = iso_root.join(exp_name);
+            copy_dir_recursive(&raw_dir, &isolated_raw_dir);
+            // Guarantee NO sibling `<10000 + expno>` exists in `iso_root`!
+            assert_eq!(fs::read_dir(&iso_root).unwrap().count(), 1);
+
+            // (a) Time-domain parity strictly from `isolated_raw_dir` vs `sc_dir`
+            let fid_raw = read_bruker_fid_2d(&isolated_raw_dir)
+                .unwrap_or_else(|e| panic!("failed to read isolated raw IPAP {raw_rel}: {e}"));
             let fid_sc = read_bruker_fid_2d(&sc_dir)
                 .unwrap_or_else(|e| panic!("failed to read splitcomb {sc_rel}: {e}"));
             assert_eq!(
@@ -2346,29 +2407,64 @@ fn v0150_p0_1_and_p1_4_real_bruker_ipap_2d_con_splitcomb_parity_and_l0_order() {
             let r_td = pearson_r_complex(&fid_raw.data, &fid_sc.data);
             assert!(
                 r_td >= 0.999,
-                "{raw_rel} vs {sc_rel} time-domain Pearson r={r_td:.6} < 0.999"
+                "{raw_rel} (isolated) vs {sc_rel} time-domain Pearson r={r_td:.6} < 0.999"
             );
 
-            let (spec_raw, _) = process_fid_dir_2d(&raw_dir, false, false)
-                .unwrap_or_else(|e| panic!("failed to process raw IPAP {raw_rel}: {e}"));
-            let (spec_sc, _) = process_fid_dir_2d(&sc_dir, false, false)
+            // (b) Frequency-domain parity under the same explicit `ProcessingRecipe`
+            let (spec_sc, sc_recipe) = process_fid_dir_2d(&sc_dir, false, false)
                 .unwrap_or_else(|e| panic!("failed to process splitcomb {sc_rel}: {e}"));
+            let mut same_recipe = sc_recipe.clone();
+            let spec_raw_same_rec =
+                process_fid_2d_mut(&fid_raw, &mut same_recipe).unwrap_or_else(|e| {
+                    panic!("failed to process isolated raw {raw_rel} with sc_recipe: {e}")
+                });
             assert_eq!(
-                (spec_raw.nx(), spec_raw.ny()),
+                (spec_raw_same_rec.nx(), spec_raw_same_rec.ny()),
                 (spec_sc.nx(), spec_sc.ny()),
-                "{raw_rel} vs {sc_rel} processed 2D dimensions must match"
-            );
-            let r_fd = pearson_r_f32(&spec_raw.data, &spec_sc.data);
-            println!(
-                "[S7 IPAP parity] {raw_rel} vs {sc_rel}: n1={}, nx={}x{}, r_td={r_td:.6}, r_fd={r_fd:.6}",
-                fid_raw.axis_y.complex_points,
-                spec_raw.nx(),
-                spec_raw.ny()
+                "{raw_rel} vs {sc_rel} processed 2D dimensions must match under same recipe"
             );
             assert!(
-                r_fd >= 0.999,
-                "{raw_rel} vs {sc_rel} processed 2D spectrum Pearson r={r_fd:.6} < 0.999"
+                (spec_raw_same_rec.axis_x.first_ppm - spec_sc.axis_x.first_ppm).abs() < 0.01
+                    && (spec_raw_same_rec.axis_y.first_ppm - spec_sc.axis_y.first_ppm).abs() < 0.01,
+                "{raw_rel} vs {sc_rel} chemical shift axes must match within 0.01 ppm"
             );
+            let r_fd = pearson_r_f32(&spec_raw_same_rec.data, &spec_sc.data);
+            assert!(
+                r_fd >= 0.999,
+                "{raw_rel} (isolated) vs {sc_rel} same-recipe 2D spectrum Pearson r={r_fd:.6} < 0.999"
+            );
+
+            // (c) Blind `process_fid_dir_2d` on `isolated_raw_dir` (stale 1H `procs` rejected, zero `/10002` access)
+            let (spec_blind, _) = process_fid_dir_2d(&isolated_raw_dir, false, false)
+                .unwrap_or_else(|e| {
+                    panic!("blind process_fid_dir_2d failed on isolated {raw_rel}: {e}")
+                });
+            assert_eq!(spec_blind.axis_x.label, "13C");
+            assert_eq!(spec_blind.axis_y.label, expected_y_label);
+            let x_first = spec_blind.axis_x.first_ppm;
+            let x_last = spec_blind.axis_x.index_to_ppm((spec_blind.nx() - 1) as f64);
+            let (x_min, x_max) = (x_first.min(x_last), x_first.max(x_last));
+            assert!(
+                x_min > 158.0 && x_max < 190.0 && (x_max - x_min) > 18.0,
+                "{raw_rel} blind 13C axis [{x_min:.2}, {x_max:.2}] must span ~161..185 ppm (never stale 1H 10.76 ppm)"
+            );
+            let y_first = spec_blind.axis_y.first_ppm;
+            let y_last = spec_blind.axis_y.index_to_ppm((spec_blind.ny() - 1) as f64);
+            let (y_min, y_max) = (y_first.min(y_last), y_first.max(y_last));
+            assert!(
+                y_min >= y_lo && y_max <= y_hi && (y_max - y_min) > 30.0,
+                "{raw_rel} blind {expected_y_label} axis [{y_min:.2}, {y_max:.2}] out of expected [{y_lo}, {y_hi}] ppm"
+            );
+
+            println!(
+                "[S7 isolated IPAP parity] {raw_rel} vs {sc_rel}: n1={}, r_td={r_td:.6}, r_fd_same_recipe={r_fd:.6}, blind_axes=({:.2}..{:.2} ppm 13C x {:.2}..{:.2} ppm {expected_y_label})",
+                fid_raw.axis_y.complex_points,
+                x_min,
+                x_max,
+                y_min,
+                y_max,
+            );
+            let _ = fs::remove_dir_all(&iso_root);
         }
     }
 }
