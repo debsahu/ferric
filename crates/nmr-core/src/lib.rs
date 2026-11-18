@@ -21,6 +21,7 @@ pub mod classify;
 pub mod cpmg;
 pub mod csp;
 pub mod dihedrals;
+pub mod domain_dock;
 pub mod dosy;
 pub mod evaluate;
 pub mod evo_graph;

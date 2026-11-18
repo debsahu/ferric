@@ -8,6 +8,7 @@
 
 pub mod af_assign_cmd;
 pub mod af_validate_cmd;
+pub mod domain_dock_cmd;
 pub mod dosy_cmd;
 pub mod exchange_cmd;
 pub mod export_fig_cmd;
@@ -232,6 +233,7 @@ fn usage() -> String {
        ferric csp             (--apo-peaks <apo.tsv> | --star <apo.str>) --step <[L]_uM[:[P]_uM]=path> ... [--out <csp.tsv>] [--experiment hsqc|hmqc] [--protein-um 100.0] [--ligand-stock-um <uM>] [--mc-trials 400] [--trajectories-out <traj.tsv>] [--json-out <csp.json>]\n\
        ferric nmr1d           (process | multiplet | qnmr) [options]  (see `ferric nmr1d --help`)\n\
        ferric structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--rdc <rdcs.tsv|rdcs.nef>] [--torsion-db] [--include-chi1] [--rdc-weight 0.75] [--rdc-free-frac 0.20] [--engine auto|gpu|cpu] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
+       ferric structure       --pae-domains --af-structure <model.cif> --af-pae <pae.json> [--rdc <rdcs.tsv|nef>] [--pcs <pcs.tsv>] [--pre <pre.tsv>] [--noesy <inter_noe.tsv>] [--rdc-free-frac 0.20] [--ensemble-size 10] [--engine auto|gpu|cpu] -o <docked.pdb|docked.cif>\n\
        ferric nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        ferric nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
        ferric report          --star|--shifts <shifts.str|shifts.nef> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--rdc <rdcs.tsv|rdcs.nef>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]\n\
@@ -5385,6 +5387,13 @@ fn run_gpu_rdc_structure_workflow(
 }
 
 fn cmd_structure(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|a| matches!(a.as_str(), "--pae-domains" | "--af-structure" | "--af-pae"))
+    {
+        return domain_dock_cmd::cmd_structure_pae_domains(args);
+    }
+
     let mut star_path: Option<PathBuf> = None;
     let mut noesy_path: Option<PathBuf> = None;
     let mut rdc_path: Option<PathBuf> = None;
