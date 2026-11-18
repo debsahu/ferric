@@ -164,12 +164,12 @@ fn cli_cofold_export_and_score_e2e_pipeline() {
             normal: ring_norm,
             vertices: vec![
                 native_lig[4].2,
-                native_lig[5].2,
                 native_lig[6].2,
                 native_lig[7].2,
                 native_lig[8].2,
+                native_lig[5].2,
             ],
-            intensity_factor: 0.56,
+            intensity_factor: 0.90,
         },
     ];
     let lig_occ: Vec<(Vec3, u8)> = native_lig
@@ -228,18 +228,14 @@ fn cli_cofold_export_and_score_e2e_pipeline() {
     let csp_path = dir.join("titration_csp.tsv");
     fs::write(&csp_path, csp_tsv).expect("write CSP TSV");
 
-    let h_44 = ubq.residues[by_sid[&44]].h.unwrap();
-    let noe_tsv = format!(
-        "chain_1\tseq_id_1\tatom_1\tchain_2\tatom_2\tupper_a\n\
-         A\t44\tH\tL\tC5\t{:.2}\n",
-        v_dist(h_44, native_lig[4].2) + 0.85
-    );
+    let noe_tsv = "chain_1\tseq_id_1\tatom_1\tchain_2\tatom_2\tupper_a\n\
+                   A\t44\tH\tL\tC5\tweak\n";
     let noe_path = dir.join("inter_noe.tsv");
     fs::write(&noe_path, noe_tsv).expect("write NOE TSV");
 
-    // 3. Run `ferric cofold export --out-prefix <prefix>`
+    // 3a. Exporting atom-level contact against a SMILES/MOL ligand MUST fail closed (`21.W3:P1-10`)
     let prefix = dir.join("ubq_lig_job");
-    let exp_out = Command::new(ferric_bin())
+    let bad_exp = Command::new(ferric_bin())
         .args([
             "cofold",
             "export",
@@ -253,6 +249,29 @@ fn cli_cofold_export_and_score_e2e_pipeline() {
             csp_path.to_str().unwrap(),
             "--noesy",
             noe_path.to_str().unwrap(),
+            "--out-prefix",
+            prefix.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run ferric cofold export with SMILES atom NOE");
+    assert!(
+        !bad_exp.status.success(),
+        "exporting SMILES ligand with atom-level NOE must fail closed"
+    );
+
+    // 3b. Run `ferric cofold export --out-prefix <prefix>` with CSP pocket conditioning
+    let exp_out = Command::new(ferric_bin())
+        .args([
+            "cofold",
+            "export",
+            "--fasta",
+            fasta_path.to_str().unwrap(),
+            "--ligand-file",
+            &format!("L:{}", lig_mol_path.display()),
+            "--apo-structure",
+            ubq_pdb_path.to_str().unwrap(),
+            "--csp",
+            csp_path.to_str().unwrap(),
             "--affinity",
             "--seeds",
             "1,2",
@@ -344,7 +363,8 @@ fn cli_cofold_export_and_score_e2e_pipeline() {
     assert_eq!(report.verdict, PoseVerdict::RankedConclusive);
     assert_eq!(report.top_pose_id.as_deref(), Some("00_near_native"));
 
-    // 5. Decoy-only CLI invocation -> `InconclusiveOrAllViolated`!
+    // 5. Decoy-only CLI invocation with direct `--csp` + `--noesy` (`scoring_only: true` allows
+    //    evaluating SMILES ligand atom NOEs against pose coordinates!) -> `InconclusiveOrAllViolated`!
     let decoy_csv = decoy_paths
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
@@ -357,8 +377,12 @@ fn cli_cofold_export_and_score_e2e_pipeline() {
             "score",
             "--poses",
             &decoy_csv,
-            "--restraints",
-            sidecar_file.to_str().unwrap(),
+            "--csp",
+            csp_path.to_str().unwrap(),
+            "--noesy",
+            noe_path.to_str().unwrap(),
+            "--ligand-file",
+            &format!("L:{}", lig_mol_path.display()),
             "--apo-structure",
             ubq_pdb_path.to_str().unwrap(),
             "-o",
@@ -366,11 +390,177 @@ fn cli_cofold_export_and_score_e2e_pipeline() {
         ])
         .output()
         .expect("run ferric cofold score on decoys only");
-    assert!(decoy_out.status.success());
+    assert!(
+        decoy_out.status.success(),
+        "decoy score failed: {}",
+        String::from_utf8_lossy(&decoy_out.stderr)
+    );
     let decoy_report: PoseScoreReport =
         serde_json::from_str(&fs::read_to_string(&decoy_json_path).unwrap()).unwrap();
     assert_eq!(decoy_report.verdict, PoseVerdict::InconclusiveOrAllViolated);
     assert_eq!(decoy_report.top_pose_id, None);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_s4_help_honesty_no_apo_guard_pre_tau_c_and_boltz_range_checks() {
+    let dir = env::temp_dir().join(format!("ferric_cofold_cli_s4_guards_{}", process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let ubq_pdb_path = ubq_fixture_path();
+
+    // 1. CLI `--help` must NOT claim `"CSP/PRE-guided AlphaFold 3"` (`21.W3:P2`)
+    let help_out = Command::new(ferric_bin())
+        .args(["cofold", "--help"])
+        .output()
+        .expect("ferric cofold --help");
+    assert!(help_out.status.success());
+    let help_txt = String::from_utf8_lossy(&help_out.stdout);
+    assert!(
+        !help_txt.contains("CSP/PRE-guided AlphaFold 3"),
+        "CLI help must not overclaim CSP/PRE conditioning in AlphaFold 3:\n{help_txt}"
+    );
+    assert!(help_txt.contains("--allow-unfiltered-no-apo"));
+    assert!(help_txt.contains("--pre-tau-c"));
+    assert!(help_txt.contains("--pre-rigid-metal"));
+    assert!(help_txt.contains("--csp-scoring"));
+
+    // 2. `ferric cofold export` with `--csp` and NO `--apo-structure` fails closed unless `--allow-unfiltered-no-apo`
+    let csp_p = dir.join("mini_csp.tsv");
+    fs::write(
+        &csp_p,
+        "seq_id\tres_name\tcsp_ppm\n1\tMET\t0.02\n2\tGLN\t0.02\n3\tILE\t0.02\n4\tPHE\t0.02\n8\tLEU\t0.42\n",
+    )
+    .unwrap();
+    let out_yaml = dir.join("out.yaml");
+    let no_apo_fail = Command::new(ferric_bin())
+        .args([
+            "cofold",
+            "export",
+            "--protein",
+            "A:MQIFVKTLTG",
+            "--ligand-ccd",
+            "M:ZN",
+            "--csp",
+            csp_p.to_str().unwrap(),
+            "-o",
+            out_yaml.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !no_apo_fail.status.success(),
+        "export without --apo-structure must fail closed by default"
+    );
+
+    let no_apo_opt_in = Command::new(ferric_bin())
+        .args([
+            "cofold",
+            "export",
+            "--protein",
+            "A:MQIFVKTLTG",
+            "--ligand-ccd",
+            "M:ZN",
+            "--csp",
+            csp_p.to_str().unwrap(),
+            "--allow-unfiltered-no-apo",
+            "-o",
+            out_yaml.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        no_apo_opt_in.status.success(),
+        "--allow-unfiltered-no-apo failed: {}",
+        String::from_utf8_lossy(&no_apo_opt_in.stderr)
+    );
+
+    // 3. `Gamma_2` PRE without `--pre-tau-c` (or `# tau_c_ns:`) fails closed; with `--pre-tau-c 10.0 --pre-rigid-metal --max-contact-dist 20.0` succeeds!
+    let pre_p = dir.join("gamma2.tsv");
+    fs::write(
+        &pre_p,
+        "# anchor: M 1 ZN\n# mode: gamma2\nA\t8\tH\t20.0\t1.0\n",
+    )
+    .unwrap();
+    let pre_fail = Command::new(ferric_bin())
+        .args([
+            "cofold",
+            "export",
+            "--apo-structure",
+            ubq_pdb_path.to_str().unwrap(),
+            "--ligand-ccd",
+            "M:ZN",
+            "--pre",
+            pre_p.to_str().unwrap(),
+            "-o",
+            out_yaml.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !pre_fail.status.success(),
+        "Gamma_2 PRE without tau_c must fail closed"
+    );
+
+    let pre_metal_ok = Command::new(ferric_bin())
+        .args([
+            "cofold",
+            "export",
+            "--apo-structure",
+            ubq_pdb_path.to_str().unwrap(),
+            "--ligand-ccd",
+            "M:ZN",
+            "--pre",
+            pre_p.to_str().unwrap(),
+            "--pre-tau-c",
+            "10.0",
+            "--pre-rigid-metal",
+            "--max-contact-dist",
+            "20.0",
+            "-o",
+            out_yaml.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        pre_metal_ok.status.success(),
+        "rigid-metal Solomon PRE export failed: {}",
+        String::from_utf8_lossy(&pre_metal_ok.stderr)
+    );
+    let metal_yaml = fs::read_to_string(&out_yaml).unwrap();
+    assert!(
+        metal_yaml.contains("  - contact:\n"),
+        "expected ~19.0 A rigid-metal Solomon PRE contact <= 20.0 A in YAML:\n{metal_yaml}"
+    );
+
+    // 4. `--pocket-max-dist` and `--max-contact-dist` outside `[4.0, 20.0]` fail closed
+    for (flag, val) in [
+        ("--pocket-max-dist", "3.5"),
+        ("--pocket-max-dist", "22.0"),
+        ("--max-contact-dist", "3.0"),
+        ("--max-contact-dist", "25.0"),
+    ] {
+        let bad = Command::new(ferric_bin())
+            .args([
+                "cofold",
+                "export",
+                "--protein",
+                "A:MQIFVKTLTG",
+                "--ligand-ccd",
+                "M:ZN",
+                flag,
+                val,
+                "-o",
+                out_yaml.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !bad.status.success(),
+            "{flag} {val} outside [4.0, 20.0] A must fail closed"
+        );
+    }
 
     let _ = fs::remove_dir_all(&dir);
 }
