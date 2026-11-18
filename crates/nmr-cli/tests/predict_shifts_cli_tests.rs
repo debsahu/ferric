@@ -4,8 +4,9 @@
 //! # Clean-Room Provenance
 //! - Shen, Y. & Bax, A. (*J. Biomol. NMR* **2010**, 48, 13-22).
 //! - Haigh, C. W. & Mallion, R. B. (*Mol. Phys.* **1972**, 24, 955-970) & Case, D. A. (*J. Biomol. NMR* **1995**, 6, 341-346).
-//! - Wagner, G., Pardi, A. & Bax, A. (*J. Am. Chem. Soc.* **1983**, 105, 5948-5949).
+//! - Empirical inverse-cube H-bond shift term inspired by Wagner, G., Pardi, A. & Bax, A. (*J. Am. Chem. Soc.* **1983**, 105, 5948-5949).
 //! - McConnell, H. M. (*J. Chem. Phys.* **1957**, 27, 226-229); Buckingham, A. D. (*Can. J. Chem.* **1960**, 38, 300-307);
+//!   MacKerell, A. D. Jr. et al. (*J. Phys. Chem. B* **1998**, 102, 3586-3616, CHARMM22 partial charges);
 //!   Sitkoff, D. & Case, D. A. (*Prog. Nucl. Magn. Reson. Spectrosc.* **1998**, 32, 165-190).
 //! - Sahakyan, A. B., Vranken, W. F., Cavalli, A. & Vendruscolo, M. (*Angew. Chem. Int. Ed.* **2011**, 50, 9620-9623).
 
@@ -144,10 +145,11 @@ fn test_predict_shifts_cli_star_nef_tsv_json_and_mmcif_end_to_end() {
     assert!(report.max_retained_seq_identity <= 0.25 + 1e-12);
     assert!(report.include_methyl_ilvmat);
 
-    // 4. ModelArchive mmCIF (.cif) input + TSV output check
-    let cif_path = dir.join("mini_af.cif");
-    let cif_content = "\
-data_MINI_AF
+    // 4. ModelArchive mmCIF (.cif) input (`>= 8` CA atoms for Layer 4 TM-score) + TSV output check,
+    //    AND verify `< 8` CA query fails closed (`21.W1:P1-4`)!
+    let short4_cif_path = dir.join("short4_af.cif");
+    let short4_cif = "\
+data_SHORT4_AF
 loop_
 _ma_qa_metric.id
 _ma_qa_metric.name
@@ -191,16 +193,29 @@ A 2 1 91.0
 A 3 1 12.0
 A 4 1 0.0
 ";
-    fs::write(&cif_path, cif_content).unwrap();
+    fs::write(&short4_cif_path, short4_cif).unwrap();
+    let short_err = predict_shifts_cmd::run_predict_shifts_cli(&[
+        "--structure".to_string(),
+        short4_cif_path.to_string_lossy().into_owned(),
+    ])
+    .unwrap_err();
+    assert!(
+        short_err.contains("Layer 4") && short_err.contains(">= 8 CA atoms"),
+        "expected Layer 4 fail-closed error on 4-residue model, got: {short_err}"
+    );
 
-    let out_tsv = dir.join("mini_af.tsv");
+    // Real committed AFDB v6 `AF-P0CG48-F1-model_v6.cif` -> TSV output check
+    let real_af_cif = root.join("data/afdb/AF-P0CG48-F1-model_v6.cif");
+    let out_tsv = dir.join("afdb_p0cg48.tsv");
     predict_shifts_cmd::run_predict_shifts_cli(&[
         "--structure".to_string(),
-        cif_path.to_string_lossy().into_owned(),
+        real_af_cif.to_string_lossy().into_owned(),
+        "--exclude-uniprot".to_string(),
+        "P0CG48".to_string(),
         "-o".to_string(),
         out_tsv.to_string_lossy().into_owned(),
     ])
-    .expect("predict-shifts .cif -> .tsv");
+    .expect("predict-shifts real AFDB .cif -> .tsv");
 
     let tsv_text = fs::read_to_string(&out_tsv).unwrap();
     assert!(tsv_text.contains("# exclusion_list_sha256:"));

@@ -5,8 +5,9 @@
 //! # Literature & Clean-Room Provenance
 //! - Shen, Y. & Bax, A. (*J. Biomol. NMR* **2010**, 48, 13-22).
 //! - Haigh, C. W. & Mallion, R. B. (*Mol. Phys.* **1972**, 24, 955-970) & Case, D. A. (*J. Biomol. NMR* **1995**, 6, 341-346).
-//! - Wagner, G., Pardi, A. & Bax, A. (*J. Am. Chem. Soc.* **1983**, 105, 5948-5949).
+//! - Empirical inverse-cube H-bond shift term inspired by Wagner, G., Pardi, A. & Bax, A. (*J. Am. Chem. Soc.* **1983**, 105, 5948-5949).
 //! - McConnell, H. M. (*J. Chem. Phys.* **1957**, 27, 226-229); Buckingham, A. D. (*Can. J. Chem.* **1960**, 38, 300-307);
+//!   MacKerell, A. D. Jr. et al. (*J. Phys. Chem. B* **1998**, 102, 3586-3616, CHARMM22 partial charges);
 //!   Sitkoff, D. & Case, D. A. (*Prog. Nucl. Magn. Reson. Spectrosc.* **1998**, 32, 165-190).
 //! - Sahakyan, A. B., Vranken, W. F., Cavalli, A. & Vendruscolo, M. (*Angew. Chem. Int. Ed.* **2011**, 50, 9620-9623).
 
@@ -76,7 +77,7 @@ pub fn predict_shifts_usage() -> &'static str {
        --exclude-family <id>               CATH/superfamily ID excluded by Layer 1 HomologFirewall\n\
        --exclude-topology <id>             CATH C.A.T / ECOD fold group excluded by Layer 2 HomologFirewall\n\
        --max-seq-identity <f64>            Layer 3 sequence-identity cutoff in (0, 1] [default: 0.25]\n\
-       --force-bfactor-plddt               Treat PDB tempFactor / mmCIF B_iso_or_equiv as pLDDT\n\
+       --treat-as-model | --force-bfactor-plddt  Explicitly treat B-factor / B_iso_or_equiv as pLDDT\n\
        --plddt <f64>                       Override uniform per-residue pLDDT in [0, 100]\n\
        --no-ring-current                   Disable Haigh-Mallion aromatic ring-current term (ablation)\n\
        --format <str|nef|tsv|json>         Explicit output format (auto-detected from -o extension)\n\
@@ -204,7 +205,7 @@ pub fn run_predict_shifts_cli(args: &[String]) -> Result<(), String> {
                 }
                 cfg.max_seq_identity = sid;
             }
-            "--force-bfactor-plddt" => {
+            "--force-bfactor-plddt" | "--treat-as-model" => {
                 cfg.force_bfactor_plddt = true;
             }
             "--plddt" => {

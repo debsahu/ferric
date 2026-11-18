@@ -22,8 +22,8 @@ use serde::Deserialize;
 use nmr_core::af_concordance::{
     evaluate_af_nmr_concordance, format_af_concordance_json, format_af_concordance_tsv,
     parse_af_structure_model, parse_modelfree_s2_tsv_file, parse_pae_json_file,
-    AfConcordanceConfig, AfConcordanceReport, AfIngestOptions, ConcordanceSummary,
-    MAX_AF_STRUCTURE_BYTES,
+    require_predicted_model, AfConcordanceConfig, AfConcordanceReport, AfIngestOptions,
+    ConcordanceSummary, MAX_AF_STRUCTURE_BYTES,
 };
 use nmr_core::nef::read_nef_file;
 use nmr_core::nmrstar::{read_star, Reference};
@@ -461,7 +461,7 @@ fn read_shifts_star_or_nef(path: &Path) -> Result<Reference, String> {
 }
 
 pub fn af_validate_usage() -> &'static str {
-    "Usage: ferric af-validate --structure <model.cif|model.pdb> [--pae <pae.json>] --shifts <assigned.str|assigned.nef> [--s2 <modelfree.tsv>] [--fetch-uniprot <id> --cache-dir <dir>] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>] [--force-bfactor-plddt] [--chain <id>] [--ph <f64>] [--temp-k <f64>] [-o <out.json|out.tsv|report.html>]"
+    "Usage: ferric af-validate --structure <model.cif|model.pdb> [--pae <pae.json>] --shifts <assigned.str|assigned.nef> [--s2 <modelfree.tsv>] [--fetch-uniprot <id> --cache-dir <dir>] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>] [--treat-as-model | --force-bfactor-plddt] [--chain <id>] [--ph <f64>] [--temp-k <f64>] [-o <out.json|out.tsv|report.html>]"
 }
 
 /// Entry point for `ferric af-validate`.
@@ -559,7 +559,7 @@ pub fn run_af_validate_cli(args: &[String]) -> Result<(), String> {
                 }
                 exclude_topology = Some(raw);
             }
-            "--force-bfactor-plddt" => {
+            "--force-bfactor-plddt" | "--treat-as-model" => {
                 force_bfactor_plddt = true;
             }
             "--chain" => {
@@ -633,6 +633,7 @@ pub fn run_af_validate_cli(args: &[String]) -> Result<(), String> {
         force_bfactor_plddt,
     };
     let structure = parse_af_structure_model(&struct_p, &ingest_opts)?;
+    require_predicted_model(&structure, force_bfactor_plddt)?;
     let pae = match pae_path {
         Some(ref pp) => Some(parse_pae_json_file(
             pp,
@@ -747,18 +748,37 @@ fn write_or_print_af_validate_output(
         ConcordanceSummary::Evaluated {
             n_eval,
             spearman_rho_s,
-            c_corr_score,
             rmsd_rigidity,
-            c_rmsd_score,
+            ..
         } => {
+            let ci_str = report
+                .spearman_rho_ci95
+                .map(|[lo, hi]| format!(" [{lo:.4}, {hi:.4}]"))
+                .unwrap_or_default();
+            let core_str = report
+                .ordered_core_spearman_rho
+                .map(|r| format!("{r:.4}"))
+                .unwrap_or_else(|| "undefined".to_string());
+            let core_ci_str = report
+                .ordered_core_spearman_rho_ci95
+                .map(|[lo, hi]| format!(" [{lo:.4}, {hi:.4}]"))
+                .unwrap_or_default();
             println!(
-                "AF-vs-NMR Concordance (chain {}, n_eval = {}): Spearman rho_s = {:.4} (C_corr = {:.1}), RMSD_rig = {:.4} (C_rmsd = {:.1})",
-                report.chain_id, n_eval, spearman_rho_s, c_corr_score, rmsd_rigidity, c_rmsd_score
+                "AF-vs-NMR Concordance (chain {}, n_eval = {}, rigidity = {}): Spearman rho_s = {:.4}{}, ordered-core (pLDDT>=70, n = {}) rho_s = {}{}, RMSD_rig = {:.4}",
+                report.chain_id,
+                n_eval,
+                report.rigidity_source.provenance_label(),
+                spearman_rho_s,
+                ci_str,
+                report.n_ordered_core,
+                core_str,
+                core_ci_str,
+                rmsd_rigidity
             );
         }
         ConcordanceSummary::InsufficientCoverage { n_eval, reason } => {
             println!(
-                "AF-vs-NMR Concordance (chain {}): InsufficientCoverage (n_eval = {}): {}",
+                "AF-vs-NMR Concordance (chain {}): InsufficientCoverage (n_eval = {}, spearman_rho = undefined): {}",
                 report.chain_id, n_eval, reason
             );
         }
