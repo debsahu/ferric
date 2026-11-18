@@ -34,6 +34,19 @@
 //! - Schwarz, G. (*Ann. Stat.* **1978**, 6, 461-464) & Kass, R. E. & Raftery, A. E. (*J. Am. Stat.
 //!   Assoc.* **1995**, 90, 773-795) -- Bayesian Information Criterion (`BIC`) and `2 ln BF`
 //!   evidence thresholds.
+//!
+//! # Scope Limits & Modeling Assumptions
+//! - **No partial-unfolding or population scaling parameter**: `H1`..`H4` compare experimental
+//!   excited-state shifts `Delta_varpi_AB = varpi_B - varpi_A` against 100%-switched endpoint
+//!   structural hypotheses (full `ncIDP` random coil in `H1`, full `trans <-> cis` in `H2`, full
+//!   rotamer/tautomer switch in `H3`, or supplied discrete endpoint conformers in `H4`). There is
+//!   no fractional folding/population parameter `p_partial in (0, 1)` inside `mu_Delta`; partial-unfolding
+//!   intermediates (e.g., Fyn SH3-like folding intermediates unless supplied as explicit `H4`
+//!   endpoint conformers) may abstain as `UnmodeledSignificantExchange` or remain unmodeled.
+//! - **Discrete-scan multiplicity & distinct-residue BIC**: Each hypothesis marginalizes over its
+//!   evaluated discrete candidate set (`ln mean L_m` via log-sum-exp, penalizing scanning `M_H`
+//!   candidates by `-ln M_H`) and counts `n = n_distinct_residues` in `BIC` so correlated nuclei on
+//!   the same residue are not double-counted as independent degrees of freedom.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::PI;
@@ -215,10 +228,10 @@ impl ProCisTransDirection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HisExchangeTransition {
     /// Neutral `pi -> tau` tautomer flip (`N_delta1-H -> N_epsilon2-H`: `ND1 +82.0`, `NE2 -82.0`,
-    /// `CD2 -7.2`, `CG +4.8 ppm`).
+    /// `CD2 -7.2`, `CG +8.3 ppm`).
     Nd1HToNe2H,
     /// Neutral `tau -> pi` tautomer flip (`N_epsilon2-H -> N_delta1-H`: `ND1 -82.0`, `NE2 +82.0`,
-    /// `CD2 +7.2`, `CG -4.8 ppm`).
+    /// `CD2 +7.2`, `CG -8.3 ppm`).
     Ne2HToNd1H,
     /// Neutral `tau` (`Ne2H`) protonation to cationic imidazolium `HisH^+`.
     Ne2HToImidazolium,
@@ -228,6 +241,9 @@ pub enum HisExchangeTransition {
     Nd1HToImidazolium,
     /// Cationic imidazolium `HisH^+` deprotonation to neutral `pi` (`Nd1H`).
     ImidazoliumToNd1H,
+    /// Unsigned CPMG `|Delta_varpi|` (without ground `ND1`/`NE2` shifts) cannot distinguish forward vs
+    /// reverse tautomer/protonation direction.
+    AmbiguousDirectionOnUnsignedCpmg,
 }
 
 impl HisExchangeTransition {
@@ -249,6 +265,20 @@ impl HisExchangeTransition {
             Self::ImidazoliumToNe2H => "HisH+_to_Ne2H",
             Self::Nd1HToImidazolium => "Nd1H_to_HisH+",
             Self::ImidazoliumToNd1H => "HisH+_to_Nd1H",
+            Self::AmbiguousDirectionOnUnsignedCpmg => "AmbiguousDirectionOnUnsignedCpmg",
+        }
+    }
+
+    #[inline]
+    pub const fn reverse(self) -> Self {
+        match self {
+            Self::Nd1HToNe2H => Self::Ne2HToNd1H,
+            Self::Ne2HToNd1H => Self::Nd1HToNe2H,
+            Self::Ne2HToImidazolium => Self::ImidazoliumToNe2H,
+            Self::ImidazoliumToNe2H => Self::Ne2HToImidazolium,
+            Self::Nd1HToImidazolium => Self::ImidazoliumToNd1H,
+            Self::ImidazoliumToNd1H => Self::Nd1HToImidazolium,
+            Self::AmbiguousDirectionOnUnsignedCpmg => Self::AmbiguousDirectionOnUnsignedCpmg,
         }
     }
 }
@@ -339,10 +369,18 @@ pub struct HypothesisScore {
     pub kind: ExcitedStateHypothesisKind,
     pub num_params_k: usize,
     pub n_obs: usize,
+    #[serde(default)]
+    pub n_distinct_residues: usize,
+    #[serde(default)]
+    pub n_candidates_evaluated: usize,
     pub max_log_likelihood: f64,
+    #[serde(default)]
+    pub marginal_log_likelihood: f64,
     pub bic: f64,
     pub posterior_weight: f64,
     pub two_ln_bf_vs_runner_up: Option<f64>,
+    #[serde(default)]
+    pub two_ln_bf_vs_best_other_non_null: Option<f64>,
     pub delta_bic_from_best: f64,
     pub two_ln_bf_vs_null: f64,
     pub reduced_chi2: f64,
@@ -354,6 +392,27 @@ pub struct HypothesisScore {
     pub parameters: HypothesisBestParameters,
     pub predictions: Vec<ObservationPredictionRow>,
     pub top_sub_candidates: Vec<SubCandidateSummary>,
+}
+
+/// Specific reason classification when [`ExcitedStateVerdict::AmbiguousOrUnmodeledState`] is returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExcitedStateAbstentionKind {
+    InsufficientDistinctResidues,
+    ConsistentWithNoise,
+    UnmodeledSignificantExchange,
+    AmbiguousBetweenMechanisms,
+}
+
+impl ExcitedStateAbstentionKind {
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InsufficientDistinctResidues => "InsufficientDistinctResidues",
+            Self::ConsistentWithNoise => "ConsistentWithNoise",
+            Self::UnmodeledSignificantExchange => "UnmodeledSignificantExchange",
+            Self::AmbiguousBetweenMechanisms => "AmbiguousBetweenMechanisms",
+        }
+    }
 }
 
 /// Final calibrated decision of [`classify_excited_state`].
@@ -423,6 +482,9 @@ pub struct ExcitedStateConfig {
     pub min_two_ln_bf_null: f64,
     pub max_reduced_chi2: f64,
     pub sigma_fwd_scale: f64,
+    /// Explicitly records whether CPMG input rows were pre-filtered by `significant_exchange=true`.
+    #[serde(default)]
+    pub cpmg_prefiltered_significant_only: bool,
 }
 
 impl Default for ExcitedStateConfig {
@@ -436,6 +498,7 @@ impl Default for ExcitedStateConfig {
             min_two_ln_bf_null: MIN_TWO_LN_BF_VS_NULL,
             max_reduced_chi2: MAX_COMMITTED_REDUCED_CHI2,
             sigma_fwd_scale: 1.0,
+            cpmg_prefiltered_significant_only: false,
         }
     }
 }
@@ -445,19 +508,35 @@ impl Default for ExcitedStateConfig {
 pub struct ExcitedStateReport {
     pub verdict: ExcitedStateVerdict,
     pub verdict_reason: String,
+    #[serde(default)]
+    pub abstention_kind: Option<ExcitedStateAbstentionKind>,
     pub n_observations: usize,
+    #[serde(default)]
+    pub n_distinct_residues: usize,
+    #[serde(default)]
+    pub n_distinct_exchanging_residues: usize,
     pub n_signed_observations: usize,
     pub n_unsigned_observations: usize,
     pub n_unmatched_observations: usize,
     pub two_ln_bf_top1_vs_top2: f64,
+    #[serde(default)]
+    pub two_ln_bf_top1_vs_runnerup_non_null: Option<f64>,
+    #[serde(default)]
+    pub runnerup_non_null_hypothesis: Option<ExcitedStateHypothesisKind>,
     pub two_ln_bf_top1_vs_null: f64,
+    #[serde(default)]
+    pub unmodeled_exchange_two_ln_bf_vs_null: f64,
     pub top1_reduced_chi2: f64,
+    #[serde(default)]
+    pub cpmg_prefiltered_significant_only: bool,
     pub sample_ph: f64,
     pub temperature_kelvin: f64,
     pub ground_exclusion_list_sha256: String,
     pub ground_max_retained_seq_identity: f64,
     pub ranked_hypotheses: Vec<HypothesisScore>,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub scope_limits_note: String,
 }
 
 // ============================================================================
@@ -616,19 +695,22 @@ pub fn parse_ground_shifts_str(text: &str, format_hint: Option<&str>) -> Result<
     }
 }
 
-/// Parse [`ExchangeShiftObservation`] rows from TSV text.
-///
-/// Accepts:
-/// 1. Explicit multi-nucleus exchange tables (`[chain_id]`, `seq_id`, `[res_name]`, `atom`,
-///    `dw_ppm` / `dw_ab_ppm` / `abs_dw_ppm`, `dw_err_ppm` / `dw_ppm_err` / `dw_ab_ppm_err`,
-///    `[sign_mode]`, `[major_ppm]`),
-/// 2. Direct `ferric cest` fit output TSVs (`dw_ab_ppm`, `dw_ab_ppm_err` -> `Signed`, `atom = "N"`
-///    unless `atom` column is supplied), and
-/// 3. Direct `ferric cpmg` fit output TSVs (`dw_ppm`, `dw_ppm_err`, `significant_exchange` ->
-///    `UnsignedMagnitude`, filtering `significant_exchange == false` rows when that column is present).
-pub fn parse_exchange_observations_tsv(
+/// Scope-limit summary emitted alongside [`ExcitedStateReport`].
+pub const EXCITED_STATE_SCOPE_LIMITS_NOTE: &str = "Endpoint-only structural Delta_varpi models (no partial-unfolding or fractional population parameter inside mu_Delta); CPMG unsigned data cannot resolve tautomer direction without ground sidechain 15N shifts.";
+
+/// Parsed exchange shift observations plus provenance flags from TSV parsing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ParsedExchangeTable {
+    pub observations: Vec<ExchangeShiftObservation>,
+    pub cpmg_prefiltered_significant_only: bool,
+    pub n_filtered_nonsignificant_cpmg_rows: usize,
+}
+
+/// Parse [`ExchangeShiftObservation`] rows and metadata from TSV text, rejecting any duplicate
+/// `(chain_id, seq_id, normalized_atom)` observations with `Err`.
+pub fn parse_exchange_observations_tsv_with_meta(
     tsv_text: &str,
-) -> Result<Vec<ExchangeShiftObservation>, String> {
+) -> Result<ParsedExchangeTable, String> {
     if tsv_text.len() > MAX_EXCHANGE_TSV_BYTES {
         return Err(format!(
             "exchange TSV ({} bytes) exceeds 16 MiB limit ({MAX_EXCHANGE_TSV_BYTES})",
@@ -638,6 +720,9 @@ pub fn parse_exchange_observations_tsv(
 
     let mut header_map: Option<BTreeMap<String, usize>> = None;
     let mut out = Vec::new();
+    let mut seen_keys: BTreeSet<(String, i32, String)> = BTreeSet::new();
+    let mut cpmg_prefiltered_significant_only = false;
+    let mut n_filtered_nonsignificant_cpmg_rows = 0usize;
 
     for (line_idx, raw_line) in tsv_text.lines().enumerate() {
         let line_no = line_idx + 1;
@@ -680,8 +765,12 @@ pub fn parse_exchange_observations_tsv(
                 None
             };
 
+            if hm.contains_key("significant_exchange") {
+                cpmg_prefiltered_significant_only = true;
+            }
             if let Some(sig_flag) = get_col(&["significant_exchange"]) {
                 if sig_flag.eq_ignore_ascii_case("false") || sig_flag == "0" {
+                    n_filtered_nonsignificant_cpmg_rows += 1;
                     continue;
                 }
             }
@@ -813,6 +902,13 @@ pub fn parse_exchange_observations_tsv(
             }
         };
 
+        if !seen_keys.insert((obs.chain_id.clone(), obs.seq_id, obs.atom.clone())) {
+            return Err(format!(
+                "line {line_no}: duplicate exchange observation for (chain_id='{}', seq_id={}, atom='{}')",
+                obs.chain_id, obs.seq_id, obs.atom
+            ));
+        }
+
         if out.len() >= MAX_EXCHANGE_OBSERVATIONS {
             return Err(format!(
                 "exchange dataset exceeds maximum observation limit ({MAX_EXCHANGE_OBSERVATIONS})"
@@ -824,7 +920,27 @@ pub fn parse_exchange_observations_tsv(
     if out.is_empty() {
         return Err("no valid chemical-exchange observations found in TSV".to_string());
     }
-    Ok(out)
+    Ok(ParsedExchangeTable {
+        observations: out,
+        cpmg_prefiltered_significant_only,
+        n_filtered_nonsignificant_cpmg_rows,
+    })
+}
+
+/// Parse [`ExchangeShiftObservation`] rows from TSV text.
+///
+/// Accepts:
+/// 1. Explicit multi-nucleus exchange tables (`[chain_id]`, `seq_id`, `[res_name]`, `atom`,
+///    `dw_ppm` / `dw_ab_ppm` / `abs_dw_ppm`, `dw_err_ppm` / `dw_ppm_err` / `dw_ab_ppm_err`,
+///    `[sign_mode]`, `[major_ppm]`),
+/// 2. Direct `ferric cest` fit output TSVs (`dw_ab_ppm`, `dw_ab_ppm_err` -> `Signed`, `atom = "N"`
+///    unless `atom` column is supplied), and
+/// 3. Direct `ferric cpmg` fit output TSVs (`dw_ppm`, `dw_ppm_err`, `significant_exchange` ->
+///    `UnsignedMagnitude`, filtering `significant_exchange == false` rows when that column is present).
+pub fn parse_exchange_observations_tsv(
+    tsv_text: &str,
+) -> Result<Vec<ExchangeShiftObservation>, String> {
+    parse_exchange_observations_tsv_with_meta(tsv_text).map(|p| p.observations)
 }
 
 /// Serialize [`ExchangeShiftObservation`] rows to canonical deterministic TSV format.
@@ -861,21 +977,29 @@ pub fn format_excited_state_tsv(report: &ExcitedStateReport) -> String {
         report.verdict.as_str(),
         report.verdict_reason
     ));
+    let non_null_bf = report
+        .two_ln_bf_top1_vs_runnerup_non_null
+        .map(|v| format!("{v:.4}"))
+        .unwrap_or_else(|| "NA".to_string());
     out.push_str(&format!(
-        "# n_obs: {}\tsigned: {}\tunsigned: {}\t2lnBF_12: {:.4}\t2lnBF_null: {:.4}\ttop1_reduced_chi2: {:.4}\n",
+        "# n_obs: {}\tn_distinct_residues: {}\tn_distinct_exchanging_residues: {}\tsigned: {}\tunsigned: {}\t2lnBF_12: {:.4}\t2lnBF_non_null: {}\t2lnBF_null: {:.4}\ttop1_reduced_chi2: {:.4}\tcpmg_prefiltered_significant_only: {}\n",
         report.n_observations,
+        report.n_distinct_residues,
+        report.n_distinct_exchanging_residues,
         report.n_signed_observations,
         report.n_unsigned_observations,
         report.two_ln_bf_top1_vs_top2,
+        non_null_bf,
         report.two_ln_bf_top1_vs_null,
-        report.top1_reduced_chi2
+        report.top1_reduced_chi2,
+        report.cpmg_prefiltered_significant_only,
     ));
     out.push_str(&format!(
         "# ground_exclusion_list_sha256: {}\tmax_retained_seq_identity: {:.4}\n",
         report.ground_exclusion_list_sha256, report.ground_max_retained_seq_identity
     ));
     out.push_str(
-        "rank\thypothesis_code\thypothesis\tk_params\tmax_log_lik\tbic\tdelta_bic\t2ln_bf_vs_null\tposterior_weight\treduced_chi2\trmse_ppm\tpearson_r\tspearman_rho\tlocus_summary\n",
+        "rank\thypothesis_code\thypothesis\tk_params\tm_cands\tmax_log_lik\tmarginal_log_lik\tbic\tdelta_bic\t2ln_bf_vs_null\tposterior_weight\treduced_chi2\trmse_ppm\tpearson_r\tspearman_rho\tlocus_summary\n",
     );
     for (idx, h) in report.ranked_hypotheses.iter().enumerate() {
         let pr = h
@@ -887,12 +1011,14 @@ pub fn format_excited_state_tsv(report: &ExcitedStateReport) -> String {
             .map(|v| format!("{v:.4}"))
             .unwrap_or_else(|| "NA".to_string());
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.6}\t{:.4}\t{:.4}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.6}\t{:.4}\t{:.4}\t{}\t{}\t{}\n",
             idx + 1,
             h.kind.short_code(),
             h.kind.as_str(),
             h.num_params_k,
+            h.n_candidates_evaluated,
             h.max_log_likelihood,
+            h.marginal_log_likelihood,
             h.bic,
             h.delta_bic_from_best,
             h.two_ln_bf_vs_null,
@@ -927,8 +1053,11 @@ struct ResolvedObs {
     sign_mode: ExchangeSignMode,
     dw_ppm: f64,
     dw_err_ppm: f64,
+    sigma_fwd_ppm: f64,
     sigma_tot_ppm: f64,
     ground_ppm: f64,
+    /// Experimental ground-state shift (`obs.major_ppm` or `ground_shifts`), `None` if fallback-only.
+    explicit_ground_ppm: Option<f64>,
     /// Predicted unblended ground-state 3D shift `delta^{struct}_A` (when modeled by `T21.2`).
     pred_a_struct_ppm: Option<f64>,
     /// Sequence/pH/T-corrected random-coil target `delta^{RC}` for `H1: LocalUnfolding`.
@@ -1189,22 +1318,64 @@ fn spearman_correlation(xs: &[f64], ys: &[f64]) -> Option<f64> {
     pearson_correlation(&rx, &ry)
 }
 
+/// Numerically stable marginalized log-likelihood `ln( (1/M) * sum_{m=1}^M exp(ll_m) )`
+/// via log-sum-exp, naturally penalizing scanning `M` discrete candidates by `-ln(M)`.
 #[inline]
-fn eval_single_obs_ll_and_z(obs: &ResolvedObs, mu_pred: f64) -> Result<(f64, f64, f64), String> {
+fn log_mean_exp(lls: &[f64]) -> f64 {
+    if lls.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+    let max_ll = lls.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !max_ll.is_finite() {
+        return max_ll;
+    }
+    let sum_exp: f64 = lls.iter().map(|&ll| (ll - max_ll).exp()).sum();
+    max_ll + sum_exp.ln() - (lls.len() as f64).ln()
+}
+
+/// Effective prediction-space scale `sigma(mu)`: equals experimental `dw_err_ppm` at `mu = 0`
+/// (spectators and `H0`) and smoothly ramps to `sqrt(dw_err^2 + sigma_fwd^2)` when `|mu| > 0`,
+/// eliminating artificial `ln(sigma_fwd / sigma_exp)` bias on unperturbed spectator residues.
+#[inline]
+fn effective_sigma_for_prediction(obs: &ResolvedObs, mu_pred: f64, is_null: bool) -> f64 {
+    if is_null || obs.sigma_fwd_ppm <= 0.0 {
+        return obs.dw_err_ppm;
+    }
+    let abs_mu = mu_pred.abs();
+    if abs_mu <= 1e-12 {
+        return obs.dw_err_ppm;
+    }
+    let ramp = abs_mu / (abs_mu * abs_mu + (0.25 * obs.sigma_fwd_ppm).powi(2)).sqrt();
+    let sigma_fwd_eff = obs.sigma_fwd_ppm * ramp;
+    let _ = obs.sigma_tot_ppm;
+    (obs.dw_err_ppm * obs.dw_err_ppm + sigma_fwd_eff * sigma_fwd_eff).sqrt()
+}
+
+#[inline]
+fn eval_single_obs_ll_and_z_with_sigma(
+    obs: &ResolvedObs,
+    mu_pred: f64,
+    sigma: f64,
+) -> Result<(f64, f64, f64), String> {
     match obs.sign_mode {
         ExchangeSignMode::Signed => {
-            let ll = signed_student_t5_log_likelihood(obs.dw_ppm, mu_pred, obs.sigma_tot_ppm)?;
-            let z = (obs.dw_ppm - mu_pred) / obs.sigma_tot_ppm;
+            let ll = signed_student_t5_log_likelihood(obs.dw_ppm, mu_pred, sigma)?;
+            let z = (obs.dw_ppm - mu_pred) / sigma;
             Ok((ll, mu_pred, z))
         }
         ExchangeSignMode::UnsignedMagnitude => {
-            let ll =
-                unsigned_folded_student_t5_log_likelihood(obs.dw_ppm, mu_pred, obs.sigma_tot_ppm)?;
+            let ll = unsigned_folded_student_t5_log_likelihood(obs.dw_ppm, mu_pred, sigma)?;
             let eff = mu_pred.abs();
-            let z = (obs.dw_ppm - eff) / obs.sigma_tot_ppm;
+            let z = (obs.dw_ppm - eff) / sigma;
             Ok((ll, eff, z))
         }
     }
+}
+
+#[inline]
+fn eval_single_obs_ll_and_z(obs: &ResolvedObs, mu_pred: f64) -> Result<(f64, f64, f64), String> {
+    let sigma = effective_sigma_for_prediction(obs, mu_pred, false);
+    eval_single_obs_ll_and_z_with_sigma(obs, mu_pred, sigma)
 }
 
 struct BestCandidateState {
@@ -1217,13 +1388,18 @@ struct BestCandidateState {
 
 type RotatedAromaticGeometry = (Vec<ConjugatedAromaticRing>, Vec<(&'static str, Vec3)>);
 
+#[allow(clippy::too_many_arguments)]
 fn build_hypothesis_score(
     kind: ExcitedStateHypothesisKind,
     num_params_k: usize,
+    n_distinct_residues: usize,
+    marginal_log_likelihood: f64,
+    n_candidates_evaluated: usize,
     resolved: &[ResolvedObs],
     winner: BestCandidateState,
     top_sub_candidates: Vec<SubCandidateSummary>,
 ) -> Result<HypothesisScore, String> {
+    let is_null = kind == ExcitedStateHypothesisKind::NullOrUnstructuredPerturbation;
     let n_obs = resolved.len();
     let mut total_ll = 0.0;
     let mut sum_z2 = 0.0;
@@ -1233,7 +1409,8 @@ fn build_hypothesis_score(
     let mut predictions = Vec::with_capacity(n_obs);
 
     for (obs, &mu) in resolved.iter().zip(winner.mu_preds.iter()) {
-        let (ll, eff_mu, z) = eval_single_obs_ll_and_z(obs, mu)?;
+        let sigma = effective_sigma_for_prediction(obs, mu, is_null);
+        let (ll, eff_mu, z) = eval_single_obs_ll_and_z_with_sigma(obs, mu, sigma)?;
         total_ll += ll;
         sum_z2 += z * z;
         let raw_resid = obs.dw_ppm - eff_mu;
@@ -1251,25 +1428,35 @@ fn build_hypothesis_score(
             observed_err_ppm: obs.dw_err_ppm,
             predicted_dw_ppm: mu,
             predicted_effective_dw_ppm: eff_mu,
-            sigma_tot_ppm: obs.sigma_tot_ppm,
+            sigma_tot_ppm: sigma,
             log_likelihood: ll,
             z_residual: z,
         });
     }
 
+    let eff_marginal = if is_null || n_candidates_evaluated <= 1 {
+        total_ll
+    } else {
+        marginal_log_likelihood
+    };
     let dof = n_obs.saturating_sub(num_params_k).max(1) as f64;
     let reduced_chi2 = sum_z2 / dof;
     let rmse_ppm = (sum_sq_err / (n_obs.max(1) as f64)).sqrt();
-    let bic = -2.0 * total_ll + (num_params_k as f64) * (n_obs.max(1) as f64).ln();
+    let bic =
+        -2.0 * eff_marginal + (num_params_k as f64) * (n_distinct_residues.max(1) as f64).ln();
 
     Ok(HypothesisScore {
         kind,
         num_params_k,
         n_obs,
+        n_distinct_residues,
+        n_candidates_evaluated: n_candidates_evaluated.max(1),
         max_log_likelihood: total_ll,
+        marginal_log_likelihood: eff_marginal,
         bic,
         posterior_weight: 0.0,
         two_ln_bf_vs_runner_up: None,
+        two_ln_bf_vs_best_other_non_null: None,
         delta_bic_from_best: 0.0,
         two_ln_bf_vs_null: 0.0,
         reduced_chi2,
@@ -1294,6 +1481,7 @@ fn build_hypothesis_score(
 fn evaluate_h1_local_unfolding(
     model: &StructureModel,
     resolved: &[ResolvedObs],
+    n_distinct_residues: usize,
 ) -> Result<Option<HypothesisScore>, String> {
     let l = model.residues.len();
     if l == 0 || resolved.is_empty() {
@@ -1344,12 +1532,13 @@ fn evaluate_h1_local_unfolding(
     }
 
     let k_h = ExcitedStateHypothesisKind::LocalUnfolding.default_k();
-    let ln_n = (resolved.len().max(1) as f64).ln();
+    let ln_n = (n_distinct_residues.max(1) as f64).ln();
     let dof = resolved.len().saturating_sub(k_h).max(1) as f64;
 
     // Partition model into contiguous same-chain segments (`seq_id` consecutive)
     let mut seg_start = 0usize;
     let mut best_uv: Option<(usize, usize, f64)> = None;
+    let mut cand_lls: Vec<f64> = Vec::new();
     let mut sub_cands: Vec<(f64, SubCandidateSummary)> = Vec::new();
 
     while seg_start < l {
@@ -1377,6 +1566,7 @@ fn evaluate_h1_local_unfolding(
                     z2 += z2_w05[v + 1] - z2_w0[v + 1];
                 }
 
+                cand_lls.push(ll);
                 if best_uv.is_none_or(|(_, _, b_ll)| ll > b_ll) {
                     best_uv = Some((u, v, ll));
                 }
@@ -1408,6 +1598,8 @@ fn evaluate_h1_local_unfolding(
         return Ok(None);
     };
 
+    let marginal_ll = log_mean_exp(&cand_lls);
+    let n_cands = cand_lls.len();
     sub_cands.sort_by(|a, b| b.0.total_cmp(&a.0));
     let top_sub: Vec<SubCandidateSummary> = sub_cands.into_iter().take(5).map(|x| x.1).collect();
 
@@ -1415,11 +1607,11 @@ fn evaluate_h1_local_unfolding(
     let left_bound = (u_best > 0
         && model.residues[u_best - 1].chain_id == *u_chain
         && model.residues[u_best - 1].seq_id + 1 == model.residues[u_best].seq_id)
-        .then_some(u_best - 1);
+        .then(|| u_best - 1);
     let right_bound = (v_best + 1 < l
         && model.residues[v_best + 1].chain_id == *u_chain
         && model.residues[v_best].seq_id + 1 == model.residues[v_best + 1].seq_id)
-        .then_some(v_best + 1);
+        .then(|| v_best + 1);
 
     let mu_preds: Vec<f64> = resolved
         .iter()
@@ -1466,6 +1658,9 @@ fn evaluate_h1_local_unfolding(
     let score = build_hypothesis_score(
         ExcitedStateHypothesisKind::LocalUnfolding,
         k_h,
+        n_distinct_residues,
+        marginal_ll,
+        n_cands,
         resolved,
         BestCandidateState {
             log_likelihood: 0.0,
@@ -1566,6 +1761,7 @@ fn evaluate_h2_proline_cis_trans(
     ground_shifts: Option<&Reference>,
     ref_map_by_res_idx: &[Option<usize>],
     resolved: &[ResolvedObs],
+    n_distinct_residues: usize,
 ) -> Result<Option<HypothesisScore>, String> {
     let l = model.residues.len();
     if l == 0 || resolved.is_empty() {
@@ -1573,10 +1769,11 @@ fn evaluate_h2_proline_cis_trans(
     }
 
     let k_h = ExcitedStateHypothesisKind::XxxProCisTrans.default_k();
-    let ln_n = (resolved.len().max(1) as f64).ln();
+    let ln_n = (n_distinct_residues.max(1) as f64).ln();
     let dof = resolved.len().saturating_sub(k_h).max(1) as f64;
 
     let mut best_cand: Option<BestCandidateState> = None;
+    let mut cand_lls: Vec<f64> = Vec::new();
     let mut sub_cands: Vec<(f64, SubCandidateSummary)> = Vec::new();
 
     for (p_idx, &ref_idx_opt) in ref_map_by_res_idx.iter().enumerate().take(l) {
@@ -1584,16 +1781,8 @@ fn evaluate_h2_proline_cis_trans(
         if rp.res_name != "PRO" {
             continue;
         }
-        // Check proximity: at least one observed spin within `|i - p| <= 3` (same chain) or `d(CA_i, CA_p) <= 8.0 A`
-        let near_obs = resolved.iter().any(|o| {
-            let ro = &model.residues[o.res_idx];
-            let seq_near =
-                ro.chain_id == rp.chain_id && (ro.seq_id - rp.seq_id).abs() <= PROLINE_SEQ_WINDOW;
-            seq_near || v_dist(ro.ca, rp.ca) <= PROLINE_SPATIAL_CUTOFF_ANGSTROM
-        });
-        if !near_obs {
-            continue;
-        }
+        // Evaluate ALL Prolines in the structure (`M_H2 = N_Pro`) without data-peeking pre-filtering
+        // so discrete-scan multiplicity `ln(1/M_H2 * sum_m L_m)` honestly penalizes scanning `N_Pro` loci.
 
         let prev_intact = p_idx > 0
             && model.residues[p_idx - 1].chain_id == rp.chain_id
@@ -1727,6 +1916,7 @@ fn evaluate_h2_proline_cis_trans(
             ll += l_i;
             z2 += z_i * z_i;
         }
+        cand_lls.push(ll);
         let bic = -2.0 * ll + (k_h as f64) * ln_n;
         let affected: Vec<i32> = affected_set.into_iter().collect();
 
@@ -1785,12 +1975,17 @@ fn evaluate_h2_proline_cis_trans(
     let Some(winner) = best_cand else {
         return Ok(None);
     };
+    let marginal_ll = log_mean_exp(&cand_lls);
+    let n_cands = cand_lls.len();
     sub_cands.sort_by(|a, b| b.0.total_cmp(&a.0));
     let top_sub = sub_cands.into_iter().take(5).map(|x| x.1).collect();
 
     let score = build_hypothesis_score(
         ExcitedStateHypothesisKind::XxxProCisTrans,
         k_h,
+        n_distinct_residues,
+        marginal_ll,
+        n_cands,
         resolved,
         winner,
         top_sub,
@@ -1999,14 +2194,14 @@ fn eval_obs_ring_current_contribution(rings: &[ConjugatedAromaticRing], obs: &Re
 }
 
 fn eval_his_transition_delta_ppm(transition: HisExchangeTransition, atom: &str) -> f64 {
-    // Pelton et al. (1993) Table 1 & Platzer et al. (2014) canonical histidine state shifts:
-    // Nd1H -> Ne2H: ND1 +82.0, NE2 -82.0, CD2 -7.2, CG +4.8, CB +2.2, CA +0.55, N -0.85, H -0.12
+    // Pelton et al. (1993) Table 1, Platzer et al. (2014) & topology::HIS_*_PRIORS canonical shifts:
+    // Nd1H -> Ne2H: ND1 +82.0, NE2 -82.0, CD2 -7.2, CG +8.3 (135.5 - 127.2), CB +2.2, CA +0.55, N -0.85, H -0.12
     match transition {
         HisExchangeTransition::Nd1HToNe2H => match atom {
             "ND1" => 82.0,
             "NE2" => -82.0,
             "CD2" => -7.2,
-            "CG" => 4.8,
+            "CG" => HIS_NE2H_PRIORS.cg.0 - HIS_ND1H_PRIORS.cg.0, // +8.3 ppm
             "CE1" => 0.2,
             "HD2" => -0.12,
             "HE1" => -0.04,
@@ -2058,18 +2253,21 @@ fn eval_his_transition_delta_ppm(transition: HisExchangeTransition, atom: &str) 
         HisExchangeTransition::ImidazoliumToNd1H => {
             -eval_his_transition_delta_ppm(HisExchangeTransition::Nd1HToImidazolium, atom)
         }
+        HisExchangeTransition::AmbiguousDirectionOnUnsignedCpmg => 0.0,
     }
 }
 
 /// Evaluate `H3: RotamerOrHisTautomerFlip` (`k = 2`) across:
 /// - (a) Steric-clash-compatible `Phe`/`Tyr`/`Trp`/`His` `(chi1 in {+60, 180, -60}, chi2 in {+90, -90, 0})`
 ///   ring-current rotamer flips within `10.0 A` of exchanging spins, and
-/// - (b) Pelton (1993) `His` imidazole `Nd1-H <-> Ne2-H` tautomer & `His^0 <-> HisH^+` protonation switches.
+/// - (b) Pelton (1993) `His` imidazole `Nd1-H <-> Ne2-H` tautomer & `His^0 <-> HisH^+` protonation switches
+///   (eligible strictly when sidechain `ND1`/`NE2`/`CD2`/`CG`/`CE1` observations are present on that `HIS`).
 fn evaluate_h3_rotamer_or_his_flip(
     model: &StructureModel,
     ground_shifts: Option<&Reference>,
     ref_map_by_res_idx: &[Option<usize>],
     resolved: &[ResolvedObs],
+    n_distinct_residues: usize,
 ) -> Result<Option<HypothesisScore>, String> {
     let l = model.residues.len();
     if l == 0 || resolved.is_empty() {
@@ -2077,7 +2275,7 @@ fn evaluate_h3_rotamer_or_his_flip(
     }
 
     let k_h = ExcitedStateHypothesisKind::RotamerOrHisTautomerFlip.default_k();
-    let ln_n = (resolved.len().max(1) as f64).ln();
+    let ln_n = (n_distinct_residues.max(1) as f64).ln();
     let dof = resolved.len().saturating_sub(k_h).max(1) as f64;
 
     // Precompute ground-state total ring-current contribution at every observation
@@ -2087,6 +2285,7 @@ fn evaluate_h3_rotamer_or_his_flip(
         .collect();
 
     let mut best_cand: Option<BestCandidateState> = None;
+    let mut cand_lls: Vec<f64> = Vec::new();
     let mut sub_cands: Vec<(f64, SubCandidateSummary)> = Vec::new();
 
     const CHI1_STATES: [f64; 3] = [60.0, 180.0, -60.0];
@@ -2193,6 +2392,7 @@ fn evaluate_h3_rotamer_or_his_flip(
                     ll += l_i;
                     z2 += z_i * z_i;
                 }
+                cand_lls.push(ll);
                 let bic = -2.0 * ll + (k_h as f64) * ln_n;
                 let affected: Vec<i32> = affected_set.into_iter().collect();
                 let label = format!(
@@ -2233,17 +2433,24 @@ fn evaluate_h3_rotamer_or_his_flip(
             }
         }
 
-        // (b) Pelton et al. (1993) Histidine imidazole tautomer (`Nd1H <-> Ne2H`) & protonation transitions
-        if rr.res_name == "HIS" {
-            // Check if ground-state ND1 / NE2 shifts pin the starting histidine state
+        // (b) Pelton et al. (1993) Histidine imidazole tautomer (`Nd1H <-> Ne2H`) & protonation transitions:
+        //     eligible ONLY when sidechain `ND1`/`NE2`/`CD2`/`CG`/`CE1` data are observed on this HIS.
+        let has_his_sidechain_data = rr.res_name == "HIS"
+            && resolved.iter().any(|o| {
+                o.res_idx == r_idx
+                    && matches!(o.atom.as_str(), "ND1" | "NE2" | "CD2" | "CG" | "CE1")
+            });
+        if has_his_sidechain_data {
+            // Check if EXPERIMENTAL ground-state ND1 / NE2 shifts pin the starting histidine state
+            // (never use `fallback_sidechain_coil_ppm`, which would bias unsigned CPMG direction!).
             let mut obs_ground_nd1: Option<f64> = resolved
                 .iter()
                 .find(|o| o.res_idx == r_idx && o.atom == "ND1")
-                .and_then(|o| (o.ground_ppm > 100.0).then_some(o.ground_ppm));
+                .and_then(|o| o.explicit_ground_ppm.filter(|&v| v > 100.0));
             let mut obs_ground_ne2: Option<f64> = resolved
                 .iter()
                 .find(|o| o.res_idx == r_idx && o.atom == "NE2")
-                .and_then(|o| (o.ground_ppm > 100.0).then_some(o.ground_ppm));
+                .and_then(|o| o.explicit_ground_ppm.filter(|&v| v > 100.0));
             if let (Some(gs), Some(ri)) = (ground_shifts, ref_idx_opt) {
                 obs_ground_nd1 =
                     obs_ground_nd1.or_else(|| lookup_reference_shift(gs, ri, "HIS", "ND1"));
@@ -2251,6 +2458,7 @@ fn evaluate_h3_rotamer_or_his_flip(
                     obs_ground_ne2.or_else(|| lookup_reference_shift(gs, ri, "HIS", "NE2"));
             }
 
+            let mut his_evals: Vec<(HisExchangeTransition, f64, BestCandidateState)> = Vec::new();
             for tr in HisExchangeTransition::ALL {
                 // Filter transitions incompatible with known ground-state imidazole 15N chemical shifts
                 let compatible = match tr {
@@ -2269,6 +2477,7 @@ fn evaluate_h3_rotamer_or_his_flip(
                         obs_ground_nd1.is_none_or(|v| v <= 205.0)
                             && obs_ground_ne2.is_none_or(|v| v <= 205.0)
                     }
+                    HisExchangeTransition::AmbiguousDirectionOnUnsignedCpmg => false,
                 };
                 if !compatible {
                     continue;
@@ -2337,6 +2546,7 @@ fn evaluate_h3_rotamer_or_his_flip(
                     ll += l_i;
                     z2 += z_i * z_i;
                 }
+                cand_lls.push(ll);
                 let bic = -2.0 * ll + (k_h as f64) * ln_n;
                 let affected: Vec<i32> = affected_set.into_iter().collect();
                 let label = format!("chain {} HIS{} {}", rr.chain_id, rr.seq_id, tr.as_str());
@@ -2351,30 +2561,65 @@ fn evaluate_h3_rotamer_or_his_flip(
                     },
                 ));
 
-                if best_cand.as_ref().is_none_or(|b| ll > b.log_likelihood) {
-                    let d_nd1 = eval_his_transition_delta_ppm(tr, "ND1");
-                    let d_ne2 = eval_his_transition_delta_ppm(tr, "NE2");
-                    let d_cd2 = eval_his_transition_delta_ppm(tr, "CD2");
-                    let d_cg = eval_his_transition_delta_ppm(tr, "CG");
-                    let summary = format!(
-                        "HisTautomerOrProtonation {label} (dND1={d_nd1:+.1}, dNE2={d_ne2:+.1}, dCD2={d_cd2:+.1}, dCG={d_cg:+.1} ppm)"
-                    );
-                    let params = HypothesisBestParameters::HisTautomerOrProtonation {
-                        chain_id: rr.chain_id.clone(),
-                        seq_id: rr.seq_id,
-                        transition: tr,
-                        delta_nd1_ppm: d_nd1,
-                        delta_ne2_ppm: d_ne2,
-                        delta_cd2_ppm: d_cd2,
-                        delta_cg_ppm: d_cg,
-                    };
-                    best_cand = Some(BestCandidateState {
+                let d_nd1 = eval_his_transition_delta_ppm(tr, "ND1");
+                let d_ne2 = eval_his_transition_delta_ppm(tr, "NE2");
+                let d_cd2 = eval_his_transition_delta_ppm(tr, "CD2");
+                let d_cg = eval_his_transition_delta_ppm(tr, "CG");
+                let summary = format!(
+                    "HisTautomerOrProtonation {label} (dND1={d_nd1:+.1}, dNE2={d_ne2:+.1}, dCD2={d_cd2:+.1}, dCG={d_cg:+.1} ppm)"
+                );
+                let params = HypothesisBestParameters::HisTautomerOrProtonation {
+                    chain_id: rr.chain_id.clone(),
+                    seq_id: rr.seq_id,
+                    transition: tr,
+                    delta_nd1_ppm: d_nd1,
+                    delta_ne2_ppm: d_ne2,
+                    delta_cd2_ppm: d_cd2,
+                    delta_cg_ppm: d_cg,
+                };
+                his_evals.push((
+                    tr,
+                    ll,
+                    BestCandidateState {
                         log_likelihood: ll,
                         mu_preds,
                         summary,
                         affected_seq_ids: affected,
                         parameters: params,
+                    },
+                ));
+            }
+
+            // Detect unsigned CPMG direction tie between forward and reverse His transitions
+            let tie_map: Vec<(HisExchangeTransition, f64)> =
+                his_evals.iter().map(|(t, l, _)| (*t, *l)).collect();
+            for (tr, ll, mut state) in his_evals {
+                let rev = tr.reverse();
+                let has_rev_tie = rev != tr
+                    && tie_map.iter().any(|&(other_t, other_ll)| {
+                        other_t == rev && (other_ll - ll).abs() <= 1e-6
                     });
+                if has_rev_tie {
+                    let d_nd1 = eval_his_transition_delta_ppm(tr, "ND1").abs();
+                    let d_ne2 = eval_his_transition_delta_ppm(tr, "NE2").abs();
+                    let d_cd2 = eval_his_transition_delta_ppm(tr, "CD2").abs();
+                    let d_cg = eval_his_transition_delta_ppm(tr, "CG").abs();
+                    state.summary = format!(
+                        "HisTautomerOrProtonation chain {} HIS{} AmbiguousDirectionOnUnsignedCpmg (|dND1|={d_nd1:.1}, |dNE2|={d_ne2:.1}, |dCD2|={d_cd2:.1}, |dCG|={d_cg:.1} ppm)",
+                        rr.chain_id, rr.seq_id
+                    );
+                    state.parameters = HypothesisBestParameters::HisTautomerOrProtonation {
+                        chain_id: rr.chain_id.clone(),
+                        seq_id: rr.seq_id,
+                        transition: HisExchangeTransition::AmbiguousDirectionOnUnsignedCpmg,
+                        delta_nd1_ppm: d_nd1,
+                        delta_ne2_ppm: d_ne2,
+                        delta_cd2_ppm: d_cd2,
+                        delta_cg_ppm: d_cg,
+                    };
+                }
+                if best_cand.as_ref().is_none_or(|b| ll > b.log_likelihood) {
+                    best_cand = Some(state);
                 }
             }
         }
@@ -2383,12 +2628,17 @@ fn evaluate_h3_rotamer_or_his_flip(
     let Some(winner) = best_cand else {
         return Ok(None);
     };
+    let marginal_ll = log_mean_exp(&cand_lls);
+    let n_cands = cand_lls.len();
     sub_cands.sort_by(|a, b| b.0.total_cmp(&a.0));
     let top_sub = sub_cands.into_iter().take(5).map(|x| x.1).collect();
 
     let score = build_hypothesis_score(
         ExcitedStateHypothesisKind::RotamerOrHisTautomerFlip,
         k_h,
+        n_distinct_residues,
+        marginal_ll,
+        n_cands,
         resolved,
         winner,
         top_sub,
@@ -2405,6 +2655,7 @@ fn evaluate_h4_alt_conformers(
     firewall_query: &HomologFirewallQuery,
     struct_cfg: &StructShiftConfig,
     resolved: &[ResolvedObs],
+    n_distinct_residues: usize,
 ) -> Result<Option<HypothesisScore>, String> {
     if alt_structures.is_empty() || resolved.is_empty() {
         return Ok(None);
@@ -2417,7 +2668,7 @@ fn evaluate_h4_alt_conformers(
     }
 
     let k_h = ExcitedStateHypothesisKind::Alternate3DConformer.default_k();
-    let ln_n = (resolved.len().max(1) as f64).ln();
+    let ln_n = (n_distinct_residues.max(1) as f64).ln();
     let dof = resolved.len().saturating_sub(k_h).max(1) as f64;
 
     let g_keys: Vec<(i32, &str)> = ground_model
@@ -2427,6 +2678,7 @@ fn evaluate_h4_alt_conformers(
         .collect();
 
     let mut best_cand: Option<BestCandidateState> = None;
+    let mut cand_lls: Vec<f64> = Vec::new();
     let mut sub_cands: Vec<(f64, SubCandidateSummary)> = Vec::new();
 
     for (m_idx, alt) in alt_structures.iter().enumerate() {
@@ -2484,6 +2736,7 @@ fn evaluate_h4_alt_conformers(
             ll += l_i;
             z2 += z_i * z_i;
         }
+        cand_lls.push(ll);
         let bic = -2.0 * ll + (k_h as f64) * ln_n;
         let affected: Vec<i32> = affected_set.into_iter().collect();
         let label = format!("alt[{}] '{}'", m_idx, alt.label);
@@ -2524,12 +2777,17 @@ fn evaluate_h4_alt_conformers(
     let Some(winner) = best_cand else {
         return Ok(None);
     };
+    let marginal_ll = log_mean_exp(&cand_lls);
+    let n_cands = cand_lls.len();
     sub_cands.sort_by(|a, b| b.0.total_cmp(&a.0));
     let top_sub = sub_cands.into_iter().take(5).map(|x| x.1).collect();
 
     let score = build_hypothesis_score(
         ExcitedStateHypothesisKind::Alternate3DConformer,
         k_h,
+        n_distinct_residues,
+        marginal_ll,
+        n_cands,
         resolved,
         winner,
         top_sub,
@@ -2636,6 +2894,8 @@ pub fn classify_excited_state_with_firewall(
     let mut n_unmatched = 0usize;
     let mut n_signed = 0usize;
     let mut n_unsigned = 0usize;
+    let mut seen_raw_keys: BTreeSet<(String, i32, String)> = BTreeSet::new();
+    let mut seen_resolved_keys: BTreeSet<(String, i32, String)> = BTreeSet::new();
 
     for (oi, obs) in observations.iter().enumerate() {
         if !obs.dw_ppm.is_finite() || !obs.dw_err_ppm.is_finite() || obs.dw_err_ppm <= 0.0 {
@@ -2648,6 +2908,20 @@ pub fn classify_excited_state_with_firewall(
             return Err(format!(
                 "observation #{oi} (seq_id={}, atom='{}') is UnsignedMagnitude but has negative dw_ppm={}",
                 obs.seq_id, obs.atom, obs.dw_ppm
+            ));
+        }
+
+        let pre_canon_atom = canonicalize_exchange_atom_name(obs.res_name.as_deref(), &obs.atom);
+        let raw_chain = obs.chain_id.trim();
+        let raw_chain_norm = if raw_chain.is_empty() { "A" } else { raw_chain };
+        if !seen_raw_keys.insert((
+            raw_chain_norm.to_string(),
+            obs.seq_id,
+            pre_canon_atom.clone(),
+        )) {
+            return Err(format!(
+                "duplicate exchange observation for (chain_id='{raw_chain_norm}', seq_id={}, atom='{pre_canon_atom}')",
+                obs.seq_id
             ));
         }
 
@@ -2685,13 +2959,25 @@ pub fn classify_excited_state_with_firewall(
         }
 
         let canon_atom = canonicalize_exchange_atom_name(Some(&r_struct.res_name), &obs.atom);
+        if !seen_resolved_keys.insert((
+            r_struct.chain_id.clone(),
+            r_struct.seq_id,
+            canon_atom.clone(),
+        )) {
+            return Err(format!(
+                "duplicate exchange observation for (chain_id='{}', seq_id={}, atom='{canon_atom}')",
+                r_struct.chain_id, r_struct.seq_id
+            ));
+        }
+
         let (pred_struct_opt, pred_rc_opt) =
             lookup_pred_struct_and_rc(&pred_a, res_idx, &canon_atom);
         let gs_ppm_opt = match (ground_shifts, ref_map_by_res_idx[res_idx]) {
             (Some(gs), Some(ri)) => lookup_reference_shift(gs, ri, &r_struct.res_name, &canon_atom),
             _ => None,
         };
-        let ground_ppm_opt = obs.major_ppm.or(gs_ppm_opt).or(pred_struct_opt);
+        let explicit_ground_ppm = obs.major_ppm.or(gs_ppm_opt);
+        let ground_ppm_opt = explicit_ground_ppm.or(pred_struct_opt);
         let coil_ppm = pred_rc_opt.unwrap_or_else(|| {
             fallback_sidechain_coil_ppm(
                 &r_struct.res_name,
@@ -2723,8 +3009,10 @@ pub fn classify_excited_state_with_firewall(
             sign_mode: obs.sign_mode,
             dw_ppm: obs.dw_ppm,
             dw_err_ppm: obs.dw_err_ppm,
+            sigma_fwd_ppm: sigma_fwd,
             sigma_tot_ppm: sigma_tot,
             ground_ppm,
+            explicit_ground_ppm,
             pred_a_struct_ppm: pred_struct_opt,
             coil_target_ppm: coil_ppm,
             spin_coords,
@@ -2735,26 +3023,70 @@ pub fn classify_excited_state_with_firewall(
         return Err("zero exchange observations matched residues in ground_structure".to_string());
     }
 
-    // Evaluate H0 (Null) and biophysical hypotheses H1..H4
+    if cfg.cpmg_prefiltered_significant_only {
+        warnings.push(
+            "CPMG input pre-filtered by significant_exchange=true (non-exchanging Delta_varpi=0 rows excluded by pre-filter)"
+                .to_string(),
+        );
+    }
+
+    let distinct_res_set: BTreeSet<(String, i32)> = resolved
+        .iter()
+        .map(|o| (o.chain_id.clone(), o.seq_id))
+        .collect();
+    let n_distinct_residues = distinct_res_set.len();
+
+    let distinct_exch_res_set: BTreeSet<(String, i32)> = resolved
+        .iter()
+        .filter(|o| o.dw_ppm.abs() > 2.0 * o.dw_err_ppm)
+        .map(|o| (o.chain_id.clone(), o.seq_id))
+        .collect();
+    let n_distinct_exchanging_residues = distinct_exch_res_set.len();
+
+    // Evaluate H0 (Null, parameterized solely with experimental sigma_exp) and biophysical hypotheses H1..H4
     let mut hyps = Vec::with_capacity(5);
     let zeros = vec![0.0_f64; resolved.len()];
     let h0 = build_hypothesis_score(
         ExcitedStateHypothesisKind::NullOrUnstructuredPerturbation,
         0,
+        n_distinct_residues,
+        0.0,
+        1,
         &resolved,
         BestCandidateState {
             log_likelihood: 0.0,
             mu_preds: zeros,
-            summary: "NullOrUnstructuredPerturbation (mu_Delta = 0 across all spins)".to_string(),
+            summary:
+                "NullOrUnstructuredPerturbation (mu_Delta = 0, sigma = sigma_exp across all spins)"
+                    .to_string(),
             affected_seq_ids: Vec::new(),
             parameters: HypothesisBestParameters::Null,
         },
         Vec::new(),
     )?;
     let bic_null = h0.bic;
+    let h0_reduced_chi2 = h0.reduced_chi2;
+
+    // Empirical unmodeled-exchange Bayes factor against H0 (for sites exceeding |z_0| > 3.5)
+    let mut unmod_delta_ll = 0.0;
+    let mut unmod_active_res: BTreeSet<(String, i32)> = BTreeSet::new();
+    for (o, p0) in resolved.iter().zip(h0.predictions.iter()) {
+        if p0.z_residual.abs() > 3.5 {
+            let (ll_fit, _, _) = eval_single_obs_ll_and_z_with_sigma(o, o.dw_ppm, o.dw_err_ppm)?;
+            if ll_fit > p0.log_likelihood {
+                unmod_delta_ll += ll_fit - p0.log_likelihood;
+                unmod_active_res.insert((o.chain_id.clone(), o.seq_id));
+            }
+        }
+    }
+    let ln_n_res = (n_distinct_residues.max(1) as f64).ln();
+    let unmodeled_exchange_two_ln_bf_vs_null =
+        (2.0 * unmod_delta_ll - (unmod_active_res.len() as f64) * ln_n_res).max(0.0);
+
     hyps.push(h0);
 
-    if let Some(h1) = evaluate_h1_local_unfolding(ground_structure, &resolved)? {
+    if let Some(h1) = evaluate_h1_local_unfolding(ground_structure, &resolved, n_distinct_residues)?
+    {
         hyps.push(h1);
     }
     if let Some(h2) = evaluate_h2_proline_cis_trans(
@@ -2762,6 +3094,7 @@ pub fn classify_excited_state_with_firewall(
         ground_shifts,
         &ref_map_by_res_idx,
         &resolved,
+        n_distinct_residues,
     )? {
         hyps.push(h2);
     }
@@ -2770,6 +3103,7 @@ pub fn classify_excited_state_with_firewall(
         ground_shifts,
         &ref_map_by_res_idx,
         &resolved,
+        n_distinct_residues,
     )? {
         hyps.push(h3);
     }
@@ -2780,6 +3114,7 @@ pub fn classify_excited_state_with_firewall(
         firewall_query,
         &struct_cfg,
         &resolved,
+        n_distinct_residues,
     )? {
         hyps.push(h4);
     }
@@ -2808,35 +3143,112 @@ pub fn classify_excited_state_with_firewall(
     }
     hyps[0].two_ln_bf_vs_runner_up = Some(two_ln_bf_12);
 
+    // Pairwise head-to-head non-null comparison for every non-null hypothesis
+    let non_null_bics: Vec<(ExcitedStateHypothesisKind, f64)> = hyps
+        .iter()
+        .filter(|h| h.kind != ExcitedStateHypothesisKind::NullOrUnstructuredPerturbation)
+        .map(|h| (h.kind, h.bic))
+        .collect();
+    for h in &mut hyps {
+        if h.kind != ExcitedStateHypothesisKind::NullOrUnstructuredPerturbation {
+            if let Some(&(_, best_other_bic)) = non_null_bics.iter().find(|&&(k, _)| k != h.kind) {
+                h.two_ln_bf_vs_best_other_non_null = Some(best_other_bic - h.bic);
+            }
+        }
+    }
+    let (two_ln_bf_top1_vs_runnerup_non_null, runnerup_non_null_hypothesis) =
+        if hyps[0].kind != ExcitedStateHypothesisKind::NullOrUnstructuredPerturbation {
+            match non_null_bics
+                .iter()
+                .find(|&&(k, _)| k != hyps[0].kind)
+                .copied()
+            {
+                Some((rk, rbic)) => (Some(rbic - hyps[0].bic), Some(rk)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
     let top = &hyps[0];
     let n_obs = resolved.len();
     let top_bf_null = top.two_ln_bf_vs_null;
     let top_rchi2 = top.reduced_chi2;
+    let h0_rejected_by_data = h0_reduced_chi2 > cfg.max_reduced_chi2
+        || top_bf_null >= cfg.min_two_ln_bf_null
+        || unmodeled_exchange_two_ln_bf_vs_null >= cfg.min_two_ln_bf_null;
 
-    let (verdict, verdict_reason) = if n_obs < cfg.min_obs_to_commit {
+    let (verdict, abstention_kind, verdict_reason) = if n_distinct_residues < cfg.min_obs_to_commit
+    {
         (
             ExcitedStateVerdict::AmbiguousOrUnmodeledState,
+            Some(ExcitedStateAbstentionKind::InsufficientDistinctResidues),
             format!(
-                "abstained: matched observation count N_obs={} < minimum {}",
-                n_obs, cfg.min_obs_to_commit
+                "abstained: distinct residue count N_res={} (N_obs={}) < minimum {}",
+                n_distinct_residues, n_obs, cfg.min_obs_to_commit
             ),
         )
     } else if top.kind == ExcitedStateHypothesisKind::NullOrUnstructuredPerturbation {
+        if h0_rejected_by_data {
+            (
+                ExcitedStateVerdict::AmbiguousOrUnmodeledState,
+                Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange),
+                format!(
+                    "UnmodeledSignificantExchange: significant exchange rejects H0 (H0 reduced chi^2_nu={:.3} > {:.2}, unmodeled 2 ln BF={:.2}), but no modeled mechanism H1..H4 fits the shift pattern",
+                    h0_reduced_chi2, cfg.max_reduced_chi2, unmodeled_exchange_two_ln_bf_vs_null
+                ),
+            )
+        } else {
+            (
+                ExcitedStateVerdict::AmbiguousOrUnmodeledState,
+                Some(ExcitedStateAbstentionKind::ConsistentWithNoise),
+                format!(
+                    "abstained: H0 (NullOrUnstructuredPerturbation) has the lowest BIC and fits within experimental noise (H0 reduced chi^2_nu={:.3} <= {:.2})",
+                    h0_reduced_chi2, cfg.max_reduced_chi2
+                ),
+            )
+        }
+    } else if top_rchi2 > cfg.max_reduced_chi2 {
         (
             ExcitedStateVerdict::AmbiguousOrUnmodeledState,
-            "abstained: H0 (NullOrUnstructuredPerturbation) has the lowest BIC (no significant structured conformational switch above noise)".to_string(),
-        )
-    } else if top_bf_null < cfg.min_two_ln_bf_null {
-        (
-            ExcitedStateVerdict::AmbiguousOrUnmodeledState,
+            Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange),
             format!(
-                "abstained: 2 ln BF_(1,H0) = {:.2} < {:.2} strong-evidence threshold over Null",
-                top_bf_null, cfg.min_two_ln_bf_null
+                "UnmodeledSignificantExchange: H0 rejected (2 ln BF_(1,H0)={:.2}, H0 reduced chi^2_nu={:.3}), yet top hypothesis {} has reduced chi^2_nu={:.3} > {:.2} goodness-of-fit ceiling",
+                top_bf_null,
+                h0_reduced_chi2,
+                top.kind.as_str(),
+                top_rchi2,
+                cfg.max_reduced_chi2
             ),
         )
+    } else if top_bf_null < cfg.min_two_ln_bf_null {
+        if h0_rejected_by_data {
+            (
+                ExcitedStateVerdict::AmbiguousOrUnmodeledState,
+                Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange),
+                format!(
+                    "UnmodeledSignificantExchange: significant exchange rejects H0 (H0 reduced chi^2_nu={:.3}, unmodeled 2 ln BF={:.2}), while top hypothesis {} has 2 ln BF_(1,H0) = {:.2} < {:.2}",
+                    h0_reduced_chi2,
+                    unmodeled_exchange_two_ln_bf_vs_null,
+                    top.kind.as_str(),
+                    top_bf_null,
+                    cfg.min_two_ln_bf_null
+                ),
+            )
+        } else {
+            (
+                ExcitedStateVerdict::AmbiguousOrUnmodeledState,
+                Some(ExcitedStateAbstentionKind::ConsistentWithNoise),
+                format!(
+                    "abstained: 2 ln BF_(1,H0) = {:.2} < {:.2} strong-evidence threshold over Null",
+                    top_bf_null, cfg.min_two_ln_bf_null
+                ),
+            )
+        }
     } else if two_ln_bf_12 < cfg.min_two_ln_bf_12 {
         (
             ExcitedStateVerdict::AmbiguousOrUnmodeledState,
+            Some(ExcitedStateAbstentionKind::AmbiguousBetweenMechanisms),
             format!(
                 "abstained: 2 ln BF_(1,2) = {:.2} < {:.2} Kass-Raftery positive/strong separation over runner-up {}",
                 two_ln_bf_12,
@@ -2844,22 +3256,27 @@ pub fn classify_excited_state_with_firewall(
                 hyps.get(1).map(|h| h.kind.as_str()).unwrap_or("none")
             ),
         )
-    } else if top_rchi2 > cfg.max_reduced_chi2 {
+    } else if n_distinct_exchanging_residues < cfg.min_obs_to_commit {
         (
             ExcitedStateVerdict::AmbiguousOrUnmodeledState,
+            Some(ExcitedStateAbstentionKind::InsufficientDistinctResidues),
             format!(
-                "abstained: top hypothesis {} has reduced chi^2_nu = {:.3} > {:.2} goodness-of-fit ceiling (unmodeled or composite state)",
-                top.kind.as_str(),
-                top_rchi2,
-                cfg.max_reduced_chi2
+                "abstained: distinct exchanging residue count N_exch_res={} (N_res={}, N_obs={}) < minimum {} required to commit",
+                n_distinct_exchanging_residues,
+                n_distinct_residues,
+                n_obs,
+                cfg.min_obs_to_commit
             ),
         )
     } else {
         (
             ExcitedStateVerdict::Committed(top.kind),
+            None,
             format!(
-                "committed {}: N_obs={}, 2 ln BF_(1,2)={:.2} >= {:.1}, 2 ln BF_(1,H0)={:.2} >= {:.1}, reduced chi^2_nu={:.3} <= {:.2}",
+                "committed {}: N_exch_res={} (N_res={}, N_obs={}), 2 ln BF_(1,2)={:.2} >= {:.1}, 2 ln BF_(1,H0)={:.2} >= {:.1}, reduced chi^2_nu={:.3} <= {:.2}",
                 top.kind.as_str(),
+                n_distinct_exchanging_residues,
+                n_distinct_residues,
                 n_obs,
                 two_ln_bf_12,
                 cfg.min_two_ln_bf_12,
@@ -2874,18 +3291,26 @@ pub fn classify_excited_state_with_firewall(
     Ok(ExcitedStateReport {
         verdict,
         verdict_reason,
+        abstention_kind,
         n_observations: n_obs,
+        n_distinct_residues,
+        n_distinct_exchanging_residues,
         n_signed_observations: n_signed,
         n_unsigned_observations: n_unsigned,
         n_unmatched_observations: n_unmatched,
         two_ln_bf_top1_vs_top2: two_ln_bf_12,
+        two_ln_bf_top1_vs_runnerup_non_null,
+        runnerup_non_null_hypothesis,
         two_ln_bf_top1_vs_null: top_bf_null,
+        unmodeled_exchange_two_ln_bf_vs_null,
         top1_reduced_chi2: top_rchi2,
+        cpmg_prefiltered_significant_only: cfg.cpmg_prefiltered_significant_only,
         sample_ph: cfg.sample_ph,
         temperature_kelvin: cfg.temperature_kelvin,
         ground_exclusion_list_sha256: pred_a.exclusion_list_sha256,
         ground_max_retained_seq_identity: pred_a.max_retained_seq_identity,
         ranked_hypotheses: hyps,
         warnings,
+        scope_limits_note: EXCITED_STATE_SCOPE_LIMITS_NOTE.to_string(),
     })
 }

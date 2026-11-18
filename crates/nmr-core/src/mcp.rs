@@ -77,8 +77,8 @@ use crate::dosy::{
     SoluteCompactnessClass, VarianDosyOverrides, ILT_ARTIFACT_CAVEAT,
 };
 use crate::excited_state::{
-    classify_excited_state_with_firewall, parse_exchange_observations_tsv, AltConformerInput,
-    ExcitedStateConfig,
+    classify_excited_state_with_firewall, parse_exchange_observations_tsv_with_meta,
+    AltConformerInput, ExcitedStateConfig, MAX_ALT_STRUCTURES,
 };
 use crate::metabolomics::{
     compute_stocsy_at_ppm, run_metabolomics_pipeline, BiofluidMaskPreset, BucketingMethod,
@@ -131,6 +131,21 @@ pub const MAX_MCP_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum resource file size (`8 MiB`) returned by `resources/read`.
 pub const MAX_RESOURCE_READ_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Maximum text/TSV/JSON/restraint file size (`16 MiB`) read by Phase 21 MCP tools.
+pub const MAX_MCP_PHASE21_TEXT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum 3D structure file size (`64 MiB`, `.cif`/`.pdb`) read by Phase 21 MCP tools.
+pub const MAX_MCP_STRUCTURE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum number of candidate co-fold complex poses evaluated in one `score_cofold_poses` call (`32`).
+pub const MAX_MCP_COFOLD_POSES: usize = 32;
+
+/// Maximum cumulative byte size across all candidate poses in one `score_cofold_poses` call (`128 MiB`).
+pub const MAX_MCP_COFOLD_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Maximum length in ASCII characters for sanitized MCP parse/domain error messages (`160`).
+pub const MAX_MCP_ERROR_MESSAGE_CHARS: usize = 160;
 
 /// JSON-RPC 2.0 standard parse error (`Invalid JSON was received by the server`).
 pub const ERR_PARSE_ERROR: i32 = -32700;
@@ -581,6 +596,10 @@ impl McpSecurityPolicy {
         self.access_mode
     }
 
+    pub fn set_access_mode(&mut self, access_mode: McpAccessMode) {
+        self.access_mode = access_mode;
+    }
+
     pub fn hide_write_tools_in_read_only(&self) -> bool {
         self.hide_write_tools_in_read_only
     }
@@ -651,6 +670,12 @@ impl McpSecurityPolicy {
             return Err(McpSecurityError::new(
                 McpSecurityErrorKind::NullByteOrInvalidPath,
                 "path must not be empty",
+            ));
+        }
+        if has_forbidden_uri_scheme_str(trimmed) {
+            return Err(McpSecurityError::new(
+                McpSecurityErrorKind::NullByteOrInvalidPath,
+                "URI schemes are forbidden in sandboxed MCP file paths",
             ));
         }
         if self.allowed_roots.is_empty() {
@@ -871,6 +896,210 @@ fn path_to_forward_slashes(path: &Path) -> String {
     parts.join("/")
 }
 
+/// Detect ANY URI scheme (`http://`, `https://`, `file://`, `ftp://`, `s3://`, `data:`,
+/// `javascript:`, `blob:`, `mailto:`, `ssh:`, etc.) while leaving single-letter Windows drive
+/// prefixes (`C:\...`) to the lexical path sandbox guard.
+fn has_forbidden_uri_scheme_str(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.contains("://") {
+        return true;
+    }
+    if let Some((scheme, _rest)) = trimmed.split_once(':') {
+        if (2..=24).contains(&scheme.len()) {
+            let bytes = scheme.as_bytes();
+            let valid_scheme = bytes[0].is_ascii_alphabetic()
+                && bytes
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+            if valid_scheme {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Collapse non-printable/non-ASCII bytes to ASCII spaces and cap length to `<= max_chars` (`160`).
+fn truncate_printable_ascii(raw: &str, max_chars: usize) -> String {
+    let mut cleaned = String::with_capacity(raw.len().min(max_chars + 16));
+    let mut prev_space = false;
+    for b in raw.bytes() {
+        let ch = if (0x20..=0x7E).contains(&b) {
+            b as char
+        } else {
+            ' '
+        };
+        if ch == ' ' {
+            if !prev_space && !cleaned.is_empty() {
+                cleaned.push(' ');
+            }
+            prev_space = true;
+        } else {
+            cleaned.push(ch);
+            prev_space = false;
+        }
+    }
+    let trimmed = cleaned.trim();
+    if trimmed.len() <= max_chars {
+        trimmed.to_string()
+    } else if max_chars > 3 {
+        format!("{}...", &trimmed[..max_chars - 3])
+    } else {
+        trimmed[..max_chars].to_string()
+    }
+}
+
+/// Sanitize any general MCP domain error message to printable ASCII `<= 160` characters.
+pub fn sanitize_mcp_error_message(raw: &str) -> String {
+    truncate_printable_ascii(raw, MAX_MCP_ERROR_MESSAGE_CHARS)
+}
+
+/// Sanitize untrusted file/TSV/STAR/NEF/PDB/CIF parser errors by redacting all quoted/backticked
+/// file tokens (`'...'`, `"..."`, `` `...` ``) and oversized unquoted tokens before truncating to
+/// `<= 160` printable ASCII characters, eliminating prompt-injection echo vectors.
+fn sanitize_untrusted_parse_error(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut unquoted = String::with_capacity(bytes.len().min(256));
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if matches!(b, b'\'' | b'"' | b'`') {
+            let quote = b;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            unquoted.push_str("<redacted>");
+        } else {
+            unquoted.push(if (0x20..=0x7E).contains(&b) {
+                b as char
+            } else {
+                ' '
+            });
+            i += 1;
+        }
+    }
+    let mut safe_tokens = Vec::new();
+    for tok in unquoted.split_whitespace() {
+        if tok.len() > 36 && tok != "<redacted>" {
+            safe_tokens.push("<redacted>");
+        } else {
+            safe_tokens.push(tok);
+        }
+    }
+    truncate_printable_ascii(&safe_tokens.join(" "), MAX_MCP_ERROR_MESSAGE_CHARS)
+}
+
+/// Format a `serde_json::Error` using only line/column and structural category (`<= 160` ASCII
+/// chars), never echoing raw untrusted JSON keys or string values into LLM context.
+fn sanitize_serde_json_error(prefix: &str, err: &serde_json::Error) -> String {
+    let cat = match err.classify() {
+        serde_json::error::Category::Io => "I/O",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "schema/type",
+        serde_json::error::Category::Eof => "unexpected EOF",
+    };
+    sanitize_mcp_error_message(&format!(
+        "{prefix}: JSON {cat} error at line {}, column {}",
+        err.line(),
+        err.column()
+    ))
+}
+
+/// Inspect `fs::symlink_metadata` strictly BEFORE opening any file in MCP tools (`21.W3:P1-13`):
+/// rejects FIFOs, Unix domain sockets, character/block devices, directories, and symlinks
+/// (`!meta.file_type().is_file()`), and enforces pre-read byte size caps (`<= max_bytes`).
+fn validate_regular_file_before_read(
+    resolved: &Path,
+    display_label: &str,
+    max_bytes: u64,
+) -> Result<u64, McpCallToolResult> {
+    let meta = fs::symlink_metadata(resolved).map_err(|_| {
+        McpCallToolResult::domain_error(
+            "io_error",
+            format!("unable to inspect metadata for '{display_label}'"),
+        )
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(McpCallToolResult::domain_error(
+            "special_file_rejected",
+            format!(
+                "refusing to read non-regular file '{display_label}' (FIFOs, sockets, devices, directories, and symlinks are forbidden)"
+            ),
+        ));
+    }
+    if meta.len() > max_bytes {
+        return Err(McpCallToolResult::domain_error(
+            "file_too_large",
+            format!(
+                "file '{display_label}' ({} bytes) exceeds maximum allowed size ({max_bytes} bytes)",
+                meta.len()
+            ),
+        ));
+    }
+    Ok(meta.len())
+}
+
+/// Validate `symlink_metadata` (`is_file()` & `<= max_bytes`) prior to opening, verify the opened
+/// file descriptor metadata, and read bounded UTF-8 text (`take(max_bytes + 1)`).
+fn read_bounded_regular_file_to_string(
+    resolved: &Path,
+    display_label: &str,
+    max_bytes: u64,
+) -> Result<String, McpCallToolResult> {
+    let est_len = validate_regular_file_before_read(resolved, display_label, max_bytes)?;
+    let file = fs::File::open(resolved).map_err(|_| {
+        McpCallToolResult::domain_error("io_error", format!("failed to open '{display_label}'"))
+    })?;
+    let fd_meta = file.metadata().map_err(|_| {
+        McpCallToolResult::domain_error(
+            "io_error",
+            format!("failed to stat open handle for '{display_label}'"),
+        )
+    })?;
+    if !fd_meta.file_type().is_file() {
+        return Err(McpCallToolResult::domain_error(
+            "special_file_rejected",
+            format!("open handle for '{display_label}' is not a regular file"),
+        ));
+    }
+    if fd_meta.len() > max_bytes {
+        return Err(McpCallToolResult::domain_error(
+            "file_too_large",
+            format!(
+                "file '{display_label}' ({} bytes) exceeds maximum allowed size ({max_bytes} bytes)",
+                fd_meta.len()
+            ),
+        ));
+    }
+    let mut buf = Vec::with_capacity((est_len as usize).min(64 * 1024));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|_| {
+            McpCallToolResult::domain_error("io_error", format!("failed to read '{display_label}'"))
+        })?;
+    if (buf.len() as u64) > max_bytes {
+        return Err(McpCallToolResult::domain_error(
+            "file_too_large",
+            format!("file '{display_label}' grew beyond maximum allowed size ({max_bytes} bytes)"),
+        ));
+    }
+    String::from_utf8(buf).map_err(|_| {
+        McpCallToolResult::domain_error(
+            "encoding_error",
+            format!("file '{display_label}' is not valid UTF-8 text"),
+        )
+    })
+}
+
 // ============================================================================
 // JSON-RPC 2.0 & MCP Wire Types
 // ============================================================================
@@ -1012,17 +1241,22 @@ pub struct McpCallToolResult {
 
 impl McpCallToolResult {
     pub fn ok_json(summary_payload: &Value) -> Self {
-        let pretty =
-            serde_json::to_string_pretty(summary_payload).unwrap_or_else(|_| "{}".to_string());
-        Self {
-            content: vec![McpContentBlock::text(pretty)],
-            is_error: Some(false),
-            structured_content: Some(summary_payload.clone()),
+        match serde_json::to_string_pretty(summary_payload) {
+            Ok(pretty) => Self {
+                content: vec![McpContentBlock::text(pretty)],
+                is_error: Some(false),
+                structured_content: Some(summary_payload.clone()),
+            },
+            Err(e) => Self::domain_error(
+                "serialization_error",
+                format!("failed to serialize tool JSON payload: {e}"),
+            ),
         }
     }
 
     pub fn domain_error(kind: &str, message: impl Into<String>) -> Self {
-        let msg = message.into();
+        let raw_msg = message.into();
+        let msg = sanitize_mcp_error_message(&raw_msg);
         Self {
             content: vec![McpContentBlock::text(format!("[MCP {kind}]: {msg}"))],
             is_error: Some(true),
@@ -1095,6 +1329,7 @@ pub struct McpServer {
     initialized: bool,
     negotiated_protocol_version: String,
     client_name: Option<String>,
+    test_panic_probe_enabled: bool,
 }
 
 impl McpServer {
@@ -1104,7 +1339,15 @@ impl McpServer {
             initialized: false,
             negotiated_protocol_version: MCP_PROTOCOL_VERSION.to_string(),
             client_name: None,
+            test_panic_probe_enabled: false,
         }
+    }
+
+    /// Test-only hook enabling `__test_panic_probe` in `tools/call` to verify `catch_unwind`
+    /// isolation across `stdio` and HTTP transports without exposing a public tool descriptor.
+    #[doc(hidden)]
+    pub fn enable_test_panic_probe(&mut self) {
+        self.test_panic_probe_enabled = true;
     }
 
     pub fn policy(&self) -> &McpSecurityPolicy {
@@ -1368,7 +1611,35 @@ impl McpServer {
             }
         };
 
-        let result = match name {
+        if !(self.test_panic_probe_enabled && name == "__test_panic_probe")
+            && !matches!(
+                name,
+                "inspect_nmr_directory"
+                    | "read_nmrstar_summary"
+                    | "read_peak_list_summary"
+                    | "evaluate_dataset_qc"
+                    | "predict_homolog_free_torsions"
+                    | "fit_relaxation_or_exchange"
+                    | "track_csp_titration"
+                    | "analyze_nmr1d_spectrum"
+                    | "fit_dosy_diffusion"
+                    | "run_metabolomics_chemometrics"
+                    | "af_concordance"
+                    | "predict_structure_shifts"
+                    | "score_cofold_poses"
+                    | "classify_excited_state"
+                    | "write_curated_peak_tsv"
+                    | "export_nmrstar_shifts"
+            )
+        {
+            return Err(JsonRpcError {
+                code: ERR_INVALID_PARAMS,
+                message: format!("unknown MCP tool '{name}'"),
+                data: None,
+            });
+        }
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match name {
             "inspect_nmr_directory" => self.tool_inspect_nmr_directory(&args_map),
             "read_nmrstar_summary" => self.tool_read_nmrstar_summary(&args_map),
             "read_peak_list_summary" => self.tool_read_peak_list_summary(&args_map),
@@ -1385,13 +1656,18 @@ impl McpServer {
             "classify_excited_state" => self.tool_classify_excited_state(&args_map),
             "write_curated_peak_tsv" => self.tool_write_curated_peak_tsv(&args_map),
             "export_nmrstar_shifts" => self.tool_export_nmrstar_shifts(&args_map),
-            _ => {
-                return Err(JsonRpcError {
-                    code: ERR_INVALID_PARAMS,
-                    message: format!("unknown MCP tool '{name}'"),
-                    data: None,
-                });
+            "__test_panic_probe" => {
+                panic!("simulated internal tool panic for MCP catch_unwind guard verification");
             }
+            _ => McpCallToolResult::domain_error("invalid_arguments", "unknown MCP tool"),
+        }));
+
+        let result = match caught {
+            Ok(res) => res,
+            Err(_) => McpCallToolResult::domain_error(
+                "internal_tool_panic",
+                format!("internal panic caught while executing MCP tool '{name}'; server state preserved"),
+            ),
         };
 
         serde_json::to_value(result).map_err(|e| JsonRpcError {
@@ -3087,21 +3363,21 @@ impl McpServer {
             }));
         }
 
-        let text = match fs::read_to_string(&resolved) {
+        let dosy_lbl = self.policy.relativize_display_path(&resolved);
+        let text = match read_bounded_regular_file_to_string(
+            &resolved,
+            &dosy_lbl,
+            MAX_MCP_PHASE21_TEXT_BYTES,
+        ) {
             Ok(t) => t,
-            Err(e) => {
-                return McpCallToolResult::domain_error(
-                    "io_error",
-                    format!("failed to read DOSY dataset JSON: {e}"),
-                );
-            }
+            Err(err_res) => return err_res,
         };
         let parsed: McpDosyInputJson = match serde_json::from_str(&text) {
             Ok(d) => d,
             Err(e) => {
                 return McpCallToolResult::domain_error(
                     "dosy_parse_error",
-                    format!("invalid DOSY JSON payload: {e}"),
+                    sanitize_serde_json_error("invalid DOSY JSON payload", &e),
                 );
             }
         };
@@ -3463,12 +3739,9 @@ impl McpServer {
         &self,
         resolved: &Path,
     ) -> Result<Vec<CohortSample1D>, McpCallToolResult> {
-        let text = fs::read_to_string(resolved).map_err(|e| {
-            McpCallToolResult::domain_error(
-                "io_error",
-                format!("failed to read metabolomics cohort file: {e}"),
-            )
-        })?;
+        let cohort_lbl = self.policy.relativize_display_path(resolved);
+        let text =
+            read_bounded_regular_file_to_string(resolved, &cohort_lbl, MAX_MCP_STRUCTURE_BYTES)?;
         let is_json = resolved
             .extension()
             .and_then(|s| s.to_str())
@@ -3482,7 +3755,7 @@ impl McpServer {
             let val: Value = serde_json::from_str(&text).map_err(|e| {
                 McpCallToolResult::domain_error(
                     "metabolomics_parse_error",
-                    format!("invalid metabolomics cohort JSON: {e}"),
+                    sanitize_serde_json_error("invalid metabolomics cohort JSON", &e),
                 )
             })?;
             if let Some(arr) = val.get("samples") {
@@ -3490,7 +3763,7 @@ impl McpServer {
                     serde_json::from_value(arr.clone()).map_err(|e| {
                         McpCallToolResult::domain_error(
                             "metabolomics_parse_error",
-                            format!("invalid 'samples' array in cohort JSON: {e}"),
+                            sanitize_serde_json_error("invalid 'samples' array in cohort JSON", &e),
                         )
                     })?;
                 return Ok(samples);
@@ -3568,6 +3841,8 @@ impl McpServer {
             .policy
             .resolve_sandboxed_path(raw_path)
             .map_err(|sec| sec.to_tool_error_result())?;
+        let rel_lbl = self.policy.relativize_display_path(&resolved);
+        validate_regular_file_before_read(&resolved, &rel_lbl, MAX_MCP_PHASE21_TEXT_BYTES)?;
         let is_nef = resolved
             .extension()
             .and_then(|s| s.to_str())
@@ -3575,24 +3850,53 @@ impl McpServer {
         let shifts = if is_nef {
             read_nef_file(&resolved)
                 .and_then(|doc| doc.to_reference())
-                .map_err(|e| McpCallToolResult::domain_error("nef_parse_error", e))?
+                .map_err(|e| {
+                    McpCallToolResult::domain_error(
+                        "nef_parse_error",
+                        sanitize_untrusted_parse_error(&e),
+                    )
+                })?
         } else {
-            read_star_all_atoms(&resolved, None)
-                .map_err(|e| McpCallToolResult::domain_error("nmrstar_parse_error", e))?
+            read_star_all_atoms(&resolved, None).map_err(|e| {
+                McpCallToolResult::domain_error(
+                    "nmrstar_parse_error",
+                    sanitize_untrusted_parse_error(&e),
+                )
+            })?
         };
         Ok((resolved, shifts))
     }
 
-    fn value_contains_http_url(val: &Value) -> bool {
+    fn value_contains_uri_scheme(val: &Value, allow_colon_identifier: bool) -> bool {
         match val {
             Value::String(s) => {
-                let low = s.trim_start().to_ascii_lowercase();
-                low.starts_with("http://") || low.starts_with("https://")
+                if allow_colon_identifier {
+                    s.trim().contains("://")
+                } else {
+                    has_forbidden_uri_scheme_str(s)
+                }
             }
-            Value::Array(items) => items.iter().any(Self::value_contains_http_url),
-            Value::Object(map) => map.values().any(Self::value_contains_http_url),
+            Value::Array(items) => items
+                .iter()
+                .any(|item| Self::value_contains_uri_scheme(item, allow_colon_identifier)),
+            Value::Object(map) => map
+                .iter()
+                .any(|(k, v)| Self::key_value_contains_uri_scheme(k, v)),
             _ => false,
         }
+    }
+
+    fn key_value_contains_uri_scheme(key: &str, val: &Value) -> bool {
+        let allow_colon_id = matches!(
+            key,
+            "ligand_smiles"
+                | "exclude_pdb_ids"
+                | "exclude_bmrb_ids"
+                | "exclude_uniprot_id"
+                | "exclude_family_id"
+                | "exclude_topology_id"
+        );
+        Self::value_contains_uri_scheme(val, allow_colon_id)
     }
 
     fn reject_network_or_fetch_args(args: &Map<String, Value>) -> Option<McpCallToolResult> {
@@ -3606,10 +3910,13 @@ impl McpServer {
                 ));
             }
         }
-        if args.values().any(Self::value_contains_http_url) {
+        if args
+            .iter()
+            .any(|(k, v)| Self::key_value_contains_uri_scheme(k, v))
+        {
             return Some(McpCallToolResult::domain_error(
                 "network_access_denied",
-                "HTTP/HTTPS URLs are forbidden in MCP tool arguments; pass workspace-sandboxed local paths only",
+                "URI schemes (http://, https://, file://, ftp://, data:, etc.) are forbidden in MCP tool arguments; pass workspace-sandboxed local paths only",
             ));
         }
         None
@@ -3679,6 +3986,14 @@ impl McpServer {
             Ok(p) => p,
             Err(sec) => return sec.to_tool_error_result(),
         };
+        let struct_lbl = self.policy.relativize_display_path(&resolved_struct);
+        if let Err(err_res) = validate_regular_file_before_read(
+            &resolved_struct,
+            &struct_lbl,
+            MAX_MCP_STRUCTURE_BYTES,
+        ) {
+            return err_res;
+        }
         let (resolved_shifts, shifts) = match self.read_sandboxed_shifts_star_or_nef(raw_shifts) {
             Ok(pair) => pair,
             Err(err_res) => return err_res,
@@ -3686,14 +4001,30 @@ impl McpServer {
 
         let resolved_pae = match args.get("pae_path").and_then(Value::as_str) {
             Some(p) if !p.trim().is_empty() => match self.policy.resolve_sandboxed_path(p) {
-                Ok(rp) => Some(rp),
+                Ok(rp) => {
+                    let lbl = self.policy.relativize_display_path(&rp);
+                    if let Err(err_res) =
+                        validate_regular_file_before_read(&rp, &lbl, MAX_MCP_PHASE21_TEXT_BYTES)
+                    {
+                        return err_res;
+                    }
+                    Some(rp)
+                }
                 Err(sec) => return sec.to_tool_error_result(),
             },
             _ => None,
         };
         let resolved_s2 = match args.get("s2_path").and_then(Value::as_str) {
             Some(p) if !p.trim().is_empty() => match self.policy.resolve_sandboxed_path(p) {
-                Ok(rp) => Some(rp),
+                Ok(rp) => {
+                    let lbl = self.policy.relativize_display_path(&rp);
+                    if let Err(err_res) =
+                        validate_regular_file_before_read(&rp, &lbl, MAX_MCP_PHASE21_TEXT_BYTES)
+                    {
+                        return err_res;
+                    }
+                    Some(rp)
+                }
                 Err(sec) => return sec.to_tool_error_result(),
             },
             _ => None,
@@ -3712,7 +4043,12 @@ impl McpServer {
         };
         let af_model = match parse_af_structure_model(&resolved_struct, &ingest_opts) {
             Ok(m) => m,
-            Err(e) => return McpCallToolResult::domain_error("structure_parse_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "structure_parse_error",
+                    sanitize_untrusted_parse_error(&e),
+                );
+            }
         };
 
         let pae_opt = match resolved_pae.as_ref() {
@@ -3722,14 +4058,24 @@ impl McpServer {
                 Some(af_model.residues.len()),
             ) {
                 Ok(pm) => Some(pm),
-                Err(e) => return McpCallToolResult::domain_error("pae_parse_error", e),
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "pae_parse_error",
+                        sanitize_untrusted_parse_error(&e),
+                    );
+                }
             },
             None => None,
         };
         let s2_opt = match resolved_s2.as_ref() {
             Some(rp) => match parse_modelfree_s2_tsv_file(rp) {
                 Ok(entries) => Some(entries),
-                Err(e) => return McpCallToolResult::domain_error("s2_parse_error", e),
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "s2_parse_error",
+                        sanitize_untrusted_parse_error(&e),
+                    );
+                }
             },
             None => None,
         };
@@ -3838,6 +4184,14 @@ impl McpServer {
             Ok(p) => p,
             Err(sec) => return sec.to_tool_error_result(),
         };
+        let struct_lbl = self.policy.relativize_display_path(&resolved_struct);
+        if let Err(err_res) = validate_regular_file_before_read(
+            &resolved_struct,
+            &struct_lbl,
+            MAX_MCP_STRUCTURE_BYTES,
+        ) {
+            return err_res;
+        }
 
         let force_bfactor_plddt = args
             .get("force_bfactor_plddt")
@@ -3845,7 +4199,12 @@ impl McpServer {
             .unwrap_or(false);
         let model = match StructureModel::parse_file(&resolved_struct, force_bfactor_plddt) {
             Ok(m) => m,
-            Err(e) => return McpCallToolResult::domain_error("structure_parse_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "structure_parse_error",
+                    sanitize_untrusted_parse_error(&e),
+                );
+            }
         };
 
         let sample_ph = args
@@ -3931,9 +4290,19 @@ impl McpServer {
                 "'pose_paths' must contain at least 1 candidate complex pose (.cif / .pdb)",
             );
         }
+        if raw_poses_arr.len() > MAX_MCP_COFOLD_POSES {
+            return McpCallToolResult::domain_error(
+                "too_many_poses",
+                format!(
+                    "'pose_paths' count ({}) exceeds MAX_MCP_COFOLD_POSES ({MAX_MCP_COFOLD_POSES})",
+                    raw_poses_arr.len()
+                ),
+            );
+        }
 
         let mut poses: Vec<StructurePoseInput> = Vec::with_capacity(raw_poses_arr.len());
         let mut pose_display_paths: Vec<String> = Vec::with_capacity(raw_poses_arr.len());
+        let mut total_pose_bytes: u64 = 0;
         for item in raw_poses_arr {
             let Some(p) = item.as_str().filter(|s| !s.trim().is_empty()) else {
                 return McpCallToolResult::domain_error(
@@ -3946,12 +4315,29 @@ impl McpServer {
                 Err(sec) => return sec.to_tool_error_result(),
             };
             let rel_lbl = self.policy.relativize_display_path(&rp);
+            let pose_bytes =
+                match validate_regular_file_before_read(&rp, &rel_lbl, MAX_MCP_STRUCTURE_BYTES) {
+                    Ok(sz) => sz,
+                    Err(err_res) => return err_res,
+                };
+            total_pose_bytes = total_pose_bytes.saturating_add(pose_bytes);
+            if total_pose_bytes > MAX_MCP_COFOLD_TOTAL_BYTES {
+                return McpCallToolResult::domain_error(
+                    "file_too_large",
+                    format!(
+                        "cumulative pose_paths size ({total_pose_bytes} bytes) exceeds MAX_MCP_COFOLD_TOTAL_BYTES ({MAX_MCP_COFOLD_TOTAL_BYTES} bytes)"
+                    ),
+                );
+            }
             let mut pose_in = match StructurePoseInput::from_file(&rp) {
                 Ok(pi) => pi,
                 Err(e) => {
                     return McpCallToolResult::domain_error(
                         "pose_parse_error",
-                        format!("'{rel_lbl}': {e}"),
+                        format!(
+                            "'{rel_lbl}': {}",
+                            sanitize_untrusted_parse_error(&e.to_string())
+                        ),
                     );
                 }
             };
@@ -4069,22 +4455,24 @@ impl McpServer {
         }
 
         if let Some(ref ap) = apo_path {
-            let txt = match fs::read_to_string(ap) {
-                Ok(t) => t,
-                Err(e) => {
-                    return McpCallToolResult::domain_error(
-                        "io_error",
-                        format!("failed to read apo structure: {e}"),
-                    );
-                }
-            };
+            let apo_lbl = self.policy.relativize_display_path(ap);
+            let txt =
+                match read_bounded_regular_file_to_string(ap, &apo_lbl, MAX_MCP_STRUCTURE_BYTES) {
+                    Ok(t) => t,
+                    Err(err_res) => return err_res,
+                };
             let ext = ap
                 .extension()
                 .and_then(|s| s.to_str())
                 .map(|s| s.to_ascii_lowercase());
             let model = match StructureModel::parse_str(&txt, ext.as_deref(), false) {
                 Ok(m) => m,
-                Err(e) => return McpCallToolResult::domain_error("apo_parse_error", e),
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "apo_parse_error",
+                        sanitize_untrusted_parse_error(&e),
+                    );
+                }
             };
             score_cfg.apo_receptor_coord_text = Some(txt);
             score_cfg.apo_receptor_format_hint = ext;
@@ -4092,21 +4480,21 @@ impl McpServer {
         }
 
         let mut bundle: CofoldRestraintBundle = if let Some(ref sc_p) = restraints_path {
-            let txt = match fs::read_to_string(sc_p) {
+            let sc_lbl = self.policy.relativize_display_path(sc_p);
+            let txt = match read_bounded_regular_file_to_string(
+                sc_p,
+                &sc_lbl,
+                MAX_MCP_PHASE21_TEXT_BYTES,
+            ) {
                 Ok(t) => t,
-                Err(e) => {
-                    return McpCallToolResult::domain_error(
-                        "io_error",
-                        format!("failed to read restraints JSON: {e}"),
-                    );
-                }
+                Err(err_res) => return err_res,
             };
             match serde_json::from_str(&txt) {
                 Ok(b) => b,
                 Err(e) => {
                     return McpCallToolResult::domain_error(
                         "restraints_parse_error",
-                        format!("invalid restraints bundle JSON: {e}"),
+                        sanitize_serde_json_error("invalid restraints bundle JSON", &e),
                     );
                 }
             }
@@ -4123,29 +4511,41 @@ impl McpServer {
                 }
             }
             if let Some(ref cp) = csp_path {
-                let txt = match fs::read_to_string(cp) {
-                    Ok(t) => t,
-                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
-                };
+                let lbl = self.policy.relativize_display_path(cp);
+                let txt =
+                    match read_bounded_regular_file_to_string(cp, &lbl, MAX_MCP_PHASE21_TEXT_BYTES)
+                    {
+                        Ok(t) => t,
+                        Err(err_res) => return err_res,
+                    };
                 match parse_csp_restraint_str(&txt) {
                     Ok((rows, kd)) => {
                         raw_input.raw_csp_rows = rows;
                         raw_input.experimental_kd_um = kd;
                     }
                     Err(e) => {
-                        return McpCallToolResult::domain_error("csp_parse_error", e.to_string());
+                        return McpCallToolResult::domain_error(
+                            "csp_parse_error",
+                            sanitize_untrusted_parse_error(&e.to_string()),
+                        );
                     }
                 }
             }
             if let Some(ref np) = noe_path {
-                let txt = match fs::read_to_string(np) {
-                    Ok(t) => t,
-                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
-                };
+                let lbl = self.policy.relativize_display_path(np);
+                let txt =
+                    match read_bounded_regular_file_to_string(np, &lbl, MAX_MCP_PHASE21_TEXT_BYTES)
+                    {
+                        Ok(t) => t,
+                        Err(err_res) => return err_res,
+                    };
                 match parse_intermolecular_noe_tsv_str(&txt) {
                     Ok(noes) => raw_input.raw_distance_restraints.extend(noes),
                     Err(e) => {
-                        return McpCallToolResult::domain_error("noe_parse_error", e.to_string());
+                        return McpCallToolResult::domain_error(
+                            "noe_parse_error",
+                            sanitize_untrusted_parse_error(&e.to_string()),
+                        );
                     }
                 }
             }
@@ -4154,10 +4554,13 @@ impl McpServer {
                 .clone()
                 .unwrap_or_else(|| "A".to_string());
             if let Some(ref pp) = pre_path {
-                let txt = match fs::read_to_string(pp) {
-                    Ok(t) => t,
-                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
-                };
+                let lbl = self.policy.relativize_display_path(pp);
+                let txt =
+                    match read_bounded_regular_file_to_string(pp, &lbl, MAX_MCP_PHASE21_TEXT_BYTES)
+                    {
+                        Ok(t) => t,
+                        Err(err_res) => return err_res,
+                    };
                 match parse_intermolecular_pre_tsv_str(
                     &txt,
                     None,
@@ -4166,31 +4569,50 @@ impl McpServer {
                 ) {
                     Ok(pres) => raw_input.raw_distance_restraints.extend(pres),
                     Err(e) => {
-                        return McpCallToolResult::domain_error("pre_parse_error", e.to_string());
+                        return McpCallToolResult::domain_error(
+                            "pre_parse_error",
+                            sanitize_untrusted_parse_error(&e.to_string()),
+                        );
                     }
                 }
             }
             if let Some(ref rdc_p) = rdc_path {
-                let txt = match fs::read_to_string(rdc_p) {
+                let lbl = self.policy.relativize_display_path(rdc_p);
+                let txt = match read_bounded_regular_file_to_string(
+                    rdc_p,
+                    &lbl,
+                    MAX_MCP_PHASE21_TEXT_BYTES,
+                ) {
                     Ok(t) => t,
-                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
+                    Err(err_res) => return err_res,
                 };
                 match parse_cofold_rdc_tsv_str(&txt, &default_rec) {
                     Ok(m) => raw_input.rdc_media = m,
                     Err(e) => {
-                        return McpCallToolResult::domain_error("rdc_parse_error", e.to_string());
+                        return McpCallToolResult::domain_error(
+                            "rdc_parse_error",
+                            sanitize_untrusted_parse_error(&e.to_string()),
+                        );
                     }
                 }
             }
             if let Some(ref pcs_p) = pcs_path {
-                let txt = match fs::read_to_string(pcs_p) {
+                let lbl = self.policy.relativize_display_path(pcs_p);
+                let txt = match read_bounded_regular_file_to_string(
+                    pcs_p,
+                    &lbl,
+                    MAX_MCP_PHASE21_TEXT_BYTES,
+                ) {
                     Ok(t) => t,
-                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
+                    Err(err_res) => return err_res,
                 };
                 match parse_cofold_pcs_tsv_str(&txt, &default_rec) {
                     Ok(t) => raw_input.pcs_tags = t,
                     Err(e) => {
-                        return McpCallToolResult::domain_error("pcs_parse_error", e.to_string());
+                        return McpCallToolResult::domain_error(
+                            "pcs_parse_error",
+                            sanitize_untrusted_parse_error(&e.to_string()),
+                        );
                     }
                 }
             }
@@ -4199,7 +4621,7 @@ impl McpServer {
                 Err(e) => {
                     return McpCallToolResult::domain_error(
                         "restraints_extract_error",
-                        e.to_string(),
+                        sanitize_untrusted_parse_error(&e.to_string()),
                     );
                 }
             }
@@ -4210,26 +4632,42 @@ impl McpServer {
                 bundle.ligand_molecules.insert(k, m);
             }
             if let Some(ref rdc_p) = rdc_path {
-                let txt = match fs::read_to_string(rdc_p) {
+                let lbl = self.policy.relativize_display_path(rdc_p);
+                let txt = match read_bounded_regular_file_to_string(
+                    rdc_p,
+                    &lbl,
+                    MAX_MCP_PHASE21_TEXT_BYTES,
+                ) {
                     Ok(t) => t,
-                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
+                    Err(err_res) => return err_res,
                 };
                 match parse_cofold_rdc_tsv_str(&txt, &bundle.receptor_chain_id) {
                     Ok(m) => bundle.rdc_media = m,
                     Err(e) => {
-                        return McpCallToolResult::domain_error("rdc_parse_error", e.to_string());
+                        return McpCallToolResult::domain_error(
+                            "rdc_parse_error",
+                            sanitize_untrusted_parse_error(&e.to_string()),
+                        );
                     }
                 }
             }
             if let Some(ref pcs_p) = pcs_path {
-                let txt = match fs::read_to_string(pcs_p) {
+                let lbl = self.policy.relativize_display_path(pcs_p);
+                let txt = match read_bounded_regular_file_to_string(
+                    pcs_p,
+                    &lbl,
+                    MAX_MCP_PHASE21_TEXT_BYTES,
+                ) {
                     Ok(t) => t,
-                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
+                    Err(err_res) => return err_res,
                 };
                 match parse_cofold_pcs_tsv_str(&txt, &bundle.receptor_chain_id) {
                     Ok(t) => bundle.pcs_tags = t,
                     Err(e) => {
-                        return McpCallToolResult::domain_error("pcs_parse_error", e.to_string());
+                        return McpCallToolResult::domain_error(
+                            "pcs_parse_error",
+                            sanitize_untrusted_parse_error(&e.to_string()),
+                        );
                     }
                 }
             }
@@ -4302,14 +4740,33 @@ impl McpServer {
             Ok(p) => p,
             Err(sec) => return sec.to_tool_error_result(),
         };
+        let struct_lbl = self.policy.relativize_display_path(&resolved_struct);
+        if let Err(err_res) = validate_regular_file_before_read(
+            &resolved_struct,
+            &struct_lbl,
+            MAX_MCP_STRUCTURE_BYTES,
+        ) {
+            return err_res;
+        }
         let resolved_exchange = match self.policy.resolve_sandboxed_path(raw_exchange) {
             Ok(p) => p,
             Err(sec) => return sec.to_tool_error_result(),
         };
+        let exch_lbl = self.policy.relativize_display_path(&resolved_exchange);
 
         let mut alt_conformers: Vec<AltConformerInput> = Vec::new();
         let mut alt_display_paths: Vec<String> = Vec::new();
         if let Some(alt_arr) = args.get("alt_structure_paths").and_then(Value::as_array) {
+            if alt_arr.len() > MAX_ALT_STRUCTURES {
+                return McpCallToolResult::domain_error(
+                    "too_many_alt_structures",
+                    format!(
+                        "'alt_structure_paths' count ({}) exceeds MAX_ALT_STRUCTURES ({MAX_ALT_STRUCTURES})",
+                        alt_arr.len()
+                    ),
+                );
+            }
+            let mut total_alt_bytes: u64 = 0;
             for item in alt_arr {
                 let Some(p) = item.as_str().filter(|s| !s.trim().is_empty()) else {
                     return McpCallToolResult::domain_error(
@@ -4322,12 +4779,27 @@ impl McpServer {
                     Err(sec) => return sec.to_tool_error_result(),
                 };
                 let rel_lbl = self.policy.relativize_display_path(&rp);
+                let alt_sz =
+                    match validate_regular_file_before_read(&rp, &rel_lbl, MAX_MCP_STRUCTURE_BYTES)
+                    {
+                        Ok(sz) => sz,
+                        Err(err_res) => return err_res,
+                    };
+                total_alt_bytes = total_alt_bytes.saturating_add(alt_sz);
+                if total_alt_bytes > MAX_MCP_COFOLD_TOTAL_BYTES {
+                    return McpCallToolResult::domain_error(
+                        "file_too_large",
+                        format!(
+                            "cumulative alt_structure_paths size ({total_alt_bytes} bytes) exceeds limit ({MAX_MCP_COFOLD_TOTAL_BYTES} bytes)"
+                        ),
+                    );
+                }
                 let alt_model = match StructureModel::parse_file(&rp, false) {
                     Ok(m) => m,
                     Err(e) => {
                         return McpCallToolResult::domain_error(
                             "alt_structure_parse_error",
-                            format!("'{rel_lbl}': {e}"),
+                            format!("'{rel_lbl}': {}", sanitize_untrusted_parse_error(&e)),
                         );
                     }
                 };
@@ -4341,20 +4813,29 @@ impl McpServer {
 
         let ground_structure = match StructureModel::parse_file(&resolved_struct, false) {
             Ok(m) => m,
-            Err(e) => return McpCallToolResult::domain_error("structure_parse_error", e),
-        };
-        let exchange_text = match fs::read_to_string(&resolved_exchange) {
-            Ok(t) => t,
             Err(e) => {
                 return McpCallToolResult::domain_error(
-                    "io_error",
-                    format!("failed to read exchange TSV: {e}"),
+                    "structure_parse_error",
+                    sanitize_untrusted_parse_error(&e),
                 );
             }
         };
-        let observations = match parse_exchange_observations_tsv(&exchange_text) {
-            Ok(obs) => obs,
-            Err(e) => return McpCallToolResult::domain_error("exchange_parse_error", e),
+        let exchange_text = match read_bounded_regular_file_to_string(
+            &resolved_exchange,
+            &exch_lbl,
+            MAX_MCP_PHASE21_TEXT_BYTES,
+        ) {
+            Ok(t) => t,
+            Err(err_res) => return err_res,
+        };
+        let parsed_exch = match parse_exchange_observations_tsv_with_meta(&exchange_text) {
+            Ok(p) => p,
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "exchange_parse_error",
+                    sanitize_untrusted_parse_error(&e),
+                );
+            }
         };
 
         let sample_ph = args
@@ -4389,6 +4870,7 @@ impl McpServer {
             sample_ph,
             temperature_kelvin,
             max_seq_identity: max_seq_id,
+            cpmg_prefiltered_significant_only: parsed_exch.cpmg_prefiltered_significant_only,
             ..ExcitedStateConfig::default()
         };
 
@@ -4396,29 +4878,42 @@ impl McpServer {
         let report = match classify_excited_state_with_firewall(
             ground_shifts_ref,
             &ground_structure,
-            &observations,
+            &parsed_exch.observations,
             &alt_conformers,
             &query,
             &cfg,
         ) {
             Ok(r) => r,
-            Err(e) => return McpCallToolResult::domain_error("excited_state_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "excited_state_error",
+                    sanitize_untrusted_parse_error(&e),
+                );
+            }
         };
 
         McpCallToolResult::ok_json(&json!({
-            "structure_path": self.policy.relativize_display_path(&resolved_struct),
-            "exchange_path": self.policy.relativize_display_path(&resolved_exchange),
+            "structure_path": struct_lbl,
+            "exchange_path": exch_lbl,
             "shifts_path": shifts_opt.as_ref().map(|(p, _)| self.policy.relativize_display_path(p)),
             "alt_structure_paths": alt_display_paths,
             "verdict": report.verdict.as_str(),
             "verdict_detail": report.verdict,
+            "abstention_kind": report.abstention_kind,
             "verdict_reason": report.verdict_reason,
             "n_observations": report.n_observations,
+            "n_distinct_residues": report.n_distinct_residues,
+            "n_distinct_exchanging_residues": report.n_distinct_exchanging_residues,
             "n_signed_observations": report.n_signed_observations,
             "n_unsigned_observations": report.n_unsigned_observations,
             "two_ln_bf_top1_vs_top2": report.two_ln_bf_top1_vs_top2,
             "two_ln_bf_top1_vs_null": report.two_ln_bf_top1_vs_null,
+            "two_ln_bf_top1_vs_runnerup_non_null": report.two_ln_bf_top1_vs_runnerup_non_null,
+            "runnerup_non_null_hypothesis": report.runnerup_non_null_hypothesis,
+            "unmodeled_exchange_two_ln_bf_vs_null": report.unmodeled_exchange_two_ln_bf_vs_null,
             "top1_reduced_chi2": report.top1_reduced_chi2,
+            "cpmg_prefiltered_significant_only": report.cpmg_prefiltered_significant_only,
+            "scope_limits_note": report.scope_limits_note,
             "enforced_max_seq_identity": max_seq_id,
             "max_retained_seq_identity": report.ground_max_retained_seq_identity,
             "exclusion_list_sha256": report.ground_exclusion_list_sha256,
@@ -4820,8 +5315,22 @@ pub fn parse_loopback_bind_addr(bind: &str) -> io::Result<std::net::SocketAddr> 
     Ok(addr)
 }
 
+/// Parse an optional `X-Nmr-Access-Mode` HTTP header (`read-only` or `read-write`).
+/// Server enforcement applies this header strictly as a monotonic downgrade ceiling (`ReadWrite`
+/// -> `ReadOnly` per request; a `ReadOnly` server is never upgraded to `ReadWrite`).
+pub fn parse_http_access_mode_header(raw: &str) -> Result<McpAccessMode, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "read-only" | "readonly" | "ro" => Ok(McpAccessMode::ReadOnly),
+        "read-write" | "readwrite" | "rw" => Ok(McpAccessMode::ReadWrite),
+        other => Err(format!(
+            "unsupported X-Nmr-Access-Mode '{other}' (expected 'read-only' or 'read-write')"
+        )),
+    }
+}
+
 /// Validate HTTP headers for a local loopback MCP endpoint (`127.0.0.1` / `localhost` / `[::1]`
-/// `Host`, no cross-origin `Origin`, and constant-time `Authorization: Bearer <token>`).
+/// `Host`, no cross-origin `Origin`, constant-time `Authorization: Bearer <token>`, and optional
+/// `X-Nmr-Access-Mode` ceiling).
 /// Returns `Ok(())` or `Err((http_status_code, reason))`.
 pub fn validate_loopback_http_headers(
     headers: &BTreeMap<String, String>,
@@ -4874,6 +5383,13 @@ pub fn validate_loopback_http_headers(
         expected_bearer_token.as_bytes(),
     ) {
         return Err((401, "invalid bearer token".to_string()));
+    }
+
+    // 4. Validate optional `X-Nmr-Access-Mode` request ceiling header (`20.W1:P3`).
+    if let Some(raw_mode) = headers.get("x-nmr-access-mode") {
+        if let Err(e) = parse_http_access_mode_header(raw_mode) {
+            return Err((400, e));
+        }
     }
 
     Ok(())
@@ -4980,10 +5496,11 @@ pub fn handle_mcp_http_stream(
     }
 
     if let Err((status, reason)) = validate_loopback_http_headers(&headers, expected_bearer_token) {
-        let status_text = if status == 401 {
-            "Unauthorized"
-        } else {
-            "Forbidden"
+        let status_text = match status {
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            500 => "Internal Server Error",
+            _ => "Forbidden",
         };
         let body = serde_json::to_string(&json!({ "error": reason })).unwrap_or_default();
         return write_rejected_http_response(
@@ -5050,7 +5567,19 @@ pub fn handle_mcp_http_stream(
         }
     };
 
-    match handle_mcp_json_request(server, body_str) {
+    let saved_mode = server.policy().access_mode();
+    if let Some(Ok(McpAccessMode::ReadOnly)) = headers
+        .get("x-nmr-access-mode")
+        .map(|raw| parse_http_access_mode_header(raw))
+    {
+        if saved_mode == McpAccessMode::ReadWrite {
+            server.policy_mut().set_access_mode(McpAccessMode::ReadOnly);
+        }
+    }
+    let rpc_resp = handle_mcp_json_request(server, body_str);
+    server.policy_mut().set_access_mode(saved_mode);
+
+    match rpc_resp {
         Some(resp_json) => write_http_response(&mut stream, 200, "OK", &resp_json)?,
         None => write_http_response(&mut stream, 202, "Accepted", "")?,
     }
@@ -5323,11 +5852,11 @@ fn builtin_prompt_descriptors() -> Vec<McpPromptDescriptor> {
         },
         McpPromptDescriptor {
             name: "validate-and-dock-alphafold-model".to_string(),
-            description: "Guided integrative structural NMR workflow validating an AlphaFold .cif + PAE JSON model against solution NMR rigidity (RCI-S^2 / Lipari-Szabo S^2), partitioning rigid PAE domains, testing Tolman GDO inter-domain motion, and docking under 20% ByPeptidePlane RdcFree holdout.".to_string(),
+            description: "Guided read-only integrative structural NMR workflow validating an AlphaFold .cif + PAE JSON model against solution NMR rigidity (RCI-S^2 / Lipari-Szabo S^2), partitioning spectral PAE rigid domains, predicting HomologFirewall 3D shifts, and re-scoring pre-computed candidate poses under 20% ByPeptidePlane RdcFree holdout (no rigid-body docking is performed in MCP).".to_string(),
             arguments: vec![
                 McpPromptArgument {
                     name: "workspace_path".to_string(),
-                    description: "Workspace directory containing coordinates, PAE JSON, and NMR restraint tables.".to_string(),
+                    description: "Workspace directory containing coordinates, PAE JSON, and NMR restraint bundles.".to_string(),
                     required: true,
                 },
                 McpPromptArgument {
@@ -5347,7 +5876,7 @@ fn builtin_prompt_descriptors() -> Vec<McpPromptDescriptor> {
                 },
                 McpPromptArgument {
                     name: "restraints_path".to_string(),
-                    description: "Optional relative path to RDC, PCS, PRE, or intermolecular NOE restraint TSV/NEF.".to_string(),
+                    description: "Optional relative path to a <prefix>.nmr_restraints.json interface restraint bundle for score_cofold_poses (default: '.nmr_restraints.json').".to_string(),
                     required: false,
                 },
             ],
@@ -5487,19 +6016,19 @@ fn build_spectroscopist_prompt(
             let structure = get_opt("structure_path", "model.cif");
             let pae = get_opt("pae_path", "pae.json");
             let shifts = get_opt("shifts_path", "assigned.str");
-            let restraints = get_opt("restraints_path", "rdcs.tsv");
+            let restraints = get_opt("restraints_path", ".nmr_restraints.json");
             Ok(McpGetPromptResult {
                 description: format!(
-                    "Integrative AlphaFold validation, PAE domain partitioning, and dipolar/paramagnetic docking workflow for '{ws}' ('{structure}', '{pae}')"
+                    "Read-only integrative AlphaFold validation, PAE domain partitioning, and candidate pose re-scoring workflow for '{ws}' ('{structure}', '{pae}')"
                 ),
                 messages: vec![McpPromptMessage {
                     role: "user".to_string(),
                     content: McpContentBlock::text(format!(
-                        "Validate and refine the integrative structural NMR model '{structure}' + '{pae}' in workspace '{ws}' against experimental shifts '{shifts}' and restraints '{restraints}'.\n\
-                        1. Call `af_concordance` on `structure_path: '{structure}'`, `shifts_path: '{shifts}'`, and `pae_path: '{pae}'` (never pass crystallographic thermal B-factors as `pLDDT`). Inspect Fowler-Williamson Spearman `rho_s`, `RMSD_rig`, and 4-class per-residue concordance (`ConcordantOrdered`, `ConcordantDisordered`, `ConditionalFoldingOrCrystalArtifact` partner-induced MoRFs/crystal packing, and `DynamicHingeOrAltState`).\n\
-                        2. Call `predict_structure_shifts` on '{structure}' enforcing the mandatory 4-layer `HomologFirewall` (`max_seq_identity <= 0.25`, `TM-score < 0.50`, recording `exclusion_list_sha256`), and keep default backbone `ferric assign` sequence-only unless `--af-structure` is explicitly opted in.\n\
-                        3. Inspect `pae_domains` spectral rigid-domain blocks and Tolman (2001) per-domain Generalized Degree of Order (`theta_d / theta_1`) before multi-domain `RDC` docking: flag `DecoupledInterDomainMotion` whenever `min_d rho_GDO < 0.80` (`> 2 sigma_MC`), and honor single-medium dipolar candor (`F8`: a single alignment medium carries 4-fold Saupe cone degeneracy and zero translational sensitivity; require >= 2 non-coaxial `RDC` media or translational+orientational `PCS`/`PRE`/inter-domain `NOE` restraints under 20% `ByPeptidePlane` `RdcFree` holdout).\n\
-                        4. When ligand/partner complexes or invisible minor states are present, evaluate `score_cofold_poses` (`rSASA >= 0.20` surface CSP pocket vs core allostery, `InconclusiveOrAllViolated` decoy abstention) and `classify_excited_state` (`BIC` and Kass-Raftery `2 ln BF` across signed `CEST` and normalized folded-Student-t5 unsigned `CPMG` differential shifts)."
+                        "Validate the integrative structural NMR model '{structure}' + '{pae}' in workspace '{ws}' against experimental shifts '{shifts}' and optional restraint bundle '{restraints}' using read-only MCP tools (note: MCP tools perform validation and pose re-scoring only, not rigid-body docking).\n\
+                        1. Call `af_concordance` with `structure_path: '{structure}'`, `shifts_path: '{shifts}'`, `pae_path: '{pae}'`, and `cluster_pae_domains: true` (never pass crystallographic thermal B-factors as `pLDDT`). Inspect Fowler-Williamson Spearman `rho_s`, `RMSD_rig`, `pae_domains` spectral rigid-domain blocks, and 4-class per-residue concordance (`ConcordantOrdered`, `ConcordantDisordered`, `ConditionalFoldingOrCrystalArtifact`, and `DynamicHingeOrAltState`).\n\
+                        2. Call `predict_structure_shifts` on `structure_path: '{structure}'` enforcing the mandatory 4-layer `HomologFirewall` (`max_seq_identity <= 0.25`, `TM-score < 0.50`, recording `exclusion_list_sha256`). Sequence-only backbone assignment tools (`evaluate_dataset_qc`) remain strictly decoupled from 3D coordinates.\n\
+                        3. When pre-computed candidate complex poses (`.cif`/`.pdb`) and an interface restraint bundle `restraints_path: '{restraints}'` (or individual `csp_path`/`noe_path`/`pre_path`/`rdc_path`/`pcs_path` tables) are present, call `score_cofold_poses` with `rdc_free_fraction: 0.20` (`ByPeptidePlane` `RdcFree` holdout): verify `rSASA >= 0.20` surface CSP pocket vs core allostery, `InconclusiveOrAllViolated` decoy abstention, and single-medium dipolar candor (a single alignment medium carries 4-fold Saupe cone degeneracy and zero translational sensitivity).\n\
+                        4. When invisible minor-state relaxation dispersion or saturation transfer data are available, call `classify_excited_state` (`>= 4` distinct residues, discrete-scan marginalized `BIC` and Kass-Raftery `2 ln BF` across endpoint-only hypotheses over signed `CEST` and folded-Student-t5 unsigned `CPMG` differential shifts)."
                     )),
                 }],
             })
@@ -6379,7 +6908,7 @@ fn builtin_tool_descriptors() -> Vec<McpToolDescriptor> {
         },
         McpToolDescriptor {
             name: "classify_excited_state".to_string(),
-            description: "Classify sparsely populated invisible excited states from signed (CEST/R1rho) and/or unsigned (CPMG |Delta_omega_AB|) differential chemical shifts via Bayesian BIC and Kass-Raftery Bayes factors across LocalUnfolding, XxxProCisTrans, RotamerOrHisTautomerFlip, and Alternate3DConformer hypotheses.".to_string(),
+            description: "Classify sparsely populated invisible excited states from signed (CEST/R1rho) and/or unsigned (CPMG |Delta_omega_AB|) differential chemical shifts (>= 4 distinct residues, duplicate (chain,seq_id,atom) rejected) via discrete-scan marginalized BIC and Kass-Raftery Bayes factors across endpoint-only LocalUnfolding, XxxProCisTrans, RotamerOrHisTautomerFlip, and Alternate3DConformer hypotheses (no partial-unfolding fraction or population parameter is fitted).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

@@ -19,7 +19,7 @@
 //! Implemented from the published equations and `docs/specs/16-dynamics-and-csp.md` §§3–5 without
 //! consulting external chemical-exchange or titration software source code.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::TAU;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,7 +44,7 @@ use nmr_core::csp::{
 };
 use nmr_core::excited_state::{
     classify_excited_state_with_firewall, format_excited_state_json, format_excited_state_tsv,
-    parse_exchange_observations_tsv, parse_ground_shifts_str, AltConformerInput,
+    parse_exchange_observations_tsv_with_meta, parse_ground_shifts_str, AltConformerInput,
     ExchangeShiftObservation, ExcitedStateConfig,
 };
 use nmr_core::nmrstar::{read_star, read_star_all_atoms};
@@ -1429,7 +1429,7 @@ pub fn exchange_state_usage() -> &'static str {
      Inputs & Biophysical Hypotheses (H0..H4):\n\
        --shifts | --star <p>       Ground-state assigned chemical shifts (.str or .nef)\n\
        --structure | --pdb <p>     Ground-state 3D structure coordinates (.cif, .mmcif, or .pdb)\n\
-       --exchange | --in <tsv>     CEST (signed), R1rho (signed), or CPMG (unsigned |dw|) TSV (repeatable)\n\
+       --exchange | --in <tsv>     CEST (signed), R1rho (signed), or CPMG (unsigned |dw|) TSV (repeatable; duplicate (chain, seq_id, atom) rows rejected)\n\
        --alt-structures <list>     Comma-separated candidate alternative 3D conformers (.cif/.pdb) for H4\n\
        --ph <f64>                  Sample pH for ncIDP coil & His titration baselines [default: 6.5]\n\
        --temp-k <f64>              Sample temperature in Kelvin [default: 298.15]\n\
@@ -1438,7 +1438,11 @@ pub fn exchange_state_usage() -> &'static str {
        --exclude-topology <id>     CATH/ECOD fold topology excluded by Layer 2 of HomologFirewall\n\
        --force-bfactor-plddt       Treat experimental PDB/CIF B_iso column as pLDDT\n\
        --json-out <out.json>       Optional explicit JSON output path\n\
-       --out | -o <out.json|tsv>   Output hypothesis ranking report (.json or .tsv)"
+       --out | -o <out.json|tsv>   Output hypothesis ranking report (.json or .tsv)\n\n\
+     Scope & Statistical Notes:\n\
+       Models 100%-switched endpoint differential shifts Delta_varpi_AB (no fractional partial-unfolding\n\
+       or population scaling parameter inside mu_Delta). Marginalizes over discrete candidates (ln mean L_m),\n\
+       counts n = distinct residues in BIC, and requires >= 4 distinct residues to commit."
 }
 
 fn split_comma_items(raw: &str) -> Vec<String> {
@@ -1576,12 +1580,27 @@ pub fn run_exchange_state_cli(args: &[String]) -> Result<(), String> {
     let ground_model = StructureModel::parse_file(&stp, force_bfactor_plddt)?;
 
     let mut all_obs: Vec<ExchangeShiftObservation> = Vec::new();
+    let mut seen_cli_keys: BTreeSet<(String, i32, String)> = BTreeSet::new();
+    let mut cpmg_prefiltered = false;
     for ep in &exchange_paths {
         let raw_tsv = fs::read_to_string(ep)
             .map_err(|e| format!("failed to read exchange TSV '{}': {e}", ep.display()))?;
-        let mut parsed = parse_exchange_observations_tsv(&raw_tsv)
+        let parsed = parse_exchange_observations_tsv_with_meta(&raw_tsv)
             .map_err(|e| format!("failed to parse exchange TSV '{}': {e}", ep.display()))?;
-        all_obs.append(&mut parsed);
+        cpmg_prefiltered |= parsed.cpmg_prefiltered_significant_only;
+        for obs in parsed.observations {
+            let key = (obs.chain_id.clone(), obs.seq_id, obs.atom.clone());
+            if !seen_cli_keys.insert(key) {
+                return Err(format!(
+                    "duplicate exchange observation across --exchange input(s) in '{}': (chain_id='{}', seq_id={}, atom='{}')",
+                    ep.display(),
+                    obs.chain_id,
+                    obs.seq_id,
+                    obs.atom
+                ));
+            }
+            all_obs.push(obs);
+        }
     }
 
     let mut alt_models: Vec<AltConformerInput> = Vec::with_capacity(alt_paths.len());
@@ -1605,6 +1624,7 @@ pub fn run_exchange_state_cli(args: &[String]) -> Result<(), String> {
     let cfg = ExcitedStateConfig {
         sample_ph,
         temperature_kelvin: temp_k,
+        cpmg_prefiltered_significant_only: cpmg_prefiltered,
         ..ExcitedStateConfig::default()
     };
 
@@ -1745,6 +1765,16 @@ mod exchange_state_cli_unit_tests {
                 atom: "N".to_string(),
                 dw_ppm: 1.85,
                 dw_err_ppm: 0.12,
+                sign_mode: ExchangeSignMode::UnsignedMagnitude,
+                major_ppm: None,
+            },
+            ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: 21,
+                res_name: Some("ASP".to_string()),
+                atom: "N".to_string(),
+                dw_ppm: 0.45,
+                dw_err_ppm: 0.08,
                 sign_mode: ExchangeSignMode::UnsignedMagnitude,
                 major_ppm: None,
             },

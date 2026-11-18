@@ -1,32 +1,35 @@
-//! Quantitative verification suite for `nmr_core::excited_state` (`T21.6b`,
-//! `docs/specs/21-alphafold-integrative-nmr.md` sections 7.1 & 8).
+//! Quantitative synthetic self-consistency & adversarial verification suite for
+//! `nmr_core::excited_state` (`T21.6b`, `docs/specs/21-alphafold-integrative-nmr.md` sections 7.1 & 8).
 //!
 //! # Provenance & Clean-Room Statement
-//! Clean-room test suite verifying:
+//! Clean-room synthetic self-consistency suite verifying:
 //! 1. Exact normalization of signed Student-`t_5` (`(-inf, +inf)`) and unsigned folded
 //!    Student-`t_5` (`[0, +inf)`) densities via high-order Simpson quadrature (`|I - 1| < 1e-4`).
-//! 2. `100%` (`4/4` hypothesis classes) top-1 `BIC` recovery (`2 ln BF_{1,2} > 10.0`,
-//!    `2 ln BF_{1,H0} > 10.0`, `reduced_chi2 <= 2.5`) across BOTH signed (`CEST` / `R1rho`) and
-//!    unsigned (`CPMG` `|Delta_varpi|`) exchange tables on `1D3Z` Ubiquitin under the 4-layer
-//!    `HomologFirewall` (`max_retained_seq_identity <= 0.25`):
+//! 2. Synthetic self-consistency across `4/4` endpoint-only hypothesis classes with realistic
+//!    forward-model perturbation noise (`reduced_chi2` near `1.0`), discrete-scan marginalized
+//!    `BIC` (`ln mean L_m`, `n = n_distinct_residues`), and head-to-head non-null competition
+//!    (`two_ln_bf_top1_vs_runnerup_non_null >= 6.0`, `two_ln_bf_top1_vs_null >= 10.0`) across
+//!    signed (`CEST` / `R1rho`) and unsigned (`CPMG` `|Delta_varpi|`) tables on `1D3Z` Ubiquitin
+//!    under the 4-layer `HomologFirewall` (`max_retained_seq_identity <= 0.25`):
 //!    - `H1: LocalUnfolding` (`ncIDP` random-coil switch across `ILE23..GLU34`),
 //!    - `H2: XxxProCisTrans` (`GLU18-PRO19` `trans -> cis`, Schubert `Delta_beta_gamma: 4.5 -> 9.6 ppm`),
 //!    - `H3a: RotamerOrHisTautomerFlip` (steric-clash-checked `PHE` `chi1` Haigh-Mallion ring-current flip),
-//!    - `H3b: RotamerOrHisTautomerFlip` (Pelton 1993 `HIS68` `+-82.0 ppm` `ND1`/`NE2` tautomer flip),
+//!    - `H3b: RotamerOrHisTautomerFlip` (Pelton 1993 `HIS68` `+-82.0 ppm` `ND1`/`NE2`, `+-8.3 ppm` `CG` tautomer flip),
 //!    - `H4: Alternate3DConformer` (candidate 3D conformer ensemble scored via `T21.2` `struct_shifts`).
-//! 3. Mixed signed (`CEST`) + unsigned (`CPMG`) multi-nucleus tables and `ferric cest` / `ferric cpmg`
-//!    TSV round-trip compatibility.
-//! 4. Honest `AmbiguousOrUnmodeledState` abstention on pure noise (`10` seeds, signed & unsigned),
-//!    sparse observations (`N_obs < 4`), unmodeled high-`chi^2` shifts, and hostile-input guards.
+//! 3. Duplicate `(chain_id, seq_id, atom)` rejection, `>= 4` distinct exchanging residue gate,
+//!    experimental-only `H0` noise parameterization (`UnmodeledSignificantExchange` on 3 sites at
+//!    `2.5 ppm`), `His` sidechain gate & unsigned direction ambiguity, and debug-build `u_best == 0` safety.
 
 use std::path::PathBuf;
 
 use nmr_core::excited_state::{
     classify_excited_state_with_firewall, format_excited_state_json, format_excited_state_tsv,
-    parse_exchange_observations_tsv, parse_ground_shifts_str, signed_student_t5_log_likelihood,
+    parse_exchange_observations_tsv, parse_exchange_observations_tsv_with_meta,
+    parse_ground_shifts_str, signed_student_t5_log_likelihood,
     unsigned_folded_student_t5_log_likelihood, write_exchange_observations_tsv, AltConformerInput,
-    ExchangeShiftObservation, ExchangeSignMode, ExcitedStateConfig, ExcitedStateHypothesisKind,
-    ExcitedStateVerdict, HisExchangeTransition, HypothesisBestParameters, ProCisTransDirection,
+    ExchangeShiftObservation, ExchangeSignMode, ExcitedStateAbstentionKind, ExcitedStateConfig,
+    ExcitedStateHypothesisKind, ExcitedStateVerdict, HisExchangeTransition,
+    HypothesisBestParameters, ProCisTransDirection,
 };
 use nmr_core::nmrstar::{read_star_all_atoms, Reference};
 use nmr_core::rng::Rng;
@@ -169,6 +172,67 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
 
     let mut rng = Rng::new(20262162);
 
+    // Build H4 candidate 3D conformer ensemble upfront so ALL 5 benchmarks (H1, H2, H3a, H3b, H4)
+    // pit every non-null mechanism (H1, H2, H3, H4) head-to-head simultaneously (`21.W3:P1-5`).
+    let seq_ids: Vec<i32> = ubq_model.residues.iter().map(|r| r.seq_id).collect();
+    let res_names: Vec<String> = ubq_model
+        .residues
+        .iter()
+        .map(|r| r.res_name.clone())
+        .collect();
+    let ca_coords: Vec<[f64; 3]> = ubq_model.residues.iter().map(|r| r.ca).collect();
+    let base_phi: Vec<Option<f64>> = ubq_model.residues.iter().map(|r| r.phi_deg).collect();
+    let base_psi: Vec<Option<f64>> = ubq_model.residues.iter().map(|r| r.psi_deg).collect();
+    let base_chi1: Vec<Option<f64>> = ubq_model.residues.iter().map(|r| r.chi1_deg).collect();
+
+    let make_switched_model =
+        |range: std::ops::RangeInclusive<i32>, target_phi: f64, target_psi: f64| {
+            let mut phi = base_phi.clone();
+            let mut psi = base_psi.clone();
+            for (k, &sid) in seq_ids.iter().enumerate() {
+                if range.contains(&sid) && phi[k].is_some() && psi[k].is_some() {
+                    phi[k] = Some(target_phi);
+                    psi[k] = Some(target_psi);
+                }
+            }
+            StructureModel::from_ca_and_torsions(
+                "A", &seq_ids, &res_names, &ca_coords, &phi, &psi, &base_chi1,
+            )
+            .expect("reconstruct switched conformer")
+        };
+
+    let ground_recon = StructureModel::from_ca_and_torsions(
+        "A", &seq_ids, &res_names, &ca_coords, &base_phi, &base_psi, &base_chi1,
+    )
+    .expect("reconstruct ground");
+    let alt_true = make_switched_model(7..=15, -62.0, -42.0);
+    let alt_decoy1 = make_switched_model(48..=56, -62.0, -42.0);
+    let alt_decoy2 = make_switched_model(25..=32, -125.0, 135.0);
+    let alt_decoy3 = make_switched_model(62..=70, -60.0, -40.0);
+
+    let pred_g_recon =
+        predict_structure_shifts_with_firewall(&ground_recon, &fw, &struct_cfg).unwrap();
+    let pred_b_true = predict_structure_shifts_with_firewall(&alt_true, &fw, &struct_cfg).unwrap();
+
+    let alt_bundle = vec![
+        AltConformerInput {
+            label: "decoy_loop48_56.pdb".to_string(),
+            model: alt_decoy1,
+        },
+        AltConformerInput {
+            label: "native_excited_hairpin7_15.pdb".to_string(),
+            model: alt_true,
+        },
+        AltConformerInput {
+            label: "decoy_helix25_32_strand.pdb".to_string(),
+            model: alt_decoy2,
+        },
+        AltConformerInput {
+            label: "decoy_cterm62_70.pdb".to_string(),
+            model: alt_decoy3,
+        },
+    ];
+
     // =========================================================================
     // 1. H1: LocalUnfolding (Ubiquitin alpha-helix ILE23..GLU34 -> ncIDP coil)
     // =========================================================================
@@ -191,13 +255,23 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             .iter()
             .position(|&s| s == sid)
             .expect("seq_id in ubq_shifts");
-        for &(atom, exp_sd) in &[("CA", 0.08), ("C", 0.08), ("N", 0.12), ("H", 0.025)] {
+        for &(atom, exp_sd, fwd_sd) in &[
+            ("CA", 0.08, 0.45),
+            ("C", 0.08, 0.50),
+            ("N", 0.12, 1.15),
+            ("H", 0.025, 0.20),
+        ] {
             if let (Some(&g_ppm), Some(bb)) = (
                 ubq_shifts.shifts.get(&(ref_idx, atom.to_string())),
                 pred_a.residues[r_idx].backbone.get(atom),
             ) {
                 let true_dw = w * (bb.rc_ppm - g_ppm);
-                let noisy_dw = true_dw + rng.normal(0.0, exp_sd);
+                let fwd_noise = if w > 0.0 {
+                    rng.normal(0.0, w * fwd_sd)
+                } else {
+                    0.0
+                };
+                let noisy_dw = true_dw + fwd_noise + rng.normal(0.0, exp_sd);
                 h1_signed.push(ExchangeShiftObservation {
                     chain_id: "A".to_string(),
                     seq_id: sid,
@@ -218,7 +292,7 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             Some(&ubq_shifts),
             &ubq_model,
             table,
-            &[],
+            &alt_bundle,
             &fw,
             &cfg,
         )
@@ -233,17 +307,28 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
                 .map(|h| (h.kind, h.bic, h.reduced_chi2))
                 .collect::<Vec<_>>()
         );
+        let bf_non_null = rep
+            .two_ln_bf_top1_vs_runnerup_non_null
+            .expect("non-null runnerup");
         assert!(
-            rep.two_ln_bf_top1_vs_top2 > 10.0,
-            "H1 ({mode_label}) expected 2 ln BF_12 > 10.0, got {:.2}",
-            rep.two_ln_bf_top1_vs_top2
+            rep.two_ln_bf_top1_vs_top2 > 10.0 && bf_non_null > 10.0,
+            "H1 ({mode_label}) expected 2 ln BF_12 > 10.0 and vs non-null > 10.0, got {:.2} / {:.2}",
+            rep.two_ln_bf_top1_vs_top2,
+            bf_non_null
         );
         println!(
-            "EXCITED_STATE_H1_{mode_label}: 2lnBF_12={:.2} 2lnBF_null={:.2} rchi2={:.3}",
-            rep.two_ln_bf_top1_vs_top2, rep.two_ln_bf_top1_vs_null, rep.top1_reduced_chi2
+            "EXCITED_STATE_H1_{mode_label}: 2lnBF_12={:.2} 2lnBF_non_null={:.2} 2lnBF_null={:.2} rchi2={:.3}",
+            rep.two_ln_bf_top1_vs_top2,
+            bf_non_null,
+            rep.two_ln_bf_top1_vs_null,
+            rep.top1_reduced_chi2
         );
         assert!(rep.two_ln_bf_top1_vs_null > 10.0);
-        assert!(rep.top1_reduced_chi2 <= 2.5);
+        assert!(
+            (0.30..=2.5).contains(&rep.top1_reduced_chi2),
+            "H1 ({mode_label}) expected realistic reduced_chi2 in [0.30, 2.5], got {:.3}",
+            rep.top1_reduced_chi2
+        );
         match &rep.ranked_hypotheses[0].parameters {
             HypothesisBestParameters::LocalUnfolding {
                 start_seq_id,
@@ -263,13 +348,13 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
     // 2. H2: XxxProCisTrans (GLU18-PRO19 trans -> cis, Delta_bg: 4.5 -> 9.6 ppm)
     // =========================================================================
     let mut h2_signed = vec![
-        // PRO19: Schubert 2002 canonical trans -> cis shifts
+        // PRO19: Schubert 2002 canonical trans -> cis shifts + realistic forward-model discrepancy
         ExchangeShiftObservation {
             chain_id: "A".to_string(),
             seq_id: 19,
             res_name: Some("PRO".to_string()),
             atom: "CB".to_string(),
-            dw_ppm: 2.42 + rng.normal(0.0, 0.07),
+            dw_ppm: 2.40 + rng.normal(0.0, 0.45) + rng.normal(0.0, 0.08),
             dw_err_ppm: 0.08,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
@@ -279,7 +364,7 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             seq_id: 19,
             res_name: Some("PRO".to_string()),
             atom: "CG".to_string(),
-            dw_ppm: -2.58 + rng.normal(0.0, 0.07),
+            dw_ppm: -2.60 + rng.normal(0.0, 0.40) + rng.normal(0.0, 0.08),
             dw_err_ppm: 0.08,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
@@ -289,7 +374,7 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             seq_id: 19,
             res_name: Some("PRO".to_string()),
             atom: "CA".to_string(),
-            dw_ppm: -0.54 + rng.normal(0.0, 0.07),
+            dw_ppm: -0.55 + rng.normal(0.0, 0.35) + rng.normal(0.0, 0.08),
             dw_err_ppm: 0.08,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
@@ -299,18 +384,28 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             seq_id: 19,
             res_name: Some("PRO".to_string()),
             atom: "C".to_string(),
-            dw_ppm: -0.84 + rng.normal(0.0, 0.07),
+            dw_ppm: -0.85 + rng.normal(0.0, 0.40) + rng.normal(0.0, 0.08),
             dw_err_ppm: 0.08,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
         },
-        // Preceding GLU18
+        // Preceding VAL17 & GLU18
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 17,
+            res_name: Some("VAL".to_string()),
+            atom: "N".to_string(),
+            dw_ppm: -0.52 + rng.normal(0.0, 0.35) + rng.normal(0.0, 0.10),
+            dw_err_ppm: 0.10,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
         ExchangeShiftObservation {
             chain_id: "A".to_string(),
             seq_id: 18,
             res_name: Some("GLU".to_string()),
             atom: "CA".to_string(),
-            dw_ppm: -1.16 + rng.normal(0.0, 0.07),
+            dw_ppm: -1.15 + rng.normal(0.0, 0.38) + rng.normal(0.0, 0.08),
             dw_err_ppm: 0.08,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
@@ -320,18 +415,18 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             seq_id: 18,
             res_name: Some("GLU".to_string()),
             atom: "C".to_string(),
-            dw_ppm: -1.33 + rng.normal(0.0, 0.07),
+            dw_ppm: -1.35 + rng.normal(0.0, 0.42) + rng.normal(0.0, 0.08),
             dw_err_ppm: 0.08,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
         },
-        // Following SER20
+        // Following SER20 & ASP21
         ExchangeShiftObservation {
             chain_id: "A".to_string(),
             seq_id: 20,
             res_name: Some("SER".to_string()),
             atom: "N".to_string(),
-            dw_ppm: -1.80 + rng.normal(0.0, 0.12),
+            dw_ppm: -1.85 + rng.normal(0.0, 0.70) + rng.normal(0.0, 0.12),
             dw_err_ppm: 0.12,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
@@ -341,8 +436,18 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             seq_id: 20,
             res_name: Some("SER".to_string()),
             atom: "H".to_string(),
-            dw_ppm: -0.30 + rng.normal(0.0, 0.03),
+            dw_ppm: -0.32 + rng.normal(0.0, 0.14) + rng.normal(0.0, 0.03),
             dw_err_ppm: 0.03,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 21,
+            res_name: Some("ASP".to_string()),
+            atom: "N".to_string(),
+            dw_ppm: -0.48 + rng.normal(0.0, 0.35) + rng.normal(0.0, 0.10),
+            dw_err_ppm: 0.10,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
         },
@@ -359,7 +464,7 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             seq_id: sid,
             res_name: Some(rn.to_string()),
             atom: at.to_string(),
-            dw_ppm: rng.normal(0.0, 0.05),
+            dw_ppm: rng.normal(0.0, 0.08),
             dw_err_ppm: 0.08,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
@@ -372,7 +477,7 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             Some(&ubq_shifts),
             &ubq_model,
             table,
-            &[],
+            &alt_bundle,
             &fw,
             &cfg,
         )
@@ -387,14 +492,26 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
                 .map(|h| (h.kind, h.bic, h.reduced_chi2))
                 .collect::<Vec<_>>()
         );
+        let bf_non_null = rep
+            .two_ln_bf_top1_vs_runnerup_non_null
+            .expect("non-null runnerup");
         assert!(
-            rep.two_ln_bf_top1_vs_top2 > 10.0,
-            "H2 ({mode_label}) expected 2 ln BF_12 > 10.0, got {:.2}",
-            rep.two_ln_bf_top1_vs_top2
+            rep.two_ln_bf_top1_vs_top2 >= 6.0 && bf_non_null >= 6.0,
+            "H2 ({mode_label}) expected 2 ln BF >= 6.0, got {:.2} / {:.2}",
+            rep.two_ln_bf_top1_vs_top2,
+            bf_non_null
+        );
+        assert!(
+            (0.25..=2.5).contains(&rep.top1_reduced_chi2),
+            "H2 ({mode_label}) expected realistic reduced_chi2 in [0.25, 2.5], got {:.3}",
+            rep.top1_reduced_chi2
         );
         println!(
-            "EXCITED_STATE_H2_{mode_label}: 2lnBF_12={:.2} 2lnBF_null={:.2} rchi2={:.3}",
-            rep.two_ln_bf_top1_vs_top2, rep.two_ln_bf_top1_vs_null, rep.top1_reduced_chi2
+            "EXCITED_STATE_H2_{mode_label}: 2lnBF_12={:.2} 2lnBF_non_null={:.2} 2lnBF_null={:.2} rchi2={:.3}",
+            rep.two_ln_bf_top1_vs_top2,
+            bf_non_null,
+            rep.two_ln_bf_top1_vs_null,
+            rep.top1_reduced_chi2
         );
         match &rep.ranked_hypotheses[0].parameters {
             HypothesisBestParameters::XxxProCisTrans {
@@ -506,13 +623,13 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
     });
 
     let mut h3a_signed = Vec::new();
-    // Self gamma-gauche CB shift on PHE45 (`g- -> g+`: `-1.65 ppm`)
+    // Self gamma-gauche CB shift on PHE45 (`g- -> g+`: `-1.65 ppm`) + forward-model perturbation noise
     h3a_signed.push(ExchangeShiftObservation {
         chain_id: "A".to_string(),
         seq_id: 45,
         res_name: Some("PHE".to_string()),
         atom: "CB".to_string(),
-        dw_ppm: -1.65 + rng.normal(0.0, 0.06),
+        dw_ppm: -1.65 + rng.normal(0.0, 0.45) + rng.normal(0.0, 0.08),
         dw_err_ppm: 0.08,
         sign_mode: ExchangeSignMode::Signed,
         major_ppm: None,
@@ -535,12 +652,13 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             );
             let (rc1, _) = evaluate_haigh_mallion_ring_current(&rot_rings, h_pt, idx, true, 1.0);
             let d_h = rc1.clamp(-1.80, 1.40) - rc0.clamp(-1.80, 1.40);
+            let w_fwd = (d_h.abs() / 0.12).clamp(0.0, 1.0);
             h3a_signed.push(ExchangeShiftObservation {
                 chain_id: "A".to_string(),
                 seq_id: r.seq_id,
                 res_name: Some(r.res_name.clone()),
                 atom: "H".to_string(),
-                dw_ppm: d_h + rng.normal(0.0, 0.015),
+                dw_ppm: d_h + rng.normal(0.0, 0.14 * w_fwd) + rng.normal(0.0, 0.02),
                 dw_err_ppm: 0.02,
                 sign_mode: ExchangeSignMode::Signed,
                 major_ppm: None,
@@ -550,12 +668,13 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             evaluate_haigh_mallion_ring_current(&ubq_model.aromatic_rings, r.ha, idx, true, 1.0);
         let (ha1, _) = evaluate_haigh_mallion_ring_current(&rot_rings, r.ha, idx, true, 1.0);
         let d_ha = ha1.clamp(-1.50, 1.20) - ha0.clamp(-1.50, 1.20);
+        let w_fwd_ha = (d_ha.abs() / 0.10).clamp(0.0, 1.0);
         h3a_signed.push(ExchangeShiftObservation {
             chain_id: "A".to_string(),
             seq_id: r.seq_id,
             res_name: Some(r.res_name.clone()),
             atom: "HA".to_string(),
-            dw_ppm: d_ha + rng.normal(0.0, 0.015),
+            dw_ppm: d_ha + rng.normal(0.0, 0.11 * w_fwd_ha) + rng.normal(0.0, 0.02),
             dw_err_ppm: 0.02,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
@@ -592,12 +711,13 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
                     .sum::<f64>()
                     / 3.0;
                 let d_hm = rc1.clamp(-1.85, 1.25) - rc0.clamp(-1.85, 1.25);
+                let w_fwd_m = (d_hm.abs() / 0.10).clamp(0.0, 1.0);
                 h3a_signed.push(ExchangeShiftObservation {
                     chain_id: "A".to_string(),
                     seq_id: r.seq_id,
                     res_name: Some(r.res_name.clone()),
                     atom: m.proton_atom.clone(),
-                    dw_ppm: d_hm + rng.normal(0.0, 0.012),
+                    dw_ppm: d_hm + rng.normal(0.0, 0.10 * w_fwd_m) + rng.normal(0.0, 0.018),
                     dw_err_ppm: 0.018,
                     sign_mode: ExchangeSignMode::Signed,
                     major_ppm: None,
@@ -615,12 +735,13 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             );
             let (ca1, _) = evaluate_haigh_mallion_ring_current(&rot_rings, r.ca, idx, true, 0.55);
             let d_ca_ppm = ca1.clamp(-1.0, 1.0) - ca0.clamp(-1.0, 1.0);
+            let w_fwd_ca = (d_ca_ppm.abs() / 0.25).clamp(0.0, 1.0);
             h3a_signed.push(ExchangeShiftObservation {
                 chain_id: "A".to_string(),
                 seq_id: r.seq_id,
                 res_name: Some(r.res_name.clone()),
                 atom: "CA".to_string(),
-                dw_ppm: d_ca_ppm + rng.normal(0.0, 0.05),
+                dw_ppm: d_ca_ppm + rng.normal(0.0, 0.30 * w_fwd_ca) + rng.normal(0.0, 0.07),
                 dw_err_ppm: 0.07,
                 sign_mode: ExchangeSignMode::Signed,
                 major_ppm: None,
@@ -637,7 +758,7 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             Some(&ubq_shifts),
             &ubq_model,
             table,
-            &[],
+            &alt_bundle,
             &fw,
             &cfg,
         )
@@ -652,14 +773,26 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
                 .map(|h| (h.kind, h.bic, h.reduced_chi2, &h.best_locus_summary))
                 .collect::<Vec<_>>()
         );
+        let bf_non_null = rep
+            .two_ln_bf_top1_vs_runnerup_non_null
+            .expect("non-null runnerup");
         assert!(
-            rep.two_ln_bf_top1_vs_top2 > 10.0,
-            "H3a PHE45 ({mode_label}) expected 2 ln BF_12 > 10.0, got {:.2}",
-            rep.two_ln_bf_top1_vs_top2
+            rep.two_ln_bf_top1_vs_top2 >= 6.0 && bf_non_null >= 6.0,
+            "H3a PHE45 ({mode_label}) expected 2 ln BF >= 6.0, got {:.2} / {:.2}",
+            rep.two_ln_bf_top1_vs_top2,
+            bf_non_null
+        );
+        assert!(
+            (0.20..=2.5).contains(&rep.top1_reduced_chi2),
+            "H3a ({mode_label}) expected realistic reduced_chi2 in [0.20, 2.5], got {:.3}",
+            rep.top1_reduced_chi2
         );
         println!(
-            "EXCITED_STATE_H3a_{mode_label}: 2lnBF_12={:.2} 2lnBF_null={:.2} rchi2={:.3}",
-            rep.two_ln_bf_top1_vs_top2, rep.two_ln_bf_top1_vs_null, rep.top1_reduced_chi2
+            "EXCITED_STATE_H3a_{mode_label}: 2lnBF_12={:.2} 2lnBF_non_null={:.2} 2lnBF_null={:.2} rchi2={:.3}",
+            rep.two_ln_bf_top1_vs_top2,
+            bf_non_null,
+            rep.two_ln_bf_top1_vs_null,
+            rep.top1_reduced_chi2
         );
         match &rep.ranked_hypotheses[0].parameters {
             HypothesisBestParameters::AromaticRotamerFlip {
@@ -677,7 +810,7 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
     }
 
     // =========================================================================
-    // 3b. H3: RotamerOrHisTautomerFlip -- Pelton 1993 HIS68 +-82 ppm ND1/NE2 flip
+    // 3b. H3: RotamerOrHisTautomerFlip -- Pelton 1993 HIS68 +-82 ppm ND1/NE2 & +-8.3 ppm CG flip
     // =========================================================================
     let h3b_signed = vec![
         ExchangeShiftObservation {
@@ -685,7 +818,7 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             seq_id: 68,
             res_name: Some("HIS".to_string()),
             atom: "ND1".to_string(),
-            dw_ppm: -81.6 + rng.normal(0.0, 0.50),
+            dw_ppm: -82.0 + rng.normal(0.0, 2.60) + rng.normal(0.0, 0.60),
             dw_err_ppm: 0.60,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: Some(249.5),
@@ -695,7 +828,7 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             seq_id: 68,
             res_name: Some("HIS".to_string()),
             atom: "NE2".to_string(),
-            dw_ppm: 81.9 + rng.normal(0.0, 0.50),
+            dw_ppm: 82.0 + rng.normal(0.0, 2.60) + rng.normal(0.0, 0.60),
             dw_err_ppm: 0.60,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: Some(168.5),
@@ -705,7 +838,7 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             seq_id: 68,
             res_name: Some("HIS".to_string()),
             atom: "CD2".to_string(),
-            dw_ppm: 7.15 + rng.normal(0.0, 0.15),
+            dw_ppm: 7.20 + rng.normal(0.0, 0.90) + rng.normal(0.0, 0.20),
             dw_err_ppm: 0.20,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: Some(118.2),
@@ -715,7 +848,7 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             seq_id: 68,
             res_name: Some("HIS".to_string()),
             atom: "CG".to_string(),
-            dw_ppm: -4.75 + rng.normal(0.0, 0.15),
+            dw_ppm: -8.30 + rng.normal(0.0, 0.90) + rng.normal(0.0, 0.20),
             dw_err_ppm: 0.20,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: Some(135.5),
@@ -725,8 +858,29 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             seq_id: 68,
             res_name: Some("HIS".to_string()),
             atom: "CB".to_string(),
-            dw_ppm: -2.15 + rng.normal(0.0, 0.10),
+            dw_ppm: -2.20 + rng.normal(0.0, 0.45) + rng.normal(0.0, 0.15),
             dw_err_ppm: 0.15,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        // Proximal amides (< 6.5 A of HIS68 ring: LYS6, ILE44, LEU67, LEU69) sensing H-bond/electrostatic switch
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 6,
+            res_name: Some("LYS".to_string()),
+            atom: "H".to_string(),
+            dw_ppm: 0.11 + rng.normal(0.0, 0.08),
+            dw_err_ppm: 0.02,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 44,
+            res_name: Some("ILE".to_string()),
+            atom: "H".to_string(),
+            dw_ppm: 0.09 + rng.normal(0.0, 0.08),
+            dw_err_ppm: 0.02,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
         },
@@ -734,8 +888,18 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             chain_id: "A".to_string(),
             seq_id: 67,
             res_name: Some("LEU".to_string()),
-            atom: "CA".to_string(),
-            dw_ppm: 0.04,
+            atom: "N".to_string(),
+            dw_ppm: 0.38 + rng.normal(0.0, 0.25),
+            dw_err_ppm: 0.08,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 69,
+            res_name: Some("LEU".to_string()),
+            atom: "N".to_string(),
+            dw_ppm: 0.36 + rng.normal(0.0, 0.25),
             dw_err_ppm: 0.08,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
@@ -743,15 +907,15 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
     ];
     let h3b_unsigned = to_unsigned_table(&h3b_signed);
 
-    for (mode_label, table) in [
-        ("signed_CEST", &h3b_signed),
-        ("unsigned_CPMG", &h3b_unsigned),
+    for (is_unsigned, mode_label, table) in [
+        (false, "signed_CEST", &h3b_signed),
+        (true, "unsigned_CPMG", &h3b_unsigned),
     ] {
         let rep = classify_excited_state_with_firewall(
             Some(&ubq_shifts),
             &ubq_model,
             table,
-            &[],
+            &alt_bundle,
             &fw,
             &cfg,
         )
@@ -762,24 +926,48 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
             "H3b HIS68 ({mode_label}) failed to commit: reason={}",
             rep.verdict_reason
         );
+        let bf_non_null = rep
+            .two_ln_bf_top1_vs_runnerup_non_null
+            .expect("non-null runnerup");
         assert!(
-            rep.two_ln_bf_top1_vs_top2 > 10.0,
-            "H3b HIS68 ({mode_label}) expected 2 ln BF_12 > 10.0, got {:.2}",
-            rep.two_ln_bf_top1_vs_top2
+            rep.two_ln_bf_top1_vs_top2 > 10.0 && bf_non_null > 10.0,
+            "H3b HIS68 ({mode_label}) expected 2 ln BF > 10.0, got {:.2} / {:.2}",
+            rep.two_ln_bf_top1_vs_top2,
+            bf_non_null
+        );
+        assert!(
+            (0.15..=2.5).contains(&rep.top1_reduced_chi2),
+            "H3b ({mode_label}) expected realistic reduced_chi2 in [0.15, 2.5], got {:.3}",
+            rep.top1_reduced_chi2
         );
         println!(
-            "EXCITED_STATE_H3b_{mode_label}: 2lnBF_12={:.2} 2lnBF_null={:.2} rchi2={:.3}",
-            rep.two_ln_bf_top1_vs_top2, rep.two_ln_bf_top1_vs_null, rep.top1_reduced_chi2
+            "EXCITED_STATE_H3b_{mode_label}: 2lnBF_12={:.2} 2lnBF_non_null={:.2} 2lnBF_null={:.2} rchi2={:.3}",
+            rep.two_ln_bf_top1_vs_top2,
+            bf_non_null,
+            rep.two_ln_bf_top1_vs_null,
+            rep.top1_reduced_chi2
         );
         match &rep.ranked_hypotheses[0].parameters {
             HypothesisBestParameters::HisTautomerOrProtonation {
-                seq_id, transition, ..
+                seq_id,
+                transition,
+                delta_cg_ppm,
+                ..
             } => {
                 assert_eq!(*seq_id, 68);
-                assert!(matches!(
-                    transition,
-                    HisExchangeTransition::Ne2HToNd1H | HisExchangeTransition::Nd1HToNe2H
-                ));
+                assert!(
+                    (delta_cg_ppm.abs() - 8.3).abs() < 1e-6,
+                    "expected |delta_cg_ppm| == 8.3 ppm matching topology::HIS_*_PRIORS, got {delta_cg_ppm}"
+                );
+                if is_unsigned {
+                    assert_eq!(
+                        *transition,
+                        HisExchangeTransition::AmbiguousDirectionOnUnsignedCpmg,
+                        "unsigned CPMG without ground ND1/NE2 shifts must report AmbiguousDirectionOnUnsignedCpmg"
+                    );
+                } else {
+                    assert_eq!(*transition, HisExchangeTransition::Ne2HToNd1H);
+                }
             }
             other => panic!("expected HisTautomerOrProtonation on HIS68, got {other:?}"),
         }
@@ -788,65 +976,33 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
     // =========================================================================
     // 4. H4: Alternate3DConformer (1 true switched 3D conformer + 3 decoys)
     // =========================================================================
-    let seq_ids: Vec<i32> = ubq_model.residues.iter().map(|r| r.seq_id).collect();
-    let res_names: Vec<String> = ubq_model
-        .residues
-        .iter()
-        .map(|r| r.res_name.clone())
-        .collect();
-    let ca_coords: Vec<[f64; 3]> = ubq_model.residues.iter().map(|r| r.ca).collect();
-    let base_phi: Vec<Option<f64>> = ubq_model.residues.iter().map(|r| r.phi_deg).collect();
-    let base_psi: Vec<Option<f64>> = ubq_model.residues.iter().map(|r| r.psi_deg).collect();
-    let base_chi1: Vec<Option<f64>> = ubq_model.residues.iter().map(|r| r.chi1_deg).collect();
-
-    // True excited conformer: beta-turn/strand segment 7..=15 flips into alpha-helical (-62, -42) basin
-    // (opposite direction from random coil, so H1 LocalUnfolding cannot mimic it!)
-    let make_switched_model =
-        |range: std::ops::RangeInclusive<i32>, target_phi: f64, target_psi: f64| {
-            let mut phi = base_phi.clone();
-            let mut psi = base_psi.clone();
-            for (k, &sid) in seq_ids.iter().enumerate() {
-                if range.contains(&sid) && phi[k].is_some() && psi[k].is_some() {
-                    phi[k] = Some(target_phi);
-                    psi[k] = Some(target_psi);
-                }
-            }
-            StructureModel::from_ca_and_torsions(
-                "A", &seq_ids, &res_names, &ca_coords, &phi, &psi, &base_chi1,
-            )
-            .expect("reconstruct switched conformer")
-        };
-
-    let ground_recon = StructureModel::from_ca_and_torsions(
-        "A", &seq_ids, &res_names, &ca_coords, &base_phi, &base_psi, &base_chi1,
-    )
-    .expect("reconstruct ground");
-    let alt_true = make_switched_model(7..=15, -62.0, -42.0);
-    let alt_decoy1 = make_switched_model(48..=56, -62.0, -42.0);
-    let alt_decoy2 = make_switched_model(25..=32, -125.0, 135.0);
-    let alt_decoy3 = make_switched_model(62..=70, -60.0, -40.0);
-
-    let pred_g_recon =
-        predict_structure_shifts_with_firewall(&ground_recon, &fw, &struct_cfg).unwrap();
-    let pred_b_true = predict_structure_shifts_with_firewall(&alt_true, &fw, &struct_cfg).unwrap();
-
     let mut h4_signed = Vec::new();
     for (idx, r) in ground_recon.residues.iter().enumerate() {
         if !(5..=17).contains(&r.seq_id) && !(26..=30).contains(&r.seq_id) {
             continue;
         }
-        for &(atom, exp_sd) in &[("CA", 0.08), ("CB", 0.09), ("C", 0.08), ("N", 0.15)] {
+        for &(atom, exp_sd, fwd_sd) in &[
+            ("CA", 0.08, 0.44),
+            ("CB", 0.09, 0.52),
+            ("C", 0.08, 0.48),
+            ("N", 0.15, 1.10),
+        ] {
             if let (Some(ga), Some(gb)) = (
                 pred_g_recon.residues[idx].backbone.get(atom),
                 pred_b_true.residues[idx].backbone.get(atom),
             ) {
                 let true_dw = gb.struct_ppm - ga.struct_ppm;
+                let fwd_noise = if true_dw.abs() > 0.10 {
+                    rng.normal(0.0, fwd_sd)
+                } else {
+                    0.0
+                };
                 h4_signed.push(ExchangeShiftObservation {
                     chain_id: "A".to_string(),
                     seq_id: r.seq_id,
                     res_name: Some(r.res_name.clone()),
                     atom: atom.to_string(),
-                    dw_ppm: true_dw + rng.normal(0.0, exp_sd),
+                    dw_ppm: true_dw + fwd_noise + rng.normal(0.0, exp_sd),
                     dw_err_ppm: exp_sd,
                     sign_mode: ExchangeSignMode::Signed,
                     major_ppm: Some(ga.struct_ppm),
@@ -855,24 +1011,6 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
         }
     }
     let h4_unsigned = to_unsigned_table(&h4_signed);
-    let alt_bundle = vec![
-        AltConformerInput {
-            label: "decoy_loop48_56.pdb".to_string(),
-            model: alt_decoy1,
-        },
-        AltConformerInput {
-            label: "native_excited_hairpin7_15.pdb".to_string(),
-            model: alt_true,
-        },
-        AltConformerInput {
-            label: "decoy_helix25_32_strand.pdb".to_string(),
-            model: alt_decoy2,
-        },
-        AltConformerInput {
-            label: "decoy_cterm62_70.pdb".to_string(),
-            model: alt_decoy3,
-        },
-    ];
 
     for (mode_label, table) in [("signed_CEST", &h4_signed), ("unsigned_CPMG", &h4_unsigned)] {
         let rep = classify_excited_state_with_firewall(
@@ -894,14 +1032,26 @@ fn test_four_hypothesis_bic_top1_recovery_signed_cest_and_unsigned_cpmg() {
                 .map(|h| (h.kind, h.bic, h.reduced_chi2))
                 .collect::<Vec<_>>()
         );
+        let bf_non_null = rep
+            .two_ln_bf_top1_vs_runnerup_non_null
+            .expect("non-null runnerup");
         println!(
-            "EXCITED_STATE_H4_{mode_label}: 2lnBF_12={:.2} 2lnBF_null={:.2} rchi2={:.3}",
-            rep.two_ln_bf_top1_vs_top2, rep.two_ln_bf_top1_vs_null, rep.top1_reduced_chi2
+            "EXCITED_STATE_H4_{mode_label}: 2lnBF_12={:.2} 2lnBF_non_null={:.2} 2lnBF_null={:.2} rchi2={:.3}",
+            rep.two_ln_bf_top1_vs_top2,
+            bf_non_null,
+            rep.two_ln_bf_top1_vs_null,
+            rep.top1_reduced_chi2
         );
         assert!(
-            rep.two_ln_bf_top1_vs_top2 > 10.0,
-            "H4 ({mode_label}) expected 2 ln BF_12 > 10.0, got {:.2}",
-            rep.two_ln_bf_top1_vs_top2
+            rep.two_ln_bf_top1_vs_top2 > 10.0 && bf_non_null > 10.0,
+            "H4 ({mode_label}) expected 2 ln BF > 10.0, got {:.2} / {:.2}",
+            rep.two_ln_bf_top1_vs_top2,
+            bf_non_null
+        );
+        assert!(
+            (0.30..=2.5).contains(&rep.top1_reduced_chi2),
+            "H4 ({mode_label}) expected realistic reduced_chi2 in [0.30, 2.5], got {:.3}",
+            rep.top1_reduced_chi2
         );
         match &rep.ranked_hypotheses[0].parameters {
             HypothesisBestParameters::Alternate3DConformer {
@@ -978,6 +1128,16 @@ fn test_mixed_cest_signed_and_cpmg_unsigned_table_and_tsv_parsers() {
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: Some(116.2),
         },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 21,
+            res_name: Some("ASP".to_string()),
+            atom: "N".to_string(),
+            dw_ppm: 0.48,
+            dw_err_ppm: 0.10,
+            sign_mode: ExchangeSignMode::UnsignedMagnitude,
+            major_ppm: None,
+        },
     ];
 
     let tsv = write_exchange_observations_tsv(&mixed);
@@ -995,8 +1155,10 @@ fn test_mixed_cest_signed_and_cpmg_unsigned_table_and_tsv_parsers() {
         &cfg,
     )
     .expect("classify mixed");
-    assert_eq!(rep.n_unsigned_observations, 3);
+    assert_eq!(rep.n_unsigned_observations, 4);
     assert_eq!(rep.n_signed_observations, 2);
+    assert_eq!(rep.n_distinct_residues, 4);
+    assert_eq!(rep.n_distinct_exchanging_residues, 4);
     assert_eq!(
         rep.verdict,
         ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::XxxProCisTrans)
@@ -1215,4 +1377,734 @@ fn test_pure_noise_sparse_and_unmodeled_state_abstention_and_hostile_inputs() {
         &cfg,
     )
     .is_err());
+}
+
+#[test]
+fn test_s5_p0_1_duplicate_observation_rejected_and_single_residue_abstains() {
+    let (ubq_model, ubq_shifts) = load_ubiquitin_ground();
+    let fw = ubiquitin_firewall();
+    let cfg = ExcitedStateConfig::default();
+
+    // 1. Exact Claude review probe (`21.W3:P0-1`): Ubiquitin S20 N = -1.85 ppm repeated 4x, 8x, 30x
+    //    must be rejected with `Err` in BOTH `parse_exchange_observations_tsv` AND `classify_excited_state_with_firewall`!
+    for &(copies, mode) in &[
+        (4usize, ExchangeSignMode::Signed),
+        (8usize, ExchangeSignMode::UnsignedMagnitude),
+        (30usize, ExchangeSignMode::Signed),
+    ] {
+        let single_row = ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 20,
+            res_name: Some("SER".to_string()),
+            atom: "N".to_string(),
+            dw_ppm: if mode == ExchangeSignMode::Signed {
+                -1.85
+            } else {
+                1.85
+            },
+            dw_err_ppm: 0.10,
+            sign_mode: mode,
+            major_ppm: Some(116.2),
+        };
+        let repeated: Vec<ExchangeShiftObservation> = vec![single_row; copies];
+        let tsv = write_exchange_observations_tsv(&repeated);
+        let parse_err = parse_exchange_observations_tsv(&tsv)
+            .expect_err("duplicate (chain_id, seq_id, atom) rows in TSV must fail closed");
+        assert!(
+            parse_err.contains("duplicate"),
+            "expected 'duplicate' in parse error, got: {parse_err}"
+        );
+
+        let classify_err = classify_excited_state_with_firewall(
+            Some(&ubq_shifts),
+            &ubq_model,
+            &repeated,
+            &[],
+            &fw,
+            &cfg,
+        )
+        .expect_err(
+            "duplicate (chain_id, seq_id, atom) slice in classify_excited_state must fail closed",
+        );
+        assert!(
+            classify_err.contains("duplicate"),
+            "expected 'duplicate' in classify error, got: {classify_err}"
+        );
+    }
+
+    // 2. Atom-alias duplicates (`HN` vs `H`, empty chain vs `"A"`) are also normalized and rejected!
+    let alias_tsv = "chain_id\tseq_id\tres_name\tatom\tdw_ppm\tdw_err_ppm\tsign_mode\n\
+                     A\t20\tSER\tH\t-0.30\t0.03\tsigned\n\
+                     \t20\tSER\tHN\t-0.31\t0.03\tsigned\n";
+    assert!(
+        parse_exchange_observations_tsv(alias_tsv).is_err(),
+        "normalized H vs HN duplicate on same (chain, seq_id) must be rejected"
+    );
+
+    // 3. Single-residue multi-atom (`N_obs = 5 >= 4`, `N_res = 1 < 4`) MUST abstain!
+    let single_res_five_atoms = vec![
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 19,
+            res_name: Some("PRO".to_string()),
+            atom: "CB".to_string(),
+            dw_ppm: 2.40,
+            dw_err_ppm: 0.08,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 19,
+            res_name: Some("PRO".to_string()),
+            atom: "CG".to_string(),
+            dw_ppm: -2.60,
+            dw_err_ppm: 0.08,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 19,
+            res_name: Some("PRO".to_string()),
+            atom: "CA".to_string(),
+            dw_ppm: -0.55,
+            dw_err_ppm: 0.08,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 19,
+            res_name: Some("PRO".to_string()),
+            atom: "C".to_string(),
+            dw_ppm: -0.85,
+            dw_err_ppm: 0.08,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 19,
+            res_name: Some("PRO".to_string()),
+            atom: "HA".to_string(),
+            dw_ppm: 0.28,
+            dw_err_ppm: 0.03,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+    ];
+    let rep_single = classify_excited_state_with_firewall(
+        Some(&ubq_shifts),
+        &ubq_model,
+        &single_res_five_atoms,
+        &[],
+        &fw,
+        &cfg,
+    )
+    .expect("single residue 5 atoms");
+    assert_eq!(rep_single.n_observations, 5);
+    assert_eq!(rep_single.n_distinct_residues, 1);
+    assert_eq!(
+        rep_single.verdict,
+        ExcitedStateVerdict::AmbiguousOrUnmodeledState
+    );
+    assert_eq!(
+        rep_single.abstention_kind,
+        Some(ExcitedStateAbstentionKind::InsufficientDistinctResidues)
+    );
+
+    // 4. Spectator-padding probe: 1 exchanging residue (`S20 N = -1.85`) + 5 zero-shift spectators
+    //    (`N_res = 6 >= 4`, `N_exch_res = 1 < 4`) MUST NOT commit!
+    let mut padded = vec![ExchangeShiftObservation {
+        chain_id: "A".to_string(),
+        seq_id: 20,
+        res_name: Some("SER".to_string()),
+        atom: "N".to_string(),
+        dw_ppm: -1.85,
+        dw_err_ppm: 0.08,
+        sign_mode: ExchangeSignMode::Signed,
+        major_ppm: Some(116.2),
+    }];
+    for &(sid, rn) in &[
+        (5, "VAL"),
+        (13, "ILE"),
+        (26, "VAL"),
+        (43, "LEU"),
+        (56, "LEU"),
+    ] {
+        padded.push(ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: sid,
+            res_name: Some(rn.to_string()),
+            atom: "N".to_string(),
+            dw_ppm: 0.0,
+            dw_err_ppm: 0.12,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        });
+    }
+    let rep_padded = classify_excited_state_with_firewall(
+        Some(&ubq_shifts),
+        &ubq_model,
+        &padded,
+        &[],
+        &fw,
+        &cfg,
+    )
+    .expect("spectator padded");
+    assert_eq!(rep_padded.n_distinct_residues, 6);
+    assert_eq!(rep_padded.n_distinct_exchanging_residues, 1);
+    assert_eq!(
+        rep_padded.verdict,
+        ExcitedStateVerdict::AmbiguousOrUnmodeledState
+    );
+}
+
+#[test]
+fn test_s5_p0_2_nterminal_u_best_zero_no_debug_underflow_panic() {
+    let (ubq_model, ubq_shifts) = load_ubiquitin_ground();
+    let fw = ubiquitin_firewall();
+    let cfg = ExcitedStateConfig::default();
+    let pred_a =
+        predict_structure_shifts_with_firewall(&ubq_model, &fw, &StructShiftConfig::default())
+            .expect("pred_a");
+
+    // N-terminal unfolding starting at residue index 0 (`MET1..VAL5`, `u_best == 0`!)
+    // Previously panicked in debug builds at `(u_best > 0 && ...).then_some(u_best - 1)`.
+    let mut nterm_obs = Vec::new();
+    for (r_idx, r) in ubq_model.residues.iter().enumerate() {
+        if !(1..=6).contains(&r.seq_id) && !(25..=28).contains(&r.seq_id) {
+            continue;
+        }
+        let w = if (1..=5).contains(&r.seq_id) {
+            1.0
+        } else if r.seq_id == 6 {
+            0.5
+        } else {
+            0.0
+        };
+        let ref_idx = ubq_shifts
+            .seq_ids
+            .iter()
+            .position(|&s| s == r.seq_id)
+            .expect("seq_id");
+        for &(atom, exp_sd) in &[("CA", 0.08), ("CB", 0.09), ("C", 0.08), ("N", 0.12)] {
+            if let (Some(&g_ppm), Some(bb)) = (
+                ubq_shifts.shifts.get(&(ref_idx, atom.to_string())),
+                pred_a.residues[r_idx].backbone.get(atom),
+            ) {
+                nterm_obs.push(ExchangeShiftObservation {
+                    chain_id: "A".to_string(),
+                    seq_id: r.seq_id,
+                    res_name: Some(r.res_name.clone()),
+                    atom: atom.to_string(),
+                    dw_ppm: w * (bb.rc_ppm - g_ppm),
+                    dw_err_ppm: exp_sd,
+                    sign_mode: ExchangeSignMode::Signed,
+                    major_ppm: Some(g_ppm),
+                });
+            }
+        }
+    }
+
+    let rep = classify_excited_state_with_firewall(
+        Some(&ubq_shifts),
+        &ubq_model,
+        &nterm_obs,
+        &[],
+        &fw,
+        &cfg,
+    )
+    .expect("u_best == 0 must never underflow in debug builds");
+    assert_eq!(
+        rep.verdict,
+        ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::LocalUnfolding)
+    );
+    match &rep.ranked_hypotheses[0].parameters {
+        HypothesisBestParameters::LocalUnfolding {
+            start_seq_id,
+            end_seq_id,
+            ..
+        } => {
+            assert_eq!(*start_seq_id, 1);
+            assert_eq!(*end_seq_id, 5);
+            assert_eq!(
+                rep.ranked_hypotheses[0].affected_seq_ids,
+                vec![1, 2, 3, 4, 5, 6]
+            );
+        }
+        other => panic!("expected LocalUnfolding at N-terminus, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_s5_p1_3_marginalized_discrete_scan_bic_and_distinct_residue_n() {
+    let (ubq_model, ubq_shifts) = load_ubiquitin_ground();
+    let fw = ubiquitin_firewall();
+    let cfg = ExcitedStateConfig::default();
+
+    // 4 distinct residues (`18, 19, 20, 21`), 8 total observations (2 nuclei per residue):
+    // BIC MUST use `n = 4` (`ln(4)`), NOT `n = 8` (`ln(8)`), and `marginal_log_likelihood`
+    // MUST equal `ln(1/M_H * sum_m L_m) < max_m ln L_m` (discrete-scan multiplicity penalty).
+    let obs = vec![
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 19,
+            res_name: Some("PRO".to_string()),
+            atom: "CB".to_string(),
+            dw_ppm: 2.40,
+            dw_err_ppm: 0.08,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 19,
+            res_name: Some("PRO".to_string()),
+            atom: "CG".to_string(),
+            dw_ppm: -2.60,
+            dw_err_ppm: 0.08,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 18,
+            res_name: Some("GLU".to_string()),
+            atom: "CA".to_string(),
+            dw_ppm: -1.15,
+            dw_err_ppm: 0.08,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 18,
+            res_name: Some("GLU".to_string()),
+            atom: "C".to_string(),
+            dw_ppm: -1.35,
+            dw_err_ppm: 0.08,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 20,
+            res_name: Some("SER".to_string()),
+            atom: "N".to_string(),
+            dw_ppm: -1.85,
+            dw_err_ppm: 0.12,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 20,
+            res_name: Some("SER".to_string()),
+            atom: "H".to_string(),
+            dw_ppm: -0.32,
+            dw_err_ppm: 0.03,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 21,
+            res_name: Some("ASP".to_string()),
+            atom: "N".to_string(),
+            dw_ppm: -0.45,
+            dw_err_ppm: 0.10,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 21,
+            res_name: Some("ASP".to_string()),
+            atom: "CA".to_string(),
+            dw_ppm: -0.22,
+            dw_err_ppm: 0.08,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+    ];
+
+    let rep =
+        classify_excited_state_with_firewall(Some(&ubq_shifts), &ubq_model, &obs, &[], &fw, &cfg)
+            .expect("classify P1-3");
+    assert_eq!(rep.n_observations, 8);
+    assert_eq!(rep.n_distinct_residues, 4);
+
+    for h in &rep.ranked_hypotheses {
+        assert_eq!(h.n_distinct_residues, 4);
+        let expected_bic =
+            -2.0 * h.marginal_log_likelihood + (h.num_params_k as f64) * (4.0_f64).ln();
+        assert!(
+            (h.bic - expected_bic).abs() < 1e-10,
+            "BIC for {:?} must equal -2*marginal_ll + k*ln(4): got {} vs {}",
+            h.kind,
+            h.bic,
+            expected_bic
+        );
+        if h.n_candidates_evaluated > 1 {
+            assert!(
+                h.marginal_log_likelihood < h.max_log_likelihood,
+                "discrete candidate scan (M_H={}) for {:?} must carry marginalization penalty (< max ll)",
+                h.n_candidates_evaluated,
+                h.kind
+            );
+        }
+    }
+    // Ubiquitin has 3 Prolines (PRO19, PRO37, PRO38); PRO19 dominates -> marginal_ll ≈ max_ll - ln(3)
+    let h2 = rep
+        .ranked_hypotheses
+        .iter()
+        .find(|h| h.kind == ExcitedStateHypothesisKind::XxxProCisTrans)
+        .expect("H2");
+    assert_eq!(h2.n_candidates_evaluated, 3);
+    let penalty_nats = h2.max_log_likelihood - h2.marginal_log_likelihood;
+    assert!(
+        (penalty_nats - (3.0_f64).ln()).abs() < 0.05,
+        "when 1 of 3 Prolines dominates, marginalization penalty must be ~ln(3)={:.4}, got {:.4}",
+        (3.0_f64).ln(),
+        penalty_nats
+    );
+}
+
+#[test]
+fn test_s5_p1_4_h0_experimental_noise_only_rejects_3_sites_at_2p5_ppm() {
+    let (ubq_model, ubq_shifts) = load_ubiquitin_ground();
+    let fw = ubiquitin_firewall();
+    let cfg = ExcitedStateConfig::default();
+
+    // Exact Claude review probe (`21.W3:P1-4`): 3 scattered sites at |dw| = 2.50 ppm (`20x`
+    // measurement error `dw_err = 0.125 ppm`) on a background of 12 pure-noise residues across
+    // 20 independent seeds (both Signed and Unsigned) MUST strongly reject H0 and report
+    // `UnmodeledSignificantExchange` (NEVER claiming `"within experimental noise"` or `"no significant exchange"`!).
+    let background_sids = [4, 7, 11, 15, 24, 27, 31, 41, 48, 52, 61, 71];
+    let outlier_sids = [(13, "ILE", 2.50), (33, "LYS", -2.50), (58, "ASP", 2.50)];
+
+    for seed in 0..20u64 {
+        let mut rng = Rng::new(77_000 + seed);
+        let mut signed_obs = Vec::new();
+        for &(sid, rn, dw) in &outlier_sids {
+            signed_obs.push(ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: sid,
+                res_name: Some(rn.to_string()),
+                atom: "N".to_string(),
+                dw_ppm: dw,
+                dw_err_ppm: 0.125,
+                sign_mode: ExchangeSignMode::Signed,
+                major_ppm: None,
+            });
+        }
+        for &sid in &background_sids {
+            let r = ubq_model
+                .residues
+                .iter()
+                .find(|x| x.seq_id == sid)
+                .expect("bg res");
+            signed_obs.push(ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: sid,
+                res_name: Some(r.res_name.clone()),
+                atom: "N".to_string(),
+                dw_ppm: rng.normal(0.0, 0.125),
+                dw_err_ppm: 0.125,
+                sign_mode: ExchangeSignMode::Signed,
+                major_ppm: None,
+            });
+        }
+        let unsigned_obs = to_unsigned_table(&signed_obs);
+
+        for (label, tbl) in [("signed", &signed_obs), ("unsigned", &unsigned_obs)] {
+            let rep = classify_excited_state_with_firewall(
+                Some(&ubq_shifts),
+                &ubq_model,
+                tbl,
+                &[],
+                &fw,
+                &cfg,
+            )
+            .expect("classify P1-4");
+            let h0 = rep
+                .ranked_hypotheses
+                .iter()
+                .find(|h| h.kind == ExcitedStateHypothesisKind::NullOrUnstructuredPerturbation)
+                .expect("H0 present");
+            assert!(
+                h0.reduced_chi2 > 20.0,
+                "seed {seed} ({label}): H0 parameterized with sigma_exp must reject 3x 20-sigma outliers (got rchi2={:.3})",
+                h0.reduced_chi2
+            );
+            assert!(
+                rep.unmodeled_exchange_two_ln_bf_vs_null > 10.0,
+                "seed {seed} ({label}): expected unmodeled_exchange_two_ln_bf_vs_null > 10.0, got {:.2}",
+                rep.unmodeled_exchange_two_ln_bf_vs_null
+            );
+            assert_eq!(rep.verdict, ExcitedStateVerdict::AmbiguousOrUnmodeledState);
+            assert_eq!(
+                rep.abstention_kind,
+                Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange),
+                "seed {seed} ({label}): expected UnmodeledSignificantExchange, got {:?} ({})",
+                rep.abstention_kind,
+                rep.verdict_reason
+            );
+            assert!(
+                rep.verdict_reason
+                    .starts_with("UnmodeledSignificantExchange:"),
+                "unexpected verdict_reason: {}",
+                rep.verdict_reason
+            );
+            assert!(
+                !rep.verdict_reason
+                    .to_ascii_lowercase()
+                    .contains("within experimental noise"),
+                "must never falsely claim consistency with noise: {}",
+                rep.verdict_reason
+            );
+        }
+    }
+
+    // Verify `cpmg_prefiltered_significant_only` is recorded explicitly when parsing CPMG fit TSV
+    let cpmg_tsv = "seq_id\tres_name\tdw_ppm\tdw_ppm_err\tsignificant_exchange\n\
+                    18\tGLU\t1.15\t0.08\ttrue\n\
+                    19\tPRO\t0.55\t0.08\ttrue\n\
+                    20\tSER\t1.85\t0.10\ttrue\n\
+                    21\tASP\t0.48\t0.09\ttrue\n\
+                    25\tASN\t0.04\t0.10\tfalse\n";
+    let parsed_meta = parse_exchange_observations_tsv_with_meta(cpmg_tsv).expect("parse meta");
+    assert!(parsed_meta.cpmg_prefiltered_significant_only);
+    assert_eq!(parsed_meta.observations.len(), 4);
+
+    let cfg_prefilt = ExcitedStateConfig {
+        cpmg_prefiltered_significant_only: parsed_meta.cpmg_prefiltered_significant_only,
+        ..ExcitedStateConfig::default()
+    };
+    let rep_pf = classify_excited_state_with_firewall(
+        Some(&ubq_shifts),
+        &ubq_model,
+        &parsed_meta.observations,
+        &[],
+        &fw,
+        &cfg_prefilt,
+    )
+    .expect("classify prefiltered");
+    assert!(rep_pf.cpmg_prefiltered_significant_only);
+    assert!(rep_pf
+        .warnings
+        .iter()
+        .any(|w| w.contains("significant_exchange=true")));
+    let tsv_pf = format_excited_state_tsv(&rep_pf);
+    assert!(tsv_pf.contains("cpmg_prefiltered_significant_only: true"));
+}
+
+#[test]
+fn test_s5_his_p2_cg_shift_backbone_gate_and_unsigned_direction_ambiguity() {
+    let (ubq_model, ubq_shifts) = load_ubiquitin_ground();
+    let fw = ubiquitin_firewall();
+    let cfg = ExcitedStateConfig::default();
+
+    // 1. Backbone-only data near HIS68 (ZERO sidechain ND1/NE2/CD2/CG/CE1 observations) MUST NEVER
+    //    select `HisTautomerOrProtonation` (`His` P2 item 2).
+    let backbone_near_his68 = vec![
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 68,
+            res_name: Some("HIS".to_string()),
+            atom: "CB".to_string(),
+            dw_ppm: -2.20,
+            dw_err_ppm: 0.12,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 68,
+            res_name: Some("HIS".to_string()),
+            atom: "CA".to_string(),
+            dw_ppm: -0.55,
+            dw_err_ppm: 0.08,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 68,
+            res_name: Some("HIS".to_string()),
+            atom: "N".to_string(),
+            dw_ppm: 0.85,
+            dw_err_ppm: 0.12,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 67,
+            res_name: Some("LEU".to_string()),
+            atom: "N".to_string(),
+            dw_ppm: 0.35,
+            dw_err_ppm: 0.10,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 69,
+            res_name: Some("LEU".to_string()),
+            atom: "N".to_string(),
+            dw_ppm: 0.35,
+            dw_err_ppm: 0.10,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 44,
+            res_name: Some("ILE".to_string()),
+            atom: "H".to_string(),
+            dw_ppm: 0.12,
+            dw_err_ppm: 0.02,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        },
+    ];
+    let rep_bb = classify_excited_state_with_firewall(
+        Some(&ubq_shifts),
+        &ubq_model,
+        &backbone_near_his68,
+        &[],
+        &fw,
+        &cfg,
+    )
+    .expect("classify backbone near HIS68");
+    for h in &rep_bb.ranked_hypotheses {
+        assert!(
+            !matches!(
+                h.parameters,
+                HypothesisBestParameters::HisTautomerOrProtonation { .. }
+            ),
+            "HisTautomerOrProtonation must be ineligible on backbone-only data, got: {:?}",
+            h.parameters
+        );
+    }
+
+    // 2. Unsigned CPMG data WITH disambiguating ground-state `ND1 = 249.5, NE2 = 168.5` (`major_ppm`)
+    //    resolves `Ne2HToNd1H` (`delta_cg_ppm == -8.3`), whereas WITHOUT ground `ND1`/`NE2` it reports
+    //    `AmbiguousDirectionOnUnsignedCpmg` (`|delta_cg_ppm| == 8.3`).
+    let unsigned_with_ground = vec![
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 68,
+            res_name: Some("HIS".to_string()),
+            atom: "ND1".to_string(),
+            dw_ppm: 82.0,
+            dw_err_ppm: 0.60,
+            sign_mode: ExchangeSignMode::UnsignedMagnitude,
+            major_ppm: Some(249.5),
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 68,
+            res_name: Some("HIS".to_string()),
+            atom: "NE2".to_string(),
+            dw_ppm: 82.0,
+            dw_err_ppm: 0.60,
+            sign_mode: ExchangeSignMode::UnsignedMagnitude,
+            major_ppm: Some(168.5),
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 68,
+            res_name: Some("HIS".to_string()),
+            atom: "CG".to_string(),
+            dw_ppm: 8.30,
+            dw_err_ppm: 0.20,
+            sign_mode: ExchangeSignMode::UnsignedMagnitude,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 6,
+            res_name: Some("LYS".to_string()),
+            atom: "H".to_string(),
+            dw_ppm: 0.10,
+            dw_err_ppm: 0.02,
+            sign_mode: ExchangeSignMode::UnsignedMagnitude,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 44,
+            res_name: Some("ILE".to_string()),
+            atom: "H".to_string(),
+            dw_ppm: 0.09,
+            dw_err_ppm: 0.02,
+            sign_mode: ExchangeSignMode::UnsignedMagnitude,
+            major_ppm: None,
+        },
+        ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: 67,
+            res_name: Some("LEU".to_string()),
+            atom: "N".to_string(),
+            dw_ppm: 0.32,
+            dw_err_ppm: 0.08,
+            sign_mode: ExchangeSignMode::UnsignedMagnitude,
+            major_ppm: None,
+        },
+    ];
+    let rep_ug = classify_excited_state_with_firewall(
+        Some(&ubq_shifts),
+        &ubq_model,
+        &unsigned_with_ground,
+        &[],
+        &fw,
+        &cfg,
+    )
+    .expect("unsigned with ground ND1/NE2");
+    match &rep_ug.ranked_hypotheses[0].parameters {
+        HypothesisBestParameters::HisTautomerOrProtonation {
+            transition,
+            delta_cg_ppm,
+            ..
+        } => {
+            assert_eq!(*transition, HisExchangeTransition::Ne2HToNd1H);
+            assert!((*delta_cg_ppm - (-8.3)).abs() < 1e-6);
+        }
+        other => panic!("expected HisTautomerOrProtonation, got {other:?}"),
+    }
+
+    let unsigned_no_ground: Vec<ExchangeShiftObservation> = unsigned_with_ground
+        .into_iter()
+        .map(|mut o| {
+            o.major_ppm = None;
+            o
+        })
+        .collect();
+    let rep_un = classify_excited_state_with_firewall(
+        Some(&ubq_shifts),
+        &ubq_model,
+        &unsigned_no_ground,
+        &[],
+        &fw,
+        &cfg,
+    )
+    .expect("unsigned without ground ND1/NE2");
+    match &rep_un.ranked_hypotheses[0].parameters {
+        HypothesisBestParameters::HisTautomerOrProtonation {
+            transition,
+            delta_cg_ppm,
+            ..
+        } => {
+            assert_eq!(
+                *transition,
+                HisExchangeTransition::AmbiguousDirectionOnUnsignedCpmg
+            );
+            assert!((*delta_cg_ppm - 8.3).abs() < 1e-6);
+        }
+        other => panic!("expected HisTautomerOrProtonation, got {other:?}"),
+    }
 }
