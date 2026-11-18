@@ -1,14 +1,30 @@
 # Torsion Fragment Corpus Provenance (`data/torsion_db/`)
 
-## Licence & Clean-Room Statement
+## Licence & Clean-Room Statement (`CC0 1.0` Coordinates/Shifts + `CC-BY-4.0` Classification Metadata)
 
-- **Data Licence**: CC0 1.0 Public Domain (`wwPDB` atomic coordinates & `BMRB` experimental chemical shifts) with open `CATH` / `PDBe SIFTS` fold topology & `UniProt` family identifiers.
+- **Composite Data Licence (`21.W1:P2-4`)**:
+  - **wwPDB / RCSB PDB Atomic Coordinates & Dihedrals** (<https://www.wwpdb.org/>): **CC0 1.0 Universal** Public Domain Dedication (`.licenses/pdb_database_LICENSE.txt`).
+  - **Biological Magnetic Resonance Data Bank (BMRB) Chemical Shifts** (<https://bmrb.io/>): **Open Public-Domain Archival Data** (NIH/NIGMS-funded public scientific archive at UConn Health / UW–Madison; factual experimental NMR-STAR v3 chemical-shift tables are distributed openly without copyright restriction).
+  - **UniProtKB, CATH & PDBe SIFTS Classification Metadata**: **Creative Commons Attribution 4.0 International (`CC-BY-4.0`)** — covering `uniprot_id` (The UniProt Consortium, *Nucleic Acids Res.* **2023**, 51, D523–D531; <https://www.uniprot.org/>) and CATH homologous superfamily (`family_id`, `C.A.T.H`) / topology fold (`topology_id`, `C.A.T`) identifiers mapped via PDBe SIFTS (Sillitoe, I. et al., *Nucleic Acids Res.* **2021**, 49, D266–D273, <https://www.cathdb.info/>; Dana, J. M. et al., *Nucleic Acids Res.* **2019**, 47, D482–D489, <https://www.ebi.ac.uk/pdbe/docs/sifts/>). Accordingly, `torsion_corpus.tsv` and `benchmark_refs.tsv` are composite `CC0 1.0` + `CC-BY-4.0` scientific datasets (not pure `CC0` as a whole; note that the `# Provenance:` comment header in `torsion_corpus.tsv` is frozen to preserve the byte-pinned SHA-256 `e34d3001...` verified by `scripts/build_torsion_corpus.py --verify`).
 - **Methodological Citations**:
   - Shen, Y., Vernon, R., Baker, D. & Bax, A. (2008). *Proc. Natl. Acad. Sci. U.S.A.* 105(12), 4685-4690.
   - Shen, Y. & Bax, A. (2013). *J. Biomol. NMR* 56(3), 227-241.
   - Wishart, D. S., Bigam, C. G., Holm, A., Hodges, R. S. & Sykes, B. D. (1995). *J. Biomol. NMR* 5(1), 67-81.
   - Berjanskii, M. V. & Wishart, D. S. (2005). *J. Am. Chem. Soc.* 127(43), 14970-14971 (`RCI` & `S^2`).
   - Zhang, Y. & Skolnick, J. (2004). *Proteins* 57(4), 702-710 (`TM-score`).
+
+## Benchmark & Held-Out Overlap Disclosure (`21.W1:P2-5` — Mandatory `HomologFirewall`)
+
+`data/torsion_db/torsion_corpus.tsv` (`129` chains) contains four chains whose BMRB accessions or UniProt/CATH fold families overlap with FERRIC's benchmark manifests (`data/benchmark/manifest.tsv` and `data/benchmark/real_manifest.tsv`):
+
+| Corpus `chain_key` | PDB ID | BMRB ID | UniProt ID | CATH Superfamily | CATH Topology | Overlap with FERRIC Benchmark Suites |
+|---|---|---|---|---|---|---|
+| `1UBQ_A` | `1UBQ` | `5387` | `P0CG48` | `3.10.20.90` | `3.10.20` | Exact match to `bmr5387` (`manifest.tsv` Ubiquitin dev-set entry) and `100%` sequence / `3.10.20.90` fold match to Ubiquitin entries `bmr6457` (`1G6J`) and `bmr17769` (`1D3Z`), plus `3.10.20` topology overlap with corpus chain `2L76_A` (`BMRB 17345`) and `2LEK_A` (`BMRB 16377`). |
+| `1XFL_A` | `1XFL` | `6318` | `P29448` | `3.40.30.10` | `3.40.30` | Exact match to `bmr6318` (`manifest.tsv` dev-set entry; plus `3.40.30` topology overlap with `2L59_A`, `BMRB 17268`). |
+| `2KL6_A` | `2KL6` | `16385` | `Q8U1U6` | `2.60.40.10` | `2.60.40` | Exact match to `bmr16385` (`manifest.tsv` dev-set entry; plus `2.60.40` topology overlap with `2E9J_A`, `2KZW_A`, `2L3B_A`, etc.). |
+| `2KKZ_A` | `2KKZ` | `16376` | `P03495` | `3.30.420.330` | `3.30.420` | Exact match to `BMRB 16376` (`real_manifest.tsv` Phase 17 spent held-out evaluation entry). |
+
+> **Mandatory Requirement**: Every consumer of `torsion_corpus.tsv` — including `nmr_core::torsion_db::HomologFirewall::predict` (`T12.3`), `nmr_core::af_concordance::evaluate_af_nmr_concordance` (`T21.1`), `nmr_core::struct_shifts::predict_structure_shifts_with_firewall` (`T21.2`), and `nmr_core::af_assign_priors::AfAssignPriors::from_structure_model` (`T21.4`) — **must** enforce the 4-layer `HomologFirewall` (`Layer 1` PDB/BMRB/UniProt/CATH superfamily exclusion, `Layer 2` CATH topology exclusion, `Layer 3` Gotoh global sequence identity `<= 25%`, and `Layer 4` Zhang–Skolnick `TM-score < 0.50`) on every call. Accessing `torsion_corpus.tsv` without `HomologFirewall` will leak these four benchmark entries into training/prediction.
 
 ## File Digests (SHA-256)
 

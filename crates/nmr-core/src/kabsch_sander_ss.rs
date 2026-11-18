@@ -12,7 +12,10 @@
 //!    $332\text{ kcal mol}^{-1}$, $E_{\text{HB}} < -0.5\text{ kcal mol}^{-1}$, top-2 H-bonds per
 //!    donor and acceptor), $n$-turn helices ($n \in \{3, 4, 5\}$), parallel and antiparallel
 //!    $\beta$-bridges / $\beta$-bulge ladders, virtual $\text{C}^\alpha$ bend angle $\kappa_i > 70^\circ$,
-//!    and 8-state hierarchy (`H, B, E, G, I, T, S, C`).
+//!    and 8-state hierarchy (`H > E > B > G > I > T > S > C`, where multi-bridge $\beta$-sheet
+//!    ladder `E` absorbs an auxiliary single bridge `B` on the same residue, and any orphaned
+//!    $3_{10}$-helix `G` fragment of `< 3` residues or $\pi$-helix `I` fragment of `< 5` residues
+//!    left after `H/E/B` boundary override is demoted back to `T > S > C`).
 //! 2. Adzhubei, A. A., Sternberg, M. J. E. & Makarov, A. A. (2013). "Polyproline-II helix in
 //!    proteins: Structure and function." *J. Mol. Biol.* **425**(12), 2100–2132 — left-handed
 //!    extended polyproline-II (`PPII`) $(\phi, \psi)$ conformational basin ($\phi \in [-105^\circ, -45^\circ]$,

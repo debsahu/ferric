@@ -8,11 +8,14 @@ use nmr_core::nef::read_nef_str;
 use nmr_core::nmrstar::{read_star_all_atoms, read_star_str};
 use nmr_core::struct_shifts::{
     af_plddt_confidence_weight, estimate_unlabelled_shift_offsets,
-    evaluate_haigh_mallion_ring_current, fit_torsion_fourier_surfaces, predict_structure_shifts,
-    predict_structure_shifts_with_firewall, BackboneShiftAtom, StructCoordinateProvenance,
-    StructShiftConfig, StructureModel,
+    evaluate_haigh_mallion_ring_current, evaluate_hbond_shifts_ppm, fit_torsion_fourier_surfaces,
+    predict_structure_shifts, predict_structure_shifts_with_db,
+    predict_structure_shifts_with_firewall, require_predicted_structure_model, BackboneShiftAtom,
+    StructCoordinateProvenance, StructShiftConfig, StructureModel,
 };
-use nmr_core::torsion_db::{HomologFirewall, HomologFirewallQuery, TorsionDb};
+use nmr_core::torsion_db::{
+    HomologFirewall, HomologFirewallQuery, TorsionCorpusChain, TorsionCorpusResidue, TorsionDb,
+};
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -154,7 +157,7 @@ fn test_9_folded_bmrb_benchmark_non_homologous_rmse_and_firewall_audit() {
     let mut folded_count = 0usize;
 
     println!(
-        "\n=== T21.2 9-PROTEIN FOLDED BMRB+PDB OUT-OF-SAMPLE SHIFT BENCHMARK (4-LAYER <=25% SEQ-ID / TM<0.50 FIREWALL) ==="
+        "\n=== T21.2 9-ENTRY FOLDED BMRB+PDB DEV-SET SHIFT BENCHMARK (NOTE: UBIQUITIN APPEARS TWICE AS bmr17769 & bmr5387; SEE DEDUPLICATED 8-PROTEIN TEST BELOW) ==="
     );
     println!(
         "{:<9} {:<5} {:>4} {:>4} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>14}",
@@ -210,9 +213,10 @@ fn test_9_folded_bmrb_benchmark_non_homologous_rmse_and_firewall_audit() {
         let t_fit = Instant::now();
         let _ = fit_torsion_fourier_surfaces(&retained_ch, 2.5);
         let elapsed_ms = t_fit.elapsed().as_secs_f64() * 1000.0;
+        let fit_gate_ms = if cfg!(debug_assertions) { 250.0 } else { 20.0 };
         assert!(
-            elapsed_ms < 20.0,
-            "{bmrb_id}: on-the-fly Fourier surface fit took {elapsed_ms:.2} ms (>= 20 ms gate)"
+            elapsed_ms < fit_gate_ms,
+            "{bmrb_id}: on-the-fly Fourier surface fit took {elapsed_ms:.2} ms (>= {fit_gate_ms:.1} ms gate)"
         );
 
         let rep =
@@ -1010,4 +1014,567 @@ fn test_ilvmat_methyl_gamma_gauche_rotamer_physics() {
         c_trans - c_gm > 3.5,
         "Ile CD1 trans ({c_trans:.2} ppm) vs g- ({c_gm:.2} ppm) must exhibit > 3.5 ppm gamma-gauche shielding"
     );
+}
+
+#[test]
+fn test_p1_4_layer4_tm_score_firewall_never_bypassed_by_short_db_chain_or_short_query() {
+    let root = workspace_root();
+    let model_1d3z =
+        StructureModel::parse_file(root.join("data/pdb_refs/1d3z.pdb"), false).unwrap();
+
+    // 1. Short query (< 8 CA atoms) MUST fail closed (`Err`) so Layer 4 (`TM-score < 0.50`) can
+    //    never be silently bypassed!
+    let mut short_query = model_1d3z.clone();
+    short_query.residues.truncate(5);
+    let err_short_q =
+        predict_structure_shifts(&short_query, &StructShiftConfig::default()).unwrap_err();
+    assert!(
+        err_short_q.contains("Layer 4") && err_short_q.contains(">= 8 CA atoms"),
+        "expected fail-closed Layer 4 error on 5-residue query, got: {err_short_q}"
+    );
+
+    // 2. Database containing a 5-residue short chain (`SHORT5_A`, `L = 5 < 8`) PLUS a disguised
+    //    76-residue Ubiquitin-fold decoy (`DECOY_UBQ_Z`, exact `1D3Z` CA trace => `TM-score = 1.0`,
+    //    but all-Alanine sequence `< 10%` seq-id and unrelated IDs so ONLY Layer 4 catches it!):
+    //    - On `6328a1e`, `SHORT5_A` set `eff_query.query_ca_coords = None` for the ENTIRE database,
+    //      letting `DECOY_UBQ_Z` leak straight into training!
+    //    - Now ONLY `SHORT5_A` is skipped (`l4_short_templates_skipped == 1`), and `DECOY_UBQ_Z`
+    //      is caught and excluded by Layer 4 (`TM-score >= 0.50`)!
+    let mut custom_chains = TorsionDb::embedded().chains.clone();
+    let short_chain = TorsionCorpusChain {
+        chain_key: "SHORT5_A".to_string(),
+        pdb_id: "9ZZ1".to_string(),
+        chain_id: "A".to_string(),
+        bmrb_id: "99991".to_string(),
+        uniprot_id: "Q00001".to_string(),
+        family_id: "9.99.99.1".to_string(),
+        topology_id: "9.99.99".to_string(),
+        seq1: b"AAAAA".to_vec(),
+        residues: (0..5_i32)
+            .map(|k| TorsionCorpusResidue {
+                seq_id: k + 1,
+                res_name: "ALA".to_string(),
+                aa1: b'A',
+                sec_shifts: [Some(0.0); 6],
+                phi_deg: Some(-62.0),
+                psi_deg: Some(-42.0),
+                chi1_deg: None,
+                ca_coord: [(k as f64) * 3.8, 0.0, 0.0],
+            })
+            .collect(),
+    };
+    let decoy_ubq_fold = TorsionCorpusChain {
+        chain_key: "DECOY_UBQ_Z".to_string(),
+        pdb_id: "9ZZ2".to_string(),
+        chain_id: "Z".to_string(),
+        bmrb_id: "99992".to_string(),
+        uniprot_id: "Q00002".to_string(),
+        family_id: "9.88.88.1".to_string(),
+        topology_id: "9.88.88".to_string(),
+        seq1: vec![b'A'; model_1d3z.residues.len()],
+        residues: model_1d3z
+            .residues
+            .iter()
+            .enumerate()
+            .map(|(k, r)| TorsionCorpusResidue {
+                seq_id: (k + 1) as i32,
+                res_name: "ALA".to_string(),
+                aa1: b'A',
+                sec_shifts: [Some(0.0); 6],
+                phi_deg: r.phi_deg,
+                psi_deg: r.psi_deg,
+                chi1_deg: None,
+                ca_coord: r.ca,
+            })
+            .collect(),
+    };
+    custom_chains.push(short_chain);
+    custom_chains.push(decoy_ubq_fold);
+    let custom_db = TorsionDb {
+        chains: custom_chains,
+    };
+
+    let rep = predict_structure_shifts_with_db(
+        &custom_db,
+        &model_1d3z,
+        &HomologFirewallQuery::default(),
+        &StructShiftConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        rep.l4_short_templates_skipped, 1,
+        "expected exactly 1 short (<8 CA) template skipped"
+    );
+    assert!(
+        rep.excluded_template_ids.iter().any(|id| id == "DECOY_UBQ_Z"),
+        "Layer 4 TM-score firewall failed to exclude disguised same-fold decoy DECOY_UBQ_Z! Excluded: {:?}",
+        rep.excluded_template_ids
+    );
+    let decoy_detail = rep
+        .excluded_details
+        .iter()
+        .find(|d| d.chain_key == "DECOY_UBQ_Z")
+        .expect("DECOY_UBQ_Z detail present");
+    assert!(
+        decoy_detail
+            .reasons
+            .iter()
+            .any(|r| r.contains("L4:tm_score")),
+        "expected L4:tm_score exclusion reason on DECOY_UBQ_Z, got: {:?}",
+        decoy_detail.reasons
+    );
+}
+
+#[test]
+fn test_p2_1_predictive_sigma_strictly_increases_at_low_plddt_and_uses_oos_residuals() {
+    let root = workspace_root();
+    let model_1d3z =
+        StructureModel::parse_file(root.join("data/pdb_refs/1d3z.pdb"), false).unwrap();
+
+    // Evaluate across monotonically decreasing pLDDT levels `[95, 80, 70, 50, 25, 0]`:
+    // On `6328a1e`, `coil_sigma_ppm < struct_sigma_ppm` (`15N: 1.45 < 2.45`), causing predictive
+    // sigma to SHRINK as pLDDT dropped! Now predictive sigma must monotonically INCREASE (never shrink)
+    // across every residue class (`General`, `Gly`, `Pro`, `PrePro`, `BetaBranched`) and every nucleus!
+    let plddt_grid = [95.0, 80.0, 70.0, 50.0, 25.0, 0.0];
+    let reports: Vec<_> = plddt_grid
+        .iter()
+        .map(|&pl| {
+            predict_structure_shifts(
+                &model_1d3z,
+                &StructShiftConfig::default()
+                    .with_methyl_ilvmat(true)
+                    .with_uniform_plddt(pl),
+            )
+            .unwrap()
+        })
+        .collect();
+
+    for res_idx in 0..model_1d3z.residues.len() {
+        for atom in BackboneShiftAtom::ALL {
+            let aname = atom.as_str();
+            if !reports[0].residues[res_idx].backbone.contains_key(aname) {
+                continue;
+            }
+            for w in 0..(plddt_grid.len() - 1) {
+                let sig_hi_plddt = reports[w].residues[res_idx].backbone[aname].predicted_sigma_ppm;
+                let sig_lo_plddt =
+                    reports[w + 1].residues[res_idx].backbone[aname].predicted_sigma_ppm;
+                assert!(
+                    sig_lo_plddt + 1.0e-12 >= sig_hi_plddt,
+                    "predictive sigma shrank at residue {} atom {} when pLDDT dropped {} -> {}: {:.4} -> {:.4}",
+                    res_idx + 1,
+                    aname,
+                    plddt_grid[w],
+                    plddt_grid[w + 1],
+                    sig_hi_plddt,
+                    sig_lo_plddt
+                );
+            }
+            let sig_95 = reports[0].residues[res_idx].backbone[aname].predicted_sigma_ppm;
+            let sig_25 = reports[4].residues[res_idx].backbone[aname].predicted_sigma_ppm;
+            assert!(
+                sig_25 > sig_95 + 0.02,
+                "predictive sigma at pLDDT=25 ({sig_25:.4}) must strictly exceed pLDDT=95 ({sig_95:.4}) on residue {} atom {}",
+                res_idx + 1,
+                aname
+            );
+        }
+        for m_idx in 0..reports[0].residues[res_idx].methyls.len() {
+            for w in 0..(plddt_grid.len() - 1) {
+                let c_hi = reports[w].residues[res_idx].methyls[m_idx].c_sigma_ppm;
+                let c_lo = reports[w + 1].residues[res_idx].methyls[m_idx].c_sigma_ppm;
+                let h_hi = reports[w].residues[res_idx].methyls[m_idx].h_sigma_ppm;
+                let h_lo = reports[w + 1].residues[res_idx].methyls[m_idx].h_sigma_ppm;
+                assert!(c_lo + 1.0e-12 >= c_hi);
+                assert!(h_lo + 1.0e-12 >= h_hi);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_p2_3_harmonized_training_vs_query_hbond_geometry_on_1ubq() {
+    let root = workspace_root();
+    let ubq_pdb =
+        StructureModel::parse_file(root.join("data/fixtures/ubiquitin_1ubq_xray.pdb"), false)
+            .unwrap();
+    let ubq_corpus = TorsionDb::embedded()
+        .chains
+        .iter()
+        .find(|c| c.chain_key == "1UBQ_A")
+        .expect("1UBQ_A present in embedded TorsionDb");
+
+    let seq_ids: Vec<i32> = ubq_corpus.residues.iter().map(|r| r.seq_id).collect();
+    let res_names: Vec<String> = ubq_corpus
+        .residues
+        .iter()
+        .map(|r| r.res_name.clone())
+        .collect();
+    let ca_coords: Vec<[f64; 3]> = ubq_corpus.residues.iter().map(|r| r.ca_coord).collect();
+    let phi: Vec<Option<f64>> = ubq_corpus.residues.iter().map(|r| r.phi_deg).collect();
+    let psi: Vec<Option<f64>> = ubq_corpus.residues.iter().map(|r| r.psi_deg).collect();
+    let chi1: Vec<Option<f64>> = ubq_corpus.residues.iter().map(|r| r.chi1_deg).collect();
+    let ubq_rebuilt = StructureModel::from_ca_and_torsions(
+        "A", &seq_ids, &res_names, &ca_coords, &phi, &psi, &chi1,
+    )
+    .unwrap();
+
+    let hb_query = evaluate_hbond_shifts_ppm(&ubq_pdb);
+    let hb_train = evaluate_hbond_shifts_ppm(&ubq_rebuilt);
+    assert_eq!(hb_query.len(), 76);
+    assert_eq!(hb_train.len(), 76);
+
+    // On `6328a1e`, 15N H-bond mismatch between `1ubq.pdb` and `1UBQ_A` was `0.154 ppm` RMS
+    // (`0.89 ppm` max) due to `OD1/OD2/OE1/OE2` sidechain oxygens and crystallographic bond geometry!
+    // After canonicalization (`21.W1:P2-3`), residual difference is solely from 2-decimal TSV rounding (< 0.02 ppm)!
+    let n_idx = BackboneShiftAtom::N.index();
+    let mut sq_sum = 0.0_f64;
+    let mut max_abs = 0.0_f64;
+    for i in 0..76 {
+        let diff = (hb_query[i][n_idx] - hb_train[i][n_idx]).abs();
+        sq_sum += diff * diff;
+        max_abs = max_abs.max(diff);
+    }
+    let rms_n_hb = (sq_sum / 76.0).sqrt();
+    println!(
+        "1UBQ query vs corpus training H-bond 15N mismatch: RMS = {rms_n_hb:.5} ppm, max = {max_abs:.5} ppm"
+    );
+    assert!(
+        rms_n_hb < 0.02 && max_abs < 0.08,
+        "expected harmonized H-bond 15N mismatch RMS < 0.02 ppm & max < 0.08 ppm, got RMS={rms_n_hb:.4}, max={max_abs:.4}"
+    );
+}
+
+#[test]
+fn test_p0_2_require_predicted_structure_model_fail_closed() {
+    let root = workspace_root();
+    let raw_1ubq = fs::read_to_string(root.join("data/fixtures/ubiquitin_1ubq_xray.pdb")).unwrap();
+    let m_xray = StructureModel::parse_pdb_str(&raw_1ubq, false).unwrap();
+    assert!(require_predicted_structure_model(&m_xray, false).is_err());
+
+    // Headerless 1UBQ (`B <= 100`) + REMARK ALPHAFOLD must remain `Unknown` with `plddt = None` and fail closed!
+    let stripped: String = raw_1ubq
+        .lines()
+        .filter(|l| l.starts_with("ATOM  ") || l.starts_with("END"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let m_stripped =
+        StructureModel::parse_pdb_str(&format!("REMARK ALPHAFOLD\n{stripped}"), false).unwrap();
+    assert_eq!(m_stripped.provenance, StructCoordinateProvenance::Unknown);
+    assert!(m_stripped.residues.iter().all(|r| r.plddt.is_none()));
+    assert!(require_predicted_structure_model(&m_stripped, false).is_err());
+
+    // QMEANDisCo mmCIF must be rejected as pLDDT (`21.W1:P2-6`)
+    let qmean_cif = "\
+data_QM
+_ma_protocol_step.step_id 1
+loop_
+_ma_qa_metric.id
+_ma_qa_metric.name
+_ma_qa_metric.mode
+1 QMEANDisCo local
+#
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+ATOM 1 N ALA A 1 0.0 0.0 0.0
+ATOM 2 CA ALA A 1 1.46 0.0 0.0
+ATOM 3 C ALA A 1 2.0 1.4 0.0
+ATOM 4 N GLY A 2 3.2 1.2 0.0
+ATOM 5 CA GLY A 2 4.5 1.8 0.0
+ATOM 6 C GLY A 2 5.2 0.6 0.0
+#
+loop_
+_ma_qa_metric_local.label_asym_id
+_ma_qa_metric_local.label_seq_id
+_ma_qa_metric_local.metric_id
+_ma_qa_metric_local.metric_value
+A 1 1 0.80
+A 2 1 0.72
+#
+";
+    let m_qm = StructureModel::parse_cif_str(qmean_cif, false).unwrap();
+    assert!(m_qm.residues.iter().all(|r| r.plddt.is_none()));
+    assert!(require_predicted_structure_model(&m_qm, false).is_err());
+
+    // Real committed AFDB v6 `AF-P0CG48-F1-model_v6.cif` must pass `require_predicted_structure_model`
+    let m_afdb =
+        StructureModel::parse_file(root.join("data/afdb/AF-P0CG48-F1-model_v6.cif"), false)
+            .unwrap();
+    assert_eq!(m_afdb.provenance, StructCoordinateProvenance::Computational);
+    assert_eq!(m_afdb.residues.len(), 685);
+    assert!(require_predicted_structure_model(&m_afdb, false).is_ok());
+}
+
+fn bootstrap_rmse_ci95(sq_errors: &[f64], n_boot: usize) -> [f64; 2] {
+    let n = sq_errors.len();
+    assert!(n >= 10);
+    let mut state: u64 = 0xD1B5_4A32_D192_ED03_u64 ^ ((n as u64) << 19);
+    let mut next_u64 = || -> u64 {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D_u64)
+    };
+    let mut samples = Vec::with_capacity(n_boot);
+    for _ in 0..n_boot {
+        let mut s = 0.0_f64;
+        for _ in 0..n {
+            let idx = (next_u64() as usize) % n;
+            s += sq_errors[idx];
+        }
+        samples.push((s / (n as f64)).sqrt());
+    }
+    samples.sort_by(f64::total_cmp);
+    let lo = samples[((0.025 * ((n_boot - 1) as f64)).floor() as usize).min(n_boot - 1)];
+    let hi = samples[((0.975 * ((n_boot - 1) as f64)).ceil() as usize).min(n_boot - 1)];
+    [lo, hi]
+}
+
+#[test]
+fn test_a4_deduplicated_8_protein_dev_set_3d_vs_sequence_only_baseline_with_bootstrap_ci() {
+    // `A4` & `21.W1:P1-3`: Deduplicated folded dev-set evaluation (`8` unique folded proteins in
+    // `manifest.tsv` — skipping `bmr5387` so Human Ubiquitin `P0CG48` is counted ONCE via `bmr17769`!),
+    // comparing sequence-only baseline (`ncIDP` random coil, `w_AF = 0`) vs `struct_shifts` 3D model
+    // with bootstrap 95% confidence intervals across all 6 backbone nuclei.
+    let root = workspace_root();
+    let manifest_text = fs::read_to_string(root.join("data/benchmark/manifest.tsv")).unwrap();
+    let bench_refs = load_benchmark_refs();
+
+    let mut sq_3d: [Vec<f64>; 6] = std::array::from_fn(|_| Vec::new());
+    let mut sq_seq: [Vec<f64>; 6] = std::array::from_fn(|_| Vec::new());
+    let mut unique_folded = 0usize;
+
+    for (line_idx, line) in manifest_text.lines().enumerate() {
+        if line_idx == 0 || line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        let bmrb_id = cols[0];
+        // Deduplicate Ubiquitin (`bmr5387` 1G6J duplicates `bmr17769` 1D3Z on Human Ubiquitin P0CG48!)
+        if bmrb_id == "bmr5387" {
+            continue;
+        }
+        let rel_path = cols[5];
+        let bref = &bench_refs[bmrb_id];
+        if !bref.is_folded {
+            continue;
+        }
+        unique_folded += 1;
+
+        let star_path = match bmrb_id {
+            "bmr16649" => root.join("data/fixtures/bmr16649_pcp_aromatic.str"),
+            "bmr17769" => root.join("data/fixtures/bmr17769_ubiquitin_allatom.str"),
+            _ => root.join(rel_path),
+        };
+        let obs_ref = read_star_all_atoms(&star_path, None).unwrap();
+        let model = load_folded_benchmark_structure(&root, bref);
+        let fw = HomologFirewallQuery {
+            query_pdb_ids: vec![bref.pdb_id.clone()],
+            query_bmrb_ids: vec![bref.bmrb_id.clone()],
+            query_uniprot_id: bref.uniprot_id.clone(),
+            query_family_id: bref.family_id.clone(),
+            query_topology_id: bref.topology_id.clone(),
+            query_ca_coords: Some(model.residues.iter().map(|r| r.ca).collect()),
+        };
+
+        let rep_3d =
+            predict_structure_shifts_with_firewall(&model, &fw, &StructShiftConfig::default())
+                .unwrap();
+        let rep_seq = predict_structure_shifts_with_firewall(
+            &model,
+            &fw,
+            &StructShiftConfig::default().with_uniform_plddt(0.0),
+        )
+        .unwrap();
+        let off_3d = estimate_unlabelled_shift_offsets(&obs_ref, &rep_3d);
+        let off_seq = estimate_unlabelled_shift_offsets(&obs_ref, &rep_seq);
+
+        let p_keys: Vec<(i32, &str)> = rep_3d
+            .residues
+            .iter()
+            .map(|r| (r.seq_id, r.res_name.as_str()))
+            .collect();
+        let t_keys: Vec<(i32, &str)> = obs_ref
+            .seq_ids
+            .iter()
+            .zip(obs_ref.sequence.iter())
+            .map(|(&s, rn)| (s, rn.as_str()))
+            .collect();
+        for (pi, ti) in align_by_res_names(&p_keys, &t_keys) {
+            if pi == 0 || pi + 1 == rep_3d.residues.len() {
+                continue;
+            }
+            for atom in BackboneShiftAtom::ALL {
+                let a_idx = atom.index();
+                let aname = atom.as_str();
+                let obs_opt = obs_ref
+                    .shifts
+                    .get(&(ti, aname.to_string()))
+                    .copied()
+                    .or_else(|| {
+                        (aname == "HA").then(|| {
+                            match (
+                                obs_ref.shifts.get(&(ti, "HA2".to_string())).copied(),
+                                obs_ref.shifts.get(&(ti, "HA3".to_string())).copied(),
+                            ) {
+                                (Some(a), Some(b)) => Some(0.5 * (a + b)),
+                                (Some(a), None) => Some(a),
+                                (None, Some(b)) => Some(b),
+                                (None, None) => None,
+                            }
+                        })?
+                    });
+                if let (Some(obs_v), Some(b3), Some(bs)) = (
+                    obs_opt,
+                    rep_3d.residues[pi].backbone.get(aname),
+                    rep_seq.residues[pi].backbone.get(aname),
+                ) {
+                    let e3 = (obs_v - off_3d[a_idx]) - b3.predicted_ppm;
+                    let es = (obs_v - off_seq[a_idx]) - bs.predicted_ppm;
+                    let typo_cap = match atom {
+                        BackboneShiftAtom::H | BackboneShiftAtom::HA => 3.5,
+                        BackboneShiftAtom::N => 16.0,
+                        _ => 10.0,
+                    };
+                    if e3.abs() <= typo_cap && es.abs() <= typo_cap {
+                        sq_3d[a_idx].push(e3 * e3);
+                        sq_seq[a_idx].push(es * es);
+                    }
+                }
+            }
+        }
+    }
+
+    // Also include the 3 unique non-Ubiquitin HA fixtures (`GB1 1PGA`, `KH3 1ZZK`, `Calbindin 1KSM`) for HA
+    for (pdb_rel, star_rel, fw_extra) in [
+        (
+            "data/pdb_refs/1pga.pdb",
+            "data/fixtures/gb1_bmr7280_shifts.str",
+            HomologFirewallQuery {
+                query_pdb_ids: vec!["1PGA".into(), "3GB1".into()],
+                query_bmrb_ids: vec!["7280".into()],
+                query_topology_id: Some("3.10.20".into()),
+                ..Default::default()
+            },
+        ),
+        (
+            "data/fixtures/kh3_1zzk_xray.pdb",
+            "data/fixtures/kh3_bmr4405_shifts.str",
+            HomologFirewallQuery {
+                query_pdb_ids: vec!["1ZZK".into(), "1KHM".into()],
+                query_bmrb_ids: vec!["4405".into()],
+                ..Default::default()
+            },
+        ),
+        (
+            "data/fixtures/calbindin_1ksm_nmr.pdb",
+            "data/fixtures/bmr6699_calbindin_la3.str",
+            HomologFirewallQuery {
+                query_pdb_ids: vec!["1KSM".into()],
+                query_bmrb_ids: vec!["6699".into(), "15594".into()],
+                query_topology_id: Some("1.10.238".into()),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let m_ex = StructureModel::parse_file(root.join(pdb_rel), false).unwrap();
+        let o_ex = read_star_all_atoms(root.join(star_rel), None).unwrap();
+        let r3 =
+            predict_structure_shifts_with_firewall(&m_ex, &fw_extra, &StructShiftConfig::default())
+                .unwrap();
+        let rs = predict_structure_shifts_with_firewall(
+            &m_ex,
+            &fw_extra,
+            &StructShiftConfig::default().with_uniform_plddt(0.0),
+        )
+        .unwrap();
+        let off3 = estimate_unlabelled_shift_offsets(&o_ex, &r3);
+        let offs = estimate_unlabelled_shift_offsets(&o_ex, &rs);
+        let pk: Vec<(i32, &str)> = r3
+            .residues
+            .iter()
+            .map(|r| (r.seq_id, r.res_name.as_str()))
+            .collect();
+        let tk: Vec<(i32, &str)> = o_ex
+            .seq_ids
+            .iter()
+            .zip(o_ex.sequence.iter())
+            .map(|(&s, rn)| (s, rn.as_str()))
+            .collect();
+        for (pi, ti) in align_by_res_names(&pk, &tk) {
+            if pi == 0 || pi + 1 == r3.residues.len() {
+                continue;
+            }
+            let obs_ha = o_ex
+                .shifts
+                .get(&(ti, "HA".to_string()))
+                .copied()
+                .or_else(|| {
+                    match (
+                        o_ex.shifts.get(&(ti, "HA2".to_string())).copied(),
+                        o_ex.shifts.get(&(ti, "HA3".to_string())).copied(),
+                    ) {
+                        (Some(a), Some(b)) => Some(0.5 * (a + b)),
+                        (Some(a), None) => Some(a),
+                        (None, Some(b)) => Some(b),
+                        (None, None) => None,
+                    }
+                });
+            if let (Some(ov), Some(b3), Some(bs)) = (
+                obs_ha,
+                r3.residues[pi].backbone.get("HA"),
+                rs.residues[pi].backbone.get("HA"),
+            ) {
+                let e3 = (ov - off3[5]) - b3.predicted_ppm;
+                let es = (ov - offs[5]) - bs.predicted_ppm;
+                if e3.abs() <= 3.5 && es.abs() <= 3.5 {
+                    sq_3d[5].push(e3 * e3);
+                    sq_seq[5].push(es * es);
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        unique_folded, 8,
+        "expected 8 deduplicated unique folded proteins (Ubiquitin counted once)"
+    );
+
+    println!(
+        "\n=== DEDUPLICATED 8-PROTEIN DEV-SET: SEQUENCE-ONLY (ncIDP) vs 3D STRUCT_SHIFTS (WITH 95% BOOTSTRAP CI) ==="
+    );
+    for atom in BackboneShiftAtom::ALL {
+        let a = atom.index();
+        let n = sq_3d[a].len();
+        let rmse_3d = (sq_3d[a].iter().sum::<f64>() / (n as f64)).sqrt();
+        let rmse_seq = (sq_seq[a].iter().sum::<f64>() / (n as f64)).sqrt();
+        let ci_3d = bootstrap_rmse_ci95(&sq_3d[a], 1000);
+        let ci_seq = bootstrap_rmse_ci95(&sq_seq[a], 1000);
+        let gain_pct = 100.0 * (rmse_seq - rmse_3d) / rmse_seq;
+        println!(
+            "  {:<3} (n={:>3}): seq-only = {:.3} [{:.3}, {:.3}] ppm -> 3D struct_shifts = {:.3} [{:.3}, {:.3}] ppm ({:+.1}% gain)",
+            atom.as_str(),
+            n,
+            rmse_seq,
+            ci_seq[0],
+            ci_seq[1],
+            rmse_3d,
+            ci_3d[0],
+            ci_3d[1],
+            gain_pct
+        );
+        assert!(
+            rmse_3d < rmse_seq,
+            "3D struct_shifts ({rmse_3d:.3}) must beat sequence-only ncIDP baseline ({rmse_seq:.3}) on {}",
+            atom.as_str()
+        );
+    }
 }

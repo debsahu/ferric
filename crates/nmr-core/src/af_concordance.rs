@@ -1,7 +1,8 @@
 //! AlphaFold / ModelArchive mmCIF, PDB, and `PAE` JSON ingestion (`<= 64 MiB` / `<= 4,096`
-//! hostile-input-guarded, `wasm32`-clean with zero network I/O) and Fowler–Sljoka–Williamson
-//! solution NMR rigidity concordance (`pLDDT` vs Lipari–Szabo $S^2$ / Berjanskii–Wishart `RCI-S²`)
-//! & 4-class per-residue structural discordance classifier.
+//! hostile-input-guarded, fail-closed model provenance, `wasm32`-clean with zero network I/O) and
+//! FERRIC's original heuristic solution NMR rigidity concordance (`pLDDT` vs experimental
+//! Lipari–Szabo $S^2$ or shift-derived, secondary-structure-coupled Berjanskii–Wishart `RCI-S²`)
+//! & 6-class gap-free per-residue structural concordance/discordance classifier.
 //!
 //! Provenance: Clean-room original implementation derived strictly from peer-reviewed literature
 //! and public open-data archive specifications (`0` copyleft, academic-licence, or proprietary
@@ -14,7 +15,7 @@
 //!    *Bioinformatics* **29**(21), 2722–2728.
 //! 3. Varadi, M., Anyango, S., Deshpande, M. et al. (2022). *Nucleic Acids Res.* **50**, D439–D444;
 //!    and Varadi, M., Bertoni, D., Magana, P. et al. (2024). *Nucleic Acids Res.* **52**, D368–D375 —
-//!    AlphaFold Protein Structure Database (`AFDB` v4, `CC-BY-4.0`), ModelArchive `_ma_qa_metric_local`
+//!    AlphaFold Protein Structure Database (`AFDB` v4/v6, `CC-BY-4.0`), ModelArchive `_ma_qa_metric_local`
 //!    mmCIF quality-assessment schema, and `PAE` JSON dialects.
 //! 4. Abramson, J., Adler, J., Dunger, J. et al. (2024). *Nature* **630**, 493–500 — AlphaFold 3
 //!    `confidences.json` token-level `PAE` (`token_chain_ids`, `token_res_ids`) and atom `pLDDT`s.
@@ -24,12 +25,15 @@
 //!    folding molecular recognition features ($\alpha$-MoRFs) in intrinsically disordered regions.
 //! 6. Berjanskii, M. V. & Wishart, D. S. (2005). "A simple method to predict protein flexibility
 //!    using secondary chemical shifts." *J. Am. Chem. Soc.* **127**(43), 14970–14971 — Random Coil
-//!    Index (`RCI`) and order parameter $S^2_{\text{RCI}}$.
-//! 7. Fowler, N. J., Sljoka, A. & Williamson, M. P. (2020). "A method for validating the accuracy
-//!    of NMR protein structures." *Nat. Commun.* **11**, 5982; and Fowler, N. J. & Williamson, M. P.
-//!    (2022). "The accuracy of AlphaFold2 predictions for proteins in solution." *Structure* **30**(7),
-//!    925–933 — local solution rigidity validation via Spearman rank correlation $\rho_s$ and
-//!    rigidity RMSD scoring.
+//!    Index (`RCI`) and order parameter $S^2_{\text{RCI}} = 1 - 0.4\ln(1 + 17.7\cdot\text{RCI})$.
+//! 7. Original FERRIC `pLDDT`-vs-$S^2$ concordance heuristic inspired by Fowler, N. J., Sljoka, A.
+//!    & Williamson, M. P. (2020), *Nat. Commun.* **11**, 5982; and Fowler, N. J. & Williamson, M. P.
+//!    (2022), *Structure* **30**(7), 925–933. Note: Fowler & Williamson compute coordinate-based
+//!    constraint-counting rigidity profiles (`FIRST`) and calibrate them against `RCI`, whereas this
+//!    module directly correlates AlphaFold `pLDDT` with experimental Lipari–Szabo $S^2$ (preferred)
+//!    or shift-derived, secondary-structure-coupled `RCI-S²`, reporting both whole-chain and
+//!    ordered-core (`pLDDT >= 70`) Spearman $\rho_s$ with moving-block bootstrap (`block_len = 5`)
+//!    95% confidence intervals (`21.W1:P1-1`, `A5`).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -78,43 +82,58 @@ pub const MIN_CONCORDANCE_EVAL_RESIDUES: usize = 10;
 // 1. AlphaFold / ModelArchive mmCIF & PDB Ingestion
 // ============================================================================
 
-/// Coordinate provenance inferred from mmCIF / PDB metadata headers.
+/// Coordinate provenance inferred from mmCIF / PDB metadata headers (`21.W1:P0-2`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CoordinateProvenance {
-    /// Computational structure prediction (`_ma_qa_metric_local`, `_ma_protocol_step`, `ALPHAFOLD`,
-    /// `BOLTZ`, `COLABFOLD`, or headerless `[0, 100]` `pLDDT` B-factor model).
+    /// Computational structure prediction verified by positive ModelArchive / AFDB provenance
+    /// (`_ma_qa_metric_local` linked to a metric explicitly named `pLDDT`, or a verified
+    /// `_ma_protocol_step` / `_ma_model_list` / `AF-*` ModelArchive mmCIF block with valid
+    /// non-constant `[0, 100]` `B_iso_or_equiv`).
     ComputationalModel,
-    /// Experimental structure (`X-RAY DIFFRACTION`, `SOLUTION NMR`, `ELECTRON MICROSCOPY`, etc.)
-    /// whose isotropic $B$-factors represent thermal displacement ($\text{\AA}^2$), not `pLDDT`.
+    /// Experimental structure (`X-RAY DIFFRACTION`, `SOLUTION NMR`, `ELECTRON MICROSCOPY`, etc.,
+    /// or non-trivial crystallographic `CRYST1` unit cell) whose isotropic $B$-factors represent
+    /// thermal displacement ($\text{\AA}^2$), not `pLDDT`.
     Experimental,
+    /// Unmarked / headerless coordinate file, PDB file with `REMARK` mentioning AlphaFold,
+    /// non-`pLDDT` `_ma_qa_metric_local` (`QMEANDisCo`), or constant/zero `B_iso_or_equiv`.
+    Unknown,
 }
 
 /// Exact table / column from which per-residue `pLDDT` values were obtained.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PlddtSource {
-    /// ModelArchive `_ma_qa_metric_local` quality-assessment loop.
+    /// ModelArchive `_ma_qa_metric_local` quality-assessment loop verified as `pLDDT` in `_ma_qa_metric`.
     MaQaMetricLocal,
-    /// Computational `_atom_site.B_iso_or_equiv` or PDB `tempFactor` column.
+    /// Computational `_atom_site.B_iso_or_equiv` or explicitly forced PDB `tempFactor` column.
     BFactorColumn,
-    /// Forced `B_iso_or_equiv` / `tempFactor` extraction (`--force-bfactor-plddt`) on an experimental file.
+    /// Forced `B_iso_or_equiv` / `tempFactor` extraction (`--force-bfactor-plddt` / `--treat-as-model`) on an experimental file.
     ForcedExperimentalBFactor,
-    /// No `pLDDT` available (e.g. crystallographic / solution NMR coordinates without `--force-bfactor-plddt`).
+    /// No verified `pLDDT` available (experimental, headerless, unverified `B_iso`, or non-`pLDDT` QA metric).
     Unavailable,
 }
 
 /// Structured audit diagnostic emitted during `.cif` / `.pdb` ingestion.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AfIngestDiagnostic {
-    /// Unit-interval `[0.0, 1.0]` `pLDDT` values (`median > 0.15`, `max <= 1.0`) were automatically
-    /// rescaled to `[0.0, 100.0]`.
+    /// Unit-interval `[0.0, 1.0]` `pLDDT` values (`median > 0.15`, `max <= 1.0`, non-constant) were
+    /// automatically rescaled to `[0.0, 100.0]`.
     RescaledUnitPlddtTo100,
     /// Experimental coordinate file (`X-RAY DIFFRACTION`, `SOLUTION NMR`, `ELECTRON MICROSCOPY`, ...)
     /// had thermal $B$-factors suppressed (`plddt_per_residue = None`).
     ExperimentalBfactorSuppressed { method: String },
     /// Experimental $B$-factors were explicitly forced into `pLDDT` via `force_bfactor_plddt = true`.
     ForcedExperimentalBfactorAsPlddt { method: String },
-    /// Headerless coordinate file contained `B_iso_or_equiv > 100.0` and was classified as experimental.
+    /// Coordinate file contained `B_iso_or_equiv > 100.0` and had $B$-factors suppressed.
     OutOfRangeBfactorSuppressed,
+    /// `_ma_qa_metric_local` referenced a non-`pLDDT` quality metric (e.g., `QMEANDisCo`) or lacked
+    /// a matching `pLDDT` definition in `_ma_qa_metric` and was rejected (`21.W1:P2-6`).
+    NonPlddtQaMetricIgnored { metric_name: String },
+    /// Constant or all-zero `B_iso_or_equiv` / `tempFactor` values (e.g. all `0.0` or all `0.5`)
+    /// were rejected as dummy $B$-factors rather than `pLDDT` (`21.W1:P0-2`).
+    ConstantOrZeroBfactorRejected,
+    /// Headerless or unverified PDB/mmCIF `B_iso_or_equiv` / `tempFactor` values (`<= 100`) were
+    /// suppressed because positive ModelArchive / AFDB provenance was absent (`21.W1:P0-2`).
+    UnverifiedBfactorNotTreatedAsPlddt,
 }
 
 /// Options controlling `.cif` / `.pdb` coordinate and `pLDDT` ingestion.
@@ -174,6 +193,13 @@ impl AfStructureModel {
     /// Extract $\text{C}^\alpha$ coordinates (`Vec<[f64; 3]>`) for `TM-score` `HomologFirewall` Layer 4.
     pub fn ca_coords(&self) -> Vec<[f64; 3]> {
         self.residues.iter().map(|r| r.ca).collect()
+    }
+
+    /// Fail-closed check verifying that `self` has positive evidence of being a predicted structure
+    /// model with valid per-residue `pLDDT` values, or that `treat_as_model` was explicitly enabled
+    /// (`21.W1:P0-2`, `P2-6`).
+    pub fn require_predicted_model(&self, treat_as_model: bool) -> Result<(), String> {
+        require_predicted_model(self, treat_as_model)
     }
 
     /// Build `BackboneResidueCoords` for clean-room Kabsch–Sander secondary-structure classification.
@@ -264,6 +290,66 @@ impl AfStructureModel {
         }
         PdbChain { residues: out }
     }
+}
+
+/// Fail-closed provenance gate verifying that `model` has positive evidence of being a predicted
+/// structure model carrying valid per-residue `pLDDT` values (`_ma_qa_metric_local` linked to an
+/// explicit `pLDDT` metric in `_ma_qa_metric`, or a verified ModelArchive/AFDB `_ma_protocol_step` /
+/// `AF-*` mmCIF block with non-constant `[0, 100]` `B_iso_or_equiv`), OR that the caller explicitly
+/// passed `treat_as_model == true` (`--treat-as-model` / `--force-bfactor-plddt`) with valid
+/// non-constant `pLDDT` values (`21.W1:P0-2`, `21.W1:P2-6`).
+pub fn require_predicted_model(
+    model: &AfStructureModel,
+    treat_as_model: bool,
+) -> Result<(), String> {
+    if model.residues.is_empty() {
+        return Err("predicted model check failed: structure contains zero residues".to_string());
+    }
+    if model
+        .diagnostics
+        .contains(&AfIngestDiagnostic::ConstantOrZeroBfactorRejected)
+    {
+        return Err(format!(
+            "predicted model check failed (chain '{}'): B_iso_or_equiv / tempFactor column is all-zero or constant (e.g. 0.0 or 0.5) and cannot be interpreted as pLDDT (diagnostics: {:?})",
+            model.chain_id, model.diagnostics
+        ));
+    }
+    let has_full_plddt = model
+        .plddt_per_residue
+        .as_ref()
+        .is_some_and(|v| v.len() == model.residues.len());
+
+    if model.provenance == CoordinateProvenance::ComputationalModel
+        && has_full_plddt
+        && matches!(
+            model.plddt_source,
+            PlddtSource::MaQaMetricLocal | PlddtSource::BFactorColumn
+        )
+    {
+        return Ok(());
+    }
+
+    if treat_as_model
+        && has_full_plddt
+        && matches!(
+            model.plddt_source,
+            PlddtSource::MaQaMetricLocal
+                | PlddtSource::BFactorColumn
+                | PlddtSource::ForcedExperimentalBFactor
+        )
+    {
+        return Ok(());
+    }
+
+    Err(format!(
+        "predicted model provenance check failed for chain '{}' (entry_id={:?}, provenance={:?}, exptl_method={:?}, plddt_source={:?}, diagnostics={:?}): positive ModelArchive/AFDB pLDDT evidence (_ma_qa_metric_local with _ma_qa_metric name='pLDDT' or verified AFDB/ModelArchive mmCIF block) is required; pass --treat-as-model / --force-bfactor-plddt only if B-factors genuinely encode pLDDT",
+        model.chain_id,
+        model.entry_id,
+        model.provenance,
+        model.exptl_method,
+        model.plddt_source,
+        model.diagnostics
+    ))
 }
 
 /// Parse an AlphaFold or experimental `.cif` / `.mmcif` / `.pdb` file from disk (`<= 64 MiB` cap).
@@ -414,7 +500,7 @@ fn is_standard_or_common_amino_acid(res_name: &str) -> bool {
 
 fn extract_afdb_uniprot_from_id(id_raw: &str) -> Option<String> {
     let up = id_raw.trim().to_ascii_uppercase();
-    // Matches e.g. `AF-P62988-F1` or `AF_AFP62988F1`
+    // Matches e.g. `AF-P0CG48-F1` or `AF_AFP0CG48F1`
     if let Some(rest) = up.strip_prefix("AF-") {
         if let Some((acc, _)) = rest.split_once('-') {
             if (6..=10).contains(&acc.len())
@@ -549,6 +635,31 @@ fn median_of_slice(vals: &[f64]) -> f64 {
     }
 }
 
+fn is_dummy_constant_or_zero_plddt(vals: &[f64], is_explicit_ma_local: bool) -> bool {
+    if vals.is_empty() {
+        return true;
+    }
+    let mut min_v = f64::INFINITY;
+    let mut max_v = f64::NEG_INFINITY;
+    for &v in vals {
+        if v.is_finite() {
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+        }
+    }
+    if !min_v.is_finite() || !max_v.is_finite() || max_v <= 1.0e-6 {
+        return true;
+    }
+    // Constant unit-interval values (e.g. all 0.50 dummy B-factors) must never be rescaled to 50
+    if max_v <= 1.0 && (max_v - min_v) <= 1.0e-6 {
+        return true;
+    }
+    if !is_explicit_ma_local && vals.len() >= 2 && (max_v - min_v) <= 1.0e-6 {
+        return true;
+    }
+    false
+}
+
 fn normalize_plddt_vector(
     mut vals: Vec<f64>,
     diagnostics: &mut Vec<AfIngestDiagnostic>,
@@ -557,6 +668,7 @@ fn normalize_plddt_vector(
     if vals.is_empty() {
         return Err(format!("{ctx}: empty pLDDT vector"));
     }
+    let mut min_v = f64::INFINITY;
     let mut max_v = f64::NEG_INFINITY;
     for (idx, &v) in vals.iter().enumerate() {
         if !v.is_finite() {
@@ -567,10 +679,11 @@ fn normalize_plddt_vector(
                 "{ctx}: pLDDT value {v:.4} at residue index {idx} outside [0, 100]"
             ));
         }
+        min_v = min_v.min(v);
         max_v = max_v.max(v);
     }
     let med = median_of_slice(&vals);
-    if max_v <= 1.0 && med > 0.15 {
+    if max_v <= 1.0 && med > 0.15 && (max_v - min_v) > 1.0e-6 {
         for v in &mut vals {
             *v = (*v * 100.0).clamp(0.0, 100.0);
         }
@@ -593,6 +706,7 @@ fn finalize_af_structure_model(
     has_computational_marker: bool,
     ma_local_plddt: Option<BTreeMap<(String, i32), f64>>,
     ma_local_by_seq: Option<BTreeMap<i32, f64>>,
+    pre_diagnostics: Vec<AfIngestDiagnostic>,
     opts: &AfIngestOptions,
 ) -> Result<AfStructureModel, String> {
     let complete: Vec<RawPolymerRes> = raw_residues
@@ -607,7 +721,7 @@ fn finalize_af_structure_model(
 
     let m = complete.len();
     let chain_id = complete[0].chain_id.clone();
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = pre_diagnostics;
 
     // Reconstruct missing carbonyl O if needed (`C=O` ~ 1.231 A)
     let mut o_coords = Vec::with_capacity(m);
@@ -640,7 +754,7 @@ fn finalize_af_structure_model(
         o_coords.push(o_pos);
     }
 
-    // Resolve provenance & per-residue pLDDT
+    // Resolve provenance & per-residue pLDDT under fail-closed positive-evidence rules (`21.W1:P0-2`, `P2-6`)
     let (provenance, plddt_source, plddt_per_residue) = if let Some(ref ma_map) = ma_local_plddt {
         let mut vals = Vec::with_capacity(m);
         for r in &complete {
@@ -663,11 +777,20 @@ fn finalize_af_structure_model(
             vals.push(v);
         }
         let norm = normalize_plddt_vector(vals, &mut diagnostics, "_ma_qa_metric_local")?;
-        (
-            CoordinateProvenance::ComputationalModel,
-            PlddtSource::MaQaMetricLocal,
-            Some(norm),
-        )
+        if is_dummy_constant_or_zero_plddt(&norm, true) {
+            diagnostics.push(AfIngestDiagnostic::ConstantOrZeroBfactorRejected);
+            (
+                CoordinateProvenance::Unknown,
+                PlddtSource::Unavailable,
+                None,
+            )
+        } else {
+            (
+                CoordinateProvenance::ComputationalModel,
+                PlddtSource::MaQaMetricLocal,
+                Some(norm),
+            )
+        }
     } else {
         let exp_method_opt = exptl_method
             .as_deref()
@@ -693,19 +816,28 @@ fn finalize_af_structure_model(
                     })?;
                     raw_b.push(b);
                 }
-                let norm =
-                    normalize_plddt_vector(raw_b, &mut diagnostics, "forced B-factor pLDDT")?;
-                diagnostics.push(AfIngestDiagnostic::ForcedExperimentalBfactorAsPlddt {
-                    method: meth.to_string(),
-                });
-                (
-                    CoordinateProvenance::Experimental,
-                    PlddtSource::ForcedExperimentalBFactor,
-                    Some(norm),
-                )
+                if is_dummy_constant_or_zero_plddt(&raw_b, false) {
+                    diagnostics.push(AfIngestDiagnostic::ConstantOrZeroBfactorRejected);
+                    (
+                        CoordinateProvenance::Experimental,
+                        PlddtSource::Unavailable,
+                        None,
+                    )
+                } else {
+                    let norm =
+                        normalize_plddt_vector(raw_b, &mut diagnostics, "forced B-factor pLDDT")?;
+                    diagnostics.push(AfIngestDiagnostic::ForcedExperimentalBfactorAsPlddt {
+                        method: meth.to_string(),
+                    });
+                    (
+                        CoordinateProvenance::Experimental,
+                        PlddtSource::ForcedExperimentalBFactor,
+                        Some(norm),
+                    )
+                }
             }
         } else {
-            // Computational model or headerless coordinate file: check B_iso_or_equiv / tempFactor
+            // Check B_iso_or_equiv / tempFactor
             let mut raw_b = Vec::with_capacity(m);
             let mut all_present = true;
             for r in &complete {
@@ -731,11 +863,7 @@ fn finalize_af_structure_model(
 
             if !all_present || raw_b.is_empty() {
                 (
-                    if has_computational_marker {
-                        CoordinateProvenance::ComputationalModel
-                    } else {
-                        CoordinateProvenance::Experimental
-                    },
+                    CoordinateProvenance::Unknown,
                     PlddtSource::Unavailable,
                     None,
                 )
@@ -752,12 +880,27 @@ fn finalize_af_structure_model(
                     PlddtSource::Unavailable,
                     None,
                 )
-            } else {
+            } else if is_dummy_constant_or_zero_plddt(&raw_b, false) {
+                diagnostics.push(AfIngestDiagnostic::ConstantOrZeroBfactorRejected);
+                (
+                    CoordinateProvenance::Unknown,
+                    PlddtSource::Unavailable,
+                    None,
+                )
+            } else if has_computational_marker || opts.force_bfactor_plddt {
                 let norm = normalize_plddt_vector(raw_b, &mut diagnostics, "B_iso_or_equiv pLDDT")?;
                 (
                     CoordinateProvenance::ComputationalModel,
                     PlddtSource::BFactorColumn,
                     Some(norm),
+                )
+            } else {
+                // Headerless or unverified PDB/mmCIF with B <= 100: fail closed (`21.W1:P0-2`)!
+                diagnostics.push(AfIngestDiagnostic::UnverifiedBfactorNotTreatedAsPlddt);
+                (
+                    CoordinateProvenance::Unknown,
+                    PlddtSource::Unavailable,
+                    None,
                 )
             }
         }
@@ -960,8 +1103,11 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
         if !tok.quoted && tok.text.starts_with("data_") {
             if entry_id.is_none() && tok.text.len() > 5 {
                 let d_id = tok.text[5..].to_string();
-                if detected_uniprot_id.is_none() {
-                    detected_uniprot_id = extract_afdb_uniprot_from_id(&d_id);
+                if let Some(unp) = extract_afdb_uniprot_from_id(&d_id) {
+                    if detected_uniprot_id.is_none() {
+                        detected_uniprot_id = Some(unp);
+                    }
+                    has_computational_marker = true;
                 }
                 entry_id = Some(d_id);
             }
@@ -976,7 +1122,10 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
             }
             let key_low = tok.text.to_ascii_lowercase();
             let val = tokens[idx + 1].text.trim();
-            if key_low.starts_with("_ma_protocol_step.") || key_low.starts_with("_ma_data.") {
+            if key_low.starts_with("_ma_protocol_step.")
+                || key_low.starts_with("_ma_data.")
+                || key_low.starts_with("_ma_model_list.")
+            {
                 has_computational_marker = true;
             }
             match key_low.as_str() {
@@ -985,26 +1134,21 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
                     if val.len() == 4 && val.bytes().all(|b| b.is_ascii_alphanumeric()) {
                         detected_pdb_id = Some(val.to_ascii_uppercase());
                     }
-                    if detected_uniprot_id.is_none() {
-                        detected_uniprot_id = extract_afdb_uniprot_from_id(val);
+                    if let Some(unp) = extract_afdb_uniprot_from_id(val) {
+                        if detected_uniprot_id.is_none() {
+                            detected_uniprot_id = Some(unp);
+                        }
+                        has_computational_marker = true;
                     }
                 }
                 "_exptl.method" if val != "." && val != "?" && !val.is_empty() => {
                     exptl_methods.push(val.to_string());
-                }
-                "_software.name" | "_computing.structure_refinement" => {
-                    let up = val.to_ascii_uppercase();
-                    if up.contains("ALPHAFOLD") || up.contains("COLABFOLD") || up.contains("BOLTZ")
-                    {
-                        has_computational_marker = true;
-                    }
                 }
                 "_ma_qa_metric.id" => scalar_ma_id = Some(val.to_string()),
                 "_ma_qa_metric.name" | "_ma_qa_metric.type" => {
                     if scalar_ma_name.is_none() || key_low == "_ma_qa_metric.name" {
                         scalar_ma_name = Some(val.to_ascii_lowercase());
                     }
-                    has_computational_marker = true;
                 }
                 "_ma_qa_metric.mode" => scalar_ma_mode = Some(val.to_ascii_lowercase()),
                 "_struct_ref.db_name" => scalar_ref_db = Some(val.to_ascii_uppercase()),
@@ -1028,10 +1172,11 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
             if ncols == 0 {
                 return Err("mmCIF loop_ contains zero column headers".to_string());
             }
-            if headers
-                .iter()
-                .any(|h| h.starts_with("_ma_protocol_step.") || h.starts_with("_ma_data."))
-            {
+            if headers.iter().any(|h| {
+                h.starts_with("_ma_protocol_step.")
+                    || h.starts_with("_ma_data.")
+                    || h.starts_with("_ma_model_list.")
+            }) {
                 has_computational_marker = true;
             }
 
@@ -1106,23 +1251,32 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
                     }
                 }
             } else if is_ma_metric {
-                has_computational_marker = true;
                 let c_id = find_col(&["_ma_qa_metric.id"])
                     .ok_or_else(|| "mmCIF _ma_qa_metric missing _ma_qa_metric.id".to_string())?;
-                let c_name = find_col(&["_ma_qa_metric.name", "_ma_qa_metric.type"]);
+                let c_name = find_col(&["_ma_qa_metric.name"]);
+                let c_type = find_col(&["_ma_qa_metric.type"]);
                 let c_mode = find_col(&["_ma_qa_metric.mode"]);
                 for r in &rows {
                     let m_id = r[c_id].text.trim().to_string();
-                    let m_name = c_name
+                    let nm_part = c_name
                         .map(|c| r[c].text.trim().to_ascii_lowercase())
                         .unwrap_or_default();
+                    let tp_part = c_type
+                        .map(|c| r[c].text.trim().to_ascii_lowercase())
+                        .unwrap_or_default();
+                    let m_name = if nm_part.is_empty() {
+                        tp_part
+                    } else if tp_part.is_empty() || nm_part == tp_part {
+                        nm_part
+                    } else {
+                        format!("{nm_part}/{tp_part}")
+                    };
                     let m_mode = c_mode
                         .map(|c| r[c].text.trim().to_ascii_lowercase())
                         .unwrap_or_default();
                     ma_metric_defs.insert(m_id, (m_name, m_mode));
                 }
             } else if is_ma_local {
-                has_computational_marker = true;
                 let c_asym = find_col(&[
                     "_ma_qa_metric_local.label_asym_id",
                     "_ma_qa_metric_local.auth_asym_id",
@@ -1300,37 +1454,67 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
         detected_uniprot_id = scalar_ref_acc;
     }
 
-    // Filter `_ma_qa_metric_local` rows to pLDDT metric IDs
-    let (ma_local_plddt, ma_local_by_seq) = if !ma_local_rows.is_empty() {
-        let plddt_ids: Vec<String> = ma_metric_defs
-            .iter()
-            .filter(|(_, (nm, mode))| {
-                nm.contains("plddt") && (mode.is_empty() || mode.contains("local"))
-            })
-            .map(|(k, _)| k.clone())
-            .collect();
+    // Filter `_ma_qa_metric_local` rows strictly to verified `pLDDT` metric IDs (`21.W1:P2-6`)
+    let mut pre_diagnostics: Vec<AfIngestDiagnostic> = Vec::new();
+    let plddt_ids: Vec<String> = ma_metric_defs
+        .iter()
+        .filter(|(_, (nm, mode))| nm.contains("plddt") && !mode.contains("global"))
+        .map(|(k, _)| k.clone())
+        .collect();
+    if !plddt_ids.is_empty() {
+        has_computational_marker = true;
+    }
 
-        let mut by_chain_seq: BTreeMap<(String, i32), f64> = BTreeMap::new();
-        let mut by_seq: BTreeMap<i32, f64> = BTreeMap::new();
-        for (asym, seq_id, mid, val) in ma_local_rows {
-            let accept = if !plddt_ids.is_empty() {
-                plddt_ids.iter().any(|want| want == &mid)
-            } else if ma_metric_defs.is_empty() {
-                true
+    let (ma_local_plddt, ma_local_by_seq) = if !ma_local_rows.is_empty() {
+        if plddt_ids.is_empty() {
+            if ma_metric_defs.is_empty() {
+                pre_diagnostics.push(AfIngestDiagnostic::NonPlddtQaMetricIgnored {
+                    metric_name: "unspecified_ma_qa_metric".to_string(),
+                });
             } else {
-                !ma_metric_defs
-                    .get(&mid)
-                    .is_some_and(|(_, mode)| mode.contains("global"))
-            };
-            if accept {
-                by_chain_seq.insert((asym, seq_id), val);
-                by_seq.entry(seq_id).or_insert(val);
+                for (nm, mode) in ma_metric_defs.values() {
+                    if !mode.contains("global") {
+                        pre_diagnostics.push(AfIngestDiagnostic::NonPlddtQaMetricIgnored {
+                            metric_name: if nm.is_empty() {
+                                "unnamed_ma_qa_metric".to_string()
+                            } else {
+                                nm.clone()
+                            },
+                        });
+                    }
+                }
             }
-        }
-        if by_chain_seq.is_empty() {
             (None, None)
         } else {
-            (Some(by_chain_seq), Some(by_seq))
+            let mut by_chain_seq: BTreeMap<(String, i32), f64> = BTreeMap::new();
+            let mut by_seq: BTreeMap<i32, f64> = BTreeMap::new();
+            let mut ignored_mids: Vec<String> = Vec::new();
+            for (asym, seq_id, mid, val) in ma_local_rows {
+                if plddt_ids.iter().any(|want| want == &mid) {
+                    by_chain_seq.entry((asym, seq_id)).or_insert(val);
+                    by_seq.entry(seq_id).or_insert(val);
+                } else if !ignored_mids.contains(&mid) {
+                    ignored_mids.push(mid.clone());
+                    let m_label = ma_metric_defs
+                        .get(&mid)
+                        .map(|(nm, _)| {
+                            if nm.is_empty() {
+                                format!("metric_id={mid}")
+                            } else {
+                                nm.clone()
+                            }
+                        })
+                        .unwrap_or_else(|| format!("metric_id={mid}"));
+                    pre_diagnostics.push(AfIngestDiagnostic::NonPlddtQaMetricIgnored {
+                        metric_name: m_label,
+                    });
+                }
+            }
+            if by_chain_seq.is_empty() {
+                (None, None)
+            } else {
+                (Some(by_chain_seq), Some(by_seq))
+            }
         }
     } else {
         (None, None)
@@ -1351,6 +1535,7 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
         has_computational_marker,
         ma_local_plddt,
         ma_local_by_seq,
+        pre_diagnostics,
         opts,
     )
 }
@@ -1379,7 +1564,7 @@ fn parse_pdb_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructureM
     let mut detected_pdb_id: Option<String> = None;
     let mut detected_uniprot_id: Option<String> = None;
     let mut exptl_parts: Vec<String> = Vec::new();
-    let mut has_computational_marker = false;
+    let mut saw_cryst1_cell = false;
 
     let mut raw_residues: Vec<RawPolymerRes> = Vec::new();
     let mut res_idx_map: BTreeMap<(String, i32), usize> = BTreeMap::new();
@@ -1407,10 +1592,6 @@ fn parse_pdb_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructureM
                     detected_pdb_id = Some(id_trim);
                 }
             }
-            let up = line.to_ascii_uppercase();
-            if up.contains("ALPHAFOLD") || up.contains("COLABFOLD") || up.contains("BOLTZ") {
-                has_computational_marker = true;
-            }
             continue;
         }
         if let Some(rest) = line.strip_prefix("EXPDTA") {
@@ -1420,15 +1601,21 @@ fn parse_pdb_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructureM
             }
             continue;
         }
-        if line.starts_with("TITLE ") || line.starts_with("REMARK") || line.starts_with("COMPND") {
-            let up = line.to_ascii_uppercase();
-            if up.contains("ALPHAFOLD")
-                || up.contains("COLABFOLD")
-                || up.contains("BOLTZ")
-                || up.contains("MODELARCHIVE")
-            {
-                has_computational_marker = true;
+        if line.starts_with("CRYST1") && line.len() >= 33 {
+            if let (Ok(a), Ok(b), Ok(c)) = (
+                line[6..15].trim().parse::<f64>(),
+                line[15..24].trim().parse::<f64>(),
+                line[24..33].trim().parse::<f64>(),
+            ) {
+                if a > 2.5 && b > 2.5 && c > 2.5 {
+                    saw_cryst1_cell = true;
+                }
             }
+            continue;
+        }
+        if line.starts_with("TITLE ") || line.starts_with("REMARK") || line.starts_with("COMPND") {
+            // Never set `has_computational_marker` from free-text PDB REMARK/TITLE/COMPND lines
+            // (`21.W1:P0-2`: molecular-replacement crystal structures routinely mention AlphaFold!).
             continue;
         }
         if line.starts_with("DBREF ") {
@@ -1533,10 +1720,12 @@ fn parse_pdb_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructureM
         raw_residues[r_slot].record_atom(&atom_name, [x, y, z], b_iso);
     }
 
-    let exptl_joined = if exptl_parts.is_empty() {
-        None
-    } else {
+    let exptl_joined = if !exptl_parts.is_empty() {
         Some(exptl_parts.join(" "))
+    } else if saw_cryst1_cell {
+        Some("X-RAY DIFFRACTION (CRYST1)".to_string())
+    } else {
+        None
     };
 
     finalize_af_structure_model(
@@ -1545,9 +1734,10 @@ fn parse_pdb_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructureM
         detected_pdb_id,
         detected_uniprot_id,
         exptl_joined,
-        has_computational_marker,
+        false,
         None,
         None,
+        Vec::new(),
         opts,
     )
 }
@@ -1606,6 +1796,36 @@ impl PaeMatrix {
                 "PAE matrix dimension N = {} does not match polymer chain length L = {}",
                 self.n_residues, expected_len
             ));
+        }
+        Ok(())
+    }
+
+    /// Cross-check PAE matrix dimension AND any embedded ColabFold/AF JSON `plddt` vector against
+    /// `structure` (`21.W1:P2-9`).
+    pub fn validate_against_structure(&self, structure: &AfStructureModel) -> Result<(), String> {
+        let l = structure.residues.len();
+        self.validate_chain_length(l)?;
+        if let Some(ref json_plddt) = self.plddt_from_json {
+            if json_plddt.len() != l {
+                return Err(format!(
+                    "PAE JSON plddt length ({}) does not match structure residue count L = {}",
+                    json_plddt.len(),
+                    l
+                ));
+            }
+            if let Some(ref struct_plddt) = structure.plddt_per_residue {
+                if struct_plddt.len() == l {
+                    for i in 0..l {
+                        let diff = (json_plddt[i] - struct_plddt[i]).abs();
+                        if diff > 1.0 {
+                            return Err(format!(
+                                "ColabFold/PAE JSON plddt mismatch at residue index {} (seq_id {}): JSON plddt {:.2} vs structure pLDDT {:.2} (|diff| = {:.2} > 1.0)",
+                                i, structure.residues[i].seq_id, json_plddt[i], struct_plddt[i], diff
+                            ));
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -2082,11 +2302,25 @@ fn aggregate_af3_token_pae(
 
     let chosen_chain = match target_chain_id {
         Some(tc) if !tc.trim().is_empty() => tc.trim().to_string(),
-        _ => chains
-            .first()
-            .ok_or_else(|| "AF3 token_chain_ids is empty".to_string())?
-            .trim()
-            .to_string(),
+        _ => {
+            let mut distinct_chains: Vec<String> = Vec::new();
+            for ch in chains {
+                let c = ch.trim();
+                if !c.is_empty() && !distinct_chains.iter().any(|x| x == c) {
+                    distinct_chains.push(c.to_string());
+                }
+            }
+            if distinct_chains.len() > 1 {
+                return Err(format!(
+                    "AF3 confidences.json contains multiple chains ({}) — explicit --chain <id> selection is required (21.W1:P2-9)",
+                    distinct_chains.join(", ")
+                ));
+            }
+            distinct_chains
+                .into_iter()
+                .next()
+                .ok_or_else(|| "AF3 token_chain_ids is empty".to_string())?
+        }
     };
 
     // Group tokens belonging to `chosen_chain` by unique `token_res_id` in chain order
@@ -2160,29 +2394,61 @@ pub struct ExperimentalS2Entry {
 /// Source of the experimental rigidity profile $S^2_{\text{exp},i}$.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ExperimentalRigiditySource {
-    /// Lipari–Szabo $S^2$ order parameters supplied via `--s2 <modelfree.tsv>`.
+    /// Lipari–Szabo $S^2$ order parameters supplied via `--s2 <modelfree.tsv>` (preferred; independent of secondary shifts).
     LipariSzaboModelFree,
-    /// 6-nucleus unlabelled-offset-corrected Berjanskii–Wishart `RCI-S²` from backbone shifts.
+    /// Shift-derived, secondary-structure-coupled 6-nucleus Berjanskii–Wishart `RCI-S²` from backbone shifts.
     BerjanskiiWishartRciS2,
 }
 
-/// Global Fowler–Sljoka–Williamson (2020, 2022) rigidity concordance summary.
+impl ExperimentalRigiditySource {
+    #[inline]
+    pub const fn provenance_label(self) -> &'static str {
+        match self {
+            Self::LipariSzaboModelFree => "experimental Lipari-Szabo S^2",
+            Self::BerjanskiiWishartRciS2 => "shift-derived secondary-structure-coupled RCI-S^2",
+        }
+    }
+}
+
+/// Original FERRIC `pLDDT`-vs-$S^2$ rigidity concordance summary (`21.W1:P1-1`, `A5`).
+///
+/// Note: `c_corr_score` and `c_rmsd_score` are retained on `Evaluated` strictly as uncalibrated
+/// display transformations (`50*(1+rho_s)` and `100*exp(-(rmsd/0.22)^2)`) for backwards struct
+/// compatibility; downstream quantitative analyses should inspect [`AfConcordanceReport::spearman_rho`],
+/// [`AfConcordanceReport::spearman_rho_ci95`], [`AfConcordanceReport::ordered_core_spearman_rho`],
+/// and [`AfConcordanceReport::ordered_core_spearman_rho_ci95`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ConcordanceSummary {
-    /// Evaluated across $N_{\text{eval}} \ge 10$ assigned non-terminal residues with finite `pLDDT`.
+    /// Evaluated across $N_{\text{eval}} \ge 10$ assigned non-terminal residues with non-zero variance in both `pLDDT` and $S^2_{\text{exp}}$.
     Evaluated {
         n_eval: usize,
         spearman_rho_s: f64,
+        /// Uncalibrated display transformation `50 * (1 + spearman_rho_s)` (`[0, 100]`).
         c_corr_score: f64,
         rmsd_rigidity: f64,
+        /// Uncalibrated display transformation `100 * exp(-(rmsd_rigidity / 0.22)^2)` (`[0, 100]`).
         c_rmsd_score: f64,
     },
-    /// Fewer than `10` assigned non-terminal residues have both `pLDDT` and $S^2_{\text{exp}}$.
+    /// Fewer than `10` assigned non-terminal residues have both `pLDDT` and $S^2_{\text{exp}}$,
+    /// OR `pLDDT` / $S^2_{\text{exp}}$ has zero variance so Spearman $\rho_s$ is undefined.
     InsufficientCoverage { n_eval: usize, reason: String },
 }
 
-/// Per-residue AlphaFold vs Solution NMR structural concordance / discordance class (`T21.1` §1.3.3).
+impl ConcordanceSummary {
+    /// Return whole-chain Spearman $\rho_s$, or `None` when coverage is insufficient or variance is zero.
+    #[inline]
+    pub fn spearman_rho(&self) -> Option<f64> {
+        match self {
+            Self::Evaluated { spearman_rho_s, .. } if spearman_rho_s.is_finite() => {
+                Some(*spearman_rho_s)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Per-residue AlphaFold vs Solution NMR structural concordance / discordance class (`T21.1` §1.3.3, `21.W1:P1-1`, `A5`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AfNmrConcordanceClass {
     /// `pLDDT >= 70`, $S^2_{\text{exp}} \ge 0.65$, no `Helix <-> Sheet` inversion, and $\Delta\theta < 60^\circ$ on `Good` torsions.
@@ -2190,21 +2456,32 @@ pub enum AfNmrConcordanceClass {
     /// `pLDDT < 70` and $S^2_{\text{exp}} < 0.65$ (flexible loop, tail, linker, or IDP in both AF and solution).
     ConcordantDisordered,
     /// `pLDDT >= 70` with 3D `Helix` or `Sheet`, while solution NMR reports disorder ($S^2_{\text{exp}} < 0.60$ and $p_{\text{coil}} + p_{\text{PPII}} \ge 0.65$).
-    ConditionalFoldingOrCrystalArtifact,
+    /// (Replaces legacy `ConditionalFoldingOrCrystalArtifact` — AF models have no crystal; `21.W1:P1-1`, `A5`.)
+    #[serde(alias = "ConditionalFoldingOrCrystalArtifact")]
+    ModelOrderedSolutionDisordered,
     /// Ordered conformational switch ($\Delta\theta \ge 60^\circ$ or `Helix <-> Sheet` flip) or rigid-in-NMR / low-`pLDDT` hinge ($S^2_{\text{exp}} \ge 0.72$, `pLDDT < 70`).
     DynamicHingeOrAltState,
+    /// Borderline / ambiguous regime where thresholds do not cleanly separate ordered vs disordered
+    /// (e.g. `pLDDT >= 70` with `0.60 <= S^2 < 0.65` and structured NMR, `pLDDT < 70` with `0.65 <= S^2 < 0.72`,
+    /// or `pLDDT >= 70` with `S^2 < 0.60` and `p_coil + p_PPII < 0.65`).
+    Indeterminate,
     /// Fewer than 2 assigned backbone chemical shifts and no experimental $S^2_i$ (or missing `pLDDT`).
     UnassignedNmr,
 }
 
 impl AfNmrConcordanceClass {
+    /// Backwards-compatible associated constant alias for [`Self::ModelOrderedSolutionDisordered`].
+    #[allow(non_upper_case_globals)]
+    pub const ConditionalFoldingOrCrystalArtifact: Self = Self::ModelOrderedSolutionDisordered;
+
     #[inline]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ConcordantOrdered => "ConcordantOrdered",
             Self::ConcordantDisordered => "ConcordantDisordered",
-            Self::ConditionalFoldingOrCrystalArtifact => "ConditionalFoldingOrCrystalArtifact",
+            Self::ModelOrderedSolutionDisordered => "ModelOrderedSolutionDisordered",
             Self::DynamicHingeOrAltState => "DynamicHingeOrAltState",
+            Self::Indeterminate => "Indeterminate",
             Self::UnassignedNmr => "UnassignedNmr",
         }
     }
@@ -2215,8 +2492,9 @@ impl AfNmrConcordanceClass {
         match self {
             Self::ConcordantOrdered => "#16A34A",
             Self::ConcordantDisordered => "#64748B",
-            Self::ConditionalFoldingOrCrystalArtifact => "#D97706",
+            Self::ModelOrderedSolutionDisordered => "#D97706",
             Self::DynamicHingeOrAltState => "#DC2626",
+            Self::Indeterminate => "#94A3B8",
             Self::UnassignedNmr => "#CBD5E1",
         }
     }
@@ -2285,6 +2563,18 @@ pub struct AfConcordanceReport {
     pub rigidity_source: ExperimentalRigiditySource,
     pub ingest_diagnostics: Vec<AfIngestDiagnostic>,
     pub summary: ConcordanceSummary,
+    /// Whole-chain Spearman $\rho_s$ across non-terminal assigned residues (`None` if `< 10` residues or zero variance; `21.W1:P1-1`).
+    pub spearman_rho: Option<f64>,
+    /// Moving-block bootstrap (`block_len = 5`, `n_boot = 500`) 95% CI `[lo, hi]` for whole-chain Spearman $\rho_s$ (`21.W1:P1-1`, `A5`).
+    pub spearman_rho_ci95: Option<[f64; 2]>,
+    /// Count of non-terminal assigned residues in the ordered core (`pLDDT >= 70`).
+    pub n_ordered_core: usize,
+    /// Ordered-core (`pLDDT >= 70`) Spearman $\rho_s$ (`None` if `< 10` core residues or zero variance; `21.W1:P1-1`, `A5`).
+    pub ordered_core_spearman_rho: Option<f64>,
+    /// Moving-block bootstrap (`block_len = 5`, `n_boot = 500`) 95% CI `[lo, hi]` for ordered-core Spearman $\rho_s$.
+    pub ordered_core_spearman_rho_ci95: Option<[f64; 2]>,
+    /// Effective rigidity RMSD between $\hat{S}^2_{\text{AF}}$ and $S^2_{\text{exp}}$ (`None` if `< 10` residues).
+    pub rmsd_rigidity: Option<f64>,
     pub secondary_structure: SecondaryStructureReport,
     pub propensity: PropensityReport,
     pub residues: Vec<ResidueConcordanceRecord>,
@@ -2292,6 +2582,7 @@ pub struct AfConcordanceReport {
     pub n_concordant_disordered: usize,
     pub n_conditional_folding: usize,
     pub n_dynamic_hinge_or_alt: usize,
+    pub n_indeterminate: usize,
     pub n_unassigned_nmr: usize,
     pub pae_n_residues: Option<usize>,
     pub pae_median_intra_ordered: Option<f64>,
@@ -2425,19 +2716,30 @@ pub fn parse_modelfree_s2_tsv_str(tsv_text: &str) -> Result<Vec<ExperimentalS2En
 /// Compute 6-nucleus unlabelled-offset-corrected Berjanskii & Wishart (*J. Am. Chem. Soc.* **2005**,
 /// 127, 14970–14971) Random Coil Index (`RCI`) and order parameter $S^2_{\text{RCI}} \in [0, 1]$
 /// from `ncIDP` secondary shifts `[dH, dN, dCA, dCB, dC', dHA]`.
+///
+/// Uses exact Berjanskii–Wishart (2005) end-cap `0.2` (`RCI = 0.2 / (1 + 3.25 * avg_z)` when
+/// scaling to `[0, 0.2]` — note `S^2_RCI = 1 - 0.4 * ln(1 + 17.7 * RCI)`, eq. 3 of JACS 2005,
+/// 127, 14970–14971) and **gap-aware** smoothing: unassigned residues / Prolines lacking any
+/// assigned shift are marked `None` prior to smoothing so a default flexible `RCI` is NEVER
+/// smeared into assigned neighbors (`21.W1:P2-7`, `P2-10`).
 pub fn compute_berjanskii_wishart_rci_s2(sec_shifts: &[[Option<f64>; 6]]) -> (Vec<f64>, Vec<f64>) {
     // Balanced 6-nucleus `[H, N, CA, CB, C', HA]` reference scales and Berjanskii-Wishart (2005, Table 1)
     // weights giving equal sensitivity to alpha-helical (CA, C', HA) and beta-strand (HA, CB, H, C') shifts.
     const SCALES: [f64; 6] = [0.42, 2.65, 1.65, 1.65, 1.55, 0.34];
     const WEIGHTS: [f64; 6] = [1.5, 0.8, 2.4, 2.0, 2.1, 3.0];
+    const RCI_UNASSIGNED_FALLBACK: f64 = 0.22;
 
     let n = sec_shifts.len();
     if n == 0 {
         return (Vec::new(), Vec::new());
     }
 
-    let mut raw_rci = vec![0.22_f64; n];
+    let mut raw_rci: Vec<Option<f64>> = vec![None; n];
     for (i, slot) in raw_rci.iter_mut().enumerate() {
+        let has_any_shift_at_i = sec_shifts[i].iter().any(Option::is_some);
+        if !has_any_shift_at_i {
+            continue;
+        }
         let mut num = 0.0_f64;
         let mut den = 0.0_f64;
         for k in 0..6 {
@@ -2458,15 +2760,24 @@ pub fn compute_berjanskii_wishart_rci_s2(sec_shifts: &[[Option<f64>; 6]]) -> (Ve
                 den += WEIGHTS[k];
             }
         }
-        let avg_z = if den > 0.0 { num / den } else { 0.0 };
-        *slot = 0.22 / (1.0 + 3.25 * avg_z);
+        if den > 0.0 {
+            let avg_z = num / den;
+            *slot = Some(RCI_UNASSIGNED_FALLBACK / (1.0 + 3.25 * avg_z));
+        }
     }
 
     // 5-residue triangular smoothing `[1, 2, 3, 2, 1]` on interior residues (Berjanskii & Wishart 2005),
-    // tapering cleanly near N/C termini (`<= 3` residues from chain ends use 3-point local window)
+    // skipping unassigned/gap residues (`raw_rci[j] == None`) so default flexible RCI never leaks
+    // across gaps or Prolines (`21.W1:P2-7`), and using the exact Berjanskii–Wishart (2005)
+    // `S^2_RCI = 1 - 0.4 * ln(1 + 17.7 * RCI)` constant (`21.W1:P2-10`).
     let mut rci_out = Vec::with_capacity(n);
     let mut s2_out = Vec::with_capacity(n);
     for i in 0..n {
+        if raw_rci[i].is_none() {
+            rci_out.push(RCI_UNASSIGNED_FALLBACK);
+            s2_out.push((1.0 - 0.4 * det_ln(1.0 + 17.7 * RCI_UNASSIGNED_FALLBACK)).clamp(0.0, 1.0));
+            continue;
+        }
         let near_term = i < 3 || i + 3 >= n;
         let (s, w) = if near_term {
             let mut acc = 0.0_f64;
@@ -2474,8 +2785,10 @@ pub fn compute_berjanskii_wishart_rci_s2(sec_shifts: &[[Option<f64>; 6]]) -> (Ve
             for (d, wt) in [(-1isize, 0.25_f64), (0, 0.50), (1, 0.25)] {
                 let j = i as isize + d;
                 if j >= 0 && (j as usize) < n {
-                    acc += wt * raw_rci[j as usize];
-                    wt_sum += wt;
+                    if let Some(rv) = raw_rci[j as usize] {
+                        acc += wt * rv;
+                        wt_sum += wt;
+                    }
                 }
             }
             (acc, wt_sum)
@@ -2484,13 +2797,15 @@ pub fn compute_berjanskii_wishart_rci_s2(sec_shifts: &[[Option<f64>; 6]]) -> (Ve
             let mut wt_sum = 0.0_f64;
             for (d, wt) in [(-2isize, 1.0_f64), (-1, 2.0), (0, 3.0), (1, 2.0), (2, 1.0)] {
                 let j = (i as isize + d) as usize;
-                acc += wt * raw_rci[j];
-                wt_sum += wt;
+                if let Some(rv) = raw_rci[j] {
+                    acc += wt * rv;
+                    wt_sum += wt;
+                }
             }
             (acc, wt_sum)
         };
         let rci_v = s / w.max(1.0e-9);
-        let s2_v = (1.0 - 0.4 * det_ln(1.0 + 17.8 * rci_v)).clamp(0.0, 1.0);
+        let s2_v = (1.0 - 0.4 * det_ln(1.0 + 17.7 * rci_v)).clamp(0.0, 1.0);
         rci_out.push(rci_v);
         s2_out.push(s2_v);
     }
@@ -2498,10 +2813,11 @@ pub fn compute_berjanskii_wishart_rci_s2(sec_shifts: &[[Option<f64>; 6]]) -> (Ve
 }
 
 /// Tie-adjusted fractional-rank Spearman correlation $\rho_s \in [-1, +1]$.
-pub fn tie_adjusted_spearman_rho(xs: &[f64], ys: &[f64]) -> f64 {
+/// Returns `None` when `n < 2` or either variable has zero variance (constant `pLDDT` or `S^2`, `21.W1:P1-1`).
+pub fn tie_adjusted_spearman_rho(xs: &[f64], ys: &[f64]) -> Option<f64> {
     let n = xs.len().min(ys.len());
     if n < 2 {
-        return 0.0;
+        return None;
     }
     let rx = average_fractional_ranks(&xs[..n]);
     let ry = average_fractional_ranks(&ys[..n]);
@@ -2519,10 +2835,63 @@ pub fn tie_adjusted_spearman_rho(xs: &[f64], ys: &[f64]) -> f64 {
     }
     let denom = (vx * vy).sqrt();
     if denom < 1.0e-12 {
-        0.0
+        None
     } else {
-        (cov / denom).clamp(-1.0, 1.0)
+        Some((cov / denom).clamp(-1.0, 1.0))
     }
+}
+
+/// Deterministic moving-block bootstrap (`block_len = 5`, `n_boot = 500`) 95% confidence interval
+/// `[q025, q975]` for Spearman $\rho_s$ (`21.W1:P1-1`, `A5`).
+pub fn block_bootstrap_spearman_rho_ci95(
+    xs: &[f64],
+    ys: &[f64],
+    block_len: usize,
+    n_boot: usize,
+) -> Option<[f64; 2]> {
+    let n = xs.len().min(ys.len());
+    if n < 4 || n_boot < 20 {
+        return None;
+    }
+    // Return None if full sample itself has zero variance
+    tie_adjusted_spearman_rho(xs, ys)?;
+
+    let b_len = block_len.max(1).min(n);
+    let n_starts = n - b_len + 1;
+    let n_blocks = n.div_ceil(b_len);
+
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15_u64 ^ ((n as u64) << 17);
+    let mut next_u64 = || -> u64 {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D_u64)
+    };
+
+    let mut boot_rhos = Vec::with_capacity(n_boot);
+    let mut bx = Vec::with_capacity(n);
+    let mut by = Vec::with_capacity(n);
+    for _ in 0..n_boot {
+        bx.clear();
+        by.clear();
+        for _ in 0..n_blocks {
+            let start = (next_u64() as usize) % n_starts;
+            let take = (n - bx.len()).min(b_len);
+            bx.extend_from_slice(&xs[start..(start + take)]);
+            by.extend_from_slice(&ys[start..(start + take)]);
+        }
+        if let Some(r) = tie_adjusted_spearman_rho(&bx, &by) {
+            boot_rhos.push(r);
+        }
+    }
+    if boot_rhos.len() < 10 {
+        return None;
+    }
+    boot_rhos.sort_by(f64::total_cmp);
+    let m = boot_rhos.len();
+    let lo_idx = ((0.025 * ((m - 1) as f64)).floor() as usize).min(m - 1);
+    let hi_idx = ((0.975 * ((m - 1) as f64)).ceil() as usize).min(m - 1);
+    Some([boot_rhos[lo_idx], boot_rhos[hi_idx]])
 }
 
 fn average_fractional_ranks(vals: &[f64]) -> Vec<f64> {
@@ -2616,9 +2985,11 @@ fn align_structure_to_nmr(
     Ok(map)
 }
 
-/// Evaluate Fowler–Sljoka–Williamson rigidity concordance (`Spearman rho_s`, `C_corr`, `RMSD_rig`,
-/// `C_rmsd`) and 4-class per-residue structural discordance (`AfNmrConcordanceClass`), enforcing
-/// `<= 25%` sequence-identity & `TM < 0.50` `HomologFirewall` on `T12.3` $(\hat{\phi}, \hat{\psi})$ predictions.
+/// Evaluate FERRIC's original `pLDDT`-vs-$S^2$ rigidity concordance heuristic (whole-chain and
+/// ordered-core `pLDDT >= 70` Spearman $\rho_s$ with moving-block bootstrap `block_len = 5` 95% CIs,
+/// plus `RMSD_rig`) and 6-class gap-free per-residue structural concordance/discordance
+/// (`AfNmrConcordanceClass`), enforcing `<= 25%` sequence-identity & `TM < 0.50` `HomologFirewall`
+/// on `T12.3` $(\hat{\phi}, \hat{\psi})$ predictions (`21.W1:P1-1`, `P2-9`, `A5`).
 pub fn evaluate_af_nmr_concordance(
     structure: &AfStructureModel,
     shifts: &Reference,
@@ -2631,7 +3002,7 @@ pub fn evaluate_af_nmr_concordance(
         return Err("structure contains zero residues".to_string());
     }
     if let Some(pm) = pae {
-        pm.validate_chain_length(l_struct)?;
+        pm.validate_against_structure(structure)?;
     }
 
     let struct_to_nmr = align_structure_to_nmr(structure, shifts)?;
@@ -2715,12 +3086,15 @@ pub fn evaluate_af_nmr_concordance(
     let mut eval_plddt = Vec::new();
     let mut eval_s2_af = Vec::new();
     let mut eval_s2_exp = Vec::new();
+    let mut core_plddt = Vec::new();
+    let mut core_s2_exp = Vec::new();
 
     let mut records = Vec::with_capacity(l_struct);
     let mut n_concordant_ordered = 0usize;
     let mut n_concordant_disordered = 0usize;
     let mut n_conditional_folding = 0usize;
     let mut n_dynamic_hinge_or_alt = 0usize;
+    let mut n_indeterminate = 0usize;
     let mut n_unassigned_nmr = 0usize;
 
     for (i, &nmr_idx_opt) in struct_to_nmr.iter().enumerate().take(l_struct) {
@@ -2799,16 +3173,30 @@ pub fn evaluate_af_nmr_concordance(
             _ => None,
         };
 
-        // Accumulate non-terminal assigned residues (`0 < i < L - 1`) for global FSW concordance
+        // Accumulate non-terminal assigned residues (`0 < i < L - 1`) for global and ordered-core concordance
         if i > 0 && i + 1 < l_struct {
             if let (Some(pl), Some(sa), Some(se)) = (plddt, s2_af_hat, s2_exp) {
                 eval_plddt.push(pl);
                 eval_s2_af.push(sa);
                 eval_s2_exp.push(se);
+                if pl >= 70.0 {
+                    core_plddt.push(pl);
+                    core_s2_exp.push(se);
+                }
             }
         }
 
-        // Classify per-residue concordance / discordance (`docs/specs/21-alphafold-integrative-nmr.md` §1.3.3)
+        // Classify per-residue concordance / discordance with zero threshold gaps (`21.W1:P1-1`, `A5`):
+        // - `pLDDT >= 70`:
+        //   * `S^2 < 0.60` & AF Helix/Sheet & `p_coil + p_ppii >= 0.65` => `ModelOrderedSolutionDisordered`
+        //   * `S^2 < 0.60` otherwise => `Indeterminate` (no clear solution disorder vs dynamic split)
+        //   * `0.60 <= S^2 < 0.65` => `Indeterminate` (borderline rigidity gap)
+        //   * `S^2 >= 0.65` & (`ss_inversion` || `delta_theta >= 60`) => `DynamicHingeOrAltState`
+        //   * `S^2 >= 0.65` otherwise => `ConcordantOrdered`
+        // - `pLDDT < 70`:
+        //   * `S^2 >= 0.72` => `DynamicHingeOrAltState`
+        //   * `0.65 <= S^2 < 0.72` => `Indeterminate` (borderline rigidity gap)
+        //   * `S^2 < 0.65` => `ConcordantDisordered`
         let concordance_class = match (plddt, s2_exp) {
             (None, _) | (_, None) => AfNmrConcordanceClass::UnassignedNmr,
             (Some(pl), Some(se)) => {
@@ -2830,14 +3218,14 @@ pub fn evaluate_af_nmr_concordance(
                     || (ss_res.state8 == KabschSanderState8::E && nmr_clearly_helix);
 
                 if pl >= 70.0 {
-                    if af_is_helix_or_sheet && se < 0.60 && (p_coil + p_ppii) >= 0.65 {
-                        AfNmrConcordanceClass::ConditionalFoldingOrCrystalArtifact
-                    } else if se < 0.65 {
+                    if se < 0.60 {
                         if af_is_helix_or_sheet && (p_coil + p_ppii) >= 0.65 {
-                            AfNmrConcordanceClass::ConditionalFoldingOrCrystalArtifact
+                            AfNmrConcordanceClass::ModelOrderedSolutionDisordered
                         } else {
-                            AfNmrConcordanceClass::DynamicHingeOrAltState
+                            AfNmrConcordanceClass::Indeterminate
                         }
+                    } else if se < 0.65 {
+                        AfNmrConcordanceClass::Indeterminate
                     } else if ss_inversion || delta_theta_deg.is_some_and(|dt| dt >= 60.0) {
                         AfNmrConcordanceClass::DynamicHingeOrAltState
                     } else {
@@ -2845,6 +3233,8 @@ pub fn evaluate_af_nmr_concordance(
                     }
                 } else if se >= 0.72 {
                     AfNmrConcordanceClass::DynamicHingeOrAltState
+                } else if se >= 0.65 {
+                    AfNmrConcordanceClass::Indeterminate
                 } else {
                     AfNmrConcordanceClass::ConcordantDisordered
                 }
@@ -2854,10 +3244,11 @@ pub fn evaluate_af_nmr_concordance(
         match concordance_class {
             AfNmrConcordanceClass::ConcordantOrdered => n_concordant_ordered += 1,
             AfNmrConcordanceClass::ConcordantDisordered => n_concordant_disordered += 1,
-            AfNmrConcordanceClass::ConditionalFoldingOrCrystalArtifact => {
+            AfNmrConcordanceClass::ModelOrderedSolutionDisordered => {
                 n_conditional_folding += 1;
             }
             AfNmrConcordanceClass::DynamicHingeOrAltState => n_dynamic_hinge_or_alt += 1,
+            AfNmrConcordanceClass::Indeterminate => n_indeterminate += 1,
             AfNmrConcordanceClass::UnassignedNmr => n_unassigned_nmr += 1,
         }
 
@@ -2887,7 +3278,15 @@ pub fn evaluate_af_nmr_concordance(
     }
 
     let n_eval = eval_plddt.len();
-    let summary = if n_eval < MIN_CONCORDANCE_EVAL_RESIDUES {
+    let n_ordered_core = core_plddt.len();
+    let (
+        summary,
+        spearman_rho,
+        spearman_rho_ci95,
+        ordered_core_spearman_rho,
+        ordered_core_spearman_rho_ci95,
+        rmsd_rigidity_opt,
+    ) = if n_eval < MIN_CONCORDANCE_EVAL_RESIDUES {
         let reason = if structure.plddt_per_residue.is_none() {
             "structure lacks per-residue pLDDT (experimental coordinate B-factor guard active)"
                 .to_string()
@@ -2896,10 +3295,25 @@ pub fn evaluate_af_nmr_concordance(
                 "only {n_eval} assigned non-terminal residues (< {MIN_CONCORDANCE_EVAL_RESIDUES} required)"
             )
         };
-        ConcordanceSummary::InsufficientCoverage { n_eval, reason }
+        (
+            ConcordanceSummary::InsufficientCoverage { n_eval, reason },
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
     } else {
         let rho_s = tie_adjusted_spearman_rho(&eval_plddt, &eval_s2_exp);
-        let c_corr = (50.0 * (1.0 + rho_s)).clamp(0.0, 100.0);
+        let rho_ci = block_bootstrap_spearman_rho_ci95(&eval_plddt, &eval_s2_exp, 5, 500);
+        let (core_rho_s, core_rho_ci) = if n_ordered_core >= MIN_CONCORDANCE_EVAL_RESIDUES {
+            (
+                tie_adjusted_spearman_rho(&core_plddt, &core_s2_exp),
+                block_bootstrap_spearman_rho_ci95(&core_plddt, &core_s2_exp, 5, 500),
+            )
+        } else {
+            (None, None)
+        };
         let mse: f64 = eval_s2_af
             .iter()
             .zip(eval_s2_exp.iter())
@@ -2912,13 +3326,29 @@ pub fn evaluate_af_nmr_concordance(
         let rmsd_rig = mse.sqrt();
         let ratio = rmsd_rig / 0.22;
         let c_rmsd = (100.0 * det_exp(-(ratio * ratio))).clamp(0.0, 100.0);
-        ConcordanceSummary::Evaluated {
-            n_eval,
-            spearman_rho_s: rho_s,
-            c_corr_score: c_corr,
-            rmsd_rigidity: rmsd_rig,
-            c_rmsd_score: c_rmsd,
-        }
+        let sum_val = match rho_s {
+            Some(r) => ConcordanceSummary::Evaluated {
+                n_eval,
+                spearman_rho_s: r,
+                c_corr_score: (50.0 * (1.0 + r)).clamp(0.0, 100.0),
+                rmsd_rigidity: rmsd_rig,
+                c_rmsd_score: c_rmsd,
+            },
+            None => ConcordanceSummary::InsufficientCoverage {
+                n_eval,
+                reason:
+                    "zero variance in pLDDT or experimental rigidity; Spearman rho_s is undefined"
+                        .to_string(),
+            },
+        };
+        (
+            sum_val,
+            rho_s,
+            rho_ci,
+            core_rho_s,
+            core_rho_ci,
+            Some(rmsd_rig),
+        )
     };
 
     // Optional PAE summary across ordered residues (`pLDDT >= 70`)
@@ -2951,6 +3381,12 @@ pub fn evaluate_af_nmr_concordance(
         rigidity_source,
         ingest_diagnostics: structure.diagnostics.clone(),
         summary,
+        spearman_rho,
+        spearman_rho_ci95,
+        n_ordered_core,
+        ordered_core_spearman_rho,
+        ordered_core_spearman_rho_ci95,
+        rmsd_rigidity: rmsd_rigidity_opt,
         secondary_structure: ss_report,
         propensity,
         residues: records,
@@ -2958,6 +3394,7 @@ pub fn evaluate_af_nmr_concordance(
         n_concordant_disordered,
         n_conditional_folding,
         n_dynamic_hinge_or_alt,
+        n_indeterminate,
         n_unassigned_nmr,
         pae_n_residues: pae.map(|pm| pm.n_residues),
         pae_median_intra_ordered,
@@ -2970,6 +3407,18 @@ pub fn evaluate_af_nmr_concordance(
 /// Format an [`AfConcordanceReport`] as clean deterministic TSV.
 pub fn format_af_concordance_tsv(rep: &AfConcordanceReport) -> String {
     let mut out = String::new();
+    let fmt_opt_f64 = |v: Option<f64>, prec: usize| -> String {
+        match v {
+            Some(x) => format!("{x:.prec$}"),
+            None => "undefined".to_string(),
+        }
+    };
+    let fmt_ci = |ci: Option<[f64; 2]>| -> String {
+        match ci {
+            Some([lo, hi]) => format!("[{lo:.4},{hi:.4}]"),
+            None => "undefined".to_string(),
+        }
+    };
     match &rep.summary {
         ConcordanceSummary::Evaluated {
             n_eval,
@@ -2979,24 +3428,35 @@ pub fn format_af_concordance_tsv(rep: &AfConcordanceReport) -> String {
             c_rmsd_score,
         } => {
             out.push_str(&format!(
-                "# ferric_af_concordance chain={} provenance={:?} plddt_source={:?} rigidity_source={:?} n_eval={} spearman_rho_s={:.4} c_corr={:.2} rmsd_rig={:.4} c_rmsd={:.2} firewall_sha256={} max_retained_seq_id={:.4}\n",
+                "# ferric_af_concordance chain={} provenance={:?} plddt_source={:?} rigidity_source=\"{}\" n_eval={} spearman_rho_s={:.4} spearman_rho_ci95={} n_ordered_core={} ordered_core_rho_s={} ordered_core_ci95={} rmsd_rig={:.4} uncal_c_corr={:.2} uncal_c_rmsd={:.2} indeterminate={} firewall_sha256={} max_retained_seq_id={:.4}\n",
                 rep.chain_id,
                 rep.provenance,
                 rep.plddt_source,
-                rep.rigidity_source,
+                rep.rigidity_source.provenance_label(),
                 n_eval,
                 spearman_rho_s,
-                c_corr_score,
+                fmt_ci(rep.spearman_rho_ci95),
+                rep.n_ordered_core,
+                fmt_opt_f64(rep.ordered_core_spearman_rho, 4),
+                fmt_ci(rep.ordered_core_spearman_rho_ci95),
                 rmsd_rigidity,
+                c_corr_score,
                 c_rmsd_score,
+                rep.n_indeterminate,
                 rep.exclusion_list_sha256,
                 rep.max_retained_seq_identity
             ));
         }
         ConcordanceSummary::InsufficientCoverage { n_eval, reason } => {
             out.push_str(&format!(
-                "# ferric_af_concordance chain={} provenance={:?} status=InsufficientCoverage n_eval={} reason=\"{}\" firewall_sha256={}\n",
-                rep.chain_id, rep.provenance, n_eval, reason, rep.exclusion_list_sha256
+                "# ferric_af_concordance chain={} provenance={:?} status=InsufficientCoverage n_eval={} spearman_rho_s={} rmsd_rig={} reason=\"{}\" firewall_sha256={}\n",
+                rep.chain_id,
+                rep.provenance,
+                n_eval,
+                fmt_opt_f64(rep.spearman_rho, 4),
+                fmt_opt_f64(rep.rmsd_rigidity, 4),
+                reason,
+                rep.exclusion_list_sha256
             ));
         }
     }

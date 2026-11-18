@@ -16,13 +16,17 @@
 //!   Spectrosc.* **1979**, 13, 303-344) & Case, D. A. (*J. Biomol. NMR* **1995**, 6, 341-346) --
 //!   signed triangular-projection conjugated aromatic ring-current shielding tensors across
 //!   `Phe`, `Tyr`, `His`, and `Trp` 5/6-membered pi-systems.
-//! - Wagner, G., Pardi, A. & Bax, A. (*J. Am. Chem. Soc.* **1983**, 105, 5948-5949) & Pardi, A.,
-//!   Wagner, G. & Wuthrich, K. (*Eur. J. Biochem.* **1983**, 137, 445-454) -- inverse-cube
-//!   `r_HO^-3` amide proton and carbonyl `13C'` hydrogen-bond chemical shift perturbations.
+//! - Empirical H-bond shift term: inverse-cube excess distance $\Delta\delta^{\text{HB}} \propto \left(r_{\text{HO}}^{-3} - r_0^{-3}\right)_+ \cos^2\theta_{\text{NHO}}$
+//!   (an original empirical functional form inspired by the inverse-cube distance scaling in
+//!   Wagner, G., Pardi, A. & Bax, A., *J. Am. Chem. Soc.* **1983**, 105, 5948–5949, and Pardi, A.,
+//!   Wagner, G. & Wuthrich, K., *Eur. J. Biochem.* **1983**, 137, 445–454; coefficients are
+//!   empirical FERRIC parameters rather than the original Wagner–Pardi–Bax regression).
 //! - McConnell, H. M. (*J. Chem. Phys.* **1957**, 27, 226-229); Buckingham, A. D. (*Can. J.
 //!   Chem.* **1960**, 38, 300-307); Sitkoff, D. & Case, D. A. (*Prog. Nucl. Magn. Reson.
-//!   Spectrosc.* **1998**, 32, 165-190) -- peptide carbonyl magnetic susceptibility anisotropy
-//!   and bond-parallel electric-field shielding `Delta_delta_EF = -A_parallel * E_parallel`.
+//!   Spectrosc.* **1998**, 32, 165-190) (peptide carbonyl magnetic susceptibility anisotropy and
+//!   bond-parallel electric-field shielding `Delta_delta_EF = -A_parallel * E_parallel`); and
+//!   MacKerell, A. D. et al. (*J. Phys. Chem. B* **1998**, 102, 3586–3616) (`CHARMM22` peptide
+//!   backbone partial charges `C': +0.51, O: -0.51, N: -0.47, H: +0.31 e`).
 //! - Sahakyan, A. B., Vranken, W. F., Cavalli, A. & Vendruscolo, M. (*Angew. Chem. Int. Ed.*
 //!   **2011**, 50, 9620-9623) -- sidechain methyl (`Ile CD1/HD1*`, `Leu CD1/HD1* & CD2/HD2*`,
 //!   `Val CG1/HG1* & CG2/HG2*`, `Met CE/HE*`, `Ala CB/HB*`, `Thr CG2/HG2*`) `gamma`-gauche
@@ -127,16 +131,18 @@ impl BackboneShiftAtom {
         }
     }
 
-    /// Baseline disordered random-coil predictive standard deviation `sigma_{coil,a}` (ppm).
+    /// Baseline disordered / low-`pLDDT` total predictive standard deviation `sigma_{low_plddt,a}` (ppm).
+    /// Must be `>= struct_sigma_ppm()` (`21.W1:P2-1`) so predictive uncertainty NEVER shrinks as
+    /// `pLDDT` falls, reflecting combined conformational disorder and coil-model uncertainty.
     #[inline]
     pub const fn coil_sigma_ppm(self) -> f64 {
         match self {
-            Self::H => 0.28,
-            Self::N => 1.45,
-            Self::CA => 0.65,
-            Self::CB => 0.70,
-            Self::C => 0.68,
-            Self::HA => 0.18,
+            Self::H => 0.62,
+            Self::N => 3.10,
+            Self::CA => 1.55,
+            Self::CB => 1.65,
+            Self::C => 1.50,
+            Self::HA => 0.36,
         }
     }
 }
@@ -255,6 +261,39 @@ pub struct StructureModel {
     pub residues: Vec<StructResidueCoords>,
     pub aromatic_rings: Vec<ConjugatedAromaticRing>,
     pub diagnostics: Vec<String>,
+}
+
+impl StructureModel {
+    /// Fail-closed check verifying that `self` has positive evidence of being a predicted structure
+    /// model carrying valid per-residue `pLDDT` values, or that `treat_as_model` was explicitly
+    /// enabled (`21.W1:P0-2`, `21.W2:P1-3`).
+    pub fn require_predicted_model(&self, treat_as_model: bool) -> Result<(), String> {
+        require_predicted_structure_model(self, treat_as_model)
+    }
+}
+
+/// Fail-closed provenance gate for [`StructureModel`] (`21.W1:P0-2`, `21.W2:P1-3`).
+pub fn require_predicted_structure_model(
+    model: &StructureModel,
+    treat_as_model: bool,
+) -> Result<(), String> {
+    if model.residues.is_empty() {
+        return Err("predicted StructureModel check failed: zero residues".to_string());
+    }
+    let has_all_plddt = model.residues.iter().all(|r| r.plddt.is_some());
+    if !has_all_plddt {
+        return Err(format!(
+            "predicted StructureModel check failed (provenance={:?}, diagnostics={:?}): per-residue pLDDT is unavailable (experimental/headerless/constant-B structure); pass --treat-as-model / --force-bfactor-plddt only if B-factors genuinely encode pLDDT",
+            model.provenance, model.diagnostics
+        ));
+    }
+    if model.provenance == StructCoordinateProvenance::Computational || treat_as_model {
+        return Ok(());
+    }
+    Err(format!(
+        "predicted StructureModel provenance check failed (provenance={:?}, diagnostics={:?}): positive ModelArchive/AFDB evidence is required unless --treat-as-model / --force-bfactor-plddt is explicitly supplied",
+        model.provenance, model.diagnostics
+    ))
 }
 
 /// Configuration for 3D structure-to-chemical-shift forward prediction.
@@ -401,6 +440,10 @@ pub struct StructShiftPredictionReport {
     pub exclusion_list_sha256: String,
     pub max_retained_seq_identity: f64,
     pub corpus_sha256: String,
+    /// Number of database template chains shorter than 8 CA atoms skipped by Layer 4 (`TM-score`)
+    /// without disabling Layer 4 for the rest of the corpus (`21.W1:P1-4`).
+    #[serde(default)]
+    pub l4_short_templates_skipped: usize,
 }
 
 // ============================================================================
@@ -586,18 +629,10 @@ impl StructureModel {
                 || line.starts_with("COMPND")
                 || line.starts_with("REMARK")
             {
+                // Never infer computational provenance from free-text PDB REMARK/TITLE/COMPND/HEADER
+                // lines (`21.W1:P0-2`); only check explicit experimental markers.
                 let up = line.to_ascii_uppercase();
-                if up.contains("ALPHAFOLD")
-                    || up.contains("COLABFOLD")
-                    || up.contains("BOLTZ")
-                    || up.contains("MODELARCHIVE")
-                    || up.contains("ESMFOLD")
-                    || up.contains("ROSETTAFOLD")
-                {
-                    if provenance == StructCoordinateProvenance::Unknown {
-                        provenance = StructCoordinateProvenance::Computational;
-                    }
-                } else if (up.contains("X-RAY")
+                if (up.contains("X-RAY")
                     || up.contains("CRYSTAL STRUCTURE")
                     || up.contains("CRYSTALLOGRAPHIC")
                     || up.contains("SOLUTION NMR")
@@ -825,10 +860,12 @@ impl StructureModel {
                             }
                         }
                     }
-                } else if prefix == "_ma_protocol_step" || prefix == "_ma_data" {
+                } else if prefix == "_ma_protocol_step"
+                    || prefix == "_ma_data"
+                    || prefix == "_ma_model_list"
+                {
                     provenance = StructCoordinateProvenance::Computational;
                 } else if prefix == "_ma_qa_metric" {
-                    provenance = StructCoordinateProvenance::Computational;
                     let id_col = find_cif_col(&cols, "_ma_qa_metric.id");
                     let name_col = find_cif_col(&cols, "_ma_qa_metric.name");
                     let type_col = find_cif_col(&cols, "_ma_qa_metric.type");
@@ -844,12 +881,14 @@ impl StructureModel {
                         let md = mode_col
                             .map(|c| row[c].to_ascii_lowercase())
                             .unwrap_or_default();
-                        if nm.contains("PLDDT") || tp.contains("PLDDT") || md == "local" {
+                        // Require explicit `pLDDT` metric name/type (`21.W1:P2-6`), rejecting QMEANDisCo etc.
+                        if (nm.contains("PLDDT") || tp.contains("PLDDT")) && !md.contains("global")
+                        {
                             plddt_metric_ids.push(row[ic].to_string());
+                            provenance = StructCoordinateProvenance::Computational;
                         }
                     }
                 } else if prefix == "_ma_qa_metric_local" {
-                    provenance = StructCoordinateProvenance::Computational;
                     let asym_col = find_cif_col(&cols, "_ma_qa_metric_local.label_asym_id")
                         .ok_or("mmCIF _ma_qa_metric_local missing label_asym_id")?;
                     let seq_col = find_cif_col(&cols, "_ma_qa_metric_local.label_seq_id")
@@ -857,30 +896,30 @@ impl StructureModel {
                     let val_col = find_cif_col(&cols, "_ma_qa_metric_local.metric_value")
                         .ok_or("mmCIF _ma_qa_metric_local missing metric_value")?;
                     let mid_col = find_cif_col(&cols, "_ma_qa_metric_local.metric_id");
-                    for row in vals.chunks_exact(ncols) {
-                        if let Some(mc) = mid_col {
-                            if !plddt_metric_ids.is_empty()
-                                && !plddt_metric_ids.iter().any(|id| id == row[mc])
-                            {
-                                continue;
+                    if !plddt_metric_ids.is_empty() {
+                        for row in vals.chunks_exact(ncols) {
+                            if let Some(mc) = mid_col {
+                                if !plddt_metric_ids.iter().any(|id| id == row[mc]) {
+                                    continue;
+                                }
                             }
+                            let seq_id: i32 = row[seq_col].parse().map_err(|e| {
+                                format!(
+                                    "invalid _ma_qa_metric_local.label_seq_id '{}': {e}",
+                                    row[seq_col]
+                                )
+                            })?;
+                            let mv: f64 = row[val_col].parse().map_err(|e| {
+                                format!(
+                                    "invalid _ma_qa_metric_local.metric_value '{}': {e}",
+                                    row[val_col]
+                                )
+                            })?;
+                            if !mv.is_finite() {
+                                return Err("non-finite pLDDT in _ma_qa_metric_local".to_string());
+                            }
+                            local_plddt_by_label.insert((row[asym_col].to_string(), seq_id), mv);
                         }
-                        let seq_id: i32 = row[seq_col].parse().map_err(|e| {
-                            format!(
-                                "invalid _ma_qa_metric_local.label_seq_id '{}': {e}",
-                                row[seq_col]
-                            )
-                        })?;
-                        let mv: f64 = row[val_col].parse().map_err(|e| {
-                            format!(
-                                "invalid _ma_qa_metric_local.metric_value '{}': {e}",
-                                row[val_col]
-                            )
-                        })?;
-                        if !mv.is_finite() {
-                            return Err("non-finite pLDDT in _ma_qa_metric_local".to_string());
-                        }
-                        local_plddt_by_label.insert((row[asym_col].to_string(), seq_id), mv);
                     }
                 } else if prefix == "_struct_conn" {
                     let type_col = find_cif_col(&cols, "_struct_conn.conn_type_id");
@@ -1699,7 +1738,7 @@ type DisulfideResiduePair = ((String, i32), (String, i32));
 /// and resolve guarded per-residue `pLDDT`.
 fn finalize_parsed_structure(
     raw_residues: Vec<RawParsedResidue>,
-    mut provenance: StructCoordinateProvenance,
+    provenance: StructCoordinateProvenance,
     force_bfactor_plddt: bool,
     explicit_disulfides: &[DisulfideResiduePair],
     diagnostics: &mut Vec<String>,
@@ -1736,31 +1775,25 @@ fn finalize_parsed_structure(
             if b_vals.len() == l {
                 let min_b = b_vals.iter().copied().fold(f64::INFINITY, f64::min);
                 let max_b = b_vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                let all_zero = min_b == 0.0 && max_b == 0.0;
-                if force_bfactor_plddt || provenance == StructCoordinateProvenance::Computational {
-                    if min_b >= 0.0 && max_b <= 100.001 {
-                        use_bfactor_plddt = true;
-                        let mut sorted = b_vals.clone();
-                        sorted.sort_by(f64::total_cmp);
-                        let med = sorted[sorted.len() / 2];
-                        if max_b <= 1.0 && med > 0.15 {
-                            rescale_01_to_100 = true;
-                            diagnostics.push(
-                                "rescaled computational [0, 1] B_iso confidence column to [0, 100] pLDDT"
-                                    .to_string(),
-                            );
-                        }
-                    }
-                } else if !all_zero && min_b >= 0.0 && max_b <= 100.0 {
-                    // Headerless file: only treat as pLDDT if median sits in high-confidence AF range (>= 65)
-                    let mut sorted = b_vals;
+                let is_constant_or_zero = max_b <= 1.0e-6 || (l >= 2 && (max_b - min_b) <= 1.0e-6);
+                if (force_bfactor_plddt || provenance == StructCoordinateProvenance::Computational)
+                    && !is_constant_or_zero
+                    && min_b >= 0.0
+                    && max_b <= 100.001
+                {
+                    use_bfactor_plddt = true;
+                    let mut sorted = b_vals.clone();
                     sorted.sort_by(f64::total_cmp);
                     let med = sorted[sorted.len() / 2];
-                    if med >= 68.0 && max_b >= 80.0 {
-                        provenance = StructCoordinateProvenance::Computational;
-                        use_bfactor_plddt = true;
+                    if max_b <= 1.0 && med > 0.15 {
+                        rescale_01_to_100 = true;
+                        diagnostics.push(
+                            "rescaled computational [0, 1] B_iso confidence column to [0, 100] pLDDT"
+                                .to_string(),
+                        );
                     }
                 }
+                // Never treat headerless PDB/mmCIF B <= 100 as computational pLDDT (`21.W1:P0-2`)!
             }
         }
     }
@@ -2468,24 +2501,78 @@ struct ResiduePhysicalShifts {
     nearest_arom_ha: Option<f64>,
 }
 
-/// Evaluate Kabsch-Sander electrostatic H-bond indicators, Wagner-Pardi-Bax `r_HO^-3 cos^2(theta)`
-/// shifts, McConnell peptide carbonyl anisotropy, Buckingham bond-parallel electric field, and
+/// Canonicalize a [`StructureModel`] onto ideal Engh–Huber `(CA, phi, psi, chi1)` peptide-plane
+/// and sidechain `OG`/`OG1`/`OH` geometry per chain segment (`21.W1:P2-3`) so that H-bond shift
+/// terms (`hbond`, `ks_nh_energy`, `ks_co_energy`, `is_helical_hbond`, `is_sheet_hbond`) are
+/// evaluated on identical backbone/acceptor geometry during both training (`torsion_corpus.tsv`)
+/// and query inference.
+fn canonicalize_model_for_hbond(model: &StructureModel) -> Vec<StructResidueCoords> {
+    let l = model.residues.len();
+    if l == 0 {
+        return Vec::new();
+    }
+    let mut out_res = Vec::with_capacity(l);
+    let mut seg_start = 0usize;
+    while seg_start < l {
+        let ch_id = &model.residues[seg_start].chain_id;
+        let mut seg_end = seg_start + 1;
+        while seg_end < l && model.residues[seg_end].chain_id == *ch_id {
+            seg_end += 1;
+        }
+        let slice = &model.residues[seg_start..seg_end];
+        if slice.len() >= 2 {
+            let seq_ids: Vec<i32> = slice.iter().map(|r| r.seq_id).collect();
+            let res_names: Vec<String> = slice.iter().map(|r| r.res_name.clone()).collect();
+            let ca_coords: Vec<[f64; 3]> = slice.iter().map(|r| r.ca).collect();
+            let phi_v: Vec<Option<f64>> = slice.iter().map(|r| r.phi_deg).collect();
+            let psi_v: Vec<Option<f64>> = slice.iter().map(|r| r.psi_deg).collect();
+            let chi1_v: Vec<Option<f64>> = slice.iter().map(|r| r.chi1_deg).collect();
+            if let Ok(rebuilt) = StructureModel::from_ca_and_torsions(
+                ch_id, &seq_ids, &res_names, &ca_coords, &phi_v, &psi_v, &chi1_v,
+            ) {
+                if rebuilt.residues.len() == slice.len() {
+                    out_res.extend(rebuilt.residues);
+                    seg_start = seg_end;
+                    continue;
+                }
+            }
+        }
+        out_res.extend_from_slice(slice);
+        seg_start = seg_end;
+    }
+    out_res
+}
+
+/// Evaluate per-residue empirical H-bond chemical-shift contributions `[H, N, CA, CB, C', HA]` (ppm)
+/// on the harmonized canonical `(CA, phi, psi, chi1)` peptide-plane geometry (`21.W1:P2-3`).
+pub fn evaluate_hbond_shifts_ppm(model: &StructureModel) -> Vec<[f64; 6]> {
+    evaluate_all_physical_terms(model)
+        .into_iter()
+        .map(|p| p.hbond)
+        .collect()
+}
+
+/// Evaluate Kabsch-Sander electrostatic H-bond indicators, empirical `r_HO^-3 cos^2(theta)` H-bond
+/// shifts (inspired by Wagner, Pardi & Bax 1983), McConnell peptide carbonyl anisotropy,
+/// CHARMM22 (MacKerell et al. 1998) / Buckingham bond-parallel electric field, and
 /// Haigh-Mallion aromatic ring-current shifts across all residues of `model`.
 fn evaluate_all_physical_terms(model: &StructureModel) -> Vec<ResiduePhysicalShifts> {
     let l = model.residues.len();
     let mut out = vec![ResiduePhysicalShifts::default(); l];
+    let hb_residues = canonicalize_model_for_hbond(model);
 
-    // Collect candidate sidechain oxygen acceptors (`OD1`, `OD2`, `OE1`, `OE2`, `OG`, `OG1`, `OH`)
+    // Collect candidate sidechain hydroxyl acceptors (`OG`, `OG1`, `OH`) present in both canonical
+    // training and query geometries (`21.W1:P2-3`)
     let mut sc_oxygens: Vec<(usize, Vec3)> = Vec::new();
-    for (idx, r) in model.residues.iter().enumerate() {
-        for oname in ["OD1", "OD2", "OE1", "OE2", "OG", "OG1", "OH"] {
+    for (idx, r) in hb_residues.iter().enumerate() {
+        for oname in ["OG", "OG1", "OH"] {
             if let Some(&ox) = r.atoms.get(oname) {
                 sc_oxygens.push((idx, ox));
             }
         }
     }
 
-    // 1. Kabsch-Sander electrostatic H-bonds + Wagner-Pardi-Bax direct `r_HO^-3` H-bond shifts
+    // 1. Kabsch-Sander electrostatic H-bonds + empirical `r_HO^-3 cos^2(theta)` H-bond shifts
     //    E_HB(donor_co k -> acceptor_nh i) = 0.42 * 0.20 * 332 * (1/r_ON + 1/r_CH - 1/r_OH - 1/r_CN)
     const KS_FACTOR: f64 = 0.42 * 0.20 * 332.0; // 27.888 kcal*A/mol
     const R0_HB: f64 = 2.60;
@@ -2495,18 +2582,17 @@ fn evaluate_all_physical_terms(model: &StructureModel) -> Vec<ResiduePhysicalShi
     let mut turn3 = vec![false; l];
 
     for i in 0..l {
-        let ri = &model.residues[i];
+        let ri = &hb_residues[i];
         // Amide N_i - H_i H-bond donor to backbone O_k and sidechain O_k
         if let Some(h_i) = ri.h {
             let mut best_nh_hb = 0.0_f64;
             let mut best_ks_e = 0.0_f64;
-            for k in 0..l {
-                let same_chain = model.residues[k].chain_id == ri.chain_id;
-                let seq_sep = (ri.seq_id - model.residues[k].seq_id).abs();
+            for (k, rk) in hb_residues.iter().enumerate() {
+                let same_chain = rk.chain_id == ri.chain_id;
+                let seq_sep = (ri.seq_id - rk.seq_id).abs();
                 if same_chain && seq_sep < 2 {
                     continue;
                 }
-                let rk = &model.residues[k];
                 let d_oh = v_dist(rk.o, h_i);
                 if d_oh <= 5.2 {
                     let r_on = v_dist(rk.o, ri.n).max(0.5);
@@ -2571,21 +2657,18 @@ fn evaluate_all_physical_terms(model: &StructureModel) -> Vec<ResiduePhysicalShi
                 }
             }
             out[i].ks_nh_energy = best_ks_e;
-            // Wagner-Pardi-Bax amide 1H^N & 15N inverse-cube deshielding
+            // Empirical inverse-cube amide 1H^N & 15N H-bond deshielding
             out[i].hbond[BackboneShiftAtom::H.index()] = (4.15 * best_nh_hb).min(1.35);
             out[i].hbond[BackboneShiftAtom::N.index()] = (8.80 * best_nh_hb).min(3.00);
         }
 
-        // Weak C_alpha - H_alpha ... O=C H-bond deshielding in beta-sheets (Wagner, Pardi & Bax 1983)
+        // Weak C_alpha - H_alpha ... O=C H-bond deshielding in beta-sheets
         let mut best_ha_hb = 0.0_f64;
         for ha_pt in [Some(ri.ha), ri.ha2, ri.ha3].into_iter().flatten() {
-            for k in 0..l {
-                if model.residues[k].chain_id == ri.chain_id
-                    && (ri.seq_id - model.residues[k].seq_id).abs() < 2
-                {
+            for rk in &hb_residues {
+                if rk.chain_id == ri.chain_id && (ri.seq_id - rk.seq_id).abs() < 2 {
                     continue;
                 }
-                let rk = &model.residues[k];
                 let d_ho = v_dist(ha_pt, rk.o);
                 if (1.80..=2.75).contains(&d_ho) {
                     let u_ch = v_unit(v_sub(ri.ca, ha_pt));
@@ -2708,7 +2791,12 @@ where
         // c3^2 -> 1 above/below the peptide plane gives upfield shift (< 0)
         aniso += (0.28 * (1.0 - 3.0 * c3 * c3) + 0.08 * (c1 * c1 - c2 * c2)) * inv_r3;
 
-        // Screened partial-charge electric field from peptide dipole (C': +0.51, O: -0.51, N: -0.47, H: +0.31)
+        // Empirical H-bond shift term (FERRIC coefficients with inverse-cube r_HO^-3 scaling
+        // inspired by Wagner, Pardi & Bax 1983) & CHARMM22 partial charges (MacKerell 1998)
+        // ...
+        // Note: training and query structures share identical `evaluate_all_physical_terms`.
+        // Screened CHARMM22 (MacKerell et al., J. Phys. Chem. B 1998, 102, 3586-3616)
+        // peptide backbone partial charges: C': +0.51, O: -0.51, N: -0.47, H: +0.31 e
         let add_q = |ef: &mut Vec3, pos: Vec3, q: f64| {
             let dr = v_sub(_r_p, pos);
             let d = v_norm(dr).max(2.00);
@@ -3107,12 +3195,14 @@ fn embedded_precomputed_corpus() -> &'static [PrecomputedCorpusChain] {
     })
 }
 
-/// Solve symmetric positive-definite linear system `A * w = b` (`N = TOTAL_BASIS_DIM`) via Cholesky `L L^T`.
+/// Solve symmetric positive-definite linear system `A * w = b` (`N = TOTAL_BASIS_DIM`) via Cholesky
+/// `A = L L^T`, simultaneously returning the exact inverse diagonal `diag(A^{-1})_d = ||L^{-1} e_d||_2^2`
+/// for Golub–Heath–Wahba (1979) Generalized Cross-Validation (`GCV`) out-of-sample degrees of freedom (`21.W1:P2-1`).
 #[allow(clippy::needless_range_loop)]
-fn solve_spd_cholesky(
+fn solve_spd_cholesky_with_inv_diag(
     a: &[[f64; TOTAL_BASIS_DIM]; TOTAL_BASIS_DIM],
     b: &[f64; TOTAL_BASIS_DIM],
-) -> [f64; TOTAL_BASIS_DIM] {
+) -> ([f64; TOTAL_BASIS_DIM], [f64; TOTAL_BASIS_DIM]) {
     let mut l = [[0.0_f64; TOTAL_BASIS_DIM]; TOTAL_BASIS_DIM];
     for i in 0..TOTAL_BASIS_DIM {
         for j in 0..=i {
@@ -3146,7 +3236,29 @@ fn solve_spd_cholesky(
         }
         w[i] = sum / l[i][i];
     }
-    w
+
+    // Lower-triangular inverse `Z = L^{-1}` -> `diag(A^{-1})_d = sum_{i >= d} Z_{i, d}^2`
+    let mut z = [[0.0_f64; TOTAL_BASIS_DIM]; TOTAL_BASIS_DIM];
+    for d in 0..TOTAL_BASIS_DIM {
+        z[d][d] = 1.0 / l[d][d];
+        for i in (d + 1)..TOTAL_BASIS_DIM {
+            let mut sum = 0.0;
+            for k in d..i {
+                sum += l[i][k] * z[k][d];
+            }
+            z[i][d] = -sum / l[i][i];
+        }
+    }
+    let mut inv_diag = [0.0_f64; TOTAL_BASIS_DIM];
+    for d in 0..TOTAL_BASIS_DIM {
+        let mut sq = 0.0;
+        for i in d..TOTAL_BASIS_DIM {
+            sq += z[i][d] * z[i][d];
+        }
+        inv_diag[d] = sq;
+    }
+
+    (w, inv_diag)
 }
 
 /// Fit hierarchical ridge-regularized trigonometric Fourier hypersurfaces (`K = 3` `(phi_i, psi_i)` +
@@ -3231,10 +3343,12 @@ pub fn fit_torsion_fourier_surfaces(
         // Symmetrize unregularized class Gram matrices and sum into pooled global system
         let mut g_glob = [[0.0_f64; TOTAL_BASIS_DIM]; TOTAL_BASIS_DIM];
         let mut b_glob = [0.0_f64; TOTAL_BASIS_DIM];
+        let mut n_tot_atom = 0usize;
         for d in 0..TOTAL_BASIS_DIM {
             g_glob[d][d] = diag_pen[d];
         }
         for c_idx in 0..5 {
+            n_tot_atom += counts[a_idx][c_idx];
             let gc_mut = &mut g_unreg[a_idx * 5 + c_idx];
             for p in 0..TOTAL_BASIS_DIM {
                 b_glob[p] += b_unreg[a_idx][c_idx][p];
@@ -3248,7 +3362,13 @@ pub fn fit_torsion_fourier_surfaces(
                 }
             }
         }
-        let w_glob = solve_spd_cholesky(&g_glob, &b_glob);
+        let (w_glob, inv_diag_glob) = solve_spd_cholesky_with_inv_diag(&g_glob, &b_glob);
+        // Effective global degrees of freedom `tr((G_glob + Lambda)^{-1} G_glob) = D - sum_d inv_diag_glob[d] * diag_pen[d]`
+        let mut nu_glob = TOTAL_BASIS_DIM as f64;
+        for d in 0..TOTAL_BASIS_DIM {
+            nu_glob -= inv_diag_glob[d] * diag_pen[d];
+        }
+        nu_glob = nu_glob.max(0.0);
 
         // Class-specific hierarchical ridge solve: `(G_c + lambda_c I) dw_c = b_c - G_c w_glob`
         let base_sd = atom.struct_sigma_ppm();
@@ -3266,17 +3386,22 @@ pub fn fit_torsion_fourier_surfaces(
                 }
                 rhs_res[p] = bc_raw[p] - gw_p;
             }
-            let dw = solve_spd_cholesky(&gc_reg, &rhs_res);
+            let (dw, inv_diag_cls) = solve_spd_cholesky_with_inv_diag(&gc_reg, &rhs_res);
             let mut w_cls = [0.0_f64; TOTAL_BASIS_DIM];
             for d in 0..TOTAL_BASIS_DIM {
                 w_cls[d] = w_glob[d] + dw[d];
             }
             weights[a_idx][c_idx] = w_cls;
 
-            // Exact quadratic residual RSS = sum_y2 - 2 w^T b + w^T G w
-            if counts[a_idx][c_idx] >= 25 {
+            // Golub–Heath–Wahba (1979) Generalized Cross-Validation (`GCV` / out-of-sample LOO PRESS)
+            // predictive residual RMSD (`21.W1:P2-1`):
+            //   nu_eff = tr((G_c + Lambda_c)^{-1} G_c) + (N_c / N_tot) * nu_glob_shrunk
+            //   sigma_GCV = sqrt(RSS_c / N_c) / (1 - nu_eff / N_c)
+            let n_c = counts[a_idx][c_idx];
+            if n_c >= 25 {
                 let mut wb = 0.0;
                 let mut wgw = 0.0;
+                let mut nu_cls = TOTAL_BASIS_DIM as f64;
                 for p in 0..TOTAL_BASIS_DIM {
                     wb += w_cls[p] * bc_raw[p];
                     let mut gp = 0.0;
@@ -3284,10 +3409,18 @@ pub fn fit_torsion_fourier_surfaces(
                         gp += gc_raw[p][q] * w_cls[q];
                     }
                     wgw += w_cls[p] * gp;
+                    nu_cls -= inv_diag_cls[p] * (diag_pen[p] * class_shrink[c_idx]);
                 }
+                let share_glob = if n_tot_atom > 0 {
+                    ((n_c as f64) / (n_tot_atom as f64)) * nu_glob
+                } else {
+                    0.0
+                };
+                let nu_eff = (nu_cls.max(0.0) + 0.5 * share_glob).min(0.75 * (n_c as f64));
                 let rss = (sum_y2[a_idx][c_idx] - 2.0 * wb + wgw).max(0.0);
-                let rms = (rss / (counts[a_idx][c_idx] as f64)).sqrt();
-                residual_sigma[a_idx][c_idx] = (0.65 * rms + 0.35 * base_sd).max(0.75 * base_sd);
+                let gcv_denom = (1.0 - nu_eff / (n_c as f64)).max(0.25);
+                let gcv_oos_rms = (rss / (n_c as f64)).sqrt() / gcv_denom;
+                residual_sigma[a_idx][c_idx] = (0.60 * gcv_oos_rms + 0.40 * base_sd).max(base_sd);
             } else {
                 residual_sigma[a_idx][c_idx] = base_sd;
             }
@@ -3387,8 +3520,16 @@ fn predict_residue_ilvmat_methyls(
         }
 
         // Sahakyan et al. (2011) 13C^m gamma-gauche rotamer shielding & coil baselines
-        let (c_rc_base, c_gg, h_rc_base, h_rot_adj, sd_c_struct, sd_c_coil, sd_h_struct, sd_h_coil) =
-            match kind {
+        let (c_rc_base, c_gg, h_rc_base, h_rot_adj, sd_c_struct, sd_c_coil, sd_h_struct, sd_h_coil): (
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+        ) = match kind {
                 MethylGroupKind::AlaCb => {
                     let (c_rc, c_tor) = match ala_cb_pred {
                         Some(cb_b) => (cb_b.rc_ppm, cb_b.delta_torsion_ppm),
@@ -3404,9 +3545,9 @@ fn predict_residue_ilvmat_methyls(
                         1.38 - 0.0010 * dt,
                         h_tor,
                         1.15,
-                        0.70,
+                        1.65,
                         0.19,
-                        0.14,
+                        0.26,
                     )
                 }
                 MethylGroupKind::IleCd1 => {
@@ -3499,14 +3640,19 @@ fn predict_residue_ilvmat_methyls(
                 }
             };
 
+        let c_rc = c_rc_base;
         let c_struct = c_rc_base + c_gg + c_rc_arom;
         let h_struct = h_rc_base + h_rot_adj + h_rc_arom + h_pep_ef;
 
-        let c_pred = w_af * c_struct + (1.0 - w_af) * c_rc_base;
+        let c_pred = w_af * c_struct + (1.0 - w_af) * c_rc;
         let h_pred = w_af * h_struct + (1.0 - w_af) * h_rc_base;
         let w2 = w_af * w_af;
-        let c_sigma = (w2 * sd_c_struct * sd_c_struct + (1.0 - w2) * sd_c_coil * sd_c_coil).sqrt();
-        let h_sigma = (w2 * sd_h_struct * sd_h_struct + (1.0 - w2) * sd_h_coil * sd_h_coil).sqrt();
+        let eff_sd_c_coil = sd_c_coil.max(sd_c_struct);
+        let eff_sd_h_coil = sd_h_coil.max(sd_h_struct);
+        let c_sigma =
+            (w2 * sd_c_struct * sd_c_struct + (1.0 - w2) * eff_sd_c_coil * eff_sd_c_coil).sqrt();
+        let h_sigma =
+            (w2 * sd_h_struct * sd_h_struct + (1.0 - w2) * eff_sd_h_coil * eff_sd_h_coil).sqrt();
 
         out.push(MethylShiftPrediction {
             kind,
@@ -3571,24 +3717,46 @@ pub fn predict_structure_shifts_with_db(
     }
 
     // Build effective 4-layer HomologFirewall query with structure's C_alpha trace pinned in Layer 4
-    // (requiring >= 8 CA atoms so Zhang-Skolnick sliding-window superposition is well-defined).
+    // (requiring >= 8 CA atoms so Zhang-Skolnick sliding-window superposition is well-defined; `21.W1:P1-4`).
     let mut eff_query = firewall_query.clone();
-    if eff_query.query_ca_coords.is_none() && structure.residues.len() >= 8 {
+    if eff_query.query_ca_coords.is_none() {
         eff_query.query_ca_coords = Some(structure.residues.iter().map(|r| r.ca).collect());
     }
     if eff_query
         .query_ca_coords
         .as_ref()
         .is_some_and(|ca| ca.len() < 8)
-        || db.chains.iter().any(|c| c.residues.len() < 8)
     {
-        eff_query.query_ca_coords = None;
+        return Err(format!(
+            "HomologFirewall Layer 4 (TM-score < 0.50) requires query structure with >= 8 CA atoms, got {} (fail-closed; 21.W1:P1-4)",
+            eff_query.query_ca_coords.as_ref().map_or(0, Vec::len)
+        ));
     }
     let query_seq1: Vec<u8> = structure.residues.iter().map(|r| r.aa1).collect();
 
+    // Filter out database template chains shorter than 8 CA atoms ONLY (never disable Layer 4
+    // across the rest of the database! `21.W1:P1-4`).
+    let mut l4_short_templates_skipped = 0usize;
+    let eligible_chains: Vec<TorsionCorpusChain> = db
+        .chains
+        .iter()
+        .filter(|c| {
+            if c.residues.len() < 8 {
+                l4_short_templates_skipped += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+    let eligible_db = TorsionDb {
+        chains: eligible_chains,
+    };
+
     let firewall = HomologFirewall::new(eff_query).with_max_seq_identity(cfg.max_seq_identity);
     let (retained_chains, excluded_details, exclusion_list_sha256, max_retained_seq_identity) =
-        firewall.apply(db, &query_seq1);
+        firewall.apply(&eligible_db, &query_seq1);
     if retained_chains.is_empty() {
         return Err(
             "HomologFirewall excluded all template chains; cannot fit empirical torsion surfaces"
@@ -3706,7 +3874,7 @@ pub fn predict_structure_shifts_with_db(
             let pred_ppm = w_af * struct_ppm + (1.0 - w_af) * rc_ppm;
 
             let sd_struct = surfaces.residual_sigma[a_idx][cls.index()];
-            let sd_coil = atom.coil_sigma_ppm();
+            let sd_coil = atom.coil_sigma_ppm().max(sd_struct * 1.15);
             let pred_sigma =
                 (w_af_sq * sd_struct * sd_struct + (1.0 - w_af_sq) * sd_coil * sd_coil).sqrt();
 
@@ -3766,6 +3934,7 @@ pub fn predict_structure_shifts_with_db(
         exclusion_list_sha256,
         max_retained_seq_identity,
         corpus_sha256: TorsionDb::embedded_sha256(),
+        l4_short_templates_skipped,
     })
 }
 
@@ -4049,8 +4218,8 @@ impl StructShiftPredictionReport {
             self.max_retained_seq_identity
         ));
         out.push_str(&format!(
-            "# retained_templates: {}\tcorpus_sha256: {}\n",
-            self.retained_template_count, self.corpus_sha256
+            "# retained_templates: {}\tl4_short_templates_skipped: {}\tcorpus_sha256: {}\n",
+            self.retained_template_count, self.l4_short_templates_skipped, self.corpus_sha256
         ));
         out.push_str(&format!(
             "# sample_ph: {:.2}\ttemperature_kelvin: {:.2}\tprovenance: {}\n",
