@@ -743,3 +743,134 @@ fn test_cli_mcp_config_all_clients_and_adversarial_flag_errors() {
         })
     );
 }
+
+#[test]
+fn test_s5_cli_mcp_access_mode_env_and_http_header_downgrade() {
+    let sb = CliSandbox::new("s5_mode_downgrade");
+    write_peaks(sb.workspace.join("peaks.tsv"), &[Peak::hsqc(8.22, 120.4)])
+        .expect("write peaks.tsv");
+
+    // 1. `NMR_MCP_ACCESS_MODE=read-only` downgrades `--mode read-write` subprocess on stdio (`20.W1:P3`)
+    let mut child = Command::new(nmrassign_bin())
+        .env("NMR_MCP_ACCESS_MODE", "read-only")
+        .args([
+            "mcp",
+            "--transport",
+            "stdio",
+            "--root",
+            sb.workspace.to_str().unwrap(),
+            "--mode",
+            "read-write",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn downgraded mcp stdio");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "write_curated_peak_tsv",
+                    "arguments": {
+                        "output_path": "denied_env.tsv",
+                        "source_peaks_path": "peaks.tsv"
+                    }
+                }
+            })
+        )
+        .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let resp: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(resp["result"]["isError"], true);
+    assert_eq!(
+        resp["result"]["structuredContent"]["error"]["code"],
+        ERR_READ_ONLY_DENIED
+    );
+    assert!(!sb.workspace.join("denied_env.tsv").exists());
+
+    // 2. Live HTTP `--mode read-write` subprocess honors `X-Nmr-Access-Mode: read-only` per request!
+    let token = "0123456789abcdef0123456789abcdef";
+    let mut http_child = Command::new(nmrassign_bin())
+        .env("NMR_MCP_BEARER_TOKEN", token)
+        .args([
+            "mcp",
+            "--transport",
+            "http",
+            "--bind",
+            "127.0.0.1:0",
+            "--root",
+            sb.workspace.to_str().unwrap(),
+            "--mode",
+            "read-write",
+            "--max-requests",
+            "2",
+        ])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn http rw server");
+
+    let stderr = http_child.stderr.take().unwrap();
+    let mut rdr = BufReader::new(stderr);
+    let mut addr_str = None;
+    let mut line = String::new();
+    while rdr.read_line(&mut line).unwrap() > 0 {
+        if let Some(rest) = line.trim().strip_prefix("MCP_HTTP_LISTENING http://") {
+            addr_str = Some(rest.to_string());
+            break;
+        }
+        line.clear();
+    }
+    let bind_addr = addr_str.expect("HTTP listening address");
+
+    let send_http = |hdr: &str, out_file: &str| -> Value {
+        let body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "write_curated_peak_tsv",
+                "arguments": {
+                    "output_path": out_file,
+                    "source_peaks_path": "peaks.tsv"
+                }
+            }
+        }))
+        .unwrap();
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n{hdr}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut s = TcpStream::connect(&bind_addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        s.flush().unwrap();
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).unwrap();
+        serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    };
+
+    let r1 = send_http("X-Nmr-Access-Mode: read-only\r\n", "denied_http.tsv");
+    assert_eq!(r1["result"]["isError"], true);
+    assert_eq!(
+        r1["result"]["structuredContent"]["error"]["code"],
+        ERR_READ_ONLY_DENIED
+    );
+    assert!(!sb.workspace.join("denied_http.tsv").exists());
+
+    let r2 = send_http("", "allowed_http.tsv");
+    assert_eq!(r2["result"]["isError"], false);
+    assert!(sb.workspace.join("allowed_http.tsv").exists());
+
+    let status = http_child.wait().unwrap();
+    assert!(status.success());
+}

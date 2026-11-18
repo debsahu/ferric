@@ -664,3 +664,165 @@ fn test_csp_cli_tight_binding_dilution_star_and_methyl_hmqc_e2e() {
         ubq_fit.global_kd_um,
     );
 }
+
+#[test]
+fn test_s5_exchange_state_cli_e2e_duplicate_rejection_and_abstention() {
+    use nmr_core::excited_state::{
+        ExcitedStateAbstentionKind, ExcitedStateHypothesisKind, ExcitedStateReport,
+        ExcitedStateVerdict,
+    };
+
+    let tmp = ScopedTempDir::new("exchange_state_s5");
+    let root = workspace_root();
+    let star_path = root.join("data/fixtures/bmr17769_ubiquitin_allatom.str");
+    let pdb_path = root.join("data/pdb_refs/1d3z.pdb");
+
+    // 1. `ferric exchange-state --help` succeeds and documents endpoint-only scope limits
+    let help = Command::new(nmrassign_bin())
+        .args(["exchange-state", "--help"])
+        .output()
+        .expect("run exchange-state --help");
+    assert!(help.status.success());
+    let help_stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(help_stdout.contains("ferric exchange-state"));
+    assert!(help_stdout.contains("partial-unfolding"));
+
+    // 2. Valid 2-file split E2E (`part_a.tsv` + `part_b.tsv` across 4 distinct residues) -> Committed(XxxProCisTrans)
+    let part_a = tmp.path.join("part_a.tsv");
+    let part_b = tmp.path.join("part_b.tsv");
+    fs::write(
+        &part_a,
+        "chain_id\tseq_id\tres_name\tatom\tdw_ppm\tdw_err_ppm\tsign_mode\n\
+         A\t19\tPRO\tCB\t2.40\t0.08\tsigned\n\
+         A\t19\tPRO\tCG\t-2.60\t0.08\tsigned\n\
+         A\t18\tGLU\tCA\t1.15\t0.08\tunsigned\n\
+         A\t18\tGLU\tC\t1.35\t0.08\tunsigned\n",
+    )
+    .unwrap();
+    fs::write(
+        &part_b,
+        "chain_id\tseq_id\tres_name\tatom\tdw_ppm\tdw_err_ppm\tsign_mode\n\
+         A\t20\tSER\tN\t-1.85\t0.12\tsigned\n\
+         A\t21\tASP\tN\t0.48\t0.10\tunsigned\n",
+    )
+    .unwrap();
+
+    let out_json = tmp.path.join("valid_rep.json");
+    let out_tsv = tmp.path.join("valid_rep.tsv");
+    let ok_run = Command::new(nmrassign_bin())
+        .args([
+            "exchange-state",
+            "--shifts",
+            star_path.to_str().unwrap(),
+            "--structure",
+            pdb_path.to_str().unwrap(),
+            "--exchange",
+            part_a.to_str().unwrap(),
+            "--exchange",
+            part_b.to_str().unwrap(),
+            "--exclude-pdb",
+            "1D3Z,1UBQ",
+            "--exclude-bmrb",
+            "17769,6457",
+            "--json-out",
+            out_json.to_str().unwrap(),
+            "-o",
+            out_tsv.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run valid exchange-state");
+    assert!(
+        ok_run.status.success(),
+        "valid exchange-state failed: {}",
+        String::from_utf8_lossy(&ok_run.stderr)
+    );
+    let rep: ExcitedStateReport =
+        serde_json::from_str(&fs::read_to_string(&out_json).unwrap()).unwrap();
+    assert_eq!(
+        rep.verdict,
+        ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::XxxProCisTrans)
+    );
+    assert_eq!(rep.n_distinct_residues, 4);
+    assert!(fs::read_to_string(&out_tsv)
+        .unwrap()
+        .contains("Committed(XxxProCisTrans)"));
+
+    // 3. Passing the SAME `--exchange` file twice (`21.W3:P0-1` cross-file duplicate!) MUST fail non-zero!
+    let dup_cross = Command::new(nmrassign_bin())
+        .args([
+            "exchange-state",
+            "--shifts",
+            star_path.to_str().unwrap(),
+            "--structure",
+            pdb_path.to_str().unwrap(),
+            "--exchange",
+            part_a.to_str().unwrap(),
+            "--exchange",
+            part_a.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run repeated --exchange");
+    assert!(
+        !dup_cross.status.success(),
+        "repeated --exchange file must fail closed with duplicate error"
+    );
+    assert!(
+        String::from_utf8_lossy(&dup_cross.stderr).contains("duplicate"),
+        "expected 'duplicate' in stderr, got: {}",
+        String::from_utf8_lossy(&dup_cross.stderr)
+    );
+
+    // 4. Duplicate row inside a single `--exchange` file (4 copies of S20 N = -1.85 ppm) MUST fail non-zero!
+    let dup_single = tmp.path.join("dup_s20.tsv");
+    fs::write(
+        &dup_single,
+        "chain_id\tseq_id\tres_name\tatom\tdw_ppm\tdw_err_ppm\tsign_mode\n\
+         A\t20\tSER\tN\t-1.85\t0.10\tsigned\n\
+         A\t20\tSER\tN\t-1.85\t0.10\tsigned\n\
+         A\t20\tSER\tN\t-1.85\t0.10\tsigned\n\
+         A\t20\tSER\tN\t-1.85\t0.10\tsigned\n",
+    )
+    .unwrap();
+    let dup_one = Command::new(nmrassign_bin())
+        .args([
+            "exchange-state",
+            "--shifts",
+            star_path.to_str().unwrap(),
+            "--structure",
+            pdb_path.to_str().unwrap(),
+            "--exchange",
+            dup_single.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run single-file duplicate");
+    assert!(!dup_one.status.success());
+    assert!(String::from_utf8_lossy(&dup_one.stderr).contains("duplicate"));
+
+    // 5. `< 4` distinct residues (`part_a.tsv` alone has 4 rows on only 2 residues: 18 & 19) -> abstains!
+    let abstain_json = tmp.path.join("abstain.json");
+    let two_res = Command::new(nmrassign_bin())
+        .args([
+            "exchange-state",
+            "--shifts",
+            star_path.to_str().unwrap(),
+            "--structure",
+            pdb_path.to_str().unwrap(),
+            "--exchange",
+            part_a.to_str().unwrap(),
+            "--json-out",
+            abstain_json.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run 2-residue exchange-state");
+    assert!(two_res.status.success());
+    let rep_abs: ExcitedStateReport =
+        serde_json::from_str(&fs::read_to_string(&abstain_json).unwrap()).unwrap();
+    assert_eq!(
+        rep_abs.verdict,
+        ExcitedStateVerdict::AmbiguousOrUnmodeledState
+    );
+    assert_eq!(
+        rep_abs.abstention_kind,
+        Some(ExcitedStateAbstentionKind::InsufficientDistinctResidues)
+    );
+}

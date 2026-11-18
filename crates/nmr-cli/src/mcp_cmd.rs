@@ -158,6 +158,8 @@ Options:
 
 Environment:
   NMR_MCP_BEARER_TOKEN           Preferred HTTP Bearer secret (>= 32 chars; avoids ps-visible --token argv).
+  NMR_MCP_ACCESS_MODE            Optional monotonic access ceiling ('read-only' downgrades a --read-write
+                                 server to read-only; never escalates a --read-only server).
 "
 }
 
@@ -258,6 +260,17 @@ pub fn run_mcp_cli(args: &[String]) -> Result<(), String> {
             }
         }
         i += 1;
+    }
+
+    if let Ok(env_mode_raw) = env::var("NMR_MCP_ACCESS_MODE") {
+        let trimmed = env_mode_raw.trim();
+        if !trimmed.is_empty() {
+            let env_mode = parse_access_mode(trimmed)
+                .map_err(|e| format!("invalid NMR_MCP_ACCESS_MODE: {e}"))?;
+            if env_mode == McpAccessMode::ReadOnly {
+                mode = McpAccessMode::ReadOnly;
+            }
+        }
     }
 
     if roots.is_empty() {
