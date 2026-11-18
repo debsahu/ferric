@@ -62,6 +62,7 @@ pub mod solver;
 pub mod spectrum;
 pub mod spinsystems;
 pub mod stereospec;
+pub mod struct_shifts;
 pub mod structure;
 pub mod topology;
 pub mod torsion_db;

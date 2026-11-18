@@ -16,6 +16,7 @@ pub mod mcp_cmd;
 pub mod metabolomics_cmd;
 pub mod methyl_cmd;
 pub mod nmr1d_cmd;
+pub mod predict_shifts_cmd;
 pub mod relax_cmd;
 
 use std::collections::BTreeMap;
@@ -216,6 +217,7 @@ fn usage() -> String {
        ferric propensity      --shifts <assigned.str|assigned.nef> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]\n\
        ferric torsions        --shifts <assigned.str|assigned.nef> -o <out.tsv|out.nef|out.json> [--include-chi1] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>]\n\
        ferric af-validate     --structure <model.cif|model.pdb> [--pae <pae.json>] --shifts <assigned.str|assigned.nef> [--s2 <modelfree.tsv>] [--fetch-uniprot <id> --cache-dir <dir>] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [-o <out.json|out.tsv|report.html>]\n\
+       ferric predict-shifts  --structure <model.cif|model.pdb> [--ph 6.5] [--temp-k 298.15] [--methyl-ilvmat] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>] [-o <out.str|out.nef|out.tsv|out.json>]\n\
        ferric score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [--no-auto-offset] [-v]\n\
        ferric simulate        --star <ref.str> --out <peaks.tsv> [--realistic] [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
        ferric pick            (--hsqc <path> [--triple EXP=path ...] | --fid <dir> [--exp <EXP>] | --fid-hsqc <dir> [--fid-triple EXP=dir ...]) --out <peaks.tsv> [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
@@ -8334,6 +8336,7 @@ fn main() {
         "propensity" => cmd_propensity(&args[1..]),
         "torsions" => cmd_torsions(&args[1..]),
         "af-validate" => af_validate_cmd::run_af_validate_cli(&args[1..]),
+        "predict-shifts" => predict_shifts_cmd::run_predict_shifts_cli(&args[1..]),
         "score" => cmd_score(&args[1..]),
         "pick" => cmd_pick(&args[1..]),
         "priors" => cmd_priors(&args[1..]),
