@@ -1842,6 +1842,835 @@ pub fn pick_triple_3d_two_pass(
     peaks
 }
 
+// ============================================================================
+// Interactive 3D Cube / Orthogonal Plane Peak Picker & Sub-Voxel Curation Helpers
+// ============================================================================
+
+/// General 3D `(F3, F2, F1)` peak picked directly on a volumetric [`Spectrum3D`] cube
+/// (`f3_ppm` along `axis_x`, `f2_ppm` along `axis_y`, `f1_ppm` along `axis_z`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CubePeak3D {
+    pub exp: String,
+    pub f3_ppm: f64,
+    pub f2_ppm: f64,
+    pub f1_ppm: f64,
+    pub sign: i32,
+    pub height: f64,
+    pub volume: f64,
+    pub snr: f64,
+    pub label: String,
+}
+
+impl CubePeak3D {
+    /// Convert to a core [`Peak`] preserving physical nucleus channels (`1H`, `15N`, `13C`, `1H_indir`).
+    pub fn to_core_peak(&self, nuc_x: &str, nuc_y: &str, nuc_z: &str) -> Peak {
+        let abs_h = self.height.abs();
+        let abs_v = self.volume.abs();
+        if nuc_x == "1H" && nuc_y == "15N" && nuc_z == "1H" {
+            Peak {
+                exp: self.exp.clone(),
+                h: self.f3_ppm,
+                n: self.f2_ppm,
+                c: Some(self.f1_ppm),
+                sign: self.sign,
+                height: Some(abs_h),
+                volume: Some(abs_v),
+                h2: Some(self.f1_ppm),
+            }
+        } else if nuc_x == "1H" && nuc_z == "15N" {
+            let is_h_y = nuc_y == "1H";
+            Peak {
+                exp: self.exp.clone(),
+                h: self.f3_ppm,
+                n: self.f1_ppm,
+                c: Some(self.f2_ppm),
+                sign: self.sign,
+                height: Some(abs_h),
+                volume: Some(abs_v),
+                h2: is_h_y.then_some(self.f2_ppm),
+            }
+        } else {
+            Peak {
+                exp: self.exp.clone(),
+                h: self.f3_ppm,
+                n: self.f2_ppm,
+                c: Some(self.f1_ppm),
+                sign: self.sign,
+                height: Some(abs_h),
+                volume: Some(abs_v),
+                h2: (nuc_x == "1H" && nuc_z == "1H").then_some(self.f1_ppm),
+            }
+        }
+    }
+}
+
+/// Configuration for [`pick_cube_3d_ridge_safe`] and [`pick_cube_3d_plane_ridge_safe`].
+#[derive(Clone, Debug)]
+pub struct Cube3dPickerConfig {
+    /// Global outlier-trimmed MAD signal-to-noise multiplier (default `5.5`).
+    pub snr_threshold: f32,
+    /// Optional explicit contour-floor intensity cutoff (`0.0` = rely solely on `snr_threshold * noise`).
+    pub min_abs_intensity: f32,
+    /// Include negative local minima (e.g. `HNCACB` `-CB` or aliased resonances).
+    pub allow_negative: bool,
+    /// Exclude homonuclear diagonal self-peaks (`|ppm_a - ppm_b| <= diagonal_tol_ppm`) when two axes
+    /// observe the same nucleus (e.g. `1H` on `F3` and `F1` in `H(CCO)NH` or `15N-NOESY`).
+    pub exclude_diagonal: bool,
+    /// Chemical-shift half-tolerance (ppm) for homonuclear diagonal exclusion (default `0.05`).
+    pub diagonal_tol_ppm: f64,
+    /// Exclude the residual direct-`1H` water slab (`|f3_ppm - water_ppm| <= water_half_width_ppm`)
+    /// when `axis_x` is `${}^{1}\text{H}$ and spans across water.
+    pub exclude_water_band: bool,
+    /// Explicit water chemical shift in ppm (`None` = auto-detect on direct `1H` projection, fallback `4.70`).
+    pub water_ppm: Option<f64>,
+    /// Half-width (ppm) around `water_ppm` excluded on the direct `${}^{1}\text{H}$ axis (default `0.06`).
+    pub water_half_width_ppm: f64,
+    /// Multiplier on local 1D fiber MAD for indirect $t_1$/$t_2$ ridge rejection (default `5.5`).
+    pub ridge_snr: f32,
+    /// Minimum fraction of 1D fiber maximum for FT truncation sinc-ripple rejection (default `0.025`).
+    pub sinc_frac: f32,
+    /// Upper bound on returned peaks after sorting by `|height|` (default `4_000`).
+    pub max_peaks: usize,
+}
+
+impl Default for Cube3dPickerConfig {
+    fn default() -> Self {
+        Self {
+            snr_threshold: 5.5,
+            min_abs_intensity: 0.0,
+            allow_negative: true,
+            exclude_diagonal: true,
+            diagonal_tol_ppm: 0.05,
+            exclude_water_band: true,
+            water_ppm: None,
+            water_half_width_ppm: 0.06,
+            ridge_snr: 5.5,
+            sinc_frac: 0.025,
+            max_peaks: 4_000,
+        }
+    }
+}
+
+fn infer_cube_axis_iso(axis: &AxisPpm, ref_h_mhz: Option<f64>) -> &'static str {
+    if let Some(hmhz) = ref_h_mhz.filter(|&m| m > 50.0) {
+        if axis.obs_mhz > 10.0 {
+            let r = axis.obs_mhz / hmhz;
+            if (r - 1.0).abs() < 0.04 {
+                return "1H";
+            }
+            if (r - 0.10133).abs() < 0.02 {
+                return "15N";
+            }
+            if (r - 0.25145).abs() < 0.025 {
+                return "13C";
+            }
+            if (r - 0.4048).abs() < 0.025 {
+                return "31P";
+            }
+            if (r - 0.9408).abs() < 0.025 {
+                return "19F";
+            }
+        }
+    }
+    let up = axis
+        .label
+        .trim()
+        .trim_matches(|c: char| c == '<' || c == '>' || c == '"' || c == '\'')
+        .trim()
+        .to_ascii_uppercase();
+    if up.contains('N') {
+        "15N"
+    } else if up.contains('C') {
+        "13C"
+    } else if up.contains('H') || (axis.max_ppm() <= 19.0 && axis.min_ppm() >= -6.0) {
+        "1H"
+    } else if axis.min_ppm() >= 88.0 && axis.max_ppm() <= 152.0 {
+        "15N"
+    } else {
+        "13C"
+    }
+}
+
+fn cube_axis_nuclei(spec: &Spectrum3D) -> (&'static str, &'static str, &'static str) {
+    let x_raw = infer_cube_axis_iso(&spec.axis_x, None);
+    let ref_h = if x_raw == "1H" && spec.axis_x.obs_mhz > 50.0 {
+        Some(spec.axis_x.obs_mhz)
+    } else {
+        None
+    };
+    let nx = infer_cube_axis_iso(&spec.axis_x, ref_h);
+    let ny = infer_cube_axis_iso(&spec.axis_y, ref_h);
+    let nz = infer_cube_axis_iso(&spec.axis_z, ref_h);
+    (nx, ny, nz)
+}
+
+fn detect_direct_water_band(
+    spec: &Spectrum3D,
+    cfg: &Cube3dPickerConfig,
+    nuc_x: &str,
+) -> Option<(f64, f64)> {
+    if !cfg.exclude_water_band || nuc_x != "1H" {
+        return None;
+    }
+    let x_lo = spec.axis_x.min_ppm();
+    let x_hi = spec.axis_x.max_ppm();
+    let spans_h2o = x_lo < 4.55 && x_hi > 4.85;
+    let spans_dmso = x_lo < 3.18 && x_hi > 3.50;
+    if !spans_h2o && !spans_dmso && cfg.water_ppm.is_none() {
+        return None;
+    }
+    let w_ppm = if let Some(explicit) = cfg.water_ppm {
+        explicit
+    } else {
+        let nx = spec.nx();
+        let total = spec.ny().saturating_mul(spec.nz());
+        let stride = (total / 256).max(1);
+        let mut prof = vec![0.0_f64; nx];
+        for r_idx in (0..total).step_by(stride) {
+            let base = r_idx * nx;
+            if base + nx <= spec.data.len() {
+                for (dst, &v) in prof.iter_mut().zip(&spec.data[base..base + nx]) {
+                    if v.is_finite() {
+                        *dst += (v as f64).abs();
+                    }
+                }
+            }
+        }
+        crate::water::detect_water_ppm(&spec.axis_x, &prof, None)
+    };
+    let hw = cfg.water_half_width_ppm.abs().max(0.015);
+    if w_ppm >= x_lo - hw && w_ppm <= x_hi + hw {
+        Some((w_ppm - hw, w_ppm + hw))
+    } else {
+        None
+    }
+}
+
+fn is_homonuclear_diagonal_hit(
+    f3_ppm: f64,
+    f2_ppm: f64,
+    f1_ppm: f64,
+    nucs: (&str, &str, &str),
+    tol_ppm: f64,
+) -> bool {
+    let tol_x_y = if nucs.0 == "1H" {
+        tol_ppm
+    } else {
+        tol_ppm.max(0.30)
+    };
+    let tol_x_z = if nucs.0 == "1H" {
+        tol_ppm
+    } else {
+        tol_ppm.max(0.30)
+    };
+    let tol_y_z = if nucs.1 == "1H" {
+        tol_ppm
+    } else {
+        tol_ppm.max(0.30)
+    };
+    (nucs.0 == nucs.1 && (f3_ppm - f2_ppm).abs() <= tol_x_y)
+        || (nucs.0 == nucs.2 && (f3_ppm - f1_ppm).abs() <= tol_x_z)
+        || (nucs.1 == nucs.2 && (f2_ppm - f1_ppm).abs() <= tol_y_z)
+}
+
+/// Trilinearly interpolate voxel amplitude in `spec` at `(f3_ppm, f2_ppm, f1_ppm)`.
+pub fn sample_cube_3d_trilinear(spec: &Spectrum3D, f3_ppm: f64, f2_ppm: f64, f1_ppm: f64) -> f64 {
+    let (nx, ny, nz) = (spec.nx(), spec.ny(), spec.nz());
+    if nx == 0 || ny == 0 || nz == 0 || spec.data.len() < nx.saturating_mul(ny).saturating_mul(nz) {
+        return 0.0;
+    }
+    let xf = spec.axis_x.ppm_to_index(f3_ppm).clamp(0.0, (nx - 1) as f64);
+    let yf = spec.axis_y.ppm_to_index(f2_ppm).clamp(0.0, (ny - 1) as f64);
+    let zf = spec.axis_z.ppm_to_index(f1_ppm).clamp(0.0, (nz - 1) as f64);
+
+    let x0 = (xf.floor() as usize).min(nx - 1);
+    let x1 = (x0 + 1).min(nx - 1);
+    let y0 = (yf.floor() as usize).min(ny - 1);
+    let y1 = (y0 + 1).min(ny - 1);
+    let z0 = (zf.floor() as usize).min(nz - 1);
+    let z1 = (z0 + 1).min(nz - 1);
+
+    let tx = (xf - x0 as f64) as f32;
+    let ty = (yf - y0 as f64) as f32;
+    let tz = (zf - z0 as f64) as f32;
+
+    let lerp = |a: f32, b: f32, t: f32| a * (1.0 - t) + b * t;
+    let c00 = lerp(spec.get(x0, y0, z0), spec.get(x1, y0, z0), tx);
+    let c10 = lerp(spec.get(x0, y1, z0), spec.get(x1, y1, z0), tx);
+    let c01 = lerp(spec.get(x0, y0, z1), spec.get(x1, y0, z1), tx);
+    let c11 = lerp(spec.get(x0, y1, z1), spec.get(x1, y1, z1), tx);
+    let c0 = lerp(c00, c10, ty);
+    let c1 = lerp(c01, c11, ty);
+    lerp(c0, c1, tz) as f64
+}
+
+/// Refine `(f3_ppm, f2_ppm, f1_ppm)` around `±search_vox` (`[rx, ry, rz]`) to the local 3D voxel
+/// extremum + 3-point parabolic/log-Gaussian sub-voxel center, returning
+/// `(fitted_f3, fitted_f2, fitted_f1, signed_height, volume, sign)`.
+pub fn snap_cube_3d_extremum(
+    spec: &Spectrum3D,
+    f3_ppm: f64,
+    f2_ppm: f64,
+    f1_ppm: f64,
+    search_vox: [usize; 3],
+    allow_negative: bool,
+) -> (f64, f64, f64, f64, f64, i32) {
+    let (nx, ny, nz) = (spec.nx(), spec.ny(), spec.nz());
+    if nx < 3 || ny < 3 || nz < 3 || spec.data.len() < nx.saturating_mul(ny).saturating_mul(nz) {
+        let amp = sample_cube_3d_trilinear(spec, f3_ppm, f2_ppm, f1_ppm);
+        let sgn = if amp < 0.0 && allow_negative { -1 } else { 1 };
+        return (f3_ppm, f2_ppm, f1_ppm, amp, amp.abs(), sgn);
+    }
+
+    let cx = spec
+        .axis_x
+        .ppm_to_index(f3_ppm)
+        .round()
+        .clamp(1.0, (nx - 2) as f64) as isize;
+    let cy = spec
+        .axis_y
+        .ppm_to_index(f2_ppm)
+        .round()
+        .clamp(1.0, (ny - 2) as f64) as isize;
+    let cz = spec
+        .axis_z
+        .ppm_to_index(f1_ppm)
+        .round()
+        .clamp(1.0, (nz - 2) as f64) as isize;
+
+    let rx = (search_vox[0].min(8)) as isize;
+    let ry = (search_vox[1].min(8)) as isize;
+    let rz = (search_vox[2].min(8)) as isize;
+
+    let mut best_ix = cx as usize;
+    let mut best_iy = cy as usize;
+    let mut best_iz = cz as usize;
+    let mut best_score = f32::NEG_INFINITY;
+
+    for dz in -rz..=rz {
+        let iz = (cz + dz).clamp(1, (nz - 2) as isize) as usize;
+        for dy in -ry..=ry {
+            let iy = (cy + dy).clamp(1, (ny - 2) as isize) as usize;
+            for dx in -rx..=rx {
+                let ix = (cx + dx).clamp(1, (nx - 2) as isize) as usize;
+                let v = spec.get(ix, iy, iz);
+                let sc = if allow_negative { v.abs() } else { v };
+                if sc > best_score {
+                    best_score = sc;
+                    best_ix = ix;
+                    best_iy = iy;
+                    best_iz = iz;
+                }
+            }
+        }
+    }
+
+    let v0 = spec.get(best_ix, best_iy, best_iz);
+    let sign = if v0 < 0.0 && allow_negative { -1 } else { 1 };
+    let dx = if search_vox[0] > 0 {
+        subvoxel_offset(
+            spec.get(best_ix - 1, best_iy, best_iz),
+            v0,
+            spec.get(best_ix + 1, best_iy, best_iz),
+        )
+    } else {
+        0.0
+    };
+    let dy = if search_vox[1] > 0 {
+        subvoxel_offset(
+            spec.get(best_ix, best_iy - 1, best_iz),
+            v0,
+            spec.get(best_ix, best_iy + 1, best_iz),
+        )
+    } else {
+        0.0
+    };
+    let dz = if search_vox[2] > 0 {
+        subvoxel_offset(
+            spec.get(best_ix, best_iy, best_iz - 1),
+            v0,
+            spec.get(best_ix, best_iy, best_iz + 1),
+        )
+    } else {
+        0.0
+    };
+
+    let out_f3 = if search_vox[0] > 0 {
+        spec.axis_x.index_to_ppm(best_ix as f64 + dx)
+    } else {
+        f3_ppm
+    };
+    let out_f2 = if search_vox[1] > 0 {
+        spec.axis_y.index_to_ppm(best_iy as f64 + dy)
+    } else {
+        f2_ppm
+    };
+    let out_f1 = if search_vox[2] > 0 {
+        spec.axis_z.index_to_ppm(best_iz as f64 + dz)
+    } else {
+        f1_ppm
+    };
+
+    let mut vol = 0.0_f64;
+    for wz in -1isize..=1 {
+        for wy in -1isize..=1 {
+            for wx in -1isize..=1 {
+                let sv = spec.get(
+                    (best_ix as isize + wx) as usize,
+                    (best_iy as isize + wy) as usize,
+                    (best_iz as isize + wz) as usize,
+                );
+                if sv.signum() == v0.signum() {
+                    vol += (sv.abs()) as f64;
+                }
+            }
+        }
+    }
+
+    (out_f3, out_f2, out_f1, v0 as f64, vol, sign)
+}
+
+/// Pick true 3D `(F3, F2, F1)` local extrema across a [`Spectrum3D`] cube with outlier-trimmed MAD
+/// noise estimation, local 1D fiber ridge & FT sinc-ripple suppression, direct `${}^{1}\text{H}$
+/// water-band exclusion, homonuclear diagonal exclusion, and 3-point sub-voxel interpolation,
+/// sorted descending by `|height|`.
+pub fn pick_cube_3d_ridge_safe(spec: &Spectrum3D, cfg: &Cube3dPickerConfig) -> Vec<CubePeak3D> {
+    let (nx, ny, nz) = (spec.nx(), spec.ny(), spec.nz());
+    let total_len = nx.saturating_mul(ny).saturating_mul(nz);
+    if nx < 3 || ny < 3 || nz < 3 || spec.data.len() < total_len {
+        return Vec::new();
+    }
+
+    let noise = estimate_noise_mad(&spec.data[..total_len]).max(1e-12);
+    let global_thr = (cfg.snr_threshold.max(1.5) * noise).max(cfg.min_abs_intensity.max(0.0));
+    let nucs = cube_axis_nuclei(spec);
+    let water_band = detect_direct_water_band(spec, cfg, nucs.0);
+    let step_x = spec.axis_x.step_ppm.abs();
+
+    let mut active_x = vec![false; nx];
+    for (ix, slot) in active_x.iter_mut().enumerate().take(nx - 1).skip(1) {
+        if let Some((w_lo, w_hi)) = water_band {
+            let px = spec.axis_x.index_to_ppm(ix as f64);
+            if px >= w_lo - 0.5 * step_x && px <= w_hi + 0.5 * step_x {
+                continue;
+            }
+        }
+        *slot = true;
+    }
+
+    let spec_max_abs = spec.data[..total_len]
+        .iter()
+        .step_by((total_len / 65_536).max(1))
+        .fold(
+            0.0_f32,
+            |m, &v| if v.is_finite() { m.max(v.abs()) } else { m },
+        );
+    let high_dr = spec_max_abs > 32.0 * noise;
+
+    let mut z_fiber_stats: BTreeMap<(usize, usize), (f32, f32)> = BTreeMap::new();
+    let mut y_fiber_stats: BTreeMap<(usize, usize), (f32, f32)> = BTreeMap::new();
+    let mut x_fiber_stats: BTreeMap<(usize, usize), (f32, f32)> = BTreeMap::new();
+    let mut fiber_buf = Vec::with_capacity(nx.max(ny).max(nz));
+    let mut scratch = Vec::with_capacity(nx.max(ny).max(nz));
+
+    let plane_stride = ny * nx;
+    let mut raw_peaks: Vec<CubePeak3D> = Vec::new();
+
+    for iz in 1..nz - 1 {
+        let z_base = iz * plane_stride;
+        for iy in 1..ny - 1 {
+            let row_base = z_base + iy * nx;
+            let row = &spec.data[row_base..row_base + nx];
+            for ix in 1..nx - 1 {
+                if !active_x[ix] {
+                    continue;
+                }
+                let raw_v = row[ix];
+                if !raw_v.is_finite()
+                    || raw_v.abs() < global_thr
+                    || (!cfg.allow_negative && raw_v < 0.0)
+                {
+                    continue;
+                }
+
+                // 26-neighbor 3D local extremum test (deterministic index tie-break on flat plateaus)
+                let pos_mode = raw_v >= 0.0;
+                let mut is_ext = true;
+                'nbr: for dz in -1isize..=1 {
+                    let nz_i = (iz as isize + dz) as usize;
+                    let nb_z = nz_i * plane_stride;
+                    for dy in -1isize..=1 {
+                        let ny_i = (iy as isize + dy) as usize;
+                        let nb_row = nb_z + ny_i * nx;
+                        for dx in -1isize..=1 {
+                            if dx == 0 && dy == 0 && dz == 0 {
+                                continue;
+                            }
+                            let nx_i = (ix as isize + dx) as usize;
+                            let nv = spec.data[nb_row + nx_i];
+                            let strictly_worse = if pos_mode { nv > raw_v } else { nv < raw_v };
+                            let tie_earlier = nv == raw_v && (dz, dy, dx) < (0, 0, 0);
+                            if strictly_worse || tie_earlier {
+                                is_ext = false;
+                                break 'nbr;
+                            }
+                        }
+                    }
+                }
+                if !is_ext {
+                    continue;
+                }
+
+                if high_dr {
+                    let (z_med, z_thr) = *z_fiber_stats.entry((ix, iy)).or_insert_with(|| {
+                        fiber_buf.clear();
+                        for gz in 0..nz {
+                            fiber_buf.push(spec.data[gz * plane_stride + iy * nx + ix]);
+                        }
+                        let (fmed, fmad, fmax) =
+                            slice_trimmed_median_mad_and_max(&fiber_buf, &mut scratch, noise);
+                        let dev_max = (fmax - fmed.abs()).max(0.0);
+                        (
+                            fmed,
+                            global_thr
+                                .max(cfg.ridge_snr * fmad)
+                                .max((cfg.sinc_frac * 0.5) * dev_max),
+                        )
+                    });
+                    if (raw_v - z_med).abs() < z_thr {
+                        continue;
+                    }
+
+                    let (y_med, y_thr) = *y_fiber_stats.entry((ix, iz)).or_insert_with(|| {
+                        fiber_buf.clear();
+                        for gy in 0..ny {
+                            fiber_buf.push(spec.data[z_base + gy * nx + ix]);
+                        }
+                        let (fmed, fmad, fmax) =
+                            slice_trimmed_median_mad_and_max(&fiber_buf, &mut scratch, noise);
+                        let dev_max = (fmax - fmed.abs()).max(0.0);
+                        (
+                            fmed,
+                            global_thr
+                                .max(cfg.ridge_snr * fmad)
+                                .max((cfg.sinc_frac * 0.5) * dev_max),
+                        )
+                    });
+                    if (raw_v - y_med).abs() < y_thr {
+                        continue;
+                    }
+
+                    let (x_med, x_thr) = *x_fiber_stats.entry((iy, iz)).or_insert_with(|| {
+                        fiber_buf.clear();
+                        fiber_buf.extend_from_slice(row);
+                        let (fmed, fmad, fmax) =
+                            slice_trimmed_median_mad_and_max(&fiber_buf, &mut scratch, noise);
+                        let dev_max = (fmax - fmed.abs()).max(0.0);
+                        (
+                            fmed,
+                            global_thr
+                                .max(cfg.ridge_snr * fmad)
+                                .max((cfg.sinc_frac * 0.5) * dev_max),
+                        )
+                    });
+                    if (raw_v - x_med).abs() < x_thr {
+                        continue;
+                    }
+                }
+
+                let dx = subvoxel_offset(row[ix - 1], raw_v, row[ix + 1]);
+                let dy = subvoxel_offset(
+                    spec.data[z_base + (iy - 1) * nx + ix],
+                    raw_v,
+                    spec.data[z_base + (iy + 1) * nx + ix],
+                );
+                let dz = subvoxel_offset(
+                    spec.data[(iz - 1) * plane_stride + iy * nx + ix],
+                    raw_v,
+                    spec.data[(iz + 1) * plane_stride + iy * nx + ix],
+                );
+
+                let f3_ppm = spec.axis_x.index_to_ppm(ix as f64 + dx);
+                let f2_ppm = spec.axis_y.index_to_ppm(iy as f64 + dy);
+                let f1_ppm = spec.axis_z.index_to_ppm(iz as f64 + dz);
+
+                if let Some((w_lo, w_hi)) = water_band {
+                    if (w_lo..=w_hi).contains(&f3_ppm) {
+                        continue;
+                    }
+                }
+                if cfg.exclude_diagonal
+                    && is_homonuclear_diagonal_hit(
+                        f3_ppm,
+                        f2_ppm,
+                        f1_ppm,
+                        nucs,
+                        cfg.diagonal_tol_ppm,
+                    )
+                {
+                    continue;
+                }
+
+                let mut vol = 0.0_f64;
+                for wz in -1isize..=1 {
+                    for wy in -1isize..=1 {
+                        for wx in -1isize..=1 {
+                            let sv = spec.get(
+                                (ix as isize + wx) as usize,
+                                (iy as isize + wy) as usize,
+                                (iz as isize + wz) as usize,
+                            );
+                            if sv.signum() == raw_v.signum() {
+                                vol += (sv.abs()) as f64;
+                            }
+                        }
+                    }
+                }
+
+                raw_peaks.push(CubePeak3D {
+                    exp: spec.exp.clone(),
+                    f3_ppm,
+                    f2_ppm,
+                    f1_ppm,
+                    sign: if raw_v < 0.0 { -1 } else { 1 },
+                    height: raw_v as f64,
+                    volume: vol,
+                    snr: (raw_v.abs() / noise) as f64,
+                    label: String::new(),
+                });
+            }
+        }
+    }
+
+    raw_peaks.sort_by(|a, b| b.height.abs().total_cmp(&a.height.abs()));
+
+    // Suppress close 1D indirect/direct FT sinc ripples around high-SNR parent peaks
+    if high_dr && raw_peaks.len() > 1 {
+        let min_parent = (35.0 * noise) as f64;
+        let tol_x = (spec.axis_x.step_ppm.abs() * 1.8).max(0.02);
+        let tol_y = (spec.axis_y.step_ppm.abs() * 1.8).max(0.12);
+        let tol_z = (spec.axis_z.step_ppm.abs() * 1.8).max(0.06);
+        let base_sinc = cfg.sinc_frac as f64;
+        let mut keep = vec![true; raw_peaks.len()];
+        for i in 1..raw_peaks.len() {
+            let pi = &raw_peaks[i];
+            let hi = pi.height.abs();
+            for pj in raw_peaks.iter().take(i) {
+                let hj = pj.height.abs();
+                if hj < min_parent || hj <= hi {
+                    break;
+                }
+                let dx = (pi.f3_ppm - pj.f3_ppm).abs();
+                let dy = (pi.f2_ppm - pj.f2_ppm).abs();
+                let dz = (pi.f1_ppm - pj.f1_ppm).abs();
+                if dx <= tol_x && dy <= tol_y && dz > tol_z && dz <= tol_z * 14.0 {
+                    let env = 0.5 * base_sinc + 0.14 / (1.0 + (dz / (tol_z * 3.0)).powi(2));
+                    if hi < hj * env {
+                        keep[i] = false;
+                        break;
+                    }
+                }
+                if dx <= tol_x && dz <= tol_z && dy > tol_y && dy <= tol_y * 14.0 {
+                    let env = 0.5 * base_sinc + 0.14 / (1.0 + (dy / (tol_y * 3.0)).powi(2));
+                    if hi < hj * env {
+                        keep[i] = false;
+                        break;
+                    }
+                }
+            }
+        }
+        let mut filtered = Vec::with_capacity(raw_peaks.len());
+        for (pk, k) in raw_peaks.into_iter().zip(keep) {
+            if k {
+                filtered.push(pk);
+            }
+        }
+        raw_peaks = filtered;
+    }
+
+    if raw_peaks.len() > cfg.max_peaks.max(1) {
+        raw_peaks.truncate(cfg.max_peaks.max(1));
+    }
+    raw_peaks
+}
+
+/// Pick ridge-safe 2D cross-peaks on a single orthogonal plane of `spec`
+/// (`ortho_axis`: `0` = fixed `F3/axis_x`, `1` = fixed `F2/axis_y`, `2` = fixed `F1/axis_z`)
+/// at `plane_idx`, with 3-point sub-voxel interpolation, sorted descending by `|height|`.
+pub fn pick_cube_3d_plane_ridge_safe(
+    spec: &Spectrum3D,
+    ortho_axis: usize,
+    plane_idx: usize,
+    cfg: &Cube3dPickerConfig,
+) -> Vec<CubePeak3D> {
+    let (nx, ny, nz) = (spec.nx(), spec.ny(), spec.nz());
+    let total_len = nx.saturating_mul(ny).saturating_mul(nz);
+    if nx < 3 || ny < 3 || nz < 3 || spec.data.len() < total_len {
+        return Vec::new();
+    }
+
+    let (nu, nv, n_ortho) = match ortho_axis {
+        0 => (ny, nz, nx),
+        1 => (nx, nz, ny),
+        _ => (nx, ny, nz),
+    };
+    if nu < 3 || nv < 3 || n_ortho == 0 {
+        return Vec::new();
+    }
+    let p_idx = plane_idx.min(n_ortho - 1);
+
+    let voxel_at = |u: usize, v: usize, w: usize| -> f32 {
+        match ortho_axis {
+            0 => spec.get(w, u, v),
+            1 => spec.get(u, w, v),
+            _ => spec.get(u, v, w),
+        }
+    };
+
+    let mut plane_vals = Vec::with_capacity(nu * nv);
+    for iv in 0..nv {
+        for iu in 0..nu {
+            plane_vals.push(voxel_at(iu, iv, p_idx));
+        }
+    }
+
+    let noise = estimate_noise_mad(&plane_vals)
+        .max(estimate_noise_mad(&spec.data[..total_len]) * 0.5)
+        .max(1e-12);
+    let base_thr = (cfg.snr_threshold.max(1.5) * noise).max(cfg.min_abs_intensity.max(0.0));
+    let nucs = cube_axis_nuclei(spec);
+    let water_band = detect_direct_water_band(spec, cfg, nucs.0);
+
+    let mut scratch = Vec::with_capacity(nu.max(nv));
+    let mut slice_buf = Vec::with_capacity(nu.max(nv));
+    let plane_max = plane_vals.iter().fold(
+        0.0_f32,
+        |m, &v| if v.is_finite() { m.max(v.abs()) } else { m },
+    );
+    let high_dr = plane_max > 30.0 * noise;
+
+    let mut col_thr = vec![base_thr; nu];
+    let mut row_thr = vec![base_thr; nv];
+    if high_dr {
+        for (iu, ct) in col_thr.iter_mut().enumerate() {
+            slice_buf.clear();
+            for iv in 0..nv {
+                slice_buf.push(plane_vals[iv * nu + iu]);
+            }
+            let (cmad, cmax) = slice_trimmed_mad_and_max(&slice_buf, &mut scratch, noise);
+            *ct = base_thr.max(cfg.ridge_snr * cmad).max(cfg.sinc_frac * cmax);
+        }
+        for (iv, rt) in row_thr.iter_mut().enumerate() {
+            slice_buf.clear();
+            slice_buf.extend_from_slice(&plane_vals[iv * nu..(iv + 1) * nu]);
+            let (rmad, rmax) = slice_trimmed_mad_and_max(&slice_buf, &mut scratch, noise);
+            *rt = base_thr.max(cfg.ridge_snr * rmad).max(cfg.sinc_frac * rmax);
+        }
+    }
+
+    let mut out = Vec::new();
+    for iv in 1..nv - 1 {
+        for iu in 1..nu - 1 {
+            let v0 = plane_vals[iv * nu + iu];
+            let loc_thr = col_thr[iu].max(row_thr[iv]);
+            if !v0.is_finite() || v0.abs() < loc_thr || (!cfg.allow_negative && v0 < 0.0) {
+                continue;
+            }
+            let pos_mode = v0 >= 0.0;
+            let mut is_ext = true;
+            'nbr2: for dv in -1isize..=1 {
+                for du in -1isize..=1 {
+                    if du == 0 && dv == 0 {
+                        continue;
+                    }
+                    let nv_val =
+                        plane_vals[(iv as isize + dv) as usize * nu + (iu as isize + du) as usize];
+                    let worse = if pos_mode { nv_val > v0 } else { nv_val < v0 };
+                    let tie = nv_val == v0 && (dv, du) < (0, 0);
+                    if worse || tie {
+                        is_ext = false;
+                        break 'nbr2;
+                    }
+                }
+            }
+            if !is_ext {
+                continue;
+            }
+
+            let du = subvoxel_offset(
+                plane_vals[iv * nu + (iu - 1)],
+                v0,
+                plane_vals[iv * nu + (iu + 1)],
+            );
+            let dv = subvoxel_offset(
+                plane_vals[(iv - 1) * nu + iu],
+                v0,
+                plane_vals[(iv + 1) * nu + iu],
+            );
+            let dw = if p_idx >= 1 && p_idx + 1 < n_ortho {
+                let wm = voxel_at(iu, iv, p_idx - 1);
+                let wp = voxel_at(iu, iv, p_idx + 1);
+                if (pos_mode && v0 >= wm && v0 >= wp) || (!pos_mode && v0 <= wm && v0 <= wp) {
+                    subvoxel_offset(wm, v0, wp)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            let (ix_f, iy_f, iz_f) = match ortho_axis {
+                0 => (p_idx as f64 + dw, iu as f64 + du, iv as f64 + dv),
+                1 => (iu as f64 + du, p_idx as f64 + dw, iv as f64 + dv),
+                _ => (iu as f64 + du, iv as f64 + dv, p_idx as f64 + dw),
+            };
+            let f3_ppm = spec.axis_x.index_to_ppm(ix_f);
+            let f2_ppm = spec.axis_y.index_to_ppm(iy_f);
+            let f1_ppm = spec.axis_z.index_to_ppm(iz_f);
+
+            if let Some((w_lo, w_hi)) = water_band {
+                if (w_lo..=w_hi).contains(&f3_ppm) {
+                    continue;
+                }
+            }
+            if cfg.exclude_diagonal
+                && is_homonuclear_diagonal_hit(f3_ppm, f2_ppm, f1_ppm, nucs, cfg.diagonal_tol_ppm)
+            {
+                continue;
+            }
+
+            let mut vol = 0.0_f64;
+            for dv_i in -1isize..=1 {
+                for du_i in -1isize..=1 {
+                    let sv = plane_vals
+                        [(iv as isize + dv_i) as usize * nu + (iu as isize + du_i) as usize];
+                    if sv.signum() == v0.signum() {
+                        vol += (sv.abs()) as f64;
+                    }
+                }
+            }
+
+            out.push(CubePeak3D {
+                exp: spec.exp.clone(),
+                f3_ppm,
+                f2_ppm,
+                f1_ppm,
+                sign: if v0 < 0.0 { -1 } else { 1 },
+                height: v0 as f64,
+                volume: vol,
+                snr: (v0.abs() / noise) as f64,
+                label: String::new(),
+            });
+        }
+    }
+
+    out.sort_by(|a, b| b.height.abs().total_cmp(&a.height.abs()));
+    if out.len() > cfg.max_peaks.max(1) {
+        out.truncate(cfg.max_peaks.max(1));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1904,5 +2733,100 @@ mod tests {
             2,
             "0.015 ppm (12.0 Hz at 800 MHz) exceeds 9.5 Hz and must remain 2 distinct peaks, got {pks_800:?}"
         );
+    }
+
+    #[test]
+    fn test_pick_cube_3d_ridge_safe_subvoxel_diagonal_water_and_plane_picker() {
+        let (nx, ny, nz) = (96usize, 24usize, 48usize);
+        let axis_x = AxisPpm::from_bounds("1H", nx, 10.5, 1.0, 800.13);
+        let axis_y = AxisPpm::from_bounds("15N", ny, 130.0, 107.0, 81.08);
+        let axis_z = AxisPpm::from_bounds("1H", nz, 9.8, 0.4, 800.13);
+        let mut data = vec![0.0_f32; nx * ny * nz];
+
+        // Deterministic baseline noise
+        let mut st = 0x1234_5678_9ABC_DEF0_u64;
+        for cell in &mut data {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u = ((st >> 32) as f32 / (u32::MAX as f32)) - 0.5;
+            *cell = u * 4.0;
+        }
+
+        // Inject residual 4.70 ppm F3 water wall + homonuclear (8.20, 118.0, 8.20) diagonal peak
+        let wx = axis_x.ppm_to_index(4.70);
+        let dx_diag = axis_x.ppm_to_index(8.20);
+        let dy_diag = axis_y.ppm_to_index(118.0);
+        let dz_diag = axis_z.ppm_to_index(8.20);
+        for iz in 0..nz {
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    let dw = (ix as f64 - wx) / 1.1;
+                    if dw.abs() <= 3.0 {
+                        data[(iz * ny + iy) * nx + ix] += 9_000.0 * (-0.5 * dw * dw).exp() as f32;
+                    }
+                    let r2 = ((ix as f64 - dx_diag) / 1.3).powi(2)
+                        + ((iy as f64 - dy_diag) / 1.1).powi(2)
+                        + ((iz as f64 - dz_diag) / 1.3).powi(2);
+                    if r2 <= 9.0 {
+                        data[(iz * ny + iy) * nx + ix] += 6_000.0 * (-0.5 * r2).exp() as f32;
+                    }
+                }
+            }
+        }
+
+        // Inject 3 genuine sub-voxel 3D cross-peaks (2 positive, 1 negative)
+        let truth = [
+            (8.42_f64, 121.3_f64, 4.18_f64, 1_450.0_f32),
+            (7.91_f64, 115.6_f64, 1.42_f64, 980.0_f32),
+            (8.42_f64, 121.3_f64, 2.86_f64, -760.0_f32),
+        ];
+        for &(f3, f2, f1, amp) in &truth {
+            let cx = axis_x.ppm_to_index(f3);
+            let cy = axis_y.ppm_to_index(f2);
+            let cz = axis_z.ppm_to_index(f1);
+            for iz in 0..nz {
+                for iy in 0..ny {
+                    for ix in 0..nx {
+                        let r2 = ((ix as f64 - cx) / 1.25).powi(2)
+                            + ((iy as f64 - cy) / 1.15).powi(2)
+                            + ((iz as f64 - cz) / 1.25).powi(2);
+                        if r2 <= 10.0 {
+                            data[(iz * ny + iy) * nx + ix] += amp * (-0.5 * r2).exp() as f32;
+                        }
+                    }
+                }
+            }
+        }
+
+        let cube = Spectrum3D {
+            name: "HCCCONH".to_string(),
+            exp: "HCCCONH".to_string(),
+            axis_x,
+            axis_y,
+            axis_z,
+            data,
+        };
+
+        let picked = pick_cube_3d_ridge_safe(&cube, &Cube3dPickerConfig::default());
+        assert_eq!(picked.len(), 3, "got {picked:?}");
+        assert!(picked[0].height.abs() >= picked[1].height.abs());
+        assert!(picked[1].height.abs() >= picked[2].height.abs());
+        assert_eq!(picked[2].sign, -1);
+        assert!((picked[0].f3_ppm - 8.42).abs() < 0.03);
+        assert!((picked[0].f2_ppm - 121.3).abs() < 0.15);
+        assert!((picked[0].f1_ppm - 4.18).abs() < 0.04);
+
+        // Single-plane pick on the F2 (`15N = 121.3 ppm`) strip plane recovers the 2 peaks on that plane
+        let iy_strip = cube.axis_y.ppm_to_index(121.3).round() as usize;
+        let plane_pks =
+            pick_cube_3d_plane_ridge_safe(&cube, 1, iy_strip, &Cube3dPickerConfig::default());
+        assert_eq!(plane_pks.len(), 2, "got {plane_pks:?}");
+
+        // 3D extremum snap from slightly perturbed coordinates recovers sub-voxel center
+        let (sf3, sf2, sf1, sh, _, sgn) =
+            snap_cube_3d_extremum(&cube, 8.36, 121.8, 4.05, [3, 2, 3], true);
+        assert!((sf3 - 8.42).abs() < 0.03);
+        assert!((sf2 - 121.3).abs() < 0.15);
+        assert!((sf1 - 4.18).abs() < 0.04);
+        assert!(sh > 1_200.0 && sgn == 1);
     }
 }

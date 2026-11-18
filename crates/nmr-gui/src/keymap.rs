@@ -96,6 +96,10 @@ pub enum ChordKey {
     QuestionMark,
     Plus,
     Minus,
+    OpenBracket,
+    CloseBracket,
+    PageUp,
+    PageDown,
     Escape,
     Other,
 }
@@ -344,8 +348,88 @@ pub const SPECTRUM_ACCELERATORS: &[AcceleratorBinding] = &[
         chord_pair: Some(('p', 't')),
         category: "Workbook Navigation",
         title: "Previous Spectrum Page",
-        description: "Switch backward to the previous open 1D or 2D spectrum page",
+        description: "Switch backward to the previous open 1D, 2D, or 3D spectrum page",
         action: WorkbenchAction::PrevWorkbookPage,
+    },
+    AcceleratorBinding {
+        keys_label: "np",
+        chord_pair: Some(('n', 'p')),
+        category: "3D Cube & Planes",
+        title: "Next 3D Cube Plane",
+        description: "Step forward one orthogonal plane in active 3D cube (also ] / PageUp / Shift+Scroll)",
+        action: WorkbenchAction::NextCubePlane,
+    },
+    AcceleratorBinding {
+        keys_label: "pp",
+        chord_pair: Some(('p', 'p')),
+        category: "3D Cube & Planes",
+        title: "Previous 3D Cube Plane",
+        description: "Step backward one orthogonal plane in active 3D cube (also [ / PageDown / Shift+Scroll)",
+        action: WorkbenchAction::PrevCubePlane,
+    },
+    AcceleratorBinding {
+        keys_label: "xy",
+        chord_pair: Some(('x', 'y')),
+        category: "3D Cube & Planes",
+        title: "3D Orientation F3×F2 (Step F1)",
+        description: "Flip 3D cube to F3×F2 planes stepped along F1 (e.g. 1H×15N at 13C/1H slice)",
+        action: WorkbenchAction::CubePlaneF3xF2,
+    },
+    AcceleratorBinding {
+        keys_label: "p1",
+        chord_pair: Some(('p', '1')),
+        category: "3D Cube & Planes",
+        title: "3D Plane Axis F1 (F3×F2)",
+        description: "Alias for F3×F2 planes stepped along F1",
+        action: WorkbenchAction::CubePlaneF3xF2,
+    },
+    AcceleratorBinding {
+        keys_label: "xz",
+        chord_pair: Some(('x', 'z')),
+        category: "3D Cube & Planes",
+        title: "3D Strip Orientation F3×F1 (Step F2)",
+        description: "Flip 3D cube to F3×F1 strip planes stepped along F2 (e.g. 1H×13C/1H at 15N plane)",
+        action: WorkbenchAction::CubePlaneF3xF1,
+    },
+    AcceleratorBinding {
+        keys_label: "p2",
+        chord_pair: Some(('p', '2')),
+        category: "3D Cube & Planes",
+        title: "3D Plane Axis F2 (F3×F1 Strips)",
+        description: "Alias for F3×F1 strip planes stepped along F2",
+        action: WorkbenchAction::CubePlaneF3xF1,
+    },
+    AcceleratorBinding {
+        keys_label: "yz",
+        chord_pair: Some(('y', 'z')),
+        category: "3D Cube & Planes",
+        title: "3D Indirect Orientation F2×F1 (Step F3)",
+        description: "Flip 3D cube to F2×F1 indirect planes stepped along F3",
+        action: WorkbenchAction::CubePlaneF2xF1,
+    },
+    AcceleratorBinding {
+        keys_label: "p3",
+        chord_pair: Some(('p', '3')),
+        category: "3D Cube & Planes",
+        title: "3D Plane Axis F3 (F2×F1 Indirect)",
+        description: "Alias for F2×F1 indirect planes stepped along F3",
+        action: WorkbenchAction::CubePlaneF2xF1,
+    },
+    AcceleratorBinding {
+        keys_label: "sk",
+        chord_pair: Some(('s', 'k')),
+        category: "3D Cube & Planes",
+        title: "Toggle 3D Cube 2D Skyline MIP",
+        description: "Toggle signed Max-|I| 2D skyline projection across the orthogonal 3D axis",
+        action: WorkbenchAction::ToggleCubeSkyline,
+    },
+    AcceleratorBinding {
+        keys_label: "gs",
+        chord_pair: Some(('g', 's')),
+        category: "3D Cube & Planes",
+        title: "Go to 3D Strip at (1H, 15N) Cursor",
+        description: "Jump from 2D HSQC cursor or picked HSQC peak directly to matching (1H, 15N) plane/strip in 3D cube",
+        action: WorkbenchAction::GotoCubeStripFromHsqc,
     },
     AcceleratorBinding {
         keys_label: "wt",
@@ -501,7 +585,7 @@ pub const SPECTRUM_ACCELERATORS: &[AcceleratorBinding] = &[
         chord_pair: Some(('w', 'u')),
         category: "1D & 2D Processing",
         title: "Undo Water Suppression",
-        description: "Restore pre-water-suppression 1D or 2D spectrum snapshot",
+        description: "Restore pre-water-suppression 1D, 2D, or 3D spectrum snapshot",
         action: WorkbenchAction::UndoWaterSuppression,
     },
     AcceleratorBinding {
@@ -582,6 +666,7 @@ fn is_valid_chord_prefix(ch: char) -> bool {
         ch,
         'a' | 'b'
             | 'c'
+            | 'g'
             | 'i'
             | 'k'
             | 'l'
@@ -594,6 +679,7 @@ fn is_valid_chord_prefix(ch: char) -> bool {
             | 'v'
             | 'w'
             | 'x'
+            | 'y'
             | 'z'
     )
 }
@@ -609,7 +695,7 @@ fn lookup_two_key_chord(prefix: char, second: char) -> Option<WorkbenchAction> {
         ('z', 'm') => Some(WorkbenchAction::SelectZoomBoxMode),
         ('m', 'v') => Some(WorkbenchAction::SelectPanMoveMode),
         ('x', 'h') => Some(WorkbenchAction::SelectCrosshairSliceMode),
-        // Contour Levels, Views, Projections & Pages
+        // Contour Levels, Views, Projections, 3D Planes & Pages
         ('c', 't') | ('v', 't') => Some(WorkbenchAction::OpenContourThresholdPopup),
         ('c', 'i') | ('c', 'u') => Some(WorkbenchAction::RaiseContourFloor),
         ('c', 'b') | ('c', 'd') => Some(WorkbenchAction::LowerContourFloor),
@@ -617,6 +703,13 @@ fn lookup_two_key_chord(prefix: char, second: char) -> Option<WorkbenchAction> {
         ('o', 'l') => Some(WorkbenchAction::OpenOverlayStackManager),
         ('n', 't') => Some(WorkbenchAction::NextWorkbookPage),
         ('p', 't') => Some(WorkbenchAction::PrevWorkbookPage),
+        ('n', 'p') => Some(WorkbenchAction::NextCubePlane),
+        ('p', 'p') => Some(WorkbenchAction::PrevCubePlane),
+        ('x', 'y') | ('p', '1') => Some(WorkbenchAction::CubePlaneF3xF2),
+        ('x', 'z') | ('p', '2') => Some(WorkbenchAction::CubePlaneF3xF1),
+        ('y', 'z') | ('p', '3') => Some(WorkbenchAction::CubePlaneF2xF1),
+        ('s', 'k') => Some(WorkbenchAction::ToggleCubeSkyline),
+        ('g', 's') => Some(WorkbenchAction::GotoCubeStripFromHsqc),
         ('w', 't') => Some(WorkbenchAction::ToggleCanvasTheme),
         // Peak Picking, Editing, Lists & Assignment
         ('k', 'r') => Some(WorkbenchAction::SelectPickPeaksMode),
@@ -828,7 +921,12 @@ impl ChordDispatcher {
                         },
                     }
                 }
-                ChordKey::Other | ChordKey::Escape => {
+                ChordKey::Other
+                | ChordKey::OpenBracket
+                | ChordKey::CloseBracket
+                | ChordKey::PageUp
+                | ChordKey::PageDown
+                | ChordKey::Escape => {
                     self.state = ChordState::Idle;
                     ChordOutcome::InvalidChord {
                         prefix,
@@ -859,6 +957,12 @@ impl ChordDispatcher {
                 ChordKey::Plus => ChordOutcome::Dispatched(WorkbenchAction::RaiseContourFloor),
                 ChordKey::Minus if !input.shift => {
                     ChordOutcome::Dispatched(WorkbenchAction::LowerContourFloor)
+                }
+                ChordKey::CloseBracket | ChordKey::PageUp if !input.shift => {
+                    ChordOutcome::Dispatched(WorkbenchAction::NextCubePlane)
+                }
+                ChordKey::OpenBracket | ChordKey::PageDown if !input.shift => {
+                    ChordOutcome::Dispatched(WorkbenchAction::PrevCubePlane)
                 }
                 ChordKey::QuestionMark => {
                     self.cheat_sheet_open = !self.cheat_sheet_open;
@@ -1156,6 +1260,7 @@ fn egui_key_to_ascii_letter(key: egui::Key) -> Option<char> {
         egui::Key::Z => Some('z'),
         egui::Key::Num1 => Some('1'),
         egui::Key::Num2 => Some('2'),
+        egui::Key::Num3 => Some('3'),
         _ => None,
     }
 }
@@ -1195,6 +1300,14 @@ pub fn extract_egui_chord_inputs(events: &[egui::Event]) -> Vec<KeyChordInput> {
                     ChordKey::Plus
                 } else if *key == egui::Key::Minus && !ctrl_or_cmd {
                     ChordKey::Minus
+                } else if *key == egui::Key::OpenBracket && !ctrl_or_cmd {
+                    ChordKey::OpenBracket
+                } else if *key == egui::Key::CloseBracket && !ctrl_or_cmd {
+                    ChordKey::CloseBracket
+                } else if *key == egui::Key::PageUp && !ctrl_or_cmd {
+                    ChordKey::PageUp
+                } else if *key == egui::Key::PageDown && !ctrl_or_cmd {
+                    ChordKey::PageDown
                 } else if *key == egui::Key::Space {
                     ChordKey::Space
                 } else if *key == egui::Key::Escape {

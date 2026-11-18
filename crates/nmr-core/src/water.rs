@@ -904,6 +904,13 @@ pub fn suppress_water_spectrum_3d(spec: &mut Spectrum3D, cfg: &WaterSuppressionC
     water_ppm
 }
 
+/// Alias for [`suppress_water_spectrum_3d`]: suppress residual water and indirect $t_1$/$t_2$
+/// water-slab ridges across a 3D spectrum (`Spectrum3D`) in place, returning `water_ppm`.
+#[inline]
+pub fn suppress_water_3d(spec: &mut Spectrum3D, cfg: &WaterSuppressionConfig) -> f64 {
+    suppress_water_spectrum_3d(spec, cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1171,5 +1178,56 @@ mod tests {
             "3D amide peak must retain >98% amplitude: pre={pre_hn_amp}, post={}",
             cube.get(ix_hn, 8, 8)
         );
+    }
+
+    #[test]
+    fn test_suppress_water_3d_alias_preserves_indirect_1h_strip_peaks_in_hccconh() {
+        let nx = 128usize;
+        let ny = 12usize;
+        let nz = 32usize;
+        let axis_x = AxisPpm::from_bounds("1H", nx, 10.7, 0.7, 800.13);
+        let axis_y = AxisPpm::from_bounds("15N", ny, 130.0, 108.0, 81.08);
+        let axis_z = AxisPpm::from_bounds("1H", nz, 9.5, -0.5, 800.13);
+        let mut data = vec![0.0_f32; nz * ny * nx];
+
+        for iz in 0..nz {
+            let z_ppm = axis_z.index_to_ppm(iz as f64);
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    let x_ppm = axis_x.index_to_ppm(ix as f64);
+                    let dw = (x_ppm - 4.70) / 0.03;
+                    let mut v = 1200.0 / (1.0 + dw * dw);
+                    if iy == 5 {
+                        let dx = (x_ppm - 8.28) / 0.035;
+                        let dz_ali = (z_ppm - 1.85) / 0.18;
+                        let dz_ha = (z_ppm - 4.70) / 0.18;
+                        v += 65.0 * (-0.5 * (dx * dx + dz_ali * dz_ali)).exp();
+                        v += 48.0 * (-0.5 * (dx * dx + dz_ha * dz_ha)).exp();
+                    }
+                    data[(iz * ny + iy) * nx + ix] = v as f32;
+                }
+            }
+        }
+
+        let mut cube = Spectrum3D {
+            name: "hccconh_test".to_string(),
+            exp: "HCCCONH".to_string(),
+            axis_x,
+            axis_y,
+            axis_z,
+            data,
+        };
+        let ix_w = cube.axis_x.ppm_to_index(4.70).round() as usize;
+        let ix_hn = cube.axis_x.ppm_to_index(8.28).round() as usize;
+        let iz_ali = cube.axis_z.ppm_to_index(1.85).round() as usize;
+        let iz_ha = cube.axis_z.ppm_to_index(4.70).round() as usize;
+        let pre_ali = cube.get(ix_hn, 5, iz_ali);
+        let pre_ha = cube.get(ix_hn, 5, iz_ha);
+
+        let w_ppm = suppress_water_3d(&mut cube, &WaterSuppressionConfig::default());
+        assert!((w_ppm - 4.70).abs() < 0.05);
+        assert!(cube.get(ix_w, 5, iz_ali).abs() < 5.0);
+        assert!(cube.get(ix_hn, 5, iz_ali) > 0.96 * pre_ali);
+        assert!(cube.get(ix_hn, 5, iz_ha) > 0.96 * pre_ha);
     }
 }

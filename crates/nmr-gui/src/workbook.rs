@@ -23,8 +23,12 @@ use eframe::egui;
 use nmr_core::c13_detected::C13PickedDataset;
 use nmr_core::nmr1d::{Experiment1DKind, Nucleus1D, Spectrum1D};
 use nmr_core::peaks::Peak;
-use nmr_core::picker::estimate_noise_mad;
+use nmr_core::picker::{
+    estimate_noise_mad, pick_cube_3d_plane_ridge_safe, pick_cube_3d_ridge_safe,
+    sample_cube_3d_trilinear, snap_cube_3d_extremum, Cube3dPickerConfig, CubePeak3D,
+};
 use nmr_core::spectrum::{AxisPpm, Spectrum2D, Spectrum3D};
+use nmr_core::water::{suppress_water_3d, WaterSuppressionConfig};
 
 use crate::contour_painter::{default_overlay_palette, OverlayLayerSpec, SyncCrosshair};
 use crate::stack1d_panel::{default_trace_color, RoiRegion1d, Stack1dState, Trace1d};
@@ -998,6 +1002,94 @@ pub fn canonical_axis_nucleus(raw_label: &str, min_ppm: f64, max_ppm: f64) -> &'
     }
 }
 
+fn proton_ref_mhz_from_axes(axes: &[&AxisPpm]) -> Option<f64> {
+    let mut best = 0.0_f64;
+    for ax in axes {
+        if !ax.obs_mhz.is_finite() || ax.obs_mhz < 60.0 {
+            continue;
+        }
+        let c_nuc = canonical_axis_nucleus(&ax.label, ax.min_ppm(), ax.max_ppm());
+        if c_nuc == "1H" && ax.obs_mhz > best {
+            best = ax.obs_mhz;
+        }
+    }
+    (best >= 60.0).then_some(best)
+}
+
+/// Resolve physical nucleus tag (`"1H"`, `"13C"`, `"15N"`, `"19F"`, `"31P"`, ...) from an
+/// [`AxisPpm`] using Larmor frequency ratio `axis.obs_mhz / ref_proton_mhz` when a `${}^{1}\text{H}$
+/// reference axis is present (preventing Bruker `AXNUC=<off>` default `"13C"` labels from
+/// mislabeling indirect `1H` axes in `3D H(CCO)NH` or `15N-NOESY`), while preserving `13C`-detected
+/// `2D CON` / `CACO` axes where `13C` `obs_mhz` exceeds `200 MHz` at high field.
+pub fn axis_physical_nucleus(axis: &AxisPpm, ref_proton_mhz: Option<f64>) -> &'static str {
+    let min_ppm = axis.min_ppm();
+    let max_ppm = axis.max_ppm();
+    let up = axis
+        .label
+        .trim()
+        .trim_matches(|c: char| c == '<' || c == '>' || c == '"' || c == '\'')
+        .trim()
+        .to_ascii_uppercase();
+    match up.as_str() {
+        "1H" | "H1" | "H" | "HN" | "HA" | "HB" | "PROTON" | "1H_IND" | "1H_ALIPH" => {
+            return "1H";
+        }
+        "15N" | "N15" | "N" | "NH" => return "15N",
+        "19F" | "F19" | "F" => return "19F",
+        "31P" | "P31" | "P" => return "31P",
+        "2H" | "H2" | "D" => return "2H",
+        "13C" | "C13" | "C" | "CA" | "CB" | "CO" | "CACB" if max_ppm > 19.0 => return "13C",
+        _ => {}
+    }
+    if let Some(h_mhz) = ref_proton_mhz.filter(|&m| m.is_finite() && m >= 60.0) {
+        if axis.obs_mhz.is_finite() && axis.obs_mhz > 5.0 {
+            let ratio = axis.obs_mhz / h_mhz;
+            if (0.980..=1.020).contains(&ratio) {
+                return "1H";
+            } else if (0.925..=0.958).contains(&ratio) {
+                return "19F";
+            } else if (0.390..=0.420).contains(&ratio) {
+                return "31P";
+            } else if (0.235..=0.270).contains(&ratio) {
+                return "13C";
+            } else if (0.145..=0.165).contains(&ratio) {
+                return "2H";
+            } else if (0.090..=0.115).contains(&ratio) {
+                return "15N";
+            }
+        }
+    }
+    // Guard against unannotated indirect 1H axes whose parser fallback label defaulted to "13C".
+    if up == "13C"
+        && max_ppm <= 18.0
+        && min_ppm >= -6.0
+        && (max_ppm - min_ppm) <= 22.0
+        && axis.obs_mhz >= 290.0
+    {
+        return "1H";
+    }
+    canonical_axis_nucleus(&axis.label, min_ppm, max_ppm)
+}
+
+/// Infer resolved physical `(F2=X, F1=Y)` nucleus tags for a [`Spectrum2D`].
+pub fn infer_2d_spectrum_nuclei(spec: &Spectrum2D) -> (&'static str, &'static str) {
+    let ref_opt = proton_ref_mhz_from_axes(&[&spec.axis_x, &spec.axis_y]);
+    (
+        axis_physical_nucleus(&spec.axis_x, ref_opt),
+        axis_physical_nucleus(&spec.axis_y, ref_opt),
+    )
+}
+
+/// Infer resolved physical `(F3=X, F2=Y, F1=Z)` nucleus tags for a [`Spectrum3D`] cube.
+pub fn infer_3d_cube_nuclei(s3: &Spectrum3D) -> (&'static str, &'static str, &'static str) {
+    let ref_opt = proton_ref_mhz_from_axes(&[&s3.axis_x, &s3.axis_y, &s3.axis_z]);
+    (
+        axis_physical_nucleus(&s3.axis_x, ref_opt),
+        axis_physical_nucleus(&s3.axis_y, ref_opt),
+        axis_physical_nucleus(&s3.axis_z, ref_opt),
+    )
+}
+
 /// Format a canonical nucleus tag with Unicode superscripts (`"1H" -> "¹H"`).
 pub const fn pretty_nucleus(nuc: &str) -> &'static str {
     if eq_str(nuc, "1H") {
@@ -1174,10 +1266,366 @@ pub fn build_mini_2d_preview_dots(spec: &Spectrum2D, max_dots: usize) -> Vec<([f
         .collect()
 }
 
-/// Persistent per-page state for a loaded 2D spectrum inside the Multi-Page Workbook.
+/// Backing data kind for a page inside the Multi-Page Workbook (`pages_2d`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WorkbookPageKind {
+    /// Native 2D spectrum page (`HSQC`, `COSY`, `NOESY`, `HMBC`, `CON`, ...).
+    #[default]
+    Spectrum2d,
+    /// Interactive 3D NMR cube page backed by `cubes_3d[cube_idx]`.
+    Cube3d { cube_idx: usize },
+}
+
+/// Orthogonal 2D plane orientation through a 3D `(F3=X, F2=Y, F1=Z)` NMR cube.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CubePlaneOrientation {
+    /// `F3×F2` planes stepped along `F1` (`axis_x × axis_y` stepped along `axis_z`; chord `xy` / `p1`).
+    #[default]
+    F3xF2StepF1,
+    /// `F3×F1` strip planes stepped along `F2` (`axis_x × axis_z` stepped along `axis_y`; chord `xz` / `p2`).
+    F3xF1StepF2,
+    /// `F2×F1` indirect planes stepped along `F3` (`axis_y × axis_z` stepped along `axis_x`; chord `yz` / `p3`).
+    F2xF1StepF3,
+}
+
+impl CubePlaneOrientation {
+    pub const ALL: [Self; 3] = [Self::F3xF2StepF1, Self::F3xF1StepF2, Self::F2xF1StepF3];
+
+    #[inline]
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::F3xF2StepF1 => "F3×F2",
+            Self::F3xF1StepF2 => "F3×F1",
+            Self::F2xF1StepF3 => "F2×F1",
+        }
+    }
+
+    #[inline]
+    pub const fn chord_badge(self) -> &'static str {
+        match self {
+            Self::F3xF2StepF1 => "xy",
+            Self::F3xF1StepF2 => "xz",
+            Self::F2xF1StepF3 => "yz",
+        }
+    }
+
+    #[inline]
+    pub const fn ortho_axis_tag(self) -> &'static str {
+        match self {
+            Self::F3xF2StepF1 => "F1",
+            Self::F3xF1StepF2 => "F2",
+            Self::F2xF1StepF3 => "F3",
+        }
+    }
+
+    /// Map to `pick_cube_3d_plane_ridge_safe` `ortho_axis` (`0` = fixed `F3/X`, `1` = fixed `F2/Y`, `2` = fixed `F1/Z`).
+    #[inline]
+    pub const fn ortho_picker_axis(self) -> usize {
+        match self {
+            Self::F3xF2StepF1 => 2,
+            Self::F3xF1StepF2 => 1,
+            Self::F2xF1StepF3 => 0,
+        }
+    }
+}
+
+/// Visibility tier of a 3D `(F3, F2, F1)` peak relative to the active 2D slice or skyline slab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PlanePeakVisibility {
+    /// Crisp crosshair + label (`|Δplane| <= 0.5` slices, or inside active skyline slab).
+    OnPlane,
+    /// Faded ghost marker (`0.5 < |Δplane| <= 1.5` slices on adjacent planes).
+    AdjacentGhost,
+    /// Hidden (`|Δplane| > 1.5` slices, or outside active skyline slab bounds).
+    OffPlane,
+}
+
+/// 2D projection of a [`CubePeak3D`] onto the active [`Cube3dSliceState`] plane.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Projected3dPeak {
+    pub peak_idx: usize,
+    pub plane_x_ppm: f64,
+    pub plane_y_ppm: f64,
+    pub ortho_ppm: f64,
+    pub delta_planes: f64,
+    pub visibility: PlanePeakVisibility,
+}
+
+/// Per-page interactive 3D slicing, skyline MIP slab, and 3D peak-curation state for [`WorkbookPageKind::Cube3d`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cube3dSliceState {
+    pub orientation: CubePlaneOrientation,
+    pub skyline_enabled: bool,
+    /// Plane index along `F1` (`axis_z`, `0..nz`).
+    pub plane_f1_idx: usize,
+    /// Plane index along `F2` (`axis_y`, `0..ny`).
+    pub plane_f2_idx: usize,
+    /// Plane index along `F3` (`axis_x`, `0..nx`).
+    pub plane_f3_idx: usize,
+    /// Optional orthogonal chemical-shift slab bounds `(ppm_a, ppm_b)` when `skyline_enabled == true`.
+    pub slab_ppm_bounds: Option<(f64, f64)>,
+    pub selected_peak_3d_idx: Option<usize>,
+    pub dragging_peak_3d_idx: Option<usize>,
+    pub exclude_diagonal: bool,
+    pub exclude_water_band: bool,
+    pub snr_threshold: f32,
+}
+
+impl Default for Cube3dSliceState {
+    fn default() -> Self {
+        Self {
+            orientation: CubePlaneOrientation::F3xF2StepF1,
+            skyline_enabled: true,
+            plane_f1_idx: 0,
+            plane_f2_idx: 0,
+            plane_f3_idx: 0,
+            slab_ppm_bounds: None,
+            selected_peak_3d_idx: None,
+            dragging_peak_3d_idx: None,
+            exclude_diagonal: true,
+            exclude_water_band: true,
+            snr_threshold: 6.0,
+        }
+    }
+}
+
+impl Cube3dSliceState {
+    pub fn from_cube(s3: &Spectrum3D) -> Self {
+        Self {
+            plane_f1_idx: s3.nz() / 2,
+            plane_f2_idx: s3.ny() / 2,
+            plane_f3_idx: s3.nx() / 2,
+            ..Self::default()
+        }
+    }
+
+    #[inline]
+    pub fn ortho_axis<'a>(&self, s3: &'a Spectrum3D) -> &'a AxisPpm {
+        match self.orientation {
+            CubePlaneOrientation::F3xF2StepF1 => &s3.axis_z,
+            CubePlaneOrientation::F3xF1StepF2 => &s3.axis_y,
+            CubePlaneOrientation::F2xF1StepF3 => &s3.axis_x,
+        }
+    }
+
+    #[inline]
+    pub fn plane_axes<'a>(&self, s3: &'a Spectrum3D) -> (&'a AxisPpm, &'a AxisPpm) {
+        match self.orientation {
+            CubePlaneOrientation::F3xF2StepF1 => (&s3.axis_x, &s3.axis_y),
+            CubePlaneOrientation::F3xF1StepF2 => (&s3.axis_x, &s3.axis_z),
+            CubePlaneOrientation::F2xF1StepF3 => (&s3.axis_y, &s3.axis_z),
+        }
+    }
+
+    #[inline]
+    pub fn ortho_len(&self, s3: &Spectrum3D) -> usize {
+        self.ortho_axis(s3).size.max(1)
+    }
+
+    #[inline]
+    pub fn active_plane_idx(&self, s3: &Spectrum3D) -> usize {
+        match self.orientation {
+            CubePlaneOrientation::F3xF2StepF1 => self.plane_f1_idx.min(s3.nz().saturating_sub(1)),
+            CubePlaneOrientation::F3xF1StepF2 => self.plane_f2_idx.min(s3.ny().saturating_sub(1)),
+            CubePlaneOrientation::F2xF1StepF3 => self.plane_f3_idx.min(s3.nx().saturating_sub(1)),
+        }
+    }
+
+    #[inline]
+    pub fn set_active_plane_idx(&mut self, s3: &Spectrum3D, idx: usize) {
+        match self.orientation {
+            CubePlaneOrientation::F3xF2StepF1 => {
+                self.plane_f1_idx = idx.min(s3.nz().saturating_sub(1));
+            }
+            CubePlaneOrientation::F3xF1StepF2 => {
+                self.plane_f2_idx = idx.min(s3.ny().saturating_sub(1));
+            }
+            CubePlaneOrientation::F2xF1StepF3 => {
+                self.plane_f3_idx = idx.min(s3.nx().saturating_sub(1));
+            }
+        }
+    }
+
+    #[inline]
+    pub fn active_ortho_ppm(&self, s3: &Spectrum3D) -> f64 {
+        let idx = self.active_plane_idx(s3);
+        self.ortho_axis(s3).index_to_ppm(idx as f64)
+    }
+
+    /// Step the orthogonal plane by `delta` slices (automatically exiting `skyline_enabled` mode into discrete plane inspection).
+    pub fn step_plane(&mut self, s3: &Spectrum3D, delta: isize) -> usize {
+        let max_idx = self.ortho_len(s3).saturating_sub(1) as isize;
+        let cur = self.active_plane_idx(s3) as isize;
+        let next = (cur + delta).clamp(0, max_idx) as usize;
+        self.skyline_enabled = false;
+        self.set_active_plane_idx(s3, next);
+        next
+    }
+
+    /// Flip to an explicit orthogonal 2D plane orientation (exiting skyline mode so the plane is inspected directly).
+    pub fn set_orientation(&mut self, s3: &Spectrum3D, orientation: CubePlaneOrientation) {
+        self.orientation = orientation;
+        self.skyline_enabled = false;
+        let clamped = self.active_plane_idx(s3);
+        self.set_active_plane_idx(s3, clamped);
+    }
+
+    /// Toggle 2D Skyline (`Max |I|` signed MIP) across the active orthogonal axis.
+    pub fn toggle_skyline(&mut self) -> bool {
+        self.skyline_enabled = !self.skyline_enabled;
+        self.skyline_enabled
+    }
+
+    /// Extract the currently active 2D plane or 2D skyline projection from `s3` with resolved physical nucleus labels.
+    pub fn extract_active_2d(&self, s3: &Spectrum3D) -> Spectrum2D {
+        if self.skyline_enabled {
+            extract_3d_skyline(s3, self.orientation, self.slab_ppm_bounds)
+        } else {
+            extract_3d_plane(s3, self.orientation, self.active_plane_idx(s3))
+        }
+    }
+
+    /// Map `(plane_x_ppm, plane_y_ppm)` on the active 2D view back to full 3D `(f3_ppm, f2_ppm, f1_ppm)`.
+    pub fn coords_from_plane_xy(
+        &self,
+        s3: &Spectrum3D,
+        plane_x_ppm: f64,
+        plane_y_ppm: f64,
+        override_ortho_ppm: Option<f64>,
+    ) -> (f64, f64, f64) {
+        let ortho_ppm = override_ortho_ppm.unwrap_or_else(|| self.active_ortho_ppm(s3));
+        match self.orientation {
+            CubePlaneOrientation::F3xF2StepF1 => (plane_x_ppm, plane_y_ppm, ortho_ppm),
+            CubePlaneOrientation::F3xF1StepF2 => (plane_x_ppm, ortho_ppm, plane_y_ppm),
+            CubePlaneOrientation::F2xF1StepF3 => (ortho_ppm, plane_x_ppm, plane_y_ppm),
+        }
+    }
+
+    /// Project a 3D peak onto the active 2D orientation and classify `OnPlane` (`|Δplane| <= 0.5`),
+    /// `AdjacentGhost` (`0.5 < |Δplane| <= 1.5`), or `OffPlane` (`|Δplane| > 1.5`).
+    pub fn project_peak_3d(
+        &self,
+        s3: &Spectrum3D,
+        peak_idx: usize,
+        pk: &CubePeak3D,
+    ) -> Projected3dPeak {
+        let (plane_x_ppm, plane_y_ppm, ortho_ppm) = match self.orientation {
+            CubePlaneOrientation::F3xF2StepF1 => (pk.f3_ppm, pk.f2_ppm, pk.f1_ppm),
+            CubePlaneOrientation::F3xF1StepF2 => (pk.f3_ppm, pk.f1_ppm, pk.f2_ppm),
+            CubePlaneOrientation::F2xF1StepF3 => (pk.f2_ppm, pk.f1_ppm, pk.f3_ppm),
+        };
+        if self.skyline_enabled {
+            let in_slab = match self.slab_ppm_bounds {
+                Some((a, b)) => (a.min(b)..=a.max(b)).contains(&ortho_ppm),
+                None => true,
+            };
+            return Projected3dPeak {
+                peak_idx,
+                plane_x_ppm,
+                plane_y_ppm,
+                ortho_ppm,
+                delta_planes: 0.0,
+                visibility: if in_slab {
+                    PlanePeakVisibility::OnPlane
+                } else {
+                    PlanePeakVisibility::OffPlane
+                },
+            };
+        }
+        let exact_idx = self.ortho_axis(s3).ppm_to_index(ortho_ppm);
+        let cur_idx = self.active_plane_idx(s3) as f64;
+        let delta_planes = exact_idx - cur_idx;
+        let ad = delta_planes.abs();
+        let visibility = if ad <= 0.5 + 1e-9 {
+            PlanePeakVisibility::OnPlane
+        } else if ad <= 1.5 + 1e-9 {
+            PlanePeakVisibility::AdjacentGhost
+        } else {
+            PlanePeakVisibility::OffPlane
+        };
+        Projected3dPeak {
+            peak_idx,
+            plane_x_ppm,
+            plane_y_ppm,
+            ortho_ppm,
+            delta_planes,
+            visibility,
+        }
+    }
+
+    /// Return all projected 3D peaks visible (`OnPlane` or `AdjacentGhost`) on the active view.
+    pub fn visible_projected_peaks(
+        &self,
+        s3: &Spectrum3D,
+        peaks: &[CubePeak3D],
+    ) -> Vec<Projected3dPeak> {
+        peaks
+            .iter()
+            .enumerate()
+            .map(|(i, pk)| self.project_peak_3d(s3, i, pk))
+            .filter(|pr| pr.visibility != PlanePeakVisibility::OffPlane)
+            .collect()
+    }
+
+    /// Synchronize this 3D cube slice to an amide `(1H, 15N)` coordinate (for the `gs` "goto strip" chord),
+    /// flipping into the strip plane stepped along `15N` (`F3×F1` when `F2` is `15N`, or `F3×F2` when `F1` is `15N`)
+    /// and returning `(plane_x_ppm, plane_y_ppm)` for cursor placement.
+    pub fn sync_to_hn(&mut self, s3: &Spectrum3D, h_ppm: f64, n_ppm: f64) -> (f64, f64) {
+        let (nx, ny, nz) = infer_3d_cube_nuclei(s3);
+        let clamp_idx = |ax: &AxisPpm, ppm: f64| -> usize {
+            if ax.size == 0 {
+                0
+            } else {
+                ax.ppm_to_index(ppm)
+                    .round()
+                    .clamp(0.0, (ax.size - 1) as f64) as usize
+            }
+        };
+        self.skyline_enabled = false;
+        if ny == "15N" {
+            self.orientation = CubePlaneOrientation::F3xF1StepF2;
+            self.plane_f2_idx = clamp_idx(&s3.axis_y, n_ppm);
+            if nx == "1H" {
+                self.plane_f3_idx = clamp_idx(&s3.axis_x, h_ppm);
+            }
+            let mid_y = 0.5 * (s3.axis_z.min_ppm() + s3.axis_z.max_ppm());
+            (h_ppm, mid_y)
+        } else if nz == "15N" {
+            self.orientation = CubePlaneOrientation::F3xF2StepF1;
+            self.plane_f1_idx = clamp_idx(&s3.axis_z, n_ppm);
+            if nx == "1H" {
+                self.plane_f3_idx = clamp_idx(&s3.axis_x, h_ppm);
+            }
+            let mid_y = 0.5 * (s3.axis_y.min_ppm() + s3.axis_y.max_ppm());
+            (h_ppm, mid_y)
+        } else if nx == "15N" {
+            self.orientation = CubePlaneOrientation::F2xF1StepF3;
+            self.plane_f3_idx = clamp_idx(&s3.axis_x, n_ppm);
+            let x_ppm = if ny == "1H" {
+                h_ppm
+            } else {
+                0.5 * (s3.axis_y.min_ppm() + s3.axis_y.max_ppm())
+            };
+            let mid_y = 0.5 * (s3.axis_z.min_ppm() + s3.axis_z.max_ppm());
+            (x_ppm, mid_y)
+        } else {
+            self.plane_f3_idx = clamp_idx(&s3.axis_x, h_ppm);
+            let mid_y = match self.orientation {
+                CubePlaneOrientation::F3xF2StepF1 => {
+                    0.5 * (s3.axis_y.min_ppm() + s3.axis_y.max_ppm())
+                }
+                _ => 0.5 * (s3.axis_z.min_ppm() + s3.axis_z.max_ppm()),
+            };
+            (h_ppm, mid_y)
+        }
+    }
+}
+
+/// Persistent per-page state for a loaded 2D spectrum or 3D cube inside the Multi-Page Workbook.
 #[derive(Clone, Debug)]
 pub struct Stored2dPage {
     pub id: u64,
+    pub kind: WorkbookPageKind,
     pub title: String,
     pub subtitle: String,
     pub nuc_x: &'static str,
@@ -1191,7 +1639,7 @@ pub struct Stored2dPage {
     pub num_levels: u32,
     pub show_negative: bool,
     pub ppm_nudge: [f32; 2],
-    /// `[h_left, h_right, n_top, n_bottom]`
+    /// `[x_left, x_right, y_top, y_bottom]`
     pub view_ppm: [f32; 4],
     pub overlay_enabled: bool,
     pub has_3d_strips: bool,
@@ -1204,31 +1652,123 @@ pub struct Stored2dPage {
     pub pick_diagonal: bool,
     pub mini_dots: Vec<([f32; 2], bool)>,
     pub source_cube_idx: Option<usize>,
+    pub cube_slice: Cube3dSliceState,
+    pub peaks_3d: Vec<CubePeak3D>,
+    pub water_undo_3d: Option<Spectrum3D>,
+}
+
+fn relabeled_axis(axis: &AxisPpm, nuc: &'static str) -> AxisPpm {
+    let mut out = axis.clone();
+    out.label = nuc.to_string();
+    out
 }
 
 /// Extract a signed max-abs 2D `(F3, F2)` skyline projection from a `Spectrum3D` cube.
 pub fn extract_3d_skyline_f3_f2(s3: &Spectrum3D) -> Spectrum2D {
+    extract_3d_skyline(s3, CubePlaneOrientation::F3xF2StepF1, None)
+}
+
+/// Extract a signed max-abs (`Pos+Neg` MIP) 2D skyline projection across any [`CubePlaneOrientation`],
+/// optionally restricted to `slab_ppm_bounds` along the orthogonal axis.
+pub fn extract_3d_skyline(
+    s3: &Spectrum3D,
+    orientation: CubePlaneOrientation,
+    slab_ppm_bounds: Option<(f64, f64)>,
+) -> Spectrum2D {
     let (nx, ny, nz) = (s3.nx(), s3.ny(), s3.nz());
-    let mut data = vec![0.0_f32; ny * nx];
-    for gz in 0..nz {
-        let plane = &s3.data[gz * ny * nx..(gz + 1) * ny * nx];
-        for (dst, &val) in data.iter_mut().zip(plane.iter()) {
-            if val.abs() > dst.abs() {
-                *dst = val;
+    let total = nx.saturating_mul(ny).saturating_mul(nz);
+    let (nuc_x, nuc_y, nuc_z) = infer_3d_cube_nuclei(s3);
+
+    let in_slab = |ax: &AxisPpm, idx: usize| -> bool {
+        match slab_ppm_bounds {
+            Some((a, b)) => {
+                let p = ax.index_to_ppm(idx as f64);
+                (a.min(b)..=a.max(b)).contains(&p)
+            }
+            None => true,
+        }
+    };
+
+    match orientation {
+        CubePlaneOrientation::F3xF2StepF1 => {
+            let mut data = vec![0.0_f32; ny * nx];
+            if s3.data.len() >= total {
+                for gz in 0..nz {
+                    if !in_slab(&s3.axis_z, gz) {
+                        continue;
+                    }
+                    let plane = &s3.data[gz * ny * nx..(gz + 1) * ny * nx];
+                    for (dst, &val) in data.iter_mut().zip(plane.iter()) {
+                        if val.abs() > dst.abs() {
+                            *dst = val;
+                        }
+                    }
+                }
+            }
+            Spectrum2D {
+                name: s3.name.clone(),
+                axis_x: relabeled_axis(&s3.axis_x, nuc_x),
+                axis_y: relabeled_axis(&s3.axis_y, nuc_y),
+                data,
+            }
+        }
+        CubePlaneOrientation::F3xF1StepF2 => {
+            let mut data = vec![0.0_f32; nz * nx];
+            if s3.data.len() >= total {
+                for gz in 0..nz {
+                    let dst_row = &mut data[gz * nx..(gz + 1) * nx];
+                    for gy in 0..ny {
+                        if !in_slab(&s3.axis_y, gy) {
+                            continue;
+                        }
+                        let src_row = &s3.data[(gz * ny + gy) * nx..(gz * ny + gy + 1) * nx];
+                        for (dst, &val) in dst_row.iter_mut().zip(src_row.iter()) {
+                            if val.abs() > dst.abs() {
+                                *dst = val;
+                            }
+                        }
+                    }
+                }
+            }
+            Spectrum2D {
+                name: s3.name.clone(),
+                axis_x: relabeled_axis(&s3.axis_x, nuc_x),
+                axis_y: relabeled_axis(&s3.axis_z, nuc_z),
+                data,
+            }
+        }
+        CubePlaneOrientation::F2xF1StepF3 => {
+            let mut data = vec![0.0_f32; nz * ny];
+            if s3.data.len() >= total {
+                for gz in 0..nz {
+                    for gy in 0..ny {
+                        let dst = &mut data[gz * ny + gy];
+                        let src_row = &s3.data[(gz * ny + gy) * nx..(gz * ny + gy + 1) * nx];
+                        for (gx, &val) in src_row.iter().enumerate() {
+                            if !in_slab(&s3.axis_x, gx) {
+                                continue;
+                            }
+                            if val.abs() > dst.abs() {
+                                *dst = val;
+                            }
+                        }
+                    }
+                }
+            }
+            Spectrum2D {
+                name: s3.name.clone(),
+                axis_x: relabeled_axis(&s3.axis_y, nuc_y),
+                axis_y: relabeled_axis(&s3.axis_z, nuc_z),
+                data,
             }
         }
     }
-    Spectrum2D {
-        name: s3.name.clone(),
-        axis_x: s3.axis_x.clone(),
-        axis_y: s3.axis_y.clone(),
-        data,
-    }
 }
 
-/// Extract a 2D `(F3, F2)` plane at fixed F1 (`iz`) from a `Spectrum3D` cube.
+/// Extract a 2D `(F3, F2)` plane at fixed `F1` (`iz`) from a `Spectrum3D` cube.
 pub fn extract_3d_plane_f1(s3: &Spectrum3D, iz: usize) -> Spectrum2D {
     let (nx, ny, nz) = (s3.nx(), s3.ny(), s3.nz());
+    let (nuc_x, nuc_y, _) = infer_3d_cube_nuclei(s3);
     let z = iz.min(nz.saturating_sub(1));
     let off = z * ny * nx;
     let data = if off + ny * nx <= s3.data.len() {
@@ -1238,15 +1778,16 @@ pub fn extract_3d_plane_f1(s3: &Spectrum3D, iz: usize) -> Spectrum2D {
     };
     Spectrum2D {
         name: s3.name.clone(),
-        axis_x: s3.axis_x.clone(),
-        axis_y: s3.axis_y.clone(),
+        axis_x: relabeled_axis(&s3.axis_x, nuc_x),
+        axis_y: relabeled_axis(&s3.axis_y, nuc_y),
         data,
     }
 }
 
-/// Extract a 2D `(F3, F1)` plane at fixed F2 (`iy`) from a `Spectrum3D` cube.
+/// Extract a 2D `(F3, F1)` strip plane at fixed `F2` (`iy`) from a `Spectrum3D` cube.
 pub fn extract_3d_plane_f2(s3: &Spectrum3D, iy: usize) -> Spectrum2D {
     let (nx, ny, nz) = (s3.nx(), s3.ny(), s3.nz());
+    let (nuc_x, _, nuc_z) = infer_3d_cube_nuclei(s3);
     let y = iy.min(ny.saturating_sub(1));
     let mut data = vec![0.0_f32; nz * nx];
     for gz in 0..nz {
@@ -1258,9 +1799,44 @@ pub fn extract_3d_plane_f2(s3: &Spectrum3D, iy: usize) -> Spectrum2D {
     }
     Spectrum2D {
         name: s3.name.clone(),
-        axis_x: s3.axis_x.clone(),
-        axis_y: s3.axis_z.clone(),
+        axis_x: relabeled_axis(&s3.axis_x, nuc_x),
+        axis_y: relabeled_axis(&s3.axis_z, nuc_z),
         data,
+    }
+}
+
+/// Extract a 2D `(F2, F1)` indirect plane at fixed `F3` (`ix`) from a `Spectrum3D` cube.
+pub fn extract_3d_plane_f3(s3: &Spectrum3D, ix: usize) -> Spectrum2D {
+    let (nx, ny, nz) = (s3.nx(), s3.ny(), s3.nz());
+    let (_, nuc_y, nuc_z) = infer_3d_cube_nuclei(s3);
+    let x = ix.min(nx.saturating_sub(1));
+    let mut data = vec![0.0_f32; nz * ny];
+    for gz in 0..nz {
+        for gy in 0..ny {
+            let src = (gz * ny + gy) * nx + x;
+            if src < s3.data.len() {
+                data[gz * ny + gy] = s3.data[src];
+            }
+        }
+    }
+    Spectrum2D {
+        name: s3.name.clone(),
+        axis_x: relabeled_axis(&s3.axis_y, nuc_y),
+        axis_y: relabeled_axis(&s3.axis_z, nuc_z),
+        data,
+    }
+}
+
+/// Extract an orthogonal 2D plane along any [`CubePlaneOrientation`] at `plane_idx`.
+pub fn extract_3d_plane(
+    s3: &Spectrum3D,
+    orientation: CubePlaneOrientation,
+    plane_idx: usize,
+) -> Spectrum2D {
+    match orientation {
+        CubePlaneOrientation::F3xF2StepF1 => extract_3d_plane_f1(s3, plane_idx),
+        CubePlaneOrientation::F3xF1StepF2 => extract_3d_plane_f2(s3, plane_idx),
+        CubePlaneOrientation::F2xF1StepF3 => extract_3d_plane_f3(s3, plane_idx),
     }
 }
 
@@ -1272,16 +1848,7 @@ impl Stored2dPage {
         has_3d_strips: bool,
     ) -> Self {
         let raw_lbl = label.into();
-        let nuc_x = canonical_axis_nucleus(
-            &spec.axis_x.label,
-            spec.axis_x.min_ppm(),
-            spec.axis_x.max_ppm(),
-        );
-        let nuc_y = canonical_axis_nucleus(
-            &spec.axis_y.label,
-            spec.axis_y.min_ppm(),
-            spec.axis_y.max_ppm(),
-        );
+        let (nuc_x, nuc_y) = infer_2d_spectrum_nuclei(&spec);
         let px = pretty_nucleus(nuc_x);
         let py = pretty_nucleus(nuc_y);
         let title = if raw_lbl.trim().is_empty() {
@@ -1302,6 +1869,7 @@ impl Stored2dPage {
         let data_arc = Arc::new(spec.data.clone());
         Self {
             id,
+            kind: WorkbookPageKind::Spectrum2d,
             title,
             subtitle,
             nuc_x,
@@ -1327,6 +1895,9 @@ impl Stored2dPage {
             pick_diagonal: false,
             mini_dots,
             source_cube_idx: None,
+            cube_slice: Cube3dSliceState::default(),
+            peaks_3d: Vec::new(),
+            water_undo_3d: None,
         }
     }
 
@@ -1336,7 +1907,8 @@ impl Stored2dPage {
         label: impl Into<String>,
         spec3d: &Spectrum3D,
     ) -> Self {
-        let skyline = extract_3d_skyline_f3_f2(spec3d);
+        let slice_state = Cube3dSliceState::from_cube(spec3d);
+        let skyline = slice_state.extract_active_2d(spec3d);
         let raw_lbl = label.into();
         let title = if raw_lbl.trim().is_empty() {
             format!("3D {}", spec3d.exp)
@@ -1348,25 +1920,29 @@ impl Stored2dPage {
         } else {
             format!("{raw_lbl} · 3D {}", spec3d.exp)
         };
-        let px = pretty_nucleus(canonical_axis_nucleus(
-            &spec3d.axis_x.label,
-            spec3d.axis_x.min_ppm(),
-            spec3d.axis_x.max_ppm(),
-        ));
-        let py = pretty_nucleus(canonical_axis_nucleus(
-            &spec3d.axis_y.label,
-            spec3d.axis_y.min_ppm(),
-            spec3d.axis_y.max_ppm(),
-        ));
-        let pz = pretty_nucleus(canonical_axis_nucleus(
-            &spec3d.axis_z.label,
-            spec3d.axis_z.min_ppm(),
-            spec3d.axis_z.max_ppm(),
-        ));
+        let (nx, ny, nz) = infer_3d_cube_nuclei(spec3d);
+        let px = pretty_nucleus(nx);
+        let py = pretty_nucleus(ny);
+        let pz = pretty_nucleus(nz);
         let mut page = Self::from_spectrum_2d(id, title, skyline, true);
+        page.kind = WorkbookPageKind::Cube3d { cube_idx };
         page.subtitle = format!("3D {px}×{py}×{pz} · {} planes", spec3d.nz());
         page.source_cube_idx = Some(cube_idx);
+        page.cube_slice = slice_state;
         page
+    }
+
+    #[inline]
+    pub const fn cube_idx(&self) -> Option<usize> {
+        match self.kind {
+            WorkbookPageKind::Cube3d { cube_idx } => Some(cube_idx),
+            WorkbookPageKind::Spectrum2d => self.source_cube_idx,
+        }
+    }
+
+    #[inline]
+    pub const fn is_cube_3d(&self) -> bool {
+        self.cube_idx().is_some()
     }
 
     #[inline]
@@ -1377,6 +1953,270 @@ impl Stored2dPage {
     #[inline]
     pub fn is_compatible_overlay_with(&self, other: &Self) -> bool {
         self.nuc_x == other.nuc_x && self.nuc_y == other.nuc_y
+    }
+
+    /// Re-extract `spec`, `data_arc`, `nuc_x`, `nuc_y`, and `mini_dots` from `s3` after a plane step,
+    /// orientation flip, skyline/slab change, or 3D water suppression.
+    pub fn refresh_from_3d_cube(&mut self, s3: &Spectrum3D, reset_viewport: bool) {
+        let prev_axes = (self.nuc_x, self.nuc_y);
+        let spec2d = self.cube_slice.extract_active_2d(s3);
+        let ref_opt = proton_ref_mhz_from_axes(&[&s3.axis_x, &s3.axis_y, &s3.axis_z]);
+        self.nuc_x = axis_physical_nucleus(&spec2d.axis_x, ref_opt);
+        self.nuc_y = axis_physical_nucleus(&spec2d.axis_y, ref_opt);
+        let (base_est, noise_est) = estimate_contour_base_and_noise(&spec2d.data);
+        if reset_viewport || prev_axes != (self.nuc_x, self.nuc_y) {
+            self.view_ppm = [
+                spec2d.axis_x.max_ppm() as f32,
+                spec2d.axis_x.min_ppm() as f32,
+                spec2d.axis_y.min_ppm() as f32,
+                spec2d.axis_y.max_ppm() as f32,
+            ];
+            self.zoom_history.clear();
+            self.base_level = base_est;
+        } else if self.base_level <= 0.0 || !self.base_level.is_finite() {
+            self.base_level = base_est;
+        }
+        self.noise_ref = noise_est;
+        self.mini_dots = build_mini_2d_preview_dots(&spec2d, 42);
+        self.data_arc = Arc::new(spec2d.data.clone());
+        self.spec = spec2d;
+        self.spec_gen = self.spec_gen.wrapping_add(1);
+    }
+
+    pub fn cube_picker_config(&self) -> Cube3dPickerConfig {
+        Cube3dPickerConfig {
+            snr_threshold: self.cube_slice.snr_threshold.max(2.0),
+            allow_negative: self.show_negative,
+            exclude_diagonal: self.cube_slice.exclude_diagonal && !self.pick_diagonal,
+            exclude_water_band: self.cube_slice.exclude_water_band,
+            ..Cube3dPickerConfig::default()
+        }
+    }
+
+    /// Run true 3D `(F3, F2, F1)` ridge-safe peak picking across the full `s3` cube.
+    pub fn pick_3d_cube_peaks(&mut self, s3: &Spectrum3D) -> usize {
+        let cfg = self.cube_picker_config();
+        self.peaks_3d = pick_cube_3d_ridge_safe(s3, &cfg);
+        self.cube_slice.selected_peak_3d_idx = (!self.peaks_3d.is_empty()).then_some(0);
+        self.peaks_3d.len()
+    }
+
+    /// Run ridge-safe 2D plane peak picking on the currently active orthogonal plane of `s3`,
+    /// merging new non-duplicate peaks into `peaks_3d` sorted descending by `|height|`.
+    pub fn pick_3d_current_plane_peaks(&mut self, s3: &Spectrum3D) -> usize {
+        let cfg = self.cube_picker_config();
+        let plane_idx = self.cube_slice.active_plane_idx(s3);
+        let ortho_ax = self.cube_slice.orientation.ortho_picker_axis();
+        let picked = pick_cube_3d_plane_ridge_safe(s3, ortho_ax, plane_idx, &cfg);
+        let tol_x = (s3.axis_x.step_ppm.abs() * 1.25).max(0.015);
+        let tol_y = (s3.axis_y.step_ppm.abs() * 1.25).max(0.08);
+        let tol_z = (s3.axis_z.step_ppm.abs() * 1.25).max(0.05);
+        let mut added = 0usize;
+        for pk in picked {
+            let dup = self.peaks_3d.iter().any(|ex| {
+                (ex.f3_ppm - pk.f3_ppm).abs() <= tol_x
+                    && (ex.f2_ppm - pk.f2_ppm).abs() <= tol_y
+                    && (ex.f1_ppm - pk.f1_ppm).abs() <= tol_z
+            });
+            if !dup {
+                self.peaks_3d.push(pk);
+                added += 1;
+            }
+        }
+        self.peaks_3d
+            .sort_by(|a, b| b.height.abs().total_cmp(&a.height.abs()));
+        if !self.peaks_3d.is_empty() && self.cube_slice.selected_peak_3d_idx.is_none() {
+            self.cube_slice.selected_peak_3d_idx = Some(0);
+        }
+        added
+    }
+
+    /// Interactive click-to-add (`pa` / Peak Add tool) on the active 3D plane, snapping within a small local
+    /// 3D voxel neighborhood when `snap_to_extremum` is enabled.
+    pub fn add_3d_peak_on_plane(
+        &mut self,
+        s3: &Spectrum3D,
+        plane_x_ppm: f64,
+        plane_y_ppm: f64,
+        snap_to_extremum: bool,
+    ) -> usize {
+        let (raw_f3, raw_f2, raw_f1) =
+            self.cube_slice
+                .coords_from_plane_xy(s3, plane_x_ppm, plane_y_ppm, None);
+        let search = if snap_to_extremum {
+            if self.cube_slice.skyline_enabled {
+                [2, 2, 2]
+            } else {
+                match self.cube_slice.orientation {
+                    CubePlaneOrientation::F3xF2StepF1 => [2, 2, 1],
+                    CubePlaneOrientation::F3xF1StepF2 => [2, 1, 2],
+                    CubePlaneOrientation::F2xF1StepF3 => [1, 2, 2],
+                }
+            }
+        } else {
+            [0, 0, 0]
+        };
+        let (f3_ppm, f2_ppm, f1_ppm, height, volume, sign) = if snap_to_extremum {
+            snap_cube_3d_extremum(s3, raw_f3, raw_f2, raw_f1, search, self.show_negative)
+        } else {
+            let h = sample_cube_3d_trilinear(s3, raw_f3, raw_f2, raw_f1);
+            (
+                raw_f3,
+                raw_f2,
+                raw_f1,
+                h,
+                h.abs(),
+                if h < 0.0 { -1 } else { 1 },
+            )
+        };
+        let noise = (self.noise_ref as f64).max(1e-9);
+        let idx = self.peaks_3d.len();
+        self.peaks_3d.push(CubePeak3D {
+            exp: s3.exp.clone(),
+            f3_ppm,
+            f2_ppm,
+            f1_ppm,
+            sign,
+            height,
+            volume,
+            snr: height.abs() / noise,
+            label: String::new(),
+        });
+        self.cube_slice.selected_peak_3d_idx = Some(idx);
+        idx
+    }
+
+    /// Drag/move `peaks_3d[peak_idx]` across the active 2D plane while preserving its orthogonal shift
+    /// and updating its interpolated 3D intensity.
+    pub fn move_3d_peak_on_plane(
+        &mut self,
+        s3: &Spectrum3D,
+        peak_idx: usize,
+        new_plane_x_ppm: f64,
+        new_plane_y_ppm: f64,
+    ) -> bool {
+        let Some(pk) = self.peaks_3d.get_mut(peak_idx) else {
+            return false;
+        };
+        match self.cube_slice.orientation {
+            CubePlaneOrientation::F3xF2StepF1 => {
+                pk.f3_ppm = new_plane_x_ppm;
+                pk.f2_ppm = new_plane_y_ppm;
+            }
+            CubePlaneOrientation::F3xF1StepF2 => {
+                pk.f3_ppm = new_plane_x_ppm;
+                pk.f1_ppm = new_plane_y_ppm;
+            }
+            CubePlaneOrientation::F2xF1StepF3 => {
+                pk.f2_ppm = new_plane_x_ppm;
+                pk.f1_ppm = new_plane_y_ppm;
+            }
+        }
+        let h = sample_cube_3d_trilinear(s3, pk.f3_ppm, pk.f2_ppm, pk.f1_ppm);
+        pk.height = h;
+        pk.sign = if h < 0.0 { -1 } else { 1 };
+        pk.snr = h.abs() / (self.noise_ref as f64).max(1e-9);
+        true
+    }
+
+    /// Snap `peaks_3d[peak_idx]` (`pc` chord) to the nearest 3D sub-voxel parabolic extremum.
+    pub fn snap_3d_peak(&mut self, s3: &Spectrum3D, peak_idx: usize) -> bool {
+        let Some(cur) = self.peaks_3d.get(peak_idx).cloned() else {
+            return false;
+        };
+        let (f3, f2, f1, height, volume, sign) = snap_cube_3d_extremum(
+            s3,
+            cur.f3_ppm,
+            cur.f2_ppm,
+            cur.f1_ppm,
+            [2, 2, 2],
+            self.show_negative,
+        );
+        if let Some(pk) = self.peaks_3d.get_mut(peak_idx) {
+            pk.f3_ppm = f3;
+            pk.f2_ppm = f2;
+            pk.f1_ppm = f1;
+            pk.height = height;
+            pk.volume = volume;
+            pk.sign = sign;
+            pk.snr = height.abs() / (self.noise_ref as f64).max(1e-9);
+            return true;
+        }
+        false
+    }
+
+    /// Relabel `peaks_3d[peak_idx]` (`pl` chord / inline table edit).
+    pub fn relabel_3d_peak(&mut self, peak_idx: usize, label: impl Into<String>) -> bool {
+        if let Some(pk) = self.peaks_3d.get_mut(peak_idx) {
+            pk.label = label.into().trim().to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Delete `peaks_3d[peak_idx]` (`pd` / `Delete`), keeping `selected_peak_3d_idx` valid.
+    pub fn delete_3d_peak(&mut self, peak_idx: usize) -> Option<CubePeak3D> {
+        if peak_idx >= self.peaks_3d.len() {
+            return None;
+        }
+        let removed = self.peaks_3d.remove(peak_idx);
+        self.cube_slice.dragging_peak_3d_idx = None;
+        self.cube_slice.selected_peak_3d_idx = if self.peaks_3d.is_empty() {
+            None
+        } else {
+            Some(peak_idx.min(self.peaks_3d.len() - 1))
+        };
+        Some(removed)
+    }
+
+    /// Jump the active 3D plane directly to `peaks_3d[peak_idx]` (exiting skyline mode and re-extracting
+    /// the slice), returning `(plane_x_ppm, plane_y_ppm)` so the 2D crosshair centers on the peak.
+    pub fn jump_to_3d_peak_plane(
+        &mut self,
+        s3: &Spectrum3D,
+        peak_idx: usize,
+    ) -> Option<(f64, f64)> {
+        let pk = self.peaks_3d.get(peak_idx)?.clone();
+        self.cube_slice.skyline_enabled = false;
+        self.cube_slice.selected_peak_3d_idx = Some(peak_idx);
+        let clamp_idx = |ax: &AxisPpm, ppm: f64| -> usize {
+            if ax.size == 0 {
+                0
+            } else {
+                ax.ppm_to_index(ppm)
+                    .round()
+                    .clamp(0.0, (ax.size - 1) as f64) as usize
+            }
+        };
+        self.cube_slice.plane_f3_idx = clamp_idx(&s3.axis_x, pk.f3_ppm);
+        self.cube_slice.plane_f2_idx = clamp_idx(&s3.axis_y, pk.f2_ppm);
+        self.cube_slice.plane_f1_idx = clamp_idx(&s3.axis_z, pk.f1_ppm);
+        self.refresh_from_3d_cube(s3, false);
+        let pr = self.cube_slice.project_peak_3d(s3, peak_idx, &pk);
+        Some((pr.plane_x_ppm, pr.plane_y_ppm))
+    }
+
+    /// Apply lossless-undoable 3D water suppression (`ws`) directly to `s3` and refresh the active plane/skyline.
+    pub fn suppress_water_on_3d_cube(
+        &mut self,
+        s3: &mut Spectrum3D,
+        cfg: &WaterSuppressionConfig,
+    ) -> f64 {
+        self.water_undo_3d = Some(s3.clone());
+        let carrier = suppress_water_3d(s3, cfg);
+        self.refresh_from_3d_cube(s3, false);
+        carrier
+    }
+
+    /// Losslessly restore `s3` prior to 3D water suppression (`wu`) and refresh the active plane/skyline.
+    pub fn undo_water_on_3d_cube(&mut self, s3: &mut Spectrum3D) -> bool {
+        let Some(prev) = self.water_undo_3d.take() else {
+            return false;
+        };
+        *s3 = prev;
+        self.refresh_from_3d_cube(s3, false);
+        true
     }
 }
 
@@ -1563,6 +2403,8 @@ pub struct WorkbookState {
     pub active_2d_idx: usize,
     next_page_id: u64,
     pub two_d: TwoDCanvasState,
+    /// Shared chemical-shift cursor map keyed by canonical physical nucleus (`"1H"`, `"15N"`, `"13C"`, ...).
+    pub shared_nucleus_ppm: BTreeMap<String, f64>,
 }
 
 impl Default for WorkbookState {
@@ -1574,11 +2416,103 @@ impl Default for WorkbookState {
             active_2d_idx: 0,
             next_page_id: 100,
             two_d: TwoDCanvasState::default(),
+            shared_nucleus_ppm: BTreeMap::new(),
         }
     }
 }
 
 impl WorkbookState {
+    #[inline]
+    pub fn invalidate_marginal_cache(&mut self) {
+        self.two_d.skyline_cache_key = None;
+    }
+
+    pub fn record_1d_cursor_by_nucleus(&mut self, nucleus: &str, ppm: f64) {
+        if ppm.is_finite() && !nucleus.is_empty() {
+            self.shared_nucleus_ppm.insert(nucleus.to_string(), ppm);
+        }
+    }
+
+    pub fn record_2d_crosshair_by_nucleus(
+        &mut self,
+        nuc_x: &str,
+        x_ppm: f64,
+        nuc_y: &str,
+        y_ppm: f64,
+    ) {
+        if x_ppm.is_finite() && !nuc_x.is_empty() {
+            self.shared_nucleus_ppm.insert(nuc_x.to_string(), x_ppm);
+        }
+        if y_ppm.is_finite() && !nuc_y.is_empty() {
+            self.shared_nucleus_ppm.insert(nuc_y.to_string(), y_ppm);
+        }
+    }
+
+    /// Resolve `(x_ppm, y_ppm)` for an active 2D/3D page's `(nuc_x, nuc_y)` from `shared_nucleus_ppm`,
+    /// falling back to `(fallback_x, fallback_y)` when a nucleus has not been visited yet.
+    pub fn shared_crosshair_for_axes(
+        &self,
+        nuc_x: &str,
+        nuc_y: &str,
+        fallback_x: f64,
+        fallback_y: f64,
+    ) -> (f64, f64) {
+        let x = self
+            .shared_nucleus_ppm
+            .get(nuc_x)
+            .copied()
+            .filter(|v| v.is_finite())
+            .unwrap_or(fallback_x);
+        let y = self
+            .shared_nucleus_ppm
+            .get(nuc_y)
+            .copied()
+            .filter(|v| v.is_finite())
+            .unwrap_or(fallback_y);
+        (x, y)
+    }
+
+    /// Synchronize all open `WorkbookPageKind::Cube3d` pages to `(h_ppm, n_ppm)` (`gs` chord)
+    /// and return the page index of the first synchronized `Cube3d` page (if any).
+    pub fn sync_open_3d_cubes_to_hn(
+        &mut self,
+        cubes_3d: &[Spectrum3D],
+        h_ppm: f64,
+        n_ppm: f64,
+    ) -> Option<(usize, f64, f64)> {
+        self.record_2d_crosshair_by_nucleus("1H", h_ppm, "15N", n_ppm);
+        let mut first_hit: Option<(usize, f64, f64)> = None;
+        for (p_idx, pg) in self.pages_2d.iter_mut().enumerate() {
+            let Some(c_idx) = pg.cube_idx() else {
+                continue;
+            };
+            let Some(s3) = cubes_3d.get(c_idx) else {
+                continue;
+            };
+            let (sx, sy) = pg.cube_slice.sync_to_hn(s3, h_ppm, n_ppm);
+            pg.refresh_from_3d_cube(s3, false);
+            if first_hit.is_none() {
+                first_hit = Some((p_idx, sx, sy));
+            }
+        }
+        if first_hit.is_some() {
+            self.two_d.skyline_cache_key = None;
+        }
+        first_hit
+    }
+
+    /// Reindex `Cube3d` pages after removing `removed_cube_idx` from `cubes_3d`.
+    pub fn reindex_after_cube_removed(&mut self, removed_cube_idx: usize) {
+        for pg in &mut self.pages_2d {
+            if let Some(ci) = pg.cube_idx() {
+                if ci > removed_cube_idx {
+                    let next_ci = ci - 1;
+                    pg.source_cube_idx = Some(next_ci);
+                    pg.kind = WorkbookPageKind::Cube3d { cube_idx: next_ci };
+                }
+            }
+        }
+    }
     pub fn alloc_page_id(&mut self) -> u64 {
         let id = self.next_page_id;
         self.next_page_id = self.next_page_id.wrapping_add(1);
@@ -2820,7 +3754,7 @@ pub fn render_workbook_sidebar(
                     paint_mini_2d_preview(painter, thumb_r, pg, is_active);
 
                     // Page number badge (tinted violet for 3D cubes)
-                    let is_3d_cube = pg.source_cube_idx.is_some();
+                    let is_3d_cube = pg.is_cube_3d();
                     let badge_r = egui::Rect::from_min_size(
                         egui::pos2(rect.left() + 7.0, rect.top() + 5.0),
                         egui::vec2(if is_3d_cube { 23.0 } else { 17.0 }, 15.0),

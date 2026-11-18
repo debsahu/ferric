@@ -77,7 +77,7 @@ use nmr_core::peaks::read_peaks;
 use nmr_core::peaks::{read_peaks_str, Peak, EXPERIMENT_NAMES};
 use nmr_core::picker::{
     estimate_noise_mad, pick_c13_hsqc_2d, pick_hsqc_2d, pick_triple_3d_two_pass,
-    CorroboratedRepickConfig, PickerConfig,
+    CorroboratedRepickConfig, CubePeak3D, PickerConfig,
 };
 use nmr_core::priors::{one_to_three, three_to_one, Priors, ATOMS};
 use nmr_core::process::{
@@ -160,14 +160,18 @@ use nmr_gui::{
         build_kinetics_demo_traces, export_stack1d_svg, render_stack1d_panel, AttachedSpectrum1d,
         InspectorTab1d, Stack1dState, Stack1dViewMode, ToolMode1d, Trace1d,
     },
-    strip_tiler::{StripSpectra3D, StripTilerAction, StripTilerContext, StripTilerPanel},
+    strip_tiler::{
+        compute_nice_strip_ticks, strip_vertical_axis_metadata, StripSpectra3D, StripTilerAction,
+        StripTilerContext, StripTilerPanel,
+    },
     workbook::{
         build_showcase_small_molecule_13c_trace, build_showcase_small_molecule_1h_trace,
         build_showcase_small_molecule_cosy_2d, chrome_icon_button, contour_palette_for_theme,
-        estimate_contour_base_and_noise, evaluate_2d_marginals, extract_3d_plane_f1,
-        extract_3d_plane_f2, extract_3d_skyline_f3_f2, f1_ppm_to_screen_y, f2_ppm_to_screen_x,
+        estimate_contour_base_and_noise, evaluate_2d_marginals, f1_ppm_to_screen_y,
+        f2_ppm_to_screen_x, infer_2d_spectrum_nuclei, infer_3d_cube_nuclei,
         paint_f1_marginal_strip, paint_f2_marginal_strip, paint_icon, rail_tool_button,
-        render_workbook_sidebar, ActiveWorkbookSelection, CanvasTheme2D, ToolMode2d, WorkbookIcon,
+        render_workbook_sidebar, trace_1d_nucleus, ActiveWorkbookSelection, CanvasTheme2D,
+        Cube3dSliceState, CubePlaneOrientation, PlanePeakVisibility, ToolMode2d, WorkbookIcon,
         WorkbookSidebarAction, WorkbookState, WorkbookStudioKind, CANVAS_TOOL_RAIL_WIDTH,
         CONTOUR_SCROLL_STEP_RATIO, MARGINAL_2D_STRIP_PX,
     },
@@ -1637,14 +1641,6 @@ impl OctetBackendAdapter for CoreOctetBackendAdapter {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum CubeViewMode {
-    #[default]
-    Skyline,
-    PlaneF2,
-    PlaneF1,
-}
-
 struct NmrWorkbenchApp {
     workspace_mode: WorkspaceMode,
     octet_app: OctetDrawPanel,
@@ -1718,9 +1714,10 @@ struct NmrWorkbenchApp {
     hnco_3d: Option<Spectrum3D>,
     cubes_3d: Vec<Spectrum3D>,
     active_cube_idx: Option<usize>,
-    cube_view_mode: CubeViewMode,
-    cube_plane_f2_idx: usize,
-    cube_plane_f1_idx: usize,
+    cube_slice: Cube3dSliceState,
+    peaks_3d: Vec<CubePeak3D>,
+    water_undo_3d: Option<Spectrum3D>,
+    focus_3d_peak_label_input: bool,
     extra_3d_count: usize,
     overlay_layers: Vec<(String, OverlayLayerSpec)>,
     primary_2d_label: String,
@@ -2240,9 +2237,10 @@ impl NmrWorkbenchApp {
             hnco_3d: None,
             cubes_3d: Vec::new(),
             active_cube_idx: None,
-            cube_view_mode: CubeViewMode::Skyline,
-            cube_plane_f2_idx: 0,
-            cube_plane_f1_idx: 0,
+            cube_slice: Cube3dSliceState::default(),
+            peaks_3d: Vec::new(),
+            water_undo_3d: None,
+            focus_3d_peak_label_input: false,
             extra_3d_count: 0,
             overlay_layers: Vec::new(),
             primary_2d_label: "15N-HSQC".to_string(),
@@ -2371,17 +2369,7 @@ impl NmrWorkbenchApp {
 
     fn active_2d_nuclei(&self) -> (&'static str, &'static str) {
         if let Some(spec) = &self.hsqc_spec {
-            let nx = Self::canonical_2d_axis_nucleus(
-                &spec.axis_x.label,
-                spec.axis_x.min_ppm(),
-                spec.axis_x.max_ppm(),
-            );
-            let ny = Self::canonical_2d_axis_nucleus(
-                &spec.axis_y.label,
-                spec.axis_y.min_ppm(),
-                spec.axis_y.max_ppm(),
-            );
-            (nx, ny)
+            infer_2d_spectrum_nuclei(spec)
         } else {
             ("1H", "15N")
         }
@@ -3024,6 +3012,16 @@ impl NmrWorkbenchApp {
     }
 
     fn save_live_2d_into_workbook(&mut self) {
+        let (nx, ny) = self.active_2d_nuclei();
+        self.workbook.record_2d_crosshair_by_nucleus(
+            nx,
+            self.crosshair.h_ppm,
+            ny,
+            self.crosshair.n_ppm,
+        );
+        if let Some(c_ppm) = self.crosshair.c_ppm {
+            self.workbook.record_1d_cursor_by_nucleus("13C", c_ppm);
+        }
         if let Some(pg) = self.workbook.pages_2d.get_mut(self.workbook.active_2d_idx) {
             pg.view_ppm = [
                 self.view_h_left,
@@ -3043,6 +3041,11 @@ impl NmrWorkbenchApp {
             pg.water_undo_2d = self.water_undo_2d.clone();
             pg.zoom_history = self.workbook.two_d.zoom_history.clone();
             pg.pick_diagonal = self.workbook.two_d.pick_diagonal;
+            if pg.is_cube_3d() {
+                pg.cube_slice = self.cube_slice.clone();
+                pg.peaks_3d = self.peaks_3d.clone();
+                pg.water_undo_3d = self.water_undo_3d.clone();
+            }
         }
     }
 
@@ -3076,20 +3079,25 @@ impl NmrWorkbenchApp {
         {
             self.save_live_2d_into_workbook();
         } else if self.show_stack1d_panel && !self.stack1d_panel.traces.is_empty() {
+            if let Some(tr) = self
+                .stack1d_panel
+                .traces
+                .get(self.stack1d_panel.ref_trace_idx)
+            {
+                if let Some(cp) = self.stack1d_panel.cursor_ppm {
+                    let nuc = trace_1d_nucleus(tr);
+                    self.workbook.record_1d_cursor_by_nucleus(nuc, cp);
+                }
+            }
             self.stack1d_panel.save_active_trace_curation_state();
         }
         self.workbook.active_2d_idx = idx;
         let pg = self.workbook.pages_2d[idx].clone();
-        if self.active_cube_idx != pg.source_cube_idx {
-            self.active_cube_idx = pg.source_cube_idx;
-            if let Some(c_idx) = self.active_cube_idx {
-                if let Some(c) = self.cubes_3d.get(c_idx) {
-                    self.cube_view_mode = CubeViewMode::Skyline;
-                    self.cube_plane_f2_idx = c.ny() / 2;
-                    self.cube_plane_f1_idx = c.nz() / 2;
-                }
-            }
-        }
+        self.active_cube_idx = pg.cube_idx();
+        self.cube_slice = pg.cube_slice.clone();
+        self.peaks_3d = pg.peaks_3d.clone();
+        self.water_undo_3d = pg.water_undo_3d.clone();
+        self.focus_3d_peak_label_input = false;
         self.primary_2d_label = pg.title.clone();
         self.primary_2d_visible = true;
         self.primary_ppm_nudge = pg.ppm_nudge;
@@ -3114,12 +3122,20 @@ impl NmrWorkbenchApp {
         self.workbook.two_d.selected_peak_idx = None;
         self.workbook.two_d.dragging_peak_idx = None;
         self.workbook.two_d.pick_box_start_pos = None;
+        self.workbook.invalidate_marginal_cache();
         self.box_zoom_2d_anchor = None;
-        self.crosshair.snap_to(
-            0.5 * (self.view_h_left as f64 + self.view_h_right as f64),
-            0.5 * (self.view_n_top as f64 + self.view_n_bottom as f64),
-            self.crosshair.c_ppm,
-        );
+        let fallback_x = 0.5 * (self.view_h_left as f64 + self.view_h_right as f64);
+        let fallback_y = 0.5 * (self.view_n_top as f64 + self.view_n_bottom as f64);
+        let (xh_x, xh_y) = self
+            .workbook
+            .shared_crosshair_for_axes(pg.nuc_x, pg.nuc_y, fallback_x, fallback_y);
+        let xh_c = self
+            .workbook
+            .shared_nucleus_ppm
+            .get("13C")
+            .copied()
+            .or(self.crosshair.c_ppm);
+        self.crosshair.snap_to(xh_x, xh_y, xh_c);
         self.sync_overlay_layers_from_workbook();
         self.workspace_mode = WorkspaceMode::ProteinNmr;
         self.show_stack1d_panel = false;
@@ -3136,8 +3152,9 @@ impl NmrWorkbenchApp {
                 self.systems.clear();
             }
         }
-        let has_3d = self.hncacb_3d.is_some() || self.hnco_3d.is_some();
-        self.show_strips_dock = pg.has_3d_strips && has_3d;
+        let has_3d =
+            self.hncacb_3d.is_some() || self.hnco_3d.is_some() || !self.cubes_3d.is_empty();
+        self.show_strips_dock = pg.has_3d_strips && has_3d && self.active_cube_idx.is_none();
         if !pg.has_3d_strips {
             self.show_mol3d_viewport = false;
             self.responsive_shell.tablet_dock = TabletActiveDock::Hidden;
@@ -3153,9 +3170,393 @@ impl NmrWorkbenchApp {
             self.save_live_2d_into_workbook();
         }
         self.stack1d_panel.activate_trace_page(idx);
+        let nuc = trace_1d_nucleus(&self.stack1d_panel.traces[idx]);
+        if let Some(&shared_ppm) = self.workbook.shared_nucleus_ppm.get(nuc) {
+            self.stack1d_panel.cursor_ppm = Some(shared_ppm);
+        }
         let lbl = self.stack1d_panel.traces[idx].label.clone();
         self.activate_1d_studio_mode();
         self.status_msg = format!("Viewing {lbl}");
+    }
+
+    fn apply_active_cube_slice_refresh(&mut self, reset_viewport: bool) {
+        let Some(c_idx) = self.active_cube_idx else {
+            return;
+        };
+        let Some(cube) = self.cubes_3d.get(c_idx).cloned() else {
+            return;
+        };
+        let prev_axes = self.active_2d_nuclei();
+        let spec2d = self.cube_slice.extract_active_2d(&cube);
+        let next_axes = infer_2d_spectrum_nuclei(&spec2d);
+        let (base_lv, noise_lv) = Self::estimate_2d_contour_base(&spec2d.data);
+        self.contour_noise_ref = noise_lv.max(base_lv / 6.0).max(1e-6);
+        if reset_viewport || prev_axes != next_axes {
+            self.view_h_left = spec2d.axis_x.max_ppm() as f32;
+            self.view_h_right = spec2d.axis_x.min_ppm() as f32;
+            self.view_n_top = spec2d.axis_y.min_ppm() as f32;
+            self.view_n_bottom = spec2d.axis_y.max_ppm() as f32;
+            self.workbook.two_d.zoom_history.clear();
+            self.contour_base = base_lv;
+            let fx = 0.5 * (self.view_h_left as f64 + self.view_h_right as f64);
+            let fy = 0.5 * (self.view_n_top as f64 + self.view_n_bottom as f64);
+            let (xh_x, xh_y) =
+                self.workbook
+                    .shared_crosshair_for_axes(next_axes.0, next_axes.1, fx, fy);
+            self.crosshair.snap_to(xh_x, xh_y, self.crosshair.c_ppm);
+        } else if self.contour_base <= 0.0 || !self.contour_base.is_finite() {
+            self.contour_base = base_lv;
+        }
+        let arc = Arc::new(spec2d.data.clone());
+        self.hsqc_arc = Arc::clone(&arc);
+        self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+        self.hsqc_spec = Some(spec2d);
+        self.workbook.invalidate_marginal_cache();
+        self.save_live_2d_into_workbook();
+        if let Some(pg) = self.workbook.pages_2d.get_mut(self.workbook.active_2d_idx) {
+            if let Some(ref s) = self.hsqc_spec {
+                pg.nuc_x = next_axes.0;
+                pg.nuc_y = next_axes.1;
+                pg.spec = s.clone();
+                pg.data_arc = arc;
+                pg.spec_gen = self.hsqc_gen;
+            }
+        }
+        self.sync_overlay_layers_from_workbook();
+    }
+
+    fn step_active_cube_plane(&mut self, delta: isize) -> bool {
+        let Some(c_idx) = self.active_cube_idx else {
+            return false;
+        };
+        let Some(cube) = self.cubes_3d.get(c_idx).cloned() else {
+            return false;
+        };
+        let was_sky = self.cube_slice.skyline_enabled;
+        let next_idx = self.cube_slice.step_plane(&cube, delta);
+        let ortho_ppm = self.cube_slice.active_ortho_ppm(&cube);
+        let ortho_tag = self.cube_slice.orientation.ortho_axis_tag();
+        let (nx, ny, nz) = infer_3d_cube_nuclei(&cube);
+        let ortho_nuc = match self.cube_slice.orientation {
+            CubePlaneOrientation::F3xF2StepF1 => nz,
+            CubePlaneOrientation::F3xF1StepF2 => ny,
+            CubePlaneOrientation::F2xF1StepF3 => nx,
+        };
+        self.workbook
+            .record_1d_cursor_by_nucleus(ortho_nuc, ortho_ppm);
+        if ortho_nuc == "13C" {
+            self.crosshair.c_ppm = Some(ortho_ppm);
+        }
+        self.apply_active_cube_slice_refresh(was_sky);
+        self.status_msg = format!(
+            "3D {} {} plane {}/{} ({ortho_tag} {} = {ortho_ppm:.2} ppm)",
+            cube.exp,
+            self.cube_slice.orientation.short_label(),
+            next_idx + 1,
+            self.cube_slice.ortho_len(&cube),
+            Self::pretty_nucleus_unicode(ortho_nuc),
+        );
+        true
+    }
+
+    fn set_active_cube_orientation(&mut self, orientation: CubePlaneOrientation) -> bool {
+        let Some(c_idx) = self.active_cube_idx else {
+            return false;
+        };
+        let Some(cube) = self.cubes_3d.get(c_idx).cloned() else {
+            return false;
+        };
+        let reset_vp =
+            self.cube_slice.orientation != orientation || self.cube_slice.skyline_enabled;
+        self.cube_slice.set_orientation(&cube, orientation);
+        let ortho_ppm = self.cube_slice.active_ortho_ppm(&cube);
+        self.apply_active_cube_slice_refresh(reset_vp);
+        self.status_msg = format!(
+            "3D {} orientation: {} stepped along {} ({ortho_ppm:.2} ppm)",
+            cube.exp,
+            orientation.short_label(),
+            orientation.ortho_axis_tag()
+        );
+        true
+    }
+
+    fn toggle_active_cube_skyline(&mut self) -> bool {
+        let Some(c_idx) = self.active_cube_idx else {
+            return false;
+        };
+        let Some(cube) = self.cubes_3d.get(c_idx).cloned() else {
+            return false;
+        };
+        let sky = self.cube_slice.toggle_skyline();
+        self.apply_active_cube_slice_refresh(true);
+        self.status_msg = if sky {
+            format!(
+                "3D {} 2D Skyline ({} MIP across {})",
+                cube.exp,
+                self.cube_slice.orientation.short_label(),
+                self.cube_slice.orientation.ortho_axis_tag()
+            )
+        } else {
+            format!(
+                "3D {} discrete {} plane {}/{}",
+                cube.exp,
+                self.cube_slice.orientation.short_label(),
+                self.cube_slice.active_plane_idx(&cube) + 1,
+                self.cube_slice.ortho_len(&cube)
+            )
+        };
+        true
+    }
+
+    fn goto_3d_strip_from_hsqc(&mut self) -> bool {
+        if self.cubes_3d.is_empty() {
+            self.status_msg = "Load a 3D NMR cube before jumping to a 3D strip (`gs`)".to_string();
+            return false;
+        }
+        let (nx, ny) = self.active_2d_nuclei();
+        let (h_ppm, n_ppm) = if nx == "1H" && ny == "15N" {
+            if let Some(sel_pk) = self
+                .workbook
+                .two_d
+                .selected_peak_idx
+                .and_then(|i| self.peaks.get(i))
+                .filter(|p| p.c.is_none())
+            {
+                (sel_pk.h, sel_pk.n)
+            } else if let Some(ss) = self.selected_ss.and_then(|s| self.systems.get(s)) {
+                (ss.h, ss.n)
+            } else {
+                (self.crosshair.h_ppm, self.crosshair.n_ppm)
+            }
+        } else {
+            let h = self
+                .workbook
+                .shared_nucleus_ppm
+                .get("1H")
+                .copied()
+                .unwrap_or(self.crosshair.h_ppm);
+            let n = self
+                .workbook
+                .shared_nucleus_ppm
+                .get("15N")
+                .copied()
+                .unwrap_or(self.crosshair.n_ppm);
+            (h, n)
+        };
+
+        self.save_live_2d_into_workbook();
+        let cubes_snapshot = self.cubes_3d.clone();
+        let target = if let Some(cur_c_idx) = self.active_cube_idx {
+            if let Some(cube) = cubes_snapshot.get(cur_c_idx) {
+                let (sx, sy) = self.cube_slice.sync_to_hn(cube, h_ppm, n_ppm);
+                let _ = self
+                    .workbook
+                    .sync_open_3d_cubes_to_hn(&cubes_snapshot, h_ppm, n_ppm);
+                self.apply_active_cube_slice_refresh(true);
+                self.crosshair.snap_to(sx, sy, self.crosshair.c_ppm);
+                Some((self.workbook.active_2d_idx, sx, sy))
+            } else {
+                None
+            }
+        } else if let Some((cube_page_idx, sx, sy)) =
+            self.workbook
+                .sync_open_3d_cubes_to_hn(&cubes_snapshot, h_ppm, n_ppm)
+        {
+            self.activate_2d_workbook_page(cube_page_idx);
+            self.crosshair.snap_to(sx, sy, self.crosshair.c_ppm);
+            Some((cube_page_idx, sx, sy))
+        } else {
+            None
+        };
+
+        if target.is_some() {
+            if self.active_2d_nuclei().0 == "1H" {
+                if let Some(ref sp) = self.hsqc_spec {
+                    let half_w = 0.22_f32;
+                    let lo = sp.axis_x.min_ppm() as f32;
+                    let hi = sp.axis_x.max_ppm() as f32;
+                    let hc = (h_ppm as f32).clamp(lo, hi);
+                    self.view_h_left = (hc + half_w).min(hi);
+                    self.view_h_right = (hc - half_w).max(lo);
+                    self.save_live_2d_into_workbook();
+                }
+            }
+            self.status_msg =
+                format!("Synced 3D strip plane to ¹H {h_ppm:.3}, ¹⁵N {n_ppm:.2} ppm (`gs`)");
+            true
+        } else {
+            false
+        }
+    }
+
+    fn pick_active_3d_cube_peaks(&mut self) -> usize {
+        let Some(c_idx) = self.active_cube_idx else {
+            return 0;
+        };
+        let Some(cube) = self.cubes_3d.get(c_idx).cloned() else {
+            return 0;
+        };
+        self.save_live_2d_into_workbook();
+        let count = if let Some(pg) = self.workbook.pages_2d.get_mut(self.workbook.active_2d_idx) {
+            let n = pg.pick_3d_cube_peaks(&cube);
+            self.peaks_3d = pg.peaks_3d.clone();
+            self.cube_slice = pg.cube_slice.clone();
+            n
+        } else {
+            0
+        };
+        self.workbook.two_d.show_peak_table = true;
+        self.status_msg = format!(
+            "Picked {count} 3D local extrema in {} (sorted by |height|)",
+            cube.exp
+        );
+        count
+    }
+
+    fn pick_active_3d_plane_peaks(&mut self) -> usize {
+        let Some(c_idx) = self.active_cube_idx else {
+            return 0;
+        };
+        let Some(cube) = self.cubes_3d.get(c_idx).cloned() else {
+            return 0;
+        };
+        self.save_live_2d_into_workbook();
+        let added = if let Some(pg) = self.workbook.pages_2d.get_mut(self.workbook.active_2d_idx) {
+            let n = pg.pick_3d_current_plane_peaks(&cube);
+            self.peaks_3d = pg.peaks_3d.clone();
+            self.cube_slice = pg.cube_slice.clone();
+            n
+        } else {
+            0
+        };
+        self.workbook.two_d.show_peak_table = true;
+        self.status_msg = format!(
+            "Picked {added} new peak(s) on active {} plane ({} total 3D peaks)",
+            self.cube_slice.orientation.short_label(),
+            self.peaks_3d.len()
+        );
+        added
+    }
+
+    fn add_active_3d_peak_on_plane(
+        &mut self,
+        plane_x_ppm: f64,
+        plane_y_ppm: f64,
+        snap_to_extremum: bool,
+    ) -> Option<usize> {
+        let c_idx = self.active_cube_idx?;
+        let cube = self.cubes_3d.get(c_idx)?.clone();
+        self.save_live_2d_into_workbook();
+        let pg = self
+            .workbook
+            .pages_2d
+            .get_mut(self.workbook.active_2d_idx)?;
+        let idx = pg.add_3d_peak_on_plane(&cube, plane_x_ppm, plane_y_ppm, snap_to_extremum);
+        self.peaks_3d = pg.peaks_3d.clone();
+        self.cube_slice = pg.cube_slice.clone();
+        self.workbook.two_d.show_peak_table = true;
+        if let Some(pk) = self.peaks_3d.get(idx) {
+            self.status_msg = format!(
+                "Added 3D peak #{}: ({:.3}, {:.2}, {:.2}) ppm",
+                idx + 1,
+                pk.f3_ppm,
+                pk.f2_ppm,
+                pk.f1_ppm
+            );
+        }
+        Some(idx)
+    }
+
+    fn move_active_3d_peak_on_plane(&mut self, peak_idx: usize, new_x: f64, new_y: f64) {
+        let Some(c_idx) = self.active_cube_idx else {
+            return;
+        };
+        let Some(cube) = self.cubes_3d.get(c_idx).cloned() else {
+            return;
+        };
+        self.save_live_2d_into_workbook();
+        if let Some(pg) = self.workbook.pages_2d.get_mut(self.workbook.active_2d_idx) {
+            if pg.move_3d_peak_on_plane(&cube, peak_idx, new_x, new_y) {
+                self.peaks_3d = pg.peaks_3d.clone();
+                self.cube_slice = pg.cube_slice.clone();
+            }
+        }
+    }
+
+    fn snap_active_3d_peak(&mut self, peak_idx: usize) {
+        let Some(c_idx) = self.active_cube_idx else {
+            return;
+        };
+        let Some(cube) = self.cubes_3d.get(c_idx).cloned() else {
+            return;
+        };
+        self.save_live_2d_into_workbook();
+        if let Some(pg) = self.workbook.pages_2d.get_mut(self.workbook.active_2d_idx) {
+            if pg.snap_3d_peak(&cube, peak_idx) {
+                self.peaks_3d = pg.peaks_3d.clone();
+                self.cube_slice = pg.cube_slice.clone();
+                if let Some(pk) = self.peaks_3d.get(peak_idx) {
+                    self.status_msg = format!(
+                        "Snapped 3D peak #{} to ({:.3}, {:.2}, {:.2}) ppm",
+                        peak_idx + 1,
+                        pk.f3_ppm,
+                        pk.f2_ppm,
+                        pk.f1_ppm
+                    );
+                }
+            }
+        }
+    }
+
+    fn relabel_active_3d_peak(&mut self, peak_idx: usize, label: impl Into<String>) {
+        self.save_live_2d_into_workbook();
+        if let Some(pg) = self.workbook.pages_2d.get_mut(self.workbook.active_2d_idx) {
+            if pg.relabel_3d_peak(peak_idx, label) {
+                self.peaks_3d = pg.peaks_3d.clone();
+            }
+        }
+    }
+
+    fn delete_active_3d_peak(&mut self, peak_idx: usize) {
+        self.save_live_2d_into_workbook();
+        if let Some(pg) = self.workbook.pages_2d.get_mut(self.workbook.active_2d_idx) {
+            if pg.delete_3d_peak(peak_idx).is_some() {
+                self.peaks_3d = pg.peaks_3d.clone();
+                self.cube_slice = pg.cube_slice.clone();
+                self.status_msg = format!("Deleted 3D peak #{}", peak_idx + 1);
+            }
+        }
+    }
+
+    fn jump_to_active_3d_peak_plane(&mut self, peak_idx: usize) {
+        let Some(c_idx) = self.active_cube_idx else {
+            return;
+        };
+        let Some(cube) = self.cubes_3d.get(c_idx).cloned() else {
+            return;
+        };
+        self.save_live_2d_into_workbook();
+        let jumped = if let Some(pg) = self.workbook.pages_2d.get_mut(self.workbook.active_2d_idx) {
+            let res = pg.jump_to_3d_peak_plane(&cube, peak_idx);
+            self.cube_slice = pg.cube_slice.clone();
+            self.peaks_3d = pg.peaks_3d.clone();
+            res
+        } else {
+            None
+        };
+        if let Some((px, py)) = jumped {
+            self.apply_active_cube_slice_refresh(false);
+            self.crosshair.snap_to(px, py, self.crosshair.c_ppm);
+            if let Some(pk) = self.peaks_3d.get(peak_idx) {
+                self.status_msg = format!(
+                    "Jumped to 3D peak #{} plane ({:.3}, {:.2}, {:.2} ppm)",
+                    peak_idx + 1,
+                    pk.f3_ppm,
+                    pk.f2_ppm,
+                    pk.f1_ppm
+                );
+            }
+        }
     }
 
     fn load_builtin_demo_suite(&mut self) {
@@ -3203,6 +3604,10 @@ impl NmrWorkbenchApp {
                 // Register clean multi-page 2D workbook entries:
                 // 0: Small-molecule 2D 1H-1H COSY (paired with Page 1 1D 1H)
                 // 1: Ubiquitin 2D 1H-15N HSQC (+ 3D HNCACB/HNCO strips)
+                self.cubes_3d.clear();
+                self.active_cube_idx = None;
+                self.peaks_3d.clear();
+                self.water_undo_3d = None;
                 self.workbook.clear_2d_pages();
                 let cosy_2d = build_showcase_small_molecule_cosy_2d();
                 let _ = self
@@ -5170,7 +5575,275 @@ impl NmrWorkbenchApp {
         rows.join("\n") + "\n"
     }
 
+    fn export_3d_peaks_tsv(&self) -> String {
+        let (nx, ny, nz) = self
+            .active_cube_idx
+            .and_then(|ci| self.cubes_3d.get(ci))
+            .map(infer_3d_cube_nuclei)
+            .unwrap_or(("1H", "15N", "13C"));
+        let mut rows = vec![format!(
+            "#\texp\tF3_{nx}_ppm\tF2_{ny}_ppm\tF1_{nz}_ppm\theight\tvolume\tsnr\tsign\tlabel"
+        )];
+        for (i, pk) in self.peaks_3d.iter().enumerate() {
+            rows.push(format!(
+                "{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.3}\t{:.3}\t{:.2}\t{}\t{}",
+                i + 1,
+                pk.exp,
+                pk.f3_ppm,
+                pk.f2_ppm,
+                pk.f1_ppm,
+                pk.height,
+                pk.volume,
+                pk.snr,
+                pk.sign,
+                pk.label
+            ));
+        }
+        rows.join("\n") + "\n"
+    }
+
+    fn draw_3d_peaks_bottom_table(&mut self, ui: &mut egui::Ui) {
+        let Some(c_idx) = self.active_cube_idx else {
+            return;
+        };
+        let Some(cube) = self.cubes_3d.get(c_idx).cloned() else {
+            return;
+        };
+        let (nx, ny, nz) = infer_3d_cube_nuclei(&cube);
+        let px = Self::pretty_nucleus_unicode(nx);
+        let py = Self::pretty_nucleus_unicode(ny);
+        let pz = Self::pretty_nucleus_unicode(nz);
+
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            let tab_lbl = format!("3D Peaks ({})", self.peaks_3d.len());
+            if ui
+                .selectable_label(self.workbook.two_d.show_peak_table, &tab_lbl)
+                .on_hover_text("Show / hide interactive 3D Cube Peak List Table (lt)")
+                .clicked()
+            {
+                self.workbook.two_d.show_peak_table = !self.workbook.two_d.show_peak_table;
+            }
+            if ui
+                .small_button("+ Add Peak (pa)")
+                .on_hover_text("Add a 3D peak at current crosshair on active plane (pa)")
+                .clicked()
+            {
+                let _ = self.add_active_3d_peak_on_plane(
+                    self.crosshair.h_ppm,
+                    self.crosshair.n_ppm,
+                    true,
+                );
+            }
+            if ui
+                .small_button("Pick 3D Cube (at)")
+                .on_hover_text(
+                    "Pick true 3D (F3, F2, F1) local extrema with 3-point sub-voxel interpolation",
+                )
+                .clicked()
+            {
+                let _ = self.pick_active_3d_cube_peaks();
+            }
+            if ui
+                .small_button("Pick Active Plane")
+                .on_hover_text("Pick 2D local extrema on the active orthogonal plane and merge")
+                .clicked()
+            {
+                let _ = self.pick_active_3d_plane_peaks();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let toggle_lbl = if self.workbook.two_d.show_peak_table {
+                    "Hide Table"
+                } else {
+                    "Show Table"
+                };
+                if ui.small_button(toggle_lbl).clicked() {
+                    self.workbook.two_d.show_peak_table = !self.workbook.two_d.show_peak_table;
+                }
+            });
+        });
+
+        if !self.workbook.two_d.show_peak_table {
+            return;
+        }
+
+        egui::Frame::group(ui.style())
+            .fill(egui::Color32::from_rgb(15, 21, 32))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(88, 60, 148)))
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                let mut repick_cube = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("3D Picker:");
+                    ui.label("Min SNR:");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut self.cube_slice.snr_threshold)
+                                .range(2.0..=50.0)
+                                .speed(0.2)
+                                .fixed_decimals(1),
+                        )
+                        .changed()
+                    {
+                        repick_cube = true;
+                    }
+                    if ui
+                        .checkbox(&mut self.cube_slice.exclude_diagonal, "Excl. Diagonal")
+                        .changed()
+                    {
+                        repick_cube = true;
+                    }
+                    if ui
+                        .checkbox(&mut self.cube_slice.exclude_water_band, "Excl. Water")
+                        .changed()
+                    {
+                        repick_cube = true;
+                    }
+                    if ui
+                        .checkbox(&mut self.show_negative, "Neg Peaks")
+                        .changed()
+                    {
+                        repick_cube = true;
+                    }
+                    ui.checkbox(&mut self.show_peak_labels, "Peak Labels (pl)");
+                    if !self.peaks_3d.is_empty() && ui.button("Copy TSV").clicked() {
+                        ui.ctx().copy_text(self.export_3d_peaks_tsv());
+                        self.status_msg = format!(
+                            "Copied {} 3D peaks (TSV) to clipboard",
+                            self.peaks_3d.len()
+                        );
+                    }
+                    if !self.peaks_3d.is_empty() && ui.button("Clear 3D Peaks").clicked() {
+                        self.peaks_3d.clear();
+                        self.cube_slice.selected_peak_3d_idx = None;
+                        self.cube_slice.dragging_peak_3d_idx = None;
+                        self.save_live_2d_into_workbook();
+                        self.status_msg = "Cleared 3D peaks".to_string();
+                    }
+                });
+                if repick_cube {
+                    let _ = self.pick_active_3d_cube_peaks();
+                }
+
+                if self.peaks_3d.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "No 3D peaks picked yet. Press 'at' or click 'Pick 3D Cube (at)', 'Pick Active Plane', or Ctrl+Click / [K] on any 3D plane.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                    return;
+                }
+
+                let mut jump_req: Option<usize> = None;
+                let mut snap_req: Option<usize> = None;
+                let mut del_req: Option<usize> = None;
+                let mut relabel_req: Option<(usize, String)> = None;
+
+                egui::ScrollArea::vertical()
+                    .id_salt("three_d_peaks_table_scroll")
+                    .max_height(136.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("three_d_peaks_grid")
+                            .striped(true)
+                            .spacing([10.0, 3.0])
+                            .show(ui, |ui| {
+                                ui.strong("#");
+                                ui.strong(format!("F3 ({px})"));
+                                ui.strong(format!("F2 ({py})"));
+                                ui.strong(format!("F1 ({pz})"));
+                                ui.strong("Height");
+                                ui.strong("SNR");
+                                ui.strong("ΔPlane");
+                                ui.strong("Label");
+                                ui.strong("Actions");
+                                ui.end_row();
+
+                                for (pk_idx, pk) in self.peaks_3d.iter().take(500).enumerate() {
+                                    let is_sel =
+                                        self.cube_slice.selected_peak_3d_idx == Some(pk_idx);
+                                    let proj =
+                                        self.cube_slice.project_peak_3d(&cube, pk_idx, pk);
+                                    if ui
+                                        .selectable_label(is_sel, format!("{}", pk_idx + 1))
+                                        .on_hover_text(
+                                            "Click to jump active 3D plane & crosshair directly onto this peak",
+                                        )
+                                        .clicked()
+                                    {
+                                        jump_req = Some(pk_idx);
+                                    }
+                                    ui.monospace(format!("{:.3}", pk.f3_ppm));
+                                    ui.monospace(format!("{:.2}", pk.f2_ppm));
+                                    ui.monospace(format!("{:.2}", pk.f1_ppm));
+                                    ui.monospace(format!("{:+.1}", pk.height));
+                                    ui.monospace(format!("{:.1}", pk.snr));
+                                    let dp_txt = if self.cube_slice.skyline_enabled {
+                                        "MIP".to_string()
+                                    } else {
+                                        format!("{:+.1}", proj.delta_planes)
+                                    };
+                                    ui.monospace(dp_txt);
+                                    let mut lbl_edit = pk.label.clone();
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut lbl_edit)
+                                                .desired_width(92.0)
+                                                .hint_text("label"),
+                                        )
+                                        .changed()
+                                    {
+                                        relabel_req = Some((pk_idx, lbl_edit));
+                                    }
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .small_button("Jump")
+                                            .on_hover_text("Jump active 3D plane to this peak")
+                                            .clicked()
+                                        {
+                                            jump_req = Some(pk_idx);
+                                        }
+                                        if ui
+                                            .small_button("Snap")
+                                            .on_hover_text(
+                                                "Snap to 3D parabolic sub-voxel extremum (pc)",
+                                            )
+                                            .clicked()
+                                        {
+                                            snap_req = Some(pk_idx);
+                                        }
+                                        if ui
+                                            .small_button("x")
+                                            .on_hover_text("Delete 3D peak (pd / Del)")
+                                            .clicked()
+                                        {
+                                            del_req = Some(pk_idx);
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+                            });
+                    });
+
+                if let Some((pi, new_lbl)) = relabel_req {
+                    self.relabel_active_3d_peak(pi, new_lbl);
+                }
+                if let Some(pi) = jump_req {
+                    self.jump_to_active_3d_peak_plane(pi);
+                } else if let Some(pi) = snap_req {
+                    self.snap_active_3d_peak(pi);
+                } else if let Some(pi) = del_req {
+                    self.delete_active_3d_peak(pi);
+                }
+            });
+    }
+
     fn draw_2d_peaks_bottom_table(&mut self, ui: &mut egui::Ui) {
+        if self.active_cube_idx.is_some() {
+            self.draw_3d_peaks_bottom_table(ui);
+            return;
+        }
         let indices: Vec<usize> = self
             .peaks
             .iter()
@@ -5586,7 +6259,22 @@ impl NmrWorkbenchApp {
                 WorkbookSidebarAction::Remove2dPage(idx) => {
                     if idx < self.workbook.pages_2d.len() {
                         let removed = self.workbook.pages_2d.remove(idx);
+                        if let Some(rm_c_idx) = removed.cube_idx() {
+                            if !self
+                                .workbook
+                                .pages_2d
+                                .iter()
+                                .any(|p| p.cube_idx() == Some(rm_c_idx))
+                                && rm_c_idx < self.cubes_3d.len()
+                            {
+                                self.cubes_3d.remove(rm_c_idx);
+                                self.workbook.reindex_after_cube_removed(rm_c_idx);
+                            }
+                        }
                         if self.workbook.pages_2d.is_empty() {
+                            self.active_cube_idx = None;
+                            self.peaks_3d.clear();
+                            self.water_undo_3d = None;
                             self.hsqc_spec = None;
                             self.hsqc_arc = Arc::new(Vec::new());
                             self.overlay_layers.clear();
@@ -5600,7 +6288,7 @@ impl NmrWorkbenchApp {
                                 .min(self.workbook.pages_2d.len() - 1);
                             self.activate_2d_workbook_page(next);
                         }
-                        self.status_msg = format!("Closed 2D page '{}'", removed.title);
+                        self.status_msg = format!("Closed page '{}'", removed.title);
                     }
                 }
                 WorkbookSidebarAction::OpenStudio(kind) => match kind {
@@ -5985,6 +6673,10 @@ impl NmrWorkbenchApp {
     fn clear_workbook_all(&mut self) {
         self.stack1d_panel = Stack1dState::default();
         self.workbook.clear_2d_pages();
+        self.cubes_3d.clear();
+        self.active_cube_idx = None;
+        self.peaks_3d.clear();
+        self.water_undo_3d = None;
         self.hsqc_spec = None;
         self.hsqc_arc = Arc::new(Vec::new());
         self.overlay_layers.clear();
@@ -6908,17 +7600,20 @@ impl NmrWorkbenchApp {
         let Some(cube) = self.cubes_3d.get(c_idx).cloned() else {
             return;
         };
-        let ny = cube.ny().max(1);
-        let nz = cube.nz().max(1);
-        self.cube_plane_f2_idx = self.cube_plane_f2_idx.min(ny - 1);
-        self.cube_plane_f1_idx = self.cube_plane_f1_idx.min(nz - 1);
-        let f2_ppm = cube.axis_y.index_to_ppm(self.cube_plane_f2_idx as f64);
-        let f1_ppm = cube.axis_z.index_to_ppm(self.cube_plane_f1_idx as f64);
-        let z_lbl = Self::pretty_nucleus_unicode(&cube.axis_z.label);
-        let y_lbl = Self::pretty_nucleus_unicode(&cube.axis_y.label);
+        let (nx, ny, nz) = infer_3d_cube_nuclei(&cube);
+        let px = Self::pretty_nucleus_unicode(nx);
+        let py = Self::pretty_nucleus_unicode(ny);
+        let pz = Self::pretty_nucleus_unicode(nz);
 
-        let mut changed = false;
-        let mut mode_switched = false;
+        let mut step_delta: Option<isize> = None;
+        let mut new_orientation: Option<CubePlaneOrientation> = None;
+        let mut toggle_sky = false;
+        let mut plane_slider_to: Option<usize> = None;
+        let mut slab_changed = false;
+        let mut trigger_pick_3d = false;
+        let mut trigger_pick_plane = false;
+        let mut trigger_goto_hsqc = false;
+
         egui::Frame::new()
             .fill(egui::Color32::from_rgb(22, 27, 42))
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(88, 60, 148)))
@@ -6927,142 +7622,188 @@ impl NmrWorkbenchApp {
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("3D {}", cube.exp))
+                        egui::RichText::new(format!("3D {} ({px}×{py}×{pz})", cube.exp))
                             .strong()
                             .small()
                             .color(egui::Color32::from_rgb(196, 181, 253)),
                     );
-                    if ui
-                        .selectable_label(
-                            self.cube_view_mode == CubeViewMode::Skyline,
-                            "2D Skyline (F3×F2)",
-                        )
-                        .clicked()
-                        && self.cube_view_mode != CubeViewMode::Skyline
-                    {
-                        self.cube_view_mode = CubeViewMode::Skyline;
-                        changed = true;
-                        mode_switched = true;
-                    }
-                    if ui
-                        .selectable_label(
-                            self.cube_view_mode == CubeViewMode::PlaneF2,
-                            format!("F2 Planes ({y_lbl} = {f2_ppm:.2} ppm)"),
-                        )
-                        .clicked()
-                        && self.cube_view_mode != CubeViewMode::PlaneF2
-                    {
-                        self.cube_view_mode = CubeViewMode::PlaneF2;
-                        changed = true;
-                        mode_switched = true;
-                    }
-                    if ui
-                        .selectable_label(
-                            self.cube_view_mode == CubeViewMode::PlaneF1,
-                            format!("F1 Planes ({z_lbl} = {f1_ppm:.2} ppm)"),
-                        )
-                        .clicked()
-                        && self.cube_view_mode != CubeViewMode::PlaneF1
-                    {
-                        self.cube_view_mode = CubeViewMode::PlaneF1;
-                        changed = true;
-                        mode_switched = true;
+
+                    // 3 Orthogonal plane orientations: F3xF2 (xy/p1), F3xF1 (xz/p2), F2xF1 (yz/p3)
+                    let ori_specs = [
+                        (
+                            CubePlaneOrientation::F3xF2StepF1,
+                            format!("F3×F2 ({px}×{py}) [xy]"),
+                        ),
+                        (
+                            CubePlaneOrientation::F3xF1StepF2,
+                            format!("F3×F1 ({px}×{pz}) [xz]"),
+                        ),
+                        (
+                            CubePlaneOrientation::F2xF1StepF3,
+                            format!("F2×F1 ({py}×{pz}) [yz]"),
+                        ),
+                    ];
+                    for (ori, lbl) in ori_specs {
+                        let active =
+                            !self.cube_slice.skyline_enabled && self.cube_slice.orientation == ori;
+                        if ui.selectable_label(active, lbl).clicked() {
+                            new_orientation = Some(ori);
+                        }
                     }
 
-                    match self.cube_view_mode {
-                        CubeViewMode::Skyline => {
+                    if ui
+                        .selectable_label(
+                            self.cube_slice.skyline_enabled,
+                            format!("2D Skyline ({}) [sk]", self.cube_slice.orientation.short_label()),
+                        )
+                        .on_hover_text(
+                            "Signed max-|I| (Pos+Neg MIP) projection across the orthogonal axis (sk)",
+                        )
+                        .clicked()
+                    {
+                        toggle_sky = true;
+                    }
+
+                    ui.separator();
+
+                    let ortho_ax = self.cube_slice.ortho_axis(&cube);
+                    let ortho_n = self.cube_slice.ortho_len(&cube);
+                    let ortho_nuc = match self.cube_slice.orientation {
+                        CubePlaneOrientation::F3xF2StepF1 => pz,
+                        CubePlaneOrientation::F3xF1StepF2 => py,
+                        CubePlaneOrientation::F2xF1StepF3 => px,
+                    };
+                    let ortho_tag = self.cube_slice.orientation.ortho_axis_tag();
+
+                    if self.cube_slice.skyline_enabled {
+                        let mut use_slab = self.cube_slice.slab_ppm_bounds.is_some();
+                        if ui
+                            .checkbox(&mut use_slab, format!("Slab {ortho_tag}"))
+                            .on_hover_text(
+                                "Restrict 2D Skyline MIP projection to a chemical-shift slab along the orthogonal axis",
+                            )
+                            .changed()
+                        {
+                            if use_slab {
+                                self.cube_slice.slab_ppm_bounds =
+                                    Some((ortho_ax.min_ppm(), ortho_ax.max_ppm()));
+                            } else {
+                                self.cube_slice.slab_ppm_bounds = None;
+                            }
+                            slab_changed = true;
+                        }
+                        if let Some((mut lo, mut hi)) = self.cube_slice.slab_ppm_bounds {
+                            let ax_lo = ortho_ax.min_ppm();
+                            let ax_hi = ortho_ax.max_ppm();
+                            let c1 = ui
+                                .add(
+                                    egui::DragValue::new(&mut lo)
+                                        .range(ax_lo..=ax_hi)
+                                        .speed(0.05)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            ui.label("..");
+                            let c2 = ui
+                                .add(
+                                    egui::DragValue::new(&mut hi)
+                                        .range(ax_lo..=ax_hi)
+                                        .speed(0.05)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            if c1 || c2 {
+                                self.cube_slice.slab_ppm_bounds = Some((lo.min(hi), lo.max(hi)));
+                                slab_changed = true;
+                            }
+                        } else {
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "{}×{}×{} max-|I| projection",
+                                    "{}×{}×{} MIP",
                                     cube.nx(),
-                                    ny,
-                                    nz
+                                    cube.ny(),
+                                    cube.nz()
                                 ))
                                 .small()
                                 .color(egui::Color32::from_rgb(148, 163, 184)),
                             );
                         }
-                        CubeViewMode::PlaneF2 => {
-                            if ui.small_button("◀").clicked() && self.cube_plane_f2_idx > 0 {
-                                self.cube_plane_f2_idx -= 1;
-                                changed = true;
-                            }
-                            let mut plane_1 = self.cube_plane_f2_idx + 1;
-                            if ui
-                                .add(
-                                    egui::Slider::new(&mut plane_1, 1..=ny)
-                                        .text(format!("/{ny} ({f2_ppm:.2} ppm)")),
-                                )
-                                .changed()
-                            {
-                                self.cube_plane_f2_idx = plane_1.saturating_sub(1).min(ny - 1);
-                                changed = true;
-                            }
-                            if ui.small_button("▶").clicked() && self.cube_plane_f2_idx + 1 < ny {
-                                self.cube_plane_f2_idx += 1;
-                                changed = true;
-                            }
+                    } else {
+                        let cur_idx = self.cube_slice.active_plane_idx(&cube);
+                        let ortho_ppm = self.cube_slice.active_ortho_ppm(&cube);
+                        if ui
+                            .small_button("<")
+                            .on_hover_text("Previous 3D Plane (pp / [ / PageDown / Shift+Scroll)")
+                            .clicked()
+                        {
+                            step_delta = Some(-1);
                         }
-                        CubeViewMode::PlaneF1 => {
-                            if ui.small_button("◀").clicked() && self.cube_plane_f1_idx > 0 {
-                                self.cube_plane_f1_idx -= 1;
-                                changed = true;
-                            }
-                            let mut plane_1 = self.cube_plane_f1_idx + 1;
-                            if ui
-                                .add(
-                                    egui::Slider::new(&mut plane_1, 1..=nz)
-                                        .text(format!("/{nz} ({f1_ppm:.2} ppm)")),
-                                )
-                                .changed()
-                            {
-                                self.cube_plane_f1_idx = plane_1.saturating_sub(1).min(nz - 1);
-                                changed = true;
-                            }
-                            if ui.small_button("▶").clicked() && self.cube_plane_f1_idx + 1 < nz {
-                                self.cube_plane_f1_idx += 1;
-                                changed = true;
-                            }
+                        let mut plane_1 = cur_idx + 1;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut plane_1, 1..=ortho_n).text(format!(
+                                    "/{ortho_n} ({ortho_tag} {ortho_nuc} = {ortho_ppm:.2} ppm)"
+                                )),
+                            )
+                            .changed()
+                        {
+                            plane_slider_to = Some(plane_1.saturating_sub(1).min(ortho_n - 1));
                         }
+                        if ui
+                            .small_button(">")
+                            .on_hover_text("Next 3D Plane (np / ] / PageUp / Shift+Scroll)")
+                            .clicked()
+                        {
+                            step_delta = Some(1);
+                        }
+                    }
+
+                    ui.separator();
+                    if ui
+                        .small_button("Pick 3D (at)")
+                        .on_hover_text("Pick true 3D local extrema across the cube (at)")
+                        .clicked()
+                    {
+                        trigger_pick_3d = true;
+                    }
+                    if ui
+                        .small_button("Pick Plane")
+                        .on_hover_text("Pick 2D extrema on the active orthogonal plane")
+                        .clicked()
+                    {
+                        trigger_pick_plane = true;
+                    }
+                    if ui
+                        .small_button("Sync HSQC (gs)")
+                        .on_hover_text(
+                            "Sync this 3D cube strip plane to the shared (1H, 15N) HSQC cursor (gs)",
+                        )
+                        .clicked()
+                    {
+                        trigger_goto_hsqc = true;
                     }
                 });
             });
 
-        if changed {
-            let spec2d = match self.cube_view_mode {
-                CubeViewMode::Skyline => extract_3d_skyline_f3_f2(&cube),
-                CubeViewMode::PlaneF2 => extract_3d_plane_f2(&cube, self.cube_plane_f2_idx),
-                CubeViewMode::PlaneF1 => extract_3d_plane_f1(&cube, self.cube_plane_f1_idx),
-            };
-            let (base_lv, noise_lv) = estimate_contour_base_and_noise(&spec2d.data);
-            self.contour_base = base_lv;
-            self.contour_noise_ref = noise_lv.max(base_lv / 6.0).max(1e-6);
-            if mode_switched {
-                self.view_h_left = spec2d.axis_x.max_ppm() as f32;
-                self.view_h_right = spec2d.axis_x.min_ppm() as f32;
-                self.view_n_top = spec2d.axis_y.min_ppm() as f32;
-                self.view_n_bottom = spec2d.axis_y.max_ppm() as f32;
-                self.workbook.two_d.zoom_history.clear();
-            }
-            let arc = Arc::new(spec2d.data.clone());
-            self.hsqc_arc = Arc::clone(&arc);
-            self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
-            self.hsqc_spec = Some(spec2d);
-            if let Some(pg) = self.workbook.pages_2d.get_mut(self.workbook.active_2d_idx) {
-                if let Some(ref s) = self.hsqc_spec {
-                    pg.spec = s.clone();
-                    pg.data_arc = arc;
-                    pg.spec_gen = self.hsqc_gen;
-                    pg.base_level = self.contour_base;
-                    pg.noise_ref = self.contour_noise_ref;
-                    pg.view_ppm = [
-                        self.view_h_left,
-                        self.view_h_right,
-                        self.view_n_top,
-                        self.view_n_bottom,
-                    ];
-                }
-            }
+        if let Some(ori) = new_orientation {
+            let _ = self.set_active_cube_orientation(ori);
+        } else if toggle_sky {
+            let _ = self.toggle_active_cube_skyline();
+        } else if let Some(d) = step_delta {
+            let _ = self.step_active_cube_plane(d);
+        } else if let Some(idx) = plane_slider_to {
+            self.cube_slice.skyline_enabled = false;
+            self.cube_slice.set_active_plane_idx(&cube, idx);
+            self.apply_active_cube_slice_refresh(false);
+        } else if slab_changed {
+            self.apply_active_cube_slice_refresh(false);
+        }
+        if trigger_pick_3d {
+            let _ = self.pick_active_3d_cube_peaks();
+        } else if trigger_pick_plane {
+            let _ = self.pick_active_3d_plane_peaks();
+        } else if trigger_goto_hsqc {
+            let _ = self.goto_3d_strip_from_hsqc();
         }
     }
 
@@ -7091,13 +7832,18 @@ impl NmrWorkbenchApp {
 
         // `Del`/`Backspace` delete selected peak and `Escape` cancels drag boxes (two-letter chords are handled globally by ChordDispatcher)
         let mut key_delete_peak: Option<usize> = None;
+        let mut key_delete_peak_3d: Option<usize> = None;
         if !is_compact_mobile && !ui.ctx().egui_wants_keyboard_input() {
             ui.input(|i| {
                 let plain = !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.alt;
                 if plain
                     && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
                 {
-                    key_delete_peak = self.workbook.two_d.selected_peak_idx;
+                    if self.active_cube_idx.is_some() {
+                        key_delete_peak_3d = self.cube_slice.selected_peak_3d_idx;
+                    } else {
+                        key_delete_peak = self.workbook.two_d.selected_peak_idx;
+                    }
                 }
                 if i.key_pressed(egui::Key::Escape) {
                     self.box_zoom_2d_anchor = None;
@@ -7105,10 +7851,14 @@ impl NmrWorkbenchApp {
                     self.workbook.two_d.drag_box_start_pos = None;
                     self.workbook.two_d.pick_box_start_pos = None;
                     self.workbook.two_d.dragging_peak_idx = None;
+                    self.cube_slice.dragging_peak_3d_idx = None;
+                    self.focus_3d_peak_label_input = false;
                 }
             });
         }
-        if let Some(di) = key_delete_peak {
+        if let Some(di3) = key_delete_peak_3d {
+            self.delete_active_3d_peak(di3);
+        } else if let Some(di) = key_delete_peak {
             self.delete_2d_peak(di);
         }
 
@@ -7300,12 +8050,16 @@ impl NmrWorkbenchApp {
                 &mut rail_ui,
                 WorkbookIcon::PeakPick,
                 tm == ToolMode2d::PickPeaks,
-                "Pick 2D Peaks (kr): Click to add, drag box to pick; click again to Auto-Pick all",
+                "Pick Peaks (kr / at): Click to add, drag box to pick; click again to Auto-Pick all",
             )
             .clicked()
             {
                 if tm == ToolMode2d::PickPeaks {
-                    self.pick_2d_roots();
+                    if self.active_cube_idx.is_some() {
+                        let _ = self.pick_active_3d_cube_peaks();
+                    } else {
+                        self.pick_2d_roots();
+                    }
                 } else {
                     self.workbook.two_d.tool_mode = ToolMode2d::PickPeaks;
                 }
@@ -7411,7 +8165,7 @@ impl NmrWorkbenchApp {
             if rail_tool_button(
                 &mut rail_ui,
                 WorkbookIcon::WaterSuppress,
-                self.water_undo_2d.is_some(),
+                self.water_undo_2d.is_some() || self.water_undo_3d.is_some(),
                 "Suppress Water Peak (ws) / Undo Water Suppression (wu)",
             )
             .clicked()
@@ -7544,21 +8298,27 @@ impl NmrWorkbenchApp {
         let space_down = ui.input(|i| i.key_down(egui::Key::Space));
         let shift_down = ui.input(|i| i.modifiers.shift);
         let hit_radius_px = if is_compact_mobile { 22.0 } else { 12.0 };
+        let has_sel_edit_bar = if self.active_cube_idx.is_some() {
+            self.cube_slice
+                .selected_peak_3d_idx
+                .is_some_and(|i| i < self.peaks_3d.len())
+        } else {
+            self.workbook
+                .two_d
+                .selected_peak_idx
+                .is_some_and(|i| i < self.peaks.len() && self.peaks[i].c.is_none())
+        };
         let peak_edit_bar_rect = (!is_compact_mobile
             && rect.width() >= 360.0
             && rect.height() >= 160.0
-            && self
-                .workbook
-                .two_d
-                .selected_peak_idx
-                .is_some_and(|i| i < self.peaks.len() && self.peaks[i].c.is_none()))
-        .then(|| {
-            let bw = (rect.width() - 16.0).min(548.0);
-            egui::Rect::from_min_size(
-                egui::pos2(rect.left() + 8.0, rect.bottom() - 36.0),
-                egui::vec2(bw, 28.0),
-            )
-        });
+            && has_sel_edit_bar)
+            .then(|| {
+                let bw = (rect.width() - 16.0).min(560.0);
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + 8.0, rect.bottom() - 36.0),
+                    egui::vec2(bw, 28.0),
+                )
+            });
         let in_peak_edit_bar = |p: egui::Pos2| peak_edit_bar_rect.is_some_and(|r| r.contains(p));
 
         let screen_to_ppm_cur = |p: egui::Pos2, vh: [f32; 4]| -> (f64, f64) {
@@ -7587,6 +8347,29 @@ impl NmrWorkbenchApp {
                 }
                 best
             };
+        let active_cube_clone = self
+            .active_cube_idx
+            .and_then(|ci| self.cubes_3d.get(ci).cloned());
+        let nearest_3d_peak = |slice_st: &Cube3dSliceState,
+                               peaks3: &[CubePeak3D],
+                               p: egui::Pos2,
+                               vh: [f32; 4],
+                               rad: f32|
+         -> Option<(usize, f32)> {
+            let cube = active_cube_clone.as_ref()?;
+            let mut best: Option<(usize, f32)> = None;
+            for pr in slice_st.visible_projected_peaks(cube, peaks3) {
+                let pt = SyncCrosshair::ppm_to_screen_2d(vh, rect, pr.plane_x_ppm, pr.plane_y_ppm);
+                if !rect.contains(pt) {
+                    continue;
+                }
+                let d = pt.distance(p);
+                if d <= rad && best.is_none_or(|(_, bd)| d < bd) {
+                    best = Some((pr.peak_idx, d));
+                }
+            }
+            best
+        };
 
         // Track stationary right-click vs right-drag pan
         if ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)) {
@@ -7612,11 +8395,12 @@ impl NmrWorkbenchApp {
             self.secondary_drag_accum_2d += response.drag_delta().length();
         }
 
-        // Start dragging an existing 2D peak marker if primary drag originates on a peak
+        // Start dragging an existing 2D or 3D peak marker if primary drag originates on a peak
         if !multi_touch_active
             && !space_down
             && !shift_down
             && self.workbook.two_d.dragging_peak_idx.is_none()
+            && self.cube_slice.dragging_peak_3d_idx.is_none()
             && self.workbook.two_d.drag_box_start_pos.is_none()
             && self.workbook.two_d.pick_box_start_pos.is_none()
             && response.dragged_by(egui::PointerButton::Primary)
@@ -7629,7 +8413,19 @@ impl NmrWorkbenchApp {
                         self.view_n_top,
                         self.view_n_bottom,
                     ];
-                    if let Some((pk_idx, _)) =
+                    if self.active_cube_idx.is_some() {
+                        if let Some((pk3_idx, _)) = nearest_3d_peak(
+                            &self.cube_slice,
+                            &self.peaks_3d,
+                            origin,
+                            cur_v,
+                            hit_radius_px,
+                        ) {
+                            self.cube_slice.dragging_peak_3d_idx = Some(pk3_idx);
+                            self.cube_slice.selected_peak_3d_idx = Some(pk3_idx);
+                            self.box_zoom_2d_anchor = None;
+                        }
+                    } else if let Some((pk_idx, _)) =
                         nearest_2d_peak(&self.peaks, origin, cur_v, hit_radius_px)
                     {
                         self.workbook.two_d.dragging_peak_idx = Some(pk_idx);
@@ -7640,7 +8436,23 @@ impl NmrWorkbenchApp {
             }
         }
 
-        if let Some(drag_idx) = self.workbook.two_d.dragging_peak_idx {
+        if let Some(drag3_idx) = self.cube_slice.dragging_peak_3d_idx {
+            if let Some(cur_pos) = response
+                .interact_pointer_pos()
+                .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+            {
+                let (nx_p, ny_p) = screen_to_ppm_cur(
+                    cur_pos,
+                    [
+                        self.view_h_left,
+                        self.view_h_right,
+                        self.view_n_top,
+                        self.view_n_bottom,
+                    ],
+                );
+                self.move_active_3d_peak_on_plane(drag3_idx, nx_p, ny_p);
+            }
+        } else if let Some(drag_idx) = self.workbook.two_d.dragging_peak_idx {
             if let Some(cur_pos) = response
                 .interact_pointer_pos()
                 .or_else(|| ui.input(|i| i.pointer.latest_pos()))
@@ -7658,7 +8470,8 @@ impl NmrWorkbenchApp {
             }
         }
 
-        let peak_drag_active = self.workbook.two_d.dragging_peak_idx.is_some();
+        let peak_drag_active = self.workbook.two_d.dragging_peak_idx.is_some()
+            || self.cube_slice.dragging_peak_3d_idx.is_some();
         let primary_pans =
             !peak_drag_active && (is_compact_mobile || tool_mode == ToolMode2d::Pan || space_down);
         let pan_dragged = !multi_touch_active
@@ -7729,6 +8542,9 @@ impl NmrWorkbenchApp {
         }
 
         if !ui.input(|i| i.pointer.any_down()) {
+            if self.cube_slice.dragging_peak_3d_idx.take().is_some() {
+                self.save_live_2d_into_workbook();
+            }
             if let Some(drag_idx) = self.workbook.two_d.dragging_peak_idx.take() {
                 if let Some(pk) = self.peaks.get(drag_idx).cloned() {
                     self.move_2d_peak_live(drag_idx, pk.h, pk.n, true);
@@ -7785,20 +8601,30 @@ impl NmrWorkbenchApp {
             self.reset_view_to_spec();
         }
 
-        // Scroll Wheel over 2D Plot:
-        // - Plain Scroll = Contour Threshold (`contour_base` up/down, `×1.18` / `÷1.18`, consuming scroll delta!)
-        // - `Ctrl` / `Cmd` + Scroll = 2D Zoom around cursor (consuming scroll delta!)
+        // Scroll Wheel over 2D/3D Plot:
+        // - `Shift + Scroll` on a `Cube3d` page = Step orthogonal 3D plane (`+1` / `-1` slice)
+        // - Plain Scroll = Contour Threshold (`contour_base` up/down, `×1.18` / `÷1.18`)
+        // - `Ctrl` / `Cmd` + Scroll = 2D Zoom around cursor
         if !multi_touch_active {
             if let Some(hover_pos) = response.hover_pos() {
-                let (scroll_y, ctrl_or_cmd) = ui.ctx().input_mut(|i| {
-                    let sy = i.smooth_scroll_delta.y;
+                let (scroll_y, ctrl_or_cmd, shift_mod) = ui.ctx().input_mut(|i| {
+                    let sh = i.modifiers.shift;
+                    let sy = if sh && i.smooth_scroll_delta.y.abs() < i.smooth_scroll_delta.x.abs()
+                    {
+                        i.smooth_scroll_delta.x
+                    } else {
+                        i.smooth_scroll_delta.y
+                    };
                     if sy.abs() > 0.05 {
                         i.smooth_scroll_delta = egui::Vec2::ZERO;
                     }
-                    (sy, i.modifiers.command || i.modifiers.ctrl)
+                    (sy, i.modifiers.command || i.modifiers.ctrl, sh)
                 });
                 if scroll_y.abs() > 0.05 {
-                    if ctrl_or_cmd {
+                    if shift_mod && !ctrl_or_cmd && self.active_cube_idx.is_some() {
+                        let step = if scroll_y > 0.0 { 1isize } else { -1isize };
+                        let _ = self.step_active_cube_plane(step);
+                    } else if ctrl_or_cmd {
                         let zoom = (1.0_f32 - scroll_y * 0.003).clamp(0.72, 1.38);
                         let u =
                             ((hover_pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
@@ -7836,7 +8662,7 @@ impl NmrWorkbenchApp {
             self.view_n_bottom,
         ];
 
-        // Stationary Right-Click Context Menu on 2D Canvas
+        // Stationary Right-Click Context Menu on 2D / 3D Canvas
         let snap_rx_ppm =
             ((4.0 / rect.width().max(1.0) * (view_ppm[1] - view_ppm[0]).abs()) as f64).max(
                 self.hsqc_spec
@@ -7856,7 +8682,7 @@ impl NmrWorkbenchApp {
                 ui.close();
                 return;
             }
-            ui.set_min_width(225.0);
+            ui.set_min_width(232.0);
             let [th, tn] = self
                 .context_menu_2d_ppm
                 .unwrap_or([self.crosshair.h_ppm, self.crosshair.n_ppm]);
@@ -7867,58 +8693,117 @@ impl NmrWorkbenchApp {
                     .weak(),
             );
             ui.separator();
-            if ui.button("+ Add Peak (Snap to Apex)").clicked() {
-                let _ = self.add_manual_2d_peak(th, tn, Some((snap_rx_ppm, snap_ry_ppm)));
-                self.workbook.two_d.show_peak_table = true;
-                ui.close();
-            }
-            if ui.button("+ Add Peak (Exact Cursor)").clicked() {
-                let _ = self.add_manual_2d_peak(th, tn, None);
-                self.workbook.two_d.show_peak_table = true;
-                ui.close();
-            }
-            if let Some(sel) = self
-                .workbook
-                .two_d
-                .selected_peak_idx
-                .filter(|&i| i < self.peaks.len() && self.peaks[i].c.is_none())
-            {
-                ui.separator();
-                if ui
-                    .button(format!("Snap Peak #{} to Extremum", sel + 1))
-                    .clicked()
+            if self.active_cube_idx.is_some() {
+                if ui.button("+ Add 3D Peak (Snap to Apex) [pa]").clicked() {
+                    let _ = self.add_active_3d_peak_on_plane(th, tn, true);
+                    ui.close();
+                }
+                if ui.button("+ Add 3D Peak (Exact Cursor)").clicked() {
+                    let _ = self.add_active_3d_peak_on_plane(th, tn, false);
+                    ui.close();
+                }
+                if let Some(sel3) = self
+                    .cube_slice
+                    .selected_peak_3d_idx
+                    .filter(|&i| i < self.peaks_3d.len())
                 {
-                    self.snap_2d_peak_by_index(sel);
+                    ui.separator();
+                    if ui
+                        .button(format!("Jump to 3D Peak #{} Plane", sel3 + 1))
+                        .clicked()
+                    {
+                        self.jump_to_active_3d_peak_plane(sel3);
+                        ui.close();
+                    }
+                    if ui
+                        .button(format!("Snap 3D Peak #{} to Extremum [pc]", sel3 + 1))
+                        .clicked()
+                    {
+                        self.snap_active_3d_peak(sel3);
+                        ui.close();
+                    }
+                    if ui
+                        .button(format!("Delete 3D Peak #{} [pd]", sel3 + 1))
+                        .clicked()
+                    {
+                        self.delete_active_3d_peak(sel3);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("Pick All 3D Cube Peaks (at)").clicked() {
+                    let _ = self.pick_active_3d_cube_peaks();
                     ui.close();
                 }
-                if ui.button(format!("Delete Peak #{}", sel + 1)).clicked() {
-                    self.delete_2d_peak(sel);
+                if ui.button("Pick Active 3D Plane Peaks").clicked() {
+                    let _ = self.pick_active_3d_plane_peaks();
                     ui.close();
                 }
-            }
-            ui.separator();
-            if ui.button("Auto-Pick All 2D Peaks").clicked() {
-                self.pick_2d_roots();
-                ui.close();
+            } else {
+                if ui.button("+ Add Peak (Snap to Apex)").clicked() {
+                    let _ = self.add_manual_2d_peak(th, tn, Some((snap_rx_ppm, snap_ry_ppm)));
+                    self.workbook.two_d.show_peak_table = true;
+                    ui.close();
+                }
+                if ui.button("+ Add Peak (Exact Cursor)").clicked() {
+                    let _ = self.add_manual_2d_peak(th, tn, None);
+                    self.workbook.two_d.show_peak_table = true;
+                    ui.close();
+                }
+                if nuc_x == "1H"
+                    && nuc_y == "15N"
+                    && !self.cubes_3d.is_empty()
+                    && ui.button("Go to 3D Strip (gs)").clicked()
+                {
+                    self.crosshair.snap_to(th, tn, self.crosshair.c_ppm);
+                    let _ = self.goto_3d_strip_from_hsqc();
+                    ui.close();
+                }
+                if let Some(sel) = self
+                    .workbook
+                    .two_d
+                    .selected_peak_idx
+                    .filter(|&i| i < self.peaks.len() && self.peaks[i].c.is_none())
+                {
+                    ui.separator();
+                    if ui
+                        .button(format!("Snap Peak #{} to Extremum", sel + 1))
+                        .clicked()
+                    {
+                        self.snap_2d_peak_by_index(sel);
+                        ui.close();
+                    }
+                    if ui.button(format!("Delete Peak #{}", sel + 1)).clicked() {
+                        self.delete_2d_peak(sel);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("Auto-Pick All 2D Peaks").clicked() {
+                    self.pick_2d_roots();
+                    ui.close();
+                }
             }
             let tbl_txt = if self.workbook.two_d.show_peak_table {
-                "Hide 2D Peak Table"
+                "Hide Peak Table (lt)"
             } else {
-                "Show 2D Peak Table"
+                "Show Peak Table (lt)"
             };
             if ui.button(tbl_txt).clicked() {
                 self.workbook.two_d.show_peak_table = !self.workbook.two_d.show_peak_table;
                 ui.close();
             }
-            if ui.button("Suppress Water Band").clicked() {
+            if ui.button("Suppress Water Band (ws)").clicked() {
                 self.suppress_water_active_spectrum();
                 ui.close();
             }
-            if self.water_undo_2d.is_some() && ui.button("Undo Water Suppression").clicked() {
+            if (self.water_undo_2d.is_some() || self.water_undo_3d.is_some())
+                && ui.button("Undo Water Suppression (wu)").clicked()
+            {
                 self.undo_water_suppression_active();
                 ui.close();
             }
-            if ui.button("Reset Full View (F)").clicked() {
+            if ui.button("Reset Full View (zf)").clicked() {
                 self.reset_view_to_spec();
                 ui.close();
             }
@@ -8183,6 +9068,39 @@ impl NmrWorkbenchApp {
                         if !apply_box_zoom(self, egui::pos2(anchor[0], anchor[1]), click_pos) {
                             self.box_zoom_2d_anchor = Some([click_pos.x, click_pos.y]);
                         }
+                    } else if self.active_cube_idx.is_some() {
+                        if ctrl_or_cmd {
+                            let _ = self.add_active_3d_peak_on_plane(tap_h, tap_n, !alt_down);
+                        } else if let Some((pk3_idx, _)) = nearest_3d_peak(
+                            &self.cube_slice,
+                            &self.peaks_3d,
+                            click_pos,
+                            view_ppm,
+                            hit_radius_px,
+                        ) {
+                            self.cube_slice.selected_peak_3d_idx = Some(pk3_idx);
+                            if let (Some(cube), Some(pk3)) =
+                                (active_cube_clone.as_ref(), self.peaks_3d.get(pk3_idx))
+                            {
+                                let pr = self.cube_slice.project_peak_3d(cube, pk3_idx, pk3);
+                                self.crosshair.snap_to(
+                                    pr.plane_x_ppm,
+                                    pr.plane_y_ppm,
+                                    self.crosshair.c_ppm,
+                                );
+                            }
+                        } else {
+                            self.cube_slice.selected_peak_3d_idx = None;
+                            if tool_mode == ToolMode2d::PickPeaks {
+                                let _ = self.add_active_3d_peak_on_plane(tap_h, tap_n, !alt_down);
+                            } else if !is_compact_mobile
+                                && (tool_mode == ToolMode2d::ZoomBox || self.box_zoom_2d_mode)
+                            {
+                                self.box_zoom_2d_anchor = Some([click_pos.x, click_pos.y]);
+                            } else {
+                                self.crosshair.update_from_2d_hover(tap_h, tap_n);
+                            }
+                        }
                     } else if ctrl_or_cmd {
                         let _ = self.add_manual_2d_peak(tap_h, tap_n, snap_opt);
                         self.workbook.two_d.show_peak_table = true;
@@ -8242,7 +9160,7 @@ impl NmrWorkbenchApp {
             }
         }
 
-        // Draw up to `3,000` 2D cross-peak / CON / protein spin-system markers + labels
+        // Draw up to `3,000` 2D cross-peak / CON / protein spin-system / 3D cube markers + labels
         let draw_selection_diamond = |pt: egui::Pos2| {
             let r = 8.5_f32;
             let pts = vec![
@@ -8258,7 +9176,97 @@ impl NmrWorkbenchApp {
             ));
         };
 
-        if is_prot_2d && !self.systems.is_empty() && !(nuc_x == "13C" && nuc_y == "15N") {
+        if let Some(ref cube) = active_cube_clone {
+            let projected = self
+                .cube_slice
+                .visible_projected_peaks(cube, &self.peaks_3d);
+            let on_plane_count = projected
+                .iter()
+                .filter(|pr| {
+                    pr.visibility == PlanePeakVisibility::OnPlane
+                        && rect.contains(ppm_to_screen(pr.plane_x_ppm, pr.plane_y_ppm))
+                })
+                .count();
+            for pr in projected.into_iter().take(3_000) {
+                let pt = ppm_to_screen(pr.plane_x_ppm, pr.plane_y_ppm);
+                if !rect.contains(pt) {
+                    continue;
+                }
+                let Some(pk3) = self.peaks_3d.get(pr.peak_idx) else {
+                    continue;
+                };
+                let is_sel = self.cube_slice.selected_peak_3d_idx == Some(pr.peak_idx);
+                match pr.visibility {
+                    PlanePeakVisibility::OnPlane => {
+                        let marker_col = if is_sel {
+                            theme.zoom_box_stroke
+                        } else if pk3.sign < 0 {
+                            egui::Color32::from_rgb(244, 63, 94)
+                        } else {
+                            theme.peak_hi_conf
+                        };
+                        let sz = if is_sel { 6.0 } else { 4.2 };
+                        let sw = if is_sel { 2.0 } else { 1.35 };
+                        painter.line_segment(
+                            [egui::pos2(pt.x - sz, pt.y), egui::pos2(pt.x + sz, pt.y)],
+                            egui::Stroke::new(sw, marker_col),
+                        );
+                        painter.line_segment(
+                            [egui::pos2(pt.x, pt.y - sz), egui::pos2(pt.x, pt.y + sz)],
+                            egui::Stroke::new(sw, marker_col),
+                        );
+                        if is_sel {
+                            draw_selection_diamond(pt);
+                        }
+                        if !pk3.label.is_empty()
+                            || (self.show_peak_labels && on_plane_count <= 260)
+                            || is_sel
+                        {
+                            let lbl = if !pk3.label.is_empty() {
+                                pk3.label.clone()
+                            } else {
+                                format!("#{} ({:.1})", pr.peak_idx + 1, pr.ortho_ppm)
+                            };
+                            painter.text(
+                                egui::pos2(pt.x + 5.5, pt.y - 5.5),
+                                egui::Align2::LEFT_BOTTOM,
+                                lbl,
+                                egui::FontId::monospace(9.8),
+                                marker_col,
+                            );
+                        }
+                    }
+                    PlanePeakVisibility::AdjacentGhost => {
+                        let base_c = if pk3.sign < 0 {
+                            egui::Color32::from_rgba_unmultiplied(244, 63, 94, 92)
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(125, 211, 252, 92)
+                        };
+                        let ghost_col = if is_sel {
+                            theme.zoom_box_stroke
+                        } else {
+                            base_c
+                        };
+                        painter.circle_stroke(pt, 3.6, egui::Stroke::new(1.0, ghost_col));
+                        if is_sel || !pk3.label.is_empty() {
+                            let lbl = if !pk3.label.is_empty() {
+                                format!("~{}", pk3.label)
+                            } else {
+                                format!("~#{}", pr.peak_idx + 1)
+                            };
+                            painter.text(
+                                egui::pos2(pt.x + 5.0, pt.y - 4.0),
+                                egui::Align2::LEFT_BOTTOM,
+                                lbl,
+                                egui::FontId::monospace(9.0),
+                                ghost_col,
+                            );
+                        }
+                    }
+                    PlanePeakVisibility::OffPlane => {}
+                }
+            }
+        } else if is_prot_2d && !self.systems.is_empty() && !(nuc_x == "13C" && nuc_y == "15N") {
             // Draw protein spin system peak markers and residue / custom labels
             for (s, ss) in self.systems.iter().enumerate() {
                 let pt = ppm_to_screen(ss.h, ss.n);
@@ -8409,7 +9417,7 @@ impl NmrWorkbenchApp {
             }
         }
 
-        // Update & draw synchronized crosshair
+        // Update & draw synchronized crosshair (sharing shifts by physical nucleus across 1D/2D/3D pages)
         if let Some(hp) = response.hover_pos() {
             if !multi_touch_active {
                 let u = (hp.x - rect.left()) / rect.width().max(1.0);
@@ -8419,6 +9427,12 @@ impl NmrWorkbenchApp {
                 self.crosshair.update_from_2d_hover(cur_h, cur_n);
             }
         }
+        self.workbook.record_2d_crosshair_by_nucleus(
+            nuc_x,
+            self.crosshair.h_ppm,
+            nuc_y,
+            self.crosshair.n_ppm,
+        );
         let ch_pt = ppm_to_screen(self.crosshair.h_ppm, self.crosshair.n_ppm);
         if rect.contains(ch_pt) {
             let ch_stroke = if self.crosshair.locked {
@@ -8734,8 +9748,129 @@ impl NmrWorkbenchApp {
         }
 
         // 7. Floating Selected-Peak Inline Edit Bar (Bottom-Left of `rect`)
-        if let (Some(bar_r), Some(sel_idx)) = (
-            peak_edit_bar_rect,
+        if let (Some(bar_r), Some(sel3_idx), Some(ref cube)) = (
+            peak_edit_bar_rect.filter(|_| self.active_cube_idx.is_some()),
+            self.cube_slice
+                .selected_peak_3d_idx
+                .filter(|&i| i < self.peaks_3d.len()),
+            active_cube_clone,
+        ) {
+            painter.rect_filled(bar_r, 4.0, theme.card_bg);
+            painter.rect_stroke(
+                bar_r,
+                4.0,
+                egui::Stroke::new(1.1, theme.zoom_box_stroke),
+                egui::StrokeKind::Inside,
+            );
+            let pk3 = self.peaks_3d[sel3_idx].clone();
+            let proj = self.cube_slice.project_peak_3d(cube, sel3_idx, &pk3);
+            let mut px_val = proj.plane_x_ppm;
+            let mut py_val = proj.plane_y_ppm;
+            let spd_x = if nuc_x == "1H" { 0.001 } else { 0.01 };
+            let spd_y = if nuc_y == "1H" { 0.001 } else { 0.01 };
+            let mut lbl_buf = pk3.label.clone();
+            let mut do_move = false;
+            let mut do_relabel = false;
+            let mut do_jump = false;
+            let mut do_snap = false;
+            let mut do_del = false;
+            let mut do_desel = false;
+
+            let mut bar_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(bar_r.shrink2(egui::vec2(6.0, 3.0)))
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            bar_ui.spacing_mut().item_spacing.x = 5.0;
+            bar_ui.label(
+                egui::RichText::new(format!("3D #{}", sel3_idx + 1))
+                    .size(10.5)
+                    .strong()
+                    .color(theme.card_title),
+            );
+            if bar_ui
+                .add(
+                    egui::DragValue::new(&mut px_val)
+                        .speed(spd_x)
+                        .fixed_decimals(3)
+                        .prefix(format!("{pretty_x} ")),
+                )
+                .changed()
+            {
+                do_move = true;
+            }
+            if bar_ui
+                .add(
+                    egui::DragValue::new(&mut py_val)
+                        .speed(spd_y)
+                        .fixed_decimals(3)
+                        .prefix(format!("{pretty_y} ")),
+                )
+                .changed()
+            {
+                do_move = true;
+            }
+            let te_resp = bar_ui.add(
+                egui::TextEdit::singleline(&mut lbl_buf)
+                    .desired_width(105.0)
+                    .hint_text("label (pl)"),
+            );
+            if self.focus_3d_peak_label_input {
+                te_resp.request_focus();
+                self.focus_3d_peak_label_input = false;
+            }
+            if te_resp.changed() {
+                do_relabel = true;
+            }
+            if bar_ui
+                .small_button("Jump")
+                .on_hover_text("Jump active 3D plane directly to this peak")
+                .clicked()
+            {
+                do_jump = true;
+            }
+            if bar_ui
+                .small_button("Snap")
+                .on_hover_text("Snap peak to local 3D parabolic extremum (pc)")
+                .clicked()
+            {
+                do_snap = true;
+            }
+            if bar_ui
+                .small_button("Delete")
+                .on_hover_text("Delete selected 3D peak (pd / Del)")
+                .clicked()
+            {
+                do_del = true;
+            }
+            if bar_ui
+                .small_button("x")
+                .on_hover_text("Deselect 3D peak")
+                .clicked()
+            {
+                do_desel = true;
+            }
+
+            if do_del {
+                self.delete_active_3d_peak(sel3_idx);
+            } else {
+                if do_relabel {
+                    self.relabel_active_3d_peak(sel3_idx, lbl_buf);
+                }
+                if do_move {
+                    self.move_active_3d_peak_on_plane(sel3_idx, px_val, py_val);
+                    self.save_live_2d_into_workbook();
+                } else if do_jump {
+                    self.jump_to_active_3d_peak_plane(sel3_idx);
+                } else if do_snap {
+                    self.snap_active_3d_peak(sel3_idx);
+                } else if do_desel {
+                    self.cube_slice.selected_peak_3d_idx = None;
+                    self.save_live_2d_into_workbook();
+                }
+            }
+        } else if let (Some(bar_r), Some(sel_idx)) = (
+            peak_edit_bar_rect.filter(|_| self.active_cube_idx.is_none()),
             self.workbook
                 .two_d
                 .selected_peak_idx
@@ -9759,26 +10894,44 @@ impl NmrWorkbenchApp {
         strips: &[(Option<usize>, &str)],
     ) {
         painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(13, 17, 24));
-        let c_top = 13.0f64;
-        let c_bot = 74.0f64;
+        let (strip_nuc, (c_top, c_bot)) = if let Some(ref s3) = self.hncacb_3d {
+            let (_, nuc, bounds) = strip_vertical_axis_metadata(s3);
+            (nuc, bounds)
+        } else {
+            ("13C", (13.0f64, 74.0f64))
+        };
         let top_pad = 22.0f32;
         let bot_pad = 8.0f32;
         let left_axis_w = 34.0f32;
 
         let plot_top = rect.top() + top_pad;
         let plot_bot = rect.bottom() - bot_pad;
+        let span = (c_bot - c_top).max(1e-6);
         let c_to_y = |c_ppm: f64| -> f32 {
-            let t = ((c_ppm - c_top) / (c_bot - c_top)) as f32;
+            let t = ((c_ppm - c_top) / span) as f32;
             plot_top + t.clamp(0.0, 1.0) * (plot_bot - plot_top)
         };
 
-        // 13C ppm scale on left
-        for c_tick in [15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 72.0] {
+        painter.text(
+            egui::pos2(rect.left() + 3.0, rect.top() + 10.0),
+            egui::Align2::LEFT_CENTER,
+            Self::pretty_nucleus_unicode(strip_nuc),
+            egui::FontId::monospace(9.0),
+            egui::Color32::from_rgb(165, 185, 210),
+        );
+
+        // Dynamic physical indirect-axis ppm scale on left
+        for c_tick in compute_nice_strip_ticks(c_top, c_bot, 6) {
             let y = c_to_y(c_tick);
+            let lbl = if span < 16.0 && c_tick.fract().abs() > 1e-4 {
+                format!("{c_tick:.1}")
+            } else {
+                format!("{c_tick:.0}")
+            };
             painter.text(
                 egui::pos2(rect.left() + 3.0, y),
                 egui::Align2::LEFT_CENTER,
-                format!("{c_tick:.0}"),
+                lbl,
                 egui::FontId::monospace(9.5),
                 egui::Color32::from_rgb(145, 165, 190),
             );
@@ -10786,9 +11939,97 @@ impl NmrWorkbenchApp {
 
             self.unprocessed_fids_remaining = self.raw_fids_total.saturating_sub(processed_fids);
 
+            // Also ingest any checked 1D experiments into `stack1d_panel` so mixed 1D + 2D + 3D
+            // folders populate all workbook sections cleanly without discarding 2D/3D pages.
+            let mut loaded_1d_specs = Vec::new();
+            let has_checked_1d = plan
+                .selected_experiments
+                .iter()
+                .any(|s| matches!(s.experiment.dimensionality, ExperimentDimensionality::Dim1D));
+            if has_checked_1d {
+                #[cfg(not(target_arch = "wasm32"))]
+                for item in &plan.selected_experiments {
+                    if matches!(
+                        item.experiment.dimensionality,
+                        ExperimentDimensionality::Dim1D
+                    ) {
+                        if let Some(ref p) = item.resolved_path {
+                            if let Ok(loaded) = nmr_core::nmr1d::load_1d_input(p, None, false) {
+                                if let Ok(sp) =
+                                    nmr_core::nmr1d::prepare_loaded_1d_for_studio(loaded)
+                                {
+                                    loaded_1d_specs.push(sp);
+                                    continue;
+                                }
+                            }
+                            if let Ok(bytes) = std::fs::read(p) {
+                                if let Some(sp) = try_load_1d_ucsf_or_pipe_bytes(
+                                    &item.experiment.display_name,
+                                    &bytes,
+                                ) {
+                                    loaded_1d_specs.push(sp);
+                                }
+                            }
+                        }
+                    }
+                }
+                if loaded_1d_specs.is_empty() && !plan.in_memory_files.is_empty() {
+                    let sel_prefixes: Vec<String> = plan
+                        .selected_experiments
+                        .iter()
+                        .filter(|s| {
+                            matches!(s.experiment.dimensionality, ExperimentDimensionality::Dim1D)
+                        })
+                        .map(|s| {
+                            s.experiment
+                                .relative_path
+                                .trim_matches('/')
+                                .trim_start_matches("./")
+                                .to_string()
+                        })
+                        .collect();
+                    let refs: Vec<(&str, &[u8])> = plan
+                        .in_memory_files
+                        .iter()
+                        .filter(|(k, _)| {
+                            sel_prefixes.iter().any(|pr| {
+                                pr.is_empty()
+                                    || pr == "."
+                                    || k.as_str() == pr
+                                    || k.starts_with(&format!("{pr}/"))
+                                    || k.contains(&format!("/{pr}/"))
+                            })
+                        })
+                        .map(|(k, v)| (k.as_str(), v.as_slice()))
+                        .collect();
+                    if let Ok(loaded) =
+                        nmr_core::nmr1d::load_1d_from_virtual_entries(&refs, None, false)
+                    {
+                        for it in loaded {
+                            if let Ok(sp) = nmr_core::nmr1d::prepare_loaded_1d_for_studio(it) {
+                                loaded_1d_specs.push(sp);
+                            }
+                        }
+                    }
+                    if loaded_1d_specs.is_empty() {
+                        for (k, v) in &refs {
+                            if let Some(sp) = try_load_1d_ucsf_or_pipe_bytes(k, v) {
+                                loaded_1d_specs.push(sp);
+                            }
+                        }
+                    }
+                }
+                if !loaded_1d_specs.is_empty() {
+                    self.stack1d_panel
+                        .load_user_spectra(loaded_1d_specs.clone());
+                }
+            }
+            let any_1d_loaded = !loaded_1d_specs.is_empty();
+
             // Promote primary_2d by priority: N15Hsqc -> Con2D -> C13Hsqc/C13Hmqc -> first loaded Dim2D
             let mut caco_2d_specs: Vec<Spectrum2D> = Vec::new();
-            if !loaded_2d_list.is_empty() {
+            let added_primary_2d = !loaded_2d_list.is_empty();
+            if added_primary_2d {
                 let rank_2d = |cls: PulseSequenceClass, tok: Option<&'static str>| -> u8 {
                     if cls == PulseSequenceClass::N15Hsqc || tok == Some("HSQC") {
                         0
@@ -10849,17 +12090,58 @@ impl NmrWorkbenchApp {
                 if prim_c == PulseSequenceClass::Caco2D {
                     caco_2d_specs.push(hsqc.clone());
                 }
+                self.active_cube_idx = None;
+                self.peaks_3d.clear();
+                self.water_undo_3d = None;
                 self.primary_2d_label = prim_lbl.clone();
                 self.primary_2d_visible = true;
                 self.primary_ppm_nudge = [0.0, 0.0];
                 self.hsqc_arc = Arc::new(hsqc.data.clone());
                 self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
-                let prim_idx =
-                    self.workbook
-                        .add_2d_page(prim_lbl, hsqc.clone(), false, !cubes_3d.is_empty());
+                let has_any_3d = !cubes_3d.is_empty() || !self.cubes_3d.is_empty();
+                let prim_idx = self
+                    .workbook
+                    .add_2d_page(prim_lbl, hsqc.clone(), false, has_any_3d);
                 self.workbook.active_2d_idx = prim_idx;
                 self.workbook.two_d.zoom_history.clear();
                 self.hsqc_spec = Some(hsqc);
+            } else if !cubes_3d.is_empty() {
+                // Register newly appended 3D cubes against any existing 1H-15N 2D HSQC page in the workbook
+                let existing_hsqc = self
+                    .workbook
+                    .pages_2d
+                    .iter()
+                    .find(|pg| !pg.is_cube_3d() && pg.nuc_x == "1H" && pg.nuc_y == "15N")
+                    .map(|pg| pg.spec.clone());
+                if let Some(ref hsqc_ref) = existing_hsqc {
+                    for (disp_name, _, s3) in &mut cubes_3d {
+                        let rescue_flag = ingested_recipes
+                            .get(disp_name)
+                            .map(|r| r.enable_axis_rescue)
+                            .unwrap_or(self.enable_axis_rescue);
+                        let (_, _, audit_opt) = register_3d_hn_to_hsqc_2d_with_audit(
+                            s3,
+                            hsqc_ref,
+                            0.08,
+                            0.60,
+                            rescue_flag,
+                        );
+                        if let Some(audit) = audit_opt {
+                            if let Some(warn) = audit.warning_message() {
+                                self.axis_rescue_notices.push(warn);
+                            }
+                            if let Some(rec) = ingested_recipes.get_mut(disp_name) {
+                                rec.axis_rescue_audit = Some(audit.clone());
+                            }
+                            self.axis_rescue_audits.push(audit);
+                        }
+                    }
+                }
+                for pg in &mut self.workbook.pages_2d {
+                    if !pg.is_cube_3d() && pg.nuc_x == "1H" && pg.nuc_y == "15N" {
+                        pg.has_3d_strips = true;
+                    }
+                }
             } else if self.workbook.pages_2d.is_empty() {
                 self.hsqc_spec = None;
                 self.hsqc_arc = Arc::new(Vec::new());
@@ -10873,11 +12155,11 @@ impl NmrWorkbenchApp {
                 let _ = self.workbook.add_2d_page(lbl, s2, true, false);
                 any_extra_2d = true;
             }
-            if any_extra_2d || self.hsqc_spec.is_some() {
+            if any_extra_2d || added_primary_2d {
                 self.sync_overlay_layers_from_workbook();
             }
 
-            if self.hsqc_spec.is_some() {
+            if added_primary_2d {
                 self.reset_view_to_spec();
                 self.save_live_2d_into_workbook();
             }
@@ -10973,10 +12255,6 @@ impl NmrWorkbenchApp {
                 }
             }
 
-            self.hncacb_3d = None;
-            self.hnco_3d = None;
-            self.cubes_3d.clear();
-            self.active_cube_idx = None;
             let mut first_3d_page_idx: Option<usize> = None;
             for (disp_3d, _, s3) in cubes_3d {
                 if s3.exp == "HNCO" || s3.exp == "HNCACO" {
@@ -10987,16 +12265,22 @@ impl NmrWorkbenchApp {
                     self.hncacb_3d = Some(s3.clone());
                 }
                 let c_idx = self.cubes_3d.len();
-                let page_idx = self.workbook.add_3d_cube_page(c_idx, &disp_3d, &s3);
+                let mut page_idx = self.workbook.add_3d_cube_page(c_idx, &disp_3d, &s3);
+                if run_full_pipeline {
+                    if let Some(pg3) = self.workbook.pages_2d.get_mut(page_idx) {
+                        let _ = pg3.pick_3d_cube_peaks(&s3);
+                    }
+                }
                 if first_3d_page_idx.is_none() {
                     first_3d_page_idx = Some(page_idx);
                 }
+                let _ = &mut page_idx;
                 self.cubes_3d.push(s3);
             }
             let stored_3d =
                 usize::from(self.hncacb_3d.is_some()) + usize::from(self.hnco_3d.is_some());
-            self.extra_3d_count = n_3d_loaded.saturating_sub(stored_3d);
-            if self.hsqc_spec.is_some() {
+            self.extra_3d_count = self.cubes_3d.len().saturating_sub(stored_3d);
+            if added_primary_2d {
                 self.save_live_2d_into_workbook();
             } else if let Some(p_idx) = first_3d_page_idx {
                 self.activate_2d_workbook_page(p_idx);
@@ -11015,20 +12299,32 @@ impl NmrWorkbenchApp {
                             let mut all_p = roots;
                             all_p.extend(p3);
                             self.peaks = all_p;
+                            self.save_live_2d_into_workbook();
                         }
                     }
                 }
+            } else if any_1d_loaded && self.workbook.pages_2d.is_empty() {
+                self.activate_1d_studio_mode();
             }
         }
 
-        let n_3d_total = usize::from(self.hncacb_3d.is_some())
-            + usize::from(self.hnco_3d.is_some())
-            + self.extra_3d_count;
+        let n_3d_total = self
+            .cubes_3d
+            .len()
+            .max(usize::from(self.hncacb_3d.is_some()) + usize::from(self.hnco_3d.is_some()));
         self.sync_session_from_app_fresh(&plan.root_name);
         self.session.state.processing_recipes = ingested_recipes;
         self.rebuild_systems_and_matrices();
 
         if self.hsqc_spec.is_none() && n_3d_total == 0 {
+            if !self.stack1d_panel.traces.is_empty() {
+                self.status_msg = format!(
+                    "Loaded {} 1D trace(s) from '{}'",
+                    self.stack1d_panel.traces.len(),
+                    plan.root_name
+                );
+                return;
+            }
             if !load_errors.is_empty() {
                 self.status_msg = format!(
                     "Failed to load selected spectra from '{}': {}",
@@ -11227,6 +12523,11 @@ impl NmrWorkbenchApp {
                 self.hsqc_spec = None;
                 self.hncacb_3d = None;
                 self.hnco_3d = None;
+                self.cubes_3d.clear();
+                self.active_cube_idx = None;
+                self.peaks_3d.clear();
+                self.water_undo_3d = None;
+                self.workbook.clear_2d_pages();
                 self.axis_rescue_notices.clear();
                 self.axis_rescue_audits.clear();
                 self.session = WorkbenchSessionController::default();
@@ -11502,6 +12803,48 @@ impl NmrWorkbenchApp {
                     }
                 }
             }
+            WorkbenchAction::NextCubePlane => {
+                if !self.step_active_cube_plane(1) {
+                    self.status_msg =
+                        "Select a 3D NMR cube page to step planes (`np` / `]`)".to_string();
+                }
+            }
+            WorkbenchAction::PrevCubePlane => {
+                if !self.step_active_cube_plane(-1) {
+                    self.status_msg =
+                        "Select a 3D NMR cube page to step planes (`pp` / `[`)".to_string();
+                }
+            }
+            WorkbenchAction::CubePlaneF3xF2 => {
+                if !self.set_active_cube_orientation(CubePlaneOrientation::F3xF2StepF1) {
+                    self.status_msg =
+                        "Select a 3D NMR cube page to switch to F3×F2 planes (`xy` / `p1`)"
+                            .to_string();
+                }
+            }
+            WorkbenchAction::CubePlaneF3xF1 => {
+                if !self.set_active_cube_orientation(CubePlaneOrientation::F3xF1StepF2) {
+                    self.status_msg =
+                        "Select a 3D NMR cube page to switch to F3×F1 strip planes (`xz` / `p2`)"
+                            .to_string();
+                }
+            }
+            WorkbenchAction::CubePlaneF2xF1 => {
+                if !self.set_active_cube_orientation(CubePlaneOrientation::F2xF1StepF3) {
+                    self.status_msg =
+                        "Select a 3D NMR cube page to switch to F2×F1 planes (`yz` / `p3`)"
+                            .to_string();
+                }
+            }
+            WorkbenchAction::ToggleCubeSkyline => {
+                if !self.toggle_active_cube_skyline() {
+                    self.status_msg =
+                        "Select a 3D NMR cube page to toggle 2D Skyline MIP (`sk`)".to_string();
+                }
+            }
+            WorkbenchAction::GotoCubeStripFromHsqc => {
+                let _ = self.goto_3d_strip_from_hsqc();
+            }
             WorkbenchAction::ToggleCanvasTheme => {
                 self.paper_white_canvas = !self.paper_white_canvas;
                 self.sync_overlay_layers_from_workbook();
@@ -11565,7 +12908,11 @@ impl NmrWorkbenchApp {
 
             // --- 4. Peak Picking & Editing ---
             WorkbenchAction::PickHsqc2dRoots => {
-                self.pick_2d_roots();
+                if self.active_cube_idx.is_some() {
+                    let _ = self.pick_active_3d_cube_peaks();
+                } else {
+                    self.pick_2d_roots();
+                }
             }
             WorkbenchAction::PickAll3dSpectra | WorkbenchAction::RunCorroboratedWeakPeakRescue => {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -11627,6 +12974,12 @@ impl NmrWorkbenchApp {
                         .stack1d_panel
                         .add_manual_peak_at_or_near_ppm(target, true);
                     self.status_msg = self.stack1d_panel.status_message.clone();
+                } else if self.active_cube_idx.is_some() {
+                    let _ = self.add_active_3d_peak_on_plane(
+                        self.crosshair.h_ppm,
+                        self.crosshair.n_ppm,
+                        true,
+                    );
                 } else {
                     let rx = self
                         .hsqc_spec
@@ -11650,6 +13003,12 @@ impl NmrWorkbenchApp {
                     if let Some(sel) = self.stack1d_panel.selected_peak_idx {
                         let _ = self.stack1d_panel.delete_picked_peak(sel);
                         self.status_msg = self.stack1d_panel.status_message.clone();
+                    }
+                } else if self.active_cube_idx.is_some() {
+                    if let Some(sel3) = self.cube_slice.selected_peak_3d_idx {
+                        self.delete_active_3d_peak(sel3);
+                    } else {
+                        self.status_msg = "Select a 3D peak to delete (`pd` / `Del`)".to_string();
                     }
                 } else if let Some(sel_2d) = self.workbook.two_d.selected_peak_idx {
                     self.delete_2d_peak(sel_2d);
@@ -11677,6 +13036,10 @@ impl NmrWorkbenchApp {
                         let _ = self.stack1d_panel.snap_picked_peak_to_apex(sel);
                         self.status_msg = self.stack1d_panel.status_message.clone();
                     }
+                } else if self.active_cube_idx.is_some() {
+                    if let Some(sel3) = self.cube_slice.selected_peak_3d_idx {
+                        self.snap_active_3d_peak(sel3);
+                    }
                 } else if let Some(sel_2d) = self.workbook.two_d.selected_peak_idx {
                     self.snap_2d_peak_by_index(sel_2d);
                 } else {
@@ -11686,6 +13049,14 @@ impl NmrWorkbenchApp {
             WorkbenchAction::TogglePeakLabels => {
                 if self.is_1d_studio_active() {
                     self.stack1d_panel.show_peak_labels = !self.stack1d_panel.show_peak_labels;
+                } else if self.active_cube_idx.is_some() {
+                    if self.cube_slice.selected_peak_3d_idx.is_some() {
+                        self.show_peak_labels = true;
+                        self.focus_3d_peak_label_input = true;
+                        self.status_msg = "Edit selected 3D peak label (`pl`)".to_string();
+                    } else {
+                        self.show_peak_labels = !self.show_peak_labels;
+                    }
                 } else {
                     self.show_peak_labels = !self.show_peak_labels;
                 }
@@ -11722,7 +13093,11 @@ impl NmrWorkbenchApp {
                 self.use_match_finder_strips = true;
             }
             WorkbenchAction::OpenResidueAssignmentPopover => {
-                self.show_assign_popover = true;
+                if self.active_cube_idx.is_some() {
+                    let _ = self.pick_active_3d_cube_peaks();
+                } else {
+                    self.show_assign_popover = true;
+                }
             }
             WorkbenchAction::LockSelectedResidueAssignment => {
                 if let (Some(ss), Some(rk)) = (self.selected_ss, self.selected_res) {
@@ -12412,6 +13787,51 @@ impl NmrWorkbenchApp {
             self.suppress_water_active_1d();
             return;
         }
+        if let Some(c_idx) = self.active_cube_idx {
+            if c_idx < self.cubes_3d.len() {
+                let (nx, ny, nz) = infer_3d_cube_nuclei(&self.cubes_3d[c_idx]);
+                if nx != "1H" && ny != "1H" && nz != "1H" {
+                    self.status_msg = format!(
+                        "Active 3D cube '{}' has no ¹H axis to suppress",
+                        self.primary_2d_label
+                    );
+                    return;
+                }
+                let cfg = nmr_core::water::WaterSuppressionConfig::default();
+                let snapshot = self.cubes_3d[c_idx].clone();
+                let reported_ppm =
+                    nmr_core::water::suppress_water_3d(&mut self.cubes_3d[c_idx], &cfg);
+                let updated_cube = self.cubes_3d[c_idx].clone();
+                if self
+                    .hncacb_3d
+                    .as_ref()
+                    .is_some_and(|s| s.name == updated_cube.name && s.exp == updated_cube.exp)
+                {
+                    self.hncacb_3d = Some(updated_cube.clone());
+                }
+                if self
+                    .hnco_3d
+                    .as_ref()
+                    .is_some_and(|s| s.name == updated_cube.name && s.exp == updated_cube.exp)
+                {
+                    self.hnco_3d = Some(updated_cube);
+                }
+                self.water_undo_3d = Some(snapshot);
+                self.apply_active_cube_slice_refresh(false);
+                // Re-estimate contour base so suppressed slice renders with post-water noise floor
+                if let Some(ref s2) = self.hsqc_spec {
+                    let (base, nref) = Self::estimate_2d_contour_base(&s2.data);
+                    self.contour_noise_ref = nref;
+                    self.contour_base = base;
+                    self.save_live_2d_into_workbook();
+                }
+                self.status_msg = format!(
+                    "Suppressed 3D residual ¹H water at {reported_ppm:.3} ppm on '{}' (`wu` restores losslessly)",
+                    self.primary_2d_label
+                );
+                return;
+            }
+        }
         let Some(orig_2d) = self.hsqc_spec.clone() else {
             if !self.stack1d_panel.traces.is_empty() {
                 self.suppress_water_active_1d();
@@ -12435,10 +13855,10 @@ impl NmrWorkbenchApp {
         let cfg = nmr_core::water::WaterSuppressionConfig::default();
         let reported_ppm = nmr_core::water::suppress_water_spectrum_2d(&mut s2, &cfg);
         if let Some(ref mut cb3) = self.hncacb_3d {
-            let _ = nmr_core::water::suppress_water_spectrum_3d(cb3, &cfg);
+            let _ = nmr_core::water::suppress_water_3d(cb3, &cfg);
         }
         if let Some(ref mut co3) = self.hnco_3d {
-            let _ = nmr_core::water::suppress_water_spectrum_3d(co3, &cfg);
+            let _ = nmr_core::water::suppress_water_3d(co3, &cfg);
         }
 
         self.water_undo_2d = Some((orig_2d, orig_cb, orig_co));
@@ -12464,6 +13884,39 @@ impl NmrWorkbenchApp {
                 self.status_msg = "No 1D water suppression snapshot to undo".to_string();
             }
             return;
+        }
+        if let Some(c_idx) = self.active_cube_idx {
+            if let Some(prev_cube) = self.water_undo_3d.take() {
+                if c_idx < self.cubes_3d.len() {
+                    if self
+                        .hncacb_3d
+                        .as_ref()
+                        .is_some_and(|s| s.name == prev_cube.name && s.exp == prev_cube.exp)
+                    {
+                        self.hncacb_3d = Some(prev_cube.clone());
+                    }
+                    if self
+                        .hnco_3d
+                        .as_ref()
+                        .is_some_and(|s| s.name == prev_cube.name && s.exp == prev_cube.exp)
+                    {
+                        self.hnco_3d = Some(prev_cube.clone());
+                    }
+                    self.cubes_3d[c_idx] = prev_cube;
+                    self.apply_active_cube_slice_refresh(false);
+                    if let Some(ref s2) = self.hsqc_spec {
+                        let (base, nref) = Self::estimate_2d_contour_base(&s2.data);
+                        self.contour_noise_ref = nref;
+                        self.contour_base = base;
+                        self.save_live_2d_into_workbook();
+                    }
+                    self.status_msg = format!(
+                        "Restored pre-water-suppression 3D cube on '{}'",
+                        self.primary_2d_label
+                    );
+                    return;
+                }
+            }
         }
         let Some((orig_2d, orig_cb, orig_co)) = self.water_undo_2d.take() else {
             if self.stack1d_panel.undo_water_suppression_active_trace() {
@@ -14348,9 +15801,10 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             hnco_3d: None,
             cubes_3d: Vec::new(),
             active_cube_idx: None,
-            cube_view_mode: CubeViewMode::Skyline,
-            cube_plane_f2_idx: 0,
-            cube_plane_f1_idx: 0,
+            cube_slice: Cube3dSliceState::default(),
+            peaks_3d: Vec::new(),
+            water_undo_3d: None,
+            focus_3d_peak_label_input: false,
             extra_3d_count: 0,
             overlay_layers: Vec::new(),
             primary_2d_label: "15N-HSQC".to_string(),
@@ -14760,9 +16214,10 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             hnco_3d: None,
             cubes_3d: Vec::new(),
             active_cube_idx: None,
-            cube_view_mode: CubeViewMode::Skyline,
-            cube_plane_f2_idx: 0,
-            cube_plane_f1_idx: 0,
+            cube_slice: Cube3dSliceState::default(),
+            peaks_3d: Vec::new(),
+            water_undo_3d: None,
+            focus_3d_peak_label_input: false,
             extra_3d_count: 0,
             overlay_layers: Vec::new(),
             primary_2d_label: "15N-HSQC".to_string(),
@@ -15040,9 +16495,10 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             hnco_3d: None,
             cubes_3d: Vec::new(),
             active_cube_idx: None,
-            cube_view_mode: CubeViewMode::Skyline,
-            cube_plane_f2_idx: 0,
-            cube_plane_f1_idx: 0,
+            cube_slice: Cube3dSliceState::default(),
+            peaks_3d: Vec::new(),
+            water_undo_3d: None,
+            focus_3d_peak_label_input: false,
             extra_3d_count: 0,
             overlay_layers: Vec::new(),
             primary_2d_label: "15N-HSQC".to_string(),
@@ -15655,12 +17111,174 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         assert_eq!(app.workbook.pages_2d.len(), 1);
         assert_eq!(app.workbook.pages_2d[0].source_cube_idx, Some(0));
 
-        let f2_plane = super::extract_3d_plane_f2(&app.cubes_3d[0], 0);
+        let f2_plane = nmr_gui::workbook::extract_3d_plane_f2(&app.cubes_3d[0], 0);
         assert_eq!(f2_plane.nx(), app.cubes_3d[0].nx());
         assert_eq!(f2_plane.ny(), app.cubes_3d[0].nz());
 
-        let f1_plane = super::extract_3d_plane_f1(&app.cubes_3d[0], 0);
+        let f1_plane = nmr_gui::workbook::extract_3d_plane_f1(&app.cubes_3d[0], 0);
         assert_eq!(f1_plane.nx(), app.cubes_3d[0].nx());
         assert_eq!(f1_plane.ny(), app.cubes_3d[0].ny());
+
+        let f3_plane = nmr_gui::workbook::extract_3d_plane_f3(&app.cubes_3d[0], 0);
+        assert_eq!(f3_plane.nx(), app.cubes_3d[0].ny());
+        assert_eq!(f3_plane.ny(), app.cubes_3d[0].nz());
+    }
+
+    #[test]
+    fn test_multi_page_1d_2d_hsqc_3d_hccconh_append_chords_curation_and_water_undo() {
+        use super::*;
+        use eframe::egui;
+        use nmr_core::nmr1d::{Experiment1DKind, Spectrum1D};
+        use nmr_core::spectrum::AxisPpm;
+        use nmr_gui::ingest_panel::DroppedPayload;
+        use nmr_gui::workbook::WorkbookPageKind;
+
+        let mut app = make_headless_test_app();
+        app.load_builtin_demo_suite();
+        assert!(app.workbook.pages_2d.iter().all(|p| p.is_demo));
+
+        // 1. Append 1D 1H trace (evicts built-in demo pages once)
+        let ax1 = AxisPpm::from_bounds("1H", 128, 10.0, 0.0, 800.13);
+        let sp1 = Spectrum1D::new(
+            "1D_1H_amide".to_string(),
+            Experiment1DKind::Proton1D,
+            ax1,
+            vec![1.0_f64; 128],
+            None,
+        );
+        app.apply_drop_outcome(IngestDropOutcome::Spectra1D {
+            source_name: "batch_1d".to_string(),
+            spectra: vec![sp1],
+        });
+        assert_eq!(app.stack1d_panel.traces.len(), 1);
+        assert_eq!(app.workbook.pages_2d.len(), 0);
+
+        // 2. Append 2D 15N-HSQC page
+        let ax_hx = AxisPpm::from_bounds("1H", 64, 10.2, 5.8, 800.13);
+        let ax_ny = AxisPpm::from_bounds("15N", 32, 130.0, 106.0, 81.08);
+        let mut hsqc_data = vec![0.0_f32; 64 * 32];
+        let hx_i = ax_hx.ppm_to_index(8.35).round() as usize;
+        let ny_i = ax_ny.ppm_to_index(119.2).round() as usize;
+        hsqc_data[ny_i * 64 + hx_i] = 600.0;
+        let hsqc_2d = Spectrum2D {
+            name: "2D_15N_HSQC".to_string(),
+            axis_x: ax_hx,
+            axis_y: ax_ny,
+            data: hsqc_data,
+        };
+        app.prepare_workbook_for_user_append();
+        let hsqc_p_idx = app
+            .workbook
+            .add_2d_page("2D 15N-HSQC", hsqc_2d, false, false);
+        app.activate_2d_workbook_page(hsqc_p_idx);
+        assert_eq!(app.stack1d_panel.traces.len(), 1);
+        assert_eq!(app.workbook.pages_2d.len(), 1);
+
+        // 3. Drop a 3D H(CCO)NH folder onto the ALREADY-populated 1D + 2D HSQC workbook!
+        let td_x = 64usize;
+        let td_y = 8usize;
+        let td_z = 8usize;
+        let acqus = format!(
+            "##TITLE= hccconh\n##$PULPROG= <hccconhgp3d2>\n##$TD= {td_x}\n##$SW_h= 9600.0\n##$SFO1= 800.13\n##$BF1= 800.13\n##$NUC1= <1H>\n##$BYTORDA= 0\n##$DTYPA= 0\n##$AQSEQ= 0\n##END=\n"
+        );
+        let acqu2s = format!(
+            "##TITLE= hccconh\n##$TD= {td_y}\n##$SW_h= 2400.0\n##$SFO1= 81.08\n##$BF1= 81.08\n##$NUC1= <15N>\n##$FnMODE= 5\n##END=\n"
+        );
+        let acqu3s = format!(
+            "##TITLE= hccconh\n##$TD= {td_z}\n##$SW_h= 9600.0\n##$SFO1= 800.13\n##$BF1= 800.13\n##$NUC1= <1H>\n##$FnMODE= 5\n##END=\n"
+        );
+        let stride_bytes = (td_x * 4).div_ceil(1024) * 1024;
+        let mut ser = vec![0u8; td_y * td_z * stride_bytes];
+        for t in 0..(td_y * td_z) {
+            for k in 0..(td_x / 2) {
+                let amp = (45_000.0 * (-(k as f64) * 0.07).exp()) as i32;
+                let off = t * stride_bytes + k * 8;
+                ser[off..off + 4].copy_from_slice(&amp.to_le_bytes());
+            }
+        }
+        let out = super::ingest_dropped_payloads(&[
+            DroppedPayload::new("4/acqus", acqus.into_bytes()),
+            DroppedPayload::new("4/acqu2s", acqu2s.into_bytes()),
+            DroppedPayload::new("4/acqu3s", acqu3s.into_bytes()),
+            DroppedPayload::new("4/ser", ser),
+        ])
+        .expect("classify 3D hccconh");
+        app.apply_drop_outcome(out);
+
+        // Verify ALL THREE pages coexist: 1D trace + 2D HSQC page + 3D H(CCO)NH page (activated!)
+        assert_eq!(app.stack1d_panel.traces.len(), 1);
+        assert_eq!(app.workbook.pages_2d.len(), 2);
+        assert_eq!(app.workbook.pages_2d[0].kind, WorkbookPageKind::Spectrum2d);
+        assert!(app.workbook.pages_2d[0].has_3d_strips);
+        assert_eq!(
+            app.workbook.pages_2d[1].kind,
+            WorkbookPageKind::Cube3d { cube_idx: 0 }
+        );
+        assert_eq!(app.workbook.active_2d_idx, 1);
+        assert_eq!(app.active_cube_idx, Some(0));
+
+        // 4. Switch to 2D HSQC page, snap crosshair to (8.35, 119.2), and dispatch `gs` (`GotoCubeStripFromHsqc`)
+        let ctx = egui::Context::default();
+        app.activate_2d_workbook_page(0);
+        app.crosshair.snap_to(8.35, 119.2, None);
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::GotoCubeStripFromHsqc);
+        assert_eq!(app.workbook.active_2d_idx, 1);
+        assert_eq!(app.active_cube_idx, Some(0));
+        assert_eq!(
+            app.cube_slice.orientation,
+            CubePlaneOrientation::F3xF1StepF2
+        );
+        assert!(!app.cube_slice.skyline_enabled);
+        assert_eq!(app.active_2d_nuclei(), ("1H", "1H"));
+
+        // 5. Exercise `np` / `pp` / `xy` / `yz` / `sk` chords + `pa` / `pl` / `pc` / `pd` + `ws` / `wu`
+        let p_before = app.cube_slice.plane_f2_idx;
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::NextCubePlane);
+        if p_before + 1 < app.cubes_3d[0].ny() {
+            assert_eq!(app.cube_slice.plane_f2_idx, p_before + 1);
+        }
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::PrevCubePlane);
+        assert_eq!(app.cube_slice.plane_f2_idx, p_before);
+
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::CubePlaneF2xF1);
+        assert_eq!(
+            app.cube_slice.orientation,
+            CubePlaneOrientation::F2xF1StepF3
+        );
+        assert_eq!(app.active_2d_nuclei(), ("15N", "1H"));
+
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::CubePlaneF3xF2);
+        assert_eq!(
+            app.cube_slice.orientation,
+            CubePlaneOrientation::F3xF2StepF1
+        );
+        assert_eq!(app.active_2d_nuclei(), ("1H", "15N"));
+
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::ToggleCubeSkyline);
+        assert!(app.cube_slice.skyline_enabled);
+
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::AddPeakAtCrosshair);
+        assert_eq!(app.peaks_3d.len(), 1);
+        app.relabel_active_3d_peak(0, "M1-HA");
+        assert_eq!(app.peaks_3d[0].label, "M1-HA");
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::SnapPeakParabolicCenter);
+
+        // Render headless 3D canvas + 3D bottom peak table to verify zero panics
+        app.workbook.two_d.show_peak_table = true;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = app.draw_hsqc_canvas(ui);
+            app.draw_2d_peaks_bottom_table(ui);
+        });
+
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::DeleteSelectedPeaks);
+        assert!(app.peaks_3d.is_empty());
+
+        // 3D water suppression (`ws`) + lossless undo (`wu`)
+        let orig_cube_data = app.cubes_3d[0].data.clone();
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::SuppressWaterPeak);
+        assert!(app.water_undo_3d.is_some());
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::UndoWaterSuppression);
+        assert!(app.water_undo_3d.is_none());
+        assert_eq!(app.cubes_3d[0].data, orig_cube_data);
     }
 }

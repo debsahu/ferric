@@ -14,10 +14,73 @@ use std::f64::consts::TAU;
 use eframe::egui;
 use nmr_core::priors::three_to_one;
 use nmr_core::solver::{Matrix2D, ScoreConfig, FORBID};
-use nmr_core::spectrum::Spectrum3D;
+use nmr_core::spectrum::{AxisPpm, Spectrum3D};
 use nmr_core::spinsystems::SpinSystem;
 
 use crate::contour_painter::SyncCrosshair;
+use crate::workbook::{infer_3d_cube_nuclei, pretty_nucleus};
+
+/// Resolve the vertical indirect strip axis, canonical physical nucleus tag (`"1H"`, `"13C"`, ...),
+/// and exact `(min_ppm, max_ppm)` bounds from a [`Spectrum3D`] cube (matching `Spectrum3D::extract_strip`
+/// whether `${}^{15}\text{N}$ sits on `F2/axis_y` or `F1/axis_z`).
+pub fn strip_vertical_axis_metadata(s3: &Spectrum3D) -> (&AxisPpm, &'static str, (f64, f64)) {
+    let (_, nuc_y, nuc_z) = infer_3d_cube_nuclei(s3);
+    let y_is_n = nuc_y == "15N"
+        || s3.axis_y.label.contains('N')
+        || (s3.axis_y.max_ppm() > 95.0
+            && s3.axis_y.min_ppm() < 145.0
+            && !s3.axis_z.label.contains('N'));
+    let (v_axis, v_nuc) = if y_is_n {
+        (&s3.axis_z, nuc_z)
+    } else {
+        (&s3.axis_y, nuc_y)
+    };
+    let lo = v_axis.min_ppm();
+    let hi = v_axis.max_ppm();
+    let bounds = if hi > lo {
+        (lo, hi)
+    } else if v_nuc == "1H" {
+        (-1.0, 11.0)
+    } else {
+        (10.0, 75.0)
+    };
+    (v_axis, v_nuc, bounds)
+}
+
+/// Generate clean human-readable chemical-shift ticks inside `[lo, hi]`.
+pub fn compute_nice_strip_ticks(lo: f64, hi: f64, target_count: usize) -> Vec<f64> {
+    let a = lo.min(hi);
+    let b = lo.max(hi);
+    let span = b - a;
+    if !span.is_finite() || span <= 1e-6 || target_count == 0 {
+        return Vec::new();
+    }
+    let raw = span / (target_count as f64);
+    let pow10 = 10.0_f64.powf(raw.log10().floor());
+    let frac = raw / pow10;
+    let step = if frac <= 1.5 {
+        1.0 * pow10
+    } else if frac <= 2.5 {
+        2.0 * pow10
+    } else if frac <= 6.0 {
+        5.0 * pow10
+    } else {
+        10.0 * pow10
+    };
+    if step <= 1e-9 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let first = (a / step).ceil() as i64;
+    let last = (b / step).floor() as i64;
+    for k in first..=last.min(first + 64) {
+        let v = (k as f64) * step;
+        if v >= a - 1e-9 && v <= b + 1e-9 {
+            out.push(v);
+        }
+    }
+    out
+}
 
 /// Direction of a candidate sequential strip relative to the active query root `i`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -672,76 +735,95 @@ impl StripTilerPanel {
                 painter.rect_filled(canvas_rect, 4.0, egui::Color32::from_rgb(13, 17, 24));
 
                 let header_h = 34.0f32;
+                let (ali_nuc, ali_range) = if let Some(s3) = ctx.spectra_3d.aliphatic_3d {
+                    let (_, nuc, bounds) = strip_vertical_axis_metadata(s3);
+                    (nuc, bounds)
+                } else {
+                    ("13C", self.c_aliphatic_range)
+                };
+                let (co_nuc, co_range) = if let Some(s3_co) = ctx.spectra_3d.carbonyl_3d {
+                    let (_, nuc, bounds) = strip_vertical_axis_metadata(s3_co);
+                    (nuc, bounds)
+                } else {
+                    ("13C", self.c_carbonyl_range)
+                };
+                let has_c_cands = ctx.systems.iter().any(|ss| {
+                    ss.cands.contains_key(&("C".to_string(), 0))
+                        || ss.cands.contains_key(&("C".to_string(), -1))
+                });
+                let show_co_band =
+                    ctx.spectra_3d.carbonyl_3d.is_some() || ali_nuc != "1H" || has_c_cands;
+
                 let co_top = canvas_rect.top() + header_h;
-                let co_bot = co_top + 54.0;
-                let ali_top = co_bot + 10.0;
+                let (co_bot, ali_top) = if show_co_band {
+                    let cb = co_top + 54.0;
+                    (cb, cb + 10.0)
+                } else {
+                    (co_top, co_top)
+                };
                 let ali_bot = canvas_rect.bottom() - 8.0;
 
                 let eff_col_w =
                     ((canvas_rect.width() - left_axis_w - 6.0) / (columns.len() as f32)).max(col_w);
 
-                let ali_is_1h = ctx
-                    .spectra_3d
-                    .aliphatic_3d
-                    .is_some_and(|s| s.axis_z.label.to_ascii_uppercase().contains('H'));
-                let ali_range = if let Some(s3) = ctx.spectra_3d.aliphatic_3d.filter(|_| ali_is_1h)
-                {
-                    let lo = s3.axis_z.min_ppm().max(-3.0);
-                    let hi = s3.axis_z.max_ppm().min(12.0);
-                    if hi > lo {
-                        (lo, hi)
-                    } else {
-                        (-2.0, 10.0)
-                    }
-                } else {
-                    self.c_aliphatic_range
-                };
-
                 let co_to_y = |ppm: f64| -> f32 {
-                    SyncCrosshair::ppm_to_strip_y(
-                        self.c_carbonyl_range.0,
-                        self.c_carbonyl_range.1,
-                        co_top,
-                        co_bot,
-                        ppm,
-                    )
+                    SyncCrosshair::ppm_to_strip_y(co_range.0, co_range.1, co_top, co_bot, ppm)
                 };
                 let ali_to_y = |ppm: f64| -> f32 {
                     SyncCrosshair::ppm_to_strip_y(ali_range.0, ali_range.1, ali_top, ali_bot, ppm)
                 };
 
-                // Draw 13C' and 13CA/CB axis ticks
-                for c_tick in [170.0, 175.0, 180.0] {
-                    let y = co_to_y(c_tick);
-                    painter.text(
-                        egui::pos2(canvas_rect.left() + 3.0, y),
-                        egui::Align2::LEFT_CENTER,
-                        format!("{c_tick:.0}"),
-                        egui::FontId::monospace(9.0),
-                        egui::Color32::from_rgb(135, 190, 150),
-                    );
-                    painter.line_segment(
-                        [
-                            egui::pos2(canvas_rect.left() + left_axis_w, y),
-                            egui::pos2(canvas_rect.right() - 4.0, y),
-                        ],
-                        egui::Stroke::new(0.5, egui::Color32::from_rgb(26, 36, 46)),
-                    );
-                }
-                let ali_ticks: &[f64] = if ali_is_1h {
-                    &[-2.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0]
+                // Axis nucleus badge in top-left gutter
+                let gutter_nuc = if show_co_band && co_nuc != ali_nuc {
+                    format!("{}/{}", pretty_nucleus(co_nuc), pretty_nucleus(ali_nuc))
                 } else {
-                    &[15.0, 25.0, 35.0, 45.0, 55.0, 65.0]
+                    format!("{} ppm", pretty_nucleus(ali_nuc))
                 };
-                for &c_tick in ali_ticks {
-                    if c_tick < ali_range.0 || c_tick > ali_range.1 {
-                        continue;
+                painter.text(
+                    egui::pos2(canvas_rect.left() + 3.0, canvas_rect.top() + 16.0),
+                    egui::Align2::LEFT_CENTER,
+                    gutter_nuc,
+                    egui::FontId::monospace(8.5),
+                    egui::Color32::from_rgb(165, 185, 210),
+                );
+
+                // Draw dynamic carbonyl/upper-band and aliphatic/indirect-band axis ticks
+                if show_co_band {
+                    for c_tick in compute_nice_strip_ticks(co_range.0, co_range.1, 3) {
+                        let y = co_to_y(c_tick);
+                        let fmt_lbl = if (co_range.1 - co_range.0).abs() < 6.0 {
+                            format!("{c_tick:.1}")
+                        } else {
+                            format!("{c_tick:.0}")
+                        };
+                        painter.text(
+                            egui::pos2(canvas_rect.left() + 3.0, y),
+                            egui::Align2::LEFT_CENTER,
+                            fmt_lbl,
+                            egui::FontId::monospace(9.0),
+                            egui::Color32::from_rgb(135, 190, 150),
+                        );
+                        painter.line_segment(
+                            [
+                                egui::pos2(canvas_rect.left() + left_axis_w, y),
+                                egui::pos2(canvas_rect.right() - 4.0, y),
+                            ],
+                            egui::Stroke::new(0.5, egui::Color32::from_rgb(26, 36, 46)),
+                        );
                     }
+                }
+                let ali_span = (ali_range.1 - ali_range.0).abs();
+                for c_tick in compute_nice_strip_ticks(ali_range.0, ali_range.1, 6) {
                     let y = ali_to_y(c_tick);
+                    let fmt_lbl = if ali_span < 16.0 && (c_tick.fract().abs() > 1e-4) {
+                        format!("{c_tick:.1}")
+                    } else {
+                        format!("{c_tick:.0}")
+                    };
                     painter.text(
                         egui::pos2(canvas_rect.left() + 3.0, y),
                         egui::Align2::LEFT_CENTER,
-                        format!("{c_tick:.0}"),
+                        fmt_lbl,
                         egui::FontId::monospace(9.0),
                         egui::Color32::from_rgb(145, 165, 190),
                     );
@@ -845,14 +927,20 @@ impl StripTilerPanel {
                         egui::Rect::from_min_max(egui::pos2(x0, co_top), egui::pos2(x1, co_bot));
                     let ali_box =
                         egui::Rect::from_min_max(egui::pos2(x0, ali_top), egui::pos2(x1, ali_bot));
-                    for sub_box in [co_box, ali_box] {
+                    if show_co_band {
                         painter.rect_stroke(
-                            sub_box,
+                            co_box,
                             2.0,
                             egui::Stroke::new(if is_center { 1.6 } else { 1.0 }, border_col),
                             egui::StrokeKind::Inside,
                         );
                     }
+                    painter.rect_stroke(
+                        ali_box,
+                        2.0,
+                        egui::Stroke::new(if is_center { 1.6 } else { 1.0 }, border_col),
+                        egui::StrokeKind::Inside,
+                    );
 
                     // Column header & score subtitle
                     let res_badge = ctx
@@ -918,14 +1006,16 @@ impl StripTilerPanel {
                     );
 
                     // Paint volumetric 3D slice OR synthetic Gaussian strip profile
-                    self.paint_band_profile(
-                        &painter,
-                        co_box,
-                        ss,
-                        ctx.spectra_3d.carbonyl_3d,
-                        self.c_carbonyl_range,
-                        &co_to_y,
-                    );
+                    if show_co_band {
+                        self.paint_band_profile(
+                            &painter,
+                            co_box,
+                            ss,
+                            ctx.spectra_3d.carbonyl_3d,
+                            co_range,
+                            &co_to_y,
+                        );
+                    }
                     self.paint_band_profile(
                         &painter,
                         ali_box,
@@ -941,13 +1031,9 @@ impl StripTilerPanel {
                     // Pointer hover -> update synchronized crosshair; header click -> SelectRoot
                     if let Some(hp) = canvas_resp.hover_pos() {
                         if (x0..=x1).contains(&hp.x) {
-                            if co_box.contains(hp) {
+                            if show_co_band && co_box.contains(hp) {
                                 let c_ppm = SyncCrosshair::strip_y_to_ppm(
-                                    self.c_carbonyl_range.0,
-                                    self.c_carbonyl_range.1,
-                                    co_top,
-                                    co_bot,
-                                    hp.y,
+                                    co_range.0, co_range.1, co_top, co_bot, hp.y,
                                 );
                                 if let Some(xh) = crosshair.as_deref_mut() {
                                     xh.update_from_strip_hover(Some(ss.h), Some(ss.n), c_ppm);
@@ -982,26 +1068,25 @@ impl StripTilerPanel {
                     }
                 }
 
-                // Draw synchronized 13C crosshair line across all strips when c_ppm is active
+                // Draw synchronized indirect crosshair line across all strips when c_ppm is active
                 if let Some(xh) = crosshair.as_deref() {
                     let line_col = if xh.locked {
                         egui::Color32::from_rgba_unmultiplied(255, 215, 90, 190)
                     } else {
                         egui::Color32::from_rgba_unmultiplied(185, 225, 255, 125)
                     };
-                    if let Some(y_co) = xh.project_c_to_strip_y(
-                        self.c_carbonyl_range.0,
-                        self.c_carbonyl_range.1,
-                        co_top,
-                        co_bot,
-                    ) {
-                        painter.line_segment(
-                            [
-                                egui::pos2(x_pred_left, y_co),
-                                egui::pos2(x_succ_right, y_co),
-                            ],
-                            egui::Stroke::new(1.0, line_col),
-                        );
+                    if show_co_band {
+                        if let Some(y_co) =
+                            xh.project_c_to_strip_y(co_range.0, co_range.1, co_top, co_bot)
+                        {
+                            painter.line_segment(
+                                [
+                                    egui::pos2(x_pred_left, y_co),
+                                    egui::pos2(x_succ_right, y_co),
+                                ],
+                                egui::Stroke::new(1.0, line_col),
+                            );
+                        }
                     }
                     if let Some(y_ali) =
                         xh.project_c_to_strip_y(ali_range.0, ali_range.1, ali_top, ali_bot)

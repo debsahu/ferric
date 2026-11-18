@@ -97,6 +97,25 @@ const EXPECTED_TWO_KEY_CHORDS: &[((char, char), &str, WorkbenchAction)] = &[
         "Chord: a_",
         WorkbenchAction::OpenResidueAssignmentPopover,
     ),
+    (
+        ('w', 'u'),
+        "Chord: w_",
+        WorkbenchAction::UndoWaterSuppression,
+    ),
+    (('n', 'p'), "Chord: n_", WorkbenchAction::NextCubePlane),
+    (('p', 'p'), "Chord: p_", WorkbenchAction::PrevCubePlane),
+    (('x', 'y'), "Chord: x_", WorkbenchAction::CubePlaneF3xF2),
+    (('p', '1'), "Chord: p_", WorkbenchAction::CubePlaneF3xF2),
+    (('x', 'z'), "Chord: x_", WorkbenchAction::CubePlaneF3xF1),
+    (('p', '2'), "Chord: p_", WorkbenchAction::CubePlaneF3xF1),
+    (('y', 'z'), "Chord: y_", WorkbenchAction::CubePlaneF2xF1),
+    (('p', '3'), "Chord: p_", WorkbenchAction::CubePlaneF2xF1),
+    (('s', 'k'), "Chord: s_", WorkbenchAction::ToggleCubeSkyline),
+    (
+        ('g', 's'),
+        "Chord: g_",
+        WorkbenchAction::GotoCubeStripFromHsqc,
+    ),
 ];
 
 #[test]
@@ -172,6 +191,27 @@ fn test_single_key_space_crosshair_lock_and_question_cheat_sheet() {
         km.feed_key(KeyChordInput::escape(), 300, focus),
         ChordOutcome::IdleEscape
     );
+
+    // `[` / `]` and `PageDown` / `PageUp` step 3D cube planes immediately without entering Pending
+    for (key, expected) in [
+        (ChordKey::OpenBracket, WorkbenchAction::PrevCubePlane),
+        (ChordKey::CloseBracket, WorkbenchAction::NextCubePlane),
+        (ChordKey::PageDown, WorkbenchAction::PrevCubePlane),
+        (ChordKey::PageUp, WorkbenchAction::NextCubePlane),
+    ] {
+        let out = km.feed_key(
+            KeyChordInput {
+                key,
+                ctrl_or_cmd: false,
+                alt: false,
+                shift: false,
+            },
+            350,
+            focus,
+        );
+        assert_eq!(out, ChordOutcome::Dispatched(expected));
+        assert_eq!(km.state(), ChordState::Idle);
+    }
 }
 
 #[test]
