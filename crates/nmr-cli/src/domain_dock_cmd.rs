@@ -13,32 +13,34 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use nmr_core::af_concordance::{parse_af_structure_model, parse_pae_json_file, AfIngestOptions};
+use nmr_core::af_concordance::{
+    parse_af_structure_model, parse_pae_json_file, AfIngestOptions, AfResidueRecord,
+};
 use nmr_core::domain_dock::{
-    dock_domains_cpu, format_domain_dock_json, format_domain_dock_tsv, read_domain_pcs_tsv,
-    read_domain_pre_tsv, write_docked_mmcif_ensemble, write_docked_pdb_ensemble, DomainDockConfig,
-    DomainDockResult, DomainPcsTagSet, DomainPreSiteSet,
+    dock_domains_multi_chain_cpu, format_domain_dock_json, format_domain_dock_tsv,
+    multi_chain_backbone_rmsd, read_domain_noe_tsv, read_domain_pcs_tsv,
+    read_domain_pre_tsv_with_defaults, read_domain_rdc_tsv, write_docked_mmcif_ensemble,
+    write_docked_pdb_ensemble, DomainDockConfig, DomainDockResult, DomainPcsTagSet,
+    DomainPreSiteSet, DomainRdcMediumSet,
 };
 use nmr_core::nef::read_nef_file;
 use nmr_core::noesy::AmbiguousDistanceRestraint;
-use nmr_core::rdc::{read_rdc_tsv, RdcMediumSet};
-use nmr_core::structure::{backbone_rmsd_between_chains, read_exp_noe_tsv};
-use nmr_gpu::domain_dock_gpu::dock_domains_gpu;
+use nmr_gpu::domain_dock_gpu::dock_domains_multi_chain_gpu;
 use nmr_gpu::GpuEngine;
 
 use crate::{parse_engine_request, EngineRequest};
 
-pub const STRUCTURE_PAE_DOMAINS_USAGE: &str = "Usage: ferric structure --pae-domains --af-structure <model.cif|pdb> --af-pae <pae.json> [--rdc <rdcs.tsv|nef>] [--pcs <pcs.tsv>] [--pre <pre.tsv>] [--noesy <inter_noe.tsv>] [--rdc-free-frac 0.20] [--ensemble-size 10] [--replicas 64] [--engine auto|gpu|cpu] [--pdb-ref <ref.pdb|cif>] [--json-out <report.json>] [--tsv-out <report.tsv>] [--seed 42] -o <docked.pdb|docked.cif>";
+pub const STRUCTURE_PAE_DOMAINS_USAGE: &str = "Usage: ferric structure --pae-domains --af-structure <model.cif|pdb> --af-pae <pae.json> [--chain <ID[,ID2,...]>] [--rdc <rdcs.tsv|nef>] [--pcs <pcs.tsv>] [--pre <pre.tsv>] [--pre-tau-c-ns <ns>] [--pre-proton-mhz <MHz>] [--mtsl-tether-allowance-a <A>] [--refine-metal-pos] [--metal-search-radius <A>] [--noesy <inter_noe.tsv>] [--rdc-free-frac 0.20] [--pcs-free-frac 0.20] [--allow-poor-intra-domain-fit] [--allow-underdetermined-single-medium] [--ensemble-size 10] [--replicas 64] [--engine auto|gpu|cpu] [--pdb-ref <ref.pdb|cif>] [--json-out <report.json>] [--tsv-out <report.tsv>] [--seed 42] -o <docked.pdb|docked.cif>";
 
-fn load_rdc_file_auto(path: &Path) -> Result<Vec<RdcMediumSet>, String> {
+fn load_rdc_file_auto(path: &Path) -> Result<Vec<DomainRdcMediumSet>, String> {
     let is_nef = path
         .extension()
         .and_then(|s| s.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("nef"));
     let media = if is_nef {
-        read_nef_file(path)?.rdc_media()?
+        DomainRdcMediumSet::from_rdc_media(&read_nef_file(path)?.rdc_media()?)
     } else {
-        read_rdc_tsv(path)?
+        read_domain_rdc_tsv(path)?
     };
     if media.is_empty() {
         return Err(format!(
@@ -62,6 +64,30 @@ fn default_sidecar_report_paths(out_coord: &Path) -> (PathBuf, PathBuf) {
     )
 }
 
+fn discover_pdb_polymer_chain_ids(path: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut chains: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("ENDMDL") {
+            break;
+        }
+        if line.starts_with("ATOM  ") && line.len() >= 22 {
+            let b = line.as_bytes()[21];
+            let cid = if b == b' ' || !b.is_ascii_graphic() {
+                "A".to_string()
+            } else {
+                (b as char).to_string()
+            };
+            if !chains.iter().any(|c| c == &cid) {
+                chains.push(cid);
+            }
+        }
+    }
+    chains
+}
+
 /// Execute `ferric structure --pae-domains ...`.
 pub fn cmd_structure_pae_domains(args: &[String]) -> Result<(), String> {
     let mut af_struct_path: Option<PathBuf> = None;
@@ -74,8 +100,13 @@ pub fn cmd_structure_pae_domains(args: &[String]) -> Result<(), String> {
     let mut json_out_path: Option<PathBuf> = None;
     let mut tsv_out_path: Option<PathBuf> = None;
     let mut pdb_ref_path: Option<PathBuf> = None;
-    let mut chain_id_opt: Option<String> = None;
+    let mut chain_ids_opt: Vec<String> = Vec::new();
     let mut force_bfactor_plddt = false;
+    let mut cli_pre_tau_c_ns: Option<f64> = None;
+    let mut cli_pre_proton_mhz: Option<f64> = None;
+    let mut cli_mtsl_tether_a: Option<f64> = None;
+    let mut cli_refine_metal_pos = false;
+    let mut cli_metal_search_radius_a: Option<f64> = None;
     let mut engine_req = EngineRequest::Auto;
     let mut cfg = DomainDockConfig::default();
 
@@ -100,14 +131,17 @@ pub fn cmd_structure_pae_domains(args: &[String]) -> Result<(), String> {
                     args.get(i).ok_or("missing value for --af-pae <pae.json>")?,
                 ));
             }
-            "--chain" => {
+            "--chain" | "--chains" => {
                 i += 1;
-                chain_id_opt = Some(
-                    args.get(i)
-                        .ok_or("missing value for --chain <ID>")?
-                        .trim()
-                        .to_string(),
-                );
+                let raw = args
+                    .get(i)
+                    .ok_or("missing value for --chain <ID[,ID2,...]>")?;
+                for part in raw.split(',') {
+                    let t = part.trim();
+                    if !t.is_empty() && !chain_ids_opt.iter().any(|c| c == t) {
+                        chain_ids_opt.push(t.to_string());
+                    }
+                }
             }
             "--force-bfactor-plddt" => {
                 force_bfactor_plddt = true;
@@ -131,6 +165,65 @@ pub fn cmd_structure_pae_domains(args: &[String]) -> Result<(), String> {
                     args.get(i).ok_or("missing value for --pre <pre.tsv>")?,
                 ));
             }
+            "--pre-tau-c-ns" | "--tau-c-ns" => {
+                i += 1;
+                let v: f64 = args
+                    .get(i)
+                    .ok_or("missing value for --pre-tau-c-ns <ns>")?
+                    .parse()
+                    .map_err(|e| format!("invalid --pre-tau-c-ns: {e}"))?;
+                if !v.is_finite() || !(0.05..=1000.0).contains(&v) {
+                    return Err(format!(
+                        "invalid --pre-tau-c-ns {v}: expected finite rotational correlation time in 0.05..=1000.0 ns"
+                    ));
+                }
+                cli_pre_tau_c_ns = Some(v);
+            }
+            "--pre-proton-mhz" | "--proton-mhz" => {
+                i += 1;
+                let v: f64 = args
+                    .get(i)
+                    .ok_or("missing value for --pre-proton-mhz <MHz>")?
+                    .parse()
+                    .map_err(|e| format!("invalid --pre-proton-mhz: {e}"))?;
+                if !v.is_finite() || !(40.0..=1500.0).contains(&v) {
+                    return Err(format!(
+                        "invalid --pre-proton-mhz {v}: expected finite 1H Larmor frequency in 40.0..=1500.0 MHz"
+                    ));
+                }
+                cli_pre_proton_mhz = Some(v);
+            }
+            "--mtsl-tether-allowance-a" | "--pre-tether-allowance" => {
+                i += 1;
+                let v: f64 = args
+                    .get(i)
+                    .ok_or("missing value for --mtsl-tether-allowance-a <A>")?
+                    .parse()
+                    .map_err(|e| format!("invalid --mtsl-tether-allowance-a: {e}"))?;
+                if !v.is_finite() || !(0.0..=15.0).contains(&v) {
+                    return Err(format!(
+                        "invalid --mtsl-tether-allowance-a {v}: expected finite allowance in 0.0..=15.0 A"
+                    ));
+                }
+                cli_mtsl_tether_a = Some(v);
+            }
+            "--refine-metal-pos" => {
+                cli_refine_metal_pos = true;
+            }
+            "--metal-search-radius" => {
+                i += 1;
+                let v: f64 = args
+                    .get(i)
+                    .ok_or("missing value for --metal-search-radius <A>")?
+                    .parse()
+                    .map_err(|e| format!("invalid --metal-search-radius: {e}"))?;
+                if !v.is_finite() || !(0.5..=20.0).contains(&v) {
+                    return Err(format!(
+                        "invalid --metal-search-radius {v}: expected finite radius in 0.5..=20.0 A"
+                    ));
+                }
+                cli_metal_search_radius_a = Some(v);
+            }
             "--noesy" | "--noesy-peaks" | "--noe" => {
                 i += 1;
                 noesy_paths.push(PathBuf::from(
@@ -151,6 +244,26 @@ pub fn cmd_structure_pae_domains(args: &[String]) -> Result<(), String> {
                     ));
                 }
                 cfg.rdc_free_fraction = frac;
+            }
+            "--pcs-free-frac" => {
+                i += 1;
+                let frac: f64 = args
+                    .get(i)
+                    .ok_or("missing value for --pcs-free-frac")?
+                    .parse()
+                    .map_err(|e| format!("invalid --pcs-free-frac: {e}"))?;
+                if !frac.is_finite() || !(0.0..=0.50).contains(&frac) {
+                    return Err(format!(
+                        "invalid --pcs-free-frac {frac}: expected finite fraction in 0.0..=0.50"
+                    ));
+                }
+                cfg.pcs_free_fraction = frac;
+            }
+            "--allow-poor-intra-domain-fit" => {
+                cfg.allow_poor_intra_domain_fit = true;
+            }
+            "--allow-underdetermined-single-medium" => {
+                cfg.allow_underdetermined_single_medium = true;
             }
             "--rdc-weight" => {
                 i += 1;
@@ -250,67 +363,195 @@ pub fn cmd_structure_pae_domains(args: &[String]) -> Result<(), String> {
         format!("`ferric structure --pae-domains` requires -o <docked.pdb|docked.cif>\n{STRUCTURE_PAE_DOMAINS_USAGE}")
     })?;
 
-    let ingest_opts = AfIngestOptions {
-        target_chain_id: chain_id_opt.clone(),
-        force_bfactor_plddt,
+    let (models, pae) = if chain_ids_opt.len() >= 2 {
+        let mut ms = Vec::with_capacity(chain_ids_opt.len());
+        let mut total_res = 0usize;
+        for cid in &chain_ids_opt {
+            let opts = AfIngestOptions {
+                target_chain_id: Some(cid.clone()),
+                force_bfactor_plddt,
+            };
+            let m = parse_af_structure_model(&struct_p, &opts)?;
+            total_res += m.residues.len();
+            ms.push(m);
+        }
+        let p = parse_pae_json_file(&pae_p, None, Some(total_res))?;
+        (ms, p)
+    } else if let Some(single_cid) = chain_ids_opt.first() {
+        let opts = AfIngestOptions {
+            target_chain_id: Some(single_cid.clone()),
+            force_bfactor_plddt,
+        };
+        let m = parse_af_structure_model(&struct_p, &opts)?;
+        let p = parse_pae_json_file(&pae_p, Some(single_cid.as_str()), Some(m.residues.len()))?;
+        (vec![m], p)
+    } else {
+        let discovered = discover_pdb_polymer_chain_ids(&struct_p);
+        if discovered.len() >= 2 {
+            let mut ms = Vec::with_capacity(discovered.len());
+            let mut total_res = 0usize;
+            let mut all_ok = true;
+            for cid in &discovered {
+                let opts = AfIngestOptions {
+                    target_chain_id: Some(cid.clone()),
+                    force_bfactor_plddt,
+                };
+                match parse_af_structure_model(&struct_p, &opts) {
+                    Ok(m) => {
+                        total_res += m.residues.len();
+                        ms.push(m);
+                    }
+                    Err(_) => {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            if all_ok {
+                if let Ok(p) = parse_pae_json_file(&pae_p, None, Some(total_res)) {
+                    (ms, p)
+                } else {
+                    let opts = AfIngestOptions {
+                        target_chain_id: None,
+                        force_bfactor_plddt,
+                    };
+                    let m = parse_af_structure_model(&struct_p, &opts)?;
+                    let p = parse_pae_json_file(&pae_p, None, Some(m.residues.len()))?;
+                    (vec![m], p)
+                }
+            } else {
+                let opts = AfIngestOptions {
+                    target_chain_id: None,
+                    force_bfactor_plddt,
+                };
+                let m = parse_af_structure_model(&struct_p, &opts)?;
+                let p = parse_pae_json_file(&pae_p, None, Some(m.residues.len()))?;
+                (vec![m], p)
+            }
+        } else {
+            let opts = AfIngestOptions {
+                target_chain_id: None,
+                force_bfactor_plddt,
+            };
+            let m = parse_af_structure_model(&struct_p, &opts)?;
+            let p = parse_pae_json_file(&pae_p, None, Some(m.residues.len()))?;
+            (vec![m], p)
+        }
     };
-    let model = parse_af_structure_model(&struct_p, &ingest_opts)?;
-    let pae = parse_pae_json_file(&pae_p, chain_id_opt.as_deref(), Some(model.residues.len()))?;
 
-    let mut rdc_media: Vec<RdcMediumSet> = Vec::new();
+    let mut rdc_media: Vec<DomainRdcMediumSet> = Vec::new();
     for rp in &rdc_paths {
         rdc_media.extend(load_rdc_file_auto(rp)?);
     }
     let mut pcs_tags: Vec<DomainPcsTagSet> = Vec::new();
     for pp in &pcs_paths {
-        pcs_tags.extend(read_domain_pcs_tsv(pp)?);
+        let mut parsed = read_domain_pcs_tsv(pp)?;
+        if cli_refine_metal_pos || cli_metal_search_radius_a.is_some() {
+            for tag in &mut parsed {
+                if cli_refine_metal_pos {
+                    tag.refine_metal_pos = true;
+                }
+                if let Some(rad) = cli_metal_search_radius_a {
+                    tag.metal_search_radius_a = Some(rad);
+                }
+            }
+        }
+        pcs_tags.extend(parsed);
     }
     let mut pre_sites: Vec<DomainPreSiteSet> = Vec::new();
     for prp in &pre_paths {
-        pre_sites.extend(read_domain_pre_tsv(prp)?);
+        pre_sites.extend(read_domain_pre_tsv_with_defaults(
+            prp,
+            cli_pre_tau_c_ns,
+            cli_pre_proton_mhz,
+            cli_mtsl_tether_a,
+        )?);
     }
-    let sequence = model.sequence_3letter();
-    let seq_ids = model.seq_ids();
-    let mut noe_adrs: Vec<AmbiguousDistanceRestraint> = Vec::new();
+    let mut all_af_residues: Vec<AfResidueRecord> = Vec::new();
+    for m in &models {
+        let cid = if m.chain_id.trim().is_empty() {
+            "A".to_string()
+        } else {
+            m.chain_id.trim().to_string()
+        };
+        for r in &m.residues {
+            let mut rec = r.clone();
+            rec.chain_id = cid.clone();
+            all_af_residues.push(rec);
+        }
+    }
+    let mut noe_restraints: Vec<AmbiguousDistanceRestraint> = Vec::new();
     for np in &noesy_paths {
-        noe_adrs.extend(read_exp_noe_tsv(np, &sequence, &seq_ids)?);
+        noe_restraints.extend(read_domain_noe_tsv(np, &all_af_residues)?);
     }
 
     let t0 = Instant::now();
     let mut dock_res: DomainDockResult = match engine_req {
         EngineRequest::Cpu => {
-            let mut r = dock_domains_cpu(
-                &model, &pae, &rdc_media, &pcs_tags, &pre_sites, &noe_adrs, &cfg,
+            let mut r = dock_domains_multi_chain_cpu(
+                &models,
+                &pae,
+                &rdc_media,
+                &pcs_tags,
+                &pre_sites,
+                &noe_restraints,
+                &cfg,
             )?;
             r.report.elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
             r
         }
         EngineRequest::Gpu => {
             let gpu = GpuEngine::new_headless()?;
-            dock_domains_gpu(
-                &gpu, &model, &pae, &rdc_media, &pcs_tags, &pre_sites, &noe_adrs, &cfg,
+            dock_domains_multi_chain_gpu(
+                &gpu,
+                &models,
+                &pae,
+                &rdc_media,
+                &pcs_tags,
+                &pre_sites,
+                &noe_restraints,
+                &cfg,
             )?
         }
         EngineRequest::Auto => match GpuEngine::new_headless() {
-            Ok(gpu) => match dock_domains_gpu(
-                &gpu, &model, &pae, &rdc_media, &pcs_tags, &pre_sites, &noe_adrs, &cfg,
+            Ok(gpu) => match dock_domains_multi_chain_gpu(
+                &gpu,
+                &models,
+                &pae,
+                &rdc_media,
+                &pcs_tags,
+                &pre_sites,
+                &noe_restraints,
+                &cfg,
             ) {
                 Ok(r) => r,
-                Err(err) => {
-                    eprintln!(
-                        "Warning: WebGPU domain docking failed ({err}); falling back to CPU (f64)."
-                    );
-                    let mut r = dock_domains_cpu(
-                        &model, &pae, &rdc_media, &pcs_tags, &pre_sites, &noe_adrs, &cfg,
+                Err(gpu_err) => {
+                    let mut r = dock_domains_multi_chain_cpu(
+                        &models,
+                        &pae,
+                        &rdc_media,
+                        &pcs_tags,
+                        &pre_sites,
+                        &noe_restraints,
+                        &cfg,
                     )?;
+                    eprintln!(
+                        "Warning: WebGPU domain docking failed ({gpu_err}); completed on CPU (f64)."
+                    );
                     r.report.engine_used = "CPU (f64, auto-fallback)".to_string();
                     r.report.elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                     r
                 }
             },
             Err(_) => {
-                let mut r = dock_domains_cpu(
-                    &model, &pae, &rdc_media, &pcs_tags, &pre_sites, &noe_adrs, &cfg,
+                let mut r = dock_domains_multi_chain_cpu(
+                    &models,
+                    &pae,
+                    &rdc_media,
+                    &pcs_tags,
+                    &pre_sites,
+                    &noe_restraints,
+                    &cfg,
                 )?;
                 r.report.elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 r
@@ -327,7 +568,10 @@ pub fn cmd_structure_pae_domains(args: &[String]) -> Result<(), String> {
         .and_then(|s| s.to_str())
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
-    let entry_label = model.entry_id.as_deref().unwrap_or("ferric_pae_dock");
+    let entry_label = models
+        .first()
+        .and_then(|m| m.entry_id.as_deref())
+        .unwrap_or("ferric_pae_dock");
 
     if ext == "json" {
         let js = format_domain_dock_json(&dock_res.report)?;
@@ -355,7 +599,8 @@ pub fn cmd_structure_pae_domains(args: &[String]) -> Result<(), String> {
     if let Some(ref_p) = &pdb_ref_path {
         let ref_model = parse_af_structure_model(ref_p, &AfIngestOptions::default())?;
         let ref_chain = ref_model.to_pdb_chain();
-        let mut dom_mask = vec![false; model.residues.len()];
+        let total_res = all_af_residues.len();
+        let mut dom_mask = vec![false; total_res];
         for dom in &dock_res.report.partition.domains {
             for &idx in &dom.residue_indices {
                 if idx < dom_mask.len() {
@@ -364,21 +609,32 @@ pub fn cmd_structure_pae_domains(args: &[String]) -> Result<(), String> {
             }
         }
         let mask_opt = dom_mask.iter().any(|&b| b).then_some(dom_mask.as_slice());
-        let bb_rmsd = backbone_rmsd_between_chains(&dock_res.chains[0], &ref_chain, mask_opt);
+        let bb_rmsd = multi_chain_backbone_rmsd(&dock_res.chains[0], &ref_chain, mask_opt);
         println!("  All-domain BB RMSD vs reference: {bb_rmsd:.3} A");
     }
 
+    let pcs_q_work_str = dock_res
+        .report
+        .pcs_q_work
+        .map_or_else(|| "NA".to_string(), |q| format!("{q:.4}"));
+    let pcs_q_free_str = dock_res
+        .report
+        .pcs_q_free
+        .map_or_else(|| "NA".to_string(), |q| format!("{q:.4}"));
+
     println!(
-        "PAE multi-domain docking complete ({}, {:.1} ms): D={} rigid domain(s), {} linker(s), regime={:?}, Tolman={:?}, Q_work={:.4}, ByPeptidePlane Q_free={:.4}, PCS Q_free={:.4}, max intra-domain distortion={:.3} A -> {}",
+        "PAE multi-domain docking complete ({}, {:.1} ms): D={} rigid domain(s), {} linker(s), verdict={:?}, regime={:?}, Tolman={:?}, Q_work={:.4}, ByPeptidePlane Q_free={:.4}, PCS Q_work={}, PCS Q_free={}, max intra-domain distortion={:.3} A -> {}",
         dock_res.report.engine_used,
         dock_res.report.elapsed_ms,
         dock_res.report.partition.domains.len(),
         dock_res.report.partition.linkers.len(),
+        dock_res.report.quality_verdict,
         dock_res.report.observability_regime,
         dock_res.report.tolman_gdo.regime,
         dock_res.report.global_rdc_q_work,
         dock_res.report.global_rdc_q_free,
-        dock_res.report.pcs_q_free,
+        pcs_q_work_str,
+        pcs_q_free_str,
         dock_res.report.max_intra_domain_rmsd_angstrom,
         out_p.display()
     );
