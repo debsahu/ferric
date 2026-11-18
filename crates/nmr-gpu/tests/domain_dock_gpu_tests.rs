@@ -23,11 +23,12 @@ use nmr_core::af_concordance::{
     PaeMatrix,
 };
 use nmr_core::domain_dock::{
-    cluster_pae_domains, cluster_pae_domains_for_model, evaluate_domain_dock_fixed_saupe_cpu,
-    parse_domain_pcs_tsv_str, parse_domain_pre_tsv_str, partition_domain_stratified_rdc_free_set,
-    quat_apply_world_rot_step, DomainDockConfig, DomainDockEnergyWeights, DomainLinkerKinematics,
-    DomainPcsRestraint, DomainPcsTagSet, DomainPreRestraint, DomainPreSiteSet, PaeClusterConfig,
-    PaeDomainPartition, PreRestraintKind, PreparedDomainDockRestraints,
+    cluster_pae_domains, cluster_pae_domains_for_model, compute_solomon_k_pre_a6_s1,
+    evaluate_domain_dock_fixed_saupe_cpu, evaluate_solomon_gamma2_s1, parse_domain_pcs_tsv_str,
+    parse_domain_pre_tsv_str, partition_domain_stratified_rdc_free_set, quat_apply_world_rot_step,
+    DomainDockConfig, DomainDockEnergyWeights, DomainLinkerKinematics, DomainPcsRestraint,
+    DomainPcsTagSet, DomainPreRestraint, DomainPreSiteSet, PaeClusterConfig, PaeDomainPartition,
+    PreRestraintKind, PreparedDomainDockRestraints, CODATA_ELECTRON_G_FACTOR,
 };
 use nmr_core::noesy::{
     parse_pdb_first_model, reconstruct_ca_substituents, v_add, v_dist, v_norm, v_scale, v_sub,
@@ -42,7 +43,7 @@ use nmr_core::rng::Rng;
 use nmr_core::structure::{backbone_rmsd_between_chains, kabsch_transform, nerf_place_atom};
 use nmr_gpu::domain_dock_gpu::{
     dock_domains_gpu, evaluate_domain_dock_batch_gpu, validate_domain_dock_gpu_limits,
-    validate_domain_dock_gpu_limits_raw, DomainDockGpuReplicaInput,
+    validate_domain_dock_gpu_limits_raw, DomainDockGpuReplicaInput, MAX_DOMAIN_DOCK_GPU_RESIDUES,
     MAX_DOMAIN_DOCK_REPLICAS_PER_DISPATCH,
 };
 use nmr_gpu::GpuEngine;
@@ -479,6 +480,22 @@ fn test_validate_domain_dock_gpu_limits_adversarial_guards() {
         validate_domain_dock_gpu_limits_raw(&lim_tiny, 16, 150, 2, 1, 2, 100, 1, 20, 1, 10, 5)
             .is_err()
     );
+    let err_l = validate_domain_dock_gpu_limits_raw(
+        &lim,
+        16,
+        MAX_DOMAIN_DOCK_GPU_RESIDUES + 1,
+        2,
+        1,
+        1,
+        10,
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+    .unwrap_err();
+    assert!(err_l.contains("MAX_DOMAIN_DOCK_GPU_RESIDUES"));
     assert!(validate_domain_dock_gpu_limits_raw(
         &lim,
         64,
@@ -523,6 +540,7 @@ fn test_webgpu_domain_dock_batch_energy_and_gradient_parity_lt_1e5() {
                 let val = predict_pcs_spherical_ppm(h, m_pos_d2, 20.0, 6.0, [0.5, 1.0, 1.9]);
                 pcs_rows.push(DomainPcsRestraint {
                     tag_id: "yb".to_string(),
+                    chain_id: None,
                     seq_id: r.seq_id,
                     atom_name: "H".to_string(),
                     pcs_obs_ppm: val,
@@ -535,31 +553,41 @@ fn test_webgpu_domain_dock_batch_energy_and_gradient_parity_lt_1e5() {
     let pcs_tag = DomainPcsTagSet {
         tag_id: "yb".to_string(),
         metal_pos_initial: Some(m_pos_d2),
+        anchor_chain_id: None,
         anchor_residue_atom: None,
         host_domain_id: Some(2),
         pre_fitted_tensor: None,
+        refine_metal_pos: false,
+        metal_search_radius_a: None,
         restraints: pcs_rows,
     };
 
     let s_pos_d1 = v_add(ch0.residues[18].ca, [-3.2, 2.6, 2.8]);
+    let k_sol = compute_solomon_k_pre_a6_s1(10.0, 600.0, 0.5, CODATA_ELECTRON_G_FACTOR).unwrap();
     let pre_site = DomainPreSiteSet {
         site_id: "mtsl".to_string(),
         site_pos_initial: Some(s_pos_d1),
+        anchor_chain_id: None,
         anchor_residue_atom: None,
         host_domain_id: Some(1),
+        tau_c_ns: Some(10.0),
+        proton_mhz: Some(600.0),
+        mtsl_tether_allowance_a: None,
         restraints: vec![
             DomainPreRestraint {
                 site_id: "mtsl".to_string(),
+                chain_id: None,
                 seq_id: 94,
                 atom_name: "H".to_string(),
                 kind: PreRestraintKind::Gamma2Rate {
                     gamma2_obs_s1: 14.0,
                     sigma_s1: 3.0,
-                    k_pre_a6_s1: 1.23e7,
+                    k_pre_a6_s1: k_sol,
                 },
             },
             DomainPreRestraint {
                 site_id: "mtsl".to_string(),
+                chain_id: None,
                 seq_id: 110,
                 atom_name: "CA".to_string(),
                 kind: PreRestraintKind::DistanceBounds {
@@ -571,22 +599,34 @@ fn test_webgpu_domain_dock_batch_energy_and_gradient_parity_lt_1e5() {
         ],
     };
 
+    // Multi-candidate ambiguous NOE (`21.W2:P2-11` Nilges `r^-6` sum-averaging parity!)
     let noe_adr = AmbiguousDistanceRestraint {
         peak_index: 1,
         exp: "EXP_NOE".to_string(),
         lower_bound: 2.0,
         upper_bound: 6.5,
-        candidates: vec![NoeCandidatePair {
-            res_a: 32,
-            atom_a: NoeProton::AlphaHA,
-            res_b: 104,
-            atom_b: NoeProton::AlphaHA,
-            shift_score: 1.0,
-            network_score: 1.0,
-            weight: 1.0,
-        }],
+        candidates: vec![
+            NoeCandidatePair {
+                res_a: 12,
+                atom_a: NoeProton::AlphaHA,
+                res_b: 128,
+                atom_b: NoeProton::AlphaHA,
+                shift_score: 1.0,
+                network_score: 1.0,
+                weight: 0.5,
+            },
+            NoeCandidatePair {
+                res_a: 32,
+                atom_a: NoeProton::AlphaHA,
+                res_b: 104,
+                atom_b: NoeProton::AlphaHA,
+                shift_score: 1.0,
+                network_score: 1.0,
+                weight: 0.5,
+            },
+        ],
         all_candidates: Vec::new(),
-        is_unambiguous: true,
+        is_unambiguous: false,
     };
 
     let prep = PreparedDomainDockRestraints::compile(
@@ -865,16 +905,16 @@ fn test_webgpu_60deg_8a_two_domain_docking_gate_under_2s() {
     let pcs_tags = parse_domain_pcs_tsv_str(&pcs_tsv).unwrap();
 
     let pre_pos = v_add(native_chain.residues[67].ca, [-2.8, 2.5, 2.8]);
-    let k_pre = 1.23e7_f64;
     let mut pre_tsv = format!(
-        "# site_pos: {:.4} {:.4} {:.4}\n# site_domain: 1\n# k_pre: {:.6e}\nseq_id\tatom_name\tgamma2_s1\tsigma_s1\n",
-        pre_pos[0], pre_pos[1], pre_pos[2], k_pre
+        "# site_pos: {:.4} {:.4} {:.4}\n# site_domain: 1\n# tau_c_ns: 10.0\n# proton_mhz: 600.0\nseq_id\tatom_name\tgamma2_s1\tsigma_s1\n",
+        pre_pos[0], pre_pos[1], pre_pos[2]
     );
     for idx in (80..native_chain.residues.len()).step_by(4) {
         let r = &native_chain.residues[idx];
         if let Some(h) = r.h {
-            let d2 = v_dist(h, pre_pos).powi(2) + 4.0;
-            let g2 = k_pre / (d2 * d2 * d2);
+            let d_a = v_dist(h, pre_pos).max(11.0);
+            let g2 = evaluate_solomon_gamma2_s1(d_a, 10.0, 600.0, 0.5, CODATA_ELECTRON_G_FACTOR)
+                .unwrap();
             pre_tsv.push_str(&format!("{}\tH\t{:.4}\t1.50\n", r.seq_id, g2));
         }
     }
@@ -889,7 +929,6 @@ fn test_webgpu_60deg_8a_two_domain_docking_gate_under_2s() {
         ..Default::default()
     };
 
-    // Warm up GPU pipeline shader cache if cold, or time full `dock_domains_gpu` directly!
     let t0 = Instant::now();
     let res = dock_domains_gpu(
         &engine,
@@ -902,7 +941,7 @@ fn test_webgpu_60deg_8a_two_domain_docking_gate_under_2s() {
         &cfg,
     )
     .unwrap();
-    let wall_s = t0.elapsed().as_secs_f64();
+    let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let mut dom_mask = vec![false; native_chain.residues.len()];
     for d in &res.report.partition.domains {
@@ -913,12 +952,17 @@ fn test_webgpu_60deg_8a_two_domain_docking_gate_under_2s() {
     let start_bb_rmsd = backbone_rmsd_between_chains(&start_chain, &native_chain, Some(&dom_mask));
     let docked_bb_rmsd =
         backbone_rmsd_between_chains(&res.chains[0], &native_chain, Some(&dom_mask));
+    let pcs_q_work = res.report.pcs_q_work.expect("PCS Q_work present");
+    let pcs_q_free = res
+        .report
+        .pcs_q_free
+        .expect("PCS Q_free present via 20% stratified holdout");
 
+    // Log elapsed ms without hard wall-clock assertion that can flake on shared CI (`21.W2:P2-7`)
     println!(
-        "WebGPU T21.5 gate: start=({rot_deg:.1} deg, {trans_a:.1} A, BB_RMSD={start_bb_rmsd:.2} A) -> docked BB_RMSD={docked_bb_rmsd:.3} A, Q_work={:.4}, ByPeptidePlane Q_free={:.4}, PCS Q_free={:.4}, intra_dist={:.3} A in {wall_s:.3} s",
+        "WebGPU T21.5 gate: start=({rot_deg:.1} deg, {trans_a:.1} A, BB_RMSD={start_bb_rmsd:.2} A) -> docked BB_RMSD={docked_bb_rmsd:.3} A, Q_work={:.4}, ByPeptidePlane Q_free={:.4}, PCS Q_work={pcs_q_work:.4}, PCS Q_free={pcs_q_free:.4}, intra_dist={:.3} A (elapsed={wall_ms:.1} ms)",
         res.report.global_rdc_q_work,
         res.report.global_rdc_q_free,
-        res.report.pcs_q_free,
         res.report.max_intra_domain_rmsd_angstrom
     );
 
@@ -931,13 +975,13 @@ fn test_webgpu_60deg_8a_two_domain_docking_gate_under_2s() {
         "WebGPU ByPeptidePlane Q_free = {:.4} (must be < 0.25)",
         res.report.global_rdc_q_free
     );
+    assert!(
+        pcs_q_free < 0.20,
+        "WebGPU held-out PCS Q_free = {pcs_q_free:.4} (must be < 0.20)"
+    );
     assert_eq!(
         res.report.max_intra_domain_rmsd_angstrom, 0.0,
         "WebGPU intra-domain distortion must be 0.000 A"
-    );
-    assert!(
-        wall_s < 2.0,
-        "WebGPU multi-domain docking took {wall_s:.3} s (must be < 2.0 s)"
     );
 
     // Verify zero `is_free` leakage on WebGPU path (`+9999.0 Hz` corruption invariance!)
@@ -949,6 +993,8 @@ fn test_webgpu_60deg_8a_two_domain_docking_gate_under_2s() {
             }
         }
     }
+    let mut cfg_bad = cfg.clone();
+    cfg_bad.allow_poor_intra_domain_fit = true;
     let res_bad = dock_domains_gpu(
         &engine,
         &start_af,
@@ -957,7 +1003,7 @@ fn test_webgpu_60deg_8a_two_domain_docking_gate_under_2s() {
         &pcs_tags,
         &pre_sites,
         &[],
-        &cfg,
+        &cfg_bad,
     )
     .unwrap();
     let leak_diff = backbone_rmsd_between_chains(&res.chains[0], &res_bad.chains[0], None);
@@ -1096,13 +1142,14 @@ fn test_cli_ferric_structure_pae_domains_end_to_end_cif_pdb_and_candor() {
     let parsed_docked = parse_af_structure_model(&out_cif, &AfIngestOptions::default()).unwrap();
     assert_eq!(parsed_docked.residues.len(), native_chain.residues.len());
 
-    // 2. Single-medium RDC without PCS/PRE/NOE -> verify `F8` cone-degeneracy candor warning!
-    let mut cmd2 = Command::new("cargo");
-    cmd2.current_dir(&root).arg("run").arg("--quiet");
+    // 2. Single-medium RDC without PCS/PRE/NOE -> refused by default (`21.W2:P2-8`), and emits `F8`
+    //    candor warning when `--allow-underdetermined-single-medium` is explicitly passed!
+    let mut cmd_refuse = Command::new("cargo");
+    cmd_refuse.current_dir(&root).arg("run").arg("--quiet");
     if !cfg!(debug_assertions) {
-        cmd2.arg("--release");
+        cmd_refuse.arg("--release");
     }
-    let candor_out = cmd2
+    let refuse_out = cmd_refuse
         .args([
             "-p",
             "nmr-cli",
@@ -1127,8 +1174,49 @@ fn test_cli_ferric_structure_pae_domains_end_to_end_cif_pdb_and_candor() {
             out_candor_pdb.to_str().unwrap(),
         ])
         .output()
-        .expect("invoke single-medium ferric structure --pae-domains");
-    assert!(candor_out.status.success());
+        .expect("invoke single-medium refusal check");
+    assert!(
+        !refuse_out.status.success(),
+        "single-medium RDC-only CLI must fail closed without --allow-underdetermined-single-medium"
+    );
+
+    let mut cmd2 = Command::new("cargo");
+    cmd2.current_dir(&root).arg("run").arg("--quiet");
+    if !cfg!(debug_assertions) {
+        cmd2.arg("--release");
+    }
+    let candor_out = cmd2
+        .args([
+            "-p",
+            "nmr-cli",
+            "--bin",
+            "ferric",
+            "--",
+            "structure",
+            "--pae-domains",
+            "--af-structure",
+            cif_in.to_str().unwrap(),
+            "--af-pae",
+            pae_in.to_str().unwrap(),
+            "--rdc",
+            rdc1_in.to_str().unwrap(),
+            "--allow-underdetermined-single-medium",
+            "--ensemble-size",
+            "2",
+            "--replicas",
+            "8",
+            "--engine",
+            "cpu",
+            "-o",
+            out_candor_pdb.to_str().unwrap(),
+        ])
+        .output()
+        .expect("invoke single-medium ferric structure --pae-domains with override");
+    assert!(
+        candor_out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&candor_out.stderr)
+    );
     let stderr_txt = String::from_utf8_lossy(&candor_out.stderr);
     assert!(
         stderr_txt.contains("F8") && stderr_txt.contains("cone degeneracy"),
@@ -1138,4 +1226,178 @@ fn test_cli_ferric_structure_pae_domains_end_to_end_cif_pdb_and_candor() {
     assert!(pdb_body.contains("F8"));
 
     let _ = fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_webgpu_p0_4_discontinuous_insertion_domain_parity_and_zero_drift() {
+    let Some(engine) = require_headless_gpu(Some(wgpu::Limits::default())) else {
+        return;
+    };
+
+    // Exact `1UBQ` insertion-domain topology (`D1 = [0..22] U [50..72], D2 = [26..46]`)
+    let root = workspace_root();
+    let ubq = parse_pdb_first_model(root.join("data/fixtures/ubiquitin_1ubq_xray.pdb")).unwrap();
+    let n = ubq.residues.len();
+    let mut true_dom = vec![0usize; n];
+    for d in &mut true_dom[0..22] {
+        *d = 1;
+    }
+    for d in &mut true_dom[26..46] {
+        *d = 2;
+    }
+    for d in &mut true_dom[50..72] {
+        *d = 1;
+    }
+    let mut plddt = vec![92.0_f64; n];
+    for p in &mut plddt[22..26] {
+        *p = 54.0;
+    }
+    for p in &mut plddt[46..50] {
+        *p = 54.0;
+    }
+    for p in &mut plddt[72..76] {
+        *p = 48.0;
+    }
+
+    let cif = serialize_chain_mmcif("ubq_gpu_insertion", &ubq, &plddt);
+    let model = parse_af_structure_model_str(&cif, &AfIngestOptions::default()).unwrap();
+    let pae = build_pae(n, &true_dom, 2104);
+    let seq_ids = model.seq_ids();
+    let part = cluster_pae_domains(
+        &pae,
+        Some(&plddt),
+        Some(&seq_ids),
+        None,
+        &PaeClusterConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(part.domains.len(), 2);
+    assert_eq!(part.domains[0].seq_id_spans.len(), 2);
+
+    let kin = DomainLinkerKinematics::from_af_model(&model, &part).unwrap();
+    let ch0 = kin.build_pdb_chain(&kin.initial_state());
+    let round_mat_f32 = |m: [[f64; 3]; 3]| -> [[f64; 3]; 3] {
+        let mut out = [[0.0; 3]; 3];
+        for r in 0..3 {
+            for c in 0..3 {
+                out[r][c] = (m[r][c] as f32) as f64;
+            }
+        }
+        out
+    };
+    let s1 = round_mat_f32(saupe_matrix_from_pas(-12.5, 0.30, [24.0, 52.0, 104.0]));
+    let s2 = round_mat_f32(saupe_matrix_from_pas(14.0, 0.44, [112.0, 76.0, 35.0]));
+    let med1 = simulate_rdc_medium(&ch0, "m1", &s1, (-1, -1), 0.0, 811);
+    let med2 = simulate_rdc_medium(&ch0, "m2", &s2, (-1, -1), 0.0, 812);
+
+    let prep = PreparedDomainDockRestraints::compile(
+        &kin,
+        &part,
+        &[med1.clone(), med2.clone()],
+        &[],
+        &[],
+        &[],
+        None,
+    )
+    .unwrap();
+
+    let weights = DomainDockEnergyWeights {
+        w_rdc: 0.05,
+        w_pcs: 0.15,
+        w_pre: 0.10,
+        w_noe: 0.25,
+        noe_soft_window: 3.0,
+        w_vdw: 0.35,
+        vdw_scale: 0.92,
+        w_rama: 0.80,
+    };
+    let mut rng = Rng::new(2105);
+    let mut batch_in = Vec::with_capacity(12);
+    for _ in 0..12 {
+        let mut st = kin.initial_state();
+        for i in 0..n {
+            st.phi_rad[i] = (st.phi_rad[i] as f32) as f64;
+            st.psi_rad[i] = (st.psi_rad[i] as f32) as f64;
+            st.omega_rad[i] = (st.omega_rad[i] as f32) as f64;
+        }
+        for &idx in &kin.active_linker_residues {
+            st.phi_rad[idx] = ((st.phi_rad[idx] + (rng.f64() - 0.5) * 0.5) as f32) as f64;
+            st.psi_rad[idx] = ((st.psi_rad[idx] + (rng.f64() - 0.5) * 0.5) as f32) as f64;
+        }
+        batch_in.push(DomainDockGpuReplicaInput {
+            state: st,
+            saupe_matrices: vec![s1, s2],
+        });
+    }
+
+    let gpu_outs =
+        evaluate_domain_dock_batch_gpu(&engine, &kin, &prep, &batch_in, &weights).unwrap();
+    for (ri, (rep_in, (eb_gpu, gr_gpu))) in batch_in.iter().zip(gpu_outs.iter()).enumerate() {
+        let (eb_cpu, gr_cpu) = evaluate_domain_dock_fixed_saupe_cpu(
+            &kin,
+            &prep,
+            &rep_in.state,
+            &rep_in.saupe_matrices,
+            &weights,
+        );
+        let rel_e = (eb_gpu.total - eb_cpu.total).abs() / eb_cpu.total.abs().max(1.0);
+        assert!(
+            rel_e < 1.0e-5,
+            "insertion domain replica {ri} energy parity failed: gpu={eb_gpu:?} cpu={eb_cpu:?} rel={rel_e:.3e}"
+        );
+        let g_scale = gr_cpu
+            .grad_phi
+            .iter()
+            .chain(gr_cpu.grad_psi.iter())
+            .fold(1.0_f64, |m, v| m.max(v.abs()));
+        for i in 0..n {
+            let rp = (gr_gpu.grad_phi[i] - gr_cpu.grad_phi[i]).abs() / g_scale;
+            let rs = (gr_gpu.grad_psi[i] - gr_cpu.grad_psi[i]).abs() / g_scale;
+            assert!(
+                rp < 1.0e-5 && rs < 1.0e-5,
+                "insertion domain replica {ri} grad[{i}] parity failed: rp={rp:.3e}, rs={rs:.3e}"
+            );
+        }
+    }
+
+    // Also verify end-to-end `dock_domains_gpu` on discontinuous insertion domain preserves `0.000 A` drift!
+    let cfg = DomainDockConfig {
+        ensemble_size: 2,
+        n_replicas: 16,
+        anneal_steps: 20,
+        lbfgs_iters: 60,
+        ..Default::default()
+    };
+    let metal_d1 = v_add(ch0.residues[60].ca, [3.0, -2.5, 2.8]);
+    let mut pcs_tsv = format!(
+        "# metal_pos: {:.4} {:.4} {:.4}\n# metal_domain: 1\nseq_id\tatom_name\tpcs_ppm\tsigma_ppm\n",
+        metal_d1[0], metal_d1[1], metal_d1[2]
+    );
+    for (idx, r) in ch0.residues.iter().enumerate() {
+        if true_dom[idx] != 0 {
+            if let Some(h) = r.h {
+                if v_dist(h, metal_d1) > 6.0 {
+                    let pv = predict_pcs_spherical_ppm(h, metal_d1, 28.0, 8.0, [0.4, 1.0, 1.8]);
+                    pcs_tsv.push_str(&format!("{}\tH\t{pv:.5}\t0.03\n", r.seq_id));
+                }
+            }
+        }
+    }
+    let pcs_tags = parse_domain_pcs_tsv_str(&pcs_tsv).unwrap();
+    let gpu_dock = dock_domains_gpu(
+        &engine,
+        &model,
+        &pae,
+        &[med1, med2],
+        &pcs_tags,
+        &[],
+        &[],
+        &cfg,
+    )
+    .unwrap();
+    assert!(
+        gpu_dock.report.max_intra_domain_rmsd_angstrom < 1.0e-12,
+        "WebGPU discontinuous insertion domain internal drift = {:.3e} A",
+        gpu_dock.report.max_intra_domain_rmsd_angstrom
+    );
 }

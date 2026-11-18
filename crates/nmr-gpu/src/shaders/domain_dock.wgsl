@@ -1,6 +1,7 @@
 // Batched multi-replica WebGPU rigid-domain + covalent NeRF flexible-linker & multi-chain SE(3)
-// hybrid RDC / PCS / PRE / inter-domain NOE / soft-core steric / Ramachandran energy & analytical
-// torque-gradient kernel (`T21.5`, `docs/specs/21-alphafold-integrative-nmr.md` §5.3).
+// hybrid RDC / PCS / PRE / inter-domain NOE / O(L) grid-hashed soft-core steric / Ramachandran +
+// cyclic re-entry loop-closure energy & analytical tree suffix-sum torque-gradient kernel
+// (`T21.5`, `docs/specs/21-alphafold-integrative-nmr.md` §5.3).
 //
 // Provenance: Clean-room WGSL compute implementation derived from peer-reviewed literature
 // (`0` const-eval NaN/Inf bitcasts; 100% Chromium Dawn / Tint & wgpu/naga clean):
@@ -10,10 +11,11 @@
 //   J. Biomol. NMR 41, 179-189 (traceless DeltaChi pseudocontact shift energy, translational force
 //   & host-domain rotational torque).
 // - Solomon, I. (1955), Phys. Rev. 99, 559-565; Clore, G. M. & Schwieters, C. D. (2004),
-//   J. Am. Chem. Soc. 126, 2923-2938 (paramagnetic relaxation enhancement r^-6 restraints).
+//   J. Am. Chem. Soc. 126, 2923-2938 (exact unsoftened Solomon–Bloembergen r^-6 PRE restraints).
+// - Nilges, M. (1995), J. Mol. Biol. 245, 645-660 (r^-6 sum-averaged ambiguous NOE restraints).
 // - Parsons, J. et al. (2005), J. Comput. Chem. 26, 1063-1068 (NeRF forward kinematics).
 // - Abe, H., Braun, W., Noguti, T. & Go, N. (1984), Comput. Chem. 8, 239-247 (O(L) local-pivot
-//   backward suffix-sum torque propagation).
+//   backward tree suffix-sum torque propagation across continuous & discontinuous rigid domains).
 // - Lovell, S. C. et al. (2003), Proteins 50, 437-450 (Ramachandran torsion basin prior).
 
 struct DomainDockParams {
@@ -36,7 +38,7 @@ struct DomainDockParams {
     vdw_scale: f32,
     w_rama: f32,
     noe_soft_window: f32,
-    pad0: u32,
+    n_noe_cands: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: DomainDockParams;
@@ -175,6 +177,15 @@ fn vdw_min_r2_base_f32(ka: u32, kb: u32) -> f32 {
     return 2.85 * 2.85;
 }
 
+// Dawn-clean (`0` bitcasts, positive-shifted `u32` wrapping arithmetic) 3D voxel hash (`21.W2:P2-13`).
+fn hash_voxel_wgsl(ix: i32, iy: i32, iz: i32, mask: u32) -> u32 {
+    let ux = u32(ix + 2097152);
+    let uy = u32(iy + 2097152);
+    let uz = u32(iz + 2097152);
+    let h = ux * 73856093u + uy * 19349663u + uz * 83492791u;
+    return h & mask;
+}
+
 // Lovell et al. (2003) smooth log-sum-exp Gaussian Ramachandran potential -> vec3(V, dV/dphi, dV/dpsi)
 fn rama_energy_and_grad_f32(rc: u32, phi: f32, psi: f32) -> vec3<f32> {
     var n_b: u32 = 6u;
@@ -273,12 +284,13 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ioff_res = 0u;
     let ioff_chains = 4u * l;
     let ioff_blocks = ioff_chains + 2u * n_chains;
-    let ioff_pcs_tags = ioff_blocks + 2u * n_blocks;
+    let ioff_pcs_tags = ioff_blocks + 4u * n_blocks;
     let ioff_pre_sites = ioff_pcs_tags + 2u * params.n_pcs_tags;
     let ioff_rdc = ioff_pre_sites + 2u * params.n_pre_sites;
     let ioff_pcs = ioff_rdc + 5u * params.n_rdc_terms;
     let ioff_pre = ioff_pcs + 3u * params.n_pcs_terms;
-    let ioff_noe = ioff_pre + 4u * params.n_pre_terms;
+    let ioff_noe_terms = ioff_pre + 4u * params.n_pre_terms;
+    let ioff_noe_cands = ioff_noe_terms + 2u * params.n_noe_terms;
 
     // Per-replica input, scratch, and gradient strides
     let in_stride = l + 2u * n_chains + 3u * n_media;
@@ -287,11 +299,21 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
     let in_saupe_base = in_chains_base + 2u * n_chains;
 
     let n_segs = 2u * l + 1u;
-    let scratch_stride = 7u * l + 4u * n_blocks + 2u * n_segs;
+    var grid_cap: u32 = 64u;
+    let target_grid_cap = 16u * l;
+    for (var sh: u32 = 0u; sh < 16u; sh = sh + 1u) {
+        if (grid_cap < target_grid_cap) {
+            grid_cap = grid_cap * 2u;
+        }
+    }
+    let scratch_stride = 7u * l + 4u * n_blocks + 2u * n_segs + 10u * l + grid_cap;
     let atom_base = conf_idx * scratch_stride;
     let blk_base = atom_base + 7u * l;
     let force_base = blk_base + 4u * n_blocks;
     let torque_base = force_base + n_segs;
+    let vdw_pos_base = torque_base + n_segs;
+    let vdw_meta_base = vdw_pos_base + 5u * l;
+    let grid_base = vdw_meta_base + 5u * l;
 
     let grad_stride = l + 2u * n_chains;
     let grad_base = conf_idx * grad_stride;
@@ -301,7 +323,7 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
         scratch[torque_base + s] = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
-    // 1. Forward kinematics across all polymer chains (exact rigid-domain blocks + covalent NeRF linkers)
+    // 1. Forward kinematics across all polymer chains (discontinuous multi-span rigid domains share `master_bid`!)
     for (var c_idx: u32 = 0u; c_idx < n_chains; c_idx = c_idx + 1u) {
         let cs = static_ints[ioff_chains + 2u * c_idx + 0u];
         let ce = static_ints[ioff_chains + 2u * c_idx + 1u];
@@ -322,46 +344,57 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
             let bg1 = static_floats[off_bond_geom + 2u * i + 1u];
 
             if (bid != NO_BLOCK_SENTINEL) {
-                let b_start = static_ints[ioff_blocks + 2u * bid + 0u];
-                let b_end = static_ints[ioff_blocks + 2u * bid + 1u];
+                let b_start = static_ints[ioff_blocks + 4u * bid + 0u];
+                let b_end = static_ints[ioff_blocks + 4u * bid + 1u];
+                let master_bid = static_ints[ioff_blocks + 4u * bid + 2u];
+
                 var n_s = vec3<f32>(0.0, 0.0, 0.0);
-                var d_nca_s = vec3<f32>(1.0, 0.0, 0.0);
-                var d_cac_s = vec3<f32>(0.0, 1.0, 0.0);
+                var rb_r0 = vec3<f32>(1.0, 0.0, 0.0);
+                var rb_r1 = vec3<f32>(0.0, 1.0, 0.0);
+                var rb_r2 = vec3<f32>(0.0, 0.0, 1.0);
 
-                if (i == cs) {
-                    let ref_n = static_floats[off_c_prev_virt + 3u * i + 0u].xyz;
-                    let ref_ca = static_floats[off_c_prev_virt + 3u * i + 1u].xyz;
-                    let ref_c = static_floats[off_c_prev_virt + 3u * i + 2u].xyz;
-                    n_s = c_af + tr_c + quat_rotate_vec(q_c, ref_n - c_af);
-                    d_nca_s = quat_rotate_vec(q_c, ref_ca - ref_n);
-                    d_cac_s = quat_rotate_vec(q_c, ref_c - ref_ca);
+                if (master_bid != bid) {
+                    let m_off = blk_base + 4u * master_bid;
+                    n_s = scratch[m_off + 0u].xyz;
+                    rb_r0 = scratch[m_off + 1u].xyz;
+                    rb_r1 = scratch[m_off + 2u].xyz;
+                    rb_r2 = scratch[m_off + 3u].xyz;
                 } else {
-                    let prev_a = atom_base + 7u * (i - 1u);
-                    let n_prev = scratch[prev_a + 0u].xyz;
-                    let ca_prev = scratch[prev_a + 2u].xyz;
-                    let c_prev = scratch[prev_a + 4u].xyz;
-                    let prev_flags = static_ints[ioff_res + 4u * (i - 1u) + 3u];
-                    let prev_in = replica_in[in_base + (i - 1u)];
-                    let prev_ref = static_floats[off_ref_tors + (i - 1u)];
-                    let psi_prev = select(prev_ref.y, prev_in.y, (prev_flags & 2u) != 0u);
-                    let omg_prev = prev_in.z;
-                    let ref_phi_i = static_floats[off_ref_tors + i].x;
+                    var d_nca_s = vec3<f32>(1.0, 0.0, 0.0);
+                    var d_cac_s = vec3<f32>(0.0, 1.0, 0.0);
+                    if (i == cs) {
+                        let ref_n = static_floats[off_c_prev_virt + 3u * i + 0u].xyz;
+                        let ref_ca = static_floats[off_c_prev_virt + 3u * i + 1u].xyz;
+                        let ref_c = static_floats[off_c_prev_virt + 3u * i + 2u].xyz;
+                        n_s = c_af + tr_c + quat_rotate_vec(q_c, ref_n - c_af);
+                        d_nca_s = quat_rotate_vec(q_c, ref_ca - ref_n);
+                        d_cac_s = quat_rotate_vec(q_c, ref_c - ref_ca);
+                    } else {
+                        let prev_a = atom_base + 7u * (i - 1u);
+                        let n_prev = scratch[prev_a + 0u].xyz;
+                        let ca_prev = scratch[prev_a + 2u].xyz;
+                        let c_prev = scratch[prev_a + 4u].xyz;
+                        let prev_flags = static_ints[ioff_res + 4u * (i - 1u) + 3u];
+                        let prev_in = replica_in[in_base + (i - 1u)];
+                        let prev_ref = static_floats[off_ref_tors + (i - 1u)];
+                        let psi_prev = select(prev_ref.y, prev_in.y, (prev_flags & 2u) != 0u);
+                        let omg_prev = prev_in.z;
+                        let ref_phi_i = static_floats[off_ref_tors + i].x;
 
-                    let d_prev_nca = ca_prev - n_prev;
-                    let d_prev_cac = c_prev - ca_prev;
-                    let d_cn = nerf_delta3(d_prev_nca, d_prev_cac, bg0.x, bg0.y, sin(psi_prev), cos(psi_prev));
-                    n_s = c_prev + d_cn;
-                    d_nca_s = nerf_delta3(d_prev_cac, d_cn, bg0.z, bg0.w, sin(omg_prev), cos(omg_prev));
-                    d_cac_s = nerf_delta3(d_cn, d_nca_s, bg1.x, bg1.y, sin(ref_phi_i), cos(ref_phi_i));
+                        let d_prev_nca = ca_prev - n_prev;
+                        let d_prev_cac = c_prev - ca_prev;
+                        let d_cn = nerf_delta3(d_prev_nca, d_prev_cac, bg0.x, bg0.y, sin(psi_prev), cos(psi_prev));
+                        n_s = c_prev + d_cn;
+                        d_nca_s = nerf_delta3(d_prev_cac, d_cn, bg0.z, bg0.w, sin(omg_prev), cos(omg_prev));
+                        d_cac_s = nerf_delta3(d_cn, d_nca_s, bg1.x, bg1.y, sin(ref_phi_i), cos(ref_phi_i));
+                    }
+                    let ex = safe_unit3(d_nca_s);
+                    let ey = safe_unit3(d_cac_s - ex * dot(d_cac_s, ex));
+                    let ez = cross(ex, ey);
+                    rb_r0 = vec3<f32>(ex.x, ey.x, ez.x);
+                    rb_r1 = vec3<f32>(ex.y, ey.y, ez.y);
+                    rb_r2 = vec3<f32>(ex.z, ey.z, ez.z);
                 }
-
-                let ex = safe_unit3(d_nca_s);
-                let ey = safe_unit3(d_cac_s - ex * dot(d_cac_s, ex));
-                let ez = cross(ex, ey);
-                // Rows of R_b = [ex, ey, ez] (columns are ex, ey, ez)
-                let rb_r0 = vec3<f32>(ex.x, ey.x, ez.x);
-                let rb_r1 = vec3<f32>(ex.y, ey.y, ez.y);
-                let rb_r2 = vec3<f32>(ex.z, ey.z, ez.z);
 
                 let b_off = blk_base + 4u * bid;
                 scratch[b_off + 0u] = vec4<f32>(n_s, 1.0);
@@ -467,7 +500,7 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
     var e_vdw: f32 = 0.0;
     var e_rama: f32 = 0.0;
 
-    // 2. Working RDC potential & forces
+    // 2. Working RDC potential & forces (accumulating intra-domain pure torque onto `master_block_id`)
     if (params.w_rdc > 0.0 && params.n_rdc_terms > 0u) {
         let w_rdc = params.w_rdc;
         var rdc_blk_tq_s = array<vec3<f32>, 16>();
@@ -517,15 +550,22 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
             let res_b = atom_b / 7u;
             let blk_a = static_ints[ioff_res + 4u * res_a + 1u];
             let blk_b = static_ints[ioff_res + 4u * res_b + 1u];
-            if (blk_a != NO_BLOCK_SENTINEL && blk_a == blk_b) {
-                let b_start = static_ints[ioff_blocks + 2u * blk_a + 0u];
-                let seg_blk = 2u * b_start;
+            var same_master = false;
+            var master_a: u32 = NO_BLOCK_SENTINEL;
+            if (blk_a != NO_BLOCK_SENTINEL && blk_b != NO_BLOCK_SENTINEL) {
+                master_a = static_ints[ioff_blocks + 4u * blk_a + 2u];
+                let master_b = static_ints[ioff_blocks + 4u * blk_b + 2u];
+                same_master = (master_a == master_b);
+            }
+            if (same_master) {
+                let m_start = static_ints[ioff_blocks + 4u * master_a + 0u];
+                let seg_blk = 2u * m_start + 1u;
                 let pure_tq = cross(dv, grad_pb);
-                if (blk_a < 16u) {
-                    let y_tq = pure_tq - rdc_blk_tq_c[blk_a];
-                    let t_tq = rdc_blk_tq_s[blk_a] + y_tq;
-                    rdc_blk_tq_c[blk_a] = (t_tq - rdc_blk_tq_s[blk_a]) - y_tq;
-                    rdc_blk_tq_s[blk_a] = t_tq;
+                if (master_a < 16u) {
+                    let y_tq = pure_tq - rdc_blk_tq_c[master_a];
+                    let t_tq = rdc_blk_tq_s[master_a] + y_tq;
+                    rdc_blk_tq_c[master_a] = (t_tq - rdc_blk_tq_s[master_a]) - y_tq;
+                    rdc_blk_tq_s[master_a] = t_tq;
                 } else {
                     scratch[torque_base + seg_blk] = vec4<f32>(scratch[torque_base + seg_blk].xyz + pure_tq, 0.0);
                 }
@@ -539,9 +579,12 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         let flush_n = min(n_blocks, 16u);
         for (var bi: u32 = 0u; bi < flush_n; bi = bi + 1u) {
-            let b_start = static_ints[ioff_blocks + 2u * bi + 0u];
-            let seg_blk = 2u * b_start;
-            scratch[torque_base + seg_blk] = vec4<f32>(scratch[torque_base + seg_blk].xyz + rdc_blk_tq_s[bi], 0.0);
+            let m_bi = static_ints[ioff_blocks + 4u * bi + 2u];
+            if (m_bi == bi) {
+                let b_start = static_ints[ioff_blocks + 4u * bi + 0u];
+                let seg_blk = 2u * b_start + 1u;
+                scratch[torque_base + seg_blk] = vec4<f32>(scratch[torque_base + seg_blk].xyz + rdc_blk_tq_s[bi], 0.0);
+            }
         }
     }
 
@@ -581,7 +624,6 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
             let inv_r5 = inv_r2 * inv_r2 * inv_r;
             let inv_r7 = inv_r5 * inv_r2;
 
-            // mv = (R_b * dchi_loc * R_b^T) * v
             let rbt_v = vec3<f32>(
                 rb0.x * v.x + rb1.x * v.y + rb2.x * v.z,
                 rb0.y * v.x + rb1.y * v.y + rb2.y * v.z,
@@ -611,7 +653,7 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // 4. Cross-domain Solomon r^-6 PRE potential & forces
+    // 4. Exact unsoftened Solomon r^-6 PRE potential & forces (`21.W3:P0-4` & `21.W2:P2-9`)
     if (params.w_pre > 0.0 && params.n_pre_terms > 0u) {
         let w_pre = params.w_pre;
         for (var k: u32 = 0u; k < params.n_pre_terms; k = k + 1u) {
@@ -666,10 +708,21 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let lo_a = pf1.x;
                 let hi_a = pf1.y;
 
-                let r2_eff = r2_raw + 4.0;
-                let inv_r2 = 1.0 / r2_eff;
-                let inv_r6 = inv_r2 * inv_r2 * inv_r2;
-                let g2_calc = k_pre * inv_r6;
+                var g2_calc: f32 = 0.0;
+                var dg2_ds: f32 = 0.0;
+                if (r2_raw >= 12.25) {
+                    let inv_s = 1.0 / r2_raw;
+                    let inv_s3 = inv_s * inv_s * inv_s;
+                    g2_calc = k_pre * inv_s3;
+                    dg2_ds = -3.0 * k_pre * inv_s3 * inv_s;
+                } else {
+                    let inv_sc: f32 = 1.0 / 12.25;
+                    let inv_sc3 = inv_sc * inv_sc * inv_sc;
+                    let g2_core = k_pre * inv_sc3;
+                    g2_calc = g2_core * (4.0 - 3.0 * r2_raw * inv_sc);
+                    dg2_ds = -3.0 * g2_core * inv_sc;
+                }
+
                 let inv_sig = sqrt(inv_s2);
                 let z = (g2_calc - g2_obs) * inv_sig;
                 let kappa: f32 = 8.0;
@@ -684,7 +737,7 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
                 e_pre = e_pre + w_pre * huber_e;
                 let d_e_dg2 = w_pre * d_huber_dz * inv_sig;
-                var g_pa = dv * (d_e_dg2 * (-6.0 * k_pre * inv_r6 * inv_r2));
+                var g_pa = dv * (d_e_dg2 * 2.0 * dg2_ds);
 
                 let d = sqrt(r2_raw + 1e-4);
                 if (d > hi_a) {
@@ -702,35 +755,66 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // 5. Inter-domain / linker NOE distance restraints
+    // 5. Inter-domain / linker NOE distance restraints with Nilges (1995) r^-6 sum-averaging (`21.W2:P2-11`)
     if (params.w_noe > 0.0 && params.n_noe_terms > 0u) {
         let w_noe = params.w_noe;
         let soft = max(params.noe_soft_window, 0.5);
         for (var k: u32 = 0u; k < params.n_noe_terms; k = k + 1u) {
-            let ib = ioff_noe + 4u * k;
-            let atom_a = static_ints[ib + 0u];
-            let atom_b = static_ints[ib + 1u];
-            let seg_a = static_ints[ib + 2u];
-            let seg_b = static_ints[ib + 3u];
+            let t_off = ioff_noe_terms + 2u * k;
+            let c_start = static_ints[t_off + 0u];
+            let c_len = static_ints[t_off + 1u];
+            if (c_len == 0u || c_start >= params.n_noe_cands) {
+                continue;
+            }
+            let c_end = min(c_start + c_len, params.n_noe_cands);
             let nf = static_floats[off_noe_f + k];
             let lo_a = nf.x;
             let hi_a = nf.y;
 
-            let a4 = scratch[atom_base + atom_a];
-            let b4 = scratch[atom_base + atom_b];
-            if (a4.w < 0.5 || b4.w < 0.5) {
+            var s_min: f32 = 1.0e30;
+            var has_valid = false;
+            for (var ci: u32 = c_start; ci < c_end; ci = ci + 1u) {
+                let cb = ioff_noe_cands + 4u * ci;
+                let a4 = scratch[atom_base + static_ints[cb + 0u]];
+                let b4 = scratch[atom_base + static_ints[cb + 1u]];
+                if (a4.w > 0.5 && b4.w > 0.5) {
+                    let diff = a4.xyz - b4.xyz;
+                    let sc = dot(diff, diff) + 1e-6;
+                    if (!has_valid || sc < s_min) {
+                        s_min = sc;
+                        has_valid = true;
+                    }
+                }
+            }
+            if (!has_valid) {
                 continue;
             }
-            let diff = a4.xyz - b4.xyz;
-            let d = sqrt(dot(diff, diff) + 1e-6);
+
+            var tilde_s: f32 = 0.0;
+            for (var ci: u32 = c_start; ci < c_end; ci = ci + 1u) {
+                let cb = ioff_noe_cands + 4u * ci;
+                let a4 = scratch[atom_base + static_ints[cb + 0u]];
+                let b4 = scratch[atom_base + static_ints[cb + 1u]];
+                if (a4.w > 0.5 && b4.w > 0.5) {
+                    let diff = a4.xyz - b4.xyz;
+                    let sc = dot(diff, diff) + 1e-6;
+                    let q = s_min / sc;
+                    tilde_s = tilde_s + q * q * q;
+                }
+            }
+            if (tilde_s <= 0.0) {
+                continue;
+            }
+
+            let d_eff = sqrt(s_min) * exp(-log(tilde_s) * (1.0 / 6.0));
             var v_e: f32 = 0.0;
             var dv_dd: f32 = 0.0;
-            if (d < lo_a) {
-                let u = lo_a - d;
+            if (d_eff < lo_a) {
+                let u = lo_a - d_eff;
                 v_e = w_noe * u * u;
                 dv_dd = -2.0 * w_noe * u;
-            } else if (d > hi_a) {
-                let u = d - hi_a;
+            } else if (d_eff > hi_a) {
+                let u = d_eff - hi_a;
                 if (u <= soft) {
                     v_e = w_noe * u * u;
                     dv_dd = 2.0 * w_noe * u;
@@ -741,143 +825,305 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             e_noe = e_noe + v_e;
             if (dv_dd != 0.0) {
-                let g = diff * (dv_dd / d);
-                add_seg_grad_dock(atom_base, force_base, torque_base, seg_a, a4.xyz, g);
-                add_seg_grad_dock(atom_base, force_base, torque_base, seg_b, b4.xyz, -g);
+                let denom = s_min * tilde_s;
+                for (var ci: u32 = c_start; ci < c_end; ci = ci + 1u) {
+                    let cb = ioff_noe_cands + 4u * ci;
+                    let atom_a = static_ints[cb + 0u];
+                    let atom_b = static_ints[cb + 1u];
+                    let seg_a = static_ints[cb + 2u];
+                    let seg_b = static_ints[cb + 3u];
+                    let a4 = scratch[atom_base + atom_a];
+                    let b4 = scratch[atom_base + atom_b];
+                    if (a4.w < 0.5 || b4.w < 0.5) {
+                        continue;
+                    }
+                    let diff = a4.xyz - b4.xyz;
+                    let sc = dot(diff, diff) + 1e-6;
+                    let q = s_min / sc;
+                    let wc = q * q * q;
+                    let g = diff * (dv_dd * (d_eff * wc * q) / denom);
+                    add_seg_grad_dock(atom_base, force_base, torque_base, seg_a, a4.xyz, g);
+                    add_seg_grad_dock(atom_base, force_base, torque_base, seg_b, b4.xyz, -g);
+                }
             }
         }
     }
 
-    // 6. Quartic soft-core excluded volume (exact match to CPU `accumulate_grid_hashed_vdw_cpu`)
+    // 6. O(L) 3D spatial voxel-grid-hashed quartic soft-core excluded volume (`21.W2:P2-13`, `0` bitcasts!)
     if (params.w_vdw > 0.0 && params.vdw_scale > 0.0) {
         let w_vdw = params.w_vdw;
         let s_vdw = params.vdw_scale;
         let s2 = s_vdw * s_vdw;
-        let ca_cull_r = 8.6 * max(s_vdw, 0.75);
-        let ca_cull_r2 = ca_cull_r * ca_cull_r;
 
+        // 6a. Local `(i, i+1)` Ramachandran steric guard on non-co-domain intra-chain pairs
+        for (var i: u32 = 0u; i + 1u < l; i = i + 1u) {
+            let im = ioff_res + 4u * i;
+            let blk_i = static_ints[im + 1u];
+            let ch_i = static_ints[im + 2u];
+            let flg_i = static_ints[im + 3u];
+
+            let jm1 = ioff_res + 4u * (i + 1u);
+            let rc_j1 = static_ints[jm1 + 0u];
+            let blk_j1 = static_ints[jm1 + 1u];
+            let ch_j1 = static_ints[jm1 + 2u];
+            let flg_j1 = static_ints[jm1 + 3u];
+
+            if (ch_i != ch_j1) {
+                continue;
+            }
+            var same_dom_1 = false;
+            if (blk_i != NO_BLOCK_SENTINEL && blk_j1 != NO_BLOCK_SENTINEL) {
+                let mi = static_ints[ioff_blocks + 4u * blk_i + 2u];
+                let mj = static_ints[ioff_blocks + 4u * blk_j1 + 2u];
+                same_dom_1 = (mi == mj);
+            }
+            if (same_dom_1) {
+                continue;
+            }
+
+            let oi_p = scratch[atom_base + 7u * i + 5u].xyz;
+            let aj1 = atom_base + 7u * (i + 1u);
+            let cj1_p = scratch[aj1 + 4u].xyz;
+            let oj1_p = scratch[aj1 + 5u].xyz;
+            let seg_oi = select(2u * i + 2u, 2u * i + 1u, (flg_i & 32u) != 0u);
+            let seg_cj1 = 2u * (i + 1u) + 1u;
+            let seg_oj1 = select(2u * (i + 1u) + 2u, 2u * (i + 1u) + 1u, (flg_j1 & 32u) != 0u);
+
+            let r2_oc = s2 * vdw_min_r2_base_f32(2u, 1u);
+            let df_oc = oi_p - cj1_p;
+            let d2_oc = dot(df_oc, df_oc);
+            if (d2_oc < r2_oc) {
+                let dl = r2_oc - d2_oc;
+                e_vdw = e_vdw + w_vdw * dl * dl;
+                let g = df_oc * (-4.0 * w_vdw * dl);
+                add_seg_grad_dock(atom_base, force_base, torque_base, seg_oi, oi_p, g);
+                add_seg_grad_dock(atom_base, force_base, torque_base, seg_cj1, cj1_p, -g);
+            }
+
+            let r2_oo = s2 * vdw_min_r2_base_f32(2u, 2u);
+            let df_oo = oi_p - oj1_p;
+            let d2_oo = dot(df_oo, df_oo);
+            if (d2_oo < r2_oo) {
+                let dl = r2_oo - d2_oo;
+                e_vdw = e_vdw + w_vdw * dl * dl;
+                let g = df_oo * (-4.0 * w_vdw * dl);
+                add_seg_grad_dock(atom_base, force_base, torque_base, seg_oi, oi_p, g);
+                add_seg_grad_dock(atom_base, force_base, torque_base, seg_oj1, oj1_p, -g);
+            }
+
+            let cbj1_4 = scratch[aj1 + 6u];
+            if (rc_j1 != 1u && cbj1_4.w > 0.5) {
+                let r2_ocb = s2 * (2.90 * 2.90);
+                let df_ocb = oi_p - cbj1_4.xyz;
+                let d2_ocb = dot(df_ocb, df_ocb);
+                if (d2_ocb < r2_ocb) {
+                    let dl = r2_ocb - d2_ocb;
+                    e_vdw = e_vdw + w_vdw * dl * dl;
+                    let g = df_ocb * (-4.0 * w_vdw * dl);
+                    add_seg_grad_dock(atom_base, force_base, torque_base, seg_oi, oi_p, g);
+                    add_seg_grad_dock(atom_base, force_base, torque_base, seg_cj1, cbj1_4.xyz, -g);
+                }
+            }
+        }
+
+        // 6b. Non-local heavy-atom pairs via O(L) open-addressed 3D spatial voxel grid
+        let cell_size = max(3.35 * max(s_vdw, 0.75), 2.5);
+        let inv_cell = 1.0 / cell_size;
+        let mask = grid_cap - 1u;
+
+        for (var gs: u32 = 0u; gs < grid_cap; gs = gs + 1u) {
+            scratch[grid_base + gs] = vec4<f32>(0.0, 0.0, 0.0, -1.0);
+        }
+
+        var n_atoms: u32 = 0u;
         for (var i: u32 = 0u; i < l; i = i + 1u) {
             let im = ioff_res + 4u * i;
             let rc_i = static_ints[im + 0u];
             let blk_i = static_ints[im + 1u];
             let ch_i = static_ints[im + 2u];
+            let flg_i = static_ints[im + 3u];
+            var mblk1_i: u32 = 0u;
+            if (blk_i != NO_BLOCK_SENTINEL) {
+                mblk1_i = static_ints[ioff_blocks + 4u * blk_i + 2u] + 1u;
+            }
+            let seg_nhca = select(2u * i, 2u * i + 1u, (flg_i & 16u) != 0u);
+            let seg_o = select(2u * i + 2u, 2u * i + 1u, (flg_i & 32u) != 0u);
+
             let ai = atom_base + 7u * i;
             let ni_p = scratch[ai + 0u].xyz;
             let cai_p = scratch[ai + 2u].xyz;
             let ci_p = scratch[ai + 4u].xyz;
             let oi_p = scratch[ai + 5u].xyz;
             let cbi_4 = scratch[ai + 6u];
-            let has_cbi = (rc_i != 1u) && (cbi_4.w > 0.5);
+            let cnt_i = select(4u, 5u, (rc_i != 1u) && (cbi_4.w > 0.5));
 
-            // Local `(i, i+1)` Ramachandran steric guard on non-co-block intra-chain pairs
-            if (i + 1u < l) {
-                let jm1 = ioff_res + 4u * (i + 1u);
-                let rc_j1 = static_ints[jm1 + 0u];
-                let blk_j1 = static_ints[jm1 + 1u];
-                let ch_j1 = static_ints[jm1 + 2u];
-                let same_blk_1 = (blk_i != NO_BLOCK_SENTINEL) && (blk_i == blk_j1);
-                if (ch_i == ch_j1 && !same_blk_1) {
-                    let aj1 = atom_base + 7u * (i + 1u);
-                    let cj1_p = scratch[aj1 + 4u].xyz;
-                    let oj1_p = scratch[aj1 + 5u].xyz;
+            var p_arr = array<vec3<f32>, 5>(ni_p, cai_p, ci_p, oi_p, cbi_4.xyz);
+            var k_arr = array<u32, 5>(0u, 1u, 1u, 2u, 3u);
+            var s_arr = array<u32, 5>(seg_nhca, seg_nhca, 2u * i + 1u, seg_o, 2u * i + 1u);
 
-                    let r2_oc = s2 * vdw_min_r2_base_f32(2u, 1u);
-                    let df_oc = oi_p - cj1_p;
-                    let d2_oc = dot(df_oc, df_oc);
-                    if (d2_oc < r2_oc) {
-                        let dl = r2_oc - d2_oc;
-                        e_vdw = e_vdw + w_vdw * dl * dl;
-                        let g = df_oc * (-4.0 * w_vdw * dl);
-                        add_seg_grad_dock(atom_base, force_base, torque_base, 2u * i + 2u, oi_p, g);
-                        add_seg_grad_dock(atom_base, force_base, torque_base, 2u * (i + 1u) + 1u, cj1_p, -g);
-                    }
+            for (var sub_a: u32 = 0u; sub_a < cnt_i; sub_a = sub_a + 1u) {
+                let at_pos = p_arr[sub_a];
+                let at_kind = k_arr[sub_a];
+                let at_seg = s_arr[sub_a];
+                let ix = clamp(i32(floor(at_pos.x * inv_cell)), -1000000, 1000000);
+                let iy = clamp(i32(floor(at_pos.y * inv_cell)), -1000000, 1000000);
+                let iz = clamp(i32(floor(at_pos.z * inv_cell)), -1000000, 1000000);
 
-                    let r2_oo = s2 * vdw_min_r2_base_f32(2u, 2u);
-                    let df_oo = oi_p - oj1_p;
-                    let d2_oo = dot(df_oo, df_oo);
-                    if (d2_oo < r2_oo) {
-                        let dl = r2_oo - d2_oo;
-                        e_vdw = e_vdw + w_vdw * dl * dl;
-                        let g = df_oo * (-4.0 * w_vdw * dl);
-                        add_seg_grad_dock(atom_base, force_base, torque_base, 2u * i + 2u, oi_p, g);
-                        add_seg_grad_dock(atom_base, force_base, torque_base, 2u * (i + 1u) + 2u, oj1_p, -g);
-                    }
+                for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+                    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+                        for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
+                            let qkx = ix + dx;
+                            let qky = iy + dy;
+                            let qkz = iz + dz;
+                            var slot = hash_voxel_wgsl(qkx, qky, qkz, mask);
+                            for (var prb: u32 = 0u; prb < grid_cap; prb = prb + 1u) {
+                                let cell = scratch[grid_base + slot];
+                                if (cell.w < -0.5) {
+                                    break;
+                                }
+                                if (i32(cell.x) == qkx && i32(cell.y) == qky && i32(cell.z) == qkz) {
+                                    var cur_f = cell.w;
+                                    for (var ls: u32 = 0u; ls <= n_atoms; ls = ls + 1u) {
+                                        if (cur_f < -0.5) {
+                                            break;
+                                        }
+                                        let b_idx = u32(cur_f);
+                                        let bp4 = scratch[vdw_pos_base + b_idx];
+                                        let bm4 = scratch[vdw_meta_base + b_idx];
+                                        cur_f = bp4.w;
 
-                    let cbj1_4 = scratch[aj1 + 6u];
-                    if (rc_j1 != 1u && cbj1_4.w > 0.5) {
-                        let r2_ocb = s2 * (2.90 * 2.90);
-                        let df_ocb = oi_p - cbj1_4.xyz;
-                        let d2_ocb = dot(df_ocb, df_ocb);
-                        if (d2_ocb < r2_ocb) {
-                            let dl = r2_ocb - d2_ocb;
-                            e_vdw = e_vdw + w_vdw * dl * dl;
-                            let g = df_ocb * (-4.0 * w_vdw * dl);
-                            add_seg_grad_dock(atom_base, force_base, torque_base, 2u * i + 2u, oi_p, g);
-                            add_seg_grad_dock(atom_base, force_base, torque_base, 2u * (i + 1u) + 1u, cbj1_4.xyz, -g);
+                                        let b_res = u32(bm4.x);
+                                        let b_ch = u32(bm4.y);
+                                        let b_mblk1 = u32(bm4.z);
+                                        let b_pk = u32(bm4.w);
+                                        let b_seg = b_pk / 4u;
+                                        let b_kind = b_pk & 3u;
+
+                                        if (b_mblk1 != 0u && b_mblk1 == mblk1_i) {
+                                            continue;
+                                        }
+                                        let same_ch = (b_ch == ch_i);
+                                        if (same_ch && i < b_res + 2u) {
+                                            continue;
+                                        }
+                                        if (same_ch && i == b_res + 2u && b_kind == 1u && at_kind == 0u && b_seg == 2u * b_res + 1u) {
+                                            continue;
+                                        }
+
+                                        let r2_min = s2 * vdw_min_r2_base_f32(b_kind, at_kind);
+                                        let diff = bp4.xyz - at_pos;
+                                        let d2 = dot(diff, diff);
+                                        if (d2 < r2_min) {
+                                            let dl = r2_min - d2;
+                                            e_vdw = e_vdw + w_vdw * dl * dl;
+                                            let g = diff * (-4.0 * w_vdw * dl);
+                                            add_seg_grad_dock(atom_base, force_base, torque_base, b_seg, bp4.xyz, g);
+                                            add_seg_grad_dock(atom_base, force_base, torque_base, at_seg, at_pos, -g);
+                                        }
+                                    }
+                                    break;
+                                }
+                                slot = (slot + 1u) & mask;
+                            }
                         }
                     }
                 }
-            }
 
-            // Non-local residue pairs `j > i`
-            var p_i = array<vec3<f32>, 5>(ni_p, cai_p, ci_p, oi_p, cbi_4.xyz);
-            var k_i = array<u32, 5>(0u, 1u, 1u, 2u, 3u);
-            var s_i = array<u32, 5>(2u * i, 2u * i, 2u * i + 1u, 2u * i + 2u, 2u * i + 1u);
-            let cnt_i = select(4u, 5u, has_cbi);
-
-            for (var j: u32 = i + 1u; j < l; j = j + 1u) {
-                let jm = ioff_res + 4u * j;
-                let rc_j = static_ints[jm + 0u];
-                let blk_j = static_ints[jm + 1u];
-                let ch_j = static_ints[jm + 2u];
-                if (blk_i != NO_BLOCK_SENTINEL && blk_i == blk_j) {
-                    continue;
-                }
-                let same_chain = (ch_i == ch_j);
-                if (same_chain && j < i + 2u) {
-                    continue;
-                }
-                let aj = atom_base + 7u * j;
-                let caj_p = scratch[aj + 2u].xyz;
-                let d_caca = caj_p - cai_p;
-                if (dot(d_caca, d_caca) > ca_cull_r2) {
-                    continue;
-                }
-
-                let nj_p = scratch[aj + 0u].xyz;
-                let cj_p = scratch[aj + 4u].xyz;
-                let oj_p = scratch[aj + 5u].xyz;
-                let cbj_4 = scratch[aj + 6u];
-                let has_cbj = (rc_j != 1u) && (cbj_4.w > 0.5);
-
-                var p_j = array<vec3<f32>, 5>(nj_p, caj_p, cj_p, oj_p, cbj_4.xyz);
-                var k_j = array<u32, 5>(0u, 1u, 1u, 2u, 3u);
-                var s_j = array<u32, 5>(2u * j, 2u * j, 2u * j + 1u, 2u * j + 2u, 2u * j + 1u);
-                let cnt_j = select(4u, 5u, has_cbj);
-
-                for (var ia: u32 = 0u; ia < cnt_i; ia = ia + 1u) {
-                    for (var ja: u32 = 0u; ja < cnt_j; ja = ja + 1u) {
-                        if (same_chain && j == i + 2u && ia == 2u && ja == 0u) {
-                            continue;
-                        }
-                        let r2_min = s2 * vdw_min_r2_base_f32(k_i[ia], k_j[ja]);
-                        let diff = p_i[ia] - p_j[ja];
-                        let d2 = dot(diff, diff);
-                        if (d2 < r2_min) {
-                            let dl = r2_min - d2;
-                            e_vdw = e_vdw + w_vdw * dl * dl;
-                            let g = diff * (-4.0 * w_vdw * dl);
-                            add_seg_grad_dock(atom_base, force_base, torque_base, s_i[ia], p_i[ia], g);
-                            add_seg_grad_dock(atom_base, force_base, torque_base, s_j[ja], p_j[ja], -g);
-                        }
+                // Insert `n_atoms` into voxel `(ix, iy, iz)`
+                var islot = hash_voxel_wgsl(ix, iy, iz, mask);
+                var prev_head: f32 = -1.0;
+                for (var prb: u32 = 0u; prb < grid_cap; prb = prb + 1u) {
+                    let cell = scratch[grid_base + islot];
+                    if (cell.w < -0.5) {
+                        scratch[grid_base + islot] = vec4<f32>(f32(ix), f32(iy), f32(iz), f32(n_atoms));
+                        break;
                     }
+                    if (i32(cell.x) == ix && i32(cell.y) == iy && i32(cell.z) == iz) {
+                        prev_head = cell.w;
+                        scratch[grid_base + islot] = vec4<f32>(cell.x, cell.y, cell.z, f32(n_atoms));
+                        break;
+                    }
+                    islot = (islot + 1u) & mask;
                 }
+                scratch[vdw_pos_base + n_atoms] = vec4<f32>(at_pos, prev_head);
+                scratch[vdw_meta_base + n_atoms] = vec4<f32>(
+                    f32(i),
+                    f32(ch_i),
+                    f32(mblk1_i),
+                    f32(4u * at_seg + at_kind),
+                );
+                n_atoms = n_atoms + 1u;
             }
         }
     }
 
-    // 7. Backward suffix-sum torque propagation per chain + Lovell Ramachandran prior
+    // 6c. Cyclic covalent peptide loop-closure restraint across re-entry rigid-block boundaries (`21.W2:P0-4`)
     let w_rama = params.w_rama;
+    if (w_rama > 0.0) {
+        let k_loop = 25.0 * w_rama;
+        for (var bid: u32 = 0u; bid < n_blocks; bid = bid + 1u) {
+            let b_start = static_ints[ioff_blocks + 4u * bid + 0u];
+            let m_bid = static_ints[ioff_blocks + 4u * bid + 2u];
+            let b_chain = static_ints[ioff_blocks + 4u * bid + 3u];
+            if (m_bid == bid) {
+                continue;
+            }
+            let cs = static_ints[ioff_chains + 2u * b_chain + 0u];
+            if (b_start <= cs) {
+                continue;
+            }
+            let prev_a = atom_base + 7u * (b_start - 1u);
+            let n_prev = scratch[prev_a + 0u].xyz;
+            let ca_prev = scratch[prev_a + 2u].xyz;
+            let c_prev = scratch[prev_a + 4u].xyz;
+            let prev_flags = static_ints[ioff_res + 4u * (b_start - 1u) + 3u];
+            let prev_in = replica_in[in_base + (b_start - 1u)];
+            let prev_ref = static_floats[off_ref_tors + (b_start - 1u)];
+            let psi_prev = select(prev_ref.y, prev_in.y, (prev_flags & 2u) != 0u);
+            let omg_prev = prev_in.z;
+            let ref_phi_s = static_floats[off_ref_tors + b_start].x;
+            let bg0 = static_floats[off_bond_geom + 2u * b_start + 0u];
+            let bg1 = static_floats[off_bond_geom + 2u * b_start + 1u];
+
+            let d_prev_nca = ca_prev - n_prev;
+            let d_prev_cac = c_prev - ca_prev;
+            let d_cn = nerf_delta3(d_prev_nca, d_prev_cac, bg0.x, bg0.y, sin(psi_prev), cos(psi_prev));
+            let n_loop = c_prev + d_cn;
+            let d_nca = nerf_delta3(d_prev_cac, d_cn, bg0.z, bg0.w, sin(omg_prev), cos(omg_prev));
+            let ca_loop = n_loop + d_nca;
+            let d_cac = nerf_delta3(d_cn, d_nca, bg1.x, bg1.y, sin(ref_phi_s), cos(ref_phi_s));
+            let c_loop = ca_loop + d_cac;
+
+            let rig_a = atom_base + 7u * b_start;
+            let n_rig = scratch[rig_a + 0u].xyz;
+            let ca_rig = scratch[rig_a + 2u].xyz;
+            let c_rig = scratch[rig_a + 4u].xyz;
+
+            let seg_loop = 2u * b_start;
+            let m_start = static_ints[ioff_blocks + 4u * m_bid + 0u];
+            let seg_master = 2u * m_start + 1u;
+
+            let dn = n_loop - n_rig;
+            e_rama = e_rama + 0.5 * k_loop * dot(dn, dn);
+            let gn = dn * k_loop;
+            add_seg_grad_dock(atom_base, force_base, torque_base, seg_loop, n_loop, gn);
+            add_seg_grad_dock(atom_base, force_base, torque_base, seg_master, n_rig, -gn);
+
+            let dca = ca_loop - ca_rig;
+            e_rama = e_rama + 0.5 * k_loop * dot(dca, dca);
+            let gca = dca * k_loop;
+            add_seg_grad_dock(atom_base, force_base, torque_base, seg_loop, ca_loop, gca);
+            add_seg_grad_dock(atom_base, force_base, torque_base, seg_master, ca_rig, -gca);
+
+            let dc = c_loop - c_rig;
+            e_rama = e_rama + 0.5 * k_loop * dot(dc, dc);
+            let gc = dc * k_loop;
+            add_seg_grad_dock(atom_base, force_base, torque_base, seg_loop, c_loop, gc);
+            add_seg_grad_dock(atom_base, force_base, torque_base, seg_master, c_rig, -gc);
+        }
+    }
+
+    // 7. Backward tree suffix-sum torque propagation per chain + Lovell Ramachandran prior
     var c_rev = n_chains;
     while (c_rev > 0u) {
         c_rev = c_rev - 1u;
@@ -907,15 +1153,18 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
             let phi_act = (r_flags & 1u) != 0u;
             let psi_act = (r_flags & 2u) != 0u;
             let rama_act = (r_flags & 4u) != 0u;
+            let is_reentry = (r_flags & 16u) != 0u;
 
-            suf_t = suf_t + cross(cur_q - ci, suf_f);
-            cur_q = ci;
-            let seg_psi = 2u * i_rev + 2u;
-            suf_f = suf_f + scratch[force_base + seg_psi].xyz;
-            suf_t = suf_t + scratch[torque_base + seg_psi].xyz;
             var g_psi: f32 = 0.0;
-            if (psi_act) {
-                g_psi = dot(safe_unit3(ci - cai), suf_t);
+            if (i_rev + 1u < ce) {
+                suf_t = suf_t + cross(cur_q - ci, suf_f);
+                cur_q = ci;
+                let seg_psi = 2u * i_rev + 2u;
+                suf_f = suf_f + scratch[force_base + seg_psi].xyz;
+                suf_t = suf_t + scratch[torque_base + seg_psi].xyz;
+                if (psi_act) {
+                    g_psi = dot(safe_unit3(ci - cai), suf_t);
+                }
             }
 
             suf_t = suf_t + cross(cur_q - cai, suf_f);
@@ -944,6 +1193,24 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
 
             grads_out[grad_base + i_rev] = vec4<f32>(g_phi, g_psi, 0.0, 0.0);
+
+            // Re-entry span transfer onto `master_block_id` (`21.W2:P0-4`)
+            if (is_reentry) {
+                let bid_re = static_ints[rm + 1u];
+                if (bid_re != NO_BLOCK_SENTINEL) {
+                    let m_bid = static_ints[ioff_blocks + 4u * bid_re + 2u];
+                    let s_0 = static_ints[ioff_blocks + 4u * m_bid + 0u];
+                    let seg_master = 2u * s_0 + 1u;
+                    let piv_master = scratch[atom_base + 7u * s_0 + 2u].xyz;
+                    scratch[force_base + seg_master] = vec4<f32>(scratch[force_base + seg_master].xyz + suf_f, 0.0);
+                    scratch[torque_base + seg_master] = vec4<f32>(
+                        scratch[torque_base + seg_master].xyz + suf_t + cross(cur_q - piv_master, suf_f),
+                        0.0,
+                    );
+                    suf_f = vec3<f32>(0.0, 0.0, 0.0);
+                    suf_t = vec3<f32>(0.0, 0.0, 0.0);
+                }
+            }
 
             if (i_rev == cs) {
                 let seg_root = 2u * cs;

@@ -11,8 +11,9 @@
 //!   Schwieters, C. D. (*J. Am. Chem. Soc.* **2004**, 126, 2923-2938).
 //! - Bertini, I. et al. (*J. Am. Chem. Soc.* **2007**, 129, 12786-12794); Schmitz, C. et al.
 //!   (*J. Biomol. NMR* **2008**, 41, 179-189).
+//! - Nilges, M. (*J. Mol. Biol.* **1995**, 245, 645-660 — $r^{-6}$-summed ambiguous NOE restraints).
 //! - Parsons, J. et al. (*J. Comput. Chem.* **2005**, 26, 1063-1068 — `NeRF`); Abe, H., Braun, W.,
-//!   Noguti, T. & Go, N. (*Comput. Chem.* **1984**, 8, 239-247 — suffix-sum torque gradient);
+//!   Noguti, T. & Go, N. (*Comput. Chem.* **1984**, 8, 239-247 — tree suffix-sum torque gradient);
 //!   Nocedal, J. (*Math. Comp.* **1980**, 35, 151, 773-782 — two-loop `L-BFGS`).
 
 use std::f64::consts::PI;
@@ -20,12 +21,12 @@ use std::f64::consts::PI;
 use bytemuck::{Pod, Zeroable};
 use nmr_core::af_concordance::{AfStructureModel, PaeMatrix};
 use nmr_core::domain_dock::{
-    cluster_pae_domains_for_model, evaluate_domain_dock_state_cpu, finalize_domain_dock_result,
-    generate_domain_dock_seed_states, prepare_domain_dock_inputs, quat_apply_world_rot_step,
-    select_and_polish_top_states, DockResClass, DomainDockConfig, DomainDockEnergyBreakdown,
-    DomainDockEnergyWeights, DomainDockGradient, DomainDockResult, DomainDockState,
-    DomainLinkerKinematics, DomainPcsTagSet, DomainPreSiteSet, PaeDomainPartition,
-    PreparedDomainDockRestraints,
+    cluster_pae_domains, cluster_pae_domains_for_model, evaluate_domain_dock_state_cpu,
+    finalize_domain_dock_pipeline, generate_domain_dock_seed_states,
+    prepare_domain_dock_inputs_full, quat_apply_world_rot_step, select_and_polish_top_states,
+    DockResClass, DomainDockConfig, DomainDockEnergyBreakdown, DomainDockEnergyWeights,
+    DomainDockGradient, DomainDockResult, DomainDockState, DomainLinkerKinematics, DomainPcsTagSet,
+    DomainPreSiteSet, DomainRdcMediumSet, PaeDomainPartition, PreparedDomainDockRestraints,
 };
 use nmr_core::noesy::{v_dot, AmbiguousDistanceRestraint};
 use nmr_core::rdc::RdcMediumSet;
@@ -36,6 +37,10 @@ use crate::GpuEngine;
 /// Maximum number of multi-domain replicas evaluated per single WebGPU compute dispatch /
 /// `queue.submit` so TDR watchdogs are never tripped (`R <= 256`).
 pub const MAX_DOMAIN_DOCK_REPLICAS_PER_DISPATCH: usize = 256;
+
+/// Explicit residue-count ceiling for WebGPU `domain_dock.wgsl` (`L <= 4096`, `21.W2:P2-13`),
+/// ensuring `f32` exact integer representation inside the `O(L)` 3D spatial voxel grid hash.
+pub const MAX_DOMAIN_DOCK_GPU_RESIDUES: usize = 4096;
 
 const NO_BLOCK_SENTINEL: u32 = u32::MAX;
 
@@ -68,18 +73,30 @@ struct DomainDockParamsGpu {
     vdw_scale: f32,
     w_rama: f32,
     noe_soft_window: f32,
-    pad0: u32,
+    n_noe_cands: u32,
 }
 
-/// Pre-check all 7 WebGPU bindings (`1` uniform + `6` storage buffers) and `R <= 256` TDR ceiling
-/// against `wgpu::Limits` prior to creating any GPU buffer.
+#[inline]
+fn vdw_grid_cap_for_residues(l_res: usize) -> Result<usize, String> {
+    if l_res == 0 {
+        return Ok(64);
+    }
+    l_res
+        .checked_mul(16)
+        .and_then(usize::checked_next_power_of_two)
+        .map(|c| c.max(64))
+        .ok_or_else(|| "domain_dock_gpu vdw grid_cap overflow".to_string())
+}
+
+/// Pre-check all 7 WebGPU bindings (`1` uniform + `6` storage buffers), `L <= 4096`, and `R <= 256`
+/// TDR ceiling against `wgpu::Limits` prior to creating any GPU buffer.
 pub fn validate_domain_dock_gpu_limits(
     limits: &wgpu::Limits,
     n_replicas_dispatch: usize,
     kin: &DomainLinkerKinematics,
     prep: &PreparedDomainDockRestraints,
 ) -> Result<(), String> {
-    let _ = compute_and_validate_domain_dock_sizes(
+    let _ = compute_and_validate_domain_dock_sizes_full(
         limits,
         n_replicas_dispatch,
         kin.residues.len(),
@@ -92,6 +109,7 @@ pub fn validate_domain_dock_gpu_limits(
         prep.pre_sites.len(),
         prep.pre_terms.len(),
         prep.noe_terms.len(),
+        prep.noe_candidates.len(),
     )?;
     Ok(())
 }
@@ -112,7 +130,7 @@ pub fn validate_domain_dock_gpu_limits_raw(
     n_pre_terms: usize,
     n_noe_terms: usize,
 ) -> Result<(), String> {
-    let _ = compute_and_validate_domain_dock_sizes(
+    let _ = compute_and_validate_domain_dock_sizes_full(
         limits,
         n_replicas_dispatch,
         l_res,
@@ -125,12 +143,13 @@ pub fn validate_domain_dock_gpu_limits_raw(
         n_pre_sites,
         n_pre_terms,
         n_noe_terms,
+        n_noe_terms,
     )?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compute_and_validate_domain_dock_sizes(
+fn compute_and_validate_domain_dock_sizes_full(
     limits: &wgpu::Limits,
     n_replicas_dispatch: usize,
     l_res: usize,
@@ -143,6 +162,7 @@ fn compute_and_validate_domain_dock_sizes(
     n_pre_sites: usize,
     n_pre_terms: usize,
     n_noe_terms: usize,
+    n_noe_cands: usize,
 ) -> Result<DomainDockDispatchSizes, String> {
     if n_replicas_dispatch == 0 {
         return Err("domain_dock_gpu dispatch requires n_replicas_dispatch >= 1".to_string());
@@ -150,6 +170,11 @@ fn compute_and_validate_domain_dock_sizes(
     if n_replicas_dispatch > MAX_DOMAIN_DOCK_REPLICAS_PER_DISPATCH {
         return Err(format!(
             "domain_dock_gpu n_replicas_dispatch ({n_replicas_dispatch}) exceeds TDR cap MAX_DOMAIN_DOCK_REPLICAS_PER_DISPATCH ({MAX_DOMAIN_DOCK_REPLICAS_PER_DISPATCH})"
+        ));
+    }
+    if l_res > MAX_DOMAIN_DOCK_GPU_RESIDUES {
+        return Err(format!(
+            "domain_dock_gpu l_res ({l_res}) exceeds MAX_DOMAIN_DOCK_GPU_RESIDUES ({MAX_DOMAIN_DOCK_GPU_RESIDUES})"
         ));
     }
     if limits.max_storage_buffers_per_shader_stage < 6 {
@@ -170,6 +195,7 @@ fn compute_and_validate_domain_dock_sizes(
         ("n_pre_sites", n_pre_sites),
         ("n_pre_terms", n_pre_terms),
         ("n_noe_terms", n_noe_terms),
+        ("n_noe_cands", n_noe_cands),
     ] {
         if val > u32::MAX as usize {
             return Err(format!(
@@ -245,7 +271,7 @@ fn compute_and_validate_domain_dock_sizes(
     si_u32s = add_u(si_u32s, mul_u(2, n_chains, "si chains")?, "si + chains")?;
     si_u32s = add_u(
         si_u32s,
-        mul_u(2, n_rigid_blocks, "si blocks")?,
+        mul_u(4, n_rigid_blocks, "si blocks")?,
         "si + blocks",
     )?;
     si_u32s = add_u(si_u32s, mul_u(2, n_pcs_tags, "si tags")?, "si + tags")?;
@@ -253,7 +279,16 @@ fn compute_and_validate_domain_dock_sizes(
     si_u32s = add_u(si_u32s, mul_u(5, n_rdc_terms, "si rdc")?, "si + rdc")?;
     si_u32s = add_u(si_u32s, mul_u(3, n_pcs_terms, "si pcs")?, "si + pcs")?;
     si_u32s = add_u(si_u32s, mul_u(4, n_pre_terms, "si pre")?, "si + pre")?;
-    si_u32s = add_u(si_u32s, mul_u(4, n_noe_terms, "si noe")?, "si + noe")?;
+    si_u32s = add_u(
+        si_u32s,
+        mul_u(2, n_noe_terms, "si noe_terms")?,
+        "si + noe_terms",
+    )?;
+    si_u32s = add_u(
+        si_u32s,
+        mul_u(4, n_noe_cands, "si noe_cands")?,
+        "si + noe_cands",
+    )?;
     if si_u32s > u32::MAX as usize {
         return Err("domain_dock_gpu static_ints u32 index overflow".to_string());
     }
@@ -279,17 +314,18 @@ fn compute_and_validate_domain_dock_sizes(
         .max(16);
     check_storage("replica_in_buf", replica_in_bytes)?;
 
-    // 4. `scratch` (`vec4<f32>` = 16 B)
+    // 4. `scratch` (`vec4<f32>` = 16 B: `7*l + 4*blocks + 2*segs + 10*l + grid_cap`)
     let n_segs = add_u(mul_u(2, l_res, "2*l")?, 1, "n_segs")?;
-    let sc_stride = add_u(
-        add_u(
-            mul_u(7, l_res, "7*l")?,
-            mul_u(4, n_rigid_blocks, "4*blocks")?,
-            "sc atoms+blocks",
-        )?,
-        mul_u(2, n_segs, "2*segs")?,
-        "scratch stride",
+    let grid_cap = vdw_grid_cap_for_residues(l_res)?;
+    let mut sc_stride = add_u(
+        mul_u(7, l_res, "7*l")?,
+        mul_u(4, n_rigid_blocks, "4*blocks")?,
+        "sc atoms+blocks",
     )?;
+    sc_stride = add_u(sc_stride, mul_u(2, n_segs, "2*segs")?, "sc + segs")?;
+    sc_stride = add_u(sc_stride, mul_u(10, l_res, "10*l vdw")?, "sc + vdw")?;
+    sc_stride = add_u(sc_stride, grid_cap, "sc + grid_cap")?;
+
     let sc_vec4s = mul_u(n_replicas_dispatch, sc_stride, "scratch count")?;
     if sc_vec4s > u32::MAX as usize {
         return Err("domain_dock_gpu scratch u32 index overflow".to_string());
@@ -327,6 +363,23 @@ fn compute_and_validate_domain_dock_sizes(
         energies_bytes,
         grads_bytes,
     })
+}
+
+fn pick_chunk_size_for_device(
+    limits: &wgpu::Limits,
+    total_replicas: usize,
+    kin: &DomainLinkerKinematics,
+    prep: &PreparedDomainDockRestraints,
+) -> Result<usize, String> {
+    let mut chunk = total_replicas.clamp(1, MAX_DOMAIN_DOCK_REPLICAS_PER_DISPATCH);
+    while chunk > 1 {
+        if validate_domain_dock_gpu_limits(limits, chunk, kin, prep).is_ok() {
+            return Ok(chunk);
+        }
+        chunk /= 2;
+    }
+    validate_domain_dock_gpu_limits(limits, 1, kin, prep)?;
+    Ok(1)
 }
 
 /// Pre-compiled WebGPU compute pipeline for `shaders/domain_dock.wgsl`.
@@ -411,9 +464,6 @@ fn pack_static_buffers(
     let mut sf: Vec<[f32; 4]> = Vec::new();
     let mut si: Vec<u32> = Vec::new();
 
-    // Global translation gauge `origin` subtracted in `f64` prior to `f32` packing so covalent
-    // `NeRF` linker propagation operates near `[0, 0, 0]` without losing `f32` mantissa bits to
-    // arbitrary PDB world-origin offsets (all 6 potentials & torques are strictly translation-invariant!).
     let origin = if let Some(b0) = kin.rigid_blocks.first() {
         kin.residues[b0.end_res.saturating_sub(1)].ref_slots[4].0
     } else {
@@ -465,9 +515,7 @@ fn pack_static_buffers(
             }
         }
     }
-    // `off_c_prev_virt = 10 * l` (`3 * l`):
-    // - For rigid block start `i`: `(ref_n, ref_ca, ref_c)` (shifted by `-origin`)
-    // - For flexible chain start `i`: `(c_prev_virtual, ref_ca, ref_c)` (shifted by `-origin`)
+    // `off_c_prev_virt = 10 * l` (`3 * l`)
     for rg in &kin.residues {
         if rg.rigid_block_id.is_some() {
             sf.push(sub_org_f32(rg.ref_slots[0].0, 0.0));
@@ -558,15 +606,26 @@ fn pack_static_buffers(
         if rg.is_chain_start {
             flg |= 8u32;
         }
+        if rg.is_reentry_start {
+            flg |= 16u32;
+        }
+        if rg.is_chain_end {
+            flg |= 32u32;
+        }
         si.extend([rc_u, bid_u, rg.chain_idx as u32, flg]);
     }
     // `ioff_chains` (`2 * n_chains`)
     for &(cs, ce) in &kin.chain_ranges {
         si.extend([cs as u32, ce as u32]);
     }
-    // `ioff_blocks` (`2 * n_rigid_blocks`)
+    // `ioff_blocks` (`4 * n_rigid_blocks`: `[start_res, end_res, master_block_id, chain_idx]`)
     for blk in &kin.rigid_blocks {
-        si.extend([blk.start_res as u32, blk.end_res as u32]);
+        si.extend([
+            blk.start_res as u32,
+            blk.end_res as u32,
+            blk.master_block_id as u32,
+            blk.chain_idx as u32,
+        ]);
     }
     // `ioff_pcs_tags` (`2 * n_pcs_tags`)
     for tag in &prep.pcs_tags {
@@ -599,13 +658,17 @@ fn pack_static_buffers(
             if pr.is_bounds_mode { 1u32 } else { 0u32 },
         ]);
     }
-    // `ioff_noe` (`4 * n_noe_terms`)
+    // `ioff_noe_terms` (`2 * n_noe_terms`)
     for nt in &prep.noe_terms {
+        si.extend([nt.cand_start as u32, nt.cand_len as u32]);
+    }
+    // `ioff_noe_cands` (`4 * n_noe_cands`)
+    for nc in &prep.noe_candidates {
         si.extend([
-            nt.atom_a as u32,
-            nt.atom_b as u32,
-            nt.seg_a as u32,
-            nt.seg_b as u32,
+            nc.atom_a as u32,
+            nc.atom_b as u32,
+            nc.seg_a as u32,
+            nc.seg_b as u32,
         ]);
     }
 
@@ -624,7 +687,7 @@ pub struct DomainDockGpuReplicaInput {
 }
 
 /// Evaluate a batch of multi-domain docking states and analytical gradients on WebGPU asynchronously
-/// (automatically chunking `> 256` replicas into TDR-safe `<= 256` dispatches).
+/// (automatically chunking replicas into TDR- and storage-binding-safe dispatches).
 pub async fn evaluate_domain_dock_batch_gpu_async(
     engine: &GpuEngine,
     kin: &DomainLinkerKinematics,
@@ -637,8 +700,7 @@ pub async fn evaluate_domain_dock_batch_gpu_async(
     }
     let pipe = DomainDockGpuPipeline::new(&engine.device);
     let lim = engine.device.limits();
-    let first_chunk = replicas.len().min(MAX_DOMAIN_DOCK_REPLICAS_PER_DISPATCH);
-    validate_domain_dock_gpu_limits(&lim, first_chunk, kin, prep)?;
+    let chunk_cap = pick_chunk_size_for_device(&lim, replicas.len(), kin, prep)?;
 
     let (sf_data, si_data) = pack_static_buffers(kin, prep);
     let sf_buf = engine
@@ -657,7 +719,7 @@ pub async fn evaluate_domain_dock_batch_gpu_async(
         });
 
     let mut all_out = Vec::with_capacity(replicas.len());
-    for chunk in replicas.chunks(MAX_DOMAIN_DOCK_REPLICAS_PER_DISPATCH) {
+    for chunk in replicas.chunks(chunk_cap) {
         let sub = dispatch_domain_dock_chunk_async(
             engine, &pipe, kin, prep, &sf_buf, &si_buf, chunk, weights,
         )
@@ -698,7 +760,7 @@ async fn dispatch_domain_dock_chunk_async(
     let nm = prep.n_media;
 
     let lim = engine.device.limits();
-    let sizes = compute_and_validate_domain_dock_sizes(
+    let sizes = compute_and_validate_domain_dock_sizes_full(
         &lim,
         c_len,
         l,
@@ -711,6 +773,7 @@ async fn dispatch_domain_dock_chunk_async(
         prep.pre_sites.len(),
         prep.pre_terms.len(),
         prep.noe_terms.len(),
+        prep.noe_candidates.len(),
     )?;
 
     let in_stride = l + 2 * nc + 3 * nm;
@@ -773,7 +836,7 @@ async fn dispatch_domain_dock_chunk_async(
         vdw_scale: weights.vdw_scale as f32,
         w_rama: weights.w_rama as f32,
         noe_soft_window: weights.noe_soft_window as f32,
-        pad0: 0,
+        n_noe_cands: prep.noe_candidates.len() as u32,
     };
 
     let params_buf = engine
@@ -946,6 +1009,90 @@ pub async fn dock_domains_gpu_async(
     .await
 }
 
+/// Run multi-chain `(chain_id, seq_id)` WebGPU + host `f64` `L-BFGS` docking across multiple polymer chains (`21.W2:P1-8`).
+#[allow(clippy::too_many_arguments)]
+pub async fn dock_domains_multi_chain_gpu_async(
+    engine: &GpuEngine,
+    models: &[AfStructureModel],
+    pae: &PaeMatrix,
+    domain_rdc_media: &[DomainRdcMediumSet],
+    pcs_tags: &[DomainPcsTagSet],
+    pre_sites: &[DomainPreSiteSet],
+    noe_adrs: &[AmbiguousDistanceRestraint],
+    cfg: &DomainDockConfig,
+) -> Result<DomainDockResult, String> {
+    if models.is_empty() {
+        return Err(
+            "dock_domains_multi_chain_gpu_async requires >= 1 AfStructureModel".to_string(),
+        );
+    }
+    let mut seq_ids = Vec::new();
+    let mut chain_ids = Vec::new();
+    let mut plddts = Vec::new();
+    let mut any_plddt = false;
+    for (m_idx, m) in models.iter().enumerate() {
+        for r in &m.residues {
+            seq_ids.push(r.seq_id);
+            let cid = if r.chain_id.trim().is_empty() {
+                format!("{}", (b'A' + (m_idx as u8).min(25)) as char)
+            } else {
+                r.chain_id.clone()
+            };
+            chain_ids.push(cid);
+            if r.plddt.is_some() {
+                any_plddt = true;
+            }
+            plddts.push(r.plddt.unwrap_or(100.0));
+        }
+    }
+    let partition = cluster_pae_domains(
+        pae,
+        any_plddt.then_some(plddts.as_slice()),
+        Some(&seq_ids),
+        Some(&chain_ids),
+        &cfg.pae_cfg,
+    )?;
+    let kin = DomainLinkerKinematics::from_multi_chain_models(models, &partition)?;
+    let mut cfg_mc = cfg.clone();
+    cfg_mc.chain_rdc_media = domain_rdc_media.to_vec();
+    dock_domains_with_kinematics_gpu_async(
+        engine,
+        kin,
+        partition,
+        &[],
+        pcs_tags,
+        pre_sites,
+        noe_adrs,
+        &cfg_mc,
+    )
+    .await
+}
+
+/// Synchronous native wrapper around [`dock_domains_multi_chain_gpu_async`].
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+pub fn dock_domains_multi_chain_gpu(
+    engine: &GpuEngine,
+    models: &[AfStructureModel],
+    pae: &PaeMatrix,
+    domain_rdc_media: &[DomainRdcMediumSet],
+    pcs_tags: &[DomainPcsTagSet],
+    pre_sites: &[DomainPreSiteSet],
+    noe_adrs: &[AmbiguousDistanceRestraint],
+    cfg: &DomainDockConfig,
+) -> Result<DomainDockResult, String> {
+    pollster::block_on(dock_domains_multi_chain_gpu_async(
+        engine,
+        models,
+        pae,
+        domain_rdc_media,
+        pcs_tags,
+        pre_sites,
+        noe_adrs,
+        cfg,
+    ))
+}
+
 /// Run WebGPU multi-replica annealing + host `f64` `L-BFGS` polish on a pre-built `DomainLinkerKinematics`.
 #[allow(clippy::too_many_arguments)]
 pub async fn dock_domains_with_kinematics_gpu_async(
@@ -962,7 +1109,7 @@ pub async fn dock_domains_with_kinematics_gpu_async(
     let t0 = std::time::Instant::now();
 
     let mut rdc_media = rdc_media_in.to_vec();
-    let (tolman_gdo, prep) = prepare_domain_dock_inputs(
+    let pipe_in = prepare_domain_dock_inputs_full(
         &kin,
         &partition,
         &mut rdc_media,
@@ -971,6 +1118,7 @@ pub async fn dock_domains_with_kinematics_gpu_async(
         noe_adrs,
         cfg,
     )?;
+    let prep = &pipe_in.prep;
 
     let has_any_restraints = !prep.rdc_terms.is_empty()
         || !prep.pcs_terms.is_empty()
@@ -982,25 +1130,18 @@ pub async fn dock_domains_with_kinematics_gpu_async(
 
     let polished = if !has_any_restraints || partition.domains.len() <= 1 {
         let st0 = kin.initial_state();
-        let (eb0, _) = evaluate_domain_dock_state_cpu(&kin, &prep, &st0, &cfg.weights);
+        let (eb0, _) = evaluate_domain_dock_state_cpu(&kin, prep, &st0, &cfg.weights);
         vec![(st0, eb0)]
     } else {
         let n_rep = cfg.n_replicas.max(n_ens);
-        let mut states = generate_domain_dock_seed_states(
-            &kin,
-            &partition,
-            &prep,
-            &cfg.weights,
-            n_rep,
-            cfg.seed,
-        );
+        let mut states =
+            generate_domain_dock_seed_states(&kin, &partition, prep, &cfg.weights, n_rep, cfg.seed);
 
         let lim = engine.device.limits();
-        let first_chunk = states.len().min(MAX_DOMAIN_DOCK_REPLICAS_PER_DISPATCH);
-        validate_domain_dock_gpu_limits(&lim, first_chunk, &kin, &prep)?;
+        let chunk_cap = pick_chunk_size_for_device(&lim, states.len(), &kin, prep)?;
 
-        let pipe = DomainDockGpuPipeline::new(&engine.device);
-        let (sf_data, si_data) = pack_static_buffers(&kin, &prep);
+        let gpu_pipe = DomainDockGpuPipeline::new(&engine.device);
+        let (sf_data, si_data) = pack_static_buffers(&kin, prep);
         let sf_buf = engine
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1026,7 +1167,7 @@ pub async fn dock_domains_with_kinematics_gpu_async(
         let mut best_energies: Vec<f64> = states
             .iter()
             .map(|s| {
-                nmr_core::domain_dock::evaluate_domain_dock_state_cpu(&kin, &prep, s, &cfg.weights)
+                nmr_core::domain_dock::evaluate_domain_dock_state_cpu(&kin, prep, s, &cfg.weights)
                     .0
                     .total
             })
@@ -1044,8 +1185,6 @@ pub async fn dock_domains_with_kinematics_gpu_async(
             cur_w.w_vdw = cfg.weights.w_vdw * (0.20 + 0.80 * ramp * ramp);
             cur_w.vdw_scale = cfg.weights.vdw_scale * (0.78 + 0.22 * ramp);
 
-            // Fit exact `f64` Saupe tensors per replica on host (`< 0.05 ms`), then evaluate full
-            // multi-domain forces & torques across all replicas in batched WebGPU dispatches!
             let mut gpu_inputs: Vec<DomainDockGpuReplicaInput> = Vec::with_capacity(states.len());
             for st in &states {
                 let saupe = if cur_w.w_rdc > 0.0 && prep.n_media > 0 {
@@ -1061,9 +1200,9 @@ pub async fn dock_domains_with_kinematics_gpu_async(
             }
 
             let mut gpu_outs = Vec::with_capacity(states.len());
-            for chunk in gpu_inputs.chunks(MAX_DOMAIN_DOCK_REPLICAS_PER_DISPATCH) {
+            for chunk in gpu_inputs.chunks(chunk_cap) {
                 let sub = dispatch_domain_dock_chunk_async(
-                    engine, &pipe, &kin, &prep, &sf_buf, &si_buf, chunk, &cur_w,
+                    engine, &gpu_pipe, &kin, prep, &sf_buf, &si_buf, chunk, &cur_w,
                 )
                 .await?;
                 gpu_outs.extend(sub);
@@ -1119,7 +1258,7 @@ pub async fn dock_domains_with_kinematics_gpu_async(
 
         select_and_polish_top_states(
             &kin,
-            &prep,
+            prep,
             best_states,
             &cfg.weights,
             n_ens,
@@ -1132,13 +1271,10 @@ pub async fn dock_domains_with_kinematics_gpu_async(
     #[cfg(target_arch = "wasm32")]
     let elapsed_ms = 0.0;
 
-    finalize_domain_dock_result(
+    finalize_domain_dock_pipeline(
         kin,
         partition,
-        tolman_gdo,
-        &prep,
-        &rdc_media,
-        pcs_tags,
+        pipe_in,
         pre_sites,
         polished,
         engine_label,

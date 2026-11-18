@@ -45,20 +45,21 @@ use crate::noesy::{
     Vec3,
 };
 use crate::paramagnetic::{
-    fit_pcs_tensor_svd, DeltaChiTensor, PcsObservation, PCS_CARTESIAN_PREFACTOR,
+    fit_pcs_tensor_svd, refine_metal_position_and_tensor, DeltaChiTensor, PcsObservation,
+    PCS_CARTESIAN_PREFACTOR,
 };
 use crate::rdc::{
-    calc_rdc_from_unit_vec, cornilescu_q, decompose_saupe_matrix, evaluate_rdc_validation,
-    fit_saupe_tensor_svd, normalize_rdc_atom_name, rdc_peptide_plane_id, RdcFreeStratification,
-    RdcMediumSet, RdcRestraint, RdcValidationSummary, SaupeTensorFit, MAX_SAUPE_SVD_COND,
+    calc_rdc_from_unit_vec, cornilescu_q, decompose_saupe_matrix, normalize_rdc_atom_name,
+    rdc_peptide_plane_id, RdcBackCalcPoint, RdcBondType, RdcFreeStratification, RdcMediumSet,
+    RdcRestraint, RdcValidationSummary, SaupeTensorFit, DMAX_NH_HZ, MAX_SAUPE_SVD_COND,
 };
 use crate::structure::{
-    backbone_rmsd_between_chains, det_acos, det_cbrt, det_exp, det_ln, det_sin_cos, kabsch_rmsd,
-    nerf_place_atom, DetRng, ANGLE_CA_C_N_DEG, ANGLE_CA_C_O_DEG, ANGLE_C_N_CA_DEG, ANGLE_C_N_H_DEG,
-    ANGLE_N_CA_C_DEG, ANGLE_N_CA_C_GLY_DEG, BOND_C_N, BOND_N_H,
+    det_acos, det_cbrt, det_exp, det_ln, det_sin_cos, kabsch_rmsd, nerf_place_atom, DetRng,
+    ANGLE_CA_C_N_DEG, ANGLE_CA_C_O_DEG, ANGLE_C_N_CA_DEG, ANGLE_C_N_H_DEG, ANGLE_N_CA_C_DEG,
+    ANGLE_N_CA_C_GLY_DEG, BOND_C_N, BOND_N_H,
 };
 
-/// Maximum restraint text size (`64 MiB`) accepted by `PCS` / `PRE` parsers.
+/// Maximum restraint text size (`64 MiB`) accepted by `PCS` / `PRE` / `RDC` / `NOE` parsers.
 pub const MAX_DOMAIN_RESTRAINT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Default minimum `pLDDT` threshold defining the ordered residue subgraph $\mathcal{O}$.
@@ -84,6 +85,175 @@ pub const MIN_TOLMAN_DOMAIN_WORK_RDCS: usize = 8;
 
 /// Default Tolman GDO inter-domain coupling threshold (`\rho_{\text{GDO}} < 0.80` at `> 2\sigma_{\text{MC}}`).
 pub const TOLMAN_GDO_RATIO_THRESHOLD: f64 = 0.80;
+
+/// Default backbone/proton coordinate noise floor (`0.08 Å`, $\approx 4.5^\circ$ on N–H) propagated
+/// into Tolman $\vartheta_{d,m}$ Monte Carlo uncertainty alongside measurement $\sigma_k$ and
+/// empirical intra-domain SVD excess $\chi^2_\nu$ (`21.W2:P1-6`).
+pub const DEFAULT_TOLMAN_COORD_NOISE_ANGSTROM: f64 = 0.08;
+
+/// Default pre-dock intra-domain `ByPeptidePlane Q_free` ceiling (`0.50`) above which a rigid
+/// domain fails its own internal coordinate fit (`21.W2:P1-6` / `A8`).
+pub const DEFAULT_MAX_INTRA_DOMAIN_RDC_Q_FREE: f64 = 0.50;
+
+/// Maximum Saupe Frobenius cosine similarity (`|cos(S_a, S_b)| < 0.85`, i.e. $\ge 31.8^\circ$)
+/// required to count two RDC alignment media as genuinely non-coaxial (`21.W2:P2-8`).
+pub const MAX_NON_COAXIAL_SAUPE_COS: f64 = 0.85;
+
+/// Default outward offset (`7.0 Å`, typical `6–9 Å` DOTA-M8 / CLaNP / EDTA-Cys chelate arm) used
+/// as the initial metal guess when `# metal_anchor:` is supplied without `# metal_pos:` (`21.W2:P2-10`).
+pub const DEFAULT_LANTHANIDE_ANCHOR_OFFSET_ANGSTROM: f64 = 7.0;
+
+/// Default MTSL nitroxide 5-bond Cys–S–S–CH₂–pyrroline flexible-tether distance allowance (`6.0 Å`)
+/// applied when spin-label PRE bounds are anchored to a residue atom rather than an exact fixed
+/// 3D paramagnetic center (`Battiste & Wagner 2000`; `Iwahara, Schwieters & Clore 2004`).
+pub const DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM: f64 = 6.0;
+
+/// CODATA 2018/2022 vacuum magnetic permeability factor $\mu_0 / (4\pi) = 10^{-7}\text{ T}\cdot\text{m}\cdot\text{A}^{-1}$.
+pub const CODATA_MU0_OVER_4PI_SI: f64 = 1.0e-7;
+
+/// CODATA 2018/2022 $^1\text{H}$ gyromagnetic ratio $\gamma_{\text{H}} = 2.675\,221\,874\,4 \times 10^8\text{ rad}\cdot\text{s}^{-1}\cdot\text{T}^{-1}$.
+pub const CODATA_GAMMA_PROTON_RAD_S_T: f64 = 2.675_221_874_4e8;
+
+/// CODATA 2018/2022 free-electron $g$-factor $g_e = 2.002\,319\,304\,362\,56$.
+pub const CODATA_ELECTRON_G_FACTOR: f64 = 2.002_319_304_362_56;
+
+/// CODATA 2018/2022 Bohr magneton $\mu_B = 9.274\,010\,078\,3 \times 10^{-24}\text{ J}\cdot\text{T}^{-1}$.
+pub const CODATA_BOHR_MAGNETON_J_T: f64 = 9.274_010_078_3e-24;
+
+/// First-principles SI Solomon–Bloembergen dipolar relaxation prefactor for $^1\text{H}$ + $S = 1/2$
+/// nitroxide radical in $\text{\AA}^6\,\text{s}^{-2}$ (`Solomon, Phys. Rev. 1955, 99, 559-565`):
+/// $$K_{\text{Solomon}} = \frac{1}{15}\left(\frac{\mu_0}{4\pi}\right)^2 \gamma_{\text{H}}^2 g_e^2 \mu_B^2 S(S+1) \times 10^{60} \approx 1.2339 \times 10^{16}\text{ \AA}^6\,\text{s}^{-2}.$$
+pub const K_SOLOMON_PROTON_NITROXIDE_A6_S2: f64 = (1.0 / 15.0)
+    * (CODATA_MU0_OVER_4PI_SI * CODATA_MU0_OVER_4PI_SI)
+    * (CODATA_GAMMA_PROTON_RAD_S_T * CODATA_GAMMA_PROTON_RAD_S_T)
+    * (CODATA_ELECTRON_G_FACTOR * CODATA_ELECTRON_G_FACTOR)
+    * (CODATA_BOHR_MAGNETON_J_T * CODATA_BOHR_MAGNETON_J_T)
+    * (0.5 * 1.5)
+    * 1.0e60;
+
+/// Compute the general SI Solomon–Bloembergen dipolar prefactor ($\text{\AA}^6\,\text{s}^{-2}$) for
+/// nuclear gyromagnetic ratio `gamma_i_rad_s_t`, electronic $g$-factor `g_factor`, and spin quantum
+/// number `spin_s` ($S \ge 1/2$, e.g. $S = 1/2$ for nitroxide/$\text{Cu}^{2+}$, $5/2$ for $\text{Mn}^{2+}$, $7/2$ for $\text{Gd}^{3+}$).
+#[inline]
+pub fn compute_solomon_dipolar_constant_a6_s2(
+    spin_s: f64,
+    g_factor: f64,
+    gamma_i_rad_s_t: f64,
+) -> Result<f64, String> {
+    if !spin_s.is_finite() || spin_s <= 0.0 {
+        return Err(format!("invalid electronic spin S ({spin_s}); must be > 0"));
+    }
+    if !g_factor.is_finite() || g_factor <= 0.0 {
+        return Err(format!(
+            "invalid electronic g_factor ({g_factor}); must be > 0"
+        ));
+    }
+    if !gamma_i_rad_s_t.is_finite() || gamma_i_rad_s_t.abs() <= 0.0 {
+        return Err(format!(
+            "invalid nuclear gyromagnetic ratio ({gamma_i_rad_s_t})"
+        ));
+    }
+    Ok((1.0 / 15.0)
+        * (CODATA_MU0_OVER_4PI_SI * CODATA_MU0_OVER_4PI_SI)
+        * (gamma_i_rad_s_t * gamma_i_rad_s_t)
+        * (g_factor * g_factor)
+        * (CODATA_BOHR_MAGNETON_J_T * CODATA_BOHR_MAGNETON_J_T)
+        * (spin_s * (spin_s + 1.0))
+        * 1.0e60)
+}
+
+/// Evaluate the effective Solomon–Bloembergen transverse dipolar factor $K_{\text{PRE}}$ in
+/// $\text{\AA}^6\,\text{s}^{-1}$ such that $\Gamma_2(r) = K_{\text{PRE}}\,r^{-6}$:
+/// $$K_{\text{PRE}}(\tau_c, \omega_{\text{H}}) = K_{\text{Solomon}}(S, g, \gamma_{\text{H}})\left(4\tau_c + \frac{3\tau_c}{1 + \omega_{\text{H}}^2 \tau_c^2}\right), \quad \omega_{\text{H}} = 2\pi \nu_{\text{H}}.$$
+/// Fails closed (`Err`) if `tau_c_ns` or `proton_mhz` is non-positive or non-finite.
+pub fn compute_solomon_k_pre_a6_s1(
+    tau_c_ns: f64,
+    proton_mhz: f64,
+    spin_s: f64,
+    g_factor: f64,
+) -> Result<f64, String> {
+    if !tau_c_ns.is_finite() || tau_c_ns <= 0.0 {
+        return Err(format!(
+            "PRE rotational correlation time tau_c_ns ({tau_c_ns}) must be finite and > 0 ns"
+        ));
+    }
+    if !proton_mhz.is_finite() || proton_mhz <= 0.0 {
+        return Err(format!(
+            "PRE spectrometer proton Larmor frequency proton_mhz ({proton_mhz}) must be finite and > 0 MHz"
+        ));
+    }
+    let k_sol =
+        compute_solomon_dipolar_constant_a6_s2(spin_s, g_factor, CODATA_GAMMA_PROTON_RAD_S_T)?;
+    let tau_c_s = tau_c_ns * 1.0e-9;
+    let omega_h_rad_s = 2.0 * PI * (proton_mhz * 1.0e6);
+    let wt = omega_h_rad_s * tau_c_s;
+    let j_factor_s = 4.0 * tau_c_s + (3.0 * tau_c_s) / (1.0 + wt * wt);
+    Ok(k_sol * j_factor_s)
+}
+
+/// Exact Solomon–Bloembergen $\Gamma_2(r)$ forward rate ($\text{s}^{-1}$) at distance `r_angstrom` (Å).
+pub fn evaluate_solomon_gamma2_s1(
+    r_angstrom: f64,
+    tau_c_ns: f64,
+    proton_mhz: f64,
+    spin_s: f64,
+    g_factor: f64,
+) -> Result<f64, String> {
+    if !r_angstrom.is_finite() || r_angstrom <= 0.0 {
+        return Err(format!(
+            "PRE internuclear distance r_angstrom ({r_angstrom}) must be finite and > 0 Å"
+        ));
+    }
+    let k_pre = compute_solomon_k_pre_a6_s1(tau_c_ns, proton_mhz, spin_s, g_factor)?;
+    let r2 = r_angstrom * r_angstrom;
+    Ok(k_pre / (r2 * r2 * r2))
+}
+
+/// Invert a measured Solomon $\Gamma_2 \pm \sigma$ ($\text{s}^{-1}$) rate into `(r_center_a, r_lower_a, r_upper_a)`
+/// in Å using exact $r = (K_{\text{PRE}} / \Gamma_2)^{1/6}$ plus configurable flexible-tether allowance
+/// `mtsl_tether_allowance_a` ($\ge 0\text{ \AA}$, e.g. `6.0 Å` for MTSL).
+pub fn solomon_gamma2_to_distance_bounds(
+    gamma2_obs_s1: f64,
+    sigma_s1: f64,
+    k_pre_a6_s1: f64,
+    mtsl_tether_allowance_a: f64,
+) -> Result<(f64, f64, f64), String> {
+    if !gamma2_obs_s1.is_finite() || gamma2_obs_s1 < 0.0 {
+        return Err(format!("invalid gamma2_obs_s1 ({gamma2_obs_s1})"));
+    }
+    if !sigma_s1.is_finite() || sigma_s1 <= 0.0 {
+        return Err(format!("invalid sigma_s1 ({sigma_s1})"));
+    }
+    if !k_pre_a6_s1.is_finite() || k_pre_a6_s1 <= 0.0 {
+        return Err(format!("invalid k_pre_a6_s1 ({k_pre_a6_s1})"));
+    }
+    if !mtsl_tether_allowance_a.is_finite() || mtsl_tether_allowance_a < 0.0 {
+        return Err(format!(
+            "invalid mtsl_tether_allowance_a ({mtsl_tether_allowance_a}); must be >= 0"
+        ));
+    }
+    let sixth_rt = |x: f64| -> f64 { det_cbrt(x.max(1e-30)).sqrt() };
+    if gamma2_obs_s1 <= 2.0 * sigma_s1 {
+        // Weak / baseline PRE: provides a lower distance bound only (`r >= r_min - tether`)
+        let g_up = (gamma2_obs_s1 + 2.0 * sigma_s1).max(0.5);
+        let r_min = (sixth_rt(k_pre_a6_s1 / g_up) - mtsl_tether_allowance_a).max(2.0);
+        let r_center = if gamma2_obs_s1 > 1e-6 {
+            sixth_rt(k_pre_a6_s1 / gamma2_obs_s1)
+        } else {
+            r_min
+        };
+        Ok((r_center, r_min, f64::INFINITY))
+    } else {
+        let r_center = sixth_rt(k_pre_a6_s1 / gamma2_obs_s1);
+        let g_hi = gamma2_obs_s1 + 2.0 * sigma_s1;
+        let g_lo = (gamma2_obs_s1 - 2.0 * sigma_s1)
+            .max(0.25 * gamma2_obs_s1)
+            .max(0.1);
+        let r_lo = (sixth_rt(k_pre_a6_s1 / g_hi) - mtsl_tether_allowance_a).max(2.0);
+        let r_hi = sixth_rt(k_pre_a6_s1 / g_lo) + mtsl_tether_allowance_a;
+        Ok((r_center, r_lo.min(r_hi), r_hi))
+    }
+}
 
 // ============================================================================
 // 1. Symmetrized PAE Spectral Domain Clustering (Ng, Jordan & Weiss 2001)
@@ -598,6 +768,23 @@ fn domain_intra_pae_median(pae: &PaeMatrix, indices: &[usize]) -> f64 {
     exact_median_f64(&mut vals)
 }
 
+fn domain_inter_pae_median(pae: &PaeMatrix, a_indices: &[usize], b_indices: &[usize]) -> f64 {
+    if a_indices.is_empty() || b_indices.is_empty() {
+        return 0.0;
+    }
+    let mut vals = Vec::with_capacity(a_indices.len() * b_indices.len());
+    for &i in a_indices {
+        for &j in b_indices {
+            if i != j {
+                if let Some(p) = pae.symmetrized(i, j) {
+                    vals.push(p);
+                }
+            }
+        }
+    }
+    exact_median_f64(&mut vals)
+}
+
 /// Partition an `AfStructureModel` + `PaeMatrix` into confident rigid domains and flexible linkers.
 pub fn cluster_pae_domains_for_model(
     model: &AfStructureModel,
@@ -842,7 +1029,6 @@ pub fn cluster_pae_domains(
         eigengap: f64,
         all_valid: bool,
         all_sized: bool,
-        max_median_pae: f64,
         ordered_labels: Vec<usize>,
     }
 
@@ -894,17 +1080,46 @@ pub fn cluster_pae_domains(
                 max_med = med;
             }
         }
-        let all_valid = all_sized && max_med <= cfg.max_intra_pae_median_angstrom;
+        // Reject artificial cuts of a single continuous globular domain (`P2-12`): any two clusters
+        // on the same polymer chain must exhibit genuinely decoupled cross-domain PAE
+        // (`domain_inter_pae_median > cfg.pae_cutoff_angstrom`).
+        let mut inter_decoupled = true;
+        if all_sized && d >= 2 {
+            for ca in 0..d {
+                for cb in (ca + 1)..d {
+                    let same_chain_pair = match (cluster_res[ca].first(), cluster_res[cb].first()) {
+                        (Some(&ia), Some(&ib)) => chain_ids[ia] == chain_ids[ib],
+                        _ => false,
+                    };
+                    if same_chain_pair {
+                        let inter_med =
+                            domain_inter_pae_median(pae, &cluster_res[ca], &cluster_res[cb]);
+                        if inter_med <= cfg.pae_cutoff_angstrom {
+                            inter_decoupled = false;
+                            break;
+                        }
+                    }
+                }
+                if !inter_decoupled {
+                    break;
+                }
+            }
+        }
+        let all_valid =
+            all_sized && inter_decoupled && max_med <= cfg.max_intra_pae_median_angstrom;
         candidates.push(CandPartition {
             d,
             eigengap,
             all_valid,
-            all_sized,
-            max_median_pae: max_med,
+            all_sized: all_sized && inter_decoupled,
             ordered_labels,
         });
     }
 
+    // Never fall back to `min_by(max_median_pae)` (which artificially bisects an elongated single
+    // domain `75/75` or returns clusters violating `max_intra_pae_median_angstrom`). If no `all_valid`
+    // partition exists directly, start from the minimal decoupled per-chain domain count (`d = 1` on
+    // a single chain) and strictly enforce `median_intra_pae <= max_intra_pae_median_angstrom` below.
     let chosen_idx = if let Some((best_i, _)) = candidates
         .iter()
         .enumerate()
@@ -912,13 +1127,10 @@ pub fn cluster_pae_domains(
         .max_by(|(_, a), (_, b)| a.eigengap.total_cmp(&b.eigengap).then(b.d.cmp(&a.d)))
     {
         best_i
-    } else if let Some((best_i, _)) = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.all_sized)
-        .min_by(|(_, a), (_, b)| a.max_median_pae.total_cmp(&b.max_median_pae))
+    } else if let Some((min_decoupled_i, _)) =
+        candidates.iter().enumerate().find(|(_, c)| c.all_sized)
     {
-        best_i
+        min_decoupled_i
     } else {
         0
     };
@@ -1004,6 +1216,51 @@ pub fn cluster_pae_domains(
             }
         }
         scan = end;
+    }
+
+    // Strict post-invariant (`P2-12`): every emitted rigid domain MUST satisfy BOTH
+    // `|D_d| >= eff_min_dom` AND `domain_intra_pae_median <= cfg.max_intra_pae_median_angstrom`.
+    // Gently trim peripheral high-PAE edge residues if needed (e.g. flexible ends of a sloped single
+    // domain), or dissolve any molten cluster that has no confident `<= max_intra_pae_median_angstrom` core.
+    for dom_id in 1..=d_final {
+        loop {
+            let members: Vec<usize> = (0..n).filter(|&i| raw_dom[i] == dom_id).collect();
+            if members.is_empty() {
+                break;
+            }
+            if members.len() < eff_min_dom {
+                for i in members {
+                    raw_dom[i] = 0;
+                }
+                break;
+            }
+            let cur_med = domain_intra_pae_median(pae, &members);
+            if cur_med <= cfg.max_intra_pae_median_angstrom {
+                break;
+            }
+            if members.len() == eff_min_dom {
+                for i in members {
+                    raw_dom[i] = 0;
+                }
+                break;
+            }
+            // Trim the single member with highest median symmetrized PAE to the rest of the cluster
+            let mut worst_idx = members[0];
+            let mut worst_med = -1.0_f64;
+            for &i in &members {
+                let mut rvals: Vec<f64> = members
+                    .iter()
+                    .filter(|&&j| j != i)
+                    .filter_map(|&j| pae.symmetrized(i, j))
+                    .collect();
+                let m_i = exact_median_f64(&mut rvals);
+                if m_i > worst_med {
+                    worst_med = m_i;
+                    worst_idx = i;
+                }
+            }
+            raw_dom[worst_idx] = 0;
+        }
     }
 
     // Re-compact domain IDs 1..=D_kept in N-to-C order
@@ -1188,74 +1445,338 @@ pub fn compute_saupe_gdo(s_matrix: &[[f64; 3]; 3]) -> f64 {
     ((2.0 / 3.0) * sum_sq).sqrt()
 }
 
-/// Deterministically hold out `free_fraction` (e.g. `0.20`) of peptide planes **stratified within
-/// every rigid domain** (`RdcFreeStratification::ByPeptidePlane`), guaranteeing zero split peptide
-/// planes across bond types or alignment media while preserving $n_{\text{work}}(d, m) \ge 8$ whenever
-/// a domain supplies $> 8$ couplings.
-pub fn partition_domain_stratified_rdc_free_set(
-    media: &mut [RdcMediumSet],
+/// Chain-explicit residual dipolar coupling restraint (`(chain_id, seq_id)` keyed for multi-chain
+/// homodimers/heteromers with overlapping residue numbers, `21.W2:P1-8`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DomainRdcRestraint {
+    pub medium_id: String,
+    #[serde(default)]
+    pub chain_id_1: Option<String>,
+    pub seq_id_1: i32,
+    pub res_name_1: String,
+    pub atom_name_1: String,
+    #[serde(default)]
+    pub chain_id_2: Option<String>,
+    pub seq_id_2: i32,
+    pub res_name_2: String,
+    pub atom_name_2: String,
+    pub bond_type: RdcBondType,
+    pub d_obs_hz: f64,
+    pub sigma_hz: f64,
+    pub d_max_hz: f64,
+    pub is_free: bool,
+}
+
+impl DomainRdcRestraint {
+    pub fn from_rdc_restraint(r: &RdcRestraint) -> Self {
+        Self {
+            medium_id: r.medium_id.clone(),
+            chain_id_1: None,
+            seq_id_1: r.seq_id_1,
+            res_name_1: r.res_name_1.clone(),
+            atom_name_1: r.atom_name_1.clone(),
+            chain_id_2: None,
+            seq_id_2: r.seq_id_2,
+            res_name_2: r.res_name_2.clone(),
+            atom_name_2: r.atom_name_2.clone(),
+            bond_type: r.bond_type,
+            d_obs_hz: r.d_obs_hz,
+            sigma_hz: r.sigma_hz,
+            d_max_hz: r.d_max_hz,
+            is_free: r.is_free,
+        }
+    }
+
+    pub fn to_rdc_restraint(&self) -> RdcRestraint {
+        RdcRestraint {
+            medium_id: self.medium_id.clone(),
+            seq_id_1: self.seq_id_1,
+            res_name_1: self.res_name_1.clone(),
+            atom_name_1: self.atom_name_1.clone(),
+            seq_id_2: self.seq_id_2,
+            res_name_2: self.res_name_2.clone(),
+            atom_name_2: self.atom_name_2.clone(),
+            bond_type: self.bond_type,
+            d_obs_hz: self.d_obs_hz,
+            sigma_hz: self.sigma_hz,
+            d_max_hz: self.d_max_hz,
+            is_free: self.is_free,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.to_rdc_restraint().validate()
+    }
+
+    #[inline]
+    pub fn peptide_plane_seq_id(&self) -> i32 {
+        rdc_peptide_plane_id(&self.to_rdc_restraint())
+    }
+}
+
+/// Alignment medium of `(chain_id, seq_id)`-keyed RDC restraints.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DomainRdcMediumSet {
+    pub medium_id: String,
+    pub restraints: Vec<DomainRdcRestraint>,
+}
+
+impl DomainRdcMediumSet {
+    pub fn from_rdc_media(media: &[RdcMediumSet]) -> Vec<Self> {
+        media
+            .iter()
+            .map(|m| Self {
+                medium_id: m.medium_id.clone(),
+                restraints: m
+                    .restraints
+                    .iter()
+                    .map(DomainRdcRestraint::from_rdc_restraint)
+                    .collect(),
+            })
+            .collect()
+    }
+}
+
+/// Multi-chain residue lookup index keyed strictly on `(chain_id, seq_id)`, with fail-closed
+/// ambiguity detection whenever a restraint omits `chain_id` on an assembly where `seq_id` appears
+/// on multiple chains (`21.W2:P1-8`).
+#[derive(Clone, Debug, Default)]
+pub struct ChainSeqIndex {
+    pub exact: BTreeMap<(String, i32), usize>,
+    pub by_seq_only: BTreeMap<i32, Vec<(String, usize)>>,
+}
+
+impl ChainSeqIndex {
+    pub fn build(chain_ids: &[String], seq_ids: &[i32]) -> Result<Self, String> {
+        if chain_ids.len() != seq_ids.len() {
+            return Err(format!(
+                "ChainSeqIndex length mismatch: {} chain_ids vs {} seq_ids",
+                chain_ids.len(),
+                seq_ids.len()
+            ));
+        }
+        let mut exact = BTreeMap::new();
+        let mut by_seq_only: BTreeMap<i32, Vec<(String, usize)>> = BTreeMap::new();
+        for (idx, (cid_raw, &sid)) in chain_ids.iter().zip(seq_ids.iter()).enumerate() {
+            let cid = if cid_raw.trim().is_empty() {
+                "A".to_string()
+            } else {
+                cid_raw.trim().to_string()
+            };
+            if exact.insert((cid.clone(), sid), idx).is_some() {
+                return Err(format!(
+                    "duplicate residue ({cid}:{sid}) in structure model"
+                ));
+            }
+            by_seq_only.entry(sid).or_default().push((cid, idx));
+        }
+        Ok(Self { exact, by_seq_only })
+    }
+
+    pub fn from_kin(kin: &DomainLinkerKinematics) -> Result<Self, String> {
+        let cids: Vec<String> = kin.residues.iter().map(|r| r.chain_id.clone()).collect();
+        let sids: Vec<i32> = kin.residues.iter().map(|r| r.seq_id).collect();
+        Self::build(&cids, &sids)
+    }
+
+    pub fn from_pdb_chain(chain: &PdbChain) -> Result<Self, String> {
+        let cids: Vec<String> = chain
+            .residues
+            .iter()
+            .map(|r| r.chain_id.to_string())
+            .collect();
+        let sids: Vec<i32> = chain.residues.iter().map(|r| r.seq_id).collect();
+        Self::build(&cids, &sids)
+    }
+
+    /// Resolve `(chain_opt, seq_id)` -> `Result<Option<usize>, String>`.
+    /// Returns `Err` if `chain_opt` is `None`/empty AND `seq_id` exists on `>= 2` chains!
+    pub fn resolve(&self, chain_opt: Option<&str>, seq_id: i32) -> Result<Option<usize>, String> {
+        if let Some(c) = chain_opt
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != ".")
+        {
+            return Ok(self.exact.get(&(c.to_string(), seq_id)).copied());
+        }
+        match self.by_seq_only.get(&seq_id) {
+            None => Ok(None),
+            Some(list) if list.len() == 1 => Ok(Some(list[0].1)),
+            Some(list) => {
+                let chains: Vec<&str> = list.iter().map(|(c, _)| c.as_str()).collect();
+                Err(format!(
+                    "ambiguous un-chained restraint on seq_id {seq_id} across multiple chains ({}); specify explicit chain_id",
+                    chains.join(", ")
+                ))
+            }
+        }
+    }
+}
+
+/// Check whether residue `idx` belongs to a confident rigid domain (`domain_id >= 1` AND
+/// `pLDDT >= min_ordered_plddt` when `pLDDT` is present, `21.W2:P1-4`).
+#[inline]
+fn is_confident_rigid_residue(
+    idx: usize,
     partition: &PaeDomainPartition,
+    plddts_opt: Option<&[Option<f64>]>,
+    min_ordered_plddt: f64,
+) -> Option<usize> {
+    let dom = partition.domain_labels.get(idx).copied().unwrap_or(0);
+    if dom == 0 {
+        return None;
+    }
+    if !matches!(
+        partition.residue_roles.get(idx),
+        Some(ResidueDomainRole::RigidDomain { .. })
+    ) {
+        return None;
+    }
+    if let Some(pls) = plddts_opt {
+        if let Some(Some(pl)) = pls.get(idx) {
+            if *pl < min_ordered_plddt {
+                return None;
+            }
+        }
+    }
+    Some(dom)
+}
+
+/// Filter `DomainRdcMediumSet` to strictly intra-domain confident rigid-domain couplings
+/// (`dom_1 == dom_2 >= 1` and `pLDDT >= min_ordered_plddt`, `21.W2:P1-4`), returning
+/// `(filtered_media, n_excluded_flexible_or_low_plddt)`.
+pub(crate) fn filter_confident_rigid_domain_rdcs(
+    media: &[DomainRdcMediumSet],
+    cseq: &ChainSeqIndex,
+    partition: &PaeDomainPartition,
+    plddts_opt: Option<&[Option<f64>]>,
+    min_ordered_plddt: f64,
+) -> Result<(Vec<DomainRdcMediumSet>, usize), String> {
+    let mut out = Vec::with_capacity(media.len());
+    let mut excluded = 0usize;
+    for m in media {
+        let mut kept = Vec::with_capacity(m.restraints.len());
+        for r in &m.restraints {
+            r.validate()?;
+            let idx1 = cseq.resolve(r.chain_id_1.as_deref(), r.seq_id_1)?;
+            let idx2 = cseq.resolve(r.chain_id_2.as_deref(), r.seq_id_2)?;
+            let (Some(i1), Some(i2)) = (idx1, idx2) else {
+                continue;
+            };
+            let d1 = is_confident_rigid_residue(i1, partition, plddts_opt, min_ordered_plddt);
+            let d2 = is_confident_rigid_residue(i2, partition, plddts_opt, min_ordered_plddt);
+            match (d1, d2) {
+                (Some(da), Some(db)) if da == db => kept.push(r.clone()),
+                _ => {
+                    excluded += 1;
+                }
+            }
+        }
+        out.push(DomainRdcMediumSet {
+            medium_id: m.medium_id.clone(),
+            restraints: kept,
+        });
+    }
+    Ok((out, excluded))
+}
+
+/// Deterministically hold out `free_fraction` (e.g. `0.20`) of peptide planes **stratified strictly
+/// within confident rigid domains `1..=D`** (`RdcFreeStratification::ByPeptidePlane`, `0` linker/tail
+/// couplings in `RdcFree`), keyed by `(chain_id, seq_id)` while preserving $n_{\text{work}}(d, m) \ge 8$.
+#[allow(clippy::too_many_arguments)]
+pub fn partition_domain_stratified_domain_rdc_free_set(
+    media: &mut [DomainRdcMediumSet],
+    cseq: &ChainSeqIndex,
+    chain_ids: &[String],
     seq_ids: &[i32],
+    partition: &PaeDomainPartition,
+    plddts_opt: Option<&[Option<f64>]>,
+    min_ordered_plddt: f64,
     free_fraction: f64,
     seed: u64,
-) {
+) -> Result<(), String> {
     let frac = free_fraction.clamp(0.0, 0.50);
     for m in media.iter_mut() {
         for r in &mut m.restraints {
             r.is_free = false;
         }
     }
-    if frac <= 0.0 || media.is_empty() {
-        return;
+    if frac <= 0.0 || media.is_empty() || partition.domains.is_empty() {
+        return Ok(());
     }
 
-    let mut seq_to_dom: BTreeMap<i32, usize> = BTreeMap::new();
-    for (idx, &sid) in seq_ids.iter().enumerate() {
-        let dom = partition.domain_labels.get(idx).copied().unwrap_or(0);
-        seq_to_dom.insert(sid, dom);
-    }
+    type RigidPlaneKey = ((String, i32), usize);
+    let resolve_plane_key_and_dom =
+        |r: &DomainRdcRestraint| -> Result<Option<RigidPlaneKey>, String> {
+            let Some(i1) = cseq.resolve(r.chain_id_1.as_deref(), r.seq_id_1)? else {
+                return Ok(None);
+            };
+            let Some(i2) = cseq.resolve(r.chain_id_2.as_deref(), r.seq_id_2)? else {
+                return Ok(None);
+            };
+            let Some(d1) = is_confident_rigid_residue(i1, partition, plddts_opt, min_ordered_plddt)
+            else {
+                return Ok(None);
+            };
+            let Some(d2) = is_confident_rigid_residue(i2, partition, plddts_opt, min_ordered_plddt)
+            else {
+                return Ok(None);
+            };
+            if d1 != d2 {
+                return Ok(None);
+            }
+            let pid = r.peptide_plane_seq_id();
+            let p_idx = if pid == seq_ids[i1] {
+                i1
+            } else if pid == seq_ids[i2] {
+                i2
+            } else {
+                cseq.resolve(Some(&chain_ids[i1]), pid)?.unwrap_or(i1)
+            };
+            // Also verify the plane anchor residue itself (e.g. `i + 1` for CACO(i)) is in the same confident rigid domain
+            if is_confident_rigid_residue(p_idx, partition, plddts_opt, min_ordered_plddt)
+                != Some(d1)
+            {
+                return Ok(None);
+            }
+            Ok(Some(((chain_ids[p_idx].clone(), pid), d1)))
+        };
 
     let n_media = media.len();
     let max_dom = partition.domains.len();
-    let mut selected_planes: BTreeSet<i32> = BTreeSet::new();
+    let mut selected_planes: BTreeSet<(String, i32)> = BTreeSet::new();
     let mut rng = DetRng::new(seed ^ 0x5244_435F_444F_4D46);
 
-    // Stratify across buckets `0..=max_dom` (`1..=D` = each rigid domain, `0` = linker/tail)
-    for bucket in 0..=max_dom {
-        let mut plane_counts: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    // Stratify strictly across confident rigid domains `1..=max_dom` (NEVER `bucket == 0` linker/tail!)
+    for bucket in 1..=max_dom {
+        let mut plane_counts: BTreeMap<(String, i32), Vec<usize>> = BTreeMap::new();
         let mut med_totals = vec![0usize; n_media];
         let mut bucket_total = 0usize;
 
         for (m_idx, m) in media.iter().enumerate() {
             for r in &m.restraints {
-                let pid = rdc_peptide_plane_id(r);
-                let dom_p = seq_to_dom.get(&pid).copied().unwrap_or(0);
+                let Some((pkey, dom_p)) = resolve_plane_key_and_dom(r)? else {
+                    continue;
+                };
                 if dom_p != bucket {
                     continue;
                 }
                 med_totals[m_idx] += 1;
                 bucket_total += 1;
                 let entry = plane_counts
-                    .entry(pid)
+                    .entry(pkey)
                     .or_insert_with(|| vec![0usize; n_media]);
                 entry[m_idx] += 1;
             }
         }
 
-        let min_keep = if bucket >= 1 {
-            MIN_TOLMAN_DOMAIN_WORK_RDCS
-        } else {
-            0
-        };
-        if bucket_total == 0
-            || plane_counts.is_empty()
-            || (min_keep > 0 && med_totals.iter().all(|&t| t <= min_keep))
+        let min_keep = MIN_TOLMAN_DOMAIN_WORK_RDCS;
+        if bucket_total == 0 || plane_counts.is_empty() || med_totals.iter().all(|&t| t <= min_keep)
         {
             continue;
         }
 
         let target_free = ((bucket_total as f64) * frac).round().max(1.0) as usize;
-        let mut planes: Vec<i32> = plane_counts.keys().copied().collect();
+        let mut planes: Vec<(String, i32)> = plane_counts.keys().cloned().collect();
         for i in (1..planes.len()).rev() {
             let j = rng.range_usize(0, i + 1);
             planes.swap(i, j);
@@ -1264,14 +1785,14 @@ pub fn partition_domain_stratified_rdc_free_set(
         let mut med_free = vec![0usize; n_media];
         let mut cur_free = 0usize;
 
-        for pid in planes {
-            let counts = &plane_counts[&pid];
+        for pkey in planes {
+            let counts = &plane_counts[&pkey];
             let add_tot: usize = counts.iter().sum();
             if add_tot == 0 {
                 continue;
             }
             let keeps_work = counts.iter().enumerate().all(|(m_idx, &c)| {
-                if c == 0 || min_keep == 0 {
+                if c == 0 {
                     true
                 } else if med_totals[m_idx] <= min_keep {
                     false
@@ -1285,7 +1806,7 @@ pub fn partition_domain_stratified_rdc_free_set(
             let cur_err = cur_free.abs_diff(target_free);
             let nxt_err = (cur_free + add_tot).abs_diff(target_free);
             if cur_free == 0 || nxt_err <= cur_err {
-                selected_planes.insert(pid);
+                selected_planes.insert(pkey);
                 for (m_idx, &c) in counts.iter().enumerate() {
                     med_free[m_idx] += c;
                 }
@@ -1299,21 +1820,299 @@ pub fn partition_domain_stratified_rdc_free_set(
 
     for m in media.iter_mut() {
         for r in &mut m.restraints {
-            if selected_planes.contains(&rdc_peptide_plane_id(r)) {
-                r.is_free = true;
+            if let Ok(Some((pkey, _))) = resolve_plane_key_and_dom(r) {
+                if selected_planes.contains(&pkey) {
+                    r.is_free = true;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Deterministically hold out `free_fraction` (e.g. `0.20`) of peptide planes **stratified strictly
+/// within confident rigid domains `1..=D`** (`RdcFreeStratification::ByPeptidePlane`, `0` linker/tail
+/// couplings in `RdcFree`).
+pub fn partition_domain_stratified_rdc_free_set(
+    media: &mut [RdcMediumSet],
+    partition: &PaeDomainPartition,
+    seq_ids: &[i32],
+    free_fraction: f64,
+    seed: u64,
+) {
+    let chain_ids = vec!["A".to_string(); seq_ids.len()];
+    let Ok(cseq) = ChainSeqIndex::build(&chain_ids, seq_ids) else {
+        return;
+    };
+    let mut dom_media = DomainRdcMediumSet::from_rdc_media(media);
+    if partition_domain_stratified_domain_rdc_free_set(
+        &mut dom_media,
+        &cseq,
+        &chain_ids,
+        seq_ids,
+        partition,
+        None,
+        DEFAULT_MIN_ORDERED_PLDDT,
+        free_fraction,
+        seed,
+    )
+    .is_ok()
+    {
+        for (dst_m, src_m) in media.iter_mut().zip(dom_media.iter()) {
+            for (dst_r, src_r) in dst_m.restraints.iter_mut().zip(src_m.restraints.iter()) {
+                dst_r.is_free = src_r.is_free;
             }
         }
     }
 }
 
+/// Resolve an atom coordinate on `PdbResidue` matching `nmr_core::rdc::resolve_chain_rdc_atom`.
+fn resolve_pdb_residue_atom_pos(res: &PdbResidue, atom_name: &str) -> Option<Vec3> {
+    let norm = normalize_rdc_atom_name(atom_name);
+    let is_gly = res.res_name.eq_ignore_ascii_case("GLY");
+    match norm {
+        "N" => Some(res.n),
+        "H" => res.h,
+        "CA" => Some(res.ca),
+        "HA" => (!is_gly).then_some(res.ha),
+        "HA2" => is_gly.then_some(res.ha2).flatten(),
+        "HA3" => is_gly.then_some(res.ha3).flatten(),
+        "C" => Some(res.c),
+        "O" => Some(res.o),
+        "CB" => res.cb,
+        _ => None,
+    }
+}
+
+/// Chain-explicit `(chain_id, seq_id)` 5-parameter Losonczi Saupe SVD fit (`n_work >= 6`) returning
+/// `(SaupeTensorFit, Vec<(chain_id, RdcBackCalcPoint)>)`.
+pub(crate) fn fit_saupe_tensor_domain_rdc(
+    chain: &PdbChain,
+    cseq: &ChainSeqIndex,
+    medium: &DomainRdcMediumSet,
+) -> Result<(SaupeTensorFit, Vec<(String, RdcBackCalcPoint)>), String> {
+    if chain.residues.is_empty() {
+        return Err("cannot fit Saupe tensor on an empty PdbChain".to_string());
+    }
+    let mut qr = DockGivensQr5::new();
+    let mut resolved: Vec<(&DomainRdcRestraint, String, Vec3)> = Vec::new();
+    let mut n_work = 0usize;
+
+    for r in &medium.restraints {
+        r.validate()?;
+        let (Some(i1), Some(i2)) = (
+            cseq.resolve(r.chain_id_1.as_deref(), r.seq_id_1)?,
+            cseq.resolve(r.chain_id_2.as_deref(), r.seq_id_2)?,
+        ) else {
+            continue;
+        };
+        let (Some(p1), Some(p2)) = (
+            resolve_pdb_residue_atom_pos(&chain.residues[i1], &r.atom_name_1),
+            resolve_pdb_residue_atom_pos(&chain.residues[i2], &r.atom_name_2),
+        ) else {
+            continue;
+        };
+        let dv = v_sub(p2, p1);
+        let dist = v_norm(dv);
+        if !dist.is_finite() || dist < 1e-6 {
+            return Err(format!(
+                "zero/degenerate internuclear distance ({dist}) on {}:{} - {}:{}",
+                r.seq_id_1, r.atom_name_1, r.seq_id_2, r.atom_name_2
+            ));
+        }
+        let u = v_scale(dv, 1.0 / dist);
+        let ch_str = chain.residues[i1].chain_id.to_string();
+        resolved.push((r, ch_str, u));
+
+        if !r.is_free {
+            let ws = r.d_max_hz / r.sigma_hz;
+            qr.push_row(
+                [
+                    ws * (u[1] * u[1] - u[0] * u[0]),
+                    ws * (u[2] * u[2] - u[0] * u[0]),
+                    ws * (2.0 * u[0] * u[1]),
+                    ws * (2.0 * u[0] * u[2]),
+                    ws * (2.0 * u[1] * u[2]),
+                ],
+                r.d_obs_hz / r.sigma_hz,
+            );
+            n_work += 1;
+        }
+    }
+
+    if n_work < 6 {
+        return Err(format!(
+            "alignment medium '{}' resolved only {n_work} finite working RDCs; require n >= 6",
+            medium.medium_id
+        ));
+    }
+    let (s_matrix, cond) = qr.solve_saupe_with_cond().ok_or_else(|| {
+        format!(
+            "alignment medium '{}' Saupe SVD ill-conditioned (cond > {:.1e})",
+            medium.medium_id, MAX_SAUPE_SVD_COND
+        )
+    })?;
+    let s_5 = [
+        s_matrix[1][1],
+        s_matrix[2][2],
+        s_matrix[0][1],
+        s_matrix[0][2],
+        s_matrix[1][2],
+    ];
+    let (principal_s, _rot, euler_zyz_deg) = decompose_saupe_matrix(s_matrix);
+    let da_nh_hz = 0.5 * DMAX_NH_HZ * principal_s[2];
+    let rhombicity = if principal_s[2].abs() > 1e-18 {
+        ((2.0 / 3.0) * (principal_s[0] - principal_s[1]) / principal_s[2]).clamp(0.0, 2.0 / 3.0)
+    } else {
+        0.0
+    };
+
+    let mut work_norm_pairs = Vec::with_capacity(n_work);
+    let mut free_norm_pairs = Vec::new();
+    let mut work_sq_hz = 0.0_f64;
+    let mut free_sq_hz = 0.0_f64;
+    let mut points = Vec::with_capacity(resolved.len());
+
+    for (r, ch_str, u) in resolved {
+        let d_calc = calc_rdc_from_unit_vec(u, r.d_max_hz, &s_matrix);
+        let scale_nh = DMAX_NH_HZ / r.d_max_hz;
+        let obs_norm = r.d_obs_hz * scale_nh;
+        let calc_norm = d_calc * scale_nh;
+        let diff_hz = r.d_obs_hz - d_calc;
+        if r.is_free {
+            free_norm_pairs.push((obs_norm, calc_norm));
+            free_sq_hz += diff_hz * diff_hz;
+        } else {
+            work_norm_pairs.push((obs_norm, calc_norm));
+            work_sq_hz += diff_hz * diff_hz;
+        }
+        points.push((
+            ch_str,
+            RdcBackCalcPoint {
+                medium_id: medium.medium_id.clone(),
+                seq_id: r.seq_id_1,
+                res_name: r.res_name_1.clone(),
+                bond_label: r.bond_type.canonical_label().to_string(),
+                d_obs_hz: r.d_obs_hz,
+                d_calc_hz: d_calc,
+                d_obs_norm_nh_hz: obs_norm,
+                d_calc_norm_nh_hz: calc_norm,
+                sigma_hz: r.sigma_hz,
+                is_free: r.is_free,
+            },
+        ));
+    }
+
+    let n_free = free_norm_pairs.len();
+    let q_work = cornilescu_q(&work_norm_pairs);
+    let q_free = cornilescu_q(&free_norm_pairs);
+    let rmsd_work_hz = (work_sq_hz / (n_work as f64)).sqrt();
+    let rmsd_free_hz = if n_free > 0 {
+        (free_sq_hz / (n_free as f64)).sqrt()
+    } else {
+        f64::NAN
+    };
+
+    Ok((
+        SaupeTensorFit {
+            medium_id: medium.medium_id.clone(),
+            s_5,
+            s_matrix,
+            principal_s,
+            da_nh_hz,
+            rhombicity,
+            euler_zyz_deg,
+            condition_number: cond,
+            n_work,
+            n_free,
+            q_work,
+            q_free,
+            rmsd_work_hz,
+            rmsd_free_hz,
+        },
+        points,
+    ))
+}
+
+/// Perturb atom coordinates of `chain` by isotropic Gaussian structural noise `sigma_coord_a` (Å)
+/// for Tolman $\vartheta$ Monte Carlo propagation of intra-domain coordinate error (`21.W2:P1-6`).
+fn jitter_pdb_chain_coords(chain: &PdbChain, sigma_coord_a: f64, rng: &mut DetRng) -> PdbChain {
+    if sigma_coord_a <= 0.0 {
+        return chain.clone();
+    }
+    let mut jv = |p: Vec3| -> Vec3 {
+        [
+            p[0] + rng.normal(0.0, sigma_coord_a),
+            p[1] + rng.normal(0.0, sigma_coord_a),
+            p[2] + rng.normal(0.0, sigma_coord_a),
+        ]
+    };
+    let mut out = Vec::with_capacity(chain.residues.len());
+    for r in &chain.residues {
+        out.push(PdbResidue {
+            seq_id: r.seq_id,
+            res_name: r.res_name.clone(),
+            chain_id: r.chain_id,
+            n: jv(r.n),
+            h: r.h.map(&mut jv),
+            ca: jv(r.ca),
+            ha: jv(r.ha),
+            ha2: r.ha2.map(&mut jv),
+            ha3: r.ha3.map(&mut jv),
+            c: jv(r.c),
+            o: jv(r.o),
+            cb: r.cb.map(&mut jv),
+            qb: r.qb.map(&mut jv),
+        });
+    }
+    PdbChain { residues: out }
+}
+
 /// Evaluate Tolman et al. (2001) per-domain Saupe SVD & Generalized Degree of Order ($\vartheta_{d,m}$)
 /// across all rigid domains (`n_work >= 8`, `cond <= 1e8`, strictly `!is_free` working couplings)
-/// with parametric Monte Carlo uncertainty propagation.
+/// with parametric Monte Carlo uncertainty propagation including BOTH measurement $\sigma_k$ AND
+/// coordinate-noise floor `coord_noise_angstrom` + empirical intra-domain SVD excess $\chi^2_\nu$ (`21.W2:P1-6`).
 pub fn evaluate_tolman_domain_gdo(
     chain: &PdbChain,
     partition: &PaeDomainPartition,
     media: &[RdcMediumSet],
     n_mc_trials: usize,
+    seed: u64,
+) -> TolmanGdoMotionReport {
+    let Ok(cseq) = ChainSeqIndex::from_pdb_chain(chain) else {
+        return TolmanGdoMotionReport {
+            regime: DomainMotionRegime::InsufficientDomainRdcs,
+            domain_fits: Vec::new(),
+            skipped_domains: Vec::new(),
+            min_rho_gdo: f64::NAN,
+            max_abs_delta_over_theta1: f64::NAN,
+            warning_message: None,
+        };
+    };
+    let dom_media = DomainRdcMediumSet::from_rdc_media(media);
+    evaluate_tolman_domain_gdo_multi_chain(
+        chain,
+        &cseq,
+        partition,
+        None,
+        DEFAULT_MIN_ORDERED_PLDDT,
+        &dom_media,
+        n_mc_trials,
+        DEFAULT_TOLMAN_COORD_NOISE_ANGSTROM,
+        seed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_tolman_domain_gdo_multi_chain(
+    chain: &PdbChain,
+    cseq: &ChainSeqIndex,
+    partition: &PaeDomainPartition,
+    plddts_opt: Option<&[Option<f64>]>,
+    min_ordered_plddt: f64,
+    media: &[DomainRdcMediumSet],
+    n_mc_trials: usize,
+    coord_noise_angstrom: f64,
     seed: u64,
 ) -> TolmanGdoMotionReport {
     if partition.domains.is_empty() || media.is_empty() || chain.residues.is_empty() {
@@ -1328,6 +2127,7 @@ pub fn evaluate_tolman_domain_gdo(
     }
 
     let trials = n_mc_trials.clamp(32, 2_000);
+    let eff_coord_sig = coord_noise_angstrom.max(0.0);
     let mut rng = DetRng::new(seed ^ 0x544F_4C4D_414E_3031);
     let mut domain_fits: Vec<DomainMediumGdoFit> = Vec::new();
     let mut skipped_domains: Vec<(usize, String, String)> = Vec::new();
@@ -1346,17 +2146,29 @@ pub fn evaluate_tolman_domain_gdo(
         let mut med_fits: Vec<RawDomFit> = Vec::new();
 
         for dom in &partition.domains {
-            let dom_seq_set: BTreeSet<i32> = dom
+            let dom_idx_set: BTreeSet<usize> = dom
                 .residue_indices
                 .iter()
-                .filter_map(|&idx| chain.residues.get(idx).map(|r| r.seq_id))
+                .copied()
+                .filter(|&idx| {
+                    is_confident_rigid_residue(idx, partition, plddts_opt, min_ordered_plddt)
+                        == Some(dom.domain_id)
+                })
                 .collect();
-            let sub_restraints: Vec<RdcRestraint> = medium
-                .restraints
-                .iter()
-                .filter(|r| dom_seq_set.contains(&r.seq_id_1) && dom_seq_set.contains(&r.seq_id_2))
-                .cloned()
-                .collect();
+
+            let mut sub_restraints: Vec<DomainRdcRestraint> = Vec::new();
+            for r in &medium.restraints {
+                let (Ok(Some(i1)), Ok(Some(i2))) = (
+                    cseq.resolve(r.chain_id_1.as_deref(), r.seq_id_1),
+                    cseq.resolve(r.chain_id_2.as_deref(), r.seq_id_2),
+                ) else {
+                    continue;
+                };
+                if dom_idx_set.contains(&i1) && dom_idx_set.contains(&i2) {
+                    sub_restraints.push(r.clone());
+                }
+            }
+
             let sub_work_cnt = sub_restraints.iter().filter(|r| !r.is_free).count();
             if sub_work_cnt < MIN_TOLMAN_DOMAIN_WORK_RDCS {
                 skipped_domains.push((
@@ -1369,12 +2181,12 @@ pub fn evaluate_tolman_domain_gdo(
                 ));
                 continue;
             }
-            let sub_medium = RdcMediumSet {
+            let sub_medium = DomainRdcMediumSet {
                 medium_id: medium.medium_id.clone(),
                 restraints: sub_restraints,
             };
-            match fit_saupe_tensor_svd(chain, &sub_medium) {
-                Ok(fit) => {
+            match fit_saupe_tensor_domain_rdc(chain, cseq, &sub_medium) {
+                Ok((fit, pts)) => {
                     if fit.n_work < MIN_TOLMAN_DOMAIN_WORK_RDCS
                         || fit.condition_number > MAX_SAUPE_SVD_COND
                     {
@@ -1389,23 +2201,40 @@ pub fn evaluate_tolman_domain_gdo(
                         continue;
                     }
                     let theta = compute_saupe_gdo(&fit.s_matrix);
-                    // Parametric MC strictly perturbing working (`!is_free`) couplings by `sigma_hz`
+                    // Compute empirical reduced chi^2 on working couplings so forward-model / AF
+                    // coordinate error beyond nominal measurement sigma inflates MC uncertainty
+                    // instead of spuriously over-calling `DecoupledInterDomainMotion` (`21.W2:P1-6`).
+                    let mut work_chi2 = 0.0_f64;
+                    let mut work_cnt = 0usize;
+                    for (_, pt) in &pts {
+                        if !pt.is_free {
+                            let z = (pt.d_obs_hz - pt.d_calc_hz) / pt.sigma_hz.max(1e-6);
+                            work_chi2 += z * z;
+                            work_cnt += 1;
+                        }
+                    }
+                    let dof = work_cnt.saturating_sub(5).max(1) as f64;
+                    let chi2_red_scale = (work_chi2 / dof).max(1.0).sqrt();
+
                     let mut mc_thetas = Vec::with_capacity(trials);
-                    let work_only: Vec<RdcRestraint> = sub_medium
+                    let work_only: Vec<DomainRdcRestraint> = sub_medium
                         .restraints
                         .iter()
                         .filter(|r| !r.is_free)
                         .cloned()
                         .collect();
                     for _ in 0..trials {
-                        let mut trial_med = RdcMediumSet {
+                        let trial_chain = jitter_pdb_chain_coords(chain, eff_coord_sig, &mut rng);
+                        let mut trial_med = DomainRdcMediumSet {
                             medium_id: medium.medium_id.clone(),
                             restraints: work_only.clone(),
                         };
                         for r in &mut trial_med.restraints {
-                            r.d_obs_hz = rng.normal(r.d_obs_hz, r.sigma_hz);
+                            r.d_obs_hz = rng.normal(r.d_obs_hz, r.sigma_hz * chi2_red_scale);
                         }
-                        if let Ok(t_fit) = fit_saupe_tensor_svd(chain, &trial_med) {
+                        if let Ok((t_fit, _)) =
+                            fit_saupe_tensor_domain_rdc(&trial_chain, cseq, &trial_med)
+                        {
                             mc_thetas.push(compute_saupe_gdo(&t_fit.s_matrix));
                         }
                     }
@@ -1472,7 +2301,9 @@ pub fn evaluate_tolman_domain_gdo(
                 if rel_d1 > max_abs_delta_over_theta1 {
                     max_abs_delta_over_theta1 = rel_d1;
                 }
-                if rho < TOLMAN_GDO_RATIO_THRESHOLD && (1.0 - rho) > 2.0 * sig_rho {
+                if rho < TOLMAN_GDO_RATIO_THRESHOLD
+                    && (TOLMAN_GDO_RATIO_THRESHOLD - rho) > 2.0 * sig_rho
+                {
                     decoupled_triggered = true;
                 }
             }
@@ -1554,13 +2385,15 @@ fn sample_std_dev(vals: &[f64]) -> f64 {
 }
 
 // ============================================================================
-// 3. Multi-Domain PCS & PRE Restraint Types and TSV Parsers
+// 3. Multi-Domain RDC, PCS, PRE & NOE Restraint Types and TSV Parsers
 // ============================================================================
 
-/// Single pseudocontact shift (`PCS`) restraint resolved to a residue and atom name.
+/// Single pseudocontact shift (`PCS`) restraint resolved to `(chain_id, seq_id, atom_name)`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DomainPcsRestraint {
     pub tag_id: String,
+    #[serde(default)]
+    pub chain_id: Option<String>,
     pub seq_id: i32,
     pub atom_name: String,
     pub pcs_obs_ppm: f64,
@@ -1574,12 +2407,22 @@ pub struct DomainPcsTagSet {
     pub tag_id: String,
     /// Optional explicit 3D metal position `(x, y, z)` in Å in the input AF model frame.
     pub metal_pos_initial: Option<Vec3>,
+    /// Optional `chain_id` for `anchor_residue_atom` (`None` = unambiguous single-chain lookup).
+    #[serde(default)]
+    pub anchor_chain_id: Option<String>,
     /// Optional `(seq_id, atom_name)` anchor inside the host rigid domain used when `metal_pos_initial` is `None`.
     pub anchor_residue_atom: Option<(i32, String)>,
     /// Optional explicit 1-based host `domain_id` (`None` = auto-detect from `metal_pos_initial` or intra-domain PCSs).
     pub host_domain_id: Option<usize>,
     /// Optional pre-fitted `DeltaChiTensor` in the input AF model frame (`None` = fit from working intra-$d_0$ PCSs).
     pub pre_fitted_tensor: Option<DeltaChiTensor>,
+    /// When `true` (or when `metal_pos_initial` is `None` and `>= 8` working intra-domain PCSs exist),
+    /// jointly refines the 3D metal position + 5-parameter $\Delta\boldsymbol{\chi}$ via 8-parameter VarPro (`21.W2:P2-10`).
+    #[serde(default)]
+    pub refine_metal_pos: bool,
+    /// Search radius (Å) around the initial metal guess during 8-parameter VarPro (`None` = config default `8.0 Å`).
+    #[serde(default)]
+    pub metal_search_radius_a: Option<f64>,
     pub restraints: Vec<DomainPcsRestraint>,
 }
 
@@ -1600,10 +2443,12 @@ pub enum PreRestraintKind {
     },
 }
 
-/// Single `PRE` restraint between paramagnetic site `site_id` and nuclear `(seq_id, atom_name)`.
+/// Single `PRE` restraint between paramagnetic site `site_id` and nuclear `(chain_id, seq_id, atom_name)`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DomainPreRestraint {
     pub site_id: String,
+    #[serde(default)]
+    pub chain_id: Option<String>,
     pub seq_id: i32,
     pub atom_name: String,
     pub kind: PreRestraintKind,
@@ -1615,10 +2460,439 @@ pub struct DomainPreSiteSet {
     pub site_id: String,
     /// Explicit 3D paramagnetic center `(x, y, z)` in Å in the input AF model frame.
     pub site_pos_initial: Option<Vec3>,
+    /// Optional `chain_id` for `anchor_residue_atom`.
+    #[serde(default)]
+    pub anchor_chain_id: Option<String>,
     /// Optional `(seq_id, atom_name)` covalent spin-label anchor inside host domain $d_0$.
     pub anchor_residue_atom: Option<(i32, String)>,
     pub host_domain_id: Option<usize>,
+    /// Mandatory effective electron-nuclear correlation time $\tau_c$ in ns whenever `Gamma2Rate`
+    /// restraints are present (`21.W3:P0-4`; fail closed `Err` if omitted!).
+    #[serde(default)]
+    pub tau_c_ns: Option<f64>,
+    /// Mandatory $^1\text{H}$ spectrometer Larmor frequency in MHz for the dispersive Solomon term
+    /// $3\tau_c / (1 + \omega_{\text{H}}^2 \tau_c^2)$ (`21.W3:P0-4`; fail closed `Err` if omitted!).
+    #[serde(default)]
+    pub proton_mhz: Option<f64>,
+    /// Optional flexible spin-label tether allowance in Å (`None` = `0.0 Å` for `# site_pos` or
+    /// `cfg.mtsl_tether_allowance_a` for `# site_anchor`).
+    #[serde(default)]
+    pub mtsl_tether_allowance_a: Option<f64>,
     pub restraints: Vec<DomainPreRestraint>,
+}
+
+/// Deterministically hold out `free_fraction` (`0.20`) of `PCS` observations stratified by
+/// `(tag_id, rigid_domain_id)` on `(chain_id, seq_id)` residue units (`21.W2:P1-5`), preserving
+/// sufficient working intra-domain PCSs (`>= 8` when 8-param metal refinement is active, else `>= 6`)
+/// in the host domain so $\Delta\boldsymbol{\chi}$ fitting never starves.
+pub fn partition_domain_stratified_pcs_free_set(
+    pcs_tags: &mut [DomainPcsTagSet],
+    cseq: &ChainSeqIndex,
+    partition: &PaeDomainPartition,
+    plddts_opt: Option<&[Option<f64>]>,
+    min_ordered_plddt: f64,
+    free_fraction: f64,
+    seed: u64,
+) -> Result<(), String> {
+    let frac = free_fraction.clamp(0.0, 0.50);
+    for t in pcs_tags.iter_mut() {
+        for r in &mut t.restraints {
+            r.is_free = false;
+        }
+    }
+    if frac <= 0.0 || pcs_tags.is_empty() || partition.domains.is_empty() {
+        return Ok(());
+    }
+
+    let mut rng = DetRng::new(seed ^ 0x5043_535F_4652_4545);
+    let max_dom = partition.domains.len();
+
+    for tag in pcs_tags.iter_mut() {
+        let host_dom_hint = tag.host_domain_id.or_else(|| {
+            tag.anchor_residue_atom.as_ref().and_then(|(sid, _)| {
+                cseq.resolve(tag.anchor_chain_id.as_deref(), *sid)
+                    .ok()
+                    .flatten()
+                    .and_then(|idx| partition.domain_labels.get(idx).copied())
+                    .filter(|&d| d >= 1)
+            })
+        });
+        let min_intra_keep = if tag.refine_metal_pos || tag.metal_pos_initial.is_none() {
+            9usize
+        } else {
+            6usize
+        };
+
+        // Stratify strictly across confident rigid domains `1..=max_dom`
+        for dom_id in 1..=max_dom {
+            let mut res_obs_indices: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            let mut bucket_total = 0usize;
+            for (r_idx, pr) in tag.restraints.iter().enumerate() {
+                let Some(res_i) = cseq.resolve(pr.chain_id.as_deref(), pr.seq_id)? else {
+                    continue;
+                };
+                if is_confident_rigid_residue(res_i, partition, plddts_opt, min_ordered_plddt)
+                    == Some(dom_id)
+                {
+                    res_obs_indices.entry(res_i).or_default().push(r_idx);
+                    bucket_total += 1;
+                }
+            }
+            let min_keep = if host_dom_hint == Some(dom_id) || host_dom_hint.is_none() {
+                // When host_domain_id is auto-detected from coordinates later, conservatively keep >= min_intra_keep
+                if host_dom_hint == Some(dom_id) {
+                    min_intra_keep
+                } else {
+                    min_intra_keep.min(bucket_total.saturating_sub(1))
+                }
+            } else {
+                1usize
+            };
+            if bucket_total <= min_keep || res_obs_indices.len() <= 1 {
+                continue;
+            }
+            let target_free = ((bucket_total as f64) * frac).round().max(1.0) as usize;
+            let mut res_keys: Vec<usize> = res_obs_indices.keys().copied().collect();
+            for i in (1..res_keys.len()).rev() {
+                let j = rng.range_usize(0, i + 1);
+                res_keys.swap(i, j);
+            }
+            let mut cur_free = 0usize;
+            for rk in res_keys {
+                let idxs = &res_obs_indices[&rk];
+                let add = idxs.len();
+                if bucket_total - (cur_free + add) < min_keep {
+                    continue;
+                }
+                let cur_err = cur_free.abs_diff(target_free);
+                let nxt_err = (cur_free + add).abs_diff(target_free);
+                if cur_free == 0 || nxt_err <= cur_err {
+                    for &ri in idxs {
+                        tag.restraints[ri].is_free = true;
+                    }
+                    cur_free += add;
+                    if cur_free >= target_free {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_chain_seq_token(
+    raw: &str,
+    kind_label: &str,
+    line_no: usize,
+) -> Result<(Option<String>, i32), String> {
+    let t = raw.trim();
+    if let Some((ch_part, seq_part)) = t.split_once(':') {
+        let ch = ch_part.trim();
+        if ch.is_empty() {
+            return Err(format!(
+                "{kind_label} line {line_no}: empty chain prefix in '{raw}'"
+            ));
+        }
+        let sid: i32 = seq_part
+            .trim()
+            .parse()
+            .map_err(|e| format!("{kind_label} line {line_no}: invalid seq_id in '{raw}': {e}"))?;
+        Ok((Some(ch.to_string()), sid))
+    } else {
+        let sid: i32 = t
+            .parse()
+            .map_err(|e| format!("{kind_label} line {line_no}: invalid seq_id '{raw}': {e}"))?;
+        Ok((None, sid))
+    }
+}
+
+fn parse_anchor_spec(
+    rest: &str,
+    kind_label: &str,
+    line_no: usize,
+) -> Result<(Option<String>, i32, String), String> {
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err(format!(
+            "{kind_label} line {line_no}: empty anchor directive"
+        ));
+    }
+    // Supports `# metal_anchor: 66 CB`, `# metal_anchor: 66:CB`, `# metal_anchor: A:66:CB`, `# metal_anchor: A:66 CB`, or `# metal_anchor: A 66 CB`
+    if parts.len() == 1 && parts[0].contains(':') {
+        let colon_parts: Vec<&str> = parts[0].split(':').collect();
+        if colon_parts.len() == 3 {
+            let sid: i32 = colon_parts[1].trim().parse().map_err(|e| {
+                format!(
+                    "{kind_label} line {line_no}: invalid anchor seq_id in '{}': {e}",
+                    parts[0]
+                )
+            })?;
+            return Ok((
+                Some(colon_parts[0].trim().to_string()),
+                sid,
+                normalize_rdc_atom_name(colon_parts[2]).to_string(),
+            ));
+        } else if colon_parts.len() == 2 && colon_parts[0].trim().parse::<i32>().is_ok() {
+            let sid: i32 = colon_parts[0].trim().parse().map_err(|e| {
+                format!(
+                    "{kind_label} line {line_no}: invalid anchor seq_id in '{}': {e}",
+                    parts[0]
+                )
+            })?;
+            return Ok((
+                None,
+                sid,
+                normalize_rdc_atom_name(colon_parts[1]).to_string(),
+            ));
+        }
+    }
+    if parts.len() >= 2 && !parts[0].contains(':') && parts[0].parse::<i32>().is_err() {
+        let ch = Some(parts[0].trim().to_string());
+        let sid: i32 = parts[1].parse().map_err(|e| {
+            format!(
+                "{kind_label} line {line_no}: invalid anchor seq_id '{}': {e}",
+                parts[1]
+            )
+        })?;
+        let aname = parts
+            .get(2)
+            .map(|s| normalize_rdc_atom_name(s).to_string())
+            .unwrap_or_else(|| "CB".to_string());
+        Ok((ch, sid, aname))
+    } else {
+        let (ch, sid) = parse_chain_seq_token(parts[0], kind_label, line_no)?;
+        let aname = parts
+            .get(1)
+            .map(|s| normalize_rdc_atom_name(s).to_string())
+            .unwrap_or_else(|| "CB".to_string());
+        Ok((ch, sid, aname))
+    }
+}
+
+/// Read chain-aware multi-domain `RDC` restraints from an ASCII/UTF-8 TSV file (`<= 64 MiB`).
+pub fn read_domain_rdc_tsv(path: impl AsRef<Path>) -> Result<Vec<DomainRdcMediumSet>, String> {
+    let p = path.as_ref();
+    let meta =
+        fs::metadata(p).map_err(|e| format!("failed to stat RDC TSV '{}': {e}", p.display()))?;
+    if meta.len() > MAX_DOMAIN_RESTRAINT_BYTES as u64 {
+        return Err(format!(
+            "RDC TSV '{}' exceeds MAX_DOMAIN_RESTRAINT_BYTES ({} B)",
+            p.display(),
+            MAX_DOMAIN_RESTRAINT_BYTES
+        ));
+    }
+    let bytes =
+        fs::read(p).map_err(|e| format!("failed to read RDC TSV '{}': {e}", p.display()))?;
+    if bytes.len() > MAX_DOMAIN_RESTRAINT_BYTES || bytes.contains(&0u8) {
+        return Err(format!(
+            "RDC TSV '{}' exceeds size cap or contains NUL bytes",
+            p.display()
+        ));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|e| format!("invalid UTF-8 in RDC TSV '{}': {e}", p.display()))?;
+    parse_domain_rdc_tsv_str(text)
+}
+
+/// Parse single-chain or multi-chain `RDC` TSV text into `Vec<DomainRdcMediumSet>`.
+///
+/// Accepts standard 11/12-column `nmr_core::rdc` TSVs (including `A:12` `chain:seq_id` tokens)
+/// as well as explicit `chain_id` / `(chain_id_1, chain_id_2)` columns.
+pub fn parse_domain_rdc_tsv_str(text: &str) -> Result<Vec<DomainRdcMediumSet>, String> {
+    if text.len() > MAX_DOMAIN_RESTRAINT_BYTES || text.as_bytes().contains(&0u8) {
+        return Err("RDC TSV text exceeds size cap or contains NUL bytes".to_string());
+    }
+    let mut sign_conv = crate::rdc::RdcSignConvention::SignNormalized;
+    let mut header_cols: Option<Vec<String>> = None;
+    let mut media_order: Vec<String> = Vec::new();
+    let mut media_rows: BTreeMap<String, Vec<DomainRdcRestraint>> = BTreeMap::new();
+
+    for (line_idx, raw_line) in text.lines().enumerate() {
+        let line_no = line_idx + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(comment) = trimmed.strip_prefix('#') {
+            if let Some((_, rest)) = parse_directive_key_and_tag(comment.trim(), "sign_convention")
+            {
+                sign_conv = crate::rdc::RdcSignConvention::parse_label(rest)?;
+            }
+            continue;
+        }
+        let cols: Vec<&str> = if trimmed.contains('\t') {
+            trimmed.split('\t').map(str::trim).collect()
+        } else {
+            trimmed.split_whitespace().collect()
+        };
+        let low0 = cols[0].to_ascii_lowercase();
+        if matches!(
+            low0.as_str(),
+            "medium_id" | "medium" | "chain_id" | "chain_1" | "seq_id_1"
+        ) && cols
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("d_obs_hz") || c.eq_ignore_ascii_case("rdc_hz"))
+        {
+            header_cols = Some(cols.iter().map(|c| c.to_ascii_lowercase()).collect());
+            continue;
+        }
+
+        let find_col = |names: &[&str]| -> Option<usize> {
+            let hc = header_cols.as_ref()?;
+            hc.iter().position(|c| names.iter().any(|n| c == *n))
+        };
+
+        let (
+            med_id,
+            ch1_col,
+            s1_raw,
+            rn1,
+            at1,
+            ch2_col,
+            s2_raw,
+            rn2,
+            at2,
+            bt_opt,
+            d_obs_raw,
+            sig_opt,
+            dmax_opt,
+            free_opt,
+        ) = if header_cols.is_some() {
+            let m_i = find_col(&["medium_id", "medium"]);
+            let c1_i = find_col(&["chain_id_1", "chain_1", "chain_id", "chain"]);
+            let c2_i = find_col(&["chain_id_2", "chain_2"]).or(c1_i);
+            let s1_i = find_col(&["seq_id_1", "resid_1", "seq_1"])
+                .ok_or_else(|| format!("RDC line {line_no}: missing seq_id_1 column"))?;
+            let r1_i = find_col(&["res_name_1", "res_1"]);
+            let a1_i = find_col(&["atom_name_1", "atom_1"])
+                .ok_or_else(|| format!("RDC line {line_no}: missing atom_name_1 column"))?;
+            let s2_i = find_col(&["seq_id_2", "resid_2", "seq_2"]).unwrap_or(s1_i);
+            let r2_i = find_col(&["res_name_2", "res_2"]).or(r1_i);
+            let a2_i = find_col(&["atom_name_2", "atom_2"])
+                .ok_or_else(|| format!("RDC line {line_no}: missing atom_name_2 column"))?;
+            let bt_i = find_col(&["bond_type", "type"]);
+            let do_i = find_col(&["d_obs_hz", "rdc_hz", "d_hz"])
+                .ok_or_else(|| format!("RDC line {line_no}: missing d_obs_hz column"))?;
+            let sg_i = find_col(&["sigma_hz", "err_hz", "sigma"]);
+            let dm_i = find_col(&["d_max_hz", "dmax_hz", "dmax"]);
+            let fr_i = find_col(&["is_free", "free"]);
+
+            let get_c = |idx: usize| -> Result<&str, String> {
+                cols.get(idx).copied().ok_or_else(|| {
+                    format!(
+                        "RDC line {line_no}: row has fewer columns ({}) than header",
+                        cols.len()
+                    )
+                })
+            };
+            (
+                m_i.and_then(|i| cols.get(i).copied()).unwrap_or("medium_1"),
+                c1_i.and_then(|i| cols.get(i).copied()),
+                get_c(s1_i)?,
+                r1_i.and_then(|i| cols.get(i).copied()).unwrap_or("."),
+                get_c(a1_i)?,
+                c2_i.and_then(|i| cols.get(i).copied()),
+                get_c(s2_i)?,
+                r2_i.and_then(|i| cols.get(i).copied()).unwrap_or("."),
+                get_c(a2_i)?,
+                bt_i.and_then(|i| cols.get(i).copied()),
+                get_c(do_i)?,
+                sg_i.and_then(|i| cols.get(i).copied()),
+                dm_i.and_then(|i| cols.get(i).copied()),
+                fr_i.and_then(|i| cols.get(i).copied()),
+            )
+        } else if cols.len() >= 11 && parse_chain_seq_token(cols[1], "RDC", line_no).is_ok() {
+            // Canonical 11/12-column schema: medium_id seq_1 res_1 atom_1 seq_2 res_2 atom_2 bond_type d_obs sigma d_max [is_free]
+            (
+                cols[0],
+                None,
+                cols[1],
+                cols[2],
+                cols[3],
+                None,
+                cols[4],
+                cols[5],
+                cols[6],
+                Some(cols[7]),
+                cols[8],
+                Some(cols[9]),
+                Some(cols[10]),
+                cols.get(11).copied(),
+            )
+        } else {
+            // Delegate non-standard headerless single-chain schemas to `nmr_core::rdc::parse_rdc_tsv_str`
+            let single = crate::rdc::parse_rdc_tsv_str_with_convention(text, sign_conv)?;
+            return Ok(DomainRdcMediumSet::from_rdc_media(&single));
+        };
+
+        let (tok_c1, seq_id_1) = parse_chain_seq_token(s1_raw, "RDC", line_no)?;
+        let (tok_c2, seq_id_2) = parse_chain_seq_token(s2_raw, "RDC", line_no)?;
+        let chain_id_1 = tok_c1.or_else(|| {
+            ch1_col
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != ".")
+                .map(str::to_string)
+        });
+        let chain_id_2 = tok_c2
+            .or_else(|| {
+                ch2_col
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != ".")
+                    .map(str::to_string)
+            })
+            .or_else(|| chain_id_1.clone());
+
+        let atom_name_1 = normalize_rdc_atom_name(at1).to_string();
+        let atom_name_2 = normalize_rdc_atom_name(at2).to_string();
+        let bond_type = match bt_opt.filter(|s| !s.is_empty() && *s != ".") {
+            Some(bt_s) => RdcBondType::parse_label(bt_s)?,
+            None => RdcBondType::infer_from_atoms(seq_id_1, &atom_name_1, seq_id_2, &atom_name_2)?,
+        };
+        let d_obs_hz = parse_finite_f64(d_obs_raw, "d_obs_hz", line_no)?;
+        let sigma_hz = parse_pos_sigma_opt(sig_opt, bond_type.default_sigma_hz(), line_no)?;
+        let d_max_hz = match dmax_opt.filter(|s| !s.is_empty() && *s != ".") {
+            Some(dm_s) => parse_finite_f64(dm_s, "d_max_hz", line_no)?,
+            None => bond_type.signed_d_max_hz(sign_conv),
+        };
+        let is_free = parse_free_flag_opt(free_opt);
+
+        let r_item = DomainRdcRestraint {
+            medium_id: med_id.to_string(),
+            chain_id_1,
+            seq_id_1,
+            res_name_1: rn1.to_string(),
+            atom_name_1,
+            chain_id_2,
+            seq_id_2,
+            res_name_2: rn2.to_string(),
+            atom_name_2,
+            bond_type,
+            d_obs_hz,
+            sigma_hz,
+            d_max_hz,
+            is_free,
+        };
+        r_item.validate()?;
+        if !media_rows.contains_key(med_id) {
+            media_order.push(med_id.to_string());
+        }
+        media_rows
+            .entry(med_id.to_string())
+            .or_default()
+            .push(r_item);
+    }
+
+    if media_order.is_empty() {
+        return Err("RDC TSV contains zero restraints".to_string());
+    }
+    Ok(media_order
+        .into_iter()
+        .map(|mid| DomainRdcMediumSet {
+            restraints: media_rows.remove(&mid).unwrap_or_default(),
+            medium_id: mid,
+        })
+        .collect())
 }
 
 /// Read multi-domain `PCS` restraints from an ASCII/UTF-8 TSV file (`<= 64 MiB`).
@@ -1651,12 +2925,15 @@ pub fn read_domain_pcs_tsv(path: impl AsRef<Path>) -> Result<Vec<DomainPcsTagSet
 /// Header directives:
 /// - `# metal_pos: <x> <y> <z>` or `# metal_pos[<tag_id>]: <x> <y> <z>`
 /// - `# metal_domain: <domain_id>` or `# metal_domain[<tag_id>]: <domain_id>`
-/// - `# metal_anchor: <seq_id> [atom_name]`
+/// - `# metal_anchor: [chain_id] <seq_id> [atom_name]` (or `A:66 CB`)
+/// - `# refine_metal_pos: true | false`
+/// - `# metal_search_radius_a: <f64>`
 ///
 /// Supported row schemas:
-/// - `seq_id  pcs_ppm  [sigma_ppm]  [is_free]`
+/// - `seq_id  pcs_ppm  [sigma_ppm]  [is_free]` (with `seq_id` or `chain:seq_id`)
 /// - `seq_id  atom_name  pcs_ppm  [sigma_ppm]  [is_free]`
-/// - `tag_id  seq_id  atom_name  pcs_ppm  [sigma_ppm]  [is_free]` (when header starts with `tag_id`)
+/// - `chain_id  seq_id  atom_name  pcs_ppm  [sigma_ppm]  [is_free]`
+/// - `tag_id  [chain_id]  seq_id  atom_name  pcs_ppm  [sigma_ppm]  [is_free]`
 pub fn parse_domain_pcs_tsv_str(text: &str) -> Result<Vec<DomainPcsTagSet>, String> {
     if text.len() > MAX_DOMAIN_RESTRAINT_BYTES || text.as_bytes().contains(&0u8) {
         return Err("PCS TSV text exceeds size cap or contains NUL bytes".to_string());
@@ -1664,8 +2941,11 @@ pub fn parse_domain_pcs_tsv_str(text: &str) -> Result<Vec<DomainPcsTagSet>, Stri
 
     let mut metal_pos_map: BTreeMap<String, Vec3> = BTreeMap::new();
     let mut host_dom_map: BTreeMap<String, usize> = BTreeMap::new();
-    let mut anchor_map: BTreeMap<String, (i32, String)> = BTreeMap::new();
+    let mut anchor_map: BTreeMap<String, (Option<String>, i32, String)> = BTreeMap::new();
+    let mut refine_map: BTreeMap<String, bool> = BTreeMap::new();
+    let mut radius_map: BTreeMap<String, f64> = BTreeMap::new();
     let mut has_tag_col = false;
+    let mut has_chain_col = false;
     let mut tag_order: Vec<String> = Vec::new();
     let mut tag_rows: BTreeMap<String, Vec<DomainPcsRestraint>> = BTreeMap::new();
 
@@ -1703,21 +2983,20 @@ pub fn parse_domain_pcs_tsv_str(text: &str) -> Result<Vec<DomainPcsTagSet>, Stri
                 }
                 host_dom_map.insert(k_tag, d_id);
             } else if let Some((k_tag, rest)) = parse_directive_key_and_tag(c, "metal_anchor") {
-                let parts: Vec<&str> = rest.split_whitespace().collect();
-                if parts.is_empty() {
-                    return Err(format!("PCS line {line_no}: empty # metal_anchor"));
+                let (ach, sid, aname) = parse_anchor_spec(rest, "PCS", line_no)?;
+                anchor_map.insert(k_tag, (ach, sid, aname));
+            } else if let Some((k_tag, rest)) = parse_directive_key_and_tag(c, "refine_metal_pos") {
+                refine_map.insert(k_tag, parse_free_flag_opt(Some(rest)));
+            } else if let Some((k_tag, rest)) =
+                parse_directive_key_and_tag(c, "metal_search_radius_a")
+            {
+                let rv = parse_finite_f64(rest, "metal_search_radius_a", line_no)?;
+                if rv < 0.0 {
+                    return Err(format!(
+                        "PCS line {line_no}: # metal_search_radius_a ({rv}) must be >= 0"
+                    ));
                 }
-                let sid: i32 = parts[0].parse().map_err(|e| {
-                    format!(
-                        "PCS line {line_no}: invalid anchor seq_id '{}': {e}",
-                        parts[0]
-                    )
-                })?;
-                let aname = parts
-                    .get(1)
-                    .map(|s| normalize_rdc_atom_name(s).to_string())
-                    .unwrap_or_else(|| "CB".to_string());
-                anchor_map.insert(k_tag, (sid, aname));
+                radius_map.insert(k_tag, rv);
             }
             continue;
         }
@@ -1730,13 +3009,20 @@ pub fn parse_domain_pcs_tsv_str(text: &str) -> Result<Vec<DomainPcsTagSet>, Stri
         let low0 = cols[0].to_ascii_lowercase();
         if matches!(low0.as_str(), "tag_id" | "site_id") {
             has_tag_col = true;
+            has_chain_col = cols
+                .get(1)
+                .is_some_and(|c| matches!(c.to_ascii_lowercase().as_str(), "chain_id" | "chain"));
+            continue;
+        }
+        if matches!(low0.as_str(), "chain_id" | "chain") {
+            has_chain_col = true;
             continue;
         }
         if matches!(low0.as_str(), "seq_id" | "resid" | "residue" | "seq") {
             continue;
         }
 
-        let (tag_id, rem): (String, &[&str]) = if has_tag_col {
+        let (tag_id, rem0): (String, &[&str]) = if has_tag_col {
             if cols.len() < 4 {
                 return Err(format!(
                     "PCS line {line_no}: expected at least 4 columns with tag_id, got {}",
@@ -1748,14 +3034,25 @@ pub fn parse_domain_pcs_tsv_str(text: &str) -> Result<Vec<DomainPcsTagSet>, Stri
             ("tag1".to_string(), &cols[..])
         };
 
+        let (col_chain_opt, rem): (Option<String>, &[&str]) = if has_chain_col {
+            if rem0.len() < 3 {
+                return Err(format!(
+                    "PCS line {line_no}: expected chain_id, seq_id, and pcs_ppm"
+                ));
+            }
+            let ch = Some(rem0[0].to_string()).filter(|s| !s.is_empty() && s != ".");
+            (ch, &rem0[1..])
+        } else {
+            (None, rem0)
+        };
+
         if rem.len() < 2 {
             return Err(format!(
                 "PCS line {line_no}: expected at least seq_id and pcs_ppm"
             ));
         }
-        let seq_id: i32 = rem[0]
-            .parse()
-            .map_err(|e| format!("PCS line {line_no}: invalid seq_id '{}': {e}", rem[0]))?;
+        let (tok_chain, seq_id) = parse_chain_seq_token(rem[0], "PCS", line_no)?;
+        let chain_id = tok_chain.or(col_chain_opt);
 
         let (atom_name, pcs_obs_ppm, sigma_ppm, is_free) = if rem[1].parse::<f64>().is_ok() {
             let pcs = parse_finite_f64(rem[1], "pcs_ppm", line_no)?;
@@ -1788,6 +3085,7 @@ pub fn parse_domain_pcs_tsv_str(text: &str) -> Result<Vec<DomainPcsTagSet>, Stri
             .or_default()
             .push(DomainPcsRestraint {
                 tag_id,
+                chain_id,
                 seq_id,
                 atom_name,
                 pcs_obs_ppm,
@@ -1811,13 +3109,26 @@ pub fn parse_domain_pcs_tsv_str(text: &str) -> Result<Vec<DomainPcsTagSet>, Stri
             .get(&tid)
             .or_else(|| host_dom_map.get(""))
             .copied();
-        let anchor_residue_atom = anchor_map.get(&tid).or_else(|| anchor_map.get("")).cloned();
+        let anch_full = anchor_map.get(&tid).or_else(|| anchor_map.get("")).cloned();
+        let (anchor_chain_id, anchor_residue_atom) = match anch_full {
+            Some((ach, sid, an)) => (ach, Some((sid, an))),
+            None => (None, None),
+        };
+        let refine_metal_pos = refine_map
+            .get(&tid)
+            .or_else(|| refine_map.get(""))
+            .copied()
+            .unwrap_or(false);
+        let metal_search_radius_a = radius_map.get(&tid).or_else(|| radius_map.get("")).copied();
         out.push(DomainPcsTagSet {
             tag_id: tid,
             metal_pos_initial,
+            anchor_chain_id,
             anchor_residue_atom,
             host_domain_id,
             pre_fitted_tensor: None,
+            refine_metal_pos,
+            metal_search_radius_a,
             restraints,
         });
     }
@@ -1826,6 +3137,17 @@ pub fn parse_domain_pcs_tsv_str(text: &str) -> Result<Vec<DomainPcsTagSet>, Stri
 
 /// Read multi-domain `PRE` restraints from an ASCII/UTF-8 TSV file (`<= 64 MiB`).
 pub fn read_domain_pre_tsv(path: impl AsRef<Path>) -> Result<Vec<DomainPreSiteSet>, String> {
+    read_domain_pre_tsv_with_defaults(path, None, None, None)
+}
+
+/// Read multi-domain `PRE` restraints with optional CLI-supplied `tau_c_ns`, `proton_mhz`, and
+/// `mtsl_tether_allowance_a` defaults.
+pub fn read_domain_pre_tsv_with_defaults(
+    path: impl AsRef<Path>,
+    cli_tau_c_ns: Option<f64>,
+    cli_proton_mhz: Option<f64>,
+    cli_mtsl_tether_a: Option<f64>,
+) -> Result<Vec<DomainPreSiteSet>, String> {
     let p = path.as_ref();
     let meta =
         fs::metadata(p).map_err(|e| format!("failed to stat PRE TSV '{}': {e}", p.display()))?;
@@ -1846,28 +3168,50 @@ pub fn read_domain_pre_tsv(path: impl AsRef<Path>) -> Result<Vec<DomainPreSiteSe
     }
     let text = std::str::from_utf8(&bytes)
         .map_err(|e| format!("invalid UTF-8 in PRE TSV '{}': {e}", p.display()))?;
-    parse_domain_pre_tsv_str(text)
+    parse_domain_pre_tsv_str_with_defaults(text, cli_tau_c_ns, cli_proton_mhz, cli_mtsl_tether_a)
 }
 
-/// Parse multi-domain Solomon `PRE` restraints from TSV text.
+/// Parse multi-domain Solomon `PRE` restraints from TSV text (`fail closed` if `tau_c_ns` or
+/// `proton_mhz` is omitted for `gamma2` rates, `21.W3:P0-4`).
 ///
 /// Header directives:
 /// - `# site_pos: <x> <y> <z>` or `# site_pos[<site_id>]: <x> <y> <z>`
-/// - `# site_anchor: <seq_id> [atom_name]`
+/// - `# site_anchor: [chain_id] <seq_id> [atom_name]` (or `A:68 CB`)
 /// - `# site_domain: <domain_id>`
-/// - `# k_pre: <f64>` (default `1.23e7` $\text{\AA}^6\text{ s}^{-1}$)
+/// - `# tau_c_ns: <f64>` (**REQUIRED** for `gamma2` mode unless passed via CLI `--pre-tau-c-ns`)
+/// - `# proton_mhz: <f64>` (**REQUIRED** for `gamma2` mode unless passed via CLI `--pre-proton-mhz`)
+/// - `# spin_s: <f64>` (optional electronic spin $S$, default `0.5` for nitroxide MTSL)
+/// - `# g_factor: <f64>` (optional electronic $g$, default CODATA `g_e = 2.0023193`)
+/// - `# mtsl_tether_allowance_a: <f64>` (optional flexible-linker allowance in Å, e.g. `6.0`)
 /// - `# mode: gamma2 | bounds`
 pub fn parse_domain_pre_tsv_str(text: &str) -> Result<Vec<DomainPreSiteSet>, String> {
+    parse_domain_pre_tsv_str_with_defaults(text, None, None, None)
+}
+
+/// Parse multi-domain Solomon `PRE` restraints with optional CLI-level `tau_c_ns`, `proton_mhz`,
+/// and `mtsl_tether_allowance_a` fallbacks (`0` silent `1.23e7` magic default!).
+pub fn parse_domain_pre_tsv_str_with_defaults(
+    text: &str,
+    cli_tau_c_ns: Option<f64>,
+    cli_proton_mhz: Option<f64>,
+    cli_mtsl_tether_a: Option<f64>,
+) -> Result<Vec<DomainPreSiteSet>, String> {
     if text.len() > MAX_DOMAIN_RESTRAINT_BYTES || text.as_bytes().contains(&0u8) {
         return Err("PRE TSV text exceeds size cap or contains NUL bytes".to_string());
     }
 
     let mut site_pos_map: BTreeMap<String, Vec3> = BTreeMap::new();
-    let mut site_anchor_map: BTreeMap<String, (i32, String)> = BTreeMap::new();
+    let mut site_anchor_map: BTreeMap<String, (Option<String>, i32, String)> = BTreeMap::new();
     let mut site_dom_map: BTreeMap<String, usize> = BTreeMap::new();
-    let mut default_k_pre = 1.23e7_f64;
+    let mut tau_c_map: BTreeMap<String, f64> = BTreeMap::new();
+    let mut mhz_map: BTreeMap<String, f64> = BTreeMap::new();
+    let mut tether_map: BTreeMap<String, f64> = BTreeMap::new();
+    let mut spin_s_val = 0.5_f64;
+    let mut g_factor_val = CODATA_ELECTRON_G_FACTOR;
+    let mut saw_legacy_k_pre = false;
     let mut bounds_mode = false;
     let mut has_site_col = false;
+    let mut has_chain_col = false;
     let mut site_order: Vec<String> = Vec::new();
     let mut site_rows: BTreeMap<String, Vec<DomainPreRestraint>> = BTreeMap::new();
 
@@ -1894,21 +3238,8 @@ pub fn parse_domain_pre_tsv_str(text: &str) -> Result<Vec<DomainPreSiteSet>, Str
                 let z = parse_finite_f64(nums[2], "site_z", line_no)?;
                 site_pos_map.insert(k_site, [x, y, z]);
             } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "site_anchor") {
-                let parts: Vec<&str> = rest.split_whitespace().collect();
-                if parts.is_empty() {
-                    return Err(format!("PRE line {line_no}: empty # site_anchor"));
-                }
-                let sid: i32 = parts[0].parse().map_err(|e| {
-                    format!(
-                        "PRE line {line_no}: invalid anchor seq_id '{}': {e}",
-                        parts[0]
-                    )
-                })?;
-                let aname = parts
-                    .get(1)
-                    .map(|s| normalize_rdc_atom_name(s).to_string())
-                    .unwrap_or_else(|| "CB".to_string());
-                site_anchor_map.insert(k_site, (sid, aname));
+                let (ach, sid, aname) = parse_anchor_spec(rest, "PRE", line_no)?;
+                site_anchor_map.insert(k_site, (ach, sid, aname));
             } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "site_domain") {
                 let d_id: usize = rest.trim().parse().map_err(|e| {
                     format!("PRE line {line_no}: invalid # site_domain '{rest}': {e}")
@@ -1919,12 +3250,48 @@ pub fn parse_domain_pre_tsv_str(text: &str) -> Result<Vec<DomainPreSiteSet>, Str
                     ));
                 }
                 site_dom_map.insert(k_site, d_id);
-            } else if let Some((_, rest)) = parse_directive_key_and_tag(c, "k_pre") {
-                let kv = parse_finite_f64(rest.trim(), "k_pre", line_no)?;
-                if kv <= 0.0 {
-                    return Err(format!("PRE line {line_no}: # k_pre must be > 0"));
+            } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "tau_c_ns")
+                .or_else(|| parse_directive_key_and_tag(c, "tau_c"))
+            {
+                let tc = parse_finite_f64(rest.trim(), "tau_c_ns", line_no)?;
+                if tc <= 0.0 {
+                    return Err(format!("PRE line {line_no}: # tau_c_ns ({tc}) must be > 0"));
                 }
-                default_k_pre = kv;
+                tau_c_map.insert(k_site, tc);
+            } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "proton_mhz")
+                .or_else(|| parse_directive_key_and_tag(c, "field_mhz"))
+                .or_else(|| parse_directive_key_and_tag(c, "omega_h_mhz"))
+            {
+                let mhz = parse_finite_f64(rest.trim(), "proton_mhz", line_no)?;
+                if mhz <= 0.0 {
+                    return Err(format!(
+                        "PRE line {line_no}: # proton_mhz ({mhz}) must be > 0"
+                    ));
+                }
+                mhz_map.insert(k_site, mhz);
+            } else if let Some((_, rest)) = parse_directive_key_and_tag(c, "spin_s") {
+                spin_s_val = parse_finite_f64(rest.trim(), "spin_s", line_no)?;
+                if spin_s_val <= 0.0 {
+                    return Err(format!("PRE line {line_no}: # spin_s must be > 0"));
+                }
+            } else if let Some((_, rest)) = parse_directive_key_and_tag(c, "g_factor") {
+                g_factor_val = parse_finite_f64(rest.trim(), "g_factor", line_no)?;
+                if g_factor_val <= 0.0 {
+                    return Err(format!("PRE line {line_no}: # g_factor must be > 0"));
+                }
+            } else if let Some((k_site, rest)) =
+                parse_directive_key_and_tag(c, "mtsl_tether_allowance_a")
+                    .or_else(|| parse_directive_key_and_tag(c, "tether_allowance_a"))
+            {
+                let tv = parse_finite_f64(rest.trim(), "mtsl_tether_allowance_a", line_no)?;
+                if tv < 0.0 {
+                    return Err(format!(
+                        "PRE line {line_no}: # mtsl_tether_allowance_a ({tv}) must be >= 0"
+                    ));
+                }
+                tether_map.insert(k_site, tv);
+            } else if parse_directive_key_and_tag(c, "k_pre").is_some() {
+                saw_legacy_k_pre = true;
             } else if let Some((_, rest)) = parse_directive_key_and_tag(c, "mode") {
                 bounds_mode = rest.trim().eq_ignore_ascii_case("bounds");
             }
@@ -1939,6 +3306,16 @@ pub fn parse_domain_pre_tsv_str(text: &str) -> Result<Vec<DomainPreSiteSet>, Str
         let low0 = cols[0].to_ascii_lowercase();
         if matches!(low0.as_str(), "site_id" | "tag_id") {
             has_site_col = true;
+            has_chain_col = cols
+                .get(1)
+                .is_some_and(|c| matches!(c.to_ascii_lowercase().as_str(), "chain_id" | "chain"));
+            if cols.iter().any(|c| c.eq_ignore_ascii_case("lower_a")) {
+                bounds_mode = true;
+            }
+            continue;
+        }
+        if matches!(low0.as_str(), "chain_id" | "chain") {
+            has_chain_col = true;
             if cols.iter().any(|c| c.eq_ignore_ascii_case("lower_a")) {
                 bounds_mode = true;
             }
@@ -1951,7 +3328,7 @@ pub fn parse_domain_pre_tsv_str(text: &str) -> Result<Vec<DomainPreSiteSet>, Str
             continue;
         }
 
-        let (site_id, rem): (String, &[&str]) = if has_site_col {
+        let (site_id, rem0): (String, &[&str]) = if has_site_col {
             if cols.len() < 5 {
                 return Err(format!(
                     "PRE line {line_no}: expected at least 5 columns with site_id, got {}",
@@ -1963,15 +3340,37 @@ pub fn parse_domain_pre_tsv_str(text: &str) -> Result<Vec<DomainPreSiteSet>, Str
             ("pre1".to_string(), &cols[..])
         };
 
+        let (col_chain_opt, rem): (Option<String>, &[&str]) = if has_chain_col {
+            if rem0.len() < 5 {
+                return Err(format!(
+                    "PRE line {line_no}: expected chain_id, seq_id, atom_name, and 2 numeric columns"
+                ));
+            }
+            let ch = Some(rem0[0].to_string()).filter(|s| !s.is_empty() && s != ".");
+            (ch, &rem0[1..])
+        } else {
+            (None, rem0)
+        };
+
         if rem.len() < 4 {
             return Err(format!(
                 "PRE line {line_no}: expected seq_id, atom_name, and 2 numeric columns"
             ));
         }
-        let seq_id: i32 = rem[0]
-            .parse()
-            .map_err(|e| format!("PRE line {line_no}: invalid seq_id '{}': {e}", rem[0]))?;
+        let (tok_chain, seq_id) = parse_chain_seq_token(rem[0], "PRE", line_no)?;
+        let chain_id = tok_chain.or(col_chain_opt);
         let atom_name = normalize_rdc_atom_name(rem[1]).to_string();
+
+        let eff_tau_c = tau_c_map
+            .get(&site_id)
+            .or_else(|| tau_c_map.get(""))
+            .copied()
+            .or(cli_tau_c_ns);
+        let eff_mhz = mhz_map
+            .get(&site_id)
+            .or_else(|| mhz_map.get(""))
+            .copied()
+            .or(cli_proton_mhz);
 
         let kind = if bounds_mode {
             let lower_a = parse_finite_f64(rem[2], "lower_a", line_no)?;
@@ -1995,16 +3394,24 @@ pub fn parse_domain_pre_tsv_str(text: &str) -> Result<Vec<DomainPreSiteSet>, Str
                 ));
             }
             let sigma_s1 = parse_pos_sigma_opt(rem.get(3).copied(), 2.0, line_no)?;
-            let k_pre_a6_s1 = match rem.get(4).copied().filter(|s| !s.is_empty() && *s != ".") {
-                Some(raw_k) => {
-                    let kv = parse_finite_f64(raw_k, "k_pre_a6_s1", line_no)?;
-                    if kv <= 0.0 {
-                        return Err(format!("PRE line {line_no}: k_pre_a6_s1 must be > 0"));
-                    }
-                    kv
+            let tau_c_ns = eff_tau_c.ok_or_else(|| {
+                if saw_legacy_k_pre {
+                    format!(
+                        "PRE line {line_no}: `# k_pre` without explicit rotational correlation time is retired; specify mandatory `# tau_c_ns: <ns>` and `# proton_mhz: <MHz>` (or `--pre-tau-c-ns` / `--pre-proton-mhz`)"
+                    )
+                } else {
+                    format!(
+                        "PRE line {line_no}: Solomon Gamma2 PRE restraints require mandatory `# tau_c_ns: <ns>` (or `--pre-tau-c-ns <ns>`) and `# proton_mhz: <MHz>` (or `--pre-proton-mhz <MHz>`)"
+                    )
                 }
-                None => default_k_pre,
-            };
+            })?;
+            let proton_mhz = eff_mhz.ok_or_else(|| {
+                format!(
+                    "PRE line {line_no}: Solomon Gamma2 PRE restraints require mandatory `# proton_mhz: <MHz>` (or `--pre-proton-mhz <MHz>`) alongside tau_c_ns={tau_c_ns}"
+                )
+            })?;
+            let k_pre_a6_s1 =
+                compute_solomon_k_pre_a6_s1(tau_c_ns, proton_mhz, spin_s_val, g_factor_val)?;
             PreRestraintKind::Gamma2Rate {
                 gamma2_obs_s1,
                 sigma_s1,
@@ -2020,6 +3427,7 @@ pub fn parse_domain_pre_tsv_str(text: &str) -> Result<Vec<DomainPreSiteSet>, Str
             .or_default()
             .push(DomainPreRestraint {
                 site_id,
+                chain_id,
                 seq_id,
                 atom_name,
                 kind,
@@ -2037,21 +3445,264 @@ pub fn parse_domain_pre_tsv_str(text: &str) -> Result<Vec<DomainPreSiteSet>, Str
             .get(&sid)
             .or_else(|| site_pos_map.get(""))
             .copied();
-        let anchor_residue_atom = site_anchor_map
+        let anch_full = site_anchor_map
             .get(&sid)
             .or_else(|| site_anchor_map.get(""))
             .cloned();
+        let (anchor_chain_id, anchor_residue_atom) = match anch_full {
+            Some((ach, rsid, an)) => (ach, Some((rsid, an))),
+            None => (None, None),
+        };
         let host_domain_id = site_dom_map
             .get(&sid)
             .or_else(|| site_dom_map.get(""))
             .copied();
+        let tau_c_ns = tau_c_map
+            .get(&sid)
+            .or_else(|| tau_c_map.get(""))
+            .copied()
+            .or(cli_tau_c_ns);
+        let proton_mhz = mhz_map
+            .get(&sid)
+            .or_else(|| mhz_map.get(""))
+            .copied()
+            .or(cli_proton_mhz);
+        let mtsl_tether_allowance_a = tether_map
+            .get(&sid)
+            .or_else(|| tether_map.get(""))
+            .copied()
+            .or(cli_mtsl_tether_a);
         out.push(DomainPreSiteSet {
             site_id: sid,
             site_pos_initial,
+            anchor_chain_id,
             anchor_residue_atom,
             host_domain_id,
+            tau_c_ns,
+            proton_mhz,
+            mtsl_tether_allowance_a,
             restraints,
         });
+    }
+    Ok(out)
+}
+
+/// Read chain-aware inter-domain / ambiguous `NOE` distance restraints (`(chain_id, seq_id)` keyed,
+/// `21.W2:P1-8` & `P2-11`) from an ASCII/UTF-8 TSV file (`<= 64 MiB`).
+pub fn read_domain_noe_tsv(
+    path: impl AsRef<Path>,
+    af_residues: &[AfResidueRecord],
+) -> Result<Vec<AmbiguousDistanceRestraint>, String> {
+    let p = path.as_ref();
+    let meta =
+        fs::metadata(p).map_err(|e| format!("failed to stat NOE TSV '{}': {e}", p.display()))?;
+    if meta.len() > MAX_DOMAIN_RESTRAINT_BYTES as u64 {
+        return Err(format!(
+            "NOE TSV '{}' exceeds MAX_DOMAIN_RESTRAINT_BYTES ({} B)",
+            p.display(),
+            MAX_DOMAIN_RESTRAINT_BYTES
+        ));
+    }
+    let bytes =
+        fs::read(p).map_err(|e| format!("failed to read NOE TSV '{}': {e}", p.display()))?;
+    if bytes.len() > MAX_DOMAIN_RESTRAINT_BYTES || bytes.contains(&0u8) {
+        return Err(format!(
+            "NOE TSV '{}' exceeds size cap or contains NUL bytes",
+            p.display()
+        ));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|e| format!("invalid UTF-8 in NOE TSV '{}': {e}", p.display()))?;
+    parse_domain_noe_tsv_str(text, af_residues)
+}
+
+/// Parse single-chain or multi-chain ambiguous/unambiguous `NOE` TSV text into
+/// `Vec<AmbiguousDistanceRestraint>`, grouping rows sharing a `peak_id` into Nilges $r^{-6}$-summed
+/// candidate sets (`21.W2:P1-8`, `P2-11`).
+pub fn parse_domain_noe_tsv_str(
+    text: &str,
+    af_residues: &[AfResidueRecord],
+) -> Result<Vec<AmbiguousDistanceRestraint>, String> {
+    if text.len() > MAX_DOMAIN_RESTRAINT_BYTES || text.as_bytes().contains(&0u8) {
+        return Err("NOE TSV text exceeds size cap or contains NUL bytes".to_string());
+    }
+    let chain_ids: Vec<String> = af_residues.iter().map(|r| r.chain_id.clone()).collect();
+    let seq_ids: Vec<i32> = af_residues.iter().map(|r| r.seq_id).collect();
+    let cseq = ChainSeqIndex::build(&chain_ids, &seq_ids)?;
+
+    let parse_noe_site = |raw_at: &str| -> Option<NoeProton> {
+        let up = raw_at.trim().to_ascii_uppercase();
+        match up.as_str() {
+            "H" | "HN" => Some(NoeProton::AmideH),
+            "HA" | "HA#" | "QA" | "HA2" | "HA3" => Some(NoeProton::AlphaHA),
+            "HB" | "HB#" | "QB" | "HB1" | "HB2" | "HB3" => Some(NoeProton::BetaQB),
+            _ => None,
+        }
+    };
+
+    let mut groups: BTreeMap<usize, (f64, f64, Vec<crate::noesy::NoeCandidatePair>)> =
+        BTreeMap::new();
+    let mut auto_peak_id = 1_000_000usize;
+    let mut has_peak_col = false;
+    let mut has_chain_cols = false;
+
+    for (line_idx, raw_line) in text.lines().enumerate() {
+        let line_no = line_idx + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = if trimmed.contains('\t') {
+            trimmed.split('\t').map(str::trim).collect()
+        } else {
+            trimmed.split_whitespace().collect()
+        };
+        let low0 = cols[0].to_ascii_lowercase();
+        if matches!(
+            low0.as_str(),
+            "peak_id"
+                | "restraint_id"
+                | "id"
+                | "chain_1"
+                | "chain_id_1"
+                | "chain_a"
+                | "seq_id_1"
+                | "resid_1"
+                | "res_1"
+                | "res_a"
+                | "seq_a"
+        ) {
+            has_peak_col = matches!(low0.as_str(), "peak_id" | "restraint_id" | "id");
+            has_chain_cols = cols.iter().any(|c| {
+                matches!(
+                    c.to_ascii_lowercase().as_str(),
+                    "chain_1" | "chain_id_1" | "chain_a"
+                )
+            });
+            continue;
+        }
+
+        let (peak_id, rem) = if has_peak_col {
+            let pid: usize = cols[0]
+                .parse()
+                .map_err(|e| format!("NOE line {line_no}: invalid peak_id '{}': {e}", cols[0]))?;
+            (pid, &cols[1..])
+        } else {
+            let pid = auto_peak_id;
+            auto_peak_id += 1;
+            (pid, &cols[..])
+        };
+
+        let (c1_opt, s1, at1, c2_opt, s2, at2, lo_a, hi_a) = if has_chain_cols {
+            if rem.len() < 8 {
+                return Err(format!(
+                    "NOE line {line_no}: expected chain_1 seq_1 atom_1 chain_2 seq_2 atom_2 lower_a upper_a"
+                ));
+            }
+            let (_, s1) = parse_chain_seq_token(rem[1], "NOE", line_no)?;
+            let (_, s2) = parse_chain_seq_token(rem[4], "NOE", line_no)?;
+            let lo = parse_finite_f64(rem[6], "lower_a", line_no)?;
+            let hi = parse_finite_f64(rem[7], "upper_a", line_no)?;
+            (
+                Some(rem[0].to_string()),
+                s1,
+                rem[2],
+                Some(rem[3].to_string()),
+                s2,
+                rem[5],
+                lo,
+                hi,
+            )
+        } else if rem.len() >= 6
+            && parse_noe_site(rem[1]).is_some()
+            && parse_noe_site(rem[3]).is_some()
+        {
+            // `seq_1 atom_1 seq_2 atom_2 lower_a upper_a` (with optional `A:10` tokens)
+            let (tc1, s1) = parse_chain_seq_token(rem[0], "NOE", line_no)?;
+            let (tc2, s2) = parse_chain_seq_token(rem[2], "NOE", line_no)?;
+            let lo = parse_finite_f64(rem[4], "lower_a", line_no)?;
+            let hi = parse_finite_f64(rem[5], "upper_a", line_no)?;
+            (tc1, s1, rem[1], tc2, s2, rem[3], lo, hi)
+        } else if rem.len() >= 5
+            && parse_noe_site(rem[1]).is_some()
+            && parse_noe_site(rem[3]).is_some()
+        {
+            // `seq_1 atom_1 seq_2 atom_2 upper_a`
+            let (tc1, s1) = parse_chain_seq_token(rem[0], "NOE", line_no)?;
+            let (tc2, s2) = parse_chain_seq_token(rem[2], "NOE", line_no)?;
+            let hi = parse_finite_f64(rem[4], "upper_a", line_no)?;
+            (tc1, s1, rem[1], tc2, s2, rem[3], 1.8, hi)
+        } else if rem.len() == 1
+            && !has_peak_col
+            && af_residues
+                .iter()
+                .map(|r| &r.chain_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                == 1
+        {
+            return Err(format!(
+                "NOE line {line_no}: unrecognized single-column NOE row '{trimmed}'"
+            ));
+        } else {
+            // Fallback to `nmr_core::structure::parse_exp_noe_tsv_str` only when single-chain
+            let uniq_chains: BTreeSet<&str> =
+                af_residues.iter().map(|r| r.chain_id.as_str()).collect();
+            if uniq_chains.len() > 1 {
+                return Err(format!(
+                    "NOE line {line_no}: multi-chain NOE TSV requires explicit chain:seq_id or chain_1/chain_2 columns"
+                ));
+            }
+            let seq3: Vec<String> = af_residues.iter().map(|r| r.res_name.clone()).collect();
+            return crate::structure::parse_exp_noe_tsv_str(text, &seq3, &seq_ids);
+        };
+
+        if lo_a <= 0.0 || hi_a < lo_a {
+            return Err(format!(
+                "NOE line {line_no}: invalid bounds [{lo_a}, {hi_a}]"
+            ));
+        }
+        let (Some(site1), Some(site2)) = (parse_noe_site(at1), parse_noe_site(at2)) else {
+            continue;
+        };
+        let (Some(res_a), Some(res_b)) = (
+            cseq.resolve(c1_opt.as_deref(), s1)?,
+            cseq.resolve(c2_opt.as_deref(), s2)?,
+        ) else {
+            continue;
+        };
+        let entry = groups
+            .entry(peak_id)
+            .or_insert_with(|| (lo_a, hi_a, Vec::new()));
+        entry.2.push(crate::noesy::NoeCandidatePair {
+            res_a,
+            atom_a: site1,
+            res_b,
+            atom_b: site2,
+            shift_score: 1.0,
+            network_score: 1.0,
+            weight: 1.0,
+        });
+    }
+
+    let mut out = Vec::with_capacity(groups.len());
+    for (pid, (lo, hi, cands)) in groups {
+        if cands.is_empty() {
+            continue;
+        }
+        let is_unambiguous = cands.len() == 1;
+        out.push(AmbiguousDistanceRestraint {
+            peak_index: pid,
+            exp: "DOMAIN_NOE".to_string(),
+            lower_bound: lo,
+            upper_bound: hi,
+            all_candidates: cands.clone(),
+            candidates: cands,
+            is_unambiguous,
+        });
+    }
+    if out.is_empty() {
+        return Err("NOE TSV contains zero resolved restraints".to_string());
     }
     Ok(out)
 }
@@ -2121,9 +3772,14 @@ pub enum DockResClass {
 }
 
 /// Contiguous rigid-domain block $\mathcal{B}_b = [\text{start\_res}, \text{end\_res})$ (`0.000 Å` internal drift).
+/// When a domain $d$ has multiple discontinuous sequence spans (e.g. an insertion-domain topology
+/// $D_1 = [s_0..e_0) \cup [s_1..e_1)$), every span of $d$ shares the **exact same rigid-body frame**
+/// `master_block_id` (`master_block_id == block_id` on the primary span, `master_block_id < block_id`
+/// on re-entry spans; `21.W2:P0-4`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RigidBlockGeom {
     pub block_id: usize,
+    pub master_block_id: usize,
     pub domain_id: usize,
     pub chain_idx: usize,
     pub start_res: usize,
@@ -2139,12 +3795,15 @@ pub struct ResidueKinGeom {
     pub chain_idx: usize,
     pub res_class: DockResClass,
     pub rigid_block_id: Option<usize>,
+    pub master_block_id: Option<usize>,
     pub domain_id: usize,
     pub phi_active: bool,
     pub psi_active: bool,
     pub rama_active: bool,
     pub is_chain_start: bool,
+    pub is_chain_end: bool,
     pub is_block_start: bool,
+    pub is_reentry_start: bool,
     /// Bond length $r(C'_{i-1}, N_i)$ and interior angle $\angle(CA_{i-1} - C'_{i-1} - N_i)$ (rad).
     pub r_c_prev_n: f64,
     pub ang_ca_prev_c_prev_n: f64,
@@ -2161,7 +3820,7 @@ pub struct ResidueKinGeom {
     pub c_prev_virtual: Vec3,
     /// Input reference coordinates `(N, H, CA, HA/HA2, C, O, CB/HA3)` and presence flags (`true` if atom exists).
     pub ref_slots: [(Vec3, bool); 7],
-    /// Local coordinates in rigid block $\mathcal{B}_b$'s orthonormal triad `(N_{s_b}, e_x, e_y, e_z)`.
+    /// Local coordinates in rigid domain master block's orthonormal triad `(N_{s_0}, e_x, e_y, e_z)`.
     pub local_slots: [(Vec3, bool); 7],
     /// Additional heavy sidechain atoms `(atom_name, local_or_ref_xyz)` preserved rigidly for `.pdb`/`.cif` export.
     pub extra_heavy_local: Vec<(String, Vec3)>,
@@ -2522,9 +4181,12 @@ impl DomainLinkerKinematics {
             chain_ref_centroids.push(v_scale(sum, 1.0 / cnt));
         }
 
-        // Identify contiguous rigid blocks `[s_b, e_b)` inside each chain
+        // Identify contiguous rigid blocks `[s_b, e_b)` inside each chain, tying all sequence spans
+        // of the same `domain_id` to a single `master_block_id` (`21.W2:P0-4`: `0.000 Å` internal drift
+        // across discontinuous insertion-domain topologies such as `D1 = [0..22] ∪ [50..72]`).
         let mut rigid_blocks: Vec<RigidBlockGeom> = Vec::new();
         let mut res_block_id: Vec<Option<usize>> = vec![None; l];
+        let mut first_block_for_domain: BTreeMap<usize, usize> = BTreeMap::new();
         for (c_idx, &(cs, ce)) in chain_ranges.iter().enumerate() {
             let mut p = cs;
             while p < ce {
@@ -2539,11 +4201,13 @@ impl DomainLinkerKinematics {
                 }
                 let b_end = p;
                 let bid = rigid_blocks.len();
+                let master_bid = *first_block_for_domain.entry(dom).or_insert(bid);
                 for slot in &mut res_block_id[b_start..b_end] {
                     *slot = Some(bid);
                 }
                 rigid_blocks.push(RigidBlockGeom {
                     block_id: bid,
+                    master_block_id: master_bid,
                     domain_id: dom,
                     chain_idx: c_idx,
                     start_res: b_start,
@@ -2552,11 +4216,17 @@ impl DomainLinkerKinematics {
             }
         }
 
-        // Precompute each rigid block's initial AF triad frame `(N_{s_b}, R_b^AF)`
+        // Precompute each rigid block's initial AF triad frame `(N_{s_master}, R_master^AF)`
+        // (re-entry spans inherit their domain's master frame so all spans share one rigid body!).
         let mut block_frames: Vec<(Vec3, [[f64; 3]; 3])> = Vec::with_capacity(rigid_blocks.len());
         for blk in &rigid_blocks {
-            let rs = &ref_chain.residues[blk.start_res];
-            block_frames.push((rs.n, triad_frame_from_n_ca_c(rs.n, rs.ca, rs.c)));
+            if blk.master_block_id == blk.block_id {
+                let rs = &ref_chain.residues[blk.start_res];
+                block_frames.push((rs.n, triad_frame_from_n_ca_c(rs.n, rs.ca, rs.c)));
+            } else {
+                let master_frame = block_frames[blk.master_block_id];
+                block_frames.push(master_frame);
+            }
         }
 
         let mut residues = Vec::with_capacity(l);
@@ -2571,8 +4241,13 @@ impl DomainLinkerKinematics {
             let c_idx = res_chain_idx[i];
             let (cs, ce) = chain_ranges[c_idx];
             let is_chain_start = i == cs;
+            let is_chain_end = i + 1 == ce;
             let blk_opt = res_block_id[i];
+            let master_blk_opt = blk_opt.map(|bid| rigid_blocks[bid].master_block_id);
             let is_block_start = blk_opt.is_some_and(|bid| rigid_blocks[bid].start_res == i);
+            let is_reentry_start = blk_opt.is_some_and(|bid| {
+                rigid_blocks[bid].start_res == i && rigid_blocks[bid].master_block_id != bid
+            });
             let is_gly = r_pdb.res_name.eq_ignore_ascii_case("GLY");
             let is_pro = r_pdb.res_name.eq_ignore_ascii_case("PRO");
             let res_class = if is_gly {
@@ -2706,12 +4381,15 @@ impl DomainLinkerKinematics {
                 chain_idx: c_idx,
                 res_class,
                 rigid_block_id: blk_opt,
+                master_block_id: master_blk_opt,
                 domain_id: partition.domain_labels[i],
                 phi_active,
                 psi_active,
                 rama_active,
                 is_chain_start,
+                is_chain_end,
                 is_block_start,
+                is_reentry_start,
                 r_c_prev_n,
                 ang_ca_prev_c_prev_n,
                 r_n_ca,
@@ -2755,6 +4433,7 @@ impl DomainLinkerKinematics {
     }
 
     /// Reconstruct world-frame 7-slot atom array (`7 * L`) and per-rigid-block world frames `(origin_n, R_b)`.
+    /// All spans belonging to a discontinuous multi-span domain share `blk_world[master_block_id]` (`0.000 Å` internal drift).
     pub fn forward_slots_and_block_frames(
         &self,
         state: &DomainDockState,
@@ -2781,47 +4460,51 @@ impl DomainLinkerKinematics {
                 let rg = &self.residues[i];
                 if let Some(bid) = rg.rigid_block_id {
                     let blk = &self.rigid_blocks[bid];
-                    let (n_s, ca_s, c_s) = if i == cs {
-                        (
-                            xform_root(rg.ref_slots[0].0),
-                            xform_root(rg.ref_slots[2].0),
-                            xform_root(rg.ref_slots[4].0),
-                        )
+                    let (n_s, r_b) = if blk.master_block_id != bid {
+                        blk_world[blk.master_block_id]
                     } else {
-                        let prev_base = 7 * (i - 1);
-                        let n_prev = slots[prev_base].0;
-                        let ca_prev = slots[prev_base + 2].0;
-                        let c_prev = slots[prev_base + 4].0;
-                        let psi_prev = state.psi_rad[i - 1];
-                        let omg_prev = state.omega_rad[i - 1];
-                        let n_cur = nerf_place_atom(
-                            n_prev,
-                            ca_prev,
-                            c_prev,
-                            rg.r_c_prev_n,
-                            rg.ang_ca_prev_c_prev_n,
-                            psi_prev,
-                        );
-                        let ca_cur = nerf_place_atom(
-                            ca_prev,
-                            c_prev,
-                            n_cur,
-                            rg.r_n_ca,
-                            rg.ang_c_prev_n_ca,
-                            omg_prev,
-                        );
-                        let c_cur = nerf_place_atom(
-                            c_prev,
-                            n_cur,
-                            ca_cur,
-                            rg.r_ca_c,
-                            rg.ang_n_ca_c,
-                            self.ref_phi_rad[i],
-                        );
-                        (n_cur, ca_cur, c_cur)
+                        let (n_s, ca_s, c_s) = if i == cs {
+                            (
+                                xform_root(rg.ref_slots[0].0),
+                                xform_root(rg.ref_slots[2].0),
+                                xform_root(rg.ref_slots[4].0),
+                            )
+                        } else {
+                            let prev_base = 7 * (i - 1);
+                            let n_prev = slots[prev_base].0;
+                            let ca_prev = slots[prev_base + 2].0;
+                            let c_prev = slots[prev_base + 4].0;
+                            let psi_prev = state.psi_rad[i - 1];
+                            let omg_prev = state.omega_rad[i - 1];
+                            let n_cur = nerf_place_atom(
+                                n_prev,
+                                ca_prev,
+                                c_prev,
+                                rg.r_c_prev_n,
+                                rg.ang_ca_prev_c_prev_n,
+                                psi_prev,
+                            );
+                            let ca_cur = nerf_place_atom(
+                                ca_prev,
+                                c_prev,
+                                n_cur,
+                                rg.r_n_ca,
+                                rg.ang_c_prev_n_ca,
+                                omg_prev,
+                            );
+                            let c_cur = nerf_place_atom(
+                                c_prev,
+                                n_cur,
+                                ca_cur,
+                                rg.r_ca_c,
+                                rg.ang_n_ca_c,
+                                self.ref_phi_rad[i],
+                            );
+                            (n_cur, ca_cur, c_cur)
+                        };
+                        (n_s, triad_frame_from_n_ca_c(n_s, ca_s, c_s))
                     };
 
-                    let r_b = triad_frame_from_n_ca_c(n_s, ca_s, c_s);
                     blk_world[bid] = (n_s, r_b);
 
                     for j in blk.start_res..blk.end_res {
@@ -3086,13 +4769,21 @@ pub struct PreparedDockPreTerm {
     pub upper_a: f64,
 }
 
-/// Pre-resolved unambiguous / effective inter-domain `NOE` distance restraint.
+/// Single candidate proton pair inside a (potentially ambiguous) inter-domain `NOE` restraint (`21.W2:P2-11`).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PreparedDockNoeTerm {
+pub struct PreparedDockNoeCandidate {
     pub atom_a: usize,
     pub atom_b: usize,
     pub seg_a: usize,
     pub seg_b: usize,
+}
+
+/// Pre-resolved inter-domain `NOE` distance restraint evaluated via Nilges (1995)
+/// $r^{-6}$-summed effective distance $d_{\text{eff}} = (\sum_c r_c^{-6})^{-1/6}$ (`21.W2:P2-11`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreparedDockNoeTerm {
+    pub cand_start: usize,
+    pub cand_len: usize,
     pub lower_a: f64,
     pub upper_a: f64,
 }
@@ -3107,57 +4798,83 @@ pub struct PreparedDomainDockRestraints {
     pub pre_sites: Vec<PreparedDockPreSite>,
     pub pre_terms: Vec<PreparedDockPreTerm>,
     pub noe_terms: Vec<PreparedDockNoeTerm>,
+    pub noe_candidates: Vec<PreparedDockNoeCandidate>,
 }
 
-pub(crate) fn resolve_kin_atom_slot_and_seg(
+#[inline]
+pub(crate) fn kin_res_seg_nhca(res_idx: usize, rg: &ResidueKinGeom) -> usize {
+    if rg.is_reentry_start {
+        2 * res_idx + 1
+    } else {
+        2 * res_idx
+    }
+}
+
+#[inline]
+pub(crate) fn kin_res_seg_o(res_idx: usize, rg: &ResidueKinGeom) -> usize {
+    if rg.is_chain_end {
+        2 * res_idx + 1
+    } else {
+        2 * res_idx + 2
+    }
+}
+
+pub(crate) fn resolve_kin_atom_slot_and_seg_multi(
     kin: &DomainLinkerKinematics,
-    seq_to_idx: &BTreeMap<i32, usize>,
+    cseq: &ChainSeqIndex,
+    chain_opt: Option<&str>,
     seq_id: i32,
     atom_name: &str,
-) -> Option<(usize, usize)> {
-    let &res_idx = seq_to_idx.get(&seq_id)?;
-    let rg = kin.residues.get(res_idx)?;
+) -> Result<Option<(usize, usize)>, String> {
+    let Some(res_idx) = cseq.resolve(chain_opt, seq_id)? else {
+        return Ok(None);
+    };
+    let Some(rg) = kin.residues.get(res_idx) else {
+        return Ok(None);
+    };
     let norm = normalize_rdc_atom_name(atom_name);
     let is_gly = rg.res_class == DockResClass::Gly;
     let base = 7 * res_idx;
+    let seg_nhca = kin_res_seg_nhca(res_idx, rg);
+    let seg_o = kin_res_seg_o(res_idx, rg);
     let (slot, seg) = match norm {
-        "N" => (base, 2 * res_idx),
+        "N" => (base, seg_nhca),
         "H" => {
             if !rg.ref_slots[1].1 && rg.res_class == DockResClass::Pro {
-                return None;
+                return Ok(None);
             }
-            (base + 1, 2 * res_idx)
+            (base + 1, seg_nhca)
         }
-        "CA" => (base + 2, 2 * res_idx),
+        "CA" => (base + 2, seg_nhca),
         "HA" => {
             if is_gly {
-                return None;
+                return Ok(None);
             }
             (base + 3, 2 * res_idx + 1)
         }
         "HA2" => {
             if !is_gly {
-                return None;
+                return Ok(None);
             }
             (base + 3, 2 * res_idx + 1)
         }
         "HA3" => {
             if !is_gly {
-                return None;
+                return Ok(None);
             }
             (base + 6, 2 * res_idx + 1)
         }
         "C" => (base + 4, 2 * res_idx + 1),
-        "O" => (base + 5, 2 * res_idx + 2),
+        "O" => (base + 5, seg_o),
         "CB" => {
             if is_gly {
-                return None;
+                return Ok(None);
             }
             (base + 6, 2 * res_idx + 1)
         }
-        _ => return None,
+        _ => return Ok(None),
     };
-    Some((slot, seg))
+    Ok(Some((slot, seg)))
 }
 
 impl PreparedDomainDockRestraints {
@@ -3172,12 +4889,44 @@ impl PreparedDomainDockRestraints {
         noe_adrs: &[AmbiguousDistanceRestraint],
         gdo_scale_map: Option<&BTreeMap<(usize, usize), f64>>,
     ) -> Result<Self, String> {
-        let mut seq_to_idx: BTreeMap<i32, usize> = BTreeMap::new();
-        for (idx, r) in kin.residues.iter().enumerate() {
-            seq_to_idx.insert(r.seq_id, idx);
-        }
+        let dom_media = DomainRdcMediumSet::from_rdc_media(rdc_media);
+        Self::compile_multi_chain(
+            kin,
+            partition,
+            &dom_media,
+            pcs_tags,
+            pre_sites,
+            noe_adrs,
+            gdo_scale_map,
+            DEFAULT_MIN_ORDERED_PLDDT,
+            false,
+            8.0,
+            0.0,
+        )
+    }
 
-        // 1. Working (`!is_free`) RDCs
+    /// Multi-chain `(chain_id, seq_id)` restraint compiler enforcing static-tensor domain hygiene
+    /// (`21.W2:P1-4`), optional 8-parameter lanthanide metal + $\Delta\boldsymbol{\chi}$ VarPro
+    /// refinement (`21.W2:P2-10`), MTSL tether allowance (`21.W3:P0-4`), unsoftened PRE bounds (`21.W2:P2-9`),
+    /// and Nilges $r^{-6}$-summed ambiguous NOEs (`21.W2:P2-11`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_multi_chain(
+        kin: &DomainLinkerKinematics,
+        partition: &PaeDomainPartition,
+        rdc_media: &[DomainRdcMediumSet],
+        pcs_tags: &[DomainPcsTagSet],
+        pre_sites: &[DomainPreSiteSet],
+        noe_adrs: &[AmbiguousDistanceRestraint],
+        gdo_scale_map: Option<&BTreeMap<(usize, usize), f64>>,
+        min_ordered_plddt: f64,
+        default_refine_metal_pos: bool,
+        default_metal_search_radius_a: f64,
+        default_mtsl_tether_allowance_a: f64,
+    ) -> Result<Self, String> {
+        let cseq = ChainSeqIndex::from_kin(kin)?;
+        let kin_plddts: Vec<Option<f64>> = kin.residues.iter().map(|r| r.plddt).collect();
+
+        // 1. Working (`!is_free`) RDCs strictly inside confident rigid domains (`21.W2:P1-4`)
         let mut rdc_terms = Vec::new();
         for (m_idx, med) in rdc_media.iter().enumerate() {
             for r in &med.restraints {
@@ -3186,13 +4935,44 @@ impl PreparedDomainDockRestraints {
                     continue;
                 }
                 let (Some((atom_a, seg_a)), Some((atom_b, seg_b))) = (
-                    resolve_kin_atom_slot_and_seg(kin, &seq_to_idx, r.seq_id_1, &r.atom_name_1),
-                    resolve_kin_atom_slot_and_seg(kin, &seq_to_idx, r.seq_id_2, &r.atom_name_2),
+                    resolve_kin_atom_slot_and_seg_multi(
+                        kin,
+                        &cseq,
+                        r.chain_id_1.as_deref(),
+                        r.seq_id_1,
+                        &r.atom_name_1,
+                    )?,
+                    resolve_kin_atom_slot_and_seg_multi(
+                        kin,
+                        &cseq,
+                        r.chain_id_2.as_deref(),
+                        r.seq_id_2,
+                        &r.atom_name_2,
+                    )?,
                 ) else {
                     continue;
                 };
                 let res_a = atom_a / 7;
-                let dom_a = kin.residues[res_a].domain_id;
+                let res_b = atom_b / 7;
+                let (Some(dom_a), Some(dom_b)) = (
+                    is_confident_rigid_residue(
+                        res_a,
+                        partition,
+                        Some(&kin_plddts),
+                        min_ordered_plddt,
+                    ),
+                    is_confident_rigid_residue(
+                        res_b,
+                        partition,
+                        Some(&kin_plddts),
+                        min_ordered_plddt,
+                    ),
+                ) else {
+                    continue;
+                };
+                if dom_a != dom_b {
+                    continue;
+                }
                 let rho_scale = gdo_scale_map
                     .and_then(|mp| mp.get(&(dom_a, m_idx)).copied())
                     .unwrap_or(1.0);
@@ -3214,24 +4994,36 @@ impl PreparedDomainDockRestraints {
         let init_state = kin.initial_state();
         let (init_slots, init_blk_frames) = kin.forward_slots_and_block_frames(&init_state);
 
-        // 2. PCS tags: resolve host block & metal position, fit intra-domain DeltaChi via `fit_pcs_tensor_svd`,
-        //    and compile working (`!is_free`) cross-domain PCS terms!
+        // 2. PCS tags: resolve host domain master block & metal position (`7.0 Å` default lanthanide
+        //    chelate offset when `# metal_anchor` is used, plus optional 8-parameter VarPro metal+DeltaChi
+        //    refinement via `refine_metal_position_and_tensor`, `21.W2:P2-10`), and compile working
+        //    (`!is_free`) cross-domain PCS terms!
         let mut prep_pcs_tags = Vec::new();
         let mut prep_pcs_terms = Vec::new();
 
         for tag in pcs_tags {
-            let (metal_world, host_dom_id, host_blk_id) = resolve_paramagnetic_host_and_pos(
-                kin,
-                partition,
-                &seq_to_idx,
-                &init_slots,
-                tag.metal_pos_initial,
-                tag.anchor_residue_atom.as_ref(),
-                tag.host_domain_id,
-                &tag.tag_id,
-            )?;
+            let (mut metal_world, host_dom_id, master_host_blk_id) =
+                resolve_paramagnetic_host_and_pos_multi(
+                    kin,
+                    partition,
+                    &cseq,
+                    &init_slots,
+                    tag.metal_pos_initial,
+                    tag.anchor_chain_id.as_deref(),
+                    tag.anchor_residue_atom.as_ref(),
+                    tag.host_domain_id,
+                    &tag.tag_id,
+                    7.0,
+                )?;
+
+            let use_varpro_metal = tag.refine_metal_pos || default_refine_metal_pos;
+            let search_rad = tag
+                .metal_search_radius_a
+                .filter(|&v| v > 0.0)
+                .unwrap_or_else(|| default_metal_search_radius_a.max(2.0));
 
             let fitted_tensor = if let Some(ref pre_t) = tag.pre_fitted_tensor {
+                metal_world = pre_t.metal_pos_angstrom;
                 pre_t.clone()
             } else {
                 let mut intra_obs: Vec<PcsObservation> = Vec::new();
@@ -3239,33 +5031,60 @@ impl PreparedDomainDockRestraints {
                     if pr.is_free {
                         continue;
                     }
-                    let Some((slot, _)) =
-                        resolve_kin_atom_slot_and_seg(kin, &seq_to_idx, pr.seq_id, &pr.atom_name)
+                    let Some((slot, _)) = resolve_kin_atom_slot_and_seg_multi(
+                        kin,
+                        &cseq,
+                        pr.chain_id.as_deref(),
+                        pr.seq_id,
+                        &pr.atom_name,
+                    )?
                     else {
                         continue;
                     };
                     let res_i = slot / 7;
-                    if kin.residues[res_i].domain_id == host_dom_id && init_slots[slot].1 {
+                    if kin.residues[res_i].domain_id == host_dom_id
+                        && kin.residues[res_i].master_block_id == Some(master_host_blk_id)
+                        && init_slots[slot].1
+                    {
                         intra_obs.push(
                             PcsObservation::new(pr.seq_id, init_slots[slot].0, pr.pcs_obs_ppm)
                                 .with_uncertainty(pr.sigma_ppm),
                         );
                     }
                 }
-                if intra_obs.len() < 6 {
-                    return Err(format!(
-                        "PCS tag '{}' has only {} working intra-domain observations in host domain {} (require >= 6 for 5-parameter DeltaChi SVD)",
-                        tag.tag_id,
-                        intra_obs.len(),
-                        host_dom_id
-                    ));
+                if use_varpro_metal {
+                    if intra_obs.len() < 9 {
+                        return Err(format!(
+                            "PCS tag '{}' 8-parameter metal position + DeltaChi refinement requires >= 9 working intra-domain observations in host domain {}, got {}",
+                            tag.tag_id,
+                            host_dom_id,
+                            intra_obs.len()
+                        ));
+                    }
+                    let step_a = (search_rad / 4.0).clamp(0.75, 2.0);
+                    let refined = refine_metal_position_and_tensor(
+                        &intra_obs,
+                        metal_world,
+                        search_rad,
+                        step_a,
+                    )?;
+                    metal_world = refined.metal_pos_angstrom;
+                    refined
+                } else {
+                    if intra_obs.len() < 6 {
+                        return Err(format!(
+                            "PCS tag '{}' has only {} working intra-domain observations in host domain {} (require >= 6 for 5-parameter DeltaChi SVD)",
+                            tag.tag_id,
+                            intra_obs.len(),
+                            host_dom_id
+                        ));
+                    }
+                    fit_pcs_tensor_svd(&intra_obs, metal_world)?
                 }
-                fit_pcs_tensor_svd(&intra_obs, metal_world)?
             };
 
-            let (orig_n, ref r_b) = init_blk_frames[host_blk_id];
+            let (orig_n, ref r_b) = init_blk_frames[master_host_blk_id];
             let metal_local_pos = mat3_transpose_mul_vec(r_b, v_sub(metal_world, orig_n));
-            // dchi_local = R_b^T * dchi_world * R_b
             let mut r_bt = [[0.0_f64; 3]; 3];
             for r in 0..3 {
                 for c in 0..3 {
@@ -3273,14 +5092,14 @@ impl PreparedDomainDockRestraints {
                 }
             }
             let dchi_local = mat3_conjugate_sym(&r_bt, &fitted_tensor.matrix_mol);
-            let host_seg_id = 2 * kin.rigid_blocks[host_blk_id].start_res + 1;
+            let host_seg_id = 2 * kin.rigid_blocks[master_host_blk_id].start_res + 1;
             let tag_idx = prep_pcs_tags.len();
             let pcs_off = fitted_tensor.pcs_offset_ppm;
 
             prep_pcs_tags.push(PreparedDockPcsTag {
                 tag_id: tag.tag_id.clone(),
                 host_domain_id: host_dom_id,
-                host_block_id: host_blk_id,
+                host_block_id: master_host_blk_id,
                 host_seg_id,
                 metal_local_pos,
                 dchi_local,
@@ -3292,14 +5111,18 @@ impl PreparedDomainDockRestraints {
                 if pr.is_free {
                     continue;
                 }
-                let Some((slot, seg)) =
-                    resolve_kin_atom_slot_and_seg(kin, &seq_to_idx, pr.seq_id, &pr.atom_name)
+                let Some((slot, seg)) = resolve_kin_atom_slot_and_seg_multi(
+                    kin,
+                    &cseq,
+                    pr.chain_id.as_deref(),
+                    pr.seq_id,
+                    &pr.atom_name,
+                )?
                 else {
                     continue;
                 };
                 let res_i = slot / 7;
-                // Only cross-domain / linker observations vary with domain docking (`r_i` in host_blk is rigid!)
-                if kin.residues[res_i].rigid_block_id == Some(host_blk_id) {
+                if kin.residues[res_i].master_block_id == Some(master_host_blk_id) {
                     continue;
                 }
                 let inv_s = 1.0 / pr.sigma_ppm.max(1e-12);
@@ -3313,40 +5136,53 @@ impl PreparedDomainDockRestraints {
             }
         }
 
-        // 3. PRE sites & cross-domain Solomon r^-6 / distance-bound terms
+        // 3. PRE sites & cross-domain Solomon r^-6 / distance-bound terms (`21.W3:P0-4` & `21.W2:P2-9`)
         let mut prep_pre_sites = Vec::new();
         let mut prep_pre_terms = Vec::new();
         for ps in pre_sites {
-            let (site_world, host_dom_id, host_blk_id) = resolve_paramagnetic_host_and_pos(
-                kin,
-                partition,
-                &seq_to_idx,
-                &init_slots,
-                ps.site_pos_initial,
-                ps.anchor_residue_atom.as_ref(),
-                ps.host_domain_id,
-                &ps.site_id,
-            )?;
-            let (orig_n, ref r_b) = init_blk_frames[host_blk_id];
+            let (site_world, host_dom_id, master_host_blk_id) =
+                resolve_paramagnetic_host_and_pos_multi(
+                    kin,
+                    partition,
+                    &cseq,
+                    &init_slots,
+                    ps.site_pos_initial,
+                    ps.anchor_chain_id.as_deref(),
+                    ps.anchor_residue_atom.as_ref(),
+                    ps.host_domain_id,
+                    &ps.site_id,
+                    2.5,
+                )?;
+            let (orig_n, ref r_b) = init_blk_frames[master_host_blk_id];
             let site_local_pos = mat3_transpose_mul_vec(r_b, v_sub(site_world, orig_n));
-            let host_seg_id = 2 * kin.rigid_blocks[host_blk_id].start_res + 1;
+            let host_seg_id = 2 * kin.rigid_blocks[master_host_blk_id].start_res + 1;
             let site_idx = prep_pre_sites.len();
             prep_pre_sites.push(PreparedDockPreSite {
                 site_id: ps.site_id.clone(),
                 host_domain_id: host_dom_id,
-                host_block_id: host_blk_id,
+                host_block_id: master_host_blk_id,
                 host_seg_id,
                 site_local_pos,
             });
 
+            let tether_a = ps
+                .mtsl_tether_allowance_a
+                .unwrap_or(default_mtsl_tether_allowance_a)
+                .max(0.0);
+
             for r in &ps.restraints {
-                let Some((slot, seg)) =
-                    resolve_kin_atom_slot_and_seg(kin, &seq_to_idx, r.seq_id, &r.atom_name)
+                let Some((slot, seg)) = resolve_kin_atom_slot_and_seg_multi(
+                    kin,
+                    &cseq,
+                    r.chain_id.as_deref(),
+                    r.seq_id,
+                    &r.atom_name,
+                )?
                 else {
                     continue;
                 };
                 let res_i = slot / 7;
-                if kin.residues[res_i].rigid_block_id == Some(host_blk_id) {
+                if kin.residues[res_i].master_block_id == Some(master_host_blk_id) {
                     continue;
                 }
                 match r.kind {
@@ -3355,29 +5191,56 @@ impl PreparedDomainDockRestraints {
                         sigma_s1,
                         k_pre_a6_s1,
                     } => {
-                        let inv_s = 1.0 / sigma_s1.max(1e-12);
-                        // Also derive conservative flat-bottom outer shell `[r_lo, r_hi]` from
-                        // `(gamma2_obs +/- 2.5 * sigma)` so far-away domains (`25-40 Å`) receive a
-                        // smooth non-vanishing basin pull while `[r_lo, r_hi]` has `0.0` bias at convergence!
-                        let g_hi = (gamma2_obs_s1 + 2.5 * sigma_s1).max(1e-6);
-                        let g_lo = (gamma2_obs_s1 - 2.5 * sigma_s1).max(0.0);
-                        let r_lo = (det_cbrt(k_pre_a6_s1 / g_hi).sqrt() - 0.5).max(2.0);
-                        let r_hi = if g_lo > 1e-6 {
-                            det_cbrt(k_pre_a6_s1 / g_lo).sqrt() + 0.5
+                        if tether_a > 0.0 {
+                            // Flexible MTSL nitroxide tether allowance (`Iwahara et al. 2004`):
+                            // convert `Gamma2 +/- sigma` via exact `r^-6` into `[r_lo - tether_a, r_hi + tether_a]`.
+                            let g_hi = (gamma2_obs_s1 + sigma_s1.max(1e-6)).max(1e-6);
+                            let g_lo = (gamma2_obs_s1 - sigma_s1.max(1e-6)).max(0.0);
+                            let r_lo = (det_cbrt(k_pre_a6_s1 / g_hi).sqrt() - tether_a).max(2.0);
+                            let r_hi = if g_lo > 1e-6 {
+                                det_cbrt(k_pre_a6_s1 / g_lo).sqrt() + tether_a
+                            } else {
+                                80.0 + tether_a
+                            };
+                            let r_nom = det_cbrt(k_pre_a6_s1 / gamma2_obs_s1.max(1e-6)).sqrt();
+                            let sig_r = (r_nom * sigma_s1 / (6.0 * gamma2_obs_s1.max(1e-3)))
+                                .clamp(0.5, 4.0);
+                            let inv_s = 1.0 / sig_r;
+                            prep_pre_terms.push(PreparedDockPreTerm {
+                                site_idx,
+                                atom_slot: slot,
+                                seg_idx: seg,
+                                is_bounds_mode: true,
+                                gamma2_obs_s1: 0.0,
+                                inv_sigma2: inv_s * inv_s,
+                                k_pre_a6_s1: 0.0,
+                                lower_a: r_lo,
+                                upper_a: r_hi.max(r_lo),
+                            });
                         } else {
-                            80.0
-                        };
-                        prep_pre_terms.push(PreparedDockPreTerm {
-                            site_idx,
-                            atom_slot: slot,
-                            seg_idx: seg,
-                            is_bounds_mode: false,
-                            gamma2_obs_s1,
-                            inv_sigma2: inv_s * inv_s,
-                            k_pre_a6_s1,
-                            lower_a: r_lo,
-                            upper_a: r_hi.max(r_lo),
-                        });
+                            let inv_s = 1.0 / sigma_s1.max(1e-12);
+                            // Exact unsoftened `[r_lo, r_hi]` outer guide (`+/- 3.0 * sigma +/- 1.0 Å`,
+                            // `0.0` energy & gradient at the exact unsoftened `r = (K_PRE / Gamma2)^{1/6}`!).
+                            let g_hi = (gamma2_obs_s1 + 3.0 * sigma_s1).max(1e-6);
+                            let g_lo = (gamma2_obs_s1 - 3.0 * sigma_s1).max(0.0);
+                            let r_lo = (det_cbrt(k_pre_a6_s1 / g_hi).sqrt() - 1.0).max(3.5);
+                            let r_hi = if g_lo > 1e-6 {
+                                det_cbrt(k_pre_a6_s1 / g_lo).sqrt() + 1.0
+                            } else {
+                                80.0
+                            };
+                            prep_pre_terms.push(PreparedDockPreTerm {
+                                site_idx,
+                                atom_slot: slot,
+                                seg_idx: seg,
+                                is_bounds_mode: false,
+                                gamma2_obs_s1,
+                                inv_sigma2: inv_s * inv_s,
+                                k_pre_a6_s1,
+                                lower_a: r_lo,
+                                upper_a: r_hi.max(r_lo),
+                            });
+                        }
                     }
                     PreRestraintKind::DistanceBounds {
                         lower_a,
@@ -3385,6 +5248,8 @@ impl PreparedDomainDockRestraints {
                         sigma_a,
                     } => {
                         let inv_s = 1.0 / sigma_a.max(1e-12);
+                        let lo_eff = (lower_a - tether_a).max(1.8);
+                        let hi_eff = (upper_a + tether_a).max(lo_eff);
                         prep_pre_terms.push(PreparedDockPreTerm {
                             site_idx,
                             atom_slot: slot,
@@ -3393,55 +5258,72 @@ impl PreparedDomainDockRestraints {
                             gamma2_obs_s1: 0.0,
                             inv_sigma2: inv_s * inv_s,
                             k_pre_a6_s1: 0.0,
-                            lower_a,
-                            upper_a,
+                            lower_a: lo_eff,
+                            upper_a: hi_eff,
                         });
                     }
                 }
             }
         }
 
-        // 4. Inter-domain / linker NOE distance restraints
+        // 4. Inter-domain / linker NOE distance restraints with Nilges (1995) r^-6 sum-averaging (`21.W2:P2-11`)
         let mut noe_terms = Vec::new();
+        let mut noe_candidates = Vec::new();
+        let map_noe_slot = |res_idx: usize, site: NoeProton| -> Option<(usize, usize)> {
+            let rg = kin.residues.get(res_idx)?;
+            let base = 7 * res_idx;
+            let seg_nhca = kin_res_seg_nhca(res_idx, rg);
+            match site {
+                NoeProton::AmideH => {
+                    (rg.res_class != DockResClass::Pro).then_some((base + 1, seg_nhca))
+                }
+                NoeProton::AlphaHA => Some((base + 3, 2 * res_idx + 1)),
+                NoeProton::BetaQB => {
+                    (rg.res_class != DockResClass::Gly).then_some((base + 6, 2 * res_idx + 1))
+                }
+            }
+        };
+
         for adr in noe_adrs {
             if adr.candidates.is_empty() {
                 continue;
             }
-            let c0 = &adr.candidates[0];
-            if c0.res_a >= kin.residues.len() || c0.res_b >= kin.residues.len() {
-                continue;
-            }
-            if kin.residues[c0.res_a].rigid_block_id.is_some()
-                && kin.residues[c0.res_a].rigid_block_id == kin.residues[c0.res_b].rigid_block_id
-            {
-                continue;
-            }
-            let map_noe_slot = |res_idx: usize, site: NoeProton| -> Option<(usize, usize)> {
-                let rg = &kin.residues[res_idx];
-                let base = 7 * res_idx;
-                match site {
-                    NoeProton::AmideH => {
-                        (rg.res_class != DockResClass::Pro).then_some((base + 1, 2 * res_idx))
-                    }
-                    NoeProton::AlphaHA => Some((base + 3, 2 * res_idx + 1)),
-                    NoeProton::BetaQB => {
-                        (rg.res_class != DockResClass::Gly).then_some((base + 6, 2 * res_idx + 1))
-                    }
+            let mut resolved_cands: Vec<PreparedDockNoeCandidate> = Vec::new();
+            let mut has_varying_pair = false;
+            for cand in &adr.candidates {
+                if cand.res_a >= kin.residues.len() || cand.res_b >= kin.residues.len() {
+                    continue;
                 }
-            };
-            if let (Some((atom_a, seg_a)), Some((atom_b, seg_b))) = (
-                map_noe_slot(c0.res_a, c0.atom_a),
-                map_noe_slot(c0.res_b, c0.atom_b),
-            ) {
-                noe_terms.push(PreparedDockNoeTerm {
+                let (Some((atom_a, seg_a)), Some((atom_b, seg_b))) = (
+                    map_noe_slot(cand.res_a, cand.atom_a),
+                    map_noe_slot(cand.res_b, cand.atom_b),
+                ) else {
+                    continue;
+                };
+                let ma = kin.residues[cand.res_a].master_block_id;
+                let mb = kin.residues[cand.res_b].master_block_id;
+                if !(ma.is_some() && ma == mb) {
+                    has_varying_pair = true;
+                }
+                resolved_cands.push(PreparedDockNoeCandidate {
                     atom_a,
                     atom_b,
                     seg_a,
                     seg_b,
-                    lower_a: adr.lower_bound,
-                    upper_a: adr.upper_bound,
                 });
             }
+            if !has_varying_pair || resolved_cands.is_empty() {
+                continue;
+            }
+            let cand_start = noe_candidates.len();
+            let cand_len = resolved_cands.len();
+            noe_candidates.extend(resolved_cands);
+            noe_terms.push(PreparedDockNoeTerm {
+                cand_start,
+                cand_len,
+                lower_a: adr.lower_bound,
+                upper_a: adr.upper_bound,
+            });
         }
 
         Ok(Self {
@@ -3452,6 +5334,7 @@ impl PreparedDomainDockRestraints {
             pre_sites: prep_pre_sites,
             pre_terms: prep_pre_terms,
             noe_terms,
+            noe_candidates,
         })
     }
 
@@ -3504,15 +5387,17 @@ impl PreparedDomainDockRestraints {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_paramagnetic_host_and_pos(
+fn resolve_paramagnetic_host_and_pos_multi(
     kin: &DomainLinkerKinematics,
     partition: &PaeDomainPartition,
-    seq_to_idx: &BTreeMap<i32, usize>,
+    cseq: &ChainSeqIndex,
     init_slots: &[(Vec3, bool)],
     explicit_pos: Option<Vec3>,
+    anchor_chain_opt: Option<&str>,
     anchor_opt: Option<&(i32, String)>,
     explicit_dom: Option<usize>,
     label: &str,
+    default_anchor_offset_a: f64,
 ) -> Result<(Vec3, usize, usize), String> {
     if kin.rigid_blocks.is_empty() {
         return Err(format!(
@@ -3524,19 +5409,19 @@ fn resolve_paramagnetic_host_and_pos(
         p
     } else if let Some((sid, aname)) = anchor_opt {
         let (slot, _) =
-            resolve_kin_atom_slot_and_seg(kin, seq_to_idx, *sid, aname).ok_or_else(|| {
-                format!("paramagnetic anchor {sid}:{aname} for '{label}' not found on chain")
-            })?;
+            resolve_kin_atom_slot_and_seg_multi(kin, cseq, anchor_chain_opt, *sid, aname)?
+                .ok_or_else(|| {
+                    format!("paramagnetic anchor {sid}:{aname} for '{label}' not found on chain")
+                })?;
         let base_p = init_slots[slot].0;
         let res_i = slot / 7;
         let ca_p = init_slots[7 * res_i + 2].0;
-        // Displace 2.5 Å outward along CA -> anchor (or +X if anchor == CA) so metal is >= 2.5 Å from host nuclei
         let dir = if v_dist(base_p, ca_p) > 0.2 {
             v_unit(v_sub(base_p, ca_p))
         } else {
             [1.0, 0.0, 0.0]
         };
-        v_add(base_p, v_scale(dir, 2.5))
+        v_add(base_p, v_scale(dir, default_anchor_offset_a))
     } else {
         return Err(format!(
             "paramagnetic site '{label}' requires explicit `# metal_pos` / `# site_pos` or `# metal_anchor` / `# site_anchor`"
@@ -3552,8 +5437,8 @@ fn resolve_paramagnetic_host_and_pos(
         }
         d_id
     } else if let Some((sid, _)) = anchor_opt {
-        let &res_i = seq_to_idx
-            .get(sid)
+        let res_i = cseq
+            .resolve(anchor_chain_opt, *sid)?
             .ok_or_else(|| format!("anchor seq_id {sid} for '{label}' not found"))?;
         let d = kin.residues[res_i].domain_id;
         if d == 0 {
@@ -3563,7 +5448,6 @@ fn resolve_paramagnetic_host_and_pos(
         }
         d
     } else {
-        // Nearest rigid-domain CA atom
         let mut best_dom = kin.rigid_blocks[0].domain_id;
         let mut best_d2 = f64::INFINITY;
         for blk in &kin.rigid_blocks {
@@ -3578,24 +5462,16 @@ fn resolve_paramagnetic_host_and_pos(
         best_dom
     };
 
-    // Select the rigid block belonging to `host_dom_id` closest to `pos`
-    let host_blk_id = kin
+    // Resolve the domain's primary `master_block_id` so multi-span domains share one rigid frame!
+    let master_blk_id = kin
         .rigid_blocks
         .iter()
-        .filter(|b| b.domain_id == host_dom_id)
-        .min_by(|a, b| {
-            let da = (a.start_res..a.end_res)
-                .map(|j| v_dist_sq(pos, init_slots[7 * j + 2].0))
-                .fold(f64::INFINITY, f64::min);
-            let db = (b.start_res..b.end_res)
-                .map(|j| v_dist_sq(pos, init_slots[7 * j + 2].0))
-                .fold(f64::INFINITY, f64::min);
-            da.total_cmp(&db)
-        })
-        .map(|b| b.block_id)
+        .find(|b| b.domain_id == host_dom_id && b.master_block_id == b.block_id)
+        .or_else(|| kin.rigid_blocks.iter().find(|b| b.domain_id == host_dom_id))
+        .map(|b| b.master_block_id)
         .ok_or_else(|| format!("no rigid block found for domain {host_dom_id}"))?;
 
-    Ok((pos, host_dom_id, host_blk_id))
+    Ok((pos, host_dom_id, master_blk_id))
 }
 
 #[derive(Clone, Copy)]
@@ -3651,6 +5527,10 @@ impl DockGivensQr5 {
     }
 
     fn solve_saupe(&self) -> Option<[[f64; 3]; 3]> {
+        self.solve_saupe_with_cond().map(|(s, _)| s)
+    }
+
+    fn solve_saupe_with_cond(&self) -> Option<([[f64; 3]; 3], f64)> {
         if self.n_rows < 6 {
             return None;
         }
@@ -3720,7 +5600,8 @@ impl DockGivensQr5 {
         if !s_max.is_finite() || !s_min.is_finite() || s_max <= 1e-30 || s_min <= 0.0 {
             return None;
         }
-        if s_max / s_min > MAX_SAUPE_SVD_COND {
+        let cond = s_max / s_min;
+        if cond > MAX_SAUPE_SVD_COND {
             return None;
         }
         let mut scaled_ut_z = [0.0_f64; 5];
@@ -3738,7 +5619,7 @@ impl DockGivensQr5 {
         }
         let (syy, szz, sxy, sxz, syz) = (s_5[0], s_5[1], s_5[2], s_5[3], s_5[4]);
         let sxx = -(syy + szz);
-        Some([[sxx, sxy, sxz], [sxy, syy, syz], [sxz, syz, szz]])
+        Some(([[sxx, sxy, sxz], [sxy, syy, syz], [sxz, syz, szz]], cond))
     }
 }
 
@@ -3748,7 +5629,7 @@ impl DockGivensQr5 {
 struct HeavyAtomEntry {
     res_idx: usize,
     chain_idx: usize,
-    block_id: Option<usize>,
+    master_block_id: Option<usize>,
     seg_idx: usize,
     kind: u8,
     pos: Vec3,
@@ -3762,6 +5643,27 @@ fn dock_vdw_min_r2_base(ka: u8, kb: u8) -> f64 {
         (3, 3) => 3.25 * 3.25,
         (_, 3) => 3.00 * 3.00,
         _ => 2.85 * 2.85,
+    }
+}
+
+/// Exact unsoftened Solomon $r^{-6}$ rate and derivative $\frac{d\Gamma_2}{d(r^2)}$ for all
+/// physical distances $r \ge 3.5\text{ \AA}$ ($s = r^2 \ge 12.25\text{ \AA}^2$), with a $C^1$-continuous
+/// linear-in-$r^2$ steric-core cap only below $r_{\text{core}} = 3.5\text{ \AA}$ (`21.W2:P2-9`).
+#[inline]
+pub(crate) fn solomon_r6_rate_and_ds(r2_raw: f64, k_pre_a6_s1: f64) -> (f64, f64) {
+    const S_CORE: f64 = 12.25;
+    if r2_raw >= S_CORE {
+        let inv_s = 1.0 / r2_raw;
+        let inv_s3 = inv_s * inv_s * inv_s;
+        (k_pre_a6_s1 * inv_s3, -3.0 * k_pre_a6_s1 * inv_s3 * inv_s)
+    } else {
+        let inv_sc = 1.0 / S_CORE;
+        let inv_sc3 = inv_sc * inv_sc * inv_sc;
+        let g2_core = k_pre_a6_s1 * inv_sc3;
+        (
+            g2_core * (4.0 - 3.0 * r2_raw * inv_sc),
+            -3.0 * g2_core * inv_sc,
+        )
     }
 }
 
@@ -3791,31 +5693,18 @@ where
         if ri.chain_idx != rj.chain_idx {
             continue;
         }
-        if ri.rigid_block_id.is_some() && ri.rigid_block_id == rj.rigid_block_id {
+        if ri.master_block_id.is_some() && ri.master_block_id == rj.master_block_id {
             continue;
         }
         let oi = slots[7 * i + 5].0;
         let cj = slots[7 * (i + 1) + 4].0;
         let oj = slots[7 * (i + 1) + 5].0;
+        let seg_oi = kin_res_seg_o(i, ri);
+        let seg_cj = 2 * (i + 1) + 1;
+        let seg_oj = kin_res_seg_o(i + 1, rj);
         let pairs = [
-            (
-                2 * i + 2,
-                oi,
-                2u8,
-                2 * (i + 1) + 1,
-                cj,
-                1u8,
-                dock_vdw_min_r2_base(2, 1),
-            ),
-            (
-                2 * i + 2,
-                oi,
-                2u8,
-                2 * (i + 1) + 2,
-                oj,
-                2u8,
-                dock_vdw_min_r2_base(2, 2),
-            ),
+            (seg_oi, oi, 2u8, seg_cj, cj, 1u8, dock_vdw_min_r2_base(2, 1)),
+            (seg_oi, oi, 2u8, seg_oj, oj, 2u8, dock_vdw_min_r2_base(2, 2)),
         ];
         for (sa, pa, _, sb, pb, _, base_r2) in pairs {
             let r2_min = s2 * base_r2;
@@ -3838,13 +5727,13 @@ where
                 let delta = r2_min - d2;
                 total_vdw += w_vdw * delta * delta;
                 let g = v_scale(diff, -4.0 * w_vdw * delta);
-                add_seg_grad(2 * i + 2, oi, g);
-                add_seg_grad(2 * (i + 1) + 1, cb_j, [-g[0], -g[1], -g[2]]);
+                add_seg_grad(seg_oi, oi, g);
+                add_seg_grad(seg_cj, cb_j, [-g[0], -g[1], -g[2]]);
             }
         }
     }
 
-    // 2. Non-local pairs (`|i - j| >= 2` or distinct chains, skipping intra-rigid-block pairs)
+    // 2. Non-local pairs (`|i - j| >= 2` or distinct chains, skipping intra-domain pairs)
     //    indexed via a deterministic fixed-prime open-addressed / linked-list 3D spatial grid (`cell = 3.5 Å`).
     let cell_size = (3.35 * vdw_scale.max(0.75)).max(2.5);
     let inv_cell = 1.0 / cell_size;
@@ -3852,26 +5741,28 @@ where
     let mut atoms = Vec::with_capacity(l * 5);
     for (i, rg) in kin.residues.iter().enumerate() {
         let base = 7 * i;
+        let seg_nhca = kin_res_seg_nhca(i, rg);
+        let seg_o = kin_res_seg_o(i, rg);
         atoms.push(HeavyAtomEntry {
             res_idx: i,
             chain_idx: rg.chain_idx,
-            block_id: rg.rigid_block_id,
-            seg_idx: 2 * i,
+            master_block_id: rg.master_block_id,
+            seg_idx: seg_nhca,
             kind: 0,
             pos: slots[base].0,
         });
         atoms.push(HeavyAtomEntry {
             res_idx: i,
             chain_idx: rg.chain_idx,
-            block_id: rg.rigid_block_id,
-            seg_idx: 2 * i,
+            master_block_id: rg.master_block_id,
+            seg_idx: seg_nhca,
             kind: 1,
             pos: slots[base + 2].0,
         });
         atoms.push(HeavyAtomEntry {
             res_idx: i,
             chain_idx: rg.chain_idx,
-            block_id: rg.rigid_block_id,
+            master_block_id: rg.master_block_id,
             seg_idx: 2 * i + 1,
             kind: 1,
             pos: slots[base + 4].0,
@@ -3879,8 +5770,8 @@ where
         atoms.push(HeavyAtomEntry {
             res_idx: i,
             chain_idx: rg.chain_idx,
-            block_id: rg.rigid_block_id,
-            seg_idx: 2 * i + 2,
+            master_block_id: rg.master_block_id,
+            seg_idx: seg_o,
             kind: 2,
             pos: slots[base + 5].0,
         });
@@ -3888,7 +5779,7 @@ where
             atoms.push(HeavyAtomEntry {
                 res_idx: i,
                 chain_idx: rg.chain_idx,
-                block_id: rg.rigid_block_id,
+                master_block_id: rg.master_block_id,
                 seg_idx: 2 * i + 1,
                 kind: 3,
                 pos: slots[base + 6].0,
@@ -3934,7 +5825,9 @@ where
                                 let b = &atoms[cur as usize];
                                 cur = next_atom[cur as usize];
 
-                                if b.block_id.is_some() && b.block_id == at.block_id {
+                                if b.master_block_id.is_some()
+                                    && b.master_block_id == at.master_block_id
+                                {
                                     continue;
                                 }
                                 let same_chain = b.chain_idx == at.chain_idx;
@@ -4263,7 +6156,7 @@ fn evaluate_domain_dock_on_precomputed_slots(
         }
     }
 
-    // 3. Solomon r^-6 PRE energy & forces
+    // 3. Exact unsoftened Solomon r^-6 PRE energy & forces (`21.W3:P0-4` & `21.W2:P2-9`)
     if weights.w_pre > 0.0 && !prep.pre_terms.is_empty() {
         let w_pre = weights.w_pre;
         let site_world: Vec<Vec3> = prep
@@ -4309,12 +6202,9 @@ fn evaluate_domain_dock_on_precomputed_slots(
                     );
                 }
             } else {
-                // Smooth short-range softened Solomon r^-6 (`r2_eff = r^2 + 4.0 Å^2`) with Huber cap `kappa = 8.0`
-                // plus flat-bottom outer shell `[lower_a, upper_a]` (`0.0` inside basin, linear/quadratic pull outside!)
-                let r2_eff = r2_raw + 4.0;
-                let inv_r2 = 1.0 / r2_eff;
-                let inv_r6 = inv_r2 * inv_r2 * inv_r2;
-                let g2_calc = term.k_pre_a6_s1 * inv_r6;
+                // Exact unsoftened `K_PRE * r^-6` for all `r >= 3.5 Å` (`C^1` core cap below `3.5 Å`)
+                // with Huber cap `kappa = 8.0` + zero-bias outer basin guide `[lower_a, upper_a]`.
+                let (g2_calc, dg2_ds) = solomon_r6_rate_and_ds(r2_raw, term.k_pre_a6_s1);
                 let resid = g2_calc - term.gamma2_obs_s1;
                 let inv_sig = term.inv_sigma2.sqrt();
                 let z = resid * inv_sig;
@@ -4325,9 +6215,8 @@ fn evaluate_domain_dock_on_precomputed_slots(
                     (kappa * (z.abs() - 0.5 * kappa), kappa * z.signum())
                 };
                 eb.pre += w_pre * huber_e;
-                // d(g2_calc)/d(pa) = -6 * k_pre * inv_r8 * dv
                 let d_e_dg2 = w_pre * d_huber_dz * inv_sig;
-                let mut g_pa = v_scale(dv, d_e_dg2 * (-6.0 * term.k_pre_a6_s1 * inv_r6 * inv_r2));
+                let mut g_pa = v_scale(dv, d_e_dg2 * 2.0 * dg2_ds);
 
                 let d = (r2_raw + 1e-4).sqrt();
                 if d > term.upper_a {
@@ -4359,25 +6248,53 @@ fn evaluate_domain_dock_on_precomputed_slots(
         }
     }
 
-    // 4. Inter-domain / linker NOE distance restraints (soft-asymptote flat-bottom)
+    // 4. Inter-domain / linker NOE distance restraints with Nilges (1995) r^-6 sum-averaging (`21.W2:P2-11`)
     if weights.w_noe > 0.0 && !prep.noe_terms.is_empty() {
         let w_noe = weights.w_noe;
         let soft = weights.noe_soft_window.max(0.5);
         for term in &prep.noe_terms {
-            let (pa, oka) = slots[term.atom_a];
-            let (pb, okb) = slots[term.atom_b];
-            if !oka || !okb {
+            let c_end = (term.cand_start + term.cand_len).min(prep.noe_candidates.len());
+            if term.cand_start >= c_end {
                 continue;
             }
-            let diff = v_sub(pa, pb);
-            let d = (v_dot(diff, diff) + 1e-6).sqrt();
-            let (v_e, dv_dd) = if d < term.lower_a {
-                let u = term.lower_a - d;
+            let cands = &prep.noe_candidates[term.cand_start..c_end];
+            let mut s_min = f64::INFINITY;
+            for cand in cands {
+                let (pa, oka) = slots[cand.atom_a];
+                let (pb, okb) = slots[cand.atom_b];
+                if oka && okb {
+                    let diff = v_sub(pa, pb);
+                    let sc = v_dot(diff, diff) + 1e-6;
+                    if sc < s_min {
+                        s_min = sc;
+                    }
+                }
+            }
+            if !s_min.is_finite() {
+                continue;
+            }
+            let mut tilde_s = 0.0_f64;
+            for cand in cands {
+                let (pa, oka) = slots[cand.atom_a];
+                let (pb, okb) = slots[cand.atom_b];
+                if oka && okb {
+                    let diff = v_sub(pa, pb);
+                    let sc = v_dot(diff, diff) + 1e-6;
+                    let q = s_min / sc;
+                    tilde_s += q * q * q;
+                }
+            }
+            if tilde_s <= 0.0 {
+                continue;
+            }
+            let d_eff = s_min.sqrt() / det_cbrt(tilde_s).sqrt();
+            let (v_e, dv_dd) = if d_eff < term.lower_a {
+                let u = term.lower_a - d_eff;
                 (w_noe * u * u, -2.0 * w_noe * u)
-            } else if d <= term.upper_a {
+            } else if d_eff <= term.upper_a {
                 (0.0, 0.0)
             } else {
-                let u = d - term.upper_a;
+                let u = d_eff - term.upper_a;
                 if u <= soft {
                     (w_noe * u * u, 2.0 * w_noe * u)
                 } else {
@@ -4389,16 +6306,28 @@ fn evaluate_domain_dock_on_precomputed_slots(
             };
             eb.noe += v_e;
             if dv_dd != 0.0 {
-                let g = v_scale(diff, dv_dd / d);
-                add_seg_ft(&mut seg_force, &mut seg_torque, slots, term.seg_a, pa, g);
-                add_seg_ft(
-                    &mut seg_force,
-                    &mut seg_torque,
-                    slots,
-                    term.seg_b,
-                    pb,
-                    [-g[0], -g[1], -g[2]],
-                );
+                let denom = s_min * tilde_s;
+                for cand in cands {
+                    let (pa, oka) = slots[cand.atom_a];
+                    let (pb, okb) = slots[cand.atom_b];
+                    if !oka || !okb {
+                        continue;
+                    }
+                    let diff = v_sub(pa, pb);
+                    let sc = v_dot(diff, diff) + 1e-6;
+                    let q = s_min / sc;
+                    let w_c = q * q * q;
+                    let g = v_scale(diff, dv_dd * (d_eff * w_c * q) / denom);
+                    add_seg_ft(&mut seg_force, &mut seg_torque, slots, cand.seg_a, pa, g);
+                    add_seg_ft(
+                        &mut seg_force,
+                        &mut seg_torque,
+                        slots,
+                        cand.seg_b,
+                        pb,
+                        [-g[0], -g[1], -g[2]],
+                    );
+                }
             }
         }
     }
@@ -4414,7 +6343,78 @@ fn evaluate_domain_dock_on_precomputed_slots(
         );
     }
 
-    // 6. Local-pivot backward suffix-sum torque propagation -> linker `(grad_phi, grad_psi)`
+    // 5b. Cyclic covalent peptide loop-closure restraint across discontinuous re-entry domain
+    //     boundaries (`21.W2:P0-4`: keeps re-entry linker C'_{s_1-1}-N_{s_1} peptide geometry closed
+    //     while `s_1..e_1` remains strictly locked to `master_block_id` with `0.000 Å` internal drift!).
+    if weights.w_rama > 0.0 {
+        let k_loop = 25.0 * weights.w_rama;
+        for blk in &kin.rigid_blocks {
+            if blk.master_block_id == blk.block_id {
+                continue;
+            }
+            let s_1 = blk.start_res;
+            let (cs, _) = kin.chain_ranges[blk.chain_idx];
+            if s_1 <= cs {
+                continue;
+            }
+            let rg = &kin.residues[s_1];
+            let prev_rg = &kin.residues[s_1 - 1];
+            let n_prev = slots[7 * (s_1 - 1)].0;
+            let ca_prev = slots[7 * (s_1 - 1) + 2].0;
+            let c_prev = slots[7 * (s_1 - 1) + 4].0;
+            let psi_prev = if prev_rg.psi_active {
+                state.psi_rad[s_1 - 1]
+            } else {
+                kin.ref_psi_rad[s_1 - 1]
+            };
+            let omg_prev = state.omega_rad[s_1 - 1];
+            let n_loop = nerf_place_atom(
+                n_prev,
+                ca_prev,
+                c_prev,
+                rg.r_c_prev_n,
+                rg.ang_ca_prev_c_prev_n,
+                psi_prev,
+            );
+            let ca_loop = nerf_place_atom(
+                ca_prev,
+                c_prev,
+                n_loop,
+                rg.r_n_ca,
+                rg.ang_c_prev_n_ca,
+                omg_prev,
+            );
+            let c_loop = nerf_place_atom(
+                c_prev,
+                n_loop,
+                ca_loop,
+                rg.r_ca_c,
+                rg.ang_n_ca_c,
+                kin.ref_phi_rad[s_1],
+            );
+            let n_rig = slots[7 * s_1].0;
+            let ca_rig = slots[7 * s_1 + 2].0;
+            let c_rig = slots[7 * s_1 + 4].0;
+            let seg_loop = 2 * s_1;
+            let seg_master = 2 * kin.rigid_blocks[blk.master_block_id].start_res + 1;
+            for (p_lp, p_rg) in [(n_loop, n_rig), (ca_loop, ca_rig), (c_loop, c_rig)] {
+                let df = v_sub(p_lp, p_rg);
+                eb.rama += 0.5 * k_loop * v_dot(df, df);
+                let g_lp = v_scale(df, k_loop);
+                add_seg_ft(&mut seg_force, &mut seg_torque, slots, seg_loop, p_lp, g_lp);
+                add_seg_ft(
+                    &mut seg_force,
+                    &mut seg_torque,
+                    slots,
+                    seg_master,
+                    p_rg,
+                    [-g_lp[0], -g_lp[1], -g_lp[2]],
+                );
+            }
+        }
+    }
+
+    // 6. Local-pivot backward tree suffix-sum torque propagation -> linker `(grad_phi, grad_psi)`
     //    and multi-chain `(grad_chain_rot, grad_chain_trans)`
     let mut grad_phi = vec![0.0_f64; l];
     let mut grad_psi = vec![0.0_f64; l];
@@ -4435,14 +6435,16 @@ fn evaluate_domain_dock_on_precomputed_slots(
             let cai = slots[7 * i_rev + 2].0;
             let ci = slots[7 * i_rev + 4].0;
 
-            suf_t = v_add(suf_t, v_cross(v_sub(cur_q, ci), suf_f));
-            cur_q = ci;
-            let seg_psi = 2 * i_rev + 2;
-            suf_f = v_add(suf_f, seg_force[seg_psi]);
-            suf_t = v_add(suf_t, seg_torque[seg_psi]);
-            if rg.psi_active {
-                let axis_psi = v_unit(v_sub(ci, cai));
-                grad_psi[i_rev] = v_dot(axis_psi, suf_t);
+            if i_rev + 1 < ce {
+                suf_t = v_add(suf_t, v_cross(v_sub(cur_q, ci), suf_f));
+                cur_q = ci;
+                let seg_psi = 2 * i_rev + 2;
+                suf_f = v_add(suf_f, seg_force[seg_psi]);
+                suf_t = v_add(suf_t, seg_torque[seg_psi]);
+                if rg.psi_active {
+                    let axis_psi = v_unit(v_sub(ci, cai));
+                    grad_psi[i_rev] = v_dot(axis_psi, suf_t);
+                }
             }
 
             suf_t = v_add(suf_t, v_cross(v_sub(cur_q, cai), suf_f));
@@ -4453,6 +6455,24 @@ fn evaluate_domain_dock_on_precomputed_slots(
             if rg.phi_active {
                 let axis_phi = v_unit(v_sub(cai, ni));
                 grad_phi[i_rev] = v_dot(axis_phi, suf_t);
+            }
+
+            // Re-entry rigid-block start (`master_block_id != rigid_block_id`): transfer the entire
+            // downstream wrench directly onto `master_block_id`'s rigid segment (`2 * s_0 + 1`) so
+            // intermediate linker torsions `[b_1.end .. s_1)` do not inherit rigid-domain forces!
+            if rg.is_reentry_start {
+                if let Some(m_bid) = rg.master_block_id {
+                    let s_0 = kin.rigid_blocks[m_bid].start_res;
+                    let seg_master = 2 * s_0 + 1;
+                    let piv_master = slots[7 * s_0 + 2].0;
+                    seg_force[seg_master] = v_add(seg_force[seg_master], suf_f);
+                    seg_torque[seg_master] = v_add(
+                        seg_torque[seg_master],
+                        v_add(suf_t, v_cross(v_sub(cur_q, piv_master), suf_f)),
+                    );
+                    suf_f = [0.0; 3];
+                    suf_t = [0.0; 3];
+                }
             }
 
             // If `i_rev == cs` (chain root), include segment `2 * cs` (`N_{cs}, H_{cs}, CA_{cs}`)
@@ -4539,15 +6559,92 @@ pub enum DipolarObservabilityRegime {
     FullyRestrainedTranslationalAndOrientational,
 }
 
+/// Pre-dock and observability quality gate verdict (`21.W2:P1-6` & `21.W2:P2-8`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DomainDockQualityVerdict {
+    /// All pre-dock intra-domain coordinate fits and observability gates passed cleanly.
+    PassedAllChecks,
+    /// One or more domains exceeded `max_intra_domain_rdc_q_free` (`> 0.50`) or had `< 8` working
+    /// intra-domain RDCs, permitted only because `allow_poor_intra_domain_fit == true`.
+    IntraDomainMismatchWarning,
+    /// Multi-domain docking proceeded on a single alignment medium (or coaxial media) without
+    /// sufficient cross-domain translational restraints, permitted only because `allow_underdetermined_single_medium == true`.
+    UnderdeterminedSingleMediumWarning,
+    /// Both `IntraDomainMismatchWarning` and `UnderdeterminedSingleMediumWarning` were overridden.
+    IntraDomainAndSingleMediumWarning,
+}
+
+/// Independent pre-dock intra-domain Saupe `Q_work` and held-out `ByPeptidePlane Q_free` check (`21.W2:P1-6`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PreDockDomainRdcCheck {
+    pub domain_id: usize,
+    pub medium_id: String,
+    pub n_work: usize,
+    pub n_free: usize,
+    pub q_work: f64,
+    pub q_free: f64,
+    pub passed: bool,
+}
+
+/// Prepared input bundle produced by [`prepare_domain_dock_inputs_full`] and shared between CPU and WebGPU engines.
+#[derive(Clone, Debug)]
+pub struct PreparedDomainDockPipeline {
+    pub domain_rdc_media: Vec<DomainRdcMediumSet>,
+    pub pcs_tags: Vec<DomainPcsTagSet>,
+    pub tolman_gdo: TolmanGdoMotionReport,
+    pub prep: PreparedDomainDockRestraints,
+    pub pre_dock_domain_checks: Vec<PreDockDomainRdcCheck>,
+    pub quality_verdict: DomainDockQualityVerdict,
+    pub extra_candor_notes: Vec<String>,
+    pub n_excluded_flexible_rdcs: usize,
+}
+
 /// Configuration for multi-domain docking (`dock_domains_cpu` and `nmr-gpu::domain_dock_gpu`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DomainDockConfig {
     pub pae_cfg: PaeClusterConfig,
     pub weights: DomainDockEnergyWeights,
-    /// Cross-validation `ByPeptidePlane` holdout fraction (`default = 0.20`).
+    /// Cross-validation `ByPeptidePlane` RDC holdout fraction (`default = 0.20`).
     pub rdc_free_fraction: f64,
     /// Whether to auto-partition `is_free` when all input RDCs have `is_free == false`.
     pub auto_partition_rdc_free: bool,
+    /// Cross-validation domain-stratified `PCS` holdout fraction (`default = 0.20`, `21.W2:P1-5`).
+    #[serde(default = "default_pcs_free_fraction")]
+    pub pcs_free_fraction: f64,
+    /// Whether to auto-partition `is_free` on `PCS` tags when all input PCS restraints have `is_free == false`.
+    #[serde(default = "default_true_flag")]
+    pub auto_partition_pcs_free: bool,
+    /// Maximum permissible pre-dock intra-domain held-out `ByPeptidePlane Q_free` (`default = 0.50`, `21.W2:P1-6`).
+    #[serde(default = "default_max_intra_domain_q_free")]
+    pub max_intra_domain_rdc_q_free: f64,
+    /// Override default refusal when a rigid domain fails its own pre-dock internal RDC check (`21.W2:P1-6`).
+    #[serde(default)]
+    pub allow_poor_intra_domain_fit: bool,
+    /// Override default refusal when multi-domain docking is requested with `< 2` non-coaxial RDC media
+    /// and insufficient cross-domain `PCS`/`PRE`/`NOE` translational restraints (`21.W2:P2-8`).
+    #[serde(default)]
+    pub allow_underdetermined_single_medium: bool,
+    /// Backbone Cartesian coordinate noise floor (Å) included in Tolman $\vartheta_d$ MC error propagation (`default = 0.08`, `21.W2:A8`).
+    #[serde(default = "default_tolman_coord_noise_a")]
+    pub tolman_coord_noise_angstrom: f64,
+    /// Optional global enable for 8-parameter lanthanide metal position + $\Delta\boldsymbol{\chi}$ VarPro refinement (`21.W2:P2-10`).
+    #[serde(default)]
+    pub refine_pcs_metal_pos: bool,
+    /// Search radius (Å) around initial metal anchor for 8-parameter VarPro PCS refinement (`default = 8.0`).
+    #[serde(default = "default_pcs_search_radius_a")]
+    pub pcs_metal_search_radius_a: f64,
+    /// Default rotational correlation time $\tau_c$ (ns) for Solomon PRE $\Gamma_2$ restraints (`21.W3:P0-4`).
+    #[serde(default)]
+    pub pre_tau_c_ns: Option<f64>,
+    /// Default $^1\text{H}$ Larmor frequency (MHz) for Solomon–Bloembergen PRE dispersion (`21.W3:P0-4`).
+    #[serde(default)]
+    pub pre_proton_mhz: Option<f64>,
+    /// Configurable flexible MTSL nitroxide tether allowance (Å, e.g. `6.0` for `CYS:CB`-anchored spin labels; `default = 0.0`, `21.W3:P0-4`).
+    #[serde(default)]
+    pub mtsl_tether_allowance_a: f64,
+    /// Optional chain-explicit `DomainRdcMediumSet` list overriding `rdc_media_in` for multi-chain complexes (`21.W2:P1-8`).
+    #[serde(default)]
+    pub chain_rdc_media: Vec<DomainRdcMediumSet>,
     /// Number of docked conformers retained in the output ensemble (`default = 10`).
     pub ensemble_size: usize,
     /// Number of multi-start replicas (`<= 256` per WebGPU dispatch; `default = 64`).
@@ -4562,6 +6659,26 @@ pub struct DomainDockConfig {
     pub seed: u64,
 }
 
+fn default_pcs_free_fraction() -> f64 {
+    0.20
+}
+
+fn default_true_flag() -> bool {
+    true
+}
+
+fn default_max_intra_domain_q_free() -> f64 {
+    0.50
+}
+
+fn default_tolman_coord_noise_a() -> f64 {
+    DEFAULT_TOLMAN_COORD_NOISE_ANGSTROM
+}
+
+fn default_pcs_search_radius_a() -> f64 {
+    8.0
+}
+
 impl Default for DomainDockConfig {
     fn default() -> Self {
         Self {
@@ -4569,6 +6686,18 @@ impl Default for DomainDockConfig {
             weights: DomainDockEnergyWeights::default(),
             rdc_free_fraction: 0.20,
             auto_partition_rdc_free: true,
+            pcs_free_fraction: 0.20,
+            auto_partition_pcs_free: true,
+            max_intra_domain_rdc_q_free: 0.50,
+            allow_poor_intra_domain_fit: false,
+            allow_underdetermined_single_medium: false,
+            tolman_coord_noise_angstrom: DEFAULT_TOLMAN_COORD_NOISE_ANGSTROM,
+            refine_pcs_metal_pos: false,
+            pcs_metal_search_radius_a: 8.0,
+            pre_tau_c_ns: None,
+            pre_proton_mhz: None,
+            mtsl_tether_allowance_a: 0.0,
+            chain_rdc_media: Vec::new(),
             ensemble_size: 10,
             n_replicas: 64,
             anneal_steps: 56,
@@ -4594,6 +6723,8 @@ pub struct PerDomainValidationSummary {
     pub domain_id: usize,
     pub n_residues: usize,
     pub intra_domain_distortion_rmsd_angstrom: f64,
+    pub pre_dock_rdc_q_work: f64,
+    pub pre_dock_rdc_q_free: f64,
     pub rdc_q_work: f64,
     pub rdc_q_free: f64,
 }
@@ -4602,16 +6733,24 @@ pub struct PerDomainValidationSummary {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DomainDockReport {
     pub engine_used: String,
+    pub quality_verdict: DomainDockQualityVerdict,
     pub partition: PaeDomainPartition,
     pub tolman_gdo: TolmanGdoMotionReport,
     pub observability_regime: DipolarObservabilityRegime,
     pub candor_notes: Vec<String>,
+    pub pre_dock_domain_checks: Vec<PreDockDomainRdcCheck>,
+    pub n_excluded_flexible_rdcs: usize,
     pub rdc_stratification: RdcFreeStratification,
     pub global_rdc_q_work: f64,
     pub global_rdc_q_free: f64,
     pub pcs_q_intra: f64,
-    pub pcs_q_inter_work: f64,
-    pub pcs_q_free: f64,
+    /// Working (`!is_free`) cross-domain PCS Cornilescu Q-factor (`None` when `n_pcs_work == 0`, `21.W2:P1-5`).
+    pub pcs_q_work: Option<f64>,
+    /// Strictly held-out (`is_free == true`) cross-domain PCS Cornilescu Q-factor — NEVER falls back
+    /// to `pcs_q_work` (`None` when `n_pcs_free == 0`, `21.W2:P1-5`).
+    pub pcs_q_free: Option<f64>,
+    pub n_pcs_work: usize,
+    pub n_pcs_free: usize,
     pub max_intra_domain_rmsd_angstrom: f64,
     pub ensemble_pairwise_bb_rmsd_angstrom: f64,
     pub per_domain_validation: Vec<PerDomainValidationSummary>,
@@ -4629,8 +6768,11 @@ pub struct DomainDockResult {
     pub report: DomainDockReport,
 }
 
-/// Classify dipolar/paramagnetic observability and emit candid `F8` cone-degeneracy warnings
-/// whenever `< 2` independent alignment media and zero translational restraints (`PCS`/`PRE`/`NOE`) are present.
+/// Non-coaxial Saupe tensor cosine threshold (`|cos(S_a, S_b)| < 0.85` <=> `>= ~32°` principal-axis separation, `21.W2:P2-8`).
+pub const MAX_COAXIAL_SAUPE_COS_SIM: f64 = 0.85;
+
+/// Classify dipolar/paramagnetic observability using genuine compiled cross-domain working restraint
+/// counts and a strict non-coaxial Saupe threshold (`|cos| < 0.85`, `21.W2:P2-8`).
 pub fn classify_dipolar_observability(
     partition: &PaeDomainPartition,
     rdc_media: &[RdcMediumSet],
@@ -4639,16 +6781,64 @@ pub fn classify_dipolar_observability(
     noe_terms_count: usize,
     chain_for_saupe: &PdbChain,
 ) -> (DipolarObservabilityRegime, Vec<String>) {
-    let mut notes = Vec::new();
-    let has_pcs = pcs_tags.iter().any(|t| !t.restraints.is_empty());
-    let has_pre = pre_sites.iter().any(|s| !s.restraints.is_empty());
-    let has_noe = noe_terms_count > 0;
-    let n_media = rdc_media.len();
+    let dom_media = DomainRdcMediumSet::from_rdc_media(rdc_media);
+    let cseq = ChainSeqIndex::from_pdb_chain(chain_for_saupe).unwrap_or_else(|_| ChainSeqIndex {
+        exact: BTreeMap::new(),
+        by_seq_only: BTreeMap::new(),
+    });
+    // Estimate cross-domain working PCS/PRE counts when called standalone without `prep`
+    let mut approx_cross_pcs = 0usize;
+    for t in pcs_tags {
+        let hd = t.host_domain_id.unwrap_or(1);
+        for r in &t.restraints {
+            if !r.is_free {
+                if let Ok(Some(idx)) = cseq.resolve(r.chain_id.as_deref(), r.seq_id) {
+                    if partition.domain_labels.get(idx).copied().unwrap_or(0) != hd {
+                        approx_cross_pcs += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut approx_cross_pre = 0usize;
+    for s in pre_sites {
+        let hd = s.host_domain_id.unwrap_or(1);
+        for r in &s.restraints {
+            if let Ok(Some(idx)) = cseq.resolve(r.chain_id.as_deref(), r.seq_id) {
+                if partition.domain_labels.get(idx).copied().unwrap_or(0) != hd {
+                    approx_cross_pre += 1;
+                }
+            }
+        }
+    }
+    classify_dipolar_observability_multi(
+        partition,
+        &dom_media,
+        approx_cross_pcs,
+        approx_cross_pre,
+        noe_terms_count,
+        chain_for_saupe,
+        &cseq,
+    )
+}
 
-    if n_media == 0 && !has_pcs && !has_pre && !has_noe {
+pub(crate) fn classify_dipolar_observability_multi(
+    partition: &PaeDomainPartition,
+    rdc_media: &[DomainRdcMediumSet],
+    n_cross_pcs_work: usize,
+    n_cross_pre_work: usize,
+    n_cross_noe_work: usize,
+    chain_for_saupe: &PdbChain,
+    cseq: &ChainSeqIndex,
+) -> (DipolarObservabilityRegime, Vec<String>) {
+    let mut notes = Vec::new();
+    let any_rdc = rdc_media.iter().any(|m| !m.restraints.is_empty());
+    let any_dist = n_cross_pcs_work > 0 || n_cross_pre_work > 0 || n_cross_noe_work > 0;
+
+    if !any_rdc && !any_dist {
         if partition.domains.len() >= 2 {
             notes.push(
-                "PAE spectral domain clustering identified multiple domains, but no experimental RDC, PCS, PRE, or inter-domain NOE restraints were supplied; coordinates retain the input AlphaFold inter-domain pose."
+                "PAE spectral domain clustering identified multiple domains, but no experimental cross-domain RDC, PCS, PRE, or NOE restraints were supplied; coordinates retain the input AlphaFold inter-domain pose."
                     .to_string(),
             );
         }
@@ -4658,17 +6848,25 @@ pub fn classify_dipolar_observability(
         );
     }
 
-    if has_pcs || has_pre || has_noe {
+    // Require sufficient non-degenerate 3D cross-domain distance+orientation restraints (`>= 5` cross-domain
+    // working PCSs, `>= 3` cross-domain PREs, or `>= 3` inter-domain NOEs; `21.W2:P2-8`) before declaring
+    // `FullyRestrainedTranslationalAndOrientational` (an intra-domain-only PCS tag or a single PRE distance
+    // cannot lift 6-DOF rigid-body / 4-fold Saupe cone degeneracy!).
+    let sufficient_trans_orient = n_cross_pcs_work >= 5
+        || n_cross_pre_work >= 3
+        || n_cross_noe_work >= 3
+        || (n_cross_pcs_work + n_cross_pre_work + n_cross_noe_work >= 4);
+    if sufficient_trans_orient {
         return (
             DipolarObservabilityRegime::FullyRestrainedTranslationalAndOrientational,
             notes,
         );
     }
 
-    // Check effective independent non-coaxial alignment media (`|cos(s_1, s_2)| < 0.96`)
+    // Check effective independent non-coaxial alignment media (`|cos(S_a, S_b)| < 0.85`, `21.W2:P2-8`)
     let mut fitted_s5: Vec<[f64; 5]> = Vec::new();
     for m in rdc_media {
-        if let Ok(fit) = fit_saupe_tensor_svd(chain_for_saupe, m) {
+        if let Ok((fit, _)) = fit_saupe_tensor_domain_rdc(chain_for_saupe, cseq, m) {
             fitted_s5.push(fit.s_5);
         }
     }
@@ -4678,7 +6876,6 @@ pub fn classify_dipolar_observability(
             for b in (a + 1)..fitted_s5.len() {
                 let sa = &fitted_s5[a];
                 let sb = &fitted_s5[b];
-                // Traceless Frobenius inner product Tr(S_a S_b)
                 let mat_a = [
                     [-(sa[0] + sa[1]), sa[2], sa[3]],
                     [sa[2], sa[0], sa[4]],
@@ -4700,7 +6897,7 @@ pub fn classify_dipolar_observability(
                     }
                 }
                 let cos_sim = dot.abs() / (na * nb).max(1e-30).sqrt();
-                if cos_sim < 0.96 {
+                if cos_sim < MAX_COAXIAL_SAUPE_COS_SIM {
                     found = true;
                     break;
                 }
@@ -4715,10 +6912,9 @@ pub fn classify_dipolar_observability(
     };
 
     if !has_two_non_coaxial {
-        notes.push(
-            "Candor note [F8 single-medium cone degeneracy]: fewer than 2 non-coaxial RDC alignment media were supplied without PCS, PRE, or inter-domain NOE restraints. A single Saupe alignment tensor carries intrinsic 4-fold principal-axis pi-rotation cone degeneracy and zero direct translational sensitivity; unambiguous 3D multi-domain placement requires >= 2 non-coaxial RDC media or translational+orientational PCS/PRE/NOE restraints."
-                .to_string(),
-        );
+        notes.push(format!(
+            "Candor note [F8 single-medium cone degeneracy]: fewer than 2 non-coaxial RDC alignment media (|cos| < {MAX_COAXIAL_SAUPE_COS_SIM:.2}) were supplied without sufficient cross-domain PCS ({n_cross_pcs_work}, need >= 5), PRE ({n_cross_pre_work}, need >= 3), or inter-domain NOE ({n_cross_noe_work}, need >= 3) restraints. A single Saupe alignment tensor carries intrinsic 4-fold principal-axis pi-rotation cone degeneracy and zero direct translational sensitivity."
+        ));
         (
             DipolarObservabilityRegime::UnderdeterminedSingleMediumRdcOnly,
             notes,
@@ -4739,7 +6935,8 @@ pub fn classify_dipolar_observability(
 /// combining:
 /// - Replica 0: exact input AlphaFold pose,
 /// - Analytical 8-branch $\mathcal{D}_2$ Saupe PAS relative rotations + `PCS`/`PRE`/`NOE` 3D placement
-///   closed onto the exact covalent `NeRF` linker manifold via target-triad `L-BFGS`, and
+///   closed onto the exact covalent `NeRF` linker manifold via target-triad `L-BFGS` (including
+///   re-entry linker closure for discontinuous multi-span domains!), and
 /// - Quasi-uniform $\text{SO}(3)$ / Ramachandran basin torsion exploration.
 pub fn generate_domain_dock_seed_states(
     kin: &DomainLinkerKinematics,
@@ -4766,16 +6963,12 @@ pub fn generate_domain_dock_seed_states(
     let mut rng = DetRng::new(seed ^ 0x444F_434B_5345_4544);
     let (init_slots, init_blk_frames) = kin.forward_slots_and_block_frames(&base_state);
 
-    // Build candidate rigid-body rotations Q in SO(3) for each downstream rigid block `b_idx >= 1`
-    // (updating sequentially from upstream block `b_idx - 1` to `b_idx`!)
     let n_blocks = kin.rigid_blocks.len();
     if n_blocks >= 2 {
         let b0 = &kin.rigid_blocks[0];
-        // Collect candidate world rotations `Q_cand` mapping block 1's initial orientation -> candidate world orientation
         let mut cand_quats_b1: Vec<[[f64; 3]; 3]> =
             vec![[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]];
 
-        // 1. Analytical 8-branch D2 (+ x<->y swap) Saupe PAS candidates strictly from `!is_free` `prep.rdc_terms`
         const PROPER_SYM_8: [[[f64; 3]; 3]; 8] = [
             [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]],
@@ -4806,7 +6999,6 @@ pub fn generate_domain_dock_seed_states(
             }
         }
 
-        // 2. Quasi-uniform random SO(3) rotations (Shoemake 1992 subgroup algorithm via DetRng)
         for _ in 0..24 {
             let u1 = rng.f64();
             let u2 = rng.f64() * 2.0 * PI;
@@ -4819,7 +7011,6 @@ pub fn generate_domain_dock_seed_states(
             cand_quats_b1.push(quat_to_rot_matrix(q));
         }
 
-        // Rank candidate rotations of block 1 by combined multi-medium working RDC chi-squared
         let mut scored_rots: Vec<(f64, [[f64; 3]; 3])> = Vec::with_capacity(cand_quats_b1.len());
         for q_mat in cand_quats_b1 {
             let rdc_score = score_block1_rotation_work_rdc(kin, prep, &init_slots, &q_mat);
@@ -4827,7 +7018,6 @@ pub fn generate_domain_dock_seed_states(
         }
         scored_rots.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-        // Deduplicate near-identical rotations (`trace(Q_a^T Q_b) > 2.98` => `< ~8 deg`)
         let mut top_rots: Vec<[[f64; 3]; 3]> = Vec::new();
         for (_, q_mat) in scored_rots {
             let dup = top_rots.iter().any(|prev| {
@@ -4847,9 +7037,6 @@ pub fn generate_domain_dock_seed_states(
             }
         }
 
-        // For each top candidate rotation `q_mat`, optimize 3D translation of block 1 against
-        // working PCS + PRE + inter-domain NOE + coarse steric clash within covalent linker reach,
-        // then project onto exact covalent linker torsions (or multi-chain `(q, t)`).
         let b1 = &kin.rigid_blocks[1];
         let same_chain_01 = b0.chain_idx == b1.chain_idx;
         let anchor_c_prev = init_slots[7 * (b0.end_res - 1) + 4].0;
@@ -4885,11 +7072,8 @@ pub fn generate_domain_dock_seed_states(
             );
 
             if !same_chain_01 {
-                // Multi-chain non-covalent partner `c_idx = b1.chain_idx`: set `(q_c, t_c)` directly!
                 let c_idx = b1.chain_idx;
                 let c_af = kin.chain_ref_centroids[c_idx];
-                // Under x' = c_af + t_c + Q (x - c_af), we want x'(init_n_b1) == target_n_b1
-                // => t_c = target_n_b1 - c_af - Q (init_n_b1 - c_af)
                 let q_unit = rot_matrix_to_quat(q_mat);
                 let base_t = v_sub(
                     v_sub(target_n_b1, c_af),
@@ -4919,8 +7103,6 @@ pub fn generate_domain_dock_seed_states(
                     seeds.push(st);
                 }
             } else if n_link_res > 0 {
-                // Single-chain covalent linker `[b0.end_res .. b1.start_res)`: close linker onto
-                // target frame `(target_n_b1, q_mat * init_blk_frames[1].1)` from diverse basin seeds!
                 let (_, ref r_b1_init) = init_blk_frames[1];
                 let r_b1_target = mat3_mul(q_mat, r_b1_init);
                 for sub in 0..seeds_per_rot {
@@ -4942,7 +7124,8 @@ pub fn generate_domain_dock_seed_states(
             }
         }
 
-        // If `n_blocks >= 3`, also diversify downstream linkers (`b_idx >= 2`) via PAS alignment!
+        // Downstream blocks `b_idx >= 2`: close re-entry linkers onto `master_block_id`'s exact
+        // rigid peptide bond (`21.W2:P0-4`), or diversify independent downstream blocks via PAS!
         if n_blocks >= 3 && seeds.len() > 1 {
             let cur_len = seeds.len();
             for s_idx in 1..cur_len {
@@ -4953,7 +7136,22 @@ pub fn generate_domain_dock_seed_states(
                         continue;
                     }
                     let (cur_slots, cur_frames) = kin.forward_slots_and_block_frames(&seeds[s_idx]);
-                    if let (Some(m0), Some(m_cur)) = (
+                    if b_cur.master_block_id != b_cur.block_id {
+                        let s_re = b_cur.start_res;
+                        let n_re = cur_slots[7 * s_re].0;
+                        let (_, ref r_master) = cur_frames[b_cur.master_block_id];
+                        let closed = close_covalent_linker_segment(
+                            kin,
+                            &seeds[s_idx],
+                            b_prev.end_res,
+                            s_re,
+                            n_re,
+                            r_master,
+                            s_idx % 3,
+                            &mut rng,
+                        );
+                        seeds[s_idx] = closed;
+                    } else if let (Some(m0), Some(m_cur)) = (
                         fit_block_work_saupe(kin, prep, &cur_slots, 0, 0),
                         fit_block_work_saupe(kin, prep, &cur_slots, b_idx, 0),
                     ) {
@@ -4987,7 +7185,6 @@ pub fn generate_domain_dock_seed_states(
         }
     }
 
-    // Fill remaining replica slots with broad Ramachandran-favored linker perturbations
     const BASIN_CENTERS_DEG: &[(f64, f64)] = &[
         (-63.0, -42.0),
         (-122.0, 135.0),
@@ -5043,7 +7240,7 @@ fn fit_block_work_saupe(
     block_id: usize,
     medium_idx: usize,
 ) -> Option<[[f64; 3]; 3]> {
-    let blk = kin.rigid_blocks.get(block_id)?;
+    let master_id = kin.rigid_blocks.get(block_id)?.master_block_id;
     let mut qr = DockGivensQr5::new();
     for t in &prep.rdc_terms {
         if t.medium_idx != medium_idx {
@@ -5051,7 +7248,9 @@ fn fit_block_work_saupe(
         }
         let ra = t.atom_a / 7;
         let rb = t.atom_b / 7;
-        if ra < blk.start_res || ra >= blk.end_res || rb < blk.start_res || rb >= blk.end_res {
+        if kin.residues[ra].master_block_id != Some(master_id)
+            || kin.residues[rb].master_block_id != Some(master_id)
+        {
             continue;
         }
         let (pa, oka) = slots[t.atom_a];
@@ -5090,7 +7289,8 @@ fn score_block1_rotation_work_rdc(
     if prep.n_media == 0 || prep.rdc_terms.is_empty() {
         return 0.0;
     }
-    let b0 = &kin.rigid_blocks[0];
+    let m0 = kin.rigid_blocks[0].master_block_id;
+    let m1 = kin.rigid_blocks[1].master_block_id;
     let b1 = &kin.rigid_blocks[1];
     let n_b1 = init_slots[7 * b1.start_res].0;
 
@@ -5104,10 +7304,11 @@ fn score_block1_rotation_work_rdc(
             }
             let ra = t.atom_a / 7;
             let rb = t.atom_b / 7;
-            let in_b0 =
-                ra >= b0.start_res && ra < b0.end_res && rb >= b0.start_res && rb < b0.end_res;
-            let in_b1 =
-                ra >= b1.start_res && ra < b1.end_res && rb >= b1.start_res && rb < b1.end_res;
+            let in_b0 = kin.residues[ra].master_block_id == Some(m0)
+                && kin.residues[rb].master_block_id == Some(m0);
+            let in_b1 = m1 != m0
+                && kin.residues[ra].master_block_id == Some(m1)
+                && kin.residues[rb].master_block_id == Some(m1);
             if !in_b0 && !in_b1 {
                 continue;
             }
@@ -5163,7 +7364,6 @@ fn optimize_block1_translation_target(
     weights: &DomainDockEnergyWeights,
 ) -> Vec3 {
     if prep.pcs_terms.is_empty() && prep.pre_terms.is_empty() && prep.noe_terms.is_empty() {
-        // Without translational restraints, keep N_{b1} comfortably inside linker reach & out of steric overlap
         let cur_v = v_sub(init_n_b1, anchor_c_prev);
         let cur_d = v_norm(cur_v);
         if cur_d <= max_reach * 0.85 && cur_d >= 3.5 {
@@ -5177,21 +7377,27 @@ fn optimize_block1_translation_target(
         return v_add(anchor_c_prev, v_scale(dir, (max_reach * 0.65).max(4.5)));
     }
 
-    let b0 = &kin.rigid_blocks[0];
-    let b1 = &kin.rigid_blocks[1];
-    let ca_b0: Vec<Vec3> = (b0.start_res..b0.end_res)
-        .map(|j| init_slots[7 * j + 2].0)
+    let m0 = kin.rigid_blocks[0].master_block_id;
+    let m1 = kin.rigid_blocks[1].master_block_id;
+    let ca_b0: Vec<Vec3> = kin
+        .residues
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.master_block_id == Some(m0))
+        .map(|(j, _)| init_slots[7 * j + 2].0)
         .collect();
-    let ca_b1_rot: Vec<Vec3> = (b1.start_res..b1.end_res)
-        .map(|j| mat3_mul_vec(q_b1, v_sub(init_slots[7 * j + 2].0, init_n_b1)))
+    let ca_b1_rot: Vec<Vec3> = kin
+        .residues
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| m1 != m0 && r.master_block_id == Some(m1))
+        .map(|(j, _)| mat3_mul_vec(q_b1, v_sub(init_slots[7 * j + 2].0, init_n_b1)))
         .collect();
 
-    // Evaluate translational energy + gradient wrt `n_pos` of block 1
     let eval_trans = |n_pos: Vec3| -> (f64, Vec3) {
         let mut e = 0.0_f64;
         let mut g = [0.0_f64; 3];
 
-        // Covalent linker reach tether
         let dv_reach = v_sub(n_pos, anchor_c_prev);
         let d_reach = (v_dot(dv_reach, dv_reach) + 1e-6).sqrt();
         let soft_reach = max_reach * 0.92;
@@ -5201,7 +7407,6 @@ fn optimize_block1_translation_target(
             g = v_add(g, v_scale(dv_reach, 24.0 * ex / d_reach));
         }
 
-        // Coarse CA-CA steric exclusion (`r_min = 4.6 Å`) between b0 and b1
         for &c0 in &ca_b0 {
             for &rel1 in &ca_b1_rot {
                 let c1 = v_add(n_pos, rel1);
@@ -5215,30 +7420,29 @@ fn optimize_block1_translation_target(
             }
         }
 
-        // Cross-domain working PCS (`b0 <-> b1`)
         if weights.w_pcs > 0.0 {
             for term in &prep.pcs_terms {
                 let res_a = term.atom_slot / 7;
                 let tag = &prep.pcs_tags[term.tag_idx];
-                let a_in_b1 = res_a >= b1.start_res && res_a < b1.end_res;
-                let a_in_b0 = res_a >= b0.start_res && res_a < b0.end_res;
-                if !(a_in_b1 && tag.host_block_id == 0) && !(a_in_b0 && tag.host_block_id == 1) {
+                let a_in_b1 = m1 != m0 && kin.residues[res_a].master_block_id == Some(m1);
+                let a_in_b0 = kin.residues[res_a].master_block_id == Some(m0);
+                if !(a_in_b1 && tag.host_block_id == m0) && !(a_in_b0 && tag.host_block_id == m1) {
                     continue;
                 }
                 let (pa, m_pos, dchi_w, sign_n) = if a_in_b1 {
                     let rel_a = mat3_mul_vec(q_b1, v_sub(init_slots[term.atom_slot].0, init_n_b1));
-                    let m0 = v_add(
-                        init_blk_frames[0].0,
-                        mat3_mul_vec(&init_blk_frames[0].1, tag.metal_local_pos),
+                    let m0_p = v_add(
+                        init_blk_frames[m0].0,
+                        mat3_mul_vec(&init_blk_frames[m0].1, tag.metal_local_pos),
                     );
-                    let dw0 = mat3_conjugate_sym(&init_blk_frames[0].1, &tag.dchi_local);
-                    (v_add(n_pos, rel_a), m0, dw0, 1.0)
+                    let dw0 = mat3_conjugate_sym(&init_blk_frames[m0].1, &tag.dchi_local);
+                    (v_add(n_pos, rel_a), m0_p, dw0, 1.0)
                 } else {
                     let pa0 = init_slots[term.atom_slot].0;
-                    let r_b1_w = mat3_mul(q_b1, &init_blk_frames[1].1);
-                    let m1 = v_add(n_pos, mat3_mul_vec(&r_b1_w, tag.metal_local_pos));
+                    let r_b1_w = mat3_mul(q_b1, &init_blk_frames[m1].1);
+                    let m1_p = v_add(n_pos, mat3_mul_vec(&r_b1_w, tag.metal_local_pos));
                     let dw1 = mat3_conjugate_sym(&r_b1_w, &tag.dchi_local);
-                    (pa0, m1, dw1, -1.0)
+                    (pa0, m1_p, dw1, -1.0)
                 };
                 let v = v_sub(pa, m_pos);
                 let r2 = v_dot(v, v) + 0.25;
@@ -5260,26 +7464,25 @@ fn optimize_block1_translation_target(
             }
         }
 
-        // Cross-domain PRE (`b0 <-> b1`)
         if weights.w_pre > 0.0 {
             for term in &prep.pre_terms {
                 let res_a = term.atom_slot / 7;
                 let ps = &prep.pre_sites[term.site_idx];
-                let a_in_b1 = res_a >= b1.start_res && res_a < b1.end_res;
-                let a_in_b0 = res_a >= b0.start_res && res_a < b0.end_res;
-                if !(a_in_b1 && ps.host_block_id == 0) && !(a_in_b0 && ps.host_block_id == 1) {
+                let a_in_b1 = m1 != m0 && kin.residues[res_a].master_block_id == Some(m1);
+                let a_in_b0 = kin.residues[res_a].master_block_id == Some(m0);
+                if !(a_in_b1 && ps.host_block_id == m0) && !(a_in_b0 && ps.host_block_id == m1) {
                     continue;
                 }
                 let (pa, s_pos, sign_n) = if a_in_b1 {
                     let rel_a = mat3_mul_vec(q_b1, v_sub(init_slots[term.atom_slot].0, init_n_b1));
                     let s0 = v_add(
-                        init_blk_frames[0].0,
-                        mat3_mul_vec(&init_blk_frames[0].1, ps.site_local_pos),
+                        init_blk_frames[m0].0,
+                        mat3_mul_vec(&init_blk_frames[m0].1, ps.site_local_pos),
                     );
                     (v_add(n_pos, rel_a), s0, 1.0)
                 } else {
                     let pa0 = init_slots[term.atom_slot].0;
-                    let r_b1_w = mat3_mul(q_b1, &init_blk_frames[1].1);
+                    let r_b1_w = mat3_mul(q_b1, &init_blk_frames[m1].1);
                     let s1 = v_add(n_pos, mat3_mul_vec(&r_b1_w, ps.site_local_pos));
                     (pa0, s1, -1.0)
                 };
@@ -5303,10 +7506,7 @@ fn optimize_block1_translation_target(
                         );
                     }
                 } else {
-                    let r2_eff = r2_raw + 4.0;
-                    let inv_r2 = 1.0 / r2_eff;
-                    let inv_r6 = inv_r2 * inv_r2 * inv_r2;
-                    let g2_c = term.k_pre_a6_s1 * inv_r6;
+                    let (g2_c, dg2_ds) = solomon_r6_rate_and_ds(r2_raw, term.k_pre_a6_s1);
                     let inv_s = term.inv_sigma2.sqrt();
                     let z = (g2_c - term.gamma2_obs_s1) * inv_s;
                     let kappa = 8.0_f64;
@@ -5317,10 +7517,7 @@ fn optimize_block1_translation_target(
                     };
                     e += weights.w_pre * he;
                     let de = weights.w_pre * dh * inv_s * sign_n;
-                    g = v_add(
-                        g,
-                        v_scale(dv, de * (-6.0 * term.k_pre_a6_s1 * inv_r6 * inv_r2)),
-                    );
+                    g = v_add(g, v_scale(dv, de * 2.0 * dg2_ds));
                     if d > term.upper_a {
                         let u = d - term.upper_a;
                         e += 0.5 * weights.w_pre * u * u;
@@ -5334,35 +7531,68 @@ fn optimize_block1_translation_target(
             }
         }
 
-        // Cross-domain NOEs (`b0 <-> b1`)
         if weights.w_noe > 0.0 {
             for term in &prep.noe_terms {
-                let ra = term.atom_a / 7;
-                let rb = term.atom_b / 7;
-                let a0_b1 =
-                    ra >= b0.start_res && ra < b0.end_res && rb >= b1.start_res && rb < b1.end_res;
-                let a1_b0 =
-                    ra >= b1.start_res && ra < b1.end_res && rb >= b0.start_res && rb < b0.end_res;
-                if !a0_b1 && !a1_b0 {
+                let c_end = (term.cand_start + term.cand_len).min(prep.noe_candidates.len());
+                if term.cand_start >= c_end {
                     continue;
                 }
-                let (pa, pb, sign_n) = if a1_b0 {
-                    let rel_a = mat3_mul_vec(q_b1, v_sub(init_slots[term.atom_a].0, init_n_b1));
-                    (v_add(n_pos, rel_a), init_slots[term.atom_b].0, 1.0)
+                let cands = &prep.noe_candidates[term.cand_start..c_end];
+                let mut cand_evals: Vec<(Vec3, f64, f64)> = Vec::new();
+                let mut s_min = f64::INFINITY;
+                for cand in cands {
+                    let ra = cand.atom_a / 7;
+                    let rb = cand.atom_b / 7;
+                    let ma = kin.residues[ra].master_block_id;
+                    let mb = kin.residues[rb].master_block_id;
+                    let a0_b1 = ma == Some(m0) && m1 != m0 && mb == Some(m1);
+                    let a1_b0 = m1 != m0 && ma == Some(m1) && mb == Some(m0);
+                    if !a0_b1 && !a1_b0 {
+                        continue;
+                    }
+                    let (pa, pb, sign_n) = if a1_b0 {
+                        let rel_a = mat3_mul_vec(q_b1, v_sub(init_slots[cand.atom_a].0, init_n_b1));
+                        (v_add(n_pos, rel_a), init_slots[cand.atom_b].0, 1.0)
+                    } else {
+                        let rel_b = mat3_mul_vec(q_b1, v_sub(init_slots[cand.atom_b].0, init_n_b1));
+                        (init_slots[cand.atom_a].0, v_add(n_pos, rel_b), -1.0)
+                    };
+                    let df = v_sub(pa, pb);
+                    let sc = v_dot(df, df) + 1e-6;
+                    if sc < s_min {
+                        s_min = sc;
+                    }
+                    cand_evals.push((df, sc, sign_n));
+                }
+                if cand_evals.is_empty() || !s_min.is_finite() {
+                    continue;
+                }
+                let mut tilde_s = 0.0_f64;
+                for &(_, sc, _) in &cand_evals {
+                    let q = s_min / sc;
+                    tilde_s += q * q * q;
+                }
+                if tilde_s <= 0.0 {
+                    continue;
+                }
+                let d_eff = s_min.sqrt() / det_cbrt(tilde_s).sqrt();
+                let (v_e, dv_dd) = if d_eff > term.upper_a {
+                    let u = d_eff - term.upper_a;
+                    (weights.w_noe * u * u, 2.0 * weights.w_noe * u)
+                } else if d_eff < term.lower_a {
+                    let u = term.lower_a - d_eff;
+                    (weights.w_noe * u * u, -2.0 * weights.w_noe * u)
                 } else {
-                    let rel_b = mat3_mul_vec(q_b1, v_sub(init_slots[term.atom_b].0, init_n_b1));
-                    (init_slots[term.atom_a].0, v_add(n_pos, rel_b), -1.0)
+                    (0.0, 0.0)
                 };
-                let df = v_sub(pa, pb);
-                let d = (v_dot(df, df) + 1e-6).sqrt();
-                if d > term.upper_a {
-                    let u = d - term.upper_a;
-                    e += weights.w_noe * u * u;
-                    g = v_add(g, v_scale(df, sign_n * 2.0 * weights.w_noe * u / d));
-                } else if d < term.lower_a {
-                    let u = term.lower_a - d;
-                    e += weights.w_noe * u * u;
-                    g = v_add(g, v_scale(df, -sign_n * 2.0 * weights.w_noe * u / d));
+                e += v_e;
+                if dv_dd != 0.0 {
+                    let denom = s_min * tilde_s;
+                    for &(df, sc, sign_n) in &cand_evals {
+                        let q = s_min / sc;
+                        let w_c = q * q * q;
+                        g = v_add(g, v_scale(df, sign_n * dv_dd * (d_eff * w_c * q) / denom));
+                    }
                 }
             }
         }
@@ -5370,19 +7600,30 @@ fn optimize_block1_translation_target(
         (e, g)
     };
 
-    // Multi-shell 3D Fibonacci grid around `anchor_c_prev` + `init_n_b1`, retaining the top 4
-    // spatially distinct (`>= 4.5 Å`) lobe basins before 3D two-loop L-BFGS refinement!
     let mut grid_cands: Vec<(f64, Vec3)> = Vec::with_capacity(390);
     let (e_init, _) = eval_trans(init_n_b1);
     grid_cands.push((e_init, init_n_b1));
 
+    let same_chain_search = kin
+        .rigid_blocks
+        .get(1)
+        .is_none_or(|b1| b1.chain_idx == kin.rigid_blocks[0].chain_idx);
+    let shell_origin = if same_chain_search {
+        anchor_c_prev
+    } else {
+        kin.chain_ref_centroids
+            .first()
+            .copied()
+            .unwrap_or(anchor_c_prev)
+    };
+    let r_cap = if same_chain_search { 35.0 } else { 60.0 };
     let r_shells = [
-        (max_reach * 0.24).clamp(3.6, 12.0),
-        (max_reach * 0.38).clamp(5.0, 16.0),
-        (max_reach * 0.52).clamp(6.5, 21.0),
-        (max_reach * 0.66).clamp(8.0, 26.0),
-        (max_reach * 0.80).clamp(9.5, 31.0),
-        (max_reach * 0.91).clamp(11.0, 35.0),
+        (max_reach * 0.24).clamp(3.6, r_cap * 0.35),
+        (max_reach * 0.38).clamp(5.0, r_cap * 0.48),
+        (max_reach * 0.52).clamp(6.5, r_cap * 0.62),
+        (max_reach * 0.66).clamp(8.0, r_cap * 0.76),
+        (max_reach * 0.80).clamp(9.5, r_cap * 0.90),
+        (max_reach * 0.91).clamp(11.0, r_cap),
     ];
     let golden = PI * (3.0 - 5.0_f64.sqrt());
     for &rad in &r_shells {
@@ -5392,9 +7633,9 @@ fn optimize_block1_translation_target(
             let th = golden * (k as f64);
             let (st, ct) = det_sin_cos(th);
             let cand = [
-                anchor_c_prev[0] + rad * r_xy * ct,
-                anchor_c_prev[1] + rad * y,
-                anchor_c_prev[2] + rad * r_xy * st,
+                shell_origin[0] + rad * r_xy * ct,
+                shell_origin[1] + rad * y,
+                shell_origin[2] + rad * r_xy * st,
             ];
             let (ce, _) = eval_trans(cand);
             grid_cands.push((ce, cand));
@@ -5415,7 +7656,6 @@ fn optimize_block1_translation_target(
         start_basins.push(init_n_b1);
     }
 
-    // Refine each distinct lobe candidate in R^3 via compact two-loop L-BFGS (60 iters)
     let mut global_best_p = start_basins[0];
     let mut global_best_e = f64::INFINITY;
     for start_p in start_basins {
@@ -5533,7 +7773,6 @@ fn close_covalent_linker_segment(
         return best_state;
     }
 
-    // Initialize linker dihedrals according to `basin_variant` (`0` = input AF, `1` = extended/PPII, `2` = alpha/turn, `3` = perturbed)
     match basin_variant {
         0 => {}
         1 => {
@@ -5579,7 +7818,6 @@ fn close_covalent_linker_segment(
     let target_ca_rel = mat3_mul_vec(r_target, rs_geom.local_slots[2].0);
     let target_c_rel = mat3_mul_vec(r_target, rs_geom.local_slots[4].0);
 
-    // Upstream anchor `(N_{lk_start-1}, CA_{lk_start-1}, C_{lk_start-1})` is completely fixed during `[lk_start..lk_end)` closure!
     let (base_slots, _) = kin.forward_slots_and_block_frames(&best_state);
     let anchor_n = base_slots[7 * (lk_start - 1)].0;
     let anchor_ca = base_slots[7 * (lk_start - 1) + 2].0;
@@ -5666,13 +7904,11 @@ fn close_covalent_linker_segment(
         let mut obj = 0.5 * w_pos * v_dot(dn, dn)
             + 0.5 * w_ori * (v_dot(d_ca_rel, d_ca_rel) + v_dot(d_c_rel, d_c_rel));
 
-        // Forces on `(N_s, CA_s, C_s)` — all three lie strictly downstream of every `[0..m_len)` torsion!
         let f_ca = v_scale(d_ca_rel, w_ori);
         let f_c = v_scale(d_c_rel, w_ori);
         let f_n = v_sub(v_scale(dn, w_pos), v_add(f_ca, f_c));
 
-        let suf_f = v_add(f_n, v_add(f_ca, f_c)); // Note: equals w_pos * dn!
-                                                  // Torque around `n_s`
+        let suf_f = v_add(f_n, v_add(f_ca, f_c));
         let mut suf_t = v_add(
             v_cross(v_sub(ca_s, n_s), f_ca),
             v_cross(v_sub(c_s, n_s), f_c),
@@ -5724,7 +7960,6 @@ fn close_covalent_linker_segment(
         obj
     };
 
-    // Compact two-loop L-BFGS (`m_hist = 6`, `140` iterations)
     let mut g = vec![0.0_f64; n_dim];
     let mut cur_obj = eval_closure(&x, &mut g);
     let m_hist = 6usize;
@@ -5864,8 +8099,6 @@ pub fn polish_domain_dock_state_lbfgs(
     }
     let n_tors = active_tors.len();
     let n_partner_chains = kin.chain_ranges.len().saturating_sub(1);
-    // Partner chain translations are pre-scaled by `trans_scale = 4.0 Å / rad` so rotational and
-    // translational steps share balanced Euclidean curvature inside L-BFGS!
     let trans_scale = 4.0_f64;
     let n_dim = n_tors + 6 * n_partner_chains;
 
@@ -6029,9 +8262,119 @@ pub fn polish_domain_dock_state_lbfgs(
     (cur_state, cur_eb)
 }
 
-/// Prepare `rdc_media` (`ByPeptidePlane` domain-stratified `RdcFree` holdout when needed), run
-/// Tolman $\vartheta_d / \vartheta_1$ GDO analysis, and compile `PreparedDomainDockRestraints`.
-pub fn prepare_domain_dock_inputs(
+/// Evaluate independent pre-dock intra-domain `RDC Q_work` & held-out `ByPeptidePlane Q_free`
+/// across all confident rigid domains (`21.W2:P1-6`).
+fn evaluate_pre_dock_intra_domain_rdcs(
+    kin: &DomainLinkerKinematics,
+    cseq: &ChainSeqIndex,
+    partition: &PaeDomainPartition,
+    filtered_media: &[DomainRdcMediumSet],
+    max_intra_q_free: f64,
+    require_min_8_work: bool,
+) -> Result<Vec<PreDockDomainRdcCheck>, String> {
+    let mut checks = Vec::new();
+    let kin_plddts: Vec<Option<f64>> = kin.residues.iter().map(|r| r.plddt).collect();
+    for dom in &partition.domains {
+        let d_id = dom.domain_id;
+        for med in filtered_media {
+            let mut sub_restraints = Vec::new();
+            let mut n_work = 0usize;
+            let mut n_free = 0usize;
+            for r in &med.restraints {
+                let (Some(i1), Some(i2)) = (
+                    cseq.resolve(r.chain_id_1.as_deref(), r.seq_id_1)?,
+                    cseq.resolve(r.chain_id_2.as_deref(), r.seq_id_2)?,
+                ) else {
+                    continue;
+                };
+                if is_confident_rigid_residue(
+                    i1,
+                    partition,
+                    Some(&kin_plddts),
+                    DEFAULT_MIN_ORDERED_PLDDT,
+                ) == Some(d_id)
+                    && is_confident_rigid_residue(
+                        i2,
+                        partition,
+                        Some(&kin_plddts),
+                        DEFAULT_MIN_ORDERED_PLDDT,
+                    ) == Some(d_id)
+                {
+                    if r.is_free {
+                        n_free += 1;
+                    } else {
+                        n_work += 1;
+                    }
+                    sub_restraints.push(r.clone());
+                }
+            }
+            if n_work == 0 && n_free == 0 {
+                continue;
+            }
+            if n_work < MIN_TOLMAN_DOMAIN_WORK_RDCS {
+                let passed = !require_min_8_work;
+                checks.push(PreDockDomainRdcCheck {
+                    domain_id: d_id,
+                    medium_id: med.medium_id.clone(),
+                    n_work,
+                    n_free,
+                    q_work: f64::NAN,
+                    q_free: f64::NAN,
+                    passed,
+                });
+                continue;
+            }
+            let sub_med = DomainRdcMediumSet {
+                medium_id: med.medium_id.clone(),
+                restraints: sub_restraints,
+            };
+            match fit_saupe_tensor_domain_rdc(&kin.ref_chain, cseq, &sub_med) {
+                Ok((fit, _)) => {
+                    let q_gate = if n_free > 0 && fit.q_free.is_finite() {
+                        fit.q_free
+                    } else {
+                        fit.q_work
+                    };
+                    let passed = q_gate.is_finite()
+                        && q_gate <= max_intra_q_free
+                        && fit.q_work.is_finite()
+                        && fit.q_work <= max_intra_q_free;
+                    checks.push(PreDockDomainRdcCheck {
+                        domain_id: d_id,
+                        medium_id: med.medium_id.clone(),
+                        n_work,
+                        n_free,
+                        q_work: fit.q_work,
+                        q_free: fit.q_free,
+                        passed,
+                    });
+                }
+                Err(_) => {
+                    checks.push(PreDockDomainRdcCheck {
+                        domain_id: d_id,
+                        medium_id: med.medium_id.clone(),
+                        n_work,
+                        n_free,
+                        q_work: f64::NAN,
+                        q_free: f64::NAN,
+                        passed: false,
+                    });
+                }
+            }
+        }
+    }
+    Ok(checks)
+}
+
+/// Full scientific hygiene & input preparation pipeline shared identically by CPU (`nmr-core`)
+/// and WebGPU (`nmr-gpu`):
+/// 1. Enforces mandatory `tau_c_ns` + `proton_mhz` on Solomon `Gamma2` PRE restraints (`21.W3:P0-4`),
+/// 2. Excludes flexible linker, tail, inter-domain, and `pLDDT < min_ordered_plddt` RDCs (`21.W2:P1-4`),
+/// 3. Stratifies `ByPeptidePlane` `RdcFree` and `20%` `PCS` `is_free` holdouts strictly inside confident rigid domains (`21.W2:P1-4`, `P1-5`),
+/// 4. Runs pre-dock intra-domain coordinate consistency check (`intra_domain_q_free <= 0.50`, `21.W2:P1-6`),
+/// 5. Runs coordinate-noise-aware Tolman $\vartheta_d / \vartheta_1$ GDO analysis (`21.W2:A8`),
+/// 6. Compiles `PreparedDomainDockRestraints` and enforces the single-medium / coaxial observability gate (`21.W2:P2-8`).
+pub fn prepare_domain_dock_inputs_full(
     kin: &DomainLinkerKinematics,
     partition: &PaeDomainPartition,
     rdc_media: &mut [RdcMediumSet],
@@ -6039,36 +8382,142 @@ pub fn prepare_domain_dock_inputs(
     pre_sites: &[DomainPreSiteSet],
     noe_adrs: &[AmbiguousDistanceRestraint],
     cfg: &DomainDockConfig,
-) -> Result<(TolmanGdoMotionReport, PreparedDomainDockRestraints), String> {
+) -> Result<PreparedDomainDockPipeline, String> {
+    let cseq = ChainSeqIndex::from_kin(kin)?;
+    let chain_ids: Vec<String> = kin.residues.iter().map(|r| r.chain_id.clone()).collect();
     let seq_ids: Vec<i32> = kin.residues.iter().map(|r| r.seq_id).collect();
+    let kin_plddts: Vec<Option<f64>> = kin.residues.iter().map(|r| r.plddt).collect();
+    let min_plddt = cfg.pae_cfg.min_ordered_plddt;
+
+    // 1. Mandatory `tau_c_ns` + `proton_mhz` check on all Solomon `Gamma2Rate` PRE restraints (`21.W3:P0-4`)
+    let mut normalized_pre_sites = pre_sites.to_vec();
+    for ps in &mut normalized_pre_sites {
+        let has_gamma2 = ps
+            .restraints
+            .iter()
+            .any(|r| matches!(r.kind, PreRestraintKind::Gamma2Rate { .. }));
+        if has_gamma2 {
+            let tc = ps.tau_c_ns.or(cfg.pre_tau_c_ns).ok_or_else(|| {
+                format!(
+                    "PRE site '{}': Solomon Gamma2 restraints require explicit rotational correlation time tau_c_ns (`# tau_c_ns: <ns>` or `--pre-tau-c-ns <ns>`)",
+                    ps.site_id
+                )
+            })?;
+            if !tc.is_finite() || tc <= 0.0 {
+                return Err(format!(
+                    "PRE site '{}': tau_c_ns ({tc}) must be finite and > 0",
+                    ps.site_id
+                ));
+            }
+            let mhz = ps.proton_mhz.or(cfg.pre_proton_mhz).ok_or_else(|| {
+                format!(
+                    "PRE site '{}': Solomon–Bloembergen Gamma2 restraints require explicit 1H Larmor frequency proton_mhz (`# proton_mhz: <MHz>` or `--pre-proton-mhz <MHz>`)",
+                    ps.site_id
+                )
+            })?;
+            if !mhz.is_finite() || mhz <= 0.0 {
+                return Err(format!(
+                    "PRE site '{}': proton_mhz ({mhz}) must be finite and > 0",
+                    ps.site_id
+                ));
+            }
+            let had_site_tc = ps.tau_c_ns.is_some() && ps.proton_mhz.is_some();
+            ps.tau_c_ns = Some(tc);
+            ps.proton_mhz = Some(mhz);
+            let default_exact_k =
+                compute_solomon_k_pre_a6_s1(tc, mhz, 0.5, CODATA_ELECTRON_G_FACTOR)?;
+            for r in &mut ps.restraints {
+                if let PreRestraintKind::Gamma2Rate { k_pre_a6_s1, .. } = &mut r.kind {
+                    if !had_site_tc || *k_pre_a6_s1 < 1.0e12 || !k_pre_a6_s1.is_finite() {
+                        *k_pre_a6_s1 = default_exact_k;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Build chain-explicit RDC media and filter out flexible linker / tail / low-pLDDT RDCs (`21.W2:P1-4`)
+    let use_chain_cfg_rdcs = !cfg.chain_rdc_media.is_empty();
+    let raw_dom_media = if use_chain_cfg_rdcs {
+        cfg.chain_rdc_media.clone()
+    } else {
+        DomainRdcMediumSet::from_rdc_media(rdc_media)
+    };
+    let (mut dom_rdc_media, n_excluded_flexible_rdcs) = filter_confident_rigid_domain_rdcs(
+        &raw_dom_media,
+        &cseq,
+        partition,
+        Some(&kin_plddts),
+        min_plddt,
+    )?;
+
     if cfg.auto_partition_rdc_free
         && cfg.rdc_free_fraction > 0.0
-        && !rdc_media.is_empty()
-        && !rdc_media
+        && !dom_rdc_media.is_empty()
+        && !dom_rdc_media
             .iter()
             .any(|m| m.restraints.iter().any(|r| r.is_free))
     {
-        partition_domain_stratified_rdc_free_set(
-            rdc_media,
-            partition,
+        partition_domain_stratified_domain_rdc_free_set(
+            &mut dom_rdc_media,
+            &cseq,
+            &chain_ids,
             &seq_ids,
+            partition,
+            Some(&kin_plddts),
+            min_plddt,
             cfg.rdc_free_fraction,
             cfg.seed,
-        );
+        )?;
+    }
+    if !use_chain_cfg_rdcs {
+        // Propagate filtered + stratified RDC sets back to caller slice when single-chain `rdc_media` was supplied
+        for (dst_m, src_m) in rdc_media.iter_mut().zip(dom_rdc_media.iter()) {
+            dst_m.restraints = src_m
+                .restraints
+                .iter()
+                .map(DomainRdcRestraint::to_rdc_restraint)
+                .collect();
+        }
     }
 
-    let tolman_gdo = evaluate_tolman_domain_gdo(
+    // 3. Domain-stratified `20%` `PCS` holdout (`21.W2:P1-5`)
+    let mut pcs_tags_prepared = pcs_tags.to_vec();
+    if cfg.auto_partition_pcs_free
+        && cfg.pcs_free_fraction > 0.0
+        && !pcs_tags_prepared.is_empty()
+        && !pcs_tags_prepared
+            .iter()
+            .any(|t| t.restraints.iter().any(|r| r.is_free))
+    {
+        partition_domain_stratified_pcs_free_set(
+            &mut pcs_tags_prepared,
+            &cseq,
+            partition,
+            Some(&kin_plddts),
+            min_plddt,
+            cfg.pcs_free_fraction,
+            cfg.seed,
+        )?;
+    }
+
+    // 4. Tolman GDO inter-domain motion test including coordinate-noise floor (`21.W2:A8`)
+    let tolman_gdo = evaluate_tolman_domain_gdo_multi_chain(
         &kin.ref_chain,
+        &cseq,
         partition,
-        rdc_media,
+        Some(&kin_plddts),
+        min_plddt,
+        &dom_rdc_media,
         cfg.tolman_mc_trials,
+        cfg.tolman_coord_noise_angstrom,
         cfg.seed,
     );
 
     let gdo_scale_map: Option<BTreeMap<(usize, usize), f64>> =
         if tolman_gdo.regime == DomainMotionRegime::DecoupledInterDomainMotion {
             let mut mp = BTreeMap::new();
-            for (m_idx, med) in rdc_media.iter().enumerate() {
+            for (m_idx, med) in dom_rdc_media.iter().enumerate() {
                 for fit in &tolman_gdo.domain_fits {
                     if fit.medium_id == med.medium_id {
                         mp.insert((fit.domain_id, m_idx), fit.rho_gdo.clamp(0.05, 1.0));
@@ -6080,21 +8529,135 @@ pub fn prepare_domain_dock_inputs(
             None
         };
 
-    let prep = PreparedDomainDockRestraints::compile(
+    // 5. Compile working restraints
+    let prep = PreparedDomainDockRestraints::compile_multi_chain(
         kin,
         partition,
-        rdc_media,
-        pcs_tags,
-        pre_sites,
+        &dom_rdc_media,
+        &pcs_tags_prepared,
+        &normalized_pre_sites,
         noe_adrs,
         gdo_scale_map.as_ref(),
+        min_plddt,
+        cfg.refine_pcs_metal_pos,
+        cfg.pcs_metal_search_radius_a,
+        cfg.mtsl_tether_allowance_a,
     )?;
-    Ok((tolman_gdo, prep))
+
+    let has_strong_dist = prep.pcs_terms.len() >= 5
+        || prep.pre_terms.len() >= 3
+        || prep.noe_terms.len() >= 3
+        || (prep.pcs_terms.len() + prep.pre_terms.len() + prep.noe_terms.len() >= 4);
+
+    // 6. Pre-dock intra-domain coordinate consistency gate (`21.W2:P1-6`)
+    let mut extra_candor_notes = Vec::new();
+    if n_excluded_flexible_rdcs > 0 {
+        extra_candor_notes.push(format!(
+            "Static-tensor hygiene [21.W2:P1-4]: excluded {n_excluded_flexible_rdcs} flexible-linker, terminal-tail, inter-domain, or low-pLDDT (< {min_plddt:.0}) RDC(s) from both static Saupe SVD and held-out RdcFree cross-validation."
+        ));
+    }
+    let pre_dock_domain_checks = evaluate_pre_dock_intra_domain_rdcs(
+        kin,
+        &cseq,
+        partition,
+        &dom_rdc_media,
+        cfg.max_intra_domain_rdc_q_free,
+        !has_strong_dist && partition.domains.len() >= 2,
+    )?;
+    let mut poor_intra = false;
+    for chk in &pre_dock_domain_checks {
+        if !chk.passed {
+            poor_intra = true;
+            let reason = if chk.n_work < MIN_TOLMAN_DOMAIN_WORK_RDCS {
+                format!(
+                    "domain {} in medium '{}' has only {} working intra-domain RDCs (< {} required without cross-domain PCS/PRE/NOE restraints)",
+                    chk.domain_id, chk.medium_id, chk.n_work, MIN_TOLMAN_DOMAIN_WORK_RDCS
+                )
+            } else {
+                format!(
+                    "domain {} in medium '{}' failed pre-dock intra-domain coordinate consistency (intra Q_work={:.4}, held-out Q_free={:.4} > {:.2})",
+                    chk.domain_id,
+                    chk.medium_id,
+                    chk.q_work,
+                    chk.q_free,
+                    cfg.max_intra_domain_rdc_q_free
+                )
+            };
+            if !cfg.allow_poor_intra_domain_fit {
+                return Err(format!(
+                    "Refusing rigid-body multi-domain docking [21.W2:P1-6]: {reason}. Fix intra-domain coordinates first or pass --allow-poor-intra-domain-fit (`allow_poor_intra_domain_fit = true`) to override with IntraDomainMismatchWarning."
+                ));
+            }
+            extra_candor_notes.push(format!(
+                "Candor warning [21.W2:P1-6 IntraDomainMismatchWarning]: {reason}; rigid-body inter-domain pose may absorb internal coordinate errors."
+            ));
+        }
+    }
+
+    // 7. Single-medium / coaxial RDC-only refusal gate (`21.W2:P2-8`)
+    let mut single_med_warn = false;
+    if partition.domains.len() >= 2 {
+        let (obs_reg, _) = classify_dipolar_observability_multi(
+            partition,
+            &dom_rdc_media,
+            prep.pcs_terms.len(),
+            prep.pre_terms.len(),
+            prep.noe_terms.len(),
+            &kin.ref_chain,
+            &cseq,
+        );
+        if obs_reg == DipolarObservabilityRegime::UnderdeterminedSingleMediumRdcOnly {
+            if !cfg.allow_underdetermined_single_medium {
+                return Err(format!(
+                    "Refusing underdetermined multi-domain docking [F8 / 21.W2:P2-8]: fewer than 2 non-coaxial RDC media (|cos| < {MAX_COAXIAL_SAUPE_COS_SIM:.2}) and insufficient cross-domain PCS ({}) / PRE ({}) / NOE ({}) restraints leave a 4-fold PAS cone degeneracy and zero translational observability. Supply >= 2 non-coaxial media or PCS/PRE/NOE restraints, or pass --allow-underdetermined-single-medium (`allow_underdetermined_single_medium = true`) to explore degenerate solutions.",
+                    prep.pcs_terms.len(),
+                    prep.pre_terms.len(),
+                    prep.noe_terms.len()
+                ));
+            }
+            single_med_warn = true;
+        }
+    }
+
+    let quality_verdict = match (poor_intra, single_med_warn) {
+        (false, false) => DomainDockQualityVerdict::PassedAllChecks,
+        (true, false) => DomainDockQualityVerdict::IntraDomainMismatchWarning,
+        (false, true) => DomainDockQualityVerdict::UnderdeterminedSingleMediumWarning,
+        (true, true) => DomainDockQualityVerdict::IntraDomainAndSingleMediumWarning,
+    };
+
+    Ok(PreparedDomainDockPipeline {
+        domain_rdc_media: dom_rdc_media,
+        pcs_tags: pcs_tags_prepared,
+        tolman_gdo,
+        prep,
+        pre_dock_domain_checks,
+        quality_verdict,
+        extra_candor_notes,
+        n_excluded_flexible_rdcs,
+    })
+}
+
+/// Prepare `rdc_media` (`ByPeptidePlane` domain-stratified `RdcFree` holdout when needed), run
+/// Tolman $\vartheta_d / \vartheta_1$ GDO analysis, and compile `PreparedDomainDockRestraints`.
+pub fn prepare_domain_dock_inputs(
+    kin: &DomainLinkerKinematics,
+    partition: &PaeDomainPartition,
+    rdc_media: &mut [RdcMediumSet],
+    pcs_tags: &[DomainPcsTagSet],
+    pre_sites: &[DomainPreSiteSet],
+    noe_adrs: &[AmbiguousDistanceRestraint],
+    cfg: &DomainDockConfig,
+) -> Result<(TolmanGdoMotionReport, PreparedDomainDockRestraints), String> {
+    let pipe = prepare_domain_dock_inputs_full(
+        kin, partition, rdc_media, pcs_tags, pre_sites, noe_adrs, cfg,
+    )?;
+    Ok((pipe.tolman_gdo, pipe.prep))
 }
 
 /// Run the complete CPU (`f64`) multi-domain docking pipeline (`PAE` spectral clustering +
-/// Tolman GDO motion test + multi-start `PAS`/`PCS`/`PRE` covalent linker seeding + heavy-ball
-/// annealing + two-loop `L-BFGS` polish).
+/// pre-dock intra-domain check + Tolman GDO motion test + multi-start `PAS`/`PCS`/`PRE` covalent
+/// linker seeding + heavy-ball annealing + two-loop `L-BFGS` polish).
 pub fn dock_domains_cpu(
     model: &AfStructureModel,
     pae: &PaeMatrix,
@@ -6117,6 +8680,51 @@ pub fn dock_domains_cpu(
     )
 }
 
+/// Run multi-chain `(chain_id, seq_id)` CPU (`f64`) docking across multiple polymer chains (`21.W2:P1-8`).
+pub fn dock_domains_multi_chain_cpu(
+    models: &[AfStructureModel],
+    pae: &PaeMatrix,
+    domain_rdc_media: &[DomainRdcMediumSet],
+    pcs_tags: &[DomainPcsTagSet],
+    pre_sites: &[DomainPreSiteSet],
+    noe_adrs: &[AmbiguousDistanceRestraint],
+    cfg: &DomainDockConfig,
+) -> Result<DomainDockResult, String> {
+    if models.is_empty() {
+        return Err("dock_domains_multi_chain_cpu requires >= 1 AfStructureModel".to_string());
+    }
+    let mut seq_ids = Vec::new();
+    let mut chain_ids = Vec::new();
+    let mut plddts = Vec::new();
+    let mut any_plddt = false;
+    for (m_idx, m) in models.iter().enumerate() {
+        for r in &m.residues {
+            seq_ids.push(r.seq_id);
+            let cid = if r.chain_id.trim().is_empty() {
+                format!("{}", (b'A' + (m_idx as u8).min(25)) as char)
+            } else {
+                r.chain_id.clone()
+            };
+            chain_ids.push(cid);
+            if r.plddt.is_some() {
+                any_plddt = true;
+            }
+            plddts.push(r.plddt.unwrap_or(100.0));
+        }
+    }
+    let partition = cluster_pae_domains(
+        pae,
+        any_plddt.then_some(plddts.as_slice()),
+        Some(&seq_ids),
+        Some(&chain_ids),
+        &cfg.pae_cfg,
+    )?;
+    let kin = DomainLinkerKinematics::from_multi_chain_models(models, &partition)?;
+    let mut cfg_mc = cfg.clone();
+    cfg_mc.chain_rdc_media = domain_rdc_media.to_vec();
+    dock_domains_with_kinematics_cpu(kin, partition, &[], pcs_tags, pre_sites, noe_adrs, &cfg_mc)
+}
+
 pub fn dock_domains_with_kinematics_cpu(
     kin: DomainLinkerKinematics,
     partition: PaeDomainPartition,
@@ -6127,7 +8735,7 @@ pub fn dock_domains_with_kinematics_cpu(
     cfg: &DomainDockConfig,
 ) -> Result<DomainDockResult, String> {
     let mut rdc_media = rdc_media_in.to_vec();
-    let (tolman_gdo, prep) = prepare_domain_dock_inputs(
+    let pipe = prepare_domain_dock_inputs_full(
         &kin,
         &partition,
         &mut rdc_media,
@@ -6136,6 +8744,7 @@ pub fn dock_domains_with_kinematics_cpu(
         noe_adrs,
         cfg,
     )?;
+    let prep = &pipe.prep;
 
     let has_any_restraints = !prep.rdc_terms.is_empty()
         || !prep.pcs_terms.is_empty()
@@ -6145,13 +8754,13 @@ pub fn dock_domains_with_kinematics_cpu(
     let n_ens = cfg.ensemble_size.max(1);
     let polished = if !has_any_restraints || partition.domains.len() <= 1 {
         let st0 = kin.initial_state();
-        let (eb0, _) = evaluate_domain_dock_state_cpu(&kin, &prep, &st0, &cfg.weights);
+        let (eb0, _) = evaluate_domain_dock_state_cpu(&kin, prep, &st0, &cfg.weights);
         vec![(st0, eb0)]
     } else {
         let mut states = generate_domain_dock_seed_states(
             &kin,
             &partition,
-            &prep,
+            prep,
             &cfg.weights,
             cfg.n_replicas.max(n_ens),
             cfg.seed,
@@ -6166,7 +8775,7 @@ pub fn dock_domains_with_kinematics_cpu(
         let mut best_energies: Vec<f64> = states
             .iter()
             .map(|s| {
-                evaluate_domain_dock_state_cpu(&kin, &prep, s, &cfg.weights)
+                evaluate_domain_dock_state_cpu(&kin, prep, s, &cfg.weights)
                     .0
                     .total
             })
@@ -6185,7 +8794,7 @@ pub fn dock_domains_with_kinematics_cpu(
             cur_w.vdw_scale = cfg.weights.vdw_scale * (0.78 + 0.22 * ramp);
 
             for (ri, st) in states.iter_mut().enumerate() {
-                let (eb, gr) = evaluate_domain_dock_state_cpu(&kin, &prep, st, &cur_w);
+                let (eb, gr) = evaluate_domain_dock_state_cpu(&kin, prep, st, &cur_w);
                 if ramp >= 1.0 && eb.total < best_energies[ri] {
                     best_energies[ri] = eb.total;
                     best_states[ri] = st.clone();
@@ -6235,7 +8844,7 @@ pub fn dock_domains_with_kinematics_cpu(
 
         select_and_polish_top_states(
             &kin,
-            &prep,
+            prep,
             best_states,
             &cfg.weights,
             n_ens,
@@ -6243,18 +8852,46 @@ pub fn dock_domains_with_kinematics_cpu(
         )
     };
 
-    finalize_domain_dock_result(
+    finalize_domain_dock_pipeline(
         kin,
         partition,
-        tolman_gdo,
-        &prep,
-        &rdc_media,
-        pcs_tags,
+        pipe,
         pre_sites,
         polished,
         "CPU (f64)".to_string(),
         0.0,
     )
+}
+
+/// Multi-chain-safe Kabsch backbone (`N`, `CA`, `C`) RMSD (Å) keyed strictly by `(chain_id, seq_id)`
+/// so homodimers / multi-chain assemblies with overlapping residue numbering never collide (`21.W2:P1-8`).
+pub fn multi_chain_backbone_rmsd(
+    chain_a: &PdbChain,
+    chain_b: &PdbChain,
+    ordered_mask_a: Option<&[bool]>,
+) -> f64 {
+    let mut b_map: BTreeMap<(char, i32), usize> = BTreeMap::new();
+    for (bi, rb) in chain_b.residues.iter().enumerate() {
+        b_map.entry((rb.chain_id, rb.seq_id)).or_insert(bi);
+    }
+    let mut pts_a = Vec::with_capacity(chain_a.residues.len() * 3);
+    let mut pts_b = Vec::with_capacity(chain_a.residues.len() * 3);
+    for (ai, ra) in chain_a.residues.iter().enumerate() {
+        if let Some(mask) = ordered_mask_a {
+            if ai < mask.len() && !mask[ai] {
+                continue;
+            }
+        }
+        if let Some(&bi) = b_map.get(&(ra.chain_id, ra.seq_id)) {
+            let rb = &chain_b.residues[bi];
+            pts_a.extend([ra.n, ra.ca, ra.c]);
+            pts_b.extend([rb.n, rb.ca, rb.c]);
+        }
+    }
+    if pts_a.len() < 3 {
+        return f64::NAN;
+    }
+    kabsch_rmsd(&pts_a, &pts_b)
 }
 
 /// Select diverse low-energy candidate states and run host `f64` two-loop `L-BFGS` polish.
@@ -6282,7 +8919,7 @@ pub fn select_and_polish_top_states(
         let ch = kin.build_pdb_chain(&st);
         let too_close = picked.iter().any(|prev| {
             let pch = kin.build_pdb_chain(prev);
-            backbone_rmsd_between_chains(&ch, &pch, None) < 0.25
+            multi_chain_backbone_rmsd(&ch, &pch, None) < 0.25
         });
         if !too_close && picked.len() < polish_budget {
             picked.push(st);
@@ -6306,24 +8943,23 @@ pub fn select_and_polish_top_states(
     polished
 }
 
-/// Assemble the validated `DomainDockResult` (`Q_work`, `ByPeptidePlane Q_free`, `PCS Q`,
-/// `0.000 Å` intra-domain RMSD check, and `F8` observability candor notes).
-#[allow(clippy::too_many_arguments)]
-pub fn finalize_domain_dock_result(
+/// Assemble the validated `DomainDockResult` from a `PreparedDomainDockPipeline` (preserving
+/// `(chain_id, seq_id)` RDC/PCS validation, honest `pcs_q_free: Option<f64>`, `0.000 Å` intra-domain
+/// RMSD check, and pre-dock / `F8` candor notes).
+pub fn finalize_domain_dock_pipeline(
     kin: DomainLinkerKinematics,
     partition: PaeDomainPartition,
-    tolman_gdo: TolmanGdoMotionReport,
-    prep: &PreparedDomainDockRestraints,
-    rdc_media: &[RdcMediumSet],
-    pcs_tags: &[DomainPcsTagSet],
-    pre_sites: &[DomainPreSiteSet],
+    pipe: PreparedDomainDockPipeline,
+    _pre_sites: &[DomainPreSiteSet],
     polished: Vec<(DomainDockState, DomainDockEnergyBreakdown)>,
     engine_used: String,
     elapsed_ms: f64,
 ) -> Result<DomainDockResult, String> {
     if polished.is_empty() {
-        return Err("finalize_domain_dock_result received 0 conformers".to_string());
+        return Err("finalize_domain_dock_pipeline received 0 conformers".to_string());
     }
+    let cseq = ChainSeqIndex::from_kin(&kin)?;
+    let prep = &pipe.prep;
 
     let mut conformers = Vec::with_capacity(polished.len());
     let mut chains = Vec::with_capacity(polished.len());
@@ -6345,21 +8981,51 @@ pub fn finalize_domain_dock_result(
     }
 
     let best_chain = &chains[0];
-    let (observability_regime, mut candor_notes) = classify_dipolar_observability(
+    let (observability_regime, mut candor_notes) = classify_dipolar_observability_multi(
         &partition,
-        rdc_media,
-        pcs_tags,
-        pre_sites,
+        &pipe.domain_rdc_media,
+        prep.pcs_terms.len(),
+        prep.pre_terms.len(),
         prep.noe_terms.len(),
         best_chain,
+        &cseq,
     );
-    if let Some(ref w_msg) = tolman_gdo.warning_message {
+    candor_notes.extend(pipe.extra_candor_notes);
+    if let Some(ref w_msg) = pipe.tolman_gdo.warning_message {
         candor_notes.push(w_msg.clone());
     }
 
-    // Evaluate global and per-domain RDC Q_work & ByPeptidePlane Q_free on Model 1
-    let rdc_validation = if !rdc_media.is_empty() {
-        evaluate_rdc_validation(best_chain, rdc_media).ok()
+    // Evaluate chain-explicit global and per-domain RDC Q_work & ByPeptidePlane Q_free on Model 1
+    let mut media_fits = Vec::new();
+    let mut all_points = Vec::new();
+    let mut chained_points: Vec<(String, RdcBackCalcPoint)> = Vec::new();
+    let mut work_pairs_all = Vec::new();
+    let mut free_pairs_all = Vec::new();
+
+    for m in &pipe.domain_rdc_media {
+        if let Ok((fit, pts)) = fit_saupe_tensor_domain_rdc(best_chain, &cseq, m) {
+            media_fits.push(fit);
+            for (ch_id, pt) in pts {
+                if pt.is_free {
+                    free_pairs_all.push((pt.d_obs_norm_nh_hz, pt.d_calc_norm_nh_hz));
+                } else {
+                    work_pairs_all.push((pt.d_obs_norm_nh_hz, pt.d_calc_norm_nh_hz));
+                }
+                all_points.push(pt.clone());
+                chained_points.push((ch_id, pt));
+            }
+        }
+    }
+
+    let rdc_validation = if !media_fits.is_empty() {
+        let overall_q_work = cornilescu_q(&work_pairs_all);
+        let overall_q_free = cornilescu_q(&free_pairs_all);
+        Some(RdcValidationSummary {
+            media: media_fits,
+            points: all_points,
+            overall_q_work,
+            overall_q_free,
+        })
     } else {
         None
     };
@@ -6368,12 +9034,12 @@ pub fn finalize_domain_dock_result(
         None => (f64::NAN, f64::NAN),
     };
 
-    // Per-domain validation summary (evaluating global Saupe fit residuals restricted to each domain!)
+    // Per-domain validation summary keyed by `(chain_id, seq_id)` (`21.W2:P1-8`)
     let mut per_domain_validation = Vec::with_capacity(partition.domains.len());
     for dom in &partition.domains {
         let mut pts_cur = Vec::with_capacity(dom.residue_indices.len() * 3);
         let mut pts_ref = Vec::with_capacity(dom.residue_indices.len() * 3);
-        let mut dom_seq_set = BTreeSet::new();
+        let mut dom_cseq_set: BTreeSet<(String, i32)> = BTreeSet::new();
         for &idx in &dom.residue_indices {
             pts_cur.extend([
                 best_chain.residues[idx].n,
@@ -6385,7 +9051,10 @@ pub fn finalize_domain_dock_result(
                 kin.ref_chain.residues[idx].ca,
                 kin.ref_chain.residues[idx].c,
             ]);
-            dom_seq_set.insert(best_chain.residues[idx].seq_id);
+            dom_cseq_set.insert((
+                best_chain.residues[idx].chain_id.to_string(),
+                best_chain.residues[idx].seq_id,
+            ));
         }
         let mut d_rmsd = if pts_cur.len() >= 3 {
             kabsch_rmsd(&pts_cur, &pts_ref)
@@ -6395,11 +9064,11 @@ pub fn finalize_domain_dock_result(
         if d_rmsd < 1e-12 {
             d_rmsd = 0.0;
         }
-        let (dq_work, dq_free) = if let Some(ref rv) = rdc_validation {
+        let (dq_work, dq_free) = if !chained_points.is_empty() {
             let mut wp = Vec::new();
             let mut fp = Vec::new();
-            for pt in &rv.points {
-                if dom_seq_set.contains(&pt.seq_id) {
+            for (ch_id, pt) in &chained_points {
+                if dom_cseq_set.contains(&(ch_id.clone(), pt.seq_id)) {
                     if pt.is_free {
                         fp.push((pt.d_obs_norm_nh_hz, pt.d_calc_norm_nh_hz));
                     } else {
@@ -6411,26 +9080,45 @@ pub fn finalize_domain_dock_result(
         } else {
             (f64::NAN, f64::NAN)
         };
+        let pre_chk = pipe
+            .pre_dock_domain_checks
+            .iter()
+            .filter(|c| c.domain_id == dom.domain_id)
+            .fold((f64::NAN, f64::NAN), |(bw, bf), c| {
+                let nw = if bw.is_nan() {
+                    c.q_work
+                } else if c.q_work.is_finite() {
+                    bw.max(c.q_work)
+                } else {
+                    bw
+                };
+                let nf = if bf.is_nan() {
+                    c.q_free
+                } else if c.q_free.is_finite() {
+                    bf.max(c.q_free)
+                } else {
+                    bf
+                };
+                (nw, nf)
+            });
         per_domain_validation.push(PerDomainValidationSummary {
             domain_id: dom.domain_id,
             n_residues: dom.residue_indices.len(),
             intra_domain_distortion_rmsd_angstrom: d_rmsd,
+            pre_dock_rdc_q_work: pre_chk.0,
+            pre_dock_rdc_q_free: pre_chk.1,
             rdc_q_work: dq_work,
             rdc_q_free: dq_free,
         });
     }
 
-    // Evaluate PCS quality factors on Model 1
+    // Evaluate honest PCS quality factors (`pcs_q_work` vs strictly held-out `pcs_q_free`, `21.W2:P1-5`)
     let (best_slots, best_blk_frames) = kin.forward_slots_and_block_frames(&conformers[0].state);
-    let mut seq_to_idx = BTreeMap::new();
-    for (idx, r) in kin.residues.iter().enumerate() {
-        seq_to_idx.insert(r.seq_id, idx);
-    }
     let mut pcs_intra_pairs = Vec::new();
     let mut pcs_inter_work_pairs = Vec::new();
     let mut pcs_free_pairs = Vec::new();
 
-    for (t_idx, tag_in) in pcs_tags.iter().enumerate() {
+    for (t_idx, tag_in) in pipe.pcs_tags.iter().enumerate() {
         let Some(prep_tag) = prep.pcs_tags.get(t_idx) else {
             continue;
         };
@@ -6438,8 +9126,13 @@ pub fn finalize_domain_dock_result(
         let m_pos = v_add(orig_n, mat3_mul_vec(r_b, prep_tag.metal_local_pos));
         let dchi_w = mat3_conjugate_sym(r_b, &prep_tag.dchi_local);
         for pr in &tag_in.restraints {
-            let Some((slot, _)) =
-                resolve_kin_atom_slot_and_seg(&kin, &seq_to_idx, pr.seq_id, &pr.atom_name)
+            let Some((slot, _)) = resolve_kin_atom_slot_and_seg_multi(
+                &kin,
+                &cseq,
+                pr.chain_id.as_deref(),
+                pr.seq_id,
+                &pr.atom_name,
+            )?
             else {
                 continue;
             };
@@ -6455,10 +9148,15 @@ pub fn finalize_domain_dock_result(
             let mv = mat3_mul_vec(&dchi_w, v);
             let calc = (PCS_CARTESIAN_PREFACTOR / r5) * v_dot(v, mv) + prep_tag.pcs_offset_ppm;
             let res_i = slot / 7;
-            if kin.residues[res_i].rigid_block_id == Some(prep_tag.host_block_id) {
-                pcs_intra_pairs.push((pr.pcs_obs_ppm, calc));
-            } else if pr.is_free {
+            let is_host = kin.residues[res_i].master_block_id == Some(prep_tag.host_block_id);
+            if pr.is_free && !is_host {
                 pcs_free_pairs.push((pr.pcs_obs_ppm, calc));
+            } else if is_host {
+                if pr.is_free {
+                    pcs_free_pairs.push((pr.pcs_obs_ppm, calc));
+                } else {
+                    pcs_intra_pairs.push((pr.pcs_obs_ppm, calc));
+                }
             } else {
                 pcs_inter_work_pairs.push((pr.pcs_obs_ppm, calc));
             }
@@ -6466,12 +9164,11 @@ pub fn finalize_domain_dock_result(
     }
 
     let pcs_q_intra = cornilescu_q(&pcs_intra_pairs);
-    let pcs_q_inter_work = cornilescu_q(&pcs_inter_work_pairs);
-    let pcs_q_free = if !pcs_free_pairs.is_empty() {
-        cornilescu_q(&pcs_free_pairs)
-    } else {
-        pcs_q_inter_work
-    };
+    let n_pcs_work = pcs_inter_work_pairs.len();
+    let n_pcs_free = pcs_free_pairs.len();
+    let pcs_q_work = (n_pcs_work > 0).then(|| cornilescu_q(&pcs_inter_work_pairs));
+    // NEVER fall back from `pcs_q_free` to `pcs_q_work`: `None` when `n_pcs_free == 0`!
+    let pcs_q_free = (n_pcs_free > 0).then(|| cornilescu_q(&pcs_free_pairs));
 
     // Pairwise ensemble backbone RMSD over rigid domains
     let mut dom_mask = vec![false; kin.residues.len()];
@@ -6488,7 +9185,7 @@ pub fn finalize_domain_dock_result(
         let mut cnt = 0usize;
         for i in 0..chains.len() {
             for j in (i + 1)..chains.len() {
-                sum += backbone_rmsd_between_chains(
+                sum += multi_chain_backbone_rmsd(
                     &chains[i],
                     &chains[j],
                     use_dom_mask.then_some(dom_mask.as_slice()),
@@ -6504,16 +9201,21 @@ pub fn finalize_domain_dock_result(
     let best_energy = conformers[0].energy;
     let report = DomainDockReport {
         engine_used,
+        quality_verdict: pipe.quality_verdict,
         partition,
-        tolman_gdo,
+        tolman_gdo: pipe.tolman_gdo,
         observability_regime,
         candor_notes,
+        pre_dock_domain_checks: pipe.pre_dock_domain_checks,
+        n_excluded_flexible_rdcs: pipe.n_excluded_flexible_rdcs,
         rdc_stratification: RdcFreeStratification::ByPeptidePlane,
         global_rdc_q_work,
         global_rdc_q_free,
         pcs_q_intra,
-        pcs_q_inter_work,
+        pcs_q_work,
         pcs_q_free,
+        n_pcs_work,
+        n_pcs_free,
         max_intra_domain_rmsd_angstrom: max_intra_all,
         ensemble_pairwise_bb_rmsd_angstrom,
         per_domain_validation,
@@ -6530,7 +9232,49 @@ pub fn finalize_domain_dock_result(
     })
 }
 
+/// Compatibility wrapper around [`finalize_domain_dock_pipeline`].
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_domain_dock_result(
+    kin: DomainLinkerKinematics,
+    partition: PaeDomainPartition,
+    tolman_gdo: TolmanGdoMotionReport,
+    prep: &PreparedDomainDockRestraints,
+    rdc_media: &[RdcMediumSet],
+    pcs_tags: &[DomainPcsTagSet],
+    pre_sites: &[DomainPreSiteSet],
+    polished: Vec<(DomainDockState, DomainDockEnergyBreakdown)>,
+    engine_used: String,
+    elapsed_ms: f64,
+) -> Result<DomainDockResult, String> {
+    let pipe = PreparedDomainDockPipeline {
+        domain_rdc_media: DomainRdcMediumSet::from_rdc_media(rdc_media),
+        pcs_tags: pcs_tags.to_vec(),
+        tolman_gdo,
+        prep: prep.clone(),
+        pre_dock_domain_checks: Vec::new(),
+        quality_verdict: DomainDockQualityVerdict::PassedAllChecks,
+        extra_candor_notes: Vec::new(),
+        n_excluded_flexible_rdcs: 0,
+    };
+    finalize_domain_dock_pipeline(
+        kin,
+        partition,
+        pipe,
+        pre_sites,
+        polished,
+        engine_used,
+        elapsed_ms,
+    )
+}
+
 // ---- PDB, mmCIF, JSON, and TSV Export Helpers ----
+
+fn fmt_opt_q(val: Option<f64>) -> String {
+    match val {
+        Some(v) if v.is_finite() => format!("{v:.4}"),
+        _ => "NA".to_string(),
+    }
+}
 
 /// Format a docked multi-domain ensemble in standard wwPDB `MODEL ... ENDMDL` format,
 /// preserving all rigid-domain sidechain heavy atoms, per-residue `pLDDT` `tempFactor`s,
@@ -6555,17 +9299,19 @@ pub fn format_docked_pdb_ensemble(result: &DomainDockResult, title: &str) -> Str
         rep.engine_used
     ));
     out.push_str(&format!(
-        "REMARK   2 DOMAINS={} LINKERS={} REGIME={:?} TOLMAN={:?}\n",
+        "REMARK   2 DOMAINS={} LINKERS={} REGIME={:?} TOLMAN={:?} VERDICT={:?}\n",
         rep.partition.domains.len(),
         rep.partition.linkers.len(),
         rep.observability_regime,
-        rep.tolman_gdo.regime
+        rep.tolman_gdo.regime,
+        rep.quality_verdict
     ));
     out.push_str(&format!(
-        "REMARK   2 RDC_Q_WORK={:.4} BY_PEPTIDE_PLANE_Q_FREE={:.4} PCS_Q_FREE={:.4} INTRA_RMSD={:.3}\n",
+        "REMARK   2 RDC_Q_WORK={:.4} BY_PEPTIDE_PLANE_Q_FREE={:.4} PCS_Q_WORK={} PCS_Q_FREE={} INTRA_RMSD={:.3}\n",
         rep.global_rdc_q_work,
         rep.global_rdc_q_free,
-        rep.pcs_q_free,
+        fmt_opt_q(rep.pcs_q_work),
+        fmt_opt_q(rep.pcs_q_free),
         rep.max_intra_domain_rmsd_angstrom
     ));
     for note in &rep.candor_notes {
@@ -6821,13 +9567,16 @@ pub fn format_docked_mmcif_ensemble(result: &DomainDockResult, entry_id: &str) -
     cif.push_str(&format!("_entry.id {id_tok}\n"));
     cif.push_str("_ma_protocol_step.step_id 1\n");
     cif.push_str(&format!(
-        "# FERRIC T21.5 domain_dock: domains={} linkers={} regime={:?} tolman={:?} q_work={:.4} q_free={:.4} intra_rmsd={:.3}\n",
+        "# FERRIC T21.5 domain_dock: domains={} linkers={} regime={:?} tolman={:?} verdict={:?} q_work={:.4} q_free={:.4} pcs_q_work={} pcs_q_free={} intra_rmsd={:.3}\n",
         rep.partition.domains.len(),
         rep.partition.linkers.len(),
         rep.observability_regime,
         rep.tolman_gdo.regime,
+        rep.quality_verdict,
         rep.global_rdc_q_work,
         rep.global_rdc_q_free,
+        fmt_opt_q(rep.pcs_q_work),
+        fmt_opt_q(rep.pcs_q_free),
         rep.max_intra_domain_rmsd_angstrom
     ));
     for note in &rep.candor_notes {
@@ -6952,12 +9701,20 @@ pub fn format_domain_dock_tsv(report: &DomainDockReport) -> String {
     let mut out = String::new();
     out.push_str(&format!("# engine_used\t{}\n", report.engine_used));
     out.push_str(&format!(
+        "# quality_verdict\t{:?}\n",
+        report.quality_verdict
+    ));
+    out.push_str(&format!(
         "# observability_regime\t{:?}\n",
         report.observability_regime
     ));
     out.push_str(&format!(
         "# tolman_gdo_regime\t{:?}\n",
         report.tolman_gdo.regime
+    ));
+    out.push_str(&format!(
+        "# n_excluded_flexible_rdcs\t{}\n",
+        report.n_excluded_flexible_rdcs
     ));
     out.push_str(&format!(
         "# global_rdc_q_work\t{:.4}\n",
@@ -6967,7 +9724,8 @@ pub fn format_domain_dock_tsv(report: &DomainDockReport) -> String {
         "# by_peptide_plane_q_free\t{:.4}\n",
         report.global_rdc_q_free
     ));
-    out.push_str(&format!("# pcs_q_free\t{:.4}\n", report.pcs_q_free));
+    out.push_str(&format!("# pcs_q_work\t{}\n", fmt_opt_q(report.pcs_q_work)));
+    out.push_str(&format!("# pcs_q_free\t{}\n", fmt_opt_q(report.pcs_q_free)));
     out.push_str(&format!(
         "# max_intra_domain_rmsd_angstrom\t{:.4}\n",
         report.max_intra_domain_rmsd_angstrom
@@ -6976,7 +9734,7 @@ pub fn format_domain_dock_tsv(report: &DomainDockReport) -> String {
         out.push_str(&format!("# candor_note\t{note}\n"));
     }
     out.push_str(
-        "domain_id\tchain_id\tn_residues\tseq_spans\tmedian_intra_pae_a\tmean_plddt\tintra_rmsd_a\trdc_q_work\trdc_q_free\n",
+        "domain_id\tchain_id\tn_residues\tseq_spans\tmedian_intra_pae_a\tmean_plddt\tintra_rmsd_a\tpre_dock_rdc_q_work\tpre_dock_rdc_q_free\trdc_q_work\trdc_q_free\n",
     );
     for (dom, val) in report
         .partition
@@ -6990,7 +9748,7 @@ pub fn format_domain_dock_tsv(report: &DomainDockReport) -> String {
             .map(|(a, b)| format!("{a}-{b}"))
             .collect();
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{:.3}\t{:.2}\t{:.4}\t{:.4}\t{:.4}\n",
+            "{}\t{}\t{}\t{}\t{:.3}\t{:.2}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\n",
             dom.domain_id,
             dom.chain_id,
             dom.residue_indices.len(),
@@ -6998,6 +9756,8 @@ pub fn format_domain_dock_tsv(report: &DomainDockReport) -> String {
             dom.median_intra_pae_angstrom,
             dom.mean_plddt,
             val.intra_domain_distortion_rmsd_angstrom,
+            val.pre_dock_rdc_q_work,
+            val.pre_dock_rdc_q_free,
             val.rdc_q_work,
             val.rdc_q_free
         ));
