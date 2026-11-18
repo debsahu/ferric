@@ -13,6 +13,72 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+/// Absolute point cap for any single loaded spectrum on 64-bit native targets (`2^30` `f32`
+/// points = 4 GiB of `f32`). Header-declared dimensions beyond this are rejected before any
+/// allocation (`v0150:P0-2`, `20.W1:P2-6`).
+pub const MAX_SPECTRUM_POINTS_NATIVE: u64 = 1 << 30;
+/// Absolute point cap on `wasm32` (`2^26` `f32` points = 256 MiB), where `usize` is 32 bits and the
+/// linear memory never shrinks.
+pub const MAX_SPECTRUM_POINTS_WASM: u64 = 1 << 26;
+/// Point cap in force for the current target pointer width.
+#[cfg(target_pointer_width = "32")]
+pub const MAX_SPECTRUM_POINTS: u64 = MAX_SPECTRUM_POINTS_WASM;
+/// Point cap in force for the current target pointer width.
+#[cfg(not(target_pointer_width = "32"))]
+pub const MAX_SPECTRUM_POINTS: u64 = MAX_SPECTRUM_POINTS_NATIVE;
+
+/// Overflow-checked product of header-declared dimensions in `u64` (never wraps).
+fn checked_product_u64(what: &str, dims: &[usize]) -> Result<u64, String> {
+    let mut acc: u64 = 1;
+    for &d in dims {
+        acc = acc
+            .checked_mul(d as u64)
+            .ok_or_else(|| format!("{what}: header dimension product {dims:?} overflows u64"))?;
+    }
+    Ok(acc)
+}
+
+/// Overflow-checked, capped point count `prod(dims)` (`1 ..= MAX_SPECTRUM_POINTS`) as `usize`.
+fn checked_points(what: &str, dims: &[usize]) -> Result<usize, String> {
+    let n = checked_product_u64(what, dims)?;
+    if n == 0 {
+        return Err(format!("{what}: zero-sized spectrum {dims:?}"));
+    }
+    if n > MAX_SPECTRUM_POINTS {
+        return Err(format!(
+            "{what}: {dims:?} = {n} points exceeds the {MAX_SPECTRUM_POINTS}-point loader cap"
+        ));
+    }
+    usize::try_from(n).map_err(|_| format!("{what}: {n} points exceed addressable memory"))
+}
+
+/// Zero-padded extent `ceil(n / t) * t` of a tiled axis in `u64` (checked, never wraps).
+fn padded_extent(n: usize, t: usize) -> Option<u64> {
+    let (n, t) = (n as u64, t.max(1) as u64);
+    n.div_ceil(t).checked_mul(t)
+}
+
+/// Verify `header_bytes + points * elem_bytes <= have_bytes` using checked `u64` arithmetic,
+/// strictly BEFORE any payload-sized allocation.
+fn require_payload_bytes(
+    what: &str,
+    header_bytes: u64,
+    points: u64,
+    elem_bytes: u64,
+    have_bytes: u64,
+) -> Result<(), String> {
+    let need = points
+        .checked_mul(elem_bytes)
+        .and_then(|b| b.checked_add(header_bytes))
+        .ok_or_else(|| format!("{what}: expected payload size overflows u64"))?;
+    if need > have_bytes {
+        return Err(format!(
+            "{what} truncated: header declares {need} bytes but only {have_bytes} are present"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct AxisPpm {
     pub label: String,
@@ -235,6 +301,9 @@ fn parse_bruker_axis(
         .ok_or("missing ##$SI in Bruker procs")?
         .parse()
         .map_err(|e| format!("invalid SI: {e}"))?;
+    if si == 0 {
+        return Err("invalid Bruker SI=0".to_string());
+    }
     let xdim: usize = params
         .get("XDIM")
         .and_then(|v| v.parse().ok())
@@ -302,16 +371,18 @@ fn decode_bruker_words(
     let big_endian = bytordp != 0;
     if dtypp == 2 {
         // 64-bit float
-        if bytes.len() < expected * 8 {
+        let need_bytes = expected
+            .checked_mul(8)
+            .ok_or_else(|| "Bruker data byte count overflow".to_string())?;
+        if bytes.len() < need_bytes {
             return Err(format!(
-                "Bruker data truncated: need {} bytes, got {}",
-                expected * 8,
+                "Bruker data truncated: need {need_bytes} bytes, got {}",
                 bytes.len()
             ));
         }
         let mut out = Vec::with_capacity(expected);
-        for chunk in bytes[..expected * 8].chunks_exact(8) {
-            let arr: [u8; 8] = chunk.try_into().unwrap();
+        for chunk in bytes[..need_bytes].chunks_exact(8) {
+            let arr: [u8; 8] = chunk.try_into().unwrap_or_default();
             let v = if big_endian {
                 f64::from_be_bytes(arr)
             } else {
@@ -322,16 +393,18 @@ fn decode_bruker_words(
         Ok(out)
     } else {
         // 32-bit int (dtypp == 0) or 32-bit float (dtypp == 1)
-        if bytes.len() < expected * 4 {
+        let need_bytes = expected
+            .checked_mul(4)
+            .ok_or_else(|| "Bruker data byte count overflow".to_string())?;
+        if bytes.len() < need_bytes {
             return Err(format!(
-                "Bruker data truncated: need {} bytes, got {}",
-                expected * 4,
+                "Bruker data truncated: need {need_bytes} bytes, got {}",
                 bytes.len()
             ));
         }
         let mut out = Vec::with_capacity(expected);
-        for chunk in bytes[..expected * 4].chunks_exact(4) {
-            let arr: [u8; 4] = chunk.try_into().unwrap();
+        for chunk in bytes[..need_bytes].chunks_exact(4) {
+            let arr: [u8; 4] = chunk.try_into().unwrap_or_default();
             let v = if dtypp == 1 {
                 let f = if big_endian {
                     f32::from_be_bytes(arr)
@@ -404,10 +477,14 @@ fn infer_bruker_2d_axis_nuclei(
     let ratio = sf_y / sf_x.max(1e-6);
 
     if !x_known && !y_known {
-        if (ratio - 0.40298).abs() < 0.025 {
+        // 15N/13C (0.40298) vs 31P/1H (0.4048) is ambiguous by ratio alone: also require physically
+        // possible ABSOLUTE frequencies (13C <= 330 MHz, 15N <= 134 MHz at 1.3 GHz).
+        let plausible =
+            |sf_c: f64, sf_n: f64| sf_c > 0.0 && sf_n > 0.0 && sf_c <= 330.0 && sf_n <= 134.0;
+        if (ratio - 0.40298).abs() < 0.025 && plausible(sf_x, sf_y) {
             axis_x.label = "13C".to_string();
             axis_y.label = "15N".to_string();
-        } else if (ratio - 2.4815).abs() < 0.12 {
+        } else if (ratio - 2.4815).abs() < 0.12 && plausible(sf_y, sf_x) {
             axis_x.label = "15N".to_string();
             axis_y.label = "13C".to_string();
         } else if (ratio - 1.0).abs() < 0.03 {
@@ -427,9 +504,21 @@ fn infer_bruker_2d_axis_nuclei(
         } else if (ratio - 0.4048).abs() < 0.025 {
             axis_x.label = "1H".to_string();
             axis_y.label = "31P".to_string();
+        } else if (ratio - 2.4704).abs() < 0.12 {
+            axis_x.label = "31P".to_string();
+            axis_y.label = "1H".to_string();
         } else if (ratio - 0.9408).abs() < 0.025 {
             axis_x.label = "1H".to_string();
             axis_y.label = "19F".to_string();
+        } else if (ratio - 1.0629).abs() < 0.03 {
+            axis_x.label = "19F".to_string();
+            axis_y.label = "1H".to_string();
+        } else if (ratio - 3.9769).abs() < 0.15 {
+            axis_x.label = "13C".to_string();
+            axis_y.label = "1H".to_string();
+        } else if (ratio - 9.8691).abs() < 0.35 {
+            axis_x.label = "15N".to_string();
+            axis_y.label = "1H".to_string();
         } else if axis_x.max_ppm() > 140.0 && sf_x < 320.0 {
             axis_x.label = "13C".to_string();
         }
@@ -442,6 +531,10 @@ fn infer_bruker_2d_axis_nuclei(
                 axis_x.label = "13C".to_string();
             } else if (rx - 0.10133).abs() < 0.02 {
                 axis_x.label = "15N".to_string();
+            } else if (rx - 0.4048).abs() < 0.025 {
+                axis_x.label = "31P".to_string();
+            } else if (rx - 0.9408).abs() < 0.025 {
+                axis_x.label = "19F".to_string();
             }
         }
     } else if !y_known {
@@ -543,14 +636,17 @@ pub fn read_bruker_pdata_2d_from_bytes(
 
     let nx = axis_x.size;
     let ny = axis_y.size;
-    let raw = decode_bruker_words(raw_bytes, bytordp, dtypp, nc_proc, nx * ny)?;
+    let n = checked_points("Bruker 2rr", &[nx, ny])?;
+    let word = if dtypp == 2 { 8 } else { 4 };
+    require_payload_bytes("Bruker 2rr", 0, n as u64, word, raw_bytes.len() as u64)?;
+    let raw = decode_bruker_words(raw_bytes, bytordp, dtypp, nc_proc, n)?;
 
     let tx = xdim_x.min(nx).max(1);
     let ty = xdim_y.min(ny).max(1);
     let nbx = nx.div_ceil(tx);
     let nby = ny.div_ceil(ty);
 
-    let mut data = vec![0.0f32; ny * nx];
+    let mut data = vec![0.0f32; n];
     let mut idx = 0usize;
     for by in 0..nby {
         for bx in 0..nbx {
@@ -584,6 +680,19 @@ pub fn read_bruker_pdata_2d(pdata_dir: impl AsRef<Path>) -> Result<Spectrum2D, S
         .map_err(|e| format!("failed to read {}: {e}", dir.join("procs").display()))?;
     let proc2s_txt = fs::read_to_string(dir.join("proc2s"))
         .map_err(|e| format!("failed to read {}: {e}", dir.join("proc2s").display()))?;
+    // Pre-read verification: never slurp a multi-GiB `2rr` whose header geometry cannot match it.
+    {
+        let p1h = parse_jcamp_params(&procs_txt);
+        let p2h = parse_jcamp_params(&proc2s_txt);
+        let (ax_h, _, _, dtypp_h, _) = parse_bruker_axis(&p1h, "1H")?;
+        let (ay_h, ..) = parse_bruker_axis(&p2h, "15N")?;
+        let n_h = checked_points("Bruker 2rr", &[ax_h.size, ay_h.size])?;
+        let have = fs::metadata(dir.join("2rr"))
+            .map_err(|e| format!("failed to stat {}: {e}", dir.join("2rr").display()))?
+            .len();
+        let word = if dtypp_h == 2 { 8 } else { 4 };
+        require_payload_bytes("Bruker 2rr", 0, n_h as u64, word, have)?;
+    }
     let raw_bytes = fs::read(dir.join("2rr"))
         .map_err(|e| format!("failed to read {}: {e}", dir.join("2rr").display()))?;
     let name = pdata_dir
@@ -669,6 +778,7 @@ pub fn read_bruker_pdata_3d_from_bytes(
         procs_txt,
         proc2s_txt,
         proc3s_txt,
+        raw_bytes.len() as u64,
         std::io::Cursor::new(raw_bytes),
     )
 }
@@ -708,6 +818,7 @@ fn read_bruker_pdata_3d_from_reader<R: Read>(
     procs_txt: &str,
     proc2s_txt: &str,
     proc3s_txt: &str,
+    total_len: u64,
     mut reader: R,
 ) -> Result<Spectrum3D, String> {
     let p1 = parse_jcamp_params(procs_txt);
@@ -726,10 +837,20 @@ fn read_bruker_pdata_3d_from_reader<R: Read>(
     let nby = ny.div_ceil(ty);
     let nbz = nz.div_ceil(tz);
 
-    let word_bytes = if dtypp == 2 { 8 } else { 4 };
+    let word_bytes: usize = if dtypp == 2 { 8 } else { 4 };
     let scale = 2.0_f64.powi(nc_proc);
-    let mut row_buf = vec![0u8; tx * word_bytes];
-    let mut data = vec![0.0f32; nz * ny * nx];
+    // Checked geometry + payload verification strictly BEFORE any allocation.
+    let n = checked_points("Bruker 3rrr", &[nx, ny, nz])?;
+    let padded = padded_extent(nx, tx)
+        .and_then(|px| px.checked_mul(padded_extent(ny, ty)?))
+        .and_then(|pxy| pxy.checked_mul(padded_extent(nz, tz)?))
+        .ok_or_else(|| "Bruker 3rrr padded submatrices overflow u64".to_string())?;
+    require_payload_bytes("Bruker 3rrr", 0, padded, word_bytes as u64, total_len)?;
+    let row_bytes = tx
+        .checked_mul(word_bytes)
+        .ok_or_else(|| "Bruker 3rrr row buffer byte count overflow".to_string())?;
+    let mut row_buf = vec![0u8; row_bytes];
+    let mut data = vec![0.0f32; n];
 
     for bz in 0..nbz {
         for by in 0..nby {
@@ -781,13 +902,25 @@ pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Sp
     let proc3s_txt = fs::read_to_string(dir.join("proc3s"))
         .map_err(|e| format!("failed to read proc3s: {e}"))?;
     let file = File::open(dir.join("3rrr")).map_err(|e| format!("failed to open 3rrr: {e}"))?;
+    let total_len = file
+        .metadata()
+        .map_err(|e| format!("failed to stat 3rrr: {e}"))?
+        .len();
     let reader = BufReader::with_capacity(1024 * 1024, file);
     let name = pdata_dir
         .as_ref()
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("3rrr");
-    read_bruker_pdata_3d_from_reader(name, exp, &procs_txt, &proc2s_txt, &proc3s_txt, reader)
+    read_bruker_pdata_3d_from_reader(
+        name,
+        exp,
+        &procs_txt,
+        &proc2s_txt,
+        &proc3s_txt,
+        total_len,
+        reader,
+    )
 }
 
 /// Write a Bruker TopSpin 3D processed directory (`procs`, `proc2s`, `proc3s`, `3rrr`) for round-trip export.
@@ -911,6 +1044,24 @@ fn pipe_axis(hdr: &[f32], raw_header: &[u8], slot: usize, size: usize) -> AxisPp
     }
 }
 
+/// Validate a header-stored NMRPipe size/count float (finite, non-negative, integral within
+/// tolerance, `<= MAX_SPECTRUM_POINTS`) BEFORE casting to `usize`. `0` maps to `1` (legacy).
+fn pipe_dim_from_header(what: &str, v: f32) -> Result<usize, String> {
+    if !v.is_finite() {
+        return Err(format!("NMRPipe {what} is not finite ({v})"));
+    }
+    if v < 0.0 {
+        return Err(format!("NMRPipe {what} is negative ({v})"));
+    }
+    let r = (v as f64).round();
+    if r > MAX_SPECTRUM_POINTS as f64 {
+        return Err(format!(
+            "NMRPipe {what}={v} exceeds the {MAX_SPECTRUM_POINTS}-point loader cap"
+        ));
+    }
+    Ok((r as usize).max(1))
+}
+
 fn pipe_slot_for_dim(hdr: &[f32], dim_idx: usize) -> usize {
     let v = hdr[24 + dim_idx].round() as isize;
     // NMRPipe FDDIMORDER stores 1-based parameter codes where 2->F2(slot 0), 1->F1(slot 1), 3->F3(slot 2), 4->F4(slot 3)
@@ -923,31 +1074,45 @@ fn pipe_slot_for_dim(hdr: &[f32], dim_idx: usize) -> usize {
     }
 }
 
+/// Refuse to slurp an NMRPipe file larger than header + `MAX_SPECTRUM_POINTS` floats.
+fn precheck_pipe_file_len(p: &Path) -> Result<(), String> {
+    let len = fs::metadata(p)
+        .map_err(|e| format!("failed to stat {}: {e}", p.display()))?
+        .len();
+    let max = MAX_SPECTRUM_POINTS
+        .saturating_mul(4)
+        .saturating_add(PIPE_HEADER_BYTES as u64);
+    if len > max {
+        return Err(format!(
+            "NMRPipe file {} is {len} bytes, above the {max}-byte loader cap",
+            p.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Decode an NMRPipe 2D spectrum (`.ft2` / `.dat`) directly from an in-memory byte slice.
 pub fn read_nmrpipe_2d_from_bytes(name: &str, bytes: &[u8]) -> Result<Spectrum2D, String> {
     let (hdr, big_endian) = decode_pipe_header(bytes)?;
 
-    let nx = (hdr[99].round() as usize).max(1);
-    let ny = (hdr[219].round() as usize).max(1);
+    let nx = pipe_dim_from_header("FDSIZE", hdr[99])?;
+    let ny = pipe_dim_from_header("FDSPECNUM", hdr[219])?;
     let slot_x = pipe_slot_for_dim(&hdr, 0);
     let slot_y = pipe_slot_for_dim(&hdr, 1);
 
     let axis_x = pipe_axis(&hdr, &bytes[..PIPE_HEADER_BYTES], slot_x, nx);
     let axis_y = pipe_axis(&hdr, &bytes[..PIPE_HEADER_BYTES], slot_y, ny);
 
-    let expected = nx * ny;
+    let expected = checked_points("NMRPipe 2D", &[nx, ny])?;
     let body = &bytes[PIPE_HEADER_BYTES..];
-    if body.len() < expected * 4 {
-        return Err(format!(
-            "NMRPipe 2D body truncated: expected {} floats, got {} bytes",
-            expected,
-            body.len()
-        ));
-    }
+    require_payload_bytes("NMRPipe 2D body", 0, expected as u64, 4, body.len() as u64)?;
+    let body_bytes = expected
+        .checked_mul(4)
+        .ok_or_else(|| "NMRPipe 2D body byte count overflow".to_string())?;
 
     let mut data = Vec::with_capacity(expected);
-    for chunk in body[..expected * 4].chunks_exact(4) {
-        let arr: [u8; 4] = chunk.try_into().unwrap();
+    for chunk in body[..body_bytes].chunks_exact(4) {
+        let arr: [u8; 4] = chunk.try_into().unwrap_or_default();
         data.push(if big_endian {
             f32::from_be_bytes(arr)
         } else {
@@ -966,6 +1131,7 @@ pub fn read_nmrpipe_2d_from_bytes(name: &str, bytes: &[u8]) -> Result<Spectrum2D
 /// Read an NMRPipe 2D spectrum (`.ft2` / `.dat`).
 pub fn read_nmrpipe_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
     let p = path.as_ref();
+    precheck_pipe_file_len(p)?;
     let bytes = fs::read(p).map_err(|e| format!("failed to read {}: {e}", p.display()))?;
     let name = p
         .file_name()
@@ -1034,9 +1200,9 @@ pub fn read_nmrpipe_3d_from_bytes(
 ) -> Result<Spectrum3D, String> {
     let (hdr, big_endian) = decode_pipe_header(bytes)?;
 
-    let nx = (hdr[99].round() as usize).max(1);
-    let ny = (hdr[219].round() as usize).max(1);
-    let nz = (hdr[15].round() as usize).max(1);
+    let nx = pipe_dim_from_header("FDSIZE", hdr[99])?;
+    let ny = pipe_dim_from_header("FDSPECNUM", hdr[219])?;
+    let nz = pipe_dim_from_header("FDF3SIZE", hdr[15])?;
 
     let slot_x = pipe_slot_for_dim(&hdr, 0);
     let slot_y = pipe_slot_for_dim(&hdr, 1);
@@ -1046,19 +1212,16 @@ pub fn read_nmrpipe_3d_from_bytes(
     let axis_y = pipe_axis(&hdr, &bytes[..PIPE_HEADER_BYTES], slot_y, ny);
     let axis_z = pipe_axis(&hdr, &bytes[..PIPE_HEADER_BYTES], slot_z, nz);
 
-    let expected = nx * ny * nz;
+    let expected = checked_points("NMRPipe 3D", &[nx, ny, nz])?;
     let body = &bytes[PIPE_HEADER_BYTES..];
-    if body.len() < expected * 4 {
-        return Err(format!(
-            "NMRPipe 3D body truncated: expected {} floats, got {} bytes",
-            expected,
-            body.len()
-        ));
-    }
+    require_payload_bytes("NMRPipe 3D body", 0, expected as u64, 4, body.len() as u64)?;
+    let body_bytes = expected
+        .checked_mul(4)
+        .ok_or_else(|| "NMRPipe 3D body byte count overflow".to_string())?;
 
     let mut data = Vec::with_capacity(expected);
-    for chunk in body[..expected * 4].chunks_exact(4) {
-        let arr: [u8; 4] = chunk.try_into().unwrap();
+    for chunk in body[..body_bytes].chunks_exact(4) {
+        let arr: [u8; 4] = chunk.try_into().unwrap_or_default();
         data.push(if big_endian {
             f32::from_be_bytes(arr)
         } else {
@@ -1079,6 +1242,7 @@ pub fn read_nmrpipe_3d_from_bytes(
 /// Read a single-stream NMRPipe 3D file (`.ft3`).
 pub fn read_nmrpipe_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, String> {
     let p = path.as_ref();
+    precheck_pipe_file_len(p)?;
     let bytes = fs::read(p).map_err(|e| format!("failed to read {}: {e}", p.display()))?;
     let name = p
         .file_name()
@@ -1360,10 +1524,14 @@ fn encode_ucsf_axis_header(ax: &AxisPpm, tile_size: usize) -> [u8; UCSF_AXIS_HEA
 /// heteronucleus (`15N` / `13C`) to `axis_y`.
 /// Decode a 2D UCSF Sparky spectrum (`.ucsf`) from an in-memory byte slice.
 pub fn read_ucsf_2d_from_bytes(name: &str, bytes: &[u8]) -> Result<Spectrum2D, String> {
-    read_ucsf_2d_from_reader(name, std::io::Cursor::new(bytes))
+    read_ucsf_2d_from_reader(name, bytes.len() as u64, std::io::Cursor::new(bytes))
 }
 
-fn read_ucsf_2d_from_reader<R: Read>(name: &str, mut reader: R) -> Result<Spectrum2D, String> {
+fn read_ucsf_2d_from_reader<R: Read>(
+    name: &str,
+    total_len: u64,
+    mut reader: R,
+) -> Result<Spectrum2D, String> {
     let mut hdr = [0u8; UCSF_FILE_HEADER_BYTES + 2 * UCSF_AXIS_HEADER_BYTES];
     reader
         .read_exact(&mut hdr)
@@ -1382,6 +1550,23 @@ fn read_ucsf_2d_from_reader<R: Read>(name: &str, mut reader: R) -> Result<Spectr
     let nt0 = n0.div_ceil(t0);
     let nt1 = n1.div_ceil(t1);
 
+    // Checked geometry + payload verification strictly BEFORE any allocation (`v0150:P0-2`).
+    let n_points = checked_points("UCSF 2D", &[n0, n1])?;
+    let padded = padded_extent(n0, t0)
+        .and_then(|p0| p0.checked_mul(padded_extent(n1, t1)?))
+        .ok_or_else(|| format!("UCSF 2D tile payload of {name} overflows u64"))?;
+    require_payload_bytes(
+        "UCSF 2D",
+        (UCSF_FILE_HEADER_BYTES + 2 * UCSF_AXIS_HEADER_BYTES) as u64,
+        padded,
+        4,
+        total_len,
+    )?;
+    let tile_points = checked_points("UCSF 2D tile", &[t0, t1])?;
+    let tile_byte_len = tile_points
+        .checked_mul(4)
+        .ok_or_else(|| format!("UCSF 2D tile byte size {t0}x{t1} overflows in {name}"))?;
+
     let nuc0 = classify_ucsf_nucleus(&ax0);
     let nuc1 = classify_ucsf_nucleus(&ax1);
     let transpose = (nuc0 == UcsfNuc::H && nuc1 != UcsfNuc::H)
@@ -1394,8 +1579,9 @@ fn read_ucsf_2d_from_reader<R: Read>(name: &str, mut reader: R) -> Result<Spectr
     let nx = axis_x.size;
     let ny = axis_y.size;
 
-    let mut data = vec![0.0f32; ny * nx];
-    let mut tile_bytes = vec![0u8; t0 * t1 * 4];
+    debug_assert_eq!(nx * ny, n_points);
+    let mut data = vec![0.0f32; n_points];
+    let mut tile_bytes = vec![0u8; tile_byte_len];
 
     for bt0 in 0..nt0 {
         let base0 = bt0 * t0;
@@ -1413,7 +1599,7 @@ fn read_ucsf_2d_from_reader<R: Read>(name: &str, mut reader: R) -> Result<Spectr
                     let src_off = l0 * t1 * 4;
                     let src_slice = &tile_bytes[src_off..src_off + valid1 * 4];
                     for (dst, chunk) in dst_row.iter_mut().zip(src_slice.chunks_exact(4)) {
-                        *dst = f32::from_be_bytes(chunk.try_into().unwrap());
+                        *dst = f32::from_be_bytes(chunk.try_into().unwrap_or_default());
                     }
                 }
             } else {
@@ -1423,7 +1609,8 @@ fn read_ucsf_2d_from_reader<R: Read>(name: &str, mut reader: R) -> Result<Spectr
                     let src_slice = &tile_bytes[src_off..src_off + valid1 * 4];
                     for (l1, chunk) in src_slice.chunks_exact(4).enumerate() {
                         let gy = base1 + l1;
-                        data[gy * nx + gx] = f32::from_be_bytes(chunk.try_into().unwrap());
+                        data[gy * nx + gx] =
+                            f32::from_be_bytes(chunk.try_into().unwrap_or_default());
                     }
                 }
             }
@@ -1441,12 +1628,16 @@ fn read_ucsf_2d_from_reader<R: Read>(name: &str, mut reader: R) -> Result<Spectr
 pub fn read_ucsf_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
     let p = path.as_ref();
     let file = File::open(p).map_err(|e| format!("failed to open {}: {e}", p.display()))?;
+    let total_len = file
+        .metadata()
+        .map_err(|e| format!("failed to stat {}: {e}", p.display()))?
+        .len();
     let reader = BufReader::with_capacity(256 * 1024, file);
     let name = p
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("spectrum.ucsf");
-    read_ucsf_2d_from_reader(name, reader)
+    read_ucsf_2d_from_reader(name, total_len, reader)
 }
 
 /// Write a 2D UCSF Sparky spectrum (`.ucsf`) using standard tile sizes (`64 x 256` capped to axis size).
@@ -1551,12 +1742,13 @@ fn choose_ucsf_3d_axis_perm(axes: &[AxisPpm; 3]) -> (usize, usize, usize) {
 /// zero-padded partial boundary tiles) and ordering dimensions into `Spectrum3D(X=1H, Y=15N, Z=13C)`.
 /// Decode a 3D UCSF Sparky spectrum (`.ucsf`) from an in-memory byte slice.
 pub fn read_ucsf_3d_from_bytes(name: &str, exp: &str, bytes: &[u8]) -> Result<Spectrum3D, String> {
-    read_ucsf_3d_from_reader(name, exp, std::io::Cursor::new(bytes))
+    read_ucsf_3d_from_reader(name, exp, bytes.len() as u64, std::io::Cursor::new(bytes))
 }
 
 fn read_ucsf_3d_from_reader<R: Read>(
     name: &str,
     exp: &str,
+    total_len: u64,
     mut reader: R,
 ) -> Result<Spectrum3D, String> {
     let mut hdr = [0u8; UCSF_FILE_HEADER_BYTES + 3 * UCSF_AXIS_HEADER_BYTES];
@@ -1589,8 +1781,27 @@ fn read_ucsf_3d_from_reader<R: Read>(
     let (nt0, nt1, nt2) = (n0.div_ceil(t0), n1.div_ceil(t1), n2.div_ceil(t2));
     let (nx, ny, nz) = (axis_x.size, axis_y.size, axis_z.size);
 
-    let mut data = vec![0.0f32; nz * ny * nx];
-    let mut tile_bytes = vec![0u8; t0 * t1 * t2 * 4];
+    // Checked geometry + payload verification strictly BEFORE any allocation (`20.W1:P2-6`).
+    let n_points = checked_points("UCSF 3D", &[n0, n1, n2])?;
+    let padded = padded_extent(n0, t0)
+        .and_then(|p0| p0.checked_mul(padded_extent(n1, t1)?))
+        .and_then(|p01| p01.checked_mul(padded_extent(n2, t2)?))
+        .ok_or_else(|| format!("UCSF 3D tile payload of {name} overflows u64"))?;
+    require_payload_bytes(
+        "UCSF 3D",
+        (UCSF_FILE_HEADER_BYTES + 3 * UCSF_AXIS_HEADER_BYTES) as u64,
+        padded,
+        4,
+        total_len,
+    )?;
+    let tile_points = checked_points("UCSF 3D tile", &[t0, t1, t2])?;
+    let tile_byte_len = tile_points
+        .checked_mul(4)
+        .ok_or_else(|| format!("UCSF 3D tile byte size {t0}x{t1}x{t2} overflows in {name}"))?;
+    debug_assert_eq!(nx * ny * nz, n_points);
+
+    let mut data = vec![0.0f32; n_points];
+    let mut tile_bytes = vec![0u8; tile_byte_len];
     let direct_zyx = (x_dim, y_dim, z_dim) == (2, 1, 0);
 
     for bt0 in 0..nt0 {
@@ -1616,7 +1827,7 @@ fn read_ucsf_3d_from_reader<R: Read>(
                             let src_off = (l0 * t1 + l1) * t2 * 4;
                             let src_slice = &tile_bytes[src_off..src_off + valid2 * 4];
                             for (dst, chunk) in dst_row.iter_mut().zip(src_slice.chunks_exact(4)) {
-                                *dst = f32::from_be_bytes(chunk.try_into().unwrap());
+                                *dst = f32::from_be_bytes(chunk.try_into().unwrap_or_default());
                             }
                         }
                     }
@@ -1633,7 +1844,7 @@ fn read_ucsf_3d_from_reader<R: Read>(
                                 let gy = coords[y_dim];
                                 let gz = coords[z_dim];
                                 data[(gz * ny + gy) * nx + gx] =
-                                    f32::from_be_bytes(chunk.try_into().unwrap());
+                                    f32::from_be_bytes(chunk.try_into().unwrap_or_default());
                             }
                         }
                     }
@@ -1655,12 +1866,16 @@ fn read_ucsf_3d_from_reader<R: Read>(
 pub fn read_ucsf_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, String> {
     let p = path.as_ref();
     let file = File::open(p).map_err(|e| format!("failed to open {}: {e}", p.display()))?;
+    let total_len = file
+        .metadata()
+        .map_err(|e| format!("failed to stat {}: {e}", p.display()))?
+        .len();
     let reader = BufReader::with_capacity(1024 * 1024, file);
     let name = p
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("spectrum3d.ucsf");
-    read_ucsf_3d_from_reader(name, exp, reader)
+    read_ucsf_3d_from_reader(name, exp, total_len, reader)
 }
 
 /// Write a 3D UCSF Sparky spectrum (`.ucsf`) using standard tile sizes (`32 x 8 x 128` capped to axis size).
@@ -1845,5 +2060,15 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_point_cap_constants() {
+        assert_eq!(MAX_SPECTRUM_POINTS_NATIVE, 1u64 << 30);
+        assert_eq!(MAX_SPECTRUM_POINTS_WASM, 1u64 << 26);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(MAX_SPECTRUM_POINTS, MAX_SPECTRUM_POINTS_NATIVE);
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(MAX_SPECTRUM_POINTS, MAX_SPECTRUM_POINTS_WASM);
     }
 }
