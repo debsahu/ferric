@@ -11,6 +11,7 @@
 /// Canonical SemVer release version inherited from `[workspace.package]` in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod af_assign_priors;
 pub mod af_concordance;
 pub mod aromatic;
 pub mod bayes_sa;

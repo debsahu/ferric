@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use crate::af_assign_priors::{AfAssignPriors, AfNoesyPairwiseTable};
 use crate::dihedrals::{align_by_res_names, periodic_angle_diff_deg, random_coil_shifts};
 use crate::noesy::{compute_chain_torsions, parse_pdb_first_model, PdbChain};
 use crate::peaks::Peak;
@@ -128,6 +129,9 @@ pub struct EvoGraphConfig<'a> {
     pub apply_qc_calibration: bool,
     /// Optional 3D backbone `(phi_deg, psi_deg)` torsions aligned to `sequence` (`None` = sequence-only).
     pub structure_torsions: Option<&'a [(Option<f64>, Option<f64>)]>,
+    /// Strictly opt-in 3D AlphaFold Student-`t(nu = 4)` shift & `PAE`-gated `15N-NOESY` priors
+    /// (`None` = default sequence-only pipeline, bit-for-bit identical).
+    pub af_priors: Option<&'a AfAssignPriors>,
     /// Optional user-locked `(spin_system_idx, seq_idx)` hard assignment constraints
     /// (merged with `score_cfg.locked_assignments`; when calling `assign_evo_graph_from_peaks`,
     /// `spin_system_idx` indexes raw `HSQC` roots in `peaks`).
@@ -168,6 +172,7 @@ impl Default for EvoGraphConfig<'_> {
             graph_consistency: true,
             apply_qc_calibration: true,
             structure_torsions: None,
+            af_priors: None,
             locked_assignments: Vec::new(),
             seed: 0,
         }
@@ -2599,6 +2604,10 @@ fn build_evo_unary_matrix(
         }
     }
 
+    if let Some(af) = cfg.af_priors {
+        af.apply_to_unary_matrix(&mut u, systems, cfg.score_cfg.use_hn);
+    }
+
     for &(s_lock, k_lock) in locks {
         if s_lock >= s_len || k_lock == 0 || k_lock >= k_len || seq[k_lock] == "PRO" {
             continue;
@@ -2631,14 +2640,20 @@ fn build_evo_unary_matrix(
 /// Calibrate raw multi-island consensus confidence with the parameter-free unit-temperature
 /// (`T = 1.0` nat) local conditional Boltzmann margin `1 / (1 + sum_m exp(E_alt_m - E*))` over
 /// unassignment, competing free spin systems, empty sequence slots, and 2-cycle swaps.
-fn calibrate_boltzmann_confidence(res: &mut AssignResult, u: &Matrix2D, p: &Matrix2D) {
-    calibrate_boltzmann_confidence_with_null_scale(res, u, p, 1.0);
+fn calibrate_boltzmann_confidence(
+    res: &mut AssignResult,
+    u: &Matrix2D,
+    p: &Matrix2D,
+    af_noe: Option<&AfNoesyPairwiseTable>,
+) {
+    calibrate_boltzmann_confidence_with_null_scale(res, u, p, af_noe, 1.0);
 }
 
 fn calibrate_boltzmann_confidence_with_null_scale(
     res: &mut AssignResult,
     u: &Matrix2D,
     p: &Matrix2D,
+    af_noe: Option<&AfNoesyPairwiseTable>,
     null_scale: f64,
 ) {
     let s_len = u.rows;
@@ -2660,6 +2675,9 @@ fn calibrate_boltzmann_confidence_with_null_scale(
         }
         if slot + 1 < k_len && cur_at[slot + 1] >= 0 {
             sc += p.get(spin, cur_at[slot + 1] as usize);
+        }
+        if let Some(noe) = af_noe {
+            sc += noe.site_bonus(spin, slot, cur_at);
         }
         sc
     };
@@ -2765,6 +2783,7 @@ fn calibrate_final_marginal_confidence(
     res: &mut AssignResult,
     u: &Matrix2D,
     p: &Matrix2D,
+    af_noe: Option<&AfNoesyPairwiseTable>,
     apply_calibration_map: bool,
 ) {
     let k_len = u.cols;
@@ -2793,7 +2812,7 @@ fn calibrate_final_marginal_confidence(
     let null_scale = 1.0 - 0.80 * high_completeness;
 
     let c0 = res.confidence.clone();
-    calibrate_boltzmann_confidence_with_null_scale(res, u, p, null_scale);
+    calibrate_boltzmann_confidence_with_null_scale(res, u, p, af_noe, null_scale);
 
     let b1 = res.confidence.clone();
     let clamp_w = |spin_idx: usize| -> f64 { b1[spin_idx].clamp(0.0, 1.0).powi(4) };
@@ -2806,6 +2825,9 @@ fn calibrate_final_marginal_confidence(
         if slot + 1 < k_len && at[slot + 1] >= 0 {
             let sr = at[slot + 1] as usize;
             sc += clamp_w(sr) * p.get(spin, sr);
+        }
+        if let Some(noe) = af_noe {
+            sc += noe.site_bonus(spin, slot, &at);
         }
         sc
     };
@@ -3036,6 +3058,7 @@ fn apply_graph_self_consistency(
     u_pass2: &mut Matrix2D,
     u_pass1: &Matrix2D,
     p: &Matrix2D,
+    af_noe: Option<&AfNoesyPairwiseTable>,
     systems: &[SpinSystem],
     seq: &[String],
     shifted_priors: &Priors,
@@ -3124,7 +3147,10 @@ fn apply_graph_self_consistency(
     let mut edge_w = vec![0.0_f64; k_len.saturating_sub(1)];
     for k in 0..k_len.saturating_sub(1) {
         if at[k] >= 0 && at[k + 1] >= 0 {
-            let p_sc = p.get(at[k] as usize, at[k + 1] as usize);
+            let mut p_sc = p.get(at[k] as usize, at[k + 1] as usize);
+            if let Some(noe) = af_noe {
+                p_sc += noe.sequential_bonus(at[k] as usize, at[k + 1] as usize, k + 1);
+            }
             edge_w[k] = sigmoid((p_sc - 1.0) / 2.8);
         }
     }
@@ -3138,7 +3164,8 @@ fn apply_graph_self_consistency(
         }
         let s = s_raw as usize;
         let q0 = pass1.confidence.get(s).copied().unwrap_or(0.0);
-        let u_sig = sigmoid(u_pass1.get(s, k) / 4.0);
+        let lr_noe_boost = af_noe.map_or(0.0, |noe| noe.medium_long_site_bonus(s, k, &at));
+        let u_sig = sigmoid((u_pass1.get(s, k) + lr_noe_boost) / 4.0);
 
         let mut nbr_sum = 0.0;
         let mut nbr_cnt = 0usize;
@@ -3322,7 +3349,12 @@ impl Individual {
     }
 }
 
-fn evaluate_total_score(at: &[i32], u: &Matrix2D, p: &Matrix2D) -> f64 {
+fn evaluate_total_score_with_af_noe(
+    at: &[i32],
+    u: &Matrix2D,
+    p: &Matrix2D,
+    af_noe: Option<&AfNoesyPairwiseTable>,
+) -> f64 {
     let k_len = at.len();
     let mut sc = 0.0;
     for (k, &s) in at.iter().enumerate() {
@@ -3337,18 +3369,23 @@ fn evaluate_total_score(at: &[i32], u: &Matrix2D, p: &Matrix2D) -> f64 {
             sc += p.get(a as usize, b as usize);
         }
     }
+    if let Some(noe) = af_noe {
+        sc += noe.total_bonus(at);
+    }
     sc
 }
 
 struct LocalAnnealer<'a> {
     u: &'a Matrix2D,
     p: &'a Matrix2D,
+    af_noe: Option<&'a AfNoesyPairwiseTable>,
     slots: &'a [Vec<usize>],
     locked_s: Vec<bool>,
     locked_k: Vec<bool>,
     s_len: usize,
     k_len: usize,
     edge_marks: Vec<u32>,
+    noe_marks: Vec<u32>,
     mark_gen: u32,
 }
 
@@ -3356,6 +3393,7 @@ impl<'a> LocalAnnealer<'a> {
     fn new(
         u: &'a Matrix2D,
         p: &'a Matrix2D,
+        af_noe: Option<&'a AfNoesyPairwiseTable>,
         slots: &'a [Vec<usize>],
         locks: &[(usize, usize)],
     ) -> Self {
@@ -3367,15 +3405,18 @@ impl<'a> LocalAnnealer<'a> {
                 locked_k[k_lock] = true;
             }
         }
+        let noe_len = af_noe.map_or(0, AfNoesyPairwiseTable::num_contacts);
         Self {
             u,
             p,
+            af_noe,
             slots,
             locked_s,
             locked_k,
             s_len: u.rows,
             k_len: u.cols,
             edge_marks: vec![0; u.cols],
+            noe_marks: vec![0; noe_len],
             mark_gen: 1,
         }
     }
@@ -3388,6 +3429,7 @@ impl<'a> LocalAnnealer<'a> {
         self.mark_gen = self.mark_gen.wrapping_add(1);
         if self.mark_gen == 0 {
             self.edge_marks.fill(0);
+            self.noe_marks.fill(0);
             self.mark_gen = 1;
         }
         let gen = self.mark_gen;
@@ -3417,6 +3459,9 @@ impl<'a> LocalAnnealer<'a> {
             if a >= 0 && b >= 0 {
                 sc += self.p.get(a as usize, b as usize);
             }
+        }
+        if let Some(noe) = self.af_noe {
+            sc += noe.local_subset_bonus(at, changed, &mut self.noe_marks, gen);
         }
         sc
     }
@@ -3468,6 +3513,9 @@ impl<'a> LocalAnnealer<'a> {
                 if k + 1 < self.k_len && ind.at[k + 1] >= 0 {
                     gain += self.p.get(s, ind.at[k + 1] as usize);
                 }
+                if let Some(noe) = self.af_noe {
+                    gain += noe.site_bonus(s, k, &ind.at);
+                }
                 if gain > best_gain {
                     best_gain = gain;
                     best_k = Some(k);
@@ -3490,10 +3538,10 @@ impl<'a> LocalAnnealer<'a> {
         max_block: usize,
     ) {
         if self.s_len == 0 || self.k_len == 0 || steps == 0 {
-            ind.score = evaluate_total_score(&ind.at, self.u, self.p);
+            ind.score = evaluate_total_score_with_af_noe(&ind.at, self.u, self.p, self.af_noe);
             return;
         }
-        let mut cur = evaluate_total_score(&ind.at, self.u, self.p);
+        let mut cur = evaluate_total_score_with_af_noe(&ind.at, self.u, self.p, self.af_noe);
         let mut best = cur;
         let mut best_at = ind.at.clone();
 
@@ -3616,6 +3664,7 @@ fn crossover_sequential_fragment(
     receiver: &Individual,
     u: &Matrix2D,
     p: &Matrix2D,
+    af_noe: Option<&AfNoesyPairwiseTable>,
     link_threshold: f64,
     rng: &mut Rng,
 ) -> Individual {
@@ -3637,7 +3686,14 @@ fn crossover_sequential_fragment(
         let mut end = k;
         let mut frag_sc = u.get(donor.at[k] as usize, k);
         while end + 1 < k_len && donor.at[end + 1] >= 0 {
-            let edge = p.get(donor.at[end] as usize, donor.at[end + 1] as usize);
+            let mut edge = p.get(donor.at[end] as usize, donor.at[end + 1] as usize);
+            if let Some(noe) = af_noe {
+                edge += noe.sequential_bonus(
+                    donor.at[end] as usize,
+                    donor.at[end + 1] as usize,
+                    end + 1,
+                );
+            }
             if edge > link_threshold {
                 end += 1;
                 frag_sc += edge + u.get(donor.at[end] as usize, end);
@@ -3750,6 +3806,7 @@ fn enforce_locks_on_individual(ind: &mut Individual, locks: &[(usize, usize)]) {
 fn evolve_island(
     u: &Matrix2D,
     p: &Matrix2D,
+    af_noe: Option<&AfNoesyPairwiseTable>,
     slots: &[Vec<usize>],
     island_pop_size: usize,
     cfg: &EvoGraphConfig<'_>,
@@ -3761,7 +3818,7 @@ fn evolve_island(
     let k_len = u.cols;
     let pop_m = island_pop_size.max(2);
     let mut rng = Rng::new(seed);
-    let mut annealer = LocalAnnealer::new(u, p, slots, locks);
+    let mut annealer = LocalAnnealer::new(u, p, af_noe, slots, locks);
     let steps_gen0 = cfg.steps_per_system_per_gen.max(50) * s_len;
     let steps_gen = ((cfg.steps_per_system_per_gen * 4) / 5).max(40) * s_len;
 
@@ -3821,6 +3878,7 @@ fn evolve_island(
                     &pop[pb],
                     u,
                     p,
+                    af_noe,
                     cfg.fragment_link_threshold,
                     &mut rng,
                 );
@@ -3850,9 +3908,11 @@ fn evolve_island(
         .unwrap_or_else(|| Individual::empty(s_len, k_len))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_parallel_islands(
     u: &Matrix2D,
     p: &Matrix2D,
+    af_noe: Option<&AfNoesyPairwiseTable>,
     u_eval: &Matrix2D,
     cfg: &EvoGraphConfig<'_>,
     locks: &[(usize, usize)],
@@ -3886,7 +3946,7 @@ fn run_parallel_islands(
         for (idx, &sd) in seeds.iter().enumerate() {
             let warm = warm_positions.and_then(|wp| wp.get(idx).map(Vec::as_slice));
             winners.push(evolve_island(
-                u, p, &slots, island_pop, cfg, locks, warm, sd,
+                u, p, af_noe, &slots, island_pop, cfg, locks, warm, sd,
             ));
         }
     } else {
@@ -3908,6 +3968,7 @@ fn run_parallel_islands(
                             local.push(evolve_island(
                                 u,
                                 p,
+                                af_noe,
                                 slots_ref,
                                 island_pop,
                                 cfg,
@@ -3934,7 +3995,7 @@ fn run_parallel_islands(
     let mut positions = Vec::with_capacity(winners.len());
     let mut scores = Vec::with_capacity(winners.len());
     for w in winners {
-        let phys_sc = evaluate_total_score(&w.at, u_eval, p);
+        let phys_sc = evaluate_total_score_with_af_noe(&w.at, u_eval, p, af_noe);
         positions.push(w.pos);
         scores.push(phys_sc);
     }
@@ -4091,9 +4152,21 @@ fn assign_evo_graph_core(
         enable_minor_damping,
     );
     let p = pair_matrix(systems, &cfg.score_cfg);
+    let af_noe = cfg
+        .af_priors
+        .and_then(|af| af.build_noesy_pairwise_table(systems));
 
     let mut master_rng = Rng::new(cfg.seed);
-    let (pos1, scores1) = run_parallel_islands(&u1, &p, &u1, cfg, locks, None, &mut master_rng);
+    let (pos1, scores1) = run_parallel_islands(
+        &u1,
+        &p,
+        af_noe.as_ref(),
+        &u1,
+        cfg,
+        locks,
+        None,
+        &mut master_rng,
+    );
     let mut res1 = consensus_from_runs(&pos1, scores1);
     // Parameter-free unit-temperature (`T = 1.0` nat) single-spin Pass-1 Boltzmann margin with
     // zero empirical knot tables upstream of Pass 2 (`P1-7(a)`): guarantees zero cross-fold
@@ -4103,7 +4176,7 @@ fn assign_evo_graph_core(
     // phases with the initial `dev` entries visible; 13-fold LOPO certifies the post-Pass-2
     // isotonic PAV map (`EVO_GRAPH_CALIBRATION_KNOTS`), while end-to-end generalization is
     // evaluated single-shot on pre-registered cold held-out cohorts (`cold_p12`).
-    calibrate_boltzmann_confidence(&mut res1, &u1, &p);
+    calibrate_boltzmann_confidence(&mut res1, &u1, &p, af_noe.as_ref());
     apply_locked_result_overrides(&mut res1, norm_seq.len(), locks);
     report.pass1_best_score = res1.score;
 
@@ -4143,6 +4216,7 @@ fn assign_evo_graph_core(
             &mut u2_guided,
             &u1,
             &p,
+            af_noe.as_ref(),
             systems,
             &norm_seq,
             &priors_pass2,
@@ -4168,6 +4242,7 @@ fn assign_evo_graph_core(
     let (pos2, scores2) = run_parallel_islands(
         &u2_guided,
         &p,
+        af_noe.as_ref(),
         &u2_phys,
         cfg,
         locks,
@@ -4175,7 +4250,13 @@ fn assign_evo_graph_core(
         &mut master_rng,
     );
     let mut res2 = consensus_from_runs(&pos2, scores2);
-    calibrate_final_marginal_confidence(&mut res2, &u2_phys, &p, cfg.apply_qc_calibration);
+    calibrate_final_marginal_confidence(
+        &mut res2,
+        &u2_phys,
+        &p,
+        af_noe.as_ref(),
+        cfg.apply_qc_calibration,
+    );
     apply_locked_result_overrides(&mut res2, norm_seq.len(), locks);
     report.final_best_score = res2.score;
     res2

@@ -6,6 +6,7 @@
 //! Provenance: Original CLI implementing `docs/specs/01-data-io.md` through `docs/specs/15-structure-viewer.md`
 //! and Octet-Draw CLI workflows.
 
+pub mod af_assign_cmd;
 pub mod af_validate_cmd;
 pub mod dosy_cmd;
 pub mod exchange_cmd;
@@ -213,7 +214,7 @@ fn usage() -> String {
        ferric fetch-bmrb      --id <bmrb_id> [--dest <dir>] [--dry-run] [--all-archives] [--max-bytes <bytes>]\n\
        ferric process         --in <fid_dir> --out <path_or_dir> [--exp <EXP>] [--recipe <json>] [--crop-h 5.5:11.5] [--no-crop] [--lp] [--auto-phase] [--phase-x P0:P1] [--phase-y P0:P1] [--phase-z P0:P1] [--hilbert] [--nus-method fista|ist]\n\
        ferric e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
-       ferric assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--r-bleach 11.0] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--solver evo-graph|standard|bayes-sa] [--engine auto|gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--no-auto-ref] [--locks <SPEC>] [--json-out <path>] [--nef-out <path>] [--report-out <path>] [--priors priors.json] [-v]\n\
+       ferric assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--af-structure <model.cif|pdb>] [--af-pae <pae.json>] [--noesy-15n <noesy.tsv|nef>] [--af-weight 0.65] [--af-clamp-nats 4.0] [--metal-ligands <SPEC>] [--r-bleach 11.0] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--solver evo-graph|standard|bayes-sa] [--engine auto|gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--no-auto-ref] [--locks <SPEC>] [--json-out <path>] [--nef-out <path>] [--report-out <path>] [--priors priors.json] [-v]\n\
        ferric propensity      --shifts <assigned.str|assigned.nef> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]\n\
        ferric torsions        --shifts <assigned.str|assigned.nef> -o <out.tsv|out.nef|out.json> [--include-chi1] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>]\n\
        ferric af-validate     --structure <model.cif|model.pdb> [--pae <pae.json>] --shifts <assigned.str|assigned.nef> [--s2 <modelfree.tsv>] [--fetch-uniprot <id> --cache-dir <dir>] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [-o <out.json|out.tsv|report.html>]\n\
@@ -2767,6 +2768,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let mut auto_reference = true;
     let mut locks_spec: Option<String> = None;
     let mut tol_overrides = ToleranceOverrides::default();
+    let mut af_opts = af_assign_cmd::AfAssignCliOpts::default();
     let mut seed = 0u64;
     let mut verbose = false;
 
@@ -2986,10 +2988,16 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                     args[i]
                 ))
             }
-            other => return Err(format!("unknown assign flag {other:?}")),
+            other => {
+                if !af_opts.try_parse_arg(args, &mut i)? {
+                    return Err(format!("unknown assign flag {other:?}"));
+                }
+            }
         }
         i += 1;
     }
+
+    af_opts.validate(regime, solver)?;
 
     if regime != RegimeKind::Paramagnetic {
         if pdb_path.is_some() {
@@ -3212,21 +3220,41 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 Some(EngineRequest::Cpu) => Some(EngineKind::Cpu),
             };
             let t_solve = Instant::now();
-            let wf = execute_assignment_workflow_with_options(
-                solver,
-                engine_opt,
-                &peaks,
-                &sequence,
-                &pri,
-                &score_cfg,
-                tol_overrides,
-                runs,
-                steps,
-                STANDARD_CPU_CALIBRATED_RUNS,
-                seed,
-                None,
-                None,
-            )?;
+            let (wf, af_meta_opt) = if af_opts.is_enabled() {
+                let (wf_af, meta_af) = af_assign_cmd::execute_af_assisted_assignment_workflow(
+                    &af_opts,
+                    solver,
+                    engine_opt,
+                    &peaks,
+                    &sequence,
+                    &seq_ids,
+                    &pri,
+                    &score_cfg,
+                    tol_overrides,
+                    runs,
+                    steps,
+                    STANDARD_CPU_CALIBRATED_RUNS,
+                    seed,
+                )?;
+                (wf_af, Some(meta_af))
+            } else {
+                let wf_std = execute_assignment_workflow_with_options(
+                    solver,
+                    engine_opt,
+                    &peaks,
+                    &sequence,
+                    &pri,
+                    &score_cfg,
+                    tol_overrides,
+                    runs,
+                    steps,
+                    STANDARD_CPU_CALIBRATED_RUNS,
+                    seed,
+                    None,
+                    None,
+                )?;
+                (wf_std, None)
+            };
             let dt_solve = t_solve.elapsed().as_secs_f64();
             log_workflow_diagnostics(
                 &wf.engine_label,
@@ -3246,13 +3274,21 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 Some(&wf.effective_priors),
             );
 
-            let star_hdr = format_star_offset_header(
+            let base_star_hdr = format_star_offset_header(
                 &wf.engine_label,
                 &wf.offsets,
                 &wf.detailed_offsets,
                 &wf.qc_report,
                 wf.bayes_report.as_ref(),
             );
+            let star_hdr = match af_meta_opt {
+                Some(ref meta) => Some(af_assign_cmd::format_af_star_header(
+                    base_star_hdr,
+                    meta,
+                    &wf,
+                )),
+                None => base_star_hdr,
+            };
             write_star_with_header(&str_out, &pred, Some(&conf), star_hdr.as_deref())?;
             write_shifts_tsv(&tsv_out, &pred, &conf)?;
 
@@ -3263,7 +3299,11 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                         fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
                     }
                 }
-                let json_txt = render_assign_workflow_json(&wf, conf.len(), n_hc)?;
+                let base_json = render_assign_workflow_json(&wf, conf.len(), n_hc)?;
+                let json_txt = match af_meta_opt {
+                    Some(ref meta) => af_assign_cmd::inject_af_json_metadata(&base_json, meta),
+                    None => base_json,
+                };
                 fs::write(jp, format!("{json_txt}\n"))
                     .map_err(|e| format!("failed to write {}: {e}", jp.display()))?;
             }

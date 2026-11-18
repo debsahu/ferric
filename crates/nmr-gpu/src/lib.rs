@@ -24,6 +24,9 @@ pub mod rdc_gpu;
 pub mod relax_gpu;
 
 use bytemuck::{Pod, Zeroable};
+use nmr_core::af_assign_priors::{
+    estimate_af_shift_offsets, AfAssignPriors, AfNoesyPairwiseTable, AF_GPU_CARRIER_CENTERS_PPM,
+};
 use nmr_core::priors::{delta_covalent, Priors, ATOMS, STANDARD_RESIDUES};
 use nmr_core::rng::Rng;
 use nmr_core::solver::{
@@ -53,33 +56,76 @@ struct ScoreParamsGpu {
     forbid_zero_carbons: u32,
     has_excess_roots: u32,
     multi_slot_dataset: u32,
+    enable_af_priors: u32,
+    af_weight: f32,
+    af_clamp_nats: f32,
+    _af_pad: u32,
+}
+
+/// Split a chemical shift `x` (ppm) into an exact `1/16 ppm` dyadic lattice coordinate `hi`
+/// (at most 13 significand bits for `|x| <= 512 ppm`, so `a_hi - b_hi` is bit-exact in `f32` even
+/// under GPU `-ffast-math`) plus bounded remainder `|lo| <= 0.03125` (`< 2e-9 ppm` ULP).
+#[inline]
+fn split_dyadic16(x: f64) -> (f32, f32) {
+    let grid = (x * 16.0).round() * 0.0625;
+    let rem = x - grid;
+    (grid as f32, rem as f32)
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct PriorEntryGpu {
-    mu: f32,
-    sd: f32,
+    mu_hi: f32,
+    mu_lo: f32,
+    inv_sd_hi: f32,
+    inv_sd_lo: f32,
+    ln_sd_hi: f32,
+    ln_sd_lo: f32,
     present: u32,
-    _pad: u32,
+    _pad0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct AfPriorEntryGpu {
+    mu_af_hi: f32,
+    mu_af_lo: f32,
+    inv_sigma_af_hi: f32,
+    inv_sigma_af_lo: f32,
+    mu_bg_hi: f32,
+    mu_bg_lo: f32,
+    inv_sigma_bg_hi: f32,
+    inv_sigma_bg_lo: f32,
+    log_sigma_ratio_hi: f32,
+    log_sigma_ratio_lo: f32,
+    w_af: f32,
+    present: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SeqEntryGpu {
     res_idx: u32,
-    d_n: f32,
-    d_ca: f32,
-    d_cb: f32,
-    d_c: f32,
-    _pad: u32,
+    _pad0: u32,
+    d_n_hi: f32,
+    d_n_lo: f32,
+    d_ca_hi: f32,
+    d_ca_lo: f32,
+    d_cb_hi: f32,
+    d_cb_lo: f32,
+    d_c_hi: f32,
+    d_c_lo: f32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CandEntryGpu {
-    val: f32,
+    val_hi: f32,
+    val_lo: f32,
     support: u32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -343,6 +389,7 @@ impl GpuEngine {
                 storage_ro(5),
                 storage_rw(6),
                 storage_rw(7),
+                storage_ro(8),
             ],
         });
         let score_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -573,6 +620,86 @@ impl GpuEngine {
         Ok(out)
     }
 
+    /// Pre-check `max_buffer_size`, `max_storage_buffer_binding_size`, and workgroup dispatch
+    /// limits before allocating any WebGPU scoring buffers (`T21.4` hostile-dimension guard).
+    pub fn validate_af_scoring_gpu_limits(
+        &self,
+        s_len: usize,
+        k_len: usize,
+        max_cands: usize,
+        has_af_priors: bool,
+    ) -> Result<(), String> {
+        if s_len == 0 || k_len == 0 {
+            return Ok(());
+        }
+        let s_u64 = u64::try_from(s_len).map_err(|_| "s_len overflow".to_string())?;
+        let k_u64 = u64::try_from(k_len).map_err(|_| "k_len overflow".to_string())?;
+        let c_u64 =
+            u64::try_from(max_cands.max(1)).map_err(|_| "max_cands overflow".to_string())?;
+
+        let u_bytes = s_u64
+            .checked_mul(k_u64)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| format!("GPU U-matrix byte size overflow for S={s_len}, K={k_len}"))?;
+        let p_bytes = s_u64
+            .checked_mul(s_u64)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| format!("GPU P-matrix byte size overflow for S={s_len}"))?;
+        let cands_bytes = s_u64
+            .checked_mul(6)
+            .and_then(|n| n.checked_mul(c_u64))
+            .and_then(|n| n.checked_mul(std::mem::size_of::<CandEntryGpu>() as u64))
+            .ok_or_else(|| format!("GPU cands buffer byte size overflow for S={s_len}"))?;
+        let roots_bytes = s_u64
+            .checked_mul(16)
+            .ok_or_else(|| "GPU roots buffer overflow".to_string())?;
+        let counts_bytes = s_u64
+            .checked_mul(24)
+            .ok_or_else(|| "GPU counts buffer overflow".to_string())?;
+        let seq_bytes = k_u64
+            .checked_mul(std::mem::size_of::<SeqEntryGpu>() as u64)
+            .ok_or_else(|| "GPU seq buffer overflow".to_string())?;
+        let af_bytes = if has_af_priors {
+            k_u64
+                .checked_mul(5)
+                .and_then(|n| n.checked_mul(std::mem::size_of::<AfPriorEntryGpu>() as u64))
+                .ok_or_else(|| format!("GPU AF prior buffer overflow for K={k_len}"))?
+        } else {
+            std::mem::size_of::<AfPriorEntryGpu>() as u64
+        };
+
+        let max_req = u_bytes
+            .max(p_bytes)
+            .max(cands_bytes)
+            .max(roots_bytes)
+            .max(counts_bytes)
+            .max(seq_bytes)
+            .max(af_bytes);
+        let lim = self.device.limits();
+        if max_req > lim.max_buffer_size {
+            return Err(format!(
+                "GPU scoring buffer ({max_req} B) exceeds device max_buffer_size ({} B) for S={s_len}, K={k_len}",
+                lim.max_buffer_size
+            ));
+        }
+        let max_bind = self.max_storage_binding_bytes();
+        if max_req > max_bind {
+            return Err(format!(
+                "GPU scoring matrix buffer ({max_req} B) exceeds device storage binding limit ({max_bind} B) for S={s_len}, K={k_len}"
+            ));
+        }
+        let max_wg_dim = lim.max_compute_workgroups_per_dimension as u64;
+        let wg_s = s_u64.div_ceil(16);
+        let wg_k = k_u64.div_ceil(16);
+        if wg_s > max_wg_dim || wg_k > max_wg_dim {
+            return Err(format!(
+                "GPU scoring workgroup count ({wg_s}x{}) exceeds device limit ({max_wg_dim}) for S={s_len}, K={k_len}",
+                wg_s.max(wg_k)
+            ));
+        }
+        Ok(())
+    }
+
     /// Compute `U` `(S x K)` and `P` `(S x S)` scoring matrices on the GPU.
     pub fn score_matrices_gpu(
         &self,
@@ -580,6 +707,20 @@ impl GpuEngine {
         sequence: &[String],
         priors: &Priors,
         cfg: &ScoreConfig,
+    ) -> Result<(Matrix2D, Matrix2D), String> {
+        self.score_matrices_with_af_priors_gpu(systems, sequence, priors, cfg, None)
+    }
+
+    /// Compute `U` `(S x K)` and `P` `(S x S)` scoring matrices on the GPU with optional
+    /// heavy-tailed Student-`t(nu = 4)` 3D AlphaFold shift priors (`0.0` diff when `af_priors`
+    /// is `None`; `max |U_cpu - U_gpu| < 1.0e-5` when `Some`).
+    pub fn score_matrices_with_af_priors_gpu(
+        &self,
+        systems: &[SpinSystem],
+        sequence: &[String],
+        priors: &Priors,
+        cfg: &ScoreConfig,
+        af_priors: Option<&AfAssignPriors>,
     ) -> Result<(Matrix2D, Matrix2D), String> {
         let s_len = systems.len();
         let k_len = sequence.len();
@@ -589,6 +730,14 @@ impl GpuEngine {
                 Matrix2D::filled(s_len, s_len, FORBID),
             ));
         }
+        if let Some(af) = af_priors {
+            if af.sequence_len() != k_len {
+                return Err(format!(
+                    "AfAssignPriors sequence length ({}) does not match sequence length ({k_len})",
+                    af.sequence_len()
+                ));
+            }
+        }
 
         let max_cands = systems
             .iter()
@@ -597,34 +746,10 @@ impl GpuEngine {
             .unwrap_or(1)
             .max(1);
 
+        self.validate_af_scoring_gpu_limits(s_len, k_len, max_cands, af_priors.is_some())?;
+
         let u_bytes = (s_len as u64) * (k_len as u64) * 4;
         let p_bytes = (s_len as u64) * (s_len as u64) * 4;
-        let cands_bytes = (s_len as u64) * 6 * (max_cands as u64) * 8;
-        let roots_bytes = (s_len as u64) * 8;
-        let counts_bytes = (s_len as u64) * 6 * 4;
-        let seq_bytes = (k_len as u64) * (std::mem::size_of::<SeqEntryGpu>() as u64);
-        let max_req = u_bytes
-            .max(p_bytes)
-            .max(cands_bytes)
-            .max(roots_bytes)
-            .max(counts_bytes)
-            .max(seq_bytes);
-        let max_bind = self.max_storage_binding_bytes();
-        if max_req > max_bind {
-            return Err(format!(
-                "GPU scoring matrix buffer ({max_req} B) exceeds device storage binding limit ({max_bind} B) for S={s_len}, K={k_len}"
-            ));
-        }
-        let max_wg_dim = self.device.limits().max_compute_workgroups_per_dimension;
-        let wg_s = (s_len as u64).div_ceil(16);
-        let wg_k = (k_len as u64).div_ceil(16);
-        if wg_s > (max_wg_dim as u64) || wg_k > (max_wg_dim as u64) {
-            return Err(format!(
-                "GPU scoring workgroup count ({}x{}) exceeds device limit ({max_wg_dim}) for S={s_len}, K={k_len}",
-                wg_s,
-                wg_s.max(wg_k)
-            ));
-        }
 
         let (eff_priors, _) = prepare_scoring_priors(systems, sequence, priors, cfg);
         let assignable = sequence
@@ -650,6 +775,13 @@ impl GpuEngine {
             false
         };
 
+        let centers = AF_GPU_CARRIER_CENTERS_PPM;
+
+        let (enable_af_priors, af_weight, af_clamp_nats) = match af_priors {
+            Some(af) => (1u32, af.cfg.af_weight as f32, af.cfg.af_clamp_nats as f32),
+            None => (0u32, 0.0f32, 4.0f32),
+        };
+
         let params = ScoreParamsGpu {
             s_len: s_len as u32,
             k_len: k_len as u32,
@@ -667,28 +799,105 @@ impl GpuEngine {
             forbid_zero_carbons: u32::from(cfg.forbid_zero_carbons),
             has_excess_roots: u32::from(has_excess_roots),
             multi_slot_dataset: u32::from(multi_slot_dataset),
+            enable_af_priors,
+            af_weight,
+            af_clamp_nats,
+            _af_pad: 0,
         };
 
         let mut prior_table = Vec::with_capacity(20 * 5);
         for &(res, _) in &STANDARD_RESIDUES {
-            for &atom in &ATOMS {
+            for (a_idx, &atom) in ATOMS.iter().enumerate() {
                 if let Some(&(mu, sd)) = eff_priors.table.get(res).and_then(|m| m.get(atom)) {
+                    let (mu_hi, mu_lo) = split_dyadic16(mu - centers[a_idx]);
+                    let inv_sd_f64 = 1.0 / sd;
+                    let inv_sd_hi = inv_sd_f64 as f32;
+                    let inv_sd_lo = (inv_sd_f64 - (inv_sd_hi as f64)) as f32;
+                    let ln_sd_f64 = sd.ln();
+                    let ln_sd_hi = ln_sd_f64 as f32;
+                    let ln_sd_lo = (ln_sd_f64 - (ln_sd_hi as f64)) as f32;
                     prior_table.push(PriorEntryGpu {
-                        mu: mu as f32,
-                        sd: sd as f32,
+                        mu_hi,
+                        mu_lo,
+                        inv_sd_hi,
+                        inv_sd_lo,
+                        ln_sd_hi,
+                        ln_sd_lo,
                         present: 1,
-                        _pad: 0,
+                        _pad0: 0,
                     });
                 } else {
                     prior_table.push(PriorEntryGpu {
-                        mu: 0.0,
-                        sd: 1.0,
+                        mu_hi: 0.0,
+                        mu_lo: 0.0,
+                        inv_sd_hi: 1.0,
+                        inv_sd_lo: 0.0,
+                        ln_sd_hi: 0.0,
+                        ln_sd_lo: 0.0,
                         present: 0,
-                        _pad: 0,
+                        _pad0: 0,
                     });
                 }
             }
         }
+
+        let af_table: Vec<AfPriorEntryGpu> = if let Some(af) = af_priors {
+            let af_offsets = estimate_af_shift_offsets(systems, af);
+            let off_arr = af_offsets.as_array();
+            let mut tbl = Vec::with_capacity(k_len * 5);
+            for k in 0..k_len {
+                let w_af = af.w_af_per_residue[k] as f32;
+                for a_idx in 0..5 {
+                    let ae = af.atom_prior(k, a_idx);
+                    if ae.present {
+                        let (mu_af_hi, mu_af_lo) =
+                            split_dyadic16((ae.mu_af_ppm + off_arr[a_idx]) - centers[a_idx]);
+                        let (mu_bg_hi, mu_bg_lo) =
+                            split_dyadic16((ae.mu_bg_ppm + off_arr[a_idx]) - centers[a_idx]);
+                        let inv_af = 1.0 / ae.sigma_af_ppm;
+                        let inv_sigma_af_hi = inv_af as f32;
+                        let inv_sigma_af_lo = (inv_af - (inv_sigma_af_hi as f64)) as f32;
+                        let inv_bg = 1.0 / ae.sigma_bg_ppm;
+                        let inv_sigma_bg_hi = inv_bg as f32;
+                        let inv_sigma_bg_lo = (inv_bg - (inv_sigma_bg_hi as f64)) as f32;
+                        let lsr_hi = ae.log_sigma_ratio as f32;
+                        let lsr_lo = (ae.log_sigma_ratio - (lsr_hi as f64)) as f32;
+                        tbl.push(AfPriorEntryGpu {
+                            mu_af_hi,
+                            mu_af_lo,
+                            inv_sigma_af_hi,
+                            inv_sigma_af_lo,
+                            mu_bg_hi,
+                            mu_bg_lo,
+                            inv_sigma_bg_hi,
+                            inv_sigma_bg_lo,
+                            log_sigma_ratio_hi: lsr_hi,
+                            log_sigma_ratio_lo: lsr_lo,
+                            w_af,
+                            present: 1,
+                        });
+                    } else {
+                        tbl.push(AfPriorEntryGpu {
+                            mu_af_hi: 0.0,
+                            mu_af_lo: 0.0,
+                            inv_sigma_af_hi: 1.0,
+                            inv_sigma_af_lo: 0.0,
+                            mu_bg_hi: 0.0,
+                            mu_bg_lo: 0.0,
+                            inv_sigma_bg_hi: 1.0,
+                            inv_sigma_bg_lo: 0.0,
+                            log_sigma_ratio_hi: 0.0,
+                            log_sigma_ratio_lo: 0.0,
+                            w_af,
+                            present: 0,
+                        });
+                    }
+                }
+            }
+            tbl
+        } else {
+            vec![AfPriorEntryGpu::zeroed(); 1]
+        };
 
         let seq_res: Vec<SeqEntryGpu> = sequence
             .iter()
@@ -700,43 +909,63 @@ impl GpuEngine {
                     .map(|i| i as u32)
                     .unwrap_or(255);
                 let (d_n, d_ca, d_cb, d_c) = delta_covalent(sequence, k);
+                let (d_n_hi, d_n_lo) = split_dyadic16(d_n);
+                let (d_ca_hi, d_ca_lo) = split_dyadic16(d_ca);
+                let (d_cb_hi, d_cb_lo) = split_dyadic16(d_cb);
+                let (d_c_hi, d_c_lo) = split_dyadic16(d_c);
                 SeqEntryGpu {
                     res_idx,
-                    d_n: d_n as f32,
-                    d_ca: d_ca as f32,
-                    d_cb: d_cb as f32,
-                    d_c: d_c as f32,
-                    _pad: 0,
+                    _pad0: 0,
+                    d_n_hi,
+                    d_n_lo,
+                    d_ca_hi,
+                    d_ca_lo,
+                    d_cb_hi,
+                    d_cb_lo,
+                    d_c_hi,
+                    d_c_lo,
+                    _pad1: 0,
+                    _pad2: 0,
                 }
             })
             .collect();
 
-        let roots_hn: Vec<[f32; 2]> = systems
+        let roots_hn: Vec<[f32; 4]> = systems
             .iter()
-            .map(|ss| [ss.h as f32, ss.n as f32])
+            .map(|ss| {
+                let (h_hi, h_lo) = split_dyadic16(ss.h - centers[0]);
+                let (n_hi, n_lo) = split_dyadic16(ss.n - centers[1]);
+                [h_hi, h_lo, n_hi, n_lo]
+            })
             .collect();
 
         let total_slots = s_len * 3 * 2;
         let mut cand_counts = vec![0u32; total_slots];
         let mut cands_flat = vec![
             CandEntryGpu {
-                val: 0.0,
-                support: 0
+                val_hi: 0.0,
+                val_lo: 0.0,
+                support: 0,
+                _pad: 0,
             };
             total_slots * max_cands
         ];
 
         for (s, ss) in systems.iter().enumerate() {
             for (atom_c, atom_name) in ["CA", "CB", "C"].iter().enumerate() {
+                let c_center = centers[atom_c + 2];
                 for (off_idx, off) in [0i32, -1i32].iter().enumerate() {
                     let slot = (s * 3 + atom_c) * 2 + off_idx;
                     if let Some(list) = ss.cands.get(&(atom_name.to_string(), *off)) {
                         let cnt = list.len().min(max_cands);
                         cand_counts[slot] = cnt as u32;
                         for (c_idx, &(val, sup)) in list[..cnt].iter().enumerate() {
+                            let (val_hi, val_lo) = split_dyadic16(val - c_center);
                             cands_flat[slot * max_cands + c_idx] = CandEntryGpu {
-                                val: val as f32,
+                                val_hi,
+                                val_lo,
                                 support: sup as u32,
+                                _pad: 0,
                             };
                         }
                     }
@@ -765,6 +994,7 @@ impl GpuEngine {
         let b_roots = mk_ro("roots", bytemuck::cast_slice(&roots_hn));
         let b_cands = mk_ro("cands", bytemuck::cast_slice(&cands_flat));
         let b_counts = mk_ro("counts", bytemuck::cast_slice(&cand_counts));
+        let b_af = mk_ro("af-priors", bytemuck::cast_slice(&af_table));
 
         let b_out_u = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("out-u"),
@@ -814,6 +1044,10 @@ impl GpuEngine {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: b_out_p.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: b_af.as_entire_binding(),
                 },
             ],
         });
@@ -866,10 +1100,33 @@ impl GpuEngine {
         score_cfg: &ScoreConfig,
         cfg: &AnnealConfig,
     ) -> Result<AssignResult, String> {
-        let (u, p) = self.score_matrices_gpu(systems, sequence, priors, score_cfg)?;
+        self.assign_with_af_priors_gpu(systems, sequence, priors, score_cfg, cfg, None)
+    }
+
+    /// Run multi-replica Simulated Annealing on the GPU with optional 3D AlphaFold shift &
+    /// `PAE`-gated `15N-NOESY` priors (`af_priors: None` executes bit-identically to [`Self::assign_gpu`]).
+    pub fn assign_with_af_priors_gpu(
+        &self,
+        systems: &[SpinSystem],
+        sequence: &[String],
+        priors: &Priors,
+        score_cfg: &ScoreConfig,
+        cfg: &AnnealConfig,
+        af_priors: Option<&AfAssignPriors>,
+    ) -> Result<AssignResult, String> {
+        let (u, p) = self
+            .score_matrices_with_af_priors_gpu(systems, sequence, priors, score_cfg, af_priors)?;
         let locks =
             resolve_locked_assignments(systems.len(), sequence, &score_cfg.locked_assignments);
-        self.anneal_from_matrices_with_locks_gpu(&u, &p, cfg, &locks)
+        let af_noe = af_priors.and_then(|af| af.build_noesy_pairwise_table(systems));
+        self.anneal_from_matrices_with_locks_and_af_noe_gpu_opts(
+            &u,
+            &p,
+            af_noe.as_ref(),
+            cfg,
+            &locks,
+            true,
+        )
     }
 
     /// Run `assign_gpu` returning raw physical (`T = 1.0` nat) marginal posteriors BEFORE applying
@@ -921,6 +1178,25 @@ impl GpuEngine {
         &self,
         u: &Matrix2D,
         p: &Matrix2D,
+        cfg: &AnnealConfig,
+        locks: &[(usize, usize)],
+        apply_calibration_map: bool,
+    ) -> Result<AssignResult, String> {
+        self.anneal_from_matrices_with_locks_and_af_noe_gpu_opts(
+            u,
+            p,
+            None,
+            cfg,
+            locks,
+            apply_calibration_map,
+        )
+    }
+
+    fn anneal_from_matrices_with_locks_and_af_noe_gpu_opts(
+        &self,
+        u: &Matrix2D,
+        p: &Matrix2D,
+        af_noe: Option<&AfNoesyPairwiseTable>,
         cfg: &AnnealConfig,
         locks: &[(usize, usize)],
         apply_calibration_map: bool,
@@ -1192,6 +1468,9 @@ impl GpuEngine {
                     if a >= 0 && b >= 0 {
                         sc += p.get(a as usize, b as usize);
                     }
+                }
+                if let Some(noe) = af_noe {
+                    sc += noe.total_bonus(at_slice);
                 }
                 let _gpu_best = scores_out[r][1];
                 positions.push(pos);

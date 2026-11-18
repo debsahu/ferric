@@ -15,6 +15,7 @@
 
 use std::f64::consts::TAU;
 
+use crate::af_assign_priors::{AfAssignPriors, AfNoesyPairwiseTable};
 pub use crate::priors::{
     covalent_atom_offset, delta_covalent, estimate_reference_offsets,
     expected_covalent_atom_offset, Priors, ShiftOffsets, COVALENT_COIL_WEIGHT,
@@ -195,6 +196,18 @@ pub fn unary_matrix(
     priors: &Priors,
     cfg: &ScoreConfig,
 ) -> Matrix2D {
+    unary_matrix_with_af_priors(systems, sequence, priors, cfg, None)
+}
+
+/// Evaluate `U(s, k)` with optional heavy-tailed Student-`t(nu = 4)` 3D shift priors
+/// (`af_priors: None` executes bit-identically to [`unary_matrix`]).
+pub fn unary_matrix_with_af_priors(
+    systems: &[SpinSystem],
+    sequence: &[String],
+    priors: &Priors,
+    cfg: &ScoreConfig,
+    af_priors: Option<&AfAssignPriors>,
+) -> Matrix2D {
     let s_len = systems.len();
     let k_len = sequence.len();
     let mut u = Matrix2D::filled(s_len, k_len, FORBID);
@@ -299,6 +312,9 @@ pub fn unary_matrix(
             sc -= cfg.assign_cost;
             u.set(s, k, sc);
         }
+    }
+    if let Some(af) = af_priors {
+        af.apply_to_unary_matrix(&mut u, systems, cfg.use_hn);
     }
     if !cfg.locked_assignments.is_empty() {
         apply_locked_assignments_to_unary(&mut u, systems, sequence, &eff_priors, cfg);
@@ -476,6 +492,7 @@ const P_RESTORE_EVICT: f64 = 0.15;
 struct Annealer<'a> {
     u: &'a Matrix2D,
     p: &'a Matrix2D,
+    af_noe: Option<&'a AfNoesyPairwiseTable>,
     rng: Rng,
     s_len: usize,
     k_len: usize,
@@ -497,12 +514,19 @@ struct Annealer<'a> {
     at: Vec<i32>,
     pos: Vec<i32>,
     edge_marks: Vec<u32>,
+    noe_marks: Vec<u32>,
     edges_buf: Vec<usize>,
     mark_gen: u32,
 }
 
 impl<'a> Annealer<'a> {
-    fn new(u: &'a Matrix2D, p: &'a Matrix2D, rng: Rng, locks: &[(usize, usize)]) -> Self {
+    fn new_with_af_noe(
+        u: &'a Matrix2D,
+        p: &'a Matrix2D,
+        af_noe: Option<&'a AfNoesyPairwiseTable>,
+        rng: Rng,
+        locks: &[(usize, usize)],
+    ) -> Self {
         let s_len = u.rows;
         let k_len = u.cols;
         let slots: Vec<Vec<usize>> = (0..s_len)
@@ -545,7 +569,22 @@ impl<'a> Annealer<'a> {
                 }
             }
             succ.truncate(MAX_SEQ_PARTNERS);
-            succ_partners[s] = succ.into_iter().map(|(t, _)| t).collect();
+            let mut succ_list: Vec<usize> = succ.into_iter().map(|(t, _)| t).collect();
+            if let Some(noe) = af_noe {
+                let mut noe_succ: Vec<(usize, f64)> = free_spins
+                    .iter()
+                    .copied()
+                    .filter(|&t| t != s && p.get(s, t) > FORBID * 0.5 && noe.evidence(s, t) > 0.15)
+                    .map(|t| (t, noe.evidence(s, t) + 0.15 * p.get(s, t).max(-4.0)))
+                    .collect();
+                noe_succ.sort_by(|a, b| b.1.total_cmp(&a.1));
+                for (t, _) in noe_succ.into_iter().take(6) {
+                    if !succ_list.contains(&t) {
+                        succ_list.push(t);
+                    }
+                }
+            }
+            succ_partners[s] = succ_list;
 
             let mut pred: Vec<(usize, f64)> = free_spins
                 .iter()
@@ -555,7 +594,22 @@ impl<'a> Annealer<'a> {
                 .collect();
             pred.sort_by(|a, b| b.1.total_cmp(&a.1));
             pred.truncate(MAX_SEQ_PARTNERS);
-            pred_partners[s] = pred.into_iter().map(|(t, _)| t).collect();
+            let mut pred_list: Vec<usize> = pred.into_iter().map(|(t, _)| t).collect();
+            if let Some(noe) = af_noe {
+                let mut noe_pred: Vec<(usize, f64)> = free_spins
+                    .iter()
+                    .copied()
+                    .filter(|&t| t != s && p.get(t, s) > FORBID * 0.5 && noe.evidence(t, s) > 0.15)
+                    .map(|t| (t, noe.evidence(t, s) + 0.15 * p.get(t, s).max(-4.0)))
+                    .collect();
+                noe_pred.sort_by(|a, b| b.1.total_cmp(&a.1));
+                for (t, _) in noe_pred.into_iter().take(6) {
+                    if !pred_list.contains(&t) {
+                        pred_list.push(t);
+                    }
+                }
+            }
+            pred_partners[s] = pred_list;
         }
 
         // Static connectivity-sparsity factor in [0, 1] determined once from `max_{s != t} P(s, t)`:
@@ -582,9 +636,12 @@ impl<'a> Annealer<'a> {
             1.0 / (free_spins.len() as f64)
         };
 
+        let noe_len = af_noe.map_or(0, AfNoesyPairwiseTable::num_contacts);
+
         Self {
             u,
             p,
+            af_noe,
             rng,
             s_len,
             k_len,
@@ -606,6 +663,7 @@ impl<'a> Annealer<'a> {
             at,
             pos,
             edge_marks: vec![0; k_len],
+            noe_marks: vec![0; noe_len],
             edges_buf: Vec::with_capacity(k_len),
             mark_gen: 1,
         }
@@ -764,6 +822,7 @@ impl<'a> Annealer<'a> {
         self.mark_gen = self.mark_gen.wrapping_add(1);
         if self.mark_gen == 0 {
             self.edge_marks.fill(0);
+            self.noe_marks.fill(0);
             self.mark_gen = 1;
         }
         let gen = self.mark_gen;
@@ -791,6 +850,9 @@ impl<'a> Annealer<'a> {
                 sc += self.p.get(a as usize, b as usize);
             }
         }
+        if let Some(noe) = self.af_noe {
+            sc += noe.local_subset_bonus(&self.at, changed_residues, &mut self.noe_marks, gen);
+        }
         sc
     }
 
@@ -808,6 +870,9 @@ impl<'a> Annealer<'a> {
             if a >= 0 && b >= 0 {
                 sc += self.p.get(a as usize, b as usize);
             }
+        }
+        if let Some(noe) = self.af_noe {
+            sc += noe.total_bonus(&self.at);
         }
         sc
     }
@@ -1959,6 +2024,60 @@ fn calibrate_standard_confidence_impl(
     }
 }
 
+/// Run `assign_uncalibrated` with optional 3D AlphaFold shift & `PAE`-gated `15N-NOESY` priors
+/// (`af_priors: None` executes bit-identically to [`assign_uncalibrated`]).
+pub fn assign_uncalibrated_with_af_priors(
+    systems: &[SpinSystem],
+    sequence: &[String],
+    priors: &Priors,
+    score_cfg: &ScoreConfig,
+    cfg: &AnnealConfig,
+    af_priors: Option<&AfAssignPriors>,
+) -> AssignResult {
+    let Some(af) = af_priors else {
+        return assign_uncalibrated(systems, sequence, priors, score_cfg, cfg);
+    };
+    let u = unary_matrix_with_af_priors(systems, sequence, priors, score_cfg, Some(af));
+    let p = pair_matrix(systems, score_cfg);
+    let locks = resolve_locked_assignments(systems.len(), sequence, &score_cfg.locked_assignments);
+    let af_noe = af.build_noesy_pairwise_table(systems);
+    assign_from_matrices_with_locks_and_af_noe_opts(
+        &u,
+        &p,
+        af_noe.as_ref(),
+        cfg,
+        &locks,
+        StandardCalibrationMode::Uncalibrated,
+    )
+}
+
+/// Run `assign` with optional 3D AlphaFold shift & `PAE`-gated `15N-NOESY` priors
+/// (`af_priors: None` executes bit-identically to [`assign`]).
+pub fn assign_with_af_priors(
+    systems: &[SpinSystem],
+    sequence: &[String],
+    priors: &Priors,
+    score_cfg: &ScoreConfig,
+    cfg: &AnnealConfig,
+    af_priors: Option<&AfAssignPriors>,
+) -> AssignResult {
+    let Some(af) = af_priors else {
+        return assign(systems, sequence, priors, score_cfg, cfg);
+    };
+    let u = unary_matrix_with_af_priors(systems, sequence, priors, score_cfg, Some(af));
+    let p = pair_matrix(systems, score_cfg);
+    let locks = resolve_locked_assignments(systems.len(), sequence, &score_cfg.locked_assignments);
+    let af_noe = af.build_noesy_pairwise_table(systems);
+    assign_from_matrices_with_locks_and_af_noe_opts(
+        &u,
+        &p,
+        af_noe.as_ref(),
+        cfg,
+        &locks,
+        StandardCalibrationMode::Cpu,
+    )
+}
+
 /// Run `assign` returning raw physical (`T = 1.0` nat) marginal posteriors BEFORE applying
 /// `STANDARD_CALIBRATION_KNOTS`, used by Leave-One-Protein-Out (LOPO) isotonic cross-validation.
 pub fn assign_uncalibrated(
@@ -2007,6 +2126,17 @@ fn assign_from_matrices_with_locks_opts(
     locks: &[(usize, usize)],
     cal_mode: StandardCalibrationMode,
 ) -> AssignResult {
+    assign_from_matrices_with_locks_and_af_noe_opts(u, p, None, cfg, locks, cal_mode)
+}
+
+fn assign_from_matrices_with_locks_and_af_noe_opts(
+    u: &Matrix2D,
+    p: &Matrix2D,
+    af_noe: Option<&AfNoesyPairwiseTable>,
+    cfg: &AnnealConfig,
+    locks: &[(usize, usize)],
+    cal_mode: StandardCalibrationMode,
+) -> AssignResult {
     let mut master_rng = Rng::new(cfg.seed);
     let steps = cfg.steps_per_system * u.rows;
     let seeds: Vec<u64> = (0..cfg.runs).map(|_| master_rng.next_u64()).collect();
@@ -2020,7 +2150,7 @@ fn assign_from_matrices_with_locks_opts(
         let mut positions = Vec::with_capacity(cfg.runs);
         let mut scores = Vec::with_capacity(cfg.runs);
         for sub_seed in seeds {
-            let mut ann = Annealer::new(u, p, Rng::new(sub_seed), locks);
+            let mut ann = Annealer::new_with_af_noe(u, p, af_noe, Rng::new(sub_seed), locks);
             let sc = ann.run(steps, cfg.t_start, cfg.t_end, cfg.max_block);
             scores.push(sc);
             positions.push(ann.pos);
@@ -2035,7 +2165,8 @@ fn assign_from_matrices_with_locks_opts(
                 handles.push(scope.spawn(move || {
                     let mut local = Vec::with_capacity(seed_chunk.len());
                     for &sub_seed in seed_chunk {
-                        let mut ann = Annealer::new(u, p, Rng::new(sub_seed), locks);
+                        let mut ann =
+                            Annealer::new_with_af_noe(u, p, af_noe, Rng::new(sub_seed), locks);
                         let sc = ann.run(steps, cfg.t_start, cfg.t_end, cfg.max_block);
                         local.push((ann.pos, sc));
                     }
