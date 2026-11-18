@@ -142,11 +142,11 @@ ferric nef-export --star ./out/all_atom.str --peaks ./out/peaks.tsv --out ./out/
 ferric nef-import --in ./out/project.nef --out-star ./out/reloaded.str --out-peaks ./out/reloaded.tsv
 
 # AlphaFold concordance, firewalled 3D shift prediction, PAE domain docking & co-folding (Chapter 9)
-ferric af-validate --structure ./data/model.cif --pae ./data/pae.json --shifts ./out/assigned.str -o ./out/af_concordance.json
+ferric af-validate --structure ./data/model.cif --pae ./data/pae.json --shifts ./out/assigned.str [--treat-as-model] [--chain A] -o ./out/af_concordance.json
 ferric predict-shifts --structure ./data/model.cif --ph 6.5 --temp-k 298.15 --methyl-ilvmat -o ./out/pred_shifts.str
-ferric structure --pae-domains --af-structure ./data/multidomain.cif --af-pae ./data/pae.json --rdc ./data/rdc_m1.tsv --pcs ./data/pcs.tsv -o ./out/docked.pdb
-ferric cofold export --format boltz2 --fasta ./data/complex.fasta --apo-structure ./data/apo.cif --csp ./out/csp_kd.tsv -o ./out/complex.yaml
-ferric cofold score --poses ./out/pose0.cif,./out/pose1.cif --apo-structure ./data/apo.cif --csp ./out/csp_kd.tsv -o ./out/pose_scores.json
+ferric structure --pae-domains --af-structure ./data/multidomain.cif --af-pae ./data/pae.json --rdc ./data/rdc_m1.tsv --pcs ./data/pcs.tsv --pcs-metal-xyz 12.4,-4.2,8.1 --pre ./data/pre.tsv --pre-tau-c-ns 9.5 --pre-proton-mhz 600.13 -o ./out/docked.pdb
+ferric cofold export --format boltz2 --fasta ./data/complex.fasta --apo-structure ./data/apo.cif --csp ./out/csp_kd.tsv [--tau-c-ns 8.5] -o ./out/complex.yaml
+ferric cofold score --poses ./out/pose0.cif,./out/pose1.cif --apo-structure ./data/apo.cif --csp ./out/csp_kd.tsv [--tau-c-ns 8.5] -o ./out/pose_scores.json
 ```
 
 #### 4. Dynamics, Chemical Exchange, 1D `qNMR`, `DOSY` & Metabolomics
@@ -157,7 +157,7 @@ See [Chapter 4: Relaxation Dynamics, CEST, CPMG & CSP](04-dynamics-and-exchange.
 # Batched GPU R1, R2, R1rho or steady-state {1H}-15N hetNOE curve fitting + reduced J(omega)
 ferric relax \
   --series ./data/ubq_r1_600 \
-  --kind r1 --field-mhz 600.0 --mc-trials 500 --engine gpu \
+  --kind r1 --field-mhz 600.0 [--hetnoe-order sat-first|ref-first] --mc-trials 500 --engine gpu \
   --out ./out/r1_600.tsv
 
 # Lipari-Szabo / Mandel-Akke-Palmer M1-M5 model-free & anisotropic diffusion tensor fit
@@ -196,8 +196,8 @@ ferric csp \
   --protein-um 100.0 --experiment hsqc \
   --out ./out/csp_kd.tsv
 
-# Analytical 1D DSP, Voigt/Hoye J-trees, journal export & NIST-traceable GUM qNMR purity
-ferric nmr1d process --in ./data/compound_1h/1 --solvent CDCl3 --hsvd --deconvolve --out ./out/spec1d.tsv
+# Analytical 1D DSP, Voigt/Hoye J-trees, DEPT-90/135 CHn editing, journal export & NIST-traceable GUM qNMR purity
+ferric nmr1d process --in ./data/compound_1h/1 --solvent CDCl3 --hsvd --deconvolve [--dept90 ./data/dept90.ft1] --out ./out/spec1d.tsv
 ferric nmr1d multiplet --in ./out/spec1d.tsv --solvent CDCl3 --style acs --out ./out/multiplets.tsv --report-out ./out/multiplets.txt
 ferric nmr1d qnmr --in ./out/spec1d.tsv \
   --std-crm DMSO2 --std-mass-mg 5.12 --std-purity 0.9994 --std-region 3.05:2.95 \
@@ -359,16 +359,16 @@ Add the following block to your client's `mcpServers` configuration file (for **
 Every `MCP` request passes through defense-in-depth security checks (`McpSecurityPolicy`):
 
 1. **Default-Safe `ReadOnly` Mode**: Both the `stdio` server and the `nmr-gui` bridge default to **`McpAccessMode::ReadOnly`**. State-modifying tools (`write_curated_peak_tsv`, `export_nmrstar_shifts`, `navigate_workbench`, `propose_curation_edit`, `undo_last_ai_edit`) carry MCP safety annotations (`readOnlyHint: false`, `destructiveHint: true`) and are unconditionally rejected (`-32002 ERR_READ_ONLY_DENIED` / `isError: true`) unless the user explicitly enables `ReadWrite`.
-2. **Canonicalized Path Sandbox (`resolve_sandboxed_path`)**:
-   - Rejects empty paths, embedded null bytes (`\0`), and any lexical `..` (`ParentDir`) traversal before touching the filesystem.
+2. **Canonicalized Path Sandbox (`resolve_sandboxed_path`) & Pre-Open `symlink_metadata` Guards**:
+   - Rejects empty paths, embedded null bytes (`\0`), URI schemes (`file://`, `http://`, `nmr://`), and any lexical `..` (`ParentDir`) traversal before touching the filesystem.
    - Blocks access to hidden credential and secret locations (`.ssh`, `.aws`, `.gnupg`, `.env`, `.env.*`, `.netrc`, `.kube`, `id_rsa`, `id_ed25519`).
-   - Canonicalizes every configured `allowed_root` and target path via `std::fs::canonicalize`, blocking symlinks or dangling links escaping `--root`, and formats responses as workspace-relative paths so host user home directories are never leaked.
-3. **Loopback-Only Binding, 256-Bit CSPRNG / `>= 32`-Char Bearer Floor & DNS-Rebinding Defense**:
-   - Both `ferric-gui` and `ferric mcp --transport http` refuse non-loopback bind addresses (`0.0.0.0`, LAN IPs, `[::]`).
+   - Verifies `std::fs::symlink_metadata` (`ft.is_file()`, rejecting FIFOs, sockets, and device nodes) and enforces pre-allocation file size (`<= 64 MiB`) and pose count (`<= 32` poses in `score_cofold_poses`) caps before opening files; canonicalizes every `allowed_root` and target path via `std::fs::canonicalize`; and sanitizes error strings so raw input lines or host paths are never echoed.
+3. **Loopback-Only Binding, 256-Bit CSPRNG / `>= 32`-Char Bearer Floor, Per-Request `ReadOnly` Downgrade & DNS-Rebinding Defense**:
+   - Both `ferric-gui` and `ferric mcp --transport http` refuse non-loopback bind addresses (`0.0.0.0`, LAN IPs, `[::]`), and `nmr-gui`'s HTTP bridge honors `X-Nmr-Access-Mode: read-only` to downgrade individual requests to `ReadOnly` even when the bridge was started in `ReadWrite` mode (never escalating `ReadOnly -> ReadWrite`).
    - Every HTTP request must carry `Authorization: Bearer <token>` verified via non-branching constant-time byte comparison (`401 Unauthorized`), a loopback `Host` header (`127.0.0.1`, `[::1]`, or `localhost`), and **zero** cross-origin browser `Origin` headers (`403 Forbidden`), defeating local browser CSRF and DNS-rebinding attacks; rejected `400`/`401`/`403`/`405`/`413` responses drain bounded unread request-body bytes into stack scratch (`0 B` heap allocation) and half-close cleanly (`Shutdown::Write`) so split-`send()` HTTP clients never encounter `ECONNRESET`.
    - For headless `ferric mcp --transport http` and `ferric mcp-config --bridge-port`, strongly prefer injecting `NMR_MCP_BEARER_TOKEN` via environment variables rather than passing `--token <bearer>` in `ps`-visible process `argv`. Any user-supplied token (`NMR_MCP_BEARER_TOKEN` or `--token`) must be at least **`32` trimmed characters** (`MIN_HTTP_BEARER_TOKEN_LEN = 32`, returning an error on shorter secrets); omitting both `NMR_MCP_BEARER_TOKEN` and `--token` on `ferric mcp --transport http` automatically generates a fresh 256-bit (`64`-hex-char) OS CSPRNG bearer token (`/dev/urandom` on Unix, Windows CNG `BCryptGenRandom` on Windows) and emits `MCP_HTTP_BEARER_TOKEN <hex64>` on `stderr` while keeping `stdout` clean.
-4. **100% Reversible AI Curation (`256`-Step `McpUndoLog`)**:
-   - In `nmr-gui`, all 9 live workbench operations (`get_workbench_state`, `capture_viewport_png`, `undo_last_ai_edit`, plus the 3 `navigate_workbench` actions and 3 `propose_curation_edit` actions) synchronize safely with the render thread; mutating commands (`AssignSpinSystemToResidue`, `UnassignResidue`, `TogglePeakExclusion`, `JumpToResidue`, `SetCrosshairPpm`, `HighlightResidues3d`) execute exclusively through `McpUndoLog` (`MAX_MCP_UNDO_DEPTH = 256`), preserving bijective `(cluster_id <-> seq_id)` displacements so pressing **`Cmd/Ctrl+Z`** (or calling `undo_last_ai_edit`) restores the exact prior state in one step.
+4. **Unified Monotonic User + AI Undo Journal (`UndoJournal` + `256`-Step `McpUndoLog`)**:
+   - In `nmr-gui`, all live workbench operations (`get_workbench_state`, `capture_viewport_png`, `undo_last_ai_edit`, `navigate_workbench`, `propose_curation_edit`) record monotonic sequence entries on the shared User+MCP `UndoJournal` (`UndoOrigin::{User, Mcp}`); pressing **`Cmd/Ctrl+Z`** undoes whichever User or MCP mutation occurred most recently (`Shift+Cmd/Ctrl+Z` redoes), while `undo_last_ai_edit` reverts the latest AI bridge action.
 
 ### Built-In `MCP` Tools, Resources, Prompts & Error Codes
 
@@ -407,7 +407,7 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
   - `deconvolve-1d-mixture-dosy`: Fulmer referencing, Voigt/Hoye multiplet trees, `qNMR` stoichiometry, and `BIC` `DOSY` vs opt-in `ILT`.
   - `fit-cest-cpmg-exchange`: Locked-shape plane integration, flat-null gate, multi-field scaling, and Bloch–McConnell `CEST` / Baldwin `CPMG`.
   - `analyze-metabolomics-cohort`: Step-by-step `AI-Binning` + `PQN`, `PCA` Hotelling $T^2$/$Q$ outlier check, leak-free `k`-fold `OPLS-DA` ($Q^2$ & permutation $p$-value overfitting guards), and `STOCSY` spin-system annotation.
-  - `validate-and-dock-alphafold-model`: Step-by-step AlphaFold `mmCIF`/`PAE` concordance audit (`af_concordance`), firewalled 3D shift check (`predict_structure_shifts`), Tolman $\vartheta_d / \vartheta_1$ GDO & multi-medium `PAE`-domain docking ([Chapter 9](09-alphafold-and-integrative-nmr.md)), co-folded complex pose ranking (`score_cofold_poses`), and `CEST`/`CPMG` excited-state classification (`classify_excited_state`).
+  - `validate-and-dock-alphafold-model`: Step-by-step AlphaFold `mmCIF`/`PAE` concordance audit (`af_concordance`), firewalled 3D shift check (`predict_structure_shifts`), co-folded complex pose ranking (`score_cofold_poses`, defaulting `restraints_path` to `".nmr_restraints.json"`), and `CEST`/`CPMG` excited-state classification (`classify_excited_state`), with CLI handoff to `ferric structure --pae-domains` for multi-domain `PAE` docking ([Chapter 9](09-alphafold-and-integrative-nmr.md)).
 
 #### JSON-RPC 2.0 & MCP Error Codes
 
@@ -426,26 +426,53 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
 
 ## Interactive Workbench Keyboard Shortcuts
 
-`ferric-gui` features a deterministic finite-state two-key NMR chord dispatcher (`450 ms` inter-key timeout; press `Esc` to cancel a pending prefix). Single- and two-key chords automatically stand down whenever a text input field or the `Octet` 2D Chemical Studio canvas holds focus.
+`ferric-gui` enforces one unified mouse, keyboard, and chord interaction grammar (`nmr-gui::interaction_grammar::INTERACTION_GRAMMAR`, driving both live canvas dispatch and the `?` shortcuts modal) across all six views (`1D`, `2D`, `3D plane`, `Strips`, `3D model`, `Sketcher`). Single-letter 1D tool keys (`H P R I M K`) route strictly through `ChordDispatcher::drain_single_key_tools()` when no two-letter chord (`450 ms` timeout) is pending, so two-letter chords never trigger accidental 1D mode changes.
 
-### Two-Key & Single-Key NMR Spectrum Accelerators
+### Canonical Unified Mouse & Keyboard Interaction Grammar (`C18`)
+
+| Input | Kind | Meaning | Views |
+| :---: | :---: | :--- | :--- |
+| `Left-click` | Mouse | Select peak / residue / atom under the pointer (pick tool: add peak) | 1D, 2D, 3D plane, Strips, 3D model, Sketcher |
+| `Cmd/Ctrl+click` | Mouse | Add to / remove from the selection | 1D, 2D, 3D plane, Strips |
+| `Left-drag` | Mouse | Active tool (pan by default; move selected peak; phase / integrate in 1D tools) | 1D, 2D, 3D plane, Strips, 3D model, Sketcher |
+| `Shift+drag` | Mouse | Zoom box (pushes zoom history) | 1D, 2D, 3D plane, Strips |
+| `Space+drag` | Mouse | Pan while held (never toggles anything) | 1D, 2D, 3D plane, Strips, 3D model, Sketcher |
+| `Right/Middle-drag` | Mouse | Pan (1D phase tool: PH1) | 1D, 2D, 3D plane, Strips |
+| `Right-click` | Mouse | Context menu | 1D, 2D, 3D plane, Strips, 3D model, Sketcher, Page cards |
+| `Double-click` | Mouse | Reset view (pushes zoom history; never adds a peak) | 1D, 2D, 3D plane, Strips, 3D model, Sketcher |
+| `Scroll` | Mouse | Adjust signal intensity / contour floor (3D model & Sketcher: zoom; horizontal scroll pans) | 1D, 2D, 3D plane, Strips, 3D model, Sketcher |
+| `Cmd/Ctrl+Scroll` | Mouse | Zoom about the pointer (pushes zoom history) | 1D, 2D, 3D plane, Strips, 3D model, Sketcher |
+| `Shift+Scroll` | Mouse | Step 3D plane (CubePlane3d) / pan axis (1D, 2D, Strips) | 1D, 2D, 3D plane, Strips |
+| `+ / -` | Key | More / less signal (1D gain x1.25; 2D/3D contour floor / 1.25) | 1D, 2D, 3D plane, Strips |
+| `Arrow keys` | Key | Pan the view by 10% of the visible span | 1D, 2D, 3D plane, Strips |
+| `Shift+Arrow` | Key | Nudge the selected peak (undoable) | 1D, 2D, 3D plane, Strips |
+| `[ ] / PgUp PgDn` | Key | Previous / next 3D plane | 3D plane |
+| `H P R I M K` | Key | 1D tools: Pan, Phase, Reference, Integrate, Multiplet, Peak pick (fire only when no chord is pending) | 1D |
+| `Esc` | Key | Cancel pending chord / clear selection / exit tool | 1D, 2D, 3D plane, Strips, 3D model, Sketcher |
+| `Del / Backspace` | Key | Delete selected peak / integral / atom (undoable) | 1D, 2D, 3D plane, Strips, Sketcher |
+| `xl` | Chord | Toggle crosshair lock | 1D, 2D, 3D plane, Strips |
+| `Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z` | Modifier | Undo / redo the most recent change (user or MCP, one stack) | 1D, 2D, 3D plane, Strips, 3D model, Sketcher |
+| `Cmd/Ctrl+K` | Modifier | Command palette (all commands, modes and developer toggles) | 1D, 2D, 3D plane, Strips, 3D model, Sketcher |
+
+### Two-Key NMR Spectrum Chords
 
 | Keys | Category | Action | Description |
 | :---: | :--- | :--- | :--- |
 | **`vt`** | Spectrum & Contours | View / Contour Threshold Popup | Open interactive base contour floor, geometric step, and level count popover |
-| **`ct`** | Spectrum & Contours | Raise Contour Floor (`×1.25`) | Multiply positive/negative contour floor by `1.25×` to suppress baseline noise |
-| **`cb`** | Spectrum & Contours | Lower Contour Floor (`÷1.25`) | Divide positive/negative contour floor by `1.25×` to reveal weak cross-peaks |
-| **`oz`** | Zoom & Navigation | Zoom Out to Full Sweep | Reset 2D viewport bounds to the full spectral sweep width |
-| **`zi`** | Zoom & Navigation | Zoom In Viewport | Zoom into the active 2D or strip spectral region by `1.25×` |
-| **`zo`** | Zoom & Navigation | Zoom Out Viewport | Zoom out of the active 2D or strip spectral region by `1.25×` |
-| **`Space`** | Zoom & Navigation | Toggle Crosshair Lock | Pin or unpin synchronized `(1H, 15N, 13C)` frequency crosshairs across views |
+| **`ci`** | Spectrum & Contours | More Signal (`+`) | Increase 1D vertical gain (`×1.25`) or lower 2D/3D contour floor (`÷1.25`) to reveal weak peaks |
+| **`cb`** | Spectrum & Contours | Less Signal (`-`) | Decrease 1D vertical gain (`÷1.25`) or raise 2D/3D contour floor (`×1.25`) to suppress baseline noise |
+| **`ws` / `wu`** | Solvent DSP | Water Suppression / Multi-Level Undo | Apply solvent suppression to the active trace/page or pop the per-spectrum `KeyedSnapshotStack` (`0` cross-cube mutation) |
+| **`zf` / `oz`** | Zoom & Navigation | Zoom Out to Full Sweep | Reset viewport bounds to the full spectral sweep width (recording history for `zp`) |
+| **`zp`** | Zoom & Navigation | Previous Zoom | Step back through recorded zoom history (including `Shift+drag` and `Double-click` resets) |
+| **`zi` / `zo`** | Zoom & Navigation | Zoom In / Out (`1.25×`) | Zoom into or out of the active 2D, 3D plane, or strip region |
+| **`xl`** | Zoom & Navigation | Toggle Crosshair Lock | Pin or unpin synchronized `(1H, 15N, 13C)` frequency crosshairs across views (`Space+drag` only pans) |
 | **`pa`** | Peak Editing | Add Peak at Crosshair | Insert a new cross-peak at the active cursor or locked crosshair |
 | **`pd`** | Peak Editing | Delete Selected Peak(s) | Delete selected cross-peak(s) (reversible via `Cmd/Ctrl+Z`) |
 | **`pc`** | Peak Editing | Parabolic Peak Center Snap | Snap selected peak(s) to the local 3-point log-parabolic extremum |
-| **`pl`** | Peak Editing | Toggle Peak Labels | Show or hide spin-system IDs and residue labels on the contour canvas |
+| **`pl`** | Peak Editing | Toggle Peak Labels | Show or hide greedy AABB-decluttered spin-system IDs and residue labels |
 | **`st`** | Strips & Assignment | Tile `i-1 / i / i+1` Strips | Tile ranked predecessor (`i-1`), active (`i`), and successor (`i+1`) 3D strips |
 | **`at`** | Strips & Assignment | Residue Assignment Popover | Open `U(s, k)` typing scores and hard-lock assignment popover for active root |
-| **`?`** | Help & Reference | Keyboard Cheat-Sheet Modal | Open searchable reference modal of all chords and global shortcuts |
+| **`?`** | Help & Reference | Keyboard & Mouse Cheat-Sheet | Open searchable reference modal generated from `INTERACTION_GRAMMAR` |
 
 ### Global Modifier Shortcuts
 

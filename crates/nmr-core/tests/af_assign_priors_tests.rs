@@ -86,7 +86,7 @@ fn ubiquitin_firewall() -> HomologFirewallQuery {
 }
 
 fn real_af_ubiquitin_paths(root: &Path) -> (PathBuf, PathBuf) {
-    let fix_dir = root.join("crates/nmr-core/tests/fixtures");
+    let fix_dir = root.join("data/afdb");
     (
         fix_dir.join("AF-P0CG48-F1-model_v6.cif"),
         fix_dir.join("AF-P0CG48-F1-predicted_aligned_error_v6.json"),

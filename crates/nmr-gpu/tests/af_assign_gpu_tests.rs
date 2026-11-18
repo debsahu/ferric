@@ -315,7 +315,7 @@ fn test_gpu_u_matrix_parity_with_student_t4_af_priors_and_clamping() {
 
     // Load real downloaded AlphaFoldDB v6 Polyubiquitin-C structure (AF-P0CG48-F1-model_v6.cif)
     // with native _ma_qa_metric_local pLDDT and enforce strict 4-layer HomologFirewall.
-    let af_cif = root.join("crates/nmr-core/tests/fixtures/AF-P0CG48-F1-model_v6.cif");
+    let af_cif = root.join("data/afdb/AF-P0CG48-F1-model_v6.cif");
     let model = StructureModel::parse_file(&af_cif, false).unwrap();
 
     let fw = ubiquitin_firewall();

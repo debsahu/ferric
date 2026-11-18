@@ -151,6 +151,23 @@ render_demo_shell_html() {
       font-weight: 700;
       letter-spacing: 0.08em;
     }
+    .preset-note {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 500;
+      padding: 1px 7px;
+      border-radius: 4px;
+      border: 1px solid #253347;
+      background: rgba(148, 163, 184, 0.08);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    @media (max-width: 820px) {
+      .preset-note {
+        display: none;
+      }
+    }
     .demo-actions {
       display: flex;
       align-items: center;
@@ -345,6 +362,7 @@ render_demo_shell_html() {
     <div class="demo-brand">
       <img src="favicon.svg" alt="" width="18" height="18" style="border-radius:4px;flex-shrink:0" />
       <strong>FERRIC</strong>
+      <span class="preset-note" title="Preloaded in-memory synthetic demonstration datasets (not cold empirical measurements)">Synthetic Ubiquitin Demo Suite &middot; In-Memory Synthetic 2D/3D, 1D, DOSY &amp; Metabolomics</span>
     </div>
     <div class="demo-actions">
       <span id="gpu_cap_badge" class="cap-badge">Checking GPU&hellip;</span>
@@ -525,6 +543,7 @@ for label, doc in (("docs/demo/index.html", demo_text), ("crates/nmr-gui/index.h
 
 demo_only_tokens = [
     "header.demo-bar",
+    "Synthetic Ubiquitin Demo Suite",
     "@media (max-width: 680px)",
     "#fallback",
     'id="fallback"',

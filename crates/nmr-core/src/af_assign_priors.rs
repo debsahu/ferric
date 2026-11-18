@@ -437,9 +437,9 @@ fn split_cif_row_tokens(row: &str) -> Vec<&str> {
     out
 }
 
-/// Fail-closed model-provenance gate on a parsed [`StructureModel`] (`21.W2:P1-3`), matching
-/// `S2`'s `require_predicted_model(model, treat_as_model)`: accepted iff `treat_as_model` is true
-/// OR (`provenance == Computational` and every residue carries a finite non-constant `pLDDT`).
+/// Fail-closed model-provenance gate on a parsed [`StructureModel`] (`21.W2:P1-3`), delegating
+/// directly to [`crate::struct_shifts::require_predicted_structure_model`] when `!treat_as_model`
+/// and enforcing non-constant/non-zero `pLDDT` on predicted models.
 pub fn af_require_predicted_model(
     model: &StructureModel,
     treat_as_model: bool,
@@ -447,6 +447,7 @@ pub fn af_require_predicted_model(
     if treat_as_model {
         return Ok(());
     }
+    crate::struct_shifts::require_predicted_structure_model(model, false)?;
     if model.provenance == StructCoordinateProvenance::Computational
         && !model.residues.is_empty()
         && model.residues.iter().all(|r| r.plddt.is_some())
@@ -1110,6 +1111,7 @@ impl AfAssignPriors {
                 exclusion_list_sha256: String::new(),
                 max_retained_seq_identity: 0.0,
                 corpus_sha256: String::new(),
+                l4_short_templates_skipped: 0,
             },
             sequence: norm_seq,
             model_evidence: "structure-free sequential NOESY baseline (no 3D model)".to_string(),
@@ -1212,15 +1214,25 @@ impl AfAssignPriors {
         cfg: &AfAssignConfig,
     ) -> Result<Self, String> {
         let has_evidence = text_has_predicted_model_evidence(structure_text);
-        if !has_evidence && !cfg.treat_as_model {
-            return Err(
-                "--af-structure refused: no positive predicted-model evidence (an mmCIF \
-                 `_ma_qa_metric` named pLDDT with `_ma_qa_metric_local` values, or verified \
-                 AFDB/ModelArchive block with non-constant pLDDT). Headerless, experimental \
-                 (X-ray / solution NMR / EM) and REMARK-only files are not treated as models; \
-                 pass --treat-as-model to use the coordinates explicitly as a native-structure oracle"
-                    .to_string(),
-            );
+        if !cfg.treat_as_model {
+            let af_check = crate::af_concordance::parse_af_structure_model_str(
+                structure_text,
+                &crate::af_concordance::AfIngestOptions {
+                    force_bfactor_plddt: cfg.struct_shift_cfg.force_bfactor_plddt,
+                    target_chain_id: None,
+                },
+            )?;
+            crate::af_concordance::require_predicted_model(&af_check, false)?;
+            if !has_evidence {
+                return Err(
+                    "--af-structure refused: no positive predicted-model evidence (an mmCIF \
+                     `_ma_qa_metric` named pLDDT with `_ma_qa_metric_local` values, or verified \
+                     AFDB/ModelArchive block with non-constant pLDDT). Headerless, experimental \
+                     (X-ray / solution NMR / EM) and REMARK-only files are not treated as models; \
+                     pass --treat-as-model to use the coordinates explicitly as a native-structure oracle"
+                        .to_string(),
+                );
+            }
         }
         let model = StructureModel::parse_str(
             structure_text,

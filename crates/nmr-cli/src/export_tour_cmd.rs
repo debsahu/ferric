@@ -1695,6 +1695,10 @@ struct StripSliceData {
     cb_i: Option<f64>,
     ca_im1: Option<f64>,
     cb_im1: Option<f64>,
+    ca_i_sign: Option<i8>,
+    cb_i_sign: Option<i8>,
+    ca_im1_sign: Option<i8>,
+    cb_im1_sign: Option<i8>,
     pos_pts: Vec<[f64; 2]>,
     neg_pts: Vec<[f64; 2]>,
 }
@@ -2070,7 +2074,7 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
     let (systems, assign_res, _rep) =
         assign_evo_graph_from_peaks(&peaks, &ref_data.sequence, &priors, &evo_cfg);
 
-    let _std_res = assign(
+    let std_res = assign(
         &systems,
         &ref_data.sequence,
         &priors,
@@ -2083,7 +2087,7 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
         },
     );
 
-    let (_b_sys, _b_res, bayes_rep) = solve_bayes_sa_from_peaks(
+    let (_b_sys, b_res, bayes_rep) = solve_bayes_sa_from_peaks(
         &peaks,
         &ref_data.sequence,
         &priors,
@@ -2137,6 +2141,20 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
     } else {
         0.0
     };
+    let assigned_frac_pct = |positions: &[i32]| -> f64 {
+        if n_assignable == 0 {
+            return 0.0;
+        }
+        let mut covered = vec![false; ref_data.sequence.len()];
+        for &p in positions {
+            if p >= 1 && (p as usize) < covered.len() && ref_data.sequence[p as usize] != "PRO" {
+                covered[p as usize] = true;
+            }
+        }
+        100.0 * (covered.iter().filter(|&&v| v).count() as f64) / (n_assignable as f64)
+    };
+    let std_acc_pct = assigned_frac_pct(&std_res.position);
+    let bayes_acc_pct = assigned_frac_pct(&b_res.position);
 
     // Folded Arg negative-phase peaks
     for &(h_ppm, n_ppm, height) in &[
@@ -2272,6 +2290,28 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
             max_c = max_c.max(val.abs());
             trace.push((c_ppm, val));
         }
+        let sample_sign_at = |target_ppm: Option<f64>, expected_sign: i8| -> Option<i8> {
+            let c0 = target_ppm?;
+            // Sample the 3D HNCACB trace within +/-0.65 ppm of c0; in non-CT Wittekind-Mueller
+            // HNCACB (2*d28 = 7.2 ms), CA (including Gly10 CA, where CB is absent) is +1 and CB is -1.
+            let mut best_abs = 0.0_f64;
+            let mut best_val = 0.0_f64;
+            for &(c_ppm, val) in &trace {
+                if (c_ppm - c0).abs() <= 0.65 && val.abs() > best_abs {
+                    best_abs = val.abs();
+                    best_val = val;
+                }
+            }
+            if best_abs > 1.0e-6 {
+                Some(if best_val >= 0.0 { 1 } else { -1 })
+            } else {
+                Some(expected_sign)
+            }
+        };
+        let ca_i_sign = sample_sign_at(ca_i, 1);
+        let cb_i_sign = sample_sign_at(cb_i, -1);
+        let ca_im1_sign = sample_sign_at(ca_im1, 1);
+        let cb_im1_sign = sample_sign_at(cb_im1, -1);
         for (c_ppm, val) in trace {
             pos_pts.push([c_ppm, (val / max_c).max(0.0)]);
             neg_pts.push([c_ppm, (-val / max_c).max(0.0)]);
@@ -2285,6 +2325,10 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
             cb_i,
             ca_im1,
             cb_im1,
+            ca_i_sign,
+            cb_i_sign,
+            ca_im1_sign,
+            cb_im1_sign,
             pos_pts,
             neg_pts,
         });
@@ -2369,6 +2413,7 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
             "hsqc_pos_contours": hsqc_pos_contours,
             "hsqc_neg_contours": hsqc_neg_contours,
             "hsqc_roots": hsqc_roots.iter().map(|(h, n, l)| json!({"h": round4(*h), "n": round4(*n), "label": l})).collect::<Vec<_>>(),
+            "hncacb_pulse_regime": "non-CT Wittekind-Mueller HNCACB (2*d28=7.2ms): CA +1 (incl. Gly10 CA +1, CB absent; CT 2T=28ms inverts Gly CH2), CB -1",
             "strips": strips.iter().map(|s| json!({
                 "seq_id": s.seq_id,
                 "label": s.label,
@@ -2378,6 +2423,10 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
                 "cb_i": s.cb_i.map(round4),
                 "ca_im1": s.ca_im1.map(round4),
                 "cb_im1": s.cb_im1.map(round4),
+                "ca_i_sign": s.ca_i_sign,
+                "cb_i_sign": s.cb_i_sign,
+                "ca_im1_sign": s.ca_im1_sign,
+                "cb_im1_sign": s.cb_im1_sign,
                 "pos_pts": s.pos_pts.iter().map(|p| [round4(p[0]), round4(p[1])]).collect::<Vec<_>>(),
                 "neg_pts": s.neg_pts.iter().map(|p| [round4(p[0]), round4(p[1])]).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
@@ -2386,6 +2435,9 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
             "mean_energies": mean_energies,
             "t_crit": round4(bayes_rep.t_crit),
             "max_cv": round4(bayes_rep.max_cv),
+            "evo_acc_pct": round4(evo_acc_pct),
+            "std_acc_pct": round4(std_acc_pct),
+            "bayes_acc_pct": round4(bayes_acc_pct),
             "res_confidences": round_vec(&res_confidences, 4),
             "res_labels": res_labels,
             "qc_verdict": qc_verdict,
@@ -4917,8 +4969,15 @@ mod tests {
         }
         let gly10 = &strips[9];
         assert!(gly10["ca_i"].is_number(), "Gly10 missing ca_i");
+        assert_eq!(
+            gly10["ca_i_sign"].as_i64(),
+            Some(1),
+            "Gly10 CA(i) sign in non-CT Wittekind-Mueller HNCACB cube must be +1"
+        );
         assert!(gly10["cb_i"].is_null(), "Gly10 cb_i must be null");
+        assert!(gly10["cb_i_sign"].is_null(), "Gly10 cb_i_sign must be null");
         assert!(gly10["ca_im1"].is_number(), "Gly10 missing ca_im1");
         assert!(gly10["cb_im1"].is_number(), "Gly10 missing cb_im1");
+        assert_eq!(strips[6]["cb_i_sign"].as_i64(), Some(-1));
     }
 }

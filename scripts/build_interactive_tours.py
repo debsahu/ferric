@@ -647,7 +647,11 @@ def render_module_html(
           <span class="overlay-sep">&middot;</span>
           <span>{html.escape(stage_hint)}</span>
         </div>
-        <div id="hud-tooltip" class="hud-tooltip" hidden></div>
+        <div id="fallback-banner" class="fallback-banner" role="alert" hidden></div>
+        <div id="hud-tooltip" class="hud-tooltip" hidden>
+          <strong id="hud-tooltip-title"></strong>
+          <div id="hud-tooltip-body" class="hud-tooltip-body"></div>
+        </div>
       </div>
 
       <div class="control-strip">
@@ -1267,6 +1271,21 @@ body.is-embed .player-topbar { min-height: 2.9rem; padding-top: 0.25rem; }
   font-weight: 600;
   pointer-events: none;
 }
+.fallback-banner {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  right: 12px;
+  z-index: 25;
+  padding: 0.42rem 0.72rem;
+  border-radius: 7px;
+  background: rgba(185, 28, 28, 0.94);
+  color: #fef2f2;
+  border: 1px solid #f87171;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.76rem;
+  font-weight: 700;
+}
 .hud-tooltip {
   position: absolute;
   z-index: 20;
@@ -1281,11 +1300,15 @@ body.is-embed .player-topbar { min-height: 2.9rem; padding-top: 0.25rem; }
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   font-size: 0.76rem;
   line-height: 1.38;
+  white-space: pre-line;
 }
 .hud-tooltip strong {
   display: block;
   color: #38bdf8;
   margin-bottom: 0.15rem;
+}
+.hud-tooltip-body {
+  white-space: pre-line;
 }
 
 /* Interactive Control Strip */
@@ -1722,10 +1745,67 @@ TOURS_PLAYER_JS = r"""(function () {
     ctx.restore();
   }
 
+  function getByPath(obj, path) {
+    if (!obj || typeof obj !== "object") return undefined;
+    var parts = path.split(".");
+    var cur = obj;
+    for (var i = 0; i < parts.length; i++) {
+      if (cur === null || cur === undefined || typeof cur !== "object") return undefined;
+      cur = cur[parts[i]];
+    }
+    return cur;
+  }
+
   function renderModuleScene(ctx, w, h, modIdx, payload, tSec, ctrlVal, state, hotspots) {
     var pal = palette();
     ctx.fillStyle = pal.bg;
     ctx.fillRect(0, 0, w, h);
+
+    var fallbackReasons = [];
+    var plottedKeys = [];
+    function markMissing(path) {
+      if (fallbackReasons.indexOf(path) === -1) fallbackReasons.push(path);
+    }
+    function markPlotted(path) {
+      if (plottedKeys.indexOf(path) === -1) plottedKeys.push(path);
+    }
+    function reqArr(path, minLen) {
+      var v = getByPath(payload, path);
+      var need = minLen === undefined ? 1 : minLen;
+      if (Array.isArray(v) && v.length >= need) {
+        markPlotted(path);
+        return v;
+      }
+      markMissing(path);
+      return null;
+    }
+    function reqNum(path) {
+      var v = getByPath(payload, path);
+      if (typeof v === "number" && isFinite(v)) {
+        markPlotted(path);
+        return v;
+      }
+      markMissing(path);
+      return null;
+    }
+    function reqStr(path) {
+      var v = getByPath(payload, path);
+      if (typeof v === "string" && v.length > 0) {
+        markPlotted(path);
+        return v;
+      }
+      markMissing(path);
+      return null;
+    }
+    function reqBool(path) {
+      var v = getByPath(payload, path);
+      if (typeof v === "boolean") {
+        markPlotted(path);
+        return v;
+      }
+      markMissing(path);
+      return null;
+    }
 
     var chIdx = Math.min(3, Math.max(0, Math.floor(tSec / 4.0)));
     var localT = (tSec - chIdx * 4.0) / 4.0;
@@ -1740,83 +1820,137 @@ TOURS_PLAYER_JS = r"""(function () {
       }
     }
 
-    if (modIdx === 1) {
-      // Module 01: FID / Pulprog / NUS / IST
-      if (chIdx === 0) {
-        drawCardTitle(ctx, padX, padY - 12, "Sandboxed Bruker Pulseprogram AST · Echo-Antiecho vs States-TPPI", "AQSEQ 321 · igrad EA · zero unsafe eval", pal);
-        var rows = [
-          ["1  d1 pl11:f1", "Recycle delay & power lock"],
-          ["2  p1 ph1", "90 deg 1H excitation pulse"],
-          ["3  igrad EA", "Rance-Kay Echo-Antiecho gradient pair"],
-          ["4  go=2 ph31", "Phase-cycled FID acquisition (AQSEQ 321)"]
-        ];
-        for (var i = 0; i < rows.length; i++) {
-          var ry = padY + 14 + i * (ph * 0.22);
-          var active = i === Math.floor(localT * 4) % 4;
-          ctx.fillStyle = active ? "rgba(56, 189, 248, 0.16)" : pal.panel;
-          ctx.strokeStyle = active ? pal.cyan : pal.grid;
-          ctx.lineWidth = active ? 1.8 : 1;
-          drawRoundRect(ctx, padX, ry, pw, ph * 0.18, 8);
-          ctx.fill();
-          ctx.stroke();
-          ctx.fillStyle = pal.cyan;
-          ctx.font = "600 12px ui-monospace, monospace";
-          ctx.fillText(rows[i][0], padX + 12, ry + ph * 0.11);
-          ctx.fillStyle = pal.muted;
-          ctx.font = "12px -apple-system, sans-serif";
-          ctx.fillText(rows[i][1], padX + Math.min(220, pw * 0.42), ry + ph * 0.11);
-          addSpot(padX + pw * 0.5, ry + ph * 0.09, 24, rows[i][0], [rows[i][1], "Sandboxed AST line #" + (i + 1)]);
-        }
-      } else if (chIdx === 1) {
-        drawCardTitle(ctx, padX, padY - 12, "1D/2D Raw FID Decay -> Sine-Bell Apodization -> Calibrated FFT", "Zero-fill 2x · Phase PH0/PH1", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Time / Chemical Shift (ppm)", "Signal", pal);
-        var fidSrc = (payload && Array.isArray(payload.fid_real) && payload.fid_real.length > 4 && typeof payload.fid_real[0] === "number") ? payload.fid_real : null;
-        ctx.strokeStyle = pal.teal;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        if (fidSrc) {
+    function drawFallbackPlaceholder(titleText) {
+      drawCardTitle(
+        ctx,
+        padX,
+        padY - 12,
+        titleText,
+        "ILLUSTRATIVE FALLBACK (not engine output) — missing payload keys: " + fallbackReasons.join(", "),
+        pal
+      );
+      drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Missing payload series", "Warning", pal);
+      ctx.save();
+      ctx.fillStyle = "rgba(159, 18, 57, 0.24)";
+      ctx.strokeStyle = pal.coral;
+      ctx.lineWidth = 1.6;
+      drawRoundRect(ctx, padX + 16, padY + ph * 0.30, pw - 32, ph * 0.36, 8);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = pal.text;
+      ctx.font = "700 12px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(
+        "ILLUSTRATIVE FALLBACK (not engine output): missing payload." + fallbackReasons.join(", "),
+        padX + pw * 0.5,
+        padY + ph * 0.50
+      );
+      ctx.restore();
+    }
+
+    function renderSceneBody() {
+      if (modIdx === 1) {
+        if (chIdx === 0) {
+          var ppName = reqStr("pulprog_name");
+          var aqseq = reqStr("aqseq");
+          var f1Quad = reqStr("f1_quad");
+          var f2Quad = reqStr("f2_quad");
+          var trSum = reqStr("transfer_summary");
+          if (!ppName || !aqseq || !f1Quad || !f2Quad || !trSum) {
+            drawFallbackPlaceholder("Module 01 Ch 1: Pulseprogram AST");
+            return;
+          }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "Sandboxed Bruker Pulseprogram AST · " + ppName,
+            "AQSEQ=" + aqseq + " · F1=" + f1Quad + " · F2=" + f2Quad + " · " + trSum,
+            pal
+          );
+          var rows = [
+            ["PULSEPROG  " + ppName, "Parsed AST header & transfer graph: " + trSum],
+            ["AQSEQ      " + aqseq, "Indirect loop nesting order from acqus + mc macro"],
+            ["F1 QUAD    " + f1Quad, "Rance-Kay igrad EA / FnMODE quadrature deduction"],
+            ["F2 QUAD    " + f2Quad, "Second indirect dimension phase-sensitive quadrature"]
+          ];
+          for (var i = 0; i < rows.length; i++) {
+            var ry = padY + 14 + i * (ph * 0.22);
+            var active = i === Math.floor(localT * 4) % 4;
+            ctx.fillStyle = active ? "rgba(56, 189, 248, 0.16)" : pal.panel;
+            ctx.strokeStyle = active ? pal.cyan : pal.grid;
+            ctx.lineWidth = active ? 1.8 : 1;
+            drawRoundRect(ctx, padX, ry, pw, ph * 0.18, 8);
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle = pal.cyan;
+            ctx.font = "600 12px ui-monospace, monospace";
+            ctx.fillText(rows[i][0], padX + 12, ry + ph * 0.11);
+            ctx.fillStyle = pal.muted;
+            ctx.font = "12px -apple-system, sans-serif";
+            ctx.fillText(rows[i][1], padX + Math.min(240, pw * 0.44), ry + ph * 0.11);
+            addSpot(padX + pw * 0.5, ry + ph * 0.09, 24, rows[i][0], [rows[i][1], "Engine AST payload (" + ppName + ")"]);
+          }
+        } else if (chIdx === 1) {
+          var fidSrc = reqArr("fid_real", 8);
+          var sineWin = reqArr("sine_window", 8);
+          var fftPhased = reqArr("fft_phased", 8);
+          var fftUnphased = reqArr("fft_unphased", 8);
+          var p0Deg = reqNum("p0_deg");
+          var p1Deg = reqNum("p1_deg");
+          if (!fidSrc || !sineWin || !fftPhased || !fftUnphased || p0Deg === null || p1Deg === null) {
+            drawFallbackPlaceholder("Module 01 Ch 2: FID Apodization & FFT");
+            return;
+          }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "1D Raw FID Decay -> Shifted Sine-Bell -> Auto-Phased FFT",
+            "Chen (2002) PH0=" + p0Deg.toFixed(1) + " deg · PH1=" + p1Deg.toFixed(1) + " deg · N_TD=" + fidSrc.length + " -> N_FFT=" + fftPhased.length,
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Time / Normalized Frequency", "Engine Signal", pal);
           var maxFid = 1e-9;
           for (var i = 0; i < fidSrc.length; i++) maxFid = Math.max(maxFid, Math.abs(fidSrc[i]));
+          ctx.strokeStyle = pal.amber;
+          ctx.lineWidth = 1.2;
+          ctx.setLineDash([3, 3]);
+          ctx.beginPath();
+          for (var i = 0; i < sineWin.length; i++) {
+            var wx = padX + (i / (sineWin.length - 1)) * pw;
+            var wy = padY + ph * 0.34 - sineWin[i] * ph * 0.22;
+            if (i === 0) ctx.moveTo(wx, wy);
+            else ctx.lineTo(wx, wy);
+          }
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.strokeStyle = pal.teal;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
           for (var i = 0; i < fidSrc.length; i++) {
             var x = padX + (i / (fidSrc.length - 1)) * pw;
             var y = padY + ph * 0.34 - (fidSrc[i] / maxFid) * ph * 0.22;
             if (i === 0) ctx.moveTo(x, y);
             else ctx.lineTo(x, y);
           }
-        } else {
-          var nPts = 90;
-          for (var i = 0; i < nPts; i++) {
-            var u = i / (nPts - 1);
-            var x = padX + u * pw;
-            var env = Math.exp(-3.2 * u) * Math.sin(Math.PI * u);
-            var sig = env * Math.cos(u * 42 + localT * 6.28);
-            var y = padY + ph * 0.34 - sig * ph * 0.22;
-            if (i === 0) ctx.moveTo(x, y);
-            else ctx.lineTo(x, y);
-          }
-        }
-        ctx.stroke();
-        // FFT spectrum bottom half: use payload.fft_phased + payload.fft_unphased when present
-        var fftPhased = (payload && Array.isArray(payload.fft_phased) && payload.fft_phased.length > 4 && typeof payload.fft_phased[0] === "number") ? payload.fft_phased : null;
-        var fftUnphased = (payload && Array.isArray(payload.fft_unphased) && payload.fft_unphased.length === (fftPhased ? fftPhased.length : 0)) ? payload.fft_unphased : null;
-        if (fftPhased) {
+          ctx.stroke();
+
           var maxSpec = 1e-9;
           for (var i = 0; i < fftPhased.length; i++) maxSpec = Math.max(maxSpec, Math.abs(fftPhased[i]));
-          if (fftUnphased) {
-            for (var i = 0; i < fftUnphased.length; i++) maxSpec = Math.max(maxSpec, Math.abs(fftUnphased[i]));
-            ctx.strokeStyle = pal.coral;
-            ctx.lineWidth = 1.4;
-            ctx.setLineDash([4, 3]);
-            ctx.beginPath();
-            for (var i = 0; i < fftUnphased.length; i++) {
-              var sx = padX + (i / (fftUnphased.length - 1)) * pw;
-              var sy = padY + ph * 0.88 - (fftUnphased[i] / maxSpec) * ph * 0.30;
-              if (i === 0) ctx.moveTo(sx, sy);
-              else ctx.lineTo(sx, sy);
-            }
-            ctx.stroke();
-            ctx.setLineDash([]);
+          for (var i = 0; i < fftUnphased.length; i++) maxSpec = Math.max(maxSpec, Math.abs(fftUnphased[i]));
+          ctx.strokeStyle = pal.coral;
+          ctx.lineWidth = 1.4;
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          for (var i = 0; i < fftUnphased.length; i++) {
+            var ux = padX + (i / (fftUnphased.length - 1)) * pw;
+            var uy = padY + ph * 0.88 - (fftUnphased[i] / maxSpec) * ph * 0.30;
+            if (i === 0) ctx.moveTo(ux, uy);
+            else ctx.lineTo(ux, uy);
           }
+          ctx.stroke();
+          ctx.setLineDash([]);
           ctx.strokeStyle = pal.cyan;
           ctx.lineWidth = 2.2;
           ctx.beginPath();
@@ -1828,97 +1962,85 @@ TOURS_PLAYER_JS = r"""(function () {
           }
           ctx.stroke();
           for (var i = 1; i < fftPhased.length - 1; i++) {
-            if (fftPhased[i] > fftPhased[i - 1] && fftPhased[i] > fftPhased[i + 1] && fftPhased[i] > maxSpec * 0.35) {
+            if (fftPhased[i] > fftPhased[i - 1] && fftPhased[i] > fftPhased[i + 1] && fftPhased[i] > maxSpec * 0.20) {
               var px = padX + (i / (fftPhased.length - 1)) * pw;
               var py = padY + ph * 0.88 - (fftPhased[i] / maxSpec) * ph * 0.30;
-              var pp = 10.0 - (i / (fftPhased.length - 1)) * 10.0;
+              var fNorm = i / (fftPhased.length - 1);
               ctx.fillStyle = pal.amber;
               ctx.beginPath();
               ctx.arc(px, py, 4, 0, Math.PI * 2);
               ctx.fill();
-              addSpot(px, py, 14, "FFT Peak " + pp.toFixed(2) + " ppm", ["Intensity: " + fftPhased[i].toFixed(2), "Phased vs unphased overlay"]);
+              addSpot(px, py, 14, "FFT Bin #" + i + " (f=" + fNorm.toFixed(2) + ")", ["Phased amp: " + fftPhased[i].toFixed(2), "PH0=" + p0Deg.toFixed(1) + " deg, PH1=" + p1Deg.toFixed(1) + " deg"]);
             }
           }
-        } else {
-          var specSrc = (payload && Array.isArray(payload.spectrum) && payload.spectrum.length > 4) ? payload.spectrum : null;
-          var peaks = specSrc || [
-            { ppm: 8.42, amp: 0.92 }, { ppm: 7.81, amp: 0.74 },
-            { ppm: 4.18, amp: 0.65 }, { ppm: 2.08, amp: 0.85 }, { ppm: 0.92, amp: 0.95 }
-          ];
-          ctx.strokeStyle = pal.cyan;
-          ctx.lineWidth = 2.2;
-          ctx.beginPath();
-          for (var i = 0; i <= 140; i++) {
-            var u = i / 140;
-            var ppm = 10.0 - u * 10.0;
-            var val = 0;
-            for (var p = 0; p < peaks.length; p++) {
-              var pk = peaks[p];
-              var pp = pk.ppm !== undefined ? pk.ppm : (9.0 - p * 1.8);
-              var aa = pk.amp !== undefined ? pk.amp : 0.7;
-              var d = (ppm - pp) / 0.14;
-              val += aa / (1 + d * d);
+        } else if (chIdx === 2) {
+          var mask = reqArr("nus_mask", 8);
+          var dirty = reqArr("nus_dirty_spec", 8);
+          if (!mask || !dirty) {
+            drawFallbackPlaceholder("Module 01 Ch 3: NUS Schedule & Zero-Fill Spectrum");
+            return;
+          }
+          var nAcq = 0;
+          for (var m = 0; m < mask.length; m++) { if (mask[m]) nAcq++; }
+          var pctAcq = ((100.0 * nAcq) / mask.length).toFixed(0);
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            pctAcq + "% Poisson-Gap NUS Schedule & Zero-Fill PSF Artifacts",
+            nAcq + " / " + mask.length + " indirect increments acquired · zero-filled DFT spectrum below",
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Indirect Increment / Frequency Bin", "NUS Mask & Dirty DFT", pal);
+          for (var i = 0; i < mask.length; i++) {
+            var bx = padX + (i / mask.length) * pw;
+            if (mask[i]) {
+              ctx.fillStyle = pal.cyan;
+              ctx.fillRect(bx, padY + 18, Math.max(2, pw / (mask.length * 1.25)), ph * 0.25);
+              addSpot(bx + 2, padY + 18 + ph * 0.12, 10, "NUS Increment #" + i, ["Acquired (" + nAcq + "/" + mask.length + " Poisson-gap)"]);
+            } else {
+              ctx.fillStyle = "rgba(148,163,184,0.16)";
+              ctx.fillRect(bx, padY + 18, Math.max(2, pw / (mask.length * 1.25)), ph * 0.08);
             }
-            var sx = padX + u * pw;
-            var sy = padY + ph * 0.92 - val * ph * 0.32;
+          }
+          var maxDirty = 1e-9;
+          for (var i = 0; i < dirty.length; i++) maxDirty = Math.max(maxDirty, Math.abs(dirty[i]));
+          ctx.strokeStyle = pal.coral;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          for (var i = 0; i < dirty.length; i++) {
+            var sx = padX + (i / (dirty.length - 1)) * pw;
+            var sy = padY + ph * 0.90 - (dirty[i] / maxDirty) * ph * 0.44;
             if (i === 0) ctx.moveTo(sx, sy);
             else ctx.lineTo(sx, sy);
           }
           ctx.stroke();
-          for (var p = 0; p < peaks.length; p++) {
-            var pp = peaks[p].ppm !== undefined ? peaks[p].ppm : (9.0 - p * 1.8);
-            var aa = peaks[p].amp !== undefined ? peaks[p].amp : 0.7;
-            var px = padX + ((10.0 - pp) / 10.0) * pw;
-            var py = padY + ph * 0.92 - aa * ph * 0.32;
-            ctx.fillStyle = pal.amber;
-            ctx.beginPath();
-            ctx.arc(px, py, 4, 0, Math.PI * 2);
-            ctx.fill();
-            addSpot(px, py, 14, "FFT Peak " + pp.toFixed(2) + " ppm", ["Intensity: " + aa.toFixed(2), "Sine-bell apodized"]);
+        } else {
+          var fistaIters = reqArr("nus_fista_iters", 2);
+          var resArr = reqArr("nus_residual_l1", 2);
+          if (!fistaIters || !resArr) {
+            drawFallbackPlaceholder("Module 01 Ch 4: IST/FISTA Reconstruction");
+            return;
           }
-        }
-      } else if (chIdx === 2) {
-        drawCardTitle(ctx, padX, padY - 12, "25% Poisson-Gap NUS Schedule & Zero-Fill PSF Artifacts", "64 / 256 increments acquired", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Indirect Increment t1", "Sampling Mask / PSF", pal);
-        var mask = (payload && Array.isArray(payload.nus_mask)) ? payload.nus_mask : null;
-        for (var i = 0; i < 64; i++) {
-          var acquired = mask ? Boolean(mask[i % mask.length]) : ((i * 17 + 3) % 4 === 0);
-          var bx = padX + (i / 64) * pw;
-          if (acquired) {
-            ctx.fillStyle = pal.cyan;
-            ctx.fillRect(bx, padY + 18, Math.max(2, pw / 80), ph * 0.28);
-            addSpot(bx + 2, padY + 18 + ph * 0.14, 10, "NUS Sample #" + i, ["Status: Acquired (25% Poisson-gap)"]);
-          } else {
-            ctx.fillStyle = "rgba(148,163,184,0.16)";
-            ctx.fillRect(bx, padY + 18, Math.max(2, pw / 80), ph * 0.1);
+          var iter = Math.round(clamp(ctrlVal, 0, fistaIters.length - 1));
+          var specIter = fistaIters[iter];
+          if (!Array.isArray(specIter) || specIter.length < 4) {
+            markMissing("nus_fista_iters[" + iter + "]");
+            drawFallbackPlaceholder("Module 01 Ch 4: IST/FISTA Iteration Slice");
+            return;
           }
-        }
-        ctx.strokeStyle = pal.coral;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        for (var i = 0; i <= 120; i++) {
-          var u = i / 120;
-          var d = (u - 0.5) * 14;
-          var mainLobe = Math.exp(-d * d * 2.0);
-          var ridge = 0.24 * Math.abs(Math.sin(u * 48 + localT * 3)) * (1 - mainLobe);
-          var sy = padY + ph * 0.9 - (mainLobe * 0.42 + ridge) * ph;
-          var sx = padX + u * pw;
-          if (i === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
-        }
-        ctx.stroke();
-      } else {
-        var iter = Math.round(clamp(ctrlVal, 0, 20));
-        var fistaIters = (payload && Array.isArray(payload.nus_fista_iters) && payload.nus_fista_iters.length > 0) ? payload.nus_fista_iters : null;
-        var resArr = (payload && Array.isArray(payload.nus_residual_l1)) ? payload.nus_residual_l1 : null;
-        var ridgeFactor = Math.exp(-0.21 * iter);
-        var resText = (resArr && resArr.length > 0)
-          ? ("Residual L1: " + Number(resArr[Math.min(iter, resArr.length - 1)]).toFixed(3))
-          : ("Residual NUS ridge: " + (ridgeFactor * 100).toFixed(1) + "%");
-        drawCardTitle(ctx, padX, padY - 12, "Hypercomplex IST/FISTA Threshold Shrinkage (iter = " + iter + " / 20)", resText, pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "15N / 1H Frequency", "Reconstructed Amplitude", pal);
-        var specIter = fistaIters ? fistaIters[Math.min(iter, fistaIters.length - 1)] : null;
-        if (Array.isArray(specIter) && specIter.length > 4) {
+          var l1Cur = Number(resArr[Math.min(iter, resArr.length - 1)]);
+          var l1Init = Number(resArr[0]);
+          var resText = "Normalized L1 error: " + l1Cur.toFixed(3) + " (iter 0: " + l1Init.toFixed(3) + ")";
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "Hypercomplex IST/FISTA Threshold Shrinkage (iter = " + iter + " / " + (fistaIters.length - 1) + ")",
+            resText,
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Frequency Bin (0.." + (specIter.length - 1) + ")", "Reconstructed Amplitude", pal);
           var maxFista = 1e-9;
           for (var i = 0; i < specIter.length; i++) maxFista = Math.max(maxFista, Math.abs(specIter[i]));
           ctx.strokeStyle = pal.green;
@@ -1932,58 +2054,53 @@ TOURS_PLAYER_JS = r"""(function () {
           }
           ctx.stroke();
           for (var i = 1; i < specIter.length - 1; i++) {
-            if (specIter[i] > specIter[i - 1] && specIter[i] > specIter[i + 1] && specIter[i] > maxFista * 0.45) {
+            if (specIter[i] > specIter[i - 1] && specIter[i] > specIter[i + 1] && specIter[i] > maxFista * 0.18) {
               var px = padX + (i / (specIter.length - 1)) * pw;
               var py = padY + ph * 0.88 - (specIter[i] / maxFista) * ph * 0.72;
               ctx.fillStyle = pal.amber;
               ctx.beginPath();
               ctx.arc(px, py, 5, 0, Math.PI * 2);
               ctx.fill();
-              addSpot(px, py, 16, "IST Peak bin #" + i, ["IST Iteration: " + iter, resText]);
+              addSpot(px, py, 16, "FISTA Peak bin #" + i, ["Amplitude: " + specIter[i].toFixed(2), resText]);
             }
-          }
-        } else {
-          var peakPos = [0.22, 0.48, 0.74];
-          ctx.strokeStyle = pal.green;
-          ctx.lineWidth = 2.4;
-          ctx.beginPath();
-          for (var i = 0; i <= 160; i++) {
-            var u = i / 160;
-            var yVal = 0;
-            for (var p = 0; p < peakPos.length; p++) {
-              var d = (u - peakPos[p]) / 0.025;
-              yVal += (0.85 - p * 0.1) / (1 + d * d);
-            }
-            yVal += 0.22 * ridgeFactor * Math.sin(u * 65 + 1.1) * Math.cos(u * 23);
-            var sx = padX + u * pw;
-            var sy = padY + ph * 0.88 - Math.max(-0.15, yVal) * ph * 0.72;
-            if (i === 0) ctx.moveTo(sx, sy);
-            else ctx.lineTo(sx, sy);
-          }
-          ctx.stroke();
-          for (var p = 0; p < peakPos.length; p++) {
-            var px = padX + peakPos[p] * pw;
-            var py = padY + ph * 0.88 - (0.85 - p * 0.1) * ph * 0.72;
-            ctx.fillStyle = pal.amber;
-            ctx.beginPath();
-            ctx.arc(px, py, 5, 0, Math.PI * 2);
-            ctx.fill();
-            addSpot(px, py, 16, "IST Peak #" + (p + 1), ["IST Iteration: " + iter, "Ridge suppression: " + ((1 - ridgeFactor) * 100).toFixed(1) + "%"]);
           }
         }
+        return;
       }
-      return;
-    }
 
-    if (modIdx === 2) {
-      // Module 02: HSQC, 3D HNCACB strips, Cv(T), Confidence ribbon
-      var focusRes = Math.round(clamp(ctrlVal, 1, 10));
-      var stripNames = ["Met1", "Gln2", "Ile3", "Phe4", "Val5", "Lys6", "Thr7", "Leu8", "Thr9", "Gly10"];
-      if (chIdx === 0) {
-        drawCardTitle(ctx, padX, padY - 12, "2D 1H-15N HSQC Contours & Picked Backbone Roots", "Cyan: +1 backbone N-H · Coral: -1 aliased Arg Ne-He", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm, 10.2 -> 6.2)", "15N (ppm, 104 -> 132)", pal);
-        var negSegs = (payload && Array.isArray(payload.hsqc_neg_contours)) ? payload.hsqc_neg_contours : null;
-        if (negSegs && negSegs.length) {
+      if (modIdx === 2) {
+        var focusRes = Math.round(clamp(ctrlVal, 1, 10));
+        if (chIdx === 0) {
+          var posSegs = reqArr("hsqc_pos_contours", 1);
+          var negSegs = reqArr("hsqc_neg_contours", 1);
+          var roots = reqArr("hsqc_roots", 5);
+          if (!posSegs || !negSegs || !roots) {
+            drawFallbackPlaceholder("Module 02 Ch 1: 2D HSQC Contours & Roots");
+            return;
+          }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "2D 1H-15N HSQC Contours & Picked Backbone Roots (" + roots.length + " roots)",
+            "Cyan: +1 backbone N-H contours · Coral: -1 folded Arg Ne-He contours",
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm, 10.2 -> 6.2)", "15N (ppm, 104 -> 132)", pal);
+          ctx.strokeStyle = "rgba(56, 189, 248, 0.34)";
+          ctx.lineWidth = 1.0;
+          for (var ps = 0; ps < posSegs.length; ps++) {
+            var pseg = posSegs[ps];
+            if (!Array.isArray(pseg) || pseg.length < 2) continue;
+            ctx.beginPath();
+            for (var k = 0; k < pseg.length; k++) {
+              var px0 = padX + clamp((10.2 - pseg[k][0]) / 4.0, 0.02, 0.98) * pw;
+              var py0 = padY + 12 + clamp((pseg[k][1] - 104.0) / 28.0, 0.02, 0.98) * (ph - 24);
+              if (k === 0) ctx.moveTo(px0, py0);
+              else ctx.lineTo(px0, py0);
+            }
+            ctx.stroke();
+          }
           ctx.strokeStyle = pal.coral;
           ctx.lineWidth = 1.4;
           for (var ns = 0; ns < negSegs.length; ns++) {
@@ -1998,393 +2115,393 @@ TOURS_PLAYER_JS = r"""(function () {
             }
             ctx.stroke();
           }
-          var s0 = negSegs[0][0];
-          addSpot(
-            padX + clamp((10.2 - s0[0]) / 4.0, 0.02, 0.98) * pw,
-            padY + 12 + clamp((s0[1] - 104.0) / 28.0, 0.02, 0.98) * (ph - 24),
-            14,
-            "Aliased Arg Ne-He (-1)",
-            ["1H: " + s0[0].toFixed(2) + " ppm", "15N: " + s0[1].toFixed(1) + " ppm (folded negative)"]
+          if (negSegs[0] && negSegs[0][0]) {
+            var s0 = negSegs[0][0];
+            addSpot(
+              padX + clamp((10.2 - s0[0]) / 4.0, 0.02, 0.98) * pw,
+              padY + 12 + clamp((s0[1] - 104.0) / 28.0, 0.02, 0.98) * (ph - 24),
+              14,
+              "Aliased Arg Ne-He (-1)",
+              ["1H: " + s0[0].toFixed(2) + " ppm", "15N: " + s0[1].toFixed(1) + " ppm (folded negative)"]
+            );
+          }
+          for (var i = 0; i < roots.length; i++) {
+            var hPpm = Number(roots[i].h);
+            var nPpm = Number(roots[i].n);
+            var lbl = String(roots[i].label || ("Res" + (i + 1)));
+            var seqNum = parseInt(lbl.replace(/\D+/g, ""), 10) || (i + 1);
+            var cx = padX + clamp((10.2 - hPpm) / 4.0, 0.03, 0.97) * pw;
+            var cy = padY + 12 + clamp((nPpm - 104.0) / 28.0, 0.04, 0.96) * (ph - 24);
+            var isSel = seqNum === focusRes;
+            ctx.strokeStyle = isSel ? pal.amber : pal.cyan;
+            ctx.lineWidth = isSel ? 2.2 : 1.3;
+            ctx.beginPath();
+            ctx.ellipse(cx, cy, 7.5, 4.6, 0, 0, Math.PI * 2);
+            ctx.stroke();
+            addSpot(cx, cy, 12, lbl + " HSQC Root", ["1H: " + hPpm.toFixed(2) + " ppm", "15N: " + nPpm.toFixed(1) + " ppm"], Math.min(10, Math.max(1, seqNum)));
+          }
+        } else if (chIdx === 1) {
+          var allStrips = reqArr("strips", 10);
+          var pulseRegime = reqStr("hncacb_pulse_regime");
+          if (!allStrips || !pulseRegime) {
+            drawFallbackPlaceholder("Module 02 Ch 2: 3D HNCACB Sequential Strip Walk");
+            return;
+          }
+          var rawStrips = allStrips.slice(3, 10);
+          var focLabel = allStrips[focusRes - 1] ? allStrips[focusRes - 1].label : ("Res" + focusRes);
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 14,
+            "3D HNCACB Sequential Strip Walk (Phe4 -> Gly10 · Focus " + focLabel + ")",
+            "Non-CT HNCACB (2*d28=7.2ms): Cyan (+1) CA [incl. Gly10 CA +1, CB null; CT 2T=28ms inverts Gly CH2] · Coral (-1) CB",
+            pal
           );
-        }
-        var roots = (payload && Array.isArray(payload.hsqc_roots) && payload.hsqc_roots.length) ? payload.hsqc_roots : null;
-        var count = roots ? roots.length : 24;
-        for (var i = 0; i < count; i++) {
-          var hPpm = roots ? (roots[i].h || 8.0) : (6.9 + ((i * 37) % 28) * 0.1);
-          var nPpm = roots ? (roots[i].n || 118.0) : (107 + ((i * 53) % 22));
-          var lbl = roots && roots[i].label ? roots[i].label : stripNames[i % 10];
-          var seqNum = parseInt(String(lbl).replace(/\D+/g, ""), 10) || ((i % 10) + 1);
-          var cx = padX + clamp((10.2 - hPpm) / 4.0, 0.03, 0.97) * pw;
-          var cy = padY + 12 + clamp((nPpm - 104.0) / 28.0, 0.04, 0.96) * (ph - 24);
-          var isSel = seqNum === focusRes;
-          ctx.strokeStyle = isSel ? pal.amber : pal.cyan;
-          ctx.lineWidth = isSel ? 2.2 : 1.3;
-          ctx.beginPath();
-          ctx.ellipse(cx, cy, 8, 5, 0, 0, Math.PI * 2);
-          ctx.stroke();
-          ctx.beginPath();
-          ctx.ellipse(cx, cy, 3.8, 2.3, 0, 0, Math.PI * 2);
-          ctx.stroke();
-          addSpot(cx, cy, 12, lbl + " HSQC Root", ["1H: " + hPpm.toFixed(2) + " ppm", "15N: " + nPpm.toFixed(1) + " ppm"], Math.min(10, Math.max(1, seqNum)));
-        }
-      } else if (chIdx === 1) {
-        drawCardTitle(
-          ctx,
-          padX,
-          padY - 14,
-          "3D HNCACB Sequential Strip Walk (Phe4 -> Gly10)",
-          "Solid = intra (i) · Hollow ring = seq (i-1) · Cyan (+) CA · Coral (-) CB · Focus: " + stripNames[focusRes - 1],
-          pal
-        );
-        var fallbackStrips = [
-          { seq_id: 4, label: "Phe4", h_ppm: 7.80, n_ppm: 119.2, ca_i: 56.8, cb_i: 41.2, ca_im1: 62.4, cb_im1: 38.7 },
-          { seq_id: 5, label: "Val5", h_ppm: 9.29, n_ppm: 121.3, ca_i: 61.8, cb_i: 32.7, ca_im1: 56.8, cb_im1: 41.2 },
-          { seq_id: 6, label: "Lys6", h_ppm: 8.92, n_ppm: 127.8, ca_i: 50.9, cb_i: 29.4, ca_im1: 61.8, cb_im1: 32.7 },
-          { seq_id: 7, label: "Thr7", h_ppm: 8.75, n_ppm: 115.3, ca_i: 62.8, cb_i: 73.3, ca_im1: 50.9, cb_im1: 29.4 },
-          { seq_id: 8, label: "Leu8", h_ppm: 9.11, n_ppm: 121.1, ca_i: 57.0, cb_i: 43.6, ca_im1: 62.8, cb_im1: 73.3 },
-          { seq_id: 9, label: "Thr9", h_ppm: 7.64, n_ppm: 105.8, ca_i: 62.5, cb_i: 67.6, ca_im1: 57.0, cb_im1: 43.6 },
-          { seq_id: 10, label: "Gly10", h_ppm: 8.03, n_ppm: 109.7, ca_i: 45.3, cb_i: null, ca_im1: 62.5, cb_im1: 67.6 }
-        ];
-        var rawStrips = (payload && Array.isArray(payload.strips) && payload.strips.length >= 10)
-          ? payload.strips.slice(3, 10)
-          : fallbackStrips;
-        var prevLabels = ["Ile3", "Phe4", "Val5", "Lys6", "Thr7", "Leu8", "Thr9"];
-        var dispLabels = ["Phe4", "Val5", "Lys6", "Thr7", "Leu8", "Thr9", "Gly10"];
-        var stripLeft = padX + 38;
-        var stripRight = padX + pw - 4;
-        var stripTop = padY + 26;
-        var stripBot = padY + ph - 6;
-        var cols = rawStrips.length;
-        var gap = Math.max(6, pw * 0.014);
-        var stripW = (stripRight - stripLeft - gap * (cols - 1)) / cols;
-        function mapCy(cPpm) {
-          return stripTop + ((cPpm - 14.0) / (76.0 - 14.0)) * (stripBot - stripTop);
-        }
+          var stripLeft = padX + 38;
+          var stripRight = padX + pw - 4;
+          var stripTop = padY + 26;
+          var stripBot = padY + ph - 6;
+          var cols = rawStrips.length;
+          var gap = Math.max(6, pw * 0.014);
+          var stripW = (stripRight - stripLeft - gap * (cols - 1)) / cols;
+          function mapCy(cPpm) {
+            return stripTop + ((cPpm - 14.0) / (76.0 - 14.0)) * (stripBot - stripTop);
+          }
 
-        // Left 13C ppm axis title + numeric ticks (standard NMR downfield-bottom 14 -> 76 ppm)
-        ctx.save();
-        ctx.fillStyle = pal.cyan;
-        ctx.font = "600 10.5px ui-monospace, SFMono-Regular, Menlo, monospace";
-        ctx.textAlign = "left";
-        ctx.fillText("13C ppm", padX, stripTop - 8);
-        var cTicks = [20, 30, 40, 50, 60, 70];
-        for (var ti = 0; ti < cTicks.length; ti++) {
-          var ty = mapCy(cTicks[ti]);
-          ctx.strokeStyle = pal.grid;
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.moveTo(stripLeft - 4, ty);
-          ctx.lineTo(stripRight, ty);
-          ctx.stroke();
-          ctx.fillStyle = pal.muted;
-          ctx.textAlign = "right";
-          ctx.fillText(String(cTicks[ti]), stripLeft - 7, ty + 3.5);
-        }
-        ctx.restore();
-
-        var centersX = [];
-        for (var s = 0; s < cols; s++) {
-          var sx0 = stripLeft + s * (stripW + gap);
-          var scx = sx0 + stripW * 0.5;
-          centersX.push(scx);
-          var rIdx = s + 3; // Phe4..Gly10 (seq_id 4..10)
-          var isFoc = (rIdx + 1) === focusRes;
-          var st = rawStrips[s];
-
-          // Strip card box
-          ctx.fillStyle = isFoc ? "rgba(56, 189, 248, 0.10)" : pal.panel;
-          ctx.strokeStyle = isFoc ? pal.amber : pal.border;
-          ctx.lineWidth = isFoc ? 1.8 : 1.1;
-          drawRoundRect(ctx, sx0, stripTop, stripW, stripBot - stripTop, 7);
-          ctx.fill();
-          ctx.stroke();
-
-          // Top strip header: Residue label above box + amide H/N ppm inside top margin
           ctx.save();
-          ctx.textAlign = "center";
-          ctx.fillStyle = isFoc ? pal.amber : pal.text;
-          ctx.font = "700 11.5px ui-monospace, SFMono-Regular, Menlo, monospace";
-          ctx.fillText(dispLabels[s], scx, stripTop - 6);
-          if (typeof st.h_ppm === "number" && typeof st.n_ppm === "number") {
+          ctx.fillStyle = pal.cyan;
+          ctx.font = "600 10.5px ui-monospace, SFMono-Regular, Menlo, monospace";
+          ctx.textAlign = "left";
+          ctx.fillText("13C ppm", padX, stripTop - 8);
+          var cTicks = [20, 30, 40, 50, 60, 70];
+          for (var ti = 0; ti < cTicks.length; ti++) {
+            var ty = mapCy(cTicks[ti]);
+            ctx.strokeStyle = pal.grid;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(stripLeft - 4, ty);
+            ctx.lineTo(stripRight, ty);
+            ctx.stroke();
             ctx.fillStyle = pal.muted;
-            ctx.font = "9.5px ui-monospace, SFMono-Regular, Menlo, monospace";
-            ctx.fillText(st.h_ppm.toFixed(2) + "/" + st.n_ppm.toFixed(0), scx, stripTop + 11);
+            ctx.textAlign = "right";
+            ctx.fillText(String(cTicks[ti]), stripLeft - 7, ty + 3.5);
           }
           ctx.restore();
 
-          // Subtle 1D 13C slice profiles (pos_pts right, neg_pts left) when present
-          if (Array.isArray(st.pos_pts) && st.pos_pts.length > 4) {
-            ctx.strokeStyle = isFoc ? "rgba(56, 189, 248, 0.55)" : "rgba(56, 189, 248, 0.30)";
-            ctx.lineWidth = 1.2;
-            ctx.beginPath();
-            for (var p = 0; p < st.pos_pts.length; p++) {
-              var px = scx + st.pos_pts[p][1] * stripW * 0.36;
-              var py = mapCy(st.pos_pts[p][0]);
-              if (p === 0) ctx.moveTo(px, py);
-              else ctx.lineTo(px, py);
-            }
-            ctx.stroke();
-          }
-          if (Array.isArray(st.neg_pts) && st.neg_pts.length > 4) {
-            ctx.strokeStyle = isFoc ? "rgba(251, 113, 133, 0.55)" : "rgba(251, 113, 133, 0.30)";
-            ctx.lineWidth = 1.2;
-            ctx.beginPath();
-            for (var p = 0; p < st.neg_pts.length; p++) {
-              var nx = scx - st.neg_pts[p][1] * stripW * 0.36;
-              var ny = mapCy(st.neg_pts[p][0]);
-              if (p === 0) ctx.moveTo(nx, ny);
-              else ctx.lineTo(nx, ny);
-            }
-            ctx.stroke();
-          }
-        }
+          var centersX = [];
+          for (var s = 0; s < cols; s++) {
+            var sx0 = stripLeft + s * (stripW + gap);
+            var scx = sx0 + stripW * 0.5;
+            centersX.push(scx);
+            var st = rawStrips[s];
+            var isFoc = st.seq_id === focusRes;
 
-        // Horizontal dashed sequential walk staircase lines: intra (s-1) -> seq (s)
-        ctx.save();
-        ctx.setLineDash([5, 3]);
-        ctx.lineWidth = 1.4;
-        for (var s = 1; s < cols; s++) {
-          var prevSt = rawStrips[s - 1];
-          var curSt = rawStrips[s];
-          if (typeof prevSt.ca_i === "number" && typeof curSt.ca_im1 === "number") {
-            ctx.strokeStyle = "rgba(56, 189, 248, 0.72)";
-            ctx.beginPath();
-            ctx.moveTo(centersX[s - 1], mapCy(prevSt.ca_i));
-            ctx.lineTo(centersX[s], mapCy(curSt.ca_im1));
+            ctx.fillStyle = isFoc ? "rgba(56, 189, 248, 0.10)" : pal.panel;
+            ctx.strokeStyle = isFoc ? pal.amber : pal.border;
+            ctx.lineWidth = isFoc ? 1.8 : 1.1;
+            drawRoundRect(ctx, sx0, stripTop, stripW, stripBot - stripTop, 7);
+            ctx.fill();
             ctx.stroke();
-          }
-          if (typeof prevSt.cb_i === "number" && typeof curSt.cb_im1 === "number") {
-            ctx.strokeStyle = "rgba(251, 113, 133, 0.72)";
-            ctx.beginPath();
-            ctx.moveTo(centersX[s - 1], mapCy(prevSt.cb_i));
-            ctx.lineTo(centersX[s], mapCy(curSt.cb_im1));
-            ctx.stroke();
-          }
-        }
-        ctx.restore();
 
-        // Draw all 4 HNCACB cross-peaks per strip (3 on Gly10 where cb_i === null)
-        for (var s = 0; s < cols; s++) {
-          var scx = centersX[s];
-          var rIdx = s + 3;
-          var st = rawStrips[s];
-          var dLbl = dispLabels[s];
-          var pLbl = prevLabels[s];
-
-          // 1. CA(i-1): sequential predecessor (+, hollow dashed cyan ring)
-          if (typeof st.ca_im1 === "number") {
-            var yCaPrev = mapCy(st.ca_im1);
             ctx.save();
-            ctx.fillStyle = pal.panel;
-            ctx.beginPath();
-            ctx.ellipse(scx, yCaPrev, 8.5, 4.5, 0, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.strokeStyle = pal.cyan;
-            ctx.lineWidth = 1.6;
-            ctx.setLineDash([3, 2]);
-            ctx.stroke();
+            ctx.textAlign = "center";
+            ctx.fillStyle = isFoc ? pal.amber : pal.text;
+            ctx.font = "700 11.5px ui-monospace, SFMono-Regular, Menlo, monospace";
+            ctx.fillText(String(st.label), scx, stripTop - 6);
+            if (typeof st.h_ppm === "number" && typeof st.n_ppm === "number") {
+              ctx.fillStyle = pal.muted;
+              ctx.font = "9.5px ui-monospace, SFMono-Regular, Menlo, monospace";
+              ctx.fillText(st.h_ppm.toFixed(2) + "/" + st.n_ppm.toFixed(0), scx, stripTop + 11);
+            }
             ctx.restore();
-            addSpot(scx, yCaPrev, 11, dLbl + " CA(i-1) [" + pLbl + "]: " + st.ca_im1.toFixed(1) + " ppm (+, seq)", ["Phase: +1 (cyan hollow ring)", "Sequential link from " + pLbl + " CA(i)"], rIdx + 1);
+
+            if (Array.isArray(st.pos_pts) && st.pos_pts.length > 4) {
+              ctx.strokeStyle = isFoc ? "rgba(56, 189, 248, 0.55)" : "rgba(56, 189, 248, 0.30)";
+              ctx.lineWidth = 1.2;
+              ctx.beginPath();
+              for (var p = 0; p < st.pos_pts.length; p++) {
+                var px = scx + st.pos_pts[p][1] * stripW * 0.36;
+                var py = mapCy(st.pos_pts[p][0]);
+                if (p === 0) ctx.moveTo(px, py);
+                else ctx.lineTo(px, py);
+              }
+              ctx.stroke();
+            }
+            if (Array.isArray(st.neg_pts) && st.neg_pts.length > 4) {
+              ctx.strokeStyle = isFoc ? "rgba(251, 113, 133, 0.55)" : "rgba(251, 113, 133, 0.30)";
+              ctx.lineWidth = 1.2;
+              ctx.beginPath();
+              for (var p = 0; p < st.neg_pts.length; p++) {
+                var nx = scx - st.neg_pts[p][1] * stripW * 0.36;
+                var ny = mapCy(st.neg_pts[p][0]);
+                if (p === 0) ctx.moveTo(nx, ny);
+                else ctx.lineTo(nx, ny);
+              }
+              ctx.stroke();
+            }
           }
 
-          // 2. CB(i-1): sequential predecessor (-, hollow dashed coral ring)
-          if (typeof st.cb_im1 === "number") {
-            var yCbPrev = mapCy(st.cb_im1);
-            ctx.save();
-            ctx.fillStyle = pal.panel;
-            ctx.beginPath();
-            ctx.ellipse(scx, yCbPrev, 8.5, 4.5, 0, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.strokeStyle = pal.coral;
-            ctx.lineWidth = 1.6;
-            ctx.setLineDash([3, 2]);
-            ctx.stroke();
-            ctx.restore();
-            addSpot(scx, yCbPrev, 11, dLbl + " CB(i-1) [" + pLbl + "]: " + st.cb_im1.toFixed(1) + " ppm (-, seq)", ["Phase: -1 (coral hollow ring)", "Sequential link from " + pLbl + " CB(i)"], rIdx + 1);
+          ctx.save();
+          ctx.setLineDash([5, 3]);
+          ctx.lineWidth = 1.4;
+          for (var s = 1; s < cols; s++) {
+            var prevSt = rawStrips[s - 1];
+            var curSt = rawStrips[s];
+            if (typeof prevSt.ca_i === "number" && typeof curSt.ca_im1 === "number") {
+              ctx.strokeStyle = "rgba(56, 189, 248, 0.72)";
+              ctx.beginPath();
+              ctx.moveTo(centersX[s - 1], mapCy(prevSt.ca_i));
+              ctx.lineTo(centersX[s], mapCy(curSt.ca_im1));
+              ctx.stroke();
+            }
+            if (typeof prevSt.cb_i === "number" && typeof curSt.cb_im1 === "number") {
+              ctx.strokeStyle = "rgba(251, 113, 133, 0.72)";
+              ctx.beginPath();
+              ctx.moveTo(centersX[s - 1], mapCy(prevSt.cb_i));
+              ctx.lineTo(centersX[s], mapCy(curSt.cb_im1));
+              ctx.stroke();
+            }
           }
+          ctx.restore();
 
-          // 3. CA(i): intra-residue (+, strong solid double-ellipse cyan + filled dot)
-          if (typeof st.ca_i === "number") {
-            var yCa = mapCy(st.ca_i);
-            ctx.strokeStyle = pal.cyan;
-            ctx.lineWidth = 1.8;
-            ctx.beginPath();
-            ctx.ellipse(scx, yCa, 11, 5.5, 0, 0, Math.PI * 2);
-            ctx.stroke();
-            ctx.beginPath();
-            ctx.ellipse(scx, yCa, 6, 3.0, 0, 0, Math.PI * 2);
-            ctx.stroke();
-            ctx.fillStyle = pal.cyan;
-            ctx.beginPath();
-            ctx.arc(scx, yCa, 2.8, 0, Math.PI * 2);
-            ctx.fill();
-            addSpot(scx, yCa, 12, dLbl + " CA(i): " + st.ca_i.toFixed(1) + " ppm (+, intra)", ["Phase: +1 (cyan solid contour)", dLbl === "Gly10" ? "Gly10 intra CA (no CB peak)" : "Strong intra-residue CA"], rIdx + 1);
-          }
+          var dispLabels = ["Phe4", "Val5", "Lys6", "Thr7", "Leu8", "Thr9", "Gly10"];
+          var prevLabels = ["Ile3", "Phe4", "Val5", "Lys6", "Thr7", "Leu8", "Thr9"];
+          for (var s = 0; s < cols; s++) {
+            var scx = centersX[s];
+            var st = rawStrips[s];
+            var dLbl = dispLabels[s] || String(st.label);
+            var pLbl = prevLabels[s] || ("Res" + (st.seq_id - 1));
+            var signColor = function (sgn, defSign) {
+              var eff = (typeof sgn === "number") ? sgn : defSign;
+              return eff >= 0 ? pal.cyan : pal.coral;
+            };
+            var signLabel = function (sgn, defSign) {
+              var eff = (typeof sgn === "number") ? sgn : defSign;
+              return eff >= 0 ? "+1" : "-1";
+            };
 
-          // 4. CB(i): intra-residue (-, strong solid double-ellipse coral + filled dot; absent on Gly10)
-          if (typeof st.cb_i === "number") {
-            var yCb = mapCy(st.cb_i);
-            var invNote = (typeof st.ca_i === "number" && st.cb_i > st.ca_i) ? ", CB>CA" : "";
-            ctx.strokeStyle = pal.coral;
-            ctx.lineWidth = 1.8;
-            ctx.beginPath();
-            ctx.ellipse(scx, yCb, 11, 5.5, 0, 0, Math.PI * 2);
-            ctx.stroke();
-            ctx.beginPath();
-            ctx.ellipse(scx, yCb, 6, 3.0, 0, 0, Math.PI * 2);
-            ctx.stroke();
-            ctx.fillStyle = pal.coral;
-            ctx.beginPath();
-            ctx.arc(scx, yCb, 2.8, 0, Math.PI * 2);
-            ctx.fill();
-            addSpot(scx, yCb, 12, dLbl + " CB(i): " + st.cb_i.toFixed(1) + " ppm (-, intra" + invNote + ")", ["Phase: -1 (coral solid contour)", invNote ? "Thr/Ser hydroxyl downfield CB > CA" : "Strong intra-residue CB"], rIdx + 1);
+            if (typeof st.ca_im1 === "number") {
+              var yCaPrev = mapCy(st.ca_im1);
+              var colCaPrev = signColor(st.ca_im1_sign, 1);
+              ctx.save();
+              ctx.fillStyle = pal.panel;
+              ctx.beginPath();
+              ctx.ellipse(scx, yCaPrev, 8.5, 4.5, 0, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.strokeStyle = colCaPrev;
+              ctx.lineWidth = 1.6;
+              ctx.setLineDash([3, 2]);
+              ctx.stroke();
+              ctx.restore();
+              addSpot(scx, yCaPrev, 11, dLbl + " CA(i-1) [" + pLbl + "]: " + st.ca_im1.toFixed(1) + " ppm (" + signLabel(st.ca_im1_sign, 1) + ", seq)", ["Phase: " + signLabel(st.ca_im1_sign, 1) + " (hollow ring)", "Sequential link from " + pLbl + " CA(i)"], st.seq_id);
+            }
+
+            if (typeof st.cb_im1 === "number") {
+              var yCbPrev = mapCy(st.cb_im1);
+              var colCbPrev = signColor(st.cb_im1_sign, -1);
+              ctx.save();
+              ctx.fillStyle = pal.panel;
+              ctx.beginPath();
+              ctx.ellipse(scx, yCbPrev, 8.5, 4.5, 0, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.strokeStyle = colCbPrev;
+              ctx.lineWidth = 1.6;
+              ctx.setLineDash([3, 2]);
+              ctx.stroke();
+              ctx.restore();
+              addSpot(scx, yCbPrev, 11, dLbl + " CB(i-1) [" + pLbl + "]: " + st.cb_im1.toFixed(1) + " ppm (" + signLabel(st.cb_im1_sign, -1) + ", seq)", ["Phase: " + signLabel(st.cb_im1_sign, -1) + " (hollow ring)", "Sequential link from " + pLbl + " CB(i)"], st.seq_id);
+            }
+
+            if (typeof st.ca_i === "number") {
+              var yCa = mapCy(st.ca_i);
+              var colCa = signColor(st.ca_i_sign, 1);
+              var sgnCa = signLabel(st.ca_i_sign, 1);
+              ctx.strokeStyle = colCa;
+              ctx.lineWidth = 1.8;
+              ctx.beginPath();
+              ctx.ellipse(scx, yCa, 11, 5.5, 0, 0, Math.PI * 2);
+              ctx.stroke();
+              ctx.beginPath();
+              ctx.ellipse(scx, yCa, 6, 3.0, 0, 0, Math.PI * 2);
+              ctx.stroke();
+              ctx.fillStyle = colCa;
+              ctx.beginPath();
+              ctx.arc(scx, yCa, 2.8, 0, Math.PI * 2);
+              ctx.fill();
+              var glyNote = dLbl === "Gly10"
+                ? "Non-CT HNCACB (2*d28=7.2ms): Gly10 CA is +1 and CB is absent (CT 2T=28ms inverts Gly CH2 to -1)"
+                : "Intra-residue CA (" + pulseRegime.split(":")[0] + ")";
+              addSpot(scx, yCa, 12, dLbl + " CA(i): " + st.ca_i.toFixed(1) + " ppm (" + sgnCa + ", intra)", ["Phase: " + sgnCa + " sampled from 3D HNCACB trace", glyNote], st.seq_id);
+            }
+
+            if (typeof st.cb_i === "number") {
+              var yCb = mapCy(st.cb_i);
+              var colCb = signColor(st.cb_i_sign, -1);
+              var sgnCb = signLabel(st.cb_i_sign, -1);
+              var invNote = (typeof st.ca_i === "number" && st.cb_i > st.ca_i) ? ", CB>CA" : "";
+              ctx.strokeStyle = colCb;
+              ctx.lineWidth = 1.8;
+              ctx.beginPath();
+              ctx.ellipse(scx, yCb, 11, 5.5, 0, 0, Math.PI * 2);
+              ctx.stroke();
+              ctx.beginPath();
+              ctx.ellipse(scx, yCb, 6, 3.0, 0, 0, Math.PI * 2);
+              ctx.stroke();
+              ctx.fillStyle = colCb;
+              ctx.beginPath();
+              ctx.arc(scx, yCb, 2.8, 0, Math.PI * 2);
+              ctx.fill();
+              addSpot(scx, yCb, 12, dLbl + " CB(i): " + st.cb_i.toFixed(1) + " ppm (" + sgnCb + ", intra" + invNote + ")", ["Phase: " + sgnCb + " sampled from 3D HNCACB trace", invNote ? "Thr/Ser hydroxyl downfield CB > CA" : "Intra-residue CB"], st.seq_id);
+            }
           }
-        }
-      } else if (chIdx === 2) {
-        drawCardTitle(ctx, padX, padY - 12, "evo-graph vs standard SA vs bayes-sa Convergence & Cv(T)", "Synthetic UBQ 98.4% · Dev CISD3 64.38% (100% HC) · Cold evo-graph 88.25-95.30% (FAILS >=94%; withdrawn)", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Annealing Progress (1/T)", "Accuracy / Normalized Cv(T)", pal);
-        var cvVals = (payload && Array.isArray(payload.cv_vals) && payload.cv_vals.length > 3) ? payload.cv_vals : null;
-        var cvTemps = (payload && Array.isArray(payload.cv_temps) && payload.cv_temps.length === (cvVals ? cvVals.length : 0)) ? payload.cv_temps : null;
-        if (cvVals) {
-          var maxCv = 1e-9;
-          for (var ci = 0; ci < cvVals.length; ci++) maxCv = Math.max(maxCv, cvVals[ci]);
+        } else if (chIdx === 2) {
+          var cvVals = reqArr("cv_vals", 4);
+          var cvTemps = reqArr("cv_temps", 4);
+          var meanE = reqArr("mean_energies", 4);
+          var tCrit = reqNum("t_crit");
+          var maxCv = reqNum("max_cv");
+          var evoAcc = reqNum("evo_acc_pct");
+          var bayesAcc = reqNum("bayes_acc_pct");
+          var stdAcc = reqNum("std_acc_pct");
+          var ubqReal = reqNum("benchmarks.ubiquitin_realistic_pct");
+          var cisd3Acc = reqNum("benchmarks.cisd3_acc_pct");
+          if (!cvVals || !cvTemps || !meanE || tCrit === null || maxCv === null || evoAcc === null || bayesAcc === null || stdAcc === null || ubqReal === null || cisd3Acc === null) {
+            drawFallbackPlaceholder("Module 02 Ch 3: Solver Cv(T) & Benchmark Trajectory");
+            return;
+          }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "Replica-Exchange bayes-sa Cv(T), Mean Energy & Solver Coverage",
+            "T_crit=" + tCrit.toFixed(2) + " (max Cv=" + maxCv.toFixed(1) + ") · Synthetic UBQ " + ubqReal.toFixed(1) + "% · Dev CISD3 " + cisd3Acc.toFixed(2) + "%",
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Cooling Stage (High T -> Low T)", "Normalized Cv(T) / Energy / Assigned %", pal);
+          var cvPeak = 1e-9;
+          for (var ci = 0; ci < cvVals.length; ci++) cvPeak = Math.max(cvPeak, cvVals[ci]);
           ctx.strokeStyle = pal.violet;
-          ctx.lineWidth = 1.8;
-          ctx.setLineDash([4, 3]);
+          ctx.lineWidth = 2.2;
           ctx.beginPath();
           for (var ci = 0; ci < cvVals.length; ci++) {
             var u = ci / (cvVals.length - 1);
             var sx = padX + u * pw;
-            var sy = padY + ph - 10 - (cvVals[ci] / maxCv) * 0.85 * (ph - 28);
+            var sy = padY + ph - 10 - (cvVals[ci] / cvPeak) * 0.82 * (ph - 28);
             if (ci === 0) ctx.moveTo(sx, sy);
             else ctx.lineTo(sx, sy);
-            if (cvVals[ci] === maxCv && cvTemps) {
-              addSpot(sx, sy, 14, "Heat-Capacity Peak Cv(T_crit)", ["T_crit: " + cvTemps[ci].toFixed(2), "Cv: " + cvVals[ci].toFixed(1)]);
+            if (cvVals[ci] === cvPeak) {
+              addSpot(sx, sy, 14, "Heat-Capacity Peak Cv(T_crit)", ["T = " + cvTemps[ci].toFixed(3), "Cv = " + cvVals[ci].toFixed(2)]);
             }
           }
           ctx.stroke();
-          ctx.setLineDash([]);
-        }
-        var curves = [
-          { col: pal.green, lbl: "evo-graph (withdrawn on cold)", finalV: 0.96 },
-          { col: pal.cyan, lbl: "bayes-sa", finalV: 0.91 },
-          { col: pal.amber, lbl: "standard SA", finalV: 0.85 }
-        ];
-        for (var c = 0; c < curves.length; c++) {
-          ctx.strokeStyle = curves[c].col;
-          ctx.lineWidth = 2.4;
+
+          var eMin = Infinity, eMax = -Infinity;
+          for (var ei = 0; ei < meanE.length; ei++) {
+            eMin = Math.min(eMin, meanE[ei]);
+            eMax = Math.max(eMax, meanE[ei]);
+          }
+          var eSpan = Math.max(1e-6, eMax - eMin);
+          ctx.strokeStyle = pal.cyan;
+          ctx.lineWidth = 2.0;
+          ctx.setLineDash([4, 3]);
           ctx.beginPath();
-          for (var i = 0; i <= 60; i++) {
-            var u = i / 60;
-            var acc = curves[c].finalV * (1 - Math.exp(-4.5 * u));
-            var sx = padX + u * pw;
-            var sy = padY + ph - 10 - acc * (ph - 28);
-            if (i === 0) ctx.moveTo(sx, sy);
-            else ctx.lineTo(sx, sy);
-            if (i === 60) addSpot(sx - 6, sy, 16, curves[c].lbl, ["Final accuracy: " + (curves[c].finalV * 100).toFixed(1) + "%"]);
+          for (var ei = 0; ei < meanE.length; ei++) {
+            var eu = ei / (meanE.length - 1);
+            var ex = padX + eu * pw;
+            var ey = padY + ph - 10 - ((meanE[ei] - eMin) / eSpan) * 0.78 * (ph - 28);
+            if (ei === 0) ctx.moveTo(ex, ey);
+            else ctx.lineTo(ex, ey);
           }
           ctx.stroke();
-        }
-      } else {
-        drawCardTitle(ctx, padX, padY - 12, "76-Residue Ubiquitin Confidence Ribbon (>= 0.80 HC Tier)", "Focus residue #" + focusRes, pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue 1..76", "Posterior Confidence", pal);
-        var threshY = padY + 12 + (1 - 0.8) * (ph - 24);
-        ctx.strokeStyle = pal.amber;
-        ctx.setLineDash([5, 4]);
-        ctx.beginPath();
-        ctx.moveTo(padX, threshY);
-        ctx.lineTo(padX + pw, threshY);
-        ctx.stroke();
-        ctx.setLineDash([]);
-        var confArr = (payload && Array.isArray(payload.res_confidences) && payload.res_confidences.length >= 76) ? payload.res_confidences : null;
-        for (var r = 1; r <= 76; r++) {
-          var conf = confArr ? confArr[r - 1] : ((r === 24 || r === 53) ? 0.64 : (0.86 + 0.13 * Math.abs(Math.sin(r * 0.43))));
-          var bx = padX + ((r - 1) / 76) * pw;
-          var bw = Math.max(2, pw / 86);
-          var bh = Math.max(2, conf * (ph - 24));
-          var by = padY + ph - 12 - bh;
-          ctx.fillStyle = (r === focusRes) ? pal.amber : (conf >= 0.8 ? pal.green : pal.coral);
-          ctx.fillRect(bx, by, bw, bh);
-          if (r % 5 === 0 || r === focusRes) {
-            addSpot(bx + bw / 2, by, 10, "Residue " + r, ["Confidence: " + (conf * 100).toFixed(1) + "%"], r <= 10 ? r : focusRes);
+          ctx.setLineDash([]);
+
+          var solverBars = [
+            { lbl: "evo-graph", pct: evoAcc, col: pal.green },
+            { lbl: "bayes-sa", pct: bayesAcc, col: pal.teal },
+            { lbl: "standard SA", pct: stdAcc, col: pal.amber }
+          ];
+          for (var sb = 0; sb < solverBars.length; sb++) {
+            var barY = padY + 22 + sb * 22;
+            var barW = clamp(solverBars[sb].pct / 100.0, 0.05, 1.0) * (pw * 0.34);
+            var barX = padX + pw * 0.62;
+            ctx.fillStyle = solverBars[sb].col;
+            ctx.fillRect(barX, barY, barW, 13);
+            ctx.fillStyle = pal.text;
+            ctx.font = "600 10.5px ui-monospace, monospace";
+            ctx.fillText(solverBars[sb].lbl + ": " + solverBars[sb].pct.toFixed(1) + "%", barX - 6, barY + 10);
+            addSpot(barX + barW * 0.5, barY + 6, 16, solverBars[sb].lbl + " (this fixture)", ["Assigned non-Pro coverage: " + solverBars[sb].pct.toFixed(1) + "%"]);
+          }
+        } else {
+          var confArr = reqArr("res_confidences", 76);
+          var resLabels = reqArr("res_labels", 76);
+          var qcVerdict = reqStr("qc_verdict");
+          var nHc = reqNum("n_high_conf");
+          if (!confArr || !resLabels || !qcVerdict || nHc === null) {
+            drawFallbackPlaceholder("Module 02 Ch 4: 76-Residue Confidence Ribbon");
+            return;
+          }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "76-Residue Ubiquitin Confidence Ribbon (QC=" + qcVerdict + " · " + nHc + "/76 >= 0.80)",
+            "Focus residue: " + (resLabels[focusRes - 1] || ("#" + focusRes)),
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue 1..76", "Posterior Confidence", pal);
+          var threshY = padY + 12 + (1 - 0.8) * (ph - 24);
+          ctx.strokeStyle = pal.amber;
+          ctx.setLineDash([5, 4]);
+          ctx.beginPath();
+          ctx.moveTo(padX, threshY);
+          ctx.lineTo(padX + pw, threshY);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          for (var r = 1; r <= confArr.length; r++) {
+            var conf = Number(confArr[r - 1]) || 0;
+            var bx = padX + ((r - 1) / confArr.length) * pw;
+            var bw = Math.max(2, pw / 86);
+            var bh = Math.max(2, conf * (ph - 24));
+            var by = padY + ph - 12 - bh;
+            ctx.fillStyle = (r === focusRes) ? pal.amber : (conf >= 0.8 ? pal.green : pal.coral);
+            ctx.fillRect(bx, by, bw, bh);
+            if (r % 5 === 0 || r === focusRes) {
+              addSpot(bx + bw / 2, by, 10, resLabels[r - 1] || ("Residue " + r), ["Confidence: " + (conf * 100).toFixed(1) + "%", "QC verdict: " + qcVerdict], r <= 10 ? r : focusRes);
+            }
           }
         }
-      }
-      return;
-    }
-
-    if (modIdx === 3) {
-      // Module 03: 1UBQ 3D Backbone, NOEs, RDC, S^2 orbit
-      var orbitDeg = clamp(ctrlVal, 0, 360);
-      var yaw = (orbitDeg * Math.PI) / 180.0;
-      var pitch = (state && typeof state.pitchRad === "number") ? state.pitchRad : 0.35;
-      var rawCa = (payload && Array.isArray(payload.ca_coords) && payload.ca_coords.length >= 10) ? payload.ca_coords : null;
-      var rawSs = (payload && Array.isArray(payload.ss_classes)) ? payload.ss_classes : null;
-      var rawS2 = (payload && Array.isArray(payload.s2_vals)) ? payload.s2_vals : null;
-      var coords = [];
-      if (rawCa) {
-        var cx0 = 0, cy0 = 0, cz0 = 0;
-        for (var i = 0; i < rawCa.length; i++) {
-          cx0 += rawCa[i][0]; cy0 += rawCa[i][1]; cz0 += rawCa[i][2];
-        }
-        cx0 /= rawCa.length; cy0 /= rawCa.length; cz0 /= rawCa.length;
-        var maxR = 1e-6;
-        for (var i = 0; i < rawCa.length; i++) {
-          var dx = rawCa[i][0] - cx0, dy = rawCa[i][1] - cy0, dz = rawCa[i][2] - cz0;
-          maxR = Math.max(maxR, Math.sqrt(dx * dx + dy * dy + dz * dz));
-        }
-        for (var i = 0; i < rawCa.length; i++) {
-          var ssCode = rawSs && rawSs[i] !== undefined ? rawSs[i] : 0;
-          var ssName = ssCode === 1 ? "helix" : (ssCode === 2 ? "sheet" : "coil");
-          var s2Val = rawS2 && typeof rawS2[i] === "number" ? rawS2[i] : 0.84;
-          coords.push({
-            x: (rawCa[i][0] - cx0) / maxR,
-            y: (rawCa[i][1] - cy0) / maxR,
-            z: (rawCa[i][2] - cz0) / maxR,
-            ss: ssName,
-            s2: s2Val
-          });
-        }
-      } else {
-        var nMock = 48;
-        for (var i = 0; i < nMock; i++) {
-          var u = i / (nMock - 1);
-          var ang = u * Math.PI * 5.2;
-          var rad = 0.55 + 0.35 * Math.sin(u * Math.PI * 2);
-          coords.push({
-            x: rad * Math.cos(ang),
-            y: (u - 0.5) * 2.1,
-            z: rad * Math.sin(ang),
-            ss: i < 16 ? "sheet" : (i < 32 ? "helix" : "coil"),
-            s2: 0.86 - (i > 41 ? (i - 41) * 0.08 : 0)
-          });
-        }
-      }
-      var nRes = coords.length;
-      function proj(pt) {
-        var cx = Math.cos(yaw), sx = Math.sin(yaw);
-        var cp = Math.cos(pitch), sp = Math.sin(pitch);
-        var x1 = pt.x * cx - pt.z * sx;
-        var z1 = pt.x * sx + pt.z * cx;
-        var y2 = pt.y * cp - z1 * sp;
-        var z2 = pt.y * sp + z1 * cp;
-        var scale = Math.min(pw, ph) * (rawCa ? 0.98 : 0.42) / (2.8 - z2 * 0.35);
-        return { x: w * 0.5 + x1 * scale, y: padY + ph * 0.50 + y2 * scale, z: z2 };
+        return;
       }
 
-      if (chIdx === 2) {
-        var qfTxt = (payload && typeof payload.q_free === "number") ? ("Q_free=" + payload.q_free.toFixed(3) + " · ") : "";
-        drawCardTitle(ctx, padX, padY - 12, "Saupe Alignment Tensor & N-H RDC D_obs vs D_calc", qfTxt + "F8 Disclosed: Unseen 1KHM->1ZZK 1.86-4.14 A (0/5 < 1.80 A)", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "D_calc (Hz)", "D_obs (Hz)", pal);
-        ctx.strokeStyle = pal.amber;
-        ctx.setLineDash([5, 4]);
-        ctx.beginPath();
-        ctx.moveTo(padX + 12, padY + ph - 14);
-        ctx.lineTo(padX + pw - 12, padY + 18);
-        ctx.stroke();
-        ctx.setLineDash([]);
-        var rdcPts = (payload && Array.isArray(payload.rdc_points) && payload.rdc_points.length > 4) ? payload.rdc_points : null;
-        if (rdcPts) {
+      if (modIdx === 3) {
+        var orbitDeg = clamp(ctrlVal, 0, 360);
+        var yaw = (orbitDeg * Math.PI) / 180.0;
+        var pitch = (state && typeof state.pitchRad === "number") ? state.pitchRad : 0.35;
+        if (chIdx === 2) {
+          var rdcPts = reqArr("rdc_points", 8);
+          var qWork = reqNum("q_work");
+          var qFree = reqNum("q_free");
+          var f8Note = reqStr("f8_holdout_note");
+          if (!rdcPts || qWork === null || qFree === null || !f8Note) {
+            drawFallbackPlaceholder("Module 03 Ch 3: Saupe Alignment Tensor & RDC Q_free");
+            return;
+          }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "Saupe Alignment Tensor & N-H RDC D_obs vs D_calc",
+            "Q_work=" + qWork.toFixed(3) + " · Q_free=" + qFree.toFixed(3) + " · " + f8Note,
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "D_calc (Hz)", "D_obs (Hz)", pal);
+          ctx.strokeStyle = pal.amber;
+          ctx.setLineDash([5, 4]);
+          ctx.beginPath();
+          ctx.moveTo(padX + 12, padY + ph - 14);
+          ctx.lineTo(padX + pw - 12, padY + 18);
+          ctx.stroke();
+          ctx.setLineDash([]);
           var maxD = 16.0;
           for (var i = 0; i < rdcPts.length; i++) {
             maxD = Math.max(maxD, Math.abs(rdcPts[i].d_calc || 0), Math.abs(rdcPts[i].d_obs || 0));
@@ -2398,55 +2515,72 @@ TOURS_PLAYER_JS = r"""(function () {
             ctx.beginPath();
             ctx.arc(sx, sy, rp.is_free ? 4.8 : 3.8, 0, Math.PI * 2);
             ctx.fill();
-            addSpot(sx, sy, 10, (rp.is_free ? "Q_free" : "Q_work") + " Res #" + rp.seq_id, ["D_calc: " + rp.d_calc.toFixed(1) + " Hz", "D_obs: " + rp.d_obs.toFixed(1) + " Hz"]);
+            addSpot(sx, sy, 10, (rp.is_free ? "Q_free" : "Q_work") + " Res #" + rp.seq_id, ["D_calc: " + rp.d_calc.toFixed(2) + " Hz", "D_obs: " + rp.d_obs.toFixed(2) + " Hz"]);
           }
-        } else {
-          for (var i = 0; i < 28; i++) {
-            var dc = -14 + i * 1.05;
-            var dobs = dc + Math.sin(i * 1.7) * 1.6;
-            var sx = padX + ((dc + 16) / 32) * pw;
-            var sy = padY + ph - 12 - ((dobs + 16) / 32) * (ph - 24);
-            ctx.fillStyle = (i % 5 === 0) ? pal.coral : pal.cyan;
-            ctx.beginPath();
-            ctx.arc(sx, sy, 4.5, 0, Math.PI * 2);
-            ctx.fill();
-            addSpot(sx, sy, 12, "RDC #" + (i + 1), ["D_calc: " + dc.toFixed(1) + " Hz", "D_obs: " + dobs.toFixed(1) + " Hz"]);
-          }
+          return;
         }
-      } else {
+
+        var rawCa = reqArr("ca_coords", 10);
+        var rawSs = reqArr("ss_classes", 10);
+        var rawS2 = reqArr("s2_vals", 10);
+        var f8Sub = reqStr("f8_holdout_note");
+        var noePairs = chIdx === 1 ? reqArr("noe_pairs", 4) : null;
+        if (!rawCa || !rawSs || !rawS2 || !f8Sub || (chIdx === 1 && !noePairs)) {
+          drawFallbackPlaceholder("Module 03: 1UBQ 3D Coordinates & NOE/S^2 Projection");
+          return;
+        }
+        var cx0 = 0, cy0 = 0, cz0 = 0;
+        for (var i = 0; i < rawCa.length; i++) {
+          cx0 += rawCa[i][0]; cy0 += rawCa[i][1]; cz0 += rawCa[i][2];
+        }
+        cx0 /= rawCa.length; cy0 /= rawCa.length; cz0 /= rawCa.length;
+        var maxR = 1e-6;
+        for (var i = 0; i < rawCa.length; i++) {
+          var dx = rawCa[i][0] - cx0, dy = rawCa[i][1] - cy0, dz = rawCa[i][2] - cz0;
+          maxR = Math.max(maxR, Math.sqrt(dx * dx + dy * dy + dz * dz));
+        }
+        var coords = [];
+        for (var i = 0; i < rawCa.length; i++) {
+          var ssCode = rawSs[i] !== undefined ? rawSs[i] : 0;
+          var ssName = ssCode === 1 ? "helix" : (ssCode === 2 ? "sheet" : "coil");
+          coords.push({
+            x: (rawCa[i][0] - cx0) / maxR,
+            y: (rawCa[i][1] - cy0) / maxR,
+            z: (rawCa[i][2] - cz0) / maxR,
+            ss: ssName,
+            s2: typeof rawS2[i] === "number" ? rawS2[i] : 0.84
+          });
+        }
+        function proj(pt) {
+          var cx = Math.cos(yaw), sx = Math.sin(yaw);
+          var cp = Math.cos(pitch), sp = Math.sin(pitch);
+          var x1 = pt.x * cx - pt.z * sx;
+          var z1 = pt.x * sx + pt.z * cx;
+          var y2 = pt.y * cp - z1 * sp;
+          var z2 = pt.y * sp + z1 * cp;
+          var scale = Math.min(pw, ph) * 0.98 / (2.8 - z2 * 0.35);
+          return { x: w * 0.5 + x1 * scale, y: padY + ph * 0.50 + y2 * scale, z: z2 };
+        }
         var titleStr = chIdx === 0
           ? "1UBQ 3D Backbone CA Trace (Drag Canvas to Orbit · " + Math.round(orbitDeg) + " deg)"
-          : (chIdx === 1 ? "Long-Range 1H-1H NOE Cylinders + Homolog-Free Torsions (<=25%)" : "1UBQ S^2 Putty Projection · 360 deg Orbit (" + Math.round(orbitDeg) + " deg)");
-        var f8Sub = (payload && payload.f8_holdout_note) ? payload.f8_holdout_note : "F8 Unseen 1KHM->1ZZK holdout disclosed (0/5 < 1.80 A)";
+          : (chIdx === 1 ? "Long-Range 1H-1H NOE Cylinders (" + noePairs.length + " pairs) + <=25% Firewall" : "1UBQ S^2 Putty Projection · 360 deg Orbit (" + Math.round(orbitDeg) + " deg)");
         drawCardTitle(ctx, padX, padY - 12, titleStr, f8Sub, pal);
         var projected = coords.map(function (c, idx) {
           var p = proj(c);
           return { x: p.x, y: p.y, z: p.z, ss: c.ss, s2: c.s2, idx: idx + 1 };
         });
-        if (chIdx === 1) {
+        if (chIdx === 1 && noePairs) {
           ctx.strokeStyle = "rgba(251, 191, 36, 0.55)";
           ctx.setLineDash([4, 3]);
           ctx.lineWidth = 1.5;
-          var noePairs = (payload && Array.isArray(payload.noe_pairs) && payload.noe_pairs.length) ? payload.noe_pairs : null;
-          if (noePairs) {
-            for (var k = 0; k < noePairs.length; k++) {
-              var np = noePairs[k];
-              var pa = projected[clamp(np.a || 0, 0, nRes - 1)];
-              var pb = projected[clamp(np.b || 0, 0, nRes - 1)];
-              ctx.beginPath();
-              ctx.moveTo(pa.x, pa.y);
-              ctx.lineTo(pb.x, pb.y);
-              ctx.stroke();
-            }
-          } else {
-            for (var k = 0; k < 10; k++) {
-              var a = projected[(k * 3) % nRes];
-              var b = projected[(k * 3 + 19) % nRes];
-              ctx.beginPath();
-              ctx.moveTo(a.x, a.y);
-              ctx.lineTo(b.x, b.y);
-              ctx.stroke();
-            }
+          for (var k = 0; k < noePairs.length; k++) {
+            var np = noePairs[k];
+            var pa = projected[clamp(np.a || 0, 0, projected.length - 1)];
+            var pb = projected[clamp(np.b || 0, 0, projected.length - 1)];
+            ctx.beginPath();
+            ctx.moveTo(pa.x, pa.y);
+            ctx.lineTo(pb.x, pb.y);
+            ctx.stroke();
           }
           ctx.setLineDash([]);
         }
@@ -2470,515 +2604,1026 @@ TOURS_PLAYER_JS = r"""(function () {
             addSpot(pt.x, pt.y, 11, "1UBQ CA #" + pt.idx, ["Secondary: " + pt.ss, "S^2: " + pt.s2.toFixed(2)]);
           }
         }
+        return;
       }
-      return;
-    }
 
-    if (modIdx === 4) {
-      // Module 04: Pseudo-3D, Dual-field R1/R2, R2/R1 tau_m, Lipari-Szabo S^2
-      var resSeq = Math.round(clamp(ctrlVal, 1, 76));
-      if (chIdx === 0) {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Pseudo-3D Locked-Footprint Integration (SNR 80 -> 4)", "Unbiased Linear LS vs Naive Local-Max Bias", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "SNR (80 -> 4)", "Relative Bias (%)", pal);
-        for (var i = 0; i < 6; i++) {
-          var bx = padX + (i + 0.5) * (pw / 6);
-          var biasMax = 2.0 + i * 4.8;
-          var biasLs = 0.4 + i * 0.35;
-          ctx.fillStyle = pal.coral;
-          ctx.fillRect(bx - 14, padY + ph - 12 - (biasMax / 32) * (ph - 24), 12, (biasMax / 32) * (ph - 24));
-          ctx.fillStyle = pal.green;
-          ctx.fillRect(bx + 2, padY + ph - 12 - (biasLs / 32) * (ph - 24), 12, (biasLs / 32) * (ph - 24));
-          addSpot(bx, padY + ph * 0.5, 20, "SNR Tier #" + (i + 1), ["Local-Max bias: +" + biasMax.toFixed(1) + "%", "Locked-Footprint LS: +" + biasLs.toFixed(1) + "%"]);
+      if (modIdx === 4) {
+        var resSeq = Math.round(clamp(ctrlVal, 1, 76));
+        if (chIdx === 0) {
+          var snrLevels = reqArr("snr_levels", 3);
+          var lsBias = reqArr("locked_ls_bias_pct", 3);
+          var maxBias = reqArr("local_max_bias_pct", 3);
+          if (!snrLevels || !lsBias || !maxBias) {
+            drawFallbackPlaceholder("Module 04 Ch 1: Locked-Footprint Integration Bias");
+            return;
+          }
+          var nTiers = Math.min(snrLevels.length, lsBias.length, maxBias.length);
+          var topBias = 5.0;
+          for (var i = 0; i < nTiers; i++) {
+            topBias = Math.max(topBias, Math.abs(lsBias[i]), Math.abs(maxBias[i]));
+          }
+          var lastIdx = nTiers - 1;
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: Pseudo-3D Locked-Footprint Integration (SNR " + snrLevels[0] + " -> " + snrLevels[lastIdx] + ")",
+            "SNR=" + snrLevels[lastIdx] + " bias: Locked LS " + lsBias[lastIdx].toFixed(2) + "% vs Local-Max +" + maxBias[lastIdx].toFixed(1) + "%",
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "SNR Tier (" + snrLevels.join(" -> ") + ")", "|Relative Bias| (%)", pal);
+          for (var i = 0; i < nTiers; i++) {
+            var bx = padX + (i + 0.5) * (pw / nTiers);
+            var hMax = (Math.abs(maxBias[i]) / (topBias * 1.12)) * (ph - 24);
+            var hLs = Math.max(2, (Math.abs(lsBias[i]) / (topBias * 1.12)) * (ph - 24));
+            ctx.fillStyle = pal.coral;
+            ctx.fillRect(bx - 14, padY + ph - 12 - hMax, 12, hMax);
+            ctx.fillStyle = pal.green;
+            ctx.fillRect(bx + 2, padY + ph - 12 - hLs, 12, hLs);
+            addSpot(bx, padY + ph * 0.5, 20, "SNR = " + snrLevels[i], ["Local-Max bias: +" + maxBias[i].toFixed(2) + "%", "Locked-Footprint LS: " + lsBias[i].toFixed(2) + "%"]);
+          }
+        } else if (chIdx === 1) {
+          var timesR1 = reqArr("times_r1", 4);
+          var c600 = reqArr("curve_600_r1", 4);
+          var c800 = reqArr("curve_800_r1", 4);
+          var r600 = reqNum("fit_600_rate");
+          var se600 = reqNum("fit_600_se");
+          var r800 = reqNum("fit_800_rate");
+          var se800 = reqNum("fit_800_se");
+          if (!timesR1 || !c600 || !c800 || r600 === null || se600 === null || r800 === null || se800 === null) {
+            drawFallbackPlaceholder("Module 04 Ch 2: Dual-Field Exponential Decay Fit");
+            return;
+          }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: Dual-Field 600 & 800 MHz R1 Decay Fit (Ile23)",
+            "600 MHz R1=" + r600.toFixed(2) + "+-" + se600.toFixed(2) + " s^-1 · 800 MHz R1=" + r800.toFixed(2) + "+-" + se800.toFixed(2) + " s^-1",
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Relaxation Delay T (s)", "Intensity I(T)", pal);
+          var tMax = Math.max(0.1, timesR1[timesR1.length - 1]);
+          var iMax = 1e-6;
+          for (var k = 0; k < c600.length; k++) iMax = Math.max(iMax, c600[k], c800[k] || 0);
+          var fitSeries = [
+            { col: pal.cyan, rate: r600, se: se600, obs: c600, i0: c600[0] * Math.exp(r600 * timesR1[0]), lbl: "600 MHz" },
+            { col: pal.amber, rate: r800, se: se800, obs: c800, i0: c800[0] * Math.exp(r800 * timesR1[0]), lbl: "800 MHz" }
+          ];
+          for (var fi = 0; fi < fitSeries.length; fi++) {
+            var fs = fitSeries[fi];
+            ctx.strokeStyle = fs.col;
+            ctx.lineWidth = 2.2;
+            ctx.beginPath();
+            for (var j = 0; j <= 48; j++) {
+              var tSecVal = (j / 48) * tMax;
+              var yFit = fs.i0 * Math.exp(-fs.rate * tSecVal);
+              var sx = padX + (tSecVal / tMax) * pw;
+              var sy = padY + ph - 12 - clamp(yFit / (iMax * 1.05), 0, 1) * (ph - 26);
+              if (j === 0) ctx.moveTo(sx, sy);
+              else ctx.lineTo(sx, sy);
+            }
+            ctx.stroke();
+            for (var p = 0; p < timesR1.length && p < fs.obs.length; p++) {
+              var px = padX + (timesR1[p] / tMax) * pw;
+              var py = padY + ph - 12 - clamp(fs.obs[p] / (iMax * 1.05), 0, 1) * (ph - 26);
+              ctx.fillStyle = fs.col;
+              ctx.fillRect(px - 3.5, py - 3.5, 7, 7);
+              addSpot(px, py, 12, fs.lbl + " @ T=" + timesR1[p].toFixed(2) + " s", ["Observed I(T): " + fs.obs[p].toFixed(2), "Fitted R1: " + fs.rate.toFixed(3) + " +- " + fs.se.toFixed(3) + " s^-1"]);
+            }
+          }
+        } else if (chIdx === 2) {
+          var seqIds = reqArr("seq_ids", 10);
+          var ratios = reqArr("r2_over_r1", 10);
+          var tauM = reqNum("tau_m_ns");
+          var dParPerp = reqNum("d_par_perp");
+          if (!seqIds || !ratios || tauM === null || dParPerp === null) {
+            drawFallbackPlaceholder("Module 04 Ch 3: Kay-Torchia-Bax R2/R1 & tau_m");
+            return;
+          }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: R2/R1 Global Tumbling tau_m = " + tauM.toFixed(2) + " ns (Inspect Res #" + resSeq + ")",
+            "Woessner axial D_par/D_perp = " + dParPerp.toFixed(2) + " · 10% outlier-trimmed rigid core",
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue Sequence (1..76)", "600 MHz R2 / R1", pal);
+          var maxRatio = 1.0;
+          var sortedR = ratios.slice().sort(function (a, b) { return a - b; });
+          var medRatio = sortedR[Math.floor(sortedR.length * 0.5)] || 1.0;
+          for (var i = 0; i < ratios.length; i++) maxRatio = Math.max(maxRatio, ratios[i]);
+          var coreY = padY + ph - 12 - clamp(medRatio / (maxRatio * 1.12), 0, 1) * (ph - 26);
+          ctx.strokeStyle = pal.teal;
+          ctx.setLineDash([5, 4]);
+          ctx.beginPath();
+          ctx.moveTo(padX, coreY);
+          ctx.lineTo(padX + pw, coreY);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          for (var i = 0; i < seqIds.length && i < ratios.length; i++) {
+            var rId = seqIds[i];
+            var ratio = ratios[i];
+            var sx = padX + ((rId - 0.5) / 76) * pw;
+            var sy = padY + ph - 12 - clamp(ratio / (maxRatio * 1.12), 0, 1) * (ph - 26);
+            var isSel = rId === resSeq;
+            var isOutlier = ratio > medRatio * 1.22;
+            ctx.fillStyle = isSel ? pal.amber : (isOutlier ? pal.coral : (rId >= 72 ? pal.violet : pal.teal));
+            ctx.beginPath();
+            ctx.arc(sx, sy, isSel ? 6 : 3.5, 0, Math.PI * 2);
+            ctx.fill();
+            addSpot(sx, sy, 10, "Res #" + rId, ["R2/R1: " + ratio.toFixed(2), "tau_m = " + tauM.toFixed(2) + " ns"], rId);
+          }
+        } else {
+          var seqIds = reqArr("seq_ids", 10);
+          var s2Vals = reqArr("s2_vals", 10);
+          var rexVals = reqArr("rex_vals", 10);
+          var modelIds = reqArr("model_ids", 10);
+          if (!seqIds || !s2Vals || !rexVals || !modelIds) {
+            drawFallbackPlaceholder("Module 04 Ch 4: Lipari-Szabo M1-M5 S^2 Profile");
+            return;
+          }
+          var nRex = 0;
+          for (var k = 0; k < rexVals.length; k++) { if (rexVals[k] > 0.5) nRex++; }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: Lipari-Szabo M1-M5 S^2 Profile (Inspect Res #" + resSeq + ")",
+            seqIds.length + " fitted non-Pro residues · " + nRex + " chemical-exchange (R_ex > 0.5 s^-1) sites",
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue Sequence (1..76)", "Order Parameter S^2", pal);
+          for (var i = 0; i < seqIds.length && i < s2Vals.length; i++) {
+            var rId = seqIds[i];
+            var s2 = s2Vals[i];
+            var rex = rexVals[i] || 0;
+            var mdl = modelIds[i] || "M1";
+            var sx = padX + ((rId - 0.5) / 76) * pw;
+            var sy = padY + 14 + (1 - clamp(s2, 0, 1)) * (ph - 28);
+            var isSel = rId === resSeq;
+            ctx.fillStyle = isSel ? pal.amber : (rex > 0.5 ? pal.coral : pal.cyan);
+            ctx.beginPath();
+            ctx.arc(sx, sy, isSel ? 6 : 3.5, 0, Math.PI * 2);
+            ctx.fill();
+            addSpot(sx, sy, 10, "Res #" + rId + " (" + mdl + ")", ["S^2: " + s2.toFixed(3), "R_ex: " + rex.toFixed(2) + " s^-1"], rId);
+          }
         }
-      } else if (chIdx === 1) {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Dual-Field 600 & 800 MHz R1/R2 Decay (Res #" + resSeq + ")", "MC bootstrap 1000x error bars", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Relaxation Delay (ms)", "I(t) / I(0)", pal);
-        var r2 = resSeq === 23 ? 16.5 : (resSeq > 70 ? 4.2 : 9.8);
-        var fields = [{ col: pal.cyan, f: 1.0, lbl: "600 MHz" }, { col: pal.amber, f: 1.18, lbl: "800 MHz" }];
-        for (var fi = 0; fi < fields.length; fi++) {
-          ctx.strokeStyle = fields[fi].col;
+        return;
+      }
+
+      if (modIdx === 5) {
+        var ligUm = clamp(ctrlVal, 0, 300);
+        if (chIdx === 0) {
+          var offsets = reqArr("cest.offsets_ppm", 8);
+          var obs15 = reqArr("cest.b1_15hz_obs", 8);
+          var fit15 = reqArr("cest.b1_15hz_fit", 8);
+          var obs30 = reqArr("cest.b1_30hz_obs", 8);
+          var fit30 = reqArr("cest.b1_30hz_fit", 8);
+          var pB = reqNum("cest.p_b");
+          var kEx = reqNum("cest.k_ex_s_inv");
+          var majPpm = reqNum("cest.major_ppm");
+          var dwPpm = reqNum("cest.dw_ab_ppm");
+          if (!offsets || !obs15 || !fit15 || !obs30 || !fit30 || pB === null || kEx === null || majPpm === null || dwPpm === null) {
+            drawFallbackPlaceholder("Module 05 Ch 1: CEST Saturation Sweep");
+            return;
+          }
+          var minOff = offsets[0], maxOff = offsets[offsets.length - 1];
+          var spanOff = Math.max(1e-6, maxOff - minOff);
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: Higham [6/6] Pade 15N CEST Sweep (B1 = 15 & 30 Hz)",
+            "Fitted pB=" + (pB * 100).toFixed(2) + "% · k_ex=" + kEx.toFixed(0) + " s^-1 · major=" + majPpm.toFixed(2) + " ppm · dw=+" + dwPpm.toFixed(2) + " ppm",
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "15N B1 Offset (" + minOff.toFixed(1) + ".." + maxOff.toFixed(1) + " ppm)", "I / I0", pal);
+          var cestCurves = [
+            { col: pal.cyan, fit: fit15, obs: obs15, lbl: "15 Hz B1" },
+            { col: pal.amber, fit: fit30, obs: obs30, lbl: "30 Hz B1" }
+          ];
+          for (var b = 0; b < cestCurves.length; b++) {
+            var cc = cestCurves[b];
+            ctx.strokeStyle = cc.col;
+            ctx.lineWidth = 2.1;
+            ctx.beginPath();
+            for (var i = 0; i < offsets.length && i < cc.fit.length; i++) {
+              var sx = padX + ((offsets[i] - minOff) / spanOff) * pw;
+              var sy = padY + 14 + (1 - clamp(cc.fit[i], 0, 1.05)) * (ph - 28);
+              if (i === 0) ctx.moveTo(sx, sy);
+              else ctx.lineTo(sx, sy);
+            }
+            ctx.stroke();
+            for (var i = 0; i < offsets.length && i < cc.obs.length; i += 2) {
+              var ox = padX + ((offsets[i] - minOff) / spanOff) * pw;
+              var oy = padY + 14 + (1 - clamp(cc.obs[i], 0, 1.05)) * (ph - 28);
+              ctx.fillStyle = cc.col;
+              ctx.beginPath();
+              ctx.arc(ox, oy, 2.6, 0, Math.PI * 2);
+              ctx.fill();
+              if (Math.abs(offsets[i] - (majPpm + dwPpm)) < 0.25) {
+                addSpot(ox, oy, 15, "Minor State Dip (" + cc.lbl + ")", ["Offset: " + offsets[i].toFixed(2) + " ppm", "I/I0: " + cc.obs[i].toFixed(3)]);
+              }
+            }
+          }
+        } else if (chIdx === 1) {
+          var nuHz = reqArr("cpmg.nu_hz", 4);
+          var r600 = reqArr("cpmg.r2_600_obs", 4);
+          var r800 = reqArr("cpmg.r2_800_obs", 4);
+          var cPb = reqNum("cpmg.p_b");
+          var cKex = reqNum("cpmg.k_ex_s_inv");
+          var dAicc = reqNum("cpmg.delta_aicc");
+          if (!nuHz || !r600 || !r800 || cPb === null || cKex === null || dAicc === null) {
+            drawFallbackPlaceholder("Module 05 Ch 2: Baldwin CPMG Dispersion");
+            return;
+          }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: Dual-Field Baldwin (2014) CPMG Dispersion & AICc Gate",
+            "Fitted pB=" + (cPb * 100).toFixed(2) + "% · k_ex=" + cKex.toFixed(0) + " s^-1 · delta_AICc=" + dAicc.toFixed(1),
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "nu_CPMG (Hz)", "R2,eff (s^-1)", pal);
+          var nuMax = Math.max(100, nuHz[nuHz.length - 1]);
+          var rMin = Infinity, rMax = -Infinity;
+          for (var i = 0; i < r600.length; i++) { rMin = Math.min(rMin, r600[i]); rMax = Math.max(rMax, r600[i]); }
+          for (var i = 0; i < r800.length; i++) { rMin = Math.min(rMin, r800[i]); rMax = Math.max(rMax, r800[i]); }
+          rMin = Math.max(0, rMin - 1.5);
+          rMax = rMax + 1.5;
+          var rSpan = Math.max(1.0, rMax - rMin);
+          var dispSeries = [
+            { col: pal.cyan, arr: r600, lbl: "600 MHz" },
+            { col: pal.coral, arr: r800, lbl: "800 MHz" }
+          ];
+          for (var f = 0; f < dispSeries.length; f++) {
+            var ds = dispSeries[f];
+            ctx.strokeStyle = ds.col;
+            ctx.lineWidth = 2.3;
+            ctx.beginPath();
+            for (var i = 0; i < nuHz.length && i < ds.arr.length; i++) {
+              var sx = padX + (nuHz[i] / nuMax) * pw;
+              var sy = padY + ph - 12 - ((ds.arr[i] - rMin) / rSpan) * (ph - 26);
+              if (i === 0) ctx.moveTo(sx, sy);
+              else ctx.lineTo(sx, sy);
+            }
+            ctx.stroke();
+            for (var i = 0; i < nuHz.length && i < ds.arr.length; i++) {
+              var px = padX + (nuHz[i] / nuMax) * pw;
+              var py = padY + ph - 12 - ((ds.arr[i] - rMin) / rSpan) * (ph - 26);
+              ctx.fillStyle = ds.col;
+              ctx.beginPath();
+              ctx.arc(px, py, 4.2, 0, Math.PI * 2);
+              ctx.fill();
+              addSpot(px, py, 12, ds.lbl + " @ " + nuHz[i].toFixed(0) + " Hz", ["R2,eff: " + ds.arr[i].toFixed(2) + " s^-1", "delta_AICc: " + dAicc.toFixed(1)]);
+            }
+          }
+        } else if (chIdx === 2) {
+          var trajs = reqArr("hsqc_trajectories", 2);
+          if (!trajs) {
+            drawFallbackPlaceholder("Module 05 Ch 3: Hungarian HSQC Titration Trajectories");
+            return;
+          }
+          var hMin = Infinity, hMax = -Infinity, nMin = Infinity, nMax = -Infinity;
+          for (var t = 0; t < trajs.length; t++) {
+            var pts = trajs[t].points || [];
+            for (var p = 0; p < pts.length; p++) {
+              if (typeof pts[p].h_ppm === "number" && typeof pts[p].n_ppm === "number") {
+                hMin = Math.min(hMin, pts[p].h_ppm);
+                hMax = Math.max(hMax, pts[p].h_ppm);
+                nMin = Math.min(nMin, pts[p].n_ppm);
+                nMax = Math.max(nMax, pts[p].n_ppm);
+              }
+            }
+          }
+          hMin -= 0.12; hMax += 0.12; nMin -= 0.8; nMax += 0.8;
+          var hSpan = Math.max(0.2, hMax - hMin);
+          var nSpan = Math.max(1.0, nMax - nMin);
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: Hungarian 2D HSQC Titration Trajectories ([L]t = " + ligUm.toFixed(0) + " uM)",
+            trajs.length + " tracked residues · max observed CSP = " + Number(trajs[0].max_csp || 0).toFixed(3) + " ppm",
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm, " + hMax.toFixed(2) + " -> " + hMin.toFixed(2) + ")", "15N (ppm, " + nMin.toFixed(1) + " -> " + nMax.toFixed(1) + ")", pal);
+          var cols = [pal.cyan, pal.green, pal.amber, pal.violet, pal.coral];
+          for (var t = 0; t < trajs.length; t++) {
+            var tr = trajs[t];
+            var pts = (tr.points || []).filter(function (pt) { return typeof pt.h_ppm === "number" && typeof pt.n_ppm === "number"; });
+            if (!pts.length) continue;
+            var col = cols[t % cols.length];
+            ctx.strokeStyle = col;
+            ctx.lineWidth = 1.8;
+            ctx.setLineDash([4, 3]);
+            ctx.beginPath();
+            var bestPt = pts[0];
+            var bestDiff = Infinity;
+            for (var p = 0; p < pts.length; p++) {
+              var sx = padX + ((hMax - pts[p].h_ppm) / hSpan) * pw;
+              var sy = padY + 14 + ((pts[p].n_ppm - nMin) / nSpan) * (ph - 28);
+              if (p === 0) ctx.moveTo(sx, sy);
+              else ctx.lineTo(sx, sy);
+              var dL = Math.abs((pts[p].ligand_um || 0) - ligUm);
+              if (dL < bestDiff) { bestDiff = dL; bestPt = pts[p]; }
+            }
+            ctx.stroke();
+            ctx.setLineDash([]);
+            var bx = padX + ((hMax - bestPt.h_ppm) / hSpan) * pw;
+            var by = padY + 14 + ((bestPt.n_ppm - nMin) / nSpan) * (ph - 28);
+            ctx.fillStyle = col;
+            ctx.beginPath();
+            ctx.arc(bx, by, 5.8, 0, Math.PI * 2);
+            ctx.fill();
+            var rLbl = String(tr.res_name || "Res") + String(tr.seq_id || "");
+            ctx.fillStyle = pal.text;
+            ctx.font = "600 11px ui-monospace, monospace";
+            ctx.fillText(rLbl, bx + 8, by + 4);
+            addSpot(bx, by, 14, rLbl + " @ [L]=" + Number(bestPt.ligand_um || 0).toFixed(0) + " uM", ["1H: " + bestPt.h_ppm.toFixed(3) + " ppm, 15N: " + bestPt.n_ppm.toFixed(2) + " ppm", "CSP: " + Number(bestPt.csp_ppm || 0).toFixed(3) + " ppm"], Number(bestPt.ligand_um || 0));
+          }
+        } else {
+          var P0 = reqNum("csp_isotherm.protein_conc_um");
+          var kdQuad = reqNum("csp_isotherm.fitted_kd_um");
+          var kdMm = reqNum("csp_isotherm.naive_mm_kd_um");
+          var dMax = reqNum("csp_isotherm.ddelta_max_ppm");
+          var obsPts = reqArr("csp_isotherm.observed_points", 3);
+          if (P0 === null || kdQuad === null || kdMm === null || dMax === null || !obsPts) {
+            drawFallbackPlaceholder("Module 05 Ch 4: Morrison Quadratic vs Naive MM Isotherm");
+            return;
+          }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: Morrison Quadratic (Kd=" + kdQuad.toFixed(2) + " uM, [P]0=" + P0.toFixed(0) + " uM) vs Naive MM (" + kdMm.toFixed(1) + " uM)",
+            "Cursor [L]t = " + ligUm.toFixed(0) + " uM · ddelta_max = " + dMax.toFixed(3) + " ppm",
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "[L] total (0..300 uM)", "CSP (ppm)", pal);
+          var yCeil = Math.max(1e-4, dMax * 1.12);
+          function quadCsp(L) {
+            var b = P0 + L + kdQuad;
+            var frac = (b - Math.sqrt(Math.max(0, b * b - 4 * P0 * L))) / (2 * P0);
+            return dMax * frac;
+          }
+          function mmCsp(L) {
+            return dMax * (L / (kdMm + L));
+          }
+          ctx.strokeStyle = pal.green;
+          ctx.lineWidth = 2.4;
+          ctx.beginPath();
+          for (var i = 0; i <= 60; i++) {
+            var L = i * 5;
+            var sx = padX + (L / 300) * pw;
+            var sy = padY + ph - 12 - clamp(quadCsp(L) / yCeil, 0, 1) * (ph - 24);
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+          }
+          ctx.stroke();
+          ctx.strokeStyle = pal.coral;
+          ctx.setLineDash([5, 4]);
+          ctx.beginPath();
+          for (var i = 0; i <= 60; i++) {
+            var L = i * 5;
+            var sx = padX + (L / 300) * pw;
+            var sy = padY + ph - 12 - clamp(mmCsp(L) / yCeil, 0, 1) * (ph - 24);
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+          }
+          ctx.stroke();
+          ctx.setLineDash([]);
+          for (var p = 0; p < obsPts.length; p++) {
+            var ox = padX + clamp((obsPts[p].ligand_um || 0) / 300, 0, 1) * pw;
+            var oy = padY + ph - 12 - clamp((obsPts[p].csp_ppm || 0) / yCeil, 0, 1) * (ph - 24);
+            ctx.fillStyle = pal.cyan;
+            ctx.beginPath();
+            ctx.arc(ox, oy, 4.5, 0, Math.PI * 2);
+            ctx.fill();
+            addSpot(ox, oy, 12, "Titration Step [L]=" + Number(obsPts[p].ligand_um).toFixed(0) + " uM", ["Observed CSP: " + Number(obsPts[p].csp_ppm).toFixed(3) + " ppm"], Number(obsPts[p].ligand_um));
+          }
+          var cx = padX + (ligUm / 300) * pw;
+          var cyQ = padY + ph - 12 - clamp(quadCsp(ligUm) / yCeil, 0, 1) * (ph - 24);
+          ctx.strokeStyle = pal.amber;
+          ctx.beginPath();
+          ctx.moveTo(cx, padY + 8);
+          ctx.lineTo(cx, padY + ph - 4);
+          ctx.stroke();
+          ctx.fillStyle = pal.amber;
+          ctx.beginPath();
+          ctx.arc(cx, cyQ, 6, 0, Math.PI * 2);
+          ctx.fill();
+          addSpot(cx, cyQ, 18, "Morrison Fit @ " + ligUm.toFixed(0) + " uM", ["Morrison CSP: " + quadCsp(ligUm).toFixed(3) + " ppm", "Naive MM CSP: " + mmCsp(ligUm).toFixed(3) + " ppm"]);
+        }
+        return;
+      }
+
+      if (modIdx === 6) {
+        var atomIdx = Math.round(clamp(ctrlVal, 0, 14));
+        if (chIdx === 0) {
+          var fPpm = reqArr("fid_processing.ppm", 10);
+          var withW = reqArr("fid_processing.with_water", 10);
+          var flat = reqArr("fid_processing.hsvd_flattened", 10);
+          var roll = reqArr("fid_processing.baseline_roll", 10);
+          var vPeaks = reqArr("fid_processing.voigt_peaks", 1);
+          if (!fPpm || !withW || !flat || !roll || !vPeaks) {
+            drawFallbackPlaceholder("Module 06 Ch 1: 1D HSVD & Whittaker Baseline");
+            return;
+          }
+          var pHi = Math.max(fPpm[0], fPpm[fPpm.length - 1]);
+          var pLo = Math.min(fPpm[0], fPpm[fPpm.length - 1]);
+          var pSpan = Math.max(0.1, pHi - pLo);
+          var maxFlat = 1e-6;
+          for (var i = 0; i < flat.length; i++) maxFlat = Math.max(maxFlat, Math.abs(flat[i]), Math.abs(roll[i] || 0));
+          var yCap = maxFlat * 1.45;
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: 1D HSVD Solvent Suppression (4.78 ppm H2O) + Whittaker Baseline",
+            vPeaks.length + " deconvolved Voigt solute components · Coral=pre-HSVD (clipped) · Cyan=HSVD+Whittaker",
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm, " + pHi.toFixed(2) + " -> " + pLo.toFixed(2) + ")", "Intensity", pal);
+          ctx.strokeStyle = pal.coral;
+          ctx.lineWidth = 1.4;
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          for (var i = 0; i < fPpm.length && i < withW.length; i++) {
+            var sx = padX + ((pHi - fPpm[i]) / pSpan) * pw;
+            var sy = padY + ph - 14 - clamp(withW[i] / yCap, -0.05, 1.0) * (ph - 28);
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+          }
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.strokeStyle = pal.cyan;
           ctx.lineWidth = 2.2;
           ctx.beginPath();
-          for (var j = 0; j <= 40; j++) {
-            var tMs = j * 4;
-            var val = Math.exp(-r2 * fields[fi].f * tMs * 0.001);
-            var sx = padX + (j / 40) * pw;
-            var sy = padY + 14 + (1 - val) * (ph - 28);
-            if (j === 0) ctx.moveTo(sx, sy);
+          for (var i = 0; i < fPpm.length && i < flat.length; i++) {
+            var sx = padX + ((pHi - fPpm[i]) / pSpan) * pw;
+            var sy = padY + ph - 14 - clamp(flat[i] / yCap, -0.05, 1.0) * (ph - 28);
+            if (i === 0) ctx.moveTo(sx, sy);
             else ctx.lineTo(sx, sy);
-            if (j % 8 === 0) {
-              ctx.fillStyle = fields[fi].col;
-              ctx.fillRect(sx - 3, sy - 3, 6, 6);
-              addSpot(sx, sy, 12, fields[fi].lbl + " @ " + tMs + " ms", ["I/I0: " + val.toFixed(3), "Res #" + resSeq]);
+          }
+          ctx.stroke();
+          for (var v = 0; v < vPeaks.length; v++) {
+            var vp = vPeaks[v];
+            var vx = padX + clamp((pHi - vp.center_ppm) / pSpan, 0.02, 0.98) * pw;
+            var vy = padY + ph - 14 - clamp((vp.height || 0) / yCap, 0, 1.0) * (ph - 28);
+            ctx.fillStyle = pal.amber;
+            ctx.beginPath();
+            ctx.arc(vx, vy, 4.2, 0, Math.PI * 2);
+            ctx.fill();
+            addSpot(vx, vy, 14, "Voigt Peak " + vp.center_ppm.toFixed(3) + " ppm", ["FWHM: " + Number(vp.fwhm_hz || 0).toFixed(2) + " Hz", "Lorentz frac: " + Number(vp.lorentz_fraction || 0).toFixed(2)]);
+          }
+        } else if (chIdx === 1) {
+          var mPpm = reqArr("multiplet.ppm", 20);
+          var mInt = reqArr("multiplet.intensity", 20);
+          var mClass = reqStr("multiplet.class");
+          var jHz = reqArr("multiplet.j_hz", 1);
+          var acsRep = reqStr("multiplet.acs_report");
+          if (!mPpm || !mInt || !mClass || !jHz || !acsRep) {
+            drawFallbackPlaceholder("Module 06 Ch 2: Recursive Hoye Multiplet Tree");
+            return;
+          }
+          var jStr = jHz.map(function (v) { return Number(v).toFixed(1); }).join(", ");
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: Hoye Multiplet Peeling (" + mClass + ", J = " + jStr + " Hz)",
+            acsRep,
+            pal
+          );
+          var mHi = Math.max(mPpm[0], mPpm[mPpm.length - 1]);
+          var mLo = Math.min(mPpm[0], mPpm[mPpm.length - 1]);
+          var mSpan = Math.max(1e-4, mHi - mLo);
+          var maxM = 1e-6;
+          for (var i = 0; i < mInt.length; i++) maxM = Math.max(maxM, mInt[i]);
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm, " + mHi.toFixed(3) + " -> " + mLo.toFixed(3) + ")", "Intensity", pal);
+          ctx.strokeStyle = pal.cyan;
+          ctx.lineWidth = 2.1;
+          ctx.beginPath();
+          for (var i = 0; i < mPpm.length && i < mInt.length; i++) {
+            var sx = padX + ((mHi - mPpm[i]) / mSpan) * pw;
+            var sy = padY + ph - 14 - clamp(mInt[i] / (maxM * 1.12), -0.05, 1.0) * (ph - 28);
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+          }
+          ctx.stroke();
+          for (var i = 2; i < mInt.length - 2; i++) {
+            if (mInt[i] > mInt[i - 1] && mInt[i] > mInt[i + 1] && mInt[i] > maxM * 0.45) {
+              var px = padX + ((mHi - mPpm[i]) / mSpan) * pw;
+              var py = padY + ph - 14 - clamp(mInt[i] / (maxM * 1.12), 0, 1.0) * (ph - 28);
+              ctx.fillStyle = pal.amber;
+              ctx.beginPath();
+              ctx.arc(px, py, 3.6, 0, Math.PI * 2);
+              ctx.fill();
+              addSpot(px, py, 12, mClass + " Subpeak " + mPpm[i].toFixed(4) + " ppm", ["J = " + jStr + " Hz", acsRep]);
+            }
+          }
+        } else if (chIdx === 2) {
+          var pur = reqNum("qnmr.purity_percent");
+          var uK2 = reqNum("qnmr.u_k2_percent");
+          var guardOk = reqBool("qnmr.relaxation_guard_passed");
+          var anaInt = reqNum("qnmr.analyte_integral");
+          var stdInt = reqNum("qnmr.std_integral");
+          if (pur === null || uK2 === null || guardOk === null || anaInt === null || stdInt === null) {
+            drawFallbackPlaceholder("Module 06 Ch 3: GUM Internal-Standard qNMR");
+            return;
+          }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: GUM Internal-Standard qNMR Purity (" + pur.toFixed(2) + "% +- " + uK2.toFixed(2) + "%, k=2)",
+            "5*T1 relaxation guard passed=" + String(guardOk) + " · Analyte norm=" + anaInt.toFixed(3) + "H · DMS Std=" + stdInt.toFixed(3) + "H",
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Audited qNMR Observable", "Normalized Scale (%)", pal);
+          var bars = [
+            { lbl: "Molar Purity", val: pur, disp: pur.toFixed(2) + "% +- " + uK2.toFixed(2) + "%", frac: clamp(pur / 100.0, 0, 1), col: pal.green },
+            { lbl: "Analyte Integral (2H)", val: anaInt, disp: anaInt.toFixed(3) + " H", frac: clamp(anaInt / 6.5, 0, 1), col: pal.cyan },
+            { lbl: "NIST DMS Std (6H)", val: stdInt, disp: stdInt.toFixed(3) + " H", frac: clamp(stdInt / 6.5, 0, 1), col: pal.teal }
+          ];
+          for (var b = 0; b < bars.length; b++) {
+            var bx = padX + (b + 0.5) * (pw / 3) - 28;
+            var bh = Math.max(8, bars[b].frac * (ph - 36));
+            ctx.fillStyle = bars[b].col;
+            ctx.fillRect(bx, padY + ph - 12 - bh, 56, bh);
+            ctx.fillStyle = pal.text;
+            ctx.font = "600 11.5px ui-monospace, monospace";
+            ctx.fillText(bars[b].disp, bx - 8, padY + ph - 18 - bh);
+            addSpot(bx + 28, padY + ph - 12 - bh / 2, 24, bars[b].lbl, ["Value: " + bars[b].disp, "5*T1 guard: " + (guardOk ? "PASS" : "WARN")]);
+          }
+        } else {
+          var atoms = reqArr("octet_ibuprofen.atoms", 6);
+          var bonds = reqArr("octet_ibuprofen.bonds", 6);
+          var h1Links = reqArr("octet_ibuprofen.h1_links", 3);
+          var smiles = reqStr("octet_ibuprofen.smiles");
+          if (!atoms || !bonds || !h1Links || !smiles) {
+            drawFallbackPlaceholder("Module 06 Ch 4: Octet 2D Structure <-> 1H Peak Linking");
+            return;
+          }
+          atomIdx = Math.round(clamp(ctrlVal, 0, atoms.length - 1));
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: Octet (S)-Ibuprofen 2D Structure <-> Predicted 1H Shifts (Atom #" + atomIdx + ")",
+            "SMILES: " + smiles + " · Click atom or 1H peak to cross-highlight",
+            pal
+          );
+          var halfW = pw * 0.46;
+          var axMin = Infinity, axMax = -Infinity, ayMin = Infinity, ayMax = -Infinity;
+          for (var a = 0; a < atoms.length; a++) {
+            axMin = Math.min(axMin, atoms[a].x); axMax = Math.max(axMax, atoms[a].x);
+            ayMin = Math.min(ayMin, atoms[a].y); ayMax = Math.max(ayMax, atoms[a].y);
+          }
+          var axSpan = Math.max(1e-4, axMax - axMin);
+          var aySpan = Math.max(1e-4, ayMax - ayMin);
+          function mapAtomPt(at) {
+            return {
+              x: padX + 14 + ((at.x - axMin) / axSpan) * (halfW - 28),
+              y: padY + 20 + ((at.y - ayMin) / aySpan) * (ph - 36)
+            };
+          }
+          var h1ByAtom = {};
+          for (var h1 = 0; h1 < h1Links.length; h1++) {
+            h1ByAtom[h1Links[h1].atom_idx] = h1Links[h1];
+          }
+          ctx.strokeStyle = pal.muted;
+          for (var b = 0; b < bonds.length; b++) {
+            var a0 = atoms[bonds[b].a], a1 = atoms[bonds[b].b];
+            if (!a0 || !a1) continue;
+            var p0 = mapAtomPt(a0), p1 = mapAtomPt(a1);
+            ctx.lineWidth = (bonds[b].order || 1) >= 2 ? 3.0 : 1.8;
+            ctx.beginPath();
+            ctx.moveTo(p0.x, p0.y);
+            ctx.lineTo(p1.x, p1.y);
+            ctx.stroke();
+          }
+          for (var a = 0; a < atoms.length; a++) {
+            var ap = mapAtomPt(atoms[a]);
+            var isSel = atoms[a].idx === atomIdx;
+            ctx.fillStyle = isSel ? pal.amber : pal.cyan;
+            ctx.beginPath();
+            ctx.arc(ap.x, ap.y, isSel ? 8.5 : 5.0, 0, Math.PI * 2);
+            ctx.fill();
+            var elTxt = atoms[a].element || "C";
+            ctx.fillStyle = pal.text;
+            ctx.font = "600 10px ui-monospace, monospace";
+            ctx.fillText(elTxt + atoms[a].idx, ap.x + 6, ap.y - 5);
+            var lk = h1ByAtom[atoms[a].idx];
+            addSpot(ap.x, ap.y, 14, "(S)-Ibuprofen Atom #" + atoms[a].idx + " (" + elTxt + ")", [lk ? ("Linked 1H: " + lk.shift_ppm.toFixed(2) + " ppm (" + lk.multiplicity + ")") : "Quaternary / non-protonated heavy atom"], atoms[a].idx);
+          }
+
+          var rx0 = padX + pw * 0.52;
+          var rw = pw * 0.48;
+          drawAxes(ctx, rx0, padY + 8, rw, ph - 12, "Predicted 1H (ppm, 12 -> 0)", "nH", pal);
+          for (var k = 0; k < h1Links.length; k++) {
+            var hl = h1Links[k];
+            var px = rx0 + clamp((12.0 - hl.shift_ppm) / 12.0, 0.04, 0.96) * rw;
+            var matched = hl.atom_idx === atomIdx;
+            var hgt = clamp((hl.n_protons || 1) / 3.5, 0.22, 0.92) * (ph - 34);
+            var py = padY + ph - 14 - hgt;
+            ctx.strokeStyle = matched ? pal.amber : pal.teal;
+            ctx.lineWidth = matched ? 3.4 : 2.0;
+            ctx.beginPath();
+            ctx.moveTo(px, padY + ph - 14);
+            ctx.lineTo(px, py);
+            ctx.stroke();
+            addSpot(px, py, 13, "1H " + hl.shift_ppm.toFixed(2) + " ppm (" + hl.multiplicity + ")", ["Atom #" + hl.atom_idx + " · " + hl.n_protons + "H"], hl.atom_idx);
+          }
+        }
+        return;
+      }
+
+      if (modIdx === 7) {
+        var gradStep = Math.round(clamp(ctrlVal, 0, 15));
+        var grads = reqArr("gradients_g_cm", 8);
+        var bVals = reqArr("b_values_s_m2", 8);
+        var peaks = reqArr("peaks", 3);
+        if (!grads || !bVals || !peaks) {
+          drawFallbackPlaceholder("Module 07: DOSY Gradient Stack & Stejskal-Tanner Payload");
+          return;
+        }
+        gradStep = Math.round(clamp(ctrlVal, 0, grads.length - 1));
+        if (chIdx === 0) {
+          var ppmAxis = reqArr("ppm_axis", 20);
+          if (!ppmAxis) {
+            drawFallbackPlaceholder("Module 07 Ch 1: BPP-LED Gradient Stack");
+            return;
+          }
+          var pHi = Math.max(ppmAxis[0], ppmAxis[ppmAxis.length - 1]);
+          var pLo = Math.min(ppmAxis[0], ppmAxis[ppmAxis.length - 1]);
+          var pSpan = Math.max(0.2, pHi - pLo);
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: BPP-LED Gradient Stack (g" + (gradStep + 1) + "/" + grads.length + " = " + grads[gradStep].toFixed(1) + " G/cm)",
+            "b = " + (bVals[gradStep] * 1e-9).toFixed(3) + "e9 s/m^2 · SINE.100 2/pi shape factor",
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm, " + pHi.toFixed(1) + " -> " + pLo.toFixed(1) + ")", "Gradient Slices g1..g" + grads.length, pal);
+          for (var g = 0; g < grads.length; g += 2) {
+            var baseLine = padY + ph - 18 - (g / grads.length) * (ph * 0.72);
+            var isSel = (g === gradStep || g + 1 === gradStep);
+            ctx.strokeStyle = isSel ? pal.amber : pal.cyan;
+            ctx.lineWidth = isSel ? 2.3 : 1.2;
+            ctx.beginPath();
+            for (var i = 0; i < ppmAxis.length; i++) {
+              var xPpm = ppmAxis[i];
+              var ySum = 0;
+              for (var pkIdx = 0; pkIdx < peaks.length; pkIdx++) {
+                var pk = peaks[pkIdx];
+                var amp = (pk.intensities && pk.intensities[g] !== undefined) ? pk.intensities[g] : 0;
+                var dx = (xPpm - pk.center_ppm) / 0.05;
+                ySum += amp / (1 + dx * dx);
+              }
+              var sx = padX + ((pHi - xPpm) / pSpan) * pw;
+              var sy = baseLine - ySum * 28;
+              if (i === 0) ctx.moveTo(sx, sy);
+              else ctx.lineTo(sx, sy);
+            }
+            ctx.stroke();
+            addSpot(padX + pw * 0.3, baseLine - 16, 14, "Step g" + (g + 1) + " (" + grads[g].toFixed(1) + " G/cm)", ["b = " + (bVals[g] * 1e-9).toFixed(3) + "e9 s/m^2"], g);
+          }
+        } else if (chIdx === 1) {
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: Stejskal-Tanner Decay & BIC K=1 vs K=2 Selection (g" + (gradStep + 1) + ")",
+            peaks.length + " fitted peaks · Overlapped 3.66 ppm selects BIC K=" + (peaks[3] ? peaks[3].selected_k : peaks[0].selected_k),
+            pal
+          );
+          var bMax = Math.max(1e6, bVals[bVals.length - 1]);
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "b-value (0.." + (bMax * 1e-9).toFixed(2) + "e9 s/m^2)", "Attenuation I(b)", pal);
+          var pCols = [pal.amber, pal.cyan, pal.green, pal.coral];
+          var showIdxs = [0, 1, 2, Math.min(3, peaks.length - 1)];
+          for (var si = 0; si < showIdxs.length; si++) {
+            var pk = peaks[showIdxs[si]];
+            var col = pCols[si % pCols.length];
+            ctx.strokeStyle = col;
+            ctx.lineWidth = pk.selected_k > 1 ? 2.5 : 1.7;
+            ctx.beginPath();
+            for (var g = 0; g < bVals.length && g < pk.intensities.length; g++) {
+              var sx = padX + (bVals[g] / bMax) * pw;
+              var sy = padY + 14 + (1 - clamp(pk.intensities[g], 0, 1.05)) * (ph - 28);
+              if (g === 0) ctx.moveTo(sx, sy);
+              else ctx.lineTo(sx, sy);
+            }
+            ctx.stroke();
+            var gx = padX + (bVals[gradStep] / bMax) * pw;
+            var gy = padY + 14 + (1 - clamp(pk.intensities[gradStep] || 0, 0, 1.05)) * (ph - 28);
+            ctx.fillStyle = col;
+            ctx.beginPath();
+            ctx.arc(gx, gy, 5, 0, Math.PI * 2);
+            ctx.fill();
+            addSpot(gx, gy, 13, pk.label + " (BIC K=" + pk.selected_k + ")", ["b = " + (bVals[gradStep] * 1e-9).toFixed(2) + "e9 s/m^2", "I(b) = " + Number(pk.intensities[gradStep] || 0).toFixed(3)], gradStep);
+          }
+        } else if (chIdx === 2) {
+          var iltGrid = reqArr("ilt_overlap.log10_d_grid", 10);
+          var iltSpec = reqArr("ilt_overlap.spectrum", 10);
+          var iltLam = reqNum("ilt_overlap.selected_lambda");
+          var iltModes = reqArr("ilt_overlap.modes", 1);
+          if (!iltGrid || !iltSpec || iltLam === null || !iltModes) {
+            drawFallbackPlaceholder("Module 07 Ch 3: 2D DOSY & Tikhonov ILT");
+            return;
+          }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: 2D DOSY (ppm x log10 D) & GCV Tikhonov ILT",
+            "3.66 ppm ILT lambda_GCV=" + iltLam.toExponential(2) + " · " + iltModes.length + " continuous modes",
+            pal
+          );
+          var leftW = pw * 0.58;
+          drawAxes(ctx, padX, padY + 8, leftW, ph - 12, "1H (ppm, 7.8 -> 0.4)", "log10 D (-8.8 -> -10.3)", pal);
+          for (var p = 0; p < peaks.length; p++) {
+            var pk = peaks[p];
+            var comps = pk.components || [];
+            for (var c = 0; c < comps.length; c++) {
+              var sx = padX + clamp((7.8 - pk.center_ppm) / 7.4, 0.05, 0.95) * leftW;
+              var sy = padY + 14 + clamp((-8.75 - comps[c].log10_d) / 1.6, 0.05, 0.95) * (ph - 28);
+              ctx.strokeStyle = pk.selected_k > 1 ? pal.coral : pal.cyan;
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.ellipse(sx, sy, 14, 8, 0, 0, Math.PI * 2);
+              ctx.stroke();
+              addSpot(sx, sy, 16, pk.label + " (" + pk.center_ppm.toFixed(2) + " ppm)", ["log10 D: " + comps[c].log10_d.toFixed(2), "D: " + comps[c].d_m2_s.toExponential(2) + " m^2/s"]);
+            }
+          }
+          var rx0 = padX + pw * 0.63;
+          var rw = pw * 0.37;
+          drawAxes(ctx, rx0, padY + 8, rw, ph - 12, "log10 D", "ILT f(D)", pal);
+          var maxIlt = 1e-9;
+          for (var i = 0; i < iltSpec.length; i++) maxIlt = Math.max(maxIlt, iltSpec[i]);
+          var gLo = iltGrid[0], gHi = iltGrid[iltGrid.length - 1];
+          var gSpan = Math.max(1e-4, gHi - gLo);
+          ctx.strokeStyle = pal.green;
+          ctx.lineWidth = 2.2;
+          ctx.beginPath();
+          for (var i = 0; i < iltGrid.length && i < iltSpec.length; i++) {
+            var ix = rx0 + ((iltGrid[i] - gLo) / gSpan) * rw;
+            var iy = padY + ph - 14 - clamp(iltSpec[i] / (maxIlt * 1.1), 0, 1) * (ph - 28);
+            if (i === 0) ctx.moveTo(ix, iy);
+            else ctx.lineTo(ix, iy);
+          }
+          ctx.stroke();
+        } else {
+          var hydro = reqArr("hydrodynamics", 3);
+          if (!hydro) {
+            drawFallbackPlaceholder("Module 07 Ch 4: Stokes-Einstein Hydrodynamic Sizing");
+            return;
+          }
+          drawCardTitle(
+            ctx,
+            padX,
+            padY - 12,
+            "SYNTHETIC: Evans Stokes-Einstein Hydrodynamic Radius Rh & MW (D2O, 298 K)",
+            hydro.map(function (h) { return h.name + " Rh=" + Number(h.r_h_angstrom).toFixed(1) + " A"; }).join(" · "),
+            pal
+          );
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "log10 MW (Da, 1.8 -> 4.4)", "Rh (Angstrom)", pal);
+          var maxRh = 1.0;
+          for (var s = 0; s < hydro.length; s++) maxRh = Math.max(maxRh, hydro[s].r_h_angstrom || 1);
+          var hCols = [pal.cyan, pal.green, pal.amber];
+          for (var s = 0; s < hydro.length; s++) {
+            var hd = hydro[s];
+            var logMw = Math.log(Math.max(10, hd.mw_da)) / Math.LN10;
+            var sx = padX + clamp((logMw - 1.8) / 2.6, 0.08, 0.90) * pw;
+            var sy = padY + ph - 16 - clamp(hd.r_h_angstrom / (maxRh * 1.18), 0.06, 0.94) * (ph - 30);
+            ctx.fillStyle = hCols[s % hCols.length];
+            ctx.beginPath();
+            ctx.arc(sx, sy, 6.5, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = pal.text;
+            ctx.font = "600 12px ui-monospace, monospace";
+            ctx.fillText(hd.name + " (Rh=" + hd.r_h_angstrom.toFixed(1) + " A, ~" + Math.round(hd.mw_da) + " Da)", sx + 10, sy - 6);
+            addSpot(sx, sy, 18, hd.name + " Stokes-Einstein", ["Rh: " + hd.r_h_angstrom.toFixed(2) + " A", "Estimated MW: " + Math.round(hd.mw_da) + " Da"]);
+          }
+        }
+        return;
+      }
+
+      // Module 08: Metabolomics (AI-Binning/PQN, PCA/OPLS-DA, STOCSY, MCP)
+      var driverIdx = Math.round(clamp(ctrlVal, 0, 20));
+      if (chIdx === 0) {
+        var nSamples = reqNum("n_samples");
+        var nBuckets = reqNum("n_buckets");
+        var sPpm = reqArr("stocsy.ppm", 10);
+        var mCtrl = reqArr("stocsy.mean_ctrl", 10);
+        var mCase = reqArr("stocsy.mean_case", 10);
+        if (nSamples === null || nBuckets === null || !sPpm || !mCtrl || !mCase) {
+          drawFallbackPlaceholder("Module 08 Ch 1: Cohort PQN Spectra & AI-Binning");
+          return;
+        }
+        drawCardTitle(
+          ctx,
+          padX,
+          padY - 12,
+          "SYNTHETIC: " + nSamples + "-Sample Biofluid Cohort (" + nBuckets + " De Meyer AI Bins + PQN)",
+          "Cyan = Mean Control · Coral = Mean Case aligned PQN spectra",
+          pal
+        );
+        var pHi = Math.max(sPpm[0], sPpm[sPpm.length - 1]);
+        var pLo = Math.min(sPpm[0], sPpm[sPpm.length - 1]);
+        var pSpan = Math.max(0.2, pHi - pLo);
+        var maxCoh = 1e-9;
+        for (var i = 0; i < mCtrl.length; i++) maxCoh = Math.max(maxCoh, mCtrl[i], mCase[i] || 0);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm, " + pHi.toFixed(2) + " -> " + pLo.toFixed(2) + ")", "PQN Mean Intensity", pal);
+        var cohortTraces = [
+          { col: pal.cyan, arr: mCtrl, lbl: "Mean Control" },
+          { col: pal.coral, arr: mCase, lbl: "Mean Case" }
+        ];
+        for (var c = 0; c < cohortTraces.length; c++) {
+          var tr = cohortTraces[c];
+          ctx.strokeStyle = tr.col;
+          ctx.lineWidth = 1.9;
+          ctx.beginPath();
+          for (var i = 0; i < sPpm.length && i < tr.arr.length; i++) {
+            var sx = padX + ((pHi - sPpm[i]) / pSpan) * pw;
+            var sy = padY + ph - 12 - clamp(tr.arr[i] / (maxCoh * 1.1), 0, 1) * (ph - 26);
+            if (i === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+            if (c === 1 && i % Math.max(1, Math.floor(sPpm.length / 10)) === 0) {
+              addSpot(sx, sy, 12, "Cohort Grid " + sPpm[i].toFixed(2) + " ppm", ["Case mean: " + mCase[i].toFixed(3), "Control mean: " + mCtrl[i].toFixed(3)]);
             }
           }
           ctx.stroke();
         }
-      } else if (chIdx === 2) {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: R2/R1 Global Tumbling tau_m = 8.1 ns (Res #" + resSeq + ")", "Rigid-core 10% trimmed median · Ile23 Rex & C-term outliers", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue 1..76", "R2 / R1 Ratio", pal);
-        var coreY = padY + 14 + (1 - 7.8 / 16.0) * (ph - 28);
-        ctx.strokeStyle = pal.teal;
-        ctx.setLineDash([5, 4]);
-        ctx.beginPath();
-        ctx.moveTo(padX, coreY);
-        ctx.lineTo(padX + pw, coreY);
-        ctx.stroke();
-        ctx.setLineDash([]);
-        for (var r = 1; r <= 76; r++) {
-          var ratio = r === 23 ? 13.8 : (r >= 72 ? Math.max(2.1, 7.2 - (r - 71) * 1.1) : (7.8 + 0.65 * Math.sin(r * 0.42)));
-          var sx = padX + ((r - 0.5) / 76) * pw;
-          var sy = padY + 14 + (1 - ratio / 16.0) * (ph - 28);
-          var isSel = r === resSeq;
-          ctx.fillStyle = isSel ? pal.amber : (r === 23 ? pal.coral : (r >= 72 ? pal.violet : pal.teal));
-          ctx.beginPath();
-          ctx.arc(sx, sy, isSel ? 6 : 3.2, 0, Math.PI * 2);
-          ctx.fill();
-          if (r % 4 === 0 || isSel || r === 23) {
-            addSpot(sx, sy, 10, "Res #" + r, ["R2/R1: " + ratio.toFixed(2), "tau_m = 8.1 ns"], r);
-          }
-        }
-      } else {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Lipari-Szabo M1-M5 S^2 Profile (Res #" + resSeq + ")", "Ile23 Rex exchange · C-term 72-76 flexible tail", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue 1..76", "Order Parameter S^2", pal);
-        for (var r = 1; r <= 76; r++) {
-          var s2 = r >= 72 ? Math.max(0.22, 0.85 - (r - 71) * 0.14) : (0.83 + 0.09 * Math.sin(r * 0.31));
-          var sx = padX + ((r - 0.5) / 76) * pw;
-          var sy = padY + 14 + (1 - s2) * (ph - 28);
-          var isSel = r === resSeq;
-          ctx.fillStyle = isSel ? pal.amber : (r === 23 ? pal.coral : pal.cyan);
-          ctx.beginPath();
-          ctx.arc(sx, sy, isSel ? 6 : 3.2, 0, Math.PI * 2);
-          ctx.fill();
-          if (r % 4 === 0 || isSel || r === 23) {
-            addSpot(sx, sy, 10, "Res #" + r, ["S^2: " + s2.toFixed(3), r === 23 ? "Model M3 (Rex)" : "Model M1/M2"], r);
-          }
-        }
-      }
-      return;
-    }
-
-    if (modIdx === 5) {
-      // Module 05: CEST, CPMG, HSQC titration, Morrison vs MM isotherm
-      var ligUm = clamp(ctrlVal, 0, 300);
-      if (chIdx === 0) {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Higham [6/6] Pade CEST Saturation Sweep (B1 = 15 & 30 Hz)", "pB = 1.5%, k_ex = 150 s^-1", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Offset (ppm)", "I / I0", pal);
-        var b1s = [{ col: pal.cyan, w: 0.55 }, { col: pal.amber, w: 0.95 }];
-        for (var b = 0; b < b1s.length; b++) {
-          ctx.strokeStyle = b1s[b].col;
-          ctx.lineWidth = 2.2;
-          ctx.beginPath();
-          for (var i = 0; i <= 100; i++) {
-            var u = i / 100;
-            var ppm = -12 + u * 24;
-            var dipMain = 0.88 / (1 + Math.pow((ppm - 0.0) / b1s[b].w, 2));
-            var dipMin = 0.42 / (1 + Math.pow((ppm + 4.5) / (b1s[b].w * 0.7), 2));
-            var val = 1.0 - Math.min(0.95, dipMain + dipMin);
-            var sx = padX + u * pw;
-            var sy = padY + 14 + (1 - val) * (ph - 28);
-            if (i === 0) ctx.moveTo(sx, sy);
-            else ctx.lineTo(sx, sy);
-            if (i === 31) addSpot(sx, sy, 16, "Minor State Dip (-4.5 ppm)", ["I/I0: " + val.toFixed(2), "pB = 1.5%"]);
-          }
-          ctx.stroke();
-        }
       } else if (chIdx === 1) {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Dual-Field Baldwin Exact CPMG Dispersion & AICc Gate", "600 vs 800 MHz R2,eff(nu_CPMG)", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "nu_CPMG (Hz)", "R2,eff (s^-1)", pal);
-        var fields = [{ col: pal.cyan, amp: 14 }, { col: pal.coral, amp: 22 }];
-        for (var f = 0; f < fields.length; f++) {
-          ctx.strokeStyle = fields[f].col;
-          ctx.lineWidth = 2.4;
-          ctx.beginPath();
-          for (var i = 0; i <= 40; i++) {
-            var nu = 25 + i * 25;
-            var r2e = 10.5 + fields[f].amp / (1 + Math.pow(nu / 220, 2));
-            var sx = padX + (i / 40) * pw;
-            var sy = padY + ph - 12 - ((r2e - 8) / 28) * (ph - 24);
-            if (i === 0) ctx.moveTo(sx, sy);
-            else ctx.lineTo(sx, sy);
-            if (i % 8 === 0) addSpot(sx, sy, 12, (f === 0 ? "600" : "800") + " MHz @ " + nu + " Hz", ["R2,eff: " + r2e.toFixed(1) + " s^-1"]);
-          }
-          ctx.stroke();
+        var scores = reqArr("pca.scores", 6);
+        var ell95 = reqArr("pca.ellipse_95", 8);
+        var q2 = reqNum("oplsda.q2");
+        var r2y = reqNum("oplsda.r2y");
+        var permP = reqNum("oplsda.perm_p_q2");
+        if (!scores || !ell95 || q2 === null || r2y === null || permP === null) {
+          drawFallbackPlaceholder("Module 08 Ch 2: PCA Hotelling T^2 & OPLS-DA");
+          return;
         }
-      } else if (chIdx === 2) {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: 2D 1H-15N HSQC Titration CSP Trajectories ([L] = " + ligUm.toFixed(0) + " uM)", "Fast-exchange linear vectors -> Kd ~ 5 uM", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm)", "15N (ppm)", pal);
-        var frac = ligUm / (ligUm + 28.0);
-        var traj = [
-          { lbl: "Phe4", x0: 0.25, y0: 0.30, dx: 0.14, dy: -0.10, col: pal.cyan },
-          { lbl: "Ile23", x0: 0.52, y0: 0.48, dx: 0.18, dy: 0.14, col: pal.green },
-          { lbl: "His68", x0: 0.72, y0: 0.68, dx: -0.12, dy: -0.15, col: pal.amber }
-        ];
-        for (var t = 0; t < traj.length; t++) {
-          var tr = traj[t];
-          var xA = padX + tr.x0 * pw, yA = padY + 14 + tr.y0 * (ph - 28);
-          var xB = padX + (tr.x0 + tr.dx) * pw, yB = padY + 14 + (tr.y0 + tr.dy) * (ph - 28);
-          ctx.strokeStyle = tr.col;
-          ctx.setLineDash([4, 3]);
-          ctx.beginPath();
-          ctx.moveTo(xA, yA);
-          ctx.lineTo(xB, yB);
-          ctx.stroke();
-          ctx.setLineDash([]);
-          var xC = xA + (xB - xA) * frac, yC = yA + (yB - yA) * frac;
-          ctx.fillStyle = tr.col;
-          ctx.beginPath();
-          ctx.arc(xC, yC, 6, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.fillStyle = pal.text;
-          ctx.font = "600 11px -apple-system, sans-serif";
-          ctx.fillText(tr.lbl, xC + 8, yC + 4);
-          addSpot(xC, yC, 16, tr.lbl + " CSP Trajectory", ["[L] = " + ligUm.toFixed(0) + " uM", "Shift progress: " + (frac * 100).toFixed(0) + "%"]);
+        drawCardTitle(
+          ctx,
+          padX,
+          padY - 12,
+          "SYNTHETIC: PCA 95% Hotelling T^2 & OPLS-DA (Q^2=" + q2.toFixed(3) + ", R^2Y=" + r2y.toFixed(3) + ")",
+          "100-permutation p=" + permP.toFixed(4) + " · Leak-free stratified k-fold CV",
+          pal
+        );
+        var xBound = 1.0, yBound = 1.0;
+        for (var i = 0; i < scores.length; i++) {
+          xBound = Math.max(xBound, Math.abs(scores[i].t1 || 0));
+          yBound = Math.max(yBound, Math.abs(scores[i].t2 || 0));
         }
-      } else {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Morrison Quadratic (Kd=5 uM, [P]0=100 uM) vs Naive MM", "Cursor [L] = " + ligUm.toFixed(0) + " uM", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "[L] total (uM)", "Fraction Bound", pal);
-        var P0 = 100.0, Kd = 5.0;
-        function quadFrac(L) {
-          var b = P0 + L + Kd;
-          return (b - Math.sqrt(Math.max(0, b * b - 4 * P0 * L))) / (2 * P0);
+        for (var i = 0; i < ell95.length; i++) {
+          xBound = Math.max(xBound, Math.abs(ell95[i][0] || 0));
+          yBound = Math.max(yBound, Math.abs(ell95[i][1] || 0));
         }
-        function mmFrac(L) {
-          return L / (Kd + L);
-        }
-        ctx.strokeStyle = pal.green;
-        ctx.lineWidth = 2.5;
-        ctx.beginPath();
-        for (var i = 0; i <= 60; i++) {
-          var L = i * 5;
-          var sx = padX + (L / 300) * pw;
-          var sy = padY + ph - 12 - quadFrac(L) * (ph - 24);
-          if (i === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
-        }
-        ctx.stroke();
-        ctx.strokeStyle = pal.coral;
-        ctx.setLineDash([5, 4]);
-        ctx.beginPath();
-        for (var i = 0; i <= 60; i++) {
-          var L = i * 5;
-          var sx = padX + (L / 300) * pw;
-          var sy = padY + ph - 12 - mmFrac(L) * (ph - 24);
-          if (i === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
-        }
-        ctx.stroke();
-        ctx.setLineDash([]);
-        var cx = padX + (ligUm / 300) * pw;
-        var cyQ = padY + ph - 12 - quadFrac(ligUm) * (ph - 24);
+        xBound *= 1.15; yBound *= 1.15;
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "PC1 t[1]", "PC2 t[2]", pal);
         ctx.strokeStyle = pal.amber;
-        ctx.beginPath();
-        ctx.moveTo(cx, padY + 8);
-        ctx.lineTo(cx, padY + ph - 4);
-        ctx.stroke();
-        ctx.fillStyle = pal.amber;
-        ctx.beginPath();
-        ctx.arc(cx, cyQ, 6, 0, Math.PI * 2);
-        ctx.fill();
-        addSpot(cx, cyQ, 18, "Morrison Fit @ " + ligUm.toFixed(0) + " uM", ["Bound: " + (quadFrac(ligUm) * 100).toFixed(1) + "%", "Naive MM: " + (mmFrac(ligUm) * 100).toFixed(1) + "%"]);
-      }
-      return;
-    }
-
-    if (modIdx === 6) {
-      // Module 06: 1D HSVD/Whittaker, Hoye ddd, GUM qNMR, Octet (S)-Ibuprofen <-> peak
-      var atomIdx = Math.round(clamp(ctrlVal, 0, 14));
-      if (chIdx === 0) {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: 1D HSVD Water Suppression + Whittaker Baseline", "4.70 ppm HDO SVD pole removal · Asymmetric least-squares baseline", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H Chemical Shift (ppm)", "Intensity", pal);
-        ctx.strokeStyle = pal.coral;
-        ctx.lineWidth = 1.6;
-        ctx.setLineDash([4, 3]);
-        ctx.beginPath();
-        for (var i = 0; i <= 160; i++) {
-          var u = i / 160;
-          var hdo = 0.85 / (1 + Math.pow((u - 0.50) / 0.035, 2));
-          var base = 0.14 * Math.sin(u * Math.PI);
-          var sx = padX + u * pw;
-          var sy = padY + ph - 14 - (hdo + base) * (ph * 0.72);
-          if (i === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
-        }
-        ctx.stroke();
-        ctx.setLineDash([]);
-        var solPeaks = [0.22, 0.34, 0.68, 0.78];
-        ctx.strokeStyle = pal.cyan;
-        ctx.lineWidth = 2.2;
-        ctx.beginPath();
-        for (var i = 0; i <= 160; i++) {
-          var u = i / 160;
-          var val = 0;
-          for (var p = 0; p < solPeaks.length; p++) {
-            var d = (u - solPeaks[p]) / 0.018;
-            val += 0.55 / (1 + d * d);
-          }
-          var sx = padX + u * pw;
-          var sy = padY + ph - 14 - val * (ph * 0.68);
-          if (i === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
-        }
-        ctx.stroke();
-        addSpot(padX + pw * 0.50, padY + ph * 0.25, 20, "4.70 ppm HDO Suppressed", ["HSVD Hankel rank-12 pole removed", "Whittaker baseline flat"]);
-        for (var p = 0; p < solPeaks.length; p++) {
-          addSpot(padX + solPeaks[p] * pw, padY + ph - 14 - 0.55 * (ph * 0.68), 14, "Solute Peak #" + (p + 1), ["Recovered after HSVD + Whittaker"]);
-        }
-      } else if (chIdx === 1) {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Hoye ddd Multiplet Tree (J = 14.2, 7.1, 2.4 Hz)", "Voigt deconvolution · ACS report", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H Chemical Shift (ppm)", "Intensity", pal);
-        ctx.strokeStyle = pal.cyan;
-        ctx.lineWidth = 2.2;
-        ctx.beginPath();
-        var subPeaks = [0.28, 0.34, 0.41, 0.47, 0.53, 0.59, 0.66, 0.72];
-        for (var i = 0; i <= 160; i++) {
-          var u = i / 160;
-          var val = 0;
-          for (var s = 0; s < subPeaks.length; s++) {
-            var d = (u - subPeaks[s]) / 0.015;
-            val += 0.7 / (1 + d * d);
-          }
-          var sx = padX + u * pw;
-          var sy = padY + ph - 14 - val * (ph * 0.62);
-          if (i === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
-        }
-        ctx.stroke();
-        for (var s = 0; s < subPeaks.length; s++) {
-          var px = padX + subPeaks[s] * pw;
-          var py = padY + ph - 14 - 0.7 * (ph * 0.62);
-          ctx.fillStyle = pal.amber;
-          ctx.beginPath();
-          ctx.arc(px, py, 3.5, 0, Math.PI * 2);
-          ctx.fill();
-          addSpot(px, py, 14, "ddd Subpeak #" + (s + 1), ["J1=14.2 Hz, J2=7.1 Hz, J3=2.4 Hz"]);
-        }
-      } else if (chIdx === 2) {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: GUM Internal-Standard qNMR Purity (98.40% +- 0.14%, k=2)", "5*T1 relaxation guard verified", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Uncertainty Budget", "Purity (%)", pal);
-        var bars = [["Purity", 98.4, pal.green], ["IS Mass", 99.1, pal.cyan], ["5*T1 Guard", 99.8, pal.teal]];
-        for (var b = 0; b < bars.length; b++) {
-          var bx = padX + (b + 0.5) * (pw / 3) - 24;
-          var bh = ((bars[b][1] - 90) / 10) * (ph - 30);
-          ctx.fillStyle = bars[b][2];
-          ctx.fillRect(bx, padY + ph - 12 - bh, 48, bh);
-          ctx.fillStyle = pal.text;
-          ctx.font = "600 12px ui-monospace, monospace";
-          ctx.fillText(bars[b][1].toFixed(2) + "%", bx, padY + ph - 18 - bh);
-          addSpot(bx + 24, padY + ph - 12 - bh / 2, 24, bars[b][0], ["Value: " + bars[b][1].toFixed(2) + "%", "GUM k=2"]);
-        }
-      } else {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Octet (S)-Ibuprofen 2D Structure <-> 1H/13C Peak (Atom #" + atomIdx + ")", "CIP (S) stereocenter · Click atom or peak", pal);
-        var halfW = pw * 0.46;
-        // Left: 2D (S)-Ibuprofen skeleton
-        var atoms = [
-          [0.18, 0.25, "O"], [0.26, 0.36, "C"], [0.18, 0.49, "OH"], [0.35, 0.42, "C*"],
-          [0.37, 0.24, "CH3"], [0.46, 0.48, "C"], [0.56, 0.38, "CH"], [0.68, 0.44, "CH"],
-          [0.70, 0.60, "C"], [0.60, 0.70, "CH"], [0.48, 0.64, "CH"], [0.82, 0.66, "CH2"],
-          [0.91, 0.54, "CH"], [0.97, 0.40, "CH3"], [0.95, 0.70, "CH3"]
-        ];
-        var bonds = [[0,1],[1,2],[1,3],[3,4],[3,5],[5,6],[6,7],[7,8],[8,9],[9,10],[10,5],[8,11],[11,12],[12,13],[12,14]];
-        ctx.strokeStyle = pal.muted;
-        ctx.lineWidth = 2;
-        for (var b = 0; b < bonds.length; b++) {
-          var a0 = atoms[bonds[b][0]], a1 = atoms[bonds[b][1]];
-          ctx.beginPath();
-          ctx.moveTo(padX + a0[0] * halfW, padY + a0[1] * ph);
-          ctx.lineTo(padX + a1[0] * halfW, padY + a1[1] * ph);
-          ctx.stroke();
-        }
-        for (var a = 0; a < atoms.length; a++) {
-          var ax = padX + atoms[a][0] * halfW;
-          var ay = padY + atoms[a][1] * ph;
-          var isSel = a === atomIdx;
-          ctx.fillStyle = isSel ? pal.amber : pal.cyan;
-          ctx.beginPath();
-          ctx.arc(ax, ay, isSel ? 9 : 5, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.fillStyle = pal.text;
-          ctx.font = "600 10px ui-monospace, monospace";
-          ctx.fillText(atoms[a][2], ax + 7, ay - 5);
-          addSpot(ax, ay, 14, "(S)-Ibuprofen Atom #" + a + " (" + atoms[a][2] + ")", ["1H shift: " + (11.5 - a * 0.7).toFixed(2) + " ppm"], a);
-        }
-        // Right: Correlated 1H spectrum
-        var rx0 = padX + pw * 0.52;
-        var rw = pw * 0.48;
-        drawAxes(ctx, rx0, padY + 8, rw, ph - 12, "1H (ppm)", "Linked Peak", pal);
-        for (var a = 0; a < atoms.length; a++) {
-          var px = rx0 + (a / 15) * (rw - 20) + 10;
-          var hgt = (a === atomIdx ? 0.85 : 0.42) * (ph - 36);
-          var py = padY + ph - 14 - hgt;
-          ctx.strokeStyle = a === atomIdx ? pal.amber : pal.teal;
-          ctx.lineWidth = a === atomIdx ? 3.2 : 1.6;
-          ctx.beginPath();
-          ctx.moveTo(px, padY + ph - 14);
-          ctx.lineTo(px, py);
-          ctx.stroke();
-          addSpot(px, py, 12, "1H Peak <-> Atom #" + a, ["Group: " + atoms[a][2], "Shift: " + (11.5 - a * 0.7).toFixed(2) + " ppm"], a);
-        }
-      }
-      return;
-    }
-
-    if (modIdx === 7) {
-      // Module 07: BPP-LED stack, Stejskal-Tanner, 2D DOSY, Stokes-Einstein Rh
-      var gradStep = Math.round(clamp(ctrlVal, 0, 15));
-      if (chIdx === 0) {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: BPP-LED Gradient Stack (Step g" + (gradStep + 1) + " / g16)", "SINE.100 2/pi shape factor", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm)", "Gradient Plane g1..g16", pal);
-        for (var g = 0; g < 16; g += 2) {
-          var baseLine = padY + ph - 18 - (g / 16) * (ph * 0.72);
-          var att = Math.exp(-0.14 * g);
-          ctx.strokeStyle = (g === gradStep || g + 1 === gradStep) ? pal.amber : pal.cyan;
-          ctx.lineWidth = (g === gradStep || g + 1 === gradStep) ? 2.4 : 1.2;
-          ctx.beginPath();
-          for (var i = 0; i <= 80; i++) {
-            var u = i / 80;
-            var pk = att * (Math.exp(-Math.pow((u - 0.3) * 18, 2)) + 0.7 * Math.exp(-Math.pow((u - 0.68) * 14, 2)));
-            var sx = padX + u * pw;
-            var sy = baseLine - pk * 36;
-            if (i === 0) ctx.moveTo(sx, sy);
-            else ctx.lineTo(sx, sy);
-          }
-          ctx.stroke();
-          addSpot(padX + pw * 0.3, baseLine - att * 25, 14, "Gradient Step g" + (g + 1), ["Attenuation: " + (att * 100).toFixed(1) + "%"], g);
-        }
-      } else if (chIdx === 1) {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Stejskal-Tanner Decay & BIC K=1 vs K=2 (g" + (gradStep + 1) + ")", "Overlapped mixture resolved", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "b-value (10^9 s/m^2)", "ln(I / I0)", pal);
-        for (var g = 0; g < 16; g++) {
-          var b = g * 0.25;
-          var yVal = Math.exp(-0.42 * b);
-          var sx = padX + (g / 15) * pw;
-          var sy = padY + 14 + (1 - yVal) * (ph - 28);
-          ctx.fillStyle = g === gradStep ? pal.amber : pal.cyan;
-          ctx.beginPath();
-          ctx.arc(sx, sy, g === gradStep ? 6.5 : 4, 0, Math.PI * 2);
-          ctx.fill();
-          addSpot(sx, sy, 12, "b-point g" + (g + 1), ["b = " + b.toFixed(2) + "e9 s/m^2", "I/I0 = " + yVal.toFixed(3)], g);
-        }
-      } else if (chIdx === 2) {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: 2D DOSY (ppm x log10 D) Contour Map", "Maleate (0.28 nm) · Raffinose (0.58 nm) · Lysozyme (1.92 nm)", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm)", "log10 D (m^2/s)", pal);
-        var species = [
-          { name: "Maleate", x: 0.24, y: 0.22, rh: "0.28 nm", mw: "116 Da", col: pal.cyan },
-          { name: "Raffinose", x: 0.52, y: 0.48, rh: "0.58 nm", mw: "504 Da", col: pal.green },
-          { name: "Lysozyme", x: 0.78, y: 0.80, rh: "1.92 nm", mw: "14.3 kDa", col: pal.amber }
-        ];
-        for (var s = 0; s < species.length; s++) {
-          var sp = species[s];
-          var sx = padX + sp.x * pw;
-          var sy = padY + 14 + sp.y * (ph - 28);
-          ctx.strokeStyle = sp.col;
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.ellipse(sx, sy, 22, 12, 0, 0, Math.PI * 2);
-          ctx.stroke();
-          ctx.fillStyle = sp.col;
-          ctx.font = "600 12px -apple-system, sans-serif";
-          ctx.fillText(sp.name + " (" + sp.rh + ")", sx + 26, sy + 4);
-          addSpot(sx, sy, 22, sp.name, ["Rh: " + sp.rh, "MW: " + sp.mw]);
-        }
-      } else {
-        drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: Evans Stokes-Einstein log10 D vs log10 MW Scaling", "Slope = -0.34 (globular compact fold)", pal);
-        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "log10 MW (Da)", "log10 D (m^2/s)", pal);
-        ctx.strokeStyle = pal.teal;
         ctx.setLineDash([5, 4]);
         ctx.beginPath();
-        ctx.moveTo(padX + pw * 0.12, padY + ph * 0.22);
-        ctx.lineTo(padX + pw * 0.88, padY + ph * 0.82);
+        for (var i = 0; i < ell95.length; i++) {
+          var ex = padX + ((ell95[i][0] + xBound) / (2 * xBound)) * pw;
+          var ey = padY + ph - 12 - ((ell95[i][1] + yBound) / (2 * yBound)) * (ph - 24);
+          if (i === 0) ctx.moveTo(ex, ey);
+          else ctx.lineTo(ex, ey);
+        }
+        ctx.closePath();
         ctx.stroke();
         ctx.setLineDash([]);
-        var pts = [
-          { name: "Maleate", x: 0.18, y: 0.27, rh: "0.28 nm", mw: "116 Da", col: pal.cyan },
-          { name: "Raffinose", x: 0.44, y: 0.47, rh: "0.58 nm", mw: "504 Da", col: pal.green },
-          { name: "Lysozyme", x: 0.82, y: 0.77, rh: "1.92 nm", mw: "14.3 kDa", col: pal.amber }
-        ];
-        for (var s = 0; s < pts.length; s++) {
-          var pt = pts[s];
-          var sx = padX + pt.x * pw;
-          var sy = padY + pt.y * ph;
-          ctx.fillStyle = pt.col;
+        for (var i = 0; i < scores.length; i++) {
+          var sc = scores[i];
+          var isCase = String(sc.group || "").toLowerCase().indexOf("case") !== -1;
+          var sx = padX + ((sc.t1 + xBound) / (2 * xBound)) * pw;
+          var sy = padY + ph - 12 - ((sc.t2 + yBound) / (2 * yBound)) * (ph - 24);
+          ctx.fillStyle = isCase ? pal.coral : pal.cyan;
           ctx.beginPath();
-          ctx.arc(sx, sy, 6, 0, Math.PI * 2);
+          ctx.arc(sx, sy, 5, 0, Math.PI * 2);
           ctx.fill();
+          addSpot(sx, sy, 12, String(sc.group || "Sample") + " #" + (i + 1), ["t1=" + sc.t1.toFixed(2) + ", t2=" + sc.t2.toFixed(2), "OPLS-DA Q^2=" + q2.toFixed(3)]);
+        }
+      } else if (chIdx === 2) {
+        var sPpm = reqArr("stocsy.ppm", 10);
+        var mCase = reqArr("stocsy.mean_case", 10);
+        var r2Arr = reqArr("stocsy.r2", 10);
+        var drvPpm = reqNum("stocsy.driver_ppm");
+        var topMatch = reqStr("stocsy.top_match");
+        var sPlot = reqArr("oplsda.s_plot", 3);
+        if (!sPpm || !mCase || !r2Arr || drvPpm === null || !topMatch || !sPlot) {
+          drawFallbackPlaceholder("Module 08 Ch 3: STOCSY Correlation Trace");
+          return;
+        }
+        var selBin = sPlot[Math.min(driverIdx, sPlot.length - 1)];
+        drawCardTitle(
+          ctx,
+          padX,
+          padY - 12,
+          "SYNTHETIC: STOCSY Driver " + drvPpm.toFixed(2) + " ppm -> " + topMatch,
+          "Inspect S-plot bin #" + driverIdx + " (" + selBin.ppm.toFixed(2) + " ppm, VIP=" + selBin.vip.toFixed(2) + ", |r|=" + Math.abs(selBin.corr).toFixed(2) + ")",
+          pal
+        );
+        var pHi = Math.max(sPpm[0], sPpm[sPpm.length - 1]);
+        var pLo = Math.min(sPpm[0], sPpm[sPpm.length - 1]);
+        var pSpan = Math.max(0.2, pHi - pLo);
+        var maxSpec = 1e-9;
+        for (var i = 0; i < mCase.length; i++) maxSpec = Math.max(maxSpec, mCase[i]);
+        drawAxes(ctx, padX, padY + 8, pw, ph - 12, "1H (ppm, " + pHi.toFixed(2) + " -> " + pLo.toFixed(2) + ")", "Intensity Colored by STOCSY r^2", pal);
+        for (var i = 1; i < sPpm.length && i < mCase.length && i < r2Arr.length; i++) {
+          var r2v = r2Arr[i] || 0;
+          ctx.strokeStyle = r2v > 0.75 ? pal.coral : (r2v > 0.35 ? pal.amber : pal.cyan);
+          ctx.lineWidth = r2v > 0.75 ? 2.6 : 1.6;
+          var x0 = padX + ((pHi - sPpm[i - 1]) / pSpan) * pw;
+          var y0 = padY + ph - 12 - clamp(mCase[i - 1] / (maxSpec * 1.1), 0, 1) * (ph - 26);
+          var x1 = padX + ((pHi - sPpm[i]) / pSpan) * pw;
+          var y1 = padY + ph - 12 - clamp(mCase[i] / (maxSpec * 1.1), 0, 1) * (ph - 26);
+          ctx.beginPath();
+          ctx.moveTo(x0, y0);
+          ctx.lineTo(x1, y1);
+          ctx.stroke();
+          if (r2v > 0.75 && i % 2 === 0) {
+            addSpot(x1, y1, 13, "STOCSY Peak " + sPpm[i].toFixed(2) + " ppm", ["r^2 to " + drvPpm.toFixed(2) + " ppm: " + r2v.toFixed(3), topMatch]);
+          }
+        }
+      } else {
+        var accMode = reqStr("mcp.access_mode");
+        var fwMax = reqNum("mcp.homolog_firewall_max_seq_id");
+        var undoCap = reqNum("mcp.undo_capacity");
+        var undoEq = reqBool("mcp.undo_bitwise_eq");
+        var initResp = getByPath(payload, "mcp.initialize_response");
+        var torResp = getByPath(payload, "mcp.torsion_call_response");
+        var denResp = getByPath(payload, "mcp.readonly_denied_response");
+        if (!accMode || fwMax === null || undoCap === null || undoEq === null || !initResp || !torResp || !denResp) {
+          markMissing("mcp.responses");
+          drawFallbackPlaceholder("Module 08 Ch 4: MCP JSON-RPC Protocol Showcase");
+          return;
+        }
+        markPlotted("mcp.initialize_response");
+        markPlotted("mcp.torsion_call_response");
+        markPlotted("mcp.readonly_denied_response");
+        drawCardTitle(
+          ctx,
+          padX,
+          padY - 12,
+          "ILLUSTRATIVE PROTOCOL DIAGRAM (live engine JSON-RPC in payload): MCP " + accMode + " + Undo(" + undoCap + ")",
+          "HomologFirewall <=" + Math.round(fwMax * 100) + "% · Undo bitwise_eq=" + String(undoEq) + " · Click 'Inspect MCP JSON-RPC' below",
+          pal
+        );
+        var steps = [
+          ["1. initialize", "protocolVersion 2024-11-05"],
+          ["2. tools/call torsions", "Firewall <=" + Math.round(fwMax * 100) + "% OK"],
+          ["3. write_curated_peak_tsv", accMode + " guard DENIED"],
+          ["4. CommandHistory(" + undoCap + ")", "bitwise_eq=" + String(undoEq)]
+        ];
+        for (var s = 0; s < steps.length; s++) {
+          var bx = padX + (s / 4) * pw + 6;
+          var bw = pw / 4 - 14;
+          var active = s === Math.floor(localT * 4) % 4;
+          ctx.fillStyle = active ? "rgba(167, 139, 250, 0.22)" : pal.panel;
+          ctx.strokeStyle = active ? pal.violet : pal.border;
+          ctx.lineWidth = active ? 2 : 1.2;
+          drawRoundRect(ctx, bx, padY + ph * 0.28, bw, ph * 0.40, 8);
+          ctx.fill();
+          ctx.stroke();
           ctx.fillStyle = pal.text;
-          ctx.font = "600 12px -apple-system, sans-serif";
-          ctx.fillText(pt.name + " · Rh=" + pt.rh, sx + 10, sy - 6);
-          addSpot(sx, sy, 18, pt.name + " Stokes-Einstein", ["MW: " + pt.mw, "Rh: " + pt.rh]);
+          ctx.font = "600 11px ui-monospace, monospace";
+          ctx.fillText(steps[s][0], bx + 8, padY + ph * 0.44, bw - 16);
+          ctx.fillStyle = pal.muted;
+          ctx.font = "10.5px -apple-system, sans-serif";
+          ctx.fillText(steps[s][1], bx + 8, padY + ph * 0.56, bw - 16);
+          addSpot(bx + bw / 2, padY + ph * 0.47, 24, steps[s][0], [steps[s][1], "ILLUSTRATIVE protocol box backed by payload.mcp"]);
         }
       }
-      return;
     }
 
-    // Module 08: Metabolomics (AI-Binning/PQN, PCA/OPLS-DA, STOCSY, MCP)
-    var driverIdx = Math.round(clamp(ctrlVal, 0, 20));
-    if (chIdx === 0) {
-      drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: 24-Sample Control vs Case Cohort (AI-Binning + PQN)", "De Meyer valley-seeking bins · PQN vs TSA", pal);
-      drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Bucket ppm", "PQN Normalized Intensity", pal);
-      for (var c = 0; c < 2; c++) {
-        ctx.strokeStyle = c === 0 ? pal.cyan : pal.coral;
-        ctx.lineWidth = 2.2;
-        ctx.beginPath();
-        for (var i = 0; i <= 20; i++) {
-          var v = 0.25 + 0.55 * Math.abs(Math.sin(i * 0.7 + c * 0.9));
-          var sx = padX + (i / 20) * pw;
-          var sy = padY + ph - 12 - v * (ph - 24);
-          if (i === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
-          if (c === 1 && i % 4 === 0) addSpot(sx, sy, 14, "Bucket #" + i, ["Case/Ctrl fold: " + (1.2 + (i % 3) * 0.4).toFixed(2) + "x"], i);
-        }
-        ctx.stroke();
-      }
-    } else if (chIdx === 1) {
-      drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: PCA 95% Hotelling T^2 & OPLS-DA Q^2=0.969 (100-Perm)", "Leak-free stratified k-fold CV", pal);
-      drawAxes(ctx, padX, padY + 8, pw, ph - 12, "t[1] Predictive Score", "to[1] Orthogonal Score", pal);
-      ctx.strokeStyle = pal.amber;
-      ctx.setLineDash([5, 4]);
-      ctx.beginPath();
-      ctx.ellipse(padX + pw * 0.5, padY + ph * 0.5, pw * 0.4, ph * 0.36, 0, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      for (var i = 0; i < 24; i++) {
-        var isCase = i >= 12;
-        var sx = padX + pw * (isCase ? 0.68 : 0.32) + Math.sin(i * 2.3) * pw * 0.11;
-        var sy = padY + ph * 0.5 + Math.cos(i * 1.9) * ph * 0.22;
-        ctx.fillStyle = isCase ? pal.coral : pal.cyan;
-        ctx.beginPath();
-        ctx.arc(sx, sy, 5, 0, Math.PI * 2);
-        ctx.fill();
-        addSpot(sx, sy, 12, (isCase ? "Case" : "Control") + " Sample #" + ((i % 12) + 1), ["OPLS-DA Q^2 = 0.969", "Hotelling T^2 95% inside"]);
-      }
-    } else if (chIdx === 2) {
-      drawCardTitle(ctx, padX, padY - 12, "SYNTHETIC: STOCSY Correlation (Driver Bucket #" + driverIdx + " -> L-Lactate)", "r^2 = 1.00 · 3:1 stoichiometry", pal);
-      drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Metabolite Bucket (0..20)", "Intensity (colored by |r|)", pal);
-      for (var b = 0; b <= 20; b++) {
-        var isLactate = b === 4 || b === 15;
-        var corr = (b === driverIdx) ? 1.0 : (isLactate && (driverIdx === 4 || driverIdx === 15) ? 0.99 : Math.max(0.1, 0.6 - Math.abs(b - driverIdx) * 0.08));
-        var bx = padX + (b / 20) * (pw - 20) + 10;
-        var bh = (0.25 + 0.65 * corr) * (ph - 30);
-        ctx.fillStyle = corr > 0.9 ? pal.coral : (corr > 0.5 ? pal.amber : pal.cyan);
-        ctx.fillRect(bx - 5, padY + ph - 12 - bh, 10, bh);
-        addSpot(bx, padY + ph - 12 - bh, 12, "STOCSY Bucket #" + b, ["|r| = " + corr.toFixed(2), isLactate ? "L-Lactate multiplet" : "Background metabolite"], b);
-      }
-    } else {
-      drawCardTitle(ctx, padX, padY - 12, "PROTOCOL SHOWCASE (F18 OPEN): MCP JSON-RPC 2.0 ReadOnly + Undo(256)", "Open MCP Packet button below for live JSON", pal);
-      var steps = ["Client -> MCP: tools/call", "Sandbox: ReadOnly Guard", "nmr-core: Execute Tool", "Workbench: 256-Step Undo Stack"];
-      for (var s = 0; s < steps.length; s++) {
-        var bx = padX + (s / 4) * pw + 6;
-        var bw = pw / 4 - 14;
-        var active = s === Math.floor(localT * 4) % 4;
-        ctx.fillStyle = active ? "rgba(167, 139, 250, 0.22)" : pal.panel;
-        ctx.strokeStyle = active ? pal.violet : pal.border;
-        ctx.lineWidth = active ? 2 : 1.2;
-        drawRoundRect(ctx, bx, padY + ph * 0.28, bw, ph * 0.38, 8);
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = pal.text;
-        ctx.font = "600 11px -apple-system, sans-serif";
-        ctx.fillText(steps[s], bx + 8, padY + ph * 0.48, bw - 16);
-        addSpot(bx + bw / 2, padY + ph * 0.47, 24, steps[s], ["MCP JSON-RPC 2.0", "256-step reversible Undo"]);
-      }
+    renderSceneBody();
+
+    if (state) {
+      state.fallbackReasons = fallbackReasons;
+      state.plottedPayloadKeys = plottedKeys;
+    }
+    if (fallbackReasons.length > 0) {
+      ctx.save();
+      ctx.fillStyle = "rgba(136, 19, 55, 0.94)";
+      ctx.fillRect(0, 0, w, 26);
+      ctx.fillStyle = "#ffe4e6";
+      ctx.font = "700 11px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(
+        "ILLUSTRATIVE FALLBACK (not engine output): missing payload." + fallbackReasons.join(", "),
+        10,
+        17
+      );
+      ctx.restore();
     }
   }
 
@@ -3000,7 +3645,10 @@ TOURS_PLAYER_JS = r"""(function () {
         var defVal = item.interactive_control ? item.interactive_control.default_val : 0;
         var ctx = cvs.getContext("2d");
         if (ctx) {
-          renderModuleScene(ctx, cvs.width, cvs.height, modIdx, item.payload || {}, (elapsed + modIdx * 2.0) % 16.0, defVal, {}, null);
+          var gState = {};
+          renderModuleScene(ctx, cvs.width, cvs.height, modIdx, item.payload || {}, (elapsed + modIdx * 2.0) % 16.0, defVal, gState, null);
+          cvs._fallbackReasons = gState.fallbackReasons || [];
+          cvs._plottedPayloadKeys = gState.plottedPayloadKeys || [];
         }
       }
       requestAnimationFrame(tick);
@@ -3023,7 +3671,10 @@ TOURS_PLAYER_JS = r"""(function () {
     var panelInt = document.getElementById("panel-interactive");
     var panelVid = document.getElementById("panel-video");
     var canvas = document.getElementById("tour-canvas");
+    var fallbackBanner = document.getElementById("fallback-banner");
     var tooltip = document.getElementById("hud-tooltip");
+    var tooltipTitle = document.getElementById("hud-tooltip-title");
+    var tooltipBody = document.getElementById("hud-tooltip-body");
     var btnPlay = document.getElementById("btn-play");
     var timeReadout = document.getElementById("time-readout");
     var timeline = document.getElementById("timeline-range");
@@ -3058,6 +3709,8 @@ TOURS_PLAYER_JS = r"""(function () {
       manualOverride: false,
       pitchRad: 0.35,
       hotspots: [],
+      fallbackReasons: [],
+      plottedPayloadKeys: [],
       dragging: false,
       lastX: 0,
       lastY: 0,
@@ -3111,7 +3764,7 @@ TOURS_PLAYER_JS = r"""(function () {
     }
 
     function syncTransportUI() {
-      btnPlay.innerHTML = state.playing ? "&#10074;&#10074; Pause" : "&#9654; Play";
+      btnPlay.textContent = state.playing ? "\u275A\u275A Pause" : "\u25B6 Play";
       timeReadout.textContent = formatTime(state.tSec) + " / " + formatTime(duration);
       timeline.value = String(state.tSec);
       syncDrawerForTime(state.tSec);
@@ -3195,7 +3848,6 @@ TOURS_PLAYER_JS = r"""(function () {
       btnLoop.setAttribute("aria-pressed", String(state.loop));
     });
 
-    // Keyboard shortcuts: Space (play/pause), 1-4 (chapters)
     document.addEventListener("keydown", function (ev) {
       if (ev.target && (ev.target.tagName === "INPUT" || ev.target.tagName === "TEXTAREA")) return;
       if (ev.code === "Space") {
@@ -3210,7 +3862,6 @@ TOURS_PLAYER_JS = r"""(function () {
       }
     });
 
-    // Video chapter jumps
     for (var i = 0; i < vidJumpBtns.length; i++) {
       vidJumpBtns[i].addEventListener("click", function (ev) {
         var s = parseFloat(ev.currentTarget.getAttribute("data-start") || "0");
@@ -3230,7 +3881,6 @@ TOURS_PLAYER_JS = r"""(function () {
       });
     }
 
-    // Copy CLI button
     if (btnCopyCli && cliCmd) {
       btnCopyCli.addEventListener("click", function () {
         var text = cliCmd.textContent || "";
@@ -3243,19 +3893,11 @@ TOURS_PLAYER_JS = r"""(function () {
       });
     }
 
-    // Module 08 MCP packet inspector
     var mcpBtn = document.getElementById("btn-mcp-toggle");
     var mcpDrawer = document.getElementById("mcp-packet-drawer");
     if (mcpBtn && mcpDrawer) {
       var pkt = (bundle.payload && bundle.payload.mcp) ? bundle.payload.mcp : {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
-        params: {
-          name: "run_metabolomics_chemometrics",
-          arguments: { normalization: "pqn", cv_folds: 5, permutations: 100 }
-        },
-        result: { status: "ok", mode: "ReadOnly", q2: 0.969, undo_depth: 256 }
+        warning: "ILLUSTRATIVE FALLBACK (not engine output): missing payload.mcp"
       };
       mcpDrawer.textContent = JSON.stringify(pkt, null, 2);
       mcpBtn.addEventListener("click", function () {
@@ -3265,7 +3907,6 @@ TOURS_PLAYER_JS = r"""(function () {
       });
     }
 
-    // Export .webm via captureStream + MediaRecorder
     if (btnExport) {
       btnExport.addEventListener("click", function () {
         if (!canvas.captureStream || typeof MediaRecorder === "undefined") {
@@ -3302,10 +3943,16 @@ TOURS_PLAYER_JS = r"""(function () {
       });
     }
 
-    // Hover / Tap tooltip + Module 03 3D Drag-to-Orbit
     function showTooltip(cx, cy, spot) {
       if (!tooltip) return;
-      tooltip.innerHTML = "<strong>" + spot.title + "</strong>" + (spot.lines || []).join("<br/>");
+      var titleText = String(spot.title || "");
+      var bodyText = Array.isArray(spot.lines) ? spot.lines.join("\n") : "";
+      if (tooltipTitle && tooltipBody) {
+        tooltipTitle.textContent = titleText;
+        tooltipBody.textContent = bodyText;
+      } else {
+        tooltip.textContent = bodyText ? (titleText + "\n" + bodyText) : titleText;
+      }
       tooltip.hidden = false;
       var rect = canvas.getBoundingClientRect();
       var tx = clamp(cx + 14, 8, Math.max(8, rect.width - 240));
@@ -3365,7 +4012,6 @@ TOURS_PLAYER_JS = r"""(function () {
     window.addEventListener("pointerup", function () { state.dragging = false; });
     canvas.addEventListener("pointerleave", hideTooltip);
 
-    // HiDPI ResizeObserver
     var cssW = 800, cssH = 450;
     function resizeCanvas() {
       var wrap = document.getElementById("canvas-wrap");
@@ -3384,6 +4030,17 @@ TOURS_PLAYER_JS = r"""(function () {
     resizeCanvas();
     syncTransportUI();
 
+    function syncFallbackBanner() {
+      if (!fallbackBanner) return;
+      if (state.fallbackReasons && state.fallbackReasons.length > 0) {
+        fallbackBanner.hidden = false;
+        fallbackBanner.textContent = "ILLUSTRATIVE FALLBACK (not engine output): missing payload." + state.fallbackReasons.join(", ");
+      } else {
+        fallbackBanner.hidden = true;
+        fallbackBanner.textContent = "";
+      }
+    }
+
     function frameLoop(now) {
       var dt = Math.min(0.1, (now - state.lastFrameTs) * 0.001);
       state.lastFrameTs = now;
@@ -3396,7 +4053,6 @@ TOURS_PLAYER_JS = r"""(function () {
             state.playing = false;
           }
         }
-        // Auto-orbit Module 03 smoothly during Ch 4 unless manually overridden
         if (bundle.module_index === 3 && !state.manualOverride && state.tSec >= 12.0) {
           applyControl(((state.tSec - 12.0) / 4.0) * 360.0, false);
         }
@@ -3409,6 +4065,9 @@ TOURS_PLAYER_JS = r"""(function () {
         state.hotspots = [];
         renderModuleScene(ctx, cssW, cssH, bundle.module_index, bundle.payload || {}, state.tSec, state.ctrlVal, state, state.hotspots);
         canvas._lastHotspots = state.hotspots;
+        canvas._fallbackReasons = state.fallbackReasons;
+        canvas._plottedPayloadKeys = state.plottedPayloadKeys;
+        syncFallbackBanner();
       }
       requestAnimationFrame(frameLoop);
     }
@@ -3529,184 +4188,173 @@ def validate_js_syntax(js_text: str) -> List[str]:
     return errors
 
 
-def validate_tour_site(
-    site_files: Dict[str, bytes],
-    bundles: Sequence[NormalizedBundle],
-    videos_rel: str = "videos",
-) -> List[str]:
-    """Validate offline CSP, WCAG 1.4.4 viewport, synthetic disclosures, clean-room hygiene, and JS syntax."""
-    errors: List[str] = []
-    expected_names = {"index.html", "tours.css", "tours_player.js"} | {
-        f"{b.slug}.html" for b in bundles
-    }
-    missing = sorted(expected_names - set(site_files.keys()))
-    if missing:
-        errors.append(f"missing expected output files: {missing}")
+REQUIRED_MODULE_PAYLOAD_KEYS: Dict[int, Tuple[str, ...]] = {
+    1: (
+        "pulprog_name",
+        "aqseq",
+        "f1_quad",
+        "f2_quad",
+        "transfer_summary",
+        "fid_real",
+        "sine_window",
+        "fft_unphased",
+        "fft_phased",
+        "p0_deg",
+        "p1_deg",
+        "nus_mask",
+        "nus_dirty_spec",
+        "nus_fista_iters",
+        "nus_residual_l1",
+    ),
+    2: (
+        "hsqc_pos_contours",
+        "hsqc_neg_contours",
+        "hsqc_roots",
+        "hncacb_pulse_regime",
+        "strips",
+        "cv_temps",
+        "cv_vals",
+        "mean_energies",
+        "t_crit",
+        "max_cv",
+        "evo_acc_pct",
+        "std_acc_pct",
+        "bayes_acc_pct",
+        "res_confidences",
+        "res_labels",
+        "qc_verdict",
+        "n_high_conf",
+        "benchmarks.ubiquitin_realistic_pct",
+        "benchmarks.cisd3_acc_pct",
+    ),
+    3: (
+        "ca_coords",
+        "ss_classes",
+        "s2_vals",
+        "noe_pairs",
+        "rdc_points",
+        "q_work",
+        "q_free",
+        "da_nh_hz",
+        "rhombicity",
+        "f8_holdout_note",
+    ),
+    4: (
+        "snr_levels",
+        "locked_ls_bias_pct",
+        "local_max_bias_pct",
+        "times_r1",
+        "curve_600_r1",
+        "curve_800_r1",
+        "fit_600_rate",
+        "fit_600_se",
+        "fit_800_rate",
+        "fit_800_se",
+        "tau_m_ns",
+        "d_par_perp",
+        "seq_ids",
+        "r2_over_r1",
+        "s2_vals",
+        "rex_vals",
+        "model_ids",
+    ),
+    5: (
+        "cest.offsets_ppm",
+        "cest.b1_15hz_obs",
+        "cest.b1_15hz_fit",
+        "cest.b1_30hz_obs",
+        "cest.b1_30hz_fit",
+        "cest.p_b",
+        "cest.k_ex_s_inv",
+        "cest.major_ppm",
+        "cest.dw_ab_ppm",
+        "cpmg.nu_hz",
+        "cpmg.r2_600_obs",
+        "cpmg.r2_800_obs",
+        "cpmg.p_b",
+        "cpmg.k_ex_s_inv",
+        "cpmg.delta_aicc",
+        "hsqc_trajectories",
+        "csp_isotherm.protein_conc_um",
+        "csp_isotherm.fitted_kd_um",
+        "csp_isotherm.naive_mm_kd_um",
+        "csp_isotherm.ddelta_max_ppm",
+        "csp_isotherm.observed_points",
+    ),
+    6: (
+        "fid_processing.ppm",
+        "fid_processing.with_water",
+        "fid_processing.hsvd_flattened",
+        "fid_processing.baseline_roll",
+        "fid_processing.voigt_peaks",
+        "multiplet.ppm",
+        "multiplet.intensity",
+        "multiplet.class",
+        "multiplet.j_hz",
+        "multiplet.acs_report",
+        "qnmr.purity_percent",
+        "qnmr.u_k2_percent",
+        "qnmr.relaxation_guard_passed",
+        "qnmr.analyte_integral",
+        "qnmr.std_integral",
+        "octet_ibuprofen.smiles",
+        "octet_ibuprofen.atoms",
+        "octet_ibuprofen.bonds",
+        "octet_ibuprofen.h1_links",
+    ),
+    7: (
+        "gradients_g_cm",
+        "b_values_s_m2",
+        "ppm_axis",
+        "peaks",
+        "ilt_overlap.log10_d_grid",
+        "ilt_overlap.spectrum",
+        "ilt_overlap.selected_lambda",
+        "ilt_overlap.modes",
+        "hydrodynamics",
+    ),
+    8: (
+        "n_samples",
+        "n_buckets",
+        "pca.scores",
+        "pca.ellipse_95",
+        "oplsda.q2",
+        "oplsda.r2y",
+        "oplsda.perm_p_q2",
+        "oplsda.s_plot",
+        "stocsy.driver_ppm",
+        "stocsy.top_match",
+        "stocsy.ppm",
+        "stocsy.mean_ctrl",
+        "stocsy.mean_case",
+        "stocsy.r2",
+        "mcp.access_mode",
+        "mcp.homolog_firewall_max_seq_id",
+        "mcp.undo_capacity",
+        "mcp.undo_bitwise_eq",
+        "mcp.initialize_response",
+        "mcp.torsion_call_response",
+        "mcp.readonly_denied_response",
+    ),
+}
 
-    cdn_re = re.compile(r'<(?:script|link|img|source)\b[^>]+(?:src|href)\s*=\s*["\']https?://', re.I)
-    forbidden_vp_re = re.compile(r"user-scalable\s*=\s*no|maximum-scale\s*=\s*1(\.0)?", re.I)
-    v_rel = videos_rel.rstrip("/")
 
-    for name, raw in sorted(site_files.items()):
-        text = raw.decode("utf-8")
-        # Strip standard WAI-ARIA HTML/JS attribute names (aria-label, aria-hidden, etc.)
-        # before clean-room product token checks so ARIA accessibility attributes do not false-trigger.
-        sanitized_low = re.sub(r"\baria-[a-z]+\b", " ", text.lower())
-        for tok in RESTRICTED_PRODUCT_TOKENS:
-            if re.search(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", sanitized_low):
-                errors.append(f"{name}: contains forbidden NMR product token {tok!r}")
-
-        if name.endswith(".html"):
-            if cdn_re.search(text):
-                errors.append(f"{name}: external http:// or https:// CDN resource reference detected")
-            if 'content="width=device-width, initial-scale=1.0, viewport-fit=cover"' not in text:
-                errors.append(f"{name}: missing WCAG 1.4.4 viewport-fit=cover meta")
-            if forbidden_vp_re.search(text):
-                errors.append(f"{name}: forbidden zoom-disabling viewport attribute detected")
-
-    for b in bundles:
-        page_name = f"{b.slug}.html"
-        if page_name not in site_files:
-            continue
-        page_text = site_files[page_name].decode("utf-8")
-        if b.module_index >= 4 and "SYNTHETIC" not in page_text:
-            errors.append(f"{page_name}: missing explicit SYNTHETIC showcase disclosure text")
-        if "<video" not in page_text:
-            errors.append(f"{page_name}: missing <video> element")
-        if f'src="{v_rel}/{b.slug}.webm"' not in page_text:
-            errors.append(f"{page_name}: missing .webm <source> tag")
-        if f'src="{v_rel}/{b.slug}.mp4"' not in page_text:
-            errors.append(f"{page_name}: missing .mp4 <source> tag")
-
-    if "tours_player.js" in site_files:
-        errors.extend(validate_js_syntax(site_files["tours_player.js"].decode("utf-8")))
-
-    # Verify build determinism
-    second = build_tour_site_files(bundles, videos_rel=videos_rel)
-    if site_digest(site_files) != site_digest(second):
-        errors.append("non-deterministic tour build output detected across consecutive renders")
-
-    return errors
+def _lookup_dot_path(obj: Any, dot_path: str) -> Tuple[bool, Any]:
+    cur = obj
+    for part in dot_path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return False, None
+        cur = cur[part]
+    return True, cur
 
 
-def _make_mock_bundles(data_dir: Path) -> None:
-    """Create minimal synthetic 01..08 *.tour.json fixtures for --self-test."""
-    specs = [
-        (1, "01_fid_pulprog_nus", "Raw-FID DSP & Pulprog Engine", "02-custom-pulprog-and-dsp.html", "fid_ingest_synthetic_nus", "RAW BRUKER/VARIAN FID INGEST · SYNTHETIC NUS DEMO", "25% Poisson-gap NUS & IST (synthetic demo)", "nus_iter", 0, 20, 1, 20, "iter"),
-        (2, "02_hsqc_strips_solvers", "HSQC Strips & Backbone Solvers", "03-solvers-and-calibration.html", "cold_gate_failed_withdrawn", "SYNTHETIC / DEV · COLD HCP GATE FAILED (WITHDRAWN)", "Synthetic UBQ 98.4%, dev CISD3 64.38%; cold evo-graph 88.25-95.30% (FAILS >=94%; withdrawn)", "focus_res", 1, 10, 1, 7, "res"),
-        (3, "03_structure_noe_rdc", "3D Structure, NOE & RDC", "01-quickstart-and-workflows.html", "cold_holdout_disclosed", "COLD HOLDOUT DISCLOSED (F8)", "Unseen 1KHM->1ZZK 1.86-4.14 A (0/5 < 1.80 A)", "orbit_deg", 0, 360, 5, 45, "deg"),
-        (4, "04_relax_modelfree", "Relaxation & Lipari-Szabo", "04-dynamics-and-exchange.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F10/F11 OPEN)", "Dual-field R1/R2/hetNOE & M1-M5 S^2", "residue_seq", 1, 76, 1, 23, "res"),
-        (5, "05_exchange_cest_cpmg_csp", "CEST, CPMG & Tight-Binding CSP", "04-dynamics-and-exchange.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F13 OPEN)", "Pade CEST, Baldwin CPMG & Morrison Kd", "ligand_um", 0, 300, 5, 100, "uM"),
-        (6, "06_nmr1d_multiplet_qnmr_octet", "1D Multiplets, qNMR & Octet", "05-nmr1d-multiplets-and-dosy.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F14 OPEN)", "(S)-Ibuprofen Hoye ddd, GUM qNMR & Octet", "atom_idx", 0, 14, 1, 3, "atom"),
-        (7, "07_dosy_diffusion", "DOSY Diffusion & Rh Sizing", "05-nmr1d-multiplets-and-dosy.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F16 OPEN)", "BPP-LED Stejskal-Tanner, 2D DOSY & Rh", "grad_step", 0, 15, 1, 4, "step"),
-        (8, "08_metabolomics_mcp", "Metabolomics, STOCSY & MCP", "08-metabolomics-and-chemometrics.html", "synthetic_and_protocol_showcase", "SYNTHETIC & PROTOCOL SHOWCASE (F17/F18 OPEN)", "AI-Binning, PQN, OPLS-DA, STOCSY & MCP JSON-RPC", "driver_bucket", 0, 20, 1, 4, "bucket"),
-    ]
-    data_dir.mkdir(parents=True, exist_ok=True)
-    for idx, slug, title, man_ch, b_kind, b_lbl, b_det, cid, cmin, cmax, cstep, cdef, cunit in specs:
-        doc = {
-            "schema_version": EXPECTED_SCHEMA_VERSION,
-            "module_index": idx,
-            "slug": slug,
-            "title": title,
-            "subtitle": f"Deterministic nmr-core showcase for {title}",
-            "manual_chapter": man_ch,
-            "validation_badge": {"kind": b_kind, "label": b_lbl, "detail": b_det},
-            "duration_sec": 16.0,
-            "fps": 30,
-            "cli_command": f"ferric export-tour --module {idx:02d} --out-dir docs/tours",
-            "chapters": [
-                {"index": 1, "start_sec": 0.0, "end_sec": 4.0, "title": "Stage One", "caption": "Chapter 1 physics", "metric": "Ch1"},
-                {"index": 2, "start_sec": 4.0, "end_sec": 8.0, "title": "Stage Two", "caption": "Chapter 2 physics", "metric": "Ch2"},
-                {"index": 3, "start_sec": 8.0, "end_sec": 12.0, "title": "Stage Three", "caption": "Chapter 3 physics", "metric": "Ch3"},
-                {"index": 4, "start_sec": 12.0, "end_sec": 16.0, "title": "Stage Four", "caption": "Chapter 4 physics", "metric": "Ch4"},
-            ],
-            "interactive_control": {
-                "id": cid,
-                "label": cid,
-                "min": cmin,
-                "max": cmax,
-                "step": cstep,
-                "default_val": cdef,
-                "unit": cunit,
-            },
-            "payload": {"seed": 20261801, "module": idx},
-        }
-        (data_dir / f"{slug}.tour.json").write_text(
-            json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8"
-        )
-
-
-def run_self_tests() -> int:
-    """Run deterministic, offline-CSP, WCAG, synthetic-disclosure, and JS syntax self-tests."""
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        data_dir = root / "data"
-        out_a = root / "out_a"
-        out_b = root / "out_b"
-        _make_mock_bundles(data_dir)
-
-        bundles = load_tour_bundles(data_dir)
-        assert len(bundles) == 8, f"expected 8 bundles, got {len(bundles)}"
-
-        files_a = build_tour_site_files(bundles, videos_rel="videos")
-        files_b = build_tour_site_files(bundles, videos_rel="videos")
-        write_site_to_disk(out_a, files_a)
-        write_site_to_disk(out_b, files_b)
-
-        # 1. Determinism & 11 expected artifacts (9 HTML + CSS + JS)
-        assert len(files_a) == 11, f"expected 11 output files, got {len(files_a)}"
-        assert site_digest(files_a) == site_digest(files_b), "build is non-deterministic"
-
-        # 2. Full validator pass & no Python-only raw_json wrapper in generated JS
-        errs = validate_tour_site(files_a, bundles, videos_rel="videos")
-        assert not errs, f"unexpected validation errors: {errs}"
-        assert b"raw_json" not in files_a["tours_player.js"], (
-            "generated tours_player.js must not reference Python raw_json wrapper"
-        )
-
-        # 3. Adversarial checks: external CDN must fail
-        mut_cdn = dict(files_a)
-        mut_cdn["index.html"] = files_a["index.html"].replace(
-            b"</head>", b'<script src="https://cdn.example.com/x.js"></script></head>'
-        )
-        assert any("CDN" in e for e in validate_tour_site(mut_cdn, bundles))
-
-        # 4. Adversarial check: user-scalable=no must fail WCAG 1.4.4
-        mut_wcag = dict(files_a)
-        mut_wcag["index.html"] = files_a["index.html"].replace(
-            b"viewport-fit=cover", b"viewport-fit=cover, user-scalable=no"
-        )
-        assert any("zoom-disabling" in e for e in validate_tour_site(mut_wcag, bundles))
-
-        # 5. Adversarial check: missing SYNTHETIC disclosure on module 04 must fail
-        mut_synth = dict(files_a)
-        mut_synth["04_relax_modelfree.html"] = files_a["04_relax_modelfree.html"].replace(
-            b"SYNTHETIC", b"HIDDEN"
-        )
-        assert any("SYNTHETIC" in e for e in validate_tour_site(mut_synth, bundles))
-
-        # 6. Adversarial check: restricted product token must fail
-        mut_tok = dict(files_a)
-        mut_tok["index.html"] = files_a["index.html"] + f"<!-- {RESTRICTED_PRODUCT_TOKENS[0]} -->".encode("utf-8")
-        assert any("forbidden NMR product token" in e for e in validate_tour_site(mut_tok, bundles))
-
-        # 7. CLI --check end-to-end verification
-        check_out = root / "out_cli_check"
-        rc = main(["--data-dir", str(data_dir), "--out", str(check_out), "--videos-rel", "videos", "--check"])
-        assert rc == 0, f"expected --check rc=0, got {rc}"
-        assert (check_out / "index.html").is_file()
-        assert (check_out / "tours.css").is_file()
-        assert (check_out / "tours_player.js").is_file()
-
-        # 8. Hard JS runtime execution test via Node vm across all 8 modules x ?ch=1..4 (32 pairs)
-        node_bin = shutil.which("node")
-        if node_bin is not None:
-            node_harness = r"""
+NODE_VM_CHECK_HARNESS = r"""
 const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
 
 const outDir = process.argv[1];
+const expectFallback = process.argv[2] === "expect-fallback";
 const jsCode = fs.readFileSync(path.join(outDir, "tours_player.js"), "utf8");
 const htmlFiles = fs.readdirSync(outDir).filter(f => /^\d{2}_.*\.html$/.test(f)).sort();
 if (htmlFiles.length !== 8) {
@@ -3714,6 +4362,7 @@ if (htmlFiles.length !== 8) {
 }
 
 let pairs = 0;
+let fallbackTriggers = 0;
 for (const file of htmlFiles) {
   const html = fs.readFileSync(path.join(outDir, file), "utf8");
   const m = html.match(/<script[^>]*id="tour-bundle-data"[^>]*>([\s\S]*?)<\/script>/);
@@ -3751,12 +4400,11 @@ for (const file of htmlFiles) {
     const makeEl = (id) => ({
       id,
       textContent: "",
-      innerHTML: "",
       value: "0",
       min: "0",
       max: "20",
       step: "1",
-      hidden: false,
+      hidden: id === "fallback-banner",
       paused: true,
       width: 960,
       height: 540,
@@ -3800,6 +4448,7 @@ for (const file of htmlFiles) {
       parseInt,
       parseFloat,
       isNaN,
+      isFinite,
       URLSearchParams,
       document: doc,
       localStorage: { getItem() { return null; }, setItem() {} },
@@ -3821,8 +4470,30 @@ for (const file of htmlFiles) {
     vm.runInNewContext(jsCode, sandbox, { filename: "tours_player.js" });
     for (const fn of domListeners) fn();
 
+    const cvs = elements["tour-canvas"];
+    const fbReasons = (cvs && cvs._fallbackReasons) || [];
+    const plottedKeys = (cvs && cvs._plottedPayloadKeys) || [];
+    const fbEl = elements["fallback-banner"];
+
+    if (fbReasons.length > 0) {
+      fallbackTriggers++;
+      if (!fbEl || fbEl.hidden || !fbEl.textContent.includes("ILLUSTRATIVE FALLBACK")) {
+        throw new Error(file + " ?ch=" + ch + " fallback fired (" + fbReasons.join(",") + ") without visible #fallback-banner");
+      }
+      if (!expectFallback) {
+        throw new Error(file + " ?ch=" + ch + " triggered payload fallback: " + fbReasons.join(", "));
+      }
+      continue;
+    }
+
     if (drawCalls < 15) {
       throw new Error(file + " ?ch=" + ch + " drew only " + drawCalls + " canvas calls (< 15)");
+    }
+    if (plottedKeys.length < 1) {
+      throw new Error(file + " ?ch=" + ch + " did not record any plotted payload keys");
+    }
+    if (fbEl && !fbEl.hidden) {
+      throw new Error(file + " ?ch=" + ch + " left #fallback-banner visible despite 0 fallbacks");
     }
     const chObj = (parsed.chapters || [])[ch - 1];
     if (chObj && (chObj.metric_pill || chObj.metric)) {
@@ -3832,36 +4503,554 @@ for (const file of htmlFiles) {
       }
     }
     if (file.startsWith("02_") && ch === 2) {
-      const spots = (elements["tour-canvas"] && elements["tour-canvas"]._lastHotspots) || [];
+      const spots = (cvs && cvs._lastHotspots) || [];
       for (const rName of ["Phe4", "Val5", "Lys6", "Thr7", "Leu8", "Thr9"]) {
         const nPeaks = spots.filter(s => s.title.startsWith(rName + " C")).length;
         if (nPeaks !== 4) {
           throw new Error("Expected 4 HNCACB peak hotspots on " + rName + ", got " + nPeaks);
         }
       }
-      const nGly = spots.filter(s => s.title.startsWith("Gly10 C")).length;
-      if (nGly !== 3) {
-        throw new Error("Expected 3 HNCACB peak hotspots on Gly10, got " + nGly);
+      const glySpots = spots.filter(s => s.title.startsWith("Gly10 C"));
+      if (glySpots.length !== 3) {
+        throw new Error("Expected 3 HNCACB peak hotspots on Gly10, got " + glySpots.length);
+      }
+      const glyCa = glySpots.find(s => s.title.startsWith("Gly10 CA(i):"));
+      if (!glyCa || !glyCa.title.includes("+1") || !(glyCa.lines || []).join(" ").includes("Non-CT HNCACB")) {
+        throw new Error("Gly10 CA(i) hotspot missing +1 Non-CT HNCACB sign disclosure");
       }
     }
     pairs++;
   }
 }
-console.log("NODE_VM_OK pairs=" + pairs);
+if (expectFallback && fallbackTriggers === 0) {
+  throw new Error("Expected at least one fallback trigger in adversarial mode, got 0");
+}
+console.log("NODE_VM_OK pairs=" + pairs + " fallbacks=" + fallbackTriggers);
 """
+
+
+def validate_tour_site(
+    site_files: Dict[str, bytes],
+    bundles: Sequence[NormalizedBundle],
+    videos_rel: str = "videos",
+) -> List[str]:
+    """Validate offline CSP, WCAG 1.4.4 viewport, payload completeness, zero innerHTML, clean-room hygiene, and Node vm execution."""
+    errors: List[str] = []
+    expected_names = {"index.html", "tours.css", "tours_player.js"} | {
+        f"{b.slug}.html" for b in bundles
+    }
+    missing = sorted(expected_names - set(site_files.keys()))
+    if missing:
+        errors.append(f"missing expected output files: {missing}")
+
+    cdn_re = re.compile(r'<(?:script|link|img|source)\b[^>]+(?:src|href)\s*=\s*["\']https?://', re.I)
+    forbidden_vp_re = re.compile(r"user-scalable\s*=\s*no|maximum-scale\s*=\s*1(\.0)?", re.I)
+    v_rel = videos_rel.rstrip("/")
+
+    for name, raw in sorted(site_files.items()):
+        text = raw.decode("utf-8")
+        # Strip standard WAI-ARIA HTML/JS attribute names (aria-label, aria-hidden, etc.)
+        # before clean-room product token checks so ARIA accessibility attributes do not false-trigger.
+        sanitized_low = re.sub(r"\baria-[a-z]+\b", " ", text.lower())
+        for tok in RESTRICTED_PRODUCT_TOKENS:
+            if re.search(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", sanitized_low):
+                errors.append(f"{name}: contains forbidden NMR product token {tok!r}")
+
+        if name.endswith(".html"):
+            if cdn_re.search(text):
+                errors.append(f"{name}: external http:// or https:// CDN resource reference detected")
+            if 'content="width=device-width, initial-scale=1.0, viewport-fit=cover"' not in text:
+                errors.append(f"{name}: missing WCAG 1.4.4 viewport-fit=cover meta")
+            if forbidden_vp_re.search(text):
+                errors.append(f"{name}: forbidden zoom-disabling viewport attribute detected")
+
+    for b in bundles:
+        page_name = f"{b.slug}.html"
+        if page_name in site_files:
+            page_text = site_files[page_name].decode("utf-8")
+            if b.module_index >= 4 and "SYNTHETIC" not in page_text:
+                errors.append(f"{page_name}: missing explicit SYNTHETIC showcase disclosure text")
+            if 'id="fallback-banner"' not in page_text:
+                errors.append(f"{page_name}: missing #fallback-banner warning element")
+            if "<video" not in page_text:
+                errors.append(f"{page_name}: missing <video> element")
+            if f'src="{v_rel}/{b.slug}.webm"' not in page_text:
+                errors.append(f"{page_name}: missing .webm <source> tag")
+            if f'src="{v_rel}/{b.slug}.mp4"' not in page_text:
+                errors.append(f"{page_name}: missing .mp4 <source> tag")
+
+        payload = b.raw_json.get("payload")
+        req_keys = REQUIRED_MODULE_PAYLOAD_KEYS.get(b.module_index, ())
+        if not isinstance(payload, dict):
+            errors.append(f"{b.slug}.tour.json: missing object payload")
+        else:
+            for dot_key in req_keys:
+                found, val = _lookup_dot_path(payload, dot_key)
+                if not found or val is None:
+                    errors.append(f"{b.slug}.tour.json: missing required payload.{dot_key}")
+                elif isinstance(val, (list, str, dict)) and len(val) == 0:
+                    errors.append(f"{b.slug}.tour.json: empty required payload.{dot_key}")
+
+    if "tours_player.js" in site_files:
+        js_text = site_files["tours_player.js"].decode("utf-8")
+        if ".innerHTML" in js_text:
+            errors.append("tours_player.js: forbidden .innerHTML assignment detected (use .textContent)")
+        errors.extend(validate_js_syntax(js_text))
+
+    node_bin = shutil.which("node")
+    if node_bin is not None and not errors:
+        with tempfile.TemporaryDirectory() as tmp_vm:
+            vm_dir = Path(tmp_vm)
+            write_site_to_disk(vm_dir, site_files)
             proc = subprocess.run(
-                [node_bin, "-e", node_harness, str(check_out)],
+                [node_bin, "-e", NODE_VM_CHECK_HARNESS, str(vm_dir)],
                 capture_output=True,
                 text=True,
                 timeout=30,
+                check=False,
             )
-            assert proc.returncode == 0, f"Node JS runtime self-test failed:\n{proc.stdout}\n{proc.stderr}"
-            assert "NODE_VM_OK pairs=32" in proc.stdout, f"Unexpected node output: {proc.stdout}"
+            if proc.returncode != 0:
+                errors.append(f"Node vm runtime payload check failed: {(proc.stderr or proc.stdout).strip()}")
+
+    # Verify build determinism
+    second = build_tour_site_files(bundles, videos_rel=videos_rel)
+    if site_digest(site_files) != site_digest(second):
+        errors.append("non-deterministic tour build output detected across consecutive renders")
+
+    return errors
+
+
+def _make_mock_payload(module_index: int) -> Dict[str, Any]:
+    """Construct complete schema-accurate mock payloads for Modules 01..08 self-tests."""
+    if module_index == 1:
+        fid = [round((0.85 ** k) * (1.0 if k % 3 != 2 else -0.6), 4) for k in range(32)]
+        sine = [round(0.2 + 0.8 * (k / 31.0), 4) for k in range(32)]
+        fft_p = [0.05] * 64
+        for idx, amp in ((12, 1.0), (24, 0.72), (38, 0.28), (50, 0.85)):
+            fft_p[idx - 1] = amp * 0.45
+            fft_p[idx] = amp
+            fft_p[idx + 1] = amp * 0.45
+        fft_u = [round(v * 0.7 - 0.08, 4) for v in fft_p]
+        return {
+            "pulprog_name": "hncacbgpwg3d",
+            "aqseq": "321",
+            "f1_quad": "EchoAntiecho",
+            "f2_quad": "StatesTppi",
+            "transfer_summary": "Hncacb (3D)",
+            "fid_real": fid,
+            "sine_window": sine,
+            "fft_unphased": fft_u,
+            "fft_phased": fft_p,
+            "p0_deg": 35.5,
+            "p1_deg": -20.1,
+            "nus_mask": [k % 4 == 0 for k in range(64)],
+            "nus_dirty_spec": [round(v + (0.12 if i % 5 == 0 else 0.02), 4) for i, v in enumerate(fft_p)],
+            "nus_fista_iters": [
+                [round(v + (0.14 * (0.85 ** it) if i % 5 == 0 else 0.0), 4) for i, v in enumerate(fft_p)]
+                for it in range(21)
+            ],
+            "nus_residual_l1": [round(0.42 * (0.90 ** it), 3) for it in range(21)],
+        }
+    if module_index == 2:
+        strip_defs = [
+            (1, "MET1", 8.25, 120.0, 54.5, 33.1, None, None),
+            (2, "GLN2", 8.90, 122.8, 55.1, 30.8, 54.5, 33.1),
+            (3, "ILE3", 8.32, 115.2, 59.6, 42.1, 55.1, 30.8),
+            (4, "PHE4", 8.61, 118.4, 56.8, 41.2, 59.6, 42.1),
+            (5, "VAL5", 9.30, 121.2, 61.8, 32.7, 56.8, 41.2),
+            (6, "LYS6", 8.94, 127.8, 54.9, 32.9, 61.8, 32.7),
+            (7, "THR7", 8.76, 115.3, 61.9, 69.5, 54.9, 32.9),
+            (8, "LEU8", 9.12, 121.1, 57.0, 41.6, 61.9, 69.5),
+            (9, "THR9", 7.65, 105.9, 61.5, 68.4, 57.0, 41.6),
+            (10, "GLY10", 7.84, 109.2, 45.3, None, 61.5, 68.4),
+        ]
+        strips = []
+        for sid, lbl, h, n, cai, cbi, caim1, cbim1 in strip_defs:
+            strips.append({
+                "seq_id": sid,
+                "label": lbl,
+                "h_ppm": h,
+                "n_ppm": n,
+                "ca_i": cai,
+                "cb_i": cbi,
+                "ca_im1": caim1,
+                "cb_im1": cbim1,
+                "ca_i_sign": 1 if cai is not None else None,
+                "cb_i_sign": -1 if cbi is not None else None,
+                "ca_im1_sign": 1 if caim1 is not None else None,
+                "cb_im1_sign": -1 if cbim1 is not None else None,
+                "pos_pts": [[20.0 + k * 5.0, 0.8 if abs((20.0 + k * 5.0) - cai) < 4.0 else 0.05] for k in range(11)],
+                "neg_pts": [[20.0 + k * 5.0, 0.7 if (cbi and abs((20.0 + k * 5.0) - cbi) < 4.0) else 0.04] for k in range(11)],
+            })
+        return {
+            "hsqc_pos_contours": [[[8.6, 118.2], [8.55, 118.6], [8.62, 118.9]]],
+            "hsqc_neg_contours": [[[7.36, 115.4], [7.32, 115.8], [7.38, 116.0]]],
+            "hsqc_roots": [{"h": 8.0 + (i % 15) * 0.1, "n": 108.0 + (i % 20), "label": f"RES{i + 1}"} for i in range(72)],
+            "hncacb_pulse_regime": "non-CT Wittekind-Mueller HNCACB (2*d28=7.2ms): CA +1 (incl. Gly10 CA +1, CB absent; CT 2T=28ms inverts Gly CH2), CB -1",
+            "strips": strips,
+            "cv_temps": [round(5.0 * (0.85 ** k), 4) for k in range(12)],
+            "cv_vals": [0.8, 1.1, 1.9, 3.4, 6.8, 11.2, 8.5, 4.2, 2.1, 1.3, 0.9, 0.6],
+            "mean_energies": [-20.0 - k * 14.5 for k in range(12)],
+            "t_crit": 2.21,
+            "max_cv": 11.2,
+            "evo_acc_pct": 98.6,
+            "std_acc_pct": 88.9,
+            "bayes_acc_pct": 94.4,
+            "res_confidences": [0.92 if r not in (23, 52) else 0.68 for r in range(76)],
+            "res_labels": [f"RES{r + 1}" for r in range(76)],
+            "qc_verdict": "PASS",
+            "n_high_conf": 74,
+            "benchmarks": {
+                "ubiquitin_realistic_pct": 98.4,
+                "cisd3_acc_pct": 64.38,
+                "cisd3_hc_prec_pct": 100.0,
+                "cold_bmrb_hc_min_pct": 86.18,
+                "cold_bmrb_hc_max_pct": 96.31,
+            },
+        }
+    if module_index == 3:
+        return {
+            "ca_coords": [[float(i) * 1.2, float((i % 5) - 2) * 1.8, float((i % 7) - 3) * 1.4] for i in range(24)],
+            "ss_classes": [2 if i < 8 else (1 if i < 16 else 0) for i in range(24)],
+            "s2_vals": [0.86 if i < 20 else 0.45 for i in range(24)],
+            "noe_pairs": [{"a": 1, "b": 14, "upper_a": 4.2}, {"a": 3, "b": 12, "upper_a": 3.8}, {"a": 5, "b": 18, "upper_a": 4.5}, {"a": 7, "b": 20, "upper_a": 4.8}],
+            "rdc_points": [{"d_obs": -10.0 + i * 2.1, "d_calc": -9.8 + i * 2.08, "is_free": (i % 4 == 0), "seq_id": i + 2} for i in range(12)],
+            "q_work": 0.142,
+            "q_free": 0.188,
+            "da_nh_hz": -11.4,
+            "rhombicity": 0.24,
+            "f8_holdout_note": "F8: unseen 1KHM -> 1ZZK improves NOE-only on 5/5 seeds (1.86-4.14 A), 0/5 < 1.80 A",
+        }
+    if module_index == 4:
+        seq_ids = [r for r in range(2, 32) if r != 19]
+        return {
+            "snr_levels": [80.0, 40.0, 20.0, 10.0, 6.0, 4.0],
+            "locked_ls_bias_pct": [0.05, -0.08, 0.12, -0.19, 0.31, 0.42],
+            "local_max_bias_pct": [1.4, 2.9, 5.8, 11.7, 19.4, 29.2],
+            "times_r1": [0.02, 0.08, 0.16, 0.30, 0.50, 0.75, 1.05, 1.40],
+            "curve_600_r1": [95.8, 84.1, 70.9, 52.4, 34.1, 19.9, 10.5, 4.9],
+            "curve_800_r1": [96.8, 87.8, 77.1, 61.5, 44.5, 29.7, 18.2, 10.3],
+            "fit_600_rate": 2.15,
+            "fit_600_se": 0.04,
+            "fit_800_rate": 1.62,
+            "fit_800_se": 0.03,
+            "tau_m_ns": 4.10,
+            "d_par_perp": 1.17,
+            "seq_ids": seq_ids,
+            "r2_over_r1": [6.8 if r == 23 else 4.35 for r in seq_ids],
+            "s2_vals": [0.84 if r == 23 else 0.87 for r in seq_ids],
+            "rex_vals": [3.6 if r == 23 else 0.0 for r in seq_ids],
+            "model_ids": ["M3" if r == 23 else "M2" for r in seq_ids],
+        }
+    if module_index == 5:
+        offs = [round(115.0 + 0.5 * i, 2) for i in range(16)]
+        fit15 = [0.18 if abs(x - 117.5) < 0.3 else (0.72 if abs(x - 121.0) < 0.3 else 0.98) for x in offs]
+        fit30 = [0.08 if abs(x - 117.5) < 0.5 else (0.55 if abs(x - 121.0) < 0.4 else 0.96) for x in offs]
+        return {
+            "cest": {
+                "offsets_ppm": offs,
+                "b1_15hz_obs": fit15,
+                "b1_15hz_fit": fit15,
+                "b1_30hz_obs": fit30,
+                "b1_30hz_fit": fit30,
+                "p_b": 0.015,
+                "k_ex_s_inv": 150.0,
+                "major_ppm": 117.5,
+                "dw_ab_ppm": 3.5,
+            },
+            "cpmg": {
+                "nu_hz": [25.0, 50.0, 100.0, 200.0, 400.0, 800.0],
+                "r2_600_obs": [18.4, 17.6, 15.8, 13.2, 11.1, 10.5],
+                "r2_800_obs": [24.2, 22.9, 19.8, 15.6, 13.1, 12.6],
+                "p_b": 0.019,
+                "k_ex_s_inv": 850.0,
+                "delta_aicc": 48.2,
+                "significant_exchange": True,
+                "f_pvalue": 1.2e-6,
+            },
+            "hsqc_trajectories": [
+                {
+                    "seq_id": 44,
+                    "res_name": "ILE",
+                    "max_csp": 0.412,
+                    "points": [
+                        {"ligand_um": l, "h_ppm": 8.42 + 0.0012 * l, "n_ppm": 121.2 - 0.006 * l, "csp_ppm": 0.41 * (l / (l + 30.0))}
+                        for l in (0.0, 25.0, 75.0, 150.0, 250.0)
+                    ],
+                },
+                {
+                    "seq_id": 68,
+                    "res_name": "HIS",
+                    "max_csp": 0.275,
+                    "points": [
+                        {"ligand_um": l, "h_ppm": 7.92 + 0.0008 * l, "n_ppm": 118.1 + 0.004 * l, "csp_ppm": 0.28 * (l / (l + 30.0))}
+                        for l in (0.0, 25.0, 75.0, 150.0, 250.0)
+                    ],
+                },
+            ],
+            "csp_isotherm": {
+                "protein_conc_um": 100.0,
+                "true_kd_um": 5.0,
+                "fitted_kd_um": 5.08,
+                "naive_mm_kd_um": 41.2,
+                "ddelta_max_ppm": 0.412,
+                "observed_points": [
+                    {"ligand_um": 20.0, "csp_ppm": 0.078},
+                    {"ligand_um": 75.0, "csp_ppm": 0.274},
+                    {"ligand_um": 130.0, "csp_ppm": 0.382},
+                    {"ligand_um": 250.0, "csp_ppm": 0.402},
+                ],
+            },
+        }
+    if module_index == 6:
+        fppm = [round(5.2 - i * 0.12, 3) for i in range(28)]
+        flat = [4.8 if abs(p - 3.84) < 0.08 else (5.5 if abs(p - 2.35) < 0.08 else 0.08) for p in fppm]
+        with_w = [85.0 if abs(p - 4.78) < 0.12 else v + 0.6 for p, v in zip(fppm, flat)]
+        mppm = [round(5.88 - i * 0.004, 4) for i in range(31)]
+        mint = [0.85 if i in (4, 8, 12, 14, 16, 18, 22, 26) else 0.06 for i in range(31)]
+        return {
+            "fid_processing": {
+                "ppm": fppm,
+                "with_water": with_w,
+                "hsvd_flattened": flat,
+                "baseline_roll": [0.55 for _ in fppm],
+                "voigt_peaks": [{"center_ppm": 3.85, "fwhm_hz": 2.2, "height": 4.8, "lorentz_fraction": 0.88}],
+            },
+            "multiplet": {
+                "center_ppm": 5.82,
+                "class": "ddd",
+                "j_hz": [14.2, 7.1, 2.4],
+                "acs_report": "1H NMR (500 MHz, CDCl3) delta 5.82 (ddd, J = 14.2, 7.1, 2.4 Hz, 1H).",
+                "ppm": mppm,
+                "intensity": mint,
+            },
+            "qnmr": {
+                "purity_percent": 98.40,
+                "u_k2_percent": 0.14,
+                "relaxation_guard_passed": True,
+                "analyte_integral": 1.968,
+                "std_integral": 6.000,
+            },
+            "octet_ibuprofen": {
+                "smiles": "CC(C)Cc1ccc(cc1)[C@@H](C)C(=O)O",
+                "n_atoms": 8,
+                "atoms": [{"idx": i, "element": "O" if i == 7 else "C", "x": float(i), "y": float(i % 2)} for i in range(8)],
+                "bonds": [{"a": i, "b": i + 1, "order": 2 if i == 6 else 1} for i in range(7)],
+                "h1_links": [
+                    {"atom_idx": 0, "shift_ppm": 0.91, "n_protons": 6.0, "multiplicity": "d"},
+                    {"atom_idx": 3, "shift_ppm": 7.18, "n_protons": 2.0, "multiplicity": "d"},
+                    {"atom_idx": 5, "shift_ppm": 3.71, "n_protons": 1.0, "multiplicity": "q"},
+                ],
+                "c13_links": [{"atom_idx": 0, "shift_ppm": 22.4}],
+            },
+        }
+    if module_index == 7:
+        grads = [2.0 + i * (50.0 / 15.0) for i in range(16)]
+        bvals = [(i / 15.0) ** 2 * 3.8e9 for i in range(16)]
+        return {
+            "gradients_g_cm": grads,
+            "b_values_s_m2": bvals,
+            "ppm_axis": [round(7.6 - i * 0.3, 2) for i in range(24)],
+            "peaks": [
+                {"label": "Lysozyme Ar-H", "center_ppm": 7.18, "selected_k": 1, "intensities": [round(0.95 ** i, 4) for i in range(16)], "components": [{"amplitude": 0.85, "d_m2_s": 1.12e-10, "log10_d": -9.95}]},
+                {"label": "Maleate =CH", "center_ppm": 6.02, "selected_k": 1, "intensities": [round(0.76 ** i, 4) for i in range(16)], "components": [{"amplitude": 1.0, "d_m2_s": 8.40e-10, "log10_d": -9.08}]},
+                {"label": "Raffinose H1", "center_ppm": 5.24, "selected_k": 1, "intensities": [round(0.86 ** i, 4) for i in range(16)], "components": [{"amplitude": 0.92, "d_m2_s": 3.10e-10, "log10_d": -9.51}]},
+                {"label": "Overlap (Oligo+Ref)", "center_ppm": 3.66, "selected_k": 2, "intensities": [round(0.55 * (0.86 ** i) + 0.45 * (0.76 ** i), 4) for i in range(16)], "components": [{"amplitude": 0.55, "d_m2_s": 3.10e-10, "log10_d": -9.51}, {"amplitude": 0.45, "d_m2_s": 8.40e-10, "log10_d": -9.08}]},
+            ],
+            "ilt_overlap": {
+                "log10_d_grid": [round(-10.3 + i * 0.1, 2) for i in range(16)],
+                "spectrum": [0.85 if i in (8, 12) else 0.04 for i in range(16)],
+                "selected_lambda": 0.012,
+                "modes": [{"log10_d": -9.51, "d_m2_s": 3.10e-10, "area_fraction": 0.55}, {"log10_d": -9.08, "d_m2_s": 8.40e-10, "area_fraction": 0.45}],
+            },
+            "hydrodynamics": [
+                {"name": "Maleate", "r_h_angstrom": 2.9, "mw_da": 116.0},
+                {"name": "Raffinose", "r_h_angstrom": 5.8, "mw_da": 504.0},
+                {"name": "Lysozyme", "r_h_angstrom": 19.2, "mw_da": 14300.0},
+            ],
+        }
+    return {
+        "n_samples": 24,
+        "n_buckets": 42,
+        "pca": {
+            "explained_var": [0.62, 0.18],
+            "scores": [{"t1": (-2.1 if i < 6 else 2.2) + 0.1 * i, "t2": (-0.6 if i % 2 == 0 else 0.5), "group": "Control" if i < 6 else "Case"} for i in range(12)],
+            "ellipse_95": [[3.2 * (1.0 if k in (0, 1, 7, 8) else -1.0), 1.8 * (1.0 if k < 4 else -1.0)] for k in range(12)],
+        },
+        "oplsda": {
+            "r2y": 0.984,
+            "q2": 0.969,
+            "perm_p_q2": 0.0100,
+            "perm_null_q2": [-0.12, 0.04, -0.08],
+            "s_plot": [
+                {"ppm": 1.33, "cov": 0.62, "corr": 0.98, "vip": 2.41},
+                {"ppm": 4.11, "cov": 0.41, "corr": 0.96, "vip": 2.18},
+                {"ppm": 3.04, "cov": -0.18, "corr": -0.45, "vip": 0.88},
+            ],
+        },
+        "stocsy": {
+            "driver_ppm": 1.33,
+            "top_match": "L-Lactate (bmse000288, score=0.99)",
+            "ppm": [round(4.5 - i * 0.2, 2) for i in range(20)],
+            "mean_ctrl": [0.35 if i not in (2, 16) else 0.65 for i in range(20)],
+            "mean_case": [0.38 if i not in (2, 16) else 1.45 for i in range(20)],
+            "r2": [0.99 if i in (2, 16) else 0.08 for i in range(20)],
+        },
+        "mcp": {
+            "access_mode": "ReadOnly",
+            "homolog_firewall_max_seq_id": 0.25,
+            "undo_capacity": 256,
+            "undo_bitwise_eq": True,
+            "initialize_response": {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}},
+            "torsion_call_response": {"jsonrpc": "2.0", "id": 2, "result": {"max_seq_identity": 0.25}},
+            "readonly_denied_response": {"jsonrpc": "2.0", "id": 3, "error": {"code": -32001, "message": "ReadOnly policy denied write"}},
+        },
+    }
+
+
+def _make_mock_bundles(data_dir: Path) -> None:
+    """Create schema-accurate synthetic 01..08 *.tour.json fixtures for --self-test."""
+    specs = [
+        (1, "01_fid_pulprog_nus", "Raw-FID DSP & Pulprog Engine", "02-custom-pulprog-and-dsp.html", "fid_ingest_synthetic_nus", "RAW BRUKER/VARIAN FID INGEST · SYNTHETIC NUS DEMO", "25% Poisson-gap NUS & IST (synthetic demo)", "nus_iter", 0, 20, 1, 20, "iter"),
+        (2, "02_hsqc_strips_solvers", "HSQC Strips & Backbone Solvers", "03-solvers-and-calibration.html", "cold_gate_failed_withdrawn", "SYNTHETIC / DEV · COLD HCP GATE FAILED (WITHDRAWN)", "Synthetic UBQ 98.4%, dev CISD3 64.38%; cold evo-graph 88.25-95.30% (FAILS >=94%; withdrawn)", "focus_res", 1, 10, 1, 7, "res"),
+        (3, "03_structure_noe_rdc", "3D Structure, NOE & RDC", "01-quickstart-and-workflows.html", "cold_holdout_disclosed", "COLD HOLDOUT DISCLOSED (F8)", "Unseen 1KHM->1ZZK 1.86-4.14 A (0/5 < 1.80 A)", "orbit_deg", 0, 360, 5, 45, "deg"),
+        (4, "04_relax_modelfree", "Relaxation & Lipari-Szabo", "04-dynamics-and-exchange.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F10/F11 OPEN)", "Dual-field R1/R2/hetNOE & M1-M5 S^2", "residue_seq", 1, 76, 1, 23, "res"),
+        (5, "05_exchange_cest_cpmg_csp", "CEST, CPMG & Tight-Binding CSP", "04-dynamics-and-exchange.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F13 OPEN)", "Pade CEST, Baldwin CPMG & Morrison Kd", "ligand_um", 0, 300, 5, 100, "uM"),
+        (6, "06_nmr1d_multiplet_qnmr_octet", "1D Multiplets, qNMR & Octet", "05-nmr1d-multiplets-and-dosy.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F14 OPEN)", "(S)-Ibuprofen Hoye ddd, GUM qNMR & Octet", "atom_idx", 0, 14, 1, 3, "atom"),
+        (7, "07_dosy_diffusion", "DOSY Diffusion & Rh Sizing", "05-nmr1d-multiplets-and-dosy.html", "synthetic_showcase", "SYNTHETIC FORWARD-MODEL SHOWCASE (F16 OPEN)", "BPP-LED Stejskal-Tanner, 2D DOSY & Rh", "grad_step", 0, 15, 1, 4, "step"),
+        (8, "08_metabolomics_mcp", "Metabolomics, STOCSY & MCP", "08-metabolomics-and-chemometrics.html", "synthetic_and_protocol_showcase", "SYNTHETIC & PROTOCOL SHOWCASE (F17/F18 OPEN)", "AI-Binning, PQN, OPLS-DA, STOCSY & MCP JSON-RPC", "driver_bucket", 0, 20, 1, 4, "bucket"),
+    ]
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for idx, slug, title, man_ch, b_kind, b_lbl, b_det, cid, cmin, cmax, cstep, cdef, cunit in specs:
+        doc = {
+            "schema_version": EXPECTED_SCHEMA_VERSION,
+            "module_index": idx,
+            "slug": slug,
+            "title": title,
+            "subtitle": f"Deterministic nmr-core showcase for {title}",
+            "manual_chapter": man_ch,
+            "validation_badge": {"kind": b_kind, "label": b_lbl, "detail": b_det},
+            "duration_sec": 16.0,
+            "fps": 30,
+            "cli_command": f"ferric export-tour --module {idx:02d} --out-dir docs/tours",
+            "chapters": [
+                {"index": 1, "start_sec": 0.0, "end_sec": 4.0, "title": "Stage One", "caption": "Chapter 1 physics", "metric": "Ch1"},
+                {"index": 2, "start_sec": 4.0, "end_sec": 8.0, "title": "Stage Two", "caption": "Chapter 2 physics", "metric": "Ch2"},
+                {"index": 3, "start_sec": 8.0, "end_sec": 12.0, "title": "Stage Three", "caption": "Chapter 3 physics", "metric": "Ch3"},
+                {"index": 4, "start_sec": 12.0, "end_sec": 16.0, "title": "Stage Four", "caption": "Chapter 4 physics", "metric": "Ch4"},
+            ],
+            "interactive_control": {
+                "id": cid,
+                "label": cid,
+                "min": cmin,
+                "max": cmax,
+                "step": cstep,
+                "default_val": cdef,
+                "unit": cunit,
+            },
+            "payload": _make_mock_payload(idx),
+        }
+        (data_dir / f"{slug}.tour.json").write_text(
+            json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8"
+        )
+
+
+def run_self_tests() -> int:
+    """Run deterministic, offline-CSP, WCAG, payload-completeness, fallback-banner, zero-innerHTML, and Node vm self-tests."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        data_dir = root / "data"
+        out_a = root / "out_a"
+        out_b = root / "out_b"
+        _make_mock_bundles(data_dir)
+
+        bundles = load_tour_bundles(data_dir)
+        assert len(bundles) == 8, f"expected 8 bundles, got {len(bundles)}"
+
+        files_a = build_tour_site_files(bundles, videos_rel="videos")
+        files_b = build_tour_site_files(bundles, videos_rel="videos")
+        write_site_to_disk(out_a, files_a)
+        write_site_to_disk(out_b, files_b)
+
+        # 1. Determinism & 11 expected artifacts (9 HTML + CSS + JS)
+        assert len(files_a) == 11, f"expected 11 output files, got {len(files_a)}"
+        assert site_digest(files_a) == site_digest(files_b), "build is non-deterministic"
+
+        # 2. Full validator pass & zero .innerHTML / raw_json in generated JS
+        errs = validate_tour_site(files_a, bundles, videos_rel="videos")
+        assert not errs, f"unexpected validation errors: {errs}"
+        assert b"raw_json" not in files_a["tours_player.js"], (
+            "generated tours_player.js must not reference Python raw_json wrapper"
+        )
+        assert b".innerHTML" not in files_a["tours_player.js"], (
+            "generated tours_player.js must not contain .innerHTML"
+        )
+
+        # 3. Adversarial checks: external CDN must fail
+        mut_cdn = dict(files_a)
+        mut_cdn["index.html"] = files_a["index.html"].replace(
+            b"</head>", b'<script src="https://cdn.example.com/x.js"></script></head>'
+        )
+        assert any("CDN" in e for e in validate_tour_site(mut_cdn, bundles))
+
+        # 4. Adversarial check: user-scalable=no must fail WCAG 1.4.4
+        mut_wcag = dict(files_a)
+        mut_wcag["index.html"] = files_a["index.html"].replace(
+            b"viewport-fit=cover", b"viewport-fit=cover, user-scalable=no"
+        )
+        assert any("zoom-disabling" in e for e in validate_tour_site(mut_wcag, bundles))
+
+        # 5. Adversarial check: missing SYNTHETIC disclosure on module 04 must fail
+        mut_synth = dict(files_a)
+        mut_synth["04_relax_modelfree.html"] = files_a["04_relax_modelfree.html"].replace(
+            b"SYNTHETIC", b"HIDDEN"
+        )
+        assert any("SYNTHETIC" in e for e in validate_tour_site(mut_synth, bundles))
+
+        # 6. Adversarial check: restricted product token must fail
+        mut_tok = dict(files_a)
+        mut_tok["index.html"] = files_a["index.html"] + f"<!-- {RESTRICTED_PRODUCT_TOKENS[0]} -->".encode("utf-8")
+        assert any("forbidden NMR product token" in e for e in validate_tour_site(mut_tok, bundles))
+
+        # 7. Adversarial check: .innerHTML in tours_player.js must fail
+        mut_xss = dict(files_a)
+        mut_xss["tours_player.js"] = files_a["tours_player.js"] + b"\n// tooltip.innerHTML = x;\n"
+        assert any("innerHTML" in e for e in validate_tour_site(mut_xss, bundles))
+
+        # 8. Adversarial check: missing payload series unhides #fallback-banner AND fails --check
+        bad_data_dir = root / "bad_data"
+        _make_mock_bundles(bad_data_dir)
+        mod04_path = bad_data_dir / "04_relax_modelfree.tour.json"
+        mod04_doc = json.loads(mod04_path.read_text(encoding="utf-8"))
+        del mod04_doc["payload"]["tau_m_ns"]
+        del mod04_doc["payload"]["curve_600_r1"]
+        mod04_path.write_text(json.dumps(mod04_doc, indent=2, sort_keys=True), encoding="utf-8")
+        bad_out = root / "bad_out"
+        rc_bad = main(["--data-dir", str(bad_data_dir), "--out", str(bad_out), "--videos-rel", "videos", "--check"])
+        assert rc_bad == 1, f"expected --check rc=1 on missing payload series, got {rc_bad}"
+        node_bin = shutil.which("node")
+        if node_bin is not None:
+            proc_fb = subprocess.run(
+                [node_bin, "-e", NODE_VM_CHECK_HARNESS, str(bad_out), "expect-fallback"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            assert proc_fb.returncode == 0, f"Fallback banner runtime check failed:\n{proc_fb.stdout}\n{proc_fb.stderr}"
+
+        # 9. CLI --check end-to-end verification (including live Node vm 32/32 check inside validate_tour_site)
+        check_out = root / "out_cli_check"
+        rc = main(["--data-dir", str(data_dir), "--out", str(check_out), "--videos-rel", "videos", "--check"])
+        assert rc == 0, f"expected --check rc=0, got {rc}"
+        assert (check_out / "index.html").is_file()
+        assert (check_out / "tours.css").is_file()
+        assert (check_out / "tours_player.js").is_file()
 
         digest = site_digest(files_a)[:16]
         print(
-            f"build_interactive_tours.py self-tests passed (8/8 checks: 11 files, "
-            f"zero-CDN, WCAG 1.4.4, 04..08 SYNTHETIC+video, clean-room, JS syntax, --check CLI, Node vm 32/32; sha256={digest})."
+            f"build_interactive_tours.py self-tests passed (9/9 checks: 11 files, "
+            f"zero-CDN, WCAG 1.4.4, 01..08 payload-backed, fallback-banner guard, zero-innerHTML, clean-room, --check CLI, Node vm 32/32; sha256={digest})."
         )
     return 0
 

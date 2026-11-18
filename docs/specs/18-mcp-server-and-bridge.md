@@ -59,10 +59,10 @@ In accordance with the MCP `tools/call` specification, protocol-level parameter 
 | `analyze_nmr1d_spectrum` | Read | `true` | `false` | `nmr1d` (`pick_peaks_1d`, `deconvolve_spectrum_1d`, Fulmer impurities) + `multiplet` (`ACS`/`JOC`/`RSC`/`Nature`) |
 | `fit_dosy_diffusion` | Read | `true` | `false` | `dosy::fit_stejskal_tanner_multi` (`BIC`/`AIC`), `estimate_hydrodynamics`, opt-in `solve_tikhonov_ilt` |
 | `run_metabolomics_chemometrics` | Read | `true` | `false` | `metabolomics::run_metabolomics_pipeline` (`AI-Binning`, `PQN`, `PCA`, `OPLS-DA`) + `compute_stocsy_at_ppm` |
-| `af_concordance` | Read | `true` | `false` | `af_concordance::evaluate_af_nmr_concordance` (`pLDDT` vs `RCI-S²`/$S^2$ Spearman $\rho_s$, `RMSD_rig`, 4-class discordance; `0` network I/O) |
+| `af_concordance` | Read | `true` | `false` | `af_concordance::evaluate_af_nmr_concordance` (fail-closed `require_predicted_model`, `pLDDT` vs `RCI-S²`/$S^2$ Spearman $\rho_s$, 6-class concordance; `0` network I/O) |
 | `predict_structure_shifts` | Read | `true` | `false` | `struct_shifts::predict_structure_shifts_with_firewall` (`DEFAULT_FIREWALL_MAX_SEQ_IDENTITY = 0.25`, `TM < 0.50`, `exclusion_list_sha256`) |
-| `score_cofold_poses` | Read | `true` | `false` | `cofold_bridge::score_cofold_poses` (`CSP` + intermolecular `NOE`/`PRE` + `RDC` $Q_{\text{free}}$ + `PCS`, `InconclusiveOrAllViolated` guard) |
-| `classify_excited_state` | Read | `true` | `false` | `excited_state::classify_excited_state_with_firewall` (signed `CEST` & folded-Student-$t_5$ unsigned `CPMG` `BIC` / $2\ln\mathrm{BF}$ across `H0`–`H4`) |
+| `score_cofold_poses` | Read | `true` | `false` | `cofold_bridge::score_cofold_poses` (`<= 32` poses, `BurialAndContactOnly` default `CSP` + `NOE`/`PRE` + `RDC` $Q_{\text{free}}$ + `PCS`) |
+| `classify_excited_state` | Read | `true` | `false` | `excited_state::classify_excited_state_with_firewall` (discrete-scan marginalized `BIC` / $2\ln\mathrm{BF}$ across `H0`–`H4`, `>= 4` distinct residues) |
 | `write_curated_peak_tsv` | Write | `false` | `true` | `peaks::write_peaks` (requires `McpAccessMode::ReadWrite` + sandboxed output path) |
 | `export_nmrstar_shifts` | Write | `false` | `true` | `nmrstar::write_star_with_header` (requires `McpAccessMode::ReadWrite` + sandboxed path) |
 
@@ -102,11 +102,11 @@ The desktop workbench wires `McpBridgeState` (`McpBridgeController`) into the to
 
 1. **Default-Safe Access Mode**: `McpAccessMode` defaults to `ReadOnly`. Mutating tools (`write_curated_peak_tsv`, `export_nmrstar_shifts`) carry `annotations: { readOnlyHint: false, destructiveHint: true }`, are hidden from `tools/list` by default in `ferric mcp --mode read-only` (unless `--expose-blocked-write-tools` is passed), and are unconditionally denied (`ERR_READ_ONLY_DENIED`) whenever `access_mode == McpAccessMode::ReadOnly`.
 2. **Canonicalized Sandbox Verification (`resolve_sandboxed_path` / `resolve_sandboxed_write_path`)**:
-   - Rejects empty strings and embedded null bytes (`\0`).
+   - Rejects empty strings, embedded null bytes (`\0`), and URI schemes (`file://`, `http://`, `https://`, `nmr://`).
    - Rejects any lexical `Component::ParentDir` (`..`) segment prior to filesystem access (including nested per-sample paths inside metabolomics cohort manifests and multi-step CSP titration manifests).
    - Rejects hidden credential and secret paths (`.ssh`, `.aws`, `.gnupg`, `.env`, `.env.*`, `.netrc`, `.kube`, `id_rsa`, `id_ed25519`) across both input components and canonicalized workspace-relative components.
-   - Canonicalizes every configured `allowed_root` via `std::fs::canonicalize` and verifies that the canonicalized target path (for existing paths) or canonicalized deepest existing ancestor plus symlink-free normal tail (for new output files) resides strictly within at least one canonicalized `allowed_root`, blocking sibling-prefix bypasses (`workspace_evil` vs `workspace`), symlink directory escapes, and dangling symlinks.
-   - Sanitizes workspace-relative paths in responses so host user home paths are never leaked.
+   - Verifies `std::fs::symlink_metadata` (`ft.is_file()`, rejecting FIFOs, sockets, and device nodes) and pre-allocation file size (`<= 64 MiB`) / pose count (`<= 32` poses) caps before opening files; canonicalizes every configured `allowed_root` via `std::fs::canonicalize` and verifies target containment; and sanitizes parse/I/O error strings so raw input lines or host paths are never echoed.
+   - On `nmr-gui`'s loopback HTTP bridge, honors `X-Nmr-Access-Mode: read-only` per request to downgrade `ReadWrite -> ReadOnly` (never escalating `ReadOnly -> ReadWrite`), and records curations on the unified monotonic User+MCP `UndoJournal`.
 
 ### 4.2 Guided Spectroscopist Prompts (`6` Built-In Workflows)
 
@@ -116,7 +116,7 @@ The desktop workbench wires `McpBridgeState` (`McpBridgeController`) into the to
 - `deconvolve-1d-mixture-dosy`: 1D phase/baseline/Fulmer-2010 referencing, global pseudo-Voigt multiplet deconvolution, `qNMR` purity stoichiometry, and `BIC`-selected discrete Stejskal–Tanner / `BPP-LED` `DOSY` vs opt-in Tikhonov `ILT`.
 - `fit-cest-cpmg-exchange`: Locked-shape pseudo-3D plane integration, flat-null vs exchange model selection (`AIC`/`BIC`, $\Delta R_{2,\text{eff}} \ge 2.0\text{ s}^{-1}$), multi-field $\alpha$-scaling, and 2-/3-state Bloch–McConnell `CEST` or Baldwin-2014 `CPMG` fitting.
 - `analyze-metabolomics-cohort`: Biofluid residual water/urea/TSP region masking, De Meyer (2008) `AI-Binning`, Dieterle (2006) `PQN` dilution normalization, Pareto-scaled `PCA` Hotelling $T^2$ / $Q$-residual outlier screening, leak-free stratified $k$-fold `OPLS-DA` with Westerhuis (2008) permutation $Q^2$ anti-overfitting checks, and Cloarec (2005) `STOCSY` spin-system covariance verification.
-- `validate-and-dock-alphafold-model`: Step-by-step AlphaFold `mmCIF`/`PAE` concordance audit (`af_concordance`), homolog-firewalled 3D shift validation (`predict_structure_shifts` at `<= 25%` seq-id / `TM < 0.50`), Tolman $\vartheta_d / \vartheta_1$ GDO inter-domain motion check & multi-medium `RDC`/`PCS`/`PRE` `PAE`-domain docking (`F8` single-medium cone candor), co-folded complex pose ranking (`score_cofold_poses`), and Bayesian `CEST`/`CPMG` excited-state classification (`classify_excited_state`).
+- `validate-and-dock-alphafold-model`: Step-by-step AlphaFold `mmCIF`/`PAE` concordance audit (`af_concordance`), homolog-firewalled 3D shift validation (`predict_structure_shifts` at `<= 25%` seq-id / `TM < 0.50`), co-folded complex pose ranking (`score_cofold_poses`, defaulting `restraints_path` to `".nmr_restraints.json"`), and Bayesian `CEST`/`CPMG` excited-state classification (`classify_excited_state`), with CLI handoff to `ferric structure --pae-domains` for multi-domain `PAE` docking.
 
 ### 4.3 CLI Interface (`ferric mcp` & `ferric mcp-config`)
 

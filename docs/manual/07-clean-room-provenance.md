@@ -37,7 +37,7 @@ To prevent data leakage, circular self-validation, or inflated accuracy claims, 
 
 ## Open `CC0 1.0` Data Policy & Private Data Isolation
 
-- **BMRB (`https://bmrb.io/`)**: Empirical amino-acid backbone and sidechain priors (`data/priors/PROVENANCE.md`), torsion corpus chains (`data/torsion_db/PROVENANCE.md`, `SHA-256` verified via `scripts/build_torsion_corpus.py --verify`), and public benchmark manifests (`data/benchmark/PROVENANCE.md`) derive exclusively from `CC0 1.0 Universal` BMRB depositions, with every accession ID and SHA-256 digest recorded.
+- **BMRB (`https://bmrb.io/`), UniProt & CATH**: Empirical amino-acid backbone and sidechain priors (`data/priors/PROVENANCE.md`), torsion corpus shifts/coordinates (`data/torsion_db/PROVENANCE.md`, `SHA-256` verified via `scripts/build_torsion_corpus.py --verify`; UniProt accession mappings and CATH fold annotations attributed under `CC-BY-4.0`, with `4` `bmrb_priors` overlap entries caught by `HomologFirewall`), and public benchmark manifests (`data/benchmark/PROVENANCE.md`) derive from `CC0 1.0 Universal` BMRB/wwPDB depositions and `CC-BY-4.0` metadata, with every accession ID and SHA-256 digest recorded.
 - **wwPDB, ModelArchive & AlphaFold Database (`https://www.wwpdb.org/`, `https://alphafold.ebi.ac.uk/`)**: Reference macromolecular coordinates (`data/pdb_refs/`) and standard 20-amino-acid covalent topologies derive from `CC0 1.0` wwPDB entries (`.licenses/pdb_database_LICENSE.txt`); opt-in CLI downloads via `ferric af-validate --fetch-uniprot` record `CC-BY-4.0` attribution and `FIPS 180-4` `SHA-256` digests in `PROVENANCE.md`.
 - **Unpublished Experimental Data (`data/private/`)**: Unpublished laboratory datasets remain strictly inside git-ignored `data/private/` and never enter public commits or fixtures.
 
@@ -233,11 +233,13 @@ FERRIC is distributed under the **MIT License** (`LICENSE`). All `327` transitiv
 - **Haigh, C. W. & Mallion, R. B.** (1972). New tables of "ring current" shielding in proton magnetic resonance. *Mol. Phys.* **24**, 955–970; and (1979) *Prog. Nucl. Magn. Reson. Spectrosc.* **13**, 303–344.
 - **Shrake, A. & Rupley, J. A.** (1973). Environment and exposure to solvent of protein atoms. *J. Mol. Biol.* **79**, 351–371.
 - **Schwarz, G.** (1978). Estimating the dimension of a model (`BIC`). *Ann. Stat.* **6**, 461–464.
+- **Golub, G. H., Heath, M. & Wahba, G.** (1979). Generalized cross-validation as a method for choosing a good ridge parameter (`GCV`). *Technometrics* **21**, 215–223.
 - **Kabsch, W. & Sander, C.** (1983). Dictionary of protein secondary structure: pattern recognition of hydrogen-bonded and geometrical features. *Biopolymers* **22**, 2577–2637.
 - **Wagner, G., Pardi, A. & Bax, A.** (1983). Hydrogen bond length and $^{1}\text{H}$ NMR chemical shifts in proteins. *J. Am. Chem. Soc.* **105**, 5948–5949.
 - **Lange, K. L., Little, R. J. A. & Taylor, J. M. G.** (1989). Robust statistical modeling using the $t$ distribution. *J. Am. Stat. Assoc.* **84**, 881–896.
 - **Case, D. A.** (1995). Calibration of ring-current effects in proteins and nucleic acids. *J. Biomol. NMR* **6**, 341–346.
 - **Kass, R. E. & Raftery, A. E.** (1995). Bayes factors. *J. Am. Stat. Assoc.* **90**, 773–795.
+- **MacKerell, A. D. Jr. et al.** (1998). All-atom empirical potential for molecular modeling and dynamics studies of proteins (`CHARMM22`). *J. Phys. Chem. B* **102**, 3586–3616.
 - **Sitkoff, D. & Case, D. A.** (1998). Theories of chemical shift anisotropies in proteins and nucleic acids. *Prog. Nucl. Magn. Reson. Spectrosc.* **32**, 165–190.
 - **Braddock, D. T., Cai, M., Baber, J. L., Huang, Y. & Clore, G. M.** (2001). Rapid identification of medium- to large-scale interdomain motion in modular proteins using dipolar couplings. *J. Am. Chem. Soc.* **123**, 8634–8635.
 - **Ng, A. Y., Jordan, M. I. & Weiss, Y.** (2001). On spectral clustering: analysis and an algorithm. *Adv. Neural Inf. Process. Syst.* **14**, 849–856.

@@ -46,9 +46,8 @@ fn test_cli_af_structure_fail_closed_no_auto_ref_and_calibration_warning() {
     let peaks_path = tmp_dir.join("peaks.tsv");
     write_peaks(&peaks_path, &peaks).unwrap();
 
-    let af_cif = root.join("crates/nmr-core/tests/fixtures/AF-P0CG48-F1-model_v6.cif");
-    let af_pae =
-        root.join("crates/nmr-core/tests/fixtures/AF-P0CG48-F1-predicted_aligned_error_v6.json");
+    let af_cif = root.join("data/afdb/AF-P0CG48-F1-model_v6.cif");
+    let af_pae = root.join("data/afdb/AF-P0CG48-F1-predicted_aligned_error_v6.json");
     let nmr_1d3z = root.join("data/pdb_refs/1d3z.pdb");
     let xray_1ubq = root.join("data/fixtures/ubiquitin_1ubq_xray.pdb");
     let headerless_pdb = tmp_dir.join("headerless.pdb");

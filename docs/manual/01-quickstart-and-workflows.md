@@ -48,10 +48,10 @@ Output artifacts written to `./workspace/ubq_results`:
 
 Launch `ferric-gui` (`cargo run --release -p nmr-gui --bin ferric-gui`) and drag a spectrometer folder, `.tar.gz` archive, `.fasta` sequence, or `.nef` session onto the window:
 
-1. **Experiment Selection Matrix (`nmr-gui::ingest_panel`)**: Displays every discovered dataset with auto-detected experiment role, observed nuclei (`1H`, `15N`, `13C`, `19F`, `31P`), field strength (`MHz`), quadrature/NUS badge, editable role dropdowns, include/exclude checkboxes, and a 1-click **Process, Pick & Run** button.
-2. **6-Stage *"What Next?"* Workflow Stepper (`nmr-gui::workflow_bar`)**: Tracks readiness across **1. Ingest → 2. Process FIDs → 3. Pick Peaks → 4. Assign Spins → 5. Fold / Dynamics → 6. Export & Report**, highlighting missing inputs or `DatasetQcReport` warnings alongside a single contextual action button.
-3. **Fuzzy Command Palette & Two-Key Chords**: Press **`Cmd/Ctrl+K`** to fuzzy-search every workbench operation, or use fast two-letter spectrum chords (`vt`, `ct`, `cb`, `pa`, `pd`, `pc`, `st`, `at`, `oz`, `Space`, `?` — full table in [Chapter 6](06-mcp-and-cli-reference.md#interactive-workbench-keyboard-shortcuts)). Every edit is recorded on a `256`-step Undo/Redo ring buffer (**`Cmd/Ctrl+Z`**).
-4. **Zero-I/O Built-in Multi-Modal Demo Suite (`🚀 Load Built-in Demo Suite`)**: On both native desktop and `wasm32-unknown-unknown` browser builds (`nmr_gui::demo_preset`), clicking **`🚀 Load Built-in Demo Suite`** in the top toolbar populates synthetic Ubiquitin `2D HSQC` + `3D HNCACB`/`HNCO` strips + `1UBQ` 3D coordinates + 4-mode 1D multiplet stack + `DOSY` decay series + 24-sample 2-group `Metabolomics` cohort purely in memory with zero filesystem I/O.
+1. **Experiment Selection Matrix (`nmr-gui::ingest_panel`)**: Displays every discovered dataset with auto-detected experiment role, observed nuclei (`1H`, `15N`, `13C`, `19F`, `31P`), field strength (`MHz`), quadrature/NUS badge, editable role dropdowns, include/exclude checkboxes, and a 1-click **Process, Pick & Run** button (`<= 5`-click first-run workflow).
+2. **Single 6-Mode Workbench Header (`nmr-gui::workbench_mode`)**: Switches cleanly across **`Process | Assign | Structure | Dynamics | Small molecule | Metabolomics`**, revealing mode-appropriate controls (`<= 12` primary controls/mode, `>= 65%` plot canvas share, `0` emojis) as matching data are loaded.
+3. **Unified Interaction Grammar, Command Palette & Two-Key Chords**: Press **`Cmd/Ctrl+K`** to fuzzy-search every workbench operation, or use unified mouse gestures and two-letter spectrum chords (`vt`, `ci`, `cb`, `ws`, `wu`, `pa`, `pd`, `pc`, `st`, `at`, `zf`, `zp`, `xl`, `Space+drag` pan, `?` — full `C18` table in [Chapter 6](06-mcp-and-cli-reference.md#interactive-workbench-keyboard-shortcuts)). Every user and AI bridge edit shares one monotonic Undo/Redo stack (**`Cmd/Ctrl+Z`**).
+4. **Zero-I/O Built-in Synthetic Demo Suite (`Load Built-in Demo Suite`)**: On both native desktop and `wasm32-unknown-unknown` browser builds (`nmr_gui::demo_preset`), clicking **`Load Built-in Demo Suite`** populates synthetic Ubiquitin `2D HSQC` + `3D HNCACB`/`HNCO` strips + `1UBQ` 3D coordinates + 4-mode 1D multiplet stack + `DOSY` decay series + 24-sample 2-group `Metabolomics` cohort purely in memory with zero filesystem I/O (explicitly badged as synthetic demonstration data).
 
 ---
 
@@ -248,7 +248,7 @@ ferric assign \
 
 For synthetic organic chemistry, natural products, pharmaceutical quality control (`qNMR`), reaction monitoring, unseparated multi-component mixtures, and untargeted biofluid cohorts, FERRIC combines the **`Octet` 2D Chemical Studio** with the **Analytical 1D, `DOSY` & Metabolomics Studios** (detailed in [Chapter 5](05-nmr1d-multiplets-and-dosy.md) and [Chapter 8](08-metabolomics-and-chemometrics.md)):
 
-1. **Sketch or Import a 2D Molecule (`ferric chem` / `⚗️ Octet Chemical Draw`)**:
+1. **Sketch or Import a 2D Molecule (`ferric chem` / `Small molecule -> Sketcher`)**:
    ```bash
    # Convert IUPAC name or SMILES to publication ACS 1996 SVG + predicted 1H/13C JCAMP-DX spectrum
    ferric chem --smiles "CC(=O)Oc1ccccc1C(=O)O" --solvent CDCl3 --mhz 600 --out aspirin.svg
