@@ -18,6 +18,7 @@ Every protocol handler, transport framing parser, security sandbox validator, im
    - Post-assignment homolog-firewalled torsion prediction (`nmr_core::torsion_db`): Shen, Vernon, Baker & Bax (*Proc. Natl. Acad. Sci. U.S.A.* 2008, **105**, 4685–4690); Shen & Bax (*J. Biomol. NMR* 2013, **56**, 227–241); Berjanskii & Wishart (*J. Am. Chem. Soc.* 2005, **127**, 14970–14971).
    - Spin relaxation, chemical exchange & ligand titration (`nmr_core::relax_io`, `nmr_core::relax_fit`, `nmr_core::cest`, `nmr_core::cpmg`, `nmr_core::csp`): Farrow et al. (*Biochemistry* 1994, **33**, 5984–6003); Vallurupalli, Bouvignies & Kay (*J. Am. Chem. Soc.* 2012, **134**, 8148–8161); Baldwin (*J. Magn. Reson.* 2014, **244**, 114–124); Williamson (*Prog. Nucl. Magn. Reson. Spectrosc.* 2013, **73**, 1–16).
    - Analytical 1D NMR, `DOSY` & 1D metabolomics chemometrics (`nmr_core::nmr1d`, `nmr_core::multiplet`, `nmr_core::dosy`, `nmr_core::metabolomics`): Fulmer et al. (*Organometallics* 2010, **29**, 2176–2179); Hoye, Hanson & Vyvyan (*J. Org. Chem.* 1994, **59**, 4096–4103); Stejskal & Tanner (*J. Chem. Phys.* 1965, **42**, 288–292); Provencher (*Comput. Phys. Commun.* 1982, **27**, 213–227); De Meyer et al. (*Anal. Chem.* 2008, **80**, 3783–3790); Dieterle et al. (*Anal. Chem.* 2006, **78**, 4281–4290); Trygg & Wold (*J. Chemom.* 2002, **16**, 119–128); Westerhuis et al. (*Metabolomics* 2008, **4**, 81–89); Cloarec et al. (*Anal. Chem.* 2005, **77**, 1282–1289).
+   - AlphaFold concordance, 3D shift forward physics, co-folded pose re-scoring & excited-state hypothesis testing (`nmr_core::af_concordance`, `nmr_core::struct_shifts`, `nmr_core::cofold_bridge`, `nmr_core::excited_state`, `T21.6b`): Jumper et al. (*Nature* 2021, **596**, 583–589); Fowler, Sljoka & Williamson (*Nat. Commun.* 2020, **11**, 5982); Shen & Bax (*J. Biomol. NMR* 2010, **48**, 13–22); Haigh & Mallion (*Mol. Phys.* 1972, **24**, 955–970); Abramson et al. (*Nature* 2024, **630**, 493–500); Wohlwend et al. (*bioRxiv* 2024); Vallurupalli, Hansen & Kay (*Proc. Natl. Acad. Sci. U.S.A.* 2008, **105**, 11766–11771); Bouvignies et al. (*Nature* 2011, **477**, 111–114); Schwarz (*Ann. Stat.* 1978, **6**, 461–464); Kass & Raftery (*J. Am. Stat. Assoc.* 1995, **90**, 773–795).
 
 ## 2. Core JSON-RPC 2.0 MCP Server Engine (`T15.1`, `nmr_core::mcp` & `ferric mcp`)
 
@@ -44,7 +45,7 @@ Every protocol handler, transport framing parser, security sandbox validator, im
 
 In accordance with the MCP `tools/call` specification, protocol-level parameter mistakes (missing `"name"`, unknown tool name, non-object `"arguments"`) return JSON-RPC `-32602`, whereas tool-level security/permission denials and domain validation errors return a structured `McpCallToolResult` with `isError: true` and machine-readable `structuredContent` carrying the error code and kind so an AI assistant can observe and respect the boundary without dropping the session. Resource read violations (`resources/read`) return JSON-RPC error objects (`-32001` / `-32003`).
 
-### 2.3 Built-In Core NMR Tools (`12` Total: `10` Read-Only + `2` Mutating) & Resources
+### 2.3 Built-In Core NMR Tools (`16` Total: `14` Read-Only + `2` Mutating) & Resources
 
 | Tool Name | Mode | `readOnlyHint` | `destructiveHint` | Underlying `nmr-core` Engine |
 | :--- | :--- | :---: | :---: | :--- |
@@ -58,6 +59,10 @@ In accordance with the MCP `tools/call` specification, protocol-level parameter 
 | `analyze_nmr1d_spectrum` | Read | `true` | `false` | `nmr1d` (`pick_peaks_1d`, `deconvolve_spectrum_1d`, Fulmer impurities) + `multiplet` (`ACS`/`JOC`/`RSC`/`Nature`) |
 | `fit_dosy_diffusion` | Read | `true` | `false` | `dosy::fit_stejskal_tanner_multi` (`BIC`/`AIC`), `estimate_hydrodynamics`, opt-in `solve_tikhonov_ilt` |
 | `run_metabolomics_chemometrics` | Read | `true` | `false` | `metabolomics::run_metabolomics_pipeline` (`AI-Binning`, `PQN`, `PCA`, `OPLS-DA`) + `compute_stocsy_at_ppm` |
+| `af_concordance` | Read | `true` | `false` | `af_concordance::evaluate_af_nmr_concordance` (`pLDDT` vs `RCI-S²`/$S^2$ Spearman $\rho_s$, `RMSD_rig`, 4-class discordance; `0` network I/O) |
+| `predict_structure_shifts` | Read | `true` | `false` | `struct_shifts::predict_structure_shifts_with_firewall` (`DEFAULT_FIREWALL_MAX_SEQ_IDENTITY = 0.25`, `TM < 0.50`, `exclusion_list_sha256`) |
+| `score_cofold_poses` | Read | `true` | `false` | `cofold_bridge::score_cofold_poses` (`CSP` + intermolecular `NOE`/`PRE` + `RDC` $Q_{\text{free}}$ + `PCS`, `InconclusiveOrAllViolated` guard) |
+| `classify_excited_state` | Read | `true` | `false` | `excited_state::classify_excited_state_with_firewall` (signed `CEST` & folded-Student-$t_5$ unsigned `CPMG` `BIC` / $2\ln\mathrm{BF}$ across `H0`–`H4`) |
 | `write_curated_peak_tsv` | Write | `false` | `true` | `peaks::write_peaks` (requires `McpAccessMode::ReadWrite` + sandboxed output path) |
 | `export_nmrstar_shifts` | Write | `false` | `true` | `nmrstar::write_star_with_header` (requires `McpAccessMode::ReadWrite` + sandboxed path) |
 
@@ -71,7 +76,7 @@ Built-in `resources/list` & `resources/read` URIs:
 
 ### 3.1 `WorkbenchSnapshot`, `McpBridgeState` & Reversible `McpUndoLog`
 
-The desktop workbench wires `McpBridgeState` (`McpBridgeController`) into the top `nmr-gui` toolbar (*"🔌 MCP Bridge"* control window + 1-click *"📋 Copy MCP Config"* button), publishing a thread-safe `WorkbenchSnapshot` (`active_residue_seq`, `crosshair_ppm`, `active_experiment`, `strip_candidates`, `selected_pdb_chain_res`, `undo_depth`, `redo_depth`, `qc_status`) and processing AI actions exclusively through reversible `McpUiCommand` entries recorded in a bounded `256`-step `McpUndoLog` (`apply_command`, `undo_last`, `redo_last`):
+The desktop workbench wires `McpBridgeState` (`McpBridgeController`) into the top `nmr-gui` toolbar (*"MCP Bridge"* control window + 1-click *"Copy MCP Config"* button), publishing a thread-safe `WorkbenchSnapshot` (`active_residue_seq`, `crosshair_ppm`, `active_experiment`, `strip_candidates`, `selected_pdb_chain_res`, `undo_depth`, `redo_depth`, `qc_status`) and processing AI actions exclusively through reversible `McpUiCommand` entries recorded in a bounded `256`-step `McpUndoLog` (`apply_command`, `undo_last`, `redo_last`):
 
 | Bridge Tool Name | Mutates UI State | Description |
 | :--- | :---: | :--- |
@@ -103,14 +108,15 @@ The desktop workbench wires `McpBridgeState` (`McpBridgeController`) into the to
    - Canonicalizes every configured `allowed_root` via `std::fs::canonicalize` and verifies that the canonicalized target path (for existing paths) or canonicalized deepest existing ancestor plus symlink-free normal tail (for new output files) resides strictly within at least one canonicalized `allowed_root`, blocking sibling-prefix bypasses (`workspace_evil` vs `workspace`), symlink directory escapes, and dangling symlinks.
    - Sanitizes workspace-relative paths in responses so host user home paths are never leaked.
 
-### 4.2 Guided Spectroscopist Prompts (`5` Built-In Workflows)
+### 4.2 Guided Spectroscopist Prompts (`6` Built-In Workflows)
 
-`prompts/list` and `prompts/get` provide five parameterized multi-step spectroscopist workflows:
+`prompts/list` and `prompts/get` provide six parameterized multi-step spectroscopist workflows:
 - `triage-qc`: Unlabelled referencing check, `DatasetQcReport` completeness/aliphatic/connectivity gate audit, and `PASS` / `WARN` / `ABSTAIN` confidence interpretation (preserving cold high-confidence precision caveats).
 - `resolve-ambiguous-strips`: Multi-pathway `(i, i-1)` strip ladder disambiguation (`HNCACB`/`CBCACONH`, `HNCO`/`HNCACO`), pre-Proline covalent shift checks, and Undo-safe curation.
 - `deconvolve-1d-mixture-dosy`: 1D phase/baseline/Fulmer-2010 referencing, global pseudo-Voigt multiplet deconvolution, `qNMR` purity stoichiometry, and `BIC`-selected discrete Stejskal–Tanner / `BPP-LED` `DOSY` vs opt-in Tikhonov `ILT`.
 - `fit-cest-cpmg-exchange`: Locked-shape pseudo-3D plane integration, flat-null vs exchange model selection (`AIC`/`BIC`, $\Delta R_{2,\text{eff}} \ge 2.0\text{ s}^{-1}$), multi-field $\alpha$-scaling, and 2-/3-state Bloch–McConnell `CEST` or Baldwin-2014 `CPMG` fitting.
 - `analyze-metabolomics-cohort`: Biofluid residual water/urea/TSP region masking, De Meyer (2008) `AI-Binning`, Dieterle (2006) `PQN` dilution normalization, Pareto-scaled `PCA` Hotelling $T^2$ / $Q$-residual outlier screening, leak-free stratified $k$-fold `OPLS-DA` with Westerhuis (2008) permutation $Q^2$ anti-overfitting checks, and Cloarec (2005) `STOCSY` spin-system covariance verification.
+- `validate-and-dock-alphafold-model`: Step-by-step AlphaFold `mmCIF`/`PAE` concordance audit (`af_concordance`), homolog-firewalled 3D shift validation (`predict_structure_shifts` at `<= 25%` seq-id / `TM < 0.50`), Tolman $\vartheta_d / \vartheta_1$ GDO inter-domain motion check & multi-medium `RDC`/`PCS`/`PRE` `PAE`-domain docking (`F8` single-medium cone candor), co-folded complex pose ranking (`score_cofold_poses`), and Bayesian `CEST`/`CPMG` excited-state classification (`classify_excited_state`).
 
 ### 4.3 CLI Interface (`ferric mcp` & `ferric mcp-config`)
 

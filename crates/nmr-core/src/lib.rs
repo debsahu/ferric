@@ -26,6 +26,7 @@ pub mod domain_dock;
 pub mod dosy;
 pub mod evaluate;
 pub mod evo_graph;
+pub mod excited_state;
 pub mod fid;
 pub mod idp_propensity;
 pub mod idp_solver;

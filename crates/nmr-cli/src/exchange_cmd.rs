@@ -42,12 +42,19 @@ use nmr_core::csp::{
     AssignedAmidePeak, CspAnalysisConfig, ResidueCspTrajectory, ResidueTitrationPoint,
     UnassignedHsqcPeak, UnassignedTitrationStep,
 };
+use nmr_core::excited_state::{
+    classify_excited_state_with_firewall, format_excited_state_json, format_excited_state_tsv,
+    parse_exchange_observations_tsv, parse_ground_shifts_str, AltConformerInput,
+    ExchangeShiftObservation, ExcitedStateConfig,
+};
 use nmr_core::nmrstar::{read_star, read_star_all_atoms};
 use nmr_core::peaks::read_peaks;
 use nmr_core::picker::{pick_c13_hsqc_2d, pick_hsqc_2d, PickerConfig};
 use nmr_core::spectrum::{
     is_ucsf_file, read_bruker_pdata_2d, read_nmrpipe_2d, read_ucsf_2d, Spectrum2D,
 };
+use nmr_core::struct_shifts::StructureModel;
+use nmr_core::torsion_db::HomologFirewallQuery;
 use nmr_gpu::cest_gpu::fit_cest_global_gpu;
 use nmr_gpu::cpmg_gpu::fit_cpmg_global_gpu;
 use nmr_gpu::GpuEngine;
@@ -1413,4 +1420,379 @@ pub fn run_csp_cli(args: &[String]) -> Result<(), String> {
         print!("{tsv}");
     }
     Ok(())
+}
+
+pub fn exchange_state_usage() -> &'static str {
+    "ferric exchange-state — Bayesian excited-state (CEST / CPMG / R1rho) structural hypothesis engine\n\
+     Usage:\n\
+       ferric exchange-state --shifts <ground.str|nef> --structure <ground.cif|pdb> --exchange <cest_or_cpmg.tsv> [--alt-structures <m1.cif,m2.pdb>] [--ph 6.5] [--temp-k 298.15] [-o <excited_state.json|tsv>]\n\n\
+     Inputs & Biophysical Hypotheses (H0..H4):\n\
+       --shifts | --star <p>       Ground-state assigned chemical shifts (.str or .nef)\n\
+       --structure | --pdb <p>     Ground-state 3D structure coordinates (.cif, .mmcif, or .pdb)\n\
+       --exchange | --in <tsv>     CEST (signed), R1rho (signed), or CPMG (unsigned |dw|) TSV (repeatable)\n\
+       --alt-structures <list>     Comma-separated candidate alternative 3D conformers (.cif/.pdb) for H4\n\
+       --ph <f64>                  Sample pH for ncIDP coil & His titration baselines [default: 6.5]\n\
+       --temp-k <f64>              Sample temperature in Kelvin [default: 298.15]\n\
+       --exclude-pdb <ids>         Comma-separated PDB IDs excluded by Layer 1 of HomologFirewall\n\
+       --exclude-bmrb <ids>        Comma-separated BMRB IDs excluded by Layer 1 of HomologFirewall\n\
+       --exclude-topology <id>     CATH/ECOD fold topology excluded by Layer 2 of HomologFirewall\n\
+       --force-bfactor-plddt       Treat experimental PDB/CIF B_iso column as pLDDT\n\
+       --json-out <out.json>       Optional explicit JSON output path\n\
+       --out | -o <out.json|tsv>   Output hypothesis ranking report (.json or .tsv)"
+}
+
+fn split_comma_items(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+pub fn run_exchange_state_cli(args: &[String]) -> Result<(), String> {
+    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", exchange_state_usage());
+        return Ok(());
+    }
+
+    let mut shifts_path: Option<PathBuf> = None;
+    let mut structure_path: Option<PathBuf> = None;
+    let mut exchange_paths: Vec<PathBuf> = Vec::new();
+    let mut alt_paths: Vec<PathBuf> = Vec::new();
+    let mut sample_ph: f64 = 6.5;
+    let mut temp_k: f64 = 298.15;
+    let mut exclude_pdb: Vec<String> = Vec::new();
+    let mut exclude_bmrb: Vec<String> = Vec::new();
+    let mut exclude_topology: Option<String> = None;
+    let mut force_bfactor_plddt = false;
+    let mut json_out: Option<PathBuf> = None;
+    let mut out_path: Option<PathBuf> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--shifts" | "--star" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("missing value for --shifts <ground.str|nef>")?;
+                shifts_path = Some(PathBuf::from(v));
+            }
+            "--structure" | "--pdb" | "--cif" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("missing value for --structure <ground.cif|pdb>")?;
+                structure_path = Some(PathBuf::from(v));
+            }
+            "--exchange" | "--in" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("missing value for --exchange <cest_or_cpmg.tsv>")?;
+                exchange_paths.push(PathBuf::from(v));
+            }
+            "--alt-structures" | "--alt-structure" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("missing value for --alt-structures <m1.cif,m2.pdb>")?;
+                for item in split_comma_items(v) {
+                    alt_paths.push(PathBuf::from(item));
+                }
+            }
+            "--ph" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for --ph")?;
+                sample_ph = v
+                    .parse::<f64>()
+                    .map_err(|e| format!("invalid --ph {v:?}: {e}"))?;
+                if !sample_ph.is_finite() || !(0.0..=14.0).contains(&sample_ph) {
+                    return Err(format!("--ph {sample_ph} out of bounds [0.0, 14.0]"));
+                }
+            }
+            "--temp-k" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for --temp-k")?;
+                temp_k = v
+                    .parse::<f64>()
+                    .map_err(|e| format!("invalid --temp-k {v:?}: {e}"))?;
+                if !temp_k.is_finite() || !(250.0..=380.0).contains(&temp_k) {
+                    return Err(format!("--temp-k {temp_k} out of bounds [250.0, 380.0] K"));
+                }
+            }
+            "--exclude-pdb" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for --exclude-pdb")?;
+                exclude_pdb.extend(split_comma_items(v));
+            }
+            "--exclude-bmrb" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for --exclude-bmrb")?;
+                exclude_bmrb.extend(split_comma_items(v));
+            }
+            "--exclude-topology" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for --exclude-topology")?;
+                exclude_topology = Some(v.trim().to_string());
+            }
+            "--force-bfactor-plddt" => {
+                force_bfactor_plddt = true;
+            }
+            "--json-out" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for --json-out")?;
+                json_out = Some(PathBuf::from(v));
+            }
+            "--out" | "-o" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for --out")?;
+                out_path = Some(PathBuf::from(v));
+            }
+            other => {
+                return Err(format!(
+                    "unknown exchange-state flag {other:?}\n\n{}",
+                    exchange_state_usage()
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    let sp = shifts_path.ok_or("ferric exchange-state requires --shifts <ground.str|nef>")?;
+    let stp =
+        structure_path.ok_or("ferric exchange-state requires --structure <ground.cif|pdb>")?;
+    if exchange_paths.is_empty() {
+        return Err("ferric exchange-state requires --exchange <cest_or_cpmg.tsv>".to_string());
+    }
+
+    let t0 = Instant::now();
+    let shifts_raw = fs::read_to_string(&sp)
+        .map_err(|e| format!("failed to read ground shifts '{}': {e}", sp.display()))?;
+    let shifts_ext = sp.extension().and_then(|s| s.to_str());
+    let ground_ref = parse_ground_shifts_str(&shifts_raw, shifts_ext)
+        .map_err(|e| format!("failed to parse ground shifts '{}': {e}", sp.display()))?;
+
+    let ground_model = StructureModel::parse_file(&stp, force_bfactor_plddt)?;
+
+    let mut all_obs: Vec<ExchangeShiftObservation> = Vec::new();
+    for ep in &exchange_paths {
+        let raw_tsv = fs::read_to_string(ep)
+            .map_err(|e| format!("failed to read exchange TSV '{}': {e}", ep.display()))?;
+        let mut parsed = parse_exchange_observations_tsv(&raw_tsv)
+            .map_err(|e| format!("failed to parse exchange TSV '{}': {e}", ep.display()))?;
+        all_obs.append(&mut parsed);
+    }
+
+    let mut alt_models: Vec<AltConformerInput> = Vec::with_capacity(alt_paths.len());
+    for ap in &alt_paths {
+        let model = StructureModel::parse_file(ap, force_bfactor_plddt)?;
+        let label = ap
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("alt_model")
+            .to_string();
+        alt_models.push(AltConformerInput { label, model });
+    }
+
+    let fw_query = HomologFirewallQuery {
+        query_pdb_ids: exclude_pdb,
+        query_bmrb_ids: exclude_bmrb,
+        query_topology_id: exclude_topology,
+        ..HomologFirewallQuery::default()
+    };
+
+    let cfg = ExcitedStateConfig {
+        sample_ph,
+        temperature_kelvin: temp_k,
+        ..ExcitedStateConfig::default()
+    };
+
+    let report = classify_excited_state_with_firewall(
+        Some(&ground_ref),
+        &ground_model,
+        &all_obs,
+        &alt_models,
+        &fw_query,
+        &cfg,
+    )?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let tsv_str = format_excited_state_tsv(&report);
+    let json_str = format_excited_state_json(&report)?;
+
+    if let Some(ref jp) = json_out {
+        fs::write(jp, &json_str).map_err(|e| format!("failed to write '{}': {e}", jp.display()))?;
+    }
+
+    if let Some(ref op) = out_path {
+        let is_json = op
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+        let payload = if is_json { &json_str } else { &tsv_str };
+        fs::write(op, payload).map_err(|e| format!("failed to write '{}': {e}", op.display()))?;
+        println!(
+            "Excited-state hypothesis engine ({} obs: {} signed, {} unsigned; {:.1} ms): {} [2lnBF_12={:.2}, 2lnBF_null={:.2}, rchi2={:.3}] -> {}",
+            report.n_observations,
+            report.n_signed_observations,
+            report.n_unsigned_observations,
+            elapsed_ms,
+            report.verdict.as_str(),
+            report.two_ln_bf_top1_vs_top2,
+            report.two_ln_bf_top1_vs_null,
+            report.top1_reduced_chi2,
+            op.display()
+        );
+    } else {
+        print!("{tsv_str}");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod exchange_state_cli_unit_tests {
+    use super::*;
+    use nmr_core::excited_state::{
+        write_exchange_observations_tsv, ExchangeSignMode, ExcitedStateHypothesisKind,
+        ExcitedStateReport, ExcitedStateVerdict,
+    };
+
+    #[test]
+    fn test_run_exchange_state_cli_help_errors_and_e2e_json_tsv() {
+        // 1. `--help` succeeds
+        run_exchange_state_cli(&["--help".to_string()]).expect("help");
+
+        // 2. Missing required flags or out-of-range pH/temp fail cleanly
+        assert!(run_exchange_state_cli(&["--unknown".to_string()]).is_err());
+        assert!(run_exchange_state_cli(&[
+            "--shifts".to_string(),
+            "missing.str".to_string(),
+            "--structure".to_string(),
+            "missing.pdb".to_string()
+        ])
+        .is_err());
+        assert!(run_exchange_state_cli(&[
+            "--shifts".to_string(),
+            "a.str".to_string(),
+            "--structure".to_string(),
+            "a.pdb".to_string(),
+            "--exchange".to_string(),
+            "a.tsv".to_string(),
+            "--ph".to_string(),
+            "19.5".to_string()
+        ])
+        .is_err());
+
+        // 3. End-to-end execution on Ubiquitin (`1d3z.pdb` + `bmr17769_ubiquitin_allatom.str`)
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root");
+        let tmp = std::env::temp_dir().join(format!(
+            "ferric_exchange_state_cli_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        let obs = vec![
+            ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: 19,
+                res_name: Some("PRO".to_string()),
+                atom: "CB".to_string(),
+                dw_ppm: 2.40,
+                dw_err_ppm: 0.08,
+                sign_mode: ExchangeSignMode::UnsignedMagnitude,
+                major_ppm: None,
+            },
+            ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: 19,
+                res_name: Some("PRO".to_string()),
+                atom: "CG".to_string(),
+                dw_ppm: 2.60,
+                dw_err_ppm: 0.08,
+                sign_mode: ExchangeSignMode::UnsignedMagnitude,
+                major_ppm: None,
+            },
+            ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: 18,
+                res_name: Some("GLU".to_string()),
+                atom: "CA".to_string(),
+                dw_ppm: 1.15,
+                dw_err_ppm: 0.08,
+                sign_mode: ExchangeSignMode::UnsignedMagnitude,
+                major_ppm: None,
+            },
+            ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: 18,
+                res_name: Some("GLU".to_string()),
+                atom: "C".to_string(),
+                dw_ppm: 1.35,
+                dw_err_ppm: 0.08,
+                sign_mode: ExchangeSignMode::UnsignedMagnitude,
+                major_ppm: None,
+            },
+            ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: 20,
+                res_name: Some("SER".to_string()),
+                atom: "N".to_string(),
+                dw_ppm: 1.85,
+                dw_err_ppm: 0.12,
+                sign_mode: ExchangeSignMode::UnsignedMagnitude,
+                major_ppm: None,
+            },
+        ];
+        let ex_tsv = tmp.join("cpmg_pro19.tsv");
+        fs::write(&ex_tsv, write_exchange_observations_tsv(&obs)).expect("write ex_tsv");
+
+        let out_json = tmp.join("report.json");
+        let out_tsv = tmp.join("report.tsv");
+        run_exchange_state_cli(&[
+            "--shifts".to_string(),
+            repo_root
+                .join("data/fixtures/bmr17769_ubiquitin_allatom.str")
+                .to_string_lossy()
+                .into_owned(),
+            "--structure".to_string(),
+            repo_root
+                .join("data/pdb_refs/1d3z.pdb")
+                .to_string_lossy()
+                .into_owned(),
+            "--exchange".to_string(),
+            ex_tsv.to_string_lossy().into_owned(),
+            "--exclude-pdb".to_string(),
+            "1D3Z,1UBQ".to_string(),
+            "--exclude-bmrb".to_string(),
+            "17769,6457".to_string(),
+            "--ph".to_string(),
+            "6.5".to_string(),
+            "--temp-k".to_string(),
+            "298.15".to_string(),
+            "--json-out".to_string(),
+            out_json.to_string_lossy().into_owned(),
+            "-o".to_string(),
+            out_tsv.to_string_lossy().into_owned(),
+        ])
+        .expect("run_exchange_state_cli");
+
+        let parsed_json: ExcitedStateReport =
+            serde_json::from_str(&fs::read_to_string(&out_json).expect("read json"))
+                .expect("deserialize report");
+        assert_eq!(
+            parsed_json.verdict,
+            ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::XxxProCisTrans)
+        );
+        assert!(parsed_json.ground_max_retained_seq_identity <= 0.25);
+        let tsv_txt = fs::read_to_string(&out_tsv).expect("read tsv");
+        assert!(tsv_txt.contains("Committed(XxxProCisTrans)"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

@@ -18,17 +18,20 @@ Every `ferric` subcommand (the deprecated `v0.14.x` `nmrassign` compatibility al
 | **Discovery & DSP** | `inspect` | Scan spectrometer folders or `.tar`/`.tgz`/`.zip` archives (`< 50 ms`) and classify experiments & regimes |
 | **Discovery & DSP** | `process` | Deterministic 2D/3D Bruker/Varian FID processing, `IST`/`FISTA` NUS reconstruction & `processing_recipe.json` export |
 | **Peak Picking** | `pick` | Classical MAD/parabolic or 2D/3D separable CNN (`--method neural`) peak picking + Pass-2 `StripBank3D` weak-peak rescue |
-| **Assignment** | `assign` | Sequence-only backbone assignment (`globular`, `idp-13c`, `paramagnetic`) across `evo-graph`, `standard`, and opt-in experimental `bayes-sa` |
+| **Assignment** | `assign` | Sequence-only backbone assignment (`globular`, `idp-13c`, `paramagnetic`) across `evo-graph`, `standard`, and opt-in `bayes-sa`, plus opt-in `--af-structure` 3D priors |
 | **Assignment** | `sidechain` | Joint aliphatic, aromatic (`--aromatic --ph`), and Bayesian stereospecific prochiral (`--stereospec`) assignment |
 | **Assignment** | `methyl` | Supramolecular `13C`-Methyl TROSY (`ILVMAT`, `ILV-proS`/`proR`) structure-based GPU contact-graph assignment |
 | **Ensemble & Structure** | `propensity` | IDP Secondary Structure Propensity (`SSP`) and 4-state (`alpha`, `beta`, `PPII`, `coil`) HMM populations |
 | **Ensemble & Structure** | `torsions` | Strictly post-assignment 3/9-mer `(phi, psi[, chi1])` prediction under the 4-layer `HomologFirewall` |
-| **Ensemble & Structure** | `structure` | 7-cycle iterative ambiguous NOESY ADR + torsion-angle NeRF + multi-medium Saupe `RDC` CPU/WebGPU ensemble folding |
+| **Ensemble & Structure** | `af-validate` | Guarded `mmCIF`/`PAE` ingestion, Kabsch–Sander `8 -> 4`-state secondary structure, and `pLDDT` vs `RCI-S²`/$S^2$ concordance |
+| **Ensemble & Structure** | `predict-shifts` | Firewalled (`<= 25%` seq-id, `TM < 0.50`) 3D coordinates to backbone & `ILVMAT` methyl chemical-shift predictor |
+| **Ensemble & Structure** | `structure` | 7-cycle NOESY + torsion + multi-medium `RDC` folding, plus `--pae-domains` rigid-domain `RDC`/`PCS`/`PRE` docking |
+| **Ensemble & Structure** | `cofold` | `CSP`/`PRE`-guided `AlphaFold 3` JSON & `Boltz-2` YAML restraint export (`export`) and multi-pose complex re-scoring (`score`) |
 | **Interchange & Reports** | `pipeline` | End-to-end single-command workflow (`FIDs/spectra/peaks + seq -> shifts.str + result.nef + report.html`) |
 | **Interchange & Reports** | `report` | Standalone `HTML+SVG` quality report (`CSI`, strip ladders, Ramachandran, `RDC` $Q$/$Q_{\text{free}}$, IDP propensities) |
 | **Interchange & Reports** | `export-fig` | Deterministic publication-ready SVG figure showcase generator across all 8 workbench modalities |
 | **Interchange & Reports** | `nef-import` / `nef-export` | Lossless conversion between `NEF v1.1` (`.nef`), `NMR-STAR v3.2` (`.str`), and 7-column Peak `TSV` |
-| **Dynamics & Exchange** | `relax` / `modelfree` / `cest` / `cpmg` / `csp` | Batched GPU $R_1$/$R_2$/hetNOE, Lipari–Szabo `M1`–`M5` $S^2$, Bloch–McConnell `CEST`, Baldwin `CPMG`, and tight-binding `CSP` $K_d$ |
+| **Dynamics & Exchange** | `relax` / `modelfree` / `cest` / `cpmg` / `exchange-state` / `csp` | Batched GPU $R_1$/$R_2$/hetNOE, Lipari–Szabo `M1`–`M5` $S^2$, Bloch–McConnell `CEST`, Baldwin `CPMG`, Bayesian `BIC` excited-state classifier, and tight-binding `CSP` $K_d$ |
 | **1D, DOSY & Chemometrics** | `nmr1d` / `dosy` / `metabolomics` / `chem` | Analytical 1D (`process`/`multiplet`/`qnmr`), pseudo-2D `DOSY` (`fit`/`ilt`/`mw`), untargeted 1D `metabolomics` (`bin`/`pca`/`oplsda`/`stocsy`), and `Octet` 2D chemical studio |
 | **Services & AI** | `serve` / `mcp` / `mcp-config` | Self-hosted loopback REST job dashboard (`serve`) and sandboxed JSON-RPC 2.0 `MCP` server & client config generator |
 | **Benchmarks & Data** | `fetch-bmrb` / `priors` / `simulate` / `score` / `benchmark` / `benchmark-suite` / `real-benchmark` / `e2e-benchmark` | Rate-limited CC0 BMRB archive downloader, prior builder, volumetric physics simulator, permutation-invariant scorer, and CI benchmark suites |
@@ -137,6 +140,13 @@ ferric pipeline \
 # Lossless NEF v1.1 round-trip interchange
 ferric nef-export --star ./out/all_atom.str --peaks ./out/peaks.tsv --out ./out/project.nef
 ferric nef-import --in ./out/project.nef --out-star ./out/reloaded.str --out-peaks ./out/reloaded.tsv
+
+# AlphaFold concordance, firewalled 3D shift prediction, PAE domain docking & co-folding (Chapter 9)
+ferric af-validate --structure ./data/model.cif --pae ./data/pae.json --shifts ./out/assigned.str -o ./out/af_concordance.json
+ferric predict-shifts --structure ./data/model.cif --ph 6.5 --temp-k 298.15 --methyl-ilvmat -o ./out/pred_shifts.str
+ferric structure --pae-domains --af-structure ./data/multidomain.cif --af-pae ./data/pae.json --rdc ./data/rdc_m1.tsv --pcs ./data/pcs.tsv -o ./out/docked.pdb
+ferric cofold export --format boltz2 --fasta ./data/complex.fasta --apo-structure ./data/apo.cif --csp ./out/csp_kd.tsv -o ./out/complex.yaml
+ferric cofold score --poses ./out/pose0.cif,./out/pose1.cif --apo-structure ./data/apo.cif --csp ./out/csp_kd.tsv -o ./out/pose_scores.json
 ```
 
 #### 4. Dynamics, Chemical Exchange, 1D `qNMR`, `DOSY` & Metabolomics
@@ -168,6 +178,15 @@ ferric cpmg \
   --in ./data/cpmg_600.tsv --in ./data/cpmg_800.tsv \
   --model baldwin2014 --engine gpu \
   --out ./out/cpmg_fit.tsv
+
+# Bayesian BIC / Bayes-factor structural hypothesis engine across signed CEST & unsigned CPMG
+ferric exchange-state \
+  --shifts ./out/assigned.str \
+  --structure ./data/ground.cif \
+  --exchange ./out/cest_fit.tsv \
+  [--alt-structures ./data/alt1.cif,./data/alt2.pdb] \
+  --ph 6.5 --temp-k 298.15 \
+  -o ./out/excited_state.json
 
 # Fast-exchange HSQC/HMQC ligand titration trajectory tracking & exact quadratic tight-binding Kd
 ferric csp \
@@ -253,7 +272,7 @@ FERRIC implements the open **Model Context Protocol (`MCP`, JSON-RPC 2.0)** spec
 
 ### Setting Up Antigravity, Claude Desktop & Cursor
 
-Client JSON configurations can be generated programmatically via `generate_mcp_client_config` (`ferric mcp-config`) or copied in one click from the **`🔌 MCP Bridge`** panel inside `nmr-gui`.
+Client JSON configurations can be generated programmatically via `generate_mcp_client_config` (`ferric mcp-config`) or copied in one click from the **`MCP Bridge`** panel inside `nmr-gui`.
 
 #### 1. Headless `stdio` Mode (`ReadOnly` Default)
 
@@ -282,7 +301,7 @@ Add the following block to your client's `mcpServers` configuration file (for **
 
 #### 2. Live `nmr-gui` Desktop Loopback Bridge Mode (`HttpBridge`)
 
-1. Open `ferric-gui` on your desktop, navigate to the **`🔌 MCP Bridge`** panel, choose **`ReadOnly`** (default) or **`ReadWrite`**, and click **Start Local Bridge**.
+1. Open `ferric-gui` on your desktop, navigate to the **`MCP Bridge`** panel, choose **`ReadOnly`** (default) or **`ReadWrite`**, and click **Start Local Bridge**.
 2. `nmr-gui` binds strictly to `127.0.0.1:<port>` (ephemeral loopback port by default) and generates a fresh 256-bit OS CSPRNG session bearer token (`nmr_mcp_<64-hex>`, drawn from `/dev/urandom` on Unix and Windows CNG `BCryptGenRandom` on Windows).
 3. Click **Copy MCP Config** (or run `ferric mcp-config --client <antigravity|claude-desktop|cursor> --bridge-port <port>`), which emits the identical canonical `"ferric-workbench"` entry for your selected host client:
 
@@ -367,6 +386,10 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
 | `analyze_nmr1d_spectrum` | `stdio` | `ReadOnly` | Run 1D DSP, Fulmer solvent referencing, Voigt/Hoye `J`-trees, journal formatting & GUM `qNMR` |
 | `fit_dosy_diffusion` | `stdio` | `ReadOnly` | Fit discrete `BIC` Stejskal–Tanner / `BPP-LED` `DOSY` decays, opt-in `ILT`, and Stokes–Einstein `MW` |
 | `run_metabolomics_chemometrics` | `stdio` | `ReadOnly` | Run sandboxed `AI-Binning`, `PQN`, `PCA` Hotelling $T^2$/$Q$, leak-free `OPLS-DA`, and `STOCSY` |
+| `af_concordance` | `stdio` | `ReadOnly` | Run Kabsch–Sander `8 -> 4`-state SS and `pLDDT` vs `RCI-S²`/$S^2$ concordance & 4-class discordance (`0` network I/O) |
+| `predict_structure_shifts` | `stdio` | `ReadOnly` | Predict 3D-to-shift backbone & `ILVMAT` shifts under `<= 25%` seq-id / `TM < 0.50` `HomologFirewall` (`exclusion_list_sha256`) |
+| `score_cofold_poses` | `stdio` | `ReadOnly` | Re-score co-folded `.cif`/`.pdb` poses against `CSP`, intermolecular `NOE`/`PRE`, `RDC` $Q_{\text{free}}$, and `PCS` |
+| `classify_excited_state` | `stdio` | `ReadOnly` | Classify `CEST`/`R1rho` (signed) & `CPMG` (folded-$t_5$ unsigned) shift differences across `H0`–`H4` by `BIC` & $2\ln\mathrm{BF}$ |
 | `write_curated_peak_tsv` | `stdio` | `ReadWrite` | Write filtered/curated 7-column peak `TSV` strictly inside `allowed_roots` |
 | `export_nmrstar_shifts` | `stdio` | `ReadWrite` | Write `NMR-STAR v3.2` chemical shifts strictly inside `allowed_roots` |
 | `get_workbench_state` | `gui` | `ReadOnly` | Snapshot active residue, `(1H, 15N, 13C)` crosshair, ranked strip candidates, undo depth & QC |
@@ -384,6 +407,7 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
   - `deconvolve-1d-mixture-dosy`: Fulmer referencing, Voigt/Hoye multiplet trees, `qNMR` stoichiometry, and `BIC` `DOSY` vs opt-in `ILT`.
   - `fit-cest-cpmg-exchange`: Locked-shape plane integration, flat-null gate, multi-field scaling, and Bloch–McConnell `CEST` / Baldwin `CPMG`.
   - `analyze-metabolomics-cohort`: Step-by-step `AI-Binning` + `PQN`, `PCA` Hotelling $T^2$/$Q$ outlier check, leak-free `k`-fold `OPLS-DA` ($Q^2$ & permutation $p$-value overfitting guards), and `STOCSY` spin-system annotation.
+  - `validate-and-dock-alphafold-model`: Step-by-step AlphaFold `mmCIF`/`PAE` concordance audit (`af_concordance`), firewalled 3D shift check (`predict_structure_shifts`), Tolman $\vartheta_d / \vartheta_1$ GDO & multi-medium `PAE`-domain docking ([Chapter 9](09-alphafold-and-integrative-nmr.md)), co-folded complex pose ranking (`score_cofold_poses`), and `CEST`/`CPMG` excited-state classification (`classify_excited_state`).
 
 #### JSON-RPC 2.0 & MCP Error Codes
 

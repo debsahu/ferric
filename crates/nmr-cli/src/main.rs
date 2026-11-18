@@ -232,6 +232,7 @@ fn usage() -> String {
        ferric modelfree       (--r1 <r1.tsv> --r2 <r2.tsv> [--hetnoe <noe.tsv>] ... | --rates <rates.tsv> ...) --out <modelfree.tsv> [--pdb <opt.pdb>] [--diffusion auto|isotropic|axial|anisotropic] [--criterion aic|aicc|bic|ftest]\n\
        ferric cest            --in <profiles.tsv> [--in <profiles_b2.tsv> ...] [--out <fit.tsv>] [--states 2|3] [--triangular] [--b1-quad 5] [--engine cpu|gpu|auto] [--chi2-surface] [--json-out <fit.json>]\n\
        ferric cpmg            (--in <cpmg.tsv> ... | --raw-planes <planes.tsv> ... | --r1rho <r1rho.tsv> --major-ppm <ppm> --larmor-mhz <mhz>) [--out <fit.tsv>] [--model baldwin2014|cr72|lm63|numerical2x2|flat] [--engine cpu|gpu|auto] [--json-out <fit.json>]\n\
+       ferric exchange-state  --shifts <ground.str|nef> --structure <ground.cif|pdb> --exchange <cest_or_cpmg.tsv> [--alt-structures <m1.cif,m2.pdb>] [--ph 6.5] [--temp-k 298.15] [-o <excited_state.json|tsv>]\n\
        ferric csp             (--apo-peaks <apo.tsv> | --star <apo.str>) --step <[L]_uM[:[P]_uM]=path> ... [--out <csp.tsv>] [--experiment hsqc|hmqc] [--protein-um 100.0] [--ligand-stock-um <uM>] [--mc-trials 400] [--trajectories-out <traj.tsv>] [--json-out <csp.json>]\n\
        ferric nmr1d           (process | multiplet | qnmr) [options]  (see `ferric nmr1d --help`)\n\
        ferric structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--rdc <rdcs.tsv|rdcs.nef>] [--torsion-db] [--include-chi1] [--rdc-weight 0.75] [--rdc-free-frac 0.20] [--engine auto|gpu|cpu] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
@@ -8398,6 +8399,7 @@ fn main() {
         "modelfree" | "model-free" => relax_cmd::run_modelfree_cli(&args[1..]),
         "cest" | "dest" => exchange_cmd::run_cest_cli(&args[1..]),
         "cpmg" | "r1rho" => exchange_cmd::run_cpmg_cli(&args[1..]),
+        "exchange-state" => exchange_cmd::run_exchange_state_cli(&args[1..]),
         "csp" => exchange_cmd::run_csp_cli(&args[1..]),
         "nmr1d" => nmr1d_cmd::run_nmr1d_cli(&args[1..]),
         "structure" => cmd_structure(&args[1..]),

@@ -28,9 +28,9 @@ FERRIC is engineered from the ground up as a **100% clean-room, permissively lic
 
 To prevent data leakage, circular self-validation, or inflated accuracy claims, FERRIC enforces four structural invariants in code and CI:
 
-1. **Sequence-Only Backbone Assignment**: `ferric assign` uses only the 1D amino-acid sequence, experimental peak tables/spectra, and fixed BMRB chemical-shift priors (`data/priors/bmrb_priors.json`, derived from `36` public BMRB entries disjoint from all benchmark manifests).
-2. **Unlabelled Reference-Offset Estimation**: Global per-nucleus chemical-shift offsets (`estimate_reference_offsets_detailed` and `ferric score`) are estimated strictly without ground-truth assignment labels (`< 1e-12` permutation-invariant).
-3. **4-Layer `HomologFirewall` (`nmr-core::torsion_db`)**: Post-assignment 3/9-mer $(\phi, \psi, \chi_1)$ prediction runs strictly *after* assignment and excludes homologous templates across `L1` (PDB/BMRB/UniProt/family IDs), `L2` (CATH/ECOD fold topology), `L3` (global Needleman–Wunsch & local Smith–Waterman `<= 25%` sequence identity at `>= 50%` coverage under both `BLOSUM62` and exact-identity scoring + `6/7` k-mer filter), and `L4` (Zhang–Skolnick `TM-score < 0.50`), emitting a deterministic `exclusion_list_sha256` audit digest.
+1. **Sequence-Only Default Backbone Assignment**: Default `ferric assign` uses only the 1D amino-acid sequence, experimental peak tables/spectra, and fixed BMRB chemical-shift priors (`data/priors/bmrb_priors.json`, derived from `36` public BMRB entries disjoint from all benchmark manifests); 3D structural shift and `PAE`-gated `15N-NOESY` priors (`--af-structure`) are strictly opt-in ([Chapter 9](09-alphafold-and-integrative-nmr.md)).
+2. **Unlabelled Reference-Offset Estimation**: Global per-nucleus chemical-shift offsets (`estimate_reference_offsets_detailed`, `estimate_af_shift_offsets`, and `ferric score`) are estimated strictly without ground-truth assignment labels (`< 1e-12` permutation-invariant).
+3. **4-Layer `HomologFirewall` (`nmr-core::torsion_db`, `nmr-core::struct_shifts`)**: Both post-assignment 3/9-mer $(\phi, \psi, \chi_1)$ prediction and 3D-to-chemical-shift Fourier hypersurface fitting (`torsion_corpus.tsv`) exclude homologous templates across `L1` (PDB/BMRB/UniProt/family IDs), `L2` (CATH/ECOD fold topology), `L3` (global Needleman–Wunsch & local Smith–Waterman `<= 25%` sequence identity at `>= 50%` coverage under both `BLOSUM62` and exact-identity scoring + `6/7` k-mer filter), and `L4` (Zhang–Skolnick `TM-score < 0.50`), emitting a deterministic `exclusion_list_sha256` audit digest.
 4. **Pre-Registered Single-Shot Cold Cohort Rotation**: Real-spectrum BMRB entries (`data/benchmark/real_manifest.tsv`) are partitioned into development/seen cohorts and pre-registered unseen (`cold_*`) cohorts. Each cold cohort is evaluated **once** after code freeze, its exact empirical accuracy and high-confidence precision are recorded verbatim ([Chapter 3](03-solvers-and-calibration.md#honest-unseen-protein-cold-cohort-empirical-precision-caveats)), and spent cold cohorts are immediately relabeled `seen_*` so they are never reused as unseen evidence.
 
 ---
@@ -38,7 +38,7 @@ To prevent data leakage, circular self-validation, or inflated accuracy claims, 
 ## Open `CC0 1.0` Data Policy & Private Data Isolation
 
 - **BMRB (`https://bmrb.io/`)**: Empirical amino-acid backbone and sidechain priors (`data/priors/PROVENANCE.md`), torsion corpus chains (`data/torsion_db/PROVENANCE.md`, `SHA-256` verified via `scripts/build_torsion_corpus.py --verify`), and public benchmark manifests (`data/benchmark/PROVENANCE.md`) derive exclusively from `CC0 1.0 Universal` BMRB depositions, with every accession ID and SHA-256 digest recorded.
-- **wwPDB & Chemical Component Dictionary (`https://www.wwpdb.org/`)**: Reference macromolecular coordinates (`data/pdb_refs/`) and standard 20-amino-acid covalent topologies derive from `CC0 1.0` wwPDB entries (`.licenses/pdb_database_LICENSE.txt`).
+- **wwPDB, ModelArchive & AlphaFold Database (`https://www.wwpdb.org/`, `https://alphafold.ebi.ac.uk/`)**: Reference macromolecular coordinates (`data/pdb_refs/`) and standard 20-amino-acid covalent topologies derive from `CC0 1.0` wwPDB entries (`.licenses/pdb_database_LICENSE.txt`); opt-in CLI downloads via `ferric af-validate --fetch-uniprot` record `CC-BY-4.0` attribution and `FIPS 180-4` `SHA-256` digests in `PROVENANCE.md`.
 - **Unpublished Experimental Data (`data/private/`)**: Unpublished laboratory datasets remain strictly inside git-ignored `data/private/` and never enter public commits or fixtures.
 
 ---
@@ -225,3 +225,36 @@ FERRIC is distributed under the **MIT License** (`LICENSE`). All `327` transitiv
 - **Gutmanas, A. et al.** (2015). NMR Exchange Format (`NEF v1.1`): a unified standard for representation of NMR restraint and chemical shift data. *Nat. Struct. Mol. Biol.* **22**, 433–434.
 - **Westbrook, J. D. et al.** (2015). The chemical component dictionary (`wwPDB CCD`): complete descriptions of constituent molecules in experimentally determined 3D macromolecules. *Bioinformatics* **31**, 1274–1278.
 - **Model Context Protocol (`MCP`) Specification** (`2024-11-05` & `2025-03-26`) & **JSON-RPC 2.0 Specification**; **RFC 2083** (PNG), **RFC 1950/1951** (ZLIB/DEFLATE), **RFC 4648** (Base64), **RFC 8259** (JSON), and **RFC 9110** (HTTP Semantics).
+
+### 9. AlphaFold Concordance, 3D Shift Forward Physics, Multi-Domain Docking, Co-Folding & Excited States
+
+- **McConnell, H. M.** (1957). Theory of nuclear magnetic shielding by electron currents. *J. Chem. Phys.* **27**, 226–229.
+- **Buckingham, A. D.** (1960). Chemical shifts in the nuclear magnetic resonance spectra of molecules containing polar groups. *Can. J. Chem.* **38**, 300–307.
+- **Haigh, C. W. & Mallion, R. B.** (1972). New tables of "ring current" shielding in proton magnetic resonance. *Mol. Phys.* **24**, 955–970; and (1979) *Prog. Nucl. Magn. Reson. Spectrosc.* **13**, 303–344.
+- **Shrake, A. & Rupley, J. A.** (1973). Environment and exposure to solvent of protein atoms. *J. Mol. Biol.* **79**, 351–371.
+- **Schwarz, G.** (1978). Estimating the dimension of a model (`BIC`). *Ann. Stat.* **6**, 461–464.
+- **Kabsch, W. & Sander, C.** (1983). Dictionary of protein secondary structure: pattern recognition of hydrogen-bonded and geometrical features. *Biopolymers* **22**, 2577–2637.
+- **Wagner, G., Pardi, A. & Bax, A.** (1983). Hydrogen bond length and $^{1}\text{H}$ NMR chemical shifts in proteins. *J. Am. Chem. Soc.* **105**, 5948–5949.
+- **Lange, K. L., Little, R. J. A. & Taylor, J. M. G.** (1989). Robust statistical modeling using the $t$ distribution. *J. Am. Stat. Assoc.* **84**, 881–896.
+- **Case, D. A.** (1995). Calibration of ring-current effects in proteins and nucleic acids. *J. Biomol. NMR* **6**, 341–346.
+- **Kass, R. E. & Raftery, A. E.** (1995). Bayes factors. *J. Am. Stat. Assoc.* **90**, 773–795.
+- **Sitkoff, D. & Case, D. A.** (1998). Theories of chemical shift anisotropies in proteins and nucleic acids. *Prog. Nucl. Magn. Reson. Spectrosc.* **32**, 165–190.
+- **Braddock, D. T., Cai, M., Baber, J. L., Huang, Y. & Clore, G. M.** (2001). Rapid identification of medium- to large-scale interdomain motion in modular proteins using dipolar couplings. *J. Am. Chem. Soc.* **123**, 8634–8635.
+- **Ng, A. Y., Jordan, M. I. & Weiss, Y.** (2001). On spectral clustering: analysis and an algorithm. *Adv. Neural Inf. Process. Syst.* **14**, 849–856.
+- **Tolman, J. R., Al-Hashimi, H. M., Kay, L. E. & Prestegard, J. H.** (2001). Structural and dynamic analysis of residual dipolar coupling data for proteins (`GDO`). *J. Am. Chem. Soc.* **123**, 1416–1424.
+- **Schubert, M., Labudde, D., Oschkinat, H. & Schmieder, P.** (2002). A software tool for the prediction of Xaa-Pro peptide bond conformations in proteins based on $^{13}\text{C}$ chemical shift statistics. *J. Biomol. NMR* **24**, 149–154.
+- **Skrynnikov, N. R., Dahlquist, F. W. & Kay, L. E.** (2002). Reconstructing NMR spectra of "invisible" excited protein states using HSQC and HMQC experiments. *J. Am. Chem. Soc.* **124**, 12352–12360.
+- **Clore, G. M. & Schwieters, C. D.** (2004). Amplitudes of protein backbone dynamics and correlated motions in a small $\alpha/\beta$ protein: correspondence of dipolar coupling and heteronuclear relaxation measurements. *J. Am. Chem. Soc.* **126**, 2923–2938.
+- **Bertini, I., Gupta, Y. K., Luchinat, C., Parigi, G., Peana, M., Sgheri, L. & Yuan, J.** (2007). Paramagnetism-based NMR restraints provide maximum allowed probabilities for the different conformations of partially independent protein domains. *J. Am. Chem. Soc.* **129**, 12786–12794.
+- **Vallurupalli, P., Hansen, D. F. & Kay, L. E.** (2008). Structures of invisible, excited protein states by relaxation dispersion NMR spectroscopy. *Proc. Natl. Acad. Sci. U.S.A.* **105**, 11766–11771.
+- **Shen, Y. & Bax, A.** (2010). Empirical NMR chemical shift prediction from protein structure and additive physical shift decomposition. *J. Biomol. NMR* **48**, 13–22; and (2010) *J. Biomol. NMR* **46**, 199–204.
+- **Bouvignies, G., Vallurupalli, P., Hansen, D. F., Correia, B. E., Lange, O., Bah, A., Vernon, R. M., Dahlquist, F. W., Baker, D. & Kay, L. E.** (2011). Solution structure of a minor and transiently formed state of a T4 lysozyme mutant. *Nature* **477**, 111–114.
+- **Sahakyan, A. B., Vranken, W. F., Cavalli, A. & Vendruscolo, M.** (2011). Structure-based prediction of methyl chemical shifts in proteins. *Angew. Chem. Int. Ed.* **50**, 9620–9623.
+- **Adzhubei, A. A., Sternberg, M. J. E. & Makarov, A. A.** (2013). Polyproline-II helix in proteins: structure and function. *J. Mol. Biol.* **425**, 2100–2132.
+- **Fowler, N. J., Sljoka, A. & Williamson, M. P.** (2020). A method for validating the accuracy of NMR protein structures. *Nat. Commun.* **11**, 5982; and **Fowler, N. J. & Williamson, M. P.** (2022). *Structure* **30**, 925–933.
+- **Jumper, J., Evans, R., Pritzel, A. et al.** (2021). Highly accurate protein structure prediction with AlphaFold. *Nature* **596**, 583–589.
+- **Varadi, M., Anyango, S., Deshpande, M. et al.** (2022). AlphaFold Protein Structure Database (`AFDB`). *Nucleic Acids Res.* **50**, D439–D444; and **Varadi, M. et al.** (2024). *Nucleic Acids Res.* **52**, D368–D375.
+- **Alderson, T. R., Pritišanac, I., Kolarić, Đ., Moses, A. M. & Forman-Kay, J. D.** (2023). Systematic identification of conditionally folded intrinsically disordered regions by AlphaFold2. *Proc. Natl. Acad. Sci. U.S.A.* **120**, e2304302120.
+- **Abramson, J., Adler, J., Dunger, J. et al.** (2024). Accurate structure prediction of biomolecular interactions with AlphaFold 3. *Nature* **630**, 493–500.
+- **Wayment-Steele, H. K., Ojoawo, A., Otten, R. et al.** (2024). Predicting multiple conformations via sequence clustering and AlphaFold2. *Nature* **625**, 832–839.
+- **Wohlwend, J., Corso, G., Passaro, S. et al.** (2024). Boltz-1: democratizing biomolecular interaction modeling. *bioRxiv* DOI: `10.1101/2024.11.19.624167`; and **Passaro, S., Corso, G., Wohlwend, J. et al.** (2025). Boltz-2: towards accurate and efficient binding affinity prediction. *bioRxiv* DOI: `10.1101/2025.06.14.659707`.
