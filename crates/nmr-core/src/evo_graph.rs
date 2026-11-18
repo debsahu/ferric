@@ -74,6 +74,17 @@ impl ReferenceOffsets {
             _ => 0.0,
         }
     }
+
+    #[inline]
+    pub const fn to_shift_offsets(self) -> crate::priors::ShiftOffsets {
+        crate::priors::ShiftOffsets {
+            h: self.d_h,
+            n: self.d_n,
+            ca: self.d_ca,
+            cb: self.d_cb,
+            c: self.d_c,
+        }
+    }
 }
 
 /// Backbone `(phi_deg, psi_deg)` torsion pair for a single residue (`None` when undefined).
@@ -2455,6 +2466,7 @@ fn build_evo_unary_matrix(
     systems: &[SpinSystem],
     seq: &[String],
     shifted_priors: &Priors,
+    applied_offsets: &ReferenceOffsets,
     cfg: &EvoGraphConfig<'_>,
     effective_assign_cost: f64,
     locks: &[(usize, usize)],
@@ -2605,7 +2617,15 @@ fn build_evo_unary_matrix(
     }
 
     if let Some(af) = cfg.af_priors {
-        af.apply_to_unary_matrix(&mut u, systems, cfg.score_cfg.use_hn);
+        let shift_off = applied_offsets.to_shift_offsets();
+        af.apply_replacement_to_unary(
+            &mut u,
+            systems,
+            seq,
+            shifted_priors,
+            &shift_off,
+            &cfg.score_cfg,
+        );
     }
 
     for &(s_lock, k_lock) in locks {
@@ -4097,6 +4117,18 @@ pub fn assign_evo_graph_with_report(
         apply_dataset_qc_to_assignments(&mut result, &qc);
         qc.already_applied = true;
     }
+    if cfg.af_priors.is_some() {
+        qc.confidence_calibrated = false;
+        let msg = "uncalibrated_af_prior=true: AF structure shift/NOE priors active; sequence-only isotonic calibration knots were not refit with AF priors (confidence_calibrated=false)".to_string();
+        qc.calibration_warning = Some(msg);
+        if !qc
+            .reasons
+            .iter()
+            .any(|r| r.contains("uncalibrated_af_prior"))
+        {
+            qc.reasons.push("uncalibrated_af_prior=true".to_string());
+        }
+    }
     apply_locked_result_overrides(&mut result, norm_seq.len(), &valid_locks);
     report.qc_report = qc;
     (result, report)
@@ -4145,6 +4177,7 @@ fn assign_evo_graph_core(
         systems,
         &norm_seq,
         &priors_pass1,
+        &pass1_offsets,
         cfg,
         effective_assign_cost,
         locks,
@@ -4202,6 +4235,7 @@ fn assign_evo_graph_core(
         systems,
         &norm_seq,
         &priors_pass2,
+        &final_offsets,
         cfg,
         effective_assign_cost,
         locks,
@@ -4255,7 +4289,7 @@ fn assign_evo_graph_core(
         &u2_phys,
         &p,
         af_noe.as_ref(),
-        cfg.apply_qc_calibration,
+        cfg.apply_qc_calibration && cfg.af_priors.is_none(),
     );
     apply_locked_result_overrides(&mut res2, norm_seq.len(), locks);
     report.final_best_score = res2.score;
@@ -4340,6 +4374,18 @@ pub fn assign_evo_graph_from_peaks_with_minor_damping(
         }
         apply_dataset_qc_to_assignments(&mut result, &qc);
         qc.already_applied = true;
+    }
+    if cfg.af_priors.is_some() {
+        qc.confidence_calibrated = false;
+        let msg = "uncalibrated_af_prior=true: AF structure shift/NOE priors active; sequence-only isotonic calibration knots were not refit with AF priors (confidence_calibrated=false)".to_string();
+        qc.calibration_warning = Some(msg);
+        if !qc
+            .reasons
+            .iter()
+            .any(|r| r.contains("uncalibrated_af_prior"))
+        {
+            qc.reasons.push("uncalibrated_af_prior=true".to_string());
+        }
     }
     apply_locked_result_overrides(&mut result, norm_seq.len(), &remapped_locks);
     report.qc_report = qc;

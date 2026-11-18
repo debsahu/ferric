@@ -215,7 +215,7 @@ pub fn unary_matrix_with_af_priors(
         return u;
     }
 
-    let (eff_priors, _) = prepare_scoring_priors(systems, sequence, priors, cfg);
+    let (eff_priors, seq_offsets) = prepare_scoring_priors(systems, sequence, priors, cfg);
     let assignable = sequence
         .iter()
         .enumerate()
@@ -314,7 +314,7 @@ pub fn unary_matrix_with_af_priors(
         }
     }
     if let Some(af) = af_priors {
-        af.apply_to_unary_matrix(&mut u, systems, cfg.use_hn);
+        af.apply_replacement_to_unary(&mut u, systems, sequence, &eff_priors, &seq_offsets, cfg);
     }
     if !cfg.locked_assignments.is_empty() {
         apply_locked_assignments_to_unary(&mut u, systems, sequence, &eff_priors, cfg);
@@ -2052,7 +2052,8 @@ pub fn assign_uncalibrated_with_af_priors(
 }
 
 /// Run `assign` with optional 3D AlphaFold shift & `PAE`-gated `15N-NOESY` priors
-/// (`af_priors: None` executes bit-identically to [`assign`]).
+/// (`af_priors: None` executes bit-identically to [`assign`]; when `af_priors` is `Some`,
+/// emits raw physical marginals rather than sequence-only `STANDARD_CALIBRATION_KNOTS` per `21.W2:P1-2`).
 pub fn assign_with_af_priors(
     systems: &[SpinSystem],
     sequence: &[String],
@@ -2074,7 +2075,7 @@ pub fn assign_with_af_priors(
         af_noe.as_ref(),
         cfg,
         &locks,
-        StandardCalibrationMode::Cpu,
+        StandardCalibrationMode::Uncalibrated,
     )
 }
 

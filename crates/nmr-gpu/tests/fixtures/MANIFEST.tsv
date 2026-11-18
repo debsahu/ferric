@@ -1,0 +1,13 @@
+name	kind	rows	cols	dtype	file
+synth_ubq_realistic_s0	cpu_u	142	76	f64	synth_ubq_realistic_s0_cpu_u.f64le
+synth_ubq_realistic_s0	cpu_p	142	142	f64	synth_ubq_realistic_s0_cpu_p.f64le
+synth_ubq_realistic_s0	gpu_u	142	76	f32	synth_ubq_realistic_s0_gpu_u.f32le
+synth_ubq_realistic_s0	gpu_p	142	142	f32	synth_ubq_realistic_s0_gpu_p.f32le
+bmr17769_realistic_s1	cpu_u	134	76	f64	bmr17769_realistic_s1_cpu_u.f64le
+bmr17769_realistic_s1	cpu_p	134	134	f64	bmr17769_realistic_s1_cpu_p.f64le
+bmr17769_realistic_s1	gpu_u	134	76	f32	bmr17769_realistic_s1_gpu_u.f32le
+bmr17769_realistic_s1	gpu_p	134	134	f32	bmr17769_realistic_s1_gpu_p.f32le
+synth_ubq_default_s3	cpu_u	87	76	f64	synth_ubq_default_s3_cpu_u.f64le
+synth_ubq_default_s3	cpu_p	87	87	f64	synth_ubq_default_s3_cpu_p.f64le
+synth_ubq_default_s3	gpu_u	87	76	f32	synth_ubq_default_s3_gpu_u.f32le
+synth_ubq_default_s3	gpu_p	87	87	f32	synth_ubq_default_s3_gpu_p.f32le
