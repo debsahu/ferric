@@ -397,6 +397,32 @@ pub fn read_fid_2d_opts(dir: impl AsRef<Path>, allow_truncated_fid: bool) -> Res
     }
 }
 
+/// Read a 2D raw FID directory with optional explicit IPAP overrides (`ipap_j_caco_hz`, `ipap_ap_scale`, `ipap_ip_first`).
+pub fn read_fid_2d_with_ipap(
+    dir: impl AsRef<Path>,
+    allow_truncated_fid: bool,
+    ipap_j_caco_hz: Option<f64>,
+    ipap_ap_scale: Option<f64>,
+    ipap_ip_first: Option<bool>,
+) -> Result<Fid2D, String> {
+    let p = resolve_fid_dir(dir.as_ref())?;
+    let has_acqu = find_file_ci(&p, "acqus").is_some() || find_file_ci(&p, "acqu").is_some();
+    let has_2 = find_file_ci(&p, "acqu2s").is_some() || find_file_ci(&p, "acqu2").is_some();
+    let has_3 = find_file_ci(&p, "acqu3s").is_some() || find_file_ci(&p, "acqu3").is_some();
+    let has_ser = find_file_ci(&p, "ser").is_some();
+    if has_acqu && has_2 && !has_3 && has_ser {
+        read_bruker_fid_2d_with_ipap(
+            &p,
+            allow_truncated_fid,
+            ipap_j_caco_hz,
+            ipap_ap_scale,
+            ipap_ip_first,
+        )
+    } else {
+        read_fid_2d_opts(&p, allow_truncated_fid)
+    }
+}
+
 /// Read a 3D raw FID directory (Bruker `ser` + `acqus`/`acqu2s`/`acqu3s` or Varian `fid` + `procpar`).
 pub fn read_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
     read_fid_3d_opts(dir, false)
@@ -452,6 +478,50 @@ fn resolve_fid_dir(path: &Path) -> Result<PathBuf, String> {
 
 const MAX_FID_TEXT_HEADER_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_FID_PROCPAR_VALUES: usize = 1_000_000;
+
+/// Maximum scalar `TD` along any single time-domain axis.
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_FID_AXIS_TD: usize = 1usize << 24;
+#[cfg(target_arch = "wasm32")]
+pub const MAX_FID_AXIS_TD: usize = 1usize << 20;
+
+/// Maximum total scalar `f64` samples (`<= 2^30` on native, `<= 2^27` on `wasm32`) and complex
+/// `Complex64` (`[f64; 2]`) points allocated by any FID loader (`v0150:P0-2`).
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_FID_POINTS: usize = 1usize << 29;
+#[cfg(target_arch = "wasm32")]
+pub const MAX_FID_POINTS: usize = 1usize << 25;
+
+pub const MAX_FID_COMPLEX_POINTS: usize = MAX_FID_POINTS / 2;
+
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_TRUNCATED_FID_COMPLEX_POINTS: usize = 1usize << 25;
+#[cfg(target_arch = "wasm32")]
+const MAX_TRUNCATED_FID_COMPLEX_POINTS: usize = 1usize << 21;
+
+fn checked_fid_complex_len(
+    dims: &[usize],
+    is_truncated_zero_fill: bool,
+    context: &str,
+) -> Result<usize, String> {
+    let mut total = 1usize;
+    for &d in dims {
+        total = total.checked_mul(d).ok_or_else(|| {
+            format!("FID grid dimension product overflow in {context} (dims={dims:?})")
+        })?;
+    }
+    let cap = if is_truncated_zero_fill {
+        MAX_TRUNCATED_FID_COMPLEX_POINTS
+    } else {
+        MAX_FID_COMPLEX_POINTS
+    };
+    if total > cap {
+        return Err(format!(
+            "FID grid size ({total} complex points) in {context} exceeds safety cap ({cap} complex points)"
+        ));
+    }
+    Ok(total)
+}
 
 /// Read a spectrometer text parameter/schedule/pulseprogram file up to `MAX_FID_TEXT_HEADER_BYTES`,
 /// decoding ISO-8859-1 / Latin-1 header comments cleanly via `String::from_utf8_lossy`.
@@ -656,14 +726,20 @@ fn bruker_proc_matches_acqu_sw(
         .get("SI")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
+    let stsi = pm
+        .get("STSI")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
     let ftsize = pm
         .get("FTSIZE")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
-    if ftsize > si && si > 0 {
-        let full_sw_p = sw_p * (ftsize as f64) / (si as f64);
-        if (full_sw_p - acqu_sw_hz).abs() / acqu_sw_hz <= 0.025 {
-            return true;
+    for strip_n in [si, stsi] {
+        if ftsize > strip_n && strip_n > 0 {
+            let full_sw_p = sw_p * (ftsize as f64) / (strip_n as f64);
+            if (full_sw_p - acqu_sw_hz).abs() / acqu_sw_hz <= 0.025 {
+                return true;
+            }
         }
     }
     false
@@ -807,6 +883,10 @@ fn bruker_proc_first_ppm(
                     .get("SI")
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(0);
+                let stsi = p
+                    .get("STSI")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
                 let ftsize = p
                     .get("FTSIZE")
                     .and_then(|v| v.parse::<usize>().ok())
@@ -815,7 +895,8 @@ fn bruker_proc_first_ppm(
                     .get("STSR")
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(0);
-                if ftsize > si && stsr > 0 && obs_mhz > 0.0 {
+                let strip_n = if stsi > 0 && stsi < ftsize { stsi } else { si };
+                if ftsize > strip_n && stsr > 0 && obs_mhz > 0.0 {
                     return offset + (stsr as f64) * (sw_hz / obs_mhz) / (ftsize as f64);
                 }
                 return offset;
@@ -918,8 +999,10 @@ fn parse_bruker_direct_axis(
         .ok_or("missing ##$TD in Bruker acqus")?
         .parse()
         .map_err(|e| format!("invalid TD in acqus: {e}"))?;
-    if td < 2 {
-        return Err(format!("invalid Bruker direct TD={td}"));
+    if !(2..=MAX_FID_AXIS_TD).contains(&td) {
+        return Err(format!(
+            "invalid or oversized Bruker direct TD={td} (expected 2..={MAX_FID_AXIS_TD})"
+        ));
     }
     let bytorda: i32 = acqus
         .get("BYTORDA")
@@ -1115,8 +1198,10 @@ fn parse_bruker_indirect_axis(
             .parse()
             .map_err(|e| format!("invalid indirect TD: {e}"))?,
     };
-    if td < 1 {
-        return Err(format!("invalid Bruker indirect TD={td}"));
+    if !(1..=MAX_FID_AXIS_TD).contains(&td) {
+        return Err(format!(
+            "invalid or oversized Bruker indirect TD={td} (expected 1..={MAX_FID_AXIS_TD})"
+        ));
     }
 
     let fnmode_opt: Option<i32> =
@@ -1372,20 +1457,39 @@ fn determine_bruker_ser_stride_opts(
     allow_truncated_fid: bool,
     dir: &Path,
 ) -> Result<(usize, usize), String> {
-    let raw_trace_bytes = td_words * word_bytes;
-    let stride_1024 = raw_trace_bytes.div_ceil(1024) * 1024;
-    let stride_256w = td_words.div_ceil(256) * 256 * word_bytes;
+    let raw_trace_bytes = td_words
+        .checked_mul(word_bytes)
+        .filter(|&b| b > 0)
+        .ok_or_else(|| format!("Bruker trace byte size overflow in {}", dir.display()))?;
+    let stride_1024 = raw_trace_bytes
+        .div_ceil(1024)
+        .checked_mul(1024)
+        .ok_or_else(|| {
+            format!(
+                "Bruker 1024-byte block stride overflow in {}",
+                dir.display()
+            )
+        })?;
+    let stride_256w = td_words
+        .div_ceil(256)
+        .checked_mul(256)
+        .and_then(|w| w.checked_mul(word_bytes))
+        .ok_or_else(|| format!("Bruker 256-word block stride overflow in {}", dir.display()))?;
 
-    if file_len == n_traces * stride_1024 {
+    let expected_1024 = n_traces.checked_mul(stride_1024);
+    let expected_256w = n_traces.checked_mul(stride_256w);
+    let expected_raw = n_traces.checked_mul(raw_trace_bytes);
+
+    if expected_1024 == Some(file_len) {
         Ok((stride_1024, n_traces))
-    } else if file_len == n_traces * stride_256w {
+    } else if expected_256w == Some(file_len) {
         Ok((stride_256w, n_traces))
     } else if allow_trailing_blocks
-        && file_len > n_traces * stride_1024
+        && expected_1024.is_some_and(|exp| file_len > exp)
         && file_len.is_multiple_of(stride_1024)
     {
         Ok((stride_1024, n_traces))
-    } else if allow_truncated_fid && file_len < n_traces * stride_1024 {
+    } else if allow_truncated_fid && expected_1024.is_none_or(|exp| file_len < exp) {
         let stride = if stride_256w != stride_1024
             && file_len >= stride_256w
             && file_len.is_multiple_of(stride_256w)
@@ -1413,17 +1517,17 @@ fn determine_bruker_ser_stride_opts(
             ));
         }
         Ok((stride, observed.min(n_traces)))
-    } else if file_len < n_traces * raw_trace_bytes {
+    } else if expected_raw.is_none_or(|exp| file_len < exp) {
         Err(format!(
             "Bruker ser in {} is smaller than expected trace count ({file_len} B < {n_traces} traces x {stride_1024} B)",
             dir.display()
         ))
     } else {
         Err(format!(
-            "Bruker ser size mismatch in {}: got {file_len} B for {n_traces} traces (expected {} B with 1024-B block stride or {} B with 256-word block stride)",
+            "Bruker ser size mismatch in {}: got {file_len} B for {n_traces} traces (expected {:?} B with 1024-B block stride or {:?} B with 256-word block stride)",
             dir.display(),
-            n_traces * stride_1024,
-            n_traces * stride_256w
+            expected_1024,
+            expected_256w
         ))
     }
 }
@@ -1492,13 +1596,42 @@ fn scale_complex_slice(dst: &mut [Complex64], scale: f64) {
     }
 }
 
-/// Default virtual homonuclear ${}^1J_{C'C\alpha}$ scalar coupling in Hz (`53.0 Hz`) for
-/// `13C`-detected IPAP `2D CON` / `(HCa)CON` / `CACO` virtual decoupling
-/// (Bermel et al., *ChemPhysChem* **2010**, 11, 689–695; Duma et al., *J. Magn. Reson.* **2003**, 162, 90–101).
-pub const DEFAULT_IPAP_J_CACO_HZ: f64 = 53.0;
+/// Default virtual homonuclear ${}^1J_{C'C\alpha}$ scalar coupling in Hz (`53.8 Hz`) for
+/// `13C`-detected IPAP `2D CON` / `(HCa)CON` / `CACO` virtual decoupling, matching Bruker
+/// TopSpin `splitcomb [ipap 2]` (`CaCO = 53.8 Hz`; Bermel et al., *ChemPhysChem* **2010**, 11, 689–695;
+/// Duma et al., *J. Magn. Reson.* **2003**, 162, 90–101).
+pub const DEFAULT_IPAP_J_CACO_HZ: f64 = 53.8;
+
+/// Default antiphase (`AP`) differential $T_2$-relaxation compensation scale factor (`1.04`)
+/// for Bruker `13C`-detected IPAP `2D CON` / `(HCa)CON` / `CACO` virtual decoupling
+/// (`splitcomb [ipap 2]: scale = 1.04`; Bermel et al., *Angew. Chem. Int. Ed.* **2005**, 44, 3089–3092).
+pub const DEFAULT_IPAP_AP_SCALE: f64 = 1.04;
+
+/// Resolved parameters for Bruker `13C`-detected 2D IPAP spin-state recombination.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IpapConfig {
+    /// Virtual homonuclear ${}^1J_{C'C\alpha}$ scalar coupling in Hz (default `53.8 Hz`).
+    pub j_caco_hz: f64,
+    /// Antiphase (`AP`) trace scaling factor $\alpha_{\text{AP}}$ compensating differential $T_2$
+    /// relaxation during the $1/(2J_{C'C\alpha})$ echo (default `1.04`).
+    pub ap_scale: f64,
+    /// `true` when the first trace of each inner `l0` pair is In-Phase (`IP`) and the second is
+    /// Antiphase (`AP`), determined from `pulseprogram` `l0` initialization and `if "l0 % 2 == ..."` parity.
+    pub ip_first: bool,
+}
+
+impl Default for IpapConfig {
+    fn default() -> Self {
+        Self {
+            j_caco_hz: DEFAULT_IPAP_J_CACO_HZ,
+            ap_scale: DEFAULT_IPAP_AP_SCALE,
+            ip_first: true,
+        }
+    }
+}
 
 /// True when a Bruker `13C`-detected 2D pulse program uses IPAP virtual decoupling
-/// (`c_hcacon_ia`, `c_con_ia`, `c_caco_ia`, `ipap`, or `pulseprogram` body containing
+/// (`c_hcacon_ia`, `c_con_iasq`, `c_caco_ia`, `*ia2d*`, `ipap`, or `pulseprogram` body containing
 /// `splitcomb [ipap` / `using IPAP scheme`).
 pub fn is_bruker_2d_ipap_sequence(pulprog: &str, pp_text: Option<&str>) -> bool {
     let mut base = pulprog
@@ -1506,17 +1639,28 @@ pub fn is_bruker_2d_ipap_sequence(pulprog: &str, pp_text: Option<&str>) -> bool 
         .trim_matches(|c| c == '<' || c == '>')
         .trim()
         .to_ascii_lowercase();
-    for ext in [
-        ".sas", ".sct", ".fp2", ".bv", ".fp", ".fa", ".be", ".1", ".2", ".3",
-    ] {
-        if let Some(stripped) = base.strip_suffix(ext) {
-            base = stripped.to_string();
+    loop {
+        let mut changed = false;
+        for ext in [
+            ".sas", ".sct", ".fp2", ".bv", ".fp", ".fa", ".be", ".t1", ".t2", ".1", ".2", ".3",
+            "v1", "v2", "v3", "v4",
+        ] {
+            if let Some(stripped) = base.strip_suffix(ext) {
+                base = stripped.to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
     if base.ends_with("_ia")
         || base.ends_with("_iasq")
+        || base.ends_with("ia2d")
         || base.ends_with("_ipap")
         || base.contains("ipap")
+        || base.contains("_ia2d")
+        || base.contains("ctfbia")
         || base.starts_with("conia")
         || base.starts_with("cacoia")
     {
@@ -1534,23 +1678,176 @@ pub fn is_bruker_2d_ipap_sequence(pulprog: &str, pp_text: Option<&str>) -> bool 
     false
 }
 
+/// Extract `(j_caco_hz, ap_scale)` from a TopSpin `splitcomb` audit or header string such as
+/// `<created by splitcomb ipap 2: scale = 1.04 CaCO = 53.8 from ...>`.
+pub fn parse_splitcomb_params_from_text(text: &str) -> (Option<f64>, Option<f64>) {
+    let mut found_j: Option<f64> = None;
+    let mut found_scale: Option<f64> = None;
+    for raw_line in text.lines() {
+        let low = raw_line.to_ascii_lowercase();
+        if !low.contains("splitcomb") && !low.contains("caco") && !low.contains("jcaco") {
+            continue;
+        }
+        for key in ["jcaco", "caco"] {
+            if found_j.is_none() {
+                if let Some(pos) = low.find(key) {
+                    let rest = low[pos + key.len()..].trim_start();
+                    if let Some(after_eq) = rest.strip_prefix('=') {
+                        let tok: String = after_eq
+                            .trim_start()
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '+' | '-'))
+                            .collect();
+                        if let Ok(v) = tok.parse::<f64>() {
+                            if (40.0..=68.0).contains(&v) {
+                                found_j = Some(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if found_scale.is_none() && low.contains("splitcomb") {
+            if let Some(pos) = low.find("scale") {
+                let rest = low[pos + "scale".len()..].trim_start();
+                if let Some(after_eq) = rest.strip_prefix('=') {
+                    let tok: String = after_eq
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '+' | '-'))
+                        .collect();
+                    if let Ok(v) = tok.parse::<f64>() {
+                        if (0.5..=2.0).contains(&v) {
+                            found_scale = Some(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (found_j, found_scale)
+}
+
 /// Resolve virtual ${}^1J_{C'C\alpha}$ coupling in Hz (`40.0..=68.0 Hz`) from `acqus` / `pulseprogram`
-/// `CNST` definitions when explicitly documented as `J(COCa)` / `J(CaCO)`, defaulting to `53.0 Hz`
-/// (Bermel et al., *ChemPhysChem* **2010**, 11, 689–695).
+/// (`JCACO`/`CACO`, `splitcomb` comments, or `CNST` definitions such as `1/(4*cnst...)` / `J(COCa)`),
+/// defaulting to [`DEFAULT_IPAP_J_CACO_HZ`] (`53.8 Hz`).
 pub fn resolve_bruker_ipap_j_caco_hz(
     acqus: &HashMap<String, String>,
     pp_text: Option<&str>,
 ) -> f64 {
-    for key in ["JCACO", "JCOCA", "J_CACO"] {
-        if let Some(val) = acqus
-            .get(key)
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .filter(|v| (40.0..=68.0).contains(v))
-        {
-            return val;
+    resolve_bruker_ipap_config(acqus, None, pp_text, &[]).j_caco_hz
+}
+
+/// Resolve IP-vs-AP inner-loop trace order (`true` = `[IP, AP]`, `false` = `[AP, IP]`) from
+/// `pulseprogram` `"l0=<init>"` (or `acqus.L[0]`, default `1`) and `if "l0 % 2 == <parity>"`.
+pub fn resolve_bruker_ipap_l0_ip_first(
+    acqus: &HashMap<String, String>,
+    pp_text: Option<&str>,
+) -> bool {
+    let mut l0_init: Option<i64> = None;
+    let mut if_mod_target: Option<i64> = None;
+
+    if let Some(txt) = pp_text {
+        for raw_line in txt.lines() {
+            let code = raw_line.split(';').next().unwrap_or("").trim();
+            if code.is_empty() {
+                continue;
+            }
+            let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+            let low = compact.to_ascii_lowercase();
+
+            if l0_init.is_none() {
+                let unq = low.trim_matches('"');
+                if let Some(rhs) = unq.strip_prefix("l0=") {
+                    let digits: String = rhs
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '-')
+                        .collect();
+                    if let Ok(v) = digits.parse::<i64>() {
+                        l0_init = Some(v);
+                    }
+                }
+            }
+
+            if if_mod_target.is_none() && low.starts_with("if\"") && low.contains("l0%2") {
+                if low.contains("l0%2==1") || low.contains("l0%2!=0") {
+                    if_mod_target = Some(1);
+                } else if low.contains("l0%2==0") || low.contains("l0%2!=1") {
+                    if_mod_target = Some(0);
+                }
+            }
         }
     }
+
+    if l0_init.is_none() {
+        l0_init = acqus
+            .get("L")
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|t| t.parse::<i64>().ok());
+    }
+
+    let init = l0_init.unwrap_or(1);
+    let target = if_mod_target.unwrap_or(1);
+    init.rem_euclid(2) == target.rem_euclid(2)
+}
+
+/// Resolve [`IpapConfig`] (`j_caco_hz`, `ap_scale`, `ip_first`) from `acqus`, `acqu2s`,
+/// `pulseprogram`, and optional `splitcomb` audit/header texts.
+pub fn resolve_bruker_ipap_config(
+    acqus: &HashMap<String, String>,
+    acqu2s: Option<&HashMap<String, String>>,
+    pp_text: Option<&str>,
+    splitcomb_texts: &[&str],
+) -> IpapConfig {
+    let mut j_opt: Option<f64> = None;
+    let mut scale_opt: Option<f64> = None;
+
+    for map in [acqu2s, Some(acqus)].into_iter().flatten() {
+        if j_opt.is_none() {
+            for key in ["JCACO", "JCOCA", "J_CACO", "CACO"] {
+                if let Some(val) = map
+                    .get(key)
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .filter(|v| (40.0..=68.0).contains(v))
+                {
+                    j_opt = Some(val);
+                    break;
+                }
+            }
+        }
+        if scale_opt.is_none() {
+            for key in ["APSCALE", "IPAP_SCALE", "AP_SCALE"] {
+                if let Some(val) = map
+                    .get(key)
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .filter(|v| (0.5..=2.0).contains(v))
+                {
+                    scale_opt = Some(val);
+                    break;
+                }
+            }
+        }
+    }
+
+    for &sc_txt in splitcomb_texts {
+        let (sj, ss) = parse_splitcomb_params_from_text(sc_txt);
+        if j_opt.is_none() {
+            j_opt = sj;
+        }
+        if scale_opt.is_none() {
+            scale_opt = ss;
+        }
+    }
+
     if let Some(txt) = pp_text {
+        let (sj, ss) = parse_splitcomb_params_from_text(txt);
+        if j_opt.is_none() {
+            j_opt = sj;
+        }
+        if scale_opt.is_none() {
+            scale_opt = ss;
+        }
+
         let cnst_vals: Vec<f64> = acqus
             .get("CNST")
             .map(|s| {
@@ -1559,26 +1856,51 @@ pub fn resolve_bruker_ipap_j_caco_hz(
                     .collect()
             })
             .unwrap_or_default();
+
         if !cnst_vals.is_empty() {
             for raw_line in txt.lines() {
                 let low = raw_line.trim().to_ascii_lowercase();
-                let mentions_j_caco = low.contains("j(coca)")
+                let compact: String = low.chars().filter(|c| !c.is_whitespace()).collect();
+                let uses_quarter_j_formula = compact.contains("1/(4*cnst")
+                    || compact.contains("0.25/cnst")
+                    || compact.contains("1/(2*cnst");
+                let mentions_j_caco = uses_quarter_j_formula
+                    || low.contains("j(coca)")
                     || low.contains("j(caco)")
                     || low.contains("jcoca")
                     || low.contains("jcaco")
-                    || low.contains("j_caco");
-                if !mentions_j_caco {
-                    continue;
+                    || low.contains("j_caco")
+                    || low.contains("j_coca");
+                if j_opt.is_none() && mentions_j_caco {
+                    let mut search_from = 0usize;
+                    while let Some(rel) = low[search_from..].find("cnst") {
+                        let pos = search_from + rel;
+                        let digits: String = low[pos + 4..]
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect();
+                        if let Ok(idx) = digits.parse::<usize>() {
+                            if let Some(&v) = cnst_vals.get(idx) {
+                                if (40.0..=68.0).contains(&v) {
+                                    j_opt = Some(v);
+                                    break;
+                                }
+                            }
+                        }
+                        search_from = pos + 4;
+                    }
                 }
-                if let Some(pos) = low.find("cnst") {
-                    let digits: String = low[pos + 4..]
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit())
-                        .collect();
-                    if let Ok(idx) = digits.parse::<usize>() {
-                        if let Some(&v) = cnst_vals.get(idx) {
-                            if (40.0..=68.0).contains(&v) {
-                                return v;
+                if scale_opt.is_none() && (low.contains("ap_scale") || low.contains("ipap_scale")) {
+                    if let Some(pos) = low.find("cnst") {
+                        let digits: String = low[pos + 4..]
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect();
+                        if let Ok(idx) = digits.parse::<usize>() {
+                            if let Some(&v) = cnst_vals.get(idx) {
+                                if (0.5..=2.0).contains(&v) {
+                                    scale_opt = Some(v);
+                                }
                             }
                         }
                     }
@@ -1586,21 +1908,27 @@ pub fn resolve_bruker_ipap_j_caco_hz(
             }
         }
     }
-    DEFAULT_IPAP_J_CACO_HZ
+
+    IpapConfig {
+        j_caco_hz: j_opt.unwrap_or(DEFAULT_IPAP_J_CACO_HZ),
+        ap_scale: scale_opt.unwrap_or(DEFAULT_IPAP_AP_SCALE),
+        ip_first: resolve_bruker_ipap_l0_ip_first(acqus, pp_text),
+    }
 }
 
 /// Clean-room time-domain IPAP spin-state virtual decoupling of an In-Phase (`ip`) and Antiphase (`ap`)
-/// `13C'` FID pair (Bermel, Bertini, Felli, Peruzzini & Pierattelli, *ChemPhysChem* **2010**, 11, 689–695;
-/// Duma, Hediger, Lesage & Emsley, *J. Magn. Reson.* **2003**, 162, 90–101):
-/// $$s_{\text{dec}}(t_2) = 2\Bigl(s_{\text{IP}}(t_2)\cos(\pi J_{C'C\alpha} t_2) + i\,s_{\text{AP}}(t_2)\sin(\pi J_{C'C\alpha} t_2)\Bigr),$$
-/// with $t_2 = (k - \text{group\_delay\_pts}) / \text{sw\_hz}$, collapsing antiphase/in-phase
-/// $\pm \tfrac{1}{2} J_{C'C\alpha}$ doublets into sharp singlets at the unshifted chemical shift $\omega_{C'}$.
-pub fn recombine_ipap_trace_pair_1d(
+/// `13C'` FID pair with explicit antiphase relaxation compensation scale `ap_scale`
+/// (Bermel et al., *Angew. Chem. Int. Ed.* **2005**, 44, 3089–3092; *ChemPhysChem* **2010**, 11, 689–695;
+/// Duma et al., *J. Magn. Reson.* **2003**, 162, 90–101):
+/// $$s_{\text{dec}}(t_2) = 2\Bigl(s_{\text{IP}}(t_2)\cos(\pi J_{C'C\alpha} t_2) + i\,\alpha_{\text{AP}}\,s_{\text{AP}}(t_2)\sin(\pi J_{C'C\alpha} t_2)\Bigr),$$
+/// with $t_2 = (k - \text{group\_delay\_pts}) / \text{sw\_hz}$.
+pub fn recombine_ipap_trace_pair_scaled_1d(
     ip: &[Complex64],
     ap: &[Complex64],
     sw_hz: f64,
     group_delay_pts: f64,
     j_caco_hz: f64,
+    ap_scale: f64,
     out: &mut [Complex64],
 ) {
     let n = ip.len().min(ap.len()).min(out.len());
@@ -1610,51 +1938,90 @@ pub fn recombine_ipap_trace_pair_1d(
     for k in 0..n {
         let t = ((k as f64) - gd) * inv_sw;
         let (sin_j, cos_j) = (omega_j * t).sin_cos();
+        let ap_sin = ap_scale * sin_j;
         let (re_ip, im_ip) = (ip[k][0], ip[k][1]);
         let (re_ap, im_ap) = (ap[k][0], ap[k][1]);
-        // i * (re_ap + i im_ap) = -im_ap + i re_ap
+        // i * ap_scale * (re_ap + i im_ap) = -ap_scale * im_ap + i * ap_scale * re_ap
         out[k] = [
-            2.0 * (re_ip * cos_j - im_ap * sin_j),
-            2.0 * (im_ip * cos_j + re_ap * sin_j),
+            2.0 * (re_ip * cos_j - im_ap * ap_sin),
+            2.0 * (im_ip * cos_j + re_ap * ap_sin),
         ];
     }
 }
 
+/// Unit-scale (`ap_scale = 1.0`) wrapper around [`recombine_ipap_trace_pair_scaled_1d`].
+pub fn recombine_ipap_trace_pair_1d(
+    ip: &[Complex64],
+    ap: &[Complex64],
+    sw_hz: f64,
+    group_delay_pts: f64,
+    j_caco_hz: f64,
+    out: &mut [Complex64],
+) {
+    recombine_ipap_trace_pair_scaled_1d(ip, ap, sw_hz, group_delay_pts, j_caco_hz, 1.0, out);
+}
+
+fn bruker_texts_indicate_already_splitcomb(
+    acqu2s: &HashMap<String, String>,
+    own_meta_texts: &[&str],
+) -> bool {
+    if acqu2s
+        .get("FnILOOP")
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        == Some(1)
+    {
+        return true;
+    }
+    own_meta_texts
+        .iter()
+        .any(|t| t.to_ascii_lowercase().contains("splitcomb"))
+}
+
+/// Returns `Some(ipap_td_excludes_inner_loop)` when a Bruker `13C`-detected 2D dataset is an
+/// unsplit IPAP `ser` requiring spin-state recombination:
+/// - `Some(false)` (standard Bruker TopSpin `ST1CNT = td1 / (2 * 2)` convention): `acqu2s.TD`
+///   already counts `IP + AP` (`ser` has `TD1` raw traces -> post-IPAP `TD1 / 2` traces and
+///   `TD1 / 4` complex $t_1$ increments).
+/// - `Some(true)` (explicit `FnILOOP = 2` where `ser` has `2 * acqu2s.TD` raw traces): `acqu2s.TD`
+///   already denotes the post-IPAP trace count.
 #[allow(clippy::too_many_arguments)]
-fn is_bruker_ipap_ser_unsplit(
+fn detect_bruker_2d_ipap_unsplit_mode(
     axis_x_label: &str,
     pulprog: &str,
     pp_text: Option<&str>,
     acqu2s: &HashMap<String, String>,
-    acqu2s_raw_txt: Option<&str>,
+    own_meta_texts: &[&str],
     bytes_len: usize,
-    n_post_ipap_traces: usize,
+    td_acq_y: usize,
     td_words: usize,
     word_bytes: usize,
-) -> bool {
+) -> Option<bool> {
     if axis_x_label != "13C"
-        || n_post_ipap_traces == 0
+        || td_acq_y == 0
         || !is_bruker_2d_ipap_sequence(pulprog, pp_text)
+        || bruker_texts_indicate_already_splitcomb(acqu2s, own_meta_texts)
     {
-        return false;
-    }
-    if acqu2s_raw_txt.is_some_and(|t| t.to_ascii_lowercase().contains("splitcomb")) {
-        return false;
+        return None;
     }
     let fn_iloop = acqu2s
         .get("FnILOOP")
         .and_then(|s| s.trim().parse::<usize>().ok());
-    if fn_iloop == Some(1) {
-        return false;
-    }
     if fn_iloop == Some(2) {
-        return true;
+        if let Some(raw_tb) = td_words.checked_mul(word_bytes) {
+            let s1024 = raw_tb.div_ceil(1024).saturating_mul(1024);
+            let s256w = td_words
+                .div_ceil(256)
+                .saturating_mul(256)
+                .saturating_mul(word_bytes);
+            let two_td = 2usize.saturating_mul(td_acq_y);
+            if bytes_len == two_td.saturating_mul(s1024)
+                || bytes_len == two_td.saturating_mul(s256w)
+            {
+                return Some(true);
+            }
+        }
     }
-    let raw_trace_bytes = td_words * word_bytes;
-    let stride_1024 = raw_trace_bytes.div_ceil(1024) * 1024;
-    let stride_256w = td_words.div_ceil(256) * 256 * word_bytes;
-    let two_n = 2 * n_post_ipap_traces;
-    bytes_len == two_n * stride_1024 || bytes_len == two_n * stride_256w
+    Some(false)
 }
 
 #[inline]
@@ -1668,34 +2035,33 @@ fn decode_bruker_2d_logical_trace(
     n0: usize,
     big_endian: bool,
     dtypa: i32,
-    ipap_interleaved: bool,
+    ipap: Option<IpapConfig>,
     sw_hz: f64,
     group_delay_pts: f64,
-    j_caco_hz: f64,
 ) -> Vec<Complex64> {
-    if !ipap_interleaved {
+    let Some(ipap_cfg) = ipap else {
         if logical_idx >= observed_raw {
             return vec![[0.0, 0.0]; n0];
         }
         let off = logical_idx * stride;
         return decode_bruker_trace(&bytes[off..off + trace_byte_len], n0 * 2, big_endian, dtypa);
-    }
-    let ip_raw = 2 * logical_idx;
-    if ip_raw >= observed_raw {
+    };
+    let first_raw = 2 * logical_idx;
+    if first_raw >= observed_raw {
         return vec![[0.0, 0.0]; n0];
     }
-    let off_ip = ip_raw * stride;
-    let ip_tr = decode_bruker_trace(
-        &bytes[off_ip..off_ip + trace_byte_len],
+    let off0 = first_raw * stride;
+    let tr0 = decode_bruker_trace(
+        &bytes[off0..off0 + trace_byte_len],
         n0 * 2,
         big_endian,
         dtypa,
     );
-    let ap_raw = ip_raw + 1;
-    let ap_tr = if ap_raw < observed_raw {
-        let off_ap = ap_raw * stride;
+    let second_raw = first_raw + 1;
+    let tr1 = if second_raw < observed_raw {
+        let off1 = second_raw * stride;
         decode_bruker_trace(
-            &bytes[off_ap..off_ap + trace_byte_len],
+            &bytes[off1..off1 + trace_byte_len],
             n0 * 2,
             big_endian,
             dtypa,
@@ -1703,8 +2069,21 @@ fn decode_bruker_2d_logical_trace(
     } else {
         vec![[0.0, 0.0]; n0]
     };
+    let (ip_tr, ap_tr) = if ipap_cfg.ip_first {
+        (&tr0, &tr1)
+    } else {
+        (&tr1, &tr0)
+    };
     let mut out = vec![[0.0, 0.0]; n0];
-    recombine_ipap_trace_pair_1d(&ip_tr, &ap_tr, sw_hz, group_delay_pts, j_caco_hz, &mut out);
+    recombine_ipap_trace_pair_scaled_1d(
+        ip_tr,
+        ap_tr,
+        sw_hz,
+        group_delay_pts,
+        ipap_cfg.j_caco_hz,
+        ipap_cfg.ap_scale,
+        &mut out,
+    );
     out
 }
 
@@ -1728,9 +2107,14 @@ pub fn read_bruker_fid_1d_from_bytes(
     validate_bruker_fntype(Path::new(name), &acqus, &[])?;
     let procs = procs_txt.map(parse_jcamp_str).filter(|m| !m.is_empty());
     let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
+    let _ = checked_fid_complex_len(&[axis_x.complex_points], false, name)?;
 
     let word_bytes = if dtypa == 2 { 8 } else { 4 };
-    let needed = (axis_x.complex_points * 2) * word_bytes;
+    let needed = axis_x
+        .complex_points
+        .checked_mul(2)
+        .and_then(|w| w.checked_mul(word_bytes))
+        .ok_or_else(|| format!("Bruker 1D fid '{name}' byte size overflow"))?;
     if bytes.len() < needed {
         return Err(format!(
             "Bruker 1D fid '{name}' truncated: need {needed} bytes, got {}",
@@ -1769,6 +2153,43 @@ pub fn read_bruker_fid_2d_from_bytes(
     bytes: &[u8],
     allow_truncated_fid: bool,
 ) -> Result<Fid2D, String> {
+    read_bruker_fid_2d_from_bytes_with_ipap(
+        name,
+        acqus_txt,
+        acqu_txt,
+        acqu2s_txt,
+        acqu2_txt,
+        procs_txt,
+        proc2s_txt,
+        pulseprogram_txt,
+        nuslist_txt,
+        bytes,
+        allow_truncated_fid,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Decode a Bruker 2D `ser` dataset from in-memory bytes with optional explicit IPAP overrides
+/// (`ipap_j_caco_hz`, `ipap_ap_scale`, `ipap_ip_first`).
+#[allow(clippy::too_many_arguments)]
+pub fn read_bruker_fid_2d_from_bytes_with_ipap(
+    name: &str,
+    acqus_txt: &str,
+    acqu_txt: Option<&str>,
+    acqu2s_txt: &str,
+    acqu2_txt: Option<&str>,
+    procs_txt: Option<&str>,
+    proc2s_txt: Option<&str>,
+    pulseprogram_txt: Option<&str>,
+    nuslist_txt: Option<&str>,
+    bytes: &[u8],
+    allow_truncated_fid: bool,
+    ipap_j_caco_hz: Option<f64>,
+    ipap_ap_scale: Option<f64>,
+    ipap_ip_first: Option<bool>,
+) -> Result<Fid2D, String> {
     let mut acqus = HashMap::new();
     if let Some(fb) = acqu_txt {
         acqus.extend(parse_jcamp_str(fb));
@@ -1797,13 +2218,22 @@ pub fn read_bruker_fid_2d_from_bytes(
 
     let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
     let word_bytes = if dtypa == 2 { 8 } else { 4 };
-    let raw_stride_1024 = (axis_x.td_raw * word_bytes).div_ceil(1024) * 1024;
+    let raw_stride_1024 = axis_x
+        .td_raw
+        .checked_mul(word_bytes)
+        .and_then(|b| b.div_ceil(1024).checked_mul(1024))
+        .ok_or_else(|| format!("Bruker 2D stride overflow in '{name}'"))?;
 
     let td_acq_y: usize = acqu2s
         .get("TD")
         .ok_or("missing ##$TD in Bruker acqu2s")?
         .parse()
         .map_err(|e| format!("invalid TD in acqu2s: {e}"))?;
+    if !(1..=MAX_FID_AXIS_TD).contains(&td_acq_y) {
+        return Err(format!(
+            "invalid or oversized Bruker acqu2s TD={td_acq_y} in '{name}' (expected 1..={MAX_FID_AXIS_TD})"
+        ));
+    }
 
     let has_nuslist = nuslist_txt.is_some_and(|s| !s.trim().is_empty());
     let nus_td_opt = acqu2s
@@ -1811,17 +2241,60 @@ pub fn read_bruker_fid_2d_from_bytes(
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v > 0)
         .or_else(|| parse_td_indirect_entry(&acqus, 1));
+    let smaller_than_acq = td_acq_y
+        .checked_mul(raw_stride_1024)
+        .is_none_or(|exp| bytes.len() < exp);
     let implicit_nus = !is_fntype_nus
         && has_nuslist
-        && (nus_td_opt.is_some_and(|ntd| ntd > td_acq_y)
-            || bytes.len() < td_acq_y * raw_stride_1024);
+        && (nus_td_opt.is_some_and(|ntd| ntd > td_acq_y) || smaller_than_acq);
     let is_nus = is_fntype_nus || implicit_nus;
 
     let td_full_y = if is_nus {
-        let unflat = (bytes.len() < td_acq_y * raw_stride_1024).then_some(td_acq_y);
+        let unflat = smaller_than_acq.then_some(td_acq_y);
         resolve_bruker_nus_full_td(&acqu2s, &acqus, 1, unflat, "F1 (acqu2s)", vdir)?
     } else {
         td_acq_y
+    };
+
+    let pulprog_str = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
+    let mut own_meta_texts: Vec<&str> = vec![acqus_txt, acqu2s_txt];
+    if let Some(t) = acqu_txt {
+        own_meta_texts.push(t);
+    }
+    if let Some(t) = acqu2_txt {
+        own_meta_texts.push(t);
+    }
+    let ipap_mode = detect_bruker_2d_ipap_unsplit_mode(
+        &axis_x.label,
+        pulprog_str,
+        pulseprogram_txt,
+        &acqu2s,
+        &own_meta_texts,
+        bytes.len(),
+        td_acq_y,
+        axis_x.td_raw,
+        word_bytes,
+    );
+    let fnmode_is_qf = acqu2s
+        .get("FnMODE")
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        == Some(1);
+    let post_ipap_td_y = match ipap_mode {
+        None => td_full_y,
+        Some(true) => td_full_y,
+        Some(false) => {
+            let post = if fnmode_is_qf {
+                td_full_y / 2
+            } else {
+                (td_full_y / 4) * 2
+            };
+            if post == 0 {
+                return Err(format!(
+                    "Bruker IPAP 2D dataset '{name}' has indirect TD={td_full_y} too small for IPAP + quadrature recombination"
+                ));
+            }
+            post
+        }
     };
 
     let mut axis_y = parse_bruker_indirect_axis(
@@ -1829,17 +2302,31 @@ pub fn read_bruker_fid_2d_from_bytes(
         &acqu2s,
         proc2s.as_ref(),
         "15N",
-        Some(td_full_y),
+        Some(post_ipap_td_y),
         None,
     )?;
     let proc2s_cal = proc2s
         .as_ref()
         .filter(|p| bruker_proc_matches_acqu_sw(Some(p), axis_y.sw_hz));
-    let pulprog_str = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
     if proc2s_cal.and_then(|p| p.get("REVERSE")).is_none() {
         axis_y.stored_proc.reverse =
             infer_bruker_raw_indirect_reverse(pulseprogram_txt, pulprog_str, 1, axis_y.quad_mode);
     }
+
+    let ipap_cfg = ipap_mode.map(|_| {
+        let mut cfg =
+            resolve_bruker_ipap_config(&acqus, Some(&acqu2s), pulseprogram_txt, &own_meta_texts);
+        if let Some(j) = ipap_j_caco_hz.filter(|v| v.is_finite() && *v > 0.0) {
+            cfg.j_caco_hz = j;
+        }
+        if let Some(sc) = ipap_ap_scale.filter(|v| v.is_finite() && *v > 0.0) {
+            cfg.ap_scale = sc;
+        }
+        if let Some(ord) = ipap_ip_first {
+            cfg.ip_first = ord;
+        }
+        cfg
+    });
 
     let q1_mult = if axis_y.quad_mode == QuadMode::Qf {
         1
@@ -1849,12 +2336,13 @@ pub fn read_bruker_fid_2d_from_bytes(
     let n0 = axis_x.complex_points;
     let n1 = axis_y.complex_points;
     let big_endian = bytorda != 0;
-    let trace_byte_len = n0 * 2 * word_bytes;
-    let mut data = vec![[0.0, 0.0]; n1 * 2 * n0];
+    let trace_byte_len = n0
+        .checked_mul(2)
+        .and_then(|w| w.checked_mul(word_bytes))
+        .ok_or_else(|| format!("Bruker 2D trace byte length overflow in '{name}'"))?;
     let mut truncated_traces: Option<(usize, usize)> = None;
-    let j_caco_hz = resolve_bruker_ipap_j_caco_hz(&acqus, pulseprogram_txt);
 
-    let nus_mask = if is_nus {
+    let (data, nus_mask) = if is_nus {
         let nl = nuslist_txt
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| {
@@ -1864,26 +2352,26 @@ pub fn read_bruker_fid_2d_from_bytes(
             crate::pulprog::decode_nuslist_str(nl, &[n1], crate::pulprog::AcquisitionOrder::Dim2D)
                 .map_err(|e| format!("invalid 2D NUS schedule in '{name}': {e}"))?;
         let coords: Vec<usize> = decoded.points.into_iter().map(|r| r[0]).collect();
-        let n_acq_traces = coords.len() * q1_mult;
-        if td_acq_y != n_acq_traces && td_acq_y != td_full_y {
+        let n_acq_traces = coords
+            .len()
+            .checked_mul(q1_mult)
+            .ok_or_else(|| format!("Bruker 2D NUS trace count overflow in '{name}'"))?;
+        let raw_ipap_acq_traces = n_acq_traces.saturating_mul(2);
+        let valid_td_acq = if ipap_mode.is_some() {
+            td_acq_y == n_acq_traces || td_acq_y == raw_ipap_acq_traces || td_acq_y == td_full_y
+        } else {
+            td_acq_y == n_acq_traces || td_acq_y == td_full_y
+        };
+        if !valid_td_acq {
             return Err(format!(
                 "Bruker 2D NUS trace count mismatch in '{name}': acqu2s.TD={td_acq_y}, nuslist has {} points ({n_acq_traces} traces)",
                 coords.len()
             ));
         }
-        let ipap_interleaved = is_bruker_ipap_ser_unsplit(
-            &axis_x.label,
-            pulprog_str,
-            pulseprogram_txt,
-            &acqu2s,
-            Some(acqu2s_txt),
-            bytes.len(),
-            n_acq_traces,
-            axis_x.td_raw,
-            word_bytes,
-        );
-        let expected_raw_traces = if ipap_interleaved {
-            2 * n_acq_traces
+        let expected_raw_traces = if ipap_mode.is_some() {
+            n_acq_traces
+                .checked_mul(2)
+                .ok_or_else(|| format!("Bruker 2D IPAP NUS trace overflow in '{name}'"))?
         } else {
             n_acq_traces
         };
@@ -1899,7 +2387,9 @@ pub fn read_bruker_fid_2d_from_bytes(
         if observed < expected_raw_traces {
             truncated_traces = Some((observed, expected_raw_traces));
         }
-        let obs_logical = if ipap_interleaved {
+        let total_cplx = checked_fid_complex_len(&[n1, 2, n0], truncated_traces.is_some(), name)?;
+        let mut data = vec![[0.0, 0.0]; total_cplx];
+        let obs_logical = if ipap_cfg.is_some() {
             observed.div_ceil(2)
         } else {
             observed
@@ -1921,10 +2411,9 @@ pub fn read_bruker_fid_2d_from_bytes(
                     n0,
                     big_endian,
                     dtypa,
-                    ipap_interleaved,
+                    ipap_cfg,
                     axis_x.sw_hz,
                     axis_x.group_delay,
-                    j_caco_hz,
                 );
                 add_complex_slice(&mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0], &tr);
             } else {
@@ -1940,10 +2429,9 @@ pub fn read_bruker_fid_2d_from_bytes(
                     n0,
                     big_endian,
                     dtypa,
-                    ipap_interleaved,
+                    ipap_cfg,
                     axis_x.sw_hz,
                     axis_x.group_delay,
-                    j_caco_hz,
                 );
                 let z1 = decode_bruker_2d_logical_trace(
                     bytes,
@@ -1954,10 +2442,9 @@ pub fn read_bruker_fid_2d_from_bytes(
                     n0,
                     big_endian,
                     dtypa,
-                    ipap_interleaved,
+                    ipap_cfg,
                     axis_x.sw_hz,
                     axis_x.group_delay,
-                    j_caco_hz,
                 );
                 recombine_quad_pair(axis_y.quad_mode, k1, &z0, &z1, &mut tmp_cos, &mut tmp_sin);
                 add_complex_slice(&mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0], &tmp_cos);
@@ -1973,23 +2460,16 @@ pub fn read_bruker_fid_2d_from_bytes(
                 );
             }
         }
-        Some(counts.into_iter().map(|c| c > 0).collect())
+        (data, Some(counts.into_iter().map(|c| c > 0).collect()))
     } else {
-        let ipap_interleaved = is_bruker_ipap_ser_unsplit(
-            &axis_x.label,
-            pulprog_str,
-            pulseprogram_txt,
-            &acqu2s,
-            Some(acqu2s_txt),
-            bytes.len(),
-            td_acq_y,
-            axis_x.td_raw,
-            word_bytes,
-        );
-        let expected_raw_traces = if ipap_interleaved {
-            2 * td_acq_y
-        } else {
-            td_acq_y
+        let expected_raw_traces = match ipap_mode {
+            None => td_acq_y,
+            Some(true) => td_acq_y
+                .checked_mul(2)
+                .ok_or_else(|| format!("Bruker 2D IPAP trace count overflow in '{name}'"))?,
+            Some(false) => post_ipap_td_y
+                .checked_mul(2)
+                .ok_or_else(|| format!("Bruker 2D IPAP trace count overflow in '{name}'"))?,
         };
         let (stride, observed) = determine_bruker_ser_stride_opts(
             bytes.len(),
@@ -2003,7 +2483,9 @@ pub fn read_bruker_fid_2d_from_bytes(
         if observed < expected_raw_traces {
             truncated_traces = Some((observed, expected_raw_traces));
         }
-        let obs_logical = if ipap_interleaved {
+        let total_cplx = checked_fid_complex_len(&[n1, 2, n0], truncated_traces.is_some(), name)?;
+        let mut data = vec![[0.0, 0.0]; total_cplx];
+        let obs_logical = if ipap_cfg.is_some() {
             observed.div_ceil(2)
         } else {
             observed
@@ -2019,10 +2501,9 @@ pub fn read_bruker_fid_2d_from_bytes(
                     n0,
                     big_endian,
                     dtypa,
-                    ipap_interleaved,
+                    ipap_cfg,
                     axis_x.sw_hz,
                     axis_x.group_delay,
-                    j_caco_hz,
                 );
                 data[(k1 * 2) * n0..(k1 * 2 + 1) * n0].copy_from_slice(&tr);
             }
@@ -2040,10 +2521,9 @@ pub fn read_bruker_fid_2d_from_bytes(
                     n0,
                     big_endian,
                     dtypa,
-                    ipap_interleaved,
+                    ipap_cfg,
                     axis_x.sw_hz,
                     axis_x.group_delay,
-                    j_caco_hz,
                 );
                 let z1 = decode_bruker_2d_logical_trace(
                     bytes,
@@ -2054,17 +2534,16 @@ pub fn read_bruker_fid_2d_from_bytes(
                     n0,
                     big_endian,
                     dtypa,
-                    ipap_interleaved,
+                    ipap_cfg,
                     axis_x.sw_hz,
                     axis_x.group_delay,
-                    j_caco_hz,
                 );
                 let (cos_slice, sin_slice) =
                     data[(k1 * 2) * n0..(k1 * 2 + 2) * n0].split_at_mut(n0);
                 recombine_quad_pair(axis_y.quad_mode, k1, &z0, &z1, cos_slice, sin_slice);
             }
         }
-        None
+        (data, None)
     };
 
     let pulse_program = acqus.get("PULPROG").cloned().unwrap_or_default();
@@ -2087,13 +2566,18 @@ pub fn read_bruker_fid_1d(dir: impl AsRef<Path>) -> Result<Fid1D, String> {
     validate_bruker_fntype(&dir, &acqus, &[])?;
     let procs = read_optional_bruker_proc(&dir, "procs");
     let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
+    let _ = checked_fid_complex_len(&[axis_x.complex_points], false, &dir.display().to_string())?;
 
     let fid_path = find_file_ci(&dir, "fid")
         .ok_or_else(|| format!("missing 1D fid binary file in {}", dir.display()))?;
     let bytes =
         fs::read(&fid_path).map_err(|e| format!("failed to read {}: {e}", fid_path.display()))?;
     let word_bytes = if dtypa == 2 { 8 } else { 4 };
-    let needed = (axis_x.complex_points * 2) * word_bytes;
+    let needed = axis_x
+        .complex_points
+        .checked_mul(2)
+        .and_then(|w| w.checked_mul(word_bytes))
+        .ok_or_else(|| format!("Bruker 1D fid byte size overflow in {}", dir.display()))?;
     if bytes.len() < needed {
         return Err(format!(
             "Bruker 1D fid truncated: need {needed} bytes, got {}",
@@ -2454,6 +2938,37 @@ pub fn infer_bruker_raw_indirect_reverse(
     f_dim == 2 && pulprog.to_ascii_lowercase().contains("gpwg3d")
 }
 
+fn read_optional_bruker_pdata1_text(dir: &Path, filename: &str) -> Option<String> {
+    let pdata_dir = find_dir_ci(dir, "pdata")?;
+    let d1 = find_dir_ci(&pdata_dir, "1")?;
+    let path = find_file_ci(&d1, filename)?;
+    read_text_lossy_capped(&path).ok()
+}
+
+fn find_bruker_splitcomb_sibling_dir(dir: &Path) -> Option<PathBuf> {
+    let expno: usize = dir.file_name()?.to_str()?.parse().ok()?;
+    if expno >= 10_000 {
+        return None;
+    }
+    let parent = dir.parent()?;
+    for cand in [10_000 + expno, 10_100 + expno] {
+        let sib = parent.join(cand.to_string());
+        if !fs::symlink_metadata(&sib).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let has_splitcomb = ["audita.txt", "acqu2s", "acqus"]
+            .into_iter()
+            .filter_map(|f| find_file_ci(&sib, f))
+            .filter_map(|p| read_text_lossy_capped(&p).ok())
+            .chain(read_optional_bruker_pdata1_text(&sib, "auditp.txt"))
+            .any(|t| t.to_ascii_lowercase().contains("splitcomb"));
+        if has_splitcomb {
+            return Some(sib);
+        }
+    }
+    None
+}
+
 /// Read a Bruker 2D `ser` directory (`acqus`, `acqu2s`, and `ser`), automatically detecting uniform vs NUS.
 pub fn read_bruker_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
     read_bruker_fid_2d_opts(dir, false)
@@ -2464,29 +2979,51 @@ pub fn read_bruker_fid_2d_opts(
     dir: impl AsRef<Path>,
     allow_truncated_fid: bool,
 ) -> Result<Fid2D, String> {
+    read_bruker_fid_2d_with_ipap(dir, allow_truncated_fid, None, None, None)
+}
+
+/// Read a Bruker 2D `ser` directory with optional explicit IPAP overrides
+/// (`ipap_j_caco_hz`, `ipap_ap_scale`, `ipap_ip_first`).
+pub fn read_bruker_fid_2d_with_ipap(
+    dir: impl AsRef<Path>,
+    allow_truncated_fid: bool,
+    ipap_j_caco_hz: Option<f64>,
+    ipap_ap_scale: Option<f64>,
+    ipap_ip_first: Option<bool>,
+) -> Result<Fid2D, String> {
     let dir = resolve_fid_dir(dir.as_ref())?;
     verify_bruker_pulseprogram_containment(&dir)?;
     let acqus = read_merged_bruker_params(&dir, "acqus", "acqu")?;
     let acqu2s = read_merged_bruker_params(&dir, "acqu2s", "acqu2")?;
     let is_fntype_nus = validate_bruker_fntype(&dir, &acqus, &[&acqu2s])?;
 
-    let procs = read_optional_bruker_proc(&dir, "procs");
-    let proc2s = read_optional_bruker_proc(&dir, "proc2s");
+    let mut procs = read_optional_bruker_proc(&dir, "procs");
+    let mut proc2s = read_optional_bruker_proc(&dir, "proc2s");
 
-    let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
+    let (mut axis_x, mut bytorda, mut dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
 
     let ser_path = find_file_ci(&dir, "ser")
         .ok_or_else(|| format!("missing 2D ser binary file in {}", dir.display()))?;
     let bytes =
         fs::read(&ser_path).map_err(|e| format!("failed to read {}: {e}", ser_path.display()))?;
-    let word_bytes = if dtypa == 2 { 8 } else { 4 };
-    let raw_stride_1024 = (axis_x.td_raw * word_bytes).div_ceil(1024) * 1024;
+    let mut word_bytes = if dtypa == 2 { 8 } else { 4 };
+    let raw_stride_1024 = axis_x
+        .td_raw
+        .checked_mul(word_bytes)
+        .and_then(|b| b.div_ceil(1024).checked_mul(1024))
+        .ok_or_else(|| format!("Bruker 2D stride overflow in {}", dir.display()))?;
 
     let td_acq_y: usize = acqu2s
         .get("TD")
         .ok_or("missing ##$TD in Bruker acqu2s")?
         .parse()
         .map_err(|e| format!("invalid TD in acqu2s: {e}"))?;
+    if !(1..=MAX_FID_AXIS_TD).contains(&td_acq_y) {
+        return Err(format!(
+            "invalid or oversized Bruker acqu2s TD={td_acq_y} in {} (expected 1..={MAX_FID_AXIS_TD})",
+            dir.display()
+        ));
+    }
 
     let sched_file = find_bruker_nuslist_file(&dir, &acqus);
     let nus_td_opt = acqu2s
@@ -2496,14 +3033,16 @@ pub fn read_bruker_fid_2d_opts(
         .or_else(|| parse_td_indirect_entry(&acqus, 1));
 
     // TopSpin 4 uniform guard: FnTYPE == 0 with ser matching td_acq_y (and NusTD <= td_acq_y when no smaller nuslist) is uniform.
+    let smaller_than_acq = td_acq_y
+        .checked_mul(raw_stride_1024)
+        .is_none_or(|exp| bytes.len() < exp);
     let implicit_nus = !is_fntype_nus
         && sched_file.is_some()
-        && (nus_td_opt.is_some_and(|ntd| ntd > td_acq_y)
-            || bytes.len() < td_acq_y * raw_stride_1024);
+        && (nus_td_opt.is_some_and(|ntd| ntd > td_acq_y) || smaller_than_acq);
     let is_nus = is_fntype_nus || implicit_nus;
 
     let td_full_y = if is_nus {
-        let unflat = (bytes.len() < td_acq_y * raw_stride_1024).then_some(td_acq_y);
+        let unflat = smaller_than_acq.then_some(td_acq_y);
         resolve_bruker_nus_full_td(&acqu2s, &acqus, 1, unflat, "F1 (acqu2s)", &dir)?
     } else {
         td_acq_y
@@ -2513,17 +3052,107 @@ pub fn read_bruker_fid_2d_opts(
     let ind_phys_y = pulprog_interp
         .as_ref()
         .and_then(|pi| pi.indirect_dims.first());
+    let pp_txt = read_optional_bruker_pulseprogram(&dir)?;
+    let pulprog_str = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
+
+    let mut own_meta_strings: Vec<String> = ["acqus", "acqu", "acqu2s", "acqu2", "audita.txt"]
+        .into_iter()
+        .filter_map(|f| find_file_ci(&dir, f))
+        .filter_map(|p| read_text_lossy_capped(&p).ok())
+        .collect();
+    for pdata_f in ["auditp.txt", "title"] {
+        if let Some(txt) = read_optional_bruker_pdata1_text(&dir, pdata_f) {
+            own_meta_strings.push(txt);
+        }
+    }
+    let own_meta_refs: Vec<&str> = own_meta_strings.iter().map(String::as_str).collect();
+
+    let ipap_mode = detect_bruker_2d_ipap_unsplit_mode(
+        &axis_x.label,
+        pulprog_str,
+        pp_txt.as_deref(),
+        &acqu2s,
+        &own_meta_refs,
+        bytes.len(),
+        td_acq_y,
+        axis_x.td_raw,
+        word_bytes,
+    );
+
+    let mut splitcomb_meta_strings = own_meta_strings.clone();
+    if ipap_mode.is_some() {
+        if let Some(sib) = find_bruker_splitcomb_sibling_dir(&dir) {
+            if let Some(aud) =
+                find_file_ci(&sib, "audita.txt").and_then(|p| read_text_lossy_capped(&p).ok())
+            {
+                splitcomb_meta_strings.push(aud);
+            }
+            if let Some(audp) = read_optional_bruker_pdata1_text(&sib, "auditp.txt") {
+                splitcomb_meta_strings.push(audp);
+            }
+            if !bruker_proc_matches_acqu_sw(procs.as_ref(), axis_x.sw_hz) {
+                if let Some(sp) = read_optional_bruker_proc(&sib, "procs") {
+                    if bruker_proc_matches_acqu_sw(Some(&sp), axis_x.sw_hz) {
+                        procs = Some(sp);
+                        (axis_x, bytorda, dtypa) =
+                            parse_bruker_direct_axis(&acqus, procs.as_ref())?;
+                        word_bytes = if dtypa == 2 { 8 } else { 4 };
+                    }
+                }
+            }
+            if let Some(sp2) = read_optional_bruker_proc(&sib, "proc2s") {
+                let sw_y_est = acqu2s
+                    .get("SW")
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .zip(acqu2s.get("SFO1").and_then(|v| v.parse::<f64>().ok()))
+                    .map(|(sw, sfo)| sw * sfo)
+                    .or_else(|| acqu2s.get("SW_h").and_then(|v| v.parse::<f64>().ok()))
+                    .unwrap_or(0.0);
+                if !bruker_proc_matches_acqu_sw(proc2s.as_ref(), sw_y_est)
+                    && bruker_proc_matches_acqu_sw(Some(&sp2), sw_y_est)
+                {
+                    proc2s = Some(sp2);
+                }
+            }
+        }
+    }
+
+    let manual_loop_quad = ind_phys_y.and_then(|ip| match ip.quad_source {
+        crate::pulprog::QuadSource::SynthesizedManualLoop { .. } => ip.quad_mode.to_fid_quad_mode(),
+        _ => None,
+    });
+    let fnmode_is_qf = acqu2s
+        .get("FnMODE")
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        == Some(1)
+        && manual_loop_quad.is_none();
+    let post_ipap_td_y = match ipap_mode {
+        None => td_full_y,
+        Some(true) => td_full_y,
+        Some(false) => {
+            let post = if fnmode_is_qf {
+                td_full_y / 2
+            } else {
+                (td_full_y / 4) * 2
+            };
+            if post == 0 {
+                return Err(format!(
+                    "Bruker IPAP 2D dataset in {} has indirect TD={td_full_y} too small for IPAP + quadrature recombination",
+                    dir.display()
+                ));
+            }
+            post
+        }
+    };
 
     let mut axis_y = parse_bruker_indirect_axis(
         &acqus,
         &acqu2s,
         proc2s.as_ref(),
         "15N",
-        Some(td_full_y),
+        Some(post_ipap_td_y),
         ind_phys_y,
     )?;
-    let pp_txt = read_optional_bruker_pulseprogram(&dir)?;
-    let pulprog_str = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
     let proc2s_cal = proc2s
         .as_ref()
         .filter(|p| bruker_proc_matches_acqu_sw(Some(p), axis_y.sw_hz));
@@ -2534,10 +3163,23 @@ pub fn read_bruker_fid_2d_opts(
             infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog_str, 1, axis_y.quad_mode)
         };
     }
-    let acqu2s_raw_txt = find_file_ci(&dir, "acqu2s")
-        .or_else(|| find_file_ci(&dir, "acqu2"))
-        .and_then(|p| read_text_lossy_capped(&p).ok());
-    let j_caco_hz = resolve_bruker_ipap_j_caco_hz(&acqus, pp_txt.as_deref());
+
+    let splitcomb_refs: Vec<&str> = splitcomb_meta_strings.iter().map(String::as_str).collect();
+    let ipap_cfg = ipap_mode.map(|_| {
+        let mut cfg =
+            resolve_bruker_ipap_config(&acqus, Some(&acqu2s), pp_txt.as_deref(), &splitcomb_refs);
+        if let Some(j) = ipap_j_caco_hz.filter(|v| v.is_finite() && *v > 0.0) {
+            cfg.j_caco_hz = j;
+        }
+        if let Some(sc) = ipap_ap_scale.filter(|v| v.is_finite() && *v > 0.0) {
+            cfg.ap_scale = sc;
+        }
+        if let Some(ord) = ipap_ip_first {
+            cfg.ip_first = ord;
+        }
+        cfg
+    });
+
     let q1_mult = if axis_y.quad_mode == QuadMode::Qf {
         1
     } else {
@@ -2546,11 +3188,14 @@ pub fn read_bruker_fid_2d_opts(
     let n0 = axis_x.complex_points;
     let n1 = axis_y.complex_points;
     let big_endian = bytorda != 0;
-    let trace_byte_len = n0 * 2 * word_bytes;
-    let mut data = vec![[0.0, 0.0]; n1 * 2 * n0];
+    let trace_byte_len = n0
+        .checked_mul(2)
+        .and_then(|w| w.checked_mul(word_bytes))
+        .ok_or_else(|| format!("Bruker 2D trace byte length overflow in {}", dir.display()))?;
+    let dir_ctx = dir.display().to_string();
     let mut truncated_traces: Option<(usize, usize)> = None;
 
-    let nus_mask = if is_nus {
+    let (data, nus_mask) = if is_nus {
         let sched_path = sched_file.ok_or_else(|| {
             format!(
                 "Bruker 2D NUS dataset in {} is missing a non-empty nuslist schedule file",
@@ -2558,27 +3203,27 @@ pub fn read_bruker_fid_2d_opts(
             )
         })?;
         let coords = parse_nus_schedule_1d(&sched_path, n1)?;
-        let n_acq_traces = coords.len() * q1_mult;
-        if td_acq_y != n_acq_traces && td_acq_y != td_full_y {
+        let n_acq_traces = coords
+            .len()
+            .checked_mul(q1_mult)
+            .ok_or_else(|| format!("Bruker 2D NUS trace count overflow in {}", dir.display()))?;
+        let raw_ipap_acq_traces = n_acq_traces.saturating_mul(2);
+        let valid_td_acq = if ipap_mode.is_some() {
+            td_acq_y == n_acq_traces || td_acq_y == raw_ipap_acq_traces || td_acq_y == td_full_y
+        } else {
+            td_acq_y == n_acq_traces || td_acq_y == td_full_y
+        };
+        if !valid_td_acq {
             return Err(format!(
                 "Bruker 2D NUS trace count mismatch in {}: acqu2s.TD={td_acq_y}, but nuslist has {} points ({n_acq_traces} traces)",
                 dir.display(),
                 coords.len()
             ));
         }
-        let ipap_interleaved = is_bruker_ipap_ser_unsplit(
-            &axis_x.label,
-            pulprog_str,
-            pp_txt.as_deref(),
-            &acqu2s,
-            acqu2s_raw_txt.as_deref(),
-            bytes.len(),
-            n_acq_traces,
-            axis_x.td_raw,
-            word_bytes,
-        );
-        let expected_raw_traces = if ipap_interleaved {
-            2 * n_acq_traces
+        let expected_raw_traces = if ipap_mode.is_some() {
+            n_acq_traces
+                .checked_mul(2)
+                .ok_or_else(|| format!("Bruker 2D IPAP NUS trace overflow in {}", dir.display()))?
         } else {
             n_acq_traces
         };
@@ -2595,7 +3240,10 @@ pub fn read_bruker_fid_2d_opts(
             truncated_traces = Some((observed, expected_raw_traces));
             warn_truncated_fid(&dir, observed, expected_raw_traces);
         }
-        let obs_logical = if ipap_interleaved {
+        let total_cplx =
+            checked_fid_complex_len(&[n1, 2, n0], truncated_traces.is_some(), &dir_ctx)?;
+        let mut data = vec![[0.0, 0.0]; total_cplx];
+        let obs_logical = if ipap_cfg.is_some() {
             observed.div_ceil(2)
         } else {
             observed
@@ -2618,10 +3266,9 @@ pub fn read_bruker_fid_2d_opts(
                     n0,
                     big_endian,
                     dtypa,
-                    ipap_interleaved,
+                    ipap_cfg,
                     axis_x.sw_hz,
                     axis_x.group_delay,
-                    j_caco_hz,
                 );
                 add_complex_slice(&mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0], &tr);
             } else {
@@ -2637,10 +3284,9 @@ pub fn read_bruker_fid_2d_opts(
                     n0,
                     big_endian,
                     dtypa,
-                    ipap_interleaved,
+                    ipap_cfg,
                     axis_x.sw_hz,
                     axis_x.group_delay,
-                    j_caco_hz,
                 );
                 let z1 = decode_bruker_2d_logical_trace(
                     &bytes,
@@ -2651,10 +3297,9 @@ pub fn read_bruker_fid_2d_opts(
                     n0,
                     big_endian,
                     dtypa,
-                    ipap_interleaved,
+                    ipap_cfg,
                     axis_x.sw_hz,
                     axis_x.group_delay,
-                    j_caco_hz,
                 );
                 recombine_quad_pair(axis_y.quad_mode, k1, &z0, &z1, &mut tmp_cos, &mut tmp_sin);
                 add_complex_slice(&mut data[(k1 * 2) * n0..(k1 * 2 + 1) * n0], &tmp_cos);
@@ -2670,23 +3315,16 @@ pub fn read_bruker_fid_2d_opts(
                 );
             }
         }
-        Some(counts.into_iter().map(|c| c > 0).collect())
+        (data, Some(counts.into_iter().map(|c| c > 0).collect()))
     } else {
-        let ipap_interleaved = is_bruker_ipap_ser_unsplit(
-            &axis_x.label,
-            pulprog_str,
-            pp_txt.as_deref(),
-            &acqu2s,
-            acqu2s_raw_txt.as_deref(),
-            bytes.len(),
-            td_acq_y,
-            axis_x.td_raw,
-            word_bytes,
-        );
-        let expected_raw_traces = if ipap_interleaved {
-            2 * td_acq_y
-        } else {
-            td_acq_y
+        let expected_raw_traces = match ipap_mode {
+            None => td_acq_y,
+            Some(true) => td_acq_y.checked_mul(2).ok_or_else(|| {
+                format!("Bruker 2D IPAP trace count overflow in {}", dir.display())
+            })?,
+            Some(false) => post_ipap_td_y.checked_mul(2).ok_or_else(|| {
+                format!("Bruker 2D IPAP trace count overflow in {}", dir.display())
+            })?,
         };
         let (stride, observed) = determine_bruker_ser_stride_opts(
             bytes.len(),
@@ -2701,7 +3339,10 @@ pub fn read_bruker_fid_2d_opts(
             truncated_traces = Some((observed, expected_raw_traces));
             warn_truncated_fid(&dir, observed, expected_raw_traces);
         }
-        let obs_logical = if ipap_interleaved {
+        let total_cplx =
+            checked_fid_complex_len(&[n1, 2, n0], truncated_traces.is_some(), &dir_ctx)?;
+        let mut data = vec![[0.0, 0.0]; total_cplx];
+        let obs_logical = if ipap_cfg.is_some() {
             observed.div_ceil(2)
         } else {
             observed
@@ -2717,10 +3358,9 @@ pub fn read_bruker_fid_2d_opts(
                     n0,
                     big_endian,
                     dtypa,
-                    ipap_interleaved,
+                    ipap_cfg,
                     axis_x.sw_hz,
                     axis_x.group_delay,
-                    j_caco_hz,
                 );
                 data[(k1 * 2) * n0..(k1 * 2 + 1) * n0].copy_from_slice(&tr);
             }
@@ -2738,10 +3378,9 @@ pub fn read_bruker_fid_2d_opts(
                     n0,
                     big_endian,
                     dtypa,
-                    ipap_interleaved,
+                    ipap_cfg,
                     axis_x.sw_hz,
                     axis_x.group_delay,
-                    j_caco_hz,
                 );
                 let z1 = decode_bruker_2d_logical_trace(
                     &bytes,
@@ -2752,17 +3391,16 @@ pub fn read_bruker_fid_2d_opts(
                     n0,
                     big_endian,
                     dtypa,
-                    ipap_interleaved,
+                    ipap_cfg,
                     axis_x.sw_hz,
                     axis_x.group_delay,
-                    j_caco_hz,
                 );
                 let (cos_slice, sin_slice) =
                     data[(k1 * 2) * n0..(k1 * 2 + 2) * n0].split_at_mut(n0);
                 recombine_quad_pair(axis_y.quad_mode, k1, &z0, &z1, cos_slice, sin_slice);
             }
         }
-        None
+        (data, None)
     };
 
     let pulse_program = acqus.get("PULPROG").cloned().unwrap_or_default();
@@ -3045,19 +3683,40 @@ fn read_bruker_fid_3d_from_params(
     };
 
     let word_bytes = if dtypa == 2 { 8 } else { 4 };
-    let raw_stride_1024 = (axis_x.td_raw * word_bytes).div_ceil(1024) * 1024;
+    let raw_stride_1024 = axis_x
+        .td_raw
+        .checked_mul(word_bytes)
+        .and_then(|b| b.div_ceil(1024).checked_mul(1024))
+        .ok_or_else(|| format!("Bruker 3D stride overflow in {}", dir.display()))?;
 
     let td_acq_y: usize = acqu2s
         .get("TD")
         .ok_or("missing ##$TD in Bruker acqu2s")?
         .parse()
         .map_err(|e| format!("invalid TD in acqu2s: {e}"))?;
+    if !(1..=MAX_FID_AXIS_TD).contains(&td_acq_y) {
+        return Err(format!(
+            "invalid or oversized Bruker acqu2s TD={td_acq_y} in {} (expected 1..={MAX_FID_AXIS_TD})",
+            dir.display()
+        ));
+    }
     let td_acq_z: usize = acqu3s
         .get("TD")
         .ok_or("missing ##$TD in Bruker acqu3s")?
         .parse()
         .map_err(|e| format!("invalid TD in acqu3s: {e}"))?;
-    let total_acq_param = td_acq_y * td_acq_z;
+    if !(1..=MAX_FID_AXIS_TD).contains(&td_acq_z) {
+        return Err(format!(
+            "invalid or oversized Bruker acqu3s TD={td_acq_z} in {} (expected 1..={MAX_FID_AXIS_TD})",
+            dir.display()
+        ));
+    }
+    let total_acq_param = td_acq_y.checked_mul(td_acq_z).ok_or_else(|| {
+        format!(
+            "Bruker 3D indirect TD product overflow in {}",
+            dir.display()
+        )
+    })?;
 
     let has_nuslist = nuslist_txt.is_some_and(|s| !s.trim().is_empty());
     let nus_td_y_opt = acqu2s
@@ -3073,10 +3732,16 @@ fn read_bruker_fid_3d_from_params(
 
     // TopSpin 4 uniform guard: FnTYPE == 0 (e.g. CISD3_HNCA with NUSLIST=<automatic>, NusAMOUNT=100,
     // TD=40x80, NusTD=40x80) is uniform when ser matches the uniform grid!
-    let full_grid_est = nus_td_y_opt.unwrap_or(td_acq_y) * nus_td_z_opt.unwrap_or(td_acq_z);
+    let full_grid_est = nus_td_y_opt
+        .unwrap_or(td_acq_y)
+        .checked_mul(nus_td_z_opt.unwrap_or(td_acq_z))
+        .ok_or_else(|| format!("Bruker 3D NUS grid estimate overflow in {}", dir.display()))?;
+    let smaller_than_full_grid = full_grid_est
+        .checked_mul(raw_stride_1024)
+        .is_none_or(|exp| bytes.len() < exp);
     let implicit_nus = !is_fntype_nus
         && has_nuslist
-        && (full_grid_est > total_acq_param || bytes.len() < full_grid_est * raw_stride_1024);
+        && (full_grid_est > total_acq_param || smaller_than_full_grid);
     let is_nus = is_fntype_nus || implicit_nus;
 
     let (td_full_y, td_full_z) = if is_nus {
@@ -3149,18 +3814,14 @@ fn read_bruker_fid_3d_from_params(
     let n1 = axis_y.complex_points;
     let n2 = axis_z.complex_points;
     let big_endian = bytorda != 0;
-    let trace_byte_len = n0 * 2 * word_bytes;
-
-    let mut data = vec![[0.0, 0.0]; n2 * 2 * n1 * 2 * n0];
+    let trace_byte_len = n0
+        .checked_mul(2)
+        .and_then(|w| w.checked_mul(word_bytes))
+        .ok_or_else(|| format!("Bruker 3D trace byte length overflow in {}", dir.display()))?;
+    let dir_ctx = dir.display().to_string();
     let mut truncated_traces: Option<(usize, usize)> = None;
-    let mut z00_cos = vec![[0.0, 0.0]; n0];
-    let mut z00_sin = vec![[0.0, 0.0]; n0];
-    let mut z01_cos = vec![[0.0, 0.0]; n0];
-    let mut z01_sin = vec![[0.0, 0.0]; n0];
-    let mut out_c2_cos = vec![[0.0, 0.0]; n0];
-    let mut out_c2_sin = vec![[0.0, 0.0]; n0];
 
-    let nus_mask = if is_nus {
+    let (data, nus_mask) = if is_nus {
         let sched_text = nuslist_txt.ok_or_else(|| {
             format!(
                 "Bruker 3D NUS dataset in {} is missing a non-empty nuslist schedule file",
@@ -3179,8 +3840,12 @@ fn read_bruker_fid_3d_from_params(
         let coords: Vec<(usize, usize)> =
             decoded.points.into_iter().map(|r| (r[0], r[1])).collect();
         let traces_per_row = q1_mult * q2_mult;
-        let expected_acq_traces = coords.len() * traces_per_row;
-        if total_acq_param != expected_acq_traces && total_acq_param != td_full_y * td_full_z {
+        let expected_acq_traces = coords
+            .len()
+            .checked_mul(traces_per_row)
+            .ok_or_else(|| format!("Bruker 3D NUS trace count overflow in {}", dir.display()))?;
+        let full_td_prod = td_full_y.checked_mul(td_full_z);
+        if total_acq_param != expected_acq_traces && Some(total_acq_param) != full_td_prod {
             return Err(format!(
                 "Bruker 3D NUS trace count mismatch in {}: acqu2s.TD*acqu3s.TD={total_acq_param}, but nuslist has {} points ({expected_acq_traces} traces)",
                 dir.display(),
@@ -3200,7 +3865,19 @@ fn read_bruker_fid_3d_from_params(
             truncated_traces = Some((observed, expected_acq_traces));
             warn_truncated_fid(dir, observed, expected_acq_traces);
         }
-        let mut counts = vec![0usize; n2 * n1];
+        let total_cplx =
+            checked_fid_complex_len(&[n2, 2, n1, 2, n0], truncated_traces.is_some(), &dir_ctx)?;
+        let n2_n1 = n2
+            .checked_mul(n1)
+            .ok_or_else(|| format!("Bruker 3D NUS mask size overflow in {}", dir.display()))?;
+        let mut data = vec![[0.0, 0.0]; total_cplx];
+        let mut z00_cos = vec![[0.0, 0.0]; n0];
+        let mut z00_sin = vec![[0.0, 0.0]; n0];
+        let mut z01_cos = vec![[0.0, 0.0]; n0];
+        let mut z01_sin = vec![[0.0, 0.0]; n0];
+        let mut out_c2_cos = vec![[0.0, 0.0]; n0];
+        let mut out_c2_sin = vec![[0.0, 0.0]; n0];
+        let mut counts = vec![0usize; n2_n1];
 
         for (row_idx, &(k1, k2)) in coords.iter().enumerate() {
             let row_base = row_idx * traces_per_row;
@@ -3253,7 +3930,7 @@ fn read_bruker_fid_3d_from_params(
                 }
             }
         }
-        Some(counts.into_iter().map(|c| c > 0).collect())
+        (data, Some(counts.into_iter().map(|c| c > 0).collect()))
     } else {
         let (stride, observed) = determine_bruker_ser_stride_opts(
             bytes.len(),
@@ -3268,6 +3945,16 @@ fn read_bruker_fid_3d_from_params(
             truncated_traces = Some((observed, total_acq_param));
             warn_truncated_fid(dir, observed, total_acq_param);
         }
+        let total_cplx =
+            checked_fid_complex_len(&[n2, 2, n1, 2, n0], truncated_traces.is_some(), &dir_ctx)?;
+        let mut data = vec![[0.0, 0.0]; total_cplx];
+        let mut z00_cos = vec![[0.0, 0.0]; n0];
+        let mut z00_sin = vec![[0.0, 0.0]; n0];
+        let mut z01_cos = vec![[0.0, 0.0]; n0];
+        let mut z01_sin = vec![[0.0, 0.0]; n0];
+        let mut out_c2_cos = vec![[0.0, 0.0]; n0];
+        let mut out_c2_sin = vec![[0.0, 0.0]; n0];
+
         for k2 in 0..n2 {
             for k1 in 0..n1 {
                 let min_tidx = if aqseq == 0 {
@@ -3315,7 +4002,7 @@ fn read_bruker_fid_3d_from_params(
                 );
             }
         }
-        None
+        (data, None)
     };
 
     let pulse_program = acqus.get("PULPROG").cloned().unwrap_or_default();
@@ -3399,7 +4086,10 @@ pub fn read_bruker_pseudo3d_planes_2d(
     let n0 = axis_x.complex_points;
     let n_t1 = axis_t1.complex_points;
     let q_mult = 2usize;
-    let total_traces = n_planes * n_t1 * q_mult;
+    let total_traces = n_planes
+        .checked_mul(n_t1)
+        .and_then(|v| v.checked_mul(q_mult))
+        .ok_or_else(|| format!("Bruker pseudo-3D trace count overflow in {}", dir.display()))?;
 
     let ser_path = find_file_ci(&dir, "ser")
         .ok_or_else(|| format!("missing pseudo-3D ser binary file in {}", dir.display()))?;
@@ -3414,8 +4104,19 @@ pub fn read_bruker_pseudo3d_planes_2d(
         true,
         &dir,
     )?;
+    let dir_ctx = dir.display().to_string();
+    let _ = checked_fid_complex_len(&[n_planes, n_t1, 2, n0], false, &dir_ctx)?;
+    let plane_cplx = checked_fid_complex_len(&[n_t1, 2, n0], false, &dir_ctx)?;
     let big_endian = bytorda != 0;
-    let trace_byte_len = n0 * 2 * word_bytes;
+    let trace_byte_len = n0
+        .checked_mul(2)
+        .and_then(|w| w.checked_mul(word_bytes))
+        .ok_or_else(|| {
+            format!(
+                "Bruker pseudo-3D trace byte length overflow in {}",
+                dir.display()
+            )
+        })?;
     let pulse_program = acqus.get("PULPROG").cloned().unwrap_or_default();
     let base_name = dir
         .file_name()
@@ -3428,7 +4129,7 @@ pub fn read_bruker_pseudo3d_planes_2d(
         .unwrap_or(inner_is_qf);
     let mut planes = Vec::with_capacity(n_planes);
     for p in 0..n_planes {
-        let mut plane_data = vec![[0.0, 0.0]; n_t1 * 2 * n0];
+        let mut plane_data = vec![[0.0, 0.0]; plane_cplx];
         for k1 in 0..n_t1 {
             let (t0_idx, t1_idx) = match (storage_order, list_inner_to_quad) {
                 (crate::pulprog::Pseudo3DStorageOrder::T1Interleaved, true) => (
@@ -3625,6 +4326,23 @@ struct VarianBinaryFid {
     traces: Vec<Vec<Complex64>>,
 }
 
+fn parse_varian_opt_dim_usize(
+    pp: &HashMap<String, ProcparVal>,
+    key: &str,
+    dir: &Path,
+) -> Result<Option<usize>, String> {
+    let Some(v) = pp.get(key).and_then(ProcparVal::first_f64) else {
+        return Ok(None);
+    };
+    if !v.is_finite() || v < 0.0 || v > (MAX_FID_AXIS_TD as f64) {
+        return Err(format!(
+            "invalid or oversized Varian `{key}`={v} in {} (expected 0..={MAX_FID_AXIS_TD})",
+            dir.display()
+        ));
+    }
+    Ok(Some(v.round() as usize))
+}
+
 fn read_varian_fid_binary(
     path: &Path,
     allow_truncated_fid: bool,
@@ -3638,14 +4356,27 @@ fn read_varian_fid_binary(
         ));
     }
 
-    let nblocks = i32::from_be_bytes(bytes[0..4].try_into().unwrap()).max(0) as usize;
-    let ntraces = i32::from_be_bytes(bytes[4..8].try_into().unwrap()).max(0) as usize;
-    let np = i32::from_be_bytes(bytes[8..12].try_into().unwrap()).max(0) as usize;
-    let ebytes = i32::from_be_bytes(bytes[12..16].try_into().unwrap()).max(0) as usize;
-    let _tbytes = i32::from_be_bytes(bytes[16..20].try_into().unwrap());
-    let bbytes = i32::from_be_bytes(bytes[20..24].try_into().unwrap()).max(0) as usize;
-    let status = u16::from_be_bytes(bytes[26..28].try_into().unwrap());
-    let nbheaders = i32::from_be_bytes(bytes[28..32].try_into().unwrap()).max(1) as usize;
+    let nblocks_i32 = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let ntraces_i32 = i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let np_i32 = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let ebytes_i32 = i32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let _tbytes = i32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let bbytes_i32 = i32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    let status = u16::from_be_bytes([bytes[26], bytes[27]]);
+    let nbheaders_i32 = i32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+
+    if nblocks_i32 <= 0 || ntraces_i32 <= 0 || bbytes_i32 < 0 || nbheaders_i32 < 0 {
+        return Err(format!(
+            "invalid negative/zero Varian fid header counts (nblocks={nblocks_i32}, ntraces={ntraces_i32}, bbytes={bbytes_i32}, nbheaders={nbheaders_i32}) in {}",
+            path.display()
+        ));
+    }
+    let nblocks = nblocks_i32 as usize;
+    let ntraces = ntraces_i32 as usize;
+    let np = np_i32.max(0) as usize;
+    let ebytes = ebytes_i32.max(0) as usize;
+    let bbytes = bbytes_i32 as usize;
+    let nbheaders = (nbheaders_i32 as usize).max(1);
 
     if (status & VARIAN_S_DATA) == 0 {
         return Err(format!(
@@ -3659,10 +4390,43 @@ fn read_varian_fid_binary(
             path.display()
         ));
     }
-    if np < 2 || !np.is_multiple_of(2) {
-        return Err(format!("invalid Varian np={np} in {}", path.display()));
+    if np < 2 || !np.is_multiple_of(2) || np > MAX_FID_AXIS_TD {
+        return Err(format!(
+            "invalid or oversized Varian np={np_i32} in {} (expected even 2..={MAX_FID_AXIS_TD})",
+            path.display()
+        ));
     }
-    let total_needed = 32 + nblocks * bbytes;
+    if !matches!(ebytes, 2 | 4) {
+        return Err(format!(
+            "unsupported Varian ebytes={ebytes_i32} in {} (expected 2 or 4)",
+            path.display()
+        ));
+    }
+    let hdr_bytes_per_block = nbheaders
+        .checked_mul(28)
+        .ok_or_else(|| format!("Varian block header byte overflow in {}", path.display()))?;
+    let trace_bytes = np
+        .checked_mul(ebytes)
+        .ok_or_else(|| format!("Varian trace byte overflow in {}", path.display()))?;
+    let min_block_bytes = ntraces
+        .checked_mul(trace_bytes)
+        .and_then(|tb| hdr_bytes_per_block.checked_add(tb))
+        .ok_or_else(|| format!("Varian block byte size overflow in {}", path.display()))?;
+    if bbytes < min_block_bytes {
+        return Err(format!(
+            "invalid Varian bbytes={bbytes} < required {min_block_bytes} ({nbheaders} hdrs + {ntraces} traces x {trace_bytes} B) in {}",
+            path.display()
+        ));
+    }
+    let total_needed = nblocks
+        .checked_mul(bbytes)
+        .and_then(|bb| bb.checked_add(32))
+        .ok_or_else(|| {
+            format!(
+                "Varian fid declared byte size overflow ({nblocks} blocks x {bbytes} B) in {}",
+                path.display()
+            )
+        })?;
     if bytes.len() < total_needed && (!allow_truncated_fid || bbytes == 0) {
         return Err(format!(
             "Varian fid {} truncated: header declares {total_needed} B ({nblocks} blocks x {bbytes} B), got {} B",
@@ -3672,23 +4436,30 @@ fn read_varian_fid_binary(
     }
 
     let n_cplx = np / 2;
-    let hdr_bytes_per_block = nbheaders * 28;
-    let trace_bytes = np * ebytes;
-    let blocks_in_file = if bytes.len() >= total_needed {
+    let is_truncated = bytes.len() < total_needed;
+    let blocks_in_file = if !is_truncated {
         nblocks
     } else {
         // Include any final partially written block that still holds >= 1 complete trace
         let full = bytes.len().saturating_sub(32) / bbytes;
         let rem = bytes.len().saturating_sub(32) % bbytes;
-        (full + usize::from(trace_bytes > 0 && rem >= hdr_bytes_per_block + trace_bytes))
-            .min(nblocks)
+        let min_one_trace = hdr_bytes_per_block.saturating_add(trace_bytes);
+        (full + usize::from(trace_bytes > 0 && rem >= min_one_trace)).min(nblocks)
     };
-    let mut traces = Vec::with_capacity(blocks_in_file * ntraces);
+    let max_traces = blocks_in_file
+        .checked_mul(ntraces)
+        .ok_or_else(|| format!("Varian trace count overflow in {}", path.display()))?;
+    let _ = checked_fid_complex_len(
+        &[max_traces.max(1), n_cplx],
+        is_truncated,
+        &path.display().to_string(),
+    )?;
+    let mut traces = Vec::with_capacity(max_traces);
 
     for b in 0..blocks_in_file {
         let b_off = 32 + b * bbytes;
         let blk_status = if nbheaders >= 1 && b_off + 4 <= bytes.len() {
-            u16::from_be_bytes(bytes[b_off + 2..b_off + 4].try_into().unwrap())
+            u16::from_be_bytes([bytes[b_off + 2], bytes[b_off + 3]])
         } else {
             status
         };
@@ -3705,22 +4476,36 @@ fn read_varian_fid_binary(
             if is_float && ebytes == 4 {
                 for k in 0..n_cplx {
                     let p = t_off + k * 8;
-                    let re = f32::from_be_bytes(bytes[p..p + 4].try_into().unwrap()) as f64;
-                    let im = f32::from_be_bytes(bytes[p + 4..p + 8].try_into().unwrap()) as f64;
+                    let re =
+                        f32::from_be_bytes([bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]])
+                            as f64;
+                    let im = f32::from_be_bytes([
+                        bytes[p + 4],
+                        bytes[p + 5],
+                        bytes[p + 6],
+                        bytes[p + 7],
+                    ]) as f64;
                     cvec.push([re, im]);
                 }
             } else if is_32 && ebytes == 4 {
                 for k in 0..n_cplx {
                     let p = t_off + k * 8;
-                    let re = i32::from_be_bytes(bytes[p..p + 4].try_into().unwrap()) as f64;
-                    let im = i32::from_be_bytes(bytes[p + 4..p + 8].try_into().unwrap()) as f64;
+                    let re =
+                        i32::from_be_bytes([bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]])
+                            as f64;
+                    let im = i32::from_be_bytes([
+                        bytes[p + 4],
+                        bytes[p + 5],
+                        bytes[p + 6],
+                        bytes[p + 7],
+                    ]) as f64;
                     cvec.push([re, im]);
                 }
             } else if ebytes == 2 {
                 for k in 0..n_cplx {
                     let p = t_off + k * 4;
-                    let re = i16::from_be_bytes(bytes[p..p + 2].try_into().unwrap()) as f64;
-                    let im = i16::from_be_bytes(bytes[p + 2..p + 4].try_into().unwrap()) as f64;
+                    let re = i16::from_be_bytes([bytes[p], bytes[p + 1]]) as f64;
+                    let im = i16::from_be_bytes([bytes[p + 2], bytes[p + 3]]) as f64;
                     cvec.push([re, im]);
                 }
             } else {
@@ -4080,26 +4865,10 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
         },
     };
 
-    let ni_raw = pp
-        .get("ni")
-        .and_then(ProcparVal::first_f64)
-        .unwrap_or(0.0)
-        .round() as usize;
-    let nimax = pp
-        .get("nimax")
-        .and_then(ProcparVal::first_f64)
-        .map(|v| v.round() as usize)
-        .filter(|&v| v > 1);
-    let ni2_raw = pp
-        .get("ni2")
-        .and_then(ProcparVal::first_f64)
-        .unwrap_or(0.0)
-        .round() as usize;
-    let ni2max = pp
-        .get("ni2max")
-        .and_then(ProcparVal::first_f64)
-        .map(|v| v.round() as usize)
-        .filter(|&v| v > 1);
+    let ni_raw = parse_varian_opt_dim_usize(&pp, "ni", dir)?.unwrap_or(0);
+    let nimax = parse_varian_opt_dim_usize(&pp, "nimax", dir)?.filter(|&v| v > 1);
+    let ni2_raw = parse_varian_opt_dim_usize(&pp, "ni2", dir)?.unwrap_or(0);
+    let ni2max = parse_varian_opt_dim_usize(&pp, "ni2max", dir)?.filter(|&v| v > 1);
 
     let pulse_program = pp
         .get("seqfil")
@@ -4189,9 +4958,18 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
         .get("f1180")
         .and_then(ProcparVal::first_str)
         .is_some_and(|s| s.eq_ignore_ascii_case("y"));
+    let td_raw_y = ni
+        .checked_mul(p1_mult)
+        .ok_or_else(|| format!("Varian indirect F1 TD overflow in {}", dir.display()))?;
+    if td_raw_y > MAX_FID_AXIS_TD {
+        return Err(format!(
+            "oversized Varian F1 TD={td_raw_y} in {} (limit={MAX_FID_AXIS_TD})",
+            dir.display()
+        ));
+    }
     let axis_y = FidAxisMeta {
         label: label_1,
-        td_raw: ni * p1_mult,
+        td_raw: td_raw_y,
         complex_points: ni,
         sw_hz: sw1,
         obs_mhz: obs_1,
@@ -4218,15 +4996,15 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
     };
 
     let n0 = axis_x.complex_points;
+    let dir_ctx = dir.display().to_string();
 
     if ni2 <= 1 {
-        let uniform_traces = ni * p1_mult;
+        let uniform_traces = td_raw_y;
         let is_nus = explicit_nus || (sched_file.is_some() && bin.traces.len() < uniform_traces);
 
-        let mut data = vec![[0.0, 0.0]; ni * 2 * n0];
         let zero_trace = vec![[0.0, 0.0]; n0];
         let mut truncated_traces: Option<(usize, usize)> = None;
-        let nus_mask = if is_nus {
+        let (data, nus_mask) = if is_nus {
             let sched_path = sched_file.ok_or_else(|| {
                 format!(
                     "Varian 2D NUS dataset in {} is missing sampling.sch / nuslist schedule file",
@@ -4234,7 +5012,9 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
                 )
             })?;
             let coords = parse_nus_schedule_1d(&sched_path, ni)?;
-            let expected_acq = coords.len() * p1_mult;
+            let expected_acq = coords.len().checked_mul(p1_mult).ok_or_else(|| {
+                format!("Varian 2D NUS trace count overflow in {}", dir.display())
+            })?;
             if bin.traces.len() != expected_acq {
                 if allow_truncated_fid && !bin.traces.is_empty() && bin.traces.len() < expected_acq
                 {
@@ -4250,6 +5030,9 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
                     ));
                 }
             }
+            let total_cplx =
+                checked_fid_complex_len(&[ni, 2, n0], truncated_traces.is_some(), &dir_ctx)?;
+            let mut data = vec![[0.0, 0.0]; total_cplx];
             let mut counts = vec![0usize; ni];
             let mut tmp_cos = vec![[0.0, 0.0]; n0];
             let mut tmp_sin = vec![[0.0, 0.0]; n0];
@@ -4286,18 +5069,20 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
                     );
                 }
             }
-            Some(counts.into_iter().map(|c| c > 0).collect())
+            (data, Some(counts.into_iter().map(|c| c > 0).collect()))
         } else {
             if let Some(sp) = sched_file {
                 // If a schedule file is present on a full-size 2D dataset, verify whether it matches;
                 // if it declares fewer points than uniform_traces, report inconsistency rather than silently ignoring.
                 let coords = parse_nus_schedule_1d(&sp, ni)?;
-                if coords.len() * p1_mult != bin.traces.len() {
+                let sched_traces = coords.len().checked_mul(p1_mult).ok_or_else(|| {
+                    format!("Varian 2D schedule trace overflow in {}", sp.display())
+                })?;
+                if sched_traces != bin.traces.len() {
                     return Err(format!(
-                        "Varian 2D schedule {} has {} points ({} traces) inconsistent with fid trace count {}",
+                        "Varian 2D schedule {} has {} points ({sched_traces} traces) inconsistent with fid trace count {}",
                         sp.display(),
                         coords.len(),
-                        coords.len() * p1_mult,
                         bin.traces.len()
                     ));
                 }
@@ -4313,6 +5098,9 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
                 warn_truncated_fid(dir, bin.traces.len(), uniform_traces);
                 truncated_traces = Some((bin.traces.len(), uniform_traces));
             }
+            let total_cplx =
+                checked_fid_complex_len(&[ni, 2, n0], truncated_traces.is_some(), &dir_ctx)?;
+            let mut data = vec![[0.0, 0.0]; total_cplx];
             if qm1 == QuadMode::Qf {
                 for k1 in 0..ni.min(bin.traces.len()) {
                     data[(k1 * 2) * n0..(k1 * 2 + 1) * n0].copy_from_slice(&bin.traces[k1]);
@@ -4332,7 +5120,7 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
                     apply_varian_fcoef_pair(coef1, t0, t1, cos_s, sin_s);
                 }
             }
-            None
+            (data, None)
         };
 
         return Ok(RawFid::Dim2(Fid2D {
@@ -4367,9 +5155,18 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
         .and_then(ProcparVal::first_str)
         .is_some_and(|s| s.eq_ignore_ascii_case("y"));
     let p2_mult = if qm2 == QuadMode::Qf { 1 } else { 2 };
+    let td_raw_z = ni2
+        .checked_mul(p2_mult)
+        .ok_or_else(|| format!("Varian indirect F2 TD overflow in {}", dir.display()))?;
+    if td_raw_z > MAX_FID_AXIS_TD {
+        return Err(format!(
+            "oversized Varian F2 TD={td_raw_z} in {} (limit={MAX_FID_AXIS_TD})",
+            dir.display()
+        ));
+    }
     let axis_z = FidAxisMeta {
         label: label_2,
-        td_raw: ni2 * p2_mult,
+        td_raw: td_raw_z,
         complex_points: ni2,
         sw_hz: sw2,
         obs_mhz: obs_2,
@@ -4413,10 +5210,14 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
         ));
     }
 
-    let uniform_traces = ni * p1_mult * ni2 * p2_mult;
+    let uniform_traces = td_raw_y.checked_mul(td_raw_z).ok_or_else(|| {
+        format!(
+            "Varian 3D uniform trace count overflow in {}",
+            dir.display()
+        )
+    })?;
     let is_nus = explicit_nus || (sched_file.is_some() && bin.traces.len() < uniform_traces);
 
-    let mut data = vec![[0.0, 0.0]; ni2 * 2 * ni * 2 * n0];
     let zero_trace = vec![[0.0, 0.0]; n0];
     let mut y_e_cos = vec![[0.0, 0.0]; n0];
     let mut y_e_sin = vec![[0.0, 0.0]; n0];
@@ -4427,7 +5228,7 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
     let traces_per_point = p1_mult * p2_mult;
     let mut truncated_traces: Option<(usize, usize)> = None;
 
-    let nus_mask = if is_nus {
+    let (data, nus_mask) = if is_nus {
         let sched_path = sched_file.ok_or_else(|| {
             format!(
                 "Varian 3D NUS dataset in {} is missing sampling.sch / nuslist schedule file",
@@ -4435,7 +5236,10 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
             )
         })?;
         let coords = parse_nus_schedule_2d(&sched_path, ni, ni2, true)?;
-        let expected_acq = coords.len() * traces_per_point;
+        let expected_acq = coords
+            .len()
+            .checked_mul(traces_per_point)
+            .ok_or_else(|| format!("Varian 3D NUS trace count overflow in {}", dir.display()))?;
         if bin.traces.len() != expected_acq {
             if allow_truncated_fid && !bin.traces.is_empty() && bin.traces.len() < expected_acq {
                 warn_truncated_fid(dir, bin.traces.len(), expected_acq);
@@ -4450,7 +5254,13 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
                 ));
             }
         }
-        let mut counts = vec![0usize; ni2 * ni];
+        let total_cplx =
+            checked_fid_complex_len(&[ni2, 2, ni, 2, n0], truncated_traces.is_some(), &dir_ctx)?;
+        let ni2_ni = ni2
+            .checked_mul(ni)
+            .ok_or_else(|| format!("Varian 3D NUS mask size overflow in {}", dir.display()))?;
+        let mut data = vec![[0.0, 0.0]; total_cplx];
+        let mut counts = vec![0usize; ni2_ni];
         for (row_idx, &(k1, k2)) in coords.iter().enumerate() {
             let base_tr = row_idx * traces_per_point;
             if base_tr >= bin.traces.len() {
@@ -4499,16 +5309,19 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
                 }
             }
         }
-        Some(counts.into_iter().map(|c| c > 0).collect())
+        (data, Some(counts.into_iter().map(|c| c > 0).collect()))
     } else {
         if let Some(sp) = sched_file {
             let coords = parse_nus_schedule_2d(&sp, ni, ni2, true)?;
-            if coords.len() * traces_per_point != bin.traces.len() {
+            let sched_traces = coords
+                .len()
+                .checked_mul(traces_per_point)
+                .ok_or_else(|| format!("Varian 3D schedule trace overflow in {}", sp.display()))?;
+            if sched_traces != bin.traces.len() {
                 return Err(format!(
-                    "Varian 3D schedule {} has {} points ({} traces) inconsistent with fid trace count {}",
+                    "Varian 3D schedule {} has {} points ({sched_traces} traces) inconsistent with fid trace count {}",
                     sp.display(),
                     coords.len(),
-                    coords.len() * traces_per_point,
                     bin.traces.len()
                 ));
             }
@@ -4524,6 +5337,9 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
             warn_truncated_fid(dir, bin.traces.len(), uniform_traces);
             truncated_traces = Some((bin.traces.len(), uniform_traces));
         }
+        let total_cplx =
+            checked_fid_complex_len(&[ni2, 2, ni, 2, n0], truncated_traces.is_some(), &dir_ctx)?;
+        let mut data = vec![[0.0, 0.0]; total_cplx];
 
         'outer_3d: for k2 in 0..ni2 {
             for k1 in 0..ni {
@@ -4562,7 +5378,7 @@ fn read_varian_fid_auto_opts(dir: &Path, allow_truncated_fid: bool) -> Result<Ra
                 );
             }
         }
-        None
+        (data, None)
     };
 
     Ok(RawFid::Dim3(Fid3D {

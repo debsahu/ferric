@@ -1,6 +1,6 @@
 use std::f64::consts::PI;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use nmr_core::fid::{
     bruker_dsp_group_delay, find_child_ci, read_bruker_fid_1d, read_bruker_fid_2d,
@@ -817,96 +817,99 @@ sparse 2 2 8 0 0 2 1 1 1 18
 #[test]
 fn real_data_ubiquitin_and_cisd3_smoke_and_quadrature_verification() {
     // 1. Ubiquitin Echo-Antiecho (`FnMODE = 6`) verification against `pdata/1/2rr`
-    let ubi_hsqc =
-        Path::new("/Users/debsahu/Workspace/nmr_software/data/ubiquitin/Ubiquitin_090309/2");
-    if ubi_hsqc.join("ser").is_file() && ubi_hsqc.join("pdata/1/2rr").is_file() {
-        let fid2 = read_fid_2d(ubi_hsqc).expect("read Ubiquitin 15N-HSQC raw FID");
-        assert!(fid2.nus_mask.is_none());
-        assert_eq!(fid2.axis_y.quad_mode, QuadMode::EchoAntiecho);
-        assert_eq!(fid2.axis_x.complex_points, 1024);
-        assert_eq!(fid2.axis_y.complex_points, 128);
+    if let Some(ubi_root) = discover_ubiquitin_data_root() {
+        let ubi_hsqc = ubi_root.join("Ubiquitin_090309/2");
+        if ubi_hsqc.join("ser").is_file() && ubi_hsqc.join("pdata/1/2rr").is_file() {
+            let fid2 = read_fid_2d(&ubi_hsqc).expect("read Ubiquitin 15N-HSQC raw FID");
+            assert!(fid2.nus_mask.is_none());
+            assert_eq!(fid2.axis_y.quad_mode, QuadMode::EchoAntiecho);
+            assert_eq!(fid2.axis_x.complex_points, 1024);
+            assert_eq!(fid2.axis_y.complex_points, 128);
 
-        let pdata2 = read_bruker_pdata_2d(ubi_hsqc.join("pdata/1")).expect("read Ubiquitin 2rr");
-        let si_x = fid2.axis_x.stored_proc.si.unwrap_or(2048);
-        let si_y = fid2.axis_y.stored_proc.si.unwrap_or(256);
-        let p0_x = fid2.axis_x.stored_proc.p0_deg.unwrap_or(0.0);
-        let p1_x = fid2.axis_x.stored_proc.p1_deg.unwrap_or(0.0);
-        let p0_y = fid2.axis_y.stored_proc.p0_deg.unwrap_or(0.0);
-        let p1_y = fid2.axis_y.stored_proc.p1_deg.unwrap_or(0.0);
+            let pdata2 =
+                read_bruker_pdata_2d(ubi_hsqc.join("pdata/1")).expect("read Ubiquitin 2rr");
+            let si_x = fid2.axis_x.stored_proc.si.unwrap_or(2048);
+            let si_y = fid2.axis_y.stored_proc.si.unwrap_or(256);
+            let p0_x = fid2.axis_x.stored_proc.p0_deg.unwrap_or(0.0);
+            let p1_x = fid2.axis_x.stored_proc.p1_deg.unwrap_or(0.0);
+            let p0_y = fid2.axis_y.stored_proc.p0_deg.unwrap_or(0.0);
+            let p1_y = fid2.axis_y.stored_proc.p1_deg.unwrap_or(0.0);
 
-        // Transform direct dimension for all 128 cos/sin pairs
-        let n1 = fid2.axis_y.complex_points;
-        let mut x_cos = Vec::with_capacity(n1);
-        let mut x_sin = Vec::with_capacity(n1);
-        for k1 in 0..n1 {
-            x_cos.push(transform_bruker_direct_trace(
-                fid2.trace(k1, 0),
-                si_x,
-                fid2.axis_x.group_delay,
-                p0_x,
-                p1_x,
-            ));
-            x_sin.push(transform_bruker_direct_trace(
-                fid2.trace(k1, 1),
-                si_x,
-                fid2.axis_x.group_delay,
-                p0_x,
-                p1_x,
-            ));
-        }
+            // Transform direct dimension for all 128 cos/sin pairs
+            let n1 = fid2.axis_y.complex_points;
+            let mut x_cos = Vec::with_capacity(n1);
+            let mut x_sin = Vec::with_capacity(n1);
+            for k1 in 0..n1 {
+                x_cos.push(transform_bruker_direct_trace(
+                    fid2.trace(k1, 0),
+                    si_x,
+                    fid2.axis_x.group_delay,
+                    p0_x,
+                    p1_x,
+                ));
+                x_sin.push(transform_bruker_direct_trace(
+                    fid2.trace(k1, 1),
+                    si_x,
+                    fid2.axis_x.group_delay,
+                    p0_x,
+                    p1_x,
+                ));
+            }
 
-        // Find global amide peak (`ix` in downfield half `0 .. si_x / 2`) in `pdata/1/2rr`
-        let mut pdata_best = (0usize, 0usize, f32::NEG_INFINITY);
-        for iy in 0..pdata2.ny() {
-            for ix in (si_x / 8)..(si_x / 2) {
-                let v = pdata2.get(ix, iy);
-                if v > pdata_best.2 {
-                    pdata_best = (ix, iy, v);
+            // Find global amide peak (`ix` in downfield half `0 .. si_x / 2`) in `pdata/1/2rr`
+            let mut pdata_best = (0usize, 0usize, f32::NEG_INFINITY);
+            for iy in 0..pdata2.ny() {
+                for ix in (si_x / 8)..(si_x / 2) {
+                    let v = pdata2.get(ix, iy);
+                    if v > pdata_best.2 {
+                        pdata_best = (ix, iy, v);
+                    }
                 }
             }
-        }
 
-        // Transform indirect `15N` column at `ix = pdata_best.0` and verify peak `iy` & positive sign!
-        let ix_test = pdata_best.0;
-        let mut col = vec![[0.0, 0.0]; si_y];
-        for k1 in 0..n1 {
-            col[k1] = [x_cos[k1][ix_test], -x_sin[k1][ix_test]];
-        }
-        col[0][0] *= 0.5;
-        col[0][1] *= 0.5;
-        fft_radix2_forward(&mut col);
-        fftshift_in_place(&mut col);
-
-        let mut fid_best_iy = 0usize;
-        let mut fid_best_val = f64::NEG_INFINITY;
-        for (iy, c) in col.iter().enumerate() {
-            let phi = (p0_y + p1_y * ((iy as f64) / (si_y as f64))).to_radians();
-            let val = c[0] * phi.cos() - c[1] * phi.sin();
-            if val > fid_best_val {
-                fid_best_val = val;
-                fid_best_iy = iy;
+            // Transform indirect `15N` column at `ix = pdata_best.0` and verify peak `iy` & positive sign!
+            let ix_test = pdata_best.0;
+            let mut col = vec![[0.0, 0.0]; si_y];
+            for k1 in 0..n1 {
+                col[k1] = [x_cos[k1][ix_test], -x_sin[k1][ix_test]];
             }
-        }
-        assert!(
-            fid_best_val > 0.0 && fid_best_iy.abs_diff(pdata_best.1) <= 1,
-            "Ubiquitin Echo-Antiecho peak mismatch: fid iy={fid_best_iy} (val={fid_best_val}), pdata iy={}",
-            pdata_best.1
-        );
+            col[0][0] *= 0.5;
+            col[0][1] *= 0.5;
+            fft_radix2_forward(&mut col);
+            fftshift_in_place(&mut col);
 
-        // Smoke-read Ubiquitin 3D uniform Echo-Antiecho `ser` (`3` HNCACB) if present
-        let ubi_hncacb =
-            Path::new("/Users/debsahu/Workspace/nmr_software/data/ubiquitin/Ubiquitin_090309/3");
-        if ubi_hncacb.join("ser").is_file() {
-            let f3 = read_fid_3d(ubi_hncacb).expect("read Ubiquitin 3D HNCACB ser");
-            assert!(f3.nus_mask.is_none());
-            assert_eq!(f3.axis_y.quad_mode, QuadMode::EchoAntiecho);
-            assert_eq!(f3.axis_z.quad_mode, QuadMode::StatesTppi);
+            let mut fid_best_iy = 0usize;
+            let mut fid_best_val = f64::NEG_INFINITY;
+            for (iy, c) in col.iter().enumerate() {
+                let phi = (p0_y + p1_y * ((iy as f64) / (si_y as f64))).to_radians();
+                let val = c[0] * phi.cos() - c[1] * phi.sin();
+                if val > fid_best_val {
+                    fid_best_val = val;
+                    fid_best_iy = iy;
+                }
+            }
+            assert!(
+                fid_best_val > 0.0 && fid_best_iy.abs_diff(pdata_best.1) <= 1,
+                "Ubiquitin Echo-Antiecho peak mismatch: fid iy={fid_best_iy} (val={fid_best_val}), pdata iy={}",
+                pdata_best.1
+            );
+
+            // Smoke-read Ubiquitin 3D uniform Echo-Antiecho `ser` (`3` HNCACB) if present
+            let ubi_hncacb = ubi_root.join("Ubiquitin_090309/3");
+            if ubi_hncacb.join("ser").is_file() {
+                let f3 = read_fid_3d(&ubi_hncacb).expect("read Ubiquitin 3D HNCACB ser");
+                assert!(f3.nus_mask.is_none());
+                assert_eq!(f3.axis_y.quad_mode, QuadMode::EchoAntiecho);
+                assert_eq!(f3.axis_z.quad_mode, QuadMode::StatesTppi);
+            }
         }
     }
 
     // 2. CISD3 TopSpin 4 uniform guard (`CISD3_HNCA`) + 3D NUS (`CISD3_CBCACONH`) vs `pdata/1/3rrr`
-    let cisd3_root =
-        Path::new("/Users/debsahu/Workspace/nmr_software/data/private/bmrb51439_cisd3");
+    let Some(priv_root) = discover_private_data_root() else {
+        return;
+    };
+    let cisd3_root = priv_root.join("bmrb51439_cisd3");
     let cisd3_hnca = cisd3_root.join("CISD3_HNCA");
     if cisd3_hnca.join("ser").is_file() {
         let hnca = read_fid_3d(&cisd3_hnca).expect("read CISD3_HNCA uniform TopSpin 4 3D");
@@ -2050,4 +2053,700 @@ f2coef 2 2 32 0 0 2 1 1 1 17
     assert!(vrec2.truncated_fid_zero_filled);
 
     let _ = fs::remove_dir_all(&vdir);
+}
+
+fn discover_ubiquitin_data_root() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("NMR_REAL_DATA_DIR") {
+        let base = PathBuf::from(p);
+        let cand = base.join("ubiquitin");
+        if cand.is_dir() {
+            return Some(cand);
+        }
+        if base.is_dir() {
+            return Some(base);
+        }
+    }
+    let manifest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let direct = manifest_root.join("../../data/ubiquitin");
+    if direct.is_dir() {
+        return Some(direct);
+    }
+    let dot_git = manifest_root.join("../../.git");
+    if dot_git.is_file() {
+        if let Ok(txt) = fs::read_to_string(&dot_git) {
+            if let Some(gitdir) = txt.trim().strip_prefix("gitdir:") {
+                let gp = PathBuf::from(gitdir.trim());
+                if let Some(main_root) = gp
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                {
+                    let cand = main_root.join("data/ubiquitin");
+                    if cand.is_dir() {
+                        return Some(cand);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn discover_private_data_root() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("NMR_ASSIGN_PRIVATE_DATA_DIR") {
+        let pb = PathBuf::from(p);
+        if pb.is_dir() {
+            return Some(pb);
+        }
+    }
+    let manifest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let direct = manifest_root.join("../../data/private");
+    if direct.is_dir() {
+        return Some(direct);
+    }
+    let dot_git = manifest_root.join("../../.git");
+    if dot_git.is_file() {
+        if let Ok(txt) = fs::read_to_string(&dot_git) {
+            if let Some(gitdir) = txt.trim().strip_prefix("gitdir:") {
+                let gp = PathBuf::from(gitdir.trim());
+                if let Some(main_root) = gp
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                {
+                    let cand = main_root.join("data/private");
+                    if cand.is_dir() {
+                        return Some(cand);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn pearson_r_complex(a: &[[f64; 2]], b: &[[f64; 2]]) -> f64 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let mut num = 0.0_f64;
+    let mut da = 0.0_f64;
+    let mut db = 0.0_f64;
+    for i in 0..n {
+        let (ar, ai) = (a[i][0], a[i][1]);
+        let (br, bi) = (b[i][0], b[i][1]);
+        num += ar * br + ai * bi;
+        da += ar * ar + ai * ai;
+        db += br * br + bi * bi;
+    }
+    if da <= 0.0 || db <= 0.0 {
+        0.0
+    } else {
+        num / (da * db).sqrt()
+    }
+}
+
+fn pearson_r_f32(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let mut num = 0.0_f64;
+    let mut da = 0.0_f64;
+    let mut db = 0.0_f64;
+    for i in 0..n {
+        let av = a[i] as f64;
+        let bv = b[i] as f64;
+        num += av * bv;
+        da += av * av;
+        db += bv * bv;
+    }
+    if da <= 0.0 || db <= 0.0 {
+        0.0
+    } else {
+        num / (da * db).sqrt()
+    }
+}
+
+#[test]
+fn v0150_p0_1_and_p1_4_real_bruker_ipap_2d_con_splitcomb_parity_and_l0_order() {
+    use nmr_core::fid::read_bruker_fid_2d_from_bytes;
+
+    // 1. Self-contained unit test mirroring real Bruker TopSpin 2.1 `c_con_iasq`:
+    //    `acqu2s` has `##$TD= 256` (counting IP + AP, with NO `##$FnILOOP`),
+    //    `ser` = 256 * 4096 B = 1,048,576 B, `CNST25 = 53.8` Hz (`1/(4*cnst25)`),
+    //    and `l0` branch parity `"l0=1"` + `if "l0 %2 == 1"`.
+    let bf_c = 125.757789_f64;
+    let sfo_c = 125.7794202_f64;
+    let sw_c_hz = 3019.32367149758_f64;
+    let sw_c_ppm = sw_c_hz / sfo_c;
+    let grpdly = 67.9843292236328_f64;
+
+    let bf_n = 50.677733_f64;
+    let sfo_n = 50.6867527_f64;
+    let sw_n_hz = 2000.03756592874_f64;
+    let sw_n_ppm = sw_n_hz / sfo_n;
+
+    let n0 = 512usize; // TD(F2) = 1024 i32 words
+    let n1 = 64usize; // post-IPAP TD1 = 128 -> 64 complex States-TPPI t1 increments; raw acqu2s.TD = 256!
+    let j_caco = 53.8_f64;
+    let ap_scale = 1.04_f64;
+
+    let build_ser = |ip_first: bool| -> (Vec<u8>, Vec<u8>) {
+        let mut raw_ser = Vec::with_capacity(256 * n0 * 2 * 4);
+        let mut sc_ser = Vec::with_capacity(128 * n0 * 2 * 4);
+        for k1 in 0..n1 {
+            let t1 = (k1 as f64) / sw_n_hz;
+            let tppi = if k1 % 2 == 1 { -1.0 } else { 1.0 };
+            for q in 0..2usize {
+                let mut ip_trace = vec![[0i32; 2]; n0];
+                let mut ap_trace = vec![[0i32; 2]; n0];
+                for k0 in 0..n0 {
+                    if (k0 as f64) >= grpdly {
+                        let t2 = ((k0 as f64) - grpdly) / sw_c_hz;
+                        let env = (-std::f64::consts::PI * 5.0 * t2).exp()
+                            * (-std::f64::consts::PI * 4.0 * t1).exp();
+                        let wn = if q == 0 {
+                            (2.0 * std::f64::consts::PI * 180.0 * t1).cos()
+                        } else {
+                            (2.0 * std::f64::consts::PI * 180.0 * t1).sin()
+                        };
+                        let ang = 2.0 * std::f64::consts::PI * 240.0 * t2 - 2.1;
+                        let (sa, ca) = ang.sin_cos();
+                        let base_amp = 4000.0 * tppi * wn * env;
+                        let c_j = (std::f64::consts::PI * j_caco * t2).cos();
+                        let s_j = (std::f64::consts::PI * j_caco * t2).sin();
+                        ip_trace[k0] = [
+                            (base_amp * c_j * ca).round() as i32,
+                            (base_amp * c_j * sa).round() as i32,
+                        ];
+                        // AP carries 1/ap_scale and -i phase so ap_scale * i * AP * sin + IP * cos recombines
+                        let ap_amp = base_amp * s_j / ap_scale;
+                        ap_trace[k0] =
+                            [(ap_amp * sa).round() as i32, (-ap_amp * ca).round() as i32];
+                    }
+                    let t = ((k0 as f64) - grpdly) / sw_c_hz;
+                    let cj = (std::f64::consts::PI * j_caco * t).cos();
+                    let sj = (std::f64::consts::PI * j_caco * t).sin();
+                    let sc_re = (2.0
+                        * ((ip_trace[k0][0] as f64) * cj
+                            - ap_scale * (ap_trace[k0][1] as f64) * sj))
+                        .round() as i32;
+                    let sc_im = (2.0
+                        * ((ip_trace[k0][1] as f64) * cj
+                            + ap_scale * (ap_trace[k0][0] as f64) * sj))
+                        .round() as i32;
+                    sc_ser.extend_from_slice(&sc_re.to_le_bytes());
+                    sc_ser.extend_from_slice(&sc_im.to_le_bytes());
+                }
+                let (first_tr, second_tr) = if ip_first {
+                    (&ip_trace, &ap_trace)
+                } else {
+                    (&ap_trace, &ip_trace)
+                };
+                for &[r, im] in first_tr {
+                    raw_ser.extend_from_slice(&r.to_le_bytes());
+                    raw_ser.extend_from_slice(&im.to_le_bytes());
+                }
+                for &[r, im] in second_tr {
+                    raw_ser.extend_from_slice(&r.to_le_bytes());
+                    raw_ser.extend_from_slice(&im.to_le_bytes());
+                }
+            }
+        }
+        (raw_ser, sc_ser)
+    };
+
+    let mut cnst_arr = vec!["0".to_string(); 64];
+    cnst_arr[25] = "53.8".to_string();
+    let acqus_txt = format!(
+        "##$PULPROG= <c_con_iasq>\n##$NUC1= <13C>\n##$BF1= {bf_c:.8}\n##$SFO1= {sfo_c:.9}\n##$SW= {sw_c_ppm:.10}\n##$SW_h= {sw_c_hz:.10}\n##$TD= 1024\n##$AQ_mod= 3\n##$GRPDLY= {grpdly}\n##$BYTORDA= 0\n##$DTYPA= 0\n##$CNST= (0..63)\n{}\n",
+        cnst_arr.join(" ")
+    );
+    // Real Bruker TopSpin acqu2s: TD = 256 (already includes IP + AP) and NO FnILOOP!
+    let acqu2s_raw_txt = format!(
+        "##$NUC1= <15N>\n##$BF1= {bf_n:.8}\n##$SFO1= {sfo_n:.9}\n##$SW= {sw_n_ppm:.10}\n##$SW_h= {sw_n_hz:.10}\n##$TD= 256\n##$FnMODE= 5\n"
+    );
+    let acqu2s_sc_txt = format!(
+        "$$ process /opt/topspin/prog/au/bin/splitcomb\n##$NUC1= <15N>\n##$BF1= {bf_n:.8}\n##$SFO1= {sfo_n:.9}\n##$SW= {sw_n_ppm:.10}\n##$SW_h= {sw_n_hz:.10}\n##$TD= 128\n##$FnMODE= 5\n"
+    );
+
+    for (ip_first, l0_init_str) in [(true, "\"l0=1\""), (false, "\"l0=0\"")] {
+        let (raw_ser, sc_ser) = build_ser(ip_first);
+        let pp_txt = format!(
+            ";c_con_iasq\n;using IPAP scheme for virtual decoupling\n\"d22=1/(4*cnst25)\"\n{l0_init_str}\n\"ST1CNT = td1 / (2 * 2)\"\n(p21 ph3):f3\nd0\n(p22 ph1):f3\nDELTA\n(p21 ph4):f3\nif \"l0 %2 == 1\"\n{{\n(p11:sp23 ph1)\nDELTA1\n}}\nelse\n{{\n(p11:sp23 ph6)\nd22\n}}\nMCWRK wr #0 if #0 zd iu0\nlo to LBLF1I1 times 2\nMCWRK ip3\nlo to LBLSTS1 times 2\nMCWRK id0\nlo to LBLF1 times ST1CNT\n;use AU-program splitcomb [ipap 2] to process data\n"
+        );
+        let fid_raw = read_bruker_fid_2d_from_bytes(
+            "raw_con_ipap",
+            &acqus_txt,
+            None,
+            &acqu2s_raw_txt,
+            None,
+            None,
+            None,
+            Some(&pp_txt),
+            None,
+            &raw_ser,
+            false,
+        )
+        .expect("decode raw Bruker IPAP 2D ser with TD1=256");
+        let fid_sc = read_bruker_fid_2d_from_bytes(
+            "sc_con_ipap",
+            &acqus_txt,
+            None,
+            &acqu2s_sc_txt,
+            None,
+            None,
+            None,
+            Some(&pp_txt),
+            None,
+            &sc_ser,
+            false,
+        )
+        .expect("decode splitcomb 2D ser with TD1=128");
+
+        assert_eq!(
+            fid_raw.axis_y.complex_points, 64,
+            "unsplit IPAP TD1=256 must yield post-IPAP TD1/2=128 and complex n1=TD1/4=64 (ip_first={ip_first})"
+        );
+        assert_eq!(fid_sc.axis_y.complex_points, 64);
+        let r_unit = pearson_r_complex(&fid_raw.data, &fid_sc.data);
+        assert!(
+            r_unit >= 0.9999,
+            "synthetic TD1=256 IPAP (ip_first={ip_first}) correlation with splitcomb must be >= 0.9999, got {r_unit:.6}"
+        );
+    }
+
+    // 2. Real Bruker TopSpin ubiquitin IPAP raw vs `splitcomb` pairs (`r >= 0.999`, `n1 = 64`):
+    if let Some(ubi_root) = discover_ubiquitin_data_root() {
+        let pairs = [
+            ("ubiquitin_08212009/2", "ubiquitin_08212009/10002", 64usize),
+            ("ubiquitin_08212009/4", "ubiquitin_08212009/10004", 64usize),
+            ("Ubiquitin_111909/3", "Ubiquitin_111909/10003", 64usize),
+            ("Ubiquitin_111909/4", "Ubiquitin_111909/10004", 64usize),
+            ("Ubiquitin_111909/5", "Ubiquitin_111909/10005", 64usize),
+            ("Ubiquitin_111909/6", "Ubiquitin_111909/10006", 64usize),
+        ];
+        for (raw_rel, sc_rel, expected_n1) in pairs {
+            let raw_dir = ubi_root.join(raw_rel);
+            let sc_dir = ubi_root.join(sc_rel);
+            if !raw_dir.join("ser").is_file() || !sc_dir.join("ser").is_file() {
+                continue;
+            }
+            let fid_raw = read_bruker_fid_2d(&raw_dir)
+                .unwrap_or_else(|e| panic!("failed to read raw IPAP {raw_rel}: {e}"));
+            let fid_sc = read_bruker_fid_2d(&sc_dir)
+                .unwrap_or_else(|e| panic!("failed to read splitcomb {sc_rel}: {e}"));
+            assert_eq!(
+                fid_raw.axis_y.complex_points, expected_n1,
+                "{raw_rel} post-IPAP complex t1 points must be {expected_n1}"
+            );
+            assert_eq!(fid_sc.axis_y.complex_points, expected_n1);
+            let r_td = pearson_r_complex(&fid_raw.data, &fid_sc.data);
+            assert!(
+                r_td >= 0.999,
+                "{raw_rel} vs {sc_rel} time-domain Pearson r={r_td:.6} < 0.999"
+            );
+
+            let (spec_raw, _) = process_fid_dir_2d(&raw_dir, false, false)
+                .unwrap_or_else(|e| panic!("failed to process raw IPAP {raw_rel}: {e}"));
+            let (spec_sc, _) = process_fid_dir_2d(&sc_dir, false, false)
+                .unwrap_or_else(|e| panic!("failed to process splitcomb {sc_rel}: {e}"));
+            assert_eq!(
+                (spec_raw.nx(), spec_raw.ny()),
+                (spec_sc.nx(), spec_sc.ny()),
+                "{raw_rel} vs {sc_rel} processed 2D dimensions must match"
+            );
+            let r_fd = pearson_r_f32(&spec_raw.data, &spec_sc.data);
+            println!(
+                "[S7 IPAP parity] {raw_rel} vs {sc_rel}: n1={}, nx={}x{}, r_td={r_td:.6}, r_fd={r_fd:.6}",
+                fid_raw.axis_y.complex_points,
+                spec_raw.nx(),
+                spec_raw.ny()
+            );
+            assert!(
+                r_fd >= 0.999,
+                "{raw_rel} vs {sc_rel} processed 2D spectrum Pearson r={r_fd:.6} < 0.999"
+            );
+        }
+    }
+}
+
+#[test]
+fn v0150_p0_2_hostile_oversized_fid_headers_reject_before_allocation() {
+    use nmr_core::fid::{
+        read_bruker_fid_1d_from_bytes, read_bruker_fid_2d_from_bytes, read_bruker_fid_3d_from_bytes,
+    };
+
+    // 1. Hostile Bruker 2D header declaring 65536 x 65536 (which would allocate 34.36 GiB at fid.rs:1853/2550)
+    //    or 2^32 x 2^32 (which wraps usize multiplication without checked_mul!) on a 64-byte payload.
+    for &(td0, td1) in &[(1usize << 32, 1usize << 32), (65536usize, 65536usize)] {
+        let acqus = format!(
+            "##$PULPROG= <hsqcetf3gpsi>\n##$NUC1= <1H>\n##$BF1= 600.13\n##$SFO1= 600.1328\n##$SW= 13.33\n##$SW_h= 8000.0\n##$TD= {td0}\n##$AQ_mod= 3\n##$GRPDLY= 68\n##$BYTORDA= 0\n##$DTYPA= 0\n"
+        );
+        let acqu2s = format!(
+            "##$NUC1= <15N>\n##$BF1= 60.81\n##$SFO1= 60.818\n##$SW= 32.0\n##$SW_h= 1946.0\n##$TD= {td1}\n##$FnMODE= 6\n"
+        );
+        let res = read_bruker_fid_2d_from_bytes(
+            "hostile_2d",
+            &acqus,
+            None,
+            &acqu2s,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[0u8; 64],
+            false,
+        );
+        assert!(
+            res.is_err(),
+            "hostile 2D header TD=({td0}, {td1}) must fail closed before allocation"
+        );
+    }
+
+    // 2. Hostile Bruker 3D header declaring 4096 x 2048 x 2048 (> 137 GiB) on a 64-byte payload.
+    let acqus_3d = "##$PULPROG= <hncacbgp3d>\n##$NUC1= <1H>\n##$BF1= 600.13\n##$SFO1= 600.1328\n##$SW= 13.33\n##$SW_h= 8000.0\n##$TD= 4096\n##$AQ_mod= 3\n##$GRPDLY= 68\n##$BYTORDA= 0\n##$DTYPA= 0\n";
+    let acqu2s_3d =
+        "##$NUC1= <15N>\n##$BF1= 60.81\n##$SFO1= 60.818\n##$SW= 32.0\n##$SW_h= 1946.0\n##$TD= 2048\n##$FnMODE= 6\n";
+    let acqu3s_3d =
+        "##$NUC1= <13C>\n##$BF1= 150.90\n##$SFO1= 150.91\n##$SW= 60.0\n##$SW_h= 9054.0\n##$TD= 2048\n##$FnMODE= 4\n";
+    assert!(
+        read_bruker_fid_3d_from_bytes(
+            "hostile_3d",
+            acqus_3d,
+            None,
+            acqu2s_3d,
+            None,
+            acqu3s_3d,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[0u8; 64],
+            false,
+        )
+        .is_err(),
+        "hostile 3D header must fail closed before allocation"
+    );
+
+    // 3. Hostile Bruker 1D header with TD = 1 << 30 on a 64-byte payload.
+    let acqus_1d = "##$PULPROG= <zg>\n##$NUC1= <1H>\n##$BF1= 600.13\n##$SFO1= 600.1328\n##$SW= 13.33\n##$SW_h= 8000.0\n##$TD= 1073741824\n##$AQ_mod= 3\n##$GRPDLY= 68\n##$BYTORDA= 0\n##$DTYPA= 0\n";
+    assert!(read_bruker_fid_1d_from_bytes("hostile_1d", acqus_1d, None, None, &[0u8; 64]).is_err());
+
+    // 4. Directory-based `read_bruker_fid_2d` / `read_bruker_fid_2d_opts` (`fid.rs:2550`) and `read_bruker_fid_3d`:
+    //    hostile `TD` headers with a 4 KiB `ser` must fail closed BEFORE `vec!` allocation (including `--allow-truncated-fid`).
+    let dir_b2 = temp_test_dir("hostile_bruker_dir_2d");
+    fs::write(
+        dir_b2.join("acqus"),
+        "##$PULPROG= <hsqcetf3gpsi>\n##$NUC1= <1H>\n##$BF1= 600.13\n##$SFO1= 600.1328\n##$SW= 13.33\n##$SW_h= 8000.0\n##$TD= 65536\n##$AQ_mod= 3\n##$GRPDLY= 68\n##$BYTORDA= 0\n##$DTYPA= 0\n",
+    )
+    .unwrap();
+    fs::write(
+        dir_b2.join("acqu2s"),
+        "##$NUC1= <15N>\n##$BF1= 60.81\n##$SFO1= 60.818\n##$SW= 32.0\n##$SW_h= 1946.0\n##$TD= 65536\n##$FnMODE= 6\n",
+    )
+    .unwrap();
+    fs::write(dir_b2.join("ser"), vec![0u8; 4096]).unwrap();
+    assert!(
+        nmr_core::fid::read_bruker_fid_2d(&dir_b2).is_err(),
+        "directory read_bruker_fid_2d must reject 65536x65536 before allocating 34 GiB"
+    );
+    assert!(
+        nmr_core::fid::read_bruker_fid_2d_opts(&dir_b2, true).is_err(),
+        "allow_truncated_fid=true must also cap oversized truncated zero-fill grid"
+    );
+    let _ = fs::remove_dir_all(&dir_b2);
+
+    let dir_b3 = temp_test_dir("hostile_bruker_dir_3d");
+    fs::write(dir_b3.join("acqus"), acqus_3d).unwrap();
+    fs::write(dir_b3.join("acqu2s"), acqu2s_3d).unwrap();
+    fs::write(dir_b3.join("acqu3s"), acqu3s_3d).unwrap();
+    fs::write(dir_b3.join("ser"), vec![0u8; 4096]).unwrap();
+    assert!(nmr_core::fid::read_bruker_fid_3d(&dir_b3).is_err());
+    let _ = fs::remove_dir_all(&dir_b3);
+
+    // 5. Hostile Varian 2D/3D binary `fid` (`nblocks * bbytes` overflow & `np = 1 << 28`) and `procpar` (`ni = 1e12`).
+    let dir_v = temp_test_dir("hostile_varian_2d");
+    let procpar_hostile = concat!(
+        "sfrq 1 1 10000 0 0 2 1 1 1 64\n1 599.90\n0\n",
+        "sw 1 1 100000 0 0 2 1 1 1 64\n1 8000.0\n0\n",
+        "tn 2 2 8 0 0 2 1 1 1 64\n1 \"H1\"\n0\n",
+        "ni 1 1 100000 0 0 2 1 1 1 64\n1 1000000000000\n0\n",
+        "sw1 1 1 100000 0 0 2 1 1 1 64\n1 2000.0\n0\n",
+        "phase 1 1 10 0 0 2 1 1 1 64\n2 1 2\n0\n",
+    );
+    fs::write(dir_v.join("procpar"), procpar_hostile).unwrap();
+    // 32-byte Varian header + 1 short block (`np=16`, `ebytes=4`, `ntraces=1`, `nblocks=1`, `bbytes=92`, `status=S_DATA|S_32`)
+    let mut vhdr = Vec::with_capacity(124);
+    vhdr.extend_from_slice(&1i32.to_be_bytes()); // nblocks
+    vhdr.extend_from_slice(&1i32.to_be_bytes()); // ntraces
+    vhdr.extend_from_slice(&16i32.to_be_bytes()); // np
+    vhdr.extend_from_slice(&4i32.to_be_bytes()); // ebytes
+    vhdr.extend_from_slice(&64i32.to_be_bytes()); // tbytes
+    vhdr.extend_from_slice(&92i32.to_be_bytes()); // bbytes = 28 + 64
+    vhdr.extend_from_slice(&0i16.to_be_bytes()); // vers_id
+    vhdr.extend_from_slice(&0x0005u16.to_be_bytes()); // status = S_DATA | S_32
+    vhdr.extend_from_slice(&1i32.to_be_bytes()); // nbheaders
+    vhdr.resize(124, 0u8);
+    fs::write(dir_v.join("fid"), &vhdr).unwrap();
+    assert!(
+        read_fid_2d(&dir_v).is_err(),
+        "hostile Varian procpar ni=1e12 must fail closed before allocation"
+    );
+    // Also corrupt Varian binary header `nblocks = i32::MAX, bbytes = i32::MAX`
+    let mut vhdr_overflow = vhdr.clone();
+    vhdr_overflow[0..4].copy_from_slice(&i32::MAX.to_be_bytes());
+    vhdr_overflow[20..24].copy_from_slice(&i32::MAX.to_be_bytes());
+    fs::write(dir_v.join("fid"), &vhdr_overflow).unwrap();
+    assert!(
+        nmr_core::fid::read_fid_2d_opts(&dir_v, true).is_err(),
+        "hostile Varian binary header nblocks*bbytes overflow must fail closed"
+    );
+    let _ = fs::remove_dir_all(&dir_v);
+}
+
+#[test]
+fn v0150_p2_strip_transformed_procs_53280_625_and_ipap_strip_procs_and_overrides() {
+    use nmr_core::fid::{
+        read_bruker_fid_1d_from_bytes, read_bruker_fid_2d_from_bytes, StoredWindowHint,
+    };
+    use nmr_core::process::{process_fid_dir_2d_with_ipap, IpapOverrideOptions};
+
+    // 1. Strip-transformed Bruker `procs` regression (`BMRB 53280/625` parameters):
+    //    `acqus`: `SW_h = 11029.4117647059`, `TD = 2048`, `SFO1 = 850.2310018`, `BF1 = 850.2269367`
+    //    `procs`: `FTSIZE = 2048`, `SI = 480`, `STSI = 480`, `STSR = 250`,
+    //             `SW_p = 2585.018382353`, `OFFSET = 9.67538404877354`, `SF = 850.22693673`,
+    //             `PHC0 = 133.3344`, `PHC1 = 0`, `WDW = 4`, `SSB = 2`, `TDeff = 1400`.
+    //    Must NOT reject `procs` as a stale template (`SW_p * FTSIZE / STSI == SW_h`) AND must
+    //    reconstruct the full uncropped `first_ppm` (`OFFSET + STSR * SW_h / (SF * FTSIZE)` = 11.2586485 ppm)
+    //    while preserving `PHC0 = 133.3344`, `SquaredSineBell`, `si = 2048`, and `td_eff = 700`!
+    let acqus_53280 = concat!(
+        "##$PULPROG= <hncogp3d>\n",
+        "##$NUC1= <1H>\n",
+        "##$BF1= 850.2269367\n",
+        "##$SFO1= 850.2310018\n",
+        "##$SW= 12.9722532145963\n",
+        "##$SW_h= 11029.4117647059\n",
+        "##$TD= 2048\n",
+        "##$AQ_mod= 3\n",
+        "##$GRPDLY= 67.9862060546875\n",
+        "##$BYTORDA= 0\n",
+        "##$DTYPA= 0\n",
+    );
+    let procs_53280 = concat!(
+        "##$FT_mod= 6\n",
+        "##$FTSIZE= 2048\n",
+        "##$SI= 480\n",
+        "##$STSI= 480\n",
+        "##$STSR= 250\n",
+        "##$SW_p= 2585.018382353\n",
+        "##$OFFSET= 9.67538404877354\n",
+        "##$SF= 850.22693673\n",
+        "##$PHC0= 133.3344\n",
+        "##$PHC1= 0\n",
+        "##$PH_mod= 1\n",
+        "##$WDW= 4\n",
+        "##$SSB= 2\n",
+        "##$TDeff= 1400\n",
+    );
+    let fid1 = read_bruker_fid_1d_from_bytes(
+        "53280_625_strip",
+        acqus_53280,
+        None,
+        Some(procs_53280),
+        &vec![0u8; 2048 * 4],
+    )
+    .expect("read strip-transformed 53280/625 procs");
+    let expected_full_first_ppm =
+        9.67538404877354 + (250.0 / 2048.0) * (11029.4117647059 / 850.22693673);
+    assert!(
+        (fid1.axis_x.first_ppm - expected_full_first_ppm).abs() < 1e-4,
+        "uncropped first_ppm must reconstruct from OFFSET + STSR*SW_h/(SF*FTSIZE): got {}, expected {expected_full_first_ppm}",
+        fid1.axis_x.first_ppm
+    );
+    assert_eq!(fid1.axis_x.stored_proc.si, Some(2048));
+    assert_eq!(fid1.axis_x.stored_proc.td_eff, Some(700));
+    assert_eq!(fid1.axis_x.stored_proc.p0_deg, Some(133.3344));
+    assert_eq!(
+        fid1.axis_x.stored_proc.window,
+        Some(StoredWindowHint::SquaredSineBell {
+            offset_pi_frac: 0.5
+        })
+    );
+
+    if let Some(priv_root) = discover_private_data_root() {
+        let real_625 = priv_root.join("bmrb/53280/625");
+        if real_625.join("ser").is_file() {
+            let f3 = read_fid_3d(&real_625).expect("read real BMRB 53280/625 3D FID");
+            assert!(
+                (f3.axis_x.first_ppm - expected_full_first_ppm).abs() < 1e-4,
+                "real 53280/625 direct axis first_ppm={} vs expected {expected_full_first_ppm}",
+                f3.axis_x.first_ppm
+            );
+            assert_eq!(f3.axis_x.stored_proc.p0_deg, Some(133.3344));
+            assert_eq!(f3.axis_x.stored_proc.si, Some(2048));
+            assert_eq!(f3.axis_x.stored_proc.td_eff, Some(700));
+        }
+    }
+
+    // 2. IPAP 2D `c_con_iasq` (`TD1 = 256`, no `FnILOOP`) with strip-transformed `13C` `procs`
+    //    AND explicit `IpapOverrideOptions` (`j_caco_hz`, `ap_scale`, `ip_first`) via `process_fid_dir_2d_with_ipap`.
+    let bf_c = 125.757789_f64;
+    let sfo_c = 125.7794202_f64;
+    let sw_c_hz = 3019.32367149758_f64;
+    let sw_c_ppm = sw_c_hz / sfo_c;
+    let grpdly = 68.0_f64;
+    let bf_n = 50.677733_f64;
+    let sfo_n = 50.6867527_f64;
+    let sw_n_hz = 2000.03756592874_f64;
+    let sw_n_ppm = sw_n_hz / sfo_n;
+
+    let ftsize_c = 2048usize;
+    let stsi_c = 512usize;
+    let stsr_c = 640usize;
+    let sw_p_strip = sw_c_hz * (stsi_c as f64) / (ftsize_c as f64);
+    let full_first_c = ((sfo_c - bf_c) * 1.0e6 + 0.5 * sw_c_hz) / bf_c;
+    let strip_offset_c = full_first_c - (stsr_c as f64 / ftsize_c as f64) * (sw_c_hz / bf_c);
+    let strip_procs_c = format!(
+        "##$FT_mod= 6\n##$FTSIZE= {ftsize_c}\n##$SI= {stsi_c}\n##$STSI= {stsi_c}\n##$STSR= {stsr_c}\n##$SW_p= {sw_p_strip:.10}\n##$OFFSET= {strip_offset_c:.10}\n##$SF= {bf_c:.8}\n##$PHC0= -120.0\n##$PHC1= 0.0\n##$PH_mod= 1\n##$WDW= 4\n##$SSB= 2\n"
+    );
+    let acqus_ipap = format!(
+        "##$PULPROG= <c_con_iasq>\n##$NUC1= <13C>\n##$BF1= {bf_c:.8}\n##$SFO1= {sfo_c:.9}\n##$SW= {sw_c_ppm:.10}\n##$SW_h= {sw_c_hz:.10}\n##$TD= 1024\n##$AQ_mod= 3\n##$GRPDLY= {grpdly}\n##$BYTORDA= 0\n##$DTYPA= 0\n"
+    );
+    let acqu2s_ipap = format!(
+        "##$NUC1= <15N>\n##$BF1= {bf_n:.8}\n##$SFO1= {sfo_n:.9}\n##$SW= {sw_n_ppm:.10}\n##$SW_h= {sw_n_hz:.10}\n##$TD= 256\n##$FnMODE= 5\n"
+    );
+    let custom_j = 56.2_f64;
+    let custom_scale = 1.15_f64;
+    let n0 = 512usize;
+    let n1 = 64usize;
+    let phi0 = (-120.0_f64).to_radians(); // Compensated by PHC0 = -120 deg
+    let mut ser_ap_first = Vec::with_capacity(256 * n0 * 2 * 4);
+    for k1 in 0..n1 {
+        let t1 = (k1 as f64) / sw_n_hz;
+        let tppi = if k1 % 2 == 1 { -1.0 } else { 1.0 };
+        for q in 0..2usize {
+            let mut ip_tr = vec![[0i32; 2]; n0];
+            let mut ap_tr = vec![[0i32; 2]; n0];
+            for k0 in 0..n0 {
+                if (k0 as f64) >= grpdly {
+                    let t2 = ((k0 as f64) - grpdly) / sw_c_hz;
+                    let env = (-std::f64::consts::PI * 5.0 * t2).exp()
+                        * (-std::f64::consts::PI * 4.0 * t1).exp();
+                    let wn = if q == 0 {
+                        (2.0 * std::f64::consts::PI * 150.0 * t1).cos()
+                    } else {
+                        (2.0 * std::f64::consts::PI * 150.0 * t1).sin()
+                    };
+                    let (sa, ca) = (2.0 * std::f64::consts::PI * 200.0 * t2 + phi0).sin_cos();
+                    let base = 5000.0 * tppi * wn * env;
+                    let cj = (std::f64::consts::PI * custom_j * t2).cos();
+                    let sj = (std::f64::consts::PI * custom_j * t2).sin() / custom_scale;
+                    ip_tr[k0] = [
+                        (base * cj * ca).round() as i32,
+                        (base * cj * sa).round() as i32,
+                    ];
+                    ap_tr[k0] = [
+                        (base * sj * sa).round() as i32,
+                        (-base * sj * ca).round() as i32,
+                    ];
+                }
+            }
+            // Write AP first (`ip_first = false`)
+            for &[r, im] in &ap_tr {
+                ser_ap_first.extend_from_slice(&r.to_le_bytes());
+                ser_ap_first.extend_from_slice(&im.to_le_bytes());
+            }
+            for &[r, im] in &ip_tr {
+                ser_ap_first.extend_from_slice(&r.to_le_bytes());
+                ser_ap_first.extend_from_slice(&im.to_le_bytes());
+            }
+        }
+    }
+
+    let fid_strip = read_bruker_fid_2d_from_bytes(
+        "ipap_strip",
+        &acqus_ipap,
+        None,
+        &acqu2s_ipap,
+        None,
+        Some(&strip_procs_c),
+        None,
+        None,
+        None,
+        &ser_ap_first,
+        false,
+    )
+    .expect("read IPAP 2D with strip-transformed procs");
+    assert_eq!(fid_strip.axis_y.complex_points, 64);
+    assert_eq!(fid_strip.axis_x.stored_proc.si, Some(ftsize_c));
+    assert_eq!(fid_strip.axis_x.stored_proc.p0_deg, Some(-120.0));
+    assert!(
+        (fid_strip.axis_x.first_ppm - full_first_c).abs() < 1e-4,
+        "IPAP strip-transformed procs must reconstruct uncropped 13C first_ppm={full_first_c}, got {}",
+        fid_strip.axis_x.first_ppm
+    );
+
+    let dir_ipap = temp_test_dir("ipap_override_dir");
+    fs::create_dir_all(dir_ipap.join("pdata/1")).unwrap();
+    fs::write(dir_ipap.join("acqus"), &acqus_ipap).unwrap();
+    fs::write(dir_ipap.join("acqu2s"), &acqu2s_ipap).unwrap();
+    fs::write(
+        dir_ipap.join("pulseprogram"),
+        ";c_con_iasq\n\"l0=1\"\n(p21 ph3):f3\nd0\n(p22 ph1):f3\nif \"l0 %2 == 1\"\n{\n}\nMCWRK ip3\nid0\n",
+    )
+    .unwrap();
+    fs::write(dir_ipap.join("pdata/1/procs"), &strip_procs_c).unwrap();
+    fs::write(dir_ipap.join("ser"), &ser_ap_first).unwrap();
+
+    // Note: pulseprogram says `"l0=1"` (`ip_first = true`), so passing `ip_first: Some(false)` verifies
+    // that explicit `IpapOverrideOptions` overrides both CNST/default J & scale AND pulseprogram l0 order!
+    let (spec_ovr, _) = process_fid_dir_2d_with_ipap(
+        &dir_ipap,
+        false,
+        false,
+        false,
+        IpapOverrideOptions {
+            j_caco_hz: Some(custom_j),
+            ap_scale: Some(custom_scale),
+            ip_first: Some(false),
+        },
+    )
+    .expect("process IPAP 2D with explicit J/scale/order overrides");
+    assert_eq!(spec_ovr.nx(), ftsize_c);
+    let target_c_ppm = (sfo_c - bf_c) * 1.0e6 / bf_c + 200.0 / bf_c;
+    let target_n_ppm = (sfo_n - bf_n) * 1.0e6 / bf_n + 150.0 / bf_n;
+    let ix_peak = spec_ovr.axis_x.ppm_to_index(target_c_ppm).round() as usize;
+    let iy_peak = spec_ovr.axis_y.ppm_to_index(target_n_ppm).round() as usize;
+    let mut apex = f32::NEG_INFINITY;
+    for dy in -1isize..=1 {
+        for dx in -2isize..=2 {
+            let v = spec_ovr.get(
+                (ix_peak as isize + dx).clamp(0, spec_ovr.nx() as isize - 1) as usize,
+                (iy_peak as isize + dy).clamp(0, spec_ovr.ny() as isize - 1) as usize,
+            );
+            apex = apex.max(v);
+        }
+    }
+    let split_ppm = 0.5 * custom_j / bf_c;
+    let ix_up = spec_ovr
+        .axis_x
+        .ppm_to_index(target_c_ppm + split_ppm)
+        .round() as usize;
+    let ix_dn = spec_ovr
+        .axis_x
+        .ppm_to_index(target_c_ppm - split_ppm)
+        .round() as usize;
+    assert!(
+        apex > 0.8 * spec_ovr.max_abs()
+            && spec_ovr.get(ix_up, iy_peak).abs() < 0.06 * apex
+            && spec_ovr.get(ix_dn, iy_peak).abs() < 0.06 * apex,
+        "explicit IPAP overrides must collapse AP-first custom-J/scale doublet cleanly into singlet (apex={apex})"
+    );
+    let _ = fs::remove_dir_all(&dir_ipap);
 }
