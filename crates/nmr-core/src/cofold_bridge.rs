@@ -48,7 +48,6 @@ use crate::csp::{
     amide_alpha_n, combined_amide_csp_ppm, compute_williamson_2sigma_threshold, CspGlobalFitResult,
     TrimmedCspThresholds,
 };
-use crate::domain_dock::PreRestraintKind;
 use crate::noesy::{
     v_add, v_cross, v_dist, v_dist_sq, v_dot, v_norm, v_scale, v_sub, v_unit, PdbChain, PdbResidue,
     Vec3,
@@ -88,11 +87,22 @@ pub const SHRAKE_RUPLEY_PROBE_RADIUS_A: f64 = 1.40;
 /// from buried `AllostericCorePerturbation` shifts (`docs/specs/21-alphafold-integrative-nmr.md` section 6.1).
 pub const DEFAULT_MIN_POCKET_RSASA: f64 = 0.20;
 
-/// Minimum clamped upper distance bound (`4.5 A`) exported as a co-folding `contact` restraint.
+/// Lower floor (`4.5 A`) applied to an exported co-folding `contact` upper bound. Raising a tighter
+/// bound up to this floor only *loosens* it (conservative: residue-level Boltz-2 tokens cannot
+/// express sub-4.5 A atom-atom NOE bounds).
 pub const MIN_COFOLD_CONTACT_UPPER_A: f64 = 4.5;
 
-/// Maximum clamped upper distance bound (`14.0 A`) exported as a co-folding `contact` restraint.
+/// Default ceiling (`14.0 A`) for an exported co-folding `contact` upper bound. A restraint whose
+/// computed upper bound exceeds the configured ceiling is **dropped** (never clamped down to the
+/// ceiling: clamping a weak `16.5 A` bound to `14.0 A` would fabricate a strong restraint,
+/// `21.W3:P1-7`). The configured ceiling must lie inside the Boltz-2 range `[4.0, 20.0] A`.
 pub const MAX_COFOLD_CONTACT_UPPER_A: f64 = 14.0;
+
+/// Boltz-2 `contact` / `pocket` `max_distance` hard lower limit (`4.0 A`).
+pub const BOLTZ2_MIN_DISTANCE_A: f64 = 4.0;
+
+/// Boltz-2 `contact` / `pocket` `max_distance` hard upper limit (`20.0 A`).
+pub const BOLTZ2_MAX_DISTANCE_A: f64 = 20.0;
 
 /// Default Boltz-2 `pocket` `max_distance` (`6.0 A`).
 pub const DEFAULT_BOLTZ2_POCKET_MAX_DISTANCE_A: f64 = 6.0;
@@ -103,8 +113,206 @@ pub const DEFAULT_CSP_CONTACT_CUTOFF_A: f64 = 5.0;
 /// Maximum permitted intermolecular `NOE`/`PRE` distance violation (`1.50 A`) before decoy abstention.
 pub const DEFAULT_MAX_ALLOWED_VIOLATION_A: f64 = 1.50;
 
-/// Minimum `CSP` `5.0 A` contact ROC-AUC (`0.58`) required when `>= 5` surface `CSP` hits exist.
-pub const DEFAULT_MIN_CSP_ROC_AUC: f64 = 0.58;
+/// Minimum `CSP` `5.0 A` contact ROC-AUC (`0.65`) required when `>= 5` surface `CSP` hits exist.
+///
+/// Derived *a priori* (before any benchmark was run; `21.W3:P0-3`): `0.65` is the conventional
+/// "better than weak" operating point, and for the minimum guard population (`n_pos = 5`
+/// surface hits against `n_neg >= 20` non-hits) it sits `~1.0` Mann-Whitney standard deviations
+/// above chance (`sigma_AUC = sqrt((n_pos + n_neg + 1) / (12 n_pos n_neg)) ~ 0.147`), i.e. a
+/// pose is flagged unless its contact enrichment is at least visibly above random. The value
+/// formerly used (`0.58`) had been fitted to a single circular test pose (`0.607`).
+/// Every pose additionally reports the one-sided Mann-Whitney `p` value of its contact AUC.
+pub const DEFAULT_MIN_CSP_ROC_AUC: f64 = 0.65;
+
+/// Default MTSL (nitroxide spin-label) tether allowance (`6.0 A`) added to the **upper** (and
+/// subtracted from the lower) electron-to-anchor-atom distance bound of a `PRE` `Gamma_2`
+/// restraint: the unpaired electron sits up to `~6-8 A` from the labelled `C-beta`/`S-gamma`.
+/// Use `0.0 A` for a rigid paramagnetic metal site.
+pub const DEFAULT_MTSL_TETHER_PAD_A: f64 = 6.0;
+
+/// Default spectrometer `1H` Larmor frequency (`600.0 MHz`) in the Solomon-Bloembergen
+/// spectral-density term.
+pub const DEFAULT_PRE_PROTON_MHZ: f64 = 600.0;
+
+/// Default paramagnetic electron spin quantum number `S = 1/2` (nitroxide / MTSL).
+pub const DEFAULT_PRE_ELECTRON_SPIN: f64 = 0.5;
+
+/// Wuethrich-class `NOE` upper bounds (`A`): strong / medium / weak (lower bound `1.8 A`).
+pub const WUTHRICH_NOE_STRONG_UPPER_A: f64 = 2.7;
+pub const WUTHRICH_NOE_MEDIUM_UPPER_A: f64 = 3.3;
+pub const WUTHRICH_NOE_WEAK_UPPER_A: f64 = 5.0;
+
+// CODATA 2018 constants for the first-principles Solomon-Bloembergen `PRE` prefactor.
+const MU0_OVER_4PI_SI: f64 = 1.0e-7; // T m A^-1 (mu_0 / 4 pi, SI)
+const GAMMA_H1_RAD_S_T: f64 = 2.675_221_874_4e8; // rad s^-1 T^-1
+const G_ELECTRON: f64 = 2.002_319_304_362_56;
+const BOHR_MAGNETON_J_T: f64 = 9.274_010_078_3e-24; // J T^-1
+const ANGSTROM6_PER_M6: f64 = 1.0e60;
+
+/// First-principles Solomon-Bloembergen dipolar `PRE` prefactor in `A^6 s^-2`:
+///
+/// `K = (1/15) (mu_0 / 4 pi)^2 gamma_H^2 g_e^2 mu_B^2 S (S + 1)`  (`= 1.234e16 A^6 s^-2` at `S = 1/2`).
+///
+/// This replaces the former hard-coded `1.23e7 A^6 s^-1`, which was `~40x` too small at
+/// `tau_c = 10 ns` (it corresponds to `tau_c ~ 0.25 ns`) and biased exported `PRE` bounds by
+/// `~6 A` (`21.W3:P0-4`). Identical to the `domain_dock` (`S3`) expression.
+pub fn solomon_pre_k_a6_s2(spin_s: f64) -> f64 {
+    let g_mu_b = G_ELECTRON * BOHR_MAGNETON_J_T;
+    (1.0 / 15.0)
+        * MU0_OVER_4PI_SI
+        * MU0_OVER_4PI_SI
+        * GAMMA_H1_RAD_S_T
+        * GAMMA_H1_RAD_S_T
+        * g_mu_b
+        * g_mu_b
+        * spin_s
+        * (spin_s + 1.0)
+        * ANGSTROM6_PER_M6
+}
+
+/// Solomon-Bloembergen spectral-density factor `4 tau_c + 3 tau_c / (1 + omega_H^2 tau_c^2)` in
+/// seconds (`tau_c` in ns, `1H` Larmor frequency in MHz).
+pub fn solomon_spectral_factor_s(tau_c_ns: f64, proton_mhz: f64) -> f64 {
+    let tau = tau_c_ns * 1.0e-9;
+    let omega = 2.0 * PI * proton_mhz * 1.0e6;
+    4.0 * tau + 3.0 * tau / (1.0 + omega * omega * tau * tau)
+}
+
+/// Effective `Gamma_2 = K_eff / r^6` numerator (`A^6 s^-1`):
+/// `K_eff = K_Solomon * (4 tau_c + 3 tau_c / (1 + omega_H^2 tau_c^2))`.
+pub fn solomon_pre_k_eff_a6_s1(
+    tau_c_ns: f64,
+    proton_mhz: f64,
+    spin_s: f64,
+) -> Result<f64, NmrError> {
+    if !tau_c_ns.is_finite() || !(0.05..=1.0e4).contains(&tau_c_ns) {
+        return Err(NmrError::invalid_input(format!(
+            "PRE tau_c_ns ({tau_c_ns}) must be finite and inside [0.05, 10000] ns"
+        )));
+    }
+    if !proton_mhz.is_finite() || !(1.0..=5.0e3).contains(&proton_mhz) {
+        return Err(NmrError::invalid_input(format!(
+            "PRE proton_mhz ({proton_mhz}) must be finite and inside [1, 5000] MHz"
+        )));
+    }
+    if !spin_s.is_finite() || !(0.5..=8.0).contains(&spin_s) {
+        return Err(NmrError::invalid_input(format!(
+            "PRE electron spin S ({spin_s}) must be finite and inside [0.5, 8.0]"
+        )));
+    }
+    Ok(solomon_pre_k_a6_s2(spin_s) * solomon_spectral_factor_s(tau_c_ns, proton_mhz))
+}
+
+/// Paramagnetic-centre-to-proton distance (`A`) from a measured `Gamma_2` (`s^-1`) and `K_eff`.
+pub fn solomon_distance_from_gamma2_a(gamma2_s1: f64, k_eff_a6_s1: f64) -> f64 {
+    sixth_root(k_eff_a6_s1 / gamma2_s1.max(1e-12))
+}
+
+/// Solomon-Bloembergen parameters required to convert measured `Gamma_2` rates into distance
+/// bounds. **There is deliberately no `Default`**: `tau_c` is mandatory (`21.W3:P0-4`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PreSolomonParams {
+    /// Rotational correlation time of the paramagnetic-centre-to-proton vector (`ns`).
+    pub tau_c_ns: f64,
+    /// Spectrometer `1H` Larmor frequency (`MHz`).
+    pub proton_mhz: f64,
+    /// Electron spin `S` (`0.5` for a nitroxide).
+    pub spin_s: f64,
+    /// MTSL tether allowance (`A`): added to the upper and subtracted from the lower bound
+    /// (`6.0 A` for MTSL, `0.0 A` for a rigid paramagnetic metal).
+    pub tether_pad_a: f64,
+    /// Additional upper-bound margin (`A`, default `1.5`).
+    pub upper_margin_a: f64,
+}
+
+impl PreSolomonParams {
+    /// MTSL defaults (`600 MHz`, `S = 1/2`, `6.0 A` tether, `+1.5 A` margin) for a given `tau_c`.
+    pub fn new(tau_c_ns: f64) -> Self {
+        Self {
+            tau_c_ns,
+            proton_mhz: DEFAULT_PRE_PROTON_MHZ,
+            spin_s: DEFAULT_PRE_ELECTRON_SPIN,
+            tether_pad_a: DEFAULT_MTSL_TETHER_PAD_A,
+            upper_margin_a: 1.5,
+        }
+    }
+
+    /// Rigid paramagnetic metal (`tether_pad_a = 0.0`).
+    pub fn rigid_metal(tau_c_ns: f64) -> Self {
+        Self {
+            tether_pad_a: 0.0,
+            ..Self::new(tau_c_ns)
+        }
+    }
+
+    /// Validated `K_eff` (`A^6 s^-1`).
+    pub fn k_eff_a6_s1(&self) -> Result<f64, NmrError> {
+        if !self.tether_pad_a.is_finite() || !(0.0..=15.0).contains(&self.tether_pad_a) {
+            return Err(NmrError::invalid_input(format!(
+                "PRE tether_pad_a ({}) must be finite in [0, 15] A",
+                self.tether_pad_a
+            )));
+        }
+        if !self.upper_margin_a.is_finite() || self.upper_margin_a < 0.0 {
+            return Err(NmrError::invalid_input(
+                "PRE upper_margin_a must be finite and >= 0",
+            ));
+        }
+        solomon_pre_k_eff_a6_s1(self.tau_c_ns, self.proton_mhz, self.spin_s)
+    }
+}
+
+/// Discrete Wuethrich `NOE` intensity class (`strong 1.8-2.7`, `medium 1.8-3.3`, `weak 1.8-5.0 A`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NoeIntensityClass {
+    Strong,
+    Medium,
+    Weak,
+}
+
+impl NoeIntensityClass {
+    /// Class upper distance bound (`A`).
+    pub const fn upper_a(self) -> f64 {
+        match self {
+            Self::Strong => WUTHRICH_NOE_STRONG_UPPER_A,
+            Self::Medium => WUTHRICH_NOE_MEDIUM_UPPER_A,
+            Self::Weak => WUTHRICH_NOE_WEAK_UPPER_A,
+        }
+    }
+
+    /// Class assigned to a true `r` (`<= 2.7` strong, `<= 3.3` medium, `<= 5.0` weak, else not observable).
+    pub fn from_distance_a(r_a: f64) -> Option<Self> {
+        if !r_a.is_finite() {
+            None
+        } else if r_a <= WUTHRICH_NOE_STRONG_UPPER_A {
+            Some(Self::Strong)
+        } else if r_a <= WUTHRICH_NOE_MEDIUM_UPPER_A {
+            Some(Self::Medium)
+        } else if r_a <= WUTHRICH_NOE_WEAK_UPPER_A {
+            Some(Self::Weak)
+        } else {
+            None
+        }
+    }
+
+    /// Next weaker class (`Weak` stays `Weak`): models integration/overlap mis-classification.
+    pub const fn weaker(self) -> Self {
+        match self {
+            Self::Strong => Self::Medium,
+            Self::Medium | Self::Weak => Self::Weak,
+        }
+    }
+
+    /// Parse `S`/`M`/`W` (or `strong`/`medium`/`weak`).
+    pub fn parse_token(tok: &str) -> Option<Self> {
+        match tok.trim().to_ascii_lowercase().as_str() {
+            "s" | "strong" => Some(Self::Strong),
+            "m" | "medium" | "med" => Some(Self::Medium),
+            "w" | "weak" => Some(Self::Weak),
+            _ => None,
+        }
+    }
+}
 
 /// Minimum number of surface-exposed `2-sigma` `CSP` hits (`5`) activating the `AUC_CSP < 0.58` guard.
 pub const DEFAULT_MIN_SURFACE_HITS_FOR_AUC_GUARD: usize = 5;
@@ -579,7 +787,10 @@ impl CofoldEntitySpec {
                 for ch in seq.chars() {
                     let up = ch.to_ascii_uppercase();
                     let ok = match kind {
-                        CofoldPolymerKind::Protein => up.is_ascii_alphabetic(),
+                        // Standard 20-aa alphabet plus `X` (unknown). `B`/`J`/`O`/`U`/`Z`
+                        // (ambiguity codes, pyrrolysine, selenocysteine) are rejected: neither
+                        // AlphaFold 3 nor Boltz-2 folds them as standard residues (`21.W3` P2).
+                        CofoldPolymerKind::Protein => is_standard_protein_letter(up),
                         CofoldPolymerKind::Rna => matches!(up, 'A' | 'U' | 'G' | 'C' | 'N'),
                         CofoldPolymerKind::Dna => matches!(up, 'A' | 'T' | 'G' | 'C' | 'N'),
                     };
@@ -627,6 +838,33 @@ impl CofoldEntitySpec {
     }
 }
 
+/// `true` for the 20 standard amino-acid one-letter codes and `X` (unknown residue).
+fn is_standard_protein_letter(up: char) -> bool {
+    matches!(
+        up,
+        'A' | 'C'
+            | 'D'
+            | 'E'
+            | 'F'
+            | 'G'
+            | 'H'
+            | 'I'
+            | 'K'
+            | 'L'
+            | 'M'
+            | 'N'
+            | 'P'
+            | 'Q'
+            | 'R'
+            | 'S'
+            | 'T'
+            | 'V'
+            | 'W'
+            | 'Y'
+            | 'X'
+    )
+}
+
 fn validate_chain_id(chain_id: &str) -> Result<(), NmrError> {
     let trimmed = chain_id.trim();
     if trimmed.is_empty()
@@ -637,6 +875,17 @@ fn validate_chain_id(chain_id: &str) -> Result<(), NmrError> {
     {
         return Err(NmrError::invalid_input(format!(
             "invalid chain_id {chain_id:?}; expected 1..=16 ASCII alphanumeric/underscore characters"
+        )));
+    }
+    Ok(())
+}
+
+/// AlphaFold 3 JSON chain/entity `id`s are uppercase-letter strings (`A`, `B`, ... `AA`).
+fn validate_af3_chain_id(chain_id: &str) -> Result<(), NmrError> {
+    let t = chain_id.trim();
+    if t.is_empty() || t.len() > 4 || !t.chars().all(|c| c.is_ascii_uppercase()) {
+        return Err(NmrError::invalid_input(format!(
+            "AlphaFold 3 requires uppercase-letter chain ids (1-4 characters, e.g. 'A'); got {chain_id:?}"
         )));
     }
     Ok(())
@@ -886,8 +1135,16 @@ pub enum CspPerturbationClass {
     SurfacePocketContact,
     /// `2-sigma` `CSP` hit buried in the apo core (`rSASA < min_pocket_rsasa`): excluded from surface `pocket`!
     AllostericCorePerturbation,
-    /// `2-sigma` `CSP` hit when no apo 3D model was provided (`rSASA` unavailable): retained in `pocket`.
+    /// `2-sigma` `CSP` hit when no apo 3D model was provided (`rSASA` unavailable): retained in `pocket`
+    /// **only** when the caller explicitly opted in (`allow_unfiltered_no_apo`).
     UnfilteredNoApoStructure,
+    /// Surface-exposed (`rSASA >= min_pocket_rsasa`) `2-sigma` hit that is spatially isolated from the
+    /// dominant surface `CSP` patch (a surface-exposed allosteric / long-range perturbation, `21.W3:P1-8`):
+    /// excluded from the Boltz-2 `pocket` (which asserts direct contact) and reported separately.
+    DistalSurfaceOutlier,
+    /// `2-sigma` hit on a residue with no resolved apo coordinates (missing density, tag, or
+    /// unaligned residue): its exposure is unknown so it is not exported to `pocket`.
+    UnresolvedInApo,
     /// Residue below the Williamson iterative `2-sigma` threshold.
     BelowThreshold,
 }
@@ -970,9 +1227,11 @@ pub struct IntermolecularDistanceRestraint {
     pub upper_a: f64,
     /// Measurement distance tolerance `sigma_a` (`A`, `> 0`) for quadratic violation scoring.
     pub sigma_a: f64,
-    /// Optional quantitative Solomon `PRE` `(gamma2_obs_s1, sigma_s1, k_pre_a6_s1)` metadata.
+    /// Optional quantitative Solomon `PRE` `(gamma2_obs_s1, sigma_s1, k_eff_a6_s1)` metadata, where
+    /// `k_eff_a6_s1 = K_Solomon * (4 tau_c + 3 tau_c / (1 + omega_H^2 tau_c^2))`.
     pub pre_gamma2: Option<(f64, f64, f64)>,
-    /// Clamped `[4.5, 14.0] A` attractive upper bound exported to `Boltz-2` `contact` (`None` if non-attractive / distal).
+    /// Attractive upper bound exported to `Boltz-2` `contact` (`None` if non-attractive, distal, or
+    /// **dropped** because its upper bound exceeds the configured ceiling; never clamped down).
     pub exported_contact_max_distance_a: Option<f64>,
     pub boltz_token_1: Option<BoltzContactToken>,
     pub boltz_token_2: Option<BoltzContactToken>,
@@ -1029,23 +1288,68 @@ pub struct CofoldPcsTagSet {
     pub observations: Vec<CofoldPcsObservation>,
 }
 
+/// How experimental restraint `seq_id`s are related to the target (FASTA) sequence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RestraintNumbering {
+    /// Pick the numbering whose residue-name cross-check against the FASTA passes (apo author
+    /// numbering preferred on ties). Fails closed when neither passes.
+    #[default]
+    Auto,
+    /// Restraint `seq_id`s use the **author numbering of the apo structure** (aligned to the FASTA
+    /// by sequence, so offsets, tags and missing-density gaps are handled).
+    ApoAuthor,
+    /// Restraint `seq_id`s already equal the 1-based FASTA / target-sequence index.
+    FastaIndex,
+}
+
+impl RestraintNumbering {
+    pub fn parse_token(tok: &str) -> Option<Self> {
+        match tok.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "apo" | "apo-author" | "author" => Some(Self::ApoAuthor),
+            "fasta" | "fasta-index" | "index" => Some(Self::FastaIndex),
+            _ => None,
+        }
+    }
+}
+
 /// Configuration for `extract_nmr_interface_restraints`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CofoldRestraintExtractConfig {
     /// Minimum apo Shrake-Rupley `rSASA` (`default = 0.20`) required for surface `pocket` membership.
     pub min_pocket_rsasa: f64,
-    /// Default Boltz-2 `pocket` `max_distance` (`default = 6.0 A`).
+    /// Default Boltz-2 `pocket` `max_distance` (`default = 6.0 A`, must lie in `[4.0, 20.0] A`).
     pub pocket_max_distance_a: f64,
-    /// Minimum clamped `contact` `max_distance` (`default = 4.5 A`).
+    /// Minimum `contact` `max_distance` floor (`default = 4.5 A`; tighter bounds are loosened to it).
     pub min_contact_distance_a: f64,
-    /// Maximum clamped `contact` `max_distance` (`default = 14.0 A`).
+    /// Ceiling for an exported `contact` `max_distance` (`default = 14.0 A`, inside `[4.0, 20.0] A`).
+    /// Restraints whose upper bound exceeds it are **dropped, never clamped**.
     pub max_contact_distance_a: f64,
-    /// Solomon `PRE` distance margin (`+1.5 A`) added to `(K_PRE / Gamma_2)^(1/6)` for contact upper bounds.
+    /// Solomon `PRE` distance margin (`+1.5 A`) added to `(K_eff / Gamma_2)^(1/6)` for contact upper bounds.
     pub pre_gamma2_upper_margin_a: f64,
     /// Whether `force: true` is emitted in Boltz-2 `pocket`/`contact` constraints (`default = false`).
     pub force_constraints: bool,
     /// Whether `properties: [{affinity: {binder}}]` is requested in Boltz-2 YAML (`default = false`).
     pub request_boltz2_affinity: bool,
+    /// Permit exporting an **unfiltered** `pocket` when no apo structure is supplied
+    /// (`default = false`: fail closed, `21.W3:P1-8`). Without exposure information, buried
+    /// allosteric hits cannot be separated from surface contacts.
+    pub allow_unfiltered_no_apo: bool,
+    /// Build the bundle for pose re-scoring only (never exported to Boltz-2/AF3): intermolecular
+    /// restraints on `SMILES`-ligand atoms are then kept for scoring instead of refused.
+    pub scoring_only: bool,
+    /// Relationship between restraint `seq_id`s and the target sequence (`default = Auto`).
+    pub numbering: RestraintNumbering,
+    /// Enable spatial clustering of surface `CSP` hits (isolated distal hits are demoted).
+    pub enable_pocket_cluster_filter: bool,
+    /// Single-linkage cutoff (`A`) between `C-beta` positions of surface `CSP` hits (`default 12.0`).
+    pub pocket_cluster_cutoff_a: f64,
+    /// Minimum size of a non-dominant surface cluster to stay in `pocket` (`default 3`).
+    pub min_secondary_cluster_size: usize,
+    /// Minimum amino-acid identity (`default 0.90`) of the structure-to-FASTA alignment and of the
+    /// residue-name cross-check of restraint rows.
+    pub min_alignment_identity: f64,
 }
 
 impl Default for CofoldRestraintExtractConfig {
@@ -1058,6 +1362,13 @@ impl Default for CofoldRestraintExtractConfig {
             pre_gamma2_upper_margin_a: 1.50,
             force_constraints: false,
             request_boltz2_affinity: false,
+            allow_unfiltered_no_apo: false,
+            scoring_only: false,
+            numbering: RestraintNumbering::Auto,
+            enable_pocket_cluster_filter: true,
+            pocket_cluster_cutoff_a: 12.0,
+            min_secondary_cluster_size: 3,
+            min_alignment_identity: 0.90,
         }
     }
 }
@@ -1119,6 +1430,25 @@ pub struct CofoldRestraintBundle {
     pub experimental_kd_um: Option<f64>,
     pub af3_conditioning_note: String,
     pub diagnostics: Vec<String>,
+    /// Number of restraints whose computed upper bound exceeded the configured
+    /// `max_contact_distance_a` ceiling and were **dropped** from the Boltz-2 export instead of being
+    /// clamped to the ceiling (`21.W3:P1-7`). They are still used, un-clamped, for pose scoring.
+    #[serde(default)]
+    pub dropped_weak_restraints_count: usize,
+    /// Surface-exposed `2-sigma` `CSP` hits isolated from the dominant surface patch (not in `pocket`).
+    #[serde(default)]
+    pub distal_surface_csp_hits: Vec<PocketContactRestraint>,
+    /// `SMILES`-ligand atom contacts kept for scoring only (never exportable; see `scoring_only`).
+    #[serde(default)]
+    pub unexportable_ligand_atom_contacts_count: usize,
+    /// Per polymer chain, `1`-based target index `k` -> experimental restraint `seq_id` at position
+    /// `k - 1`. Empty for a chain whose restraint numbering equals the FASTA index. Used by
+    /// [`score_cofold_poses`] to re-index `1..N` AF3/Boltz pose residues onto experimental numbering.
+    #[serde(default)]
+    pub chain_exp_numbering: BTreeMap<String, Vec<i32>>,
+    /// Which restraint numbering was resolved for the receptor (`auto` decision audit).
+    #[serde(default)]
+    pub numbering_resolution: String,
 }
 
 impl CofoldRestraintBundle {
@@ -1155,49 +1485,624 @@ impl CofoldRestraintBundle {
     }
 }
 
-/// Extract surface-filtered `2-sigma` `CSP` pocket contacts (`rSASA >= 0.20`), classify buried
-/// `AllostericCorePerturbation` shifts (`rSASA < 0.20`), and canonicalize `NOE`/`PRE` `[4.5, 14.0] A`
-/// intermolecular contacts into a [`CofoldRestraintBundle`].
-pub fn extract_nmr_interface_restraints(
-    input: &CofoldRestraintInput,
-    cfg: &CofoldRestraintExtractConfig,
-) -> Result<CofoldRestraintBundle, NmrError> {
+// ============================================================================
+// 4a. Sequence-Aligned Residue Indexing (`21.W3:P1-9`)
+// ============================================================================
+
+const ALIGN_MATCH: i32 = 3;
+const ALIGN_MISMATCH: i32 = -2;
+const ALIGN_GAP_OPEN: i32 = -6;
+const ALIGN_GAP_EXTEND: i32 = -1;
+const ALIGN_NEG_INF: i32 = i32::MIN / 4;
+
+/// Maximum dynamic-programming cells (`observed x target`) of the structure-to-FASTA alignment.
+pub const MAX_ALIGNMENT_CELLS: usize = 40_000_000;
+
+/// One-letter code (`b'X'` = unknown) of a three-letter residue name (standard + common variants).
+pub fn aa_one_letter_from_name(name: &str) -> u8 {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "ALA" => b'A',
+        "ARG" => b'R',
+        "ASN" => b'N',
+        "ASP" | "ASH" => b'D',
+        "CYS" | "CYX" | "CYM" => b'C',
+        "GLN" => b'Q',
+        "GLU" | "GLH" => b'E',
+        "GLY" => b'G',
+        "HIS" | "HID" | "HIE" | "HIP" | "HSD" | "HSE" | "HSP" => b'H',
+        "ILE" => b'I',
+        "LEU" => b'L',
+        "LYS" | "LYN" => b'K',
+        "MET" | "MSE" => b'M',
+        "PHE" => b'F',
+        "PRO" => b'P',
+        "SER" => b'S',
+        "THR" => b'T',
+        "TRP" => b'W',
+        "TYR" => b'Y',
+        "VAL" => b'V',
+        _ => b'X',
+    }
+}
+
+/// Result of aligning an observed residue string (e.g. the residues present in a coordinate file)
+/// against the target (FASTA) sequence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SequenceAlignment {
+    /// Observed residue `k` -> `0`-based target index (`None` for tag / insertion residues).
+    pub observed_to_target: Vec<Option<usize>>,
+    pub n_observed: usize,
+    pub n_target: usize,
+    pub n_aligned: usize,
+    /// Aligned pairs where neither side is the unknown residue `X`.
+    pub n_comparable: usize,
+    pub n_identical: usize,
+}
+
+impl SequenceAlignment {
+    /// Amino-acid identity over comparable aligned pairs.
+    pub fn identity(&self) -> f64 {
+        if self.n_comparable == 0 {
+            0.0
+        } else {
+            self.n_identical as f64 / self.n_comparable as f64
+        }
+    }
+
+    /// Fraction of observed residues that aligned to the target.
+    pub fn coverage(&self) -> f64 {
+        if self.n_observed == 0 {
+            0.0
+        } else {
+            self.n_aligned as f64 / self.n_observed as f64
+        }
+    }
+}
+
+#[inline]
+fn align_pair_score(a: u8, b: u8) -> i32 {
+    if a == b'X' || b == b'X' {
+        0
+    } else if a == b {
+        ALIGN_MATCH
+    } else {
+        ALIGN_MISMATCH
+    }
+}
+
+/// Affine-gap (Gotoh) overlap alignment of `observed` residues onto `target` with free end gaps on
+/// both sides, so N-terminal expression tags, missing termini and **internal missing-density gaps**
+/// are all represented explicitly instead of compacting observed residues to `1..N_obs`.
+pub fn align_observed_to_target(
+    observed: &[u8],
+    target: &[u8],
+) -> Result<SequenceAlignment, NmrError> {
+    let n = observed.len();
+    let m = target.len();
+    if n == 0 || m == 0 {
+        return Err(NmrError::empty_input(
+            "cannot align an empty residue string to the target sequence",
+        ));
+    }
+    let w = m + 1;
+    let cells = (n + 1)
+        .checked_mul(w)
+        .filter(|&c| c <= MAX_ALIGNMENT_CELLS)
+        .ok_or_else(|| {
+            NmrError::invalid_input(format!(
+                "sequence alignment of {n} observed x {m} target residues exceeds the {MAX_ALIGNMENT_CELLS}-cell cap"
+            ))
+        })?;
+    let mut tb = vec![0u8; cells];
+    let mut m_prev = vec![0i32; w];
+    let mut x_prev = vec![ALIGN_NEG_INF; w];
+    let mut m_cur = vec![0i32; w];
+    let mut x_cur = vec![ALIGN_NEG_INF; w];
+    let mut y_cur = vec![ALIGN_NEG_INF; w];
+    let mut y_prev = vec![ALIGN_NEG_INF; w];
+    let mut best_score = ALIGN_NEG_INF;
+    let mut best_ij = (0usize, 0usize);
+
+    for i in 1..=n {
+        m_cur[0] = 0;
+        x_cur[0] = ALIGN_NEG_INF;
+        y_cur[0] = ALIGN_NEG_INF;
+        for j in 1..=m {
+            let s = align_pair_score(observed[i - 1], target[j - 1]);
+            let (pm, px, py) = (m_prev[j - 1], x_prev[j - 1], y_prev[j - 1]);
+            let (mut bm, mut from) = (pm, 0u8);
+            if px > bm {
+                bm = px;
+                from = 1;
+            }
+            if py > bm {
+                bm = py;
+                from = 2;
+            }
+            m_cur[j] = bm + s;
+            let mut bits = from;
+            let xo = m_prev[j] + ALIGN_GAP_OPEN;
+            let xe = x_prev[j] + ALIGN_GAP_EXTEND;
+            if xe > xo {
+                x_cur[j] = xe;
+                bits |= 4;
+            } else {
+                x_cur[j] = xo;
+            }
+            let yo = m_cur[j - 1] + ALIGN_GAP_OPEN;
+            let ye = y_cur[j - 1] + ALIGN_GAP_EXTEND;
+            if ye > yo {
+                y_cur[j] = ye;
+                bits |= 8;
+            } else {
+                y_cur[j] = yo;
+            }
+            tb[i * w + j] = bits;
+            if (i == n || j == m) && m_cur[j] > best_score {
+                best_score = m_cur[j];
+                best_ij = (i, j);
+            }
+        }
+        std::mem::swap(&mut m_prev, &mut m_cur);
+        std::mem::swap(&mut x_prev, &mut x_cur);
+        std::mem::swap(&mut y_prev, &mut y_cur);
+    }
+    if best_score <= ALIGN_NEG_INF / 2 {
+        return Err(NmrError::invalid_input(
+            "structure residues could not be aligned to the target sequence",
+        ));
+    }
+
+    let (mut i, mut j) = best_ij;
+    let mut state = 0u8;
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    while i > 0 && j > 0 {
+        let bits = tb[i * w + j];
+        match state {
+            0 => {
+                pairs.push((i - 1, j - 1));
+                state = bits & 3;
+                i -= 1;
+                j -= 1;
+            }
+            1 => {
+                state = if bits & 4 != 0 { 1 } else { 0 };
+                i -= 1;
+            }
+            _ => {
+                state = if bits & 8 != 0 { 2 } else { 0 };
+                j -= 1;
+            }
+        }
+    }
+    pairs.reverse();
+
+    let mut observed_to_target = vec![None; n];
+    let mut n_comparable = 0usize;
+    let mut n_identical = 0usize;
+    for &(oi, tj) in &pairs {
+        observed_to_target[oi] = Some(tj);
+        if observed[oi] != b'X' && target[tj] != b'X' {
+            n_comparable += 1;
+            if observed[oi] == target[tj] {
+                n_identical += 1;
+            }
+        }
+    }
+    Ok(SequenceAlignment {
+        observed_to_target,
+        n_observed: n,
+        n_target: m,
+        n_aligned: pairs.len(),
+        n_comparable,
+        n_identical,
+    })
+}
+
+/// Explicit amino-acid identity cross-check of a structure-to-FASTA alignment.
+fn require_alignment_quality(
+    label: &str,
+    a: &SequenceAlignment,
+    min_identity: f64,
+) -> Result<(), NmrError> {
+    if a.n_aligned < 3.min(a.n_observed) || a.coverage() < 0.5 {
+        return Err(NmrError::restraint_mismatch(format!(
+            "{label}: only {}/{} observed residues align to the {}-residue target sequence (coverage {:.2} < 0.50)",
+            a.n_aligned,
+            a.n_observed,
+            a.n_target,
+            a.coverage()
+        )));
+    }
+    if a.identity() < min_identity {
+        return Err(NmrError::restraint_mismatch(format!(
+            "{label}: amino-acid identity {:.3} over {} aligned residues is below the {:.2} cross-check (structure does not match the FASTA sequence)",
+            a.identity(),
+            a.n_comparable,
+            min_identity
+        )));
+    }
+    Ok(())
+}
+
+/// Observed `(seq_id, aa1, model_pos)` residues of one chain of a [`StructureModel`] in file order.
+fn model_chain_observed(model: &StructureModel, chain_id: &str) -> Vec<(i32, u8, usize)> {
+    model
+        .residues
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.chain_id == chain_id)
+        .map(|(pos, r)| (r.seq_id, r.aa1.to_ascii_uppercase(), pos))
+        .collect()
+}
+
+/// Choose the apo-model chain matching `receptor_chain` (exact id, sole chain, or legacy `A`).
+fn select_model_chain(model: &StructureModel, receptor_chain: &str) -> Option<String> {
+    let mut chains: BTreeSet<&str> = BTreeSet::new();
+    for r in &model.residues {
+        chains.insert(r.chain_id.as_str());
+    }
+    if chains.contains(receptor_chain) {
+        return Some(receptor_chain.to_string());
+    }
+    if chains.len() == 1 {
+        return chains.iter().next().map(|s| (*s).to_string());
+    }
+    chains.contains("A").then(|| "A".to_string())
+}
+
+/// Gap-preserving sequence inferred from observed `(seq_id, aa1)` when no FASTA is supplied:
+/// missing residues inside the observed span become `X`, so indices follow `seq_id - min_seq_id + 1`.
+fn infer_target_from_observed(obs: &[(i32, u8, usize)]) -> (Vec<u8>, BTreeMap<i32, usize>) {
+    let mut map = BTreeMap::new();
+    let (Some(min_id), Some(max_id)) =
+        (obs.iter().map(|o| o.0).min(), obs.iter().map(|o| o.0).max())
+    else {
+        return (Vec::new(), map);
+    };
+    let span = (i64::from(max_id) - i64::from(min_id) + 1) as usize;
+    if span <= 3 * obs.len() + 50 {
+        let mut seq = vec![b'X'; span];
+        for &(sid, aa, _) in obs {
+            let idx0 = (sid - min_id) as usize;
+            seq[idx0] = aa;
+            map.insert(sid, idx0 + 1);
+        }
+        (seq, map)
+    } else {
+        let mut seq = Vec::with_capacity(obs.len());
+        for (k, &(sid, aa, _)) in obs.iter().enumerate() {
+            seq.push(aa);
+            map.insert(sid, k + 1);
+        }
+        (seq, map)
+    }
+}
+
+/// Residue-indexing state of one polymer chain: target sequence, structure-to-target map and the
+/// resolved relationship between experimental restraint `seq_id`s and the target index.
+#[derive(Clone, Debug)]
+struct ChainIndexing {
+    target: Vec<u8>,
+    /// Structure author `seq_id` -> `1`-based target index (aligned residues only).
+    author_to_idx: BTreeMap<i32, usize>,
+    /// `1`-based target index -> position in the structure model's `residues` vector.
+    idx_to_pos: BTreeMap<usize, usize>,
+    numbering: RestraintNumbering,
+}
+
+impl ChainIndexing {
+    fn exp_to_idx(&self, seq_id: i32) -> Option<usize> {
+        let l = self.target.len();
+        let in_range = |v: i64| -> Option<usize> {
+            (v >= 1 && (l == 0 || v as usize <= l)).then_some(v as usize)
+        };
+        match self.numbering {
+            RestraintNumbering::FastaIndex | RestraintNumbering::Auto => {
+                in_range(i64::from(seq_id))
+            }
+            RestraintNumbering::ApoAuthor => {
+                if let Some(&idx) = self.author_to_idx.get(&seq_id) {
+                    return Some(idx);
+                }
+                // Missing-density / unaligned residue: extend the nearest aligned residue's offset.
+                let below = self.author_to_idx.range(..seq_id).next_back();
+                let above = self.author_to_idx.range(seq_id..).next();
+                let anchor = match (below, above) {
+                    (Some(b), Some(a)) => {
+                        if (seq_id - *b.0) <= (*a.0 - seq_id) {
+                            Some(b)
+                        } else {
+                            Some(a)
+                        }
+                    }
+                    (Some(b), None) => Some(b),
+                    (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                }?;
+                in_range(*anchor.1 as i64 + i64::from(seq_id) - i64::from(*anchor.0))
+            }
+        }
+    }
+
+    /// Experimental `seq_id` at every `1`-based target index (length = target length).
+    fn idx_to_exp(&self) -> Vec<i32> {
+        let l = self.target.len();
+        match self.numbering {
+            RestraintNumbering::FastaIndex | RestraintNumbering::Auto => {
+                (1..=l).map(|k| k as i32).collect()
+            }
+            RestraintNumbering::ApoAuthor => {
+                let by_idx: BTreeMap<usize, i32> = self
+                    .author_to_idx
+                    .iter()
+                    .map(|(&sid, &idx)| (idx, sid))
+                    .collect();
+                (1..=l)
+                    .map(|k| {
+                        if let Some(&sid) = by_idx.get(&k) {
+                            return sid;
+                        }
+                        let below = by_idx.range(..k).next_back();
+                        let above = by_idx.range(k..).next();
+                        let anchor = match (below, above) {
+                            (Some(b), Some(a)) => {
+                                if k - *b.0 <= *a.0 - k {
+                                    Some(b)
+                                } else {
+                                    Some(a)
+                                }
+                            }
+                            (Some(b), None) => Some(b),
+                            (None, Some(a)) => Some(a),
+                            (None, None) => None,
+                        };
+                        match anchor {
+                            Some((&ak, &asid)) => asid + (k as i32 - ak as i32),
+                            None => k as i32,
+                        }
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// Fraction of `(seq_id, aa1)` rows whose residue letter agrees with the target at the index the
+/// given numbering assigns (rows that map outside the target count as mismatches).
+fn row_name_identity(ix: &ChainIndexing, rows: &[(i32, u8)]) -> f64 {
+    if rows.is_empty() {
+        return 1.0;
+    }
+    let ok = rows
+        .iter()
+        .filter(|&&(sid, aa)| {
+            ix.exp_to_idx(sid)
+                .map(|idx| {
+                    let t = ix.target.get(idx - 1).copied().unwrap_or(b'X');
+                    t == b'X' || t == aa
+                })
+                .unwrap_or(false)
+        })
+        .count();
+    ok as f64 / rows.len() as f64
+}
+
+#[inline]
+fn is_smiles_ligand_chain(entities: &[CofoldEntitySpec], chain: &str) -> bool {
+    entities.iter().any(|e| {
+        matches!(
+            e,
+            CofoldEntitySpec::Ligand {
+                chain_id,
+                spec: CofoldLigandSpec::Smiles(_)
+            } if chain_id == chain
+        )
+    })
+}
+
+fn validate_extract_config(cfg: &CofoldRestraintExtractConfig) -> Result<(), NmrError> {
     if !cfg.min_pocket_rsasa.is_finite() || !(0.0..=1.0).contains(&cfg.min_pocket_rsasa) {
         return Err(NmrError::invalid_input(format!(
             "min_pocket_rsasa ({}) must be finite in [0.0, 1.0]",
             cfg.min_pocket_rsasa
         )));
     }
-    if !cfg.pocket_max_distance_a.is_finite() || cfg.pocket_max_distance_a <= 0.0 {
-        return Err(NmrError::invalid_input(
-            "pocket_max_distance_a must be finite and > 0",
-        ));
+    let in_boltz =
+        |v: f64| v.is_finite() && (BOLTZ2_MIN_DISTANCE_A..=BOLTZ2_MAX_DISTANCE_A).contains(&v);
+    if !in_boltz(cfg.pocket_max_distance_a) {
+        return Err(NmrError::invalid_input(format!(
+            "pocket_max_distance_a ({}) must lie in the Boltz-2 range [{BOLTZ2_MIN_DISTANCE_A}, {BOLTZ2_MAX_DISTANCE_A}] A",
+            cfg.pocket_max_distance_a
+        )));
     }
-    if !cfg.min_contact_distance_a.is_finite()
-        || !cfg.max_contact_distance_a.is_finite()
-        || cfg.min_contact_distance_a <= 0.0
+    if !in_boltz(cfg.min_contact_distance_a)
+        || !in_boltz(cfg.max_contact_distance_a)
         || cfg.max_contact_distance_a < cfg.min_contact_distance_a
     {
+        return Err(NmrError::invalid_input(format!(
+            "invalid [min_contact_distance_a, max_contact_distance_a] = [{}, {}]; both must lie in [{BOLTZ2_MIN_DISTANCE_A}, {BOLTZ2_MAX_DISTANCE_A}] A with min <= max",
+            cfg.min_contact_distance_a, cfg.max_contact_distance_a
+        )));
+    }
+    if !cfg.pre_gamma2_upper_margin_a.is_finite() || cfg.pre_gamma2_upper_margin_a < 0.0 {
         return Err(NmrError::invalid_input(
-            "invalid [min_contact_distance_a, max_contact_distance_a] range",
+            "pre_gamma2_upper_margin_a must be finite and >= 0",
+        ));
+    }
+    if !cfg.pocket_cluster_cutoff_a.is_finite() || cfg.pocket_cluster_cutoff_a <= 0.0 {
+        return Err(NmrError::invalid_input(
+            "pocket_cluster_cutoff_a must be finite and > 0",
+        ));
+    }
+    if !cfg.min_alignment_identity.is_finite()
+        || cfg.min_alignment_identity <= 0.0
+        || cfg.min_alignment_identity > 1.0
+    {
+        return Err(NmrError::invalid_input(
+            "min_alignment_identity must be in (0.0, 1.0]",
+        ));
+    }
+    Ok(())
+}
+
+/// Single-linkage clusters (union-find) of points closer than `cutoff`.
+fn single_linkage_clusters(points: &[Vec3], cutoff: f64) -> Vec<Vec<usize>> {
+    let n = points.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let cut_sq = cutoff * cutoff;
+    for a in 0..n {
+        for b in (a + 1)..n {
+            if v_dist_sq(points[a], points[b]) <= cut_sq {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                if ra != rb {
+                    parent[ra.max(rb)] = ra.min(rb);
+                }
+            }
+        }
+    }
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for k in 0..n {
+        let r = find(&mut parent, k);
+        groups.entry(r).or_default().push(k);
+    }
+    groups.into_values().collect()
+}
+
+/// Validate an AlphaFold 3 `bondedAtomPairs` endpoint against the entity list: the chain must be a
+/// polymer or a **CCD** ligand (a `SMILES` ligand has no addressable atom names) and the 1-based
+/// residue index must lie inside the entity.
+fn validate_bonded_atom_pair(
+    bp: &BondedAtomPairSpec,
+    entities: &[CofoldEntitySpec],
+) -> Result<(), NmrError> {
+    for ep in [&bp.atom1, &bp.atom2] {
+        if ep.one_based_res_idx == 0 {
+            return Err(NmrError::invalid_input(
+                "AlphaFold 3 bondedAtomPairs require 1-based residue indices (>= 1)",
+            ));
+        }
+        if ep.atom_name.trim().is_empty() {
+            return Err(NmrError::invalid_input(format!(
+                "bondedAtomPairs endpoint on chain '{}' has an empty atom name",
+                ep.chain_id
+            )));
+        }
+        let ent = entities
+            .iter()
+            .find(|e| e.chain_id() == ep.chain_id)
+            .ok_or_else(|| {
+                NmrError::invalid_input(format!(
+                    "bondedAtomPairs references chain '{}' that is not a declared entity",
+                    ep.chain_id
+                ))
+            })?;
+        match ent {
+            CofoldEntitySpec::Polymer { .. } => {
+                let len = ent.polymer_len().unwrap_or(0);
+                if ep.one_based_res_idx > len {
+                    return Err(NmrError::invalid_input(format!(
+                        "bondedAtomPairs residue index {} exceeds polymer chain '{}' length ({len})",
+                        ep.one_based_res_idx, ep.chain_id
+                    )));
+                }
+            }
+            CofoldEntitySpec::Ligand {
+                spec: CofoldLigandSpec::Smiles(_),
+                ..
+            } => {
+                return Err(NmrError::invalid_input(format!(
+                    "bondedAtomPairs endpoint on SMILES ligand chain '{}' is invalid: only polymer chains and CCD ligands expose addressable atom names",
+                    ep.chain_id
+                )));
+            }
+            CofoldEntitySpec::Ligand {
+                spec: CofoldLigandSpec::CcdCodes(codes),
+                ..
+            } => {
+                if ep.one_based_res_idx > codes.len() {
+                    return Err(NmrError::invalid_input(format!(
+                        "bondedAtomPairs residue index {} exceeds the {} CCD component(s) of ligand chain '{}'",
+                        ep.one_based_res_idx,
+                        codes.len(),
+                        ep.chain_id
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Extract surface-filtered `2-sigma` `CSP` pocket contacts (`rSASA >= 0.20`), classify buried
+/// `AllostericCorePerturbation` shifts (`rSASA < 0.20`), demote isolated distal surface hits, and
+/// canonicalize `NOE`/`PRE` intermolecular contacts into a [`CofoldRestraintBundle`].
+///
+/// Hardening (`21.W3` P1-7..P1-11):
+/// - fails closed (`Err`) when `CSP` rows exist but no apo structure was supplied, unless
+///   `allow_unfiltered_no_apo` is set;
+/// - maps every restraint `seq_id` to the FASTA index by **sequence alignment** with an explicit
+///   amino-acid identity cross-check (offsets, tags and missing-density gaps are preserved);
+/// - **drops** (never clamps) contact bounds above `max_contact_distance_a`;
+/// - refuses exportable atom-level contacts on `SMILES` ligands (their atom names cannot be derived).
+pub fn extract_nmr_interface_restraints(
+    input: &CofoldRestraintInput,
+    cfg: &CofoldRestraintExtractConfig,
+) -> Result<CofoldRestraintBundle, NmrError> {
+    validate_extract_config(cfg)?;
+
+    if !input.raw_csp_rows.is_empty()
+        && input.apo_receptor_model.is_none()
+        && !cfg.allow_unfiltered_no_apo
+    {
+        return Err(NmrError::invalid_input(
+            "CSP rows were supplied without an apo receptor 3D structure: without solvent exposure, buried allosteric hits cannot be separated from surface contacts, so the unfiltered pocket export is refused (`UnfilteredNoApoStructure`). Supply --apo-structure, or opt in explicitly with --allow-unfiltered-no-apo (CofoldRestraintExtractConfig::allow_unfiltered_no_apo)",
         ));
     }
 
-    // Build entity list (auto-inferring receptor polymer from `apo_receptor_model` if `entities` is empty)
+    let mut diagnostics = Vec::new();
+    if !input.raw_csp_rows.is_empty() && input.apo_receptor_model.is_none() {
+        diagnostics.push(
+            "WARNING: UnfilteredNoApoStructure opt-in active (no apo 3D structure supplied); buried allosteric core hits cannot be separated from surface pocket contacts."
+                .to_string(),
+        );
+    }
+
+    // Entity list; when no polymer entities were supplied, infer gap- and offset-preserving receptor polymers from the apo model.
     let mut entities = input.entities.clone();
-    if entities.is_empty() {
+    let mut inferred_author_maps: BTreeMap<String, BTreeMap<i32, usize>> = BTreeMap::new();
+    if !entities.iter().any(|e| e.is_polymer()) {
         if let Some(ref apo) = input.apo_receptor_model {
-            let mut by_chain: BTreeMap<String, String> = BTreeMap::new();
-            for r in &apo.residues {
-                let ch = char::from(r.aa1);
-                by_chain.entry(r.chain_id.clone()).or_default().push(ch);
-            }
-            for (cid, seq) in by_chain {
-                entities.push(CofoldEntitySpec::Polymer {
+            let chain_ids: BTreeSet<String> =
+                apo.residues.iter().map(|r| r.chain_id.clone()).collect();
+            let mut inferred_polymers = Vec::new();
+            for cid in chain_ids {
+                let obs = model_chain_observed(apo, &cid);
+                let (seq, map) = infer_target_from_observed(&obs);
+                if seq.is_empty() {
+                    continue;
+                }
+                inferred_author_maps.insert(cid.clone(), map);
+                inferred_polymers.push(CofoldEntitySpec::Polymer {
                     kind: CofoldPolymerKind::Protein,
                     chain_id: cid,
-                    sequence: seq,
+                    sequence: String::from_utf8_lossy(&seq).into_owned(),
                 });
+            }
+            if !inferred_polymers.is_empty() {
+                inferred_polymers.extend(entities);
+                entities = inferred_polymers;
+                diagnostics.push(
+                    "No FASTA supplied: polymer sequences were inferred from the apo model with 'X' placeholders for missing-density gaps; indices are relative to the first observed residue."
+                        .to_string(),
+                );
             }
         }
     }
@@ -1236,26 +2141,8 @@ pub fn extract_nmr_interface_restraints(
     };
     validate_chain_id(&binder_chain_id)?;
 
-    let mut diagnostics = Vec::new();
-
-    // Build `(chain_id, seq_id) -> 1-based sequence index` & apo `rSASA` lookup tables
-    let mut seq_id_to_one_based: BTreeMap<(String, i32), usize> = BTreeMap::new();
-    let mut rsasa_by_seq_id: BTreeMap<(String, i32), f64> = BTreeMap::new();
-
-    if let Some(ref apo) = input.apo_receptor_model {
-        let sasa_vec = compute_shrake_rupley_rsasa(apo, &[]);
-        let mut per_chain_counter: BTreeMap<String, usize> = BTreeMap::new();
-        for item in sasa_vec {
-            let entry = per_chain_counter.entry(item.chain_id.clone()).or_insert(0);
-            *entry += 1;
-            seq_id_to_one_based.insert((item.chain_id.clone(), item.seq_id), *entry);
-            rsasa_by_seq_id.insert((item.chain_id, item.seq_id), item.rsasa);
-        }
-    } else {
-        diagnostics.push(
-            "No apo 3D structure supplied; 2-sigma CSP hits retained without Shrake-Rupley rSASA core filtering."
-                .to_string(),
-        );
+    for bp in &input.bonded_atom_pairs {
+        validate_bonded_atom_pair(bp, &entities)?;
     }
 
     let polymer_lengths: BTreeMap<String, usize> = entities
@@ -1268,13 +2155,236 @@ pub fn extract_nmr_interface_restraints(
         .map(|e| e.chain_id().to_string())
         .collect();
 
+    // ---- Receptor residue indexing: apo structure aligned to the target sequence ----------------
+    let receptor_target: Option<Vec<u8>> = entities.iter().find_map(|e| match e {
+        CofoldEntitySpec::Polymer {
+            kind: CofoldPolymerKind::Protein,
+            chain_id,
+            sequence,
+        } if *chain_id == receptor_chain_id => {
+            Some(sequence.trim().to_ascii_uppercase().into_bytes())
+        }
+        _ => None,
+    });
+
+    let mut apo_rsasa_by_idx: BTreeMap<usize, f64> = BTreeMap::new();
+    let mut apo_cb_by_idx: BTreeMap<usize, Vec3> = BTreeMap::new();
+    let mut receptor_ix = ChainIndexing {
+        target: receptor_target.unwrap_or_default(),
+        author_to_idx: BTreeMap::new(),
+        idx_to_pos: BTreeMap::new(),
+        numbering: RestraintNumbering::FastaIndex,
+    };
+    let mut have_apo_map = false;
+
+    if let Some(ref apo) = input.apo_receptor_model {
+        let apo_chain = select_model_chain(apo, &receptor_chain_id).ok_or_else(|| {
+            NmrError::restraint_mismatch(format!(
+                "apo structure has no chain matching receptor chain '{receptor_chain_id}'"
+            ))
+        })?;
+        let obs = model_chain_observed(apo, &apo_chain);
+        if let Some(inferred) = inferred_author_maps.get(&apo_chain) {
+            for &(sid, _, pos) in &obs {
+                if let Some(&idx) = inferred.get(&sid) {
+                    receptor_ix.author_to_idx.insert(sid, idx);
+                    receptor_ix.idx_to_pos.insert(idx, pos);
+                }
+            }
+            have_apo_map = true;
+        } else if !receptor_ix.target.is_empty() {
+            let obs_letters: Vec<u8> = obs.iter().map(|o| o.1).collect();
+            let aln = align_observed_to_target(&obs_letters, &receptor_ix.target)?;
+            require_alignment_quality(
+                &format!("apo structure chain '{apo_chain}' vs FASTA chain '{receptor_chain_id}'"),
+                &aln,
+                cfg.min_alignment_identity,
+            )?;
+            for (k, tgt) in aln.observed_to_target.iter().enumerate() {
+                if let Some(t0) = tgt {
+                    receptor_ix.author_to_idx.insert(obs[k].0, t0 + 1);
+                    receptor_ix.idx_to_pos.insert(t0 + 1, obs[k].2);
+                }
+            }
+            diagnostics.push(format!(
+                "apo chain '{apo_chain}' aligned to FASTA chain '{receptor_chain_id}': {}/{} residues aligned, identity {:.3} (tags/gaps preserved)",
+                aln.n_aligned,
+                aln.n_observed,
+                aln.identity()
+            ));
+            have_apo_map = true;
+        } else {
+            return Err(NmrError::restraint_mismatch(format!(
+                "receptor chain '{receptor_chain_id}' has no protein sequence to align the apo structure against"
+            )));
+        }
+
+        let sasa_vec = compute_shrake_rupley_rsasa(apo, &[]);
+        for (&idx, &pos) in &receptor_ix.idx_to_pos {
+            if let Some(s) = sasa_vec.get(pos) {
+                apo_rsasa_by_idx.insert(idx, s.rsasa);
+            }
+            if let Some(r) = apo.residues.get(pos) {
+                apo_cb_by_idx.insert(idx, r.cb.unwrap_or(r.ca));
+            }
+        }
+    } else if !input.raw_csp_rows.is_empty() {
+        diagnostics.push(
+            "No apo 3D structure supplied; 2-sigma CSP hits retained without Shrake-Rupley rSASA core filtering (explicit allow_unfiltered_no_apo opt-in)."
+                .to_string(),
+        );
+    }
+
+    // ---- Resolve how experimental seq_ids relate to the target sequence ------------------------
+    let mut name_rows: Vec<(i32, u8)> = input
+        .raw_csp_rows
+        .iter()
+        .filter_map(|(sid, name, _, _, _)| {
+            let aa = aa_one_letter_from_name(name);
+            (aa != b'X').then_some((*sid, aa))
+        })
+        .collect();
+    if name_rows.is_empty() {
+        for m in &input.rdc_media {
+            for r in &m.restraints {
+                if r.chain_1 == receptor_chain_id {
+                    let aa = aa_one_letter_from_name(&r.res_name_1);
+                    if aa != b'X' {
+                        name_rows.push((r.seq_id_1, aa));
+                    }
+                }
+                if r.chain_2 == receptor_chain_id && r.seq_id_2 != r.seq_id_1 {
+                    let aa = aa_one_letter_from_name(&r.res_name_2);
+                    if aa != b'X' {
+                        name_rows.push((r.seq_id_2, aa));
+                    }
+                }
+            }
+        }
+    }
+    let mut cand_apo = receptor_ix.clone();
+    cand_apo.numbering = RestraintNumbering::ApoAuthor;
+    let mut cand_fasta = receptor_ix.clone();
+    cand_fasta.numbering = RestraintNumbering::FastaIndex;
+    let have_target = !receptor_ix.target.is_empty();
+    let id_apo = if have_apo_map {
+        row_name_identity(&cand_apo, &name_rows)
+    } else {
+        0.0
+    };
+    let id_fasta = row_name_identity(&cand_fasta, &name_rows);
+    let min_id = cfg.min_alignment_identity;
+    let (resolved, resolution_note) = match cfg.numbering {
+        RestraintNumbering::ApoAuthor => {
+            if !have_apo_map {
+                return Err(NmrError::invalid_input(
+                    "numbering=apo requires an apo receptor structure",
+                ));
+            }
+            if have_target && !name_rows.is_empty() && id_apo < min_id {
+                return Err(NmrError::restraint_mismatch(format!(
+                    "residue-name cross-check failed under apo author numbering (identity {id_apo:.3} < {min_id:.2})"
+                )));
+            }
+            (
+                RestraintNumbering::ApoAuthor,
+                "apo author numbering (explicit)".to_string(),
+            )
+        }
+        RestraintNumbering::FastaIndex => {
+            if have_target && !name_rows.is_empty() && id_fasta < min_id {
+                return Err(NmrError::restraint_mismatch(format!(
+                    "residue-name cross-check failed under FASTA-index numbering (identity {id_fasta:.3} < {min_id:.2})"
+                )));
+            }
+            (
+                RestraintNumbering::FastaIndex,
+                "FASTA-index numbering (explicit)".to_string(),
+            )
+        }
+        RestraintNumbering::Auto => {
+            if name_rows.is_empty() || !have_target {
+                if have_apo_map {
+                    let dist_sids: Vec<i32> = input
+                        .raw_distance_restraints
+                        .iter()
+                        .flat_map(|r| {
+                            let mut v = Vec::new();
+                            if r.chain_1 == receptor_chain_id && r.one_based_seq_idx_1.is_none() {
+                                v.push(r.seq_id_1);
+                            }
+                            if r.chain_2 == receptor_chain_id && r.one_based_seq_idx_2.is_none() {
+                                v.push(r.seq_id_2);
+                            }
+                            v
+                        })
+                        .collect();
+                    let all_apo = dist_sids.iter().all(|&s| cand_apo.exp_to_idx(s).is_some());
+                    let all_fasta = dist_sids
+                        .iter()
+                        .all(|&s| cand_fasta.exp_to_idx(s).is_some());
+                    if !dist_sids.is_empty() && !all_apo && all_fasta {
+                        (
+                            RestraintNumbering::FastaIndex,
+                            "FASTA-index numbering (unverified by residue names; distance restraint seq_ids fit FASTA indices)"
+                                .to_string(),
+                        )
+                    } else {
+                        (
+                            RestraintNumbering::ApoAuthor,
+                            "apo author numbering (unverified: no residue names to cross-check)"
+                                .to_string(),
+                        )
+                    }
+                } else {
+                    (
+                        RestraintNumbering::FastaIndex,
+                        "FASTA-index numbering (unverified: no apo structure / residue names)"
+                            .to_string(),
+                    )
+                }
+            } else if have_apo_map && id_apo >= min_id {
+                (
+                    RestraintNumbering::ApoAuthor,
+                    format!("apo author numbering (residue-name identity {id_apo:.3}; FASTA-index identity {id_fasta:.3})"),
+                )
+            } else if id_fasta >= min_id {
+                (
+                    RestraintNumbering::FastaIndex,
+                    format!("FASTA-index numbering (residue-name identity {id_fasta:.3}; apo-author identity {id_apo:.3})"),
+                )
+            } else {
+                return Err(NmrError::restraint_mismatch(format!(
+                    "restraint residue names match neither apo author numbering (identity {id_apo:.3}) nor FASTA indices (identity {id_fasta:.3}); refusing to guess the restraint numbering (cross-check threshold {min_id:.2})"
+                )));
+            }
+        }
+    };
+    receptor_ix.numbering = resolved;
+    diagnostics.push(format!("Restraint numbering resolved: {resolution_note}."));
+
+    let mut chain_exp_numbering: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+    if have_target {
+        let v = receptor_ix.idx_to_exp();
+        if v.iter().enumerate().any(|(k, &e)| e != (k as i32 + 1)) {
+            chain_exp_numbering.insert(receptor_chain_id.clone(), v);
+        }
+    }
+
+    // Experimental `seq_id` -> 1-based target index (receptor chain: aligned numbering; other
+    // polymer chains carry no structure so `seq_id` is taken as the FASTA index).
     let resolve_one_based = |chain_id: &str, seq_id: i32| -> Result<usize, NmrError> {
-        if let Some(&idx1) = seq_id_to_one_based.get(&(chain_id.to_string(), seq_id)) {
-            return Ok(idx1);
+        if chain_id == receptor_chain_id {
+            return receptor_ix.exp_to_idx(seq_id).ok_or_else(|| {
+                NmrError::restraint_mismatch(format!(
+                    "residue seq_id {seq_id} on receptor chain '{chain_id}' cannot be mapped into the {}-residue target sequence under the resolved numbering",
+                    receptor_ix.target.len()
+                ))
+            });
         }
         if seq_id < 1 {
             return Err(NmrError::invalid_input(format!(
-                "residue seq_id {seq_id} on chain '{chain_id}' cannot map to a 1-based sequence index without an apo coordinate model"
+                "residue seq_id {seq_id} on chain '{chain_id}' cannot map to a 1-based sequence index"
             )));
         }
         let idx1 = seq_id as usize;
@@ -1289,9 +2399,11 @@ pub fn extract_nmr_interface_restraints(
     };
 
     // 1. Williamson (2013) iterative 2-sigma CSP threshold + Shrake-Rupley rSASA pocket filtering
-    let mut csp_observations = Vec::with_capacity(input.raw_csp_rows.len());
+    let mut csp_observations: Vec<ReceptorCspObservation> =
+        Vec::with_capacity(input.raw_csp_rows.len());
     let mut pocket_contacts = Vec::new();
     let mut allosteric_core_perturbations = Vec::new();
+    let mut distal_surface_csp_hits = Vec::new();
 
     let csp_thresholds = if !input.raw_csp_rows.is_empty() {
         let mut pairs = Vec::with_capacity(input.raw_csp_rows.len());
@@ -1308,20 +2420,12 @@ pub fn extract_nmr_interface_restraints(
 
         for (seq_id, res_name, csp_val, dh_opt, dn_opt) in &input.raw_csp_rows {
             let one_based = resolve_one_based(&receptor_chain_id, *seq_id)?;
-            let apo_rsasa = rsasa_by_seq_id
-                .get(&(receptor_chain_id.clone(), *seq_id))
-                .copied()
-                .or_else(|| {
-                    // Fallback if apo PDB used default chain 'A' while FASTA used custom receptor ID
-                    if input.apo_receptor_model.is_some() {
-                        rsasa_by_seq_id.get(&("A".to_string(), *seq_id)).copied()
-                    } else {
-                        None
-                    }
-                });
+            let apo_rsasa = apo_rsasa_by_idx.get(&one_based).copied();
             let is_hit = sig_set.contains(seq_id);
             let p_class = if !is_hit {
                 CspPerturbationClass::BelowThreshold
+            } else if input.apo_receptor_model.is_none() {
+                CspPerturbationClass::UnfilteredNoApoStructure
             } else if let Some(rs) = apo_rsasa {
                 if rs >= cfg.min_pocket_rsasa {
                     CspPerturbationClass::SurfacePocketContact
@@ -1329,9 +2433,8 @@ pub fn extract_nmr_interface_restraints(
                     CspPerturbationClass::AllostericCorePerturbation
                 }
             } else {
-                CspPerturbationClass::UnfilteredNoApoStructure
+                CspPerturbationClass::UnresolvedInApo
             };
-
             csp_observations.push(ReceptorCspObservation {
                 chain_id: receptor_chain_id.clone(),
                 one_based_seq_idx: one_based,
@@ -1344,45 +2447,97 @@ pub fn extract_nmr_interface_restraints(
                 is_2sigma_hit: is_hit,
                 perturbation_class: p_class,
             });
+        }
 
-            match p_class {
-                CspPerturbationClass::SurfacePocketContact
-                | CspPerturbationClass::UnfilteredNoApoStructure => {
-                    pocket_contacts.push(PocketContactRestraint {
-                        chain_id: receptor_chain_id.clone(),
-                        one_based_seq_idx: one_based,
-                        seq_id: *seq_id,
-                        res_name: res_name.clone(),
-                        csp_ppm: *csp_val,
-                        apo_rsasa,
-                        classification: p_class,
-                    });
+        // Spatial cluster filter: a surface-exposed hit isolated from the dominant surface patch is a
+        // distal (allosteric / long-range) perturbation, not a direct contact (`21.W3:P1-8`).
+        if cfg.enable_pocket_cluster_filter {
+            let surf: Vec<usize> = csp_observations
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| {
+                    o.perturbation_class == CspPerturbationClass::SurfacePocketContact
+                        && apo_cb_by_idx.contains_key(&o.one_based_seq_idx)
+                })
+                .map(|(k, _)| k)
+                .collect();
+            if surf.len() >= 2 {
+                let pts: Vec<Vec3> = surf
+                    .iter()
+                    .map(|&k| apo_cb_by_idx[&csp_observations[k].one_based_seq_idx])
+                    .collect();
+                let clusters = single_linkage_clusters(&pts, cfg.pocket_cluster_cutoff_a);
+                if clusters.len() > 1 {
+                    let cluster_weight = |c: &Vec<usize>| -> f64 {
+                        c.iter()
+                            .map(|&p| csp_observations[surf[p]].csp_obs_ppm)
+                            .sum()
+                    };
+                    let primary = clusters
+                        .iter()
+                        .enumerate()
+                        .max_by(|(ia, a), (ib, b)| {
+                            cluster_weight(a)
+                                .total_cmp(&cluster_weight(b))
+                                .then_with(|| ib.cmp(ia))
+                        })
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    let mut n_demoted = 0usize;
+                    for (ci, cl) in clusters.iter().enumerate() {
+                        if ci != primary && cl.len() < cfg.min_secondary_cluster_size {
+                            for &p in cl {
+                                csp_observations[surf[p]].perturbation_class =
+                                    CspPerturbationClass::DistalSurfaceOutlier;
+                                n_demoted += 1;
+                            }
+                        }
+                    }
+                    if n_demoted > 0 {
+                        diagnostics.push(format!(
+                            "WARNING: {n_demoted} surface-exposed 2-sigma CSP hit(s) lie > {:.1} A (C-beta single linkage) from the dominant surface patch and were demoted to DistalSurfaceOutlier (not exported as Boltz-2 pocket contacts); they may be surface-exposed allosteric perturbations.",
+                            cfg.pocket_cluster_cutoff_a
+                        ));
+                    }
                 }
+            }
+        }
+
+        for o in &csp_observations {
+            let rec = || PocketContactRestraint {
+                chain_id: o.chain_id.clone(),
+                one_based_seq_idx: o.one_based_seq_idx,
+                seq_id: o.seq_id,
+                res_name: o.res_name.clone(),
+                csp_ppm: o.csp_obs_ppm,
+                apo_rsasa: o.apo_rsasa,
+                classification: o.perturbation_class,
+            };
+            match o.perturbation_class {
+                CspPerturbationClass::SurfacePocketContact
+                | CspPerturbationClass::UnfilteredNoApoStructure => pocket_contacts.push(rec()),
                 CspPerturbationClass::AllostericCorePerturbation => {
-                    allosteric_core_perturbations.push(PocketContactRestraint {
-                        chain_id: receptor_chain_id.clone(),
-                        one_based_seq_idx: one_based,
-                        seq_id: *seq_id,
-                        res_name: res_name.clone(),
-                        csp_ppm: *csp_val,
-                        apo_rsasa,
-                        classification: p_class,
-                    });
+                    allosteric_core_perturbations.push(rec())
+                }
+                CspPerturbationClass::DistalSurfaceOutlier => distal_surface_csp_hits.push(rec()),
+                CspPerturbationClass::UnresolvedInApo => {
+                    diagnostics.push(format!(
+                        "2-sigma CSP hit at seq_id {} (target index {}) has no resolved apo coordinates (missing density / tag); excluded from the pocket export.",
+                        o.seq_id, o.one_based_seq_idx
+                    ));
                 }
                 CspPerturbationClass::BelowThreshold => {}
             }
         }
 
         // Deterministic sort by `(chain_id, one_based_seq_idx)`
-        pocket_contacts.sort_by(|a, b| {
-            (&a.chain_id, a.one_based_seq_idx).cmp(&(&b.chain_id, b.one_based_seq_idx))
-        });
+        let key = |p: &PocketContactRestraint| (p.chain_id.clone(), p.one_based_seq_idx);
+        pocket_contacts.sort_by_key(key);
         pocket_contacts.dedup_by(|a, b| {
             a.chain_id == b.chain_id && a.one_based_seq_idx == b.one_based_seq_idx
         });
-        allosteric_core_perturbations.sort_by(|a, b| {
-            (&a.chain_id, a.one_based_seq_idx).cmp(&(&b.chain_id, b.one_based_seq_idx))
-        });
+        allosteric_core_perturbations.sort_by_key(key);
+        distal_surface_csp_hits.sort_by_key(key);
 
         if !allosteric_core_perturbations.is_empty() {
             diagnostics.push(format!(
@@ -1397,8 +2552,11 @@ pub fn extract_nmr_interface_restraints(
         None
     };
 
-    // 2. Intermolecular NOE & PRE distance restraints -> `[4.5, 14.0] A` Boltz-2 contact tokens
+    // 2. Intermolecular NOE & PRE distance restraints -> Boltz-2 contact tokens.
+    //    Upper bounds above `max_contact_distance_a` are DROPPED (never clamped to the ceiling).
     let mut distance_restraints = Vec::with_capacity(input.raw_distance_restraints.len());
+    let mut dropped_weak = 0usize;
+    let mut unexportable_lig_contacts = 0usize;
     for raw in &input.raw_distance_restraints {
         if !raw.lower_a.is_finite()
             || raw.lower_a < 0.0
@@ -1439,40 +2597,64 @@ pub fn extract_nmr_interface_restraints(
             })
         };
 
-        let tok1 = if is_lig_1 {
-            BoltzContactToken::LigandAtom {
-                chain_id: raw.chain_1.clone(),
-                atom_name: raw.atom_1.trim().to_ascii_uppercase(),
-            }
-        } else {
-            BoltzContactToken::PolymerResidue {
-                chain_id: raw.chain_1.clone(),
-                one_based_seq_idx: idx1_opt.unwrap_or(1),
-            }
-        };
-        let tok2 = if is_lig_2 {
-            BoltzContactToken::LigandAtom {
-                chain_id: raw.chain_2.clone(),
-                atom_name: raw.atom_2.trim().to_ascii_uppercase(),
-            }
-        } else {
-            BoltzContactToken::PolymerResidue {
-                chain_id: raw.chain_2.clone(),
-                one_based_seq_idx: idx2_opt.unwrap_or(1),
-            }
-        };
-
-        // Export attractive intermolecular contacts (`chain_1 != chain_2` and finite attractive upper bound <= 20 A)
-        // clamped into `[min_contact_distance_a, max_contact_distance_a]` (`[4.5, 14.0] A`).
-        let exported_max =
-            if raw.chain_1 != raw.chain_2 && raw.upper_a.is_finite() && raw.upper_a <= 20.0 {
-                Some(
-                    raw.upper_a
-                        .clamp(cfg.min_contact_distance_a, cfg.max_contact_distance_a),
-                )
+        let attractive = raw.chain_1 != raw.chain_2 && raw.upper_a.is_finite();
+        let mut exported_max = None;
+        if attractive {
+            if raw.upper_a > cfg.max_contact_distance_a {
+                dropped_weak += 1;
             } else {
-                None
-            };
+                exported_max = Some(raw.upper_a.max(cfg.min_contact_distance_a));
+            }
+        }
+
+        // `SMILES` ligand atoms cannot be addressed in Boltz-2 `contact` tokens (the exported
+        // SMILES is re-canonicalised, so user atom names do not match how Boltz names atoms).
+        let touches_smiles_atom = (is_lig_1 && is_smiles_ligand_chain(&entities, &raw.chain_1))
+            || (is_lig_2 && is_smiles_ligand_chain(&entities, &raw.chain_2));
+        if exported_max.is_some() && touches_smiles_atom {
+            if cfg.scoring_only {
+                exported_max = None;
+                unexportable_lig_contacts += 1;
+            } else {
+                return Err(NmrError::invalid_input(format!(
+                    "atom-level contact {}:{}:{} <-> {}:{}:{} involves a SMILES ligand: Boltz-2/AF3 re-derive atom names from the canonicalised SMILES, so user atom names cannot be exported. Use a CCD ligand, a residue-level restraint, or build the bundle for scoring only (CofoldRestraintExtractConfig::scoring_only / `ferric cofold score`)",
+                    raw.chain_1, raw.seq_id_1, raw.atom_1, raw.chain_2, raw.seq_id_2, raw.atom_2
+                )));
+            }
+        }
+
+        let (tok1, tok2) = match (exported_max, idx1_opt, idx2_opt) {
+            (Some(_), i1, i2) => {
+                let t1 = if is_lig_1 {
+                    BoltzContactToken::LigandAtom {
+                        chain_id: raw.chain_1.clone(),
+                        atom_name: raw.atom_1.trim().to_ascii_uppercase(),
+                    }
+                } else {
+                    BoltzContactToken::PolymerResidue {
+                        chain_id: raw.chain_1.clone(),
+                        one_based_seq_idx: i1.ok_or_else(|| {
+                            NmrError::invalid_input("missing residue index for polymer endpoint 1")
+                        })?,
+                    }
+                };
+                let t2 = if is_lig_2 {
+                    BoltzContactToken::LigandAtom {
+                        chain_id: raw.chain_2.clone(),
+                        atom_name: raw.atom_2.trim().to_ascii_uppercase(),
+                    }
+                } else {
+                    BoltzContactToken::PolymerResidue {
+                        chain_id: raw.chain_2.clone(),
+                        one_based_seq_idx: i2.ok_or_else(|| {
+                            NmrError::invalid_input("missing residue index for polymer endpoint 2")
+                        })?,
+                    }
+                };
+                (Some(t1), Some(t2))
+            }
+            _ => (None, None),
+        };
 
         distance_restraints.push(IntermolecularDistanceRestraint {
             source: raw.source,
@@ -1489,9 +2671,20 @@ pub fn extract_nmr_interface_restraints(
             sigma_a: raw.sigma_a,
             pre_gamma2: raw.pre_gamma2,
             exported_contact_max_distance_a: exported_max,
-            boltz_token_1: exported_max.map(|_| tok1),
-            boltz_token_2: exported_max.map(|_| tok2),
+            boltz_token_1: tok1,
+            boltz_token_2: tok2,
         });
+    }
+    if dropped_weak > 0 {
+        diagnostics.push(format!(
+            "Dropped {dropped_weak} weak intermolecular restraint(s) whose upper bound exceeds the {:.1} A export ceiling (dropped, never clamped); they remain in the bundle with their original bounds for pose scoring.",
+            cfg.max_contact_distance_a
+        ));
+    }
+    if unexportable_lig_contacts > 0 {
+        diagnostics.push(format!(
+            "{unexportable_lig_contacts} SMILES-ligand atom contact(s) kept for pose scoring only (not exportable to Boltz-2/AF3)."
+        ));
     }
 
     let job_name = if input.job_name.trim().is_empty() {
@@ -1522,6 +2715,11 @@ pub fn extract_nmr_interface_restraints(
         experimental_kd_um: input.experimental_kd_um,
         af3_conditioning_note: "Public AlphaFold 3 JSON v2 (dialect='alphafold3', version=2) specifies polymer sequences, small-molecule SMILES/CCD ligands, modelSeeds, and covalent bondedAtomPairs only; non-covalent NMR pocket and PRE/NOE contact conditioning are enforced natively in Boltz-2 YAML v1 and downstream via `ferric cofold score` using this `.nmr_restraints.json` sidecar.".to_string(),
         diagnostics,
+        dropped_weak_restraints_count: dropped_weak,
+        distal_surface_csp_hits,
+        unexportable_ligand_atom_contacts_count: unexportable_lig_contacts,
+        chain_exp_numbering,
+        numbering_resolution: resolution_note,
     })
 }
 
@@ -1799,12 +2997,16 @@ pub fn parse_intermolecular_noe_tsv_str(
             (1, cols[4].to_ascii_uppercase(), 5usize)
         };
 
-        let upper_a: f64 = cols[rem_start].parse().map_err(|e| {
-            NmrError::parse(format!(
-                "NOE TSV line {line_no}: invalid upper_a '{}': {e}",
-                cols[rem_start]
-            ))
-        })?;
+        let upper_a: f64 = if let Some(cls) = NoeIntensityClass::parse_token(cols[rem_start]) {
+            cls.upper_a()
+        } else {
+            cols[rem_start].parse().map_err(|e| {
+                NmrError::parse(format!(
+                    "NOE TSV line {line_no}: invalid upper_a '{}': {e}",
+                    cols[rem_start]
+                ))
+            })?
+        };
         let lower_a: f64 = match cols
             .get(rem_start + 1)
             .copied()
@@ -1868,27 +3070,76 @@ pub fn parse_intermolecular_noe_tsv_str(
     Ok(out)
 }
 
-/// Parse intermolecular `T11.4` `PRE` bleaching / distance-bound / Solomon `Gamma_2` restraints from TSV text.
+/// Parse intermolecular `T11.4` `PRE` bleaching / distance-bound / Solomon `Gamma_2` restraints
+/// using [`parse_intermolecular_pre_tsv_str_with_params`].
 ///
-/// Header directives:
-/// - `# anchor: <chain_id> <seq_id> <atom_name>` (default spin-label/metal site when per-row anchor columns are omitted)
-/// - `# k_pre: <f64>` (Solomon constant in `A^6 s^-1`, default `1.23e7`)
-/// - `# mode: bounds | gamma2 | bleach`
-///
-/// Supported row schemas:
-/// - Explicit two-endpoint bounds: `chain_1  seq_id_1  atom_1  chain_2  seq_id_2  atom_2  lower_a  upper_a  [sigma_a]`
-/// - Explicit two-endpoint `gamma2`: `chain_1  seq_id_1  atom_1  chain_2  seq_id_2  atom_2  gamma2_s1  sigma_s1  [k_pre]`
-/// - Anchor-referenced target rows: `[target_chain]  target_seq_id  target_atom  <gamma2_s1 | lower_a upper_a | bleach upper_a>`
+/// For `Gamma_2` rate tables, `tau_c_ns` MUST be provided in the TSV header (`# tau_c_ns: <ns>`);
+/// otherwise this function fails closed (`Err`) instead of assuming a bogus constant (`21.W3:P0-4`).
 pub fn parse_intermolecular_pre_tsv_str(
     text: &str,
     default_anchor: Option<(&str, i32, &str)>,
     default_target_chain: &str,
     gamma2_upper_margin_a: f64,
 ) -> Result<Vec<IntermolecularDistanceRestraint>, NmrError> {
+    parse_intermolecular_pre_tsv_str_with_margin(
+        text,
+        default_anchor,
+        default_target_chain,
+        None,
+        gamma2_upper_margin_a,
+    )
+}
+
+/// Parse intermolecular `T11.4` `PRE` bleaching / distance-bound / Solomon `Gamma_2` restraints from
+/// TSV text with explicit [`PreSolomonParams`] (mandatory `tau_c_ns`, `proton_mhz`, `spin_s`,
+/// `tether_pad_a`).
+///
+/// Header directives:
+/// - `# anchor: <chain_id> <seq_id> <atom_name>`
+/// - `# tau_c_ns: <f64>` (required for `gamma2` unless `solomon_params` is `Some`)
+/// - `# proton_mhz: <f64>` (default `600.0 MHz`)
+/// - `# spin_s: <f64>` (default `0.5`)
+/// - `# tether_pad_a: <f64>` (default `6.0 A` for MTSL; `0.0 A` for rigid paramagnetic metal)
+/// - `# mode: bounds | gamma2 | bleach`
+pub fn parse_intermolecular_pre_tsv_str_with_params(
+    text: &str,
+    default_anchor: Option<(&str, i32, &str)>,
+    default_target_chain: &str,
+    solomon_params: Option<&PreSolomonParams>,
+) -> Result<Vec<IntermolecularDistanceRestraint>, NmrError> {
+    let margin = solomon_params.map(|p| p.upper_margin_a).unwrap_or(1.5);
+    parse_intermolecular_pre_tsv_str_with_margin(
+        text,
+        default_anchor,
+        default_target_chain,
+        solomon_params,
+        margin,
+    )
+}
+
+fn parse_intermolecular_pre_tsv_str_with_margin(
+    text: &str,
+    default_anchor: Option<(&str, i32, &str)>,
+    default_target_chain: &str,
+    solomon_params: Option<&PreSolomonParams>,
+    gamma2_upper_margin_a: f64,
+) -> Result<Vec<IntermolecularDistanceRestraint>, NmrError> {
     check_bounded_text(text, "intermolecular PRE TSV")?;
     let mut header_anchor: Option<(String, i32, String)> =
         default_anchor.map(|(c, s, a)| (c.to_string(), s, a.to_ascii_uppercase()));
-    let mut default_k_pre = 1.23e7_f64;
+    let mut header_tau_c_ns: Option<f64> = solomon_params.map(|p| p.tau_c_ns);
+    let mut header_proton_mhz: f64 = solomon_params
+        .map(|p| p.proton_mhz)
+        .unwrap_or(DEFAULT_PRE_PROTON_MHZ);
+    let mut header_spin_s: f64 = solomon_params
+        .map(|p| p.spin_s)
+        .unwrap_or(DEFAULT_PRE_ELECTRON_SPIN);
+    let mut header_tether_pad_a: f64 = solomon_params
+        .map(|p| p.tether_pad_a)
+        .unwrap_or(DEFAULT_MTSL_TETHER_PAD_A);
+    let header_upper_margin_a: f64 = solomon_params
+        .map(|p| p.upper_margin_a)
+        .unwrap_or(gamma2_upper_margin_a);
     let mut mode_hint: Option<String> = None;
     let mut out = Vec::new();
 
@@ -1923,16 +3174,62 @@ pub fn parse_intermolecular_pre_tsv_str(
                     })?;
                     header_anchor = Some(("B".to_string(), sid, parts[1].to_ascii_uppercase()));
                 }
-            } else if let Some(rest) = c.strip_prefix("k_pre:") {
-                let kv: f64 = rest.trim().parse().map_err(|e| {
-                    NmrError::parse(format!("PRE TSV line {line_no}: invalid # k_pre: {e}"))
+            } else if let Some(rest) = c
+                .strip_prefix("tau_c_ns:")
+                .or_else(|| c.strip_prefix("tau_c:"))
+            {
+                let tv: f64 = rest.trim().parse().map_err(|e| {
+                    NmrError::parse(format!("PRE TSV line {line_no}: invalid # tau_c_ns: {e}"))
                 })?;
-                if !kv.is_finite() || kv <= 0.0 {
+                if !tv.is_finite() || !(0.05..=1.0e4).contains(&tv) {
                     return Err(NmrError::parse(format!(
-                        "PRE TSV line {line_no}: # k_pre must be finite and > 0"
+                        "PRE TSV line {line_no}: # tau_c_ns ({tv}) must be finite in [0.05, 10000] ns"
                     )));
                 }
-                default_k_pre = kv;
+                if solomon_params.is_none() {
+                    header_tau_c_ns = Some(tv);
+                }
+            } else if let Some(rest) = c.strip_prefix("proton_mhz:") {
+                let fv: f64 = rest.trim().parse().map_err(|e| {
+                    NmrError::parse(format!("PRE TSV line {line_no}: invalid # proton_mhz: {e}"))
+                })?;
+                if !fv.is_finite() || !(1.0..=5.0e3).contains(&fv) {
+                    return Err(NmrError::parse(format!(
+                        "PRE TSV line {line_no}: # proton_mhz ({fv}) must be finite in [1, 5000] MHz"
+                    )));
+                }
+                if solomon_params.is_none() {
+                    header_proton_mhz = fv;
+                }
+            } else if let Some(rest) = c.strip_prefix("spin_s:") {
+                let sv: f64 = rest.trim().parse().map_err(|e| {
+                    NmrError::parse(format!("PRE TSV line {line_no}: invalid # spin_s: {e}"))
+                })?;
+                if !sv.is_finite() || !(0.5..=8.0).contains(&sv) {
+                    return Err(NmrError::parse(format!(
+                        "PRE TSV line {line_no}: # spin_s ({sv}) must be finite in [0.5, 8.0]"
+                    )));
+                }
+                if solomon_params.is_none() {
+                    header_spin_s = sv;
+                }
+            } else if let Some(rest) = c
+                .strip_prefix("tether_pad_a:")
+                .or_else(|| c.strip_prefix("mtsl_pad_a:"))
+            {
+                let pv: f64 = rest.trim().parse().map_err(|e| {
+                    NmrError::parse(format!(
+                        "PRE TSV line {line_no}: invalid # tether_pad_a: {e}"
+                    ))
+                })?;
+                if !pv.is_finite() || !(0.0..=15.0).contains(&pv) {
+                    return Err(NmrError::parse(format!(
+                        "PRE TSV line {line_no}: # tether_pad_a ({pv}) must be finite in [0, 15] A"
+                    )));
+                }
+                if solomon_params.is_none() {
+                    header_tether_pad_a = pv;
+                }
             } else if let Some(rest) = c.strip_prefix("mode:") {
                 mode_hint = Some(rest.trim().to_ascii_lowercase());
             }
@@ -2119,6 +3416,20 @@ pub fn parse_intermolecular_pre_tsv_str(
                 boltz_token_2: None,
             });
         } else {
+            let tau_c_ns = header_tau_c_ns.ok_or_else(|| {
+                NmrError::invalid_input(format!(
+                    "PRE line {line_no}: Gamma_2 PRE conversion requires rotational correlation time tau_c_ns (--pre-tau-c or `# tau_c_ns: <ns>` header); no default tau_c is assumed (21.W3:P0-4)"
+                ))
+            })?;
+            let params = PreSolomonParams {
+                tau_c_ns,
+                proton_mhz: header_proton_mhz,
+                spin_s: header_spin_s,
+                tether_pad_a: header_tether_pad_a,
+                upper_margin_a: header_upper_margin_a,
+            };
+            let k_eff = params.k_eff_a6_s1()?;
+
             let gamma2: f64 = rem[0].parse().map_err(|e| {
                 NmrError::parse(format!(
                     "PRE line {line_no}: invalid gamma2_s1 '{}': {e}",
@@ -2131,25 +3442,18 @@ pub fn parse_intermolecular_pre_tsv_str(
                 })?,
                 None => 2.0,
             };
-            let k_pre: f64 = match rem.get(2).copied().filter(|s| !s.is_empty() && *s != ".") {
-                Some(s) => s.parse().map_err(|e| {
-                    NmrError::parse(format!("PRE line {line_no}: invalid k_pre '{s}': {e}"))
-                })?,
-                None => default_k_pre,
-            };
-            if !gamma2.is_finite()
-                || gamma2 < 0.0
-                || !sigma_g2.is_finite()
-                || sigma_g2 <= 0.0
-                || !k_pre.is_finite()
-                || k_pre <= 0.0
-            {
+            if !gamma2.is_finite() || gamma2 < 0.0 || !sigma_g2.is_finite() || sigma_g2 <= 0.0 {
                 return Err(NmrError::parse(format!(
-                    "PRE line {line_no}: non-physical gamma2/sigma/k_pre values"
+                    "PRE line {line_no}: non-physical gamma2/sigma values"
                 )));
             }
-            let (lower_a, upper_a) =
-                solomon_gamma2_to_distance_bounds(gamma2, sigma_g2, k_pre, gamma2_upper_margin_a);
+            let (lower_a, upper_a) = solomon_gamma2_to_distance_bounds(
+                gamma2,
+                sigma_g2,
+                k_eff,
+                params.tether_pad_a,
+                params.upper_margin_a,
+            );
             out.push(IntermolecularDistanceRestraint {
                 source: DistanceRestraintSource::PreGamma2Rate,
                 chain_1: c1,
@@ -2163,7 +3467,7 @@ pub fn parse_intermolecular_pre_tsv_str(
                 lower_a,
                 upper_a,
                 sigma_a: 1.00,
-                pre_gamma2: Some((gamma2, sigma_g2, k_pre)),
+                pre_gamma2: Some((gamma2, sigma_g2, k_eff)),
                 exported_contact_max_distance_a: None,
                 boltz_token_1: None,
                 boltz_token_2: None,
@@ -2182,48 +3486,25 @@ fn sixth_root(x: f64) -> f64 {
     det_cbrt(x.max(0.0).sqrt())
 }
 
-fn solomon_gamma2_to_distance_bounds(
+/// Convert a Solomon `Gamma_2` (`s^-1`) and `sigma` (`s^-1`) into `(lower_a, upper_a)` bounds
+/// including configurable MTSL `tether_pad_a` (`6.0 A` for MTSL, `0.0 A` for rigid metal).
+pub fn solomon_gamma2_to_distance_bounds(
     gamma2_s1: f64,
     sigma_s1: f64,
-    k_pre_a6_s1: f64,
+    k_eff_a6_s1: f64,
+    tether_pad_a: f64,
     upper_margin_a: f64,
 ) -> (f64, f64) {
+    let pad = tether_pad_a.max(0.0);
     let g_hi = (gamma2_s1 + 2.0 * sigma_s1).max(0.5);
-    let r_min = (sixth_root(k_pre_a6_s1 / g_hi) - 1.0).max(1.80);
+    let r_min = (sixth_root(k_eff_a6_s1 / g_hi) - pad - 1.0).max(1.80);
     // Near-zero PRE (`gamma2 <= 2 * sigma` and `< 3.0 s^-1`) gives a lower-bound exclusion zone only!
     if gamma2_s1 <= 2.0 * sigma_s1 && gamma2_s1 < 3.0 {
         (r_min, f64::INFINITY)
     } else {
         let g_lo = (gamma2_s1 - 2.0 * sigma_s1).max(0.5 * gamma2_s1).max(0.5);
-        let r_max = sixth_root(k_pre_a6_s1 / g_lo) + upper_margin_a.max(0.5);
+        let r_max = sixth_root(k_eff_a6_s1 / g_lo) + pad + upper_margin_a.max(0.0);
         (r_min.min(r_max - 0.5), r_max)
-    }
-}
-
-/// Convert a [`PreRestraintKind`] (`domain_dock`) into `(lower_a, upper_a, sigma_a, pre_gamma2_opt)`.
-pub fn domain_pre_kind_to_bounds(
-    kind: PreRestraintKind,
-    upper_margin_a: f64,
-) -> (f64, f64, f64, Option<(f64, f64, f64)>) {
-    match kind {
-        PreRestraintKind::DistanceBounds {
-            lower_a,
-            upper_a,
-            sigma_a,
-        } => (lower_a, upper_a, sigma_a, None),
-        PreRestraintKind::Gamma2Rate {
-            gamma2_obs_s1,
-            sigma_s1,
-            k_pre_a6_s1,
-        } => {
-            let (lo, hi) = solomon_gamma2_to_distance_bounds(
-                gamma2_obs_s1,
-                sigma_s1,
-                k_pre_a6_s1,
-                upper_margin_a,
-            );
-            (lo, hi, 1.0, Some((gamma2_obs_s1, sigma_s1, k_pre_a6_s1)))
-        }
     }
 }
 
@@ -2270,6 +3551,11 @@ pub fn parse_cofold_rdc_tsv_str(
             experimental_kd_um: None,
             af3_conditioning_note: String::new(),
             diagnostics: Vec::new(),
+            dropped_weak_restraints_count: 0,
+            distal_surface_csp_hits: Vec::new(),
+            unexportable_ligand_atom_contacts_count: 0,
+            chain_exp_numbering: BTreeMap::new(),
+            numbering_resolution: String::new(),
         }
         .with_chain_rdc_media(default_chain, &single);
         return Ok(bundle.rdc_media);
@@ -2655,6 +3941,7 @@ pub fn export_af3_json(
     }
     for ent in &restraints.entities {
         ent.validate()?;
+        validate_af3_chain_id(ent.chain_id())?;
     }
 
     let mut seq_entries: Vec<Value> = Vec::with_capacity(restraints.entities.len());
@@ -2701,11 +3988,7 @@ pub fn export_af3_json(
 
     let mut bonded_pairs: Vec<Value> = Vec::with_capacity(restraints.bonded_atom_pairs.len());
     for bp in &restraints.bonded_atom_pairs {
-        if bp.atom1.one_based_res_idx == 0 || bp.atom2.one_based_res_idx == 0 {
-            return Err(NmrError::invalid_input(
-                "AlphaFold 3 bondedAtomPairs require 1-based residue indices (>= 1)",
-            ));
-        }
+        validate_bonded_atom_pair(bp, &restraints.entities)?;
         bonded_pairs.push(json!([
             [
                 bp.atom1.chain_id,
@@ -2774,13 +4057,16 @@ fn yaml_single_quote(s: &str) -> String {
 
 fn yaml_safe_scalar(s: &str) -> String {
     let trimmed = s.trim();
+    let starts_digit = trimmed.chars().next().is_some_and(|c| c.is_ascii_digit());
     if !trimmed.is_empty()
+        && !starts_digit
+        && trimmed.parse::<f64>().is_err()
         && trimmed
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !matches!(
             trimmed.to_ascii_lowercase().as_str(),
-            "true" | "false" | "null" | "yes" | "no" | "on" | "off"
+            "true" | "false" | "null" | "yes" | "no" | "on" | "off" | "y" | "n"
         )
     {
         trimmed.to_string()
@@ -2825,10 +4111,12 @@ pub fn export_boltz2_yaml(
     let pocket_max_d = cfg
         .pocket_max_distance_override
         .unwrap_or(restraints.pocket_max_distance_a);
-    if !pocket_max_d.is_finite() || pocket_max_d <= 0.0 {
-        return Err(NmrError::invalid_input(
-            "Boltz-2 pocket max_distance must be finite and > 0",
-        ));
+    if !pocket_max_d.is_finite()
+        || !(BOLTZ2_MIN_DISTANCE_A..=BOLTZ2_MAX_DISTANCE_A).contains(&pocket_max_d)
+    {
+        return Err(NmrError::invalid_input(format!(
+            "Boltz-2 pocket max_distance ({pocket_max_d}) must lie in [{BOLTZ2_MIN_DISTANCE_A}, {BOLTZ2_MAX_DISTANCE_A}] A"
+        )));
     }
     let force_flag = cfg.force_override.unwrap_or(restraints.force_constraints);
     let include_affinity = cfg
@@ -2863,19 +4151,16 @@ pub fn export_boltz2_yaml(
                         y.push_str(&format!("      smiles: {}\n", yaml_single_quote(&can)));
                     }
                     CofoldLigandSpec::CcdCodes(codes) => {
-                        if codes.len() == 1 {
-                            y.push_str(&format!(
-                                "      ccd: {}\n",
-                                yaml_safe_scalar(&codes[0].to_ascii_uppercase())
-                            ));
-                        } else {
-                            let joined = codes
-                                .iter()
-                                .map(|c| yaml_safe_scalar(&c.to_ascii_uppercase()))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            y.push_str(&format!("      ccd: [{joined}]\n"));
+                        if codes.len() != 1 {
+                            return Err(NmrError::invalid_input(format!(
+                                "Boltz-2 YAML ligand 'ccd' on chain '{chain_id}' requires a single CCD code string, got {} codes (use separate ligand entities or SMILES)",
+                                codes.len()
+                            )));
                         }
+                        y.push_str(&format!(
+                            "      ccd: {}\n",
+                            yaml_safe_scalar(&codes[0].to_ascii_uppercase())
+                        ));
                     }
                 }
             }
@@ -2949,6 +4234,22 @@ pub fn export_boltz2_yaml(
         }
 
         for ((t1, t2), d_max) in &dedup_contacts {
+            if !d_max.is_finite()
+                || !(BOLTZ2_MIN_DISTANCE_A..=BOLTZ2_MAX_DISTANCE_A).contains(d_max)
+            {
+                return Err(NmrError::invalid_input(format!(
+                    "Boltz-2 contact max_distance ({d_max}) must lie in [{BOLTZ2_MIN_DISTANCE_A}, {BOLTZ2_MAX_DISTANCE_A}] A"
+                )));
+            }
+            for tok in [t1, t2] {
+                if let BoltzContactToken::LigandAtom { chain_id, .. } = tok {
+                    if is_smiles_ligand_chain(&restraints.entities, chain_id) {
+                        return Err(NmrError::invalid_input(format!(
+                            "Boltz-2 YAML cannot export atom-level contact on SMILES ligand chain '{chain_id}'"
+                        )));
+                    }
+                }
+            }
             y.push_str("  - contact:\n");
             y.push_str(&format!("      token1: {}\n", format_boltz_token_yaml(t1)));
             y.push_str(&format!("      token2: {}\n", format_boltz_token_yaml(t2)));
@@ -2991,6 +4292,7 @@ struct ComplexAtomRecord {
     is_hetatm: bool,
     chain_id: String,
     seq_id: i32,
+    ins_code: Option<String>,
     res_name: String,
     atom_name: String,
     z: u8,
@@ -3198,12 +4500,10 @@ fn parse_all_atoms_from_pose_str(
                                 continue;
                             }
                         }
-                        if let Some(ic) = ins_c {
-                            let ins = row[ic];
-                            if !matches!(ins, "." | "?" | "") {
-                                continue;
-                            }
-                        }
+                        let ins_code = ins_c.and_then(|ic| {
+                            let ins = row[ic].trim();
+                            (!matches!(ins, "." | "?" | "")).then(|| ins.to_string())
+                        });
                         let is_hetatm = grp_c
                             .map(|gc| row[gc].eq_ignore_ascii_case("HETATM"))
                             .unwrap_or(false);
@@ -3230,7 +4530,11 @@ fn parse_all_atoms_from_pose_str(
                                 NmrError::parse(format!("invalid mmCIF seq_id '{s}': {e}"))
                             })?,
                             None if is_hetatm => 1,
-                            None => 1,
+                            None => {
+                                return Err(NmrError::parse(
+                                    "mmCIF ATOM record missing auth_seq_id and label_seq_id",
+                                ));
+                            }
                         };
                         let x: f64 = row[x_c]
                             .parse()
@@ -3251,6 +4555,7 @@ fn parse_all_atoms_from_pose_str(
                             is_hetatm,
                             chain_id,
                             seq_id,
+                            ins_code,
                             res_name,
                             atom_name,
                             z: z_num,
@@ -3290,9 +4595,7 @@ fn parse_all_atoms_from_pose_str(
                 continue;
             }
             let i_code = line.as_bytes()[26];
-            if i_code != b' ' {
-                continue;
-            }
+            let ins_code = (i_code != b' ').then(|| (i_code as char).to_string());
             let res_name = line[17..20].trim().to_ascii_uppercase();
             if is_water_res_name(&res_name) {
                 continue;
@@ -3304,7 +4607,12 @@ fn parse_all_atoms_from_pose_str(
             } else {
                 chain_raw.to_string()
             };
-            let seq_id: i32 = line[22..26].trim().parse().unwrap_or(1);
+            let seq_raw = line[22..26].trim();
+            let seq_id: i32 = seq_raw.parse().map_err(|e| {
+                NmrError::parse(format!(
+                    "PDB line {line_no}: invalid residue seq_id '{seq_raw}': {e}"
+                ))
+            })?;
             let x: f64 = line[30..38]
                 .trim()
                 .parse()
@@ -3328,6 +4636,7 @@ fn parse_all_atoms_from_pose_str(
                 is_hetatm: is_het,
                 chain_id,
                 seq_id,
+                ins_code,
                 res_name,
                 atom_name,
                 z: z_num,
@@ -3521,6 +4830,7 @@ fn ring_geometry_and_planarity(vertices: &[Vec3]) -> Option<(Vec3, Vec3, f64)> {
 }
 
 fn ring_intensity_factor_for_elements(z_cycle: &[u8]) -> f64 {
+    let n_count = z_cycle.iter().filter(|&&z| z == 7).count();
     if z_cycle.len() == 6 {
         if z_cycle.iter().all(|&z| z == 6) {
             1.00
@@ -3528,7 +4838,15 @@ fn ring_intensity_factor_for_elements(z_cycle: &[u8]) -> f64 {
             0.85
         }
     } else if z_cycle.len() == 5 {
-        0.56
+        // Case (1995) / Haigh-Mallion 5-ring intensity factors: pyrrole/indole 5-ring (1 N) ~ 0.90,
+        // imidazole / His-like 5-ring (>= 2 N) ~ 0.43, other 5-rings ~ 0.56.
+        if n_count == 1 {
+            0.90
+        } else if n_count >= 2 {
+            0.43
+        } else {
+            0.56
+        }
     } else {
         0.75
     }
@@ -3801,7 +5119,14 @@ pub fn compute_interface_rmsd_angstrom(
 ) -> Result<f64, NmrError> {
     let ref_atoms = parse_all_atoms_from_pose_str(reference_coord_text, reference_format_hint)?;
     let cand_atoms = parse_all_atoms_from_pose_str(candidate_coord_text, candidate_format_hint)?;
+    compute_interface_rmsd_from_atoms(&cand_atoms, &ref_atoms, receptor_chain_id)
+}
 
+fn compute_interface_rmsd_from_atoms(
+    cand_atoms: &[ComplexAtomRecord],
+    ref_atoms: &[ComplexAtomRecord],
+    receptor_chain_id: &str,
+) -> Result<f64, NmrError> {
     let ref_rec: Vec<&ComplexAtomRecord> = ref_atoms
         .iter()
         .filter(|a| a.z > 1 && a.chain_id == receptor_chain_id)
@@ -3817,22 +5142,27 @@ pub fn compute_interface_rmsd_angstrom(
     }
 
     let cut_sq = CAPRI_INTERFACE_CUTOFF_A * CAPRI_INTERFACE_CUTOFF_A;
-    let mut iface_res: BTreeSet<(String, i32)> = BTreeSet::new();
+    let mut iface_res: BTreeSet<(String, i32, Option<String>)> = BTreeSet::new();
     for ra in &ref_rec {
         for pa in &ref_partner {
             if v_dist_sq(ra.pos, pa.pos) <= cut_sq {
-                iface_res.insert((ra.chain_id.clone(), ra.seq_id));
-                iface_res.insert((pa.chain_id.clone(), pa.seq_id));
+                iface_res.insert((ra.chain_id.clone(), ra.seq_id, ra.ins_code.clone()));
+                iface_res.insert((pa.chain_id.clone(), pa.seq_id, pa.ins_code.clone()));
             }
         }
     }
 
-    // Build `(chain_id, seq_id, atom_name) -> pos` map on candidate
-    let mut cand_map: BTreeMap<(String, i32, String), Vec3> = BTreeMap::new();
-    for a in &cand_atoms {
+    // Build `(chain_id, seq_id, ins_code, atom_name) -> pos` map on candidate
+    let mut cand_map: BTreeMap<(String, i32, Option<String>, String), Vec3> = BTreeMap::new();
+    for a in cand_atoms {
         if a.z > 1 {
             cand_map
-                .entry((a.chain_id.clone(), a.seq_id, a.atom_name.clone()))
+                .entry((
+                    a.chain_id.clone(),
+                    a.seq_id,
+                    a.ins_code.clone(),
+                    a.atom_name.clone(),
+                ))
                 .or_insert(a.pos);
         }
     }
@@ -3845,7 +5175,7 @@ pub fn compute_interface_rmsd_angstrom(
     //   nucleic `(P, C4', C1')` atoms across both receptor and partner interface residues.
     let has_polymer_partner_iface = ref_partner.iter().any(|pa| {
         !pa.is_hetatm
-            && iface_res.contains(&(pa.chain_id.clone(), pa.seq_id))
+            && iface_res.contains(&(pa.chain_id.clone(), pa.seq_id, pa.ins_code.clone()))
             && matches!(
                 pa.atom_name.as_str(),
                 "N" | "CA" | "C" | "O" | "P" | "C4'" | "C1'"
@@ -3856,7 +5186,7 @@ pub fn compute_interface_rmsd_angstrom(
         let mut pocket_ref = Vec::new();
         let mut pocket_cand = Vec::new();
         for ra in &ref_rec {
-            if !iface_res.contains(&(ra.chain_id.clone(), ra.seq_id)) {
+            if !iface_res.contains(&(ra.chain_id.clone(), ra.seq_id, ra.ins_code.clone())) {
                 continue;
             }
             if !matches!(
@@ -3865,8 +5195,12 @@ pub fn compute_interface_rmsd_angstrom(
             ) {
                 continue;
             }
-            if let Some(&cp) = cand_map.get(&(ra.chain_id.clone(), ra.seq_id, ra.atom_name.clone()))
-            {
+            if let Some(&cp) = cand_map.get(&(
+                ra.chain_id.clone(),
+                ra.seq_id,
+                ra.ins_code.clone(),
+                ra.atom_name.clone(),
+            )) {
                 pocket_ref.push(ra.pos);
                 pocket_cand.push(cp);
             }
@@ -3877,9 +5211,12 @@ pub fn compute_interface_rmsd_angstrom(
             pocket_cand.clear();
             for ra in &ref_rec {
                 if matches!(ra.atom_name.as_str(), "N" | "CA" | "C" | "O") {
-                    if let Some(&cp) =
-                        cand_map.get(&(ra.chain_id.clone(), ra.seq_id, ra.atom_name.clone()))
-                    {
+                    if let Some(&cp) = cand_map.get(&(
+                        ra.chain_id.clone(),
+                        ra.seq_id,
+                        ra.ins_code.clone(),
+                        ra.atom_name.clone(),
+                    )) {
                         pocket_ref.push(ra.pos);
                         pocket_cand.push(cp);
                     }
@@ -3890,8 +5227,12 @@ pub fn compute_interface_rmsd_angstrom(
         let mut lig_ref = Vec::new();
         let mut lig_cand = Vec::new();
         for pa in &ref_partner {
-            if let Some(&cp) = cand_map.get(&(pa.chain_id.clone(), pa.seq_id, pa.atom_name.clone()))
-            {
+            if let Some(&cp) = cand_map.get(&(
+                pa.chain_id.clone(),
+                pa.seq_id,
+                pa.ins_code.clone(),
+                pa.atom_name.clone(),
+            )) {
                 lig_ref.push(pa.pos);
                 lig_cand.push(cp);
             }
@@ -3915,11 +5256,12 @@ pub fn compute_interface_rmsd_angstrom(
 
     let mut pts_ref = Vec::new();
     let mut pts_cand = Vec::new();
-    for a in &ref_atoms {
+    for a in ref_atoms {
         if a.z <= 1 {
             continue;
         }
-        let in_iface = iface_res.contains(&(a.chain_id.clone(), a.seq_id)) || a.is_hetatm;
+        let in_iface =
+            iface_res.contains(&(a.chain_id.clone(), a.seq_id, a.ins_code.clone())) || a.is_hetatm;
         if !in_iface {
             continue;
         }
@@ -3931,7 +5273,12 @@ pub fn compute_interface_rmsd_angstrom(
         if !use_atom {
             continue;
         }
-        if let Some(&c_pos) = cand_map.get(&(a.chain_id.clone(), a.seq_id, a.atom_name.clone())) {
+        if let Some(&c_pos) = cand_map.get(&(
+            a.chain_id.clone(),
+            a.seq_id,
+            a.ins_code.clone(),
+            a.atom_name.clone(),
+        )) {
             pts_ref.push(a.pos);
             pts_cand.push(c_pos);
         }
@@ -4030,6 +5377,23 @@ impl StructurePoseInput {
     }
 }
 
+/// How [`score_cofold_poses`] computes the per-residue predicted `CSP` term `S_CSP` (`A7`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CspScoringMode {
+    /// Contact / burial enrichment (`AUC_contact` + `delta_rSASA` burial rank correlation + pocket
+    /// distance penalty) without adding `T21.2` `Delta_delta_calc` torsion shifts, which sit below
+    /// `T21.2`'s `~0.55 ppm` `1H` RMSE noise floor whenever apo and complex backbone conformations
+    /// differ (`A7`).
+    #[default]
+    BurialAndContactOnly,
+    /// Include `T21.2` `Delta_delta_calc` + ligand Haigh-Mallion + H-bond terms alongside burial.
+    FullForwardShiftAndBurial,
+}
+
+fn default_min_alignment_identity() -> f64 {
+    0.90
+}
+
 /// Configuration for [`score_cofold_poses`] (`docs/specs/21-alphafold-integrative-nmr.md` section 6.2).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PoseScoreConfig {
@@ -4045,7 +5409,7 @@ pub struct PoseScoreConfig {
     pub contact_cutoff_angstrom: f64,
     /// Maximum allowed intermolecular distance violation (`default = 1.50 A`) before decoy flag.
     pub max_allowed_distance_violation_angstrom: f64,
-    /// Minimum `CSP` contact ROC-AUC (`default = 0.58`) when `>= min_surface_hits_for_auc_guard` exist.
+    /// Minimum `CSP` contact ROC-AUC (`default = 0.65`) when `>= min_surface_hits_for_auc_guard` exist.
     pub min_csp_roc_auc: f64,
     /// Minimum surface `2-sigma` `CSP` hit count (`default = 5`) activating `min_csp_roc_auc`.
     pub min_surface_hits_for_auc_guard: usize,
@@ -4064,6 +5428,12 @@ pub struct PoseScoreConfig {
     pub struct_shift_config: StructShiftConfig,
     /// `HomologFirewall` exclusion query (`max_seq_identity <= 0.25`, `TM-score < 0.50`).
     pub firewall_query: HomologFirewallQuery,
+    /// Whether `S_CSP` uses burial/contact-only (`A7` default) or includes `T21.2` `Delta_delta_calc`.
+    #[serde(default)]
+    pub csp_scoring_mode: CspScoringMode,
+    /// Minimum amino-acid identity (`default = 0.90`) for pose-to-target alignment re-indexing.
+    #[serde(default = "default_min_alignment_identity")]
+    pub min_alignment_identity: f64,
 }
 
 impl Default for PoseScoreConfig {
@@ -4088,6 +5458,8 @@ impl Default for PoseScoreConfig {
                 ..StructShiftConfig::default()
             },
             firewall_query: HomologFirewallQuery::default(),
+            csp_scoring_mode: CspScoringMode::BurialAndContactOnly,
+            min_alignment_identity: default_min_alignment_identity(),
         }
     }
 }
@@ -4097,7 +5469,7 @@ impl Default for PoseScoreConfig {
 pub enum PoseViolationFlag {
     /// `max_distance_violation_angstrom > max_allowed_distance_violation_angstrom` (`1.50 A`).
     MaxDistanceViolationExceeded,
-    /// `csp_contact_roc_auc < min_csp_roc_auc` (`0.58`) with `>= 5` surface `CSP` pocket hits.
+    /// `csp_contact_roc_auc < min_csp_roc_auc` (`0.65`) with `>= 5` surface `CSP` pocket hits.
     LowCspContactEnrichment,
     /// `ByPeptidePlane` `RDC` `Q_free > max_allowed_rdc_q_free` (`0.65`).
     HighRdcQFree,
@@ -4140,6 +5512,9 @@ pub struct PoseScoreEntry {
     pub s_csp: f64,
     pub csp_spearman_rho: Option<f64>,
     pub csp_contact_roc_auc: Option<f64>,
+    /// One-sided Mann-Whitney U `p`-value testing `AUC_contact > 0.50` (`None` if no ROC samples).
+    #[serde(default)]
+    pub csp_contact_p_value: Option<f64>,
     pub mean_pocket_excess_dist_a: f64,
     pub noe_pre_violation_energy: f64,
     pub max_distance_violation_angstrom: f64,
@@ -4166,6 +5541,9 @@ pub struct PoseScoreReport {
     pub n_distance_restraints: usize,
     pub n_rdc_media: usize,
     pub n_pcs_tags: usize,
+    /// `CspScoringMode` used to evaluate `S_CSP` (`A7`).
+    #[serde(default)]
+    pub csp_scoring_mode: CspScoringMode,
     /// Spearman rank correlation `rho_s(-iRMSD, total_score)` when `cfg.reference_complex_pose` is supplied.
     pub funnel_spearman_rho_vs_neg_irmsd: Option<f64>,
     pub poses: Vec<PoseScoreEntry>,
@@ -4252,6 +5630,70 @@ pub fn binary_roc_auc(labels_and_scores: &[(bool, f64)]) -> Option<f64> {
     let nf_neg = n_neg as f64;
     let u_stat = rank_sum_pos - 0.5 * nf_pos * (nf_pos + 1.0);
     Some((u_stat / (nf_pos * nf_neg)).clamp(0.0, 1.0))
+}
+
+/// Complementary error function `erfc(x)` for `x >= 0` (Abramowitz & Stegun 7.1.26, max err `1.5e-7`),
+/// used for `wasm32`-clean deterministic Mann-Whitney `p`-values.
+fn erfc_approx(x: f64) -> f64 {
+    if x < 0.0 {
+        return 2.0 - erfc_approx(-x);
+    }
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let poly = t
+        * (0.254829592
+            + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    (poly * (-x * x).exp()).clamp(0.0, 2.0)
+}
+
+/// One-sided tie-corrected Mann-Whitney U `p`-value testing `AUC_contact > 0.50`.
+pub fn mann_whitney_p_value(labels_and_scores: &[(bool, f64)]) -> Option<f64> {
+    let n_pos = labels_and_scores.iter().filter(|&&(y, _)| y).count();
+    let n_neg = labels_and_scores.len().saturating_sub(n_pos);
+    if n_pos == 0 || n_neg == 0 {
+        return None;
+    }
+    let mut sorted: Vec<(bool, f64)> = labels_and_scores.to_vec();
+    sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+    let n = sorted.len();
+    let mut rank_sum_pos = 0.0_f64;
+    let mut tie_corr = 0.0_f64;
+    let mut i = 0usize;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && (sorted[j].1 - sorted[i].1).abs() <= 1e-12 {
+            j += 1;
+        }
+        let t = (j - i) as f64;
+        if t > 1.0 {
+            tie_corr += t * t * t - t;
+        }
+        let midrank = 0.5 * ((i + 1 + j) as f64);
+        for &(is_pos, _) in &sorted[i..j] {
+            if is_pos {
+                rank_sum_pos += midrank;
+            }
+        }
+        i = j;
+    }
+
+    let nf_pos = n_pos as f64;
+    let nf_neg = n_neg as f64;
+    let nf = n as f64;
+    let u_stat = rank_sum_pos - 0.5 * nf_pos * (nf_pos + 1.0);
+    let mu = 0.5 * nf_pos * nf_neg;
+    let var_term = (nf + 1.0)
+        - if nf > 1.0 {
+            tie_corr / (nf * (nf - 1.0))
+        } else {
+            0.0
+        };
+    let var = (nf_pos * nf_neg * var_term / 12.0).max(0.0);
+    if var <= 1e-15 {
+        return Some(1.0);
+    }
+    let z = (u_stat - mu) / var.sqrt();
+    Some((0.5 * erfc_approx(z / std::f64::consts::SQRT_2)).clamp(0.0, 1.0))
 }
 
 fn filter_model_to_chain(model: &StructureModel, receptor_chain_id: &str) -> StructureModel {
@@ -4620,6 +6062,97 @@ fn evaluate_pose_pcs_q(
     }
 }
 
+/// Re-index protein chain `chain_id` inside a [`StructureModel`] (and optionally matching
+/// non-HETATM atoms in `all_atoms`) by sequence alignment against `target`, mapping `0`-based
+/// target index `t0` to `exp_numbering[t0]` (or `(t0 + 1) as i32`). Unaligned tag/insertion
+/// residues receive disjoint negative IDs `-100_000 - k` so they never collide with experimental
+/// numbering while remaining physically present for SASA/sterics.
+fn reindex_model_chain_to_experimental(
+    model: &mut StructureModel,
+    mut all_atoms: Option<&mut Vec<ComplexAtomRecord>>,
+    chain_id: &str,
+    target: &[u8],
+    exp_numbering: Option<&[i32]>,
+    min_identity: f64,
+    label: &str,
+) -> Result<(), NmrError> {
+    if target.is_empty() || target.iter().all(|&b| b == b'X') {
+        return Ok(());
+    }
+    let obs = model_chain_observed(model, chain_id);
+    if obs.is_empty() {
+        return Ok(());
+    }
+    let obs_letters: Vec<u8> = obs.iter().map(|o| o.1).collect();
+    let aln = align_observed_to_target(&obs_letters, target)?;
+    require_alignment_quality(label, &aln, min_identity)?;
+
+    let mut pos_to_new: BTreeMap<usize, i32> = BTreeMap::new();
+    let mut old_to_new: BTreeMap<i32, i32> = BTreeMap::new();
+    for (k, tgt) in aln.observed_to_target.iter().enumerate() {
+        let (old_sid, _, pos) = obs[k];
+        let new_sid = match tgt {
+            Some(t0) => exp_numbering
+                .and_then(|v| v.get(*t0).copied())
+                .unwrap_or((*t0 + 1) as i32),
+            None => -100_000 - (k as i32),
+        };
+        pos_to_new.insert(pos, new_sid);
+        old_to_new.insert(old_sid, new_sid);
+    }
+
+    for (&pos, &new_sid) in &pos_to_new {
+        model.residues[pos].seq_id = new_sid;
+    }
+    for ring in &mut model.aromatic_rings {
+        if let Some(&new_sid) = pos_to_new.get(&ring.residue_index) {
+            ring.seq_id = new_sid;
+        }
+    }
+    if let Some(ref mut atoms) = all_atoms {
+        for a in atoms.iter_mut() {
+            if !a.is_hetatm && a.chain_id == chain_id && a.ins_code.is_none() {
+                if let Some(&new_sid) = old_to_new.get(&a.seq_id) {
+                    a.seq_id = new_sid;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reindex_pose_to_experimental(
+    pose: &mut ParsedComplexPose,
+    restraints: &CofoldRestraintBundle,
+    min_identity: f64,
+    label: &str,
+) -> Result<(), NmrError> {
+    for ent in &restraints.entities {
+        if let CofoldEntitySpec::Polymer {
+            kind: CofoldPolymerKind::Protein,
+            chain_id,
+            sequence,
+        } = ent
+        {
+            let target = sequence.trim().to_ascii_uppercase().into_bytes();
+            let exp_nums = restraints
+                .chain_exp_numbering
+                .get(chain_id)
+                .map(Vec::as_slice);
+            reindex_model_chain_to_experimental(
+                &mut pose.protein_model,
+                Some(&mut pose.all_atoms),
+                chain_id,
+                &target,
+                exp_nums,
+                min_identity,
+                &format!("{label} chain '{chain_id}'"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Rank and cross-validate $M \ge 1$ candidate co-folded complex poses (`.cif`/`.pdb`) against
 /// experimental `CSP`, intermolecular `NOE`/`PRE`, `ByPeptidePlane` `RDC` `Q_free`, and `PCS`
 /// restraints (`docs/specs/21-alphafold-integrative-nmr.md` section 6.2).
@@ -4648,8 +6181,16 @@ pub fn score_cofold_poses(
     } else {
         restraints.receptor_chain_id.trim()
     };
+    let receptor_target: Option<Vec<u8>> = restraints.entities.iter().find_map(|e| match e {
+        CofoldEntitySpec::Polymer {
+            kind: CofoldPolymerKind::Protein,
+            chain_id,
+            sequence,
+        } if chain_id == receptor_chain => Some(sequence.trim().to_ascii_uppercase().into_bytes()),
+        _ => None,
+    });
 
-    let opt_apo_model = match &cfg.apo_receptor_coord_text {
+    let mut opt_apo_model = match &cfg.apo_receptor_coord_text {
         Some(txt) => Some(
             StructureModel::parse_str(
                 txt,
@@ -4658,6 +6199,42 @@ pub fn score_cofold_poses(
             )
             .map_err(NmrError::parse)?,
         ),
+        None => None,
+    };
+    if let (Some(ref mut apo), Some(ref target)) = (&mut opt_apo_model, &receptor_target) {
+        if let Some(apo_ch) = select_model_chain(apo, receptor_chain) {
+            let exp_nums = restraints
+                .chain_exp_numbering
+                .get(receptor_chain)
+                .map(Vec::as_slice);
+            reindex_model_chain_to_experimental(
+                apo,
+                None,
+                &apo_ch,
+                target,
+                exp_nums,
+                cfg.min_alignment_identity,
+                "apo baseline structure",
+            )?;
+        }
+    }
+
+    let opt_ref_pose = match &cfg.reference_complex_pose {
+        Some((ref_txt, ref_hint)) => {
+            let mut ref_parsed = parse_complex_pose(
+                ref_txt,
+                ref_hint.as_deref(),
+                cfg.struct_shift_config.force_bfactor_plddt,
+                &restraints.ligand_molecules,
+            )?;
+            reindex_pose_to_experimental(
+                &mut ref_parsed,
+                restraints,
+                cfg.min_alignment_identity,
+                "reference pose",
+            )?;
+            Some(ref_parsed.all_atoms)
+        }
         None => None,
     };
 
@@ -4680,11 +6257,17 @@ pub fn score_cofold_poses(
     let mut entries: Vec<PoseScoreEntry> = Vec::with_capacity(poses.len());
 
     for pose_in in poses {
-        let parsed = parse_complex_pose(
+        let mut parsed = parse_complex_pose(
             &pose_in.coord_text,
             pose_in.format_hint.as_deref(),
             cfg.struct_shift_config.force_bfactor_plddt,
             &restraints.ligand_molecules,
+        )?;
+        reindex_pose_to_experimental(
+            &mut parsed,
+            restraints,
+            cfg.min_alignment_identity,
+            &format!("pose '{}'", pose_in.pose_id),
         )?;
 
         let isolated_from_pose = filter_model_to_chain(&parsed.protein_model, receptor_chain);
@@ -4707,46 +6290,60 @@ pub fn score_cofold_poses(
             None => isolated_from_pose.clone(),
         };
 
-        // 1. Forward-physics complex-vs-apo differential shifts (`T21.2` + partner/ligand ring-current + H-bond + Delta_rSASA)
+        // 1. HomologFirewall SHA-256 audit + optional `T21.2` complex-vs-apo differential shifts
         let unified_fw = build_unified_firewall_query(
             &cfg.firewall_query,
             cfg.struct_shift_config.max_seq_identity,
             &baseline_receptor,
             &parsed.protein_model,
         );
-        // Evaluate structural shifts with uniform folded weight (`w_AF = 1.0`) for differential interface deltas
-        // so AF3/Boltz B-factor differences between complex and apo never inject coil-blending artifacts!
-        let diff_shift_cfg = StructShiftConfig {
-            override_uniform_plddt: Some(100.0),
-            ..cfg.struct_shift_config.clone()
-        };
-        let apo_shifts = predict_structure_shifts_with_firewall(
-            &baseline_receptor,
-            &unified_fw,
-            &diff_shift_cfg,
-        )
-        .map_err(NmrError::parse)?;
-        let complex_shifts = predict_structure_shifts_with_firewall(
-            &parsed.protein_model,
-            &unified_fw,
-            &diff_shift_cfg,
-        )
-        .map_err(NmrError::parse)?;
-
         let mut apo_shift_map: BTreeMap<i32, (f64, f64)> = BTreeMap::new();
-        for r in &apo_shifts.residues {
-            let h = r.backbone.get("H").map(|b| b.struct_ppm).unwrap_or(0.0);
-            let n = r.backbone.get("N").map(|b| b.struct_ppm).unwrap_or(0.0);
-            apo_shift_map.insert(r.seq_id, (h, n));
-        }
         let mut comp_shift_map: BTreeMap<i32, (f64, f64)> = BTreeMap::new();
-        for r in &complex_shifts.residues {
-            if r.chain_id == receptor_chain {
-                let h = r.backbone.get("H").map(|b| b.struct_ppm).unwrap_or(0.0);
-                let n = r.backbone.get("N").map(|b| b.struct_ppm).unwrap_or(0.0);
-                comp_shift_map.insert(r.seq_id, (h, n));
+        let exclusion_list_sha256 = match cfg.csp_scoring_mode {
+            CspScoringMode::FullForwardShiftAndBurial => {
+                let diff_shift_cfg = StructShiftConfig {
+                    override_uniform_plddt: Some(100.0),
+                    ..cfg.struct_shift_config.clone()
+                };
+                let apo_shifts = predict_structure_shifts_with_firewall(
+                    &baseline_receptor,
+                    &unified_fw,
+                    &diff_shift_cfg,
+                )
+                .map_err(NmrError::parse)?;
+                let complex_shifts = predict_structure_shifts_with_firewall(
+                    &parsed.protein_model,
+                    &unified_fw,
+                    &diff_shift_cfg,
+                )
+                .map_err(NmrError::parse)?;
+                for r in &apo_shifts.residues {
+                    let h = r.backbone.get("H").map(|b| b.struct_ppm).unwrap_or(0.0);
+                    let n = r.backbone.get("N").map(|b| b.struct_ppm).unwrap_or(0.0);
+                    apo_shift_map.insert(r.seq_id, (h, n));
+                }
+                for r in &complex_shifts.residues {
+                    if r.chain_id == receptor_chain {
+                        let h = r.backbone.get("H").map(|b| b.struct_ppm).unwrap_or(0.0);
+                        let n = r.backbone.get("N").map(|b| b.struct_ppm).unwrap_or(0.0);
+                        comp_shift_map.insert(r.seq_id, (h, n));
+                    }
+                }
+                complex_shifts.exclusion_list_sha256
             }
-        }
+            CspScoringMode::BurialAndContactOnly => {
+                let seq1: Vec<u8> = parsed
+                    .protein_model
+                    .residues
+                    .iter()
+                    .map(|r| r.aa1)
+                    .collect();
+                let fw = HomologFirewall::new(unified_fw)
+                    .with_max_seq_identity(cfg.struct_shift_config.max_seq_identity);
+                let (_, _, sha, _) = fw.apply(TorsionDb::embedded(), &seq1);
+                sha
+            }
+        };
 
         // Non-receptor partner heavy atoms & non-protein H-bond acceptors/donors
         let partner_heavy: Vec<(Vec3, u8)> = parsed
@@ -4784,80 +6381,90 @@ pub fn score_cofold_poses(
         const INV_R0_HB_CUBE: f64 = 1.0 / (2.60 * 2.60 * 2.60);
 
         for (r_idx, res) in isolated_from_pose.residues.iter().enumerate() {
-            let (apo_h, apo_n) = apo_shift_map
-                .get(&res.seq_id)
-                .copied()
-                .unwrap_or((0.0, 0.0));
-            let (cmp_h, cmp_n) = comp_shift_map
-                .get(&res.seq_id)
-                .copied()
-                .unwrap_or((apo_h, apo_n));
-            let mut dh_calc = cmp_h - apo_h;
-            let mut dn_calc = cmp_n - apo_n;
-
-            // Add non-protein partner (`HETATM` small-molecule ligand / RNA / DNA) Haigh-Mallion ring currents
-            // and Wagner-Pardi-Bax intermolecular H-bonds!
-            if cfg.struct_shift_config.enable_ring_current
-                && !parsed.non_protein_aromatic_rings.is_empty()
+            let (mut dh_calc, mut dn_calc) = if cfg.csp_scoring_mode
+                == CspScoringMode::FullForwardShiftAndBurial
             {
-                if let Some(h_pos) = res.h {
-                    let (rc_h, _) = evaluate_haigh_mallion_ring_current(
-                        &parsed.non_protein_aromatic_rings,
-                        h_pos,
-                        usize::MAX,
-                        false,
-                        1.0,
-                    );
-                    dh_calc += rc_h.clamp(-1.80, 1.40);
-                }
-                if res.res_name != "PRO" {
-                    let (rc_n, _) = evaluate_haigh_mallion_ring_current(
-                        &parsed.non_protein_aromatic_rings,
-                        res.n,
-                        usize::MAX,
-                        false,
-                        0.65,
-                    );
-                    dn_calc += rc_n.clamp(-1.50, 1.50);
-                }
-            }
+                let (apo_h, apo_n) = apo_shift_map
+                    .get(&res.seq_id)
+                    .copied()
+                    .unwrap_or((0.0, 0.0));
+                let (cmp_h, cmp_n) = comp_shift_map
+                    .get(&res.seq_id)
+                    .copied()
+                    .unwrap_or((apo_h, apo_n));
+                let mut dh = cmp_h - apo_h;
+                let mut dn = cmp_n - apo_n;
 
-            if cfg.struct_shift_config.enable_hbond && !non_protein_polar_atoms.is_empty() {
-                if let Some(h_pos) = res.h {
-                    let u_hn = v_unit(v_sub(res.n, h_pos));
-                    let mut best_hb = 0.0_f64;
-                    for pa in &non_protein_polar_atoms {
-                        let d_ha = v_dist(h_pos, pa.pos);
-                        if (1.55..=3.20).contains(&d_ha) {
-                            let u_ha = v_unit(v_sub(pa.pos, h_pos));
-                            let cos_ang = v_dot(u_hn, u_ha);
-                            if cos_ang <= -0.34202014 {
-                                let excess =
-                                    (1.0 / d_ha.max(1.65).powi(3) - INV_R0_HB_CUBE).max(0.0);
-                                best_hb = best_hb.max(excess * cos_ang * cos_ang);
+                // Add non-protein partner (`HETATM` small-molecule ligand / RNA / DNA) Haigh-Mallion ring currents
+                // and Wagner-Pardi-Bax intermolecular H-bonds.
+                if cfg.struct_shift_config.enable_ring_current
+                    && !parsed.non_protein_aromatic_rings.is_empty()
+                {
+                    if let Some(h_pos) = res.h {
+                        let (rc_h, _) = evaluate_haigh_mallion_ring_current(
+                            &parsed.non_protein_aromatic_rings,
+                            h_pos,
+                            usize::MAX,
+                            false,
+                            1.0,
+                        );
+                        dh += rc_h.clamp(-1.80, 1.40);
+                    }
+                    if res.res_name != "PRO" {
+                        let (rc_n, _) = evaluate_haigh_mallion_ring_current(
+                            &parsed.non_protein_aromatic_rings,
+                            res.n,
+                            usize::MAX,
+                            false,
+                            0.65,
+                        );
+                        dn += rc_n.clamp(-1.50, 1.50);
+                    }
+                }
+
+                if cfg.struct_shift_config.enable_hbond && !non_protein_polar_atoms.is_empty() {
+                    if let Some(h_pos) = res.h {
+                        let u_hn = v_unit(v_sub(res.n, h_pos));
+                        let mut best_hb = 0.0_f64;
+                        for pa in &non_protein_polar_atoms {
+                            let d_ha = v_dist(h_pos, pa.pos);
+                            if (1.55..=3.20).contains(&d_ha) {
+                                let u_ha = v_unit(v_sub(pa.pos, h_pos));
+                                let cos_ang = v_dot(u_hn, u_ha);
+                                if cos_ang <= -0.34202014 {
+                                    let excess =
+                                        (1.0 / d_ha.max(1.65).powi(3) - INV_R0_HB_CUBE).max(0.0);
+                                    best_hb = best_hb.max(excess * cos_ang * cos_ang);
+                                }
                             }
                         }
+                        dh += (4.15 * best_hb).min(1.35);
+                        dn += (8.80 * best_hb).min(3.00);
                     }
-                    dh_calc += (4.15 * best_hb).min(1.35);
-                    dn_calc += (8.80 * best_hb).min(3.00);
-                }
-                // Preceding carbonyl `O_{i-1}` accepting H-bond from ligand polar donor polarizes peptide `(i-1, i)`
-                if r_idx > 0 && isolated_from_pose.residues[r_idx - 1].seq_id + 1 == res.seq_id {
-                    let prev_o = isolated_from_pose.residues[r_idx - 1].o;
-                    let mut best_co_w = 0.0_f64;
-                    for pa in &non_protein_polar_atoms {
-                        if matches!(pa.z, 7 | 8) {
-                            let d_oa = v_dist(prev_o, pa.pos);
-                            if (2.40..=3.35).contains(&d_oa) {
-                                let w = ((3.35 - d_oa) / (3.35 - 2.65)).clamp(0.0, 1.0);
-                                best_co_w = best_co_w.max(w);
+                    // Preceding carbonyl `O_{i-1}` accepting H-bond from ligand polar donor polarizes peptide `(i-1, i)`
+                    if r_idx > 0 && isolated_from_pose.residues[r_idx - 1].seq_id + 1 == res.seq_id
+                    {
+                        let prev_o = isolated_from_pose.residues[r_idx - 1].o;
+                        let mut best_co_w = 0.0_f64;
+                        for pa in &non_protein_polar_atoms {
+                            if matches!(pa.z, 7 | 8) {
+                                let d_oa = v_dist(prev_o, pa.pos);
+                                if (2.40..=3.35).contains(&d_oa) {
+                                    let w = ((3.35 - d_oa) / (3.35 - 2.65)).clamp(0.0, 1.0);
+                                    best_co_w = best_co_w.max(w);
+                                }
                             }
                         }
+                        dh += 0.22 * best_co_w;
+                        dn += 1.10 * best_co_w;
                     }
-                    dh_calc += 0.22 * best_co_w;
-                    dn_calc += 1.10 * best_co_w;
                 }
-            }
+                (dh, dn)
+            } else {
+                (0.0, 0.0)
+            };
+            // Keep `mut` warning-free when only read downstream
+            let _ = (&mut dh_calc, &mut dn_calc);
 
             // Minimum heavy-atom distance from receptor residue `res` to any partner heavy atom
             let mut d_min = f64::INFINITY;
@@ -4885,12 +6492,20 @@ pub fn score_cofold_poses(
             let burial_csp = 0.12 * delta_rsasa + 0.08 * prox;
             let alpha_n = amide_alpha_n(&res.res_name);
             let dir_csp = dh_calc.hypot(alpha_n * dn_calc);
-            let csp_calc = dir_csp.hypot(burial_csp);
+            let csp_calc = match cfg.csp_scoring_mode {
+                CspScoringMode::BurialAndContactOnly => burial_csp,
+                CspScoringMode::FullForwardShiftAndBurial => dir_csp.hypot(burial_csp),
+            };
 
             if let Some(obs) = obs_csp_by_seq.get(&res.seq_id) {
-                // Exclude buried `AllostericCorePerturbation` shifts from direct surface interface correlation/ROC
-                let is_allosteric_core =
-                    obs.perturbation_class == CspPerturbationClass::AllostericCorePerturbation;
+                // Exclude buried `AllostericCorePerturbation`, distal surface outliers, and
+                // unresolved-in-apo shifts from direct surface interface correlation/ROC.
+                let is_non_interface_csp = matches!(
+                    obs.perturbation_class,
+                    CspPerturbationClass::AllostericCorePerturbation
+                        | CspPerturbationClass::DistalSurfaceOutlier
+                        | CspPerturbationClass::UnresolvedInApo
+                );
                 let is_surf_hit = matches!(
                     obs.perturbation_class,
                     CspPerturbationClass::SurfacePocketContact
@@ -4902,13 +6517,16 @@ pub fn score_cofold_poses(
                         .map(|v| v >= restraints.min_pocket_rsasa)
                         .unwrap_or(true);
 
-                if !is_allosteric_core {
+                if !is_non_interface_csp {
                     obs_vec.push(obs.csp_obs_ppm);
                     calc_vec.push(csp_calc);
                     if is_surf_hit || is_surf_residue {
-                        // Heavy-atom interface contact score strictly supported on `d_min <= contact_cutoff_angstrom` (`5.0 A`)
-                        let c_score = if d_min <= cfg.contact_cutoff_angstrom {
-                            (cfg.contact_cutoff_angstrom - d_min) + 1e-6
+                        // First + second-shell physical CSP proximity envelope (`8.0 A`, covering both
+                        // direct `<= 5 A` VdW contact and `5-8 A` ring-current / electric-field shifts
+                        // while vanishing `== 0` for detached / distal decoys beyond `8 A`).
+                        let csp_shell_cut = (cfg.contact_cutoff_angstrom * 1.6).max(8.0);
+                        let c_score = if d_min <= csp_shell_cut {
+                            (csp_shell_cut - d_min) + 1e-6
                         } else {
                             0.0
                         };
@@ -4947,8 +6565,9 @@ pub fn score_cofold_poses(
                     .get(&res.seq_id)
                     .copied()
                     .unwrap_or(f64::INFINITY);
-                let c_score = if d_min <= cfg.contact_cutoff_angstrom {
-                    (cfg.contact_cutoff_angstrom - d_min) + 1e-6
+                let csp_shell_cut = (cfg.contact_cutoff_angstrom * 1.6).max(8.0);
+                let c_score = if d_min <= csp_shell_cut {
+                    (csp_shell_cut - d_min) + 1e-6
                 } else {
                     0.0
                 };
@@ -4983,6 +6602,7 @@ pub fn score_cofold_poses(
             None
         };
         let csp_contact_roc_auc = binary_roc_auc(&roc_samples);
+        let csp_contact_p_value = mann_whitney_p_value(&roc_samples);
 
         // Mean excess distance beyond `pocket_max_distance_a` (`6.0 A`) across surface pocket hits
         let mean_pocket_excess_dist_a = if !restraints.pocket_contacts.is_empty() {
@@ -5073,10 +6693,8 @@ pub fn score_cofold_poses(
             cfg.rdc_free_seed,
         )?;
         let rdc_q_work = rdc_q_work_raw.is_finite().then_some(rdc_q_work_raw);
-        let rdc_q_free = rdc_q_free_raw
-            .is_finite()
-            .then_some(rdc_q_free_raw)
-            .or(rdc_q_work);
+        let rdc_q_free = rdc_q_free_raw.is_finite().then_some(rdc_q_free_raw);
+        let rdc_q_for_score = rdc_q_free.or(rdc_q_work).unwrap_or(0.0);
 
         // 4. 5-parameter `Delta_chi` `PCS` `Q`-factor
         let pcs_q_factor = evaluate_pose_pcs_q(&parsed, &restraints.pcs_tags)?;
@@ -5084,7 +6702,7 @@ pub fn score_cofold_poses(
         // Composite score `S_total(m)` (`section 6.2`)
         let total_score = cfg.w_csp * s_csp
             - cfg.w_noe_pre * noe_pre_violation_energy
-            - cfg.w_rdc * rdc_q_free.unwrap_or(0.0)
+            - cfg.w_rdc * rdc_q_for_score
             - cfg.w_pcs * pcs_q_factor.unwrap_or(0.0);
 
         // Decoy-cluster abstention guard flags (`section 6.2(4)`)
@@ -5106,16 +6724,12 @@ pub fn score_cofold_poses(
         }
         let passes_nmr_guards = violation_flags.is_empty();
 
-        let irmsd_to_reference_angstrom = match &cfg.reference_complex_pose {
-            Some((ref_txt, ref_hint)) => Some(compute_interface_rmsd_angstrom(
-                &pose_in.coord_text,
-                pose_in.format_hint.as_deref(),
-                ref_txt,
-                ref_hint.as_deref(),
-                receptor_chain,
-            )?),
-            None => None,
-        };
+        let irmsd_to_reference_angstrom = opt_ref_pose
+            .as_ref()
+            .map(|ref_atoms| {
+                compute_interface_rmsd_from_atoms(&parsed.all_atoms, ref_atoms, receptor_chain)
+            })
+            .transpose()?;
 
         entries.push(PoseScoreEntry {
             rank: 0,
@@ -5127,6 +6741,7 @@ pub fn score_cofold_poses(
             s_csp,
             csp_spearman_rho,
             csp_contact_roc_auc,
+            csp_contact_p_value,
             mean_pocket_excess_dist_a,
             noe_pre_violation_energy,
             max_distance_violation_angstrom: max_viol_a,
@@ -5136,7 +6751,7 @@ pub fn score_cofold_poses(
             pcs_q_factor,
             irmsd_to_reference_angstrom,
             cofold_confidence: pose_in.cofold_confidence.clone(),
-            exclusion_list_sha256: complex_shifts.exclusion_list_sha256,
+            exclusion_list_sha256,
             residue_csp_points,
         });
     }
@@ -5189,6 +6804,7 @@ pub fn score_cofold_poses(
         n_distance_restraints: restraints.distance_restraints.len(),
         n_rdc_media: restraints.rdc_media.len(),
         n_pcs_tags: restraints.pcs_tags.len(),
+        csp_scoring_mode: cfg.csp_scoring_mode,
         funnel_spearman_rho_vs_neg_irmsd,
         poses: entries,
     })
