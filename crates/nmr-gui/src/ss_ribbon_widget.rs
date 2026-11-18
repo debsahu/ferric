@@ -622,15 +622,36 @@ impl SsRibbonState {
     }
 
     /// Directly set Track 1 (`3D SS`) 4-state secondary-structure slice.
+    /// Directly set Track 1 3D secondary-structure states (`[0..L]`).
     pub fn set_ss3d_slice(&mut self, ss: &[SsState4]) {
         self.ss3d_track.clear();
         self.ss3d_track.extend_from_slice(ss);
+    }
+
+    /// Directly set Track 1 3D secondary-structure states from `nmr_core::kabsch_sander_ss::SecondaryStructure4`.
+    pub fn set_core_ss3d_slice(&mut self, ss: &[nmr_core::kabsch_sander_ss::SecondaryStructure4]) {
+        self.ss3d_track.clear();
+        self.ss3d_track
+            .extend(ss.iter().copied().map(SsState4::from));
     }
 
     /// Directly set per-residue AlphaFold `pLDDT` (`[0, 100]`) values.
     pub fn set_plddt_slice(&mut self, plddt: &[Option<f64>]) {
         self.plddt_track.clear();
         self.plddt_track.extend_from_slice(plddt);
+    }
+
+    /// Supply an explicit Track 3 concordance vector from `nmr_core::af_concordance::AfNmrConcordanceClass`.
+    pub fn set_core_concordance_override(
+        &mut self,
+        classes: &[nmr_core::af_concordance::AfNmrConcordanceClass],
+    ) {
+        let mapped: Vec<ConcordanceTrackClass> = classes
+            .iter()
+            .copied()
+            .map(ConcordanceTrackClass::from)
+            .collect();
+        self.set_concordance_override(&mapped);
     }
 
     /// Supply an explicit Track 3 concordance vector (e.g. from `nmr-core::af_concordance`).

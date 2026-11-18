@@ -255,6 +255,66 @@ pub enum ConcordanceTrackClass {
 /// Spec-matching type alias (`docs/specs/21-alphafold-integrative-nmr.md` §1.3 & §3.2).
 pub type AfNmrConcordanceClass = ConcordanceTrackClass;
 
+impl From<nmr_core::kabsch_sander_ss::SecondaryStructure4> for SsState4 {
+    #[inline]
+    fn from(s: nmr_core::kabsch_sander_ss::SecondaryStructure4) -> Self {
+        match s {
+            nmr_core::kabsch_sander_ss::SecondaryStructure4::Helix => Self::Helix,
+            nmr_core::kabsch_sander_ss::SecondaryStructure4::Sheet => Self::Sheet,
+            nmr_core::kabsch_sander_ss::SecondaryStructure4::Ppii => Self::Ppii,
+            nmr_core::kabsch_sander_ss::SecondaryStructure4::Coil => Self::Coil,
+        }
+    }
+}
+
+impl From<SsState4> for nmr_core::kabsch_sander_ss::SecondaryStructure4 {
+    #[inline]
+    fn from(s: SsState4) -> Self {
+        match s {
+            SsState4::Helix => Self::Helix,
+            SsState4::Sheet => Self::Sheet,
+            SsState4::Ppii => Self::Ppii,
+            SsState4::Coil => Self::Coil,
+        }
+    }
+}
+
+impl From<nmr_core::af_concordance::AfNmrConcordanceClass> for ConcordanceTrackClass {
+    #[inline]
+    fn from(c: nmr_core::af_concordance::AfNmrConcordanceClass) -> Self {
+        match c {
+            nmr_core::af_concordance::AfNmrConcordanceClass::ConcordantOrdered => {
+                Self::ConcordantOrdered
+            }
+            nmr_core::af_concordance::AfNmrConcordanceClass::ConcordantDisordered => {
+                Self::ConcordantDisordered
+            }
+            nmr_core::af_concordance::AfNmrConcordanceClass::ConditionalFoldingOrCrystalArtifact => {
+                Self::ConditionalFoldingOrCrystalArtifact
+            }
+            nmr_core::af_concordance::AfNmrConcordanceClass::DynamicHingeOrAltState => {
+                Self::DynamicHingeOrAltState
+            }
+            nmr_core::af_concordance::AfNmrConcordanceClass::UnassignedNmr => Self::UnassignedNmr,
+        }
+    }
+}
+
+impl From<ConcordanceTrackClass> for nmr_core::af_concordance::AfNmrConcordanceClass {
+    #[inline]
+    fn from(c: ConcordanceTrackClass) -> Self {
+        match c {
+            ConcordanceTrackClass::ConcordantOrdered => Self::ConcordantOrdered,
+            ConcordanceTrackClass::ConcordantDisordered => Self::ConcordantDisordered,
+            ConcordanceTrackClass::ConditionalFoldingOrCrystalArtifact => {
+                Self::ConditionalFoldingOrCrystalArtifact
+            }
+            ConcordanceTrackClass::DynamicHingeOrAltState => Self::DynamicHingeOrAltState,
+            ConcordanceTrackClass::UnassignedNmr => Self::UnassignedNmr,
+        }
+    }
+}
+
 impl ConcordanceTrackClass {
     pub const ALL: [Self; 5] = [
         Self::ConcordantOrdered,
