@@ -468,6 +468,110 @@ impl MultiFieldResidueInput {
     }
 }
 
+/// Minimum Fisher-information z-score (`|parameter - boundary| / sigma_Fisher`) a non-trivial
+/// model-free parameter must reach for its model to be retained (`2.0` is the two-sided
+/// ~95% normal criterion; `~1.96`).
+///
+/// This is the single identifiability threshold of the M5 elimination rule. It follows the
+/// model-elimination idea of d'Auvergne & Gooley (J. Biomol. NMR 2003, 25, 25-39; 2006, 35,
+/// 117-135) -- discard over-parameterised fits whose parameters are not resolved from a physical
+/// boundary -- and the Monte Carlo / Fisher identifiability analysis of Mandel, Akke & Palmer
+/// (J. Mol. Biol. 1995, 246, 144-163). Nothing else in the M5 rule is a free number.
+pub const MIN_IDENTIFIABILITY_Z: f64 = 2.0;
+
+/// Lower edge of the M5 optimizer domain for `S_f^2` and `S_s^2` (positivity guard of the product
+/// `S^2 = S_f^2 S_s^2`, `0 < S^2 <= 1`; Clore et al. 1990). Domain definition, not a decision rule.
+const M5_AMPLITUDE_FLOOR: f64 = 0.05;
+
+/// Lower edge of the M5 optimizer domain for the slow internal time `tau_s` (100 ps): `tau_s` is
+/// the *slow* internal timescale of Clore et al. (1990), so the domain starts above the fast
+/// (`tau_e` ~ 2-100 ps) regime fitted by M2/M4. Domain definition, not a decision rule.
+const M5_TAU_S_FLOOR_SEC: f64 = 100.0e-12;
+
+/// Upper edge of the M5 optimizer domain: `tau_s <= 0.60 tau_m` keeps `tau_s < tau_m` with margin
+/// (the effective time `tau_s tau_m / (tau_s + tau_m)` saturates near `tau_m`, so slower motions
+/// are indistinguishable from overall tumbling). Domain definition, not a decision rule.
+const M5_TAU_S_MAX_FRACTION: f64 = 0.60;
+
+/// Rule used to decide whether a fitted extended model-free (`M5`) candidate is eliminated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum M5EliminationRule {
+    /// Principled rule (default): physical-boundary checks plus Fisher-information identifiability
+    /// with the single threshold [`MIN_IDENTIFIABILITY_Z`], and Hurvich-Tsai AICc selection
+    /// guard on M5 (Hurvich & Tsai, Biometrika 1989, 76, 297-307; Burnham & Anderson 2002).
+    #[default]
+    PrincipledFisher,
+    /// Heuristic thresholds in force before commit e693f11 (no AICc guard); retained only so the
+    /// two rules can be compared on identical synthetic data (see `tests/modelfree_tests.rs`).
+    LegacyPreF28,
+}
+
+/// Decide whether a fitted M5 candidate is eliminated.
+///
+/// `params` carries `(S_f^2, S_s^2, tau_s)` (`tau_s` in `tau_e_sec`); `sigma_sf2`, `sigma_ss2`,
+/// `sigma_tau_s_sec` are the local Fisher-information standard errors of those parameters and
+/// `tau_m_eff` is the effective overall correlation time (s).
+///
+/// Principled rule (clean-room; Clore et al. 1990; Mandel, Akke & Palmer 1995; d'Auvergne &
+/// Gooley 2003/2006): M5 is eliminated unless every physical bound is satisfied *and* each of its
+/// three parameters is resolved from the nearest edge of its physical domain by at least
+/// [`MIN_IDENTIFIABILITY_Z`] Fisher standard errors:
+/// - `S_f^2` and `S_s^2` away from 1 (otherwise the two-timescale split collapses onto M1/M2) and
+///   away from the positivity floor;
+/// - `tau_s` away from the fast-motion floor (so it is a *slow* time) and away from the
+///   `tau_m`-limited upper edge (so `tau_s < tau_m`), and `tau_s` above the 2 ps M2/M4 floor.
+pub fn m5_is_eliminated(
+    rule: M5EliminationRule,
+    params: &LocalMfParams,
+    sigma_sf2: f64,
+    sigma_ss2: f64,
+    sigma_tau_s_sec: f64,
+    tau_m_eff: f64,
+) -> bool {
+    match rule {
+        M5EliminationRule::LegacyPreF28 => {
+            params.sf2 > 0.975
+                || params.ss2 > 0.975
+                || params.tau_e_sec < 150.0e-12
+                || params.tau_e_sec > 0.52 * tau_m_eff
+                || sigma_tau_s_sec > 0.55 * params.tau_e_sec
+                || sigma_sf2 > 0.55 * (1.0 - params.sf2)
+                || sigma_ss2 > 0.55 * (1.0 - params.ss2)
+        }
+        M5EliminationRule::PrincipledFisher => {
+            let finite = params.sf2.is_finite()
+                && params.ss2.is_finite()
+                && params.tau_e_sec.is_finite()
+                && sigma_sf2.is_finite()
+                && sigma_ss2.is_finite()
+                && sigma_tau_s_sec.is_finite();
+            if !finite {
+                return true;
+            }
+            let ts = params.tau_e_sec;
+            let tau_s_hi = M5_TAU_S_MAX_FRACTION * tau_m_eff;
+            // Physical boundaries: S^2 = S_f^2 S_s^2 in (0, 1]; 2 ps = fastest resolvable internal
+            // time (the M2/M4 `tau_e` floor); tau_s < tau_m.
+            let s2_ok = params.sf2 * params.ss2 > 0.0 && params.sf2 <= 1.0 && params.ss2 <= 1.0;
+            let tau_ok = ts > TAU_E_RESOLUTION_FLOOR_SEC && ts < tau_m_eff;
+            if !(s2_ok && tau_ok) {
+                return true;
+            }
+            let z = MIN_IDENTIFIABILITY_Z;
+            let resolved = |dist: f64, sigma: f64| dist >= z * sigma;
+            !resolved(1.0 - params.sf2, sigma_sf2)
+                || !resolved(params.sf2 - M5_AMPLITUDE_FLOOR, sigma_sf2)
+                || !resolved(1.0 - params.ss2, sigma_ss2)
+                || !resolved(params.ss2 - M5_AMPLITUDE_FLOOR, sigma_ss2)
+                || !resolved(ts - M5_TAU_S_FLOOR_SEC, sigma_tau_s_sec)
+                || !resolved(tau_s_hi - ts, sigma_tau_s_sec)
+        }
+    }
+}
+
+/// Fastest internal correlation time (2 ps) resolved by the fits (`tau_e` floor of M2/M4).
+const TAU_E_RESOLUTION_FLOOR_SEC: f64 = 2.0e-12;
+
 /// Configuration for Lipari–Szabo / Palmer model-free fitting and global diffusion optimization.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModelFreeConfig {
@@ -617,9 +721,11 @@ fn decode_internal_vec(model: ModelFreeId, q: &[f64], tau_m_eff: f64) -> LocalMf
             LocalMfParams::m4(s2, te, rex)
         }
         ModelFreeId::M5 => {
-            let sf2 = q[0].clamp(0.05, 1.0);
-            let ss2 = q[1].clamp(0.05, 1.0);
-            let ts = q[2].exp().clamp(100.0e-12, 0.60 * tau_m_eff);
+            let sf2 = q[0].clamp(M5_AMPLITUDE_FLOOR, 1.0);
+            let ss2 = q[1].clamp(M5_AMPLITUDE_FLOOR, 1.0);
+            let ts = q[2]
+                .exp()
+                .clamp(M5_TAU_S_FLOOR_SEC, M5_TAU_S_MAX_FRACTION * tau_m_eff);
             LocalMfParams::m5(sf2, ss2, ts)
         }
     }
@@ -644,9 +750,14 @@ fn clamp_internal_vec(model: ModelFreeId, q: &mut [f64], tau_m_eff: f64) {
             q[2] = q[2].clamp(0.0, 80.0);
         }
         ModelFreeId::M5 => {
-            q[0] = q[0].clamp(0.05, 1.0);
-            q[1] = q[1].clamp(0.05, 1.0);
-            q[2] = q[2].clamp((100.0e-12_f64).ln(), (0.60 * tau_m_eff).max(200.0e-12).ln());
+            q[0] = q[0].clamp(M5_AMPLITUDE_FLOOR, 1.0);
+            q[1] = q[1].clamp(M5_AMPLITUDE_FLOOR, 1.0);
+            q[2] = q[2].clamp(
+                M5_TAU_S_FLOOR_SEC.ln(),
+                (M5_TAU_S_MAX_FRACTION * tau_m_eff)
+                    .max(2.0 * M5_TAU_S_FLOOR_SEC)
+                    .ln(),
+            );
         }
     }
 }
@@ -922,7 +1033,8 @@ fn local_fisher_uncertainties(
     }
 }
 
-/// Fit one specific model (`M1`–`M5`) on a single residue using deterministic multi-start + LM.
+/// Fit one specific model (`M1`–`M5`) on a single residue using deterministic multi-start + LM
+/// (default [`M5EliminationRule::PrincipledFisher`]).
 pub fn fit_single_model_on_residue(
     model: ModelFreeId,
     res: &MultiFieldResidueInput,
@@ -930,6 +1042,27 @@ pub fn fit_single_model_on_residue(
     tau_m_eff: f64,
     ref_field_mhz: f64,
     cfg: &ModelFreeConfig,
+) -> CandidateModelFit {
+    fit_single_model_on_residue_with_m5_rule(
+        model,
+        res,
+        rot_comps,
+        tau_m_eff,
+        ref_field_mhz,
+        cfg,
+        M5EliminationRule::default(),
+    )
+}
+
+/// As [`fit_single_model_on_residue`] with an explicit M5 elimination rule.
+pub fn fit_single_model_on_residue_with_m5_rule(
+    model: ModelFreeId,
+    res: &MultiFieldResidueInput,
+    rot_comps: &[(f64, f64)],
+    tau_m_eff: f64,
+    ref_field_mhz: f64,
+    cfg: &ModelFreeConfig,
+    m5_rule: M5EliminationRule,
 ) -> CandidateModelFit {
     let m_obs = res.total_observables();
 
@@ -1149,20 +1282,16 @@ pub fn fit_single_model_on_residue(
                     || sigma_rex_ref > 0.50 * params.rex_ref_s_inv
             }
             ModelFreeId::M5 => {
-                // Clore et al. (J. Am. Chem. Soc. 1990, 112, 4989-4991);
-                // Mandel, Akke & Palmer (J. Mol. Biol. 1995, 246, 144-163);
-                // d'Auvergne & Gooley (J. Biomol. NMR 2003, 25, 25-39 & 2006, 35, 117-135):
-                // Extended two-timescale model M5 requires non-degenerate fast and slow amplitudes
-                // and an identifiable slow internal correlation time tau_s.
-                let slow_weight = params.sf2 - params.s2;
-                params.sf2 > 0.955
-                    || params.ss2 > 0.86
-                    || slow_weight < 0.12
-                    || params.tau_e_sec < 180.0e-12
-                    || params.tau_e_sec > 0.50 * tau_m_eff
-                    || sigma_tau_e_sec > 0.42 * params.tau_e_sec
-                    || sigma_sf2 > 0.48 * (1.0 - params.sf2)
-                    || sigma_ss2 > 0.48 * (1.0 - params.ss2)
+                // Clore et al. (JACS 1990, 112, 4989-4991); Mandel, Akke & Palmer (J. Mol. Biol.
+                // 1995, 246, 144-163); d'Auvergne & Gooley (2003, 2006): see `m5_is_eliminated`.
+                m5_is_eliminated(
+                    m5_rule,
+                    &params,
+                    sigma_sf2,
+                    sigma_ss2,
+                    sigma_tau_e_sec,
+                    tau_m_eff,
+                )
             }
         }
     };
@@ -1183,12 +1312,30 @@ pub fn fit_single_model_on_residue(
     }
 }
 
-/// Fit all 5 canonical models `M1`–`M5` on `res` and select the optimal model under `cfg.selection_criterion`.
+/// Fit all 5 canonical models `M1`–`M5` on `res` and select the optimal model under `cfg.selection_criterion`
+/// (default [`M5EliminationRule::PrincipledFisher`]).
 pub fn fit_and_select_residue_modelfree(
     res: &MultiFieldResidueInput,
     tensor: &DiffusionTensor,
     ref_field_mhz: f64,
     cfg: &ModelFreeConfig,
+) -> ResidueModelFreeResult {
+    fit_and_select_residue_modelfree_with_m5_rule(
+        res,
+        tensor,
+        ref_field_mhz,
+        cfg,
+        M5EliminationRule::default(),
+    )
+}
+
+/// As [`fit_and_select_residue_modelfree`] with an explicit M5 elimination / selection rule.
+pub fn fit_and_select_residue_modelfree_with_m5_rule(
+    res: &MultiFieldResidueInput,
+    tensor: &DiffusionTensor,
+    ref_field_mhz: f64,
+    cfg: &ModelFreeConfig,
+    m5_rule: M5EliminationRule,
 ) -> ResidueModelFreeResult {
     let rot_comps = tensor.rotational_components(res.nh_unit_vec);
     let tau_m_eff = tensor.effective_tau_m_sec();
@@ -1196,7 +1343,17 @@ pub fn fit_and_select_residue_modelfree(
 
     let candidates: Vec<CandidateModelFit> = ModelFreeId::ALL
         .iter()
-        .map(|&m| fit_single_model_on_residue(m, res, &rot_comps, tau_m_eff, ref_field_mhz, cfg))
+        .map(|&m| {
+            fit_single_model_on_residue_with_m5_rule(
+                m,
+                res,
+                &rot_comps,
+                tau_m_eff,
+                ref_field_mhz,
+                cfg,
+                m5_rule,
+            )
+        })
         .collect();
 
     let chosen_idx = match cfg.selection_criterion {
@@ -1208,12 +1365,16 @@ pub fn fit_and_select_residue_modelfree(
                 .min_by(|a, b| a.1.aic.total_cmp(&b.1.aic))
                 .map(|(i, _)| i)
                 .unwrap_or(0);
-            // Finite-sample Hurvich-Tsai AICc parsimony guard on non-nested 3-parameter M5
-            // (Hurvich & Tsai, Biometrika 1989, 76, 297-307; Burnham & Anderson 2002):
-            // at 1-3 static fields (`m_obs <= 9`), asymptotic AIC (`Delta chi^2 > 2`) under-penalizes
-            // splitting `S^2` into `S_f^2 * S_s^2`; require M5 to also improve small-sample AICc
-            // (or BIC when `m_obs <= 4`) over the best uneliminated M1-M4 model.
-            if raw_best == 4 && cfg.enable_model_elimination && m_obs <= 9 {
+            // Finite-sample Hurvich-Tsai AICc parsimony guard on the 3-parameter M5
+            // (Hurvich & Tsai, Biometrika 1989, 76, 297-307; Burnham & Anderson 2002, sec. 2.4):
+            // asymptotic AIC under-penalizes splitting `S^2` into `S_f^2 * S_s^2` when the
+            // observable count is small; require M5 to also win on AICc (`AICc -> AIC` as the
+            // number of observables grows, so no observable-count cutoff is needed), falling back
+            // to BIC when AICc is undefined (`m_obs <= k + 1`).
+            if raw_best == 4
+                && cfg.enable_model_elimination
+                && m5_rule == M5EliminationRule::PrincipledFisher
+            {
                 let best_non_m5 = candidates[..4]
                     .iter()
                     .enumerate()
@@ -1397,6 +1558,7 @@ fn fit_all_residues_parallel(
     tensor: &DiffusionTensor,
     ref_field_mhz: f64,
     cfg: &ModelFreeConfig,
+    m5_rule: M5EliminationRule,
 ) -> Vec<ResidueModelFreeResult> {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -1410,11 +1572,12 @@ fn fit_all_residues_parallel(
             for (cin, cout) in residues.chunks(chunk_sz).zip(out.chunks_mut(chunk_sz)) {
                 s.spawn(move || {
                     for (r, dst) in cin.iter().zip(cout.iter_mut()) {
-                        *dst = Some(fit_and_select_residue_modelfree(
+                        *dst = Some(fit_and_select_residue_modelfree_with_m5_rule(
                             r,
                             tensor,
                             ref_field_mhz,
                             cfg,
+                            m5_rule,
                         ));
                     }
                 });
@@ -1426,7 +1589,15 @@ fn fit_all_residues_parallel(
     {
         residues
             .iter()
-            .map(|r| fit_and_select_residue_modelfree(r, tensor, ref_field_mhz, cfg))
+            .map(|r| {
+                fit_and_select_residue_modelfree_with_m5_rule(
+                    r,
+                    tensor,
+                    ref_field_mhz,
+                    cfg,
+                    m5_rule,
+                )
+            })
             .collect()
     }
 }
@@ -1732,6 +1903,7 @@ fn fit_with_fixed_diffusion_symmetry(
     residues: &[MultiFieldResidueInput],
     ref_field_mhz: f64,
     cfg: &ModelFreeConfig,
+    m5_rule: M5EliminationRule,
 ) -> Result<ModelFreeDatasetResult, String> {
     if residues.is_empty() {
         return Err("fit_modelfree_dataset requires >= 1 residue".to_string());
@@ -1806,7 +1978,8 @@ fn fit_with_fixed_diffusion_symmetry(
         ..cfg.clone()
     };
 
-    let mut local_res = fit_all_residues_parallel(residues, &tensor, ref_field_mhz, &inner_cfg);
+    let mut local_res =
+        fit_all_residues_parallel(residues, &tensor, ref_field_mhz, &inner_cfg, m5_rule);
     let mut used_iters = 1usize;
 
     for outer in 0..cfg.max_outer_iters {
@@ -1815,7 +1988,8 @@ fn fit_with_fixed_diffusion_symmetry(
 
         tensor =
             optimize_global_tensor_step(&tensor, residues, &local_res, ref_field_mhz, &cfg.physics);
-        local_res = fit_all_residues_parallel(residues, &tensor, ref_field_mhz, &inner_cfg);
+        local_res =
+            fit_all_residues_parallel(residues, &tensor, ref_field_mhz, &inner_cfg, m5_rule);
         used_iters = outer + 1;
 
         let new_tm = tensor.effective_tau_m_sec();
@@ -1829,7 +2003,7 @@ fn fit_with_fixed_diffusion_symmetry(
     }
 
     if cfg.mc_replicates > 0 {
-        local_res = fit_all_residues_parallel(residues, &tensor, ref_field_mhz, cfg);
+        local_res = fit_all_residues_parallel(residues, &tensor, ref_field_mhz, cfg, m5_rule);
     }
 
     let total_chi2: f64 = local_res.iter().map(|r| r.chi2).sum();
@@ -1863,6 +2037,16 @@ pub fn fit_modelfree_dataset(
     residues: &[MultiFieldResidueInput],
     cfg: &ModelFreeConfig,
 ) -> Result<ModelFreeDatasetResult, String> {
+    fit_modelfree_dataset_with_m5_rule(residues, cfg, M5EliminationRule::default())
+}
+
+/// As [`fit_modelfree_dataset`] with an explicit M5 elimination / selection rule (used to compare
+/// [`M5EliminationRule::PrincipledFisher`] against [`M5EliminationRule::LegacyPreF28`]).
+pub fn fit_modelfree_dataset_with_m5_rule(
+    residues: &[MultiFieldResidueInput],
+    cfg: &ModelFreeConfig,
+    m5_rule: M5EliminationRule,
+) -> Result<ModelFreeDatasetResult, String> {
     if residues.is_empty() {
         return Err("fit_modelfree_dataset requires >= 1 residue".to_string());
     }
@@ -1877,7 +2061,13 @@ pub fn fit_modelfree_dataset(
     }
 
     if cfg.diffusion_kind != DiffusionTensorKind::Auto {
-        return fit_with_fixed_diffusion_symmetry(cfg.diffusion_kind, residues, ref_field_mhz, cfg);
+        return fit_with_fixed_diffusion_symmetry(
+            cfg.diffusion_kind,
+            residues,
+            ref_field_mhz,
+            cfg,
+            m5_rule,
+        );
     }
 
     let n_with_vec = residues.iter().filter(|r| r.nh_unit_vec.is_some()).count();
@@ -1886,6 +2076,7 @@ pub fn fit_modelfree_dataset(
         residues,
         ref_field_mhz,
         cfg,
+        m5_rule,
     )?];
     if n_with_vec >= 5 {
         if let Ok(ax) = fit_with_fixed_diffusion_symmetry(
@@ -1893,6 +2084,7 @@ pub fn fit_modelfree_dataset(
             residues,
             ref_field_mhz,
             cfg,
+            m5_rule,
         ) {
             candidates.push(ax);
         }
@@ -1903,6 +2095,7 @@ pub fn fit_modelfree_dataset(
             residues,
             ref_field_mhz,
             cfg,
+            m5_rule,
         ) {
             candidates.push(aniso);
         }

@@ -295,6 +295,42 @@ pub struct RawPseudo3D {
     pub interleaving: Pseudo3DInterleaving,
     pub schedule: RelaxSchedule,
     pub planes: Vec<Fid2D>,
+    /// Non-fatal provenance warnings raised while decoding (for example a hetNOE saturation delay
+    /// taken from the `D[1]` recycle delay rather than from an explicit schedule). Callers should
+    /// surface these to the user.
+    pub warnings: Vec<String>,
+}
+
+/// Plane order of a schedule-less 2-plane interleaved Bruker `{1H}-15N` hetNOE `ser`.
+///
+/// `Auto` only succeeds when the order is positively proven from the pulse program (a
+/// `l<k> % 2 == <rem>` branch parity parse, an explicit `hetnoe_order: sat_first|ref_first`
+/// comment tag, or the stock Bruker `recording noe and nonoe` / `recording nonoe and noe`
+/// comments); otherwise decoding fails closed. `SatFirst` / `RefFirst` are explicit caller
+/// assertions (CLI `--hetnoe-order sat-first|ref-first`) and skip that proof.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HetNoeOrder {
+    /// Infer from the pulse program; error when the order cannot be proven.
+    #[default]
+    Auto,
+    /// Plane 0 is proton-saturated (`NOE`), plane 1 is the unsaturated reference.
+    SatFirst,
+    /// Plane 0 is the unsaturated reference (`NONOE`), plane 1 is proton-saturated.
+    RefFirst,
+}
+
+impl HetNoeOrder {
+    /// Parse a CLI label: `sat-first` / `sat_first`, `ref-first` / `ref_first`, or `auto`.
+    pub fn parse_label(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "auto" => Ok(Self::Auto),
+            "sat-first" => Ok(Self::SatFirst),
+            "ref-first" => Ok(Self::RefFirst),
+            other => Err(format!(
+                "invalid --hetnoe-order {other:?} (expected sat-first or ref-first)"
+            )),
+        }
+    }
 }
 
 /// Parsed Varian `procpar` relaxation schedule and inferred loop order.
@@ -1864,17 +1900,94 @@ fn sum_bruker_pulse_line_duration_sec(line: &str, vars: &HashMap<String, f64>) -
     sum
 }
 
+/// Prove the saturated-vs-reference plane order from `l<k> % 2 == <rem>` branch parity in a
+/// Bruker `pulseprogram`. Returns `Some(true)` when plane 0 is proton-saturated, `Some(false)`
+/// when plane 0 is the unsaturated reference, and `None` when the branch structure is absent or
+/// does not discriminate the two branches.
+fn hetnoe_order_from_branch_parity(txt: &str) -> Option<bool> {
+    // Parse exact `"l<k>=<init>"` statements before `ze`
+    let mut loop_inits: HashMap<String, i64> = HashMap::new();
+    for raw_line in txt.lines() {
+        let code = raw_line.split(';').next().unwrap_or("").trim();
+        if contains_pp_ident_local(code, "ze") {
+            break;
+        }
+        if let Some(q0) = code.find('"') {
+            if let Some(q1) = code[q0 + 1..].find('"') {
+                let stmt = code[q0 + 1..q0 + 1 + q1].trim();
+                if let Some((lhs, rhs)) = stmt.split_once('=') {
+                    let l_trim = lhs.trim().to_ascii_lowercase();
+                    if l_trim.starts_with('l') && l_trim[1..].chars().all(|c| c.is_ascii_digit()) {
+                        if let Ok(iv) = rhs.trim().parse::<i64>() {
+                            loop_inits.insert(l_trim, iv);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // `if "l<k> % 2 == <rem>" { ... } else { ... }`
+    let low_txt = txt.to_ascii_lowercase();
+    let if_pos = low_txt.find("if \"l")?;
+    let tail = &low_txt[if_pos..];
+    let q0 = tail.find('"')?;
+    let q1_rel = tail[q0 + 1..].find('"')?;
+    let cond = tail[q0 + 1..q0 + 1 + q1_rel].replace(' ', "");
+    let b0 = tail.find('{')?;
+    // The opening brace must directly follow the condition (no intervening statements).
+    if !tail.get(q0 + 2 + q1_rel..b0)?.trim().is_empty() {
+        return None;
+    }
+    let (lvar, rem_s) = cond.split_once("%2==")?;
+    let rem: i64 = rem_s.parse().ok()?;
+    let after_b0 = &tail[b0 + 1..];
+    let b1 = after_b0.find('}')?;
+    let then_blk = &after_b0[..b1];
+    let after_then = after_b0[b1 + 1..].trim_start();
+    let else_blk = after_then
+        .strip_prefix("else")
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix('{'))
+        .and_then(|after_eb0| after_eb0.find('}').map(|eb1| &after_eb0[..eb1]));
+    let is_sat_blk = |blk: &str| -> bool {
+        blk.contains("lo to")
+            && (blk.contains("p0") || blk.contains("times l") || blk.contains("p1"))
+    };
+    let then_sat = is_sat_blk(then_blk);
+    let else_sat = else_blk.is_some_and(is_sat_blk);
+    if then_sat == else_sat {
+        return None;
+    }
+    let init = loop_inits.get(lvar).copied().unwrap_or(0);
+    let plane0_takes_then = init.rem_euclid(2) == rem.rem_euclid(2);
+    Some(if plane0_takes_then {
+        then_sat
+    } else {
+        else_sat
+    })
+}
+
 /// Recognize schedule-less Bruker 2-plane interleaved steady-state `{1H}-15N` `hetNOE` datasets
 /// (`hsqcnoef3gpsi`, `hsqcnoef3gpsi3d`, `trosynoef3gpsi`, etc.), deducing whether plane 0 is
-/// unsaturated reference (`NONOE`, `delay = 0`) or proton-saturated (`NOE`, `delay = D[1]`)
-/// directly from `pulseprogram` loop-counter parity (`l0 % 2 == 1` vs `0`) and comments.
+/// unsaturated reference (`NONOE`, `delay = 0`) or proton-saturated (`NOE`, `delay = D[1]`).
+///
+/// The plane order must be positively proven from `pulseprogram` loop-counter parity
+/// (`l0 % 2 == 1` vs `0`), an explicit `hetnoe_order: sat_first|ref_first` comment tag, or the
+/// stock Bruker `recording noe and nonoe` / `recording nonoe and noe` comments. Pure absence of
+/// evidence, or contradictory evidence, is an error unless the caller passes an explicit
+/// [`HetNoeOrder`]. The saturation delay is taken from `D[1]` (missing or non-positive is an
+/// error) and a provenance warning is returned alongside the schedule.
+///
+/// Returns `Ok(None)` when the dataset is not a recognizable 2-plane hetNOE series.
 fn infer_bruker_hetnoe_schedule(
     pp_text: Option<&str>,
     pulprog: &str,
     acqus: &HashMap<String, String>,
     acqu2s: &HashMap<String, String>,
     acqu3s: Option<&HashMap<String, String>>,
-) -> Option<RelaxSchedule> {
+    order: HetNoeOrder,
+) -> Result<Option<(RelaxSchedule, Vec<String>)>, String> {
     let p_low = pulprog.to_ascii_lowercase();
     let name_is_hetnoe =
         p_low.contains("noe") && !p_low.contains("noesy") && !p_low.contains("roesy");
@@ -1886,7 +1999,7 @@ fn infer_bruker_hetnoe_schedule(
             || low.contains("heteronuclear noe")
     });
     if !name_is_hetnoe && !pp_mentions_hetnoe {
-        return None;
+        return Ok(None);
     }
 
     // Verify 2-plane compatibility (`acqu3s.TD == 2`, `acqu2s.TD == 2` in 3D, or 2D doubled `TD`).
@@ -1894,20 +2007,16 @@ fn infer_bruker_hetnoe_schedule(
     if let Some(a3) = acqu3s {
         let td3: usize = a3.get("TD").and_then(|s| s.parse().ok()).unwrap_or(0);
         if td3 != 2 && td2 != 2 {
-            return None;
+            return Ok(None);
         }
     } else if td2 < 2 || !td2.is_multiple_of(2) {
-        return None;
+        return Ok(None);
     }
 
-    let d_sat = acqus
-        .get("D")
-        .and_then(|d_arr| d_arr.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|&v| v.is_finite() && v > 0.0)
-        .unwrap_or(3.0);
+    let mut warnings: Vec<String> = Vec::new();
 
-    let mut sat_first: Option<bool> = None;
+    // Positive evidence for the plane order (`true` = saturated plane first).
+    let mut tag_votes: Vec<bool> = Vec::new();
     if let Some(txt) = pp_text {
         for raw_line in txt.lines() {
             if let Some((_, cmt)) = raw_line.split_once(';') {
@@ -1915,92 +2024,95 @@ fn infer_bruker_hetnoe_schedule(
                 if low.contains("hetnoe_order: sat_first")
                     || low.contains("recording noe and nonoe")
                 {
-                    sat_first = Some(true);
-                    break;
+                    tag_votes.push(true);
                 }
                 if low.contains("hetnoe_order: ref_first")
                     || low.contains("hetnoe_order: nonoe_first")
                     || low.contains("recording nonoe and noe")
                 {
-                    sat_first = Some(false);
-                }
-            }
-        }
-
-        // Parse exact `"l<k>=<init>"` + `if "l<k> % 2 == <rem>" { ... } else { ... }` branch physics
-        let mut loop_inits: HashMap<String, i64> = HashMap::new();
-        for raw_line in txt.lines() {
-            let code = raw_line.split(';').next().unwrap_or("").trim();
-            if contains_pp_ident_local(code, "ze") {
-                break;
-            }
-            if let Some(q0) = code.find('"') {
-                if let Some(q1) = code[q0 + 1..].find('"') {
-                    let stmt = code[q0 + 1..q0 + 1 + q1].trim();
-                    if let Some((lhs, rhs)) = stmt.split_once('=') {
-                        let l_trim = lhs.trim().to_ascii_lowercase();
-                        if l_trim.starts_with('l')
-                            && l_trim[1..].chars().all(|c| c.is_ascii_digit())
-                        {
-                            if let Ok(iv) = rhs.trim().parse::<i64>() {
-                                loop_inits.insert(l_trim, iv);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let low_txt = txt.to_ascii_lowercase();
-        if let Some(if_pos) = low_txt.find("if \"l") {
-            let tail = &low_txt[if_pos..];
-            if let (Some(q0), Some(b0)) = (tail.find('"'), tail.find('{')) {
-                if let Some(q1_rel) = tail[q0 + 1..].find('"') {
-                    let cond = tail[q0 + 1..q0 + 1 + q1_rel].replace(' ', "");
-                    // Match `l<k>%2==<rem>`
-                    if let Some((lvar, rem_s)) = cond.split_once("%2==") {
-                        if let Ok(rem) = rem_s.parse::<i64>() {
-                            let after_b0 = &tail[b0 + 1..];
-                            if let Some(b1) = after_b0.find('}') {
-                                let then_blk = &after_b0[..b1];
-                                let after_then = &after_b0[b1 + 1..];
-                                let else_blk = if let Some(eb0) = after_then.find('{') {
-                                    let after_eb0 = &after_then[eb0 + 1..];
-                                    after_eb0.find('}').map(|eb1| &after_eb0[..eb1])
-                                } else {
-                                    None
-                                };
-                                let is_sat_blk = |blk: &str| -> bool {
-                                    blk.contains("lo to")
-                                        && (blk.contains("p0")
-                                            || blk.contains("times l")
-                                            || blk.contains("p1"))
-                                };
-                                let then_sat = is_sat_blk(then_blk);
-                                let else_sat = else_blk.is_some_and(is_sat_blk);
-                                if then_sat != else_sat {
-                                    let init = loop_inits.get(lvar).copied().unwrap_or(0);
-                                    let plane0_takes_then = init.rem_euclid(2) == rem.rem_euclid(2);
-                                    sat_first = Some(if plane0_takes_then {
-                                        then_sat
-                                    } else {
-                                        else_sat
-                                    });
-                                }
-                            }
-                        }
-                    }
+                    tag_votes.push(false);
                 }
             }
         }
     }
+    let tag_has_true = tag_votes.iter().any(|&v| v);
+    let tag_has_false = tag_votes.iter().any(|&v| !v);
+    let tag_order: Option<bool> = match (tag_has_true, tag_has_false) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    };
+    let parity_order: Option<bool> = pp_text.and_then(hetnoe_order_from_branch_parity);
+    let proven: Result<Option<bool>, String> = if tag_has_true && tag_has_false {
+        Err("pulseprogram comments contradict each other about the hetNOE plane order".to_string())
+    } else {
+        match (tag_order, parity_order) {
+            (Some(a), Some(b)) if a != b => Err(
+                "pulseprogram comment tag and `l<k> % 2` branch parity disagree about the hetNOE plane order"
+                    .to_string(),
+            ),
+            (Some(a), _) | (_, Some(a)) => Ok(Some(a)),
+            (None, None) => Ok(None),
+        }
+    };
 
-    let delays_sec = if sat_first.unwrap_or(false) {
+    let sat_first = match order {
+        HetNoeOrder::SatFirst | HetNoeOrder::RefFirst => {
+            let asserted = order == HetNoeOrder::SatFirst;
+            if let Ok(Some(p)) = proven {
+                if p != asserted {
+                    warnings.push(format!(
+                        "explicit hetNOE plane order ({}) overrides the pulseprogram-derived order ({})",
+                        if asserted { "sat-first" } else { "ref-first" },
+                        if p { "sat-first" } else { "ref-first" }
+                    ));
+                }
+            }
+            asserted
+        }
+        HetNoeOrder::Auto => match proven {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return Err(
+                    "cannot prove the saturated-vs-reference plane order of this schedule-less Bruker hetNOE ser: \
+                     the pulseprogram has no decidable `l<k> % 2 == <rem>` branch parity, no `hetnoe_order: sat_first|ref_first` \
+                     comment tag, and no `recording noe and nonoe` / `recording nonoe and noe` comment; \
+                     pass --hetnoe-order sat-first|ref-first (or an explicit --delays / --vdlist schedule)"
+                        .to_string(),
+                );
+            }
+            Err(why) => {
+                return Err(format!(
+                    "{why}; pass --hetnoe-order sat-first|ref-first (or an explicit --delays / --vdlist schedule)"
+                ));
+            }
+        },
+    };
+
+    let d_sat = acqus
+        .get("D")
+        .and_then(|d_arr| d_arr.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&v| v.is_finite() && v > 0.0)
+        .ok_or_else(|| {
+            "schedule-less Bruker hetNOE ser has no positive finite acqus D[1] to use as the proton \
+             saturation delay; pass an explicit --delays 0,<t_sat> (or --vdlist) schedule"
+                .to_string()
+        })?;
+    warnings.push(format!(
+        "hetNOE saturation delay {d_sat} s was taken from acqus D[1] (the d1 recycle delay), not from an explicit schedule; \
+         verify it equals the proton saturation time or pass --delays 0,<t_sat>"
+    ));
+
+    let delays_sec = if sat_first {
         vec![d_sat, 0.0]
     } else {
         vec![0.0, d_sat]
     };
-    Some(RelaxSchedule::VariableDelaysSec { delays_sec })
+    Ok(Some((
+        RelaxSchedule::VariableDelaysSec { delays_sec },
+        warnings,
+    )))
 }
 
 fn infer_bruker_pseudo3d_interleaving(
@@ -2213,6 +2325,27 @@ pub fn read_bruker_pseudo3d_with_schedule(
     unit_cycle_sec_for_vclist: Option<f64>,
     schedule_override: Option<RelaxSchedule>,
 ) -> Result<RawPseudo3D, String> {
+    read_bruker_pseudo3d_with_hetnoe_order(
+        dir,
+        interleaving_override,
+        unit_cycle_sec_for_vclist,
+        schedule_override,
+        HetNoeOrder::Auto,
+    )
+}
+
+/// Like [`read_bruker_pseudo3d_with_schedule`], with an explicit [`HetNoeOrder`] for schedule-less
+/// 2-plane hetNOE `ser` directories. With `HetNoeOrder::Auto` the saturated-vs-reference plane order
+/// must be positively proven from the pulse program, otherwise this returns `Err` (fail closed);
+/// `SatFirst` / `RefFirst` assert the order explicitly. The order is irrelevant when a
+/// `schedule_override`, `vdlist`, `vclist`, or `fqlist` supplies the schedule.
+pub fn read_bruker_pseudo3d_with_hetnoe_order(
+    dir: impl AsRef<Path>,
+    interleaving_override: Option<Pseudo3DInterleaving>,
+    unit_cycle_sec_for_vclist: Option<f64>,
+    schedule_override: Option<RelaxSchedule>,
+    hetnoe_order: HetNoeOrder,
+) -> Result<RawPseudo3D, String> {
     let dir = dir.as_ref();
     let acqus = read_merged_jcamp_local(dir, "acqus", "acqu")?;
     let acqu2s = read_merged_jcamp_local(dir, "acqu2s", "acqu2")?;
@@ -2373,6 +2506,7 @@ pub fn read_bruker_pseudo3d_with_schedule(
             RelaxExperimentKind::R1
         }
     };
+    let mut warnings: Vec<String> = Vec::new();
     let (schedule, exp_kind) = if let Some(sched_ovr) = schedule_override {
         (sched_ovr, infer_kind_from_pulprog())
     } else if let Some(vd_path) = find_file_ci_local(dir, "vdlist") {
@@ -2419,13 +2553,15 @@ pub fn read_bruker_pseudo3d_with_schedule(
             RelaxSchedule::FrequencyOffsets { offsets },
             RelaxExperimentKind::Cest,
         )
-    } else if let Some(noe_sched) = infer_bruker_hetnoe_schedule(
+    } else if let Some((noe_sched, noe_warnings)) = infer_bruker_hetnoe_schedule(
         pp_txt.as_deref(),
         &pulprog,
         &acqus,
         &acqu2s,
         acqu3s.as_ref(),
-    ) {
+        hetnoe_order,
+    )? {
+        warnings.extend(noe_warnings);
         (noe_sched, RelaxExperimentKind::HetNoe)
     } else {
         return Err(format!(
@@ -2623,6 +2759,7 @@ pub fn read_bruker_pseudo3d_with_schedule(
         interleaving,
         schedule,
         planes,
+        warnings,
     })
 }
 
@@ -2662,6 +2799,11 @@ fn read_be_f32_at(bytes: &[u8], off: usize) -> Result<f32, String> {
     Ok(f32::from_be_bytes(arr))
 }
 
+/// Upper bound on `nblocks * ntraces` accepted from a Varian `fid` header.
+const VARIAN_MAX_TRACES: usize = 1 << 22;
+/// Upper bound on the per-trace point count `np` accepted from a Varian `fid` header.
+const VARIAN_MAX_NP: usize = 1 << 24;
+
 /// Read a raw Varian/Agilent arrayed pseudo-3D relaxation or exchange directory (`procpar` + `fid`),
 /// supporting both plane-queued and $t_1$-interleaved (`array = "relaxT,phase"` vs `"phase,relaxT"`)
 /// datasets into per-plane `Fid2D` slices.
@@ -2689,32 +2831,89 @@ pub fn read_varian_pseudo3d(
             fid_path.display()
         ));
     }
-    let nblocks = read_be_i32_at(&bytes, 0)?.max(0) as usize;
-    let ntraces = read_be_i32_at(&bytes, 4)?.max(0) as usize;
-    let np = read_be_i32_at(&bytes, 8)?.max(0) as usize;
-    let ebytes = read_be_i32_at(&bytes, 12)?.max(0) as usize;
-    let bbytes = read_be_i32_at(&bytes, 20)?.max(0) as usize;
+    let nblocks_raw = read_be_i32_at(&bytes, 0)?;
+    let ntraces_raw = read_be_i32_at(&bytes, 4)?;
+    let np_raw = read_be_i32_at(&bytes, 8)?;
+    let ebytes_raw = read_be_i32_at(&bytes, 12)?;
+    let tbytes_raw = read_be_i32_at(&bytes, 16)?;
+    let bbytes_raw = read_be_i32_at(&bytes, 20)?;
     let status = read_be_u16_at(&bytes, 26)?;
     let nbheaders = read_be_i32_at(&bytes, 28)?.max(1) as usize;
+    let fid_disp = fid_path.display();
 
-    if np < 2 || !np.is_multiple_of(2) {
-        return Err(format!("invalid Varian np={np} in {}", fid_path.display()));
+    // Fail closed on hostile/corrupt headers BEFORE any size-driven allocation or loop.
+    if nblocks_raw <= 0 {
+        return Err(format!(
+            "invalid Varian nblocks={nblocks_raw} in {fid_disp}"
+        ));
     }
-    let needed = 32 + nblocks * bbytes;
+    if ntraces_raw <= 0 {
+        return Err(format!(
+            "invalid Varian ntraces={ntraces_raw} in {fid_disp}"
+        ));
+    }
+    if tbytes_raw <= 0 {
+        return Err(format!("invalid Varian tbytes={tbytes_raw} in {fid_disp}"));
+    }
+    if bbytes_raw <= 0 {
+        return Err(format!("invalid Varian bbytes={bbytes_raw} in {fid_disp}"));
+    }
+    if ebytes_raw != 2 && ebytes_raw != 4 {
+        return Err(format!(
+            "unsupported Varian ebytes={ebytes_raw} in {fid_disp} (expected 2 or 4)"
+        ));
+    }
+    if np_raw < 2 || np_raw % 2 != 0 || np_raw as usize > VARIAN_MAX_NP {
+        return Err(format!(
+            "invalid Varian np={np_raw} in {fid_disp} (expected even, 2..={VARIAN_MAX_NP})"
+        ));
+    }
+    let nblocks = nblocks_raw as usize;
+    let ntraces = ntraces_raw as usize;
+    let np = np_raw as usize;
+    let ebytes = ebytes_raw as usize;
+    let bbytes = bbytes_raw as usize;
+
+    let total_traces = nblocks
+        .checked_mul(ntraces)
+        .filter(|&t| t <= VARIAN_MAX_TRACES)
+        .ok_or_else(|| {
+            format!(
+                "Varian fid {fid_disp} declares nblocks={nblocks} x ntraces={ntraces} traces (limit {VARIAN_MAX_TRACES})"
+            )
+        })?;
+    let needed = nblocks
+        .checked_mul(bbytes)
+        .and_then(|v| v.checked_add(32))
+        .ok_or_else(|| format!("Varian fid {fid_disp} nblocks*bbytes overflows"))?;
     if bytes.len() < needed {
         return Err(format!(
-            "Varian pseudo-3D fid {} truncated: expected {needed} B, got {} B",
-            fid_path.display(),
+            "Varian pseudo-3D fid {fid_disp} truncated: expected {needed} B, got {} B",
             bytes.len()
+        ));
+    }
+    let hdr_per_block = nbheaders
+        .checked_mul(28)
+        .ok_or_else(|| format!("Varian fid {fid_disp} nbheaders={nbheaders} overflows"))?;
+    let trace_bytes = np
+        .checked_mul(ebytes)
+        .ok_or_else(|| format!("Varian fid {fid_disp} np*ebytes overflows"))?;
+    let block_payload = ntraces
+        .checked_mul(trace_bytes)
+        .and_then(|v| v.checked_add(hdr_per_block))
+        .ok_or_else(|| format!("Varian fid {fid_disp} block payload size overflows"))?;
+    if block_payload > bbytes {
+        return Err(format!(
+            "Varian fid {fid_disp} block holds {bbytes} B but header declares {block_payload} B \
+             (nbheaders={nbheaders}, ntraces={ntraces}, np={np}, ebytes={ebytes})"
         ));
     }
 
     let n0 = np / 2;
-    let hdr_per_block = nbheaders * 28;
     let is_float = (status & 0x0008) != 0;
     let is_32 = (status & 0x0004) != 0 || ebytes == 4;
 
-    let mut raw_traces: Vec<Vec<Complex64>> = Vec::with_capacity(nblocks * ntraces);
+    let mut raw_traces: Vec<Vec<Complex64>> = Vec::with_capacity(total_traces);
     for b in 0..nblocks {
         let b_off = 32 + b * bbytes;
         let data_start = b_off + hdr_per_block;
@@ -2766,7 +2965,12 @@ pub fn read_varian_pseudo3d(
         .and_then(LocalProcparVal::numbers)
         .unwrap_or(&[1.0, 2.0]);
     let q_mult = if phase_arr.len() == 1 { 1 } else { 2 };
-    let expected_traces = n_planes * ni * q_mult;
+    let expected_traces = n_planes
+        .checked_mul(ni)
+        .and_then(|v| v.checked_mul(q_mult))
+        .ok_or_else(|| {
+            format!("Varian pseudo-3D trace count overflows (n_planes={n_planes}, ni={ni})")
+        })?;
     if raw_traces.len() < expected_traces {
         return Err(format!(
             "Varian pseudo-3D trace count mismatch: got {}, expected {expected_traces} (n_planes={n_planes}, ni={ni}, q_mult={q_mult})",
@@ -2955,6 +3159,7 @@ pub fn read_varian_pseudo3d(
         interleaving,
         schedule: sched_info.schedule,
         planes,
+        warnings: Vec::new(),
     })
 }
 

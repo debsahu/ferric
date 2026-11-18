@@ -36,15 +36,13 @@ use nmr_core::multiplet::{
     QnmrStandardSpec, ReportNucleus, ReportedSignal, TextEncoding,
 };
 use nmr_core::nmr1d::{
-    apply_apodization_1d, apply_phase_1d, auto_calibrate_solvent_1d, auto_phase_and_apply_1d,
-    convert_c13_spectrum_reference_1d, correct_baseline_1d, deconvolve_region_1d,
-    deconvolve_spectrum_1d, estimate_noise_sigma_1d, eval_pseudo_voigt_sum_1d, fft_1d,
-    load_1d_input, load_processed_spectrum_1d, match_trace_impurities, pick_peaks_1d,
-    subtract_solvent_hsvd_1d, suppress_solvent_notch_1d, zero_fill_1d, zero_fill_pow2_1d,
-    Apodization1D, AutoPhase1DConfig, BaselineConfig1D, BaselineMethod1D, DeconvolutionResult1D,
-    DeconvolveConfig1D, Experiment1DKind, HsvdConfig, HsvdPole, Loaded1DData, NotchConfig1D,
-    Nucleus1D, Peak1DPicked, PeakPickConfig1D, PhaseResult1D, Pivot1D, ReferenceStandard,
-    Spectrum1D, VoigtPeak1D,
+    ch_reference_ppm_from_dept90, deconvolve_region_1d, deconvolve_spectrum_1d,
+    eval_pseudo_voigt_sum_1d, load_1d_input, load_processed_spectrum_1d, match_trace_impurities,
+    pick_peaks_1d, process_loaded_1d, Apodization1D, AutoPhase1DConfig, BaselineConfig1D,
+    BaselineMethod1D, DeconvolutionResult1D, DeconvolveConfig1D, Experiment1DKind, HsvdConfig,
+    HsvdPole, Loaded1DData, Nucleus1D, Peak1DPicked, PeakPickConfig1D, PhaseMode1D, PhaseResult1D,
+    Pivot1D, Polarity1D, Process1DOptions, ReferenceStandard, SolventCalibration1D, Spectrum1D,
+    VoigtPeak1D, ZeroFill1D,
 };
 use nmr_core::octet_mol::{parse_smiles, read_mol, read_sdf, Molecule};
 
@@ -56,9 +54,9 @@ pub fn nmr1d_usage() -> &'static str {
      \x20                           [--hsvd [<lo:hi,...>]] [--hsvd-rank 24] [--apod em|gm|lg|cos|cos2|ssb|none]\n\
      \x20                           [--lb <hz>] [--gb <hz>] [--lg-center 0.0] [--first-point 0.5] [--zf 2 | --zf-points <N>]\n\
      \x20                           [--auto-phase | --phase <PHC0:PHC1>] [--pivot <frac|ppm:val|idx:k|max>]\n\
-     \x20                           [--exclude-ppm <lo:hi,...>] [--biphasic-pos <lo:hi>] [--notch <lo:hi,...>]\n\
+     \x20                           [--exclude-ppm <lo:hi,...>] [--biphasic-pos <lo:hi>] [--dept90 <spec>] [--notch <lo:hi,...>]\n\
      \x20                           [--baseline whittaker|asymmetric-whittaker|bernstein|none] [--lambda 1e6] [--bernstein-degree 6]\n\
-     \x20                           [--calibrate-solvent <SOLV>] [--cal-window 0.25] [--ref-offset <ppm>]\n\
+     \x20                           [--calibrate-solvent <SOLV> | --no-auto-calibrate] [--cal-window 0.25] [--ref-offset <ppm>]\n\
      \x20                           [--c13-ref dss|tms] [--c13-source-ref dss|tms]\n\
      \x20                           [--min-snr 6.0] [--shoulders] [--match-impurities] [--deconvolve] [--deconv-region <lo:hi>]\n\
      \x20                           [--peaks-out <peaks.tsv>] [--json-out <summary.json>]\n\
@@ -119,6 +117,16 @@ fn parse_experiment_kind(label: &str) -> Result<Experiment1DKind, String> {
     }
 }
 
+fn ensure_parent_dir(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create directory {}: {e}", parent.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn write_spectrum_1d_tsv(
     path: &Path,
     spec: &Spectrum1D,
@@ -126,8 +134,12 @@ fn write_spectrum_1d_tsv(
     residual: Option<&[f64]>,
 ) -> Result<(), String> {
     let mut out = String::with_capacity(spec.len() * 48 + 256);
+    let ref_shift_str = spec
+        .applied_reference_shift_ppm
+        .map(|d| format!("; applied_reference_shift_ppm={d:+.6}"))
+        .unwrap_or_default();
     out.push_str(&format!(
-        "# name={}; nucleus={}; obs_mhz={:.6}; solvent={}; phc0_deg={:.4}; phc1_deg={:.4}; pivot_frac={:.4}\n",
+        "# name={}; nucleus={}; obs_mhz={:.6}; solvent={}; phc0_deg={:.4}; phc1_deg={:.4}; pivot_frac={:.4}{ref_shift_str}\n",
         spec.name,
         spec.experiment.nucleus().as_str(),
         spec.axis.obs_mhz,
@@ -260,11 +272,15 @@ pub struct Process1dCliReport {
     pub phase_applied_deg: (f64, f64, f64),
     pub auto_phase: Option<PhaseResult1D>,
     pub baseline_noise_sigma: f64,
+    #[serde(default)]
+    pub applied_reference_shift_ppm: Option<f64>,
     pub solvent_calibration_delta_ppm: Option<f64>,
     #[serde(default)]
     pub c13_reference_standard: Option<String>,
     #[serde(default)]
     pub c13_reference_delta_ppm: Option<f64>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub picked_peaks: Vec<Peak1DPicked>,
     pub impurity_matches: Vec<CliImpurityMatch>,
     pub deconvolved_peaks: Vec<VoigtPeak1D>,
@@ -303,6 +319,7 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
     let mut pivot = Pivot1D::Fraction(0.5);
     let mut exclude_ppm: Vec<(f64, f64)> = Vec::new();
     let mut biphasic_pos: Option<(f64, f64)> = None;
+    let mut dept90_path: Option<PathBuf> = None;
     let mut notch_windows: Vec<(f64, f64)> = Vec::new();
 
     let mut baseline_mode = String::from("none");
@@ -310,6 +327,7 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
     let mut bernstein_degree: usize = 6;
 
     let mut calibrate_solvent: Option<String> = None;
+    let mut no_auto_calibrate = false;
     let mut cal_window_ppm: f64 = 0.25;
     let mut ref_offset_ppm: Option<f64> = None;
     let mut c13_target_ref: Option<ReferenceStandard> = None;
@@ -477,6 +495,11 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
                 let v = args.get(i).ok_or("missing value for `--biphasic-pos`")?;
                 biphasic_pos = Some(parse_ppm_pair(v, "--biphasic-pos")?);
             }
+            "--dept90" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for `--dept90`")?;
+                dept90_path = Some(PathBuf::from(v));
+            }
             "--notch" => {
                 i += 1;
                 let v = args.get(i).ok_or("missing value for `--notch`")?;
@@ -509,6 +532,9 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
                     .get(i)
                     .ok_or("missing value for `--calibrate-solvent`")?;
                 calibrate_solvent = Some(v.clone());
+            }
+            "--no-auto-calibrate" => {
+                no_auto_calibrate = true;
             }
             "--cal-window" => {
                 i += 1;
@@ -578,157 +604,177 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
     let out_path = out_path.ok_or("`nmr1d process` requires `--out <path>`")?;
 
     let loaded = load_1d_input(&in_path, mhz_override, true)?;
-    let mut hsvd_subtracted: Vec<HsvdPole> = Vec::new();
+    let eff_exp = exp_override.clone().unwrap_or_else(|| match &loaded {
+        Loaded1DData::TimeDomain(td) => td.experiment.clone(),
+        Loaded1DData::FrequencyDomain(sp) => sp.experiment.clone(),
+    });
 
-    let mut spec = match loaded {
-        Loaded1DData::TimeDomain(mut td) => {
-            if let Some(ref exp) = exp_override {
-                td.experiment = exp.clone();
-            }
-            if let Some(ref wins) = hsvd_windows {
-                let hsvd_res = subtract_solvent_hsvd_1d(
-                    &mut td,
-                    &HsvdConfig {
-                        subspace_rank: hsvd_rank,
-                        max_hankel_points: hsvd_pts,
-                        solvent_ppm_windows: wins.clone(),
-                    },
-                );
-                hsvd_subtracted = hsvd_res.subtracted_poles;
-            }
-
-            let default_lb = td.experiment.default_line_broadening_hz();
-            let window = match apod_kind.as_str() {
-                "none" | "rect" => Apodization1D::None,
-                "em" | "exp" | "exponential" => Apodization1D::Exponential {
-                    lb_hz: lb_hz.unwrap_or(default_lb),
-                },
-                "gm" | "gauss" | "gaussian" => Apodization1D::Gaussian { gb_hz },
-                "lg" | "lorentz-gauss" => Apodization1D::LorentzToGauss {
-                    narrow_lb_hz: lb_hz.unwrap_or(default_lb).abs().max(0.1),
-                    gb_hz,
-                    center_frac: lg_center,
-                },
-                "cos" | "cosine" => Apodization1D::CosineBell { power: 1.0 },
-                "cos2" | "cosine2" => Apodization1D::CosineBell { power: 2.0 },
-                "ssb" | "sine" => Apodization1D::ShiftedSineBell {
-                    offset_pi_frac: ssb_offset,
-                    power: 2.0,
-                },
-                other => {
-                    return Err(format!(
-                        "unsupported `--apod` window {other:?} (expected em|gm|lg|cos|cos2|ssb|none)"
-                    ));
-                }
-            };
-            apply_apodization_1d(&mut td, window, first_point_scale);
-
-            if let Some(target_n) = zf_points {
-                zero_fill_1d(&mut td, target_n);
-            } else if zf_factor > 0 {
-                zero_fill_pow2_1d(&mut td, zf_factor);
-            }
-            fft_1d(&td)
-        }
-        Loaded1DData::FrequencyDomain(mut sp) => {
-            if let Some(ref exp) = exp_override {
-                sp.experiment = exp.clone();
-                sp.axis.label = exp.nucleus().as_str().to_string();
-            }
-            sp
+    let apod_opt: Option<Apodization1D> = match apod_kind.as_str() {
+        "none" | "rect" => Some(Apodization1D::None),
+        "em" | "exp" | "exponential" => lb_hz.map(|lb| Apodization1D::Exponential { lb_hz: lb }),
+        "gm" | "gauss" | "gaussian" => Some(Apodization1D::Gaussian { gb_hz }),
+        "lg" | "lorentz-gauss" => Some(Apodization1D::LorentzToGauss {
+            narrow_lb_hz: lb_hz
+                .unwrap_or_else(|| eff_exp.default_line_broadening_hz())
+                .abs()
+                .max(0.1),
+            gb_hz,
+            center_frac: lg_center,
+        }),
+        "cos" | "cosine" => Some(Apodization1D::CosineBell { power: 1.0 }),
+        "cos2" | "cosine2" => Some(Apodization1D::CosineBell { power: 2.0 }),
+        "ssb" | "sine" => Some(Apodization1D::ShiftedSineBell {
+            offset_pi_frac: ssb_offset,
+            power: 2.0,
+        }),
+        other => {
+            return Err(format!(
+                "unsupported `--apod` window {other:?} (expected em|gm|lg|cos|cos2|ssb|none)"
+            ));
         }
     };
 
-    if let Some(solv) = solvent_override {
-        spec.solvent = Some(solv);
-    }
+    let zero_fill = if let Some(target_n) = zf_points {
+        ZeroFill1D::Points(target_n)
+    } else if zf_factor > 0 {
+        ZeroFill1D::Pow2 {
+            factor: zf_factor,
+            max_points: None,
+        }
+    } else {
+        ZeroFill1D::Off
+    };
 
-    let mut auto_phase_res: Option<PhaseResult1D> = None;
-    if let Some((p0, p1)) = manual_phase {
-        apply_phase_1d(&mut spec, p0, p1, pivot);
-    } else if auto_phase {
+    let known_ch_ppm = if let Some(ref d90_p) = dept90_path {
+        let d90_spec = load_processed_spectrum_1d(d90_p, mhz_override)?;
+        let ch = ch_reference_ppm_from_dept90(&d90_spec)?;
+        if ch.is_empty() {
+            return Err(format!(
+                "`--dept90` spectrum {} contained zero positive CH peaks above SNR {min_snr:.1}",
+                d90_p.display()
+            ));
+        }
+        ch
+    } else {
+        Vec::new()
+    };
+
+    let phase_mode = if let Some((p0, p1)) = manual_phase {
+        PhaseMode1D::Manual {
+            phc0_deg: p0,
+            phc1_deg: p1,
+            pivot,
+        }
+    } else if auto_phase || !known_ch_ppm.is_empty() {
         let mut ap_cfg = AutoPhase1DConfig {
             pivot,
             excluded_ppm_regions: exclude_ppm,
             biphasic_positive_ppm: biphasic_pos,
+            known_ch_ppm,
             ..AutoPhase1DConfig::default()
         };
-        if spec.experiment == Experiment1DKind::Dept135 && ap_cfg.biphasic_positive_ppm.is_none() {
-            ap_cfg.polarity = Some(nmr_core::nmr1d::Polarity1D::Biphasic);
+        if eff_exp == Experiment1DKind::Dept135 && ap_cfg.biphasic_positive_ppm.is_none() {
+            ap_cfg.polarity = Some(Polarity1D::Biphasic);
         }
-        auto_phase_res = Some(auto_phase_and_apply_1d(&mut spec, &ap_cfg));
-    }
+        PhaseMode1D::Auto(ap_cfg)
+    } else {
+        PhaseMode1D::Off
+    };
 
-    for &(lo, hi) in &notch_windows {
-        suppress_solvent_notch_1d(&mut spec, &NotchConfig1D::new(lo, hi));
-    }
-
-    let mut baseline_noise_sigma = estimate_noise_sigma_1d(&spec);
-    match baseline_mode.as_str() {
-        "none" | "off" => {}
-        "whittaker" | "als" | "pls" => {
-            let bres = correct_baseline_1d(
-                &mut spec,
-                &BaselineConfig1D {
-                    method: BaselineMethod1D::Whittaker {
-                        lambda: whittaker_lambda,
-                    },
-                    ..BaselineConfig1D::default()
-                },
-            );
-            baseline_noise_sigma = bres.baseline_noise_sigma;
-        }
-        "asymmetric-whittaker" | "asym-whittaker" => {
-            let bres = correct_baseline_1d(
-                &mut spec,
-                &BaselineConfig1D {
-                    method: BaselineMethod1D::AsymmetricWhittaker {
-                        lambda: whittaker_lambda,
-                        asymmetry_p: 0.005,
-                    },
-                    ..BaselineConfig1D::default()
-                },
-            );
-            baseline_noise_sigma = bres.baseline_noise_sigma;
-        }
-        "bernstein" | "poly" => {
-            let bres = correct_baseline_1d(
-                &mut spec,
-                &BaselineConfig1D {
-                    method: BaselineMethod1D::Bernstein {
-                        degree: bernstein_degree,
-                    },
-                    ..BaselineConfig1D::default()
-                },
-            );
-            baseline_noise_sigma = bres.baseline_noise_sigma;
-        }
+    let baseline_cfg: Option<BaselineConfig1D> = match baseline_mode.as_str() {
+        "none" | "off" => None,
+        "whittaker" | "als" | "pls" => Some(BaselineConfig1D {
+            method: BaselineMethod1D::Whittaker {
+                lambda: whittaker_lambda,
+            },
+            ..BaselineConfig1D::default()
+        }),
+        "asymmetric-whittaker" | "asym-whittaker" => Some(BaselineConfig1D {
+            method: BaselineMethod1D::AsymmetricWhittaker {
+                lambda: whittaker_lambda,
+                asymmetry_p: 0.005,
+            },
+            ..BaselineConfig1D::default()
+        }),
+        "bernstein" | "poly" => Some(BaselineConfig1D {
+            method: BaselineMethod1D::Bernstein {
+                degree: bernstein_degree,
+            },
+            ..BaselineConfig1D::default()
+        }),
         other => {
             return Err(format!(
                 "unknown `--baseline` method {other:?} (expected whittaker|asymmetric-whittaker|bernstein|none)"
             ));
         }
-    }
+    };
 
-    let mut solvent_cal_delta: Option<f64> = None;
-    if let Some(ref solv_name) = calibrate_solvent {
-        let delta = auto_calibrate_solvent_1d(&mut spec, solv_name, cal_window_ppm)?;
-        solvent_cal_delta = Some(delta);
-    }
-    if let Some(off) = ref_offset_ppm {
-        spec.apply_reference_offset(off);
-        solvent_cal_delta = Some(solvent_cal_delta.unwrap_or(0.0) + off);
-    }
+    let calibrate_cfg = if let Some(ref solv_name) = calibrate_solvent {
+        Some(SolventCalibration1D {
+            solvent: Some(solv_name.clone()),
+            window_ppm: cal_window_ppm,
+            required: true,
+        })
+    } else if no_auto_calibrate {
+        None
+    } else {
+        Some(SolventCalibration1D {
+            solvent: None,
+            window_ppm: cal_window_ppm,
+            required: false,
+        })
+    };
 
-    let mut c13_ref_delta_ppm: Option<f64> = None;
-    if let Some(target_ref) = c13_target_ref {
+    let c13_conv = c13_target_ref.map(|target_ref| {
         let source_ref = c13_source_ref.unwrap_or(match target_ref {
             ReferenceStandard::Dss => ReferenceStandard::Tms,
             ReferenceStandard::Tms => ReferenceStandard::Dss,
         });
-        let delta = convert_c13_spectrum_reference_1d(&mut spec, source_ref, target_ref)?;
-        c13_ref_delta_ppm = Some(delta);
+        (source_ref, target_ref)
+    });
+
+    let post_process_frequency_domain = !matches!(phase_mode, PhaseMode1D::Off)
+        || !notch_windows.is_empty()
+        || baseline_cfg.is_some()
+        || calibrate_solvent.is_some()
+        || ref_offset_ppm.is_some()
+        || c13_conv.is_some();
+
+    let proc_opts = Process1DOptions {
+        experiment_override: exp_override,
+        solvent_override,
+        hsvd: hsvd_windows.map(|wins| HsvdConfig {
+            subspace_rank: hsvd_rank,
+            max_hankel_points: hsvd_pts,
+            solvent_ppm_windows: wins,
+        }),
+        apodization: apod_opt,
+        first_point_scale,
+        zero_fill,
+        phase: phase_mode,
+        notch_windows,
+        baseline: baseline_cfg,
+        calibrate: calibrate_cfg,
+        reference_offset_ppm: ref_offset_ppm,
+        c13_reference_conversion: c13_conv,
+        post_process_frequency_domain,
+        strict: true,
+    };
+
+    let processed = process_loaded_1d(loaded, &proc_opts)?;
+    for w in &processed.warnings {
+        eprintln!("warning: {w}");
     }
+    let spec = processed.spectrum;
+    let hsvd_subtracted = processed.hsvd_subtracted;
+    let auto_phase_res = processed.phase;
+    let baseline_noise_sigma = processed.baseline_noise_sigma;
+    let mut solvent_cal_delta = processed.solvent_calibration_delta_ppm;
+    if let Some(off) = ref_offset_ppm {
+        solvent_cal_delta = Some(solvent_cal_delta.unwrap_or(0.0) + off);
+    }
+    let c13_ref_delta_ppm = processed.c13_reference_delta_ppm;
+    let proc_warnings = processed.warnings;
 
     let pick_cfg = PeakPickConfig1D {
         min_snr,
@@ -794,12 +840,7 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
         None
     };
 
-    if let Some(parent) = out_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-        }
-    }
+    ensure_parent_dir(&out_path)?;
 
     let out_ext = out_path
         .extension()
@@ -821,11 +862,7 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
     }
 
     if let Some(ref pk_path) = peaks_out {
-        if let Some(parent) = pk_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
-            }
-        }
+        ensure_parent_dir(pk_path)?;
         let mut pk_tsv = String::new();
         if let Some(ref d) = deconv_res {
             pk_tsv.push_str(
@@ -869,9 +906,11 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
         phase_applied_deg: spec.phase_applied,
         auto_phase: auto_phase_res,
         baseline_noise_sigma,
+        applied_reference_shift_ppm: spec.applied_reference_shift_ppm,
         solvent_calibration_delta_ppm: solvent_cal_delta,
         c13_reference_standard: c13_target_ref.map(|r| r.as_str().to_string()),
         c13_reference_delta_ppm: c13_ref_delta_ppm,
+        warnings: proc_warnings,
         picked_peaks,
         impurity_matches,
         deconvolved_peaks: deconv_res
@@ -882,19 +921,19 @@ fn run_nmr1d_process(args: &[String]) -> Result<(), String> {
     };
 
     if let Some(ref js_path) = json_out {
-        if let Some(parent) = js_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
-            }
-        }
+        ensure_parent_dir(js_path)?;
         let js = serde_json::to_string_pretty(&summary)
             .map_err(|e| format!("failed to serialize process summary JSON: {e}"))?;
         fs::write(js_path, js)
             .map_err(|e| format!("failed to write {}: {e}", js_path.display()))?;
     }
 
+    let ref_note = summary
+        .applied_reference_shift_ppm
+        .map(|d| format!(", ref_shift={d:+.4} ppm"))
+        .unwrap_or_default();
     println!(
-        "nmr1d process: {} ({}, {:.2} MHz, {} pts, {:.3}..{:.3} ppm) -> {} (picked={}, deconvolved={})",
+        "nmr1d process: {} ({}, {:.2} MHz, {} pts, {:.3}..{:.3} ppm{ref_note}) -> {} (picked={}, deconvolved={})",
         summary.name,
         summary.nucleus,
         summary.obs_mhz,
@@ -1350,11 +1389,7 @@ fn run_nmr1d_multiplet(args: &[String]) -> Result<(), String> {
     }
 
     if let Some(ref tsv_path) = out_path {
-        if let Some(parent) = tsv_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
-            }
-        }
+        ensure_parent_dir(tsv_path)?;
         let mut tsv = String::from(
             "index\tppm_high\tppm_low\tcenter_ppm\tclass\tj_hz\tabs_integral\tnorm_integral\tnorm_sigma\tnearest_h\tis_roofed\tinner_outer_ratio\tlabel\n",
         );
@@ -1389,11 +1424,7 @@ fn run_nmr1d_multiplet(args: &[String]) -> Result<(), String> {
         let tbl = assignment_table
             .as_ref()
             .ok_or("`--links-out` requires `--mol <file>` or `--smiles <SMILES>`")?;
-        if let Some(parent) = lpath.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
-            }
-        }
+        ensure_parent_dir(lpath)?;
         let lext = lpath
             .extension()
             .and_then(|s| s.to_str())
@@ -1411,11 +1442,7 @@ fn run_nmr1d_multiplet(args: &[String]) -> Result<(), String> {
     }
 
     if let Some(ref rpath) = report_out {
-        if let Some(parent) = rpath.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
-            }
-        }
+        ensure_parent_dir(rpath)?;
         fs::write(rpath, format!("{formatted_primary}\n"))
             .map_err(|e| format!("failed to write {}: {e}", rpath.display()))?;
     }
@@ -1436,11 +1463,7 @@ fn run_nmr1d_multiplet(args: &[String]) -> Result<(), String> {
     };
 
     if let Some(ref js_path) = json_out {
-        if let Some(parent) = js_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
-            }
-        }
+        ensure_parent_dir(js_path)?;
         let js = serde_json::to_string_pretty(&full_report)
             .map_err(|e| format!("failed to serialize multiplet JSON: {e}"))?;
         fs::write(js_path, js)
@@ -1954,11 +1977,7 @@ fn run_nmr1d_qnmr(args: &[String]) -> Result<(), String> {
     };
 
     if let Some(ref tsv_path) = out_path {
-        if let Some(parent) = tsv_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
-            }
-        }
+        ensure_parent_dir(tsv_path)?;
         let mut tsv = String::from(
             "analyte\tpurity_percent\tcombined_uncertainty_percent\texpanded_uncertainty_k2_percent\tmolar_concentration_mm\treplicate_count\treplicate_rsd_percent\tt1_recycle_warning\n",
         );
@@ -1984,11 +2003,7 @@ fn run_nmr1d_qnmr(args: &[String]) -> Result<(), String> {
     }
 
     if let Some(ref js_path) = json_out {
-        if let Some(parent) = js_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
-            }
-        }
+        ensure_parent_dir(js_path)?;
         let js = serde_json::to_string_pretty(&report)
             .map_err(|e| format!("failed to serialize qNMR report JSON: {e}"))?;
         fs::write(js_path, js)

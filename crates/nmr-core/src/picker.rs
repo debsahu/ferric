@@ -1951,34 +1951,56 @@ impl Default for Cube3dPickerConfig {
     }
 }
 
-fn infer_cube_axis_iso(axis: &AxisPpm, ref_h_mhz: Option<f64>) -> &'static str {
-    if let Some(hmhz) = ref_h_mhz.filter(|&m| m > 50.0) {
-        if axis.obs_mhz > 10.0 {
-            let r = axis.obs_mhz / hmhz;
-            if (r - 1.0).abs() < 0.04 {
-                return "1H";
-            }
-            if (r - 0.10133).abs() < 0.02 {
-                return "15N";
-            }
-            if (r - 0.25145).abs() < 0.025 {
-                return "13C";
-            }
-            if (r - 0.4048).abs() < 0.025 {
-                return "31P";
-            }
-            if (r - 0.9408).abs() < 0.025 {
-                return "19F";
-            }
-        }
+/// Larmor-frequency-ratio nucleus windows (`sf_mhz / proton_mhz`), identical to the windows used by
+/// `nmr-gui::workbook::axis_physical_nucleus` so the GUI and the core picker always agree on the same cube.
+fn nucleus_from_larmor_ratio(ratio: f64) -> Option<&'static str> {
+    if (0.980..=1.020).contains(&ratio) {
+        Some("1H")
+    } else if (0.925..=0.958).contains(&ratio) {
+        Some("19F")
+    } else if (0.390..=0.420).contains(&ratio) {
+        Some("31P")
+    } else if (0.235..=0.270).contains(&ratio) {
+        Some("13C")
+    } else if (0.145..=0.165).contains(&ratio) {
+        Some("2H")
+    } else if (0.090..=0.115).contains(&ratio) {
+        Some("15N")
+    } else {
+        None
     }
-    let up = axis
+}
+
+/// Infer the nucleus of a cube axis **from its label alone** (`20.W1:P1-1`).
+///
+/// Exact standard labels are matched first (`"HN"`, `"HA"`, `"H"`, `"1H"` -> `1H`; `"N"`, `"NH"`, `"15N"` -> `15N`;
+/// `"C"`, `"CA"`, `"CB"`, `"CO"`, `"13C"` -> `13C`). In the substring fallback `H`/`1H` is tested
+/// **before** a bare `N`, because the ubiquitous amide-proton label `"HN"` contains the letter `N` and used to
+/// be misread as `15N` (which silently disabled the `4.70 ppm` water-band and diagonal exclusion).
+fn nucleus_from_axis_label(axis: &AxisPpm) -> &'static str {
+    let up: String = axis
         .label
         .trim()
         .trim_matches(|c: char| c == '<' || c == '>' || c == '"' || c == '\'')
         .trim()
         .to_ascii_uppercase();
-    if up.contains('N') {
+    match up.as_str() {
+        "1H" | "H1" | "H" | "HN" | "HA" | "HB" | "HC" | "PROTON" | "1H_IND" | "1H_ALIPH" => {
+            return "1H";
+        }
+        "15N" | "N15" | "N" | "NH" => return "15N",
+        "13C" | "C13" | "C" | "CA" | "CB" | "CO" | "CACB" => return "13C",
+        "19F" | "F19" | "F" => return "19F",
+        "31P" | "P31" | "P" => return "31P",
+        _ => {}
+    }
+    if up.contains("1H") || up.contains("H1") || up.starts_with('H') {
+        "1H"
+    } else if up.contains("15N") || up.contains("N15") {
+        "15N"
+    } else if up.contains("13C") || up.contains("C13") {
+        "13C"
+    } else if up.contains('N') {
         "15N"
     } else if up.contains('C') {
         "13C"
@@ -1991,13 +2013,43 @@ fn infer_cube_axis_iso(axis: &AxisPpm, ref_h_mhz: Option<f64>) -> &'static str {
     }
 }
 
+fn infer_cube_axis_iso(axis: &AxisPpm, ref_h_mhz: Option<f64>) -> &'static str {
+    if let Some(hmhz) = ref_h_mhz.filter(|&m| m > 50.0) {
+        if axis.obs_mhz.is_finite() && axis.obs_mhz > 5.0 {
+            if let Some(n) = nucleus_from_larmor_ratio(axis.obs_mhz / hmhz) {
+                // `2H` is not a supported cube nucleus tag in the picker; fall through to the label.
+                if n != "2H" {
+                    return n;
+                }
+            }
+        }
+    }
+    nucleus_from_axis_label(axis)
+}
+
+/// Resolve the proton reference frequency of a cube: the largest `sf_mhz` among the axes that are
+/// unambiguously `1H` (by label or by a proton-sized ppm window), falling back to the overall highest
+/// spectrometer frequency when its ppm window is proton-like (the `1H` axis always has the highest `SF`
+/// in the supported triple-resonance cubes).
+fn cube_proton_reference_mhz(spec: &Spectrum3D) -> Option<f64> {
+    let axes = [&spec.axis_x, &spec.axis_y, &spec.axis_z];
+    let by_label = axes
+        .iter()
+        .filter(|a| a.obs_mhz.is_finite() && a.obs_mhz > 50.0 && nucleus_from_axis_label(a) == "1H")
+        .map(|a| a.obs_mhz)
+        .fold(0.0_f64, f64::max);
+    if by_label > 50.0 {
+        return Some(by_label);
+    }
+    let top = axes
+        .iter()
+        .filter(|a| a.obs_mhz.is_finite() && a.obs_mhz > 50.0)
+        .max_by(|a, b| a.obs_mhz.total_cmp(&b.obs_mhz))?;
+    (top.max_ppm() <= 25.0 && top.min_ppm() >= -10.0).then_some(top.obs_mhz)
+}
+
 fn cube_axis_nuclei(spec: &Spectrum3D) -> (&'static str, &'static str, &'static str) {
-    let x_raw = infer_cube_axis_iso(&spec.axis_x, None);
-    let ref_h = if x_raw == "1H" && spec.axis_x.obs_mhz > 50.0 {
-        Some(spec.axis_x.obs_mhz)
-    } else {
-        None
-    };
+    let ref_h = cube_proton_reference_mhz(spec);
     let nx = infer_cube_axis_iso(&spec.axis_x, ref_h);
     let ny = infer_cube_axis_iso(&spec.axis_y, ref_h);
     let nz = infer_cube_axis_iso(&spec.axis_z, ref_h);
@@ -2735,12 +2787,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_pick_cube_3d_ridge_safe_subvoxel_diagonal_water_and_plane_picker() {
+    /// Synthetic `HCCCONH`-like cube with a `4.70 ppm` F3 water wall, a homonuclear `(8.20, 118.0, 8.20)`
+    /// diagonal and 3 genuine sub-voxel cross-peaks. Axis `labels` / `sf_mhz` are caller-selected so the same
+    /// physical cube can be presented with different (equally legitimate) label conventions.
+    fn water_diag_cube(labels: (&str, &str, &str), sf_mhz: (f64, f64, f64)) -> Spectrum3D {
         let (nx, ny, nz) = (96usize, 24usize, 48usize);
-        let axis_x = AxisPpm::from_bounds("1H", nx, 10.5, 1.0, 800.13);
-        let axis_y = AxisPpm::from_bounds("15N", ny, 130.0, 107.0, 81.08);
-        let axis_z = AxisPpm::from_bounds("1H", nz, 9.8, 0.4, 800.13);
+        let axis_x = AxisPpm::from_bounds(labels.0, nx, 10.5, 1.0, sf_mhz.0);
+        let axis_y = AxisPpm::from_bounds(labels.1, ny, 130.0, 107.0, sf_mhz.1);
+        let axis_z = AxisPpm::from_bounds(labels.2, nz, 9.8, 0.4, sf_mhz.2);
         let mut data = vec![0.0_f32; nx * ny * nz];
 
         // Deterministic baseline noise
@@ -2797,14 +2851,78 @@ mod tests {
             }
         }
 
-        let cube = Spectrum3D {
+        Spectrum3D {
             name: "HCCCONH".to_string(),
             exp: "HCCCONH".to_string(),
             axis_x,
             axis_y,
             axis_z,
             data,
-        };
+        }
+    }
+
+    /// `HNCA`-like cube (`F3 = 1H`, `F2 = 15N`, `F1 = 13C`) with a `4.70 ppm` F3 water wall and 3 sub-voxel
+    /// peaks; axis labels are caller-selected (`20.W1:P1-1` label-convention regression).
+    fn water_hnca_cube(labels: (&str, &str, &str)) -> Spectrum3D {
+        let (nx, ny, nz) = (96usize, 24usize, 48usize);
+        let axis_x = AxisPpm::from_bounds(labels.0, nx, 10.5, 1.0, 800.13);
+        let axis_y = AxisPpm::from_bounds(labels.1, ny, 130.0, 107.0, 81.08);
+        let axis_z = AxisPpm::from_bounds(labels.2, nz, 70.0, 40.0, 201.19);
+        let mut data = vec![0.0_f32; nx * ny * nz];
+        let mut st = 0x0BAD_C0FF_EE12_3456_u64;
+        for cell in &mut data {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u = ((st >> 32) as f32 / (u32::MAX as f32)) - 0.5;
+            *cell = u * 4.0;
+        }
+        let wx = axis_x.ppm_to_index(4.70);
+        for iz in 0..nz {
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    let dw = (ix as f64 - wx) / 1.1;
+                    if dw.abs() <= 3.0 {
+                        data[(iz * ny + iy) * nx + ix] += 9_000.0 * (-0.5 * dw * dw).exp() as f32;
+                    }
+                }
+            }
+        }
+        let truth = [
+            (8.42_f64, 121.3_f64, 55.2_f64, 1_450.0_f32),
+            (7.91_f64, 115.6_f64, 62.8_f64, 980.0_f32),
+            (8.42_f64, 121.3_f64, 45.5_f64, -760.0_f32),
+        ];
+        for &(f3, f2, f1, amp) in &truth {
+            let (cx, cy, cz) = (
+                axis_x.ppm_to_index(f3),
+                axis_y.ppm_to_index(f2),
+                axis_z.ppm_to_index(f1),
+            );
+            for iz in 0..nz {
+                for iy in 0..ny {
+                    for ix in 0..nx {
+                        let r2 = ((ix as f64 - cx) / 1.25).powi(2)
+                            + ((iy as f64 - cy) / 1.15).powi(2)
+                            + ((iz as f64 - cz) / 1.25).powi(2);
+                        if r2 <= 10.0 {
+                            data[(iz * ny + iy) * nx + ix] += amp * (-0.5 * r2).exp() as f32;
+                        }
+                    }
+                }
+            }
+        }
+        Spectrum3D {
+            name: "HNCA".to_string(),
+            exp: "HNCA".to_string(),
+            axis_x,
+            axis_y,
+            axis_z,
+            data,
+        }
+    }
+
+    #[test]
+    fn test_pick_cube_3d_ridge_safe_subvoxel_diagonal_water_and_plane_picker() {
+        let cube = water_diag_cube(("1H", "15N", "1H"), (800.13, 81.08, 800.13));
 
         let picked = pick_cube_3d_ridge_safe(&cube, &Cube3dPickerConfig::default());
         assert_eq!(picked.len(), 3, "got {picked:?}");
@@ -2828,5 +2946,114 @@ mod tests {
         assert!((sf2 - 121.3).abs() < 0.15);
         assert!((sf1 - 4.18).abs() < 0.04);
         assert!(sh > 1_200.0 && sgn == 1);
+    }
+
+    /// `20.W1:P1-1`: the same physical cube must be picked identically whether its axes carry the
+    /// explicit isotope labels (`1H`/`15N`/`13CA`) or the ubiquitous amide-walk labels (`HN`/`N`/`CA`);
+    /// `"HN"` is the amide PROTON, never `15N`, so the `4.70 ppm` water band and the homonuclear
+    /// diagonal must be excluded in both runs (zero difference).
+    #[test]
+    fn test_cube_axis_labels_hn_n_ca_equal_1h_15n_13ca_with_water_artifact() {
+        let cfg = Cube3dPickerConfig::default();
+        // Z axis is the second proton dimension of the diagonal test cube; `CA`/`13CA` is only used for the
+        // nucleus-inference regression below, so keep the picked cube physically identical (proton Z).
+        let explicit = water_diag_cube(("1H", "15N", "1H"), (800.13, 81.08, 800.13));
+        let walk = water_diag_cube(("HN", "N", "H"), (800.13, 81.08, 800.13));
+        let ratio_only = water_diag_cube(("F3", "F2", "F1"), (800.13, 81.08, 800.13));
+
+        assert_eq!(cube_axis_nuclei(&explicit), ("1H", "15N", "1H"));
+        assert_eq!(cube_axis_nuclei(&walk), ("1H", "15N", "1H"));
+        assert_eq!(cube_axis_nuclei(&ratio_only), ("1H", "15N", "1H"));
+
+        let p_explicit = pick_cube_3d_ridge_safe(&explicit, &cfg);
+        let p_walk = pick_cube_3d_ridge_safe(&walk, &cfg);
+        let p_ratio = pick_cube_3d_ridge_safe(&ratio_only, &cfg);
+        assert_eq!(p_explicit.len(), 3, "explicit labels: {p_explicit:?}");
+        assert_eq!(
+            p_walk.len(),
+            p_explicit.len(),
+            "`HN`/`N`/`H` labels must not add water-band false peaks: {p_walk:?}"
+        );
+        assert_eq!(p_ratio.len(), p_explicit.len(), "ratio-only: {p_ratio:?}");
+        for ((a, b), c) in p_explicit.iter().zip(&p_walk).zip(&p_ratio) {
+            for other in [b, c] {
+                assert_eq!(a.sign, other.sign);
+                assert!((a.f3_ppm - other.f3_ppm).abs() == 0.0);
+                assert!((a.f2_ppm - other.f2_ppm).abs() == 0.0);
+                assert!((a.f1_ppm - other.f1_ppm).abs() == 0.0);
+                assert!((a.height - other.height).abs() == 0.0);
+            }
+        }
+        // None of the picks may sit inside the 4.70 ppm water band (direct F3 axis).
+        assert!(p_walk.iter().all(|p| (p.f3_ppm - 4.70).abs() > 0.06));
+
+        // Literal label-set comparison on an `HNCA`-style cube: `1H/15N/13CA` vs `HN/N/CA` (and ratio-only).
+        let h_a = water_hnca_cube(("1H", "15N", "13CA"));
+        let h_b = water_hnca_cube(("HN", "N", "CA"));
+        let h_c = water_hnca_cube(("F3", "F2", "F1"));
+        assert_eq!(cube_axis_nuclei(&h_a), ("1H", "15N", "13C"));
+        assert_eq!(cube_axis_nuclei(&h_b), ("1H", "15N", "13C"));
+        assert_eq!(cube_axis_nuclei(&h_c), ("1H", "15N", "13C"));
+        let (pa, pb, pc) = (
+            pick_cube_3d_ridge_safe(&h_a, &cfg),
+            pick_cube_3d_ridge_safe(&h_b, &cfg),
+            pick_cube_3d_ridge_safe(&h_c, &cfg),
+        );
+        assert_eq!(pa.len(), 3, "explicit HNCA labels: {pa:?}");
+        assert_eq!(pb.len(), pa.len(), "`HN`/`N`/`CA` HNCA cube: {pb:?}");
+        assert_eq!(pc.len(), pa.len(), "ratio-only HNCA cube: {pc:?}");
+        for ((a, b), c) in pa.iter().zip(&pb).zip(&pc) {
+            for other in [b, c] {
+                assert_eq!(a.sign, other.sign);
+                assert!((a.f3_ppm - other.f3_ppm).abs() == 0.0);
+                assert!((a.f2_ppm - other.f2_ppm).abs() == 0.0);
+                assert!((a.f1_ppm - other.f1_ppm).abs() == 0.0);
+                assert!((a.height - other.height).abs() == 0.0);
+            }
+        }
+        assert!(pb.iter().all(|p| (p.f3_ppm - 4.70).abs() > 0.06));
+    }
+
+    /// `20.W1:P1-1`: label-set regression for the three-axis `HN`/`N`/`CA` convention, including the
+    /// frequency-ratio-first rule (labels are only a fallback) shared with `workbook.rs`.
+    #[test]
+    fn test_infer_cube_axis_iso_label_and_ratio_rules() {
+        let ax =
+            |label: &str, sf: f64, hi: f64, lo: f64| AxisPpm::from_bounds(label, 64, hi, lo, sf);
+        // Label-only fallback (no proton reference): `HN` is 1H, never 15N.
+        assert_eq!(infer_cube_axis_iso(&ax("HN", 0.0, 10.5, 6.0), None), "1H");
+        assert_eq!(
+            infer_cube_axis_iso(&ax("N", 0.0, 130.0, 105.0), None),
+            "15N"
+        );
+        assert_eq!(infer_cube_axis_iso(&ax("CA", 0.0, 70.0, 40.0), None), "13C");
+        assert_eq!(infer_cube_axis_iso(&ax("<HN>", 0.0, 10.5, 6.0), None), "1H");
+        assert_eq!(infer_cube_axis_iso(&ax("1H", 0.0, 10.5, 6.0), None), "1H");
+        assert_eq!(
+            infer_cube_axis_iso(&ax("15N", 0.0, 130.0, 105.0), None),
+            "15N"
+        );
+        assert_eq!(
+            infer_cube_axis_iso(&ax("13CA", 0.0, 70.0, 40.0), None),
+            "13C"
+        );
+        // Frequency ratio wins over a misleading label (`HN` string on a 81 MHz axis is 15N).
+        let h = 800.13;
+        assert_eq!(
+            infer_cube_axis_iso(&ax("HN", 81.08, 130.0, 105.0), Some(h)),
+            "15N"
+        );
+        assert_eq!(
+            infer_cube_axis_iso(&ax("N", 800.13, 10.5, 6.0), Some(h)),
+            "1H"
+        );
+        assert_eq!(
+            infer_cube_axis_iso(&ax("CA", 201.19, 70.0, 40.0), Some(h)),
+            "13C"
+        );
+        assert_eq!(
+            infer_cube_axis_iso(&ax("X", 752.9, -70.0, -140.0), Some(h)),
+            "19F"
+        );
     }
 }

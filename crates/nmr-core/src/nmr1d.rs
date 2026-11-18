@@ -302,6 +302,9 @@ pub struct TimeDomain1D {
     /// Optional deuterated or aqueous solvent identifier propagated from acquisition metadata.
     #[serde(default)]
     pub solvent: Option<String>,
+    /// Non-fatal loader diagnostics carried through to [`Spectrum1D::processing_warnings`].
+    #[serde(default)]
+    pub load_warnings: Vec<String>,
     /// Complex `(re, im)` samples (length `>= active_td` after zero-filling).
     pub data: Vec<Complex64>,
 }
@@ -327,6 +330,7 @@ impl TimeDomain1D {
             group_delay_pts: 0.0,
             conjugate_for_fft: false,
             solvent: None,
+            load_warnings: Vec::new(),
             data,
         }
     }
@@ -350,6 +354,7 @@ impl TimeDomain1D {
             group_delay_pts: fid.axis_x.group_delay,
             conjugate_for_fft: !fid.axis_x.conjugate_for_fft,
             solvent: None,
+            load_warnings: Vec::new(),
             data: fid.data.clone(),
         };
         compensate_group_delay_1d(&mut td);
@@ -417,6 +422,16 @@ pub struct Spectrum1D {
     pub temperature_k: Option<f64>,
     /// Cumulative `(phc0_deg, phc1_deg, pivot_frac)` applied since FFT.
     pub phase_applied: (f64, f64, f64),
+    /// Cumulative chemical-shift referencing offset (ppm) applied to the axis by solvent calibration, an
+    /// explicit `--ref-offset`, or a `13C` DSS/TMS scale conversion (`None` = axis exactly as acquired /
+    /// as stored by the vendor). Recorded so every consumer can show which reference shift was applied
+    /// (`v0150:P1-3`).
+    #[serde(default)]
+    pub applied_reference_shift_ppm: Option<f64>,
+    /// Non-fatal processing diagnostics (skipped/failed solvent referencing, ambiguous `DEPT-135`
+    /// polarity, sibling datasets that failed to load, ...). Never swallowed with `let _ =`.
+    #[serde(default)]
+    pub processing_warnings: Vec<String>,
 }
 
 impl PartialEq for Spectrum1D {
@@ -458,6 +473,8 @@ impl Spectrum1D {
             solvent: None,
             temperature_k: None,
             phase_applied: (0.0, 0.0, 0.5),
+            applied_reference_shift_ppm: None,
+            processing_warnings: Vec::new(),
         }
     }
 
@@ -494,6 +511,8 @@ impl Spectrum1D {
     /// Shift the entire chemical-shift axis by `delta_ppm` (`new_ppm = old_ppm + delta_ppm`).
     pub fn apply_reference_offset(&mut self, delta_ppm: f64) {
         self.axis.first_ppm += delta_ppm;
+        self.applied_reference_shift_ppm =
+            Some(self.applied_reference_shift_ppm.unwrap_or(0.0) + delta_ppm);
     }
 
     /// Calibrate the chemical-shift axis so a peak currently at `observed_ppm` moves to `target_ppm`.
@@ -763,6 +782,7 @@ pub fn fft_1d(fid: &TimeDomain1D) -> Spectrum1D {
         Some(imag),
     );
     spec.solvent = fid.solvent.clone();
+    spec.processing_warnings = fid.load_warnings.clone();
     spec
 }
 
@@ -998,6 +1018,52 @@ pub struct AutoPhase1DConfig {
     /// trapping at `PHC1 = ±180°` boundaries (`F29`, default `0.06`).
     #[serde(default = "default_biphasic_phc1_prior_weight")]
     pub biphasic_phc1_prior_weight: f64,
+    /// Chemical shifts (ppm) of carbons **independently known to be methine `CH`** (positive in `DEPT-135`),
+    /// e.g. the peak list of a phased `DEPT-90` spectrum of the same sample
+    /// ([`ch_reference_ppm_from_dept90`]) or `1H`-coupled doublets. This is the shift-independent
+    /// multiplicity evidence that resolves the global `0°` vs `180°` sign of a `DEPT-135` spectrum
+    /// (`20.W1:P1-2`); without it (or `biphasic_positive_ppm`) the sign is reported as
+    /// [`PolarityResolution1D::AmbiguousGlobalPolarity`] instead of being guessed from a shift band.
+    #[serde(default)]
+    pub known_ch_ppm: Vec<f64>,
+    /// Matching tolerance (ppm) between `known_ch_ppm` entries and `DEPT-135` lines (default `0.25`).
+    #[serde(default = "default_ch_match_tol_ppm")]
+    pub ch_match_tol_ppm: f64,
+}
+
+fn default_ch_match_tol_ppm() -> f64 {
+    0.25
+}
+
+/// How the global `0°` vs `180°` sign of a [`Polarity1D::Biphasic`] (`DEPT-135`) autophase was fixed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolarityResolution1D {
+    /// No global-sign decision was required (`AllPositive` spectra, or too few points).
+    #[default]
+    NotApplicable,
+    /// Sign fixed by the caller-supplied positive-reference window `biphasic_positive_ppm`.
+    ExplicitPositiveWindow,
+    /// Sign fixed by independently known methine positions (`known_ch_ppm`, e.g. from `DEPT-90`).
+    MultiplicityReference,
+    /// No chemical-shift-independent evidence is available: the minimum-entropy phase is right up to a
+    /// global `180°` and the returned orientation (dominant lobe positive) is only a **convention**.
+    /// Do not interpret `CH`/`CH2` from the sign without a `DEPT-90` reference.
+    AmbiguousGlobalPolarity,
+}
+
+impl PolarityResolution1D {
+    /// Human-readable warning text for unresolved polarity (`None` when the sign is trustworthy).
+    pub fn warning(&self) -> Option<&'static str> {
+        match self {
+            Self::AmbiguousGlobalPolarity => Some(
+                "AmbiguousGlobalPolarity: DEPT-135 global sign (CH/CH3 positive vs CH2 negative) could not be \
+                 determined without chemical-shift assumptions; supply a DEPT-90 reference (known_ch_ppm / \
+                 --dept90) or a positive-reference window (biphasic_positive_ppm / --biphasic-pos). The returned \
+                 orientation (dominant lobe positive) is a convention, not a multiplicity assignment.",
+            ),
+            _ => None,
+        }
+    }
 }
 
 impl Default for AutoPhase1DConfig {
@@ -1014,6 +1080,8 @@ impl Default for AutoPhase1DConfig {
             biphasic_positive_ppm: None,
             auto_mask_aqueous_hdo: true,
             biphasic_phc1_prior_weight: 0.06,
+            known_ch_ppm: Vec::new(),
+            ch_match_tol_ppm: default_ch_match_tol_ppm(),
         }
     }
 }
@@ -1029,6 +1097,9 @@ pub struct PhaseResult1D {
     pub pivot_frac: f64,
     /// Final composite minimum-entropy + dispersion objective value.
     pub objective: f64,
+    /// How the global `0°`/`180°` sign was fixed for `Biphasic` (`DEPT-135`) spectra.
+    #[serde(default)]
+    pub polarity_resolution: PolarityResolution1D,
 }
 
 fn median_in_place(vals: &mut [f64]) -> f64 {
@@ -1067,6 +1138,7 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
             phc1_deg: 0.0,
             pivot_frac: u_piv,
             objective: 0.0,
+            polarity_resolution: PolarityResolution1D::NotApplicable,
         };
     }
 
@@ -1816,6 +1888,7 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
     }
 
     // Stage 3: Global 0 vs 180 deg sign lock on full active array.
+    let mut polarity_resolution = PolarityResolution1D::NotApplicable;
     let p1_final_rad = best_p1.to_radians();
     let phi0_final_rad = best_pc.to_radians() - p1_final_rad * u_c;
     let step_final_rad = p1_final_rad / denom;
@@ -1839,61 +1912,85 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
             }
         }
         Polarity1D::Biphasic => {
+            // Global `0°` vs `180°` sign of a `DEPT-135` spectrum (CH/CH3 positive, CH2 negative;
+            // Doddrell, Pegg & Bendall 1982). The minimum-entropy objective is invariant under a global
+            // sign flip, so the sign needs *independent* evidence. Chemical-shift bands are NOT such
+            // evidence (they mislabel amino-acid C-alpha CH at 50-62 ppm, sugar/PEG CH2 at 62-72 ppm,
+            // OCH3/NCH3 and aromatic CH; `20.W1:P1-2`), so only two kinds of evidence are accepted:
+            //   1. an explicit caller-supplied positive window (`biphasic_positive_ppm`), or
+            //   2. independently known methine positions (`known_ch_ppm`, e.g. from `DEPT-90`).
+            // Without either, the sign is reported as `AmbiguousGlobalPolarity` and the branch with
+            // minimum zero-order rotation (`|PHC0_at_pivot| <= 90°` relative to the input receiver phase)
+            // is retained rather than guessing from chemical-shift regions or lobe areas.
+            let sig_cut = (4.0 * sigma_noise).max(tau_neg);
+            // `Some(true)` = keep, `Some(false)` = flip, `None` = unresolved.
+            let mut decision: Option<bool> = None;
             if let Some((a, b)) = config.biphasic_positive_ppm {
                 let (lo, hi) = (a.min(b), a.max(b));
                 let mut band_sum = 0.0_f64;
+                let mut band_n = 0usize;
                 for (j, &rj) in r_buf.iter().enumerate() {
                     let ppm = spec.ppm_at(j);
-                    if active[j] && ppm >= lo && ppm <= hi && rj.abs() > tau_neg {
+                    if active[j] && ppm >= lo && ppm <= hi && rj.abs() > sig_cut {
                         band_sum += rj * rj.abs();
+                        band_n += 1;
                     }
                 }
-                if band_sum < 0.0 {
-                    best_pc = wrap_deg_180(best_pc + 180.0);
-                    best_obj = eval_objective(best_pc, best_p1, &mut r_buf);
+                if band_n > 0 && band_sum != 0.0 {
+                    decision = Some(band_sum > 0.0);
+                    polarity_resolution = PolarityResolution1D::ExplicitPositiveWindow;
                 }
-            } else {
-                // Automatic `DEPT-135` `0° vs 180°` sign disambiguation (`F29`, Doddrell et al. 1982):
-                // methines (`CH`, `68..220 ppm` outside terminal `=CH2` `108..122 ppm`) and primary
-                // methyls (`CH3`, `-5..22.5 ppm`) carry positive polarization, while aliphatic
-                // methylenes (`CH2`, `24..62 ppm`) carry negative polarization.
-                let sig_cut = (4.0 * sigma_noise).max(tau_neg);
-                let mut ch_ch3_signed = 0.0_f64;
-                let mut ch2_signed = 0.0_f64;
-                let mut pos_e2 = 0.0_f64;
-                let mut neg_e2 = 0.0_f64;
-                for (j, &rj) in r_buf.iter().enumerate() {
-                    if !active[j] || rj.abs() <= sig_cut {
+            }
+            if decision.is_none() && !config.known_ch_ppm.is_empty() {
+                let tol = config.ch_match_tol_ppm.abs().max(spec.bin_width_ppm());
+                let (mut n_pos, mut n_neg) = (0usize, 0usize);
+                let mut ref_signed = 0.0_f64;
+                for &ch_ppm in &config.known_ch_ppm {
+                    if !ch_ppm.is_finite() {
                         continue;
                     }
-                    let e2 = rj * rj;
-                    let s_e2 = rj * rj.abs();
-                    if rj >= 0.0 {
-                        pos_e2 += e2;
-                    } else {
-                        neg_e2 += e2;
+                    let mut best_abs = 0.0_f64;
+                    let mut best_val = 0.0_f64;
+                    for (j, &rj) in r_buf.iter().enumerate() {
+                        if active[j]
+                            && (spec.ppm_at(j) - ch_ppm).abs() <= tol
+                            && rj.abs() > best_abs
+                        {
+                            best_abs = rj.abs();
+                            best_val = rj;
+                        }
                     }
-                    let ppm = spec.ppm_at(j);
-                    let in_ch_band =
-                        (68.0..=220.0).contains(&ppm) && !(108.0..=122.0).contains(&ppm);
-                    let in_ch3_band = (-5.0..=22.5).contains(&ppm);
-                    if in_ch_band || in_ch3_band {
-                        ch_ch3_signed += s_e2;
-                    } else if (24.0..=62.0).contains(&ppm) {
-                        ch2_signed += s_e2;
+                    if best_abs > sig_cut {
+                        ref_signed += best_val * best_abs;
+                        if best_val > 0.0 {
+                            n_pos += 1;
+                        } else {
+                            n_neg += 1;
+                        }
                     }
                 }
-                let tot_e2 = pos_e2 + neg_e2;
-                let dept_score = ch_ch3_signed - 0.5 * ch2_signed;
-                let should_flip = if tot_e2 > 0.0 && dept_score.abs() > 0.05 * tot_e2 {
-                    dept_score < 0.0
-                } else {
-                    neg_e2 > pos_e2
-                };
-                if should_flip {
-                    best_pc = wrap_deg_180(best_pc + 180.0);
-                    best_obj = eval_objective(best_pc, best_p1, &mut r_buf);
+                let n_tot = n_pos + n_neg;
+                // Require the usable CH references to agree (>= 75% same sign) before trusting them.
+                if n_tot > 0
+                    && (n_pos.max(n_neg) as f64) >= 0.75 * (n_tot as f64)
+                    && ref_signed != 0.0
+                {
+                    decision = Some(ref_signed > 0.0);
+                    polarity_resolution = PolarityResolution1D::MultiplicityReference;
                 }
+            }
+            let keep = match decision {
+                Some(keep) => keep,
+                None => {
+                    polarity_resolution = PolarityResolution1D::AmbiguousGlobalPolarity;
+                    // Minimum zero-order rotation relative to input receiver phase (`|PHC0_at_pivot| <= 90°`).
+                    let phc0_cand = wrap_deg_180(best_pc + best_p1 * (u_piv - u_c));
+                    phc0_cand.abs() < 90.0 || (phc0_cand.abs() == 90.0 && phc0_cand >= 0.0)
+                }
+            };
+            if !keep {
+                best_pc = wrap_deg_180(best_pc + 180.0);
+                best_obj = eval_objective(best_pc, best_p1, &mut r_buf);
             }
         }
     }
@@ -1904,6 +2001,7 @@ pub fn auto_phase_1d(spec: &Spectrum1D, config: &AutoPhase1DConfig) -> PhaseResu
         phc1_deg: best_p1,
         pivot_frac: u_piv,
         objective: best_obj,
+        polarity_resolution,
     }
 }
 
@@ -1916,7 +2014,60 @@ pub fn auto_phase_and_apply_1d(spec: &mut Spectrum1D, config: &AutoPhase1DConfig
         sol.phc1_deg,
         Pivot1D::Fraction(sol.pivot_frac),
     );
+    if let Some(w) = sol.polarity_resolution.warning() {
+        spec.processing_warnings.push(w.to_string());
+    }
     sol
+}
+
+/// Extract the carbon positions that are **methine `CH`** from a `DEPT-90` spectrum of the same sample
+/// (only `CH` survives the `DEPT-90` editing; Doddrell, Pegg & Bendall, *J. Magn. Reson.* **1982**, 48,
+/// 323–327): the spectrum is minimum-entropy phased with all-positive polarity and its significant peaks are
+/// returned (ppm, descending). Feed the result to [`AutoPhase1DConfig::known_ch_ppm`] so the `DEPT-135`
+/// global sign is fixed by multiplicity evidence instead of a chemical-shift band (`20.W1:P1-2`).
+pub fn ch_reference_ppm_from_dept90(dept90: &Spectrum1D) -> Result<Vec<f64>, String> {
+    if dept90.experiment != Experiment1DKind::Dept90 {
+        return Err(format!(
+            "ch_reference_ppm_from_dept90 requires a DEPT-90 spectrum, got {:?}",
+            dept90.experiment
+        ));
+    }
+    let mut work = dept90.clone();
+    let cfg = AutoPhase1DConfig {
+        polarity: Some(Polarity1D::AllPositive),
+        ..AutoPhase1DConfig::default()
+    };
+    let _phase = auto_phase_and_apply_1d(&mut work, &cfg);
+    let peaks = pick_peaks_1d(
+        &work,
+        &PeakPickConfig1D {
+            polarity: Some(Polarity1D::AllPositive),
+            ..PeakPickConfig1D::default()
+        },
+    );
+    if peaks.is_empty() {
+        return Err("DEPT-90 spectrum contains no significant methine (CH) peaks".to_string());
+    }
+    Ok(peaks.iter().map(|p| p.ppm).collect())
+}
+
+/// Phase a `DEPT-135` spectrum in place using a same-sample `DEPT-90` spectrum as the multiplicity
+/// reference for the global sign (see [`ch_reference_ppm_from_dept90`]). `base` supplies all other
+/// auto-phase settings; its `known_ch_ppm` is replaced by the `DEPT-90` peaks.
+pub fn auto_phase_dept135_with_dept90(
+    dept135: &mut Spectrum1D,
+    dept90: &Spectrum1D,
+    base: &AutoPhase1DConfig,
+) -> Result<PhaseResult1D, String> {
+    if dept135.experiment != Experiment1DKind::Dept135 {
+        return Err(format!(
+            "auto_phase_dept135_with_dept90 requires a DEPT-135 spectrum, got {:?}",
+            dept135.experiment
+        ));
+    }
+    let mut cfg = base.clone();
+    cfg.known_ch_ppm = ch_reference_ppm_from_dept90(dept90)?;
+    Ok(auto_phase_and_apply_1d(dept135, &cfg))
 }
 
 // ============================================================================
@@ -4123,13 +4274,53 @@ pub fn match_trace_impurities(
     matches
 }
 
-/// Automatically calibrate `spec`'s chemical shift axis to the primary Fulmer (2010) residual
-/// solvent peak within `±search_window_ppm`, returning the applied shift offset `delta_ppm`.
-pub fn auto_calibrate_solvent_1d(
-    spec: &mut Spectrum1D,
+/// Minimum height (in baseline-noise `sigma` units) of a line to be accepted as the residual solvent
+/// reference peak (`v0150:P1-3`).
+pub const SOLVENT_REF_MIN_PROMINENCE_SNR: f64 = 8.0;
+/// Minimum height as a fraction of the search window's maximum intensity so zero-fill sinc sidelobes and
+/// baseline noise ripples next to a taller peak in `[lo, hi]` are never mistaken for spectral lines.
+pub const SOLVENT_REF_MIN_WINDOW_FRACTION: f64 = 0.05;
+/// Maximum individual-line `FWHM` (Hz) of an acceptable residual solvent reference line; broader humps
+/// (unsuppressed water wings, baseline roll, aggregates) are refused.
+pub const SOLVENT_REF_MAX_FWHM_HZ: f64 = 30.0;
+/// Neighbouring local maxima `>=` this fraction of the candidate height that lie outside the expected solvent
+/// multiplet pattern mark the candidate as part of a solute `J`-multiplet.
+pub const SOLVENT_REF_NEIGHBOR_FRACTION: f64 = 0.25;
+/// Distance (Hz) beyond the expected solvent multiplet half-span inside which a significant neighbouring
+/// line disqualifies the candidate as a solute `J`-multiplet member.
+pub const SOLVENT_REF_ISOLATION_HZ: f64 = 15.0;
+
+/// Validated residual solvent reference line found by [`find_solvent_reference_peak_1d`].
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SolventReferencePeak1D {
+    /// Sub-bin observed chemical shift (ppm) before referencing.
+    pub observed_ppm: f64,
+    /// Published (Fulmer 2010) chemical shift (ppm) it will be mapped to.
+    pub expected_ppm: f64,
+    /// Individual-line full width at half maximum (Hz).
+    pub fwhm_hz: f64,
+    /// Line height in baseline-noise `sigma` units.
+    pub snr: f64,
+}
+
+/// Locate and **validate** the residual solvent reference line for `solvent_name` within
+/// `±search_window_ppm` of its published shift (Fulmer et al., *Organometallics* **2010**, 29, 2176).
+///
+/// The tallest point in the window is NOT assumed to be the solvent (it can be an anomeric/methyl solute
+/// line). Every local maximum `>= SOLVENT_REF_MIN_PROMINENCE_SNR * sigma` is tested for solvent-like lineshape:
+/// * individual `FWHM <= SOLVENT_REF_MAX_FWHM_HZ` (no broad humps; half-height crossings must exist);
+/// * isolation: no neighbouring line `>= SOLVENT_REF_NEIGHBOR_FRACTION` of its height outside the expected
+///   solvent multiplet half-span `(n_lines - 1) / 2 * J_HD(CD)` plus `SOLVENT_REF_ISOLATION_HZ` — a solute `J`-multiplet
+///   (doublet, triplet, `dd`, ...) therefore fails the *singlet* test of e.g. CHCl3.
+///
+/// Of the surviving candidates the one nearest the published shift is returned, **unless** several mutually
+/// separated solvent-like lines survive (a solute singlet next to the solvent), in which case the
+/// assignment is ambiguous and an `Err` asks for an explicit reference offset instead of guessing.
+pub fn find_solvent_reference_peak_1d(
+    spec: &Spectrum1D,
     solvent_name: &str,
     search_window_ppm: f64,
-) -> Result<f64, String> {
+) -> Result<SolventReferencePeak1D, String> {
     let nuc = spec.experiment.nucleus();
     let refs = solvent_residual_shifts(solvent_name, &nuc).ok_or_else(|| {
         format!(
@@ -4147,38 +4338,171 @@ pub fn auto_calibrate_solvent_1d(
     })?;
 
     let win = search_window_ppm.abs().max(0.02);
-    let lo = primary.ppm - win;
-    let hi = primary.ppm + win;
-
+    let (lo, hi) = (primary.ppm - win, primary.ppm + win);
     let n = spec.len();
-    let mut best_j: Option<usize> = None;
-    let mut best_y = f64::NEG_INFINITY;
-    for j in 1..n.saturating_sub(1) {
+    if n < 8 {
+        return Err("spectrum too short for solvent referencing".to_string());
+    }
+    let bin_hz = spec.bin_width_hz().max(1e-12);
+    let sigma = estimate_noise_sigma_1d(spec).max(1e-300);
+    let y = &spec.real;
+
+    // Pattern half-span (Hz) of the expected solvent multiplet: (n_lines - 1)/2 * J (1.25x slack).
+    let half_span_hz = if primary.num_lines > 1 {
+        1.25 * 0.5 * ((primary.num_lines as f64) - 1.0) * primary.j_hd_or_cd_hz.max(0.0) + 1.0
+    } else {
+        0.0
+    };
+    let neighbor_reach_hz = half_span_hz + SOLVENT_REF_ISOLATION_HZ;
+    let neighbor_pts = ((neighbor_reach_hz / bin_hz).ceil() as usize).max(2);
+
+    let mut w_max = 0.0_f64;
+    for (j, &yj) in y.iter().enumerate().take(n - 1).skip(1) {
         let ppm = spec.ppm_at(j);
-        if ppm >= lo && ppm <= hi && spec.real[j] > best_y {
-            best_y = spec.real[j];
-            best_j = Some(j);
+        if ppm >= lo && ppm <= hi && yj > w_max {
+            w_max = yj;
         }
     }
+    let min_h =
+        (SOLVENT_REF_MIN_PROMINENCE_SNR * sigma).max(SOLVENT_REF_MIN_WINDOW_FRACTION * w_max);
 
-    let j = best_j.ok_or_else(|| {
-        format!(
-            "no spectral points inside [{:.3}, {:.3}] ppm for solvent '{}'",
-            lo, hi, solvent_name
-        )
-    })?;
+    // All significant local maxima in the *window* + neighbourhood (for isolation tests).
+    let is_local_max = |j: usize| j >= 1 && j + 1 < n && y[j] >= y[j - 1] && y[j] > y[j + 1];
+    let mut cands: Vec<(usize, f64, f64)> = Vec::new(); // (j, fwhm_hz, snr)
+    let mut rejected_broad = 0usize;
+    let mut rejected_multiplet = 0usize;
+    let mut n_significant = 0usize;
+    for j in 1..n - 1 {
+        let ppm = spec.ppm_at(j);
+        if ppm < lo || ppm > hi || !is_local_max(j) {
+            continue;
+        }
+        let h = y[j];
+        if h < min_h {
+            continue;
+        }
+        n_significant += 1;
+        // Half-height crossings -> individual line FWHM.
+        let half = 0.5 * h;
+        let max_reach = ((SOLVENT_REF_MAX_FWHM_HZ * 2.0 / bin_hz).ceil() as usize).max(4);
+        let find_cross = |dir: isize| -> Option<f64> {
+            let mut k = j as isize;
+            for _ in 0..max_reach {
+                let kn = k + dir;
+                if kn < 0 || (kn as usize) >= n {
+                    return None;
+                }
+                if y[kn as usize] <= half {
+                    let (ya, yb) = (y[k as usize], y[kn as usize]);
+                    let frac = if (ya - yb).abs() > 1e-300 {
+                        (ya - half) / (ya - yb)
+                    } else {
+                        0.0
+                    };
+                    return Some((k - j as isize) as f64 + (dir as f64) * frac);
+                }
+                k = kn;
+            }
+            None
+        };
+        let (Some(l), Some(r)) = (find_cross(-1), find_cross(1)) else {
+            rejected_broad += 1;
+            continue;
+        };
+        let fwhm_hz = (r - l).abs() * bin_hz;
+        if fwhm_hz > SOLVENT_REF_MAX_FWHM_HZ {
+            rejected_broad += 1;
+            continue;
+        }
+        // Isolation: significant neighbours outside the expected solvent multiplet pattern.
+        let lo_k = j.saturating_sub(neighbor_pts).max(1);
+        let hi_k = (j + neighbor_pts).min(n - 2);
+        let pattern_pts = (half_span_hz / bin_hz).ceil() as usize;
+        let own_flank_pts = ((0.75 * fwhm_hz / bin_hz).ceil() as usize).max(1);
+        let mut part_of_other_multiplet = false;
+        for (k, &yk) in y.iter().enumerate().take(hi_k + 1).skip(lo_k) {
+            if k == j || !is_local_max(k) {
+                continue;
+            }
+            let d = k.abs_diff(j);
+            if yk >= SOLVENT_REF_NEIGHBOR_FRACTION * h && d > pattern_pts.max(own_flank_pts) {
+                part_of_other_multiplet = true;
+                break;
+            }
+            // Resolved neighbour of comparable height *inside* the expected pattern is fine; for a
+            // singlet (`pattern_pts == 0`) any comparable line beyond its own flank is a J-multiplet member.
+        }
+        if part_of_other_multiplet {
+            rejected_multiplet += 1;
+            continue;
+        }
+        cands.push((j, fwhm_hz, h / sigma));
+    }
+
+    if cands.is_empty() {
+        return Err(format!(
+            "no solvent-like reference line for '{}' within [{:.3}, {:.3}] ppm ({} significant line(s) \
+             inspected, {} too broad, {} part of a J-multiplet); refusing to snap onto a solute peak - pass an \
+             explicit reference offset",
+            solvent_name, lo, hi, n_significant, rejected_broad, rejected_multiplet
+        ));
+    }
+
+    // Collapse candidates that belong to the same expected solvent multiplet.
+    cands.sort_by(|a, b| {
+        (spec.ppm_at(a.0) - primary.ppm)
+            .abs()
+            .total_cmp(&(spec.ppm_at(b.0) - primary.ppm).abs())
+    });
+    let (j0, fwhm0, snr0) = cands[0];
+    let separated: Vec<&(usize, f64, f64)> = cands[1..]
+        .iter()
+        .filter(|c| (c.0.abs_diff(j0) as f64) * bin_hz > half_span_hz + 2.0 * fwhm0.max(bin_hz))
+        .collect();
+    if !separated.is_empty() {
+        let others: Vec<String> = separated
+            .iter()
+            .map(|c| format!("{:.4}", spec.ppm_at(c.0)))
+            .collect();
+        return Err(format!(
+            "ambiguous solvent reference for '{}': solvent-like line at {:.4} ppm and other isolated line(s) at \
+             {} ppm in the search window; refusing to guess - pass an explicit reference offset",
+            solvent_name,
+            spec.ppm_at(j0),
+            others.join(", ")
+        ));
+    }
 
     // Parabolic 3-point sub-bin peak centroid.
-    let (yl, yc, yr) = (spec.real[j - 1], spec.real[j], spec.real[j + 1]);
+    let (yl, yc, yr) = (y[j0 - 1], y[j0], y[j0 + 1]);
     let denom = yl - 2.0 * yc + yr;
     let sub = if denom.abs() > 1e-18 && yc >= yl && yc >= yr {
         (0.5 * (yl - yr) / denom).clamp(-0.5, 0.5)
     } else {
         0.0
     };
-    let obs_ppm = spec.axis.index_to_ppm((j as f64) + sub);
+    Ok(SolventReferencePeak1D {
+        observed_ppm: spec.axis.index_to_ppm((j0 as f64) + sub),
+        expected_ppm: primary.ppm,
+        fwhm_hz: fwhm0,
+        snr: snr0,
+    })
+}
+
+/// Automatically calibrate `spec`'s chemical shift axis to the primary Fulmer (2010) residual
+/// solvent peak within `±search_window_ppm`, returning the applied shift offset `delta_ppm`.
+///
+/// The reference line is validated by [`find_solvent_reference_peak_1d`] (width, prominence, isolation from
+/// solute `J`-multiplets, uniqueness); on failure the axis is left untouched and `Err` is returned.
+/// The applied shift is recorded in [`Spectrum1D::applied_reference_shift_ppm`].
+pub fn auto_calibrate_solvent_1d(
+    spec: &mut Spectrum1D,
+    solvent_name: &str,
+    search_window_ppm: f64,
+) -> Result<f64, String> {
+    let peak = find_solvent_reference_peak_1d(spec, solvent_name, search_window_ppm)?;
     spec.solvent = lookup_deuterated_solvent(solvent_name).map(|s| s.canonical_name.to_string());
-    Ok(spec.calibrate_reference_peak(obs_ppm, primary.ppm))
+    Ok(spec.calibrate_reference_peak(peak.observed_ppm, peak.expected_ppm))
 }
 
 /// IUPAC 2001/2008 primary organic `${}^{13}\text{C}$ unified frequency ratio
@@ -4192,12 +4516,17 @@ pub const XI_C13_TMS: f64 = 0.251_450_20;
 /// *Pure Appl. Chem.* **1998**, 70, 117–142; Harris et al. **2001**).
 pub const XI_C13_DSS: f64 = 0.251_449_53;
 
-/// Chemical shift of aqueous $\text{DSS}$ `${}^{13}\text{C}$ methyls ($\delta_{\text{DSS}} \equiv 0\text{ ppm}$)
-/// when measured on a spectrometer `BF1`/`SF` locked to the organic $\text{TMS}$ `${}^{13}\text{C}$ scale
-/// in $\text{D}_2\text{O}$ at $298\text{ K}$ ($\delta_{\text{TMS}}(\text{DSS}) = -2.371\text{ ppm}$,
-/// $\nu_{\text{ref,DSS}} / \nu_{\text{ref,TMS}} = 1 - 2.371 \times 10^{-6}$;
-/// Harris et al. 2001/2008; Wishart et al. 1995).
-pub const C13_DSS_VS_TMS_OFFSET_PPM: f64 = -2.371;
+/// Relative offset of the aqueous-DSS `${}^{13}\text{C}$ reference frequency from the organic-TMS one,
+/// **derived directly from the two IUPAC $\Xi$ ratios above** (no fitted literal):
+/// $$\epsilon_{\text{DSS/TMS}} = \Bigl(\frac{\Xi_{\text{DSS}}}{\Xi_{\text{TMS}}} - 1\Bigr) \times 10^{6}
+///   = \Bigl(\frac{0.25144953}{0.25145020} - 1\Bigr) \times 10^{6} \approx -2.6645\text{ ppm}$$
+/// (Harris et al., *Pure Appl. Chem.* **2001**, 73, 1795–1818 & **2008**, 80, 59–84; Wishart et al.,
+/// *J. Biomol. NMR* **1995**, 6, 135–140; Markley et al., *Pure Appl. Chem.* **1998**, 70, 117–142).
+/// The 8-digit published $\Xi$ values bound the precision of this offset at roughly $\pm 0.02\text{ ppm}$.
+///
+/// History (`20.W1:P0-2`): the previous literal `-2.371` contradicted these very $\Xi$ values and equalled
+/// the offset observed on one development spectrum, so it is removed; `-2.371` must not reappear.
+pub const C13_DSS_VS_TMS_OFFSET_PPM: f64 = ((XI_C13_DSS - XI_C13_TMS) / XI_C13_TMS) * 1.0e6;
 
 /// Chemical-shift zero-point standard (`TMS` organic vs `DSS` aqueous biomolecular) for `${}^{13}\text{C}$
 /// scale conversion (`F29`, Harris et al. 2001/2008; Wishart et al. 1995).
@@ -4241,20 +4570,11 @@ impl ReferenceStandard {
 /// Convert a `${}^{13}\text{C}$ chemical shift `ppm` between organic `TMS` (`BF1`/`SF` lock) and
 /// aqueous `DSS` (`BMRB`) zero-point scales using the exact spectrometer reference-frequency ratio
 /// $\nu_{\text{ref}}(\text{DSS}) / \nu_{\text{ref}}(\text{TMS}) = 1 + \text{C13\_DSS\_VS\_TMS\_OFFSET\_PPM} \times 10^{-6}$
-/// (`-2.371 ppm` when converting `DSS -> TMS`, `+2.371 ppm` when converting `TMS -> DSS`).
+/// (`-2.665 ppm` when converting `DSS -> TMS`, `+2.665 ppm` when converting `TMS -> DSS`;
+/// numerically identical to [`convert_c13_ppm_xi_ratio`]).
 #[inline]
 pub fn convert_c13_ppm_reference(ppm: f64, from: ReferenceStandard, to: ReferenceStandard) -> f64 {
-    if from == to {
-        return ppm;
-    }
-    let eps_ppm = match (from, to) {
-        (ReferenceStandard::Dss, ReferenceStandard::Tms) => C13_DSS_VS_TMS_OFFSET_PPM,
-        (ReferenceStandard::Tms, ReferenceStandard::Dss) => {
-            -C13_DSS_VS_TMS_OFFSET_PPM / (1.0 + C13_DSS_VS_TMS_OFFSET_PPM * 1.0e-6)
-        }
-        _ => 0.0,
-    };
-    ppm + (1.0 + ppm * 1.0e-6) * eps_ppm
+    convert_c13_ppm_xi_ratio(ppm, from, to)
 }
 
 /// Convert a `${}^{13}\text{C}$ chemical shift `ppm` using the pure lock-free IUPAC unified
@@ -4297,7 +4617,10 @@ pub fn convert_c13_spectrum_reference_1d(
     spec.axis.step_ppm *= rho;
     spec.axis.obs_mhz /= rho;
     let mid_after = 0.5 * (spec.axis.first_ppm + spec.axis.last_ppm());
-    Ok(mid_after - mid_before)
+    let delta = mid_after - mid_before;
+    spec.applied_reference_shift_ppm =
+        Some(spec.applied_reference_shift_ppm.unwrap_or(0.0) + delta);
+    Ok(delta)
 }
 
 // ============================================================================
@@ -5327,11 +5650,50 @@ pub const MAX_1D_INGEST_POINTS: usize = 4_194_304;
 /// Maximum permitted 1D input file size (`64 MiB`) checked via `fs::metadata` prior to buffer allocation.
 pub const MAX_1D_INGEST_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Maximum decompressed archive bytes permitted during `wasm32` 1D virtual archive expansion (`128 MiB`,
+/// lowered from `512 MiB` so browser linear memory cannot balloon on large archives; `v0150` P2).
+pub const WASM32_MAX_1D_ARCHIVE_INFLATE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Maximum retained in-memory payload bytes permitted during `wasm32` 1D virtual archive expansion (`64 MiB`).
+pub const WASM32_MAX_1D_ARCHIVE_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Active maximum decompressed archive bytes for [`load_1d_from_virtual_entries`].
+#[cfg(target_arch = "wasm32")]
+pub const MAX_1D_ARCHIVE_INFLATE_BYTES: u64 = WASM32_MAX_1D_ARCHIVE_INFLATE_BYTES;
+/// Active maximum decompressed archive bytes for [`load_1d_from_virtual_entries`].
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_1D_ARCHIVE_INFLATE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Active maximum retained archive payload bytes for [`load_1d_from_virtual_entries`].
+#[cfg(target_arch = "wasm32")]
+pub const MAX_1D_ARCHIVE_RETAINED_BYTES: usize = WASM32_MAX_1D_ARCHIVE_RETAINED_BYTES;
+/// Active maximum retained archive payload bytes for [`load_1d_from_virtual_entries`].
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_1D_ARCHIVE_RETAINED_BYTES: usize = 128 * 1024 * 1024;
+
 /// Parsed 1D input payload (either complex time-domain FID or processed frequency-domain spectrum).
 #[derive(Clone, Debug)]
 pub enum Loaded1DData {
     TimeDomain(TimeDomain1D),
     FrequencyDomain(Spectrum1D),
+}
+
+impl Loaded1DData {
+    /// Append a non-fatal diagnostic message so downstream processing preserves sibling/load warnings.
+    pub fn push_warning(&mut self, warning: String) {
+        match self {
+            Self::TimeDomain(td) => td.load_warnings.push(warning),
+            Self::FrequencyDomain(sp) => sp.processing_warnings.push(warning),
+        }
+    }
+}
+
+/// Multi-dataset virtual load result isolating per-dataset errors so one corrupt `expno` or file
+/// never aborts valid sibling 1D datasets (`v0150` `nmr1d` P2).
+#[derive(Clone, Debug)]
+pub struct Virtual1DLoadOutcome {
+    pub loaded: Vec<Loaded1DData>,
+    pub dataset_errors: Vec<String>,
 }
 
 impl TimeDomain1D {
@@ -6996,66 +7358,363 @@ pub fn load_1d_input(
         .map_err(|e| format!("{e} ({})", path.display()))
 }
 
-/// Load a processed 1D spectrum from Bruker `pdata` (`procs` + `1r`), `JCAMP-DX`, JSON, TSV, or
-/// raw time-domain FID (automatically apodizing, zero-filling, FFT-ing, and minimum-entropy
-/// autophasing when the input is time-domain; hardened per `F15`).
-/// Prepare a [`Loaded1DData`] item for interactive studio inspection (`wasm32` + native):
-/// preserves `FrequencyDomain` spectra as-is; for raw `TimeDomain` FIDs, applies matched exponential
-/// apodization (`first_point_scale = 0.5`), power-of-two zero-filling (capped at `131_072` points),
-/// digital-filter-compensated `fft_1d`, minimum-entropy `auto_phase_and_apply_1d`, Whittaker
-/// `correct_baseline_1d`, and optional solvent reference calibration when `solvent` metadata is present.
-pub fn prepare_loaded_1d_for_studio(loaded: Loaded1DData) -> Result<Spectrum1D, String> {
-    match loaded {
-        Loaded1DData::FrequencyDomain(spec) => {
-            spec.validate()?;
-            Ok(spec)
-        }
-        Loaded1DData::TimeDomain(mut td) => {
-            let lb = td.experiment.default_line_broadening_hz();
-            apply_apodization_1d(&mut td, Apodization1D::Exponential { lb_hz: lb }, 0.5);
-            let target_zf = (td.data.len().saturating_mul(2))
-                .next_power_of_two()
-                .min(131_072);
-            if target_zf > td.data.len() {
-                zero_fill_1d(&mut td, target_zf);
-            }
-            let mut spec = fft_1d(&td);
-            let _ = auto_phase_and_apply_1d(&mut spec, &AutoPhase1DConfig::default());
-            let _ = correct_baseline_1d(&mut spec, &BaselineConfig1D::default());
-            if let Some(solv) = spec.solvent.clone() {
-                let _ = auto_calibrate_solvent_1d(&mut spec, &solv, 0.25);
-            }
-            spec.validate()?;
-            Ok(spec)
+/// Zero-filling policy of the shared 1D pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZeroFill1D {
+    /// No zero-filling.
+    Off,
+    /// Zero-fill to `next_power_of_two(len * factor)`, optionally capped at `max_points`.
+    Pow2 {
+        factor: usize,
+        max_points: Option<usize>,
+    },
+    /// Zero-fill to an explicit number of complex points.
+    Points(usize),
+}
+
+/// Phase-correction stage of the shared 1D pipeline.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PhaseMode1D {
+    Off,
+    Manual {
+        phc0_deg: f64,
+        phc1_deg: f64,
+        pivot: Pivot1D,
+    },
+    Auto(AutoPhase1DConfig),
+}
+
+/// Residual-solvent referencing stage of the shared 1D pipeline.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SolventCalibration1D {
+    /// Solvent used for referencing (`None` = use `spectrum.solvent` on raw FIDs; skipped when neither is set).
+    pub solvent: Option<String>,
+    /// Half-width (ppm) of the search window around the published residual shift.
+    pub window_ppm: f64,
+    /// `true` when explicitly requested (e.g. CLI `--calibrate-solvent`), causing missing/invalid solvent
+    /// peaks to return `Err`; `false` when inferred from FID `SOLVENT` metadata, recording a warning instead.
+    pub required: bool,
+}
+
+/// Options of the one shared 1D processing pipeline ([`process_loaded_1d`]) used by the CLI
+/// (`ferric nmr1d process`), path loads ([`load_processed_spectrum_1d`]) and byte/browser loads
+/// ([`prepare_loaded_1d_for_studio`]) (`v0150:P1-3`).
+#[derive(Clone, Debug)]
+pub struct Process1DOptions {
+    /// Override the detected experiment (nucleus/DEPT kind).
+    pub experiment_override: Option<Experiment1DKind>,
+    /// Override/record the solvent label.
+    pub solvent_override: Option<String>,
+    /// Time-domain `HSVD` solvent-pole subtraction (before apodization).
+    pub hsvd: Option<HsvdConfig>,
+    /// Apodization (`None` = matched exponential at the experiment's default line broadening).
+    pub apodization: Option<Apodization1D>,
+    /// Otting first-point multiplier.
+    pub first_point_scale: f64,
+    pub zero_fill: ZeroFill1D,
+    pub phase: PhaseMode1D,
+    /// Frequency-domain notch windows `(ppm_a, ppm_b)`.
+    pub notch_windows: Vec<(f64, f64)>,
+    pub baseline: Option<BaselineConfig1D>,
+    pub calibrate: Option<SolventCalibration1D>,
+    /// Explicit extra axis offset in ppm (`--ref-offset`).
+    pub reference_offset_ppm: Option<f64>,
+    /// `13C` `(from, to)` reference-standard conversion.
+    pub c13_reference_conversion: Option<(ReferenceStandard, ReferenceStandard)>,
+    /// Also run phase/notch/baseline/referencing on already-processed (frequency-domain) inputs.
+    pub post_process_frequency_domain: bool,
+    /// `true`: a failing stage aborts with `Err` (CLI). `false`: it is recorded in
+    /// [`Spectrum1D::processing_warnings`] and the stage output is discarded (interactive).
+    pub strict: bool,
+}
+
+impl Process1DOptions {
+    /// Defaults shared by path, byte and browser loads: matched exponential apodization, power-of-two
+    /// zero-fill (`<= 131072` points), minimum-entropy autophase, Whittaker baseline and validated residual
+    /// solvent referencing when the acquisition metadata names a solvent. Already-processed vendor spectra
+    /// are left as stored.
+    pub fn interactive_defaults() -> Self {
+        Self {
+            experiment_override: None,
+            solvent_override: None,
+            hsvd: None,
+            apodization: None,
+            first_point_scale: 0.5,
+            zero_fill: ZeroFill1D::Pow2 {
+                factor: 2,
+                max_points: Some(131_072),
+            },
+            phase: PhaseMode1D::Auto(AutoPhase1DConfig::default()),
+            notch_windows: Vec::new(),
+            baseline: Some(BaselineConfig1D::default()),
+            calibrate: Some(SolventCalibration1D {
+                solvent: None,
+                window_ppm: 0.25,
+                required: false,
+            }),
+            reference_offset_ppm: None,
+            c13_reference_conversion: None,
+            post_process_frequency_domain: false,
+            strict: false,
         }
     }
 }
 
-/// Load one or more 1D NMR datasets directly from in-memory `(relative_path, bytes)` entries
-/// (`wasm32` browser folder/file drop & picker + native multi-file/archive drop).
-///
-/// Supports:
-/// - Multi-experiment Bruker study folders (`study/1/...`, `study/10/...`), single expno folders
-///   (`10/fid`+`acqus` and/or `10/pdata/1/1r`+`procs`), `pdata/1` folders, or flat sibling file
-///   selections (`1r` + `procs` [+ `1i`, `acqus`], or `fid` + `acqus` [+ `acqu`, `procs`]).
-/// - Embedded `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives (expanded automatically).
-/// - Standalone `.jdx` / `.dx` / `.jcamp` JCAMP-DX files, 1D `.json`, and 1D `ppm\treal` `.tsv`/`.csv`.
-/// - Clear, actionable guidance when a bare Bruker binary (`1r`, `1i`, `fid`, `2rr`, `ser`) is dropped
-///   without its sibling parameter file (`procs` / `acqus`).
-pub fn load_1d_from_virtual_entries(
+/// Result of [`process_loaded_1d`]. All diagnostics are also stored on `spectrum`
+/// ([`Spectrum1D::processing_warnings`], [`Spectrum1D::applied_reference_shift_ppm`]).
+#[derive(Clone, Debug)]
+pub struct Processed1D {
+    pub spectrum: Spectrum1D,
+    /// Total referencing shift applied to the axis (`None` = none), see [`Spectrum1D::applied_reference_shift_ppm`].
+    pub applied_reference_shift_ppm: Option<f64>,
+    pub phase: Option<PhaseResult1D>,
+    pub baseline_noise_sigma: f64,
+    pub hsvd_subtracted: Vec<HsvdPole>,
+    /// Shift applied by residual-solvent calibration alone (`None` when not run/failed).
+    pub solvent_calibration_delta_ppm: Option<f64>,
+    /// Midpoint shift applied by the `13C` DSS/TMS conversion (`None` when not run).
+    pub c13_reference_delta_ppm: Option<f64>,
+    pub warnings: Vec<String>,
+}
+
+/// The one shared 1D processing pipeline (HSVD -> apodization -> zero-fill -> FFT -> phase -> notch ->
+/// baseline -> solvent/offset referencing -> `13C` scale conversion). No stage error is swallowed:
+/// in strict mode it aborts, otherwise it becomes a structured warning and the failing stage's output
+/// is discarded so the spectrum is never silently half-processed.
+pub fn process_loaded_1d(
+    loaded: Loaded1DData,
+    opts: &Process1DOptions,
+) -> Result<Processed1D, String> {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut hsvd_subtracted: Vec<HsvdPole> = Vec::new();
+
+    let (mut spec, from_time_domain) = match loaded {
+        Loaded1DData::TimeDomain(mut td) => {
+            warnings.append(&mut td.load_warnings);
+            if let Some(exp) = &opts.experiment_override {
+                td.experiment = exp.clone();
+            }
+            if let Some(cfg) = &opts.hsvd {
+                hsvd_subtracted = subtract_solvent_hsvd_1d(&mut td, cfg).subtracted_poles;
+            }
+            let window = opts.apodization.unwrap_or(Apodization1D::Exponential {
+                lb_hz: td.experiment.default_line_broadening_hz(),
+            });
+            apply_apodization_1d(&mut td, window, opts.first_point_scale);
+            match opts.zero_fill {
+                ZeroFill1D::Off => {}
+                ZeroFill1D::Pow2 { factor, max_points } => {
+                    let mut target = td
+                        .data
+                        .len()
+                        .saturating_mul(factor.max(1))
+                        .max(1)
+                        .next_power_of_two();
+                    if let Some(cap) = max_points {
+                        target = target.min(cap.max(1));
+                    }
+                    zero_fill_1d(&mut td, target);
+                }
+                ZeroFill1D::Points(target) => {
+                    zero_fill_1d(&mut td, target.min(MAX_1D_INGEST_POINTS))
+                }
+            }
+            (fft_1d(&td), true)
+        }
+        Loaded1DData::FrequencyDomain(mut sp) => {
+            if let Some(exp) = &opts.experiment_override {
+                sp.experiment = exp.clone();
+                sp.axis.label = exp.nucleus().as_str().to_string();
+            }
+            (sp, false)
+        }
+    };
+    warnings.append(&mut spec.processing_warnings);
+    if let Some(solv) = &opts.solvent_override {
+        spec.solvent = Some(solv.clone());
+    }
+
+    let run_post = from_time_domain || opts.post_process_frequency_domain;
+    let mut phase_res: Option<PhaseResult1D> = None;
+    let mut solvent_delta: Option<f64> = None;
+    let mut c13_delta: Option<f64> = None;
+    let mut baseline_sigma = f64::NAN;
+
+    // Failing-stage policy: strict => Err, otherwise warn.
+    macro_rules! stage_failed {
+        ($stage:expr, $msg:expr) => {{
+            let msg: String = $msg;
+            if opts.strict {
+                return Err(format!("1D processing stage '{}' failed: {msg}", $stage));
+            }
+            warnings.push(format!("{}: {msg}", $stage));
+        }};
+    }
+
+    if run_post {
+        match &opts.phase {
+            PhaseMode1D::Off => {}
+            PhaseMode1D::Manual {
+                phc0_deg,
+                phc1_deg,
+                pivot,
+            } => {
+                if !phc0_deg.is_finite() || !phc1_deg.is_finite() {
+                    stage_failed!(
+                        "phase",
+                        format!("non-finite manual phase ({phc0_deg}, {phc1_deg})")
+                    );
+                } else {
+                    apply_phase_1d(&mut spec, *phc0_deg, *phc1_deg, *pivot);
+                }
+            }
+            PhaseMode1D::Auto(cfg) => {
+                let backup = spec.clone();
+                let sol = auto_phase_and_apply_1d(&mut spec, cfg);
+                if !sol.phc0_deg.is_finite()
+                    || !sol.phc1_deg.is_finite()
+                    || spec.validate().is_err()
+                {
+                    spec = backup;
+                    stage_failed!(
+                        "autophase",
+                        "minimum-entropy phasing produced a non-finite solution; spectrum left unphased"
+                            .to_string()
+                    );
+                } else {
+                    warnings.append(&mut spec.processing_warnings);
+                    phase_res = Some(sol);
+                }
+            }
+        }
+        for &(lo, hi) in &opts.notch_windows {
+            suppress_solvent_notch_1d(&mut spec, &NotchConfig1D::new(lo, hi));
+        }
+        if let Some(bcfg) = &opts.baseline {
+            let backup = spec.clone();
+            let bres = correct_baseline_1d(&mut spec, bcfg);
+            if !bres.baseline_noise_sigma.is_finite() || spec.validate().is_err() {
+                spec = backup;
+                stage_failed!(
+                    "baseline",
+                    "baseline correction produced non-finite values; baseline left uncorrected"
+                        .to_string()
+                );
+            } else {
+                baseline_sigma = bres.baseline_noise_sigma;
+            }
+        }
+        if let Some(cal) = &opts.calibrate {
+            let solv = cal
+                .solvent
+                .clone()
+                .or_else(|| from_time_domain.then(|| spec.solvent.clone()).flatten());
+            if let Some(solv_name) = solv {
+                if solvent_residual_shifts(&solv_name, &spec.experiment.nucleus()).is_none() {
+                    let msg = format!(
+                        "no residual-solvent reference registered for '{}' on {}; axis left as acquired",
+                        solv_name,
+                        spec.experiment.nucleus().as_str()
+                    );
+                    if cal.required {
+                        return Err(format!(
+                            "1D processing stage 'solvent-calibration' failed: {msg}"
+                        ));
+                    }
+                    warnings.push(format!("solvent-calibration: {msg}"));
+                } else {
+                    match auto_calibrate_solvent_1d(&mut spec, &solv_name, cal.window_ppm) {
+                        Ok(delta) => solvent_delta = Some(delta),
+                        Err(e) => {
+                            if cal.required {
+                                return Err(format!(
+                                    "1D processing stage 'solvent-calibration' failed: {e}"
+                                ));
+                            }
+                            warnings.push(format!("solvent-calibration: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(off) = opts.reference_offset_ppm {
+            if off.is_finite() {
+                spec.apply_reference_offset(off);
+            } else {
+                stage_failed!("reference-offset", format!("non-finite offset {off}"));
+            }
+        }
+        if let Some((from, to)) = opts.c13_reference_conversion {
+            match convert_c13_spectrum_reference_1d(&mut spec, from, to) {
+                Ok(d) => c13_delta = Some(d),
+                Err(e) => stage_failed!("c13-reference", e),
+            }
+        }
+    }
+
+    if !baseline_sigma.is_finite() {
+        baseline_sigma = estimate_noise_sigma_1d(&spec);
+    }
+    spec.processing_warnings.extend(warnings.iter().cloned());
+    spec.validate()?;
+    Ok(Processed1D {
+        applied_reference_shift_ppm: spec.applied_reference_shift_ppm,
+        phase: phase_res,
+        baseline_noise_sigma: baseline_sigma,
+        hsvd_subtracted,
+        solvent_calibration_delta_ppm: solvent_delta,
+        c13_reference_delta_ppm: c13_delta,
+        warnings,
+        spectrum: spec,
+    })
+}
+
+/// Prepare a [`Loaded1DData`] item for interactive studio inspection (`wasm32` + native) through the shared
+/// [`process_loaded_1d`] pipeline with [`Process1DOptions::interactive_defaults`]: processed vendor spectra are kept
+/// as-is, raw FIDs are apodized, zero-filled, FFT-ed, minimum-entropy autophased, baseline-corrected and
+/// referenced to the validated residual solvent line. The applied reference shift and every non-fatal
+/// stage failure are recorded on the returned [`Spectrum1D`].
+pub fn prepare_loaded_1d_for_studio(loaded: Loaded1DData) -> Result<Spectrum1D, String> {
+    process_loaded_1d(loaded, &Process1DOptions::interactive_defaults()).map(|p| p.spectrum)
+}
+
+/// Load a processed 1D spectrum from Bruker `pdata` (`procs` + `1r`), `JCAMP-DX`, JSON, TSV, or
+/// raw time-domain FID (processed through the same shared pipeline as the browser/CLI loads,
+/// [`prepare_loaded_1d_for_studio`]; hardened per `F15`).
+pub fn load_processed_spectrum_1d(
+    path: &std::path::Path,
+    mhz_override: Option<f64>,
+) -> Result<Spectrum1D, String> {
+    prepare_loaded_1d_for_studio(load_1d_input(path, mhz_override, false)?)
+}
+
+/// Load one or more 1D NMR datasets directly from in-memory `(relative_path, bytes)` entries,
+/// isolating per-dataset errors so a single corrupt `expno` or file never aborts valid sibling
+/// 1D datasets (`v0150` `nmr1d` P2). Returns `Err` only when zero datasets succeed.
+pub fn load_1d_from_virtual_entries_isolated(
     entries: &[(&str, &[u8])],
     mhz_override: Option<f64>,
     prefer_fid: bool,
-) -> Result<Vec<Loaded1DData>, String> {
+) -> Result<Virtual1DLoadOutcome, String> {
     use std::collections::{BTreeMap, BTreeSet};
 
+    if let Some(m) = mhz_override {
+        if !m.is_finite() || m <= 0.0 {
+            return Err(format!("invalid mhz_override={m} (must be finite and > 0)"));
+        }
+    }
     if entries.is_empty() {
         return Err("No files provided for 1D NMR loading.".to_string());
     }
 
-    // 1. Normalize paths, discard OS/VCS junk, and expand any `.zip`/`.tar`/`.tar.gz` archives.
+    // 1. Normalize paths, discard OS/VCS junk, and expand any `.zip`/`.tar`/`.tar.gz` archives
+    //    under bounded `MAX_1D_ARCHIVE_INFLATE_BYTES` / `MAX_1D_ARCHIVE_RETAINED_BYTES`.
     let mut owned_archive_items: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut retained_archive_bytes: usize = 0;
     let mut flat_refs: Vec<(String, usize, bool)> = Vec::new();
+    let mut dataset_errors: Vec<String> = Vec::new();
+    let mut txt_errors: Vec<String> = Vec::new();
+
     for (idx, &(raw_path, bytes)) in entries.iter().enumerate() {
         let norm = raw_path
             .replace('\\', "/")
@@ -7086,16 +7745,31 @@ pub fn load_1d_from_virtual_entries(
             || crate::classify::is_zip_magic(bytes)
             || (bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b);
         if is_arch {
-            let unpacked = crate::classify::extract_archive_full_entries_bounded(
+            let rem_retained = MAX_1D_ARCHIVE_RETAINED_BYTES.saturating_sub(retained_archive_bytes);
+            if rem_retained == 0 {
+                dataset_errors.push(format!(
+                    "archive '{norm}': exceeded MAX_1D_ARCHIVE_RETAINED_BYTES ({MAX_1D_ARCHIVE_RETAINED_BYTES})"
+                ));
+                continue;
+            }
+            match crate::classify::extract_archive_full_entries_bounded(
                 &norm,
                 bytes,
-                512 * 1024 * 1024,
-                256 * 1024 * 1024,
-            )?;
-            for (sub_rel, sub_bytes) in unpacked {
-                let slot = owned_archive_items.len();
-                owned_archive_items.push((sub_rel.clone(), sub_bytes));
-                flat_refs.push((sub_rel, slot, true));
+                MAX_1D_ARCHIVE_INFLATE_BYTES,
+                rem_retained,
+            ) {
+                Ok(unpacked) => {
+                    for (sub_rel, sub_bytes) in unpacked {
+                        retained_archive_bytes =
+                            retained_archive_bytes.saturating_add(sub_bytes.len());
+                        let slot = owned_archive_items.len();
+                        owned_archive_items.push((sub_rel.clone(), sub_bytes));
+                        flat_refs.push((sub_rel, slot, true));
+                    }
+                }
+                Err(e) => {
+                    dataset_errors.push(format!("archive '{norm}': {e}"));
+                }
             }
         } else {
             flat_refs.push((norm, idx, false));
@@ -7259,6 +7933,18 @@ pub fn load_1d_from_virtual_entries(
         let has_pdata = pdata_by_exp.contains_key(exp_d);
         let has_fid = fid_by_exp.contains(exp_d);
 
+        // Always mark this Bruker experiment's files consumed so corrupt expnos are never re-parsed as standalone text.
+        if let Some((_, pdir)) = pdata_by_exp.get(exp_d) {
+            for (rel, _, _) in dir_map[pdir].values() {
+                consumed_files.insert(rel.clone());
+            }
+        }
+        if let Some(efiles) = dir_map.get(exp_d) {
+            for (rel, _, _) in efiles.values() {
+                consumed_files.insert(rel.clone());
+            }
+        }
+
         let load_pdata = |pdir: &str| -> Result<Loaded1DData, String> {
             let pfiles = &dir_map[pdir];
             let (r_rel, r_slot, r_arch) = &pfiles["1r"];
@@ -7323,25 +8009,21 @@ pub fn load_1d_from_virtual_entries(
             Ok(Loaded1DData::TimeDomain(td))
         };
 
-        let item = if prefer_fid && has_fid {
-            load_fid(exp_d)?
+        let item_res = if prefer_fid && has_fid {
+            load_fid(exp_d)
         } else if has_pdata {
             let (_, ref pdir) = pdata_by_exp[exp_d];
-            load_pdata(pdir)?
+            load_pdata(pdir)
         } else {
-            load_fid(exp_d)?
+            load_fid(exp_d)
         };
-        if let Some((_, pdir)) = pdata_by_exp.get(exp_d) {
-            for (rel, _, _) in dir_map[pdir].values() {
-                consumed_files.insert(rel.clone());
+        match item_res {
+            Ok(item) => results.push(item),
+            Err(e) => {
+                let disp = label_for_dir(exp_d, "bruker_1d");
+                dataset_errors.push(format!("{disp}: {e}"));
             }
         }
-        if let Some(efiles) = dir_map.get(exp_d) {
-            for (rel, _, _) in efiles.values() {
-                consumed_files.insert(rel.clone());
-            }
-        }
-        results.push(item);
     }
 
     // 3. Standalone 1D files (JEOL `.jdf`, `.jdx`/`.dx`/`.jcamp`, 1D `.json`, 1D `.tsv`/`.csv`)
@@ -7352,18 +8034,31 @@ pub fn load_1d_from_virtual_entries(
         let fname = rel.rsplit_once('/').map(|(_, f)| f).unwrap_or(rel);
         let low = fname.to_ascii_lowercase();
         let bytes = get_bytes(*slot, *from_arch);
-        if bytes.len() as u64 > MAX_1D_INGEST_BYTES {
-            continue;
-        }
         let ext = fname
             .rsplit_once('.')
             .map(|(_, e)| e.to_ascii_lowercase())
             .unwrap_or_default();
 
+        if bytes.len() as u64 > MAX_1D_INGEST_BYTES {
+            if matches!(
+                ext.as_str(),
+                "jdf" | "jdx" | "dx" | "jcamp" | "json" | "tsv" | "csv"
+            ) || is_jeol_jdf_magic(bytes)
+            {
+                dataset_errors.push(format!(
+                    "'{rel}': ({} bytes) exceeds MAX_1D_INGEST_BYTES ({MAX_1D_INGEST_BYTES})",
+                    bytes.len()
+                ));
+            }
+            continue;
+        }
+
         if ext == "jdf" || is_jeol_jdf_magic(bytes) {
             let stem = fname.rsplit_once('.').map(|(s, _)| s).unwrap_or(fname);
-            let loaded = parse_jeol_jdf_1d_bytes(stem, bytes, mhz_override)?;
-            results.push(loaded);
+            match parse_jeol_jdf_1d_bytes(stem, bytes, mhz_override) {
+                Ok(loaded) => results.push(loaded),
+                Err(e) => dataset_errors.push(format!("'{rel}': {e}")),
+            }
             continue;
         }
 
@@ -7375,11 +8070,18 @@ pub fn load_1d_from_virtual_entries(
             continue;
         }
         let Ok(text) = std::str::from_utf8(bytes) else {
+            if matches!(
+                ext.as_str(),
+                "jdx" | "dx" | "jcamp" | "json" | "tsv" | "csv"
+            ) {
+                dataset_errors.push(format!("'{rel}': invalid UTF-8 text"));
+            }
             continue;
         };
         if ext == "json" {
-            if let Ok(loaded) = parse_json_1d_str(text, mhz_override) {
-                results.push(loaded);
+            match parse_json_1d_str(text, mhz_override) {
+                Ok(loaded) => results.push(loaded),
+                Err(e) => dataset_errors.push(format!("'{rel}': {e}")),
             }
             continue;
         }
@@ -7393,58 +8095,80 @@ pub fn load_1d_from_virtual_entries(
                 && text.trim_start().starts_with("##TITLE=")
                 && text.contains("##XYDATA="))
         {
-            let blocks = crate::octet_analyt::jcamp_spec1d::read_jcamp(text)?;
-            let first = blocks
-                .first()
-                .ok_or_else(|| format!("JCAMP-DX file '{rel}' contained zero spectrum blocks"))?;
-            if first.y.len() < 2 {
-                return Err(format!(
-                    "JCAMP-DX file '{rel}' contains fewer than 2 points"
-                ));
+            let jdx_res = (|| -> Result<Loaded1DData, String> {
+                let blocks = crate::octet_analyt::jcamp_spec1d::read_jcamp(text)?;
+                let first = blocks.first().ok_or_else(|| {
+                    format!("JCAMP-DX file '{rel}' contained zero spectrum blocks")
+                })?;
+                if first.y.len() < 2 {
+                    return Err(format!(
+                        "JCAMP-DX file '{rel}' contains fewer than 2 points"
+                    ));
+                }
+                let nuc_str = first.nucleus.as_deref().unwrap_or("1H");
+                let exp = Experiment1DKind::from_pulse_program("", nuc_str);
+                let mhz = mhz_override.or(first.mhz).unwrap_or(500.0);
+                if !mhz.is_finite() || mhz <= 0.0 {
+                    return Err(format!("invalid JCAMP-DX observation frequency mhz={mhz}"));
+                }
+                let mut xs = first.x_axis();
+                let mut ys = first.y.clone();
+                if xs.first().copied().unwrap_or(0.0) < xs.last().copied().unwrap_or(0.0) {
+                    xs.reverse();
+                    ys.reverse();
+                }
+                let high_ppm = xs[0];
+                let low_ppm = *xs.last().unwrap_or(&high_ppm);
+                if !high_ppm.is_finite()
+                    || !low_ppm.is_finite()
+                    || (high_ppm - low_ppm).abs() <= 1e-12
+                {
+                    return Err(format!(
+                        "JCAMP-DX file '{rel}' has invalid x-axis bounds [{low_ppm}, {high_ppm}]"
+                    ));
+                }
+                let axis =
+                    AxisPpm::from_bounds(exp.nucleus().as_str(), ys.len(), high_ppm, low_ppm, mhz);
+                let title = if first.title.trim().is_empty() {
+                    fname.to_string()
+                } else {
+                    first.title.clone()
+                };
+                let mut spec = Spectrum1D::new(title, exp, axis, ys, None);
+                spec.solvent = first.solvent.clone();
+                spec.validate()?;
+                Ok(Loaded1DData::FrequencyDomain(spec))
+            })();
+            match jdx_res {
+                Ok(loaded) => results.push(loaded),
+                Err(e) => dataset_errors.push(format!("'{rel}': {e}")),
             }
-            let nuc_str = first.nucleus.as_deref().unwrap_or("1H");
-            let exp = Experiment1DKind::from_pulse_program("", nuc_str);
-            let mhz = mhz_override.or(first.mhz).unwrap_or(500.0);
-            if !mhz.is_finite() || mhz <= 0.0 {
-                return Err(format!("invalid JCAMP-DX observation frequency mhz={mhz}"));
-            }
-            let mut xs = first.x_axis();
-            let mut ys = first.y.clone();
-            if xs.first().copied().unwrap_or(0.0) < xs.last().copied().unwrap_or(0.0) {
-                xs.reverse();
-                ys.reverse();
-            }
-            let high_ppm = xs[0];
-            let low_ppm = *xs.last().unwrap_or(&high_ppm);
-            if !high_ppm.is_finite() || !low_ppm.is_finite() || (high_ppm - low_ppm).abs() <= 1e-12
-            {
-                return Err(format!(
-                    "JCAMP-DX file '{rel}' has invalid x-axis bounds [{low_ppm}, {high_ppm}]"
-                ));
-            }
-            let axis =
-                AxisPpm::from_bounds(exp.nucleus().as_str(), ys.len(), high_ppm, low_ppm, mhz);
-            let title = if first.title.trim().is_empty() {
-                fname.to_string()
-            } else {
-                first.title.clone()
-            };
-            let mut spec = Spectrum1D::new(title, exp, axis, ys, None);
-            spec.solvent = first.solvent.clone();
-            spec.validate()?;
-            results.push(Loaded1DData::FrequencyDomain(spec));
             continue;
         }
         if matches!(ext.as_str(), "tsv" | "csv" | "txt") {
             let stem = fname.rsplit_once('.').map(|(s, _)| s).unwrap_or(fname);
-            if let Ok(loaded) = parse_tsv_1d_str(text, stem, mhz_override) {
-                results.push(loaded);
+            match parse_tsv_1d_str(text, stem, mhz_override) {
+                Ok(loaded) => results.push(loaded),
+                Err(e) => {
+                    if ext == "txt" {
+                        txt_errors.push(format!("'{rel}': {e}"));
+                    } else {
+                        dataset_errors.push(format!("'{rel}': {e}"));
+                    }
+                }
             }
         }
     }
 
     if !results.is_empty() {
-        return Ok(results);
+        return Ok(Virtual1DLoadOutcome {
+            loaded: results,
+            dataset_errors,
+        });
+    }
+
+    if !dataset_errors.is_empty() {
+        return Err(dataset_errors.join("; "));
     }
 
     // 4. Actionable bare-file guidance when no complete 1D dataset could be assembled.
@@ -7472,26 +8196,33 @@ pub fn load_1d_from_virtual_entries(
                 .to_string(),
         );
     }
+    if !txt_errors.is_empty() {
+        return Err(txt_errors.join("; "));
+    }
 
     Err("No 1D NMR datasets found in dropped items.".to_string())
 }
 
-pub fn load_processed_spectrum_1d(
-    path: &std::path::Path,
+/// Load one or more 1D NMR datasets directly from in-memory `(relative_path, bytes)` entries
+/// (`wasm32` browser folder/file drop & picker + native multi-file/archive drop).
+///
+/// Isolates per-dataset errors via [`load_1d_from_virtual_entries_isolated`]: when a multi-experiment
+/// drop contains both valid and corrupt 1D datasets, all valid sibling datasets are returned and
+/// any skipped dataset errors are preserved onto the returned [`Loaded1DData`] warnings (`v0150` P2).
+pub fn load_1d_from_virtual_entries(
+    entries: &[(&str, &[u8])],
     mhz_override: Option<f64>,
-) -> Result<Spectrum1D, String> {
-    match load_1d_input(path, mhz_override, false)? {
-        Loaded1DData::FrequencyDomain(spec) => Ok(spec),
-        Loaded1DData::TimeDomain(mut td) => {
-            let lb = td.experiment.default_line_broadening_hz();
-            apply_apodization_1d(&mut td, Apodization1D::Exponential { lb_hz: lb }, 0.5);
-            zero_fill_pow2_1d(&mut td, 2);
-            let mut spec = fft_1d(&td);
-            let _ = auto_phase_and_apply_1d(&mut spec, &AutoPhase1DConfig::default());
-            spec.validate()?;
-            Ok(spec)
+    prefer_fid: bool,
+) -> Result<Vec<Loaded1DData>, String> {
+    let mut out = load_1d_from_virtual_entries_isolated(entries, mhz_override, prefer_fid)?;
+    if !out.dataset_errors.is_empty() {
+        if let Some(first) = out.loaded.first_mut() {
+            for err in &out.dataset_errors {
+                first.push_warning(format!("skipped corrupt sibling 1D dataset ({err})"));
+            }
         }
     }
+    Ok(out.loaded)
 }
 
 #[cfg(test)]

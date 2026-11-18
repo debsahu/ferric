@@ -1370,18 +1370,38 @@ fn f29_dept135_ch2_free_vs_ch2_containing_hdo_mask_and_iupac_c13_dss_tms() {
         sol_aq.phc1_deg
     );
 
-    // 4. IUPAC 2001/2008 13C DSS-vs-TMS ReferenceStandard exact round-trip & -2.371 ppm offset
+    // 4. IUPAC 2001/2008 13C DSS-vs-TMS ReferenceStandard exact first-principles Xi derivation (`20.W1:P0-2`)
+    let expected_dss_in_tms_ppm =
+        ((0.251_449_53_f64 - 0.251_450_20_f64) / 0.251_450_20_f64) * 1.0e6;
     assert!((XI_C13_TMS - 0.251_450_20).abs() < 1e-10);
     assert!((XI_C13_DSS - 0.251_449_53).abs() < 1e-10);
-    assert!((C13_DSS_VS_TMS_OFFSET_PPM - (-2.371)).abs() < 1e-12);
+    assert!(
+        (C13_DSS_VS_TMS_OFFSET_PPM - expected_dss_in_tms_ppm).abs() < 1e-12,
+        "C13_DSS_VS_TMS_OFFSET_PPM must equal ((XI_C13_DSS - XI_C13_TMS) / XI_C13_TMS) * 1e6 = {expected_dss_in_tms_ppm:.9}, got {C13_DSS_VS_TMS_OFFSET_PPM:.9}"
+    );
+    assert!(
+        ((0.251_449_53_f64 / 0.251_450_20_f64 - 1.0) * 1.0e6 - C13_DSS_VS_TMS_OFFSET_PPM).abs()
+            < 1e-9
+    );
+    assert!((C13_DSS_VS_TMS_OFFSET_PPM - (-2.664_543_5)).abs() < 1e-6);
+    assert!(
+        (C13_DSS_VS_TMS_OFFSET_PPM - (-2.371)).abs() > 0.29,
+        "regression guard: fucose-fitted -2.371 ppm literal must not return"
+    );
     let dss_zero_in_tms =
         convert_c13_ppm_reference(0.0, ReferenceStandard::Dss, ReferenceStandard::Tms);
-    assert!((dss_zero_in_tms - (-2.371)).abs() < 1e-12);
-    let anomeric_dss =
+    assert!((dss_zero_in_tms - expected_dss_in_tms_ppm).abs() < 1e-12);
+    let tms_zero_in_dss =
+        convert_c13_ppm_reference(0.0, ReferenceStandard::Tms, ReferenceStandard::Dss);
+    let xi_zero_in_dss =
+        convert_c13_ppm_xi_ratio(0.0, ReferenceStandard::Tms, ReferenceStandard::Dss);
+    assert!((tms_zero_in_dss - xi_zero_in_dss).abs() < 1e-12);
+    assert!((tms_zero_in_dss - 2.664_550_6).abs() < 1e-6);
+    let sample_dss =
         convert_c13_ppm_reference(96.5678, ReferenceStandard::Tms, ReferenceStandard::Dss);
-    assert!((anomeric_dss - 98.939).abs() < 0.005);
+    assert!((sample_dss - (96.5678 + 2.664_808)).abs() < 1e-5);
     let roundtrip =
-        convert_c13_ppm_reference(anomeric_dss, ReferenceStandard::Dss, ReferenceStandard::Tms);
+        convert_c13_ppm_reference(sample_dss, ReferenceStandard::Dss, ReferenceStandard::Tms);
     assert!((roundtrip - 96.5678).abs() < 1e-11);
     let xi_rt = convert_c13_ppm_xi_ratio(
         convert_c13_ppm_xi_ratio(100.0, ReferenceStandard::Tms, ReferenceStandard::Dss),
@@ -1396,7 +1416,7 @@ fn f29_dept135_ch2_free_vs_ch2_containing_hdo_mask_and_iupac_c13_dss_tms() {
         ReferenceStandard::Dss,
     )
     .expect("13C TMS -> DSS");
-    assert!((delta_spec - 2.371).abs() < 0.01);
+    assert!((delta_spec - 2.6647).abs() < 0.005);
     assert!(
         convert_c13_spectrum_reference_1d(
             &mut spec_aq,
@@ -1731,4 +1751,327 @@ fn f29_clean_room_jeol_jdf_1d_big_and_little_endian_multinuclear_and_f15_adversa
     let d_off = u32::from_be_bytes(nan_jdf[1284..1288].try_into().unwrap()) as usize + 8 * 10;
     nan_jdf[d_off..d_off + 8].copy_from_slice(&f64::NAN.to_le_bytes());
     assert!(parse_jeol_jdf_1d_bytes("nan_body", &nan_jdf, None).is_err());
+}
+
+#[test]
+fn p20_w1_p1_2_dept135_calpha_54ppm_ch_and_66ppm_ch2_no_fucose_band_inversion() {
+    use nmr_core::nmr1d::{auto_phase_dept135_with_dept90, PolarityResolution1D};
+
+    // Amino-acid / glycopeptide-like motif that defeats any hardcoded chemical-shift-band sign table:
+    // - C-alpha methine `CH` at `54.0 ppm` (positive in DEPT-135, inside 50-62 ppm!)
+    // - Hydroxymethyl / PEG `CH2`s at `66.0 ppm` and `70.5 ppm` (negative in DEPT-135, inside 62-72 ppm!)
+    let dept135_lines = [
+        SyntheticLine1D::lorentzian(54.0, 1.2, 1.8), // C-alpha CH (+)
+        SyntheticLine1D {
+            ppm: 66.0,
+            amplitude: 1.5,
+            fwhm_hz: 1.8,
+            gauss_fwhm_hz: 0.0,
+            phase_deg: 180.0, // CH2 (-)
+        },
+        SyntheticLine1D {
+            ppm: 70.5,
+            amplitude: 1.5,
+            fwhm_hz: 1.8,
+            gauss_fwhm_hz: 0.0,
+            phase_deg: 180.0, // CH2 (-)
+        },
+    ];
+    let mut fid_135 = synthesize_fid_1d(
+        "calpha_peg_dept135",
+        Experiment1DKind::Dept135,
+        4096,
+        20_000.0,
+        125.76,
+        62.0,
+        &dept135_lines,
+    );
+    apply_apodization_1d(&mut fid_135, Apodization1D::Exponential { lb_hz: 1.0 }, 0.5);
+    zero_fill_pow2_1d(&mut fid_135, 2);
+    let base_135 = fft_1d(&fid_135);
+
+    // Case A: Without DEPT-90 or `biphasic_positive_ppm`, under mild receiver phase error (+38 deg, -24 deg),
+    // autophase MUST NOT flip C-alpha CH(54 ppm) negative and CH2(66, 70.5 ppm) positive, and MUST emit
+    // `AmbiguousGlobalPolarity` warning because global 0 vs 180 deg sign cannot be proven from chemical shift alone.
+    let mut spec_a = base_135.clone();
+    apply_phase_1d(&mut spec_a, 38.0, -24.0, Pivot1D::Fraction(0.5));
+    let sol_a = auto_phase_and_apply_1d(&mut spec_a, &AutoPhase1DConfig::default());
+    let i_ca = spec_a.axis.ppm_to_index(54.0).round() as usize;
+    let i_ch2_66 = spec_a.axis.ppm_to_index(66.0).round() as usize;
+    let i_ch2_70 = spec_a.axis.ppm_to_index(70.5).round() as usize;
+    assert!(
+        spec_a.real[i_ca] > 0.0 && spec_a.real[i_ch2_66] < 0.0 && spec_a.real[i_ch2_70] < 0.0,
+        "DEPT-135 C-alpha CH(54 ppm)={:.3} must stay > 0 and CH2(66, 70.5 ppm)=({:.3}, {:.3}) must stay < 0",
+        spec_a.real[i_ca],
+        spec_a.real[i_ch2_66],
+        spec_a.real[i_ch2_70]
+    );
+    assert_eq!(
+        sol_a.polarity_resolution,
+        PolarityResolution1D::AmbiguousGlobalPolarity
+    );
+    assert!(
+        spec_a
+            .processing_warnings
+            .iter()
+            .any(|w| w.contains("AmbiguousGlobalPolarity")),
+        "expected AmbiguousGlobalPolarity warning on unassisted DEPT-135, got {:?}",
+        spec_a.processing_warnings
+    );
+
+    // Case B: Even under a 180-deg-inverted receiver phase (-142 deg = +38 - 180 deg), an accompanying
+    // `DEPT-90` spectrum (which excites ONLY methine CH at 54.0 ppm) disambiguates global polarity cleanly!
+    let dept90_lines = [SyntheticLine1D::lorentzian(54.0, 1.2, 1.8)];
+    let mut fid_90 = synthesize_fid_1d(
+        "calpha_peg_dept90",
+        Experiment1DKind::Dept90,
+        4096,
+        20_000.0,
+        125.76,
+        62.0,
+        &dept90_lines,
+    );
+    apply_apodization_1d(&mut fid_90, Apodization1D::Exponential { lb_hz: 1.0 }, 0.5);
+    zero_fill_pow2_1d(&mut fid_90, 2);
+    let spec_90 = fft_1d(&fid_90);
+
+    let mut spec_b = base_135;
+    apply_phase_1d(&mut spec_b, -142.0, -24.0, Pivot1D::Fraction(0.5));
+    let sol_b =
+        auto_phase_dept135_with_dept90(&mut spec_b, &spec_90, &AutoPhase1DConfig::default())
+            .expect("DEPT-90 disambiguation");
+    assert_eq!(
+        sol_b.polarity_resolution,
+        PolarityResolution1D::MultiplicityReference
+    );
+    assert!(
+        spec_b.processing_warnings.is_empty(),
+        "DEPT-90 disambiguated DEPT-135 must not emit ambiguity warning: {:?}",
+        spec_b.processing_warnings
+    );
+    assert!(
+        spec_b.real[i_ca] > 0.0 && spec_b.real[i_ch2_66] < 0.0 && spec_b.real[i_ch2_70] < 0.0,
+        "DEPT-90 disambiguation failed: CH(54)={:.3}, CH2(66)={:.3}, CH2(70.5)={:.3}",
+        spec_b.real[i_ca],
+        spec_b.real[i_ch2_66],
+        spec_b.real[i_ch2_70]
+    );
+}
+
+#[test]
+fn p20_w1_p2_2_real_public_jeol_jdf_fixture_rutin_400mhz_dmsod6() {
+    use nmr_core::nmr1d::{
+        load_processed_spectrum_1d, parse_jeol_jdf_1d_bytes, prepare_loaded_1d_for_studio,
+        Loaded1DData,
+    };
+    use std::path::Path;
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../data/fixtures/jeol_public/rutin_q1h_400mhz_dmsod6.jdf");
+    assert!(
+        fixture.is_file(),
+        "missing real public JEOL .jdf fixture at {}",
+        fixture.display()
+    );
+    let bytes = std::fs::read(&fixture).expect("read public JEOL .jdf fixture");
+    assert_eq!(bytes.len(), 555_392);
+    assert_eq!(&bytes[0..8], b"JEOL.NMR");
+
+    let parsed = parse_jeol_jdf_1d_bytes("rutin_q1h_400mhz_dmsod6", &bytes, None)
+        .expect("parse real public JEOL Delta 1D .jdf");
+    match &parsed {
+        Loaded1DData::TimeDomain(td) => {
+            assert_eq!(td.experiment, Experiment1DKind::Proton1D);
+            // `Data_Points = 32768` with `Data_Offset = [20..=32767]` (`32_748` active samples)
+            assert_eq!(td.data.len(), 32_748);
+            assert!((td.obs_mhz - 399.782_198).abs() < 1e-3);
+            assert_eq!(td.solvent.as_deref(), Some("DMSO-D6"));
+        }
+        Loaded1DData::FrequencyDomain(_) => {
+            panic!("expected time-domain qHNMR FID in rutin_q1h_400mhz_dmsod6.jdf")
+        }
+    }
+
+    let studio_spec =
+        prepare_loaded_1d_for_studio(parsed).expect("studio process real JEOL .jdf FID");
+    let path_spec = load_processed_spectrum_1d(&fixture, None)
+        .expect("load_processed_spectrum_1d real JEOL .jdf");
+    assert_eq!(studio_spec.len(), path_spec.len());
+    assert!(
+        (studio_spec.axis.first_ppm - path_spec.axis.first_ppm).abs() < 1e-12,
+        "byte/studio and path 1D pipelines must agree identically on real JEOL .jdf"
+    );
+    assert!(
+        studio_spec.applied_reference_shift_ppm.is_some(),
+        "DMSO-d6 residual quintet at 2.50 ppm must calibrate and record applied_reference_shift_ppm"
+    );
+    let pks = pick_peaks_1d(&studio_spec, &PeakPickConfig1D::default());
+    assert!(
+        pks.iter().any(|p| (p.ppm - 2.50).abs() < 0.02),
+        "expected calibrated DMSO-d5 residual peak at 2.50 ppm, got top peaks {:?}",
+        &pks[..pks.len().min(8)]
+    );
+    // Rutin flavonol H-6 / H-8 / B-ring aromatic protons (6.15 - 7.60 ppm) & H-1'' anomeric (~5.10 ppm)
+    assert!(
+        pks.iter().any(|p| (6.10..=7.65).contains(&p.ppm)),
+        "expected Rutin aromatic 1H resonances in 6.10..7.65 ppm"
+    );
+}
+
+#[test]
+fn v0150_p1_3_and_p2_shared_1d_pipeline_solvent_lineshape_guard_and_sibling_isolation() {
+    use nmr_core::nmr1d::{
+        load_1d_from_virtual_entries, load_1d_from_virtual_entries_isolated,
+        load_processed_spectrum_1d, prepare_loaded_1d_for_studio, process_loaded_1d, Loaded1DData,
+        Process1DOptions, WASM32_MAX_1D_ARCHIVE_INFLATE_BYTES,
+    };
+
+    // 1. `wasm32` archive expansion cap must be <= 128 MiB (`v0150` P2).
+    const {
+        assert!(WASM32_MAX_1D_ARCHIVE_INFLATE_BYTES <= 128 * 1024 * 1024);
+    }
+
+    // 2. Solvent lineshape guard (`v0150:P1-3`):
+    //    (a) A sharp solute J-doublet (`J = 8.0 Hz` = `0.016 ppm` at 500 MHz, equal-height twin lines at
+    //        `7.242` and `7.258 ppm`, no CHCl3 singlet) MUST be rejected by `auto_calibrate_solvent_1d`!
+    let doublet_lines = [
+        SyntheticLine1D::lorentzian(7.242, 12.0, 1.1),
+        SyntheticLine1D::lorentzian(7.258, 12.0, 1.1),
+        SyntheticLine1D::lorentzian(2.150, 18.0, 1.2),
+    ];
+    let mut fid_dbl = synthesize_fid_1d(
+        "solute_doublet_near_cdcl3",
+        Experiment1DKind::Proton1D,
+        8192,
+        6000.0,
+        500.0,
+        4.70,
+        &doublet_lines,
+    );
+    add_complex_gaussian_noise(&mut fid_dbl, 5.0e-4, 4242);
+    apply_apodization_1d(&mut fid_dbl, Apodization1D::Exponential { lb_hz: 0.2 }, 0.5);
+    zero_fill_pow2_1d(&mut fid_dbl, 2);
+    let mut spec_dbl = fft_1d(&fid_dbl);
+    let first_before = spec_dbl.axis.first_ppm;
+    let err_dbl = auto_calibrate_solvent_1d(&mut spec_dbl, "CDCl3", 0.25)
+        .expect_err("sharp solute J-doublet near 7.26 ppm must NOT be mistaken for CHCl3 singlet");
+    assert!(
+        err_dbl.contains("multiplet")
+            || err_dbl.contains("doublet")
+            || err_dbl.contains("lineshape")
+            || err_dbl.contains("companion"),
+        "unexpected J-doublet rejection message: {err_dbl}"
+    );
+    assert!((spec_dbl.axis.first_ppm - first_before).abs() < 1e-12);
+
+    //    (b) A broad baseline hump (`FWHM = 55 Hz` at `7.24 ppm`) MUST also be rejected!
+    let hump_lines = [
+        SyntheticLine1D::lorentzian(7.24, 15.0, 55.0),
+        SyntheticLine1D::lorentzian(1.25, 10.0, 1.2),
+    ];
+    let mut fid_hump = synthesize_fid_1d(
+        "broad_hump_cdcl3",
+        Experiment1DKind::Proton1D,
+        8192,
+        6000.0,
+        500.0,
+        4.70,
+        &hump_lines,
+    );
+    add_complex_gaussian_noise(&mut fid_hump, 5.0e-4, 5353);
+    let mut spec_hump = fft_1d(&fid_hump);
+    assert!(
+        auto_calibrate_solvent_1d(&mut spec_hump, "CDCl3", 0.25).is_err(),
+        "broad 55 Hz hump at 7.24 ppm must NOT be accepted as residual CHCl3"
+    );
+
+    //    (c) Genuine residual CHCl3 singlet shifted by `-0.042 ppm` (`7.218 ppm` -> `7.260 ppm`)
+    //        calibrates identically across `process_loaded_1d`, `prepare_loaded_1d_for_studio`,
+    //        and `load_processed_spectrum_1d`, recording `applied_reference_shift_ppm ≈ +0.042 ppm`.
+    let chcl3_lines = [
+        SyntheticLine1D::lorentzian(7.218, 10.0, 1.2),
+        SyntheticLine1D::lorentzian(3.620, 25.0, 1.3),
+    ];
+    let mut fid_ok = synthesize_fid_1d(
+        "valid_cdcl3_fid",
+        Experiment1DKind::Proton1D,
+        4096,
+        6000.0,
+        500.0,
+        4.70,
+        &chcl3_lines,
+    );
+    fid_ok.solvent = Some("CDCl3".to_string());
+    add_complex_gaussian_noise(&mut fid_ok, 5.0e-4, 6464);
+
+    let tmp_fid_json = std::env::temp_dir().join("v0150_p1_3_shared_cdcl3_fid.json");
+    std::fs::write(&tmp_fid_json, serde_json::to_string(&fid_ok).unwrap()).unwrap();
+    let sp_from_path =
+        load_processed_spectrum_1d(&tmp_fid_json, None).expect("path pipeline on FID");
+    let _ = std::fs::remove_file(&tmp_fid_json);
+    let sp_from_studio = prepare_loaded_1d_for_studio(Loaded1DData::TimeDomain(fid_ok.clone()))
+        .expect("studio pipeline on FID");
+    let proc_direct = process_loaded_1d(
+        Loaded1DData::TimeDomain(fid_ok),
+        &Process1DOptions::interactive_defaults(),
+    )
+    .expect("direct shared pipeline on FID");
+
+    let shift = sp_from_path
+        .applied_reference_shift_ppm
+        .expect("applied_reference_shift_ppm recorded");
+    assert!(
+        (shift - 0.042).abs() < 0.004,
+        "expected ~+0.042 ppm calibration shift onto 7.26 ppm CHCl3, got {shift:+.5}"
+    );
+    assert_eq!(
+        sp_from_path.applied_reference_shift_ppm,
+        sp_from_studio.applied_reference_shift_ppm
+    );
+    assert_eq!(
+        sp_from_path.applied_reference_shift_ppm,
+        proc_direct.applied_reference_shift_ppm
+    );
+    assert!((sp_from_path.axis.first_ppm - sp_from_studio.axis.first_ppm).abs() < 1e-12);
+
+    // 3. Multi-experiment virtual drop error isolation (`v0150` P2):
+    //    `study/1` (valid Bruker pdata) + `study/2` (corrupt/truncated `1r`) + `study/3` (valid Bruker pdata)
+    //    must recover BOTH valid siblings (`1` and `3`) and surface the corrupt `study/2` error as a warning!
+    let procs_txt = b"##TITLE= pdata\n##$SI= 4\n##$OFFSET= 10.0\n##$SW_p= 4000.0\n##$SF= 400.0\n##$NC_proc= 0\n##$BYTORDP= 0\n##$DTYPP= 0\n##END=\n".to_vec();
+    let mut good_1r = Vec::with_capacity(16);
+    for v in [10i32, 500, 20, 5] {
+        good_1r.extend_from_slice(&v.to_le_bytes());
+    }
+    let bad_trunc_1r = vec![0u8; 8]; // truncated: 8 bytes instead of 16 for SI=4!
+
+    let entries: Vec<(&str, &[u8])> = vec![
+        ("study/1/pdata/1/procs", procs_txt.as_slice()),
+        ("study/1/pdata/1/1r", good_1r.as_slice()),
+        ("study/2/pdata/1/procs", procs_txt.as_slice()),
+        ("study/2/pdata/1/1r", bad_trunc_1r.as_slice()),
+        ("study/3/pdata/1/procs", procs_txt.as_slice()),
+        ("study/3/pdata/1/1r", good_1r.as_slice()),
+    ];
+    let outcome = load_1d_from_virtual_entries_isolated(&entries, None, true)
+        .expect("isolated multi-expno virtual load");
+    assert_eq!(
+        outcome.loaded.len(),
+        2,
+        "expected 2 valid sibling expnos to survive corrupt expno 2, got {}",
+        outcome.loaded.len()
+    );
+    assert_eq!(outcome.dataset_errors.len(), 1);
+    assert!(outcome.dataset_errors[0].contains("study/2"));
+
+    let surviving = load_1d_from_virtual_entries(&entries, None, true)
+        .expect("multi-expno drop with 2 valid siblings must succeed rather than aborting");
+    assert_eq!(surviving.len(), 2);
+    let sp0 = prepare_loaded_1d_for_studio(surviving.into_iter().next().unwrap()).unwrap();
+    assert!(
+        sp0.processing_warnings
+            .iter()
+            .any(|w| w.contains("study/2")),
+        "sibling load error must propagate into processing_warnings, got {:?}",
+        sp0.processing_warnings
+    );
 }

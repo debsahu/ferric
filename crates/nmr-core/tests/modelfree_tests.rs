@@ -17,10 +17,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use nmr_core::modelfree::{
-    extract_nh_unit_vectors_from_pdb, fit_modelfree_dataset, group_multifield_rates,
-    predict_r1_r2_noe, woessner_anisotropic_components, write_modelfree_tsv_str, DiffusionTensor,
-    DiffusionTensorKind, LocalMfParams, ModelFreeConfig, ModelFreeId, ModelSelectionCriterion,
-    MultiFieldResidueInput,
+    extract_nh_unit_vectors_from_pdb, fit_modelfree_dataset, fit_modelfree_dataset_with_m5_rule,
+    group_multifield_rates, m5_is_eliminated, predict_r1_r2_noe, woessner_anisotropic_components,
+    write_modelfree_tsv_str, DiffusionTensor, DiffusionTensorKind, LocalMfParams,
+    M5EliminationRule, ModelFreeConfig, ModelFreeId, ModelSelectionCriterion,
+    MultiFieldResidueInput, MIN_IDENTIFIABILITY_Z,
 };
 use nmr_core::relax_fit::{
     compute_hetnoe, fit_decay_curve_cpu, woessner_axial_components, DecayCurveInput, ExpFitConfig,
@@ -1027,5 +1028,337 @@ fn f28_m5_parsimony_guard_prevents_noisy_3field_overselection_and_csa_160_vs_172
     assert!(
         mean_s2_160 > mean_s2_172 + 0.015,
         "expected mean S^2(-160 ppm)={mean_s2_160:.4} > mean S^2(-172 ppm)={mean_s2_172:.4}"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// S8 / finding 20.W1:P1-3: principled M5 elimination vs the legacy heuristic, with a
+// deterministic ground-truth Monte Carlo confusion matrix at 1, 2 and 3 static fields.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn s8_m5_principled_rule_is_fisher_identifiability_based_with_no_retired_magic_literals() {
+    assert!(
+        (MIN_IDENTIFIABILITY_Z - 2.0).abs() < 1.0e-12,
+        "single named identifiability z-threshold"
+    );
+    let tau_m = 6.0e-9_f64;
+    let p = |ts: f64| LocalMfParams::m5(0.85, 0.65, ts);
+    let rule = M5EliminationRule::PrincipledFisher;
+    assert_eq!(M5EliminationRule::default(), rule);
+
+    // Well-determined: sigma(tau_s)/tau_s = 0.2 < 1/z -> kept.
+    assert!(!m5_is_eliminated(
+        rule,
+        &p(1.5e-9),
+        0.02,
+        0.03,
+        0.30e-9,
+        tau_m
+    ));
+    // Fisher sigma(tau_s)/tau_s = 0.6 > 1/z -> eliminated, with everything else unchanged.
+    assert!(m5_is_eliminated(
+        rule,
+        &p(1.5e-9),
+        0.02,
+        0.03,
+        0.90e-9,
+        tau_m
+    ));
+    // Poorly determined amplitudes: S_s^2 not resolved from 1 (distance 0.35 < z * 0.30).
+    assert!(m5_is_eliminated(
+        rule,
+        &p(1.5e-9),
+        0.02,
+        0.30,
+        0.30e-9,
+        tau_m
+    ));
+    assert!(m5_is_eliminated(
+        rule,
+        &p(1.5e-9),
+        0.10,
+        0.03,
+        0.30e-9,
+        tau_m
+    ));
+    // Physical boundaries: tau_s >= tau_m, tau_s below the 2 ps resolution floor, non-finite sigma.
+    assert!(m5_is_eliminated(
+        rule,
+        &p(7.0e-9),
+        0.02,
+        0.03,
+        0.01e-9,
+        tau_m
+    ));
+    assert!(m5_is_eliminated(
+        rule,
+        &p(1.0e-12),
+        0.02,
+        0.03,
+        1.0e-15,
+        tau_m
+    ));
+    assert!(m5_is_eliminated(
+        rule,
+        &p(1.5e-9),
+        f64::NAN,
+        0.03,
+        0.30e-9,
+        tau_m
+    ));
+    // Sf^2 = 0.99 resolved from 1 at 10 sigma is identifiable under the principled rule, whereas
+    // the legacy heuristic discards it on a bare magnitude cutoff (documented behavioural change).
+    let hi_sf = LocalMfParams::m5(0.99, 0.65, 1.5e-9);
+    assert!(!m5_is_eliminated(rule, &hi_sf, 0.001, 0.03, 0.30e-9, tau_m));
+    assert!(m5_is_eliminated(
+        M5EliminationRule::LegacyPreF28,
+        &hi_sf,
+        0.001,
+        0.03,
+        0.30e-9,
+        tau_m
+    ));
+    // A 140 ps tau_s with tight errors is legal for the principled rule but below the legacy cut.
+    assert!(!m5_is_eliminated(
+        rule,
+        &p(0.14e-9),
+        0.01,
+        0.01,
+        0.005e-9,
+        tau_m
+    ));
+    assert!(m5_is_eliminated(
+        M5EliminationRule::LegacyPreF28,
+        &p(0.14e-9),
+        0.01,
+        0.01,
+        0.005e-9,
+        tau_m
+    ));
+
+    // The retuned e693f11 literals must be gone from the M5 decision function.
+    let src = include_str!("../src/modelfree.rs");
+    let start = src
+        .find("pub fn m5_is_eliminated(")
+        .expect("m5_is_eliminated present");
+    let end = start + src[start..].find("\n}\n").expect("end of m5_is_eliminated");
+    let body = &src[start..end];
+    for lit in ["0.955", "0.86", "180.0e-12", "0.42", "0.48", "0.12"] {
+        assert!(
+            !body.contains(lit),
+            "retired unsourced M5 literal {lit} still in m5_is_eliminated"
+        );
+    }
+    assert!(
+        !src.contains("slow_weight"),
+        "retuned `slow_weight < 0.12` rule must be removed"
+    );
+    assert!(
+        !src.contains("m_obs <= 9"),
+        "unsourced `m_obs <= 9` AICc cutoff must be removed"
+    );
+}
+
+fn mc_truth(rng: &mut Rng, model: ModelFreeId) -> LocalMfParams {
+    match model {
+        ModelFreeId::M1 => LocalMfParams::m1(rng.uniform(0.80, 0.95)),
+        ModelFreeId::M2 => {
+            LocalMfParams::m2(rng.uniform(0.75, 0.92), rng.uniform(20.0e-12, 120.0e-12))
+        }
+        ModelFreeId::M3 => LocalMfParams::m3(rng.uniform(0.83, 0.93), rng.uniform(2.4, 6.0)),
+        ModelFreeId::M4 => LocalMfParams::m4(
+            rng.uniform(0.75, 0.88),
+            rng.uniform(20.0e-12, 120.0e-12),
+            rng.uniform(2.6, 5.5),
+        ),
+        ModelFreeId::M5 => LocalMfParams::m5(
+            rng.uniform(0.80, 0.95),
+            rng.uniform(0.55, 0.85),
+            rng.uniform(0.5e-9, 2.0e-9),
+        ),
+    }
+}
+
+/// `[true][selected]` counts.
+type Confusion = [[usize; 5]; 5];
+
+fn model_index(m: ModelFreeId) -> usize {
+    ModelFreeId::ALL
+        .iter()
+        .position(|&x| x == m)
+        .expect("model in ALL")
+}
+
+fn mc_confusion_for_fields(
+    fields_mhz: &[f64],
+    per_model_per_tau: usize,
+    seed: u64,
+) -> (Confusion, Confusion) {
+    let phys = RelaxPhysicsConfig::default();
+    let ref_mhz = fields_mhz[0];
+    let mut conf_pr: Confusion = [[0; 5]; 5];
+    let mut conf_lg: Confusion = [[0; 5]; 5];
+    for (it, &tau_m_ns) in [4.0_f64, 6.0, 8.0].iter().enumerate() {
+        let tau_m = tau_m_ns * 1.0e-9;
+        let rot = [(1.0, tau_m)];
+        let mut rng = Rng::new(seed ^ ((it as u64 + 1) * 0x9E37_79B9));
+        let mut inputs = Vec::new();
+        let mut truth_idx = Vec::new();
+        let mut seq = 0_i32;
+        for _ in 0..per_model_per_tau {
+            for &m in ModelFreeId::ALL.iter() {
+                seq += 1;
+                let truth = mc_truth(&mut rng, m);
+                let mut f_vec = Vec::new();
+                for &fm in fields_mhz {
+                    let (r1, r2, noe) = predict_r1_r2_noe(&rot, &truth, fm, ref_mhz, &phys);
+                    let (sr1, sr2, sn) = (0.025 * r1, 0.025 * r2, 0.025);
+                    f_vec.push(ResidueRelaxRates {
+                        seq_id: seq,
+                        res_name: "VAL".to_string(),
+                        field_mhz: fm,
+                        r1: (r1 + rng.normal(0.0, sr1)).max(0.1),
+                        sigma_r1: sr1,
+                        r2: (r2 + rng.normal(0.0, sr2)).max(0.5),
+                        sigma_r2: sr2,
+                        hetnoe: Some(noe + rng.normal(0.0, sn)),
+                        sigma_hetnoe: Some(sn),
+                    });
+                }
+                inputs.push(MultiFieldResidueInput {
+                    seq_id: seq,
+                    res_name: "VAL".to_string(),
+                    nh_unit_vec: None,
+                    fields: f_vec,
+                });
+                truth_idx.push(model_index(m));
+            }
+        }
+        let cfg = ModelFreeConfig {
+            diffusion_kind: DiffusionTensorKind::Isotropic,
+            selection_criterion: ModelSelectionCriterion::Aic,
+            ref_field_mhz: Some(ref_mhz),
+            physics: phys,
+            enable_model_elimination: true,
+            max_outer_iters: 4,
+            mc_replicates: 0,
+            seed: 42,
+        };
+        for (rule, conf) in [
+            (M5EliminationRule::PrincipledFisher, &mut conf_pr),
+            (M5EliminationRule::LegacyPreF28, &mut conf_lg),
+        ] {
+            let fit =
+                fit_modelfree_dataset_with_m5_rule(&inputs, &cfg, rule).expect("fit MC dataset");
+            for (r, &t) in fit.residues.iter().zip(truth_idx.iter()) {
+                conf[t][model_index(r.selected_model)] += 1;
+            }
+        }
+    }
+    (conf_pr, conf_lg)
+}
+
+fn print_confusion(label: &str, conf: &Confusion) {
+    println!("confusion [{label}] rows=true M1..M5, cols=selected M1..M5");
+    for (i, row) in conf.iter().enumerate() {
+        println!(
+            "  true M{} | {}",
+            i + 1,
+            row.iter()
+                .map(|c| format!("{c:4}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+}
+
+fn acc(conf: &Confusion) -> f64 {
+    let tot: usize = conf.iter().flatten().sum();
+    let ok: usize = (0..5).map(|i| conf[i][i]).sum();
+    ok as f64 / tot.max(1) as f64
+}
+
+/// Fraction of true-M1/M2 residues (single-timescale) selected as M5.
+fn spurious_m5_rate(conf: &Confusion) -> f64 {
+    let n: usize = conf[0].iter().chain(conf[1].iter()).sum();
+    (conf[0][4] + conf[1][4]) as f64 / n.max(1) as f64
+}
+
+fn m5_recall(conf: &Confusion) -> f64 {
+    conf[4][4] as f64 / conf[4].iter().sum::<usize>().max(1) as f64
+}
+
+#[test]
+fn s8_ground_truth_m1_m5_confusion_matrix_principled_vs_legacy_at_1_2_3_fields() {
+    let configs: [(&str, &[f64]); 3] = [
+        ("1field_600", &[600.0]),
+        ("2field_600_800", &[600.0, 800.0]),
+        ("3field_500_600_800", &[500.0, 600.0, 800.0]),
+    ];
+    let mut summary = Vec::new();
+    for (ci, (label, fields)) in configs.iter().enumerate() {
+        // 3 tau_m values x 48 residues = 144 true residues per model per field count.
+        let (pr, lg) = mc_confusion_for_fields(fields, 48, 2026_8000 + ci as u64);
+        print_confusion(&format!("{label} PrincipledFisher"), &pr);
+        print_confusion(&format!("{label} LegacyPreF28"), &lg);
+        println!(
+            "{label}: acc principled={:.3} legacy={:.3}; spurious-M5(true M1/M2) principled={:.3} legacy={:.3}; M5 recall principled={:.3} legacy={:.3}",
+            acc(&pr), acc(&lg), spurious_m5_rate(&pr), spurious_m5_rate(&lg), m5_recall(&pr), m5_recall(&lg)
+        );
+        for row in &pr {
+            let n: usize = row.iter().sum();
+            assert!(n >= 40, "need >= 40 true residues per model, got {n}");
+        }
+        // Data-derived gates (set after the printed matrices, ~5 pp margin on n = 144 per model;
+        // measured principled values: acc 0.900 / 0.954 / 0.971, M5 recall 0.826 / 0.917 / 0.972,
+        // spurious-M5 0.042 / 0.003 / 0.003 for 1 / 2 / 3 fields).
+        let (acc_floor, recall_floor) = match fields.len() {
+            1 => (0.86, 0.76),
+            2 => (0.92, 0.86),
+            _ => (0.95, 0.92),
+        };
+        assert!(
+            acc(&pr) >= acc_floor,
+            "{label}: accuracy {:.3} < {acc_floor}",
+            acc(&pr)
+        );
+        assert!(
+            m5_recall(&pr) >= recall_floor,
+            "{label}: M5 recall {:.3} < {recall_floor}",
+            m5_recall(&pr)
+        );
+        assert!(
+            spurious_m5_rate(&pr) <= 0.10,
+            "{label}: spurious-M5 rate {:.3} > 10%",
+            spurious_m5_rate(&pr)
+        );
+        if fields.len() == 3 {
+            assert!(
+                spurious_m5_rate(&pr) <= spurious_m5_rate(&lg),
+                "3 fields: principled spurious-M5 {:.3} must not exceed legacy {:.3}",
+                spurious_m5_rate(&pr),
+                spurious_m5_rate(&lg)
+            );
+        }
+        summary.push((label.to_string(), pr, lg));
+    }
+    emit_w3_metrics(
+        "s8_modelfree_confusion_matrix",
+        json!({
+            "record": "s8_modelfree_confusion_matrix",
+            "min_identifiability_z": MIN_IDENTIFIABILITY_Z,
+            "configs": summary.iter().map(|(l, pr, lg)| json!({
+                "fields": l,
+                "principled_confusion": pr,
+                "legacy_confusion": lg,
+                "principled_accuracy": acc(pr),
+                "legacy_accuracy": acc(lg),
+                "principled_spurious_m5_rate": spurious_m5_rate(pr),
+                "legacy_spurious_m5_rate": spurious_m5_rate(lg),
+                "principled_m5_recall": m5_recall(pr),
+                "legacy_m5_recall": m5_recall(lg),
+            })).collect::<Vec<_>>(),
+        }),
     );
 }

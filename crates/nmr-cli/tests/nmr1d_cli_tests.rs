@@ -1,5 +1,5 @@
-//! End-to-end CLI integration tests for `nmrassign nmr1d process`, `nmrassign nmr1d multiplet`,
-//! and `nmrassign nmr1d qnmr` (`T14.1`–`T14.2`).
+//! End-to-end CLI integration tests for `ferric nmr1d process`, `ferric nmr1d multiplet`,
+//! and `ferric nmr1d qnmr` (`T14.1`–`T14.2`).
 //!
 //! # Clean-Room Provenance & Literature Citations
 //! - Bartholdi, E. & Ernst, R. R. (*J. Magn. Reson.* **1973**, 11, 9–19).
@@ -866,13 +866,13 @@ fn cli_f15_adversarial_1d_ingest_error_paths() {
 fn cli_f29_nmr1d_process_c13_dss_ref_and_jeol_jdf_ingest() {
     let tmp = ScopedTempDir::new("f29_c13_jdf");
 
-    // 1. Verify `--c13-ref dss` shifts TMS-referenced 13C peaks by +2.371 ppm onto BMRB DSS scale
+    // 1. Verify `--c13-ref dss` shifts TMS-referenced 13C peaks by exact IUPAC Xi +2.665 ppm onto BMRB DSS scale (`20.W1:P0-2`)
     let lines_c13 = [
         SyntheticLine1D::lorentzian(96.568, 10.0, 1.5),
         SyntheticLine1D::lorentzian(15.853, 12.0, 1.8),
     ];
     let td_c13 = synthesize_fid_1d(
-        "fucose_13c",
+        "sample_13c",
         Experiment1DKind::Carbon13Decoupled,
         4096,
         22_000.0,
@@ -907,6 +907,10 @@ fn cli_f29_nmr1d_process_c13_dss_ref_and_jeol_jdf_ingest() {
     );
     let rep: Value = serde_json::from_str(&fs::read_to_string(&c13_sum).unwrap()).unwrap();
     assert_eq!(rep["c13_reference_standard"].as_str(), Some("dss"));
+    let applied_ref = rep["applied_reference_shift_ppm"]
+        .as_f64()
+        .expect("applied_reference_shift_ppm present");
+    assert!((applied_ref - 2.6648).abs() < 0.005);
     let mut pks: Vec<&Value> = rep["picked_peaks"].as_array().unwrap().iter().collect();
     pks.sort_by(|a, b| {
         b["height"]
@@ -919,8 +923,8 @@ fn cli_f29_nmr1d_process_c13_dss_ref_and_jeol_jdf_ingest() {
         pks[1]["ppm"].as_f64().unwrap(),
     ];
     top2_ppms.sort_by(|a, b| b.total_cmp(a));
-    assert!((top2_ppms[0] - 98.939).abs() < 0.02);
-    assert!((top2_ppms[1] - 18.224).abs() < 0.02);
+    assert!((top2_ppms[0] - (96.568 + 2.6648)).abs() < 0.02);
+    assert!((top2_ppms[1] - (15.853 + 2.6646)).abs() < 0.02);
 
     // 2. Verify CLI `nmr1d process` ingests `.jdf` cleanly and rejects corrupted `.jdf` without panic
     let mut jdf = vec![0u8; 1296 + 256 * 16];
@@ -997,4 +1001,197 @@ fn cli_f29_nmr1d_process_c13_dss_ref_and_jeol_jdf_ingest() {
         .unwrap();
     assert!(!bad_out.status.success());
     assert!(!String::from_utf8_lossy(&bad_out.stderr).contains("panicked at"));
+
+    // Real public JEOL Delta `.jdf` (`rutin_q1h_400mhz_dmsod6.jdf`, `20.W1:P2-2`) end-to-end CLI check
+    let real_jdf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../data/fixtures/jeol_public/rutin_q1h_400mhz_dmsod6.jdf");
+    let real_out = tmp.path.join("rutin_out.tsv");
+    let real_sum = tmp.path.join("rutin_sum.json");
+    let res_real = Command::new(nmrassign_bin())
+        .args([
+            "nmr1d",
+            "process",
+            "--in",
+            real_jdf.to_str().unwrap(),
+            "--out",
+            real_out.to_str().unwrap(),
+            "--auto-phase",
+            "--baseline",
+            "whittaker",
+            "--json-out",
+            real_sum.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run nmr1d process on real public JEOL .jdf");
+    assert!(
+        res_real.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&res_real.stderr)
+    );
+    let rrep: Value = serde_json::from_str(&fs::read_to_string(&real_sum).unwrap()).unwrap();
+    assert!(rrep["applied_reference_shift_ppm"].as_f64().is_some());
+}
+
+#[test]
+fn cli_v0150_p1_3_shared_pipeline_fid_auto_ref_dept90_and_lineshape_guard() {
+    let tmp = ScopedTempDir::new("v0150_p1_3_cli");
+
+    // 1. Raw FID carrying `solvent = Some("CDCl3")` auto-calibrates via the shared 1D pipeline even
+    //    WITHOUT explicit `--calibrate-solvent`, recording `applied_reference_shift_ppm` in JSON & TSV!
+    let lines_cdcl3 = [
+        SyntheticLine1D::lorentzian(7.215, 10.0, 1.2), // uncalibrated CHCl3 (-0.045 ppm from 7.260)
+        SyntheticLine1D::lorentzian(3.655, 22.0, 1.3),
+    ];
+    let mut fid_cdcl3 = synthesize_fid_1d(
+        "auto_ref_fid",
+        Experiment1DKind::Proton1D,
+        4096,
+        6000.0,
+        500.0,
+        4.70,
+        &lines_cdcl3,
+    );
+    fid_cdcl3.solvent = Some("CDCl3".to_string());
+    let fid_in = tmp.path.join("cdcl3_fid.json");
+    fs::write(&fid_in, serde_json::to_string(&fid_cdcl3).unwrap()).unwrap();
+    let fid_out = tmp.path.join("cdcl3_out.tsv");
+    let fid_sum = tmp.path.join("cdcl3_sum.json");
+    let res = Command::new(nmrassign_bin())
+        .args([
+            "nmr1d",
+            "process",
+            "--in",
+            fid_in.to_str().unwrap(),
+            "--out",
+            fid_out.to_str().unwrap(),
+            "--json-out",
+            fid_sum.to_str().unwrap(),
+        ])
+        .output()
+        .expect("nmr1d process auto-ref on FID");
+    assert!(
+        res.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let rep: Value = serde_json::from_str(&fs::read_to_string(&fid_sum).unwrap()).unwrap();
+    let shift = rep["applied_reference_shift_ppm"]
+        .as_f64()
+        .expect("applied_reference_shift_ppm recorded by CLI");
+    assert!((shift - 0.045).abs() < 0.004, "got shift={shift}");
+    let tsv_hdr = fs::read_to_string(&fid_out)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(tsv_hdr.contains("applied_reference_shift_ppm="));
+
+    // 2. Explicit `--calibrate-solvent CDCl3` fails closed (`!status.success()`) when only a sharp
+    //    solute J-doublet sits near 7.26 ppm (`v0150:P1-3` lineshape guard).
+    let dbl_lines = [
+        SyntheticLine1D::lorentzian(7.242, 14.0, 1.1),
+        SyntheticLine1D::lorentzian(7.258, 14.0, 1.1),
+    ];
+    let fid_dbl = synthesize_fid_1d(
+        "dbl_fid",
+        Experiment1DKind::Proton1D,
+        8192,
+        6000.0,
+        500.0,
+        4.70,
+        &dbl_lines,
+    );
+    let dbl_in = tmp.path.join("dbl_fid.json");
+    fs::write(&dbl_in, serde_json::to_string(&fid_dbl).unwrap()).unwrap();
+    let res_dbl = Command::new(nmrassign_bin())
+        .args([
+            "nmr1d",
+            "process",
+            "--in",
+            dbl_in.to_str().unwrap(),
+            "--out",
+            tmp.path.join("dbl_out.tsv").to_str().unwrap(),
+            "--calibrate-solvent",
+            "CDCl3",
+        ])
+        .output()
+        .expect("nmr1d process --calibrate-solvent on doublet");
+    assert!(
+        !res_dbl.status.success(),
+        "explicit --calibrate-solvent must fail closed on solute J-doublet"
+    );
+
+    // 3. `--dept90` disambiguates an inverted C-alpha (54 ppm CH) + PEG (66 ppm CH2) DEPT-135 (`20.W1:P1-2`).
+    let d135_lines = [
+        SyntheticLine1D {
+            ppm: 54.0,
+            amplitude: 1.2,
+            fwhm_hz: 1.8,
+            gauss_fwhm_hz: 0.0,
+            phase_deg: 150.0, // inverted (> 90 deg) without DEPT-90!
+        },
+        SyntheticLine1D {
+            ppm: 66.0,
+            amplitude: 1.6,
+            fwhm_hz: 1.8,
+            gauss_fwhm_hz: 0.0,
+            phase_deg: -30.0, // 180 deg opposite to CH
+        },
+    ];
+    let fid_135 = synthesize_fid_1d(
+        "d135",
+        Experiment1DKind::Dept135,
+        4096,
+        20_000.0,
+        125.76,
+        60.0,
+        &d135_lines,
+    );
+    let fid_90 = synthesize_fid_1d(
+        "d90",
+        Experiment1DKind::Dept90,
+        4096,
+        20_000.0,
+        125.76,
+        60.0,
+        &[SyntheticLine1D::lorentzian(54.0, 1.2, 1.8)],
+    );
+    let d135_in = tmp.path.join("d135.json");
+    let d90_in = tmp.path.join("d90.json");
+    let d135_out = tmp.path.join("d135_phased.json");
+    let d135_sum = tmp.path.join("d135_sum.json");
+    fs::write(&d135_in, serde_json::to_string(&fid_135).unwrap()).unwrap();
+    fs::write(&d90_in, serde_json::to_string(&fid_90).unwrap()).unwrap();
+    let res_d135 = Command::new(nmrassign_bin())
+        .args([
+            "nmr1d",
+            "process",
+            "--in",
+            d135_in.to_str().unwrap(),
+            "--out",
+            d135_out.to_str().unwrap(),
+            "--auto-phase",
+            "--dept90",
+            d90_in.to_str().unwrap(),
+            "--json-out",
+            d135_sum.to_str().unwrap(),
+        ])
+        .output()
+        .expect("nmr1d process --dept90");
+    assert!(
+        res_d135.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&res_d135.stderr)
+    );
+    let drep: Value = serde_json::from_str(&fs::read_to_string(&d135_sum).unwrap()).unwrap();
+    assert_eq!(
+        drep["auto_phase"]["polarity_resolution"].as_str(),
+        Some("MultiplicityReference")
+    );
+    let sp_phased: nmr_core::nmr1d::Spectrum1D =
+        serde_json::from_str(&fs::read_to_string(&d135_out).unwrap()).unwrap();
+    let idx_54 = sp_phased.axis.ppm_to_index(54.0).round() as usize;
+    let idx_66 = sp_phased.axis.ppm_to_index(66.0).round() as usize;
+    assert!(sp_phased.real[idx_54] > 0.0 && sp_phased.real[idx_66] < 0.0);
 }
