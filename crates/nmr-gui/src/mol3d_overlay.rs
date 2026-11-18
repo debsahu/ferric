@@ -291,15 +291,14 @@ impl From<nmr_core::af_concordance::AfNmrConcordanceClass> for ConcordanceTrackC
             nmr_core::af_concordance::AfNmrConcordanceClass::ConcordantDisordered => {
                 Self::ConcordantDisordered
             }
-            nmr_core::af_concordance::AfNmrConcordanceClass::ConditionalFoldingOrCrystalArtifact => {
+            nmr_core::af_concordance::AfNmrConcordanceClass::ModelOrderedSolutionDisordered => {
                 Self::ConditionalFoldingOrCrystalArtifact
             }
             nmr_core::af_concordance::AfNmrConcordanceClass::DynamicHingeOrAltState => {
                 Self::DynamicHingeOrAltState
             }
+            nmr_core::af_concordance::AfNmrConcordanceClass::Indeterminate => Self::Indeterminate,
             nmr_core::af_concordance::AfNmrConcordanceClass::UnassignedNmr => Self::UnassignedNmr,
-            #[allow(unreachable_patterns)]
-            _ => Self::Indeterminate,
         }
     }
 }
@@ -311,12 +310,11 @@ impl From<ConcordanceTrackClass> for nmr_core::af_concordance::AfNmrConcordanceC
             ConcordanceTrackClass::ConcordantOrdered => Self::ConcordantOrdered,
             ConcordanceTrackClass::ConcordantDisordered => Self::ConcordantDisordered,
             ConcordanceTrackClass::ConditionalFoldingOrCrystalArtifact => {
-                Self::ConditionalFoldingOrCrystalArtifact
+                Self::ModelOrderedSolutionDisordered
             }
             ConcordanceTrackClass::DynamicHingeOrAltState => Self::DynamicHingeOrAltState,
-            ConcordanceTrackClass::Indeterminate | ConcordanceTrackClass::UnassignedNmr => {
-                Self::UnassignedNmr
-            }
+            ConcordanceTrackClass::Indeterminate => Self::Indeterminate,
+            ConcordanceTrackClass::UnassignedNmr => Self::UnassignedNmr,
         }
     }
 }

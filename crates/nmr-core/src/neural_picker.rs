@@ -2157,7 +2157,7 @@ pub fn train_weights_2d(cfg: &TrainerConfig) -> (SeparableConvNet2D, f64, f64) {
                 let p_seed = cfg
                     .seed
                     .wrapping_mul(6364136223846793005)
-                    .wrapping_add(((step * 16 + b) as u64) * 1442695040888963407);
+                    .wrapping_add(((step * 16 + b) as u64).wrapping_mul(1442695040888963407));
                 handles.push(s.spawn(move || {
                     let syn = generate_synthetic_spectrum_2d(&SyntheticGenConfig2D {
                         nx,
@@ -2298,7 +2298,7 @@ pub fn train_weights_3d(cfg: &TrainerConfig) -> (SeparableConvNet3D, f64, f64) {
                 let p_seed = cfg
                     .seed
                     .wrapping_mul(2862933555777941757)
-                    .wrapping_add(((step * 16 + b) as u64) * 3037000493);
+                    .wrapping_add(((step * 16 + b) as u64).wrapping_mul(3037000493));
                 handles.push(s.spawn(move || {
                     let syn = generate_synthetic_spectrum_3d(&SyntheticGenConfig3D {
                         nx,

@@ -1762,7 +1762,7 @@ fn build_core_tour_state(module: TourModuleId, seed: u64) -> Result<CoreTourStat
 
 fn build_m01_state(_seed: u64) -> Result<CoreTourState, String> {
     // 1. Real Bruker pulseprogram AST & quad detection via `nmr_core::pulprog`
-    let acqus = "##TITLE= Bruker 3D HNCACB\n##$AQSEQ= 1\n##$NUC1= <1H>\n##$SFO1= 600.13\n##$SW= 14.0\n##$TD= 2048\n##$DSPFVS= 20\n##$DECIM= 24\n##$ZGOPTNS= <-DLABEL_CN -DNUS>\n";
+    let acqus = "##TITLE= Bruker 3D HNCACB\n##$PULPROG= <hncacbgpwg3d>\n##$AQSEQ= 1\n##$NUC1= <1H>\n##$SFO1= 600.13\n##$SW= 14.0\n##$TD= 2048\n##$DSPFVS= 20\n##$DECIM= 24\n##$ZGOPTNS= <-DLABEL_CN -DNUS>\n";
     let acqu2s = "##$NUC1= <15N>\n##$SFO1= 60.81\n##$SW= 32.0\n##$TD= 64\n##$FnMODE= 6\n";
     let acqu3s = "##$NUC1= <13C>\n##$SFO1= 150.90\n##$SW= 64.0\n##$TD= 96\n##$FnMODE= 5\n";
     let pulprog_src = "\

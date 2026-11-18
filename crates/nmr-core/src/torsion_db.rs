@@ -1379,7 +1379,7 @@ pub fn tm_score_ca(query_ca: &[[f64; 3]], template_ca: &[[f64; 3]]) -> f64 {
         }
 
         let mut win_specs: Vec<(usize, usize)> = vec![(0, len)];
-        let w_len = (l_norm / 2).clamp(8, len);
+        let w_len = (l_norm / 2).max(8).min(len);
         if w_len < len {
             win_specs.push((0, w_len));
             win_specs.push(((len - w_len) / 2, w_len));

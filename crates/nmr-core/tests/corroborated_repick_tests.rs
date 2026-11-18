@@ -60,7 +60,8 @@ fn make_test_cube(
     let axis_y = AxisPpm::from_bounds("15N", ny, 130.0, 106.0, 60.81);
     let axis_z = AxisPpm::from_bounds("13C", nz, c_hi, c_lo, 150.90);
     let mut data = vec![0.0f32; nx * ny * nz];
-    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ (exp.len() as u64 * 0x517C_C1B7_2722_0A95);
+    let mut state =
+        0x9E37_79B9_7F4A_7C15u64 ^ (exp.len() as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
     for v in &mut data {
         state = state
             .wrapping_mul(6364136223846793005)

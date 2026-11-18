@@ -1745,13 +1745,36 @@ fn p1_10_11_p2_schema_hygiene_smiles_bonded_yaml_af3_chains_noncanonical_aa_five
     }
 
     // Score a probe proton 3.0 A above a 1-nitrogen pyrrole (`Trp`-like, `0.90`) vs 2-nitrogen imidazole (`His`-like, `0.43`)
-    let probe_pdb = "\
-ATOM      1  N   ALA A   1       0.000   0.000   3.800  1.00 90.00           N
-ATOM      2  H   ALA A   1       0.000   0.000   2.800  1.00 90.00           H
-ATOM      3  CA  ALA A   1       1.200   0.000   4.500  1.00 90.00           C
-ATOM      4  C   ALA A   1       1.200   1.400   5.000  1.00 90.00           C
-ATOM      5  O   ALA A   1       0.200   2.100   5.000  1.00 90.00           O
-";
+    // (`>= 8` CA atoms in `probe_pdb` to satisfy `21.W1:P1-4` Layer 4 `TM-score` firewall)
+    let mut probe_pdb = String::from(
+        "ATOM      1  N   ALA A   1       0.000   0.000   3.800  1.00 90.00           N\n\
+         ATOM      2  H   ALA A   1       0.000   0.000   2.800  1.00 90.00           H\n\
+         ATOM      3  CA  ALA A   1       1.200   0.000   4.500  1.00 90.00           C\n\
+         ATOM      4  C   ALA A   1       1.200   1.400   5.000  1.00 90.00           C\n\
+         ATOM      5  O   ALA A   1       0.200   2.100   5.000  1.00 90.00           O\n",
+    );
+    for r in 2..=8 {
+        let z = 4.5 + (r as f64 - 1.0) * 3.8;
+        let base_serial = (r - 1) * 5;
+        probe_pdb.push_str(&format!(
+            "ATOM   {:4}  N   ALA A {:3}       1.200   1.800 {:7.3}  1.00 90.00           N\n\
+             ATOM   {:4}  CA  ALA A {:3}       1.800   0.600 {:7.3}  1.00 90.00           C\n\
+             ATOM   {:4}  C   ALA A {:3}       1.200  -0.600 {:7.3}  1.00 90.00           C\n\
+             ATOM   {:4}  O   ALA A {:3}       0.100  -0.600 {:7.3}  1.00 90.00           O\n",
+            base_serial + 1,
+            r,
+            z - 1.2,
+            base_serial + 2,
+            r,
+            z,
+            base_serial + 3,
+            r,
+            z + 1.2,
+            base_serial + 4,
+            r,
+            z + 1.2,
+        ));
+    }
     let (_, pyrrole_mol) = ligand_spec_from_octet_str("c1cc[nH]c1", Some("smi")).unwrap();
     let (_, imidaz_mol) = ligand_spec_from_octet_str("c1c[nH]cn1", Some("smi")).unwrap();
     let ring_coords = [
@@ -1761,23 +1784,23 @@ ATOM      5  O   ALA A   1       0.200   2.100   5.000  1.00 90.00           O
         ("N4", "N", -0.93, -0.68),
         ("C5", "C", 0.36, -1.09),
     ];
-    let mut pyr_pose = String::from(probe_pdb);
+    let mut pyr_pose = probe_pdb.clone();
     for (idx, &(an, el, x, y)) in ring_coords.iter().enumerate() {
         pyr_pose.push_str(&format!(
             "HETATM {:4} {:<4} LIG L   1    {:8.3}{:8.3}   0.000  1.00 90.00          {:>2}\n",
-            10 + idx,
+            100 + idx,
             an,
             x,
             y,
             el
         ));
     }
-    let mut imi_pose = String::from(probe_pdb);
+    let mut imi_pose = probe_pdb.clone();
     for (idx, &(an, el, x, y)) in ring_coords.iter().enumerate() {
         let (an2, el2) = if idx == 1 { ("N2", "N") } else { (an, el) };
         imi_pose.push_str(&format!(
             "HETATM {:4} {:<4} LIG L   1    {:8.3}{:8.3}   0.000  1.00 90.00          {:>2}\n",
-            10 + idx,
+            100 + idx,
             an2,
             x,
             y,
@@ -1792,7 +1815,7 @@ ATOM      5  O   ALA A   1       0.200   2.100   5.000  1.00 90.00           O
                 entities: vec![CofoldEntitySpec::Polymer {
                     kind: CofoldPolymerKind::Protein,
                     chain_id: "A".to_string(),
-                    sequence: "A".to_string(),
+                    sequence: "AAAAAAAA".to_string(),
                 }],
                 ligand_molecules: lm,
                 receptor_chain_id: Some("A".to_string()),
@@ -1808,7 +1831,7 @@ ATOM      5  O   ALA A   1       0.200   2.100   5.000  1.00 90.00           O
         .unwrap()
     };
     let fwd_cfg = PoseScoreConfig {
-        apo_receptor_coord_text: Some(probe_pdb.to_string()),
+        apo_receptor_coord_text: Some(probe_pdb),
         apo_receptor_format_hint: Some("pdb".to_string()),
         csp_scoring_mode: CspScoringMode::FullForwardShiftAndBurial,
         ..PoseScoreConfig::default()

@@ -2465,13 +2465,12 @@ fn concordance_class_color(cls: AfNmrConcordanceClass) -> egui::Color32 {
     match cls {
         AfNmrConcordanceClass::ConcordantOrdered => egui::Color32::from_rgb(0x16, 0xA3, 0x4A),
         AfNmrConcordanceClass::ConcordantDisordered => egui::Color32::from_rgb(0x64, 0x74, 0x8B),
-        AfNmrConcordanceClass::ConditionalFoldingOrCrystalArtifact => {
+        AfNmrConcordanceClass::ModelOrderedSolutionDisordered => {
             egui::Color32::from_rgb(0xD9, 0x77, 0x06)
         }
         AfNmrConcordanceClass::DynamicHingeOrAltState => egui::Color32::from_rgb(0xDC, 0x26, 0x26),
+        AfNmrConcordanceClass::Indeterminate => egui::Color32::from_rgb(100, 116, 139),
         AfNmrConcordanceClass::UnassignedNmr => egui::Color32::from_rgb(148, 163, 184),
-        #[allow(unreachable_patterns)]
-        _ => egui::Color32::from_rgb(148, 163, 184),
     }
 }
 

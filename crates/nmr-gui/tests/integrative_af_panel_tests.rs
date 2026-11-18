@@ -285,13 +285,13 @@ fn test_headless_cofold_tab_and_excited_state_bic_parity_interaction() {
     panel.structure_input_buf =
         include_str!("../../../data/fixtures/ubiquitin_1ubq_xray.pdb").to_string();
     panel.exchange_tsv_buf = "chain_id\tseq_id\tres_name\tatom\tdw_ppm\tdw_err_ppm\tsign_mode\n\
-                              A\t19\tPRO\tCB\t2.40\t0.25\tsigned\n\
-                              A\t19\tPRO\tCG\t-2.60\t0.25\tsigned\n\
-                              A\t19\tPRO\tCA\t-0.55\t0.25\tsigned\n\
-                              A\t18\tGLU\tCA\t1.15\t0.25\tunsigned\n\
-                              A\t18\tGLU\tC\t1.35\t0.28\tunsigned\n\
-                              A\t17\tVAL\tCA\t-0.20\t0.35\tsigned\n\
-                              A\t20\tSER\tCA\t-0.18\t0.35\tsigned\n"
+                              A\t19\tPRO\tCB\t2.40\t0.10\tsigned\n\
+                              A\t19\tPRO\tCG\t-2.60\t0.10\tsigned\n\
+                              A\t19\tPRO\tCA\t-0.55\t0.10\tsigned\n\
+                              A\t18\tGLU\tCA\t1.15\t0.10\tunsigned\n\
+                              A\t18\tGLU\tC\t1.35\t0.10\tunsigned\n\
+                              A\t20\tSER\tN\t-1.82\t0.12\tsigned\n\
+                              A\t21\tASP\tN\t0.48\t0.10\tunsigned\n"
         .to_string();
     let live_rep = panel
         .evaluate_excited_state_from_buffers(None)
