@@ -2908,6 +2908,8 @@ pub struct Stack1dState {
     pub pending_undo: Vec<Stack1dUndoSnapshot>,
     /// Label rects (peak + integral) placed during the last rendered frame (`UI-B4`).
     pub last_label_rects: Vec<egui::Rect>,
+    /// Strict inner 1D plot canvas rectangle from the most recent frame (`UI-B6`).
+    pub last_plot_rect: Option<egui::Rect>,
     /// Compact "Go to ppm" input buffer in the cursor readout bar (`UI-C11`).
     pub goto_ppm_input: String,
     last_peak_pick_click: Option<(f64, egui::Pos2, Stack1dUndoSnapshot)>,
@@ -3034,6 +3036,7 @@ impl Default for Stack1dState {
             water_undo: KeyedSnapshotStack::default(),
             pending_undo: Vec::new(),
             last_label_rects: Vec::new(),
+            last_plot_rect: None,
             goto_ppm_input: String::new(),
             last_peak_pick_click: None,
             show_params_card: false,
@@ -4907,118 +4910,281 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
         state.tool_mode = ToolMode1d::IntegrateRoi;
     }
 
-    // 1. Standalone compact 1-line bar (hidden completely when embedded inside the Multi-Page Workbook!)
-    // Zero duplicate "Open Folder"/"Open Files" (`UI-B8`) and presets tucked under "Advanced" (`<= 12` controls!).
-    if !in_workbook {
-        ui.horizontal_wrapped(|ui| {
-            ui.strong("1D NMR");
-            ui.menu_button("Advanced", |ui| {
-                ui.label(egui::RichText::new("View Mode").size(11.0).weak());
-                for mode in Stack1dViewMode::ALL {
+    let _ = in_workbook;
+
+    // 1. Single consolidated 1D Process toolbar (`<= 12` primary controls, `UI-B2`, `UI-B6`, `UI-B8`):
+    //    Tool selector + Auto-Phase + Baseline + Water + Pick Peaks + Full View + Inspector + Advanced
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+
+        egui::ComboBox::from_id_salt("stack1d_tool_mode_combo")
+            .selected_text(format!("Tool: {}", state.tool_mode.label()))
+            .width(142.0)
+            .show_ui(ui, |ui| {
+                for tm in ToolMode1d::ALL {
+                    let mut chosen = state.tool_mode;
                     if ui
-                        .selectable_value(&mut state.view_mode, mode, mode.label())
-                        .changed()
-                        && mode != Stack1dViewMode::SuperimposedOverlay
+                        .selectable_value(&mut chosen, tm, tm.label())
+                        .on_hover_text(tm.tooltip())
+                        .clicked()
                     {
-                        state.selected_inspector_tab = InspectorTab1d::MultiTraceStack;
-                        state.show_1d_analysis_drawer = true;
-                        ui.close();
+                        state.select_tool_mode(chosen);
                     }
-                }
-                ui.separator();
-                if ui.button("1H Showcase").clicked() {
-                    let tr = build_clean_1h_showcase_trace();
-                    state.traces = vec![tr];
-                    state.roi_regions.clear();
-                    state.ref_trace_idx = 0;
-                    state.view_mode = Stack1dViewMode::SuperimposedOverlay;
-                    state.target_total_protons = 12.0;
-                    state.zoom_history.clear();
-                    state.zoom_redo_stack.clear();
-                    state.fit_full_ppm_bounds();
-                    state.refresh_active_trace_peaks_and_multiplets();
-                    state.status_message =
-                        "Loaded 600 MHz Ethyl 2-acetoxybenzoate 1H showcase spectrum.".to_string();
-                    ui.close();
-                }
-                if ui.button("Kinetics Sample").clicked() {
-                    let (traces, rois) = build_kinetics_demo_traces();
-                    state.traces = traces;
-                    state.roi_regions = rois;
-                    state.covariate_kind = CovariateKind::TimeMinutes;
-                    state.ref_trace_idx = 0;
-                    state.zoom_history.clear();
-                    state.zoom_redo_stack.clear();
-                    state.fit_full_ppm_bounds();
-                    state.refresh_active_trace_peaks_and_multiplets();
-                    state.status_message = "Loaded 8-trace reaction kinetics 1D array.".to_string();
-                    ui.close();
-                }
-                if ui.button("STD Sample").clicked() {
-                    let (traces, rois) = build_std_difference_demo_traces();
-                    state.traces = traces;
-                    state.roi_regions = rois;
-                    state.covariate_kind = CovariateKind::TimeSeconds;
-                    state.ref_trace_idx = 0;
-                    state.view_mode = Stack1dViewMode::DifferenceSpectrum;
-                    state.selected_inspector_tab = InspectorTab1d::MultiTraceStack;
-                    state.diff_ref_ppm_min = 1.05;
-                    state.diff_ref_ppm_max = 1.35;
-                    state.diff_alpha_mode = DifferenceAlphaMode::LeastSquaresRegion {
-                        ppm_min: 1.05,
-                        ppm_max: 1.35,
-                        fit_intercept: false,
-                    };
-                    state.zoom_history.clear();
-                    state.zoom_redo_stack.clear();
-                    state.fit_full_ppm_bounds();
-                    state.y_gain = 3.2;
-                    state.refresh_active_trace_peaks_and_multiplets();
-                    state.status_message =
-                        "Loaded 5-trace STD-NMR difference array (OLS α matched on [1.05, 1.35] ppm)."
-                            .to_string();
-                    ui.close();
-                }
-                if !state.traces.is_empty() {
-                    ui.separator();
-                    if ui.button("Copy SVG").clicked() {
-                        let svg = export_stack1d_svg(state, 1200, 640);
-                        ui.ctx().copy_text(svg.clone());
-                        state.last_exported_svg = Some(svg);
-                        state.status_message =
-                            "Copied 1200x640 vector SVG to clipboard.".to_string();
-                        ui.close();
-                    }
-                    if state.traces.len() >= 3 && ui.button("Send to Metabolomics").clicked() {
-                        state.pending_send_to_metabolomics = true;
-                        ui.close();
-                    }
-                    if ui.button("Clear Traces").clicked() {
-                        state.traces.clear();
-                        state.roi_regions.clear();
-                        state.picked_peaks.clear();
-                        state.detected_multiplets.clear();
-                        state.detected_multiplet_integrals.clear();
-                        state.formatted_journal_report.clear();
-                        state.zoom_history.clear();
-                        state.zoom_redo_stack.clear();
-                        state.zoom_anchor_ppm = None;
-                        state.status_message = "Cleared 1D traces.".to_string();
-                        ui.close();
-                    }
-                }
-                let theme_lbl = if paper_white {
-                    "Dark Theme"
-                } else {
-                    "Paper Theme"
-                };
-                if ui.button(theme_lbl).clicked() {
-                    state.paper_white_override = Some(!paper_white);
-                    ui.close();
                 }
             });
+
+        if ui
+            .button(egui::RichText::new("Auto-Phase").size(12.5))
+            .on_hover_text("Auto-phase active 1D trace")
+            .clicked()
+        {
+            state.auto_phase_active_trace();
+        }
+        if ui
+            .button(egui::RichText::new("Baseline").size(12.5))
+            .on_hover_text("Apply baseline correction to active 1D trace")
+            .clicked()
+        {
+            state.baseline_correct_active_trace();
+        }
+        let water_lbl = if state.has_water_undo_active() {
+            "Undo Water"
+        } else {
+            "Water"
+        };
+        if ui
+            .button(egui::RichText::new(water_lbl).size(12.5))
+            .on_hover_text("Suppress residual H2O / HDO resonance (ws) or restore (wu)")
+            .clicked()
+        {
+            if state.has_water_undo_active() {
+                let _ = state.undo_water_suppression_active_trace();
+            } else {
+                state.pending_water_suppress_1d = true;
+            }
+        }
+        if ui
+            .button(egui::RichText::new("Pick Peaks").size(12.5))
+            .on_hover_text("Auto-pick peaks and coupled multiplets on active 1D trace")
+            .clicked()
+        {
+            state.refresh_active_trace_peaks_and_multiplets();
+        }
+        if ui
+            .button(egui::RichText::new("Full View").size(12.5))
+            .on_hover_text("Reset chemical-shift bounds and vertical gain = 1x (zf)")
+            .clicked()
+        {
+            state.reset_full_view();
+        }
+
+        let insp_summary = if !state.show_1d_analysis_drawer {
+            format!("Table ({} pk)", state.picked_peaks.len())
+        } else {
+            match state.selected_inspector_tab {
+                InspectorTab1d::Peaks => format!("Table: Peaks ({})", state.picked_peaks.len()),
+                InspectorTab1d::Multiplets => {
+                    format!("Table: Multiplets ({})", state.detected_multiplets.len())
+                }
+                InspectorTab1d::Integrals => {
+                    format!("Table: Integrals ({})", state.roi_regions.len())
+                }
+                InspectorTab1d::PhaseBaseline => "Table: Processing".to_string(),
+                InspectorTab1d::MultiTraceStack => {
+                    format!("Table: Stack ({})", state.traces.len())
+                }
+            }
+        };
+        egui::ComboBox::from_id_salt("stack1d_inspector_combo")
+            .selected_text(insp_summary)
+            .width(148.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(!state.show_1d_analysis_drawer, "Hidden")
+                    .clicked()
+                {
+                    state.show_1d_analysis_drawer = false;
+                }
+                ui.separator();
+                let pk_lbl = format!("Peaks ({})", state.picked_peaks.len());
+                let mp_lbl = format!("Multiplets ({})", state.detected_multiplets.len());
+                let in_lbl = format!("Integrals ({})", state.roi_regions.len());
+                let st_lbl = format!("Stack ({})", state.traces.len());
+                for (tab, label) in [
+                    (InspectorTab1d::Peaks, pk_lbl.as_str()),
+                    (InspectorTab1d::Multiplets, mp_lbl.as_str()),
+                    (InspectorTab1d::Integrals, in_lbl.as_str()),
+                    (InspectorTab1d::PhaseBaseline, "Processing"),
+                    (InspectorTab1d::MultiTraceStack, st_lbl.as_str()),
+                ] {
+                    if ui
+                        .selectable_label(
+                            state.show_1d_analysis_drawer && state.selected_inspector_tab == tab,
+                            label,
+                        )
+                        .clicked()
+                    {
+                        state.selected_inspector_tab = tab;
+                        state.show_1d_analysis_drawer = true;
+                    }
+                }
+            });
+
+        ui.menu_button(egui::RichText::new("Advanced").size(12.5), |ui| {
+            ui.set_min_width(220.0);
+            if ui.button("Fit Y to Window").clicked() {
+                state.fit_y_to_visible_window();
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    !state.zoom_history.is_empty(),
+                    egui::Button::new("Undo Zoom (zp)"),
+                )
+                .clicked()
+            {
+                state.undo_zoom();
+                ui.close();
+            }
+            ui.checkbox(&mut state.show_params_card, "Acquisition Params Card");
+            ui.checkbox(&mut state.show_journal_card, "Journal Multiplet Card");
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Go to ppm:").size(11.0));
+                let go_resp = ui.add(
+                    egui::TextEdit::singleline(&mut state.goto_ppm_input)
+                        .hint_text("ppm")
+                        .desired_width(68.0),
+                );
+                let enter = go_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.small_button("Go").clicked() || enter {
+                    if let Ok(target_ppm) = state.goto_ppm_input.trim().parse::<f64>() {
+                        state.recenter_to_ppm(target_ppm);
+                        ui.close();
+                    }
+                }
+            });
+            ui.separator();
+            ui.label(egui::RichText::new("View Mode").size(11.0).weak());
+            for mode in Stack1dViewMode::ALL {
+                if ui
+                    .selectable_value(&mut state.view_mode, mode, mode.label())
+                    .changed()
+                    && mode != Stack1dViewMode::SuperimposedOverlay
+                {
+                    state.selected_inspector_tab = InspectorTab1d::MultiTraceStack;
+                    state.show_1d_analysis_drawer = true;
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("1H Showcase").clicked() {
+                let tr = build_clean_1h_showcase_trace();
+                state.traces = vec![tr];
+                state.roi_regions.clear();
+                state.ref_trace_idx = 0;
+                state.view_mode = Stack1dViewMode::SuperimposedOverlay;
+                state.target_total_protons = 12.0;
+                state.zoom_history.clear();
+                state.zoom_redo_stack.clear();
+                state.fit_full_ppm_bounds();
+                state.refresh_active_trace_peaks_and_multiplets();
+                state.status_message =
+                    "Loaded 600 MHz Ethyl 2-acetoxybenzoate 1H showcase spectrum.".to_string();
+                ui.close();
+            }
+            if ui.button("Kinetics Sample").clicked() {
+                let (traces, rois) = build_kinetics_demo_traces();
+                state.traces = traces;
+                state.roi_regions = rois;
+                state.covariate_kind = CovariateKind::TimeMinutes;
+                state.ref_trace_idx = 0;
+                state.zoom_history.clear();
+                state.zoom_redo_stack.clear();
+                state.fit_full_ppm_bounds();
+                state.refresh_active_trace_peaks_and_multiplets();
+                state.status_message = "Loaded 8-trace reaction kinetics 1D array.".to_string();
+                ui.close();
+            }
+            if ui.button("STD Sample").clicked() {
+                let (traces, rois) = build_std_difference_demo_traces();
+                state.traces = traces;
+                state.roi_regions = rois;
+                state.covariate_kind = CovariateKind::TimeSeconds;
+                state.ref_trace_idx = 0;
+                state.view_mode = Stack1dViewMode::DifferenceSpectrum;
+                state.selected_inspector_tab = InspectorTab1d::MultiTraceStack;
+                state.diff_ref_ppm_min = 1.05;
+                state.diff_ref_ppm_max = 1.35;
+                state.diff_alpha_mode = DifferenceAlphaMode::LeastSquaresRegion {
+                    ppm_min: 1.05,
+                    ppm_max: 1.35,
+                    fit_intercept: false,
+                };
+                state.zoom_history.clear();
+                state.zoom_redo_stack.clear();
+                state.fit_full_ppm_bounds();
+                state.y_gain = 3.2;
+                state.refresh_active_trace_peaks_and_multiplets();
+                state.status_message =
+                    "Loaded 5-trace STD-NMR difference array (OLS α matched on [1.05, 1.35] ppm)."
+                        .to_string();
+                ui.close();
+            }
+            if !state.traces.is_empty() {
+                ui.separator();
+                if ui.button("Copy SVG").clicked() {
+                    let svg = export_stack1d_svg(state, 1200, 640);
+                    ui.ctx().copy_text(svg.clone());
+                    state.last_exported_svg = Some(svg);
+                    state.status_message = "Copied 1200x640 vector SVG to clipboard.".to_string();
+                    ui.close();
+                }
+                if state.traces.len() >= 3 && ui.button("Send to Metabolomics").clicked() {
+                    state.pending_send_to_metabolomics = true;
+                    ui.close();
+                }
+                if ui.button("Clear Traces").clicked() {
+                    state.traces.clear();
+                    state.roi_regions.clear();
+                    state.picked_peaks.clear();
+                    state.detected_multiplets.clear();
+                    state.detected_multiplet_integrals.clear();
+                    state.formatted_journal_report.clear();
+                    state.zoom_history.clear();
+                    state.zoom_redo_stack.clear();
+                    state.zoom_anchor_ppm = None;
+                    state.status_message = "Cleared 1D traces.".to_string();
+                    ui.close();
+                }
+            }
+            let theme_lbl = if paper_white {
+                "Dark Theme"
+            } else {
+                "Paper Theme"
+            };
+            if ui.button(theme_lbl).clicked() {
+                state.paper_white_override = Some(!paper_white);
+                ui.close();
+            }
         });
-    }
+
+        if let Some(c_ppm) = state.cursor_ppm {
+            let ref_i = state.safe_ref_trace_idx();
+            let obs_mhz = state.active_obs_mhz();
+            let val = state.traces[ref_i].sample_at_ppm(c_ppm);
+            let snr = val.abs() / state.estimated_noise_sigma.max(1e-12);
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!(
+                    "δ {c_ppm:.4} ppm | {:.1} Hz | I {val:.2e} | S/N {snr:.1}",
+                    c_ppm * obs_mhz
+                ))
+                .monospace()
+                .size(TYPE_CAPTION_PX),
+            );
+        }
+    });
 
     #[cfg(not(target_arch = "wasm32"))]
     if state.show_native_open_bar {
@@ -5049,6 +5215,7 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
     }
 
     if state.traces.is_empty() {
+        state.last_plot_rect = None;
         ui.add_space(10.0);
         ui.label(
             "No 1D spectra loaded. Drop a Bruker folder, .zip, .jdx, or .ucsf/.usf onto the window to begin.",
@@ -5116,92 +5283,14 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
         _ => {}
     }
 
-    // 2. Main Workstation Row: Slim 38 px Left Vertical Tool Rail + Full-Width 1D Spectrum Canvas
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        render_left_tool_rail_1d(ui, state, in_workbook, paper_white);
-        paint_interactive_1d_canvas(ui, state, paper_white);
-    });
-
-    // 3. Clean Collapsible 5-Tab Bottom Table (Zero Emojis)
-    ui.add_space(3.0);
-    ui.horizontal_wrapped(|ui| {
-        let pk_lbl = format!("Peaks ({})", state.picked_peaks.len());
-        let mp_lbl = format!("Multiplets ({})", state.detected_multiplets.len());
-        let in_lbl = format!("Integrals ({})", state.roi_regions.len());
-        let st_lbl = format!("Stack ({})", state.traces.len());
-        for (tab, label) in [
-            (InspectorTab1d::Peaks, pk_lbl.as_str()),
-            (InspectorTab1d::Multiplets, mp_lbl.as_str()),
-            (InspectorTab1d::Integrals, in_lbl.as_str()),
-            (InspectorTab1d::PhaseBaseline, "Processing"),
-            (InspectorTab1d::MultiTraceStack, st_lbl.as_str()),
-        ] {
-            if ui
-                .selectable_label(
-                    state.show_1d_analysis_drawer && state.selected_inspector_tab == tab,
-                    label,
-                )
-                .clicked()
-            {
-                if state.show_1d_analysis_drawer && state.selected_inspector_tab == tab {
-                    state.show_1d_analysis_drawer = false;
-                } else {
-                    state.selected_inspector_tab = tab;
-                    state.show_1d_analysis_drawer = true;
-                }
-            }
-        }
-        if let Some(c_ppm) = state.cursor_ppm {
-            let ref_i = state.safe_ref_trace_idx();
-            let obs_mhz = state.active_obs_mhz();
-            let val = state.traces[ref_i].sample_at_ppm(c_ppm);
-            let snr = val.abs() / state.estimated_noise_sigma.max(1e-12);
-            ui.separator();
-            ui.label(
-                egui::RichText::new(format!(
-                    "δ {c_ppm:.4} ppm | {:.1} Hz | I {val:.2e} | S/N {snr:.1}",
-                    c_ppm * obs_mhz
-                ))
-                .monospace()
-                .size(TYPE_CAPTION_PX),
-            );
-        } else if !state.status_message.is_empty() {
-            ui.separator();
-            ui.label(
-                egui::RichText::new(&state.status_message)
-                    .size(TYPE_CAPTION_PX)
-                    .color(egui::Color32::from_rgb(125, 211, 252)),
-            );
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let toggle_txt = if state.show_1d_analysis_drawer {
-                "Hide Table"
-            } else {
-                "Show Table"
-            };
-            if ui.small_button(toggle_txt).clicked() {
-                state.show_1d_analysis_drawer = !state.show_1d_analysis_drawer;
-            }
-            let go_clicked = ui.small_button("Go").clicked();
-            let go_resp = ui.add(
-                egui::TextEdit::singleline(&mut state.goto_ppm_input)
-                    .hint_text("Go to ppm")
-                    .desired_width(68.0),
-            );
-            let enter = go_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if go_clicked || enter {
-                if let Ok(target_ppm) = state.goto_ppm_input.trim().parse::<f64>() {
-                    state.recenter_to_ppm(target_ppm);
-                }
-            }
-        });
-    });
+    // 2. Full-width 1D Spectrum Canvas (`>= 65%` viewport area, zero side tool rail clutter)
+    paint_interactive_1d_canvas(ui, state, paper_white);
 
     if !state.show_1d_analysis_drawer {
         return;
     }
 
+    ui.add_space(3.0);
     egui::Frame::group(ui.style())
         .fill(egui::Color32::from_rgb(15, 21, 32))
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 58, 78)))
@@ -5213,147 +5302,6 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
             InspectorTab1d::PhaseBaseline => render_phase_baseline_inspector_tab(ui, state),
             InspectorTab1d::MultiTraceStack => render_multitrace_stack_inspector_tab(ui, state),
         });
-}
-
-fn rail_icon_btn(
-    ui: &mut egui::Ui,
-    icon: Icon1d,
-    active: bool,
-    enabled: bool,
-    tooltip: &str,
-) -> bool {
-    let size = egui::vec2(30.0, 25.0);
-    let sense = if enabled {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    let (rect, resp) = ui.allocate_exact_size(size, sense);
-    let hovered = enabled && resp.hovered();
-    let bg = if active {
-        egui::Color32::from_rgb(14, 116, 144)
-    } else if hovered {
-        egui::Color32::from_rgb(30, 41, 59)
-    } else {
-        egui::Color32::from_rgb(15, 23, 36)
-    };
-    let border = if active {
-        egui::Color32::from_rgb(56, 189, 248)
-    } else if hovered {
-        egui::Color32::from_rgb(100, 116, 139)
-    } else {
-        egui::Color32::from_rgb(38, 49, 66)
-    };
-    let fg = if !enabled {
-        egui::Color32::from_rgb(71, 85, 105)
-    } else if active {
-        egui::Color32::WHITE
-    } else {
-        egui::Color32::from_rgb(203, 213, 225)
-    };
-    ui.painter().rect(
-        rect,
-        4.0,
-        bg,
-        egui::Stroke::new(if active { 1.4 } else { 1.0 }, border),
-        egui::StrokeKind::Inside,
-    );
-    let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 15.0));
-    paint_1d_icon(ui.painter(), icon_rect, icon, fg);
-    resp.on_hover_text(tooltip).clicked() && enabled
-}
-
-fn render_left_tool_rail_1d(
-    ui: &mut egui::Ui,
-    state: &mut Stack1dState,
-    in_workbook: bool,
-    paper_white: bool,
-) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(38.0, 340.0),
-        egui::Layout::top_down(egui::Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.y = 3.0;
-            for tm in ToolMode1d::ALL {
-                if rail_icon_btn(ui, tm.icon(), state.tool_mode == tm, true, tm.tooltip()) {
-                    state.select_tool_mode(tm);
-                }
-            }
-            ui.add_space(3.0);
-            ui.separator();
-            ui.add_space(2.0);
-
-            if rail_icon_btn(
-                ui,
-                Icon1d::FullView,
-                false,
-                true,
-                "Full View (zf): Reset chemical-shift bounds and vertical gain = 1x",
-            ) {
-                state.reset_full_view();
-            }
-            if rail_icon_btn(
-                ui,
-                Icon1d::Undo,
-                false,
-                !state.zoom_history.is_empty(),
-                "Undo Zoom (zp): Return to previous horizontal zoom window",
-            ) {
-                state.undo_zoom();
-            }
-            if rail_icon_btn(
-                ui,
-                Icon1d::FitY,
-                false,
-                true,
-                "Fit Y: Auto-scale vertical peak height to ~75% of current window",
-            ) {
-                state.fit_y_to_visible_window();
-            }
-            if rail_icon_btn(
-                ui,
-                Icon1d::GainDouble,
-                false,
-                true,
-                "Increase vertical peak intensity (+)",
-            ) {
-                state.y_gain = (state.y_gain * 2.0).clamp(0.001, 100_000.0);
-            }
-            if rail_icon_btn(
-                ui,
-                Icon1d::GainHalf,
-                false,
-                true,
-                "Decrease vertical peak intensity (-)",
-            ) {
-                state.y_gain = (state.y_gain * 0.5).clamp(0.001, 100_000.0);
-            }
-            if rail_icon_btn(
-                ui,
-                Icon1d::WaterSuppress,
-                state.has_water_undo_active(),
-                !state.traces.is_empty(),
-                "Suppress Water Peak (ws): Attenuate residual H2O / HDO solvent resonance (click again or wu to undo)",
-            ) {
-                if state.has_water_undo_active() {
-                    let _ = state.undo_water_suppression_active_trace();
-                } else {
-                    state.pending_water_suppress_1d = true;
-                }
-            }
-            if !in_workbook
-                && rail_icon_btn(
-                    ui,
-                    Icon1d::ThemeToggle,
-                    paper_white,
-                    true,
-                    "Toggle Publication Paper White / Dark Oscilloscope canvas",
-                )
-            {
-                state.paper_white_override = Some(!paper_white);
-            }
-        },
-    );
 }
 
 fn render_peaks_inspector_tab(ui: &mut egui::Ui, state: &mut Stack1dState) {
@@ -6500,12 +6448,11 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState, pape
     state.last_label_rects.clear();
     let theme = CanvasTheme1d::new(paper_white);
     let avail_w = ui.available_width().max(280.0);
-    let target_frac = if state.show_1d_analysis_drawer {
-        0.64
+    let canvas_h = if state.show_1d_analysis_drawer {
+        (ui.available_height() * 0.64).clamp(360.0, 720.0)
     } else {
-        0.88
+        (ui.available_height() - 4.0).clamp(360.0, 1600.0)
     };
-    let canvas_h = (ui.available_height() * target_frac).clamp(360.0, 720.0);
     let (canvas_rect, resp) =
         ui.allocate_exact_size(egui::vec2(avail_w, canvas_h), egui::Sense::click_and_drag());
 
@@ -6523,6 +6470,7 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState, pape
             (canvas_rect.bottom() - bottom_reserve).max(canvas_rect.top() + pad_t + 80.0),
         ),
     );
+    state.last_plot_rect = Some(plot_rect);
     let minimap_rect = egui::Rect::from_min_max(
         egui::pos2(plot_rect.left(), canvas_rect.bottom() - minimap_h - 4.0),
         egui::pos2(plot_rect.right(), canvas_rect.bottom() - 4.0),
@@ -6650,19 +6598,12 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState, pape
                 }
             }
         }
+        let _ = space_pressed;
         if del_key
             || (back_key && state.selected_peak_idx.is_some() && state.zoom_anchor_ppm.is_none())
         {
             if let Some(sel) = state.selected_peak_idx {
                 let _ = state.delete_picked_peak(sel);
-            }
-        } else if resp.hovered() && space_pressed && state.tool_mode == ToolMode1d::Phase {
-            if let Some(c_ppm) = state.cursor_ppm {
-                state.phase_pivot_ppm = state.nearest_peak_or_apex_ppm(c_ppm, 0.08);
-                state.phase_pivot_mode = PivotMode1d::AtPpm;
-                state.apply_live_phase_to_active_trace();
-                state.status_message =
-                    format!("Set phase pivot to {:.4} ppm.", state.phase_pivot_ppm);
             }
         }
     }
@@ -6696,6 +6637,14 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState, pape
         );
         ui.separator();
         if state.tool_mode == ToolMode1d::Phase {
+            if ui.button("Set Phase Pivot Here").clicked() {
+                state.phase_pivot_ppm = state.nearest_peak_or_apex_ppm(target_ppm, 0.08);
+                state.phase_pivot_mode = PivotMode1d::AtPpm;
+                state.apply_live_phase_to_active_trace();
+                state.status_message =
+                    format!("Set phase pivot to {:.4} ppm.", state.phase_pivot_ppm);
+                ui.close();
+            }
             if ui.button("Auto-Phase").clicked() {
                 state.auto_phase_active_trace();
                 ui.close();
@@ -6802,24 +6751,29 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState, pape
         if canvas_rect.contains(hover_pos) {
             let (wheel_sy, smooth_sy, scroll_x, zoom_delta, shift_down, cmd_or_ctrl) =
                 ui.input(|i| {
-                    let wy: f32 = i
-                        .events
-                        .iter()
-                        .filter_map(|ev| match ev {
-                            egui::Event::MouseWheel { delta, .. } => Some(delta.y),
-                            _ => None,
-                        })
-                        .sum();
+                    let mut wy = 0.0f32;
+                    let mut esh = false;
+                    let mut ecm = false;
+                    for ev in &i.events {
+                        if let egui::Event::MouseWheel {
+                            delta, modifiers, ..
+                        } = ev
+                        {
+                            wy += delta.y;
+                            esh |= modifiers.shift;
+                            ecm |= modifiers.command || modifiers.ctrl;
+                        }
+                    }
                     (
                         wy,
                         i.smooth_scroll_delta.y,
                         i.smooth_scroll_delta.x,
                         i.zoom_delta(),
-                        i.modifiers.shift,
-                        i.modifiers.command || i.modifiers.ctrl,
+                        i.modifiers.shift || esh,
+                        i.modifiers.command || i.modifiers.ctrl || ecm,
                     )
                 });
-            let sy = if smooth_sy.abs() >= wheel_sy.abs() {
+            let sy = if smooth_sy.abs() >= (wheel_sy * 16.0).abs() {
                 smooth_sy
             } else {
                 wheel_sy * 16.0
@@ -6853,8 +6807,14 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState, pape
                     lo = state.view_ppm_min.min(state.view_ppm_max);
                     hi = state.view_ppm_min.max(state.view_ppm_max);
                 }
+            } else if shift_down && sy.abs() > 0.05 {
+                let d_ppm = (sy / plot_rect.width().max(1.0)) as f64 * (hi - lo);
+                lo += d_ppm;
+                hi += d_ppm;
+                state.view_ppm_min = lo;
+                state.view_ppm_max = hi;
             } else if sy.abs() > 0.05 {
-                state.apply_vertical_scroll_gain(sy, shift_down);
+                state.apply_vertical_scroll_gain(sy, false);
             }
 
             if scroll_x.abs() > 0.1 {
@@ -6881,78 +6841,56 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState, pape
     let mut overlay_btns: Vec<(egui::Rect, CanvasOverlayAction1d)> = Vec::new();
     let mut overlay_block_rects: Vec<egui::Rect> = Vec::new();
 
-    // A) Top-Right Acquisition Parameters Card geometry
-    let params_card_rect = if plot_rect.width() >= 480.0 {
-        if state.show_params_card {
-            let r = egui::Rect::from_min_size(
-                egui::pos2(plot_rect.right() - 210.0, plot_rect.top() + 6.0),
-                egui::vec2(204.0, 112.0),
-            );
-            let close_r = egui::Rect::from_min_size(
-                egui::pos2(r.right() - 18.0, r.top() + 3.0),
-                egui::vec2(15.0, 15.0),
-            );
-            overlay_btns.push((close_r, CanvasOverlayAction1d::CloseParamsCard));
-            overlay_block_rects.push(r);
-            Some((r, true))
-        } else {
-            let r = egui::Rect::from_min_size(
-                egui::pos2(plot_rect.right() - 70.0, plot_rect.top() + 6.0),
-                egui::vec2(64.0, 20.0),
-            );
-            overlay_btns.push((r, CanvasOverlayAction1d::OpenParamsCard));
-            overlay_block_rects.push(r);
-            Some((r, false))
-        }
+    // A) Top-Right Acquisition Parameters Card geometry (hidden completely when `show_params_card` is false — `UI-B4`)
+    let params_card_rect = if state.show_params_card && plot_rect.width() >= 480.0 {
+        let r = egui::Rect::from_min_size(
+            egui::pos2(plot_rect.right() - 210.0, plot_rect.top() + 6.0),
+            egui::vec2(204.0, 112.0),
+        );
+        let close_r = egui::Rect::from_min_size(
+            egui::pos2(r.right() - 18.0, r.top() + 3.0),
+            egui::vec2(15.0, 15.0),
+        );
+        overlay_btns.push((close_r, CanvasOverlayAction1d::CloseParamsCard));
+        overlay_block_rects.push(r);
+        Some((r, true))
     } else {
         None
     };
 
-    // B) Top-Left Journal Multiplet Summary Card geometry
+    // B) Top-Left Journal Multiplet Summary Card geometry (hidden completely when `show_journal_card` is false — `UI-B4`)
     let has_report = !state.formatted_journal_report.is_empty();
-    let journal_card_rect = if has_report && plot_rect.width() >= 540.0 {
-        if state.show_journal_card {
-            let card_w = (plot_rect.width() * 0.44).clamp(276.0, 410.0);
-            let r = egui::Rect::from_min_size(
-                egui::pos2(plot_rect.left() + 6.0, plot_rect.top() + 6.0),
-                egui::vec2(card_w, 76.0),
-            );
-            let styles = [
-                (PublicationStyle::Acs, "ACS"),
-                (PublicationStyle::Joc, "JOC"),
-                (PublicationStyle::Rsc, "RSC"),
-                (PublicationStyle::Nature, "Nat"),
-            ];
-            let mut bx = r.left() + 74.0;
-            for (st, _) in styles {
-                let br = egui::Rect::from_min_size(
-                    egui::pos2(bx, r.top() + 3.0),
-                    egui::vec2(32.0, 16.0),
-                );
-                overlay_btns.push((br, CanvasOverlayAction1d::SetJournalStyle(st)));
-                bx += 34.0;
-            }
-            let copy_r = egui::Rect::from_min_size(
-                egui::pos2(r.right() - 62.0, r.top() + 3.0),
-                egui::vec2(40.0, 16.0),
-            );
-            let close_r = egui::Rect::from_min_size(
-                egui::pos2(r.right() - 18.0, r.top() + 3.0),
-                egui::vec2(15.0, 16.0),
-            );
-            overlay_btns.push((copy_r, CanvasOverlayAction1d::CopyJournalReport));
-            overlay_btns.push((close_r, CanvasOverlayAction1d::CloseJournalCard));
-            overlay_block_rects.push(r);
-            Some((r, true))
-        } else {
-            let r = egui::Rect::from_min_size(
-                egui::pos2(plot_rect.left() + 6.0, plot_rect.top() + 6.0),
-                egui::vec2(64.0, 20.0),
-            );
-            overlay_btns.push((r, CanvasOverlayAction1d::OpenJournalCard));
-            overlay_block_rects.push(r);
-            Some((r, false))
+    let journal_card_rect = if has_report && state.show_journal_card && plot_rect.width() >= 540.0 {
+        let card_w = (plot_rect.width() * 0.44).clamp(276.0, 410.0);
+        let r = egui::Rect::from_min_size(
+            egui::pos2(plot_rect.left() + 6.0, plot_rect.top() + 6.0),
+            egui::vec2(card_w, 76.0),
+        );
+        let styles = [
+            (PublicationStyle::Acs, "ACS"),
+            (PublicationStyle::Joc, "JOC"),
+            (PublicationStyle::Rsc, "RSC"),
+            (PublicationStyle::Nature, "Nat"),
+        ];
+        let mut bx = r.left() + 74.0;
+        for (st, _) in styles {
+            let br =
+                egui::Rect::from_min_size(egui::pos2(bx, r.top() + 3.0), egui::vec2(32.0, 16.0));
+            overlay_btns.push((br, CanvasOverlayAction1d::SetJournalStyle(st)));
+            bx += 34.0;
         }
+        let copy_r = egui::Rect::from_min_size(
+            egui::pos2(r.right() - 62.0, r.top() + 3.0),
+            egui::vec2(40.0, 16.0),
+        );
+        let close_r = egui::Rect::from_min_size(
+            egui::pos2(r.right() - 18.0, r.top() + 3.0),
+            egui::vec2(15.0, 16.0),
+        );
+        overlay_btns.push((copy_r, CanvasOverlayAction1d::CopyJournalReport));
+        overlay_btns.push((close_r, CanvasOverlayAction1d::CloseJournalCard));
+        overlay_block_rects.push(r);
+        Some((r, true))
     } else {
         None
     };

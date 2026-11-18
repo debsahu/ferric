@@ -296,69 +296,151 @@ pub fn compute_rci_s2_from_propensity(report: &PropensityReport) -> Vec<Option<f
     out
 }
 
-fn average_ties_ranks(vals: &[f64]) -> Vec<f64> {
-    let n = vals.len();
-    let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| vals[a].total_cmp(&vals[b]));
-    let mut ranks = vec![0.0f64; n];
-    let mut i = 0usize;
-    while i < n {
-        let mut j = i + 1;
-        while j < n && (vals[idx[j]] - vals[idx[i]]).abs() <= 1e-12 {
-            j += 1;
-        }
-        let avg_rank = 0.5 * ((i + 1 + j) as f64);
-        for &slot in &idx[i..j] {
-            ranks[slot] = avg_rank;
-        }
-        i = j;
-    }
-    ranks
-}
-
-fn spearman_rank_correlation(xs: &[f64], ys: &[f64]) -> Option<f64> {
-    if xs.len() != ys.len() || xs.len() < 3 {
+/// Convert a validated computational [`StructureEnsemble3d`] into [`nmr_core::af_concordance::AfStructureModel`]
+/// so `nmr_core::af_concordance::evaluate_af_nmr_concordance` is the single concordance classifier (`21.W1:P1-5`).
+///
+/// Fails closed (`None`) whenever `ens.require_predicted_model(treat_bfactors_as_plddt)` returns `Err`.
+pub fn ensemble_to_af_structure_model(
+    ens: &StructureEnsemble3d,
+    treat_bfactors_as_plddt: bool,
+) -> Option<nmr_core::af_concordance::AfStructureModel> {
+    if ens
+        .require_predicted_model(treat_bfactors_as_plddt)
+        .is_err()
+    {
         return None;
     }
-    let rx = average_ties_ranks(xs);
-    let ry = average_ties_ranks(ys);
-    let n = rx.len() as f64;
-    let mx = rx.iter().sum::<f64>() / n;
-    let my = ry.iter().sum::<f64>() / n;
-    let mut cov = 0.0f64;
-    let mut vx = 0.0f64;
-    let mut vy = 0.0f64;
-    for (&a, &b) in rx.iter().zip(ry.iter()) {
-        let da = a - mx;
-        let db = b - my;
-        cov += da * db;
-        vx += da * da;
-        vy += db * db;
+    let m0 = ens.models.first()?;
+    let c0 = m0.chains.first()?;
+    if c0.residues.is_empty() {
+        return None;
     }
-    let denom = (vx * vy).sqrt();
-    if denom <= 1e-12 {
-        return Some(0.0);
+
+    let mut raw_plddts: Vec<f64> = if let Some(ref pv) = ens.per_residue_plddt {
+        if pv.len() != c0.residues.len() {
+            return None;
+        }
+        pv.clone()
+    } else if treat_bfactors_as_plddt {
+        let mut bs = Vec::with_capacity(c0.residues.len());
+        for res in &c0.residues {
+            let b_opt = res
+                .atoms
+                .iter()
+                .find(|a| a.atom_name == "CA")
+                .map(|a| a.b_factor as f64)
+                .or_else(|| {
+                    let mut sum = 0.0f64;
+                    let mut cnt = 0usize;
+                    for a in &res.atoms {
+                        if matches!(a.atom_name.as_str(), "N" | "CA" | "C" | "O") {
+                            sum += a.b_factor as f64;
+                            cnt += 1;
+                        }
+                    }
+                    (cnt > 0).then(|| sum / (cnt as f64))
+                })?;
+            bs.push(b_opt);
+        }
+        let max_b = bs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut sorted = bs.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let med_b = sorted[sorted.len() / 2];
+        if max_b <= 1.0 && med_b > 0.15 {
+            for v in &mut bs {
+                *v *= 100.0;
+            }
+        }
+        bs
+    } else {
+        return None;
+    };
+
+    let mut residues = Vec::with_capacity(c0.residues.len());
+    let mut kept_plddts = Vec::with_capacity(c0.residues.len());
+    let chain_str = c0.chain_id.to_string();
+    for (r_pos, (res, pv)) in c0.residues.iter().zip(raw_plddts.drain(..)).enumerate() {
+        let mut atoms_map = BTreeMap::new();
+        for a in &res.atoms {
+            atoms_map.insert(
+                a.atom_name.clone(),
+                [a.pos[0] as f64, a.pos[1] as f64, a.pos[2] as f64],
+            );
+        }
+        let Some(&n) = atoms_map.get("N") else {
+            continue;
+        };
+        let Some(&ca) = atoms_map.get("CA") else {
+            continue;
+        };
+        let Some(&c) = atoms_map.get("C") else {
+            continue;
+        };
+        let Some(&o) = atoms_map.get("O") else {
+            continue;
+        };
+        let cb = atoms_map.get("CB").copied();
+        let explicit_h = atoms_map.get("H").or_else(|| atoms_map.get("HN")).copied();
+        residues.push(nmr_core::af_concordance::AfResidueRecord {
+            seq_index: residues.len(),
+            seq_id: res.seq_id,
+            label_seq_id: Some((r_pos + 1) as i32),
+            chain_id: chain_str.clone(),
+            res_name: res.res_name.clone(),
+            n,
+            ca,
+            c,
+            o,
+            cb,
+            explicit_h,
+            atoms: atoms_map,
+            plddt: Some(pv),
+        });
+        kept_plddts.push(pv);
     }
-    Some((cov / denom).clamp(-1.0, 1.0))
+    if residues.is_empty() {
+        return None;
+    }
+
+    let plddt_source = match ens.provenance {
+        crate::mol3d_viewer::CoordinateProvenance::ModelArchiveQaMetric => {
+            nmr_core::af_concordance::PlddtSource::MaQaMetricLocal
+        }
+        crate::mol3d_viewer::CoordinateProvenance::ComputationalBFactor => {
+            nmr_core::af_concordance::PlddtSource::BFactorColumn
+        }
+        _ => nmr_core::af_concordance::PlddtSource::ForcedExperimentalBFactor,
+    };
+
+    Some(nmr_core::af_concordance::AfStructureModel {
+        entry_id: Some(ens.title.clone()),
+        detected_pdb_id: None,
+        detected_uniprot_id: None,
+        exptl_method: None,
+        chain_id: chain_str,
+        provenance: nmr_core::af_concordance::CoordinateProvenance::ComputationalModel,
+        plddt_source,
+        plddt_per_residue: Some(kept_plddts),
+        residues,
+        diagnostics: Vec::new(),
+    })
 }
 
-/// Evaluate per-residue [`ConcordanceTrackClass`] and global Fowler–Sljoka–Williamson rigidity
-/// metrics (`Spearman rho_s`, `RMSD_rig`) from 3D secondary structure, optional `pLDDT`,
-/// `PropensityReport` (`SSP`/`delta2D` + `RCI-S^2`), and optional Lipari–Szabo `S^2`.
-///
-/// Never defaults missing `pLDDT` to `85.0` and never fabricates `(p_coil, p_ppii)` from `S^2`.
-pub fn evaluate_concordance_with_summary(
+/// Align an [`nmr_core::af_concordance::AfConcordanceReport`] onto `0..seq_len` by `seq_id`
+/// (handling cloning tags, N-Met cleavage, or missing loops cleanly without length-equality assumptions).
+pub fn map_core_concordance_report_to_summary(
     seq_len: usize,
-    ss3d: Option<&[SsState4]>,
-    plddt: Option<&[Option<f64>]>,
+    nmr_seq_ids: &[i32],
+    rep: &nmr_core::af_concordance::AfConcordanceReport,
     propensity: Option<&PropensityReport>,
     exp_s2: Option<&BTreeMap<usize, f64>>,
 ) -> ConcordanceTrackSummary {
+    let rci_s2 = propensity
+        .map(compute_rci_s2_from_propensity)
+        .unwrap_or_else(|| vec![None; seq_len]);
     let mut summary = ConcordanceTrackSummary {
         classes: vec![ConcordanceTrackClass::UnassignedNmr; seq_len],
-        rci_s2: propensity
-            .map(compute_rci_s2_from_propensity)
-            .unwrap_or_else(|| vec![None; seq_len]),
+        rci_s2,
         effective_s2: vec![None; seq_len],
         spearman_rho: None,
         rigidity_rmsd: None,
@@ -366,92 +448,39 @@ pub fn evaluate_concordance_with_summary(
         class_counts: [0; 5],
     };
 
-    if seq_len == 0 || (ss3d.is_none() && plddt.is_none()) {
-        summary.class_counts[4] = seq_len;
-        return summary;
+    let mut by_seq_id = BTreeMap::new();
+    for rec in &rep.residues {
+        by_seq_id.entry(rec.seq_id).or_insert(rec);
     }
 
-    let mut eval_plddt = Vec::with_capacity(seq_len);
-    let mut eval_s2 = Vec::with_capacity(seq_len);
-    let mut rig_sq_sum = 0.0f64;
-
     for k in 0..seq_len {
-        let s2_opt = exp_s2
+        let fallback_s2 = exp_s2
             .and_then(|m| m.get(&k).copied())
             .filter(|v| v.is_finite())
             .map(|v| v.clamp(0.0, 1.0))
             .or_else(|| summary.rci_s2.get(k).copied().flatten());
-        summary.effective_s2[k] = s2_opt;
 
-        let plddt_opt = plddt
-            .and_then(|p| p.get(k).copied().flatten())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.0, 100.0));
+        let target_sid = nmr_seq_ids.get(k).copied().unwrap_or((k + 1) as i32);
+        let matched = by_seq_id.get(&target_sid).copied().or_else(|| {
+            (nmr_seq_ids.is_empty() && rep.residues.len() == seq_len)
+                .then(|| rep.residues.get(k))
+                .flatten()
+        });
 
-        // Fail closed when NMR rigidity or pLDDT is absent — never default missing pLDDT to 85.0 (`21.W1:P1-5`)!
-        let Some(s2_val) = s2_opt else {
-            summary.classes[k] = ConcordanceTrackClass::UnassignedNmr;
-            summary.class_counts[4] += 1;
-            continue;
-        };
-        let Some(pv) = plddt_opt else {
-            summary.classes[k] = ConcordanceTrackClass::Indeterminate;
-            summary.class_counts[4] += 1;
-            continue;
-        };
-
-        let ss_k = ss3d
-            .and_then(|s| s.get(k).copied())
-            .unwrap_or(SsState4::Coil);
-
-        if k > 0 && k + 1 < seq_len {
-            eval_plddt.push(pv);
-            eval_s2.push(s2_val);
-            let s2_af = ((pv - 35.0) / 55.0).clamp(0.0, 1.0);
-            let diff = s2_af - s2_val;
-            rig_sq_sum += diff * diff;
-        }
-
-        let prop_res = propensity
-            .and_then(|rep| rep.residues.get(k))
-            .filter(|r| r.has_data);
-        let ssp_opt = prop_res.and_then(|r| r.ssp_score);
-        let p_helix = prop_res.map(|r| r.p_alpha).unwrap_or(0.0);
-        let p_sheet = prop_res.map(|r| r.p_beta).unwrap_or(0.0);
-        let p_ppii = prop_res.map(|r| r.p_ppii).unwrap_or(0.0);
-        let p_coil = prop_res.map(|r| r.p_coil).unwrap_or(0.0);
-
-        let has_ss_inversion = prop_res.is_some()
-            && ((ss_k == SsState4::Helix
-                && (ssp_opt.is_some_and(|s| s <= -0.25) || p_sheet >= 0.45))
-                || (ss_k == SsState4::Sheet
-                    && (ssp_opt.is_some_and(|s| s >= 0.25) || p_helix >= 0.45)));
-
-        let cls = if pv >= 70.0 {
-            if s2_val < 0.65 {
-                if matches!(ss_k, SsState4::Helix | SsState4::Sheet)
-                    && prop_res.is_some()
-                    && (p_coil + p_ppii) >= 0.65
-                {
-                    ConcordanceTrackClass::ConditionalFoldingOrCrystalArtifact
-                } else {
-                    ConcordanceTrackClass::DynamicHingeOrAltState
-                }
-            } else if has_ss_inversion {
-                ConcordanceTrackClass::DynamicHingeOrAltState
-            } else if ss3d.is_none() && prop_res.is_none() {
+        let cls = if let Some(rec) = matched {
+            summary.effective_s2[k] = rec.s2_exp.or(fallback_s2);
+            if rec.plddt.is_none() && summary.effective_s2[k].is_some() {
                 ConcordanceTrackClass::Indeterminate
             } else {
-                ConcordanceTrackClass::ConcordantOrdered
+                ConcordanceTrackClass::from(rec.concordance_class)
             }
-        } else if pv >= 50.0 {
-            ConcordanceTrackClass::Indeterminate
-        } else if s2_val >= 0.75 || p_helix >= 0.50 || p_sheet >= 0.50 {
-            ConcordanceTrackClass::DynamicHingeOrAltState
-        } else if s2_val < 0.65 || (prop_res.is_some() && (p_coil + p_ppii) >= 0.50) {
-            ConcordanceTrackClass::ConcordantDisordered
         } else {
-            ConcordanceTrackClass::Indeterminate
+            summary.effective_s2[k] = fallback_s2;
+            if fallback_s2.is_some() {
+                ConcordanceTrackClass::Indeterminate
+            } else {
+                ConcordanceTrackClass::UnassignedNmr
+            }
         };
 
         summary.classes[k] = cls;
@@ -465,23 +494,58 @@ pub fn evaluate_concordance_with_summary(
         summary.class_counts[bucket] += 1;
     }
 
-    summary.n_evaluated = eval_s2.len();
-    if summary.n_evaluated >= 10 {
-        summary.spearman_rho = spearman_rank_correlation(&eval_plddt, &eval_s2);
-        summary.rigidity_rmsd = Some((rig_sq_sum / (summary.n_evaluated as f64)).sqrt());
+    match rep.summary {
+        nmr_core::af_concordance::ConcordanceSummary::Evaluated {
+            n_eval,
+            spearman_rho_s,
+            rmsd_rigidity,
+            ..
+        } => {
+            summary.n_evaluated = n_eval;
+            summary.spearman_rho = Some(spearman_rho_s);
+            summary.rigidity_rmsd = Some(rmsd_rigidity);
+        }
+        nmr_core::af_concordance::ConcordanceSummary::InsufficientCoverage { n_eval, .. } => {
+            summary.n_evaluated = n_eval;
+        }
     }
     summary
 }
 
-/// Convenience wrapper returning the per-residue [`ConcordanceTrackClass`] vector.
-pub fn evaluate_concordance_track(
+/// Fail-closed neutral Track 3 summary when no validated `pLDDT` model is loaded (`21.W1:P0-2`, `P1-5`).
+pub fn neutral_concordance_summary_without_predicted_model(
     seq_len: usize,
-    ss3d: Option<&[SsState4]>,
-    plddt: Option<&[Option<f64>]>,
+    has_3d: bool,
     propensity: Option<&PropensityReport>,
     exp_s2: Option<&BTreeMap<usize, f64>>,
-) -> Vec<ConcordanceTrackClass> {
-    evaluate_concordance_with_summary(seq_len, ss3d, plddt, propensity, exp_s2).classes
+) -> ConcordanceTrackSummary {
+    let rci_s2 = propensity
+        .map(compute_rci_s2_from_propensity)
+        .unwrap_or_else(|| vec![None; seq_len]);
+    let mut summary = ConcordanceTrackSummary {
+        classes: vec![ConcordanceTrackClass::UnassignedNmr; seq_len],
+        rci_s2,
+        effective_s2: vec![None; seq_len],
+        spearman_rho: None,
+        rigidity_rmsd: None,
+        n_evaluated: 0,
+        class_counts: [0; 5],
+    };
+    for k in 0..seq_len {
+        let s2_opt = exp_s2
+            .and_then(|m| m.get(&k).copied())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0))
+            .or_else(|| summary.rci_s2.get(k).copied().flatten());
+        summary.effective_s2[k] = s2_opt;
+        summary.classes[k] = if has_3d && s2_opt.is_some() {
+            ConcordanceTrackClass::Indeterminate
+        } else {
+            ConcordanceTrackClass::UnassignedNmr
+        };
+    }
+    summary.class_counts[4] = seq_len;
+    summary
 }
 
 // ============================================================================
@@ -571,6 +635,8 @@ pub struct SsRibbonState {
     pub plddt_track: Vec<Option<f64>>,
     /// Cached Track 2 (`NMR SS`) Marsh `SSP` & Camilloni 4-state `delta2D` report.
     pub cached_propensity: Option<PropensityReport>,
+    /// Cached NMR [`Reference`] shifts used to evaluate `nmr_core::af_concordance::evaluate_af_nmr_concordance`.
+    pub cached_reference: Option<Reference>,
     /// Optional external override for Track 3 (`AF vs NMR`, e.g. from `nmr-core::af_concordance`).
     pub concordance_override: Option<Vec<ConcordanceTrackClass>>,
     /// `true` when experimental Lipari–Szabo relaxation `S²` values are loaded; `false` when Track 3
@@ -606,6 +672,7 @@ impl SsRibbonState {
             ss3d_track: Vec::new(),
             plddt_track: Vec::new(),
             cached_propensity: None,
+            cached_reference: None,
             concordance_override: None,
             has_experimental_s2: false,
             concordance_summary: ConcordanceTrackSummary::default(),
@@ -674,6 +741,26 @@ impl SsRibbonState {
         self.set_concordance_override(&mapped);
     }
 
+    /// Align an [`nmr_core::af_concordance::AfConcordanceReport`] onto `0..seq_len` by `seq_id`
+    /// and store both the override vector and full [`ConcordanceTrackSummary`].
+    pub fn set_core_concordance_report_aligned(
+        &mut self,
+        seq_len: usize,
+        nmr_seq_ids: &[i32],
+        rep: &nmr_core::af_concordance::AfConcordanceReport,
+        exp_s2: Option<&BTreeMap<usize, f64>>,
+    ) {
+        let summary = map_core_concordance_report_to_summary(
+            seq_len,
+            nmr_seq_ids,
+            rep,
+            self.cached_propensity.as_ref(),
+            exp_s2,
+        );
+        self.concordance_override = Some(summary.classes.clone());
+        self.concordance_summary = summary;
+    }
+
     /// Supply an explicit Track 3 concordance vector (e.g. from `nmr-core::af_concordance`).
     pub fn set_concordance_override(&mut self, classes: &[ConcordanceTrackClass]) {
         let mut counts = [0usize; 5];
@@ -710,8 +797,10 @@ impl SsRibbonState {
         }
         self.last_shift_fingerprint = fp;
         let timer = FastTimer::start();
-        self.cached_propensity = ref_data
-            .filter(|r| !r.sequence.is_empty())
+        self.cached_reference = ref_data.filter(|r| !r.sequence.is_empty()).cloned();
+        self.cached_propensity = self
+            .cached_reference
+            .as_ref()
             .map(|r| compute_idp_propensity(r, cfg));
         self.last_nmr_update_ms = timer.elapsed_ms();
         true
@@ -783,11 +872,43 @@ impl SsRibbonState {
         }
 
         let has_3d = !self.ss3d_track.is_empty();
-        let any_plddt = self.plddt_track.iter().any(Option::is_some);
-        self.concordance_summary = evaluate_concordance_with_summary(
+        if let (Some(ens), Some(shifts)) = (ensemble, self.cached_reference.as_ref()) {
+            if let Some(af_model) = ensemble_to_af_structure_model(ens, false) {
+                let s2_entries: Option<Vec<nmr_core::af_concordance::ExperimentalS2Entry>> = exp_s2
+                    .map(|m| {
+                        m.iter()
+                            .filter(|&(_, &v)| v.is_finite() && (0.0..=1.0).contains(&v))
+                            .map(|(&k, &v)| nmr_core::af_concordance::ExperimentalS2Entry {
+                                seq_id: shifts.seq_ids.get(k).copied().unwrap_or((k + 1) as i32),
+                                res_name: shifts.sequence.get(k).cloned(),
+                                s2: v,
+                                sigma_s2: None,
+                            })
+                            .collect()
+                    });
+                let cfg = nmr_core::af_concordance::AfConcordanceConfig::default();
+                if let Ok(rep) = nmr_core::af_concordance::evaluate_af_nmr_concordance(
+                    &af_model,
+                    shifts,
+                    None,
+                    s2_entries.as_deref().filter(|entries| !entries.is_empty()),
+                    &cfg,
+                ) {
+                    self.concordance_summary = map_core_concordance_report_to_summary(
+                        seq_len,
+                        &shifts.seq_ids,
+                        &rep,
+                        self.cached_propensity.as_ref(),
+                        exp_s2,
+                    );
+                    return;
+                }
+            }
+        }
+
+        self.concordance_summary = neutral_concordance_summary_without_predicted_model(
             seq_len,
-            has_3d.then_some(self.ss3d_track.as_slice()),
-            any_plddt.then_some(self.plddt_track.as_slice()),
+            has_3d,
             self.cached_propensity.as_ref(),
             exp_s2,
         );

@@ -248,6 +248,7 @@ pub struct DynamicsStudioPanel {
     pub csp_trajectories: Vec<ResidueCspTrajectory>,
     pub csp_fit: Option<CspGlobalFitResult>,
     pub csp_threshold: Option<TrimmedCspThresholds>,
+    pub last_canvas_rect: Option<egui::Rect>,
 }
 
 impl Default for DynamicsStudioPanel {
@@ -268,6 +269,7 @@ impl Default for DynamicsStudioPanel {
             csp_trajectories: Vec::new(),
             csp_fit: None,
             csp_threshold: None,
+            last_canvas_rect: None,
         }
     }
 }
@@ -890,6 +892,8 @@ impl DynamicsStudioPanel {
             });
 
         ui.separator();
+
+        self.last_canvas_rect = Some(ui.available_rect_before_wrap().intersect(ui.clip_rect()));
 
         match self.active_tab {
             DynamicsStudioTab::RelaxationModelFree => {

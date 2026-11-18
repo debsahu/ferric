@@ -330,52 +330,98 @@ impl StructureEnsemble3d {
     }
 
     /// Fail-closed gate verifying that `self` carries validated per-residue `pLDDT` model
-    /// provenance (`ModelArchiveQaMetric` or `ComputationalBFactor`, with non-constant `plddt`
-    /// values not all `0.0` or `0.5`/`50.0`), unless the user explicitly enables `treat_as_model`
-    /// (`"Treat B-factors as pLDDT"`).
+    /// provenance (`ModelArchiveQaMetric` or `ComputationalBFactor`, or explicit `treat_as_model`
+    /// `"Treat B-factors as pLDDT"` opt-in), AND that per-residue `pLDDT` / `B`-factor values are
+    /// non-empty, finite, strictly within `[0.0, 100.0]`, and non-constant (`max - min > 1e-3`,
+    /// rejecting all-`0.0`, all-`0.5`, and constant experimental `B`-factors even when opted in).
     pub fn require_predicted_model(&self, treat_as_model: bool) -> Result<(), String> {
-        if treat_as_model {
-            return Ok(());
-        }
-        if !self.provenance.is_computational() {
-            return Err(format!(
-                "Structure '{}' has {:?} provenance rather than a verified computational pLDDT model; enable \"Treat B-factors as pLDDT\" to opt in explicitly.",
-                self.title, self.provenance
-            ));
-        }
-        let Some(ref plddts) = self.per_residue_plddt else {
-            return Err(format!(
-                "Structure '{}' has {:?} provenance but lacks per-residue pLDDT values; enable \"Treat B-factors as pLDDT\" to opt in explicitly.",
-                self.title, self.provenance
-            ));
-        };
-        if plddts.is_empty() {
-            return Err(format!(
-                "Structure '{}' contains an empty pLDDT array; enable \"Treat B-factors as pLDDT\" to opt in explicitly.",
-                self.title
-            ));
-        }
-        let mut min_v = f64::INFINITY;
-        let mut max_v = f64::NEG_INFINITY;
-        let mut any_finite = false;
-        for &v in plddts {
-            if v.is_finite() {
-                any_finite = true;
+        let validate_slice = |vals: &[f64]| -> Result<(), String> {
+            if vals.is_empty() {
+                return Err(format!(
+                    "Structure '{}' contains zero polymer residue pLDDT/B-factor values.",
+                    self.title
+                ));
+            }
+            let mut min_v = f64::INFINITY;
+            let mut max_v = f64::NEG_INFINITY;
+            for &v in vals {
+                if !v.is_finite() || !(0.0..=100.0).contains(&v) {
+                    return Err(format!(
+                        "Structure '{}' contains out-of-range or non-finite B-factor/pLDDT value ({v:.3} outside [0.0, 100.0]).",
+                        self.title
+                    ));
+                }
                 min_v = min_v.min(v);
                 max_v = max_v.max(v);
             }
+            if (max_v - min_v) <= 1e-3 {
+                return Err(format!(
+                    "Structure '{}' has constant/degenerate pLDDT or B-factor values (min={min_v:.3}, max={max_v:.3}).",
+                    self.title
+                ));
+            }
+            Ok(())
+        };
+
+        if !treat_as_model {
+            if !self.provenance.is_computational() {
+                return Err(format!(
+                    "Structure '{}' has {:?} provenance rather than a verified computational pLDDT model; enable \"Treat B-factors as pLDDT\" to opt in explicitly.",
+                    self.title, self.provenance
+                ));
+            }
+            let Some(ref plddts) = self.per_residue_plddt else {
+                return Err(format!(
+                    "Structure '{}' has {:?} provenance but lacks per-residue pLDDT values; enable \"Treat B-factors as pLDDT\" to opt in explicitly.",
+                    self.title, self.provenance
+                ));
+            };
+            return validate_slice(plddts);
         }
-        let all_zero = any_finite && max_v.abs() <= 1e-6;
-        let all_half_or_50 = any_finite
-            && ((min_v - 0.5).abs() <= 1e-6 && (max_v - 0.5).abs() <= 1e-6
-                || (min_v - 50.0).abs() <= 1e-6 && (max_v - 50.0).abs() <= 1e-6);
-        if !any_finite || all_zero || all_half_or_50 {
+
+        if let Some(ref plddts) = self.per_residue_plddt {
+            return validate_slice(plddts);
+        }
+
+        let Some(c0) = self.models.first().and_then(|m| m.chains.first()) else {
             return Err(format!(
-                "Structure '{}' has degenerate/constant pLDDT values (min={min_v:.3}, max={max_v:.3}); enable \"Treat B-factors as pLDDT\" to opt in explicitly.",
+                "Structure '{}' contains no polymer chains for B-factor pLDDT extraction.",
+                self.title
+            ));
+        };
+        if c0.residues.is_empty() {
+            return Err(format!(
+                "Structure '{}' contains zero polymer residues for B-factor pLDDT extraction.",
                 self.title
             ));
         }
-        Ok(())
+        let mut raw_b = Vec::with_capacity(c0.residues.len());
+        for res in &c0.residues {
+            let b_opt = res
+                .atoms
+                .iter()
+                .find(|a| a.atom_name == "CA")
+                .map(|a| a.b_factor as f64)
+                .or_else(|| {
+                    let mut sum = 0.0f64;
+                    let mut cnt = 0usize;
+                    for a in &res.atoms {
+                        if matches!(a.atom_name.as_str(), "N" | "CA" | "C" | "O") {
+                            sum += a.b_factor as f64;
+                            cnt += 1;
+                        }
+                    }
+                    (cnt > 0).then(|| sum / (cnt as f64))
+                });
+            let Some(bv) = b_opt else {
+                return Err(format!(
+                    "Structure '{}' residue {}{} lacks backbone B-factors.",
+                    self.title, res.res_name, res.seq_id
+                ));
+            };
+            raw_b.push(bv);
+        }
+        validate_slice(&raw_b)
     }
 
     /// Re-align `sequence_idx` on polymer residues to an external NMR [`Reference`] sequence when
@@ -5182,12 +5228,18 @@ impl Mol3dViewerPanel {
         let Some(ens) = self.ensemble.as_ref() else {
             return;
         };
+        if ens
+            .require_predicted_model(self.treat_bfactors_as_plddt)
+            .is_err()
+        {
+            return;
+        }
         if let Some(ref plddt_vals) = ens.per_residue_plddt {
             if let Some(c0) = ens.models.first().and_then(|m| m.chains.first()) {
                 for (r_idx, res) in c0.residues.iter().enumerate() {
                     if let (Some(seq_k), Some(&pv)) = (res.sequence_idx, plddt_vals.get(r_idx)) {
-                        if pv.is_finite() {
-                            self.track_data.plddt.insert(seq_k, pv.clamp(0.0, 100.0));
+                        if pv.is_finite() && (0.0..=100.0).contains(&pv) {
+                            self.track_data.plddt.insert(seq_k, pv);
                         }
                     }
                 }
@@ -5217,7 +5269,7 @@ impl Mol3dViewerPanel {
                         (res.sequence_idx, b_opt.filter(|v| v.is_finite()))
                     {
                         keys.push(seq_k);
-                        raw.push(bv.clamp(0.0, 100.0));
+                        raw.push(bv);
                     }
                 }
                 let _ = normalize_plddt_vec_if_unit_scale(&mut raw);
@@ -6646,7 +6698,10 @@ ATOM 3 CA ILE A 3 7.600 0.000 0.000 {const_b}
                 "constant B={const_b} must be rejected as pLDDT"
             );
             assert!(require_predicted_model(&ens_const, false).is_err());
-            assert!(require_predicted_model(&ens_const, true).is_ok());
+            assert!(
+                require_predicted_model(&ens_const, true).is_err(),
+                "constant B={const_b} must remain rejected even when treat_as_model=true"
+            );
         }
     }
 }

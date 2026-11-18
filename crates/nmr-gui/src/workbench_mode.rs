@@ -161,11 +161,14 @@ impl DynamicsView {
 /// `egui::Id` salt used by every mode-switcher segment so tests can locate them.
 pub const MODE_SWITCHER_ID_SALT: &str = "ferric_mode_switcher";
 
-/// Draw the single segmented top-level mode switcher. Returns the newly selected mode when the
-/// user clicked a different segment this frame.
-pub fn draw_mode_switcher(ui: &mut egui::Ui, current: WorkbenchMode) -> Option<WorkbenchMode> {
+/// Draw the single segmented top-level mode switcher and also return its exact bounding rectangle
+/// (`mode_switcher_rect`) so control-count audits exclude ONLY the 6-mode switcher itself (`UI-B2`).
+pub fn draw_mode_switcher_with_rect(
+    ui: &mut egui::Ui,
+    current: WorkbenchMode,
+) -> (Option<WorkbenchMode>, egui::Rect) {
     let mut picked = None;
-    ui.push_id(MODE_SWITCHER_ID_SALT, |ui| {
+    let inner = ui.push_id(MODE_SWITCHER_ID_SALT, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             for mode in WorkbenchMode::ALL {
@@ -183,9 +186,17 @@ pub fn draw_mode_switcher(ui: &mut egui::Ui, current: WorkbenchMode) -> Option<W
                     picked = Some(mode);
                 }
             }
-        });
+        })
+        .response
+        .rect
     });
-    picked
+    (picked, inner.inner)
+}
+
+/// Draw the single segmented top-level mode switcher. Returns the newly selected mode when the
+/// user clicked a different segment this frame.
+pub fn draw_mode_switcher(ui: &mut egui::Ui, current: WorkbenchMode) -> Option<WorkbenchMode> {
+    draw_mode_switcher_with_rect(ui, current).0
 }
 
 /// Draw a compact segmented sub-view selector (e.g. `Sketcher | DOSY`). Returns true when the

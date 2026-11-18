@@ -431,10 +431,6 @@ pub fn render_dosy_panel(ui: &mut egui::Ui, state: &mut DosyPanelState) -> Vec<D
                 .strong(),
         );
 
-        if ui.button("Load Demo").clicked() {
-            *state = DosyPanelState::with_synthetic_demo();
-            actions.push(DosyPanelAction::LoadedDemoMixture);
-        }
         if ui.button("Fit Stejskal-Tanner").clicked() {
             state.rebuild_2d_grid();
             state.status_line = format!(
@@ -464,11 +460,6 @@ pub fn render_dosy_panel(ui: &mut egui::Ui, state: &mut DosyPanelState) -> Vec<D
                 }
             }
         }
-        if ui.button("Export TSV").clicked() {
-            let tsv = state.export_tsv();
-            ui.ctx().copy_text(tsv);
-            state.status_line = "Copied DOSY Stejskal-Tanner & MW TSV to clipboard.".to_string();
-        }
         if ui.button("Reset Zoom").clicked() {
             state.reset_viewport();
         }
@@ -496,6 +487,17 @@ pub fn render_dosy_panel(ui: &mut egui::Ui, state: &mut DosyPanelState) -> Vec<D
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
+                if ui.button("Load Demo").clicked() {
+                    *state = DosyPanelState::with_synthetic_demo();
+                    actions.push(DosyPanelAction::LoadedDemoMixture);
+                }
+                if ui.button("Export TSV").clicked() {
+                    let tsv = state.export_tsv();
+                    ui.ctx().copy_text(tsv);
+                    state.status_line =
+                        "Copied DOSY Stejskal-Tanner & MW TSV to clipboard.".to_string();
+                }
+                ui.separator();
                 // Keep "T (K):" and its DragValue inside a nested horizontal block so they never split across rows
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("T (K):").size(12.5));

@@ -19,8 +19,7 @@ use nmr_gui::mol3d_viewer::{
 };
 use nmr_gui::sidechain_widget::SequenceRibbonState;
 use nmr_gui::ss_ribbon_widget::{
-    apply_ss_ribbon_click_sync, evaluate_concordance_with_summary, SsRibbonPanel, SsRibbonState,
-    SsRibbonTheme, SsRibbonWorkspaceInput,
+    apply_ss_ribbon_click_sync, SsRibbonPanel, SsRibbonState, SsRibbonTheme, SsRibbonWorkspaceInput,
 };
 
 const UBIQUITIN_1UBQ_PDB: &str = include_str!("../../../data/fixtures/ubiquitin_1ubq_xray.pdb");
@@ -382,7 +381,8 @@ fn t21_3_live_concordance_regimes_ordered_disordered_morf_and_hinge() {
     );
     assert_eq!(state.rigidity_source_label(), "RCI-S² (shift-derived)");
 
-    ubiq_ens.per_residue_plddt = Some(vec![92.0; 76]);
+    ubiq_ens.provenance = CoordinateProvenance::ModelArchiveQaMetric;
+    ubiq_ens.per_residue_plddt = Some((0..76).map(|i| 93.0 - ((i % 6) as f64) * 1.2).collect());
     state.sync_from_ensemble_and_nmr(
         ubiq_ref.sequence.len(),
         Some(&ubiq_ens),
@@ -397,100 +397,94 @@ fn t21_3_live_concordance_regimes_ordered_disordered_morf_and_hinge() {
         state.concordance_summary.class_counts
     );
 
-    // 2. Planted regimes across realistic contiguous segments:
-    //    - 0..=1: ConcordantOrdered (3D Helix, pLDDT=93, helical NMR shifts, S^2=0.87)
-    //    - 2..=3: ConcordantDisordered (3D Coil, pLDDT=41, coil NMR shifts, S^2=0.30)
-    //    - 4..=6: ConditionalFoldingOrCrystalArtifact (3D Helix, pLDDT=88, random-coil NMR shifts, S^2=0.34)
-    //    - 7..=8: DynamicHingeOrAltState (3D Helix, pLDDT=91, strong beta-strand NMR shifts, S^2=0.86)
-    //    - 9    : UnassignedNmr (0 backbone shifts, no S^2)
-    let seq: Vec<String> = [
-        "ALA", "ALA", "GLY", "SER", "GLU", "ALA", "GLN", "VAL", "ILE", "GLY",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
-    let seq_ids: Vec<i32> = (1..=10).collect();
-    let mut custom_ref = Reference::new(seq, seq_ids);
-    for k in [0usize, 1] {
-        custom_ref.shifts.insert((k, "CA".to_string()), 56.4);
-        custom_ref.shifts.insert((k, "CB".to_string()), 17.3);
+    // 2. Planted regimes evaluated 100% through `nmr_core::af_concordance::evaluate_af_nmr_concordance`
+    //    on 1UBQ's main alpha-helix (`0`-based `23..=32`) and C-terminal tail (`71..=75`):
+    //    - 23..=25: ConcordantOrdered (3D Helix, pLDDT=93, native helical shifts, S^2=0.87)
+    //    - 71..=73: ConcordantDisordered (3D Coil, pLDDT=41, coil shifts, S^2=0.30)
+    //    - 26..=29: ConditionalFoldingOrCrystalArtifact (3D Helix, pLDDT=89, random-coil shifts, S^2=0.34)
+    //    - 30..=32: DynamicHingeOrAltState (3D Helix, pLDDT=91, strong beta-strand shifts, S^2=0.86)
+    //    - 75     : UnassignedNmr (0 backbone shifts, no S^2)
+    let mut planted_ref = ubiq_ref.clone();
+    let mut planted_plddt: Vec<f64> = (0..76).map(|i| 92.0 - ((i % 5) as f64)).collect();
+    for slot in &mut planted_plddt[71..=74] {
+        *slot = 41.0;
     }
-    custom_ref.shifts.insert((2, "CA".to_string()), 45.1);
-    custom_ref.shifts.insert((2, "C".to_string()), 173.9);
-    custom_ref.shifts.insert((3, "CA".to_string()), 58.3);
-    custom_ref.shifts.insert((3, "CB".to_string()), 63.8);
-    custom_ref.shifts.insert((4, "CA".to_string()), 56.6);
-    custom_ref.shifts.insert((4, "CB".to_string()), 30.0);
-    custom_ref.shifts.insert((5, "CA".to_string()), 52.5);
-    custom_ref.shifts.insert((5, "CB".to_string()), 19.1);
-    custom_ref.shifts.insert((6, "CA".to_string()), 55.7);
-    custom_ref.shifts.insert((6, "CB".to_string()), 29.4);
-    custom_ref.shifts.insert((7, "CA".to_string()), 58.5);
-    custom_ref.shifts.insert((7, "CB".to_string()), 36.4);
-    custom_ref.shifts.insert((8, "CA".to_string()), 57.6);
-    custom_ref.shifts.insert((8, "CB".to_string()), 42.1);
+    planted_plddt[75] = 78.0;
+    ubiq_ens.per_residue_plddt = Some(planted_plddt);
 
-    let prop =
-        nmr_core::idp_propensity::compute_idp_propensity(&custom_ref, &PropensityConfig::default());
-    let ss3d = [
-        SsState4::Helix,
-        SsState4::Helix,
-        SsState4::Coil,
-        SsState4::Coil,
-        SsState4::Helix,
-        SsState4::Helix,
-        SsState4::Helix,
-        SsState4::Helix,
-        SsState4::Helix,
-        SsState4::Coil,
-    ];
-    let plddt = [
-        Some(93.0),
-        Some(92.0),
-        Some(41.0),
-        Some(39.0),
-        Some(88.0),
-        Some(90.0),
-        Some(87.0),
-        Some(91.0),
-        Some(92.0),
-        Some(78.0),
-    ];
+    // Random-coil shifts on helix segment 26..=29 (LYS27, ALA28, LYS29, ILE30 -> 0-based 26..=29)
+    planted_ref.shifts.insert((26, "CA".to_string()), 56.2);
+    planted_ref.shifts.insert((26, "CB".to_string()), 32.8);
+    planted_ref.shifts.insert((26, "C".to_string()), 176.4);
+    planted_ref.shifts.insert((27, "CA".to_string()), 52.5);
+    planted_ref.shifts.insert((27, "CB".to_string()), 19.1);
+    planted_ref.shifts.insert((27, "C".to_string()), 177.6);
+    planted_ref.shifts.insert((28, "CA".to_string()), 56.2);
+    planted_ref.shifts.insert((28, "CB".to_string()), 32.8);
+    planted_ref.shifts.insert((28, "C".to_string()), 176.4);
+    planted_ref.shifts.insert((29, "CA".to_string()), 60.9);
+    planted_ref.shifts.insert((29, "CB".to_string()), 38.6);
+    planted_ref.shifts.insert((29, "C".to_string()), 176.2);
+
+    // Strong beta-strand secondary shifts on helix segment 30..=32 (GLN31, ASP32, LYS33 -> 0-based 30..=32)
+    for k in 30..=32 {
+        if let Some(ca) = planted_ref.shifts.get_mut(&(k, "CA".to_string())) {
+            *ca -= 4.8;
+        }
+        if let Some(cb) = planted_ref.shifts.get_mut(&(k, "CB".to_string())) {
+            *cb += 4.2;
+        }
+        if let Some(co) = planted_ref.shifts.get_mut(&(k, "C".to_string())) {
+            *co -= 3.5;
+        }
+    }
+
+    // Clear all shifts on terminal residue 75 -> UnassignedNmr
+    planted_ref.shifts.retain(|&(k, _), _| k != 75);
+
     let mut exp_s2 = BTreeMap::new();
-    for k in [0, 1] {
+    for k in 23..=25 {
         exp_s2.insert(k, 0.87);
     }
-    for k in [2, 3] {
+    for k in 71..=73 {
         exp_s2.insert(k, 0.30);
     }
-    for k in [4, 5, 6] {
+    for k in 26..=29 {
         exp_s2.insert(k, 0.34);
     }
-    for k in [7, 8] {
+    for k in 30..=32 {
         exp_s2.insert(k, 0.86);
     }
 
-    let summary = evaluate_concordance_with_summary(
-        10,
-        Some(&ss3d),
-        Some(&plddt),
-        Some(&prop),
+    let mut planted_state = SsRibbonState::new();
+    planted_state.sync_from_ensemble_and_nmr(
+        planted_ref.sequence.len(),
+        Some(&ubiq_ens),
+        Some(&planted_ref),
+        &PropensityConfig::default(),
         Some(&exp_s2),
     );
-    assert_eq!(summary.classes[0], ConcordanceTrackClass::ConcordantOrdered);
+    assert_eq!(planted_state.rigidity_source_label(), "Experimental S²");
     assert_eq!(
-        summary.classes[2],
+        planted_state.concordance_summary.classes[24],
+        ConcordanceTrackClass::ConcordantOrdered
+    );
+    assert_eq!(
+        planted_state.concordance_summary.classes[72],
         ConcordanceTrackClass::ConcordantDisordered
     );
     assert_eq!(
-        summary.classes[5],
+        planted_state.concordance_summary.classes[27],
         ConcordanceTrackClass::ConditionalFoldingOrCrystalArtifact
     );
     assert_eq!(
-        summary.classes[7],
+        planted_state.concordance_summary.classes[31],
         ConcordanceTrackClass::DynamicHingeOrAltState
     );
-    assert_eq!(summary.classes[9], ConcordanceTrackClass::UnassignedNmr);
+    assert_eq!(
+        planted_state.concordance_summary.classes[75],
+        ConcordanceTrackClass::UnassignedNmr
+    );
 }
 
 #[test]

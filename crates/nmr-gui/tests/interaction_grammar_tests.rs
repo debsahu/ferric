@@ -662,3 +662,414 @@ fn test_c8_c10_c12_c16_c18_and_phase21_provenance_concordance_pae_cache() {
         assert!(INTERACTION_GRAMMAR.len() >= 10);
     }
 }
+
+#[test]
+fn test_c18_headless_gesture_matrix_across_1d_strips_mol3d_and_octet() {
+    use nmr_gui::octet_canvas::OctetDrawPanel;
+    use nmr_gui::stack1d_panel::render_stack1d_panel;
+
+    let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+    let wheel_ev = |dy: f32, modifiers: egui::Modifiers| -> egui::Event {
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, dy),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Trackpad,
+            modifiers,
+        }
+    };
+
+    // ------------------------------------------------------------------------
+    // A) 1D Spectrum (`Spectrum1d`): Scroll=gain, Cmd+Scroll=zoom, Shift+Scroll=pan,
+    //    +/-=signal, Arrow=pan, Shift+Arrow=nudge peak, Shift+drag=zoom box,
+    //    Space+drag=pan (even in Phase mode!), Double-click=reset (pushes zoom history)
+    // ------------------------------------------------------------------------
+    {
+        let ctx = egui::Context::default();
+        let ax = AxisPpm::from_bounds("1H", 512, 10.0, 0.0, 600.0);
+        let mut real = vec![0.02_f64; 512];
+        for (k, slot) in real.iter_mut().enumerate() {
+            let ppm = ax.index_to_ppm(k as f64);
+            *slot += 10.0 * (-0.5 * ((ppm - 7.26) / 0.02).powi(2)).exp();
+            *slot += 6.0 * (-0.5 * ((ppm - 3.65) / 0.02).powi(2)).exp();
+        }
+        let sp = Spectrum1D::new("1h", Experiment1DKind::Proton1D, ax, real, None);
+        let mut st = Stack1dState::default();
+        st.load_user_spectra(vec![sp]);
+
+        let mut t_sec = 0.1_f64;
+        let mut run_1d = |events: Vec<egui::Event>, st: &mut Stack1dState| {
+            t_sec += 0.25;
+            let raw = egui::RawInput {
+                screen_rect: Some(vp),
+                time: Some(t_sec),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    render_stack1d_panel(ui, st);
+                });
+            });
+            out.textures_delta.clear();
+        };
+
+        // Warm-up 2 frames
+        run_1d(Vec::new(), &mut st);
+        run_1d(Vec::new(), &mut st);
+        let c = st.last_plot_rect.expect("1d plot_rect").center();
+
+        // 1. Plain Scroll -> increases y_gain WITHOUT changing ppm bounds
+        let g0 = st.y_gain;
+        let (lo0, hi0) = (st.view_ppm_min, st.view_ppm_max);
+        run_1d(
+            vec![
+                egui::Event::PointerMoved(c),
+                wheel_ev(24.0, egui::Modifiers::NONE),
+            ],
+            &mut st,
+        );
+        assert!(
+            st.y_gain > g0,
+            "1D plain scroll up must increase y_gain ({g0} -> {})",
+            st.y_gain
+        );
+        assert!((st.view_ppm_min - lo0).abs() < 1e-9 && (st.view_ppm_max - hi0).abs() < 1e-9);
+
+        // 2. Cmd/Ctrl+Scroll -> zooms ppm window and pushes zoom_history
+        let cmd_mod = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let zhist0 = st.zoom_history.len();
+        let span0 = (st.view_ppm_max - st.view_ppm_min).abs();
+        run_1d(
+            vec![egui::Event::PointerMoved(c), wheel_ev(36.0, cmd_mod)],
+            &mut st,
+        );
+        let span1 = (st.view_ppm_max - st.view_ppm_min).abs();
+        assert!(
+            span1 < span0 && st.zoom_history.len() > zhist0,
+            "1D Cmd+Scroll must zoom in and push zoom history"
+        );
+
+        // 3. Shift+Scroll -> pans horizontally without changing span
+        let sh_mod = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let lo_pre_pan = st.view_ppm_min;
+        run_1d(
+            vec![egui::Event::PointerMoved(c), wheel_ev(36.0, sh_mod)],
+            &mut st,
+        );
+        assert!(
+            (st.view_ppm_min - lo_pre_pan).abs() > 1e-4,
+            "1D Shift+Scroll must pan horizontally"
+        );
+
+        // 4. `+` / `-` -> more / less signal
+        let g_pre_plus = st.y_gain;
+        run_1d(
+            vec![
+                egui::Event::PointerMoved(c),
+                egui::Event::Text("+".to_string()),
+            ],
+            &mut st,
+        );
+        assert!(st.y_gain > g_pre_plus, "1D '+' must increase y_gain");
+        let g_after_plus = st.y_gain;
+        run_1d(
+            vec![
+                egui::Event::PointerMoved(c),
+                egui::Event::Text("-".to_string()),
+            ],
+            &mut st,
+        );
+        assert!(st.y_gain < g_after_plus, "1D '-' must decrease y_gain");
+
+        // 5. ArrowLeft -> pans by 10%
+        let lo_arr = st.view_ppm_min;
+        run_1d(
+            vec![
+                egui::Event::PointerMoved(c),
+                egui::Event::Key {
+                    key: egui::Key::ArrowLeft,
+                    physical_key: Some(egui::Key::ArrowLeft),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut st,
+        );
+        assert!(
+            (st.view_ppm_min - lo_arr).abs() > 1e-4,
+            "1D ArrowLeft must pan"
+        );
+
+        // 6. Shift+ArrowLeft -> nudges selected peak (and records undo snapshot)
+        assert!(!st.picked_peaks.is_empty());
+        st.selected_peak_idx = Some(0);
+        let pk0 = st.picked_peaks[0].ppm;
+        let _ = st.drain_pending_undo();
+        run_1d(
+            vec![
+                egui::Event::PointerMoved(c),
+                egui::Event::Key {
+                    key: egui::Key::ArrowLeft,
+                    physical_key: Some(egui::Key::ArrowLeft),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: sh_mod,
+                },
+            ],
+            &mut st,
+        );
+        assert!(
+            (st.picked_peaks[0].ppm - pk0).abs() > 1e-5 && !st.drain_pending_undo().is_empty(),
+            "1D Shift+ArrowLeft must nudge selected peak and emit undo snapshot"
+        );
+
+        // 7. Space in Phase mode NEVER hijacks phase pivot (`UI-C5`)
+        st.select_tool_mode(ToolMode1d::Phase);
+        let piv_before = (st.phase_pivot_mode, st.phase_pivot_ppm);
+        run_1d(
+            vec![
+                egui::Event::PointerMoved(c),
+                egui::Event::Key {
+                    key: egui::Key::Space,
+                    physical_key: Some(egui::Key::Space),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut st,
+        );
+        assert_eq!(
+            (st.phase_pivot_mode, st.phase_pivot_ppm),
+            piv_before,
+            "Space in 1D Phase mode must NEVER mutate phase pivot (`UI-C5`)"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // B) 3D Strips (`StripTilerPanel`): Scroll=gain, Cmd+Scroll=13C zoom,
+    //    Shift+Scroll=13C pan, +/-=gain, ArrowUp=13C pan, Shift+ArrowUp=nudge peak
+    // ------------------------------------------------------------------------
+    {
+        let suite =
+            build_builtin_demo_suite(BUILTIN_DEMO_SUITE_SEED).expect("build builtin demo suite");
+        let ref_data = suite.ubiquitin_ref;
+        let systems =
+            build_spin_systems(&suite.peaks, &Tolerances::default(), 4, false).expect("systems");
+        let scfg = ScoreConfig::default();
+        let u_mat = unary_matrix(&systems, &ref_data.sequence, &Priors::bmrb(), &scfg);
+        let p_mat = pair_matrix(&systems, &scfg);
+
+        let ctx = egui::Context::default();
+        let mut tiler = StripTilerPanel::new();
+        let mut t_sec = 0.1_f64;
+        let mut run_strips =
+            |events: Vec<egui::Event>, tiler: &mut StripTilerPanel| -> Vec<StripTilerAction> {
+                t_sec += 0.25;
+                let raw = egui::RawInput {
+                    screen_rect: Some(vp),
+                    time: Some(t_sec),
+                    events,
+                    ..Default::default()
+                };
+                let mut acts = Vec::new();
+                let mut out = ctx.run_ui(raw, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let tctx = StripTilerContext {
+                            systems: &systems,
+                            pair_mat: &p_mat,
+                            u_mat: Some(&u_mat),
+                            sequence: &ref_data.sequence,
+                            seq_ids: &ref_data.seq_ids,
+                            active_root: 0,
+                            assignments: None,
+                            locks: None,
+                            confirmed_links: None,
+                            spectra_3d: StripSpectra3D {
+                                aliphatic_3d: Some(&suite.hncacb_3d),
+                                carbonyl_3d: None,
+                            },
+                        };
+                        acts = tiler.show(ui, &tctx, None);
+                    });
+                });
+                out.textures_delta.clear();
+                acts
+            };
+
+        let _ = run_strips(Vec::new(), &mut tiler);
+        let c = tiler.last_canvas_rect.expect("strips canvas rect").center();
+
+        // Plain Scroll -> increases strip_gain without zooming indirect_zoom
+        let sg0 = tiler.strip_gain;
+        let _ = run_strips(
+            vec![
+                egui::Event::PointerMoved(c),
+                wheel_ev(24.0, egui::Modifiers::NONE),
+            ],
+            &mut tiler,
+        );
+        assert!(tiler.strip_gain > sg0 && tiler.indirect_zoom.is_none());
+
+        // Cmd+Scroll -> zooms indirect 13C range
+        let cmd_mod = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let _ = run_strips(
+            vec![egui::Event::PointerMoved(c), wheel_ev(36.0, cmd_mod)],
+            &mut tiler,
+        );
+        let z_after_cmd = tiler
+            .indirect_zoom
+            .expect("Cmd+Scroll on Strips must zoom 13C");
+
+        // Shift+Scroll -> pans indirect 13C range
+        let sh_mod = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let _ = run_strips(
+            vec![egui::Event::PointerMoved(c), wheel_ev(36.0, sh_mod)],
+            &mut tiler,
+        );
+        assert_ne!(
+            tiler.indirect_zoom.unwrap(),
+            z_after_cmd,
+            "Shift+Scroll on Strips must pan 13C range"
+        );
+
+        // `+` / `-` -> strip_gain up/down
+        let sg_pre = tiler.strip_gain;
+        let _ = run_strips(
+            vec![
+                egui::Event::PointerMoved(c),
+                egui::Event::Text("+".to_string()),
+            ],
+            &mut tiler,
+        );
+        assert!(tiler.strip_gain > sg_pre);
+
+        // ArrowUp (unshifted) -> pans indirect_zoom
+        let z_pre_arr = tiler.indirect_zoom.unwrap();
+        let _ = run_strips(
+            vec![
+                egui::Event::PointerMoved(c),
+                egui::Event::Key {
+                    key: egui::Key::ArrowUp,
+                    physical_key: Some(egui::Key::ArrowUp),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut tiler,
+        );
+        assert_ne!(tiler.indirect_zoom.unwrap(), z_pre_arr);
+    }
+
+    // ------------------------------------------------------------------------
+    // C) 3D Model (`Mol3dViewerPanel`) & Sketcher (`OctetDrawPanel`): plain Scroll zooms
+    // ------------------------------------------------------------------------
+    {
+        let ref_data = read_star_str(SYNTH_UBQ_STR, None).expect("ubq");
+        let mut mol3d = Mol3dViewerPanel::new();
+        mol3d
+            .load_structure_text(UBQ_1UBQ_PDB, &ref_data.sequence, &ref_data.seq_ids)
+            .expect("1ubq");
+        let ctx_m = egui::Context::default();
+        let mut out0 = ctx_m.run_ui(
+            egui::RawInput {
+                screen_rect: Some(vp),
+                time: Some(0.1),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let _ = mol3d.show(
+                        ui,
+                        None,
+                        &ref_data.sequence,
+                        &ref_data.seq_ids,
+                        Some(&ref_data),
+                    );
+                });
+            },
+        );
+        out0.textures_delta.clear();
+        let mc = mol3d.last_canvas_rect.expect("mol3d canvas").center();
+        let dist0 = mol3d.camera.distance;
+        let mut out1 = ctx_m.run_ui(
+            egui::RawInput {
+                screen_rect: Some(vp),
+                time: Some(0.4),
+                events: vec![
+                    egui::Event::PointerMoved(mc),
+                    wheel_ev(36.0, egui::Modifiers::NONE),
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let _ = mol3d.show(
+                        ui,
+                        None,
+                        &ref_data.sequence,
+                        &ref_data.seq_ids,
+                        Some(&ref_data),
+                    );
+                });
+            },
+        );
+        out1.textures_delta.clear();
+        assert!(
+            (mol3d.camera.distance - dist0).abs() > 1e-4,
+            "Mol3D plain scroll must zoom camera"
+        );
+
+        let mut octet = OctetDrawPanel::new();
+        let ctx_o = egui::Context::default();
+        let mut oo0 = ctx_o.run_ui(
+            egui::RawInput {
+                screen_rect: Some(vp),
+                time: Some(0.1),
+                ..Default::default()
+            },
+            |ui| {
+                octet.show(ui);
+            },
+        );
+        oo0.textures_delta.clear();
+        let oc = octet.last_canvas_rect.expect("octet canvas").center();
+        let z0 = octet.pixels_per_bond;
+        let mut oo1 = ctx_o.run_ui(
+            egui::RawInput {
+                screen_rect: Some(vp),
+                time: Some(0.4),
+                events: vec![
+                    egui::Event::PointerMoved(oc),
+                    wheel_ev(36.0, egui::Modifiers::NONE),
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                octet.show(ui);
+            },
+        );
+        oo1.textures_delta.clear();
+        assert!(
+            (octet.pixels_per_bond - z0).abs() > 1e-4,
+            "Octet plain scroll must zoom canvas"
+        );
+    }
+}

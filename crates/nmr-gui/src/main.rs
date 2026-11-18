@@ -167,7 +167,8 @@ use nmr_gui::{
     },
     undo_journal::{KeyedSnapshotStack, SpectrumKey, UndoJournal, UndoOrigin},
     workbench_mode::{
-        draw_mode_switcher, draw_sub_view_selector, DynamicsView, SmallMoleculeView, WorkbenchMode,
+        draw_mode_switcher_with_rect, draw_sub_view_selector, DynamicsView, SmallMoleculeView,
+        WorkbenchMode,
     },
     workbook::{
         build_showcase_small_molecule_13c_trace, build_showcase_small_molecule_1h_trace,
@@ -1664,8 +1665,20 @@ enum AppUndoPayload {
         page_idx: usize,
         peaks_3d: Vec<CubePeak3D>,
     },
-    /// 1D trace snapshot (phase, baseline, reference, peak/ROI edit).
+    /// 1D trace snapshot (phase, baseline, reference, peak/ROI edit, water suppression).
     Stack1d(Box<Stack1dUndoSnapshot>),
+    /// 2D water suppression snapshot keyed to `pages_2d[page_idx]`.
+    Water2d {
+        page_idx: usize,
+        key: SpectrumKey,
+        spec: Box<Spectrum2D>,
+    },
+    /// 3D cube water suppression snapshot (`Arc<Spectrum3D>`, zero cube clone).
+    Water3d {
+        cube_idx: usize,
+        key: SpectrumKey,
+        cube: Arc<Spectrum3D>,
+    },
 }
 
 struct NmrWorkbenchApp {
@@ -1675,6 +1688,8 @@ struct NmrWorkbenchApp {
     dynamics_view: DynamicsView,
     structure_show_pae_view: bool,
     developer_benchmark_mode: bool,
+    last_mode_switcher_rect: egui::Rect,
+    last_global_chrome_rects: Vec<egui::Rect>,
     sequence_search_query: String,
     goto_ppm_2d_input: String,
     drag_peak_pre_snapshot: Option<Peaks2dDragSnapshot>,
@@ -2217,6 +2232,8 @@ impl NmrWorkbenchApp {
             dynamics_view: DynamicsView::Relaxation,
             structure_show_pae_view: false,
             developer_benchmark_mode: false,
+            last_mode_switcher_rect: egui::Rect::ZERO,
+            last_global_chrome_rects: Vec::new(),
             sequence_search_query: String::new(),
             goto_ppm_2d_input: String::new(),
             drag_peak_pre_snapshot: None,
@@ -2537,6 +2554,42 @@ impl NmrWorkbenchApp {
         SpectrumKey::Cube3d(cname)
     }
 
+    fn commit_contour_base_change(&mut self, next_base: f32) {
+        if let Some(layer) = self
+            .session
+            .state
+            .contour_layers
+            .iter_mut()
+            .find(|l| l.layer_id == "HSQC")
+        {
+            layer.base_level = self.contour_base;
+            layer.level_factor = self.contour_factor;
+            layer.num_levels = self.contour_levels;
+            layer.show_negative = self.show_negative;
+            layer.ppm_nudge = self.primary_ppm_nudge;
+        } else {
+            let mut cur = SessionContourParams::new("HSQC");
+            cur.base_level = self.contour_base;
+            cur.level_factor = self.contour_factor;
+            cur.num_levels = self.contour_levels;
+            cur.show_negative = self.show_negative;
+            cur.ppm_nudge = self.primary_ppm_nudge;
+            self.session.state.contour_layers.push(cur);
+        }
+        self.contour_base = next_base;
+        let mut params = SessionContourParams::new("HSQC");
+        params.base_level = self.contour_base;
+        params.level_factor = self.contour_factor;
+        params.num_levels = self.contour_levels;
+        params.show_negative = self.show_negative;
+        params.ppm_nudge = self.primary_ppm_nudge;
+        let msg = self.execute_session_cmd(WorkbenchCommand::SetContourParams {
+            layer_id: "HSQC".to_string(),
+            params,
+        });
+        self.status_msg = msg;
+    }
+
     fn undo_unified(&mut self) {
         self.drain_1d_undo_into_journal();
         if let Some(mut entry) = self.undo_journal.pop_undo() {
@@ -2591,6 +2644,91 @@ impl NmrWorkbenchApp {
                     if let Some(redo_snap) = self.stack1d_panel.restore_undo_snapshot(*snap) {
                         self.status_msg = format!("Undo: {}", entry.label);
                         entry.payload = AppUndoPayload::Stack1d(Box::new(redo_snap));
+                        self.undo_journal.push_redo(entry);
+                        return;
+                    }
+                }
+                AppUndoPayload::Water2d {
+                    page_idx,
+                    key,
+                    spec,
+                } => {
+                    let prev_spec = *spec;
+                    let cur_opt = if self.workbook.active_2d_idx == page_idx {
+                        self.hsqc_spec.clone()
+                    } else {
+                        self.workbook
+                            .pages_2d
+                            .get(page_idx)
+                            .map(|pg| pg.spec.clone())
+                    };
+                    if let Some(cur_spec) = cur_opt {
+                        let _ = self.water_undo_stack_2d.pop(&key);
+                        let has_more = self.water_undo_stack_2d.has(&key);
+                        if let Some(pg) = self.workbook.pages_2d.get_mut(page_idx) {
+                            pg.spec = prev_spec.clone();
+                        }
+                        if self.workbook.active_2d_idx == page_idx {
+                            let (base, nref) = Self::estimate_2d_contour_base(&prev_spec.data);
+                            self.contour_noise_ref = nref;
+                            self.contour_base = base;
+                            self.hsqc_arc = Arc::new(prev_spec.data.clone());
+                            self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+                            self.workbook.update_active_2d_spectrum(prev_spec.clone());
+                            self.hsqc_spec = Some(prev_spec.clone());
+                            self.water_undo_2d = has_more.then_some(prev_spec);
+                            self.save_live_2d_into_workbook();
+                        }
+                        self.status_msg = format!("Undo: {}", entry.label);
+                        entry.payload = AppUndoPayload::Water2d {
+                            page_idx,
+                            key,
+                            spec: Box::new(cur_spec),
+                        };
+                        self.undo_journal.push_redo(entry);
+                        return;
+                    }
+                }
+                AppUndoPayload::Water3d {
+                    cube_idx,
+                    key,
+                    cube,
+                } => {
+                    if cube_idx < self.cubes_3d.len() {
+                        let cur_cube = Arc::clone(&self.cubes_3d[cube_idx]);
+                        let _ = self.water_undo_stack_3d.pop(&key);
+                        let has_more = self.water_undo_stack_3d.has(&key);
+                        if self
+                            .hncacb_3d
+                            .as_ref()
+                            .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
+                        {
+                            self.hncacb_3d = Some((*cube).clone());
+                        }
+                        if self
+                            .hnco_3d
+                            .as_ref()
+                            .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
+                        {
+                            self.hnco_3d = Some((*cube).clone());
+                        }
+                        self.cubes_3d[cube_idx] = Arc::clone(&cube);
+                        self.water_undo_3d = has_more.then_some(cube);
+                        if self.active_cube_idx == Some(cube_idx) {
+                            self.apply_active_cube_slice_refresh(false);
+                            if let Some(ref s2) = self.hsqc_spec {
+                                let (base, nref) = Self::estimate_2d_contour_base(&s2.data);
+                                self.contour_noise_ref = nref;
+                                self.contour_base = base;
+                                self.save_live_2d_into_workbook();
+                            }
+                        }
+                        self.status_msg = format!("Undo: {}", entry.label);
+                        entry.payload = AppUndoPayload::Water3d {
+                            cube_idx,
+                            key,
+                            cube: cur_cube,
+                        };
                         self.undo_journal.push_redo(entry);
                         return;
                     }
@@ -2662,6 +2800,90 @@ impl NmrWorkbenchApp {
                     if let Some(undo_snap) = self.stack1d_panel.restore_undo_snapshot(*snap) {
                         self.status_msg = format!("Redo: {}", entry.label);
                         entry.payload = AppUndoPayload::Stack1d(Box::new(undo_snap));
+                        self.undo_journal.push_undo_after_redo(entry);
+                        return;
+                    }
+                }
+                AppUndoPayload::Water2d {
+                    page_idx,
+                    key,
+                    spec,
+                } => {
+                    let next_spec = *spec;
+                    let cur_opt = if self.workbook.active_2d_idx == page_idx {
+                        self.hsqc_spec.clone()
+                    } else {
+                        self.workbook
+                            .pages_2d
+                            .get(page_idx)
+                            .map(|pg| pg.spec.clone())
+                    };
+                    if let Some(cur_spec) = cur_opt {
+                        self.water_undo_stack_2d.push(key.clone(), cur_spec.clone());
+                        if let Some(pg) = self.workbook.pages_2d.get_mut(page_idx) {
+                            pg.spec = next_spec.clone();
+                        }
+                        if self.workbook.active_2d_idx == page_idx {
+                            let (base, nref) = Self::estimate_2d_contour_base(&next_spec.data);
+                            self.contour_noise_ref = nref;
+                            self.contour_base = base;
+                            self.hsqc_arc = Arc::new(next_spec.data.clone());
+                            self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+                            self.workbook.update_active_2d_spectrum(next_spec.clone());
+                            self.hsqc_spec = Some(next_spec);
+                            self.water_undo_2d = Some(cur_spec.clone());
+                            self.save_live_2d_into_workbook();
+                        }
+                        self.status_msg = format!("Redo: {}", entry.label);
+                        entry.payload = AppUndoPayload::Water2d {
+                            page_idx,
+                            key,
+                            spec: Box::new(cur_spec),
+                        };
+                        self.undo_journal.push_undo_after_redo(entry);
+                        return;
+                    }
+                }
+                AppUndoPayload::Water3d {
+                    cube_idx,
+                    key,
+                    cube,
+                } => {
+                    if cube_idx < self.cubes_3d.len() {
+                        let cur_cube = Arc::clone(&self.cubes_3d[cube_idx]);
+                        self.water_undo_stack_3d
+                            .push(key.clone(), Arc::clone(&cur_cube));
+                        if self
+                            .hncacb_3d
+                            .as_ref()
+                            .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
+                        {
+                            self.hncacb_3d = Some((*cube).clone());
+                        }
+                        if self
+                            .hnco_3d
+                            .as_ref()
+                            .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
+                        {
+                            self.hnco_3d = Some((*cube).clone());
+                        }
+                        self.cubes_3d[cube_idx] = Arc::clone(&cube);
+                        self.water_undo_3d = Some(Arc::clone(&cur_cube));
+                        if self.active_cube_idx == Some(cube_idx) {
+                            self.apply_active_cube_slice_refresh(false);
+                            if let Some(ref s2) = self.hsqc_spec {
+                                let (base, nref) = Self::estimate_2d_contour_base(&s2.data);
+                                self.contour_noise_ref = nref;
+                                self.contour_base = base;
+                                self.save_live_2d_into_workbook();
+                            }
+                        }
+                        self.status_msg = format!("Redo: {}", entry.label);
+                        entry.payload = AppUndoPayload::Water3d {
+                            cube_idx,
+                            key,
+                            cube: cur_cube,
+                        };
                         self.undo_journal.push_undo_after_redo(entry);
                         return;
                     }
@@ -3109,6 +3331,9 @@ impl NmrWorkbenchApp {
     }
 
     fn sync_ss_ribbon_and_concordance(&mut self) {
+        self.ss_ribbon_state.clear_concordance_override();
+        let active_shifts = self.pred_ref.as_ref().or(self.reference.as_ref());
+        self.ss_ribbon_state.cached_reference = active_shifts.cloned();
         let exp_s2 = (!self.mol3d_panel.track_data.lipari_szabo_s2.is_empty())
             .then_some(&self.mol3d_panel.track_data.lipari_szabo_s2);
         self.ss_ribbon_state.sync_with_cached_propensity(
@@ -3117,37 +3342,85 @@ impl NmrWorkbenchApp {
             self.propensity_report.as_ref(),
             exp_s2,
         );
-        // Drive Track 3 directly from `nmr_core::af_concordance` whenever a predicted model + shifts
-        // are available (`21.W1:P1-5`).
-        if let Some(ref rep) = self.integrative_af_panel.concordance_report {
-            if rep.residues.len() == self.sequence.len() {
-                let classes: Vec<_> = rep.residues.iter().map(|r| r.concordance_class).collect();
-                self.ss_ribbon_state.set_core_concordance_override(&classes);
-            }
-        } else if let (Some(ens), Some(pdb_txt), Some(shifts)) = (
-            self.mol3d_panel.ensemble.as_ref(),
-            self.loaded_pdb_text.as_deref(),
-            self.pred_ref.as_ref().or(self.reference.as_ref()),
-        ) {
-            if ens
-                .require_predicted_model(self.mol3d_panel.treat_bfactors_as_plddt)
-                .is_ok()
-            {
-                let ingest_opts = nmr_core::af_concordance::AfIngestOptions {
-                    force_bfactor_plddt: self.mol3d_panel.treat_bfactors_as_plddt,
-                    ..Default::default()
-                };
-                if let Ok(af_model) =
-                    nmr_core::af_concordance::parse_af_structure_model_str(pdb_txt, &ingest_opts)
-                {
-                    let cfg = nmr_core::af_concordance::AfConcordanceConfig::default();
-                    if let Ok(rep) = nmr_core::af_concordance::evaluate_af_nmr_concordance(
-                        &af_model, shifts, None, None, &cfg,
-                    ) {
-                        if rep.residues.len() == self.sequence.len() {
-                            let classes: Vec<_> =
-                                rep.residues.iter().map(|r| r.concordance_class).collect();
-                            self.ss_ribbon_state.set_core_concordance_override(&classes);
+
+        let treat_as_model = self.mol3d_panel.treat_bfactors_as_plddt;
+        let ensemble_allows_af = self
+            .mol3d_panel
+            .ensemble
+            .as_ref()
+            .is_none_or(|ens| ens.require_predicted_model(treat_as_model).is_ok());
+
+        // Drive Track 3 strictly from `nmr_core::af_concordance` (`21.W1:P1-5`), aligning by `seq_id`
+        // and forwarding experimental Lipari-Szabo `S^2` whenever present.
+        if ensemble_allows_af {
+            if let Some(ref rep) = self.integrative_af_panel.concordance_report {
+                self.ss_ribbon_state.set_core_concordance_report_aligned(
+                    self.sequence.len(),
+                    &self.seq_ids,
+                    rep,
+                    exp_s2,
+                );
+            } else if let (Some(ens), Some(shifts)) = (
+                self.mol3d_panel.ensemble.as_ref(),
+                self.pred_ref.as_ref().or(self.reference.as_ref()),
+            ) {
+                if ens.require_predicted_model(treat_as_model).is_ok() {
+                    let ingest_opts = nmr_core::af_concordance::AfIngestOptions {
+                        force_bfactor_plddt: treat_as_model,
+                        ..Default::default()
+                    };
+                    let af_model_opt = self
+                        .loaded_pdb_text
+                        .as_deref()
+                        .and_then(|txt| {
+                            nmr_core::af_concordance::parse_af_structure_model_str(
+                                txt,
+                                &ingest_opts,
+                            )
+                            .ok()
+                        })
+                        .or_else(|| {
+                            nmr_gui::ss_ribbon_widget::ensemble_to_af_structure_model(
+                                ens,
+                                treat_as_model,
+                            )
+                        });
+                    if let Some(af_model) = af_model_opt {
+                        let s2_entries: Option<Vec<nmr_core::af_concordance::ExperimentalS2Entry>> =
+                            exp_s2.map(|m| {
+                                m.iter()
+                                    .filter(|&(_, &v)| v.is_finite() && (0.0..=1.0).contains(&v))
+                                    .map(|(&k, &v)| nmr_core::af_concordance::ExperimentalS2Entry {
+                                        seq_id: self
+                                            .seq_ids
+                                            .get(k)
+                                            .copied()
+                                            .or_else(|| shifts.seq_ids.get(k).copied())
+                                            .unwrap_or((k + 1) as i32),
+                                        res_name: self
+                                            .sequence
+                                            .get(k)
+                                            .cloned()
+                                            .or_else(|| shifts.sequence.get(k).cloned()),
+                                        s2: v,
+                                        sigma_s2: None,
+                                    })
+                                    .collect()
+                            });
+                        let cfg = nmr_core::af_concordance::AfConcordanceConfig::default();
+                        if let Ok(rep) = nmr_core::af_concordance::evaluate_af_nmr_concordance(
+                            &af_model,
+                            shifts,
+                            None,
+                            s2_entries.as_deref().filter(|entries| !entries.is_empty()),
+                            &cfg,
+                        ) {
+                            self.ss_ribbon_state.set_core_concordance_report_aligned(
+                                self.sequence.len(),
+                                &self.seq_ids,
+                                &rep,
+                                exp_s2,
+                            );
                         }
                     }
                 }
@@ -3186,9 +3459,8 @@ impl NmrWorkbenchApp {
                         }
                     }
                 }
-                if text.lines().any(|ln| ln.starts_with("ATOM  ")) {
-                    self.loaded_pdb_text = Some(text.to_string());
-                }
+                self.loaded_pdb_text = Some(text.to_string());
+                self.integrative_af_panel.concordance_report = None;
                 self.show_mol3d_viewport = true;
                 self.has_structure_or_dynamics = true;
                 self.workspace_mode = WorkspaceMode::ProteinNmr;
@@ -5778,6 +6050,7 @@ impl NmrWorkbenchApp {
             height: Some(amp),
             volume: Some(amp),
         };
+        self.session.state.peaks = self.peaks.clone();
         let _ = self.execute_session_cmd(WorkbenchCommand::AddPeak(pk));
         self.peaks = self.session.state.peaks.clone();
         let new_idx = self.peaks.len().saturating_sub(1);
@@ -7094,20 +7367,21 @@ impl NmrWorkbenchApp {
         tablet_dock: Option<&mut TabletActiveDock>,
     ) {
         let ctx = ui.ctx().clone();
+        self.last_global_chrome_rects.clear();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
 
             // Left: Collapsible Mode Data List Sidebar Toggle + single FERRIC brand mark (`UI-B5`)
-            if chrome_icon_button(
+            let sb_resp = chrome_icon_button(
                 ui,
                 WorkbookIcon::SidebarToggle,
                 None,
                 self.workbook.show_sidebar,
                 "Show / hide left data list sidebar",
                 26.0,
-            )
-            .clicked()
-            {
+            );
+            self.last_global_chrome_rects.push(sb_resp.rect);
+            if sb_resp.clicked() {
                 self.workbook.show_sidebar = !self.workbook.show_sidebar;
             }
 
@@ -7122,7 +7396,9 @@ impl NmrWorkbenchApp {
             ui.separator();
 
             // Single canonical 6-mode switcher (`UI-B1`, `21.W3:P1-15`)
-            if let Some(next_mode) = draw_mode_switcher(ui, self.workbench_mode) {
+            let (next_mode_opt, ms_rect) = draw_mode_switcher_with_rect(ui, self.workbench_mode);
+            self.last_mode_switcher_rect = ms_rect;
+            if let Some(next_mode) = next_mode_opt {
                 self.set_workbench_mode(next_mode);
             }
 
@@ -7353,29 +7629,29 @@ impl NmrWorkbenchApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 5.0;
 
-                if chrome_icon_button(
+                let cmdk_resp = chrome_icon_button(
                     ui,
                     WorkbookIcon::CommandKey,
                     Some("Cmd+K"),
                     self.command_palette.open,
                     "Open Command Palette (Cmd/Ctrl+K) — samples, export, overlays, settings",
                     26.0,
-                )
-                .clicked()
-                {
+                );
+                self.last_global_chrome_rects.push(cmdk_resp.rect);
+                if cmdk_resp.clicked() {
                     self.command_palette.open = !self.command_palette.open;
                 }
 
-                if chrome_icon_button(
+                let open_resp = chrome_icon_button(
                     ui,
                     WorkbookIcon::Folder,
                     Some("Open"),
                     false,
                     "Open Bruker folder, .zip/.tar.gz, .str/.nef/.tsv, .jdx, .ucsf/.ft2, .pdb/.cif, or .mol/.sdf (Cmd/Ctrl+O)",
                     26.0,
-                )
-                .clicked()
-                {
+                );
+                self.last_global_chrome_rects.push(open_resp.rect);
+                if open_resp.clicked() {
                     self.arm_browser_picker_wakeup();
                     #[cfg(target_arch = "wasm32")]
                     trigger_browser_folder_picker();
@@ -8437,18 +8713,39 @@ impl NmrWorkbenchApp {
             self.reset_view_to_spec();
         }
 
-        // Canonical Scroll Wheel & Trackpad Gestures over 2D/3D Plot (`UI-C11`, `UI-C18`):
-        // - Horizontal trackpad scroll = Pan F2 horizontally
-        // - `Shift + Scroll` on `Cube3d` = Step orthogonal 3D plane (`+1` / `-1` slice); on 2D = contour floor
-        // - `Ctrl` / `Cmd` + Scroll = Zoom indirect axis (`F1`) around cursor
-        // - Plain vertical Scroll = Zoom 2D (`F2` & `F1`) around cursor
+        // Canonical Scroll Wheel & Trackpad Gestures over 2D/3D Plot (`UI-C2`, `UI-C7`, `UI-C11`, `UI-C18`):
+        // - Plain vertical Scroll = Adjust contour floor (`sy > 0` lowers floor -> more signal, undoable via `Cmd+Z`)
+        // - `Ctrl` / `Cmd` + Scroll = Zoom 2D (`F2` & `F1`) about the pointer (pushes zoom history)
+        // - `Shift + Scroll` = Step orthogonal 3D plane (`CubePlane3d`) / pan `F2` horizontally (`Spectrum2d`)
+        // - Horizontal trackpad scroll = Pan `F2` horizontally
         if !multi_touch_active {
             if let Some(hover_pos) = response.hover_pos() {
                 let (scroll_x, scroll_y, ctrl_or_cmd, shift_mod) = ui.ctx().input_mut(|i| {
-                    let sh = i.modifiers.shift;
-                    let cc = i.modifiers.command || i.modifiers.ctrl;
-                    let sx = i.smooth_scroll_delta.x;
-                    let sy = i.smooth_scroll_delta.y;
+                    let mut sh = i.modifiers.shift;
+                    let mut cc = i.modifiers.command || i.modifiers.ctrl;
+                    let mut wx = 0.0f32;
+                    let mut wy = 0.0f32;
+                    for ev in &i.events {
+                        if let egui::Event::MouseWheel {
+                            delta, modifiers, ..
+                        } = ev
+                        {
+                            wx += delta.x;
+                            wy += delta.y;
+                            sh |= modifiers.shift;
+                            cc |= modifiers.command || modifiers.ctrl;
+                        }
+                    }
+                    let sx = if i.smooth_scroll_delta.x.abs() >= (wx * 16.0).abs() {
+                        i.smooth_scroll_delta.x
+                    } else {
+                        wx * 16.0
+                    };
+                    let sy = if i.smooth_scroll_delta.y.abs() >= (wy * 16.0).abs() {
+                        i.smooth_scroll_delta.y
+                    } else {
+                        wy * 16.0
+                    };
                     if sx.abs() > 0.05 || sy.abs() > 0.05 {
                         i.smooth_scroll_delta = egui::Vec2::ZERO;
                     }
@@ -8484,12 +8781,21 @@ impl NmrWorkbenchApp {
                                 let step = if eff_sy > 0.0 { 1isize } else { -1isize };
                                 let _ = self.step_active_cube_plane(step);
                             } else {
-                                let notches = (eff_sy / 36.0).clamp(-3.0, 3.0);
-                                let factor = CONTOUR_SCROLL_STEP_RATIO.powf(-notches);
-                                self.contour_base =
-                                    (self.contour_base * factor).clamp(base_lo, base_hi);
+                                let span_h = self.view_h_right - self.view_h_left;
+                                let dh = -(eff_sy / rect.width().max(1.0)) * span_h;
+                                let clamped = clamp_view_ppm_2d(
+                                    [
+                                        self.view_h_left + dh,
+                                        self.view_h_right + dh,
+                                        self.view_n_top,
+                                        self.view_n_bottom,
+                                    ],
+                                    limits,
+                                );
+                                self.view_h_left = clamped[0];
+                                self.view_h_right = clamped[1];
                             }
-                        } else {
+                        } else if ctrl_or_cmd {
                             let prev = [
                                 self.view_h_left,
                                 self.view_h_right,
@@ -8505,20 +8811,10 @@ impl NmrWorkbenchApp {
                                 self.view_h_left + u * (self.view_h_right - self.view_h_left);
                             let anchor_n =
                                 self.view_n_top + v * (self.view_n_bottom - self.view_n_top);
-                            let next_h_left = if ctrl_or_cmd {
-                                self.view_h_left
-                            } else {
-                                anchor_h + (self.view_h_left - anchor_h) * zoom
-                            };
-                            let next_h_right = if ctrl_or_cmd {
-                                self.view_h_right
-                            } else {
-                                anchor_h + (self.view_h_right - anchor_h) * zoom
-                            };
                             let clamped = clamp_view_ppm_2d(
                                 [
-                                    next_h_left,
-                                    next_h_right,
+                                    anchor_h + (self.view_h_left - anchor_h) * zoom,
+                                    anchor_h + (self.view_h_right - anchor_h) * zoom,
                                     anchor_n + (self.view_n_top - anchor_n) * zoom,
                                     anchor_n + (self.view_n_bottom - anchor_n) * zoom,
                                 ],
@@ -8533,6 +8829,13 @@ impl NmrWorkbenchApp {
                             self.view_h_right = clamped[1];
                             self.view_n_top = clamped[2];
                             self.view_n_bottom = clamped[3];
+                        } else {
+                            let notches = (eff_sy / 36.0).clamp(-3.0, 3.0);
+                            let factor = CONTOUR_SCROLL_STEP_RATIO.powf(-notches);
+                            let next_base = (self.contour_base * factor).clamp(base_lo, base_hi);
+                            if (next_base - self.contour_base).abs() > 1e-7 {
+                                self.commit_contour_base_change(next_base);
+                            }
                         }
                     }
                 }
@@ -8548,20 +8851,17 @@ impl NmrWorkbenchApp {
                 if i.modifiers.command || i.modifiers.ctrl || i.modifiers.alt {
                     return None;
                 }
-                let sh = i.modifiers.shift;
-                let m = if sh {
-                    egui::Modifiers::SHIFT
-                } else {
-                    egui::Modifiers::NONE
-                };
                 for (k, dx, dy) in [
                     (egui::Key::ArrowLeft, -1.0_f32, 0.0_f32),
                     (egui::Key::ArrowRight, 1.0, 0.0),
                     (egui::Key::ArrowUp, 0.0, -1.0),
                     (egui::Key::ArrowDown, 0.0, 1.0),
                 ] {
-                    if i.consume_key(m, k) {
-                        return Some((sh, dx, dy));
+                    if i.consume_key(egui::Modifiers::SHIFT, k) {
+                        return Some((true, dx, dy));
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, k) {
+                        return Some((false, dx, dy));
                     }
                 }
                 None
@@ -12915,18 +13215,8 @@ impl NmrWorkbenchApp {
                     self.stack1d_panel.y_gain = gain_after(self.stack1d_panel.y_gain, dir);
                 } else {
                     let hi = (self.contour_noise_ref * 1e4).max(1e9);
-                    self.contour_base = contour_floor_after(self.contour_base, dir).min(hi);
-                    let mut params = SessionContourParams::new("HSQC");
-                    params.base_level = self.contour_base;
-                    params.level_factor = self.contour_factor;
-                    params.num_levels = self.contour_levels;
-                    params.show_negative = self.show_negative;
-                    params.ppm_nudge = self.primary_ppm_nudge;
-                    let msg = self.execute_session_cmd(WorkbenchCommand::SetContourParams {
-                        layer_id: "HSQC".to_string(),
-                        params,
-                    });
-                    self.status_msg = msg;
+                    let next_base = contour_floor_after(self.contour_base, dir).min(hi);
+                    self.commit_contour_base_change(next_base);
                 }
             }
             WorkbenchAction::RaiseContourFloor | WorkbenchAction::LowerContourFloor => {
@@ -12944,18 +13234,7 @@ impl NmrWorkbenchApp {
                     } else {
                         (self.contour_base / CONTOUR_FLOOR_STEP_RATIO).max(1e-6)
                     };
-                    self.contour_base = new_base;
-                    let mut params = SessionContourParams::new("HSQC");
-                    params.base_level = self.contour_base;
-                    params.level_factor = self.contour_factor;
-                    params.num_levels = self.contour_levels;
-                    params.show_negative = self.show_negative;
-                    params.ppm_nudge = self.primary_ppm_nudge;
-                    let msg = self.execute_session_cmd(WorkbenchCommand::SetContourParams {
-                        layer_id: "HSQC".to_string(),
-                        params,
-                    });
-                    self.status_msg = msg;
+                    self.commit_contour_base_change(new_base);
                 }
             }
             WorkbenchAction::ToggleNegativeContours => {
@@ -13890,19 +14169,11 @@ impl NmrWorkbenchApp {
         if spec.len() < 8 {
             return;
         }
-        if let Some(snap) = self
-            .stack1d_panel
-            .capture_undo_snapshot("Suppress 1D water")
-        {
-            let _ = self.undo_journal.record(
-                UndoOrigin::User,
-                "Suppress 1D water",
-                AppUndoPayload::Stack1d(Box::new(snap)),
-            );
-        }
+        self.drain_1d_undo_into_journal();
         let cfg = nmr_core::water::WaterSuppressionConfig::default();
         let center_ppm = nmr_core::water::suppress_water_spectrum_1d(&mut spec, &cfg);
         self.stack1d_panel.push_water_undo_active(orig_spec);
+        self.drain_1d_undo_into_journal();
         self.stack1d_panel.traces[idx].raw_spec = Some(AttachedSpectrum1d(spec.clone()));
         self.stack1d_panel.traces[idx].sync_from_spectrum1d(&spec);
         self.stack1d_panel
@@ -13930,10 +14201,21 @@ impl NmrWorkbenchApp {
                     );
                     return;
                 }
+                self.drain_1d_undo_into_journal();
                 let cfg = nmr_core::water::WaterSuppressionConfig::default();
                 let snapshot = Arc::clone(&self.cubes_3d[c_idx]);
                 let key3 = self.active_3d_water_key(c_idx);
-                self.water_undo_stack_3d.push(key3, Arc::clone(&snapshot));
+                self.water_undo_stack_3d
+                    .push(key3.clone(), Arc::clone(&snapshot));
+                let _ = self.undo_journal.record(
+                    UndoOrigin::User,
+                    format!("Suppress 3D water ({})", self.primary_2d_label),
+                    AppUndoPayload::Water3d {
+                        cube_idx: c_idx,
+                        key: key3,
+                        cube: Arc::clone(&snapshot),
+                    },
+                );
                 self.water_undo_3d = Some(snapshot);
                 let cube_mut = Arc::make_mut(&mut self.cubes_3d[c_idx]);
                 let reported_ppm = nmr_core::water::suppress_water_3d(cube_mut, &cfg);
@@ -13985,12 +14267,23 @@ impl NmrWorkbenchApp {
         }
         // `v0150:P1-6`: 2D water suppression touches ONLY the active 2D spectrum page — NEVER
         // mutating loaded 3D HNCACB / HNCO / cubes_3d!
+        self.drain_1d_undo_into_journal();
         let mut s2 = orig_2d.clone();
         let cfg = nmr_core::water::WaterSuppressionConfig::default();
         let reported_ppm = nmr_core::water::suppress_water_spectrum_2d(&mut s2, &cfg);
 
         let key2 = self.active_2d_water_key();
-        self.water_undo_stack_2d.push(key2, orig_2d.clone());
+        let page_idx = self.workbook.active_2d_idx;
+        self.water_undo_stack_2d.push(key2.clone(), orig_2d.clone());
+        let _ = self.undo_journal.record(
+            UndoOrigin::User,
+            format!("Suppress 2D water ({})", self.primary_2d_label),
+            AppUndoPayload::Water2d {
+                page_idx,
+                key: key2,
+                spec: Box::new(orig_2d.clone()),
+            },
+        );
         self.water_undo_2d = Some(orig_2d);
         let (base, nref) = Self::estimate_2d_contour_base(&s2.data);
         self.contour_noise_ref = nref;
@@ -14805,7 +15098,9 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
         let has_notices = self.bare_bruker_hint.is_some() || !self.axis_rescue_notices.is_empty();
         match self.workbench_mode {
             WorkbenchMode::Dynamics => !has_notices,
-            WorkbenchMode::Structure => self.sequence.is_empty() && !has_notices,
+            WorkbenchMode::Structure => {
+                (self.sequence.is_empty() || self.structure_show_pae_view) && !has_notices
+            }
             WorkbenchMode::Process => self.is_1d_studio_active() || !has_notices,
             WorkbenchMode::Assign => {
                 (self.is_1d_studio_active()
@@ -15028,7 +15323,10 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
                     });
                 });
         }
-        if self.workbench_mode == WorkbenchMode::Structure && !self.sequence.is_empty() {
+        if self.workbench_mode == WorkbenchMode::Structure
+            && !self.structure_show_pae_view
+            && !self.sequence.is_empty()
+        {
             self.ss_ribbon_state.selected_residue = self.selected_res;
             let ss_out = SsRibbonPanel::show(
                 ui,
@@ -15060,14 +15358,13 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
         let viz_rect = if self.workbench_mode == WorkbenchMode::Structure {
             if self.structure_show_pae_view {
                 let paper_white = self.paper_white_canvas;
-                let actions = egui::ScrollArea::vertical()
-                    .id_salt("structure_mode_pae_scroll")
-                    .show(ui, |ui| self.integrative_af_panel.show(ui, paper_white))
-                    .inner;
+                let actions = self.integrative_af_panel.show(ui, paper_white);
                 if !actions.is_empty() {
                     self.apply_integrative_af_actions(actions);
                 }
-                body_avail
+                self.integrative_af_panel
+                    .last_canvas_rect
+                    .unwrap_or(body_avail)
             } else {
                 let display_ref = self.pred_ref.as_ref().or(self.reference.as_ref());
                 let wgpu_rs = self.wgpu_render_state.clone();
@@ -15091,7 +15388,7 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
                 self.selected_res,
                 self.loaded_pdb_text.as_deref(),
             );
-            body_avail
+            self.relax_panel.last_canvas_rect.unwrap_or(body_avail)
         } else if self.show_dynamics_panel {
             if self.dynamics_panel.selected_seq_id.is_none() {
                 if let Some(k) = self.selected_res {
@@ -15100,10 +15397,10 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
                 }
             }
             dyn_output = Some(self.dynamics_panel.show(ui));
-            body_avail
+            self.dynamics_panel.last_canvas_rect.unwrap_or(body_avail)
         } else if self.show_stack1d_panel {
             self.render_and_sync_stack1d_panel(ui);
-            body_avail
+            self.stack1d_panel.last_plot_rect.unwrap_or(body_avail)
         } else {
             let r = self.draw_hsqc_canvas(ui);
             self.draw_2d_peaks_bottom_table(ui);
@@ -16721,6 +17018,8 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             dynamics_view: DynamicsView::Relaxation,
             structure_show_pae_view: false,
             developer_benchmark_mode: false,
+            last_mode_switcher_rect: egui::Rect::ZERO,
+            last_global_chrome_rects: Vec::new(),
             sequence_search_query: String::new(),
             goto_ppm_2d_input: String::new(),
             drag_peak_pre_snapshot: None,
@@ -17623,23 +17922,84 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             unreachable!()
         };
 
-        // 1. Audit all 6 modes on full NmrWorkbenchApp at 1440x900 (<= 12 controls, >= 65% canvas) & 1280x800 (0 clip/overlap, >= 11px)
+        // 1. Audit all 6 modes + all sub-views (incl. all 4 Structure PAE & Co-Fold tabs!) on full
+        //    NmrWorkbenchApp at 1440x900 (<= 12 controls, >= 65% canvas) & 1280x800 (0 clip/overlap, >= 11px).
+        //    Honest exclusion contract (`UI-B2`, `UI-B6`): exclude ONLY `last_mode_switcher_rect` (6-mode pills),
+        //    `last_global_chrome_rects` (`[Sidebar]`, `[Open]`, `[Cmd+K]`), `sidebar_excl`, `status_bar_rect`,
+        //    and the TRUE plot/canvas rect `viz_r` — NEVER excluding mode-specific header buttons or studio toolbars!
+        let _ = app.integrative_af_panel.load_synthetic_two_domain_demo();
         type ModeAuditCase<'a> = (
             &'a str,
             WorkbenchMode,
             Option<SmallMoleculeView>,
             Option<DynamicsView>,
+            Option<nmr_gui::integrative_af_panel::IntegrativeStudioTab>,
             bool,
         );
+        use nmr_gui::integrative_af_panel::IntegrativeStudioTab as AfTab;
         let mode_cases: &[ModeAuditCase<'_>] = &[
-            ("Process (1D)", WorkbenchMode::Process, None, None, true),
-            ("Process (2D)", WorkbenchMode::Process, None, None, false),
-            ("Assign (2D HSQC)", WorkbenchMode::Assign, None, None, false),
+            (
+                "Process (1D)",
+                WorkbenchMode::Process,
+                None,
+                None,
+                None,
+                true,
+            ),
+            (
+                "Process (2D)",
+                WorkbenchMode::Process,
+                None,
+                None,
+                None,
+                false,
+            ),
+            (
+                "Assign (2D HSQC)",
+                WorkbenchMode::Assign,
+                None,
+                None,
+                None,
+                false,
+            ),
             (
                 "Structure (3D)",
                 WorkbenchMode::Structure,
                 None,
                 None,
+                None,
+                false,
+            ),
+            (
+                "Structure (PAE:Conc)",
+                WorkbenchMode::Structure,
+                None,
+                None,
+                Some(AfTab::ConcordanceSummary),
+                false,
+            ),
+            (
+                "Structure (PAE:Map)",
+                WorkbenchMode::Structure,
+                None,
+                None,
+                Some(AfTab::PaeDomainHeatmap),
+                false,
+            ),
+            (
+                "Structure (PAE:Pose)",
+                WorkbenchMode::Structure,
+                None,
+                None,
+                Some(AfTab::CofoldPoseRanker),
+                false,
+            ),
+            (
+                "Structure (PAE:BIC)",
+                WorkbenchMode::Structure,
+                None,
+                None,
+                Some(AfTab::ExcitedStateExplorer),
                 false,
             ),
             (
@@ -17647,6 +18007,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 WorkbenchMode::Dynamics,
                 None,
                 Some(DynamicsView::Relaxation),
+                None,
                 false,
             ),
             (
@@ -17654,12 +18015,14 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 WorkbenchMode::Dynamics,
                 None,
                 Some(DynamicsView::Exchange),
+                None,
                 false,
             ),
             (
                 "SmallMol (Sketch)",
                 WorkbenchMode::SmallMolecule,
                 Some(SmallMoleculeView::Sketcher),
+                None,
                 None,
                 false,
             ),
@@ -17668,6 +18031,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 WorkbenchMode::SmallMolecule,
                 Some(SmallMoleculeView::Dosy),
                 None,
+                None,
                 false,
             ),
             (
@@ -17675,18 +18039,26 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 WorkbenchMode::Metabolomics,
                 None,
                 None,
+                None,
                 false,
             ),
         ];
 
-        for &(name, mode, sm_opt, dyn_opt, force_1d) in mode_cases {
+        for &(name, mode, sm_opt, dyn_opt, af_tab_opt, force_1d) in mode_cases {
             if let Some(sv) = sm_opt {
                 app.small_molecule_view = sv;
             }
             if let Some(dv) = dyn_opt {
                 app.dynamics_view = dv;
             }
+            app.structure_show_pae_view = af_tab_opt.is_some();
+            if let Some(at) = af_tab_opt {
+                app.integrative_af_panel.active_tab = at;
+            }
             app.set_workbench_mode(mode);
+            if mode == WorkbenchMode::Structure {
+                app.structure_show_pae_view = af_tab_opt.is_some();
+            }
             if mode == WorkbenchMode::Process {
                 if force_1d {
                     app.activate_1d_workbook_page(0);
@@ -17705,33 +18077,21 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 (WorkbenchMode::SmallMolecule, Some(SmallMoleculeView::Dosy)) => app
                     .dosy_panel
                     .last_canvas_rect
-                    .unwrap_or(m1440.active_viz_rect),
-                (WorkbenchMode::Dynamics, _) => egui::Rect::from_min_max(
-                    egui::pos2(
-                        m1440.active_viz_rect.left(),
-                        m1440.active_viz_rect.top() + 44.0,
-                    ),
-                    m1440.active_viz_rect.max,
-                ),
-                (WorkbenchMode::Metabolomics, _) => egui::Rect::from_min_max(
-                    egui::pos2(
-                        m1440.active_viz_rect.left(),
-                        m1440.active_viz_rect.top() + 64.0,
-                    ),
-                    m1440.active_viz_rect.max,
-                ),
+                    .expect("dosy last_canvas_rect"),
+                (WorkbenchMode::Metabolomics, _) => app
+                    .metabolomics_panel
+                    .last_canvas_rect
+                    .expect("metabolomics last_canvas_rect"),
                 _ => m1440.active_viz_rect,
             };
-            let ctrls = primary_controls(
-                &ctx_1440,
-                &[
-                    m1440.top_header_rect,
-                    sidebar_excl,
-                    m1440.status_bar_rect,
-                    viz_r,
-                ],
-                40_000.0,
-            );
+            let mut excl_rects = vec![
+                app.last_mode_switcher_rect,
+                sidebar_excl,
+                m1440.status_bar_rect,
+                viz_r,
+            ];
+            excl_rects.extend_from_slice(&app.last_global_chrome_rects);
+            let ctrls = primary_controls(&ctx_1440, &excl_rects, 40_000.0);
             let share = viz_r.area() / (1440.0 * 900.0);
             assert!(
                 ctrls.len() <= MAX_PRIMARY_CONTROLS_PER_MODE,
@@ -17748,7 +18108,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             let vp1280 = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
             let audit = audit_text_layout(&out1280.shapes, vp1280);
             println!(
-                "[S9 FULL-APP AUDIT] {:<18} | ctrls={:>2}/12 | canvas_1440={:>5.1}% | clip_1280={} | ovlp_1280={} | min_font={:.1}px",
+                "[S9 FULL-APP AUDIT] {:<20} | ctrls={:>2}/12 | canvas_1440={:>5.1}% | clip_1280={} | ovlp_1280={} | min_font={:.1}px",
                 name,
                 ctrls.len(),
                 share * 100.0,
@@ -17773,6 +18133,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 MIN_FONT_PX
             );
         }
+        app.structure_show_pae_view = false;
 
         // 2. Scientific candor: "Benchmark vs Truth" hidden by default; labelled "Synthetic Benchmark" when opted in (`UI-B3`)
         app.set_workbench_mode(WorkbenchMode::Assign);
@@ -17806,10 +18167,50 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         );
 
         // 3. `v0150:P1-6` on full NmrWorkbenchApp: 2D `ws, ws, wu, wu` restores exact original AND NEVER mutates `hncacb_3d`!
+        let ax_hw = nmr_core::spectrum::AxisPpm::from_bounds("1H", 64, 10.0, 0.0, 600.0);
+        let ax_nw = nmr_core::spectrum::AxisPpm::from_bounds("15N", 16, 130.0, 105.0, 60.8);
+        let ax_cw = nmr_core::spectrum::AxisPpm::from_bounds("13C", 8, 65.0, 15.0, 150.9);
+        let wi_470 = ax_hw.ppm_to_index(4.70).round() as usize;
+        let mut hsqc_w_data = vec![1.0_f32; 64 * 16];
+        for iy in 0..16 {
+            hsqc_w_data[iy * 64 + wi_470] = 9_500.0;
+        }
+        let hsqc_w_spec = Spectrum2D {
+            name: "HSQC_WATER".into(),
+            axis_x: ax_hw.clone(),
+            axis_y: ax_nw.clone(),
+            data: hsqc_w_data,
+        };
+        let mut cube_w_data = vec![2.0_f32; 64 * 16 * 8];
+        for iz in 0..8 {
+            for iy in 0..16 {
+                cube_w_data[(iz * 16 + iy) * 64 + wi_470] = 12_000.0;
+            }
+        }
+        let cube_w = Spectrum3D {
+            name: "HNCACB_WATER".into(),
+            exp: "HNCACB".into(),
+            axis_x: ax_hw,
+            axis_y: ax_nw,
+            axis_z: ax_cw,
+            data: cube_w_data,
+        };
+        app.hncacb_3d = Some(cube_w.clone());
+        let w_cube_idx = app.cubes_3d.len();
+        app.cubes_3d.push(Arc::new(cube_w.clone()));
+        let _ = app
+            .workbook
+            .add_3d_cube_page(w_cube_idx, "HNCACB_WATER", &cube_w);
+        let w_page_idx = app
+            .workbook
+            .add_2d_page("HSQC_WATER", hsqc_w_spec, false, true);
+        app.activate_2d_workbook_page(w_page_idx);
+
         let hncacb_orig = app.hncacb_3d.as_ref().expect("hncacb loaded").data.clone();
         let hsqc_orig = app.hsqc_spec.as_ref().expect("hsqc loaded").data.clone();
         app.suppress_water_active_spectrum();
         let hsqc_ws1 = app.hsqc_spec.as_ref().unwrap().data.clone();
+        assert_ne!(hsqc_ws1, hsqc_orig);
         assert_eq!(
             app.hncacb_3d.as_ref().unwrap().data,
             hncacb_orig,
@@ -17850,5 +18251,274 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         assert_eq!(app.peaks.len(), n_pks_0 + 1);
         app.redo_unified();
         assert!((app.crosshair.h_ppm - 9.05).abs() < 1e-6);
+
+        // 5. `UI-C2`: `Cmd+Z` (`undo_unified`) & `Shift+Cmd+Z` (`redo_unified`) cover 2D `ws`, 3D `ws`,
+        //    1D `ws` (single undo step, zero double-push!), and scroll-wheel `contour_base` changes!
+        let hsqc_before_ws = app.hsqc_spec.as_ref().unwrap().data.clone();
+        app.suppress_water_active_spectrum();
+        let hsqc_after_ws = app.hsqc_spec.as_ref().unwrap().data.clone();
+        assert_ne!(hsqc_after_ws, hsqc_before_ws);
+        app.undo_unified();
+        assert_eq!(
+            app.hsqc_spec.as_ref().unwrap().data,
+            hsqc_before_ws,
+            "Cmd+Z must undo 2D water suppression without undoing older peak edits"
+        );
+        assert_eq!(app.peaks.len(), n_pks_0 + 1);
+        app.redo_unified();
+        assert_eq!(app.hsqc_spec.as_ref().unwrap().data, hsqc_after_ws);
+        app.undo_unified();
+        assert_eq!(app.hsqc_spec.as_ref().unwrap().data, hsqc_before_ws);
+
+        // Contour scroll change -> Cmd+Z restores exact contour_base
+        let c_base_before = app.contour_base;
+        app.commit_contour_base_change(c_base_before * 0.72);
+        assert!((app.contour_base - c_base_before * 0.72).abs() < 1e-6);
+        app.undo_unified();
+        assert!(
+            (app.contour_base - c_base_before).abs() < 1e-5,
+            "Cmd+Z must restore pre-scroll contour_base"
+        );
+
+        // 3D `ws` -> Cmd+Z -> Shift+Cmd+Z
+        {
+            let c_idx = w_cube_idx;
+            app.active_cube_idx = Some(c_idx);
+            let cube_before = app.cubes_3d[c_idx].data.clone();
+            app.suppress_water_active_spectrum();
+            let cube_after = app.cubes_3d[c_idx].data.clone();
+            assert_ne!(cube_after, cube_before);
+            app.undo_unified();
+            assert_eq!(
+                app.cubes_3d[c_idx].data, cube_before,
+                "Cmd+Z must undo 3D water suppression"
+            );
+            app.redo_unified();
+            assert_eq!(app.cubes_3d[c_idx].data, cube_after);
+            app.undo_unified();
+            assert_eq!(app.cubes_3d[c_idx].data, cube_before);
+            app.active_cube_idx = None;
+        }
+
+        // 1D `ws` -> ONE Cmd+Z restores original 1D trace (no double-push!)
+        app.set_workbench_mode(WorkbenchMode::Process);
+        app.activate_1d_workbook_page(0);
+        let ax_1d = nmr_core::spectrum::AxisPpm::from_bounds("1H", 256, 10.0, 0.0, 600.0);
+        let mut y_1d = vec![0.02_f64; 256];
+        for (k, slot) in y_1d.iter_mut().enumerate() {
+            let ppm = ax_1d.index_to_ppm(k as f64);
+            *slot += 12.0 * (-0.5 * ((ppm - 4.70) / 0.03).powi(2)).exp();
+            *slot += 3.0 * (-0.5 * ((ppm - 1.25) / 0.015).powi(2)).exp();
+        }
+        let spec_1d = nmr_core::nmr1d::Spectrum1D::new(
+            "1h_ws_cmdz",
+            nmr_core::nmr1d::Experiment1DKind::Proton1D,
+            ax_1d,
+            y_1d,
+            None,
+        );
+        app.stack1d_panel.load_user_spectra(vec![spec_1d]);
+        app.drain_1d_undo_into_journal();
+        let tr_before = app.stack1d_panel.traces[0].intensities().to_vec();
+        app.suppress_water_active_1d();
+        let tr_after = app.stack1d_panel.traces[0].intensities().to_vec();
+        assert_ne!(tr_after, tr_before);
+        app.undo_unified();
+        assert_eq!(
+            app.stack1d_panel.traces[0].intensities(),
+            tr_before.as_slice(),
+            "A single Cmd+Z must undo 1D water suppression (zero double-push!)"
+        );
+        app.redo_unified();
+        assert_eq!(
+            app.stack1d_panel.traces[0].intensities(),
+            tr_after.as_slice()
+        );
+
+        // 6. `21.W1:P1-5`: Loading X-ray `1UBQ` after an AF concordance model MUST clear `concordance_override`
+        //    and reset Track 3 to `Indeterminate` (`0` stale `ConcordantOrdered` residues!)
+        let _ = app
+            .integrative_af_panel
+            .load_synthetic_two_domain_demo()
+            .expect("load af demo");
+        let af_cif = app.integrative_af_panel.structure_input_buf.clone();
+        app.load_structure_3d_in_memory(&af_cif, "two_domain_af.cif");
+        assert!(
+            app.ss_ribbon_state.concordance_override.is_some(),
+            "AF concordance report must populate Track 3 override"
+        );
+        app.load_structure_3d_in_memory(DEMO_UBIQUITIN_1UBQ_PDB, "1UBQ X-ray");
+        assert!(
+            app.ss_ribbon_state.concordance_override.is_none(),
+            "Loading experimental 1UBQ must clear stale AF concordance_override"
+        );
+        assert_eq!(
+            app.ss_ribbon_state.concordance_summary.class_counts[0], 0,
+            "Experimental 1UBQ must have 0 ConcordantOrdered residues after AF->X-ray switch"
+        );
+    }
+
+    #[test]
+    fn test_c18_headless_gesture_matrix_2d_and_3d_plane() {
+        use super::*;
+        use eframe::egui;
+        use nmr_gui::workflow_bar::ResponsiveFrameMetrics;
+        let mut app = make_headless_test_app();
+        app.load_builtin_demo_suite();
+        app.set_workbench_mode(WorkbenchMode::Assign);
+        app.show_strips_dock = false;
+        let ctx = egui::Context::default();
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+        let wheel_ev = |dy: f32, modifiers: egui::Modifiers| -> egui::Event {
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, dy),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Trackpad,
+                modifiers,
+            }
+        };
+
+        let mut t_sec = 0.1_f64;
+        let mut run_2d =
+            |events: Vec<egui::Event>, app: &mut NmrWorkbenchApp| -> ResponsiveFrameMetrics {
+                t_sec += 0.25;
+                let raw = egui::RawInput {
+                    screen_rect: Some(vp),
+                    time: Some(t_sec),
+                    events,
+                    ..Default::default()
+                };
+                let mut m_out = None;
+                let mut out = ctx.run_ui(raw, |ui| {
+                    let mut shell = std::mem::take(&mut app.responsive_shell);
+                    m_out = Some(render_responsive_workbench(ui, 300, &mut shell, app));
+                    app.responsive_shell = shell;
+                });
+                out.textures_delta.clear();
+                m_out.expect("metrics")
+            };
+
+        let _ = run_2d(Vec::new(), &mut app);
+        let m0 = run_2d(Vec::new(), &mut app);
+        let c = m0.active_viz_rect.center();
+
+        // 1. Plain Scroll on 2D -> lowers contour_base (more signal) AND Cmd+Z restores contour_base
+        let base0 = app.contour_base;
+        let h_left0 = app.view_h_left;
+        let _ = run_2d(
+            vec![
+                egui::Event::PointerMoved(c),
+                wheel_ev(36.0, egui::Modifiers::NONE),
+            ],
+            &mut app,
+        );
+        assert!(
+            app.contour_base < base0,
+            "2D plain scroll up must lower contour_base (more signal): {base0} -> {}",
+            app.contour_base
+        );
+        assert!((app.view_h_left - h_left0).abs() < 1e-6);
+        app.undo_unified();
+        assert!(
+            (app.contour_base - base0).abs() < 1e-5,
+            "Cmd+Z after 2D scroll contour change must restore contour_base"
+        );
+
+        // 2. Cmd+Scroll on 2D -> zooms (F2, F1) and pushes zoom history
+        let cmd_mod = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let zlen0 = app.workbook.two_d.zoom_history.len();
+        let span_h0 = (app.view_h_left - app.view_h_right).abs();
+        let _ = run_2d(
+            vec![egui::Event::PointerMoved(c), wheel_ev(36.0, cmd_mod)],
+            &mut app,
+        );
+        let span_h1 = (app.view_h_left - app.view_h_right).abs();
+        assert!(
+            span_h1 < span_h0 && app.workbook.two_d.zoom_history.len() > zlen0,
+            "2D Cmd+Scroll must zoom in and push zoom history"
+        );
+
+        // 3. Shift+Scroll on 2D -> pans F2 horizontally
+        let sh_mod = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let hl_pre = app.view_h_left;
+        let _ = run_2d(
+            vec![egui::Event::PointerMoved(c), wheel_ev(3.0, sh_mod)],
+            &mut app,
+        );
+        assert!(
+            (app.view_h_left - hl_pre).abs() > 1e-4,
+            "2D Shift+Scroll must pan F2 horizontally"
+        );
+
+        // 4. ArrowRight on 2D -> pans F2; Shift+ArrowLeft -> nudges selected 2D peak (undoable!)
+        let hl_arr = app.view_h_left;
+        let _ = run_2d(
+            vec![
+                egui::Event::PointerMoved(c),
+                egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    physical_key: Some(egui::Key::ArrowRight),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut app,
+        );
+        assert!((app.view_h_left - hl_arr).abs() > 1e-4);
+
+        if !app.peaks.is_empty() {
+            app.workbook.two_d.selected_peak_idx = Some(0);
+            let pk_h0 = app.peaks[0].h;
+            let _ = run_2d(
+                vec![
+                    egui::Event::PointerMoved(c),
+                    egui::Event::Key {
+                        key: egui::Key::ArrowLeft,
+                        physical_key: Some(egui::Key::ArrowLeft),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: sh_mod,
+                    },
+                ],
+                &mut app,
+            );
+            assert!((app.peaks[0].h - pk_h0).abs() > 1e-5);
+            app.undo_unified();
+            assert!((app.peaks[0].h - pk_h0).abs() < 1e-6);
+        }
+
+        // 5. Shift+Scroll on 3D Cube Plane (`CubePlane3d`) -> steps orthogonal 3D plane!
+        if !app.cubes_3d.is_empty() {
+            app.active_cube_idx = Some(0);
+            app.apply_active_cube_slice_refresh(true);
+            let _ = run_2d(Vec::new(), &mut app);
+            let slice0 = (
+                app.cube_slice.plane_f1_idx,
+                app.cube_slice.plane_f2_idx,
+                app.cube_slice.plane_f3_idx,
+            );
+            let _ = run_2d(
+                vec![egui::Event::PointerMoved(c), wheel_ev(24.0, sh_mod)],
+                &mut app,
+            );
+            let slice1 = (
+                app.cube_slice.plane_f1_idx,
+                app.cube_slice.plane_f2_idx,
+                app.cube_slice.plane_f3_idx,
+            );
+            assert_ne!(
+                slice1, slice0,
+                "Shift+Scroll on CubePlane3d must step orthogonal 3D plane"
+            );
+        }
     }
 }

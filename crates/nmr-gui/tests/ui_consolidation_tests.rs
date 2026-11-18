@@ -30,9 +30,9 @@ use nmr_gui::octet_canvas::{extract_active_molecule_subgraph, OctetDrawPanel};
 use nmr_gui::ss_ribbon_widget::{SsRibbonPanel, SsRibbonState, SsRibbonWorkspaceInput};
 use nmr_gui::stack1d_panel::{render_stack1d_panel, Stack1dState, Trace1d};
 use nmr_gui::workbench_mode::{
-    apply_type_scale, audit_text_layout, draw_mode_switcher, draw_sub_view_selector,
-    primary_controls, SmallMoleculeView, WorkbenchMode, MAX_PRIMARY_CONTROLS_PER_MODE,
-    MIN_CANVAS_AREA_FRACTION, MIN_FONT_PX,
+    apply_type_scale, audit_text_layout, draw_mode_switcher, draw_mode_switcher_with_rect,
+    draw_sub_view_selector, primary_controls, SmallMoleculeView, WorkbenchMode,
+    MAX_PRIMARY_CONTROLS_PER_MODE, MIN_CANVAS_AREA_FRACTION, MIN_FONT_PX,
 };
 use nmr_gui::workbook::{render_workbook_sidebar, ActiveWorkbookSelection, WorkbookState};
 
@@ -178,24 +178,21 @@ fn test_primary_control_budget_le_12_and_canvas_area_ge_65_percent_at_1440x900()
 
     let screen_area = 1440.0_f32 * 900.0_f32;
 
-    // 1. Process mode (1D)
+    // 1. Process mode (1D) — uses TRUE `stack1d.last_plot_rect` and `draw_mode_switcher_with_rect` (`0` toolbar exclusions!)
     {
         let ctx = egui::Context::default();
         let mut switcher_r = egui::Rect::ZERO;
-        let mut canvas_r = egui::Rect::ZERO;
         let _ = run_two_passes(&ctx, 1440.0, 900.0, |ui| {
-            let top = egui::Panel::top("hdr_proc").show(ui, |ui| {
-                let _ = draw_mode_switcher(ui, WorkbenchMode::Process);
+            egui::Panel::top("hdr_proc").show(ui, |ui| {
+                switcher_r = draw_mode_switcher_with_rect(ui, WorkbenchMode::Process).1;
             });
-            switcher_r = top.response.rect;
-            let c = egui::CentralPanel::default().show(ui, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 render_stack1d_panel(ui, &mut stack1d);
             });
-            canvas_r = egui::Rect::from_min_max(
-                egui::pos2(c.response.rect.left(), c.response.rect.top() + 36.0),
-                c.response.rect.max,
-            );
         });
+        let canvas_r = stack1d
+            .last_plot_rect
+            .expect("stack1d must record last_plot_rect");
         let ctrls = primary_controls(&ctx, &[switcher_r, canvas_r], 40_000.0);
         assert!(
             ctrls.len() <= MAX_PRIMARY_CONTROLS_PER_MODE,
@@ -215,9 +212,9 @@ fn test_primary_control_budget_le_12_and_canvas_area_ge_65_percent_at_1440x900()
         let mut switcher_r = egui::Rect::ZERO;
         let mut canvas_r = egui::Rect::ZERO;
         let _ = run_two_passes(&ctx, 1440.0, 900.0, |ui| {
-            let top = egui::Panel::top("hdr_assign").show(ui, |ui| {
+            egui::Panel::top("hdr_assign").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let _ = draw_mode_switcher(ui, WorkbenchMode::Assign);
+                    switcher_r = draw_mode_switcher_with_rect(ui, WorkbenchMode::Assign).1;
                     let _ = ui.button("Pick Peaks");
                     let _ = ui.button("Run Assignment");
                     let _ = ui.button("3D Strips");
@@ -226,7 +223,6 @@ fn test_primary_control_budget_le_12_and_canvas_area_ge_65_percent_at_1440x900()
                     });
                 });
             });
-            switcher_r = egui::Rect::from_min_size(top.response.rect.min, egui::vec2(520.0, 36.0));
             egui::Panel::top("seq_strip_assign").show(ui, |ui| {
                 let mut q = String::new();
                 ui.horizontal(|ui| {
@@ -256,15 +252,15 @@ fn test_primary_control_budget_le_12_and_canvas_area_ge_65_percent_at_1440x900()
         );
     }
 
-    // 3. Structure mode (Concordance Ribbon + 3D Model)
+    // 3. Structure mode (`3D Model` AND `PAE & Co-Fold` across all 4 IntegrativeStudioTabs)
     {
         let ctx = egui::Context::default();
         let mut switcher_r = egui::Rect::ZERO;
         let mut show_pae = false;
         let _ = run_two_passes(&ctx, 1440.0, 900.0, |ui| {
-            let top = egui::Panel::top("hdr_struct").show(ui, |ui| {
+            egui::Panel::top("hdr_struct").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let _ = draw_mode_switcher(ui, WorkbenchMode::Structure);
+                    switcher_r = draw_mode_switcher_with_rect(ui, WorkbenchMode::Structure).1;
                     let _ = draw_sub_view_selector(
                         ui,
                         &mut show_pae,
@@ -272,7 +268,6 @@ fn test_primary_control_budget_le_12_and_canvas_area_ge_65_percent_at_1440x900()
                     );
                 });
             });
-            switcher_r = egui::Rect::from_min_size(top.response.rect.min, egui::vec2(520.0, 36.0));
             egui::Panel::top("struct_ss_ribbon").show(ui, |ui| {
                 let _ = SsRibbonPanel::show(
                     ui,
@@ -293,25 +288,66 @@ fn test_primary_control_budget_le_12_and_canvas_area_ge_65_percent_at_1440x900()
         let ctrls = primary_controls(&ctx, &[switcher_r, canvas_r], 40_000.0);
         assert!(
             ctrls.len() <= MAX_PRIMARY_CONTROLS_PER_MODE,
-            "Structure mode exceeded 12 primary controls: got {}",
+            "Structure (3D Model) exceeded 12 primary controls: got {}",
             ctrls.len()
         );
         let share = canvas_r.area() / screen_area;
         assert!(
             share >= MIN_CANVAS_AREA_FRACTION,
-            "Structure mode 3D canvas share {share:.3} < {MIN_CANVAS_AREA_FRACTION}"
+            "Structure (3D Model) canvas share {share:.3} < {MIN_CANVAS_AREA_FRACTION}"
         );
     }
+    {
+        let mut af_panel = IntegrativeAfPanel::new();
+        let _ = af_panel
+            .load_synthetic_two_domain_demo()
+            .expect("load 2-domain af demo");
+        for tab in IntegrativeStudioTab::ALL {
+            af_panel.active_tab = tab;
+            let ctx = egui::Context::default();
+            let mut switcher_r = egui::Rect::ZERO;
+            let mut show_pae = true;
+            let _ = run_two_passes(&ctx, 1440.0, 900.0, |ui| {
+                egui::Panel::top("hdr_struct_pae").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        switcher_r = draw_mode_switcher_with_rect(ui, WorkbenchMode::Structure).1;
+                        let _ = draw_sub_view_selector(
+                            ui,
+                            &mut show_pae,
+                            &[(false, "3D Model"), (true, "PAE & Co-Fold")],
+                        );
+                    });
+                });
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let _ = af_panel.show(ui, true);
+                });
+            });
+            let canvas_r = af_panel
+                .last_canvas_rect
+                .expect("af_panel last_canvas_rect");
+            let ctrls = primary_controls(&ctx, &[switcher_r, canvas_r], 40_000.0);
+            assert!(
+                ctrls.len() <= MAX_PRIMARY_CONTROLS_PER_MODE,
+                "Structure (PAE & Co-Fold: {tab:?}) exceeded 12 primary controls: got {}",
+                ctrls.len()
+            );
+            let share = canvas_r.area() / screen_area;
+            assert!(
+                share >= MIN_CANVAS_AREA_FRACTION,
+                "Structure (PAE & Co-Fold: {tab:?}) canvas share {share:.3} < {MIN_CANVAS_AREA_FRACTION}"
+            );
+        }
+    }
 
-    // 4. Small molecule mode (Sketcher & DOSY)
+    // 4. Small molecule mode (Sketcher & DOSY) — counts `Sketcher | DOSY` pills honestly!
     for view in SmallMoleculeView::ALL {
         let ctx = egui::Context::default();
         let mut switcher_r = egui::Rect::ZERO;
         let mut sv = view;
         let _ = run_two_passes(&ctx, 1440.0, 900.0, |ui| {
-            let top = egui::Panel::top("hdr_sm").show(ui, |ui| {
+            egui::Panel::top("hdr_sm").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let _ = draw_mode_switcher(ui, WorkbenchMode::SmallMolecule);
+                    switcher_r = draw_mode_switcher_with_rect(ui, WorkbenchMode::SmallMolecule).1;
                     let _ = draw_sub_view_selector(
                         ui,
                         &mut sv,
@@ -322,7 +358,6 @@ fn test_primary_control_budget_le_12_and_canvas_area_ge_65_percent_at_1440x900()
                     );
                 });
             });
-            switcher_r = top.response.rect;
             match sv {
                 SmallMoleculeView::Sketcher => {
                     octet.show(ui);
@@ -351,24 +386,21 @@ fn test_primary_control_budget_le_12_and_canvas_area_ge_65_percent_at_1440x900()
         );
     }
 
-    // 5. Metabolomics mode
+    // 5. Metabolomics mode — uses TRUE `metab.last_canvas_rect`
     {
         let ctx = egui::Context::default();
         let mut switcher_r = egui::Rect::ZERO;
-        let mut plot_r = egui::Rect::ZERO;
         let _ = run_two_passes(&ctx, 1440.0, 900.0, |ui| {
-            let top = egui::Panel::top("hdr_metab").show(ui, |ui| {
-                let _ = draw_mode_switcher(ui, WorkbenchMode::Metabolomics);
+            egui::Panel::top("hdr_metab").show(ui, |ui| {
+                switcher_r = draw_mode_switcher_with_rect(ui, WorkbenchMode::Metabolomics).1;
             });
-            switcher_r = top.response.rect;
-            let c = egui::CentralPanel::default().show(ui, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 metab.ui(ui);
             });
-            plot_r = egui::Rect::from_min_max(
-                egui::pos2(c.response.rect.left(), c.response.rect.top() + 64.0),
-                c.response.rect.max,
-            );
         });
+        let plot_r = metab
+            .last_canvas_rect
+            .expect("metabolomics last_canvas_rect");
         let ctrls = primary_controls(&ctx, &[switcher_r, plot_r], 40_000.0);
         assert!(
             ctrls.len() <= MAX_PRIMARY_CONTROLS_PER_MODE,

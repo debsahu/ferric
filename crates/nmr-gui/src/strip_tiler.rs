@@ -539,6 +539,8 @@ pub struct StripTilerPanel {
     pub strip_gain: f64,
     /// Currently selected strip peak `(spin_system_idx, peak_idx_in_cands)`.
     pub selected_peak: Option<(usize, usize)>,
+    /// Bounding rectangle of the strip plot canvas from the most recent frame.
+    pub last_canvas_rect: Option<egui::Rect>,
     user_resized_height: bool,
     zoom_drag_start_ppm: Option<f64>,
     context_menu_ss_idx: Option<usize>,
@@ -558,6 +560,7 @@ impl Default for StripTilerPanel {
             strip_height_px: 0.0,
             strip_gain: 1.0,
             selected_peak: None,
+            last_canvas_rect: None,
             user_resized_height: false,
             zoom_drag_start_ppm: None,
             context_menu_ss_idx: None,
@@ -785,6 +788,7 @@ impl StripTilerPanel {
                     egui::vec2(desired_w, strip_h),
                     egui::Sense::click_and_drag(),
                 );
+                self.last_canvas_rect = Some(canvas_rect);
                 let painter = ui.painter_at(canvas_rect);
                 painter.rect_filled(canvas_rect, 4.0, egui::Color32::from_rgb(13, 17, 24));
 
@@ -801,29 +805,42 @@ impl StripTilerPanel {
                 let eff_col_w =
                     ((canvas_rect.width() - left_axis_w - 6.0) / (columns.len() as f32)).max(col_w);
 
-                // Interactive indirect-axis zoom (Cmd/Ctrl+Scroll, Shift+drag box, double-click reset) & plain scroll gain
+                // Interactive indirect-axis zoom (Cmd/Ctrl+Scroll, Shift+drag box, double-click reset),
+                // Shift+Scroll / Space+drag / Right/Middle-drag indirect pan, & plain scroll gain (`UI-C10`, `UI-C18`)
                 if canvas_resp.double_clicked() {
                     self.indirect_zoom = None;
                     self.zoom_drag_start_ppm = None;
                 }
 
-                let (shift_held, cmd_or_ctrl) =
-                    ui.input(|i| (i.modifiers.shift, i.modifiers.command || i.modifiers.ctrl));
+                let (mut shift_held, mut cmd_or_ctrl, space_down) = ui.input(|i| {
+                    (
+                        i.modifiers.shift,
+                        i.modifiers.command || i.modifiers.ctrl,
+                        i.key_down(egui::Key::Space),
+                    )
+                });
 
                 if let Some(hover_pos) = canvas_resp.hover_pos() {
                     if canvas_rect.contains(hover_pos) {
-                        let (wheel_sy, smooth_sy) = ui.input(|i| {
-                            let wy: f32 = i
-                                .events
-                                .iter()
-                                .filter_map(|ev| match ev {
-                                    egui::Event::MouseWheel { delta, .. } => Some(delta.y),
-                                    _ => None,
-                                })
-                                .sum();
-                            (wy, i.smooth_scroll_delta.y)
+                        let (wheel_sy, smooth_sy, ev_shift, ev_cmd) = ui.input(|i| {
+                            let mut wy = 0.0f32;
+                            let mut esh = false;
+                            let mut ecm = false;
+                            for ev in &i.events {
+                                if let egui::Event::MouseWheel {
+                                    delta, modifiers, ..
+                                } = ev
+                                {
+                                    wy += delta.y;
+                                    esh |= modifiers.shift;
+                                    ecm |= modifiers.command || modifiers.ctrl;
+                                }
+                            }
+                            (wy, i.smooth_scroll_delta.y, esh, ecm)
                         });
-                        let sy = if smooth_sy.abs() >= wheel_sy.abs() {
+                        shift_held |= ev_shift;
+                        cmd_or_ctrl |= ev_cmd;
+                        let sy = if smooth_sy.abs() >= (wheel_sy * 16.0).abs() {
                             smooth_sy
                         } else {
                             wheel_sy * 16.0
@@ -848,11 +865,38 @@ impl StripTilerPanel {
                                 if new_hi - new_lo >= 0.5 {
                                     self.indirect_zoom = Some((new_lo, new_hi));
                                 }
-                            } else if !shift_held {
+                            } else if shift_held {
+                                let cur = self
+                                    .indirect_zoom
+                                    .map(|(a, b)| (a.min(b), a.max(b)))
+                                    .unwrap_or(ali_range);
+                                let span = (cur.1 - cur.0).max(0.5);
+                                let d_ppm =
+                                    -(sy as f64 / (ali_bot - ali_top).max(1.0) as f64) * span;
+                                self.indirect_zoom = Some((cur.0 + d_ppm, cur.1 + d_ppm));
+                            } else {
                                 let g_factor = (sy as f64 * 0.0045).exp().clamp(0.25, 4.0);
                                 self.strip_gain = (self.strip_gain * g_factor).clamp(0.1, 50.0);
                             }
                         }
+                    }
+                }
+
+                // Space+drag or Right/Middle-drag pans the indirect 13C range (`UI-C5`, `UI-C18`)
+                if !shift_held
+                    && ((space_down && canvas_resp.dragged_by(egui::PointerButton::Primary))
+                        || canvas_resp.dragged_by(egui::PointerButton::Secondary)
+                        || canvas_resp.dragged_by(egui::PointerButton::Middle))
+                {
+                    let dy = canvas_resp.drag_delta().y;
+                    if dy.abs() > 0.1 {
+                        let cur = self
+                            .indirect_zoom
+                            .map(|(a, b)| (a.min(b), a.max(b)))
+                            .unwrap_or(ali_range);
+                        let span = (cur.1 - cur.0).max(0.5);
+                        let d_ppm = -(dy as f64 / (ali_bot - ali_top).max(1.0) as f64) * span;
+                        self.indirect_zoom = Some((cur.0 + d_ppm, cur.1 + d_ppm));
                     }
                 }
 
@@ -1340,7 +1384,59 @@ impl StripTilerPanel {
                     }
                 });
 
-                // Shift+Up / Shift+Down nudges the selected strip peak's indirect shift
+                // Keyboard gestures on Strips (`UI-C6`, `UI-C10`, `UI-C13`, `UI-C18`):
+                // - `+` / `-` scales strip intensity gain (`SIGNAL_STEP_RATIO`)
+                // - `ArrowUp` / `ArrowDown` (unshifted) pans indirect 13C range by 10%
+                // - `Shift + ArrowUp` / `Shift + ArrowDown` nudges selected strip peak
+                // - `Esc` clears selected strip peak
+                if !ui.ctx().egui_wants_keyboard_input()
+                    && (canvas_resp.hovered() || canvas_resp.has_focus())
+                {
+                    let (more_sig, less_sig, pan_up, pan_down, esc_pressed) = ui.input(|i| {
+                        let plain = !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.alt;
+                        let more_txt = i
+                            .events
+                            .iter()
+                            .any(|ev| matches!(ev, egui::Event::Text(s) if s == "+" || s == "="));
+                        let less_txt = i
+                            .events
+                            .iter()
+                            .any(|ev| matches!(ev, egui::Event::Text(s) if s == "-" || s == "_"));
+                        let more_k = plain
+                            && (i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals));
+                        let less_k = plain && i.key_pressed(egui::Key::Minus);
+                        let p_up = plain && !i.modifiers.shift && i.key_pressed(egui::Key::ArrowUp);
+                        let p_dn =
+                            plain && !i.modifiers.shift && i.key_pressed(egui::Key::ArrowDown);
+                        let esc = i.key_pressed(egui::Key::Escape);
+                        (more_txt || more_k, less_txt || less_k, p_up, p_dn, esc)
+                    });
+                    if more_sig {
+                        self.strip_gain = crate::interaction_grammar::gain_after(
+                            self.strip_gain,
+                            crate::interaction_grammar::SignalDirection::More,
+                        )
+                        .clamp(0.1, 50.0);
+                    } else if less_sig {
+                        self.strip_gain = crate::interaction_grammar::gain_after(
+                            self.strip_gain,
+                            crate::interaction_grammar::SignalDirection::Less,
+                        )
+                        .clamp(0.1, 50.0);
+                    }
+                    if pan_up || pan_down {
+                        let cur = self
+                            .indirect_zoom
+                            .map(|(a, b)| (a.min(b), a.max(b)))
+                            .unwrap_or(ali_range);
+                        let step = ((cur.1 - cur.0).abs() * 0.10).max(0.1);
+                        let d_ppm = if pan_up { -step } else { step };
+                        self.indirect_zoom = Some((cur.0 + d_ppm, cur.1 + d_ppm));
+                    }
+                    if esc_pressed {
+                        self.selected_peak = None;
+                    }
+                }
                 if !ui.ctx().egui_wants_keyboard_input() {
                     if let Some((sel_strip, sel_peak)) = self.selected_peak {
                         let (up_nudge, down_nudge) = ui.input(|i| {

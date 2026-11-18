@@ -443,6 +443,8 @@ pub struct IntegrativeAfPanel {
     pub selected_parity_idx: Option<usize>,
     pub last_bic_chart_rect: Option<egui::Rect>,
     pub last_parity_plot_rect: Option<egui::Rect>,
+    /// Visualization/content rectangle below the top studio control bar (`UI-B6`).
+    pub last_canvas_rect: Option<egui::Rect>,
 
     // Frame telemetry for deterministic headless tests
     pub last_telemetry: IntegrativeStudioTelemetry,
@@ -517,6 +519,7 @@ impl IntegrativeAfPanel {
             selected_parity_idx: None,
             last_bic_chart_rect: None,
             last_parity_plot_rect: None,
+            last_canvas_rect: None,
             last_telemetry: IntegrativeStudioTelemetry::default(),
         }
     }
@@ -1106,17 +1109,17 @@ impl IntegrativeAfPanel {
 
         egui::Frame::NONE
             .fill(theme.panel_bg)
-            .inner_margin(egui::Margin::same(10))
+            .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 self.draw_header_and_tabs(ui, &theme, &mut actions);
-                ui.add_space(6.0);
+                ui.add_space(3.0);
 
                 egui::CollapsingHeader::new("Advanced Parameters & Data Input")
                     .default_open(self.show_loader_drawer)
                     .show(ui, |ui| {
                         self.draw_loader_drawer(ui, &theme, &mut actions);
                     });
-                ui.add_space(6.0);
+                ui.add_space(4.0);
 
                 if let Some(ref err) = self.last_error {
                     egui::Frame::NONE
@@ -1131,23 +1134,29 @@ impl IntegrativeAfPanel {
                                     .color(theme.badge_alert_fg),
                             );
                         });
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                 }
 
-                match self.active_tab {
-                    IntegrativeStudioTab::ConcordanceSummary => {
-                        self.draw_concordance_tab(ui, &theme, &mut actions);
-                    }
-                    IntegrativeStudioTab::PaeDomainHeatmap => {
-                        self.draw_pae_heatmap_tab(ui, &theme, &mut actions);
-                    }
-                    IntegrativeStudioTab::CofoldPoseRanker => {
-                        self.draw_cofold_tab(ui, &theme, &mut actions);
-                    }
-                    IntegrativeStudioTab::ExcitedStateExplorer => {
-                        self.draw_excited_state_tab(ui, &theme, &mut actions);
-                    }
-                }
+                let tab_avail = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+                self.last_canvas_rect = Some(tab_avail);
+
+                egui::ScrollArea::vertical()
+                    .id_salt("integrative_af_active_tab_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.active_tab {
+                        IntegrativeStudioTab::ConcordanceSummary => {
+                            self.draw_concordance_tab(ui, &theme, &mut actions);
+                        }
+                        IntegrativeStudioTab::PaeDomainHeatmap => {
+                            self.draw_pae_heatmap_tab(ui, &theme, &mut actions);
+                        }
+                        IntegrativeStudioTab::CofoldPoseRanker => {
+                            self.draw_cofold_tab(ui, &theme, &mut actions);
+                        }
+                        IntegrativeStudioTab::ExcitedStateExplorer => {
+                            self.draw_excited_state_tab(ui, &theme, &mut actions);
+                        }
+                    });
             });
 
         self.last_telemetry.pae_texture_uploads = self.pae_texture_uploads;
@@ -1204,14 +1213,16 @@ impl IntegrativeAfPanel {
             {
                 actions.push(IntegrativeAfAction::SyncStructureAndConcordance);
             }
-        });
 
-        ui.add_space(3.0);
-        ui.label(
-            egui::RichText::new(&self.status_message)
-                .size(11.0)
-                .color(theme.text_muted),
-        );
+            if !self.status_message.is_empty() {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(&self.status_message)
+                        .size(11.0)
+                        .color(theme.text_muted),
+                );
+            }
+        });
     }
 
     fn draw_loader_drawer(
@@ -1916,17 +1927,21 @@ impl IntegrativeAfPanel {
             CofoldPreviewDialect::AlphaFold3Json => &self.af3_json_preview,
         };
         if !preview_text.is_empty() {
-            let mut ro_copy = preview_text.clone();
-            egui::ScrollArea::vertical()
-                .id_salt("integrative_cofold_schema_preview")
-                .max_height(135.0)
+            egui::Frame::NONE
+                .fill(theme.plot_bg)
+                .stroke(egui::Stroke::new(1.0, theme.border))
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut ro_copy)
-                            .desired_rows(5)
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Monospace),
-                    );
+                    ui.set_min_width(ui.available_width());
+                    for line in preview_text.lines() {
+                        ui.label(
+                            egui::RichText::new(line)
+                                .monospace()
+                                .size(11.0)
+                                .color(theme.text_primary),
+                        );
+                    }
                 });
             ui.add_space(8.0);
         }
@@ -2107,7 +2122,7 @@ impl IntegrativeAfPanel {
                 .iter()
                 .map(|b| b.two_ln_bf_vs_null)
                 .fold(12.0_f64, f64::max);
-            let left_gutter = 132.0_f32.min(chart_rect.width() * 0.46);
+            let left_gutter = 205.0_f32.min(chart_rect.width() * 0.54);
             let plot_x0 = chart_rect.min.x + left_gutter;
             let plot_x1 = (chart_rect.max.x - 54.0).max(plot_x0 + 24.0);
             let span_x = plot_x1 - plot_x0;

@@ -137,20 +137,20 @@ pub const INTERACTION_GRAMMAR: &[GestureBinding] = &[
     GestureBinding {
         input: "Scroll",
         kind: GestureKind::Mouse,
-        meaning: "Zoom about the pointer (horizontal trackpad scroll pans F2)",
+        meaning: "Adjust signal intensity / contour floor (3D model & Sketcher: zoom; horizontal scroll pans)",
         views: ALL_CANVASES,
     },
     GestureBinding {
         input: "Cmd/Ctrl+Scroll",
         kind: GestureKind::Mouse,
-        meaning: "Zoom the indirect axis only (Strips: 13C range)",
-        views: &[V::Spectrum2d, V::CubePlane3d, V::Strips],
+        meaning: "Zoom about the pointer (pushes zoom history)",
+        views: ALL_CANVASES,
     },
     GestureBinding {
         input: "Shift+Scroll",
         kind: GestureKind::Mouse,
-        meaning: "Step 3D plane / vertical gain",
-        views: &[V::Spectrum1d, V::CubePlane3d],
+        meaning: "Step 3D plane (CubePlane3d) / pan axis (1D, 2D, Strips)",
+        views: SPECTRA,
     },
     GestureBinding {
         input: "+ / -",

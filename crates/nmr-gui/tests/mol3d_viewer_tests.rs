@@ -1308,10 +1308,14 @@ fn test_fail_closed_plddt_provenance_and_headless_mol3d_panel_gestures() {
     let remark_crystal = "\
 EXPDTA    X-RAY DIFFRACTION
 REMARK   3 ALPHAFOLD
-ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 20.00           N
-ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00 25.00           C
-ATOM      3  C   ALA A   1       2.000   1.420   0.000  1.00 30.00           C
-ATOM      4  O   ALA A   1       1.200   2.350   0.000  1.00 35.00           O
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 84.00           N
+ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00 85.00           C
+ATOM      3  C   ALA A   1       2.000   1.420   0.000  1.00 86.00           C
+ATOM      4  O   ALA A   1       1.200   2.350   0.000  1.00 83.00           O
+ATOM      5  N   GLY A   2       3.300   1.420   0.000  1.00 76.00           N
+ATOM      6  CA  GLY A   2       4.000   2.700   0.000  1.00 78.00           C
+ATOM      7  C   GLY A   2       5.450   2.700   0.000  1.00 77.00           C
+ATOM      8  O   GLY A   2       6.000   1.600   0.000  1.00 75.00           O
 END
 ";
     let ens_remark = parse_pdb_ensemble(remark_crystal).expect("parse remark crystal");
@@ -1322,6 +1326,44 @@ END
     assert!(ens_remark.per_residue_plddt.is_none());
     assert!(ens_remark.require_predicted_model(false).is_err());
     assert!(require_predicted_model(&ens_remark, true).is_ok());
+
+    // (a2) `21.W1:P0-2`: Even when `treat_as_model == true` ("Treat B-factors as pLDDT"),
+    //      constant (`0.0`, `0.5`, `20.0`) or out-of-range (`> 100`, `< 0`) B-factors MUST fail closed!
+    for (bad_label, b1, b2) in [
+        ("all-zero", 0.0_f64, 0.0_f64),
+        ("all-half", 0.50, 0.50),
+        ("constant-20", 20.0, 20.0),
+        ("gt-100", 85.0, 125.0),
+        ("negative", -2.0, 82.0),
+    ] {
+        let bad_pdb = format!(
+            "\
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 {b1:5.2}           N
+ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00 {b1:5.2}           C
+ATOM      3  C   ALA A   1       2.000   1.420   0.000  1.00 {b1:5.2}           C
+ATOM      4  O   ALA A   1       1.200   2.350   0.000  1.00 {b1:5.2}           O
+ATOM      5  N   GLY A   2       3.300   1.420   0.000  1.00 {b2:5.2}           N
+ATOM      6  CA  GLY A   2       4.000   2.700   0.000  1.00 {b2:5.2}           C
+ATOM      7  C   GLY A   2       5.450   2.700   0.000  1.00 {b2:5.2}           C
+ATOM      8  O   GLY A   2       6.000   1.600   0.000  1.00 {b2:5.2}           O
+END
+"
+        );
+        let ens_bad = parse_pdb_ensemble(&bad_pdb).expect("parse bad bfactor pdb");
+        assert!(
+            require_predicted_model(&ens_bad, true).is_err(),
+            "{bad_label}: require_predicted_model(_, true) must reject degenerate/out-of-range B-factors"
+        );
+        let mut p_bad = Mol3dViewerPanel::new();
+        p_bad
+            .load_structure_text(&bad_pdb, &["ALA".to_string(), "GLY".to_string()], &[1, 2])
+            .expect("load bad_pdb");
+        p_bad.set_treat_bfactors_as_plddt(true);
+        assert!(
+            p_bad.track_data.plddt.is_empty(),
+            "{bad_label}: set_treat_bfactors_as_plddt(true) must NOT populate plddt track"
+        );
+    }
 
     // (b) Headerless ATOM-only PDB -> Unknown + plddt None
     let headerless = "\

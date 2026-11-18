@@ -109,6 +109,8 @@ pub struct MetabolomicsStudioPanel {
     pub demo_seed: u64,
     /// Last rendered inner plot rectangles for Quadrants A, B, and C.
     pub last_plot_rects: [Option<egui::Rect>; 3],
+    /// Union visualization bounding rectangle across the active metabolomics plots (`UI-B6`).
+    pub last_canvas_rect: Option<egui::Rect>,
 }
 
 impl Default for MetabolomicsStudioPanel {
@@ -141,6 +143,7 @@ impl MetabolomicsStudioPanel {
                     .to_string(),
             demo_seed: 20261115,
             last_plot_rects: [None; 3],
+            last_canvas_rect: None,
         }
     }
 
@@ -246,6 +249,7 @@ impl MetabolomicsStudioPanel {
     /// Render the complete 4-Quadrant Metabolomics & Biomarker Discovery Studio.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.last_plot_rects = [None; 3];
+        self.last_canvas_rect = None;
         self.draw_top_toolbar(ui);
         ui.add_space(3.0);
 
@@ -308,6 +312,12 @@ impl MetabolomicsStudioPanel {
                 },
             );
         }
+
+        self.last_canvas_rect = self
+            .last_plot_rects
+            .into_iter()
+            .flatten()
+            .reduce(egui::Rect::union);
     }
 
     fn draw_empty_state(&mut self, ui: &mut egui::Ui) {
@@ -390,20 +400,21 @@ impl MetabolomicsStudioPanel {
                             });
                     }
 
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("Load 24-Sample Demo")
-                                    .size(12.5)
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(185, 245, 255)),
+                    if self.study.is_none()
+                        && ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Load 24-Sample Demo")
+                                        .size(12.5)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(185, 245, 255)),
+                                )
+                                .fill(egui::Color32::from_rgb(24, 82, 128)),
                             )
-                            .fill(egui::Color32::from_rgb(24, 82, 128)),
-                        )
-                        .on_hover_text(
-                            "Synthesize 24 human biofluid 1D 1H spectra (12 Control, 12 Case) with sample dilutions, pH jitter, and Lactate/Valine/TMAO biomarkers",
-                        )
-                        .clicked()
+                            .on_hover_text(
+                                "Synthesize 24 human biofluid 1D 1H spectra (12 Control, 12 Case) with sample dilutions, pH jitter, and Lactate/Valine/TMAO biomarkers",
+                            )
+                            .clicked()
                     {
                         self.demo_seed = self.demo_seed.wrapping_add(1);
                         self.load_demo_cohort();
@@ -411,12 +422,6 @@ impl MetabolomicsStudioPanel {
 
                     if !self.samples.is_empty() && ui.button("Re-Run").clicked() {
                         trigger_rerun = true;
-                    }
-
-                    if self.study.is_some() && ui.button("Full Sweep").clicked() {
-                        if let Some(ref st) = self.study {
-                            self.view_ppm_bounds = (st.config.min_ppm, st.config.max_ppm);
-                        }
                     }
 
                     ui.separator();
@@ -499,6 +504,17 @@ impl MetabolomicsStudioPanel {
                 .default_open(false)
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
+                        if ui.button("Load 24-Sample Demo").clicked() {
+                            self.demo_seed = self.demo_seed.wrapping_add(1);
+                            self.load_demo_cohort();
+                        }
+                        if self.study.is_some() && ui.button("Full Sweep").clicked() {
+                            if let Some(ref st) = self.study {
+                                self.view_ppm_bounds = (st.config.min_ppm, st.config.max_ppm);
+                            }
+                        }
+                        ui.separator();
+
                         let is_adaptive = matches!(
                             self.config.bucketing,
                             BucketingMethod::AdaptiveIntelligent { .. }

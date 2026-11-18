@@ -1231,42 +1231,15 @@ impl OctetDrawPanel {
     }
 
     fn draw_top_workflow_bar(&mut self, ui: &mut egui::Ui) {
-        // <= 10 visible primary controls: Undo, Redo, Clean 2D, Clear, Tool, Molecule, Inspector, 1D NMR, Import/Export (9 total)
+        // <= 6 primary toolbar controls (Undo/Redo/Clear live in Advanced & right-click menu):
+        // Clean 2D, Tool, Active Molecule, Inspector, 1D NMR, Import/Export
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(
-                    !self.undo_stack.is_empty(),
-                    egui::Button::new(egui::RichText::new("Undo").size(12.5)),
-                )
-                .on_hover_text("Undo (Cmd/Ctrl+Z)")
-                .clicked()
-            {
-                self.undo();
-            }
-            if ui
-                .add_enabled(
-                    !self.redo_stack.is_empty(),
-                    egui::Button::new(egui::RichText::new("Redo").size(12.5)),
-                )
-                .on_hover_text("Redo (Cmd/Ctrl+Shift+Z)")
-                .clicked()
-            {
-                self.redo();
-            }
             if ui
                 .button(egui::RichText::new("Clean 2D").size(12.5))
                 .on_hover_text("Regularize bond lengths and 120 deg angles")
                 .clicked()
             {
                 self.clean_2d_structure();
-            }
-            if ui
-                .button(egui::RichText::new("Clear").size(12.5))
-                .on_hover_text("Clear canvas")
-                .clicked()
-            {
-                self.set_scene(RenderScene::new());
-                self.status_msg = "Cleared canvas".to_string();
             }
 
             ui.separator();
@@ -1428,6 +1401,36 @@ impl OctetDrawPanel {
 
     fn draw_advanced_tools_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !self.undo_stack.is_empty(),
+                    egui::Button::new(egui::RichText::new("Undo").size(12.5)),
+                )
+                .on_hover_text("Undo (Cmd/Ctrl+Z)")
+                .clicked()
+            {
+                self.undo();
+            }
+            if ui
+                .add_enabled(
+                    !self.redo_stack.is_empty(),
+                    egui::Button::new(egui::RichText::new("Redo").size(12.5)),
+                )
+                .on_hover_text("Redo (Cmd/Ctrl+Shift+Z)")
+                .clicked()
+            {
+                self.redo();
+            }
+            if ui
+                .button(egui::RichText::new("Clear").size(12.5))
+                .on_hover_text("Clear canvas")
+                .clicked()
+            {
+                self.set_scene(RenderScene::new());
+                self.status_msg = "Cleared canvas".to_string();
+            }
+            ui.separator();
+
             ui.label(egui::RichText::new("Style:").size(12.5));
             let cur_preset = self.style.preset;
             egui::ComboBox::from_id_salt("octet_journal_style_combo")

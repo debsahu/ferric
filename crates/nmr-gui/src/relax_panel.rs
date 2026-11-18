@@ -85,6 +85,7 @@ pub struct RelaxPanelState {
     pub exported_tsv_preview: String,
     pub show_tsv_modal: bool,
     pub status_banner: String,
+    pub last_canvas_rect: Option<egui::Rect>,
 }
 
 impl Default for RelaxPanelState {
@@ -117,6 +118,7 @@ impl RelaxPanelState {
             status_banner:
                 "Load a relaxation series TSV/NEF or synthesize dual-field 600+800 MHz dynamics."
                     .to_string(),
+            last_canvas_rect: None,
         }
     }
 
@@ -795,6 +797,8 @@ impl RelaxPanelState {
                         .color(egui::Color32::from_rgb(155, 195, 225)),
                 );
             });
+
+        self.last_canvas_rect = Some(ui.available_rect_before_wrap().intersect(ui.clip_rect()));
 
         if self.show_paste_drawer {
             ui.group(|ui| {
