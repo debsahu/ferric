@@ -678,7 +678,22 @@ enum DeflatePhase {
     Done,
 }
 
-const MAX_DISK_INFLATE_BYTES: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB bound for streamed/discarded archive payloads
+const MAX_DISK_INFLATE_BYTES: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB bound for streamed/discarded ON-DISK archive payloads
+/// Total inflate bound for browser / in-memory `.tar.gz` / `.tgz` / `.zip` ingest on native targets
+/// (`1 GiB`). The 16 GiB disk bound must NEVER be applied to an archive already held in memory.
+pub const MAX_INMEMORY_ARCHIVE_INFLATE_BYTES_NATIVE: u64 = 1024 * 1024 * 1024;
+/// Total inflate bound for browser / in-memory archive ingest on `wasm32` (`256 MiB`; wasm linear
+/// memory never shrinks and a 16 MB gzip bomb must not freeze the UI).
+pub const MAX_INMEMORY_ARCHIVE_INFLATE_BYTES_WASM: u64 = 256 * 1024 * 1024;
+/// In-memory archive inflate bound in force for the current target pointer width.
+#[cfg(target_pointer_width = "32")]
+pub const MAX_INMEMORY_ARCHIVE_INFLATE_BYTES: u64 = MAX_INMEMORY_ARCHIVE_INFLATE_BYTES_WASM;
+/// In-memory archive inflate bound in force for the current target pointer width.
+#[cfg(not(target_pointer_width = "32"))]
+pub const MAX_INMEMORY_ARCHIVE_INFLATE_BYTES: u64 = MAX_INMEMORY_ARCHIVE_INFLATE_BYTES_NATIVE;
+/// Initial `Vec` capacity for any payload whose size comes from an untrusted archive header;
+/// buffers grow only as real (compressed) bytes are actually produced.
+const ARCHIVE_INITIAL_CAPACITY: usize = 64 * 1024;
 const MAX_RETAINED_HEADER_BYTES: usize = 64 * 1024 * 1024; // 64 MiB bound on retained VirtualEntry.header_bytes memory
 
 const fn build_crc32_table() -> [u32; 256] {
@@ -766,6 +781,12 @@ impl<R: Read> GzipStreamDecoder<R> {
     #[inline]
     fn crc32(&self) -> u32 {
         !self.crc32_state
+    }
+
+    /// True once the final DEFLATE block (`BFINAL`) and its end-of-block code were consumed.
+    #[inline]
+    fn is_finished(&self) -> bool {
+        self.phase == DeflatePhase::Done
     }
 
     #[inline]
@@ -1302,7 +1323,10 @@ fn classify_file_read_action(rel_path: &str) -> FileReadAction {
             | "3rrr"
             | "3rri"
             | "3rir"
+            | "3iri"
             | "3iir"
+            | "3iii"
+            | "3rii"
             | "4rrrr"
     ) {
         return FileReadAction::MetadataOnlySignal;
@@ -1543,6 +1567,33 @@ fn discard_bytes_read<R: Read>(r: &mut R, mut count: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Read exactly `len` bytes, growing the buffer in 64 KiB steps as data really arrives (never
+/// pre-allocating `len` from an untrusted archive header). EOF before `len` is an error.
+fn read_exact_growing<R: Read>(r: &mut R, len: usize) -> io::Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::with_capacity(len.min(ARCHIVE_INITIAL_CAPACITY));
+    let mut chunk = [0u8; 16 * 1024];
+    while out.len() < len {
+        let want = (len - out.len()).min(chunk.len());
+        let n = r.read(&mut chunk[..want])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated archive entry payload",
+            ));
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    Ok(out)
+}
+
+/// True when any path segment (after `\\` -> `/`) is a `..` traversal. Benign `.` segments
+/// (`./1/acqus`) are allowed.
+fn has_dotdot_segment(raw: &str) -> bool {
+    raw.replace('\\', "/")
+        .split('/')
+        .any(|seg| seg.trim() == "..")
+}
+
 fn validate_tar_header_checksum(hdr: &[u8; 512]) -> bool {
     let chk_field = &hdr[148..156];
     let s = std::str::from_utf8(chk_field).unwrap_or("");
@@ -1564,6 +1615,12 @@ fn validate_tar_header_checksum(hdr: &[u8; 512]) -> bool {
     stored == unsigned_sum || stored == signed_sum
 }
 
+/// Entry retention predicate `(relative_path, declared_size) -> keep` for archive extraction.
+pub type ArchiveEntryFilter<'a> = &'a dyn Fn(&str, u64) -> bool;
+
+/// Optional retention filter for full-payload extraction: `(relative_path, declared_size) -> keep`.
+type RetainFilter<'a> = Option<ArchiveEntryFilter<'a>>;
+
 /// Walk a POSIX.1-1988 `ustar` stream using `skip_fn` to advance over unread payload tails
 /// (`Seek::seek` on `.tar` files/cursors in `O(1)`, or bounded scratch discard on `.tar.gz`),
 /// while enforcing `max_retained_header_bytes` across all retained `VirtualEntry.header_bytes`.
@@ -1572,6 +1629,7 @@ fn scan_tar_with_skipper<R, S>(
     mut skip_fn: S,
     max_retained_header_bytes: usize,
     retain_full_payloads: bool,
+    keep: RetainFilter<'_>,
     out: &mut Vec<VirtualEntry>,
 ) -> Result<(), String>
 where
@@ -1583,6 +1641,7 @@ where
     let mut gnu_long_name: Option<String> = None;
     let mut pax_path: Option<String> = None;
     let mut pax_size: Option<u64> = None;
+    let mut seen_paths: BTreeSet<String> = BTreeSet::new();
     let mut retained_header_bytes: usize = out.iter().map(|e| e.header_bytes.len()).sum();
 
     loop {
@@ -1678,6 +1737,9 @@ where
             }
         };
 
+        if has_dotdot_segment(&name) {
+            return Err(format!("unsafe path traversal in tar entry '{name}'"));
+        }
         let is_regular = typeflag == 0 || typeflag == b'0' || typeflag == b'7';
         if !is_regular {
             if padded_size > 0 {
@@ -1687,8 +1749,19 @@ where
         }
 
         let rel = normalize_rel_path(&name);
+        if rel.is_empty() || is_macos_or_vcs_junk(&rel) {
+            if padded_size > 0 {
+                skip_fn(reader, padded_size).map_err(|e| format!("tar skip error: {e}"))?;
+            }
+            continue;
+        }
+        if !seen_paths.insert(rel.clone()) {
+            return Err(format!(
+                "duplicate normalized tar entry path '{rel}' (ambiguous archive)"
+            ));
+        }
         if retain_full_payloads {
-            if is_macos_or_vcs_junk(&rel) {
+            if keep.is_some_and(|k| !k(&rel, raw_size)) {
                 if padded_size > 0 {
                     skip_fn(reader, padded_size).map_err(|e| format!("tar skip error: {e}"))?;
                 }
@@ -1706,11 +1779,9 @@ where
                     "archive exceeded maximum retained byte limit ({max_retained_header_bytes} bytes)"
                 ));
             }
-            let mut full_bytes = vec![0u8; to_read];
-            if to_read > 0 {
-                read_exact_or_eof(reader, &mut full_bytes)
-                    .map_err(|e| format!("tar entry read error: {e}"))?;
-            }
+            // Grow only as real bytes arrive: a 512-byte header may claim hundreds of MiB.
+            let full_bytes = read_exact_growing(reader, to_read)
+                .map_err(|e| format!("tar entry read error: {e}"))?;
             let rem = padded_size.saturating_sub(to_read as u64);
             if rem > 0 {
                 skip_fn(reader, rem).map_err(|e| format!("tar skip error: {e}"))?;
@@ -1739,11 +1810,8 @@ where
                         "archive exceeded maximum retained header byte limit ({max_retained_header_bytes} bytes)"
                     ));
                 }
-                let mut prefix_bytes = vec![0u8; to_read];
-                if to_read > 0 {
-                    read_exact_or_eof(reader, &mut prefix_bytes)
-                        .map_err(|e| format!("tar header entry read error: {e}"))?;
-                }
+                let prefix_bytes = read_exact_growing(reader, to_read)
+                    .map_err(|e| format!("tar header entry read error: {e}"))?;
                 let rem = padded_size.saturating_sub(to_read as u64);
                 if rem > 0 {
                     skip_fn(reader, rem).map_err(|e| format!("tar skip error: {e}"))?;
@@ -1781,6 +1849,7 @@ fn scan_zip_seekable_internal<R: Read + Seek>(
     max_inflate_bytes: u64,
     max_retained_bytes: usize,
     retain_full_payloads: bool,
+    keep: RetainFilter<'_>,
     out: &mut Vec<VirtualEntry>,
 ) -> Result<(), String> {
     let file_len = reader
@@ -1828,7 +1897,7 @@ fn scan_zip_seekable_internal<R: Read + Seek>(
     if total_entries == 0xFFFF || cd_offset == 0xFFFF_FFFF {
         return Err("ZIP64 (>4 GiB) archives are not supported in in-memory ingest".to_string());
     }
-    if cd_offset.saturating_add(cd_size) > file_len {
+    if cd_offset.saturating_add(cd_size) > file_len || cd_size > 64 * 1024 * 1024 {
         return Err("corrupt ZIP Central Directory bounds".to_string());
     }
 
@@ -1842,6 +1911,7 @@ fn scan_zip_seekable_internal<R: Read + Seek>(
 
     struct ZipCdItem {
         rel: String,
+        raw_name: Vec<u8>,
         method: u16,
         crc32: u32,
         comp_size: u64,
@@ -1850,6 +1920,10 @@ fn scan_zip_seekable_internal<R: Read + Seek>(
     }
 
     let mut items = Vec::with_capacity(total_entries.min(4096));
+    // Lower-bound byte span `[local_offset, local_offset + 30 + name + comp_size)` of EVERY central
+    // directory record (files, directories, skipped junk) for overlap / duplicate-offset detection.
+    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(total_entries.min(4096));
+    let mut seen_paths: BTreeSet<String> = BTreeSet::new();
     let mut pos = 0usize;
     for _ in 0..total_entries {
         if pos + 46 > cd_buf.len() {
@@ -1898,24 +1972,33 @@ fn scan_zip_seekable_internal<R: Read + Seek>(
         if hdr_end > cd_buf.len() {
             return Err("truncated ZIP Central Directory filename/extra field".to_string());
         }
-        let raw_name = String::from_utf8_lossy(&cd_buf[pos + 46..pos + 46 + name_len]);
+        let name_bytes = cd_buf[pos + 46..pos + 46 + name_len].to_vec();
+        let raw_name = String::from_utf8_lossy(&name_bytes).into_owned();
         pos = hdr_end;
+        spans.push((
+            local_offset,
+            30u64
+                .saturating_add(name_len as u64)
+                .saturating_add(comp_size),
+        ));
         if raw_name.ends_with('/') || raw_name.ends_with('\\') {
             continue;
         }
-        if raw_name
-            .replace('\\', "/")
-            .split('/')
-            .any(|seg| seg == "..")
-        {
+        if has_dotdot_segment(&raw_name) {
             return Err(format!("unsafe path traversal in ZIP entry '{raw_name}'"));
         }
         let rel = normalize_rel_path(&raw_name);
         if is_macos_or_vcs_junk(&rel) {
             continue;
         }
+        if !seen_paths.insert(rel.clone()) {
+            return Err(format!(
+                "duplicate normalized ZIP entry path '{rel}' (ambiguous archive)"
+            ));
+        }
         items.push(ZipCdItem {
             rel,
+            raw_name: name_bytes,
             method,
             crc32,
             comp_size,
@@ -1924,11 +2007,87 @@ fn scan_zip_seekable_internal<R: Read + Seek>(
         });
     }
 
+    // Reject overlapping entries / duplicate local header offsets (zip-quine & shared-data bombs).
+    spans.sort_unstable();
+    for w in spans.windows(2) {
+        if w[0].0.saturating_add(w[0].1) > w[1].0 {
+            return Err(format!(
+                "overlapping ZIP entries at local header offsets {} and {}",
+                w[0].0, w[1].0
+            ));
+        }
+    }
+
     let mut total_inflated: u64 = 0;
     let mut retained_bytes: usize = out.iter().map(|e| e.header_bytes.len()).sum();
+    let mut exact_spans: Vec<(u64, u64)> = Vec::with_capacity(items.len());
 
     for it in items {
+        if it.local_offset.saturating_add(30) > cd_offset {
+            return Err(format!(
+                "corrupt local header offset for ZIP entry '{}'",
+                it.rel
+            ));
+        }
+        reader
+            .seek(SeekFrom::Start(it.local_offset))
+            .map_err(|e| format!("ZIP local header seek error: {e}"))?;
+        let mut lhdr = [0u8; 30];
+        reader
+            .read_exact(&mut lhdr)
+            .map_err(|e| format!("ZIP local header read error: {e}"))?;
+        if &lhdr[..4] != b"PK\x03\x04" {
+            return Err(format!(
+                "invalid ZIP local header signature for '{}'",
+                it.rel
+            ));
+        }
+        let l_name_len = u16::from_le_bytes([lhdr[26], lhdr[27]]) as u64;
+        let l_extra_len = u16::from_le_bytes([lhdr[28], lhdr[29]]) as u64;
+        // The local-file-header name must match the Central Directory name (no name confusion).
+        if l_name_len != it.raw_name.len() as u64 {
+            return Err(format!(
+                "ZIP local header name length differs from Central Directory for '{}'",
+                it.rel
+            ));
+        }
+        let mut local_name = vec![0u8; it.raw_name.len()];
+        reader
+            .read_exact(&mut local_name)
+            .map_err(|e| format!("ZIP local header name read error: {e}"))?;
+        if local_name != it.raw_name {
+            return Err(format!(
+                "ZIP local header name differs from Central Directory name for '{}'",
+                it.rel
+            ));
+        }
+        let data_start = it
+            .local_offset
+            .saturating_add(30)
+            .saturating_add(l_name_len)
+            .saturating_add(l_extra_len);
+        let data_end = data_start.saturating_add(it.comp_size);
+        if data_end > cd_offset || data_end > file_len {
+            return Err(format!(
+                "truncated or out-of-bounds compressed data for ZIP entry '{}'",
+                it.rel
+            ));
+        }
+        if exact_spans
+            .iter()
+            .any(|&(s0, e0)| it.local_offset < e0 && s0 < data_end)
+        {
+            return Err(format!(
+                "overlapping ZIP local payload range for '{}'",
+                it.rel
+            ));
+        }
+        exact_spans.push((it.local_offset, data_end));
+
         let read_limit: usize = if retain_full_payloads {
+            if keep.is_some_and(|k| !k(&it.rel, it.uncomp_size)) {
+                continue;
+            }
             if it.uncomp_size > (max_retained_bytes as u64) {
                 return Err(format!(
                     "ZIP entry '{}' ({} bytes) exceeds maximum retained byte limit ({max_retained_bytes} bytes)",
@@ -1966,44 +2125,12 @@ fn scan_zip_seekable_internal<R: Read + Seek>(
             ));
         }
 
-        if it.local_offset.saturating_add(30) > file_len {
-            return Err(format!(
-                "corrupt local header offset for ZIP entry '{}'",
-                it.rel
-            ));
-        }
-        reader
-            .seek(SeekFrom::Start(it.local_offset))
-            .map_err(|e| format!("ZIP local header seek error: {e}"))?;
-        let mut lhdr = [0u8; 30];
-        reader
-            .read_exact(&mut lhdr)
-            .map_err(|e| format!("ZIP local header read error: {e}"))?;
-        if &lhdr[..4] != b"PK\x03\x04" {
-            return Err(format!(
-                "invalid ZIP local header signature for '{}'",
-                it.rel
-            ));
-        }
-        let l_name_len = u16::from_le_bytes([lhdr[26], lhdr[27]]) as u64;
-        let l_extra_len = u16::from_le_bytes([lhdr[28], lhdr[29]]) as u64;
-        let data_start = it
-            .local_offset
-            .saturating_add(30)
-            .saturating_add(l_name_len)
-            .saturating_add(l_extra_len);
-        if data_start.saturating_add(it.comp_size) > file_len {
-            return Err(format!(
-                "truncated compressed data for ZIP entry '{}'",
-                it.rel
-            ));
-        }
         reader
             .seek(SeekFrom::Start(data_start))
             .map_err(|e| format!("ZIP data seek error: {e}"))?;
 
-        let mut buf = vec![0u8; read_limit];
         let verify_full_crc = (read_limit as u64) == it.uncomp_size;
+        let buf: Vec<u8>;
         match it.method {
             0 => {
                 if (read_limit as u64) > it.comp_size {
@@ -2012,11 +2139,8 @@ fn scan_zip_seekable_internal<R: Read + Seek>(
                         it.rel, it.comp_size, it.uncomp_size
                     ));
                 }
-                if read_limit > 0 {
-                    reader
-                        .read_exact(&mut buf)
-                        .map_err(|e| format!("ZIP stored read error in '{}': {e}", it.rel))?;
-                }
+                buf = read_exact_growing(reader, read_limit)
+                    .map_err(|e| format!("ZIP stored read error in '{}': {e}", it.rel))?;
                 if verify_full_crc {
                     let mut crc: u32 = 0xFFFF_FFFF;
                     for &b in &buf {
@@ -2031,28 +2155,56 @@ fn scan_zip_seekable_internal<R: Read + Seek>(
             8 => {
                 let comp_slice = reader.by_ref().take(it.comp_size);
                 let mut dec = GzipStreamDecoder::new_raw_deflate(comp_slice, read_limit as u64 + 1);
-                let mut pos_out = 0usize;
-                while pos_out < read_limit {
+                // Grow only as real inflated bytes appear (declared sizes are untrusted).
+                let mut out_buf: Vec<u8> =
+                    Vec::with_capacity(read_limit.min(ARCHIVE_INITIAL_CAPACITY));
+                let mut chunk = [0u8; 16 * 1024];
+                while out_buf.len() < read_limit {
+                    let want = (read_limit - out_buf.len()).min(chunk.len());
                     let n = dec
-                        .read(&mut buf[pos_out..])
+                        .read(&mut chunk[..want])
                         .map_err(|e| format!("ZIP DEFLATE error in '{}': {e}", it.rel))?;
                     if n == 0 {
                         break;
                     }
-                    pos_out += n;
+                    out_buf.extend_from_slice(&chunk[..n]);
                 }
-                if pos_out != read_limit {
+                if out_buf.len() != read_limit {
                     return Err(format!(
                         "ZIP entry '{}' inflated {} bytes, expected {}",
-                        it.rel, pos_out, read_limit
+                        it.rel,
+                        out_buf.len(),
+                        read_limit
                     ));
                 }
-                if verify_full_crc && dec.crc32() != it.crc32 {
-                    return Err(format!(
-                        "ZIP CRC-32 mismatch in deflated entry '{}'",
-                        it.rel
-                    ));
+                if verify_full_crc {
+                    // Full read: the DEFLATE stream must now be exactly exhausted (BFINAL block and
+                    // its end-of-block code consumed); any further output means the entry inflates
+                    // beyond its declared size.
+                    let mut probe = [0u8; 1];
+                    let extra = dec
+                        .read(&mut probe)
+                        .map_err(|e| format!("ZIP DEFLATE error in '{}': {e}", it.rel))?;
+                    if extra != 0 {
+                        return Err(format!(
+                            "ZIP entry '{}' inflates beyond its declared {} bytes",
+                            it.rel, it.uncomp_size
+                        ));
+                    }
+                    if !dec.is_finished() {
+                        return Err(format!(
+                            "ZIP entry '{}' DEFLATE stream is not terminated by a BFINAL block",
+                            it.rel
+                        ));
+                    }
+                    if dec.crc32() != it.crc32 {
+                        return Err(format!(
+                            "ZIP CRC-32 mismatch in deflated entry '{}'",
+                            it.rel
+                        ));
+                    }
                 }
+                buf = out_buf;
             }
             other => {
                 return Err(format!(
@@ -2079,6 +2231,7 @@ fn scan_zip_seekable_bounded<R: Read + Seek>(
         max_inflate_bytes,
         max_retained_header_bytes,
         false,
+        None,
         out,
     )
 }
@@ -2095,20 +2248,39 @@ fn scan_zip_seekable<R: Read + Seek>(
     )
 }
 
+fn seek_skip_bounded<R: Seek>(r: &mut R, n: u64, end_pos: u64) -> io::Result<()> {
+    let step = i64::try_from(n)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tar entry > i64::MAX"))?;
+    let new_pos = r.seek(SeekFrom::Current(step))?;
+    if new_pos > end_pos {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated tar entry payload",
+        ));
+    }
+    Ok(())
+}
+
 fn scan_tar_seekable_bounded<R: Read + Seek>(
     reader: &mut R,
     max_retained_header_bytes: usize,
     out: &mut Vec<VirtualEntry>,
 ) -> Result<(), String> {
+    let start_pos = reader
+        .stream_position()
+        .map_err(|e| format!("tar seek error: {e}"))?;
+    let end_pos = reader
+        .seek(SeekFrom::End(0))
+        .map_err(|e| format!("tar seek error: {e}"))?;
+    reader
+        .seek(SeekFrom::Start(start_pos))
+        .map_err(|e| format!("tar seek error: {e}"))?;
     scan_tar_with_skipper(
         reader,
-        |r, n| {
-            let step = i64::try_from(n)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tar entry > i64::MAX"))?;
-            r.seek(SeekFrom::Current(step)).map(|_| ())
-        },
+        |r, n| seek_skip_bounded(r, n, end_pos),
         max_retained_header_bytes,
         false,
+        None,
         out,
     )
 }
@@ -2132,6 +2304,7 @@ fn scan_targz_reader_bounded<R: Read>(
         discard_bytes_read,
         max_retained_header_bytes,
         false,
+        None,
         out,
     )?;
     let mut scratch = [0u8; 4096];
@@ -2202,6 +2375,26 @@ pub fn extract_archive_full_entries_bounded(
     max_inflate_bytes: u64,
     max_retained_bytes: usize,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
+    extract_archive_full_entries_filtered(
+        archive_name,
+        archive_bytes,
+        max_inflate_bytes,
+        max_retained_bytes,
+        None,
+    )
+}
+
+/// Like [`extract_archive_full_entries_bounded`], but `keep(relative_path, declared_size)` may veto
+/// individual entries BEFORE any byte is retained (unused imaginary parts such as `2ii`/`3rri`, or
+/// bulk payloads that no longer fit the caller's remaining memory budget). Vetoed entries are
+/// streamed past (gzip) or seeked over (tar/zip) without allocation.
+pub fn extract_archive_full_entries_filtered(
+    archive_name: &str,
+    archive_bytes: &[u8],
+    max_inflate_bytes: u64,
+    max_retained_bytes: usize,
+    keep: Option<ArchiveEntryFilter<'_>>,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
     let lower = archive_name.to_ascii_lowercase();
     let is_zip = is_zip_path_lower(&lower) || is_zip_magic(archive_bytes);
     let is_gz = !is_zip
@@ -2215,6 +2408,7 @@ pub fn extract_archive_full_entries_bounded(
             max_inflate_bytes,
             max_retained_bytes,
             true,
+            keep,
             &mut entries,
         )?;
     } else if is_gz {
@@ -2224,10 +2418,12 @@ pub fn extract_archive_full_entries_bounded(
             discard_bytes_read,
             max_retained_bytes,
             true,
+            keep,
             &mut entries,
         )?;
     } else {
-        if (archive_bytes.len() as u64) > max_inflate_bytes {
+        let end_pos = archive_bytes.len() as u64;
+        if end_pos > max_inflate_bytes {
             return Err(format!(
                 "archive exceeded maximum uncompressed byte limit ({max_inflate_bytes} bytes)"
             ));
@@ -2235,14 +2431,10 @@ pub fn extract_archive_full_entries_bounded(
         let mut cur = Cursor::new(archive_bytes);
         scan_tar_with_skipper(
             &mut cur,
-            |r, n| {
-                let step = i64::try_from(n).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "tar entry > i64::MAX")
-                })?;
-                r.seek(SeekFrom::Current(step)).map(|_| ())
-            },
+            |r, n| seek_skip_bounded(r, n, end_pos),
             max_retained_bytes,
             true,
+            keep,
             &mut entries,
         )?;
     }
@@ -2252,9 +2444,11 @@ pub fn extract_archive_full_entries_bounded(
         .collect())
 }
 
-/// Inspect an in-memory `.tar` or `.tar.gz` / `.tgz` byte buffer into `VirtualEntry` headers
-/// without retaining bulk binary signal payloads (`ser`/`fid` payloads are streamed and discarded
-/// up to `16 GiB` while retained `VirtualEntry.header_bytes` memory is bounded to `64 MiB`).
+/// Inspect an in-memory `.zip`, `.tar` or `.tar.gz` / `.tgz` byte buffer into `VirtualEntry`
+/// headers without retaining bulk binary signal payloads (`ser`/`fid`/`3rrr`/`2rr` payloads are
+/// streamed and discarded while retained `VirtualEntry.header_bytes` memory is bounded to
+/// `64 MiB`). Total inflate is bounded by [`MAX_INMEMORY_ARCHIVE_INFLATE_BYTES`] (`1 GiB` native,
+/// `256 MiB` on `wasm32`), NEVER the 16 GiB on-disk bound used for archives scanned from a path.
 pub fn extract_archive_virtual_entries(
     archive_name: &str,
     archive_bytes: &[u8],
@@ -2262,7 +2456,7 @@ pub fn extract_archive_virtual_entries(
     extract_archive_virtual_entries_bounded(
         archive_name,
         archive_bytes,
-        MAX_DISK_INFLATE_BYTES,
+        MAX_INMEMORY_ARCHIVE_INFLATE_BYTES,
         MAX_RETAINED_HEADER_BYTES,
     )
 }
@@ -2569,6 +2763,22 @@ fn collect_virtual_entries_from_dir(
 // ============================================================================
 // Vendor Header Parsers (Bruker JCAMP-DX, Varian procpar, UCSF v2, NMRPipe)
 // ============================================================================
+
+/// Highest physically possible `13C` observe frequency (MHz, 1.3 GHz magnet).
+const MAX_13C_OBS_MHZ: f64 = 330.0;
+/// Highest physically possible `15N` observe frequency (MHz, 1.3 GHz magnet).
+const MAX_15N_OBS_MHZ: f64 = 134.0;
+
+/// True when `(sf_c13, sf_n15)` are absolute observe frequencies a `13C`/`15N` channel pair can
+/// really have, disambiguating the `15N/13C` ratio (`0.40298`) from `31P/1H` (`0.4048`).
+fn is_c13_n15_pair(sf_c13: f64, sf_n15: f64) -> bool {
+    sf_c13.is_finite()
+        && sf_n15.is_finite()
+        && sf_c13 > 0.0
+        && sf_n15 > 0.0
+        && sf_c13 <= MAX_13C_OBS_MHZ
+        && sf_n15 <= MAX_15N_OBS_MHZ
+}
 
 fn canonical_nucleus(raw: &str) -> String {
     let cleaned = raw
@@ -2939,6 +3149,9 @@ fn parse_nmrpipe_header(
         };
     }
 
+    if !hdr[9].is_finite() || hdr[9] < 0.5 || hdr[9] > 8.5 {
+        return Err(format!("invalid NMRPipe FDDIMCOUNT={}", hdr[9]));
+    }
     let mut ndim = (hdr[9].round() as usize).clamp(1, 4);
     if plane_count_override.is_some_and(|c| c > 1) && ndim < 3 {
         ndim = 3;
@@ -2955,11 +3168,33 @@ fn parse_nmrpipe_header(
     const OBS_IDX: [usize; 4] = [119, 218, 10, 28];
     const LABEL_IDX: [usize; 4] = [16, 18, 20, 22];
 
+    let parse_pipe_sz = |v: f32, field: &str| -> Result<usize, String> {
+        if !v.is_finite()
+            || v < 0.0
+            || (v as f64).round() > crate::spectrum::MAX_SPECTRUM_POINTS as f64
+        {
+            return Err(format!("invalid NMRPipe {field}={v}"));
+        }
+        Ok(((v as f64).round() as usize).max(1))
+    };
+
     let sizes = [
-        (hdr[99].round() as usize).max(1),
-        (hdr[219].round() as usize).max(1),
-        plane_count_override.unwrap_or_else(|| (hdr[15].round() as usize).max(1)),
-        (hdr[32].round() as usize).max(1),
+        parse_pipe_sz(hdr[99], "FDSIZE")?,
+        if ndim >= 2 {
+            parse_pipe_sz(hdr[219], "FDSPECNUM")?
+        } else {
+            1
+        },
+        match plane_count_override {
+            Some(c) => c,
+            None if ndim >= 3 => parse_pipe_sz(hdr[15], "FDF3SIZE")?,
+            None => 1,
+        },
+        if ndim >= 4 {
+            parse_pipe_sz(hdr[32], "FDF4SIZE")?
+        } else {
+            1
+        },
     ];
 
     let mut axes = Vec::with_capacity(ndim);
@@ -3152,6 +3387,13 @@ fn classify_pulse_token(
     let has_15n = axes.iter().skip(1).any(|a| a.nucleus == "15N");
     let has_13c = axes.iter().skip(1).any(|a| a.nucleus == "13C");
 
+    // HBHA(CO)NH (`hbhaconhgp3d`, `hbhaconh`): sidechain Ha/Hb -> N-H correlation. It has the same
+    // 1H/15N/1H axes as a 15N-NOESY-HSQC but is NOT one (mislabelled NOESY peaks could become
+    // distance restraints) and is not a backbone assignment input, so it stays `Unknown`.
+    if compact.contains("hbhacon") {
+        return Some(PulseSequenceClass::Unknown);
+    }
+
     // 0. Pseudo-2D DOSY Diffusion (`ledbpgp*`, `stebpgp*`, `dstebpgp*`, `doneshot*`, `dbppste*`, `dosy*`)
     if matches!(
         dim,
@@ -3189,6 +3431,7 @@ fn classify_pulse_token(
     // Longitudinal R1/T1 (`hsqct1`, `invit1`, `_t1_`, `gt1`, `nh_t1`, `r1_`) — NOT `.t1` evolution suffix on `hcacon`!
     if !compact.contains("hcacon")
         && (compact.contains("hsqct1")
+            || compact.starts_with("t1ir")
             || compact.contains("invit1")
             || base.contains("_t1_")
             || base.ends_with("_t1")
@@ -3318,10 +3561,7 @@ fn classify_pulse_token(
     }
 
     // 4. Aliphatic Sidechain 3D TOCSY (`HCCH-TOCSY`, `H(CCO)NH`, `CC(CO)NH`)
-    if compact.contains("hcchtocsy")
-        || compact.contains("hcchcosy")
-        || compact.contains("hcchdipsi")
-    {
+    if compact.contains("hcchtocsy") || compact.contains("hcchcosy") || compact.contains("hcchdi") {
         return Some(PulseSequenceClass::HcchTocsy);
     }
     if compact.contains("hccconh")
@@ -3519,6 +3759,13 @@ fn has_13C_only(axes: &[ClassifiedAxis]) -> bool {
 }
 
 /// Pure axis-physics fallback when pulse program and title strings are absent or generic.
+///
+/// Policy (`v0150:P1-9`): axes alone can positively identify only a few experiments (HSQC-type
+/// heteronuclear correlations, 13C-detected CON/CACO/CANCO/CBCACO, INADEQUATE, J-resolved by its
+/// tiny F1 width, and the triple-resonance carbon windows). Anything else - in particular a
+/// `1H`-`1H` 2D, a `1H`-`Delay` array, or a 3D with two `1H` axes (identical for 15N/13C-NOESY,
+/// HCCH-TOCSY, HBHA(CO)NH, ...) - returns [`PulseSequenceClass::Unknown`] instead of inventing a
+/// `NOESY`/`COSY` label that could silently feed distance restraints.
 fn infer_pulse_class_from_axis_physics(
     dim: ExperimentDimensionality,
     axes: &[ClassifiedAxis],
@@ -3531,7 +3778,9 @@ fn infer_pulse_class_from_axis_physics(
         return match pseudo_kind {
             Some("vclist") => PulseSequenceClass::Cpmg,
             Some("fqlist") => PulseSequenceClass::Cest,
-            _ => PulseSequenceClass::RelaxR1,
+            Some("vdlist") => PulseSequenceClass::RelaxR1,
+            // Unlabelled QF plane stacks / unknown list kinds are not positively identifiable.
+            _ => PulseSequenceClass::Unknown,
         };
     }
 
@@ -3544,15 +3793,16 @@ fn infer_pulse_class_from_axis_physics(
             {
                 return PulseSequenceClass::JRes2D;
             }
-            return PulseSequenceClass::Cosy2D;
+            // A bare 1H-1H 2D is COSY, TOCSY, NOESY, ROESY, ...: axes cannot tell them apart.
+            return PulseSequenceClass::Unknown;
         }
         if direct == "1H" && (ind.is_empty() || ind == "Delay") {
             if axes[1].sw_ppm.is_some_and(|sw| sw > 0.0 && sw < 0.30) {
                 return PulseSequenceClass::JRes2D;
             }
-            if axes[1].sw_ppm.is_some_and(|sw| (4.0..=18.0).contains(&sw)) {
-                return PulseSequenceClass::Cosy2D;
-            }
+            // A 1H x delay/counter array (inversion recovery `t1ir`, DOSY, kinetics, ...) is not a
+            // COSY; leave it `Unknown` unless a pulse program token identified it.
+            return PulseSequenceClass::Unknown;
         }
         if direct == "1H" && ind == "15N" {
             return PulseSequenceClass::N15Hsqc;
@@ -3586,11 +3836,15 @@ fn infer_pulse_class_from_axis_physics(
                 PulseSequenceClass::Canco3D
             };
         }
-        if direct == "1H" && ((ind1 == "15N" && ind2 == "1H") || (ind1 == "1H" && ind2 == "15N")) {
-            return PulseSequenceClass::N15Noesy;
-        }
-        if direct == "1H" && ((ind1 == "13C" && ind2 == "1H") || (ind1 == "1H" && ind2 == "13C")) {
-            return PulseSequenceClass::C13Noesy;
+        // 1H/15N/1H and 1H/13C/1H are shared by 15N/13C-NOESY-HSQC, HCCH-TOCSY, HBHA(CO)NH, ...
+        // Never guess NOESY from axes alone (`v0150:P1-9`).
+        if direct == "1H"
+            && ((ind1 == "15N" && ind2 == "1H")
+                || (ind1 == "1H" && ind2 == "15N")
+                || (ind1 == "13C" && ind2 == "1H")
+                || (ind1 == "1H" && ind2 == "13C"))
+        {
+            return PulseSequenceClass::Unknown;
         }
         if direct == "1H" && ind1 == "13C" && ind2 == "13C" {
             return PulseSequenceClass::HcchTocsy;
@@ -3833,6 +4087,37 @@ fn display_name_from_rel(rel_path: &str, root_name: &str) -> String {
 /// variable counter/pulse (`vc`/`vp`/`va`), or frequency-offset (`fq1`..`fq8`) hardware list in its
 /// `PULPROG` name, `acqus` list parameter, or non-comment `pulseprogram` body (preventing TopSpin's
 /// default unused `fq1list`/`vdlist`/`vclist`/`vplist` template files from promoting 2D spectra to `Pseudo3D`).
+/// True when a Bruker `pulseprogram` body (comments stripped) increments a frequency-list pointer
+/// (`ifq1`..`ifq8`) or reads `calclist(fq...)` - i.e. the `fq*list` drives a loop rather than
+/// merely supplying a static selective-pulse offset.
+fn pulseprogram_steps_fq_list(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    let code: String = text
+        .lines()
+        .map(|l| l.split(';').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if code.contains("calclist(fq") {
+        return true;
+    }
+    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let cb = code.as_bytes();
+    (1..=8).any(|k| {
+        let word = format!("ifq{k}");
+        let mut pos = 0usize;
+        while let Some(rel) = code[pos..].find(&word) {
+            let st = pos + rel;
+            let en = st + word.len();
+            if (st == 0 || !is_id(cb[st - 1])) && (en == cb.len() || !is_id(cb[en])) {
+                return true;
+            }
+            pos = st + 1;
+        }
+        false
+    })
+}
+
 fn bruker_2d_references_schedule(
     kind: &str,
     pulprog: Option<&str>,
@@ -4103,10 +4388,14 @@ fn build_bruker_experiment(
                 .or_else(|| jcamp_f64(&p2, "OFFSET"))
                 .unwrap_or(0.0);
             if axes[0].nucleus.is_empty() && axes[1].nucleus.is_empty() {
-                if (ratio - 0.40298).abs() < 0.025 {
+                // The 15N/13C ratio window (0.40298 +/- 0.025) also contains 31P/1H (0.4048), so the
+                // ratio alone is ambiguous: require physically possible ABSOLUTE frequencies
+                // (13C <= 330 MHz, 15N <= 134 MHz at 1.3 GHz) before choosing 13C/15N. A 202/500 MHz
+                // pair is 31P/1H and falls through to the dedicated 1H/31P branch below.
+                if (ratio - 0.40298).abs() < 0.025 && is_c13_n15_pair(sf0, sf1) {
                     axes[0].nucleus = "13C".to_string();
                     axes[1].nucleus = "15N".to_string();
-                } else if (ratio - 2.4815).abs() < 0.12 {
+                } else if (ratio - 2.4815).abs() < 0.12 && is_c13_n15_pair(sf1, sf0) {
                     axes[0].nucleus = "15N".to_string();
                     axes[1].nucleus = "13C".to_string();
                 } else if (ratio - 1.0).abs() < 0.03 {
@@ -4123,12 +4412,24 @@ fn build_bruker_experiment(
                 } else if (ratio - 0.25145).abs() < 0.02 {
                     axes[0].nucleus = "1H".to_string();
                     axes[1].nucleus = "13C".to_string();
-                } else if (ratio - 0.4048).abs() < 0.02 {
+                } else if (ratio - 0.4048).abs() < 0.025 {
                     axes[0].nucleus = "1H".to_string();
                     axes[1].nucleus = "31P".to_string();
-                } else if (ratio - 0.9408).abs() < 0.02 {
+                } else if (ratio - 2.4704).abs() < 0.12 {
+                    axes[0].nucleus = "31P".to_string();
+                    axes[1].nucleus = "1H".to_string();
+                } else if (ratio - 0.9408).abs() < 0.025 {
                     axes[0].nucleus = "1H".to_string();
                     axes[1].nucleus = "19F".to_string();
+                } else if (ratio - 1.0629).abs() < 0.03 {
+                    axes[0].nucleus = "19F".to_string();
+                    axes[1].nucleus = "1H".to_string();
+                } else if (ratio - 3.9769).abs() < 0.15 {
+                    axes[0].nucleus = "13C".to_string();
+                    axes[1].nucleus = "1H".to_string();
+                } else if (ratio - 9.8691).abs() < 0.35 {
+                    axes[0].nucleus = "15N".to_string();
+                    axes[1].nucleus = "1H".to_string();
                 }
             } else if axes[0].nucleus.is_empty() {
                 if let Some(bmhz) = infer_proton_base_mhz(&axes[1].nucleus, sf1) {
@@ -4139,6 +4440,10 @@ fn build_bruker_experiment(
                         axes[0].nucleus = "13C".to_string();
                     } else if (r0 - 0.10133).abs() < 0.02 {
                         axes[0].nucleus = "15N".to_string();
+                    } else if (r0 - 0.4048).abs() < 0.025 {
+                        axes[0].nucleus = "31P".to_string();
+                    } else if (r0 - 0.9408).abs() < 0.025 {
+                        axes[0].nucleus = "19F".to_string();
                     }
                 }
             } else if axes[1].nucleus.is_empty() {
@@ -4280,6 +4585,24 @@ fn build_bruker_experiment(
                     || jcamp_usize(&a1, "AQSEQ") == Some(1)
                     || ndim_raw >= 3)));
 
+    let any_indirect_qf_matches_prelim = |sched_len: usize| -> bool {
+        sched_len > 0
+            && axes
+                .iter()
+                .skip(1)
+                .any(|a| a.quadrature == QuadratureKind::Qf && a.points == sched_len)
+    };
+    let fq_drives_indirect_prelim = ndim_raw >= 3
+        || any_indirect_qf_matches_prelim(fq_len)
+        || grp
+            .pulseprogram
+            .as_deref()
+            .is_some_and(pulseprogram_steps_fq_list)
+        || (grp.pulseprogram.is_none()
+            && pulprog
+                .as_deref()
+                .is_some_and(|s| s.to_ascii_lowercase().contains("cest")));
+
     let pulprog_interp = if needs_pulprog_interp {
         let a1_s = grp
             .acqus
@@ -4317,6 +4640,7 @@ fn build_bruker_experiment(
         let fq_s = grp
             .fqlist
             .as_deref()
+            .filter(|_| fq_drives_indirect_prelim)
             .map(|b| String::from_utf8_lossy(b).into_owned());
         let df_s = grp
             .difflist
@@ -4436,9 +4760,18 @@ fn build_bruker_experiment(
             &a1,
             grp.pulseprogram.as_deref(),
         );
+    // An `fq*list` only makes a 2D a pseudo-3D when the list is stepped by an indirect loop:
+    // `ifq1..8` / `calclist(fq...)` in the pulse program, or an indirect `QF` axis whose `TD`
+    // equals the list length. Selective-pulse offset lists (`fq1:f1`, `cnst21(bf ppm)`) never are.
+    let fq_drives_indirect_loop = any_indirect_qf_matches(fq_len)
+        || grp
+            .pulseprogram
+            .as_deref()
+            .is_some_and(pulseprogram_steps_fq_list);
     let allow_2d_fq_pseudo = ndim_raw == 2
         && fq_len >= 4
         && is_genuine_dynamics
+        && fq_drives_indirect_loop
         && bruker_2d_references_schedule(
             "fq",
             pulprog.as_deref(),
@@ -4623,10 +4956,24 @@ fn build_bruker_experiment(
     }
     let is_known_specialized_j = pulprog.as_deref().is_some_and(|s| {
         let sl = s.to_ascii_lowercase();
-        sl == "ghnha" || sl == "hnha" || sl.starts_with("hnhagp")
+        sl == "ghnha"
+            || sl == "hnha"
+            || sl.starts_with("hnhagp")
+            || sl.contains("hbhacon")
+            || sl.contains("hbhanh")
     });
     if is_known_specialized_j {
-        notes.push("3D HNHA scalar-coupling experiment".to_string());
+        if pulprog
+            .as_deref()
+            .is_some_and(|s| s.to_ascii_lowercase().contains("hbha"))
+        {
+            notes.push("3D HBHA(CO)NH aliphatic proton correlation".to_string());
+        } else {
+            notes.push("3D HNHA scalar-coupling experiment".to_string());
+        }
+    }
+    if is_known_specialized_j {
+        pulse_class = PulseSequenceClass::Unknown;
     }
     if !is_dosy
         && !is_cal_scout
@@ -5040,10 +5387,21 @@ fn build_varian_experiment(
     let disp = display_name_from_rel(rel_root, root_name);
     let is_known_specialized_j = seqfil.as_deref().is_some_and(|s| {
         let sl = s.to_ascii_lowercase();
-        sl == "ghnha" || sl == "hnha" || sl.starts_with("hnhagp")
+        sl == "ghnha"
+            || sl == "hnha"
+            || sl.starts_with("hnhagp")
+            || sl.contains("hbhacon")
+            || sl.contains("hbhanh")
     });
     if is_known_specialized_j {
-        notes.push("3D HNHA scalar-coupling experiment".to_string());
+        if seqfil
+            .as_deref()
+            .is_some_and(|s| s.to_ascii_lowercase().contains("hbha"))
+        {
+            notes.push("3D HBHA(CO)NH aliphatic proton correlation".to_string());
+        } else {
+            notes.push("3D HNHA scalar-coupling experiment".to_string());
+        }
     }
     let is_cal_scout = seqfil.as_deref().is_some_and(is_calibration_scout_token);
     let mut pulse_class = if is_varian_dosy {
@@ -6214,9 +6572,9 @@ mod tests {
         );
         assert_eq!(
             find_cls("unnamed_2d_1h_1h.bin").pulse_class,
-            PulseSequenceClass::Cosy2D
+            PulseSequenceClass::Unknown
         );
-        assert!(find_cls("unnamed_2d_1h_1h.bin").selected_by_default);
+        assert!(!find_cls("unnamed_2d_1h_1h.bin").selected_by_default);
         assert_eq!(
             find_cls("unnamed_wide_hc.usf").pulse_class,
             PulseSequenceClass::C13Hmbc
@@ -6493,7 +6851,7 @@ mod tests {
             ),
             VirtualEntry::new(
                 "30/pulseprogram",
-                b";hsqc_cest_2d\nd1 fq1:f3\np1 ph1\ngo=2 ph31\n".to_vec(),
+                b";hsqc_cest_2d\nd1 fq1:f3\np1 ph1\n10u ifq1\ngo=2 ph31\n".to_vec(),
             ),
             VirtualEntry::new("30/fq1list", stale_fq1list.to_vec()),
             VirtualEntry::header_only("30/ser", Vec::new(), 2_097_152),

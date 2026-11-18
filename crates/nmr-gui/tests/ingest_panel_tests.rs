@@ -535,3 +535,112 @@ fn test_usf_ucsf_homonuclear_and_heteronuclear_2d_small_molecule_regime_and_1d_u
         other => panic!("expected Spectra1D for 1D .usf, got {other:?}"),
     }
 }
+
+#[test]
+fn test_v0150_p1_8_browser_archive_caps_bulk_skip_1d_hostile_and_js_rust_cap_parity() {
+    use nmr_gui::ingest_panel::try_load_1d_ucsf_or_pipe_bytes;
+
+    // 1. JS/Rust browser cap parity: `ingest_panel.rs` inline JS has zero `512 MiB` / `384 MiB` vs
+    //    `256 MiB` message mismatch, and never calls the 16 GiB `extract_archive_virtual_entries`!
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ingest_panel.rs"),
+    )
+    .expect("read ingest_panel.rs");
+    assert!(src.contains("Reached 256 MiB browser drop memory cap"));
+    assert!(src.contains("Reached 256 MiB browser folder memory cap"));
+    assert!(!src.contains("Reached 512 MiB browser drop memory cap"));
+    assert!(!src.contains("extract_archive_virtual_entries(&p.name"));
+
+    // 2. Archive containing valid 2D HSQC (`procs`/`proc2s`/`2rr`), unused imaginary quadrants
+    //    (`2ii`, `3rri`), AND a 3D experiment: unused imaginary files are NEVER retained in `in_memory_files`.
+    let hsqc_acqus = b"##TITLE= 15N-HSQC\n##$PULPROG= <hsqcetf3gpsi>\n##$PARMODE= 1\n##$TD= 256\n##$SW= 14.0\n##$SFO1= 600.13\n##$BF1= 600.13\n##$NUC1= <1H>\n";
+    let hsqc_acqu2s =
+        b"##$TD= 64\n##$SW= 32.0\n##$SFO1= 60.81\n##$BF1= 60.81\n##$NUC1= <15N>\n##$FnMODE= 6\n";
+    let procs =
+        b"##$SI= 4\n##$XDIM= 4\n##$SW_p= 6000.0\n##$SF= 600.13\n##$OFFSET= 10.0\n##$AXNUC= <1H>\n";
+    let proc2s =
+        b"##$SI= 4\n##$XDIM= 4\n##$SW_p= 2000.0\n##$SF= 60.81\n##$OFFSET= 130.0\n##$AXNUC= <15N>\n";
+    let small_2rr = vec![0u8; 64];
+    let imag_junk = vec![0xAAu8; 4096];
+
+    let tar_bytes = build_ustar_archive(&[
+        ("./study/10/acqus", hsqc_acqus),
+        ("./study/10/acqu2s", hsqc_acqu2s),
+        ("./study/10/pdata/1/procs", procs),
+        ("./study/10/pdata/1/proc2s", proc2s),
+        ("./study/10/pdata/1/2rr", &small_2rr),
+        ("./study/10/pdata/1/2ii", &imag_junk),
+        ("./study/10/pdata/1/3rri", &imag_junk),
+    ]);
+    let tgz_bytes = wrap_gzip_stored(&tar_bytes);
+    let out = ingest_dropped_payloads(&[DroppedPayload::new("study.tgz", tgz_bytes)])
+        .expect("ingest .tgz with ./ prefixes and imaginary files");
+    let panel = match out {
+        IngestDropOutcome::Workspace(p) => p,
+        other => panic!("expected Workspace, got {other:?}"),
+    };
+    assert_eq!(panel.inventory.experiments.len(), 1);
+    assert!(panel.in_memory_files.contains_key("study/10/pdata/1/2rr"));
+    assert!(!panel.in_memory_files.contains_key("study/10/pdata/1/2ii"));
+    assert!(!panel.in_memory_files.contains_key("study/10/pdata/1/3rri"));
+
+    // 3. Hostile `.tar` header declaring > 1 GiB (> MAX_INMEMORY_ARCHIVE_INFLATE_BYTES) must be
+    //    rejected immediately by `ingest_dropped_payloads` instead of using the 16 GiB disk cap!
+    let huge_fake_tar = vec![0u8; 1024];
+    let mut over_cap_tar = Vec::with_capacity(1536);
+    {
+        let mut hdr = [0u8; 512];
+        let name = b"study/10/ser";
+        hdr[..name.len()].copy_from_slice(name);
+        hdr[100..108].copy_from_slice(b"0000644\0");
+        hdr[108..116].copy_from_slice(b"0001000\0");
+        hdr[116..124].copy_from_slice(b"0001000\0");
+        // GNU base-256 size = 2 GiB (> 1 GiB native in-memory cap)
+        let two_gib: u64 = 2 * 1024 * 1024 * 1024;
+        hdr[124] = 0x80;
+        hdr[128..136].copy_from_slice(&two_gib.to_be_bytes());
+        hdr[136..148].copy_from_slice(b"14600000000\0");
+        hdr[148..156].fill(b' ');
+        hdr[156] = b'0';
+        hdr[257..263].copy_from_slice(b"ustar\0");
+        hdr[263..265].copy_from_slice(b"00");
+        let cksum: u32 = hdr.iter().map(|&b| u32::from(b)).sum();
+        hdr[148..156].copy_from_slice(format!("{cksum:06o}\0 ").as_bytes());
+        over_cap_tar.extend_from_slice(&hdr);
+        over_cap_tar.extend_from_slice(&huge_fake_tar);
+    }
+    assert!(
+        ingest_dropped_payloads(&[DroppedPayload::new("over_1gib.tar", over_cap_tar)]).is_err(),
+        "in-memory archive exceeding MAX_INMEMORY_ARCHIVE_INFLATE_BYTES must be rejected"
+    );
+
+    // 4. Hostile 1D UCSF (`npoints = 2^30` + 1) and 1D NMRPipe (`FDSIZE = NaN`, `Inf`, `-1`, `4e9`)
+    //    must return `None` cleanly without panicking or allocating!
+    let mut bad_ucsf_1d = vec![0u8; 320];
+    bad_ucsf_1d[0..8].copy_from_slice(b"UCSF NMR");
+    bad_ucsf_1d[10] = 1;
+    bad_ucsf_1d[11] = 1;
+    bad_ucsf_1d[13] = 2;
+    bad_ucsf_1d[180..182].copy_from_slice(b"1H");
+    bad_ucsf_1d[188..192].copy_from_slice(&((1i32 << 30) + 1).to_be_bytes());
+    bad_ucsf_1d[196..200].copy_from_slice(&64i32.to_be_bytes());
+    bad_ucsf_1d[200..204].copy_from_slice(&500.0f32.to_be_bytes());
+    bad_ucsf_1d[204..208].copy_from_slice(&5000.0f32.to_be_bytes());
+    bad_ucsf_1d[208..212].copy_from_slice(&4.7f32.to_be_bytes());
+    assert!(try_load_1d_ucsf_or_pipe_bytes("hostile1d.ucsf", &bad_ucsf_1d).is_none());
+
+    for bad_fdsize in [f32::NAN, f32::INFINITY, -1.0, 4.0e9] {
+        let mut hdr = [0.0f32; 512];
+        hdr[2] = 2.345;
+        hdr[9] = 1.0;
+        hdr[99] = bad_fdsize;
+        hdr[100] = 5000.0;
+        hdr[119] = 500.0;
+        let mut bytes = Vec::with_capacity(2064);
+        for v in hdr {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0u8; 16]);
+        assert!(try_load_1d_ucsf_or_pipe_bytes("hostile1d.ft1", &bytes).is_none());
+    }
+}

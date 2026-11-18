@@ -23,10 +23,10 @@ use std::sync::Arc;
 
 use eframe::egui;
 use nmr_core::classify::{
-    classify_nmr_entries, extract_archive_full_entries_bounded, extract_archive_virtual_entries,
-    is_nmrpipe_magic, is_ucsf_magic, is_zip_magic, is_zip_path_lower, ClassifiedExperiment,
-    DataState, ExperimentDimensionality, ProblemRegime, PulseSequenceClass, VirtualEntry,
-    WorkspaceInventory,
+    classify_nmr_entries, extract_archive_full_entries_filtered,
+    extract_archive_virtual_entries_bounded, is_nmrpipe_magic, is_ucsf_magic, is_zip_magic,
+    is_zip_path_lower, ClassifiedExperiment, DataState, ExperimentDimensionality, ProblemRegime,
+    PulseSequenceClass, VirtualEntry, WorkspaceInventory, MAX_INMEMORY_ARCHIVE_INFLATE_BYTES,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_core::classify::{
@@ -39,7 +39,19 @@ use nmr_core::nmr1d::{
 use nmr_core::nmrstar::read_star_str;
 use nmr_core::priors::{one_to_three, three_to_one};
 use nmr_core::session::read_session_nef_str;
-use nmr_core::spectrum::AxisPpm;
+use nmr_core::spectrum::{AxisPpm, MAX_SPECTRUM_POINTS};
+
+/// Maximum retained payload bytes across in-memory / browser drops on `wasm32` (`256 MiB`, aligned
+/// with the JS drop/picker `MAX_TOTAL_BYTES` and `MAX_INMEMORY_ARCHIVE_INFLATE_BYTES_WASM`).
+pub const MAX_BROWSER_RETAINED_BYTES_WASM: usize = 256 * 1024 * 1024;
+/// Maximum retained payload bytes across in-memory drops on native targets (`512 MiB`).
+pub const MAX_BROWSER_RETAINED_BYTES_NATIVE: usize = 512 * 1024 * 1024;
+/// Active in-memory drop retention cap for the current target.
+#[cfg(target_arch = "wasm32")]
+pub const MAX_BROWSER_RETAINED_BYTES: usize = MAX_BROWSER_RETAINED_BYTES_WASM;
+/// Active in-memory drop retention cap for the current target.
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_BROWSER_RETAINED_BYTES: usize = MAX_BROWSER_RETAINED_BYTES_NATIVE;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_folder_bridge {
@@ -51,13 +63,13 @@ const STATE = {
   batches: [],
   errors: [],
 };
-const MAX_FILE_BYTES = 384 * 1024 * 1024;
-const MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+const MAX_FILE_BYTES = 256 * 1024 * 1024;
+const MAX_TOTAL_BYTES = 256 * 1024 * 1024;
 
 function isUnusedBrukerImaginary(relPath) {
   const base = (relPath.split("/").pop() || "").toLowerCase();
   return base === "2ri" || base === "2ir" || base === "2ii"
-    || base === "3rri" || base === "3iri" || base === "3iir" || base === "3iii"
+    || base === "3rri" || base === "3rir" || base === "3iri" || base === "3iir" || base === "3iii"
     || base === "3rii";
 }
 
@@ -95,7 +107,7 @@ function readFileEntry(fileEntry, relPath, acc) {
           }
           if (file.size > MAX_FILE_BYTES) {
             if (!isBrukerRealCube(relPath)) {
-              STATE.errors.push(`Skipped '${relPath}' (${(file.size / 1048576).toFixed(1)} MiB exceeds 384 MiB per-file browser cap).`);
+              STATE.errors.push(`Skipped '${relPath}' (${(file.size / 1048576).toFixed(1)} MiB exceeds 256 MiB per-file browser cap).`);
             }
             resolve();
             return;
@@ -171,7 +183,7 @@ async function ingestFileList(fileList) {
     if (!rel || rel.includes("__MACOSX") || rel.endsWith(".DS_Store") || isUnusedBrukerImaginary(rel)) continue;
     if (f.size > MAX_FILE_BYTES) {
       if (!isBrukerRealCube(rel)) {
-        STATE.errors.push(`Skipped '${rel}' (> 384 MiB browser per-file limit).`);
+        STATE.errors.push(`Skipped '${rel}' (> 256 MiB browser per-file limit).`);
       }
       continue;
     }
@@ -188,7 +200,7 @@ async function ingestFileList(fileList) {
     }
   }
   if (acc.capped) {
-    STATE.errors.push("Reached 512 MiB browser drop memory cap; some trailing files were omitted.");
+    STATE.errors.push("Reached 256 MiB browser drop memory cap; some trailing files were omitted.");
   }
   if (acc.files.length > 0) {
     STATE.batches.push(acc.files);
@@ -872,12 +884,16 @@ impl IngestPanelState {
                 }
             }
         } else if path.is_file()
+            && !state.inventory.auxiliary_files.is_empty()
             && is_archive_name_lower(&path.to_string_lossy().to_ascii_lowercase())
         {
             if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(entries) =
-                    extract_archive_virtual_entries(&state.inventory.root_name, &bytes)
-                {
+                if let Ok(entries) = extract_archive_virtual_entries_bounded(
+                    &state.inventory.root_name,
+                    &bytes,
+                    MAX_INMEMORY_ARCHIVE_INFLATE_BYTES,
+                    64 * 1024 * 1024,
+                ) {
                     state.populate_sequence_from_virtual_entries(&entries);
                 }
             }
@@ -1110,6 +1126,9 @@ pub fn try_load_1d_ucsf_or_pipe_bytes(name: &str, bytes: &[u8]) -> Option<Spectr
         }
         let npoints = npts_i32 as usize;
         let tile_size = tile_i32 as usize;
+        if (npoints as u64) > MAX_SPECTRUM_POINTS || (tile_size as u64) > MAX_SPECTRUM_POINTS {
+            return None;
+        }
         let obs_mhz = f32::from_be_bytes([ax_hdr[20], ax_hdr[21], ax_hdr[22], ax_hdr[23]]) as f64;
         let sw_hz = f32::from_be_bytes([ax_hdr[24], ax_hdr[25], ax_hdr[26], ax_hdr[27]]) as f64;
         let xmtr_ppm = f32::from_be_bytes([ax_hdr[28], ax_hdr[29], ax_hdr[30], ax_hdr[31]]) as f64;
@@ -1162,12 +1181,21 @@ pub fn try_load_1d_ucsf_or_pipe_bytes(name: &str, bytes: &[u8]) -> Option<Spectr
                 f32::from_le_bytes(arr)
             }
         };
-        let ndim = read_hdr_f32(9).round() as isize;
-        let ny = read_hdr_f32(219).round() as isize;
+        let raw_ndim = read_hdr_f32(9);
+        let raw_ny = read_hdr_f32(219);
+        let raw_nx = read_hdr_f32(99);
+        if !raw_ndim.is_finite() || !raw_ny.is_finite() || !raw_nx.is_finite() {
+            return None;
+        }
+        let ndim = raw_ndim.round() as isize;
+        let ny = raw_ny.round() as isize;
         if ndim != 1 && !(ndim <= 2 && ny <= 1) {
             return None;
         }
-        let nx = (read_hdr_f32(99).round() as isize).max(1) as usize;
+        if raw_nx < 0.0 || (raw_nx as f64).round() > MAX_SPECTRUM_POINTS as f64 {
+            return None;
+        }
+        let nx = ((raw_nx as f64).round() as usize).max(1);
         let code0 = read_hdr_f32(24).round() as isize;
         let slot = match code0 {
             2 => 0usize,
@@ -1301,12 +1329,11 @@ pub fn ingest_dropped_payloads(payloads: &[DroppedPayload]) -> Result<IngestDrop
         }
     }
 
-    const MAX_BROWSER_RETAINED_BYTES: usize = 512 * 1024 * 1024;
     let is_unused_imaginary = |rel: &str| -> bool {
         let base = rel.rsplit('/').next().unwrap_or(rel);
         matches!(
             base.to_ascii_lowercase().as_str(),
-            "2ri" | "2ir" | "2ii" | "3rri" | "3iri" | "3iir" | "3iii" | "3rii"
+            "2ri" | "2ir" | "2ii" | "3rri" | "3rir" | "3iri" | "3iir" | "3iii" | "3rii"
         )
     };
     let mut virtual_entries: Vec<VirtualEntry> = Vec::new();
@@ -1315,20 +1342,32 @@ pub fn ingest_dropped_payloads(payloads: &[DroppedPayload]) -> Result<IngestDrop
 
     for p in payloads {
         if is_archive_filename_or_magic(&p.name, &p.bytes) {
-            let extracted = extract_archive_virtual_entries(&p.name, &p.bytes)?;
-            virtual_entries.extend(extracted);
-            if let Ok(full_items) = extract_archive_full_entries_bounded(
+            let extracted = extract_archive_virtual_entries_bounded(
                 &p.name,
                 &p.bytes,
-                512 * 1024 * 1024,
-                MAX_BROWSER_RETAINED_BYTES.saturating_sub(mem_total),
-            ) {
-                for (rel, b) in full_items {
-                    if !is_unused_imaginary(&rel)
-                        && mem_total + b.len() <= MAX_BROWSER_RETAINED_BYTES
-                    {
-                        mem_total += b.len();
-                        mem_map.insert(normalize_mem_rel(&rel), b);
+                MAX_INMEMORY_ARCHIVE_INFLATE_BYTES,
+                MAX_BROWSER_RETAINED_BYTES.min(64 * 1024 * 1024),
+            )?;
+            virtual_entries.extend(extracted);
+            let remaining_budget = MAX_BROWSER_RETAINED_BYTES.saturating_sub(mem_total);
+            if remaining_budget > 0 {
+                let keep_fn = |rel: &str, declared_sz: u64| -> bool {
+                    !is_unused_imaginary(rel) && declared_sz <= (remaining_budget as u64)
+                };
+                if let Ok(full_items) = extract_archive_full_entries_filtered(
+                    &p.name,
+                    &p.bytes,
+                    MAX_INMEMORY_ARCHIVE_INFLATE_BYTES,
+                    remaining_budget,
+                    Some(&keep_fn),
+                ) {
+                    for (rel, b) in full_items {
+                        if !is_unused_imaginary(&rel)
+                            && mem_total + b.len() <= MAX_BROWSER_RETAINED_BYTES
+                        {
+                            mem_total += b.len();
+                            mem_map.insert(normalize_mem_rel(&rel), b);
+                        }
                     }
                 }
             }
