@@ -28,6 +28,7 @@ Feature parity target, mapped to modules:
 | Custom `pulseprogram` physics interpreter, Bayesian pseudo-energy + $C_v(T)$ adaptive SA backbone solver (`--solver bayes-sa`), GPU spin relaxation ($R_1/R_2/\text{NOE}$), Palmer Model-Free ($S^2$), `CEST`, `CPMG` & ligand `CSP` $K_d$ | `pulprog`, `bayes_sa`, `relax_io`, `relax_fit`, `modelfree`, `cest`, `cpmg`, `csp`, `nmr-gpu` | 11, 16, 19 | Planned (`Phase 13`, `T13.0`, `T13.0b`, `T13.1`–`T13.6`) |
 | Analytical 1D NMR Voigt deconvolution, Hoye multiplet `J`-trees, `qNMR`, multi-trace stack/overlay & pseudo-2D `DOSY` studio (discrete `BIC`/`AIC` default + opt-in `CONTIN` `ILT`) | `nmr1d`, `multiplet`, `dosy`, `nmr-gpu`, `stack1d_panel`, `dosy_panel` | 17 | Planned (`Phase 14`, `T14.1`–`T14.4`) |
 | Clean-room Model Context Protocol (`MCP`) server (`stdio` & Streamable HTTP) & live Undo/Redo `nmr-gui` desktop bridge | `mcp`, `mcp_workflows`, `nmr-gui::mcp_bridge`, `nmr-cli` | 18 | Planned (`Phase 15`, `T15.1`–`T15.3`) |
+| AlphaFold mmCIF/`PAE` concordance, Kabsch–Sander + live NMR secondary-structure ribbon, `HomologFirewall` 3D-to-shift forward model, opt-in Student-$t$ 3D assignment priors, `PAE` multi-domain `RDC`/`PCS`/`PRE` docking, `AF3`/`Boltz-2` co-folding bridge & Bayesian `CEST`/`CPMG` excited-state engine | `kabsch_sander_ss`, `af_concordance`, `struct_shifts`, `af_assign_priors`, `domain_dock`, `cofold_bridge`, `excited_state`, `nmr-gpu::domain_dock_gpu`, `nmr-gui::{ss_ribbon_widget, integrative_af_panel}` | 21 | Planned (`Phase 21`, `T21.1`–`T21.6b`) |
 
 ## Pipeline
 
@@ -42,6 +43,7 @@ Feature parity target, mapped to modules:
 | 6 | Torsions, NOESY ADR, `RDC` & 3D `wgpu` Viewer | Assigned shifts + 3D NOESY peaks + multi-medium `RDC`s (`1D_NH`/`CAHA`/`CACO`/`NC'`/`HNC'`) | Firewalled 3/9-mer torsions, CPU/WebGPU `RDC`-refined PDB ensemble, Cornilescu `Q`/`Q_free` & interactive 3D ribbons | 04, 15 |
 | 7 | Reporting, HTTP & `MCP` Services | Shifts / peaks / ensemble / `RDC`s / browser uploads / `MCP` JSON-RPC | Single-file HTML+SVG report, `.str`, `.nef`, REST job status, planned `MCP` tools | 04, 08, 14, 18 |
 | 8 | Octet Chemical & 1D/`DOSY` Studio | 2D sketch, `SMILES`/`InChI`/IUPAC, `CDXML`/`CDX`/`MOL`, 1D/pseudo-2D `DOSY` | Cleaned 2D coordinates, CIP stereo, ¹H/¹³C 1D NMR, planned Voigt/`J`-trees/`DOSY` | 17 |
+| 9 | AlphaFold & Integrative Structural NMR | AF `.cif` + `PAE` JSON + shifts / `RDC` / `PCS` / `PRE` / `CSP` / `CEST` / `CPMG` | `pLDDT` vs `RCI-S²` concordance, 3-track SS ribbon, firewalled 3D shifts, multi-domain docked ensemble, `AF3`/`Boltz-2` specs & pose scores, excited-state `BIC` ranking | 21 |
 | x | Benchmark & simulation | Public BMRB entries (`data/benchmark/` `manifest.tsv` & 26-entry `real_manifest.tsv`) | Synthetic self-consistency & non-circular real-data accuracy/HC-prec/`ECE_4`/`ECE_10`/`ECE_12` | 05, 11, 14 |
 
 ## Principles
