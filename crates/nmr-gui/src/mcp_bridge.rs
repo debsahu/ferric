@@ -1146,8 +1146,17 @@ pub fn build_mcp_client_config_json_with_permission(
         bearer_token: bearer_token.trim().to_string(),
         access_mode,
     };
-    nmr_core::mcp::generate_mcp_client_config_pretty(client.to_core_target(), &mode)
-        .unwrap_or_else(|_| "{}".to_string())
+    nmr_core::mcp::generate_mcp_client_config_pretty(client.to_core_target(), &mode).unwrap_or_else(
+        |err| {
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {},
+                "error": format!("failed to build MCP client config: {err}")
+            }))
+            .unwrap_or_else(|_| {
+                "{\"mcpServers\":{},\"error\":\"failed to build MCP client config\"}".to_string()
+            })
+        },
+    )
 }
 
 /// Validate `Host` and optional browser `Origin` headers to prevent DNS-rebinding and browser CSRF
@@ -1505,6 +1514,20 @@ fn parse_curation_command(args: &Value) -> Result<McpUiCommand, String> {
 /// Execute a single JSON-RPC 2.0 MCP message against `inner`, returning `None` for one-way
 /// JSON-RPC notifications (`notifications/initialized`) and `Some(response_json)` for requests.
 fn dispatch_mcp_jsonrpc(inner: &mut SharedBridgeInner, raw_body: &[u8]) -> Option<Value> {
+    dispatch_mcp_jsonrpc_with_permission(inner, raw_body, None)
+}
+
+fn dispatch_mcp_jsonrpc_with_permission(
+    inner: &mut SharedBridgeInner,
+    raw_body: &[u8],
+    permission_override: Option<McpBridgePermission>,
+) -> Option<Value> {
+    let effective_permission = match (inner.permission, permission_override) {
+        (_, Some(McpBridgePermission::ReadOnly)) | (McpBridgePermission::ReadOnly, _) => {
+            McpBridgePermission::ReadOnly
+        }
+        (McpBridgePermission::ReadWrite, _) => McpBridgePermission::ReadWrite,
+    };
     inner.handled_requests = inner.handled_requests.saturating_add(1);
     let parsed: Value = match serde_json::from_slice(raw_body) {
         Ok(v) => v,
@@ -1580,7 +1603,7 @@ fn dispatch_mcp_jsonrpc(inner: &mut SharedBridgeInner, raw_body: &[u8]) -> Optio
                     if let Some(m) = snap.as_object_mut() {
                         m.insert(
                             "permission".to_string(),
-                            Value::String(inner.permission.as_str().to_string()),
+                            Value::String(effective_permission.as_str().to_string()),
                         );
                     }
                     Some(jsonrpc_ok(id, mcp_text_result(snap, false)))
@@ -1590,7 +1613,7 @@ fn dispatch_mcp_jsonrpc(inner: &mut SharedBridgeInner, raw_body: &[u8]) -> Optio
                         Ok(c) => c,
                         Err(msg) => return Some(jsonrpc_err(id, -32602, msg)),
                     };
-                    if inner.permission == McpBridgePermission::ReadOnly {
+                    if effective_permission == McpBridgePermission::ReadOnly {
                         inner.undo_log.record_blocked_readonly(format!(
                             "navigate_workbench: {}",
                             cmd.summary()
@@ -1634,7 +1657,7 @@ fn dispatch_mcp_jsonrpc(inner: &mut SharedBridgeInner, raw_body: &[u8]) -> Optio
                         Ok(c) => c,
                         Err(msg) => return Some(jsonrpc_err(id, -32602, msg)),
                     };
-                    if inner.permission == McpBridgePermission::ReadOnly {
+                    if effective_permission == McpBridgePermission::ReadOnly {
                         inner.undo_log.record_blocked_readonly(format!(
                             "propose_curation_edit: {}",
                             cmd.summary()
@@ -1667,7 +1690,7 @@ fn dispatch_mcp_jsonrpc(inner: &mut SharedBridgeInner, raw_body: &[u8]) -> Optio
                     ))
                 }
                 "undo_last_ai_edit" => {
-                    if inner.permission == McpBridgePermission::ReadOnly {
+                    if effective_permission == McpBridgePermission::ReadOnly {
                         inner
                             .undo_log
                             .record_blocked_readonly("undo_last_ai_edit blocked in ReadOnly mode");
@@ -1821,6 +1844,7 @@ struct ParsedHttpRequest {
     duplicate_host: bool,
     origin: Option<String>,
     authorization: Option<String>,
+    access_mode_readonly: bool,
     body: Vec<u8>,
 }
 
@@ -1859,6 +1883,7 @@ fn read_loopback_http_request(
     let mut duplicate_host = false;
     let mut origin = None;
     let mut authorization = None;
+    let mut access_mode_readonly = false;
     let mut header_count = 0usize;
 
     loop {
@@ -1901,6 +1926,11 @@ fn read_loopback_http_request(
                 }
             } else if key.eq_ignore_ascii_case("authorization") {
                 authorization = Some(v.trim().to_string());
+            } else if key.eq_ignore_ascii_case("x-nmr-access-mode") {
+                let mode = v.trim();
+                if mode.eq_ignore_ascii_case("read-only") || mode.eq_ignore_ascii_case("readonly") {
+                    access_mode_readonly = true;
+                }
             }
         }
     }
@@ -1919,6 +1949,7 @@ fn read_loopback_http_request(
         duplicate_host,
         origin,
         authorization,
+        access_mode_readonly,
         body,
     }))
 }
@@ -2030,8 +2061,13 @@ fn handle_loopback_connection(
         return;
     }
 
+    let perm_override = if req.access_mode_readonly {
+        Some(McpBridgePermission::ReadOnly)
+    } else {
+        None
+    };
     let response_opt = match shared.lock() {
-        Ok(mut guard) => dispatch_mcp_jsonrpc(&mut guard, &req.body),
+        Ok(mut guard) => dispatch_mcp_jsonrpc_with_permission(&mut guard, &req.body, perm_override),
         Err(_) => {
             let payload = json!({ "error": "internal lock poisoned" }).to_string();
             write_http_json_response(
@@ -2406,25 +2442,25 @@ pub fn render_mcp_bridge_panel(
         let running = controller.is_running();
         ui.horizontal_wrapped(|ui| {
             if running {
-                if ui.button("⏹ Stop Bridge").clicked() {
+                if ui.button("Stop Bridge").clicked() {
                     controller.stop_bridge();
                 }
                 if let Some(addr) = controller.bound_addr_string() {
                     ui.colored_label(
                         egui::Color32::from_rgb(90, 220, 140),
-                        format!("● Active: http://{addr}/mcp"),
+                        format!("Active: http://{addr}/mcp"),
                     );
                 }
             } else {
                 ui.label("Bind:");
                 ui.add(egui::TextEdit::singleline(&mut controller.bind_input).desired_width(130.0));
-                if ui.button("▶ Start Local Bridge").clicked() {
+                if ui.button("Start Local Bridge").clicked() {
                     let target = controller.bind_input.clone();
                     if let Err(err) = controller.start_bridge(&target) {
                         controller.status_banner = format!("Start failed: {err}");
                     }
                 }
-                ui.colored_label(egui::Color32::GRAY, "○ Stopped");
+                ui.colored_label(egui::Color32::GRAY, "Stopped");
             }
         });
     }
@@ -2463,12 +2499,12 @@ pub fn render_mcp_bridge_panel(
         ui.selectable_value(
             &mut perm,
             McpBridgePermission::ReadOnly,
-            "🔒 ReadOnly (Inspect & PNG Only)",
+            "ReadOnly (Inspect & PNG Only)",
         );
         ui.selectable_value(
             &mut perm,
             McpBridgePermission::ReadWrite,
-            "✏ ReadWrite (Undo-Backed Curation)",
+            "ReadWrite (Undo-Backed Curation)",
         );
         if perm != prev_perm {
             controller.set_permission(perm);
@@ -2514,7 +2550,7 @@ pub fn render_mcp_bridge_panel(
                     ui.selectable_value(&mut controller.selected_client, target, target.label());
                 }
             });
-        if ui.button("📋 Copy MCP Config").clicked() {
+        if ui.button("Copy MCP Config").clicked() {
             let cfg_json = controller.build_client_config_json();
             ui.ctx().copy_text(cfg_json);
             controller.status_banner = format!(
@@ -2537,7 +2573,7 @@ pub fn render_mcp_bridge_panel(
             "AI Curation Audit Log (Undo: {undo_depth}/{MAX_MCP_UNDO_DEPTH}, Redo: {redo_depth})"
         ));
         if ui
-            .add_enabled(undo_depth > 0, egui::Button::new("↩ Undo AI Action"))
+            .add_enabled(undo_depth > 0, egui::Button::new("Undo AI Action"))
             .clicked()
         {
             if let Some(cmd) = controller.undo_last() {
@@ -2546,7 +2582,7 @@ pub fn render_mcp_bridge_panel(
             }
         }
         if ui
-            .add_enabled(redo_depth > 0, egui::Button::new("↪ Redo"))
+            .add_enabled(redo_depth > 0, egui::Button::new("Redo"))
             .clicked()
         {
             if let Some(cmd) = controller.redo_last() {
@@ -3023,10 +3059,11 @@ mod tests {
         let mut ctrl = ctrl;
 
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             let resp = render_mcp_bridge_panel(ui, &mut ctrl);
             assert!(!resp.copied_config);
         });
+        out.textures_delta.clear();
     }
 
     #[test]
@@ -3275,8 +3312,28 @@ mod tests {
         assert_eq!(resp_ro["result"]["isError"], true);
         assert_eq!(ctrl.snapshot(), initial);
 
-        // 5. Switch to ReadWrite -> apply curation edit -> verify state -> undo_last_ai_edit -> exact restoration
+        // 5. Switch to ReadWrite -> X-Nmr-Access-Mode: read-only header still enforces ReadOnly ->
+        //    without override, curation edit succeeds -> undo_last_ai_edit -> exact restoration
         ctrl.set_permission(McpBridgePermission::ReadWrite);
+        {
+            let mut stream = TcpStream::connect(&addr).expect("connect for X-Nmr-Access-Mode test");
+            let body_bytes = serde_json::to_vec(&edit_req).unwrap();
+            let req = format!(
+                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {bearer}\r\nX-Nmr-Access-Mode: read-only\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body_bytes.len()
+            );
+            stream.write_all(req.as_bytes()).unwrap();
+            stream.write_all(&body_bytes).unwrap();
+            stream.flush().unwrap();
+            let mut resp_bytes = Vec::new();
+            stream.read_to_end(&mut resp_bytes).unwrap();
+            let resp_str = String::from_utf8_lossy(&resp_bytes);
+            let (_, payload) = resp_str.split_once("\r\n\r\n").expect("HTTP split");
+            let resp_hdr_ro: Value = serde_json::from_str(payload).unwrap();
+            assert_eq!(resp_hdr_ro["result"]["isError"], true);
+            assert_eq!(ctrl.snapshot(), initial);
+            assert_eq!(ctrl.permission(), McpBridgePermission::ReadWrite);
+        }
         let (code_rw, resp_rw) = send_raw_http_post(&addr, &addr, Some(&bearer), None, &edit_req);
         assert_eq!(code_rw, 200);
         assert_eq!(resp_rw["result"]["isError"], false);

@@ -99,11 +99,18 @@ pub struct MetabolomicsStudioPanel {
     pub feature_mode: FeaturePlotMode,
     pub show_bucket_boundaries: bool,
     pub auto_zoom_on_select: bool,
+    pub show_biomarker_table: bool,
+    /// True when the currently loaded cohort came from the built-in synthetic biofluid generator.
+    pub is_synthetic_demo_cohort: bool,
 
     /// Visible horizontal chemical-shift window `(low_ppm, high_ppm)` in Quadrant A.
     pub view_ppm_bounds: (f64, f64),
     pub status_banner: String,
     pub demo_seed: u64,
+    /// Last rendered inner plot rectangles for Quadrants A, B, and C.
+    pub last_plot_rects: [Option<egui::Rect>; 3],
+    /// Union visualization bounding rectangle across the active metabolomics plots (`UI-B6`).
+    pub last_canvas_rect: Option<egui::Rect>,
 }
 
 impl Default for MetabolomicsStudioPanel {
@@ -128,16 +135,21 @@ impl MetabolomicsStudioPanel {
             feature_mode: FeaturePlotMode::OplsSPlot,
             show_bucket_boundaries: true,
             auto_zoom_on_select: true,
+            show_biomarker_table: false,
+            is_synthetic_demo_cohort: false,
             view_ppm_bounds: view_bounds,
             status_banner:
-                "No cohort loaded — click 'Load 24-Sample Biofluid Demo' to run untargeted 1D metabolomics."
+                "No cohort loaded -- click 'Load 24-Sample Biofluid Demo' to run untargeted 1D metabolomics."
                     .to_string(),
             demo_seed: 20261115,
+            last_plot_rects: [None; 3],
+            last_canvas_rect: None,
         }
     }
 
-    /// Load a cohort of 1D samples and execute the full metabolomics + `OPLS-DA` + `STOCSY` pipeline.
+    /// Load an external cohort of 1D samples and execute the full metabolomics + `OPLS-DA` + `STOCSY` pipeline.
     pub fn set_cohort_and_run(&mut self, samples: Vec<CohortSample1D>) {
+        self.is_synthetic_demo_cohort = false;
         self.samples = samples;
         self.recompute_pipeline();
     }
@@ -146,7 +158,9 @@ impl MetabolomicsStudioPanel {
     pub fn load_demo_cohort(&mut self) {
         let cohort = generate_demo_biofluid_cohort(self.demo_seed);
         self.view_ppm_bounds = (self.config.min_ppm, self.config.max_ppm);
-        self.set_cohort_and_run(cohort);
+        self.is_synthetic_demo_cohort = true;
+        self.samples = cohort;
+        self.recompute_pipeline();
     }
 
     /// Re-run the full `nmr_core::metabolomics::run_metabolomics_pipeline` on `self.samples`.
@@ -163,20 +177,26 @@ impl MetabolomicsStudioPanel {
         self.selected_bucket_idx = default_b;
         let n_s = res.sample_ids.len();
         let n_b = res.buckets.len();
+        let demo_prefix = if self.is_synthetic_demo_cohort {
+            "[Synthetic Demo Cohort] "
+        } else {
+            ""
+        };
         let summary_txt = if let Some(ref op) = res.opls_da {
+            let caveat = if op.permutation.is_validated {
+                ""
+            } else {
+                " [!] Overfit warning"
+            };
             format!(
-                "Analyzed {n_s} spectra -> {n_b} buckets | OPLS-DA R²Y={:.3}, CV Q²={:.3}, perm p={:.3} ({})",
-                op.r2_y,
+                "{demo_prefix}Analyzed {n_s} spectra -> {n_b} buckets | CV Q² = {:.2} (7-fold), R²Y = {:.2}, permutation p <= {:.3} (n={}){caveat}",
                 op.q2,
+                op.r2_y,
                 op.permutation.p_value_q2,
-                if op.permutation.is_validated {
-                    "VALIDATED"
-                } else {
-                    "OVERFIT WARNING"
-                }
+                op.permutation.n_permutations,
             )
         } else {
-            format!("Analyzed {n_s} spectra -> {n_b} buckets (PCA only)")
+            format!("{demo_prefix}Analyzed {n_s} spectra -> {n_b} buckets (PCA only)")
         };
         self.status_banner = summary_txt;
         self.study = Some(res);
@@ -214,8 +234,13 @@ impl MetabolomicsStudioPanel {
                 .first()
                 .map(|m| format!("{} ({}, score {:.2})", m.name, m.bmrb_id, m.score))
                 .unwrap_or_else(|| "no BMRB hit".to_string());
+            let demo_prefix = if self.is_synthetic_demo_cohort {
+                "[Synthetic Demo Cohort] "
+            } else {
+                ""
+            };
             self.status_banner = format!(
-                "STOCSY driver B{:03} @ {:.3} ppm -> top match: {}",
+                "{demo_prefix}STOCSY driver B{:03} @ {:.3} ppm -> top match: {}",
                 bucket_idx, st.driver_ppm, top_hit
             );
         }
@@ -223,8 +248,10 @@ impl MetabolomicsStudioPanel {
 
     /// Render the complete 4-Quadrant Metabolomics & Biomarker Discovery Studio.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        self.last_plot_rects = [None; 3];
+        self.last_canvas_rect = None;
         self.draw_top_toolbar(ui);
-        ui.add_space(4.0);
+        ui.add_space(3.0);
 
         if self.study.is_none() {
             self.draw_empty_state(ui);
@@ -232,32 +259,65 @@ impl MetabolomicsStudioPanel {
         }
 
         let avail = ui.available_size();
-        let half_h = ((avail.y - 8.0) * 0.5).max(210.0);
-        let half_w = ((avail.x - 8.0) * 0.5).max(280.0);
+        let full_w = avail.x.max(320.0);
+        let table_h = if self.show_biomarker_table {
+            (avail.y * 0.13).clamp(80.0, 102.0)
+        } else {
+            0.0
+        };
+        let plots_avail_h =
+            (avail.y - table_h - if self.show_biomarker_table { 6.0 } else { 2.0 }).max(320.0);
+        let row1_h = (plots_avail_h * 0.52).max(165.0);
+        let row2_h = (plots_avail_h - row1_h - 4.0).max(155.0);
+        let half_w = ((full_w - 6.0) * 0.5).max(240.0);
 
-        // Top Row: Quadrant A (1D Overlay / STOCSY) + Quadrant B (PCA / OPLS-DA Score Plot)
+        // Row 1: Full-width Quadrant A (1D Spectral Overlay & Live STOCSY Trace)
+        ui.allocate_ui_with_layout(
+            egui::vec2(full_w, row1_h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                self.render_quadrant_a_overlay(ui, egui::vec2(full_w, row1_h));
+            },
+        );
+
+        ui.add_space(4.0);
+
+        // Row 2: Quadrant B (PCA / OPLS-DA Score Plot) + Quadrant C (Clickable S-Plot / Volcano)
         ui.horizontal(|ui| {
-            ui.allocate_ui(egui::vec2(half_w, half_h), |ui| {
-                self.draw_quadrant_a_spectra(ui, egui::vec2(half_w, half_h));
-            });
+            ui.allocate_ui_with_layout(
+                egui::vec2(half_w, row2_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    self.draw_quadrant_b_scores(ui, egui::vec2(half_w, row2_h));
+                },
+            );
             ui.add_space(6.0);
-            ui.allocate_ui(egui::vec2(half_w, half_h), |ui| {
-                self.draw_quadrant_b_scores(ui, egui::vec2(half_w, half_h));
-            });
+            ui.allocate_ui_with_layout(
+                egui::vec2(half_w, row2_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    self.draw_quadrant_c_splot_volcano(ui, egui::vec2(half_w, row2_h));
+                },
+            );
         });
 
-        ui.add_space(6.0);
+        // Row 3: Compact full-width Quadrant D (Biomarker & BMRB Table)
+        if self.show_biomarker_table {
+            ui.add_space(4.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(full_w, table_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    self.draw_quadrant_d_biomarker_table(ui, egui::vec2(full_w, table_h));
+                },
+            );
+        }
 
-        // Bottom Row: Quadrant C (Clickable S-Plot / Volcano) + Quadrant D (Biomarker & BMRB Table)
-        ui.horizontal(|ui| {
-            ui.allocate_ui(egui::vec2(half_w, half_h), |ui| {
-                self.draw_quadrant_c_splot_volcano(ui, egui::vec2(half_w, half_h));
-            });
-            ui.add_space(6.0);
-            ui.allocate_ui(egui::vec2(half_w, half_h), |ui| {
-                self.draw_quadrant_d_biomarker_table(ui, egui::vec2(half_w, half_h));
-            });
-        });
+        self.last_canvas_rect = self
+            .last_plot_rects
+            .into_iter()
+            .flatten()
+            .reduce(egui::Rect::union);
     }
 
     fn draw_empty_state(&mut self, ui: &mut egui::Ui) {
@@ -269,22 +329,27 @@ impl MetabolomicsStudioPanel {
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(28.0);
-                    ui.heading(
+                    ui.label(
                         egui::RichText::new(
                             "Untargeted 1D NMR Metabolomics, Chemometrics & STOCSY Biomarker Studio",
                         )
+                        .size(15.0)
+                        .strong()
                         .color(egui::Color32::from_rgb(140, 220, 255)),
                     );
                     ui.add_space(8.0);
                     ui.label(
-                        "Interval FFT Peak Alignment • Adaptive Intelligent Binning • PQN Normalization • PCA / OPLS-DA • S-Plot / Volcano • Live STOCSY + 28-Metabolite CC0 BMRB Library",
+                        egui::RichText::new(
+                            "Interval FFT Peak Alignment | Adaptive Intelligent Binning | PQN Normalization | PCA / OPLS-DA | S-Plot / Volcano | Live STOCSY + 28-Metabolite CC0 BMRB Library",
+                        )
+                        .size(12.5),
                     );
                     ui.add_space(16.0);
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("▶ Load 24-Sample Biofluid Demo Cohort")
-                                    .size(14.5)
+                                egui::RichText::new("Load 24-Sample Biofluid Demo Cohort")
+                                    .size(14.0)
                                     .strong()
                                     .color(egui::Color32::WHITE),
                             )
@@ -307,273 +372,406 @@ impl MetabolomicsStudioPanel {
             .fill(egui::Color32::from_rgb(18, 24, 35))
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(44, 56, 78)))
             .corner_radius(5.0)
-            .inner_margin(egui::Margin::symmetric(8, 6))
+            .inner_margin(egui::Margin::symmetric(8, 5))
             .show(ui, |ui| {
+                // Primary Toolbar (<= 8 visible primary interactive controls)
                 ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("Load 24-Sample Demo")
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(185, 245, 255)),
+                    ui.label(
+                        egui::RichText::new("1D Metabolomics Studio")
+                            .size(15.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(185, 230, 255)),
+                    );
+
+                    if self.is_synthetic_demo_cohort {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(52, 42, 18))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(202, 138, 4)))
+                            .corner_radius(3.0)
+                            .inner_margin(egui::Margin::symmetric(6, 2))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("Synthetic Demo Cohort")
+                                        .size(11.0)
+                                        .monospace()
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(253, 224, 71)),
+                                );
+                            });
+                    }
+
+                    if self.study.is_none()
+                        && ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Load 24-Sample Demo")
+                                        .size(12.5)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(185, 245, 255)),
+                                )
+                                .fill(egui::Color32::from_rgb(24, 82, 128)),
                             )
-                            .fill(egui::Color32::from_rgb(24, 82, 128)),
-                        )
-                        .on_hover_text(
-                            "Synthesize 24 realistic human biofluid 1D 1H spectra (12 Control, 12 Case) with sample dilutions, pH jitter, and Lactate/Valine/TMAO biomarkers",
-                        )
-                        .clicked()
+                            .on_hover_text(
+                                "Synthesize 24 human biofluid 1D 1H spectra (12 Control, 12 Case) with sample dilutions, pH jitter, and Lactate/Valine/TMAO biomarkers",
+                            )
+                            .clicked()
                     {
                         self.demo_seed = self.demo_seed.wrapping_add(1);
                         self.load_demo_cohort();
                     }
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        if ui
-                            .button("📂 Open Study Folder")
-                            .on_hover_text("Select a multi-sample Bruker 1D cohort folder from disk")
-                            .clicked()
-                        {
-                            crate::ingest_panel::trigger_browser_folder_picker();
-                        }
-                        if ui
-                            .button("📄 Open Cohort .zip / Files")
-                            .on_hover_text("Select a .zip/.tar.gz archive or multiple .jdx/.tsv 1D spectra")
-                            .clicked()
-                        {
-                            crate::ingest_panel::trigger_browser_files_picker();
-                        }
-                    }
 
-                    ui.separator();
-
-                    // Bucketing selector
-                    let is_adaptive =
-                        matches!(self.config.bucketing, BucketingMethod::AdaptiveIntelligent { .. });
-                    ui.label(egui::RichText::new("Bucketing:").small());
-                    if ui.selectable_label(is_adaptive, "Adaptive (AIB)").clicked() && !is_adaptive
-                    {
-                        self.config.bucketing = BucketingMethod::default();
-                        trigger_rerun = true;
-                    }
-                    if ui.selectable_label(!is_adaptive, "Uniform 0.04").clicked() && is_adaptive {
-                        self.config.bucketing = BucketingMethod::Uniform {
-                            bin_width_ppm: 0.04,
-                            min_bucket_snr: 3.0,
-                        };
+                    if !self.samples.is_empty() && ui.button("Re-Run").clicked() {
                         trigger_rerun = true;
                     }
 
                     ui.separator();
 
-                    // Alignment toggle
-                    let mut align_on = !matches!(self.config.alignment, AlignmentMode::Disabled);
+                    let spec_lbl = match self.spectrum_mode {
+                        SpectrumViewMode::CohortOverlay => "1D Overlay",
+                        SpectrumViewMode::StocsyCovarianceHeat => "STOCSY Cov + r^2",
+                    };
+                    egui::ComboBox::from_id_salt("metab_spec_mode")
+                        .selected_text(spec_lbl)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.spectrum_mode,
+                                SpectrumViewMode::CohortOverlay,
+                                "1D Overlay",
+                            );
+                            ui.selectable_value(
+                                &mut self.spectrum_mode,
+                                SpectrumViewMode::StocsyCovarianceHeat,
+                                "STOCSY Cov + r^2",
+                            );
+                        });
+
+                    let score_lbl = match self.score_mode {
+                        ScorePlotMode::OplsDa => "OPLS-DA Scores",
+                        ScorePlotMode::Pca => "PCA Scores",
+                        ScorePlotMode::PlsDa => "PLS-DA Scores",
+                    };
+                    egui::ComboBox::from_id_salt("metab_score_mode")
+                        .selected_text(score_lbl)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.score_mode,
+                                ScorePlotMode::OplsDa,
+                                "OPLS-DA Scores",
+                            );
+                            ui.selectable_value(
+                                &mut self.score_mode,
+                                ScorePlotMode::Pca,
+                                "PCA Scores",
+                            );
+                            ui.selectable_value(
+                                &mut self.score_mode,
+                                ScorePlotMode::PlsDa,
+                                "PLS-DA Scores",
+                            );
+                        });
+
+                    let feat_lbl = match self.feature_mode {
+                        FeaturePlotMode::OplsSPlot => "OPLS-DA S-Plot",
+                        FeaturePlotMode::VolcanoPlot => "BH-FDR Volcano",
+                    };
+                    egui::ComboBox::from_id_salt("metab_feat_mode")
+                        .selected_text(feat_lbl)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.feature_mode,
+                                FeaturePlotMode::OplsSPlot,
+                                "OPLS-DA S-Plot",
+                            );
+                            ui.selectable_value(
+                                &mut self.feature_mode,
+                                FeaturePlotMode::VolcanoPlot,
+                                "BH-FDR Volcano",
+                            );
+                        });
+
                     if ui
-                        .checkbox(&mut align_on, "Interval FFT Align")
-                        .on_hover_text(
-                            "Savorani et al. (2010) valley-snapped FFT cross-correlation local peak alignment",
-                        )
-                        .changed()
+                        .selectable_label(self.show_biomarker_table, "Biomarker Table")
+                        .clicked()
                     {
-                        self.config.alignment = if align_on {
-                            AlignmentMode::AutomaticIntervals {
-                                interval_width_ppm: 0.24,
-                                max_shift_ppm: 0.05,
-                                reference: AlignmentReference::Median,
-                            }
-                        } else {
-                            AlignmentMode::Disabled
-                        };
-                        trigger_rerun = true;
-                    }
-
-                    ui.separator();
-
-                    // Normalization combo
-                    let norm_label = match self.config.normalization {
-                        NormalizationMethod::ProbabilisticQuotient => "PQN",
-                        NormalizationMethod::TotalSpectralArea => "TSA",
-                        NormalizationMethod::InternalStandard { .. } => "TSP (0 ppm)",
-                        NormalizationMethod::None => "None",
-                    };
-                    egui::ComboBox::from_label("Norm")
-                        .selected_text(norm_label)
-                        .width(92.0)
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(
-                                    matches!(
-                                        self.config.normalization,
-                                        NormalizationMethod::ProbabilisticQuotient
-                                    ),
-                                    "PQN (Dieterle 2006)",
-                                )
-                                .clicked()
-                            {
-                                self.config.normalization =
-                                    NormalizationMethod::ProbabilisticQuotient;
-                                trigger_rerun = true;
-                            }
-                            if ui
-                                .selectable_label(
-                                    matches!(
-                                        self.config.normalization,
-                                        NormalizationMethod::TotalSpectralArea
-                                    ),
-                                    "Total Area (TSA)",
-                                )
-                                .clicked()
-                            {
-                                self.config.normalization = NormalizationMethod::TotalSpectralArea;
-                                trigger_rerun = true;
-                            }
-                            if ui
-                                .selectable_label(
-                                    matches!(
-                                        self.config.normalization,
-                                        NormalizationMethod::InternalStandard { .. }
-                                    ),
-                                    "Internal Std (TSP 0.0)",
-                                )
-                                .clicked()
-                            {
-                                self.config.normalization = NormalizationMethod::InternalStandard {
-                                    target_ppm: 0.0,
-                                    half_window_ppm: 0.08,
-                                };
-                                trigger_rerun = true;
-                            }
-                            if ui
-                                .selectable_label(
-                                    matches!(self.config.normalization, NormalizationMethod::None),
-                                    "None",
-                                )
-                                .clicked()
-                            {
-                                self.config.normalization = NormalizationMethod::None;
-                                trigger_rerun = true;
-                            }
-                        });
-
-                    // Scaling combo
-                    let scale_label = match self.config.scaling {
-                        ScalingMethod::Pareto => "Pareto",
-                        ScalingMethod::UnitVariance => "UV",
-                        ScalingMethod::MeanCenter => "Center",
-                        ScalingMethod::None => "None",
-                    };
-                    egui::ComboBox::from_label("Scale")
-                        .selected_text(scale_label)
-                        .width(76.0)
-                        .show_ui(ui, |ui| {
-                            for (m, lbl) in [
-                                (ScalingMethod::Pareto, "Pareto"),
-                                (ScalingMethod::UnitVariance, "Unit Variance (UV)"),
-                                (ScalingMethod::MeanCenter, "Mean Center"),
-                                (ScalingMethod::None, "None"),
-                            ] {
-                                if ui.selectable_label(self.config.scaling == m, lbl).clicked() {
-                                    self.config.scaling = m;
-                                    trigger_rerun = true;
-                                }
-                            }
-                        });
-
-                    // Mask preset combo
-                    let mask_label = match self.config.mask_preset {
-                        BiofluidMaskPreset::Urine => "Urine (H2O+Urea)",
-                        BiofluidMaskPreset::SerumPlasma => "Serum (H2O)",
-                        BiofluidMaskPreset::AqueousMinimal => "H2O Only",
-                        BiofluidMaskPreset::None => "No Mask",
-                        BiofluidMaskPreset::Custom(_) => "Custom",
-                    };
-                    egui::ComboBox::from_label("Mask")
-                        .selected_text(mask_label)
-                        .width(118.0)
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(
-                                    self.config.mask_preset == BiofluidMaskPreset::Urine,
-                                    "Urine (H2O + Urea + TSP)",
-                                )
-                                .clicked()
-                            {
-                                self.config.mask_preset = BiofluidMaskPreset::Urine;
-                                trigger_rerun = true;
-                            }
-                            if ui
-                                .selectable_label(
-                                    self.config.mask_preset == BiofluidMaskPreset::SerumPlasma,
-                                    "Serum / Plasma (H2O + TSP)",
-                                )
-                                .clicked()
-                            {
-                                self.config.mask_preset = BiofluidMaskPreset::SerumPlasma;
-                                trigger_rerun = true;
-                            }
-                            if ui
-                                .selectable_label(
-                                    self.config.mask_preset == BiofluidMaskPreset::AqueousMinimal,
-                                    "Minimal H2O (4.70-4.95)",
-                                )
-                                .clicked()
-                            {
-                                self.config.mask_preset = BiofluidMaskPreset::AqueousMinimal;
-                                trigger_rerun = true;
-                            }
-                            if ui
-                                .selectable_label(
-                                    self.config.mask_preset == BiofluidMaskPreset::None,
-                                    "None",
-                                )
-                                .clicked()
-                            {
-                                self.config.mask_preset = BiofluidMaskPreset::None;
-                                trigger_rerun = true;
-                            }
-                        });
-
-                    if !self.samples.is_empty() && ui.button("↻ Re-Run").clicked() {
-                        trigger_rerun = true;
-                    }
-
-                    if let Some(ref st) = self.study {
-                        ui.separator();
-                        if ui
-                            .small_button("Copy Biomarkers CSV")
-                            .on_hover_text("Copy ranked candidate biomarker table CSV to clipboard")
-                            .clicked()
-                        {
-                            ui.ctx().copy_text(export_biomarker_ranking_csv(st));
-                            self.status_banner =
-                                "Copied ranked biomarker discovery CSV to clipboard.".to_string();
-                        }
-                        if ui
-                            .small_button("Copy Buckets CSV")
-                            .on_hover_text("Copy normalized N x P bucket matrix CSV to clipboard")
-                            .clicked()
-                        {
-                            ui.ctx().copy_text(export_bucket_table_csv(st));
-                            self.status_banner =
-                                "Copied normalized bucket matrix CSV to clipboard.".to_string();
-                        }
-                        if ui
-                            .small_button("Copy Summary JSON")
-                            .on_hover_text("Copy structured JSON study summary to clipboard")
-                            .clicked()
-                        {
-                            if let Ok(js) = export_study_summary_json(st, 20) {
-                                ui.ctx().copy_text(js);
-                                self.status_banner =
-                                    "Copied JSON study summary to clipboard.".to_string();
-                            }
-                        }
+                        self.show_biomarker_table = !self.show_biomarker_table;
                     }
                 });
 
-                // Second row: Model Validation & Overfitting Guardrail Banner
+                // Progressive-disclosure Advanced Preprocessing & Export
+                egui::CollapsingHeader::new(
+                    egui::RichText::new("Advanced Preprocessing & Export").size(12.5),
+                )
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Load 24-Sample Demo").clicked() {
+                            self.demo_seed = self.demo_seed.wrapping_add(1);
+                            self.load_demo_cohort();
+                        }
+                        if self.study.is_some() && ui.button("Full Sweep").clicked() {
+                            if let Some(ref st) = self.study {
+                                self.view_ppm_bounds = (st.config.min_ppm, st.config.max_ppm);
+                            }
+                        }
+                        ui.separator();
+
+                        let is_adaptive = matches!(
+                            self.config.bucketing,
+                            BucketingMethod::AdaptiveIntelligent { .. }
+                        );
+                        ui.label(egui::RichText::new("Bucketing:").size(11.0));
+                        if ui.selectable_label(is_adaptive, "Adaptive (AIB)").clicked()
+                            && !is_adaptive
+                        {
+                            self.config.bucketing = BucketingMethod::default();
+                            trigger_rerun = true;
+                        }
+                        if ui.selectable_label(!is_adaptive, "Uniform").clicked() && is_adaptive {
+                            self.config.bucketing = BucketingMethod::Uniform {
+                                bin_width_ppm: 0.04,
+                                min_bucket_snr: 3.0,
+                            };
+                            trigger_rerun = true;
+                        }
+                        if let BucketingMethod::Uniform {
+                            ref mut bin_width_ppm,
+                            ..
+                        } = self.config.bucketing
+                        {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("d_ppm:").size(11.0));
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(bin_width_ppm)
+                                            .range(0.005..=0.20)
+                                            .speed(0.005)
+                                            .fixed_decimals(3),
+                                    )
+                                    .changed()
+                                {
+                                    trigger_rerun = true;
+                                }
+                            });
+                        }
+
+                        ui.separator();
+
+                        let mut align_on = !matches!(self.config.alignment, AlignmentMode::Disabled);
+                        if ui
+                            .checkbox(&mut align_on, "Interval FFT Align")
+                            .on_hover_text(
+                                "Savorani et al. (2010) valley-snapped FFT cross-correlation local peak alignment",
+                            )
+                            .changed()
+                        {
+                            self.config.alignment = if align_on {
+                                AlignmentMode::AutomaticIntervals {
+                                    interval_width_ppm: 0.24,
+                                    max_shift_ppm: 0.05,
+                                    reference: AlignmentReference::Median,
+                                }
+                            } else {
+                                AlignmentMode::Disabled
+                            };
+                            trigger_rerun = true;
+                        }
+
+                        ui.separator();
+
+                        let norm_label = match self.config.normalization {
+                            NormalizationMethod::ProbabilisticQuotient => "PQN",
+                            NormalizationMethod::TotalSpectralArea => "TSA",
+                            NormalizationMethod::InternalStandard { .. } => "TSP (0 ppm)",
+                            NormalizationMethod::None => "None",
+                        };
+                        egui::ComboBox::from_label("Norm")
+                            .selected_text(norm_label)
+                            .width(92.0)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        matches!(
+                                            self.config.normalization,
+                                            NormalizationMethod::ProbabilisticQuotient
+                                        ),
+                                        "PQN (Dieterle 2006)",
+                                    )
+                                    .clicked()
+                                {
+                                    self.config.normalization =
+                                        NormalizationMethod::ProbabilisticQuotient;
+                                    trigger_rerun = true;
+                                }
+                                if ui
+                                    .selectable_label(
+                                        matches!(
+                                            self.config.normalization,
+                                            NormalizationMethod::TotalSpectralArea
+                                        ),
+                                        "Total Area (TSA)",
+                                    )
+                                    .clicked()
+                                {
+                                    self.config.normalization =
+                                        NormalizationMethod::TotalSpectralArea;
+                                    trigger_rerun = true;
+                                }
+                                if ui
+                                    .selectable_label(
+                                        matches!(
+                                            self.config.normalization,
+                                            NormalizationMethod::InternalStandard { .. }
+                                        ),
+                                        "Internal Std (TSP 0.0)",
+                                    )
+                                    .clicked()
+                                {
+                                    self.config.normalization =
+                                        NormalizationMethod::InternalStandard {
+                                            target_ppm: 0.0,
+                                            half_window_ppm: 0.08,
+                                        };
+                                    trigger_rerun = true;
+                                }
+                                if ui
+                                    .selectable_label(
+                                        matches!(
+                                            self.config.normalization,
+                                            NormalizationMethod::None
+                                        ),
+                                        "None",
+                                    )
+                                    .clicked()
+                                {
+                                    self.config.normalization = NormalizationMethod::None;
+                                    trigger_rerun = true;
+                                }
+                            });
+
+                        let scale_label = match self.config.scaling {
+                            ScalingMethod::Pareto => "Pareto",
+                            ScalingMethod::UnitVariance => "UV",
+                            ScalingMethod::MeanCenter => "Center",
+                            ScalingMethod::None => "None",
+                        };
+                        egui::ComboBox::from_label("Scale")
+                            .selected_text(scale_label)
+                            .width(76.0)
+                            .show_ui(ui, |ui| {
+                                for (m, lbl) in [
+                                    (ScalingMethod::Pareto, "Pareto"),
+                                    (ScalingMethod::UnitVariance, "Unit Variance (UV)"),
+                                    (ScalingMethod::MeanCenter, "Mean Center"),
+                                    (ScalingMethod::None, "None"),
+                                ] {
+                                    if ui.selectable_label(self.config.scaling == m, lbl).clicked()
+                                    {
+                                        self.config.scaling = m;
+                                        trigger_rerun = true;
+                                    }
+                                }
+                            });
+
+                        let mask_label = match self.config.mask_preset {
+                            BiofluidMaskPreset::Urine => "Urine (H2O+Urea)",
+                            BiofluidMaskPreset::SerumPlasma => "Serum (H2O)",
+                            BiofluidMaskPreset::AqueousMinimal => "H2O Only",
+                            BiofluidMaskPreset::None => "No Mask",
+                            BiofluidMaskPreset::Custom(_) => "Custom",
+                        };
+                        egui::ComboBox::from_label("Mask")
+                            .selected_text(mask_label)
+                            .width(118.0)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.config.mask_preset == BiofluidMaskPreset::Urine,
+                                        "Urine (H2O + Urea + TSP)",
+                                    )
+                                    .clicked()
+                                {
+                                    self.config.mask_preset = BiofluidMaskPreset::Urine;
+                                    trigger_rerun = true;
+                                }
+                                if ui
+                                    .selectable_label(
+                                        self.config.mask_preset == BiofluidMaskPreset::SerumPlasma,
+                                        "Serum / Plasma (H2O + TSP)",
+                                    )
+                                    .clicked()
+                                {
+                                    self.config.mask_preset = BiofluidMaskPreset::SerumPlasma;
+                                    trigger_rerun = true;
+                                }
+                                if ui
+                                    .selectable_label(
+                                        self.config.mask_preset
+                                            == BiofluidMaskPreset::AqueousMinimal,
+                                        "Minimal H2O (4.70-4.95)",
+                                    )
+                                    .clicked()
+                                {
+                                    self.config.mask_preset = BiofluidMaskPreset::AqueousMinimal;
+                                    trigger_rerun = true;
+                                }
+                                if ui
+                                    .selectable_label(
+                                        self.config.mask_preset == BiofluidMaskPreset::None,
+                                        "None",
+                                    )
+                                    .clicked()
+                                {
+                                    self.config.mask_preset = BiofluidMaskPreset::None;
+                                    trigger_rerun = true;
+                                }
+                            });
+
+                        ui.checkbox(&mut self.show_bucket_boundaries, "Buckets");
+                        ui.checkbox(&mut self.auto_zoom_on_select, "Auto-Zoom 1D");
+
+                        if let Some(ref st) = self.study {
+                            ui.separator();
+                            if ui
+                                .button("Export CSV")
+                                .on_hover_text(
+                                    "Copy ranked candidate biomarker table CSV to clipboard",
+                                )
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(export_biomarker_ranking_csv(st));
+                                self.status_banner =
+                                    "Copied ranked biomarker discovery CSV to clipboard."
+                                        .to_string();
+                            }
+                            if ui
+                                .button("Copy Buckets CSV")
+                                .on_hover_text(
+                                    "Copy normalized N x P bucket matrix CSV to clipboard",
+                                )
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(export_bucket_table_csv(st));
+                                self.status_banner =
+                                    "Copied normalized bucket matrix CSV to clipboard.".to_string();
+                            }
+                            if ui
+                                .button("Copy Summary JSON")
+                                .on_hover_text("Copy structured JSON study summary to clipboard")
+                                .clicked()
+                            {
+                                if let Ok(js) = export_study_summary_json(st, 20) {
+                                    ui.ctx().copy_text(js);
+                                    self.status_banner =
+                                        "Copied JSON study summary to clipboard.".to_string();
+                                }
+                            }
+                        }
+                    });
+                });
+
+                // Compact Statistical Reporting Banner (neutral scientific candor, zero "VALIDATED")
                 if let Some(ref study) = self.study {
-                    ui.add_space(3.0);
+                    ui.add_space(2.0);
                     ui.horizontal_wrapped(|ui| {
                         let pca_r2 = study
                             .pca
@@ -584,33 +782,34 @@ impl MetabolomicsStudioPanel {
                             .unwrap_or(0.0);
                         ui.label(
                             egui::RichText::new(format!(
-                                "Cohort: {} spectra × {} buckets | PCA 2-comp R²X={:.1}%",
+                                "Cohort: {} spectra x {} buckets | PCA 2-comp R²X={:.1}%",
                                 study.sample_ids.len(),
                                 study.buckets.len(),
                                 pca_r2 * 100.0
                             ))
-                            .small()
+                            .size(11.0)
                             .monospace()
                             .color(egui::Color32::from_rgb(175, 205, 235)),
                         );
 
                         if let Some(ref op) = study.opls_da {
                             ui.separator();
+                            let stats_txt = format!(
+                                "CV Q² = {:.2} (7-fold), R²Y = {:.2}, permutation p <= {:.3} (n={})",
+                                op.q2,
+                                op.r2_y,
+                                op.permutation.p_value_q2,
+                                op.permutation.n_permutations
+                            );
                             let (badge_txt, fill_c, txt_c) = if op.permutation.is_validated {
                                 (
-                                    format!(
-                                        "✓ OPLS-DA VALIDATED (R²Y={:.3}, CV Q²={:.3}, perm p={:.3})",
-                                        op.r2_y, op.q2, op.permutation.p_value_q2
-                                    ),
-                                    egui::Color32::from_rgb(20, 72, 48),
-                                    egui::Color32::from_rgb(167, 243, 208),
+                                    stats_txt,
+                                    egui::Color32::from_rgb(24, 52, 68),
+                                    egui::Color32::from_rgb(186, 230, 253),
                                 )
                             } else {
                                 (
-                                    format!(
-                                        "⚠ OVERFIT / UNVALIDATED (R²Y={:.3}, CV Q²={:.3}, perm p={:.3})",
-                                        op.r2_y, op.q2, op.permutation.p_value_q2
-                                    ),
+                                    format!("[!] Overfit warning | {stats_txt}"),
                                     egui::Color32::from_rgb(98, 34, 34),
                                     egui::Color32::from_rgb(254, 202, 202),
                                 )
@@ -622,21 +821,21 @@ impl MetabolomicsStudioPanel {
                                 .show(ui, |ui| {
                                     ui.label(
                                         egui::RichText::new(badge_txt)
-                                            .small()
+                                            .size(11.0)
                                             .monospace()
                                             .strong()
                                             .color(txt_c),
                                     );
                                 });
                         }
-
-                        ui.separator();
+                    });
+                    if self.status_banner.starts_with("Copied ") {
                         ui.label(
                             egui::RichText::new(&self.status_banner)
-                                .small()
+                                .size(11.0)
                                 .color(egui::Color32::from_rgb(203, 213, 225)),
                         );
-                    });
+                    }
                 }
             });
 
@@ -649,43 +848,18 @@ impl MetabolomicsStudioPanel {
     // Quadrant A: Cohort 1D Spectral Overlay & Live STOCSY r^2 Heat Trace
     // ========================================================================
 
-    fn draw_quadrant_a_spectra(&mut self, ui: &mut egui::Ui, size: egui::Vec2) {
+    pub fn render_quadrant_a_overlay(&mut self, ui: &mut egui::Ui, size: egui::Vec2) {
         let mut clicked_bucket: Option<usize> = None;
 
         egui::Frame::new()
             .fill(egui::Color32::from_rgb(14, 18, 26))
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(42, 54, 74)))
             .corner_radius(5.0)
-            .inner_margin(egui::Margin::same(6))
+            .inner_margin(egui::Margin::same(4))
             .show(ui, |ui| {
-                ui.set_min_size(size - egui::vec2(12.0, 12.0));
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("A. Cohort 1D Overlay & STOCSY Trace")
-                            .strong()
-                            .color(egui::Color32::from_rgb(135, 215, 255)),
-                    );
-                    ui.separator();
-                    ui.selectable_value(
-                        &mut self.spectrum_mode,
-                        SpectrumViewMode::CohortOverlay,
-                        "1D Overlay",
-                    );
-                    ui.selectable_value(
-                        &mut self.spectrum_mode,
-                        SpectrumViewMode::StocsyCovarianceHeat,
-                        "STOCSY Cov + r²",
-                    );
-                    ui.checkbox(&mut self.show_bucket_boundaries, "Buckets");
-                    if ui.small_button("Full Sweep").clicked() {
-                        if let Some(ref st) = self.study {
-                            self.view_ppm_bounds = (st.config.min_ppm, st.config.max_ppm);
-                        }
-                    }
-                });
-
-                let canvas_h = (ui.available_height() - 4.0).max(120.0);
-                let canvas_w = ui.available_width().max(180.0);
+                ui.set_min_size(size - egui::vec2(8.0, 8.0));
+                let canvas_h = (size.y - 8.0).max(120.0);
+                let canvas_w = (size.x - 8.0).max(180.0);
                 let (rect, resp) = ui.allocate_exact_size(
                     egui::vec2(canvas_w, canvas_h),
                     egui::Sense::click_and_drag(),
@@ -693,16 +867,25 @@ impl MetabolomicsStudioPanel {
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(10, 14, 21));
 
+                painter.text(
+                    egui::pos2(rect.left() + 8.0, rect.top() + 4.0),
+                    egui::Align2::LEFT_TOP,
+                    "A. Cohort 1D Overlay & STOCSY Trace",
+                    egui::FontId::proportional(12.5),
+                    egui::Color32::from_rgb(135, 215, 255),
+                );
+
                 let Some(ref study) = self.study else {
                     return;
                 };
                 let plot_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + 8.0, rect.top() + 8.0),
-                    egui::pos2(rect.right() - 8.0, rect.bottom() - 22.0),
+                    egui::pos2(rect.left() + 8.0, rect.top() + 20.0),
+                    egui::pos2(rect.right() - 8.0, rect.bottom() - 28.0),
                 );
                 if plot_rect.width() <= 16.0 || plot_rect.height() <= 16.0 {
                     return;
                 }
+                self.last_plot_rects[0] = Some(rect);
 
                 // Interactive horizontal pan & scroll-wheel zoom on descending NMR ppm axis
                 let (mut v_lo, mut v_hi) = self.view_ppm_bounds;
@@ -952,7 +1135,7 @@ impl MetabolomicsStudioPanel {
                     }
                 }
 
-                // 3. Draw chemical-shift axis ticks along bottom
+                // 3. Draw chemical-shift axis ticks along bottom (>= 60 px spacing + single "1H (ppm)" title)
                 painter.line_segment(
                     [
                         egui::pos2(plot_rect.left(), plot_rect.bottom()),
@@ -960,7 +1143,7 @@ impl MetabolomicsStudioPanel {
                     ],
                     egui::Stroke::new(1.0, egui::Color32::from_rgb(82, 98, 126)),
                 );
-                let n_ticks = 6usize;
+                let n_ticks = ((plot_rect.width() / 72.0).floor() as usize).clamp(1, 10);
                 for t in 0..=n_ticks {
                     let frac = (t as f64) / (n_ticks as f64);
                     let ppm = v_hi - frac * (v_hi - v_lo);
@@ -973,13 +1156,20 @@ impl MetabolomicsStudioPanel {
                         egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 128, 158)),
                     );
                     painter.text(
-                        egui::pos2(x, plot_rect.bottom() + 5.0),
+                        egui::pos2(x, plot_rect.bottom() + 4.0),
                         egui::Align2::CENTER_TOP,
-                        format!("{ppm:.2}"),
-                        egui::FontId::monospace(10.0),
+                        format!("{ppm:.1}"),
+                        egui::FontId::monospace(11.0),
                         egui::Color32::from_rgb(165, 182, 208),
                     );
                 }
+                painter.text(
+                    egui::pos2(plot_rect.center().x, rect.bottom() - 1.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    "1H (ppm)",
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgb(186, 202, 224),
+                );
 
                 // Click to select nearest bucket & compute live STOCSY
                 if resp.clicked() {
@@ -1012,40 +1202,36 @@ impl MetabolomicsStudioPanel {
             .fill(egui::Color32::from_rgb(14, 18, 26))
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(42, 54, 74)))
             .corner_radius(5.0)
-            .inner_margin(egui::Margin::same(6))
+            .inner_margin(egui::Margin::same(4))
             .show(ui, |ui| {
-                ui.set_min_size(size - egui::vec2(12.0, 12.0));
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("B. Score Space & 95% Hotelling T²")
-                            .strong()
-                            .color(egui::Color32::from_rgb(135, 215, 255)),
-                    );
-                    ui.separator();
-                    ui.selectable_value(&mut self.score_mode, ScorePlotMode::OplsDa, "OPLS-DA");
-                    ui.selectable_value(&mut self.score_mode, ScorePlotMode::Pca, "PCA");
-                    ui.selectable_value(&mut self.score_mode, ScorePlotMode::PlsDa, "PLS-DA");
-                });
-
-                let canvas_h = (ui.available_height() - 4.0).max(120.0);
-                let canvas_w = ui.available_width().max(180.0);
+                ui.set_min_size(size - egui::vec2(8.0, 8.0));
+                let canvas_h = (size.y - 8.0).max(120.0);
+                let canvas_w = (size.x - 8.0).max(180.0);
                 let (rect, resp) = ui.allocate_exact_size(
                     egui::vec2(canvas_w, canvas_h),
                     egui::Sense::hover(),
                 );
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(10, 14, 21));
+                painter.text(
+                    egui::pos2(rect.left() + 8.0, rect.top() + 4.0),
+                    egui::Align2::LEFT_TOP,
+                    "B. Score Space & 95% Hotelling T^2",
+                    egui::FontId::proportional(12.5),
+                    egui::Color32::from_rgb(135, 215, 255),
+                );
 
                 let Some(ref study) = self.study else {
                     return;
                 };
                 let plot_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + 34.0, rect.top() + 10.0),
-                    egui::pos2(rect.right() - 12.0, rect.bottom() - 22.0),
+                    egui::pos2(rect.left() + 34.0, rect.top() + 20.0),
+                    egui::pos2(rect.right() - 10.0, rect.bottom() - 20.0),
                 );
                 if plot_rect.width() <= 20.0 || plot_rect.height() <= 20.0 {
                     return;
                 }
+                self.last_plot_rects[1] = Some(rect);
 
                 // Gather (x, y, sample_idx, is_outlier) points + ellipses + axis labels
                 struct ScorePoint {
@@ -1261,7 +1447,7 @@ impl MetabolomicsStudioPanel {
                     painter.text(
                         egui::pos2(lx, ly),
                         egui::Align2::RIGHT_CENTER,
-                        format!("● {g_name}"),
+                        format!("[*] {g_name}"),
                         egui::FontId::proportional(11.0),
                         group_color(gi),
                     );
@@ -1269,24 +1455,24 @@ impl MetabolomicsStudioPanel {
 
                 // Axis captions
                 painter.text(
-                    egui::pos2(plot_rect.center().x, rect.bottom() - 4.0),
+                    egui::pos2(plot_rect.center().x, rect.bottom() - 3.0),
                     egui::Align2::CENTER_BOTTOM,
                     x_lbl,
-                    egui::FontId::monospace(10.5),
+                    egui::FontId::monospace(11.0),
                     egui::Color32::from_rgb(165, 182, 208),
                 );
                 painter.text(
-                    egui::pos2(rect.left() + 4.0, plot_rect.top() + 2.0),
+                    egui::pos2(plot_rect.left() + 4.0, plot_rect.top() + 2.0),
                     egui::Align2::LEFT_TOP,
                     y_lbl,
-                    egui::FontId::monospace(10.0),
+                    egui::FontId::monospace(11.0),
                     egui::Color32::from_rgb(165, 182, 208),
                 );
 
                 if let Some(sp) = hovered_sample {
                     let si = sp.sample_idx;
                     resp.on_hover_text(format!(
-                        "{} ({})\nScore: ({:.3}, {:.3})\nHotelling T²: {:.2} (95% lim {:.2})\nQ-residual (SPE): {:.3} (95% lim {:.3})",
+                        "{} ({})\nScore: ({:.3}, {:.3})\nHotelling T^2: {:.2} (95% lim {:.2})\nQ-residual (SPE): {:.3} (95% lim {:.3})",
                         study.sample_ids[si],
                         study.sample_groups[si],
                         sp.x,
@@ -1311,37 +1497,24 @@ impl MetabolomicsStudioPanel {
             .fill(egui::Color32::from_rgb(14, 18, 26))
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(42, 54, 74)))
             .corner_radius(5.0)
-            .inner_margin(egui::Margin::same(6))
+            .inner_margin(egui::Margin::same(4))
             .show(ui, |ui| {
-                ui.set_min_size(size - egui::vec2(12.0, 12.0));
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("C. Biomarker S-Plot / Volcano")
-                            .strong()
-                            .color(egui::Color32::from_rgb(135, 215, 255)),
-                    );
-                    ui.separator();
-                    ui.selectable_value(
-                        &mut self.feature_mode,
-                        FeaturePlotMode::OplsSPlot,
-                        "OPLS-DA S-Plot",
-                    );
-                    ui.selectable_value(
-                        &mut self.feature_mode,
-                        FeaturePlotMode::VolcanoPlot,
-                        "BH-FDR Volcano",
-                    );
-                    ui.checkbox(&mut self.auto_zoom_on_select, "Auto-Zoom 1D");
-                });
-
-                let canvas_h = (ui.available_height() - 4.0).max(120.0);
-                let canvas_w = ui.available_width().max(180.0);
+                ui.set_min_size(size - egui::vec2(8.0, 8.0));
+                let canvas_h = (size.y - 8.0).max(120.0);
+                let canvas_w = (size.x - 8.0).max(180.0);
                 let (rect, resp) = ui.allocate_exact_size(
                     egui::vec2(canvas_w, canvas_h),
                     egui::Sense::click(),
                 );
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(10, 14, 21));
+                painter.text(
+                    egui::pos2(rect.left() + 8.0, rect.top() + 4.0),
+                    egui::Align2::LEFT_TOP,
+                    "C. Biomarker S-Plot / Volcano",
+                    egui::FontId::proportional(12.5),
+                    egui::Color32::from_rgb(135, 215, 255),
+                );
 
                 let Some(ref study) = self.study else {
                     return;
@@ -1350,12 +1523,13 @@ impl MetabolomicsStudioPanel {
                     return;
                 }
                 let plot_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + 34.0, rect.top() + 10.0),
-                    egui::pos2(rect.right() - 12.0, rect.bottom() - 22.0),
+                    egui::pos2(rect.left() + 34.0, rect.top() + 20.0),
+                    egui::pos2(rect.right() - 10.0, rect.bottom() - 20.0),
                 );
                 if plot_rect.width() <= 20.0 || plot_rect.height() <= 20.0 {
                     return;
                 }
+                self.last_plot_rects[2] = Some(rect);
 
                 let use_splot =
                     self.feature_mode == FeaturePlotMode::OplsSPlot && study.opls_da.is_some();
@@ -1425,7 +1599,6 @@ impl MetabolomicsStudioPanel {
                         );
                     }
                 } else {
-                    // FDR q = 0.05 => -log10(0.05) = 1.30103
                     let y_fdr = to_screen(0.0, 1.301_03).y;
                     painter.line_segment(
                         [
@@ -1485,17 +1658,17 @@ impl MetabolomicsStudioPanel {
                 }
 
                 painter.text(
-                    egui::pos2(plot_rect.center().x, rect.bottom() - 4.0),
+                    egui::pos2(plot_rect.center().x, rect.bottom() - 3.0),
                     egui::Align2::CENTER_BOTTOM,
                     x_lbl,
-                    egui::FontId::monospace(10.5),
+                    egui::FontId::monospace(11.0),
                     egui::Color32::from_rgb(165, 182, 208),
                 );
                 painter.text(
-                    egui::pos2(rect.left() + 4.0, plot_rect.top() + 2.0),
+                    egui::pos2(plot_rect.left() + 4.0, plot_rect.top() + 2.0),
                     egui::Align2::LEFT_TOP,
                     y_lbl,
-                    egui::FontId::monospace(10.0),
+                    egui::FontId::monospace(11.0),
                     egui::Color32::from_rgb(165, 182, 208),
                 );
 
@@ -1526,7 +1699,7 @@ impl MetabolomicsStudioPanel {
     }
 
     // ========================================================================
-    // Quadrant D: Ranked Candidate Biomarker & BMRB Metabolite Table
+    // Quadrant D: Compact Ranked Candidate Biomarker & BMRB Metabolite Table
     // ========================================================================
 
     fn draw_quadrant_d_biomarker_table(&mut self, ui: &mut egui::Ui, size: egui::Vec2) {
@@ -1536,60 +1709,46 @@ impl MetabolomicsStudioPanel {
             .fill(egui::Color32::from_rgb(14, 18, 26))
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(42, 54, 74)))
             .corner_radius(5.0)
-            .inner_margin(egui::Margin::same(6))
+            .inner_margin(egui::Margin::symmetric(8, 4))
             .show(ui, |ui| {
-                ui.set_min_size(size - egui::vec2(12.0, 12.0));
-                ui.label(
-                    egui::RichText::new("D. Ranked Candidate Biomarkers & STOCSY BMRB Matches")
-                        .strong()
-                        .color(egui::Color32::from_rgb(135, 215, 255)),
-                );
-
-                // Active STOCSY spin-system match summary card
-                if let Some(ref st) = self.active_stocsy {
-                    egui::Frame::new()
-                        .fill(egui::Color32::from_rgb(20, 28, 42))
-                        .corner_radius(4.0)
-                        .inner_margin(egui::Margin::symmetric(6, 4))
-                        .show(ui, |ui| {
-                            if let Some(top) = st.metabolite_matches.first() {
-                                let peaks_str = top
-                                    .matched_peaks
-                                    .iter()
-                                    .map(|(r_ppm, _, r2)| format!("{r_ppm:.2} (r²={r2:.2})"))
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Driver {:.3} ppm -> {} [{}] | Score {:.2} ({}/{} multiplets, stoich cos {:.2}) | {}",
-                                        st.driver_ppm,
-                                        top.name,
-                                        top.bmrb_id,
-                                        top.score,
-                                        top.matched_multiplets,
-                                        top.observable_multiplets,
-                                        top.stoichiometry_cosine,
-                                        peaks_str
-                                    ))
-                                    .small()
-                                    .monospace()
-                                    .color(egui::Color32::from_rgb(190, 242, 214)),
-                                );
-                            } else {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Driver {:.3} ppm — no BMRB library resonance within chemical-shift tolerance",
-                                        st.driver_ppm
-                                    ))
-                                    .small()
-                                    .monospace()
-                                    .color(egui::Color32::from_rgb(165, 180, 204)),
-                                );
-                            }
-                        });
-                }
-
-                ui.add_space(3.0);
+                ui.set_min_size(size - egui::vec2(16.0, 8.0));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("D. Candidate Biomarkers & STOCSY BMRB Matches")
+                            .size(12.5)
+                            .strong()
+                            .color(egui::Color32::from_rgb(135, 215, 255)),
+                    );
+                    if let Some(ref st) = self.active_stocsy {
+                        ui.separator();
+                        if let Some(top) = st.metabolite_matches.first() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Driver {:.3} ppm -> {} [{}] (score {:.2}, {}/{} multiplets)",
+                                    st.driver_ppm,
+                                    top.name,
+                                    top.bmrb_id,
+                                    top.score,
+                                    top.matched_multiplets,
+                                    top.observable_multiplets,
+                                ))
+                                .size(11.0)
+                                .monospace()
+                                .color(egui::Color32::from_rgb(190, 242, 214)),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Driver {:.3} ppm -- no BMRB library match within shift tolerance",
+                                    st.driver_ppm
+                                ))
+                                .size(11.0)
+                                .monospace()
+                                .color(egui::Color32::from_rgb(165, 180, 204)),
+                            );
+                        }
+                    }
+                });
 
                 let Some(ref study) = self.study else {
                     return;
@@ -1597,32 +1756,32 @@ impl MetabolomicsStudioPanel {
 
                 egui::ScrollArea::vertical()
                     .id_salt("metabolomics_biomarker_table_scroll")
-                    .max_height((ui.available_height() - 2.0).max(80.0))
+                    .max_height((ui.available_height() - 2.0).max(52.0))
                     .show(ui, |ui| {
                         egui::Grid::new("metabolomics_biomarker_grid")
                             .striped(true)
-                            .spacing([8.0, 3.0])
+                            .spacing([14.0, 2.0])
                             .show(ui, |ui| {
                                 for hdr in [
                                     "#",
-                                    "δ (ppm)",
+                                    "Shift (ppm)",
                                     "VIP",
                                     "p(corr)",
                                     "log2 FC",
                                     "FDR q",
-                                    "STOCSY r²",
+                                    "STOCSY r^2",
                                     "Putative BMRB Metabolite",
                                 ] {
                                     ui.label(
                                         egui::RichText::new(hdr)
-                                            .small()
+                                            .size(11.0)
                                             .strong()
                                             .color(egui::Color32::from_rgb(148, 184, 226)),
                                     );
                                 }
                                 ui.end_row();
 
-                                for bm in study.biomarkers.iter().take(60) {
+                                for bm in study.biomarkers.iter().take(25) {
                                     let is_sel = self.selected_bucket_idx == Some(bm.bucket_index);
                                     let r2 = self
                                         .active_stocsy
@@ -1630,26 +1789,37 @@ impl MetabolomicsStudioPanel {
                                         .and_then(|s| s.bucket_r2.get(bm.bucket_index).copied())
                                         .unwrap_or(0.0);
 
-                                    let rank_btn = ui.selectable_label(
-                                        is_sel,
-                                        egui::RichText::new(format!("{:>2}", bm.rank))
-                                            .small()
-                                            .monospace(),
+                                    let row_col = if is_sel {
+                                        egui::Color32::from_rgb(250, 204, 21)
+                                    } else {
+                                        egui::Color32::from_rgb(226, 232, 240)
+                                    };
+                                    let rank_lbl = ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("{:>2}", bm.rank))
+                                                .size(11.0)
+                                                .monospace()
+                                                .color(row_col),
+                                        )
+                                        .sense(egui::Sense::click()),
                                     );
-                                    let ppm_btn = ui.selectable_label(
-                                        is_sel,
-                                        egui::RichText::new(format!("{:.3}", bm.center_ppm))
-                                            .small()
-                                            .monospace()
-                                            .strong(),
+                                    let ppm_lbl = ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("{:.3}", bm.center_ppm))
+                                                .size(11.0)
+                                                .monospace()
+                                                .strong()
+                                                .color(row_col),
+                                        )
+                                        .sense(egui::Sense::click()),
                                     );
-                                    if rank_btn.clicked() || ppm_btn.clicked() {
+                                    if rank_lbl.clicked() || ppm_lbl.clicked() {
                                         clicked_bucket = Some(bm.bucket_index);
                                     }
 
                                     ui.label(
                                         egui::RichText::new(format!("{:.2}", bm.vip))
-                                            .small()
+                                            .size(11.0)
                                             .monospace()
                                             .color(if bm.vip >= 1.0 {
                                                 egui::Color32::from_rgb(134, 239, 172)
@@ -1659,12 +1829,12 @@ impl MetabolomicsStudioPanel {
                                     );
                                     ui.label(
                                         egui::RichText::new(format!("{:+.2}", bm.s_plot_corr))
-                                            .small()
+                                            .size(11.0)
                                             .monospace(),
                                     );
                                     ui.label(
                                         egui::RichText::new(format!("{:+.2}", bm.log2_fold_change))
-                                            .small()
+                                            .size(11.0)
                                             .monospace()
                                             .color(if bm.log2_fold_change > 0.3 {
                                                 egui::Color32::from_rgb(251, 146, 60)
@@ -1676,7 +1846,7 @@ impl MetabolomicsStudioPanel {
                                     );
                                     ui.label(
                                         egui::RichText::new(format!("{:.1e}", bm.fdr_q))
-                                            .small()
+                                            .size(11.0)
                                             .monospace()
                                             .color(if bm.fdr_q <= 0.05 {
                                                 egui::Color32::from_rgb(167, 243, 208)
@@ -1686,21 +1856,25 @@ impl MetabolomicsStudioPanel {
                                     );
                                     ui.label(
                                         egui::RichText::new(format!("{:.2}", r2))
-                                            .small()
+                                            .size(11.0)
                                             .monospace()
                                             .color(stocsy_r2_color(r2)),
                                     );
 
-                                    let met_txt = match (&bm.putative_metabolite, &bm.putative_bmrb_id)
-                                    {
-                                        (Some(m), Some(id)) => format!("{m} ({id})"),
-                                        (Some(m), None) => m.clone(),
-                                        _ => "—".to_string(),
-                                    };
+                                    let met_txt =
+                                        match (&bm.putative_metabolite, &bm.putative_bmrb_id) {
+                                            (Some(m), Some(id)) => format!("{m} ({id})"),
+                                            (Some(m), None) => m.clone(),
+                                            _ => "--".to_string(),
+                                        };
                                     if ui
-                                        .selectable_label(
-                                            is_sel,
-                                            egui::RichText::new(met_txt).small(),
+                                        .add(
+                                            egui::Label::new(
+                                                egui::RichText::new(met_txt)
+                                                    .size(11.0)
+                                                    .color(row_col),
+                                            )
+                                            .sense(egui::Sense::click()),
                                         )
                                         .clicked()
                                     {
@@ -1730,14 +1904,22 @@ mod tests {
         studio.config.n_permutations = 20;
 
         // Frame 1: empty state render
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut out1 = ctx.run_ui(egui::RawInput::default(), |ui| {
             studio.ui(ui);
         });
+        out1.textures_delta.clear();
 
         // Load 24-spectrum demo cohort and render OPLS-DA + S-plot + Cohort Overlay
         studio.load_demo_cohort();
+        assert!(studio.is_synthetic_demo_cohort);
         assert!(studio.study.is_some());
         assert!(studio.active_stocsy.is_some());
+        assert!(
+            !studio.status_banner.to_uppercase().contains("VALIDATED"),
+            "status_banner must never claim VALIDATED: {}",
+            studio.status_banner
+        );
+        assert!(studio.status_banner.contains("Synthetic Demo Cohort"));
 
         let raw_in = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1746,9 +1928,24 @@ mod tests {
             )),
             ..Default::default()
         };
-        let _ = ctx.run_ui(raw_in.clone(), |ui| {
-            studio.ui(ui);
+        let mut out2 = ctx.run_ui(raw_in.clone(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                studio.ui(ui);
+            });
         });
+        out2.textures_delta.clear();
+
+        let plot_area_sum: f32 = studio
+            .last_plot_rects
+            .iter()
+            .filter_map(|r| r.map(|rect| rect.area()))
+            .sum();
+        assert!(
+            plot_area_sum >= 0.65 * 1440.0 * 900.0,
+            "Metabolomics plots A+B+C area {:.0} must be >= 65% of 1440x900 ({:.0})",
+            plot_area_sum,
+            0.65 * 1440.0 * 900.0
+        );
 
         // Jump to Lactate 1.33 ppm bucket, switch to STOCSY heat + PCA + Volcano, and render Frame 3
         let lac_idx = studio
@@ -1784,8 +1981,11 @@ mod tests {
         studio.spectrum_mode = SpectrumViewMode::StocsyCovarianceHeat;
         studio.score_mode = ScorePlotMode::Pca;
         studio.feature_mode = FeaturePlotMode::VolcanoPlot;
-        let _ = ctx.run_ui(raw_in, |ui| {
-            studio.ui(ui);
+        let mut out3 = ctx.run_ui(raw_in, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                studio.ui(ui);
+            });
         });
+        out3.textures_delta.clear();
     }
 }

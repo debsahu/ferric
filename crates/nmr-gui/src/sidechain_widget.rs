@@ -1273,7 +1273,7 @@ impl SidechainInspectorPanel {
                     cls.fill_color(),
                     cls.border_stroke(Element::C),
                 );
-                ui.label(egui::RichText::new(txt).size(10.5).weak());
+                ui.label(egui::RichText::new(txt).size(11.0).weak());
             }
         });
 
@@ -1339,11 +1339,11 @@ impl SidechainInspectorPanel {
             painter.circle(center, radius, eval.class.fill_color(), stroke);
 
             let font_sz = if node.name.len() >= 4 {
-                (radius * 0.68).clamp(7.0, 9.5)
+                (radius * 0.68).clamp(11.0, 12.5)
             } else if node.name.len() == 3 {
-                (radius * 0.76).clamp(7.5, 10.5)
+                (radius * 0.76).clamp(11.0, 12.5)
             } else {
-                (radius * 0.88).clamp(8.5, 11.5)
+                (radius * 0.88).clamp(11.0, 12.5)
             };
             painter.text(
                 center,
@@ -1362,7 +1362,7 @@ impl SidechainInspectorPanel {
                         cap_pos,
                         egui::Align2::CENTER_CENTER,
                         caption,
-                        egui::FontId::monospace(9.0),
+                        egui::FontId::monospace(11.0),
                         egui::Color32::from_rgb(226, 238, 255),
                     );
                 }

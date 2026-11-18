@@ -191,7 +191,7 @@ pub struct StructureAtom3d {
 pub enum CoordinateProvenance {
     /// Explicit ModelArchive `_ma_qa_metric_local` per-residue `pLDDT` table.
     ModelArchiveQaMetric,
-    /// Computational structure (`AlphaFold` / `Boltz` / `ColabFold` or unannotated `[0, 100]` `B_iso`)
+    /// Computational structure (`AlphaFold` / `Boltz` / `ColabFold` or explicitly opted-in `B_iso`)
     /// where `CA` / backbone `B_iso_or_equiv` encodes `pLDDT`.
     ComputationalBFactor,
     /// Experimental structure (`X-RAY DIFFRACTION`, `SOLUTION NMR`, `ELECTRON MICROSCOPY`) where
@@ -200,6 +200,27 @@ pub enum CoordinateProvenance {
     /// Unclassified coordinate source without `pLDDT`.
     #[default]
     Unknown,
+}
+
+/// Alias matching `StructureProvenance` specification terminology.
+pub type StructureProvenance = CoordinateProvenance;
+
+#[allow(non_upper_case_globals)]
+impl CoordinateProvenance {
+    /// Computational model provenance alias (`ComputationalBFactor`).
+    pub const ComputationalModel: Self = Self::ComputationalBFactor;
+    /// Experimental crystallography / NMR / cryo-EM provenance alias (`Experimental`).
+    pub const ExperimentalCrystallography: Self = Self::Experimental;
+
+    /// Returns `true` when coordinates carry verified computational model provenance
+    /// (`ModelArchiveQaMetric` or `ComputationalBFactor`).
+    #[inline]
+    pub const fn is_computational(self) -> bool {
+        matches!(
+            self,
+            Self::ModelArchiveQaMetric | Self::ComputationalBFactor
+        )
+    }
 }
 
 /// Polymer amino-acid residue within a single chain and conformer.
@@ -306,6 +327,101 @@ impl StructureEnsemble3d {
             .first()
             .map(|m| m.chains.iter().map(|c| c.residues.len()).sum())
             .unwrap_or(0)
+    }
+
+    /// Fail-closed gate verifying that `self` carries validated per-residue `pLDDT` model
+    /// provenance (`ModelArchiveQaMetric` or `ComputationalBFactor`, or explicit `treat_as_model`
+    /// `"Treat B-factors as pLDDT"` opt-in), AND that per-residue `pLDDT` / `B`-factor values are
+    /// non-empty, finite, strictly within `[0.0, 100.0]`, and non-constant (`max - min > 1e-3`,
+    /// rejecting all-`0.0`, all-`0.5`, and constant experimental `B`-factors even when opted in).
+    pub fn require_predicted_model(&self, treat_as_model: bool) -> Result<(), String> {
+        let validate_slice = |vals: &[f64]| -> Result<(), String> {
+            if vals.is_empty() {
+                return Err(format!(
+                    "Structure '{}' contains zero polymer residue pLDDT/B-factor values.",
+                    self.title
+                ));
+            }
+            let mut min_v = f64::INFINITY;
+            let mut max_v = f64::NEG_INFINITY;
+            for &v in vals {
+                if !v.is_finite() || !(0.0..=100.0).contains(&v) {
+                    return Err(format!(
+                        "Structure '{}' contains out-of-range or non-finite B-factor/pLDDT value ({v:.3} outside [0.0, 100.0]).",
+                        self.title
+                    ));
+                }
+                min_v = min_v.min(v);
+                max_v = max_v.max(v);
+            }
+            if (max_v - min_v) <= 1e-3 {
+                return Err(format!(
+                    "Structure '{}' has constant/degenerate pLDDT or B-factor values (min={min_v:.3}, max={max_v:.3}).",
+                    self.title
+                ));
+            }
+            Ok(())
+        };
+
+        if !treat_as_model {
+            if !self.provenance.is_computational() {
+                return Err(format!(
+                    "Structure '{}' has {:?} provenance rather than a verified computational pLDDT model; enable \"Treat B-factors as pLDDT\" to opt in explicitly.",
+                    self.title, self.provenance
+                ));
+            }
+            let Some(ref plddts) = self.per_residue_plddt else {
+                return Err(format!(
+                    "Structure '{}' has {:?} provenance but lacks per-residue pLDDT values; enable \"Treat B-factors as pLDDT\" to opt in explicitly.",
+                    self.title, self.provenance
+                ));
+            };
+            return validate_slice(plddts);
+        }
+
+        if let Some(ref plddts) = self.per_residue_plddt {
+            return validate_slice(plddts);
+        }
+
+        let Some(c0) = self.models.first().and_then(|m| m.chains.first()) else {
+            return Err(format!(
+                "Structure '{}' contains no polymer chains for B-factor pLDDT extraction.",
+                self.title
+            ));
+        };
+        if c0.residues.is_empty() {
+            return Err(format!(
+                "Structure '{}' contains zero polymer residues for B-factor pLDDT extraction.",
+                self.title
+            ));
+        }
+        let mut raw_b = Vec::with_capacity(c0.residues.len());
+        for res in &c0.residues {
+            let b_opt = res
+                .atoms
+                .iter()
+                .find(|a| a.atom_name == "CA")
+                .map(|a| a.b_factor as f64)
+                .or_else(|| {
+                    let mut sum = 0.0f64;
+                    let mut cnt = 0usize;
+                    for a in &res.atoms {
+                        if matches!(a.atom_name.as_str(), "N" | "CA" | "C" | "O") {
+                            sum += a.b_factor as f64;
+                            cnt += 1;
+                        }
+                    }
+                    (cnt > 0).then(|| sum / (cnt as f64))
+                });
+            let Some(bv) = b_opt else {
+                return Err(format!(
+                    "Structure '{}' residue {}{} lacks backbone B-factors.",
+                    self.title, res.res_name, res.seq_id
+                ));
+            };
+            raw_b.push(bv);
+        }
+        validate_slice(&raw_b)
     }
 
     /// Re-align `sequence_idx` on polymer residues to an external NMR [`Reference`] sequence when
@@ -575,6 +691,8 @@ struct PlddtIngestHints {
     saw_qa_local_loop: bool,
     is_experimental_method: bool,
     is_computational_hint: bool,
+    has_ma_protocol_or_model_list: bool,
+    has_af_data_header: bool,
     force_bfactor_plddt: bool,
 }
 
@@ -635,6 +753,22 @@ fn normalize_plddt_vec_if_unit_scale(vals: &mut [f64]) -> bool {
 // ============================================================================
 // 4. Safe `.pdb` & `.cif`/`.mmcif` Parsers
 // ============================================================================
+
+/// Free-function wrapper for [`StructureEnsemble3d::require_predicted_model`].
+pub fn require_predicted_model(
+    ensemble: &StructureEnsemble3d,
+    treat_as_model: bool,
+) -> Result<(), String> {
+    ensemble.require_predicted_model(treat_as_model)
+}
+
+/// Alias matching [`parse_pdb_ensemble_with_options`] for callers toggling explicit B-factor opt-in.
+pub fn parse_pdb_ensemble_with_plddt_override(
+    text: &str,
+    force_bfactor_plddt: bool,
+) -> Result<StructureEnsemble3d, String> {
+    parse_pdb_ensemble_with_options(text, force_bfactor_plddt)
+}
 
 /// Auto-detect `.cif`/`.mmcif` vs `.pdb` format from text content and parse into a superposed
 /// [`StructureEnsemble3d`].
@@ -702,9 +836,6 @@ pub fn parse_pdb_ensemble_with_options(
             let body: String = line.chars().skip(10).collect();
             let trimmed = body.trim();
             if !trimmed.is_empty() {
-                if text_declares_computational_model(trimmed) {
-                    hints.is_computational_hint = true;
-                }
                 title_parts.push(trimmed.to_string());
             }
             continue;
@@ -713,9 +844,7 @@ pub fn parse_pdb_ensemble_with_options(
             let body: String = line.chars().skip(10).take(56).collect();
             let trimmed = body.trim();
             if !trimmed.is_empty() {
-                if text_declares_computational_model(trimmed) {
-                    hints.is_computational_hint = true;
-                } else if text_declares_experimental_method(trimmed) {
+                if text_declares_experimental_method(trimmed) {
                     hints.is_experimental_method = true;
                 }
                 if header_fallback.is_empty() {
@@ -736,9 +865,6 @@ pub fn parse_pdb_ensemble_with_options(
             continue;
         }
         if rec_prefix.starts_with(b"REMARK") {
-            if text_declares_computational_model(line) {
-                hints.is_computational_hint = true;
-            }
             continue;
         }
         if rec_prefix.starts_with(b"MODEL ") || rec_prefix == b"MODEL" {
@@ -1021,7 +1147,8 @@ pub fn parse_mmcif_ensemble_with_options(
         let tok = &tokens[idx];
         if !tok.is_quoted && title.is_empty() && tok.text.starts_with("data_") {
             title = tok.text.chars().skip(5).collect();
-            if text_declares_computational_model(&title) || title.starts_with("AF-") {
+            if title.starts_with("AF-") || title.starts_with("AF_") {
+                hints.has_af_data_header = true;
                 hints.is_computational_hint = true;
             }
             idx += 1;
@@ -1032,9 +1159,6 @@ pub fn parse_mmcif_ensemble_with_options(
             if tag_low == "_struct.title" {
                 let t = tokens[idx + 1].text.trim();
                 if !t.is_empty() && (tokens[idx + 1].is_quoted || (t != "." && t != "?")) {
-                    if text_declares_computational_model(t) {
-                        hints.is_computational_hint = true;
-                    }
                     title = t.to_string();
                 }
                 idx += 2;
@@ -1052,6 +1176,7 @@ pub fn parse_mmcif_ensemble_with_options(
                 continue;
             }
             if tag_low.starts_with("_ma_protocol_step.") || tag_low.starts_with("_ma_model_list.") {
+                hints.has_ma_protocol_or_model_list = true;
                 hints.is_computational_hint = true;
                 idx += 2;
                 continue;
@@ -1100,6 +1225,7 @@ pub fn parse_mmcif_ensemble_with_options(
                 .iter()
                 .any(|h| h.starts_with("_ma_protocol_step.") || h.starts_with("_ma_model_list."))
             {
+                hints.has_ma_protocol_or_model_list = true;
                 hints.is_computational_hint = true;
             }
 
@@ -1382,23 +1508,20 @@ fn extract_ensemble_plddt(
     if !hints.qa_local_rows.is_empty() {
         let is_plddt_metric_id = |mid: &str| -> bool {
             if hints.qa_defs.is_empty() {
-                return true;
+                // Only when `_ma_qa_metric` is completely absent, allow if positive AF/MA provenance
+                // exists or fail closed when no metric metadata exists. Wait: AF/MA files always
+                // define `_ma_qa_metric`; if absent, allow only when positive MA/AF header exists.
+                return hints.has_ma_protocol_or_model_list || hints.has_af_data_header;
             }
             if let Some(def) = hints.qa_defs.get(mid) {
                 let nm = def.name.to_ascii_lowercase();
                 let tp = def.metric_type.to_ascii_lowercase();
-                let md = def.mode.to_ascii_lowercase();
-                if nm.contains("plddt") || tp.contains("plddt") {
-                    return true;
-                }
-                // Accept sole local metric when no explicit pLDDT-named metric is declared
-                let any_explicit_plddt = hints.qa_defs.values().any(|d| {
-                    d.name.to_ascii_lowercase().contains("plddt")
-                        || d.metric_type.to_ascii_lowercase().contains("plddt")
-                });
-                !any_explicit_plddt && (md == "local" || hints.qa_defs.len() == 1)
+                let _md = def.mode.to_ascii_lowercase();
+                // Strict fail-closed: only accept metric IDs whose name or type explicitly contains "plddt"
+                // (e.g. reject QMEANDisCo even when it is the sole local metric!).
+                nm.contains("plddt") || tp.contains("plddt")
             } else {
-                true
+                false
             }
         };
 
@@ -1442,13 +1565,18 @@ fn extract_ensemble_plddt(
     }
 
     // 2. Experimental `B_iso_or_equiv` / `tempFactor` guard (`X-RAY DIFFRACTION`, `SOLUTION NMR`, `EM`)
-    if hints.is_experimental_method && !hints.force_bfactor_plddt && !hints.is_computational_hint {
+    if hints.is_experimental_method && !hints.force_bfactor_plddt {
         return (None, false, CoordinateProvenance::Experimental);
     }
 
     // 3. Computational `B_iso_or_equiv` / `tempFactor` fallback (`CA` or mean backbone heavy-atom)
+    //    Fail-closed (`21.W1:P0-2`): ONLY accept B-factors as pLDDT when `force_bfactor_plddt` is
+    //    true OR positive ModelArchive/AFDB mmCIF provenance (`has_ma_protocol_or_model_list` or
+    //    `data_AF-` block header) is present, AND values lie in `[0.0, 100.0]` with non-zero
+    //    variance (`max_b - min_b > 1e-3`, rejecting constant `0.0` or `0.50`).
     let mut b_vals = Vec::with_capacity(n_res);
-    let mut max_b = 0.0f64;
+    let mut min_b = f64::INFINITY;
+    let mut max_b = f64::NEG_INFINITY;
     let mut all_in_0_100 = true;
     for res in &c0.residues {
         let b_opt = res
@@ -1475,15 +1603,18 @@ fn extract_ensemble_plddt(
             all_in_0_100 = false;
             break;
         }
+        min_b = min_b.min(bv);
         max_b = max_b.max(bv);
         b_vals.push(bv);
     }
 
+    let positive_provenance = hints.has_ma_protocol_or_model_list || hints.has_af_data_header;
+    let has_nonzero_variance = min_b.is_finite() && max_b.is_finite() && (max_b - min_b) > 1e-3;
+
     if all_in_0_100
         && b_vals.len() == n_res
-        && (hints.force_bfactor_plddt
-            || hints.is_computational_hint
-            || (models.len() == 1 && max_b > 0.0))
+        && has_nonzero_variance
+        && (hints.force_bfactor_plddt || positive_provenance)
     {
         let rescaled = normalize_plddt_vec_if_unit_scale(&mut b_vals);
         return (
@@ -5008,8 +5139,10 @@ pub struct Mol3dViewerPanel {
     pub last_exported_svg: Option<String>,
     pub last_exported_png_bytes: Option<Vec<u8>>,
     pub show_mobile_options: bool,
+    pub treat_bfactors_as_plddt: bool,
     pub last_canvas_rect: Option<egui::Rect>,
     suppress_single_drag_until_release: bool,
+    secondary_drag_accum: f32,
     next_scene_gen: u64,
     scene_dirty: bool,
     putty_only_dirty: bool,
@@ -5043,8 +5176,10 @@ impl Mol3dViewerPanel {
             last_exported_svg: None,
             last_exported_png_bytes: None,
             show_mobile_options: false,
+            treat_bfactors_as_plddt: false,
             last_canvas_rect: None,
             suppress_single_drag_until_release: false,
+            secondary_drag_accum: 0.0,
             next_scene_gen: 1,
             scene_dirty: false,
             putty_only_dirty: false,
@@ -5052,20 +5187,94 @@ impl Mol3dViewerPanel {
         }
     }
 
+    /// Reset camera framing around the loaded ensemble (or default origin if empty).
+    pub fn reset_camera(&mut self) {
+        if let Some(ens) = self.ensemble.as_ref() {
+            self.camera.fit_ensemble(ens);
+        } else {
+            self.camera = ArcballCamera::default();
+        }
+    }
+
+    /// Clear any active residue/atom selection highlight.
+    pub fn clear_selection(&mut self) {
+        self.last_picked_hit = None;
+        self.highlight_sequence_residue(None, false);
+        self.flush_pending_updates();
+    }
+
+    /// Cycle the active 3D quantitative color track through [`QuantitativeTrack::ALL`].
+    pub fn cycle_color_track(&mut self) {
+        let idx = QuantitativeTrack::ALL
+            .iter()
+            .position(|&t| t == self.track_data.active_track)
+            .unwrap_or(0);
+        let next = QuantitativeTrack::ALL[(idx + 1) % QuantitativeTrack::ALL.len()];
+        self.track_data.active_track = next;
+        self.track_data.colormap = next.default_colormap();
+        self.putty_only_dirty = true;
+    }
+
+    /// Toggle whether `B_iso` / `tempFactor` columns are treated as `pLDDT` for the loaded
+    /// structure and refresh the `plddt` track accordingly.
+    pub fn set_treat_bfactors_as_plddt(&mut self, treat: bool) {
+        self.treat_bfactors_as_plddt = treat;
+        self.sync_plddt_from_ensemble();
+        self.putty_only_dirty = true;
+    }
+
     fn sync_plddt_from_ensemble(&mut self) {
         self.track_data.plddt.clear();
         let Some(ens) = self.ensemble.as_ref() else {
             return;
         };
-        let Some(ref plddt_vals) = ens.per_residue_plddt else {
+        if ens
+            .require_predicted_model(self.treat_bfactors_as_plddt)
+            .is_err()
+        {
             return;
-        };
-        if let Some(c0) = ens.models.first().and_then(|m| m.chains.first()) {
-            for (r_idx, res) in c0.residues.iter().enumerate() {
-                if let (Some(seq_k), Some(&pv)) = (res.sequence_idx, plddt_vals.get(r_idx)) {
-                    if pv.is_finite() {
-                        self.track_data.plddt.insert(seq_k, pv.clamp(0.0, 100.0));
+        }
+        if let Some(ref plddt_vals) = ens.per_residue_plddt {
+            if let Some(c0) = ens.models.first().and_then(|m| m.chains.first()) {
+                for (r_idx, res) in c0.residues.iter().enumerate() {
+                    if let (Some(seq_k), Some(&pv)) = (res.sequence_idx, plddt_vals.get(r_idx)) {
+                        if pv.is_finite() && (0.0..=100.0).contains(&pv) {
+                            self.track_data.plddt.insert(seq_k, pv);
+                        }
                     }
+                }
+            }
+        } else if self.treat_bfactors_as_plddt {
+            if let Some(c0) = ens.models.first().and_then(|m| m.chains.first()) {
+                let mut raw = Vec::with_capacity(c0.residues.len());
+                let mut keys = Vec::with_capacity(c0.residues.len());
+                for res in &c0.residues {
+                    let b_opt = res
+                        .atoms
+                        .iter()
+                        .find(|a| a.atom_name == "CA")
+                        .map(|a| a.b_factor as f64)
+                        .or_else(|| {
+                            let mut sum = 0.0f64;
+                            let mut cnt = 0usize;
+                            for a in &res.atoms {
+                                if matches!(a.atom_name.as_str(), "N" | "CA" | "C" | "O") {
+                                    sum += a.b_factor as f64;
+                                    cnt += 1;
+                                }
+                            }
+                            (cnt > 0).then(|| sum / (cnt as f64))
+                        });
+                    if let (Some(seq_k), Some(bv)) =
+                        (res.sequence_idx, b_opt.filter(|v| v.is_finite()))
+                    {
+                        keys.push(seq_k);
+                        raw.push(bv);
+                    }
+                }
+                let _ = normalize_plddt_vec_if_unit_scale(&mut raw);
+                for (seq_k, pv) in keys.into_iter().zip(raw) {
+                    self.track_data.plddt.insert(seq_k, pv);
                 }
             }
         }
@@ -5087,7 +5296,7 @@ impl Mol3dViewerPanel {
         nmr_seq: &[String],
         nmr_seq_ids: &[i32],
     ) -> Result<(), String> {
-        let mut ens = parse_structure_auto(text)?;
+        let mut ens = parse_structure_with_options(text, self.treat_bfactors_as_plddt)?;
         ens.bind_to_nmr_sequence(nmr_seq, nmr_seq_ids);
         self.camera.fit_ensemble(&ens);
         self.status_banner = format_ensemble_status_banner(&ens);
@@ -5396,10 +5605,10 @@ impl Mol3dViewerPanel {
                 });
         }
 
-        // Top compact control strip 1 & 2 (always shown on Desktop/Tablet; expandable via Opts on CompactMobile)
+        // Primary compact header strip (`<= 6` visible controls); secondary toggles/exports live
+        // inside a collapsed "Advanced" CollapsingHeader so narrow widths never clip or overflow.
         if !is_compact_mobile || self.show_mobile_options {
             ui.horizontal_wrapped(|ui| {
-                ui.strong("3D Structure");
                 egui::ComboBox::from_id_salt("mol3d_repr_combo")
                     .selected_text(self.scene_cfg.style.label())
                     .width(138.0)
@@ -5414,168 +5623,6 @@ impl Mol3dViewerPanel {
                         }
                     });
 
-                let proj_btn = match self.camera.projection {
-                    ProjectionMode::Perspective => "Persp",
-                    ProjectionMode::Orthographic => "Ortho",
-                };
-                if ui
-                    .button(proj_btn)
-                    .on_hover_text("Toggle Perspective / Orthographic camera projection")
-                    .clicked()
-                {
-                    self.camera.projection = match self.camera.projection {
-                        ProjectionMode::Perspective => ProjectionMode::Orthographic,
-                        ProjectionMode::Orthographic => ProjectionMode::Perspective,
-                    };
-                }
-
-                if ui
-                    .button("Fit")
-                    .on_hover_text("Reset view & Z-slab around loaded structure")
-                    .clicked()
-                {
-                    if let Some(ens) = self.ensemble.as_ref() {
-                        self.camera.fit_ensemble(ens);
-                    }
-                }
-
-                if ui
-                    .button("Paste PDB/CIF")
-                    .on_hover_text("Paste .pdb / .cif coordinates or NOE/PRE restraints")
-                    .clicked()
-                {
-                    self.show_paste_modal = !self.show_paste_modal;
-                }
-
-                #[cfg(not(target_arch = "wasm32"))]
-                if ui
-                    .button("PNG")
-                    .on_hover_text(
-                        "Export high-DPI offscreen 4x MSAA PNG snapshot (atomic CSPRNG temp file or custom save path)",
-                    )
-                    .clicked()
-                {
-                    if let Some(rs) = wgpu_render_state {
-                        let mut renderer = rs.renderer.write();
-                        if let Some(res) = renderer
-                            .callback_resources
-                            .get_mut::<Mol3dPipelineResource>()
-                        {
-                            self.flush_pending_updates();
-                            let uni = self.camera.to_gpu_uniforms(1600.0, 1200.0, DEFAULT_BG_RGBA);
-                            match res.export_offscreen_png(
-                                &rs.device,
-                                &rs.queue,
-                                1600,
-                                1200,
-                                &uni,
-                                &self.scene,
-                            ) {
-                                Ok(png) => {
-                                    let user_target = {
-                                        let t = self.custom_export_path.trim();
-                                        (!t.is_empty()).then(|| std::path::PathBuf::from(t))
-                                    };
-                                    match save_mol3d_snapshot(
-                                        user_target.as_deref(),
-                                        &png,
-                                        "png",
-                                        "PNG",
-                                    ) {
-                                        Ok(out_path) => {
-                                            self.status_banner = format!(
-                                                "Exported 1600x1200 PNG ({})",
-                                                out_path.display()
-                                            );
-                                            self.last_exported_path = Some(out_path);
-                                            self.last_exported_png_bytes = Some(png);
-                                        }
-                                        Err(err) => {
-                                            self.status_banner = err;
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    self.status_banner = format!("PNG export failed: {err}");
-                                }
-                            }
-                        } else {
-                            self.status_banner =
-                                "PNG export failed: 3D GPU pipeline unavailable".to_string();
-                        }
-                    } else {
-                        self.status_banner =
-                            "PNG export failed: WebGPU render state unavailable".to_string();
-                    }
-                }
-
-                if ui
-                    .button("SVG")
-                    .on_hover_text(
-                        "Export deterministic XML-escaped vector SVG (atomic CSPRNG temp file or custom save path)",
-                    )
-                    .clicked()
-                {
-                    if let Some(ens) = self.ensemble.as_ref() {
-                        let svg = export_structure_svg(
-                            ens,
-                            &self.camera,
-                            &self.scene_cfg,
-                            &self.track_data,
-                            Some(&self.restraint_overlay),
-                            1200,
-                            900,
-                        );
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            let user_target = {
-                                let t = self.custom_export_path.trim();
-                                (!t.is_empty()).then(|| std::path::PathBuf::from(t))
-                            };
-                            match save_mol3d_snapshot(
-                                user_target.as_deref(),
-                                svg.as_bytes(),
-                                "svg",
-                                "SVG",
-                            ) {
-                                Ok(out_path) => {
-                                    ui.ctx().copy_text(svg.clone());
-                                    self.status_banner = format!(
-                                        "Exported vector SVG ({}, copied to clipboard).",
-                                        out_path.display()
-                                    );
-                                    self.last_exported_path = Some(out_path);
-                                    self.last_exported_svg = Some(svg);
-                                }
-                                Err(err) => {
-                                    self.status_banner = err;
-                                }
-                            }
-                        }
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            ui.ctx().copy_text(svg.clone());
-                            self.last_exported_svg = Some(svg);
-                            self.status_banner =
-                                "Exported vector SVG (copied to clipboard).".to_string();
-                        }
-                    }
-                }
-
-                #[cfg(not(target_arch = "wasm32"))]
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.custom_export_path)
-                        .desired_width(135.0)
-                        .hint_text("Save path (opt.)"),
-                )
-                .on_hover_text(
-                    "Optional save file or folder path for PNG/SVG export; leave blank for an unpredictable 0600 CSPRNG temp file",
-                );
-            });
-
-            // Control strip 2: Quantitative Putty / Colormap Track + Ensemble & Z-Slab sliders
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Color:");
                 egui::ComboBox::from_id_salt("mol3d_track_combo")
                     .selected_text(self.track_data.active_track.label())
                     .width(150.0)
@@ -5595,22 +5642,6 @@ impl Mol3dViewerPanel {
                         }
                     });
 
-                if !self.track_data.active_track.uses_semantic_palette() {
-                    egui::ComboBox::from_id_salt("mol3d_cmap_combo")
-                        .selected_text(self.track_data.colormap.label())
-                        .width(112.0)
-                        .show_ui(ui, |ui| {
-                            for cm in ColormapKind::ALL {
-                                if ui
-                                    .selectable_value(&mut self.track_data.colormap, cm, cm.label())
-                                    .changed()
-                                {
-                                    self.putty_only_dirty = true;
-                                }
-                            }
-                        });
-                }
-
                 if ui
                     .checkbox(&mut self.track_data.putty_enabled, "Putty")
                     .on_hover_text("Scale ribbon tube radius by the active quantitative NMR track")
@@ -5619,90 +5650,293 @@ impl Mol3dViewerPanel {
                     self.putty_only_dirty = true;
                 }
 
-                if self.ensemble.as_ref().is_some_and(|e| e.models.len() > 1) {
-                    if ui
-                        .checkbox(&mut self.scene_cfg.show_all_ensemble_models, "Bundle")
-                        .changed()
-                    {
-                        self.scene_dirty = true;
-                    }
-                    if self.scene_cfg.show_all_ensemble_models
-                        && ui
-                            .add(
-                                egui::Slider::new(
-                                    &mut self.scene_cfg.ensemble_bundle_opacity,
-                                    0.08..=0.85,
-                                )
-                                .text("α"),
+                if ui
+                    .button("Fit")
+                    .on_hover_text("Reset view & Z-slab around loaded structure")
+                    .clicked()
+                {
+                    self.reset_camera();
+                }
+            });
+
+            egui::CollapsingHeader::new("Advanced")
+                .id_salt("mol3d_advanced_controls")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let proj_btn = match self.camera.projection {
+                            ProjectionMode::Perspective => "Persp",
+                            ProjectionMode::Orthographic => "Ortho",
+                        };
+                        if ui
+                            .button(proj_btn)
+                            .on_hover_text("Toggle Perspective / Orthographic camera projection")
+                            .clicked()
+                        {
+                            self.camera.projection = match self.camera.projection {
+                                ProjectionMode::Perspective => ProjectionMode::Orthographic,
+                                ProjectionMode::Orthographic => ProjectionMode::Perspective,
+                            };
+                        }
+                        if ui
+                            .button("Paste PDB/CIF")
+                            .on_hover_text("Paste .pdb / .cif coordinates or NOE/PRE restraints")
+                            .clicked()
+                        {
+                            self.show_paste_modal = !self.show_paste_modal;
+                        }
+                        let mut treat_bfac = self.treat_bfactors_as_plddt;
+                        if ui
+                            .checkbox(&mut treat_bfac, "Treat B-factors as pLDDT")
+                            .on_hover_text(
+                                "Explicitly opt in to reading B_iso/tempFactor columns as pLDDT on experimental or unknown coordinate files",
                             )
                             .changed()
-                    {
-                        self.scene_dirty = true;
+                        {
+                            self.set_treat_bfactors_as_plddt(treat_bfac);
+                        }
+
+                        if !self.track_data.active_track.uses_semantic_palette() {
+                            egui::ComboBox::from_id_salt("mol3d_cmap_combo")
+                                .selected_text(self.track_data.colormap.label())
+                                .width(112.0)
+                                .show_ui(ui, |ui| {
+                                    for cm in ColormapKind::ALL {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.track_data.colormap,
+                                                cm,
+                                                cm.label(),
+                                            )
+                                            .changed()
+                                        {
+                                            self.putty_only_dirty = true;
+                                        }
+                                    }
+                                });
+                        }
+
+                        if self.ensemble.as_ref().is_some_and(|e| e.models.len() > 1) {
+                            if ui
+                                .checkbox(&mut self.scene_cfg.show_all_ensemble_models, "Bundle")
+                                .changed()
+                            {
+                                self.scene_dirty = true;
+                            }
+                            if self.scene_cfg.show_all_ensemble_models
+                                && ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut self.scene_cfg.ensemble_bundle_opacity,
+                                            0.08..=0.85,
+                                        )
+                                        .text("Alpha"),
+                                    )
+                                    .changed()
+                            {
+                                self.scene_dirty = true;
+                            }
+                        }
+
+                        ui.label("Slab:");
+                        let mut near_f = self.camera.slab_near_offset as f32;
+                        let mut far_f = self.camera.slab_far_offset as f32;
+                        if ui
+                            .add(egui::DragValue::new(&mut near_f).speed(0.5).prefix("N "))
+                            .changed()
+                        {
+                            self.camera.slab_near_offset =
+                                (near_f as f64).min(self.camera.slab_far_offset - 1.0);
+                        }
+                        if ui
+                            .add(egui::DragValue::new(&mut far_f).speed(0.5).prefix("F "))
+                            .changed()
+                        {
+                            self.camera.slab_far_offset =
+                                (far_f as f64).max(self.camera.slab_near_offset + 1.0);
+                        }
+                    });
+
+                    ui.horizontal_wrapped(|ui| {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if ui
+                            .button("PNG")
+                            .on_hover_text(
+                                "Export high-DPI offscreen 4x MSAA PNG snapshot (atomic CSPRNG temp file or custom save path)",
+                            )
+                            .clicked()
+                        {
+                            if let Some(rs) = wgpu_render_state {
+                                let mut renderer = rs.renderer.write();
+                                if let Some(res) = renderer
+                                    .callback_resources
+                                    .get_mut::<Mol3dPipelineResource>()
+                                {
+                                    self.flush_pending_updates();
+                                    let uni = self.camera.to_gpu_uniforms(1600.0, 1200.0, DEFAULT_BG_RGBA);
+                                    match res.export_offscreen_png(
+                                        &rs.device,
+                                        &rs.queue,
+                                        1600,
+                                        1200,
+                                        &uni,
+                                        &self.scene,
+                                    ) {
+                                        Ok(png) => {
+                                            let user_target = {
+                                                let t = self.custom_export_path.trim();
+                                                (!t.is_empty()).then(|| std::path::PathBuf::from(t))
+                                            };
+                                            match save_mol3d_snapshot(
+                                                user_target.as_deref(),
+                                                &png,
+                                                "png",
+                                                "PNG",
+                                            ) {
+                                                Ok(out_path) => {
+                                                    self.status_banner = format!(
+                                                        "Exported 1600x1200 PNG ({})",
+                                                        out_path.display()
+                                                    );
+                                                    self.last_exported_path = Some(out_path);
+                                                    self.last_exported_png_bytes = Some(png);
+                                                }
+                                                Err(err) => {
+                                                    self.status_banner = err;
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            self.status_banner = format!("PNG export failed: {err}");
+                                        }
+                                    }
+                                } else {
+                                    self.status_banner =
+                                        "PNG export failed: 3D GPU pipeline unavailable".to_string();
+                                }
+                            } else {
+                                self.status_banner =
+                                    "PNG export failed: WebGPU render state unavailable".to_string();
+                            }
+                        }
+
+                        if ui
+                            .button("SVG")
+                            .on_hover_text(
+                                "Export deterministic XML-escaped vector SVG (atomic CSPRNG temp file or custom save path)",
+                            )
+                            .clicked()
+                        {
+                            if let Some(ens) = self.ensemble.as_ref() {
+                                let svg = export_structure_svg(
+                                    ens,
+                                    &self.camera,
+                                    &self.scene_cfg,
+                                    &self.track_data,
+                                    Some(&self.restraint_overlay),
+                                    1200,
+                                    900,
+                                );
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    let user_target = {
+                                        let t = self.custom_export_path.trim();
+                                        (!t.is_empty()).then(|| std::path::PathBuf::from(t))
+                                    };
+                                    match save_mol3d_snapshot(
+                                        user_target.as_deref(),
+                                        svg.as_bytes(),
+                                        "svg",
+                                        "SVG",
+                                    ) {
+                                        Ok(out_path) => {
+                                            ui.ctx().copy_text(svg.clone());
+                                            self.status_banner = format!(
+                                                "Exported vector SVG ({}, copied to clipboard).",
+                                                out_path.display()
+                                            );
+                                            self.last_exported_path = Some(out_path);
+                                            self.last_exported_svg = Some(svg);
+                                        }
+                                        Err(err) => {
+                                            self.status_banner = err;
+                                        }
+                                    }
+                                }
+                                #[cfg(target_arch = "wasm32")]
+                                {
+                                    ui.ctx().copy_text(svg.clone());
+                                    self.last_exported_svg = Some(svg);
+                                    self.status_banner =
+                                        "Exported vector SVG (copied to clipboard).".to_string();
+                                }
+                            }
+                        }
+
+                        #[cfg(not(target_arch = "wasm32"))]
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.custom_export_path)
+                                .desired_width(135.0)
+                                .hint_text("Save path (opt.)"),
+                        )
+                        .on_hover_text(
+                            "Optional save file or folder path for PNG/SVG export; leave blank for an unpredictable 0600 CSPRNG temp file",
+                        );
+                    });
+
+                    if !self.restraints.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .checkbox(&mut self.restraint_filter.enabled, "NOE/PRE")
+                                .changed()
+                            {
+                                self.restraints_only_dirty = true;
+                            }
+                            let sat_lbl =
+                                format!("Sat ({})", self.restraint_overlay.satisfied_count);
+                            let min_lbl = format!(
+                                "<0.5Å ({})",
+                                self.restraint_overlay.minor_violation_count
+                            );
+                            let maj_lbl = format!(
+                                "≥0.5Å ({})",
+                                self.restraint_overlay.major_violation_count
+                            );
+                            if ui
+                                .checkbox(&mut self.restraint_filter.show_satisfied, sat_lbl)
+                                .changed()
+                                || ui
+                                    .checkbox(&mut self.restraint_filter.show_minor, min_lbl)
+                                    .changed()
+                                || ui
+                                    .checkbox(&mut self.restraint_filter.show_major, maj_lbl)
+                                    .changed()
+                                || ui
+                                    .checkbox(
+                                        &mut self.restraint_filter.selected_residue_only,
+                                        "Sel Only",
+                                    )
+                                    .changed()
+                            {
+                                self.restraints_only_dirty = true;
+                            }
+                            if self.restraint_overlay.unresolved_count > 0 {
+                                ui.small(format!(
+                                    "RMS {:.2} Å | Max {:.2} Å | Unresolved: {}",
+                                    self.restraint_overlay.rms_violation_angstrom,
+                                    self.restraint_overlay.max_violation_angstrom,
+                                    self.restraint_overlay.unresolved_count
+                                ));
+                            } else {
+                                ui.small(format!(
+                                    "RMS {:.2} Å | Max {:.2} Å",
+                                    self.restraint_overlay.rms_violation_angstrom,
+                                    self.restraint_overlay.max_violation_angstrom
+                                ));
+                            }
+                        });
                     }
-                }
-
-                ui.label("Slab:");
-                let mut near_f = self.camera.slab_near_offset as f32;
-                let mut far_f = self.camera.slab_far_offset as f32;
-                if ui
-                    .add(egui::DragValue::new(&mut near_f).speed(0.5).prefix("N "))
-                    .changed()
-                {
-                    self.camera.slab_near_offset =
-                        (near_f as f64).min(self.camera.slab_far_offset - 1.0);
-                }
-                if ui
-                    .add(egui::DragValue::new(&mut far_f).speed(0.5).prefix("F "))
-                    .changed()
-                {
-                    self.camera.slab_far_offset =
-                        (far_f as f64).max(self.camera.slab_near_offset + 1.0);
-                }
-            });
-        }
-
-        // Control strip 3: NOE/PRE Restraints filter bar when restraints are loaded
-        if !self.restraints.is_empty() && (!is_compact_mobile || self.show_mobile_options) {
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .checkbox(&mut self.restraint_filter.enabled, "NOE/PRE")
-                    .changed()
-                {
-                    self.restraints_only_dirty = true;
-                }
-                let sat_lbl = format!("Sat ({})", self.restraint_overlay.satisfied_count);
-                let min_lbl = format!("<0.5Å ({})", self.restraint_overlay.minor_violation_count);
-                let maj_lbl = format!("≥0.5Å ({})", self.restraint_overlay.major_violation_count);
-                if ui
-                    .checkbox(&mut self.restraint_filter.show_satisfied, sat_lbl)
-                    .changed()
-                    || ui
-                        .checkbox(&mut self.restraint_filter.show_minor, min_lbl)
-                        .changed()
-                    || ui
-                        .checkbox(&mut self.restraint_filter.show_major, maj_lbl)
-                        .changed()
-                    || ui
-                        .checkbox(&mut self.restraint_filter.selected_residue_only, "Sel Only")
-                        .changed()
-                {
-                    self.restraints_only_dirty = true;
-                }
-                if self.restraint_overlay.unresolved_count > 0 {
-                    ui.small(format!(
-                        "RMS {:.2} Å | Max {:.2} Å | Unresolved: {}",
-                        self.restraint_overlay.rms_violation_angstrom,
-                        self.restraint_overlay.max_violation_angstrom,
-                        self.restraint_overlay.unresolved_count
-                    ));
-                } else {
-                    ui.small(format!(
-                        "RMS {:.2} Å | Max {:.2} Å",
-                        self.restraint_overlay.rms_violation_angstrom,
-                        self.restraint_overlay.max_violation_angstrom
-                    ));
-                }
-            });
+                });
         }
 
         if self.show_paste_modal {
@@ -5755,6 +5989,50 @@ impl Mol3dViewerPanel {
         if !ui.input(|i| i.pointer.any_down()) {
             self.suppress_single_drag_until_release = false;
         }
+        if response.secondary_clicked() {
+            self.secondary_drag_accum = 0.0;
+        }
+        if response.dragged_by(egui::PointerButton::Secondary) {
+            self.secondary_drag_accum += response.drag_delta().length();
+        }
+        if response.double_clicked() {
+            self.reset_camera();
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.clear_selection();
+        }
+        response.context_menu(|ui| {
+            if self.secondary_drag_accum >= 5.0 {
+                ui.close();
+                return;
+            }
+            ui.set_min_width(196.0);
+            if ui.button("Reset Camera").clicked() {
+                self.reset_camera();
+                ui.close();
+            }
+            if ui.button("Cycle Color Track").clicked() {
+                self.cycle_color_track();
+                ui.close();
+            }
+            if ui.button("Toggle Putty Radius").clicked() {
+                self.track_data.putty_enabled = !self.track_data.putty_enabled;
+                self.putty_only_dirty = true;
+                ui.close();
+            }
+            if ui.button("Clear Selection").clicked() {
+                self.clear_selection();
+                ui.close();
+            }
+            ui.separator();
+            let mut treat_bfac = self.treat_bfactors_as_plddt;
+            if ui
+                .checkbox(&mut treat_bfac, "Treat B-factors as pLDDT")
+                .changed()
+            {
+                self.set_treat_bfactors_as_plddt(treat_bfac);
+            }
+        });
 
         // Two-finger multi-touch pinch-to-zoom & translation pan (isolated from 1-finger orbit)
         let multi_touch_active = if let Some(mt) = ui.ctx().input(|i| i.multi_touch()) {
@@ -5874,6 +6152,18 @@ impl Mol3dViewerPanel {
             ui.small(&self.status_banner);
         }
         emitted_sync
+    }
+
+    /// Alias for [`Self::ui`] matching standard panel `show(...)` conventions.
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        wgpu_render_state: Option<&egui_wgpu::RenderState>,
+        nmr_seq: &[String],
+        nmr_seq_ids: &[i32],
+        ref_data: Option<&Reference>,
+    ) -> Option<Mol3dSyncAction> {
+        self.ui(ui, wgpu_render_state, nmr_seq, nmr_seq_ids, ref_data)
     }
 }
 
@@ -6287,5 +6577,131 @@ END
         let io_err = write_mol3d_export_file(&bad_dir_path, b"PNG", "PNG")
             .expect_err("writing into nonexistent parent directory must propagate I/O error");
         assert!(io_err.contains("PNG export failed"), "got: {io_err}");
+    }
+
+    #[test]
+    fn p0_2_fail_closed_provenance_remark_headerless_qmeandisco_and_constant_bfactors() {
+        // (a) Crystal PDB with `REMARK 3 ALPHAFOLD` and `B <= 100` -> ExperimentalCrystallography (`plddt: None`)
+        let crystal_with_af_remark = "\
+HEADER    OXIDOREDUCTASE                          01-JAN-24   9XYZ
+TITLE     CRYSTAL STRUCTURE SOLVED BY MOLECULAR REPLACEMENT WITH ALPHAFOLD
+EXPDTA    X-RAY DIFFRACTION
+REMARK   3  MOLECULAR REPLACEMENT SEARCH MODEL: ALPHAFOLD MONOMER V2
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 18.40           N
+ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00 19.20           C
+ATOM      3  C   ALA A   1       2.009   1.420   0.000  1.00 20.10           C
+ATOM      4  O   ALA A   1       1.251   2.390   0.000  1.00 22.50           O
+ATOM      5  N   GLY A   2       3.325   1.540   0.000  1.00 26.80           N
+ATOM      6  CA  GLY A   2       3.970   2.845   0.000  1.00 31.40           C
+END
+";
+        let ens_xray =
+            parse_pdb_ensemble(crystal_with_af_remark).expect("crystal PDB with AF remark parses");
+        assert_eq!(
+            ens_xray.provenance,
+            StructureProvenance::ExperimentalCrystallography
+        );
+        assert!(ens_xray.per_residue_plddt.is_none());
+        assert!(require_predicted_model(&ens_xray, false).is_err());
+        assert!(ens_xray.require_predicted_model(false).is_err());
+        assert!(require_predicted_model(&ens_xray, true).is_ok());
+
+        // (b) Headerless ATOM-only PDB -> Unknown (`plddt: None`)
+        let headerless_pdb = "\
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 84.50           N
+ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00 84.50           C
+ATOM      3  N   GLY A   2       3.325   1.540   0.000  1.00 91.20           N
+ATOM      4  CA  GLY A   2       3.970   2.845   0.000  1.00 91.20           C
+END
+";
+        let ens_hdrless = parse_pdb_ensemble(headerless_pdb).expect("headerless PDB parses");
+        assert_eq!(ens_hdrless.provenance, CoordinateProvenance::Unknown);
+        assert!(ens_hdrless.per_residue_plddt.is_none());
+        assert!(require_predicted_model(&ens_hdrless, false).is_err());
+        assert!(require_predicted_model(&ens_hdrless, true).is_ok());
+
+        // Explicit opt-in (`parse_pdb_ensemble_with_plddt_override(..., true)`) extracts B-factors
+        let ens_opt_in = parse_pdb_ensemble_with_plddt_override(headerless_pdb, true)
+            .expect("explicit opt-in PDB parses");
+        assert_eq!(
+            ens_opt_in.provenance,
+            StructureProvenance::ComputationalModel
+        );
+        assert_eq!(ens_opt_in.per_residue_plddt.as_ref().map(Vec::len), Some(2));
+        assert!(require_predicted_model(&ens_opt_in, false).is_ok());
+
+        // (c) mmCIF with `_ma_qa_metric` = `QMEANDisCo` is rejected as pLDDT
+        let qmean_cif = "\
+data_MODEL_QMEAN
+_struct.title 'ALPHAFOLD HOMOLOGY MODEL'
+loop_
+_ma_qa_metric.id
+_ma_qa_metric.name
+_ma_qa_metric.mode
+_ma_qa_metric.type
+1 QMEANDisCo local distance
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.B_iso_or_equiv
+ATOM 1 CA ALA A 1 0.000 0.000 0.000 0.78
+ATOM 2 CA GLY A 2 3.800 0.000 0.000 0.64
+loop_
+_ma_qa_metric_local.label_asym_id
+_ma_qa_metric_local.label_seq_id
+_ma_qa_metric_local.label_comp_id
+_ma_qa_metric_local.metric_id
+_ma_qa_metric_local.metric_value
+A 1 ALA 1 0.78
+A 2 GLY 1 0.64
+";
+        let ens_qmean = parse_mmcif_ensemble(qmean_cif).expect("QMEANDisCo mmCIF parses");
+        assert!(
+            ens_qmean.per_residue_plddt.is_none(),
+            "QMEANDisCo local metric must NOT be accepted as pLDDT"
+        );
+        assert!(require_predicted_model(&ens_qmean, false).is_err());
+        assert!(require_predicted_model(&ens_qmean, true).is_ok());
+
+        // (d) `AF-*` mmCIF with constant `B = 0.0` or constant `B = 0.5` is rejected as pLDDT
+        for const_b in ["0.00", "0.50"] {
+            let const_af_cif = format!(
+                "\
+data_AF-P0CG48-F1
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.B_iso_or_equiv
+ATOM 1 CA MET A 1 0.000 0.000 0.000 {const_b}
+ATOM 2 CA GLN A 2 3.800 0.000 0.000 {const_b}
+ATOM 3 CA ILE A 3 7.600 0.000 0.000 {const_b}
+"
+            );
+            let ens_const =
+                parse_mmcif_ensemble(&const_af_cif).expect("constant-B AF mmCIF parses");
+            assert!(
+                ens_const.per_residue_plddt.is_none(),
+                "constant B={const_b} must be rejected as pLDDT"
+            );
+            assert!(require_predicted_model(&ens_const, false).is_err());
+            assert!(
+                require_predicted_model(&ens_const, true).is_err(),
+                "constant B={const_b} must remain rejected even when treat_as_model=true"
+            );
+        }
     }
 }

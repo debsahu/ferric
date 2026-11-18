@@ -248,6 +248,7 @@ pub struct DynamicsStudioPanel {
     pub csp_trajectories: Vec<ResidueCspTrajectory>,
     pub csp_fit: Option<CspGlobalFitResult>,
     pub csp_threshold: Option<TrimmedCspThresholds>,
+    pub last_canvas_rect: Option<egui::Rect>,
 }
 
 impl Default for DynamicsStudioPanel {
@@ -268,6 +269,7 @@ impl Default for DynamicsStudioPanel {
             csp_trajectories: Vec::new(),
             csp_fit: None,
             csp_threshold: None,
+            last_canvas_rect: None,
         }
     }
 }
@@ -775,6 +777,7 @@ impl DynamicsStudioPanel {
     pub fn show(&mut self, ui: &mut egui::Ui) -> DynamicsStudioOutput {
         let mut output = DynamicsStudioOutput::default();
 
+        // Primary Toolbar (<= 8 visible primary interactive controls)
         ui.horizontal_wrapped(|ui| {
             for tab in DynamicsStudioTab::ALL {
                 if ui
@@ -785,54 +788,46 @@ impl DynamicsStudioPanel {
                 }
             }
             ui.separator();
-            ui.checkbox(&mut self.putty_enabled, "Putty tube");
-            egui::ComboBox::from_id_salt("dyn_studio_cmap")
-                .selected_text(self.overlay_colormap.label())
-                .show_ui(ui, |ui| {
-                    for cmap in ColormapKind::ALL {
-                        ui.selectable_value(&mut self.overlay_colormap, cmap, cmap.label());
+
+            let default_track = match self.active_tab {
+                DynamicsStudioTab::RelaxationModelFree => {
+                    if self.active_relax_metric == SequenceMetricKind::ExchangeRex {
+                        QuantitativeTrack::ChemicalExchangeRex
+                    } else {
+                        QuantitativeTrack::LipariSzaboS2
                     }
-                });
-
-            let s2_avail = self.relaxation_records.iter().any(|r| r.s2.is_some());
+                }
+                DynamicsStudioTab::CestDest | DynamicsStudioTab::CpmgDispersion => {
+                    QuantitativeTrack::ChemicalExchangeRex
+                }
+                DynamicsStudioTab::LigandCsp => QuantitativeTrack::LigandCsp,
+            };
+            let proj_avail = match default_track {
+                QuantitativeTrack::LipariSzaboS2 => {
+                    self.relaxation_records.iter().any(|r| r.s2.is_some())
+                }
+                QuantitativeTrack::ChemicalExchangeRex => {
+                    self.relaxation_records
+                        .iter()
+                        .any(|r| r.rex_s_inv.is_some())
+                        || !self.cpmg_series.is_empty()
+                }
+                QuantitativeTrack::LigandCsp => !self.csp_trajectories.is_empty(),
+                _ => false,
+            };
             if ui
-                .add_enabled(s2_avail, egui::Button::new("Project S² -> 3D"))
-                .on_hover_text("Project Lipari–Szabo S² order parameters onto 3D structure putty")
+                .add_enabled(proj_avail, egui::Button::new("Project -> 3D Putty"))
+                .on_hover_text("Project active quantitative dynamics/CSP metric onto 3D structure putty")
                 .clicked()
             {
-                output.overlay_projection =
-                    self.build_overlay_projection(QuantitativeTrack::LipariSzaboS2);
-            }
-
-            let rex_avail = self
-                .relaxation_records
-                .iter()
-                .any(|r| r.rex_s_inv.is_some())
-                || !self.cpmg_series.is_empty();
-            if ui
-                .add_enabled(rex_avail, egui::Button::new("Project R_ex -> 3D"))
-                .on_hover_text("Project conformational exchange R_ex onto 3D structure putty")
-                .clicked()
-            {
-                output.overlay_projection =
-                    self.build_overlay_projection(QuantitativeTrack::ChemicalExchangeRex);
-            }
-
-            let csp_avail = !self.csp_trajectories.is_empty();
-            if ui
-                .add_enabled(csp_avail, egui::Button::new("Project CSP -> 3D"))
-                .on_hover_text("Project ligand titration Δδ_comb onto 3D structure putty")
-                .clicked()
-            {
-                output.overlay_projection =
-                    self.build_overlay_projection(QuantitativeTrack::LigandCsp);
+                output.overlay_projection = self.build_overlay_projection(default_track);
             }
 
             if (self.cest_profiles.is_empty()
                 || self.cpmg_series.is_empty()
                 || self.csp_trajectories.is_empty())
                 && ui
-                    .small_button("Load Demo CEST / CPMG / CSP")
+                    .button("Load Demo CEST / CPMG / CSP")
                     .on_hover_text(
                         "Populate synthetic dual-B1 CEST, multi-field Baldwin2014 CPMG, and tight-binding CSP Kd curves",
                     )
@@ -841,7 +836,64 @@ impl DynamicsStudioPanel {
                 let _ = self.ensure_demo_exchange_and_csp(&[], &[]);
             }
         });
+
+        // Progressive-disclosure Advanced Fitting & Export section (collapsed by default)
+        egui::CollapsingHeader::new(egui::RichText::new("Advanced Fitting & Export").size(12.5))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.putty_enabled, "Putty tube");
+                    egui::ComboBox::from_id_salt("dyn_studio_cmap")
+                        .selected_text(self.overlay_colormap.label())
+                        .show_ui(ui, |ui| {
+                            for cmap in ColormapKind::ALL {
+                                ui.selectable_value(&mut self.overlay_colormap, cmap, cmap.label());
+                            }
+                        });
+
+                    let s2_avail = self.relaxation_records.iter().any(|r| r.s2.is_some());
+                    if ui
+                        .add_enabled(s2_avail, egui::Button::new("Project S^2 -> 3D"))
+                        .clicked()
+                    {
+                        output.overlay_projection =
+                            self.build_overlay_projection(QuantitativeTrack::LipariSzaboS2);
+                    }
+
+                    let rex_avail = self
+                        .relaxation_records
+                        .iter()
+                        .any(|r| r.rex_s_inv.is_some())
+                        || !self.cpmg_series.is_empty();
+                    if ui
+                        .add_enabled(rex_avail, egui::Button::new("Project R_ex -> 3D"))
+                        .clicked()
+                    {
+                        output.overlay_projection =
+                            self.build_overlay_projection(QuantitativeTrack::ChemicalExchangeRex);
+                    }
+
+                    let csp_avail = !self.csp_trajectories.is_empty();
+                    if ui
+                        .add_enabled(csp_avail, egui::Button::new("Project CSP -> 3D"))
+                        .clicked()
+                    {
+                        output.overlay_projection =
+                            self.build_overlay_projection(QuantitativeTrack::LigandCsp);
+                    }
+
+                    if self.active_tab == DynamicsStudioTab::LigandCsp {
+                        ui.checkbox(
+                            &mut self.show_naive_mm_comparison,
+                            "Overlay naive [L]_free ~ [L]_t curve",
+                        );
+                    }
+                });
+            });
+
         ui.separator();
+
+        self.last_canvas_rect = Some(ui.available_rect_before_wrap().intersect(ui.clip_rect()));
 
         match self.active_tab {
             DynamicsStudioTab::RelaxationModelFree => {
@@ -863,18 +915,26 @@ impl DynamicsStudioPanel {
 
     fn render_relaxation_tab(&mut self, ui: &mut egui::Ui, output: &mut DynamicsStudioOutput) {
         ui.horizontal_wrapped(|ui| {
-            ui.label("Sequence Track:");
-            for m in SequenceMetricKind::RELAX_METRICS {
-                if ui
-                    .selectable_label(self.active_relax_metric == m, m.label())
-                    .clicked()
-                {
-                    self.active_relax_metric = m;
-                }
-            }
+            ui.label(egui::RichText::new("Sequence Track:").size(12.5));
+            egui::ComboBox::from_id_salt("dyn_relax_metric_combo")
+                .selected_text(self.active_relax_metric.label())
+                .show_ui(ui, |ui| {
+                    for m in SequenceMetricKind::RELAX_METRICS {
+                        ui.selectable_value(&mut self.active_relax_metric, m, m.label());
+                    }
+                });
             ui.separator();
-            ui.selectable_value(&mut self.show_r2_decay, false, "R1 Decay Curve");
-            ui.selectable_value(&mut self.show_r2_decay, true, "R2 Decay Curve");
+            let decay_lbl = if self.show_r2_decay {
+                "R2 Decay Curve"
+            } else {
+                "R1 Decay Curve"
+            };
+            egui::ComboBox::from_id_salt("dyn_relax_decay_combo")
+                .selected_text(decay_lbl)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.show_r2_decay, false, "R1 Decay Curve");
+                    ui.selectable_value(&mut self.show_r2_decay, true, "R2 Decay Curve");
+                });
         });
 
         if self.relaxation_records.is_empty() {
@@ -1314,21 +1374,18 @@ impl DynamicsStudioPanel {
             return;
         }
 
-        ui.horizontal_wrapped(|ui| {
-            if let Some(fit) = &self.csp_fit {
-                ui.label(format!(
-                    "Global Quadratic Tight-Binding Kd = {:.2} µM (95% CI [{:.2}, {:.2}] µM)  |  Naive MM Kd = {:.2} µM",
+        if let Some(fit) = &self.csp_fit {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Global Quadratic Tight-Binding Kd = {:.2} uM (95% CI [{:.2}, {:.2}] uM)  |  Naive MM Kd = {:.2} uM",
                     fit.global_kd_um,
                     fit.global_kd_ci95_low_um,
                     fit.global_kd_ci95_high_um,
                     fit.global_naive_mm_kd_um,
-                ));
-            }
-            ui.checkbox(
-                &mut self.show_naive_mm_comparison,
-                "Overlay naive [L]_free ≈ [L]_t curve",
+                ))
+                .size(12.5),
             );
-        });
+        }
 
         let mut hlines = Vec::new();
         let thresh_2s = self
@@ -1500,7 +1557,8 @@ fn draw_sequence_bar_plot(
     horiz_thresholds: &[(f64, egui::Color32)],
     default_bar_col: egui::Color32,
 ) -> Option<i32> {
-    let desired = egui::vec2(ui.available_width().max(260.0), 145.0);
+    let bar_h = (ui.available_height() * 0.42).max(165.0);
+    let desired = egui::vec2(ui.available_width().max(260.0), bar_h);
     let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
 
@@ -1621,7 +1679,7 @@ fn draw_sequence_bar_plot(
                 egui::pos2(cx, plot.bottom() + 4.0),
                 egui::Align2::CENTER_TOP,
                 format!("{}", b.seq_id),
-                egui::FontId::monospace(9.5),
+                egui::FontId::monospace(11.0),
                 egui::Color32::from_rgb(148, 163, 184),
             );
         }
@@ -1631,20 +1689,20 @@ fn draw_sequence_bar_plot(
         egui::pos2(rect.left() + 8.0, rect.top() + 4.0),
         egui::Align2::LEFT_TOP,
         y_label,
-        egui::FontId::proportional(11.5),
+        egui::FontId::proportional(12.5),
         egui::Color32::from_rgb(226, 232, 240),
     );
     painter.text(
         egui::pos2(plot.left() - 4.0, plot.top()),
         egui::Align2::RIGHT_TOP,
         format!("{:.2}", y_min + y_span),
-        egui::FontId::monospace(9.5),
+        egui::FontId::monospace(11.0),
         egui::Color32::from_rgb(148, 163, 184),
     );
 
     if let Some(h) = hovered_entry {
         response.on_hover_text(format!(
-            "{}{} : {:.4} ± {:.4}",
+            "{}{} : {:.4} +- {:.4}",
             h.res_name, h.seq_id, h.value, h.err
         ));
     }
@@ -1666,7 +1724,8 @@ fn draw_xy_curve_canvas(
     vert_guides: &[(f64, egui::Color32)],
     invert_x: bool,
 ) {
-    let desired = egui::vec2(ui.available_width().max(260.0), 190.0);
+    let curve_h = (ui.available_height() - 4.0).max(205.0);
+    let desired = egui::vec2(ui.available_width().max(260.0), curve_h);
     let (rect, _resp) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
@@ -1781,28 +1840,28 @@ fn draw_xy_curve_canvas(
         egui::pos2(rect.left() + 8.0, rect.top() + 4.0),
         egui::Align2::LEFT_TOP,
         title,
-        egui::FontId::proportional(11.5),
+        egui::FontId::proportional(12.5),
         egui::Color32::from_rgb(226, 232, 240),
     );
     painter.text(
         egui::pos2(plot.center().x, rect.bottom() - 3.0),
         egui::Align2::CENTER_BOTTOM,
         format!("{x_label}   [{y_label}]"),
-        egui::FontId::monospace(9.5),
+        egui::FontId::monospace(11.0),
         egui::Color32::from_rgb(148, 163, 184),
     );
     painter.text(
         egui::pos2(plot.left() - 4.0, plot.top()),
         egui::Align2::RIGHT_TOP,
         format!("{yb:.2}"),
-        egui::FontId::monospace(9.5),
+        egui::FontId::monospace(11.0),
         egui::Color32::from_rgb(148, 163, 184),
     );
     painter.text(
         egui::pos2(plot.left() - 4.0, plot.bottom()),
         egui::Align2::RIGHT_BOTTOM,
         format!("{ya:.2}"),
-        egui::FontId::monospace(9.5),
+        egui::FontId::monospace(11.0),
         egui::Color32::from_rgb(148, 163, 184),
     );
 }
@@ -2034,9 +2093,10 @@ mod tests {
         let ctx = egui::Context::default();
         for tab in DynamicsStudioTab::ALL {
             panel.active_tab = tab;
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
                 let _ = panel.show(ui);
             });
+            out.textures_delta.clear();
         }
 
         let decay = build_exponential_decay_curve(1.0, 2.0, 1.0, 10);

@@ -253,13 +253,13 @@ pub const SPECTRUM_ACCELERATORS: &[AcceleratorBinding] = &[
         action: WorkbenchAction::SelectCrosshairSliceMode,
     },
     AcceleratorBinding {
-        keys_label: "Space",
-        chord_pair: None,
+        keys_label: "xl",
+        chord_pair: Some(('x', 'l')),
         category: "Zoom & Navigation",
         title: "Toggle Crosshair Lock",
         description:
-            "Pin or unpin the synchronized (1H, 15N, 13C) frequency crosshair across views",
-        action: WorkbenchAction::ToggleCrosshairLock,
+            "Pin or unpin the synchronized (1H, 15N, 13C) frequency crosshair across views (Space holds to pan)",
+        action: WorkbenchAction::ToggleCrosshairLockChord,
     },
     // Contour Levels, Views & Pages
     AcceleratorBinding {
@@ -283,33 +283,33 @@ pub const SPECTRUM_ACCELERATORS: &[AcceleratorBinding] = &[
         keys_label: "ci",
         chord_pair: Some(('c', 'i')),
         category: "Spectrum & Contours",
-        title: "Raise Contour Floor / 1D Gain (×1.25)",
-        description: "Multiply contour threshold or 1D vertical gain by 1.25x (or press +)",
-        action: WorkbenchAction::RaiseContourFloor,
+        title: "Show More Signal (+, 1D gain x1.25 / 2D-3D floor / 1.25)",
+        description: "Increase 1D vertical gain by 1.25x or lower 2D/3D contour floor by 1.25x (or press +)",
+        action: WorkbenchAction::ShowMoreSignal,
     },
     AcceleratorBinding {
         keys_label: "cu",
         chord_pair: Some(('c', 'u')),
         category: "Spectrum & Contours",
-        title: "Contour Up / Raise Floor (×1.25)",
-        description: "Raise contour threshold or 1D vertical gain by 1.25x",
-        action: WorkbenchAction::RaiseContourFloor,
+        title: "Show More Signal (alias)",
+        description: "Increase 1D vertical gain by 1.25x or lower 2D/3D contour floor by 1.25x",
+        action: WorkbenchAction::ShowMoreSignal,
     },
     AcceleratorBinding {
         keys_label: "cb",
         chord_pair: Some(('c', 'b')),
         category: "Spectrum & Contours",
-        title: "Lower Contour Floor / 1D Gain (÷1.25)",
-        description: "Divide contour threshold or 1D vertical gain by 1.25x (or press -)",
-        action: WorkbenchAction::LowerContourFloor,
+        title: "Show Less Signal (-, 1D gain / 1.25 / 2D-3D floor x1.25)",
+        description: "Decrease 1D vertical gain by 1.25x or raise 2D/3D contour floor by 1.25x (or press -)",
+        action: WorkbenchAction::ShowLessSignal,
     },
     AcceleratorBinding {
         keys_label: "cd",
         chord_pair: Some(('c', 'd')),
         category: "Spectrum & Contours",
-        title: "Contour Down / Lower Floor (÷1.25)",
-        description: "Lower contour threshold or 1D vertical gain by 1.25x",
-        action: WorkbenchAction::LowerContourFloor,
+        title: "Show Less Signal (alias)",
+        description: "Decrease 1D vertical gain by 1.25x or raise 2D/3D contour floor by 1.25x",
+        action: WorkbenchAction::ShowLessSignal,
     },
     AcceleratorBinding {
         keys_label: "v1",
@@ -695,10 +695,11 @@ fn lookup_two_key_chord(prefix: char, second: char) -> Option<WorkbenchAction> {
         ('z', 'm') => Some(WorkbenchAction::SelectZoomBoxMode),
         ('m', 'v') => Some(WorkbenchAction::SelectPanMoveMode),
         ('x', 'h') => Some(WorkbenchAction::SelectCrosshairSliceMode),
+        ('x', 'l') => Some(WorkbenchAction::ToggleCrosshairLockChord),
         // Contour Levels, Views, Projections, 3D Planes & Pages
         ('c', 't') | ('v', 't') => Some(WorkbenchAction::OpenContourThresholdPopup),
-        ('c', 'i') | ('c', 'u') => Some(WorkbenchAction::RaiseContourFloor),
-        ('c', 'b') | ('c', 'd') => Some(WorkbenchAction::LowerContourFloor),
+        ('c', 'i') | ('c', 'u') => Some(WorkbenchAction::ShowMoreSignal),
+        ('c', 'b') | ('c', 'd') => Some(WorkbenchAction::ShowLessSignal),
         ('v', '1') | ('v', '2') => Some(WorkbenchAction::ToggleMarginalProjections),
         ('o', 'l') => Some(WorkbenchAction::OpenOverlayStackManager),
         ('n', 't') => Some(WorkbenchAction::NextWorkbookPage),
@@ -743,6 +744,8 @@ pub struct ChordDispatcher {
     pub cheat_sheet_open: bool,
     pub cheat_sheet_query: String,
     cheat_sheet_filter_id: Option<egui::Id>,
+    /// Single-letter 1D tool keys (`h/p/r/i/m/k`) queued on timeout or immediately for `h` (`UI-C1`).
+    pending_single_keys: Vec<char>,
 }
 
 impl Default for ChordDispatcher {
@@ -765,6 +768,7 @@ impl ChordDispatcher {
             cheat_sheet_open: false,
             cheat_sheet_query: String::new(),
             cheat_sheet_filter_id: None,
+            pending_single_keys: Vec::new(),
         }
     }
 
@@ -788,6 +792,21 @@ impl ChordDispatcher {
     /// Reset any pending half-chord back to [`ChordState::Idle`].
     pub fn reset(&mut self) {
         self.state = ChordState::Idle;
+        self.pending_single_keys.clear();
+    }
+
+    /// True when the chord FSM is currently [`ChordState::Idle`] (`UI-C1`).
+    #[inline]
+    pub const fn is_idle(&self) -> bool {
+        matches!(self.state, ChordState::Idle)
+    }
+
+    /// Drain single-letter 1D tool keys (`h`, `p`, `r`, `i`, `m`, `k`) ready to fire now (`UI-C1`).
+    ///
+    /// `p`, `r`, `i`, `m`, `k` are valid chord prefixes, so they are only emitted after their
+    /// chord window expires without a second key; `h` is not a prefix and fires immediately.
+    pub fn drain_single_key_tools(&mut self) -> Vec<char> {
+        std::mem::take(&mut self.pending_single_keys)
     }
 
     /// Expire any pending half-chord whose elapsed age exceeds `self.timeout_ms`.
@@ -801,6 +820,9 @@ impl ChordDispatcher {
         {
             if now_ms.saturating_sub(started_at_ms) > self.timeout_ms {
                 self.state = ChordState::Idle;
+                if matches!(prefix, 'p' | 'r' | 'i' | 'm' | 'k') {
+                    self.pending_single_keys.push(prefix);
+                }
                 return Some(prefix);
             }
         }
@@ -943,6 +965,15 @@ impl ChordDispatcher {
                             started_at_ms: now_ms,
                         };
                         ChordOutcome::PendingPrefix { prefix: lower }
+                    } else if lower == 'h' {
+                        self.pending_single_keys.push('h');
+                        if let Some(exp) = expired_prefix {
+                            ChordOutcome::ExpiredToIdle {
+                                expired_prefix: exp,
+                            }
+                        } else {
+                            ChordOutcome::UnboundKey
+                        }
                     } else if let Some(exp) = expired_prefix {
                         ChordOutcome::ExpiredToIdle {
                             expired_prefix: exp,
@@ -952,11 +983,12 @@ impl ChordDispatcher {
                     }
                 }
                 ChordKey::Space if !input.shift => {
-                    ChordOutcome::Dispatched(WorkbenchAction::ToggleCrosshairLock)
+                    // `Space` is reserved for hold-to-pan across every canvas (`UI-C5`).
+                    ChordOutcome::UnboundKey
                 }
-                ChordKey::Plus => ChordOutcome::Dispatched(WorkbenchAction::RaiseContourFloor),
+                ChordKey::Plus => ChordOutcome::Dispatched(WorkbenchAction::ShowMoreSignal),
                 ChordKey::Minus if !input.shift => {
-                    ChordOutcome::Dispatched(WorkbenchAction::LowerContourFloor)
+                    ChordOutcome::Dispatched(WorkbenchAction::ShowLessSignal)
                 }
                 ChordKey::CloseBracket | ChordKey::PageUp if !input.shift => {
                     ChordOutcome::Dispatched(WorkbenchAction::NextCubePlane)
@@ -1099,13 +1131,13 @@ impl ChordDispatcher {
         let mut window_open = self.cheat_sheet_open;
         let mut triggered: Option<WorkbenchAction> = None;
 
-        egui::Window::new("⌨ NMR Spectrum Keyboard Accelerators")
+        egui::Window::new("NMR Spectrum Keyboard and Mouse Shortcuts")
             .id(egui::Id::unique("nmr_keyboard_cheat_sheet_modal"))
             .open(&mut window_open)
             .collapsible(false)
             .resizable(true)
-            .default_width(620.0)
-            .default_height(460.0)
+            .default_width(640.0)
+            .default_height(480.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Filter:").strong());
@@ -1136,6 +1168,45 @@ impl ChordDispatcher {
                 egui::ScrollArea::vertical()
                     .id_salt("keyboard_cheat_sheet_scroll")
                     .show(ui, |ui| {
+                        let q = self.cheat_sheet_query.trim().to_ascii_lowercase();
+                        let gesture_hits: Vec<_> = crate::interaction_grammar::INTERACTION_GRAMMAR
+                            .iter()
+                            .filter(|g| {
+                                q.is_empty()
+                                    || g.input.to_ascii_lowercase().contains(&q)
+                                    || g.meaning.to_ascii_lowercase().contains(&q)
+                                    || g.views
+                                        .iter()
+                                        .any(|v| v.label().to_ascii_lowercase().contains(&q))
+                            })
+                            .collect();
+                        if !gesture_hits.is_empty() {
+                            ui.label(
+                                egui::RichText::new("Unified Mouse & Key Grammar (all views)")
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(135, 248, 205)),
+                            );
+                            ui.add_space(3.0);
+                            egui::Grid::new("cheat_sheet_grammar_grid")
+                                .striped(true)
+                                .min_col_width(84.0)
+                                .show(ui, |ui| {
+                                    ui.strong("Input");
+                                    ui.strong("Views");
+                                    ui.strong("Action");
+                                    ui.end_row();
+                                    for g in gesture_hits {
+                                        let vs: Vec<&str> =
+                                            g.views.iter().map(|v| v.label()).collect();
+                                        ui.monospace(egui::RichText::new(g.input).strong());
+                                        ui.label(egui::RichText::new(vs.join(", ")).size(11.0));
+                                        ui.label(egui::RichText::new(g.meaning).size(11.5));
+                                        ui.end_row();
+                                    }
+                                });
+                            ui.add_space(8.0);
+                            ui.separator();
+                        }
                         ui.label(
                             egui::RichText::new("Two-Key & Single-Key Spectrum Accelerators")
                                 .strong()

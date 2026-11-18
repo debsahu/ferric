@@ -85,6 +85,7 @@ pub struct RelaxPanelState {
     pub exported_tsv_preview: String,
     pub show_tsv_modal: bool,
     pub status_banner: String,
+    pub last_canvas_rect: Option<egui::Rect>,
 }
 
 impl Default for RelaxPanelState {
@@ -117,6 +118,7 @@ impl RelaxPanelState {
             status_banner:
                 "Load a relaxation series TSV/NEF or synthesize dual-field 600+800 MHz dynamics."
                     .to_string(),
+            last_canvas_rect: None,
         }
     }
 
@@ -623,16 +625,17 @@ impl RelaxPanelState {
             }
         }
 
-        // Top Toolbar
+        // Top Toolbar (<= 8 visible primary interactive controls)
         ui.horizontal_wrapped(|ui| {
-            ui.strong(
-                egui::RichText::new("📈 Relaxation (R₁ / R₂ / hetNOE) & Lipari–Szabo S²")
-                    .size(13.5),
+            ui.label(
+                egui::RichText::new("Relaxation (R1 / R2 / hetNOE) & Lipari-Szabo S^2")
+                    .size(15.0)
+                    .strong(),
             );
             ui.separator();
 
             if ui
-                .button("⚡ Demo 600+800 MHz")
+                .button("Demo 600+800 MHz")
                 .on_hover_text(
                     "Synthesize dual-field R1, R2 & hetNOE series, fit MC curves, and solve M1-M5",
                 )
@@ -644,16 +647,8 @@ impl RelaxPanelState {
                 }
             }
 
-            if ui
-                .button("📥 Paste Series TSV/NEF")
-                .on_hover_text("Import integrated relaxation series TSV or NEF v1.1 text")
-                .clicked()
-            {
-                self.show_paste_drawer = !self.show_paste_drawer;
-            }
-
             if (!self.r1_curves.is_empty() || !self.r2_curves.is_empty())
-                && ui.button("↻ Fit Curves").clicked()
+                && ui.button("Fit Curves").clicked()
             {
                 match self.refit_loaded_curves() {
                     Ok(msg) => actions.push(RelaxPanelAction::StatusMessage(msg)),
@@ -662,7 +657,7 @@ impl RelaxPanelState {
             }
 
             if (!self.r1_fits.is_empty() && !self.r2_fits.is_empty())
-                && ui.button("🧬 Run M1–M5").clicked()
+                && ui.button("Run M1-M5").clicked()
             {
                 match self.run_modelfree(pdb_text) {
                     Ok(msg) => actions.push(RelaxPanelAction::StatusMessage(msg)),
@@ -670,10 +665,21 @@ impl RelaxPanelState {
                 }
             }
 
+            let curve_lbl = match self.active_decay {
+                ActiveDecayView::R1 => "Curve: R1(tau)",
+                ActiveDecayView::R2 => "Curve: R2(tau)",
+            };
+            egui::ComboBox::from_id_salt("relax_panel_curve_view")
+                .selected_text(curve_lbl)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.active_decay, ActiveDecayView::R1, "R1(tau)");
+                    ui.selectable_value(&mut self.active_decay, ActiveDecayView::R2, "R2(tau)");
+                });
+
             if self.modelfree_result.is_some() {
                 if ui
-                    .button("🧊 Map S² → 3D Putty")
-                    .on_hover_text("Color & scale 3D PDB B-factor putty by Lipari-Szabo S²")
+                    .button("Map S^2 -> 3D Putty")
+                    .on_hover_text("Color & scale 3D PDB B-factor putty by Lipari-Szabo S^2")
                     .clicked()
                 {
                     if let Some(act) =
@@ -683,7 +689,7 @@ impl RelaxPanelState {
                     }
                 }
                 if ui
-                    .button("🔥 Map R_ex → 3D Putty")
+                    .button("Map R_ex -> 3D Putty")
                     .on_hover_text("Color & scale 3D PDB B-factor putty by chemical exchange R_ex")
                     .clicked()
                 {
@@ -693,74 +699,115 @@ impl RelaxPanelState {
                         actions.push(act);
                     }
                 }
-                if ui.small_button("📄 TSV").clicked() {
-                    self.show_tsv_modal = !self.show_tsv_modal;
-                }
             }
         });
 
-        // Parameter strip
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Curve:");
-            ui.selectable_value(&mut self.active_decay, ActiveDecayView::R1, "R₁(τ)");
-            ui.selectable_value(&mut self.active_decay, ActiveDecayView::R2, "R₂(τ)");
-            ui.separator();
-            ui.label("MC:");
-            ui.add(
-                egui::DragValue::new(&mut self.mc_replicates)
-                    .range(0..=2000)
-                    .speed(10),
-            );
-            ui.separator();
-            ui.label("Criterion:");
-            egui::ComboBox::from_id_salt("relax_panel_mf_crit")
-                .selected_text(format!("{:?}", self.criterion))
-                .width(82.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.criterion, ModelSelectionCriterion::Aic, "AIC");
-                    ui.selectable_value(&mut self.criterion, ModelSelectionCriterion::Aicc, "AICc");
-                    ui.selectable_value(&mut self.criterion, ModelSelectionCriterion::Bic, "BIC");
-                    ui.selectable_value(
-                        &mut self.criterion,
-                        ModelSelectionCriterion::PalmerFTest,
-                        "Palmer F-test",
-                    );
+        // Progressive-disclosure Advanced Fitting & Export section (collapsed by default)
+        egui::CollapsingHeader::new(egui::RichText::new("Advanced Fitting & Export").size(12.5))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Monte Carlo:").size(12.5));
+                        ui.add(
+                            egui::DragValue::new(&mut self.mc_replicates)
+                                .range(0..=2000)
+                                .speed(10),
+                        );
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Field 1 (MHz):").size(12.5));
+                        ui.add(
+                            egui::DragValue::new(&mut self.primary_field_mhz)
+                                .range(200.0..=1200.0)
+                                .speed(10.0)
+                                .fixed_decimals(1),
+                        );
+                    });
+                    ui.separator();
+                    ui.label(egui::RichText::new("Criterion:").size(12.5));
+                    egui::ComboBox::from_id_salt("relax_panel_mf_crit")
+                        .selected_text(format!("{:?}", self.criterion))
+                        .width(88.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.criterion,
+                                ModelSelectionCriterion::Aic,
+                                "AIC",
+                            );
+                            ui.selectable_value(
+                                &mut self.criterion,
+                                ModelSelectionCriterion::Aicc,
+                                "AICc",
+                            );
+                            ui.selectable_value(
+                                &mut self.criterion,
+                                ModelSelectionCriterion::Bic,
+                                "BIC",
+                            );
+                            ui.selectable_value(
+                                &mut self.criterion,
+                                ModelSelectionCriterion::PalmerFTest,
+                                "Palmer F-test",
+                            );
+                        });
+                    ui.label(egui::RichText::new("Diffusion / Tau_m:").size(12.5));
+                    egui::ComboBox::from_id_salt("relax_panel_diff_kind")
+                        .selected_text(format!("{:?}", self.diffusion_kind))
+                        .width(115.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.diffusion_kind,
+                                DiffusionTensorKind::Auto,
+                                "Auto (AIC)",
+                            );
+                            ui.selectable_value(
+                                &mut self.diffusion_kind,
+                                DiffusionTensorKind::Isotropic,
+                                "Isotropic",
+                            );
+                            ui.selectable_value(
+                                &mut self.diffusion_kind,
+                                DiffusionTensorKind::AxialSymmetric,
+                                "AxialSymmetric",
+                            );
+                            ui.selectable_value(
+                                &mut self.diffusion_kind,
+                                DiffusionTensorKind::FullyAnisotropic,
+                                "FullyAnisotropic",
+                            );
+                        });
+
+                    ui.separator();
+                    if ui
+                        .button("Paste Series TSV/NEF")
+                        .on_hover_text("Import integrated relaxation series TSV or NEF v1.1 text")
+                        .clicked()
+                    {
+                        self.show_paste_drawer = !self.show_paste_drawer;
+                    }
+                    if self.modelfree_result.is_some() && ui.button("Export TSV").clicked() {
+                        self.show_tsv_modal = !self.show_tsv_modal;
+                    }
                 });
-            ui.label("Diffusion:");
-            egui::ComboBox::from_id_salt("relax_panel_diff_kind")
-                .selected_text(format!("{:?}", self.diffusion_kind))
-                .width(105.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.diffusion_kind,
-                        DiffusionTensorKind::Auto,
-                        "Auto (AIC)",
-                    );
-                    ui.selectable_value(
-                        &mut self.diffusion_kind,
-                        DiffusionTensorKind::Isotropic,
-                        "Isotropic",
-                    );
-                    ui.selectable_value(
-                        &mut self.diffusion_kind,
-                        DiffusionTensorKind::AxialSymmetric,
-                        "AxialSymmetric",
-                    );
-                    ui.selectable_value(
-                        &mut self.diffusion_kind,
-                        DiffusionTensorKind::FullyAnisotropic,
-                        "FullyAnisotropic",
-                    );
-                });
-            ui.small(
-                egui::RichText::new(&self.status_banner)
-                    .color(egui::Color32::from_rgb(155, 195, 225)),
-            );
-        });
+                ui.label(
+                    egui::RichText::new(&self.status_banner)
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(155, 195, 225)),
+                );
+            });
+
+        self.last_canvas_rect = Some(ui.available_rect_before_wrap().intersect(ui.clip_rect()));
 
         if self.show_paste_drawer {
             ui.group(|ui| {
-                ui.label("Paste Relaxation Series TSV or `save_nmrassign_relaxation_series` NEF:");
+                ui.label(
+                    egui::RichText::new(
+                        "Paste Relaxation Series TSV or `save_nmrassign_relaxation_series` NEF:",
+                    )
+                    .size(12.5),
+                );
                 ui.add(
                     egui::TextEdit::multiline(&mut self.paste_series_buf)
                         .desired_rows(4)
@@ -788,11 +835,11 @@ impl RelaxPanelState {
         if self.show_tsv_modal && !self.exported_tsv_preview.is_empty() {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.strong("Model-Free M1–M5 TSV Output");
-                    if ui.small_button("Copy").clicked() {
+                    ui.strong("Model-Free M1-M5 TSV Output");
+                    if ui.button("Copy").clicked() {
                         ui.ctx().copy_text(self.exported_tsv_preview.clone());
                     }
-                    if ui.small_button("Hide").clicked() {
+                    if ui.button("Hide").clicked() {
                         self.show_tsv_modal = false;
                     }
                 });
@@ -810,19 +857,26 @@ impl RelaxPanelState {
             ui.vertical_centered(|ui| {
                 ui.add_space(28.0);
                 ui.label(
-                    "No relaxation curves loaded yet. Click `⚡ Demo 600+800 MHz` or `📥 Paste Series TSV/NEF`.",
+                    egui::RichText::new(
+                        "No relaxation curves loaded yet. Click 'Demo 600+800 MHz' or open 'Advanced Fitting & Export' to paste TSV/NEF.",
+                    )
+                    .size(12.5),
                 );
             });
             return actions;
         }
 
+        let avail_h = ui.available_height().max(460.0);
+        let decay_h = (avail_h * 0.34).max(175.0);
+        let track_h = ((avail_h - decay_h - 46.0) / 5.0).max(58.0);
+
         egui::ScrollArea::vertical().show(ui, |ui| {
             // 1. Interactive I(tau) mono-exponential decay plot with fitted curve + MC 1-sigma envelope
-            self.draw_decay_curve_canvas(ui, sequence, seq_ids, &mut actions);
-            ui.add_space(6.0);
+            self.draw_decay_curve_canvas(ui, sequence, seq_ids, decay_h, &mut actions);
+            ui.add_space(4.0);
 
             // 2. Per-residue sequence bar tracks: R1, R2, hetNOE, S^2, R_ex
-            self.draw_sequence_tracks_canvas(ui, sequence, seq_ids, &mut actions);
+            self.draw_sequence_tracks_canvas(ui, sequence, seq_ids, track_h, &mut actions);
         });
 
         actions
@@ -833,19 +887,20 @@ impl RelaxPanelState {
         ui: &mut egui::Ui,
         sequence: &[String],
         seq_ids: &[i32],
+        canvas_height: f32,
         actions: &mut Vec<RelaxPanelAction>,
     ) {
         let (curves, fits, label, accent) = match self.active_decay {
             ActiveDecayView::R1 => (
                 &self.r1_curves,
                 &self.r1_fits,
-                "R₁",
+                "R1",
                 egui::Color32::from_rgb(76, 185, 255),
             ),
             ActiveDecayView::R2 => (
                 &self.r2_curves,
                 &self.r2_fits,
-                "R₂",
+                "R2",
                 egui::Color32::from_rgb(255, 162, 68),
             ),
         };
@@ -858,7 +913,7 @@ impl RelaxPanelState {
         self.selected_seq_id = active_sid;
 
         let Some(sid) = active_sid else {
-            ui.small(format!("No {label} curves fitted yet."));
+            ui.label(egui::RichText::new(format!("No {label} curves fitted yet.")).size(11.0));
             return;
         };
         let (Some(curve), Some(fit)) = (curves.get(&sid), fits.get(&sid)) else {
@@ -868,14 +923,14 @@ impl RelaxPanelState {
         // Header & residue stepper
         ui.horizontal_wrapped(|ui| {
             let cur_pos = all_sids.iter().position(|&x| x == sid).unwrap_or(0);
-            if ui.small_button("◀").clicked() && cur_pos > 0 {
+            if ui.button("<").clicked() && cur_pos > 0 {
                 let prev_sid = all_sids[cur_pos - 1];
                 self.selected_seq_id = Some(prev_sid);
                 if let Some(k) = seq_ids.iter().position(|&x| x == prev_sid) {
                     actions.push(RelaxPanelAction::SelectResidueIndex(k));
                 }
             }
-            if ui.small_button("▶").clicked() && cur_pos + 1 < all_sids.len() {
+            if ui.button(">").clicked() && cur_pos + 1 < all_sids.len() {
                 let next_sid = all_sids[cur_pos + 1];
                 self.selected_seq_id = Some(next_sid);
                 if let Some(k) = seq_ids.iter().position(|&x| x == next_sid) {
@@ -889,10 +944,14 @@ impl RelaxPanelState {
                 .and_then(|k| sequence.get(k))
                 .map(|s| s.as_str())
                 .unwrap_or(&fit.res_name);
-            ui.strong(format!(
-                "{res_label}{sid} — {label} = {:.3} ± {:.3} s⁻¹ (I₀ = {:.1}, χ²/ν = {:.2}/{})",
-                fit.rate, fit.sigma_rate_mc, fit.i0, fit.chi2, fit.dof
-            ));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{res_label}{sid} -- {label} = {:.3} +- {:.3} s^-1 (I0 = {:.1}, chi^2/dof = {:.2}/{})",
+                    fit.rate, fit.sigma_rate_mc, fit.i0, fit.chi2, fit.dof
+                ))
+                .size(12.5)
+                .strong(),
+            );
 
             if let Some(mf) = self
                 .modelfree_result
@@ -901,18 +960,19 @@ impl RelaxPanelState {
             {
                 ui.colored_label(
                     egui::Color32::from_rgb(130, 235, 165),
-                    format!(
-                        "[{}] S² = {:.3} ± {:.3}  R_ex = {:.2} s⁻¹",
+                    egui::RichText::new(format!(
+                        "[{}] S^2 = {:.3} +- {:.3}  R_ex = {:.2} s^-1",
                         mf.selected_model.as_str(),
                         mf.params.s2,
                         mf.sigma_s2,
                         mf.params.rex_ref_s_inv
-                    ),
+                    ))
+                    .size(11.0),
                 );
             }
         });
 
-        let desired = egui::vec2(ui.available_width().max(260.0), 175.0);
+        let desired = egui::vec2(ui.available_width().max(260.0), canvas_height);
         let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(16, 20, 28));
@@ -975,7 +1035,7 @@ impl RelaxPanelState {
                     egui::pos2(plot.left() - 4.0, py),
                     egui::Align2::RIGHT_CENTER,
                     format!("{yv:.0}"),
-                    egui::FontId::monospace(9.5),
+                    egui::FontId::monospace(11.0),
                     egui::Color32::from_rgb(138, 150, 170),
                 );
             }
@@ -987,7 +1047,7 @@ impl RelaxPanelState {
                 egui::pos2(px, plot.bottom() + 11.0),
                 egui::Align2::CENTER_CENTER,
                 format!("{tv:.2}s"),
-                egui::FontId::monospace(9.5),
+                egui::FontId::monospace(11.0),
                 egui::Color32::from_rgb(138, 150, 170),
             );
         }
@@ -1064,6 +1124,7 @@ impl RelaxPanelState {
         ui: &mut egui::Ui,
         sequence: &[String],
         seq_ids: &[i32],
+        track_h: f32,
         actions: &mut Vec<RelaxPanelAction>,
     ) {
         // Collect ordered sequence positions
@@ -1157,9 +1218,8 @@ impl RelaxPanelState {
         ];
 
         let n_cols = ordered_ids.len();
-        let pad_l = 74.0_f32;
+        let pad_l = 78.0_f32;
         let pad_r = 10.0_f32;
-        let track_h = 54.0_f32;
 
         for (t_idx, spec) in specs.iter().enumerate() {
             let desired = egui::vec2(ui.available_width().max(260.0), track_h);
@@ -1174,17 +1234,17 @@ impl RelaxPanelState {
             );
 
             painter.text(
-                egui::pos2(rect.left() + 6.0, rect.top() + 11.0),
+                egui::pos2(rect.left() + 6.0, rect.top() + 12.0),
                 egui::Align2::LEFT_CENTER,
                 spec.title,
                 egui::FontId::proportional(11.0),
                 egui::Color32::from_rgb(210, 220, 235),
             );
             painter.text(
-                egui::pos2(rect.left() + 6.0, rect.bottom() - 10.0),
+                egui::pos2(rect.left() + 6.0, rect.bottom() - 11.0),
                 egui::Align2::LEFT_CENTER,
                 format!("{:.1}..{:.1}", spec.y_min, spec.y_max),
-                egui::FontId::monospace(9.0),
+                egui::FontId::monospace(11.0),
                 egui::Color32::from_rgb(126, 140, 160),
             );
 
@@ -1443,16 +1503,18 @@ mod tests {
         let seq_ids: Vec<i32> = (1..=6).collect();
 
         // 1. Empty state frame
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut out1 = ctx.run_ui(egui::RawInput::default(), |ui| {
             let acts = panel.ui(ui, &seq, &seq_ids, Some(0), None);
             assert!(acts.is_empty());
         });
+        out1.textures_delta.clear();
 
         // 2. Populated state frame (`I(tau)` canvas + 5 sequence bar tracks)
         panel.load_demo_dynamics(&seq, &seq_ids, None).unwrap();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut out2 = ctx.run_ui(egui::RawInput::default(), |ui| {
             let _acts = panel.ui(ui, &seq, &seq_ids, Some(2), None);
         });
+        out2.textures_delta.clear();
         assert_eq!(panel.selected_seq_id, Some(3));
     }
 }

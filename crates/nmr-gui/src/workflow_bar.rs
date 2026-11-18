@@ -187,6 +187,22 @@ pub enum WorkbenchAction {
     OpenKeyboardCheatSheet,
     ReSimulateSyntheticNoise,
     ShowAboutAndProvenance,
+
+    // --- 10. Unified interaction grammar & single top-level mode switcher (`UI-B1`, `UI-C5`, `UI-C6`) ---
+    /// `+` / `ci` / `cu`: show MORE signal (1D gain x1.25, 2D/3D contour floor / 1.25).
+    ShowMoreSignal,
+    /// `-` / `cb` / `cd`: show LESS signal (1D gain / 1.25, 2D/3D contour floor x1.25).
+    ShowLessSignal,
+    /// `xl`: pin / unpin the synchronized crosshair (Space is reserved for hold-to-pan).
+    ToggleCrosshairLockChord,
+    SwitchModeProcess,
+    SwitchModeAssign,
+    SwitchModeStructure,
+    SwitchModeDynamics,
+    SwitchModeSmallMolecule,
+    SwitchModeMetabolomics,
+    /// Developer-only synthetic benchmark overlay (off by default, `UI-B3`).
+    ToggleDeveloperBenchmarkMode,
 }
 
 /// Static metadata describing a registered [`WorkbenchAction`] across menus, palettes, and keymaps.
@@ -315,6 +331,17 @@ impl WorkbenchAction {
         Self::OpenKeyboardCheatSheet,
         Self::ReSimulateSyntheticNoise,
         Self::ShowAboutAndProvenance,
+        // Interaction grammar & modes (10)
+        Self::ShowMoreSignal,
+        Self::ShowLessSignal,
+        Self::ToggleCrosshairLockChord,
+        Self::SwitchModeProcess,
+        Self::SwitchModeAssign,
+        Self::SwitchModeStructure,
+        Self::SwitchModeDynamics,
+        Self::SwitchModeSmallMolecule,
+        Self::SwitchModeMetabolomics,
+        Self::ToggleDeveloperBenchmarkMode,
     ];
 
     /// Retrieve canonical UI metadata, category, description, and shortcut/chord badges.
@@ -539,20 +566,20 @@ impl WorkbenchAction {
                 action: self,
                 menu: TopMenu::Spectrum,
                 category: "Spectrum View",
-                title: "Raise Contour Floor / 1D Gain (×1.25)",
-                description: "Multiply contour threshold or 1D vertical gain by 1.25x",
+                title: "Raise Contour Floor (x1.25)",
+                description: "Multiply 2D/3D contour threshold by 1.25x to suppress noise",
                 modifier_shortcut: None,
-                chord_badge: Some("ci"),
+                chord_badge: None,
                 menu_separator_after: false,
             },
             Self::LowerContourFloor => ActionMetadata {
                 action: self,
                 menu: TopMenu::Spectrum,
                 category: "Spectrum View",
-                title: "Lower Contour Floor / 1D Gain (÷1.25)",
-                description: "Divide contour threshold or 1D vertical gain by 1.25x",
+                title: "Lower Contour Floor (/1.25)",
+                description: "Divide 2D/3D contour threshold by 1.25x to reveal weaker signal",
                 modifier_shortcut: None,
-                chord_badge: Some("cb"),
+                chord_badge: None,
                 menu_separator_after: false,
             },
             Self::ToggleNegativeContours => ActionMetadata {
@@ -842,7 +869,7 @@ impl WorkbenchAction {
                 title: "Toggle Synchronized Crosshair Lock",
                 description: "Pin or unpin the synchronized (1H, 15N, 13C) frequency crosshair across 2D and 3D views",
                 modifier_shortcut: None,
-                chord_badge: Some("Space"),
+                chord_badge: None,
                 menu_separator_after: true,
             },
             Self::OpenOverlayStackManager => ActionMetadata {
@@ -1333,6 +1360,106 @@ impl WorkbenchAction {
                 category: "Help & Shortcuts",
                 title: "About FERRIC & Clean-Room Provenance",
                 description: "Display release version, WebGPU adapter status, and peer-reviewed algorithm citations",
+                modifier_shortcut: None,
+                chord_badge: None,
+                menu_separator_after: false,
+            },
+            Self::ShowMoreSignal => ActionMetadata {
+                action: self,
+                menu: TopMenu::Spectrum,
+                category: "Spectrum View",
+                title: "Show More Signal (+)",
+                description: "1D: vertical gain x1.25. 2D/3D: lower contour floor by 1.25 so weaker peaks appear",
+                modifier_shortcut: None,
+                chord_badge: Some("ci"),
+                menu_separator_after: false,
+            },
+            Self::ShowLessSignal => ActionMetadata {
+                action: self,
+                menu: TopMenu::Spectrum,
+                category: "Spectrum View",
+                title: "Show Less Signal (-)",
+                description: "1D: vertical gain / 1.25. 2D/3D: raise contour floor by 1.25 to hide noise",
+                modifier_shortcut: None,
+                chord_badge: Some("cb"),
+                menu_separator_after: false,
+            },
+            Self::ToggleCrosshairLockChord => ActionMetadata {
+                action: self,
+                menu: TopMenu::Spectrum,
+                category: "Spectrum View",
+                title: "Toggle Crosshair Lock",
+                description: "Pin or unpin the synchronized frequency crosshair (Space is hold-to-pan only)",
+                modifier_shortcut: None,
+                chord_badge: Some("xl"),
+                menu_separator_after: false,
+            },
+            Self::SwitchModeProcess => ActionMetadata {
+                action: self,
+                menu: TopMenu::Process,
+                category: "Modes",
+                title: "Mode: Process",
+                description: "Switch to the Process mode (1D / 2D / 3D spectrum processing)",
+                modifier_shortcut: None,
+                chord_badge: None,
+                menu_separator_after: false,
+            },
+            Self::SwitchModeAssign => ActionMetadata {
+                action: self,
+                menu: TopMenu::Assignment,
+                category: "Modes",
+                title: "Mode: Assign",
+                description: "Switch to the Assign mode (2D HSQC / 3D strips / sequence)",
+                modifier_shortcut: None,
+                chord_badge: None,
+                menu_separator_after: false,
+            },
+            Self::SwitchModeStructure => ActionMetadata {
+                action: self,
+                menu: TopMenu::Structure,
+                category: "Modes",
+                title: "Mode: Structure",
+                description: "Switch to the Structure mode (3D model, secondary-structure concordance, PAE)",
+                modifier_shortcut: None,
+                chord_badge: None,
+                menu_separator_after: false,
+            },
+            Self::SwitchModeDynamics => ActionMetadata {
+                action: self,
+                menu: TopMenu::Dynamics,
+                category: "Modes",
+                title: "Mode: Dynamics",
+                description: "Switch to the Dynamics mode (relaxation, model-free, CEST / CPMG / CSP)",
+                modifier_shortcut: None,
+                chord_badge: None,
+                menu_separator_after: false,
+            },
+            Self::SwitchModeSmallMolecule => ActionMetadata {
+                action: self,
+                menu: TopMenu::Chemistry,
+                category: "Modes",
+                title: "Mode: Small molecule",
+                description: "Switch to the Small molecule mode (2D sketcher and DOSY)",
+                modifier_shortcut: None,
+                chord_badge: None,
+                menu_separator_after: false,
+            },
+            Self::SwitchModeMetabolomics => ActionMetadata {
+                action: self,
+                menu: TopMenu::Chemistry,
+                category: "Modes",
+                title: "Mode: Metabolomics",
+                description: "Switch to the Metabolomics mode (PCA / OPLS-DA / STOCSY)",
+                modifier_shortcut: None,
+                chord_badge: None,
+                menu_separator_after: false,
+            },
+            Self::ToggleDeveloperBenchmarkMode => ActionMetadata {
+                action: self,
+                menu: TopMenu::Help,
+                category: "Developer",
+                title: "Developer: Synthetic Benchmark Overlay",
+                description: "Show or hide the synthetic benchmark-vs-truth panel (developer use only, off by default)",
                 modifier_shortcut: None,
                 chord_badge: None,
                 menu_separator_after: false,
@@ -1984,25 +2111,25 @@ pub fn draw_workflow_stepper(
 
                     let (prefix, fill, stroke, text_col) = match status {
                         StageStatus::Completed => (
-                            "✓",
+                            "[ok]",
                             egui::Color32::from_rgb(22, 68, 52),
                             egui::Stroke::new(1.0, egui::Color32::from_rgb(62, 175, 122)),
                             egui::Color32::from_rgb(185, 248, 215),
                         ),
                         StageStatus::Active => (
-                            "●",
+                            "[*]",
                             egui::Color32::from_rgb(26, 74, 118),
                             egui::Stroke::new(1.6, egui::Color32::from_rgb(105, 215, 255)),
                             egui::Color32::WHITE,
                         ),
                         StageStatus::Blocked => (
-                            "!",
+                            "[!]",
                             egui::Color32::from_rgb(96, 46, 28),
                             egui::Stroke::new(1.4, egui::Color32::from_rgb(245, 152, 76)),
                             egui::Color32::from_rgb(255, 222, 185),
                         ),
                         StageStatus::Upcoming => (
-                            "○",
+                            "[ ]",
                             egui::Color32::from_rgb(26, 32, 44),
                             egui::Stroke::new(1.0, egui::Color32::from_rgb(56, 68, 88)),
                             egui::Color32::from_rgb(148, 164, 188),
@@ -2462,6 +2589,7 @@ pub fn render_responsive_workbench<H: ResponsiveWorkbenchHost>(
     shell: &mut ResponsiveShellState,
     host: &mut H,
 ) -> ResponsiveFrameMetrics {
+    crate::workbench_mode::apply_type_scale(ui.ctx());
     let ctx = ui.ctx().clone();
     let content_rect = ctx.content_rect();
     let breakpoint = ResponsiveBreakpoint::from_width(content_rect.width());
@@ -2587,7 +2715,7 @@ fn render_compact_mobile_shell<H: ResponsiveWorkbenchHost>(
                             let [tr, tg, tb] = qc.text_rgb;
                             let qc_btn = egui::Button::new(
                                 egui::RichText::new(qc.label)
-                                    .size(10.5)
+                                    .size(11.0)
                                     .strong()
                                     .color(egui::Color32::from_rgb(tr, tg, tb)),
                             )
@@ -2624,13 +2752,13 @@ fn render_compact_mobile_shell<H: ResponsiveWorkbenchHost>(
                 let quick_items = [
                     ("Paste / Export Text", WorkbenchAction::OpenPasteTextModal),
                     ("Ingest Matrix", WorkbenchAction::OpenIngestMatrix),
-                    ("▶ Run Assignment", WorkbenchAction::RunBackboneAssignment),
+                    ("Run Assignment", WorkbenchAction::RunBackboneAssignment),
                     ("Save NEF Session", WorkbenchAction::SaveSessionNef),
                     (
                         "HTML Quality Report",
                         WorkbenchAction::ExportQualityReportHtml,
                     ),
-                    ("⌘ Command Palette", WorkbenchAction::OpenCommandPalette),
+                    ("Command Palette", WorkbenchAction::OpenCommandPalette),
                     (
                         "Keyboard Shortcuts",
                         WorkbenchAction::OpenKeyboardCheatSheet,
@@ -2678,7 +2806,7 @@ fn render_compact_mobile_shell<H: ResponsiveWorkbenchHost>(
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(display)
-                                    .size(10.5)
+                                    .size(11.0)
                                     .color(egui::Color32::from_rgb(185, 208, 236)),
                             )
                             .extend(),
@@ -3047,8 +3175,8 @@ fn render_desktop_full_shell<H: ResponsiveWorkbenchHost>(
             let sb_open = host.show_workbook_sidebar();
             if host.show_strips_dock() && !host.is_1d_full_canvas() {
                 let r_resp = egui::Panel::right("right_strip_inspector")
-                    .default_size(if sb_open { 336.0 } else { 400.0 })
-                    .min_size(if sb_open { 276.0 } else { 320.0 })
+                    .default_size(if sb_open { 276.0 } else { 300.0 })
+                    .min_size(236.0)
                     .show(ui, |ui| {
                         host.draw_strips_inspector_view(ui);
                     });

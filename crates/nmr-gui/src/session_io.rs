@@ -56,49 +56,6 @@ pub fn classify_key_shortcut(
     }
 }
 
-/// Poll and consume `Cmd/Ctrl+Z`, `Cmd/Ctrl+Shift+Z`, `Cmd/Ctrl+Y`, `Cmd/Ctrl+S`, and `Cmd/Ctrl+O`
-/// from `egui::Context`.
-///
-/// Checks `Shift+Z` prior to plain `Z` so `Cmd/Ctrl+Shift+Z` is never shadowed by `Cmd/Ctrl+Z`.
-pub fn poll_session_shortcuts(
-    ctx: &egui::Context,
-    external_focus_suppress: bool,
-) -> Option<SessionShortcutAction> {
-    let text_focus = external_focus_suppress || ctx.egui_wants_keyboard_input();
-
-    ctx.input_mut(|input| {
-        if !text_focus {
-            let redo_shift_z = egui::KeyboardShortcut::new(
-                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-                egui::Key::Z,
-            );
-            if input.consume_shortcut(&redo_shift_z) {
-                return Some(SessionShortcutAction::Redo);
-            }
-            let redo_y = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Y);
-            if input.consume_shortcut(&redo_y) {
-                return Some(SessionShortcutAction::Redo);
-            }
-            let undo_z = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
-            if input.consume_shortcut(&undo_z) {
-                return Some(SessionShortcutAction::Undo);
-            }
-        }
-
-        let save_s = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
-        if input.consume_shortcut(&save_s) {
-            return Some(SessionShortcutAction::SaveSessionNef);
-        }
-
-        let open_o = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
-        if input.consume_shortcut(&open_o) {
-            return Some(SessionShortcutAction::OpenSessionNef);
-        }
-
-        None
-    })
-}
-
 /// Serialize a [`WorkbenchSessionState`] to UTF-8 `.nef` bytes in memory (`native` & `wasm32`).
 pub fn serialize_session_nef_bytes(state: &WorkbenchSessionState) -> Vec<u8> {
     write_session_nef_str(state).into_bytes()

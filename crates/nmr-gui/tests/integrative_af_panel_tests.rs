@@ -30,9 +30,10 @@ fn run_headless_frame(
         ..Default::default()
     };
     let mut actions = Vec::new();
-    let _ = ctx.run_ui(raw_input, |ui| {
+    let mut out = ctx.run_ui(raw_input, |ui| {
         actions = panel.show(ui, paper_white);
     });
+    out.textures_delta.clear();
     actions
 }
 
@@ -73,7 +74,9 @@ fn test_headless_concordance_and_pae_domain_heatmap_click_to_mol3d() {
     let (demo_ref, status) = panel
         .load_synthetic_two_domain_demo()
         .expect("load synthetic 2-domain AF demo");
-    assert!(status.contains("Validated 52 residues"));
+    assert!(status.contains("Analyzed 52 residues"), "got: {status}");
+    assert!(status.contains("synthetic demo"), "got: {status}");
+    assert!(!status.contains("Validated"), "got: {status}");
 
     // Verify 2 rigid domains were clustered by T21.5 spectral PAE partitioning
     let part = panel
@@ -286,13 +289,15 @@ fn test_headless_cofold_tab_and_excited_state_bic_parity_interaction() {
                               A\t19\tPRO\tCG\t-2.60\t0.25\tsigned\n\
                               A\t19\tPRO\tCA\t-0.55\t0.25\tsigned\n\
                               A\t18\tGLU\tCA\t1.15\t0.25\tunsigned\n\
-                              A\t18\tGLU\tC\t1.35\t0.28\tunsigned\n"
+                              A\t18\tGLU\tC\t1.35\t0.28\tunsigned\n\
+                              A\t17\tVAL\tCA\t-0.20\t0.35\tsigned\n\
+                              A\t20\tSER\tCA\t-0.18\t0.35\tsigned\n"
         .to_string();
     let live_rep = panel
         .evaluate_excited_state_from_buffers(None)
         .expect("live excited state classification");
     assert_eq!(live_rep.verdict.as_str(), "Committed(XxxProCisTrans)");
-    assert_eq!(panel.excited_parity_points.len(), 5);
+    assert_eq!(panel.excited_parity_points.len(), 7);
     let _ = run_headless_frame(&ctx, &mut panel, true, Vec::new());
 
     // Also test live `populate_from_cofold_report` against `nmr_core::cofold_bridge`
@@ -374,4 +379,19 @@ fn test_hostile_buffer_ingest_errors_and_zero_emoji_audit() {
             );
         }
     }
+}
+
+#[test]
+fn test_pae_heatmap_cached_texture_uploads_once_over_five_frames() {
+    let ctx = egui::Context::default();
+    let mut panel = IntegrativeAfPanel::new();
+    let _ = panel
+        .load_synthetic_two_domain_demo()
+        .expect("load synthetic 2-domain AF demo");
+    panel.active_tab = IntegrativeStudioTab::PaeDomainHeatmap;
+
+    for _ in 0..5 {
+        let _ = run_headless_frame(&ctx, &mut panel, false, Vec::new());
+    }
+    assert_eq!(panel.last_telemetry().pae_texture_uploads, 1);
 }
