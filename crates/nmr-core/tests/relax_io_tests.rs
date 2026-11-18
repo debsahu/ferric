@@ -21,10 +21,10 @@ use nmr_core::relax_io::{
     cpmg_frequencies_from_vclist, estimate_plane_noise_mad_2d, extract_naive_local_max_series,
     footprint_eval_2d, integrate_relax_planes, parse_bruker_fqlist, parse_bruker_vclist,
     parse_bruker_vdlist, parse_relax_series_nef_str, parse_relax_series_tsv_str,
-    parse_varian_relax_schedule, process_pseudo3d_fids, read_bruker_pseudo3d, read_varian_pseudo3d,
-    write_relax_series_nef_str, write_relax_series_tsv_str, FootprintShapeModel,
-    Pseudo3DInterleaving, RelaxExperimentKind, RelaxIntegrationConfig, RelaxSchedule,
-    TargetPeakSeed,
+    parse_varian_relax_schedule, process_pseudo3d_fids, read_bruker_pseudo3d,
+    read_bruker_pseudo3d_with_hetnoe_order, read_varian_pseudo3d, write_relax_series_nef_str,
+    write_relax_series_tsv_str, FootprintShapeModel, HetNoeOrder, Pseudo3DInterleaving,
+    RelaxExperimentKind, RelaxIntegrationConfig, RelaxSchedule, TargetPeakSeed,
 };
 use nmr_core::rng::Rng;
 use nmr_core::spectrum::{AxisPpm, Spectrum2D};
@@ -1754,4 +1754,309 @@ fn f28_bruker_nbl_id10_echo_antiecho_states_tppi_and_3ch_t2_vclist_timing() {
     }
 
     let _ = fs::remove_dir_all(&tmp_root);
+}
+
+// ============================================================================
+// 20.W1:P2-3 fail-closed schedule-less hetNOE plane order
+// ============================================================================
+
+/// Minimal schedule-less 2-plane Bruker hetNOE `ser` directory (zero data) with a caller-chosen
+/// `pulseprogram` and `acqus` `D` line.
+fn write_minimal_hetnoe_dir(dir: &Path, pulseprogram: &str, d_line: &str) {
+    fs::create_dir_all(dir).unwrap();
+    let n0 = 16usize;
+    let n1 = 4usize;
+    let td_x = 2 * n0;
+    let td_y_doubled = 2 * (2 * n1);
+    let bf1_x = 600.13_f64;
+    let sfo1_x = bf1_x * (1.0 + 8.0e-6);
+    let bf1_y = 60.810645_f64;
+    let sfo1_y = bf1_y * (1.0 + 118.0e-6);
+    fs::write(
+        dir.join("acqus"),
+        format!(
+            "##TITLE= hetNOE\n##$PULPROG= <hsqcnoef3gpsi>\n##$PARMODE= 1\n##$AQSEQ= 0\n\
+             ##$BYTORDA= 1\n##$DTYPA= 0\n##$TD= {td_x}\n##$SFO1= {sfo1_x:.8}\n##$BF1= {bf1_x:.8}\n\
+             ##$SW_h= 6000.0\n##$NUC1= <1H>\n##$GRPDLY= 0\n{d_line}##END=\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("acqu2s"),
+        format!(
+            "##TITLE= F1 15N EA\n##$FnMODE= 6\n##$TD= {td_y_doubled}\n##$SFO1= {sfo1_y:.8}\n\
+             ##$BF1= {bf1_y:.8}\n##$SW= 32.0\n##$SW_h= 2000\n##$NUC1= <15N>\n##END=\n"
+        ),
+    )
+    .unwrap();
+    fs::write(dir.join("pulseprogram"), pulseprogram).unwrap();
+    let total_traces = 2 * n1 * 2;
+    fs::write(dir.join("ser"), vec![0u8; total_traces * td_x * 4]).unwrap();
+}
+
+const HETNOE_D_LINE_OK: &str = "##$D= (0..3)\n0 3.5 0 0\n";
+/// Names the experiment but carries no order evidence (no branch parity, no tag, no stock comment).
+const HETNOE_PP_UNDECIDABLE: &str = ";hsqcnoef3gpsi\n;for measuring H1-N15 NOEs\n1 ze\nd1\ngo=2 ph31\nMCWRK wr #0 if #0 zd iu0\nlo to LBLF1I1 times 2\n";
+
+fn hetnoe_pp_parity(l0_init: i32) -> String {
+    format!(
+        ";hsqcnoef3gpsi\n;for measuring H1-N15 NOEs\n\"l0={l0_init}\"\n1 ze\n\
+         if \"l0 %2 == 1\"\n{{\nd1\n}}\nelse\n{{\n4 (p0 ph1)\n5m\nlo to 4 times l4\n}}\n\
+         go=2 ph31\nMCWRK wr #0 if #0 zd iu0\nlo to LBLF1I1 times 2\n"
+    )
+}
+
+#[test]
+fn p2_3_hetnoe_undecidable_pulseprogram_fails_closed_without_explicit_order() {
+    let dir = temp_test_dir("p23_undecidable");
+    write_minimal_hetnoe_dir(&dir, HETNOE_PP_UNDECIDABLE, HETNOE_D_LINE_OK);
+    let err = read_bruker_pseudo3d(&dir, None, None)
+        .expect_err("undecidable hetNOE plane order must not silently default");
+    assert!(
+        err.contains("--hetnoe-order"),
+        "unexpected error text: {err}"
+    );
+    let err_auto =
+        read_bruker_pseudo3d_with_hetnoe_order(&dir, None, None, None, HetNoeOrder::Auto)
+            .expect_err("Auto must fail closed too");
+    assert!(err_auto.contains("--hetnoe-order"), "{err_auto}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn p2_3_hetnoe_explicit_order_succeeds_with_swapped_schedules_and_d1_warning() {
+    let dir = temp_test_dir("p23_explicit");
+    write_minimal_hetnoe_dir(&dir, HETNOE_PP_UNDECIDABLE, HETNOE_D_LINE_OK);
+    let sat = read_bruker_pseudo3d_with_hetnoe_order(&dir, None, None, None, HetNoeOrder::SatFirst)
+        .expect("explicit sat-first");
+    let rf = read_bruker_pseudo3d_with_hetnoe_order(&dir, None, None, None, HetNoeOrder::RefFirst)
+        .expect("explicit ref-first");
+    assert_eq!(sat.experiment_kind, RelaxExperimentKind::HetNoe);
+    assert_eq!(
+        sat.schedule,
+        RelaxSchedule::VariableDelaysSec {
+            delays_sec: vec![3.5, 0.0]
+        }
+    );
+    assert_eq!(
+        rf.schedule,
+        RelaxSchedule::VariableDelaysSec {
+            delays_sec: vec![0.0, 3.5]
+        }
+    );
+    assert!(
+        sat.warnings.iter().any(|w| w.contains("D[1]")),
+        "expected a loud D[1] provenance warning, got {:?}",
+        sat.warnings
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn p2_3_hetnoe_missing_or_nonpositive_d1_is_an_error_not_3s() {
+    for (tag, d_line) in [
+        ("missing", ""),
+        ("zero", "##$D= (0..3)\n0 0 0 0\n"),
+        ("negative", "##$D= (0..3)\n0 -2.0 0 0\n"),
+    ] {
+        let dir = temp_test_dir(&format!("p23_d1_{tag}"));
+        write_minimal_hetnoe_dir(&dir, &hetnoe_pp_parity(1), d_line);
+        let err = read_bruker_pseudo3d(&dir, None, None)
+            .expect_err("missing/non-positive D[1] must not fall back to 3.0 s");
+        assert!(err.contains("D[1]"), "{tag}: unexpected error text: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn p2_3_hetnoe_decidable_branch_parity_works_without_flag() {
+    for (l0_init, expect) in [(1, vec![0.0, 3.5]), (0, vec![3.5, 0.0])] {
+        let dir = temp_test_dir(&format!("p23_parity_{l0_init}"));
+        write_minimal_hetnoe_dir(&dir, &hetnoe_pp_parity(l0_init), HETNOE_D_LINE_OK);
+        let raw = read_bruker_pseudo3d(&dir, None, None).expect("decidable parity pp");
+        assert_eq!(
+            raw.schedule,
+            RelaxSchedule::VariableDelaysSec { delays_sec: expect }
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn p2_3_hetnoe_machine_tag_and_stock_comments_are_positive_evidence_but_conflicts_fail() {
+    let tagged = |c: &str| format!(";hsqcnoef3gpsi\n;{c}\n1 ze\nd1\ngo=2 ph31\n");
+    for (cmt, expect) in [
+        ("hetnoe_order: sat_first", vec![3.5, 0.0]),
+        ("hetnoe_order: ref_first", vec![0.0, 3.5]),
+        ("recording noe and nonoe", vec![3.5, 0.0]),
+        ("recording nonoe and noe", vec![0.0, 3.5]),
+    ] {
+        let dir = temp_test_dir("p23_tag");
+        write_minimal_hetnoe_dir(&dir, &tagged(cmt), HETNOE_D_LINE_OK);
+        let raw = read_bruker_pseudo3d(&dir, None, None).expect(cmt);
+        assert_eq!(
+            raw.schedule,
+            RelaxSchedule::VariableDelaysSec { delays_sec: expect },
+            "{cmt}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+    // Contradictory comments, and comment vs branch-parity disagreement, are not "proof".
+    let dir = temp_test_dir("p23_conflict");
+    let both = ";hsqcnoef3gpsi\n;recording noe and nonoe\n;recording nonoe and noe\n1 ze\n";
+    write_minimal_hetnoe_dir(&dir, both, HETNOE_D_LINE_OK);
+    let err = read_bruker_pseudo3d(&dir, None, None).expect_err("contradictory comments");
+    assert!(err.contains("--hetnoe-order"), "{err}");
+    // parity says ref-first (l0=1) but tag says sat-first
+    let clash = hetnoe_pp_parity(1).replace(";hsqcnoef3gpsi\n", ";hetnoe_order: sat_first\n");
+    write_minimal_hetnoe_dir(&dir, &clash, HETNOE_D_LINE_OK);
+    let err = read_bruker_pseudo3d(&dir, None, None).expect_err("tag vs parity conflict");
+    assert!(err.contains("disagree"), "{err}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
+// 20.W1:P2-4 Varian fid header validation (no header-driven allocation)
+// ============================================================================
+
+#[allow(clippy::too_many_arguments)]
+fn varian_header(
+    nblocks: i32,
+    ntraces: i32,
+    np: i32,
+    ebytes: i32,
+    tbytes: i32,
+    bbytes: i32,
+    status: u16,
+    nbheaders: i32,
+) -> Vec<u8> {
+    let mut h = Vec::new();
+    for v in [nblocks, ntraces, np, ebytes, tbytes, bbytes] {
+        h.extend_from_slice(&v.to_be_bytes());
+    }
+    h.extend_from_slice(&0i16.to_be_bytes());
+    h.extend_from_slice(&status.to_be_bytes());
+    h.extend_from_slice(&nbheaders.to_be_bytes());
+    h
+}
+
+/// Valid synthetic Varian dir (procpar), then replace `fid` with `fid_bytes`; returns the
+/// `read_varian_pseudo3d` result and the wall time.
+fn read_varian_with_crafted_fid(tag: &str, fid_bytes: &[u8]) -> (Result<(), String>, f64) {
+    let dir = temp_test_dir(tag);
+    let peaks = vec![(8.42, 120.5, 100.0, 2.2)];
+    write_synthetic_varian_pseudo3d_dir(
+        &dir,
+        Pseudo3DInterleaving::T1PlaneQuad,
+        &[0.01, 0.05, 0.12],
+        &peaks,
+        0.0,
+        7,
+    );
+    fs::write(dir.join("fid"), fid_bytes).unwrap();
+    let t0 = std::time::Instant::now();
+    let res = read_varian_pseudo3d(&dir, None, None).map(|_| ());
+    let dt = t0.elapsed().as_secs_f64();
+    let _ = fs::remove_dir_all(&dir);
+    (res, dt)
+}
+
+#[test]
+fn p2_4_varian_zero_bbytes_with_huge_nblocks_ntraces_errs_without_allocating() {
+    for (tag, nb, nt) in [
+        ("1e6", 1_000_000, 1_000_000),
+        ("1e9", 1_000_000_000, 1_000_000_000),
+    ] {
+        let hdr = varian_header(nb, nt, 256, 4, 1024, 0, 0x000D, 1);
+        let (res, dt) = read_varian_with_crafted_fid(&format!("p24_bbytes0_{tag}"), &hdr);
+        assert!(res.is_err(), "{tag}: bbytes=0 header must be rejected");
+        assert!(dt < 2.0, "{tag}: rejection took {dt:.2}s");
+    }
+}
+
+#[test]
+fn p2_4_varian_nblocks_times_bbytes_exceeding_file_or_overflowing_errs() {
+    for (tag, nblocks, bbytes) in [
+        ("exceeds", 1_000_000, 1_000_000),
+        ("max", i32::MAX, i32::MAX),
+        ("neg_bbytes", 1_000_000, -1),
+    ] {
+        let hdr = varian_header(nblocks, 1_000_000, 256, 4, 1024, bbytes, 0x000D, 1);
+        let (res, dt) = read_varian_with_crafted_fid(&format!("p24_nbl_{tag}"), &hdr);
+        let err = res.expect_err("corrupt nblocks/bbytes must be rejected");
+        assert!(
+            !err.contains("unexpected EOF"),
+            "{tag}: must fail at header validation before the trace loop, got: {err}"
+        );
+        assert!(dt < 2.0, "{tag}: rejection took {dt:.2}s");
+    }
+}
+
+#[test]
+fn p2_4_varian_zero_ebytes_tbytes_nblocks_ntraces_np_and_bad_ebytes_err() {
+    let cases: [(&str, Vec<u8>); 8] = [
+        (
+            "ebytes0",
+            varian_header(1, 1_000_000, 256, 0, 1024, 28 + 1024, 0x000D, 1),
+        ),
+        (
+            "ebytes3",
+            varian_header(1, 1, 256, 3, 768, 28 + 768, 0x000D, 1),
+        ),
+        (
+            "tbytes0",
+            varian_header(1, 1, 256, 4, 0, 28 + 1024, 0x000D, 1),
+        ),
+        (
+            "nblocks0",
+            varian_header(0, 1, 256, 4, 1024, 28 + 1024, 0x000D, 1),
+        ),
+        (
+            "ntraces0",
+            varian_header(1, 0, 256, 4, 1024, 28 + 1024, 0x000D, 1),
+        ),
+        (
+            "np_huge",
+            varian_header(1, 1, i32::MAX - 1, 4, 1024, 28 + 1024, 0x000D, 1),
+        ),
+        (
+            "negative_nblocks",
+            varian_header(-5, 1, 256, 4, 1024, 28 + 1024, 0x000D, 1),
+        ),
+        (
+            "block_too_small_for_declared_traces",
+            // bbytes covers only 1 trace but the header declares 1000 traces/block, with extra
+            // trailing bytes in the file so an unchecked reader would walk past the block boundary.
+            {
+                let mut v = varian_header(1, 1000, 2, 4, 8, 28 + 8, 0x000D, 1);
+                v.extend(vec![0u8; 28 + 1000 * 8]);
+                v
+            },
+        ),
+    ];
+    for (tag, hdr) in cases {
+        let (res, dt) = read_varian_with_crafted_fid(&format!("p24_{tag}"), &hdr);
+        let err = res.expect_err(&format!("{tag}: crafted header must be rejected"));
+        // Every case must be caught by header validation before the trace-reading loop or post-loop
+        // `expected_traces` check.
+        assert!(
+            !err.contains("unexpected EOF") && !err.contains("trace count mismatch"),
+            "{tag}: must fail in header validation, got: {err}"
+        );
+        assert!(dt < 2.0, "{tag}: rejection took {dt:.2}s");
+    }
+}
+
+#[test]
+fn p2_4_varian_trace_count_cap_rejects_total_traces_above_limit() {
+    // 2^22 + 1 total traces declared across blocks; the header must be rejected by the trace-count
+    // cap before `needed` / `Vec::with_capacity`.
+    let ntraces = 1 << 11;
+    let nblocks = (1 << 11) + 1;
+    let bbytes = 28 + ntraces * 8;
+    let hdr = varian_header(nblocks, ntraces, 2, 4, 8, bbytes, 0x000D, 1);
+    let (res, dt) = read_varian_with_crafted_fid("p24_trace_cap", &hdr);
+    let err = res.expect_err("total traces above cap must be rejected");
+    assert!(err.contains("limit"), "unexpected error: {err}");
+    assert!(dt < 2.0, "rejection took {dt:.2}s");
 }

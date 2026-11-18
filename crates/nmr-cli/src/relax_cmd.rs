@@ -40,9 +40,9 @@ use nmr_core::relax_fit::{
 use nmr_core::relax_io::{
     integrate_relax_planes, parse_bruker_delay_token_sec, parse_bruker_vdlist,
     parse_relax_series_nef_str, parse_relax_series_tsv_str, process_pseudo3d_fids,
-    read_bruker_pseudo3d_with_schedule, read_varian_pseudo3d, write_relax_series_nef_str,
-    write_relax_series_tsv_str, RelaxExperimentKind, RelaxIntegrationConfig, RelaxSchedule,
-    RelaxSeriesDataset, TargetPeakSeed,
+    read_bruker_pseudo3d_with_hetnoe_order, read_varian_pseudo3d, write_relax_series_nef_str,
+    write_relax_series_tsv_str, HetNoeOrder, RelaxExperimentKind, RelaxIntegrationConfig,
+    RelaxSchedule, RelaxSeriesDataset, TargetPeakSeed,
 };
 use nmr_core::spectrum::{read_bruker_pdata_2d, read_nmrpipe_2d, read_ucsf_2d, Spectrum2D};
 use nmr_gpu::relax_gpu::fit_decay_batch_gpu;
@@ -88,6 +88,7 @@ pub fn relax_usage() -> &'static str {
        --offset-gate <mode>     3-parameter offset gate: none|aic|aicc|bic|always [default: none]\n\
        --unsat-plane <idx>      Reference unsaturated plane index for hetNOE (auto-detected by default)\n\
        --sat-plane <idx>        Steady-state saturated plane index for hetNOE (auto-detected by default)\n\
+       --hetnoe-order <sat-first|ref-first>  Plane order of a schedule-less 2-plane Bruker hetNOE ser; REQUIRED when the pulseprogram does not prove it (otherwise `ferric relax` fails closed)\n\
        --seed <u64>             Deterministic PRNG seed [default: 20261302]\n\
        --out | -o <rates.tsv>   Output fitted relaxation rate / hetNOE TSV table"
 }
@@ -424,6 +425,7 @@ fn load_or_integrate_series(
     shifts_path: Option<&Path>,
     kind_override: Option<RelaxExperimentKind>,
     field_override: Option<f64>,
+    hetnoe_order: HetNoeOrder,
 ) -> Result<RelaxSeriesDataset, String> {
     if let Some(p_csv) = planes_csv {
         let plane_paths: Vec<PathBuf> = p_csv
@@ -507,7 +509,7 @@ fn load_or_integrate_series(
 
     let mut ds = if sp.join("ser").is_file() && sp.join("acqus").is_file() {
         let raw_p3d = if let Some(ref sched_ovr) = explicit_sched {
-            match read_bruker_pseudo3d_with_schedule(sp, None, None, None) {
+            match read_bruker_pseudo3d_with_hetnoe_order(sp, None, None, None, hetnoe_order) {
                 Ok(mut p3d) => {
                     if sched_ovr.len() != p3d.planes.len() {
                         return Err(format!(
@@ -516,16 +518,25 @@ fn load_or_integrate_series(
                             p3d.planes.len()
                         ));
                     }
+                    // The explicit schedule supersedes any inferred hetNOE delay/order.
+                    p3d.warnings.clear();
                     p3d.schedule = sched_ovr.clone();
                     p3d
                 }
-                Err(_) => {
-                    read_bruker_pseudo3d_with_schedule(sp, None, None, Some(sched_ovr.clone()))?
-                }
+                Err(_) => read_bruker_pseudo3d_with_hetnoe_order(
+                    sp,
+                    None,
+                    None,
+                    Some(sched_ovr.clone()),
+                    hetnoe_order,
+                )?,
             }
         } else {
-            read_bruker_pseudo3d_with_schedule(sp, None, None, None)?
+            read_bruker_pseudo3d_with_hetnoe_order(sp, None, None, None, hetnoe_order)?
         };
+        for w in &raw_p3d.warnings {
+            eprintln!("warning: {w}");
+        }
         let (planes, _recipe) = process_pseudo3d_fids(&raw_p3d.planes, None)?;
         let seeds = resolve_target_seeds(peaks_path, shifts_path, &planes[0])?;
         let exp_kind = kind_override.unwrap_or(raw_p3d.experiment_kind);
@@ -731,6 +742,7 @@ pub fn run_relax_cli(args: &[String]) -> Result<(), String> {
     let mut offset_gate = OffsetModelGate::Disabled;
     let mut unsat_plane: Option<usize> = None;
     let mut sat_plane: Option<usize> = None;
+    let mut hetnoe_order = HetNoeOrder::Auto;
     let mut seed: u64 = 2026_1302;
 
     let mut i = 0;
@@ -833,6 +845,13 @@ pub fn run_relax_cli(args: &[String]) -> Result<(), String> {
                         .map_err(|_| format!("invalid --sat-plane {v:?}"))?,
                 );
             }
+            "--hetnoe-order" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--hetnoe-order requires sat-first|ref-first")?;
+                hetnoe_order = HetNoeOrder::parse_label(v)?;
+            }
             "--seed" => {
                 i += 1;
                 let v = args.get(i).ok_or("--seed requires an integer")?;
@@ -861,6 +880,7 @@ pub fn run_relax_cli(args: &[String]) -> Result<(), String> {
         shifts_path.as_deref(),
         kind_override,
         field_override,
+        hetnoe_order,
     )?;
 
     if let Some(ref ser_out) = series_out_path {

@@ -1,4 +1,4 @@
-//! End-to-end integration tests for `nmrassign relax` and `nmrassign modelfree` (`T13.1`–`T13.3`).
+//! End-to-end integration tests for `ferric relax` and `ferric modelfree` (`T13.1`–`T13.3`).
 //!
 //! # Literature & Clean-Room Provenance
 //! - Kay, L. E., Torchia, D. A. & Bax, A. (1989). *Biochemistry* 28(23), 8972–8979.
@@ -798,4 +798,175 @@ fn cli_f28_raw_ser_delays_override_and_legacy_nmrstar_default_rel_sigma() {
             "expected S^2 ~ 0.85, got {s2_fit}"
         );
     }
+}
+
+// ============================================================================
+// 20.W1:P2-3 `--hetnoe-order` for schedule-less 2-plane Bruker hetNOE ser dirs
+// ============================================================================
+
+const HETNOE_PP_UNDECIDABLE: &str =
+    ";hsqcnoef3gpsi\n;for measuring H1-N15 NOEs\n1 ze\nd1\ngo=2 ph31\nlo to LBLF1I1 times 2\n";
+const HETNOE_PP_PARITY_REF_FIRST: &str =
+    ";hsqcnoef3gpsi\n;for measuring H1-N15 NOEs\n\"l0=1\"\n1 ze\n\
+     if \"l0 %2 == 1\"\n{\nd1\n}\nelse\n{\n4 (p0 ph1)\n5m\nlo to 4 times l4\n}\ngo=2 ph31\n";
+
+/// Schedule-less 2-plane hetNOE `ser` (deterministic pseudo-noise + one seeded HSQC peak file).
+fn write_cli_hetnoe_dir(dir: &std::path::Path, pulseprogram: &str) -> PathBuf {
+    let n0 = 64usize;
+    let n1 = 16usize;
+    let td_x = 2 * n0;
+    let td_y_doubled = 2 * (2 * n1);
+    let bf1_x = 600.13_f64;
+    let sfo1_x = bf1_x * (1.0 + 8.0e-6);
+    let bf1_y = 60.810645_f64;
+    let sfo1_y = bf1_y * (1.0 + 118.0e-6);
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("acqus"),
+        format!(
+            "##TITLE= hetNOE\n##$PULPROG= <hsqcnoef3gpsi>\n##$PARMODE= 1\n##$AQSEQ= 0\n##$BYTORDA= 1\n\
+             ##$DTYPA= 0\n##$TD= {td_x}\n##$SFO1= {sfo1_x:.8}\n##$BF1= {bf1_x:.8}\n##$SW_h= 6000.0\n\
+             ##$NUC1= <1H>\n##$GRPDLY= 0\n##$D= (0..3)\n0 3.5 0 0\n##END=\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("acqu2s"),
+        format!(
+            "##TITLE= F1 15N EA\n##$FnMODE= 6\n##$TD= {td_y_doubled}\n##$SFO1= {sfo1_y:.8}\n\
+             ##$BF1= {bf1_y:.8}\n##$SW= 32.0\n##$SW_h= 2000\n##$NUC1= <15N>\n##END=\n"
+        ),
+    )
+    .unwrap();
+    fs::write(dir.join("pulseprogram"), pulseprogram).unwrap();
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut ser = Vec::new();
+    for _ in 0..(2 * n1 * 2 * td_x) {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let v = ((state >> 40) as i32 % 2000) - 1000;
+        ser.extend_from_slice(&(v + 5000).to_be_bytes());
+    }
+    fs::write(dir.join("ser"), ser).unwrap();
+    let peaks = dir.join("seed_peaks.tsv");
+    fs::write(&peaks, "experiment\tH\tN\tC\nHSQC\t8.42\t125.5\t\n").unwrap();
+    peaks
+}
+
+fn run_relax_hetnoe(
+    dir: &std::path::Path,
+    peaks: &std::path::Path,
+    out: &std::path::Path,
+    extra: &[&str],
+) -> std::process::Output {
+    let mut args: Vec<&str> = vec![
+        "relax",
+        "--series",
+        dir.to_str().unwrap(),
+        "--peaks",
+        peaks.to_str().unwrap(),
+        "--mc-trials",
+        "0",
+        "--out",
+        out.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    Command::new(nmrassign_bin()).args(&args).output().unwrap()
+}
+
+#[test]
+fn cli_p2_3_hetnoe_undecidable_order_fails_closed_and_flag_resolves_it() {
+    let tmp = ScopedTempDir::new("p23_hetnoe_flag");
+    let dir = tmp.path.join("noe_undecidable");
+    let peaks = write_cli_hetnoe_dir(&dir, HETNOE_PP_UNDECIDABLE);
+    let out = tmp.path.join("noe.tsv");
+
+    // No flag: must fail closed and name the flag.
+    let res = run_relax_hetnoe(&dir, &peaks, &out, &[]);
+    let stderr = String::from_utf8_lossy(&res.stderr).to_string();
+    assert!(!res.status.success(), "undecidable order must fail closed");
+    assert!(stderr.contains("--hetnoe-order"), "stderr: {stderr}");
+    assert!(
+        !out.exists(),
+        "no output may be written on the fail-closed path"
+    );
+
+    // Explicit orders succeed and swap the unsaturated/saturated planes.
+    for (flag, expect) in [
+        ("sat-first", "unsat plane 1, sat plane 0"),
+        ("ref-first", "unsat plane 0, sat plane 1"),
+    ] {
+        let res = run_relax_hetnoe(&dir, &peaks, &out, &["--hetnoe-order", flag]);
+        let stdout = String::from_utf8_lossy(&res.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&res.stderr).to_string();
+        assert!(res.status.success(), "{flag} failed: {stderr}");
+        assert!(stdout.contains(expect), "{flag}: stdout: {stdout}");
+        assert!(
+            stderr.contains("warning:") && stderr.contains("D[1]"),
+            "{flag}: expected loud D[1] warning, stderr: {stderr}"
+        );
+    }
+
+    // `--unsat-plane/--sat-plane` still work alongside the flag.
+    let res = run_relax_hetnoe(
+        &dir,
+        &peaks,
+        &out,
+        &[
+            "--hetnoe-order",
+            "ref-first",
+            "--unsat-plane",
+            "1",
+            "--sat-plane",
+            "0",
+        ],
+    );
+    assert!(
+        res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert!(String::from_utf8_lossy(&res.stdout).contains("unsat plane 1, sat plane 0"));
+
+    // Bad flag value is a usage error.
+    let res = run_relax_hetnoe(&dir, &peaks, &out, &["--hetnoe-order", "sideways"]);
+    assert!(!res.status.success());
+    assert!(String::from_utf8_lossy(&res.stderr).contains("--hetnoe-order"));
+
+    // Usage text documents the flag.
+    let help = Command::new(nmrassign_bin())
+        .args(["relax", "--help"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--hetnoe-order"));
+}
+
+#[test]
+fn cli_p2_3_hetnoe_decidable_branch_parity_needs_no_flag() {
+    let tmp = ScopedTempDir::new("p23_hetnoe_parity");
+    let dir = tmp.path.join("noe_parity");
+    let peaks = write_cli_hetnoe_dir(&dir, HETNOE_PP_PARITY_REF_FIRST);
+    let out = tmp.path.join("noe.tsv");
+    let res = run_relax_hetnoe(&dir, &peaks, &out, &[]);
+    let stderr = String::from_utf8_lossy(&res.stderr).to_string();
+    assert!(res.status.success(), "stderr: {stderr}");
+    assert!(
+        String::from_utf8_lossy(&res.stdout).contains("unsat plane 0, sat plane 1"),
+        "l0=1 + `l0 %2 == 1` -> reference-first"
+    );
+}
+
+#[test]
+fn cli_p2_3_explicit_delays_bypass_hetnoe_order_inference() {
+    let tmp = ScopedTempDir::new("p23_hetnoe_delays");
+    let dir = tmp.path.join("noe_undecidable");
+    let peaks = write_cli_hetnoe_dir(&dir, HETNOE_PP_UNDECIDABLE);
+    let out = tmp.path.join("noe.tsv");
+    let res = run_relax_hetnoe(&dir, &peaks, &out, &["--delays", "0,3.5"]);
+    assert!(
+        res.status.success(),
+        "explicit schedule must not need --hetnoe-order: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
 }

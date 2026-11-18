@@ -745,7 +745,10 @@ fn test_s_plot_vip_and_bh_fdr_volcano_recover_spiked_biomarkers_100_pct_precisio
 
 /// [Test 10] `STOCSY` (`Cloarec et al. 2005`) driven from the L-Lactate `1.33 ppm` doublet automatically
 /// recovers its intramolecular `4.11 ppm` quartet (`r^2 > 0.90`, `3 : 1` covariance stoichiometry)
-/// and ranks `BMRB` `L-Lactate` (`bmse000036`) #1.
+/// and ranks the built-in synthetic biofluid library's `L-Lactate` entry #1.
+/// Note (`20.W1:P3`): `BMRB_BIOFLUID_LIBRARY` in `metabolomics.rs` carries the legacy internal key
+/// `"bmse000036"` on its `L-Lactate` entry; in upstream BMRB metabolomics, `bmse000036` is L-fucose
+/// (`F29`) whereas L-lactic acid is `bmse000035`.
 #[test]
 fn test_stocsy_lactate_driver_recovers_411_quartet_and_matches_bmrb_lactate() {
     let cohort = generate_demo_biofluid_cohort(1010);
@@ -803,7 +806,8 @@ fn test_stocsy_lactate_driver_recovers_411_quartet_and_matches_bmrb_lactate() {
         );
     }
 
-    // Top BMRB match must be L-Lactate (bmse000036)
+    // Top built-in library match must be L-Lactate (tagged with legacy synthetic library ID "bmse000036";
+    // note upstream BMRB uses bmse000036 for L-fucose and bmse000035 for L-lactate).
     let top_match = stocsy
         .metabolite_matches
         .first()

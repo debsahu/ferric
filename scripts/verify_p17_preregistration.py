@@ -493,7 +493,14 @@ def _validate_pass_criteria_and_verdicts(gate_id: str, g: Dict[str, Any], errors
                             errors.append(
                                 f"{clabel}.fallback_threshold_overrides key {ov_acc!r} must be <NS>:<ID>"
                             )
-                        if not _is_strict_number(ov_val):
+                        if isinstance(ov_val, dict):
+                            # Object form: {"threshold", "justification", "same_mw_same_fold"} (20.W1:P2-1).
+                            if not _is_strict_number(ov_val.get("threshold")):
+                                errors.append(
+                                    f"{clabel}.fallback_threshold_overrides[{ov_acc!r}].threshold must be numeric, "
+                                    f"got {ov_val.get('threshold')!r}"
+                                )
+                        elif not _is_strict_number(ov_val):
                             errors.append(
                                 f"{clabel}.fallback_threshold_overrides[{ov_acc!r}] must be numeric, got {ov_val!r}"
                             )
@@ -742,6 +749,94 @@ def _validate_modelfree_fallback_overrides(
                 f"{clabel}.fallback_threshold_overrides missing explicit protein-specific override(s) "
                 f"for non-primary fallback target(s): {missing_accs} (F28 / 17.5b:P2-2 guard)"
             )
+        _validate_fallback_override_values(gate_id, idx, clabel, crit, fallback_accs, overrides, errors)
+
+
+def _is_finite_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))
+
+
+def _validate_fallback_override_values(
+    gate_id: str,
+    idx: int,
+    clabel: str,
+    crit: Dict[str, Any],
+    fallback_accs: Sequence[str],
+    overrides: Dict[str, Any],
+    errors: List[str],
+) -> None:
+    """17.5b:P2-2 / 20.W1:P2-1 value checks: key presence alone is not enough, because copying the
+    primary protein's own threshold onto every fallback accession is exactly the leak the guard
+    exists to stop. Each non-primary override MUST be a finite positive number, or an object
+    ``{"threshold": <finite > 0>, "justification": "<text>", "same_mw_same_fold": <bool>}``.
+    A value equal to the primary criterion threshold (abs diff < 1e-12) is rejected unless the object
+    form carries ``same_mw_same_fold: true`` and a justification of >= 20 characters. Overrides
+    identical across all fallback accessions and equal to the primary threshold are rejected too.
+    """
+    primary_thr = crit.get("threshold")
+    primary_ok = _is_finite_number(primary_thr)
+    copied_accs: List[str] = []
+    unjustified_copies: List[str] = []
+    checked_accs: List[str] = []
+    for acc in fallback_accs:
+        if acc not in overrides:
+            continue  # already reported as missing
+        raw = overrides[acc]
+        where = f"{clabel}.fallback_threshold_overrides[{acc}] (gate {gate_id}, criterion index {idx}, accession {acc})"
+        justification: Optional[str] = None
+        same_flag = False
+        if isinstance(raw, dict):
+            thr = raw.get("threshold")
+            justification = raw.get("justification")
+            if not isinstance(justification, str) or not justification.strip():
+                errors.append(
+                    f"{where} object form requires a non-empty `justification` string (F28 / 17.5b:P2-2 guard)"
+                )
+            sflag = raw.get("same_mw_same_fold", False)
+            if not isinstance(sflag, bool):
+                errors.append(f"{where}.same_mw_same_fold must be a boolean (F28 / 17.5b:P2-2 guard)")
+            else:
+                same_flag = sflag
+        else:
+            thr = raw
+        if not _is_finite_number(thr):
+            errors.append(
+                f"{where} threshold must be a finite number, got {thr!r} (F28 / 17.5b:P2-2 guard)"
+            )
+            continue
+        if float(thr) <= 0.0:
+            errors.append(
+                f"{where} threshold must be > 0 for rotational-diffusion criteria, got {thr!r} "
+                f"(F28 / 17.5b:P2-2 guard)"
+            )
+            continue
+        checked_accs.append(acc)
+        if primary_ok and abs(float(thr) - float(primary_thr)) < 1e-12:
+            copied_accs.append(acc)
+            exempt = (
+                same_flag
+                and isinstance(justification, str)
+                and len(justification.strip()) >= 20
+            )
+            if not exempt:
+                unjustified_copies.append(acc)
+                errors.append(
+                    f"{where} copies the primary criterion threshold {float(primary_thr)!r} verbatim without "
+                    f"`same_mw_same_fold: true` and a justification of >= 20 chars; primary-protein constants "
+                    f"must not leak onto other proteins (F28 / 17.5b:P2-2 guard)"
+                )
+    if (
+        len(checked_accs) > 1
+        and len(copied_accs) == len(checked_accs)
+        and unjustified_copies
+        and len(unjustified_copies) == len(copied_accs)
+    ):
+        # All fallback overrides are identical to the primary threshold with no per-target exemption.
+        errors.append(
+            f"{clabel}.fallback_threshold_overrides are identical across ALL fallback accessions "
+            f"{checked_accs} and equal to the primary threshold {float(primary_thr)!r} "
+            f"(gate {gate_id}, criterion index {idx}) (F28 / 17.5b:P2-2 guard)"
+        )
 
 
 def validate_preregistration(
@@ -1452,6 +1547,26 @@ def validate_preregistration(
     return errors, stats
 
 
+# Synthetic, per-accession multipliers (self-test fixtures only; NOT scientific values). Each fallback
+# protein gets a distinct protein-specific bound derived from the primary criterion threshold so the
+# clean fixture never copies the primary threshold verbatim (20.W1:P2-1 / 17.5b:P2-2).
+_FIXTURE_TAU_M_FACTORS: Dict[str, float] = {"BMRB:18971": 1.35, "BMRB:5839": 1.6, "BMRB:6243": 1.85}
+_FIXTURE_ANISO_FACTORS: Dict[str, float] = {"BMRB:18971": 1.25, "BMRB:5839": 1.5, "BMRB:6243": 1.75}
+
+
+def _fixture_fallback_override(acc: str, primary_threshold: float, is_aniso: bool) -> Dict[str, Any]:
+    table = _FIXTURE_ANISO_FACTORS if is_aniso else _FIXTURE_TAU_M_FACTORS
+    factor = table.get(acc)
+    if factor is None:
+        digest = int(hashlib.sha256(acc.encode("utf-8")).hexdigest()[:6], 16)
+        factor = 1.9 + (digest % 1000) / 1000.0  # distinct, never 1.0
+    return {
+        "threshold": round(primary_threshold * factor, 6),
+        "justification": f"synthetic fixture value for self-test only ({acc})",
+        "same_mw_same_fold": False,
+    }
+
+
 def _build_minimal_fixture_repo(tmp_root: Path, real_repo: Path) -> Tuple[Path, Dict[str, Any]]:
     """Create an isolated temporary git repo mirroring ``crates/``, ``Cargo.lock``, and benchmark tables."""
     shutil.copytree(real_repo / "crates", tmp_root / "crates")
@@ -1486,7 +1601,10 @@ def _build_minimal_fixture_repo(tmp_root: Path, real_repo: Path) -> Tuple[Path, 
             if "tau_m" in m_low or "d_par" in m_low or "d_perp" in m_low:
                 ov = dict(crit.get("fallback_threshold_overrides") or {})
                 for acc in f10_non_primary:
-                    ov.setdefault(acc, float(crit["threshold"]))
+                    if acc not in ov:
+                        ov[acc] = _fixture_fallback_override(
+                            acc, float(crit["threshold"]), "d_par" in m_low or "d_perp" in m_low
+                        )
                 crit["fallback_threshold_overrides"] = ov
     # Sync `v0120_baseline_sha256` in the isolated temp fixture to the fixture's copied `crates/` baseline
     r1_fix = fixture_mobj.get("protocol_rules", {}).get("rule_1_solver_and_shader_freeze", {})
@@ -1539,10 +1657,10 @@ def _build_minimal_fixture_repo(tmp_root: Path, real_repo: Path) -> Tuple[Path, 
 
 
 def run_self_tests(real_repo: Path) -> int:
-    """Execute live repository check plus 16 adversarial mutation unit tests (including F28(5) fallback guards)."""
+    """Execute live repository check plus 20 adversarial mutation unit tests (including F28(5) fallback guards)."""
     live_errors, live_stats = validate_preregistration(real_repo)
     if live_errors:
-        print("FAIL [self-test 0/16: live repository check]:", file=sys.stderr)
+        print("FAIL [self-test 0/20: live repository check]:", file=sys.stderr)
         for err in live_errors:
             print(f"  - {err}", file=sys.stderr)
         return 1
@@ -1557,7 +1675,7 @@ def run_self_tests(real_repo: Path) -> int:
         return 1
 
     cases_passed = 0
-    total_cases = 16
+    total_cases = 20
 
     def _write_manifest(root: Path, obj: Dict[str, Any]) -> Path:
         p = root / "data" / "benchmark" / "p17_empirical_preregistration.json"
@@ -1799,6 +1917,80 @@ def run_self_tests(real_repo: Path) -> int:
         _write_manifest(clean_root, base_manifest)
         cases_passed += 1
 
+        # Cases 17-20 (20.W1:P2-1 / 17.5b:P2-2): override VALUES, not just keys, are validated.
+        def _f10_overrides_mut(mutator: Any) -> Dict[str, Any]:
+            mm = copy.deepcopy(base_manifest)
+            crit0 = mm["gates"]["F10"]["pass_criteria"][0]
+            accs = list(crit0["fallback_threshold_overrides"].keys())
+            mutator(crit0, accs)
+            return mm
+
+        # Case 17: overrides that merely copy the primary threshold verbatim (numeric form) MUST fail.
+        def _copy_numeric(crit0: Dict[str, Any], accs: List[str]) -> None:
+            crit0["fallback_threshold_overrides"] = {a: float(crit0["threshold"]) for a in accs}
+
+        _write_manifest(clean_root, _f10_overrides_mut(_copy_numeric))
+        errs17, _ = validate_preregistration(clean_root)
+        assert any(
+            "F10.pass_criteria[0]" in e and "17.5b:P2-2" in e and "BMRB:6243" in e and "verbatim" in e
+            for e in errs17
+        ), f"Case 17 failed to reject verbatim-copied primary threshold overrides: {errs17}"
+        cases_passed += 1
+
+        # Case 18: copied threshold, but object form with same_mw_same_fold=true + >=20 char justification => accepted.
+        def _copy_justified(crit0: Dict[str, Any], accs: List[str]) -> None:
+            crit0["fallback_threshold_overrides"] = {
+                a: {
+                    "threshold": float(crit0["threshold"]),
+                    "justification": f"same MW and same fold as primary target; reuse bound for {a}",
+                    "same_mw_same_fold": True,
+                }
+                for a in accs
+            }
+
+        _write_manifest(clean_root, _f10_overrides_mut(_copy_justified))
+        errs18, _ = validate_preregistration(clean_root)
+        assert not any("17.5b:P2-2" in e for e in errs18), (
+            f"Case 18 wrongly rejected justified same_mw_same_fold copy: {errs18}"
+        )
+        cases_passed += 1
+
+        # Case 19: copied threshold with same_mw_same_fold=true but empty / short justification => rejected.
+        for bad_just in ("", "too short"):
+            def _copy_short(crit0: Dict[str, Any], accs: List[str], _j: str = bad_just) -> None:
+                crit0["fallback_threshold_overrides"] = {
+                    a: {
+                        "threshold": float(crit0["threshold"]),
+                        "justification": _j,
+                        "same_mw_same_fold": True,
+                    }
+                    for a in accs
+                }
+
+            _write_manifest(clean_root, _f10_overrides_mut(_copy_short))
+            errs19, _ = validate_preregistration(clean_root)
+            assert any(
+                "F10.pass_criteria[0]" in e and "17.5b:P2-2" in e and "BMRB:5839" in e for e in errs19
+            ), f"Case 19 failed to reject same_mw_same_fold copy with justification {bad_just!r}: {errs19}"
+        cases_passed += 1
+
+        # Case 20: NaN / negative / zero threshold => rejected.
+        for bad_thr in (float("nan"), -0.5, 0.0, float("inf")):
+            def _bad_value(crit0: Dict[str, Any], accs: List[str], _t: float = bad_thr) -> None:
+                crit0["fallback_threshold_overrides"][accs[0]] = {
+                    "threshold": _t,
+                    "justification": "synthetic fixture value for self-test only",
+                    "same_mw_same_fold": False,
+                }
+
+            _write_manifest(clean_root, _f10_overrides_mut(_bad_value))
+            errs20, _ = validate_preregistration(clean_root)
+            assert any(
+                "F10.pass_criteria[0]" in e and "17.5b:P2-2" in e and "BMRB:18971" in e for e in errs20
+            ), f"Case 20 failed to reject non-finite/non-positive threshold {bad_thr!r}: {errs20}"
+        _write_manifest(clean_root, base_manifest)
+        cases_passed += 1
+
     print(
         f"OK [self-test]: live manifest verified + {cases_passed}/{total_cases} adversarial rejection tests passed "
         f"(manifest SHA-256 = {live_stats['manifest_sha256'][:16]}...)"
@@ -1818,7 +2010,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="Run live validation plus 16 isolated adversarial rejection unit tests.",
+        help="Run live validation plus 20 isolated adversarial rejection unit tests.",
     )
     parser.add_argument(
         "--strict-fallback-overrides",
