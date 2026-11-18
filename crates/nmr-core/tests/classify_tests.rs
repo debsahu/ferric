@@ -2191,6 +2191,41 @@ fn test_v0150_p1_8_and_p2_zip_tar_integrity_streaming_alloc_and_path_parity() {
         "DEFLATE stream inflating beyond declared uncomp_size must be rejected"
     );
 
+    //    (c) Valid `BFINAL = 1` stored DEFLATE block (and fixed-Huffman block) followed by
+    //        trailing unread bytes inside `comp_size` -> Err (`has_trailing_bytes()`).
+    let mut trailing_stored = deflate_stored_block(acqus_b, true);
+    trailing_stored.extend_from_slice(b"TRAILING_GARBAGE");
+    let trailing_stored_zip = build_custom_zip(&[RawZipSpec {
+        cd_name: "1/acqus",
+        local_name: "1/acqus",
+        method: 8,
+        raw_comp_data: &trailing_stored,
+        declared_uncomp_size: acqus_b.len() as u32,
+        crc32: crc32_ieee(acqus_b),
+        local_offset_override: None,
+    }]);
+    let trailing_err = extract_archive_virtual_entries("trailing_stored.zip", &trailing_stored_zip)
+        .expect_err("stored DEFLATE block with trailing bytes inside comp_size must be rejected");
+    assert!(trailing_err.contains("trailing"), "{trailing_err}");
+
+    let trailing_huff_zip = build_custom_zip(&[RawZipSpec {
+        cd_name: "1/acqus",
+        local_name: "1/acqus",
+        method: 8,
+        raw_comp_data: &[0x03, 0x00, 0xAA],
+        declared_uncomp_size: 0,
+        crc32: 0,
+        local_offset_override: None,
+    }]);
+    let trailing_huff_err =
+        extract_archive_virtual_entries("trailing_huff.zip", &trailing_huff_zip).expect_err(
+            "Huffman DEFLATE block with trailing bytes inside comp_size must be rejected",
+        );
+    assert!(
+        trailing_huff_err.contains("trailing"),
+        "{trailing_huff_err}"
+    );
+
     // 7. Streaming allocation in ZIP & tar inflate:
     //    Tiny ~120 B ZIP and ~528 B tar declaring `400 MiB` (`419_430_400` bytes) over a 4-byte
     //    truncated stream must fail in < 50 ms without pre-allocating 400 MiB!

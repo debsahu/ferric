@@ -789,6 +789,15 @@ impl<R: Read> GzipStreamDecoder<R> {
         self.phase == DeflatePhase::Done
     }
 
+    /// True if any unread byte remains in the bit reservoir (`>= 8` bits beyond final-byte padding)
+    /// or in the underlying buffered reader (`BufRead::fill_buf`).
+    fn has_trailing_bytes(&mut self) -> io::Result<bool> {
+        if self.bit_cnt >= 8 {
+            return Ok(true);
+        }
+        Ok(!std::io::BufRead::fill_buf(&mut self.inner)?.is_empty())
+    }
+
     #[inline]
     fn push_out_byte(&mut self, out: &mut [u8], written: &mut usize, b: u8) -> io::Result<()> {
         if self.total_out_bytes >= self.max_inflate_bytes {
@@ -2133,9 +2142,11 @@ fn scan_zip_seekable_internal<R: Read + Seek>(
         let buf: Vec<u8>;
         match it.method {
             0 => {
-                if (read_limit as u64) > it.comp_size {
+                if (read_limit as u64) > it.comp_size
+                    || (verify_full_crc && it.comp_size != it.uncomp_size)
+                {
                     return Err(format!(
-                        "ZIP stored entry '{}' size mismatch (comp={} < uncomp={})",
+                        "ZIP stored entry '{}' size mismatch (comp={} vs uncomp={})",
                         it.rel, it.comp_size, it.uncomp_size
                     ));
                 }
@@ -2194,6 +2205,15 @@ fn scan_zip_seekable_internal<R: Read + Seek>(
                     if !dec.is_finished() {
                         return Err(format!(
                             "ZIP entry '{}' DEFLATE stream is not terminated by a BFINAL block",
+                            it.rel
+                        ));
+                    }
+                    if dec
+                        .has_trailing_bytes()
+                        .map_err(|e| format!("ZIP DEFLATE tail check error in '{}': {e}", it.rel))?
+                    {
+                        return Err(format!(
+                            "ZIP entry '{}' has trailing bytes after BFINAL DEFLATE block",
                             it.rel
                         ));
                     }
