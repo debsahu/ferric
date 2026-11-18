@@ -171,8 +171,11 @@ Usage:
                     [--command <ferric_bin>] [-o <mcp_config.json>]
 
 Notes:
-  For --bridge-port <port>, any supplied --token or NMR_MCP_BEARER_TOKEN must be >= 32 characters;
-  prefer NMR_MCP_BEARER_TOKEN environment injection over ps-visible --token CLI arguments.
+  For --bridge-port <port>, emits canonical server key \"ferric-workbench\" matching nmr-gui's
+  1-click \"Copy MCP Config\" schema (Claude Desktop: \"transport\": \"streamable-http\" + \"url\";
+  Antigravity: \"serverUrl\" + \"X-Nmr-Access-Mode\"; Cursor/generic: \"url\"). Any supplied --token or
+  NMR_MCP_BEARER_TOKEN must be >= 32 characters; prefer NMR_MCP_BEARER_TOKEN environment injection
+  over ps-visible --token CLI arguments.
 "
 }
 

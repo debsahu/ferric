@@ -946,3 +946,62 @@ fn large_480aa_protein_webgpu_accuracy_and_under_5s_gate() {
         );
     }
 }
+
+#[test]
+fn test_f27_bayes_sa_wgsl_dawn_tint_const_eval_portability_and_parity() {
+    let wgsl_src = include_str!("../src/shaders/bayes_sa.wgsl");
+    assert!(
+        !wgsl_src.contains("bitcast<f32>"),
+        "bayes_sa.wgsl must not contain const-eval or runtime NaN-aliasing bitcast<f32>(...) expressions"
+    );
+
+    let Some(gpu) = require_gpu_solver() else {
+        return;
+    };
+    let priors = Priors::default();
+    let ref_data = nmr_core::nmrstar::read_star("data/fixtures/synthetic_ubiquitin.str", None)
+        .unwrap_or_else(|_| {
+            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../data/fixtures/synthetic_ubiquitin.str");
+            nmr_core::nmrstar::read_star(p, None).expect("load synthetic_ubiquitin.str")
+        });
+    let (peaks, _) = simulate(
+        &ref_data,
+        &SimConfig {
+            seed: 27,
+            p_missing_root: 0.05,
+            p_missing_peak: 0.05,
+            spurious_rate: 0.03,
+            ..SimConfig::default()
+        },
+    );
+    let cfg = BayesSaConfig {
+        seed: 27,
+        replicas: 16,
+        ..BayesSaConfig::default_gpu()
+    };
+    let cond = condition_peaks_preserving_hsqc_roots(&peaks, &cfg.tolerances);
+    let sys = build_spin_systems(&cond, &cfg.tolerances, cfg.max_cands, false).expect("sys");
+    let mats = gpu
+        .compute_energy_matrices(&sys, &ref_data.sequence, &priors, &cfg)
+        .expect("gpu mats");
+    let tables = build_bayes_move_tables(&mats, &cfg);
+    let mut rng = Rng::new(27);
+    let (ats, _poss, _es, _seeds) = build_initial_bayes_replicas(&mats, &tables, 16, &mut rng);
+
+    let gpu_es = gpu
+        .evaluate_states_energy(&mats, &ats)
+        .expect("F27 integer-sentinel Q27.36 state eval");
+    let mut max_err = 0.0_f64;
+    for (r, &gpu_e) in gpu_es.iter().enumerate() {
+        let cpu_e = evaluate_state_energy(&ats[r], &mats).expect("cpu state eval");
+        let err = (gpu_e - cpu_e).abs();
+        if err > max_err {
+            max_err = err;
+        }
+    }
+    assert!(
+        max_err < 4.6e-5,
+        "F27 CPU/GPU state-energy parity error {max_err:.3e} exceeded 4.6e-5 ceiling"
+    );
+}

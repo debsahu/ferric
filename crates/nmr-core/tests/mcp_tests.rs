@@ -1857,3 +1857,119 @@ fn test_adversarial_prealloc_content_length_413_and_non_loopback_bind_rejection(
         })
     );
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn test_f25_split_send_loopback_http_rejected_401_403_413_zero_econnreset() {
+    use nmr_core::mcp::handle_mcp_http_stream;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    let run_split_send = |headers: String, body: Vec<u8>, inter_send_pause_ms: u64| -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let srv_handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+            let mut srv = McpServer::new(McpSecurityPolicy::empty_read_only());
+            handle_mcp_http_stream(&mut srv, stream, "valid-32-char-secret-bearer-token-01")
+                .expect("handle_mcp_http_stream");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        client.set_nodelay(true).expect("TCP_NODELAY");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        client
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("client write timeout");
+
+        // Split syscall #1: HTTP request line + headers only
+        client
+            .write_all(headers.as_bytes())
+            .expect("split send #1 (headers)");
+        client.flush().expect("flush headers");
+
+        if inter_send_pause_ms > 0 {
+            std::thread::sleep(Duration::from_millis(inter_send_pause_ms));
+        }
+
+        // Split syscall #2: JSON-RPC request body (mirrors Python http.client / requests split send)
+        if !body.is_empty() {
+            client
+                .write_all(&body)
+                .expect("split send #2 (body must not fail with BrokenPipe)");
+            client.flush().expect("flush body");
+        }
+
+        let mut resp = String::new();
+        client
+            .read_to_string(&mut resp)
+            .expect("reading HTTP rejection must never fail with ECONNRESET / ConnectionReset");
+        srv_handle.join().expect("server thread join");
+        resp
+    };
+
+    let big_pad = "x".repeat(32 * 1024);
+    let json_body = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 99,
+        "method": "initialize",
+        "params": { "padding": big_pad }
+    }))
+    .unwrap();
+
+    for pause_ms in [0_u64, 8_u64] {
+        // 1. Split-send 401 Unauthorized (missing Bearer token & invalid Bearer token)
+        for auth_hdr in ["", "Authorization: Bearer wrong-bearer-token\r\n"] {
+            let hdr_401 = format!(
+                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth_hdr}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                json_body.len()
+            );
+            let resp_401 = run_split_send(hdr_401, json_body.clone(), pause_ms);
+            assert!(
+                resp_401.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+                "expected clean 401 on pause={pause_ms}ms, got: {resp_401}"
+            );
+            assert!(resp_401.contains("\"error\""));
+        }
+
+        // 2. Split-send 403 Forbidden (DNS-rebinding Host, duplicate Host, cross-origin Origin)
+        for bad_hdrs in [
+            format!(
+                "POST /mcp HTTP/1.1\r\nHost: attacker.example\r\nAuthorization: Bearer valid-32-char-secret-bearer-token-01\r\nContent-Length: {}\r\n\r\n",
+                json_body.len()
+            ),
+            format!(
+                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: evil.example\r\nAuthorization: Bearer valid-32-char-secret-bearer-token-01\r\nContent-Length: {}\r\n\r\n",
+                json_body.len()
+            ),
+            format!(
+                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://evil.example\r\nAuthorization: Bearer valid-32-char-secret-bearer-token-01\r\nContent-Length: {}\r\n\r\n",
+                json_body.len()
+            ),
+        ] {
+            let resp_403 = run_split_send(bad_hdrs, json_body.clone(), pause_ms);
+            assert!(
+                resp_403.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+                "expected clean 403 on pause={pause_ms}ms, got: {resp_403}"
+            );
+            assert!(resp_403.contains("\"error\""));
+        }
+
+        // 3. Split-send 413 Payload Too Large (Content-Length > MAX_MCP_FRAME_BYTES + body chunk)
+        let hdr_413 = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer valid-32-char-secret-bearer-token-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            nmr_core::mcp::MAX_MCP_FRAME_BYTES + 1024 * 1024
+        );
+        let resp_413 = run_split_send(hdr_413, vec![b'A'; 32 * 1024], pause_ms);
+        assert!(
+            resp_413.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+            "expected clean 413 on pause={pause_ms}ms, got: {resp_413}"
+        );
+        assert!(resp_413.contains("MAX_MCP_FRAME_BYTES"));
+    }
+}

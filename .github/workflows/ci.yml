@@ -18,9 +18,11 @@ jobs:
   test-and-lint:
     name: Test, Lint & Benchmark Gate (CPU + WebGPU)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux GUI & Mesa Vulkan (Lavapipe) packages
         run: |
@@ -34,13 +36,26 @@ jobs:
             libxcb-shape0-dev \
             libxcb-xfixes0-dev
 
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - name: Activate stable Rust toolchain (clippy, rustfmt)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component clippy rustfmt --no-self-update
+          rustup default stable
+          rustc -vV
+          cargo -V
 
       - name: Cache Cargo registry & build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ci-linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ci-linux-
 
       - name: Check formatting with rustfmt
         run: cargo fmt --all -- --check
@@ -96,19 +111,30 @@ jobs:
   wasm-check:
     name: WebAssembly + WebGPU GUI Check (wasm32-unknown-unknown)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust stable toolchain with wasm32-unknown-unknown
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      - name: Activate stable Rust toolchain (wasm32-unknown-unknown)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown --no-self-update
+          rustup default stable
 
       - name: Cache Cargo registry & WASM target artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          key: wasm32
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ci-wasm32-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ci-wasm32-
 
       - name: Check nmr-gui for wasm32-unknown-unknown
         run: cargo check --release -p nmr-gui --target wasm32-unknown-unknown
@@ -116,24 +142,35 @@ jobs:
   windows-check:
     name: Windows Cross-Target Check (x86_64-pc-windows-gnu)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install MinGW-w64 cross-toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
 
-      - name: Install Rust stable toolchain with x86_64-pc-windows-gnu
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-gnu
+      - name: Activate stable Rust toolchain (x86_64-pc-windows-gnu)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu --no-self-update
+          rustup default stable
 
       - name: Cache Cargo registry & Windows GNU target artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          key: windows-gnu
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ci-windows-gnu-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ci-windows-gnu-
 
       - name: Check nmr-cli & nmr-gui for x86_64-pc-windows-gnu (dev + release)
         run: |

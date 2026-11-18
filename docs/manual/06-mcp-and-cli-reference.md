@@ -284,16 +284,50 @@ Add the following block to your client's `mcpServers` configuration file (for **
 
 1. Open `ferric-gui` on your desktop, navigate to the **`🔌 MCP Bridge`** panel, choose **`ReadOnly`** (default) or **`ReadWrite`**, and click **Start Local Bridge**.
 2. `nmr-gui` binds strictly to `127.0.0.1:<port>` (ephemeral loopback port by default) and generates a fresh 256-bit OS CSPRNG session bearer token (`nmr_mcp_<64-hex>`, drawn from `/dev/urandom` on Unix and Windows CNG `BCryptGenRandom` on Windows).
-3. Click **Copy MCP Config** for **Antigravity**, **Claude Desktop**, or **Cursor**, which produces:
+3. Click **Copy MCP Config** (or run `ferric mcp-config --client <antigravity|claude-desktop|cursor> --bridge-port <port>`), which emits the identical canonical `"ferric-workbench"` entry for your selected host client:
+
+**Claude Desktop (`--client claude-desktop`)**:
 
 ```json
 {
   "mcpServers": {
     "ferric-workbench": {
-      "url": "http://127.0.0.1:54912/mcp",
       "headers": {
         "Authorization": "Bearer <session-bearer-token>"
-      }
+      },
+      "transport": "streamable-http",
+      "url": "http://127.0.0.1:54912/mcp"
+    }
+  }
+}
+```
+
+**Antigravity (`--client antigravity`)**:
+
+```json
+{
+  "mcpServers": {
+    "ferric-workbench": {
+      "headers": {
+        "Authorization": "Bearer <session-bearer-token>",
+        "X-Nmr-Access-Mode": "read-only"
+      },
+      "serverUrl": "http://127.0.0.1:54912/mcp"
+    }
+  }
+}
+```
+
+**Cursor / Generic MCP (`--client cursor`)**:
+
+```json
+{
+  "mcpServers": {
+    "ferric-workbench": {
+      "headers": {
+        "Authorization": "Bearer <session-bearer-token>"
+      },
+      "url": "http://127.0.0.1:54912/mcp"
     }
   }
 }
@@ -312,7 +346,7 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
    - Canonicalizes every configured `allowed_root` and target path via `std::fs::canonicalize`, blocking symlinks or dangling links escaping `--root`, and formats responses as workspace-relative paths so host user home directories are never leaked.
 3. **Loopback-Only Binding, 256-Bit CSPRNG / `>= 32`-Char Bearer Floor & DNS-Rebinding Defense**:
    - Both `ferric-gui` and `ferric mcp --transport http` refuse non-loopback bind addresses (`0.0.0.0`, LAN IPs, `[::]`).
-   - Every HTTP request must carry `Authorization: Bearer <token>` verified via non-branching constant-time byte comparison (`401 Unauthorized`), a loopback `Host` header (`127.0.0.1`, `[::1]`, or `localhost`), and **zero** cross-origin browser `Origin` headers (`403 Forbidden`), defeating local browser CSRF and DNS-rebinding attacks.
+   - Every HTTP request must carry `Authorization: Bearer <token>` verified via non-branching constant-time byte comparison (`401 Unauthorized`), a loopback `Host` header (`127.0.0.1`, `[::1]`, or `localhost`), and **zero** cross-origin browser `Origin` headers (`403 Forbidden`), defeating local browser CSRF and DNS-rebinding attacks; rejected `400`/`401`/`403`/`405`/`413` responses drain bounded unread request-body bytes into stack scratch (`0 B` heap allocation) and half-close cleanly (`Shutdown::Write`) so split-`send()` HTTP clients never encounter `ECONNRESET`.
    - For headless `ferric mcp --transport http` and `ferric mcp-config --bridge-port`, strongly prefer injecting `NMR_MCP_BEARER_TOKEN` via environment variables rather than passing `--token <bearer>` in `ps`-visible process `argv`. Any user-supplied token (`NMR_MCP_BEARER_TOKEN` or `--token`) must be at least **`32` trimmed characters** (`MIN_HTTP_BEARER_TOKEN_LEN = 32`, returning an error on shorter secrets); omitting both `NMR_MCP_BEARER_TOKEN` and `--token` on `ferric mcp --transport http` automatically generates a fresh 256-bit (`64`-hex-char) OS CSPRNG bearer token (`/dev/urandom` on Unix, Windows CNG `BCryptGenRandom` on Windows) and emits `MCP_HTTP_BEARER_TOKEN <hex64>` on `stderr` while keeping `stdout` clean.
 4. **100% Reversible AI Curation (`256`-Step `McpUndoLog`)**:
    - In `nmr-gui`, all 9 live workbench operations (`get_workbench_state`, `capture_viewport_png`, `undo_last_ai_edit`, plus the 3 `navigate_workbench` actions and 3 `propose_curation_edit` actions) synchronize safely with the render thread; mutating commands (`AssignSpinSystemToResidue`, `UnassignResidue`, `TogglePeakExclusion`, `JumpToResidue`, `SetCrosshairPpm`, `HighlightResidues3d`) execute exclusively through `McpUndoLog` (`MAX_MCP_UNDO_DEPTH = 256`), preserving bijective `(cluster_id <-> seq_id)` displacements so pressing **`Cmd/Ctrl+Z`** (or calling `undo_last_ai_edit`) restores the exact prior state in one step.

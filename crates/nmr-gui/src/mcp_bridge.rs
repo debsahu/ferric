@@ -1102,42 +1102,52 @@ impl McpClientTarget {
             Self::Cursor => "Cursor",
         }
     }
+    /// Map to the shared `nmr_core::mcp::McpClientTarget` enum for unified schema generation.
+    pub const fn to_core_target(self) -> nmr_core::mcp::McpClientTarget {
+        match self {
+            Self::Antigravity => nmr_core::mcp::McpClientTarget::Antigravity,
+            Self::ClaudeDesktop => nmr_core::mcp::McpClientTarget::ClaudeDesktop,
+            Self::Cursor => nmr_core::mcp::McpClientTarget::Cursor,
+        }
+    }
 }
 
-/// Build ready-to-paste client MCP configuration JSON for Antigravity, Claude Desktop, or Cursor.
+/// Build ready-to-paste client MCP configuration JSON for Antigravity, Claude Desktop, or Cursor
+/// using the canonical `nmr_core::mcp::generate_mcp_client_config_pretty` schema (`"ferric-workbench"`,
+/// `"transport": "streamable-http"` for Claude Desktop, `"serverUrl"` for Antigravity, `"url"` for Cursor).
 pub fn build_mcp_client_config_json(
     client: McpClientTarget,
     endpoint_url: &str,
     bearer_token: &str,
 ) -> String {
-    let auth_value = format!("Bearer {}", bearer_token.trim());
-    let server_entry = match client {
-        McpClientTarget::Antigravity => json!({
-            "serverUrl": endpoint_url,
-            "headers": {
-                "Authorization": auth_value,
-            }
-        }),
-        McpClientTarget::ClaudeDesktop => json!({
-            "transport": "http",
-            "url": endpoint_url,
-            "headers": {
-                "Authorization": auth_value,
-            }
-        }),
-        McpClientTarget::Cursor => json!({
-            "url": endpoint_url,
-            "headers": {
-                "Authorization": auth_value,
-            }
-        }),
+    build_mcp_client_config_json_with_permission(
+        client,
+        endpoint_url,
+        bearer_token,
+        McpBridgePermission::ReadOnly,
+    )
+}
+
+/// Build ready-to-paste client MCP configuration JSON with explicit [`McpBridgePermission`] mode,
+/// delegating directly to [`nmr_core::mcp::generate_mcp_client_config_pretty`] for 100% parity
+/// with `ferric mcp-config --bridge-port`.
+pub fn build_mcp_client_config_json_with_permission(
+    client: McpClientTarget,
+    endpoint_url: &str,
+    bearer_token: &str,
+    permission: McpBridgePermission,
+) -> String {
+    let access_mode = match permission {
+        McpBridgePermission::ReadOnly => nmr_core::mcp::McpAccessMode::ReadOnly,
+        McpBridgePermission::ReadWrite => nmr_core::mcp::McpAccessMode::ReadWrite,
     };
-    let doc = json!({
-        "mcpServers": {
-            "ferric-workbench": server_entry,
-        }
-    });
-    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
+    let mode = nmr_core::mcp::McpClientMode::HttpBridge {
+        endpoint_url: endpoint_url.trim().to_string(),
+        bearer_token: bearer_token.trim().to_string(),
+        access_mode,
+    };
+    nmr_core::mcp::generate_mcp_client_config_pretty(client.to_core_target(), &mode)
+        .unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Validate `Host` and optional browser `Origin` headers to prevent DNS-rebinding and browser CSRF
@@ -2344,10 +2354,11 @@ impl McpBridgeController {
 
     /// Build ready-to-paste client MCP configuration JSON for the currently selected client.
     pub fn build_client_config_json(&self) -> String {
-        build_mcp_client_config_json(
+        build_mcp_client_config_json_with_permission(
             self.selected_client,
             &self.endpoint_url(),
             &self.bearer_token(),
+            self.permission(),
         )
     }
 
@@ -2971,19 +2982,36 @@ mod tests {
             let cfg_str = build_mcp_client_config_json(
                 client,
                 "http://127.0.0.1:54321/mcp",
-                "nmr_mcp_testtoken",
+                "nmr_mcp_testtoken_0123456789abcdef",
             );
+            let core_expected = nmr_core::mcp::generate_mcp_client_config_pretty(
+                client.to_core_target(),
+                &nmr_core::mcp::McpClientMode::HttpBridge {
+                    endpoint_url: "http://127.0.0.1:54321/mcp".to_string(),
+                    bearer_token: "nmr_mcp_testtoken_0123456789abcdef".to_string(),
+                    access_mode: nmr_core::mcp::McpAccessMode::ReadOnly,
+                },
+            )
+            .expect("core config pretty");
+            assert_eq!(
+                cfg_str, core_expected,
+                "GUI bridge config for {client:?} must match nmr_core::mcp::generate_mcp_client_config_pretty byte-for-byte"
+            );
+
             let parsed: Value = serde_json::from_str(&cfg_str).expect("valid client config JSON");
             let entry = &parsed["mcpServers"]["ferric-workbench"];
             assert_eq!(
                 entry["headers"]["Authorization"],
-                "Bearer nmr_mcp_testtoken"
+                "Bearer nmr_mcp_testtoken_0123456789abcdef"
             );
             let url_val = entry
                 .get("serverUrl")
                 .or_else(|| entry.get("url"))
                 .and_then(Value::as_str);
             assert_eq!(url_val, Some("http://127.0.0.1:54321/mcp"));
+            if client == McpClientTarget::ClaudeDesktop {
+                assert_eq!(entry["transport"], "streamable-http");
+            }
         }
     }
 

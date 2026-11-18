@@ -1097,7 +1097,6 @@ impl BayesSaGpuSolver {
                 usage: wgpu::BufferUsages::UNIFORM,
             });
             let dummy_f = [0.0f32; 4];
-            let dummy_i = [0i32; 4];
             let dummy_f4 = [[0.0f32; 4]; 1];
             let dummy_u4 = [[0u32; 4]; 2];
             let b_ro_f = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1110,11 +1109,10 @@ impl BayesSaGpuSolver {
                 contents: bytemuck::cast_slice(&q36_ints),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-            let b_out = dev.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("bayes-eval-out"),
-                size: out_bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
+            let b_mat_a = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-eval-dummy-mat-a"),
+                contents: bytemuck::cast_slice(&dummy_f),
+                usage: wgpu::BufferUsages::STORAGE,
             });
             let b_mat_b = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("bayes-eval-dummy-mat-b"),
@@ -1126,10 +1124,11 @@ impl BayesSaGpuSolver {
                 contents: bytemuck::cast_slice(&at_flat),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-            let b_pos = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("bayes-eval-dummy-pos"),
-                contents: bytemuck::cast_slice(&dummy_i),
-                usage: wgpu::BufferUsages::STORAGE,
+            let b_out = dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("bayes-eval-out-i32"),
+                size: out_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
             });
             let b_sf = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("bayes-eval-dummy-sf"),
@@ -1160,7 +1159,7 @@ impl BayesSaGpuSolver {
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: b_out.as_entire_binding(),
+                        resource: b_mat_a.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
@@ -1172,7 +1171,7 @@ impl BayesSaGpuSolver {
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
-                        resource: b_pos.as_entire_binding(),
+                        resource: b_out.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 7,

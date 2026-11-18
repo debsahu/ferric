@@ -4338,6 +4338,8 @@ pub struct Mol3dViewerPanel {
     pub show_paste_modal: bool,
     pub paste_structure_buf: String,
     pub paste_restraints_buf: String,
+    pub custom_export_path: String,
+    pub last_exported_path: Option<std::path::PathBuf>,
     pub last_exported_svg: Option<String>,
     pub last_exported_png_bytes: Option<Vec<u8>>,
     pub show_mobile_options: bool,
@@ -4371,6 +4373,8 @@ impl Mol3dViewerPanel {
             show_paste_modal: false,
             paste_structure_buf: String::new(),
             paste_restraints_buf: String::new(),
+            custom_export_path: String::new(),
+            last_exported_path: None,
             last_exported_svg: None,
             last_exported_png_bytes: None,
             show_mobile_options: false,
@@ -4752,7 +4756,9 @@ impl Mol3dViewerPanel {
                 #[cfg(not(target_arch = "wasm32"))]
                 if ui
                     .button("PNG")
-                    .on_hover_text("Export high-DPI offscreen 4x MSAA PNG snapshot")
+                    .on_hover_text(
+                        "Export high-DPI offscreen 4x MSAA PNG snapshot (atomic CSPRNG temp file or custom save path)",
+                    )
                     .clicked()
                 {
                     if let Some(rs) = wgpu_render_state {
@@ -4772,15 +4778,23 @@ impl Mol3dViewerPanel {
                                 &self.scene,
                             ) {
                                 Ok(png) => {
-                                    let out_path =
-                                        std::env::temp_dir().join("nmr_structure_3d.png");
-                                    match write_mol3d_export_file(&out_path, &png, "PNG") {
-                                        Ok(()) => {
-                                            self.last_exported_png_bytes = Some(png);
+                                    let user_target = {
+                                        let t = self.custom_export_path.trim();
+                                        (!t.is_empty()).then(|| std::path::PathBuf::from(t))
+                                    };
+                                    match save_mol3d_snapshot(
+                                        user_target.as_deref(),
+                                        &png,
+                                        "png",
+                                        "PNG",
+                                    ) {
+                                        Ok(out_path) => {
                                             self.status_banner = format!(
                                                 "Exported 1600x1200 PNG ({})",
                                                 out_path.display()
                                             );
+                                            self.last_exported_path = Some(out_path);
+                                            self.last_exported_png_bytes = Some(png);
                                         }
                                         Err(err) => {
                                             self.status_banner = err;
@@ -4803,7 +4817,9 @@ impl Mol3dViewerPanel {
 
                 if ui
                     .button("SVG")
-                    .on_hover_text("Export deterministic XML-escaped vector SVG")
+                    .on_hover_text(
+                        "Export deterministic XML-escaped vector SVG (atomic CSPRNG temp file or custom save path)",
+                    )
                     .clicked()
                 {
                     if let Some(ens) = self.ensemble.as_ref() {
@@ -4818,15 +4834,24 @@ impl Mol3dViewerPanel {
                         );
                         #[cfg(not(target_arch = "wasm32"))]
                         {
-                            let out_path = std::env::temp_dir().join("nmr_structure_3d.svg");
-                            match write_mol3d_export_file(&out_path, svg.as_bytes(), "SVG") {
-                                Ok(()) => {
+                            let user_target = {
+                                let t = self.custom_export_path.trim();
+                                (!t.is_empty()).then(|| std::path::PathBuf::from(t))
+                            };
+                            match save_mol3d_snapshot(
+                                user_target.as_deref(),
+                                svg.as_bytes(),
+                                "svg",
+                                "SVG",
+                            ) {
+                                Ok(out_path) => {
                                     ui.ctx().copy_text(svg.clone());
-                                    self.last_exported_svg = Some(svg);
                                     self.status_banner = format!(
                                         "Exported vector SVG ({}, copied to clipboard).",
                                         out_path.display()
                                     );
+                                    self.last_exported_path = Some(out_path);
+                                    self.last_exported_svg = Some(svg);
                                 }
                                 Err(err) => {
                                     self.status_banner = err;
@@ -4842,6 +4867,16 @@ impl Mol3dViewerPanel {
                         }
                     }
                 }
+
+                #[cfg(not(target_arch = "wasm32"))]
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.custom_export_path)
+                        .desired_width(135.0)
+                        .hint_text("Save path (opt.)"),
+                )
+                .on_hover_text(
+                    "Optional save file or folder path for PNG/SVG export; leave blank for an unpredictable 0600 CSPRNG temp file",
+                );
             });
 
             // Control strip 2: Quantitative Putty / Colormap Track + Ensemble & Z-Slab sliders
@@ -5165,19 +5200,293 @@ pub fn format_ensemble_status_banner(ens: &StructureEnsemble3d) -> String {
     )
 }
 
-/// Write exported 3D snapshot bytes (`PNG` or `SVG`) to `path`, propagating filesystem I/O errors
-/// instead of silently reporting success.
+#[cfg(unix)]
+fn fill_mol3d_csprng_bytes(raw: &mut [u8; 8]) -> bool {
+    use std::io::Read as _;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(raw).is_ok() && raw.iter().any(|&b| b != 0) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn fill_mol3d_csprng_bytes(raw: &mut [u8; 8]) -> bool {
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    #[link(name = "bcrypt")]
+    #[allow(non_snake_case)]
+    extern "system" {
+        fn BCryptGenRandom(
+            hAlgorithm: *mut core::ffi::c_void,
+            pbBuffer: *mut u8,
+            cbBuffer: u32,
+            dwFlags: u32,
+        ) -> i32;
+    }
+    // SAFETY: `pbBuffer` points to a valid mutable 8-byte stack buffer (`cbBuffer = 8`),
+    // `hAlgorithm` is NULL with `BCRYPT_USE_SYSTEM_PREFERRED_RNG` (`0x0000_0002`) per Windows CNG,
+    // and both `status == 0` (`STATUS_SUCCESS`) and non-zero output bytes are checked before use.
+    let status = unsafe {
+        BCryptGenRandom(
+            core::ptr::null_mut(),
+            raw.as_mut_ptr(),
+            raw.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    status == 0 && raw.iter().any(|&b| b != 0)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn fill_mol3d_csprng_bytes(_raw: &mut [u8; 8]) -> bool {
+    false
+}
+
+/// Generate a 64-bit (`16`-lowercase-hex-character) unpredictable suffix from the OS CSPRNG
+/// (`/dev/urandom` on Unix, `BCryptGenRandom` on Windows; fails closed on unsupported targets).
+pub fn generate_mol3d_snapshot_hex16() -> Result<String, String> {
+    let mut raw = [0u8; 8];
+    if !fill_mol3d_csprng_bytes(&mut raw) {
+        return Err("OS CSPRNG unavailable for 3D snapshot temporary file creation".to_string());
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(16);
+    for b in raw {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    Ok(out)
+}
+
+fn validate_snapshot_path_str(path: &std::path::Path, format_label: &str) -> Result<(), String> {
+    let s = path.as_os_str();
+    if s.is_empty() {
+        return Err(format!("{format_label} export path must not be empty"));
+    }
+    if path.to_string_lossy().contains('\0') {
+        return Err(format!(
+            "{format_label} export path contains forbidden null byte"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_extension(ext: &str, format_label: &str) -> Result<String, String> {
+    let trimmed = ext.trim().trim_start_matches('.');
+    if trimmed.is_empty()
+        || trimmed.len() > 16
+        || !trimmed.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return Err(format!(
+            "{format_label} export extension '{ext}' must be 1..=16 ASCII alphanumeric characters"
+        ));
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
+/// Atomically create and write a brand-new 3D snapshot file at `path` using `create_new(true)`
+/// (`O_CREAT | O_EXCL` + mode `0600` on Unix, `CREATE_NEW` on Windows).
+///
+/// Refuses pre-existing regular files, directories, live symlinks, and dangling symlinks without
+/// following symlinks or truncating existing targets.
+pub fn write_mol3d_exclusive_new_file(
+    path: &std::path::Path,
+    bytes: &[u8],
+    format_label: &str,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    validate_snapshot_path_str(path, format_label)?;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+
+    let mut file = opts.open(path).map_err(|err| {
+        format!(
+            "{format_label} export failed creating '{}': {err}",
+            path.display()
+        )
+    })?;
+    file.write_all(bytes)
+        .and_then(|()| file.flush())
+        .map_err(|err| {
+            format!(
+                "{format_label} export failed writing '{}': {err}",
+                path.display()
+            )
+        })
+}
+
+/// Atomically write 3D snapshot bytes (`PNG` or `SVG`) into an OS-CSPRNG-suffixed file
+/// (`ferric_structure_3d_{hex16}.{ext}`) inside `dir` using `create_new(true)` (`0600` on Unix).
+pub fn write_mol3d_temp_snapshot_in_dir(
+    dir: &std::path::Path,
+    bytes: &[u8],
+    ext: &str,
+    format_label: &str,
+) -> Result<std::path::PathBuf, String> {
+    use std::io::Write as _;
+    validate_snapshot_path_str(dir, format_label)?;
+    let ext_clean = validate_snapshot_extension(ext, format_label)?;
+
+    for _attempt in 0..8 {
+        let hex16 = generate_mol3d_snapshot_hex16()?;
+        let candidate = dir.join(format!("ferric_structure_3d_{hex16}.{ext_clean}"));
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+
+        match opts.open(&candidate) {
+            Ok(mut file) => {
+                file.write_all(bytes)
+                    .and_then(|()| file.flush())
+                    .map_err(|err| {
+                        format!(
+                            "{format_label} export failed writing '{}': {err}",
+                            candidate.display()
+                        )
+                    })?;
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "{format_label} export failed creating '{}': {err}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "{format_label} export exhausted CSPRNG collision retries in '{}'",
+        dir.display()
+    ))
+}
+
+/// Atomically write 3D snapshot bytes (`PNG` or `SVG`) to an unpredictable OS-CSPRNG-suffixed
+/// temporary file (`std::env::temp_dir().join("ferric_structure_3d_{hex16}.{ext}")`) with
+/// `create_new(true)` (`O_CREAT | O_EXCL`, mode `0600` on Unix).
+pub fn write_mol3d_temp_snapshot(
+    bytes: &[u8],
+    ext: &str,
+    format_label: &str,
+) -> Result<std::path::PathBuf, String> {
+    write_mol3d_temp_snapshot_in_dir(&std::env::temp_dir(), bytes, ext, format_label)
+}
+
+/// Write exported 3D snapshot bytes (`PNG` or `SVG`) to an explicit user-selected `path`,
+/// refusing symlinks/non-regular targets, using `create_new(true)` (`0600` on Unix) when `path`
+/// does not yet exist, and propagating filesystem I/O errors instead of silently reporting success.
 pub fn write_mol3d_export_file(
     path: &std::path::Path,
     bytes: &[u8],
     format_label: &str,
 ) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|err| {
-        format!(
+    use std::io::Write as _;
+    validate_snapshot_path_str(path, format_label)?;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "{format_label} export refused symlink target '{}'",
+                    path.display()
+                ));
+            }
+            if !meta.file_type().is_file() {
+                return Err(format!(
+                    "{format_label} export failed writing '{}': target is not a regular file",
+                    path.display()
+                ));
+            }
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                // O_NOFOLLOW ensures symlink swap between symlink_metadata() and open() is refused
+                #[cfg(target_os = "macos")]
+                opts.custom_flags(0x0100);
+                #[cfg(target_os = "linux")]
+                opts.custom_flags(0x20000);
+            }
+            let mut file = opts.open(path).map_err(|err| {
+                format!(
+                    "{format_label} export failed writing '{}': {err}",
+                    path.display()
+                )
+            })?;
+            file.write_all(bytes)
+                .and_then(|()| file.flush())
+                .map_err(|err| {
+                    format!(
+                        "{format_label} export failed writing '{}': {err}",
+                        path.display()
+                    )
+                })
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            write_mol3d_exclusive_new_file(path, bytes, format_label).map_err(|create_err| {
+                create_err.replacen("export failed creating", "export failed writing", 1)
+            })
+        }
+        Err(err) => Err(format!(
             "{format_label} export failed writing '{}': {err}",
             path.display()
-        )
-    })
+        )),
+    }
+}
+
+/// Save a 3D snapshot either to an explicit `user_selected_path` (if `Some`, supporting both a
+/// file path and an existing directory) or to an atomic `create_new(true)` OS-CSPRNG-suffixed
+/// temporary file (`ferric_structure_3d_{hex16}.{ext}`).
+pub fn save_mol3d_snapshot(
+    user_selected_path: Option<&std::path::Path>,
+    bytes: &[u8],
+    ext: &str,
+    format_label: &str,
+) -> Result<std::path::PathBuf, String> {
+    let ext_clean = validate_snapshot_extension(ext, format_label)?;
+    match user_selected_path {
+        None => write_mol3d_temp_snapshot(bytes, &ext_clean, format_label),
+        Some(raw_path) => {
+            validate_snapshot_path_str(raw_path, format_label)?;
+            if let Ok(meta) = std::fs::symlink_metadata(raw_path) {
+                if meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "{format_label} export refused symlink target '{}'",
+                        raw_path.display()
+                    ));
+                }
+                if meta.is_dir() {
+                    return write_mol3d_temp_snapshot_in_dir(
+                        raw_path,
+                        bytes,
+                        &ext_clean,
+                        format_label,
+                    );
+                }
+            }
+            let dest = if raw_path.extension().is_none() {
+                raw_path.with_extension(&ext_clean)
+            } else {
+                raw_path.to_path_buf()
+            };
+            write_mol3d_export_file(&dest, bytes, format_label)?;
+            Ok(dest)
+        }
+    }
 }
 
 #[cfg(test)]

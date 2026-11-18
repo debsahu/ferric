@@ -3998,23 +3998,25 @@ pub fn handle_mcp_http_stream(
         return Ok(());
     }
     if req_exceeded {
-        write_http_response(
+        return write_rejected_http_response(
+            &mut reader,
             &mut stream,
             413,
             "Payload Too Large",
             r#"{"error":"request line exceeds maximum length"}"#,
-        )?;
-        return Ok(());
+            None,
+        );
     }
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
-        write_http_response(
+        return write_rejected_http_response(
+            &mut reader,
             &mut stream,
             400,
             "Bad Request",
             r#"{"error":"bad request"}"#,
-        )?;
-        return Ok(());
+            Some(0),
+        );
     }
     let method = parts[0];
 
@@ -4024,13 +4026,14 @@ pub fn handle_mcp_http_stream(
     loop {
         header_count += 1;
         if header_count > MAX_MCP_HEADER_COUNT {
-            write_http_response(
+            return write_rejected_http_response(
+                &mut reader,
                 &mut stream,
                 400,
                 "Bad Request",
                 r#"{"error":"too many HTTP headers"}"#,
-            )?;
-            return Ok(());
+                None,
+            );
         }
         let mut line = String::new();
         let (hb, h_exceeded) =
@@ -4039,13 +4042,14 @@ pub fn handle_mcp_http_stream(
             break;
         }
         if h_exceeded {
-            write_http_response(
+            return write_rejected_http_response(
+                &mut reader,
                 &mut stream,
                 413,
                 "Payload Too Large",
                 r#"{"error":"HTTP header line exceeds maximum length"}"#,
-            )?;
-            return Ok(());
+                None,
+            );
         }
         if let Some((k, v)) = line.split_once(':') {
             let key_lower = k.trim().to_ascii_lowercase();
@@ -4056,14 +4060,17 @@ pub fn handle_mcp_http_stream(
         }
     }
 
+    let drain_hint = parse_rejected_drain_hint(&headers);
+
     if duplicate_host {
-        write_http_response(
+        return write_rejected_http_response(
+            &mut reader,
             &mut stream,
             403,
             "Forbidden",
             r#"{"error":"duplicate Host header rejected"}"#,
-        )?;
-        return Ok(());
+            drain_hint,
+        );
     }
 
     if let Err((status, reason)) = validate_loopback_http_headers(&headers, expected_bearer_token) {
@@ -4073,18 +4080,25 @@ pub fn handle_mcp_http_stream(
             "Forbidden"
         };
         let body = serde_json::to_string(&json!({ "error": reason })).unwrap_or_default();
-        write_http_response(&mut stream, status, status_text, &body)?;
-        return Ok(());
+        return write_rejected_http_response(
+            &mut reader,
+            &mut stream,
+            status,
+            status_text,
+            &body,
+            drain_hint,
+        );
     }
 
     if method != "POST" {
-        write_http_response(
+        return write_rejected_http_response(
+            &mut reader,
             &mut stream,
             405,
             "Method Not Allowed",
             r#"{"error":"MCP Streamable HTTP requires POST"}"#,
-        )?;
-        return Ok(());
+            drain_hint,
+        );
     }
 
     let content_len = match headers.get("content-length") {
@@ -4092,22 +4106,24 @@ pub fn handle_mcp_http_stream(
         Some(raw_len) => match parse_bounded_content_length(raw_len, MAX_MCP_FRAME_BYTES) {
             Ok(n) => n,
             Err(ContentLengthError::Malformed) => {
-                write_http_response(
+                return write_rejected_http_response(
+                    &mut reader,
                     &mut stream,
                     400,
                     "Bad Request",
                     r#"{"error":"invalid Content-Length header"}"#,
-                )?;
-                return Ok(());
+                    None,
+                );
             }
             Err(ContentLengthError::ExceedsLimit { .. }) => {
-                write_http_response(
+                return write_rejected_http_response(
+                    &mut reader,
                     &mut stream,
                     413,
                     "Payload Too Large",
                     r#"{"error":"payload exceeds MAX_MCP_FRAME_BYTES"}"#,
-                )?;
-                return Ok(());
+                    None,
+                );
             }
         },
     };
@@ -4123,6 +4139,7 @@ pub fn handle_mcp_http_stream(
                 "Bad Request",
                 r#"{"error":"invalid utf8"}"#,
             )?;
+            let _ = stream.shutdown(std::net::Shutdown::Write);
             return Ok(());
         }
     };
@@ -4130,6 +4147,91 @@ pub fn handle_mcp_http_stream(
     match handle_mcp_json_request(server, body_str) {
         Some(resp_json) => write_http_response(&mut stream, 200, "OK", &resp_json)?,
         None => write_http_response(&mut stream, 202, "Accepted", "")?,
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    Ok(())
+}
+
+/// Bounded stack-only byte budget (`1 MiB`, zero heap allocation) drained on rejected (`400`/`401`/
+/// `403`/`405`/`413`) loopback HTTP requests before closing `TcpStream`, preventing BSD/Darwin
+/// kernel `TCP RST` (`ECONNRESET`) when split-`send()` HTTP clients transmit headers then body.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_MCP_HTTP_REJECT_DRAIN_BYTES: usize = 1024 * 1024;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_rejected_drain_hint(headers: &BTreeMap<String, String>) -> Option<usize> {
+    match headers.get("content-length") {
+        Some(raw) => parse_bounded_content_length(raw, MAX_MCP_HTTP_REJECT_DRAIN_BYTES).ok(),
+        None => {
+            if headers.contains_key("transfer-encoding") {
+                None
+            } else {
+                Some(0)
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn drain_rejected_http_body(
+    reader: &mut io::BufReader<std::net::TcpStream>,
+    expected_bytes: Option<usize>,
+    timeout: std::time::Duration,
+) -> usize {
+    let target = match expected_bytes {
+        Some(0) => return 0,
+        Some(n) => n.min(MAX_MCP_HTTP_REJECT_DRAIN_BYTES),
+        None => MAX_MCP_HTTP_REJECT_DRAIN_BYTES,
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    let mut drained = 0usize;
+    let mut scratch = [0u8; 8192];
+    while drained < target {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let rem_time = (deadline - now).max(std::time::Duration::from_millis(1));
+        let _ = reader.get_ref().set_read_timeout(Some(rem_time));
+        let want = (target - drained).min(scratch.len());
+        match reader.read(&mut scratch[..want]) {
+            Ok(0) => break,
+            Ok(n) => drained += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    drained
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_rejected_http_response(
+    reader: &mut io::BufReader<std::net::TcpStream>,
+    stream: &mut std::net::TcpStream,
+    status_code: u16,
+    status_text: &str,
+    body: &str,
+    expected_body_bytes: Option<usize>,
+) -> io::Result<()> {
+    let pre_drained = drain_rejected_http_body(
+        reader,
+        expected_body_bytes,
+        std::time::Duration::from_millis(200),
+    );
+    write_http_response(stream, status_code, status_text, body)?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let post_budget = match expected_body_bytes {
+        Some(n) => n
+            .min(MAX_MCP_HTTP_REJECT_DRAIN_BYTES)
+            .saturating_sub(pre_drained),
+        None => MAX_MCP_HTTP_REJECT_DRAIN_BYTES,
+    };
+    if post_budget > 0 {
+        let _ = drain_rejected_http_body(
+            reader,
+            Some(post_budget),
+            std::time::Duration::from_millis(50),
+        );
     }
     Ok(())
 }

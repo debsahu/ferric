@@ -620,12 +620,62 @@ fn test_cli_mcp_config_all_clients_and_adversarial_flag_errors() {
             .output()
             .expect("run mcp-config bridge");
         assert!(out_bridge.status.success());
+        let stdout_str = String::from_utf8(out_bridge.stdout.clone()).expect("utf8 stdout");
         let parsed_bridge: Value =
-            serde_json::from_slice(&out_bridge.stdout).expect("valid bridge mcp-config JSON");
+            serde_json::from_str(&stdout_str).expect("valid bridge mcp-config JSON");
+        let wb_entry = &parsed_bridge["mcpServers"]["ferric-workbench"];
         assert_eq!(
-            parsed_bridge["mcpServers"]["ferric-workbench"]["headers"]["Authorization"],
+            wb_entry["headers"]["Authorization"],
             format!("Bearer {bridge_cli_token}")
         );
+
+        let core_target = match client {
+            "antigravity" => nmr_core::mcp::McpClientTarget::Antigravity,
+            "claude-desktop" => {
+                assert_eq!(wb_entry["transport"], "streamable-http");
+                assert_eq!(wb_entry["url"], "http://127.0.0.1:51439/mcp");
+                nmr_core::mcp::McpClientTarget::ClaudeDesktop
+            }
+            "cursor" | "generic" => {
+                assert_eq!(wb_entry["url"], "http://127.0.0.1:51439/mcp");
+                assert!(wb_entry.get("transport").is_none());
+                nmr_core::mcp::McpClientTarget::Cursor
+            }
+            _ => unreachable!(),
+        };
+        let expected_pretty = nmr_core::mcp::generate_mcp_client_config_pretty(
+            core_target,
+            &nmr_core::mcp::McpClientMode::HttpBridge {
+                endpoint_url: "http://127.0.0.1:51439/mcp".to_string(),
+                bearer_token: bridge_cli_token.to_string(),
+                access_mode: nmr_core::mcp::McpAccessMode::ReadOnly,
+            },
+        )
+        .expect("core expected pretty");
+        assert_eq!(
+            stdout_str.trim_end(),
+            expected_pretty,
+            "CLI mcp-config --client {client} --bridge-port must match canonical nmr_core::mcp schema byte-for-byte"
+        );
+    }
+
+    // F26 cross-check: verify `docs/manual/06-mcp-and-cli-reference.md` & `docs/specs/18-mcp-server-and-bridge.md`
+    // document the exact canonical `"ferric-workbench"` + `"transport": "streamable-http"` schema
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let manual_ch06 =
+        fs::read_to_string(repo_root.join("docs/manual/06-mcp-and-cli-reference.md")).unwrap();
+    let spec_18 =
+        fs::read_to_string(repo_root.join("docs/specs/18-mcp-server-and-bridge.md")).unwrap();
+    for doc_txt in [&manual_ch06, &spec_18] {
+        assert!(doc_txt.contains("\"ferric-workbench\""));
+        assert!(doc_txt.contains("\"streamable-http\""));
+        assert!(!doc_txt.contains("\"nmr-assign-workbench\""));
+        assert!(!doc_txt.contains("\"nmrassign-workbench\""));
     }
 
     // Adversarial `mcp-config` invocations (including < 32-char `--token` on `--bridge-port`) must exit non-zero

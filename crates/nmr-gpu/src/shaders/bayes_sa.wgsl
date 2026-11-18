@@ -484,9 +484,9 @@ fn eval_state_energies(@builtin(global_invocation_id) gid: vec3<u32>) {
             let cell2 = 2u * (eu_off + u32(s) * k_len + k);
             let lo = bitcast<u32>(ro_ints[cell2]);
             let hi = ro_ints[cell2 + 1u];
-            if (hi == 2147483647 && lo == 4294967295u) {
-                rw_mat_a[2u * idx] = bitcast<f32>(4294967295u);
-                rw_mat_a[2u * idx + 1u] = bitcast<f32>(2147483647u);
+            if (hi == 2147483647 && lo == 0xffffffffu) {
+                pos_buf[2u * idx] = -1;
+                pos_buf[2u * idx + 1u] = 2147483647;
                 return;
             }
             acc = i64_add(acc, vec2<u32>(lo, bitcast<u32>(hi)));
@@ -502,8 +502,8 @@ fn eval_state_energies(@builtin(global_invocation_id) gid: vec3<u32>) {
             acc = i64_add(acc, vec2<u32>(lo, bitcast<u32>(hi)));
         }
     }
-    rw_mat_a[2u * idx] = bitcast<f32>(acc.x);
-    rw_mat_a[2u * idx + 1u] = bitcast<f32>(acc.y);
+    pos_buf[2u * idx] = bitcast<i32>(acc.x);
+    pos_buf[2u * idx + 1u] = bitcast<i32>(acc.y);
 }
 
 // ============================================================================

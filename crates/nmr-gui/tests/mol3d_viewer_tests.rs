@@ -1153,3 +1153,142 @@ fn test_p2_explicit_canonical_variant_override_persists() {
     assert_eq!(ribbon.variant_for(0), ResidueVariant::Canonical);
     assert_eq!(ribbon.variant_for(1), ResidueVariant::Canonical);
 }
+
+#[test]
+fn test_f24_unpredictable_csprng_create_new_and_symlink_collision_refusal() {
+    use nmr_gui::mol3d_viewer::{
+        generate_mol3d_snapshot_hex16, save_mol3d_snapshot, write_mol3d_exclusive_new_file,
+        write_mol3d_export_file, write_mol3d_temp_snapshot, write_mol3d_temp_snapshot_in_dir,
+    };
+
+    let h1 = generate_mol3d_snapshot_hex16().expect("OS CSPRNG hex16 #1");
+    let h2 = generate_mol3d_snapshot_hex16().expect("OS CSPRNG hex16 #2");
+    assert_eq!(h1.len(), 16);
+    assert_eq!(h2.len(), 16);
+    assert_ne!(h1, h2, "CSPRNG suffixes must be unique and unpredictable");
+    assert!(h1.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
+    assert_ne!(h1, "0000000000000000");
+
+    let sandbox = std::env::temp_dir().join(format!("ferric_f24_mol3d_test_{h1}"));
+    std::fs::create_dir_all(&sandbox).expect("create F24 test sandbox");
+
+    // 1. Default temp-dir snapshot writer creates unpredictable `ferric_structure_3d_{hex16}.{ext}` with 0600 mode
+    let sys_tmp_png =
+        write_mol3d_temp_snapshot(b"\x89PNG\r\n\x1a\ntest", "png", "PNG").expect("sys temp png");
+    let sys_fname = sys_tmp_png
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    assert!(
+        sys_fname.starts_with("ferric_structure_3d_") && sys_fname.ends_with(".png"),
+        "unexpected temp filename: {sys_fname}"
+    );
+    assert_eq!(
+        sys_fname.len(),
+        "ferric_structure_3d_".len() + 16 + ".png".len()
+    );
+    assert_ne!(sys_fname, "nmr_structure_3d.png");
+    let _ = std::fs::remove_file(&sys_tmp_png);
+
+    let mut seen_names = std::collections::BTreeSet::new();
+    for i in 0..8 {
+        let p = write_mol3d_temp_snapshot_in_dir(
+            &sandbox,
+            format!("<svg id=\"{i}\"/>").as_bytes(),
+            "svg",
+            "SVG",
+        )
+        .expect("sandbox CSPRNG temp svg");
+        let fname = p.file_name().unwrap().to_string_lossy().to_string();
+        assert!(fname.starts_with("ferric_structure_3d_") && fname.ends_with(".svg"));
+        assert!(
+            seen_names.insert(fname),
+            "duplicate CSPRNG filename emitted"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "temp snapshot must be mode 0600, got {mode:o}");
+        }
+    }
+
+    // 2. Exclusive `create_new(true)` writer refuses existing regular-file collisions without truncating
+    let existing_file = sandbox.join("collision_target.png");
+    std::fs::write(&existing_file, b"ORIGINAL_PROTECTED_DATA").unwrap();
+    let coll_err = write_mol3d_exclusive_new_file(&existing_file, b"OVERWRITE", "PNG")
+        .expect_err("create_new must refuse existing file collision");
+    assert!(coll_err.contains("PNG export failed"), "got: {coll_err}");
+    assert_eq!(
+        std::fs::read(&existing_file).unwrap(),
+        b"ORIGINAL_PROTECTED_DATA",
+        "collision refusal must preserve existing file bytes untouched"
+    );
+
+    // 3. Explicit user-selected path writer succeeds on clean regular files & directories, and rejects bad extensions
+    let user_svg_stem = sandbox.join("figure_panel_a");
+    let saved_user_svg = save_mol3d_snapshot(Some(&user_svg_stem), b"<svg/>", "svg", "SVG")
+        .expect("explicit user stem save");
+    assert_eq!(saved_user_svg, sandbox.join("figure_panel_a.svg"));
+    assert_eq!(std::fs::read(&saved_user_svg).unwrap(), b"<svg/>");
+
+    let saved_in_dir =
+        save_mol3d_snapshot(Some(&sandbox), b"PNGDATA", "png", "PNG").expect("directory save");
+    assert_eq!(saved_in_dir.parent(), Some(sandbox.as_path()));
+    assert!(saved_in_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("ferric_structure_3d_"));
+
+    assert!(write_mol3d_temp_snapshot_in_dir(&sandbox, b"x", "../evil", "PNG").is_err());
+    assert!(write_mol3d_temp_snapshot_in_dir(&sandbox, b"x", "", "PNG").is_err());
+
+    // 4. Adversarial live & dangling symlink refusal on both `create_new` and explicit user-path writers
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let victim = sandbox.join("sensitive_victim.txt");
+        std::fs::write(&victim, b"DO_NOT_CLOBBER").unwrap();
+
+        let live_link = sandbox.join("planted_live_symlink.png");
+        symlink(&victim, &live_link).expect("create live symlink");
+
+        assert!(
+            write_mol3d_exclusive_new_file(&live_link, b"ATTACK", "PNG").is_err(),
+            "exclusive create_new writer must refuse live symlink"
+        );
+        let sym_err = write_mol3d_export_file(&live_link, b"ATTACK", "PNG")
+            .expect_err("explicit export writer must refuse live symlink");
+        assert!(sym_err.contains("symlink"), "got: {sym_err}");
+        assert!(
+            save_mol3d_snapshot(Some(&live_link), b"ATTACK", "png", "PNG").is_err(),
+            "save_mol3d_snapshot must refuse live symlink"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"DO_NOT_CLOBBER",
+            "victim file behind symlink must remain 100% intact"
+        );
+
+        let dangling_target = sandbox.join("should_never_be_created.svg");
+        let dangling_link = sandbox.join("planted_dangling_symlink.svg");
+        symlink(&dangling_target, &dangling_link).expect("create dangling symlink");
+
+        assert!(
+            write_mol3d_exclusive_new_file(&dangling_link, b"<svg/>", "SVG").is_err(),
+            "exclusive create_new writer must refuse dangling symlink"
+        );
+        assert!(
+            write_mol3d_export_file(&dangling_link, b"<svg/>", "SVG").is_err(),
+            "explicit export writer must refuse dangling symlink"
+        );
+        assert!(
+            !dangling_target.exists(),
+            "dangling symlink target must never be created"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
