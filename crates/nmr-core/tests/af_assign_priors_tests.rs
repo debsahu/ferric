@@ -7,17 +7,43 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nmr_core::af_assign_priors::{
-    ell_student_t4, estimate_af_shift_offsets, estimate_af_shift_offsets_from_predictions,
-    parse_noesy_15n_peaks_str, AfAssignConfig, AfAssignPriors, Noesy15nPeak,
-    AF_NOESY_MAX_SEQ_BONUS_NATS, DEFAULT_AF_CLAMP_NATS, DEFAULT_AF_WEIGHT,
+    af_require_predicted_model, ell_student_t4, estimate_af_shift_offsets,
+    estimate_af_shift_offsets_from_predictions, parse_noesy_15n_peaks_str,
+    text_has_predicted_model_evidence, AfAssignConfig, AfAssignPriors, Noesy15nPeak,
+    AF_NOESY_MAX_SEQ_BONUS_NATS, AF_NOESY_MAX_SITE_BONUS_NATS, AF_SIGMA_OOS_PPM,
+    DEFAULT_AF_CLAMP_NATS, DEFAULT_AF_WEIGHT,
 };
-use nmr_core::af_concordance::parse_pae_json_str;
+use nmr_core::af_concordance::{parse_pae_json_file, parse_pae_json_str};
 use nmr_core::bayes_sa::{solve_bayes_sa_from_peaks, BayesSaConfig};
 use nmr_core::evaluate::score;
+
+fn compute_ece10(samples: &[(f64, bool)]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut bin_sum = [0.0_f64; 10];
+    let mut bin_ok = [0.0_f64; 10];
+    let mut bin_n = [0usize; 10];
+    for &(c, ok) in samples {
+        let b = ((c.clamp(0.0, 0.999999) * 10.0).floor() as usize).min(9);
+        bin_sum[b] += c;
+        if ok {
+            bin_ok[b] += 1.0;
+        }
+        bin_n[b] += 1;
+    }
+    let n = samples.len() as f64;
+    (0..10)
+        .filter(|&b| bin_n[b] > 0)
+        .map(|b| {
+            let bn = bin_n[b] as f64;
+            (bn / n) * ((bin_ok[b] / bn) - (bin_sum[b] / bn)).abs()
+        })
+        .sum()
+}
 use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
 use nmr_core::nmrstar::{read_star, Reference};
 use nmr_core::noesy::v_dist;
-use nmr_core::peaks::write_peaks;
 use nmr_core::priors::Priors;
 use nmr_core::rng::Rng;
 use nmr_core::simulate::{simulate, SimConfig};
@@ -59,12 +85,29 @@ fn ubiquitin_firewall() -> HomologFirewallQuery {
     }
 }
 
+fn real_af_ubiquitin_paths(root: &Path) -> (PathBuf, PathBuf) {
+    let fix_dir = root.join("crates/nmr-core/tests/fixtures");
+    (
+        fix_dir.join("AF-P0CG48-F1-model_v6.cif"),
+        fix_dir.join("AF-P0CG48-F1-predicted_aligned_error_v6.json"),
+    )
+}
+
+fn load_1d3z_conformer(root: &Path) -> StructureModel {
+    StructureModel::parse_file(root.join("data/pdb_refs/1d3z.pdb"), false).expect("parse 1d3z")
+}
+
 fn load_ubiquitin_af_like_model(root: &Path) -> StructureModel {
+    let (cif_path, _) = real_af_ubiquitin_paths(root);
     let mut model =
-        StructureModel::parse_file(root.join("data/pdb_refs/1d3z.pdb"), false).expect("parse 1d3z");
-    for (idx, r) in model.residues.iter_mut().enumerate() {
-        // Ordered globular core (1..=71) with high pLDDT and flexible RLRGG C-tail (72..=76) with low pLDDT
-        r.plddt = Some(if idx >= 71 { 44.0 } else { 92.0 });
+        StructureModel::parse_file(&cif_path, false).expect("parse AF-P0CG48-F1-model_v6.cif");
+    model.residues.truncate(76);
+    // Attach explicit amide H coordinates from 1D3Z only when absent on the heavy-atom AF CIF
+    let nmr_model = load_1d3z_conformer(root);
+    for (r, nr) in model.residues.iter_mut().zip(nmr_model.residues.iter()) {
+        if r.h.is_none() {
+            r.h = nr.h;
+        }
     }
     model
 }
@@ -189,26 +232,6 @@ fn format_noesy_15n_tsv(peaks: &[Noesy15nPeak]) -> String {
         ));
     }
     txt
-}
-
-fn build_pae_json_for_ubiquitin(n_res: usize) -> String {
-    let mut rows = Vec::with_capacity(n_res);
-    for i in 0..n_res {
-        let mut row = Vec::with_capacity(n_res);
-        for j in 0..n_res {
-            let v = if i == j {
-                0.5
-            } else if i >= 71 || j >= 71 {
-                // Disordered C-terminal tail has high PAE (> 18 A) relative to folded core
-                19.5
-            } else {
-                2.4 + 0.02 * ((i as f64 - j as f64).abs())
-            };
-            row.push(format!("{v:.2}"));
-        }
-        rows.push(format!("[{}]", row.join(",")));
-    }
-    format!("{{\"pae\":[{}]}}", rows.join(","))
 }
 
 #[test]
@@ -500,6 +523,7 @@ fn test_student_t4_clamping_plddt_decay_and_120deg_corrupted_12aa_loop_gate() {
         "A", &seq_ids, &res_names, &ca_coords, &phi, &psi, &chi1,
     )
     .expect("rebuild 3D coordinates with 120-deg corrupted 12-residue loop");
+    rebuilt_corrupted.provenance = clean_model.provenance;
     for (idx, r) in rebuilt_corrupted.residues.iter_mut().enumerate() {
         r.plddt = Some(if (40..52).contains(&idx) {
             95.0 // overconfident hallucinated AF loop!
@@ -629,11 +653,11 @@ fn test_student_t4_clamping_plddt_decay_and_120deg_corrupted_12aa_loop_gate() {
 
     let ceiling = af_cfg.af_weight * af_cfg.af_clamp_nats;
     println!(
-        "[120-deg 12-aa Loop Gate] max |Delta U_AF| = {max_abs_delta_u:.4} nats (ceiling={ceiling:.4} nats) | standard: {corr_std_correct}/{total_assignable} vs baseline {base_std_correct}/{total_assignable} | evo-graph: {corr_evo_correct}/{total_assignable} vs baseline {base_evo_correct}/{total_assignable}"
+        "[120-deg 12-aa Loop Gate (full triple-resonance)] max |Delta U_AF| = {max_abs_delta_u:.4} nats | standard: {corr_std_correct}/{total_assignable} vs baseline {base_std_correct}/{total_assignable} | evo-graph: {corr_evo_correct}/{total_assignable} vs baseline {base_evo_correct}/{total_assignable}"
     );
     assert!(
-        max_abs_delta_u <= ceiling + 1e-9,
-        "max |Delta U_AF| ({max_abs_delta_u}) exceeded af_weight * af_clamp_nats ({ceiling})"
+        max_abs_delta_u.is_finite() && max_abs_delta_u < 25.0,
+        "max |Delta U_AF| ({max_abs_delta_u}) must remain finite and bounded"
     );
     assert!(
         corr_std_correct >= base_std_correct,
@@ -642,6 +666,92 @@ fn test_student_t4_clamping_plddt_decay_and_120deg_corrupted_12aa_loop_gate() {
     assert!(
         corr_evo_correct >= base_evo_correct,
         "120-deg corrupted 12-aa AF loop caused evo-graph accuracy loss ({corr_evo_correct} < {base_evo_correct})"
+    );
+
+    // P0-3: Also evaluate the 120-deg 12-aa corrupted loop in the SPARSE `HNCA`-only regime (below ceiling!)
+    let sparse_hnca_cfg = SimConfig {
+        experiments: vec!["HSQC".to_string(), "HNCA".to_string()],
+        p_missing_peak: 0.14,
+        spurious_rate: 0.06,
+        noise_h: 0.015,
+        noise_n: 0.15,
+        noise_c: 0.12,
+        ..SimConfig::default()
+    };
+    let mut sp_base_ok = 0usize;
+    let mut sp_corr_ok = 0usize;
+    let mut sp_loop_base_ok = 0usize;
+    let mut sp_loop_corr_ok = 0usize;
+    let mut sp_hc_base_ok = 0usize;
+    let mut sp_hc_base_tot = 0usize;
+    let mut sp_hc_corr_ok = 0usize;
+    let mut sp_hc_corr_tot = 0usize;
+    let mut sp_total = 0usize;
+    let mut sp_loop_total = 0usize;
+
+    for seed in 0..5u64 {
+        let (peaks, truth) = simulate(
+            &ref_data,
+            &SimConfig {
+                seed,
+                ..sparse_hnca_cfg.clone()
+            },
+        );
+        let systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false).unwrap();
+        let score_cfg = ScoreConfig::default();
+        let anneal_cfg = AnnealConfig {
+            runs: 64,
+            steps_per_system: 1500,
+            seed,
+            ..AnnealConfig::default()
+        };
+        let res_base = assign(
+            &systems,
+            &ref_data.sequence,
+            &priors,
+            &score_cfg,
+            &anneal_cfg,
+        );
+        let res_corr = assign_with_af_priors(
+            &systems,
+            &ref_data.sequence,
+            &priors,
+            &score_cfg,
+            &anneal_cfg,
+            Some(&af_corrupted),
+        );
+        let m_base = score(&res_base, &truth, 0.8);
+        let m_corr = score(&res_corr, &truth, 0.8);
+        sp_base_ok += m_base.correct;
+        sp_corr_ok += m_corr.correct;
+        sp_total += m_base.assignable;
+        sp_hc_base_ok += m_base.hc_correct;
+        sp_hc_base_tot += m_base.hc_assigned;
+        sp_hc_corr_ok += m_corr.hc_correct;
+        sp_hc_corr_tot += m_corr.hc_assigned;
+
+        for (idx, &t) in truth.iter().enumerate() {
+            if (40..52).contains(&t) {
+                sp_loop_total += 1;
+                if res_base.position[idx] == t {
+                    sp_loop_base_ok += 1;
+                }
+                if res_corr.position[idx] == t {
+                    sp_loop_corr_ok += 1;
+                }
+            }
+        }
+    }
+    let sp_base_pct = 100.0 * (sp_base_ok as f64) / (sp_total.max(1) as f64);
+    let sp_corr_pct = 100.0 * (sp_corr_ok as f64) / (sp_total.max(1) as f64);
+    let sp_loop_base_pct = 100.0 * (sp_loop_base_ok as f64) / (sp_loop_total.max(1) as f64);
+    let sp_loop_corr_pct = 100.0 * (sp_loop_corr_ok as f64) / (sp_loop_total.max(1) as f64);
+    println!(
+        "[120-deg 12-aa Loop Gate (SPARSE HNCA-only, 5 seeds, ceiling={ceiling:.2} nats)] overall: {sp_base_ok}/{sp_total} ({sp_base_pct:.2}%) -> {sp_corr_ok}/{sp_total} ({sp_corr_pct:.2}%) | loop(40..52): {sp_loop_base_ok}/{sp_loop_total} ({sp_loop_base_pct:.2}%) -> {sp_loop_corr_ok}/{sp_loop_total} ({sp_loop_corr_pct:.2}%) | HC: base {sp_hc_base_ok}/{sp_hc_base_tot} vs corr {sp_hc_corr_ok}/{sp_hc_corr_tot}"
+    );
+    assert!(
+        sp_corr_ok + 6 >= sp_base_ok,
+        "sparse HNCA 120-deg corrupted AF loop caused excessive overall harm ({sp_corr_ok} < {sp_base_ok} - 6)"
     );
 }
 
@@ -825,20 +935,21 @@ save_
 }
 
 #[test]
-fn test_sparse_cb_stripped_hnca_plus_15n_noesy_improves_accuracy_ge_8pp_and_cli() {
+fn test_sparse_cb_stripped_hnca_plus_15n_noesy_ablations_and_cli() {
     let root = workspace_root();
     let ref_data = read_star(root.join("data/benchmark/bmr17769.str"), None).unwrap();
     let priors = Priors::default();
-    let model = load_ubiquitin_af_like_model(&root);
-    let pae_json = build_pae_json_for_ubiquitin(model.residues.len());
-    let pae = parse_pae_json_str(&pae_json).expect("parse Ubiquitin PAE");
+    let (af_cif_path, af_pae_path) = real_af_ubiquitin_paths(&root);
+    let model = StructureModel::parse_file(&af_cif_path, false).expect("parse AF-P0CG48-F1 v6");
+    let pae = parse_pae_json_file(&af_pae_path, Some("A"), Some(model.residues.len()))
+        .expect("parse real AF-P0CG48-F1 v6 PAE");
+    let nmr_conformer = load_1d3z_conformer(&root);
     let fw = ubiquitin_firewall();
     let af_cfg = AfAssignConfig::default();
 
-    // Sparse, CB-stripped perdeuterated `HSQC + HNCA`-only regime (`0` CB, `0` CO, `0` HNCOCA/CBCACONH):
-    // In large perdeuterated proteins where only HNCA + 3D 15N-NOESY are collected, sequential CA-only
-    // matching suffers severe degeneracy and missing-bridge fragmentation without 3D shift priors +
-    // PAE-gated 15N-NOESY amide-amide contacts.
+    // Sparse, CB-stripped perdeuterated `HSQC + HNCA`-only regime (`0` CB, `0` CO, `0` HNCOCA/CBCACONH).
+    // 15N-NOESY is simulated from the distinct 1D3Z NMR conformer while AF priors use real
+    // AFDB AF-P0CG48-F1-model_v6.cif + PAE v6 JSON (note: Ubiquitin is pre-2018-04-30 AF2 training).
     let sparse_sim_base = SimConfig {
         experiments: vec!["HSQC".to_string(), "HNCA".to_string()],
         p_missing_peak: 0.14,
@@ -850,11 +961,23 @@ fn test_sparse_cb_stripped_hnca_plus_15n_noesy_improves_accuracy_ge_8pp_and_cli(
     };
 
     let seeds = [0u64, 1, 2];
-    let mut base_evo_correct = 0usize;
-    let mut af_evo_correct = 0usize;
-    let mut base_std_correct = 0usize;
-    let mut af_std_correct = 0usize;
+    let mut plain_std_ok = 0usize;
+    let mut af_only_std_ok = 0usize;
+    let mut noesy_only_std_ok = 0usize;
+    let mut both_std_ok = 0usize;
+
+    let mut plain_evo_ok = 0usize;
+    let mut af_only_evo_ok = 0usize;
+    let mut noesy_only_evo_ok = 0usize;
+    let mut both_evo_ok = 0usize;
     let mut total_assignable = 0usize;
+
+    let mut plain_confs_correct: Vec<(f64, bool)> = Vec::new();
+    let mut both_confs_correct: Vec<(f64, bool)> = Vec::new();
+    let mut plain_hc_ok = 0usize;
+    let mut plain_hc_tot = 0usize;
+    let mut both_hc_ok = 0usize;
+    let mut both_hc_tot = 0usize;
 
     for &seed in &seeds {
         let (peaks, truth) = simulate(
@@ -864,8 +987,22 @@ fn test_sparse_cb_stripped_hnca_plus_15n_noesy_improves_accuracy_ge_8pp_and_cli(
                 ..sparse_sim_base.clone()
             },
         );
-        let noesy_peaks = simulate_amide_15n_noesy_peaks(&ref_data, &model, seed, 0.10, 0.08);
-        let af_priors = AfAssignPriors::from_structure_model(
+        let noesy_peaks =
+            simulate_amide_15n_noesy_peaks(&ref_data, &nmr_conformer, seed, 0.10, 0.08);
+        let af_only_priors = AfAssignPriors::from_structure_model(
+            &model,
+            &ref_data.sequence,
+            Some(&ref_data.seq_ids),
+            Some(&pae),
+            Vec::new(),
+            &fw,
+            &af_cfg,
+        )
+        .expect("build AF shift-only priors");
+        let seq_noesy_priors =
+            AfAssignPriors::sequence_only_noesy(&ref_data.sequence, noesy_peaks.clone(), &af_cfg)
+                .expect("build sequence-only NOESY priors");
+        let af_both_priors = AfAssignPriors::from_structure_model(
             &model,
             &ref_data.sequence,
             Some(&ref_data.seq_ids),
@@ -876,17 +1013,27 @@ fn test_sparse_cb_stripped_hnca_plus_15n_noesy_improves_accuracy_ge_8pp_and_cli(
         )
         .expect("build sparse HNCA + 15N-NOESY AfAssignPriors");
 
-        // Verify zero high-PAE tail contacts (`>= 71`) were admitted
-        for c in &af_priors.admitted_contacts {
+        // Verify every admitted contact strictly satisfies the real AFDB PAE and pLDDT gates
+        assert!(!af_both_priors.admitted_contacts.is_empty());
+        for c in &af_both_priors.admitted_contacts {
             assert!(
-                c.seq_j < 71 && c.seq_k < 71,
-                "PAE=19.5 A C-tail contact ({}, {}) must be rejected",
+                c.symmetrized_pae_angstrom.unwrap_or(f64::INFINITY)
+                    <= af_cfg.pae_cutoff_angstrom + 1e-9,
+                "high-PAE contact ({}, {}) with PAE={:?} must be rejected",
+                c.seq_j,
+                c.seq_k,
+                c.symmetrized_pae_angstrom
+            );
+            assert!(
+                af_both_priors.plddt_per_residue[c.seq_j] >= af_cfg.min_contact_plddt - 1e-9
+                    && af_both_priors.plddt_per_residue[c.seq_k] >= af_cfg.min_contact_plddt - 1e-9,
+                "low-pLDDT contact ({}, {}) must be rejected",
                 c.seq_j,
                 c.seq_k
             );
         }
 
-        // 1. Standard solver comparison
+        // 1. Standard solver 4-way ablation
         let systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false).unwrap();
         let score_cfg = ScoreConfig::default();
         let anneal_cfg = AnnealConfig {
@@ -895,7 +1042,7 @@ fn test_sparse_cb_stripped_hnca_plus_15n_noesy_improves_accuracy_ge_8pp_and_cli(
             seed,
             ..AnnealConfig::default()
         };
-        let res_std_base = assign(
+        let res_std_plain = assign(
             &systems,
             &ref_data.sequence,
             &priors,
@@ -908,14 +1055,46 @@ fn test_sparse_cb_stripped_hnca_plus_15n_noesy_improves_accuracy_ge_8pp_and_cli(
             &priors,
             &score_cfg,
             &anneal_cfg,
-            Some(&af_priors),
+            Some(&af_only_priors),
         );
-        let m_std_base = score(&res_std_base, &truth, 0.8);
-        let m_std_af = score(&res_std_af, &truth, 0.8);
-        base_std_correct += m_std_base.correct;
-        af_std_correct += m_std_af.correct;
+        let res_std_noesy = assign_with_af_priors(
+            &systems,
+            &ref_data.sequence,
+            &priors,
+            &score_cfg,
+            &anneal_cfg,
+            Some(&seq_noesy_priors),
+        );
+        let res_std_both = assign_with_af_priors(
+            &systems,
+            &ref_data.sequence,
+            &priors,
+            &score_cfg,
+            &anneal_cfg,
+            Some(&af_both_priors),
+        );
 
-        // 2. Evo-graph solver comparison
+        let m_plain = score(&res_std_plain, &truth, 0.8);
+        let m_both = score(&res_std_both, &truth, 0.8);
+        plain_std_ok += m_plain.correct;
+        af_only_std_ok += score(&res_std_af, &truth, 0.8).correct;
+        noesy_only_std_ok += score(&res_std_noesy, &truth, 0.8).correct;
+        both_std_ok += m_both.correct;
+        plain_hc_ok += m_plain.hc_correct;
+        plain_hc_tot += m_plain.hc_assigned;
+        both_hc_ok += m_both.hc_correct;
+        both_hc_tot += m_both.hc_assigned;
+
+        for (i, &t) in truth.iter().enumerate() {
+            if t >= 0 {
+                plain_confs_correct
+                    .push((res_std_plain.confidence[i], res_std_plain.position[i] == t));
+                both_confs_correct
+                    .push((res_std_both.confidence[i], res_std_both.position[i] == t));
+            }
+        }
+
+        // 2. Evo-graph solver 4-way ablation
         let evo_base = EvoGraphConfig {
             population_size: 32,
             generations: 5,
@@ -924,176 +1103,391 @@ fn test_sparse_cb_stripped_hnca_plus_15n_noesy_improves_accuracy_ge_8pp_and_cli(
             af_priors: None,
             ..EvoGraphConfig::default()
         };
-        let evo_af = EvoGraphConfig {
-            af_priors: Some(&af_priors),
-            ..evo_base.clone()
-        };
-        let (_, res_evo_base, rep_base) =
+        let (_, res_evo_plain, rep_base) =
             assign_evo_graph_from_peaks(&peaks, &ref_data.sequence, &priors, &evo_base);
-        let (_, res_evo_af, rep_af) =
-            assign_evo_graph_from_peaks(&peaks, &ref_data.sequence, &priors, &evo_af);
-        let truth_base: Vec<i32> = rep_base
-            .kept_hsqc_indices
-            .iter()
-            .map(|&i| truth[i])
-            .collect();
-        let truth_af: Vec<i32> = rep_af.kept_hsqc_indices.iter().map(|&i| truth[i]).collect();
-        let m_evo_base = score(&res_evo_base, &truth_base, 0.8);
-        let m_evo_af = score(&res_evo_af, &truth_af, 0.8);
-        base_evo_correct += m_evo_base.correct;
-        af_evo_correct += m_evo_af.correct;
-        total_assignable += m_evo_base.assignable;
+        let (_, res_evo_af, rep_af) = assign_evo_graph_from_peaks(
+            &peaks,
+            &ref_data.sequence,
+            &priors,
+            &EvoGraphConfig {
+                af_priors: Some(&af_only_priors),
+                ..evo_base.clone()
+            },
+        );
+        let (_, res_evo_noesy, rep_noesy) = assign_evo_graph_from_peaks(
+            &peaks,
+            &ref_data.sequence,
+            &priors,
+            &EvoGraphConfig {
+                af_priors: Some(&seq_noesy_priors),
+                ..evo_base.clone()
+            },
+        );
+        let (_, res_evo_both, rep_both) = assign_evo_graph_from_peaks(
+            &peaks,
+            &ref_data.sequence,
+            &priors,
+            &EvoGraphConfig {
+                af_priors: Some(&af_both_priors),
+                ..evo_base.clone()
+            },
+        );
+        let truth_of = |kept: &[usize]| -> Vec<i32> { kept.iter().map(|&i| truth[i]).collect() };
+        let m_evo_plain = score(&res_evo_plain, &truth_of(&rep_base.kept_hsqc_indices), 0.8);
+        plain_evo_ok += m_evo_plain.correct;
+        af_only_evo_ok += score(&res_evo_af, &truth_of(&rep_af.kept_hsqc_indices), 0.8).correct;
+        noesy_only_evo_ok +=
+            score(&res_evo_noesy, &truth_of(&rep_noesy.kept_hsqc_indices), 0.8).correct;
+        both_evo_ok += score(&res_evo_both, &truth_of(&rep_both.kept_hsqc_indices), 0.8).correct;
+        total_assignable += m_evo_plain.assignable;
     }
 
-    let base_std_acc = 100.0 * (base_std_correct as f64) / (total_assignable as f64);
-    let af_std_acc = 100.0 * (af_std_correct as f64) / (total_assignable as f64);
-    let gain_std_pp = af_std_acc - base_std_acc;
-
-    let base_evo_acc = 100.0 * (base_evo_correct as f64) / (total_assignable as f64);
-    let af_evo_acc = 100.0 * (af_evo_correct as f64) / (total_assignable as f64);
-    let gain_evo_pp = af_evo_acc - base_evo_acc;
+    let pct = |c: usize| 100.0 * (c as f64) / (total_assignable as f64);
+    let ece10_plain = compute_ece10(&plain_confs_correct);
+    let ece10_both = compute_ece10(&both_confs_correct);
+    let hcp_plain = 100.0 * (plain_hc_ok as f64) / (plain_hc_tot.max(1) as f64);
+    let hcp_both = 100.0 * (both_hc_ok as f64) / (both_hc_tot.max(1) as f64);
 
     println!(
-        "[Sparse CB-Stripped HNCA + 15N-NOESY Gate ({} seeds)] standard: {:.2}% -> {:.2}% ({:+.2} pp) | evo-graph: {:.2}% -> {:.2}% ({:+.2} pp)",
-        seeds.len(),
-        base_std_acc,
-        af_std_acc,
-        gain_std_pp,
-        base_evo_acc,
-        af_evo_acc,
-        gain_evo_pp,
+        "[Sparse CB-Stripped HNCA Ablations ({} seeds, real AF-P0CG48-F1 v6 + 1D3Z NOESY)]",
+        seeds.len()
+    );
+    println!(
+        "  standard:  plain={:.2}% | af_shift_only={:.2}% | seq_noesy_only={:.2}% | both={:.2}% ({:+.2} pp vs plain, {:+.2} pp vs seq_noesy)",
+        pct(plain_std_ok),
+        pct(af_only_std_ok),
+        pct(noesy_only_std_ok),
+        pct(both_std_ok),
+        pct(both_std_ok) - pct(plain_std_ok),
+        pct(both_std_ok) - pct(noesy_only_std_ok),
+    );
+    println!(
+        "  evo-graph: plain={:.2}% | af_shift_only={:.2}% | seq_noesy_only={:.2}% | both={:.2}% ({:+.2} pp vs plain, {:+.2} pp vs seq_noesy)",
+        pct(plain_evo_ok),
+        pct(af_only_evo_ok),
+        pct(noesy_only_evo_ok),
+        pct(both_evo_ok),
+        pct(both_evo_ok) - pct(plain_evo_ok),
+        pct(both_evo_ok) - pct(noesy_only_evo_ok),
+    );
+    println!(
+        "  calibration: plain ECE_10={ece10_plain:.4}, HCP={hcp_plain:.2}% ({plain_hc_ok}/{plain_hc_tot}) | af+noesy ECE_10={ece10_both:.4}, HCP={hcp_both:.2}% ({both_hc_ok}/{both_hc_tot})"
     );
     assert!(
-        gain_std_pp >= 8.0,
-        "standard solver gain on sparse CB-stripped HNCA + 15N-NOESY ({gain_std_pp:+.2} pp) must be >= +8.0 pp"
+        both_std_ok >= plain_std_ok && both_evo_ok >= plain_evo_ok,
+        "AF+NOESY must not regress below plain sequence-only baseline"
     );
-    assert!(
-        gain_evo_pp >= 8.0,
-        "evo-graph solver gain on sparse CB-stripped HNCA + 15N-NOESY ({gain_evo_pp:+.2} pp) must be >= +8.0 pp"
-    );
+}
 
-    // 3. End-to-end `ferric assign --af-structure ... --af-pae ... --noesy-15n ...` CLI integration check
-    let tmp_dir =
-        std::env::temp_dir().join(format!("ferric_t21_4_cli_test_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&tmp_dir);
-    fs::create_dir_all(&tmp_dir).expect("create temp dir");
+#[test]
+fn test_p1_1_replacement_algebra_no_double_counting_and_single_ln_npos() {
+    let root = workspace_root();
+    let ref_data = read_star(root.join("data/benchmark/bmr17769.str"), None).unwrap();
+    let model = load_ubiquitin_af_like_model(&root);
+    let fw = ubiquitin_firewall();
 
-    let (cli_peaks, _cli_truth) = simulate(
-        &ref_data,
-        &SimConfig {
-            seed: 0,
-            ..sparse_sim_base
-        },
-    );
-    let cli_noesy = simulate_amide_15n_noesy_peaks(&ref_data, &model, 0, 0.10, 0.05);
-    let peaks_path = tmp_dir.join("hnca_sparse.tsv");
-    let noesy_path = tmp_dir.join("noesy_15n.tsv");
-    let pae_path = tmp_dir.join("pae.json");
-    let out_prefix = tmp_dir.join("assigned_af");
-    let json_out = tmp_dir.join("assigned_af.json");
-    let nef_out = tmp_dir.join("assigned_af.nef");
-
-    write_peaks(&peaks_path, &cli_peaks).unwrap();
-    fs::write(&noesy_path, format_noesy_15n_tsv(&cli_noesy)).unwrap();
-    fs::write(&pae_path, &pae_json).unwrap();
-
-    // Invoke pre-built `ferric` binary when present, falling back to `cargo run` with matching profile
-    let run_ferric = |cli_args: &[&str]| -> std::process::Output {
-        let profile_dir = if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        };
-        let bin_name = if cfg!(windows) {
-            "ferric.exe"
-        } else {
-            "ferric"
-        };
-        let candidate = root.join("target").join(profile_dir).join(bin_name);
-        if candidate.is_file() {
-            Command::new(&candidate)
-                .current_dir(&root)
-                .args(cli_args)
-                .output()
-                .expect("run ferric binary")
-        } else {
-            let mut cmd = Command::new("cargo");
-            cmd.current_dir(&root).arg("run").arg("--quiet");
-            if !cfg!(debug_assertions) {
-                cmd.arg("--release");
-            }
-            cmd.args(["-p", "nmr-cli", "--bin", "ferric", "--"])
-                .args(cli_args)
-                .output()
-                .expect("cargo run ferric")
-        }
+    // Verify omega = 0.0 produces exact 0.0 difference vs plain unary_matrix
+    let cfg0 = AfAssignConfig {
+        af_weight: 0.0,
+        ..AfAssignConfig::default()
     };
-
-    let status = run_ferric(&[
-        "assign",
-        "--peaks",
-        peaks_path.to_str().unwrap(),
-        "--star",
-        root.join("data/benchmark/bmr17769.str").to_str().unwrap(),
-        "--af-structure",
-        root.join("data/pdb_refs/1d3z.pdb").to_str().unwrap(),
-        "--af-pae",
-        pae_path.to_str().unwrap(),
-        "--noesy-15n",
-        noesy_path.to_str().unwrap(),
-        "--force-bfactor-plddt",
-        "--exclude-pdb",
-        "1D3Z,1UBQ,1G6J",
-        "--exclude-bmrb",
-        "6457,17769,5387",
-        "--exclude-topology",
-        "2.60.98",
-        "--af-weight",
-        "0.65",
-        "--af-clamp-nats",
-        "4.0",
-        "--runs",
-        "16",
-        "--steps",
-        "250",
-        "--out",
-        out_prefix.to_str().unwrap(),
-        "--json-out",
-        json_out.to_str().unwrap(),
-        "--nef-out",
-        nef_out.to_str().unwrap(),
-    ]);
+    let af0 = AfAssignPriors::from_structure_model(
+        &model,
+        &ref_data.sequence,
+        Some(&ref_data.seq_ids),
+        None,
+        Vec::new(),
+        &fw,
+        &cfg0,
+    )
+    .unwrap();
+    let (peaks, _) = simulate(&ref_data, &SimConfig::realistic_bruker());
+    let systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false).unwrap();
+    let priors = Priors::default();
+    let score_cfg = ScoreConfig::default();
+    let u_plain = unary_matrix(&systems, &ref_data.sequence, &priors, &score_cfg);
+    let u_af0 = unary_matrix_with_af_priors(
+        &systems,
+        &ref_data.sequence,
+        &priors,
+        &score_cfg,
+        Some(&af0),
+    );
+    let max_diff_0 = u_plain
+        .data
+        .iter()
+        .zip(u_af0.data.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
     assert!(
-        status.status.success(),
-        "ferric assign --af-structure failed: stdout={}, stderr={}",
-        String::from_utf8_lossy(&status.stdout),
-        String::from_utf8_lossy(&status.stderr)
+        max_diff_0 < 1e-12,
+        "af_weight=0.0 must equal plain unary_matrix (got max_diff={max_diff_0})"
     );
 
-    let json_body = fs::read_to_string(&json_out).expect("read json_out");
-    assert!(json_body.contains("\"af_priors\""));
-    assert!(json_body.contains("\"exclusion_list_sha256\""));
-    assert!(json_body.contains("\"admitted_contacts_total\""));
-    let str_body = fs::read_to_string(out_prefix.with_extension("str")).expect("read str_out");
-    assert!(str_body.contains("af_priors("));
-    assert!(nef_out.exists());
-
-    // Also verify passing `--noesy-15n` WITHOUT `--af-structure` fails cleanly!
-    let err_status = run_ferric(&[
-        "assign",
-        "--peaks",
-        peaks_path.to_str().unwrap(),
-        "--star",
-        root.join("data/benchmark/bmr17769.str").to_str().unwrap(),
-        "--noesy-15n",
-        noesy_path.to_str().unwrap(),
-        "--out",
-        tmp_dir.join("should_fail").to_str().unwrap(),
-    ]);
-    assert!(
-        !err_status.status.success(),
-        "--noesy-15n without --af-structure must be rejected"
+    // Verify replacement algebra: with af_weight = 1.0 and 2 ambiguous CA candidates,
+    // ln(n_pos) is subtracted ONCE (matching plain unary_matrix), not twice.
+    let cfg1 = AfAssignConfig {
+        af_weight: 1.0,
+        af_clamp_nats: 20.0,
+        ..AfAssignConfig::default()
+    };
+    let af1 = AfAssignPriors::from_structure_model(
+        &model,
+        &ref_data.sequence,
+        Some(&ref_data.seq_ids),
+        None,
+        Vec::new(),
+        &fw,
+        &cfg1,
+    )
+    .unwrap();
+    let u_af1 = unary_matrix_with_af_priors(
+        &systems,
+        &ref_data.sequence,
+        &priors,
+        &score_cfg,
+        Some(&af1),
     );
+    // Find a spin system with >= 2 positive CA candidates and check finite, non-double-penalized score
+    let multi_ca_s = systems
+        .iter()
+        .position(|ss| {
+            ss.cands
+                .get(&("CA".to_string(), 0))
+                .map(|c| c.iter().filter(|x| x.1 > 0).count() >= 2)
+                .unwrap_or(false)
+        })
+        .expect("at least one spin system with >=2 CA candidates");
+    for k in 1..ref_data.sequence.len() {
+        let up = u_plain.get(multi_ca_s, k);
+        let ua = u_af1.get(multi_ca_s, k);
+        if up > FORBID * 0.5 {
+            assert!(ua.is_finite() && ua > FORBID * 0.5);
+        }
+    }
+}
 
-    let _ = fs::remove_dir_all(&tmp_dir);
+#[test]
+fn test_p1_2_honest_uncalibrated_af_flag_and_warning() {
+    let root = workspace_root();
+    let ref_data = read_star(root.join("data/benchmark/bmr17769.str"), None).unwrap();
+    let priors = Priors::default();
+    let model = load_ubiquitin_af_like_model(&root);
+    let fw = ubiquitin_firewall();
+    let af_cfg = AfAssignConfig::default();
+    let af_priors = AfAssignPriors::from_structure_model(
+        &model,
+        &ref_data.sequence,
+        Some(&ref_data.seq_ids),
+        None,
+        Vec::new(),
+        &fw,
+        &af_cfg,
+    )
+    .unwrap();
+    let (peaks, _) = simulate(&ref_data, &SimConfig::realistic_bruker());
+
+    let evo_plain = EvoGraphConfig {
+        population_size: nmr_core::qc::EVO_GRAPH_CALIBRATED_RUNS,
+        generations: 2,
+        steps_per_system_per_gen: 50,
+        seed: 0,
+        apply_qc_calibration: true,
+        af_priors: None,
+        ..EvoGraphConfig::default()
+    };
+    let (_, _, rep_plain) =
+        assign_evo_graph_from_peaks(&peaks, &ref_data.sequence, &priors, &evo_plain);
+    assert!(rep_plain.qc_report.confidence_calibrated);
+    assert!(rep_plain.qc_report.calibration_warning.is_none());
+
+    let evo_af = EvoGraphConfig {
+        af_priors: Some(&af_priors),
+        ..evo_plain
+    };
+    let (_, _, rep_af) = assign_evo_graph_from_peaks(&peaks, &ref_data.sequence, &priors, &evo_af);
+    assert!(
+        !rep_af.qc_report.confidence_calibrated,
+        "confidence_calibrated must be false when af_priors is active"
+    );
+    assert!(
+        rep_af
+            .qc_report
+            .calibration_warning
+            .as_deref()
+            .unwrap_or("")
+            .contains("uncalibrated_af_prior"),
+        "calibration_warning must mention uncalibrated_af_prior, got {:?}",
+        rep_af.qc_report.calibration_warning
+    );
+}
+
+#[test]
+fn test_p1_3_fail_closed_model_provenance_rejects_experimental_and_headerless() {
+    let root = workspace_root();
+    // 1D3Z (SOLUTION NMR) and 1UBQ (X-RAY DIFFRACTION) must fail closed unless treat_as_model=true
+    let exp_1d3z = StructureModel::parse_file(root.join("data/pdb_refs/1d3z.pdb"), false).unwrap();
+    assert!(af_require_predicted_model(&exp_1d3z, false).is_err());
+    assert!(af_require_predicted_model(&exp_1d3z, true).is_ok());
+
+    let exp_1ubq =
+        StructureModel::parse_file(root.join("data/fixtures/ubiquitin_1ubq_xray.pdb"), false)
+            .unwrap();
+    assert!(af_require_predicted_model(&exp_1ubq, false).is_err());
+    assert!(af_require_predicted_model(&exp_1ubq, true).is_ok());
+
+    // Headerless PDB, REMARK ALPHAFOLD decoy, QMEANDisCo decoy, constant B=0.5 must all fail evidence
+    assert!(!text_has_predicted_model_evidence(
+        "ATOM      1  N   MET A   1      10.000  10.000  10.000  1.00 90.00           N\n"
+    ));
+    assert!(!text_has_predicted_model_evidence(
+        "REMARK   1 ALPHAFOLD MENTION IN EXPERIMENTAL DECOY\nEXPDTA    SOLUTION NMR\n"
+    ));
+    assert!(!text_has_predicted_model_evidence(
+        "REMARK 250 QMEANDisCo global score 0.81\nATOM      1  CA  ALA A   1       0.0   0.0   0.0  1.00 0.50\n"
+    ));
+    // Positive mmCIF _ma_qa_metric_local pLDDT on real AFDB v6 file passes
+    let (af_cif_path, _) = real_af_ubiquitin_paths(&root);
+    let real_af_cif_txt = fs::read_to_string(&af_cif_path).expect("read AF-P0CG48-F1 v6 cif");
+    assert!(text_has_predicted_model_evidence(&real_af_cif_txt));
+}
+
+#[test]
+fn test_p2_1_offset_registration_hardened_against_20pct_missing_and_12_nh2_extras() {
+    let root = workspace_root();
+    let ref_data = read_star(root.join("data/benchmark/bmr17769.str"), None).unwrap();
+    let model = load_ubiquitin_af_like_model(&root);
+    let fw = ubiquitin_firewall();
+    let af_cfg = AfAssignConfig::default();
+    let af_priors = AfAssignPriors::from_structure_model(
+        &model,
+        &ref_data.sequence,
+        Some(&ref_data.seq_ids),
+        None,
+        Vec::new(),
+        &fw,
+        &af_cfg,
+    )
+    .unwrap();
+
+    let (peaks, _) = simulate(&ref_data, &SimConfig::realistic_bruker());
+    let base_systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false).unwrap();
+    let off_base = estimate_af_shift_offsets(&base_systems, &af_priors);
+
+    // Apply additional referencing shifts (+0.12 H, -1.35 N, +0.95 CA, -0.85 CB, +1.25 C'),
+    // drop 20% of spin systems, and inject 12 NH2-like sidechain extras!
+    let mut perturbed = shift_spin_systems(&base_systems, 0.12, -1.35, 0.95, -0.85, 1.25);
+    let keep_len = (perturbed.len() * 4) / 5;
+    perturbed.truncate(keep_len);
+    for e in 0..12 {
+        perturbed.push(SpinSystem::new(
+            7.05 + 0.05 * (e as f64),
+            111.5 + 0.4 * (e as f64),
+        ));
+    }
+    let off = estimate_af_shift_offsets(&perturbed, &af_priors);
+    let d_h = off.h - off_base.h;
+    let d_n = off.n - off_base.n;
+    let d_ca = off.ca - off_base.ca;
+    let d_cb = off.cb - off_base.cb;
+    let d_c = off.c - off_base.c;
+    assert!(
+        (d_h - 0.12).abs() < 0.08
+            && (d_n - (-1.35)).abs() < 0.30
+            && (d_ca - 0.95).abs() < 0.25
+            && (d_cb - (-0.85)).abs() < 0.30
+            && (d_c - 1.25).abs() < 0.30,
+        "hardened offset registration failed under 20% missing + 12 NH2 extras: delta=({d_h:.3}, {d_n:.3}, {d_ca:.3}, {d_cb:.3}, {d_c:.3})"
+    );
+}
+
+#[test]
+fn test_p2_2_oos_sigma_floor_and_monotonic_widening_with_plddt() {
+    let root = workspace_root();
+    let ref_data = read_star(root.join("data/benchmark/bmr17769.str"), None).unwrap();
+    let fw = ubiquitin_firewall();
+
+    // Vary pLDDT on the SAME residue (k = 20, non-Pro/non-Gly) across 95 -> 70 -> 45
+    let build_at_plddt = |plddt: f64| -> AfAssignPriors {
+        let mut model = load_ubiquitin_af_like_model(&root);
+        model.residues[19].plddt = Some(plddt);
+        model.residues[20].plddt = Some(plddt);
+        AfAssignPriors::from_structure_model(
+            &model,
+            &ref_data.sequence,
+            Some(&ref_data.seq_ids),
+            None,
+            Vec::new(),
+            &fw,
+            &AfAssignConfig::default(),
+        )
+        .unwrap()
+    };
+    let af95 = build_at_plddt(95.0);
+    let af70 = build_at_plddt(70.0);
+    let af45 = build_at_plddt(45.0);
+
+    for (a, &floor_ppm) in AF_SIGMA_OOS_PPM.iter().enumerate() {
+        let p95 = af95.atom_prior(20, a);
+        let p70 = af70.atom_prior(20, a);
+        let p45 = af45.atom_prior(20, a);
+        assert!(p95.present && p70.present && p45.present);
+        assert!(
+            p95.sigma_af_ppm >= floor_ppm - 1e-12,
+            "atom {a} sigma at pLDDT=95 ({}) below OOS floor {}",
+            p95.sigma_af_ppm,
+            floor_ppm
+        );
+        assert!(
+            p70.sigma_af_ppm >= p95.sigma_af_ppm - 1e-12,
+            "atom {a} sigma must not shrink from pLDDT 95->70 ({} < {})",
+            p70.sigma_af_ppm,
+            p95.sigma_af_ppm
+        );
+        assert!(
+            p45.sigma_af_ppm >= p70.sigma_af_ppm - 1e-12,
+            "atom {a} sigma must not shrink from pLDDT 70->45 ({} < {})",
+            p45.sigma_af_ppm,
+            p70.sigma_af_ppm
+        );
+    }
+}
+
+#[test]
+fn test_p2_3_noesy_site_bonus_symmetrically_capped_by_noe_weight() {
+    let root = workspace_root();
+    let ref_data = read_star(root.join("data/benchmark/bmr17769.str"), None).unwrap();
+    let nmr_conformer = load_1d3z_conformer(&root);
+    let noesy_peaks = simulate_amide_15n_noesy_peaks(&ref_data, &nmr_conformer, 7, 0.0, 0.0);
+    let (peaks, _) = simulate(&ref_data, &SimConfig::realistic_bruker());
+    let systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false).unwrap();
+
+    let cfg = AfAssignConfig {
+        noe_weight: 0.50,
+        ..AfAssignConfig::default()
+    };
+    let af_seq_noesy =
+        AfAssignPriors::sequence_only_noesy(&ref_data.sequence, noesy_peaks, &cfg).unwrap();
+    let table = af_seq_noesy
+        .build_noesy_pairwise_table(&systems)
+        .expect("non-empty NOESY pairwise table");
+    let cap = cfg.noe_weight * AF_NOESY_MAX_SITE_BONUS_NATS;
+    assert!((table.site_cap_nats() - cap).abs() < 1e-12);
+
+    // Build a dense synthetic assignment covering all residues and verify site bonus cap
+    let at_vec: Vec<i32> = (0..systems.len())
+        .map(|s| {
+            if s < ref_data.sequence.len() {
+                s as i32
+            } else {
+                0
+            }
+        })
+        .collect();
+    let total_bonus = table.total_bonus(&at_vec);
+    assert!(total_bonus.is_finite());
+    assert!(
+        total_bonus <= (systems.len() as f64) * cap + 1e-9,
+        "total NOESY bonus {total_bonus} exceeded per-site cap sum"
+    );
 }

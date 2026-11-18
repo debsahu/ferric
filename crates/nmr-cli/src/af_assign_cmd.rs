@@ -15,8 +15,8 @@
 use std::path::PathBuf;
 
 use nmr_core::af_assign_priors::{
-    estimate_af_shift_offsets, AfAssignConfig, AfAssignPriors, AfShiftOffsets,
-    DEFAULT_AF_CLAMP_NATS, DEFAULT_AF_WEIGHT,
+    AfAssignConfig, AfAssignPriors, AfShiftOffsets, DEFAULT_AF_CLAMP_NATS, DEFAULT_AF_WEIGHT,
+    DEFAULT_NOE_WEIGHT,
 };
 use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
 use nmr_core::peaks::Peak;
@@ -44,11 +44,13 @@ pub struct AfAssignCliOpts {
     pub af_pae_path: Option<PathBuf>,
     pub noesy_15n_path: Option<PathBuf>,
     pub af_weight: Option<f64>,
+    pub noe_weight: Option<f64>,
     pub af_clamp_nats: Option<f64>,
     pub max_seq_identity: Option<f64>,
     pub firewall_query: HomologFirewallQuery,
     pub has_firewall_flag: bool,
     pub force_bfactor_plddt: bool,
+    pub treat_as_model: bool,
 }
 
 fn push_csv_items(dst: &mut Vec<String>, raw: &str) {
@@ -99,10 +101,21 @@ impl AfAssignCliOpts {
                 let w: f64 = v
                     .parse()
                     .map_err(|e| format!("invalid --af-weight {v:?}: {e}"))?;
-                if !w.is_finite() || !(0.0..=5.0).contains(&w) {
-                    return Err(format!("--af-weight {w} out of allowed bounds [0.0, 5.0]"));
+                if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+                    return Err(format!("--af-weight {w} out of allowed bounds [0.0, 1.0]"));
                 }
                 self.af_weight = Some(w);
+                Ok(true)
+            }
+            "--noe-weight" => {
+                let v = next_val(idx, flag)?;
+                let w: f64 = v
+                    .parse()
+                    .map_err(|e| format!("invalid --noe-weight {v:?}: {e}"))?;
+                if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+                    return Err(format!("--noe-weight {w} out of allowed bounds [0.0, 1.0]"));
+                }
+                self.noe_weight = Some(w);
                 Ok(true)
             }
             "--af-clamp-nats" => {
@@ -175,6 +188,10 @@ impl AfAssignCliOpts {
                 self.force_bfactor_plddt = true;
                 Ok(true)
             }
+            "--treat-as-model" => {
+                self.treat_as_model = true;
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -185,12 +202,14 @@ impl AfAssignCliOpts {
             if self.af_pae_path.is_some()
                 || self.noesy_15n_path.is_some()
                 || self.af_weight.is_some()
+                || self.noe_weight.is_some()
                 || self.af_clamp_nats.is_some()
                 || self.has_firewall_flag
                 || self.force_bfactor_plddt
+                || self.treat_as_model
             {
                 return Err(
-                    "--af-pae / --noesy-15n / --af-weight / --af-clamp-nats / --exclude-* require explicit opt-in --af-structure <model.cif|pdb> (backbone assignment is strictly structure-free by default)"
+                    "--af-pae / --noesy-15n / --af-weight / --noe-weight / --af-clamp-nats / --treat-as-model / --exclude-* require explicit opt-in --af-structure <model.cif|pdb> (backbone assignment is strictly structure-free by default)"
                         .to_string(),
                 );
             }
@@ -225,8 +244,9 @@ impl AfWorkflowMetadata {
         let rep = &self.af_priors.shift_report;
         let cs = &self.af_priors.contact_summary;
         format!(
-            "af_priors(af_weight={:.3}, af_clamp_nats={:.2}, max_retained_seq_id={:.4}, exclusion_sha256={}, af_offsets=[dH={:+.3}, dN={:+.3}, dCA={:+.3}, dCB={:+.3}, dC={:+.3}], noesy_peaks={}, admitted_contacts={}, seq_contacts={}, lr_contacts={}, rejected_high_pae={})",
+            "af_priors(uncalibrated_af_prior=true, af_weight={:.3}, noe_weight={:.3}, af_clamp_nats={:.2}, max_retained_seq_id={:.4}, exclusion_sha256={}, af_offsets=[dH={:+.3}, dN={:+.3}, dCA={:+.3}, dCB={:+.3}, dC={:+.3}], noesy_peaks={}, admitted_contacts={}, seq_contacts={}, lr_contacts={}, rejected_high_pae={})",
             self.af_priors.cfg.af_weight,
+            self.af_priors.cfg.noe_weight,
             self.af_priors.cfg.af_clamp_nats,
             rep.max_retained_seq_identity,
             rep.exclusion_list_sha256,
@@ -248,8 +268,12 @@ impl AfWorkflowMetadata {
         let cs = &self.af_priors.contact_summary;
         format!(
             "{{\n\
+             \x20   \"uncalibrated_af_prior\": true,\n\
              \x20   \"af_weight\": {:.6},\n\
+             \x20   \"noe_weight\": {:.6},\n\
              \x20   \"af_clamp_nats\": {:.6},\n\
+             \x20   \"treat_as_model\": {},\n\
+             \x20   \"model_evidence\": \"{}\",\n\
              \x20   \"exclusion_list_sha256\": \"{}\",\n\
              \x20   \"max_retained_seq_identity\": {:.6},\n\
              \x20   \"af_offsets\": {{ \"h\": {:.6}, \"n\": {:.6}, \"ca\": {:.6}, \"cb\": {:.6}, \"c\": {:.6} }},\n\
@@ -264,7 +288,10 @@ impl AfWorkflowMetadata {
              \x20   }}\n\
              \x20 }}",
             self.af_priors.cfg.af_weight,
+            self.af_priors.cfg.noe_weight,
             self.af_priors.cfg.af_clamp_nats,
+            self.af_priors.cfg.treat_as_model,
+            real_benchmark::json_escape(&self.af_priors.model_evidence),
             real_benchmark::json_escape(&rep.exclusion_list_sha256),
             rep.max_retained_seq_identity,
             self.af_offsets.h,
@@ -307,6 +334,8 @@ pub(crate) fn execute_af_assisted_assignment_workflow(
 
     let mut af_cfg = AfAssignConfig {
         af_weight: opts.af_weight.unwrap_or(DEFAULT_AF_WEIGHT),
+        noe_weight: opts.noe_weight.unwrap_or(DEFAULT_NOE_WEIGHT),
+        treat_as_model: opts.treat_as_model,
         af_clamp_nats: opts.af_clamp_nats.unwrap_or(DEFAULT_AF_CLAMP_NATS),
         ..AfAssignConfig::default()
     };
@@ -350,11 +379,7 @@ pub(crate) fn execute_af_assisted_assignment_workflow(
             let (effective_priors, offsets) =
                 prepare_scoring_priors(&systems, sequence, priors, score_cfg);
             let detailed_offsets = sync_detailed_reference_offsets(&offsets, &base_detailed);
-            let af_offsets = if score_cfg.auto_reference {
-                estimate_af_shift_offsets(&systems, &af_priors)
-            } else {
-                AfShiftOffsets::default()
-            };
+            let af_offsets = AfShiftOffsets::from_shift_offsets(&offsets);
 
             let (mut result, engine_label, fit_runs, used_runs, used_steps) = match requested_engine
             {
@@ -450,10 +475,23 @@ pub(crate) fn execute_af_assisted_assignment_workflow(
             );
             if used_runs != fit_runs {
                 qc_report.mark_uncalibrated_runs(&engine_label, used_runs, fit_runs);
-                if let Some(ref w) = qc_report.calibration_warning {
-                    eprintln!("Warning: [{engine_label}] confidence_calibrated=false — {w}");
-                }
             }
+            qc_report.confidence_calibrated = false;
+            let af_warn = format!(
+                "uncalibrated_af_prior=true: 3D AlphaFold shift/NOE priors active on {engine_label}; sequence-only isotonic calibration knots were not refit with AF priors (confidence_calibrated=false)"
+            );
+            qc_report.calibration_warning = Some(match qc_report.calibration_warning.take() {
+                Some(prev) => format!("{prev}; {af_warn}"),
+                None => af_warn.clone(),
+            });
+            if !qc_report
+                .reasons
+                .iter()
+                .any(|r| r.contains("uncalibrated_af_prior"))
+            {
+                qc_report.reasons.push("uncalibrated_af_prior=true".to_string());
+            }
+            eprintln!("Warning: [{engine_label}] {af_warn}");
             apply_dataset_qc_to_assignments(&mut result, &qc_report);
             qc_report.already_applied = true;
 
@@ -499,11 +537,6 @@ pub(crate) fn execute_af_assisted_assignment_workflow(
             }
             let (systems, result, mut rep) =
                 assign_evo_graph_from_peaks(peaks, sequence, priors, &evo_cfg);
-            let af_offsets = if score_cfg.auto_reference {
-                estimate_af_shift_offsets(&systems, &af_priors)
-            } else {
-                AfShiftOffsets::default()
-            };
             let engine_label = "CPU (f64, evo-graph, af-priors)".to_string();
             let requested_runs = runs_opt.unwrap_or(evo_cfg.population_size);
             if requested_runs != EVO_GRAPH_CALIBRATED_RUNS {
@@ -513,8 +546,9 @@ pub(crate) fn execute_af_assisted_assignment_workflow(
                     EVO_GRAPH_CALIBRATED_RUNS,
                 );
             }
+            rep.qc_report.confidence_calibrated = false;
             if let Some(ref w) = rep.qc_report.calibration_warning {
-                eprintln!("Warning: [{engine_label}] confidence_calibrated=false — {w}");
+                eprintln!("Warning: [{engine_label}] {w}");
             }
             let detailed_offsets = rep.qc_report.detailed_offsets;
             let offsets = ShiftOffsets {
@@ -524,6 +558,7 @@ pub(crate) fn execute_af_assisted_assignment_workflow(
                 cb: rep.final_offsets.d_cb,
                 c: rep.final_offsets.d_c,
             };
+            let af_offsets = AfShiftOffsets::from_shift_offsets(&offsets);
             let effective_priors = rep.shifted_priors(priors);
             let replicas = evo_cfg.population_size;
             let steps_per_system = evo_cfg.generations * evo_cfg.steps_per_system_per_gen;

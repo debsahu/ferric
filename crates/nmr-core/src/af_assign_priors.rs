@@ -11,6 +11,9 @@
 //! - Lange, K. L., Little, R. J. A. & Taylor, J. M. G. (*J. Am. Stat. Assoc.* **1989**, 84,
 //!   881-896) -- robust statistical modeling with heavy-tailed Student-`t(nu = 4)` likelihoods
 //!   `ell_{t4}(z) = -(5/2) ln(1 + z^2 / 4)`.
+//! - Genest, C. & Zidek, J. V. (*Statist. Sci.* **1986**, 1, 114-148) -- logarithmic
+//!   (log-linear) opinion pooling, used here as the per-nucleus replacement rule
+//!   `ell_a = (1 - omega) ell_seq,a + omega ell_AF,a` (section "Replacement algebra" below).
 //! - Wuthrich, K. (*NMR of Proteins and Nucleic Acids*, Wiley, **1986**) & Grzesiek, S.,
 //!   Wingfield, P., Stahl, S., Kaufman, J. D. & Bax, A. (*J. Biomol. NMR* **1995**, 5, 225-233) --
 //!   `3D 15N-edited NOESY-HSQC` `d_{NN}(i, j) <= 5.5 A` amide-proton sequential and cross-strand
@@ -22,21 +25,43 @@
 //!   physics implemented in `nmr-core::struct_shifts`.
 //! - Huber, P. J. (*Ann. Math. Stat.* **1964**, 35, 73-101) -- Huber M-estimation iteratively
 //!   reweighted least squares (`IRLS`) for outlier-resistant location registration.
+//!
+//! # Replacement algebra (`21.W2:P1-1`, design critique `A2`)
+//! The sequence-only unary score is a sum of per-observation log-likelihood ratios against one
+//! pooled residue-averaged background `bg_a(v)` (`Priors::background`):
+//! `ell_seq,a(v) = max(ln N(v | mu_res,a + d_cov + off_a, sd_res,a) - bg_a(v), -12)`.
+//! For every observed nucleus `a in {H, N, CA, CB, C'}` of the target residue `r` (`r = k` for
+//! intra-residue observations, `r = k - 1` for the `(i - 1)` carbons) the AF prior **replaces**
+//! that term by the log-linear pool
+//! `ell_a(v) = (1 - omega_r) ell_seq,a(v) + omega_r ell_AF,a(v)`,
+//! `ell_AF,a(v) = max(ln t4(v | mu_AF,r,a + off_a, sigma_AF,r,a) - bg_a(v), -12)`,
+//! with `omega_r = clamp(lambda_AF * w_AF(pLDDT_r), 0, 1)`. Both terms share the same
+//! background `bg_a`, the same `-12` floor and the same reference frame (`off_a` is the
+//! sequence-only offset actually applied by `prepare_scoring_priors` / evo-graph, so
+//! `--no-auto-ref` sets it to zero for both). Candidate choice is joint: each slot keeps
+//! `max_c [ell_a(v_c) + support_bonus (sup_c - 1)] - ln(n_pos)`, so `ln(n_pos)` appears exactly
+//! once (inside the unchanged sequence-only term) and cancels in
+//! `Delta U^{AF}_{s,k} = U^{pool}_{s,k} - U^{seq}_{s,k}`, which is finally clamped to
+//! `[-lambda_AF U_max, +lambda_AF U_max]`.
+//!
+//! The pooled per-nucleus likelihood is **not** separately calibrated: confidences produced
+//! with AF priors carry `uncalibrated_af_prior = true` (`confidence_calibrated = false`,
+//! `21.W2:P1-2`).
 
 use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::af_concordance::{parse_pae_json_file, parse_pae_json_str_for_chain, PaeMatrix};
+use crate::af_concordance::{parse_pae_json_str_for_chain, PaeMatrix};
 use crate::dihedrals::align_by_res_names;
 use crate::nef::read_nef_str;
 use crate::noesy::v_dist;
 use crate::peaks::{read_peaks_str, Peak};
 use crate::priors::{
-    delta_covalent, expected_covalent_atom_offset, one_to_three, Priors, ShiftOffsets, ATOMS,
+    covalent_atom_offset, delta_covalent, one_to_three, Priors, ShiftOffsets, ATOMS,
 };
-use crate::solver::{Matrix2D, FORBID};
+use crate::solver::{Matrix2D, ScoreConfig, FORBID};
 use crate::spinsystems::SpinSystem;
 use crate::struct_shifts::{
     af_plddt_confidence_weight, predict_structure_shifts_with_firewall, ResidueShiftPrediction,
@@ -45,11 +70,14 @@ use crate::struct_shifts::{
 };
 use crate::torsion_db::{HomologFirewallQuery, DEFAULT_FIREWALL_MAX_SEQ_IDENTITY};
 
-/// Default scaling factor `lambda_AF = 0.65` applied to clamped Student-`t(nu = 4)` 3D shift LLRs.
+/// Default AF replacement weight `lambda_AF = 0.65` (`omega_r = lambda_AF * w_AF(pLDDT_r)`).
 pub const DEFAULT_AF_WEIGHT: f64 = 0.65;
 
-/// Default symmetric per-residue Student-`t(nu = 4)` LLR clamp ceiling `U_max^{clamp} = 4.0` nats.
+/// Default per-residue clamp `U_max^{clamp} = 4.0` nats (final `|Delta U| <= lambda_AF U_max`).
 pub const DEFAULT_AF_CLAMP_NATS: f64 = 4.0;
+
+/// Default `15N-NOESY` contact-bonus weight (`P2-3`, matching `DEFAULT_AF_WEIGHT`).
+pub const DEFAULT_NOE_WEIGHT: f64 = 0.65;
 
 /// Degrees of freedom `nu = 4` for the heavy-tailed Student-`t` 3D shift likelihood.
 pub const STUDENT_T4_DOF: f64 = 4.0;
@@ -57,6 +85,17 @@ pub const STUDENT_T4_DOF: f64 = 4.0;
 /// Normalization constant `3 / 8 = 0.375` of the standard Student-`t(nu = 4)` density
 /// `f_{t4}(z) = (3 / 8) * (1 + z^2 / 4)^(-5/2)`.
 pub const STUDENT_T4_NORM_CONST: f64 = 0.375;
+
+/// Shared per-observation log-ratio floor (identical to the sequence-only `llr` floor).
+pub const AF_LLR_FLOOR_NATS: f64 = -12.0;
+
+/// Out-of-sample `T21.2` RMSE scale floor `[H, N, CA, CB, C']` in ppm (`21.W2:P1-2`, `P2-2`).
+///
+/// Grounded in `T21.2` leave-one-protein-out RMSEs (`H^N 0.505`, `N 2.804`, `CA 0.985`,
+/// `CB 1.140`, `C' 1.009` ppm; dev-set evidence per `21.W1:P1-3`), rounded up. `sigma_AF` never
+/// shrinks below these floors and widens monotonically toward `max(sigma_oos, sd_BMRB)` as
+/// `pLDDT` drops: `sigma_AF^2 = w^2 sigma_oos^2 + (1 - w^2) max(sigma_oos, sd_BMRB)^2`.
+pub const AF_SIGMA_OOS_PPM: [f64; 5] = [0.52, 2.80, 1.05, 1.20, 1.05];
 
 /// Maximum amide-proton distance `d(H^N_j, H^N_k) <= 5.5 A` for admitting a pair into `C_AF`.
 pub const AF_NOESY_MAX_DIST_ANGSTROM: f64 = 5.5;
@@ -82,9 +121,17 @@ pub const AF_NOESY_MAX_SEQ_BONUS_NATS: f64 = 2.50;
 /// Hard upper bound (`+2.20` nats) on medium/long-range `|j - k| >= 2` `15N-NOESY` pairwise bonus.
 pub const AF_NOESY_MAX_LR_BONUS_NATS: f64 = 2.20;
 
+/// Hard upper bound (`+2.50` nats, scaled by `noe_weight`) on the summed `15N-NOESY` bonus
+/// incident on any single residue (`P2-3`). Enforced symmetrically on each edge `(j, k)` via
+/// `min(1, site_cap / max(M_j, M_k))` so MCMC `local_subset_bonus` telescopes identically.
+pub const AF_NOESY_MAX_SITE_BONUS_NATS: f64 = 2.50;
+
+/// Generic sequential `d_NN` (`3.5 A`) assumed by the structure-free sequential `15N-NOESY`
+/// baseline ([`AfAssignPriors::sequence_only_noesy`]; `21.W2:P0-2` ablation control).
+pub const STRUCTURE_FREE_SEQ_DNN_ANGSTROM: f64 = 3.5;
+
 /// Exact integer carrier-center ppm constants `[H, N, CA, CB, C]` subtracted in `f64` on the host
-/// before `f32` WebGPU buffer upload so `scoring.wgsl` achieves `max |U_cpu - U_gpu| < 1.0e-5`
-/// even near `176 ppm` carbonyl `13C'`.
+/// before `f32` WebGPU AF buffer upload so `compute_unary_af` achieves `max |U_cpu - U_gpu| < 1e-5`.
 pub const AF_GPU_CARRIER_CENTERS_PPM: [f64; 5] = [8.0, 120.0, 56.0, 44.0, 176.0];
 
 /// Unnormalized heavy-tailed Student-`t(nu = 4)` log-kernel `ell_{t4}(z) = -(5/2) ln(1 + z^2 / 4)`
@@ -94,13 +141,365 @@ pub fn ell_student_t4(z: f64) -> f64 {
     -2.5 * (1.0 + 0.25 * z * z).ln()
 }
 
+/// Normalized Student-`t(nu = 4)` log-density of `v` with location `mu` and scale `sigma`.
+#[inline]
+pub fn ln_student_t4_density(v: f64, mu: f64, sigma: f64) -> f64 {
+    let z = (v - mu) / sigma;
+    STUDENT_T4_NORM_CONST.ln() - sigma.ln() + ell_student_t4(z)
+}
+
+#[inline]
+fn atom_index(atom: &str) -> Option<usize> {
+    ATOMS.iter().position(|&a| a == atom)
+}
+
+#[inline]
+fn is_experimental_method_token(s: &str) -> bool {
+    let up = s.to_ascii_uppercase();
+    up.contains("X-RAY")
+        || up.contains("NMR")
+        || up.contains("ELECTRON")
+        || up.contains("DIFFRACTION")
+        || up.contains("MICROSCOPY")
+        || up.contains("CRYSTAL")
+        || up.contains("NEUTRON")
+}
+
+/// Positive-evidence check that a coordinate text is a predicted model (`21.W2:P1-3`).
+///
+/// Local fail-closed stand-in matching `S2`'s `require_predicted_model()` contract: returns `true`
+/// ONLY for non-experimental mmCIF text carrying either:
+/// 1. a `_ma_qa_metric` entry whose `name` is explicitly `pLDDT` (case-insensitive; rejecting
+///    `QMEANDisCo` and other non-`pLDDT` metrics) paired with matching `_ma_qa_metric_local` rows, or
+/// 2. a verified ModelArchive/AFDB `_ma_protocol_step` / `_entry.id AF-*` mmCIF block with
+///    non-constant finite `_atom_site.B_iso_or_equiv` values in `[0, 100]` (rejecting all-zero and
+///    all-`0.5` constant B-factors).
+///
+/// Headerless PDBs, `EXPDTA`/`_exptl` experimental files (`1D3Z`, `1UBQ`), `CRYST1` unit cells,
+/// `REMARK`/title mentions of AlphaFold, and raw `B <= 100` PDBs all return `false`.
+pub fn text_has_predicted_model_evidence(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    if lines.is_empty() {
+        return false;
+    }
+
+    // Reject any PDB or mmCIF declaring experimental provenance or crystallographic unit cells.
+    for &line in &lines {
+        if line.starts_with("EXPDTA") && is_experimental_method_token(line) {
+            return false;
+        }
+        if line.starts_with("CRYST1") && line.len() >= 33 {
+            if let (Ok(a), Ok(b), Ok(c)) = (
+                line[6..15].trim().parse::<f64>(),
+                line[15..24].trim().parse::<f64>(),
+                line[24..33].trim().parse::<f64>(),
+            ) {
+                if a > 2.5 && b > 2.5 && c > 2.5 {
+                    return false;
+                }
+            }
+        }
+        if let Some(rest) = line.strip_prefix("_exptl.method") {
+            if is_experimental_method_token(rest) {
+                return false;
+            }
+        }
+    }
+
+    let mut has_mmcif_data = false;
+    let mut has_ma_protocol_or_af_entry = false;
+    let mut plddt_metric_ids: Vec<String> = Vec::new();
+    let mut has_kv_plddt_metric = false;
+    let mut has_matching_local_plddt = false;
+    let mut b_min = f64::INFINITY;
+    let mut b_max = f64::NEG_INFINITY;
+    let mut b_count = 0usize;
+    let mut b_out_of_range = false;
+
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.starts_with("data_") {
+            has_mmcif_data = true;
+        }
+        if let Some(rest) = line.strip_prefix("_entry.id") {
+            let val = rest.trim().trim_matches(|c| c == '\'' || c == '"');
+            if val.to_ascii_uppercase().starts_with("AF-") {
+                has_ma_protocol_or_af_entry = true;
+            }
+        }
+        if line.starts_with("_ma_protocol_step.") {
+            has_ma_protocol_or_af_entry = true;
+        }
+        if let Some(rest) = line.strip_prefix("_ma_qa_metric.name") {
+            let val = rest.trim().trim_matches(|c| c == '\'' || c == '"');
+            if val.eq_ignore_ascii_case("pLDDT") {
+                has_kv_plddt_metric = true;
+            }
+        }
+
+        if line.eq_ignore_ascii_case("loop_") {
+            let mut cols: Vec<&str> = Vec::new();
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].starts_with('_') {
+                cols.push(lines[j].split_whitespace().next().unwrap_or(""));
+                j += 1;
+            }
+            let first_low = cols
+                .first()
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+            if first_low.starts_with("_exptl.") {
+                let m_col = cols
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case("_exptl.method"));
+                while j < lines.len() {
+                    let row = lines[j];
+                    if row.is_empty()
+                        || row.starts_with('#')
+                        || row.starts_with('_')
+                        || row.eq_ignore_ascii_case("loop_")
+                        || row.eq_ignore_ascii_case("stop_")
+                    {
+                        break;
+                    }
+                    if m_col.is_some() && is_experimental_method_token(row) {
+                        return false;
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            } else if first_low.starts_with("_ma_protocol_step.") {
+                has_ma_protocol_or_af_entry = true;
+            } else if first_low.starts_with("_ma_qa_metric.") {
+                let id_col = cols
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case("_ma_qa_metric.id"));
+                let name_col = cols
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case("_ma_qa_metric.name"));
+                let mode_col = cols
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case("_ma_qa_metric.mode"));
+                while j < lines.len() {
+                    let row = lines[j];
+                    if row.is_empty()
+                        || row.starts_with('#')
+                        || row.starts_with('_')
+                        || row.eq_ignore_ascii_case("loop_")
+                        || row.eq_ignore_ascii_case("stop_")
+                    {
+                        break;
+                    }
+                    let toks = split_cif_row_tokens(row);
+                    if toks.len() == cols.len() {
+                        let name_ok = name_col
+                            .and_then(|c| toks.get(c))
+                            .is_some_and(|t| t.eq_ignore_ascii_case("pLDDT"));
+                        let mode_ok = mode_col
+                            .and_then(|c| toks.get(c))
+                            .is_none_or(|t| t.eq_ignore_ascii_case("local"));
+                        if name_ok && mode_ok {
+                            if let Some(ic) = id_col.and_then(|c| toks.get(c)) {
+                                plddt_metric_ids.push((*ic).to_string());
+                            } else {
+                                has_kv_plddt_metric = true;
+                            }
+                        }
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            } else if first_low.starts_with("_ma_qa_metric_local.") {
+                let mid_col = cols
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case("_ma_qa_metric_local.metric_id"));
+                let val_col = cols
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case("_ma_qa_metric_local.metric_value"));
+                if val_col.is_some() {
+                    while j < lines.len() {
+                        let row = lines[j];
+                        if row.is_empty()
+                            || row.starts_with('#')
+                            || row.starts_with('_')
+                            || row.eq_ignore_ascii_case("loop_")
+                            || row.eq_ignore_ascii_case("stop_")
+                        {
+                            break;
+                        }
+                        let toks = split_cif_row_tokens(row);
+                        if toks.len() == cols.len() {
+                            let id_matches = match mid_col {
+                                Some(mc) => {
+                                    (!plddt_metric_ids.is_empty()
+                                        && toks.get(mc).is_some_and(|id| {
+                                            plddt_metric_ids.iter().any(|p| p == id)
+                                        }))
+                                        || (plddt_metric_ids.is_empty() && has_kv_plddt_metric)
+                                }
+                                None => has_kv_plddt_metric || !plddt_metric_ids.is_empty(),
+                            };
+                            let val_ok = val_col
+                                .and_then(|vc| toks.get(vc))
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .is_some_and(|v| v.is_finite() && (0.0..=100.001).contains(&v));
+                            if id_matches && val_ok {
+                                has_matching_local_plddt = true;
+                            }
+                        }
+                        j += 1;
+                    }
+                }
+                i = j;
+                continue;
+            } else if first_low.starts_with("_atom_site.") {
+                let b_col = cols
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case("_atom_site.B_iso_or_equiv"));
+                if let Some(bc) = b_col {
+                    while j < lines.len() {
+                        let row = lines[j];
+                        if row.is_empty()
+                            || row.starts_with('#')
+                            || row.starts_with('_')
+                            || row.eq_ignore_ascii_case("loop_")
+                            || row.eq_ignore_ascii_case("stop_")
+                        {
+                            break;
+                        }
+                        let toks = split_cif_row_tokens(row);
+                        if toks.len() == cols.len() {
+                            if let Some(bs) = toks.get(bc) {
+                                if let Ok(b) = bs.parse::<f64>() {
+                                    if !b.is_finite() || !(0.0..=100.001).contains(&b) {
+                                        b_out_of_range = true;
+                                    } else {
+                                        b_min = b_min.min(b);
+                                        b_max = b_max.max(b);
+                                        b_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                        j += 1;
+                    }
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    if !has_mmcif_data {
+        return false;
+    }
+    if has_matching_local_plddt {
+        return true;
+    }
+    has_ma_protocol_or_af_entry && !b_out_of_range && b_count >= 2 && (b_max - b_min) > 1.0e-3
+}
+
+fn split_cif_row_tokens(row: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = row.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        while i < n && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let q = bytes[i];
+            let start = i + 1;
+            i += 1;
+            while i < n && !(bytes[i] == q && (i + 1 == n || bytes[i + 1].is_ascii_whitespace())) {
+                i += 1;
+            }
+            out.push(&row[start..i]);
+            if i < n {
+                i += 1;
+            }
+        } else {
+            let start = i;
+            while i < n && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            out.push(&row[start..i]);
+        }
+    }
+    out
+}
+
+/// Fail-closed model-provenance gate on a parsed [`StructureModel`] (`21.W2:P1-3`), matching
+/// `S2`'s `require_predicted_model(model, treat_as_model)`: accepted iff `treat_as_model` is true
+/// OR (`provenance == Computational` and every residue carries a finite non-constant `pLDDT`).
+pub fn af_require_predicted_model(
+    model: &StructureModel,
+    treat_as_model: bool,
+) -> Result<(), String> {
+    if treat_as_model {
+        return Ok(());
+    }
+    if model.provenance == StructCoordinateProvenance::Computational
+        && !model.residues.is_empty()
+        && model.residues.iter().all(|r| r.plddt.is_some())
+    {
+        let mut p_min = f64::INFINITY;
+        let mut p_max = f64::NEG_INFINITY;
+        for r in &model.residues {
+            let p = r.plddt.unwrap_or(0.0);
+            if !p.is_finite() || !(0.0..=100.001).contains(&p) {
+                return Err("model contains non-finite or out-of-range pLDDT".to_string());
+            }
+            p_min = p_min.min(p);
+            p_max = p_max.max(p);
+        }
+        // Reject constant all-0 or all-50 (rescaled 0.5) dummy B-factors
+        if model.residues.len() >= 2 && p_max <= 1e-6 {
+            return Err(
+                "--af-structure refused: all-zero pLDDT / B-factor column is not a valid predicted model; pass --treat-as-model to opt in explicitly"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    Err(format!(
+        "--af-structure requires positive evidence of a predicted model (ModelArchive/AFDB mmCIF \
+         `_ma_qa_metric_local` values for a metric named pLDDT); got provenance={} with {}/{} \
+         residues carrying pLDDT. Experimental (X-ray / solution NMR / EM) or headerless \
+         coordinates are refused; pass --treat-as-model to use them explicitly as a \
+         native-structure oracle",
+        model.provenance.as_str(),
+        model.residues.iter().filter(|r| r.plddt.is_some()).count(),
+        model.residues.len()
+    ))
+}
+
+const fn default_noe_weight() -> f64 {
+    DEFAULT_NOE_WEIGHT
+}
+
 /// Configuration for opt-in 3D-prior-assisted backbone and `PAE`-gated `15N-NOESY` assignment.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AfAssignConfig {
-    /// Global weight `lambda_AF` scaling the clamped per-residue 3D shift LLR (`default = 0.65`).
+    /// AF replacement weight `lambda_AF in [0, 1]` (`omega_r = lambda_AF w_AF(pLDDT_r)`; default 0.65).
     pub af_weight: f64,
-    /// Symmetric per-residue Student-`t4` LLR clamp ceiling `U_max^{clamp}` in nats (`default = 4.0`).
+    /// Per-residue clamp `U_max^{clamp}` in nats (`|Delta U| <= lambda_AF U_max`; default 4.0).
     pub af_clamp_nats: f64,
+    /// Weight on `PAE`-gated `15N-NOESY` contact bonuses (`[0, 1]`, default 0.65, `P2-3`).
+    #[serde(default = "default_noe_weight")]
+    pub noe_weight: f64,
+    /// Explicit opt-in to treat coordinates without predicted-model evidence as a model
+    /// (`--treat-as-model`; e.g. a native-structure oracle). Default `false` (fail closed).
+    #[serde(default)]
+    pub treat_as_model: bool,
     /// Symmetrized `PAE` cutoff in Angstroms for admitting `3D 15N-NOESY` contacts (`default = 6.0`).
     pub pae_cutoff_angstrom: f64,
     /// Minimum endpoint `pLDDT` required on both `(j, k)` residues for `15N-NOESY` contacts (`default = 70.0`).
@@ -120,6 +519,8 @@ impl Default for AfAssignConfig {
         Self {
             af_weight: DEFAULT_AF_WEIGHT,
             af_clamp_nats: DEFAULT_AF_CLAMP_NATS,
+            noe_weight: DEFAULT_NOE_WEIGHT,
+            treat_as_model: false,
             pae_cutoff_angstrom: AF_NOESY_MAX_SYMMETRIZED_PAE_ANGSTROM,
             min_contact_plddt: AF_NOESY_MIN_PLDDT,
             noesy_strip_tol_hn: (0.04, 0.40),
@@ -133,10 +534,16 @@ impl Default for AfAssignConfig {
 impl AfAssignConfig {
     /// Validate that all configuration scalars are finite and within physically admissible bounds.
     pub fn validate(&self) -> Result<(), String> {
-        if !self.af_weight.is_finite() || !(0.0..=5.0).contains(&self.af_weight) {
+        if !self.af_weight.is_finite() || !(0.0..=1.0).contains(&self.af_weight) {
             return Err(format!(
-                "invalid af_weight {}: expected finite value in [0.0, 5.0]",
+                "invalid af_weight {}: expected finite replacement weight in [0.0, 1.0]",
                 self.af_weight
+            ));
+        }
+        if !self.noe_weight.is_finite() || !(0.0..=1.0).contains(&self.noe_weight) {
+            return Err(format!(
+                "invalid noe_weight {}: expected finite value in [0.0, 1.0]",
+                self.noe_weight
             ));
         }
         if !self.af_clamp_nats.is_finite() || !(0.25..=20.0).contains(&self.af_clamp_nats) {
@@ -188,10 +595,15 @@ impl AfAssignConfig {
         }
         Ok(())
     }
+
+    /// Final per-cell clamp `lambda_AF * U_max` in nats.
+    #[inline]
+    pub fn delta_u_ceiling_nats(&self) -> f64 {
+        self.af_weight * self.af_clamp_nats
+    }
 }
 
-/// Global chemical-shift referencing offsets `(obs_ppm - af_pred_ppm)` across `[H, N, CA, CB, C']`,
-/// estimated strictly without ground-truth labels via grid profile-likelihood + Huber IRLS.
+/// Global chemical-shift referencing offsets `(obs_ppm - pred_ppm)` across `[H, N, CA, CB, C']`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AfShiftOffsets {
     pub h: f64,
@@ -229,31 +641,49 @@ impl AfShiftOffsets {
             c: self.c,
         }
     }
+
+    #[inline]
+    pub const fn from_shift_offsets(o: &ShiftOffsets) -> Self {
+        Self {
+            h: o.h,
+            n: o.n,
+            ca: o.ca,
+            cb: o.cb,
+            c: o.c,
+        }
+    }
 }
 
-/// Per-residue, per-atom (`H=0, N=1, CA=2, CB=3, C=4`) heavy-tailed Student-`t(nu = 4)` parameters.
+/// Per-residue, per-atom (`H=0, N=1, CA=2, CB=3, C=4`) AF-conditioned shift prior.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AfResidueAtomPrior {
     pub present: bool,
+    /// `T21.2` predicted shift (DSS frame; `pLDDT`-blended toward random coil by `T21.2`).
     pub mu_af_ppm: f64,
+    /// Student-`t4` scale `sigma_AF >= AF_SIGMA_OOS_PPM[a]`, never shrinking as `pLDDT` drops.
     pub sigma_af_ppm: f64,
-    pub mu_bg_ppm: f64,
-    pub sigma_bg_ppm: f64,
-    pub log_sigma_ratio: f64,
+    /// Replacement weight `omega_r = clamp(lambda_AF w_AF(pLDDT_r), 0, 1)` of this residue.
+    pub omega: f64,
 }
 
 impl AfResidueAtomPrior {
-    /// Evaluate `ell_{t4}(z^{AF}) - ell_{bg}(obs_ppm)` in nats after subtracting `off_ppm`.
+    /// `ell_AF,a(v) = max(ln t4(v | mu_AF + off, sigma_AF) - bg_a(v), -12)` against the shared
+    /// pooled background `bg` (`Priors::background(atom, v)` of the sequence-only priors).
     #[inline]
-    pub fn atom_llr(&self, obs_ppm: f64, off_ppm: f64) -> f64 {
-        if !self.present {
-            return 0.0;
-        }
-        let v_corr = obs_ppm - off_ppm;
-        let z_af = (v_corr - self.mu_af_ppm) / self.sigma_af_ppm;
-        let z_bg = (v_corr - self.mu_bg_ppm) / self.sigma_bg_ppm;
-        ell_student_t4(z_af) - (ell_student_t4(z_bg) + self.log_sigma_ratio)
+    pub fn af_llr(&self, v: f64, off_ppm: f64, bg: f64) -> f64 {
+        (ln_student_t4_density(v, self.mu_af_ppm + off_ppm, self.sigma_af_ppm) - bg)
+            .max(AF_LLR_FLOOR_NATS)
     }
+}
+
+/// Telemetry of one `Delta U^{AF}` application (`21.W2:P1-1` audit).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AfReplacementStats {
+    pub cells_scored: usize,
+    pub cells_nonzero: usize,
+    pub cells_at_clamp: usize,
+    pub max_abs_delta_u: f64,
+    pub ceiling_nats: f64,
 }
 
 /// Unassigned `3D 15N-edited NOESY-HSQC` peak `(H_direct, N15, H_indirect, volume)`.
@@ -275,7 +705,7 @@ pub struct AfAdmittedAmideContact {
     pub symmetrized_pae_angstrom: Option<f64>,
     pub plddt_j: f64,
     pub plddt_k: f64,
-    /// Precomputed distance-scaled ceiling before multiplying by `evid_NOE(s_1, s_2) in [0, 1]`.
+    /// Precomputed distance-scaled ceiling before multiplying by `noe_weight` and `evid_NOE`.
     pub max_distance_scale_nats: f64,
     pub cap_nats: f64,
     pub is_sequential: bool,
@@ -304,9 +734,9 @@ pub struct AfAssignPriors {
     pub seq_to_struct: Vec<Option<usize>>,
     /// Per-residue `pLDDT` aligned to `sequence` (`0.0` when unaligned).
     pub plddt_per_residue: Vec<f64>,
-    /// Per-residue smooth `pLDDT`-sigmoid weight `w_AF(pLDDT_k) in [0.0, 1.0)` aligned to `sequence`.
+    /// Per-residue smooth `pLDDT`-sigmoid weight `w_AF(pLDDT_k) in [0.0, 1.0]` aligned to `sequence`.
     pub w_af_per_residue: Vec<f64>,
-    /// Flat `[k * 5 + atom_idx]` Student-`t4` parameters (`H=0, N=1, CA=2, CB=3, C=4`).
+    /// Flat `[k * 5 + atom_idx]` AF shift priors (`H=0, N=1, CA=2, CB=3, C=4`).
     pub atom_priors: Vec<AfResidueAtomPrior>,
     /// Admitted confident amide-amide contacts `(j < k)` in `C_AF`.
     pub admitted_contacts: Vec<AfAdmittedAmideContact>,
@@ -316,6 +746,9 @@ pub struct AfAssignPriors {
     pub contact_summary: AfNoesyContactSummary,
     /// Full `T21.2` shift prediction report carrying `exclusion_list_sha256` & `max_retained_seq_identity`.
     pub shift_report: StructShiftPredictionReport,
+    /// Human-readable record of the predicted-model evidence that admitted this structure.
+    #[serde(default)]
+    pub model_evidence: String,
 }
 
 #[inline]
@@ -333,31 +766,11 @@ fn normalize_seq_tokens(sequence: &[String]) -> Vec<String> {
         .collect()
 }
 
-#[inline]
-fn effective_contact_plddt(
-    provenance: StructCoordinateProvenance,
-    res_plddt: Option<f64>,
-    override_plddt: Option<f64>,
-    pae_plddt: Option<f64>,
-) -> f64 {
-    if let Some(ov) = override_plddt {
-        return ov.clamp(0.0, 100.0);
-    }
-    if let Some(p) = res_plddt.or(pae_plddt) {
-        return p.clamp(0.0, 100.0);
-    }
-    match provenance {
-        // Computational model missing explicit pLDDT fails closed for NOE gating
-        StructCoordinateProvenance::Computational => 0.0,
-        // Experimental / unmarked coordinates without B-factor pLDDT treat backbone coordinates as ordered
-        StructCoordinateProvenance::Experimental | StructCoordinateProvenance::Unknown => 100.0,
-    }
-}
-
 impl AfAssignPriors {
     /// Build `AfAssignPriors` from a parsed [`StructureModel`], target `sequence`, optional
     /// [`PaeMatrix`], and optional `3D 15N-NOESY` crosspeaks, enforcing the 4-layer
-    /// `HomologFirewall` (`max_seq_identity <= 0.25`, `TM-score < 0.50`).
+    /// `HomologFirewall` (`max_seq_identity <= 0.25`, `TM-score < 0.50`) and the fail-closed
+    /// predicted-model gate ([`af_require_predicted_model`], `21.W2:P1-3`).
     pub fn from_structure_model(
         structure: &StructureModel,
         sequence: &[String],
@@ -384,7 +797,6 @@ impl AfAssignPriors {
             None => (1..=(k_len as i32)).collect(),
         };
 
-        // Validate PAE matrix dimensions if supplied
         let mut structure_work = structure.clone();
         if let Some(pae) = pae_opt {
             if pae.n_residues != structure_work.residues.len() && pae.n_residues != k_len {
@@ -394,7 +806,6 @@ impl AfAssignPriors {
                     structure_work.residues.len()
                 ));
             }
-            // Populate per-residue pLDDT from PAE JSON (e.g. ColabFold / AF3 JSON) when absent on coordinates
             if let Some(ref plddt_json) = pae.plddt_from_json {
                 if plddt_json.len() == structure_work.residues.len() {
                     for (r, &p_val) in structure_work.residues.iter_mut().zip(plddt_json.iter()) {
@@ -405,6 +816,12 @@ impl AfAssignPriors {
                 }
             }
         }
+        if let Some(ov) = cfg.struct_shift_cfg.override_uniform_plddt {
+            for r in &mut structure_work.residues {
+                r.plddt = Some(ov.clamp(0.0, 100.0));
+            }
+        }
+        af_require_predicted_model(&structure_work, cfg.treat_as_model)?;
 
         let shift_report = predict_structure_shifts_with_firewall(
             &structure_work,
@@ -446,69 +863,48 @@ impl AfAssignPriors {
             let Some(si) = seq_to_struct[k] else {
                 continue;
             };
-            let pred_r = &shift_report.residues[si];
-            let pae_p = pae_opt
-                .and_then(|pae| pae.plddt_from_json.as_ref())
-                .and_then(|v| {
-                    if v.len() == structure_work.residues.len() {
-                        v.get(si).copied()
-                    } else {
-                        v.get(k).copied()
-                    }
-                });
-            let eff_p = effective_contact_plddt(
-                structure_work.provenance,
-                pred_r.plddt,
-                cfg.struct_shift_cfg.override_uniform_plddt,
-                pae_p,
-            );
-            let w_af = match cfg
-                .struct_shift_cfg
-                .override_uniform_plddt
-                .or(pred_r.plddt)
-                .or(pae_p)
-            {
-                Some(p) => af_plddt_confidence_weight(p),
-                None => pred_r.w_af,
+            // Fail closed unless explicit `treat_as_model` opted in to unannotated coordinates.
+            let (p, w_af) = match structure_work.residues[si].plddt {
+                Some(raw_p) => {
+                    let pc = raw_p.clamp(0.0, 100.0);
+                    (pc, af_plddt_confidence_weight(pc))
+                }
+                None if cfg.treat_as_model => (100.0, 1.0),
+                None => {
+                    return Err(format!(
+                        "aligned residue {} {} lacks pLDDT; pass --treat-as-model to opt in explicitly",
+                        structure_work.residues[si].res_name, structure_work.residues[si].seq_id
+                    ));
+                }
             };
-            plddt_per_residue[k] = eff_p;
+            plddt_per_residue[k] = p;
             w_af_per_residue[k] = w_af;
+            let omega = (cfg.af_weight * w_af).clamp(0.0, 1.0);
 
+            let pred_r = &shift_report.residues[si];
             let rname = &norm_seq[k];
-            let cov_k = delta_covalent(&norm_seq, k);
             for (atom_idx, &atom_name) in ATOMS.iter().enumerate() {
                 if (rname == "PRO" && atom_name == "H") || (rname == "GLY" && atom_name == "CB") {
                     continue;
                 }
-                let Some((mu_bmrb, sd_bmrb)) = bmrb.get(rname, atom_name) else {
+                let Some((_, sd_bmrb)) = bmrb.get(rname, atom_name) else {
                     continue;
                 };
                 let Some(pred_b) = pred_r.backbone.get(atom_name) else {
                     continue;
                 };
-                if !pred_b.predicted_ppm.is_finite() || !pred_b.predicted_sigma_ppm.is_finite() {
+                if !pred_b.predicted_ppm.is_finite() {
                     continue;
                 }
-                // Out-of-sample non-homologous 3D shift uncertainty floor (specs/21 section 8 T21.2)
-                let sigma_af_floor = match atom_name {
-                    "H" => 0.48,
-                    "N" => 2.60,
-                    "CA" => 1.20,
-                    "CB" => 1.30,
-                    _ => 1.15,
-                };
-                let sigma_bg_floor = if atom_name == "H" { 0.12 } else { 0.35 };
-                let sigma_af = pred_b.predicted_sigma_ppm.max(sigma_af_floor);
-                let sigma_bg = sd_bmrb.max(sigma_bg_floor);
-                let mu_bg = mu_bmrb + expected_covalent_atom_offset(cov_k, atom_name);
-
+                let s_oos = AF_SIGMA_OOS_PPM[atom_idx];
+                let s_wide = s_oos.max(sd_bmrb);
+                let w2 = w_af * w_af;
+                let sigma_af = (w2 * s_oos * s_oos + (1.0 - w2) * s_wide * s_wide).sqrt();
                 atom_priors[k * 5 + atom_idx] = AfResidueAtomPrior {
                     present: true,
                     mu_af_ppm: pred_b.predicted_ppm,
                     sigma_af_ppm: sigma_af,
-                    mu_bg_ppm: mu_bg,
-                    sigma_bg_ppm: sigma_bg,
-                    log_sigma_ratio: (sigma_af / sigma_bg).ln(),
+                    omega,
                 };
             }
         }
@@ -624,6 +1020,16 @@ impl AfAssignPriors {
             }
         }
 
+        let model_evidence = if cfg.treat_as_model {
+            "explicit --treat-as-model opt-in (coordinates NOT verified as a predicted model; native-structure oracle if experimental)".to_string()
+        } else {
+            format!(
+                "provenance={} with per-residue pLDDT on all {} residues",
+                structure_work.provenance.as_str(),
+                structure_work.residues.len()
+            )
+        };
+
         Ok(Self {
             cfg: cfg.clone(),
             sequence: norm_seq,
@@ -636,11 +1042,84 @@ impl AfAssignPriors {
             noesy_15n_peaks,
             contact_summary: summary,
             shift_report,
+            model_evidence,
+        })
+    }
+
+    /// Structure-free `15N-NOESY` baseline: zero AF shift priors (`omega = 0` everywhere) and
+    /// one generic sequential `(k - 1, k)` amide-amide contact per non-Proline pair at
+    /// [`STRUCTURE_FREE_SEQ_DNN_ANGSTROM`]. Gives the sequence-only baseline the exact same
+    /// NOESY peak list without any 3D model (`21.W2:P0-2` ablation control; original method).
+    pub fn sequence_only_noesy(
+        sequence: &[String],
+        noesy_15n_peaks: Vec<Noesy15nPeak>,
+        cfg: &AfAssignConfig,
+    ) -> Result<Self, String> {
+        cfg.validate()?;
+        let norm_seq = normalize_seq_tokens(sequence);
+        let k_len = norm_seq.len();
+        if k_len == 0 {
+            return Err("empty target sequence".to_string());
+        }
+        let d = STRUCTURE_FREE_SEQ_DNN_ANGSTROM;
+        let scale = (1.85 * (3.0 / d).powi(6)).clamp(0.0, AF_NOESY_MAX_SEQ_BONUS_NATS);
+        let mut admitted_contacts = Vec::new();
+        for k in 2..k_len {
+            if norm_seq[k] == "PRO" || norm_seq[k - 1] == "PRO" {
+                continue;
+            }
+            admitted_contacts.push(AfAdmittedAmideContact {
+                seq_j: k - 1,
+                seq_k: k,
+                dist_hn_angstrom: d,
+                symmetrized_pae_angstrom: None,
+                plddt_j: 0.0,
+                plddt_k: 0.0,
+                max_distance_scale_nats: scale,
+                cap_nats: AF_NOESY_MAX_SEQ_BONUS_NATS,
+                is_sequential: true,
+            });
+        }
+        let summary = AfNoesyContactSummary {
+            noesy_peak_count: noesy_15n_peaks.len(),
+            admitted_contacts_total: admitted_contacts.len(),
+            admitted_sequential_contacts: admitted_contacts.len(),
+            ..Default::default()
+        };
+        let mut cfg_eff = cfg.clone();
+        cfg_eff.af_weight = 0.0;
+        Ok(Self {
+            cfg: cfg_eff,
+            seq_ids: (1..=(k_len as i32)).collect(),
+            seq_to_struct: vec![None; k_len],
+            plddt_per_residue: vec![0.0; k_len],
+            w_af_per_residue: vec![0.0; k_len],
+            atom_priors: vec![AfResidueAtomPrior::default(); k_len * 5],
+            admitted_contacts,
+            noesy_15n_peaks,
+            contact_summary: summary,
+            shift_report: StructShiftPredictionReport {
+                residues: Vec::new(),
+                sample_ph: cfg.struct_shift_cfg.sample_ph,
+                temperature_kelvin: cfg.struct_shift_cfg.temperature_kelvin,
+                include_methyl_ilvmat: false,
+                provenance: StructCoordinateProvenance::Unknown,
+                retained_template_count: 0,
+                excluded_template_ids: Vec::new(),
+                excluded_details: Vec::new(),
+                exclusion_list_sha256: String::new(),
+                max_retained_seq_identity: 0.0,
+                corpus_sha256: String::new(),
+            },
+            sequence: norm_seq,
+            model_evidence: "structure-free sequential NOESY baseline (no 3D model)".to_string(),
         })
     }
 
     /// Parse coordinate, optional `PAE` JSON, and optional `3D 15N-NOESY` files from disk and build
-    /// [`AfAssignPriors`].
+    /// [`AfAssignPriors`]. Fails closed unless the coordinate text carries positive predicted-model
+    /// evidence ([`text_has_predicted_model_evidence`]) or `cfg.treat_as_model` is explicitly set
+    /// (`21.W2:P1-3`).
     pub fn from_files(
         structure_path: impl AsRef<Path>,
         sequence: &[String],
@@ -650,24 +1129,42 @@ impl AfAssignPriors {
         firewall_query: &HomologFirewallQuery,
         cfg: &AfAssignConfig,
     ) -> Result<Self, String> {
-        let model = StructureModel::parse_file(
-            structure_path.as_ref(),
-            cfg.struct_shift_cfg.force_bfactor_plddt,
-        )?;
-        let chain_hint = model.residues.first().map(|r| r.chain_id.as_str());
-        let pae = match pae_path_opt {
-            Some(p) => Some(parse_pae_json_file(p, chain_hint, None)?),
-            None => None,
-        };
+        let p = structure_path.as_ref();
+        let meta = fs::metadata(p)
+            .map_err(|e| format!("failed to stat structure file '{}': {e}", p.display()))?;
+        if meta.len() > MAX_STRUCTURE_FILE_BYTES as u64 {
+            return Err(format!(
+                "structure file '{}' exceeds 64 MiB limit",
+                p.display()
+            ));
+        }
+        let text = fs::read_to_string(p)
+            .map_err(|e| format!("failed to read structure file '{}': {e}", p.display()))?;
+        let fmt_hint = p.extension().and_then(|e| e.to_str()).map(str::to_string);
         let noesy_peaks = match noesy_15n_path_opt {
-            Some(p) => parse_noesy_15n_peaks_file(p)?,
+            Some(np) => parse_noesy_15n_peaks_file(np)?,
             None => Vec::new(),
         };
-        Self::from_structure_model(
-            &model,
+        let pae_text = match pae_path_opt {
+            Some(pp) => {
+                let pm = fs::metadata(pp)
+                    .map_err(|e| format!("failed to stat PAE file '{}': {e}", pp.display()))?;
+                if pm.len() > 256 * 1024 * 1024 {
+                    return Err(format!("PAE file '{}' exceeds 256 MiB limit", pp.display()));
+                }
+                Some(
+                    fs::read_to_string(pp)
+                        .map_err(|e| format!("failed to read PAE file '{}': {e}", pp.display()))?,
+                )
+            }
+            None => None,
+        };
+        Self::from_strs_with_peaks(
+            &text,
+            fmt_hint.as_deref(),
             sequence,
             seq_ids_opt,
-            pae.as_ref(),
+            pae_text.as_deref(),
             noesy_peaks,
             firewall_query,
             cfg,
@@ -687,6 +1184,44 @@ impl AfAssignPriors {
         firewall_query: &HomologFirewallQuery,
         cfg: &AfAssignConfig,
     ) -> Result<Self, String> {
+        let noesy_peaks = match noesy_15n_text_opt {
+            Some(txt) => parse_noesy_15n_peaks_str(txt)?,
+            None => Vec::new(),
+        };
+        Self::from_strs_with_peaks(
+            structure_text,
+            format_hint,
+            sequence,
+            seq_ids_opt,
+            pae_json_opt,
+            noesy_peaks,
+            firewall_query,
+            cfg,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_strs_with_peaks(
+        structure_text: &str,
+        format_hint: Option<&str>,
+        sequence: &[String],
+        seq_ids_opt: Option<&[i32]>,
+        pae_json_opt: Option<&str>,
+        noesy_peaks: Vec<Noesy15nPeak>,
+        firewall_query: &HomologFirewallQuery,
+        cfg: &AfAssignConfig,
+    ) -> Result<Self, String> {
+        let has_evidence = text_has_predicted_model_evidence(structure_text);
+        if !has_evidence && !cfg.treat_as_model {
+            return Err(
+                "--af-structure refused: no positive predicted-model evidence (an mmCIF \
+                 `_ma_qa_metric` named pLDDT with `_ma_qa_metric_local` values, or verified \
+                 AFDB/ModelArchive block with non-constant pLDDT). Headerless, experimental \
+                 (X-ray / solution NMR / EM) and REMARK-only files are not treated as models; \
+                 pass --treat-as-model to use the coordinates explicitly as a native-structure oracle"
+                    .to_string(),
+            );
+        }
         let model = StructureModel::parse_str(
             structure_text,
             format_hint,
@@ -697,11 +1232,7 @@ impl AfAssignPriors {
             Some(txt) => Some(parse_pae_json_str_for_chain(txt, chain_hint, None)?),
             None => None,
         };
-        let noesy_peaks = match noesy_15n_text_opt {
-            Some(txt) => parse_noesy_15n_peaks_str(txt)?,
-            None => Vec::new(),
-        };
-        Self::from_structure_model(
+        let mut out = Self::from_structure_model(
             &model,
             sequence,
             seq_ids_opt,
@@ -709,7 +1240,12 @@ impl AfAssignPriors {
             noesy_peaks,
             firewall_query,
             cfg,
-        )
+        )?;
+        if has_evidence {
+            out.model_evidence =
+                "mmCIF _ma_qa_metric (name=pLDDT) + _ma_qa_metric_local values".to_string();
+        }
+        Ok(out)
     }
 
     #[inline]
@@ -725,94 +1261,123 @@ impl AfAssignPriors {
             .unwrap_or_default()
     }
 
-    /// Evaluate the clamped heavy-tailed Student-`t(nu = 4)` 3D shift prior `Delta U^{AF}_{s,k}`
-    /// (in nats) for placing spin system `ss` onto sequence index `k`, given unlabelled `offsets`.
-    pub fn compute_af_delta_u_cell(
+    /// `Delta U^{AF}_{s,k}` (nats) for placing `ss` at `k` under the per-nucleus replacement
+    /// algebra (module docs), BEFORE the final `lambda_AF U_max` clamp.
+    ///
+    /// `seq_priors` must be the sequence-only priors in the experimental frame (offsets already
+    /// applied, as used for `U^{seq}`), and `offsets` the very same offsets, applied to the AF
+    /// means so both terms live in one unified reference frame.
+    pub fn raw_delta_u_cell(
         &self,
         ss: &SpinSystem,
+        sequence: &[String],
         k: usize,
-        offsets: &AfShiftOffsets,
-        use_hn: bool,
+        seq_priors: &Priors,
+        offsets: &ShiftOffsets,
+        score_cfg: &ScoreConfig,
+    ) -> f64 {
+        self.raw_delta_u_cell_capped(ss, sequence, k, seq_priors, offsets, score_cfg, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn raw_delta_u_cell_capped(
+        &self,
+        ss: &SpinSystem,
+        sequence: &[String],
+        k: usize,
+        seq_priors: &Priors,
+        offsets: &ShiftOffsets,
+        score_cfg: &ScoreConfig,
         max_cands_cap: Option<usize>,
     ) -> f64 {
-        let k_len = self.sequence.len();
-        if k == 0 || k >= k_len || self.sequence[k] == "PRO" || self.cfg.af_weight <= 0.0 {
+        let k_len = self.sequence.len().min(sequence.len());
+        if k == 0 || k >= k_len || sequence[k] == "PRO" {
             return 0.0;
         }
-        let w_k = self.w_af_per_residue[k];
-        if w_k <= 0.0 {
-            return 0.0;
-        }
-
-        // Sum strictly over observed intra-residue `a in O_s` (`off == 0`: CA_i, CB_i, C'_i, N_i, H_i)
-        // at residue `k`, matching specs/21 section 4.2 eq. without double-counting `k - 1`.
-        let mut raw_sum = 0.0_f64;
-        for (atom_c, atom_name) in ["CA", "CB", "C"].iter().enumerate() {
-            let atom_idx = atom_c + 2;
-            let ae = self.atom_prior(k, atom_idx);
-            if !ae.present {
+        let res = &sequence[k];
+        let prev = &sequence[k - 1];
+        let cov_k = delta_covalent(sequence, k);
+        let cov_km1 = delta_covalent(sequence, k - 1);
+        let mut delta = 0.0_f64;
+        for ((atom, off), raw_cands) in &ss.cands {
+            let Some(a_idx) = atom_index(atom) else {
+                continue;
+            };
+            let (target_k, target_res, cov) = if *off == 0 {
+                (k, res, cov_k)
+            } else {
+                (k - 1, prev, cov_km1)
+            };
+            let ae = self.atom_prior(target_k, a_idx);
+            if !ae.present || ae.omega <= 0.0 {
                 continue;
             }
-            let Some(raw_list) = ss.cands.get(&((*atom_name).to_string(), 0)) else {
-                continue;
-            };
-            let off_ppm = offsets.get(atom_name);
             let slice = match max_cands_cap {
-                Some(cap) => &raw_list[..raw_list.len().min(cap)],
-                None => raw_list.as_slice(),
+                Some(cap) => &raw_cands[..raw_cands.len().min(cap)],
+                None => raw_cands.as_slice(),
             };
-            let mut n_pos = 0usize;
-            let mut best_af = f64::NEG_INFINITY;
-            for &(val, sup) in slice {
-                if sup > 0 {
-                    n_pos += 1;
-                    let term = ae.atom_llr(val, off_ppm);
-                    if term > best_af {
-                        best_af = term;
-                    }
+            let d_cov = covalent_atom_offset(cov, atom);
+            let off_a = offsets.get(atom);
+            let mut best_seq = f64::NEG_INFINITY;
+            let mut best_pool = f64::NEG_INFINITY;
+            for &(v, sup) in slice {
+                if sup == 0 {
+                    continue;
+                }
+                let bonus = score_cfg.support_bonus * ((sup as f64) - 1.0);
+                let l_seq = seq_priors.llr_shifted(target_res, atom, v, d_cov);
+                let l_af = ae.af_llr(v, off_a, seq_priors.background(atom, v));
+                let seq_c = l_seq + bonus;
+                let pool_c = (1.0 - ae.omega) * l_seq + ae.omega * l_af + bonus;
+                if seq_c > best_seq {
+                    best_seq = seq_c;
+                }
+                if pool_c > best_pool {
+                    best_pool = pool_c;
                 }
             }
-            if n_pos > 0 {
-                raw_sum += best_af - (n_pos as f64).ln();
+            if best_seq.is_finite() && best_pool.is_finite() {
+                // `- ln(n_pos)` is identical in both terms and cancels identically (`21.W2:P1-1`).
+                delta += best_pool - best_seq;
             }
         }
-
-        if use_hn {
+        if score_cfg.use_hn {
             let ae_n = self.atom_prior(k, 1);
+            if ae_n.present && ae_n.omega > 0.0 {
+                let l_seq = seq_priors.llr_shifted(res, "N", ss.n, cov_k.0);
+                let l_af = ae_n.af_llr(ss.n, offsets.n, seq_priors.background("N", ss.n));
+                delta += ae_n.omega * (l_af - l_seq);
+            }
             let ae_h = self.atom_prior(k, 0);
-            raw_sum += ae_n.atom_llr(ss.n, offsets.n) + ae_h.atom_llr(ss.h, offsets.h);
+            if ae_h.present && ae_h.omega > 0.0 {
+                let l_seq = seq_priors.llr(res, "H", ss.h);
+                let l_af = ae_h.af_llr(ss.h, offsets.h, seq_priors.background("H", ss.h));
+                delta += ae_h.omega * (l_af - l_seq);
+            }
         }
-
-        let clamped = raw_sum.clamp(-self.cfg.af_clamp_nats, self.cfg.af_clamp_nats);
-        self.cfg.af_weight * w_k * clamped
+        delta
     }
 
-    /// Add `Delta U^{AF}_{s,k}` in-place onto all admissible (`> FORBID * 0.5`) cells of an
-    /// unlocked `U (S x K)` matrix, estimating global unlabelled offsets automatically.
-    pub fn apply_to_unary_matrix(
+    /// Add the clamped per-nucleus replacement `Delta U^{AF}` onto every admissible
+    /// (`> FORBID / 2`) cell of a sequence-only `U (S x K)` matrix (before user locks).
+    pub fn apply_replacement_to_unary(
         &self,
         u: &mut Matrix2D,
         systems: &[SpinSystem],
-        use_hn: bool,
-    ) -> AfShiftOffsets {
-        let offsets = estimate_af_shift_offsets(systems, self);
-        self.apply_to_unary_matrix_with_offsets(u, systems, &offsets, use_hn);
-        offsets
-    }
-
-    /// Add `Delta U^{AF}_{s,k}` in-place onto all admissible (`> FORBID * 0.5`) cells of `u`
-    /// using pre-estimated `offsets`.
-    pub fn apply_to_unary_matrix_with_offsets(
-        &self,
-        u: &mut Matrix2D,
-        systems: &[SpinSystem],
-        offsets: &AfShiftOffsets,
-        use_hn: bool,
-    ) {
+        sequence: &[String],
+        seq_priors: &Priors,
+        offsets: &ShiftOffsets,
+        score_cfg: &ScoreConfig,
+    ) -> AfReplacementStats {
+        let ceiling = self.cfg.delta_u_ceiling_nats();
+        let mut stats = AfReplacementStats {
+            ceiling_nats: ceiling,
+            ..Default::default()
+        };
         let s_len = u.rows.min(systems.len());
-        let k_len = u.cols.min(self.sequence.len());
-        if s_len == 0 || k_len <= 1 || self.cfg.af_weight <= 0.0 {
-            return;
+        let k_len = u.cols.min(self.sequence.len()).min(sequence.len());
+        if s_len == 0 || k_len <= 1 || ceiling <= 0.0 {
+            return stats;
         }
         let max_cands = systems
             .iter()
@@ -820,9 +1385,8 @@ impl AfAssignPriors {
             .max()
             .unwrap_or(1)
             .max(1);
-
         for k in 1..k_len {
-            if self.sequence[k] == "PRO" || self.w_af_per_residue[k] <= 0.0 {
+            if sequence[k] == "PRO" {
                 continue;
             }
             for (s, ss) in systems.iter().enumerate().take(s_len) {
@@ -830,14 +1394,32 @@ impl AfAssignPriors {
                 if base <= FORBID * 0.5 {
                     continue;
                 }
-                let du = self.compute_af_delta_u_cell(ss, k, offsets, use_hn, Some(max_cands));
-                u.set(s, k, base + du);
+                stats.cells_scored += 1;
+                let raw = self.raw_delta_u_cell_capped(
+                    ss,
+                    sequence,
+                    k,
+                    seq_priors,
+                    offsets,
+                    score_cfg,
+                    Some(max_cands),
+                );
+                let du = raw.clamp(-ceiling, ceiling);
+                if du != 0.0 {
+                    stats.cells_nonzero += 1;
+                    if raw.abs() >= ceiling {
+                        stats.cells_at_clamp += 1;
+                    }
+                    stats.max_abs_delta_u = stats.max_abs_delta_u.max(du.abs());
+                    u.set(s, k, base + du);
+                }
             }
         }
+        stats
     }
 
     /// Build a fast `O(1)`-per-move pairwise `15N-NOESY` lookup table for `systems` (`None` when
-    /// either `noesy_15n_peaks` or `admitted_contacts` is empty).
+    /// either `noesy_15n_peaks` or `admitted_contacts` is empty, or `noe_weight == 0`).
     pub fn build_noesy_pairwise_table(
         &self,
         systems: &[SpinSystem],
@@ -847,14 +1429,15 @@ impl AfAssignPriors {
 }
 
 // ============================================================================
-// 1. Unlabelled Grid Profile-Likelihood + Huber IRLS Offset Registration
+// 1. Unlabelled Grid Profile-Likelihood + Outlier-Resistant Huber IRLS Offsets
 // ============================================================================
 
 #[inline]
-fn spin_system_canonical_rank_key(ss: &SpinSystem) -> (usize, usize, u64, u64, u64) {
+fn spin_system_canonical_rank_key(ss: &SpinSystem) -> (bool, usize, usize, u64, u64, u64) {
     let mut slots = 0usize;
     let mut sup_sum = 0usize;
     let mut first_ca = 0.0_f64;
+    let mut has_ca = false;
     for ((atom, off), cands) in &ss.cands {
         let mut best_pos: Option<(usize, f64)> = None;
         for &(v, sup) in cands {
@@ -874,12 +1457,16 @@ fn spin_system_canonical_rank_key(ss: &SpinSystem) -> (usize, usize, u64, u64, u
         if let Some((bs, bv)) = best_pos {
             slots += 1;
             sup_sum += bs;
-            if atom == "CA" && *off == 0 {
-                first_ca = bv;
+            if atom == "CA" {
+                has_ca = true;
+                if *off == 0 {
+                    first_ca = bv;
+                }
             }
         }
     }
     (
+        has_ca,
         sup_sum,
         slots,
         ss.h.to_bits(),
@@ -910,6 +1497,30 @@ fn best_positive_slot_value(ss: &SpinSystem, atom: &str, off: i32) -> Option<f64
 }
 
 #[inline]
+fn is_nh2_sidechain_pair_member(idx: usize, systems: &[SpinSystem]) -> bool {
+    let ss = &systems[idx];
+    let has_ca0 = best_positive_slot_value(ss, "CA", 0).is_some();
+    if has_ca0 {
+        return false;
+    }
+    for (j, other) in systems.iter().enumerate() {
+        if j == idx {
+            continue;
+        }
+        let other_ca0 = best_positive_slot_value(other, "CA", 0).is_some();
+        if other_ca0 {
+            continue;
+        }
+        let dn = (ss.n - other.n).abs();
+        let dh = (ss.h - other.h).abs();
+        if dn <= 0.25 && (0.15..=1.60).contains(&dh) {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
 fn fit_single_channel_profile_huber_irls(
     obs_sorted: &[f64],
     preds_sorted: &[(f64, f64)],
@@ -921,7 +1532,7 @@ fn fit_single_channel_profile_huber_irls(
     if obs_sorted.len() < 4 || preds_sorted.len() < 4 {
         return 0.0;
     }
-    const OUTLIER_EPS: f64 = 0.05;
+    const OUTLIER_EPS: f64 = 0.20;
     let fg_scale = (1.0 - OUTLIER_EPS) / (preds_sorted.len() as f64);
     let bg_const = OUTLIER_EPS / spectral_range_ppm;
 
@@ -930,7 +1541,7 @@ fn fit_single_channel_profile_huber_irls(
     let mut best_idx = n_steps / 2;
     let mut best_ll = f64::NEG_INFINITY;
 
-    // Stage 1: Unlabelled Student-t4 marginal mixture grid profile-likelihood
+    // Stage 1: Unlabelled Student-t4 + uniform outlier marginal mixture profile-likelihood
     for (g_idx, slot) in scores.iter_mut().enumerate() {
         let d = -max_search_ppm + (g_idx as f64) * grid_step_ppm;
         let mut ll = 0.0_f64;
@@ -962,21 +1573,25 @@ fn fit_single_channel_profile_huber_irls(
         }
     }
 
-    // Stage 2: Responsibility-weighted Huber IRLS refinement (`12` iterations)
+    // Stage 2: Inlier-gated Huber IRLS refinement (`12` iterations)
     for _ in 0..12 {
         let mut num = 0.0_f64;
         let mut den = 0.0_f64;
         for &x in obs_sorted {
-            let mut tot_p = bg_const;
+            let mut fg_sum = 0.0_f64;
             for &(mu, sig) in preds_sorted {
                 let z = (x - (mu + d_est)) / sig;
-                let u = fg_scale * STUDENT_T4_NORM_CONST * (1.0 + 0.25 * z * z).powf(-2.5) / sig;
-                tot_p += u;
+                fg_sum += fg_scale * STUDENT_T4_NORM_CONST * (1.0 + 0.25 * z * z).powf(-2.5) / sig;
             }
-            let inv_tot = 1.0 / tot_p.max(1e-30);
+            let tot_p = (fg_sum + bg_const).max(1e-30);
+            let p_inlier = fg_sum / tot_p;
+            let inv_tot = p_inlier / tot_p;
             for &(mu, sig) in preds_sorted {
                 let raw_diff = x - mu;
                 let resid = (raw_diff - d_est).abs();
+                if resid > 3.0 * sig {
+                    continue;
+                }
                 let z = resid / sig;
                 let u = fg_scale * STUDENT_T4_NORM_CONST * (1.0 + 0.25 * z * z).powf(-2.5) / sig;
                 let resp = u * inv_tot;
@@ -1006,8 +1621,9 @@ fn fit_single_channel_profile_huber_irls(
 
 /// Estimate global referencing offsets `(dH, dN, dCA, dCB, dC')` (`obs - pred`) strictly from the
 /// unordered multiset of `SpinSystem` shifts and unordered `T21.2` [`ResidueShiftPrediction`]s
-/// via grid profile-likelihood + Huber IRLS (`0` ground-truth labels; exact `< 1e-12` permutation
-/// invariance under arbitrary permutations of both `systems` and `predictions`).
+/// via outlier-gated profile-likelihood + Huber IRLS (`0` ground-truth labels; exact `< 1e-12`
+/// permutation invariance under arbitrary permutations of both `systems` and `predictions`, and
+/// hardened against missing roots + sidechain `NH2`-like extras per `21.W2:P2-1`).
 pub fn estimate_af_shift_offsets_from_predictions(
     systems: &[SpinSystem],
     predictions: &[ResidueShiftPrediction],
@@ -1016,68 +1632,115 @@ pub fn estimate_af_shift_offsets_from_predictions(
         return AfShiftOffsets::default();
     }
 
-    // Canonicalize spin-system selection deterministically so arbitrary permutations of `systems`
-    // select the exact same subset in identical canonical order.
-    let max_selected = ((predictions.len() * 4) / 3).max(24);
-    let mut ranked: Vec<&SpinSystem> = systems
+    let non_nh2: Vec<&SpinSystem> = systems
         .iter()
-        .filter(|ss| spin_system_canonical_rank_key(ss).1 >= 2)
+        .enumerate()
+        .filter_map(|(i, ss)| (!is_nh2_sidechain_pair_member(i, systems)).then_some(ss))
         .collect();
-    if ranked.len() < 8 {
-        ranked = systems
+    let pool: &[&SpinSystem] = if non_nh2.len() >= 6 {
+        &non_nh2
+    } else {
+        // Fallback only on tiny synthetic inputs
+        &systems.iter().collect::<Vec<_>>()
+    };
+
+    let ca_backed: Vec<&SpinSystem> = pool
+        .iter()
+        .copied()
+        .filter(|ss| {
+            let k = spin_system_canonical_rank_key(ss);
+            k.0 && k.2 >= 2
+        })
+        .collect();
+    let mut ranked: Vec<&SpinSystem> = if ca_backed.len() >= 8 {
+        ca_backed
+    } else {
+        let multi: Vec<&SpinSystem> = pool
             .iter()
-            .filter(|ss| ss.has_observed_carbons())
+            .copied()
+            .filter(|ss| spin_system_canonical_rank_key(ss).2 >= 2)
             .collect();
-    }
-    if ranked.is_empty() {
-        ranked = systems.iter().collect();
-    }
+        if multi.len() >= 6 {
+            multi
+        } else {
+            let carb: Vec<&SpinSystem> = pool
+                .iter()
+                .copied()
+                .filter(|ss| ss.has_observed_carbons())
+                .collect();
+            if carb.is_empty() {
+                pool.to_vec()
+            } else {
+                carb
+            }
+        }
+    };
+
     ranked.sort_by(|a, b| {
         let ka = spin_system_canonical_rank_key(a);
         let kb = spin_system_canonical_rank_key(b);
         kb.0.cmp(&ka.0)
+            .then_with(|| kb.2.cmp(&ka.2))
             .then_with(|| kb.1.cmp(&ka.1))
             .then_with(|| a.h.total_cmp(&b.h))
             .then_with(|| a.n.total_cmp(&b.n))
-            .then_with(|| ka.4.cmp(&kb.4))
+            .then_with(|| ka.5.cmp(&kb.5))
     });
+    let max_selected = predictions.len().max(16);
     if ranked.len() > max_selected {
         ranked.truncate(max_selected);
     }
 
-    let collect_preds =
-        |atom: &str, is_pro_excluded: bool, is_gly_excluded: bool| -> Vec<(f64, f64)> {
-            let floor = if atom == "H" { 0.15 } else { 0.40 };
-            let mut v: Vec<(f64, f64)> = predictions
-                .iter()
-                .filter(|r| {
-                    !(is_pro_excluded && r.res_name == "PRO")
-                        && !(is_gly_excluded && r.res_name == "GLY")
-                })
-                .filter_map(|r| {
-                    let b = r.backbone.get(atom)?;
-                    if b.predicted_ppm.is_finite() && b.predicted_sigma_ppm.is_finite() {
-                        Some((b.predicted_ppm, b.predicted_sigma_ppm.max(floor)))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            v.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
-            v
-        };
+    let collect_preds = |atom: &str,
+                         floor_ppm: f64,
+                         is_pro_excluded: bool,
+                         is_gly_excluded: bool|
+     -> Vec<(f64, f64)> {
+        let mut v: Vec<(f64, f64)> = predictions
+            .iter()
+            .filter(|r| {
+                !(is_pro_excluded && r.res_name == "PRO")
+                    && !(is_gly_excluded && r.res_name == "GLY")
+            })
+            .filter_map(|r| {
+                let b = r.backbone.get(atom)?;
+                if b.predicted_ppm.is_finite() && b.predicted_sigma_ppm.is_finite() {
+                    Some((b.predicted_ppm, b.predicted_sigma_ppm.max(floor_ppm)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+        v
+    };
 
+    // Prefer intra-residue (`off = 0`, 1 observation per spin system) when well-populated (`>= 8`),
+    // falling back to sequential (`off = -1`) on `CBCACONH`/`HNCO`-only sets so residues are not
+    // asymmetrically double-counted across missing sequential neighbors.
     let collect_carbon_obs = |atom: &str, lo: f64, hi: f64| -> Vec<f64> {
-        let mut obs = Vec::new();
+        let mut obs0 = Vec::new();
+        let mut obsm1 = Vec::new();
         for ss in &ranked {
-            for off in [0, -1] {
-                if let Some(v) = best_positive_slot_value(ss, atom, off) {
-                    if (lo..=hi).contains(&v) {
-                        obs.push(v);
-                    }
+            if let Some(v) = best_positive_slot_value(ss, atom, 0) {
+                if (lo..=hi).contains(&v) {
+                    obs0.push(v);
+                }
+            }
+            if let Some(v) = best_positive_slot_value(ss, atom, -1) {
+                if (lo..=hi).contains(&v) {
+                    obsm1.push(v);
                 }
             }
         }
+        let mut obs = if obs0.len() >= 8 && obs0.len() * 2 >= obsm1.len() {
+            obs0
+        } else if obsm1.len() >= 8 && obsm1.len() > obs0.len() * 2 {
+            obsm1
+        } else {
+            obs0.extend(obsm1);
+            obs0
+        };
         obs.sort_by(f64::total_cmp);
         obs
     };
@@ -1085,14 +1748,14 @@ pub fn estimate_af_shift_offsets_from_predictions(
     let mut obs_h: Vec<f64> = ranked
         .iter()
         .map(|ss| ss.h)
-        .filter(|v| v.is_finite() && (4.5..=13.0).contains(v))
+        .filter(|v| v.is_finite() && (5.0..=12.5).contains(v))
         .collect();
     obs_h.sort_by(f64::total_cmp);
 
     let mut obs_n: Vec<f64> = ranked
         .iter()
         .map(|ss| ss.n)
-        .filter(|v| v.is_finite() && (95.0..=145.0).contains(v))
+        .filter(|v| v.is_finite() && (98.0..=142.0).contains(v))
         .collect();
     obs_n.sort_by(f64::total_cmp);
 
@@ -1100,21 +1763,21 @@ pub fn estimate_af_shift_offsets_from_predictions(
     let obs_cb = collect_carbon_obs("CB", 8.0, 78.0);
     let obs_c = collect_carbon_obs("C", 160.0, 190.0);
 
-    let preds_h = collect_preds("H", true, false);
-    let preds_n = collect_preds("N", true, false);
-    let preds_ca = collect_preds("CA", false, false);
-    let preds_cb = collect_preds("CB", false, true);
-    let preds_c = collect_preds("C", false, false);
+    let preds_h = collect_preds("H", AF_SIGMA_OOS_PPM[0], true, false);
+    let preds_n = collect_preds("N", AF_SIGMA_OOS_PPM[1], true, false);
+    let preds_ca = collect_preds("CA", AF_SIGMA_OOS_PPM[2], false, false);
+    let preds_cb = collect_preds("CB", AF_SIGMA_OOS_PPM[3], false, true);
+    let preds_c = collect_preds("C", AF_SIGMA_OOS_PPM[4], false, false);
 
-    let h = fit_single_channel_profile_huber_irls(&obs_h, &preds_h, 2.5, 0.01, 5.0, 0.35);
-    let n = fit_single_channel_profile_huber_irls(&obs_n, &preds_n, 12.0, 0.05, 40.0, 1.80);
-    let ca = fit_single_channel_profile_huber_irls(&obs_ca, &preds_ca, 12.0, 0.05, 36.0, 0.90);
+    let h = fit_single_channel_profile_huber_irls(&obs_h, &preds_h, 2.5, 0.01, 5.0, 0.30);
+    let n = fit_single_channel_profile_huber_irls(&obs_n, &preds_n, 12.0, 0.05, 40.0, 1.50);
+    let ca = fit_single_channel_profile_huber_irls(&obs_ca, &preds_ca, 12.0, 0.05, 36.0, 0.75);
     let cb = if obs_cb.len() >= 4 {
-        fit_single_channel_profile_huber_irls(&obs_cb, &preds_cb, 12.0, 0.05, 64.0, 1.00)
+        fit_single_channel_profile_huber_irls(&obs_cb, &preds_cb, 12.0, 0.05, 64.0, 0.85)
     } else {
         ca
     };
-    let c = fit_single_channel_profile_huber_irls(&obs_c, &preds_c, 12.0, 0.05, 24.0, 0.90);
+    let c = fit_single_channel_profile_huber_irls(&obs_c, &preds_c, 12.0, 0.05, 24.0, 0.75);
 
     AfShiftOffsets { h, n, ca, cb, c }
 }
@@ -1126,7 +1789,6 @@ pub fn estimate_af_shift_offsets(
     systems: &[SpinSystem],
     af_priors: &AfAssignPriors,
 ) -> AfShiftOffsets {
-    // Restrict predicted multiset to residues aligned to the target sequence
     let aligned_preds: Vec<ResidueShiftPrediction> = af_priors
         .seq_to_struct
         .iter()
@@ -1144,32 +1806,44 @@ pub fn estimate_af_shift_offsets(
 struct AdjNoeContact {
     contact_id: usize,
     partner_k: usize,
-    max_distance_scale_nats: f64,
-    cap_nats: f64,
+    eff_scale_nats: f64,
+    eff_cap_nats: f64,
     is_sequential: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ScaledContactEdge {
+    seq_j: usize,
+    seq_k: usize,
+    eff_scale_nats: f64,
+    eff_cap_nats: f64,
+}
+
 /// Fast `O(1)`-per-move pairwise scorer for `PAE`-gated `3D 15N-NOESY` sequential `(k - 1, k)` and
-/// medium/long-range `|j - k| >= 2` amide-amide contacts.
+/// medium/long-range `|j - k| >= 2` amide-amide contacts, scaled by `noe_weight` and symmetrically
+/// capped per residue at `noe_weight * AF_NOESY_MAX_SITE_BONUS_NATS` (`P2-3`).
 #[derive(Clone, Debug)]
 pub struct AfNoesyPairwiseTable {
     s_len: usize,
     k_len: usize,
+    site_cap_nats: f64,
     /// Symmetric `S x S` reciprocity-weighted experimental NOE crosspeak evidence in `[0.0, 1.0]`.
     evid_matrix: Vec<f64>,
-    contacts: Vec<AfAdmittedAmideContact>,
+    edges: Vec<ScaledContactEdge>,
     adj_by_k: Vec<Vec<AdjNoeContact>>,
-    seq_edge_scale: Vec<Option<f64>>,
+    seq_edge_scale: Vec<Option<(f64, f64)>>,
 }
 
 impl AfNoesyPairwiseTable {
     /// Precompute `(s_1, s_2)` bidirectional `3D 15N-NOESY` crosspeak reciprocity and map onto
-    /// `af_priors.admitted_contacts` (`C_AF`).
+    /// `af_priors.admitted_contacts` (`C_AF`) with symmetric per-site cap and `noe_weight` scaling.
     pub fn build(systems: &[SpinSystem], af_priors: &AfAssignPriors) -> Option<Self> {
         let s_len = systems.len();
         let k_len = af_priors.sequence.len();
+        let noe_w = af_priors.cfg.noe_weight;
         if s_len < 2
             || k_len < 2
+            || noe_w <= 0.0
             || af_priors.noesy_15n_peaks.is_empty()
             || af_priors.admitted_contacts.is_empty()
         {
@@ -1180,7 +1854,6 @@ impl AfNoesyPairwiseTable {
         let sig_h = af_priors.cfg.noesy_indirect_sigma_h_ppm.max(1e-4);
         let cut_h = af_priors.cfg.noesy_indirect_cutoff_h_ppm.max(sig_h);
 
-        // Attach indirect 1H crosspeaks to each HSQC root strip `(ss.h, ss.n)`
         let mut strip_h2: Vec<Vec<f64>> = vec![Vec::new(); s_len];
         for pk in &af_priors.noesy_15n_peaks {
             if !pk.h_direct_ppm.is_finite()
@@ -1201,13 +1874,13 @@ impl AfNoesyPairwiseTable {
             return None;
         }
 
-        // Local 1H^N spectral crowding factor per spin system
-        let crowd_window = 2.0 * sig_h;
+        // Local 1H^N degeneracy multiplicity within `cut_h` (`P2-3`): linear `1 / crowd`
+        // specificity damping + reciprocal requirement under amide-H overlap.
         let mut h_crowding = vec![1usize; s_len];
         for s in 0..s_len {
             let mut cnt = 1usize;
             for t in 0..s_len {
-                if t != s && (systems[t].h - systems[s].h).abs() <= crowd_window {
+                if t != s && (systems[t].h - systems[s].h).abs() <= cut_h {
                     cnt += 1;
                 }
             }
@@ -1235,11 +1908,16 @@ impl AfNoesyPairwiseTable {
                 let m_fwd = best_match(&strip_h2[s1], systems[s2].h);
                 let m_rev = best_match(&strip_h2[s2], systems[s1].h);
                 if m_fwd > 0.0 || m_rev > 0.0 {
-                    let crowd = (0.5 * ((h_crowding[s1] + h_crowding[s2]) as f64))
-                        .max(1.0)
-                        .sqrt();
-                    let evid = ((0.35 * (m_fwd + m_rev) + 0.30 * (m_fwd * m_rev).sqrt()) / crowd)
-                        .clamp(0.0, 1.0);
+                    let crowd = (0.5 * ((h_crowding[s1] + h_crowding[s2]) as f64)).max(1.0);
+                    let bidir = (m_fwd * m_rev).sqrt();
+                    let unidir = 0.5 * (m_fwd + m_rev);
+                    // Suppress one-sided matches when either amide proton is degenerate (`crowd > 1.5`)
+                    let raw = if crowd > 1.5 && bidir <= 0.0 {
+                        0.0
+                    } else {
+                        0.85 * bidir + 0.15 * unidir
+                    };
+                    let evid = (raw / crowd).clamp(0.0, 1.0);
                     if evid > 1e-9 {
                         evid_matrix[s1 * s_len + s2] = evid;
                         evid_matrix[s2 * s_len + s1] = evid;
@@ -1252,36 +1930,63 @@ impl AfNoesyPairwiseTable {
             return None;
         }
 
+        // Pre-compute per-residue total weighted ceiling `M_r` so every undirected edge `(j, k)`
+        // is symmetrically damped by `min(1, site_cap / max(M_j, M_k))` (`P2-3`).
+        let site_cap = noe_w * AF_NOESY_MAX_SITE_BONUS_NATS;
+        let mut m_res = vec![0.0_f64; k_len];
+        for c in &af_priors.admitted_contacts {
+            if c.seq_j < k_len && c.seq_k < k_len {
+                let w0 = (noe_w * c.max_distance_scale_nats).min(noe_w * c.cap_nats);
+                m_res[c.seq_j] += w0;
+                m_res[c.seq_k] += w0;
+            }
+        }
+
+        let mut edges = Vec::with_capacity(af_priors.admitted_contacts.len());
         let mut adj_by_k = vec![Vec::new(); k_len];
         let mut seq_edge_scale = vec![None; k_len];
-        for (cid, c) in af_priors.admitted_contacts.iter().enumerate() {
+        for c in &af_priors.admitted_contacts {
             if c.seq_j >= k_len || c.seq_k >= k_len {
                 continue;
             }
+            let w0 = noe_w * c.max_distance_scale_nats;
+            let cap0 = noe_w * c.cap_nats;
+            let max_m = m_res[c.seq_j].max(m_res[c.seq_k]).max(1e-12);
+            let sym_factor = (site_cap / max_m).min(1.0);
+            let eff_scale = w0 * sym_factor;
+            let eff_cap = (cap0 * sym_factor).min(site_cap);
+            let cid = edges.len();
+            edges.push(ScaledContactEdge {
+                seq_j: c.seq_j,
+                seq_k: c.seq_k,
+                eff_scale_nats: eff_scale,
+                eff_cap_nats: eff_cap,
+            });
             adj_by_k[c.seq_j].push(AdjNoeContact {
                 contact_id: cid,
                 partner_k: c.seq_k,
-                max_distance_scale_nats: c.max_distance_scale_nats,
-                cap_nats: c.cap_nats,
+                eff_scale_nats: eff_scale,
+                eff_cap_nats: eff_cap,
                 is_sequential: c.is_sequential,
             });
             adj_by_k[c.seq_k].push(AdjNoeContact {
                 contact_id: cid,
                 partner_k: c.seq_j,
-                max_distance_scale_nats: c.max_distance_scale_nats,
-                cap_nats: c.cap_nats,
+                eff_scale_nats: eff_scale,
+                eff_cap_nats: eff_cap,
                 is_sequential: c.is_sequential,
             });
             if c.is_sequential && c.seq_j + 1 == c.seq_k {
-                seq_edge_scale[c.seq_k] = Some(c.max_distance_scale_nats);
+                seq_edge_scale[c.seq_k] = Some((eff_scale, eff_cap));
             }
         }
 
         Some(Self {
             s_len,
             k_len,
+            site_cap_nats: site_cap,
             evid_matrix,
-            contacts: af_priors.admitted_contacts.clone(),
+            edges,
             adj_by_k,
             seq_edge_scale,
         })
@@ -1289,7 +1994,12 @@ impl AfNoesyPairwiseTable {
 
     #[inline]
     pub fn num_contacts(&self) -> usize {
-        self.contacts.len()
+        self.edges.len()
+    }
+
+    #[inline]
+    pub fn site_cap_nats(&self) -> f64 {
+        self.site_cap_nats
     }
 
     #[inline]
@@ -1301,8 +2011,9 @@ impl AfNoesyPairwiseTable {
         }
     }
 
-    /// Evaluate the exact `PAE`-gated pairwise bonus for placing `(s1, s2)` at `(j, k)` (`0.0`
-    /// whenever `(min(j,k), max(j,k))` is not in `C_AF`, including any `PAE > 6.0 A` pair).
+    /// Evaluate the exact `PAE`-gated, `noe_weight`-scaled, symmetrically site-capped pairwise
+    /// bonus for placing `(s1, s2)` at `(j, k)` (`0.0` whenever `(min(j,k), max(j,k))` is not in
+    /// `C_AF`, including any `PAE > 6.0 A` pair).
     pub fn pair_bonus(&self, s1: usize, s2: usize, j: usize, k: usize) -> f64 {
         if s1 == s2
             || s1 >= self.s_len
@@ -1319,13 +2030,13 @@ impl AfNoesyPairwiseTable {
         }
         for e in &self.adj_by_k[j] {
             if e.partner_k == k {
-                return (e.max_distance_scale_nats * ev).clamp(0.0, e.cap_nats);
+                return (e.eff_scale_nats * ev).clamp(0.0, e.eff_cap_nats);
             }
         }
         0.0
     }
 
-    /// Sequential `(k - 1, k)` NOE bonus `Delta P^{NOE}_{s_1, s_2}(k - 1, k) in [0, +2.50]` nats.
+    /// Sequential `(k - 1, k)` NOE bonus `Delta P^{NOE}_{s_1, s_2}(k - 1, k)`.
     #[inline]
     pub fn sequential_bonus(&self, s_prev: usize, s_curr: usize, k_curr: usize) -> f64 {
         if s_prev == s_curr
@@ -1336,15 +2047,15 @@ impl AfNoesyPairwiseTable {
         {
             return 0.0;
         }
-        let Some(scale) = self.seq_edge_scale[k_curr] else {
+        let Some((scale, cap)) = self.seq_edge_scale[k_curr] else {
             return 0.0;
         };
         let ev = self.evid_matrix[s_prev * self.s_len + s_curr];
-        (scale * ev).clamp(0.0, AF_NOESY_MAX_SEQ_BONUS_NATS)
+        (scale * ev).clamp(0.0, cap)
     }
 
     /// Sum of all incident sequential + medium/long-range NOE bonuses on `spin` placed at `slot`
-    /// given current sequence assignment `at`.
+    /// given current sequence assignment `at` (strictly `<= noe_weight * AF_NOESY_MAX_SITE_BONUS_NATS`).
     #[inline]
     pub fn site_bonus(&self, spin: usize, slot: usize, at: &[i32]) -> f64 {
         if spin >= self.s_len || slot >= self.k_len {
@@ -1357,12 +2068,12 @@ impl AfNoesyPairwiseTable {
                     let sp = sp_raw as usize;
                     if sp < self.s_len && sp != spin {
                         let ev = self.evid_matrix[spin * self.s_len + sp];
-                        sc += (e.max_distance_scale_nats * ev).clamp(0.0, e.cap_nats);
+                        sc += (e.eff_scale_nats * ev).clamp(0.0, e.eff_cap_nats);
                     }
                 }
             }
         }
-        sc
+        sc.min(self.site_cap_nats)
     }
 
     /// Sum of only medium/long-range (`|j - k| >= 2`) NOE bonuses incident on `(spin, slot)`.
@@ -1381,12 +2092,12 @@ impl AfNoesyPairwiseTable {
                     let sp = sp_raw as usize;
                     if sp < self.s_len && sp != spin {
                         let ev = self.evid_matrix[spin * self.s_len + sp];
-                        sc += (e.max_distance_scale_nats * ev).clamp(0.0, e.cap_nats);
+                        sc += (e.eff_scale_nats * ev).clamp(0.0, e.eff_cap_nats);
                     }
                 }
             }
         }
-        sc
+        sc.min(self.site_cap_nats)
     }
 
     /// Deduplicated local NOE score across all contacts incident on `changed_residues`, using
@@ -1417,7 +2128,7 @@ impl AfNoesyPairwiseTable {
                     let sb = b as usize;
                     if sa < self.s_len && sb < self.s_len {
                         let ev = self.evid_matrix[sa * self.s_len + sb];
-                        sc += (e.max_distance_scale_nats * ev).clamp(0.0, e.cap_nats);
+                        sc += (e.eff_scale_nats * ev).clamp(0.0, e.eff_cap_nats);
                     }
                 }
             }
@@ -1428,15 +2139,15 @@ impl AfNoesyPairwiseTable {
     /// Exact total `15N-NOESY` pairwise bonus summed over all admitted contacts `(j < k)` in `C_AF`.
     pub fn total_bonus(&self, at: &[i32]) -> f64 {
         let mut sc = 0.0_f64;
-        for c in &self.contacts {
-            let a = at.get(c.seq_j).copied().unwrap_or(-1);
-            let b = at.get(c.seq_k).copied().unwrap_or(-1);
+        for e in &self.edges {
+            let a = at.get(e.seq_j).copied().unwrap_or(-1);
+            let b = at.get(e.seq_k).copied().unwrap_or(-1);
             if a >= 0 && b >= 0 && a != b {
                 let sa = a as usize;
                 let sb = b as usize;
                 if sa < self.s_len && sb < self.s_len {
                     let ev = self.evid_matrix[sa * self.s_len + sb];
-                    sc += (c.max_distance_scale_nats * ev).clamp(0.0, c.cap_nats);
+                    sc += (e.eff_scale_nats * ev).clamp(0.0, e.eff_cap_nats);
                 }
             }
         }
@@ -1498,7 +2209,6 @@ pub fn parse_noesy_15n_peaks_str(text: &str) -> Result<Vec<Noesy15nPeak>, String
         return noesy_15n_peaks_from_peaks(&pks);
     }
 
-    // First try standard FERRIC Peak TSV format (`experiment\tH\tN\tC\tsign\theight\tvolume\tH2`)
     if let Ok(std_peaks) = read_peaks_str(text) {
         if let Ok(conv) = noesy_15n_peaks_from_peaks(&std_peaks) {
             if !conv.is_empty() {
@@ -1507,7 +2217,6 @@ pub fn parse_noesy_15n_peaks_str(text: &str) -> Result<Vec<Noesy15nPeak>, String
         }
     }
 
-    // Fallback: compact 3/4-column `(H_direct, N15, H_indirect[, volume])` or `(exp, H_direct, N15, H_indirect[, volume])` TSV
     let mut out = Vec::new();
     for (line_idx, raw_line) in text.lines().enumerate() {
         let line_no = line_idx + 1;
