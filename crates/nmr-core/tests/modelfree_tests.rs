@@ -920,3 +920,112 @@ fn aic_model_selection_exceeds_95pct_accuracy_under_2pct_gaussian_intensity_nois
         }),
     );
 }
+
+#[test]
+fn f28_m5_parsimony_guard_prevents_noisy_3field_overselection_and_csa_160_vs_172() {
+    let tau_m = 4.10e-9_f64;
+    let tensor = DiffusionTensor::Isotropic { tau_m_sec: tau_m };
+    let comps = tensor.rotational_components(None);
+    let phys_172 = RelaxPhysicsConfig {
+        csa_n_ppm: -172.0,
+        ..RelaxPhysicsConfig::default()
+    };
+    let phys_160 = RelaxPhysicsConfig {
+        csa_n_ppm: -160.0,
+        ..RelaxPhysicsConfig::default()
+    };
+    let fields = [500.0_f64, 600.0, 800.0];
+    let mut rng = Rng::new(2026_0428);
+
+    // 24 rigid/fast-ps beta-sheet M1/M2 residues under 2.5% 3-field experimental noise + 4 true M5 loop residues
+    let mut residues = Vec::new();
+    for idx in 0..28_i32 {
+        let seq_id = idx + 1;
+        let truth = if idx < 24 {
+            LocalMfParams::m2(0.86 + ((idx % 4) as f64) * 0.015, 25.0e-12)
+        } else {
+            LocalMfParams::m5(0.85, 0.65, 1.05e-9)
+        };
+        let mut f_vec = Vec::new();
+        for &fm in &fields {
+            let (r1, r2, noe) = predict_r1_r2_noe(&comps, &truth, fm, 500.0, &phys_172);
+            let sr1 = 0.025 * r1;
+            let sr2 = 0.025 * r2;
+            let snoe = 0.025;
+            f_vec.push(ResidueRelaxRates {
+                seq_id,
+                res_name: "VAL".to_string(),
+                field_mhz: fm,
+                r1: (r1 + rng.normal(0.0, sr1)).max(0.1),
+                sigma_r1: sr1,
+                r2: (r2 + rng.normal(0.0, sr2)).max(0.5),
+                sigma_r2: sr2,
+                hetnoe: Some(noe + rng.normal(0.0, snoe)),
+                sigma_hetnoe: Some(snoe),
+            });
+        }
+        residues.push(MultiFieldResidueInput {
+            seq_id,
+            res_name: "VAL".to_string(),
+            nh_unit_vec: None,
+            fields: f_vec,
+        });
+    }
+
+    let fit_172 = fit_modelfree_dataset(
+        &residues,
+        &ModelFreeConfig {
+            diffusion_kind: DiffusionTensorKind::Isotropic,
+            selection_criterion: ModelSelectionCriterion::Aic,
+            physics: phys_172,
+            enable_model_elimination: true,
+            ..ModelFreeConfig::default()
+        },
+    )
+    .expect("fit 3-field -172 ppm");
+
+    let spurious_m5 = fit_172.residues[..24]
+        .iter()
+        .filter(|r| r.selected_model == ModelFreeId::M5)
+        .count();
+    let true_m5_recovered = fit_172.residues[24..]
+        .iter()
+        .filter(|r| r.selected_model == ModelFreeId::M5)
+        .count();
+    assert_eq!(
+        spurious_m5, 0,
+        "M5 parsimony guard must prevent spurious M5 selection on single-timescale core residues"
+    );
+    assert_eq!(
+        true_m5_recovered, 4,
+        "M5 parsimony guard must retain genuine two-timescale loop residues"
+    );
+
+    // Smaller magnitude CSA (`-160 ppm` vs `-172 ppm`) attributes less relaxation to CSA,
+    // monotonically increasing fitted order parameters `S^2` on identical rates.
+    let fit_160 = fit_modelfree_dataset(
+        &residues,
+        &ModelFreeConfig {
+            diffusion_kind: DiffusionTensorKind::Isotropic,
+            selection_criterion: ModelSelectionCriterion::Aic,
+            physics: phys_160,
+            enable_model_elimination: true,
+            ..ModelFreeConfig::default()
+        },
+    )
+    .expect("fit 3-field -160 ppm");
+    let mean_s2_172: f64 = fit_172.residues[..24]
+        .iter()
+        .map(|r| r.params.s2)
+        .sum::<f64>()
+        / 24.0;
+    let mean_s2_160: f64 = fit_160.residues[..24]
+        .iter()
+        .map(|r| r.params.s2)
+        .sum::<f64>()
+        / 24.0;
+    assert!(
+        mean_s2_160 > mean_s2_172 + 0.015,
+        "expected mean S^2(-160 ppm)={mean_s2_160:.4} > mean S^2(-172 ppm)={mean_s2_172:.4}"
+    );
+}

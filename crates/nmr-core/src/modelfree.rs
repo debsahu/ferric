@@ -1149,13 +1149,20 @@ pub fn fit_single_model_on_residue(
                     || sigma_rex_ref > 0.50 * params.rex_ref_s_inv
             }
             ModelFreeId::M5 => {
-                params.sf2 > 0.975
-                    || params.ss2 > 0.975
-                    || params.tau_e_sec < 150.0e-12
-                    || params.tau_e_sec > 0.52 * tau_m_eff
-                    || sigma_tau_e_sec > 0.55 * params.tau_e_sec
-                    || sigma_sf2 > 0.55 * (1.0 - params.sf2)
-                    || sigma_ss2 > 0.55 * (1.0 - params.ss2)
+                // Clore et al. (J. Am. Chem. Soc. 1990, 112, 4989-4991);
+                // Mandel, Akke & Palmer (J. Mol. Biol. 1995, 246, 144-163);
+                // d'Auvergne & Gooley (J. Biomol. NMR 2003, 25, 25-39 & 2006, 35, 117-135):
+                // Extended two-timescale model M5 requires non-degenerate fast and slow amplitudes
+                // and an identifiable slow internal correlation time tau_s.
+                let slow_weight = params.sf2 - params.s2;
+                params.sf2 > 0.955
+                    || params.ss2 > 0.86
+                    || slow_weight < 0.12
+                    || params.tau_e_sec < 180.0e-12
+                    || params.tau_e_sec > 0.50 * tau_m_eff
+                    || sigma_tau_e_sec > 0.42 * params.tau_e_sec
+                    || sigma_sf2 > 0.48 * (1.0 - params.sf2)
+                    || sigma_ss2 > 0.48 * (1.0 - params.ss2)
             }
         }
     };
@@ -1193,13 +1200,43 @@ pub fn fit_and_select_residue_modelfree(
         .collect();
 
     let chosen_idx = match cfg.selection_criterion {
-        ModelSelectionCriterion::Aic => candidates
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| !c.eliminated)
-            .min_by(|a, b| a.1.aic.total_cmp(&b.1.aic))
-            .map(|(i, _)| i)
-            .unwrap_or(0),
+        ModelSelectionCriterion::Aic => {
+            let raw_best = candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.eliminated)
+                .min_by(|a, b| a.1.aic.total_cmp(&b.1.aic))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            // Finite-sample Hurvich-Tsai AICc parsimony guard on non-nested 3-parameter M5
+            // (Hurvich & Tsai, Biometrika 1989, 76, 297-307; Burnham & Anderson 2002):
+            // at 1-3 static fields (`m_obs <= 9`), asymptotic AIC (`Delta chi^2 > 2`) under-penalizes
+            // splitting `S^2` into `S_f^2 * S_s^2`; require M5 to also improve small-sample AICc
+            // (or BIC when `m_obs <= 4`) over the best uneliminated M1-M4 model.
+            if raw_best == 4 && cfg.enable_model_elimination && m_obs <= 9 {
+                let best_non_m5 = candidates[..4]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| !c.eliminated)
+                    .min_by(|a, b| a.1.aic.total_cmp(&b.1.aic))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let c_m5 = &candidates[4];
+                let c_alt = &candidates[best_non_m5];
+                let m5_wins_parsimony = if c_m5.aicc.is_finite() && c_alt.aicc.is_finite() {
+                    c_m5.aicc < c_alt.aicc
+                } else {
+                    c_m5.bic < c_alt.bic
+                };
+                if m5_wins_parsimony {
+                    4
+                } else {
+                    best_non_m5
+                }
+            } else {
+                raw_best
+            }
+        }
         ModelSelectionCriterion::Aicc => candidates
             .iter()
             .enumerate()
@@ -1383,7 +1420,7 @@ fn fit_all_residues_parallel(
                 });
             }
         });
-        out.into_iter().map(|o| o.unwrap()).collect()
+        out.into_iter().flatten().collect()
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -1871,15 +1908,25 @@ pub fn fit_modelfree_dataset(
         }
     }
 
+    let mut cand_iter = candidates.into_iter();
+    let first = cand_iter
+        .next()
+        .ok_or_else(|| "no rotational diffusion tensor candidates evaluated".to_string())?;
     let best = match cfg.selection_criterion {
-        ModelSelectionCriterion::Bic => candidates
-            .into_iter()
-            .min_by(|a, b| a.global_bic.total_cmp(&b.global_bic))
-            .unwrap(),
-        _ => candidates
-            .into_iter()
-            .min_by(|a, b| a.global_aic.total_cmp(&b.global_aic))
-            .unwrap(),
+        ModelSelectionCriterion::Bic => cand_iter.fold(first, |acc, c| {
+            if c.global_bic < acc.global_bic {
+                c
+            } else {
+                acc
+            }
+        }),
+        _ => cand_iter.fold(first, |acc, c| {
+            if c.global_aic < acc.global_aic {
+                c
+            } else {
+                acc
+            }
+        }),
     };
     Ok(best)
 }
@@ -1918,11 +1965,26 @@ pub fn group_multifield_rates(
 
 /// Export a `ModelFreeDatasetResult` to clean tabular TSV format (`docs/specs/16-dynamics-and-csp.md` §2.6).
 pub fn write_modelfree_tsv_str(res: &ModelFreeDatasetResult) -> String {
+    let d_ratio = match res.diffusion_tensor {
+        DiffusionTensor::Isotropic { .. } => 1.0,
+        DiffusionTensor::AxialSymmetric {
+            d_perp_s_inv,
+            d_par_s_inv,
+            ..
+        } => d_par_s_inv / d_perp_s_inv.max(1.0),
+        DiffusionTensor::FullyAnisotropic {
+            dx_s_inv,
+            dy_s_inv,
+            dz_s_inv,
+            ..
+        } => 2.0 * dz_s_inv / (dx_s_inv + dy_s_inv).max(1.0),
+    };
     let mut out = String::new();
     out.push_str(&format!(
-        "# nmrassign_modelfree ref_field_mhz={:.3} effective_tau_m_ns={:.4} total_chi2={:.4} global_aic={:.4}\n",
+        "# nmrassign_modelfree ref_field_mhz={:.3} effective_tau_m_ns={:.4} d_par_over_d_perp={:.4} total_chi2={:.4} global_aic={:.4}\n",
         res.ref_field_mhz,
         res.diffusion_tensor.effective_tau_m_sec() * 1.0e9,
+        d_ratio,
         res.total_chi2,
         res.global_aic
     ));

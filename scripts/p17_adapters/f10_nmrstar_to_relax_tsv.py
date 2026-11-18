@@ -25,6 +25,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--prefix", default="ubq", help="Output filename prefix (default: ubq)")
     ap.add_argument("--accession", default="BMRB:6470", help="Dataset accession ID")
     ap.add_argument("--only-600-mhz", action="store_true", help="Emit only disambiguated 600 MHz saveframes")
+    ap.add_argument(
+        "--default-rel-sigma",
+        type=float,
+        default=None,
+        help="Explicit opt-in fractional sigma (0 < f < 1) for legacy null Val_err ('.') saveframes",
+    )
     ap.add_argument("--eval-modelfree-tsv", help="Post-fit nmrassign modelfree --out TSV to evaluate")
     ap.add_argument("--eval-stdout-file", help="Optional captured stdout from nmrassign modelfree")
     ap.add_argument("--exit-code", type=int, default=0, help="CLI exit code of nmrassign modelfree")
@@ -52,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
         prefix=args.prefix,
         accession_id=args.accession,
         only_600_mhz=args.only_600_mhz,
+        default_rel_sigma=args.default_rel_sigma,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0

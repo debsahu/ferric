@@ -40,7 +40,7 @@ use nmr_core::relax_fit::{
 use nmr_core::relax_io::{
     integrate_relax_planes, parse_bruker_delay_token_sec, parse_bruker_vdlist,
     parse_relax_series_nef_str, parse_relax_series_tsv_str, process_pseudo3d_fids,
-    read_bruker_pseudo3d, read_varian_pseudo3d, write_relax_series_nef_str,
+    read_bruker_pseudo3d_with_schedule, read_varian_pseudo3d, write_relax_series_nef_str,
     write_relax_series_tsv_str, RelaxExperimentKind, RelaxIntegrationConfig, RelaxSchedule,
     RelaxSeriesDataset, TargetPeakSeed,
 };
@@ -75,8 +75,8 @@ pub fn relax_usage() -> &'static str {
      Inputs & Integration:\n\
        --series | --in <path>   Relaxation series TSV/NEF, Bruker/Varian pseudo-3D folder, or 2D plane folder\n\
        --planes <p1,p2,...>     Comma-separated 2D spectrum paths (.ft2, .ucsf, or Bruker pdata dir)\n\
-       --vdlist <file>          Variable-delay schedule file (seconds / ms / us suffixes)\n\
-       --delays <t1,t2,...>     Comma-separated delay list (e.g. 0.01,0.05,0.1,0.2,0.4,0.8)\n\
+       --vdlist <file>          Variable-delay schedule file (seconds / ms / us suffixes; overrides raw ser/fid schedule)\n\
+       --delays <csv|file>      Comma-separated delay list or schedule file (overrides raw ser/fid schedule)\n\
        --peaks <peaks.tsv>      Target 2D HSQC crosspeak seeds for locked-footprint integration\n\
        --star | --shifts <p>    Target NMR-STAR (.str) or NEF (.nef) shift list for footprint seeds\n\
        --series-out <path>      Optional path to save integrated series (.tsv or .nef)\n\n\
@@ -95,12 +95,12 @@ pub fn relax_usage() -> &'static str {
 pub fn modelfree_usage() -> &'static str {
     "ferric modelfree — Lipari-Szabo / Mandel-Akke-Palmer M1-M5 & anisotropic rotational diffusion\n\
      Usage:\n\
-       ferric modelfree (--r1 <r1.tsv> --r2 <r2.tsv> [--hetnoe <noe.tsv>] ... | --rates <combined.tsv> ...) --out <modelfree.tsv> [options]\n\n\
+       ferric modelfree (--r1 <r1.tsv> --r2 <r2.tsv> [--hetnoe <noe.tsv>] ... | --rates <rates.tsv|bmr.str> ...) --out <modelfree.tsv> [options]\n\n\
      Inputs (repeatable for multi-field 600 + 800 + 900 MHz datasets):\n\
        --r1 <r1.tsv>            R1 rate table from `ferric relax` (repeatable per static B0 field)\n\
        --r2 <r2.tsv>            R2 rate table from `ferric relax` (repeatable per static B0 field)\n\
        --hetnoe | --noe <tsv>   Steady-state {1H}-15N hetNOE table from `ferric relax` (repeatable)\n\
-       --rates <rates.tsv>      Single-kind or combined multi-column rate table (repeatable)\n\
+       --rates | --star <path>  Single-kind/combined rate TSV or NMR-STAR (.str) relaxation entry (repeatable)\n\
        --pdb <model.pdb>        Optional 3D PDB structure for N-H unit vectors & axial/anisotropic tensor\n\n\
      Model Selection & Physics:\n\
        --diffusion <mode>       auto|isotropic|axial|anisotropic [default: auto with --pdb, else isotropic]\n\
@@ -108,7 +108,8 @@ pub fn modelfree_usage() -> &'static str {
        --ref-mhz <f64>          Reference 1H field (MHz) for Rex quadratic B0^2 reporting [default: min field]\n\
        --mc-trials <N>          Parametric MC replicates for S^2 / tau_e / Rex uncertainties [default: 0]\n\
        --r-nh <angstrom>        Effective N-H bond length in Angstroms [default: 1.02]\n\
-       --csa-ppm <ppm>          15N chemical shift anisotropy in ppm [default: -172.0]\n\
+       --csa-ppm <ppm>          15N chemical shift anisotropy in ppm (e.g. -172.0 or legacy -160.0) [default: -172.0]\n\
+       --default-rel-sigma <f>  Explicit opt-in fractional uncertainty (0 < f < 1) for legacy null Val_err (.) [default: off]\n\
        --seed <u64>             Deterministic PRNG seed [default: 20261303]\n\
        --rsd-out <j_map.tsv>    Optional Farrow (1995) reduced spectral density J(0), J(wN), J(0.87wH) TSV\n\
        --out | -o <mf.tsv>      Output Lipari-Szabo Model-Free M1-M5 TSV table"
@@ -338,37 +339,58 @@ fn resolve_target_seeds(
         .collect())
 }
 
+fn parse_explicit_schedule_override(
+    vdlist_path: Option<&Path>,
+    delays_csv: Option<&str>,
+) -> Result<Option<RelaxSchedule>, String> {
+    if let Some(spec) = delays_csv {
+        let p = Path::new(spec.trim());
+        let delays = if p.is_file() {
+            let txt = fs::read_to_string(p)
+                .map_err(|e| format!("failed to read --delays file '{}': {e}", p.display()))?;
+            parse_bruker_vdlist(&txt)?
+        } else {
+            let mut v = Vec::new();
+            for tok in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                v.push(parse_bruker_delay_token_sec(tok)?);
+            }
+            if v.len() < 2 {
+                return Err(format!(
+                    "--delays requires at least 2 delay values (got {})",
+                    v.len()
+                ));
+            }
+            v
+        };
+        return Ok(Some(RelaxSchedule::VariableDelaysSec {
+            delays_sec: delays,
+        }));
+    }
+    if let Some(vp) = vdlist_path {
+        let txt = fs::read_to_string(vp)
+            .map_err(|e| format!("failed to read --vdlist '{}': {e}", vp.display()))?;
+        let delays = parse_bruker_vdlist(&txt)?;
+        return Ok(Some(RelaxSchedule::VariableDelaysSec {
+            delays_sec: delays,
+        }));
+    }
+    Ok(None)
+}
+
 fn parse_schedule_for_planes(
     vdlist_path: Option<&Path>,
     delays_csv: Option<&str>,
     fallback_dir: Option<&Path>,
     expected_planes: usize,
 ) -> Result<RelaxSchedule, String> {
-    if let Some(csv) = delays_csv {
-        let mut delays = Vec::new();
-        for tok in csv.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            delays.push(parse_bruker_delay_token_sec(tok)?);
-        }
-        if delays.len() != expected_planes {
+    if let Some(sched) = parse_explicit_schedule_override(vdlist_path, delays_csv)? {
+        if sched.len() != expected_planes {
             return Err(format!(
-                "--delays count ({}) does not match plane count ({expected_planes})",
-                delays.len()
+                "explicit schedule count ({}) does not match plane count ({expected_planes})",
+                sched.len()
             ));
         }
-        return Ok(RelaxSchedule::VariableDelaysSec { delays_sec: delays });
-    }
-    if let Some(vp) = vdlist_path {
-        let txt = fs::read_to_string(vp)
-            .map_err(|e| format!("failed to read --vdlist '{}': {e}", vp.display()))?;
-        let delays = parse_bruker_vdlist(&txt)?;
-        if delays.len() != expected_planes {
-            return Err(format!(
-                "--vdlist '{}' count ({}) does not match plane count ({expected_planes})",
-                vp.display(),
-                delays.len()
-            ));
-        }
-        return Ok(RelaxSchedule::VariableDelaysSec { delays_sec: delays });
+        return Ok(sched);
     }
     if let Some(dir) = fallback_dir {
         let cand = dir.join("vdlist");
@@ -453,6 +475,16 @@ fn load_or_integrate_series(
         } else {
             parse_relax_series_tsv_str(&raw)?
         };
+        if let Some(sched) = parse_explicit_schedule_override(vdlist_path, delays_csv)? {
+            if sched.len() != ds.schedule.len() {
+                return Err(format!(
+                    "explicit schedule count ({}) does not match series plane count ({})",
+                    sched.len(),
+                    ds.schedule.len()
+                ));
+            }
+            ds.schedule = sched;
+        }
         if let Some(k) = kind_override {
             ds.experiment_kind = k;
         }
@@ -471,8 +503,29 @@ fn load_or_integrate_series(
         .and_then(|s| s.to_str())
         .unwrap_or("relax_series");
 
+    let explicit_sched = parse_explicit_schedule_override(vdlist_path, delays_csv)?;
+
     let mut ds = if sp.join("ser").is_file() && sp.join("acqus").is_file() {
-        let raw_p3d = read_bruker_pseudo3d(sp, None, None)?;
+        let raw_p3d = if let Some(ref sched_ovr) = explicit_sched {
+            match read_bruker_pseudo3d_with_schedule(sp, None, None, None) {
+                Ok(mut p3d) => {
+                    if sched_ovr.len() != p3d.planes.len() {
+                        return Err(format!(
+                            "explicit schedule count ({}) does not match Bruker ser plane count ({})",
+                            sched_ovr.len(),
+                            p3d.planes.len()
+                        ));
+                    }
+                    p3d.schedule = sched_ovr.clone();
+                    p3d
+                }
+                Err(_) => {
+                    read_bruker_pseudo3d_with_schedule(sp, None, None, Some(sched_ovr.clone()))?
+                }
+            }
+        } else {
+            read_bruker_pseudo3d_with_schedule(sp, None, None, None)?
+        };
         let (planes, _recipe) = process_pseudo3d_fids(&raw_p3d.planes, None)?;
         let seeds = resolve_target_seeds(peaks_path, shifts_path, &planes[0])?;
         let exp_kind = kind_override.unwrap_or(raw_p3d.experiment_kind);
@@ -485,7 +538,17 @@ fn load_or_integrate_series(
             &RelaxIntegrationConfig::default(),
         )?
     } else if sp.join("fid").is_file() && sp.join("procpar").is_file() {
-        let raw_p3d = read_varian_pseudo3d(sp, None, None)?;
+        let mut raw_p3d = read_varian_pseudo3d(sp, None, None)?;
+        if let Some(sched_ovr) = explicit_sched {
+            if sched_ovr.len() != raw_p3d.planes.len() {
+                return Err(format!(
+                    "explicit schedule count ({}) does not match Varian fid plane count ({})",
+                    sched_ovr.len(),
+                    raw_p3d.planes.len()
+                ));
+            }
+            raw_p3d.schedule = sched_ovr;
+        }
         let (planes, _recipe) = process_pseudo3d_fids(&raw_p3d.planes, None)?;
         let seeds = resolve_target_seeds(peaks_path, shifts_path, &planes[0])?;
         let exp_kind = kind_override.unwrap_or(raw_p3d.experiment_kind);
@@ -950,13 +1013,521 @@ enum ForcedRateKind {
     Auto,
 }
 
+#[inline]
+fn fallback_sigma_for_observable(val: f64, kind: ForcedRateKind, rel_sigma: f64) -> f64 {
+    match kind {
+        ForcedRateKind::HetNoe => rel_sigma * val.abs().max(1.0),
+        _ => (rel_sigma * val.abs()).max(1.0e-6),
+    }
+}
+
+fn tokenize_star_line_local(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'#' {
+            break;
+        }
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let q = bytes[i];
+            i += 1;
+            let s0 = i;
+            while i < bytes.len() {
+                if bytes[i] == q && (i + 1 == bytes.len() || bytes[i + 1].is_ascii_whitespace()) {
+                    break;
+                }
+                i += 1;
+            }
+            out.push(line[s0..i].to_string());
+            if i < bytes.len() && bytes[i] == q {
+                i += 1;
+            }
+        } else {
+            let s0 = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            out.push(line[s0..i].to_string());
+        }
+    }
+    out
+}
+
+fn ingest_nmrstar_relax_str(
+    path: &Path,
+    star_text: &str,
+    default_rel_sigma: Option<f64>,
+    acc: &mut BTreeMap<(i32, i64), PartialFieldRateRow>,
+) -> Result<(), String> {
+    #[derive(Clone, Debug)]
+    struct StarSaveframe {
+        tags: BTreeMap<String, String>,
+        loops: Vec<(Vec<String>, Vec<Vec<String>>)>,
+    }
+
+    let mut saveframes: Vec<StarSaveframe> = Vec::new();
+    let mut cur_sf: Option<StarSaveframe> = None;
+    let mut in_loop = false;
+    let mut reading_loop_tags = false;
+    let mut cur_loop_tags: Vec<String> = Vec::new();
+    let mut cur_loop_vals: Vec<String> = Vec::new();
+
+    let flush_loop = |sf: &mut StarSaveframe, tags: &mut Vec<String>, vals: &mut Vec<String>| {
+        if !tags.is_empty() && !vals.is_empty() {
+            let ncols = tags.len();
+            let nrows = vals.len() / ncols;
+            let mut rows = Vec::with_capacity(nrows);
+            for r in 0..nrows {
+                rows.push(vals[r * ncols..(r + 1) * ncols].to_vec());
+            }
+            sf.loops.push((std::mem::take(tags), rows));
+        } else {
+            tags.clear();
+        }
+        vals.clear();
+    };
+
+    let lines: Vec<&str> = star_text.lines().collect();
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let raw = lines[idx];
+        idx += 1;
+        if raw.starts_with(';') {
+            while idx < lines.len() && !lines[idx].starts_with(';') {
+                idx += 1;
+            }
+            if idx < lines.len() {
+                idx += 1;
+            }
+            continue;
+        }
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let toks = tokenize_star_line_local(trimmed);
+        if toks.is_empty() {
+            continue;
+        }
+        let t0_low = toks[0].to_ascii_lowercase();
+        if t0_low.starts_with("save_") && toks[0].len() > 5 {
+            if let Some(mut prev) = cur_sf.take() {
+                if in_loop {
+                    flush_loop(&mut prev, &mut cur_loop_tags, &mut cur_loop_vals);
+                }
+                saveframes.push(prev);
+            }
+            in_loop = false;
+            reading_loop_tags = false;
+            cur_sf = Some(StarSaveframe {
+                tags: BTreeMap::new(),
+                loops: Vec::new(),
+            });
+            continue;
+        }
+        if t0_low == "save_" {
+            if let Some(mut prev) = cur_sf.take() {
+                if in_loop {
+                    flush_loop(&mut prev, &mut cur_loop_tags, &mut cur_loop_vals);
+                }
+                saveframes.push(prev);
+            }
+            in_loop = false;
+            reading_loop_tags = false;
+            continue;
+        }
+        let Some(ref mut sf) = cur_sf else {
+            continue;
+        };
+        if t0_low == "loop_" {
+            if in_loop {
+                flush_loop(sf, &mut cur_loop_tags, &mut cur_loop_vals);
+            }
+            in_loop = true;
+            reading_loop_tags = true;
+            continue;
+        }
+        if t0_low == "stop_" {
+            if in_loop {
+                flush_loop(sf, &mut cur_loop_tags, &mut cur_loop_vals);
+            }
+            in_loop = false;
+            reading_loop_tags = false;
+            continue;
+        }
+        if in_loop {
+            if reading_loop_tags && toks[0].starts_with('_') {
+                for tk in toks {
+                    cur_loop_tags.push(tk);
+                }
+            } else {
+                reading_loop_tags = false;
+                for tk in toks {
+                    cur_loop_vals.push(tk);
+                }
+            }
+        } else if toks[0].starts_with('_') && toks.len() >= 2 {
+            let short = toks[0]
+                .rsplit_once('.')
+                .map(|(_, s)| s)
+                .unwrap_or(&toks[0])
+                .to_ascii_lowercase();
+            sf.tags.insert(short, toks[1].clone());
+        }
+    }
+    if let Some(mut last) = cur_sf.take() {
+        if in_loop {
+            flush_loop(&mut last, &mut cur_loop_tags, &mut cur_loop_vals);
+        }
+        saveframes.push(last);
+    }
+
+    // Map spectrometer IDs (`_Spectrometer.ID` -> `Field_strength` MHz)
+    let mut spec_mhz: BTreeMap<String, f64> = BTreeMap::new();
+    for sf in &saveframes {
+        let cat = sf
+            .tags
+            .get("sf_category")
+            .map(String::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if cat.contains("spectrometer") {
+            if let (Some(id), Some(fs_s)) = (sf.tags.get("id"), sf.tags.get("field_strength")) {
+                if let Ok(fm) = fs_s.parse::<f64>() {
+                    if fm.is_finite() && fm > 0.0 {
+                        spec_mhz.insert(id.clone(), fm);
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    let mut parsed_sets: Vec<(ForcedRateKind, f64, Vec<(i32, String, f64, f64)>)> = Vec::new();
+    for sf in &saveframes {
+        let cat = sf
+            .tags
+            .get("sf_category")
+            .map(String::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let kind_opt = if cat.contains("heteronucl_t1") || cat == "t1_relaxation" {
+            Some(ForcedRateKind::R1)
+        } else if cat.contains("heteronucl_t2") || cat == "t2_relaxation" {
+            Some(ForcedRateKind::R2)
+        } else if cat.contains("heteronucl_noe") {
+            Some(ForcedRateKind::HetNoe)
+        } else if cat.contains("auto_relaxation") {
+            let tc = sf
+                .tags
+                .get("temp_calibration_method")
+                .or_else(|| sf.tags.get("common_relaxation_type_name"))
+                .or_else(|| sf.tags.get("sf_framecode"))
+                .map(String::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if tc.contains("r2") || tc.contains("t2") || tc.contains("r1rho") {
+                Some(ForcedRateKind::R2)
+            } else {
+                Some(ForcedRateKind::R1)
+            }
+        } else {
+            None
+        };
+        let Some(kind) = kind_opt else {
+            continue;
+        };
+
+        let fm = sf
+            .tags
+            .get("spectrometer_frequency_1h")
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|&v| v.is_finite() && v > 0.0)
+            .or_else(|| {
+                sf.tags
+                    .get("spectrometer_id")
+                    .and_then(|id| spec_mhz.get(id).copied())
+            })
+            .unwrap_or(600.0);
+
+        let units_raw = sf
+            .tags
+            .get("t1_val_units")
+            .or_else(|| sf.tags.get("t2_val_units"))
+            .or_else(|| sf.tags.get("auto_relaxation_val_units"))
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let units = if !units_raw.is_empty() && units_raw != "." && units_raw != "?" {
+            units_raw
+        } else if cat.contains("auto_relax") {
+            "s-1".to_string()
+        } else {
+            // In NMR-STAR v2/v3 `_Heteronucl_T1/T2_relaxation`, omitted/`.` `T1_val_units` defaults to seconds (`s`).
+            "s".to_string()
+        };
+
+        for (ltags, lrows) in &sf.loops {
+            let short_tags: Vec<String> = ltags
+                .iter()
+                .map(|t| {
+                    t.rsplit_once('.')
+                        .map(|(_, s)| s)
+                        .unwrap_or(t)
+                        .to_ascii_lowercase()
+                })
+                .collect();
+            let seq_cols: Vec<usize> = [
+                "seq_id",
+                "comp_index_id",
+                "auth_seq_id",
+                "seq_id_1",
+                "comp_index_id_1",
+                "auth_seq_id_1",
+            ]
+            .iter()
+            .filter_map(|cand| short_tags.iter().position(|s| s == cand))
+            .collect();
+            let val_col = short_tags.iter().position(|s| {
+                matches!(
+                    s.as_str(),
+                    "val"
+                        | "t1_val"
+                        | "t2_val"
+                        | "noe_val"
+                        | "auto_relaxation_val"
+                        | "heteronucl_noe_val"
+                )
+            });
+            let err_col = short_tags.iter().position(|s| {
+                matches!(
+                    s.as_str(),
+                    "val_err"
+                        | "t1_val_err"
+                        | "t2_val_err"
+                        | "noe_val_err"
+                        | "auto_relaxation_val_err"
+                        | "heteronucl_noe_val_err"
+                )
+            });
+            let res_cols: Vec<usize> = ["comp_id", "comp_id_1", "auth_comp_id", "auth_comp_id_1"]
+                .iter()
+                .filter_map(|cand| short_tags.iter().position(|s| s == cand))
+                .collect();
+            let atom_col = short_tags
+                .iter()
+                .position(|s| matches!(s.as_str(), "atom_id" | "atom_id_1" | "auth_atom_id"));
+
+            let Some(vc) = val_col else {
+                continue;
+            };
+            if seq_cols.is_empty() {
+                continue;
+            }
+            let mut rows_out = Vec::new();
+            for r in lrows {
+                if let Some(ac) = atom_col {
+                    let at = r[ac].to_ascii_uppercase();
+                    if !matches!(at.as_str(), "N" | "HN" | "H" | "15N" | "N15" | "." | "?") {
+                        continue;
+                    }
+                }
+                let Some(seq_id) = seq_cols
+                    .iter()
+                    .find_map(|&sc| r.get(sc).and_then(|s| s.trim().parse::<i32>().ok()))
+                else {
+                    continue;
+                };
+                let v_str = r[vc].trim();
+                if v_str.is_empty() || v_str == "." || v_str == "?" {
+                    continue;
+                }
+                let Ok(raw_v) = v_str.parse::<f64>() else {
+                    continue;
+                };
+                if !raw_v.is_finite() {
+                    continue;
+                }
+                let res_name = res_cols
+                    .iter()
+                    .find_map(|&rc| {
+                        r.get(rc)
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty() && *s != "." && *s != "?")
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "UNK".to_string());
+
+                let raw_err_opt = err_col.and_then(|ec| {
+                    let es = r[ec].trim();
+                    if es.is_empty() || es == "." || es == "?" || es.eq_ignore_ascii_case("na") {
+                        None
+                    } else {
+                        es.parse::<f64>().ok().filter(|&e| e.is_finite() && e > 0.0)
+                    }
+                });
+                let raw_err = match raw_err_opt {
+                    Some(e) => e,
+                    None => {
+                        let rel = default_rel_sigma.ok_or_else(|| {
+                            format!(
+                                "NMR-STAR relaxation saveframe in '{}' has null/missing Val_err ('.') at seq_id={seq_id}; pass explicit --default-rel-sigma <frac> (e.g. 0.03) to opt into relative uncertainty assignment",
+                                path.display()
+                            )
+                        })?;
+                        fallback_sigma_for_observable(raw_v, kind, rel)
+                    }
+                };
+
+                let (final_val, final_sig) = if kind == ForcedRateKind::HetNoe {
+                    (raw_v, raw_err)
+                } else if units == "s" {
+                    if raw_v <= 0.0 {
+                        continue;
+                    }
+                    (1.0 / raw_v, raw_err / (raw_v * raw_v))
+                } else if units == "ms" {
+                    if raw_v <= 0.0 {
+                        continue;
+                    }
+                    let t_sec = raw_v * 1.0e-3;
+                    let sig_sec = raw_err * 1.0e-3;
+                    (1.0 / t_sec, sig_sec / (t_sec * t_sec))
+                } else {
+                    if raw_v <= 0.0 {
+                        continue;
+                    }
+                    (raw_v, raw_err)
+                };
+                rows_out.push((seq_id, res_name, final_val, final_sig));
+            }
+            if !rows_out.is_empty() {
+                parsed_sets.push((kind, fm, rows_out));
+            }
+        }
+    }
+
+    if parsed_sets.is_empty() {
+        return Err(format!(
+            "NMR-STAR file '{}' contains no 15N R1/R2/hetNOE relaxation saveframes",
+            path.display()
+        ));
+    }
+
+    // Disambiguate duplicate nominal spectrometer frequencies ONLY when R1 medians differ
+    // substantially (`|med0 - med1| / max(med0, med1) >= 0.10`, indicating distinct B0 fields);
+    // when `< 0.10` (technical replicates at the same B0 field, e.g. BMRB:6470 set_1 & set_2),
+    // pool replicates at their shared field via inverse-variance weighting!
+    let mut alt_other_mhz: Option<f64> = None;
+    for &v in spec_mhz.values() {
+        if (v - 600.0).abs() > 25.0 {
+            alt_other_mhz = Some(v);
+        }
+    }
+    let r1_indices: Vec<usize> = parsed_sets
+        .iter()
+        .enumerate()
+        .filter(|(_, (k, _, _))| *k == ForcedRateKind::R1)
+        .map(|(i, _)| i)
+        .collect();
+    if r1_indices.len() == 2 {
+        let (r0, r1) = (r1_indices[0], r1_indices[1]);
+        if (parsed_sets[r0].1 - parsed_sets[r1].1).abs() < 1.0 {
+            let med0 = median_f64(parsed_sets[r0].2.iter().map(|r| r.2).collect());
+            let med1 = median_f64(parsed_sets[r1].2.iter().map(|r| r.2).collect());
+            let rel_diff = (med0 - med1).abs() / med0.max(med1).max(1.0e-9);
+            if rel_diff >= 0.10 {
+                let base_mhz = parsed_sets[r0].1;
+                let other_mhz = alt_other_mhz.unwrap_or(360.13);
+                let second_is_other = if other_mhz < base_mhz {
+                    med1 > med0 // Lower B0 -> larger R1 (`1/T1`)
+                } else {
+                    med1 < med0 // Higher B0 -> smaller R1 (`1/T1`)
+                };
+                for check_kind in [
+                    ForcedRateKind::R1,
+                    ForcedRateKind::R2,
+                    ForcedRateKind::HetNoe,
+                ] {
+                    let idxs: Vec<usize> = parsed_sets
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (k, _, _))| *k == check_kind)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if idxs.len() == 2 {
+                        if second_is_other {
+                            parsed_sets[idxs[1]].1 = other_mhz;
+                        } else {
+                            parsed_sets[idxs[0]].1 = other_mhz;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let pool_pair = |cur: Option<(f64, f64)>, val: f64, sig: f64| -> Option<(f64, f64)> {
+        match cur {
+            None => Some((val, sig)),
+            Some((v0, s0)) => {
+                let w0 = 1.0 / (s0 * s0).max(1.0e-18);
+                let w1 = 1.0 / (sig * sig).max(1.0e-18);
+                let wsum = w0 + w1;
+                Some(((w0 * v0 + w1 * val) / wsum, (1.0 / wsum).sqrt()))
+            }
+        }
+    };
+
+    for (kind, fm, rows) in parsed_sets {
+        let field_key = (fm * 100.0).round() as i64;
+        for (seq_id, res_name, val, sig) in rows {
+            let entry = acc
+                .entry((seq_id, field_key))
+                .or_insert_with(|| PartialFieldRateRow {
+                    seq_id,
+                    res_name: res_name.clone(),
+                    field_mhz: fm,
+                    ..PartialFieldRateRow::default()
+                });
+            if entry.res_name == "UNK" && res_name != "UNK" {
+                entry.res_name = res_name;
+            }
+            match kind {
+                ForcedRateKind::R1 => entry.r1 = pool_pair(entry.r1, val, sig),
+                ForcedRateKind::R2 => entry.r2 = pool_pair(entry.r2, val, sig),
+                ForcedRateKind::HetNoe => entry.hetnoe = pool_pair(entry.hetnoe, val, sig),
+                ForcedRateKind::Auto => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ingest_rate_tsv_file(
     path: &Path,
     forced_kind: ForcedRateKind,
+    default_rel_sigma: Option<f64>,
     acc: &mut BTreeMap<(i32, i64), PartialFieldRateRow>,
 ) -> Result<(), String> {
     let text = fs::read_to_string(path)
         .map_err(|e| format!("failed to read rate table '{}': {e}", path.display()))?;
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "str"
+        || ext == "star"
+        || text.trim_start().starts_with("data_")
+        || text.contains("_Heteronucl_T1_relaxation")
+    {
+        return ingest_nmrstar_relax_str(path, &text, default_rel_sigma, acc);
+    }
+
     let mut header_field_mhz: Option<f64> = None;
     let mut header_kind: Option<ForcedRateKind> = None;
     let mut col_idx: BTreeMap<String, usize> = BTreeMap::new();
@@ -1052,16 +1623,55 @@ fn ingest_rate_tsv_file(
 
         // Combined multi-column format (`r1`, `sigma_r1`, `r2`, `sigma_r2`, `hetnoe`, `sigma_hetnoe`)
         if col_idx.contains_key("r1") || col_idx.contains_key("r2") {
-            if let (Some(r1), Some(sr1)) = (get_f64("r1"), get_f64("sigma_r1")) {
+            if let Some(r1) = get_f64("r1") {
+                let sr1 = match get_f64("sigma_r1").filter(|&s| s > 0.0) {
+                    Some(s) => s,
+                    None => {
+                        let rel = default_rel_sigma.ok_or_else(|| {
+                            format!(
+                                "rate TSV '{}' line {}: null/missing sigma_r1; pass explicit --default-rel-sigma <frac> to opt in",
+                                path.display(),
+                                line_no + 1
+                            )
+                        })?;
+                        fallback_sigma_for_observable(r1, ForcedRateKind::R1, rel)
+                    }
+                };
                 entry.r1 = Some((r1, sr1));
             }
-            if let (Some(r2), Some(sr2)) = (get_f64("r2"), get_f64("sigma_r2")) {
+            if let Some(r2) = get_f64("r2") {
+                let sr2 = match get_f64("sigma_r2").filter(|&s| s > 0.0) {
+                    Some(s) => s,
+                    None => {
+                        let rel = default_rel_sigma.ok_or_else(|| {
+                            format!(
+                                "rate TSV '{}' line {}: null/missing sigma_r2; pass explicit --default-rel-sigma <frac> to opt in",
+                                path.display(),
+                                line_no + 1
+                            )
+                        })?;
+                        fallback_sigma_for_observable(r2, ForcedRateKind::R2, rel)
+                    }
+                };
                 entry.r2 = Some((r2, sr2));
             }
-            if let (Some(n), Some(sn)) = (
-                get_f64("hetnoe").or_else(|| get_f64("noe")),
-                get_f64("sigma_hetnoe").or_else(|| get_f64("sigma_noe")),
-            ) {
+            if let Some(n) = get_f64("hetnoe").or_else(|| get_f64("noe")) {
+                let sn = match get_f64("sigma_hetnoe")
+                    .or_else(|| get_f64("sigma_noe"))
+                    .filter(|&s| s > 0.0)
+                {
+                    Some(s) => s,
+                    None => {
+                        let rel = default_rel_sigma.ok_or_else(|| {
+                            format!(
+                                "rate TSV '{}' line {}: null/missing sigma_hetnoe; pass explicit --default-rel-sigma <frac> to opt in",
+                                path.display(),
+                                line_no + 1
+                            )
+                        })?;
+                        fallback_sigma_for_observable(n, ForcedRateKind::HetNoe, rel)
+                    }
+                };
                 entry.hetnoe = Some((n, sn));
             }
             continue;
@@ -1074,16 +1684,6 @@ fn ingest_rate_tsv_file(
             .ok_or_else(|| {
                 format!(
                     "rate TSV '{}' line {}: missing `value` column",
-                    path.display(),
-                    line_no + 1
-                )
-            })?;
-        let sig = get_f64("sigma")
-            .or_else(|| get_f64("sigma_rate"))
-            .or_else(|| get_f64("sigma_noe"))
-            .ok_or_else(|| {
-                format!(
-                    "rate TSV '{}' line {}: missing `sigma` column",
                     path.display(),
                     line_no + 1
                 )
@@ -1111,6 +1711,24 @@ fn ingest_rate_tsv_file(
                 "rate TSV '{}' has no `kind` column or header; pass via --r1, --r2, or --hetnoe",
                 path.display()
             ));
+        };
+
+        let sig = match get_f64("sigma")
+            .or_else(|| get_f64("sigma_rate"))
+            .or_else(|| get_f64("sigma_noe"))
+            .filter(|&s| s > 0.0)
+        {
+            Some(s) => s,
+            None => {
+                let rel = default_rel_sigma.ok_or_else(|| {
+                    format!(
+                        "rate TSV '{}' line {}: missing/null `sigma` value; pass explicit --default-rel-sigma <frac> to opt in",
+                        path.display(),
+                        line_no + 1
+                    )
+                })?;
+                fallback_sigma_for_observable(val, row_kind, rel)
+            }
         };
 
         match row_kind {
@@ -1221,6 +1839,7 @@ pub fn run_modelfree_cli(args: &[String]) -> Result<(), String> {
     let mut mc_trials: usize = 0;
     let mut r_nh: f64 = 1.02;
     let mut csa_ppm: f64 = -172.0;
+    let mut default_rel_sigma: Option<f64> = None;
     let mut seed: u64 = 2026_1303;
     let mut rsd_out_path: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
@@ -1243,9 +1862,11 @@ pub fn run_modelfree_cli(args: &[String]) -> Result<(), String> {
                 let v = args.get(i).ok_or("--hetnoe requires a TSV file path")?;
                 input_files.push((PathBuf::from(v), ForcedRateKind::HetNoe));
             }
-            "--rates" | "--in" => {
+            "--rates" | "--in" | "--star" => {
                 i += 1;
-                let v = args.get(i).ok_or("--rates requires a TSV file path")?;
+                let v = args
+                    .get(i)
+                    .ok_or("--rates/--star requires a TSV or NMR-STAR file path")?;
                 input_files.push((PathBuf::from(v), ForcedRateKind::Auto));
             }
             "--pdb" => {
@@ -1301,6 +1922,21 @@ pub fn run_modelfree_cli(args: &[String]) -> Result<(), String> {
                     return Err(format!("--csa-ppm out of physical range: {csa_ppm}"));
                 }
             }
+            "--default-rel-sigma" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--default-rel-sigma requires a fractional uncertainty in (0, 1)")?;
+                let rel: f64 = v
+                    .parse()
+                    .map_err(|_| format!("invalid --default-rel-sigma {v:?}"))?;
+                if !rel.is_finite() || rel <= 0.0 || rel >= 1.0 {
+                    return Err(format!(
+                        "--default-rel-sigma must be strictly in (0.0, 1.0), got {rel}"
+                    ));
+                }
+                default_rel_sigma = Some(rel);
+            }
             "--seed" => {
                 i += 1;
                 let v = args.get(i).ok_or("--seed requires an integer")?;
@@ -1344,7 +1980,7 @@ pub fn run_modelfree_cli(args: &[String]) -> Result<(), String> {
     let t0 = Instant::now();
     let mut acc: BTreeMap<(i32, i64), PartialFieldRateRow> = BTreeMap::new();
     for (path, fkind) in &input_files {
-        ingest_rate_tsv_file(path, *fkind, &mut acc)?;
+        ingest_rate_tsv_file(path, *fkind, default_rel_sigma, &mut acc)?;
     }
 
     let mut by_field: BTreeMap<i64, Vec<ResidueRelaxRates>> = BTreeMap::new();

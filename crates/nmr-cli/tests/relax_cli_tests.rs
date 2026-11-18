@@ -544,3 +544,258 @@ fn cli_relax_to_modelfree_multifield_1ubq_end_to_end() {
         );
     }
 }
+
+#[test]
+fn cli_f28_raw_ser_delays_override_and_legacy_nmrstar_default_rel_sigma() {
+    use std::f64::consts::PI;
+
+    let tmp = ScopedTempDir::new("f28_cli_ser_and_star");
+
+    // 1. Raw Bruker `ser` directory with deliberately scaled wrong `vdlist` (`10x` too long),
+    // verifying that `--delays <csv>` and `--delays <file>` override the raw `ser` schedule!
+    let ser_dir = tmp.path.join("bruker_r2_raw");
+    fs::create_dir_all(&ser_dir).unwrap();
+    let n0 = 64usize;
+    let n1 = 24usize;
+    let td_x = 2 * n0;
+    let td_y = 2 * n1;
+    let true_delays = [0.016_f64, 0.032, 0.064, 0.128, 0.256];
+    let wrong_vdlist = "0.160\n0.320\n0.640\n1.280\n2.560\n";
+    let bf1_x = 600.0_f64;
+    let sfo1_x = bf1_x * (1.0 + 8.0e-6);
+    let sw_hz_x = 4800.0_f64;
+    let bf1_y = 60.8_f64;
+    let sfo1_y = bf1_y * (1.0 + 118.0e-6);
+    let sw_ppm_y = 24.0_f64;
+    let sw_hz_y = sw_ppm_y * sfo1_y;
+
+    fs::write(
+        ser_dir.join("acqus"),
+        format!(
+            "##$PULPROG= <hsqct2etf3gpsi3d>\n##$PARMODE= 2\n##$AQSEQ= 0\n##$BYTORDA= 0\n##$DTYPA= 0\n\
+             ##$TD= {td_x}\n##$SFO1= {sfo1_x:.8}\n##$BF1= {bf1_x:.8}\n##$SW_h= {sw_hz_x:.6}\n\
+             ##$NUC1= <1H>\n##$GRPDLY= 0\n##END=\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        ser_dir.join("acqu2s"),
+        format!(
+            "##$FnMODE= 4\n##$TD= {td_y}\n##$SFO1= {sfo1_y:.8}\n##$BF1= {bf1_y:.8}\n\
+             ##$SW= {sw_ppm_y:.6}\n##$SW_h= {sw_hz_y:.6}\n##$NUC1= <15N>\n##END=\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        ser_dir.join("acqu3s"),
+        format!(
+            "##$FnMODE= 1\n##$TD= {}\n##$SFO1= {sfo1_x:.8}\n##$BF1= {bf1_x:.8}\n##$SW= 10.0\n##$SW_h= {sw_hz_x:.6}\n##END=\n",
+            true_delays.len()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        ser_dir.join("pulseprogram"),
+        "; pseudo3d: plane_queued\n; f2 reverse: false\n",
+    )
+    .unwrap();
+    fs::write(ser_dir.join("vdlist"), wrong_vdlist).unwrap();
+
+    let true_r2 = 7.50_f64;
+    let dh = 8.25_f64;
+    let dn = 120.0_f64;
+    let cx = (sfo1_x - bf1_x) * 1.0e6 / bf1_x;
+    let cy = (sfo1_y - bf1_y) * 1.0e6 / bf1_y;
+    let mut ser_bytes = Vec::new();
+    for &t_d in &true_delays {
+        let amp = 2.0e5 * (-true_r2 * t_d).exp();
+        for k1 in 0..n1 {
+            let t1 = (k1 as f64) / sw_hz_y;
+            let env1 = (-60.0 * t1).exp();
+            for q in 0..2 {
+                let mod_y = if q == 0 {
+                    (2.0 * PI * (dn - cy) * bf1_y * t1).cos()
+                } else {
+                    (2.0 * PI * (dn - cy) * bf1_y * t1).sin()
+                } * env1;
+                for k0 in 0..n0 {
+                    let t0 = (k0 as f64) / sw_hz_x;
+                    let env0 = (-90.0 * t0).exp();
+                    let (s0, c0) = (2.0 * PI * (dh - cx) * bf1_x * t0).sin_cos();
+                    let re = (amp * mod_y * env0 * c0).round() as i32;
+                    let im = (amp * mod_y * env0 * s0).round() as i32;
+                    ser_bytes.extend_from_slice(&re.to_le_bytes());
+                    ser_bytes.extend_from_slice(&im.to_le_bytes());
+                }
+            }
+        }
+    }
+    fs::write(ser_dir.join("ser"), ser_bytes).unwrap();
+
+    let peaks_tsv = tmp.path.join("seed_peaks.tsv");
+    fs::write(
+        &peaks_tsv,
+        format!("experiment\tH\tN\tC\nHSQC\t{dh}\t{dn}\t\n"),
+    )
+    .unwrap();
+
+    let out_csv_ovr = tmp.path.join("r2_ovr_csv.tsv");
+    let run_ovr = Command::new(nmrassign_bin())
+        .args([
+            "relax",
+            "--series",
+            ser_dir.to_str().unwrap(),
+            "--peaks",
+            peaks_tsv.to_str().unwrap(),
+            "--delays",
+            "0.016,0.032,0.064,0.128,0.256",
+            "--mc-trials",
+            "0",
+            "--out",
+            out_csv_ovr.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        run_ovr.status.success(),
+        "relax --delays override failed: {}",
+        String::from_utf8_lossy(&run_ovr.stderr)
+    );
+    let r2_fit: f64 = fs::read_to_string(&out_csv_ovr)
+        .unwrap()
+        .lines()
+        .find(|l| !l.starts_with('#') && !l.starts_with("seq_id") && !l.trim().is_empty())
+        .unwrap()
+        .split('\t')
+        .nth(4)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (r2_fit - true_r2).abs() < 0.15,
+        "expected --delays override on raw ser to recover R2 ~ {true_r2}, got {r2_fit}"
+    );
+
+    // Also verify `--delays <file_path>` override works identically
+    let delays_file = tmp.path.join("override_delays.txt");
+    fs::write(&delays_file, "16ms\n32ms\n64ms\n128ms\n256ms\n").unwrap();
+    let out_file_ovr = tmp.path.join("r2_ovr_file.tsv");
+    let run_file_ovr = Command::new(nmrassign_bin())
+        .args([
+            "relax",
+            "--series",
+            ser_dir.to_str().unwrap(),
+            "--peaks",
+            peaks_tsv.to_str().unwrap(),
+            "--delays",
+            delays_file.to_str().unwrap(),
+            "--mc-trials",
+            "0",
+            "--out",
+            out_file_ovr.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(run_file_ovr.status.success());
+
+    // 2. Legacy NMR-STAR with `.` null `Val_err`: must fail closed by default and succeed with `--default-rel-sigma`!
+    let tau_m = 4.10e-9_f64;
+    let comps = DiffusionTensor::Isotropic { tau_m_sec: tau_m }.rotational_components(None);
+    let phys_160 = RelaxPhysicsConfig {
+        csa_n_ppm: -160.0,
+        ..RelaxPhysicsConfig::default()
+    };
+    let mut t1_loop = String::new();
+    let mut t2_loop = String::new();
+    let mut noe_loop = String::new();
+    for seq_id in 2..=16 {
+        let s2 = 0.85_f64;
+        let (r1, r2, noe) =
+            predict_r1_r2_noe(&comps, &LocalMfParams::m1(s2), 600.0, 600.0, &phys_160);
+        t1_loop.push_str(&format!("  {seq_id} {seq_id} ALA N {:.5} . .\n", 1.0 / r1));
+        t2_loop.push_str(&format!("  {seq_id} {seq_id} ALA N {:.5} . .\n", 1.0 / r2));
+        noe_loop.push_str(&format!("  {seq_id} {seq_id} ALA N {:.5} .\n", noe));
+    }
+    let star_null_err = format!(
+        "data_legacy_null_err\n\
+         save_15N_T1_set_1\n\
+           _Heteronucl_T1_list.Sf_category heteronucl_T1_relaxation\n\
+           _Heteronucl_T1_list.Spectrometer_frequency_1H 600\n\
+           _Heteronucl_T1_list.T1_val_units s\n\
+           loop_\n\
+             _T1.ID\n_T1.Seq_ID\n_T1.Comp_ID\n_T1.Atom_ID\n_T1.Val\n_T1.Val_err\n_T1.Auth_seq_ID\n\
+         {t1_loop}  stop_\n\
+         save_\n\
+         save_15N_T2_set_1\n\
+           _Heteronucl_T2_list.Sf_category heteronucl_T2_relaxation\n\
+           _Heteronucl_T2_list.Spectrometer_frequency_1H 600\n\
+           _Heteronucl_T2_list.T2_val_units s\n\
+           loop_\n\
+             _T2.ID\n_T2.Seq_ID\n_T2.Comp_ID\n_T2.Atom_ID\n_T2.T2_val\n_T2.T2_val_err\n_T2.Auth_seq_ID\n\
+         {t2_loop}  stop_\n\
+         save_\n\
+         save_hetNOE_set_1\n\
+           _Heteronucl_NOE_list.Sf_category heteronucl_NOEs\n\
+           _Heteronucl_NOE_list.Spectrometer_frequency_1H 600\n\
+           loop_\n\
+             _Heteronucl_NOE.ID\n_Heteronucl_NOE.Seq_ID_1\n_Heteronucl_NOE.Comp_ID_1\n_Heteronucl_NOE.Atom_ID_1\n_Heteronucl_NOE.Val\n_Heteronucl_NOE.Val_err\n\
+         {noe_loop}  stop_\n\
+         save_\n"
+    );
+    let star_path = tmp.path.join("legacy_6470_like.str");
+    fs::write(&star_path, star_null_err).unwrap();
+
+    let mf_fail_out = tmp.path.join("mf_fail.tsv");
+    let fail_res = Command::new(nmrassign_bin())
+        .args([
+            "modelfree",
+            "--star",
+            star_path.to_str().unwrap(),
+            "--out",
+            mf_fail_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !fail_res.status.success(),
+        "modelfree without --default-rel-sigma must fail closed on null Val_err"
+    );
+    assert!(
+        String::from_utf8_lossy(&fail_res.stderr).contains("--default-rel-sigma"),
+        "stderr must mention --default-rel-sigma, got: {}",
+        String::from_utf8_lossy(&fail_res.stderr)
+    );
+
+    let mf_ok_out = tmp.path.join("mf_ok.tsv");
+    let ok_res = Command::new(nmrassign_bin())
+        .args([
+            "modelfree",
+            "--star",
+            star_path.to_str().unwrap(),
+            "--default-rel-sigma",
+            "0.03",
+            "--csa-ppm",
+            "-160.0",
+            "--out",
+            mf_ok_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        ok_res.status.success(),
+        "modelfree with --default-rel-sigma 0.03 failed: {}",
+        String::from_utf8_lossy(&ok_res.stderr)
+    );
+    let mf_txt = fs::read_to_string(&mf_ok_out).unwrap();
+    assert!(mf_txt.contains("d_par_over_d_perp=1.0000"));
+    for line in mf_txt.lines() {
+        if line.starts_with('#') || line.starts_with("seq_id") || line.trim().is_empty() {
+            continue;
+        }
+        let s2_fit: f64 = line.split('\t').nth(3).unwrap().parse().unwrap();
+        assert!(
+            (s2_fit - 0.85).abs() < 0.01,
+            "expected S^2 ~ 0.85, got {s2_fit}"
+        );
+    }
+}

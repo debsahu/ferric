@@ -651,6 +651,25 @@ fn find_file_ci_local(dir: &Path, target: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+fn find_dir_ci_local(dir: &Path, target: &str) -> Option<std::path::PathBuf> {
+    let direct = dir.join(target);
+    if direct.is_dir() {
+        return Some(direct);
+    }
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir()
+            && p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(target))
+        {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn normalize_nuc(raw: &str, fallback: &str) -> String {
     let s = raw
         .trim()
@@ -661,7 +680,7 @@ fn normalize_nuc(raw: &str, fallback: &str) -> String {
     if s.is_empty() || s == "OFF" || s == "NONE" {
         return fallback.to_string();
     }
-    if s == "H1" || s == "1H" || s == "H" {
+    if s == "H1" || s == "1H" || s == "H" || s == "HN" {
         "1H".to_string()
     } else if s == "N15" || s == "15N" || s == "N" {
         "15N".to_string()
@@ -672,16 +691,157 @@ fn normalize_nuc(raw: &str, fallback: &str) -> String {
     }
 }
 
+fn bruker_proc_is_processed_local(pm: &HashMap<String, String>) -> bool {
+    // In XWIN-NMR and TopSpin, `##$FT_mod= 0` marks an un-transformed acquisition template
+    // whose `OFFSET`, `SF`, `WDW`, `PHC0`, and `REVERSE` have not been populated by `efp`/`xfb`/`ftnd`.
+    pm.get("FT_mod")
+        .and_then(|s| s.parse::<i32>().ok())
+        .map(|ft_mod| ft_mod != 0)
+        .unwrap_or(true)
+}
+
+fn bruker_proc_matches_acqu_sw_local(
+    proc_map: Option<&HashMap<String, String>>,
+    acqu_sw_hz: f64,
+) -> bool {
+    let Some(pm) = proc_map else {
+        return false;
+    };
+    let Some(sw_p) = pm
+        .get("SW_p")
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&v| v > 0.0 && v.is_finite())
+    else {
+        return true;
+    };
+    if acqu_sw_hz <= 0.0 || !acqu_sw_hz.is_finite() {
+        return true;
+    }
+    if (sw_p - acqu_sw_hz).abs() / acqu_sw_hz <= 0.025 {
+        return true;
+    }
+    let si = pm
+        .get("SI")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let ftsize = pm
+        .get("FTSIZE")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    if ftsize > si && si > 0 {
+        let full_sw_p = sw_p * (ftsize as f64) / (si as f64);
+        if (full_sw_p - acqu_sw_hz).abs() / acqu_sw_hz <= 0.025 {
+            return true;
+        }
+    }
+    false
+}
+
+fn bruker_proc_valid_sf_local(proc_map: Option<&HashMap<String, String>>, bf1: f64) -> Option<f64> {
+    let sf = proc_map?
+        .get("SF")?
+        .parse::<f64>()
+        .ok()
+        .filter(|&v| v > 0.0 && v.is_finite())?;
+    if bf1 > 0.0 && (sf - bf1).abs() / bf1.max(1.0e-6) <= 0.02 {
+        Some(sf)
+    } else {
+        None
+    }
+}
+
+fn resolve_bruker_indirect_sfo1_local(
+    acqus: &HashMap<String, String>,
+    proc_ind: Option<&HashMap<String, String>>,
+    label: &str,
+    sfo_ind: f64,
+    bf_ind: f64,
+) -> f64 {
+    let has_valid_proc_cal = proc_ind.is_some_and(|p| {
+        let sf_ok = p
+            .get("SF")
+            .is_none_or(|_| bruker_proc_valid_sf_local(Some(p), bf_ind).is_some());
+        let off_ok = p
+            .get("OFFSET")
+            .and_then(|v| v.parse::<f64>().ok())
+            .is_some_and(|o| o.is_finite() && o.abs() <= 1000.0);
+        sf_ok && off_ok
+    });
+    if has_valid_proc_cal || !matches!(label, "15N" | "13C") || bf_ind <= 0.0 {
+        return sfo_ind;
+    }
+    for ch in 2..=4 {
+        let nuc_key = format!("NUC{ch}");
+        let Some(raw_nuc) = acqus.get(&nuc_key) else {
+            continue;
+        };
+        if normalize_nuc(raw_nuc, "") != label {
+            continue;
+        }
+        let bf_key = format!("BF{ch}");
+        let sfo_key = format!("SFO{ch}");
+        let Some(bf_ch) = acqus.get(&bf_key).and_then(|v| v.parse::<f64>().ok()) else {
+            continue;
+        };
+        let Some(sfo_ch) = acqus.get(&sfo_key).and_then(|v| v.parse::<f64>().ok()) else {
+            continue;
+        };
+        if (bf_ch - bf_ind).abs() <= 1.0e-3 && sfo_ch > 0.0 {
+            let ppm_ch = (sfo_ch - bf_ch) * 1.0e6 / bf_ch;
+            let ppm_ind = (sfo_ind - bf_ind) * 1.0e6 / bf_ind;
+            let uninit_ind =
+                label == "15N" && ppm_ind.abs() <= 1.0e-3 && (90.0..=150.0).contains(&ppm_ch);
+            let max_delta = if label == "15N" { 20.0 } else { 15.0 };
+            if (ppm_ch - ppm_ind).abs() <= max_delta || uninit_ind {
+                return sfo_ch;
+            }
+        }
+    }
+    sfo_ind
+}
+
+fn decode_bruker_proc_mc2_local(mc2: i32, fallback_label: &str) -> Result<QuadMode, String> {
+    match mc2 {
+        0 => Ok(QuadMode::Qf),
+        3 => Ok(QuadMode::States),
+        4 => Ok(QuadMode::StatesTppi),
+        5 => Ok(QuadMode::EchoAntiecho),
+        other => Err(format!(
+            "unsupported Bruker indirect proc MC2={other} fallback on {fallback_label} (expected 0=QF, 3=States, 4=States-TPPI, 5=Echo-Antiecho)"
+        )),
+    }
+}
+
 fn extract_stored_proc_jcamp(proc_map: Option<&HashMap<String, String>>) -> StoredDimProc {
     let Some(p) = proc_map else {
         return StoredDimProc::default();
     };
-    let p0_deg = p.get("PHC0").and_then(|s| s.parse::<f64>().ok());
-    let p1_deg = p.get("PHC1").and_then(|s| s.parse::<f64>().ok());
-    let si = p
+    let ph_mod = p
+        .get("PH_mod")
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(1);
+    let (p0_deg, p1_deg) = if ph_mod == 0 {
+        (None, None)
+    } else {
+        (
+            p.get("PHC0").and_then(|s| s.parse::<f64>().ok()),
+            p.get("PHC1").and_then(|s| s.parse::<f64>().ok()),
+        )
+    };
+    let si_raw = p
         .get("SI")
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v >= 2);
+    let ftsize = p
+        .get("FTSIZE")
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v >= 2);
+    let si = match (si_raw, ftsize) {
+        (Some(s), Some(ft)) => Some(s.max(ft)),
+        (Some(s), None) => Some(s),
+        (None, Some(ft)) => Some(ft),
+        (None, None) => None,
+    };
     let td_eff = p
         .get("TDeff")
         .and_then(|s| s.parse::<usize>().ok())
@@ -701,7 +861,7 @@ fn extract_stored_proc_jcamp(proc_map: Option<&HashMap<String, String>>) -> Stor
             .get("SSB")
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(2.0);
-        let offset_pi_frac = if ssb >= 1.0 { 1.0 / ssb } else { 0.0 };
+        let offset_pi_frac = if ssb >= 2.0 { 1.0 / ssb } else { 0.0 };
         match wdw {
             0 => StoredWindowHint::None,
             1 => StoredWindowHint::Exponential {
@@ -711,8 +871,8 @@ fn extract_stored_proc_jcamp(proc_map: Option<&HashMap<String, String>>) -> Stor
                     .unwrap_or(0.0)
                     .max(0.0),
             },
-            2 => StoredWindowHint::SineBell { offset_pi_frac },
-            3 => StoredWindowHint::SquaredSineBell { offset_pi_frac },
+            3 => StoredWindowHint::SineBell { offset_pi_frac },
+            4 => StoredWindowHint::SquaredSineBell { offset_pi_frac },
             _ => StoredWindowHint::SquaredSineBell {
                 offset_pi_frac: 0.5,
             },
@@ -737,16 +897,138 @@ fn bruker_first_ppm(
     proc_map: Option<&HashMap<String, String>>,
     sfo1: f64,
     obs_mhz: f64,
+    bf1: f64,
     sw_hz: f64,
 ) -> f64 {
-    if let Some(off) = proc_map
-        .and_then(|p| p.get("OFFSET"))
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite())
-    {
-        return off;
+    if let Some(p) = proc_map {
+        let sf_ok = p
+            .get("SF")
+            .is_none_or(|_| bruker_proc_valid_sf_local(Some(p), bf1).is_some());
+        let sref = p
+            .get("SREF_mod")
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(1);
+        if sf_ok && sref != 0 {
+            if let Some(off) = p
+                .get("OFFSET")
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|&v| v.is_finite() && v.abs() <= 1000.0)
+            {
+                let si = p
+                    .get("SI")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let ftsize = p
+                    .get("FTSIZE")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let stsr = p
+                    .get("STSR")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                if ftsize > si && stsr > 0 && obs_mhz > 0.0 {
+                    return off + (stsr as f64) * (sw_hz / obs_mhz) / (ftsize as f64);
+                }
+                return off;
+            }
+        }
     }
     ((sfo1 - obs_mhz) * 1.0e6 + 0.5 * sw_hz) / obs_mhz.max(1.0e-9)
+}
+
+type JcampParamMap = HashMap<String, String>;
+
+/// Resolve processed Bruker `procs` (direct `1H`) and `chem_proc` (indirect `15N`/`13C`) maps.
+/// Filters out un-transformed `FT_mod == 0` templates and stale `edc`-inherited `SW_p` mismatches,
+/// and falls back to processed sibling 2D plane directories (`pdata/10`, `pdata/2`, ...) when
+/// TopSpin processed individual `(F2=1H, F1=15N)` 2D planes instead of `pdata/1`.
+fn resolve_bruker_pseudo3d_proc_maps(
+    dir: &Path,
+    chem_is_acqu2s: bool,
+    chem_label: &str,
+    sw_hz_x: f64,
+    sw_hz_y: f64,
+) -> (Option<JcampParamMap>, Option<JcampParamMap>) {
+    let valid_direct = |m: HashMap<String, String>| -> Option<HashMap<String, String>> {
+        if bruker_proc_is_processed_local(&m)
+            && bruker_proc_matches_acqu_sw_local(Some(&m), sw_hz_x)
+        {
+            Some(m)
+        } else {
+            None
+        }
+    };
+    let valid_chem = |m: HashMap<String, String>| -> Option<HashMap<String, String>> {
+        if !bruker_proc_is_processed_local(&m)
+            || !bruker_proc_matches_acqu_sw_local(Some(&m), sw_hz_y)
+        {
+            return None;
+        }
+        if let Some(axnuc) = m.get("AXNUC") {
+            let norm = normalize_nuc(axnuc, "");
+            if !norm.is_empty() && norm != chem_label {
+                return None;
+            }
+        }
+        Some(m)
+    };
+
+    let mut direct_out: Option<HashMap<String, String>> = None;
+    let mut chem_out: Option<HashMap<String, String>> = None;
+
+    if let Some(pdata_dir) = find_dir_ci_local(dir, "pdata") {
+        if let Some(d1) = find_dir_ci_local(&pdata_dir, "1") {
+            direct_out = read_jcamp_file_opt(&d1, "procs").and_then(valid_direct);
+            let primary_name = if chem_is_acqu2s { "proc2s" } else { "proc3s" };
+            chem_out = read_jcamp_file_opt(&d1, primary_name).and_then(valid_chem);
+        }
+        if direct_out.is_none() || chem_out.is_none() {
+            if let Ok(entries) = fs::read_dir(&pdata_dir) {
+                let mut sibs: Vec<(u64, std::path::PathBuf)> = entries
+                    .flatten()
+                    .filter_map(|e| {
+                        let p = e.path();
+                        if !p.is_dir() {
+                            return None;
+                        }
+                        let n: u64 = p.file_name()?.to_str()?.parse().ok()?;
+                        if n >= 2 {
+                            Some((n, p))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                sibs.sort_by_key(|(n, _)| *n);
+                for (_, pdir) in sibs {
+                    if direct_out.is_none() {
+                        direct_out = read_jcamp_file_opt(&pdir, "procs").and_then(valid_direct);
+                    }
+                    if chem_out.is_none() {
+                        // Processed 2D planes extracted via `xfb` store the `(F2=1H, F1=15N)`
+                        // indirect axis in `proc2s` (or `proc3s` in full 3D `pdata`).
+                        let primary_name = if chem_is_acqu2s { "proc2s" } else { "proc3s" };
+                        chem_out = read_jcamp_file_opt(&pdir, primary_name)
+                            .and_then(valid_chem)
+                            .or_else(|| read_jcamp_file_opt(&pdir, "proc2s").and_then(valid_chem));
+                    }
+                    if direct_out.is_some() && chem_out.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if direct_out.is_none() {
+        direct_out = read_jcamp_file_opt(dir, "procs").and_then(valid_direct);
+    }
+    if chem_out.is_none() {
+        let primary_name = if chem_is_acqu2s { "proc2s" } else { "proc3s" };
+        chem_out = read_jcamp_file_opt(dir, primary_name).and_then(valid_chem);
+    }
+
+    (direct_out, chem_out)
 }
 
 #[derive(Clone, Debug)]
@@ -1054,8 +1336,16 @@ fn decode_bruker_trace_local(
         2 => {
             for k in 0..n_cplx {
                 let b = k * 16;
-                let r: [u8; 8] = slice[b..b + 8].try_into().unwrap();
-                let m: [u8; 8] = slice[b + 8..b + 16].try_into().unwrap();
+                let (Some(r), Some(m)) = (
+                    slice
+                        .get(b..b + 8)
+                        .and_then(|s| <[u8; 8]>::try_from(s).ok()),
+                    slice
+                        .get(b + 8..b + 16)
+                        .and_then(|s| <[u8; 8]>::try_from(s).ok()),
+                ) else {
+                    break;
+                };
                 let re = if big_endian {
                     f64::from_be_bytes(r)
                 } else {
@@ -1072,8 +1362,16 @@ fn decode_bruker_trace_local(
         1 => {
             for k in 0..n_cplx {
                 let b = k * 8;
-                let r: [u8; 4] = slice[b..b + 4].try_into().unwrap();
-                let m: [u8; 4] = slice[b + 4..b + 8].try_into().unwrap();
+                let (Some(r), Some(m)) = (
+                    slice
+                        .get(b..b + 4)
+                        .and_then(|s| <[u8; 4]>::try_from(s).ok()),
+                    slice
+                        .get(b + 4..b + 8)
+                        .and_then(|s| <[u8; 4]>::try_from(s).ok()),
+                ) else {
+                    break;
+                };
                 let re = if big_endian {
                     f32::from_be_bytes(r) as f64
                 } else {
@@ -1090,8 +1388,16 @@ fn decode_bruker_trace_local(
         _ => {
             for k in 0..n_cplx {
                 let b = k * 8;
-                let r: [u8; 4] = slice[b..b + 4].try_into().unwrap();
-                let m: [u8; 4] = slice[b + 4..b + 8].try_into().unwrap();
+                let (Some(r), Some(m)) = (
+                    slice
+                        .get(b..b + 4)
+                        .and_then(|s| <[u8; 4]>::try_from(s).ok()),
+                    slice
+                        .get(b + 4..b + 8)
+                        .and_then(|s| <[u8; 4]>::try_from(s).ok()),
+                ) else {
+                    break;
+                };
                 let re = if big_endian {
                     i32::from_be_bytes(r) as f64
                 } else {
@@ -1106,9 +1412,18 @@ fn decode_bruker_trace_local(
             }
         }
     }
+    while out.len() < n_cplx {
+        out.push([0.0, 0.0]);
+    }
     out
 }
 
+/// Rance–Kay Echo-Antiecho and States-TPPI quadrature recombination identical to `fid.rs`
+/// (Palmer et al., *J. Magn. Reson.* **1991**, 93, 151–170; Kay, Keifer & Saarinen,
+/// *J. Am. Chem. Soc.* **1992**, 114, 10663–10665; Marion et al., *J. Magn. Reson.* **1989**,
+/// 85, 393–399). Under Bruker `conjugate_for_fft = true`, `z_cos_conj = -i*(z0_conj + z1_conj)`
+/// and `z_sin_conj = -(z0_conj - z1_conj)` place crosspeaks in pure absorption at `procs.PHC0`
+/// with canonical indirect heteronuclear frequency sign.
 #[inline]
 fn recombine_quad_pair_local(
     quad_mode: QuadMode,
@@ -1122,10 +1437,10 @@ fn recombine_quad_pair_local(
     match quad_mode {
         QuadMode::EchoAntiecho => {
             for i in 0..n {
-                let (r0, m0) = (z0[i][0], z0[i][1]);
-                let (r1, m1) = (z1[i][0], z1[i][1]);
-                out_cos[i] = [0.5 * (r0 + r1), 0.5 * (m0 + m1)];
-                out_sin[i] = [0.5 * (m0 - m1), 0.5 * (r1 - r0)];
+                let (re0, im0) = (z0[i][0], z0[i][1]);
+                let (re1, im1) = (z1[i][0], z1[i][1]);
+                out_cos[i] = [-(im0 + im1), re0 + re1];
+                out_sin[i] = [re1 - re0, im1 - im0];
             }
         }
         QuadMode::StatesTppi => {
@@ -1159,12 +1474,543 @@ fn trace_index_for_interleaving(
     }
 }
 
+fn contains_pp_ident_local(code: &str, ident: &str) -> bool {
+    let bytes = code.as_bytes();
+    let wb = ident.as_bytes();
+    if wb.is_empty() || wb.len() > bytes.len() {
+        return false;
+    }
+    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut pos = 0usize;
+    while pos + wb.len() <= bytes.len() {
+        if let Some(rel) = code[pos..].find(ident) {
+            let start = pos + rel;
+            let end = start + wb.len();
+            let left_ok = start == 0 || !is_id(bytes[start - 1]);
+            let right_ok = end == bytes.len() || !is_id(bytes[end]);
+            if left_ok && right_ok {
+                return true;
+            }
+            pos = start + 1;
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+/// Evaluate a Bruker TopSpin pulseprogram scalar delay/pulse expression (`+`, `-`, `*`, `/`,
+/// parentheses, `larger(a,b)`, Bruker `s`/`m`/`u`/`n` suffixes, and symbol lookups).
+fn eval_bruker_pp_expr_sec(expr: &str, vars: &HashMap<String, f64>) -> Option<f64> {
+    struct Parser<'a> {
+        b: &'a [u8],
+        pos: usize,
+        vars: &'a HashMap<String, f64>,
+    }
+    impl<'a> Parser<'a> {
+        fn skip_ws(&mut self) {
+            while self.pos < self.b.len() && self.b[self.pos].is_ascii_whitespace() {
+                self.pos += 1;
+            }
+        }
+        fn parse_expr(&mut self) -> Option<f64> {
+            let mut v = self.parse_term()?;
+            loop {
+                self.skip_ws();
+                if self.pos < self.b.len() && self.b[self.pos] == b'+' {
+                    self.pos += 1;
+                    v += self.parse_term()?;
+                } else if self.pos < self.b.len() && self.b[self.pos] == b'-' {
+                    self.pos += 1;
+                    v -= self.parse_term()?;
+                } else {
+                    break;
+                }
+            }
+            Some(v)
+        }
+        fn parse_term(&mut self) -> Option<f64> {
+            let mut v = self.parse_factor()?;
+            loop {
+                self.skip_ws();
+                if self.pos < self.b.len() && self.b[self.pos] == b'*' {
+                    self.pos += 1;
+                    v *= self.parse_factor()?;
+                } else if self.pos < self.b.len() && self.b[self.pos] == b'/' {
+                    self.pos += 1;
+                    let denom = self.parse_factor()?;
+                    if denom.abs() <= 1.0e-30 {
+                        return None;
+                    }
+                    v /= denom;
+                } else {
+                    break;
+                }
+            }
+            Some(v)
+        }
+        fn parse_factor(&mut self) -> Option<f64> {
+            self.skip_ws();
+            if self.pos >= self.b.len() {
+                return None;
+            }
+            if self.b[self.pos] == b'+' {
+                self.pos += 1;
+                return self.parse_factor();
+            }
+            if self.b[self.pos] == b'-' {
+                self.pos += 1;
+                return self.parse_factor().map(|x| -x);
+            }
+            if self.b[self.pos] == b'(' {
+                self.pos += 1;
+                let inner = self.parse_expr()?;
+                self.skip_ws();
+                if self.pos >= self.b.len() || self.b[self.pos] != b')' {
+                    return None;
+                }
+                self.pos += 1;
+                return Some(inner);
+            }
+            let start = self.pos;
+            if self.b[start].is_ascii_digit() || self.b[start] == b'.' {
+                while self.pos < self.b.len()
+                    && (self.b[self.pos].is_ascii_digit() || self.b[self.pos] == b'.')
+                {
+                    self.pos += 1;
+                }
+                if self.pos < self.b.len()
+                    && (self.b[self.pos] == b'e' || self.b[self.pos] == b'E')
+                    && self.pos + 1 < self.b.len()
+                    && (self.b[self.pos + 1].is_ascii_digit()
+                        || self.b[self.pos + 1] == b'+'
+                        || self.b[self.pos + 1] == b'-')
+                {
+                    self.pos += 1;
+                    if self.b[self.pos] == b'+' || self.b[self.pos] == b'-' {
+                        self.pos += 1;
+                    }
+                    while self.pos < self.b.len() && self.b[self.pos].is_ascii_digit() {
+                        self.pos += 1;
+                    }
+                }
+                let num_s = std::str::from_utf8(&self.b[start..self.pos]).ok()?;
+                let val: f64 = num_s.parse().ok()?;
+                let mut scale = 1.0_f64;
+                if self.pos < self.b.len() && self.b[self.pos].is_ascii_alphabetic() {
+                    let u_start = self.pos;
+                    while self.pos < self.b.len() && self.b[self.pos].is_ascii_alphabetic() {
+                        self.pos += 1;
+                    }
+                    let unit = std::str::from_utf8(&self.b[u_start..self.pos])
+                        .ok()?
+                        .to_ascii_lowercase();
+                    scale = match unit.as_str() {
+                        "s" | "sec" => 1.0,
+                        "m" | "ms" | "msec" => 1.0e-3,
+                        "u" | "us" | "usec" => 1.0e-6,
+                        "n" | "ns" | "nsec" => 1.0e-9,
+                        _ => return None,
+                    };
+                }
+                return Some(val * scale);
+            }
+            if self.b[start].is_ascii_alphabetic() || self.b[start] == b'_' {
+                while self.pos < self.b.len()
+                    && (self.b[self.pos].is_ascii_alphanumeric() || self.b[self.pos] == b'_')
+                {
+                    self.pos += 1;
+                }
+                let ident = std::str::from_utf8(&self.b[start..self.pos])
+                    .ok()?
+                    .to_ascii_lowercase();
+                self.skip_ws();
+                if ident == "larger" && self.pos < self.b.len() && self.b[self.pos] == b'(' {
+                    self.pos += 1;
+                    let a = self.parse_expr()?;
+                    self.skip_ws();
+                    if self.pos >= self.b.len() || self.b[self.pos] != b',' {
+                        return None;
+                    }
+                    self.pos += 1;
+                    let b_val = self.parse_expr()?;
+                    self.skip_ws();
+                    if self.pos >= self.b.len() || self.b[self.pos] != b')' {
+                        return None;
+                    }
+                    self.pos += 1;
+                    return Some(a.max(b_val));
+                }
+                return self.vars.get(&ident).copied();
+            }
+            None
+        }
+    }
+    let mut p = Parser {
+        b: expr.as_bytes(),
+        pos: 0,
+        vars,
+    };
+    let val = p.parse_expr()?;
+    p.skip_ws();
+    if p.pos == p.b.len() && val.is_finite() {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+/// Infer the physical duration (seconds) of a single Bruker `vclist` loop (`lo to <lbl> times c`
+/// or `times vc`), supporting both 2-channel `f2` (`d20` + `p4`) and 3-channel `f3` (`15N`)
+/// `hsqct2etf3gpsi3d` sequences (`d21` + `p30` / `d31 = p30*16 + d21*32`, Farrow et al.,
+/// *Biochemistry* **1994**, 33, 5984–6003).
+fn infer_bruker_vclist_unit_cycle_sec(
+    pp_text: Option<&str>,
+    pulprog: &str,
+    acqus: &HashMap<String, String>,
+) -> f64 {
+    let mut vars: HashMap<String, f64> = HashMap::new();
+    if let Some(d_arr) = acqus.get("D") {
+        for (idx, tok) in d_arr.split_whitespace().enumerate() {
+            if let Ok(v) = tok.parse::<f64>() {
+                if v.is_finite() && v >= 0.0 {
+                    vars.insert(format!("d{idx}"), v);
+                }
+            }
+        }
+    }
+    if let Some(p_arr) = acqus.get("P") {
+        for (idx, tok) in p_arr.split_whitespace().enumerate() {
+            if let Ok(v) = tok.parse::<f64>() {
+                if v.is_finite() && v >= 0.0 {
+                    // Bruker `##$P` pulse lengths in `acqus` are stored in microseconds.
+                    vars.insert(format!("p{idx}"), v * 1.0e-6);
+                }
+            }
+        }
+    }
+    if let Some(c_arr) = acqus.get("CNST") {
+        for (idx, tok) in c_arr.split_whitespace().enumerate() {
+            if let Ok(v) = tok.parse::<f64>() {
+                if v.is_finite() {
+                    vars.insert(format!("cnst{idx}"), v);
+                }
+            }
+        }
+    }
+
+    if let Some(txt) = pp_text {
+        let mut assigned_d31 = false;
+        for raw_line in txt.lines() {
+            let code = raw_line.split(';').next().unwrap_or("").trim();
+            if code.is_empty() || code.starts_with('#') {
+                continue;
+            }
+            if contains_pp_ident_local(code, "ze") {
+                break;
+            }
+            // Parse quoted Bruker parameter relations: `"d21=450u"`, `"d31=(p30*16+d21*32)"`, `"DELTA3=d21-p2/2"`
+            let mut rest = code;
+            while let Some(q0) = rest.find('"') {
+                let after_q0 = &rest[q0 + 1..];
+                let Some(q1) = after_q0.find('"') else {
+                    break;
+                };
+                let stmt = after_q0[..q1].trim();
+                if let Some((lhs_raw, rhs_raw)) = stmt.split_once('=') {
+                    if !lhs_raw.ends_with('=') && !rhs_raw.starts_with('=') {
+                        let lhs = lhs_raw.trim().to_ascii_lowercase();
+                        if let Some(val) = eval_bruker_pp_expr_sec(rhs_raw.trim(), &vars) {
+                            if val >= 0.0 {
+                                if lhs == "d31" {
+                                    assigned_d31 = true;
+                                }
+                                vars.insert(lhs, val);
+                            }
+                        }
+                    }
+                }
+                rest = &after_q0[q1 + 1..];
+            }
+        }
+
+        // Integrate `<lbl> ... lo to <lbl> times c` (or `times vc`) directly from `pulseprogram`
+        let clean_lines: Vec<&str> = txt
+            .lines()
+            .map(|l| l.split(';').next().unwrap_or("").trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        for (end_idx, &line) in clean_lines.iter().enumerate() {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            if toks.len() >= 5
+                && toks[0].eq_ignore_ascii_case("lo")
+                && toks[1].eq_ignore_ascii_case("to")
+                && toks[3].eq_ignore_ascii_case("times")
+                && (toks[4].eq_ignore_ascii_case("c") || toks[4].eq_ignore_ascii_case("vc"))
+            {
+                let target_lbl = toks[2].trim_end_matches(',');
+                if let Some(start_idx) = clean_lines[..end_idx].iter().rposition(|cand| {
+                    let first = cand
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches(',');
+                    first == target_lbl
+                }) {
+                    let mut loop_sec = 0.0_f64;
+                    for (li, &body_line) in clean_lines[start_idx..end_idx].iter().enumerate() {
+                        let body = if li == 0 {
+                            let first_tok = body_line.split_whitespace().next().unwrap_or_default();
+                            body_line[first_tok.len()..].trim()
+                        } else {
+                            body_line
+                        };
+                        loop_sec += sum_bruker_pulse_line_duration_sec(body, &vars);
+                    }
+                    if loop_sec > 1.0e-4 && loop_sec < 1.0 {
+                        return loop_sec;
+                    }
+                }
+            }
+        }
+
+        if assigned_d31 {
+            if let Some(&d31) = vars.get("d31").filter(|&&v| v > 1.0e-4 && v < 1.0) {
+                return d31;
+            }
+        }
+    }
+
+    let p_low = pulprog.to_ascii_lowercase();
+    if p_low.contains("t2") {
+        // In Bruker TopSpin `hsqct2et*` / `trosyt2et*`, `D[31]` holds the evaluated single CPMG loop length.
+        if let Some(&d31) = vars.get("d31").filter(|&&v| (1.0e-3..=0.25).contains(&v)) {
+            return d31;
+        }
+        if p_low.contains("f3") {
+            if let Some(&d21) = vars.get("d21").filter(|&&v| (1.0e-4..=0.02).contains(&v)) {
+                let p30 = vars.get("p30").copied().unwrap_or(0.0);
+                return 32.0 * d21 + 16.0 * p30;
+            }
+        }
+    }
+
+    vars.get("d20")
+        .copied()
+        .filter(|&v| v > 1.0e-4)
+        .unwrap_or(0.016)
+}
+
+fn sum_bruker_pulse_line_duration_sec(line: &str, vars: &HashMap<String, f64>) -> f64 {
+    // Strip channel suffixes (`:f1`, `:f2`, `:f3`, `:sp13`, `:gp1`) and parentheses,
+    // handling `(center (a) (b))` as `max(dur(a), dur(b))`.
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return 0.0;
+    }
+    let low = trimmed.to_ascii_lowercase();
+    if low.starts_with("(center ") || low.starts_with("(center(") {
+        let inner = trimmed.trim_start_matches('(').trim_end_matches(')').trim();
+        let after_center = inner.get("center".len()..).unwrap_or("").trim();
+        let mut best = 0.0_f64;
+        let mut depth = 0i32;
+        let mut seg_start: Option<usize> = None;
+        for (i, ch) in after_center.char_indices() {
+            if ch == '(' {
+                if depth == 0 {
+                    seg_start = Some(i + 1);
+                }
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s0) = seg_start.take() {
+                        let sub = &after_center[s0..i];
+                        best = best.max(sum_bruker_pulse_line_duration_sec(sub, vars));
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    let cleaned: String = trimmed
+        .chars()
+        .map(|c| if c == '(' || c == ')' { ' ' } else { c })
+        .collect();
+    let mut sum = 0.0_f64;
+    for raw_tok in cleaned.split_whitespace() {
+        let base = raw_tok.split(':').next().unwrap_or("").trim();
+        if base.is_empty() {
+            continue;
+        }
+        let b_low = base.to_ascii_lowercase();
+        if b_low.starts_with("ph")
+            || b_low.starts_with("pl")
+            || b_low.starts_with("sp")
+            || b_low.starts_with("gp")
+            || b_low.starts_with("cpd")
+            || b_low.starts_with("do")
+            || b_low.starts_with("cw")
+        {
+            continue;
+        }
+        if let Some(v) = eval_bruker_pp_expr_sec(base, vars) {
+            if v > 0.0 && v < 10.0 {
+                sum += v;
+            }
+        }
+    }
+    sum
+}
+
+/// Recognize schedule-less Bruker 2-plane interleaved steady-state `{1H}-15N` `hetNOE` datasets
+/// (`hsqcnoef3gpsi`, `hsqcnoef3gpsi3d`, `trosynoef3gpsi`, etc.), deducing whether plane 0 is
+/// unsaturated reference (`NONOE`, `delay = 0`) or proton-saturated (`NOE`, `delay = D[1]`)
+/// directly from `pulseprogram` loop-counter parity (`l0 % 2 == 1` vs `0`) and comments.
+fn infer_bruker_hetnoe_schedule(
+    pp_text: Option<&str>,
+    pulprog: &str,
+    acqus: &HashMap<String, String>,
+    acqu2s: &HashMap<String, String>,
+    acqu3s: Option<&HashMap<String, String>>,
+) -> Option<RelaxSchedule> {
+    let p_low = pulprog.to_ascii_lowercase();
+    let name_is_hetnoe =
+        p_low.contains("noe") && !p_low.contains("noesy") && !p_low.contains("roesy");
+    let pp_mentions_hetnoe = pp_text.is_some_and(|txt| {
+        let low = txt.to_ascii_lowercase();
+        low.contains("measuring h1-n15 noe")
+            || low.contains("recording nonoe and noe")
+            || low.contains("recording noe and nonoe")
+            || low.contains("heteronuclear noe")
+    });
+    if !name_is_hetnoe && !pp_mentions_hetnoe {
+        return None;
+    }
+
+    // Verify 2-plane compatibility (`acqu3s.TD == 2`, `acqu2s.TD == 2` in 3D, or 2D doubled `TD`).
+    let td2: usize = acqu2s.get("TD").and_then(|s| s.parse().ok()).unwrap_or(0);
+    if let Some(a3) = acqu3s {
+        let td3: usize = a3.get("TD").and_then(|s| s.parse().ok()).unwrap_or(0);
+        if td3 != 2 && td2 != 2 {
+            return None;
+        }
+    } else if td2 < 2 || !td2.is_multiple_of(2) {
+        return None;
+    }
+
+    let d_sat = acqus
+        .get("D")
+        .and_then(|d_arr| d_arr.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&v| v.is_finite() && v > 0.0)
+        .unwrap_or(3.0);
+
+    let mut sat_first: Option<bool> = None;
+    if let Some(txt) = pp_text {
+        for raw_line in txt.lines() {
+            if let Some((_, cmt)) = raw_line.split_once(';') {
+                let low = cmt.trim().to_ascii_lowercase();
+                if low.contains("hetnoe_order: sat_first")
+                    || low.contains("recording noe and nonoe")
+                {
+                    sat_first = Some(true);
+                    break;
+                }
+                if low.contains("hetnoe_order: ref_first")
+                    || low.contains("hetnoe_order: nonoe_first")
+                    || low.contains("recording nonoe and noe")
+                {
+                    sat_first = Some(false);
+                }
+            }
+        }
+
+        // Parse exact `"l<k>=<init>"` + `if "l<k> % 2 == <rem>" { ... } else { ... }` branch physics
+        let mut loop_inits: HashMap<String, i64> = HashMap::new();
+        for raw_line in txt.lines() {
+            let code = raw_line.split(';').next().unwrap_or("").trim();
+            if contains_pp_ident_local(code, "ze") {
+                break;
+            }
+            if let Some(q0) = code.find('"') {
+                if let Some(q1) = code[q0 + 1..].find('"') {
+                    let stmt = code[q0 + 1..q0 + 1 + q1].trim();
+                    if let Some((lhs, rhs)) = stmt.split_once('=') {
+                        let l_trim = lhs.trim().to_ascii_lowercase();
+                        if l_trim.starts_with('l')
+                            && l_trim[1..].chars().all(|c| c.is_ascii_digit())
+                        {
+                            if let Ok(iv) = rhs.trim().parse::<i64>() {
+                                loop_inits.insert(l_trim, iv);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let low_txt = txt.to_ascii_lowercase();
+        if let Some(if_pos) = low_txt.find("if \"l") {
+            let tail = &low_txt[if_pos..];
+            if let (Some(q0), Some(b0)) = (tail.find('"'), tail.find('{')) {
+                if let Some(q1_rel) = tail[q0 + 1..].find('"') {
+                    let cond = tail[q0 + 1..q0 + 1 + q1_rel].replace(' ', "");
+                    // Match `l<k>%2==<rem>`
+                    if let Some((lvar, rem_s)) = cond.split_once("%2==") {
+                        if let Ok(rem) = rem_s.parse::<i64>() {
+                            let after_b0 = &tail[b0 + 1..];
+                            if let Some(b1) = after_b0.find('}') {
+                                let then_blk = &after_b0[..b1];
+                                let after_then = &after_b0[b1 + 1..];
+                                let else_blk = if let Some(eb0) = after_then.find('{') {
+                                    let after_eb0 = &after_then[eb0 + 1..];
+                                    after_eb0.find('}').map(|eb1| &after_eb0[..eb1])
+                                } else {
+                                    None
+                                };
+                                let is_sat_blk = |blk: &str| -> bool {
+                                    blk.contains("lo to")
+                                        && (blk.contains("p0")
+                                            || blk.contains("times l")
+                                            || blk.contains("p1"))
+                                };
+                                let then_sat = is_sat_blk(then_blk);
+                                let else_sat = else_blk.is_some_and(is_sat_blk);
+                                if then_sat != else_sat {
+                                    let init = loop_inits.get(lvar).copied().unwrap_or(0);
+                                    let plane0_takes_then = init.rem_euclid(2) == rem.rem_euclid(2);
+                                    sat_first = Some(if plane0_takes_then {
+                                        then_sat
+                                    } else {
+                                        else_sat
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let delays_sec = if sat_first.unwrap_or(false) {
+        vec![d_sat, 0.0]
+    } else {
+        vec![0.0, d_sat]
+    };
+    Some(RelaxSchedule::VariableDelaysSec { delays_sec })
+}
+
 fn infer_bruker_pseudo3d_interleaving(
     dir: &Path,
     pp_text: Option<&str>,
     acqus: &HashMap<String, String>,
     chem_is_acqu2s: bool,
+    n_planes: usize,
 ) -> Pseudo3DInterleaving {
+    let mut pp_aqseq_312 = false;
     if let Some(txt) = pp_text {
         for raw_line in txt.lines() {
             if let Some((_, cmt)) = raw_line.split_once(';') {
@@ -1186,6 +2032,126 @@ fn infer_bruker_pseudo3d_interleaving(
                 }
             }
         }
+
+        // Direct `pulseprogram` loop-closing & `NBL` multi-buffer analysis (Bruker TopSpin `mc`
+        // and `lo to <lbl> times nbl` inner block stride):
+        // Closing `lo to ...` statements appear from innermost to outermost at the bottom of the
+        // pulse sequence.
+        let mut pos_t1_close: Option<usize> = None;
+        let mut pos_plane_close: Option<usize> = None;
+        let mut pos_quad_close: Option<usize> = None;
+        let mut prev_code = "";
+        for (idx, line) in txt.lines().enumerate() {
+            let code = line.split(';').next().unwrap_or("").trim();
+            if code.is_empty() || code.starts_with('#') {
+                continue;
+            }
+            let low = code.to_ascii_lowercase();
+            if low.starts_with("aqseq") && low.contains("312") {
+                pp_aqseq_312 = true;
+            }
+            if low.starts_with("lo ") || low.starts_with("lo\t") {
+                let toks: Vec<&str> = code.split_whitespace().collect();
+                let lbl = toks.get(2).copied().unwrap_or("").to_ascii_uppercase();
+                let cnt = toks.get(4).copied().unwrap_or("").to_ascii_lowercase();
+                let prev_low = prev_code.to_ascii_lowercase();
+
+                let is_nbl_plane = cnt == "nbl"
+                    && (contains_pp_ident_local(&prev_low, "ivd")
+                        || contains_pp_ident_local(&prev_low, "ivc")
+                        || contains_pp_ident_local(&prev_low, "ifq")
+                        || contains_pp_ident_local(&prev_low, "st"));
+                let is_plane_loop = is_nbl_plane
+                    || lbl.starts_with("LBLF1I")
+                    || lbl.starts_with("LBLAV")
+                    || contains_pp_ident_local(&prev_low, "ivd")
+                    || contains_pp_ident_local(&prev_low, "ivc")
+                    || contains_pp_ident_local(&prev_low, "ifq")
+                    || contains_pp_ident_local(&prev_low, "iu0");
+                let is_quad_loop = lbl.starts_with("LBLSTS")
+                    || (cnt == "2"
+                        && !is_plane_loop
+                        && (contains_pp_ident_local(&prev_low, "igrad")
+                            || prev_low.contains("f1ph")
+                            || prev_low.contains("f2ph")
+                            || prev_low.contains("ip")));
+                let is_t1_loop = (lbl.starts_with("LBLF") && !lbl.starts_with("LBLF1I"))
+                    || contains_pp_ident_local(&prev_low, "id0")
+                    || contains_pp_ident_local(&prev_low, "dd0")
+                    || contains_pp_ident_local(&prev_low, "id10")
+                    || contains_pp_ident_local(&prev_low, "dd10");
+
+                if is_plane_loop && pos_plane_close.is_none() {
+                    pos_plane_close = Some(idx);
+                } else if is_quad_loop && pos_quad_close.is_none() {
+                    pos_quad_close = Some(idx);
+                } else if is_t1_loop && pos_t1_close.is_none() {
+                    pos_t1_close = Some(idx);
+                }
+            }
+            prev_code = code;
+        }
+
+        if let (Some(i_t1), Some(i_pl)) = (pos_t1_close, pos_plane_close) {
+            if i_t1 < i_pl {
+                return Pseudo3DInterleaving::PlaneQueued;
+            }
+            if let Some(i_q) = pos_quad_close {
+                if i_pl < i_q {
+                    return Pseudo3DInterleaving::T1QuadPlane;
+                }
+            }
+            return Pseudo3DInterleaving::T1PlaneQuad;
+        }
+
+        // Token-position fallback for unexpanded / custom Bruker sequences without `LBL*` macros
+        let mut pos_id0 = None;
+        let mut pos_ivd = None;
+        let mut pos_quad = None;
+        for (idx, line) in txt.lines().enumerate() {
+            let code = line.split(';').next().unwrap_or("").trim();
+            if code.is_empty() || code.starts_with('#') {
+                continue;
+            }
+            if pos_id0.is_none()
+                && (contains_pp_ident_local(code, "id0")
+                    || contains_pp_ident_local(code, "dd0")
+                    || contains_pp_ident_local(code, "id10")
+                    || contains_pp_ident_local(code, "dd10"))
+            {
+                pos_id0 = Some(idx);
+            }
+            if pos_ivd.is_none()
+                && (contains_pp_ident_local(code, "ivd")
+                    || contains_pp_ident_local(code, "ivc")
+                    || contains_pp_ident_local(code, "ifq")
+                    || contains_pp_ident_local(code, "iu0"))
+            {
+                pos_ivd = Some(idx);
+            }
+            if pos_quad.is_none()
+                && (code.contains("F1PH")
+                    || code.contains("F2PH")
+                    || contains_pp_ident_local(code, "igrad")
+                    || contains_pp_ident_local(code, "ip1")
+                    || contains_pp_ident_local(code, "ip3")
+                    || contains_pp_ident_local(code, "ip5"))
+            {
+                pos_quad = Some(idx);
+            }
+        }
+        if let (Some(i_t1), Some(i_vd)) = (pos_id0, pos_ivd) {
+            if i_t1 < i_vd {
+                return Pseudo3DInterleaving::PlaneQueued;
+            }
+            if let Some(i_q) = pos_quad {
+                if i_vd < i_q {
+                    return Pseudo3DInterleaving::T1QuadPlane;
+                }
+            }
+            return Pseudo3DInterleaving::T1PlaneQuad;
+        }
+
         if let Ok(interp) = crate::pulprog::interpret_bruker_dir(dir) {
             match interp.pseudo_3d_order {
                 crate::pulprog::Pseudo3DStorageOrder::PlaneQueued => {
@@ -1203,52 +2169,19 @@ fn infer_bruker_pseudo3d_interleaving(
                 crate::pulprog::Pseudo3DStorageOrder::NotPseudo3D => {}
             }
         }
-        let mut pos_id0 = None;
-        let mut pos_ivd = None;
-        let mut pos_quad = None;
-        for (idx, line) in txt.lines().enumerate() {
-            let code = line.split(';').next().unwrap_or("").trim();
-            if code.is_empty() || code.starts_with('#') {
-                continue;
-            }
-            if pos_id0.is_none() && (code.contains("id0") || code.contains("id10")) {
-                pos_id0 = Some(idx);
-            }
-            if pos_ivd.is_none()
-                && (code.contains("ivd") || code.contains("ivc") || code.contains("ifq"))
-            {
-                pos_ivd = Some(idx);
-            }
-            if pos_quad.is_none()
-                && (code.contains("F1PH")
-                    || code.contains("F2PH")
-                    || code.contains("igrad")
-                    || code.contains("ip1")
-                    || code.contains("ip3"))
-            {
-                pos_quad = Some(idx);
-            }
-        }
-        // In Bruker pulse programs, inner loops appear BEFORE outer `lo to ...` statements at the bottom:
-        if let (Some(i_t1), Some(i_vd)) = (pos_id0, pos_ivd) {
-            if i_t1 < i_vd {
-                return Pseudo3DInterleaving::PlaneQueued;
-            }
-            if let Some(i_q) = pos_quad {
-                if i_vd < i_q {
-                    return Pseudo3DInterleaving::T1QuadPlane;
-                }
-            }
-            return Pseudo3DInterleaving::T1PlaneQuad;
-        }
     }
 
-    let aqseq: i32 = acqus.get("AQSEQ").and_then(|s| s.parse().ok()).unwrap_or(0);
-    // When `acqu2s` is chemical shift (`F2` inner) and `acqu3s` is `QF` (`F1` outer) under default `AQSEQ=0` (`321`),
-    // planes are outer -> `PlaneQueued`. When `acqu2s` is `QF` (`F2` inner) and `acqu3s` is chemical shift (`F1` outer),
-    // planes step inside each `(t1, quad)` increment -> `T1QuadPlane`.
+    let nbl: usize = acqus.get("NBL").and_then(|s| s.parse().ok()).unwrap_or(1);
+    if n_planes > 1 && nbl == n_planes {
+        return Pseudo3DInterleaving::T1QuadPlane;
+    }
+
+    let aqseq: i32 = acqus
+        .get("AQSEQ")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if pp_aqseq_312 { 1 } else { 0 });
     if chem_is_acqu2s {
-        if aqseq == 1 {
+        if aqseq == 1 || pp_aqseq_312 {
             Pseudo3DInterleaving::T1QuadPlane
         } else {
             Pseudo3DInterleaving::PlaneQueued
@@ -1261,22 +2194,30 @@ fn infer_bruker_pseudo3d_interleaving(
 }
 
 /// Read a raw Bruker pseudo-3D relaxation or exchange `ser` directory (`acqus`, `acqu2s`, optional `acqu3s`,
-/// and `vdlist` / `vclist` / `fqlist`), decoding both plane-queued and $t_1$-interleaved `ser` binaries
-/// into per-plane `Fid2D` slices.
+/// and `vdlist` / `vclist` / `fqlist` or schedule-less 2-plane interleaved `hetNOE`), decoding both
+/// plane-queued and $t_1$/`NBL`-interleaved `ser` binaries into per-plane `Fid2D` slices.
 pub fn read_bruker_pseudo3d(
     dir: impl AsRef<Path>,
     interleaving_override: Option<Pseudo3DInterleaving>,
     unit_cycle_sec_for_vclist: Option<f64>,
 ) -> Result<RawPseudo3D, String> {
+    read_bruker_pseudo3d_with_schedule(dir, interleaving_override, unit_cycle_sec_for_vclist, None)
+}
+
+/// Like [`read_bruker_pseudo3d`], with an optional caller-supplied `schedule_override`
+/// (honoring explicit CLI `--delays` / `--vdlist` overrides on raw `ser` directories even when
+/// `vdlist`/`vclist`/`fqlist` is absent or superseded).
+pub fn read_bruker_pseudo3d_with_schedule(
+    dir: impl AsRef<Path>,
+    interleaving_override: Option<Pseudo3DInterleaving>,
+    unit_cycle_sec_for_vclist: Option<f64>,
+    schedule_override: Option<RelaxSchedule>,
+) -> Result<RawPseudo3D, String> {
     let dir = dir.as_ref();
     let acqus = read_merged_jcamp_local(dir, "acqus", "acqu")?;
     let acqu2s = read_merged_jcamp_local(dir, "acqu2s", "acqu2")?;
     let acqu3s = read_merged_jcamp_local(dir, "acqu3s", "acqu3").ok();
-
-    let pdata1 = dir.join("pdata").join("1");
-    let procs = read_jcamp_file_opt(&pdata1, "procs");
-    let proc2s = read_jcamp_file_opt(&pdata1, "proc2s");
-    let proc3s = read_jcamp_file_opt(&pdata1, "proc3s");
+    let pp_txt = find_file_ci_local(dir, "pulseprogram").and_then(|p| fs::read_to_string(p).ok());
 
     // Parse direct axis (`F3`/`F2`, `1H`)
     let td_x: usize = acqus
@@ -1316,13 +2257,63 @@ pub fn read_bruker_pseudo3d(
                 .map(|sw| sw * sfo1_x)
         })
         .ok_or("missing ##$SW_h / ##$SW in Bruker acqus")?;
-    let obs_x = procs
-        .as_ref()
-        .and_then(|p| p.get("SF"))
+
+    // Identify chemical-shift indirect axis (`acqu2s` vs `acqu3s`)
+    let fn2: i32 = acqu2s
+        .get("FnMODE")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let nuc2 = normalize_nuc(acqu2s.get("NUC1").map(String::as_str).unwrap_or(""), "");
+    let (chem_acqu, chem_is_acqu2s) = if let Some(ref a3) = acqu3s {
+        let fn3: i32 = a3.get("FnMODE").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let nuc3 = normalize_nuc(a3.get("NUC1").map(String::as_str).unwrap_or(""), "");
+        if fn2 <= 1 && fn3 > 1 {
+            (a3, false)
+        } else if fn2 > 1 && fn3 <= 1 {
+            (&acqu2s, true)
+        } else if matches!(nuc3.as_str(), "15N" | "13C") && !matches!(nuc2.as_str(), "15N" | "13C")
+        {
+            (a3, false)
+        } else {
+            (&acqu2s, true)
+        }
+    } else {
+        (&acqu2s, true)
+    };
+
+    let chem_label = normalize_nuc(
+        chem_acqu.get("NUC1").map(String::as_str).unwrap_or("15N"),
+        "15N",
+    );
+    let sfo1_y_raw: f64 = chem_acqu
+        .get("SFO1")
+        .or_else(|| chem_acqu.get("BF1"))
+        .ok_or("missing ##$SFO1 in Bruker indirect acqus")?
+        .parse()
+        .map_err(|e| format!("invalid indirect SFO1: {e}"))?;
+    let bf1_y: f64 = chem_acqu
+        .get("BF1")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(sfo1_y_raw);
+    let sw_hz_y: f64 = chem_acqu
+        .get("SW")
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|&v| v > 0.0)
-        .unwrap_or(bf1_x);
-    let first_ppm_x = bruker_first_ppm(procs.as_ref(), sfo1_x, obs_x, sw_hz_x);
+        .map(|sw| sw * sfo1_y_raw)
+        .or_else(|| {
+            chem_acqu
+                .get("SW_h")
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|&v| v > 0.0)
+        })
+        .ok_or("missing ##$SW / ##$SW_h in Bruker indirect acqus")?;
+
+    let (procs, chem_proc_owned) =
+        resolve_bruker_pseudo3d_proc_maps(dir, chem_is_acqu2s, &chem_label, sw_hz_x, sw_hz_y);
+    let chem_proc = chem_proc_owned.as_ref();
+
+    let obs_x = bruker_proc_valid_sf_local(procs.as_ref(), bf1_x).unwrap_or(bf1_x);
+    let first_ppm_x = bruker_first_ppm(procs.as_ref(), sfo1_x, obs_x, bf1_x, sw_hz_x);
 
     let grpdly_raw = acqus
         .get("GRPDLY")
@@ -1361,55 +2352,30 @@ pub fn read_bruker_pseudo3d(
         stored_proc: stored_x,
     };
 
-    // Identify chemical-shift indirect axis (`acqu2s` vs `acqu3s`)
-    let fn2: i32 = acqu2s
-        .get("FnMODE")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
-    let (chem_acqu, chem_proc, chem_is_acqu2s) = if let Some(ref a3) = acqu3s {
-        let fn3: i32 = a3.get("FnMODE").and_then(|s| s.parse().ok()).unwrap_or(1);
-        if fn2 == 1 && fn3 != 1 {
-            (a3, proc3s.as_ref(), false)
-        } else {
-            (&acqu2s, proc2s.as_ref(), true)
-        }
-    } else {
-        (&acqu2s, proc2s.as_ref(), true)
-    };
-
-    let sfo1_y: f64 = chem_acqu
-        .get("SFO1")
-        .or_else(|| chem_acqu.get("BF1"))
-        .ok_or("missing ##$SFO1 in Bruker indirect acqus")?
-        .parse()
-        .map_err(|e| format!("invalid indirect SFO1: {e}"))?;
-    let bf1_y: f64 = chem_acqu
-        .get("BF1")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(sfo1_y);
-    let sw_hz_y: f64 = chem_acqu
-        .get("SW")
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|&v| v > 0.0)
-        .map(|sw| sw * sfo1_y)
-        .or_else(|| {
-            chem_acqu
-                .get("SW_h")
-                .and_then(|s| s.parse::<f64>().ok())
-                .filter(|&v| v > 0.0)
-        })
-        .ok_or("missing ##$SW / ##$SW_h in Bruker indirect acqus")?;
-    let obs_y = chem_proc
-        .and_then(|p| p.get("SF"))
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|&v| v > 0.0)
-        .unwrap_or(bf1_y);
+    let sfo1_y =
+        resolve_bruker_indirect_sfo1_local(&acqus, chem_proc, &chem_label, sfo1_y_raw, bf1_y);
+    let obs_y = bruker_proc_valid_sf_local(chem_proc, bf1_y).unwrap_or(bf1_y);
     let carrier_ppm_y = (sfo1_y - obs_y) * 1.0e6 / obs_y.max(1.0e-9);
 
-    // Locate schedule file (`vdlist`, `vclist`, or `fqlist` / `fq1list` / `fq2list` / `fq3list`)
+    // Locate schedule (`schedule_override` takes precedence, then `vdlist`, `vclist`, `fqlist`, or 2-plane `hetNOE`)
     let pulprog = acqus.get("PULPROG").cloned().unwrap_or_default();
     let p_low = pulprog.to_ascii_lowercase();
-    let (schedule, exp_kind) = if let Some(vd_path) = find_file_ci_local(dir, "vdlist") {
+    let infer_kind_from_pulprog = || -> RelaxExperimentKind {
+        if p_low.contains("cpmg") || p_low.contains("rex") {
+            RelaxExperimentKind::Cpmg
+        } else if p_low.contains("t2") || p_low.contains("r2") {
+            RelaxExperimentKind::R2
+        } else if p_low.contains("t1rho") || p_low.contains("r1rho") {
+            RelaxExperimentKind::R1rho
+        } else if p_low.contains("noe") && !p_low.contains("noesy") && !p_low.contains("roesy") {
+            RelaxExperimentKind::HetNoe
+        } else {
+            RelaxExperimentKind::R1
+        }
+    };
+    let (schedule, exp_kind) = if let Some(sched_ovr) = schedule_override {
+        (sched_ovr, infer_kind_from_pulprog())
+    } else if let Some(vd_path) = find_file_ci_local(dir, "vdlist") {
         let txt = fs::read_to_string(&vd_path)
             .map_err(|e| format!("failed to read {}: {e}", vd_path.display()))?;
         let delays_sec = parse_bruker_vdlist(&txt)?;
@@ -1425,13 +2391,7 @@ pub fn read_bruker_pseudo3d(
         let txt = fs::read_to_string(&vc_path)
             .map_err(|e| format!("failed to read {}: {e}", vc_path.display()))?;
         let unit_sec = unit_cycle_sec_for_vclist.unwrap_or_else(|| {
-            // Bruker `D[20]` or `2 * D[20]` spin-echo / CPMG delay fallback (`16 ms` typical CPMG/T2 block)
-            acqus
-                .get("D")
-                .and_then(|d_arr| d_arr.split_whitespace().nth(20))
-                .and_then(|s| s.parse::<f64>().ok())
-                .filter(|&v| v > 0.0)
-                .unwrap_or(0.016)
+            infer_bruker_vclist_unit_cycle_sec(pp_txt.as_deref(), &pulprog, &acqus)
         });
         let (counts, values_sec) = parse_bruker_vclist(&txt, unit_sec)?;
         let kind = if p_low.contains("cpmg") || p_low.contains("rex") {
@@ -1459,6 +2419,14 @@ pub fn read_bruker_pseudo3d(
             RelaxSchedule::FrequencyOffsets { offsets },
             RelaxExperimentKind::Cest,
         )
+    } else if let Some(noe_sched) = infer_bruker_hetnoe_schedule(
+        pp_txt.as_deref(),
+        &pulprog,
+        &acqus,
+        &acqu2s,
+        acqu3s.as_ref(),
+    ) {
+        (noe_sched, RelaxExperimentKind::HetNoe)
     } else {
         return Err(format!(
             "missing Bruker pseudo-3D schedule file (vdlist, vclist, or fqlist) in {}",
@@ -1467,31 +2435,66 @@ pub fn read_bruker_pseudo3d(
     };
 
     let n_planes = schedule.len();
-    let fn_chem: i32 = chem_acqu
-        .get("FnMODE")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
-    let quad_y = match fn_chem {
-        1 => QuadMode::Qf,
-        4 => QuadMode::States,
-        5 => QuadMode::StatesTppi,
-        6 => QuadMode::EchoAntiecho,
-        other => {
+    let fn_chem_opt: Option<i32> = match chem_acqu.get("FnMODE") {
+        Some(raw) => Some(
+            raw.parse::<i32>()
+                .map_err(|e| format!("invalid indirect FnMODE in {}: {e}", dir.display()))?,
+        ),
+        None => None,
+    };
+    let quad_y = match fn_chem_opt {
+        None | Some(0) => {
+            if let Some(mc2_raw) = chem_proc.and_then(|p| p.get("MC2")) {
+                let mc2 = mc2_raw
+                    .trim()
+                    .parse::<i32>()
+                    .map_err(|e| format!("invalid indirect MC2 '{mc2_raw}': {e}"))?;
+                decode_bruker_proc_mc2_local(mc2, &chem_label)?
+            } else {
+                return Err(format!(
+                    "missing or undefined Bruker indirect FnMODE in {} and no proc MC2 fallback available",
+                    dir.display()
+                ));
+            }
+        }
+        Some(1) => QuadMode::Qf,
+        Some(4) => QuadMode::States,
+        Some(5) => QuadMode::StatesTppi,
+        Some(6) => QuadMode::EchoAntiecho,
+        Some(other) => {
             return Err(format!(
-                "unsupported Bruker indirect FnMODE={other} in {}",
+                "unsupported Bruker indirect FnMODE={other} in {} (expected 1=QF, 4=States, 5=States-TPPI, 6=Echo-Antiecho)",
                 dir.display()
             ));
         }
     };
     let q_mult = if quad_y == QuadMode::Qf { 1 } else { 2 };
 
+    let ser_path = find_file_ci_local(dir, "ser")
+        .ok_or_else(|| format!("missing Bruker ser binary in {}", dir.display()))?;
+    let bytes =
+        fs::read(&ser_path).map_err(|e| format!("failed to read {}: {e}", ser_path.display()))?;
+
     let td_chem_raw: usize = chem_acqu
         .get("TD")
         .ok_or("missing ##$TD in Bruker indirect acqus")?
         .parse()
         .map_err(|e| format!("invalid indirect TD: {e}"))?;
+
+    let exact_stride = td_x * word_bytes;
+    let block_stride = exact_stride.div_ceil(1024) * 1024;
     let td_per_plane_y = if acqu3s.is_none() && td_chem_raw.is_multiple_of(n_planes) {
-        td_chem_raw / n_planes
+        // Disambiguate 2D interleaved `TD = td_per_plane * n_planes` (e.g. `hsqcnoef3gpsi` where
+        // `ST1CNT = td1 / (2 * 2)`) vs `TD = td_per_plane` using physical `ser` file length.
+        let unsplit_traces = td_chem_raw * n_planes;
+        if bytes.len() >= unsplit_traces * exact_stride
+            && (bytes.len() == unsplit_traces * exact_stride
+                || bytes.len() == unsplit_traces * block_stride)
+        {
+            td_chem_raw
+        } else {
+            td_chem_raw / n_planes
+        }
     } else {
         td_chem_raw
     };
@@ -1503,31 +2506,30 @@ pub fn read_bruker_pseudo3d(
     }
     let n1 = td_per_plane_y / q_mult;
 
-    let pp_txt = find_file_ci_local(dir, "pulseprogram").and_then(|p| fs::read_to_string(p).ok());
     let mut stored_y = extract_stored_proc_jcamp(chem_proc);
     if let Some(ref mut tde) = stored_y.td_eff {
         *tde = (*tde / q_mult).min(n1).max(1);
     }
+    // In 2D (`acqu3s.is_none()`), `acqu2s` is Bruker `F1` (`d0` -> `f_dim = 1`);
+    // in 3D (`acqu3s.is_some()`), `acqu2s` is Bruker `F2` (`d10` -> `f_dim = 2`) and `acqu3s` is `F1` (`f_dim = 1`).
+    let chem_f_dim = if acqu3s.is_some() && chem_is_acqu2s {
+        2
+    } else {
+        1
+    };
     if chem_proc.and_then(|p| p.get("REVERSE")).is_none() {
-        stored_y.reverse = infer_bruker_raw_indirect_reverse(
-            pp_txt.as_deref(),
-            &pulprog,
-            if chem_is_acqu2s { 2 } else { 1 },
-            quad_y,
-        );
+        stored_y.reverse =
+            infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), &pulprog, chem_f_dim, quad_y);
     }
 
     let axis_y = FidAxisMeta {
-        label: normalize_nuc(
-            chem_acqu.get("NUC1").map(String::as_str).unwrap_or("15N"),
-            "15N",
-        ),
+        label: chem_label,
         td_raw: td_per_plane_y,
         complex_points: n1,
         sw_hz: sw_hz_y,
         obs_mhz: obs_y,
         carrier_mhz: sfo1_y,
-        first_ppm: bruker_first_ppm(chem_proc, sfo1_y, obs_y, sw_hz_y),
+        first_ppm: bruker_first_ppm(chem_proc, sfo1_y, obs_y, bf1_y, sw_hz_y),
         quad_mode: quad_y,
         states_recombined: quad_y != QuadMode::Qf,
         group_delay: 0.0,
@@ -1535,14 +2537,7 @@ pub fn read_bruker_pseudo3d(
         stored_proc: stored_y,
     };
 
-    let ser_path = find_file_ci_local(dir, "ser")
-        .ok_or_else(|| format!("missing Bruker ser binary in {}", dir.display()))?;
-    let bytes =
-        fs::read(&ser_path).map_err(|e| format!("failed to read {}: {e}", ser_path.display()))?;
-
     let total_traces = n_planes * n1 * q_mult;
-    let exact_stride = td_x * word_bytes;
-    let block_stride = exact_stride.div_ceil(1024) * 1024;
     let stride = if bytes.len() == total_traces * exact_stride {
         exact_stride
     } else if bytes.len() >= total_traces * block_stride {
@@ -1561,7 +2556,7 @@ pub fn read_bruker_pseudo3d(
     };
 
     let interleaving = interleaving_override.unwrap_or_else(|| {
-        infer_bruker_pseudo3d_interleaving(dir, pp_txt.as_deref(), &acqus, chem_is_acqu2s)
+        infer_bruker_pseudo3d_interleaving(dir, pp_txt.as_deref(), &acqus, chem_is_acqu2s, n_planes)
     });
 
     let n0 = axis_x.complex_points;
@@ -1631,6 +2626,42 @@ pub fn read_bruker_pseudo3d(
     })
 }
 
+#[inline]
+fn read_be_i32_at(bytes: &[u8], off: usize) -> Result<i32, String> {
+    let arr: [u8; 4] = bytes
+        .get(off..off + 4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| format!("unexpected EOF reading i32 at byte offset {off}"))?;
+    Ok(i32::from_be_bytes(arr))
+}
+
+#[inline]
+fn read_be_u16_at(bytes: &[u8], off: usize) -> Result<u16, String> {
+    let arr: [u8; 2] = bytes
+        .get(off..off + 2)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| format!("unexpected EOF reading u16 at byte offset {off}"))?;
+    Ok(u16::from_be_bytes(arr))
+}
+
+#[inline]
+fn read_be_i16_at(bytes: &[u8], off: usize) -> Result<i16, String> {
+    let arr: [u8; 2] = bytes
+        .get(off..off + 2)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| format!("unexpected EOF reading i16 at byte offset {off}"))?;
+    Ok(i16::from_be_bytes(arr))
+}
+
+#[inline]
+fn read_be_f32_at(bytes: &[u8], off: usize) -> Result<f32, String> {
+    let arr: [u8; 4] = bytes
+        .get(off..off + 4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| format!("unexpected EOF reading f32 at byte offset {off}"))?;
+    Ok(f32::from_be_bytes(arr))
+}
+
 /// Read a raw Varian/Agilent arrayed pseudo-3D relaxation or exchange directory (`procpar` + `fid`),
 /// supporting both plane-queued and $t_1$-interleaved (`array = "relaxT,phase"` vs `"phase,relaxT"`)
 /// datasets into per-plane `Fid2D` slices.
@@ -1658,13 +2689,13 @@ pub fn read_varian_pseudo3d(
             fid_path.display()
         ));
     }
-    let nblocks = i32::from_be_bytes(bytes[0..4].try_into().unwrap()).max(0) as usize;
-    let ntraces = i32::from_be_bytes(bytes[4..8].try_into().unwrap()).max(0) as usize;
-    let np = i32::from_be_bytes(bytes[8..12].try_into().unwrap()).max(0) as usize;
-    let ebytes = i32::from_be_bytes(bytes[12..16].try_into().unwrap()).max(0) as usize;
-    let bbytes = i32::from_be_bytes(bytes[20..24].try_into().unwrap()).max(0) as usize;
-    let status = u16::from_be_bytes(bytes[26..28].try_into().unwrap());
-    let nbheaders = i32::from_be_bytes(bytes[28..32].try_into().unwrap()).max(1) as usize;
+    let nblocks = read_be_i32_at(&bytes, 0)?.max(0) as usize;
+    let ntraces = read_be_i32_at(&bytes, 4)?.max(0) as usize;
+    let np = read_be_i32_at(&bytes, 8)?.max(0) as usize;
+    let ebytes = read_be_i32_at(&bytes, 12)?.max(0) as usize;
+    let bbytes = read_be_i32_at(&bytes, 20)?.max(0) as usize;
+    let status = read_be_u16_at(&bytes, 26)?;
+    let nbheaders = read_be_i32_at(&bytes, 28)?.max(1) as usize;
 
     if np < 2 || !np.is_multiple_of(2) {
         return Err(format!("invalid Varian np={np} in {}", fid_path.display()));
@@ -1693,22 +2724,22 @@ pub fn read_varian_pseudo3d(
             if is_float && ebytes == 4 {
                 for k in 0..n0 {
                     let p = t_off + k * 8;
-                    let re = f32::from_be_bytes(bytes[p..p + 4].try_into().unwrap()) as f64;
-                    let im = f32::from_be_bytes(bytes[p + 4..p + 8].try_into().unwrap()) as f64;
+                    let re = read_be_f32_at(&bytes, p)? as f64;
+                    let im = read_be_f32_at(&bytes, p + 4)? as f64;
                     cvec.push([re, im]);
                 }
             } else if is_32 && ebytes == 4 {
                 for k in 0..n0 {
                     let p = t_off + k * 8;
-                    let re = i32::from_be_bytes(bytes[p..p + 4].try_into().unwrap()) as f64;
-                    let im = i32::from_be_bytes(bytes[p + 4..p + 8].try_into().unwrap()) as f64;
+                    let re = read_be_i32_at(&bytes, p)? as f64;
+                    let im = read_be_i32_at(&bytes, p + 4)? as f64;
                     cvec.push([re, im]);
                 }
             } else if ebytes == 2 {
                 for k in 0..n0 {
                     let p = t_off + k * 4;
-                    let re = i16::from_be_bytes(bytes[p..p + 2].try_into().unwrap()) as f64;
-                    let im = i16::from_be_bytes(bytes[p + 2..p + 4].try_into().unwrap()) as f64;
+                    let re = read_be_i16_at(&bytes, p)? as f64;
+                    let im = read_be_i16_at(&bytes, p + 2)? as f64;
                     cvec.push([re, im]);
                 }
             } else {
@@ -1951,10 +2982,46 @@ pub fn process_pseudo3d_fids(
 
     let mut locked = match recipe_override {
         Some(r) => r.clone(),
-        None => ProcessingRecipe::from_fid_2d(&fids[ref_idx]),
+        None => {
+            let mut r = ProcessingRecipe::from_fid_2d(&fids[ref_idx]);
+            // When Bruker DSP oversampling (`group_delay > 0`) is active, stored `pdata` `PHC0`
+            // reflects TopSpin's `PKNL` time-origin rather than `remove_digital_filter`; solve
+            // pure-absorption direct-axis `(p0, p1)` via Chen et al. (2002) on `ref_idx` and lock.
+            if fids[ref_idx].vendor == FidVendor::Bruker
+                && fids[ref_idx].axis_x.group_delay > 0.0
+                && !r.dims.is_empty()
+            {
+                r.dims[0].p0_deg = None;
+                r.dims[0].p1_deg = None;
+                r.dims[0].phase_source = PhaseSource::AutoChen2002;
+            }
+            r
+        }
     };
 
-    let ref_spec = process_fid_2d_mut(&fids[ref_idx], &mut locked)?;
+    let mut ref_spec = process_fid_2d_mut(&fids[ref_idx], &mut locked)?;
+    // Enforce canonical positive-absorption polarity on the reference plane when auto-phased
+    if recipe_override.is_none() && !locked.dims.is_empty() {
+        let mad = estimate_plane_noise_mad_2d(&ref_spec).max(1.0e-12);
+        let thr = 6.0 * mad;
+        let mut pos_e = 0.0_f64;
+        let mut neg_e = 0.0_f64;
+        for &v in &ref_spec.data {
+            let vf = v as f64;
+            if vf > thr {
+                pos_e += vf * vf;
+            } else if vf < -thr {
+                neg_e += vf * vf;
+            }
+        }
+        if neg_e > 2.0 * pos_e && neg_e > 0.0 {
+            let cur_p0 = locked.dims[0].p0_deg.unwrap_or(0.0);
+            locked.dims[0].p0_deg = Some(cur_p0 + 180.0);
+            for v in &mut ref_spec.data {
+                *v = -*v;
+            }
+        }
+    }
     // Lock resolved phases explicitly so low-SNR or inverted planes never re-run auto-phasing
     for d in &mut locked.dims {
         let p0 = d.p0_deg.unwrap_or(0.0);
@@ -2720,6 +3787,210 @@ fn build_reference_composite(
     planes[best_p].clone()
 }
 
+/// Transpose a 2D spectrum whose axes are `(axis_x = 15N/13C, axis_y = 1H)` into canonical
+/// `(axis_x = 1H, axis_y = 15N/13C)` layout so seed `(delta_h_ppm, delta_x_ppm)` coordinates map cleanly.
+fn spectrum_2d_needs_hn_transpose(sp: &Spectrum2D) -> bool {
+    let lx = normalize_nuc(&sp.axis_x.label, "");
+    let ly = normalize_nuc(&sp.axis_y.label, "");
+    if matches!(lx.as_str(), "15N" | "13C") && ly == "1H" {
+        return true;
+    }
+    if lx != "1H"
+        && sp.axis_x.first_ppm.abs() > 35.0
+        && sp.axis_y.first_ppm.abs() > 0.0
+        && sp.axis_y.first_ppm.abs() < 25.0
+    {
+        return true;
+    }
+    false
+}
+
+fn transpose_spectrum_2d_local(sp: &Spectrum2D) -> Spectrum2D {
+    let old_nx = sp.nx();
+    let old_ny = sp.ny();
+    let mut data = vec![0.0_f32; old_nx * old_ny];
+    for iy in 0..old_ny {
+        for ix in 0..old_nx {
+            // New `x` is old `y` (`1H`, length `old_ny`); new `y` is old `x` (`15N/13C`, length `old_nx`).
+            data[ix * old_ny + iy] = sp.data[iy * old_nx + ix];
+        }
+    }
+    Spectrum2D {
+        name: sp.name.clone(),
+        axis_x: sp.axis_y.clone(),
+        axis_y: sp.axis_x.clone(),
+        data,
+    }
+}
+
+/// Estimate a rigid global 2D chemical-shift referencing offset `(Delta_H_ppm, Delta_X_ppm)`
+/// (`spec_ppm - seed_ppm`, e.g. DSS vs H2O carrier temperature calibration differences up to
+/// `+-0.35 ppm` in `1H` and `+-2.5 ppm` in `15N`/`13C`) by 2D consensus Hough voting against
+/// local maxima on the highest-SNR plane. Requires `>= 6` seeds and `>= 45%` inlier consensus.
+fn align_seeds_global_referencing_2d(
+    planes: &[Spectrum2D],
+    plane_mad: &[f64],
+    seeds: &[TargetPeakSeed],
+) -> Vec<TargetPeakSeed> {
+    if seeds.len() < 6 || planes.is_empty() {
+        return seeds.to_vec();
+    }
+    let best_p = planes
+        .iter()
+        .enumerate()
+        .max_by(|(ia, sa), (ib, sb)| {
+            let ma = plane_mad[*ia].max(1.0e-12);
+            let mb = plane_mad[*ib].max(1.0e-12);
+            let ea: f64 = sa
+                .data
+                .iter()
+                .map(|&v| ((v as f64) / ma).max(0.0).powi(2))
+                .sum();
+            let eb: f64 = sb
+                .data
+                .iter()
+                .map(|&v| ((v as f64) / mb).max(0.0).powi(2))
+                .sum();
+            ea.total_cmp(&eb)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let sp = &planes[best_p];
+    let nx = sp.nx();
+    let ny = sp.ny();
+    if nx < 8 || ny < 8 {
+        return seeds.to_vec();
+    }
+    let thr = (5.5 * plane_mad[best_p]).max(1.0e-12);
+    let mut maxima: Vec<(f64, f64, f64)> = Vec::new();
+    for iy in 1..(ny - 1) {
+        for ix in 1..(nx - 1) {
+            let v = sp.get(ix, iy) as f64;
+            if v < thr {
+                continue;
+            }
+            let mut is_max = true;
+            'nbr: for dy in -1isize..=1 {
+                for dx in -1isize..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nv =
+                        sp.get((ix as isize + dx) as usize, (iy as isize + dy) as usize) as f64;
+                    if nv > v {
+                        is_max = false;
+                        break 'nbr;
+                    }
+                }
+            }
+            if is_max {
+                maxima.push((
+                    sp.axis_x.index_to_ppm(ix as f64),
+                    sp.axis_y.index_to_ppm(iy as f64),
+                    v,
+                ));
+            }
+        }
+    }
+    if maxima.len() < 6 {
+        return seeds.to_vec();
+    }
+    maxima.sort_by(|a, b| b.2.total_cmp(&a.2));
+    if maxima.len() > 4 * seeds.len() {
+        maxima.truncate(4 * seeds.len());
+    }
+
+    // Candidate translations from seed-to-peak pairs within physical referencing window
+    let mut cand_shifts: Vec<(f64, f64)> = vec![(0.0, 0.0)];
+    for s in seeds {
+        for &(ph, px, _) in &maxima {
+            let dh = ph - s.delta_h_ppm;
+            let dx = px - s.delta_x_ppm;
+            if dh.abs() <= 0.35 && dx.abs() <= 2.5 {
+                cand_shifts.push((dh, dx));
+            }
+        }
+    }
+
+    let tol_h = 0.028_f64;
+    let tol_x = 0.28_f64;
+    let mut best_inliers = 0usize;
+    let mut best_pen = f64::INFINITY;
+    let mut best_shift = (0.0_f64, 0.0_f64);
+
+    for &(ch, cx) in &cand_shifts {
+        let mut inliers = 0usize;
+        let mut pen = 0.0_f64;
+        for s in seeds {
+            let th = s.delta_h_ppm + ch;
+            let tx = s.delta_x_ppm + cx;
+            let mut min_d2 = f64::INFINITY;
+            for &(ph, px, _) in &maxima {
+                let eh = (ph - th) / tol_h;
+                let ex = (px - tx) / tol_x;
+                let d2 = eh * eh + ex * ex;
+                if d2 < min_d2 {
+                    min_d2 = d2;
+                }
+            }
+            if min_d2 <= 1.0 {
+                inliers += 1;
+                pen += min_d2;
+            }
+        }
+        if inliers > best_inliers || (inliers == best_inliers && pen < best_pen) {
+            best_inliers = inliers;
+            best_pen = pen;
+            best_shift = (ch, cx);
+        }
+    }
+
+    let min_consensus = (seeds.len() * 9).div_ceil(20).max(6);
+    if best_inliers < min_consensus {
+        return seeds.to_vec();
+    }
+
+    // Refine `(Delta_H, Delta_X)` via median residual over matched inliers
+    let mut dhs = Vec::with_capacity(best_inliers);
+    let mut dxs = Vec::with_capacity(best_inliers);
+    for s in seeds {
+        let th = s.delta_h_ppm + best_shift.0;
+        let tx = s.delta_x_ppm + best_shift.1;
+        let mut best_match: Option<(f64, f64, f64)> = None;
+        for &(ph, px, _) in &maxima {
+            let eh = (ph - th) / tol_h;
+            let ex = (px - tx) / tol_x;
+            let d2 = eh * eh + ex * ex;
+            if d2 <= 1.25 && best_match.is_none_or(|m| d2 < m.2) {
+                best_match = Some((ph - s.delta_h_ppm, px - s.delta_x_ppm, d2));
+            }
+        }
+        if let Some((rh, rx, _)) = best_match {
+            dhs.push(rh);
+            dxs.push(rx);
+        }
+    }
+    if dhs.len() < min_consensus {
+        return seeds.to_vec();
+    }
+    let med_dh = median_f64(&mut dhs);
+    let med_dx = median_f64(&mut dxs);
+    if med_dh.abs() < 1.0e-4 && med_dx.abs() < 1.0e-3 {
+        return seeds.to_vec();
+    }
+    seeds
+        .iter()
+        .map(|s| TargetPeakSeed {
+            seq_id: s.seq_id,
+            res_name: s.res_name.clone(),
+            atom_h: s.atom_h.clone(),
+            atom_x: s.atom_x.clone(),
+            delta_h_ppm: s.delta_h_ppm + med_dh,
+            delta_x_ppm: s.delta_x_ppm + med_dx,
+        })
+        .collect()
+}
+
 /// Integrate a stack of pre-processed `Spectrum2D` planes using **shared/locked 2D Gaussian/Voigt
 /// footprints** and connected-component linear least squares, with 2D MAD + duplicate-delay
 /// replicate variance pooling.
@@ -2745,19 +4016,28 @@ pub fn integrate_relax_planes(
         return Err("integrate_relax_planes requires at least 1 TargetPeakSeed".to_string());
     }
 
-    let nx = planes[0].nx();
-    let ny = planes[0].ny();
+    let nx0 = planes[0].nx();
+    let ny0 = planes[0].ny();
     for (idx, sp) in planes.iter().enumerate() {
-        if sp.nx() != nx || sp.ny() != ny || sp.data.len() != nx * ny {
+        if sp.nx() != nx0 || sp.ny() != ny0 || sp.data.len() != nx0 * ny0 {
             return Err(format!(
-                "plane {idx} grid dimensions ({}x{}) do not match plane 0 ({nx}x{ny})",
+                "plane {idx} grid dimensions ({}x{}) do not match plane 0 ({nx0}x{ny0})",
                 sp.nx(),
                 sp.ny()
             ));
         }
     }
 
+    let transposed_owned: Option<Vec<Spectrum2D>> = if spectrum_2d_needs_hn_transpose(&planes[0]) {
+        Some(planes.iter().map(transpose_spectrum_2d_local).collect())
+    } else {
+        None
+    };
+    let planes: &[Spectrum2D] = transposed_owned.as_deref().unwrap_or(planes);
+
     let plane_noise_mad: Vec<f64> = planes.iter().map(estimate_plane_noise_mad_2d).collect();
+    let aligned_seeds = align_seeds_global_referencing_2d(planes, &plane_noise_mad, seeds);
+    let seeds: &[TargetPeakSeed] = &aligned_seeds;
     let ref_spec = build_reference_composite(
         planes,
         &plane_noise_mad,
@@ -3396,7 +4676,9 @@ pub fn parse_relax_series_tsv_str(text: &str) -> Result<RelaxSeriesDataset, Stri
 
     let mut traces = Vec::with_capacity(res_order.len());
     for key in res_order {
-        let (fp, mut pmap) = res_rows.remove(&key).unwrap();
+        let Some((fp, mut pmap)) = res_rows.remove(&key) else {
+            continue;
+        };
         let mut intensities = Vec::with_capacity(n_planes);
         let mut sigmas = Vec::with_capacity(n_planes);
         let mut volumes = Vec::with_capacity(n_planes);
@@ -3807,7 +5089,9 @@ pub fn parse_relax_series_nef_str(nef_text: &str) -> Result<RelaxSeriesDataset, 
 
     let mut traces = Vec::with_capacity(res_order.len());
     for key in res_order {
-        let (fp, mut pmap) = res_rows.remove(&key).unwrap();
+        let Some((fp, mut pmap)) = res_rows.remove(&key) else {
+            continue;
+        };
         let mut intensities = Vec::with_capacity(n_planes);
         let mut sigmas = Vec::with_capacity(n_planes);
         let mut volumes = Vec::with_capacity(n_planes);

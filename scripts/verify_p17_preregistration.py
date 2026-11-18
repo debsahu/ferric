@@ -59,6 +59,13 @@ EXPECTED_GATES: Tuple[str, ...] = (
     "F17",
 )
 
+# Immutable SHA-256 of the executed Phase 17 W1 single-shot pre-registration manifest (`TODO.md` line 167).
+# In post-`v0.13.0` repositories (`v0.14.0`+), historical verification checks this manifest against the
+# completed `v0.13.0` Phase 17 freeze boundary tag (`v0.13.0:crates` & `frozen_w1_commit:Cargo.lock`).
+HISTORICAL_P17_W1_MANIFEST_SHA256: str = (
+    "34b19655a64265a1c592ac9438c0a61760d7326c33f2808e7495c90d6d595873"
+)
+
 STRICT_LICENSE_ALLOWLIST: Set[str] = {
     "CC0",
     "CC-BY-4.0",
@@ -654,10 +661,96 @@ def stamp_current_freeze(
     return validate_preregistration(repo_root, mpath)
 
 
+def _git_blob_bytes_and_sha256(repo_root: Path, rev_spec: str) -> Optional[Tuple[int, str]]:
+    """Read raw git blob ``rev_spec`` (e.g. ``v0.13.0:crates/nmr-core/src/modelfree.rs``) and return ``(bytes, sha256)``."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "cat-file", "-p", rev_spec],
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = proc.stdout
+    return len(raw), hashlib.sha256(raw).hexdigest()
+
+
+def _validate_modelfree_fallback_overrides(
+    gate_id: str,
+    g: Dict[str, Any],
+    errors: List[str],
+) -> None:
+    """Enforce F28(5): any `modelfree` gate with non-primary fallback proteins MUST supply
+    explicit per-target `fallback_threshold_overrides` on every `tau_m` and `D_par/D_perp`
+    criterion so primary-protein constants (e.g. ubiquitin `tau_m = 4.09 ns`, `D_par/D_perp = 1.17`)
+    never leak onto distinct fallback proteins (`17.5b:P2-2`).
+    """
+    cli_low = str(g.get("exact_cli_command_template", "")).lower()
+    criteria = g.get("pass_criteria")
+    if not isinstance(criteria, list):
+        return
+    has_rot_diff_criterion = any(
+        isinstance(c, dict)
+        and isinstance(c.get("metric"), str)
+        and any(tok in c["metric"].lower() for tok in ("tau_m", "d_par", "d_perp"))
+        for c in criteria
+    )
+    if "modelfree" not in cli_low and not has_rot_diff_criterion:
+        return
+
+    fallback_accs: List[str] = []
+    prim = g.get("primary_datasets")
+    if isinstance(prim, list):
+        for ds in prim[1:]:
+            if isinstance(ds, dict) and isinstance(ds.get("accession_id"), str) and ds["accession_id"].strip():
+                fallback_accs.append(ds["accession_id"].strip())
+    bkp = g.get("backup_datasets")
+    if isinstance(bkp, list):
+        for ds in bkp:
+            if isinstance(ds, dict) and isinstance(ds.get("accession_id"), str) and ds["accession_id"].strip():
+                fallback_accs.append(ds["accession_id"].strip())
+
+    if not fallback_accs:
+        return
+
+    for idx, crit in enumerate(criteria):
+        if not isinstance(crit, dict):
+            continue
+        metric = crit.get("metric")
+        if not isinstance(metric, str):
+            continue
+        m_low = metric.lower()
+        is_tau_m = "tau_m" in m_low
+        is_aniso = "d_par" in m_low or "d_perp" in m_low
+        if not (is_tau_m or is_aniso):
+            continue
+        cid = crit.get("id", f"idx_{idx}")
+        clabel = f"gates.{gate_id}.pass_criteria[{idx}] ({cid})"
+        overrides = crit.get("fallback_threshold_overrides")
+        if not isinstance(overrides, dict) or not overrides:
+            errors.append(
+                f"{clabel} evaluates protein-specific rotational diffusion (`{metric}`) on a gate with "
+                f"non-primary fallback targets {fallback_accs}, but is missing `fallback_threshold_overrides` "
+                f"for `tau_m` / `D_par/D_perp` (F28 / 17.5b:P2-2 guard)"
+            )
+            continue
+        missing_accs = [acc for acc in fallback_accs if acc not in overrides]
+        if missing_accs:
+            errors.append(
+                f"{clabel}.fallback_threshold_overrides missing explicit protein-specific override(s) "
+                f"for non-primary fallback target(s): {missing_accs} (F28 / 17.5b:P2-2 guard)"
+            )
+
+
 def validate_preregistration(
     repo_root: Path,
     manifest_path: Optional[Path] = None,
     extra_private_dirs: Optional[Sequence[Path]] = None,
+    *,
+    strict_fallback_overrides: bool = False,
+    enforce_active_freeze: bool = False,
 ) -> Tuple[List[str], Dict[str, Any]]:
     """Run all Phase 17 pre-registration checks; return ``(errors, summary_stats)``."""
     errors: List[str] = []
@@ -667,6 +760,7 @@ def validate_preregistration(
     if not mpath.is_file():
         return [f"missing pre-registration manifest: {mpath}"], stats
 
+    manifest_sha256 = _sha256_file(mpath)
     try:
         manifest = json.loads(mpath.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -674,6 +768,23 @@ def validate_preregistration(
 
     if not isinstance(manifest, dict):
         return [f"{mpath}: top-level JSON value must be an object"], stats
+
+    # Detect post-`v0.13.0` historical archive mode: the immutable `34b19655...` Phase 17 W1 manifest
+    # is verified against the `v0.13.0` Phase 17 freeze boundary tag once post-freeze development (`v0.14.0`+) advances `HEAD`.
+    post_v0130_archive = False
+    if (
+        not enforce_active_freeze
+        and manifest_sha256 == HISTORICAL_P17_W1_MANIFEST_SHA256
+        and (repo_root / ".git").exists()
+    ):
+        rc_tag, tag_commit, _ = _run_git(repo_root, ["rev-parse", "--verify", "v0.13.0^{commit}"])
+        rc_head, cur_head, _ = _run_git(repo_root, ["rev-parse", "HEAD"])
+        if rc_tag == 0 and rc_head == 0 and tag_commit != cur_head:
+            rc_anc_tag, _, _ = _run_git(
+                repo_root, ["merge-base", "--is-ancestor", tag_commit, "HEAD"]
+            )
+            if rc_anc_tag == 0:
+                post_v0130_archive = True
 
     # 1. Top-level metadata, whole-crates/ + Cargo.lock freeze & protocol invariants
     if not _is_strict_int(manifest.get("schema_version")) or manifest["schema_version"] != 1:
@@ -720,7 +831,14 @@ def validate_preregistration(
         cargo_lock_sha = ""
 
     cargo_lock_path = repo_root / "Cargo.lock"
-    if not cargo_lock_path.is_file():
+    if post_v0130_archive and frozen_w1_commit and _is_strict_int(cargo_lock_bytes) and cargo_lock_sha:
+        blob_info = _git_blob_bytes_and_sha256(repo_root, f"{frozen_w1_commit}:Cargo.lock")
+        if blob_info is None or blob_info != (cargo_lock_bytes, cargo_lock_sha):
+            errors.append(
+                f"historical 17.W1 Cargo.lock mismatch at `{frozen_w1_commit}:Cargo.lock` "
+                f"(expected {cargo_lock_sha} [{cargo_lock_bytes} B], got {blob_info!r})"
+            )
+    elif not cargo_lock_path.is_file():
         errors.append(f"missing Cargo.lock at {cargo_lock_path}")
     elif _is_strict_int(cargo_lock_bytes) and cargo_lock_sha:
         actual_lock_bytes = cargo_lock_path.stat().st_size
@@ -750,15 +868,16 @@ def validate_preregistration(
                     f"frozen_w1_commit {frozen_w1_commit} is not an ancestor of current HEAD"
                 )
 
+            target_tree_ref = "v0.13.0:crates" if post_v0130_archive else "HEAD:crates"
             rc_w1_tree, w1_tree, err_w1_tree = _run_git(
                 repo_root, ["rev-parse", f"{frozen_w1_commit}:crates"]
             )
             rc_head_tree, head_tree, err_head_tree = _run_git(
-                repo_root, ["rev-parse", "HEAD:crates"]
+                repo_root, ["rev-parse", target_tree_ref]
             )
             if rc_w1_tree != 0 or rc_head_tree != 0:
                 errors.append(
-                    f"git rev-parse :crates failed: w1={err_w1_tree!r}, head={err_head_tree!r}"
+                    f"git rev-parse :crates failed: w1={err_w1_tree!r}, ref={err_head_tree!r}"
                 )
             else:
                 if w1_tree != frozen_crates_tree:
@@ -768,27 +887,29 @@ def validate_preregistration(
                     )
                 if head_tree != w1_tree:
                     errors.append(
-                        f"whole-crates/ git tree freeze violation: `HEAD:crates` ({head_tree}) != "
+                        f"whole-crates/ git tree freeze violation: `{target_tree_ref}` ({head_tree}) != "
                         f"`{frozen_w1_commit[:12]}:crates` ({w1_tree})"
                     )
 
-            rc_diff, _, _ = _run_git(
-                repo_root, ["diff", "--quiet", frozen_w1_commit, "--", "crates/", "Cargo.lock"]
-            )
-            if rc_diff != 0:
-                errors.append(
-                    f"git diff violation against {frozen_w1_commit[:12]} in `crates/` or `Cargo.lock`"
+            if not post_v0130_archive:
+                rc_diff, _, _ = _run_git(
+                    repo_root, ["diff", "--quiet", frozen_w1_commit, "--", "crates/", "Cargo.lock"]
                 )
+                if rc_diff != 0:
+                    errors.append(
+                        f"git diff violation against {frozen_w1_commit[:12]} in `crates/` or `Cargo.lock`"
+                    )
 
-        rc_stat, stat_out, stat_err = _run_git(
-            repo_root, ["status", "--porcelain", "--", "crates/", "Cargo.lock"]
-        )
-        if rc_stat != 0:
-            errors.append(f"git status --porcelain failed: {stat_err}")
-        elif stat_out:
-            errors.append(
-                f"unclean git status in `crates/` or `Cargo.lock`: {stat_out.splitlines()[0]!r}"
+        if not post_v0130_archive:
+            rc_stat, stat_out, stat_err = _run_git(
+                repo_root, ["status", "--porcelain", "--", "crates/", "Cargo.lock"]
             )
+            if rc_stat != 0:
+                errors.append(f"git status --porcelain failed: {stat_err}")
+            elif stat_out:
+                errors.append(
+                    f"unclean git status in `crates/` or `Cargo.lock`: {stat_out.splitlines()[0]!r}"
+                )
 
     if manifest.get("zero_data_payload_bytes_downloaded_at_registration") is not True:
         errors.append("zero_data_payload_bytes_downloaded_at_registration must be strictly `true`")
@@ -871,7 +992,7 @@ def validate_preregistration(
             )
             if not isinstance(wgsl_files, list) or not wgsl_files:
                 errors.append("rule_1_solver_and_shader_freeze.protected_wgsl_shaders must be non-empty")
-            elif disk_wgsl and set(wgsl_files) != set(disk_wgsl):
+            elif not post_v0130_archive and disk_wgsl and set(wgsl_files) != set(disk_wgsl):
                 errors.append(
                     f"protected_wgsl_shaders mismatch vs disk shaders: manifest={sorted(wgsl_files)} disk={disk_wgsl}"
                 )
@@ -935,12 +1056,21 @@ def validate_preregistration(
                             errors.append(
                                 f"non-exception file {rel_path} has w1_enforced_sha256 != v0120_baseline_sha256"
                             )
-                    abs_path = repo_root / rel_path
-                    if not abs_path.is_file():
-                        errors.append(f"protected solver/shader file missing on disk: {rel_path}")
-                        continue
-                    actual_bytes = abs_path.stat().st_size
-                    actual_sha = _sha256_file(abs_path)
+                    if post_v0130_archive:
+                        blob_info = _git_blob_bytes_and_sha256(repo_root, f"v0.13.0:{rel_path}")
+                        if blob_info is None:
+                            errors.append(
+                                f"protected solver/shader file missing at v0.13.0 tag: {rel_path}"
+                            )
+                            continue
+                        actual_bytes, actual_sha = blob_info
+                    else:
+                        abs_path = repo_root / rel_path
+                        if not abs_path.is_file():
+                            errors.append(f"protected solver/shader file missing on disk: {rel_path}")
+                            continue
+                        actual_bytes = abs_path.stat().st_size
+                        actual_sha = _sha256_file(abs_path)
                     if actual_sha != rec["sha256"] or actual_bytes != rec["bytes"]:
                         errors.append(
                             f"protected solver/shader file modified vs 17.W1 pinned freeze: {rel_path} "
@@ -1129,6 +1259,8 @@ def validate_preregistration(
                     )
 
             _validate_cli_and_bound_parameters(gate_id, g, errors)
+            if strict_fallback_overrides or manifest_sha256 != HISTORICAL_P17_W1_MANIFEST_SHA256:
+                _validate_modelfree_fallback_overrides(gate_id, g, errors)
 
             adapter = g.get("deterministic_format_adapter_spec")
             if (
@@ -1337,6 +1469,38 @@ def _build_minimal_fixture_repo(tmp_root: Path, real_repo: Path) -> Tuple[Path, 
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
 
+    # Upgrade the fixture manifest with explicit F28(5) protein-specific `fallback_threshold_overrides`
+    # on F10 `tau_m` (F10-C1) and `D_par/D_perp` (F10-C2) for all non-primary fallback targets so
+    # new manifests pass the mandatory F28(5) / 17.5b:P2-2 guard!
+    fixture_mpath = tmp_root / "data" / "benchmark" / "p17_empirical_preregistration.json"
+    fixture_mobj = json.loads(fixture_mpath.read_text(encoding="utf-8"))
+    f10_gate = fixture_mobj.get("gates", {}).get("F10", {})
+    f10_non_primary = [
+        ds["accession_id"]
+        for ds in (f10_gate.get("primary_datasets", [])[1:] + f10_gate.get("backup_datasets", []))
+        if isinstance(ds, dict) and "accession_id" in ds
+    ]
+    for crit in f10_gate.get("pass_criteria", []):
+        if isinstance(crit, dict) and isinstance(crit.get("metric"), str):
+            m_low = crit["metric"].lower()
+            if "tau_m" in m_low or "d_par" in m_low or "d_perp" in m_low:
+                ov = dict(crit.get("fallback_threshold_overrides") or {})
+                for acc in f10_non_primary:
+                    ov.setdefault(acc, float(crit["threshold"]))
+                crit["fallback_threshold_overrides"] = ov
+    # Sync `v0120_baseline_sha256` in the isolated temp fixture to the fixture's copied `crates/` baseline
+    r1_fix = fixture_mobj.get("protocol_rules", {}).get("rule_1_solver_and_shader_freeze", {})
+    v0120_fix = r1_fix.setdefault("v0120_baseline_sha256", {})
+    fix_wgsl = sorted(
+        p.relative_to(tmp_root).as_posix()
+        for p in (tmp_root / "crates" / "nmr-gpu" / "src" / "shaders").glob("*.wgsl")
+    )
+    for rel_p in sorted(set(REQUIRED_PROTECTED_CORE_FILES) | set(fix_wgsl)):
+        if rel_p not in ALLOWED_PRE_DOWNLOAD_EXCEPTION_FILES:
+            fp = tmp_root / rel_p
+            v0120_fix[rel_p] = {"bytes": fp.stat().st_size, "sha256": _sha256_file(fp)}
+    fixture_mpath.write_text(json.dumps(fixture_mobj, indent=2) + "\n", encoding="utf-8")
+
     (tmp_root / ".gitignore").write_text("data/private/\n", encoding="utf-8")
     (tmp_root / "data" / "private").mkdir(parents=True, exist_ok=True)
     (tmp_root / "data" / "private" / ".gitkeep").write_text("", encoding="utf-8")
@@ -1375,16 +1539,25 @@ def _build_minimal_fixture_repo(tmp_root: Path, real_repo: Path) -> Tuple[Path, 
 
 
 def run_self_tests(real_repo: Path) -> int:
-    """Execute live repository check plus 14 adversarial mutation unit tests."""
+    """Execute live repository check plus 16 adversarial mutation unit tests (including F28(5) fallback guards)."""
     live_errors, live_stats = validate_preregistration(real_repo)
     if live_errors:
-        print("FAIL [self-test 0/14: live repository check]:", file=sys.stderr)
+        print("FAIL [self-test 0/16: live repository check]:", file=sys.stderr)
         for err in live_errors:
             print(f"  - {err}", file=sys.stderr)
         return 1
 
+    # Also verify that `strict_fallback_overrides=True` deterministically catches the historical 17.5b:P2-2 leak!
+    strict_hist_errs, _ = validate_preregistration(real_repo, strict_fallback_overrides=True)
+    if not any("17.5b:P2-2" in e and "F10" in e for e in strict_hist_errs):
+        print(
+            f"FAIL [self-test: strict_fallback_overrides failed to flag historical F10 17.5b:P2-2 leak]: {strict_hist_errs}",
+            file=sys.stderr,
+        )
+        return 1
+
     cases_passed = 0
-    total_cases = 14
+    total_cases = 16
 
     def _write_manifest(root: Path, obj: Dict[str, Any]) -> Path:
         p = root / "data" / "benchmark" / "p17_empirical_preregistration.json"
@@ -1600,6 +1773,32 @@ def run_self_tests(real_repo: Path) -> int:
         _write_manifest(clean_root, base_manifest)
         cases_passed += 1
 
+        # Case 15 (F28 / 17.5b:P2-2): Omitting `fallback_threshold_overrides` on modelfree `tau_m` or `D_par/D_perp`
+        # criteria when non-primary fallback proteins are registered MUST fail!
+        m15 = copy.deepcopy(base_manifest)
+        del m15["gates"]["F10"]["pass_criteria"][0]["fallback_threshold_overrides"]
+        del m15["gates"]["F10"]["pass_criteria"][1]["fallback_threshold_overrides"]
+        _write_manifest(clean_root, m15)
+        errs_f28_missing, _ = validate_preregistration(clean_root)
+        assert any(
+            "F10.pass_criteria[0]" in e and "17.5b:P2-2" in e for e in errs_f28_missing
+        ), f"Case 15a failed to reject missing tau_m fallback_threshold_overrides: {errs_f28_missing}"
+        assert any(
+            "F10.pass_criteria[1]" in e and "17.5b:P2-2" in e for e in errs_f28_missing
+        ), f"Case 15b failed to reject missing D_par/D_perp fallback_threshold_overrides: {errs_f28_missing}"
+        cases_passed += 1
+
+        # Case 16 (F28 / 17.5b:P2-2): Partial `fallback_threshold_overrides` omitting a backup protein (`BMRB:6243`) MUST fail!
+        m16 = copy.deepcopy(base_manifest)
+        del m16["gates"]["F10"]["pass_criteria"][1]["fallback_threshold_overrides"]["BMRB:6243"]
+        _write_manifest(clean_root, m16)
+        errs_f28_partial, _ = validate_preregistration(clean_root)
+        assert any(
+            "BMRB:6243" in e and "17.5b:P2-2" in e for e in errs_f28_partial
+        ), f"Case 16 failed to reject partial fallback_threshold_overrides omitting BMRB:6243: {errs_f28_partial}"
+        _write_manifest(clean_root, base_manifest)
+        cases_passed += 1
+
     print(
         f"OK [self-test]: live manifest verified + {cases_passed}/{total_cases} adversarial rejection tests passed "
         f"(manifest SHA-256 = {live_stats['manifest_sha256'][:16]}...)"
@@ -1619,7 +1818,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="Run live validation plus 14 isolated adversarial rejection unit tests.",
+        help="Run live validation plus 16 isolated adversarial rejection unit tests.",
+    )
+    parser.add_argument(
+        "--strict-fallback-overrides",
+        action="store_true",
+        help="Enforce F28(5) tau_m & D_par/D_perp fallback_threshold_overrides even on historical manifests.",
     )
     parser.add_argument(
         "--stamp-current-freeze",
@@ -1667,7 +1871,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return rc
 
     if args.check:
-        errors, stats = validate_preregistration(repo_root, args.manifest)
+        errors, stats = validate_preregistration(
+            repo_root,
+            args.manifest,
+            strict_fallback_overrides=args.strict_fallback_overrides,
+        )
         if errors:
             print("FAIL [verify_p17_preregistration]:", file=sys.stderr)
             for err in errors:

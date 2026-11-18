@@ -135,6 +135,7 @@ def _extract_relax_loop_rows(
     kind: str,
     unit_mode: str,
     mm_scale: float,
+    default_rel_sigma: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     val_c = lp.find_col(
         [
@@ -220,8 +221,14 @@ def _extract_relax_loop_rows(
             rate_sig = abs(raw_err) if raw_err is not None else 0.0
 
         if rate_sig <= 0.0:
-            # Conservative fallback only if Val_err cell is missing; BMRB tables provide Val_err.
-            continue
+            if default_rel_sigma is None:
+                continue
+            if kind == "hetNOE":
+                rate_sig = default_rel_sigma * max(abs(rate_val), 1.0)
+            else:
+                rate_sig = default_rel_sigma * abs(rate_val)
+            if rate_sig <= 0.0:
+                continue
 
         rows_out[seq_id] = {
             "seq_id": seq_id,
@@ -239,6 +246,7 @@ def extract_nmrstar_relaxation_tables(
     *,
     accession_id: Optional[str] = None,
     only_600_mhz: bool = False,
+    default_rel_sigma: Optional[float] = None,
     manifest: Optional[Mapping[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Extract R1, R2, and hetNOE tables from NMR-STAR text without reading ``_Order_param``.
@@ -246,6 +254,8 @@ def extract_nmrstar_relaxation_tables(
     Applies Rule P17-R2 ``relaxation_time_to_rate`` (`R = 1/T`, `sigma_R = sigma_T / T^2`)
     and ``bmrb6470_dual_field_saveframe_disambiguation`` (`median(T1_A) > median(T1_B) => 600.13 vs 360.13 MHz`).
     """
+    if default_rel_sigma is not None and (default_rel_sigma <= 0.0 or default_rel_sigma >= 1.0):
+        raise ValueError(f"default_rel_sigma must be strictly inside (0.0, 1.0), got {default_rel_sigma}")
     if accession_id is not None:
         assert_not_excluded_contaminated_entry(accession_id, manifest)
     mf = manifest if manifest is not None else load_preregistration_manifest()
@@ -269,7 +279,14 @@ def extract_nmrstar_relaxation_tables(
             if kind is None:
                 continue
             unit_mode = _infer_relax_units(sf, lp, kind)
-            rows = _extract_relax_loop_rows(sf, lp, kind, unit_mode, mm_scale)
+            rows = _extract_relax_loop_rows(
+                sf,
+                lp,
+                kind,
+                unit_mode,
+                mm_scale,
+                default_rel_sigma=default_rel_sigma,
+            )
             if not rows:
                 continue
             raw_tables.append(
@@ -305,10 +322,16 @@ def extract_nmrstar_relaxation_tables(
 
         med0 = _effective_t1_median(r1_tables[0])
         med1 = _effective_t1_median(r1_tables[1])
-        if med0 >= med1:
-            assigned_fields = [hi_6470, lo_6470]
+        rel_diff = abs(med0 - med1) / max(med0, med1, 1.0 / mm_scale)
+        # Only split into distinct [600.13, 360.13] MHz fields when T1 medians differ by >= 10%;
+        # when < 10% (e.g. BMRB:6470 duplicate 600 MHz replicates set_1 & set_2), both stay at 600.13 MHz.
+        if rel_diff * float(10) >= 1.0:
+            if med0 >= med1:
+                assigned_fields = [hi_6470, lo_6470]
+            else:
+                assigned_fields = [lo_6470, hi_6470]
         else:
-            assigned_fields = [lo_6470, hi_6470]
+            assigned_fields = [hi_6470, hi_6470]
 
         for idx, fm in enumerate(assigned_fields):
             r1_tables[idx]["field_mhz"] = fm
@@ -345,6 +368,7 @@ def export_f10_modelfree_tsvs(
     prefix: str = "ubq",
     accession_id: Optional[str] = None,
     only_600_mhz: bool = False,
+    default_rel_sigma: Optional[float] = None,
     manifest: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Convert an NMR-STAR relaxation file (`bmr6470_3.str`, `bmr18971_3.str`, etc.) to `nmrassign modelfree` TSVs."""
@@ -354,6 +378,7 @@ def export_f10_modelfree_tsvs(
         star_text,
         accession_id=accession_id,
         only_600_mhz=only_600_mhz,
+        default_rel_sigma=default_rel_sigma,
         manifest=manifest,
     )
     if not tables:

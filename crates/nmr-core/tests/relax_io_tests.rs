@@ -1322,3 +1322,436 @@ fn overlapping_footprints_deconvolve_and_tsv_nef_roundtrip_cleanly() {
         }),
     );
 }
+
+#[test]
+fn f28_scheduleless_hetnoe_2plane_ser_decodes_both_nonoe_first_and_noe_first() {
+    use nmr_core::relax_fit::{compute_hetnoe_batch, HetNoeInput};
+
+    let tmp_root = std::env::temp_dir().join(format!("nmr_f28_hetnoe_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp_root);
+
+    let peaks: [(i32, &str, f64, f64, f64, f64); 4] = [
+        (4, "ALA", 8.42, 125.5, 1.0e5, -0.72),
+        (10, "LEU", 8.05, 121.2, 1.2e5, 0.78),
+        (17, "GLY", 8.65, 109.4, 0.9e5, 0.81),
+        (28, "VAL", 7.62, 118.6, 1.1e5, 0.64),
+    ];
+
+    for (variant, l0_init, expect_unsat_idx, expect_sat_idx) in [
+        ("nonoe_first", 1, 0usize, 1usize),
+        ("noe_first", 0, 1usize, 0usize),
+    ] {
+        let dir = tmp_root.join(variant);
+        fs::create_dir_all(dir.join("pdata/1")).unwrap();
+
+        let n0 = 128usize;
+        let n1 = 32usize;
+        let td_x = 2 * n0;
+        let td_y_doubled = 2 * (2 * n1); // 2 planes * 2 Echo-Antiecho * n1
+
+        let bf1_x = 600.13_f64;
+        let sfo1_x = bf1_x * (1.0 + 8.0e-6);
+        let sw_hz_x = 6000.0_f64;
+        let bf1_y = 60.810645_f64;
+        let sfo1_y = bf1_y * (1.0 + 118.0e-6);
+        let sw_ppm_y = 32.0_f64;
+        let sw_hz_y = sw_ppm_y * sfo1_y;
+
+        fs::write(
+            dir.join("acqus"),
+            format!(
+                "##TITLE= F28 hetNOE\n##$PULPROG= <hsqcnoef3gpsi>\n##$PARMODE= 1\n##$AQSEQ= 0\n\
+                 ##$BYTORDA= 1\n##$DTYPA= 0\n##$TD= {td_x}\n##$SFO1= {sfo1_x:.8}\n##$BF1= {bf1_x:.8}\n\
+                 ##$SW_h= {sw_hz_x:.6}\n##$NUC1= <1H>\n##$GRPDLY= 0\n##$D= (0..3)\n0 3.5 0 0\n##END=\n"
+            ),
+        )
+        .unwrap();
+
+        fs::write(
+            dir.join("acqu2s"),
+            format!(
+                "##TITLE= F1 15N EA\n##$FnMODE= 6\n##$TD= {td_y_doubled}\n##$SFO1= {sfo1_y:.8}\n\
+                 ##$BF1= {bf1_y:.8}\n##$SW= {sw_ppm_y:.6}\n##$SW_h= 2000\n##$NUC1= <15N>\n##END=\n"
+            ),
+        )
+        .unwrap();
+
+        // Stale `pdata/1` with wrong `SW_p` (must be ignored by `bruker_proc_matches_acqu_sw_local`)
+        fs::write(
+            dir.join("pdata/1/procs"),
+            "##$FT_mod= 6\n##$SW_p= 9999.0\n##$OFFSET= 15.0\n##$PHC0= 90\n##$PH_mod= 1\n##END=\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pdata/1/proc2s"),
+            "##$FT_mod= 6\n##$SW_p= 1500.0\n##$OFFSET= 130.0\n##$MC2= 5\n##$PH_mod= 1\n##END=\n",
+        )
+        .unwrap();
+        // Processed sibling `pdata/10` with matching `SW_p`
+        fs::create_dir_all(dir.join("pdata/10")).unwrap();
+        fs::write(
+            dir.join("pdata/10/procs"),
+            format!("##$FT_mod= 6\n##$SW_p= {sw_hz_x:.6}\n##$PHC0= 0\n##$PHC1= 0\n##$PH_mod= 1\n##$WDW= 1\n##$LB= 3.0\n##$SI= 256\n##END=\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pdata/10/proc2s"),
+            format!("##$FT_mod= 6\n##$AXNUC= <15N>\n##$SW_p= {sw_hz_y:.6}\n##$PHC0= 0\n##$PHC1= 0\n##$PH_mod= 1\n##$MC2= 5\n##$WDW= 1\n##$LB= 2.0\n##$SI= 128\n##$REVERSE= no\n##END=\n"),
+        )
+        .unwrap();
+
+        let pp = format!(
+            ";hsqcnoef3gpsi\n;for measuring H1-N15 NOEs\n\"l0={l0_init}\"\n1 ze\n\
+             LBLF1I1, MCWRK\nLBLSTS1, MCWRK\nLBLF1, MCWRK\n\
+             if \"l0 %2 == 1\"\n{{\nd1\n}}\nelse\n{{\n4 (p0 ph1)\n5m\nlo to 4 times l4\n}}\n\
+             go=2 ph31\nMCWRK wr #0 if #0 zd iu0\nlo to LBLF1I1 times 2\n\
+             MCWRK igrad EA\nlo to LBLSTS1 times 2\nMCWRK id0\nlo to LBLF1 times ST1CNT\n"
+        );
+        fs::write(dir.join("pulseprogram"), pp).unwrap();
+
+        let carrier_x = (sfo1_x - bf1_x) * 1.0e6 / bf1_x;
+        let carrier_y = (sfo1_y - bf1_y) * 1.0e6 / bf1_y;
+        let dt_x = 1.0 / sw_hz_x;
+        let dt_y = 1.0 / sw_hz_y;
+
+        let total_traces = 2 * n1 * 2;
+        let mut ser_bytes = Vec::with_capacity(total_traces * td_x * 4);
+        for k1 in 0..n1 {
+            let t1 = (k1 as f64) * dt_y;
+            let env1 = (-70.0 * t1).exp();
+            for q in 0..2 {
+                for p_idx in 0..2 {
+                    let is_sat = p_idx == expect_sat_idx;
+                    let mut tr = vec![[0.0_f64; 2]; n0];
+                    for &(_sid, _rn, dh, dn, i_ref, noe) in &peaks {
+                        let amp = if is_sat { i_ref * noe } else { i_ref };
+                        let fx = (dh - carrier_x) * bf1_x;
+                        let fy = (dn - carrier_y) * bf1_y;
+                        let cy = (2.0 * PI * fy * t1).cos() * env1;
+                        let sy = (2.0 * PI * fy * t1).sin() * env1;
+                        for (k0, dst) in tr.iter_mut().enumerate() {
+                            let t0 = (k0 as f64) * dt_x;
+                            let env0 = (-110.0 * t0).exp();
+                            let (s0, c0) = (2.0 * PI * fx * t0).sin_cos();
+                            let out_cos = [amp * cy * env0 * c0, amp * cy * env0 * s0];
+                            let out_sin = [amp * sy * env0 * c0, amp * sy * env0 * s0];
+                            // Inverse of Rance-Kay Echo-Antiecho recombination (`recombine_quad_pair_local`)
+                            let z = if q == 0 {
+                                [
+                                    0.5 * (out_cos[1] - out_sin[0]),
+                                    0.5 * (-out_cos[0] - out_sin[1]),
+                                ]
+                            } else {
+                                [
+                                    0.5 * (out_cos[1] + out_sin[0]),
+                                    0.5 * (-out_cos[0] + out_sin[1]),
+                                ]
+                            };
+                            dst[0] += z[0];
+                            dst[1] += z[1];
+                        }
+                    }
+                    for &[re, im] in &tr {
+                        ser_bytes.extend_from_slice(&(re.round() as i32).to_be_bytes());
+                        ser_bytes.extend_from_slice(&(im.round() as i32).to_be_bytes());
+                    }
+                }
+            }
+        }
+        fs::write(dir.join("ser"), ser_bytes).unwrap();
+
+        let raw = read_bruker_pseudo3d(&dir, None, None).expect("decode schedule-less hetNOE ser");
+        assert_eq!(raw.experiment_kind, RelaxExperimentKind::HetNoe);
+        assert_eq!(raw.interleaving, Pseudo3DInterleaving::T1QuadPlane);
+        assert_eq!(raw.planes.len(), 2);
+        let sched_vals = raw.schedule.primary_values();
+        assert!(sched_vals[expect_unsat_idx].abs() < 1.0e-9);
+        assert!((sched_vals[expect_sat_idx] - 3.5).abs() < 1.0e-9);
+
+        let (planes_2d, _) = process_pseudo3d_fids(&raw.planes, None).expect("process hetNOE");
+        let seeds: Vec<TargetPeakSeed> = peaks
+            .iter()
+            .map(|&(seq_id, res_name, dh, dn, _, _)| TargetPeakSeed {
+                seq_id,
+                res_name: res_name.to_string(),
+                atom_h: "H".to_string(),
+                atom_x: "N".to_string(),
+                delta_h_ppm: dh,
+                delta_x_ppm: dn,
+            })
+            .collect();
+        let ds = integrate_relax_planes(
+            "f28_hetnoe",
+            raw.experiment_kind,
+            raw.schedule,
+            &planes_2d,
+            &seeds,
+            &RelaxIntegrationConfig::default(),
+        )
+        .expect("integrate hetNOE planes");
+
+        let inputs: Vec<HetNoeInput> = ds
+            .traces
+            .iter()
+            .map(|tr| HetNoeInput {
+                seq_id: tr.footprint.seq_id,
+                res_name: tr.footprint.res_name.clone(),
+                i_unsat: tr.intensities[expect_unsat_idx],
+                sigma_unsat: tr.sigmas[expect_unsat_idx],
+                i_sat: tr.intensities[expect_sat_idx],
+                sigma_sat: tr.sigmas[expect_sat_idx],
+            })
+            .collect();
+        let noe_res = compute_hetnoe_batch(&inputs, 0, 42).expect("compute hetNOE");
+        for (got, &(_, _, _, _, _, true_noe)) in noe_res.iter().zip(peaks.iter()) {
+            assert!(
+                (got.noe - true_noe).abs() < 0.015,
+                "{variant} seq={}: got NOE={:.4} vs true={:.4}",
+                got.seq_id,
+                got.noe,
+                true_noe
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[test]
+fn f28_bruker_nbl_id10_echo_antiecho_states_tppi_and_3ch_t2_vclist_timing() {
+    use nmr_core::relax_fit::{decay_inputs_from_series, fit_decay_batch_cpu, ExpFitConfig};
+
+    let tmp_root = std::env::temp_dir().join(format!("nmr_f28_nbl_t2_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp_root);
+
+    let vc_counts = [1_u32, 2, 4, 6, 10, 15];
+    let peaks = [
+        (10, "ALA", 8.20, 122.0, 2.0e5, 6.50),
+        (20, "VAL", 8.75, 116.5, 1.8e5, 9.20),
+        (30, "GLY", 7.85, 110.2, 2.1e5, 4.40),
+    ];
+
+    // Verify both FnMODE=6 (Echo-Antiecho) and FnMODE=5 (States-TPPI) under inner NBL + id10 + D[21]/D[31] vclist!
+    for fnmode in [6_i32, 5_i32] {
+        let dir = tmp_root.join(format!("fnmode_{fnmode}"));
+        fs::create_dir_all(dir.join("pdata/1")).unwrap();
+        let n0 = 128usize;
+        let n1 = 32usize;
+        let td_x = 2 * n0;
+        let td_y = 2 * n1;
+        let n_planes = vc_counts.len();
+
+        let bf1_x = 600.13_f64;
+        let sfo1_x = bf1_x * (1.0 + 8.0e-6);
+        let sw_hz_x = 6000.0_f64;
+        let bf1_y = 60.810645_f64;
+        let sfo1_y = bf1_y * (1.0 + 118.0e-6);
+        let sw_ppm_y = 30.0_f64;
+        let sw_hz_y = sw_ppm_y * sfo1_y;
+
+        // Note decoy `D[20] = 1e-5` while `D[21] = 0.00045`, `P[30] = 100.0`, `D[31] = 0.016` -> unit_cycle = 16.0 ms!
+        let mut d_vals = vec!["0"; 32];
+        d_vals[20] = "1e-05";
+        d_vals[21] = "0.00045";
+        d_vals[31] = "0.016";
+        let mut p_vals = vec!["0"; 32];
+        p_vals[2] = "15.2";
+        p_vals[30] = "100";
+
+        fs::write(
+            dir.join("acqus"),
+            format!(
+                "##TITLE= F28 3ch T2\n##$PULPROG= <hsqct2etf3gpsi3d>\n##$PARMODE= 2\n##$AQSEQ= 1\n\
+                 ##$NBL= {n_planes}\n##$BYTORDA= 0\n##$DTYPA= 0\n##$TD= {td_x}\n\
+                 ##$SFO1= {sfo1_x:.8}\n##$BF1= {bf1_x:.8}\n##$SW_h= {sw_hz_x:.6}\n##$NUC1= <1H>\n\
+                 ##$GRPDLY= 0\n##$D= (0..31)\n{}\n##$P= (0..31)\n{}\n##END=\n",
+                d_vals.join(" "),
+                p_vals.join(" ")
+            ),
+        )
+        .unwrap();
+
+        fs::write(
+            dir.join("acqu2s"),
+            format!(
+                "##TITLE= F2 15N\n##$FnMODE= {fnmode}\n##$TD= {td_y}\n##$SFO1= {sfo1_y:.8}\n\
+                 ##$BF1= {bf1_y:.8}\n##$SW= {sw_ppm_y:.6}\n##$SW_h= 1800\n##$NUC1= <15N>\n##END=\n"
+            ),
+        )
+        .unwrap();
+
+        fs::write(
+            dir.join("acqu3s"),
+            format!(
+                "##TITLE= F1 vclist\n##$FnMODE= 1\n##$TD= {n_planes}\n##$SFO1= {sfo1_x:.8}\n\
+                 ##$BF1= {bf1_x:.8}\n##$SW= 10.0\n##$SW_h= {sw_hz_x:.6}\n##$NUC1= <1H>\n##END=\n"
+            ),
+        )
+        .unwrap();
+
+        // Unprocessed `pdata/1` (`FT_mod= 0`) must be rejected cleanly
+        fs::write(
+            dir.join("pdata/1/procs"),
+            "##$FT_mod= 0\n##$OFFSET= 4.70\n##$PHC0= -121\n##$PH_mod= 0\n##END=\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pdata/1/proc2s"),
+            "##$FT_mod= 0\n##$OFFSET= 118.5\n##$SI= 4\n##$PH_mod= 0\n##END=\n",
+        )
+        .unwrap();
+
+        let pp = "\
+            ;hsqct2etf3gpsi3d\n\
+            \"d21=450u\"\n\
+            \"d31=(p30*16+d21*32)\"\n\
+            \"DELTA3=d21-p2/2\"\n\
+            aqseq 312\n\
+            1 ze\n\
+            3 3m\n\
+            4 MCWRK\n\
+            LBLSTS1, MCWRK\n\
+            LBLF1, MCWRK\n\
+            6 d21\n\
+              (p30 ph6 d21*2 p30 ph6 d21*2 p30 ph6 d21*2 p30 ph6):f3\n\
+              DELTA3\n  (p2 ph1)\n  DELTA3\n\
+              (p30 ph6 d21*2 p30 ph6 d21*2 p30 ph6 d21*2 p30 ph6):f3\n\
+              d21*2\n\
+              (p30 ph6 d21*2 p30 ph6 d21*2 p30 ph6 d21*2 p30 ph6):f3\n\
+              DELTA3\n  (p2 ph8)\n  DELTA3\n\
+              (p30 ph6 d21*2 p30 ph6 d21*2 p30 ph6 d21*2 p30 ph6):f3\n\
+              d21\n\
+              lo to 6 times c\n\
+              goscnp ph31\n\
+              3m st ivc\n\
+              lo to 3 times nbl\n\
+              lo to 4 times ns\n\
+              MCWRK wr #0 if #0 zd igrad EA\n\
+              lo to LBLSTS1 times 2\n\
+              MCWRK id10\n\
+              lo to LBLF1 times ST1CNT\n";
+        fs::write(dir.join("pulseprogram"), pp).unwrap();
+
+        let vc_str = vc_counts
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(dir.join("vclist"), format!("{vc_str}\n")).unwrap();
+
+        let carrier_x = (sfo1_x - bf1_x) * 1.0e6 / bf1_x;
+        let carrier_y = (sfo1_y - bf1_y) * 1.0e6 / bf1_y;
+        let dt_x = 1.0 / sw_hz_x;
+        let dt_y = 1.0 / sw_hz_y;
+
+        let total_traces = n_planes * n1 * 2;
+        let mut ser_bytes = Vec::with_capacity(total_traces * td_x * 4);
+        for k1 in 0..n1 {
+            let t1 = (k1 as f64) * dt_y;
+            let env1 = (-65.0 * t1).exp();
+            let tppi_sign = if k1 % 2 == 1 { -1.0 } else { 1.0 };
+            for q in 0..2 {
+                for &vc in &vc_counts {
+                    let t_relax = (vc as f64) * 0.016;
+                    let mut tr = vec![[0.0_f64; 2]; n0];
+                    for &(_sid, _rn, dh, dn, i0, r2_true) in &peaks {
+                        let amp = i0 * (-r2_true * t_relax).exp();
+                        let fx = (dh - carrier_x) * bf1_x;
+                        let fy = (dn - carrier_y) * bf1_y;
+                        let cy = (2.0 * PI * fy * t1).cos() * env1;
+                        let sy = (2.0 * PI * fy * t1).sin() * env1;
+                        for (k0, dst) in tr.iter_mut().enumerate() {
+                            let t0 = (k0 as f64) * dt_x;
+                            let env0 = (-100.0 * t0).exp();
+                            let (s0, c0) = (2.0 * PI * fx * t0).sin_cos();
+                            let out_cos = [amp * cy * env0 * c0, amp * cy * env0 * s0];
+                            let out_sin = [amp * sy * env0 * c0, amp * sy * env0 * s0];
+                            let z = if fnmode == 6 {
+                                if q == 0 {
+                                    [
+                                        0.5 * (out_cos[1] - out_sin[0]),
+                                        0.5 * (-out_cos[0] - out_sin[1]),
+                                    ]
+                                } else {
+                                    [
+                                        0.5 * (out_cos[1] + out_sin[0]),
+                                        0.5 * (-out_cos[0] + out_sin[1]),
+                                    ]
+                                }
+                            } else if q == 0 {
+                                [tppi_sign * out_cos[0], tppi_sign * out_cos[1]]
+                            } else {
+                                [tppi_sign * out_sin[0], tppi_sign * out_sin[1]]
+                            };
+                            dst[0] += z[0];
+                            dst[1] += z[1];
+                        }
+                    }
+                    for &[re, im] in &tr {
+                        ser_bytes.extend_from_slice(&(re.round() as i32).to_le_bytes());
+                        ser_bytes.extend_from_slice(&(im.round() as i32).to_le_bytes());
+                    }
+                }
+            }
+        }
+        fs::write(dir.join("ser"), ser_bytes).unwrap();
+
+        let raw = read_bruker_pseudo3d(&dir, None, None).expect("decode 3ch NBL T2 ser");
+        assert_eq!(raw.experiment_kind, RelaxExperimentKind::R2);
+        assert_eq!(raw.interleaving, Pseudo3DInterleaving::T1QuadPlane);
+        match &raw.schedule {
+            RelaxSchedule::LoopCounts {
+                unit_cycle_sec,
+                values_sec,
+                ..
+            } => {
+                assert!((*unit_cycle_sec - 0.016).abs() < 1.0e-9);
+                assert!((values_sec[5] - 0.240).abs() < 1.0e-9);
+            }
+            other => panic!("expected LoopCounts schedule, got {other:?}"),
+        }
+
+        let (planes_2d, _) = process_pseudo3d_fids(&raw.planes, None).expect("process 3ch T2");
+        let seeds: Vec<TargetPeakSeed> = peaks
+            .iter()
+            .map(|&(seq_id, res_name, dh, dn, _, _)| TargetPeakSeed {
+                seq_id,
+                res_name: res_name.to_string(),
+                atom_h: "H".to_string(),
+                atom_x: "N".to_string(),
+                delta_h_ppm: dh,
+                delta_x_ppm: dn,
+            })
+            .collect();
+        let ds = integrate_relax_planes(
+            "f28_t2",
+            raw.experiment_kind,
+            raw.schedule,
+            &planes_2d,
+            &seeds,
+            &RelaxIntegrationConfig::default(),
+        )
+        .expect("integrate 3ch T2");
+        let fit_in = decay_inputs_from_series(&ds);
+        let fits = fit_decay_batch_cpu(
+            &fit_in,
+            &ExpFitConfig {
+                mc_replicates: 0,
+                ..ExpFitConfig::default()
+            },
+        )
+        .expect("fit R2");
+        for (f, &(_, _, _, _, _, true_r2)) in fits.iter().zip(peaks.iter()) {
+            let rel_err = (f.rate - true_r2).abs() / true_r2;
+            assert!(
+                rel_err < 0.015,
+                "fnmode={fnmode} seq={}: fit R2={:.4} vs true={:.4} (rel_err={rel_err:.4})",
+                f.seq_id,
+                f.rate,
+                true_r2
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(&tmp_root);
+}
