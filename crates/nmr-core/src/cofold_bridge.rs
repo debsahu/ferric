@@ -6693,10 +6693,8 @@ pub fn score_cofold_poses(
             cfg.rdc_free_seed,
         )?;
         let rdc_q_work = rdc_q_work_raw.is_finite().then_some(rdc_q_work_raw);
-        let rdc_q_free = rdc_q_free_raw
-            .is_finite()
-            .then_some(rdc_q_free_raw)
-            .or(rdc_q_work);
+        let rdc_q_free = rdc_q_free_raw.is_finite().then_some(rdc_q_free_raw);
+        let rdc_q_for_score = rdc_q_free.or(rdc_q_work).unwrap_or(0.0);
 
         // 4. 5-parameter `Delta_chi` `PCS` `Q`-factor
         let pcs_q_factor = evaluate_pose_pcs_q(&parsed, &restraints.pcs_tags)?;
@@ -6704,7 +6702,7 @@ pub fn score_cofold_poses(
         // Composite score `S_total(m)` (`section 6.2`)
         let total_score = cfg.w_csp * s_csp
             - cfg.w_noe_pre * noe_pre_violation_energy
-            - cfg.w_rdc * rdc_q_free.unwrap_or(0.0)
+            - cfg.w_rdc * rdc_q_for_score
             - cfg.w_pcs * pcs_q_factor.unwrap_or(0.0);
 
         // Decoy-cluster abstention guard flags (`section 6.2(4)`)

@@ -850,21 +850,41 @@ fn non_circular_synthetic_benchmark_and_ablations_across_1d3z_apo_and_1ubq_poses
         "CSP + discrete Wuethrich NOE funnel Spearman rho ({funnel_csp_noe:.4}) must be >= 0.75"
     );
 
-    println!(
-        "[S4 non-circular ablations] 1D3Z-vs-1UBQ CA_dRMSD={ca_drmsd_apo_vs_xray:.3} A | \
-         (a) rho_burial={rho_burial:.4} vs rho_forward={rho_forward:.4} | \
-         (b) CSP-only top={} auc={auc_csp_only:.4} p={pval_csp_only:.3e} funnel_rho={funnel_csp_only:.4} | \
-         (c) CSP+discrete-NOE top={} funnel_rho={funnel_csp_noe:.4}",
-        rep_csp_burial.top_pose_id.as_deref().unwrap_or("NONE"),
-        rep_csp_noe.top_pose_id.as_deref().unwrap_or("NONE"),
-    );
+    // Decoy-only ablation (b): CSP-only (`0` NOEs, `0` PREs) rejects `3/9` solvent-detached decoys
+    // (`LowCspContactEnrichment`), while `6/9` pocket-adjacent decoys (`4.7..10.2 A` iRMSD) remain
+    // admissible because coarse `8 A` CSP patch proximity alone provides no hard atom-pair exclusion!
+    let decoy_csp_only_report =
+        score_cofold_poses(&decoy_poses_only, &bundle_csp_only, &cfg_burial)
+            .expect("score 9 decoys CSP-only");
+    assert_eq!(decoy_csp_only_report.verdict, PoseVerdict::RankedConclusive);
+    assert_eq!(decoy_csp_only_report.n_admissible_poses, 6);
+    let n_detached_rejected = decoy_csp_only_report
+        .poses
+        .iter()
+        .filter(|p| {
+            p.violation_flags
+                .contains(&PoseViolationFlag::LowCspContactEnrichment)
+        })
+        .count();
+    assert_eq!(n_detached_rejected, 3);
 
-    // Decoy-only ensemble -> `PoseVerdict::InconclusiveOrAllViolated`!
+    // Decoy-only ablation (c): CSP + discrete Wuethrich NOE classes -> `PoseVerdict::InconclusiveOrAllViolated` (`0/9` admissible)!
     let decoy_report = score_cofold_poses(&decoy_poses_only, &bundle_csp_noe, &cfg_burial)
-        .expect("score 9 decoys only");
+        .expect("score 9 decoys with discrete NOEs");
     assert_eq!(decoy_report.verdict, PoseVerdict::InconclusiveOrAllViolated);
     assert_eq!(decoy_report.top_pose_id, None);
     assert_eq!(decoy_report.n_admissible_poses, 0);
+
+    println!(
+        "[S4 non-circular ablations] 1D3Z-vs-1UBQ CA_dRMSD={ca_drmsd_apo_vs_xray:.3} A | \
+         (a) rho_burial={rho_burial:.4} vs rho_forward={rho_forward:.4} | \
+         (b) CSP-only top={} auc={auc_csp_only:.4} p={pval_csp_only:.3e} funnel_rho={funnel_csp_only:.4} decoy_only_admissible={}/9 | \
+         (c) CSP+discrete-NOE top={} funnel_rho={funnel_csp_noe:.4} decoy_only_admissible={}/9",
+        rep_csp_burial.top_pose_id.as_deref().unwrap_or("NONE"),
+        decoy_csp_only_report.n_admissible_poses,
+        rep_csp_noe.top_pose_id.as_deref().unwrap_or("NONE"),
+        decoy_report.n_admissible_poses,
+    );
 }
 
 #[test]
@@ -1024,6 +1044,19 @@ fn multi_subunit_rdc_by_peptide_plane_qfree_and_pcs_discriminate_complex_orienta
     let bad_only = score_cofold_poses(&poses[0..1], &bundle, &PoseScoreConfig::default())
         .expect("score misoriented only");
     assert_eq!(bad_only.verdict, PoseVerdict::InconclusiveOrAllViolated);
+
+    // When `rdc_free_fraction == 0.0` (and no preset free rows), working `rdc_q_work` is NEVER aliased as `rdc_q_free`!
+    let no_free_rep = score_cofold_poses(
+        &poses[1..2],
+        &bundle,
+        &PoseScoreConfig {
+            rdc_free_fraction: 0.0,
+            ..PoseScoreConfig::default()
+        },
+    )
+    .expect("score with rdc_free_fraction = 0.0");
+    assert!(no_free_rep.poses[0].rdc_q_work.is_some());
+    assert_eq!(no_free_rep.poses[0].rdc_q_free, None);
 }
 
 #[test]
