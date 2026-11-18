@@ -145,6 +145,10 @@ pub struct DosyPanelState {
     pub viewport: DosyViewportTransform,
     /// Grid synthesis configuration.
     pub grid_cfg: DosyGridConfig,
+    /// Whether the right-side Inspector Table / decay column (`260.0 px`) is expanded.
+    pub show_inspector_table: bool,
+    /// Last rendered 2D + 1D DOSY canvas bounding rectangle.
+    pub last_canvas_rect: Option<egui::Rect>,
     /// Optional status banner message.
     pub status_line: String,
 }
@@ -185,7 +189,9 @@ impl DosyPanelState {
                 log10_d_bottom: -10.8,
             },
             grid_cfg,
-            status_line: "Click 'Load Demo Mixture' or import Bruker difflist / Varian procpar."
+            show_inspector_table: false,
+            last_canvas_rect: None,
+            status_line: "Click 'Load Demo' or import Bruker difflist / Varian procpar."
                 .to_string(),
         }
     }
@@ -370,45 +376,105 @@ impl DosyPanelState {
         )
         .ok();
     }
+
+    /// Export fitted DOSY components and Stokes-Einstein hydrodynamics as TSV text.
+    pub fn export_tsv(&self) -> String {
+        let mut out = String::from(
+            "peak_index\tlabel\tcenter_ppm\tselected_k\tcomp_index\tfraction\td_m2_s\tci95_low_m2_s\tci95_high_m2_s\tr_h_angstrom\test_mw_da\n",
+        );
+        for (pi, pk) in self.peaks.iter().enumerate() {
+            let (k_sel, fit) = self.active_fit_for_peak(pk);
+            for (ci, comp) in fit.components.iter().enumerate() {
+                let (rh, mw) = estimate_hydrodynamics(
+                    comp.d_m2_s,
+                    self.solvent,
+                    self.temperature_k,
+                    self.compactness_class,
+                )
+                .map(|h| (h.r_h_angstrom, h.estimated_mw_da))
+                .unwrap_or((0.0, 0.0));
+                out.push_str(&format!(
+                    "{}\t{}\t{:.4}\t{}\t{}\t{:.4}\t{:.4e}\t{:.4e}\t{:.4e}\t{:.2}\t{:.1}\n",
+                    pi + 1,
+                    pk.label,
+                    pk.center_ppm,
+                    k_sel,
+                    ci + 1,
+                    comp.fraction,
+                    comp.d_m2_s,
+                    comp.ci95_d_m2_s.0,
+                    comp.ci95_d_m2_s.1,
+                    rh,
+                    mw
+                ));
+            }
+        }
+        out
+    }
 }
 
 /// Render the complete interactive 2D `DOSY` studio panel (`wasm32`-compatible).
 pub fn render_dosy_panel(ui: &mut egui::Ui, state: &mut DosyPanelState) -> Vec<DosyPanelAction> {
     let mut actions = Vec::new();
 
-    // ---- Top Control Bar ----
+    // ---- Top Control Bar (<= 8 visible primary interactive controls) ----
     ui.horizontal_wrapped(|ui| {
-        ui.heading("🌊 2D DOSY Diffusion Studio");
+        ui.label(
+            egui::RichText::new("2D DOSY Diffusion Studio")
+                .size(15.0)
+                .strong(),
+        );
         ui.separator();
-        ui.label(egui::RichText::new(&state.dataset_title).strong());
+        ui.label(
+            egui::RichText::new(&state.dataset_title)
+                .size(12.5)
+                .strong(),
+        );
 
-        if ui.button("Load Demo Mixture").clicked() {
+        if ui.button("Load Demo").clicked() {
             *state = DosyPanelState::with_synthetic_demo();
             actions.push(DosyPanelAction::LoadedDemoMixture);
         }
-        #[cfg(target_arch = "wasm32")]
-        {
-            if ui
-                .button("📂 Open Folder")
-                .on_hover_text("Select a Bruker pseudo-2D DOSY folder from disk")
-                .clicked()
-            {
-                crate::ingest_panel::trigger_browser_folder_picker();
+        if ui.button("Fit Stejskal-Tanner").clicked() {
+            state.rebuild_2d_grid();
+            state.status_line = format!(
+                "Fitted Stejskal-Tanner models across {} DOSY peaks.",
+                state.peaks.len()
+            );
+        }
+        if ui.button("Stokes-Einstein MW").clicked() {
+            state.show_inspector_table = true;
+            if let Some(pk) = state.peaks.get(state.selected_peak_idx) {
+                let (_, fit) = state.active_fit_for_peak(pk);
+                if let Some(c0) = fit.components.first() {
+                    if let Ok(hyd) = estimate_hydrodynamics(
+                        c0.d_m2_s,
+                        state.solvent,
+                        state.temperature_k,
+                        state.compactness_class,
+                    ) {
+                        state.status_line = format!(
+                            "Peak {:.2} ppm: R_h = {:.2} A, Est. MW = {:.0} Da ({})",
+                            pk.center_ppm,
+                            hyd.r_h_angstrom,
+                            hyd.estimated_mw_da,
+                            state.solvent.label()
+                        );
+                    }
+                }
             }
-            if ui
-                .button("📄 Open Files")
-                .on_hover_text("Select DOSY .zip/.tar.gz archive or files")
-                .clicked()
-            {
-                crate::ingest_panel::trigger_browser_files_picker();
-            }
+        }
+        if ui.button("Export TSV").clicked() {
+            let tsv = state.export_tsv();
+            ui.ctx().copy_text(tsv);
+            state.status_line = "Copied DOSY Stejskal-Tanner & MW TSV to clipboard.".to_string();
         }
         if ui.button("Reset Zoom").clicked() {
             state.reset_viewport();
         }
 
         ui.separator();
-        ui.label("Solvent:");
+        ui.label(egui::RichText::new("Solvent:").size(12.5));
         egui::ComboBox::from_id_salt("dosy_solvent_combo")
             .selected_text(state.solvent.label())
             .show_ui(ui, |ui| {
@@ -417,114 +483,145 @@ pub fn render_dosy_panel(ui: &mut egui::Ui, state: &mut DosyPanelState) -> Vec<D
                 }
             });
 
-        ui.label("T (K):");
-        let mut t_k = state.temperature_k;
         if ui
-            .add(
-                egui::DragValue::new(&mut t_k)
-                    .range(273.15..=373.15)
-                    .speed(0.5)
-                    .fixed_decimals(2),
-            )
-            .changed()
+            .selectable_label(state.show_inspector_table, "Inspector Table")
+            .clicked()
         {
-            state.temperature_k = t_k.clamp(273.15, 373.15);
-        }
-        if let Ok(eta) = state.solvent.viscosity_pa_s(state.temperature_k) {
-            ui.label(
-                egui::RichText::new(format!("η = {:.3} mPa·s", eta * 1.0e3))
-                    .small()
-                    .color(egui::Color32::from_rgb(148, 163, 184)),
-            );
-        }
-
-        ui.separator();
-        ui.label("Class:");
-        egui::ComboBox::from_id_salt("dosy_class_combo")
-            .selected_text(state.compactness_class.label())
-            .show_ui(ui, |ui| {
-                for cl in [
-                    SoluteCompactnessClass::SmallMolecule,
-                    SoluteCompactnessClass::GlobularProtein,
-                    SoluteCompactnessClass::ExpandedPolymer,
-                ] {
-                    ui.selectable_value(&mut state.compactness_class, cl, cl.label());
-                }
-            });
-
-        ui.separator();
-        ui.label("Criterion:");
-        let crit_lbl = match state.criterion {
-            ModelSelectionCriterion::Bic => "BIC",
-            ModelSelectionCriterion::Aic => "AIC",
-        };
-        egui::ComboBox::from_id_salt("dosy_crit_combo")
-            .selected_text(crit_lbl)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut state.criterion,
-                    ModelSelectionCriterion::Bic,
-                    "BIC (strict)",
-                );
-                ui.selectable_value(
-                    &mut state.criterion,
-                    ModelSelectionCriterion::Aic,
-                    "AIC (Akaike)",
-                );
-            });
-
-        ui.separator();
-        let mut ilt_on = state.enable_tikhonov_ilt;
-        if ui
-            .checkbox(&mut ilt_on, "Tikhonov ILT (opt-in)")
-            .on_hover_text(ILT_ARTIFACT_CAVEAT)
-            .changed()
-        {
-            state.enable_tikhonov_ilt = ilt_on;
-            state.rebuild_2d_grid();
-            actions.push(DosyPanelAction::ToggledIlt { enabled: ilt_on });
-        }
-
-        if state.enable_tikhonov_ilt {
-            let cur_lbl = match state.ilt_strategy {
-                IltLambdaStrategy::Gcv => "GCV",
-                IltLambdaStrategy::LCurve => "L-Curve",
-                IltLambdaStrategy::DiscrepancyPrinciple { .. } => "Discrepancy",
-                IltLambdaStrategy::Fixed(_) => "Fixed λ",
-            };
-            let mut changed_strat = false;
-            egui::ComboBox::from_id_salt("dosy_ilt_strat_combo")
-                .selected_text(cur_lbl)
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(
-                            matches!(state.ilt_strategy, IltLambdaStrategy::Gcv),
-                            "GCV",
-                        )
-                        .clicked()
-                    {
-                        state.ilt_strategy = IltLambdaStrategy::Gcv;
-                        changed_strat = true;
-                    }
-                    if ui
-                        .selectable_label(
-                            matches!(state.ilt_strategy, IltLambdaStrategy::LCurve),
-                            "L-Curve",
-                        )
-                        .clicked()
-                    {
-                        state.ilt_strategy = IltLambdaStrategy::LCurve;
-                        changed_strat = true;
-                    }
-                });
-            if changed_strat {
-                for pk in &mut state.peaks {
-                    pk.ilt = None;
-                }
-                state.rebuild_2d_grid();
-            }
+            state.show_inspector_table = !state.show_inspector_table;
         }
     });
+
+    // Progressive-disclosure Advanced Parameters section (collapsed by default)
+    egui::CollapsingHeader::new(egui::RichText::new("Advanced Parameters").size(12.5))
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                // Keep "T (K):" and its DragValue inside a nested horizontal block so they never split across rows
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("T (K):").size(12.5));
+                    let mut t_k = state.temperature_k;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut t_k)
+                                .range(273.15..=373.15)
+                                .speed(0.5)
+                                .fixed_decimals(2),
+                        )
+                        .changed()
+                    {
+                        state.temperature_k = t_k.clamp(273.15, 373.15);
+                    }
+                });
+
+                if let Ok(eta) = state.solvent.viscosity_pa_s(state.temperature_k) {
+                    ui.label(
+                        egui::RichText::new(format!("eta = {:.3} mPa.s", eta * 1.0e3))
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(148, 163, 184)),
+                    );
+                }
+
+                ui.separator();
+                ui.label(egui::RichText::new("Class:").size(12.5));
+                egui::ComboBox::from_id_salt("dosy_class_combo")
+                    .selected_text(state.compactness_class.label())
+                    .show_ui(ui, |ui| {
+                        for cl in [
+                            SoluteCompactnessClass::SmallMolecule,
+                            SoluteCompactnessClass::GlobularProtein,
+                            SoluteCompactnessClass::ExpandedPolymer,
+                        ] {
+                            ui.selectable_value(&mut state.compactness_class, cl, cl.label());
+                        }
+                    });
+
+                ui.separator();
+                ui.label(egui::RichText::new("Criterion:").size(12.5));
+                let crit_lbl = match state.criterion {
+                    ModelSelectionCriterion::Bic => "BIC",
+                    ModelSelectionCriterion::Aic => "AIC",
+                };
+                egui::ComboBox::from_id_salt("dosy_crit_combo")
+                    .selected_text(crit_lbl)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut state.criterion,
+                            ModelSelectionCriterion::Bic,
+                            "BIC (strict)",
+                        );
+                        ui.selectable_value(
+                            &mut state.criterion,
+                            ModelSelectionCriterion::Aic,
+                            "AIC (Akaike)",
+                        );
+                    });
+
+                ui.separator();
+                let mut ilt_on = state.enable_tikhonov_ilt;
+                if ui
+                    .checkbox(&mut ilt_on, "Tikhonov ILT (opt-in)")
+                    .on_hover_text(ILT_ARTIFACT_CAVEAT)
+                    .changed()
+                {
+                    state.enable_tikhonov_ilt = ilt_on;
+                    state.rebuild_2d_grid();
+                    actions.push(DosyPanelAction::ToggledIlt { enabled: ilt_on });
+                }
+
+                if state.enable_tikhonov_ilt {
+                    let cur_lbl = match state.ilt_strategy {
+                        IltLambdaStrategy::Gcv => "GCV",
+                        IltLambdaStrategy::LCurve => "L-Curve",
+                        IltLambdaStrategy::DiscrepancyPrinciple { .. } => "Discrepancy",
+                        IltLambdaStrategy::Fixed(_) => "Fixed lambda",
+                    };
+                    let mut changed_strat = false;
+                    egui::ComboBox::from_id_salt("dosy_ilt_strat_combo")
+                        .selected_text(cur_lbl)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(
+                                    matches!(state.ilt_strategy, IltLambdaStrategy::Gcv),
+                                    "GCV",
+                                )
+                                .clicked()
+                            {
+                                state.ilt_strategy = IltLambdaStrategy::Gcv;
+                                changed_strat = true;
+                            }
+                            if ui
+                                .selectable_label(
+                                    matches!(state.ilt_strategy, IltLambdaStrategy::LCurve),
+                                    "L-Curve",
+                                )
+                                .clicked()
+                            {
+                                state.ilt_strategy = IltLambdaStrategy::LCurve;
+                                changed_strat = true;
+                            }
+                        });
+                    if changed_strat {
+                        for pk in &mut state.peaks {
+                            pk.ilt = None;
+                        }
+                        state.rebuild_2d_grid();
+                    }
+                }
+
+                ui.separator();
+                ui.label(egui::RichText::new("Contour floor:").size(11.0));
+                ui.add(
+                    egui::Slider::new(&mut state.contour_floor_frac, 0.02..=0.50)
+                        .fixed_decimals(2)
+                        .show_value(true),
+                );
+                ui.label(
+                    egui::RichText::new(format!("Peaks: {}", state.peaks.len()))
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(148, 163, 184)),
+                );
+            });
+        });
 
     // Explicit scientific caveat banner when Tikhonov ILT is enabled
     if state.enable_tikhonov_ilt {
@@ -535,70 +632,60 @@ pub fn render_dosy_panel(ui: &mut egui::Ui, state: &mut DosyPanelState) -> Vec<D
             .corner_radius(4.0)
             .show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new(format!("⚠ {ILT_ARTIFACT_CAVEAT}"))
-                        .small()
+                    egui::RichText::new(format!("[!] {ILT_ARTIFACT_CAVEAT}"))
+                        .size(11.0)
                         .color(egui::Color32::from_rgb(253, 224, 71)),
                 );
             });
     }
 
-    ui.add_space(4.0);
+    ui.add_space(2.0);
 
     if state.peaks.is_empty() {
         ui.centered_and_justified(|ui| {
-            ui.label(&state.status_line);
+            ui.label(egui::RichText::new(&state.status_line).size(12.5));
         });
         return actions;
     }
 
-    // ---- Main Two-Column Split: Left = Aligned 1D + 2D (ppm, log10(D)), Right = Decay + R_h/MW Inspector ----
+    // ---- Main Two-Column Split: Left = Aligned 1D + 2D (ppm, log10(D)), Right = Collapsible 260 px Inspector ----
     let avail = ui.available_size();
-    let left_w = (avail.x * 0.58).max(280.0);
-    let right_w = (avail.x - left_w - 12.0).max(240.0);
     let total_h = avail.y.max(380.0);
 
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.set_width(left_w);
-            render_left_2d_dosy_canvas(ui, state, left_w, total_h, &mut actions);
+    if state.show_inspector_table && avail.x >= 680.0 {
+        let right_w = 260.0_f32;
+        let left_w = (avail.x - right_w - 8.0).max(320.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(left_w);
+                draw_dosy_2d_canvas(ui, state, left_w, total_h, &mut actions);
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.set_width(right_w);
+                render_right_decay_and_hydrodynamics(ui, state, right_w, total_h, &mut actions);
+            });
         });
-        ui.separator();
-        ui.vertical(|ui| {
-            ui.set_width(right_w);
-            render_right_decay_and_hydrodynamics(ui, state, right_w, total_h, &mut actions);
-        });
-    });
+    } else {
+        let left_w = avail.x.max(280.0);
+        draw_dosy_2d_canvas(ui, state, left_w, total_h, &mut actions);
+    }
 
     actions
 }
 
-fn render_left_2d_dosy_canvas(
+pub fn draw_dosy_2d_canvas(
     ui: &mut egui::Ui,
     state: &mut DosyPanelState,
     width: f32,
     height: f32,
     actions: &mut Vec<DosyPanelAction>,
 ) {
-    let left_gutter = 56.0_f32;
-    let right_pad = 12.0_f32;
-    let top_1d_h = (height * 0.22).clamp(72.0, 125.0);
-    let bottom_axis_h = 24.0_f32;
-    let map_2d_h = (height - top_1d_h - bottom_axis_h - 32.0).max(160.0);
-
-    // Contour floor slider row
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Contour floor:").small());
-        ui.add(
-            egui::Slider::new(&mut state.contour_floor_frac, 0.02..=0.50)
-                .fixed_decimals(2)
-                .show_value(true),
-        );
-        ui.label(
-            egui::RichText::new(format!("Peaks: {}", state.peaks.len()))
-                .small()
-                .color(egui::Color32::from_rgb(148, 163, 184)),
-        );
-    });
+    let left_gutter = 58.0_f32;
+    let right_pad = 6.0_f32;
+    let top_1d_h = (height * 0.22).clamp(72.0, 130.0);
+    let bottom_axis_h = 30.0_f32;
+    let map_2d_h = (height - top_1d_h - bottom_axis_h - 4.0).max(160.0);
 
     // 1. Top aligned 1D trace region
     let (full_1d_rect, _) =
@@ -668,6 +755,7 @@ fn render_left_2d_dosy_canvas(
         egui::pos2(full_2d_rect.left() + left_gutter, full_2d_rect.top()),
         egui::pos2(plot_1d_rect.right(), full_2d_rect.top() + map_2d_h),
     );
+    state.last_canvas_rect = Some(full_1d_rect.union(full_2d_rect));
 
     let painter_2d = ui.painter_at(full_2d_rect);
     painter_2d.rect_filled(plot_2d_rect, 3.0, egui::Color32::from_rgb(11, 15, 24));
@@ -678,13 +766,23 @@ fn render_left_2d_dosy_canvas(
         egui::StrokeKind::Inside,
     );
 
-    // Horizontal log10(D) grid lines & labels
+    // Explicit y-axis title on the left margin
+    painter_2d.text(
+        egui::pos2(full_2d_rect.left() + 2.0, plot_2d_rect.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        "log10(D / m^2 s^-1)",
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_rgb(148, 163, 184),
+    );
+
+    // Horizontal log10(D) grid lines & labels (padded in 0.08..=0.92 and clamped so top tick never clips)
     let n_y_ticks = 5usize;
     for t in 0..=n_y_ticks {
-        let frac = (t as f64) / (n_y_ticks as f64);
+        let frac = 0.08 + 0.84 * ((t as f64) / (n_y_ticks as f64));
         let ld = state.viewport.log10_d_top
             + frac * (state.viewport.log10_d_bottom - state.viewport.log10_d_top);
-        let y = state.viewport.log10_d_to_y(plot_2d_rect, ld);
+        let y_raw = state.viewport.log10_d_to_y(plot_2d_rect, ld);
+        let y = y_raw.clamp(plot_2d_rect.top() + 18.0, plot_2d_rect.bottom() - 8.0);
         painter_2d.line_segment(
             [
                 egui::pos2(plot_2d_rect.left(), y),
@@ -696,12 +794,12 @@ fn render_left_2d_dosy_canvas(
             egui::pos2(plot_2d_rect.left() - 5.0, y),
             egui::Align2::RIGHT_CENTER,
             format!("{ld:.2}"),
-            egui::FontId::monospace(10.0),
+            egui::FontId::monospace(11.0),
             egui::Color32::from_rgb(148, 163, 184),
         );
     }
 
-    // Vertical ppm grid lines & bottom axis ticks
+    // Vertical ppm grid lines & bottom axis ticks (formatted as "{:.1}" with single bottom title)
     let n_x_ticks = 6usize;
     for t in 0..=n_x_ticks {
         let frac = (t as f64) / (n_x_ticks as f64);
@@ -715,14 +813,28 @@ fn render_left_2d_dosy_canvas(
             ],
             egui::Stroke::new(0.6, egui::Color32::from_rgb(30, 41, 59)),
         );
+        let align_x = if t == 0 {
+            egui::Align2::LEFT_CENTER
+        } else if t == n_x_ticks {
+            egui::Align2::RIGHT_CENTER
+        } else {
+            egui::Align2::CENTER_CENTER
+        };
         painter_2d.text(
-            egui::pos2(x, plot_2d_rect.bottom() + 10.0),
-            egui::Align2::CENTER_CENTER,
-            format!("{ppm:.2} ppm"),
-            egui::FontId::monospace(10.0),
+            egui::pos2(x, plot_2d_rect.bottom() + 8.0),
+            align_x,
+            format!("{ppm:.1}"),
+            egui::FontId::monospace(11.0),
             egui::Color32::from_rgb(148, 163, 184),
         );
     }
+    painter_2d.text(
+        egui::pos2(plot_2d_rect.center().x, plot_2d_rect.bottom() + 21.0),
+        egui::Align2::CENTER_CENTER,
+        "1H Chemical Shift (ppm)",
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_rgb(186, 202, 224),
+    );
 
     // Render 2D DOSY elliptical contour spots + vertical alignment guides
     let spot_painter = painter_2d.with_clip_rect(plot_2d_rect);
@@ -896,10 +1008,10 @@ fn render_left_2d_dosy_canvas(
                 egui::pos2(plot_2d_rect.left() + 6.0, plot_2d_rect.top() + 6.0),
                 egui::Align2::LEFT_TOP,
                 format!(
-                    "δ={h_ppm:.3} ppm | log10(D)={h_ld:.2} (D={:.2e} m²/s) | {rh_str}",
+                    "delta={h_ppm:.3} ppm | log10(D)={h_ld:.2} (D={:.2e} m^2/s) | {rh_str}",
                     h_d
                 ),
-                egui::FontId::monospace(10.5),
+                egui::FontId::monospace(11.0),
                 egui::Color32::from_rgb(226, 232, 240),
             );
         }
@@ -948,7 +1060,7 @@ fn render_right_decay_and_hydrodynamics(
 
     // Peak selector + BIC model-order badge
     ui.horizontal_wrapped(|ui| {
-        ui.label("Peak:");
+        ui.label(egui::RichText::new("Peak:").size(12.5));
         let cur_label = state.peaks[sel_idx].label.clone();
         egui::ComboBox::from_id_salt("dosy_peak_selector")
             .selected_text(cur_label)
@@ -995,7 +1107,12 @@ fn render_right_decay_and_hydrodynamics(
             .inner_margin(egui::Margin::symmetric(7, 3))
             .corner_radius(4.0)
             .show(ui, |ui| {
-                ui.label(egui::RichText::new(badge_txt).strong().color(badge_fg));
+                ui.label(
+                    egui::RichText::new(badge_txt)
+                        .size(11.0)
+                        .strong()
+                        .color(badge_fg),
+                );
             });
     });
 
@@ -1006,7 +1123,7 @@ fn render_right_decay_and_hydrodynamics(
     ui.horizontal_wrapped(|ui| {
         for cand in &pk.multi_exp.candidate_fits {
             let tag = if cand.k_components == active_k {
-                "★"
+                "*"
             } else {
                 " "
             };
@@ -1023,7 +1140,7 @@ fn render_right_decay_and_hydrodynamics(
                     }
                 ))
                 .monospace()
-                .small()
+                .size(11.0)
                 .color(egui::Color32::from_rgb(148, 163, 184)),
             );
         }
@@ -1039,46 +1156,46 @@ fn render_right_decay_and_hydrodynamics(
         .corner_radius(4.0)
         .show(ui, |ui| {
             ui.label(
-                egui::RichText::new("Stokes–Einstein Hydrodynamics & Bootstrap 95% CIs")
+                egui::RichText::new("Stokes-Einstein & 95% CIs")
                     .strong()
-                    .small(),
+                    .size(11.0),
             );
             egui::Grid::new("dosy_comp_hydro_grid")
                 .striped(true)
-                .spacing([10.0, 3.0])
+                .spacing([4.0, 3.0])
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new("Comp").small().strong());
-                    ui.label(egui::RichText::new("Frac").small().strong());
-                    ui.label(egui::RichText::new("D (10⁻¹⁰ m²/s)").small().strong());
-                    ui.label(egui::RichText::new("95% CI").small().strong());
-                    ui.label(egui::RichText::new("R_h (Å)").small().strong());
-                    ui.label(egui::RichText::new("Est. MW").small().strong());
+                    ui.label(egui::RichText::new("#").size(11.0).strong());
+                    ui.label(egui::RichText::new("Frac").size(11.0).strong());
+                    ui.label(egui::RichText::new("D").size(11.0).strong());
+                    ui.label(egui::RichText::new("95% CI").size(11.0).strong());
+                    ui.label(egui::RichText::new("Rh").size(11.0).strong());
+                    ui.label(egui::RichText::new("MW").size(11.0).strong());
                     ui.end_row();
 
                     for (ci, comp) in active_fit.components.iter().enumerate() {
                         ui.label(
                             egui::RichText::new(format!("#{}", ci + 1))
                                 .monospace()
-                                .small(),
+                                .size(11.0),
                         );
                         ui.label(
                             egui::RichText::new(format!("{:.1}%", comp.fraction * 100.0))
                                 .monospace()
-                                .small(),
+                                .size(11.0),
                         );
                         ui.label(
-                            egui::RichText::new(format!("{:.3}", comp.d_m2_s * 1.0e10))
+                            egui::RichText::new(format!("{:.2}", comp.d_m2_s * 1.0e10))
                                 .monospace()
-                                .small(),
+                                .size(11.0),
                         );
                         ui.label(
                             egui::RichText::new(format!(
-                                "[{:.2}, {:.2}]",
+                                "[{:.1},{:.1}]",
                                 comp.ci95_d_m2_s.0 * 1.0e10,
                                 comp.ci95_d_m2_s.1 * 1.0e10
                             ))
                             .monospace()
-                            .small(),
+                            .size(11.0),
                         );
                         if let Ok(hyd) = estimate_hydrodynamics(
                             comp.d_m2_s,
@@ -1087,25 +1204,25 @@ fn render_right_decay_and_hydrodynamics(
                             state.compactness_class,
                         ) {
                             ui.label(
-                                egui::RichText::new(format!("{:.2} Å", hyd.r_h_angstrom))
+                                egui::RichText::new(format!("{:.1}", hyd.r_h_angstrom))
                                     .monospace()
-                                    .small()
+                                    .size(11.0)
                                     .color(egui::Color32::from_rgb(125, 211, 252)),
                             );
                             let mw_txt = if hyd.estimated_mw_da >= 2_500.0 {
-                                format!("{:.2} kDa", hyd.estimated_mw_da * 1.0e-3)
+                                format!("{:.1}k", hyd.estimated_mw_da * 1.0e-3)
                             } else {
-                                format!("{:.0} Da", hyd.estimated_mw_da)
+                                format!("{:.0}", hyd.estimated_mw_da)
                             };
                             ui.label(
                                 egui::RichText::new(mw_txt)
                                     .monospace()
-                                    .small()
+                                    .size(11.0)
                                     .color(egui::Color32::from_rgb(134, 239, 172)),
                             );
                         } else {
-                            ui.label("-");
-                            ui.label("-");
+                            ui.label(egui::RichText::new("-").size(11.0));
+                            ui.label(egui::RichText::new("-").size(11.0));
                         }
                         ui.end_row();
                     }
@@ -1169,7 +1286,7 @@ fn render_stejskal_tanner_log_plot(
     painter.text(
         egui::pos2(inner.left(), rect.top() + 2.0),
         egui::Align2::LEFT_TOP,
-        "Stejskal–Tanner Attenuation: ln(I / I0) vs b (10⁹ s/m²)",
+        "Stejskal-Tanner: ln(I / I0) vs b",
         egui::FontId::proportional(11.0),
         egui::Color32::from_rgb(203, 213, 225),
     );
@@ -1250,21 +1367,21 @@ fn render_stejskal_tanner_log_plot(
         egui::pos2(inner.left() - 4.0, inner.top()),
         egui::Align2::RIGHT_TOP,
         "0.0",
-        egui::FontId::monospace(9.5),
+        egui::FontId::monospace(11.0),
         egui::Color32::from_rgb(148, 163, 184),
     );
     painter.text(
         egui::pos2(inner.left() - 4.0, inner.bottom()),
         egui::Align2::RIGHT_BOTTOM,
         format!("{ln_min:.1}"),
-        egui::FontId::monospace(9.5),
+        egui::FontId::monospace(11.0),
         egui::Color32::from_rgb(148, 163, 184),
     );
     painter.text(
         egui::pos2(inner.right(), rect.bottom() - 1.0),
         egui::Align2::RIGHT_BOTTOM,
-        format!("b_max = {:.2} × 10⁹ s/m²", b_max * 1.0e-9),
-        egui::FontId::monospace(9.5),
+        format!("b_max = {:.2}e9 s/m^2", b_max * 1.0e-9),
+        egui::FontId::monospace(11.0),
         egui::Color32::from_rgb(148, 163, 184),
     );
 }
@@ -1279,7 +1396,7 @@ fn render_residuals_plot(
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     let inner = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 42.0, rect.top() + 13.0),
+        egui::pos2(rect.left() + 42.0, rect.top() + 14.0),
         egui::pos2(
             (rect.right() - 8.0).max(rect.left() + 60.0),
             rect.bottom() - 3.0,
@@ -1296,7 +1413,7 @@ fn render_residuals_plot(
         egui::pos2(inner.left(), rect.top()),
         egui::Align2::LEFT_TOP,
         format!("Residuals I_obs - I_fit (RMSE = {:.3})", fit.rmse),
-        egui::FontId::proportional(10.5),
+        egui::FontId::proportional(11.0),
         egui::Color32::from_rgb(148, 163, 184),
     );
 
@@ -1359,11 +1476,11 @@ fn render_ilt_distribution_plot(
         egui::pos2(inner.left(), rect.top()),
         egui::Align2::LEFT_TOP,
         format!(
-            "Tikhonov ILT f(log10 D)  [λ* = {:.2e}, {} modes]",
+            "Tikhonov ILT f(log10 D) [lambda* = {:.2e}, {} modes]",
             ilt.selected_lambda,
             ilt.modes.len()
         ),
-        egui::FontId::proportional(10.5),
+        egui::FontId::proportional(11.0),
         egui::Color32::from_rgb(216, 180, 254),
     );
 
@@ -1442,16 +1559,18 @@ mod tests {
         assert!(state.peaks[1].ilt.is_some());
 
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut out1 = ctx.run_ui(egui::RawInput::default(), |ui| {
             let _actions = render_dosy_panel(ui, &mut state);
         });
+        out1.textures_delta.clear();
 
         state.criterion = ModelSelectionCriterion::Aic;
         state.solvent = DosySolvent::CDCl3;
         state.temperature_k = 303.15;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut out2 = ctx.run_ui(egui::RawInput::default(), |ui| {
             let _actions = render_dosy_panel(ui, &mut state);
         });
+        out2.textures_delta.clear();
     }
 
     #[test]
@@ -1472,9 +1591,10 @@ mod tests {
         assert!((empty.viewport.y_to_log10_d(rect, y) - (-9.5)).abs() < 1.0e-8);
 
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             let actions = render_dosy_panel(ui, &mut empty);
             assert!(actions.is_empty());
         });
+        out.textures_delta.clear();
     }
 }

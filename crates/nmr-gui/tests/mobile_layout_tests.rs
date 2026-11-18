@@ -178,7 +178,7 @@ impl ResponsiveWorkbenchHost for DemoWorkbenchHost {
 
     fn draw_protein_desktop_central(&mut self, ui: &mut egui::Ui) -> egui::Rect {
         ui.horizontal(|ui| {
-            ui.label("🎯 2D HSQC Contours");
+            ui.label("2D HSQC Contours");
         });
         ui.separator();
         self.draw_hsqc_2d_view(ui)
@@ -194,7 +194,7 @@ impl ResponsiveWorkbenchHost for DemoWorkbenchHost {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().interact_size.y = MOBILE_TOUCH_MIN_HEIGHT;
                         let _ = ui.add(
-                            egui::Button::new("🎚 Levels")
+                            egui::Button::new("Levels")
                                 .min_size(egui::vec2(64.0, MOBILE_TOUCH_MIN_HEIGHT)),
                         );
                         let _ = ui.add(
@@ -321,7 +321,8 @@ impl ResponsiveWorkbenchHost for DemoWorkbenchHost {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for (idx, aa) in self.demo.ubiquitin_ref.sequence.iter().enumerate() {
-                        let _ = ui.small_button(format!("{aa}{}", idx + 1));
+                        let _ =
+                            ui.button(egui::RichText::new(format!("{aa}{}", idx + 1)).size(11.0));
                     }
                 });
             });
@@ -369,7 +370,7 @@ impl ResponsiveWorkbenchHost for DemoWorkbenchHost {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().interact_size.y = MOBILE_TOUCH_MIN_HEIGHT;
                     let _ = ui.add(
-                        egui::Button::new("✨ Clean 2D")
+                        egui::Button::new("Clean 2D")
                             .min_size(egui::vec2(78.0, MOBILE_TOUCH_MIN_HEIGHT)),
                     );
                 });
@@ -416,9 +417,10 @@ fn run_frame_at_size(
         ..Default::default()
     };
     let mut metrics = ResponsiveFrameMetrics::default();
-    let _ = ctx.run_ui(raw, |ui| {
+    let mut out = ctx.run_ui(raw, |ui| {
         metrics = render_responsive_workbench(ui, 1_000, shell, host);
     });
+    out.textures_delta.clear();
     metrics
 }
 
@@ -546,7 +548,7 @@ fn test_phone_protein_and_chemstudio_all_tabs_zero_panics_and_viewport_budget() 
             }
         }
 
-        // Verify `☰` mobile quick-actions drawer renders cleanly on phone without panics
+        // Verify [Menu] mobile quick-actions drawer renders cleanly on phone without panics
         shell.mobile_menu_open = true;
         let m_drawer = run_frame_at_size(&ctx, w, h, Vec::new(), &mut shell, &mut host);
         assert_eq!(m_drawer.docked_side_panel_count(), 0);

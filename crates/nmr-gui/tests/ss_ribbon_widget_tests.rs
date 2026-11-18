@@ -222,9 +222,10 @@ fn t21_3_three_track_vector_geometry_partial_ssp_under_1ms_and_themes() {
         updated,
         "mutated shift table must trigger incremental SSP update"
     );
+    let ssp_budget_ms = if cfg!(debug_assertions) { 15.0 } else { 1.0 };
     assert!(
-        elapsed_ms < 1.0 && state.last_nmr_update_ms < 1.0,
-        "Track 2 live SSP update took {elapsed_ms:.3} ms (reported {:.3} ms), exceeding 1.0 ms gate",
+        elapsed_ms < ssp_budget_ms && state.last_nmr_update_ms < ssp_budget_ms,
+        "Track 2 live SSP update took {elapsed_ms:.3} ms (reported {:.3} ms), exceeding {ssp_budget_ms:.1} ms gate",
         state.last_nmr_update_ms
     );
 
@@ -290,7 +291,7 @@ fn t21_3_three_track_vector_geometry_partial_ssp_under_1ms_and_themes() {
             )),
             ..Default::default()
         };
-        let full_out = ctx.run_ui(raw, |ui| {
+        let mut full_out = ctx.run_ui(raw, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 let _ = SsRibbonPanel::show(
                     ui,
@@ -304,6 +305,7 @@ fn t21_3_three_track_vector_geometry_partial_ssp_under_1ms_and_themes() {
                 );
             });
         });
+        full_out.textures_delta.clear();
 
         assert!(
             full_out.shapes.len() > 80,
@@ -364,8 +366,23 @@ fn t21_3_live_concordance_regimes_ordered_disordered_morf_and_hinge() {
     let mut ubiq_ens = parse_pdb_ensemble(UBIQUITIN_1UBQ_PDB).expect("parse 1UBQ");
     ubiq_ens.bind_to_nmr_sequence(&ubiq_ref.sequence, &ubiq_ref.seq_ids);
 
-    // 1. Folded Ubiquitin shifts vs 1UBQ: predominantly ConcordantOrdered
+    // 1. Experimental 1UBQ (`per_residue_plddt: None`) must NOT fabricate 85.0 pLDDT -> ord_cnt == 0;
+    //    when explicit per-residue pLDDT is present, folded Ubiquitin is predominantly ConcordantOrdered
     let mut state = SsRibbonState::new();
+    state.sync_from_ensemble_and_nmr(
+        ubiq_ref.sequence.len(),
+        Some(&ubiq_ens),
+        Some(&ubiq_ref),
+        &PropensityConfig::default(),
+        None,
+    );
+    assert_eq!(
+        state.concordance_summary.class_counts[0], 0,
+        "experimental 1UBQ without pLDDT must not fabricate ConcordantOrdered"
+    );
+    assert_eq!(state.rigidity_source_label(), "RCI-S² (shift-derived)");
+
+    ubiq_ens.per_residue_plddt = Some(vec![92.0; 76]);
     state.sync_from_ensemble_and_nmr(
         ubiq_ref.sequence.len(),
         Some(&ubiq_ens),
@@ -376,7 +393,7 @@ fn t21_3_live_concordance_regimes_ordered_disordered_morf_and_hinge() {
     let ord_cnt = state.concordance_summary.class_counts[0];
     assert!(
         ord_cnt >= 50,
-        "expected >= 50 ConcordantOrdered residues on Ubiquitin, got {ord_cnt} ({:?})",
+        "expected >= 50 ConcordantOrdered residues on Ubiquitin with pLDDT, got {ord_cnt} ({:?})",
         state.concordance_summary.class_counts
     );
 
@@ -497,7 +514,7 @@ fn t21_3_bidirectional_click_syncs_crosshair_sidechain_and_3d_highlight() {
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2000.0, 200.0));
 
     // Frame 1: lay out columns
-    let _ = ctx.run_ui(
+    let mut out1 = ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(screen),
             ..Default::default()
@@ -517,12 +534,13 @@ fn t21_3_bidirectional_click_syncs_crosshair_sidechain_and_3d_highlight() {
             });
         },
     );
+    out1.textures_delta.clear();
 
     // Click residue index 26 (`LYS 27` in Ubiquitin alpha-helix)
     let target_k = 26usize;
     let click_pos = ss_state.last_col_rects[target_k].center();
     let mut ribbon_out = Default::default();
-    let _ = ctx.run_ui(
+    let mut out2 = ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(screen),
             events: vec![
@@ -557,6 +575,7 @@ fn t21_3_bidirectional_click_syncs_crosshair_sidechain_and_3d_highlight() {
             });
         },
     );
+    out2.textures_delta.clear();
 
     assert_eq!(ribbon_out.clicked_residue, Some(target_k));
     assert_eq!(ss_state.selected_residue, Some(target_k));
@@ -797,7 +816,8 @@ A 4 PHE 1 41.25
 
     // 7. `< 2.0 ms` in-place putty update gate across a 150-aa 20-conformer (51,000-atom) ensemble!
     let bench_pdb = synthesize_ensemble_pdb(20, 150);
-    let bench_ens = parse_pdb_ensemble(&bench_pdb).expect("parse 20x150 ensemble");
+    let bench_ens = nmr_gui::mol3d_viewer::parse_pdb_ensemble_with_plddt_override(&bench_pdb, true)
+        .expect("parse 20x150 ensemble");
     assert_eq!(bench_ens.models.len(), 20);
     assert_eq!(bench_ens.primary_sequence.len(), 150);
     assert_eq!(
@@ -843,9 +863,10 @@ A 4 PHE 1 41.25
             scene.update_quantitative_putty(&bench_tracks);
         }
         let avg_ms = (t0.elapsed().as_secs_f64() * 1000.0) / f64::from(iters);
+        let putty_budget_ms = if cfg!(debug_assertions) { 15.0 } else { 2.0 };
         assert!(
-            avg_ms < 2.0,
-            "{track:?} putty update across 20x150aa ensemble averaged {avg_ms:.3} ms (gate < 2.0 ms)"
+            avg_ms < putty_budget_ms,
+            "{track:?} putty update across 20x150aa ensemble averaged {avg_ms:.3} ms (gate < {putty_budget_ms:.1} ms)"
         );
     }
 }

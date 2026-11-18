@@ -197,6 +197,12 @@ pub fn pae_green_to_white_color(pae_angstrom: f32) -> egui::Color32 {
     )
 }
 
+/// Backwards-compatible alias for the canonical `0..31.75 A` AlphaFold `PAE` colormap.
+#[inline]
+pub fn pae_viridis_like_color(pae_angstrom: f32) -> egui::Color32 {
+    pae_green_to_white_color(pae_angstrom)
+}
+
 // ============================================================================
 // 2. Tabs, View-Models & Outbound Studio Actions
 // ============================================================================
@@ -372,18 +378,23 @@ pub struct IntegrativeStudioTelemetry {
     pub gdo_badges_drawn: usize,
     pub bic_bars_drawn: usize,
     pub parity_points_drawn: usize,
+    pub pae_texture_uploads: usize,
 }
+
+/// Alias for [`IntegrativeStudioTelemetry`].
+pub type IntegrativeAfFrameTelemetry = IntegrativeStudioTelemetry;
 
 // ============================================================================
 // 3. Stateful Integrative Structural & AlphaFold Studio Controller
 // ============================================================================
 
 /// Stateful controller for the zero-emoji Integrative Structural & AlphaFold Studio (`nmr-gui`).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct IntegrativeAfPanel {
     pub active_tab: IntegrativeStudioTab,
     pub show_loader_drawer: bool,
     pub force_bfactor_plddt: bool,
+    pub is_synthetic_demo: bool,
 
     // Raw text buffers for desktop + `wasm32` in-memory ingestion
     pub structure_input_buf: String,
@@ -402,11 +413,14 @@ pub struct IntegrativeAfPanel {
     pub loaded_rdc_media_count: usize,
     pub has_paramagnetic_pcs_or_pre: bool,
 
-    // Interactive PAE selection state
+    // Interactive PAE selection & cached GPU/CPU texture state (`21.W3:P1-14`)
     pub selected_residue_idx: Option<usize>,
     pub selected_pae_cell: Option<(usize, usize)>,
     pub selected_domain_pair: Option<(usize, usize)>,
     pub last_pae_plot_rect: Option<egui::Rect>,
+    pub pae_texture: Option<egui::TextureHandle>,
+    pub pae_texture_key: Option<u64>,
+    pub pae_texture_uploads: usize,
 
     // T21.6a Co-Folding Restraint Preview & Pose Ranker state
     pub preview_dialect: CofoldPreviewDialect,
@@ -434,6 +448,20 @@ pub struct IntegrativeAfPanel {
     pub last_telemetry: IntegrativeStudioTelemetry,
 }
 
+impl std::fmt::Debug for IntegrativeAfPanel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IntegrativeAfPanel")
+            .field("active_tab", &self.active_tab)
+            .field("is_synthetic_demo", &self.is_synthetic_demo)
+            .field("status_message", &self.status_message)
+            .field("pae_texture_loaded", &self.pae_texture.is_some())
+            .field("pae_texture_key", &self.pae_texture_key)
+            .field("pae_texture_uploads", &self.pae_texture_uploads)
+            .field("last_telemetry", &self.last_telemetry)
+            .finish()
+    }
+}
+
 impl Default for IntegrativeAfPanel {
     fn default() -> Self {
         Self::new()
@@ -446,6 +474,7 @@ impl IntegrativeAfPanel {
             active_tab: IntegrativeStudioTab::ConcordanceSummary,
             show_loader_drawer: false,
             force_bfactor_plddt: false,
+            is_synthetic_demo: false,
             structure_input_buf: String::new(),
             pae_json_buf: String::new(),
             s2_tsv_buf: String::new(),
@@ -465,6 +494,9 @@ impl IntegrativeAfPanel {
             selected_pae_cell: None,
             selected_domain_pair: None,
             last_pae_plot_rect: None,
+            pae_texture: None,
+            pae_texture_key: None,
+            pae_texture_uploads: 0,
             preview_dialect: CofoldPreviewDialect::Boltz2Yaml,
             af3_json_preview: String::new(),
             af3_sidecar_note:
@@ -489,11 +521,29 @@ impl IntegrativeAfPanel {
         }
     }
 
+    /// Return the latest per-frame telemetry snapshot (`21.W3:P1-14`).
+    pub fn last_telemetry(&self) -> &IntegrativeStudioTelemetry {
+        &self.last_telemetry
+    }
+
+    /// Alias for [`Self::load_synthetic_two_domain_demo`].
+    pub fn load_ubiquitin_demo(&mut self) -> Result<(Reference, String), String> {
+        self.load_synthetic_two_domain_demo()
+    }
+
     /// Parse `.cif`/`.pdb` coordinates (`structure_input_buf`), optional `PAE` JSON (`pae_json_buf`),
     /// optional `modelfree.tsv` $S^2$ (`s2_tsv_buf`), and optional `RDC` TSV (`rdc_tsv_buf`), then
     /// run `T21.1` concordance (`evaluate_af_nmr_concordance`) and `T21.5` spectral domain clustering
     /// (`cluster_pae_domains_for_model` + `evaluate_tolman_domain_gdo`).
     pub fn ingest_from_buffers(
+        &mut self,
+        nmr_shifts: Option<&Reference>,
+    ) -> Result<String, String> {
+        self.is_synthetic_demo = false;
+        self.ingest_from_buffers_inner(nmr_shifts)
+    }
+
+    fn ingest_from_buffers_inner(
         &mut self,
         nmr_shifts: Option<&Reference>,
     ) -> Result<String, String> {
@@ -591,16 +641,33 @@ impl IntegrativeAfPanel {
                 spearman_rho_s,
                 rmsd_rigidity,
                 ..
-            } => format!(
-                "Validated {n_res} residues (rho_s = {spearman_rho_s:.3}, RMSD_rig = {rmsd_rigidity:.3}, {n_dom} PAE domain(s))"
-            ),
-            ConcordanceSummary::InsufficientCoverage { n_eval, .. } => format!(
-                "Loaded {n_res} residues ({n_eval} NMR-evaluated; {n_dom} PAE domain(s))"
-            ),
+            } => {
+                if self.is_synthetic_demo {
+                    format!(
+                        "Analyzed {n_res} residues (synthetic demo, rho_s = {spearman_rho_s:.2}, RMSD_rig = {rmsd_rigidity:.2} A, {n_dom} PAE domain(s))"
+                    )
+                } else {
+                    format!(
+                        "Analyzed {n_res} residues (rho_s = {spearman_rho_s:.2}, RMSD_rig = {rmsd_rigidity:.2} A, {n_dom} PAE domain(s))"
+                    )
+                }
+            }
+            ConcordanceSummary::InsufficientCoverage { n_eval, .. } => {
+                if self.is_synthetic_demo {
+                    format!(
+                        "Loaded {n_res} residues (synthetic demo, {n_eval} NMR-evaluated; {n_dom} PAE domain(s))"
+                    )
+                } else {
+                    format!(
+                        "Loaded {n_res} residues ({n_eval} NMR-evaluated; {n_dom} PAE domain(s))"
+                    )
+                }
+            }
         };
 
         self.af_model = Some(model);
         self.pae_matrix = pae_opt;
+        self.pae_texture_key = None;
         self.concordance_report = Some(conc_report);
         self.domain_partition = partition_opt;
         self.last_error = None;
@@ -800,7 +867,8 @@ impl IntegrativeAfPanel {
         self.pae_json_buf = pae_json;
         self.s2_tsv_buf.clear();
         self.rdc_tsv_buf = rdc_tsv;
-        let msg = self.ingest_from_buffers(Some(&demo_ref))?;
+        self.is_synthetic_demo = true;
+        let msg = self.ingest_from_buffers_inner(Some(&demo_ref))?;
 
         // Populate deterministic T21.6a Co-Fold preview & multi-pose ranking showcase
         self.surface_pocket_seq_ids = vec![8, 10, 12, 14, 16, 18];
@@ -1030,7 +1098,10 @@ impl IntegrativeAfPanel {
     /// dock tab) and return any synchronization actions triggered during this frame.
     pub fn show(&mut self, ui: &mut egui::Ui, paper_white: bool) -> Vec<IntegrativeAfAction> {
         let theme = IntegrativeStudioTheme::for_mode(paper_white);
-        self.last_telemetry = IntegrativeStudioTelemetry::default();
+        self.last_telemetry = IntegrativeStudioTelemetry {
+            pae_texture_uploads: self.pae_texture_uploads,
+            ..Default::default()
+        };
         let mut actions = Vec::new();
 
         egui::Frame::NONE
@@ -1040,10 +1111,12 @@ impl IntegrativeAfPanel {
                 self.draw_header_and_tabs(ui, &theme, &mut actions);
                 ui.add_space(6.0);
 
-                if self.show_loader_drawer {
-                    self.draw_loader_drawer(ui, &theme, &mut actions);
-                    ui.add_space(8.0);
-                }
+                egui::CollapsingHeader::new("Advanced Parameters & Data Input")
+                    .default_open(self.show_loader_drawer)
+                    .show(ui, |ui| {
+                        self.draw_loader_drawer(ui, &theme, &mut actions);
+                    });
+                ui.add_space(6.0);
 
                 if let Some(ref err) = self.last_error {
                     egui::Frame::NONE
@@ -1077,6 +1150,7 @@ impl IntegrativeAfPanel {
                 }
             });
 
+        self.last_telemetry.pae_texture_uploads = self.pae_texture_uploads;
         actions
     }
 
@@ -1120,16 +1194,6 @@ impl IntegrativeAfPanel {
             }
 
             ui.separator();
-            if ui
-                .button(if self.show_loader_drawer {
-                    "Hide Input Buffers"
-                } else {
-                    "Paste .cif / PAE JSON"
-                })
-                .clicked()
-            {
-                self.show_loader_drawer = !self.show_loader_drawer;
-            }
             if ui
                 .button("Load 2-Domain AF Demo")
                 .on_hover_text(
@@ -1194,11 +1258,64 @@ impl IntegrativeAfPanel {
                         &mut self.force_bfactor_plddt,
                         "Force B_iso/tempFactor as pLDDT on experimental headers",
                     );
-                    if ui.button("Validate & Cluster PAE").clicked()
+                    if ui.button("Analyze & Cluster PAE").clicked()
                         && self.ingest_from_buffers(None).is_ok()
                     {
                         actions.push(IntegrativeAfAction::SyncStructureAndConcordance);
                     }
+                    if ui
+                        .button("Color 3D Ribbon by AlphaFold pLDDT")
+                        .on_hover_text("Apply canonical 4-band AlphaFold pLDDT palette (#0053D6..#FF7D45)")
+                        .clicked()
+                    {
+                        actions.push(IntegrativeAfAction::SetMol3dTrack {
+                            track: QuantitativeTrack::AlphaFoldPlddt,
+                            putty_enabled: true,
+                        });
+                    }
+                    if ui
+                        .button("Color 3D Putty by AF vs NMR Concordance")
+                        .on_hover_text(
+                            "Highlight Model-Ordered / Solution-Disordered and DynamicHingeOrAltState discrepancies on 3D putty",
+                        )
+                        .clicked()
+                    {
+                        actions.push(IntegrativeAfAction::SetMol3dTrack {
+                            track: QuantitativeTrack::AfNmrConcordance,
+                            putty_enabled: true,
+                        });
+                    }
+                    if ui.button("Sync 3-Track SS Ribbon").clicked() {
+                        actions.push(IntegrativeAfAction::SyncStructureAndConcordance);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("Sort Co-Fold Poses:")
+                            .size(11.0)
+                            .color(theme.text_muted),
+                    );
+                    ui.selectable_value(
+                        &mut self.pose_sort,
+                        PoseSortColumn::TotalScoreDesc,
+                        "S_total",
+                    );
+                    ui.selectable_value(
+                        &mut self.pose_sort,
+                        PoseSortColumn::CspScoreDesc,
+                        "S_CSP",
+                    );
+                    ui.selectable_value(
+                        &mut self.pose_sort,
+                        PoseSortColumn::NoePreViolationAsc,
+                        "E_viol (NOE/PRE)",
+                    );
+                    ui.selectable_value(
+                        &mut self.pose_sort,
+                        PoseSortColumn::RdcQFreeAsc,
+                        "RDC Q_free",
+                    );
                 });
             });
     }
@@ -1287,38 +1404,6 @@ impl IntegrativeAfPanel {
                 &format!("max id {:.1}%", rep.max_retained_seq_identity * 100.0),
                 &format!("SHA256 {sha_prefix}..."),
             );
-        });
-
-        ui.add_space(8.0);
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .button("Color 3D Ribbon by AlphaFold pLDDT")
-                .on_hover_text("Apply canonical 4-band AlphaFold pLDDT palette (#0053D6..#FF7D45)")
-                .clicked()
-            {
-                actions.push(IntegrativeAfAction::SetMol3dTrack {
-                    track: QuantitativeTrack::AlphaFoldPlddt,
-                    putty_enabled: true,
-                });
-            }
-            if ui
-                .button("Color 3D Putty by AF vs NMR Concordance")
-                .on_hover_text(
-                    "Highlight ConditionalFoldingOrCrystalArtifact and DynamicHingeOrAltState discrepancies on 3D putty",
-                )
-                .clicked()
-            {
-                actions.push(IntegrativeAfAction::SetMol3dTrack {
-                    track: QuantitativeTrack::AfNmrConcordance,
-                    putty_enabled: true,
-                });
-            }
-            if ui
-                .button("Sync 3-Track SS Ribbon")
-                .clicked()
-            {
-                actions.push(IntegrativeAfAction::SyncStructureAndConcordance);
-            }
         });
 
         ui.add_space(8.0);
@@ -1567,43 +1652,83 @@ impl IntegrativeAfPanel {
             painter.rect_filled(plot_rect, 2.0, theme.plot_bg);
 
             let bins = n.clamp(1, MAX_PAE_HEATMAP_BINS);
-            let cell_w = plot_rect.width() / (bins as f32);
-            let cell_h = plot_rect.height() / (bins as f32);
+            let domain_count = self.domain_partition.as_ref().map_or(0, |p| p.domains.len());
+            let first_bits = pae.get(0, 0).unwrap_or(0.0).to_bits() as u64;
+            let mid_bits = pae.get(n / 2, n / 2).unwrap_or(0.0).to_bits() as u64;
+            let last_bits = pae
+                .get(n.saturating_sub(1), n.saturating_sub(1))
+                .unwrap_or(0.0)
+                .to_bits() as u64;
+            let off_bits = pae
+                .get(0, n.saturating_sub(1))
+                .unwrap_or(0.0)
+                .to_bits() as u64;
+            let mut key = 0xcbf2_9ce4_8422_2325_u64;
+            for word in [
+                n as u64,
+                bins as u64,
+                (n * n) as u64,
+                first_bits,
+                mid_bits,
+                last_bits,
+                off_bits,
+                domain_count as u64,
+            ] {
+                key ^= word;
+                key = key.wrapping_mul(0x0100_0000_01b3);
+            }
 
-            for bi in 0..bins {
-                let r0 = (bi * n) / bins;
-                let r1 = (((bi + 1) * n) / bins).max(r0 + 1).min(n);
-                for bj in 0..bins {
-                    let c0 = (bj * n) / bins;
-                    let c1 = (((bj + 1) * n) / bins).max(c0 + 1).min(n);
-                    let mut sum = 0.0f32;
-                    let mut cnt = 0usize;
-                    for rr in r0..r1 {
-                        for cc in c0..c1 {
-                            if let Some(v) = pae.get(rr, cc) {
-                                sum += v;
-                                cnt += 1;
+            if self.pae_texture_key != Some(key) || self.pae_texture.is_none() {
+                let mut pixels = Vec::with_capacity(bins * bins);
+                for bi in 0..bins {
+                    let r0 = (bi * n) / bins;
+                    let r1 = (((bi + 1) * n) / bins).max(r0 + 1).min(n);
+                    for bj in 0..bins {
+                        let c0 = (bj * n) / bins;
+                        let c1 = (((bj + 1) * n) / bins).max(c0 + 1).min(n);
+                        let mut sum = 0.0f32;
+                        let mut cnt = 0usize;
+                        for rr in r0..r1 {
+                            for cc in c0..c1 {
+                                if let Some(v) = pae.get(rr, cc) {
+                                    sum += v;
+                                    cnt += 1;
+                                }
                             }
                         }
+                        let mean_pae = if cnt > 0 {
+                            sum / (cnt as f32)
+                        } else {
+                            PAE_COLORBAR_MAX_ANGSTROM
+                        };
+                        pixels.push(pae_green_to_white_color(mean_pae));
                     }
-                    let mean_pae = if cnt > 0 {
-                        sum / (cnt as f32)
-                    } else {
-                        PAE_COLORBAR_MAX_ANGSTROM
-                    };
-                    let min_pt = egui::pos2(
-                        plot_rect.min.x + (bj as f32) * cell_w,
-                        plot_rect.min.y + (bi as f32) * cell_h,
-                    );
-                    let max_pt = egui::pos2(min_pt.x + cell_w, min_pt.y + cell_h);
-                    painter.rect_filled(
-                        egui::Rect::from_min_max(min_pt, max_pt),
-                        0.0,
-                        pae_green_to_white_color(mean_pae),
-                    );
-                    self.last_telemetry.pae_cells_drawn += 1;
                 }
+                let color_image = egui::ColorImage {
+                    size: [bins, bins],
+                    source_size: egui::vec2(bins as f32, bins as f32),
+                    pixels,
+                };
+                let tex = ui.ctx().load_texture(
+                    "pae_heatmap_tex",
+                    color_image,
+                    egui::TextureOptions::NEAREST,
+                );
+                self.pae_texture = Some(tex);
+                self.pae_texture_key = Some(key);
+                self.pae_texture_uploads += 1;
             }
+
+            if let Some(ref tex) = self.pae_texture {
+                painter.image(
+                    tex.id(),
+                    plot_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            self.last_telemetry.pae_cells_drawn = bins * bins;
+            self.last_telemetry.pae_texture_uploads = self.pae_texture_uploads;
 
             // Overlay spectral rigid-domain bounding boxes (`T21.5`)
             if let Some(ref part) = self.domain_partition {
@@ -1735,7 +1860,7 @@ impl IntegrativeAfPanel {
                     egui::pos2(strip.max.x + 5.0, y),
                     egui::Align2::LEFT_TOP,
                     lbl,
-                    egui::FontId::proportional(10.5),
+                    egui::FontId::proportional(11.0),
                     theme.text_muted,
                 );
             }
@@ -1806,7 +1931,7 @@ impl IntegrativeAfPanel {
             ui.add_space(8.0);
         }
 
-        // Pose Ranker Verdict + Sort Controls
+        // Pose Ranker Verdict Banner
         ui.horizontal_wrapped(|ui| {
             let (v_bg, v_fg) = match self.pose_verdict {
                 CofoldRankVerdictView::TopPoseSelected => (theme.badge_ok_bg, theme.badge_ok_fg),
@@ -1816,28 +1941,6 @@ impl IntegrativeAfPanel {
                 CofoldRankVerdictView::Unscored => (theme.card_bg, theme.text_muted),
             };
             draw_pill_badge(ui, v_bg, v_fg, self.pose_verdict.label());
-            ui.separator();
-            ui.label(
-                egui::RichText::new("Sort poses:")
-                    .size(11.0)
-                    .color(theme.text_muted),
-            );
-            ui.selectable_value(
-                &mut self.pose_sort,
-                PoseSortColumn::TotalScoreDesc,
-                "S_total",
-            );
-            ui.selectable_value(&mut self.pose_sort, PoseSortColumn::CspScoreDesc, "S_CSP");
-            ui.selectable_value(
-                &mut self.pose_sort,
-                PoseSortColumn::NoePreViolationAsc,
-                "E_viol (NOE/PRE)",
-            );
-            ui.selectable_value(
-                &mut self.pose_sort,
-                PoseSortColumn::RdcQFreeAsc,
-                "RDC Q_free",
-            );
         });
 
         ui.add_space(4.0);
@@ -2023,7 +2126,7 @@ impl IntegrativeAfPanel {
                     egui::pos2(tx, chart_rect.max.y - 14.0),
                     egui::Align2::CENTER_TOP,
                     lbl,
-                    egui::FontId::proportional(9.5),
+                    egui::FontId::proportional(11.0),
                     theme.text_muted,
                 );
             }
@@ -2035,7 +2138,7 @@ impl IntegrativeAfPanel {
                     egui::pos2(chart_rect.min.x + 6.0, row_y + 8.0),
                     egui::Align2::LEFT_CENTER,
                     &bar.family_label,
-                    egui::FontId::proportional(10.8),
+                    egui::FontId::proportional(11.0),
                     theme.text_primary,
                 );
                 let frac = (bar.two_ln_bf_vs_null.max(0.0) / max_bf).clamp(0.0, 1.0) as f32;
@@ -2054,7 +2157,7 @@ impl IntegrativeAfPanel {
                     egui::pos2(rect.max.x + 4.0, row_y + 8.5),
                     egui::Align2::LEFT_CENTER,
                     format!("{:.1}", bar.two_ln_bf_vs_null),
-                    egui::FontId::proportional(10.5),
+                    egui::FontId::proportional(11.0),
                     theme.text_muted,
                 );
                 self.last_telemetry.bic_bars_drawn += 1;
@@ -2318,7 +2421,7 @@ fn draw_metric_card(
             ui.vertical(|ui| {
                 ui.label(
                     egui::RichText::new(title)
-                        .size(10.5)
+                        .size(11.0)
                         .color(theme.text_muted),
                 );
                 ui.label(
@@ -2327,7 +2430,7 @@ fn draw_metric_card(
                         .strong()
                         .color(theme.text_primary),
                 );
-                ui.label(egui::RichText::new(sub).size(10.0).color(theme.text_muted));
+                ui.label(egui::RichText::new(sub).size(11.0).color(theme.text_muted));
             });
         });
 }
@@ -2351,7 +2454,9 @@ fn concordance_class_color(cls: AfNmrConcordanceClass) -> egui::Color32 {
             egui::Color32::from_rgb(0xD9, 0x77, 0x06)
         }
         AfNmrConcordanceClass::DynamicHingeOrAltState => egui::Color32::from_rgb(0xDC, 0x26, 0x26),
-        AfNmrConcordanceClass::UnassignedNmr => egui::Color32::from_rgb(0x94, 0xA3, 0xB8),
+        AfNmrConcordanceClass::UnassignedNmr => egui::Color32::from_rgb(148, 163, 184),
+        #[allow(unreachable_patterns)]
+        _ => egui::Color32::from_rgb(148, 163, 184),
     }
 }
 

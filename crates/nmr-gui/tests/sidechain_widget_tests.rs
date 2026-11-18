@@ -646,9 +646,10 @@ fn simulate_click(
         pressed: true,
         modifiers: egui::Modifiers::NONE,
     });
-    let _ = ctx.run_ui(press_in, |ui| {
+    let mut press_out = ctx.run_ui(press_in, |ui| {
         let _ = run_frame(ui);
     });
+    press_out.textures_delta.clear();
 
     let mut release_in = egui::RawInput {
         screen_rect: Some(screen_rect),
@@ -665,9 +666,10 @@ fn simulate_click(
         jump_to_atom: None,
         variant_override: None,
     };
-    let _ = ctx.run_ui(release_in, |ui| {
+    let mut release_out = ctx.run_ui(release_in, |ui| {
         out = run_frame(ui);
     });
+    release_out.textures_delta.clear();
     out
 }
 
@@ -726,13 +728,14 @@ fn test_headless_egui_ribbon_selection_atom_jump_and_variant_toggle() {
         screen_rect: Some(screen_rect),
         ..egui::RawInput::default()
     };
-    let full_out0 = ctx.run_ui(raw0, |ui| {
+    let mut full_out0 = ctx.run_ui(raw0, |ui| {
         egui::CentralPanel::default().show(ui, |ui| {
             let out = SidechainInspectorPanel::show(ui, &mut state, &input);
             assert_eq!(out.selected_residue, 0);
             assert!(out.jump_to_atom.is_none());
         });
     });
+    full_out0.textures_delta.clear();
     assert!(
         !full_out0.shapes.is_empty(),
         "Painter must emit tessellatable shapes"
@@ -843,7 +846,7 @@ fn test_headless_egui_ribbon_selection_atom_jump_and_variant_toggle() {
     );
     assert_eq!(state.variant_for(1), ResidueVariant::CysOxidized);
 
-    let _ = ctx.run_ui(
+    let mut out_cys_refresh = ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(screen_rect),
             ..egui::RawInput::default()
@@ -854,6 +857,7 @@ fn test_headless_egui_ribbon_selection_atom_jump_and_variant_toggle() {
             });
         },
     );
+    out_cys_refresh.textures_delta.clear();
     assert!(
         !state.last_atom_hit_rects.contains_key("HG"),
         "CysOxidized toggle must remove HG from 2D canvas"
@@ -905,7 +909,7 @@ fn test_headless_egui_ribbon_selection_atom_jump_and_variant_toggle() {
     );
     for (idx, res_name) in all_seq.iter().enumerate() {
         state.selected_residue = idx;
-        let _ = ctx.run_ui(
+        let mut out_aa = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(screen_rect),
                 ..egui::RawInput::default()
@@ -917,6 +921,7 @@ fn test_headless_egui_ribbon_selection_atom_jump_and_variant_toggle() {
                 });
             },
         );
+        out_aa.textures_delta.clear();
         let raw_len = residue_topology(res_name).unwrap().atoms.len();
         let expected_len = if res_name == "HIS" {
             raw_len - 2

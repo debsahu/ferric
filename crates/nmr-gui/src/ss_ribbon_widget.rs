@@ -37,7 +37,7 @@ pub const MIN_SS_COL_WIDTH_PX: f32 = 8.0;
 /// Maximum zoomable residue column width (`px`).
 pub const MAX_SS_COL_WIDTH_PX: f32 = 64.0;
 /// Width of the pinned left track-title gutter (`px`).
-pub const SS_TRACK_HEADER_WIDTH_PX: f32 = 74.0;
+pub const SS_TRACK_HEADER_WIDTH_PX: f32 = 152.0;
 
 #[inline]
 fn monotonic_ms_start() -> u128 {
@@ -345,6 +345,8 @@ fn spearman_rank_correlation(xs: &[f64], ys: &[f64]) -> Option<f64> {
 /// Evaluate per-residue [`ConcordanceTrackClass`] and global Fowler–Sljoka–Williamson rigidity
 /// metrics (`Spearman rho_s`, `RMSD_rig`) from 3D secondary structure, optional `pLDDT`,
 /// `PropensityReport` (`SSP`/`delta2D` + `RCI-S^2`), and optional Lipari–Szabo `S^2`.
+///
+/// Never defaults missing `pLDDT` to `85.0` and never fabricates `(p_coil, p_ppii)` from `S^2`.
 pub fn evaluate_concordance_with_summary(
     seq_len: usize,
     ss3d: Option<&[SsState4]>,
@@ -381,8 +383,19 @@ pub fn evaluate_concordance_with_summary(
             .or_else(|| summary.rci_s2.get(k).copied().flatten());
         summary.effective_s2[k] = s2_opt;
 
+        let plddt_opt = plddt
+            .and_then(|p| p.get(k).copied().flatten())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 100.0));
+
+        // Fail closed when NMR rigidity or pLDDT is absent — never default missing pLDDT to 85.0 (`21.W1:P1-5`)!
         let Some(s2_val) = s2_opt else {
             summary.classes[k] = ConcordanceTrackClass::UnassignedNmr;
+            summary.class_counts[4] += 1;
+            continue;
+        };
+        let Some(pv) = plddt_opt else {
+            summary.classes[k] = ConcordanceTrackClass::Indeterminate;
             summary.class_counts[4] += 1;
             continue;
         };
@@ -390,62 +403,55 @@ pub fn evaluate_concordance_with_summary(
         let ss_k = ss3d
             .and_then(|s| s.get(k).copied())
             .unwrap_or(SsState4::Coil);
-        let plddt_opt = plddt
-            .and_then(|p| p.get(k).copied().flatten())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.0, 100.0));
-        // Experimental X-ray / NMR models lacking pLDDT default to ordered coordinate confidence (85.0).
-        let eff_plddt = plddt_opt.unwrap_or(85.0);
 
         if k > 0 && k + 1 < seq_len {
-            if let Some(pv) = plddt_opt {
-                eval_plddt.push(pv);
-                eval_s2.push(s2_val);
-                let s2_af = ((pv - 35.0) / 55.0).clamp(0.0, 1.0);
-                let diff = s2_af - s2_val;
-                rig_sq_sum += diff * diff;
-            }
+            eval_plddt.push(pv);
+            eval_s2.push(s2_val);
+            let s2_af = ((pv - 35.0) / 55.0).clamp(0.0, 1.0);
+            let diff = s2_af - s2_val;
+            rig_sq_sum += diff * diff;
         }
 
-        let (ssp_val, p_alpha, p_beta, p_ppii, p_coil) = propensity
+        let prop_res = propensity
             .and_then(|rep| rep.residues.get(k))
-            .filter(|r| r.has_data)
-            .map(|r| {
-                (
-                    r.ssp_score.unwrap_or(0.0),
-                    r.p_alpha,
-                    r.p_beta,
-                    r.p_ppii,
-                    r.p_coil,
-                )
-            })
-            .unwrap_or_else(|| {
-                if s2_val < 0.60 {
-                    (0.0, 0.05, 0.05, 0.25, 0.65)
+            .filter(|r| r.has_data);
+        let ssp_opt = prop_res.and_then(|r| r.ssp_score);
+        let p_helix = prop_res.map(|r| r.p_alpha).unwrap_or(0.0);
+        let p_sheet = prop_res.map(|r| r.p_beta).unwrap_or(0.0);
+        let p_ppii = prop_res.map(|r| r.p_ppii).unwrap_or(0.0);
+        let p_coil = prop_res.map(|r| r.p_coil).unwrap_or(0.0);
+
+        let has_ss_inversion = prop_res.is_some()
+            && ((ss_k == SsState4::Helix
+                && (ssp_opt.is_some_and(|s| s <= -0.25) || p_sheet >= 0.45))
+                || (ss_k == SsState4::Sheet
+                    && (ssp_opt.is_some_and(|s| s >= 0.25) || p_helix >= 0.45)));
+
+        let cls = if pv >= 70.0 {
+            if s2_val < 0.65 {
+                if matches!(ss_k, SsState4::Helix | SsState4::Sheet)
+                    && prop_res.is_some()
+                    && (p_coil + p_ppii) >= 0.65
+                {
+                    ConcordanceTrackClass::ConditionalFoldingOrCrystalArtifact
                 } else {
-                    (0.0, 0.35, 0.35, 0.10, 0.20)
+                    ConcordanceTrackClass::DynamicHingeOrAltState
                 }
-            });
-
-        let has_ss_inversion = (ss_k == SsState4::Helix && (ssp_val <= -0.25 || p_beta >= 0.45))
-            || (ss_k == SsState4::Sheet && (ssp_val >= 0.25 || p_alpha >= 0.45));
-
-        let cls = if eff_plddt >= 70.0
-            && matches!(ss_k, SsState4::Helix | SsState4::Sheet)
-            && s2_val < 0.60
-            && (p_coil + p_ppii) >= 0.65
-        {
-            ConcordanceTrackClass::ConditionalFoldingOrCrystalArtifact
-        } else if (eff_plddt >= 70.0 && s2_val >= 0.65 && has_ss_inversion)
-            || (eff_plddt < 70.0 && s2_val >= 0.72)
-        {
+            } else if has_ss_inversion {
+                ConcordanceTrackClass::DynamicHingeOrAltState
+            } else if ss3d.is_none() && prop_res.is_none() {
+                ConcordanceTrackClass::Indeterminate
+            } else {
+                ConcordanceTrackClass::ConcordantOrdered
+            }
+        } else if pv >= 50.0 {
+            ConcordanceTrackClass::Indeterminate
+        } else if s2_val >= 0.75 || p_helix >= 0.50 || p_sheet >= 0.50 {
             ConcordanceTrackClass::DynamicHingeOrAltState
-        } else if eff_plddt < 70.0 {
+        } else if s2_val < 0.65 || (prop_res.is_some() && (p_coil + p_ppii) >= 0.50) {
             ConcordanceTrackClass::ConcordantDisordered
-        } else if s2_val < 0.55 && (p_coil + p_ppii) >= 0.70 {
-            ConcordanceTrackClass::ConditionalFoldingOrCrystalArtifact
         } else {
-            ConcordanceTrackClass::ConcordantOrdered
+            ConcordanceTrackClass::Indeterminate
         };
 
         summary.classes[k] = cls;
@@ -454,7 +460,7 @@ pub fn evaluate_concordance_with_summary(
             ConcordanceTrackClass::ConcordantDisordered => 1,
             ConcordanceTrackClass::ConditionalFoldingOrCrystalArtifact => 2,
             ConcordanceTrackClass::DynamicHingeOrAltState => 3,
-            ConcordanceTrackClass::UnassignedNmr => 4,
+            ConcordanceTrackClass::Indeterminate | ConcordanceTrackClass::UnassignedNmr => 4,
         };
         summary.class_counts[bucket] += 1;
     }
@@ -567,6 +573,9 @@ pub struct SsRibbonState {
     pub cached_propensity: Option<PropensityReport>,
     /// Optional external override for Track 3 (`AF vs NMR`, e.g. from `nmr-core::af_concordance`).
     pub concordance_override: Option<Vec<ConcordanceTrackClass>>,
+    /// `true` when experimental Lipari–Szabo relaxation `S²` values are loaded; `false` when Track 3
+    /// uses chemical-shift-derived `"RCI-S² (shift-derived)"`.
+    pub has_experimental_s2: bool,
     /// Evaluated Track 3 concordance summary (live or override-backed).
     pub concordance_summary: ConcordanceTrackSummary,
     /// Wall-clock duration (`ms`) of the most recent Track 2 `SSP` incremental update.
@@ -598,6 +607,7 @@ impl SsRibbonState {
             plddt_track: Vec::new(),
             cached_propensity: None,
             concordance_override: None,
+            has_experimental_s2: false,
             concordance_summary: ConcordanceTrackSummary::default(),
             last_nmr_update_ms: 0.0,
             last_col_rects: Vec::new(),
@@ -605,6 +615,17 @@ impl SsRibbonState {
             last_widget_rect: None,
             last_prim_counts: SsRibbonPrimCounts::default(),
             last_shift_fingerprint: 0,
+        }
+    }
+
+    /// Explicit provenance label for the solution NMR rigidity source (`"Experimental S²"` vs
+    /// `"RCI-S² (shift-derived)"`).
+    #[inline]
+    pub const fn rigidity_source_label(&self) -> &'static str {
+        if self.has_experimental_s2 {
+            "Experimental S²"
+        } else {
+            "RCI-S² (shift-derived)"
         }
     }
 
@@ -621,7 +642,6 @@ impl SsRibbonState {
         self.col_width_px = DEFAULT_SS_COL_WIDTH_PX;
     }
 
-    /// Directly set Track 1 (`3D SS`) 4-state secondary-structure slice.
     /// Directly set Track 1 3D secondary-structure states (`[0..L]`).
     pub fn set_ss3d_slice(&mut self, ss: &[SsState4]) {
         self.ss3d_track.clear();
@@ -663,7 +683,7 @@ impl SsRibbonState {
                 ConcordanceTrackClass::ConcordantDisordered => 1,
                 ConcordanceTrackClass::ConditionalFoldingOrCrystalArtifact => 2,
                 ConcordanceTrackClass::DynamicHingeOrAltState => 3,
-                ConcordanceTrackClass::UnassignedNmr => 4,
+                ConcordanceTrackClass::Indeterminate | ConcordanceTrackClass::UnassignedNmr => 4,
             };
             counts[b] += 1;
         }
@@ -731,6 +751,7 @@ impl SsRibbonState {
         ensemble: Option<&StructureEnsemble3d>,
         exp_s2: Option<&BTreeMap<usize, f64>>,
     ) {
+        self.has_experimental_s2 = exp_s2.is_some_and(|m| !m.is_empty());
         if let Some(ens) = ensemble {
             let mut ss_vec = vec![SsState4::Coil; seq_len];
             let mut plddt_vec = vec![None::<f64>; seq_len];
@@ -931,10 +952,10 @@ impl SsRibbonPanel {
         }
 
         let theme = SsRibbonTheme::for_mode(input.paper_white);
-        let ruler_h = 13.0_f32;
+        let ruler_h = 15.0_f32;
         let t1_h = 16.0_f32;
         let t2_h = 17.0_f32;
-        let t3_h = 13.0_f32;
+        let t3_h = 15.0_f32;
         let total_h = ruler_h + t1_h + t2_h + t3_h + 4.0;
         let col_w = state
             .col_width_px
@@ -987,19 +1008,24 @@ impl SsRibbonPanel {
                     egui::pos2(hdr_rect.left() + 5.0, r0_mid),
                     egui::Align2::LEFT_CENTER,
                     format!("Seq {zoom_pct}%"),
-                    egui::FontId::monospace(8.5),
+                    egui::FontId::monospace(11.0),
                     theme.ruler_text,
                 );
+                let track3_label = if state.has_experimental_s2 {
+                    "AF vs S2"
+                } else {
+                    "RCI-S² (shift-derived)"
+                };
                 for (mid_y, lbl) in [
                     (t1_top + 0.5 * t1_h, "3D SS"),
                     (t2_top + 0.5 * t2_h, "NMR SS"),
-                    (t3_top + 0.5 * t3_h, "AF vs NMR"),
+                    (t3_top + 0.5 * t3_h, track3_label),
                 ] {
                     hp.text(
                         egui::pos2(hdr_rect.left() + 5.0, mid_y),
                         egui::Align2::LEFT_CENTER,
                         lbl,
-                        egui::FontId::monospace(9.0),
+                        egui::FontId::monospace(11.0),
                         theme.header_text,
                     );
                 }
@@ -1111,6 +1137,7 @@ impl SsRibbonPanel {
 
                         // Sequence ruler row (1-letter amino acid code + periodic residue ticks)
                         let ruler_mid_y = r_ruler.center().y;
+                        let vis_clip = ui.clip_rect();
                         for (k, three) in input.sequence.iter().enumerate() {
                             let cx = canvas_rect.left() + ((k as f32) + 0.5) * col_w;
                             let sid = input.seq_ids.get(k).copied().unwrap_or((k + 1) as i32);
@@ -1121,21 +1148,32 @@ impl SsRibbonPanel {
                                 } else {
                                     ch.to_string()
                                 };
-                                painter.text(
-                                    egui::pos2(cx, ruler_mid_y),
-                                    egui::Align2::CENTER_CENTER,
-                                    lbl,
-                                    egui::FontId::monospace(8.5),
-                                    theme.ruler_text,
-                                );
+                                let est_half_w = (lbl.chars().count() as f32) * 3.8 + 2.0;
+                                if cx - est_half_w >= vis_clip.left()
+                                    && cx + est_half_w <= vis_clip.right()
+                                {
+                                    painter.text(
+                                        egui::pos2(cx, ruler_mid_y),
+                                        egui::Align2::CENTER_CENTER,
+                                        lbl,
+                                        egui::FontId::monospace(11.0),
+                                        theme.ruler_text,
+                                    );
+                                }
                             } else if k == 0 || sid % 10 == 0 {
-                                painter.text(
-                                    egui::pos2(cx, ruler_mid_y),
-                                    egui::Align2::CENTER_CENTER,
-                                    format!("{sid}"),
-                                    egui::FontId::monospace(8.0),
-                                    theme.ruler_text,
-                                );
+                                let lbl = format!("{sid}");
+                                let est_half_w = (lbl.len() as f32) * 3.8 + 2.0;
+                                if cx - est_half_w >= vis_clip.left()
+                                    && cx + est_half_w <= vis_clip.right()
+                                {
+                                    painter.text(
+                                        egui::pos2(cx, ruler_mid_y),
+                                        egui::Align2::CENTER_CENTER,
+                                        lbl,
+                                        egui::FontId::monospace(11.0),
+                                        theme.ruler_text,
+                                    );
+                                }
                             }
                         }
 
@@ -1421,6 +1459,13 @@ impl SsRibbonPanel {
                                     }
                                     state.last_prim_counts.track3_double_borders += 1;
                                 }
+                                ConcordanceTrackClass::Indeterminate => {
+                                    painter.rect_filled(
+                                        blk,
+                                        1.5,
+                                        egui::Color32::from_rgb(148, 163, 184),
+                                    );
+                                }
                                 ConcordanceTrackClass::UnassignedNmr => {
                                     painter.rect_filled(blk, 1.5, theme.unassigned_fill);
                                     painter.rect_stroke(
@@ -1508,15 +1553,16 @@ impl SsRibbonPanel {
                                         ui.monospace("NMR SS    : Unassigned");
                                     }
                                 }
+                                let rig_label = state.rigidity_source_label();
                                 match s2_opt {
                                     Some(s2) => {
                                         ui.monospace(format!(
-                                            "AF vs NMR : {} (S^2 {s2:.2})",
+                                            "{rig_label}: {} (S^2 {s2:.2})",
                                             cls.label()
                                         ));
                                     }
                                     None => {
-                                        ui.monospace(format!("AF vs NMR : {}", cls.label()));
+                                        ui.monospace(format!("{rig_label}: {}", cls.label()));
                                     }
                                 }
                                 ui.label(

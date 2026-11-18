@@ -123,7 +123,7 @@ fn test_physical_nucleus_inference_and_all_3_orthogonal_orientations_plus_skylin
     let mut tiler = StripTilerPanel::new();
     let mut xh = SyncCrosshair::new(8.42, 118.5, Some(1.42));
     let ctx_egui = egui::Context::default();
-    let _ = ctx_egui.run_ui(egui::RawInput::default(), |ui| {
+    let mut out = ctx_egui.run_ui(egui::RawInput::default(), |ui| {
         let sctx = StripTilerContext {
             systems: &systems,
             pair_mat: &p_mat,
@@ -141,6 +141,7 @@ fn test_physical_nucleus_inference_and_all_3_orthogonal_orientations_plus_skylin
         };
         let _ = tiler.show(ui, &sctx, Some(&mut xh));
     });
+    out.textures_delta.clear();
 
     // 1. F3xF2 plane stepped along F1 (1H_NH x 15N at 1H_aliph = 1.42 ppm)
     let iz_hb = hccconh.axis_z.ppm_to_index(1.42).round() as usize;

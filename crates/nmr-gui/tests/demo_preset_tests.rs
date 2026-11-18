@@ -78,15 +78,18 @@ fn test_builtin_demo_suite_in_memory_and_headless_panels() {
 
     // 6. Headless egui rendering smoke test across 1D Stack, DOSY, and Metabolomics panels
     let ctx = egui::Context::default();
-    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+    let mut out1 = ctx.run_ui(egui::RawInput::default(), |ui| {
         render_stack1d_panel(ui, &mut suite.stack1d_panel);
     });
-    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+    out1.textures_delta.clear();
+    let mut out2 = ctx.run_ui(egui::RawInput::default(), |ui| {
         let _ = render_dosy_panel(ui, &mut suite.dosy_panel);
     });
-    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+    out2.textures_delta.clear();
+    let mut out3 = ctx.run_ui(egui::RawInput::default(), |ui| {
         suite.metabolomics_panel.ui(ui);
     });
+    out3.textures_delta.clear();
 
     // 7. Determinism check on identical seed
     let suite_repeat =

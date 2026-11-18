@@ -34,7 +34,7 @@ use crate::contour_painter::{default_overlay_palette, OverlayLayerSpec, SyncCros
 use crate::stack1d_panel::{default_trace_color, RoiRegion1d, Stack1dState, Trace1d};
 
 /// Default width in logical pixels of the collapsible left `"Spectra"` workbook sidebar on Desktop.
-pub const WORKBOOK_SIDEBAR_DEFAULT_WIDTH: f32 = 196.0;
+pub const WORKBOOK_SIDEBAR_DEFAULT_WIDTH: f32 = 168.0;
 
 /// Exact width in logical pixels of the slim vertical left tool rail on 1D and 2D spectrum canvases.
 pub const CANVAS_TOOL_RAIL_WIDTH: f32 = 38.0;
@@ -1647,7 +1647,7 @@ pub struct Stored2dPage {
     pub peaks: Vec<Peak>,
     pub peak_2d_labels: BTreeMap<(i64, i64), String>,
     pub c13_picked_dataset: Option<C13PickedDataset>,
-    pub water_undo_2d: Option<(Spectrum2D, Option<Spectrum3D>, Option<Spectrum3D>)>,
+    pub water_undo_2d: Option<Spectrum2D>,
     pub zoom_history: Vec<[f32; 4]>,
     pub pick_diagonal: bool,
     pub mini_dots: Vec<([f32; 2], bool)>,
@@ -1655,6 +1655,12 @@ pub struct Stored2dPage {
     pub cube_slice: Cube3dSliceState,
     pub peaks_3d: Vec<CubePeak3D>,
     pub water_undo_3d: Option<Spectrum3D>,
+    /// Multi-level 2D water suppression undo stack (`v0150:P1-6`).
+    pub water_undo_2d_stack: Vec<Spectrum2D>,
+    /// Multi-level 3D water suppression undo stack (`v0150:P1-6`).
+    pub water_undo_3d_stack: Vec<Spectrum3D>,
+    /// Per-layer axis-sync flags `[sync_f2, sync_f1]` for overlays (`UI-C12`).
+    pub axis_sync: [bool; 2],
 }
 
 fn relabeled_axis(axis: &AxisPpm, nuc: &'static str) -> AxisPpm {
@@ -1898,6 +1904,9 @@ impl Stored2dPage {
             cube_slice: Cube3dSliceState::default(),
             peaks_3d: Vec::new(),
             water_undo_3d: None,
+            water_undo_2d_stack: Vec::new(),
+            water_undo_3d_stack: Vec::new(),
+            axis_sync: [true, true],
         }
     }
 
@@ -2198,22 +2207,36 @@ impl Stored2dPage {
     }
 
     /// Apply lossless-undoable 3D water suppression (`ws`) directly to `s3` and refresh the active plane/skyline.
+    ///
+    /// Multi-level (`v0150:P1-6`): repeated `ws` calls push onto `water_undo_3d_stack` (bounded on
+    /// `wasm32`) so `ws, ws, wu, wu` restores the intermediate and then the original cube.
     pub fn suppress_water_on_3d_cube(
         &mut self,
         s3: &mut Spectrum3D,
         cfg: &WaterSuppressionConfig,
     ) -> f64 {
-        self.water_undo_3d = Some(s3.clone());
+        let cap = crate::undo_journal::default_snapshot_depth();
+        if self.water_undo_3d_stack.len() >= cap {
+            let excess = self.water_undo_3d_stack.len() + 1 - cap;
+            self.water_undo_3d_stack.drain(0..excess);
+        }
+        self.water_undo_3d_stack.push(s3.clone());
+        self.water_undo_3d = self.water_undo_3d_stack.last().cloned();
         let carrier = suppress_water_3d(s3, cfg);
         self.refresh_from_3d_cube(s3, false);
         carrier
     }
 
-    /// Losslessly restore `s3` prior to 3D water suppression (`wu`) and refresh the active plane/skyline.
+    /// Losslessly restore `s3` prior to the most recent 3D water suppression (`wu`) and refresh.
     pub fn undo_water_on_3d_cube(&mut self, s3: &mut Spectrum3D) -> bool {
-        let Some(prev) = self.water_undo_3d.take() else {
+        let prev = self
+            .water_undo_3d_stack
+            .pop()
+            .or_else(|| self.water_undo_3d.take());
+        let Some(prev) = prev else {
             return false;
         };
+        self.water_undo_3d = self.water_undo_3d_stack.last().cloned();
         *s3 = prev;
         self.refresh_from_3d_cube(s3, false);
         true
@@ -2242,6 +2265,9 @@ pub enum ActiveWorkbookSelection {
 /// User actions emitted by [`render_workbook_sidebar`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkbookSidebarAction {
+    /// Right-click context menu on a workbook page card (`UI-C9`).
+    ContextMenuRenamePage(WorkbookPageRef),
+    /// Duplicate / export / remove actions via right-click (`UI-C9`).
     Select1dPage(usize),
     Toggle1dOverlay(usize),
     Remove1dPage(usize),
@@ -2250,6 +2276,13 @@ pub enum WorkbookSidebarAction {
     Remove2dPage(usize),
     OpenStudio(WorkbookStudioKind),
     TriggerOpenFiles,
+}
+
+/// Reference to a workbook page for context-menu actions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkbookPageRef {
+    Trace1D(usize),
+    Spectrum2D(usize),
 }
 
 // ============================================================================
@@ -2346,9 +2379,9 @@ pub struct TwoDCanvasState {
 impl Default for TwoDCanvasState {
     fn default() -> Self {
         Self {
-            tool_mode: ToolMode2d::ZoomBox,
-            show_projections: true,
-            show_params_card: true,
+            tool_mode: ToolMode2d::Pan,
+            show_projections: false,
+            show_params_card: false,
             show_peak_table: false,
             pick_diagonal: false,
             selected_peak_idx: None,
@@ -2474,9 +2507,9 @@ impl WorkbookState {
 
     /// Synchronize all open `WorkbookPageKind::Cube3d` pages to `(h_ppm, n_ppm)` (`gs` chord)
     /// and return the page index of the first synchronized `Cube3d` page (if any).
-    pub fn sync_open_3d_cubes_to_hn(
+    pub fn sync_open_3d_cubes_to_hn<S: std::borrow::Borrow<Spectrum3D>>(
         &mut self,
-        cubes_3d: &[Spectrum3D],
+        cubes_3d: &[S],
         h_ppm: f64,
         n_ppm: f64,
     ) -> Option<(usize, f64, f64)> {
@@ -2486,7 +2519,7 @@ impl WorkbookState {
             let Some(c_idx) = pg.cube_idx() else {
                 continue;
             };
-            let Some(s3) = cubes_3d.get(c_idx) else {
+            let Some(s3) = cubes_3d.get(c_idx).map(std::borrow::Borrow::borrow) else {
                 continue;
             };
             let (sx, sy) = pg.cube_slice.sync_to_hn(s3, h_ppm, n_ppm);
@@ -3225,7 +3258,7 @@ pub fn paint_f2_marginal_strip(
         egui::pos2(f2_rect.right() - 5.0, f2_rect.top() + 3.0),
         egui::Align2::RIGHT_TOP,
         &curve.source_label,
-        egui::FontId::monospace(9.0),
+        egui::FontId::monospace(11.0),
         theme.axis_muted,
     );
     p.rect_stroke(
@@ -3299,7 +3332,7 @@ pub fn paint_f1_marginal_strip(
         egui::pos2(f1_rect.left() + 4.0, f1_rect.bottom() - 3.0),
         egui::Align2::LEFT_BOTTOM,
         &curve.source_label,
-        egui::FontId::monospace(8.5),
+        egui::FontId::monospace(11.0),
         theme.axis_muted,
     );
     p.rect_stroke(
@@ -3399,6 +3432,24 @@ fn paint_mini_2d_preview(
     );
 }
 
+fn paint_elided_card_line(
+    painter: &egui::Painter,
+    clip_rect: egui::Rect,
+    center_y: f32,
+    text: &str,
+    font_id: egui::FontId,
+    color: egui::Color32,
+) {
+    let avail_w = (clip_rect.width() - 2.0).max(8.0);
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font_id, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(avail_w);
+    let galley = painter.layout_job(job);
+    let y = center_y - 0.5 * galley.size().y;
+    painter
+        .with_clip_rect(clip_rect)
+        .galley(egui::pos2(clip_rect.left(), y), galley, color);
+}
+
 /// Render the unified Multi-Page `"Spectra"` Workbook Sidebar (`196 px` default Desktop width).
 #[allow(clippy::too_many_arguments)]
 pub fn render_workbook_sidebar(
@@ -3406,20 +3457,21 @@ pub fn render_workbook_sidebar(
     workbook: &mut WorkbookState,
     stack1d: &Stack1dState,
     selection: ActiveWorkbookSelection,
-    has_3d_cubes: bool,
-    has_pdb: bool,
-    show_strips_dock: bool,
-    show_mol3d_dock: bool,
+    _has_3d_cubes: bool,
+    _has_pdb: bool,
+    _show_strips_dock: bool,
+    _show_mol3d_dock: bool,
 ) -> Vec<WorkbookSidebarAction> {
     let mut actions = Vec::new();
     let total_pages = stack1d.traces.len() + workbook.pages_2d.len();
 
     // 1. Sidebar Header: "SPECTRA" + page count badge + quick Open icon
+    // Fixed-order horizontal layout so `+` never overlaps the badge (`UI-B5`).
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("SPECTRA")
-                .size(10.5)
+                .size(11.0)
                 .strong()
                 .color(egui::Color32::from_rgb(148, 163, 184)),
         );
@@ -3430,33 +3482,31 @@ pub fn render_workbook_sidebar(
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(format!("{total_pages}"))
-                        .size(10.0)
+                        .size(11.0)
                         .monospace()
                         .color(egui::Color32::from_rgb(203, 213, 225)),
                 );
             });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if chrome_icon_button(
-                ui,
-                WorkbookIcon::PlusOverlay,
-                None,
-                false,
-                "Open spectrum folder or file into workbook",
-                22.0,
-            )
-            .clicked()
-            {
-                actions.push(WorkbookSidebarAction::TriggerOpenFiles);
-            }
-        });
+        let rem = (ui.available_width() - 26.0).max(0.0);
+        if rem > 0.0 {
+            ui.add_space(rem);
+        }
+        if chrome_icon_button(
+            ui,
+            WorkbookIcon::PlusOverlay,
+            None,
+            false,
+            "Open spectrum folder or file into workbook",
+            22.0,
+        )
+        .clicked()
+        {
+            actions.push(WorkbookSidebarAction::TriggerOpenFiles);
+        }
     });
     ui.add_space(3.0);
 
-    // Reserve bottom space for the collapsible "Tools & Studios" section
-    let studio_active = matches!(selection, ActiveWorkbookSelection::Studio(_));
-    let tools_expanded = workbook.show_tools_section || studio_active;
-    let bottom_reserve = if tools_expanded { 196.0 } else { 34.0 };
-    let list_h = (ui.available_height() - bottom_reserve).max(96.0);
+    let list_h = (ui.available_height() - 6.0).max(96.0);
 
     // 2. Scrollable numbered Page Cards (`1..=N`)
     egui::ScrollArea::vertical()
@@ -3572,7 +3622,7 @@ pub fn render_workbook_sidebar(
                         badge_r.center(),
                         egui::Align2::CENTER_CENTER,
                         format!("{page_num}"),
-                        egui::FontId::monospace(9.5),
+                        egui::FontId::monospace(11.0),
                         egui::Color32::from_rgb(226, 232, 240),
                     );
 
@@ -3588,9 +3638,10 @@ pub fn render_workbook_sidebar(
                         egui::pos2(badge_r.right() + 5.0, rect.top() + 3.0),
                         egui::pos2(max_title_x.max(badge_r.right() + 20.0), rect.top() + 21.0),
                     );
-                    painter.with_clip_rect(title_clip).text(
-                        egui::pos2(title_clip.left(), badge_r.center().y),
-                        egui::Align2::LEFT_CENTER,
+                    paint_elided_card_line(
+                        painter,
+                        title_clip,
+                        badge_r.center().y,
                         &title,
                         egui::FontId::proportional(11.5),
                         egui::Color32::from_rgb(241, 245, 249),
@@ -3598,14 +3649,15 @@ pub fn render_workbook_sidebar(
 
                     // Subtitle
                     let sub_clip = egui::Rect::from_min_max(
-                        egui::pos2(rect.left() + 7.0, rect.top() + 21.0),
-                        egui::pos2(rect.right() - 6.0, rect.top() + 35.0),
+                        egui::pos2(rect.left() + 7.0, rect.top() + 20.0),
+                        egui::pos2(rect.right() - 6.0, rect.top() + 36.0),
                     );
-                    painter.with_clip_rect(sub_clip).text(
-                        egui::pos2(sub_clip.left(), sub_clip.center().y),
-                        egui::Align2::LEFT_CENTER,
+                    paint_elided_card_line(
+                        painter,
+                        sub_clip,
+                        sub_clip.center().y,
                         &subtitle,
-                        egui::FontId::monospace(9.2),
+                        egui::FontId::monospace(11.0),
                         egui::Color32::from_rgb(148, 163, 184),
                     );
 
@@ -3662,12 +3714,33 @@ pub fn render_workbook_sidebar(
                     }
                 }
 
-                resp.on_hover_text(if show_ov_btn {
+                let resp = resp.on_hover_text(if show_ov_btn {
                     format!(
                         "{title}\nClick card to solo · Click '+'/eye to superimpose with active 1D"
                     )
                 } else {
                     format!("{title}\n{subtitle}")
+                });
+                resp.context_menu(|ui| {
+                    if ui.button("Open Page").clicked() {
+                        actions.push(WorkbookSidebarAction::Select1dPage(idx));
+                        ui.close();
+                    }
+                    if show_ov_btn {
+                        let lbl = if is_overlaid {
+                            "Hide Overlay"
+                        } else {
+                            "Overlay on Active 1D"
+                        };
+                        if ui.button(lbl).clicked() {
+                            actions.push(WorkbookSidebarAction::Toggle1dOverlay(idx));
+                            ui.close();
+                        }
+                    }
+                    if ui.button("Close Page").clicked() {
+                        actions.push(WorkbookSidebarAction::Remove1dPage(idx));
+                        ui.close();
+                    }
                 });
                 page_num += 1;
             }
@@ -3782,7 +3855,7 @@ pub fn render_workbook_sidebar(
                         } else {
                             format!("{page_num}")
                         },
-                        egui::FontId::monospace(9.5),
+                        egui::FontId::monospace(11.0),
                         egui::Color32::from_rgb(226, 232, 240),
                     );
 
@@ -3797,9 +3870,10 @@ pub fn render_workbook_sidebar(
                         egui::pos2(badge_r.right() + 5.0, rect.top() + 3.0),
                         egui::pos2(max_title_x.max(badge_r.right() + 20.0), rect.top() + 21.0),
                     );
-                    painter.with_clip_rect(title_clip).text(
-                        egui::pos2(title_clip.left(), badge_r.center().y),
-                        egui::Align2::LEFT_CENTER,
+                    paint_elided_card_line(
+                        painter,
+                        title_clip,
+                        badge_r.center().y,
                         &pg.title,
                         egui::FontId::proportional(11.5),
                         egui::Color32::from_rgb(241, 245, 249),
@@ -3809,11 +3883,12 @@ pub fn render_workbook_sidebar(
                         egui::pos2(rect.left() + 7.0, rect.top() + 24.0),
                         egui::pos2(thumb_r.left() - 4.0, rect.bottom() - 4.0),
                     );
-                    painter.with_clip_rect(sub_clip).text(
-                        egui::pos2(sub_clip.left(), sub_clip.center().y),
-                        egui::Align2::LEFT_CENTER,
+                    paint_elided_card_line(
+                        painter,
+                        sub_clip,
+                        sub_clip.center().y,
                         &pg.subtitle,
-                        egui::FontId::monospace(9.0),
+                        egui::FontId::monospace(11.0),
                         egui::Color32::from_rgb(148, 163, 184),
                     );
 
@@ -3861,7 +3936,7 @@ pub fn render_workbook_sidebar(
                     }
                 }
 
-                resp.on_hover_text(if compat_with_active {
+                let resp = resp.on_hover_text(if compat_with_active {
                     format!(
                         "{}\nClick card to inspect · Click '+'/eye to overlay GPU contours",
                         pg.title
@@ -3869,88 +3944,30 @@ pub fn render_workbook_sidebar(
                 } else {
                     format!("{}\n{}", pg.title, pg.subtitle)
                 });
+                resp.context_menu(|ui| {
+                    if ui.button("Open Page").clicked() {
+                        actions.push(WorkbookSidebarAction::Select2dPage(idx));
+                        ui.close();
+                    }
+                    if compat_with_active {
+                        let lbl = if is_overlaid {
+                            "Hide Overlay"
+                        } else {
+                            "Overlay on Active 2D"
+                        };
+                        if ui.button(lbl).clicked() {
+                            actions.push(WorkbookSidebarAction::Toggle2dOverlay(idx));
+                            ui.close();
+                        }
+                    }
+                    if ui.button("Close Page").clicked() {
+                        actions.push(WorkbookSidebarAction::Remove2dPage(idx));
+                        ui.close();
+                    }
+                });
                 page_num += 1;
             }
         });
-
-    // 3. Bottom Collapsible "Tools & Studios" Section
-    ui.add_space(4.0);
-    ui.separator();
-    let chev = if tools_expanded {
-        WorkbookIcon::ChevronDown
-    } else {
-        WorkbookIcon::ChevronRight
-    };
-    if chrome_icon_button(
-        ui,
-        chev,
-        Some("Tools & Studios"),
-        studio_active,
-        "Expand specialized Chemical Structure, 3D Strips, Dynamics, DOSY, and Metabolomics studios",
-        24.0,
-    )
-    .clicked()
-    {
-        workbook.show_tools_section = !tools_expanded;
-    }
-
-    if workbook.show_tools_section || studio_active {
-        ui.add_space(2.0);
-        ui.spacing_mut().item_spacing.y = 3.0;
-        let items = [
-            (
-                WorkbookStudioKind::ChemicalStructure,
-                WorkbookIcon::StructureChem,
-                "Chemical Structure",
-                selection == ActiveWorkbookSelection::Studio(WorkbookStudioKind::ChemicalStructure),
-            ),
-            (
-                WorkbookStudioKind::Protein3dStrips,
-                WorkbookIcon::Strips3D,
-                if has_3d_cubes {
-                    "3D Protein Strips (Loaded)"
-                } else {
-                    "3D Protein Strips"
-                },
-                show_strips_dock,
-            ),
-            (
-                WorkbookStudioKind::Biomolecular3dPdb,
-                WorkbookIcon::Cube3D,
-                if has_pdb {
-                    "3D Structure PDB (Loaded)"
-                } else {
-                    "3D Structure PDB"
-                },
-                show_mol3d_dock,
-            ),
-            (
-                WorkbookStudioKind::RelaxationDynamics,
-                WorkbookIcon::RelaxDynamics,
-                "Relaxation & CEST",
-                selection
-                    == ActiveWorkbookSelection::Studio(WorkbookStudioKind::RelaxationDynamics),
-            ),
-            (
-                WorkbookStudioKind::DosyDiffusion,
-                WorkbookIcon::DosyGradient,
-                "DOSY Diffusion",
-                selection == ActiveWorkbookSelection::Studio(WorkbookStudioKind::DosyDiffusion),
-            ),
-            (
-                WorkbookStudioKind::MetabolomicsCohort,
-                WorkbookIcon::MetabolomicsCluster,
-                "Metabolomics",
-                selection
-                    == ActiveWorkbookSelection::Studio(WorkbookStudioKind::MetabolomicsCohort),
-            ),
-        ];
-        for (kind, icon, label, active) in items {
-            if chrome_icon_button(ui, icon, Some(label), active, label, 24.0).clicked() {
-                actions.push(WorkbookSidebarAction::OpenStudio(kind));
-            }
-        }
-    }
 
     actions
 }
@@ -4155,7 +4172,7 @@ mod tests {
         wb.set_single_2d_page("2D COSY", build_showcase_small_molecule_cosy_2d(), false);
 
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             let _ = render_workbook_sidebar(
                 ui,
                 &mut wb,
@@ -4194,5 +4211,6 @@ mod tests {
                 let _ = rail_tool_button(ui, icon, false, "test");
             }
         });
+        out.textures_delta.clear();
     }
 }

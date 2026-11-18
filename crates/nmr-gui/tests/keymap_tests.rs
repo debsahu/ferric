@@ -50,8 +50,13 @@ const EXPECTED_TWO_KEY_CHORDS: &[((char, char), &str, WorkbenchAction)] = &[
         "Chord: x_",
         WorkbenchAction::SelectCrosshairSliceMode,
     ),
-    (('c', 'i'), "Chord: c_", WorkbenchAction::RaiseContourFloor),
-    (('c', 'b'), "Chord: c_", WorkbenchAction::LowerContourFloor),
+    (
+        ('x', 'l'),
+        "Chord: x_",
+        WorkbenchAction::ToggleCrosshairLockChord,
+    ),
+    (('c', 'i'), "Chord: c_", WorkbenchAction::ShowMoreSignal),
+    (('c', 'b'), "Chord: c_", WorkbenchAction::ShowLessSignal),
     (
         ('k', 'r'),
         "Chord: k_",
@@ -163,14 +168,39 @@ fn test_single_key_space_crosshair_lock_and_question_cheat_sheet() {
     let mut km = ChordDispatcher::new();
     let focus = KeyFocusContext::default();
 
-    // Space toggles crosshair lock immediately without entering Pending
+    // `Space` is reserved strictly for hold-to-pan across all canvases (`UI-C5`), never toggling lock!
     let sp = km.feed_key(KeyChordInput::space(), 100, focus);
-    assert_eq!(
-        sp,
-        ChordOutcome::Dispatched(WorkbenchAction::ToggleCrosshairLock)
-    );
+    assert_eq!(sp, ChordOutcome::UnboundKey);
     assert_eq!(km.state(), ChordState::Idle);
     assert!(!km.cheat_sheet_open);
+
+    // `+` -> ShowMoreSignal, `-` -> ShowLessSignal (`UI-C6`)
+    assert_eq!(
+        km.feed_key(
+            KeyChordInput {
+                key: ChordKey::Plus,
+                ctrl_or_cmd: false,
+                alt: false,
+                shift: false,
+            },
+            120,
+            focus,
+        ),
+        ChordOutcome::Dispatched(WorkbenchAction::ShowMoreSignal)
+    );
+    assert_eq!(
+        km.feed_key(
+            KeyChordInput {
+                key: ChordKey::Minus,
+                ctrl_or_cmd: false,
+                alt: false,
+                shift: false,
+            },
+            140,
+            focus,
+        ),
+        ChordOutcome::Dispatched(WorkbenchAction::ShowLessSignal)
+    );
 
     // `?` toggles searchable cheat-sheet modal and emits OpenKeyboardCheatSheet
     let q1 = km.feed_key(KeyChordInput::question_mark(), 200, focus);
@@ -467,11 +497,12 @@ fn test_headless_egui_chrome_palette_cheat_sheet_and_two_frame_chord() {
 
     // Frame 1: render Top Menu Bar, Workflow Stepper, Command Palette (requests TextEdit focus),
     // and Cheat-Sheet cleanly; verify focused TextEdit suppresses spectrum chords in egui!
-    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+    let mut out1 = ctx.run_ui(egui::RawInput::default(), |ui| {
         let _ = draw_workbench_chrome(ui, &readiness);
         let _ = palette.show(ui.ctx());
         let _ = keymap.show_cheat_sheet_window(ui.ctx());
     });
+    out1.textures_delta.clear();
     assert!(ctx.egui_wants_keyboard_input());
 
     let mut raw_suppressed = egui::RawInput {
@@ -485,13 +516,14 @@ fn test_headless_egui_chrome_palette_cheat_sheet_and_two_frame_chord() {
         repeat: false,
         modifiers: egui::Modifiers::NONE,
     });
-    let _ = ctx.run_ui(raw_suppressed, |ui| {
+    let mut out_suppressed = ctx.run_ui(raw_suppressed, |ui| {
         // Palette is still open and its search TextEdit holds focus -> 'p' MUST be suppressed!
         let _ = palette.show(ui.ctx());
         let suppressed_acts = keymap.handle_egui_input(ui.ctx(), false);
         assert!(suppressed_acts.is_empty());
         assert_eq!(keymap.state(), ChordState::Idle);
     });
+    out_suppressed.textures_delta.clear();
 
     // Close modals and run one clean frame (releasing Key::P) so egui releases modal widget focus
     palette.close_palette();
@@ -507,9 +539,10 @@ fn test_headless_egui_chrome_palette_cheat_sheet_and_two_frame_chord() {
         repeat: false,
         modifiers: egui::Modifiers::NONE,
     });
-    let _ = ctx.run_ui(raw_release, |ui| {
+    let mut out_release = ctx.run_ui(raw_release, |ui| {
         let _ = draw_workbench_chrome(ui, &readiness);
     });
+    out_release.textures_delta.clear();
     assert!(!ctx.text_edit_focused());
 
     // Frame 2: inject plain 'p' at t = 1.000 s (no widget focus) -> Pending 'p_'
@@ -525,10 +558,11 @@ fn test_headless_egui_chrome_palette_cheat_sheet_and_two_frame_chord() {
         modifiers: egui::Modifiers::NONE,
     });
     let mut frame2_actions = Vec::new();
-    let _ = ctx.run_ui(raw_p, |ui| {
+    let mut out_p = ctx.run_ui(raw_p, |ui| {
         frame2_actions = keymap.handle_egui_input(ui.ctx(), false);
         keymap.draw_status_bar_indicator(ui, 1_000);
     });
+    out_p.textures_delta.clear();
     assert!(frame2_actions.is_empty());
     assert_eq!(
         keymap.peek_status_indicator(1_050).as_deref(),
@@ -548,9 +582,10 @@ fn test_headless_egui_chrome_palette_cheat_sheet_and_two_frame_chord() {
         modifiers: egui::Modifiers::NONE,
     });
     let mut frame3_actions = Vec::new();
-    let _ = ctx.run_ui(raw_a, |ui| {
+    let mut out_a = ctx.run_ui(raw_a, |ui| {
         frame3_actions = keymap.handle_egui_input(ui.ctx(), false);
     });
+    out_a.textures_delta.clear();
     assert_eq!(frame3_actions, vec![WorkbenchAction::AddPeakAtCrosshair]);
     assert_eq!(keymap.state(), ChordState::Idle);
 }

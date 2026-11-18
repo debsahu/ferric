@@ -527,7 +527,7 @@ impl CommandPalette {
         let mut chosen_action: Option<WorkbenchAction> = None;
         let mut window_open = self.open;
 
-        egui::Window::new("⌘ Command Palette")
+        egui::Window::new("Command Palette")
             .id(egui::Id::unique("nmr_workbench_command_palette"))
             .open(&mut window_open)
             .collapsible(false)
@@ -539,7 +539,7 @@ impl CommandPalette {
                 let edit_resp = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
                         .hint_text(
-                            "Type a command, workflow step, nucleus, or two-key chord (e.g. vt, pa, st, nef, cest, rba)…",
+                            "Type a command, workflow step, nucleus, or two-key chord (e.g. vt, pa, st, nef, cest, rba)...",
                         )
                         .desired_width(f32::INFINITY),
                 );
@@ -560,13 +560,13 @@ impl CommandPalette {
                             results.len(),
                             self.commands.len()
                         ))
-                        .small()
+                        .size(11.0)
                         .weak(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            egui::RichText::new("↑/↓ Navigate   ↵ Run   Esc Close")
-                                .small()
+                            egui::RichText::new("Up/Down Navigate   Enter Run   Esc Close")
+                                .size(11.0)
                                 .monospace()
                                 .weak(),
                         );
@@ -614,7 +614,7 @@ impl CommandPalette {
                                                 item.command.category
                                             ))
                                             .monospace()
-                                            .size(10.5)
+                                            .size(11.0)
                                             .color(egui::Color32::from_rgb(130, 195, 235)),
                                         );
 
@@ -748,7 +748,7 @@ fn draw_keycap_pill(ui: &mut egui::Ui, label: &str, fill: egui::Color32, text_co
             ui.label(
                 egui::RichText::new(label)
                     .monospace()
-                    .size(10.5)
+                    .size(11.0)
                     .strong()
                     .color(text_col),
             );
@@ -801,8 +801,8 @@ mod tests {
             ("pc", WorkbenchAction::SnapPeakParabolicCenter),
             ("pl", WorkbenchAction::TogglePeakLabels),
             ("zf", WorkbenchAction::ZoomFullSweep),
-            ("ci", WorkbenchAction::RaiseContourFloor),
-            ("cb", WorkbenchAction::LowerContourFloor),
+            ("ci", WorkbenchAction::ShowMoreSignal),
+            ("cb", WorkbenchAction::ShowLessSignal),
             ("st", WorkbenchAction::TileSequentialStrips),
             ("at", WorkbenchAction::OpenResidueAssignmentPopover),
             ("zp", WorkbenchAction::ZoomPrevious),
@@ -908,14 +908,15 @@ mod tests {
             let _ = palette.search(q);
         }
 
+        let budget_ms = if cfg!(debug_assertions) { 10.0 } else { 1.0 };
         for q in sample_queries {
             let t0 = std::time::Instant::now();
             let res = std::hint::black_box(palette.search(std::hint::black_box(q)));
             let elapsed = t0.elapsed();
             assert!(!res.is_empty(), "Query '{q}' returned empty results");
             assert!(
-                elapsed.as_secs_f64() * 1000.0 < 1.0,
-                "CommandPalette::search('{q}') took {:.4} ms (>= 1.0 ms gate)",
+                elapsed.as_secs_f64() * 1000.0 < budget_ms,
+                "CommandPalette::search('{q}') took {:.4} ms (>= {budget_ms:.1} ms gate)",
                 elapsed.as_secs_f64() * 1000.0
             );
         }

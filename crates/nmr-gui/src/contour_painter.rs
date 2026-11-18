@@ -155,9 +155,24 @@ pub struct OverlayLayerSpec {
     /// Display chemical-shift nudge `(dh_ppm, dn_ppm)` applied to this layer
     pub ppm_nudge: [f32; 2],
     pub visible: bool,
+    /// Per-layer axis sync (`F2`, `F1`) (`UI-C12`).
+    pub sync_f2: bool,
+    pub sync_f1: bool,
+    /// True once the user explicitly picked a custom layer color (`UI-C12`).
+    pub custom_color: bool,
+    /// Frozen `[h_left, h_right, n_top, n_bottom]` used for axes where `sync_f2`/`sync_f1` is false.
+    pub unlinked_view_ppm: Option<[f32; 4]>,
 }
 
 impl OverlayLayerSpec {
+    fn native_view_ppm(axis_ppm: [f32; 4], dims: [u32; 2]) -> [f32; 4] {
+        let x0 = axis_ppm[0];
+        let x1 = axis_ppm[0] + axis_ppm[1] * (dims[0].saturating_sub(1) as f32);
+        let y0 = axis_ppm[2];
+        let y1 = axis_ppm[2] + axis_ppm[3] * (dims[1].saturating_sub(1) as f32);
+        [x0.max(x1), x0.min(x1), y0.min(y1), y0.max(y1)]
+    }
+
     /// Build an overlay layer from a [`Spectrum2D`] using [`default_overlay_palette`].
     pub fn from_spectrum_2d(
         layer_id: u64,
@@ -168,17 +183,19 @@ impl OverlayLayerSpec {
         palette_index: usize,
     ) -> Self {
         let (pos_rgba, neg_rgba) = default_overlay_palette(palette_index);
+        let axis_ppm = [
+            spec.axis_x.first_ppm as f32,
+            spec.axis_x.step_ppm as f32,
+            spec.axis_y.first_ppm as f32,
+            spec.axis_y.step_ppm as f32,
+        ];
+        let dims = [spec.nx() as u32, spec.ny() as u32];
         Self {
             layer_id,
             spec_gen,
             spec_data,
-            axis_ppm: [
-                spec.axis_x.first_ppm as f32,
-                spec.axis_x.step_ppm as f32,
-                spec.axis_y.first_ppm as f32,
-                spec.axis_y.step_ppm as f32,
-            ],
-            dims: [spec.nx() as u32, spec.ny() as u32],
+            axis_ppm,
+            dims,
             base_level: base_level.max(1e-4),
             level_factor: 1.42,
             num_levels: 10,
@@ -187,6 +204,10 @@ impl OverlayLayerSpec {
             neg_rgba,
             ppm_nudge: [0.0, 0.0],
             visible: true,
+            sync_f2: true,
+            sync_f1: true,
+            custom_color: false,
+            unlinked_view_ppm: Some(Self::native_view_ppm(axis_ppm, dims)),
         }
     }
 
@@ -238,17 +259,19 @@ impl OverlayLayerSpec {
         let _ = c_axis;
 
         let (pos_rgba, neg_rgba) = default_overlay_palette(palette_index);
+        let axis_ppm = [
+            spec3d.axis_x.first_ppm as f32,
+            spec3d.axis_x.step_ppm as f32,
+            n_axis.first_ppm as f32,
+            n_axis.step_ppm as f32,
+        ];
+        let dims = [nx as u32, n_axis.size as u32];
         Self {
             layer_id,
             spec_gen,
             spec_data: Arc::new(plane_data),
-            axis_ppm: [
-                spec3d.axis_x.first_ppm as f32,
-                spec3d.axis_x.step_ppm as f32,
-                n_axis.first_ppm as f32,
-                n_axis.step_ppm as f32,
-            ],
-            dims: [nx as u32, n_axis.size as u32],
+            axis_ppm,
+            dims,
             base_level: base_level.max(1e-4),
             level_factor: 1.42,
             num_levels: 10,
@@ -257,6 +280,10 @@ impl OverlayLayerSpec {
             neg_rgba,
             ppm_nudge: [0.0, 0.0],
             visible: true,
+            sync_f2: true,
+            sync_f1: true,
+            custom_color: false,
+            unlinked_view_ppm: Some(Self::native_view_ppm(axis_ppm, dims)),
         }
     }
 
@@ -292,17 +319,19 @@ impl OverlayLayerSpec {
         };
 
         let (pos_rgba, neg_rgba) = default_overlay_palette(palette_index);
+        let axis_ppm = [
+            axes[0].first_ppm as f32,
+            axes[0].step_ppm as f32,
+            axes[1].first_ppm as f32,
+            axes[1].step_ppm as f32,
+        ];
+        let dims = [nx as u32, ny as u32];
         Self {
             layer_id,
             spec_gen,
             spec_data: Arc::new(plane),
-            axis_ppm: [
-                axes[0].first_ppm as f32,
-                axes[0].step_ppm as f32,
-                axes[1].first_ppm as f32,
-                axes[1].step_ppm as f32,
-            ],
-            dims: [nx as u32, ny as u32],
+            axis_ppm,
+            dims,
             base_level: base_level.max(1e-4),
             level_factor: 1.42,
             num_levels: 10,
@@ -311,7 +340,42 @@ impl OverlayLayerSpec {
             neg_rgba,
             ppm_nudge: [0.0, 0.0],
             visible: true,
+            sync_f2: true,
+            sync_f1: true,
+            custom_color: false,
+            unlinked_view_ppm: Some(Self::native_view_ppm(axis_ppm, dims)),
         }
+    }
+
+    /// Resolve the effective `[f2_left, f2_right, f1_top, f1_bottom]` for this layer, honoring
+    /// `sync_f2` and `sync_f1` (`UI-C12`).
+    #[inline]
+    pub fn effective_view_ppm(&self, shared_view_ppm: [f32; 4]) -> [f32; 4] {
+        let fallback = self
+            .unlinked_view_ppm
+            .unwrap_or_else(|| Self::native_view_ppm(self.axis_ppm, self.dims));
+        [
+            if self.sync_f2 {
+                shared_view_ppm[0]
+            } else {
+                fallback[0]
+            },
+            if self.sync_f2 {
+                shared_view_ppm[1]
+            } else {
+                fallback[1]
+            },
+            if self.sync_f1 {
+                shared_view_ppm[2]
+            } else {
+                fallback[2]
+            },
+            if self.sync_f1 {
+                shared_view_ppm[3]
+            } else {
+                fallback[3]
+            },
+        ]
     }
 
     /// Map a viewport coordinate `(view_x_ppm, view_y_ppm)` into this layer's native spectrum
@@ -332,8 +396,9 @@ impl OverlayLayerSpec {
         canvas_size_px: [f32; 2],
         draw_background: bool,
     ) -> GpuContourLayerUniforms {
+        let eff_view = self.effective_view_ppm(view_ppm);
         GpuContourLayerUniforms {
-            view_ppm,
+            view_ppm: eff_view,
             axis_ppm: self.axis_ppm,
             dims: [
                 self.dims[0] as f32,

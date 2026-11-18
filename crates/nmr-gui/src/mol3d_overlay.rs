@@ -242,11 +242,13 @@ pub enum ConcordanceTrackClass {
     /// Disordered / flexible in both 3D (`pLDDT < 70`) and solution NMR (`S^2 < 0.65`) (`#64748B`).
     ConcordantDisordered,
     /// Confidently folded in 3D (`pLDDT >= 70`, `Helix`/`Sheet`) yet disordered in solution
-    /// (`S^2 < 0.60`, coil+PPII `>= 0.65`), flagging conditional folding (MoRF) or crystal packing (`#D97706`).
+    /// (`S^2 < 0.65`, coil+PPII `>= 0.55`), flagging conditional folding (MoRF) or model-ordered / solution-disordered (`#D97706`).
     ConditionalFoldingOrCrystalArtifact,
     /// Conformational switch (`Helix <-> Sheet` / large dihedral shift) or rigid solution fold in
     /// low-`pLDDT` region (`#DC2626`).
     DynamicHingeOrAltState,
+    /// Intermediate `pLDDT` (`50 <= pLDDT < 70`) or ordered confidence without 2D secondary-structure evidence (`#94A3B8`).
+    Indeterminate,
     /// Insufficient experimental NMR backbone shifts (`< 2` nuclei and no `S^2`) to score concordance.
     #[default]
     UnassignedNmr,
@@ -296,6 +298,8 @@ impl From<nmr_core::af_concordance::AfNmrConcordanceClass> for ConcordanceTrackC
                 Self::DynamicHingeOrAltState
             }
             nmr_core::af_concordance::AfNmrConcordanceClass::UnassignedNmr => Self::UnassignedNmr,
+            #[allow(unreachable_patterns)]
+            _ => Self::Indeterminate,
         }
     }
 }
@@ -310,17 +314,28 @@ impl From<ConcordanceTrackClass> for nmr_core::af_concordance::AfNmrConcordanceC
                 Self::ConditionalFoldingOrCrystalArtifact
             }
             ConcordanceTrackClass::DynamicHingeOrAltState => Self::DynamicHingeOrAltState,
-            ConcordanceTrackClass::UnassignedNmr => Self::UnassignedNmr,
+            ConcordanceTrackClass::Indeterminate | ConcordanceTrackClass::UnassignedNmr => {
+                Self::UnassignedNmr
+            }
         }
     }
 }
 
+#[allow(non_upper_case_globals)]
 impl ConcordanceTrackClass {
-    pub const ALL: [Self; 5] = [
+    /// Alias for model-ordered / solution-disordered concordance class.
+    pub const ModelOrderedSolutionDisordered: Self = Self::ConditionalFoldingOrCrystalArtifact;
+    /// Alias for transient helix / hidden order in low-`pLDDT` region.
+    pub const TransientHelixOrHiddenOrder: Self = Self::DynamicHingeOrAltState;
+    /// Alias for shared flexibility in both model and solution NMR.
+    pub const SharedFlexibility: Self = Self::ConcordantDisordered;
+
+    pub const ALL: [Self; 6] = [
         Self::ConcordantOrdered,
         Self::ConcordantDisordered,
         Self::ConditionalFoldingOrCrystalArtifact,
         Self::DynamicHingeOrAltState,
+        Self::Indeterminate,
         Self::UnassignedNmr,
     ];
 
@@ -329,8 +344,9 @@ impl ConcordanceTrackClass {
         match self {
             Self::ConcordantOrdered => "Concordant Ordered",
             Self::ConcordantDisordered => "Concordant Disordered",
-            Self::ConditionalFoldingOrCrystalArtifact => "Conditional Folding / Crystal Artifact",
+            Self::ConditionalFoldingOrCrystalArtifact => "Model-Ordered / Solution-Disordered",
             Self::DynamicHingeOrAltState => "Dynamic Hinge / Alt State",
+            Self::Indeterminate => "Indeterminate (No 2D SS / Low Confidence)",
             Self::UnassignedNmr => "Unassigned NMR",
         }
     }
@@ -342,6 +358,7 @@ impl ConcordanceTrackClass {
             Self::ConcordantDisordered => "DIS",
             Self::ConditionalFoldingOrCrystalArtifact => "MORF/XTAL",
             Self::DynamicHingeOrAltState => "HINGE/ALT",
+            Self::Indeterminate => "?",
             Self::UnassignedNmr => "UNASG",
         }
     }
@@ -353,6 +370,7 @@ impl ConcordanceTrackClass {
             Self::ConcordantDisordered => "#64748B",
             Self::ConditionalFoldingOrCrystalArtifact => "#D97706",
             Self::DynamicHingeOrAltState => "#DC2626",
+            Self::Indeterminate => "#94A3B8",
             Self::UnassignedNmr => "#6B7B91",
         }
     }
@@ -364,8 +382,15 @@ impl ConcordanceTrackClass {
             Self::ConcordantDisordered => [0x64, 0x74, 0x8B],
             Self::ConditionalFoldingOrCrystalArtifact => [0xD9, 0x77, 0x06],
             Self::DynamicHingeOrAltState => [0xDC, 0x26, 0x26],
+            Self::Indeterminate => [148, 163, 184],
             Self::UnassignedNmr => [0x6B, 0x7B, 0x91],
         }
+    }
+
+    #[inline]
+    pub const fn rgba_u8(self) -> [u8; 4] {
+        let [r, g, b] = self.rgb_u8();
+        [r, g, b, 255]
     }
 
     #[inline]
@@ -378,6 +403,7 @@ impl ConcordanceTrackClass {
                 UNASSIGNED_PUTTY_RGBA[2],
                 a,
             ],
+            Self::Indeterminate => [148.0 / 255.0, 163.0 / 255.0, 184.0 / 255.0, a],
             other => {
                 let [r, g, b] = other.rgb_u8();
                 [
@@ -404,6 +430,7 @@ impl ConcordanceTrackClass {
     pub const fn discrepancy_putty_t(self) -> f32 {
         match self {
             Self::ConcordantOrdered => 0.0,
+            Self::Indeterminate => 0.15,
             Self::ConcordantDisordered => 0.30,
             Self::ConditionalFoldingOrCrystalArtifact => 0.85,
             Self::DynamicHingeOrAltState => 1.00,
@@ -982,6 +1009,7 @@ impl QuantitativeTrackData {
                     ConcordanceTrackClass::ConcordantDisordered => Some(2.0),
                     ConcordanceTrackClass::ConditionalFoldingOrCrystalArtifact => Some(3.0),
                     ConcordanceTrackClass::DynamicHingeOrAltState => Some(4.0),
+                    ConcordanceTrackClass::Indeterminate => Some(0.5),
                     ConcordanceTrackClass::UnassignedNmr => None,
                 };
                 ResiduePuttyStyle {

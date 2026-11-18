@@ -12,7 +12,7 @@
 //! directly into `crates/nmr-gui/src/main.rs`.
 
 use eframe::egui;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::f64::consts::PI;
 
 use nmr_core::octet_render::{
@@ -25,8 +25,10 @@ use nmr_core::octet_render::{
     SpectrumSignal1D, TemplateCategory, TemplateLibrary, VectorPrimitive, HIGHLIGHT_PALETTE,
 };
 
-/// Top-level alias so callers can instantiate either `OctetDrawPanel` or `OctetDrawApp`.
+/// Top-level aliases so callers can instantiate `OctetDrawPanel`, `OctetCanvasPanel`, or `OctetDrawApp`.
 pub type OctetDrawApp = OctetDrawPanel;
+pub type OctetCanvasPanel = OctetDrawPanel;
+pub type OctetGraph = RenderScene;
 
 // ============================================================================
 // 1. Pluggable Backend Hooks for `octet_mol` & `octet_analyt` Integration
@@ -199,6 +201,39 @@ pub enum DrawTool {
     Eraser,
 }
 
+impl DrawTool {
+    pub fn short_label(&self) -> String {
+        match self {
+            Self::SelectBox => "Select (V)".to_string(),
+            Self::Lasso => "Lasso".to_string(),
+            Self::Pan => "Pan".to_string(),
+            Self::Eraser => "Eraser".to_string(),
+            Self::Bond { order, stereo } => match (*order, *stereo) {
+                (BondOrder::Single, BondStereo::None) => "Single Bond (1)".to_string(),
+                (BondOrder::Double, BondStereo::None) => "Double Bond (2)".to_string(),
+                (BondOrder::Triple, BondStereo::None) => "Triple Bond (3)".to_string(),
+                (BondOrder::Single, BondStereo::UpWedge) => "Up Wedge (W)".to_string(),
+                (BondOrder::Single, BondStereo::DownHash) => "Down Hash (H)".to_string(),
+                (BondOrder::Single, BondStereo::Wavy) => "Wavy Bond".to_string(),
+                (BondOrder::Single, BondStereo::Dative) => "Dative Bond".to_string(),
+                (BondOrder::Aromatic, _) => "Aromatic Bond".to_string(),
+                _ => "Bond".to_string(),
+            },
+            Self::Chain => "Chain 120 deg".to_string(),
+            Self::RingStamp { template_id } => format!("Ring: {template_id}"),
+            Self::ReactionArrow { kind } => format!("Rxn Arrow ({kind:?})"),
+            Self::CurvedArrow { kind } => match kind {
+                PushingArrowKind::FullTwoElectron => "Curved 2e-".to_string(),
+                PushingArrowKind::FishhookOneElectron => "Fishhook 1e-".to_string(),
+            },
+            Self::Bracket { style } => format!("Bracket ({style:?})"),
+            Self::Orbital { orbital_type } => format!("Orbital ({orbital_type:?})"),
+            Self::TlcPlate => "TLC Plate".to_string(),
+            Self::TextLabel => "Text Label".to_string(),
+        }
+    }
+}
+
 /// Canvas object under the mouse cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoverTarget {
@@ -322,10 +357,17 @@ pub struct OctetDrawPanel {
     pub nmr_tab: NmrViewTab,
     pub spectrometer_mhz: f64,
     pub ref_scale_mmol: f64,
-    cached_props: MolecularPropertiesSummary,
-    cached_stoich: Vec<StoichiometryRow>,
-    cached_1h: Vec<SpectrumSignal1D>,
-    cached_13c: Vec<SpectrumSignal1D>,
+    /// Selected connected-component molecule index (`0` = leftmost reactant by default).
+    pub active_molecule_index: usize,
+    /// Total connected-component molecules currently present on the canvas.
+    pub total_molecules: usize,
+    /// Last rendered interactive canvas `Rect` (for viewport layout verification).
+    pub last_canvas_rect: Option<egui::Rect>,
+    secondary_drag_accum: f32,
+    pub cached_props: MolecularPropertiesSummary,
+    pub cached_stoich: Vec<StoichiometryRow>,
+    pub cached_1h: Vec<SpectrumSignal1D>,
+    pub cached_13c: Vec<SpectrumSignal1D>,
     scene_dirty: bool,
 
     /// Status message displayed in the studio footer/header.
@@ -370,7 +412,7 @@ impl OctetDrawPanel {
             loaded_protein_sequence: Vec::new(),
             protein_import_max_res: 8,
             name_or_smiles_input: "aspirin".to_string(),
-            active_text_caption: "Cat. Pd(PPh3)4".to_string(),
+            active_text_caption: "NaOH, H2O".to_string(),
             arrow_above_input: "NaOH, H2O".to_string(),
             arrow_below_input: "25 C, 95%".to_string(),
             bracket_sub_input: "n".to_string(),
@@ -383,18 +425,23 @@ impl OctetDrawPanel {
             last_png_bytes_len: 0,
             last_pdf_bytes_len: 0,
             show_right_drawer: true,
-            show_bottom_nmr_panel: true,
+            show_bottom_nmr_panel: false,
             nmr_tab: NmrViewTab::Proton1H,
             spectrometer_mhz: 500.0,
             ref_scale_mmol: 1.0,
+            active_molecule_index: 0,
+            total_molecules: 0,
+            last_canvas_rect: None,
+            secondary_drag_accum: 0.0,
             cached_props: MolecularPropertiesSummary::default(),
             cached_stoich: Vec::new(),
             cached_1h: Vec::new(),
             cached_13c: Vec::new(),
             scene_dirty: true,
-            status_msg: "Octet Chemical Studio ready — click/drag to draw bonds, press C/N/O/S/P/F on atoms, V to select, 1/2/3/W/H for bond styles.".to_string(),
+            status_msg: "Octet Chemical Studio ready - click/drag to draw bonds, right-click for canvas menu, V to select, 1/2/3/W/H for bond styles.".to_string(),
             backend: None,
         };
+        panel.fit_camera_to_scene();
         panel.recompute_live_analytics();
         panel
     }
@@ -422,6 +469,7 @@ impl OctetDrawPanel {
         self.push_undo();
         self.scene = new_scene;
         self.selected_atoms.clear();
+        self.active_molecule_index = 0;
         self.scene_dirty = true;
         self.fit_camera_to_scene();
         self.recompute_live_analytics();
@@ -869,7 +917,7 @@ impl OctetDrawPanel {
         match builtin_name_or_smiles_to_scene(&q, &self.library) {
             Ok(sc) => {
                 self.set_scene(sc);
-                self.status_msg = format!("Converted `{q}` → 2D chemical structure");
+                self.status_msg = format!("Converted `{q}` -> 2D chemical structure");
             }
             Err(e) => {
                 self.status_msg = e;
@@ -950,27 +998,57 @@ impl OctetDrawPanel {
     }
 
     // ========================================================================
-    // Live Properties, Stoichiometry & ¹H / ¹³C NMR Predictor
+    // Live Properties, Stoichiometry & 1H / 13C NMR Predictor (Per-Molecule)
     // ========================================================================
 
+    /// Return the active single-molecule subgraph (`OctetGraph`) selected by `selected_atoms`
+    /// or `active_molecule_index` (`0` = leftmost reactant by default).
+    pub fn active_molecule_subgraph(&self) -> OctetGraph {
+        let sel_u32: BTreeSet<u32> = self.selected_atoms.iter().map(|&i| i as u32).collect();
+        let (sub, _, _) =
+            extract_active_molecule_subgraph(&self.scene, &sel_u32, self.active_molecule_index);
+        sub
+    }
+
+    /// Recompute live molecular properties, stoichiometry, and predicted 1D 1H/13C NMR
+    /// for the active single-molecule subgraph (never summing Reactant + Product).
+    pub fn recompute_properties_and_nmr(&mut self) {
+        self.recompute_live_analytics();
+    }
+
     pub fn recompute_live_analytics(&mut self) {
+        let sel_u32: BTreeSet<u32> = self.selected_atoms.iter().map(|&i| i as u32).collect();
+        let (sub, resolved_idx, total_mols, parent_map) = extract_active_molecule_subgraph_with_map(
+            &self.scene,
+            &sel_u32,
+            self.active_molecule_index,
+        );
+        self.active_molecule_index = resolved_idx;
+        self.total_molecules = total_mols;
+
         if let Some(ad) = &self.backend {
-            if let Some(props) = ad.compute_properties(&self.scene) {
+            if let Some(props) = ad.compute_properties(&sub) {
                 self.cached_props = props;
             } else {
-                self.cached_props = compute_builtin_properties(&self.scene);
+                self.cached_props = compute_builtin_properties(&sub);
             }
-            if let Some((h1, c13)) = ad.predict_nmr_1h_13c(&self.scene, self.spectrometer_mhz) {
+            if let Some((mut h1, mut c13)) = ad.predict_nmr_1h_13c(&sub, self.spectrometer_mhz) {
+                remap_signal_atoms_to_parent(&mut h1, &parent_map);
+                remap_signal_atoms_to_parent(&mut c13, &parent_map);
                 self.cached_1h = h1;
                 self.cached_13c = c13;
             } else {
-                let (h1, c13) = predict_builtin_nmr_1h_13c(&self.scene);
+                let (mut h1, mut c13) = predict_builtin_nmr_1h_13c(&sub);
+                remap_signal_atoms_to_parent(&mut h1, &parent_map);
+                remap_signal_atoms_to_parent(&mut c13, &parent_map);
                 self.cached_1h = h1;
                 self.cached_13c = c13;
             }
         } else {
-            self.cached_props = compute_builtin_properties(&self.scene);
-            let (h1, c13) = predict_builtin_nmr_1h_13c(&self.scene);
+            self.cached_props = compute_builtin_properties(&sub);
+            let (mut h1, mut c13) = predict_builtin_nmr_1h_13c(&sub);
+            remap_signal_atoms_to_parent(&mut h1, &parent_map);
+            remap_signal_atoms_to_parent(&mut c13, &parent_map);
             self.cached_1h = h1;
             self.cached_13c = c13;
         }
@@ -1101,6 +1179,11 @@ impl OctetDrawPanel {
 // ============================================================================
 
 impl OctetDrawPanel {
+    /// Alias for [`Self::ui`] so callers can invoke either `panel.show(ui)` or `panel.ui(ui)`.
+    pub fn show(&mut self, ui: &mut egui::Ui) {
+        self.ui(ui);
+    }
+
     /// Render the complete interactive Octet Chemical Draw & 1D NMR Studio inside `ui`.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         if self.scene_dirty {
@@ -1113,14 +1196,21 @@ impl OctetDrawPanel {
 
         egui::Panel::top("octet_top_workflow_bar").show(ui, |ui| {
             self.draw_top_workflow_bar(ui);
-            ui.add_space(2.0);
-            self.draw_quick_group_and_hotkey_bar(ui);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Advanced Tools & Templates").size(12.5),
+            )
+            .id_salt("octet_advanced_tools_collapse")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.draw_advanced_tools_panel(ui);
+            });
         });
 
         if self.show_right_drawer {
             egui::Panel::right("octet_right_props_drawer")
-                .default_size(315.0)
-                .min_size(265.0)
+                .default_size(225.0)
+                .min_size(195.0)
+                .max_size(260.0)
                 .show(ui, |ui| {
                     self.draw_properties_and_stoichiometry_drawer(ui);
                 });
@@ -1128,19 +1218,12 @@ impl OctetDrawPanel {
 
         if self.show_bottom_nmr_panel {
             egui::Panel::bottom("octet_bottom_nmr_inspector")
-                .default_size(195.0)
-                .min_size(145.0)
+                .default_size(165.0)
+                .min_size(135.0)
                 .show(ui, |ui| {
                     self.draw_bottom_nmr_inspector(ui);
                 });
         }
-
-        egui::Panel::left("octet_left_tool_palette")
-            .default_size(138.0)
-            .min_size(124.0)
-            .show(ui, |ui| {
-                self.draw_left_tool_palette(ui);
-            });
 
         egui::CentralPanel::default().show(ui, |ui| {
             self.draw_interactive_canvas(ui);
@@ -1148,44 +1231,214 @@ impl OctetDrawPanel {
     }
 
     fn draw_top_workflow_bar(&mut self, ui: &mut egui::Ui) {
+        // <= 10 visible primary controls: Undo, Redo, Clean 2D, Clear, Tool, Molecule, Inspector, 1D NMR, Import/Export (9 total)
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("↩ Undo"))
+                .add_enabled(
+                    !self.undo_stack.is_empty(),
+                    egui::Button::new(egui::RichText::new("Undo").size(12.5)),
+                )
                 .on_hover_text("Undo (Cmd/Ctrl+Z)")
                 .clicked()
             {
                 self.undo();
             }
             if ui
-                .add_enabled(!self.redo_stack.is_empty(), egui::Button::new("↪ Redo"))
+                .add_enabled(
+                    !self.redo_stack.is_empty(),
+                    egui::Button::new(egui::RichText::new("Redo").size(12.5)),
+                )
                 .on_hover_text("Redo (Cmd/Ctrl+Shift+Z)")
                 .clicked()
             {
                 self.redo();
             }
             if ui
-                .button("✨ Clean 2D")
-                .on_hover_text("Regularize bond lengths & 120° angles")
+                .button(egui::RichText::new("Clean 2D").size(12.5))
+                .on_hover_text("Regularize bond lengths and 120 deg angles")
                 .clicked()
             {
                 self.clean_2d_structure();
             }
-            if ui.button("🗑 Clear").clicked() {
+            if ui
+                .button(egui::RichText::new("Clear").size(12.5))
+                .on_hover_text("Clear canvas")
+                .clicked()
+            {
                 self.set_scene(RenderScene::new());
                 self.status_msg = "Cleared canvas".to_string();
             }
 
             ui.separator();
 
-            // Journal Style Preset Dropdown (`ACS 1996` default)
-            ui.label("Style:");
+            ui.label(egui::RichText::new("Tool:").size(12.5));
+            let cur_tool_lbl = self.active_tool.short_label();
+            egui::ComboBox::from_id_salt("octet_primary_tool_combo")
+                .selected_text(egui::RichText::new(cur_tool_lbl).size(12.5))
+                .show_ui(ui, |ui| {
+                    let primary_tools = [
+                        ("Select (V)", DrawTool::SelectBox),
+                        ("Lasso", DrawTool::Lasso),
+                        ("Pan", DrawTool::Pan),
+                        ("Eraser", DrawTool::Eraser),
+                        (
+                            "Single Bond (1)",
+                            DrawTool::Bond {
+                                order: BondOrder::Single,
+                                stereo: BondStereo::None,
+                            },
+                        ),
+                        (
+                            "Double Bond (2)",
+                            DrawTool::Bond {
+                                order: BondOrder::Double,
+                                stereo: BondStereo::None,
+                            },
+                        ),
+                        (
+                            "Triple Bond (3)",
+                            DrawTool::Bond {
+                                order: BondOrder::Triple,
+                                stereo: BondStereo::None,
+                            },
+                        ),
+                        (
+                            "Up Wedge (W)",
+                            DrawTool::Bond {
+                                order: BondOrder::Single,
+                                stereo: BondStereo::UpWedge,
+                            },
+                        ),
+                        (
+                            "Down Hash (H)",
+                            DrawTool::Bond {
+                                order: BondOrder::Single,
+                                stereo: BondStereo::DownHash,
+                            },
+                        ),
+                        ("Chain 120 deg", DrawTool::Chain),
+                        (
+                            "Benzene Ring",
+                            DrawTool::RingStamp {
+                                template_id: "benzene".to_string(),
+                            },
+                        ),
+                        (
+                            "6-Ring",
+                            DrawTool::RingStamp {
+                                template_id: "cyclohexane".to_string(),
+                            },
+                        ),
+                        (
+                            "5-Ring",
+                            DrawTool::RingStamp {
+                                template_id: "cyclopentane".to_string(),
+                            },
+                        ),
+                        (
+                            "Reaction Arrow",
+                            DrawTool::ReactionArrow {
+                                kind: ArrowKind::Solid,
+                            },
+                        ),
+                        (
+                            "Curved Arrow (2e-)",
+                            DrawTool::CurvedArrow {
+                                kind: PushingArrowKind::FullTwoElectron,
+                            },
+                        ),
+                        ("Text Label", DrawTool::TextLabel),
+                    ];
+                    for (lbl, target) in primary_tools {
+                        if ui
+                            .selectable_label(
+                                self.active_tool == target,
+                                egui::RichText::new(lbl).size(12.5),
+                            )
+                            .clicked()
+                        {
+                            self.active_tool = target;
+                        }
+                    }
+                });
+
+            let n_mols = self.total_molecules.max(1);
+            let cur_mol_idx = self.active_molecule_index.min(n_mols - 1);
+            let mol_sel_text = if self.total_molecules == 0 {
+                "No Molecule".to_string()
+            } else {
+                self.molecule_display_label(cur_mol_idx)
+            };
+            ui.label(egui::RichText::new("Active:").size(12.5));
+            egui::ComboBox::from_id_salt("octet_active_molecule_combo")
+                .selected_text(egui::RichText::new(mol_sel_text).size(12.5))
+                .show_ui(ui, |ui| {
+                    for idx in 0..n_mols {
+                        let lbl = self.molecule_display_label(idx);
+                        if ui
+                            .selectable_label(
+                                cur_mol_idx == idx,
+                                egui::RichText::new(lbl).size(12.5),
+                            )
+                            .clicked()
+                        {
+                            self.active_molecule_index = idx;
+                            self.selected_atoms.clear();
+                            self.recompute_live_analytics();
+                        }
+                    }
+                });
+
+            ui.separator();
+
+            ui.checkbox(
+                &mut self.show_right_drawer,
+                egui::RichText::new("Inspector").size(12.5),
+            );
+            ui.checkbox(
+                &mut self.show_bottom_nmr_panel,
+                egui::RichText::new("1D NMR").size(12.5),
+            );
+            if ui
+                .button(egui::RichText::new("Import / Export").size(12.5))
+                .on_hover_text(
+                    "CDXML, CDX, OCT, MOL/SDF, SMILES, InChI, JCAMP-DX, SVG, PDF 1.4, PNG",
+                )
+                .clicked()
+            {
+                self.refresh_export_buffer();
+                self.show_io_modal = !self.show_io_modal;
+            }
+        });
+    }
+
+    fn molecule_display_label(&self, idx: usize) -> String {
+        if let Some(row) = self.cached_stoich.get(idx) {
+            format!(
+                "Mol {}/{} ({}: {})",
+                idx + 1,
+                self.total_molecules.max(1),
+                row.role,
+                row.formula
+            )
+        } else {
+            format!("Mol {}/{}", idx + 1, self.total_molecules.max(1))
+        }
+    }
+
+    fn draw_advanced_tools_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Style:").size(12.5));
             let cur_preset = self.style.preset;
             egui::ComboBox::from_id_salt("octet_journal_style_combo")
-                .selected_text(cur_preset.name())
+                .selected_text(egui::RichText::new(cur_preset.name()).size(12.5))
                 .show_ui(ui, |ui| {
                     for &preset in JournalStyle::ALL {
                         if ui
-                            .selectable_label(cur_preset == preset, preset.name())
+                            .selectable_label(
+                                cur_preset == preset,
+                                egui::RichText::new(preset.name()).size(12.5),
+                            )
                             .clicked()
                         {
                             let cpk = self.style.color_by_element;
@@ -1201,30 +1454,35 @@ impl OctetDrawPanel {
                     }
                 });
 
-            ui.checkbox(&mut self.style.color_by_element, "CPK")
-                .on_hover_text("Color heteroatoms by IUPAC CPK palette");
-            ui.checkbox(&mut self.snap_angles, "Snap 30°");
-            ui.checkbox(&mut self.show_grid, "Grid");
+            ui.checkbox(
+                &mut self.style.color_by_element,
+                egui::RichText::new("CPK").size(12.5),
+            )
+            .on_hover_text("Color heteroatoms by IUPAC CPK palette");
+            ui.checkbox(
+                &mut self.snap_angles,
+                egui::RichText::new("Snap 30 deg").size(12.5),
+            );
+            ui.checkbox(&mut self.show_grid, egui::RichText::new("Grid").size(12.5));
 
             ui.separator();
 
-            // Name <-> Structure bar
-            ui.label("Name/SMILES:");
+            ui.label(egui::RichText::new("Name/SMILES:").size(12.5));
             let name_resp = ui.add(
-                egui::TextEdit::singleline(&mut self.name_or_smiles_input).desired_width(125.0),
+                egui::TextEdit::singleline(&mut self.name_or_smiles_input).desired_width(120.0),
             );
             if name_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 self.convert_name_or_smiles_to_structure();
             }
             if ui
-                .small_button("→ Struct")
+                .button(egui::RichText::new("To Struct").size(11.5))
                 .on_hover_text("Name or SMILES to 2D Structure")
                 .clicked()
             {
                 self.convert_name_or_smiles_to_structure();
             }
             if ui
-                .small_button("→ SMILES")
+                .button(egui::RichText::new("To SMILES").size(11.5))
                 .on_hover_text("Current Structure to SMILES")
                 .clicked()
             {
@@ -1233,58 +1491,44 @@ impl OctetDrawPanel {
 
             ui.separator();
 
-            // Peptide-from-Sequence + 1-click Import from Loaded Protein!
-            ui.label("Peptide:");
-            ui.add(egui::TextEdit::singleline(&mut self.peptide_seq_input).desired_width(98.0));
-            if ui.small_button("Build").clicked() {
+            ui.label(egui::RichText::new("Peptide:").size(12.5));
+            ui.add(egui::TextEdit::singleline(&mut self.peptide_seq_input).desired_width(96.0));
+            if ui.button(egui::RichText::new("Build").size(11.5)).clicked() {
                 self.build_peptide_from_input();
             }
             let prot_label = if self.loaded_protein_sequence.is_empty() {
-                "🧬 Import Protein Seq".to_string()
+                "Import Protein Seq".to_string()
             } else {
                 format!(
-                    "🧬 Import Protein (1–{})",
+                    "Import Protein (1-{})",
                     self.protein_import_max_res
                         .min(self.loaded_protein_sequence.len())
                 )
             };
             if ui
-                .small_button(prot_label)
+                .button(egui::RichText::new(prot_label).size(11.5))
                 .on_hover_text("1-click import polypeptide from the loaded NMR protein sequence")
                 .clicked()
             {
                 self.import_from_loaded_protein();
             }
 
-            ui.separator();
-
-            if ui.button("📚 Templates").clicked() {
-                self.show_template_gallery = !self.show_template_gallery;
-            }
             if ui
-                .button("📤 Import / Export")
-                .on_hover_text(
-                    "CDXML, CDX, OCT, MOL/SDF, SMILES, InChI, JCAMP-DX, SVG, PDF 1.4, PNG",
-                )
+                .button(egui::RichText::new("Templates").size(11.5))
                 .clicked()
             {
-                self.refresh_export_buffer();
-                self.show_io_modal = !self.show_io_modal;
+                self.show_template_gallery = !self.show_template_gallery;
             }
-            ui.checkbox(&mut self.show_right_drawer, "Props");
-            ui.checkbox(&mut self.show_bottom_nmr_panel, "1D NMR");
         });
-    }
 
-    fn draw_quick_group_and_hotkey_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
-            ui.label(egui::RichText::new("Atoms & Groups:").small().weak());
+            ui.label(egui::RichText::new("Atoms & Groups:").size(11.0).weak());
             for sym in [
                 "C", "N", "O", "S", "P", "F", "Cl", "Br", "I", "B", "Mg", "Pd", "K", "H",
             ] {
                 if ui
-                    .small_button(sym)
+                    .button(egui::RichText::new(sym).size(11.5))
                     .on_hover_text(format!("Set hovered/selected atom to {sym}"))
                     .clicked()
                 {
@@ -1294,220 +1538,169 @@ impl OctetDrawPanel {
             ui.separator();
             for grp in ["Boc", "Fmoc", "Ph", "Ac", "tBu", "COOH", "NO2", "CF3"] {
                 if ui
-                    .small_button(grp)
+                    .button(egui::RichText::new(grp).size(11.5))
                     .on_hover_text(format!(
                         "Apply condensed {grp} group to hovered/selected atom"
                     ))
                     .clicked()
                 {
-                    let anchor = match grp {
-                        "Boc" | "Fmoc" | "Ac" | "COOH" | "Ph" | "tBu" | "CF3" => "C",
-                        "NO2" => "N",
-                        _ => "C",
-                    };
+                    let anchor = if grp == "NO2" { "N" } else { "C" };
                     self.apply_atom_element_or_group(anchor, Some(grp));
                 }
             }
             ui.separator();
             if ui
-                .small_button("⊕ +")
+                .button(egui::RichText::new("Charge +").size(11.5))
                 .on_hover_text("Increment formal charge (+)")
                 .clicked()
             {
                 self.adjust_atom_charge(1);
             }
             if ui
-                .small_button("⊖ −")
-                .on_hover_text("Decrement formal charge (−)")
+                .button(egui::RichText::new("Charge -").size(11.5))
+                .on_hover_text("Decrement formal charge (-)")
                 .clicked()
             {
                 self.adjust_atom_charge(-1);
             }
             if ui
-                .small_button("(R)/(S)")
+                .button(egui::RichText::new("(R)/(S)").size(11.5))
                 .on_hover_text("Toggle CIP (R)/(S) stereocenter badge on hovered/selected atom")
                 .clicked()
             {
                 self.toggle_cip_badge();
             }
             if ui
-                .small_button("Highlight")
+                .button(egui::RichText::new("Highlight").size(11.5))
                 .on_hover_text("Toggle soft ring/atom highlight")
                 .clicked()
             {
                 self.toggle_selection_highlight();
             }
         });
-    }
 
-    fn draw_left_tool_palette(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical()
-            .id_salt("octet_left_tools_scroll")
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("Select & Edit").small().strong());
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(self.active_tool == DrawTool::SelectBox, "⬚ Select (V)")
-                        .clicked()
-                    {
-                        self.active_tool = DrawTool::SelectBox;
-                    }
-                    if ui
-                        .selectable_label(self.active_tool == DrawTool::Lasso, "➰ Lasso")
-                        .clicked()
-                    {
-                        self.active_tool = DrawTool::Lasso;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(self.active_tool == DrawTool::Pan, "✋ Pan")
-                        .on_hover_text("Pan canvas (or hold Space + drag anytime)")
-                        .clicked()
-                    {
-                        self.active_tool = DrawTool::Pan;
-                    }
-                    if ui
-                        .selectable_label(self.active_tool == DrawTool::Eraser, "⌫ Eraser")
-                        .on_hover_text("Delete atom, bond, or annotation (Del/Backspace)")
-                        .clicked()
-                    {
-                        self.active_tool = DrawTool::Eraser;
-                    }
-                });
-
-                ui.separator();
-                ui.label(egui::RichText::new("Bonds & Chains").small().strong());
-                let bond_tools = [
-                    ("─ Solid (1)", BondOrder::Single, BondStereo::None),
-                    ("═ Double (2)", BondOrder::Double, BondStereo::None),
-                    ("≡ Triple (3)", BondOrder::Triple, BondStereo::None),
-                    ("◀ Wedge (W)", BondOrder::Single, BondStereo::UpWedge),
-                    ("◁ Hash (H)", BondOrder::Single, BondStereo::DownHash),
-                    ("∿ Wavy", BondOrder::Single, BondStereo::Wavy),
-                    ("→ Dative", BondOrder::Single, BondStereo::Dative),
-                    ("⚏ Aromatic", BondOrder::Aromatic, BondStereo::None),
-                ];
-                for (lbl, ord, st) in bond_tools {
-                    let target = DrawTool::Bond {
-                        order: ord,
-                        stereo: st,
-                    };
-                    if ui
-                        .selectable_label(self.active_tool == target, lbl)
-                        .clicked()
-                    {
-                        self.active_tool = target;
-                    }
-                }
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(egui::RichText::new("Extra Stamps:").size(11.0).weak());
+            for (lbl, tid) in [
+                ("3-Ring", "cyclopropane"),
+                ("4-Ring", "cyclobutane"),
+                ("7-Ring", "cycloheptane"),
+                ("8-Ring", "cyclooctane"),
+                ("Chair 4C1", "chair_cyclohexane_1"),
+                ("Chair 1C4", "chair_cyclohexane_2"),
+                ("Norbornane", "norbornane"),
+                ("Adamantane", "adamantane"),
+                ("Steroid", "steroid_core"),
+            ] {
+                let target = DrawTool::RingStamp {
+                    template_id: tid.to_string(),
+                };
                 if ui
-                    .selectable_label(self.active_tool == DrawTool::Chain, "⋀⋁ Chain 120°")
+                    .selectable_label(
+                        self.active_tool == target,
+                        egui::RichText::new(lbl).size(11.5),
+                    )
                     .clicked()
                 {
-                    self.active_tool = DrawTool::Chain;
+                    self.active_tool = target;
                 }
-
-                ui.separator();
-                ui.label(egui::RichText::new("Rings & Chairs").small().strong());
-                for (lbl, tid) in [
-                    ("⬡ Benzene", "benzene"),
-                    ("△ 3-Ring", "cyclopropane"),
-                    ("□ 4-Ring", "cyclobutane"),
-                    ("⬠ 5-Ring", "cyclopentane"),
-                    ("⬡ 6-Ring", "cyclohexane"),
-                    ("⯃ 7-Ring", "cycloheptane"),
-                    ("⯄ 8-Ring", "cyclooctane"),
-                    ("⑂ Chair ⁴C₁", "chair_cyclohexane_1"),
-                    ("⑃ Chair ¹C₄", "chair_cyclohexane_2"),
-                    ("⛨ Norbornane", "norbornane"),
-                    ("❖ Adamantane", "adamantane"),
-                    ("⬡⬡ Steroid", "steroid_core"),
-                ] {
-                    let target = DrawTool::RingStamp {
-                        template_id: tid.to_string(),
-                    };
-                    if ui
-                        .selectable_label(self.active_tool == target, lbl)
-                        .clicked()
-                    {
-                        self.active_tool = target;
-                    }
-                }
-
-                ui.separator();
-                ui.label(egui::RichText::new("Reaction & Pushing").small().strong());
-                for (lbl, kind) in [
-                    ("⟶ Rxn Solid", ArrowKind::Solid),
-                    ("⇌ Equilibrium", ArrowKind::Equilibrium),
-                    ("⟹ Retrosynth", ArrowKind::Retrosynthetic),
-                    ("⟷ Resonance", ArrowKind::Resonance),
-                    ("─✕→ No-Go", ArrowKind::NoGo),
-                ] {
-                    let target = DrawTool::ReactionArrow { kind };
-                    if ui
-                        .selectable_label(self.active_tool == target, lbl)
-                        .clicked()
-                    {
-                        self.active_tool = target;
-                    }
-                }
-                for (lbl, kind) in [
-                    ("↷ Curved 2e⁻", PushingArrowKind::FullTwoElectron),
-                    ("⇀ Fishhook 1e⁻", PushingArrowKind::FishhookOneElectron),
-                ] {
-                    let target = DrawTool::CurvedArrow { kind };
-                    if ui
-                        .selectable_label(self.active_tool == target, lbl)
-                        .clicked()
-                    {
-                        self.active_tool = target;
-                    }
-                }
-
-                ui.separator();
-                ui.label(egui::RichText::new("Brackets, MO & TLC").small().strong());
-                for (lbl, bstyle) in [
-                    ("[ ]n Polymer", BracketStyle::Square),
-                    ("( )n Paren", BracketStyle::Parenthesis),
-                    ("{ } Brace", BracketStyle::CurlyBrace),
-                ] {
-                    let target = DrawTool::Bracket { style: bstyle };
-                    if ui
-                        .selectable_label(self.active_tool == target, lbl)
-                        .clicked()
-                    {
-                        self.active_tool = target;
-                    }
-                }
-                for (lbl, otype) in [
-                    ("◯ s Orbital", OrbitalType::S),
-                    ("∞ p Orbital", OrbitalType::P),
-                    ("✥ d Orbital", OrbitalType::DClover),
-                    ("⏣ dz² Orbital", OrbitalType::Dz2),
-                ] {
-                    let target = DrawTool::Orbital {
-                        orbital_type: otype,
-                    };
-                    if ui
-                        .selectable_label(self.active_tool == target, lbl)
-                        .clicked()
-                    {
-                        self.active_tool = target;
-                    }
-                }
+            }
+            for (lbl, target) in [
+                (
+                    "Wavy",
+                    DrawTool::Bond {
+                        order: BondOrder::Single,
+                        stereo: BondStereo::Wavy,
+                    },
+                ),
+                (
+                    "Dative",
+                    DrawTool::Bond {
+                        order: BondOrder::Single,
+                        stereo: BondStereo::Dative,
+                    },
+                ),
+                (
+                    "Aromatic",
+                    DrawTool::Bond {
+                        order: BondOrder::Aromatic,
+                        stereo: BondStereo::None,
+                    },
+                ),
+                (
+                    "Equilibrium",
+                    DrawTool::ReactionArrow {
+                        kind: ArrowKind::Equilibrium,
+                    },
+                ),
+                (
+                    "Retrosynth",
+                    DrawTool::ReactionArrow {
+                        kind: ArrowKind::Retrosynthetic,
+                    },
+                ),
+                (
+                    "Resonance",
+                    DrawTool::ReactionArrow {
+                        kind: ArrowKind::Resonance,
+                    },
+                ),
+                (
+                    "No-Go",
+                    DrawTool::ReactionArrow {
+                        kind: ArrowKind::NoGo,
+                    },
+                ),
+                (
+                    "Fishhook 1e-",
+                    DrawTool::CurvedArrow {
+                        kind: PushingArrowKind::FishhookOneElectron,
+                    },
+                ),
+                (
+                    "[ ]n Polymer",
+                    DrawTool::Bracket {
+                        style: BracketStyle::Square,
+                    },
+                ),
+                (
+                    "s Orbital",
+                    DrawTool::Orbital {
+                        orbital_type: OrbitalType::S,
+                    },
+                ),
+                (
+                    "p Orbital",
+                    DrawTool::Orbital {
+                        orbital_type: OrbitalType::P,
+                    },
+                ),
+                (
+                    "d Orbital",
+                    DrawTool::Orbital {
+                        orbital_type: OrbitalType::DClover,
+                    },
+                ),
+                (
+                    "dz2 Orbital",
+                    DrawTool::Orbital {
+                        orbital_type: OrbitalType::Dz2,
+                    },
+                ),
+                ("TLC Plate", DrawTool::TlcPlate),
+            ] {
                 if ui
-                    .selectable_label(self.active_tool == DrawTool::TlcPlate, "▤ TLC Plate")
+                    .selectable_label(
+                        self.active_tool == target,
+                        egui::RichText::new(lbl).size(11.5),
+                    )
                     .clicked()
                 {
-                    self.active_tool = DrawTool::TlcPlate;
+                    self.active_tool = target;
                 }
-                if ui
-                    .selectable_label(self.active_tool == DrawTool::TextLabel, "𝐀 Text / Label")
-                    .clicked()
-                {
-                    self.active_tool = DrawTool::TextLabel;
-                }
-            });
+            }
+        });
     }
 
     // ========================================================================
@@ -1857,6 +2050,7 @@ impl OctetDrawPanel {
         let avail = ui.available_size();
         let canvas_size = egui::vec2(avail.x.max(220.0), avail.y.max(200.0));
         let (rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
+        self.last_canvas_rect = Some(rect);
 
         let center_scr = rect.center();
 
@@ -1900,6 +2094,14 @@ impl OctetDrawPanel {
         // Keyboard shortcuts & atom hotkeys
         self.handle_canvas_keyboard_shortcuts(ui, response.hovered());
 
+        // Track secondary-button drag distance so right-drag pan does not pop open the context menu
+        if response.drag_started_by(egui::PointerButton::Secondary) {
+            self.secondary_drag_accum = 0.0;
+        }
+        if response.dragged_by(egui::PointerButton::Secondary) {
+            self.secondary_drag_accum += response.drag_delta().length();
+        }
+
         // Mouse Pan (Middle-drag, Right-drag, Space + drag, or Pan tool)
         let space_held =
             !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_down(egui::Key::Space));
@@ -1915,6 +2117,62 @@ impl OctetDrawPanel {
         } else {
             self.handle_primary_pointer(&response, &screen_to_mol);
         }
+
+        // Right-click canvas context menu (`UI-C9`)
+        response.context_menu(|ui| {
+            if self.secondary_drag_accum >= 5.0 {
+                ui.close();
+                return;
+            }
+            if ui
+                .button(egui::RichText::new("Select Tool (V)").size(12.5))
+                .clicked()
+            {
+                self.active_tool = DrawTool::SelectBox;
+                ui.close();
+            }
+            if ui
+                .button(egui::RichText::new("Clean 2D Coordinates").size(12.5))
+                .clicked()
+            {
+                self.clean_2d_structure();
+                ui.close();
+            }
+            if ui
+                .button(egui::RichText::new("Fit to Screen").size(12.5))
+                .clicked()
+            {
+                self.fit_camera_to_scene();
+                ui.close();
+            }
+            if self.total_molecules > 1
+                && ui
+                    .button(egui::RichText::new("Switch Active Molecule").size(12.5))
+                    .clicked()
+            {
+                self.active_molecule_index =
+                    (self.active_molecule_index + 1) % self.total_molecules;
+                self.selected_atoms.clear();
+                self.recompute_live_analytics();
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .button(egui::RichText::new("Delete Selected").size(12.5))
+                .clicked()
+            {
+                self.delete_hovered_or_selected();
+                ui.close();
+            }
+            if ui
+                .button(egui::RichText::new("Clear Canvas").size(12.5))
+                .clicked()
+            {
+                self.set_scene(RenderScene::new());
+                self.status_msg = "Cleared canvas".to_string();
+                ui.close();
+            }
+        });
 
         // --- Render Publication Scene onto `egui::Painter` ---
         let painter = ui.painter_at(rect);
@@ -2184,6 +2442,7 @@ impl OctetDrawPanel {
                     } else {
                         self.selected_atoms.clear();
                     }
+                    self.recompute_live_analytics();
                 }
                 DrawTool::Eraser => {
                     self.hover_target = hit;
@@ -2448,6 +2707,7 @@ impl OctetDrawPanel {
                     })
                     .map(|(i, _)| i)
                     .collect();
+                self.recompute_live_analytics();
             }
             ActiveDrag::LassoSelect { points_mol } => {
                 if points_mol.len() >= 3 {
@@ -2461,6 +2721,7 @@ impl OctetDrawPanel {
                         })
                         .map(|(i, _)| i)
                         .collect();
+                    self.recompute_live_analytics();
                 }
             }
             ActiveDrag::MoveSelection { pushed_undo, .. } => {
@@ -2763,38 +3024,74 @@ impl OctetDrawPanel {
                         .size(15.0)
                         .strong(),
                 );
+                let active_hdr = if self.total_molecules == 0 {
+                    "No active molecule".to_string()
+                } else {
+                    format!(
+                        "Active: {}",
+                        self.molecule_display_label(
+                            self.active_molecule_index
+                                .min(self.total_molecules.saturating_sub(1))
+                        )
+                    )
+                };
+                ui.label(egui::RichText::new(active_hdr).size(11.5).strong());
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     egui::Grid::new("octet_mol_props_grid")
                         .num_columns(2)
                         .striped(true)
                         .show(ui, |ui| {
-                            ui.label("Formula:");
-                            ui.monospace(&self.cached_props.formula_hill);
+                            ui.label(egui::RichText::new("Formula:").size(12.0));
+                            ui.label(
+                                egui::RichText::new(&self.cached_props.formula_hill)
+                                    .size(12.0)
+                                    .monospace(),
+                            );
                             ui.end_row();
 
-                            ui.label("Mol. Weight:");
-                            ui.monospace(format!(
-                                "{:.2} g/mol",
-                                self.cached_props.molecular_weight
-                            ));
+                            ui.label(egui::RichText::new("Mol. Weight:").size(12.0));
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{:.2} g/mol",
+                                    self.cached_props.molecular_weight
+                                ))
+                                .size(12.0)
+                                .monospace(),
+                            );
                             ui.end_row();
 
-                            ui.label("Exact Mass:");
-                            ui.monospace(format!("{:.5} Da", self.cached_props.exact_mass));
+                            ui.label(egui::RichText::new("Exact Mass:").size(12.0));
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{:.4} Da",
+                                    self.cached_props.exact_mass
+                                ))
+                                .size(12.0)
+                                .monospace(),
+                            );
                             ui.end_row();
 
-                            ui.label("Heavy / Rings:");
-                            ui.monospace(format!(
-                                "{} atoms / {} rings",
-                                self.cached_props.heavy_atoms, self.cached_props.rings
-                            ));
+                            ui.label(egui::RichText::new("Heavy / Rings:").size(12.0));
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} / {}",
+                                    self.cached_props.heavy_atoms, self.cached_props.rings
+                                ))
+                                .size(12.0)
+                                .monospace(),
+                            );
                             ui.end_row();
 
-                            ui.label("HBD / HBA:");
-                            ui.monospace(format!(
-                                "{} / {}",
-                                self.cached_props.h_bond_donors, self.cached_props.h_bond_acceptors
-                            ));
+                            ui.label(egui::RichText::new("HBD / HBA:").size(12.0));
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} / {}",
+                                    self.cached_props.h_bond_donors,
+                                    self.cached_props.h_bond_acceptors
+                                ))
+                                .size(12.0)
+                                .monospace(),
+                            );
                             ui.end_row();
                         });
                     if !self.cached_props.elemental_analysis.is_empty() {
@@ -2804,75 +3101,85 @@ impl OctetDrawPanel {
                                 "Elem. Anal.: {}",
                                 self.cached_props.elemental_analysis
                             ))
-                            .small()
+                            .size(11.0)
                             .monospace(),
                         );
                     }
                 });
 
-                ui.add_space(8.0);
-                ui.heading(
-                    egui::RichText::new("Reaction Stoichiometry")
-                        .size(14.5)
-                        .strong(),
-                );
-                ui.horizontal(|ui| {
-                    ui.label("Scale (mmol):");
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut self.ref_scale_mmol)
-                                .speed(0.1)
-                                .range(0.01..=1000.0),
-                        )
-                        .changed()
-                    {
-                        self.cached_stoich =
-                            compute_builtin_stoichiometry(&self.scene, self.ref_scale_mmol);
-                    }
-                });
-
-                egui::Grid::new("octet_stoich_grid")
-                    .striped(true)
-                    .min_col_width(40.0)
-                    .show(ui, |ui| {
-                        ui.strong("Role");
-                        ui.strong("Formula");
-                        ui.strong("MW");
-                        ui.strong("Mass (mg)");
-                        ui.end_row();
-                        for row in &self.cached_stoich {
-                            ui.label(&row.role);
-                            ui.monospace(&row.formula);
-                            ui.monospace(format!("{:.1}", row.mw));
-                            ui.monospace(format!("{:.1}", row.mass_mg));
-                            ui.end_row();
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new(
+                    egui::RichText::new("Stoichiometry & Arrow Labels").size(12.5),
+                )
+                .id_salt("octet_stoich_and_labels_collapse")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Scale (mmol):").size(12.0));
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.ref_scale_mmol)
+                                    .speed(0.1)
+                                    .range(0.01..=1000.0),
+                            )
+                            .changed()
+                        {
+                            self.cached_stoich =
+                                compute_builtin_stoichiometry(&self.scene, self.ref_scale_mmol);
                         }
                     });
 
-                ui.add_space(8.0);
-                ui.separator();
-                ui.label(
-                    egui::RichText::new("Arrow / Bracket Labels")
-                        .small()
-                        .strong(),
-                );
-                ui.horizontal(|ui| {
-                    ui.label("Above →:");
-                    ui.text_edit_singleline(&mut self.arrow_above_input);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Below →:");
-                    ui.text_edit_singleline(&mut self.arrow_below_input);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Caption:");
-                    ui.text_edit_singleline(&mut self.active_text_caption);
+                    egui::Grid::new("octet_stoich_grid")
+                        .striped(true)
+                        .min_col_width(36.0)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("Role").size(11.5).strong());
+                            ui.label(egui::RichText::new("Formula").size(11.5).strong());
+                            ui.label(egui::RichText::new("MW").size(11.5).strong());
+                            ui.label(egui::RichText::new("mg").size(11.5).strong());
+                            ui.end_row();
+                            for row in &self.cached_stoich {
+                                ui.label(egui::RichText::new(&row.role).size(11.5));
+                                ui.label(egui::RichText::new(&row.formula).size(11.5).monospace());
+                                ui.label(
+                                    egui::RichText::new(format!("{:.1}", row.mw))
+                                        .size(11.5)
+                                        .monospace(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("{:.1}", row.mass_mg))
+                                        .size(11.5)
+                                        .monospace(),
+                                );
+                                ui.end_row();
+                            }
+                        });
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Arrow / Bracket Labels")
+                            .size(11.5)
+                            .strong(),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Above ->:").size(11.5));
+                        ui.text_edit_singleline(&mut self.arrow_above_input);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Below ->:").size(11.5));
+                        ui.text_edit_singleline(&mut self.arrow_below_input);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Caption:").size(11.5));
+                        ui.text_edit_singleline(&mut self.active_text_caption);
+                    });
                 });
             });
     }
 
     // ========================================================================
-    // Bottom Panel: Live Predicted ¹H & ¹³C NMR Inspector + Interactive 1D Plot
+    // Bottom Panel: Live Predicted 1H & 13C NMR Inspector + Interactive 1D Plot
     // ========================================================================
 
     fn draw_bottom_nmr_inspector(&mut self, ui: &mut egui::Ui) {
@@ -2884,9 +3191,21 @@ impl OctetDrawPanel {
         };
 
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Live Predicted 1D NMR").strong());
-            ui.selectable_value(&mut self.nmr_tab, NmrViewTab::Proton1H, "¹H NMR");
-            ui.selectable_value(&mut self.nmr_tab, NmrViewTab::Carbon13C, "¹³C{¹H} NMR");
+            ui.label(
+                egui::RichText::new("Live Predicted 1D NMR")
+                    .size(12.5)
+                    .strong(),
+            );
+            ui.selectable_value(
+                &mut self.nmr_tab,
+                NmrViewTab::Proton1H,
+                egui::RichText::new("1H NMR").size(12.5),
+            );
+            ui.selectable_value(
+                &mut self.nmr_tab,
+                NmrViewTab::Carbon13C,
+                egui::RichText::new("13C{1H} NMR").size(12.5),
+            );
             if ui
                 .add(
                     egui::Slider::new(&mut self.spectrometer_mhz, 60.0..=900.0)
@@ -2898,7 +3217,7 @@ impl OctetDrawPanel {
                 self.recompute_live_analytics();
             }
             if ui
-                .small_button("📌 Embed 1D Plot on Canvas")
+                .button(egui::RichText::new("Embed 1D Plot on Canvas").size(11.5))
                 .on_hover_text("Insert publication 1D NMR spectrum directly onto the drawing canvas for SVG/PDF/PNG export")
                 .clicked()
             {
@@ -2988,7 +3307,7 @@ impl OctetDrawPanel {
                     egui::pos2(tx, rect.bottom() - 2.0),
                     egui::Align2::CENTER_BOTTOM,
                     format!("{tk:.0}"),
-                    egui::FontId::monospace(9.5),
+                    egui::FontId::monospace(11.0),
                     egui::Color32::from_rgb(148, 163, 184),
                 );
                 tk += step;
@@ -3001,8 +3320,8 @@ impl OctetDrawPanel {
                 painter.text(
                     egui::pos2(rect.right() - 8.0, rect.top() + 4.0),
                     egui::Align2::RIGHT_TOP,
-                    format!("δ {cur_ppm:.2} ppm"),
-                    egui::FontId::monospace(10.5),
+                    format!("{cur_ppm:.2} ppm"),
+                    egui::FontId::monospace(11.0),
                     egui::Color32::from_rgb(226, 232, 240),
                 );
                 for sig in signals {
@@ -3033,11 +3352,11 @@ impl OctetDrawPanel {
                         .striped(true)
                         .min_col_width(44.0)
                         .show(ui, |ui| {
-                            ui.strong("δ (ppm)");
-                            ui.strong("Mult.");
-                            ui.strong("J (Hz)");
-                            ui.strong("Int.");
-                            ui.strong("Assignment");
+                            ui.label(egui::RichText::new("Shift (ppm)").size(11.5).strong());
+                            ui.label(egui::RichText::new("Mult.").size(11.5).strong());
+                            ui.label(egui::RichText::new("J (Hz)").size(11.5).strong());
+                            ui.label(egui::RichText::new("Int.").size(11.5).strong());
+                            ui.label(egui::RichText::new("Assignment").size(11.5).strong());
                             ui.end_row();
 
                             for sig in signals {
@@ -3050,12 +3369,17 @@ impl OctetDrawPanel {
                                 };
                                 let r_shift = ui.label(
                                     egui::RichText::new(format!("{:.2}", sig.ppm))
+                                        .size(11.5)
                                         .monospace()
                                         .color(col),
                                 );
-                                ui.monospace(&sig.multiplicity);
+                                ui.label(
+                                    egui::RichText::new(&sig.multiplicity)
+                                        .size(11.5)
+                                        .monospace(),
+                                );
                                 let j_txt = if sig.couplings_hz.is_empty() {
-                                    "—".to_string()
+                                    "-".to_string()
                                 } else {
                                     sig.couplings_hz
                                         .iter()
@@ -3063,9 +3387,18 @@ impl OctetDrawPanel {
                                         .collect::<Vec<_>>()
                                         .join(", ")
                                 };
-                                ui.monospace(j_txt);
-                                ui.monospace(format!("{:.0}", sig.integral));
-                                ui.label(sig.assignment_label.as_deref().unwrap_or("—"));
+                                ui.label(egui::RichText::new(j_txt).size(11.5).monospace());
+                                ui.label(
+                                    egui::RichText::new(format!("{:.0}", sig.integral))
+                                        .size(11.5)
+                                        .monospace(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        sig.assignment_label.as_deref().unwrap_or("-"),
+                                    )
+                                    .size(11.5),
+                                );
                                 if r_shift.hovered() {
                                     for &ai in &sig.atom_indices {
                                         self.highlighted_nmr_atoms.insert(ai);
@@ -3089,21 +3422,25 @@ impl OctetDrawPanel {
         let mut open = self.show_template_gallery;
         let mut chosen_id: Option<String> = None;
 
-        egui::Window::new("📚 Octet Structure & Clipware Template Gallery")
+        egui::Window::new("Octet Structure & Clipware Template Gallery")
             .open(&mut open)
             .default_width(540.0)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Search:");
+                    ui.label(egui::RichText::new("Search:").size(12.5));
                     ui.text_edit_singleline(&mut self.template_search_query);
-                    if ui.small_button("Clear").clicked() {
+                    if ui.button(egui::RichText::new("Clear").size(11.5)).clicked() {
                         self.template_search_query.clear();
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
                     for &cat in TemplateCategory::ALL {
-                        ui.selectable_value(&mut self.template_category_filter, cat, cat.name());
+                        ui.selectable_value(
+                            &mut self.template_category_filter,
+                            cat,
+                            egui::RichText::new(cat.name()).size(12.0),
+                        );
                     }
                 });
                 ui.separator();
@@ -3134,7 +3471,7 @@ impl OctetDrawPanel {
                                 } else {
                                     tname
                                 };
-                                if ui.button(lbl).clicked() {
+                                if ui.button(egui::RichText::new(lbl).size(12.0)).clicked() {
                                     chosen_id = Some(tid);
                                 }
                             }
@@ -3160,29 +3497,41 @@ impl OctetDrawPanel {
         let mut trigger_export = false;
         let mut trigger_import = false;
 
-        egui::Window::new("📤 Multi-Format Chemical & Publication Import / Export")
+        egui::Window::new("Multi-Format Chemical & Publication Import / Export")
             .open(&mut open)
             .default_width(640.0)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Format:");
+                    ui.label(egui::RichText::new("Format:").size(12.5));
                     let prev_fmt = self.selected_io_format;
                     egui::ComboBox::from_id_salt("octet_io_format_combo")
-                        .selected_text(self.selected_io_format.label())
+                        .selected_text(
+                            egui::RichText::new(self.selected_io_format.label()).size(12.5),
+                        )
                         .show_ui(ui, |ui| {
                             for &fmt in IoFormat::ALL {
-                                ui.selectable_value(&mut self.selected_io_format, fmt, fmt.label());
+                                ui.selectable_value(
+                                    &mut self.selected_io_format,
+                                    fmt,
+                                    egui::RichText::new(fmt.label()).size(12.5),
+                                );
                             }
                         });
                     if self.selected_io_format != prev_fmt {
                         trigger_export = true;
                     }
 
-                    if ui.button("🔄 Generate Export").clicked() {
+                    if ui
+                        .button(egui::RichText::new("Generate Export").size(12.0))
+                        .clicked()
+                    {
                         trigger_export = true;
                     }
-                    if ui.button("📋 Copy to Clipboard").clicked() {
+                    if ui
+                        .button(egui::RichText::new("Copy to Clipboard").size(12.0))
+                        .clicked()
+                    {
                         ui.ctx().copy_text(self.io_text_buffer.clone());
                         self.status_msg = format!(
                             "Copied {} ({} chars) to clipboard",
@@ -3191,7 +3540,9 @@ impl OctetDrawPanel {
                         );
                     }
                     if self.selected_io_format.can_import()
-                        && ui.button("📥 Import from Buffer").clicked()
+                        && ui
+                            .button(egui::RichText::new("Import from Buffer").size(12.0))
+                            .clicked()
                     {
                         trigger_import = true;
                     }
@@ -3204,7 +3555,7 @@ impl OctetDrawPanel {
                         self.last_pdf_bytes_len,
                         self.last_png_bytes_len
                     ))
-                    .small()
+                    .size(11.0)
                     .weak(),
                 );
 
@@ -3351,7 +3702,7 @@ fn paint_vector_primitive(
             ..
         } => {
             let sp = pt_to_scr(*pos);
-            let fsz = (*font_size_pt as f32 * pt_scale).clamp(7.5, 42.0);
+            let fsz = (*font_size_pt as f32 * pt_scale).clamp(11.0, 42.0);
             painter.text(
                 sp,
                 egui::Align2::LEFT_BOTTOM,
@@ -3383,11 +3734,13 @@ fn point_in_polygon(pt: [f64; 2], poly: &[[f64; 2]]) -> bool {
 // ============================================================================
 
 fn build_default_showcase_scene(lib: &TemplateLibrary) -> RenderScene {
-    // Showcase: Aspirin (acetylsalicylic acid) -> Salicylic acid + Acetic acid hydrolysis scheme
+    // Showcase: Aspirin (acetylsalicylic acid) -> Salicylic acid hydrolysis scheme
+    // Well-separated coordinates so Aspirin, curved nucleophilic arrow, reaction arrow labels
+    // ("NaOH, H2O" / "25 C, 95%"), and Salicylic acid have zero AABB overlap.
     let mut scene = RenderScene::new();
     if let Some(bz) = lib.get("benzene") {
-        // Reactant: Aspirin centered at (-3.5, 0.3)
-        let r_base = scene.merge_at(&bz.scene, -3.5, 0.3);
+        // Reactant: Aspirin centered at (-5.0, 0.3) (all Aspirin atoms have x <= -1.536 < 0.0)
+        let r_base = scene.merge_at(&bz.scene, -5.0, 0.3);
         // Ortho COOH on top vertex (r_base + 0)
         let c_cooh = scene.add_atom(SceneAtom::carbon(
             scene.atoms[r_base].x,
@@ -3431,26 +3784,26 @@ fn build_default_showcase_scene(lib: &TemplateLibrary) -> RenderScene {
         scene.add_bond(SceneBond::double(c_ac, o_ac));
         scene.add_bond(SceneBond::single(c_ac, me_ac));
 
-        // Curved nucleophilic attack arrow demonstration
+        // Curved carbonyl pi-bond electron-pushing arrow tucked cleanly to the right of C=O
         scene.curved_arrows.push(SceneCurvedArrow::from_chord(
-            [scene.atoms[c_ac].x + 0.15, scene.atoms[c_ac].y - 0.15],
-            [scene.atoms[o_ac].x + 0.22, scene.atoms[o_ac].y - 0.05],
-            0.42,
+            [scene.atoms[c_ac].x + 0.22, scene.atoms[c_ac].y - 0.26],
+            [scene.atoms[o_ac].x + 0.26, scene.atoms[o_ac].y + 0.06],
+            0.32,
             PushingArrowKind::FullTwoElectron,
         ));
 
-        // Reaction arrow
+        // Reaction arrow well clear of Aspirin (x <= -1.536) and Salicylic acid (x >= 4.134)
         scene.reaction_arrows.push(SceneReactionArrow {
-            from: [-0.2, 0.3],
-            to: [2.2, 0.3],
+            from: [0.0, 0.3],
+            to: [2.6, 0.3],
             kind: ArrowKind::Solid,
             above_text: Some("NaOH, H2O".to_string()),
-            below_text: Some("25 C, 96%".to_string()),
+            below_text: Some("25 C, 95%".to_string()),
             color: None,
         });
 
-        // Product: Salicylic acid centered at (4.2, 0.3)
-        let p_base = scene.merge_at(&bz.scene, 4.2, 0.3);
+        // Product: Salicylic acid centered at (5.0, 0.3)
+        let p_base = scene.merge_at(&bz.scene, 5.0, 0.3);
         let pc = scene.add_atom(SceneAtom::with_group(
             "C",
             "COOH",
@@ -3697,10 +4050,111 @@ fn connected_components(scene: &RenderScene) -> Vec<Vec<usize>> {
             }
         }
         if !comp.is_empty() {
+            comp.sort_unstable();
             comps.push(comp);
         }
     }
+    // Order connected components left-to-right by x-centroid so index 0 is always the leftmost molecule
+    comps.sort_by(|ca, cb| {
+        let xa = ca.iter().map(|&i| scene.atoms[i].x).sum::<f64>() / (ca.len() as f64);
+        let xb = cb.iter().map(|&i| scene.atoms[i].x).sum::<f64>() / (cb.len() as f64);
+        xa.total_cmp(&xb)
+    });
     comps
+}
+
+/// Extract a single connected-component molecule subgraph (`OctetGraph`) from a multi-molecule
+/// reaction scheme (`UI-B10` / `UI-C14`), returning `(subgraph, resolved_component_idx, total_components)`.
+pub fn extract_active_molecule_subgraph(
+    graph: &OctetGraph,
+    selected_atoms: &BTreeSet<u32>,
+    active_component_idx: usize,
+) -> (OctetGraph, usize, usize) {
+    let (sub, resolved_idx, total, _) =
+        extract_active_molecule_subgraph_with_map(graph, selected_atoms, active_component_idx);
+    (sub, resolved_idx, total)
+}
+
+fn extract_active_molecule_subgraph_with_map(
+    graph: &OctetGraph,
+    selected_atoms: &BTreeSet<u32>,
+    active_component_idx: usize,
+) -> (OctetGraph, usize, usize, Vec<usize>) {
+    let comps = connected_components(graph);
+    if comps.is_empty() {
+        return (RenderScene::new(), 0, 0, Vec::new());
+    }
+
+    // If atoms are selected, choose the component containing the majority of selected atoms
+    // (tie-breaking toward leftmost component). Otherwise use `active_component_idx`.
+    let chosen_idx = if !selected_atoms.is_empty() {
+        let mut best_comp: Option<(usize, usize)> = None;
+        for (ci, comp) in comps.iter().enumerate() {
+            let hits = comp
+                .iter()
+                .filter(|&&ai| selected_atoms.contains(&(ai as u32)))
+                .count();
+            if hits > 0 && best_comp.is_none_or(|(_, bh)| hits > bh) {
+                best_comp = Some((ci, hits));
+            }
+        }
+        best_comp
+            .map(|(ci, _)| ci)
+            .unwrap_or_else(|| active_component_idx.min(comps.len() - 1))
+    } else {
+        active_component_idx.min(comps.len() - 1)
+    };
+
+    let comp = &comps[chosen_idx];
+    let mut old_to_new = vec![None; graph.atoms.len()];
+    let mut sub = RenderScene::new();
+    let mut parent_map = Vec::with_capacity(comp.len());
+
+    for &old_ai in comp {
+        let new_ai = sub.atoms.len();
+        old_to_new[old_ai] = Some(new_ai);
+        parent_map.push(old_ai);
+        sub.atoms.push(graph.atoms[old_ai].clone());
+    }
+    for a in &mut sub.atoms {
+        a.multi_center_atoms = a
+            .multi_center_atoms
+            .iter()
+            .filter_map(|&old| old_to_new.get(old).copied().flatten())
+            .collect();
+    }
+    for b in &graph.bonds {
+        if let (Some(na), Some(nb)) = (
+            old_to_new.get(b.a).copied().flatten(),
+            old_to_new.get(b.b).copied().flatten(),
+        ) {
+            let mut nbond = b.clone();
+            nbond.a = na;
+            nbond.b = nb;
+            sub.bonds.push(nbond);
+        }
+    }
+    for ring in &graph.aromatic_circles {
+        let remapped: Vec<usize> = ring
+            .iter()
+            .filter_map(|&old| old_to_new.get(old).copied().flatten())
+            .collect();
+        if remapped.len() == ring.len() && !remapped.is_empty() {
+            sub.aromatic_circles.push(remapped);
+        }
+    }
+
+    (sub, chosen_idx, comps.len(), parent_map)
+}
+
+fn remap_signal_atoms_to_parent(signals: &mut [SpectrumSignal1D], parent_map: &[usize]) {
+    for sig in signals {
+        sig.atom_indices = sig
+            .atom_indices
+            .iter()
+            .filter_map(|&sub_i| parent_map.get(sub_i).copied())
+            .collect();
+    }
 }
 
 fn compute_builtin_properties(scene: &RenderScene) -> MolecularPropertiesSummary {
@@ -4860,5 +5314,170 @@ mod tests {
         assert!((1..=12).contains(&mm), "month out of range: {mm}");
         assert!((1..=31).contains(&dd), "day out of range: {dd}");
         assert_eq!(&line2[20..22], "2D");
+    }
+
+    #[test]
+    fn aspirin_hydrolysis_showcase_computes_per_molecule_properties_and_1h_nmr() {
+        let mut panel = OctetDrawPanel::new();
+        assert_eq!(
+            panel.total_molecules, 2,
+            "Showcase scheme must contain 2 connected-component molecules (Aspirin + Salicylic acid)"
+        );
+        assert_eq!(panel.active_molecule_index, 0);
+
+        // Active molecule 0 = Aspirin (C9H8O4, MW ~ 180.16 g/mol, exact mass ~ 180.0423 Da)
+        assert_eq!(
+            panel.cached_props.formula_hill, "C9H8O4",
+            "Active molecule 0 must be Aspirin (C9H8O4), never Reactant+Product (C16H14O7)"
+        );
+        assert!(
+            (panel.cached_props.molecular_weight - 180.16).abs() < 0.05,
+            "Expected Aspirin MW ~ 180.16, got {}",
+            panel.cached_props.molecular_weight
+        );
+        assert!(
+            (panel.cached_props.exact_mass - 180.0423).abs() < 0.001,
+            "Expected Aspirin exact mass ~ 180.0423, got {}",
+            panel.cached_props.exact_mass
+        );
+        let total_1h_integral: f64 = panel.cached_1h.iter().map(|s| s.integral).sum();
+        assert!(
+            (total_1h_integral - 8.0).abs() < 1e-6,
+            "Expected 8.0 total 1H integral for Aspirin (C9H8O4), got {total_1h_integral}"
+        );
+        assert_eq!(
+            panel.cached_1h.len(),
+            6,
+            "Expected 6 Aspirin 1H signals (4 ArH + 1 COOH + 1 OAc CH3), got {}",
+            panel.cached_1h.len()
+        );
+
+        // Switching to molecule 1 = Salicylic acid (C7H6O3, MW ~ 138.12 g/mol)
+        panel.active_molecule_index = 1;
+        panel.recompute_properties_and_nmr();
+        assert_eq!(panel.cached_props.formula_hill, "C7H6O3");
+        assert!((panel.cached_props.molecular_weight - 138.12).abs() < 0.05);
+        let prod_1h_integral: f64 = panel.cached_1h.iter().map(|s| s.integral).sum();
+        assert!(
+            (prod_1h_integral - 6.0).abs() < 1e-6,
+            "Expected 6.0 total 1H integral for Salicylic acid (C7H6O3), got {prod_1h_integral}"
+        );
+
+        // Verify custom backend adapter also receives the single-molecule subgraph (`&sub`), not `self.scene`
+        struct SubgraphVerifyingAdapter;
+        impl OctetBackendAdapter for SubgraphVerifyingAdapter {
+            fn compute_properties(
+                &self,
+                scene: &RenderScene,
+            ) -> Option<MolecularPropertiesSummary> {
+                assert_eq!(
+                    connected_components(scene).len(),
+                    1,
+                    "OctetBackendAdapter::compute_properties must receive single-molecule subgraph"
+                );
+                Some(compute_builtin_properties(scene))
+            }
+            fn predict_nmr_1h_13c(
+                &self,
+                scene: &RenderScene,
+                _freq_mhz: f64,
+            ) -> Option<(Vec<SpectrumSignal1D>, Vec<SpectrumSignal1D>)> {
+                assert_eq!(
+                    connected_components(scene).len(),
+                    1,
+                    "OctetBackendAdapter::predict_nmr_1h_13c must receive single-molecule subgraph"
+                );
+                Some(predict_builtin_nmr_1h_13c(scene))
+            }
+        }
+
+        panel.active_molecule_index = 0;
+        panel.set_backend_adapter(Box::new(SubgraphVerifyingAdapter));
+        assert_eq!(panel.cached_props.formula_hill, "C9H8O4");
+    }
+
+    #[test]
+    fn showcase_labels_coherent_and_curved_arrow_has_zero_aabb_overlap() {
+        let panel = OctetDrawPanel::new();
+        assert_eq!(panel.arrow_above_input, "NaOH, H2O");
+        assert_eq!(panel.arrow_below_input, "25 C, 95%");
+        assert_eq!(panel.active_text_caption, "NaOH, H2O");
+        assert!(!panel.active_text_caption.contains("Pd"));
+
+        let arr = panel
+            .scene
+            .reaction_arrows
+            .first()
+            .expect("showcase reaction arrow");
+        assert_eq!(arr.above_text.as_deref(), Some("NaOH, H2O"));
+        assert_eq!(arr.below_text.as_deref(), Some("25 C, 95%"));
+
+        // Compile curved-arrow-only vs ester-bonds-and-text scenes in raw mol->pt space to verify zero AABB overlap
+        let bl = panel.style.bond_length_pt;
+        let ca = panel
+            .scene
+            .curved_arrows
+            .first()
+            .expect("showcase curved arrow");
+        let mut ca_min_x = f64::INFINITY;
+        let mut ca_max_x = f64::NEG_INFINITY;
+        let mut ca_min_y = f64::INFINITY;
+        let mut ca_max_y = f64::NEG_INFINITY;
+        for step in 0..=32 {
+            let t = step as f64 / 32.0;
+            let mt = 1.0 - t;
+            let x = mt * mt * mt * ca.start[0]
+                + 3.0 * mt * mt * t * ca.ctrl1[0]
+                + 3.0 * mt * t * t * ca.ctrl2[0]
+                + t * t * t * ca.end[0];
+            let y = mt * mt * mt * ca.start[1]
+                + 3.0 * mt * mt * t * ca.ctrl1[1]
+                + 3.0 * mt * t * t * ca.ctrl2[1]
+                + t * t * t * ca.end[1];
+            ca_min_x = ca_min_x.min(x);
+            ca_max_x = ca_max_x.max(x);
+            ca_min_y = ca_min_y.min(y);
+            ca_max_y = ca_max_y.max(y);
+        }
+        // Reaction arrow text span centered at x = 1.3 with width <= 3.8 bond lengths -> x >= -0.6
+        let rxn_mid_x = 0.5 * (arr.from[0] + arr.to[0]);
+        let rxn_text_left_x = rxn_mid_x - (0.5 * 9.0 * panel.style.caption_size_pt * 0.6 / bl);
+        assert!(
+            ca_max_x + 0.15 < rxn_text_left_x,
+            "Curved arrow max_x ({ca_max_x:.2}) must not overlap reaction arrow text left_x ({rxn_text_left_x:.2})"
+        );
+    }
+
+    #[test]
+    fn octet_canvas_occupies_at_least_68_percent_of_1440x900_viewport() {
+        let ctx = egui::Context::default();
+        let mut panel = OctetDrawPanel::new();
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+        let mut raw = egui::RawInput {
+            screen_rect: Some(vp),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw.clone(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                panel.ui(ui);
+            });
+        });
+        out.textures_delta.clear();
+        raw.events.clear();
+        let mut out2 = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                panel.ui(ui);
+            });
+        });
+        out2.textures_delta.clear();
+
+        let canvas_rect = panel
+            .last_canvas_rect
+            .expect("OctetDrawPanel must record last_canvas_rect");
+        let share = (canvas_rect.width() * canvas_rect.height()) / (1440.0 * 900.0);
+        assert!(
+            share >= 0.68,
+            "Expected Octet canvas share >= 0.68 at 1440x900, got {share:.3} ({canvas_rect:?})"
+        );
     }
 }
