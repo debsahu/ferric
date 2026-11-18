@@ -30,6 +30,17 @@
 //!   2006, 78, 4281–4290); Trygg, J. & Wold, S. (*J. Chemom.* 2002, 16, 119–128); Westerhuis,
 //!   J. A. et al. (*Metabolomics* 2008, 4, 81–89); Cloarec, O. et al. (*Anal. Chem.* 2005, 77,
 //!   1282–1289) — Phase 14 `AI-Binning`, `PQN`, `PCA`, `OPLS-DA`, and `STOCSY` chemometrics.
+//! - Jumper, J. et al. (*Nature* 2021, 596, 583–589); Varadi, M. et al. (*Nucleic Acids Res.*
+//!   2022, 50, D439–D444; 2024, 52, D368–D375); Fowler, N. J., Sljoka, A. & Williamson, M. P.
+//!   (*Nat. Commun.* 2020, 11, 5982; *Structure* 2022, 30, 925–933); Shen, Y. & Bax, A. (*J.
+//!   Biomol. NMR* 2010, 48, 13–22); Haigh, C. W. & Mallion, R. B. (*Mol. Phys.* 1972, 24,
+//!   955–970); Ng, A. Y., Jordan, M. I. & Weiss, Y. (*NeurIPS* 2001, 14, 849–856); Tolman, J. R.
+//!   et al. (*J. Am. Chem. Soc.* 2001, 123, 1416–1424); Abramson, J. et al. (*Nature* 2024, 630,
+//!   493–500); Wohlwend, J. et al. (*bioRxiv* 2024); Shrake, A. & Rupley, J. A. (*J. Mol. Biol.*
+//!   1973, 79, 351–371); Vallurupalli, P., Hansen, D. F. & Kay, L. E. (*Proc. Natl. Acad. Sci.
+//!   U.S.A.* 2008, 105, 11766–11771); Skrynnikov, N. R. et al. (*J. Am. Chem. Soc.* 2002, 124,
+//!   12352–12360); Kass, R. E. & Raftery, A. E. (*J. Am. Stat. Assoc.* 1995, 90, 773–795) —
+//!   Phase 21 AlphaFold concordance, 3D shift prediction, co-fold pose scoring, and excited states.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -40,18 +51,34 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::af_concordance::{
+    evaluate_af_nmr_concordance, parse_af_structure_model, parse_modelfree_s2_tsv_file,
+    parse_pae_json_file, AfConcordanceConfig, AfIngestOptions,
+};
 use crate::cest::{fit_cest_global_cpu, read_cest_profiles_tsv, CestFitConfig};
 use crate::classify::classify_nmr_workspace;
+use crate::cofold_bridge::{
+    extract_nmr_interface_restraints, ligand_spec_from_octet_str, parse_cofold_pcs_tsv_str,
+    parse_cofold_rdc_tsv_str, parse_csp_restraint_str, parse_intermolecular_noe_tsv_str,
+    parse_intermolecular_pre_tsv_str, score_cofold_poses, CofoldEntitySpec, CofoldRestraintBundle,
+    CofoldRestraintExtractConfig, CofoldRestraintInput, PoseScoreConfig, PoseVerdict,
+    StructurePoseInput,
+};
 use crate::cpmg::{fit_cpmg_global_cpu, read_cpmg_series_tsv, CpmgFitConfig, CpmgModel};
 use crate::csp::{
     fit_csp_global_kd, track_methyl_hmqc_trajectories, track_titration_trajectories,
     AssignedAmidePeak, CspAnalysisConfig, UnassignedHsqcPeak, UnassignedTitrationStep,
 };
+use crate::domain_dock::{cluster_pae_domains_for_model, PaeClusterConfig};
 use crate::dosy::{
     compute_b_values_s_m2, estimate_hydrodynamics, fit_stejskal_tanner_multi, read_bruker_dosy_dir,
     read_varian_dosy_dir, solve_tikhonov_ilt, BrukerDosyOverrides, DosyFitConfig, DosyNucleus,
     DosySequenceType, DosySolvent, GradientShape, IltConfig, ModelSelectionCriterion,
     SoluteCompactnessClass, VarianDosyOverrides, ILT_ARTIFACT_CAVEAT,
+};
+use crate::excited_state::{
+    classify_excited_state_with_firewall, parse_exchange_observations_tsv, AltConformerInput,
+    ExcitedStateConfig,
 };
 use crate::metabolomics::{
     compute_stocsy_at_ppm, run_metabolomics_pipeline, BiofluidMaskPreset, BucketingMethod,
@@ -61,6 +88,7 @@ use crate::multiplet::{
     analyze_multiplet_region, format_journal_nmr_report, JournalNmrReport, MultipletConfig,
     PublicationStyle, ReportNucleus, ReportedSignal, TextEncoding,
 };
+use crate::nef::read_nef_file;
 use crate::nmr1d::{
     auto_calibrate_solvent_1d, deconvolve_spectrum_1d, estimate_noise_sigma_1d,
     load_processed_spectrum_1d, match_trace_impurities, pick_peaks_1d, DeconvolveConfig1D,
@@ -81,6 +109,9 @@ use crate::relax_fit::{decay_inputs_from_series, fit_decay_batch_cpu, ExpFitConf
 use crate::relax_io::{parse_relax_series_nef_str, parse_relax_series_tsv_str};
 use crate::solver::{assign, prepare_scoring_priors, AnnealConfig, ScoreConfig};
 use crate::spinsystems::{build_spin_systems, Tolerances};
+use crate::struct_shifts::{
+    predict_structure_shifts_with_firewall, StructShiftConfig, StructureModel,
+};
 use crate::torsion_db::{
     sha256_hex, HomologFirewall, HomologFirewallQuery, TorsionPredictionClass,
     DEFAULT_FIREWALL_MAX_SEQ_IDENTITY,
@@ -1348,6 +1379,10 @@ impl McpServer {
             "analyze_nmr1d_spectrum" => self.tool_analyze_nmr1d_spectrum(&args_map),
             "fit_dosy_diffusion" => self.tool_fit_dosy_diffusion(&args_map),
             "run_metabolomics_chemometrics" => self.tool_run_metabolomics_chemometrics(&args_map),
+            "af_concordance" => self.tool_af_concordance(&args_map),
+            "predict_structure_shifts" => self.tool_predict_structure_shifts(&args_map),
+            "score_cofold_poses" => self.tool_score_cofold_poses(&args_map),
+            "classify_excited_state" => self.tool_classify_excited_state(&args_map),
             "write_curated_peak_tsv" => self.tool_write_curated_peak_tsv(&args_map),
             "export_nmrstar_shifts" => self.tool_export_nmrstar_shifts(&args_map),
             _ => {
@@ -3520,6 +3555,877 @@ impl McpServer {
         }
         Ok(samples)
     }
+
+    // ========================================================================
+    // Phase 21 Read-Only Integrative Structural & AlphaFold MCP Tools (`T21.6b`)
+    // ========================================================================
+
+    fn read_sandboxed_shifts_star_or_nef(
+        &self,
+        raw_path: &str,
+    ) -> Result<(PathBuf, Reference), McpCallToolResult> {
+        let resolved = self
+            .policy
+            .resolve_sandboxed_path(raw_path)
+            .map_err(|sec| sec.to_tool_error_result())?;
+        let is_nef = resolved
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("nef"));
+        let shifts = if is_nef {
+            read_nef_file(&resolved)
+                .and_then(|doc| doc.to_reference())
+                .map_err(|e| McpCallToolResult::domain_error("nef_parse_error", e))?
+        } else {
+            read_star_all_atoms(&resolved, None)
+                .map_err(|e| McpCallToolResult::domain_error("nmrstar_parse_error", e))?
+        };
+        Ok((resolved, shifts))
+    }
+
+    fn value_contains_http_url(val: &Value) -> bool {
+        match val {
+            Value::String(s) => {
+                let low = s.trim_start().to_ascii_lowercase();
+                low.starts_with("http://") || low.starts_with("https://")
+            }
+            Value::Array(items) => items.iter().any(Self::value_contains_http_url),
+            Value::Object(map) => map.values().any(Self::value_contains_http_url),
+            _ => false,
+        }
+    }
+
+    fn reject_network_or_fetch_args(args: &Map<String, Value>) -> Option<McpCallToolResult> {
+        for forbidden_key in ["fetch_uniprot", "url", "structure_url", "pae_url"] {
+            if args.contains_key(forbidden_key) {
+                return Some(McpCallToolResult::domain_error(
+                    "network_access_denied",
+                    format!(
+                        "network fetching ('{forbidden_key}') is strictly disabled in MCP tools; pass workspace-sandboxed local file paths only"
+                    ),
+                ));
+            }
+        }
+        if args.values().any(Self::value_contains_http_url) {
+            return Some(McpCallToolResult::domain_error(
+                "network_access_denied",
+                "HTTP/HTTPS URLs are forbidden in MCP tool arguments; pass workspace-sandboxed local paths only",
+            ));
+        }
+        None
+    }
+
+    fn parse_enforced_firewall_seq_identity(
+        args: &Map<String, Value>,
+    ) -> Result<f64, McpCallToolResult> {
+        let requested = args
+            .get("max_seq_identity")
+            .and_then(Value::as_f64)
+            .unwrap_or(DEFAULT_FIREWALL_MAX_SEQ_IDENTITY);
+        if !requested.is_finite() || requested <= 0.0 {
+            return Err(McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "max_seq_identity must be a positive finite number in [0.05, 0.25]",
+            ));
+        }
+        if requested > DEFAULT_FIREWALL_MAX_SEQ_IDENTITY + 1e-9 {
+            return Err(McpCallToolResult::domain_error(
+                "homolog_firewall_violation",
+                format!(
+                    "requested max_seq_identity ({requested:.3}) exceeds mandatory HomologFirewall ceiling ({DEFAULT_FIREWALL_MAX_SEQ_IDENTITY:.2})"
+                ),
+            ));
+        }
+        Ok(requested.clamp(0.05, DEFAULT_FIREWALL_MAX_SEQ_IDENTITY))
+    }
+
+    fn parse_string_list_arg(args: &Map<String, Value>, key: &str) -> Vec<String> {
+        args.get(key)
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn tool_af_concordance(&self, args: &Map<String, Value>) -> McpCallToolResult {
+        if let Some(net_err) = Self::reject_network_or_fetch_args(args) {
+            return net_err;
+        }
+        let Some(raw_struct) = args.get("structure_path").and_then(Value::as_str) else {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "missing required string argument 'structure_path'",
+            );
+        };
+        let Some(raw_shifts) = args.get("shifts_path").and_then(Value::as_str) else {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "missing required string argument 'shifts_path'",
+            );
+        };
+
+        let max_seq_id = match Self::parse_enforced_firewall_seq_identity(args) {
+            Ok(v) => v,
+            Err(err_res) => return err_res,
+        };
+
+        let resolved_struct = match self.policy.resolve_sandboxed_path(raw_struct) {
+            Ok(p) => p,
+            Err(sec) => return sec.to_tool_error_result(),
+        };
+        let (resolved_shifts, shifts) = match self.read_sandboxed_shifts_star_or_nef(raw_shifts) {
+            Ok(pair) => pair,
+            Err(err_res) => return err_res,
+        };
+
+        let resolved_pae = match args.get("pae_path").and_then(Value::as_str) {
+            Some(p) if !p.trim().is_empty() => match self.policy.resolve_sandboxed_path(p) {
+                Ok(rp) => Some(rp),
+                Err(sec) => return sec.to_tool_error_result(),
+            },
+            _ => None,
+        };
+        let resolved_s2 = match args.get("s2_path").and_then(Value::as_str) {
+            Some(p) if !p.trim().is_empty() => match self.policy.resolve_sandboxed_path(p) {
+                Ok(rp) => Some(rp),
+                Err(sec) => return sec.to_tool_error_result(),
+            },
+            _ => None,
+        };
+
+        let ingest_opts = AfIngestOptions {
+            target_chain_id: args
+                .get("chain_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
+            force_bfactor_plddt: args
+                .get("force_bfactor_plddt")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        };
+        let af_model = match parse_af_structure_model(&resolved_struct, &ingest_opts) {
+            Ok(m) => m,
+            Err(e) => return McpCallToolResult::domain_error("structure_parse_error", e),
+        };
+
+        let pae_opt = match resolved_pae.as_ref() {
+            Some(rp) => match parse_pae_json_file(
+                rp,
+                Some(af_model.chain_id.as_str()),
+                Some(af_model.residues.len()),
+            ) {
+                Ok(pm) => Some(pm),
+                Err(e) => return McpCallToolResult::domain_error("pae_parse_error", e),
+            },
+            None => None,
+        };
+        let s2_opt = match resolved_s2.as_ref() {
+            Some(rp) => match parse_modelfree_s2_tsv_file(rp) {
+                Ok(entries) => Some(entries),
+                Err(e) => return McpCallToolResult::domain_error("s2_parse_error", e),
+            },
+            None => None,
+        };
+
+        let temperature_kelvin = args
+            .get("temperature_k")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(298.15);
+        let sample_ph = args
+            .get("sample_ph")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && (0.0..=14.0).contains(v));
+
+        let conc_cfg = AfConcordanceConfig {
+            temperature_kelvin,
+            sample_ph,
+            exclude_pdb_ids: Self::parse_string_list_arg(args, "exclude_pdb_ids"),
+            exclude_bmrb_ids: Self::parse_string_list_arg(args, "exclude_bmrb_ids"),
+            exclude_uniprot_id: args
+                .get("exclude_uniprot_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            exclude_topology_id: args
+                .get("exclude_topology_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            firewall_max_seq_identity: max_seq_id,
+        };
+
+        let report = match evaluate_af_nmr_concordance(
+            &af_model,
+            &shifts,
+            pae_opt.as_ref(),
+            s2_opt.as_deref(),
+            &conc_cfg,
+        ) {
+            Ok(r) => r,
+            Err(e) => return McpCallToolResult::domain_error("af_concordance_error", e),
+        };
+
+        let cluster_domains = args
+            .get("cluster_pae_domains")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let pae_domains_json = match (&pae_opt, cluster_domains) {
+            (Some(pm), true) => {
+                match cluster_pae_domains_for_model(&af_model, pm, &PaeClusterConfig::default()) {
+                    Ok(part) => Some(json!({
+                        "n_domains": part.domains.len(),
+                        "n_linkers": part.linkers.len(),
+                        "selected_eigengap": part.selected_eigengap,
+                        "domains": part.domains,
+                        "linkers": part.linkers,
+                    })),
+                    Err(e) => return McpCallToolResult::domain_error("pae_domain_error", e),
+                }
+            }
+            _ => None,
+        };
+
+        McpCallToolResult::ok_json(&json!({
+            "structure_path": self.policy.relativize_display_path(&resolved_struct),
+            "shifts_path": self.policy.relativize_display_path(&resolved_shifts),
+            "pae_path": resolved_pae.as_ref().map(|p| self.policy.relativize_display_path(p)),
+            "s2_path": resolved_s2.as_ref().map(|p| self.policy.relativize_display_path(p)),
+            "chain_id": report.chain_id,
+            "provenance": report.provenance,
+            "plddt_source": report.plddt_source,
+            "rigidity_source": report.rigidity_source,
+            "ingest_diagnostics": report.ingest_diagnostics,
+            "summary": report.summary,
+            "n_residues": report.residues.len(),
+            "class_counts": {
+                "concordant_ordered": report.n_concordant_ordered,
+                "concordant_disordered": report.n_concordant_disordered,
+                "conditional_folding_or_crystal_artifact": report.n_conditional_folding,
+                "dynamic_hinge_or_alt_state": report.n_dynamic_hinge_or_alt,
+                "unassigned_nmr": report.n_unassigned_nmr,
+            },
+            "enforced_max_seq_identity": max_seq_id,
+            "max_retained_seq_identity": report.max_retained_seq_identity,
+            "excluded_templates_count": report.excluded_template_ids.len(),
+            "exclusion_list_sha256": report.exclusion_list_sha256,
+            "pae_domains": pae_domains_json,
+            "residues": report.residues,
+        }))
+    }
+
+    fn tool_predict_structure_shifts(&self, args: &Map<String, Value>) -> McpCallToolResult {
+        if let Some(net_err) = Self::reject_network_or_fetch_args(args) {
+            return net_err;
+        }
+        let Some(raw_struct) = args.get("structure_path").and_then(Value::as_str) else {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "missing required string argument 'structure_path'",
+            );
+        };
+        let max_seq_id = match Self::parse_enforced_firewall_seq_identity(args) {
+            Ok(v) => v,
+            Err(err_res) => return err_res,
+        };
+
+        let resolved_struct = match self.policy.resolve_sandboxed_path(raw_struct) {
+            Ok(p) => p,
+            Err(sec) => return sec.to_tool_error_result(),
+        };
+
+        let force_bfactor_plddt = args
+            .get("force_bfactor_plddt")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let model = match StructureModel::parse_file(&resolved_struct, force_bfactor_plddt) {
+            Ok(m) => m,
+            Err(e) => return McpCallToolResult::domain_error("structure_parse_error", e),
+        };
+
+        let sample_ph = args
+            .get("sample_ph")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && (0.0..=14.0).contains(v))
+            .unwrap_or(6.5);
+        let temperature_kelvin = args
+            .get("temperature_k")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(298.15);
+        let include_methyl_ilvmat = args
+            .get("include_methyl_ilvmat")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let query = HomologFirewallQuery {
+            query_pdb_ids: Self::parse_string_list_arg(args, "exclude_pdb_ids"),
+            query_bmrb_ids: Self::parse_string_list_arg(args, "exclude_bmrb_ids"),
+            query_uniprot_id: args
+                .get("exclude_uniprot_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            query_family_id: args
+                .get("exclude_family_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            query_topology_id: args
+                .get("exclude_topology_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            query_ca_coords: None,
+        };
+        let cfg = StructShiftConfig {
+            sample_ph,
+            temperature_kelvin,
+            include_methyl_ilvmat,
+            max_seq_identity: max_seq_id,
+            force_bfactor_plddt,
+            ..StructShiftConfig::default()
+        };
+
+        let report = match predict_structure_shifts_with_firewall(&model, &query, &cfg) {
+            Ok(r) => r,
+            Err(e) => return McpCallToolResult::domain_error("struct_shifts_error", e),
+        };
+
+        McpCallToolResult::ok_json(&json!({
+            "structure_path": self.policy.relativize_display_path(&resolved_struct),
+            "n_residues": report.residues.len(),
+            "provenance": report.provenance.as_str(),
+            "sample_ph": report.sample_ph,
+            "temperature_k": report.temperature_kelvin,
+            "include_methyl_ilvmat": report.include_methyl_ilvmat,
+            "enforced_max_seq_identity": max_seq_id,
+            "max_retained_seq_identity": report.max_retained_seq_identity,
+            "retained_template_count": report.retained_template_count,
+            "excluded_templates_count": report.excluded_template_ids.len(),
+            "exclusion_list_sha256": report.exclusion_list_sha256,
+            "corpus_sha256": report.corpus_sha256,
+            "residues": report.residues,
+        }))
+    }
+
+    fn tool_score_cofold_poses(&self, args: &Map<String, Value>) -> McpCallToolResult {
+        if let Some(net_err) = Self::reject_network_or_fetch_args(args) {
+            return net_err;
+        }
+        let max_seq_id = match Self::parse_enforced_firewall_seq_identity(args) {
+            Ok(v) => v,
+            Err(err_res) => return err_res,
+        };
+        let Some(raw_poses_arr) = args.get("pose_paths").and_then(Value::as_array) else {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "missing required non-empty array argument 'pose_paths'",
+            );
+        };
+        if raw_poses_arr.is_empty() {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "'pose_paths' must contain at least 1 candidate complex pose (.cif / .pdb)",
+            );
+        }
+
+        let mut poses: Vec<StructurePoseInput> = Vec::with_capacity(raw_poses_arr.len());
+        let mut pose_display_paths: Vec<String> = Vec::with_capacity(raw_poses_arr.len());
+        for item in raw_poses_arr {
+            let Some(p) = item.as_str().filter(|s| !s.trim().is_empty()) else {
+                return McpCallToolResult::domain_error(
+                    "invalid_arguments",
+                    "every entry in 'pose_paths' must be a non-empty path string",
+                );
+            };
+            let rp = match self.policy.resolve_sandboxed_path(p) {
+                Ok(rp) => rp,
+                Err(sec) => return sec.to_tool_error_result(),
+            };
+            let rel_lbl = self.policy.relativize_display_path(&rp);
+            let mut pose_in = match StructurePoseInput::from_file(&rp) {
+                Ok(pi) => pi,
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "pose_parse_error",
+                        format!("'{rel_lbl}': {e}"),
+                    );
+                }
+            };
+            // Scrub host canonical path so MCP outputs remain strictly workspace-relative.
+            pose_in.source_path = Some(PathBuf::from(&rel_lbl));
+            pose_display_paths.push(rel_lbl);
+            poses.push(pose_in);
+        }
+
+        let resolve_opt = |key: &str| -> Result<Option<PathBuf>, McpCallToolResult> {
+            match args.get(key).and_then(Value::as_str) {
+                Some(raw) if !raw.trim().is_empty() => self
+                    .policy
+                    .resolve_sandboxed_path(raw)
+                    .map(Some)
+                    .map_err(|sec| sec.to_tool_error_result()),
+                _ => Ok(None),
+            }
+        };
+
+        let apo_path = match resolve_opt("apo_structure_path") {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let restraints_path = match resolve_opt("restraints_path") {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let csp_path = match resolve_opt("csp_path") {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let noe_path = match resolve_opt("noe_path") {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let pre_path = match resolve_opt("pre_path") {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let rdc_path = match resolve_opt("rdc_path") {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let pcs_path = match resolve_opt("pcs_path") {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+
+        let mut score_cfg = PoseScoreConfig::default();
+        score_cfg.struct_shift_config.max_seq_identity = max_seq_id;
+        score_cfg.firewall_query = HomologFirewallQuery {
+            query_pdb_ids: Self::parse_string_list_arg(args, "exclude_pdb_ids"),
+            query_bmrb_ids: Self::parse_string_list_arg(args, "exclude_bmrb_ids"),
+            query_uniprot_id: args
+                .get("exclude_uniprot_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            query_family_id: args
+                .get("exclude_family_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            query_topology_id: args
+                .get("exclude_topology_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            query_ca_coords: None,
+        };
+        if let Some(frac) = args
+            .get("rdc_free_fraction")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && (0.0..=0.5).contains(v))
+        {
+            score_cfg.rdc_free_fraction = frac;
+        }
+        if let Some(seed) = args.get("seed").and_then(Value::as_u64) {
+            score_cfg.rdc_free_seed = seed;
+        }
+
+        let mut raw_input = CofoldRestraintInput {
+            receptor_chain_id: args
+                .get("receptor_chain_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
+            binder_chain_id: args
+                .get("partner_chain_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
+            ..CofoldRestraintInput::default()
+        };
+        let extract_cfg = CofoldRestraintExtractConfig::default();
+
+        if let Some(smi) = args
+            .get("ligand_smiles")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            let lid = raw_input
+                .binder_chain_id
+                .clone()
+                .unwrap_or_else(|| "L".to_string());
+            let (spec, mol) = match ligand_spec_from_octet_str(smi, Some("smi")) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    return McpCallToolResult::domain_error("ligand_parse_error", e.to_string())
+                }
+            };
+            raw_input.ligand_molecules.insert(lid.clone(), mol);
+            raw_input.entities.push(CofoldEntitySpec::Ligand {
+                chain_id: lid,
+                spec,
+            });
+        }
+
+        if let Some(ref ap) = apo_path {
+            let txt = match fs::read_to_string(ap) {
+                Ok(t) => t,
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "io_error",
+                        format!("failed to read apo structure: {e}"),
+                    );
+                }
+            };
+            let ext = ap
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase());
+            let model = match StructureModel::parse_str(&txt, ext.as_deref(), false) {
+                Ok(m) => m,
+                Err(e) => return McpCallToolResult::domain_error("apo_parse_error", e),
+            };
+            score_cfg.apo_receptor_coord_text = Some(txt);
+            score_cfg.apo_receptor_format_hint = ext;
+            raw_input.apo_receptor_model = Some(model);
+        }
+
+        let mut bundle: CofoldRestraintBundle = if let Some(ref sc_p) = restraints_path {
+            let txt = match fs::read_to_string(sc_p) {
+                Ok(t) => t,
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "io_error",
+                        format!("failed to read restraints JSON: {e}"),
+                    );
+                }
+            };
+            match serde_json::from_str(&txt) {
+                Ok(b) => b,
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "restraints_parse_error",
+                        format!("invalid restraints bundle JSON: {e}"),
+                    );
+                }
+            }
+        } else {
+            if raw_input.apo_receptor_model.is_none() {
+                if let Some(first_pose) = poses.first() {
+                    if let Ok(m) = StructureModel::parse_str(
+                        &first_pose.coord_text,
+                        first_pose.format_hint.as_deref(),
+                        false,
+                    ) {
+                        raw_input.apo_receptor_model = Some(m);
+                    }
+                }
+            }
+            if let Some(ref cp) = csp_path {
+                let txt = match fs::read_to_string(cp) {
+                    Ok(t) => t,
+                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
+                };
+                match parse_csp_restraint_str(&txt) {
+                    Ok((rows, kd)) => {
+                        raw_input.raw_csp_rows = rows;
+                        raw_input.experimental_kd_um = kd;
+                    }
+                    Err(e) => {
+                        return McpCallToolResult::domain_error("csp_parse_error", e.to_string());
+                    }
+                }
+            }
+            if let Some(ref np) = noe_path {
+                let txt = match fs::read_to_string(np) {
+                    Ok(t) => t,
+                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
+                };
+                match parse_intermolecular_noe_tsv_str(&txt) {
+                    Ok(noes) => raw_input.raw_distance_restraints.extend(noes),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error("noe_parse_error", e.to_string());
+                    }
+                }
+            }
+            let default_rec = raw_input
+                .receptor_chain_id
+                .clone()
+                .unwrap_or_else(|| "A".to_string());
+            if let Some(ref pp) = pre_path {
+                let txt = match fs::read_to_string(pp) {
+                    Ok(t) => t,
+                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
+                };
+                match parse_intermolecular_pre_tsv_str(
+                    &txt,
+                    None,
+                    &default_rec,
+                    extract_cfg.pre_gamma2_upper_margin_a,
+                ) {
+                    Ok(pres) => raw_input.raw_distance_restraints.extend(pres),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error("pre_parse_error", e.to_string());
+                    }
+                }
+            }
+            if let Some(ref rdc_p) = rdc_path {
+                let txt = match fs::read_to_string(rdc_p) {
+                    Ok(t) => t,
+                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
+                };
+                match parse_cofold_rdc_tsv_str(&txt, &default_rec) {
+                    Ok(m) => raw_input.rdc_media = m,
+                    Err(e) => {
+                        return McpCallToolResult::domain_error("rdc_parse_error", e.to_string());
+                    }
+                }
+            }
+            if let Some(ref pcs_p) = pcs_path {
+                let txt = match fs::read_to_string(pcs_p) {
+                    Ok(t) => t,
+                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
+                };
+                match parse_cofold_pcs_tsv_str(&txt, &default_rec) {
+                    Ok(t) => raw_input.pcs_tags = t,
+                    Err(e) => {
+                        return McpCallToolResult::domain_error("pcs_parse_error", e.to_string());
+                    }
+                }
+            }
+            match extract_nmr_interface_restraints(&raw_input, &extract_cfg) {
+                Ok(b) => b,
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "restraints_extract_error",
+                        e.to_string(),
+                    );
+                }
+            }
+        };
+
+        if restraints_path.is_some() {
+            for (k, m) in raw_input.ligand_molecules {
+                bundle.ligand_molecules.insert(k, m);
+            }
+            if let Some(ref rdc_p) = rdc_path {
+                let txt = match fs::read_to_string(rdc_p) {
+                    Ok(t) => t,
+                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
+                };
+                match parse_cofold_rdc_tsv_str(&txt, &bundle.receptor_chain_id) {
+                    Ok(m) => bundle.rdc_media = m,
+                    Err(e) => {
+                        return McpCallToolResult::domain_error("rdc_parse_error", e.to_string());
+                    }
+                }
+            }
+            if let Some(ref pcs_p) = pcs_path {
+                let txt = match fs::read_to_string(pcs_p) {
+                    Ok(t) => t,
+                    Err(e) => return McpCallToolResult::domain_error("io_error", e.to_string()),
+                };
+                match parse_cofold_pcs_tsv_str(&txt, &bundle.receptor_chain_id) {
+                    Ok(t) => bundle.pcs_tags = t,
+                    Err(e) => {
+                        return McpCallToolResult::domain_error("pcs_parse_error", e.to_string());
+                    }
+                }
+            }
+        }
+
+        let report = match score_cofold_poses(&poses, &bundle, &score_cfg) {
+            Ok(r) => r,
+            Err(e) => return McpCallToolResult::domain_error("cofold_score_error", e.to_string()),
+        };
+
+        let verdict_str = match report.verdict {
+            PoseVerdict::RankedConclusive => "RankedConclusive",
+            PoseVerdict::InconclusiveOrAllViolated => "InconclusiveOrAllViolated",
+        };
+        let excl_sha = report
+            .poses
+            .first()
+            .map(|p| p.exclusion_list_sha256.clone())
+            .unwrap_or_default();
+
+        McpCallToolResult::ok_json(&json!({
+            "pose_paths": pose_display_paths,
+            "apo_structure_path": apo_path.as_ref().map(|p| self.policy.relativize_display_path(p)),
+            "verdict": verdict_str,
+            "top_pose_id": report.top_pose_id,
+            "n_poses_evaluated": report.n_poses_evaluated,
+            "n_admissible_poses": report.n_admissible_poses,
+            "n_surface_csp_hits": report.n_surface_csp_hits,
+            "n_distance_restraints": report.n_distance_restraints,
+            "n_rdc_media": report.n_rdc_media,
+            "n_pcs_tags": report.n_pcs_tags,
+            "enforced_max_seq_identity": max_seq_id,
+            "exclusion_list_sha256": excl_sha,
+            "poses": report.poses,
+        }))
+    }
+
+    fn tool_classify_excited_state(&self, args: &Map<String, Value>) -> McpCallToolResult {
+        if let Some(net_err) = Self::reject_network_or_fetch_args(args) {
+            return net_err;
+        }
+        let Some(raw_struct) = args.get("structure_path").and_then(Value::as_str) else {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "missing required string argument 'structure_path'",
+            );
+        };
+        let Some(raw_exchange) = args.get("exchange_path").and_then(Value::as_str) else {
+            return McpCallToolResult::domain_error(
+                "invalid_arguments",
+                "missing required string argument 'exchange_path'",
+            );
+        };
+        let max_seq_id = match Self::parse_enforced_firewall_seq_identity(args) {
+            Ok(v) => v,
+            Err(err_res) => return err_res,
+        };
+
+        let shifts_opt = match args.get("shifts_path").and_then(Value::as_str) {
+            Some(raw_shifts) if !raw_shifts.trim().is_empty() => {
+                match self.read_sandboxed_shifts_star_or_nef(raw_shifts) {
+                    Ok(pair) => Some(pair),
+                    Err(err_res) => return err_res,
+                }
+            }
+            _ => None,
+        };
+
+        let resolved_struct = match self.policy.resolve_sandboxed_path(raw_struct) {
+            Ok(p) => p,
+            Err(sec) => return sec.to_tool_error_result(),
+        };
+        let resolved_exchange = match self.policy.resolve_sandboxed_path(raw_exchange) {
+            Ok(p) => p,
+            Err(sec) => return sec.to_tool_error_result(),
+        };
+
+        let mut alt_conformers: Vec<AltConformerInput> = Vec::new();
+        let mut alt_display_paths: Vec<String> = Vec::new();
+        if let Some(alt_arr) = args.get("alt_structure_paths").and_then(Value::as_array) {
+            for item in alt_arr {
+                let Some(p) = item.as_str().filter(|s| !s.trim().is_empty()) else {
+                    return McpCallToolResult::domain_error(
+                        "invalid_arguments",
+                        "every entry in 'alt_structure_paths' must be a non-empty path string",
+                    );
+                };
+                let rp = match self.policy.resolve_sandboxed_path(p) {
+                    Ok(rp) => rp,
+                    Err(sec) => return sec.to_tool_error_result(),
+                };
+                let rel_lbl = self.policy.relativize_display_path(&rp);
+                let alt_model = match StructureModel::parse_file(&rp, false) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "alt_structure_parse_error",
+                            format!("'{rel_lbl}': {e}"),
+                        );
+                    }
+                };
+                alt_display_paths.push(rel_lbl.clone());
+                alt_conformers.push(AltConformerInput {
+                    label: rel_lbl,
+                    model: alt_model,
+                });
+            }
+        }
+
+        let ground_structure = match StructureModel::parse_file(&resolved_struct, false) {
+            Ok(m) => m,
+            Err(e) => return McpCallToolResult::domain_error("structure_parse_error", e),
+        };
+        let exchange_text = match fs::read_to_string(&resolved_exchange) {
+            Ok(t) => t,
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "io_error",
+                    format!("failed to read exchange TSV: {e}"),
+                );
+            }
+        };
+        let observations = match parse_exchange_observations_tsv(&exchange_text) {
+            Ok(obs) => obs,
+            Err(e) => return McpCallToolResult::domain_error("exchange_parse_error", e),
+        };
+
+        let sample_ph = args
+            .get("sample_ph")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && (0.0..=14.0).contains(v))
+            .unwrap_or(6.5);
+        let temperature_kelvin = args
+            .get("temperature_k")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(298.15);
+
+        let query = HomologFirewallQuery {
+            query_pdb_ids: Self::parse_string_list_arg(args, "exclude_pdb_ids"),
+            query_bmrb_ids: Self::parse_string_list_arg(args, "exclude_bmrb_ids"),
+            query_uniprot_id: args
+                .get("exclude_uniprot_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            query_family_id: args
+                .get("exclude_family_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            query_topology_id: args
+                .get("exclude_topology_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            query_ca_coords: None,
+        };
+        let cfg = ExcitedStateConfig {
+            sample_ph,
+            temperature_kelvin,
+            max_seq_identity: max_seq_id,
+            ..ExcitedStateConfig::default()
+        };
+
+        let ground_shifts_ref = shifts_opt.as_ref().map(|(_, r)| r);
+        let report = match classify_excited_state_with_firewall(
+            ground_shifts_ref,
+            &ground_structure,
+            &observations,
+            &alt_conformers,
+            &query,
+            &cfg,
+        ) {
+            Ok(r) => r,
+            Err(e) => return McpCallToolResult::domain_error("excited_state_error", e),
+        };
+
+        McpCallToolResult::ok_json(&json!({
+            "structure_path": self.policy.relativize_display_path(&resolved_struct),
+            "exchange_path": self.policy.relativize_display_path(&resolved_exchange),
+            "shifts_path": shifts_opt.as_ref().map(|(p, _)| self.policy.relativize_display_path(p)),
+            "alt_structure_paths": alt_display_paths,
+            "verdict": report.verdict.as_str(),
+            "verdict_detail": report.verdict,
+            "verdict_reason": report.verdict_reason,
+            "n_observations": report.n_observations,
+            "n_signed_observations": report.n_signed_observations,
+            "n_unsigned_observations": report.n_unsigned_observations,
+            "two_ln_bf_top1_vs_top2": report.two_ln_bf_top1_vs_top2,
+            "two_ln_bf_top1_vs_null": report.two_ln_bf_top1_vs_null,
+            "top1_reduced_chi2": report.top1_reduced_chi2,
+            "enforced_max_seq_identity": max_seq_id,
+            "max_retained_seq_identity": report.ground_max_retained_seq_identity,
+            "exclusion_list_sha256": report.ground_exclusion_list_sha256,
+            "ranked_hypotheses": report.ranked_hypotheses,
+            "warnings": report.warnings,
+        }))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -4415,6 +5321,37 @@ fn builtin_prompt_descriptors() -> Vec<McpPromptDescriptor> {
                 },
             ],
         },
+        McpPromptDescriptor {
+            name: "validate-and-dock-alphafold-model".to_string(),
+            description: "Guided integrative structural NMR workflow validating an AlphaFold .cif + PAE JSON model against solution NMR rigidity (RCI-S^2 / Lipari-Szabo S^2), partitioning rigid PAE domains, testing Tolman GDO inter-domain motion, and docking under 20% ByPeptidePlane RdcFree holdout.".to_string(),
+            arguments: vec![
+                McpPromptArgument {
+                    name: "workspace_path".to_string(),
+                    description: "Workspace directory containing coordinates, PAE JSON, and NMR restraint tables.".to_string(),
+                    required: true,
+                },
+                McpPromptArgument {
+                    name: "structure_path".to_string(),
+                    description: "Relative path to the AlphaFold or 3D structure .cif / .pdb file (default: 'model.cif').".to_string(),
+                    required: false,
+                },
+                McpPromptArgument {
+                    name: "pae_path".to_string(),
+                    description: "Relative path to the N x N PAE JSON file (default: 'pae.json').".to_string(),
+                    required: false,
+                },
+                McpPromptArgument {
+                    name: "shifts_path".to_string(),
+                    description: "Relative path to the assigned NMR-STAR (.str) or NEF (.nef) shift file (default: 'assigned.str').".to_string(),
+                    required: false,
+                },
+                McpPromptArgument {
+                    name: "restraints_path".to_string(),
+                    description: "Optional relative path to RDC, PCS, PRE, or intermolecular NOE restraint TSV/NEF.".to_string(),
+                    required: false,
+                },
+            ],
+        },
     ]
 }
 
@@ -4541,6 +5478,28 @@ fn build_spectroscopist_prompt(
                         2. Screen unsupervised `PCA` scores against the 95% Hotelling $T^2$ ellipse and Jackson-Mudholkar $Q$-residual threshold before interpreting supervised models.\n\
                         3. Verify leak-free stratified $k$-fold `OPLS-DA` cross-validated $Q^2$ and Westerhuis (2008) label-permutation $p$-value (`is_validated == true`) so small-$N$/large-$P$ class separation is never overclaimed.\n\
                         4. Cross-check top `VIP` / Wiklund `S-plot` / Benjamini-Hochberg `FDR` biomarkers with Cloarec (2005) `STOCSY` covarying intra-metabolite multiplets (`stocsy_driver_ppm`) matched against the CC0 `BMRB` biofluid reference library, noting matrix/pH shift caveats."
+                    )),
+                }],
+            })
+        }
+        "validate-and-dock-alphafold-model" => {
+            let ws = require_workspace()?;
+            let structure = get_opt("structure_path", "model.cif");
+            let pae = get_opt("pae_path", "pae.json");
+            let shifts = get_opt("shifts_path", "assigned.str");
+            let restraints = get_opt("restraints_path", "rdcs.tsv");
+            Ok(McpGetPromptResult {
+                description: format!(
+                    "Integrative AlphaFold validation, PAE domain partitioning, and dipolar/paramagnetic docking workflow for '{ws}' ('{structure}', '{pae}')"
+                ),
+                messages: vec![McpPromptMessage {
+                    role: "user".to_string(),
+                    content: McpContentBlock::text(format!(
+                        "Validate and refine the integrative structural NMR model '{structure}' + '{pae}' in workspace '{ws}' against experimental shifts '{shifts}' and restraints '{restraints}'.\n\
+                        1. Call `af_concordance` on `structure_path: '{structure}'`, `shifts_path: '{shifts}'`, and `pae_path: '{pae}'` (never pass crystallographic thermal B-factors as `pLDDT`). Inspect Fowler-Williamson Spearman `rho_s`, `RMSD_rig`, and 4-class per-residue concordance (`ConcordantOrdered`, `ConcordantDisordered`, `ConditionalFoldingOrCrystalArtifact` partner-induced MoRFs/crystal packing, and `DynamicHingeOrAltState`).\n\
+                        2. Call `predict_structure_shifts` on '{structure}' enforcing the mandatory 4-layer `HomologFirewall` (`max_seq_identity <= 0.25`, `TM-score < 0.50`, recording `exclusion_list_sha256`), and keep default backbone `ferric assign` sequence-only unless `--af-structure` is explicitly opted in.\n\
+                        3. Inspect `pae_domains` spectral rigid-domain blocks and Tolman (2001) per-domain Generalized Degree of Order (`theta_d / theta_1`) before multi-domain `RDC` docking: flag `DecoupledInterDomainMotion` whenever `min_d rho_GDO < 0.80` (`> 2 sigma_MC`), and honor single-medium dipolar candor (`F8`: a single alignment medium carries 4-fold Saupe cone degeneracy and zero translational sensitivity; require >= 2 non-coaxial `RDC` media or translational+orientational `PCS`/`PRE`/inter-domain `NOE` restraints under 20% `ByPeptidePlane` `RdcFree` holdout).\n\
+                        4. When ligand/partner complexes or invisible minor states are present, evaluate `score_cofold_poses` (`rSASA >= 0.20` surface CSP pocket vs core allostery, `InconclusiveOrAllViolated` decoy abstention) and `classify_excited_state` (`BIC` and Kass-Raftery `2 ln BF` across signed `CEST` and normalized folded-Student-t5 unsigned `CPMG` differential shifts)."
                     )),
                 }],
             })
@@ -5175,6 +6134,312 @@ fn builtin_tool_descriptors() -> Vec<McpToolDescriptor> {
             }),
             annotations: McpToolAnnotations {
                 title: "Run 1D Metabolomics Chemometrics & STOCSY".to_string(),
+                read_only_hint: true,
+                destructive_hint: false,
+                idempotent_hint: true,
+                open_world_hint: false,
+            },
+        },
+        McpToolDescriptor {
+            name: "af_concordance".to_string(),
+            description: "Validate a sandboxed AlphaFold or 3D structure (.cif/.pdb + optional PAE JSON) against solution NMR shifts (.str/.nef) and optional Lipari-Szabo S^2: Fowler-Williamson Spearman rho_s, RMSD_rig, 4-class discordance taxonomy, HomologFirewall audit, and spectral PAE rigid-domain partitioning.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "structure_path": {
+                        "type": "string",
+                        "description": "Sandboxed workspace path to the .cif, .mmcif, or .pdb structure file."
+                    },
+                    "shifts_path": {
+                        "type": "string",
+                        "description": "Sandboxed workspace path to the assigned NMR-STAR (.str) or NEF (.nef) shift file."
+                    },
+                    "pae_path": {
+                        "type": "string",
+                        "description": "Optional sandboxed workspace path to an AFDB, ColabFold, or AF3 PAE JSON file."
+                    },
+                    "s2_path": {
+                        "type": "string",
+                        "description": "Optional sandboxed workspace path to a modelfree.tsv Lipari-Szabo S^2 file."
+                    },
+                    "chain_id": {
+                        "type": "string",
+                        "description": "Optional target polymer chain identifier."
+                    },
+                    "force_bfactor_plddt": {
+                        "type": "boolean",
+                        "description": "Override experimental EXPDTA B-factor guard and treat B_iso/tempFactor as pLDDT (default: false)."
+                    },
+                    "sample_ph": {
+                        "type": "number",
+                        "description": "Optional sample pH for random-coil titration baseline."
+                    },
+                    "temperature_k": {
+                        "type": "number",
+                        "description": "Sample temperature in Kelvin (default: 298.15)."
+                    },
+                    "exclude_pdb_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Query PDB IDs excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_bmrb_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Query BMRB IDs excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_uniprot_id": {
+                        "type": "string",
+                        "description": "Optional UniProt accession excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_topology_id": {
+                        "type": "string",
+                        "description": "Optional CATH/ECOD topology identifier excluded in HomologFirewall Layer 2."
+                    },
+                    "max_seq_identity": {
+                        "type": "number",
+                        "description": "Maximum sequence identity cutoff in [0.05, 0.25] (default: 0.25; values > 0.25 are rejected)."
+                    },
+                    "cluster_pae_domains": {
+                        "type": "boolean",
+                        "description": "Partition rigid PAE domains when pae_path is provided (default: true)."
+                    }
+                },
+                "required": ["structure_path", "shifts_path"],
+                "additionalProperties": false
+            }),
+            annotations: McpToolAnnotations {
+                title: "Validate AlphaFold vs Solution NMR Concordance".to_string(),
+                read_only_hint: true,
+                destructive_hint: false,
+                idempotent_hint: true,
+                open_world_hint: false,
+            },
+        },
+        McpToolDescriptor {
+            name: "predict_structure_shifts".to_string(),
+            description: "Predict 6-nucleus backbone (H, N, CA, CB, C', HA) and optional ILVMAT methyl chemical shifts from a sandboxed 3D structure (.cif/.pdb) using Haigh-Mallion ring currents, H-bonds, peptide anisotropy, and CC0-fitted Fourier torsion surfaces under the mandatory <=25% HomologFirewall (TM-score < 0.50).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "structure_path": {
+                        "type": "string",
+                        "description": "Sandboxed workspace path to the .cif, .mmcif, or .pdb structure file."
+                    },
+                    "sample_ph": {
+                        "type": "number",
+                        "description": "Sample pH (default: 6.5)."
+                    },
+                    "temperature_k": {
+                        "type": "number",
+                        "description": "Sample temperature in Kelvin (default: 298.15)."
+                    },
+                    "include_methyl_ilvmat": {
+                        "type": "boolean",
+                        "description": "Include ILVMAT sidechain methyl (1H^m, 13C^m) predictions (default: false)."
+                    },
+                    "force_bfactor_plddt": {
+                        "type": "boolean",
+                        "description": "Force B_iso/tempFactor interpretation as pLDDT on experimental headers (default: false)."
+                    },
+                    "exclude_pdb_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Query PDB IDs excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_bmrb_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Query BMRB IDs excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_uniprot_id": {
+                        "type": "string",
+                        "description": "Optional UniProt accession excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_family_id": {
+                        "type": "string",
+                        "description": "Optional family identifier excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_topology_id": {
+                        "type": "string",
+                        "description": "Optional CATH/ECOD topology identifier excluded in HomologFirewall Layer 2."
+                    },
+                    "max_seq_identity": {
+                        "type": "number",
+                        "description": "Maximum sequence identity cutoff in [0.05, 0.25] (default: 0.25; values > 0.25 are rejected)."
+                    }
+                },
+                "required": ["structure_path"],
+                "additionalProperties": false
+            }),
+            annotations: McpToolAnnotations {
+                title: "Predict Homolog-Firewalled 3D Structure Chemical Shifts".to_string(),
+                read_only_hint: true,
+                destructive_hint: false,
+                idempotent_hint: true,
+                open_world_hint: false,
+            },
+        },
+        McpToolDescriptor {
+            name: "score_cofold_poses".to_string(),
+            description: "Re-score and rank candidate co-folded complex poses (.cif/.pdb from AlphaFold 3, Boltz-2, or docking) against sandboxed CSP, intermolecular NOE, PRE, RDC (20% ByPeptidePlane Q_free), and PCS restraints with InconclusiveOrAllViolated decoy abstention.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pose_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Sandboxed workspace paths to candidate complex .cif / .pdb poses."
+                    },
+                    "apo_structure_path": {
+                        "type": "string",
+                        "description": "Optional sandboxed apo receptor .cif / .pdb path for differential shift & rSASA evaluation."
+                    },
+                    "restraints_path": {
+                        "type": "string",
+                        "description": "Optional sandboxed <prefix>.nmr_restraints.json bundle path."
+                    },
+                    "csp_path": {
+                        "type": "string",
+                        "description": "Optional sandboxed per-residue CSP TSV path."
+                    },
+                    "noe_path": {
+                        "type": "string",
+                        "description": "Optional sandboxed intermolecular NOE TSV path."
+                    },
+                    "pre_path": {
+                        "type": "string",
+                        "description": "Optional sandboxed paramagnetic PRE TSV path."
+                    },
+                    "rdc_path": {
+                        "type": "string",
+                        "description": "Optional sandboxed RDC TSV or NEF path."
+                    },
+                    "pcs_path": {
+                        "type": "string",
+                        "description": "Optional sandboxed PCS TSV path."
+                    },
+                    "ligand_smiles": {
+                        "type": "string",
+                        "description": "Optional small-molecule ligand SMILES for Hueckel aromatic ring-current scoring."
+                    },
+                    "receptor_chain_id": {
+                        "type": "string",
+                        "description": "Optional receptor chain identifier (default: 'A')."
+                    },
+                    "partner_chain_id": {
+                        "type": "string",
+                        "description": "Optional partner/ligand chain identifier."
+                    },
+                    "rdc_free_fraction": {
+                        "type": "number",
+                        "description": "ByPeptidePlane RdcFree holdout fraction (default: 0.20)."
+                    },
+                    "exclude_pdb_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Query PDB IDs excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_bmrb_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Query BMRB IDs excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_uniprot_id": {
+                        "type": "string",
+                        "description": "Optional UniProt accession excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_family_id": {
+                        "type": "string",
+                        "description": "Optional family identifier excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_topology_id": {
+                        "type": "string",
+                        "description": "Optional CATH/ECOD topology identifier excluded in HomologFirewall Layer 2."
+                    },
+                    "max_seq_identity": {
+                        "type": "number",
+                        "description": "Maximum sequence identity cutoff in [0.05, 0.25] (default: 0.25; values > 0.25 are rejected)."
+                    },
+                    "seed": {
+                        "type": "integer",
+                        "description": "Deterministic PRNG seed (default: 0)."
+                    }
+                },
+                "required": ["pose_paths"],
+                "additionalProperties": false
+            }),
+            annotations: McpToolAnnotations {
+                title: "Score Co-Folded Complex Poses with NMR Restraints".to_string(),
+                read_only_hint: true,
+                destructive_hint: false,
+                idempotent_hint: true,
+                open_world_hint: false,
+            },
+        },
+        McpToolDescriptor {
+            name: "classify_excited_state".to_string(),
+            description: "Classify sparsely populated invisible excited states from signed (CEST/R1rho) and/or unsigned (CPMG |Delta_omega_AB|) differential chemical shifts via Bayesian BIC and Kass-Raftery Bayes factors across LocalUnfolding, XxxProCisTrans, RotamerOrHisTautomerFlip, and Alternate3DConformer hypotheses.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "shifts_path": {
+                        "type": "string",
+                        "description": "Sandboxed workspace path to ground-state assigned shifts (.str or .nef)."
+                    },
+                    "structure_path": {
+                        "type": "string",
+                        "description": "Sandboxed workspace path to ground-state 3D coordinates (.cif or .pdb)."
+                    },
+                    "exchange_path": {
+                        "type": "string",
+                        "description": "Sandboxed workspace path to the CEST / CPMG / R1rho differential shift TSV."
+                    },
+                    "alt_structure_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional sandboxed workspace paths to candidate alternative 3D conformers (.cif/.pdb) for H4."
+                    },
+                    "sample_ph": {
+                        "type": "number",
+                        "description": "Sample pH (default: 6.5)."
+                    },
+                    "temperature_k": {
+                        "type": "number",
+                        "description": "Sample temperature in Kelvin (default: 298.15)."
+                    },
+                    "exclude_pdb_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Query PDB IDs excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_bmrb_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Query BMRB IDs excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_uniprot_id": {
+                        "type": "string",
+                        "description": "Optional UniProt accession excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_family_id": {
+                        "type": "string",
+                        "description": "Optional family identifier excluded in HomologFirewall Layer 1."
+                    },
+                    "exclude_topology_id": {
+                        "type": "string",
+                        "description": "Optional CATH/ECOD topology identifier excluded in HomologFirewall Layer 2."
+                    },
+                    "max_seq_identity": {
+                        "type": "number",
+                        "description": "Maximum sequence identity cutoff in [0.05, 0.25] (default: 0.25; values > 0.25 are rejected)."
+                    }
+                },
+                "required": ["structure_path", "exchange_path"],
+                "additionalProperties": false
+            }),
+            annotations: McpToolAnnotations {
+                title: "Classify Excited-State Structural Hypotheses (CEST/CPMG)".to_string(),
                 read_only_hint: true,
                 destructive_hint: false,
                 idempotent_hint: true,

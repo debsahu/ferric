@@ -15,6 +15,7 @@ pub mod demo_preset;
 pub mod dosy_panel;
 pub mod dynamics_panel;
 pub mod ingest_panel;
+pub mod integrative_af_panel;
 pub mod keymap;
 pub mod mcp_bridge;
 pub mod metabolomics_panel;

@@ -152,9 +152,9 @@ fn test_cli_mcp_stdio_read_only_and_read_write_subprocess_roundtrip() {
     assert_eq!(lines.len(), 6);
     assert_eq!(lines[0]["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
     let ro_tools = lines[1]["result"]["tools"].as_array().expect("tools");
-    assert_eq!(ro_tools.len(), 10);
+    assert_eq!(ro_tools.len(), 14);
     let prompts = lines[2]["result"]["prompts"].as_array().expect("prompts");
-    assert_eq!(prompts.len(), 5);
+    assert_eq!(prompts.len(), 6);
     assert_eq!(lines[3]["result"]["isError"], false);
     assert_eq!(lines[3]["result"]["structuredContent"]["total_peaks"], 3);
     assert_eq!(lines[4]["result"]["isError"], true);

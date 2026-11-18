@@ -146,6 +146,7 @@ use nmr_gui::{
         poll_browser_drop_error, poll_browser_dropped_payloads, try_load_1d_ucsf_or_pipe_bytes,
         IngestAction, IngestDropOutcome, IngestExecutionPlan, IngestPanelState,
     },
+    integrative_af_panel::{apply_integrative_af_action, IntegrativeAfAction, IntegrativeAfPanel},
     keymap::{poll_global_modifier_shortcuts, ChordDispatcher, CONTOUR_FLOOR_STEP_RATIO},
     mcp_bridge::{render_mcp_bridge_panel, McpBridgeState, McpUiCommand, ViewportFrameBuffer},
     metabolomics_panel::MetabolomicsStudioPanel,
@@ -1749,6 +1750,9 @@ struct NmrWorkbenchApp {
     show_about_modal: bool,
     mcp_bridge: McpBridgeState,
     show_mcp_bridge_window: bool,
+    integrative_af_panel: IntegrativeAfPanel,
+    show_integrative_af_window: bool,
+    mol3d_dock_af_tab: bool,
     mcp_last_viewport_key: (u64, i32, i32, i32),
     assign_target_res: usize,
     assign_lock_check: bool,
@@ -2272,6 +2276,9 @@ impl NmrWorkbenchApp {
             show_about_modal: false,
             mcp_bridge: McpBridgeState::default(),
             show_mcp_bridge_window: false,
+            integrative_af_panel: IntegrativeAfPanel::new(),
+            show_integrative_af_window: false,
+            mol3d_dock_af_tab: false,
             mcp_last_viewport_key: (0, 0, 0, -1),
             assign_target_res: 0,
             assign_lock_check: true,
@@ -6974,6 +6981,12 @@ impl NmrWorkbenchApp {
                     self.workspace_mode = WorkspaceMode::Metabolomics;
                     self.show_stack1d_panel = false;
                 }
+                if ui.button("Open Integrative AlphaFold Studio").clicked() {
+                    ui.close();
+                    self.workspace_mode = WorkspaceMode::ProteinNmr;
+                    self.show_stack1d_panel = false;
+                    self.show_integrative_af_window = true;
+                }
             });
 
             ui.menu_button("View", |ui| {
@@ -7029,6 +7042,10 @@ impl NmrWorkbenchApp {
                 );
                 ui.separator();
                 ui.checkbox(&mut self.show_mol3d_viewport, "3D Structure Dock");
+                ui.checkbox(
+                    &mut self.show_integrative_af_window,
+                    "Integrative AlphaFold Studio",
+                );
                 ui.checkbox(&mut self.show_strips_dock, "3D Strips Dock");
                 ui.checkbox(&mut self.show_workflow_guide, "Workflow Stepper");
             });
@@ -14132,7 +14149,8 @@ impl eframe::App for NmrWorkbenchApp {
             || self.show_text_io_modal
             || self.show_assign_popover
             || self.show_contour_modal
-            || self.show_mcp_bridge_window;
+            || self.show_mcp_bridge_window
+            || self.show_integrative_af_window;
         let chord_actions = self
             .chord_dispatcher
             .handle_egui_input(&ctx, suppress_chords);
@@ -14151,6 +14169,7 @@ impl eframe::App for NmrWorkbenchApp {
         self.draw_text_io_window(&ctx);
         self.draw_phase9_modals(&ctx);
         self.draw_mcp_bridge_window(&ctx);
+        self.draw_integrative_af_window(&ctx);
 
         // 5. Responsive Workbench Shell (`CompactMobile < 680`, `TabletSplit 680..1024`, `DesktopFull >= 1024`)
         let mut shell = std::mem::take(&mut self.responsive_shell);
@@ -14724,7 +14743,8 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
 
     fn draw_mol3d_structure_view(&mut self, ui: &mut egui::Ui) -> egui::Rect {
         ui.horizontal(|ui| {
-            ui.strong("3D Structure");
+            ui.selectable_value(&mut self.mol3d_dock_af_tab, false, "3D Structure");
+            ui.selectable_value(&mut self.mol3d_dock_af_tab, true, "AF Studio");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("× Hide")
@@ -14733,6 +14753,15 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
                 {
                     self.show_mol3d_viewport = false;
                     self.responsive_shell.tablet_dock = TabletActiveDock::Hidden;
+                }
+                if ui
+                    .small_button("Window")
+                    .on_hover_text(
+                        "Open Integrative Structural & AlphaFold Studio in a floating window",
+                    )
+                    .clicked()
+                {
+                    self.show_integrative_af_window = true;
                 }
                 if (self.loaded_pdb_text.is_some() || self.mol3d_panel.ensemble.is_some())
                     && ui
@@ -14748,6 +14777,18 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
             });
         });
         ui.separator();
+        if self.mol3d_dock_af_tab {
+            let avail_rect = ui.available_rect_before_wrap();
+            let paper_white = self.paper_white_canvas;
+            let actions = egui::ScrollArea::vertical()
+                .id_salt("mol3d_dock_integrative_af_scroll")
+                .show(ui, |ui| self.integrative_af_panel.show(ui, paper_white))
+                .inner;
+            if !actions.is_empty() {
+                self.apply_integrative_af_actions(actions);
+            }
+            return avail_rect;
+        }
         let display_ref = self.pred_ref.as_ref().or(self.reference.as_ref());
         let wgpu_rs = self.wgpu_render_state.clone();
         let picked = self.mol3d_panel.ui(
@@ -15126,6 +15167,105 @@ impl NmrWorkbenchApp {
             if let Some(cmd) = resp.redone_command {
                 let summary = cmd.summary();
                 self.sync_app_from_mcp_snapshot(&format!("Redid AI action: {summary}"));
+            }
+        }
+    }
+
+    fn draw_integrative_af_window(&mut self, ctx: &egui::Context) {
+        if !self.show_integrative_af_window {
+            return;
+        }
+        let mut open = self.show_integrative_af_window;
+        let max_modal_w = (ctx.content_rect().width() - 24.0).max(280.0);
+        let max_modal_h = (ctx.content_rect().height() - 48.0).max(240.0);
+        let paper_white = self.paper_white_canvas;
+        let mut actions = Vec::new();
+        egui::Window::new("Integrative Structural & AlphaFold Studio")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(680.0_f32.min(max_modal_w))
+            .max_width(max_modal_w)
+            .max_height(max_modal_h)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("integrative_af_window_scroll")
+                    .show(ui, |ui| {
+                        actions = self.integrative_af_panel.show(ui, paper_white);
+                    });
+            });
+        self.show_integrative_af_window = open;
+        if !actions.is_empty() {
+            self.apply_integrative_af_actions(actions);
+        }
+    }
+
+    fn apply_integrative_af_actions(&mut self, actions: Vec<IntegrativeAfAction>) {
+        for act in actions {
+            {
+                let display_ref = self.pred_ref.as_ref().or(self.reference.as_ref());
+                apply_integrative_af_action(
+                    &act,
+                    &self.integrative_af_panel,
+                    display_ref,
+                    &self.sequence,
+                    &self.seq_ids,
+                    &mut self.crosshair,
+                    &mut self.sidechain_ribbon_state,
+                    &mut self.ss_ribbon_state,
+                    &mut self.mol3d_panel,
+                );
+            }
+            match act {
+                IntegrativeAfAction::SelectResidue { seq_idx, .. } => {
+                    if seq_idx < self.sequence.len() {
+                        self.select_residue_and_sync_strip(seq_idx);
+                    }
+                }
+                IntegrativeAfAction::SetMol3dTrack { .. }
+                | IntegrativeAfAction::HighlightDomainPair { .. }
+                | IntegrativeAfAction::SyncStructureAndConcordance => {
+                    if self.sequence.is_empty() {
+                        if let Some(ens) = self.mol3d_panel.ensemble.as_ref() {
+                            if !ens.primary_sequence.is_empty() {
+                                self.sequence = ens.primary_sequence.clone();
+                                self.seq_ids = ens.primary_seq_ids.clone();
+                            }
+                        }
+                    }
+                    self.show_mol3d_viewport = true;
+                    self.mol3d_dock_af_tab = false;
+                    self.has_structure_or_dynamics = true;
+                }
+                IntegrativeAfAction::JumpToDynamicsResidue {
+                    seq_idx,
+                    seq_id,
+                    prefer_cpmg_unsigned,
+                } => {
+                    if seq_idx < self.sequence.len() {
+                        self.select_residue_and_sync_strip(seq_idx);
+                    }
+                    self.dynamics_panel.selected_seq_id = Some(seq_id);
+                    self.dynamics_panel.active_tab = if prefer_cpmg_unsigned {
+                        DynamicsStudioTab::CpmgDispersion
+                    } else {
+                        DynamicsStudioTab::CestDest
+                    };
+                    self.show_dynamics_panel = true;
+                    self.show_relax_panel = false;
+                    self.show_mol3d_viewport = true;
+                    self.has_structure_or_dynamics = true;
+                }
+                IntegrativeAfAction::SelectCofoldPose {
+                    pose_id,
+                    highlight_seq_idx,
+                    ..
+                } => {
+                    if let Some(k) = highlight_seq_idx.filter(|&k| k < self.sequence.len()) {
+                        self.select_residue_and_sync_strip(k);
+                    }
+                    self.show_mol3d_viewport = true;
+                    self.status_msg = format!("Selected co-fold complex pose {pose_id}");
+                }
             }
         }
     }
@@ -15940,6 +16080,9 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             show_about_modal: false,
             mcp_bridge: McpBridgeState::default(),
             show_mcp_bridge_window: false,
+            integrative_af_panel: IntegrativeAfPanel::new(),
+            show_integrative_af_window: false,
+            mol3d_dock_af_tab: false,
             mcp_last_viewport_key: (0, 0, 0, -1),
             assign_target_res: 0,
             assign_lock_check: true,
@@ -16355,6 +16498,9 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             show_about_modal: false,
             mcp_bridge: McpBridgeState::default(),
             show_mcp_bridge_window: false,
+            integrative_af_panel: IntegrativeAfPanel::new(),
+            show_integrative_af_window: false,
+            mol3d_dock_af_tab: false,
             mcp_last_viewport_key: (0, 0, 0, -1),
             assign_target_res: 0,
             assign_lock_check: true,
@@ -16638,6 +16784,9 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             show_about_modal: false,
             mcp_bridge: McpBridgeState::default(),
             show_mcp_bridge_window: false,
+            integrative_af_panel: IntegrativeAfPanel::new(),
+            show_integrative_af_window: false,
+            mol3d_dock_af_tab: false,
             mcp_last_viewport_key: (0, 0, 0, -1),
             assign_target_res: 0,
             assign_lock_check: true,

@@ -283,7 +283,7 @@ fn test_e2e_stdio_newline_lifecycle_and_all_read_tools() {
 
     // Response 2 (id=3): tools/list
     let tools = lines[2]["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 12);
+    assert_eq!(tools.len(), 16);
     for t in tools {
         let tname = t["name"].as_str().unwrap();
         let ro = t["annotations"]["readOnlyHint"].as_bool().unwrap();
@@ -324,7 +324,8 @@ fn test_e2e_stdio_newline_lifecycle_and_all_read_tools() {
             "resolve-ambiguous-strips",
             "deconvolve-1d-mixture-dosy",
             "fit-cest-cpmg-exchange",
-            "analyze-metabolomics-cohort"
+            "analyze-metabolomics-cohort",
+            "validate-and-dock-alphafold-model"
         ]
     );
     let triage_msg = lines[6]["result"]["messages"][0]["content"]["text"]
@@ -723,7 +724,7 @@ fn test_read_only_denial_vs_read_write_sandboxed_mutation_success() {
     .unwrap();
     let list_val: Value = serde_json::from_str(&list_raw).unwrap();
     let visible_tools = list_val["result"]["tools"].as_array().unwrap();
-    assert_eq!(visible_tools.len(), 10);
+    assert_eq!(visible_tools.len(), 14);
     assert!(visible_tools
         .iter()
         .all(|t| t["annotations"]["readOnlyHint"] == true));
@@ -1971,5 +1972,498 @@ fn test_f25_split_send_loopback_http_rejected_401_403_413_zero_econnreset() {
             "expected clean 413 on pause={pause_ms}ms, got: {resp_413}"
         );
         assert!(resp_413.contains("MAX_MCP_FRAME_BYTES"));
+    }
+}
+
+#[test]
+fn test_phase21_mcp_af_concordance_predict_shifts_and_prompt() {
+    let sb = TempTestSandbox::new("p21_af_shifts");
+    let ubq_pdb = fixture_path("ubiquitin_1ubq_xray.pdb");
+    let ubq_str = fixture_path("bmr17769_ubiquitin_allatom.str");
+    // Convert 1UBQ coordinates into an AlphaFold-annotated PDB with pLDDT = 92.0 in domains 1..36 & 41..76 and 45.0 in linker 37..40
+    let raw_pdb = fs::read_to_string(&ubq_pdb).expect("read ubq pdb");
+    let mut af_pdb = String::from("TITLE     ALPHAFOLD MONOMER V2.0 PREDICTION FOR UBIQUITIN\n");
+    for line in raw_pdb.lines() {
+        if line.starts_with("ATOM  ") && line.len() >= 66 {
+            let seq_id: i32 = line[22..26].trim().parse().unwrap_or(1);
+            let plddt = if (37..=40).contains(&seq_id) {
+                45.00
+            } else {
+                92.50
+            };
+            af_pdb.push_str(&line[..60]);
+            af_pdb.push_str(&format!("{plddt:6.2}"));
+            af_pdb.push_str(&line[66..]);
+            af_pdb.push('\n');
+        } else if line.starts_with("END") {
+            af_pdb.push_str(line);
+            af_pdb.push('\n');
+        }
+    }
+    fs::write(sb.workspace.join("ubq_model.pdb"), af_pdb).expect("write af ubq pdb");
+    fs::copy(&ubq_str, sb.workspace.join("ubq_shifts.str")).expect("copy ubq str");
+
+    // Build a synthetic 76x76 AFDB v4 PAE JSON with 2 rigid blocks (1..38 and 39..76)
+    let n = 76usize;
+    let mut pae_rows = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut row = Vec::with_capacity(n);
+        for j in 0..n {
+            let v = if i == j {
+                0.5
+            } else if (i < 36 && j < 36) || (i >= 40 && j >= 40) {
+                2.2
+            } else {
+                22.0
+            };
+            row.push(v);
+        }
+        pae_rows.push(row);
+    }
+    let pae_json = serde_json::to_string(&json!([{
+        "max_predicted_aligned_error": 31.75,
+        "predicted_aligned_error": pae_rows,
+    }]))
+    .expect("serialize pae json");
+    fs::write(sb.workspace.join("ubq_pae.json"), pae_json).expect("write pae json");
+
+    let policy = McpSecurityPolicy::read_only([&sb.workspace]).expect("read_only policy");
+    let mut server = McpServer::new(policy);
+
+    // 1. Prompt `validate-and-dock-alphafold-model`
+    let prompt_raw = handle_mcp_json_request(
+        &mut server,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "prompts/get",
+            "params": {
+                "name": "validate-and-dock-alphafold-model",
+                "arguments": {
+                    "workspace_path": ".",
+                    "structure_path": "ubq_model.pdb",
+                    "pae_path": "ubq_pae.json",
+                    "shifts_path": "ubq_shifts.str"
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("prompt response");
+    let prompt_val: Value = serde_json::from_str(&prompt_raw).unwrap();
+    assert!(prompt_val["error"].is_null(), "prompt failed: {prompt_val}");
+    let prompt_txt = prompt_val["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(prompt_txt.contains("af_concordance"));
+    assert!(prompt_txt.contains("predict_structure_shifts"));
+    assert!(prompt_txt.contains("ByPeptidePlane"));
+
+    // 2. `af_concordance` with `force_bfactor_plddt: true` (since 1UBQ has X-RAY EXPDTA) + PAE domains
+    let conc_raw = handle_mcp_json_request(
+        &mut server,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "af_concordance",
+                "arguments": {
+                    "structure_path": "ubq_model.pdb",
+                    "shifts_path": "ubq_shifts.str",
+                    "pae_path": "ubq_pae.json",
+                    "force_bfactor_plddt": true,
+                    "exclude_pdb_ids": ["1UBQ", "1D3Z"],
+                    "exclude_bmrb_ids": ["17769", "6457"]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("af_concordance response");
+    let conc_val: Value = serde_json::from_str(&conc_raw).unwrap();
+    assert_eq!(conc_val["result"]["isError"], false, "got: {conc_val}");
+    let conc_sc = &conc_val["result"]["structuredContent"];
+    assert_eq!(conc_sc["structure_path"], "ubq_model.pdb");
+    assert_eq!(conc_sc["n_residues"], 76);
+    assert_eq!(conc_sc["exclusion_list_sha256"].as_str().unwrap().len(), 64);
+    assert!(conc_sc["max_retained_seq_identity"].as_f64().unwrap() <= 0.25 + 1e-9);
+    assert_eq!(conc_sc["pae_domains"]["n_domains"], 2);
+
+    // 3. `predict_structure_shifts` enforcing HomologFirewall <= 0.25 + methyl ILVMAT
+    let pred_raw = handle_mcp_json_request(
+        &mut server,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "predict_structure_shifts",
+                "arguments": {
+                    "structure_path": "ubq_model.pdb",
+                    "include_methyl_ilvmat": true,
+                    "exclude_pdb_ids": ["1UBQ", "1D3Z"],
+                    "exclude_bmrb_ids": ["17769", "6457"]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("predict_structure_shifts response");
+    let pred_val: Value = serde_json::from_str(&pred_raw).unwrap();
+    assert_eq!(pred_val["result"]["isError"], false, "got: {pred_val}");
+    let pred_sc = &pred_val["result"]["structuredContent"];
+    assert_eq!(pred_sc["n_residues"], 76);
+    assert_eq!(pred_sc["enforced_max_seq_identity"], 0.25);
+    assert!(pred_sc["max_retained_seq_identity"].as_f64().unwrap() <= 0.25 + 1e-9);
+    assert_eq!(pred_sc["exclusion_list_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(pred_sc["corpus_sha256"].as_str().unwrap().len(), 64);
+    assert!(pred_sc["excluded_templates_count"].as_u64().unwrap() >= 1);
+
+    // 4. `classify_excited_state` E2E on Glu18-Pro19 trans->cis (mixed Signed CEST + Unsigned CPMG)
+    let exch_tsv = "chain_id\tseq_id\tres_name\tatom\tdw_ppm\tdw_err_ppm\tsign_mode\n\
+                    A\t19\tPRO\tCB\t2.42\t0.25\tsigned\n\
+                    A\t19\tPRO\tCG\t-2.58\t0.25\tsigned\n\
+                    A\t19\tPRO\tCA\t-0.52\t0.25\tsigned\n\
+                    A\t18\tGLU\tCA\t1.14\t0.25\tunsigned\n\
+                    A\t18\tGLU\tC\t1.33\t0.28\tunsigned\n";
+    fs::write(sb.workspace.join("pro19_exchange.tsv"), exch_tsv).expect("write exchange tsv");
+
+    let exc_raw = handle_mcp_json_request(
+        &mut server,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "classify_excited_state",
+                "arguments": {
+                    "shifts_path": "ubq_shifts.str",
+                    "structure_path": "ubq_model.pdb",
+                    "exchange_path": "pro19_exchange.tsv",
+                    "exclude_pdb_ids": ["1UBQ", "1D3Z"],
+                    "exclude_bmrb_ids": ["17769", "6457"]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("classify_excited_state response");
+    let exc_val: Value = serde_json::from_str(&exc_raw).unwrap();
+    assert_eq!(exc_val["result"]["isError"], false, "got: {exc_val}");
+    let exc_sc = &exc_val["result"]["structuredContent"];
+    assert_eq!(exc_sc["verdict"], "Committed(XxxProCisTrans)");
+    assert_eq!(exc_sc["n_observations"], 5);
+    assert_eq!(exc_sc["n_signed_observations"], 3);
+    assert_eq!(exc_sc["n_unsigned_observations"], 2);
+    assert!(exc_sc["two_ln_bf_top1_vs_top2"].as_f64().unwrap() >= 6.0);
+    assert!(exc_sc["two_ln_bf_top1_vs_null"].as_f64().unwrap() >= 10.0);
+    assert!(exc_sc["max_retained_seq_identity"].as_f64().unwrap() <= 0.25 + 1e-9);
+    assert_eq!(exc_sc["exclusion_list_sha256"].as_str().unwrap().len(), 64);
+
+    // 5. `score_cofold_poses` E2E: two-chain complex (chain A = 1UBQ, chain B = peptide partner near Ile44 pocket vs 15 A decoy)
+    let mut native_pose = String::from("HEADER    UBIQUITIN-PEPTIDE NATIVE COMPLEX\n");
+    let mut decoy_pose = String::from("HEADER    UBIQUITIN-PEPTIDE DECOY COMPLEX\n");
+    for line in raw_pdb.lines() {
+        if line.starts_with("ATOM  ") {
+            native_pose.push_str(line);
+            native_pose.push('\n');
+            decoy_pose.push_str(line);
+            decoy_pose.push('\n');
+        }
+    }
+    // Find Ile44 CA coordinates in 1UBQ to place partner chain B near Ile44 (native) vs +20 A away (decoy)
+    let mut ile44_ca = [30.0_f64, 29.0, 15.0];
+    for line in raw_pdb.lines() {
+        if line.starts_with("ATOM  ") && line[12..16].trim() == "CA" && line[22..26].trim() == "44"
+        {
+            ile44_ca = [
+                line[30..38].trim().parse().unwrap_or(30.0),
+                line[38..46].trim().parse().unwrap_or(29.0),
+                line[46..54].trim().parse().unwrap_or(15.0),
+            ];
+            break;
+        }
+    }
+    for (r_idx, res_nm) in ["PHE", "ALA", "LEU"].iter().enumerate() {
+        let sid = r_idx + 1;
+        for (a_idx, (anm, el, off)) in [
+            ("N", "N", [-1.2, 0.0, 0.0]),
+            ("CA", "C", [0.0, 0.0, 0.0]),
+            ("C", "C", [1.2, 0.5, 0.0]),
+            ("O", "O", [1.4, 1.7, 0.0]),
+            ("CB", "C", [0.0, -1.4, 0.5]),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let serial = 900 + r_idx * 10 + a_idx;
+            let nx = ile44_ca[0] + 4.2 + off[0] + (r_idx as f64) * 2.5;
+            let ny = ile44_ca[1] + off[1];
+            let nz = ile44_ca[2] + off[2];
+            native_pose.push_str(&format!(
+                "ATOM  {serial:>5}  {anm:<3} {res_nm} B{sid:>4}    {nx:>8.3}{ny:>8.3}{nz:>8.3}  1.00 85.00           {el:>2}\n"
+            ));
+            let dx = nx + 20.0;
+            decoy_pose.push_str(&format!(
+                "ATOM  {serial:>5}  {anm:<3} {res_nm} B{sid:>4}    {dx:>8.3}{ny:>8.3}{nz:>8.3}  1.00 85.00           {el:>2}\n"
+            ));
+        }
+    }
+    native_pose.push_str("END\n");
+    decoy_pose.push_str("END\n");
+    fs::write(sb.workspace.join("pose_native.pdb"), &native_pose).unwrap();
+    fs::write(sb.workspace.join("pose_decoy.pdb"), &decoy_pose).unwrap();
+    fs::write(
+        sb.workspace.join("inter_noe.tsv"),
+        "chain_1\tseq_id_1\tatom_1\tchain_2\tseq_id_2\tatom_2\tupper_a\nA\t44\tCA\tB\t1\tCA\t6.0\n",
+    )
+    .unwrap();
+
+    // (a) Native + decoy -> RankedConclusive with `pose_native` ranked #1 and zero host-path leakage
+    let cf_raw = handle_mcp_json_request(
+        &mut server,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "score_cofold_poses",
+                "arguments": {
+                    "pose_paths": ["pose_decoy.pdb", "pose_native.pdb"],
+                    "apo_structure_path": "ubq_model.pdb",
+                    "noe_path": "inter_noe.tsv",
+                    "exclude_pdb_ids": ["1UBQ", "1D3Z"],
+                    "exclude_bmrb_ids": ["17769", "6457"]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("score_cofold_poses response");
+    assert!(
+        !cf_raw.contains(sb.base.to_str().unwrap()),
+        "score_cofold_poses must never leak host sandbox prefix"
+    );
+    let cf_val: Value = serde_json::from_str(&cf_raw).unwrap();
+    assert_eq!(cf_val["result"]["isError"], false, "got: {cf_val}");
+    let cf_sc = &cf_val["result"]["structuredContent"];
+    assert_eq!(cf_sc["verdict"], "RankedConclusive");
+    assert_eq!(cf_sc["top_pose_id"], "pose_native");
+    assert_eq!(cf_sc["poses"][0]["pose_id"], "pose_native");
+    assert_eq!(cf_sc["exclusion_list_sha256"].as_str().unwrap().len(), 64);
+
+    // (b) Decoy-only -> abstains honestly as `InconclusiveOrAllViolated`
+    let cf_decoy_raw = handle_mcp_json_request(
+        &mut server,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "score_cofold_poses",
+                "arguments": {
+                    "pose_paths": ["pose_decoy.pdb"],
+                    "apo_structure_path": "ubq_model.pdb",
+                    "noe_path": "inter_noe.tsv"
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let cf_decoy_val: Value = serde_json::from_str(&cf_decoy_raw).unwrap();
+    assert_eq!(cf_decoy_val["result"]["isError"], false);
+    assert_eq!(
+        cf_decoy_val["result"]["structuredContent"]["verdict"],
+        "InconclusiveOrAllViolated"
+    );
+    assert!(cf_decoy_val["result"]["structuredContent"]["top_pose_id"].is_null());
+}
+
+#[test]
+fn test_phase21_mcp_all_four_tools_adversarial_sandbox_and_firewall() {
+    let sb = TempTestSandbox::new("p21_sec");
+    fs::copy(
+        fixture_path("ubiquitin_1ubq_xray.pdb"),
+        sb.workspace.join("ok.pdb"),
+    )
+    .unwrap();
+    fs::copy(
+        fixture_path("synthetic_ubiquitin.str"),
+        sb.workspace.join("ok.str"),
+    )
+    .unwrap();
+    fs::write(sb.outside.join("secret.pdb"), "OUTSIDE").unwrap();
+    fs::create_dir_all(sb.workspace.join(".ssh")).unwrap();
+    fs::write(sb.workspace.join(".ssh/id_rsa"), "PRIVKEY").unwrap();
+    fs::write(sb.workspace.join(".env"), "TOKEN=1").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        sb.outside.join("secret.pdb"),
+        sb.workspace.join("sym_escape.pdb"),
+    )
+    .unwrap();
+
+    let policy = McpSecurityPolicy::read_only([&sb.workspace]).unwrap();
+    let mut server = McpServer::new(policy);
+
+    let call_tool = |srv: &mut McpServer, name: &str, args: Value| -> Value {
+        let raw = handle_mcp_json_request(
+            srv,
+            &serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    };
+
+    // Every one of the 4 Phase 21 tools must block `..` traversal, `.ssh`/`.env` credentials,
+    // symlinks outside workspace, and network/fetch_uniprot URLs!
+    let escape_cases = [
+        (
+            "af_concordance",
+            json!({ "structure_path": "../outside/secret.pdb", "shifts_path": "ok.str" }),
+        ),
+        (
+            "af_concordance",
+            json!({ "structure_path": "ok.pdb", "shifts_path": "ok.str", "pae_path": ".env" }),
+        ),
+        (
+            "predict_structure_shifts",
+            json!({ "structure_path": ".ssh/id_rsa" }),
+        ),
+        (
+            "score_cofold_poses",
+            json!({ "pose_paths": ["ok.pdb", "../outside/secret.pdb"] }),
+        ),
+        (
+            "score_cofold_poses",
+            json!({ "pose_paths": ["ok.pdb"], "csp_path": ".env" }),
+        ),
+        (
+            "classify_excited_state",
+            json!({
+                "shifts_path": "ok.str",
+                "structure_path": "../outside/secret.pdb",
+                "exchange_path": "ok.str"
+            }),
+        ),
+        (
+            "classify_excited_state",
+            json!({
+                "shifts_path": "ok.str",
+                "structure_path": "ok.pdb",
+                "exchange_path": "ok.str",
+                "alt_structure_paths": [".ssh/id_rsa"]
+            }),
+        ),
+    ];
+
+    for (tname, bad_args) in escape_cases {
+        let resp = call_tool(&mut server, tname, bad_args.clone());
+        assert_eq!(
+            resp["result"]["isError"], true,
+            "expected security rejection on {tname} {bad_args}: {resp}"
+        );
+        assert_eq!(
+            resp["result"]["structuredContent"]["error"]["code"], ERR_SECURITY_VIOLATION,
+            "expected ERR_SECURITY_VIOLATION on {tname} {bad_args}: {resp}"
+        );
+    }
+
+    #[cfg(unix)]
+    for (tname, sym_args) in [
+        (
+            "af_concordance",
+            json!({ "structure_path": "sym_escape.pdb", "shifts_path": "ok.str" }),
+        ),
+        (
+            "predict_structure_shifts",
+            json!({ "structure_path": "sym_escape.pdb" }),
+        ),
+        (
+            "score_cofold_poses",
+            json!({ "pose_paths": ["sym_escape.pdb"] }),
+        ),
+        (
+            "classify_excited_state",
+            json!({
+                "shifts_path": "ok.str",
+                "structure_path": "sym_escape.pdb",
+                "exchange_path": "ok.str"
+            }),
+        ),
+    ] {
+        let resp = call_tool(&mut server, tname, sym_args);
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(
+            resp["result"]["structuredContent"]["error"]["kind"],
+            "symlink_escape"
+        );
+    }
+
+    // Network / `--fetch-uniprot` / HTTPS URL attempts are explicitly blocked across all 4 tools
+    for (tname, net_args) in [
+        (
+            "af_concordance",
+            json!({ "fetch_uniprot": "P0CG48", "structure_path": "ok.pdb", "shifts_path": "ok.str" }),
+        ),
+        (
+            "predict_structure_shifts",
+            json!({ "structure_path": "https://alphafold.ebi.ac.uk/files/AF-P0CG48-F1-model_v4.cif" }),
+        ),
+        (
+            "score_cofold_poses",
+            json!({ "pose_paths": ["https://alphafold.ebi.ac.uk/pose.cif"] }),
+        ),
+        (
+            "classify_excited_state",
+            json!({
+                "shifts_path": "ok.str",
+                "structure_path": "https://example.org/model.cif",
+                "exchange_path": "ok.str"
+            }),
+        ),
+    ] {
+        let resp = call_tool(&mut server, tname, net_args);
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(
+            resp["result"]["structuredContent"]["error"]["kind"],
+            "network_access_denied"
+        );
+    }
+
+    // HomologFirewall > 0.25 ceiling bypass rejected
+    for (tname, fw_args) in [
+        (
+            "af_concordance",
+            json!({ "structure_path": "ok.pdb", "shifts_path": "ok.str", "max_seq_identity": 0.50 }),
+        ),
+        (
+            "predict_structure_shifts",
+            json!({ "structure_path": "ok.pdb", "max_seq_identity": 0.40 }),
+        ),
+        (
+            "classify_excited_state",
+            json!({
+                "shifts_path": "ok.str",
+                "structure_path": "ok.pdb",
+                "exchange_path": "ok.str",
+                "max_seq_identity": 0.30
+            }),
+        ),
+    ] {
+        let resp = call_tool(&mut server, tname, fw_args);
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(
+            resp["result"]["structuredContent"]["error"]["kind"],
+            "homolog_firewall_violation"
+        );
     }
 }
