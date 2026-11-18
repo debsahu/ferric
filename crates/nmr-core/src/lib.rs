@@ -18,6 +18,7 @@ pub mod bayes_sa;
 pub mod c13_detected;
 pub mod cest;
 pub mod classify;
+pub mod cofold_bridge;
 pub mod cpmg;
 pub mod csp;
 pub mod dihedrals;
