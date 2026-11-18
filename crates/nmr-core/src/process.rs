@@ -38,12 +38,14 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::fid::{
-    format_truncated_fid_name_warning, read_fid_2d_opts, read_fid_3d_opts, Complex64, Fid1D, Fid2D,
-    Fid3D, FidAxisMeta, FidVendor, QuadMode, StoredWindowHint,
+    format_truncated_fid_name_warning, read_fid_2d_with_ipap, read_fid_3d_opts, Complex64, Fid1D,
+    Fid2D, Fid3D, FidAxisMeta, FidVendor, QuadMode, StoredWindowHint,
 };
 pub use crate::fid::{
-    is_bruker_2d_ipap_sequence, recombine_ipap_trace_pair_1d, resolve_bruker_ipap_j_caco_hz,
-    DEFAULT_IPAP_J_CACO_HZ,
+    is_bruker_2d_ipap_sequence, read_bruker_fid_2d_from_bytes_with_ipap,
+    read_bruker_fid_2d_with_ipap, recombine_ipap_trace_pair_1d,
+    recombine_ipap_trace_pair_scaled_1d, resolve_bruker_ipap_config, resolve_bruker_ipap_j_caco_hz,
+    resolve_bruker_ipap_l0_ip_first, IpapConfig, DEFAULT_IPAP_AP_SCALE, DEFAULT_IPAP_J_CACO_HZ,
 };
 use crate::ops::{
     auto_phase_1d, auto_phase_direct_nd, auto_phase_indirect_nd, hilbert_transform_in_place,
@@ -4210,6 +4212,17 @@ pub fn process_fid_dir_2d(
     process_fid_dir_2d_opts(dir, no_crop, lp, false)
 }
 
+/// Optional explicit IPAP recombination overrides (`j_caco_hz`, `ap_scale`, `ip_first`) for `2D CON` / `CACO`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IpapOverrideOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub j_caco_hz: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap_scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_first: Option<bool>,
+}
+
 /// Read and process a 2D FID directory with explicit `allow_truncated_fid` opt-in zero-filling for halted acquisitions.
 pub fn process_fid_dir_2d_opts(
     dir: impl AsRef<Path>,
@@ -4217,7 +4230,30 @@ pub fn process_fid_dir_2d_opts(
     lp: bool,
     allow_truncated_fid: bool,
 ) -> Result<(Spectrum2D, ProcessingRecipe), String> {
-    let fid = read_fid_2d_opts(dir, allow_truncated_fid)?;
+    process_fid_dir_2d_with_ipap(
+        dir,
+        no_crop,
+        lp,
+        allow_truncated_fid,
+        IpapOverrideOptions::default(),
+    )
+}
+
+/// Read and process a 2D FID directory with optional explicit IPAP recombination overrides.
+pub fn process_fid_dir_2d_with_ipap(
+    dir: impl AsRef<Path>,
+    no_crop: bool,
+    lp: bool,
+    allow_truncated_fid: bool,
+    ipap: IpapOverrideOptions,
+) -> Result<(Spectrum2D, ProcessingRecipe), String> {
+    let fid = read_fid_2d_with_ipap(
+        dir,
+        allow_truncated_fid,
+        ipap.j_caco_hz,
+        ipap.ap_scale,
+        ipap.ip_first,
+    )?;
     let mut recipe = ProcessingRecipe::from_fid_2d(&fid);
     recipe.allow_truncated_fid = allow_truncated_fid;
     if no_crop {
@@ -4269,9 +4305,9 @@ mod ipap_con_tests {
     #[test]
     fn test_clean_room_ipap_virtual_decoupling_2d_con_collapses_c_prime_doublets_to_singlets() {
         // Synthesize a realistic 800 MHz Bruker 2D `(HCa)CON` (`PULPROG = <c_hcacon_ia>`,
-        // `FnMODE = 5` States-TPPI, `FnILOOP = 2`, `GRPDLY = 68`, `TD(F2) = 1024`, `TD(F1) = 128`,
-        // `ser` = 256 interleaved IP/AP rows of 1024 little-endian `i32` words = 1,048,576 B),
-        // including a stale un-executed `procs` / `proc2s` template with mismatched `SW_p`.
+        // `FnMODE = 5` States-TPPI, `GRPDLY = 68`, `TD(F2) = 1024`, `ser` = 256 interleaved
+        // IP/AP rows of 1024 little-endian `i32` words = 1,048,576 B), checking BOTH standard
+        // Bruker TopSpin `TD(F1) = 256` (no `FnILOOP`) and explicit `TD(F1) = 128, FnILOOP = 2`.
         let bf_c = 201.22302255_f64;
         let sfo_c = 201.258035356_f64;
         let sw_c_hz = 2380.95238095238_f64;
@@ -4284,20 +4320,19 @@ mod ipap_con_tests {
         let sw_n_ppm = sw_n_hz / sfo_n;
 
         let n0 = 512usize; // TD(F2) = 1024 scalar i32
-        let n1 = 64usize; // TD(F1) = 128 hypercomplex -> 64 complex States-TPPI pairs
-        let j_caco = 53.0_f64;
+        let n1 = 64usize; // 64 complex States-TPPI pairs (128 post-IPAP traces, 256 raw IP+AP traces)
+        let j_caco = DEFAULT_IPAP_J_CACO_HZ;
 
         let targets = [
             (172.68_f64, 124.28_f64, 1.0e6_f64),
             (175.36_f64, 112.89_f64, 0.8e6_f64),
-            (172.56_f64, 135.81_f64, 0.9e6_f64), // Proline 15N ~135.8 ppm!
+            (172.56_f64, 135.81_f64, 0.9e6_f64), // Proline 15N ~135.8 ppm
         ];
 
         let car_c_ppm = (sfo_c - bf_c) * 1.0e6 / bf_c;
         let car_n_ppm = (sfo_n - bf_n) * 1.0e6 / bf_n;
-        let phi0_c = (-110.0_f64).to_radians(); // Non-zero receiver phase on 13C
+        let phi0_c = (-110.0_f64).to_radians();
 
-        // Build 256-trace `ser` (`128` States-TPPI traces × `2` IP/AP inner-loop rows)
         let mut ser_bytes = Vec::with_capacity(256 * n0 * 2 * 4);
         for k1 in 0..n1 {
             let t1 = (k1 as f64) / sw_n_hz;
@@ -4314,7 +4349,7 @@ mod ipap_con_tests {
                             let j_mod = if !is_ap {
                                 (PI * j_caco * t2).cos()
                             } else {
-                                (PI * j_caco * t2).sin()
+                                (PI * j_caco * t2).sin() / DEFAULT_IPAP_AP_SCALE
                             };
                             for &(cp_ppm, np_ppm, amp) in &targets {
                                 let f_c = (cp_ppm - car_c_ppm) * bf_c;
@@ -4324,8 +4359,6 @@ mod ipap_con_tests {
                                 } else {
                                     (2.0 * PI * f_n * t1).sin()
                                 };
-                                // Bruker direct convention in `nmr-core`: downfield `+f_c` oscillates as `exp(+i (2pi f_c t2 + phi0_c))`,
-                                // and AP carries `-i` (`ph7 = 3`) so `IP * cos + i * AP * sin` collapses the ±J/2 doublet.
                                 let ang = 2.0 * PI * f_c * t2 + phi0_c;
                                 let (sa, ca) = ang.sin_cos();
                                 let sc = amp * tppi_sign * w_n * env1 * env2 * j_mod;
@@ -4334,7 +4367,6 @@ mod ipap_con_tests {
                                     re += s0_re;
                                     im += s0_im;
                                 } else {
-                                    // -i * (s0_re + i s0_im) = s0_im - i s0_re
                                     re += s0_im;
                                     im -= s0_re;
                                 }
@@ -4351,79 +4383,85 @@ mod ipap_con_tests {
         let acqus_txt = format!(
             "##$PULPROG= <c_hcacon_ia>\n##$NUC1= <13C>\n##$BF1= {bf_c:.8}\n##$SFO1= {sfo_c:.9}\n##$SW= {sw_c_ppm:.10}\n##$SW_h= {sw_c_hz:.10}\n##$TD= 1024\n##$AQ_mod= 3\n##$GRPDLY= {grpdly}\n##$BYTORDA= 0\n##$DTYPA= 0\n"
         );
-        let acqu2s_txt = format!(
-            "##$NUC1= <15N>\n##$BF1= {bf_n:.8}\n##$SFO1= {sfo_n:.9}\n##$SW= {sw_n_ppm:.10}\n##$SW_h= {sw_n_hz:.10}\n##$TD= 128\n##$FnMODE= 5\n##$FnILOOP= 2\n"
-        );
-        // Stale un-executed `procs` / `proc2s` template with wrong `SW_p` and wrong `OFFSET`
         let stale_procs =
             "##$FT_mod= 6\n##$SW_p= 8196.72\n##$OFFSET= 193.87\n##$SF= 201.22302255\n##$SI= 2048\n##$PHC0= 0\n##$PHC1= 0\n##$PH_mod= 1\n";
         let stale_proc2s =
             "##$FT_mod= 4\n##$SW_p= 3810.98\n##$OFFSET= 146.50\n##$SF= 81.08862828\n##$SI= 256\n##$PHC0= 0\n##$PHC1= 0\n##$PH_mod= 1\n";
-        let pp_txt = ";c_hcacon_ia\n;using IPAP scheme for virtual decoupling\n(p21 ph4):f3\nd0\n(p22 ph1):f3\nMCWRK ip4\nid0\n;use AU-program splitcomb [ipap 2] to process data\n";
+        let pp_txt = ";c_hcacon_ia\n;using IPAP scheme for virtual decoupling\n\"l0=1\"\n(p21 ph4):f3\nif \"l0 %2 == 1\"\n{\n}\nd0\n(p22 ph1):f3\nMCWRK ip4\nid0\n;use AU-program splitcomb [ipap 2] to process data\n";
 
-        let fid = read_bruker_fid_2d_from_bytes(
-            "3_con_ipap",
-            &acqus_txt,
-            None,
-            &acqu2s_txt,
-            None,
-            Some(stale_procs),
-            Some(stale_proc2s),
-            Some(pp_txt),
-            None,
-            &ser_bytes,
-            false,
-        )
-        .expect("decode IPAP 2D CON ser");
-        assert_eq!(fid.axis_x.label, "13C");
-        assert_eq!(fid.axis_y.label, "15N");
-        assert_eq!(fid.axis_y.complex_points, 64);
-        assert!(fid.truncated_traces.is_none());
+        for acqu2s_variant in [
+            format!(
+                "##$NUC1= <15N>\n##$BF1= {bf_n:.8}\n##$SFO1= {sfo_n:.9}\n##$SW= {sw_n_ppm:.10}\n##$SW_h= {sw_n_hz:.10}\n##$TD= 256\n##$FnMODE= 5\n"
+            ),
+            format!(
+                "##$NUC1= <15N>\n##$BF1= {bf_n:.8}\n##$SFO1= {sfo_n:.9}\n##$SW= {sw_n_ppm:.10}\n##$SW_h= {sw_n_hz:.10}\n##$TD= 128\n##$FnMODE= 5\n##$FnILOOP= 2\n"
+            ),
+        ] {
+            let fid = read_bruker_fid_2d_from_bytes(
+                "3_con_ipap",
+                &acqus_txt,
+                None,
+                &acqu2s_variant,
+                None,
+                Some(stale_procs),
+                Some(stale_proc2s),
+                Some(pp_txt),
+                None,
+                &ser_bytes,
+                false,
+            )
+            .expect("decode IPAP 2D CON ser");
+            assert_eq!(fid.axis_x.label, "13C");
+            assert_eq!(fid.axis_y.label, "15N");
+            assert_eq!(fid.axis_y.td_raw, 128);
+            assert_eq!(fid.axis_y.complex_points, 64);
+            assert!(fid.truncated_traces.is_none());
 
-        let mut recipe = ProcessingRecipe::from_fid_2d(&fid);
-        let spec = process_fid_2d_mut(&fid, &mut recipe).expect("process IPAP 2D CON");
+            let mut recipe = ProcessingRecipe::from_fid_2d(&fid);
+            let spec = process_fid_2d_mut(&fid, &mut recipe).expect("process IPAP 2D CON");
 
-        let max_val = spec.max_abs();
-        for &(cp_ppm, np_ppm, _) in &targets {
-            let ix_c = spec.axis_x.ppm_to_index(cp_ppm).round() as usize;
-            let iy_n = spec.axis_y.ppm_to_index(np_ppm).round() as usize;
-            let mut best_v = f32::NEG_INFINITY;
-            let mut best_c = 0.0;
-            let mut best_n = 0.0;
-            for dy in -2isize..=2 {
-                for dx in -3isize..=3 {
-                    let x = (ix_c as isize + dx).clamp(0, spec.nx() as isize - 1) as usize;
-                    let y = (iy_n as isize + dy).clamp(0, spec.ny() as isize - 1) as usize;
-                    let v = spec.get(x, y);
-                    if v > best_v {
-                        best_v = v;
-                        best_c = spec.axis_x.index_to_ppm(x as f64);
-                        best_n = spec.axis_y.index_to_ppm(y as f64);
+            let max_val = spec.max_abs();
+            for &(cp_ppm, np_ppm, _) in &targets {
+                let ix_c = spec.axis_x.ppm_to_index(cp_ppm).round() as usize;
+                let iy_n = spec.axis_y.ppm_to_index(np_ppm).round() as usize;
+                let mut best_v = f32::NEG_INFINITY;
+                let mut best_c = 0.0;
+                let mut best_n = 0.0;
+                for dy in -2isize..=2 {
+                    for dx in -3isize..=3 {
+                        let x = (ix_c as isize + dx).clamp(0, spec.nx() as isize - 1) as usize;
+                        let y = (iy_n as isize + dy).clamp(0, spec.ny() as isize - 1) as usize;
+                        let v = spec.get(x, y);
+                        if v > best_v {
+                            best_v = v;
+                            best_c = spec.axis_x.index_to_ppm(x as f64);
+                            best_n = spec.axis_y.index_to_ppm(y as f64);
+                        }
                     }
                 }
-            }
-            assert!(
-                best_v > 0.45 * max_val,
-                "expected strong positive singlet at ({cp_ppm}, {np_ppm}), got {best_v} (max={max_val})"
-            );
-            assert!(
-                (best_c - cp_ppm).abs() < 0.02,
-                "13C shift {best_c} vs {cp_ppm}"
-            );
-            assert!(
-                (best_n - np_ppm).abs() < 0.20,
-                "15N shift {best_n} vs {np_ppm}"
-            );
+                assert!(
+                    best_v > 0.45 * max_val,
+                    "expected strong positive singlet at ({cp_ppm}, {np_ppm}), got {best_v} (max={max_val})"
+                );
+                assert!(
+                    (best_c - cp_ppm).abs() < 0.02,
+                    "13C shift {best_c} vs {cp_ppm}"
+                );
+                assert!(
+                    (best_n - np_ppm).abs() < 0.20,
+                    "15N shift {best_n} vs {np_ppm}"
+                );
 
-            // Verify the ±J/2 (~0.132 ppm) doublet components collapsed cleanly (< 8% of singlet apex)!
-            let split_ppm = 0.5 * j_caco / bf_c;
-            let ix_up = spec.axis_x.ppm_to_index(cp_ppm + split_ppm).round() as usize;
-            let ix_dn = spec.axis_x.ppm_to_index(cp_ppm - split_ppm).round() as usize;
-            assert!(
-                spec.get(ix_up, iy_n).abs() < 0.08 * best_v
-                    && spec.get(ix_dn, iy_n).abs() < 0.08 * best_v,
-                "doublet splittings at ±J/2 must collapse into singlet"
-            );
+                // Verify the ±J/2 doublet components collapsed cleanly (< 8% of singlet apex)!
+                let split_ppm = 0.5 * j_caco / bf_c;
+                let ix_up = spec.axis_x.ppm_to_index(cp_ppm + split_ppm).round() as usize;
+                let ix_dn = spec.axis_x.ppm_to_index(cp_ppm - split_ppm).round() as usize;
+                assert!(
+                    spec.get(ix_up, iy_n).abs() < 0.08 * best_v
+                        && spec.get(ix_dn, iy_n).abs() < 0.08 * best_v,
+                    "doublet splittings at ±J/2 must collapse into singlet"
+                );
+            }
         }
     }
 }
