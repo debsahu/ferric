@@ -266,36 +266,136 @@ fn test_gpu_sequence_only_matches_5c4e87d_golden_snapshots_exact_zero_diff() {
         let ref_gpu_u = read_f32_le_bin(&fix_dir.join(f_gu));
         let ref_gpu_p = read_f32_le_bin(&fix_dir.join(f_gp));
 
-        let max_cpu_u_diff = cpu_u
-            .data
-            .iter()
-            .zip(ref_cpu_u.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        let max_cpu_p_diff = cpu_p
-            .data
-            .iter()
-            .zip(ref_cpu_p.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        let max_gpu_u_diff = gpu_u
-            .data
-            .iter()
-            .zip(ref_gpu_u.iter())
-            .map(|(a, b)| ((*a as f32) - *b).abs())
-            .fold(0.0_f32, f32::max);
-        let max_gpu_p_diff = gpu_p
-            .data
-            .iter()
-            .zip(ref_gpu_p.iter())
-            .map(|(a, b)| ((*a as f32) - *b).abs())
-            .fold(0.0_f32, f32::max);
-
-        assert_eq!(max_cpu_u_diff, 0.0, "{case} CPU U drifted from 5c4e87d");
-        assert_eq!(max_cpu_p_diff, 0.0, "{case} CPU P drifted from 5c4e87d");
-        assert_eq!(max_gpu_u_diff, 0.0, "{case} GPU U drifted from 5c4e87d");
-        assert_eq!(max_gpu_p_diff, 0.0, "{case} GPU P drifted from 5c4e87d");
+        let is_metal_reference = gpu.backend_name.eq_ignore_ascii_case("Metal");
+        verify_golden_cpu_f64_slice(&format!("{case} CPU U"), &cpu_u.data, &ref_cpu_u)
+            .expect("CPU U golden snapshot check");
+        verify_golden_cpu_f64_slice(&format!("{case} CPU P"), &cpu_p.data, &ref_cpu_p)
+            .expect("CPU P golden snapshot check");
+        let (gu_abs, gu_ulp) = verify_golden_gpu_f32_slice(
+            &format!("{case} GPU U"),
+            &gpu_u.data,
+            &ref_gpu_u,
+            is_metal_reference,
+        )
+        .expect("GPU U golden snapshot check");
+        let (gp_abs, gp_ulp) = verify_golden_gpu_f32_slice(
+            &format!("{case} GPU P"),
+            &gpu_p.data,
+            &ref_gpu_p,
+            is_metal_reference,
+        )
+        .expect("GPU P golden snapshot check");
+        println!(
+            "[B16 golden {case} backend={}] CPU U/P=0.0 | GPU U max_abs={gu_abs:.3e} ({gu_ulp} ULP) | GPU P max_abs={gp_abs:.3e} ({gp_ulp} ULP)",
+            gpu.backend_name
+        );
     }
+}
+
+/// Compute the integer ULP distance between two finite `f32` values (treating `-0.0 == +0.0`).
+fn f32_ulp_distance(a: f32, b: f32) -> u32 {
+    if a == b {
+        return 0;
+    }
+    let to_ordered = |x: f32| -> u32 {
+        let bits = x.to_bits();
+        if (bits & 0x8000_0000) != 0 {
+            !bits
+        } else {
+            bits | 0x8000_0000
+        }
+    };
+    to_ordered(a).abs_diff(to_ordered(b))
+}
+
+/// Compare a computed `f64` matrix buffer against a golden `f64` snapshot: exact `0.0` (`0` ULP)
+/// and strict length equality before zipping (`21F:B16`).
+fn verify_golden_cpu_f64_slice(label: &str, got: &[f64], expected: &[f64]) -> Result<(), String> {
+    if got.len() != expected.len() {
+        return Err(format!(
+            "{label}: snapshot length mismatch (got {} vs expected {})",
+            got.len(),
+            expected.len()
+        ));
+    }
+    let max_diff = got
+        .iter()
+        .zip(expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    if max_diff != 0.0 {
+        return Err(format!(
+            "{label}: drifted from 5c4e87d (max abs diff = {max_diff:.3e})"
+        ));
+    }
+    Ok(())
+}
+
+/// Compare a computed GPU matrix buffer (`f64` cast to `f32`) against a golden `f32` snapshot
+/// captured on Apple Metal (`21F:B16`).
+/// - Always asserts exact slice length BEFORE zipping so truncated snapshots fail loudly.
+/// - On Apple Metal (`is_metal_reference == true`): requires exact `0.0` (`0` ULP).
+/// - On non-Metal adapters (e.g. Lavapipe/Vulkan/DX12 where `exp`/`log`/`sqrt` differ by 1-4 ULP):
+///   requires `max_ulp <= 4` AND `max_abs <= 1.0e-5`.
+fn verify_golden_gpu_f32_slice(
+    label: &str,
+    got: &[f64],
+    expected: &[f32],
+    is_metal_reference: bool,
+) -> Result<(f32, u32), String> {
+    if got.len() != expected.len() {
+        return Err(format!(
+            "{label}: snapshot length mismatch (got {} vs expected {})",
+            got.len(),
+            expected.len()
+        ));
+    }
+    let mut max_abs = 0.0_f32;
+    let mut max_ulp = 0_u32;
+    for (&a64, &b) in got.iter().zip(expected.iter()) {
+        let a = a64 as f32;
+        if !a.is_finite() || !b.is_finite() {
+            return Err(format!("{label}: non-finite entry (got={a}, expected={b})"));
+        }
+        max_abs = max_abs.max((a - b).abs());
+        max_ulp = max_ulp.max(f32_ulp_distance(a, b));
+    }
+    if is_metal_reference {
+        if max_abs != 0.0 || max_ulp != 0 {
+            return Err(format!(
+                "{label}: Metal GPU drifted from 5c4e87d (max_abs={max_abs:.3e}, max_ulp={max_ulp})"
+            ));
+        }
+    } else if max_ulp > 4 || max_abs > 1.0e-5 {
+        return Err(format!(
+            "{label}: non-Metal GPU exceeded portability gate (max_abs={max_abs:.3e}, max_ulp={max_ulp}, limits: ulp<=4 & abs<=1e-5)"
+        ));
+    }
+    Ok((max_abs, max_ulp))
+}
+
+#[test]
+fn test_b16_golden_snapshot_length_and_ulp_portability_gate() {
+    // 1. Truncated snapshots must fail loudly instead of silently passing via `.zip(...)`.
+    assert!(verify_golden_cpu_f64_slice("trunc_cpu", &[1.0, 2.0], &[1.0]).is_err());
+    assert!(verify_golden_gpu_f32_slice("trunc_gpu", &[1.0, 2.0], &[1.0_f32], true).is_err());
+    assert!(verify_golden_gpu_f32_slice("trunc_gpu", &[1.0], &[1.0_f32, 2.0_f32], false).is_err());
+
+    // 2. Non-Metal adapters (e.g. Lavapipe/Vulkan) tolerate <= 4 ULP and <= 1e-5 abs;
+    //    Apple Metal reference requires exact 0.0 (0 ULP); >= 5 ULP always fails.
+    let base = 1.0_f32;
+    let plus_2_ulp = f32::from_bits(base.to_bits() + 2);
+    let plus_5_ulp = f32::from_bits(base.to_bits() + 5);
+    assert!(verify_golden_gpu_f32_slice("metal_exact", &[base as f64], &[base], true).is_ok());
+    assert!(
+        verify_golden_gpu_f32_slice("metal_2ulp", &[plus_2_ulp as f64], &[base], true).is_err()
+    );
+    assert!(
+        verify_golden_gpu_f32_slice("lavapipe_2ulp", &[plus_2_ulp as f64], &[base], false).is_ok()
+    );
+    assert!(
+        verify_golden_gpu_f32_slice("lavapipe_5ulp", &[plus_5_ulp as f64], &[base], false).is_err()
+    );
 }
 
 #[test]

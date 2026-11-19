@@ -243,9 +243,10 @@ O ALA 1 1.5 2.4 0.0 82.0
     assert!(require_predicted_model(&cryo_forced, false).is_err());
 
     // 6. Unit-interval `[0, 1] -> [0, 100]` auto-rescaling with audit diagnostic
+    //    (requires a recognized AFDB/ColabFold header; bare `_ma_protocol_step` no longer qualifies!)
     let unit_b_cif = "\
-data_unit_af
-_ma_protocol_step.step_id 1
+data_AF-P00001-F1-model_v4
+_entry.id AF-P00001-F1-model_v4
 loop_
 _atom_site.label_atom_id
 _atom_site.label_comp_id
@@ -933,6 +934,79 @@ A 2 1 0.74
     )));
     assert!(m_qm.plddt_per_residue.is_none());
     assert!(require_predicted_model(&m_qm, false).is_err());
+
+    // `21F:B1` regression: real-shaped ModelArchive QMEANDisCo mmCIF carrying `_ma_protocol_step`,
+    // `_ma_data`, `_ma_model_list`, AND non-constant `_atom_site.B_iso_or_equiv` in `[0, 1]`
+    // (must fail closed and NOT rescale 0.924 -> pLDDT 92.4!). Fails at `f8408b9`.
+    let qmean_real_shaped_cif = "\
+data_MA-BAK-CEPC-0001
+_entry.id MA-BAK-CEPC-0001
+_ma_data.id 1
+_ma_data.name 'SWISS-MODEL entry'
+_ma_model_list.ordinal_id 1
+_ma_model_list.model_name 'SWISS-MODEL QMEANDisCo'
+loop_
+_ma_protocol_step.ordinal_id
+_ma_protocol_step.protocol_id
+_ma_protocol_step.step_id
+_ma_protocol_step.method_type
+1 1 1 'template search'
+2 1 2 'modeling'
+#
+loop_
+_ma_qa_metric.id
+_ma_qa_metric.name
+_ma_qa_metric.type
+_ma_qa_metric.mode
+1 QMEANDisCo other local
+#
+loop_
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_seq_id
+_atom_site.auth_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.B_iso_or_equiv
+N ALA A 1 1 0.0 0.0 0.0 0.924
+CA ALA A 1 1 1.46 0.0 0.0 0.924
+C ALA A 1 1 2.0 1.4 0.0 0.924
+N GLY A 2 2 3.2 1.2 0.0 0.781
+CA GLY A 2 2 4.5 1.8 0.0 0.781
+C GLY A 2 2 5.2 0.6 0.0 0.781
+#
+loop_
+_ma_qa_metric_local.label_asym_id
+_ma_qa_metric_local.label_seq_id
+_ma_qa_metric_local.metric_id
+_ma_qa_metric_local.metric_value
+A 1 1 0.924
+A 2 1 0.781
+#
+";
+    let m_qm_real = parse_af_structure_model_str(qmean_real_shaped_cif, &opts).unwrap();
+    assert_eq!(
+        m_qm_real.provenance,
+        CoordinateProvenance::Unknown,
+        "ModelArchive QMEANDisCo mmCIF must NOT be promoted to ComputationalModel"
+    );
+    assert_eq!(m_qm_real.plddt_source, PlddtSource::Unavailable);
+    assert!(
+        m_qm_real.plddt_per_residue.is_none(),
+        "QMEANDisCo B_iso_or_equiv must NOT be treated as pLDDT or rescaled x100"
+    );
+    assert!(
+        !m_qm_real
+            .diagnostics
+            .contains(&AfIngestDiagnostic::RescaledUnitPlddtTo100),
+        "must not emit RescaledUnitPlddtTo100 for QMEANDisCo"
+    );
+    assert!(
+        require_predicted_model(&m_qm_real, false).is_err(),
+        "require_predicted_model must reject real-shaped ModelArchive QMEANDisCo mmCIF"
+    );
 
     let mixed_qa_cif = "\
 data_MIXED_QA
