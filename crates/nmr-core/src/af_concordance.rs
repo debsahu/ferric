@@ -85,10 +85,11 @@ pub const MIN_CONCORDANCE_EVAL_RESIDUES: usize = 10;
 /// Coordinate provenance inferred from mmCIF / PDB metadata headers (`21.W1:P0-2`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CoordinateProvenance {
-    /// Computational structure prediction verified by positive ModelArchive / AFDB provenance
-    /// (`_ma_qa_metric_local` linked to a metric explicitly named `pLDDT`, or a verified
-    /// `_ma_protocol_step` / `_ma_model_list` / `AF-*` ModelArchive mmCIF block with valid
-    /// non-constant `[0, 100]` `B_iso_or_equiv`).
+    /// Computational structure prediction verified by [`PlddtProvenanceEvidence::verdict`]:
+    /// `_ma_qa_metric_local` rows of a local metric explicitly named `pLDDT`, or a recognized
+    /// predictor header (`data_AF-*` / `_entry.id AF-*` / AlphaFold-ColabFold-Boltz
+    /// `_software.name`) with no declared QA metric schema and valid non-constant `[0, 100]`
+    /// `B_iso_or_equiv`. Generic ModelArchive blocks never qualify (`21F:B1`).
     ComputationalModel,
     /// Experimental structure (`X-RAY DIFFRACTION`, `SOLUTION NMR`, `ELECTRON MICROSCOPY`, etc.,
     /// or non-trivial crystallographic `CRYST1` unit cell) whose isotropic $B$-factors represent
@@ -144,6 +145,270 @@ pub struct AfIngestOptions {
     /// Override the crystallographic / experimental $B$-factor guard and interpret `B_iso_or_equiv` /
     /// `tempFactor` as `pLDDT` even when `EXPDTA` / `_exptl.method` declares experimental coordinates.
     pub force_bfactor_plddt: bool,
+}
+
+// ---- Shared pLDDT provenance classifier (`21F:B1`, FIX3) ----
+
+/// One `_ma_qa_metric` declaration (`id`, `name`, `type`, `mode`) as written in the file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QaMetricDecl {
+    pub id: String,
+    pub name: String,
+    pub metric_type: String,
+    pub mode: String,
+}
+
+impl QaMetricDecl {
+    /// `name` or `type` explicitly names `pLDDT` (case-insensitive).
+    pub fn names_plddt(&self) -> bool {
+        self.name.to_ascii_lowercase().contains("plddt")
+            || self.metric_type.to_ascii_lowercase().contains("plddt")
+    }
+
+    /// Fail-closed global test: `global` anywhere in `mode`, `name` or `type` (so `'global'` in a
+    /// `type` column of a loop without a `mode` column is global, not local).
+    pub fn is_global(&self) -> bool {
+        [&self.mode, &self.name, &self.metric_type]
+            .iter()
+            .any(|s| s.to_ascii_lowercase().contains("global"))
+    }
+
+    /// A per-residue (`local`) `pLDDT` metric.
+    pub fn is_local_plddt(&self) -> bool {
+        self.names_plddt() && !self.is_global()
+    }
+}
+
+/// `true` for `_software.name` values naming a structure predictor whose `B_iso_or_equiv`
+/// column conventionally stores `pLDDT` (AlphaFold, ColabFold, Boltz).
+pub fn is_recognized_predictor_software(name: &str) -> bool {
+    let up = name.to_ascii_uppercase();
+    up.contains("ALPHAFOLD") || up.contains("COLABFOLD") || up.contains("BOLTZ")
+}
+
+/// `true` for AFDB-style identifiers (`data_AF-…` block code or `_entry.id AF-…`).
+pub fn is_afdb_entry_id(id: &str) -> bool {
+    id.trim()
+        .trim_matches(|c| c == '\'' || c == '"')
+        .to_ascii_uppercase()
+        .starts_with("AF-")
+}
+
+/// Metadata gathered from an mmCIF file by any parser, fed to the single shared `pLDDT`
+/// provenance rule ([`Self::verdict`]) used by `af_concordance`, `struct_shifts`,
+/// `af_assign_priors`, and the GUI `mol3d` viewer (`21F:B1`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlddtProvenanceEvidence {
+    /// `data_AF-*` / `_entry.id AF-*`, or `_software.name` naming AlphaFold / ColabFold / Boltz.
+    pub recognized_predictor_header: bool,
+    /// Every `_ma_qa_metric` declaration (loop rows and scalar form).
+    pub qa_metrics: Vec<QaMetricDecl>,
+    /// `metric_id` of each `_ma_qa_metric_local` row (`None` when the loop has no `metric_id`).
+    pub local_row_metric_ids: Vec<Option<String>>,
+}
+
+/// Outcome of the shared `pLDDT` provenance rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PlddtProvenanceVerdict {
+    /// A local `pLDDT` `_ma_qa_metric` with at least one matching `_ma_qa_metric_local` row: read
+    /// per-residue `pLDDT` from those rows only.
+    LocalPlddtRows,
+    /// Recognized predictor header and NO declared QA schema (no `_ma_qa_metric`, no
+    /// `_ma_qa_metric_local` rows): `B_iso_or_equiv` may be read as `pLDDT` (subject to the
+    /// per-gate range / non-constancy checks).
+    PredictorHeaderBfactor,
+    /// No positive `pLDDT` evidence: B-factors / QA values must NOT be read as `pLDDT`.
+    NotPlddt,
+}
+
+impl PlddtProvenanceEvidence {
+    /// Record a `_ma_qa_metric` declaration.
+    pub fn push_metric(&mut self, id: &str, name: &str, metric_type: &str, mode: &str) {
+        self.qa_metrics.push(QaMetricDecl {
+            id: id.trim().to_string(),
+            name: name.trim().to_string(),
+            metric_type: metric_type.trim().to_string(),
+            mode: mode.trim().to_string(),
+        });
+    }
+
+    /// Whether a `_ma_qa_metric_local` row with this `metric_id` carries local `pLDDT`. A row
+    /// without a `metric_id` column is attributed only when every declared non-global metric is a
+    /// local `pLDDT` metric (unambiguous); otherwise it fails closed.
+    pub fn local_row_is_plddt(&self, metric_id: Option<&str>) -> bool {
+        match metric_id.map(str::trim) {
+            Some(mid) => self
+                .qa_metrics
+                .iter()
+                .any(|m| m.id == mid && m.is_local_plddt()),
+            None => {
+                let mut locals = self.qa_metrics.iter().filter(|m| !m.is_global()).peekable();
+                locals.peek().is_some() && locals.all(QaMetricDecl::is_local_plddt)
+            }
+        }
+    }
+
+    /// Scan mmCIF text for the provenance metadata only (header ids, `_software.name`,
+    /// `_ma_qa_metric`, `_ma_qa_metric_local.metric_id`), using the same tokenizer as
+    /// [`parse_af_structure_model_str`]. Experimental-method detection is NOT done here.
+    pub fn from_mmcif_text(text: &str) -> Result<Self, String> {
+        let tokens = tokenize_mmcif(text)?;
+        let mut ev = Self::default();
+        let mut scalar: [Option<String>; 4] = [None, None, None, None]; // id, name, type, mode
+        let mut idx = 0usize;
+        while idx < tokens.len() {
+            let tok = &tokens[idx];
+            if !tok.quoted && tok.text.starts_with("data_") {
+                if is_afdb_entry_id(&tok.text[5..]) {
+                    ev.recognized_predictor_header = true;
+                }
+                idx += 1;
+                continue;
+            }
+            if !tok.quoted && tok.text.starts_with('_') {
+                if idx + 1 >= tokens.len() || is_cif_control_tok(&tokens[idx + 1]) {
+                    idx += 1;
+                    continue;
+                }
+                let key = tok.text.to_ascii_lowercase();
+                let val = tokens[idx + 1].text.trim();
+                match key.as_str() {
+                    "_entry.id" if is_afdb_entry_id(val) => ev.recognized_predictor_header = true,
+                    "_software.name" if is_recognized_predictor_software(val) => {
+                        ev.recognized_predictor_header = true;
+                    }
+                    "_ma_qa_metric.id" => scalar[0] = Some(val.to_string()),
+                    "_ma_qa_metric.name" => scalar[1] = Some(val.to_string()),
+                    "_ma_qa_metric.type" => scalar[2] = Some(val.to_string()),
+                    "_ma_qa_metric.mode" => scalar[3] = Some(val.to_string()),
+                    _ => {}
+                }
+                idx += 2;
+                continue;
+            }
+            if !tok.quoted && tok.text.eq_ignore_ascii_case("loop_") {
+                idx += 1;
+                let mut headers = Vec::new();
+                while idx < tokens.len() && !tokens[idx].quoted && tokens[idx].text.starts_with('_')
+                {
+                    headers.push(tokens[idx].text.to_ascii_lowercase());
+                    idx += 1;
+                }
+                let start = idx;
+                while idx < tokens.len() && !is_cif_control_tok(&tokens[idx]) {
+                    idx += 1;
+                }
+                let ncols = headers.len();
+                if ncols == 0 {
+                    continue;
+                }
+                let col = |name: &str| headers.iter().position(|h| h == name);
+                let rows = tokens[start..idx].chunks_exact(ncols);
+                if headers.iter().any(|h| h.starts_with("_ma_qa_metric.")) {
+                    let (ci, cn, ct, cm) = (
+                        col("_ma_qa_metric.id"),
+                        col("_ma_qa_metric.name"),
+                        col("_ma_qa_metric.type"),
+                        col("_ma_qa_metric.mode"),
+                    );
+                    for r in rows {
+                        let get = |c: Option<usize>| c.map(|c| r[c].text.as_str()).unwrap_or("");
+                        ev.push_metric(get(ci), get(cn), get(ct), get(cm));
+                    }
+                } else if headers
+                    .iter()
+                    .any(|h| h.starts_with("_ma_qa_metric_local."))
+                {
+                    let cmid = col("_ma_qa_metric_local.metric_id");
+                    for r in rows {
+                        ev.local_row_metric_ids
+                            .push(cmid.map(|c| r[c].text.trim().to_string()));
+                    }
+                } else if let Some(cn) = col("_software.name") {
+                    if rows
+                        .into_iter()
+                        .any(|r| is_recognized_predictor_software(&r[cn].text))
+                    {
+                        ev.recognized_predictor_header = true;
+                    }
+                }
+                continue;
+            }
+            idx += 1;
+        }
+        if scalar.iter().any(Option::is_some) {
+            let [id, nm, tp, md] = scalar.map(Option::unwrap_or_default);
+            ev.push_metric(&id, &nm, &tp, &md);
+        }
+        Ok(ev)
+    }
+
+    /// Number of `_ma_qa_metric_local` rows attributable to a local `pLDDT` metric.
+    pub fn local_plddt_row_count(&self) -> usize {
+        self.local_row_metric_ids
+            .iter()
+            .filter(|m| self.local_row_is_plddt(m.as_deref()))
+            .count()
+    }
+
+    /// The single shared rule (`21F:B1`). Experimental-method suppression is applied separately by
+    /// each gate (it overrides this verdict unless explicitly forced).
+    pub fn verdict(&self) -> PlddtProvenanceVerdict {
+        if self.local_plddt_row_count() > 0 {
+            PlddtProvenanceVerdict::LocalPlddtRows
+        } else if self.recognized_predictor_header
+            && self.qa_metrics.is_empty()
+            && self.local_row_metric_ids.is_empty()
+        {
+            PlddtProvenanceVerdict::PredictorHeaderBfactor
+        } else {
+            PlddtProvenanceVerdict::NotPlddt
+        }
+    }
+
+    /// Non-`pLDDT` / unverifiable QA metric labels present in the file (for diagnostics).
+    pub fn ignored_metric_labels(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |s: String| {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        };
+        for m in &self.qa_metrics {
+            if m.is_global() {
+                continue;
+            }
+            let has_rows = self
+                .local_row_metric_ids
+                .iter()
+                .any(|r| r.as_deref().map(str::trim) == Some(m.id.as_str()));
+            if !m.is_local_plddt() {
+                push(if m.name.is_empty() {
+                    format!("metric_id={}", m.id)
+                } else {
+                    m.name.clone()
+                });
+            } else if !has_rows {
+                push(format!(
+                    "{} (declared local pLDDT metric_id={} has no _ma_qa_metric_local rows)",
+                    m.name, m.id
+                ));
+            }
+        }
+        for r in &self.local_row_metric_ids {
+            let known = match r {
+                Some(mid) => self.qa_metrics.iter().any(|m| &m.id == mid),
+                None => !self.qa_metrics.is_empty(),
+            };
+            if !known {
+                push(match r {
+                    Some(mid) => format!("metric_id={mid} (undeclared)"),
+                    None => "unspecified_ma_qa_metric".to_string(),
+                });
+            }
+        }
+        out
+    }
 }
 
 /// Parsed polymer residue from an AlphaFold or experimental `.cif` / `.pdb` model.
@@ -294,8 +559,9 @@ impl AfStructureModel {
 
 /// Fail-closed provenance gate verifying that `model` has positive evidence of being a predicted
 /// structure model carrying valid per-residue `pLDDT` values (`_ma_qa_metric_local` linked to an
-/// explicit `pLDDT` metric in `_ma_qa_metric`, or a verified ModelArchive/AFDB `_ma_protocol_step` /
-/// `AF-*` mmCIF block with non-constant `[0, 100]` `B_iso_or_equiv`), OR that the caller explicitly
+/// explicit local `pLDDT` metric in `_ma_qa_metric`, or a recognized AFDB/AlphaFold/ColabFold/Boltz
+/// header with no declared QA metric schema and non-constant `[0, 100]` `B_iso_or_equiv`; see
+/// [`PlddtProvenanceEvidence::verdict`]), OR that the caller explicitly
 /// passed `treat_as_model == true` (`--treat-as-model` / `--force-bfactor-plddt`) with valid
 /// non-constant `pLDDT` values (`21.W1:P0-2`, `21.W1:P2-6`).
 pub fn require_predicted_model(
@@ -1075,12 +1341,11 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
     let mut detected_pdb_id: Option<String> = None;
     let mut detected_uniprot_id: Option<String> = None;
     let mut exptl_methods: Vec<String> = Vec::new();
-    let mut has_computational_marker = false;
 
-    // `_ma_qa_metric` definitions: metric_id -> (name_lower, mode_lower)
-    let mut ma_metric_defs: BTreeMap<String, (String, String)> = BTreeMap::new();
     // Raw `_ma_qa_metric_local` rows: (asym_id, label_seq_id, metric_id, value)
-    let mut ma_local_rows: Vec<(String, i32, String, f64)> = Vec::new();
+    let mut ma_local_rows: Vec<(String, i32, Option<String>, f64)> = Vec::new();
+    // Shared provenance evidence (`21F:B1`): decided by `PlddtProvenanceEvidence::verdict`.
+    let mut prov_ev = PlddtProvenanceEvidence::default();
 
     let mut raw_residues: Vec<RawPolymerRes> = Vec::new();
     let mut res_idx_map: BTreeMap<(String, i32), usize> = BTreeMap::new();
@@ -1091,9 +1356,8 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
         .filter(|s| !s.is_empty());
     let mut selected_model_num: Option<String> = None;
 
-    let mut scalar_ma_id: Option<String> = None;
-    let mut scalar_ma_name: Option<String> = None;
-    let mut scalar_ma_mode: Option<String> = None;
+    // Scalar `_ma_qa_metric` (id, name, type, mode).
+    let mut scalar_ma: [Option<String>; 4] = [None, None, None, None];
     let mut scalar_ref_db: Option<String> = None;
     let mut scalar_ref_acc: Option<String> = None;
 
@@ -1107,7 +1371,9 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
                     if detected_uniprot_id.is_none() {
                         detected_uniprot_id = Some(unp);
                     }
-                    has_computational_marker = true;
+                }
+                if is_afdb_entry_id(&d_id) {
+                    prov_ev.recognized_predictor_header = true;
                 }
                 entry_id = Some(d_id);
             }
@@ -1126,11 +1392,8 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
             // `_ma_model_list`) as pLDDT provenance (`21F:B1`): e.g. SWISS-MODEL/QMEANDisCo
             // ModelArchive entries carry those blocks while storing non-pLDDT scores in B_iso.
             // Recognize explicit AFDB/ColabFold software headers only.
-            if key_low.starts_with("_software.") && key_low.ends_with(".name") {
-                let up = val.to_ascii_uppercase();
-                if up.contains("ALPHAFOLD") || up.contains("COLABFOLD") || up.contains("BOLTZ") {
-                    has_computational_marker = true;
-                }
+            if key_low == "_software.name" && is_recognized_predictor_software(val) {
+                prov_ev.recognized_predictor_header = true;
             }
             match key_low.as_str() {
                 "_entry.id" if val != "." && val != "?" && !val.is_empty() => {
@@ -1142,19 +1405,18 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
                         if detected_uniprot_id.is_none() {
                             detected_uniprot_id = Some(unp);
                         }
-                        has_computational_marker = true;
+                    }
+                    if is_afdb_entry_id(val) {
+                        prov_ev.recognized_predictor_header = true;
                     }
                 }
                 "_exptl.method" if val != "." && val != "?" && !val.is_empty() => {
                     exptl_methods.push(val.to_string());
                 }
-                "_ma_qa_metric.id" => scalar_ma_id = Some(val.to_string()),
-                "_ma_qa_metric.name" | "_ma_qa_metric.type" => {
-                    if scalar_ma_name.is_none() || key_low == "_ma_qa_metric.name" {
-                        scalar_ma_name = Some(val.to_ascii_lowercase());
-                    }
-                }
-                "_ma_qa_metric.mode" => scalar_ma_mode = Some(val.to_ascii_lowercase()),
+                "_ma_qa_metric.id" => scalar_ma[0] = Some(val.to_string()),
+                "_ma_qa_metric.name" => scalar_ma[1] = Some(val.to_string()),
+                "_ma_qa_metric.type" => scalar_ma[2] = Some(val.to_string()),
+                "_ma_qa_metric.mode" => scalar_ma[3] = Some(val.to_string()),
                 "_struct_ref.db_name" => scalar_ref_db = Some(val.to_ascii_uppercase()),
                 "_struct_ref.pdbx_db_accession" if val != "." && val != "?" && !val.is_empty() => {
                     scalar_ref_acc = Some(val.to_ascii_uppercase());
@@ -1250,14 +1512,11 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
                 }
             } else if is_software {
                 if let Some(c_name) = find_col(&["_software.name"]) {
-                    for r in &rows {
-                        let up = r[c_name].text.trim().to_ascii_uppercase();
-                        if up.contains("ALPHAFOLD")
-                            || up.contains("COLABFOLD")
-                            || up.contains("BOLTZ")
-                        {
-                            has_computational_marker = true;
-                        }
+                    if rows
+                        .iter()
+                        .any(|r| is_recognized_predictor_software(&r[c_name].text))
+                    {
+                        prov_ev.recognized_predictor_header = true;
                     }
                 }
             } else if is_ma_metric {
@@ -1267,24 +1526,8 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
                 let c_type = find_col(&["_ma_qa_metric.type"]);
                 let c_mode = find_col(&["_ma_qa_metric.mode"]);
                 for r in &rows {
-                    let m_id = r[c_id].text.trim().to_string();
-                    let nm_part = c_name
-                        .map(|c| r[c].text.trim().to_ascii_lowercase())
-                        .unwrap_or_default();
-                    let tp_part = c_type
-                        .map(|c| r[c].text.trim().to_ascii_lowercase())
-                        .unwrap_or_default();
-                    let m_name = if nm_part.is_empty() {
-                        tp_part
-                    } else if tp_part.is_empty() || nm_part == tp_part {
-                        nm_part
-                    } else {
-                        format!("{nm_part}/{tp_part}")
-                    };
-                    let m_mode = c_mode
-                        .map(|c| r[c].text.trim().to_ascii_lowercase())
-                        .unwrap_or_default();
-                    ma_metric_defs.insert(m_id, (m_name, m_mode));
+                    let get = |c: Option<usize>| c.map(|c| r[c].text.as_str()).unwrap_or("");
+                    prov_ev.push_metric(&r[c_id].text, get(c_name), get(c_type), get(c_mode));
                 }
             } else if is_ma_local {
                 let c_asym = find_col(&[
@@ -1311,10 +1554,9 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
                     let seq_id: i32 = r[c_seq].text.trim().parse().map_err(|e| {
                         format!("{ctx}: invalid label_seq_id '{}': {e}", r[c_seq].text)
                     })?;
-                    let mid = c_mid
-                        .map(|c| r[c].text.trim().to_string())
-                        .unwrap_or_else(|| "1".to_string());
+                    let mid = c_mid.map(|c| r[c].text.trim().to_string());
                     let val = parse_req_finite_f64(&r[c_val].text, "metric_value", &ctx)?;
+                    prov_ev.local_row_metric_ids.push(mid.clone());
                     ma_local_rows.push((asym, seq_id, mid, val));
                 }
             } else if is_atom_site {
@@ -1448,14 +1690,9 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
         idx += 1;
     }
 
-    if let Some(id_s) = scalar_ma_id {
-        ma_metric_defs.insert(
-            id_s,
-            (
-                scalar_ma_name.unwrap_or_default(),
-                scalar_ma_mode.unwrap_or_default(),
-            ),
-        );
+    if scalar_ma.iter().any(Option::is_some) {
+        let [id, nm, tp, md] = scalar_ma.map(Option::unwrap_or_default);
+        prov_ev.push_metric(&id, &nm, &tp, &md);
     }
     if detected_uniprot_id.is_none()
         && scalar_ref_db.as_deref() == Some("UNP")
@@ -1464,75 +1701,30 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
         detected_uniprot_id = scalar_ref_acc;
     }
 
-    // Filter `_ma_qa_metric_local` rows strictly to verified `pLDDT` metric IDs (`21.W1:P2-6`)
-    let mut pre_diagnostics: Vec<AfIngestDiagnostic> = Vec::new();
-    let plddt_ids: Vec<String> = ma_metric_defs
-        .iter()
-        .filter(|(_, (nm, mode))| nm.contains("plddt") && !mode.contains("global"))
-        .map(|(k, _)| k.clone())
+    // Single shared pLDDT provenance rule (`21F:B1`, `21.W1:P2-6`): local pLDDT rows, or a
+    // recognized predictor header with NO declared QA schema. A declared pLDDT metric without
+    // matching `_ma_qa_metric_local` rows (or with only QMEANDisCo rows) fails closed.
+    let mut pre_diagnostics: Vec<AfIngestDiagnostic> = prov_ev
+        .ignored_metric_labels()
+        .into_iter()
+        .map(|metric_name| AfIngestDiagnostic::NonPlddtQaMetricIgnored { metric_name })
         .collect();
-    if !plddt_ids.is_empty() {
-        has_computational_marker = true;
-    } else if !ma_metric_defs.is_empty() {
-        // File explicitly declared `_ma_qa_metric` entries (e.g. QMEANDisCo) with NO local pLDDT:
-        // never fall back to interpreting B-factors as pLDDT (`21F:B1`).
-        has_computational_marker = false;
-    }
-
-    let (ma_local_plddt, ma_local_by_seq) = if !ma_local_rows.is_empty() {
-        if plddt_ids.is_empty() {
-            if ma_metric_defs.is_empty() {
-                pre_diagnostics.push(AfIngestDiagnostic::NonPlddtQaMetricIgnored {
-                    metric_name: "unspecified_ma_qa_metric".to_string(),
-                });
-            } else {
-                for (nm, mode) in ma_metric_defs.values() {
-                    if !mode.contains("global") {
-                        pre_diagnostics.push(AfIngestDiagnostic::NonPlddtQaMetricIgnored {
-                            metric_name: if nm.is_empty() {
-                                "unnamed_ma_qa_metric".to_string()
-                            } else {
-                                nm.clone()
-                            },
-                        });
-                    }
-                }
-            }
-            (None, None)
-        } else {
-            let mut by_chain_seq: BTreeMap<(String, i32), f64> = BTreeMap::new();
-            let mut by_seq: BTreeMap<i32, f64> = BTreeMap::new();
-            let mut ignored_mids: Vec<String> = Vec::new();
-            for (asym, seq_id, mid, val) in ma_local_rows {
-                if plddt_ids.iter().any(|want| want == &mid) {
-                    by_chain_seq.entry((asym, seq_id)).or_insert(val);
-                    by_seq.entry(seq_id).or_insert(val);
-                } else if !ignored_mids.contains(&mid) {
-                    ignored_mids.push(mid.clone());
-                    let m_label = ma_metric_defs
-                        .get(&mid)
-                        .map(|(nm, _)| {
-                            if nm.is_empty() {
-                                format!("metric_id={mid}")
-                            } else {
-                                nm.clone()
-                            }
-                        })
-                        .unwrap_or_else(|| format!("metric_id={mid}"));
-                    pre_diagnostics.push(AfIngestDiagnostic::NonPlddtQaMetricIgnored {
-                        metric_name: m_label,
-                    });
-                }
-            }
-            if by_chain_seq.is_empty() {
-                (None, None)
-            } else {
-                (Some(by_chain_seq), Some(by_seq))
+    let verdict = prov_ev.verdict();
+    let has_computational_marker = verdict != PlddtProvenanceVerdict::NotPlddt;
+    let (ma_local_plddt, ma_local_by_seq) = if verdict == PlddtProvenanceVerdict::LocalPlddtRows {
+        let mut by_chain_seq: BTreeMap<(String, i32), f64> = BTreeMap::new();
+        let mut by_seq: BTreeMap<i32, f64> = BTreeMap::new();
+        for (asym, seq_id, mid, val) in ma_local_rows {
+            if prov_ev.local_row_is_plddt(mid.as_deref()) {
+                by_chain_seq.entry((asym, seq_id)).or_insert(val);
+                by_seq.entry(seq_id).or_insert(val);
             }
         }
+        (Some(by_chain_seq), Some(by_seq))
     } else {
         (None, None)
     };
+    pre_diagnostics.dedup();
 
     let exptl_joined = if exptl_methods.is_empty() {
         None

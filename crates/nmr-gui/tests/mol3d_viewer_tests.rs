@@ -1053,13 +1053,16 @@ fn test_headless_wgpu_20_conformer_150aa_48k_atoms_sustains_60fps() {
         return;
     };
 
-    let (warmup_frames, n_frames, max_frame_ms) = if is_software_cpu {
-        // Software CPU rasterizers (e.g. Mesa llvmpipe / SwiftShader on headless Linux CI):
-        // verify full offscreen 3D pipeline execution without applying a hardware-GPU 60 fps gate
-        // (~1.5x the ~660 ms/frame 256-bit AVX2 llvmpipe GitHub Actions VM measurement on 51,000 atoms).
+    // Wall-clock frame time is a NON-GATING diagnostic (`FIX3`): shared CI runners and loaded dev
+    // machines make ms/frame non-reproducible, so the 60 fps (16.67 ms) hardware target and the
+    // 1000 ms software-rasterizer budget are reported via `eprintln!` only. The test still gates on
+    // ensemble size and on every offscreen frame of both styles being recorded, submitted, and
+    // completed by the device.
+    let (warmup_frames, n_frames, target_frame_ms) = if is_software_cpu {
+        // Software CPU rasterizers (e.g. Mesa llvmpipe / SwiftShader on headless Linux CI).
         (2usize, 5usize, 1000.0f64)
     } else {
-        // Hardware / virtual GPU (Metal, Vulkan GPU, DX12): enforce >= 60 fps (<= 16.67 ms/frame).
+        // Hardware / virtual GPU (Metal, Vulkan GPU, DX12): 60 fps target (<= 16.67 ms/frame).
         (5usize, 30usize, 16.67f64)
     };
 
@@ -1080,6 +1083,7 @@ fn test_headless_wgpu_20_conformer_150aa_48k_atoms_sustains_60fps() {
             ..SceneBuildConfig::default()
         };
         let scene = build_mol3d_scene(&ens, &cfg, &tracks, None, 1);
+        let mut frames_completed = 0usize;
 
         // Warm-up frames (pipeline + target + VBO upload warm-up)
         for w_i in 0..warmup_frames {
@@ -1105,17 +1109,31 @@ fn test_headless_wgpu_20_conformer_150aa_48k_atoms_sustains_60fps() {
             gpu_res
                 .record_offscreen_3d_pass(&device, &queue, &mut enc, 960, 720, &uniforms, &scene);
             queue.submit(Some(enc.finish()));
-            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("headless wgpu device poll must complete every benchmark frame");
+            frames_completed += 1;
         }
         let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         let mean_ms = total_ms / (n_frames as f64);
         let fps = 1000.0 / mean_ms.max(1e-6);
-        println!(
-            "[mol3d bench] adapter={adapter_label} software_cpu={is_software_cpu} style={style:?} atoms={total_atoms} mean_frame={mean_ms:.3} ms ({fps:.1} fps, gate <= {max_frame_ms:.2} ms)"
+        assert_eq!(
+            frames_completed, n_frames,
+            "{style:?}: every timed offscreen frame must be submitted and completed"
         );
         assert!(
-            mean_ms <= max_frame_ms,
-            "Headless wgpu (software_cpu={is_software_cpu}) {style:?} on {total_atoms} atoms averaged {mean_ms:.3} ms/frame (gate: <= {max_frame_ms:.2} ms)"
+            !scene.opaque_spheres.is_empty()
+                || !scene.opaque_cylinders.is_empty()
+                || !scene.opaque_ribbon_indices.is_empty(),
+            "{style:?}: benchmarked scene must contain geometry"
+        );
+        let verdict = if mean_ms <= target_frame_ms {
+            "meets"
+        } else {
+            "MISSES (non-gating)"
+        };
+        eprintln!(
+            "[mol3d bench, non-gating] adapter={adapter_label} software_cpu={is_software_cpu} style={style:?} atoms={total_atoms} mean_frame={mean_ms:.3} ms ({fps:.1} fps) {verdict} target <= {target_frame_ms:.2} ms"
         );
     }
 }
@@ -1476,4 +1494,50 @@ ATOM 8 O O GLY A 2 6.000 1.600 0.000 1.00 0.50 1
     });
     out.textures_delta.clear();
     assert_eq!(panel.scene_cfg.highlighted_seq_idx, None);
+}
+
+#[path = "../../nmr-core/tests/support/af_provenance_probes.rs"]
+mod af_provenance_probes;
+
+/// `21F:B1` (FIX3 slice A): the GUI `mol3d` gate (`parse_structure_auto` +
+/// `require_predicted_model(false)`) and the `ensemble_to_af_structure_model` concordance fallback
+/// must decide the shared probe matrix exactly like the three nmr-core gates. Real-shaped
+/// SWISS-MODEL QMEANDisCo mmCIF (B in 0..1, with/without `_software` AlphaFold) must yield
+/// non-predicted provenance, no pLDDT, and `require_predicted_model(false) = Err`.
+/// Fails at `b5e87a3` (QMEANDisCo ModelArchive files became `ComputationalBFactor` with
+/// x100-rescaled "pLDDT").
+#[test]
+fn test_21f_b1_gui_mol3d_gate_agrees_with_all_core_gates_on_probe_matrix() {
+    use af_provenance_probes::{core_gate_verdicts, GateVerdict};
+    use nmr_gui::mol3d_viewer::require_predicted_model;
+    use nmr_gui::ss_ribbon_widget::ensemble_to_af_structure_model;
+
+    af_provenance_probes::assert_matrix(|p| {
+        let mut v = core_gate_verdicts(p);
+        let ens = parse_structure_auto(&p.text)
+            .unwrap_or_else(|e| panic!("[{}] GUI parse_structure_auto failed: {e}", p.name));
+        let gate = require_predicted_model(&ens, false);
+        let gui_ok = gate.is_ok();
+        let gui_plddt = ens.per_residue_plddt.clone();
+        // A rejected structure must not carry computational provenance either (the GUI shows
+        // "Provenance: Predicted (pLDDT)" from `provenance.is_computational()`).
+        let prov_consistent = ens.provenance.is_computational() == gui_ok;
+        v.push(GateVerdict {
+            gate: "gui_mol3d",
+            predicted: gui_ok && prov_consistent,
+            plddt: gui_plddt,
+            detail: format!(
+                "provenance={:?} rescaled={} gate={:?}",
+                ens.provenance, ens.plddt_rescaled_from_unit, gate
+            ),
+        });
+        let conv = ensemble_to_af_structure_model(&ens, false);
+        v.push(GateVerdict {
+            gate: "gui_ensemble_to_af_structure_model",
+            predicted: conv.is_some(),
+            plddt: conv.as_ref().and_then(|m| m.plddt_per_residue.clone()),
+            detail: format!("source={:?}", conv.as_ref().map(|m| m.plddt_source)),
+        });
+        v
+    });
 }

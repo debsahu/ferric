@@ -18,6 +18,10 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use eframe::{egui, egui_wgpu, wgpu};
+use nmr_core::af_concordance::{
+    is_afdb_entry_id, is_recognized_predictor_software, PlddtProvenanceEvidence,
+    PlddtProvenanceVerdict,
+};
 use nmr_core::nmrstar::Reference;
 use nmr_core::priors::Priors;
 use wgpu::util::DeviceExt;
@@ -669,30 +673,24 @@ struct SsSpan {
 }
 
 #[derive(Clone, Debug)]
-struct QaMetricDef {
-    name: String,
-    mode: String,
-    metric_type: String,
-}
-
-#[derive(Clone, Debug)]
 struct QaLocalMetricRow {
     model_id: usize,
     chain_id: char,
     seq_id: i32,
-    metric_id: String,
+    /// `None` when the `_ma_qa_metric_local` loop has no `metric_id` column.
+    metric_id: Option<String>,
     value: f64,
 }
 
 #[derive(Clone, Debug, Default)]
 struct PlddtIngestHints {
-    qa_defs: HashMap<String, QaMetricDef>,
+    /// Shared nmr-core `pLDDT` provenance evidence (`21F:B1`): the GUI applies exactly the
+    /// [`PlddtProvenanceEvidence::verdict`] rule used by `af_concordance`, `struct_shifts`, and
+    /// `af_assign_priors`.
+    prov_ev: PlddtProvenanceEvidence,
     qa_local_rows: Vec<QaLocalMetricRow>,
-    saw_qa_local_loop: bool,
     is_experimental_method: bool,
     is_computational_hint: bool,
-    has_ma_protocol_or_model_list: bool,
-    has_af_data_header: bool,
     force_bfactor_plddt: bool,
 }
 
@@ -1147,8 +1145,8 @@ pub fn parse_mmcif_ensemble_with_options(
         let tok = &tokens[idx];
         if !tok.is_quoted && title.is_empty() && tok.text.starts_with("data_") {
             title = tok.text.chars().skip(5).collect();
-            if title.starts_with("AF-") || title.starts_with("AF_") {
-                hints.has_af_data_header = true;
+            if is_afdb_entry_id(&title) {
+                hints.prov_ev.recognized_predictor_header = true;
                 hints.is_computational_hint = true;
             }
             idx += 1;
@@ -1175,8 +1173,10 @@ pub fn parse_mmcif_ensemble_with_options(
                 idx += 2;
                 continue;
             }
-            if tag_low.starts_with("_ma_protocol_step.") || tag_low.starts_with("_ma_model_list.") {
-                hints.has_ma_protocol_or_model_list = true;
+            // Generic ModelArchive blocks (`_ma_protocol_step`, `_ma_model_list`, `_ma_data`) are
+            // NOT pLDDT provenance (`21F:B1`): SWISS-MODEL QMEANDisCo entries carry them too.
+            if tag_low == "_entry.id" && is_afdb_entry_id(&tokens[idx + 1].text) {
+                hints.prov_ev.recognized_predictor_header = true;
                 hints.is_computational_hint = true;
                 idx += 2;
                 continue;
@@ -1184,6 +1184,9 @@ pub fn parse_mmcif_ensemble_with_options(
             if tag_low == "_software.name" {
                 if text_declares_computational_model(&tokens[idx + 1].text) {
                     hints.is_computational_hint = true;
+                }
+                if is_recognized_predictor_software(&tokens[idx + 1].text) {
+                    hints.prov_ev.recognized_predictor_header = true;
                 }
                 idx += 2;
                 continue;
@@ -1220,13 +1223,6 @@ pub fn parse_mmcif_ensemble_with_options(
             let ncols = headers.len();
             if ncols == 0 {
                 continue;
-            }
-            if headers
-                .iter()
-                .any(|h| h.starts_with("_ma_protocol_step.") || h.starts_with("_ma_model_list."))
-            {
-                hints.has_ma_protocol_or_model_list = true;
-                hints.is_computational_hint = true;
             }
 
             let col_of = |names: &[&str]| -> Option<usize> {
@@ -1272,27 +1268,22 @@ pub fn parse_mmcif_ensemble_with_options(
                     let c_name = col_of(&["_ma_qa_metric.name"]);
                     let c_mode = col_of(&["_ma_qa_metric.mode"]);
                     let c_type = col_of(&["_ma_qa_metric.type"]);
-                    if let Some(ci) = c_id {
-                        for row in loop_vals.chunks_exact(ncols) {
-                            let id_s = row[ci].text.trim().to_string();
-                            hints.qa_defs.insert(
-                                id_s,
-                                QaMetricDef {
-                                    name: c_name
-                                        .map(|c| row[c].text.trim().to_string())
-                                        .unwrap_or_default(),
-                                    mode: c_mode
-                                        .map(|c| row[c].text.trim().to_string())
-                                        .unwrap_or_default(),
-                                    metric_type: c_type
-                                        .map(|c| row[c].text.trim().to_string())
-                                        .unwrap_or_default(),
-                                },
-                            );
+                    for row in loop_vals.chunks_exact(ncols) {
+                        let get = |c: Option<usize>| c.map(|c| row[c].text.as_str()).unwrap_or("");
+                        hints
+                            .prov_ev
+                            .push_metric(get(c_id), get(c_name), get(c_type), get(c_mode));
+                    }
+                } else if let Some(cn) = col_of(&["_software.name"]) {
+                    for row in loop_vals.chunks_exact(ncols) {
+                        if text_declares_computational_model(&row[cn].text) {
+                            hints.is_computational_hint = true;
+                        }
+                        if is_recognized_predictor_software(&row[cn].text) {
+                            hints.prov_ev.recognized_predictor_header = true;
                         }
                     }
                 } else if is_qa_local {
-                    hints.saw_qa_local_loop = true;
                     hints.is_computational_hint = true;
                     let c_asym = col_of(&[
                         "_ma_qa_metric_local.label_asym_id",
@@ -1323,9 +1314,8 @@ pub fn parse_mmcif_ensemble_with_options(
                                 row[c_seq].text.trim()
                             )
                         })?;
-                        let metric_id = c_mid
-                            .map(|c| row[c].text.trim().to_string())
-                            .unwrap_or_else(|| "1".to_string());
+                        let metric_id = c_mid.map(|c| row[c].text.trim().to_string());
+                        hints.prov_ev.local_row_metric_ids.push(metric_id.clone());
                         let value = parse_finite_f64_token(&row[c_val].text, "metric_value", &ctx)?;
                         let model_id = c_mod
                             .and_then(|c| row[c].text.trim().parse::<usize>().ok())
@@ -1473,12 +1463,17 @@ pub fn parse_mmcif_ensemble_with_options(
         idx += 1;
     }
 
-    if !single_qa_id.is_empty() {
-        hints.qa_defs.entry(single_qa_id).or_insert(QaMetricDef {
-            name: single_qa_name,
-            mode: single_qa_mode,
-            metric_type: single_qa_type,
-        });
+    if !(single_qa_id.is_empty()
+        && single_qa_name.is_empty()
+        && single_qa_mode.is_empty()
+        && single_qa_type.is_empty())
+    {
+        hints.prov_ev.push_metric(
+            &single_qa_id,
+            &single_qa_name,
+            &single_qa_type,
+            &single_qa_mode,
+        );
     }
 
     if raw_atoms.is_empty() {
@@ -1504,30 +1499,16 @@ fn extract_ensemble_plddt(
     }
     let first_model_num = models.first().map(|m| m.model_number).unwrap_or(1);
 
-    // 1. Primary path: ModelArchive `_ma_qa_metric_local` cross-referenced with `_ma_qa_metric`
-    if !hints.qa_local_rows.is_empty() {
-        let is_plddt_metric_id = |mid: &str| -> bool {
-            if hints.qa_defs.is_empty() {
-                // Only when `_ma_qa_metric` is completely absent, allow if positive AF/MA provenance
-                // exists or fail closed when no metric metadata exists. Wait: AF/MA files always
-                // define `_ma_qa_metric`; if absent, allow only when positive MA/AF header exists.
-                return hints.has_ma_protocol_or_model_list || hints.has_af_data_header;
-            }
-            if let Some(def) = hints.qa_defs.get(mid) {
-                let nm = def.name.to_ascii_lowercase();
-                let tp = def.metric_type.to_ascii_lowercase();
-                let _md = def.mode.to_ascii_lowercase();
-                // Strict fail-closed: only accept metric IDs whose name or type explicitly contains "plddt"
-                // (e.g. reject QMEANDisCo even when it is the sole local metric!).
-                nm.contains("plddt") || tp.contains("plddt")
-            } else {
-                false
-            }
-        };
+    // Single shared nmr-core rule (`21F:B1`): identical to `af_concordance`, `struct_shifts`, and
+    // `af_assign_priors` (local pLDDT rows, or a recognized predictor header with NO declared QA
+    // schema). Generic ModelArchive blocks never qualify.
+    let verdict = hints.prov_ev.verdict();
 
+    // 1. Primary path: `_ma_qa_metric_local` rows of a verified local (non-global) pLDDT metric.
+    if verdict == PlddtProvenanceVerdict::LocalPlddtRows {
         let mut by_chain_seq: HashMap<(char, i32), f64> = HashMap::new();
         for row in &hints.qa_local_rows {
-            if !is_plddt_metric_id(&row.metric_id) {
+            if !hints.prov_ev.local_row_is_plddt(row.metric_id.as_deref()) {
                 continue;
             }
             if row.model_id == first_model_num
@@ -1570,10 +1551,11 @@ fn extract_ensemble_plddt(
     }
 
     // 3. Computational `B_iso_or_equiv` / `tempFactor` fallback (`CA` or mean backbone heavy-atom)
-    //    Fail-closed (`21.W1:P0-2`): ONLY accept B-factors as pLDDT when `force_bfactor_plddt` is
-    //    true OR positive ModelArchive/AFDB mmCIF provenance (`has_ma_protocol_or_model_list` or
-    //    `data_AF-` block header) is present, AND values lie in `[0.0, 100.0]` with non-zero
-    //    variance (`max_b - min_b > 1e-3`, rejecting constant `0.0` or `0.50`).
+    //    Fail-closed (`21.W1:P0-2`, `21F:B1`): ONLY accept B-factors as pLDDT when
+    //    `force_bfactor_plddt` is true OR the shared verdict is `PredictorHeaderBfactor`
+    //    (`data_AF-*` / `_entry.id AF-*` / AlphaFold-ColabFold-Boltz `_software.name` with no
+    //    declared QA metric schema), AND values lie in `[0.0, 100.0]` with non-zero variance
+    //    (`max_b - min_b > 1e-3`, rejecting constant `0.0` or `0.50`).
     let mut b_vals = Vec::with_capacity(n_res);
     let mut min_b = f64::INFINITY;
     let mut max_b = f64::NEG_INFINITY;
@@ -1608,7 +1590,7 @@ fn extract_ensemble_plddt(
         b_vals.push(bv);
     }
 
-    let positive_provenance = hints.has_ma_protocol_or_model_list || hints.has_af_data_header;
+    let positive_provenance = verdict == PlddtProvenanceVerdict::PredictorHeaderBfactor;
     let has_nonzero_variance = min_b.is_finite() && max_b.is_finite() && (max_b - min_b) > 1e-3;
 
     if all_in_0_100

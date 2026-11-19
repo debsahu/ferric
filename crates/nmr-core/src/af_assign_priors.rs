@@ -177,12 +177,16 @@ fn is_experimental_method_token(s: &str) -> bool {
 ///
 /// Local fail-closed stand-in matching `S2`'s `require_predicted_model()` contract: returns `true`
 /// ONLY for non-experimental mmCIF text carrying either:
-/// 1. a `_ma_qa_metric` entry whose `name` is explicitly `pLDDT` (case-insensitive, non-global;
-///    rejecting `QMEANDisCo` and other non-`pLDDT` metrics) paired with matching
-///    `_ma_qa_metric_local` rows (or non-constant finite `_atom_site.B_iso_or_equiv` in `[0, 100]`), or
+/// 1. a local `_ma_qa_metric` whose `name`/`type` is explicitly `pLDDT` (case-insensitive; no
+///    `global` in mode/name/type; rejecting `QMEANDisCo` and other non-`pLDDT` metrics) with at
+///    least one matching `_ma_qa_metric_local` row — a declared pLDDT metric WITHOUT such rows
+///    fails closed (`21F:B1`), or
 /// 2. a recognized AFDB/ColabFold header (`data_AF-*`, `_entry.id AF-*`, or `_software.name`
 ///    naming `AlphaFold`/`ColabFold`/`Boltz`) with non-constant finite `_atom_site.B_iso_or_equiv`
-///    values in `[0, 100]` and no conflicting non-`pLDDT` `_ma_qa_metric` declaration.
+///    values in `[0, 100]` and NO declared `_ma_qa_metric` / `_ma_qa_metric_local` QA schema.
+///
+/// The metadata rule is [`crate::af_concordance::PlddtProvenanceEvidence::verdict`], shared by
+/// every gate.
 ///
 /// Generic ModelArchive blocks (`_ma_protocol_step`, `_ma_data`, `_ma_model_list`), headerless
 /// PDBs, `EXPDTA`/`_exptl` experimental files (`1D3Z`, `1UBQ`), `CRYST1` unit cells,
@@ -221,12 +225,6 @@ fn classify_predicted_model_evidence(text: &str) -> Option<&'static str> {
     }
 
     let mut has_mmcif_data = false;
-    let mut has_recognized_af_header = false;
-    let mut saw_ma_qa_metric = false;
-    let mut plddt_metric_ids: Vec<String> = Vec::new();
-    let mut has_kv_plddt_metric = false;
-    let mut kv_ma_mode_global = false;
-    let mut has_matching_local_plddt = false;
     let mut b_min = f64::INFINITY;
     let mut b_max = f64::NEG_INFINITY;
     let mut b_count = 0usize;
@@ -235,40 +233,8 @@ fn classify_predicted_model_evidence(text: &str) -> Option<&'static str> {
     let mut i = 0usize;
     while i < lines.len() {
         let line = lines[i];
-        if let Some(rest) = line.strip_prefix("data_") {
+        if line.starts_with("data_") {
             has_mmcif_data = true;
-            if rest.trim().to_ascii_uppercase().starts_with("AF-") {
-                has_recognized_af_header = true;
-            }
-        }
-        if let Some(rest) = line.strip_prefix("_entry.id") {
-            let val = rest.trim().trim_matches(|c| c == '\'' || c == '"');
-            if val.to_ascii_uppercase().starts_with("AF-") {
-                has_recognized_af_header = true;
-            }
-        }
-        if let Some(rest) = line.strip_prefix("_software.name") {
-            let up = rest
-                .trim()
-                .trim_matches(|c| c == '\'' || c == '"')
-                .to_ascii_uppercase();
-            if up.contains("ALPHAFOLD") || up.contains("COLABFOLD") || up.contains("BOLTZ") {
-                has_recognized_af_header = true;
-            }
-        }
-        if let Some(rest) = line.strip_prefix("_ma_qa_metric.name") {
-            saw_ma_qa_metric = true;
-            let val = rest.trim().trim_matches(|c| c == '\'' || c == '"');
-            if val.to_ascii_lowercase().contains("plddt") {
-                has_kv_plddt_metric = true;
-            }
-        }
-        if let Some(rest) = line.strip_prefix("_ma_qa_metric.mode") {
-            saw_ma_qa_metric = true;
-            let val = rest.trim().trim_matches(|c| c == '\'' || c == '"');
-            if val.to_ascii_lowercase().contains("global") {
-                kv_ma_mode_global = true;
-            }
         }
 
         if line.eq_ignore_ascii_case("loop_") {
@@ -282,139 +248,22 @@ fn classify_predicted_model_evidence(text: &str) -> Option<&'static str> {
                 .first()
                 .map(|s| s.to_ascii_lowercase())
                 .unwrap_or_default();
+            let is_row = |row: &str| {
+                !(row.is_empty()
+                    || row.starts_with('#')
+                    || row.starts_with('_')
+                    || row.eq_ignore_ascii_case("loop_")
+                    || row.eq_ignore_ascii_case("stop_"))
+            };
             if first_low.starts_with("_exptl.") {
                 let m_col = cols
                     .iter()
                     .position(|c| c.eq_ignore_ascii_case("_exptl.method"));
-                while j < lines.len() {
-                    let row = lines[j];
-                    if row.is_empty()
-                        || row.starts_with('#')
-                        || row.starts_with('_')
-                        || row.eq_ignore_ascii_case("loop_")
-                        || row.eq_ignore_ascii_case("stop_")
-                    {
-                        break;
-                    }
-                    if m_col.is_some() && is_experimental_method_token(row) {
+                while j < lines.len() && is_row(lines[j]) {
+                    if m_col.is_some() && is_experimental_method_token(lines[j]) {
                         return None;
                     }
                     j += 1;
-                }
-                i = j;
-                continue;
-            } else if first_low.starts_with("_software.") {
-                let n_col = cols
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case("_software.name"));
-                while j < lines.len() {
-                    let row = lines[j];
-                    if row.is_empty()
-                        || row.starts_with('#')
-                        || row.starts_with('_')
-                        || row.eq_ignore_ascii_case("loop_")
-                        || row.eq_ignore_ascii_case("stop_")
-                    {
-                        break;
-                    }
-                    let toks = split_cif_row_tokens(row);
-                    if toks.len() == cols.len() {
-                        if let Some(nm) = n_col.and_then(|c| toks.get(c)) {
-                            let up = nm.to_ascii_uppercase();
-                            if up.contains("ALPHAFOLD")
-                                || up.contains("COLABFOLD")
-                                || up.contains("BOLTZ")
-                            {
-                                has_recognized_af_header = true;
-                            }
-                        }
-                    }
-                    j += 1;
-                }
-                i = j;
-                continue;
-            } else if first_low.starts_with("_ma_qa_metric.") {
-                saw_ma_qa_metric = true;
-                let id_col = cols
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case("_ma_qa_metric.id"));
-                let name_col = cols
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case("_ma_qa_metric.name"));
-                let mode_col = cols
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case("_ma_qa_metric.mode"));
-                while j < lines.len() {
-                    let row = lines[j];
-                    if row.is_empty()
-                        || row.starts_with('#')
-                        || row.starts_with('_')
-                        || row.eq_ignore_ascii_case("loop_")
-                        || row.eq_ignore_ascii_case("stop_")
-                    {
-                        break;
-                    }
-                    let toks = split_cif_row_tokens(row);
-                    if toks.len() == cols.len() {
-                        let name_ok = name_col
-                            .and_then(|c| toks.get(c))
-                            .is_some_and(|t| t.to_ascii_lowercase().contains("plddt"));
-                        let mode_ok = mode_col
-                            .and_then(|c| toks.get(c))
-                            .is_none_or(|t| !t.to_ascii_lowercase().contains("global"));
-                        if name_ok && mode_ok {
-                            if let Some(ic) = id_col.and_then(|c| toks.get(c)) {
-                                plddt_metric_ids.push((*ic).to_string());
-                            } else {
-                                has_kv_plddt_metric = true;
-                            }
-                        }
-                    }
-                    j += 1;
-                }
-                i = j;
-                continue;
-            } else if first_low.starts_with("_ma_qa_metric_local.") {
-                let mid_col = cols
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case("_ma_qa_metric_local.metric_id"));
-                let val_col = cols
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case("_ma_qa_metric_local.metric_value"));
-                if val_col.is_some() {
-                    while j < lines.len() {
-                        let row = lines[j];
-                        if row.is_empty()
-                            || row.starts_with('#')
-                            || row.starts_with('_')
-                            || row.eq_ignore_ascii_case("loop_")
-                            || row.eq_ignore_ascii_case("stop_")
-                        {
-                            break;
-                        }
-                        let toks = split_cif_row_tokens(row);
-                        if toks.len() == cols.len() {
-                            let kv_local_plddt = has_kv_plddt_metric && !kv_ma_mode_global;
-                            let id_matches = match mid_col {
-                                Some(mc) => {
-                                    (!plddt_metric_ids.is_empty()
-                                        && toks.get(mc).is_some_and(|id| {
-                                            plddt_metric_ids.iter().any(|p| p == id)
-                                        }))
-                                        || (plddt_metric_ids.is_empty() && kv_local_plddt)
-                                }
-                                None => kv_local_plddt || !plddt_metric_ids.is_empty(),
-                            };
-                            let val_ok = val_col
-                                .and_then(|vc| toks.get(vc))
-                                .and_then(|s| s.parse::<f64>().ok())
-                                .is_some_and(|v| v.is_finite() && (0.0..=100.001).contains(&v));
-                            if id_matches && val_ok {
-                                has_matching_local_plddt = true;
-                            }
-                        }
-                        j += 1;
-                    }
                 }
                 i = j;
                 continue;
@@ -423,27 +272,16 @@ fn classify_predicted_model_evidence(text: &str) -> Option<&'static str> {
                     .iter()
                     .position(|c| c.eq_ignore_ascii_case("_atom_site.B_iso_or_equiv"));
                 if let Some(bc) = b_col {
-                    while j < lines.len() {
-                        let row = lines[j];
-                        if row.is_empty()
-                            || row.starts_with('#')
-                            || row.starts_with('_')
-                            || row.eq_ignore_ascii_case("loop_")
-                            || row.eq_ignore_ascii_case("stop_")
-                        {
-                            break;
-                        }
-                        let toks = split_cif_row_tokens(row);
+                    while j < lines.len() && is_row(lines[j]) {
+                        let toks = split_cif_row_tokens(lines[j]);
                         if toks.len() == cols.len() {
-                            if let Some(bs) = toks.get(bc) {
-                                if let Ok(b) = bs.parse::<f64>() {
-                                    if !b.is_finite() || !(0.0..=100.001).contains(&b) {
-                                        b_out_of_range = true;
-                                    } else {
-                                        b_min = b_min.min(b);
-                                        b_max = b_max.max(b);
-                                        b_count += 1;
-                                    }
+                            if let Some(Ok(b)) = toks.get(bc).map(|bs| bs.parse::<f64>()) {
+                                if !b.is_finite() || !(0.0..=100.001).contains(&b) {
+                                    b_out_of_range = true;
+                                } else {
+                                    b_min = b_min.min(b);
+                                    b_max = b_max.max(b);
+                                    b_count += 1;
                                 }
                             }
                         }
@@ -460,19 +298,22 @@ fn classify_predicted_model_evidence(text: &str) -> Option<&'static str> {
     if !has_mmcif_data {
         return None;
     }
-    if has_matching_local_plddt {
-        return Some("mmCIF _ma_qa_metric (name=pLDDT) + _ma_qa_metric_local values");
-    }
+    // Single shared pLDDT provenance rule (`21F:B1`), identical to `af_concordance`,
+    // `struct_shifts`, and the GUI `mol3d` gate. A declared pLDDT `_ma_qa_metric` without matching
+    // `_ma_qa_metric_local` rows (f3/f5) or `global` in the `type` column (e2) fails closed.
+    let evidence = crate::af_concordance::PlddtProvenanceEvidence::from_mmcif_text(text).ok()?;
     let has_valid_bfactor = !b_out_of_range && b_count >= 2 && (b_max - b_min) > 1.0e-3;
-    let has_local_plddt_def =
-        !plddt_metric_ids.is_empty() || (has_kv_plddt_metric && !kv_ma_mode_global);
-    if has_valid_bfactor && has_local_plddt_def {
-        return Some("mmCIF _ma_qa_metric (name=pLDDT) + non-constant B_iso_or_equiv pLDDT");
+    match evidence.verdict() {
+        crate::af_concordance::PlddtProvenanceVerdict::LocalPlddtRows => {
+            Some("mmCIF _ma_qa_metric (name=pLDDT) + _ma_qa_metric_local values")
+        }
+        crate::af_concordance::PlddtProvenanceVerdict::PredictorHeaderBfactor
+            if has_valid_bfactor =>
+        {
+            Some("mmCIF recognized AFDB/ColabFold header + non-constant B_iso_or_equiv pLDDT")
+        }
+        _ => None,
     }
-    if has_valid_bfactor && has_recognized_af_header && !saw_ma_qa_metric {
-        return Some("mmCIF recognized AFDB/ColabFold header + non-constant B_iso_or_equiv pLDDT");
-    }
-    None
 }
 
 fn split_cif_row_tokens(row: &str) -> Vec<&str> {
