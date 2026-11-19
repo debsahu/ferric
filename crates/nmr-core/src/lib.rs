@@ -16,6 +16,7 @@ pub mod af_concordance;
 pub mod aromatic;
 pub mod bayes_sa;
 pub mod c13_detected;
+pub mod ccr_relax;
 pub mod cest;
 pub mod classify;
 pub mod cofold_bridge;
