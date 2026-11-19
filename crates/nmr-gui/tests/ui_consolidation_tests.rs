@@ -269,10 +269,14 @@ fn test_primary_control_budget_le_12_and_canvas_area_ge_65_percent_at_1440x900()
                 "Assign + real 3D Strips ({vw}x{vh}) exceeded 12 primary controls: got {}",
                 ctrls.len()
             );
-            let share = (canvas_r.area() + strip_r.area()) / (vw * vh);
+            // Share = stand-in central plot rect (this harness has no real HSQC canvas) + the REAL
+            // strip data-plot band boxes (`last_plot_rects`, excl. ppm gutter / headers / gaps).
+            // The honest full-app data-plot metric lives in `main.rs` (`21F:B11`).
+            let strip_plot_area: f32 = tiler.last_plot_rects.iter().map(|r| r.area()).sum();
+            let share = (canvas_r.area() + strip_plot_area) / (vw * vh);
             assert!(
                 share >= MIN_CANVAS_AREA_FRACTION,
-                "Assign + real 3D Strips ({vw}x{vh}) total spectrum share {share:.3} < {MIN_CANVAS_AREA_FRACTION}"
+                "Assign + real 3D Strips ({vw}x{vh}) stand-in plot + strip data-plot share {share:.3} < {MIN_CANVAS_AREA_FRACTION}"
             );
             assert!(
                 tiler.last_column_rects.len() >= 3,
@@ -343,7 +347,7 @@ fn test_primary_control_budget_le_12_and_canvas_area_ge_65_percent_at_1440x900()
     {
         let mut af_panel = IntegrativeAfPanel::new();
         let _ = af_panel
-            .load_synthetic_two_domain_demo()
+            .load_ubiquitin_single_domain_demo()
             .expect("load 2-domain af demo");
         for tab in IntegrativeStudioTab::ALL {
             af_panel.active_tab = tab;
@@ -767,8 +771,8 @@ fn test_scientific_candor_metabolomics_integrative_af_and_octet() {
         let ctx = egui::Context::default();
         let mut af = IntegrativeAfPanel::new();
         let (_, msg) = af
-            .load_synthetic_two_domain_demo()
-            .expect("two-domain demo");
+            .load_ubiquitin_single_domain_demo()
+            .expect("ubiquitin AF demo");
         assert!(
             !msg.contains("Validated") && msg.contains("Analyzed"),
             "IntegrativeAfPanel status must say Analyzed ... (synthetic demo), got {msg:?}"
@@ -838,11 +842,14 @@ fn test_scientific_candor_metabolomics_integrative_af_and_octet() {
 }
 
 #[test]
-fn test_first_run_bruker_open_process_pick_assign_completes_within_5_clicks() {
-    // Real headless `egui::Context` pointer-click test driving the mode switcher & workflow buttons
-    // through real `egui::RawInput` `PointerMoved` + `PointerButton` events (`<= 5` dispatched clicks).
-    // (The full `NmrWorkbenchApp` test opening a real on-disk Bruker `pdata/1` dir via `DroppedFile`
-    // and clicking `Water` -> `Assign` -> `Pick Peaks` -> `Run Assignment` lives in `main.rs`.)
+fn test_mock_widgets_demo_suite_open_water_pick_assign_within_5_clicks() {
+    // MOCK-WIDGET test (`21F:B12`): real `egui::RawInput` pointer events, but on HAND-BUILT buttons in
+    // this test whose handlers call library functions directly (`pick_hsqc_2d`, `assign_from_matrices`).
+    // "Open Dataset" loads the built-in synthetic demo suite, NOT a Bruker directory. It checks that
+    // the library pipeline behind 5 buttons assigns the demo protein; it does NOT exercise the real app.
+    // The real-app first-run test (on-disk Bruker HSQC + HNCA dropped onto `NmrWorkbenchApp`, real
+    // clicks on the app's own buttons, ground-truth residue check) is
+    // `test_first_run_bruker_open_process_pick_assign_within_5_real_clicks` in `src/main.rs`.
     let ctx = egui::Context::default();
     let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
     let mut mode = WorkbenchMode::Process;
@@ -1045,5 +1052,180 @@ fn test_first_run_bruker_open_process_pick_assign_completes_within_5_clicks() {
     assert!(
         assigned_count >= 45,
         "Expected >= 45 assigned residues, got {assigned_count}"
+    );
+}
+
+/// `21F:B11`: Top-K must change what the docked match-finder can show. The compact dock renders one
+/// `i-1 | i | i+1` triplet plus a collapsible list of the K ranked competing `i-1` / `i+1`
+/// candidates (rank, residue badge, pair score, relative probability); clicking a row swaps that
+/// candidate into the side strip. Driven with real pointer events on the real `StripTilerPanel`.
+#[test]
+fn test_strip_dock_top_k_lists_competing_candidates_and_swaps_side_strip() {
+    use nmr_gui::strip_tiler::{CandidateMatchFinder, MatchFinderConfig};
+    let suite =
+        build_builtin_demo_suite(BUILTIN_DEMO_SUITE_SEED).expect("build builtin demo suite");
+    let seq = suite.ubiquitin_ref.sequence.clone();
+    let seq_ids = suite.ubiquitin_ref.seq_ids.clone();
+    let p_mat = pair_matrix(&suite.systems, &ScoreConfig::default());
+    let root = 0usize;
+    let (vw, vh) = (1440.0_f32, 900.0_f32);
+    let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(vw, vh));
+    let ctx = egui::Context::default();
+    let mut tiler = StripTilerPanel::new();
+    let mut dock_r = egui::Rect::ZERO;
+    let frame = |tiler: &mut StripTilerPanel,
+                 dock_r: &mut egui::Rect,
+                 events: Vec<egui::Event>|
+     -> egui::FullOutput {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(vp),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                apply_type_scale(ui.ctx());
+                let dr = egui::Panel::right("topk_dock")
+                    .default_size(300.0)
+                    .min_size(236.0)
+                    .show(ui, |ui| {
+                        let tctx = StripTilerContext {
+                            systems: &suite.systems,
+                            pair_mat: &p_mat,
+                            u_mat: None,
+                            sequence: &seq,
+                            seq_ids: &seq_ids,
+                            active_root: root,
+                            assignments: None,
+                            locks: None,
+                            confirmed_links: None,
+                            spectra_3d: StripSpectra3D {
+                                aliphatic_3d: Some(&suite.hncacb_3d),
+                                carbonyl_3d: Some(&suite.hnco_3d),
+                            },
+                        };
+                        let _ = tiler.show(ui, &tctx, None);
+                    });
+                *dock_r = dr.response.rect;
+                egui::CentralPanel::default().show(ui, |ui| ui.label("HSQC"));
+            },
+        );
+        out.textures_delta.clear();
+        out
+    };
+    let click = |pos: egui::Pos2| {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    };
+    let find = |out: &egui::FullOutput, pred: &dyn Fn(&str) -> bool| -> Option<egui::Rect> {
+        audit_text_layout(&out.shapes, vp)
+            .texts
+            .iter()
+            .find(|t| pred(t.text.trim()))
+            .map(|t| t.rect)
+    };
+
+    // Top-K = 1: no competitors exist, so no list is offered.
+    tiler.cfg.top_k = 1;
+    let _ = frame(&mut tiler, &mut dock_r, Vec::new());
+    let out1 = frame(&mut tiler, &mut dock_r, Vec::new());
+    assert_eq!(tiler.last_competitor_counts, (1, 1));
+    assert!(find(&out1, &|t: &str| t.contains("Competing")).is_none());
+
+    // Top-K = 8: the ranked lists grow and a collapsible competing-candidates list appears.
+    tiler.cfg.top_k = 8;
+    let ranked = CandidateMatchFinder::rank_neighbors(
+        &suite.systems,
+        &p_mat,
+        root,
+        None,
+        None,
+        None,
+        &MatchFinderConfig {
+            top_k: 8,
+            ..MatchFinderConfig::default()
+        },
+    );
+    assert!(
+        ranked.predecessors.len() >= 2,
+        "fixture root must have >= 2 ranked i-1 candidates, got {}",
+        ranked.predecessors.len()
+    );
+    let _ = frame(&mut tiler, &mut dock_r, Vec::new());
+    let out8 = frame(&mut tiler, &mut dock_r, Vec::new());
+    assert_eq!(
+        tiler.last_competitor_counts,
+        (ranked.predecessors.len(), ranked.successors.len())
+    );
+    assert_eq!(tiler.last_column_spin_systems.len(), 3);
+    assert_eq!(
+        tiler.last_column_spin_systems[0], ranked.predecessors[0].spin_system_idx,
+        "default i-1 strip is the best-ranked candidate"
+    );
+    let hdr = find(&out8, &|t: &str| t.contains("Competing i-1/i+1 (Top-8"))
+        .expect("Top-8 competing-candidates header must render");
+    let strips_h_collapsed = tiler.last_canvas_rect.expect("strip canvas").height();
+
+    // Expand the list with a real click.
+    let _ = frame(&mut tiler, &mut dock_r, click(hdr.center()));
+    let _ = frame(&mut tiler, &mut dock_r, Vec::new());
+    let out_exp = frame(&mut tiler, &mut dock_r, Vec::new());
+    assert!(tiler.show_competitors, "header click must expand the list");
+    let audit = audit_text_layout(&out_exp.shapes, vp);
+    assert!(
+        audit.clipped.is_empty(),
+        "expanded list clipped text: {:?}",
+        audit.clipped
+    );
+    let rank2 = audit
+        .texts
+        .iter()
+        .find(|t| t.text.trim().starts_with("#2 ") && t.rect.center().x < dock_r.center().x)
+        .map(|t| t.rect)
+        .expect("rank #2 i-1 competitor row (with its P score) must render");
+    assert!(dock_r.contains_rect(rank2), "competitor row outside dock");
+    assert!(
+        audit
+            .texts
+            .iter()
+            .any(|t| t.text.trim().starts_with("#2 ") && t.text.contains('P')),
+        "competitor rows carry match scores"
+    );
+    for (ci, col_r) in tiler.last_column_rects.iter().enumerate() {
+        assert!(
+            col_r.left() >= dock_r.left() - 1.0 && col_r.right() <= dock_r.right() + 1.0,
+            "strip #{ci} clipped outside dock with list expanded"
+        );
+    }
+    let canvas_exp = tiler.last_canvas_rect.expect("strip canvas");
+    assert!(
+        canvas_exp.height() < strips_h_collapsed,
+        "strips must shrink to make room for the expanded list (no overlap)"
+    );
+    assert!(
+        rank2.top() >= canvas_exp.bottom(),
+        "list must sit below the strips"
+    );
+
+    // Click the rank-2 i-1 row: that competitor is now drawn in the i-1 strip.
+    let _ = frame(&mut tiler, &mut dock_r, click(rank2.center()));
+    let _ = frame(&mut tiler, &mut dock_r, Vec::new());
+    assert_eq!(tiler.pred_display_rank, 1);
+    assert_eq!(
+        tiler.last_column_spin_systems[0], ranked.predecessors[1].spin_system_idx,
+        "i-1 strip must now show the rank-2 competing candidate"
     );
 }

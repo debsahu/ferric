@@ -486,6 +486,15 @@ pub struct StripSpectra3D<'a> {
     pub carbonyl_3d: Option<&'a Spectrum3D>,
 }
 
+/// Minimum / maximum auto-fit strip canvas height in pixels.
+pub const STRIP_MIN_HEIGHT_PX: f32 = 220.0;
+/// Upper bound on the strip canvas height (large enough to fill a 900-px-tall dock).
+pub const STRIP_MAX_HEIGHT_PX: f32 = 1200.0;
+/// Row pitch of the Top-K competing-candidates list.
+const COMPETITOR_ROW_PX: f32 = 20.0;
+/// Rows visible in the expanded competing-candidates list before it scrolls.
+const COMPETITOR_VISIBLE_ROWS: usize = 4;
+
 /// Read-only data context passed to [`StripTilerPanel::show`].
 pub struct StripTilerContext<'a> {
     pub systems: &'a [SpinSystem],
@@ -533,7 +542,8 @@ pub struct StripTilerPanel {
     pub strip_half_width_h_ppm: f64,
     /// Shared indirect (`13C`) zoom range across all strips (`None` = full range).
     pub indirect_zoom: Option<(f64, f64)>,
-    /// Current strip canvas height in pixels (auto-fills available height clamped `220..=680`, or user-resized).
+    /// Current strip canvas height in pixels (auto-fills available height clamped to
+    /// [`STRIP_MIN_HEIGHT_PX`]`..=`[`STRIP_MAX_HEIGHT_PX`], or user-resized).
     pub strip_height_px: f32,
     /// Vertical/intensity gain multiplier for strip profiles (adjusted by plain scroll wheel).
     pub strip_gain: f64,
@@ -543,12 +553,30 @@ pub struct StripTilerPanel {
     pub last_canvas_rect: Option<egui::Rect>,
     /// Bounding rectangles of each rendered strip column from the most recent frame.
     pub last_column_rects: Vec<egui::Rect>,
+    /// Data-plot rectangles (the `C'` and `Cα/Cβ` band boxes of every rendered strip) from the most
+    /// recent frame. Excludes the ppm axis gutter, column headers, band gap and inter-strip gaps,
+    /// so layout audits can measure honest data-plot area (`21F:B11`).
+    pub last_plot_rects: Vec<egui::Rect>,
+    /// Spin-system index shown in each rendered strip column (left to right) in the most recent frame.
+    pub last_column_spin_systems: Vec<usize>,
     /// Compact docked mode (`true` by default): keeps inline controls inside the inspector `Options`
     /// menu and fits the `i-1 / i / i+1` triplet cleanly to the available dock width without clipping.
     pub compact_dock_mode: bool,
     /// Show inline per-column `Walk`/`Link`/`Lock` footer buttons beneath strips (`false` by default;
     /// all curation actions remain available via right-click context menu on any strip column).
     pub show_footer_buttons: bool,
+    /// 0-based rank (into the Top-K ranked predecessor list) of the `i - 1` candidate shown in the
+    /// docked strip column. Chosen from the competing-candidates list; resets to the best (`0`)
+    /// whenever the active root changes.
+    pub pred_display_rank: usize,
+    /// 0-based rank of the `i + 1` candidate shown in the docked strip column (see
+    /// [`Self::pred_display_rank`]).
+    pub succ_display_rank: usize,
+    /// Whether the compact Top-K competing-candidates list beneath the docked strips is expanded.
+    pub show_competitors: bool,
+    /// Number of ranked predecessors/successors returned by the last frame's match-finder run.
+    pub last_competitor_counts: (usize, usize),
+    rank_root: Option<usize>,
     user_resized_height: bool,
     zoom_drag_start_ppm: Option<f64>,
     context_menu_ss_idx: Option<usize>,
@@ -570,8 +598,15 @@ impl Default for StripTilerPanel {
             selected_peak: None,
             last_canvas_rect: None,
             last_column_rects: Vec::new(),
+            last_plot_rects: Vec::new(),
+            last_column_spin_systems: Vec::new(),
             compact_dock_mode: true,
             show_footer_buttons: false,
+            pred_display_rank: 0,
+            succ_display_rank: 0,
+            show_competitors: false,
+            last_competitor_counts: (0, 0),
+            rank_root: None,
             user_resized_height: false,
             zoom_drag_start_ppm: None,
             context_menu_ss_idx: None,
@@ -677,6 +712,7 @@ impl StripTilerPanel {
     ) -> Vec<StripTilerAction> {
         let mut actions = Vec::new();
         if ctx.active_root >= ctx.systems.len() {
+            self.last_plot_rects.clear();
             ui.label("Select an HSQC root to inspect ranked i − 1 / i / i + 1 candidate strips.");
             return actions;
         }
@@ -690,6 +726,18 @@ impl StripTilerPanel {
             ctx.confirmed_links,
             &self.cfg,
         );
+        if self.rank_root != Some(ctx.active_root) {
+            self.rank_root = Some(ctx.active_root);
+            self.pred_display_rank = 0;
+            self.succ_display_rank = 0;
+        }
+        self.pred_display_rank = self
+            .pred_display_rank
+            .min(matches.predecessors.len().saturating_sub(1));
+        self.succ_display_rank = self
+            .succ_display_rank
+            .min(matches.successors.len().saturating_sub(1));
+        self.last_competitor_counts = (matches.predecessors.len(), matches.successors.len());
 
         // Top controls bar: in compact dock mode, controls live in the inspector Options menu to
         // preserve the <= 12 primary-control budget and maximize 3D strip plot area (`UI-B2`, `UI-B7`).
@@ -740,33 +788,46 @@ impl StripTilerPanel {
         }
 
         // Build ordered column list: [p_m ... p_2, p_1, Active(i), q_1, q_2 ... q_n]
-        // In compact dock mode, show the primary adjacent triplet `[p_1, Active(i), q_1]`
-        // so all 3 strips fit cleanly inside the docked inspector with zero horizontal clipping.
-        let max_side_cols = if self.compact_dock_mode {
-            1usize
+        // In compact dock mode, show ONE `i-1 | i | i+1` triplet so all 3 strips fit the docked
+        // inspector with zero horizontal clipping; the side columns show the candidate picked in the
+        // Top-K competing-candidates list beneath the strips (rank #1 by default, `21F:B11`).
+        let mut columns: Vec<ColumnRole> = Vec::with_capacity(2 * self.cfg.top_k + 1);
+        if self.compact_dock_mode {
+            if let Some(cand) = matches.predecessors.get(self.pred_display_rank) {
+                columns.push(ColumnRole::Predecessor {
+                    rank_1based: self.pred_display_rank + 1,
+                    cand: cand.clone(),
+                });
+            }
         } else {
-            self.cfg.top_k
-        };
-        let shown_preds = &matches.predecessors[..matches.predecessors.len().min(max_side_cols)];
-        let shown_succs = &matches.successors[..matches.successors.len().min(max_side_cols)];
-        let mut columns: Vec<ColumnRole> =
-            Vec::with_capacity(shown_preds.len() + 1 + shown_succs.len());
-        for (idx, cand) in shown_preds.iter().cloned().enumerate().rev() {
-            columns.push(ColumnRole::Predecessor {
-                rank_1based: idx + 1,
-                cand,
-            });
+            for (idx, cand) in matches.predecessors.iter().cloned().enumerate().rev() {
+                columns.push(ColumnRole::Predecessor {
+                    rank_1based: idx + 1,
+                    cand,
+                });
+            }
         }
         let center_col_idx = columns.len();
         columns.push(ColumnRole::ActiveRoot {
             ss_idx: ctx.active_root,
         });
-        for (idx, cand) in shown_succs.iter().cloned().enumerate() {
-            columns.push(ColumnRole::Successor {
-                rank_1based: idx + 1,
-                cand,
-            });
+        if self.compact_dock_mode {
+            if let Some(cand) = matches.successors.get(self.succ_display_rank) {
+                columns.push(ColumnRole::Successor {
+                    rank_1based: self.succ_display_rank + 1,
+                    cand: cand.clone(),
+                });
+            }
+        } else {
+            for (idx, cand) in matches.successors.iter().cloned().enumerate() {
+                columns.push(ColumnRole::Successor {
+                    rank_1based: idx + 1,
+                    cand,
+                });
+            }
         }
+        let has_competitors = self.compact_dock_mode
+            && (matches.predecessors.len() > 1 || matches.successors.len() > 1);
 
         let avail_w = ui.available_width().max(220.0);
         let left_axis_w = if self.compact_dock_mode {
@@ -784,10 +845,17 @@ impl StripTilerPanel {
                 104.0
             } else {
                 14.0
+            } + if has_competitors {
+                self.competitor_list_height(&matches)
+            } else {
+                0.0
             };
-            self.strip_height_px = (ui.available_height() - reserve_h).clamp(220.0, 680.0);
+            self.strip_height_px =
+                (ui.available_height() - reserve_h).clamp(STRIP_MIN_HEIGHT_PX, STRIP_MAX_HEIGHT_PX);
         }
-        let strip_h = self.strip_height_px.clamp(220.0, 680.0);
+        let strip_h = self
+            .strip_height_px
+            .clamp(STRIP_MIN_HEIGHT_PX, STRIP_MAX_HEIGHT_PX);
         let desired_w = if self.compact_dock_mode && columns.len() <= 3 {
             avail_w
         } else {
@@ -1125,6 +1193,7 @@ impl StripTilerPanel {
             // Collect painted marker hit targets `(spin_system_idx, peak_idx, screen_pos)`
             let mut marker_hits: Vec<(usize, usize, egui::Pos2)> = Vec::new();
             let mut col_rects: Vec<(usize, egui::Rect)> = Vec::with_capacity(columns.len());
+            let mut plot_rects: Vec<egui::Rect> = Vec::with_capacity(2 * columns.len());
 
             // Render each strip column (header, 3D slice or synthetic Gaussian + sticks, click-to-select)
             for (c_idx, col) in columns.iter().enumerate() {
@@ -1157,6 +1226,10 @@ impl StripTilerPanel {
                 let ali_box =
                     egui::Rect::from_min_max(egui::pos2(x0, ali_top), egui::pos2(x1, ali_bot));
                 if show_co_band {
+                    plot_rects.push(co_box);
+                }
+                plot_rects.push(ali_box);
+                if show_co_band {
                     painter.rect_stroke(
                         co_box,
                         2.0,
@@ -1172,20 +1245,7 @@ impl StripTilerPanel {
                 );
 
                 // Column header & score subtitle (zero emojis; >= 11 px font)
-                let res_badge = ctx
-                    .locks
-                    .and_then(|m| m.get(&ss_idx).copied())
-                    .map(|k| format!("[L]{}{}", three_to_one(&ctx.sequence[k]), ctx.seq_ids[k]))
-                    .or_else(|| {
-                        ctx.assignments
-                            .and_then(|a| a.get(ss_idx).copied())
-                            .filter(|&k| k >= 0 && (k as usize) < ctx.sequence.len())
-                            .map(|k| {
-                                let ku = k as usize;
-                                format!("{}{}", three_to_one(&ctx.sequence[ku]), ctx.seq_ids[ku])
-                            })
-                    })
-                    .unwrap_or_else(|| format!("SS#{ss_idx}"));
+                let res_badge = Self::residue_badge(ctx, ss_idx);
 
                 let compact_hdr = self.compact_dock_mode || eff_col_w < 130.0;
                 let (top_label, sub_label, sub_col) = match col {
@@ -1195,7 +1255,9 @@ impl StripTilerPanel {
                         } else {
                             format!("i−1 #{rank_1based} {res_badge}")
                         },
-                        if compact_hdr {
+                        if compact_hdr && *rank_1based > 1 {
+                            format!("#{rank_1based} P{:+.0}", cand.pair_score)
+                        } else if compact_hdr {
                             format!("P{:+.0} {:.0}%", cand.pair_score, cand.rel_prob * 100.0)
                         } else {
                             format!(
@@ -1226,7 +1288,9 @@ impl StripTilerPanel {
                         } else {
                             format!("i+1 #{rank_1based} {res_badge}")
                         },
-                        if compact_hdr {
+                        if compact_hdr && *rank_1based > 1 {
+                            format!("#{rank_1based} P{:+.0}", cand.pair_score)
+                        } else if compact_hdr {
                             format!("P{:+.0} {:.0}%", cand.pair_score, cand.rel_prob * 100.0)
                         } else {
                             format!(
@@ -1577,8 +1641,8 @@ impl StripTilerPanel {
             }
             if grip_resp.dragged() {
                 self.user_resized_height = true;
-                self.strip_height_px =
-                    (self.strip_height_px + grip_resp.drag_delta().y).clamp(220.0, 680.0);
+                self.strip_height_px = (self.strip_height_px + grip_resp.drag_delta().y)
+                    .clamp(STRIP_MIN_HEIGHT_PX, STRIP_MAX_HEIGHT_PX);
             }
             let grip_col = if grip_resp.hovered() || grip_resp.dragged() {
                 egui::Color32::from_rgb(95, 210, 255)
@@ -1594,6 +1658,8 @@ impl StripTilerPanel {
             );
 
             self.last_column_rects = col_rects.iter().map(|(_, r)| *r).collect();
+            self.last_plot_rects = plot_rects;
+            self.last_column_spin_systems = col_rects.iter().map(|(ss, _)| *ss).collect();
 
             // 2. Per-column residual summary & 1-click curation action buttons (optional; right-click always available)
             if self.show_footer_buttons {
@@ -1670,7 +1736,142 @@ impl StripTilerPanel {
                 .show(ui, render_strips);
         }
 
+        if has_competitors {
+            self.show_competitor_list(ui, ctx, &matches);
+        }
+
         actions
+    }
+
+    /// Pixel height reserved beneath the docked strips for the Top-K competing-candidates list
+    /// (collapsed header row, plus up to [`COMPETITOR_VISIBLE_ROWS`] scrollable rows when expanded).
+    fn competitor_list_height(&self, matches: &StripMatchResult) -> f32 {
+        let header = COMPETITOR_ROW_PX + 4.0;
+        if !self.show_competitors {
+            return header;
+        }
+        let rows = matches
+            .predecessors
+            .len()
+            .max(matches.successors.len())
+            .min(COMPETITOR_VISIBLE_ROWS);
+        header + COMPETITOR_ROW_PX + 4.0 + rows as f32 * COMPETITOR_ROW_PX + 8.0
+    }
+
+    /// Short residue/spin-system badge (`[L]K12`, `K12`, or `SS#4`) for a strip column or list row.
+    fn residue_badge(ctx: &StripTilerContext<'_>, ss_idx: usize) -> String {
+        ctx.locks
+            .and_then(|m| m.get(&ss_idx).copied())
+            .filter(|&k| k < ctx.sequence.len() && k < ctx.seq_ids.len())
+            .map(|k| format!("[L]{}{}", three_to_one(&ctx.sequence[k]), ctx.seq_ids[k]))
+            .or_else(|| {
+                ctx.assignments
+                    .and_then(|a| a.get(ss_idx).copied())
+                    .filter(|&k| {
+                        k >= 0
+                            && (k as usize) < ctx.sequence.len()
+                            && (k as usize) < ctx.seq_ids.len()
+                    })
+                    .map(|k| {
+                        let ku = k as usize;
+                        format!("{}{}", three_to_one(&ctx.sequence[ku]), ctx.seq_ids[ku])
+                    })
+            })
+            .unwrap_or_else(|| format!("SS#{ss_idx}"))
+    }
+
+    /// Compact Top-K competing `i - 1` / `i + 1` candidates list (rank, residue badge, pair score
+    /// `P`, relative probability). Clicking a row shows that candidate in the docked side strip,
+    /// so competing sequential matches can be compared visually against the active root.
+    fn show_competitor_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &StripTilerContext<'_>,
+        matches: &StripMatchResult,
+    ) {
+        let (n_p, n_s) = (matches.predecessors.len(), matches.successors.len());
+        let arrow = if self.show_competitors { "v" } else { ">" };
+        let hdr = ui.add(
+            egui::Button::new(
+                egui::RichText::new(format!(
+                    "{arrow} Competing i-1/i+1 (Top-{}: {n_p}/{n_s})",
+                    self.cfg.top_k
+                ))
+                .size(TYPE_CAPTION_PX),
+            )
+            .frame(false),
+        );
+        if hdr
+            .on_hover_text("Ranked candidate strips from the match-finder; click a row to show it")
+            .clicked()
+        {
+            self.show_competitors = !self.show_competitors;
+        }
+        if !self.show_competitors {
+            return;
+        }
+        let rows = n_p.max(n_s).min(COMPETITOR_VISIBLE_ROWS);
+        let list_h = COMPETITOR_ROW_PX + 4.0 + rows as f32 * COMPETITOR_ROW_PX;
+        let col_w = ((ui.available_width() - 8.0) * 0.5).max(60.0);
+        let row_text = |rank: usize, c: &StripMatchCandidate| {
+            format!(
+                "#{rank} {} P{:+.0} {:.0}%",
+                Self::residue_badge(ctx, c.spin_system_idx),
+                c.pair_score,
+                c.rel_prob * 100.0
+            )
+        };
+        let mut new_pred: Option<usize> = None;
+        let mut new_succ: Option<usize> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("strip_tiler_competitors")
+            .max_height(list_h)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    for (is_pred, cands, cur) in [
+                        (true, &matches.predecessors, self.pred_display_rank),
+                        (false, &matches.successors, self.succ_display_rank),
+                    ] {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(col_w, list_h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(col_w);
+                                ui.label(
+                                    egui::RichText::new(if is_pred { "i-1" } else { "i+1" })
+                                        .size(TYPE_CAPTION_PX)
+                                        .strong(),
+                                );
+                                for (r, c) in cands.iter().enumerate() {
+                                    let resp = ui.add_sized(
+                                        [col_w, COMPETITOR_ROW_PX - 2.0],
+                                        egui::Button::selectable(
+                                            r == cur,
+                                            egui::RichText::new(row_text(r + 1, c))
+                                                .monospace()
+                                                .size(TYPE_CAPTION_PX),
+                                        ),
+                                    );
+                                    if resp.clicked() {
+                                        if is_pred {
+                                            new_pred = Some(r);
+                                        } else {
+                                            new_succ = Some(r);
+                                        }
+                                    }
+                                }
+                            },
+                        );
+                    }
+                });
+            });
+        if let Some(r) = new_pred {
+            self.pred_display_rank = r;
+        }
+        if let Some(r) = new_succ {
+            self.succ_display_rank = r;
+        }
     }
 
     fn paint_band_profile(
@@ -2198,9 +2399,10 @@ mod tests {
             audit.clipped
         );
 
-        // Strip height auto-filled available height within 220..=680
+        // Strip height auto-filled available height within STRIP_MIN..=STRIP_MAX_HEIGHT_PX
         assert!(
-            (220.0..=680.0).contains(&panel.strip_height_px) && panel.strip_height_px > 286.0,
+            (STRIP_MIN_HEIGHT_PX..=STRIP_MAX_HEIGHT_PX).contains(&panel.strip_height_px)
+                && panel.strip_height_px > 286.0,
             "expected responsive strip height > 286 at 1280x800, got {}",
             panel.strip_height_px
         );
