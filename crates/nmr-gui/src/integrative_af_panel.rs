@@ -68,7 +68,19 @@ use nmr_core::rdc::{parse_rdc_tsv_str, RdcMediumSet};
 use nmr_core::struct_shifts::StructureModel;
 
 use crate::contour_painter::SyncCrosshair;
-use crate::demo_preset::{EMBEDDED_SYNTHETIC_UBIQUITIN_STR, EMBEDDED_UBIQUITIN_1UBQ_PDB};
+use crate::demo_preset::EMBEDDED_UBIQUITIN_1UBQ_PDB;
+
+/// Embedded experimental human ubiquitin backbone/side-chain shifts (BMRB 17769, CC0).
+const EMBEDDED_BMR17769_UBIQUITIN_STR: &str =
+    include_str!("../../../data/fixtures/bmr17769_ubiquitin_allatom.str");
+/// Embedded experimental ubiquitin RDCs (wwPDB restraint archive 1D3Z; Cornilescu, Marquardt,
+/// Ottiger & Bax, J. Am. Chem. Soc. 120, 6836-6837, 1998; CC0).
+const EMBEDDED_UBIQUITIN_1D3Z_RDC_TSV: &str =
+    include_str!("../../../data/fixtures/ubiquitin_1d3z_rdc.tsv");
+/// Alignment medium of the 1D3Z N-H RDCs used by the ubiquitin demo.
+pub const UBIQUITIN_DEMO_RDC_MEDIUM: &str = "bicelle_neutral";
+/// Provenance label shown on every tab of the ubiquitin AF demo (`21F:B13`).
+pub const UBIQUITIN_DEMO_PROVENANCE: &str = "Synthetic Demo: 1UBQ X-ray coordinates posing as an AF model (synthetic pLDDT/PAE); ubiquitin is ONE rigid domain; real BMRB 17769 shifts and 1D3Z N-H RDCs";
 use crate::mol3d_overlay::{
     ConcordanceTrackClass, DistanceRestraint3d, QuantitativeTrack, RestraintAtomSelector,
     RestraintKind,
@@ -76,6 +88,41 @@ use crate::mol3d_overlay::{
 use crate::mol3d_viewer::{parse_pdb_ensemble, Mol3dViewerPanel};
 use crate::sidechain_widget::SequenceRibbonState;
 use crate::ss_ribbon_widget::SsRibbonState;
+
+/// Width of the PAE heatmap residue (y) axis gutter.
+const PAE_Y_AXIS_W: f32 = 30.0;
+/// Height of the PAE heatmap residue (x) axis row.
+const PAE_X_AXIS_H: f32 = 20.0;
+/// Width of the PAE colorbar + labels (wide enough for "31.75 A" at 11 px).
+const PAE_COLORBAR_W: f32 = 70.0;
+
+/// Residue-axis ticks `(0-based index, 1-based label)` for an `n`-residue PAE heatmap: first, last,
+/// and round multiples of 10/20 in between (kept >= ~8% of the axis away from the end labels).
+fn pae_residue_axis_ticks(n: usize) -> Vec<(usize, String)> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let step = if n <= 40 {
+        10
+    } else if n <= 120 {
+        20
+    } else {
+        ((n / 5).div_ceil(50)) * 50
+    };
+    let min_gap = (n / 12).max(1);
+    let mut out = vec![(0usize, "1".to_string())];
+    let mut k = step;
+    while k < n {
+        if k > min_gap && n - k >= min_gap {
+            out.push((k - 1, k.to_string()));
+        }
+        k += step;
+    }
+    if n > 1 {
+        out.push((n - 1, n.to_string()));
+    }
+    out
+}
 
 /// Canonical upper clamp (`31.75 A`) of the AlphaFold Predicted Aligned Error (`PAE`) color scale.
 pub const PAE_COLORBAR_MAX_ANGSTROM: f32 = 31.75;
@@ -530,9 +577,16 @@ impl IntegrativeAfPanel {
         &self.last_telemetry
     }
 
-    /// Alias for [`Self::load_synthetic_two_domain_demo`].
+    /// Alias for [`Self::load_ubiquitin_single_domain_demo`].
     pub fn load_ubiquitin_demo(&mut self) -> Result<(Reference, String), String> {
-        self.load_synthetic_two_domain_demo()
+        self.load_ubiquitin_single_domain_demo()
+    }
+
+    /// Historical name kept for API compatibility. It loads the SINGLE-domain ubiquitin demo
+    /// ([`Self::load_ubiquitin_single_domain_demo`]): ubiquitin is one rigid domain, so the former
+    /// two-domain partition (with an imposed 0.48 D2 RDC scale) was removed in `21F:B13`.
+    pub fn load_synthetic_two_domain_demo(&mut self) -> Result<(Reference, String), String> {
+        self.load_ubiquitin_single_domain_demo()
     }
 
     /// Parse `.cif`/`.pdb` coordinates (`structure_input_buf`), optional `PAE` JSON (`pae_json_buf`),
@@ -863,11 +917,15 @@ impl IntegrativeAfPanel {
         self.selected_pose_idx = (!self.pose_rows.is_empty()).then_some(0);
     }
 
-    /// Populate a deterministic 76-residue Ubiquitin 2-domain AlphaFold `.cif` + `76 x 76` `PAE`
-    /// JSON + solution NMR concordance + Tolman `GDO` + Co-Fold pose + Excited-State synthetic demo
-    /// dataset in memory (`wasm32`-safe).
-    pub fn load_synthetic_two_domain_demo(&mut self) -> Result<(Reference, String), String> {
-        let (cif_text, pae_json, demo_ref, rdc_tsv) = build_synthetic_two_domain_af_demo();
+    /// Populate a deterministic 76-residue ubiquitin demo in memory (`wasm32`-safe): `1UBQ` X-ray
+    /// coordinates written as an AF-style `.cif` with SYNTHETIC pLDDT and a SYNTHETIC `76 x 76` PAE
+    /// that encodes ubiquitin as what it is, a single rigid domain (residues 1-71) plus a flexible
+    /// C-terminal tail (72-76); EXPERIMENTAL BMRB 17769 shifts for the concordance; EXPERIMENTAL
+    /// 1D3Z N-H RDCs (neutral bicelle, ~20% held out as `is_free`) so the Saupe fit `Q_free` is a
+    /// genuine cross-validation of `1UBQ` against solution data. Co-Fold and Excited-State tabs keep
+    /// their labelled synthetic showcase values.
+    pub fn load_ubiquitin_single_domain_demo(&mut self) -> Result<(Reference, String), String> {
+        let (cif_text, pae_json, demo_ref, rdc_tsv) = build_ubiquitin_single_domain_af_demo();
         self.structure_input_buf = cif_text;
         self.pae_json_buf = pae_json;
         self.s2_tsv_buf.clear();
@@ -1206,12 +1264,12 @@ impl IntegrativeAfPanel {
 
             ui.separator();
             if ui
-                .button("Load 2-Domain AF Demo")
+                .button("Load Ubiquitin AF Demo")
                 .on_hover_text(
-                    "Populate a 76-residue Ubiquitin AlphaFold .cif + 76x76 PAE JSON + RDC + Co-Fold + Excited-State synthetic demo",
+                    "1UBQ X-ray as an AF-style model with synthetic pLDDT/PAE (single rigid domain), BMRB 17769 shifts, 1D3Z N-H RDCs, plus synthetic Co-Fold / Excited-State showcases",
                 )
                 .clicked()
-                && self.load_synthetic_two_domain_demo().is_ok()
+                && self.load_ubiquitin_single_domain_demo().is_ok()
             {
                 actions.push(IntegrativeAfAction::SyncStructureAndConcordance);
             }
@@ -1225,6 +1283,13 @@ impl IntegrativeAfPanel {
                 );
             }
         });
+        if self.is_synthetic_demo {
+            ui.label(
+                egui::RichText::new(UBIQUITIN_DEMO_PROVENANCE)
+                    .size(11.0)
+                    .color(theme.badge_warn_fg),
+            );
+        }
     }
 
     fn draw_loader_drawer(
@@ -1360,9 +1425,39 @@ impl IntegrativeAfPanel {
                     ui,
                     theme.badge_warn_bg,
                     theme.badge_warn_fg,
-                    "Synthetic Demo (76-aa Ubiquitin AF/NMR concordance)",
+                    "Synthetic Demo (76-aa ubiquitin, single rigid domain)",
                 );
             });
+            ui.add_space(4.0);
+        }
+        // Candor for torsion-mismatch flags: `DynamicHingeOrAltState` driven by delta_theta >= 60 deg
+        // means the model (phi, psi) disagrees with shift-PREDICTED torsions. Gly and positive-phi
+        // residues are a known failure mode of shift-based torsion prediction, so these are
+        // hypotheses to test, not detected motion (`21F:B13`).
+        let torsion_flags: Vec<String> = rep
+            .residues
+            .iter()
+            .filter(|r| {
+                r.concordance_class == AfNmrConcordanceClass::DynamicHingeOrAltState
+                    && r.delta_theta_deg.is_some_and(|d| d >= 60.0)
+            })
+            .map(|r| {
+                format!(
+                    "{}{}",
+                    nmr_core::priors::three_to_one(&r.res_name),
+                    r.seq_id
+                )
+            })
+            .collect();
+        if !torsion_flags.is_empty() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "DynamicHingeOrAltState via torsion mismatch only ({}): model (phi, psi) vs shift-predicted (phi, psi) differ by >= 60 deg. Shift-based torsion prediction often fails for Gly / positive-phi residues; treat as a hypothesis (test with relaxation dispersion), not detected motion.",
+                    torsion_flags.join(", ")
+                ))
+                .size(11.0)
+                .color(theme.text_muted),
+            );
             ui.add_space(4.0);
         }
         ui.horizontal_wrapped(|ui| {
@@ -1533,7 +1628,7 @@ impl IntegrativeAfPanel {
         let Some(ref pae) = self.pae_matrix else {
             ui.label(
                 egui::RichText::new(
-                    "No PAE JSON matrix loaded. Load a PAE matrix or click 'Load 2-Domain AF Demo' to inspect spectral rigid domains.",
+                    "No PAE JSON matrix loaded. Load a PAE matrix or click 'Load Ubiquitin AF Demo' to inspect spectral rigid domains.",
                 )
                 .color(theme.text_muted),
             );
@@ -1545,6 +1640,10 @@ impl IntegrativeAfPanel {
             return;
         }
 
+        let single_domain = self
+            .domain_partition
+            .as_ref()
+            .is_some_and(|p| p.domains.len() == 1);
         // Top row: local Synthetic Demo label + Tolman GDO badges & F8 single-medium dipolar candor notice
         if let Some(ref gdo_rep) = self.tolman_gdo_report {
             ui.horizontal_wrapped(|ui| {
@@ -1553,10 +1652,17 @@ impl IntegrativeAfPanel {
                         ui,
                         theme.badge_warn_bg,
                         theme.badge_warn_fg,
-                        "Synthetic Demo (76-aa Ubiquitin)",
+                        "Synthetic Demo PAE (76-aa ubiquitin)",
                     );
                 }
-                let (bg, fg, regime_txt) = match gdo_rep.regime {
+                let (bg, fg, regime_txt) = if single_domain {
+                    (
+                        theme.badge_ok_bg,
+                        theme.badge_ok_fg,
+                        "Single rigid PAE domain: inter-domain GDO test not applicable",
+                    )
+                } else {
+                    match gdo_rep.regime {
                     DomainMotionRegime::RigidlyCoupledDomains => (
                         theme.badge_ok_bg,
                         theme.badge_ok_fg,
@@ -1572,6 +1678,7 @@ impl IntegrativeAfPanel {
                         theme.badge_warn_fg,
                         "Tolman GDO: InsufficientDomainRdcs (< 8 work RDCs/domain)",
                     ),
+                    }
                 };
                 draw_pill_badge(ui, bg, fg, regime_txt);
                 self.last_telemetry.gdo_badges_drawn += 1;
@@ -1582,6 +1689,15 @@ impl IntegrativeAfPanel {
                     } else {
                         "N/A".to_string()
                     };
+                    if single_domain {
+                        let badge = format!(
+                            "D{} ({}) Saupe fit: n_work={} n_free={} | Q_work={:.3} | Q_free={q_free_str}",
+                            fit.domain_id, fit.medium_id, fit.n_work, fit.n_free, fit.q_work,
+                        );
+                        draw_pill_badge(ui, theme.card_bg, theme.text_primary, &badge);
+                        self.last_telemetry.gdo_badges_drawn += 1;
+                        continue;
+                    }
                     let badge = format!(
                         "D{} ({}) theta={:.4}+/-{:.4} | theta_d/theta_1={:.2} | Q_free={q_free_str}",
                         fit.domain_id,
@@ -1601,11 +1717,21 @@ impl IntegrativeAfPanel {
                         .color(theme.badge_alert_fg),
                 );
             }
+            if self.is_synthetic_demo {
+                ui.label(
+                    egui::RichText::new(
+                        "RDCs: experimental 1D3Z N-H couplings (Cornilescu et al. 1998, neutral bicelle) fitted to 1UBQ X-ray + ideal amide H; Q_free on held-out N-H is a genuine cross-validation (not back-calculated from this model). pLDDT and PAE are synthetic.",
+                    )
+                    .size(11.0)
+                    .color(theme.text_muted),
+                );
+            }
             ui.add_space(4.0);
         }
 
-        // F8 Single-Medium Dipolar Candor note whenever < 2 media without PCS/PRE
-        if self.loaded_rdc_media_count < 2 && !self.has_paramagnetic_pcs_or_pre {
+        // F8 Single-Medium Dipolar Candor note whenever < 2 media without PCS/PRE, for multi-domain
+        // placement (not applicable to a single rigid domain).
+        if !single_domain && self.loaded_rdc_media_count < 2 && !self.has_paramagnetic_pcs_or_pre {
             egui::Frame::NONE
                 .fill(theme.badge_warn_bg)
                 .stroke(egui::Stroke::new(1.0, theme.badge_warn_fg))
@@ -1678,9 +1804,46 @@ impl IntegrativeAfPanel {
         }
 
         // Interactive N x N PAE Heatmap Canvas + 0..31.75 A Colorbar
+        // Layout: [y residue axis | N x N heatmap | colorbar], then the x residue axis row beneath.
         let avail_w = ui.available_width().max(240.0);
-        let side = (avail_w - 90.0).clamp(180.0, 340.0);
+        let side = (avail_w - PAE_Y_AXIS_W - PAE_COLORBAR_W - 24.0).clamp(180.0, 340.0);
+        let axis_ticks = pae_residue_axis_ticks(n);
         ui.horizontal(|ui| {
+            // Y axis: aligned residue i (rows), tick labels right-aligned against the heatmap.
+            let (y_axis_rect, _) =
+                ui.allocate_exact_size(egui::vec2(PAE_Y_AXIS_W, side), egui::Sense::hover());
+            let y_painter = ui.painter_at(y_axis_rect);
+            for &(idx, ref lbl) in &axis_ticks {
+                let y = y_axis_rect.min.y + ((idx as f32) + 0.5) / (n as f32) * side;
+                let align = if idx == 0 {
+                    egui::Align2::RIGHT_TOP
+                } else if idx + 1 == n {
+                    egui::Align2::RIGHT_BOTTOM
+                } else {
+                    egui::Align2::RIGHT_CENTER
+                };
+                let y_txt = if idx == 0 {
+                    y_axis_rect.min.y
+                } else if idx + 1 == n {
+                    y_axis_rect.max.y
+                } else {
+                    y
+                };
+                y_painter.text(
+                    egui::pos2(y_axis_rect.max.x - 6.0, y_txt),
+                    align,
+                    lbl,
+                    egui::FontId::proportional(11.0),
+                    theme.text_muted,
+                );
+                y_painter.line_segment(
+                    [
+                        egui::pos2(y_axis_rect.max.x - 4.0, y),
+                        egui::pos2(y_axis_rect.max.x, y),
+                    ],
+                    egui::Stroke::new(1.0, theme.border),
+                );
+            }
             let (plot_rect, resp) =
                 ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click_and_drag());
             self.last_pae_plot_rect = Some(plot_rect);
@@ -1864,10 +2027,10 @@ impl IntegrativeAfPanel {
                 }
             }
 
-            // Vertical 0..31.75 A Colorbar Legend
+            // Vertical 0..31.75 A Colorbar Legend (labels anchored INSIDE the bar rect: `21F:B13`)
             ui.add_space(10.0);
             let (bar_rect, _) =
-                ui.allocate_exact_size(egui::vec2(56.0, side), egui::Sense::hover());
+                ui.allocate_exact_size(egui::vec2(PAE_COLORBAR_W, side), egui::Sense::hover());
             let bar_painter = ui.painter_at(bar_rect);
             let strip = egui::Rect::from_min_max(
                 bar_rect.min,
@@ -1890,17 +2053,72 @@ impl IntegrativeAfPanel {
                 egui::Stroke::new(1.0, theme.border),
                 egui::StrokeKind::Outside,
             );
-            for (frac, lbl) in [(0.0f32, "0 A"), (0.5f32, "16 A"), (1.0f32, "31.8 A")] {
-                let y = strip.min.y + frac * (strip.height() - 10.0);
+            let top_lbl = "0 A".to_string();
+            let mid_lbl = format!("{:.0} A", 0.5 * PAE_COLORBAR_MAX_ANGSTROM);
+            let max_lbl = format!("{PAE_COLORBAR_MAX_ANGSTROM:.2} A");
+            for (frac, lbl, align) in [
+                (0.0f32, &top_lbl, egui::Align2::LEFT_TOP),
+                (0.5f32, &mid_lbl, egui::Align2::LEFT_CENTER),
+                (1.0f32, &max_lbl, egui::Align2::LEFT_BOTTOM),
+            ] {
+                let y = strip.min.y + frac * strip.height();
                 bar_painter.text(
                     egui::pos2(strip.max.x + 5.0, y),
-                    egui::Align2::LEFT_TOP,
+                    align,
                     lbl,
                     egui::FontId::proportional(11.0),
                     theme.text_muted,
                 );
             }
         });
+        // X axis: scored residue j (columns), aligned under the heatmap.
+        let plot_r = self
+            .last_pae_plot_rect
+            .unwrap_or_else(|| egui::Rect::from_min_size(ui.cursor().min, egui::vec2(side, side)));
+        let (x_axis_rect, _) = ui.allocate_exact_size(
+            egui::vec2((plot_r.max.x - ui.cursor().min.x).max(side), PAE_X_AXIS_H),
+            egui::Sense::hover(),
+        );
+        let x_painter = ui.painter_at(x_axis_rect);
+        let x0 = plot_r.min.x;
+        for &(idx, ref lbl) in &axis_ticks {
+            let x = x0 + ((idx as f32) + 0.5) / (n as f32) * side;
+            let align = if idx == 0 {
+                egui::Align2::LEFT_TOP
+            } else if idx + 1 == n {
+                egui::Align2::RIGHT_TOP
+            } else {
+                egui::Align2::CENTER_TOP
+            };
+            let x_txt = if idx == 0 {
+                x0
+            } else if idx + 1 == n {
+                x0 + side
+            } else {
+                x
+            };
+            x_painter.line_segment(
+                [
+                    egui::pos2(x, x_axis_rect.min.y),
+                    egui::pos2(x, x_axis_rect.min.y + 4.0),
+                ],
+                egui::Stroke::new(1.0, theme.border),
+            );
+            x_painter.text(
+                egui::pos2(x_txt, x_axis_rect.min.y + 5.0),
+                align,
+                lbl,
+                egui::FontId::proportional(11.0),
+                theme.text_muted,
+            );
+        }
+        ui.label(
+            egui::RichText::new(
+                "x: scored residue j | y: aligned residue i (residue numbers, 1-based)",
+            )
+            .size(11.0)
+            .color(theme.text_muted),
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -2517,16 +2735,19 @@ fn concordance_class_color(cls: AfNmrConcordanceClass) -> egui::Color32 {
     }
 }
 
-/// Build a self-contained **76-residue Ubiquitin** AlphaFold ModelArchive `.cif` (`_ma_qa_metric_local`
-/// `pLDDT`) using the real `1UBQ` 3D backbone coordinates (so N-terminal residues `1..=7` carry true
-/// β-strand geometry matching the 3D viewer), a `76 x 76` `PAE` JSON (`Domain 1 = 1..35`,
-/// `Linker = 36..40`, `Domain 2 = 41..71`, `Tail = 72..76`), matching 76-residue Ubiquitin
-/// [`Reference`] chemical shifts, and well-conditioned 3D `N-H` RDC TSV (finite `Q_free`).
-fn build_synthetic_two_domain_af_demo() -> (String, String, Reference, String) {
+/// Build the ubiquitin AF demo: an AF-style ModelArchive `.cif` (`_ma_qa_metric_local` pLDDT) on the
+/// real `1UBQ` X-ray backbone (idealized amide H on the C(i-1)-N-CA bisector), a SYNTHETIC `76 x 76`
+/// PAE JSON for a single rigid domain (1-71) plus a flexible tail (72-76), the EXPERIMENTAL BMRB 17769
+/// [`Reference`] shifts, and an RDC TSV holding the EXPERIMENTAL 1D3Z N-H couplings measured in
+/// [`UBIQUITIN_DEMO_RDC_MEDIUM`] (residues with `seq_id % 5 == 2` held out as `is_free`).
+/// Residues `1..=71` form ubiquitin's single rigid domain in the demo; `72..=76` are the flexible tail.
+const UBQ_DEMO_CORE_LEN: usize = 71;
+
+fn build_ubiquitin_single_domain_af_demo() -> (String, String, Reference, String) {
     let ens = parse_pdb_ensemble(EMBEDDED_UBIQUITIN_1UBQ_PDB)
         .expect("embedded 1UBQ PDB must parse for 76-aa AF demo");
-    let demo_ref = read_star_str(EMBEDDED_SYNTHETIC_UBIQUITIN_STR, None)
-        .expect("embedded synthetic_ubiquitin.str must parse for 76-aa AF demo");
+    let demo_ref = read_star_str(EMBEDDED_BMR17769_UBIQUITIN_STR, None)
+        .expect("embedded BMRB 17769 ubiquitin shifts must parse for 76-aa AF demo");
 
     let chain_res = &ens.models[0].chains[0].residues;
     let n = chain_res.len();
@@ -2543,9 +2764,21 @@ fn build_synthetic_two_domain_af_demo() -> (String, String, Reference, String) {
 
     let mut plddts = Vec::with_capacity(n);
     let mut atom_id = 1usize;
+    // Experimental 1D3Z N-H RDCs (one medium), with a deterministic ~20% hold-out for Q_free.
     let mut nh_rdc_tsv = String::from(
         "medium_id\tseq_id_1\tres_name_1\tatom_name_1\tseq_id_2\tres_name_2\tatom_name_2\tbond_type\td_obs_hz\tsigma_hz\td_max_hz\tis_free\n",
     );
+    for line in EMBEDDED_UBIQUITIN_1D3Z_RDC_TSV.lines() {
+        let cols: Vec<&str> = line.trim().split('\t').collect();
+        if cols.len() < 11 || cols[0] != UBIQUITIN_DEMO_RDC_MEDIUM || cols[7] != "1D_NH" {
+            continue;
+        }
+        let Ok(sid) = cols[1].parse::<i32>() else {
+            continue;
+        };
+        let is_free = u8::from(sid.rem_euclid(5) == 2);
+        let _ = writeln!(nh_rdc_tsv, "{}\t{is_free}", cols[..11].join("\t"));
+    }
 
     let norm3 = |v: [f64; 3]| -> [f64; 3] {
         let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-9);
@@ -2553,14 +2786,11 @@ fn build_synthetic_two_domain_af_demo() -> (String, String, Reference, String) {
     };
 
     for (i, res) in chain_res.iter().enumerate() {
-        let in_d1 = i < 35;
-        let in_d2 = (40..71).contains(&i);
-        let plddt = if in_d1 {
-            93.2 - ((i % 4) as f64) * 1.1
-        } else if in_d2 {
-            90.4 - ((i % 5) as f64) * 1.0
+        // Synthetic AF-style confidence: rigid core 1-71 high, flexible C-terminal tail 72-76 falling.
+        let plddt = if i < UBQ_DEMO_CORE_LEN {
+            93.5 - ((i % 4) as f64) * 1.2
         } else {
-            44.5 + ((i % 3) as f64) * 2.2
+            74.0 - ((i - UBQ_DEMO_CORE_LEN) as f64) * 6.0
         };
         plddts.push(plddt);
 
@@ -2636,22 +2866,6 @@ fn build_synthetic_two_domain_af_demo() -> (String, String, Reference, String) {
                 emit_atom("CB", "C", cb);
             }
         }
-
-        // Synthetic axial Saupe tensor RDCs computed on real 3D 1UBQ N-H vectors (full-rank Saupe fit -> finite Q_free!).
-        // Domain 2 is scaled by 0.48x to demonstrate Tolman GDO decoupled inter-domain motion.
-        if rname != "PRO" && (in_d1 || in_d2) {
-            let [ux, uy, uz] = h_dir;
-            let scale = if in_d2 { 0.48 } else { 1.0 };
-            let noise = (((i * 7 + 3) % 5) as f64 - 2.0) * 0.08;
-            let rdc_val =
-                scale * 10.0 * ((3.0 * uz * uz - 1.0) + 0.30 * (ux * ux - uy * uy)) + noise;
-            // Hold out ~20% of residues per domain (`is_free = 1`) for honest Cornilescu Q_free cross-validation.
-            let is_free = if i % 5 == 2 { 1 } else { 0 };
-            let _ = writeln!(
-                nh_rdc_tsv,
-                "pf1\t{sid}\t{rname}\tN\t{sid}\t{rname}\tH\t1D_NH\t{rdc_val:.3}\t0.25\t21.70\t{is_free}"
-            );
-        }
     }
     cif.push_str("#\nloop_\n_ma_qa_metric_local.ordinal_id\n_ma_qa_metric_local.model_id\n_ma_qa_metric_local.label_asym_id\n_ma_qa_metric_local.label_seq_id\n_ma_qa_metric_local.label_comp_id\n_ma_qa_metric_local.metric_id\n_ma_qa_metric_local.metric_value\n");
     for (i, &pv) in plddts.iter().enumerate() {
@@ -2660,7 +2874,8 @@ fn build_synthetic_two_domain_af_demo() -> (String, String, Reference, String) {
     }
     cif.push_str("#\n");
 
-    // Build 76 x 76 AFDB v4 PAE JSON (`0..31.75 A`): D1 = 1..35, Linker = 36..40, D2 = 41..71, Tail = 72..76
+    // Build a SYNTHETIC 76 x 76 AFDB-v4-style PAE JSON (`0..31.75 A`): one rigid core 1..71 (low,
+    // slowly growing with sequence separation) and a flexible tail 72..76 (high PAE to everything).
     let mut pae_json = String::with_capacity(48_000);
     pae_json.push_str("[{\"max_predicted_aligned_error\":31.75,\"predicted_aligned_error\":[");
     for i in 0..n {
@@ -2668,32 +2883,18 @@ fn build_synthetic_two_domain_af_demo() -> (String, String, Reference, String) {
             pae_json.push(',');
         }
         pae_json.push('[');
-        let d_i = if i < 35 {
-            1
-        } else if (40..71).contains(&i) {
-            2
-        } else {
-            0
-        };
+        let tail_i = i.saturating_sub(UBQ_DEMO_CORE_LEN - 1);
         for j in 0..n {
             if j > 0 {
                 pae_json.push(',');
             }
-            let d_j = if j < 35 {
-                1
-            } else if (40..71).contains(&j) {
-                2
-            } else {
-                0
-            };
+            let tail_j = j.saturating_sub(UBQ_DEMO_CORE_LEN - 1);
             let v = if i == j {
-                0.50
-            } else if d_i != 0 && d_i == d_j {
-                (1.50 + (i.abs_diff(j) as f64) * 0.08).min(4.20)
-            } else if d_i == 0 || d_j == 0 {
-                24.50
+                0.25
+            } else if tail_i == 0 && tail_j == 0 {
+                (0.8 + (i.abs_diff(j) as f64) * 0.025).min(3.0)
             } else {
-                21.80
+                6.0 + 2.5 * (tail_i.max(tail_j) as f64)
             };
             let _ = write!(pae_json, "{v:.2}");
         }

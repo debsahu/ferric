@@ -72,13 +72,14 @@ fn test_headless_concordance_and_pae_domain_heatmap_click_to_mol3d() {
     let ctx = egui::Context::default();
     let mut panel = IntegrativeAfPanel::new();
     let (demo_ref, status) = panel
-        .load_synthetic_two_domain_demo()
-        .expect("load synthetic 2-domain AF demo");
+        .load_ubiquitin_single_domain_demo()
+        .expect("load ubiquitin AF demo");
     assert!(status.contains("Analyzed 76 residues"), "got: {status}");
     assert!(status.contains("synthetic demo"), "got: {status}");
     assert!(!status.contains("Validated"), "got: {status}");
 
-    // Verify 76-residue Ubiquitin PAE matrix & 2 rigid domains clustered by T21.5 spectral PAE partitioning
+    // `21F:B13`: ubiquitin is ONE rigid domain. The synthetic PAE must cluster to a single domain
+    // (core 1-71; flexible tail 72-76 unassigned), with no inter-domain GDO motion verdict.
     let pae = panel.pae_matrix.as_ref().expect("PAE matrix loaded");
     assert_eq!(
         pae.n_residues, 76,
@@ -88,18 +89,55 @@ fn test_headless_concordance_and_pae_domain_heatmap_click_to_mol3d() {
         .domain_partition
         .as_ref()
         .expect("PAE domain partition");
-    assert_eq!(part.domains.len(), 2);
+    assert_eq!(
+        part.domains.len(),
+        1,
+        "ubiquitin must not be split into domains"
+    );
+    assert!(part.domains[0].residue_indices.len() >= 65);
+    assert!(
+        !part.domains[0].residue_indices.iter().any(|&i| i >= 72),
+        "flexible tail 73-76 must not be in the rigid domain"
+    );
 
-    // Verify Tolman GDO motion test flagged decoupled Domain 2 (`0.48x` scaled RDCs) AND Q_free is strictly finite!
+    // RDCs are the EXPERIMENTAL 1D3Z N-H couplings (no fabricated domain scaling), so the Saupe
+    // fit Q_free on held-out couplings is a genuine cross-validation of 1UBQ.
+    let n_exp_nh = include_str!("../../../data/fixtures/ubiquitin_1d3z_rdc.tsv")
+        .lines()
+        .filter(|l| l.starts_with("bicelle_neutral\t") && l.contains("\t1D_NH\t"))
+        .count();
+    let n_demo_rdc = panel.rdc_tsv_buf.lines().skip(1).count();
+    assert_eq!(n_demo_rdc, n_exp_nh, "demo RDCs must be the 1D3Z N-H set");
+    assert!(
+        !panel.rdc_tsv_buf.contains("pf1"),
+        "no synthetic back-calculated RDCs"
+    );
     let gdo = panel.tolman_gdo_report.as_ref().expect("Tolman GDO report");
-    assert_eq!(gdo.domain_fits.len(), 2);
-    assert!(gdo.min_rho_gdo < 0.70);
-    for fit in &gdo.domain_fits {
-        assert!(
-            fit.q_free.is_finite(),
-            "Domain {} Q_free must be finite (never NaN), got {}",
-            fit.domain_id,
-            fit.q_free
+    assert_ne!(
+        format!("{:?}", gdo.regime),
+        "DecoupledInterDomainMotion",
+        "no manufactured inter-domain motion warning"
+    );
+    assert!(gdo.warning_message.is_none());
+    assert_eq!(gdo.domain_fits.len(), 1);
+    let fit = &gdo.domain_fits[0];
+    assert!(fit.n_free >= 8, "held-out N-H couplings: {}", fit.n_free);
+    assert!(
+        fit.q_free.is_finite() && fit.q_free < 0.35,
+        "1UBQ vs 1D3Z N-H RDC Q_free should be a good-structure value, got {}",
+        fit.q_free
+    );
+
+    // The beta1 residues Q2/I3 must not be flagged as hinges (the former dTheta ~177 deg flags came
+    // from helix-like synthetic shifts, not from an N-H vector sign error).
+    let conc0 = panel.concordance_report.as_ref().expect("concordance");
+    for sid in [2, 3] {
+        let r = conc0.residues.iter().find(|r| r.seq_id == sid).unwrap();
+        assert_ne!(
+            format!("{:?}", r.concordance_class),
+            "DynamicHingeOrAltState",
+            "residue {sid}: dTheta={:?}",
+            r.delta_theta_deg
         );
     }
 
@@ -155,10 +193,53 @@ fn test_headless_concordance_and_pae_domain_heatmap_click_to_mol3d() {
     panel.active_tab = IntegrativeStudioTab::PaeDomainHeatmap;
     let _ = run_headless_frame(&ctx, &mut panel, false, Vec::new());
     assert_eq!(panel.last_telemetry.pae_cells_drawn, 76 * 76);
-    assert_eq!(panel.last_telemetry.pae_domain_boxes_drawn, 2);
-    assert!(panel.last_telemetry.gdo_badges_drawn >= 3);
+    assert_eq!(panel.last_telemetry.pae_domain_boxes_drawn, 1);
+    assert!(panel.last_telemetry.gdo_badges_drawn >= 2);
 
-    // Simulate clicking an inter-domain off-diagonal cell `(i ~ 10 in D1, j ~ 50 in D2)` on the PAE heatmap
+    // UI mechanics of the domain-pair click -> mol3d coupling need >= 2 PAE domains. Use an
+    // explicitly TOY two-block PAE written here in the test (NOT shipped as a demo and NOT a property
+    // of ubiquitin) on the same coordinates, without RDCs.
+    let toy_pae = {
+        let blk = |i: usize| {
+            if i < 35 {
+                1
+            } else if (40..71).contains(&i) {
+                2
+            } else {
+                0
+            }
+        };
+        let rows: Vec<String> = (0..76)
+            .map(|i| {
+                let cells: Vec<String> = (0..76)
+                    .map(|j| {
+                        let v = if i == j {
+                            0.5
+                        } else if blk(i) != 0 && blk(i) == blk(j) {
+                            2.0
+                        } else {
+                            22.0
+                        };
+                        format!("{v:.2}")
+                    })
+                    .collect();
+                format!("[{}]", cells.join(","))
+            })
+            .collect();
+        format!(
+            "[{{\"max_predicted_aligned_error\":31.75,\"predicted_aligned_error\":[{}]}}]",
+            rows.join(",")
+        )
+    };
+    panel.pae_json_buf = toy_pae;
+    panel.rdc_tsv_buf.clear();
+    panel
+        .ingest_from_buffers(Some(&demo_ref))
+        .expect("toy two-block PAE ingest");
+    assert_eq!(panel.domain_partition.as_ref().unwrap().domains.len(), 2);
+    let _ = run_headless_frame(&ctx, &mut panel, false, Vec::new());
+
+    // Simulate clicking an inter-block off-diagonal cell `(i ~ 10 in D1, j ~ 50 in D2)` on the toy heatmap
     let pae_rect = panel.last_pae_plot_rect.expect("pae_plot_rect recorded");
     let click_pos = egui::pos2(
         pae_rect.min.x + pae_rect.width() * (50.5 / 76.0),
@@ -239,7 +320,7 @@ fn test_headless_concordance_and_pae_domain_heatmap_click_to_mol3d() {
 fn test_headless_cofold_tab_and_excited_state_bic_parity_interaction() {
     let ctx = egui::Context::default();
     let mut panel = IntegrativeAfPanel::new();
-    let (demo_ref, _) = panel.load_synthetic_two_domain_demo().unwrap();
+    let (demo_ref, _) = panel.load_ubiquitin_single_domain_demo().unwrap();
 
     // Render Tab 3 (Co-Fold Pose Ranker) across dialects & sort columns
     panel.active_tab = IntegrativeStudioTab::CofoldPoseRanker;
@@ -426,8 +507,8 @@ fn test_pae_heatmap_cached_texture_uploads_once_over_five_frames() {
     let ctx = egui::Context::default();
     let mut panel = IntegrativeAfPanel::new();
     let _ = panel
-        .load_synthetic_two_domain_demo()
-        .expect("load synthetic 2-domain AF demo");
+        .load_ubiquitin_single_domain_demo()
+        .expect("load ubiquitin AF demo");
     panel.active_tab = IntegrativeStudioTab::PaeDomainHeatmap;
 
     for _ in 0..5 {
@@ -442,7 +523,7 @@ fn test_af_demo_local_synthetic_labels_76aa_and_no_nan() {
 
     let mut panel = IntegrativeAfPanel::new();
     let (demo_ref, _) = panel
-        .load_synthetic_two_domain_demo()
+        .load_ubiquitin_single_domain_demo()
         .expect("load 76-aa Ubiquitin synthetic AF demo");
     assert_eq!(demo_ref.sequence.len(), 76);
     assert_eq!(panel.pae_matrix.as_ref().expect("pae").n_residues, 76);
@@ -478,5 +559,89 @@ fn test_af_demo_local_synthetic_labels_76aa_and_no_nan() {
             !joined.contains("NaN"),
             "AF demo tab {tab:?} must never render NaN (e.g. Q_free=NaN): {joined}"
         );
+    }
+}
+
+/// `21F:B13`: the PAE colorbar labels and the residue axes must be fully inside their clip rects.
+/// Stricter than `audit_text_layout` (which uses tight glyph mesh bounds + 2.5 px tolerance and so
+/// missed the bottom "31.8 A" label overflowing the colorbar rect): uses each galley's full layout
+/// rect with zero tolerance.
+#[test]
+fn test_pae_tab_colorbar_and_residue_axes_unclipped_strict_galley_rects() {
+    fn walk(
+        shape: &egui::Shape,
+        clip: egui::Rect,
+        out: &mut Vec<(String, egui::Rect, egui::Rect)>,
+    ) {
+        match shape {
+            egui::Shape::Text(ts) => {
+                let t = ts.galley.job.text.clone();
+                if !t.trim().is_empty() {
+                    out.push((t, ts.galley.rect.translate(ts.pos.to_vec2()), clip));
+                }
+            }
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, clip, out)),
+            _ => {}
+        }
+    }
+    let mut panel = IntegrativeAfPanel::new();
+    let _ = panel.load_ubiquitin_single_domain_demo().unwrap();
+    panel.active_tab = IntegrativeStudioTab::PaeDomainHeatmap;
+    for (w, h) in [(1440.0_f32, 900.0_f32), (1280.0, 800.0)] {
+        let ctx = egui::Context::default();
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
+        let mut out = egui::FullOutput::default();
+        for _ in 0..2 {
+            out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(vp),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let _ = panel.show(ui, false);
+                    });
+                },
+            );
+            out.textures_delta.clear();
+        }
+        let mut texts = Vec::new();
+        for cs in &out.shapes {
+            walk(&cs.shape, cs.clip_rect, &mut texts);
+        }
+        let plot = panel.last_pae_plot_rect.expect("pae plot rect");
+        let max_lbl = format!("{PAE_COLORBAR_MAX_ANGSTROM:.2} A");
+        let colorbar_lbl = texts
+            .iter()
+            .find(|(t, _, _)| *t == max_lbl)
+            .unwrap_or_else(|| panic!("colorbar max label {max_lbl:?} must render at {w}x{h}"));
+        // Residue-axis labels: "1" and "76" on both axes, adjacent to the heatmap.
+        let near_plot = |r: &egui::Rect| r.intersects(plot.expand(40.0)) && !plot.contains_rect(*r);
+        for lbl in ["1", "76"] {
+            let n_lbl = texts
+                .iter()
+                .filter(|(t, r, _)| t.trim() == lbl && near_plot(r))
+                .count();
+            assert!(
+                n_lbl >= 2,
+                "residue axis label {lbl:?} on x and y axes at {w}x{h}, got {n_lbl}"
+            );
+        }
+        assert!(texts.iter().any(|(t, _, _)| t.contains("scored residue j")));
+        let checked: Vec<_> = texts
+            .iter()
+            .filter(|(t, r, _)| {
+                *t == colorbar_lbl.0
+                    || t.ends_with(" A") && r.min.x >= plot.max.x
+                    || (t.trim().parse::<usize>().is_ok() && near_plot(r))
+            })
+            .collect();
+        assert!(checked.len() >= 7);
+        for (t, r, clip) in checked {
+            assert!(
+                clip.contains_rect(*r),
+                "{t:?} clipped at {w}x{h}: galley={r:?} clip={clip:?}"
+            );
+        }
     }
 }

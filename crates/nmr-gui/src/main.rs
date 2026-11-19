@@ -1755,6 +1755,10 @@ struct NmrWorkbenchApp {
     show_strips_dock: bool,
     show_strip_details_drawer: bool,
     last_sequence_ribbon_rect: Option<egui::Rect>,
+    /// Data-plot rectangle of the 2D spectrum canvas from the most recent frame (contour area only:
+    /// excludes the F1/F2 marginal projection strips, the ppm rulers and the peak table). Recorded
+    /// by `draw_hsqc_canvas` for the honest "data-plot area" layout metric (`21F:B11`).
+    last_hsqc_plot_rect: Option<egui::Rect>,
     show_workflow_guide: bool,
     show_sequence_ribbon: bool,
     paper_white_canvas: bool,
@@ -2299,6 +2303,7 @@ impl NmrWorkbenchApp {
             show_strips_dock: false,
             show_strip_details_drawer: false,
             last_sequence_ribbon_rect: None,
+            last_hsqc_plot_rect: None,
             show_workflow_guide: false,
             show_sequence_ribbon: true,
             paper_white_canvas: true,
@@ -8293,7 +8298,9 @@ impl NmrWorkbenchApp {
             && stage_rect.width() >= 280.0
             && stage_rect.height() >= 240.0;
         let ruler_bottom_h = if is_compact_mobile { 0.0 } else { 24.0 };
-        let ruler_right_w = if is_compact_mobile { 0.0 } else { 72.0 };
+        // F1 ruler: numeric ticks only (the nucleus tag sits on its own line under the first tick),
+        // so 52 px suffices for `121.25`-style labels and the contour plot keeps the width (`21F:B11`).
+        let ruler_right_w = if is_compact_mobile { 0.0 } else { 52.0 };
         let gap = if show_proj { 4.0 } else { 0.0 };
         let marg_sz = if show_proj { MARGINAL_2D_STRIP_PX } else { 0.0 };
 
@@ -8306,6 +8313,7 @@ impl NmrWorkbenchApp {
             egui::pos2(plot_left, plot_top),
             egui::pos2(plot_right, plot_bottom),
         );
+        self.last_hsqc_plot_rect = Some(rect);
         let f2_rect = show_proj.then(|| {
             egui::Rect::from_min_max(
                 egui::pos2(rect.left(), stage_rect.top()),
@@ -10040,7 +10048,7 @@ impl NmrWorkbenchApp {
                     tick_stroke,
                 );
                 let y_lbl = if i == 0 {
-                    format!("{n_val:.y_tick_dec$} {pretty_y}")
+                    format!("{n_val:.y_tick_dec$}\n{pretty_y}")
                 } else {
                     format!("{n_val:.y_tick_dec$}")
                 };
@@ -11137,6 +11145,8 @@ impl NmrWorkbenchApp {
                 egui::Sense::hover(),
             );
             self.strip_tiler.last_canvas_rect = Some(strip_rect);
+            // The sequential-walk painter does not report per-band data rects yet.
+            self.strip_tiler.last_plot_rects.clear();
             self.paint_sequential_strips(ui.painter_at(strip_rect), strip_rect, &strip_list);
         }
 
@@ -17166,6 +17176,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             show_strips_dock: false,
             show_strip_details_drawer: false,
             last_sequence_ribbon_rect: None,
+            last_hsqc_plot_rect: None,
             show_workflow_guide: false,
             show_sequence_ribbon: true,
             paper_white_canvas: true,
@@ -18015,7 +18026,11 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         //      `strip_tiler.last_canvas_rect` when strips are open).
         //    - Count the residue strip HONESTLY as `+1` composite interactive widget whenever visible
         //      (never silently excluded as 0 controls because its scrollable rect exceeds 40,000 px^2).
-        let _ = app.integrative_af_panel.load_synthetic_two_domain_demo();
+        //    Area metric (`21F:B11`): the canvas rects above are used ONLY to exclude the canvases from
+        //    the control count. For HSQC-canvas modes the asserted share is the DATA-PLOT share (2D
+        //    contour plot + strip band boxes, no gutters/headers/gaps): >= 0.65 at 1440x900 and, with
+        //    the 3D strip dock open, >= 0.60 at 1280x800.
+        let _ = app.integrative_af_panel.load_ubiquitin_single_domain_demo();
         type ModeAuditCase<'a> = (
             &'a str,
             WorkbenchMode,
@@ -18184,6 +18199,8 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 }
             }
             app.last_sequence_ribbon_rect = None;
+            app.last_hsqc_plot_rect = None;
+            app.strip_tiler.last_plot_rects.clear();
 
             let ctx_1440 = egui::Context::default();
             let (out1440, m1440) = run_app_two_passes(&ctx_1440, 1440.0, 900.0, &mut app);
@@ -18239,8 +18256,35 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                     ctrl_count += 1;
                 }
             }
-            let total_spec_area_1440 = viz_r.area() + strip_canvas_1440.map_or(0.0, |r| r.area());
-            let share = total_spec_area_1440 / (1440.0 * 900.0);
+            // Area metric (`21F:B11`). For the HSQC-canvas modes (Process 2D, Assign) the honest metric
+            // is the DATA-PLOT share: union of the 2D contour plot rect (excl. F1/F2 projection
+            // strips, ppm rulers, peak table) and, when the dock is open, every strip's C'/Cα-Cβ band
+            // box (excl. ppm gutter, column headers, band gap, inter-strip gaps), as recorded by the
+            // drawing code itself. Other modes still report the panel-reported canvas rect share.
+            let uses_hsqc_canvas =
+                !force_1d && matches!(mode, WorkbenchMode::Process | WorkbenchMode::Assign);
+            let data_plot_share = |hsqc_plot: Option<egui::Rect>,
+                                   strip_plots: &[egui::Rect],
+                                   vw: f32,
+                                   vh: f32|
+             -> f32 {
+                let mut rs: Vec<egui::Rect> = hsqc_plot.into_iter().collect();
+                rs.extend_from_slice(strip_plots);
+                union_area_px2(&rs) / (vw * vh)
+            };
+            let share = if uses_hsqc_canvas {
+                let hp = app
+                    .last_hsqc_plot_rect
+                    .expect("draw_hsqc_canvas must record last_hsqc_plot_rect");
+                let strips: &[egui::Rect] = if open_strips {
+                    &app.strip_tiler.last_plot_rects
+                } else {
+                    &[]
+                };
+                data_plot_share(Some(hp), strips, 1440.0, 900.0)
+            } else {
+                viz_r.area() / (1440.0 * 900.0)
+            };
             assert!(
                 ctrl_count <= MAX_PRIMARY_CONTROLS_PER_MODE,
                 "{name}: expected <= 12 primary controls (incl. residue strip), got {ctrl_count} (rects={:?})",
@@ -18248,7 +18292,10 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             );
             assert!(
                 share >= MIN_CANVAS_AREA_FRACTION,
-                "{name}: expected spectrum/canvas share >= {MIN_CANVAS_AREA_FRACTION} at 1440x900, got {share:.3} (viz={viz_r:?}, strips={strip_canvas_1440:?})"
+                "{name}: expected {} share >= {MIN_CANVAS_AREA_FRACTION} at 1440x900, got {share:.3} (hsqc_plot={:?}, strip_plots={:?})",
+                if uses_hsqc_canvas { "data-plot" } else { "canvas" },
+                app.last_hsqc_plot_rect,
+                app.strip_tiler.last_plot_rects
             );
             if mode == WorkbenchMode::Assign {
                 assert!(
@@ -18276,24 +18323,35 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             let vp1280 = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
             let audit = audit_text_layout(&out1280.shapes, vp1280);
             println!(
-                "[S9 FULL-APP AUDIT] {:<20} | ctrls={:>2}/12 | canvas_1440={:>5.1}% | clip_1280={} | ovlp_1280={} | min_font={:.1}px",
+                "[S9 FULL-APP AUDIT] {:<20} | ctrls={:>2}/12 | {}_1440={:>5.1}% | clip_1280={} | ovlp_1280={} | min_font={:.1}px",
                 name,
                 ctrl_count,
+                if uses_hsqc_canvas { "dataplot" } else { "canvas" },
                 share * 100.0,
                 audit.clipped.len(),
                 audit.overlapping.len(),
                 audit.min_font_px
             );
             if open_strips {
-                let strip_canvas_1280 = app
-                    .strip_tiler
-                    .last_canvas_rect
-                    .expect("1280x800 strip canvas rect");
-                let share_1280 =
-                    (m1280.active_viz_rect.area() + strip_canvas_1280.area()) / (1280.0 * 800.0);
+                // Data-plot share at 1280x800 (HSQC contour plot + strip band boxes), floor 0.60.
+                const MIN_DATA_PLOT_FRACTION_1280: f32 = 0.60;
+                let share_1280 = data_plot_share(
+                    app.last_hsqc_plot_rect,
+                    &app.strip_tiler.last_plot_rects,
+                    1280.0,
+                    800.0,
+                );
+                println!(
+                    "[S9 FULL-APP AUDIT] {name:<20} | dataplot_1280={:>5.1}% | hsqc_plot={:?} | n_strip_plots={}",
+                    share_1280 * 100.0,
+                    app.last_hsqc_plot_rect,
+                    app.strip_tiler.last_plot_rects.len()
+                );
                 assert!(
-                    share_1280 >= MIN_CANVAS_AREA_FRACTION,
-                    "{name} at 1280x800: expected HSQC+3D strips share >= {MIN_CANVAS_AREA_FRACTION}, got {share_1280:.3}"
+                    share_1280 >= MIN_DATA_PLOT_FRACTION_1280,
+                    "{name} at 1280x800: expected HSQC+3D-strip data-plot share >= {MIN_DATA_PLOT_FRACTION_1280}, got {share_1280:.3} (hsqc_plot={:?}, strip_plots={:?})",
+                    app.last_hsqc_plot_rect,
+                    app.strip_tiler.last_plot_rects
                 );
                 let dock_r_1280 = m1280.right_dock_rect.expect("1280x800 strips right dock");
                 assert!(
@@ -18808,100 +18866,185 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         }
     }
 
+    /// Exact area of the union of axis-aligned rects (coordinate compression), in px^2.
+    fn union_area_px2(rects: &[eframe::egui::Rect]) -> f32 {
+        let rs: Vec<_> = rects.iter().filter(|r| r.is_positive()).collect();
+        let mut xs: Vec<f32> = rs.iter().flat_map(|r| [r.left(), r.right()]).collect();
+        let mut ys: Vec<f32> = rs.iter().flat_map(|r| [r.top(), r.bottom()]).collect();
+        xs.sort_by(f32::total_cmp);
+        xs.dedup();
+        ys.sort_by(f32::total_cmp);
+        ys.dedup();
+        let mut area = 0.0f32;
+        for xw in xs.windows(2) {
+            for yw in ys.windows(2) {
+                let c = eframe::egui::pos2(0.5 * (xw[0] + xw[1]), 0.5 * (yw[0] + yw[1]));
+                if rs.iter().any(|r| r.contains(c)) {
+                    area += (xw[1] - xw[0]) * (yw[1] - yw[0]);
+                }
+            }
+        }
+        area
+    }
+
+    #[test]
+    fn test_union_area_px2_counts_overlap_once() {
+        use eframe::egui::{pos2, Rect};
+        let a = Rect::from_min_max(pos2(0.0, 0.0), pos2(10.0, 10.0));
+        let b = Rect::from_min_max(pos2(5.0, 5.0), pos2(15.0, 15.0));
+        assert!((union_area_px2(&[a, b]) - 175.0).abs() < 1e-3);
+        assert!((union_area_px2(&[a]) - 100.0).abs() < 1e-3);
+    }
+
+    /// Write a real on-disk multi-experiment Bruker folder (`1/` = 2D 1H-15N HSQC `2rr`,
+    /// `2/` = 3D HNCA `3rrr`, `3/` = 3D HN(CO)CA `3rrr`, each with `acqus` PULPROG) plus `seq.fasta`
+    /// for the first `n_res` residues of the synthetic ubiquitin reference
+    /// (`data/fixtures/synthetic_ubiquitin.str`). Peaks are simulated with `nmr_core::simulate` and
+    /// rendered with `render_hsqc_2d` / `render_triple_3d`; the returned sub-reference is the ground
+    /// truth for assignment checks.
+    fn write_first_run_hsqc_hnca_bruker_fixture(
+        root: &std::path::Path,
+        n_res: usize,
+    ) -> nmr_core::nmrstar::Reference {
+        use nmr_core::simulate::{
+            render_hsqc_2d, render_triple_3d, simulate, SimConfig, SpectrumRenderConfig,
+        };
+        use nmr_core::spectrum::{write_bruker_pdata_2d, write_bruker_pdata_3d};
+        let full = nmr_core::nmrstar::read_star_str(super::SYNTHETIC_UBIQUITIN_STR, None)
+            .expect("parse synthetic ubiquitin");
+        let mut sub = nmr_core::nmrstar::Reference::new(
+            full.sequence[..n_res].to_vec(),
+            full.seq_ids[..n_res].to_vec(),
+        );
+        for ((k, atom), v) in &full.shifts {
+            if *k < n_res {
+                sub.shifts.insert((*k, atom.clone()), *v);
+            }
+        }
+        let (peaks, _truth) = simulate(
+            &sub,
+            &SimConfig {
+                experiments: vec!["HSQC".into(), "HNCA".into(), "HNCOCA".into()],
+                p_missing_peak: 0.0,
+                p_missing_root: 0.0,
+                spurious_rate: 0.0,
+                sidechain_nh2: false,
+                seed: 11,
+                ..SimConfig::default()
+            },
+        );
+        let rcfg = SpectrumRenderConfig {
+            nx_h: 192,
+            ny_n: 64,
+            nz_c: 64,
+            lw_h_ppm: 0.035,
+            lw_n_ppm: 0.45,
+            lw_c_ppm: 0.45,
+            seed: 5,
+            ..SpectrumRenderConfig::default()
+        };
+        let _ = std::fs::remove_dir_all(root);
+        let hsqc = render_hsqc_2d(&peaks, &rcfg);
+        write_bruker_pdata_2d(root.join("1").join("pdata").join("1"), &hsqc).expect("write HSQC");
+        for (expno, exp, pulprog) in [("2", "HNCA", "hncagp3d"), ("3", "HNCOCA", "hncocagp3d")] {
+            let cube = render_triple_3d(exp, &peaks, &rcfg);
+            write_bruker_pdata_3d(root.join(expno).join("pdata").join("1"), &cube)
+                .expect("write 3D cube");
+            std::fs::write(
+                root.join(expno).join("acqus"),
+                format!("##TITLE= {exp}\n##$PULPROG= <{pulprog}>\n##$NUC1= <1H>\n##END=\n"),
+            )
+            .expect("write 3D acqus");
+            std::fs::write(
+                root.join(expno).join("acqu2s"),
+                "##TITLE= C\n##$NUC1= <13C>\n##$TD= 64\n##END=\n",
+            )
+            .expect("write 3D acqu2s");
+            std::fs::write(
+                root.join(expno).join("acqu3s"),
+                "##TITLE= N\n##$NUC1= <15N>\n##$TD= 64\n##END=\n",
+            )
+            .expect("write 3D acqu3s");
+        }
+        std::fs::write(
+            root.join("1").join("acqus"),
+            "##TITLE= HSQC\n##$PULPROG= <hsqcetfpf3gpsi>\n##$NUC1= <1H>\n##END=\n",
+        )
+        .expect("write HSQC acqus");
+        std::fs::write(
+            root.join("1").join("acqu2s"),
+            "##TITLE= HSQC F1\n##$NUC1= <15N>\n##$TD= 64\n##END=\n",
+        )
+        .expect("write HSQC acqu2s");
+        let one_letter: String = sub
+            .sequence
+            .iter()
+            .map(|r| nmr_core::priors::three_to_one(r))
+            .collect();
+        std::fs::write(
+            root.join("seq.fasta"),
+            format!(">ubq_1_{n_res}\n{one_letter}\n"),
+        )
+        .expect("write seq.fasta");
+        sub
+    }
+
+    /// Residues whose assigned spin system's (H, N) matches the ground-truth amide of the residue it
+    /// was placed on (|dH| <= 0.03 ppm, |dN| <= 0.3 ppm). Returns `(n_correct, n_assigned)`.
+    fn count_ground_truth_assignments(
+        app: &super::NmrWorkbenchApp,
+        truth: &nmr_core::nmrstar::Reference,
+    ) -> (usize, usize, Vec<String>) {
+        let Some(res) = app.assign_res.as_ref() else {
+            return (0, 0, Vec::new());
+        };
+        let mut n_ok = 0usize;
+        let mut n_asg = 0usize;
+        let mut ok_labels = Vec::new();
+        for (ss_idx, &k) in res.position.iter().enumerate() {
+            if k < 0 {
+                continue;
+            }
+            let k = k as usize;
+            let Some(ss) = app.systems.get(ss_idx) else {
+                continue;
+            };
+            n_asg += 1;
+            let h = truth.shifts.get(&(k, "H".to_string()));
+            let n = truth.shifts.get(&(k, "N".to_string()));
+            if let (Some(&h), Some(&n)) = (h, n) {
+                if (ss.h - h).abs() <= 0.03 && (ss.n - n).abs() <= 0.3 {
+                    n_ok += 1;
+                    ok_labels.push(format!(
+                        "{}{}",
+                        nmr_core::priors::three_to_one(&truth.sequence[k]),
+                        truth.seq_ids[k]
+                    ));
+                }
+            }
+        }
+        (n_ok, n_asg, ok_labels)
+    }
+
     #[test]
     fn test_first_run_bruker_open_process_pick_assign_within_5_real_clicks() {
         use super::*;
         use eframe::egui;
         use nmr_gui::workbench_mode::audit_text_layout;
 
-        // 1. Write a real Bruker 2D HSQC (`pdata/1/{procs, proc2s, 2rr}`) + sequence FASTA to a temp directory
+        // 1. Real on-disk multi-experiment Bruker folder: 2D HSQC + 3D HNCA + 3D HN(CO)CA + FASTA
+        //    for ubiquitin residues 1-15 (sequential CA connectivity, known ground truth).
+        const N_RES: usize = 15;
         let tmp_root = std::env::temp_dir().join(format!(
-            "ferric_b12_first_run_bruker_{}",
+            "ferric_b12_first_run_hsqc_hnca_{}",
             std::process::id()
         ));
-        let _ = std::fs::remove_dir_all(&tmp_root);
-        let pdata_dir = tmp_root.join("1").join("pdata").join("1");
-        std::fs::create_dir_all(&pdata_dir).expect("create temp Bruker pdata/1 dir");
+        let truth = write_first_run_hsqc_hnca_bruker_fixture(&tmp_root, N_RES);
 
-        let nx = 64usize;
-        let ny = 32usize;
-        let procs = format!(
-            "##TITLE= Synthetic HSQC F2\n\
-             ##$SI= {nx}\n\
-             ##$XDIM= {nx}\n\
-             ##$OFFSET= 10.5\n\
-             ##$SW_p= 3600.0\n\
-             ##$SF= 600.13\n\
-             ##$NC_proc= 0\n\
-             ##$BYTORDP= 0\n\
-             ##$DTYPP= 0\n\
-             ##$AXNUC= <1H>\n\
-             ##END=\n"
-        );
-        let proc2s = format!(
-            "##TITLE= Synthetic HSQC F1\n\
-             ##$SI= {ny}\n\
-             ##$XDIM= {ny}\n\
-             ##$OFFSET= 132.0\n\
-             ##$SW_p= 1824.0\n\
-             ##$SF= 60.81\n\
-             ##$NC_proc= 0\n\
-             ##$BYTORDP= 0\n\
-             ##$DTYPP= 0\n\
-             ##$AXNUC= <15N>\n\
-             ##END=\n"
-        );
-        std::fs::write(pdata_dir.join("procs"), procs).expect("write procs");
-        std::fs::write(pdata_dir.join("proc2s"), proc2s).expect("write proc2s");
-        std::fs::write(
-            tmp_root.join("1").join("acqus"),
-            "##TITLE= HSQC acqus\n##$PULPROG= <hsqcetfpf3gpsi>\n##$NUC1= <1H>\n##$PARMODE= 1\n##END=\n",
-        )
-        .expect("write acqus");
-        std::fs::write(
-            tmp_root.join("1").join("acqu2s"),
-            "##TITLE= HSQC acqu2s\n##$NUC1= <15N>\n##$TD= 32\n##END=\n",
-        )
-        .expect("write acqu2s");
-        std::fs::write(pdata_dir.join("title"), "1H-15N HSQC\n").expect("write title");
-
-        let ax_h = nmr_core::spectrum::AxisPpm::from_bounds("1H", nx, 10.5, 4.5, 600.13);
-        let ax_n = nmr_core::spectrum::AxisPpm::from_bounds("15N", ny, 132.0, 102.0, 60.81);
-        let mut raw_2rr = Vec::with_capacity(nx * ny * 4);
-        let peak_coords = [
-            (8.92_f64, 121.4_f64),
-            (8.45, 118.2),
-            (8.12, 115.6),
-            (7.85, 124.8),
-            (7.55, 119.5),
-            (8.68, 112.4),
-        ];
-        for iy in 0..ny {
-            let n_ppm = ax_n.index_to_ppm(iy as f64);
-            for ix in 0..nx {
-                let h_ppm = ax_h.index_to_ppm(ix as f64);
-                let mut val = 10.0_f64;
-                // Residual water ridge near 4.70 ppm
-                let dw = (h_ppm - 4.70) / 0.08;
-                val += 50_000.0 * (-0.5 * dw * dw).exp();
-                for &(ph, pn) in &peak_coords {
-                    let dh = (h_ppm - ph) / 0.09;
-                    let dn = (n_ppm - pn) / 0.9;
-                    val += 80_000.0 * (-0.5 * (dh * dh + dn * dn)).exp();
-                }
-                raw_2rr.extend_from_slice(&(val.round() as i32).to_le_bytes());
-            }
-        }
-        std::fs::write(pdata_dir.join("2rr"), &raw_2rr).expect("write 2rr");
-        std::fs::write(tmp_root.join("seq.fasta"), ">ubq_frag\nMQIFVKTLTGK\n")
-            .expect("write seq.fasta");
-
-        // 2. Drive the REAL NmrWorkbenchApp headlessly via real egui::RawInput events!
-        let mut app = make_headless_test_app();
-        let ctx = egui::Context::default();
         let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
         let t_sec = std::cell::Cell::new(0.1_f64);
-        let run_frame = |events: Vec<egui::Event>,
+        let run_frame = |ctx: &egui::Context,
+                         events: Vec<egui::Event>,
                          dropped_files: Vec<egui::DroppedFileHandle>,
                          app: &mut NmrWorkbenchApp|
          -> egui::FullOutput {
@@ -18914,8 +19057,11 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 dropped_files,
                 ..Default::default()
             };
+            // Same per-frame order as `NmrWorkbenchApp::ui`: drops, phase-9 modals (ingest
+            // review matrix), then the responsive shell.
             let mut out = ctx.run_ui(raw, |ui| {
                 app.handle_dropped_files(ui.ctx());
+                app.draw_phase9_modals(ui.ctx());
                 let mut shell = std::mem::take(&mut app.responsive_shell);
                 let _ = render_responsive_workbench(ui, 400, &mut shell, app);
                 app.responsive_shell = shell;
@@ -18923,130 +19069,158 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             out.textures_delta.clear();
             out
         };
-
-        let find_button_center = |out: &egui::FullOutput, label: &str| -> egui::Pos2 {
-            let audit = audit_text_layout(&out.shapes, vp);
-            audit
-                .texts
-                .iter()
-                .find(|t| t.text.trim() == label)
-                .map(|t| t.rect.center())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Expected rendered UI button {label:?}, found {:?}",
-                        audit
-                            .texts
-                            .iter()
-                            .map(|t| t.text.as_str())
-                            .collect::<Vec<_>>()
-                    )
-                })
-        };
-
         let real_input_actions = std::cell::Cell::new(0usize);
-        let click_label = |label: &str, app: &mut NmrWorkbenchApp| -> egui::FullOutput {
-            let pre = run_frame(Vec::new(), Vec::new(), app);
-            let pos = find_button_center(&pre, label);
-            real_input_actions.set(real_input_actions.get() + 1);
-            let _ = run_frame(
-                vec![
-                    egui::Event::PointerMoved(pos),
-                    egui::Event::PointerButton {
+        // One real input action = one pointer press+release at the centre of the rendered label.
+        let click_label =
+            |ctx: &egui::Context, label: &str, app: &mut NmrWorkbenchApp| -> egui::FullOutput {
+                let pre = run_frame(ctx, Vec::new(), Vec::new(), app);
+                let audit = audit_text_layout(&pre.shapes, vp);
+                let pos = audit
+                    .texts
+                    .iter()
+                    .rev()
+                    .find(|t| t.text.trim() == label)
+                    .map(|t| t.rect.center())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Expected rendered UI button {label:?}, found {:?}",
+                            audit
+                                .texts
+                                .iter()
+                                .map(|t| t.text.as_str())
+                                .collect::<Vec<_>>()
+                        )
+                    });
+                real_input_actions.set(real_input_actions.get() + 1);
+                let _ = run_frame(
+                    ctx,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    Vec::new(),
+                    app,
+                );
+                let _ = run_frame(
+                    ctx,
+                    vec![egui::Event::PointerButton {
                         pos,
                         button: egui::PointerButton::Primary,
-                        pressed: true,
+                        pressed: false,
                         modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                Vec::new(),
-                app,
-            );
+                    }],
+                    Vec::new(),
+                    app,
+                );
+                run_frame(ctx, Vec::new(), Vec::new(), app)
+            };
+        let drop_folder = |ctx: &egui::Context, app: &mut NmrWorkbenchApp| {
+            real_input_actions.set(real_input_actions.get() + 1);
             let _ = run_frame(
-                vec![egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
+                ctx,
                 Vec::new(),
+                vec![nmr_gui::ingest_panel::InMemoryDroppedFile::into_handle(
+                    tmp_root.clone(),
+                    Vec::new(),
+                )],
                 app,
             );
-            run_frame(Vec::new(), Vec::new(), app)
+            let _ = run_frame(ctx, Vec::new(), Vec::new(), app);
         };
 
-        // Action 1: Drop / Open the real Bruker directory (and sequence) into NmrWorkbenchApp
+        // ---- Route A: one-shot route through the review matrix (no direct method calls) ----
+        // Precondition only: the real app starts in Process mode (`NmrWorkbenchApp::new`); the
+        // headless constructor defaults to Assign, so mirror the real first-run state BEFORE input.
+        let mut app = make_headless_test_app();
+        app.workbench_mode = WorkbenchMode::Process;
+        let ctx = egui::Context::default();
+
+        // Action 1: drop the multi-experiment Bruker folder -> the ingest review matrix opens.
         assert!(app.hsqc_spec.is_none());
-        real_input_actions.set(real_input_actions.get() + 1);
-        let _ = run_frame(
-            Vec::new(),
-            vec![nmr_gui::ingest_panel::InMemoryDroppedFile::into_handle(
-                tmp_root.clone(),
-                Vec::new(),
-            )],
-            &mut app,
-        );
-        let _ = run_frame(Vec::new(), Vec::new(), &mut app);
+        drop_folder(&ctx, &mut app);
         assert!(
-            app.hsqc_spec.is_some(),
-            "Action 1 (Open Bruker dir) must load 2D HSQC spectrum (ingest_open={}, status={:?}, exps={:?}, aux={:?})",
             app.ingest_panel.open,
-            app.status_msg,
-            app.ingest_panel
-                .inventory
-                .experiments
-                .iter()
-                .map(|e| (&e.relative_path, &e.dimensionality, &e.data_state))
-                .collect::<Vec<_>>(),
-            app.ingest_panel
-                .inventory
-                .auxiliary_files
-                .iter()
-                .map(|f| &f.relative_path)
-                .collect::<Vec<_>>(),
+            "A multi-experiment Bruker folder must open the review matrix (status={:?})",
+            app.status_msg
         );
-        assert!(
-            !app.sequence.is_empty(),
-            "Action 1 must load sequence from seq.fasta"
-        );
-        app.set_workbench_mode(WorkbenchMode::Process);
-        app.activate_2d_workbook_page(app.workbook.active_2d_idx);
-
-        // Action 2: Real click on "Water" in Process mode
-        assert!(app.water_undo_2d.is_none());
-        let _ = click_label("Water", &mut app);
-        assert!(
-            app.water_undo_2d.is_some(),
-            "Action 2 (Click 'Water') must run 2D water suppression and record undo state"
-        );
-
-        // Action 3: Real click on "Assign" in the mode switcher
-        let _ = click_label("Assign", &mut app);
         assert_eq!(
-            app.workbench_mode,
-            WorkbenchMode::Assign,
-            "Action 3 (Click 'Assign') must switch workbench to Assign mode"
+            app.ingest_panel.inventory.experiments.len(),
+            3,
+            "fixture has 3 experiments (HSQC, HNCA, HN(CO)CA)"
         );
 
-        // Action 4: Real click on "Pick Peaks" in Assign mode
-        let _ = click_label("Pick Peaks", &mut app);
+        // Action 2: real click on the matrix's "Process, Pick & Run" (load + pick 2D/3D + assign).
+        let _ = click_label(&ctx, "Process, Pick & Run", &mut app);
+        assert!(app.hsqc_spec.is_some(), "status={:?}", app.status_msg);
+        assert_eq!(app.sequence.len(), N_RES, "Action 2 must load seq.fasta");
+        let n_3d_peaks = app.peaks.iter().filter(|p| p.c.is_some()).count();
         assert!(
-            app.peaks.len() >= 4,
-            "Action 4 (Click 'Pick Peaks') must pick >= 4 HSQC cross-peaks from real Bruker 2rr, got {}",
-            app.peaks.len()
+            n_3d_peaks > 0,
+            "Action 2 must pick 3D HNCA/HN(CO)CA peaks, got none (status={:?})",
+            app.status_msg
         );
 
-        // Action 5: Real click on "Run Assignment" in Assign mode
-        assert!(app.assign_res.is_none());
-        let _ = click_label("Run Assignment", &mut app);
+        // Action 3: real click on the "Assign" mode pill to review the assignment.
+        let _ = click_label(&ctx, "Assign", &mut app);
+        assert_eq!(app.workbench_mode, WorkbenchMode::Assign);
+
+        let (n_ok, n_asg, ok_labels) = count_ground_truth_assignments(&app, &truth);
+        println!(
+            "[B12 FIRST-RUN] route A: {} real actions | {} spin systems | {n_asg} assigned | {n_ok} match ground truth ({ok_labels:?}) | status={:?}",
+            real_input_actions.get(),
+            app.systems.len(),
+            app.status_msg
+        );
         assert!(
-            app.assign_res.is_some(),
-            "Action 5 (Click 'Run Assignment') must execute the assignment solver"
+            n_ok >= 1,
+            "Route A must place >= 1 spin system on its ground-truth residue (assigned {n_asg}, status={:?})",
+            app.status_msg
         );
-
+        // Noise-free synthetic HNCA/HN(CO)CA data: at least 80% of placed spin systems must sit on
+        // their true residue (route B below, HSQC roots only, has no sequential CA links).
+        assert!(
+            n_ok * 10 >= n_asg * 8,
+            "Route A ground-truth precision too low: {n_ok}/{n_asg} ({ok_labels:?})"
+        );
         assert!(
             real_input_actions.get() <= 5,
-            "Real headless first-run Bruker Open -> Process -> Pick -> Assign must complete in <= 5 actions, took {}",
+            "Route A must complete in <= 5 real actions, took {}",
             real_input_actions.get()
+        );
+
+        // ---- Route B: manual Water -> Assign -> Pick -> Run route on the same folder ----
+        // Disclosure (`21F:B12`): the review matrix adds a click, and Assign-mode "Pick Peaks" picks
+        // only 2D HSQC roots, so the 3D cubes stay unpicked and the run has no sequential CA data.
+        real_input_actions.set(0);
+        let mut app_b = make_headless_test_app();
+        app_b.workbench_mode = WorkbenchMode::Process;
+        let ctx_b = egui::Context::default();
+        drop_folder(&ctx_b, &mut app_b);
+        assert!(app_b.ingest_panel.open);
+        let _ = click_label(&ctx_b, "Load Selected Spectra", &mut app_b);
+        assert!(app_b.hsqc_spec.is_some());
+        let _ = click_label(&ctx_b, "Water", &mut app_b);
+        let _ = click_label(&ctx_b, "Assign", &mut app_b);
+        let _ = click_label(&ctx_b, "Pick Peaks", &mut app_b);
+        let n_3d_b = app_b.peaks.iter().filter(|p| p.c.is_some()).count();
+        let _ = click_label(&ctx_b, "Run Assignment", &mut app_b);
+        let clicks_b = real_input_actions.get();
+        let (ok_b, asg_b, _) = count_ground_truth_assignments(&app_b, &truth);
+        println!(
+            "[B12 FIRST-RUN] route B (drop, Load Selected Spectra, Water, Assign, Pick Peaks, Run Assignment): {clicks_b} real actions, {n_3d_b} 3D peaks picked, {ok_b}/{asg_b} placed on ground truth"
+        );
+        assert_eq!(
+            n_3d_b, 0,
+            "Assign-mode Pick Peaks picks only 2D roots; 3D picking needs Peaks > Pick All 3D"
+        );
+        assert!(
+            clicks_b > 5,
+            "manual multi-experiment route takes {clicks_b} actions and still lacks 3D peaks"
         );
 
         let _ = std::fs::remove_dir_all(&tmp_root);
