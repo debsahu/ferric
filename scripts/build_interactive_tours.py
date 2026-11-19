@@ -406,13 +406,19 @@ def render_gallery_html(bundles: Sequence[NormalizedBundle]) -> str:
                     "cisd3_hc_prec_pct",
                     "cold_bmrb_hc_min_pct",
                     "cold_bmrb_hc_max_pct",
+                    "cold_bmrb_gate_pct",
+                    "cold_bmrb_withdrawal_ref",
+                    "dev_target",
                 )
             ):
+                # Every scalar below is read from payload.benchmarks (B15); a missing key falls back to
+                # the scalar-free generic legend above and is reported by --check as a missing payload key.
                 m02_legend_text = (
                     f"Module 02 [historical disclosure] synthetic Ubiquitin ({float(bm['ubiquitin_realistic_pct']):.1f}%), "
-                    f"dev CISD3 ({float(bm['cisd3_acc_pct']):.2f}% / {float(bm['cisd3_hc_prec_pct']):.0f}% HC); "
+                    f"dev {html.escape(str(bm['dev_target']))} ({float(bm['cisd3_acc_pct']):.2f}% / {float(bm['cisd3_hc_prec_pct']):.0f}% HC); "
                     f"default evo-graph cold HCP {float(bm['cold_bmrb_hc_min_pct']):.2f}&ndash;{float(bm['cold_bmrb_hc_max_pct']):.2f}% "
-                    f"(latest {float(bm['cold_bmrb_hc_min_pct']):.2f}% FAILS &ge; 94%; withdrawn 13.1:P1-2)"
+                    f"(latest {float(bm['cold_bmrb_hc_min_pct']):.2f}% FAILS &ge; {float(bm['cold_bmrb_gate_pct']):.0f}%; "
+                    f"withdrawn {html.escape(str(bm['cold_bmrb_withdrawal_ref']))})"
                 )
             break
 
@@ -563,7 +569,16 @@ def render_module_html(
     elif bundle.module_index == 3:
         preset_chips = [("0° Front", 0), ("90° Side", 90), ("180° Back", 180), ("270°", 270)]
     elif bundle.module_index == 4:
-        preset_chips = [("Ile23 (Rex)", 23), ("Core Res 45", 45), ("Tail Gly75", 75)]
+        # R_ex chips come from the fitted payload.rex_sites (B15), never a hard-coded residue.
+        p4 = bundle.raw_json.get("payload", {}) or {}
+        rex_sites = p4.get("rex_sites") if isinstance(p4, dict) else None
+        if isinstance(rex_sites, list):
+            for site in rex_sites[:2]:
+                if isinstance(site, dict) and isinstance(site.get("seq_id"), (int, float)):
+                    preset_chips.append(
+                        (f"{site.get('label', site['seq_id'])} ({site.get('model', 'R_ex')} Rex)", site["seq_id"])
+                    )
+        preset_chips += [("Core Res 45", 45), ("Tail Gly75", 75)]
     elif bundle.module_index == 5:
         preset_chips = [("0 uM", 0), ("50 uM", 50), ("100 uM (Equiv)", 100), ("250 uM", 250)]
     elif bundle.module_index == 6:
@@ -2165,7 +2180,9 @@ TOURS_PLAYER_JS = r"""(function () {
         } else if (chIdx === 1) {
           var allStrips = reqArr("strips", 10);
           var pulseRegime = reqStr("hncacb_pulse_regime");
-          if (!allStrips || !pulseRegime) {
+          var walkStart = reqStr("strip_walk.start_label");
+          var walkEnd = reqStr("strip_walk.end_label");
+          if (!allStrips || !pulseRegime || !walkStart || !walkEnd) {
             drawFallbackPlaceholder("Module 02 Ch 2: 3D HNCACB Sequential Strip Walk");
             return;
           }
@@ -2175,7 +2192,7 @@ TOURS_PLAYER_JS = r"""(function () {
             ctx,
             padX,
             padY - 14,
-            "3D HNCACB Sequential Strip Walk (Phe4 -> Gly10 · Focus " + focLabel + ")",
+            "3D HNCACB Sequential Strip Walk (" + walkStart + " -> " + walkEnd + " · Focus " + focLabel + ")",
             "Non-CT HNCACB (2*d28=7.2ms): Cyan (+1) CA [incl. Gly10 CA +1, CB null; CT 2T=28ms inverts Gly CH2] · Coral (-1) CB",
             pal
           );
@@ -2390,6 +2407,12 @@ TOURS_PLAYER_JS = r"""(function () {
           var cisd3Hc = reqNum("benchmarks.cisd3_hc_prec_pct");
           var coldMin = reqNum("benchmarks.cold_bmrb_hc_min_pct");
           var coldMax = reqNum("benchmarks.cold_bmrb_hc_max_pct");
+          var coldGate = reqNum("benchmarks.cold_bmrb_gate_pct");
+          var devTarget = reqStr("benchmarks.dev_target");
+          if (coldGate === null || !devTarget) {
+            drawFallbackPlaceholder("Module 02 Ch 3: Solver Cv(T) & Benchmark Trajectory");
+            return;
+          }
           if (!cvVals || !cvTemps || !meanE || tCrit === null || maxCv === null || evoAcc === null || bayesAcc === null || stdAcc === null || ubqReal === null || cisd3Acc === null || cisd3Hc === null || coldMin === null || coldMax === null) {
             drawFallbackPlaceholder("Module 02 Ch 3: Solver Cv(T) & Benchmark Trajectory");
             return;
@@ -2399,7 +2422,7 @@ TOURS_PLAYER_JS = r"""(function () {
             padX,
             padY - 12,
             "Replica-Exchange bayes-sa Cv(T), Mean Energy & Solver Coverage",
-            "Live T_crit=" + tCrit.toFixed(2) + " (max Cv=" + maxCv.toFixed(1) + ") · [Historical] UBQ " + ubqReal.toFixed(1) + "% · CISD3 " + cisd3Acc.toFixed(2) + "%/" + cisd3Hc.toFixed(0) + "% HC · Cold " + coldMin.toFixed(2) + "-" + coldMax.toFixed(2) + "% (withdrawn)",
+            "Live T_crit=" + tCrit.toFixed(2) + " (max Cv=" + maxCv.toFixed(1) + ") · [Historical] UBQ " + ubqReal.toFixed(1) + "% · " + devTarget + " " + cisd3Acc.toFixed(2) + "%/" + cisd3Hc.toFixed(0) + "% HC · Cold " + coldMin.toFixed(2) + "-" + coldMax.toFixed(2) + "% (FAILS >=" + coldGate.toFixed(0) + "%; withdrawn)",
             pal
           );
           drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Cooling Stage (High T -> Low T)", "Normalized Cv(T) / Energy / Assigned %", pal);
@@ -2461,7 +2484,9 @@ TOURS_PLAYER_JS = r"""(function () {
           var resLabels = reqArr("res_labels", 76);
           var qcVerdict = reqStr("qc_verdict");
           var nHc = reqNum("n_high_conf");
-          if (!confArr || !resLabels || !qcVerdict || nHc === null) {
+          var nResTot = reqNum("n_res_total");
+          var hcThr = reqNum("hc_conf_threshold");
+          if (!confArr || !resLabels || !qcVerdict || nHc === null || nResTot === null || hcThr === null) {
             drawFallbackPlaceholder("Module 02 Ch 4: 76-Residue Confidence Ribbon");
             return;
           }
@@ -2469,12 +2494,12 @@ TOURS_PLAYER_JS = r"""(function () {
             ctx,
             padX,
             padY - 12,
-            "76-Residue Ubiquitin Confidence Ribbon (QC=" + qcVerdict + " · " + nHc + "/76 >= 0.80)",
+            nResTot + "-Residue Ubiquitin Confidence Ribbon (QC=" + qcVerdict + " · " + nHc + "/" + nResTot + " >= " + hcThr.toFixed(2) + ")",
             "Focus residue: " + (resLabels[focusRes - 1] || ("#" + focusRes)),
             pal
           );
-          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue 1..76", "Posterior Confidence", pal);
-          var threshY = padY + 12 + (1 - 0.8) * (ph - 24);
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue 1.." + nResTot, "Posterior Confidence", pal);
+          var threshY = padY + 12 + (1 - hcThr) * (ph - 24);
           ctx.strokeStyle = pal.amber;
           ctx.setLineDash([5, 4]);
           ctx.beginPath();
@@ -2488,7 +2513,7 @@ TOURS_PLAYER_JS = r"""(function () {
             var bw = Math.max(2, pw / 86);
             var bh = Math.max(2, conf * (ph - 24));
             var by = padY + ph - 12 - bh;
-            ctx.fillStyle = (r === focusRes) ? pal.amber : (conf >= 0.8 ? pal.green : pal.coral);
+            ctx.fillStyle = (r === focusRes) ? pal.amber : (conf >= hcThr ? pal.green : pal.coral);
             ctx.fillRect(bx, by, bw, bh);
             if (r % 5 === 0 || r === focusRes) {
               addSpot(bx + bw / 2, by, 10, resLabels[r - 1] || ("Residue " + r), ["Confidence: " + (conf * 100).toFixed(1) + "%", "QC verdict: " + qcVerdict], r <= 10 ? r : focusRes);
@@ -2633,7 +2658,16 @@ TOURS_PLAYER_JS = r"""(function () {
       }
 
       if (modIdx === 4) {
-        var resSeq = Math.round(clamp(ctrlVal, 1, 76));
+        var lastSeq = reqNum("last_seq_id");
+        var fieldA = reqNum("field_a_mhz");
+        var fieldB = reqNum("field_b_mhz");
+        if (lastSeq === null || fieldA === null || fieldB === null) {
+          drawFallbackPlaceholder("Module 04: missing payload last_seq_id / field_a_mhz / field_b_mhz");
+          return;
+        }
+        var fieldALbl = fieldA.toFixed(0) + " MHz";
+        var fieldBLbl = fieldB.toFixed(0) + " MHz";
+        var resSeq = Math.round(clamp(ctrlVal, 1, lastSeq));
         if (chIdx === 0) {
           var snrLevels = reqArr("snr_levels", 3);
           var lsBias = reqArr("locked_ls_bias_pct", 3);
@@ -2675,7 +2709,9 @@ TOURS_PLAYER_JS = r"""(function () {
           var se600 = reqNum("fit_600_se");
           var r800 = reqNum("fit_800_rate");
           var se800 = reqNum("fit_800_se");
-          if (!timesR1 || !c600 || !c800 || r600 === null || se600 === null || r800 === null || se800 === null) {
+          var decayLbl = reqStr("decay_demo_label");
+          var mcReps = reqNum("fit_mc_replicates");
+          if (!timesR1 || !c600 || !c800 || r600 === null || se600 === null || r800 === null || se800 === null || !decayLbl || mcReps === null) {
             drawFallbackPlaceholder("Module 04 Ch 2: Dual-Field Exponential Decay Fit");
             return;
           }
@@ -2683,8 +2719,8 @@ TOURS_PLAYER_JS = r"""(function () {
             ctx,
             padX,
             padY - 12,
-            "SYNTHETIC: Dual-Field 600 & 800 MHz R1 Decay Fit (Ile23)",
-            "600 MHz R1=" + r600.toFixed(2) + "+-" + se600.toFixed(2) + " s^-1 · 800 MHz R1=" + r800.toFixed(2) + "+-" + se800.toFixed(2) + " s^-1",
+            "SYNTHETIC: Dual-Field " + fieldA.toFixed(0) + " & " + fieldBLbl + " R1 Decay Fit (" + decayLbl + ")",
+            fieldALbl + " R1=" + r600.toFixed(2) + "+-" + se600.toFixed(2) + " s^-1 · " + fieldBLbl + " R1=" + r800.toFixed(2) + "+-" + se800.toFixed(2) + " s^-1 (" + mcReps.toFixed(0) + "-trial MC SE)",
             pal
           );
           drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Relaxation Delay T (s)", "Intensity I(T)", pal);
@@ -2692,8 +2728,8 @@ TOURS_PLAYER_JS = r"""(function () {
           var iMax = 1e-6;
           for (var k = 0; k < c600.length; k++) iMax = Math.max(iMax, c600[k], c800[k] || 0);
           var fitSeries = [
-            { col: pal.cyan, rate: r600, se: se600, obs: c600, i0: c600[0] * Math.exp(r600 * timesR1[0]), lbl: "600 MHz" },
-            { col: pal.amber, rate: r800, se: se800, obs: c800, i0: c800[0] * Math.exp(r800 * timesR1[0]), lbl: "800 MHz" }
+            { col: pal.cyan, rate: r600, se: se600, obs: c600, i0: c600[0] * Math.exp(r600 * timesR1[0]), lbl: fieldALbl },
+            { col: pal.amber, rate: r800, se: se800, obs: c800, i0: c800[0] * Math.exp(r800 * timesR1[0]), lbl: fieldBLbl }
           ];
           for (var fi = 0; fi < fitSeries.length; fi++) {
             var fs = fitSeries[fi];
@@ -2722,7 +2758,8 @@ TOURS_PLAYER_JS = r"""(function () {
           var ratios = reqArr("r2_over_r1", 10);
           var tauM = reqNum("tau_m_ns");
           var dParPerp = reqNum("d_par_perp");
-          if (!seqIds || !ratios || tauM === null || dParPerp === null) {
+          var tailStart = reqNum("sim_tail_start_seq");
+          if (!seqIds || !ratios || tauM === null || dParPerp === null || tailStart === null) {
             drawFallbackPlaceholder("Module 04 Ch 3: Kay-Torchia-Bax R2/R1 & tau_m");
             return;
           }
@@ -2734,7 +2771,7 @@ TOURS_PLAYER_JS = r"""(function () {
             "Woessner axial D_par/D_perp = " + dParPerp.toFixed(2) + " · 10% outlier-trimmed rigid core",
             pal
           );
-          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue Sequence (1..76)", "600 MHz R2 / R1", pal);
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue Sequence (1.." + lastSeq + ")", fieldALbl + " R2 / R1", pal);
           var maxRatio = 1.0;
           var sortedR = ratios.slice().sort(function (a, b) { return a - b; });
           var medRatio = sortedR[Math.floor(sortedR.length * 0.5)] || 1.0;
@@ -2750,11 +2787,11 @@ TOURS_PLAYER_JS = r"""(function () {
           for (var i = 0; i < seqIds.length && i < ratios.length; i++) {
             var rId = seqIds[i];
             var ratio = ratios[i];
-            var sx = padX + ((rId - 0.5) / 76) * pw;
+            var sx = padX + ((rId - 0.5) / lastSeq) * pw;
             var sy = padY + ph - 12 - clamp(ratio / (maxRatio * 1.12), 0, 1) * (ph - 26);
             var isSel = rId === resSeq;
             var isOutlier = ratio > medRatio * 1.22;
-            ctx.fillStyle = isSel ? pal.amber : (isOutlier ? pal.coral : (rId >= 72 ? pal.violet : pal.teal));
+            ctx.fillStyle = isSel ? pal.amber : (isOutlier ? pal.coral : (rId >= tailStart ? pal.violet : pal.teal));
             ctx.beginPath();
             ctx.arc(sx, sy, isSel ? 6 : 3.5, 0, Math.PI * 2);
             ctx.fill();
@@ -2765,30 +2802,32 @@ TOURS_PLAYER_JS = r"""(function () {
           var s2Vals = reqArr("s2_vals", 10);
           var rexVals = reqArr("rex_vals", 10);
           var modelIds = reqArr("model_ids", 10);
-          if (!seqIds || !s2Vals || !rexVals || !modelIds) {
+          var rexThr = reqNum("rex_report_threshold_s_inv");
+          var rexClause = reqStr("rex_clause");
+          if (!seqIds || !s2Vals || !rexVals || !modelIds || rexThr === null || !rexClause) {
             drawFallbackPlaceholder("Module 04 Ch 4: Lipari-Szabo M1-M5 S^2 Profile");
             return;
           }
           var nRex = 0;
-          for (var k = 0; k < rexVals.length; k++) { if (rexVals[k] > 0.5) nRex++; }
+          for (var k = 0; k < rexVals.length; k++) { if (rexVals[k] > rexThr) nRex++; }
           drawCardTitle(
             ctx,
             padX,
             padY - 12,
             "SYNTHETIC: Lipari-Szabo M1-M5 S^2 Profile (Inspect Res #" + resSeq + ")",
-            seqIds.length + " fitted non-Pro residues · " + nRex + " chemical-exchange (R_ex > 0.5 s^-1) sites",
+            seqIds.length + " fitted non-Pro residues · " + nRex + " chemical-exchange (R_ex > " + rexThr.toFixed(1) + " s^-1) sites · fit: " + rexClause,
             pal
           );
-          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue Sequence (1..76)", "Order Parameter S^2", pal);
+          drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Residue Sequence (1.." + lastSeq + ")", "Order Parameter S^2", pal);
           for (var i = 0; i < seqIds.length && i < s2Vals.length; i++) {
             var rId = seqIds[i];
             var s2 = s2Vals[i];
             var rex = rexVals[i] || 0;
             var mdl = modelIds[i] || "M1";
-            var sx = padX + ((rId - 0.5) / 76) * pw;
+            var sx = padX + ((rId - 0.5) / lastSeq) * pw;
             var sy = padY + 14 + (1 - clamp(s2, 0, 1)) * (ph - 28);
             var isSel = rId === resSeq;
-            ctx.fillStyle = isSel ? pal.amber : (rex > 0.5 ? pal.coral : pal.cyan);
+            ctx.fillStyle = isSel ? pal.amber : (rex > rexThr ? pal.coral : pal.cyan);
             ctx.beginPath();
             ctx.arc(sx, sy, isSel ? 6 : 3.5, 0, Math.PI * 2);
             ctx.fill();
@@ -4254,6 +4293,17 @@ REQUIRED_MODULE_PAYLOAD_KEYS: Dict[int, Tuple[str, ...]] = {
         "benchmarks.cisd3_hc_prec_pct",
         "benchmarks.cold_bmrb_hc_min_pct",
         "benchmarks.cold_bmrb_hc_max_pct",
+        "benchmarks.cold_bmrb_gate_pct",
+        "benchmarks.cold_bmrb_withdrawal_ref",
+        "benchmarks.dev_target",
+        "benchmarks.ubiquitin_hc_correct",
+        "benchmarks.ubiquitin_hc_total",
+        "benchmarks.cisd3_hc_correct",
+        "benchmarks.cisd3_hc_total",
+        "n_res_total",
+        "hc_conf_threshold",
+        "strip_walk.start_label",
+        "strip_walk.end_label",
     ),
     3: (
         "ca_coords",
@@ -4285,6 +4335,16 @@ REQUIRED_MODULE_PAYLOAD_KEYS: Dict[int, Tuple[str, ...]] = {
         "s2_vals",
         "rex_vals",
         "model_ids",
+        "last_seq_id",
+        "field_a_mhz",
+        "field_b_mhz",
+        "fit_mc_replicates",
+        "decay_demo_label",
+        "sim_tail_start_seq",
+        "rex_report_threshold_s_inv",
+        "rex_clause",
+        "validation_status.blind_gates_passed",
+        "validation_status.blind_gates_total",
     ),
     5: (
         "cest.offsets_ppm",
@@ -4383,6 +4443,10 @@ const vm = require("vm");
 
 const outDir = process.argv[1];
 const expectFallback = process.argv[2] === "expect-fallback";
+// Optional "dump-text=<path>": write every canvas fillText string per "<file>#<ch>" as JSON (B15 self-test).
+const dumpArg = process.argv.slice(2).find(a => a.startsWith("dump-text="));
+const dumpPath = dumpArg ? dumpArg.slice("dump-text=".length) : null;
+const textDump = {};
 const jsCode = fs.readFileSync(path.join(outDir, "tours_player.js"), "utf8");
 const htmlFiles = fs.readdirSync(outDir).filter(f => /^\d{2}_.*\.html$/.test(f)).sort();
 if (htmlFiles.length !== 8) {
@@ -4400,6 +4464,8 @@ for (const file of htmlFiles) {
 
   for (const ch of [1, 2, 3, 4]) {
     let drawCalls = 0;
+    const texts = [];
+    textDump[file + "#" + ch] = texts;
     const ctx = {
       _fillStyle: "#000",
       _strokeStyle: "#000",
@@ -4422,7 +4488,7 @@ for (const file of htmlFiles) {
       strokeRect() { drawCalls++; },
       fill() { drawCalls++; },
       stroke() { drawCalls++; },
-      fillText() { drawCalls++; }
+      fillText(t) { drawCalls++; texts.push(String(t)); }
     };
 
     const makeEl = (id) => ({
@@ -4575,6 +4641,9 @@ for (const file of htmlFiles) {
 if (expectFallback && fallbackTriggers === 0) {
   throw new Error("Expected at least one fallback trigger in adversarial mode, got 0");
 }
+if (dumpPath) {
+  fs.writeFileSync(dumpPath, JSON.stringify(textDump));
+}
 console.log("NODE_VM_OK pairs=" + pairs + " fallbacks=" + fallbackTriggers);
 """
 
@@ -4670,6 +4739,29 @@ def validate_tour_site(
                                 errors.append(
                                     f"{b.slug}.tour.json: {field_lbl} does not match payload.benchmarks cisd3_acc_pct {cisd3_s}"
                                 )
+                    try:
+                        u_cnt = f"({int(bm['ubiquitin_hc_correct'])}/{int(bm['ubiquitin_hc_total'])})"
+                        c_cnt = f"({int(bm['cisd3_hc_correct'])}/{int(bm['cisd3_hc_total'])})"
+                        gate_s = f">={float(bm['cold_bmrb_gate_pct']):.0f}%"
+                        gate_s2 = f">= {float(bm['cold_bmrb_gate_pct']):.0f}%"
+                    except (KeyError, TypeError, ValueError):
+                        u_cnt = c_cnt = gate_s = gate_s2 = ""
+                    if u_cnt:
+                        for cnt_s in (u_cnt, c_cnt):
+                            if cnt_s not in b.badge_detail:
+                                errors.append(
+                                    f"{b.slug}.tour.json: validation_badge.detail does not quote payload.benchmarks HC counts {cnt_s}"
+                                )
+                        ch3_cap = str(b.chapters[2].get("caption", "")) if len(b.chapters) >= 3 else ""
+                        for field_lbl, text in (("subtitle", b.subtitle), ("chapters[2].caption", ch3_cap)):
+                            if gate_s not in text:
+                                errors.append(
+                                    f"{b.slug}.tour.json: {field_lbl} does not match payload.benchmarks cold_bmrb_gate_pct {gate_s}"
+                                )
+                        if gate_s2 not in b.badge_detail:
+                            errors.append(
+                                f"{b.slug}.tour.json: validation_badge.detail does not match payload.benchmarks cold_bmrb_gate_pct {gate_s2}"
+                            )
                 strips = payload.get("strips")
                 if isinstance(strips, list) and len(strips) >= 7 and len(b.chapters) >= 2:
                     thr7 = strips[6]
@@ -4693,6 +4785,34 @@ def validate_tour_site(
                     if expected_tau not in ch3_pill:
                         errors.append(
                             f"{b.slug}.tour.json: chapters[2].metric_pill missing payload-matched '{expected_tau}' (got: {ch3_pill!r})"
+                        )
+                # Ch4 R_ex claim must name exactly the fitted payload.rex_sites (label + selected model).
+                rex_sites = payload.get("rex_sites")
+                rex_clause = payload.get("rex_clause")
+                if len(b.chapters) >= 4 and isinstance(rex_sites, list):
+                    ch4_cap = str(b.chapters[3].get("caption", ""))
+                    if isinstance(rex_clause, str) and rex_clause not in ch4_cap:
+                        errors.append(
+                            f"{b.slug}.tour.json: chapters[3].caption missing payload.rex_clause {rex_clause!r} (got: {ch4_cap!r})"
+                        )
+                    for site in rex_sites:
+                        if isinstance(site, dict):
+                            want = f"{site.get('label')} ({site.get('model')})"
+                            if want not in ch4_cap:
+                                errors.append(
+                                    f"{b.slug}.tour.json: chapters[3].caption missing fitted R_ex site {want!r}"
+                                )
+                    for mdl in re.findall(r"\bM[1-5]\b", re.sub(r"M1-M5", " ", ch4_cap)):
+                        if not any(isinstance(x, dict) and x.get("model") == mdl for x in rex_sites):
+                            errors.append(
+                                f"{b.slug}.tour.json: chapters[3].caption quotes model {mdl} not selected in payload.rex_sites"
+                            )
+                vs = payload.get("validation_status")
+                if isinstance(vs, dict) and "blind_gates_passed" in vs and "blind_gates_total" in vs:
+                    want_g = f"{int(vs['blind_gates_passed'])}/{int(vs['blind_gates_total'])}"
+                    if want_g not in b.badge_detail:
+                        errors.append(
+                            f"{b.slug}.tour.json: validation_badge.detail does not quote payload.validation_status gates {want_g}"
                         )
 
     if "tours_player.js" in site_files:
@@ -4812,7 +4932,27 @@ def _make_mock_payload(module_index: int) -> Dict[str, Any]:
                 "cold_bmrb_hc_min_pct": 88.25,
                 "cold_bmrb_hc_max_pct": 95.30,
                 "cold_bmrb_gate_pct": 94.0,
-                "cold_bmrb_status": "FAILS >=94%; withdrawn (13.1:P1-2)",
+                "cold_bmrb_withdrawal_ref": "13.1:P1-2",
+                "cold_bmrb_status": "FAILS >=94%; withdrawn under 13.1:P1-2",
+                "historical_seed_count": 5,
+                "ubiquitin_hc_correct": 310,
+                "ubiquitin_hc_total": 315,
+                "dev_target": "CISD3",
+                "dev_target_bmrb_id": 51439,
+                "cisd3_hc_correct": 59,
+                "cisd3_hc_total": 59,
+            },
+            "n_res_total": 76,
+            "n_hsqc_roots": 72,
+            "hsqc_sf_h_mhz": 600.13,
+            "hc_conf_threshold": 0.80,
+            "strip_walk": {
+                "start_label": "Phe4",
+                "end_label": "Gly10",
+                "inversion_label": "Thr7",
+                "inversion_cb_ppm": 73.3,
+                "inversion_ca_ppm": 62.8,
+                "end_cb_null": True,
             },
         }
     if module_index == 3:
@@ -4848,6 +4988,32 @@ def _make_mock_payload(module_index: int) -> Dict[str, Any]:
             "s2_vals": [0.84 if r == 23 else 0.87 for r in seq_ids],
             "rex_vals": [3.6 if r == 23 else 0.0 for r in seq_ids],
             "model_ids": ["M3" if r == 23 else "M2" for r in seq_ids],
+            "fields_mhz": [600.0, 800.0],
+            "field_a_mhz": 600.0,
+            "field_b_mhz": 800.0,
+            "fit_mc_replicates": 100,
+            "decay_demo_seq_id": 23,
+            "decay_demo_res_name": "ILE",
+            "decay_demo_label": "Ile23",
+            "snr_report_level": 4.0,
+            "snr_report_ls_bias_pct": 0.42,
+            "snr_report_max_bias_pct": 29.2,
+            "pdb_id": "1UBQ",
+            "first_seq_id": 1,
+            "last_seq_id": 76,
+            "sim_tail_start_seq": 72,
+            "core_s2_mean": 0.87,
+            "rex_report_threshold_s_inv": 0.5,
+            "rex_sites": [{"seq_id": 23, "res_name": "ILE", "label": "Ile23", "model": "M3", "rex_s_inv": 3.6}],
+            "rex_clause": "R_ex at Ile23 (M3)",
+            "validation_status": {
+                "scope": "todo_md_disclosure",
+                "phase": 17,
+                "blind_gates_passed": 0,
+                "blind_gates_total": 8,
+                "open_gates": ["F10", "F11"],
+                "open_gate_scopes": ["real-data relaxation & model-free", "raw pseudo-3D relax_io"],
+            },
         }
     if module_index == 5:
         offs = [round(115.0 + 0.5 * i, 2) for i in range(16)]
@@ -5042,9 +5208,16 @@ def _make_mock_bundles(data_dir: Path) -> None:
             thr7 = payload["strips"][6]
             subtitle = (
                 f"Live fixture: evo-graph {payload['evo_acc_pct']:.1f}% · [Historical disclosure] "
-                f"UBQ {bm['ubiquitin_realistic_pct']:.1f}%, dev CISD3 {bm['cisd3_acc_pct']:.2f}%/"
+                f"UBQ {bm['ubiquitin_realistic_pct']:.1f}%, dev {bm['dev_target']} {bm['cisd3_acc_pct']:.2f}%/"
                 f"{bm['cisd3_hc_prec_pct']:.0f}% HC, cold BMRB {bm['cold_bmrb_hc_min_pct']:.2f}-"
-                f"{bm['cold_bmrb_hc_max_pct']:.2f}% (FAILS >=94%; withdrawn)"
+                f"{bm['cold_bmrb_hc_max_pct']:.2f}% (FAILS >={bm['cold_bmrb_gate_pct']:.0f}%; withdrawn)"
+            )
+            b_det = (
+                f"Synthetic UBQ {bm['ubiquitin_realistic_pct']:.1f}% "
+                f"({bm['ubiquitin_hc_correct']}/{bm['ubiquitin_hc_total']}), dev {bm['dev_target']} "
+                f"{bm['cisd3_acc_pct']:.2f}% ({bm['cisd3_hc_correct']}/{bm['cisd3_hc_total']}); cold evo-graph "
+                f"{bm['cold_bmrb_hc_min_pct']:.2f}-{bm['cold_bmrb_hc_max_pct']:.2f}% "
+                f"(FAILS >= {bm['cold_bmrb_gate_pct']:.0f}% gate; withdrawn under {bm['cold_bmrb_withdrawal_ref']})"
             )
             chapters[1]["caption"] = (
                 f"Walks Phe4 -> Gly10: Thr7 CB={thr7['cb_i']:.1f} > CA={thr7['ca_i']:.1f} inversion."
@@ -5052,7 +5225,8 @@ def _make_mock_bundles(data_dir: Path) -> None:
             chapters[2]["caption"] = (
                 f"Live bayes-sa Cv(T) alongside [historical disclosure]: UBQ {bm['ubiquitin_realistic_pct']:.1f}%, "
                 f"dev CISD3 {bm['cisd3_acc_pct']:.2f}%/{bm['cisd3_hc_prec_pct']:.0f}% HC, "
-                f"cold BMRB {bm['cold_bmrb_hc_min_pct']:.2f}-{bm['cold_bmrb_hc_max_pct']:.2f}%."
+                f"cold BMRB {bm['cold_bmrb_hc_min_pct']:.2f}-{bm['cold_bmrb_hc_max_pct']:.2f}% "
+                f"(FAILS >={bm['cold_bmrb_gate_pct']:.0f}%)."
             )
         elif idx == 4:
             tau_m = float(payload["tau_m_ns"])
@@ -5061,6 +5235,12 @@ def _make_mock_bundles(data_dir: Path) -> None:
                 f"Outlier-trimmed R2/R1 global tau_m={tau_m:.2f} ns & Woessner axial D_par/D_perp={d_pp:.2f}."
             )
             chapters[2]["metric"] = f"tau_m={tau_m:.2f} ns  D_par/D_perp={d_pp:.2f}"
+            chapters[3]["caption"] = f"S^2 profile: {payload['rex_clause']}."
+            vs = payload["validation_status"]
+            b_det = (
+                f"Synthetic forward-model showcase: {vs['blind_gates_passed']}/{vs['blind_gates_total']} "
+                f"Phase {vs['phase']} blind real-data gates passed."
+            )
         doc = {
             "schema_version": EXPECTED_SCHEMA_VERSION,
             "module_index": idx,
@@ -5197,6 +5377,106 @@ def run_self_tests() -> int:
             f"expected B15 Mod04 tau_m mismatch error, got: {b15_errs}"
         )
 
+        # 11. B15: legend, preset chips and canvas JS must render payload scalars (not literals).
+        #     Plant sentinel values in the mock payloads and require them to surface verbatim.
+        sent_dir = root / "b15_sentinel_data"
+        _make_mock_bundles(sent_dir)
+        s02 = sent_dir / "02_hsqc_strips_solvers.tour.json"
+        d02 = json.loads(s02.read_text(encoding="utf-8"))
+        d02["payload"]["benchmarks"]["cold_bmrb_gate_pct"] = 91.0
+        d02["payload"]["benchmarks"]["cold_bmrb_withdrawal_ref"] = "99.9:PX-9"
+        d02["payload"]["benchmarks"]["dev_target"] = "PROTX"
+        d02["payload"]["hc_conf_threshold"] = 0.85
+        d02["payload"]["n_res_total"] = 77
+        d02["payload"]["strip_walk"]["start_label"] = "Abc4"
+        s02.write_text(json.dumps(d02, indent=2, sort_keys=True), encoding="utf-8")
+        s04 = sent_dir / "04_relax_modelfree.tour.json"
+        d04 = json.loads(s04.read_text(encoding="utf-8"))
+        d04["payload"].update({
+            "field_a_mhz": 611.0,
+            "field_b_mhz": 822.0,
+            "decay_demo_label": "Xaa99",
+            "fit_mc_replicates": 37,
+            "rex_report_threshold_s_inv": 0.7,
+            "rex_clause": "R_ex at Xaa99 (M4)",
+            "rex_sites": [{"seq_id": 23, "res_name": "XAA", "label": "Xaa99", "model": "M4", "rex_s_inv": 2.0}],
+            "last_seq_id": 81,
+        })
+        s04.write_text(json.dumps(d04, indent=2, sort_keys=True), encoding="utf-8")
+        sent_bundles = load_tour_bundles(sent_dir)
+        sent_files = build_tour_site_files(sent_bundles, videos_rel="videos")
+        index_html = sent_files["index.html"].decode("utf-8")
+        leg_at = index_html.find("<span>Module 02 [historical disclosure]")
+        assert leg_at >= 0, "gallery legend for Module 02 historical disclosure not rendered"
+        legend = index_html[leg_at:index_html.find("</span>", leg_at)]
+        assert "FAILS &ge; 91%" in legend and "99.9:PX-9" in legend and "dev PROTX" in legend, (
+            "gallery legend must read benchmarks.cold_bmrb_gate_pct / cold_bmrb_withdrawal_ref / dev_target"
+        )
+        assert "&ge; 94%" not in legend and "13.1:P1-2" not in legend, "legend still hard-codes 94% / 13.1:P1-2"
+        page04 = sent_files["04_relax_modelfree.html"].decode("utf-8")
+        assert "Xaa99 (M4 Rex)" in page04 and "Ile23 (Rex)" not in page04, "Mod04 R_ex preset chip must come from payload.rex_sites"
+        if node_bin is not None:
+            sent_out = root / "b15_sentinel_out"
+            write_site_to_disk(sent_out, sent_files)
+            dump_file = root / "b15_text_dump.json"
+            proc_txt = subprocess.run(
+                [node_bin, "-e", NODE_VM_CHECK_HARNESS, str(sent_out), f"dump-text={dump_file}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            assert proc_txt.returncode == 0, f"B15 sentinel Node run failed:\n{proc_txt.stdout}\n{proc_txt.stderr}"
+            dump = json.loads(dump_file.read_text(encoding="utf-8"))
+            joined = {k: " | ".join(v) for k, v in dump.items()}
+            want = {
+                "02_hsqc_strips_solvers.html#2": ["Abc4 ->"],
+                "02_hsqc_strips_solvers.html#3": ["FAILS >=91%", "PROTX "],
+                "02_hsqc_strips_solvers.html#4": ["77-Residue", "/77 >= 0.85", "Residue 1..77"],
+                "04_relax_modelfree.html#2": ["611 & 822 MHz", "(Xaa99)", "37-trial", "611 MHz"],
+                "04_relax_modelfree.html#3": ["611 MHz R2 / R1", "(1..81)"],
+                "04_relax_modelfree.html#4": ["R_ex > 0.7 s^-1", "R_ex at Xaa99 (M4)", "(1..81)"],
+            }
+            for key, needles in want.items():
+                txt = joined.get(key, "")
+                for needle in needles:
+                    assert needle in txt, f"B15: {key} canvas text missing payload-derived {needle!r}: {txt[:400]}"
+            forbid = {
+                "02_hsqc_strips_solvers.html#2": ["Phe4 -> Gly10"],
+                "02_hsqc_strips_solvers.html#4": ["76-Residue", "/76", ">= 0.80"],
+                "04_relax_modelfree.html#2": ["600 & 800", "(Ile23)", "600 MHz", "800 MHz"],
+                "04_relax_modelfree.html#4": ["R_ex > 0.5"],
+            }
+            for key, needles in forbid.items():
+                txt = joined.get(key, "")
+                for needle in needles:
+                    assert needle not in txt, f"B15: {key} canvas text still hard-codes {needle!r}"
+        # Missing B15 keys must fail --check (required payload reads fail loudly).
+        miss_dir = root / "b15_missing_data"
+        _make_mock_bundles(miss_dir)
+        m04m = miss_dir / "04_relax_modelfree.tour.json"
+        dm = json.loads(m04m.read_text(encoding="utf-8"))
+        del dm["payload"]["rex_report_threshold_s_inv"]
+        m04m.write_text(json.dumps(dm, indent=2, sort_keys=True), encoding="utf-8")
+        m02m = miss_dir / "02_hsqc_strips_solvers.tour.json"
+        dm2 = json.loads(m02m.read_text(encoding="utf-8"))
+        del dm2["payload"]["benchmarks"]["cold_bmrb_gate_pct"]
+        m02m.write_text(json.dumps(dm2, indent=2, sort_keys=True), encoding="utf-8")
+        miss_b = load_tour_bundles(miss_dir)
+        miss_errs = validate_tour_site(build_tour_site_files(miss_b, videos_rel="videos"), miss_b, videos_rel="videos")
+        assert any("payload.rex_report_threshold_s_inv" in e for e in miss_errs), miss_errs
+        assert any("payload.benchmarks.cold_bmrb_gate_pct" in e for e in miss_errs), miss_errs
+        # Caption naming a model the fit did not select must fail.
+        wrong_dir = root / "b15_wrong_model"
+        _make_mock_bundles(wrong_dir)
+        m04w = wrong_dir / "04_relax_modelfree.tour.json"
+        dw = json.loads(m04w.read_text(encoding="utf-8"))
+        dw["chapters"][3]["caption"] = "S^2 profile: Ile23 R_ex (M4)."
+        m04w.write_text(json.dumps(dw, indent=2, sort_keys=True), encoding="utf-8")
+        wb = load_tour_bundles(wrong_dir)
+        w_errs = validate_tour_site(build_tour_site_files(wb, videos_rel="videos"), wb, videos_rel="videos")
+        assert any("rex_clause" in e for e in w_errs) and any("model M4" in e for e in w_errs), w_errs
+
         # 10. CLI --check end-to-end verification (including live Node vm 32/32 check inside validate_tour_site)
         check_out = root / "out_cli_check"
         rc = main(["--data-dir", str(data_dir), "--out", str(check_out), "--videos-rel", "videos", "--check"])
@@ -5207,8 +5487,9 @@ def run_self_tests() -> int:
 
         digest = site_digest(files_a)[:16]
         print(
-            f"build_interactive_tours.py self-tests passed (10/10 checks: 11 files, "
-            f"zero-CDN, WCAG 1.4.4, 01..08 payload-backed, fallback-banner guard, zero-innerHTML, clean-room, B15 caption-payload parity, --check CLI, Node vm 32/32; sha256={digest})."
+            f"build_interactive_tours.py self-tests passed (11/11 checks: 11 files, "
+            f"zero-CDN, WCAG 1.4.4, 01..08 payload-backed, fallback-banner guard, zero-innerHTML, clean-room, B15 caption-payload parity, "
+            f"B15 payload-sentinel legend/chips/canvas text, --check CLI, Node vm 32/32; sha256={digest})."
         )
     return 0
 
