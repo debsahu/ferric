@@ -24,6 +24,7 @@ pub mod csp;
 pub mod dihedrals;
 pub mod domain_dock;
 pub mod dosy;
+pub mod dynamics_detectors;
 pub mod evaluate;
 pub mod evo_graph;
 pub mod excited_state;
