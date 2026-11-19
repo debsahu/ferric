@@ -63,6 +63,7 @@ EXPECTED_MANUAL_CHAPTERS: Tuple[str, ...] = (
     "07-clean-room-provenance.md",
     "08-metabolomics-and-chemometrics.md",
     "09-alphafold-and-integrative-nmr.md",
+    "10-references-and-acknowledgments.md",
 )
 
 KNOWN_TOUR_PAGES: Set[str] = {
