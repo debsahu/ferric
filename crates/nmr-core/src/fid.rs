@@ -1701,6 +1701,51 @@ pub fn is_bruker_2d_ipap_sequence(pulprog: &str, pp_text: Option<&str>) -> bool 
     false
 }
 
+/// True when a Bruker 3D pulse program uses IPAP virtual decoupling (`c_cbcanco_ia3d`,
+/// `c_canco_ia3d`, `c_cbcaco_ia3d`, `*ia3d*`, `*ipap*`, or `pulseprogram` body containing
+/// `splitcomb [ipap` / `using IPAP scheme`).
+pub fn is_bruker_3d_ipap_sequence(pulprog: &str, pp_text: Option<&str>) -> bool {
+    let mut base = pulprog
+        .trim()
+        .trim_matches(|c| c == '<' || c == '>')
+        .trim()
+        .to_ascii_lowercase();
+    loop {
+        let mut changed = false;
+        for ext in [
+            ".sas", ".sct", ".fp2", ".bv", ".fp", ".fa", ".be", ".t1", ".t2", ".1", ".2", ".3",
+            "v1", "v2", "v3", "v4",
+        ] {
+            if let Some(stripped) = base.strip_suffix(ext) {
+                base = stripped.to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if base.contains("ia3d")
+        || base.ends_with("_ia")
+        || base.ends_with("_iasq")
+        || base.ends_with("_ipap")
+        || base.contains("ipap")
+        || base.contains("ctfbia")
+    {
+        return true;
+    }
+    if let Some(txt) = pp_text {
+        let low = txt.to_ascii_lowercase();
+        if low.contains("splitcomb [ipap")
+            || low.contains("splitcomb ipap")
+            || low.contains("using ipap scheme")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Extract `(j_caco_hz, ap_scale)` from a TopSpin `splitcomb` audit or header string such as
 /// `<created by splitcomb ipap 2: scale = 1.04 CaCO = 53.8 from ...>`.
 pub fn parse_splitcomb_params_from_text(text: &str) -> (Option<f64>, Option<f64>) {
@@ -3496,6 +3541,26 @@ pub fn read_bruker_fid_3d_opts(
         .unwrap_or("ser")
         .to_string();
 
+    let mut own_meta_strings: Vec<String> = [
+        "acqus",
+        "acqu",
+        "acqu2s",
+        "acqu2",
+        "acqu3s",
+        "acqu3",
+        "audita.txt",
+    ]
+    .into_iter()
+    .filter_map(|f| find_file_ci(&dir, f))
+    .filter_map(|p| read_text_lossy_capped(&p).ok())
+    .collect();
+    for pdata_f in ["auditp.txt", "title"] {
+        if let Some(txt) = read_optional_bruker_pdata1_text(&dir, pdata_f) {
+            own_meta_strings.push(txt);
+        }
+    }
+    let own_meta_refs: Vec<&str> = own_meta_strings.iter().map(String::as_str).collect();
+
     read_bruker_fid_3d_from_params(
         &name,
         &dir,
@@ -3507,6 +3572,7 @@ pub fn read_bruker_fid_3d_opts(
         proc3s.as_ref(),
         pulprog_interp,
         pp_txt.as_deref(),
+        &own_meta_refs,
         nuslist_txt.as_deref(),
         &bytes,
         allow_truncated_fid,
@@ -3589,6 +3655,21 @@ pub fn read_bruker_fid_3d_from_bytes(
         None
     };
 
+    let mut own_meta_refs: Vec<&str> = vec![acqus_txt, acqu2s_txt, acqu3s_txt];
+    for opt in [
+        acqu_txt,
+        acqu2_txt,
+        acqu3_txt,
+        procs_txt,
+        proc2s_txt,
+        proc3s_txt,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        own_meta_refs.push(opt);
+    }
+
     read_bruker_fid_3d_from_params(
         name,
         Path::new(name),
@@ -3600,6 +3681,7 @@ pub fn read_bruker_fid_3d_from_bytes(
         proc3s.as_ref(),
         pulprog_interp,
         pulseprogram_txt,
+        &own_meta_refs,
         nuslist_txt,
         bytes,
         allow_truncated_fid,
@@ -3618,10 +3700,23 @@ fn read_bruker_fid_3d_from_params(
     proc3s: Option<&HashMap<String, String>>,
     pulprog_interp: Option<crate::pulprog::PulprogInterpretation>,
     pp_txt: Option<&str>,
+    own_meta_refs: &[&str],
     nuslist_txt: Option<&str>,
     bytes: &[u8],
     allow_truncated_fid: bool,
 ) -> Result<Fid3D, String> {
+    let pulprog_str = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
+    let already_splitcomb = bruker_texts_indicate_already_splitcomb(acqu2s, own_meta_refs)
+        || bruker_texts_indicate_already_splitcomb(acqu3s, own_meta_refs);
+    if is_bruker_3d_ipap_sequence(pulprog_str, pp_txt) && !already_splitcomb {
+        return Err(format!(
+            "unsupported unsplit Bruker 3D IPAP dataset '{name}' (PULPROG={pulprog_str}): \
+             raw 3D IPAP spin-state recombination is not yet supported (loading raw IP+AP traces \
+             without recombination would double the indirect dimension). Pre-process with Bruker \
+             TopSpin `splitcomb` first or use 2D IPAP recombination."
+        ));
+    }
+
     let is_fntype_nus = validate_bruker_fntype(dir, acqus, &[acqu2s, acqu3s])?;
 
     let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(acqus, procs)?;
