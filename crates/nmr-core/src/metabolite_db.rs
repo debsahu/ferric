@@ -1,22 +1,29 @@
-//! Offline CC0 `BMRB-BMSE` Compact Aqueous Metabolite Reference Index, Fast `< 5 ms`
+//! Offline `BMRB-BMSE` Compact Aqueous Metabolite Reference Index, Fast `< 5 ms`
 //! Peak-List / `STOCSY`-Cluster Matcher, 1D Reference Spectrum Synthesizer, and Opt-In
-//! Desktop `BMRB v2` / `NP-MRD` Online Query Engine.
+//! Desktop `BMRB v2` Online Query Engine (with honest `NP-MRD` web search URL).
 //!
 //! # Clean-Room Scientific & Open-Data Provenance
-//! Original clean-room implementation built strictly from public-domain / permissive open
-//! scientific data and peer-reviewed NMR metabolomics literature:
-//! - **BMRB (Biological Magnetic Resonance Data Bank, `BMRB-BMSE`, `CC0` / Public Domain)**:
+//! Original clean-room implementation built strictly from open scientific archives and
+//! peer-reviewed NMR metabolomics literature:
+//! - **BMRB (Biological Magnetic Resonance Data Bank, `BMRB-BMSE`; free access, © UConn Health,
+//!   acknowledgement requested)**:
 //!   Ulrich, E. L., Akutsu, H., Doreleijers, J. F., Harano, Y., Ioannidis, Y. E., Lin, J.,
 //!   Livny, M., Mading, S., Maziuk, D., Miller, Z., Nakatani, E., Schulte, C. F., Tolmie, D. E.,
 //!   Kent Wenger, R., Yao, H. & Markley, J. L., "BioMagResBank," *Nucleic Acids Res.* **2008**,
 //!   36(Database issue), D402–D408 (`10.1093/nar/gkm957`); <https://bmrb.io/metabolomics/>.
+//!   Every entry in `OFFLINE_BMRB_METABOLITES` was verified directly against the live
+//!   `https://api.bmrb.io/v2/entry/<bmse_id>` REST API (accession ID, `Chem_comp.Name`,
+//!   `Formula`, `Chem_comp_SMILES`, `Sample_conditions` pH, and `Assigned_chem_shift` /
+//!   `spectral_peak_1H` chemical shifts).
 //! - **NP-MRD (Natural Products Magnetic Resonance Database, `CC-BY-4.0`)**:
 //!   Wishart, D. S., Sayeeda, Z., Budinski, Z., Guo, A., Lee, B. L., Berjanskii, M., Rout, M.,
 //!   Peters, H., Dizon, R., Mah, R., Torres-Calzada, C., Hiebert-Giesbrecht, M., Varshavi, D.,
 //!   Varshavi, D., Oler, E., Allen, D., Cao, X., Gautam, V., Maras, A., Poynton, E. F.,
 //!   Tavangar, P., Yang, V., van Santen, J. A., Linington, R. G. & Hu, X., "NP-MRD: the Natural
 //!   Products Magnetic Resonance Database," *Nucleic Acids Res.* **2022**, 50(D1), D622–D631
-//!   (`10.1093/nar/gkab1052`); <https://np-mrd.org/>.
+//!   (`10.1093/nar/gkab1052`); <https://np-mrd.org/>. NP-MRD does not expose an unauthenticated
+//!   JSON shift-search API, so FERRIC provides the direct web search URL (`https://np-mrd.org/`)
+//!   instead of calling a nonexistent endpoint.
 //! - **STOCSY (Statistical Total Correlation Spectroscopy)**:
 //!   Cloarec, O., Dumas, M.-E., Craig, A., Barton, R. H., Trygg, J., Hudson, J., Blancher, C.,
 //!   Gauguier, D., Lindon, J. C., Holmes, E. & Nicholson, J. K., *Anal. Chem.* **2005**, 77(5),
@@ -25,8 +32,9 @@
 //! **Clean-room notice**: Strictly zero `HMDB` (non-commercial restriction) or `Chenomx`
 //! (proprietary) data, libraries, or shift tables were consulted or bundled. All online queries
 //! are strictly opt-in, desktop-only (`#[cfg(not(target_arch = "wasm32"))]`), enforce an exact
-//! HTTPS host allowlist (`api.bmrb.io`, `np-mrd.org` only), use a `5 s` connect/read timeout
-//! and `4 MiB` response cap, disable cross-host redirects, and fail closed when offline.
+//! HTTPS host allowlist (`api.bmrb.io`, `np-mrd.org` only), invoke `curl -q` (ignoring
+//! `~/.curlrc`), use a `5 s` connect/read timeout and `4 MiB` response cap, disable cross-host
+//! redirects, and fail closed when offline.
 
 use serde::{Deserialize, Serialize};
 
@@ -38,8 +46,14 @@ pub const ALLOWED_ONLINE_HOSTS: &[&str] = &["api.bmrb.io", "np-mrd.org"];
 /// Canonical BMRB v2 REST API base URL.
 pub const BMRB_V2_API_BASE: &str = "https://api.bmrb.io/v2";
 
-/// Canonical NP-MRD REST API base URL.
+/// Canonical NP-MRD web portal base URL (manual browser search; no public JSON shift-search API).
+pub const NPMRD_WEB_URL: &str = "https://np-mrd.org/";
+
+/// Backwards-compatible alias for [`NPMRD_WEB_URL`] host base.
 pub const NPMRD_API_BASE: &str = "https://np-mrd.org";
+
+/// Hard upper bound on chemical-shift matching tolerance (`2.0 ppm`) for CLI/online queries.
+pub const MAX_METABOLITE_TOL_PPM: f64 = 2.0;
 
 /// Hard upper bound on any single online HTTP response payload (`4 MiB`).
 pub const MAX_ONLINE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -168,20 +182,20 @@ pub struct MetaboliteShift13C {
 /// Provenance database source for a metabolite entry or search candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MetaboliteSource {
-    /// Built-in offline CC0 `BMRB-BMSE` compact index.
+    /// Built-in offline `BMRB-BMSE` compact index (free access, © UConn Health, acknowledgement requested).
     BmrbBmseOffline,
     /// Opt-in live desktop query against `BMRB v2` REST API (`https://api.bmrb.io/v2/...`).
     BmrbOnline,
-    /// Opt-in live desktop query against `NP-MRD` (`https://np-mrd.org/...`, `CC-BY-4.0`).
+    /// Reference marker for `NP-MRD` (`https://np-mrd.org/`, `CC-BY-4.0` web portal).
     NpMrdOnline,
 }
 
 impl MetaboliteSource {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::BmrbBmseOffline => "BMRB-BMSE (CC0 Offline)",
+            Self::BmrbBmseOffline => "BMRB-BMSE (Offline)",
             Self::BmrbOnline => "BMRB v2 (Online)",
-            Self::NpMrdOnline => "NP-MRD (CC-BY-4.0 Online)",
+            Self::NpMrdOnline => "NP-MRD (CC-BY-4.0 Web)",
         }
     }
 }
@@ -380,7 +394,9 @@ pub fn validate_metabolite_online_url(url: &str) -> Result<OnlineHost, String> {
 }
 
 // ============================================================================
-// Static Offline CC0 BMRB-BMSE Compact Metabolite Index (46 Canonical Metabolites)
+// Static Offline BMRB-BMSE Compact Metabolite Index (57 Live-Verified Entries)
+// Every entry verified against https://api.bmrb.io/v2/entry/<bmse_id>
+// (free access, © UConn Health, acknowledgement requested).
 // ============================================================================
 
 struct StaticPeak1H {
@@ -400,6 +416,7 @@ struct StaticShift13C {
 struct StaticMetaboliteEntry {
     bmse_id: &'static str,
     name: &'static str,
+    aliases: &'static [&'static str],
     formula: &'static str,
     smiles: &'static str,
     ph: f64,
@@ -464,837 +481,1117 @@ macro_rules! c13 {
 }
 
 const OFFLINE_BMRB_METABOLITES: &[StaticMetaboliteEntry] = &[
-    // 1. L-Lactate
+    // 1. L-(+) Lactic acid (bmse000208, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000036",
-        name: "L-Lactate",
+        bmse_id: "bmse000208",
+        name: "L-(+) Lactic acid",
+        aliases: &["L-Lactate", "L-Lactic acid"],
         formula: "C3H6O3",
-        smiles: "C[C@H](O)C(=O)O",
-        ph: 7.4,
+        smiles: "C[C@@H](C(=O)O)O",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("CH3", 1.330, Doublet, [6.9], 3),
-            p1h!("CH", 4.110, Quartet, [6.9], 1),
+            p1h!("H7/H8/H9", 1.318, Doublet, [7.5], 3),
+            p1h!("H10", 4.101, Quartet, [7.0], 1),
         ],
         shifts_13c: &[
-            c13!("C3(CH3)", 22.8, 1),
-            c13!("C2(CH)", 71.2, 1),
-            c13!("C1(COO-)", 185.1, 1),
+            c13!("C1", 22.812, 1),
+            c13!("C2", 71.227, 1),
+            c13!("C3", 185.321, 1),
         ],
     },
-    // 2. L-Alanine
+    // 2. L-Alanine (bmse000028, D2O, pH 7.40)
     StaticMetaboliteEntry {
         bmse_id: "bmse000028",
         name: "L-Alanine",
+        aliases: &["L-Alanine"],
         formula: "C3H7NO2",
-        smiles: "C[C@H](N)C(=O)O",
-        ph: 7.4,
+        smiles: "C[C@@H](C(=O)O)N",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("beta-CH3", 1.478, Doublet, [7.2], 3),
-            p1h!("alpha-CH", 3.778, Quartet, [7.2], 1),
+            p1h!("H7/H8/H9", 1.471, Doublet, [7.2], 3),
+            p1h!("H10", 3.771, Quartet, [7.2], 1),
         ],
         shifts_13c: &[
-            c13!("Cbeta", 18.9, 1),
-            c13!("Calpha", 53.3, 1),
-            c13!("C(COO-)", 178.5, 1),
+            c13!("C1", 18.830, 1),
+            c13!("C2", 53.200, 1),
+            c13!("C3", 178.560, 1),
         ],
     },
-    // 3. alpha-D-Glucose
+    // 3. D-(+)-Glucose (bmse000015, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000016a",
-        name: "alpha-D-Glucose",
+        bmse_id: "bmse000015",
+        name: "D-(+)-Glucose",
+        aliases: &["D-Glucose", "Glucose"],
         formula: "C6H12O6",
-        smiles: "OC[C@H]1O[C@H](O)[C@H](O)[C@@H](O)[C@@H]1O",
-        ph: 7.4,
+        smiles: "C([C@@H]1[C@H]([C@@H]([C@H]([C@H](O1)O)O)O)O)O",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("H4", 3.408, Triplet, [9.4], 1),
-            p1h!("H2", 3.533, DoubletOfDoublets, [9.8, 3.7], 1),
-            p1h!("H3", 3.710, Triplet, [9.5], 1),
-            p1h!("H5/H6", 3.833, Multiplet, [9.5, 4.5], 3),
-            p1h!("H1-alpha", 5.233, Doublet, [3.7], 1),
+            p1h!("H13..H18(6H)", 3.232, Triplet, [8.8], 1),
+            p1h!("H13..H18(6H)", 3.401, Multiplet, [], 1),
+            p1h!("H13..H18(6H)", 3.459, Multiplet, [], 1),
+            p1h!("H13..H18(6H)", 3.517, Multiplet, [], 1),
+            p1h!("H13..H18(6H)", 3.726, Multiplet, [], 1),
+            p1h!("H13..H18(6H)", 3.828, Multiplet, [], 1),
+            p1h!("H13..H18(6H)", 3.887, DoubletOfDoublets, [], 1),
+            p1h!("H19", 4.636, Doublet, [8.0], 1),
+            p1h!("H19", 5.222, Doublet, [3.5], 1),
         ],
         shifts_13c: &[
-            c13!("C6", 63.4, 1),
-            c13!("C4", 72.4, 1),
-            c13!("C2", 74.2, 1),
-            c13!("C5", 74.3, 1),
-            c13!("C3", 75.5, 1),
-            c13!("C1", 94.8, 1),
+            c13!("C1", 63.284, 1),
+            c13!("C1", 63.454, 1),
+            c13!("C2..C5", 72.309, 1),
+            c13!("C2..C5", 72.352, 1),
+            c13!("C2..C5", 74.166, 1),
+            c13!("C2..C5", 74.202, 1),
+            c13!("C2..C5", 75.480, 1),
+            c13!("C2..C5", 76.854, 1),
+            c13!("C2..C5", 78.474, 1),
+            c13!("C2..C5", 78.690, 1),
+            c13!("C6", 94.826, 1),
+            c13!("C6", 98.643, 1),
         ],
     },
-    // 4. beta-D-Glucose
-    StaticMetaboliteEntry {
-        bmse_id: "bmse000016b",
-        name: "beta-D-Glucose",
-        formula: "C6H12O6",
-        smiles: "OC[C@H]1O[C@@H](O)[C@H](O)[C@@H](O)[C@@H]1O",
-        ph: 7.4,
-        peaks_1h: &[
-            p1h!("H2", 3.242, DoubletOfDoublets, [9.2, 7.9], 1),
-            p1h!("H4", 3.400, Triplet, [9.3], 1),
-            p1h!("H3/H5", 3.475, Triplet, [9.2], 2),
-            p1h!("H6b", 3.720, DoubletOfDoublets, [12.2, 5.8], 1),
-            p1h!("H6a", 3.895, DoubletOfDoublets, [12.2, 2.1], 1),
-            p1h!("H1-beta", 4.642, Doublet, [7.9], 1),
-        ],
-        shifts_13c: &[
-            c13!("C6", 63.5, 1),
-            c13!("C4", 72.4, 1),
-            c13!("C2", 76.9, 1),
-            c13!("C3", 78.5, 1),
-            c13!("C5", 78.7, 1),
-            c13!("C1", 98.7, 1),
-        ],
-    },
-    // 5. Acetate
+    // 4. Acetic acid (bmse000191, D2O, pH 7.40)
     StaticMetaboliteEntry {
         bmse_id: "bmse000191",
-        name: "Acetate",
+        name: "Acetic acid",
+        aliases: &["Acetate", "Acetic acid"],
         formula: "C2H4O2",
         smiles: "CC(=O)O",
-        ph: 7.4,
-        peaks_1h: &[p1h!("CH3", 1.918, Singlet, [], 3)],
-        shifts_13c: &[c13!("C2(CH3)", 26.0, 1), c13!("C1(COO-)", 184.0, 1)],
+        ph: 7.40,
+        peaks_1h: &[p1h!("H5/H6/H7", 1.905, Singlet, [], 3)],
+        shifts_13c: &[c13!("C1", 25.990, 1), c13!("C2", 184.250, 1)],
     },
-    // 6. Citrate
+    // 5. Citrate (bmse000076, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000074",
+        bmse_id: "bmse000076",
         name: "Citrate",
+        aliases: &["Citrate", "Citric acid"],
         formula: "C6H8O7",
-        smiles: "OC(CC(=O)O)(CC(=O)O)C(=O)O",
-        ph: 7.4,
-        peaks_1h: &[
-            p1h!("CH2a", 2.535, Doublet, [15.3], 2),
-            p1h!("CH2b", 2.675, Doublet, [15.3], 2),
-        ],
+        smiles: "C(C(=O)O)C(CC(=O)O)(C(=O)O)O",
+        ph: 7.40,
+        peaks_1h: &[p1h!("H14..H17(4H)", 2.579, DoubletOfDoublets, [], 4)],
         shifts_13c: &[
-            c13!("C2/C4(CH2)", 48.2, 2),
-            c13!("C3(C-OH)", 77.7, 1),
-            c13!("C1/C5(COO-)", 181.5, 2),
-            c13!("C6(COO-)", 184.2, 1),
+            c13!("C1/C2", 48.446, 2),
+            c13!("C6", 77.963, 1),
+            c13!("C3/C4", 182.021, 2),
+            c13!("C5", 184.740, 1),
         ],
     },
-    // 7. Succinate
+    // 6. Succinic acid (bmse000183, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000181",
-        name: "Succinate",
+        bmse_id: "bmse000183",
+        name: "Succinic acid",
+        aliases: &["Succinate", "Succinic acid"],
         formula: "C4H6O4",
-        smiles: "O=C(O)CCC(=O)O",
-        ph: 7.4,
-        peaks_1h: &[p1h!("2xCH2", 2.405, Singlet, [], 4)],
-        shifts_13c: &[c13!("C2/C3(CH2)", 36.8, 2), c13!("C1/C4(COO-)", 184.9, 2)],
+        smiles: "C(CC(=O)O)C(=O)O",
+        ph: 7.40,
+        peaks_1h: &[p1h!("H10..H9(4H)", 2.391, Singlet, [], 4)],
+        shifts_13c: &[c13!("C1/C2", 36.915, 2), c13!("C3/C4", 185.203, 2)],
     },
-    // 8. Creatine
+    // 7. Creatine (bmse000078, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000059",
+        bmse_id: "bmse000078",
         name: "Creatine",
+        aliases: &["Creatine"],
         formula: "C4H9N3O2",
         smiles: "CN(CC(=O)O)C(=N)N",
-        ph: 7.4,
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("N-CH3", 3.032, Singlet, [], 3),
-            p1h!("N-CH2", 3.928, Singlet, [], 2),
+            p1h!("H10/H11/H12", 3.024, Singlet, [], 3),
+            p1h!("H13/H14", 3.920, Singlet, [], 2),
         ],
         shifts_13c: &[
-            c13!("N-CH3", 39.6, 1),
-            c13!("CH2", 56.5, 1),
-            c13!("C=N", 159.8, 1),
-            c13!("COO-", 177.2, 1),
+            c13!("C1", 39.653, 1),
+            c13!("C2", 56.555, 1),
+            c13!("C4", 159.820, 1),
+            c13!("C3", 177.426, 1),
         ],
     },
-    // 9. Creatinine
+    // 8. Creatinine (bmse000155, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000060",
+        bmse_id: "bmse000155",
         name: "Creatinine",
+        aliases: &["Creatinine"],
         formula: "C4H7N3O",
         smiles: "CN1CC(=O)N=C1N",
-        ph: 7.4,
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("N-CH3", 3.043, Singlet, [], 3),
-            p1h!("CH2", 4.052, Singlet, [], 2),
+            p1h!("H10/H11/H9", 3.034, Singlet, [], 3),
+            p1h!("H12/H13", 4.042, Singlet, [], 2),
         ],
         shifts_13c: &[
-            c13!("N-CH3", 32.9, 1),
-            c13!("CH2", 59.0, 1),
-            c13!("C=N", 171.8, 1),
-            c13!("C=O", 191.5, 1),
+            c13!("C1", 32.930, 1),
+            c13!("C2", 59.156, 1),
+            c13!("C4", 172.002, 1),
+            c13!("C3", 191.757, 1),
         ],
     },
-    // 10. Glycine
+    // 9. Glycine (bmse000089, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000087",
+        bmse_id: "bmse000089",
         name: "Glycine",
+        aliases: &["Glycine"],
         formula: "C2H5NO2",
-        smiles: "NCC(=O)O",
-        ph: 7.4,
-        peaks_1h: &[p1h!("CH2", 3.555, Singlet, [], 2)],
-        shifts_13c: &[c13!("Calpha", 44.2, 1), c13!("COO-", 175.2, 1)],
+        smiles: "C(C(=O)O)N",
+        ph: 7.40,
+        peaks_1h: &[p1h!("H6/H7", 3.545, Singlet, [], 2)],
+        shifts_13c: &[c13!("C1", 44.133, 1), c13!("C2", 175.225, 1)],
     },
-    // 11. Taurine
+    // 10. Taurine (bmse000120, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000140",
+        bmse_id: "bmse000120",
         name: "Taurine",
+        aliases: &["Taurine"],
         formula: "C2H7NO3S",
-        smiles: "NCCS(=O)(=O)O",
-        ph: 7.4,
+        smiles: "C(CS(=O)(=O)O)N",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("CH2-NH3", 3.260, Triplet, [6.6], 2),
-            p1h!("CH2-SO3", 3.425, Triplet, [6.6], 2),
+            p1h!("H10/H11", 3.246, Triplet, [6.8], 2),
+            p1h!("H8/H9", 3.410, Triplet, [6.8], 2),
         ],
-        shifts_13c: &[c13!("CH2-NH3", 38.2, 1), c13!("CH2-SO3", 50.4, 1)],
+        shifts_13c: &[c13!("C1", 38.068, 1), c13!("C2", 50.215, 1)],
     },
-    // 12. Choline
+    // 11. Choline (bmse000285, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000057",
+        bmse_id: "bmse000285",
         name: "Choline",
+        aliases: &["Choline"],
         formula: "C5H14NO+",
         smiles: "C[N+](C)(C)CCO",
-        ph: 7.4,
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("N(CH3)3", 3.200, Singlet, [], 9),
-            p1h!("CH2-N", 3.515, Triplet, [5.0], 2),
-            p1h!("CH2-O", 4.060, Multiplet, [5.0], 2),
+            p1h!("H10..H9(9H)", 3.195, Singlet, [], 9),
+            p1h!("H17/H18", 3.514, Triplet, [5.0], 2),
+            p1h!("H19/H20", 4.053, Multiplet, [], 2),
         ],
         shifts_13c: &[
-            c13!("N(CH3)3", 56.6, 3),
-            c13!("CH2-O", 58.3, 1),
-            c13!("CH2-N", 70.1, 1),
+            c13!("C1/C2/C3", 56.584, 3),
+            c13!("C5", 58.325, 1),
+            c13!("C4", 70.117, 1),
         ],
     },
-    // 13. TMAO
+    // 12. Trimethylamine N-oxide (bmse000426, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000279",
-        name: "TMAO",
+        bmse_id: "bmse000426",
+        name: "Trimethylamine N-oxide",
+        aliases: &["TMAO", "Trimethylamine N-oxide"],
         formula: "C3H9NO",
         smiles: "C[N+](C)(C)[O-]",
-        ph: 7.4,
-        peaks_1h: &[p1h!("3xCH3", 3.266, Singlet, [], 9)],
-        shifts_13c: &[c13!("3xCH3", 62.2, 3)],
+        ph: 7.40,
+        peaks_1h: &[p1h!("H10..H9(9H)", 3.249, Singlet, [], 9)],
+        shifts_13c: &[c13!("C1/C2/C3", 62.262, 3)],
     },
-    // 14. L-Glutamine
-    StaticMetaboliteEntry {
-        bmse_id: "bmse000033",
-        name: "L-Glutamine",
-        formula: "C5H10N2O3",
-        smiles: "NC(=O)CC[C@H](N)C(=O)O",
-        ph: 7.4,
-        peaks_1h: &[
-            p1h!("beta-CH2", 2.135, Multiplet, [7.2], 2),
-            p1h!("gamma-CH2", 2.452, Multiplet, [7.5], 2),
-            p1h!("alpha-CH", 3.770, Triplet, [6.2], 1),
-        ],
-        shifts_13c: &[
-            c13!("Cbeta", 29.0, 1),
-            c13!("Cgamma", 33.6, 1),
-            c13!("Calpha", 57.0, 1),
-            c13!("C(COO-)", 176.6, 1),
-            c13!("Cdelta(CONH2)", 180.4, 1),
-        ],
-    },
-    // 15. L-Glutamate
-    StaticMetaboliteEntry {
-        bmse_id: "bmse000032",
-        name: "L-Glutamate",
-        formula: "C5H9NO4",
-        smiles: "N[C@@H](CCC(=O)O)C(=O)O",
-        ph: 7.4,
-        peaks_1h: &[
-            p1h!("beta-CH2", 2.062, Multiplet, [7.2], 2),
-            p1h!("gamma-CH2", 2.348, Multiplet, [7.4], 2),
-            p1h!("alpha-CH", 3.755, DoubletOfDoublets, [7.2, 4.7], 1),
-        ],
-        shifts_13c: &[
-            c13!("Cbeta", 29.7, 1),
-            c13!("Cgamma", 36.2, 1),
-            c13!("Calpha", 57.4, 1),
-            c13!("C(COO-)", 177.3, 1),
-            c13!("Cdelta(COO-)", 183.9, 1),
-        ],
-    },
-    // 16. L-Valine
-    StaticMetaboliteEntry {
-        bmse_id: "bmse000049",
-        name: "L-Valine",
-        formula: "C5H11NO2",
-        smiles: "CC(C)[C@H](N)C(=O)O",
-        ph: 7.4,
-        peaks_1h: &[
-            p1h!("gamma1-CH3", 0.985, Doublet, [7.0], 3),
-            p1h!("gamma2-CH3", 1.037, Doublet, [7.0], 3),
-            p1h!("beta-CH", 2.268, Multiplet, [7.0, 4.4], 1),
-            p1h!("alpha-CH", 3.605, Doublet, [4.4], 1),
-        ],
-        shifts_13c: &[
-            c13!("Cgamma1", 19.4, 1),
-            c13!("Cgamma2", 20.8, 1),
-            c13!("Cbeta", 31.9, 1),
-            c13!("Calpha", 63.2, 1),
-            c13!("C(COO-)", 177.0, 1),
-        ],
-    },
-    // 17. L-Leucine
+    // 13. L-Glutamine (bmse000038, D2O, pH 7.40)
     StaticMetaboliteEntry {
         bmse_id: "bmse000038",
+        name: "L-Glutamine",
+        aliases: &["L-Glutamine"],
+        formula: "C5H10N2O3",
+        smiles: "C(CC(=O)N)[C@@H](C(=O)O)N",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H11/H12", 2.130, Quartet, [6.9], 2),
+            p1h!("H13/H14", 2.447, Multiplet, [], 2),
+            p1h!("H15", 3.764, Triplet, [6.2], 1),
+        ],
+        shifts_13c: &[
+            c13!("C1", 28.950, 1),
+            c13!("C2", 33.520, 1),
+            c13!("C3", 56.830, 1),
+            c13!("C5", 176.830, 1),
+            c13!("C4", 180.370, 1),
+        ],
+    },
+    // 14. L-Glutamic acid (bmse000037, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000037",
+        name: "L-Glutamic acid",
+        aliases: &["L-Glutamate", "L-Glutamic acid"],
+        formula: "C5H9NO4",
+        smiles: "C(CC(=O)O)C(C(=O)O)N",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H11/H12", 2.078, Multiplet, [], 2),
+            p1h!("H13/H14", 2.339, Multiplet, [], 2),
+            p1h!("H15", 3.747, DoubletOfDoublets, [], 1),
+        ],
+        shifts_13c: &[
+            c13!("C1", 29.728, 1),
+            c13!("C2", 36.200, 1),
+            c13!("C3", 57.357, 1),
+            c13!("C5", 177.360, 1),
+            c13!("C4", 184.088, 1),
+        ],
+    },
+    // 15. L-Valine (bmse000052, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000052",
+        name: "L-Valine",
+        aliases: &["L-Valine"],
+        formula: "C5H11NO2",
+        smiles: "CC(C)[C@@H](C(=O)O)N",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H10..H9(6H)", 0.981, Doublet, [7.0], 1),
+            p1h!("H10..H9(6H)", 1.034, Doublet, [7.0], 1),
+            p1h!("H15", 2.266, Multiplet, [], 1),
+            p1h!("H16", 3.599, DoubletOfDoublets, [], 1),
+        ],
+        shifts_13c: &[
+            c13!("C1/C2", 19.368, 1),
+            c13!("C1/C2", 20.696, 1),
+            c13!("C3", 31.834, 1),
+            c13!("C4", 63.084, 1),
+            c13!("C5", 177.086, 1),
+        ],
+    },
+    // 16. L-Leucine (bmse000042, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000042",
         name: "L-Leucine",
+        aliases: &["L-Leucine"],
         formula: "C6H13NO2",
-        smiles: "CC(C)C[C@H](N)C(=O)O",
-        ph: 7.4,
+        smiles: "CC(C)C[C@@H](C(=O)O)N",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("delta1-CH3", 0.952, Doublet, [6.4], 3),
-            p1h!("delta2-CH3", 0.964, Doublet, [6.4], 3),
-            p1h!("beta-CH2/gamma-CH", 1.706, Multiplet, [6.4], 3),
-            p1h!("alpha-CH", 3.728, Triplet, [6.2], 1),
+            p1h!("H10..H15(6H)", 0.949, Triplet, [5.5], 6),
+            p1h!("H16/H17/H18", 1.701, Multiplet, [], 3),
+            p1h!("H19", 3.719, Multiplet, [], 1),
         ],
         shifts_13c: &[
-            c13!("Cdelta1", 23.6, 1),
-            c13!("Cdelta2", 24.8, 1),
-            c13!("Cgamma", 26.8, 1),
-            c13!("Cbeta", 42.6, 1),
-            c13!("Calpha", 56.2, 1),
-            c13!("C(COO-)", 178.3, 1),
+            c13!("C1/C2", 23.589, 1),
+            c13!("C1/C2", 24.751, 1),
+            c13!("C4", 26.871, 1),
+            c13!("C3", 42.526, 1),
+            c13!("C5", 56.112, 1),
+            c13!("C6", 178.382, 1),
         ],
     },
-    // 18. L-Isoleucine
+    // 17. L-Isoleucine (bmse000041, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000035",
+        bmse_id: "bmse000041",
         name: "L-Isoleucine",
+        aliases: &["L-Isoleucine"],
         formula: "C6H13NO2",
-        smiles: "CC[C@H](C)[C@H](N)C(=O)O",
-        ph: 7.4,
+        smiles: "CC[C@H](C)[C@@H](C(=O)O)N",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("delta-CH3", 0.933, Triplet, [7.4], 3),
-            p1h!("gamma2-CH3", 1.005, Doublet, [7.0], 3),
-            p1h!("gamma1a-CH2", 1.255, Multiplet, [7.4, 7.0], 1),
-            p1h!("gamma1b-CH2", 1.465, Multiplet, [7.4, 7.0], 1),
-            p1h!("beta-CH", 1.975, Multiplet, [7.0, 4.0], 1),
-            p1h!("alpha-CH", 3.667, Doublet, [4.0], 1),
+            p1h!("H10/H11/H12", 0.927, Triplet, [7.5], 1),
+            p1h!("H13/H14/H15", 0.998, Doublet, [7.0], 1),
+            p1h!("H16/H17", 1.249, Multiplet, [], 1),
+            p1h!("H16/H17", 1.458, Multiplet, [], 1),
+            p1h!("H18", 1.969, Multiplet, [], 1),
+            p1h!("H19", 3.657, Doublet, [4.0], 1),
         ],
         shifts_13c: &[
-            c13!("Cdelta1", 13.8, 1),
-            c13!("Cgamma2", 17.5, 1),
-            c13!("Cgamma1", 27.2, 1),
-            c13!("Cbeta", 38.6, 1),
-            c13!("Calpha", 62.4, 1),
-            c13!("C(COO-)", 176.9, 1),
+            c13!("C1", 13.834, 1),
+            c13!("C2", 17.411, 1),
+            c13!("C3", 27.174, 1),
+            c13!("C4", 38.614, 1),
+            c13!("C5", 62.249, 1),
+            c13!("C6", 176.972, 1),
         ],
     },
-    // 19. L-Tyrosine
+    // 18. L-Tyrosine (bmse000051, D2O, pH 11.15)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000048",
+        bmse_id: "bmse000051",
         name: "L-Tyrosine",
+        aliases: &["L-Tyrosine"],
         formula: "C9H11NO3",
-        smiles: "N[C@@H](Cc1ccc(O)cc1)C(=O)O",
-        ph: 7.4,
+        smiles: "C1=CC(=CC=C1C[C@@H](C(=O)O)N)O",
+        ph: 11.15,
         peaks_1h: &[
-            p1h!("beta-CH2a", 3.055, DoubletOfDoublets, [14.5, 8.0], 1),
-            p1h!("beta-CH2b", 3.195, DoubletOfDoublets, [14.5, 5.2], 1),
-            p1h!("alpha-CH", 3.935, DoubletOfDoublets, [8.0, 5.2], 1),
-            p1h!("ring-H3/H5", 6.895, Doublet, [8.4], 2),
-            p1h!("ring-H2/H6", 7.190, Doublet, [8.4], 2),
+            p1h!("H18/H19", 3.055, Multiplet, [], 1),
+            p1h!("H18/H19", 3.200, Multiplet, [], 1),
+            p1h!("H20", 3.936, Multiplet, [], 1),
+            p1h!("H16/H17", 6.898, Multiplet, [], 1),
+            p1h!("H14/H15", 7.192, Multiplet, [], 1),
         ],
         shifts_13c: &[
-            c13!("Cbeta", 38.3, 1),
-            c13!("Calpha", 58.9, 1),
-            c13!("Cepsilon", 118.6, 2),
-            c13!("Cgamma", 129.6, 1),
-            c13!("Cdelta", 133.4, 2),
-            c13!("Czeta", 157.5, 1),
-            c13!("C(COO-)", 176.8, 1),
+            c13!("C5", 38.277, 1),
+            c13!("C8", 58.838, 1),
+            c13!("C3/C4", 118.610, 2),
+            c13!("C6", 129.523, 1),
+            c13!("C1/C2", 133.531, 2),
+            c13!("C7", 157.683, 1),
+            c13!("C9", 176.964, 1),
         ],
     },
-    // 20. L-Phenylalanine
+    // 19. L-Phenylalanine (bmse000045, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000043",
+        bmse_id: "bmse000045",
         name: "L-Phenylalanine",
+        aliases: &["L-Phenylalanine"],
         formula: "C9H11NO2",
-        smiles: "N[C@@H](Cc1ccccc1)C(=O)O",
-        ph: 7.4,
+        smiles: "C1=CC=C(C=C1)C[C@@H](C(=O)O)N",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("beta-CH2a", 3.125, DoubletOfDoublets, [14.5, 8.0], 1),
-            p1h!("beta-CH2b", 3.280, DoubletOfDoublets, [14.5, 5.2], 1),
-            p1h!("alpha-CH", 3.990, DoubletOfDoublets, [8.0, 5.2], 1),
-            p1h!("ortho-CH", 7.328, Doublet, [7.3], 2),
-            p1h!("para-CH", 7.375, Triplet, [7.3], 1),
-            p1h!("meta-CH", 7.425, Triplet, [7.4], 2),
+            p1h!("H18/H19", 3.110, DoubletOfDoublets, [], 1),
+            p1h!("H18/H19", 3.271, DoubletOfDoublets, [], 1),
+            p1h!("H20", 3.975, Quartet, [4.5], 1),
+            p1h!("H13..H17(5H)", 7.369, Multiplet, [], 1),
         ],
         shifts_13c: &[
-            c13!("Cbeta", 39.2, 1),
-            c13!("Calpha", 58.8, 1),
-            c13!("Czeta", 130.3, 1),
-            c13!("Cepsilon", 131.7, 2),
-            c13!("Cdelta", 132.1, 2),
-            c13!("Cgamma", 137.9, 1),
-            c13!("C(COO-)", 176.7, 1),
+            c13!("C6", 39.095, 1),
+            c13!("C8", 58.744, 1),
+            c13!("C1", 130.418, 1),
+            c13!("C2/C3", 131.834, 2),
+            c13!("C4/C5", 132.093, 2),
+            c13!("C7", 137.798, 1),
+            c13!("C9", 176.774, 1),
         ],
     },
-    // 21. L-Histidine
+    // 20. L-Histidine (bmse000039, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000034",
+        bmse_id: "bmse000039",
         name: "L-Histidine",
+        aliases: &["L-Histidine"],
         formula: "C6H9N3O2",
-        smiles: "N[C@@H](Cc1c[nH]cn1)C(=O)O",
-        ph: 7.4,
+        smiles: "C1=C(NC=N1)C[C@@H](C(=O)O)N",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("beta-CH2a", 3.155, DoubletOfDoublets, [15.5, 7.8], 1),
-            p1h!("beta-CH2b", 3.245, DoubletOfDoublets, [15.5, 4.8], 1),
-            p1h!("alpha-CH", 3.985, DoubletOfDoublets, [7.8, 4.8], 1),
-            p1h!("ring-C4H", 7.085, Singlet, [], 1),
-            p1h!("ring-C2H", 7.865, Singlet, [], 1),
+            p1h!("H12/H13", 3.131, DoubletOfDoublets, [], 1),
+            p1h!("H12/H13", 3.234, DoubletOfDoublets, [], 1),
+            p1h!("H16", 3.980, Quartet, [4.0], 1),
+            p1h!("H14", 7.066, Singlet, [], 1),
+            p1h!("H15", 7.826, Singlet, [], 1),
         ],
         shifts_13c: &[
-            c13!("Cbeta", 30.3, 1),
-            c13!("Calpha", 57.5, 1),
-            c13!("Cdelta2", 120.1, 1),
-            c13!("Cgamma", 134.5, 1),
-            c13!("Cepsilon1", 138.8, 1),
-            c13!("C(COO-)", 176.4, 1),
+            c13!("C1", 30.696, 1),
+            c13!("C5", 57.435, 1),
+            c13!("C2", 119.574, 1),
+            c13!("C4", 134.445, 1),
+            c13!("C3", 138.873, 1),
+            c13!("C6", 176.642, 1),
         ],
     },
-    // 22. Formate
+    // 21. Formate (bmse000203, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000206",
+        bmse_id: "bmse000203",
         name: "Formate",
+        aliases: &["Formate", "Formic acid"],
         formula: "CH2O2",
-        smiles: "O=CO",
-        ph: 7.4,
-        peaks_1h: &[p1h!("CH", 8.448, Singlet, [], 1)],
-        shifts_13c: &[c13!("C1", 173.8, 1)],
+        smiles: "C(=O)O",
+        ph: 7.40,
+        peaks_1h: &[p1h!("H4", 8.447, Singlet, [], 1)],
+        shifts_13c: &[c13!("C1", 173.892, 1)],
     },
-    // 23. Pyruvate
+    // 22. Pyruvic acid (bmse000112, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000174",
-        name: "Pyruvate",
+        bmse_id: "bmse000112",
+        name: "Pyruvic acid",
+        aliases: &["Pyruvate", "Pyruvic acid"],
         formula: "C3H4O3",
         smiles: "CC(=O)C(=O)O",
-        ph: 7.4,
-        peaks_1h: &[p1h!("CH3", 2.368, Singlet, [], 3)],
+        ph: 7.40,
+        peaks_1h: &[p1h!("H7/H8/H9", 2.364, Singlet, [], 3)],
         shifts_13c: &[
-            c13!("C3(CH3)", 29.2, 1),
-            c13!("C1(COO-)", 173.0, 1),
-            c13!("C2(C=O)", 207.8, 1),
+            c13!("C1", 29.204, 1),
+            c13!("C3", 172.967, 1),
+            c13!("C2", 207.760, 1),
         ],
     },
-    // 24. Fumarate
+    // 23. Fumaric acid (bmse000083, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000157",
-        name: "Fumarate",
+        bmse_id: "bmse000083",
+        name: "Fumaric acid",
+        aliases: &["Fumarate", "Fumaric acid"],
         formula: "C4H4O4",
-        smiles: "O=C(O)/C=C/C(=O)O",
-        ph: 7.4,
-        peaks_1h: &[p1h!("2xCH", 6.515, Singlet, [], 2)],
-        shifts_13c: &[c13!("C2/C3(CH=)", 138.1, 2), c13!("C1/C4(COO-)", 177.5, 2)],
+        smiles: "C(=C\\C(=O)O)/C(=O)O",
+        ph: 7.40,
+        peaks_1h: &[p1h!("H10/H9", 6.508, Singlet, [], 2)],
+        shifts_13c: &[c13!("C1/C2", 138.036, 2), c13!("C3/C4", 177.427, 2)],
     },
-    // 25. Ethanol
+    // 24. Ethanol (bmse000297, D2O, pH 7.40)
     StaticMetaboliteEntry {
         bmse_id: "bmse000297",
         name: "Ethanol",
+        aliases: &["Ethanol"],
         formula: "C2H6O",
         smiles: "CCO",
-        ph: 7.0,
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("CH3", 1.178, Triplet, [7.1], 3),
-            p1h!("CH2", 3.650, Quartet, [7.1], 2),
+            p1h!("H4/H5/H6", 1.175, Triplet, [7.2], 3),
+            p1h!("H7/H8", 3.645, Quartet, [7.1], 2),
         ],
-        shifts_13c: &[c13!("C2(CH3)", 19.6, 1), c13!("C1(CH2)", 60.2, 1)],
+        shifts_13c: &[c13!("C1", 19.480, 1), c13!("C2", 60.130, 1)],
     },
-    // 26. Methanol
+    // 25. Methanol (bmse000294, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000298",
+        bmse_id: "bmse000294",
         name: "Methanol",
+        aliases: &["Methanol"],
         formula: "CH4O",
         smiles: "CO",
-        ph: 7.0,
-        peaks_1h: &[p1h!("CH3", 3.350, Singlet, [], 3)],
-        shifts_13c: &[c13!("C1(CH3)", 51.6, 1)],
+        ph: 7.40,
+        peaks_1h: &[p1h!("H3/H4/H5", 3.346, Singlet, [], 3)],
+        shifts_13c: &[c13!("C1", 51.570, 1)],
     },
-    // 27. Acetone
+    // 26. Betaine (bmse000069, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000201",
-        name: "Acetone",
-        formula: "C3H6O",
-        smiles: "CC(=O)C",
-        ph: 7.0,
-        peaks_1h: &[p1h!("2xCH3", 2.225, Singlet, [], 6)],
-        shifts_13c: &[c13!("C1/C3(CH3)", 32.9, 2), c13!("C2(C=O)", 218.0, 1)],
-    },
-    // 28. Betaine
-    StaticMetaboliteEntry {
-        bmse_id: "bmse000053",
+        bmse_id: "bmse000069",
         name: "Betaine",
+        aliases: &["Betaine"],
         formula: "C5H11NO2",
         smiles: "C[N+](C)(C)CC(=O)[O-]",
-        ph: 7.4,
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("N(CH3)3", 3.255, Singlet, [], 9),
-            p1h!("CH2", 3.895, Singlet, [], 2),
+            p1h!("H10..H9(9H)", 3.255, Singlet, [], 9),
+            p1h!("H18/H19", 3.895, Singlet, [], 2),
         ],
         shifts_13c: &[
-            c13!("N(CH3)3", 56.1, 3),
-            c13!("CH2", 68.9, 1),
-            c13!("COO-", 172.0, 1),
+            c13!("C1/C2/C3", 56.053, 3),
+            c13!("C4", 68.838, 1),
+            c13!("C5", 172.009, 1),
         ],
     },
-    // 29. Myo-inositol
+    // 27. myo-Inositol (bmse000103, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000112",
-        name: "Myo-inositol",
+        bmse_id: "bmse000103",
+        name: "myo-Inositol",
+        aliases: &["Myo-inositol", "myo-Inositol"],
         formula: "C6H12O6",
-        smiles: "O[C@H]1[C@H](O)[C@@H](O)[C@H](O)[C@@H](O)[C@H]1O",
-        ph: 7.4,
+        smiles: "C1(C(C(C(C(C1O)O)O)O)O)O",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("H5", 3.278, Triplet, [9.3], 1),
-            p1h!("H1/H3", 3.532, DoubletOfDoublets, [9.9, 2.9], 2),
-            p1h!("H4/H6", 3.620, Triplet, [9.5], 2),
-            p1h!("H2", 4.058, Triplet, [2.9], 1),
+            p1h!("H13..H18(6H)", 3.264, Triplet, [9.2], 1),
+            p1h!("H13..H18(6H)", 3.520, DoubletOfDoublets, [], 1),
+            p1h!("H13..H18(6H)", 3.609, Triplet, [9.8], 1),
+            p1h!("H13..H18(6H)", 4.047, Triplet, [2.5], 1),
         ],
         shifts_13c: &[
-            c13!("C1/C3", 73.9, 2),
-            c13!("C2", 75.0, 1),
-            c13!("C4/C6", 75.2, 2),
-            c13!("C5", 77.1, 1),
+            c13!("C1..C6", 73.849, 1),
+            c13!("C1..C6", 74.906, 1),
+            c13!("C1..C6", 75.115, 1),
+            c13!("C1..C6", 77.073, 1),
         ],
     },
-    // 30. L-Serine
+    // 28. L-Serine (bmse000048, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000046",
+        bmse_id: "bmse000048",
         name: "L-Serine",
+        aliases: &["L-Serine"],
         formula: "C3H7NO3",
-        smiles: "N[C@@H](CO)C(=O)O",
-        ph: 7.4,
+        smiles: "C([C@@H](C(=O)O)N)O",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("alpha-CH", 3.838, DoubletOfDoublets, [5.8, 3.8], 1),
-            p1h!("beta-CH2a", 3.942, DoubletOfDoublets, [12.2, 5.8], 1),
-            p1h!("beta-CH2b", 3.980, DoubletOfDoublets, [12.2, 3.8], 1),
+            p1h!("H10", 3.828, Multiplet, [], 1),
+            p1h!("H8/H9", 3.952, Multiplet, [], 2),
         ],
         shifts_13c: &[
-            c13!("Calpha", 59.2, 1),
-            c13!("Cbeta", 63.0, 1),
-            c13!("C(COO-)", 175.1, 1),
+            c13!("C2", 59.096, 1),
+            c13!("C1", 62.906, 1),
+            c13!("C3", 175.227, 1),
         ],
     },
-    // 31. L-Threonine
+    // 29. L-Threonine (bmse000049, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000049",
+        name: "L-Threonine",
+        aliases: &["L-Threonine"],
+        formula: "C4H9NO3",
+        smiles: "C[C@H]([C@@H](C(=O)O)N)O",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H10/H11/H9", 1.318, Doublet, [6.5], 3),
+            p1h!("H13", 3.573, Doublet, [5.0], 1),
+            p1h!("H12", 4.241, Quintet, [], 1),
+        ],
+        shifts_13c: &[
+            c13!("C1", 22.179, 1),
+            c13!("C3", 63.172, 1),
+            c13!("C2", 68.679, 1),
+            c13!("C4", 175.689, 1),
+        ],
+    },
+    // 30. L-Proline (bmse000047, D2O, pH 7.40)
     StaticMetaboliteEntry {
         bmse_id: "bmse000047",
-        name: "L-Threonine",
-        formula: "C4H9NO3",
-        smiles: "C[C@@H](O)[C@H](N)C(=O)O",
-        ph: 7.4,
-        peaks_1h: &[
-            p1h!("gamma-CH3", 1.324, Doublet, [6.6], 3),
-            p1h!("alpha-CH", 3.580, Doublet, [4.9], 1),
-            p1h!("beta-CH", 4.248, Multiplet, [6.6, 4.9], 1),
-        ],
-        shifts_13c: &[
-            c13!("Cgamma", 22.3, 1),
-            c13!("Calpha", 63.2, 1),
-            c13!("Cbeta", 68.8, 1),
-            c13!("C(COO-)", 175.8, 1),
-        ],
-    },
-    // 32. L-Proline
-    StaticMetaboliteEntry {
-        bmse_id: "bmse000044",
         name: "L-Proline",
+        aliases: &["L-Proline"],
         formula: "C5H9NO2",
-        smiles: "O=C(O)[C@@H]1CCCN1",
-        ph: 7.4,
+        smiles: "C1C[C@@H](NC1)C(=O)O",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("gamma-CH2", 2.002, Multiplet, [7.2], 2),
-            p1h!("beta-CH2a", 2.065, Multiplet, [7.2], 1),
-            p1h!("beta-CH2b", 2.342, Multiplet, [7.2], 1),
-            p1h!("delta-CH2a", 3.332, Multiplet, [7.2], 1),
-            p1h!("delta-CH2b", 3.412, Multiplet, [7.2], 1),
-            p1h!("alpha-CH", 4.125, DoubletOfDoublets, [8.6, 6.4], 1),
+            p1h!("H10..H9(4H)", 2.022, Multiplet, [], 1),
+            p1h!("H11/H12", 2.337, Multiplet, [], 1),
+            p1h!("H13/H14", 3.366, Multiplet, [], 1),
+            p1h!("H15", 4.119, Multiplet, [], 1),
         ],
         shifts_13c: &[
-            c13!("Cgamma", 26.5, 1),
-            c13!("Cbeta", 31.7, 1),
-            c13!("Cdelta", 48.9, 1),
-            c13!("Calpha", 64.0, 1),
-            c13!("C(COO-)", 177.2, 1),
+            c13!("C1", 26.487, 1),
+            c13!("C2", 31.728, 1),
+            c13!("C3", 48.775, 1),
+            c13!("C4", 63.922, 1),
+            c13!("C5", 177.483, 1),
         ],
     },
-    // 33. L-Lysine
+    // 31. L-Lysine (bmse000043, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000039",
+        bmse_id: "bmse000043",
         name: "L-Lysine",
+        aliases: &["L-Lysine"],
         formula: "C6H14N2O2",
-        smiles: "NCCCC[C@H](N)C(=O)O",
-        ph: 7.4,
+        smiles: "C(CCN)C[C@@H](C(=O)O)N",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("gamma-CH2", 1.468, Multiplet, [7.5], 2),
-            p1h!("delta-CH2", 1.720, Multiplet, [7.5], 2),
-            p1h!("beta-CH2", 1.900, Multiplet, [7.2], 2),
-            p1h!("epsilon-CH2", 3.022, Triplet, [7.5], 2),
-            p1h!("alpha-CH", 3.752, Triplet, [6.1], 1),
+            p1h!("H11/H12", 1.465, Multiplet, [], 2),
+            p1h!("H13/H14", 1.716, Quintet, [], 2),
+            p1h!("H15/H16", 1.895, Multiplet, [], 2),
+            p1h!("H17/H18", 3.012, Triplet, [7.5], 2),
+            p1h!("H19", 3.745, Triplet, [6.0], 1),
         ],
         shifts_13c: &[
-            c13!("Cgamma", 24.2, 1),
-            c13!("Cdelta", 29.2, 1),
-            c13!("Cbeta", 32.7, 1),
-            c13!("Cepsilon", 41.9, 1),
-            c13!("Calpha", 57.3, 1),
-            c13!("C(COO-)", 177.3, 1),
+            c13!("C1", 24.145, 1),
+            c13!("C2", 29.137, 1),
+            c13!("C3", 32.628, 1),
+            c13!("C4", 41.754, 1),
+            c13!("C5", 57.190, 1),
+            c13!("C6", 177.484, 1),
         ],
     },
-    // 34. L-Arginine
+    // 32. L-Arginine (bmse000029, D2O, pH 7.40)
     StaticMetaboliteEntry {
         bmse_id: "bmse000029",
         name: "L-Arginine",
+        aliases: &["L-Arginine"],
         formula: "C6H14N4O2",
-        smiles: "N=C(N)NCCC[C@H](N)C(=O)O",
-        ph: 7.4,
+        smiles: "C(C[C@@H](C(=O)O)N)CN=C(N)N",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("gamma-CH2", 1.685, Multiplet, [7.2], 2),
-            p1h!("beta-CH2", 1.908, Multiplet, [7.0], 2),
-            p1h!("delta-CH2", 3.240, Triplet, [6.9], 2),
-            p1h!("alpha-CH", 3.762, Triplet, [6.1], 1),
+            p1h!("H13/H14", 1.679, Multiplet, [], 2),
+            p1h!("H15/H16", 1.909, Multiplet, [], 2),
+            p1h!("H17/H18", 3.236, Triplet, [6.8], 2),
+            p1h!("H19", 3.764, Triplet, [6.0], 1),
         ],
         shifts_13c: &[
-            c13!("Cgamma", 26.7, 1),
-            c13!("Cbeta", 30.4, 1),
-            c13!("Cdelta", 43.3, 1),
-            c13!("Calpha", 57.1, 1),
-            c13!("Czeta", 159.5, 1),
-            c13!("C(COO-)", 177.1, 1),
+            c13!("C1", 26.577, 1),
+            c13!("C2", 30.281, 1),
+            c13!("C3", 43.201, 1),
+            c13!("C4", 57.002, 1),
+            c13!("C6", 159.504, 1),
+            c13!("C5", 177.238, 1),
         ],
     },
-    // 35. L-Aspartate
+    // 33. L-Aspartic acid (bmse000031, D2O, pH 7.40)
     StaticMetaboliteEntry {
         bmse_id: "bmse000031",
-        name: "L-Aspartate",
+        name: "L-Aspartic acid",
+        aliases: &["L-Aspartate", "L-Aspartic acid"],
         formula: "C4H7NO4",
-        smiles: "N[C@@H](CC(=O)O)C(=O)O",
-        ph: 7.4,
+        smiles: "C([C@@H](C(=O)O)N)C(=O)O",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("beta-CH2a", 2.672, DoubletOfDoublets, [17.5, 8.8], 1),
-            p1h!("beta-CH2b", 2.805, DoubletOfDoublets, [17.5, 3.7], 1),
-            p1h!("alpha-CH", 3.895, DoubletOfDoublets, [8.8, 3.7], 1),
+            p1h!("H11", 2.703, Doublet, [8.8], 1),
+            p1h!("H10", 2.786, Multiplet, [], 1),
+            p1h!("H12", 3.889, Multiplet, [], 1),
         ],
         shifts_13c: &[
-            c13!("Cbeta", 39.4, 1),
-            c13!("Calpha", 55.0, 1),
-            c13!("C(COO-)", 177.2, 1),
-            c13!("Cgamma(COO-)", 180.5, 1),
+            c13!("C1", 39.250, 1),
+            c13!("C2", 54.910, 1),
+            c13!("C4", 177.000, 1),
+            c13!("C3", 180.300, 1),
         ],
     },
-    // 36. L-Asparagine
+    // 34. L-Asparagine (bmse000030, D2O, pH 7.40)
     StaticMetaboliteEntry {
         bmse_id: "bmse000030",
         name: "L-Asparagine",
+        aliases: &["L-Asparagine"],
         formula: "C4H8N2O3",
-        smiles: "NC(=O)C[C@H](N)C(=O)O",
-        ph: 7.4,
+        smiles: "C([C@@H](C(=O)O)N)C(=O)N",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("beta-CH2a", 2.845, DoubletOfDoublets, [16.9, 7.6], 1),
-            p1h!("beta-CH2b", 2.948, DoubletOfDoublets, [16.9, 4.3], 1),
-            p1h!("alpha-CH", 3.998, DoubletOfDoublets, [7.6, 4.3], 1),
+            p1h!("H10/H11", 2.894, Quartet, [], 2),
+            p1h!("H12", 3.991, Multiplet, [], 1),
         ],
         shifts_13c: &[
-            c13!("Cbeta", 37.4, 1),
-            c13!("Calpha", 54.1, 1),
-            c13!("C(COO-)", 176.2, 1),
-            c13!("Cgamma(CONH2)", 177.3, 1),
+            c13!("C1", 37.278, 1),
+            c13!("C2", 53.990, 1),
+            c13!("C3/C4", 176.206, 1),
+            c13!("C3/C4", 177.173, 1),
         ],
     },
-    // 37. L-Methionine
+    // 35. L-Methionine (bmse000044, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000042",
+        bmse_id: "bmse000044",
         name: "L-Methionine",
+        aliases: &["L-Methionine"],
         formula: "C5H11NO2S",
-        smiles: "CSCC[C@H](N)C(=O)O",
-        ph: 7.4,
+        smiles: "CSCC[C@@H](C(=O)O)N",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("S-CH3", 2.130, Singlet, [], 3),
-            p1h!("beta-CH2", 2.150, Multiplet, [7.2], 2),
-            p1h!("gamma-CH2", 2.635, Triplet, [7.5], 2),
-            p1h!("alpha-CH", 3.855, DoubletOfDoublets, [7.0, 5.5], 1),
+            p1h!("H10..H14(5H)", 2.122, Multiplet, [], 1),
+            p1h!("H13/H14", 2.183, Multiplet, [], 1),
+            p1h!("H15/H16", 2.629, Triplet, [7.5], 1),
+            p1h!("H17", 3.850, Triplet, [], 1),
         ],
         shifts_13c: &[
-            c13!("Cepsilon(CH3)", 16.8, 1),
-            c13!("Cgamma", 31.7, 1),
-            c13!("Cbeta", 32.6, 1),
-            c13!("Calpha", 56.8, 1),
-            c13!("C(COO-)", 177.0, 1),
+            c13!("C1", 16.636, 1),
+            c13!("C3", 31.513, 1),
+            c13!("C2", 32.395, 1),
+            c13!("C4", 56.584, 1),
+            c13!("C5", 177.093, 1),
         ],
     },
-    // 38. L-Tryptophan
+    // 36. L-Tryptophan (bmse000050, D2O, pH 7.40)
     StaticMetaboliteEntry {
         bmse_id: "bmse000050",
         name: "L-Tryptophan",
+        aliases: &["L-Tryptophan"],
         formula: "C11H12N2O2",
-        smiles: "N[C@@H](Cc1c[nH]c2ccccc12)C(=O)O",
-        ph: 7.4,
+        smiles: "C1=CC=C2C(=C1)C(=CN2)C[C@@H](C(=O)O)N",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("beta-CH2a", 3.300, DoubletOfDoublets, [15.4, 8.1], 1),
-            p1h!("beta-CH2b", 3.478, DoubletOfDoublets, [15.4, 4.8], 1),
-            p1h!("alpha-CH", 4.052, DoubletOfDoublets, [8.1, 4.8], 1),
-            p1h!("H5", 7.195, Triplet, [7.5], 1),
-            p1h!("H6", 7.278, Triplet, [7.5], 1),
-            p1h!("H2", 7.318, Singlet, [], 1),
-            p1h!("H7", 7.535, Doublet, [8.1], 1),
-            p1h!("H4", 7.728, Doublet, [7.9], 1),
+            p1h!("H20/H21", 3.292, DoubletOfDoublets, [], 1),
+            p1h!("H20/H21", 3.471, DoubletOfDoublets, [], 1),
+            p1h!("H23", 4.036, Multiplet, [], 1),
+            p1h!("H17", 7.190, Triplet, [7.2], 1),
+            p1h!("H16/H22", 7.281, Multiplet, [], 1),
+            p1h!("H19", 7.529, Doublet, [7.5], 1),
+            p1h!("H18", 7.721, Doublet, [8.0], 1),
         ],
         shifts_13c: &[
-            c13!("Cbeta", 29.1, 1),
-            c13!("Calpha", 57.8, 1),
-            c13!("C3", 110.2, 1),
-            c13!("C7", 114.6, 1),
-            c13!("C4", 121.1, 1),
-            c13!("C5", 122.1, 1),
-            c13!("C6", 124.8, 1),
-            c13!("C2", 127.7, 1),
-            c13!("C3a", 129.4, 1),
-            c13!("C7a", 139.0, 1),
-            c13!("C(COO-)", 177.1, 1),
+            c13!("C5", 29.152, 1),
+            c13!("C9", 57.764, 1),
+            c13!("C7", 110.188, 1),
+            c13!("C4", 114.700, 1),
+            c13!("C3", 121.196, 1),
+            c13!("C2", 122.200, 1),
+            c13!("C1", 124.871, 1),
+            c13!("C6", 127.797, 1),
+            c13!("C8", 129.377, 1),
+            c13!("C10", 139.075, 1),
+            c13!("C11", 177.332, 1),
         ],
     },
-    // 39. Hippurate
+    // 37. Hippuric acid (bmse000408, D2O, pH 7.40)
     StaticMetaboliteEntry {
-        bmse_id: "bmse000222",
-        name: "Hippurate",
+        bmse_id: "bmse000408",
+        name: "Hippuric acid",
+        aliases: &["Hippurate", "Hippuric acid"],
         formula: "C9H9NO3",
-        smiles: "O=C(O)CNC(=O)c1ccccc1",
-        ph: 7.4,
+        smiles: "C1=CC=C(C=C1)C(=O)NCC(=O)O",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("CH2", 3.968, Doublet, [5.8], 2),
-            p1h!("meta-CH", 7.548, Triplet, [7.6], 2),
-            p1h!("para-CH", 7.635, Triplet, [7.4], 1),
-            p1h!("ortho-CH", 7.832, Doublet, [7.6], 2),
+            p1h!("H19/H20", 3.944, Singlet, [], 2),
+            p1h!("H15/H16", 7.530, Triplet, [7.7], 2),
+            p1h!("H14", 7.618, Triplet, [7.5], 1),
+            p1h!("H17/H18", 7.808, Doublet, [7.0], 2),
         ],
         shifts_13c: &[
-            c13!("CH2", 46.7, 1),
-            c13!("Cortho", 129.6, 2),
-            c13!("Cmeta", 131.4, 2),
-            c13!("Cpara", 134.5, 1),
-            c13!("Cipso", 136.3, 1),
-            c13!("CONH", 173.4, 1),
-            c13!("COO-", 179.3, 1),
+            c13!("C6", 46.502, 1),
+            c13!("C4/C5", 129.868, 2),
+            c13!("C2/C3", 131.499, 2),
+            c13!("C1", 134.902, 1),
+            c13!("C7", 136.105, 1),
+            c13!("C9", 173.257, 1),
+            c13!("C8", 179.579, 1),
         ],
     },
-    // 40. 3-Hydroxybutyrate
-    StaticMetaboliteEntry {
-        bmse_id: "bmse000143",
-        name: "3-Hydroxybutyrate",
-        formula: "C4H8O3",
-        smiles: "C[C@@H](O)CC(=O)O",
-        ph: 7.4,
-        peaks_1h: &[
-            p1h!("gamma-CH3", 1.196, Doublet, [6.3], 3),
-            p1h!("alpha-CH2a", 2.305, DoubletOfDoublets, [14.5, 6.2], 1),
-            p1h!("alpha-CH2b", 2.405, DoubletOfDoublets, [14.5, 7.3], 1),
-            p1h!("beta-CH", 4.150, Multiplet, [6.5], 1),
-        ],
-        shifts_13c: &[
-            c13!("C4(CH3)", 24.5, 1),
-            c13!("C2(CH2)", 49.2, 1),
-            c13!("C3(CH)", 68.5, 1),
-            c13!("C1(COO-)", 183.1, 1),
-        ],
-    },
-    // 41. Acetoacetate
-    StaticMetaboliteEntry {
-        bmse_id: "bmse000370",
-        name: "Acetoacetate",
-        formula: "C4H6O3",
-        smiles: "CC(=O)CC(=O)O",
-        ph: 7.4,
-        peaks_1h: &[
-            p1h!("CH3", 2.278, Singlet, [], 3),
-            p1h!("CH2", 3.442, Singlet, [], 2),
-        ],
-        shifts_13c: &[
-            c13!("C4(CH3)", 32.3, 1),
-            c13!("C2(CH2)", 56.2, 1),
-            c13!("C1(COO-)", 177.6, 1),
-            c13!("C3(C=O)", 212.9, 1),
-        ],
-    },
-    // 42. Dimethylamine
-    StaticMetaboliteEntry {
-        bmse_id: "bmse000277",
-        name: "Dimethylamine",
-        formula: "C2H7N",
-        smiles: "CNC",
-        ph: 7.4,
-        peaks_1h: &[p1h!("2xCH3", 2.720, Singlet, [], 6)],
-        shifts_13c: &[c13!("2xCH3", 37.3, 2)],
-    },
-    // 43. Glycerol
-    StaticMetaboliteEntry {
-        bmse_id: "bmse000090",
-        name: "Glycerol",
-        formula: "C3H8O3",
-        smiles: "OCC(O)CO",
-        ph: 7.0,
-        peaks_1h: &[
-            p1h!("CH2a", 3.558, DoubletOfDoublets, [11.7, 6.5], 2),
-            p1h!("CH2b", 3.652, DoubletOfDoublets, [11.7, 4.4], 2),
-            p1h!("CH", 3.782, Multiplet, [6.5, 4.4], 1),
-        ],
-        shifts_13c: &[c13!("C1/C3(CH2)", 65.3, 2), c13!("C2(CH)", 74.8, 1)],
-    },
-    // 44. Phosphocholine
-    StaticMetaboliteEntry {
-        bmse_id: "bmse000098",
-        name: "Phosphocholine",
-        formula: "C5H15NO4P+",
-        smiles: "C[N+](C)(C)CCOP(=O)(O)O",
-        ph: 7.4,
-        peaks_1h: &[
-            p1h!("N(CH3)3", 3.218, Singlet, [], 9),
-            p1h!("CH2-N", 3.595, Multiplet, [5.0], 2),
-            p1h!("CH2-O", 4.165, Multiplet, [5.0], 2),
-        ],
-        shifts_13c: &[
-            c13!("N(CH3)3", 56.7, 3),
-            c13!("CH2-O", 61.1, 1),
-            c13!("CH2-N", 69.1, 1),
-        ],
-    },
-    // 45. L-Cysteine
-    StaticMetaboliteEntry {
-        bmse_id: "bmse000037",
-        name: "L-Cysteine",
-        formula: "C3H7NO2S",
-        smiles: "N[C@@H](CS)C(=O)O",
-        ph: 7.4,
-        peaks_1h: &[
-            p1h!("beta-CH2a", 3.015, DoubletOfDoublets, [14.8, 5.5], 1),
-            p1h!("beta-CH2b", 3.105, DoubletOfDoublets, [14.8, 4.2], 1),
-            p1h!("alpha-CH", 3.972, DoubletOfDoublets, [5.5, 4.2], 1),
-        ],
-        shifts_13c: &[
-            c13!("Cbeta", 27.6, 1),
-            c13!("Calpha", 58.6, 1),
-            c13!("C(COO-)", 175.1, 1),
-        ],
-    },
-    // 46. Uracil
+    // 38. 3-Hydroxybutyrate (bmse000161, D2O, pH 7.40)
     StaticMetaboliteEntry {
         bmse_id: "bmse000161",
-        name: "Uracil",
-        formula: "C4H4N2O2",
-        smiles: "O=c1cc[nH]c(=O)[nH]1",
-        ph: 7.4,
+        name: "3-Hydroxybutyrate",
+        aliases: &["3-Hydroxybutyrate"],
+        formula: "C4H8O3",
+        smiles: "CC(CC(=O)O)O",
+        ph: 7.40,
         peaks_1h: &[
-            p1h!("H5", 5.802, Doublet, [7.7], 1),
-            p1h!("H6", 7.536, Doublet, [7.7], 1),
+            p1h!("H10/H8/H9", 1.187, Doublet, [7.0], 3),
+            p1h!("H11/H12", 2.343, Multiplet, [], 2),
+            p1h!("H13", 4.139, Multiplet, [], 1),
         ],
         shifts_13c: &[
-            c13!("C5", 103.5, 1),
-            c13!("C6", 145.7, 1),
-            c13!("C2", 155.1, 1),
-            c13!("C4", 169.3, 1),
+            c13!("C1", 24.442, 1),
+            c13!("C2", 49.253, 1),
+            c13!("C3", 68.433, 1),
+            c13!("C4", 183.228, 1),
+        ],
+    },
+    // 39. Glycerol (bmse000184, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000184",
+        name: "Glycerol",
+        aliases: &["Glycerol"],
+        formula: "C3H8O3",
+        smiles: "C(C(CO)O)O",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H10..H9(4H)", 3.591, Multiplet, [], 4),
+            p1h!("H11", 3.768, Multiplet, [], 1),
+        ],
+        shifts_13c: &[c13!("C1/C2", 65.187, 2), c13!("C3", 74.769, 1)],
+    },
+    // 40. L-Cysteine (bmse000034, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000034",
+        name: "L-Cysteine",
+        aliases: &["L-Cysteine"],
+        formula: "C3H7NO2S",
+        smiles: "C([C@@H](C(=O)O)N)S",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H8/H9", 3.044, Multiplet, [], 2),
+            p1h!("H10", 3.952, Triplet, [4.7], 1),
+        ],
+        shifts_13c: &[
+            c13!("C1", 27.647, 1),
+            c13!("C2", 58.680, 1),
+            c13!("C3", 175.486, 1),
+        ],
+    },
+    // 41. Uracil (bmse000187, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000187",
+        name: "Uracil",
+        aliases: &["Uracil"],
+        formula: "C4H4N2O2",
+        smiles: "C1=CNC(=O)NC1=O",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H9", 5.792, Doublet, [8.0], 1),
+            p1h!("H10", 7.526, Doublet, [7.5], 1),
+        ],
+        shifts_13c: &[
+            c13!("C1", 103.795, 1),
+            c13!("C2", 146.265, 1),
+            c13!("C4", 155.933, 1),
+            c13!("C3", 170.295, 1),
+        ],
+    },
+    // 42. L-Malic acid (bmse000238, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000238",
+        name: "L-Malic acid",
+        aliases: &["L-Malate", "L-Malic acid"],
+        formula: "C4H6O5",
+        smiles: "C([C@@H](C(=O)O)O)C(=O)O",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H10", 2.355, Multiplet, [], 1),
+            p1h!("H12", 2.663, Multiplet, [], 1),
+            p1h!("H11", 4.286, Multiplet, [], 1),
+        ],
+        shifts_13c: &[
+            c13!("C1", 45.310, 1),
+            c13!("C2", 73.050, 1),
+            c13!("C4", 182.570, 1),
+            c13!("C3", 183.770, 1),
+        ],
+    },
+    // 43. alpha-Ketoglutaric acid (bmse000064, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000064",
+        name: "alpha-Ketoglutaric acid",
+        aliases: &["2-Oxoglutarate", "alpha-Ketoglutarate"],
+        formula: "C5H6O5",
+        smiles: "C(CC(=O)O)C(=O)C(=O)O",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H11..H14(4H)", 2.428, Triplet, [6.8], 1),
+            p1h!("H11..H14(4H)", 2.996, Triplet, [6.8], 1),
+        ],
+        shifts_13c: &[c13!("C1/C2", 33.325, 1), c13!("C1/C2", 38.573, 1)],
+    },
+    // 44. gamma-Aminobutyric acid (bmse000340, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000340",
+        name: "gamma-Aminobutyric acid",
+        aliases: &["GABA", "4-Aminobutyrate"],
+        formula: "C4H9NO2",
+        smiles: "C(CC(=O)O)CN",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H8/H9", 1.893, Multiplet, [], 2),
+            p1h!("H10/H11", 2.286, Triplet, [7.5], 2),
+            p1h!("H12/H13", 2.998, Triplet, [8.0], 2),
+        ],
+        shifts_13c: &[
+            c13!("C1", 26.393, 1),
+            c13!("C2", 37.130, 1),
+            c13!("C3", 42.005, 1),
+            c13!("C4", 184.370, 1),
+        ],
+    },
+    // 45. L-Ornithine (bmse000162, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000162",
+        name: "L-Ornithine",
+        aliases: &["L-Ornithine"],
+        formula: "C5H12N2O2",
+        smiles: "C(C[C@@H](C(=O)O)N)CN",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H10/H11", 1.796, Multiplet, [], 2),
+            p1h!("H12/H13", 1.932, Multiplet, [], 2),
+            p1h!("H14/H15", 3.043, Triplet, [], 2),
+            p1h!("H16", 3.771, Triplet, [], 1),
+        ],
+        shifts_13c: &[
+            c13!("C1", 25.467, 1),
+            c13!("C2", 30.183, 1),
+            c13!("C3", 41.558, 1),
+            c13!("C4", 56.803, 1),
+            c13!("C5", 177.052, 1),
+        ],
+    },
+    // 46. L-Citrulline (bmse000032, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000032",
+        name: "L-Citrulline",
+        aliases: &["L-Citrulline"],
+        formula: "C6H13N3O3",
+        smiles: "C(C[C@@H](C(=O)O)N)CNC(=O)N",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H13/H14", 1.559, Multiplet, [], 2),
+            p1h!("H15/H16", 1.865, Multiplet, [], 2),
+            p1h!("H17/H18", 3.134, Triplet, [], 2),
+            p1h!("H19", 3.743, Triplet, [6.0], 1),
+        ],
+        shifts_13c: &[
+            c13!("C1", 27.680, 1),
+            c13!("C2", 30.459, 1),
+            c13!("C3", 41.913, 1),
+            c13!("C4", 57.203, 1),
+            c13!("C6", 164.305, 1),
+            c13!("C5", 177.428, 1),
+        ],
+    },
+    // 47. L(-)-Carnitine (bmse000211, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000211",
+        name: "L(-)-Carnitine",
+        aliases: &["L-Carnitine"],
+        formula: "C7H15NO3",
+        smiles: "C[N+](C)(C)C[C@@H](CC(=O)[O-])O",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H21/H22", 2.425, Triplet, [], 2),
+            p1h!("H12..H20(9H)", 3.215, Singlet, [], 9),
+            p1h!("H23/H24", 3.419, Doublet, [], 2),
+            p1h!("H25", 4.555, Multiplet, [], 1),
+        ],
+        shifts_13c: &[
+            c13!("C4", 45.684, 1),
+            c13!("C1/C2/C3", 56.798, 3),
+            c13!("C6", 66.787, 1),
+            c13!("C5", 73.890, 1),
+            c13!("C7", 180.793, 1),
+        ],
+    },
+    // 48. Acetyl-L-carnitine (bmse000464, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000464",
+        name: "Acetyl-L-carnitine",
+        aliases: &["Acetyl-L-carnitine"],
+        formula: "C9H17NO4",
+        smiles: "CC(=O)O[C@H](CC(=O)[O-])C[N+](C)(C)C",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H15/H16/H17", 2.129, Singlet, [], 3),
+            p1h!("H28", 2.492, DoubletOfDoublets, [], 1),
+            p1h!("H27", 2.632, DoubletOfDoublets, [], 1),
+            p1h!("H18..H26(9H)", 3.183, Singlet, [], 9),
+            p1h!("H30", 3.597, DoubletOfDoublets, [], 1),
+            p1h!("H29", 3.845, DoubletOfDoublets, [], 1),
+            p1h!("H31", 5.594, Quartet, [7.0], 1),
+        ],
+        shifts_13c: &[
+            c13!("C1", 23.308, 1),
+            c13!("C5", 42.910, 1),
+            c13!("C2/C3/C4", 56.514, 3),
+            c13!("C8", 69.582, 1),
+            c13!("C6", 70.848, 1),
+            c13!("C7", 175.470, 1),
+            c13!("C9", 179.356, 1),
+        ],
+    },
+    // 49. Inosine (bmse000098, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000098",
+        name: "Inosine",
+        aliases: &["Inosine"],
+        formula: "C10H12N4O5",
+        smiles: "C1=NC(=O)C2=C(N1)N(C=N2)C3C(C(C(O3)CO)O)O",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H20/H21", 3.882, Multiplet, [], 1),
+            p1h!("H24", 4.278, Quartet, [2.7], 1),
+            p1h!("H25", 4.439, Triplet, [3.6], 1),
+            p1h!("H26", 4.752, Triplet, [4.2], 1),
+            p1h!("H27", 6.066, Doublet, [4.8], 1),
+            p1h!("H22/H23", 8.189, Singlet, [], 1),
+            p1h!("H22/H23", 8.310, Singlet, [], 1),
+        ],
+        shifts_13c: &[
+            c13!("C1", 64.020, 1),
+            c13!("C6", 73.081, 1),
+            c13!("C7", 76.776, 1),
+            c13!("C4", 88.270, 1),
+            c13!("C10", 91.113, 1),
+            c13!("C5", 126.857, 1),
+            c13!("C2/C3", 142.882, 1),
+            c13!("C2/C3", 148.918, 1),
+            c13!("C8", 151.077, 1),
+            c13!("C9", 161.346, 1),
+        ],
+    },
+    // 50. Sarcosine (bmse000160, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000160",
+        name: "Sarcosine",
+        aliases: &["Sarcosine"],
+        formula: "C3H7NO2",
+        smiles: "CNCC(=O)O",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H7/H8/H9", 2.725, Singlet, [], 3),
+            p1h!("H10/H11", 3.601, Singlet, [], 2),
+        ],
+        shifts_13c: &[
+            c13!("C1", 35.350, 1),
+            c13!("C2", 53.515, 1),
+            c13!("C3", 174.180, 1),
+        ],
+    },
+    // 51. N,N-Dimethylglycine (bmse000241, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000241",
+        name: "N,N-Dimethylglycine",
+        aliases: &["N,N-Dimethylglycine", "Dimethylglycine"],
+        formula: "C4H9NO2",
+        smiles: "CN(C)CC(=O)O",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H10..H9(6H)", 2.917, Singlet, [], 6),
+            p1h!("H14/H15", 3.716, Singlet, [], 2),
+        ],
+        shifts_13c: &[
+            c13!("C1/C2", 46.229, 2),
+            c13!("C3", 62.573, 1),
+            c13!("C4", 173.105, 1),
+        ],
+    },
+    // 52. Trimethylamine (bmse000224, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000224",
+        name: "Trimethylamine",
+        aliases: &["Trimethylamine"],
+        formula: "C3H9N",
+        smiles: "CN(C)C",
+        ph: 7.40,
+        peaks_1h: &[p1h!("H10..H9(9H)", 2.879, Singlet, [], 9)],
+        shifts_13c: &[c13!("C1/C2/C3", 47.359, 3)],
+    },
+    // 53. Allantoin (bmse000437, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000437",
+        name: "Allantoin",
+        aliases: &["Allantoin"],
+        formula: "C4H6N4O3",
+        smiles: "C1(C(=O)NC(=O)N1)NC(=O)N",
+        ph: 7.40,
+        peaks_1h: &[p1h!("H12", 5.375, Singlet, [], 1)],
+        shifts_13c: &[
+            c13!("C1", 65.942, 1),
+            c13!("C3", 162.132, 1),
+            c13!("C4", 162.548, 1),
+            c13!("C2", 178.950, 1),
+        ],
+    },
+    // 54. Benzoate (bmse000300, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000300",
+        name: "Benzoate",
+        aliases: &["Benzoate", "Benzoic acid"],
+        formula: "C7H6O2",
+        smiles: "C1=CC=C(C=C1)C(=O)O",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H11/H12", 7.469, Triplet, [7.4], 2),
+            p1h!("H10", 7.542, Triplet, [7.2], 1),
+            p1h!("H13/H14", 7.863, Doublet, [7.2], 2),
+        ],
+        shifts_13c: &[
+            c13!("C2/C3", 131.018, 2),
+            c13!("C4/C5", 131.497, 2),
+            c13!("C1", 133.971, 1),
+            c13!("C6", 138.912, 1),
+            c13!("C7", 178.537, 1),
+        ],
+    },
+    // 55. Butyric acid (bmse000402, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000402",
+        name: "Butyric acid",
+        aliases: &["Butyrate", "Butyric acid"],
+        formula: "C4H8O2",
+        smiles: "CCCC(=O)O",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H7/H8/H9", 0.881, Triplet, [7.3], 3),
+            p1h!("H10/H11", 1.545, Multiplet, [], 2),
+            p1h!("H12/H13", 2.143, Triplet, [7.2], 2),
+        ],
+        shifts_13c: &[
+            c13!("C1", 15.949, 1),
+            c13!("C2", 22.083, 1),
+            c13!("C3", 42.329, 1),
+            c13!("C4", 186.894, 1),
+        ],
+    },
+    // 56. Isobutyric acid (bmse000439, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000439",
+        name: "Isobutyric acid",
+        aliases: &["Isobutyrate", "Isobutyric acid"],
+        formula: "C4H8O2",
+        smiles: "CC(C)C(=O)O",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H10..H9(6H)", 1.049, Doublet, [7.0], 6),
+            p1h!("H13", 2.374, Multiplet, [], 1),
+        ],
+        shifts_13c: &[
+            c13!("C1/C2", 22.105, 2),
+            c13!("C3", 39.672, 1),
+            c13!("C4", 190.599, 1),
+        ],
+    },
+    // 57. Nicotinamide (bmse000281, D2O, pH 7.40)
+    StaticMetaboliteEntry {
+        bmse_id: "bmse000281",
+        name: "Nicotinamide",
+        aliases: &["Nicotinamide"],
+        formula: "C6H6N2O",
+        smiles: "C1=CC(=CN=C1)C(=O)N",
+        ph: 7.40,
+        peaks_1h: &[
+            p1h!("H10", 7.567, DoubletOfDoublets, [], 1),
+            p1h!("H11", 8.211, Doublet, [8.4], 1),
+            p1h!("H12", 8.686, Doublet, [], 1),
+            p1h!("H13", 8.894, Singlet, [], 1),
+        ],
+        shifts_13c: &[
+            c13!("C1", 126.922, 1),
+            c13!("C5", 131.938, 1),
+            c13!("C2", 139.152, 1),
+            c13!("C4", 150.342, 1),
+            c13!("C3", 154.525, 1),
+            c13!("C6", 173.377, 1),
         ],
     },
 ];
 
-/// Return the number of canonical aqueous metabolites in the built-in CC0 `BMRB-BMSE` index.
+/// Return the number of canonical aqueous metabolites in the built-in `BMRB-BMSE` index.
 pub fn offline_metabolite_count() -> usize {
     OFFLINE_BMRB_METABOLITES.len()
 }
 
-/// Return all canonical aqueous metabolites in the built-in CC0 `BMRB-BMSE` compact index.
+/// Return all canonical aqueous metabolites in the built-in `BMRB-BMSE` compact index.
 pub fn offline_metabolite_database() -> Vec<MetaboliteEntry> {
     OFFLINE_BMRB_METABOLITES
         .iter()
@@ -1302,16 +1599,28 @@ pub fn offline_metabolite_database() -> Vec<MetaboliteEntry> {
         .collect()
 }
 
-/// Look up an offline metabolite entry by case-insensitive `bmse_id` or common name.
+/// Look up an offline metabolite entry by case-insensitive `bmse_id`, exact BMRB compound name,
+/// or verified common biochemical alias (e.g. `"L-Lactate"` -> `bmse000208`).
 pub fn lookup_offline_metabolite(query: &str) -> Option<MetaboliteEntry> {
     let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return None;
+    }
     OFFLINE_BMRB_METABOLITES
         .iter()
-        .find(|e| e.bmse_id.eq_ignore_ascii_case(&q) || e.name.to_ascii_lowercase() == q)
+        .find(|e| {
+            e.bmse_id.eq_ignore_ascii_case(&q)
+                || e.name.to_ascii_lowercase() == q
+                || e.aliases.iter().any(|a| a.to_ascii_lowercase() == q)
+        })
         .map(StaticMetaboliteEntry::to_entry)
 }
 
 /// Extract a coherent `STOCSY` peak cluster (`r >= min_r`, default `0.85`) as [`QueryPeak`]s.
+///
+/// Suppresses monotonically decaying Lorentzian wing buckets by retaining the driver bucket plus
+/// local maxima of `stocsy.bucket_covariance` among buckets with `r >= min_r` (falling back to
+/// all `r >= min_r` buckets if `bucket_covariance` is empty or flat).
 pub fn extract_stocsy_cluster_query_peaks(
     buckets: &[SpectralBucket],
     stocsy: &StocsyResult,
@@ -1322,15 +1631,38 @@ pub fn extract_stocsy_cluster_query_peaks(
     } else {
         DEFAULT_STOCSY_CLUSTER_MIN_R
     };
+    let has_cov = stocsy.bucket_covariance.len() == buckets.len()
+        && stocsy
+            .bucket_covariance
+            .iter()
+            .any(|&c| c.is_finite() && c > 0.0);
+
     let mut peaks = Vec::new();
     for (idx, bucket) in buckets.iter().enumerate() {
         let r = stocsy.bucket_correlation.get(idx).copied().unwrap_or(0.0);
-        if r.is_finite() && (r >= threshold || idx == stocsy.driver_bucket_index) {
-            peaks.push(QueryPeak::from_stocsy_cluster(
-                bucket.center_ppm,
-                r.clamp(0.0, 1.0),
-            ));
+        let is_driver = idx == stocsy.driver_bucket_index;
+        if !r.is_finite() || (!is_driver && r < threshold) {
+            continue;
         }
+        if !is_driver && has_cov {
+            let cov = stocsy.bucket_covariance[idx];
+            if !cov.is_finite() || cov <= 0.0 {
+                continue;
+            }
+            let left_wing = idx > 0
+                && (buckets[idx - 1].center_ppm - bucket.center_ppm).abs() <= 0.08
+                && stocsy.bucket_covariance[idx - 1] > cov;
+            let right_wing = idx + 1 < buckets.len()
+                && (buckets[idx + 1].center_ppm - bucket.center_ppm).abs() <= 0.08
+                && stocsy.bucket_covariance[idx + 1] > cov;
+            if left_wing || right_wing {
+                continue;
+            }
+        }
+        peaks.push(QueryPeak::from_stocsy_cluster(
+            bucket.center_ppm,
+            r.clamp(0.0, 1.0),
+        ));
     }
     peaks
 }
@@ -1406,18 +1738,33 @@ fn filter_active_query_peaks(query_peaks: &[QueryPeak]) -> Vec<&QueryPeak> {
     }
 }
 
-/// Fast `< 5 ms` offline matcher against the built-in CC0 `BMRB-BMSE` metabolite index.
+/// Multi-peak specificity / chance-match attenuation factor in `(0.0, 1.0]`.
+///
+/// For a pure-compound query where every query peak is explained (`precision == 1.0`),
+/// the factor is `1.0`. In a dense mixture (`precision < 1.0`), a 1-peak singlet carries a high
+/// chance-match risk (`1 / (1 + 1.5) = 0.40`), whereas a multi-peak spin system (e.g.
+/// L-Isoleucine matching 5/6 peaks: `5 / (5 + 1.5) = 0.77`) carries much stronger statistical
+/// corroboration and ranks strictly above single-peak coincidences.
+fn mixture_specificity_factor(matched_peaks: usize, precision: f64) -> f64 {
+    let m = matched_peaks as f64;
+    let evidence = m / (m + 1.5);
+    let p = precision.clamp(0.0, 1.0);
+    (p + (1.0 - p) * evidence).clamp(0.0, 1.0)
+}
+
+/// Fast `< 5 ms` offline matcher against the built-in `BMRB-BMSE` metabolite index.
 ///
 /// Supports both full picked 1D peak lists (`1H` or `13C`) and `STOCSY` correlated peak clusters
-/// (`r >= 0.85`). Scores chemical-shift recall, query precision, Gaussian shift proximity, and
-/// multiplicity/`J`-coupling consistency into a composite score in `[0.0, 1.0]`.
+/// (`r >= 0.85`). Scores chemical-shift recall, query precision, Gaussian shift proximity,
+/// multiplicity/`J`-coupling consistency, and multi-peak mixture specificity into a composite
+/// score in `[0.0, 1.0]`.
 pub fn query_offline_metabolites(
     query_peaks: &[QueryPeak],
     nucleus: MetaboliteNucleus,
     tol_ppm: f64,
     top_k: usize,
 ) -> Vec<MetaboliteMatch> {
-    if top_k == 0 || !tol_ppm.is_finite() || tol_ppm <= 0.0 {
+    if top_k == 0 || !tol_ppm.is_finite() || tol_ppm <= 0.0 || tol_ppm > MAX_METABOLITE_TOL_PPM {
         return Vec::new();
     }
     let active_q = filter_active_query_peaks(query_peaks);
@@ -1474,7 +1821,7 @@ fn score_entry_h1(
         return None;
     }
 
-    // Greedy 1-to-1 assignment prioritizing smallest shift error (modulated gently by mult/J).
+    // Strict 1-to-1 greedy assignment prioritizing smallest shift error (modulated by mult/J).
     pairs.sort_by(|a, b| {
         let cost_a = a.2 / tol_ppm + 0.35 * (1.0 - a.3);
         let cost_b = b.2 / tol_ppm + 0.35 * (1.0 - b.3);
@@ -1514,40 +1861,10 @@ fn score_entry_h1(
         sum_err += diff;
         if let Some(r) = qp.stocsy_r.filter(|v| v.is_finite()) {
             let rc = r.clamp(0.0, 1.0);
-            sum_stocsy_r += rc;
-            if rc >= max_stocsy_r - 0.02 {
-                matched_driver = true;
-            }
-        }
-        if used_mj {
-            any_mj_checked = true;
-        }
-        matched_pairs.push(MatchedPeakPair {
-            assignment: rp.assignment.to_string(),
-            ref_ppm: rp.ppm,
-            query_ppm: qp.ppm,
-            delta_ppm: qp.ppm - rp.ppm,
-            mult_j_consistency: mj,
-        });
-    }
-
-    // Secondary pass: allow closely overlapping doublets/multiplets of the SAME metabolite
-    // (e.g. Leucine 0.952/0.964 coalesced into a single AIB bucket) to also claim an already-used
-    // query peak if within 0.75 * tol_ppm, without inflating matched_query_count.
-    for &(ri, qi, diff, mj, used_mj) in &pairs {
-        if ref_used[ri] || diff > 0.75 * tol_ppm {
-            continue;
-        }
-        ref_used[ri] = true;
-        let rp = &entry.peaks_1h[ri];
-        let qp = active_q[qi];
-        let s_prox = (-1.5 * (diff / tol_ppm).powi(2)).exp();
-        sum_shift += s_prox;
-        sum_mj += mj;
-        sum_err += diff;
-        if let Some(r) = qp.stocsy_r.filter(|v| v.is_finite()) {
-            let rc = r.clamp(0.0, 1.0);
-            sum_stocsy_r += rc;
+            // Weight STOCSY coherence sharply (r^4) so intramolecular spin-system peaks
+            // (r >= 0.98 -> r^4 >= 0.92) decisively outrank intermolecular pathway correlations
+            // (r ~ 0.88 -> r^4 ~ 0.60).
+            sum_stocsy_r += rc.powi(4);
             if rc >= max_stocsy_r - 0.02 {
                 matched_driver = true;
             }
@@ -1584,6 +1901,7 @@ fn score_entry_h1(
     } else {
         0.50 * recall + 0.22 * precision + 0.28 * shift_score
     };
+    composite *= mixture_specificity_factor(matched_q, precision);
     if is_stocsy_mode && max_stocsy_r >= DEFAULT_STOCSY_CLUSTER_MIN_R && !matched_driver {
         // Intermolecular pathway correlation (does not explain the STOCSY driver resonance).
         composite *= 0.65;
@@ -1654,7 +1972,7 @@ fn score_entry_c13(
         sum_err += diff;
         if let Some(r) = qp.stocsy_r.filter(|v| v.is_finite()) {
             let rc_clamped = r.clamp(0.0, 1.0);
-            sum_stocsy_r += rc_clamped;
+            sum_stocsy_r += rc_clamped.powi(4);
             if rc_clamped >= max_stocsy_r - 0.02 {
                 matched_driver = true;
             }
@@ -1684,6 +2002,7 @@ fn score_entry_c13(
     } else {
         0.50 * recall + 0.22 * precision + 0.28 * shift_score
     };
+    composite *= mixture_specificity_factor(matched_q, precision);
     if is_stocsy_mode && max_stocsy_r >= DEFAULT_STOCSY_CLUSTER_MIN_R && !matched_driver {
         composite *= 0.65;
     }
@@ -1860,18 +2179,18 @@ pub fn synthesize_reference_spectrum_1d(
 }
 
 // ============================================================================
-// Opt-In Desktop Online Query: BMRB v2 REST API + NP-MRD (Strict Allowlist)
+// Opt-In Desktop Online Query: BMRB v2 REST API + Honest NP-MRD Web Search URL
 // ============================================================================
 
-/// Pluggable HTTPS GET transport for desktop online queries (production uses `curl`, unit tests
+/// Pluggable HTTPS GET transport for desktop online queries (production uses `curl -q`, unit tests
 /// inject deterministic mocks without touching the network).
 #[cfg(not(target_arch = "wasm32"))]
 pub trait OnlineMetaboliteTransport {
     fn get_https_json(&mut self, url: &str) -> Result<String, String>;
 }
 
-/// Production desktop HTTPS client invoking `curl` with strict host allowlist, `5 s` connect/read
-/// timeout, no cross-host redirects, and a hard `4 MiB` response byte cap.
+/// Production desktop HTTPS client invoking `curl -q` (ignoring `~/.curlrc`) with strict host
+/// allowlist, `5 s` connect/read timeout, no cross-host redirects, and a hard `4 MiB` byte cap.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 pub struct CurlMetaboliteTransport;
@@ -1888,6 +2207,7 @@ impl OnlineMetaboliteTransport for CurlMetaboliteTransport {
 
         let mut child = Command::new("curl")
             .args([
+                "-q",
                 "-fsS",
                 "--proto",
                 "=https",
@@ -1946,66 +2266,238 @@ impl OnlineMetaboliteTransport for CurlMetaboliteTransport {
 }
 
 /// Build the strictly allowlisted `BMRB v2` chemical-shift search URL for a query peak.
+///
+/// Uses the live `BMRB v2` `shift=` query parameter (`https://api.bmrb.io/v2/search/chemical_shifts`).
 pub fn build_bmrb_v2_shift_search_url(
     ppm: f64,
     nucleus: MetaboliteNucleus,
     tol_ppm: f64,
 ) -> Result<String, String> {
-    if !ppm.is_finite() || !tol_ppm.is_finite() || tol_ppm <= 0.0 {
-        return Err("invalid non-finite ppm or tolerance for BMRB v2 query".to_string());
+    if !ppm.is_finite()
+        || !tol_ppm.is_finite()
+        || tol_ppm <= 0.0
+        || tol_ppm > MAX_METABOLITE_TOL_PPM
+    {
+        return Err(format!(
+            "invalid ppm or tolerance for BMRB v2 query (tol must be in (0.0, {MAX_METABOLITE_TOL_PPM}])"
+        ));
     }
     let atom_type = match nucleus {
         MetaboliteNucleus::H1 => "H",
         MetaboliteNucleus::C13 => "C",
     };
     let url = format!(
-        "{BMRB_V2_API_BASE}/search/chemical_shifts?shift_val={ppm:.4}&threshold={tol_ppm:.4}&atom_type={atom_type}&database=metabolomics"
+        "{BMRB_V2_API_BASE}/search/chemical_shifts?shift={ppm:.4}&threshold={tol_ppm:.4}&atom_type={atom_type}&database=metabolomics"
     );
     validate_metabolite_online_url(&url)?;
     Ok(url)
 }
 
-/// Build the strictly allowlisted `NP-MRD` shift search URL for a set of query peaks.
-pub fn build_npmrd_shift_search_url(
-    query_peaks: &[QueryPeak],
-    nucleus: MetaboliteNucleus,
-    tol_ppm: f64,
-) -> Result<String, String> {
-    if !tol_ppm.is_finite() || tol_ppm <= 0.0 {
-        return Err("invalid non-finite tolerance for NP-MRD query".to_string());
+/// Build the strictly allowlisted `BMRB v2` compact entry metadata + full shift-table URL for
+/// a single accession (e.g. `bmse000208`).
+pub fn build_bmrb_v2_entry_metadata_url(bmse_id: &str) -> Result<String, String> {
+    let id = bmse_id.trim();
+    if id.is_empty() || id.len() > 32 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(format!("invalid BMRB accession ID {bmse_id:?}"));
     }
-    let shifts: Vec<String> = query_peaks
-        .iter()
-        .filter(|q| q.ppm.is_finite())
-        .take(24)
-        .map(|q| format!("{:.4}", q.ppm))
-        .collect();
-    if shifts.is_empty() {
-        return Err("at least one finite query peak is required for NP-MRD query".to_string());
-    }
-    let nuc = nucleus.as_str();
     let url = format!(
-        "{NPMRD_API_BASE}/api/v1/spectra/search?nucleus={nuc}&shifts={}&tolerance={tol_ppm:.4}",
-        shifts.join(",")
+        "{BMRB_V2_API_BASE}/entry/{id}?tag=Chem_comp.Name&tag=Chem_comp.Formula&tag=Chem_comp_SMILES.String&tag=Atom_chem_shift.Atom_ID&tag=Atom_chem_shift.Atom_type&tag=Atom_chem_shift.Val"
     );
     validate_metabolite_online_url(&url)?;
     Ok(url)
 }
 
-/// Parse `BMRB v2` REST API JSON (`/v2/search/chemical_shifts`) into [`MetaboliteMatch`] hits.
-pub fn parse_bmrb_v2_response(
-    json_text: &str,
-    query_peaks: &[QueryPeak],
+/// Honest `NP-MRD` (`CC-BY-4.0`) web portal URL for manual browser search.
+///
+/// NP-MRD does not publish an unauthenticated JSON shift-search REST endpoint, so FERRIC
+/// links directly to the web portal rather than calling a nonexistent API path.
+pub fn npmrd_web_search_url() -> &'static str {
+    NPMRD_WEB_URL
+}
+
+fn is_placeholder_comp_id(raw: &str) -> bool {
+    let t = raw.trim();
+    t.is_empty() || t == "." || t == "?" || t.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Deduplicate equivalent chemical shifts (e.g. methyl protons `H7`/`H8`/`H9` at identical ppm
+/// or `13C-14N` triplet lines) into distinct resonance clusters.
+fn group_equivalent_shifts(
+    raw_shifts: &[(String, f64)],
+    merge_eps_ppm: f64,
+) -> Vec<(String, f64, u8)> {
+    let mut sorted: Vec<(&str, f64)> = raw_shifts
+        .iter()
+        .filter(|(_, p)| p.is_finite())
+        .map(|(a, p)| (a.as_str(), *p))
+        .collect();
+    sorted.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+
+    let mut groups: Vec<(Vec<String>, f64, usize)> = Vec::new();
+    for (atom, ppm) in sorted {
+        if let Some(last) = groups.last_mut() {
+            let mean_ppm = last.1 / (last.2 as f64);
+            if (ppm - mean_ppm).abs() <= merge_eps_ppm {
+                if !last.0.iter().any(|existing| existing == atom) {
+                    last.0.push(atom.to_string());
+                }
+                last.1 += ppm;
+                last.2 += 1;
+                continue;
+            }
+        }
+        groups.push((vec![atom.to_string()], ppm, 1));
+    }
+
+    groups
+        .into_iter()
+        .map(|(atoms, sum_ppm, count)| {
+            let label = if atoms.len() <= 3 {
+                atoms.join("/")
+            } else {
+                format!("{}..{}", atoms[0], atoms[atoms.len() - 1])
+            };
+            let mean_ppm = sum_ppm / (count as f64);
+            (label, mean_ppm, (atoms.len().min(12) as u8).max(1))
+        })
+        .collect()
+}
+
+/// Score a deduplicated online shift list against `active_q` with strict 1-to-1 matching.
+///
+/// When `total_ref_known` is `false` (partial rows from `/v2/search/chemical_shifts`), a
+/// conservative denominator `(n_matched + 3)` is used so single-atom partial hits never report
+/// a spurious `recall = 1.0`.
+#[allow(clippy::too_many_arguments)]
+fn build_online_bmrb_match(
+    bmse_id: String,
+    name: String,
+    formula: String,
+    smiles: String,
+    peaks_1h: Vec<MetabolitePeak1H>,
+    shifts_13c: Vec<MetaboliteShift13C>,
+    active_q: &[&QueryPeak],
     nucleus: MetaboliteNucleus,
     tol_ppm: f64,
-) -> Result<Vec<MetaboliteMatch>, String> {
+    total_ref_known: bool,
+) -> Option<MetaboliteMatch> {
+    let ref_list: Vec<(&str, f64)> = match nucleus {
+        MetaboliteNucleus::H1 => peaks_1h
+            .iter()
+            .map(|p| (p.assignment.as_str(), p.ppm))
+            .collect(),
+        MetaboliteNucleus::C13 => shifts_13c
+            .iter()
+            .map(|c| (c.assignment.as_str(), c.ppm))
+            .collect(),
+    };
+    if ref_list.is_empty() || active_q.is_empty() {
+        return None;
+    }
+
+    let mut pairs: Vec<(usize, usize, f64)> = Vec::new();
+    for (ri, &(_, rppm)) in ref_list.iter().enumerate() {
+        for (qi, qp) in active_q.iter().enumerate() {
+            let diff = (rppm - qp.ppm).abs();
+            if diff <= tol_ppm {
+                pairs.push((ri, qi, diff));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    pairs.sort_by(|a, b| a.2.total_cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+
+    let mut ref_used = vec![false; ref_list.len()];
+    let mut q_used = vec![false; active_q.len()];
+    let mut matched_pairs = Vec::new();
+    let mut sum_err = 0.0_f64;
+    let mut sum_shift = 0.0_f64;
+
+    for &(ri, qi, diff) in &pairs {
+        if ref_used[ri] || q_used[qi] {
+            continue;
+        }
+        ref_used[ri] = true;
+        q_used[qi] = true;
+        let (asgn, rppm) = ref_list[ri];
+        let qp = active_q[qi];
+        sum_err += diff;
+        sum_shift += (-1.5 * (diff / tol_ppm).powi(2)).exp();
+        matched_pairs.push(MatchedPeakPair {
+            assignment: asgn.to_string(),
+            ref_ppm: rppm,
+            query_ppm: qp.ppm,
+            delta_ppm: qp.ppm - rppm,
+            mult_j_consistency: 1.0,
+        });
+    }
+
+    let n_matched = matched_pairs.len();
+    if n_matched == 0 {
+        return None;
+    }
+    let ref_len = ref_list.len();
+    let matched_q = q_used.iter().filter(|&&u| u).count();
+    let total_ref = if total_ref_known {
+        ref_len.max(n_matched)
+    } else {
+        // Partial search response does not report unmatched peaks of the compound;
+        // do not inflate recall to 1.0.
+        n_matched + 3
+    };
+    let recall = (n_matched as f64) / (total_ref as f64);
+    let precision = (matched_q as f64) / (active_q.len() as f64);
+    let shift_score = (sum_shift / (n_matched as f64)).clamp(0.0, 1.0);
+    let mean_abs_error_ppm = sum_err / (n_matched as f64);
+    let raw_score = 0.50 * recall + 0.22 * precision + 0.28 * shift_score;
+    let score = (raw_score * mixture_specificity_factor(matched_q, precision)).clamp(0.0, 1.0);
+    let reported_total_ref = if total_ref_known {
+        ref_len.max(n_matched)
+    } else {
+        0
+    };
+
+    Some(MetaboliteMatch {
+        entry: MetaboliteEntry {
+            bmse_id,
+            name,
+            formula,
+            smiles,
+            solvent: "D2O".to_string(),
+            ph: 7.4,
+            peaks_1h,
+            shifts_13c,
+            source: MetaboliteSource::BmrbOnline,
+        },
+        nucleus,
+        score,
+        recall,
+        precision,
+        shift_score,
+        mult_j_score: 1.0,
+        matched_ref_peaks: n_matched,
+        total_ref_peaks: reported_total_ref,
+        mean_abs_error_ppm,
+        matched_pairs,
+    })
+}
+
+type BmrbSearchRowGroup = (Option<String>, Vec<(String, f64)>);
+
+/// Extract grouped `(bmse_id -> (api_name_opt, Vec<(atom, ppm)>))` from a raw `BMRB v2`
+/// `/v2/search/chemical_shifts` JSON payload.
+fn extract_bmrb_v2_search_rows(
+    json_text: &str,
+) -> Result<std::collections::BTreeMap<String, BmrbSearchRowGroup>, String> {
     use std::collections::BTreeMap;
 
     let root: serde_json::Value = serde_json::from_str(json_text)
         .map_err(|e| format!("failed to parse BMRB v2 JSON response: {e}"))?;
 
-    // Collect (entry_id -> (name, matched shifts))
-    let mut grouped: BTreeMap<String, (String, Vec<(String, f64)>)> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, BmrbSearchRowGroup> = BTreeMap::new();
 
     if let (Some(cols), Some(rows)) = (
         root.get("columns").and_then(|v| v.as_array()),
@@ -2016,12 +2508,15 @@ pub fn parse_bmrb_v2_response(
             .filter_map(|c| c.as_str().map(|s| s.to_ascii_lowercase()))
             .collect();
         let find_col = |needles: &[&str]| -> Option<usize> {
-            col_names
-                .iter()
-                .position(|c| needles.iter().any(|n| c == n || c.ends_with(n)))
+            col_names.iter().position(|c| {
+                let tail = c.rsplit('.').next().unwrap_or(c.as_str());
+                needles.iter().any(|&n| c == n || tail == n)
+            })
         };
         let id_col = find_col(&["entry_id", "bmse_id"]);
-        let name_col = find_col(&["comp_id", "name", "compound_name"]);
+        // Prefer explicit compound name columns over Comp_ID (which BMRB sets to "1" in metabolomics).
+        let explicit_name_col = find_col(&["compound_name", "chem_comp_name", "title", "name"]);
+        let comp_id_col = find_col(&["comp_id"]);
         let val_col = find_col(&["val", "shift_val", "ppm"]);
         let atom_col = find_col(&["atom_id", "assignment"]);
 
@@ -2030,7 +2525,12 @@ pub fn parse_bmrb_v2_response(
                 let Some(arr) = row.as_array() else {
                     continue;
                 };
-                let Some(entry_id) = arr.get(ic).and_then(|v| v.as_str()) else {
+                let Some(entry_id) = arr
+                    .get(ic)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
                     continue;
                 };
                 let shift_val = arr.get(vc).and_then(|v| {
@@ -2040,12 +2540,19 @@ pub fn parse_bmrb_v2_response(
                 let Some(ppm) = shift_val.filter(|v| v.is_finite()) else {
                     continue;
                 };
-                let cname = name_col
+                let cname = explicit_name_col
                     .and_then(|nc| arr.get(nc))
                     .and_then(|v| v.as_str())
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or(entry_id)
-                    .to_string();
+                    .map(str::trim)
+                    .filter(|s| !is_placeholder_comp_id(s))
+                    .or_else(|| {
+                        comp_id_col
+                            .and_then(|nc| arr.get(nc))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !is_placeholder_comp_id(s))
+                    })
+                    .map(str::to_string);
                 let atom = atom_col
                     .and_then(|ac| arr.get(ac))
                     .and_then(|v| v.as_str())
@@ -2053,7 +2560,10 @@ pub fn parse_bmrb_v2_response(
                     .to_string();
                 let slot = grouped
                     .entry(entry_id.to_string())
-                    .or_insert_with(|| (cname, Vec::new()));
+                    .or_insert_with(|| (cname.clone(), Vec::new()));
+                if slot.0.is_none() && cname.is_some() {
+                    slot.0 = cname;
+                }
                 slot.1.push((atom, ppm));
             }
         }
@@ -2077,11 +2587,14 @@ pub fn parse_bmrb_v2_response(
                 continue;
             }
             let cname = obj
-                .get("Comp_ID")
+                .get("Title")
+                .or_else(|| obj.get("compound_name"))
                 .or_else(|| obj.get("name"))
+                .or_else(|| obj.get("Comp_ID"))
                 .and_then(|v| v.as_str())
-                .unwrap_or(entry_id)
-                .to_string();
+                .map(str::trim)
+                .filter(|s| !is_placeholder_comp_id(s))
+                .map(str::to_string);
             let shift_val = obj.get("Val").or_else(|| obj.get("ppm")).and_then(|v| {
                 v.as_f64()
                     .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
@@ -2095,269 +2608,223 @@ pub fn parse_bmrb_v2_response(
                     .to_string();
                 let slot = grouped
                     .entry(entry_id.to_string())
-                    .or_insert_with(|| (cname, Vec::new()));
+                    .or_insert_with(|| (cname.clone(), Vec::new()));
+                if slot.0.is_none() && cname.is_some() {
+                    slot.0 = cname;
+                }
                 slot.1.push((atom, ppm));
             }
         }
     }
 
-    let active_q = filter_active_query_peaks(query_peaks);
-    let q_denom = active_q.len().max(1) as f64;
-    let mut hits = Vec::new();
-    for (bmse_id, (name, shifts)) in grouped {
-        let mut matched_pairs = Vec::new();
-        let mut sum_err = 0.0_f64;
-        let mut sum_shift = 0.0_f64;
-        let mut peaks_1h = Vec::new();
-        let mut shifts_13c = Vec::new();
-
-        for (atom, rppm) in &shifts {
-            match nucleus {
-                MetaboliteNucleus::H1 => peaks_1h.push(MetabolitePeak1H {
-                    assignment: atom.clone(),
-                    ppm: *rppm,
-                    multiplicity: PeakMultiplicity::Multiplet,
-                    j_hz: Vec::new(),
-                    n_protons: 1,
-                }),
-                MetaboliteNucleus::C13 => shifts_13c.push(MetaboliteShift13C {
-                    assignment: atom.clone(),
-                    ppm: *rppm,
-                    n_carbons: 1,
-                }),
-            }
-            if let Some(best_q) = active_q
-                .iter()
-                .min_by(|a, b| (a.ppm - rppm).abs().total_cmp(&(b.ppm - rppm).abs()))
-            {
-                let diff = (best_q.ppm - rppm).abs();
-                if diff <= tol_ppm {
-                    sum_err += diff;
-                    sum_shift += (-1.5 * (diff / tol_ppm).powi(2)).exp();
-                    matched_pairs.push(MatchedPeakPair {
-                        assignment: atom.clone(),
-                        ref_ppm: *rppm,
-                        query_ppm: best_q.ppm,
-                        delta_ppm: best_q.ppm - rppm,
-                        mult_j_consistency: 1.0,
-                    });
-                }
-            }
-        }
-        if matched_pairs.is_empty() {
-            continue;
-        }
-        let n_matched = matched_pairs.len();
-        let total_ref = shifts.len().max(n_matched);
-        let recall = (n_matched as f64) / (total_ref as f64);
-        let precision = ((n_matched as f64) / q_denom).clamp(0.0, 1.0);
-        let shift_score = (sum_shift / (n_matched as f64)).clamp(0.0, 1.0);
-        let mean_abs_error_ppm = sum_err / (n_matched as f64);
-        let score = (0.45 * recall + 0.25 * precision + 0.30 * shift_score).clamp(0.0, 1.0);
-
-        let offline_ref = lookup_offline_metabolite(&bmse_id);
-        hits.push(MetaboliteMatch {
-            entry: MetaboliteEntry {
-                bmse_id,
-                name: offline_ref.as_ref().map(|e| e.name.clone()).unwrap_or(name),
-                formula: offline_ref
-                    .as_ref()
-                    .map(|e| e.formula.clone())
-                    .unwrap_or_default(),
-                smiles: offline_ref
-                    .as_ref()
-                    .map(|e| e.smiles.clone())
-                    .unwrap_or_default(),
-                solvent: "D2O".to_string(),
-                ph: 7.4,
-                peaks_1h,
-                shifts_13c,
-                source: MetaboliteSource::BmrbOnline,
-            },
-            nucleus,
-            score,
-            recall,
-            precision,
-            shift_score,
-            mult_j_score: 1.0,
-            matched_ref_peaks: n_matched,
-            total_ref_peaks: total_ref,
-            mean_abs_error_ppm,
-            matched_pairs,
-        });
-    }
-    Ok(hits)
+    Ok(grouped)
 }
 
-/// Parse `NP-MRD` JSON search response into [`MetaboliteMatch`] hits.
-pub fn parse_npmrd_response(
+/// Parse a `BMRB v2` REST API JSON payload (`/v2/search/chemical_shifts`) into [`MetaboliteMatch`]
+/// hits using ONLY metadata returned by the API itself (never overwriting names or SMILES from
+/// the offline index).
+///
+/// Because `/v2/search/chemical_shifts` returns only atoms matching the query window (without
+/// the compound's remaining peaks), hits parsed from this response alone use a conservative
+/// partial-hit recall denominator so single-atom hits never report a spurious `recall = 1.0`.
+pub fn parse_bmrb_v2_response(
     json_text: &str,
     query_peaks: &[QueryPeak],
     nucleus: MetaboliteNucleus,
     tol_ppm: f64,
 ) -> Result<Vec<MetaboliteMatch>, String> {
-    let root: serde_json::Value = serde_json::from_str(json_text)
-        .map_err(|e| format!("failed to parse NP-MRD JSON response: {e}"))?;
-    let items = root
-        .as_array()
-        .or_else(|| root.get("results").and_then(|v| v.as_array()))
-        .or_else(|| root.get("data").and_then(|v| v.as_array()))
-        .or_else(|| root.get("hits").and_then(|v| v.as_array()));
-
-    let Some(arr) = items else {
+    if !tol_ppm.is_finite() || tol_ppm <= 0.0 || tol_ppm > MAX_METABOLITE_TOL_PPM {
+        return Err(format!(
+            "invalid shift tolerance {tol_ppm} ppm (must be in (0.0, {MAX_METABOLITE_TOL_PPM}])"
+        ));
+    }
+    let grouped = extract_bmrb_v2_search_rows(json_text)?;
+    let active_q = filter_active_query_peaks(query_peaks);
+    if active_q.is_empty() {
         return Ok(Vec::new());
+    }
+    let merge_eps = match nucleus {
+        MetaboliteNucleus::H1 => 0.005,
+        MetaboliteNucleus::C13 => 0.08,
     };
 
-    let active_q = filter_active_query_peaks(query_peaks);
-    let q_denom = active_q.len().max(1) as f64;
     let mut hits = Vec::new();
-
-    for item in arr {
-        let Some(obj) = item.as_object() else {
-            continue;
-        };
-        let acc = obj
-            .get("np_mrd_id")
-            .or_else(|| obj.get("accession"))
-            .or_else(|| obj.get("id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if acc.is_empty() {
-            continue;
-        }
-        let name = obj
-            .get("name")
-            .or_else(|| obj.get("compound_name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(&acc)
-            .to_string();
-        let formula = obj
-            .get("formula")
-            .or_else(|| obj.get("molecular_formula"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let smiles = obj
-            .get("smiles")
-            .or_else(|| obj.get("canonical_smiles"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let mut ref_ppms = Vec::new();
-        if let Some(p_arr) = obj
-            .get("peaks")
-            .or_else(|| obj.get("shifts"))
-            .and_then(|v| v.as_array())
-        {
-            for pv in p_arr {
-                if let Some(p) = pv.as_f64().filter(|v| v.is_finite()) {
-                    ref_ppms.push(p);
-                } else if let Some(p) = pv
-                    .as_object()
-                    .and_then(|po| po.get("ppm").or_else(|| po.get("shift")))
-                    .and_then(|v| v.as_f64())
-                    .filter(|v| v.is_finite())
-                {
-                    ref_ppms.push(p);
-                }
-            }
-        }
-
+    for (bmse_id, (api_name, shifts)) in grouped {
+        let deduped = group_equivalent_shifts(&shifts, merge_eps);
         let mut peaks_1h = Vec::new();
         let mut shifts_13c = Vec::new();
-        let mut matched_pairs = Vec::new();
-        let mut sum_err = 0.0_f64;
-        let mut sum_shift = 0.0_f64;
-
-        for (idx, &rppm) in ref_ppms.iter().enumerate() {
-            let lbl = format!("P{}", idx + 1);
+        for (atom, rppm, count) in deduped {
             match nucleus {
                 MetaboliteNucleus::H1 => peaks_1h.push(MetabolitePeak1H {
-                    assignment: lbl.clone(),
+                    assignment: atom,
                     ppm: rppm,
                     multiplicity: PeakMultiplicity::Multiplet,
                     j_hz: Vec::new(),
-                    n_protons: 1,
+                    n_protons: count,
                 }),
                 MetaboliteNucleus::C13 => shifts_13c.push(MetaboliteShift13C {
-                    assignment: lbl.clone(),
+                    assignment: atom,
                     ppm: rppm,
-                    n_carbons: 1,
+                    n_carbons: count,
                 }),
             }
-            if let Some(best_q) = active_q
-                .iter()
-                .min_by(|a, b| (a.ppm - rppm).abs().total_cmp(&(b.ppm - rppm).abs()))
-            {
-                let diff = (best_q.ppm - rppm).abs();
-                if diff <= tol_ppm {
-                    sum_err += diff;
-                    sum_shift += (-1.5 * (diff / tol_ppm).powi(2)).exp();
-                    matched_pairs.push(MatchedPeakPair {
-                        assignment: lbl,
-                        ref_ppm: rppm,
-                        query_ppm: best_q.ppm,
-                        delta_ppm: best_q.ppm - rppm,
-                        mult_j_consistency: 1.0,
-                    });
-                }
-            }
         }
-
-        let reported_score = obj
-            .get("score")
-            .and_then(|v| v.as_f64())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.0, 1.0));
-
-        let (score, recall, precision, shift_score, mean_abs_error_ppm, matched_ref, total_ref) =
-            if !matched_pairs.is_empty() {
-                let nm = matched_pairs.len();
-                let nr = ref_ppms.len().max(nm);
-                let rec = (nm as f64) / (nr as f64);
-                let prec = ((nm as f64) / q_denom).clamp(0.0, 1.0);
-                let sh = (sum_shift / (nm as f64)).clamp(0.0, 1.0);
-                let sc = reported_score
-                    .unwrap_or_else(|| (0.45 * rec + 0.25 * prec + 0.30 * sh).clamp(0.0, 1.0));
-                (sc, rec, prec, sh, sum_err / (nm as f64), nm, nr)
-            } else if let Some(sc) = reported_score {
-                (sc, sc, sc, sc, 0.0, 0, ref_ppms.len())
-            } else {
-                continue;
-            };
-
-        hits.push(MetaboliteMatch {
-            entry: MetaboliteEntry {
-                bmse_id: acc,
-                name,
-                formula,
-                smiles,
-                solvent: "D2O".to_string(),
-                ph: 7.0,
-                peaks_1h,
-                shifts_13c,
-                source: MetaboliteSource::NpMrdOnline,
-            },
+        let display_name = api_name.unwrap_or_else(|| bmse_id.clone());
+        if let Some(hit) = build_online_bmrb_match(
+            bmse_id,
+            display_name,
+            String::new(),
+            String::new(),
+            peaks_1h,
+            shifts_13c,
+            &active_q,
             nucleus,
-            score,
-            recall,
-            precision,
-            shift_score,
-            mult_j_score: 1.0,
-            matched_ref_peaks: matched_ref,
-            total_ref_peaks: total_ref,
-            mean_abs_error_ppm,
-            matched_pairs,
-        });
+            tol_ppm,
+            false,
+        ) {
+            hits.push(hit);
+        }
     }
-
     Ok(hits)
 }
 
+/// Parse a `BMRB v2` entry metadata JSON payload (`/v2/entry/<bmse_id>?tag=...`) and score the
+/// complete entry shift list against `query_peaks` using genuine `recall` and API-sourced
+/// `Chem_comp.Name`, `Chem_comp.Formula`, and `Chem_comp_SMILES.String`.
+pub fn parse_bmrb_v2_entry_metadata_and_score(
+    bmse_id: &str,
+    json_text: &str,
+    query_peaks: &[QueryPeak],
+    nucleus: MetaboliteNucleus,
+    tol_ppm: f64,
+) -> Result<Option<MetaboliteMatch>, String> {
+    if !tol_ppm.is_finite() || tol_ppm <= 0.0 || tol_ppm > MAX_METABOLITE_TOL_PPM {
+        return Err(format!(
+            "invalid shift tolerance {tol_ppm} ppm (must be in (0.0, {MAX_METABOLITE_TOL_PPM}])"
+        ));
+    }
+    let root: serde_json::Value = serde_json::from_str(json_text)
+        .map_err(|e| format!("failed to parse BMRB v2 entry metadata JSON for {bmse_id}: {e}"))?;
+    let entry_obj = root
+        .get(bmse_id)
+        .or_else(|| root.as_object().and_then(|m| m.values().next()))
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| format!("BMRB v2 entry metadata JSON for {bmse_id} had no entry object"))?;
+
+    let first_non_empty_str = |key: &str| -> Option<String> {
+        entry_obj
+            .get(key)
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(str::trim)
+                    .find(|s| !s.is_empty() && *s != "." && *s != "?")
+            })
+            .map(str::to_string)
+    };
+
+    let name = first_non_empty_str("Chem_comp.Name")
+        .or_else(|| first_non_empty_str("Entry.Title"))
+        .unwrap_or_else(|| bmse_id.to_string());
+    let formula = first_non_empty_str("Chem_comp.Formula")
+        .map(|f| f.replace(' ', ""))
+        .unwrap_or_default();
+    let smiles = entry_obj
+        .get("Chem_comp_SMILES.String")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            let candidates: Vec<&str> = arr
+                .iter()
+                .filter_map(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "." && *s != "?")
+                .collect();
+            candidates
+                .iter()
+                .copied()
+                .find(|s| crate::octet_mol::parse_smiles(s).is_ok())
+                .or_else(|| candidates.first().copied())
+                .unwrap_or("")
+                .to_string()
+        })
+        .unwrap_or_default();
+
+    let atom_ids = entry_obj
+        .get("Atom_chem_shift.Atom_ID")
+        .and_then(|v| v.as_array());
+    let atom_types = entry_obj
+        .get("Atom_chem_shift.Atom_type")
+        .and_then(|v| v.as_array());
+    let vals = entry_obj
+        .get("Atom_chem_shift.Val")
+        .and_then(|v| v.as_array());
+
+    let mut raw_h: Vec<(String, f64)> = Vec::new();
+    let mut raw_c: Vec<(String, f64)> = Vec::new();
+    if let (Some(a_types), Some(a_vals)) = (atom_types, vals) {
+        let n = a_types.len().min(a_vals.len());
+        for i in 0..n {
+            let atype = a_types[i].as_str().unwrap_or("").trim();
+            let ppm = a_vals[i]
+                .as_f64()
+                .or_else(|| a_vals[i].as_str().and_then(|s| s.parse::<f64>().ok()));
+            let Some(ppm) = ppm.filter(|v| v.is_finite()) else {
+                continue;
+            };
+            let aid = atom_ids
+                .and_then(|ids| ids.get(i))
+                .and_then(|v| v.as_str())
+                .unwrap_or(atype)
+                .to_string();
+            match atype {
+                "H" => raw_h.push((aid, ppm)),
+                "C" => raw_c.push((aid, ppm)),
+                _ => {}
+            }
+        }
+    }
+
+    let peaks_1h: Vec<MetabolitePeak1H> = group_equivalent_shifts(&raw_h, 0.005)
+        .into_iter()
+        .map(|(assignment, ppm, n_protons)| MetabolitePeak1H {
+            assignment,
+            ppm,
+            multiplicity: PeakMultiplicity::Multiplet,
+            j_hz: Vec::new(),
+            n_protons,
+        })
+        .collect();
+    let shifts_13c: Vec<MetaboliteShift13C> = group_equivalent_shifts(&raw_c, 0.08)
+        .into_iter()
+        .map(|(assignment, ppm, n_carbons)| MetaboliteShift13C {
+            assignment,
+            ppm,
+            n_carbons,
+        })
+        .collect();
+
+    let active_q = filter_active_query_peaks(query_peaks);
+    Ok(build_online_bmrb_match(
+        bmse_id.to_string(),
+        name,
+        formula,
+        smiles,
+        peaks_1h,
+        shifts_13c,
+        &active_q,
+        nucleus,
+        tol_ppm,
+        true,
+    ))
+}
+
 /// Opt-in desktop online query using a pluggable transport (useful for deterministic unit tests).
+///
+/// Queries `https://api.bmrb.io/v2/search/chemical_shifts?shift=...` for up to 3 representative
+/// query peaks, aggregates top candidate accessions, and fetches compact entry metadata
+/// (`/v2/entry/<bmse_id>?tag=...`) so real compound names, SMILES, and full-spectrum recall
+/// are reported directly from BMRB.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn query_online_bmrb_and_npmrd_with_transport<T: OnlineMetaboliteTransport>(
     query_peaks: &[QueryPeak],
@@ -2366,90 +2833,164 @@ pub fn query_online_bmrb_and_npmrd_with_transport<T: OnlineMetaboliteTransport>(
     sources: OnlineQuerySources,
     transport: &mut T,
 ) -> Result<Vec<MetaboliteMatch>, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
     if !sources.bmrb && !sources.npmrd {
         return Err("no online metabolite sources selected".to_string());
     }
-    if !tol_ppm.is_finite() || tol_ppm <= 0.0 {
-        return Err(format!("invalid shift tolerance {tol_ppm} ppm"));
+    if !sources.bmrb && sources.npmrd {
+        return Err(format!(
+            "NP-MRD does not expose a public JSON shift-search API; use web search at {NPMRD_WEB_URL}"
+        ));
+    }
+    if !tol_ppm.is_finite() || tol_ppm <= 0.0 || tol_ppm > MAX_METABOLITE_TOL_PPM {
+        return Err(format!(
+            "invalid shift tolerance {tol_ppm} ppm (must be in (0.0, {MAX_METABOLITE_TOL_PPM}])"
+        ));
     }
     let active_q = filter_active_query_peaks(query_peaks);
     if active_q.is_empty() {
         return Err("at least one finite query peak is required for online search".to_string());
     }
 
-    let mut combined: Vec<MetaboliteMatch> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    let mut succeeded_sources = 0usize;
+    let mut bmrb_ok = false;
 
-    if sources.bmrb {
-        let mut bmrb_ok = false;
-        // Query up to 3 representative peaks against BMRB v2 chemical_shifts endpoint.
-        let mut bmrb_raw_hits = Vec::new();
-        for qp in active_q.iter().take(3) {
-            let url = build_bmrb_v2_shift_search_url(qp.ppm, nucleus, tol_ppm)?;
-            match transport.get_https_json(&url) {
-                Ok(body) => match parse_bmrb_v2_response(&body, query_peaks, nucleus, tol_ppm) {
-                    Ok(mut parsed) => {
-                        bmrb_ok = true;
-                        bmrb_raw_hits.append(&mut parsed);
-                    }
-                    Err(e) => errors.push(format!("BMRB v2 parse error: {e}")),
-                },
-                Err(e) => errors.push(format!("BMRB v2 network error: {e}")),
-            }
-        }
-        if bmrb_ok {
-            succeeded_sources += 1;
-            combined.extend(bmrb_raw_hits);
-        }
-    }
+    // Aggregate raw candidate accessions across up to 3 queried peaks:
+    // bmse_id -> (matched_query_peak_indices, min_err_ppm, fallback_api_name, raw_shifts)
+    #[allow(clippy::type_complexity)]
+    let mut candidates: BTreeMap<
+        String,
+        (BTreeSet<usize>, f64, Option<String>, Vec<(String, f64)>),
+    > = BTreeMap::new();
 
-    if sources.npmrd {
-        let url = build_npmrd_shift_search_url(query_peaks, nucleus, tol_ppm)?;
+    for (q_idx, qp) in active_q.iter().take(3).enumerate() {
+        let url = build_bmrb_v2_shift_search_url(qp.ppm, nucleus, tol_ppm)?;
         match transport.get_https_json(&url) {
-            Ok(body) => match parse_npmrd_response(&body, query_peaks, nucleus, tol_ppm) {
-                Ok(parsed) => {
-                    succeeded_sources += 1;
-                    combined.extend(parsed);
+            Ok(body) => match extract_bmrb_v2_search_rows(&body) {
+                Ok(rows_by_id) => {
+                    bmrb_ok = true;
+                    for (bmse_id, (api_name, shifts)) in rows_by_id {
+                        let min_d = shifts
+                            .iter()
+                            .map(|(_, p)| (*p - qp.ppm).abs())
+                            .fold(f64::INFINITY, f64::min);
+                        if min_d <= tol_ppm {
+                            let slot = candidates.entry(bmse_id).or_insert_with(|| {
+                                (BTreeSet::new(), f64::INFINITY, None, Vec::new())
+                            });
+                            slot.0.insert(q_idx);
+                            slot.1 = slot.1.min(min_d);
+                            if slot.2.is_none() && api_name.is_some() {
+                                slot.2 = api_name;
+                            }
+                            slot.3.extend(shifts);
+                        }
+                    }
                 }
-                Err(e) => errors.push(format!("NP-MRD parse error: {e}")),
+                Err(e) => errors.push(format!("BMRB v2 parse error: {e}")),
             },
-            Err(e) => errors.push(format!("NP-MRD network error: {e}")),
+            Err(e) => errors.push(format!("BMRB v2 network error: {e}")),
         }
     }
 
-    if succeeded_sources == 0 {
+    if !bmrb_ok {
         return Err(format!(
-            "all online metabolite queries failed (offline or unreachable): {}",
+            "BMRB v2 online metabolite query failed (offline or unreachable): {}",
             errors.join("; ")
         ));
     }
 
-    // Deduplicate by (source, bmse_id), keeping highest-scoring entry.
+    // Rank candidates by distinct matched query peaks DESC, then smallest shift error ASC.
+    let mut ranked_ids: Vec<(String, usize, f64)> = candidates
+        .iter()
+        .map(|(id, (qset, min_d, _, _))| (id.clone(), qset.len(), *min_d))
+        .collect();
+    ranked_ids.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.2.total_cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked_ids.truncate(8);
+
+    let merge_eps = match nucleus {
+        MetaboliteNucleus::H1 => 0.005,
+        MetaboliteNucleus::C13 => 0.08,
+    };
+    let mut combined: Vec<MetaboliteMatch> = Vec::new();
+
+    for (bmse_id, _, _) in ranked_ids {
+        let mut resolved = false;
+        if let Ok(meta_url) = build_bmrb_v2_entry_metadata_url(&bmse_id) {
+            if let Ok(meta_body) = transport.get_https_json(&meta_url) {
+                if let Ok(Some(hit)) = parse_bmrb_v2_entry_metadata_and_score(
+                    &bmse_id,
+                    &meta_body,
+                    query_peaks,
+                    nucleus,
+                    tol_ppm,
+                ) {
+                    combined.push(hit);
+                    resolved = true;
+                }
+            }
+        }
+        if !resolved {
+            if let Some((_, _, api_name, shifts)) = candidates.get(&bmse_id) {
+                let deduped = group_equivalent_shifts(shifts, merge_eps);
+                let mut peaks_1h = Vec::new();
+                let mut shifts_13c = Vec::new();
+                for (atom, rppm, count) in deduped {
+                    match nucleus {
+                        MetaboliteNucleus::H1 => peaks_1h.push(MetabolitePeak1H {
+                            assignment: atom,
+                            ppm: rppm,
+                            multiplicity: PeakMultiplicity::Multiplet,
+                            j_hz: Vec::new(),
+                            n_protons: count,
+                        }),
+                        MetaboliteNucleus::C13 => shifts_13c.push(MetaboliteShift13C {
+                            assignment: atom,
+                            ppm: rppm,
+                            n_carbons: count,
+                        }),
+                    }
+                }
+                let display_name = api_name.clone().unwrap_or_else(|| bmse_id.clone());
+                if let Some(hit) = build_online_bmrb_match(
+                    bmse_id,
+                    display_name,
+                    String::new(),
+                    String::new(),
+                    peaks_1h,
+                    shifts_13c,
+                    &active_q,
+                    nucleus,
+                    tol_ppm,
+                    false,
+                ) {
+                    combined.push(hit);
+                }
+            }
+        }
+    }
+
     combined.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
+            .then_with(|| b.matched_ref_peaks.cmp(&a.matched_ref_peaks))
             .then_with(|| a.mean_abs_error_ppm.total_cmp(&b.mean_abs_error_ppm))
             .then_with(|| a.entry.bmse_id.cmp(&b.entry.bmse_id))
     });
-    let mut deduped: Vec<MetaboliteMatch> = Vec::with_capacity(combined.len());
-    for hit in combined {
-        let exists = deduped
-            .iter()
-            .any(|d| d.entry.source == hit.entry.source && d.entry.bmse_id == hit.entry.bmse_id);
-        if !exists {
-            deduped.push(hit);
-        }
-    }
-    Ok(deduped)
+    Ok(combined)
 }
 
-/// Opt-in desktop online metabolite search querying `BMRB v2` (`https://api.bmrb.io/v2/...`)
-/// and/or `NP-MRD` (`https://np-mrd.org/...`).
+/// Opt-in desktop online metabolite search querying `BMRB v2` (`https://api.bmrb.io/v2/...`).
 ///
-/// Strictly enforces HTTPS host allowlist (`api.bmrb.io`, `np-mrd.org` only), `5 s` connect/read
-/// timeout, `4 MiB` response cap, no cross-host redirects, and fails closed with `Err` when
-/// offline. Never invoked automatically without explicit user opt-in.
+/// Strictly enforces HTTPS host allowlist (`api.bmrb.io`, `np-mrd.org` only), invokes `curl -q`
+/// (ignoring `~/.curlrc`), enforces `5 s` connect/read timeout and `4 MiB` response cap, disables
+/// cross-host redirects, and fails closed with `Err` when offline. Never invoked automatically
+/// without explicit user opt-in. For NP-MRD, use [`npmrd_web_search_url`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn query_online_bmrb_and_npmrd(
     query_peaks: &[QueryPeak],

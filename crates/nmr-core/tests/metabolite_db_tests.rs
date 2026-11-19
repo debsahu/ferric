@@ -1,18 +1,24 @@
 //! Integration tests for `nmr_core::metabolite_db`:
-//! - Built-in CC0 `BMRB-BMSE` compact aqueous metabolite index (`>= 40` metabolites, valid SMILES)
-//! - Fast `< 5 ms` offline identification for L-Lactate, L-Alanine, D-Glucose (`1H` & `13C`)
+//! - Built-in live-verified `BMRB-BMSE` compact aqueous metabolite index (`>= 40` metabolites, valid SMILES)
+//! - Fast `< 5 ms` offline identification for L-(+) Lactic acid (`bmse000208`), L-Alanine (`bmse000028`),
+//!   D-(+)-Glucose (`bmse000015`) (`1H` & `13C`)
+//! - Multi-peak mixture specificity ranking (`L-Isoleucine 5/6` strictly above 1-peak singlets)
+//! - Strict 1-to-1 peak matching and tolerance cap (`tol <= 2.0 ppm`)
 //! - Multiplicity / scalar `J`-coupling discrimination & `STOCSY` correlated cluster (`r >= 0.85`)
 //! - Strict HTTPS host allowlist SSRF rejection (`api.bmrb.io`, `np-mrd.org` only)
-//! - Deterministic mock desktop online query (`BMRB v2` + `NP-MRD`) and fail-closed offline `Err`
+//! - Honest `BMRB v2` REST API query (`shift=`, real compound names via `/v2/entry/<id>`, never
+//!   overwriting online hits from the offline table, no fake partial `recall = 1.0`) and honest
+//!   `NP-MRD` web search URL (`https://np-mrd.org/`), plus fail-closed offline `Err`
 //! - 1D reference spectrum synthesis (`synthesize_reference_spectrum_1d`) for overlay plotting.
 
 use std::collections::BTreeSet;
 use std::time::Instant;
 
 use nmr_core::metabolite_db::{
-    build_bmrb_v2_shift_search_url, build_npmrd_shift_search_url,
-    extract_stocsy_cluster_query_peaks, lookup_offline_metabolite, offline_metabolite_count,
-    offline_metabolite_database, query_offline_metabolites, synthesize_reference_spectrum_1d,
+    build_bmrb_v2_entry_metadata_url, build_bmrb_v2_shift_search_url,
+    extract_stocsy_cluster_query_peaks, lookup_offline_metabolite, npmrd_web_search_url,
+    offline_metabolite_count, offline_metabolite_database, parse_bmrb_v2_entry_metadata_and_score,
+    parse_bmrb_v2_response, query_offline_metabolites, synthesize_reference_spectrum_1d,
     validate_metabolite_online_url, MetaboliteNucleus, MetaboliteSource, OnlineHost,
     PeakMultiplicity, QueryPeak, DEFAULT_STOCSY_CLUSTER_MIN_R,
 };
@@ -27,7 +33,7 @@ fn test_offline_database_completeness_uniqueness_and_octet_smiles_validity() {
     let db = offline_metabolite_database();
     assert!(
         db.len() >= 40,
-        "expected >= 40 canonical aqueous metabolites, got {}",
+        "expected >= 40 live-verified BMRB-BMSE aqueous metabolites, got {}",
         db.len()
     );
     assert_eq!(db.len(), offline_metabolite_count());
@@ -40,8 +46,10 @@ fn test_offline_database_completeness_uniqueness_and_octet_smiles_validity() {
             entry.bmse_id
         );
         assert!(
-            entry.bmse_id.starts_with("bmse"),
-            "expected bmse* accession, got {}",
+            entry.bmse_id.starts_with("bmse")
+                && entry.bmse_id.len() == 10
+                && entry.bmse_id[4..].bytes().all(|b| b.is_ascii_digit()),
+            "expected canonical bmse000XXX accession, got {}",
             entry.bmse_id
         );
         assert!(!entry.name.trim().is_empty());
@@ -49,12 +57,17 @@ fn test_offline_database_completeness_uniqueness_and_octet_smiles_validity() {
         assert!(!entry.smiles.trim().is_empty());
         assert_eq!(entry.solvent, "D2O");
         assert!(
-            (6.8..=7.6).contains(&entry.ph),
+            (1.0..=12.0).contains(&entry.ph),
             "unexpected aqueous pH {} for {}",
             entry.ph,
             entry.name
         );
         assert_eq!(entry.source, MetaboliteSource::BmrbBmseOffline);
+        assert!(
+            !entry.source.label().contains("CC0"),
+            "BMRB source label must not claim CC0: {}",
+            entry.source.label()
+        );
         assert!(
             !entry.peaks_1h.is_empty(),
             "missing 1H peaks for {}",
@@ -87,63 +100,74 @@ fn test_offline_database_completeness_uniqueness_and_octet_smiles_validity() {
         );
     }
 
-    // Spot-check canonical biofluid entries requested by spec.
-    for required in [
-        "L-Lactate",
-        "L-Alanine",
-        "alpha-D-Glucose",
-        "beta-D-Glucose",
-        "Acetate",
-        "Citrate",
-        "Succinate",
-        "Creatine",
-        "Creatinine",
-        "Glycine",
-        "Taurine",
-        "Choline",
-        "TMAO",
-        "L-Glutamine",
-        "L-Glutamate",
-        "L-Valine",
-        "L-Leucine",
-        "L-Isoleucine",
-        "L-Tyrosine",
-        "L-Phenylalanine",
-        "L-Histidine",
-        "Formate",
-        "Pyruvate",
-        "Fumarate",
-        "Ethanol",
-        "Methanol",
-        "Acetone",
-        "Betaine",
-        "Myo-inositol",
-        "L-Serine",
-        "L-Threonine",
-        "L-Proline",
-        "L-Lysine",
-        "L-Arginine",
-        "L-Aspartate",
-        "L-Asparagine",
-        "L-Methionine",
-        "L-Tryptophan",
-        "Hippurate",
-        "3-Hydroxybutyrate",
-        "Acetoacetate",
+    // Spot-check live-verified BMRB-BMSE accessions and exact compound names.
+    for (alias, expected_id) in [
+        ("L-Lactate", "bmse000208"),
+        ("L-Alanine", "bmse000028"),
+        ("D-Glucose", "bmse000015"),
+        ("Acetate", "bmse000191"),
+        ("Citrate", "bmse000076"),
+        ("Succinate", "bmse000183"),
+        ("Creatine", "bmse000078"),
+        ("Creatinine", "bmse000155"),
+        ("Glycine", "bmse000089"),
+        ("Taurine", "bmse000120"),
+        ("Choline", "bmse000285"),
+        ("TMAO", "bmse000426"),
+        ("L-Glutamine", "bmse000038"),
+        ("L-Glutamate", "bmse000037"),
+        ("L-Valine", "bmse000052"),
+        ("L-Leucine", "bmse000042"),
+        ("L-Isoleucine", "bmse000041"),
+        ("L-Tyrosine", "bmse000051"),
+        ("L-Phenylalanine", "bmse000045"),
+        ("L-Histidine", "bmse000039"),
+        ("Formate", "bmse000203"),
+        ("Pyruvate", "bmse000112"),
+        ("Fumarate", "bmse000083"),
+        ("Ethanol", "bmse000297"),
+        ("Methanol", "bmse000294"),
+        ("Betaine", "bmse000069"),
+        ("Myo-inositol", "bmse000103"),
+        ("L-Serine", "bmse000048"),
+        ("L-Threonine", "bmse000049"),
+        ("L-Proline", "bmse000047"),
+        ("L-Lysine", "bmse000043"),
+        ("L-Arginine", "bmse000029"),
+        ("L-Aspartate", "bmse000031"),
+        ("L-Asparagine", "bmse000030"),
+        ("L-Methionine", "bmse000044"),
+        ("L-Tryptophan", "bmse000050"),
+        ("Hippurate", "bmse000408"),
+        ("3-Hydroxybutyrate", "bmse000161"),
+        ("Glycerol", "bmse000184"),
+        ("L-Cysteine", "bmse000034"),
+        ("Uracil", "bmse000187"),
     ] {
-        assert!(
-            lookup_offline_metabolite(required).is_some(),
-            "required metabolite {required:?} missing from offline index"
+        let entry = lookup_offline_metabolite(alias)
+            .unwrap_or_else(|| panic!("required metabolite {alias:?} missing from offline index"));
+        assert_eq!(
+            entry.bmse_id, expected_id,
+            "unexpected bmse_id for {alias:?}"
         );
     }
+
+    // Verify Hippuric acid (bmse000408) CH2 in D2O is a Singlet (amide NH exchanges with D2O).
+    let hipp = lookup_offline_metabolite("bmse000408").expect("Hippuric acid");
+    let ch2 = hipp
+        .peaks_1h
+        .iter()
+        .find(|p| (p.ppm - 3.944).abs() < 0.01)
+        .expect("Hippuric acid CH2 peak at 3.944 ppm");
+    assert_eq!(ch2.multiplicity, PeakMultiplicity::Singlet);
 }
 
 #[test]
 fn test_offline_identification_lactate_alanine_glucose_1h_and_13c_fast() {
-    // 1. L-Lactate 1H (with small experimental jitter + latency check < 5 ms)
+    // 1. L-(+) Lactic acid (bmse000208) 1H (with small experimental jitter + latency check < 5 ms)
     let lac_q = vec![
-        QueryPeak::with_multiplet(1.332, PeakMultiplicity::Doublet, vec![6.9]),
-        QueryPeak::with_multiplet(4.108, PeakMultiplicity::Quartet, vec![6.9]),
+        QueryPeak::with_multiplet(1.320, PeakMultiplicity::Doublet, vec![7.2]),
+        QueryPeak::with_multiplet(4.100, PeakMultiplicity::Quartet, vec![7.0]),
     ];
     let t0 = Instant::now();
     let lac_hits = query_offline_metabolites(&lac_q, MetaboliteNucleus::H1, 0.03, 5);
@@ -153,104 +177,171 @@ fn test_offline_identification_lactate_alanine_glucose_1h_and_13c_fast() {
         "offline query took {elapsed_ms:.3} ms (must be < 5 ms)"
     );
     assert!(!lac_hits.is_empty());
-    assert_eq!(lac_hits[0].entry.name, "L-Lactate");
-    assert_eq!(lac_hits[0].entry.bmse_id, "bmse000036");
+    assert_eq!(lac_hits[0].entry.bmse_id, "bmse000208");
+    assert_eq!(lac_hits[0].entry.name, "L-(+) Lactic acid");
     assert_eq!(lac_hits[0].matched_ref_peaks, 2);
     assert_eq!(lac_hits[0].total_ref_peaks, 2);
     assert!(lac_hits[0].score > 0.95, "score={}", lac_hits[0].score);
 
-    // 2. L-Alanine 1H
+    // 2. L-Alanine (bmse000028) 1H
     let ala_q = vec![
-        QueryPeak::with_multiplet(1.476, PeakMultiplicity::Doublet, vec![7.2]),
-        QueryPeak::with_multiplet(3.780, PeakMultiplicity::Quartet, vec![7.2]),
+        QueryPeak::with_multiplet(1.471, PeakMultiplicity::Doublet, vec![7.2]),
+        QueryPeak::with_multiplet(3.771, PeakMultiplicity::Quartet, vec![7.2]),
     ];
     let ala_hits = query_offline_metabolites(&ala_q, MetaboliteNucleus::H1, 0.03, 5);
-    assert_eq!(ala_hits[0].entry.name, "L-Alanine");
     assert_eq!(ala_hits[0].entry.bmse_id, "bmse000028");
+    assert_eq!(ala_hits[0].entry.name, "L-Alanine");
     assert!(ala_hits[0].score > 0.95);
 
-    // 3. alpha-D-Glucose 1H
-    let aglc_q = vec![
-        QueryPeak::from_ppm(5.233),
-        QueryPeak::from_ppm(3.833),
-        QueryPeak::from_ppm(3.710),
-        QueryPeak::from_ppm(3.533),
-        QueryPeak::from_ppm(3.408),
+    // 3. D-(+)-Glucose (bmse000015) 1H
+    let glc_q = vec![
+        QueryPeak::from_ppm(3.232),
+        QueryPeak::from_ppm(3.401),
+        QueryPeak::from_ppm(3.459),
+        QueryPeak::from_ppm(3.517),
+        QueryPeak::from_ppm(3.726),
+        QueryPeak::from_ppm(3.828),
+        QueryPeak::from_ppm(3.887),
+        QueryPeak::from_ppm(4.636),
+        QueryPeak::from_ppm(5.222),
     ];
-    let aglc_hits = query_offline_metabolites(&aglc_q, MetaboliteNucleus::H1, 0.03, 5);
-    assert_eq!(aglc_hits[0].entry.name, "alpha-D-Glucose");
-    assert_eq!(aglc_hits[0].matched_ref_peaks, 5);
-    assert_eq!(aglc_hits[0].total_ref_peaks, 5);
-    assert!(aglc_hits[0].score > 0.98);
+    let glc_hits = query_offline_metabolites(&glc_q, MetaboliteNucleus::H1, 0.03, 5);
+    assert_eq!(glc_hits[0].entry.bmse_id, "bmse000015");
+    assert_eq!(glc_hits[0].entry.name, "D-(+)-Glucose");
+    assert_eq!(glc_hits[0].matched_ref_peaks, 9);
+    assert_eq!(glc_hits[0].total_ref_peaks, 9);
+    assert!(glc_hits[0].score > 0.98);
 
-    // 4. beta-D-Glucose 1H
-    let bglc_q = vec![
-        QueryPeak::from_ppm(4.642),
-        QueryPeak::from_ppm(3.895),
-        QueryPeak::from_ppm(3.720),
-        QueryPeak::from_ppm(3.475),
-        QueryPeak::from_ppm(3.400),
-        QueryPeak::from_ppm(3.242),
-    ];
-    let bglc_hits = query_offline_metabolites(&bglc_q, MetaboliteNucleus::H1, 0.03, 5);
-    assert_eq!(bglc_hits[0].entry.name, "beta-D-Glucose");
-    assert_eq!(bglc_hits[0].matched_ref_peaks, 6);
-    assert!(bglc_hits[0].score > 0.98);
-
-    // 5. 13C identification for L-Lactate and L-Alanine
+    // 4. 13C identification for L-(+) Lactic acid and L-Alanine
     let lac_c13 = vec![
-        QueryPeak::from_ppm(22.9),
-        QueryPeak::from_ppm(71.1),
-        QueryPeak::from_ppm(185.0),
+        QueryPeak::from_ppm(22.81),
+        QueryPeak::from_ppm(71.23),
+        QueryPeak::from_ppm(185.32),
     ];
     let lac_c13_hits = query_offline_metabolites(&lac_c13, MetaboliteNucleus::C13, 0.50, 5);
-    assert_eq!(lac_c13_hits[0].entry.name, "L-Lactate");
+    assert_eq!(lac_c13_hits[0].entry.bmse_id, "bmse000208");
     assert_eq!(lac_c13_hits[0].matched_ref_peaks, 3);
     assert!(lac_c13_hits[0].score > 0.95);
 
     let ala_c13 = vec![
-        QueryPeak::from_ppm(18.9),
-        QueryPeak::from_ppm(53.3),
-        QueryPeak::from_ppm(178.5),
+        QueryPeak::from_ppm(18.83),
+        QueryPeak::from_ppm(53.20),
+        QueryPeak::from_ppm(178.56),
     ];
     let ala_c13_hits = query_offline_metabolites(&ala_c13, MetaboliteNucleus::C13, 0.50, 5);
-    assert_eq!(ala_c13_hits[0].entry.name, "L-Alanine");
+    assert_eq!(ala_c13_hits[0].entry.bmse_id, "bmse000028");
     assert!(ala_c13_hits[0].score > 0.98);
+
+    // 5. Absurd tolerance (> 2.0 ppm) must be rejected cleanly
+    assert!(query_offline_metabolites(&lac_q, MetaboliteNucleus::H1, 1e300, 5).is_empty());
+    assert!(query_offline_metabolites(&lac_q, MetaboliteNucleus::H1, 2.5, 5).is_empty());
+}
+
+#[test]
+fn test_mixture_scoring_ranks_multipeak_isoleucine_above_singlet_coincidences() {
+    // Regression test for 171.metab:P1-4:
+    // Dense 20-peak mixture containing 5 of 6 L-Isoleucine peaks (bmse000041) plus
+    // exact 1-peak singlets for Acetic acid (1.905), Formate (8.447), Methanol (3.346),
+    // Glycine (3.545), and 11 additional mixture peaks.
+    let mixture = vec![
+        // 5/6 L-Isoleucine peaks (omitting 1.458)
+        QueryPeak::from_ppm(0.927),
+        QueryPeak::from_ppm(0.998),
+        QueryPeak::from_ppm(1.249),
+        QueryPeak::from_ppm(1.969),
+        QueryPeak::from_ppm(3.657),
+        // Exact 1-peak singlets
+        QueryPeak::from_ppm(1.905), // Acetic acid
+        QueryPeak::from_ppm(8.447), // Formate
+        QueryPeak::from_ppm(3.346), // Methanol
+        QueryPeak::from_ppm(3.545), // Glycine
+        // Additional background mixture peaks
+        QueryPeak::from_ppm(0.810),
+        QueryPeak::from_ppm(1.110),
+        QueryPeak::from_ppm(1.620),
+        QueryPeak::from_ppm(2.220),
+        QueryPeak::from_ppm(2.810),
+        QueryPeak::from_ppm(4.350),
+        QueryPeak::from_ppm(5.100),
+        QueryPeak::from_ppm(6.150),
+        QueryPeak::from_ppm(6.720),
+        QueryPeak::from_ppm(7.020),
+        QueryPeak::from_ppm(8.950),
+    ];
+
+    let hits = query_offline_metabolites(&mixture, MetaboliteNucleus::H1, 0.03, 25);
+    let ile_pos = hits
+        .iter()
+        .position(|h| h.entry.bmse_id == "bmse000041")
+        .expect("L-Isoleucine must appear in mixture hits");
+    let ile = &hits[ile_pos];
+    assert_eq!(ile.matched_ref_peaks, 5);
+    assert_eq!(ile.total_ref_peaks, 6);
+
+    for singlet_id in ["bmse000191", "bmse000203", "bmse000294", "bmse000089"] {
+        let s_pos = hits
+            .iter()
+            .position(|h| h.entry.bmse_id == singlet_id)
+            .unwrap_or_else(|| panic!("singlet {singlet_id} should appear in hits"));
+        assert!(
+            ile.score > hits[s_pos].score + 0.15 && ile_pos < s_pos,
+            "L-Isoleucine (5/6, rank={}, score={:.3}) must rank strictly above 1-peak singlet {} (rank={}, score={:.3})",
+            ile_pos + 1,
+            ile.score,
+            singlet_id,
+            s_pos + 1,
+            hits[s_pos].score
+        );
+    }
+
+    // Strict 1-to-1 matching: a single query peak must never claim > 1 reference peak.
+    let single_q = vec![QueryPeak::from_ppm(1.007)];
+    let single_hits = query_offline_metabolites(&single_q, MetaboliteNucleus::H1, 0.03, 10);
+    for h in &single_hits {
+        assert_eq!(
+            h.matched_ref_peaks, 1,
+            "single query peak must match at most 1 reference peak for {} (got {})",
+            h.entry.name, h.matched_ref_peaks
+        );
+    }
 }
 
 #[test]
 fn test_multiplicity_and_j_consistency_disambiguates_overlapping_shifts() {
-    // Taurine triplet @ 3.260 (J=6.6) + 3.425 (J=6.6) vs TMAO singlet @ 3.266
+    // Taurine (bmse000120) triplet @ 3.246 (J=6.8) + 3.410 (J=6.8) vs TMAO (bmse000426) singlet @ 3.249
     let taurine_q = vec![
-        QueryPeak::with_multiplet(3.261, PeakMultiplicity::Triplet, vec![6.6]),
-        QueryPeak::with_multiplet(3.426, PeakMultiplicity::Triplet, vec![6.6]),
+        QueryPeak::with_multiplet(3.246, PeakMultiplicity::Triplet, vec![6.8]),
+        QueryPeak::with_multiplet(3.410, PeakMultiplicity::Triplet, vec![6.8]),
     ];
     let hits = query_offline_metabolites(&taurine_q, MetaboliteNucleus::H1, 0.03, 5);
+    assert_eq!(hits[0].entry.bmse_id, "bmse000120");
     assert_eq!(hits[0].entry.name, "Taurine");
     assert!(hits[0].mult_j_score > 0.98);
 
-    // Single singlet peak @ 3.266 -> TMAO outranks Taurine
+    // Single singlet peak @ 3.249 -> Trimethylamine N-oxide (bmse000426) outranks Taurine
     let tmao_q = vec![QueryPeak::with_multiplet(
-        3.266,
+        3.249,
         PeakMultiplicity::Singlet,
         vec![],
     )];
     let hits_tmao = query_offline_metabolites(&tmao_q, MetaboliteNucleus::H1, 0.03, 5);
-    assert_eq!(hits_tmao[0].entry.name, "TMAO");
+    assert_eq!(hits_tmao[0].entry.bmse_id, "bmse000426");
+    assert_eq!(hits_tmao[0].entry.name, "Trimethylamine N-oxide");
 }
 
 #[test]
 fn test_stocsy_correlated_cluster_identification_synthetic_and_cohort() {
     // 1. Direct STOCSY cluster filtering: L-Lactate peaks r >= 0.85, distractors r < 0.85
     let stocsy_cluster = vec![
-        QueryPeak::from_stocsy_cluster(1.331, 1.00),
-        QueryPeak::from_stocsy_cluster(4.109, 0.96),
-        QueryPeak::from_stocsy_cluster(1.918, 0.28), // Acetate noise (r < 0.85)
-        QueryPeak::from_stocsy_cluster(2.405, 0.14), // Succinate noise (r < 0.85)
-        QueryPeak::from_stocsy_cluster(8.448, -0.35), // Formate anticorrelated
+        QueryPeak::from_stocsy_cluster(1.319, 1.00),
+        QueryPeak::from_stocsy_cluster(4.101, 0.96),
+        QueryPeak::from_stocsy_cluster(1.905, 0.28), // Acetic acid noise (r < 0.85)
+        QueryPeak::from_stocsy_cluster(2.391, 0.14), // Succinic acid noise (r < 0.85)
+        QueryPeak::from_stocsy_cluster(8.447, -0.35), // Formate anticorrelated
     ];
     let hits = query_offline_metabolites(&stocsy_cluster, MetaboliteNucleus::H1, 0.03, 5);
-    assert_eq!(hits[0].entry.name, "L-Lactate");
+    assert_eq!(hits[0].entry.bmse_id, "bmse000208");
+    assert_eq!(hits[0].entry.name, "L-(+) Lactic acid");
     assert_eq!(hits[0].matched_ref_peaks, 2);
     assert!(
         (hits[0].precision - 1.0).abs() < 1e-6,
@@ -274,48 +365,69 @@ fn test_stocsy_correlated_cluster_identification_synthetic_and_cohort() {
         cluster_peaks.len()
     );
     let cohort_hits = query_offline_metabolites(&cluster_peaks, MetaboliteNucleus::H1, 0.04, 5);
-    assert_eq!(cohort_hits[0].entry.name, "L-Lactate");
-    assert_eq!(cohort_hits[0].entry.bmse_id, "bmse000036");
+    assert_eq!(
+        cohort_hits[0].entry.bmse_id,
+        "bmse000208",
+        "cluster_peaks={cluster_peaks:?} hits={:?}",
+        cohort_hits
+            .iter()
+            .map(|h| (
+                &h.entry.bmse_id,
+                &h.entry.name,
+                h.score,
+                h.matched_ref_peaks,
+                h.total_ref_peaks,
+                h.mean_abs_error_ppm
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(cohort_hits[0].entry.name, "L-(+) Lactic acid");
 }
 
 #[test]
-fn test_strict_https_host_allowlist_ssrf_rejection() {
-    // Strictly permitted hosts
+fn test_strict_https_host_allowlist_ssrf_rejection_and_honest_urls() {
+    // Strictly permitted hosts & live BMRB v2 `shift=` query parameter
+    let bmrb_url =
+        build_bmrb_v2_shift_search_url(1.318, MetaboliteNucleus::H1, 0.03).expect("BMRB URL");
+    assert!(
+        bmrb_url.contains("?shift=1.3180&") && !bmrb_url.contains("shift_val="),
+        "BMRB v2 URL must use `shift=` (not `shift_val=`): {bmrb_url}"
+    );
     assert_eq!(
-        validate_metabolite_online_url(
-            "https://api.bmrb.io/v2/search/chemical_shifts?shift_val=1.3300&threshold=0.0300&atom_type=H&database=metabolomics"
-        ),
+        validate_metabolite_online_url(&bmrb_url),
         Ok(OnlineHost::BmrbApiV2)
     );
+
+    let meta_url = build_bmrb_v2_entry_metadata_url("bmse000208").expect("entry metadata URL");
     assert_eq!(
-        validate_metabolite_online_url(
-            "https://np-mrd.org/api/v1/spectra/search?nucleus=1H&shifts=1.3300,4.1100&tolerance=0.0300"
-        ),
+        validate_metabolite_online_url(&meta_url),
+        Ok(OnlineHost::BmrbApiV2)
+    );
+    assert!(build_bmrb_v2_entry_metadata_url("../evil").is_err());
+    assert!(build_bmrb_v2_shift_search_url(1.318, MetaboliteNucleus::H1, 2.5).is_err());
+
+    // Honest NP-MRD web portal URL (no invented /api/v1/spectra/search 404 endpoint)
+    assert_eq!(npmrd_web_search_url(), "https://np-mrd.org/");
+    assert_eq!(
+        validate_metabolite_online_url("https://np-mrd.org/searches"),
         Ok(OnlineHost::NpMrd)
     );
-    assert!(build_bmrb_v2_shift_search_url(1.33, MetaboliteNucleus::H1, 0.03).is_ok());
-    assert!(build_npmrd_shift_search_url(
-        &[QueryPeak::from_ppm(1.33)],
-        MetaboliteNucleus::H1,
-        0.03
-    )
-    .is_ok());
 
     // SSRF / scheme / lookalike / port / userinfo / traversal attacks MUST be rejected
     let forbidden = [
         "http://api.bmrb.io/v2/search/chemical_shifts",
-        "http://np-mrd.org/api/v1/spectra/search",
+        "http://np-mrd.org/searches",
         "file:///etc/passwd",
         "ftp://api.bmrb.io/v2/x",
         "https://api.bmrb.io.evil.example/v2/search",
         "https://evil-api.bmrb.io/v2/search",
-        "https://np-mrd.org.attacker.net/api/v1/spectra/search",
-        "https://www.np-mrd.org/api/v1/spectra/search",
+        "https://np-mrd.org.attacker.net/searches",
+        "https://www.np-mrd.org/searches",
         "https://bmrb.io/v2/search",
         "https://hmdb.ca/spectra/nmr_one_d/1",
         "https://user@api.bmrb.io/v2/search",
         "https://api.bmrb.io:8443/v2/search",
-        "https://np-mrd.org:443/api/v1/spectra/search",
+        "https://np-mrd.org:443/searches",
         "https://127.0.0.1/v2/search",
         "https://[::1]/v2/search",
         "https://169.254.169.254/latest/meta-data/",
@@ -334,12 +446,85 @@ fn test_strict_https_host_allowlist_ssrf_rejection() {
 }
 
 #[test]
+fn test_parse_bmrb_v2_never_overwrites_from_offline_or_inflates_partial_recall() {
+    // Regression test for 171.metab:P0-2 and 171.metab:P1-3:
+    // Realistic BMRB v2 /search/chemical_shifts response uses Comp_ID = "1" and returns
+    // only the matching methyl atoms (H7/H8/H9 at 1.318 ppm).
+    let raw_search_json = r#"{
+        "columns": [
+            "Atom_chem_shift.Entry_ID",
+            "Atom_chem_shift.Comp_ID",
+            "Atom_chem_shift.Atom_ID",
+            "Atom_chem_shift.Val"
+        ],
+        "data": [
+            ["bmse000208", "1", "H7", 1.318],
+            ["bmse000208", "1", "H8", 1.318],
+            ["bmse000208", "1", "H9", 1.318],
+            ["bmse000049", "1", "H10", 1.318]
+        ]
+    }"#;
+    let q = vec![QueryPeak::from_ppm(1.318), QueryPeak::from_ppm(4.101)];
+    let hits = parse_bmrb_v2_response(raw_search_json, &q, MetaboliteNucleus::H1, 0.03)
+        .expect("parse raw BMRB v2 search response");
+    assert_eq!(hits.len(), 2);
+    for hit in &hits {
+        // Must NEVER treat numeric Comp_ID "1" as a compound name, and must NEVER
+        // overwrite name/SMILES from the offline database.
+        assert_ne!(hit.entry.name, "1");
+        assert_eq!(hit.entry.name, hit.entry.bmse_id);
+        assert!(
+            hit.entry.smiles.is_empty(),
+            "raw search hit must not copy SMILES from offline table"
+        );
+        // Equivalent methyl atoms (H7/H8/H9) must deduplicate to 1 peak, not 3.
+        assert_eq!(hit.matched_ref_peaks, 1);
+        // Partial search hit must NEVER report spurious recall == 1.0!
+        assert!(
+            hit.recall < 0.50,
+            "partial search hit {} must not get recall=1.0 (got {})",
+            hit.entry.bmse_id,
+            hit.recall
+        );
+    }
+
+    // Entry metadata parser uses ONLY what the online API returns — even if the API returns
+    // a distinct name/SMILES for an ID that exists in the offline table.
+    let custom_meta_json = r#"{
+        "bmse000049": {
+            "Chem_comp.Name": ["Custom API Threonine Name"],
+            "Chem_comp.Formula": ["C4 H9 N O3"],
+            "Chem_comp_SMILES.String": ["CC(O)C(N)C(=O)O"],
+            "Atom_chem_shift.Atom_ID": ["H7", "H8", "H9", "H10", "H11"],
+            "Atom_chem_shift.Atom_type": ["H", "H", "H", "H", "H"],
+            "Atom_chem_shift.Val": ["1.318", "1.318", "1.318", "3.573", "4.241"]
+        }
+    }"#;
+    let thr_hit = parse_bmrb_v2_entry_metadata_and_score(
+        "bmse000049",
+        custom_meta_json,
+        &q,
+        MetaboliteNucleus::H1,
+        0.03,
+    )
+    .expect("parse metadata")
+    .expect("matched bmse000049");
+    assert_eq!(thr_hit.entry.name, "Custom API Threonine Name");
+    assert_eq!(thr_hit.entry.smiles, "CC(O)C(N)C(=O)O");
+    // Only 1 of 3 distinct proton shifts matched (1.318 matched; 3.573 & 4.241 did not).
+    assert_eq!(thr_hit.matched_ref_peaks, 1);
+    assert_eq!(thr_hit.total_ref_peaks, 3);
+    assert!((thr_hit.recall - (1.0 / 3.0)).abs() < 1e-6);
+}
+
+#[test]
 fn test_synthesize_reference_spectrum_1d_1h_and_13c() {
     let lac = lookup_offline_metabolite("L-Lactate").expect("L-Lactate in DB");
+    assert_eq!(lac.bmse_id, "bmse000208");
 
     // 1H reference spectrum
     let spec_1h = synthesize_reference_spectrum_1d(&lac, MetaboliteNucleus::H1, 600.0, 2048);
-    assert_eq!(spec_1h.bmse_id, "bmse000036");
+    assert_eq!(spec_1h.bmse_id, "bmse000208");
     assert_eq!(spec_1h.ppm_grid.len(), 2048);
     assert_eq!(spec_1h.intensities.len(), 2048);
     // Descending ppm axis
@@ -348,7 +533,7 @@ fn test_synthesize_reference_spectrum_1d_1h_and_13c() {
     assert_eq!(spec_1h.sticks.len(), 6);
     let max_i = spec_1h.intensities.iter().copied().fold(0.0_f64, f64::max);
     assert!((max_i - 1.0).abs() < 1e-6, "expected max=1.0, got {max_i}");
-    // Strong signal near 1.330 ppm and 4.110 ppm, near-zero at 7.0 ppm
+    // Strong signal near 1.318 ppm and 4.101 ppm, near-zero at 7.0 ppm
     let val_at = |target: f64| -> f64 {
         spec_1h
             .ppm_grid
@@ -359,10 +544,10 @@ fn test_synthesize_reference_spectrum_1d_1h_and_13c() {
             .fold(0.0_f64, f64::max)
     };
     assert!(
-        val_at(1.330) > 0.70,
-        "expected strong doublet near 1.330 ppm"
+        val_at(1.318) > 0.70,
+        "expected strong doublet near 1.318 ppm"
     );
-    assert!(val_at(4.110) > 0.05, "expected quartet near 4.110 ppm");
+    assert!(val_at(4.101) > 0.05, "expected quartet near 4.101 ppm");
     assert!(val_at(7.000) < 0.01, "expected baseline near 7.000 ppm");
 
     // 13C reference spectrum
@@ -374,7 +559,7 @@ fn test_synthesize_reference_spectrum_1d_1h_and_13c() {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
-fn test_online_query_mock_transport_and_fail_closed_offline() {
+fn test_online_query_mock_transport_bmrb_v2_enrichment_and_fail_closed_offline() {
     use nmr_core::metabolite_db::{
         query_online_bmrb_and_npmrd_with_transport, OnlineMetaboliteTransport, OnlineQuerySources,
     };
@@ -386,32 +571,61 @@ fn test_online_query_mock_transport_and_fail_closed_offline() {
         fn get_https_json(&mut self, url: &str) -> Result<String, String> {
             let host = validate_metabolite_online_url(url)?;
             self.seen_urls.push(url.to_string());
-            match host {
-                OnlineHost::BmrbApiV2 => Ok(r#"{
-                    "columns": ["Entry_ID", "Comp_ID", "Atom_ID", "Val"],
+            assert_eq!(
+                host,
+                OnlineHost::BmrbApiV2,
+                "online transport must only call live BMRB v2 API, not invented NP-MRD 404 endpoint"
+            );
+            if url.contains("/v2/search/chemical_shifts?shift=1.3180") {
+                Ok(r#"{
+                    "columns": ["Atom_chem_shift.Entry_ID", "Atom_chem_shift.Comp_ID", "Atom_chem_shift.Atom_ID", "Atom_chem_shift.Val"],
                     "data": [
-                        ["bmse000036", "L-Lactate", "H3", 1.330],
-                        ["bmse000036", "L-Lactate", "H2", 4.110]
+                        ["bmse000208", "1", "H7", 1.318],
+                        ["bmse000208", "1", "H8", 1.318],
+                        ["bmse000208", "1", "H9", 1.318],
+                        ["bmse000049", "1", "H10", 1.318]
                     ]
                 }"#
-                .to_string()),
-                OnlineHost::NpMrd => Ok(r#"{
-                    "results": [
-                        {
-                            "np_mrd_id": "NP0000123",
-                            "name": "L-Lactic acid",
-                            "formula": "C3H6O3",
-                            "smiles": "C[C@H](O)C(=O)O",
-                            "peaks": [1.331, 4.109]
-                        }
+                .to_string())
+            } else if url.contains("/v2/search/chemical_shifts?shift=4.1010") {
+                Ok(r#"{
+                    "columns": ["Atom_chem_shift.Entry_ID", "Atom_chem_shift.Comp_ID", "Atom_chem_shift.Atom_ID", "Atom_chem_shift.Val"],
+                    "data": [
+                        ["bmse000208", "1", "H10", 4.101]
                     ]
                 }"#
-                .to_string()),
+                .to_string())
+            } else if url.contains("/v2/entry/bmse000208?") {
+                Ok(r#"{
+                    "bmse000208": {
+                        "Chem_comp.Name": ["L-(+) Lactic acid"],
+                        "Chem_comp.Formula": ["C3 H6 O3"],
+                        "Chem_comp_SMILES.String": ["C[C@@H](C(=O)O)O"],
+                        "Atom_chem_shift.Atom_ID": ["C3", "C2", "C1", "H10", "H7", "H8", "H9"],
+                        "Atom_chem_shift.Atom_type": ["C", "C", "C", "H", "H", "H", "H"],
+                        "Atom_chem_shift.Val": ["185.321", "71.227", "22.812", "4.101", "1.318", "1.318", "1.318"]
+                    }
+                }"#
+                .to_string())
+            } else if url.contains("/v2/entry/bmse000049?") {
+                Ok(r#"{
+                    "bmse000049": {
+                        "Chem_comp.Name": ["L-Threonine"],
+                        "Chem_comp.Formula": ["C4 H9 N O3"],
+                        "Chem_comp_SMILES.String": ["C[C@H]([C@@H](C(=O)O)N)O"],
+                        "Atom_chem_shift.Atom_ID": ["H7", "H8", "H9", "H10", "H11"],
+                        "Atom_chem_shift.Atom_type": ["H", "H", "H", "H", "H"],
+                        "Atom_chem_shift.Val": ["1.318", "1.318", "1.318", "3.573", "4.241"]
+                    }
+                }"#
+                .to_string())
+            } else {
+                Err(format!("unexpected mock URL: {url}"))
             }
         }
     }
 
-    let query = vec![QueryPeak::from_ppm(1.330), QueryPeak::from_ppm(4.110)];
+    let query = vec![QueryPeak::from_ppm(1.318), QueryPeak::from_ppm(4.101)];
     let mut ok_t = MockOkTransport {
         seen_urls: Vec::new(),
     };
@@ -426,21 +640,46 @@ fn test_online_query_mock_transport_and_fail_closed_offline() {
     assert!(ok_t
         .seen_urls
         .iter()
-        .any(|u| u.starts_with("https://api.bmrb.io/v2/")));
+        .any(|u| u.contains("/v2/search/chemical_shifts?shift=")));
     assert!(ok_t
         .seen_urls
         .iter()
-        .any(|u| u.starts_with("https://np-mrd.org/")));
-    assert!(
-        hits.iter()
-            .any(|h| h.entry.source == MetaboliteSource::BmrbOnline
-                && h.entry.bmse_id == "bmse000036")
-    );
-    assert!(
-        hits.iter()
-            .any(|h| h.entry.source == MetaboliteSource::NpMrdOnline
-                && h.entry.bmse_id == "NP0000123")
-    );
+        .any(|u| u.contains("/v2/entry/bmse000208?")));
+    assert!(!ok_t
+        .seen_urls
+        .iter()
+        .any(|u| u.contains("/api/v1/spectra/search")));
+
+    assert_eq!(hits.len(), 2);
+    // Full 2/2 L-(+) Lactic acid must outrank partial 1/3 L-Threonine
+    assert_eq!(hits[0].entry.source, MetaboliteSource::BmrbOnline);
+    assert_eq!(hits[0].entry.bmse_id, "bmse000208");
+    assert_eq!(hits[0].entry.name, "L-(+) Lactic acid");
+    assert_eq!(hits[0].matched_ref_peaks, 2);
+    assert_eq!(hits[0].total_ref_peaks, 2);
+    assert!((hits[0].recall - 1.0).abs() < 1e-6);
+
+    assert_eq!(hits[1].entry.bmse_id, "bmse000049");
+    assert_eq!(hits[1].entry.name, "L-Threonine");
+    assert_eq!(hits[1].matched_ref_peaks, 1);
+    assert_eq!(hits[1].total_ref_peaks, 3);
+    assert!((hits[1].recall - (1.0 / 3.0)).abs() < 1e-6);
+    assert!(hits[0].score > hits[1].score + 0.30);
+
+    // Requesting npmrd_only must return an honest guidance Err (no 404 call)
+    let mut no_net = MockOkTransport {
+        seen_urls: Vec::new(),
+    };
+    let npmrd_err = query_online_bmrb_and_npmrd_with_transport(
+        &query,
+        MetaboliteNucleus::H1,
+        0.03,
+        OnlineQuerySources::npmrd_only(),
+        &mut no_net,
+    )
+    .expect_err("npmrd_only should guide user to web URL");
+    assert!(npmrd_err.contains("https://np-mrd.org/"));
+    assert!(no_net.seen_urls.is_empty());
 
     // Fail-closed offline test
     struct OfflineTransport;
