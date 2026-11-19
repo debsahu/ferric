@@ -3,6 +3,7 @@
 //! All synthetic training, conformer perturbation, and self-consistency checks in this file
 //! are explicitly labelled `[synthetic self-consistency]` / `[dev-set]`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use nmr_core::legolas_shifts::{
@@ -498,6 +499,11 @@ fn test_synthetic_aev_oracle_backprop_and_adam_convergence() {
         77_003,
     )
     .expect("init ensemble");
+    assert!(!ensemble.is_trained());
+    assert!(matches!(
+        ensemble.predict_aev(&train_aevs[0]),
+        Err(LegolasError::UntrainedWeights { .. })
+    ));
 
     let train_cfg = LegolasTrainConfig {
         learning_rate: 1.5e-2,
@@ -514,6 +520,7 @@ fn test_synthetic_aev_oracle_backprop_and_adam_convergence() {
         77_004,
     )
     .expect("train ensemble");
+    assert!(ensemble.is_trained());
 
     assert_eq!(report.mean_epoch_mse.len(), 120);
     assert!(
@@ -677,13 +684,23 @@ fn test_legolas_v1_json_and_binary_bundle_roundtrip_and_hostile_rejection() {
 
 #[test]
 fn test_untrained_model_fails_closed_on_default_predict_shifts() {
-    // Regression test for 22.12:P1-1: untrained / init_random predictors MUST carry
-    // weights_trained=false, weights_provenance="untrained-architecture-no-bundled-weights",
-    // and fail closed with Err(LegolasError::UntrainedWeights) on default predict_shifts,
-    // predict_atoms, and predict_structure_model.
+    // Regression test for 22.12:P1-1 & Round-2 P2 hardening:
+    // - Untrained / init_random predictors MUST carry weights_trained=false and
+    //   weights_provenance="untrained-architecture-no-bundled-weights".
+    // - Default predict_shifts, predict_atoms, predict_structure_model, AND low-level
+    //   ensembles[..].predict_aev() MUST fail closed with Err(LegolasError::UntrainedWeights).
+    // - Trained status cannot be forged arbitrarily: it requires real training via
+    //   train_nucleus_ensemble / train_nucleus (epochs >= 1) or a verified trained bundle.
+    let default_meta = LegolasModelMetadata::untrained();
+    assert!(!default_meta.weights_trained());
+    assert_eq!(
+        default_meta.weights_provenance(),
+        UNTRAINED_WEIGHTS_PROVENANCE
+    );
+
     let cfg = AevConfig::compact();
     let mut model = LegolasModel::init_random_all_backbone(
-        cfg,
+        cfg.clone(),
         &[16, 8],
         ActivationKind::Celu { alpha: 0.1 },
         3,
@@ -692,9 +709,9 @@ fn test_untrained_model_fails_closed_on_default_predict_shifts() {
     .expect("init_random model");
     assert!(!model.is_trained());
     assert_eq!(model.weights_provenance(), UNTRAINED_WEIGHTS_PROVENANCE);
-    assert!(!model.metadata.weights_trained);
+    assert!(!model.metadata.weights_trained());
     assert_eq!(
-        model.metadata.weights_provenance,
+        model.metadata.weights_provenance(),
         "untrained-architecture-no-bundled-weights"
     );
 
@@ -721,13 +738,38 @@ fn test_untrained_model_fails_closed_on_default_predict_shifts() {
         .expect_err("untrained model must fail closed on predict_structure_model");
     assert!(matches!(err_struct, LegolasError::UntrainedWeights { .. }));
 
-    // Untrained bundle roundtrip must stay untrained and continue failing closed
+    // Round-2 P2-1: low-level ensembles[..].predict_aev() MUST fail closed on untrained models!
+    let aevs = compute_aevs_for_indices(&atoms, &[2], &cfg).expect("compute CA AEV");
+    let ca_ens = &model.ensembles[&TargetNucleus::Ca13];
+    assert!(!ca_ens.is_trained());
+    let err_low_level = ca_ens
+        .predict_aev(&aevs[0])
+        .expect_err("low-level ensembles[..].predict_aev() must fail closed on untrained weights");
+    assert_eq!(
+        err_low_level,
+        LegolasError::UntrainedWeights {
+            provenance: UNTRAINED_WEIGHTS_PROVENANCE.to_string()
+        }
+    );
+    let test_opts = LegolasPredictOptions {
+        allow_untrained_for_testing: true,
+    };
+    let opt_ens_est = ca_ens
+        .predict_aev_with_options(&aevs[0], &test_opts)
+        .expect("explicit testing opt-in on ensemble predict_aev_with_options");
+    assert!(opt_ens_est.mean_ppm.is_finite());
+
+    // Untrained bundle roundtrip must stay untrained and continue failing closed on both high & low paths
     let json = model.to_json_bundle().expect("serialize untrained JSON");
     assert!(json.contains("\"weights_trained\": false"));
     assert!(json.contains(UNTRAINED_WEIGHTS_PROVENANCE));
     let reloaded_json = LegolasModel::from_json_bundle(&json).expect("reload untrained JSON");
     assert!(matches!(
         reloaded_json.predict_shifts(&atoms),
+        Err(LegolasError::UntrainedWeights { .. })
+    ));
+    assert!(matches!(
+        reloaded_json.ensembles[&TargetNucleus::Ca13].predict_aev(&aevs[0]),
         Err(LegolasError::UntrainedWeights { .. })
     ));
 
@@ -737,34 +779,98 @@ fn test_untrained_model_fails_closed_on_default_predict_shifts() {
         reloaded_bin.predict_shifts(&atoms),
         Err(LegolasError::UntrainedWeights { .. })
     ));
+    assert!(matches!(
+        reloaded_bin.ensembles[&TargetNucleus::Ca13].predict_aev(&aevs[0]),
+        Err(LegolasError::UntrainedWeights { .. })
+    ));
 
-    // Contradictory metadata (weights_trained=true with untrained provenance) must fail validation
-    let mut bad_meta = model.clone();
-    bad_meta.metadata.weights_trained = true;
-    assert!(bad_meta.validate().is_err());
-    assert!(LegolasModelMetadata::trained("").is_err());
-    assert!(LegolasModelMetadata::trained(UNTRAINED_WEIGHTS_PROVENANCE).is_err());
+    // Round-2 P2-2: untrained ensembles cannot be wrapped into a trained model, and 0-epoch training fails
+    let mut untrained_map = BTreeMap::new();
+    untrained_map.insert(TargetNucleus::Ca13, ca_ens.clone());
+    assert!(
+        LegolasModel::from_trained_ensembles(cfg.clone(), untrained_map, "synthetic-test").is_err()
+    );
+
+    let train_cfg = LegolasTrainConfig::default();
+    let zero_epoch_err = model
+        .train_nucleus(
+            TargetNucleus::Ca13,
+            &aevs,
+            &[55.2],
+            0,
+            &train_cfg,
+            99,
+            "synthetic-unit-test-trained-provenance",
+        )
+        .expect_err("0-epoch training must fail closed");
+    assert!(zero_epoch_err.contains("epochs"));
+    assert!(!model.is_trained());
+    assert!(!model.ensembles[&TargetNucleus::Ca13].is_trained());
 
     // Explicit opt-in allows numerical testing on untrained weights
     let opt_preds = model
-        .predict_shifts_with_options(
-            &atoms,
-            &LegolasPredictOptions {
-                allow_untrained_for_testing: true,
-            },
-        )
+        .predict_shifts_with_options(&atoms, &test_opts)
         .expect("opt-in testing prediction");
     assert!(!opt_preds.is_empty());
 
-    // Marking weights trained with verified provenance enables default predict_shifts & survives bundles
+    // Real training of one nucleus marks that ensemble trained, while leaving multi-nucleus model untrained
     model
-        .mark_weights_trained("synthetic-unit-test-trained-provenance")
-        .expect("mark trained");
+        .train_nucleus(
+            TargetNucleus::Ca13,
+            &aevs,
+            &[55.2],
+            2,
+            &train_cfg,
+            100,
+            "synthetic-unit-test-trained-provenance",
+        )
+        .expect("train CA ensemble");
+    assert!(model.ensembles[&TargetNucleus::Ca13].is_trained());
+    assert!(model.ensembles[&TargetNucleus::Ca13]
+        .predict_aev(&aevs[0])
+        .is_ok());
+    assert!(
+        !model.is_trained(),
+        "model must remain untrained until all ensembles in the model are trained"
+    );
+    assert!(matches!(
+        model.predict_shifts(&atoms),
+        Err(LegolasError::UntrainedWeights { .. })
+    ));
+
+    // Train all remaining nuclei -> model automatically transitions to trained via the training flow
+    for (idx, nuc) in TargetNucleus::ALL.into_iter().enumerate() {
+        if nuc == TargetNucleus::Ca13 {
+            continue;
+        }
+        model
+            .train_nucleus(
+                nuc,
+                &aevs,
+                &[nuc.default_mean_ppm()],
+                2,
+                &train_cfg,
+                101 + idx as u64,
+                "synthetic-unit-test-trained-provenance",
+            )
+            .expect("train nucleus ensemble");
+    }
     assert!(model.is_trained());
+    assert_eq!(
+        model.weights_provenance(),
+        "synthetic-unit-test-trained-provenance"
+    );
     let trained_preds = model
         .predict_shifts(&atoms)
         .expect("trained predict_shifts");
     assert_eq!(trained_preds.len(), opt_preds.len());
+
+    // Trained state & provenance survive both JSON and binary LEGOLAS-V1 bundle roundtrips
+    let trained_json = model.to_json_bundle().expect("serialize trained JSON");
+    let reloaded_trained_json =
+        LegolasModel::from_json_bundle(&trained_json).expect("reload trained JSON");
+    assert!(reloaded_trained_json.is_trained());
+    assert!(reloaded_trained_json.predict_shifts(&atoms).is_ok());
 
     let trained_bin = model.to_binary_bundle().expect("serialize trained bin");
     let reloaded_trained = LegolasModel::from_binary_bundle(&trained_bin).expect("reload trained");
@@ -774,6 +880,25 @@ fn test_untrained_model_fails_closed_on_default_predict_shifts() {
         "synthetic-unit-test-trained-provenance"
     );
     assert!(reloaded_trained.predict_shifts(&atoms).is_ok());
+
+    // Swapping an untrained ensemble into a trained model must fail validation & predict_shifts
+    let mut mixed_bad = reloaded_trained.clone();
+    let fresh_untrained_ca = NucleusEnsemble::new_seeded(
+        TargetNucleus::Ca13,
+        cfg.total_dim(),
+        &[16, 8],
+        ActivationKind::Celu { alpha: 0.1 },
+        3,
+        55.5,
+        5.5,
+        777,
+    )
+    .expect("fresh untrained ensemble");
+    mixed_bad
+        .ensembles
+        .insert(TargetNucleus::Ca13, fresh_untrained_ca);
+    assert!(mixed_bad.validate().is_err());
+    assert!(mixed_bad.predict_shifts(&atoms).is_err());
 }
 
 #[test]

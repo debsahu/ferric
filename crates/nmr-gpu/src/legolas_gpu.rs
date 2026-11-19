@@ -3,8 +3,9 @@
 //!
 //! # Provenance & License Attribution
 //! Clean-room WebGPU compute implementation matching `nmr_core::legolas_shifts` to `< 1e-4`:
-//! - Darrows, M. A., Kodituwakku, M., Xue, K., Pickering, I., Terrel, J. & Roitberg, A. E.
-//!   (*J. Chem. Theory Comput.* **2025**, 21(8), 4266–4275;
+//! - Darrows, M. Y., Kodituwakku, D., Xue, J., Pickering, I., Terrel, N. S. & Roitberg, A. E.,
+//!   "LEGOLAS: A Machine Learning Method for Rapid and Accurate Predictions of Protein NMR
+//!   Chemical Shifts" (*J. Chem. Theory Comput.* **2025**, 21(8), 4266–4275;
 //!   DOI: `10.1021/acs.jctc.5c00026`; <https://github.com/roitberg-group/legolas>,
 //!   **MIT License**).
 //! - Smith, J. S., Isayev, O. & Roitberg, A. E. (*Chem. Sci.* **2017**, 8, 3192–3203;
@@ -18,6 +19,7 @@ use nmr_core::legolas_shifts::{
     validate_atoms, AevConfig, AtomShiftPrediction, LegolasAtom, LegolasError, LegolasMlp,
     LegolasModel, LegolasPredictOptions, NucleusEnsemble, NucleusShiftEstimate, TargetNucleus,
     MAX_LEGOLAS_ATOMS_PER_CELL, MAX_LEGOLAS_NEIGHBORS_PER_ATOM, MIN_PAIR_DIST_ANGSTROM,
+    UNTRAINED_WEIGHTS_PROVENANCE,
 };
 use wgpu::util::DeviceExt;
 
@@ -968,22 +970,53 @@ impl<'a> LegolasGpuEngine<'a> {
     }
 
     /// Async (`wasm32`-compatible) WebGPU ensemble MLP inference over precomputed flat `f32` AEVs.
+    ///
+    /// **Fails closed** with `Err(LegolasError::UntrainedWeights { .. })` whenever
+    /// `!ensemble.is_trained()`.
     pub async fn predict_ensemble_aevs_gpu_async(
         &self,
         ensemble: &NucleusEnsemble,
         aevs_flat: &[f32],
         n_queries: usize,
-    ) -> Result<Vec<NucleusShiftEstimate>, String> {
+    ) -> Result<Vec<NucleusShiftEstimate>, LegolasError> {
+        self.predict_ensemble_aevs_gpu_with_options_async(
+            ensemble,
+            aevs_flat,
+            n_queries,
+            &LegolasPredictOptions::default(),
+        )
+        .await
+    }
+
+    /// Async (`wasm32`-compatible) WebGPU ensemble MLP inference over precomputed flat `f32` AEVs
+    /// with explicit inference options.
+    ///
+    /// Fails closed with `Err(LegolasError::UntrainedWeights { .. })` unless either
+    /// `ensemble.is_trained()` is `true` or `options.allow_untrained_for_testing` is enabled.
+    pub async fn predict_ensemble_aevs_gpu_with_options_async(
+        &self,
+        ensemble: &NucleusEnsemble,
+        aevs_flat: &[f32],
+        n_queries: usize,
+        options: &LegolasPredictOptions,
+    ) -> Result<Vec<NucleusShiftEstimate>, LegolasError> {
+        let aev_dim = ensemble.members.first().map_or(0, LegolasMlp::input_dim);
+        ensemble
+            .validate(aev_dim)
+            .map_err(LegolasError::Validation)?;
+        if !ensemble.is_trained() && !options.allow_untrained_for_testing {
+            return Err(LegolasError::UntrainedWeights {
+                provenance: UNTRAINED_WEIGHTS_PROVENANCE.to_string(),
+            });
+        }
         if n_queries == 0 {
             return Ok(Vec::new());
         }
-        let aev_dim = ensemble.members.first().map_or(0, LegolasMlp::input_dim);
-        ensemble.validate(aev_dim)?;
         if aevs_flat.len() != n_queries * aev_dim {
-            return Err(format!(
+            return Err(LegolasError::Validation(format!(
                 "aevs_flat length {} != n_queries ({n_queries}) * aev_dim ({aev_dim})",
                 aevs_flat.len()
-            ));
+            )));
         }
 
         let max_out_dim = ensemble
@@ -1004,7 +1037,7 @@ impl<'a> LegolasGpuEngine<'a> {
             let q_len = end_q - start_q;
             let slice = &aevs_flat[start_q * aev_dim..end_q * aev_dim];
             let bytes = std::mem::size_of_val(slice) as u64;
-            check_storage_limit(&limits, "aev_in", bytes)?;
+            check_storage_limit(&limits, "aev_in", bytes).map_err(LegolasError::Gpu)?;
             let aev_buf =
                 self.engine
                     .device
@@ -1015,28 +1048,47 @@ impl<'a> LegolasGpuEngine<'a> {
                     });
             let ests = self
                 .evaluate_ensemble_on_aev_buffer(ensemble, &aev_buf, q_len)
-                .await?;
+                .await
+                .map_err(LegolasError::Gpu)?;
             all_estimates.extend(ests);
             start_q = end_q;
         }
         Ok(all_estimates)
     }
 
-    /// Synchronous native WebGPU ensemble MLP inference over precomputed flat `f32` AEVs.
+    /// Synchronous native WebGPU ensemble MLP inference over precomputed flat `f32` AEVs
+    /// (fails closed on untrained ensembles).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn predict_ensemble_aevs_gpu(
         &self,
         ensemble: &NucleusEnsemble,
         aevs_flat: &[f32],
         n_queries: usize,
-    ) -> Result<Vec<NucleusShiftEstimate>, String> {
+    ) -> Result<Vec<NucleusShiftEstimate>, LegolasError> {
         pollster::block_on(self.predict_ensemble_aevs_gpu_async(ensemble, aevs_flat, n_queries))
+    }
+
+    /// Synchronous native WebGPU ensemble MLP inference over precomputed flat `f32` AEVs
+    /// with explicit inference options.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn predict_ensemble_aevs_gpu_with_options(
+        &self,
+        ensemble: &NucleusEnsemble,
+        aevs_flat: &[f32],
+        n_queries: usize,
+        options: &LegolasPredictOptions,
+    ) -> Result<Vec<NucleusShiftEstimate>, LegolasError> {
+        pollster::block_on(
+            self.predict_ensemble_aevs_gpu_with_options_async(
+                ensemble, aevs_flat, n_queries, options,
+            ),
+        )
     }
 
     /// Async (`wasm32`-compatible) end-to-end WebGPU `AEV + MLP` backbone chemical-shift prediction.
     ///
     /// **Fails closed** with `Err(LegolasError::UntrainedWeights { .. })` whenever
-    /// `!model.metadata.weights_trained` (`22.12:P1-1`).
+    /// `!model.is_trained()` (`22.12:P1-1`).
     pub async fn predict_shifts_gpu_async(
         &self,
         model: &LegolasModel,
@@ -1058,9 +1110,9 @@ impl<'a> LegolasGpuEngine<'a> {
         options: &LegolasPredictOptions,
     ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
         model.validate().map_err(LegolasError::Validation)?;
-        if !model.metadata.weights_trained && !options.allow_untrained_for_testing {
+        if !model.is_trained() && !options.allow_untrained_for_testing {
             return Err(LegolasError::UntrainedWeights {
-                provenance: model.metadata.weights_provenance.clone(),
+                provenance: model.weights_provenance().to_string(),
             });
         }
         validate_atoms(atoms).map_err(LegolasError::Validation)?;

@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use nmr_core::legolas_shifts::{
     compute_aevs_for_indices, extract_atoms_from_structure_model, train_nucleus_ensemble,
     ActivationKind, AevConfig, LegolasAtom, LegolasError, LegolasMlp, LegolasModel,
-    LegolasModelMetadata, LegolasPredictOptions, LegolasTrainConfig, NucleusEnsemble, Species,
-    TargetNucleus, MAX_LEGOLAS_ATOMS, MAX_LEGOLAS_NEIGHBORS_PER_ATOM, UNTRAINED_WEIGHTS_PROVENANCE,
+    LegolasPredictOptions, LegolasTrainConfig, NucleusEnsemble, Species, TargetNucleus,
+    MAX_LEGOLAS_ATOMS, MAX_LEGOLAS_NEIGHBORS_PER_ATOM, UNTRAINED_WEIGHTS_PROVENANCE,
 };
 use nmr_core::struct_shifts::StructureModel;
 use nmr_gpu::legolas_gpu::LegolasGpuEngine;
@@ -116,7 +116,8 @@ fn test_legolas_gpu_aev_and_ensemble_mlp_parity_all_activations() {
         )
         .expect("seeded model");
 
-        // Regression guard (22.12:P1-1): default GPU predict_shifts_gpu MUST fail closed on untrained weights!
+        // Regression guard (22.12:P1-1 & Round-2 P2-1): default GPU predict_shifts_gpu AND
+        // low-level predict_ensemble_aevs_gpu MUST fail closed on untrained weights!
         let err = legolas_gpu
             .predict_shifts_gpu(&model, &atoms)
             .expect_err("untrained model must fail closed on default predict_shifts_gpu");
@@ -126,6 +127,24 @@ fn test_legolas_gpu_aev_and_ensemble_mlp_parity_all_activations() {
                 provenance: UNTRAINED_WEIGHTS_PROVENANCE.to_string()
             }
         );
+        let err_ens = legolas_gpu
+            .predict_ensemble_aevs_gpu(&model.ensembles[&TargetNucleus::Ca13], &gpu_aevs[0], 1)
+            .expect_err("untrained ensemble must fail closed on predict_ensemble_aevs_gpu");
+        assert_eq!(
+            err_ens,
+            LegolasError::UntrainedWeights {
+                provenance: UNTRAINED_WEIGHTS_PROVENANCE.to_string()
+            }
+        );
+        let opt_ens = legolas_gpu
+            .predict_ensemble_aevs_gpu_with_options(
+                &model.ensembles[&TargetNucleus::Ca13],
+                &gpu_aevs[0],
+                1,
+                &test_opts,
+            )
+            .expect("explicit testing opt-in on predict_ensemble_aevs_gpu_with_options");
+        assert_eq!(opt_ens.len(), 1);
 
         let cpu_preds = model
             .predict_atoms_with_options(&atoms, &test_opts)
@@ -302,14 +321,22 @@ fn test_legolas_gpu_trained_bundle_and_heterogeneous_ensemble_parity() {
     // Build a heterogeneous ensemble (member 0: [16, 1], member 1: [24, 12, 1])
     let m0 = LegolasMlp::new_seeded(aev_dim, &[16], 301).expect("m0");
     let m1 = LegolasMlp::new_seeded(aev_dim, &[24, 12], 302).expect("m1");
-    let mut ens = NucleusEnsemble {
-        nucleus: TargetNucleus::Ca13,
-        activation: ActivationKind::Celu { alpha: 0.1 },
-        output_mean: 55.0,
-        output_scale: 4.0,
-        members: vec![m0, m1],
-    };
+    let mut ens = NucleusEnsemble::from_members(
+        TargetNucleus::Ca13,
+        ActivationKind::Celu { alpha: 0.1 },
+        55.0,
+        4.0,
+        vec![m0, m1],
+    )
+    .expect("hetero ensemble");
     assert!(!ens.is_homogeneous_architecture());
+    assert!(!ens.is_trained());
+
+    let ca_aevs_f32: Vec<f32> = ca_aevs.iter().flatten().map(|&v| v as f32).collect();
+    assert!(matches!(
+        legolas_gpu.predict_ensemble_aevs_gpu(&ens, &ca_aevs_f32, ca_aevs.len()),
+        Err(LegolasError::UntrainedWeights { .. })
+    ));
 
     let train_cfg = LegolasTrainConfig {
         learning_rate: 1e-2,
@@ -318,17 +345,20 @@ fn test_legolas_gpu_trained_bundle_and_heterogeneous_ensemble_parity() {
     let rep =
         train_nucleus_ensemble(&mut ens, &ca_aevs, &targets, 25, &train_cfg, 303).expect("train");
     assert!(rep.final_rmse_ppm < rep.initial_rmse_ppm);
+    assert!(ens.is_trained());
+    let gpu_ens_after = legolas_gpu
+        .predict_ensemble_aevs_gpu(&ens, &ca_aevs_f32, ca_aevs.len())
+        .expect("trained ensemble GPU predict");
+    assert_eq!(gpu_ens_after.len(), ca_aevs.len());
 
     let mut ensembles = BTreeMap::new();
     ensembles.insert(TargetNucleus::Ca13, ens);
-    let model = LegolasModel {
-        aev_config: cfg,
+    let model = LegolasModel::from_trained_ensembles(
+        cfg,
         ensembles,
-        metadata: LegolasModelMetadata::trained(
-            "synthetic-aev-oracle-parity-test [synthetic self-consistency; not BMRB empirical validation]",
-        )
-        .expect("trained metadata"),
-    };
+        "synthetic-aev-oracle-parity-test [synthetic self-consistency; not BMRB empirical validation]",
+    )
+    .expect("trained model");
 
     // Roundtrip through both JSON and binary LEGOLAS-V1 bundles
     let json = model.to_json_bundle().expect("json bundle");

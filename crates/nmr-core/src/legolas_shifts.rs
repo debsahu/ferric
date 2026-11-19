@@ -6,8 +6,9 @@
 //! # Provenance & License Attribution
 //! Clean-room original Rust implementation derived strictly from peer-reviewed literature and
 //! the MIT-licensed `LEGOLAS` architecture:
-//! - Darrows, M. A., Kodituwakku, M., Xue, K., Pickering, I., Terrel, J. & Roitberg, A. E.
-//!   (*J. Chem. Theory Comput.* **2025**, 21(8), 4266–4275;
+//! - Darrows, M. Y., Kodituwakku, D., Xue, J., Pickering, I., Terrel, N. S. & Roitberg, A. E.,
+//!   "LEGOLAS: A Machine Learning Method for Rapid and Accurate Predictions of Protein NMR
+//!   Chemical Shifts" (*J. Chem. Theory Comput.* **2025**, 21(8), 4266–4275;
 //!   DOI: `10.1021/acs.jctc.5c00026`; reference repository:
 //!   <https://github.com/roitberg-group/legolas>, **MIT License**) — species- and
 //!   nucleus-resolved ANI Atomic Environment Vector (`AEV`) neural ensemble architecture for
@@ -1496,10 +1497,41 @@ pub struct NucleusEnsemble {
     pub output_mean: f64,
     pub output_scale: f64,
     pub members: Vec<LegolasMlp>,
+    /// Private trained-state gate: `false` on random/untrained construction and set to `true`
+    /// strictly via `train_nucleus_ensemble` (with `epochs >= 1`) or verified trained bundle loading.
+    #[serde(default)]
+    weights_trained: bool,
 }
 
 impl NucleusEnsemble {
-    /// Create a deterministically seeded `E`-member MLP ensemble for `nucleus`.
+    /// Construct a custom (potentially heterogeneous) **untrained** `E`-member MLP ensemble.
+    ///
+    /// Starts with `is_trained() == false` so `predict_aev` fails closed with
+    /// `Err(LegolasError::UntrainedWeights { .. })` until trained via `train_nucleus_ensemble`.
+    pub fn from_members(
+        nucleus: TargetNucleus,
+        activation: ActivationKind,
+        output_mean: f64,
+        output_scale: f64,
+        members: Vec<LegolasMlp>,
+    ) -> Result<Self, String> {
+        let aev_dim = members
+            .first()
+            .map(LegolasMlp::input_dim)
+            .ok_or_else(|| format!("ensemble {nucleus:?} must contain at least one member"))?;
+        let ens = Self {
+            nucleus,
+            activation,
+            output_mean,
+            output_scale,
+            members,
+            weights_trained: false,
+        };
+        ens.validate(aev_dim)?;
+        Ok(ens)
+    }
+
+    /// Create a deterministically seeded **untrained** `E`-member MLP ensemble for `nucleus`.
     #[allow(clippy::too_many_arguments)]
     pub fn new_seeded(
         nucleus: TargetNucleus,
@@ -1535,7 +1567,15 @@ impl NucleusEnsemble {
             output_mean,
             output_scale,
             members,
+            weights_trained: false,
         })
+    }
+
+    /// True if this ensemble's weights were trained via `train_nucleus_ensemble` or loaded from a
+    /// verified trained `LEGOLAS-V1` bundle.
+    #[inline]
+    pub fn is_trained(&self) -> bool {
+        self.weights_trained
     }
 
     pub fn validate(&self, expected_aev_dim: usize) -> Result<(), String> {
@@ -1576,7 +1616,38 @@ impl NucleusEnsemble {
     }
 
     /// Evaluate the ensemble on a single precomputed AEV vector.
-    pub fn predict_aev(&self, aev: &[f64]) -> Result<NucleusShiftEstimate, String> {
+    ///
+    /// **Fails closed** with `Err(LegolasError::UntrainedWeights { .. })` when `!self.is_trained()`
+    /// so external callers cannot bypass the model-level untrained-weights gate via
+    /// `model.ensembles[..].predict_aev()`.
+    pub fn predict_aev(&self, aev: &[f64]) -> Result<NucleusShiftEstimate, LegolasError> {
+        self.predict_aev_with_options(aev, &LegolasPredictOptions::default())
+    }
+
+    /// Evaluate the ensemble on a single precomputed AEV vector with explicit inference options.
+    ///
+    /// Fails closed with `Err(LegolasError::UntrainedWeights { .. })` unless either
+    /// `self.is_trained()` is `true` or `options.allow_untrained_for_testing` is explicitly enabled.
+    pub fn predict_aev_with_options(
+        &self,
+        aev: &[f64],
+        options: &LegolasPredictOptions,
+    ) -> Result<NucleusShiftEstimate, LegolasError> {
+        if !self.weights_trained && !options.allow_untrained_for_testing {
+            return Err(LegolasError::UntrainedWeights {
+                provenance: UNTRAINED_WEIGHTS_PROVENANCE.to_string(),
+            });
+        }
+        self.predict_aev_unchecked(aev)
+            .map_err(LegolasError::Validation)
+    }
+
+    /// Crate-internal unchecked ensemble forward pass used inside the training loop (to compute
+    /// initial pre-training RMSE) and by gated outer entry points.
+    pub(crate) fn predict_aev_unchecked(
+        &self,
+        aev: &[f64],
+    ) -> Result<NucleusShiftEstimate, String> {
         if self.members.is_empty() {
             return Err(format!("ensemble {:?} has zero members", self.nucleus));
         }
@@ -1623,11 +1694,15 @@ fn validate_trained_weights_provenance(provenance: &str) -> Result<(), String> {
     if trimmed.is_empty() {
         return Err("trained LEGOLAS weights_provenance must be non-empty".to_string());
     }
-    if trimmed.eq_ignore_ascii_case(UNTRAINED_WEIGHTS_PROVENANCE)
-        || trimmed.to_ascii_lowercase().starts_with("untrained")
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == UNTRAINED_WEIGHTS_PROVENANCE
+        || lower.contains("untrained")
+        || lower.contains("random-init")
+        || lower == "none"
+        || lower == "n/a"
     {
         return Err(format!(
-            "weights_trained=true contradicts untrained weights_provenance {trimmed:?}"
+            "weights_trained=true contradicts non-trained weights_provenance {trimmed:?}"
         ));
     }
     Ok(())
@@ -1640,12 +1715,13 @@ pub struct LegolasModelMetadata {
     pub provenance: String,
     pub license: String,
     pub ferric_version: String,
-    /// `true` ONLY when numerical weights were trained or loaded from a verified trained bundle.
-    /// Randomly initialized / architecture-only models MUST keep this `false` (`22.12:P1-1`).
-    pub weights_trained: bool,
+    /// `true` ONLY when numerical weights were trained via the training flow or loaded from a
+    /// verified trained bundle. Kept private so external callers cannot arbitrarily toggle it
+    /// (`22.12:P1-1`).
+    weights_trained: bool,
     /// Explicit provenance tag for the numerical weights (e.g.
     /// `"untrained-architecture-no-bundled-weights"` for random initialization).
-    pub weights_provenance: String,
+    weights_provenance: String,
 }
 
 impl Default for LegolasModelMetadata {
@@ -1670,8 +1746,9 @@ impl LegolasModelMetadata {
         }
     }
 
-    /// Metadata for a model carrying trained weights with explicit provenance.
-    pub fn trained(weights_provenance: impl Into<String>) -> Result<Self, String> {
+    /// Crate-internal constructor for metadata carrying trained weights with explicit provenance,
+    /// restricted to the training flow and verified bundle loaders.
+    pub(crate) fn trained(weights_provenance: impl Into<String>) -> Result<Self, String> {
         let wp = weights_provenance.into();
         validate_trained_weights_provenance(&wp)?;
         Ok(Self {
@@ -1682,6 +1759,18 @@ impl LegolasModelMetadata {
             weights_trained: true,
             weights_provenance: wp,
         })
+    }
+
+    /// True if this metadata marks trained weights.
+    #[inline]
+    pub fn weights_trained(&self) -> bool {
+        self.weights_trained
+    }
+
+    /// Return the explicit weight provenance string.
+    #[inline]
+    pub fn weights_provenance(&self) -> &str {
+        &self.weights_provenance
     }
 }
 
@@ -1764,6 +1853,66 @@ impl LegolasModel {
         Self::new_seeded_all_backbone(aev_config, hidden_dims, activation, n_members, base_seed)
     }
 
+    /// Construct a trained `LegolasModel` strictly from ensembles that have already been trained
+    /// via `train_nucleus_ensemble` (or loaded from a verified trained `LEGOLAS-V1` bundle).
+    ///
+    /// Fails closed if `ensembles` is empty, if any ensemble still carries untrained weights
+    /// (`!ens.is_trained()`), or if `weights_provenance` is empty/untrained.
+    pub fn from_trained_ensembles(
+        aev_config: AevConfig,
+        ensembles: BTreeMap<TargetNucleus, NucleusEnsemble>,
+        weights_provenance: impl Into<String>,
+    ) -> Result<Self, String> {
+        aev_config.validate()?;
+        if ensembles.is_empty() {
+            return Err("LegolasModel must contain at least one nucleus ensemble".to_string());
+        }
+        for (&key, ens) in &ensembles {
+            if !ens.is_trained() {
+                return Err(format!(
+                    "cannot construct trained LegolasModel: ensemble {key:?} has untrained weights; run train_nucleus_ensemble first"
+                ));
+            }
+        }
+        let metadata = LegolasModelMetadata::trained(weights_provenance)?;
+        let model = Self {
+            aev_config,
+            ensembles,
+            metadata,
+        };
+        model.validate()?;
+        Ok(model)
+    }
+
+    /// Train the ensemble for `nucleus` via analytical-backpropagation Adam (`epochs >= 1`).
+    ///
+    /// Marks the target `NucleusEnsemble` as trained upon completion. Once **every** ensemble
+    /// stored in `self.ensembles` has been trained, promotes `self.metadata` to trained with
+    /// `weights_provenance` so default `predict_shifts` is enabled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_nucleus(
+        &mut self,
+        nucleus: TargetNucleus,
+        aevs: &[Vec<f64>],
+        targets_ppm: &[f64],
+        epochs: usize,
+        cfg: &LegolasTrainConfig,
+        seed: u64,
+        weights_provenance: impl Into<String>,
+    ) -> Result<EnsembleTrainReport, String> {
+        let wp = weights_provenance.into();
+        validate_trained_weights_provenance(&wp)?;
+        let ens = self
+            .ensembles
+            .get_mut(&nucleus)
+            .ok_or_else(|| format!("LegolasModel has no ensemble for nucleus {nucleus:?}"))?;
+        let report = train_nucleus_ensemble(ens, aevs, targets_ppm, epochs, cfg, seed)?;
+        if !self.ensembles.is_empty() && self.ensembles.values().all(NucleusEnsemble::is_trained) {
+            self.mark_weights_trained(wp)?;
+        }
+        Ok(report)
+    }
+
     /// True if this model carries verified trained weights (rather than untrained random init).
     #[inline]
     pub fn is_trained(&self) -> bool {
@@ -1776,11 +1925,23 @@ impl LegolasModel {
         &self.metadata.weights_provenance
     }
 
-    /// Mark this model's weights as trained with an explicit non-empty provenance tag.
-    pub fn mark_weights_trained(
+    /// Crate-internal helper restricted to the training flow: marks this model's metadata as
+    /// trained ONLY after verifying every ensemble in `self.ensembles` has been trained and
+    /// `weights_provenance` is a valid non-untrained provenance tag.
+    pub(crate) fn mark_weights_trained(
         &mut self,
         weights_provenance: impl Into<String>,
     ) -> Result<(), String> {
+        if self.ensembles.is_empty() {
+            return Err("cannot mark empty LegolasModel as trained".to_string());
+        }
+        for (&key, ens) in &self.ensembles {
+            if !ens.is_trained() {
+                return Err(format!(
+                    "cannot mark LegolasModel as trained while ensemble {key:?} has untrained weights"
+                ));
+            }
+        }
         let meta = LegolasModelMetadata::trained(weights_provenance)?;
         self.metadata = meta;
         Ok(())
@@ -1805,6 +1966,11 @@ impl LegolasModel {
                 return Err(format!(
                     "LegolasModel ensemble key {:?} does not match ensemble.nucleus {:?}",
                     key, ens.nucleus
+                ));
+            }
+            if self.metadata.weights_trained && !ens.is_trained() {
+                return Err(format!(
+                    "LegolasModel has weights_trained=true but ensemble {key:?} has untrained weights"
                 ));
             }
             ens.validate(aev_dim)?;
@@ -1865,7 +2031,7 @@ impl LegolasModel {
             let Some(ens) = self.ensembles.get(&nuc) else {
                 continue;
             };
-            let estimate = ens.predict_aev(aev).map_err(LegolasError::Validation)?;
+            let estimate = ens.predict_aev_with_options(aev, options)?;
             preds.push(AtomShiftPrediction {
                 atom_index: atom_idx,
                 residue_seq_id: atom.residue_seq_id,
@@ -2366,6 +2532,7 @@ pub fn canonical_payload_bytes(model: &LegolasModel) -> Result<Vec<u8>, String> 
         }
         push_f64_le(&mut buf, ens.output_mean);
         push_f64_le(&mut buf, ens.output_scale);
+        buf.push(u8::from(ens.weights_trained));
         let n_members =
             u32::try_from(ens.members.len()).map_err(|_| "member count exceeds u32".to_string())?;
         push_u32_le(&mut buf, n_members);
@@ -2529,6 +2696,16 @@ fn decode_canonical_payload_bytes(payload: &[u8]) -> Result<LegolasModel, String
         };
         let output_mean = cur.read_f64_le()?;
         let output_scale = cur.read_f64_le()?;
+        let ens_trained_flag = cur.read_u8()?;
+        let ens_weights_trained = match ens_trained_flag {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(format!(
+                    "invalid ensemble weights_trained flag {ens_trained_flag} in binary payload (expected 0 or 1)"
+                ));
+            }
+        };
         let n_members = cur.read_u32_le()? as usize;
         if n_members == 0 || n_members > MAX_LEGOLAS_ENSEMBLE_MEMBERS {
             return Err(format!(
@@ -2564,6 +2741,7 @@ fn decode_canonical_payload_bytes(payload: &[u8]) -> Result<LegolasModel, String
                 output_mean,
                 output_scale,
                 members,
+                weights_trained: ens_weights_trained,
             },
         );
     }
@@ -2926,6 +3104,8 @@ pub struct EnsembleTrainReport {
 
 /// Train every member of a `NucleusEnsemble` with deterministic bootstrap resampling (when
 /// `members.len() > 1`) and full-batch Adam steps, tracking ensemble RMSE reduction.
+///
+/// Requires `epochs >= 1` and marks `ensemble.is_trained() == true` upon completion.
 pub fn train_nucleus_ensemble(
     ensemble: &mut NucleusEnsemble,
     aevs: &[Vec<f64>],
@@ -2935,6 +3115,9 @@ pub fn train_nucleus_ensemble(
     seed: u64,
 ) -> Result<EnsembleTrainReport, String> {
     cfg.validate()?;
+    if epochs == 0 {
+        return Err("training epochs must be >= 1".to_string());
+    }
     if aevs.is_empty() || aevs.len() != targets_ppm.len() {
         return Err("training AEVs and targets must be non-empty and equal length".to_string());
     }
@@ -2944,7 +3127,7 @@ pub fn train_nucleus_ensemble(
     let eval_rmse = |ens: &NucleusEnsemble| -> Result<f64, String> {
         let mut sq = 0.0_f64;
         for (x, &y) in aevs.iter().zip(targets_ppm.iter()) {
-            let est = ens.predict_aev(x)?;
+            let est = ens.predict_aev_unchecked(x)?;
             let d = est.mean_ppm - y;
             sq += d * d;
         }
@@ -2999,10 +3182,58 @@ pub fn train_nucleus_ensemble(
         mean_epoch_mse.push(mse_sum / (n_members as f64));
     }
 
+    ensemble.weights_trained = true;
     let final_rmse_ppm = eval_rmse(ensemble)?;
     Ok(EnsembleTrainReport {
         initial_rmse_ppm,
         final_rmse_ppm,
         mean_epoch_mse,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_internal_mark_weights_trained_rejects_untrained_ensembles_and_bad_provenance() {
+        let cfg = AevConfig::compact();
+        let model_res = LegolasModel::init_random_all_backbone(
+            cfg,
+            &[8],
+            ActivationKind::Celu { alpha: 0.1 },
+            1,
+            7,
+        );
+        assert!(model_res.is_ok(), "init model failed: {:?}", model_res);
+        let Ok(mut model) = model_res else {
+            return;
+        };
+
+        // Internal mark_weights_trained must refuse while any ensemble is untrained
+        let mark_res = model.mark_weights_trained("valid-trained-provenance");
+        assert!(
+            matches!(&mark_res, Err(msg) if msg.contains("untrained weights")),
+            "expected untrained-weights rejection, got: {:?}",
+            mark_res
+        );
+        assert!(!model.is_trained());
+
+        // LegolasModelMetadata::trained must reject empty / non-trained labels
+        for bad in [
+            "",
+            "   ",
+            UNTRAINED_WEIGHTS_PROVENANCE,
+            "untrained-custom",
+            "model-untrained-v1",
+            "random-init-seed42",
+            "none",
+            "N/A",
+        ] {
+            assert!(
+                LegolasModelMetadata::trained(bad).is_err(),
+                "expected rejection of bad provenance {bad:?}"
+            );
+        }
+    }
 }
