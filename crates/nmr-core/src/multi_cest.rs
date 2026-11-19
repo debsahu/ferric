@@ -191,6 +191,24 @@ fn scale_mat7(a: &Mat7, factor: f64) -> Mat7 {
 // 2. Multi-Frequency CEST Parameter Types & Forward Propagators (T22.6)
 // ============================================================================
 
+/// Maximum allowed saturation duration `T_EX` (`s`) for physical `CEST` schemes.
+pub const MAX_CEST_DURATION_S: f64 = 10.0;
+/// Maximum allowed RF nutation frequency (`Hz`) for physical `CEST` schemes.
+pub const MAX_CEST_B1_HZ: f64 = 100_000.0;
+/// Maximum allowed number of `DANTE-CEST` pulse-train cycles.
+pub const MAX_DANTE_PULSES: u32 = 10_000;
+/// Maximum allowed midpoint Trotter steps per cosine modulation period (`cos-CEST`).
+pub const MAX_COS_CEST_STEPS_PER_CYCLE: u32 = 256;
+/// Maximum allowed cosine modulation frequency `nu_mod` (`Hz`) for `cos-CEST`.
+pub const MAX_COS_CEST_MOD_FREQ_HZ: f64 = 20_000.0;
+/// Maximum allowed cosine modulation cycles (`t_ex_s * mod_freq_hz`) to prevent `u32` saturation
+/// and `f32` precision loss in remainder integration.
+pub const MAX_COS_CEST_CYCLES: u32 = 200_000;
+/// Maximum allowed Gauss–Hermite `B1` quadrature nodes per offset.
+pub const MAX_CEST_B1_QUAD_NODES: usize = 31;
+/// Maximum allowed total propagator steps per simulation call or GPU batch (work budget).
+pub const MAX_TOTAL_PROPAGATOR_STEPS: u64 = 5_000_000;
+
 /// Irradiation scheme for two-state multi-frequency `CEST` saturation profiles.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum MultiCestScheme {
@@ -265,15 +283,93 @@ impl MultiCestScheme {
         }
     }
 
-    /// Validate physical constraints on the irradiation scheme.
+    /// Compute bounded propagator steps (7x7 matrix exponentials / binary-squaring multiplies)
+    /// required per `(offset, B1 quadrature node)` evaluation.
+    pub fn propagator_steps_per_eval(&self) -> Result<u64, String> {
+        match *self {
+            Self::Cw { .. } => Ok(1),
+            Self::Dante { n_pulses, .. } => {
+                if n_pulses == 0 || n_pulses > MAX_DANTE_PULSES {
+                    return Err(format!(
+                        "DANTE-CEST requires 1 <= n_pulses <= {MAX_DANTE_PULSES}, got {n_pulses}"
+                    ));
+                }
+                let pow_steps = 32u32.saturating_sub(n_pulses.leading_zeros());
+                Ok(2u64 + u64::from(pow_steps))
+            }
+            Self::CosModulated {
+                t_ex_s,
+                mod_freq_hz,
+                n_steps_per_cycle,
+                ..
+            } => {
+                if !t_ex_s.is_finite() || t_ex_s <= 0.0 || t_ex_s > MAX_CEST_DURATION_S {
+                    return Err(format!(
+                        "cos-CEST requires finite t_ex_s in (0, {MAX_CEST_DURATION_S}], got {t_ex_s}"
+                    ));
+                }
+                if !mod_freq_hz.is_finite()
+                    || mod_freq_hz <= 0.0
+                    || mod_freq_hz > MAX_COS_CEST_MOD_FREQ_HZ
+                {
+                    return Err(format!(
+                        "cos-CEST requires finite mod_freq_hz in (0, {MAX_COS_CEST_MOD_FREQ_HZ}], got {mod_freq_hz}"
+                    ));
+                }
+                if !(4..=MAX_COS_CEST_STEPS_PER_CYCLE).contains(&n_steps_per_cycle) {
+                    return Err(format!(
+                        "cos-CEST requires n_steps_per_cycle in 4..={MAX_COS_CEST_STEPS_PER_CYCLE}, got {n_steps_per_cycle}"
+                    ));
+                }
+                let cycles_f = t_ex_s * mod_freq_hz;
+                if !cycles_f.is_finite()
+                    || !(0.0..=(MAX_COS_CEST_CYCLES as f64)).contains(&cycles_f)
+                {
+                    return Err(format!(
+                        "cos-CEST cycle count t_ex_s * mod_freq_hz ({cycles_f:.3e}) exceeds MAX_COS_CEST_CYCLES ({MAX_COS_CEST_CYCLES})"
+                    ));
+                }
+                let n_full = (cycles_f + 1e-6).floor().max(0.0) as u32;
+                let cycle_steps = if n_steps_per_cycle.is_multiple_of(2) {
+                    n_steps_per_cycle / 2
+                } else {
+                    n_steps_per_cycle
+                };
+                let pow_steps = if n_full > 0 {
+                    32u32.saturating_sub(n_full.leading_zeros())
+                } else {
+                    0
+                };
+                let t_mod = 1.0 / mod_freq_hz;
+                let t_rem = (t_ex_s - (n_full as f64) * t_mod).max(0.0);
+                let rem_steps = if t_rem > 1e-6 * t_mod {
+                    ((n_steps_per_cycle as f64) * (t_rem / t_mod))
+                        .ceil()
+                        .clamp(1.0, n_steps_per_cycle as f64) as u32
+                } else {
+                    0
+                };
+                u64::from(cycle_steps)
+                    .checked_add(u64::from(pow_steps))
+                    .and_then(|v| v.checked_add(u64::from(rem_steps)))
+                    .ok_or_else(|| "cos-CEST propagator step count overflowed u64".to_string())
+            }
+        }
+    }
+
+    /// Validate physical constraints and upper work bounds on the irradiation scheme.
     pub fn validate(&self) -> Result<(), String> {
         match *self {
             Self::Cw { t_ex_s, b1_hz } => {
-                if !t_ex_s.is_finite() || t_ex_s <= 0.0 {
-                    return Err(format!("CW CEST requires finite t_ex_s > 0, got {t_ex_s}"));
+                if !t_ex_s.is_finite() || t_ex_s <= 0.0 || t_ex_s > MAX_CEST_DURATION_S {
+                    return Err(format!(
+                        "CW CEST requires finite t_ex_s in (0, {MAX_CEST_DURATION_S}], got {t_ex_s}"
+                    ));
                 }
-                if !b1_hz.is_finite() || b1_hz < 0.0 {
-                    return Err(format!("CW CEST requires finite b1_hz >= 0, got {b1_hz}"));
+                if !b1_hz.is_finite() || !(0.0..=MAX_CEST_B1_HZ).contains(&b1_hz) {
+                    return Err(format!(
+                        "CW CEST requires finite b1_hz in [0, {MAX_CEST_B1_HZ}], got {b1_hz}"
+                    ));
                 }
             }
             Self::Dante {
@@ -282,22 +378,33 @@ impl MultiCestScheme {
                 n_pulses,
                 b1_pulse_hz,
             } => {
-                if !tau_pulse_s.is_finite() || tau_pulse_s <= 0.0 {
+                if !tau_pulse_s.is_finite()
+                    || tau_pulse_s <= 0.0
+                    || tau_pulse_s > MAX_CEST_DURATION_S
+                {
                     return Err(format!(
-                        "DANTE-CEST requires finite tau_pulse_s > 0, got {tau_pulse_s}"
+                        "DANTE-CEST requires finite tau_pulse_s in (0, {MAX_CEST_DURATION_S}], got {tau_pulse_s}"
                     ));
                 }
-                if !tau_delay_s.is_finite() || tau_delay_s < 0.0 {
+                if !tau_delay_s.is_finite() || !(0.0..=MAX_CEST_DURATION_S).contains(&tau_delay_s) {
                     return Err(format!(
-                        "DANTE-CEST requires finite tau_delay_s >= 0, got {tau_delay_s}"
+                        "DANTE-CEST requires finite tau_delay_s in [0, {MAX_CEST_DURATION_S}], got {tau_delay_s}"
                     ));
                 }
-                if n_pulses == 0 {
-                    return Err("DANTE-CEST requires n_pulses >= 1".to_string());
-                }
-                if !b1_pulse_hz.is_finite() || b1_pulse_hz < 0.0 {
+                if n_pulses == 0 || n_pulses > MAX_DANTE_PULSES {
                     return Err(format!(
-                        "DANTE-CEST requires finite b1_pulse_hz >= 0, got {b1_pulse_hz}"
+                        "DANTE-CEST requires n_pulses in 1..={MAX_DANTE_PULSES}, got {n_pulses}"
+                    ));
+                }
+                let total_dur = (tau_pulse_s + tau_delay_s) * (n_pulses as f64);
+                if !total_dur.is_finite() || total_dur <= 0.0 || total_dur > MAX_CEST_DURATION_S {
+                    return Err(format!(
+                        "DANTE-CEST total duration ({total_dur:.3e} s) must be finite in (0, {MAX_CEST_DURATION_S}]"
+                    ));
+                }
+                if !b1_pulse_hz.is_finite() || !(0.0..=MAX_CEST_B1_HZ).contains(&b1_pulse_hz) {
+                    return Err(format!(
+                        "DANTE-CEST requires finite b1_pulse_hz in [0, {MAX_CEST_B1_HZ}], got {b1_pulse_hz}"
                     ));
                 }
             }
@@ -307,28 +414,74 @@ impl MultiCestScheme {
                 mod_freq_hz,
                 n_steps_per_cycle,
             } => {
-                if !t_ex_s.is_finite() || t_ex_s <= 0.0 {
-                    return Err(format!("cos-CEST requires finite t_ex_s > 0, got {t_ex_s}"));
-                }
-                if !b1_eff_hz.is_finite() || b1_eff_hz < 0.0 {
+                if !t_ex_s.is_finite() || t_ex_s <= 0.0 || t_ex_s > MAX_CEST_DURATION_S {
                     return Err(format!(
-                        "cos-CEST requires finite b1_eff_hz >= 0, got {b1_eff_hz}"
+                        "cos-CEST requires finite t_ex_s in (0, {MAX_CEST_DURATION_S}], got {t_ex_s}"
                     ));
                 }
-                if !mod_freq_hz.is_finite() || mod_freq_hz <= 0.0 {
+                if !b1_eff_hz.is_finite() || !(0.0..=MAX_CEST_B1_HZ).contains(&b1_eff_hz) {
                     return Err(format!(
-                        "cos-CEST requires finite mod_freq_hz > 0, got {mod_freq_hz}"
+                        "cos-CEST requires finite b1_eff_hz in [0, {MAX_CEST_B1_HZ}], got {b1_eff_hz}"
                     ));
                 }
-                if n_steps_per_cycle < 4 {
+                if !mod_freq_hz.is_finite()
+                    || mod_freq_hz <= 0.0
+                    || mod_freq_hz > MAX_COS_CEST_MOD_FREQ_HZ
+                {
                     return Err(format!(
-                        "cos-CEST requires n_steps_per_cycle >= 4, got {n_steps_per_cycle}"
+                        "cos-CEST requires finite mod_freq_hz in (0, {MAX_COS_CEST_MOD_FREQ_HZ}], got {mod_freq_hz}"
+                    ));
+                }
+                if !(4..=MAX_COS_CEST_STEPS_PER_CYCLE).contains(&n_steps_per_cycle) {
+                    return Err(format!(
+                        "cos-CEST requires n_steps_per_cycle in 4..={MAX_COS_CEST_STEPS_PER_CYCLE}, got {n_steps_per_cycle}"
+                    ));
+                }
+                let cycles_f = t_ex_s * mod_freq_hz;
+                if !cycles_f.is_finite()
+                    || !(0.0..=(MAX_COS_CEST_CYCLES as f64)).contains(&cycles_f)
+                {
+                    return Err(format!(
+                        "cos-CEST total cycles t_ex_s * mod_freq_hz ({cycles_f:.3e}) exceeds MAX_COS_CEST_CYCLES ({MAX_COS_CEST_CYCLES})"
                     ));
                 }
             }
         }
+        let steps = self.propagator_steps_per_eval()?;
+        if steps > MAX_TOTAL_PROPAGATOR_STEPS {
+            return Err(format!(
+                "multi-CEST single-eval propagator steps ({steps}) exceeds MAX_TOTAL_PROPAGATOR_STEPS ({MAX_TOTAL_PROPAGATOR_STEPS})"
+            ));
+        }
         Ok(())
     }
+}
+
+/// Validate the total propagator-step work budget (`n_offsets * eff_quad * steps_per_eval`)
+/// using checked arithmetic to prevent CPU/GPU DoS or TDR hangs.
+pub fn validate_multi_cest_work_budget(
+    scheme: &MultiCestScheme,
+    n_offsets: usize,
+    n_quad: usize,
+) -> Result<u64, String> {
+    scheme.validate()?;
+    if n_quad > MAX_CEST_B1_QUAD_NODES {
+        return Err(format!(
+            "n_b1_quad ({n_quad}) exceeds MAX_CEST_B1_QUAD_NODES ({MAX_CEST_B1_QUAD_NODES})"
+        ));
+    }
+    let steps_per_eval = scheme.propagator_steps_per_eval()?;
+    let eff_quad = n_quad.max(1) as u64;
+    let total = (n_offsets as u64)
+        .checked_mul(eff_quad)
+        .and_then(|v| v.checked_mul(steps_per_eval))
+        .ok_or_else(|| "multi-CEST total propagator work overflowed u64".to_string())?;
+    if total > MAX_TOTAL_PROPAGATOR_STEPS {
+        return Err(format!(
+            "multi-CEST total propagator steps ({total}) exceeds MAX_TOTAL_PROPAGATOR_STEPS ({MAX_TOTAL_PROPAGATOR_STEPS})"
+        ));
+    }
+    Ok(total)
 }
 
 /// Complete physical parameters for a 2-state `DANTE-CEST` simulation.
@@ -523,6 +676,12 @@ impl MultiCestSimParams {
                 self.b1_inhomogeneity_frac
             ));
         }
+        if self.n_b1_quad > MAX_CEST_B1_QUAD_NODES {
+            return Err(format!(
+                "n_b1_quad ({}) exceeds MAX_CEST_B1_QUAD_NODES ({MAX_CEST_B1_QUAD_NODES})",
+                self.n_b1_quad
+            ));
+        }
         self.scheme.validate()
     }
 }
@@ -633,12 +792,17 @@ pub fn cos_cest_cycle_propagator_m1(
     mod_freq_hz: f64,
     n_steps_per_cycle: u32,
 ) -> Result<Mat7, String> {
-    if !mod_freq_hz.is_finite() || mod_freq_hz <= 0.0 {
+    if !mod_freq_hz.is_finite() || mod_freq_hz <= 0.0 || mod_freq_hz > MAX_COS_CEST_MOD_FREQ_HZ {
         return Err(format!(
-            "cos_cest_cycle_propagator_m1 requires finite mod_freq_hz > 0, got {mod_freq_hz}"
+            "cos_cest_cycle_propagator_m1 requires finite mod_freq_hz in (0, {MAX_COS_CEST_MOD_FREQ_HZ}], got {mod_freq_hz}"
         ));
     }
-    let m = n_steps_per_cycle.max(4);
+    if !(4..=MAX_COS_CEST_STEPS_PER_CYCLE).contains(&n_steps_per_cycle) {
+        return Err(format!(
+            "cos_cest_cycle_propagator_m1 requires n_steps_per_cycle in 4..={MAX_COS_CEST_STEPS_PER_CYCLE}, got {n_steps_per_cycle}"
+        ));
+    }
+    let m = n_steps_per_cycle;
     let t_mod = 1.0 / mod_freq_hz;
     let dt = t_mod / (m as f64);
 
@@ -714,6 +878,8 @@ pub fn simulate_multi_cest_profile(
     let scale_rad = TAU * p.larmor_mhz;
 
     let use_quad = p.b1_inhomogeneity_frac > 0.0 && p.n_b1_quad > 1;
+    let eff_quad = if use_quad { p.n_b1_quad } else { 1 };
+    validate_multi_cest_work_budget(&p.scheme, offsets_ppm.len(), eff_quad)?;
     let quad_nodes = if use_quad {
         gauss_hermite_normalized(p.n_b1_quad)
     } else {
@@ -836,7 +1002,8 @@ pub fn simulate_multi_cest_profile(
                     if has_rem {
                         let m_rem = ((n_steps_per_cycle as f64) * (t_rem / t_mod))
                             .ceil()
-                            .max(1.0) as u32;
+                            .clamp(1.0, n_steps_per_cycle as f64)
+                            as u32;
                         let dt_rem = t_rem / (m_rem as f64);
                         for k in 0..m_rem {
                             let t_k = ((k as f64) + 0.5) * dt_rem;
@@ -926,11 +1093,23 @@ impl MultiCestProfile {
                 self.b1_inhomogeneity_frac
             ));
         }
+        if self.n_b1_quad > MAX_CEST_B1_QUAD_NODES {
+            return Err(format!(
+                "profile n_b1_quad ({}) exceeds MAX_CEST_B1_QUAD_NODES ({MAX_CEST_B1_QUAD_NODES})",
+                self.n_b1_quad
+            ));
+        }
         self.scheme.validate()?;
         let n = self.offsets_ppm.len();
         if n == 0 {
             return Err("profile offsets_ppm must not be empty".to_string());
         }
+        let eff_quad = if self.b1_inhomogeneity_frac > 0.0 && self.n_b1_quad > 1 {
+            self.n_b1_quad
+        } else {
+            1
+        };
+        validate_multi_cest_work_budget(&self.scheme, n, eff_quad)?;
         if self.intensities.len() != n || self.uncertainties.len() != n {
             return Err(format!(
                 "profile array length mismatch: offsets={n}, intensities={}, uncertainties={}",
@@ -1066,10 +1245,15 @@ impl Default for MultiCestLmConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MultiCestFitResult {
     pub params: MultiCestFitParams,
-    /// `1-sigma` Cramér–Rao standard errors `[p_b, k_ex, dw_ppm, r1, r2a, r2b]`.
-    pub std_errors: [f64; 6],
-    /// Exact `6x6` Cramér–Rao covariance matrix `(J^T J)^(-1)` in physical coordinates.
-    pub cramer_rao_cov: [[f64; 6]; 6],
+    /// `1-sigma` Cramér–Rao standard errors `[p_b, k_ex, dw_ppm, r1, r2a, r2b]`, or `None` when
+    /// the Fisher information matrix is rank-deficient or cannot be validly inverted.
+    pub std_errors: Option<[f64; 6]>,
+    /// Exact `6x6` Cramér–Rao covariance matrix `(J^T J)^(-1)` in physical coordinates, or `None`
+    /// when Fisher inversion fails or yields non-finite / non-positive diagonal variances.
+    pub cramer_rao_cov: Option<[[f64; 6]; 6]>,
+    /// True iff `cramer_rao_cov` and `std_errors` came from a valid finite, positive-variance
+    /// Fisher matrix inversion (never silently zero-filled on failure).
+    pub covariance_valid: bool,
     /// True if mild Tikhonov damping was needed to invert a near-singular Fisher matrix.
     pub covariance_regularized: bool,
     pub chi2: f64,
@@ -1163,10 +1347,24 @@ fn invert_6x6(a: &[[f64; 6]; 6]) -> Result<[[f64; 6]; 6], String> {
 }
 
 struct CramerRaoCovResult {
-    cov: [[f64; 6]; 6],
-    std_errors: [f64; 6],
+    cov: Option<[[f64; 6]; 6]>,
+    std_errors: Option<[f64; 6]>,
+    valid: bool,
     regularized: bool,
     evals: usize,
+}
+
+fn is_valid_cramer_rao_cov(cov: &[[f64; 6]; 6]) -> bool {
+    cov.iter().all(|row| row.iter().all(|v| v.is_finite()))
+        && (0..6).all(|i| cov[i][i].is_finite() && cov[i][i] > 0.0)
+}
+
+fn std_errors_from_cov(cov: &[[f64; 6]; 6]) -> [f64; 6] {
+    let mut se = [0.0; 6];
+    for i in 0..6 {
+        se[i] = cov[i][i].sqrt();
+    }
+    se
 }
 
 fn compute_cramer_rao_covariance(
@@ -1228,26 +1426,34 @@ fn compute_cramer_rao_covariance(
         }
     }
 
-    let (cov, regularized) = match invert_6x6(&fisher) {
-        Ok(c) if c.iter().all(|row| row.iter().all(|v| v.is_finite())) => (c, false),
-        _ => {
-            let mut reg = fisher;
-            for i in 0..6 {
-                let d = reg[i][i].abs().max(1.0);
-                reg[i][i] += 1e-8 * d;
+    let all_diag_informative = (0..6).all(|i| fisher[i][i].is_finite() && fisher[i][i] > 0.0);
+    let (cov, std_errors, valid, regularized) = if !all_diag_informative {
+        (None, None, false, false)
+    } else {
+        match invert_6x6(&fisher) {
+            Ok(c) if is_valid_cramer_rao_cov(&c) => {
+                (Some(c), Some(std_errors_from_cov(&c)), true, false)
             }
-            let c = invert_6x6(&reg).unwrap_or([[0.0; 6]; 6]);
-            (c, true)
+            _ => {
+                let mut reg = fisher;
+                for i in 0..6 {
+                    let d = reg[i][i].abs().max(1.0);
+                    reg[i][i] += 1e-8 * d;
+                }
+                match invert_6x6(&reg) {
+                    Ok(c) if is_valid_cramer_rao_cov(&c) => {
+                        (Some(c), Some(std_errors_from_cov(&c)), true, true)
+                    }
+                    _ => (None, None, false, true),
+                }
+            }
         }
     };
 
-    let mut se = [0.0; 6];
-    for i in 0..6 {
-        se[i] = cov[i][i].max(0.0).sqrt();
-    }
     Ok(CramerRaoCovResult {
         cov,
-        std_errors: se,
+        std_errors,
+        valid,
         regularized,
         evals,
     })
@@ -1402,6 +1608,7 @@ pub fn fit_multi_cest_lm(
         params: cur_params,
         std_errors: cr.std_errors,
         cramer_rao_cov: cr.cov,
+        covariance_valid: cr.valid,
         covariance_regularized: cr.regularized,
         chi2: cur_chi2,
         reduced_chi2,
@@ -1438,6 +1645,224 @@ pub fn estimate_baseline_relaxation(profiles: &[MultiCestProfile]) -> (f64, f64)
         1.3
     };
     (r1, 14.0)
+}
+
+fn profile_baseline_q90(intensities: &[f64]) -> f64 {
+    if intensities.is_empty() {
+        return 1.0;
+    }
+    let mut sorted = intensities.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let q90_idx = ((sorted.len() as f64) * 0.90)
+        .floor()
+        .clamp(0.0, sorted.len().saturating_sub(1) as f64) as usize;
+    sorted[q90_idx]
+}
+
+fn interp_sorted_pairs(pairs: &[(f64, f64)], query: f64) -> Option<f64> {
+    if pairs.is_empty() || query < pairs[0].0 || query > pairs[pairs.len() - 1].0 {
+        return None;
+    }
+    let pos = pairs.partition_point(|&(x, _)| x < query);
+    if pos == 0 {
+        return Some(pairs[0].1);
+    }
+    if pos >= pairs.len() {
+        return Some(pairs[pairs.len() - 1].1);
+    }
+    let (x0, y0) = pairs[pos - 1];
+    let (x1, y1) = pairs[pos];
+    let dx = x1 - x0;
+    if dx.abs() < 1e-12 {
+        Some(0.5 * (y0 + y1))
+    } else {
+        Some(y0 + ((query - x0) / dx) * (y1 - y0))
+    }
+}
+
+/// Non-neural scheme-aware deepest-dip heuristic seed for `CW`, `DANTE-CEST`, and `cos-CEST`
+/// profiles: masks major-state dip(s), locates the deepest non-major minor-state dip (folding
+/// comb periodicity for `DANTE-CEST` and pairing `+-nu_mod` sidebands for `cos-CEST`), and
+/// combines the estimated `dw_ab_ppm` with baseline `(R1, R2a)` and mid-range `(p_B, k_ex)`.
+pub fn deepest_dip_heuristic_seed(
+    profiles: &[MultiCestProfile],
+) -> Result<MultiCestFitParams, String> {
+    if profiles.is_empty() {
+        return Err("deepest_dip_heuristic_seed requires at least one profile".to_string());
+    }
+    for prof in profiles {
+        prof.validate()?;
+    }
+
+    let (r1_init, r2a_init) = estimate_baseline_relaxation(profiles);
+    let major_excl_ppm = 1.2_f64;
+
+    // Precompute sorted (delta_ppm, normalized_depth) curves for every profile.
+    let mut depth_curves: Vec<Vec<(f64, f64)>> = Vec::with_capacity(profiles.len());
+    for prof in profiles {
+        let base_i = profile_baseline_q90(&prof.intensities).max(1e-6);
+        let mut pairs: Vec<(f64, f64)> = prof
+            .offsets_ppm
+            .iter()
+            .zip(prof.intensities.iter())
+            .map(|(&off, &y)| (off - prof.major_ppm, ((base_i - y) / base_i).max(0.0)))
+            .collect();
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        depth_curves.push(pairs);
+    }
+
+    let dw_est = match profiles[0].scheme {
+        MultiCestScheme::Cw { .. } => {
+            let mut best_local_dw = None;
+            let mut best_local_score = -1.0_f64;
+            let mut best_any_dw = 3.0_f64;
+            let mut best_any_score = -1.0_f64;
+            for curve in &depth_curves {
+                let n = curve.len();
+                for i in 0..n {
+                    let delta = curve[i].0;
+                    if delta.abs() < major_excl_ppm {
+                        continue;
+                    }
+                    let mut sum = 0.0;
+                    let mut cnt = 0usize;
+                    for c2 in &depth_curves {
+                        if let Some(d) = interp_sorted_pairs(c2, delta) {
+                            sum += d;
+                            cnt += 1;
+                        }
+                    }
+                    let score = if cnt > 0 { sum / (cnt as f64) } else { 0.0 };
+                    if score > best_any_score {
+                        best_any_score = score;
+                        best_any_dw = delta;
+                    }
+                    let is_local_peak = i > 0
+                        && i + 1 < n
+                        && curve[i].1 > curve[i - 1].1
+                        && curve[i].1 >= curve[i + 1].1;
+                    if is_local_peak && score > best_local_score {
+                        best_local_score = score;
+                        best_local_dw = Some(delta);
+                    }
+                }
+            }
+            best_local_dw.unwrap_or(best_any_dw)
+        }
+        MultiCestScheme::Dante {
+            tau_pulse_s,
+            tau_delay_s,
+            ..
+        } => {
+            let sw_ppm = 1.0 / ((tau_pulse_s + tau_delay_s) * profiles[0].larmor_mhz);
+            let mut best_local_dw = None;
+            let mut best_local_score = -1.0_f64;
+            let mut best_any_dw = 3.0_f64;
+            let mut best_any_score = -1.0_f64;
+            for curve in &depth_curves {
+                let n = curve.len();
+                for i in 0..n {
+                    let delta = curve[i].0;
+                    let folded = delta - (delta / sw_ppm).round() * sw_ppm;
+                    if folded.abs() < major_excl_ppm {
+                        continue;
+                    }
+                    let mut sum = 0.0;
+                    let mut cnt = 0usize;
+                    for c2 in &depth_curves {
+                        if let Some(d) = interp_sorted_pairs(c2, folded) {
+                            sum += d;
+                            cnt += 1;
+                        }
+                    }
+                    let score = if cnt > 0 { sum / (cnt as f64) } else { 0.0 };
+                    if score > best_any_score {
+                        best_any_score = score;
+                        best_any_dw = folded;
+                    }
+                    let is_local_peak = i > 0
+                        && i + 1 < n
+                        && curve[i].1 > curve[i - 1].1
+                        && curve[i].1 >= curve[i + 1].1;
+                    if is_local_peak && score > best_local_score {
+                        best_local_score = score;
+                        best_local_dw = Some(folded);
+                    }
+                }
+            }
+            best_local_dw.unwrap_or(best_any_dw)
+        }
+        MultiCestScheme::CosModulated { mod_freq_hz, .. } => {
+            let sb_ppm = mod_freq_hz / profiles[0].larmor_mhz;
+            let mut local_candidates: Vec<f64> = Vec::new();
+            let mut any_candidates: Vec<f64> = Vec::new();
+            for curve in &depth_curves {
+                let n = curve.len();
+                for i in 0..n {
+                    let delta = curve[i].0;
+                    if (delta - sb_ppm).abs() < major_excl_ppm
+                        || (delta + sb_ppm).abs() < major_excl_ppm
+                    {
+                        continue;
+                    }
+                    let is_local_peak = i > 0
+                        && i + 1 < n
+                        && curve[i].1 > curve[i - 1].1
+                        && curve[i].1 >= curve[i + 1].1;
+                    for cand in [delta + sb_ppm, delta - sb_ppm] {
+                        if cand.abs() >= 1.0 && cand.abs() <= 15.0 {
+                            any_candidates.push(cand);
+                            if is_local_peak {
+                                local_candidates.push(cand);
+                            }
+                        }
+                    }
+                }
+            }
+            let cands = if local_candidates.is_empty() {
+                &any_candidates
+            } else {
+                &local_candidates
+            };
+            let mut best_dw = 3.0_f64;
+            let mut best_score = -1.0_f64;
+            for &dw_c in cands {
+                let s_lo = dw_c - sb_ppm;
+                let s_hi = dw_c + sb_ppm;
+                let lo_ok = (s_lo - sb_ppm).abs() >= major_excl_ppm
+                    && (s_lo + sb_ppm).abs() >= major_excl_ppm;
+                let hi_ok = (s_hi - sb_ppm).abs() >= major_excl_ppm
+                    && (s_hi + sb_ppm).abs() >= major_excl_ppm;
+                let mut total = 0.0;
+                for c2 in &depth_curves {
+                    if lo_ok {
+                        if let Some(d) = interp_sorted_pairs(c2, s_lo) {
+                            total += d;
+                        }
+                    }
+                    if hi_ok {
+                        if let Some(d) = interp_sorted_pairs(c2, s_hi) {
+                            total += d;
+                        }
+                    }
+                }
+                if total > best_score {
+                    best_score = total;
+                    best_dw = dw_c;
+                }
+            }
+            best_dw
+        }
+    };
+
+    Ok(MultiCestFitParams {
+        p_b: 0.02,
+        k_ex_s_inv: 150.0,
+        dw_ab_ppm: dw_est.clamp(-25.0, 25.0),
+        r1_s_inv: r1_init,
+        r2a_s_inv: r2a_init,
+        r2b_s_inv: 20.0,
+    })
 }
 
 /// Global grid-seeded multi-`B1` Levenberg–Marquardt fit for `DANTE-CEST`, `cos-CEST`, or

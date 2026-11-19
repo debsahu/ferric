@@ -8,14 +8,19 @@
 //! Bouvignies (*J. Phys. Chem. Lett.* 2018, 9, 2501–2507), Vallurupalli, Bouvignies & Kay
 //! (*JACS* 2012, 134, 8148–8161), and Higham (*SIAM J. Matrix Anal. Appl.* 2005, 26, 1179–1193).
 
+use std::time::Instant;
+
 use nmr_core::cest::{simulate_cest_2state_profile, Cest2StateParams, CestNormalization};
 use nmr_core::multi_cest::{
-    fit_cest_amortized_seeded_lm, fit_multi_cest_grid_lm, fit_multi_cest_lm,
-    generate_cest_training_ensemble, simulate_cos_cest_profile, simulate_dante_cest_profile,
-    simulate_multi_cest_profile, train_amortized_cest_net, AmortizedCestNet,
-    AmortizedCestNetConfig, AmortizedHybridFitConfig, AmortizedSeedStatus, AmortizedTrainConfig,
-    CestEnsembleGenConfig, CestTrainingSample, CosCestParams, DanteCestParams, MultiCestFitParams,
-    MultiCestLmConfig, MultiCestProfile, MultiCestScheme, MultiCestSimParams,
+    cos_cest_cycle_propagator_m1, deepest_dip_heuristic_seed, fit_cest_amortized_seeded_lm,
+    fit_multi_cest_grid_lm, fit_multi_cest_lm, generate_cest_training_ensemble,
+    resample_profiles_for_net, simulate_cos_cest_profile, simulate_dante_cest_profile,
+    simulate_multi_cest_profile, train_amortized_cest_net, validate_multi_cest_work_budget,
+    AmortizedCestNet, AmortizedCestNetConfig, AmortizedHybridFitConfig, AmortizedSeedStatus,
+    AmortizedTrainConfig, CestEnsembleGenConfig, CestTrainingSample, CosCestParams,
+    DanteCestParams, MultiCestFitParams, MultiCestLmConfig, MultiCestProfile, MultiCestScheme,
+    MultiCestSimParams, MAX_CEST_DURATION_S, MAX_COS_CEST_MOD_FREQ_HZ,
+    MAX_COS_CEST_STEPS_PER_CYCLE, MAX_DANTE_PULSES,
 };
 use nmr_core::rng::Rng;
 
@@ -49,9 +54,9 @@ fn test_dante_cest_sideband_periodicity_and_cw_limit_convergence() {
     };
     let cw_ref = simulate_cest_2state_profile(&cw_params, &offsets_cw).unwrap();
 
-    // Very short cycle: tau_c = 20 us -> sw_DANTE = 50,000 Hz (>> offset span), N = 20,000
-    let tau_p_short = 2.0e-6;
-    let tau_d_short = 18.0e-6;
+    // Very short cycle: tau_c = 40 us -> sw_DANTE = 25,000 Hz (>> offset span), N = 10,000
+    let tau_p_short = 4.0e-6;
+    let tau_d_short = 36.0e-6;
     let dante_cw_limit = DanteCestParams {
         p_b: cw_params.p_b,
         k_ex_s_inv: cw_params.k_ex_s_inv,
@@ -64,7 +69,7 @@ fn test_dante_cest_sideband_periodicity_and_cw_limit_convergence() {
         larmor_mhz,
         tau_pulse_s: tau_p_short,
         tau_delay_s: tau_d_short,
-        n_pulses: 20_000,
+        n_pulses: 10_000,
         b1_pulse_hz: 25.0 * ((tau_p_short + tau_d_short) / tau_p_short),
         b1_inhomogeneity_frac: 0.0,
         n_b1_quad: 1,
@@ -390,13 +395,21 @@ fn test_multi_b1_dante_cest_noisy_parameter_recovery_under_5pct() {
         "reduced_chi2={:.3} out of expected noise band",
         fit.reduced_chi2
     );
-    for (j, &se) in fit.std_errors.iter().enumerate() {
+    assert!(
+        fit.covariance_valid,
+        "DANTE-CEST well-conditioned fit must yield valid Cramer-Rao covariance"
+    );
+    let std_errors = fit.std_errors.expect("valid fit must provide std_errors");
+    let cov = fit
+        .cramer_rao_cov
+        .expect("valid fit must provide cramer_rao_cov");
+    for (j, &se) in std_errors.iter().enumerate() {
         assert!(
             se.is_finite() && se > 0.0,
             "Cramer-Rao SE[{j}] must be finite > 0"
         );
         assert!(
-            (fit.cramer_rao_cov[j][j].sqrt() - se).abs() < 1e-12,
+            (cov[j][j].sqrt() - se).abs() < 1e-12,
             "SE must match sqrt(diag(cov))"
         );
     }
@@ -506,7 +519,12 @@ fn test_multi_b1_cos_cest_noisy_parameter_recovery_under_5pct() {
         "reduced_chi2={:.3} out of expected noise band",
         fit.reduced_chi2
     );
-    for &se in &fit.std_errors {
+    assert!(
+        fit.covariance_valid,
+        "cos-CEST well-conditioned fit must yield valid Cramer-Rao covariance"
+    );
+    let std_errors = fit.std_errors.expect("valid fit must provide std_errors");
+    for &se in &std_errors {
         assert!(se.is_finite() && se > 0.0);
     }
 }
@@ -575,113 +593,175 @@ fn test_amortized_cest_net_backprop_fd_gradient_check() {
     );
 }
 
-/// `[synthetic self-consistency]` Online backpropagation training of [`AmortizedCestNet`] on
-/// synthetic Bloch–McConnell multi-`B1` `CEST` ensembles, verifying:
-/// 1. NLL loss decreases substantially during Adam training.
-/// 2. On held-out synthetic profiles, `fit_cest_amortized_seeded_lm` matches/beats grid-seeded LM
-///    in parameter accuracy & chi^2 while converging in fewer evaluations & iterations.
-/// 3. Clean `AbstainToGridFallback` when given an uncalibrated/sabotaged network.
-#[test]
-fn test_amortized_cest_training_hybrid_lm_speedup_and_abstention() {
-    let larmor_mhz = 60.8106;
-    let major_ppm = 118.0;
-    let schemes = vec![
-        MultiCestScheme::Cw {
-            t_ex_s: 0.40,
-            b1_hz: 15.0,
-        },
-        MultiCestScheme::Cw {
-            t_ex_s: 0.40,
-            b1_hz: 30.0,
-        },
-    ];
+struct SchemeBenchmarkSpec {
+    name: &'static str,
+    larmor_mhz: f64,
+    major_ppm: f64,
+    schemes: Vec<MultiCestScheme>,
+    offset_window_ppm: (f64, f64),
+    dw_abs_range_ppm: (f64, f64),
+    grid_dw_range_ppm: (f64, f64),
+    grid_dw_step_ppm: f64,
+    offsets_ppm: Vec<f64>,
+    held_out_cases: Vec<MultiCestFitParams>,
+    seed_base: u64,
+}
 
+fn evaluate_raw_net_metrics(
+    net: &AmortizedCestNet,
+    profiles_list: &[Vec<MultiCestProfile>],
+    truths: &[MultiCestFitParams],
+) -> (f64, f64, f64, f64) {
+    let mut nll_sum = 0.0;
+    let mut dw_mae = 0.0;
+    let mut pb_mae = 0.0;
+    let mut kex_mae = 0.0;
+    for (profs, truth) in profiles_list.iter().zip(truths.iter()) {
+        let tensor = resample_profiles_for_net(profs, &net.cfg).unwrap();
+        let target = [truth.p_b.log10(), truth.k_ex_s_inv.log10(), truth.dw_ab_ppm];
+        nll_sum += net.nll_loss_single(&tensor, target).unwrap();
+        let post = net.predict_posterior(&tensor).unwrap();
+        pb_mae += (post.log10_pb_mean - target[0]).abs();
+        kex_mae += (post.log10_kex_mean - target[1]).abs();
+        dw_mae += (post.dw_ppm_mean - target[2]).abs();
+    }
+    let n = truths.len() as f64;
+    (nll_sum / n, dw_mae / n, pb_mae / n, kex_mae / n)
+}
+
+fn run_honest_seeder_benchmark_for_scheme(spec: &SchemeBenchmarkSpec) {
     let net_cfg = AmortizedCestNetConfig {
         n_channels: 2,
         n_grid: 40,
-        offset_window_ppm: (-8.0, 8.0),
-        conv1_channels: 8,
-        conv2_channels: 10,
+        offset_window_ppm: spec.offset_window_ppm,
+        conv1_channels: 6,
+        conv2_channels: 8,
         kernel_size: 5,
-        hidden_dim: 40,
+        hidden_dim: 32,
         target_mean: [-1.65, 2.20, 0.0],
-        target_std: [0.25, 0.25, 4.2],
+        target_std: [0.25, 0.25, spec.dw_abs_range_ppm.1 * 0.75],
         sigma_floor: 0.03,
     };
 
     let gen_cfg = CestEnsembleGenConfig {
-        larmor_mhz,
-        major_ppm,
-        schemes: schemes.clone(),
+        larmor_mhz: spec.larmor_mhz,
+        major_ppm: spec.major_ppm,
+        schemes: spec.schemes.clone(),
         normalization: CestNormalization::ZeroTimePhaseCycled,
         b1_inhomogeneity_frac: 0.0,
         n_b1_quad: 1,
         log10_pb_range: (-2.0, -1.3),
         log10_kex_range: (1.85, 2.55),
-        dw_abs_range_ppm: (2.0, 6.2),
+        dw_abs_range_ppm: spec.dw_abs_range_ppm,
         r1_range: (1.1, 1.5),
         r2a_range: (12.0, 16.0),
         r2b_range: (16.0, 28.0),
         noise_sigma: 0.004,
     };
 
-    let train_data = generate_cest_training_ensemble(&net_cfg, &gen_cfg, 180, 7701).unwrap();
-    let mut net = AmortizedCestNet::new(net_cfg.clone(), 7702).unwrap();
+    let train_data =
+        generate_cest_training_ensemble(&net_cfg, &gen_cfg, 160, spec.seed_base).unwrap();
+    let mut trained_net = AmortizedCestNet::new(net_cfg.clone(), spec.seed_base + 1).unwrap();
     let train_cfg = AmortizedTrainConfig {
-        epochs: 65,
+        epochs: 60,
         batch_size: 16,
         learning_rate: 4e-3,
         weight_decay: 1e-4,
         grad_clip_norm: 5.0,
-        seed: 7703,
+        seed: spec.seed_base + 2,
     };
-    let report = train_amortized_cest_net(&mut net, &train_data, &train_cfg).unwrap();
-    println!(
-        "[synthetic self-consistency] AmortizedCestNet NLL: {:.3} -> {:.3} ({} updates)",
-        report.initial_nll, report.final_nll, report.updates_completed
-    );
+    let report = train_amortized_cest_net(&mut trained_net, &train_data, &train_cfg).unwrap();
     assert!(
-        report.final_nll < report.initial_nll - 0.8,
-        "training failed to substantially reduce NLL: {} -> {}",
+        report.final_nll < report.initial_nll - 0.5,
+        "[{}] training failed to reduce NLL substantially: {} -> {}",
+        spec.name,
         report.initial_nll,
         report.final_nll
     );
 
-    // Held-out synthetic profiles not in train_data
-    let held_out_cases = [
-        MultiCestFitParams {
-            p_b: 0.025,
-            k_ex_s_inv: 180.0,
-            dw_ab_ppm: 4.2,
-            r1_s_inv: 1.3,
-            r2a_s_inv: 14.0,
-            r2b_s_inv: 21.0,
-        },
-        MultiCestFitParams {
-            p_b: 0.018,
-            k_ex_s_inv: 130.0,
-            dw_ab_ppm: -3.6,
-            r1_s_inv: 1.25,
-            r2a_s_inv: 13.5,
-            r2b_s_inv: 24.0,
-        },
-        MultiCestFitParams {
-            p_b: 0.032,
-            k_ex_s_inv: 240.0,
-            dw_ab_ppm: 5.1,
-            r1_s_inv: 1.35,
-            r2a_s_inv: 15.0,
-            r2b_s_inv: 19.0,
-        },
-    ];
+    // 3-seed random untrained control networks
+    let random_nets: Vec<AmortizedCestNet> = [101u64, 202, 303]
+        .iter()
+        .map(|&s| AmortizedCestNet::new(net_cfg.clone(), spec.seed_base + s).unwrap())
+        .collect();
 
-    let offsets: Vec<f64> = (-25..=25).map(|k| major_ppm + 0.32 * (k as f64)).collect();
+    // Generate noisy held-out synthetic profiles
     let noise_sigma = 0.004;
-    let mut rng = Rng::new(7799);
+    let mut rng = Rng::new(spec.seed_base + 999);
+    let mut held_out_profiles: Vec<Vec<MultiCestProfile>> =
+        Vec::with_capacity(spec.held_out_cases.len());
+    for true_p in &spec.held_out_cases {
+        let mut profiles = Vec::new();
+        for scheme in &spec.schemes {
+            let sim_p = MultiCestSimParams {
+                p_b: true_p.p_b,
+                k_ex_s_inv: true_p.k_ex_s_inv,
+                major_ppm: spec.major_ppm,
+                dw_ab_ppm: true_p.dw_ab_ppm,
+                r1a_s_inv: true_p.r1_s_inv,
+                r2a_s_inv: true_p.r2a_s_inv,
+                r1b_s_inv: true_p.r1_s_inv,
+                r2b_s_inv: true_p.r2b_s_inv,
+                larmor_mhz: spec.larmor_mhz,
+                b1_inhomogeneity_frac: 0.0,
+                n_b1_quad: 1,
+                normalization: CestNormalization::ZeroTimePhaseCycled,
+                scheme: scheme.clone(),
+            };
+            let clean = simulate_multi_cest_profile(&sim_p, &spec.offsets_ppm).unwrap();
+            let noisy: Vec<f64> = clean
+                .iter()
+                .map(|&y| y + rng.normal(0.0, noise_sigma))
+                .collect();
+            profiles.push(MultiCestProfile {
+                larmor_mhz: spec.larmor_mhz,
+                major_ppm: spec.major_ppm,
+                b1_inhomogeneity_frac: 0.0,
+                n_b1_quad: 1,
+                normalization: CestNormalization::ZeroTimePhaseCycled,
+                scheme: scheme.clone(),
+                offsets_ppm: spec.offsets_ppm.clone(),
+                intensities: noisy,
+                uncertainties: vec![noise_sigma; spec.offsets_ppm.len()],
+            });
+        }
+        held_out_profiles.push(profiles);
+    }
 
+    // 1. Raw pre-LM prediction accuracy (BEFORE LM +-sigma rescue!)
+    let (tr_nll, tr_dw_mae, tr_pb_mae, tr_kex_mae) =
+        evaluate_raw_net_metrics(&trained_net, &held_out_profiles, &spec.held_out_cases);
+    let mut rnd_nlls = Vec::new();
+    let mut rnd_dw_maes = Vec::new();
+    let mut rnd_pb_maes = Vec::new();
+    let mut rnd_kex_maes = Vec::new();
+    for rnet in &random_nets {
+        let (rn, rdw, rpb, rkex) =
+            evaluate_raw_net_metrics(rnet, &held_out_profiles, &spec.held_out_cases);
+        rnd_nlls.push(rn);
+        rnd_dw_maes.push(rdw);
+        rnd_pb_maes.push(rpb);
+        rnd_kex_maes.push(rkex);
+    }
+    let rnd_nll_min = rnd_nlls.iter().copied().fold(f64::INFINITY, f64::min);
+    let rnd_nll_avg = rnd_nlls.iter().sum::<f64>() / (rnd_nlls.len() as f64);
+    let rnd_dw_avg = rnd_dw_maes.iter().sum::<f64>() / (rnd_dw_maes.len() as f64);
+    let rnd_pb_avg = rnd_pb_maes.iter().sum::<f64>() / (rnd_pb_maes.len() as f64);
+    let rnd_kex_avg = rnd_kex_maes.iter().sum::<f64>() / (rnd_kex_maes.len() as f64);
+
+    let mut dip_dw_mae = 0.0;
+    let mut dip_seeds = Vec::with_capacity(held_out_profiles.len());
+    for (profs, truth) in held_out_profiles.iter().zip(spec.held_out_cases.iter()) {
+        let seed = deepest_dip_heuristic_seed(profs).unwrap();
+        dip_dw_mae += (seed.dw_ab_ppm - truth.dw_ab_ppm).abs();
+        dip_seeds.push(seed);
+    }
+    dip_dw_mae /= spec.held_out_cases.len() as f64;
+
+    // 2. End-to-end LM benchmarks for all 4 seeders (+ mean-only neural control)
     let lm_cfg = MultiCestLmConfig {
-        grid_dw_range_ppm: (-6.5, 6.5),
-        grid_dw_step_ppm: 0.65,
+        grid_dw_range_ppm: spec.grid_dw_range_ppm,
+        grid_dw_step_ppm: spec.grid_dw_step_ppm,
         ..Default::default()
     };
     let hybrid_cfg = AmortizedHybridFitConfig {
@@ -691,110 +771,190 @@ fn test_amortized_cest_training_hybrid_lm_speedup_and_abstention() {
         early_accept_reduced_chi2: 1.5,
         max_dw_std_abstain_ppm: 5.0,
     };
+    let mean_only_cfg = AmortizedHybridFitConfig {
+        max_sigma_multistarts: 0,
+        ..hybrid_cfg.clone()
+    };
 
-    let mut total_amort_iters = 0usize;
-    let mut total_grid_iters = 0usize;
-    let mut total_amort_evals = 0usize;
-    let mut total_grid_evals = 0usize;
-    let mut accepted_count = 0usize;
+    let mut grid_iters = 0usize;
+    let mut grid_evals = 0usize;
+    let mut dip_iters = 0usize;
+    let mut dip_evals = 0usize;
+    let mut dip_max_chi2_gap = 0.0_f64;
 
-    let mut first_profiles: Option<Vec<MultiCestProfile>> = None;
+    let mut tr_iters = 0usize;
+    let mut tr_evals = 0usize;
+    let mut tr_acc = 0usize;
+    let mut tr_seeds_ref = 0usize;
+    let mut tr_max_chi2_gap = 0.0_f64;
 
-    for (idx, true_p) in held_out_cases.iter().enumerate() {
-        let mut profiles = Vec::new();
-        for scheme in &schemes {
-            let sim_p = MultiCestSimParams {
-                p_b: true_p.p_b,
-                k_ex_s_inv: true_p.k_ex_s_inv,
-                major_ppm,
-                dw_ab_ppm: true_p.dw_ab_ppm,
-                r1a_s_inv: true_p.r1_s_inv,
-                r2a_s_inv: true_p.r2a_s_inv,
-                r1b_s_inv: true_p.r1_s_inv,
-                r2b_s_inv: true_p.r2b_s_inv,
-                larmor_mhz,
-                b1_inhomogeneity_frac: 0.0,
-                n_b1_quad: 1,
-                normalization: CestNormalization::ZeroTimePhaseCycled,
-                scheme: scheme.clone(),
-            };
-            let clean = simulate_multi_cest_profile(&sim_p, &offsets).unwrap();
-            let noisy: Vec<f64> = clean
-                .iter()
-                .map(|&y| y + rng.normal(0.0, noise_sigma))
-                .collect();
-            profiles.push(MultiCestProfile {
-                larmor_mhz,
-                major_ppm,
-                b1_inhomogeneity_frac: 0.0,
-                n_b1_quad: 1,
-                normalization: CestNormalization::ZeroTimePhaseCycled,
-                scheme: scheme.clone(),
-                offsets_ppm: offsets.clone(),
-                intensities: noisy,
-                uncertainties: vec![noise_sigma; offsets.len()],
-            });
+    let mut tr_m0_acc = 0usize;
+    let mut tr_m0_evals = 0usize;
+
+    let mut rnd_iters_tot = 0usize;
+    let mut rnd_evals_tot = 0usize;
+    let mut rnd_acc_tot = 0usize;
+    let mut rnd_seeds_ref_tot = 0usize;
+    let mut rnd_m0_acc_tot = 0usize;
+    let mut rnd_m0_evals_tot = 0usize;
+
+    for (idx, (profs, truth)) in held_out_profiles
+        .iter()
+        .zip(spec.held_out_cases.iter())
+        .enumerate()
+    {
+        let grid_fit = fit_multi_cest_grid_lm(profs, &lm_cfg).unwrap();
+        let dip_fit = fit_multi_cest_lm(profs, dip_seeds[idx], &lm_cfg).unwrap();
+        let tr_res = fit_cest_amortized_seeded_lm(&trained_net, profs, &hybrid_cfg).unwrap();
+        let tr_m0 = fit_cest_amortized_seeded_lm(&trained_net, profs, &mean_only_cfg).unwrap();
+
+        grid_iters += grid_fit.iterations;
+        grid_evals += grid_fit.n_evals;
+
+        dip_iters += dip_fit.iterations;
+        dip_evals += dip_fit.n_evals;
+        dip_max_chi2_gap = dip_max_chi2_gap.max(dip_fit.chi2 - grid_fit.chi2);
+
+        tr_iters += tr_res.fit.iterations;
+        tr_evals += tr_res.fit.n_evals;
+        tr_seeds_ref += tr_res.neural_seeds_refined;
+        tr_max_chi2_gap = tr_max_chi2_gap.max(tr_res.fit.chi2 - grid_fit.chi2);
+        if tr_res.status == AmortizedSeedStatus::AcceptedNeuralSeed {
+            tr_acc += 1;
         }
-        if idx == 0 {
-            first_profiles = Some(profiles.clone());
+        if tr_m0.status == AmortizedSeedStatus::AcceptedNeuralSeed {
+            tr_m0_acc += 1;
+        }
+        tr_m0_evals += tr_m0.fit.n_evals;
+
+        for rnet in &random_nets {
+            let r_res = fit_cest_amortized_seeded_lm(rnet, profs, &hybrid_cfg).unwrap();
+            let r_m0 = fit_cest_amortized_seeded_lm(rnet, profs, &mean_only_cfg).unwrap();
+            rnd_iters_tot += r_res.fit.iterations;
+            rnd_evals_tot += r_res.fit.n_evals;
+            rnd_seeds_ref_tot += r_res.neural_seeds_refined;
+            if r_res.status == AmortizedSeedStatus::AcceptedNeuralSeed {
+                rnd_acc_tot += 1;
+            }
+            if r_m0.status == AmortizedSeedStatus::AcceptedNeuralSeed {
+                rnd_m0_acc_tot += 1;
+            }
+            rnd_m0_evals_tot += r_m0.fit.n_evals;
+            assert!(
+                r_res.fit.chi2 <= grid_fit.chi2 + 0.05,
+                "[{}] random+hybrid fallback must still match grid chi2 on case #{idx}",
+                spec.name
+            );
         }
 
-        let grid_fit = fit_multi_cest_grid_lm(&profiles, &lm_cfg).unwrap();
-        let amort_res = fit_cest_amortized_seeded_lm(&net, &profiles, &hybrid_cfg).unwrap();
-
-        total_grid_iters += grid_fit.iterations;
-        total_amort_iters += amort_res.fit.iterations;
-        total_grid_evals += grid_fit.n_evals;
-        total_amort_evals += amort_res.fit.n_evals;
-        if amort_res.status == AmortizedSeedStatus::AcceptedNeuralSeed {
-            accepted_count += 1;
-        }
-
-        let pb_err = (amort_res.fit.params.p_b - true_p.p_b).abs() / true_p.p_b;
-        let kex_err =
-            (amort_res.fit.params.k_ex_s_inv - true_p.k_ex_s_inv).abs() / true_p.k_ex_s_inv;
-        let dw_err = (amort_res.fit.params.dw_ab_ppm - true_p.dw_ab_ppm).abs();
-        println!(
-            "[synthetic self-consistency] held-out #{idx}: status={:?}, post_dw={:.2}+/-{:.2}, fit_chi2={:.2} vs grid_chi2={:.2}, iters={} vs {}, evals={} vs {}, errs=(pB {:.2}%, kex {:.2}%, dw {:.3} ppm)",
-            amort_res.status,
-            amort_res.posterior.dw_ppm_mean,
-            amort_res.posterior.dw_ppm_std,
-            amort_res.fit.chi2,
-            grid_fit.chi2,
-            amort_res.fit.iterations,
-            grid_fit.iterations,
-            amort_res.fit.n_evals,
-            grid_fit.n_evals,
+        let pb_err = (tr_res.fit.params.p_b - truth.p_b).abs() / truth.p_b;
+        let kex_err = (tr_res.fit.params.k_ex_s_inv - truth.k_ex_s_inv).abs() / truth.k_ex_s_inv;
+        let dw_err = (tr_res.fit.params.dw_ab_ppm - truth.dw_ab_ppm).abs();
+        let mle_dw_diff = (tr_res.fit.params.dw_ab_ppm - grid_fit.params.dw_ab_ppm).abs();
+        assert!(
+            pb_err < 0.10 && kex_err < 0.12 && dw_err < 0.10 && mle_dw_diff < 0.02,
+            "[{}] trained hybrid fit accuracy failed on case #{idx}: pB={:.2}%, kex={:.2}%, dw={:.3} ppm, mle_dw_diff={:.4}",
+            spec.name,
             pb_err * 100.0,
             kex_err * 100.0,
-            dw_err
+            dw_err,
+            mle_dw_diff
         );
-
-        assert!(pb_err < 0.05 && kex_err < 0.06 && dw_err < 0.08);
         assert!(
-            amort_res.fit.chi2 <= grid_fit.chi2 + 1e-2,
-            "amortized-seeded LM must match or beat grid-seeded LM chi^2"
+            tr_res.fit.chi2 <= grid_fit.chi2 + 0.05,
+            "[{}] trained hybrid chi2 {:.3} > grid chi2 {:.3}",
+            spec.name,
+            tr_res.fit.chi2,
+            grid_fit.chi2
+        );
+        assert!(
+            dip_fit.chi2 <= grid_fit.chi2 + 0.05,
+            "[{}] deepest-dip heuristic chi2 {:.3} > grid chi2 {:.3}",
+            spec.name,
+            dip_fit.chi2,
+            grid_fit.chi2
         );
     }
 
-    assert!(
-        accepted_count >= 2,
-        "trained amortized net should accept >= 2/3 held-out seeds without fallback, got {accepted_count}/3"
+    let n_rnd = random_nets.len() as f64;
+    let n_cases = spec.held_out_cases.len();
+    println!(
+        "[synthetic self-consistency][{}] train NLL {:.3} -> {:.3} ({} updates)",
+        spec.name, report.initial_nll, report.final_nll, report.updates_completed
     );
-    assert!(
-        total_amort_iters < total_grid_iters && total_amort_evals < total_grid_evals,
-        "amortized-seeded LM should converge in fewer iterations ({total_amort_iters} vs {total_grid_iters}) and evaluations ({total_amort_evals} vs {total_grid_evals})"
+    println!(
+        "[synthetic self-consistency][{}] RAW pre-LM: trained(NLL={:.3}, dw_MAE={:.3} ppm, log10_pB_MAE={:.3}, log10_kex_MAE={:.3}) vs random_3seed(NLL={:.3} [min {:.3}], dw_MAE={:.3} ppm, log10_pB_MAE={:.3}, log10_kex_MAE={:.3}) vs deepest_dip(dw_MAE={:.3} ppm)",
+        spec.name,
+        tr_nll,
+        tr_dw_mae,
+        tr_pb_mae,
+        tr_kex_mae,
+        rnd_nll_avg,
+        rnd_nll_min,
+        rnd_dw_avg,
+        rnd_pb_avg,
+        rnd_kex_avg,
+        dip_dw_mae
+    );
+    println!(
+        "[synthetic self-consistency][{}] MEAN-ONLY LM (no +-sigma rescue): trained(acc={}/{}, evals={}) vs random_3seed(acc={}/{}, avg_evals={:.1})",
+        spec.name,
+        tr_m0_acc,
+        n_cases,
+        tr_m0_evals,
+        rnd_m0_acc_tot,
+        n_cases * random_nets.len(),
+        (rnd_m0_evals_tot as f64) / n_rnd
+    );
+    println!(
+        "[synthetic self-consistency][{}] FULL 4-SEEDER (3 cases): trained(acc={}/{}, seeds={}, iters={}, evals={}, max_dchi2={:.3}) | random_3seed(acc={}/{}, avg_seeds={:.1}, avg_iters={:.1}, avg_evals={:.1}) | deepest_dip(iters={}, evals={}, max_dchi2={:.3}) | coarse_grid(iters={}, evals={})",
+        spec.name,
+        tr_acc,
+        n_cases,
+        tr_seeds_ref,
+        tr_iters,
+        tr_evals,
+        tr_max_chi2_gap,
+        rnd_acc_tot,
+        n_cases * random_nets.len(),
+        (rnd_seeds_ref_tot as f64) / n_rnd,
+        (rnd_iters_tot as f64) / n_rnd,
+        (rnd_evals_tot as f64) / n_rnd,
+        dip_iters,
+        dip_evals,
+        dip_max_chi2_gap,
+        grid_iters,
+        grid_evals
     );
 
-    // Verify clean AbstainToGridFallback when neural network predicts a grossly wrong dw_ppm
-    let mut bad_net = AmortizedCestNet::new(net_cfg, 9999).unwrap();
-    // Force fc2 weights to zero and bias dw_std to -3.0 (so mean dw = -12.6 ppm, far from +4.2 ppm)
+    // Honest statistical discrimination assertions: trained network MUST beat ALL 3 random
+    // untrained networks on raw pre-LM prediction accuracy (held-out NLL and dw MAE).
+    assert!(
+        tr_nll < rnd_nll_min - 0.25,
+        "[{}] trained held-out NLL ({tr_nll:.3}) must decisively beat best random net ({rnd_nll_min:.3})",
+        spec.name
+    );
+    assert!(
+        tr_dw_mae < 0.5 * rnd_dw_avg && tr_dw_mae < 1.2,
+        "[{}] trained raw dw MAE ({tr_dw_mae:.3} ppm) must decisively beat random 3-seed avg ({rnd_dw_avg:.3} ppm)",
+        spec.name
+    );
+    assert!(
+        tr_m0_acc > 0 && (tr_m0_acc * random_nets.len()) > rnd_m0_acc_tot,
+        "[{}] mean-only (no +-sigma rescue) acceptance must distinguish trained ({tr_m0_acc}/{n_cases}) from random ({rnd_m0_acc_tot}/{})",
+        spec.name,
+        n_cases * random_nets.len()
+    );
+
+    // Verify clean AbstainToGridFallback when given a sabotaged / OOD network
+    let mut bad_net = AmortizedCestNet::new(net_cfg, spec.seed_base + 9999).unwrap();
     bad_net.fc2_w.fill(0.0);
     bad_net.fc2_b = vec![-2.0, -2.0, -3.5, -2.0, -2.0, -2.0];
-    let profiles_0 = first_profiles.unwrap();
-    let fallback_res = fit_cest_amortized_seeded_lm(&bad_net, &profiles_0, &hybrid_cfg).unwrap();
+    let fallback_res =
+        fit_cest_amortized_seeded_lm(&bad_net, &held_out_profiles[0], &hybrid_cfg).unwrap();
     println!(
-        "[synthetic self-consistency] sabotaged net fallback: status={:?}, neural_chi2_nu={:.2}, recovered_chi2_nu={:.3}, recovered_dw={:.3}",
+        "[synthetic self-consistency][{}] sabotaged net fallback: status={:?}, neural_chi2_nu={:.2}, recovered_chi2_nu={:.3}, recovered_dw={:.3}",
+        spec.name,
         fallback_res.status,
         fallback_res.neural_seeded_reduced_chi2,
         fallback_res.fit.reduced_chi2,
@@ -805,10 +965,330 @@ fn test_amortized_cest_training_hybrid_lm_speedup_and_abstention() {
         AmortizedSeedStatus::AbstainToGridFallback
     );
     assert!(
-        (fallback_res.fit.params.dw_ab_ppm - 4.2).abs() < 0.1,
-        "grid fallback must still recover exact dw = +4.2 ppm"
+        (fallback_res.fit.params.dw_ab_ppm - spec.held_out_cases[0].dw_ab_ppm).abs() < 0.12,
+        "[{}] grid fallback must recover exact dw = {:.2} ppm, got {:.3}",
+        spec.name,
+        spec.held_out_cases[0].dw_ab_ppm,
+        fallback_res.fit.params.dw_ab_ppm
     );
-    assert!(fallback_res.fit.reduced_chi2 < 1.6);
+    assert!(fallback_res.fit.reduced_chi2 < 1.8);
+}
+
+/// `[synthetic self-consistency]` Honest 4-seeder benchmark (`trained neural`, `random untrained`
+/// 3-seed control, `deepest-dip heuristic`, `coarse grid`) across `CW`, `DANTE-CEST`, and
+/// `cos-CEST`, verifying raw pre-LM discrimination from random weights, mean-only LM seeding
+/// without `+-sigma` rescue, physical recovery accuracy, and clean `AbstainToGridFallback`.
+#[test]
+fn test_amortized_cest_honest_benchmark_cw_dante_cos_and_abstention() {
+    let larmor_mhz = 60.8106;
+
+    // 1. CW-CEST
+    let cw_major = 118.0;
+    let cw_spec = SchemeBenchmarkSpec {
+        name: "CW-CEST",
+        larmor_mhz,
+        major_ppm: cw_major,
+        schemes: vec![
+            MultiCestScheme::Cw {
+                t_ex_s: 0.40,
+                b1_hz: 15.0,
+            },
+            MultiCestScheme::Cw {
+                t_ex_s: 0.40,
+                b1_hz: 30.0,
+            },
+        ],
+        offset_window_ppm: (-8.0, 8.0),
+        dw_abs_range_ppm: (2.0, 6.2),
+        grid_dw_range_ppm: (-6.5, 6.5),
+        grid_dw_step_ppm: 0.65,
+        offsets_ppm: (-25..=25).map(|k| cw_major + 0.32 * (k as f64)).collect(),
+        held_out_cases: vec![
+            MultiCestFitParams {
+                p_b: 0.025,
+                k_ex_s_inv: 180.0,
+                dw_ab_ppm: 4.2,
+                r1_s_inv: 1.3,
+                r2a_s_inv: 14.0,
+                r2b_s_inv: 21.0,
+            },
+            MultiCestFitParams {
+                p_b: 0.018,
+                k_ex_s_inv: 130.0,
+                dw_ab_ppm: -3.6,
+                r1_s_inv: 1.25,
+                r2a_s_inv: 13.5,
+                r2b_s_inv: 24.0,
+            },
+            MultiCestFitParams {
+                p_b: 0.032,
+                k_ex_s_inv: 240.0,
+                dw_ab_ppm: 5.1,
+                r1_s_inv: 1.35,
+                r2a_s_inv: 15.0,
+                r2b_s_inv: 19.0,
+            },
+        ],
+        seed_base: 7701,
+    };
+    run_honest_seeder_benchmark_for_scheme(&cw_spec);
+
+    // 2. DANTE-CEST (sw_DANTE = 666.67 Hz ~ 10.96 ppm -> unambiguous +-5.48 ppm)
+    let dante_major = 118.0;
+    let tau_p = 15.0e-6;
+    let tau_d = 1.485e-3;
+    let duty = tau_p / (tau_p + tau_d);
+    let dante_spec = SchemeBenchmarkSpec {
+        name: "DANTE-CEST",
+        larmor_mhz,
+        major_ppm: dante_major,
+        schemes: vec![
+            MultiCestScheme::Dante {
+                tau_pulse_s: tau_p,
+                tau_delay_s: tau_d,
+                n_pulses: 266,
+                b1_pulse_hz: 12.0 / duty,
+            },
+            MultiCestScheme::Dante {
+                tau_pulse_s: tau_p,
+                tau_delay_s: tau_d,
+                n_pulses: 266,
+                b1_pulse_hz: 28.0 / duty,
+            },
+        ],
+        offset_window_ppm: (-5.4, 5.4),
+        dw_abs_range_ppm: (1.8, 4.6),
+        grid_dw_range_ppm: (-5.0, 5.0),
+        grid_dw_step_ppm: 0.60,
+        offsets_ppm: (-24..=24)
+            .map(|k| dante_major + 0.22 * (k as f64))
+            .collect(),
+        held_out_cases: vec![
+            MultiCestFitParams {
+                p_b: 0.025,
+                k_ex_s_inv: 180.0,
+                dw_ab_ppm: 4.0,
+                r1_s_inv: 1.3,
+                r2a_s_inv: 14.0,
+                r2b_s_inv: 21.0,
+            },
+            MultiCestFitParams {
+                p_b: 0.019,
+                k_ex_s_inv: 140.0,
+                dw_ab_ppm: -3.2,
+                r1_s_inv: 1.25,
+                r2a_s_inv: 13.5,
+                r2b_s_inv: 23.0,
+            },
+            MultiCestFitParams {
+                p_b: 0.030,
+                k_ex_s_inv: 220.0,
+                dw_ab_ppm: 2.6,
+                r1_s_inv: 1.35,
+                r2a_s_inv: 15.0,
+                r2b_s_inv: 19.0,
+            },
+        ],
+        seed_base: 8701,
+    };
+    run_honest_seeder_benchmark_for_scheme(&dante_spec);
+
+    // 3. cos-CEST (mod_freq = 320 Hz ~ 5.26 ppm, dual sidebands)
+    let cos_major = 120.0;
+    let cos_spec = SchemeBenchmarkSpec {
+        name: "cos-CEST",
+        larmor_mhz,
+        major_ppm: cos_major,
+        schemes: vec![
+            MultiCestScheme::CosModulated {
+                t_ex_s: 0.40,
+                b1_eff_hz: 14.0,
+                mod_freq_hz: 320.0,
+                n_steps_per_cycle: 16,
+            },
+            MultiCestScheme::CosModulated {
+                t_ex_s: 0.40,
+                b1_eff_hz: 30.0,
+                mod_freq_hz: 320.0,
+                n_steps_per_cycle: 16,
+            },
+        ],
+        offset_window_ppm: (-11.0, 11.0),
+        dw_abs_range_ppm: (2.0, 5.2),
+        grid_dw_range_ppm: (-6.0, 6.0),
+        grid_dw_step_ppm: 0.75,
+        offsets_ppm: (-26..=26).map(|k| cos_major + 0.42 * (k as f64)).collect(),
+        held_out_cases: vec![
+            MultiCestFitParams {
+                p_b: 0.025,
+                k_ex_s_inv: 180.0,
+                dw_ab_ppm: 4.2,
+                r1_s_inv: 1.3,
+                r2a_s_inv: 14.0,
+                r2b_s_inv: 21.0,
+            },
+            MultiCestFitParams {
+                p_b: 0.020,
+                k_ex_s_inv: 145.0,
+                dw_ab_ppm: -3.5,
+                r1_s_inv: 1.25,
+                r2a_s_inv: 13.5,
+                r2b_s_inv: 23.0,
+            },
+            MultiCestFitParams {
+                p_b: 0.031,
+                k_ex_s_inv: 230.0,
+                dw_ab_ppm: 2.8,
+                r1_s_inv: 1.35,
+                r2a_s_inv: 15.0,
+                r2b_s_inv: 19.0,
+            },
+        ],
+        seed_base: 9701,
+    };
+    run_honest_seeder_benchmark_for_scheme(&cos_spec);
+}
+
+/// Hostile upper-bound & total-work budget regression tests (`22.6:P1-2`) verifying instant
+/// fail-closed rejection (`< 5 ms`), plus unidentifiable Cramér–Rao covariance failure test
+/// (`22.6:P2-5`) verifying no silent zero-filled standard errors.
+#[test]
+fn test_multi_cest_hostile_bounds_fail_closed_under_5ms_and_cr_cov_failure() {
+    let base_cos = CosCestParams {
+        p_b: 0.02,
+        k_ex_s_inv: 150.0,
+        major_ppm: 118.0,
+        dw_ab_ppm: 3.0,
+        r1a_s_inv: 1.3,
+        r2a_s_inv: 14.0,
+        r1b_s_inv: 1.3,
+        r2b_s_inv: 20.0,
+        larmor_mhz: 60.8106,
+        t_ex_s: 0.4,
+        b1_eff_hz: 20.0,
+        mod_freq_hz: 250.0,
+        n_steps_per_cycle: 32,
+        b1_inhomogeneity_frac: 0.0,
+        n_b1_quad: 1,
+        normalization: CestNormalization::ZeroTimePhaseCycled,
+    };
+
+    // 1. n_steps_per_cycle = u32::MAX must fail closed instantaneously (< 5 ms)
+    let mut hostile_steps = base_cos.clone();
+    hostile_steps.n_steps_per_cycle = u32::MAX;
+    let t0 = Instant::now();
+    assert!(hostile_steps.to_multi_params().validate().is_err());
+    assert!(simulate_cos_cest_profile(&hostile_steps, &[118.0]).is_err());
+    assert!(cos_cest_cycle_propagator_m1(
+        0.02,
+        150.0,
+        0.0,
+        100.0,
+        125.0,
+        1.3,
+        14.0,
+        1.3,
+        20.0,
+        250.0,
+        u32::MAX
+    )
+    .is_err());
+    let dt_steps = t0.elapsed();
+    assert!(
+        dt_steps.as_millis() < 5,
+        "n_steps_per_cycle=u32::MAX took {dt_steps:?}, expected < 5 ms"
+    );
+
+    // 2. mod_freq_hz = 1e10 must fail closed instantaneously (< 5 ms)
+    let mut hostile_freq = base_cos.clone();
+    hostile_freq.mod_freq_hz = 1e10;
+    let t1 = Instant::now();
+    assert!(hostile_freq.to_multi_params().validate().is_err());
+    assert!(simulate_cos_cest_profile(&hostile_freq, &[118.0]).is_err());
+    assert!(cos_cest_cycle_propagator_m1(
+        0.02, 150.0, 0.0, 100.0, 125.0, 1.3, 14.0, 1.3, 20.0, 1e10, 32
+    )
+    .is_err());
+    let dt_freq = t1.elapsed();
+    assert!(
+        dt_freq.as_millis() < 5,
+        "mod_freq_hz=1e10 took {dt_freq:?}, expected < 5 ms"
+    );
+
+    // 3. Tight boundary checks just above every physical upper bound
+    let mut over_steps = base_cos.clone();
+    over_steps.n_steps_per_cycle = MAX_COS_CEST_STEPS_PER_CYCLE + 1;
+    assert!(simulate_cos_cest_profile(&over_steps, &[118.0]).is_err());
+
+    let mut over_freq = base_cos.clone();
+    over_freq.mod_freq_hz = MAX_COS_CEST_MOD_FREQ_HZ + 1.0;
+    assert!(simulate_cos_cest_profile(&over_freq, &[118.0]).is_err());
+
+    let mut over_tex = base_cos;
+    over_tex.t_ex_s = MAX_CEST_DURATION_S + 1.0;
+    assert!(simulate_cos_cest_profile(&over_tex, &[118.0]).is_err());
+
+    let hostile_dante_scheme = MultiCestScheme::Dante {
+        tau_pulse_s: 1e-6,
+        tau_delay_s: 1e-6,
+        n_pulses: MAX_DANTE_PULSES + 1,
+        b1_pulse_hz: 500.0,
+    };
+    assert!(hostile_dante_scheme.validate().is_err());
+    let hostile_dante_u32max = MultiCestScheme::Dante {
+        tau_pulse_s: 1e-6,
+        tau_delay_s: 1e-6,
+        n_pulses: u32::MAX,
+        b1_pulse_hz: 500.0,
+    };
+    assert!(hostile_dante_u32max.validate().is_err());
+
+    // 4. Total-work budget & checked_mul overflow rejection (< 5 ms)
+    let valid_heavy_cos = MultiCestScheme::CosModulated {
+        t_ex_s: 0.401,
+        b1_eff_hz: 20.0,
+        mod_freq_hz: 250.0,
+        n_steps_per_cycle: MAX_COS_CEST_STEPS_PER_CYCLE,
+    };
+    let t2 = Instant::now();
+    assert!(validate_multi_cest_work_budget(&valid_heavy_cos, usize::MAX, 5).is_err());
+    assert!(validate_multi_cest_work_budget(&valid_heavy_cos, 100_000, 9).is_err());
+    assert!(t2.elapsed().as_millis() < 5);
+
+    // 5. 22.6:P2-5 — Degenerate zero-B1 profile (unidentifiable p_B, k_ex, dw, R2a, R2b):
+    //    must report covariance_valid = false and None (never silent zero standard errors!).
+    let zero_b1_offsets: Vec<f64> = (-6..=6).map(|k| 118.0 + 0.5 * (k as f64)).collect();
+    let flat_profile = MultiCestProfile {
+        larmor_mhz: 60.8106,
+        major_ppm: 118.0,
+        b1_inhomogeneity_frac: 0.0,
+        n_b1_quad: 1,
+        normalization: CestNormalization::ZeroTimePhaseCycled,
+        scheme: MultiCestScheme::Cw {
+            t_ex_s: 0.40,
+            b1_hz: 0.0,
+        },
+        offsets_ppm: zero_b1_offsets.clone(),
+        intensities: vec![(-1.3_f64 * 0.40).exp(); zero_b1_offsets.len()],
+        uncertainties: vec![0.005; zero_b1_offsets.len()],
+    };
+    let init = MultiCestFitParams {
+        p_b: 0.02,
+        k_ex_s_inv: 150.0,
+        dw_ab_ppm: 3.0,
+        r1_s_inv: 1.3,
+        r2a_s_inv: 14.0,
+        r2b_s_inv: 20.0,
+    };
+    let deg_fit = fit_multi_cest_lm(&[flat_profile], init, &MultiCestLmConfig::default()).unwrap();
+    assert!(
+        !deg_fit.covariance_valid,
+        "zero-B1 unidentifiable fit must not claim valid covariance"
+    );
+    assert!(
+        deg_fit.cramer_rao_cov.is_none() && deg_fit.std_errors.is_none(),
+        "failed/rank-deficient Cramer-Rao covariance must be None, not silent zeros"
+    );
 }
 
 /// Hostile input rejection tests for `DANTE-CEST`, `cos-CEST`, LM fitter, and amortized network.

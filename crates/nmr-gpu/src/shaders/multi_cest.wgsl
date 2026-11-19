@@ -72,6 +72,9 @@ const PADE_B3: f32 = 0.015151515151515152;     // 1 / 66
 const PADE_B4: f32 = 0.0012626262626262627;    // 1 / 792
 const PADE_B5: f32 = 0.00006313131313131313;   // 1 / 15840
 const PADE_B6: f32 = 0.0000015031265031265032; // 1 / 665280
+const MAX_DANTE_PULSES_GPU: u32 = 10000u;
+const MAX_COS_STEPS_GPU: u32 = 256u;
+const MAX_COS_CYCLES_GPU: f32 = 200000.0;
 
 fn mat7_zero() -> array<f32, 49> {
     var z: array<f32, 49>;
@@ -354,7 +357,7 @@ fn eval_multi_cest_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
         // DANTE-CEST: U = (exp(L_delay * tau_d) * exp(L_pulse * tau_p))^n_pulses
         let tau_p = c.t_ex_or_tau_p;
         let tau_d = c.tau_d_or_mod_freq;
-        let n_pulses = c.n_pulses_or_steps;
+        let n_pulses = min(c.n_pulses_or_steps, MAX_DANTE_PULSES_GPU);
 
         var f_delay = mat7_zero();
         if (tau_d > 0.0) {
@@ -385,9 +388,9 @@ fn eval_multi_cest_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
         let t_ex = c.t_ex_or_tau_p;
         let mod_freq = max(c.tau_d_or_mod_freq, 1e-12);
         let t_mod = 1.0 / mod_freq;
-        let m_steps = max(c.n_pulses_or_steps, 4u);
+        let m_steps = clamp(c.n_pulses_or_steps, 4u, MAX_COS_STEPS_GPU);
         let dt = t_mod / f32(m_steps);
-        let cycles_f = t_ex / t_mod;
+        let cycles_f = min(t_ex / t_mod, MAX_COS_CYCLES_GPU);
         let n_full = u32(max(0.0, floor(cycles_f + 1e-6)));
         let t_rem = max(0.0, t_ex - f32(n_full) * t_mod);
         let has_rem = t_rem > 1e-6 * t_mod;
@@ -432,7 +435,7 @@ fn eval_multi_cest_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
 
             if (has_rem) {
-                let m_rem = max(1u, u32(ceil(f32(m_steps) * (t_rem / t_mod))));
+                let m_rem = clamp(u32(ceil(f32(m_steps) * (t_rem / t_mod))), 1u, m_steps);
                 let dt_rem = t_rem / f32(m_rem);
                 for (var k = 0u; k < m_rem; k = k + 1u) {
                     let t_k = (f32(k) + 0.5) * dt_rem;

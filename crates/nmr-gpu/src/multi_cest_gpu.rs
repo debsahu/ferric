@@ -14,8 +14,8 @@
 use bytemuck::{Pod, Zeroable};
 use nmr_core::cest::gauss_hermite_normalized;
 use nmr_core::multi_cest::{
-    compute_multi_cest_e0_inv_i0, CosCestParams, DanteCestParams, MultiCestScheme,
-    MultiCestSimParams,
+    compute_multi_cest_e0_inv_i0, validate_multi_cest_work_budget, CosCestParams, DanteCestParams,
+    MultiCestScheme, MultiCestSimParams, MAX_CEST_B1_QUAD_NODES, MAX_TOTAL_PROPAGATOR_STEPS,
 };
 use wgpu::util::DeviceExt;
 
@@ -185,6 +185,47 @@ fn aligned_copy_bytes(raw_bytes: u64) -> u64 {
         * wgpu::COPY_BUFFER_ALIGNMENT
 }
 
+/// Fail-closed host precheck validating every curve's physical bounds, quadrature node count,
+/// and total propagator-step work budget BEFORE pipeline creation, buffer allocation, or
+/// WebGPU compute dispatch.
+pub fn validate_multi_cest_gpu_batch(
+    requests: &[(MultiCestSimParams, &[f64])],
+    n_b1_quad: usize,
+) -> Result<u64, String> {
+    if n_b1_quad > MAX_CEST_B1_QUAD_NODES {
+        return Err(format!(
+            "GPU multi-CEST n_b1_quad ({n_b1_quad}) exceeds MAX_CEST_B1_QUAD_NODES ({MAX_CEST_B1_QUAD_NODES})"
+        ));
+    }
+    let mut total_batch_work: u64 = 0;
+    for (c_idx, (p, offs)) in requests.iter().enumerate() {
+        p.validate()?;
+        for (i, &rf) in offs.iter().enumerate() {
+            if !rf.is_finite() {
+                return Err(format!(
+                    "non-finite offset at curve {c_idx} index {i}: {rf}"
+                ));
+            }
+        }
+        let eff_quad = if p.b1_inhomogeneity_frac > 0.0 && n_b1_quad > 1 {
+            n_b1_quad
+        } else {
+            1
+        };
+        let curve_work = validate_multi_cest_work_budget(&p.scheme, offs.len(), eff_quad)
+            .map_err(|e| format!("GPU curve {c_idx}: {e}"))?;
+        total_batch_work = total_batch_work
+            .checked_add(curve_work)
+            .ok_or_else(|| "GPU multi-CEST batch propagator work overflowed u64".to_string())?;
+        if total_batch_work > MAX_TOTAL_PROPAGATOR_STEPS {
+            return Err(format!(
+                "GPU multi-CEST batch total propagator steps ({total_batch_work}) exceeds MAX_TOTAL_PROPAGATOR_STEPS ({MAX_TOTAL_PROPAGATOR_STEPS})"
+            ));
+        }
+    }
+    Ok(total_batch_work)
+}
+
 /// Evaluate a batch of multi-frequency `CEST` (`CW`, `DANTE-CEST`, `cos-CEST`) profiles on
 /// WebGPU (`async`) using a pre-compiled [`MultiCestGpuPipeline`].
 pub async fn simulate_multi_cest_batch_with_pipeline_async(
@@ -196,6 +237,7 @@ pub async fn simulate_multi_cest_batch_with_pipeline_async(
     if requests.is_empty() {
         return Ok(Vec::new());
     }
+    validate_multi_cest_gpu_batch(requests, n_b1_quad)?;
 
     let quad_pairs = gauss_hermite_normalized(n_b1_quad.max(1));
     let quad_gpu: Vec<QuadNodeGpu> = quad_pairs
@@ -425,6 +467,10 @@ pub async fn simulate_multi_cest_batch_gpu_async(
     requests: &[(MultiCestSimParams, &[f64])],
     n_b1_quad: usize,
 ) -> Result<Vec<Vec<f64>>, String> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    validate_multi_cest_gpu_batch(requests, n_b1_quad)?;
     let pipe = MultiCestGpuPipeline::new(&engine.device);
     simulate_multi_cest_batch_with_pipeline_async(engine, &pipe, requests, n_b1_quad).await
 }

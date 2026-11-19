@@ -8,10 +8,13 @@
 //! Bouvignies (*J. Phys. Chem. Lett.* 2018, 9, 2501–2507), Vallurupalli, Bouvignies & Kay
 //! (*JACS* 2012, 134, 8148–8161), and Higham (*SIAM J. Matrix Anal. Appl.* 2005, 26, 1179–1193).
 
+use std::time::Instant;
+
 use nmr_core::cest::CestNormalization;
 use nmr_core::multi_cest::{
     simulate_cos_cest_profile, simulate_dante_cest_profile, simulate_multi_cest_profile,
-    CosCestParams, DanteCestParams, MultiCestScheme, MultiCestSimParams,
+    CosCestParams, DanteCestParams, MultiCestScheme, MultiCestSimParams, MAX_COS_CEST_MOD_FREQ_HZ,
+    MAX_COS_CEST_STEPS_PER_CYCLE, MAX_DANTE_PULSES,
 };
 use nmr_gpu::multi_cest_gpu::{
     simulate_cos_cest_batch_gpu, simulate_dante_cest_batch_gpu, simulate_multi_cest_batch_gpu,
@@ -288,7 +291,85 @@ fn test_webgpu_multi_cest_default_limits_and_hostile_input_guards() {
     bad_p.p_b = f64::NAN;
     assert!(simulate_multi_cest_batch_gpu(&engine, &[(bad_p, offsets.as_slice())], 1).is_err());
 
-    assert!(simulate_multi_cest_batch_gpu(&engine, &[(base, &[f64::INFINITY])], 1).is_err());
+    assert!(
+        simulate_multi_cest_batch_gpu(&engine, &[(base.clone(), &[f64::INFINITY])], 1).is_err()
+    );
+
+    // 22.6:P1-2 hostile GPU precheck regressions: must fail closed BEFORE GPU dispatch (< 5 ms)
+    let mut hostile_steps = base.clone();
+    hostile_steps.scheme = MultiCestScheme::CosModulated {
+        t_ex_s: 0.40,
+        b1_eff_hz: 20.0,
+        mod_freq_hz: 250.0,
+        n_steps_per_cycle: u32::MAX,
+    };
+    let t0 = Instant::now();
+    assert!(
+        simulate_multi_cest_batch_gpu(&engine, &[(hostile_steps, offsets.as_slice())], 1).is_err()
+    );
+    assert!(
+        t0.elapsed().as_millis() < 5,
+        "GPU hostile n_steps_per_cycle=u32::MAX took {:?}, expected < 5 ms",
+        t0.elapsed()
+    );
+
+    let mut hostile_freq = base.clone();
+    hostile_freq.scheme = MultiCestScheme::CosModulated {
+        t_ex_s: 0.40,
+        b1_eff_hz: 20.0,
+        mod_freq_hz: 1e10,
+        n_steps_per_cycle: 32,
+    };
+    let t1 = Instant::now();
+    assert!(
+        simulate_multi_cest_batch_gpu(&engine, &[(hostile_freq, offsets.as_slice())], 1).is_err()
+    );
+    assert!(
+        t1.elapsed().as_millis() < 5,
+        "GPU hostile mod_freq_hz=1e10 took {:?}, expected < 5 ms",
+        t1.elapsed()
+    );
+
+    let mut over_dante = base.clone();
+    over_dante.scheme = MultiCestScheme::Dante {
+        tau_pulse_s: 1e-6,
+        tau_delay_s: 1e-6,
+        n_pulses: MAX_DANTE_PULSES + 1,
+        b1_pulse_hz: 500.0,
+    };
+    assert!(
+        simulate_multi_cest_batch_gpu(&engine, &[(over_dante, offsets.as_slice())], 1).is_err()
+    );
+
+    let mut over_mod = base.clone();
+    over_mod.scheme = MultiCestScheme::CosModulated {
+        t_ex_s: 0.40,
+        b1_eff_hz: 20.0,
+        mod_freq_hz: MAX_COS_CEST_MOD_FREQ_HZ + 1.0,
+        n_steps_per_cycle: 32,
+    };
+    assert!(simulate_multi_cest_batch_gpu(&engine, &[(over_mod, offsets.as_slice())], 1).is_err());
+
+    // Total batch work budget precheck (> MAX_TOTAL_PROPAGATOR_STEPS)
+    let mut heavy_cos = base;
+    heavy_cos.b1_inhomogeneity_frac = 0.05;
+    heavy_cos.n_b1_quad = 9;
+    heavy_cos.scheme = MultiCestScheme::CosModulated {
+        t_ex_s: 0.401,
+        b1_eff_hz: 20.0,
+        mod_freq_hz: 250.0,
+        n_steps_per_cycle: MAX_COS_CEST_STEPS_PER_CYCLE,
+    };
+    let big_offsets = vec![118.0; 25_000];
+    let t2 = Instant::now();
+    assert!(
+        simulate_multi_cest_batch_gpu(&engine, &[(heavy_cos, big_offsets.as_slice())], 9).is_err()
+    );
+    assert!(
+        t2.elapsed().as_millis() < 5,
+        "GPU batch work-budget rejection took {:?}, expected < 5 ms",
+        t2.elapsed()
+    );
 
     // Storage limit guard rejects absurd buffer sizes cleanly
     let huge = engine.device.limits().max_buffer_size.saturating_add(4096);
