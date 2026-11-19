@@ -47,6 +47,7 @@ pub mod octet_mol;
 pub mod octet_render;
 pub mod ops;
 pub mod paramagnetic;
+pub mod pcs_transfer;
 pub mod peaks;
 pub mod picker;
 pub mod priors;
