@@ -794,12 +794,12 @@ impl StructureModel {
         }
 
         let mut provenance = StructCoordinateProvenance::Unknown;
-        let mut plddt_metric_ids: Vec<String> = Vec::new();
-        let mut saw_ma_qa_metric = false;
-        let mut scalar_ma_id: Option<String> = None;
-        let mut scalar_ma_name: Option<String> = None;
-        let mut scalar_ma_mode: Option<String> = None;
-        let mut local_plddt_by_label: BTreeMap<(String, i32), f64> = BTreeMap::new();
+        // Shared `pLDDT` provenance rule (`21F:B1`): `af_concordance::PlddtProvenanceEvidence`.
+        let mut prov_ev = crate::af_concordance::PlddtProvenanceEvidence::default();
+        // Scalar `_ma_qa_metric` (id, name, type, mode).
+        let mut scalar_ma: [Option<String>; 4] = [None, None, None, None];
+        // Raw `_ma_qa_metric_local` rows: (label_asym_id, label_seq_id, metric_id, value).
+        let mut local_rows: Vec<(String, i32, Option<String>, f64)> = Vec::new();
         let mut explicit_disulfides: Vec<((String, i32), (String, i32))> = Vec::new();
         let mut raw_residues: Vec<RawParsedResidue> = Vec::new();
         let mut idx_map: BTreeMap<(String, i32), usize> = BTreeMap::new();
@@ -866,40 +866,25 @@ impl StructureModel {
                     }
                 } else if prefix == "_software" {
                     if let Some(n_col) = find_cif_col(&cols, "_software.name") {
-                        for row in vals.chunks_exact(ncols) {
-                            let up = row[n_col].to_ascii_uppercase();
-                            if (up.contains("ALPHAFOLD")
-                                || up.contains("COLABFOLD")
-                                || up.contains("BOLTZ"))
-                                && provenance == StructCoordinateProvenance::Unknown
-                            {
-                                provenance = StructCoordinateProvenance::Computational;
-                            }
+                        if vals.chunks_exact(ncols).any(|row| {
+                            crate::af_concordance::is_recognized_predictor_software(row[n_col])
+                        }) {
+                            prov_ev.recognized_predictor_header = true;
                         }
                     }
                 } else if prefix == "_ma_qa_metric" {
-                    saw_ma_qa_metric = true;
                     let id_col = find_cif_col(&cols, "_ma_qa_metric.id");
                     let name_col = find_cif_col(&cols, "_ma_qa_metric.name");
                     let type_col = find_cif_col(&cols, "_ma_qa_metric.type");
                     let mode_col = find_cif_col(&cols, "_ma_qa_metric.mode");
                     for row in vals.chunks_exact(ncols) {
-                        let Some(ic) = id_col else { continue };
-                        let nm = name_col
-                            .map(|c| row[c].to_ascii_uppercase())
-                            .unwrap_or_default();
-                        let tp = type_col
-                            .map(|c| row[c].to_ascii_uppercase())
-                            .unwrap_or_default();
-                        let md = mode_col
-                            .map(|c| row[c].to_ascii_lowercase())
-                            .unwrap_or_default();
-                        // Require explicit `pLDDT` metric name/type (`21.W1:P2-6`), rejecting QMEANDisCo etc.
-                        if (nm.contains("PLDDT") || tp.contains("PLDDT")) && !md.contains("global")
-                        {
-                            plddt_metric_ids.push(row[ic].to_string());
-                            provenance = StructCoordinateProvenance::Computational;
-                        }
+                        let get = |c: Option<usize>| c.map(|c| row[c]).unwrap_or("");
+                        prov_ev.push_metric(
+                            get(id_col),
+                            get(name_col),
+                            get(type_col),
+                            get(mode_col),
+                        );
                     }
                 } else if prefix == "_ma_qa_metric_local" {
                     let asym_col = find_cif_col(&cols, "_ma_qa_metric_local.label_asym_id")
@@ -909,13 +894,10 @@ impl StructureModel {
                     let val_col = find_cif_col(&cols, "_ma_qa_metric_local.metric_value")
                         .ok_or("mmCIF _ma_qa_metric_local missing metric_value")?;
                     let mid_col = find_cif_col(&cols, "_ma_qa_metric_local.metric_id");
-                    if !plddt_metric_ids.is_empty() {
+                    {
                         for row in vals.chunks_exact(ncols) {
-                            if let Some(mc) = mid_col {
-                                if !plddt_metric_ids.iter().any(|id| id == row[mc]) {
-                                    continue;
-                                }
-                            }
+                            let mid = mid_col.map(|mc| row[mc].to_string());
+                            prov_ev.local_row_metric_ids.push(mid.clone());
                             let seq_id: i32 = row[seq_col].parse().map_err(|e| {
                                 format!(
                                     "invalid _ma_qa_metric_local.label_seq_id '{}': {e}",
@@ -931,7 +913,7 @@ impl StructureModel {
                             if !mv.is_finite() {
                                 return Err("non-finite pLDDT in _ma_qa_metric_local".to_string());
                             }
-                            local_plddt_by_label.insert((row[asym_col].to_string(), seq_id), mv);
+                            local_rows.push((row[asym_col].to_string(), seq_id, mid, mv));
                         }
                     }
                 } else if prefix == "_struct_conn" {
@@ -1110,9 +1092,8 @@ impl StructureModel {
                     }
                 }
             } else if !quoted && tok.starts_with("data_") {
-                let d_up = tok[5..].to_ascii_uppercase();
-                if d_up.starts_with("AF-") && provenance == StructCoordinateProvenance::Unknown {
-                    provenance = StructCoordinateProvenance::Computational;
+                if crate::af_concordance::is_afdb_entry_id(&tok[5..]) {
+                    prov_ev.recognized_predictor_header = true;
                 }
                 pos += 1;
             } else if !quoted && tok.starts_with('_') {
@@ -1130,29 +1111,21 @@ impl StructureModel {
                             provenance = StructCoordinateProvenance::Experimental;
                         }
                     } else if key_low == "_entry.id" {
-                        if val_up.starts_with("AF-")
-                            && provenance == StructCoordinateProvenance::Unknown
-                        {
-                            provenance = StructCoordinateProvenance::Computational;
+                        if crate::af_concordance::is_afdb_entry_id(val_raw) {
+                            prov_ev.recognized_predictor_header = true;
                         }
                     } else if key_low == "_ma_qa_metric.id" {
-                        saw_ma_qa_metric = true;
-                        scalar_ma_id = Some(val_raw.to_string());
-                    } else if key_low == "_ma_qa_metric.name" || key_low == "_ma_qa_metric.type" {
-                        saw_ma_qa_metric = true;
-                        if scalar_ma_name.is_none() || key_low == "_ma_qa_metric.name" {
-                            scalar_ma_name = Some(val_up);
-                        }
+                        scalar_ma[0] = Some(val_raw.to_string());
+                    } else if key_low == "_ma_qa_metric.name" {
+                        scalar_ma[1] = Some(val_raw.to_string());
+                    } else if key_low == "_ma_qa_metric.type" {
+                        scalar_ma[2] = Some(val_raw.to_string());
                     } else if key_low == "_ma_qa_metric.mode" {
-                        saw_ma_qa_metric = true;
-                        scalar_ma_mode = Some(val_raw.to_ascii_lowercase());
-                    } else if key_low.contains("software")
-                        && (val_up.contains("ALPHAFOLD")
-                            || val_up.contains("COLABFOLD")
-                            || val_up.contains("BOLTZ"))
-                        && provenance == StructCoordinateProvenance::Unknown
+                        scalar_ma[3] = Some(val_raw.to_string());
+                    } else if key_low == "_software.name"
+                        && crate::af_concordance::is_recognized_predictor_software(val_raw)
                     {
-                        provenance = StructCoordinateProvenance::Computational;
+                        prov_ev.recognized_predictor_header = true;
                     }
                     pos += 2;
                 } else {
@@ -1163,28 +1136,33 @@ impl StructureModel {
             }
         }
 
-        if let Some(nm) = scalar_ma_name.as_deref() {
-            let md = scalar_ma_mode.as_deref().unwrap_or("");
-            if nm.contains("PLDDT") && !md.contains("global") {
-                if let Some(id_s) = scalar_ma_id {
-                    plddt_metric_ids.push(id_s);
-                }
-                if provenance == StructCoordinateProvenance::Unknown {
-                    provenance = StructCoordinateProvenance::Computational;
-                }
-            }
+        if scalar_ma.iter().any(Option::is_some) {
+            let [id, nm, tp, md] = scalar_ma.map(Option::unwrap_or_default);
+            prov_ev.push_metric(&id, &nm, &tp, &md);
         }
-        // If the mmCIF explicitly declared `_ma_qa_metric` entries (e.g. `QMEANDisCo`) with NO
-        // local `pLDDT` metric, fail closed rather than interpreting `B_iso` as pLDDT (`21F:B1`).
-        if saw_ma_qa_metric
-            && plddt_metric_ids.is_empty()
-            && provenance == StructCoordinateProvenance::Computational
-        {
-            provenance = StructCoordinateProvenance::Unknown;
+        // Single shared pLDDT provenance rule (`21F:B1`): verified local pLDDT rows, or a
+        // recognized predictor header with no declared QA schema. A declared pLDDT metric without
+        // matching `_ma_qa_metric_local` rows fails closed (no B-factor fallback / rescaling).
+        let verdict = prov_ev.verdict();
+        if provenance != StructCoordinateProvenance::Experimental {
+            provenance = if verdict == crate::af_concordance::PlddtProvenanceVerdict::NotPlddt {
+                StructCoordinateProvenance::Unknown
+            } else {
+                StructCoordinateProvenance::Computational
+            };
+        }
+        for label in prov_ev.ignored_metric_labels() {
+            diagnostics.push(format!("ignored non-pLDDT / unverified QA metric: {label}"));
         }
 
-        // Attach explicit `_ma_qa_metric_local` pLDDTs
-        if !local_plddt_by_label.is_empty() {
+        // Attach explicit `_ma_qa_metric_local` pLDDTs (verified local pLDDT metric ids only)
+        if verdict == crate::af_concordance::PlddtProvenanceVerdict::LocalPlddtRows {
+            let mut local_plddt_by_label: BTreeMap<(String, i32), f64> = BTreeMap::new();
+            for (lasym, lseq, mid, mv) in local_rows {
+                if prov_ev.local_row_is_plddt(mid.as_deref()) {
+                    local_plddt_by_label.insert((lasym, lseq), mv);
+                }
+            }
             for ((lasym, lseq), mv) in &local_plddt_by_label {
                 if let Some(&r_idx) = label_to_res_idx
                     .get(&(lasym.clone(), *lseq))

@@ -1260,3 +1260,18 @@ A 2 1 88.5
         "expected ColabFold plddt mismatch error, got: {err_cf}"
     );
 }
+
+#[path = "support/af_provenance_probes.rs"]
+mod af_provenance_probes;
+
+/// `21F:B1` (FIX3 slice A): the shared probe matrix must be decided identically by all three
+/// nmr-core gates — `af_concordance::require_predicted_model`, `struct_shifts::
+/// require_predicted_structure_model`, and the `af_assign_priors` text-evidence + `from_strs`
+/// gate. SWISS-MODEL QMEANDisCo files (with/without `_software` AlphaFold or `data_AF-` header),
+/// a declared pLDDT metric lacking local rows (f3/f5), and `global` in the type column (e2) must
+/// fail closed; real AFDB v6 and verified local-pLDDT rows must still be accepted. Fails at
+/// `b5e87a3` on f3, f5 and e2.
+#[test]
+fn test_21f_b1_provenance_probe_matrix_all_core_gates_agree() {
+    af_provenance_probes::assert_matrix(af_provenance_probes::core_gate_verdicts);
+}
