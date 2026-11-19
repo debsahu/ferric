@@ -21,6 +21,7 @@ pub mod domain_dock_gpu;
 pub mod dosy_gpu;
 pub mod fidnet_gpu;
 pub mod methyl_gpu;
+pub mod multi_cest_gpu;
 pub mod neural_gpu;
 pub mod rdc_gpu;
 pub mod relax_gpu;

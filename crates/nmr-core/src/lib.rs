@@ -41,6 +41,7 @@ pub mod metabolomics;
 pub mod methyl_solver;
 pub mod methyl_trosy;
 pub mod modelfree;
+pub mod multi_cest;
 pub mod multiplet;
 pub mod nef;
 pub mod neural_picker;
