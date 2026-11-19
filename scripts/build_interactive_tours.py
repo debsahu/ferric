@@ -394,6 +394,28 @@ def render_gallery_html(bundles: Sequence[NormalizedBundle]) -> str:
 
     manifest_json = safe_json_for_script_tag(gallery_manifest)
 
+    m02_legend_text = "Module 02 live solver fixture + historical benchmark disclosure"
+    for b in bundles:
+        if b.module_index == 2:
+            bm = b.raw_json.get("payload", {}).get("benchmarks", {})
+            if isinstance(bm, dict) and all(
+                k in bm
+                for k in (
+                    "ubiquitin_realistic_pct",
+                    "cisd3_acc_pct",
+                    "cisd3_hc_prec_pct",
+                    "cold_bmrb_hc_min_pct",
+                    "cold_bmrb_hc_max_pct",
+                )
+            ):
+                m02_legend_text = (
+                    f"Module 02 [historical disclosure] synthetic Ubiquitin ({float(bm['ubiquitin_realistic_pct']):.1f}%), "
+                    f"dev CISD3 ({float(bm['cisd3_acc_pct']):.2f}% / {float(bm['cisd3_hc_prec_pct']):.0f}% HC); "
+                    f"default evo-graph cold HCP {float(bm['cold_bmrb_hc_min_pct']):.2f}&ndash;{float(bm['cold_bmrb_hc_max_pct']):.2f}% "
+                    f"(latest {float(bm['cold_bmrb_hc_min_pct']):.2f}% FAILS &ge; 94%; withdrawn 13.1:P1-2)"
+                )
+            break
+
     return f"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
@@ -446,7 +468,7 @@ def render_gallery_html(bundles: Sequence[NormalizedBundle]) -> str:
         </div>
         <div class="legend-item">
           <span class="val-badge badge-holdout">Synthetic / Dev &middot; Cold HCP Gate Failed (Withdrawn)</span>
-          <span>Module 02 synthetic Ubiquitin (98.4%), dev CISD3 (64.38% / 100% HC); default evo-graph cold HCP 88.25&ndash;95.30% (latest 88.25% FAILS &ge; 94%; withdrawn 13.1:P1-2)</span>
+          <span>{m02_legend_text}</span>
         </div>
         <div class="legend-item">
           <span class="val-badge badge-holdout">Cold Holdout Disclosed (F8)</span>
@@ -2365,7 +2387,10 @@ TOURS_PLAYER_JS = r"""(function () {
           var stdAcc = reqNum("std_acc_pct");
           var ubqReal = reqNum("benchmarks.ubiquitin_realistic_pct");
           var cisd3Acc = reqNum("benchmarks.cisd3_acc_pct");
-          if (!cvVals || !cvTemps || !meanE || tCrit === null || maxCv === null || evoAcc === null || bayesAcc === null || stdAcc === null || ubqReal === null || cisd3Acc === null) {
+          var cisd3Hc = reqNum("benchmarks.cisd3_hc_prec_pct");
+          var coldMin = reqNum("benchmarks.cold_bmrb_hc_min_pct");
+          var coldMax = reqNum("benchmarks.cold_bmrb_hc_max_pct");
+          if (!cvVals || !cvTemps || !meanE || tCrit === null || maxCv === null || evoAcc === null || bayesAcc === null || stdAcc === null || ubqReal === null || cisd3Acc === null || cisd3Hc === null || coldMin === null || coldMax === null) {
             drawFallbackPlaceholder("Module 02 Ch 3: Solver Cv(T) & Benchmark Trajectory");
             return;
           }
@@ -2374,7 +2399,7 @@ TOURS_PLAYER_JS = r"""(function () {
             padX,
             padY - 12,
             "Replica-Exchange bayes-sa Cv(T), Mean Energy & Solver Coverage",
-            "T_crit=" + tCrit.toFixed(2) + " (max Cv=" + maxCv.toFixed(1) + ") · Synthetic UBQ " + ubqReal.toFixed(1) + "% · Dev CISD3 " + cisd3Acc.toFixed(2) + "%",
+            "Live T_crit=" + tCrit.toFixed(2) + " (max Cv=" + maxCv.toFixed(1) + ") · [Historical] UBQ " + ubqReal.toFixed(1) + "% · CISD3 " + cisd3Acc.toFixed(2) + "%/" + cisd3Hc.toFixed(0) + "% HC · Cold " + coldMin.toFixed(2) + "-" + coldMax.toFixed(2) + "% (withdrawn)",
             pal
           );
           drawAxes(ctx, padX, padY + 8, pw, ph - 12, "Cooling Stage (High T -> Low T)", "Normalized Cv(T) / Energy / Assigned %", pal);
@@ -4226,6 +4251,9 @@ REQUIRED_MODULE_PAYLOAD_KEYS: Dict[int, Tuple[str, ...]] = {
         "n_high_conf",
         "benchmarks.ubiquitin_realistic_pct",
         "benchmarks.cisd3_acc_pct",
+        "benchmarks.cisd3_hc_prec_pct",
+        "benchmarks.cold_bmrb_hc_min_pct",
+        "benchmarks.cold_bmrb_hc_max_pct",
     ),
     3: (
         "ca_coords",
@@ -4519,6 +4547,28 @@ for (const file of htmlFiles) {
         throw new Error("Gly10 CA(i) hotspot missing +1 Non-CT HNCACB sign disclosure");
       }
     }
+    if (file.startsWith("02_") && ch === 3) {
+      const reqBmKeys = [
+        "evo_acc_pct",
+        "bayes_acc_pct",
+        "std_acc_pct",
+        "benchmarks.ubiquitin_realistic_pct",
+        "benchmarks.cisd3_acc_pct",
+        "benchmarks.cisd3_hc_prec_pct",
+        "benchmarks.cold_bmrb_hc_min_pct",
+        "benchmarks.cold_bmrb_hc_max_pct"
+      ];
+      for (const rk of reqBmKeys) {
+        if (!plottedKeys.includes(rk)) {
+          throw new Error("Module 02 Ch 3 player did not read payload." + rk + " (plotted=" + plottedKeys.join(",") + ")");
+        }
+      }
+    }
+    if (file.startsWith("04_") && ch === 3) {
+      if (!plottedKeys.includes("tau_m_ns") || !plottedKeys.includes("d_par_perp")) {
+        throw new Error("Module 04 Ch 3 player did not read payload.tau_m_ns / d_par_perp");
+      }
+    }
     pairs++;
   }
 }
@@ -4591,6 +4641,60 @@ def validate_tour_site(
                 elif isinstance(val, (list, str, dict)) and len(val) == 0:
                     errors.append(f"{b.slug}.tour.json: empty required payload.{dot_key}")
 
+            # B15: caption-vs-payload scalar consistency checks for Module 02 & Module 04
+            if b.module_index == 2:
+                bm = payload.get("benchmarks")
+                if isinstance(bm, dict):
+                    try:
+                        ubq_s = f"{float(bm['ubiquitin_realistic_pct']):.1f}%"
+                        cisd3_s = f"{float(bm['cisd3_acc_pct']):.2f}%"
+                        cold_rng = f"{float(bm['cold_bmrb_hc_min_pct']):.2f}-{float(bm['cold_bmrb_hc_max_pct']):.2f}%"
+                    except (KeyError, TypeError, ValueError):
+                        ubq_s = cisd3_s = cold_rng = ""
+                    if cold_rng:
+                        ch3_cap = str(b.chapters[2].get("caption", "")) if len(b.chapters) >= 3 else ""
+                        for field_lbl, text in (
+                            ("subtitle", b.subtitle),
+                            ("validation_badge.detail", b.badge_detail),
+                            ("chapters[2].caption", ch3_cap),
+                        ):
+                            if cold_rng not in text:
+                                errors.append(
+                                    f"{b.slug}.tour.json: {field_lbl} does not match payload.benchmarks cold range {cold_rng}"
+                                )
+                            if ubq_s and ubq_s not in text:
+                                errors.append(
+                                    f"{b.slug}.tour.json: {field_lbl} does not match payload.benchmarks ubiquitin_realistic_pct {ubq_s}"
+                                )
+                            if cisd3_s and cisd3_s not in text:
+                                errors.append(
+                                    f"{b.slug}.tour.json: {field_lbl} does not match payload.benchmarks cisd3_acc_pct {cisd3_s}"
+                                )
+                strips = payload.get("strips")
+                if isinstance(strips, list) and len(strips) >= 7 and len(b.chapters) >= 2:
+                    thr7 = strips[6]
+                    if isinstance(thr7, dict) and isinstance(thr7.get("cb_i"), (int, float)):
+                        thr7_cb_str = f"Thr7 CB={float(thr7['cb_i']):.1f}"
+                        ch2_cap = str(b.chapters[1].get("caption", ""))
+                        if "Thr7 CB=" in ch2_cap and thr7_cb_str not in ch2_cap:
+                            errors.append(
+                                f"{b.slug}.tour.json: chapters[1].caption Thr7 CB does not match payload.strips[6].cb_i ({thr7_cb_str})"
+                            )
+            elif b.module_index == 4:
+                tau_m = payload.get("tau_m_ns")
+                if isinstance(tau_m, (int, float)) and len(b.chapters) >= 3:
+                    expected_tau = f"tau_m={float(tau_m):.2f} ns"
+                    ch3_cap = str(b.chapters[2].get("caption", ""))
+                    ch3_pill = str(b.chapters[2].get("metric_pill", "") or b.chapters[2].get("metric", ""))
+                    if expected_tau not in ch3_cap:
+                        errors.append(
+                            f"{b.slug}.tour.json: chapters[2].caption missing payload-matched '{expected_tau}' (got: {ch3_cap!r})"
+                        )
+                    if expected_tau not in ch3_pill:
+                        errors.append(
+                            f"{b.slug}.tour.json: chapters[2].metric_pill missing payload-matched '{expected_tau}' (got: {ch3_pill!r})"
+                        )
+
     if "tours_player.js" in site_files:
         js_text = site_files["tours_player.js"].decode("utf-8")
         if ".innerHTML" in js_text:
@@ -4659,8 +4763,8 @@ def _make_mock_payload(module_index: int) -> Dict[str, Any]:
             (4, "PHE4", 8.61, 118.4, 56.8, 41.2, 59.6, 42.1),
             (5, "VAL5", 9.30, 121.2, 61.8, 32.7, 56.8, 41.2),
             (6, "LYS6", 8.94, 127.8, 54.9, 32.9, 61.8, 32.7),
-            (7, "THR7", 8.76, 115.3, 61.9, 69.5, 54.9, 32.9),
-            (8, "LEU8", 9.12, 121.1, 57.0, 41.6, 61.9, 69.5),
+            (7, "THR7", 8.76, 115.3, 62.8, 73.3, 54.9, 32.9),
+            (8, "LEU8", 9.12, 121.1, 57.0, 41.6, 62.8, 73.3),
             (9, "THR9", 7.65, 105.9, 61.5, 68.4, 57.0, 41.6),
             (10, "GLY10", 7.84, 109.2, 45.3, None, 61.5, 68.4),
         ]
@@ -4701,11 +4805,14 @@ def _make_mock_payload(module_index: int) -> Dict[str, Any]:
             "qc_verdict": "PASS",
             "n_high_conf": 74,
             "benchmarks": {
+                "scope": "historical_disclosure",
                 "ubiquitin_realistic_pct": 98.4,
                 "cisd3_acc_pct": 64.38,
                 "cisd3_hc_prec_pct": 100.0,
-                "cold_bmrb_hc_min_pct": 86.18,
-                "cold_bmrb_hc_max_pct": 96.31,
+                "cold_bmrb_hc_min_pct": 88.25,
+                "cold_bmrb_hc_max_pct": 95.30,
+                "cold_bmrb_gate_pct": 94.0,
+                "cold_bmrb_status": "FAILS >=94%; withdrawn (13.1:P1-2)",
             },
         }
     if module_index == 3:
@@ -4734,8 +4841,8 @@ def _make_mock_payload(module_index: int) -> Dict[str, Any]:
             "fit_600_se": 0.04,
             "fit_800_rate": 1.62,
             "fit_800_se": 0.03,
-            "tau_m_ns": 4.10,
-            "d_par_perp": 1.17,
+            "tau_m_ns": 4.0837,
+            "d_par_perp": 0.9987,
             "seq_ids": seq_ids,
             "r2_over_r1": [6.8 if r == 23 else 4.35 for r in seq_ids],
             "s2_vals": [0.84 if r == 23 else 0.87 for r in seq_ids],
@@ -4922,23 +5029,50 @@ def _make_mock_bundles(data_dir: Path) -> None:
     ]
     data_dir.mkdir(parents=True, exist_ok=True)
     for idx, slug, title, man_ch, b_kind, b_lbl, b_det, cid, cmin, cmax, cstep, cdef, cunit in specs:
+        payload = _make_mock_payload(idx)
+        subtitle = f"Deterministic nmr-core showcase for {title}"
+        chapters = [
+            {"index": 1, "start_sec": 0.0, "end_sec": 4.0, "title": "Stage One", "caption": "Chapter 1 physics", "metric": "Ch1"},
+            {"index": 2, "start_sec": 4.0, "end_sec": 8.0, "title": "Stage Two", "caption": "Chapter 2 physics", "metric": "Ch2"},
+            {"index": 3, "start_sec": 8.0, "end_sec": 12.0, "title": "Stage Three", "caption": "Chapter 3 physics", "metric": "Ch3"},
+            {"index": 4, "start_sec": 12.0, "end_sec": 16.0, "title": "Stage Four", "caption": "Chapter 4 physics", "metric": "Ch4"},
+        ]
+        if idx == 2:
+            bm = payload["benchmarks"]
+            thr7 = payload["strips"][6]
+            subtitle = (
+                f"Live fixture: evo-graph {payload['evo_acc_pct']:.1f}% · [Historical disclosure] "
+                f"UBQ {bm['ubiquitin_realistic_pct']:.1f}%, dev CISD3 {bm['cisd3_acc_pct']:.2f}%/"
+                f"{bm['cisd3_hc_prec_pct']:.0f}% HC, cold BMRB {bm['cold_bmrb_hc_min_pct']:.2f}-"
+                f"{bm['cold_bmrb_hc_max_pct']:.2f}% (FAILS >=94%; withdrawn)"
+            )
+            chapters[1]["caption"] = (
+                f"Walks Phe4 -> Gly10: Thr7 CB={thr7['cb_i']:.1f} > CA={thr7['ca_i']:.1f} inversion."
+            )
+            chapters[2]["caption"] = (
+                f"Live bayes-sa Cv(T) alongside [historical disclosure]: UBQ {bm['ubiquitin_realistic_pct']:.1f}%, "
+                f"dev CISD3 {bm['cisd3_acc_pct']:.2f}%/{bm['cisd3_hc_prec_pct']:.0f}% HC, "
+                f"cold BMRB {bm['cold_bmrb_hc_min_pct']:.2f}-{bm['cold_bmrb_hc_max_pct']:.2f}%."
+            )
+        elif idx == 4:
+            tau_m = float(payload["tau_m_ns"])
+            d_pp = float(payload["d_par_perp"])
+            chapters[2]["caption"] = (
+                f"Outlier-trimmed R2/R1 global tau_m={tau_m:.2f} ns & Woessner axial D_par/D_perp={d_pp:.2f}."
+            )
+            chapters[2]["metric"] = f"tau_m={tau_m:.2f} ns  D_par/D_perp={d_pp:.2f}"
         doc = {
             "schema_version": EXPECTED_SCHEMA_VERSION,
             "module_index": idx,
             "slug": slug,
             "title": title,
-            "subtitle": f"Deterministic nmr-core showcase for {title}",
+            "subtitle": subtitle,
             "manual_chapter": man_ch,
             "validation_badge": {"kind": b_kind, "label": b_lbl, "detail": b_det},
             "duration_sec": 16.0,
             "fps": 30,
             "cli_command": f"ferric export-tour --module {idx:02d} --out-dir docs/tours",
-            "chapters": [
-                {"index": 1, "start_sec": 0.0, "end_sec": 4.0, "title": "Stage One", "caption": "Chapter 1 physics", "metric": "Ch1"},
-                {"index": 2, "start_sec": 4.0, "end_sec": 8.0, "title": "Stage Two", "caption": "Chapter 2 physics", "metric": "Ch2"},
-                {"index": 3, "start_sec": 8.0, "end_sec": 12.0, "title": "Stage Three", "caption": "Chapter 3 physics", "metric": "Ch3"},
-                {"index": 4, "start_sec": 12.0, "end_sec": 16.0, "title": "Stage Four", "caption": "Chapter 4 physics", "metric": "Ch4"},
-            ],
+            "chapters": chapters,
             "interactive_control": {
                 "id": cid,
                 "label": cid,
@@ -4948,7 +5082,7 @@ def _make_mock_bundles(data_dir: Path) -> None:
                 "default_val": cdef,
                 "unit": cunit,
             },
-            "payload": _make_mock_payload(idx),
+            "payload": payload,
         }
         (data_dir / f"{slug}.tour.json").write_text(
             json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8"
@@ -5039,7 +5173,31 @@ def run_self_tests() -> int:
             )
             assert proc_fb.returncode == 0, f"Fallback banner runtime check failed:\n{proc_fb.stdout}\n{proc_fb.stderr}"
 
-        # 9. CLI --check end-to-end verification (including live Node vm 32/32 check inside validate_tour_site)
+        # 9. Adversarial check (B15): caption/payload mismatch on Mod02 cold range or Mod04 tau_m must fail
+        b15_data_dir = root / "b15_mismatch_data"
+        _make_mock_bundles(b15_data_dir)
+        m02_p = b15_data_dir / "02_hsqc_strips_solvers.tour.json"
+        m02_d = json.loads(m02_p.read_text(encoding="utf-8"))
+        # Replicate f8408b9 bug: payload has 86.18-96.31 while captions quote 88.25-95.30
+        m02_d["payload"]["benchmarks"]["cold_bmrb_hc_min_pct"] = 86.18
+        m02_d["payload"]["benchmarks"]["cold_bmrb_hc_max_pct"] = 96.31
+        m02_p.write_text(json.dumps(m02_d, indent=2, sort_keys=True), encoding="utf-8")
+        m04_p = b15_data_dir / "04_relax_modelfree.tour.json"
+        m04_d = json.loads(m04_p.read_text(encoding="utf-8"))
+        # Replicate f8408b9 bug: caption quotes 4.10 ns while payload is 4.0837 ns
+        m04_d["chapters"][2]["caption"] = "Outlier-trimmed R2/R1 global tau_m=4.10 ns & Woessner axial."
+        m04_p.write_text(json.dumps(m04_d, indent=2, sort_keys=True), encoding="utf-8")
+        b15_bundles = load_tour_bundles(b15_data_dir)
+        b15_files = build_tour_site_files(b15_bundles, videos_rel="videos")
+        b15_errs = validate_tour_site(b15_files, b15_bundles, videos_rel="videos")
+        assert any("02_hsqc_strips_solvers.tour.json" in e and "cold range" in e for e in b15_errs), (
+            f"expected B15 Mod02 cold-range mismatch error, got: {b15_errs}"
+        )
+        assert any("04_relax_modelfree.tour.json" in e and "tau_m=4.08 ns" in e for e in b15_errs), (
+            f"expected B15 Mod04 tau_m mismatch error, got: {b15_errs}"
+        )
+
+        # 10. CLI --check end-to-end verification (including live Node vm 32/32 check inside validate_tour_site)
         check_out = root / "out_cli_check"
         rc = main(["--data-dir", str(data_dir), "--out", str(check_out), "--videos-rel", "videos", "--check"])
         assert rc == 0, f"expected --check rc=0, got {rc}"
@@ -5049,8 +5207,8 @@ def run_self_tests() -> int:
 
         digest = site_digest(files_a)[:16]
         print(
-            f"build_interactive_tours.py self-tests passed (9/9 checks: 11 files, "
-            f"zero-CDN, WCAG 1.4.4, 01..08 payload-backed, fallback-banner guard, zero-innerHTML, clean-room, --check CLI, Node vm 32/32; sha256={digest})."
+            f"build_interactive_tours.py self-tests passed (10/10 checks: 11 files, "
+            f"zero-CDN, WCAG 1.4.4, 01..08 payload-backed, fallback-banner guard, zero-innerHTML, clean-room, B15 caption-payload parity, --check CLI, Node vm 32/32; sha256={digest})."
         )
     return 0
 
