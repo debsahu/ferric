@@ -1131,6 +1131,13 @@ fn validate_param_value(
 }
 
 fn validate_node_params(node: &DagNode) -> Result<(), DagError> {
+    if !node.position[0].is_finite() || !node.position[1].is_finite() {
+        return Err(DagError::InvalidParam {
+            node_id: node.id.clone(),
+            key: "position".to_string(),
+            reason: "canvas coordinates must be finite".to_string(),
+        });
+    }
     if node.label.is_empty()
         || node.label.len() > MAX_STRING_PARAM_LEN
         || contains_control_chars(&node.label)
@@ -1802,7 +1809,7 @@ pub fn execute_dag_manifest_dry_run(
     cache: &mut DagArtifactCache,
 ) -> Result<DagExecutionTrace, DagError> {
     execute_dag_manifest(manifest, cache, |node, upstream| {
-        let short_hash = &node.node_sha256[..node.node_sha256.len().min(12)];
+        let short_hash: String = node.node_sha256.chars().take(12).collect();
         Ok(format!(
             "dry-run {} ({}) inputs={} sha256={}",
             node.kind.canonical_id(),

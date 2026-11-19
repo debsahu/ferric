@@ -3,7 +3,7 @@
 //! for `nmr_gui::workflow_dag_panel` (`T22.11`).
 
 use eframe::egui;
-use nmr_core::workflow_dag::{DagEdge, DagError, NodeKind, PortType};
+use nmr_core::workflow_dag::{DagEdge, DagError, NodeKind, PortType, MAX_DAG_NODES};
 use nmr_gui::workbench_mode::{apply_type_scale, audit_text_layout, MIN_FONT_PX};
 use nmr_gui::workflow_dag_panel::{
     port_type_color, DagPresetKind, DagTheme, WorkflowDagAction, WorkflowDagPanel,
@@ -486,4 +486,27 @@ fn test_theme_palette_zero_emojis_and_no_panics_in_production_sources() {
             );
         }
     }
+}
+
+#[test]
+fn test_add_node_enforces_max_dag_nodes_cap_fail_closed() {
+    let mut panel = WorkflowDagPanel::new();
+    panel.load_preset(DagPresetKind::Metabolomics);
+    while panel.dag.nodes.len() < MAX_DAG_NODES {
+        panel
+            .add_node(NodeKind::IngestBrukerVarian)
+            .expect("adding up to MAX_DAG_NODES succeeds");
+    }
+    assert_eq!(panel.dag.nodes.len(), MAX_DAG_NODES);
+
+    let err = panel.add_node(NodeKind::IngestBrukerVarian);
+    assert_eq!(
+        err,
+        Err(DagError::TooManyNodes {
+            count: MAX_DAG_NODES + 1,
+            max: MAX_DAG_NODES,
+        })
+    );
+    assert_eq!(panel.dag.nodes.len(), MAX_DAG_NODES);
+    assert!(panel.last_interaction_error.is_some());
 }

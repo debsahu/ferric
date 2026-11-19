@@ -11,7 +11,7 @@ use nmr_core::workflow_dag::{
     compile_dag_manifest, execute_dag_manifest_dry_run, manifest_to_json,
     preset_backbone_assignment_dag, preset_dynamics_relax_cest_dag, preset_metabolomics_1d_dag,
     validate_candidate_edge, DagArtifactCache, DagEdge, DagError, DagExecutionTrace, DagManifest,
-    DagNode, NodeKind, PortType, WorkflowDag,
+    DagNode, NodeKind, PortType, WorkflowDag, MAX_DAG_NODES,
 };
 
 use crate::workbench_mode::{font_px, MIN_FONT_PX};
@@ -283,6 +283,14 @@ impl WorkflowDagPanel {
 
     /// Add a new typed stage node with a unique ID and non-overlapping canvas coordinates.
     pub fn add_node(&mut self, kind: NodeKind) -> Result<String, DagError> {
+        if self.dag.nodes.len() >= MAX_DAG_NODES {
+            let err = DagError::TooManyNodes {
+                count: self.dag.nodes.len() + 1,
+                max: MAX_DAG_NODES,
+            };
+            self.last_interaction_error = Some(err.to_string());
+            return Err(err);
+        }
         let prefix = kind.id_prefix();
         let mut candidate_id = format!("{prefix}_{}", self.next_node_counter);
         while self.dag.nodes.iter().any(|n| n.id == candidate_id) {
@@ -544,8 +552,7 @@ impl WorkflowDagPanel {
             } else {
                 match &self.compiled_result {
                     Ok(manifest) => {
-                        let short_sha =
-                            &manifest.manifest_sha256[..manifest.manifest_sha256.len().min(12)];
+                        let short_sha: String = manifest.manifest_sha256.chars().take(12).collect();
                         let trace_suffix = match &self.last_trace {
                             Some(t) => format!(
                                 " | Run: {} exec, {} cached",

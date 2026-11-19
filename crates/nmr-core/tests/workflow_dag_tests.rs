@@ -93,6 +93,24 @@ fn test_topological_and_manifest_sha256_determinism_under_permutations() {
             base_manifest.topological_order
         );
     }
+
+    // Verify nested JSON object parameter key-order invariance
+    let mut nested_a = base.clone();
+    let mut nested_b = base.clone();
+    let val_a: serde_json::Value =
+        serde_json::from_str(r#"{"z":1,"a":{"k2":true,"k1":3}}"#).expect("nested JSON A");
+    let val_b: serde_json::Value =
+        serde_json::from_str(r#"{"a":{"k1":3,"k2":true},"z":1}"#).expect("nested JSON B");
+    nested_a.nodes[0]
+        .params
+        .insert("solver_opts".to_string(), val_a);
+    nested_b.nodes[0]
+        .params
+        .insert("solver_opts".to_string(), val_b);
+    let ma = compile_dag_manifest(&nested_a).expect("compile nested_a");
+    let mb = compile_dag_manifest(&nested_b).expect("compile nested_b");
+    assert_eq!(ma.manifest_sha256, mb.manifest_sha256);
+    assert_eq!(ma.nodes[0].node_sha256, mb.nodes[0].node_sha256);
 }
 
 #[test]
@@ -412,6 +430,37 @@ fn test_hostile_bounds_control_chars_and_path_traversal_rejected() {
         validate_dag(&bad_snr),
         Err(DagError::InvalidParam { key, .. }) if key == "snr_threshold"
     ));
+
+    // 7. Non-finite canvas positions (`NaN` / `Infinity`) rejected fail-closed
+    for bad_pos in [
+        [f32::NAN, 10.0],
+        [10.0, f32::INFINITY],
+        [f32::NEG_INFINITY, 0.0],
+    ] {
+        let mut dag = preset_metabolomics_1d_dag();
+        dag.nodes[0].position = bad_pos;
+        assert!(matches!(
+            validate_dag(&dag),
+            Err(DagError::InvalidParam { key, .. }) if key == "position"
+        ));
+    }
+}
+
+#[test]
+fn test_adversarial_multibyte_utf8_manifest_sha_no_panic() {
+    let mut manifest =
+        compile_dag_manifest(&preset_metabolomics_1d_dag()).expect("compile metabolomics preset");
+    // Multi-byte UTF-8 character straddling byte offset 12 (11 ASCII bytes + 2-byte U+00E9)
+    let crafted_sha = "aaaaaaaaaaa\u{00E9}bbbb".to_string();
+    assert!(!crafted_sha.is_char_boundary(12));
+    manifest.manifest_sha256 = crafted_sha.clone();
+    manifest.nodes[0].node_sha256 = crafted_sha;
+
+    let mut cache = DagArtifactCache::new();
+    let trace =
+        execute_dag_manifest_dry_run(&manifest, &mut cache).expect("dry-run must not panic");
+    assert_eq!(trace.executed_count, manifest.nodes.len());
+    assert!(trace.steps[0].summary.contains("aaaaaaaaaaa\u{00E9}"));
 }
 
 #[test]
