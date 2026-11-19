@@ -18068,7 +18068,19 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             }
 
             let ctx_1440 = egui::Context::default();
-            let (_, m1440) = run_app_two_passes(&ctx_1440, 1440.0, 900.0, &mut app);
+            let (out1440, m1440) = run_app_two_passes(&ctx_1440, 1440.0, 900.0, &mut app);
+            let vp1440 = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+            let audit_1440 = audit_text_layout(&out1440.shapes, vp1440);
+            assert!(
+                audit_1440.clipped.is_empty(),
+                "{name} at 1440x900 has clipped text: {:?}",
+                audit_1440.clipped
+            );
+            assert!(
+                audit_1440.overlapping.is_empty(),
+                "{name} at 1440x900 has overlapping text: {:?}",
+                audit_1440.overlapping
+            );
             let sidebar_excl = egui::Rect::from_min_max(
                 egui::pos2(0.0, m1440.top_header_rect.bottom()),
                 egui::pos2(190.0, m1440.status_bar_rect.top()),
@@ -18131,6 +18143,22 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 "{name} at 1280x800 min_font_px {} < {}",
                 audit.min_font_px,
                 MIN_FONT_PX
+            );
+
+            // Also verify `1280x760` (`1280x772` browser canvas under 28 px demo header) has 0 clip/overlap
+            let ctx_1280_760 = egui::Context::default();
+            let (out1280_760, _) = run_app_two_passes(&ctx_1280_760, 1280.0, 760.0, &mut app);
+            let vp1280_760 = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 760.0));
+            let audit_760 = audit_text_layout(&out1280_760.shapes, vp1280_760);
+            assert!(
+                audit_760.clipped.is_empty(),
+                "{name} at 1280x760 has clipped text: {:?}",
+                audit_760.clipped
+            );
+            assert!(
+                audit_760.overlapping.is_empty(),
+                "{name} at 1280x760 has overlapping text: {:?}",
+                audit_760.overlapping
             );
         }
         app.structure_show_pae_view = false;

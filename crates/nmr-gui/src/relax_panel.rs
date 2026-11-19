@@ -866,9 +866,8 @@ impl RelaxPanelState {
             return actions;
         }
 
-        let avail_h = ui.available_height().max(460.0);
-        let decay_h = (avail_h * 0.34).max(175.0);
-        let track_h = ((avail_h - decay_h - 46.0) / 5.0).max(58.0);
+        let avail_h = ui.available_height().max(420.0);
+        let decay_h = (avail_h * 0.28).clamp(148.0, 210.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             // 1. Interactive I(tau) mono-exponential decay plot with fitted curve + MC 1-sigma envelope
@@ -876,6 +875,7 @@ impl RelaxPanelState {
             ui.add_space(4.0);
 
             // 2. Per-residue sequence bar tracks: R1, R2, hetNOE, S^2, R_ex
+            let track_h = ((ui.available_height() - 42.0) / 5.0).clamp(44.0, 74.0);
             self.draw_sequence_tracks_canvas(ui, sequence, seq_ids, track_h, &mut actions);
         });
 
@@ -1043,9 +1043,16 @@ impl RelaxPanelState {
         for gx in 0..=4 {
             let tv = t_max * (gx as f64 / 4.0);
             let px = map_pt(tv, y_min).x;
+            let align = if gx == 0 {
+                egui::Align2::LEFT_CENTER
+            } else if gx == 4 {
+                egui::Align2::RIGHT_CENTER
+            } else {
+                egui::Align2::CENTER_CENTER
+            };
             painter.text(
                 egui::pos2(px, plot.bottom() + 11.0),
-                egui::Align2::CENTER_CENTER,
+                align,
                 format!("{tv:.2}s"),
                 egui::FontId::monospace(11.0),
                 egui::Color32::from_rgb(138, 150, 170),

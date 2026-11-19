@@ -8361,17 +8361,19 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState, pape
                 [egui::pos2(sx, axis_y), egui::pos2(sx, axis_y + 5.0)],
                 egui::Stroke::new(1.2, theme.ruler_stroke),
             );
-            painter.text(
-                egui::pos2(sx, axis_y + 6.0),
-                egui::Align2::CENTER_TOP,
-                if span <= 0.8 {
-                    format!("{p:.3}")
-                } else {
-                    format!("{p:.2}")
-                },
-                egui::FontId::monospace(TYPE_CAPTION_PX),
-                theme.ruler_text,
-            );
+            if sx > plot_rect.left() + 20.0 && sx < plot_rect.right() - 62.0 {
+                painter.text(
+                    egui::pos2(sx, axis_y + 6.0),
+                    egui::Align2::CENTER_TOP,
+                    if span <= 0.8 {
+                        format!("{p:.3}")
+                    } else {
+                        format!("{p:.2}")
+                    },
+                    egui::FontId::monospace(TYPE_CAPTION_PX),
+                    theme.ruler_text,
+                );
+            }
         }
     }
     painter.text(

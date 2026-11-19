@@ -1155,9 +1155,16 @@ impl MetabolomicsStudioPanel {
                         ],
                         egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 128, 158)),
                     );
+                    let align = if t == 0 {
+                        egui::Align2::LEFT_TOP
+                    } else if t == n_ticks {
+                        egui::Align2::RIGHT_TOP
+                    } else {
+                        egui::Align2::CENTER_TOP
+                    };
                     painter.text(
                         egui::pos2(x, plot_rect.bottom() + 4.0),
-                        egui::Align2::CENTER_TOP,
+                        align,
                         format!("{ppm:.1}"),
                         egui::FontId::monospace(11.0),
                         egui::Color32::from_rgb(165, 182, 208),
