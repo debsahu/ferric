@@ -1321,16 +1321,12 @@ fn test_fidnet_abstention_uncertainty_truncated_fid_and_denoising_gate() {
     let mut unstable_model =
         FidNetModel::init_random(FidNetConfig::nus_default(6, 6), 909).expect("init unstable");
     for blk in &mut unstable_model.weights.blocks {
-        for b in &mut blk.skip_b {
-            *b = 0.5;
-        }
+        blk.skip_b.fill(0.5);
         for w in &mut blk.skip_w {
             *w *= 8.0;
         }
     }
-    for b in &mut unstable_model.weights.head1_b {
-        *b = 0.5;
-    }
+    unstable_model.weights.head1_b.fill(0.5);
     for w in &mut unstable_model.weights.out_w {
         *w *= 80.0;
     }

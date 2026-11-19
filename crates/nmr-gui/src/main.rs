@@ -129,6 +129,11 @@ use nmr_gui::ingest_panel::{
 #[cfg(target_arch = "wasm32")]
 use nmr_gui::session_io::{default_session_nef_filename, trigger_browser_nef_download};
 use nmr_gui::{
+    about_references_modal::AboutReferencesModal,
+    assign_setup_drawer::{
+        AssignProteinRegime, AssignSetupAction, AssignSetupDrawerState, AssignSetupInput,
+        AssignSolverEngine, AssignTriageSummary,
+    },
     command_palette::CommandPalette,
     contour_painter::{
         apply_pinch_zoom_and_pan_2d, clamp_view_ppm_2d, default_overlay_palette,
@@ -162,10 +167,14 @@ use nmr_gui::{
         Stack1dState, Stack1dUndoSnapshot, Stack1dViewMode, ToolMode1d, Trace1d,
     },
     strip_tiler::{
-        compute_nice_strip_ticks, strip_vertical_axis_metadata, StripSpectra3D, StripTilerAction,
-        StripTilerContext, StripTilerPanel,
+        compute_nice_strip_ticks, strip_vertical_axis_metadata, StripSpectra3D, StripSpectra3DFull,
+        StripTilerAction, StripTilerContext, StripTilerPanel,
     },
     undo_journal::{KeyedSnapshotStack, SpectrumKey, UndoJournal, UndoOrigin},
+    vnmrj_rail::{
+        render_2d_vnmrj_rail, InstantAction2D, MouseMode2D, RailAction2D, VnmrJRail2DConfig,
+        RAIL_WIDTH_PX,
+    },
     workbench_mode::{
         draw_mode_switcher_with_rect, draw_sub_view_selector, DynamicsView, SmallMoleculeView,
         WorkbenchMode,
@@ -1811,6 +1820,10 @@ struct NmrWorkbenchApp {
     show_integrative_af_window: bool,
     workflow_dag_panel: WorkflowDagPanel,
     show_workflow_dag_window: bool,
+    assign_setup_drawer: AssignSetupDrawerState,
+    about_references_modal: AboutReferencesModal,
+    octet_exp_sync_key: (usize, usize),
+    relax_peaks_sync_key: (usize, usize),
     mcp_last_viewport_key: (u64, i32, i32, i32),
     assign_target_res: usize,
     assign_lock_check: bool,
@@ -2353,6 +2366,10 @@ impl NmrWorkbenchApp {
             show_integrative_af_window: false,
             workflow_dag_panel: WorkflowDagPanel::new(),
             show_workflow_dag_window: false,
+            assign_setup_drawer: AssignSetupDrawerState::new(),
+            about_references_modal: AboutReferencesModal::new(),
+            octet_exp_sync_key: (0, usize::MAX),
+            relax_peaks_sync_key: (0, 0),
             mcp_last_viewport_key: (0, 0, 0, -1),
             assign_target_res: 0,
             assign_lock_check: true,
@@ -7588,6 +7605,10 @@ impl NmrWorkbenchApp {
                             ui.close();
                             self.show_text_io_modal = true;
                         }
+                        if ui.button("Assignment Setup Drawer...").clicked() {
+                            ui.close();
+                            self.assign_setup_drawer.open = true;
+                        }
                         if ui.button("Workflow DAG Composer...").clicked() {
                             ui.close();
                             self.show_workflow_dag_window = true;
@@ -7667,6 +7688,13 @@ impl NmrWorkbenchApp {
                 let tools_resp = ui.menu_button(egui::RichText::new("Tools").size(12.0), |ui| {
                     ui.set_min_width(210.0);
                     if ui
+                        .button(egui::RichText::new("Assignment Setup...").size(12.0))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.assign_setup_drawer.open = !self.assign_setup_drawer.open;
+                    }
+                    if ui
                         .button(egui::RichText::new("Workflow DAG Composer").size(12.0))
                         .clicked()
                     {
@@ -7687,6 +7715,14 @@ impl NmrWorkbenchApp {
                     {
                         ui.close();
                         self.show_text_io_modal = true;
+                    }
+                    ui.separator();
+                    if ui
+                        .button(egui::RichText::new("About & Scientific References...").size(12.0))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.about_references_modal.open_modal();
                     }
                 });
                 self.last_global_chrome_rects.push(tools_resp.response.rect);
@@ -8325,8 +8361,77 @@ impl NmrWorkbenchApp {
         );
         let (outer_rect, _) = ui.allocate_exact_size(outer_size, egui::Sense::hover());
 
-        // Full-width stage (`UI-B2`: 12-icon left vertical tool rail removed; tools live in chords & context menu)
-        let stage_rect = outer_rect;
+        // Color-coded VnmrJ-style left vertical mouse-mode icon rail (`v0.17.1`)
+        let show_vnmrj_rail = !is_compact_mobile && outer_rect.width() >= 340.0;
+        let stage_rect = if show_vnmrj_rail {
+            let rail_gutter = RAIL_WIDTH_PX + 4.0;
+            let rail_host = egui::Rect::from_min_max(
+                outer_rect.min,
+                egui::pos2(outer_rect.left() + RAIL_WIDTH_PX, outer_rect.bottom()),
+            );
+            let mut active_mouse_mode = match self.workbook.two_d.tool_mode {
+                ToolMode2d::ZoomBox => MouseMode2D::ZoomBox,
+                ToolMode2d::Pan => MouseMode2D::Pan,
+                ToolMode2d::CrosshairSlice => MouseMode2D::CrosshairMeasure,
+                ToolMode2d::PickPeaks => MouseMode2D::PickPeak,
+            };
+            let rail_out = ui
+                .scope_builder(egui::UiBuilder::new().max_rect(rail_host), |ui| {
+                    render_2d_vnmrj_rail(
+                        ui,
+                        &mut active_mouse_mode,
+                        VnmrJRail2DConfig {
+                            paper_white: self.paper_white_canvas,
+                            enabled: true,
+                            water_suppressed: false,
+                        },
+                    )
+                })
+                .inner;
+            if let Some(act) = rail_out.action {
+                match act {
+                    RailAction2D::SetMode(m) => {
+                        self.workbook.two_d.tool_mode = match m {
+                            MouseMode2D::ZoomBox => ToolMode2d::ZoomBox,
+                            MouseMode2D::Pan => ToolMode2d::Pan,
+                            MouseMode2D::CrosshairMeasure => ToolMode2d::CrosshairSlice,
+                            MouseMode2D::PickPeak | MouseMode2D::EditDeletePeak => {
+                                ToolMode2d::PickPeaks
+                            }
+                        };
+                        self.box_zoom_2d_mode = m == MouseMode2D::ZoomBox;
+                        self.status_msg = format!("2D mouse mode: {}", m.label());
+                    }
+                    RailAction2D::Instant(inst) => match inst {
+                        InstantAction2D::ContourUp => {
+                            self.contour_base =
+                                contour_floor_after(self.contour_base, SignalDirection::More);
+                            self.status_msg =
+                                format!("Contour floor lowered ({:.2})", self.contour_base);
+                        }
+                        InstantAction2D::ContourDown => {
+                            self.contour_base =
+                                contour_floor_after(self.contour_base, SignalDirection::Less);
+                            self.status_msg =
+                                format!("Contour floor raised ({:.2})", self.contour_base);
+                        }
+                        InstantAction2D::WaterSuppress => {
+                            self.suppress_water_active_spectrum();
+                        }
+                        InstantAction2D::FullView => {
+                            self.reset_view_to_spec();
+                            self.status_msg = "2D view reset to full bounds".to_string();
+                        }
+                    },
+                }
+            }
+            egui::Rect::from_min_max(
+                egui::pos2(outer_rect.left() + rail_gutter, outer_rect.top()),
+                outer_rect.max,
+            )
+        } else {
+            outer_rect
+        };
 
         // 2. Partition `stage_rect` into aligned Top F2 (`64 px`), Left F1 (`64 px`), Plot, and Rulers
         let show_proj = !is_compact_mobile
@@ -11135,6 +11240,19 @@ impl NmrWorkbenchApp {
                 let locks_snapshot = self.session.state.locked_residues.clone();
                 let links_snapshot = self.session.state.confirmed_links.clone();
                 let strip_actions = {
+                    let hncaco_3d = self.cubes_3d.iter().find(|c| {
+                        let e = c.exp.to_ascii_uppercase();
+                        let n = c.name.to_ascii_uppercase();
+                        e.contains("HN(CA)CO")
+                            || e.contains("HNCACO")
+                            || n.contains("HN(CA)CO")
+                            || n.contains("HNCACO")
+                    });
+                    let spectra_full = StripSpectra3DFull {
+                        aliphatic_3d: self.hncacb_3d.as_ref(),
+                        carbonyl_3d: self.hnco_3d.as_ref(),
+                        carbonyl_intra_3d: hncaco_3d.map(|v| &**v),
+                    };
                     let tiler_ctx = StripTilerContext {
                         systems: &self.systems,
                         pair_mat: &p_mat,
@@ -11150,8 +11268,12 @@ impl NmrWorkbenchApp {
                             carbonyl_3d: self.hnco_3d.as_ref(),
                         },
                     };
-                    self.strip_tiler
-                        .show(ui, &tiler_ctx, Some(&mut self.crosshair))
+                    self.strip_tiler.show_full(
+                        ui,
+                        &tiler_ctx,
+                        spectra_full,
+                        Some(&mut self.crosshair),
+                    )
                 };
                 for act in strip_actions {
                     self.handle_strip_tiler_action(act);
@@ -14904,6 +15026,7 @@ impl eframe::App for NmrWorkbenchApp {
         self.draw_phase9_modals(&ctx);
         self.draw_mcp_bridge_window(&ctx);
         self.draw_workflow_dag_window(&ctx);
+        self.draw_v0171_windows_and_bridges(&ctx);
         self.draw_integrative_af_window(&ctx);
 
         // 5. Responsive Workbench Shell (`CompactMobile < 680`, `TabletSplit 680..1024`, `DesktopFull >= 1024`)
@@ -16058,6 +16181,393 @@ impl NmrWorkbenchApp {
             }
         }
         saw_specific
+    }
+
+    fn draw_v0171_windows_and_bridges(&mut self, ctx: &egui::Context) {
+        // 1. In-app About & Verified Scientific References modal
+        self.about_references_modal.show(ctx);
+
+        // 2. 3-Step Assignment Setup Drawer
+        if self.assign_setup_drawer.open {
+            let mut exp_counts = [(false, 0usize); 7];
+            let canonical_names = [
+                "HSQC",
+                "HNCACB",
+                "CBCA(CO)NH",
+                "HNCA",
+                "HN(CO)CA",
+                "HNCO",
+                "HN(CA)CO",
+            ];
+            let count_peaks = |name: &str| -> usize {
+                self.peaks
+                    .iter()
+                    .filter(|p| p.exp.eq_ignore_ascii_case(name))
+                    .count()
+            };
+            let has_cube = |name: &str| -> bool {
+                self.cubes_3d
+                    .iter()
+                    .any(|c| c.exp.eq_ignore_ascii_case(name) || c.name.eq_ignore_ascii_case(name))
+            };
+            for (idx, name) in canonical_names.iter().enumerate() {
+                let pc = count_peaks(name);
+                let loaded = pc > 0
+                    || (*name == "HSQC" && self.hsqc_spec.is_some())
+                    || (*name == "HNCACB" && self.hncacb_3d.is_some())
+                    || (*name == "HNCO" && self.hnco_3d.is_some())
+                    || has_cube(name);
+                exp_counts[idx] = (loaded, pc);
+            }
+            let mut triage = AssignTriageSummary::default();
+            if let Some(ref res) = self.assign_res {
+                let n_res = self.sequence.len();
+                let mut assigned_conf: Vec<Option<f64>> = vec![None; n_res];
+                for (ss_idx, &pos_i32) in res.position.iter().enumerate() {
+                    if pos_i32 >= 0 {
+                        let r = pos_i32 as usize;
+                        if r < n_res {
+                            let c = res.confidence.get(ss_idx).copied().unwrap_or(0.0);
+                            assigned_conf[r] = Some(c);
+                        }
+                    }
+                }
+                for (r, conf_opt) in assigned_conf.iter().copied().enumerate() {
+                    if self.session.state.locked_residues.contains_key(&r) {
+                        triage.locked_residues.push(r);
+                    }
+                    match conf_opt {
+                        Some(c) if c >= 0.80 => triage.high_conf_residues.push(r),
+                        Some(_) => triage.ambiguous_residues.push(r),
+                        None => triage.unassigned_residues.push(r),
+                    }
+                }
+                triage.residue_labels = self
+                    .sequence
+                    .iter()
+                    .enumerate()
+                    .map(|(i, aa)| {
+                        let id = self.seq_ids.get(i).copied().unwrap_or((i + 1) as i32);
+                        format!("{aa}{id}")
+                    })
+                    .collect();
+            }
+            let seq_preview: String = self
+                .sequence
+                .iter()
+                .take(48)
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("-");
+            let input = AssignSetupInput {
+                sequence_len: self.sequence.len(),
+                sequence_preview: seq_preview,
+                experiments: AssignSetupInput::canonical_checklist(exp_counts),
+                has_af_structure: self.integrative_af_panel.af_model.is_some(),
+                solver_running: false,
+                triage,
+                last_status: self.status_msg.clone(),
+            };
+            let drawer_actions = self.assign_setup_drawer.show_window(ctx, &input);
+            for act in drawer_actions {
+                match act {
+                    AssignSetupAction::LoadSequenceFile => {
+                        self.show_text_io_modal = true;
+                        self.status_msg =
+                            "Open Paste NMR-STAR / FASTA modal to load sequence".to_string();
+                    }
+                    AssignSetupAction::ApplySequenceText(seq_str) => {
+                        let res_names: Vec<String> = seq_str
+                            .chars()
+                            .map(|c| {
+                                match c.to_ascii_uppercase() {
+                                    'A' => "ALA",
+                                    'R' => "ARG",
+                                    'N' => "ASN",
+                                    'D' => "ASP",
+                                    'C' => "CYS",
+                                    'Q' => "GLN",
+                                    'E' => "GLU",
+                                    'G' => "GLY",
+                                    'H' => "HIS",
+                                    'I' => "ILE",
+                                    'L' => "LEU",
+                                    'K' => "LYS",
+                                    'M' => "MET",
+                                    'F' => "PHE",
+                                    'P' => "PRO",
+                                    'S' => "SER",
+                                    'T' => "THR",
+                                    'W' => "TRP",
+                                    'Y' => "TYR",
+                                    'V' => "VAL",
+                                    _ => "ALA",
+                                }
+                                .to_string()
+                            })
+                            .collect();
+                        self.seq_ids = (1..=res_names.len() as i32).collect();
+                        self.sequence = res_names;
+                        self.octet_app
+                            .set_loaded_protein_sequence(self.sequence.clone());
+                        self.status_msg =
+                            format!("Applied sequence ({} residues)", self.sequence.len());
+                    }
+                    AssignSetupAction::PickAllSpectra { snr_threshold } => {
+                        self.picker_snr = snr_threshold as f32;
+                        self.pick_2d_roots();
+                        let n_cubes = self.cubes_3d.len();
+                        self.status_msg = format!(
+                            "Picked 2D roots & refreshed {n_cubes} 3D cube(s) (SNR {snr_threshold:.1})"
+                        );
+                    }
+                    AssignSetupAction::RunAssignment {
+                        engine,
+                        regime,
+                        use_af_priors: _,
+                    } => {
+                        self.solver_kind = match engine {
+                            AssignSolverEngine::EvoGraph => GuiSolverKind::EvoGraph,
+                            AssignSolverEngine::StandardSa => GuiSolverKind::Standard,
+                            AssignSolverEngine::BayesSa => GuiSolverKind::BayesSa,
+                        };
+                        self.regime_kind = match regime {
+                            AssignProteinRegime::Globular => GuiRegimeKind::Globular,
+                            AssignProteinRegime::Idp13C => GuiRegimeKind::Idp13C,
+                            AssignProteinRegime::Paramagnetic => GuiRegimeKind::Paramagnetic,
+                        };
+                        self.run_assignment();
+                    }
+                    AssignSetupAction::JumpToResidue(res_idx) => {
+                        self.show_strips_dock = true;
+                        self.select_residue_and_sync_strip(res_idx);
+                    }
+                }
+            }
+        }
+
+        // 3. Octet -> 1D Suite bridge (`Send to 1D Suite`)
+        if let Some(scene_spec) = self.octet_app.pending_send_to_1d.take() {
+            let n_pts = 2048usize;
+            let lo = scene_spec.ppm_min.min(scene_spec.ppm_max);
+            let hi = scene_spec.ppm_min.max(scene_spec.ppm_max);
+            let span = (hi - lo).max(1.0);
+            let mut intensities = vec![0.0f64; n_pts];
+            let is_c13 = scene_spec.nucleus.eq_ignore_ascii_case("13C");
+            let fwhm_ppm = (scene_spec.linewidth_hz / scene_spec.spectrometer_mhz.max(100.0))
+                .max(if is_c13 { 0.08 } else { 0.012 });
+            let gamma = fwhm_ppm * 0.5;
+            for (i, slot) in intensities.iter_mut().enumerate() {
+                let t = (i as f64) / ((n_pts - 1) as f64);
+                let x = hi - t * span;
+                let mut y = 0.0f64;
+                for sig in &scene_spec.signals {
+                    let dx = x - sig.ppm;
+                    y += sig.integral / (1.0 + (dx / gamma).powi(2));
+                }
+                *slot = y;
+            }
+            let label = scene_spec
+                .title
+                .unwrap_or_else(|| format!("Predicted {} NMR", scene_spec.nucleus));
+            let axis = nmr_core::spectrum::AxisPpm::from_bounds(
+                &scene_spec.nucleus,
+                n_pts,
+                hi,
+                lo,
+                scene_spec.spectrometer_mhz,
+            );
+            let kind = if is_c13 {
+                nmr_core::nmr1d::Experiment1DKind::Carbon13Decoupled
+            } else {
+                nmr_core::nmr1d::Experiment1DKind::Proton1D
+            };
+            let spec =
+                nmr_core::nmr1d::Spectrum1D::new(label.clone(), kind, axis, intensities, None);
+            self.prepare_workbook_for_user_append();
+            self.stack1d_panel.load_user_spectra(vec![spec]);
+            self.activate_1d_studio_mode();
+            self.set_workbench_mode(WorkbenchMode::Process);
+            self.status_msg = format!("Sent '{label}' to 1D Suite");
+        }
+
+        // 4. Open 1D Spectra -> Octet experimental_spectra sync
+        let exp_key = (
+            self.stack1d_panel.traces.len(),
+            self.stack1d_panel.ref_trace_idx,
+        );
+        if exp_key != self.octet_exp_sync_key {
+            self.octet_exp_sync_key = exp_key;
+            self.octet_app.experimental_spectra = self
+                .stack1d_panel
+                .traces
+                .iter()
+                .map(|tr| {
+                    let nuc = trace_1d_nucleus(tr).to_string();
+                    let ppms = tr.raw_ppm();
+                    let vals = tr.intensities();
+                    let (p_min, p_max) = ppms
+                        .iter()
+                        .copied()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), x| {
+                            (a.min(x), b.max(x))
+                        });
+                    let max_y = vals
+                        .iter()
+                        .copied()
+                        .map(f64::abs)
+                        .fold(0.0f64, f64::max)
+                        .max(1e-12);
+                    let stride = (ppms.len() / 1024).max(1);
+                    let custom_trace: Vec<[f64; 2]> = ppms
+                        .iter()
+                        .zip(vals.iter())
+                        .step_by(stride)
+                        .map(|(&x, &y)| [x, (y / max_y).clamp(-0.2, 1.0)])
+                        .collect();
+                    SceneSpectrum1D {
+                        origin: [0.0, 0.0],
+                        width_mol: 10.0,
+                        height_mol: 3.0,
+                        nucleus: nuc,
+                        spectrometer_mhz: 600.0,
+                        ppm_min: if p_min.is_finite() { p_min } else { -0.5 },
+                        ppm_max: if p_max.is_finite() { p_max } else { 12.0 },
+                        linewidth_hz: 1.5,
+                        show_integrals: false,
+                        show_peak_labels: false,
+                        title: Some(tr.label.clone()),
+                        signals: Vec::new(),
+                        custom_trace,
+                    }
+                })
+                .collect();
+        }
+
+        // 5. 1D Suite `Predict 1H / 13C` quick request bridge
+        if let Some((smiles, is_13c)) = self.stack1d_panel.pending_predict_1d_request.take() {
+            let trimmed = smiles.trim();
+            if !trimmed.is_empty() {
+                if let Ok(mut mol) = parse_smiles(trimmed) {
+                    clean_2d(&mut mol);
+                    let sc = CoreOctetBackendAdapter::mol_with_cip_to_scene(mol);
+                    self.octet_app.set_scene(sc);
+                }
+            }
+            self.octet_app.nmr_tab = if is_13c {
+                octet_canvas::NmrViewTab::Carbon13C
+            } else {
+                octet_canvas::NmrViewTab::Proton1H
+            };
+            self.octet_app.recompute_live_analytics();
+            let scene_spec = self.octet_app.build_active_scene_spectrum_1d();
+            let n_pts = 1024usize;
+            let lo = scene_spec.ppm_min.min(scene_spec.ppm_max);
+            let hi = scene_spec.ppm_min.max(scene_spec.ppm_max);
+            let span = (hi - lo).max(1.0);
+            let gamma = if is_13c { 0.15 } else { 0.018 };
+            let mut data = vec![0.0f64; n_pts];
+            for (i, slot) in data.iter_mut().enumerate() {
+                let t = (i as f64) / ((n_pts - 1) as f64);
+                let x = hi - t * span;
+                let mut y = 0.0f64;
+                for sig in &scene_spec.signals {
+                    let dx = x - sig.ppm;
+                    y += sig.integral / (1.0 + (dx / gamma).powi(2));
+                }
+                *slot = y;
+            }
+            let nuc = if is_13c { "13C" } else { "1H" };
+            let kind = if is_13c {
+                nmr_core::nmr1d::Experiment1DKind::Carbon13Decoupled
+            } else {
+                nmr_core::nmr1d::Experiment1DKind::Proton1D
+            };
+            let axis = nmr_core::spectrum::AxisPpm::from_bounds(
+                nuc,
+                n_pts,
+                hi,
+                lo,
+                scene_spec.spectrometer_mhz,
+            );
+            let spec1d = nmr_core::nmr1d::Spectrum1D::new(
+                format!("Predicted {nuc}"),
+                kind,
+                axis,
+                data,
+                None,
+            );
+            self.stack1d_panel
+                .set_predicted_overlay(spec1d, format!("Predicted {nuc}"));
+            self.status_msg = format!("Predicted {nuc} overlay updated in 1D Suite");
+        }
+
+        // 6. Metabolomics -> Octet SMILES bridge
+        if let Some(smiles) = self.metabolomics_panel.pending_send_smiles_to_octet.take() {
+            match parse_smiles(&smiles) {
+                Ok(mut mol) => {
+                    clean_2d(&mut mol);
+                    let sc = CoreOctetBackendAdapter::mol_with_cip_to_scene(mol);
+                    self.octet_app.set_scene(sc);
+                    self.small_molecule_view = SmallMoleculeView::Sketcher;
+                    self.set_workbench_mode(WorkbenchMode::SmallMolecule);
+                    self.status_msg = format!("Loaded metabolite ({smiles}) into Octet Sketcher");
+                }
+                Err(e) => {
+                    self.status_msg = format!("Could not parse metabolite SMILES '{smiles}': {e}");
+                }
+            }
+        }
+
+        // 7. Assign -> Dynamics (`Relax`) assigned HSQC peak sync
+        let relax_key = (self.peaks.len(), self.sequence.len());
+        if self.workbench_mode == WorkbenchMode::Dynamics && relax_key != self.relax_peaks_sync_key
+        {
+            self.relax_peaks_sync_key = relax_key;
+            let seq_str: String = self
+                .sequence
+                .iter()
+                .map(|s| match s.to_ascii_uppercase().as_str() {
+                    "ALA" | "A" => 'A',
+                    "ARG" | "R" => 'R',
+                    "ASN" | "N" => 'N',
+                    "ASP" | "D" => 'D',
+                    "CYS" | "C" => 'C',
+                    "GLN" | "Q" => 'Q',
+                    "GLU" | "E" => 'E',
+                    "GLY" | "G" => 'G',
+                    "HIS" | "H" => 'H',
+                    "ILE" | "I" => 'I',
+                    "LEU" | "L" => 'L',
+                    "LYS" | "K" => 'K',
+                    "MET" | "M" => 'M',
+                    "PHE" | "F" => 'F',
+                    "PRO" | "P" => 'P',
+                    "SER" | "S" => 'S',
+                    "THR" | "T" => 'T',
+                    "TRP" | "W" => 'W',
+                    "TYR" | "Y" => 'Y',
+                    "VAL" | "V" => 'V',
+                    _ => 'X',
+                })
+                .collect();
+            let hsqc_peaks_2d: Vec<nmr_gui::relax_panel::Peak2D> = self
+                .peaks
+                .iter()
+                .filter(|p| p.exp.eq_ignore_ascii_case("HSQC"))
+                .enumerate()
+                .map(|(idx, p)| {
+                    nmr_gui::relax_panel::Peak2D::from_core_peak(
+                        p,
+                        Some((idx + 1) as i32),
+                        self.sequence.get(idx).map(|s| s.as_str()),
+                    )
+                })
+                .collect();
+            let _ = self
+                .relax_panel
+                .sync_assigned_hsqc_peaks(&hsqc_peaks_2d, &seq_str);
+        }
     }
 
     fn draw_workflow_dag_window(&mut self, ctx: &egui::Context) {
@@ -17424,6 +17934,10 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             show_integrative_af_window: false,
             workflow_dag_panel: WorkflowDagPanel::new(),
             show_workflow_dag_window: false,
+            assign_setup_drawer: AssignSetupDrawerState::new(),
+            about_references_modal: AboutReferencesModal::new(),
+            octet_exp_sync_key: (0, usize::MAX),
+            relax_peaks_sync_key: (0, 0),
             mcp_last_viewport_key: (0, 0, 0, -1),
             assign_target_res: 0,
             assign_lock_check: true,

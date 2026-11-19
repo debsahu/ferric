@@ -8,8 +8,8 @@
 //! structure viewport, workflow navigation, fuzzy command-palette search, and keyboard
 //! accelerators for native desktop and `wasm32-unknown-unknown` targets.
 
-pub mod assign_setup_drawer;
 pub mod about_references_modal;
+pub mod assign_setup_drawer;
 pub mod brand_icon;
 pub mod command_palette;
 pub mod contour_painter;
