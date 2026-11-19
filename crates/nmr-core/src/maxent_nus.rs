@@ -25,6 +25,18 @@
 //!   Hypercomplex `States`, `States-TPPI`, and `Echo-Antiecho` indirect quadrature encoding.
 //! - Hyberts, S. G., Takeuchi, K. & Wagner, G. (*J. Am. Chem. Soc.* **2010**, 132, 2145–2147) —
 //!   Sinusoidally weighted Poisson-gap non-uniform sampling schedules.
+//!
+//! ## Scientific Scope & Nonlinearity Disclosure
+//! Maximum-entropy (`MaxEnt`) reconstruction is a **nonlinear, entropy-regularized complement** to
+//! linear / sparsity-based NUS reconstruction (such as `nmr_core::process::reconstruct_nus_2d_hypercomplex_ist`,
+//! which preserves near-linear peak heights and achieves lower linear ground-truth NRMSE on
+//! synthetic benchmarks). The Hoch–Hore spin-$1/2$ entropy penalty compresses low-SNR peak
+//! amplitudes more strongly than high-SNR peaks (a nonlinear response depending on `def` and
+//! `lambda`), and zero-filled frequency-domain MaxEnt (`zero_fill_factor > 1`) extrapolates the
+//! time-domain FID beyond the acquired `n` grid, altering linewidths and peak heights relative to a
+//! truncated zero-filled Fourier transform. Quantitative amplitude analyses (relaxation, NOE,
+//! titration volumes) should either use linear/IST reconstruction or apply synthetic-signal /
+//! standard-curve nonlinearity calibration (Hoch & Stern 1996).
 
 use std::f64::consts::PI;
 
@@ -46,6 +58,21 @@ pub const MAX_MAXENT_POINTS: usize = 1 << 20;
 /// (`2^24 = 16,777,216`).
 pub const MAX_MAXENT_3D_TOTAL_POINTS: usize = 1 << 24;
 
+/// Maximum total 3D frequency-domain voxels (`nx * f2 * f1`) permitted in [`reconstruct_maxent_3d`]
+/// (`2^24 = 16,777,216` hypercomplex voxels, bounding the reconstructed 3D output volume).
+pub const MAX_MAXENT_3D_TOTAL_VOXELS: usize = 1 << 24;
+
+/// Maximum solver workspace memory budget in bytes (`256 MiB`), enforced per solve (1D/2D) and
+/// across concurrent worker threads in [`reconstruct_maxent_3d`] before any allocation.
+pub const MAX_MAXENT_WORKSPACE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Hard upper bound on inner FISTA iterations per `lambda` solve (`10,000`) to prevent
+/// unbounded CPU work from hostile configurations.
+pub const MAX_MAXENT_ITERATIONS: usize = 10_000;
+
+/// Hard upper bound on outer Morozov discrepancy-principle search iterations (`64`).
+pub const MAX_MAXENT_OUTER_ITERATIONS: usize = 64;
+
 /// Maximum frequency-domain magnitude permitted in overflow-guarded `sinh` dual-to-primal mapping
 /// (`1e150`, leaving headroom so squared norms never overflow `f64::MAX`).
 const MAX_SAFE_DUAL_PRIMAL_MAG: f64 = 1e150;
@@ -60,7 +87,7 @@ const MAX_PROX_NEWTON_ITERS: usize = 24;
 const MIN_ADAPTIVE_L: f64 = 0.05;
 
 /// Standard scientific disclosure attached to every MaxEnt reconstruction result.
-pub const MAXENT_LINEARITY_DISCLOSURE: &str = "MaxEnt nonlinearity disclosure (Hoch & Stern 1996; Worley 2016): the Hoch-Hore spin-1/2 entropy penalty introduces a nonlinear amplitude response that compresses low-SNR peaks more strongly than high-SNR peaks as a function of `def` and `lambda`. Use reconstructed intensities qualitatively or apply synthetic-signal calibration / standard-curve correction before quantitative relaxation, NOE, or titration volume analysis.";
+pub const MAXENT_LINEARITY_DISCLOSURE: &str = "MaxEnt nonlinearity & extrapolation disclosure (Hoch & Stern 1996; Worley 2016): MaxEnt is a nonlinear, entropy-regularized complement to linear/sparsity NUS reconstruction (such as IST/FISTA, which achieves lower linear ground-truth NRMSE and near-linear peak heights). The Hoch-Hore spin-1/2 entropy penalty compresses low-SNR peaks more strongly than high-SNR peaks as a function of `def` and `lambda` (e.g. ~33% weak/strong ratio compression at 10:1 dynamic range), and zero-filled frequency-domain reconstruction (`zero_fill_factor > 1`) extrapolates the FID beyond the acquired window, altering linewidths and peak heights relative to a truncated zero-filled FT. Use reconstructed intensities qualitatively or apply synthetic-signal / standard-curve calibration before quantitative relaxation, NOE, or titration volume analysis.";
 
 // ============================================================================
 // Public Configuration & Result Types
@@ -162,6 +189,11 @@ impl MaxEntConfig {
             noise_sigma: Some(noise_sigma),
             ..Self::default()
         }
+    }
+
+    /// Validate all numerical parameters and hard iteration caps (fail-closed).
+    pub fn validate(&self) -> Result<(), String> {
+        validate_config(self)
     }
 }
 
@@ -534,8 +566,11 @@ fn validate_positive_squarable(val: f64, name: &str) -> Result<(), String> {
 
 fn validate_config(cfg: &MaxEntConfig) -> Result<(), String> {
     validate_positive_squarable(cfg.def, "cfg.def")?;
-    if cfg.max_iterations == 0 {
-        return Err("cfg.max_iterations must be >= 1".to_string());
+    if cfg.max_iterations == 0 || cfg.max_iterations > MAX_MAXENT_ITERATIONS {
+        return Err(format!(
+            "cfg.max_iterations ({}) must be in 1..={MAX_MAXENT_ITERATIONS}",
+            cfg.max_iterations
+        ));
     }
     validate_positive_finite(cfg.kkt_tol, "cfg.kkt_tol")?;
     if cfg.zero_fill_factor == 0 {
@@ -557,12 +592,90 @@ fn validate_config(cfg: &MaxEntConfig) -> Result<(), String> {
             validate_positive_squarable(noise_sigma, "cfg.lambda_mode.noise_sigma")?;
             validate_positive_finite(target_chi2_nu, "cfg.lambda_mode.target_chi2_nu")?;
             validate_positive_finite(chi2_tol, "cfg.lambda_mode.chi2_tol")?;
-            if max_outer_iterations == 0 {
-                return Err("cfg.lambda_mode.max_outer_iterations must be >= 1".to_string());
+            if max_outer_iterations == 0 || max_outer_iterations > MAX_MAXENT_OUTER_ITERATIONS {
+                return Err(format!(
+                    "cfg.lambda_mode.max_outer_iterations ({max_outer_iterations}) must be in 1..={MAX_MAXENT_OUTER_ITERATIONS}"
+                ));
             }
         }
     }
     Ok(())
+}
+
+/// Compute exact peak workspace + output allocation bytes for a 1D MaxEnt solve using
+/// overflow-checked arithmetic.
+pub fn maxent_1d_workspace_bytes(n1: usize, n_fft: usize) -> Result<usize, String> {
+    let c_sz = std::mem::size_of::<Complex64>();
+    let b_sz = std::mem::size_of::<bool>();
+    // Solve1DWorkspace: 7 Vec<Complex64> of len n_fft + 4 Vec<Complex64> of len n1 + 1 Vec<bool> of len n1
+    // Plus exported fid Vec<Complex64> of len n1 (spectrum moves ws.f_cur).
+    let fft_bytes = n_fft
+        .checked_mul(7)
+        .and_then(|v| v.checked_mul(c_sz))
+        .ok_or_else(|| "1D MaxEnt workspace byte size overflow".to_string())?;
+    let td_bytes = n1
+        .checked_mul(5)
+        .and_then(|v| v.checked_mul(c_sz))
+        .ok_or_else(|| "1D MaxEnt time-domain workspace byte size overflow".to_string())?;
+    let mask_bytes = n1
+        .checked_mul(b_sz)
+        .ok_or_else(|| "1D MaxEnt mask byte size overflow".to_string())?;
+    fft_bytes
+        .checked_add(td_bytes)
+        .and_then(|v| v.checked_add(mask_bytes))
+        .ok_or_else(|| "1D MaxEnt total workspace byte size overflow".to_string())
+}
+
+/// Compute exact peak per-thread workspace + per-plane export bytes for a 2D hypercomplex
+/// MaxEnt solve using overflow-checked arithmetic.
+pub fn maxent_2d_workspace_bytes(
+    n2: usize,
+    n1: usize,
+    f2: usize,
+    f1: usize,
+) -> Result<usize, String> {
+    let c_sz = std::mem::size_of::<Complex64>();
+    let q_sz = std::mem::size_of::<[f64; 4]>();
+    let b_sz = std::mem::size_of::<bool>();
+    let total = n2
+        .checked_mul(n1)
+        .ok_or_else(|| "2D MaxEnt time-domain grid size overflow".to_string())?;
+    let n_vox = f2
+        .checked_mul(f1)
+        .ok_or_else(|| "2D MaxEnt FFT grid size overflow".to_string())?;
+    // Solve2DWorkspace:
+    // - 14 Vec<Complex64> of len n_vox (work_p/m, fp/fm cur/next, wp/wm, gcp/gcm cur/next/w)
+    // - 8 Vec<Complex64> of len total (dp/dm, afp/afm cur/next, awp/awm)
+    // - 1 Vec<bool> of len total (mask)
+    // - 1 Vec<Complex64> of len f2 (col_buf)
+    // Plus per-plane export buffers: 1 Vec<[f64; 4]> of len n_vox + 1 Vec<[f64; 4]> of len total.
+    let fft_ws = n_vox
+        .checked_mul(14)
+        .and_then(|v| v.checked_mul(c_sz))
+        .ok_or_else(|| "2D MaxEnt FFT workspace byte size overflow".to_string())?;
+    let td_ws = total
+        .checked_mul(8)
+        .and_then(|v| v.checked_mul(c_sz))
+        .ok_or_else(|| "2D MaxEnt time-domain workspace byte size overflow".to_string())?;
+    let mask_ws = total
+        .checked_mul(b_sz)
+        .ok_or_else(|| "2D MaxEnt mask byte size overflow".to_string())?;
+    let col_ws = f2
+        .checked_mul(c_sz)
+        .ok_or_else(|| "2D MaxEnt column scratch byte size overflow".to_string())?;
+    let spec_out = n_vox
+        .checked_mul(q_sz)
+        .ok_or_else(|| "2D MaxEnt spectrum export byte size overflow".to_string())?;
+    let fid_out = total
+        .checked_mul(q_sz)
+        .ok_or_else(|| "2D MaxEnt FID export byte size overflow".to_string())?;
+    fft_ws
+        .checked_add(td_ws)
+        .and_then(|v| v.checked_add(mask_ws))
+        .and_then(|v| v.checked_add(col_ws))
+        .and_then(|v| v.checked_add(spec_out))
+        .and_then(|v| v.checked_add(fid_out))
+        .ok_or_else(|| "2D MaxEnt total workspace byte size overflow".to_string())
 }
 
 fn validate_hypercomplex_quad_mode(mode: QuadMode, axis_desc: &str) -> Result<(), String> {
@@ -751,6 +864,17 @@ fn fft_2d_unitary(
 
 /// Isometric quadrature conversion of a single 2D hypercomplex sample `[q00, q01, q10, q11]` at
 /// grid index `(k2, k1)` from `quad_modes = [mode2, mode1]` into canonical `States` `[cc, cs, sc, ss]`.
+///
+/// ## Echo-Antiecho Phase Convention (Aligned with `fid.rs::recombine_quad_pair`)
+/// For a Rance–Kay sensitivity-enhanced Echo-Antiecho pair `(z0, z1)` where `z0 = (re0, im0)`
+/// and `z1 = (re1, im1)`, this applies the exact unitary (`1 / sqrt(2)`-scaled) Bruker TopSpin
+/// `MC2 = 5` recombination matching `crate::fid::recombine_quad_pair`:
+/// - `out_cos = (1 / sqrt(2)) * [-(im0 + im1), re0 + re1]` (`-i` rotation in Bruker conjugate rep / `+i` in `(re, im)`)
+/// - `out_sin = (1 / sqrt(2)) * [re1 - re0, im1 - im0]`
+///
+/// This removes the 90° sensitivity-enhancement phase offset on real Bruker Echo-Antiecho data
+/// while remaining strictly orthogonal (`M^T M = I`), preserving Euclidean noise variance and
+/// Hoch–Hore entropy invariance.
 #[inline]
 fn quad_to_states(mut q: [f64; 4], k2: usize, k1: usize, quad_modes: [QuadMode; 2]) -> [f64; 4] {
     let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
@@ -763,12 +887,13 @@ fn quad_to_states(mut q: [f64; 4], k2: usize, k1: usize, quad_modes: [QuadMode; 
             }
         }
         QuadMode::EchoAntiecho => {
-            // z_P = [q00, q01], z_N = [q10, q11] -> unitary Rance-Kay recombination
+            // z0 = [q00, q01], z1 = [q10, q11] -> out_cos = [cc, cs], out_sin = [sc, ss]
+            // Unitary Bruker MC2 = 5 / fid.rs::recombine_quad_pair with -i rotation
             q = [
+                inv_sqrt2 * -(q[1] + q[3]),
                 inv_sqrt2 * (q[0] + q[2]),
-                inv_sqrt2 * (q[1] + q[3]),
-                inv_sqrt2 * (q[1] - q[3]),
                 inv_sqrt2 * (q[2] - q[0]),
+                inv_sqrt2 * (q[3] - q[1]),
             ];
         }
         QuadMode::Qf | QuadMode::Dqd => {}
@@ -782,12 +907,13 @@ fn quad_to_states(mut q: [f64; 4], k2: usize, k1: usize, quad_modes: [QuadMode; 
             }
         }
         QuadMode::EchoAntiecho => {
-            // z_P = [q00, q10], z_N = [q01, q11] -> unitary Rance-Kay recombination
+            // z0 = [q00, q10], z1 = [q01, q11] -> out_cos = [cc, sc], out_sin = [cs, ss]
+            // Unitary Bruker MC2 = 5 / fid.rs::recombine_quad_pair with -i rotation
             q = [
-                inv_sqrt2 * (q[0] + q[1]),
-                inv_sqrt2 * (q[2] - q[3]),
-                inv_sqrt2 * (q[2] + q[3]),
+                inv_sqrt2 * -(q[2] + q[3]),
                 inv_sqrt2 * (q[1] - q[0]),
+                inv_sqrt2 * (q[0] + q[1]),
+                inv_sqrt2 * (q[3] - q[2]),
             ];
         }
         QuadMode::Qf | QuadMode::Dqd => {}
@@ -795,8 +921,8 @@ fn quad_to_states(mut q: [f64; 4], k2: usize, k1: usize, quad_modes: [QuadMode; 
     q
 }
 
-/// Exact inverse of [`quad_to_states`]: converts canonical `States` `[cc, cs, sc, ss]` back to
-/// `quad_modes = [mode2, mode1]`.
+/// Exact orthogonal inverse (`M^T = M^{-1}`) of [`quad_to_states`]: converts canonical `States`
+/// `[cc, cs, sc, ss]` back to `quad_modes = [mode2, mode1]`.
 #[inline]
 fn states_to_quad(mut q: [f64; 4], k2: usize, k1: usize, quad_modes: [QuadMode; 2]) -> [f64; 4] {
     let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
@@ -811,10 +937,10 @@ fn states_to_quad(mut q: [f64; 4], k2: usize, k1: usize, quad_modes: [QuadMode; 
         QuadMode::EchoAntiecho => {
             let [cc, cs, sc, ss] = q;
             q = [
-                inv_sqrt2 * (cc - ss),
-                inv_sqrt2 * (cc + ss),
-                inv_sqrt2 * (sc + cs),
                 inv_sqrt2 * (sc - cs),
+                inv_sqrt2 * (sc + cs),
+                inv_sqrt2 * (-cc - ss),
+                inv_sqrt2 * (-cc + ss),
             ];
         }
         QuadMode::Qf | QuadMode::Dqd => {}
@@ -830,10 +956,10 @@ fn states_to_quad(mut q: [f64; 4], k2: usize, k1: usize, quad_modes: [QuadMode; 
         QuadMode::EchoAntiecho => {
             let [cc, cs, sc, ss] = q;
             q = [
-                inv_sqrt2 * (cc - ss),
-                inv_sqrt2 * (cs + sc),
-                inv_sqrt2 * (cc + ss),
                 inv_sqrt2 * (cs - sc),
+                inv_sqrt2 * (-cc - ss),
+                inv_sqrt2 * (cs + sc),
+                inv_sqrt2 * (-cc + ss),
             ];
         }
         QuadMode::Qf | QuadMode::Dqd => {}
@@ -1338,6 +1464,12 @@ pub fn reconstruct_maxent_1d(
             "1D MaxEnt FFT grid size {n_fft} exceeds MAX_MAXENT_POINTS ({MAX_MAXENT_POINTS})"
         ));
     }
+    let ws_bytes = maxent_1d_workspace_bytes(n1, n_fft)?;
+    if ws_bytes > MAX_MAXENT_WORKSPACE_BYTES {
+        return Err(format!(
+            "1D MaxEnt workspace size ({ws_bytes} bytes) exceeds MAX_MAXENT_WORKSPACE_BYTES ({MAX_MAXENT_WORKSPACE_BYTES})"
+        ));
+    }
     let mut n_sampled = 0usize;
     let mut data_energy = 0.0_f64;
     for (idx, (&sample, &m)) in obs.iter().zip(mask.iter()).enumerate() {
@@ -1537,30 +1669,9 @@ struct Solve2DWorkspace {
 }
 
 impl Solve2DWorkspace {
-    fn new(
-        obs_quad: &[[f64; 4]],
-        n2: usize,
-        n1: usize,
-        f2: usize,
-        f1: usize,
-        mask: &[bool],
-        quad_modes: [QuadMode; 2],
-    ) -> Self {
+    fn new_empty(n2: usize, n1: usize, f2: usize, f1: usize, mask: &[bool]) -> Self {
         let total = n2 * n1;
         let n_vox = f2 * f1;
-        let mut dp_masked = vec![[0.0, 0.0]; total];
-        let mut dm_masked = vec![[0.0, 0.0]; total];
-        for k2 in 0..n2 {
-            for k1 in 0..n1 {
-                let idx = k2 * n1 + k1;
-                if mask[idx] {
-                    let states = quad_to_states(obs_quad[idx], k2, k1, quad_modes);
-                    let (up, um) = states_to_bicomplex(states);
-                    dp_masked[idx] = up;
-                    dm_masked[idx] = um;
-                }
-            }
-        }
         Self {
             n2,
             n1,
@@ -1568,8 +1679,8 @@ impl Solve2DWorkspace {
             f1,
             n_vox,
             mask: mask.to_vec(),
-            dp_masked,
-            dm_masked,
+            dp_masked: vec![[0.0, 0.0]; total],
+            dm_masked: vec![[0.0, 0.0]; total],
             work_p: vec![[0.0, 0.0]; n_vox],
             work_m: vec![[0.0, 0.0]; n_vox],
             col_buf: vec![[0.0, 0.0]; f2],
@@ -1592,6 +1703,20 @@ impl Solve2DWorkspace {
             gcp_w: vec![[0.0, 0.0]; n_vox],
             gcm_w: vec![[0.0, 0.0]; n_vox],
         }
+    }
+
+    fn new(
+        obs_quad: &[[f64; 4]],
+        n2: usize,
+        n1: usize,
+        f2: usize,
+        f1: usize,
+        mask: &[bool],
+        quad_modes: [QuadMode; 2],
+    ) -> Self {
+        let mut ws = Self::new_empty(n2, n1, f2, f1, mask);
+        let _ = ws.load_plane(obs_quad, quad_modes);
+        ws
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2183,31 +2308,132 @@ impl Solve2DWorkspace {
 
     fn export_spectrum(&self) -> Vec<[f64; 4]> {
         let mut spec = vec![[0.0; 4]; self.n_vox];
+        self.export_spectrum_into(&mut spec);
+        spec
+    }
+
+    fn export_spectrum_into(&self, out: &mut [[f64; 4]]) {
         for m2 in 0..self.f2 {
             let row = m2 * self.f1;
             for m1 in 0..self.f1 {
                 let m1_c = (self.f1 - m1) % self.f1;
-                spec[row + m1] =
-                    bicomplex_to_states(self.fp_cur[row + m1], self.fm_cur[row + m1_c]);
+                out[row + m1] = bicomplex_to_states(self.fp_cur[row + m1], self.fm_cur[row + m1_c]);
             }
         }
-        spec
     }
 
     fn export_fid(&mut self, quad_modes: [QuadMode; 2]) -> Vec<[f64; 4]> {
+        let mut fid = vec![[0.0; 4]; self.n2 * self.n1];
+        self.export_fid_into(quad_modes, &mut fid);
+        fid
+    }
+
+    fn export_fid_into(&mut self, quad_modes: [QuadMode; 2], out: &mut [[f64; 4]]) {
         self.work_p.copy_from_slice(&self.fp_cur);
         self.work_m.copy_from_slice(&self.fm_cur);
         fft_2d_unitary(&mut self.work_p, self.f2, self.f1, &mut self.col_buf, true);
         fft_2d_unitary(&mut self.work_m, self.f2, self.f1, &mut self.col_buf, true);
-        let mut fid = vec![[0.0; 4]; self.n2 * self.n1];
         for k2 in 0..self.n2 {
             for k1 in 0..self.n1 {
                 let g = k2 * self.f1 + k1;
                 let states = bicomplex_to_states(self.work_p[g], self.work_m[g]);
-                fid[k2 * self.n1 + k1] = states_to_quad(states, k2, k1, quad_modes);
+                out[k2 * self.n1 + k1] = states_to_quad(states, k2, k1, quad_modes);
             }
         }
-        fid
+    }
+
+    fn load_plane(&mut self, obs_quad: &[[f64; 4]], quad_modes: [QuadMode; 2]) -> f64 {
+        let mut data_energy = 0.0_f64;
+        for k2 in 0..self.n2 {
+            for k1 in 0..self.n1 {
+                let idx = k2 * self.n1 + k1;
+                if self.mask[idx] {
+                    let q = obs_quad[idx];
+                    data_energy += q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+                    let states = quad_to_states(q, k2, k1, quad_modes);
+                    let (up, um) = states_to_bicomplex(states);
+                    self.dp_masked[idx] = up;
+                    self.dm_masked[idx] = um;
+                } else {
+                    self.dp_masked[idx] = [0.0, 0.0];
+                    self.dm_masked[idx] = [0.0, 0.0];
+                }
+            }
+        }
+        self.fp_cur.fill([0.0, 0.0]);
+        self.fm_cur.fill([0.0, 0.0]);
+        data_energy
+    }
+
+    fn solve_configured(
+        &mut self,
+        cfg: &MaxEntConfig,
+        n_obs_scalars: usize,
+        data_energy: f64,
+    ) -> (f64, usize, usize, InnerSolveStats) {
+        match cfg.lambda_mode {
+            MaxEntLambdaMode::Fixed { lambda } => {
+                let st = self.solve_fixed_lambda(
+                    cfg.def,
+                    lambda,
+                    cfg.max_iterations,
+                    cfg.kkt_tol,
+                    cfg.accelerate,
+                    cfg.adaptive_restart,
+                    cfg.adaptive_step_size,
+                    cfg.record_objective_trace,
+                );
+                (lambda, 0, st.iterations, st)
+            }
+            MaxEntLambdaMode::DiscrepancyPrinciple {
+                noise_sigma,
+                target_chi2_nu,
+                chi2_tol,
+                max_outer_iterations,
+            } => {
+                let denom = (n_obs_scalars as f64) * noise_sigma * noise_sigma;
+                let search_tol = (cfg.kkt_tol * 5.0).max(cfg.kkt_tol).min(1e-5);
+                let (chosen_lambda, outer_evals, mut total_inner) = select_discrepancy_lambda(
+                    cfg.def,
+                    noise_sigma,
+                    target_chi2_nu,
+                    chi2_tol,
+                    max_outer_iterations,
+                    data_energy,
+                    denom,
+                    |lam| {
+                        let st = self.solve_fixed_lambda(
+                            cfg.def,
+                            lam,
+                            cfg.max_iterations,
+                            search_tol,
+                            cfg.accelerate,
+                            cfg.adaptive_restart,
+                            cfg.adaptive_step_size,
+                            false,
+                        );
+                        (st.data_residual_sq / denom, st.iterations)
+                    },
+                );
+
+                if cfg.record_objective_trace {
+                    self.fp_cur.fill([0.0, 0.0]);
+                    self.fm_cur.fill([0.0, 0.0]);
+                }
+                let st = self.solve_fixed_lambda(
+                    cfg.def,
+                    chosen_lambda,
+                    cfg.max_iterations,
+                    cfg.kkt_tol,
+                    cfg.accelerate,
+                    cfg.adaptive_restart,
+                    cfg.adaptive_step_size,
+                    cfg.record_objective_trace,
+                );
+                total_inner += st.iterations;
+                (chosen_lambda, outer_evals, total_inner, st)
+            }
+        }
     }
 }
 
@@ -2215,11 +2441,12 @@ impl Solve2DWorkspace {
 /// sampled on `mask[k2 * n1 + k1]` with quadrature modes `quad_modes = [axis2_mode, axis1_mode]`
 /// (`States`, `StatesTppi`, or `EchoAntiecho`) using clean-room Convex Accelerated MaxEnt.
 ///
-/// The solver converts `obs_quad` isometrically to canonical `States` `(cc, cs, sc, ss)`,
-/// solves the exact quaternion/bicomplex Hoch–Hore entropy convex program, returns the
-/// pure-absorption canonical 2D hypercomplex spectrum `[RR, RI, IR, II]` in `result.spectrum`,
-/// and returns the reconstructed time-domain mock FID in the caller's input `quad_modes`
-/// encoding in `result.fid`.
+/// The solver converts `obs_quad` isometrically to canonical `States` `(cc, cs, sc, ss)` (for
+/// `EchoAntiecho`, using the unitary Bruker `MC2 = 5` / `fid.rs::recombine_quad_pair` convention
+/// including its `-i` sensitivity-enhancement rotation), solves the exact quaternion/bicomplex
+/// Hoch–Hore entropy convex program, returns the pure-absorption canonical 2D hypercomplex
+/// spectrum `[RR, RI, IR, II]` in `result.spectrum`, and returns the reconstructed time-domain
+/// mock FID in the caller's input `quad_modes` encoding in `result.fid`.
 pub fn reconstruct_maxent_2d(
     obs_quad: &[[f64; 4]],
     n2: usize,
@@ -2237,18 +2464,6 @@ pub fn reconstruct_maxent_2d(
     let total = n2
         .checked_mul(n1)
         .ok_or_else(|| "2D MaxEnt grid size overflow".to_string())?;
-    if obs_quad.len() != total {
-        return Err(format!(
-            "2D MaxEnt obs_quad length ({}) does not match n2*n1 ({total})",
-            obs_quad.len()
-        ));
-    }
-    if mask.len() != total {
-        return Err(format!(
-            "2D MaxEnt mask length ({}) does not match n2*n1 ({total})",
-            mask.len()
-        ));
-    }
     let f2 = n2
         .checked_mul(cfg.zero_fill_factor)
         .ok_or_else(|| "2D MaxEnt f2 overflow".to_string())?;
@@ -2261,6 +2476,24 @@ pub fn reconstruct_maxent_2d(
     if n_vox > MAX_MAXENT_POINTS {
         return Err(format!(
             "2D MaxEnt FFT grid size {n_vox} ({f2}x{f1}) exceeds MAX_MAXENT_POINTS ({MAX_MAXENT_POINTS})"
+        ));
+    }
+    let ws_bytes = maxent_2d_workspace_bytes(n2, n1, f2, f1)?;
+    if ws_bytes > MAX_MAXENT_WORKSPACE_BYTES {
+        return Err(format!(
+            "2D MaxEnt workspace size ({ws_bytes} bytes for {n2}x{n1} -> {f2}x{f1}) exceeds MAX_MAXENT_WORKSPACE_BYTES ({MAX_MAXENT_WORKSPACE_BYTES})"
+        ));
+    }
+    if obs_quad.len() != total {
+        return Err(format!(
+            "2D MaxEnt obs_quad length ({}) does not match n2*n1 ({total})",
+            obs_quad.len()
+        ));
+    }
+    if mask.len() != total {
+        return Err(format!(
+            "2D MaxEnt mask length ({}) does not match n2*n1 ({total})",
+            mask.len()
         ));
     }
 
@@ -2280,70 +2513,8 @@ pub fn reconstruct_maxent_2d(
     }
     let n_obs_scalars = 4 * n_sampled;
     let mut ws = Solve2DWorkspace::new(obs_quad, n2, n1, f2, f1, mask, quad_modes);
-
-    let (final_lambda, outer_iters, total_iters, stats) = match cfg.lambda_mode {
-        MaxEntLambdaMode::Fixed { lambda } => {
-            let st = ws.solve_fixed_lambda(
-                cfg.def,
-                lambda,
-                cfg.max_iterations,
-                cfg.kkt_tol,
-                cfg.accelerate,
-                cfg.adaptive_restart,
-                cfg.adaptive_step_size,
-                cfg.record_objective_trace,
-            );
-            (lambda, 0, st.iterations, st)
-        }
-        MaxEntLambdaMode::DiscrepancyPrinciple {
-            noise_sigma,
-            target_chi2_nu,
-            chi2_tol,
-            max_outer_iterations,
-        } => {
-            let denom = (n_obs_scalars as f64) * noise_sigma * noise_sigma;
-            let search_tol = (cfg.kkt_tol * 5.0).max(cfg.kkt_tol).min(1e-5);
-            let (chosen_lambda, outer_evals, mut total_inner) = select_discrepancy_lambda(
-                cfg.def,
-                noise_sigma,
-                target_chi2_nu,
-                chi2_tol,
-                max_outer_iterations,
-                data_energy,
-                denom,
-                |lam| {
-                    let st = ws.solve_fixed_lambda(
-                        cfg.def,
-                        lam,
-                        cfg.max_iterations,
-                        search_tol,
-                        cfg.accelerate,
-                        cfg.adaptive_restart,
-                        cfg.adaptive_step_size,
-                        false,
-                    );
-                    (st.data_residual_sq / denom, st.iterations)
-                },
-            );
-
-            if cfg.record_objective_trace {
-                ws.fp_cur.fill([0.0, 0.0]);
-                ws.fm_cur.fill([0.0, 0.0]);
-            }
-            let st = ws.solve_fixed_lambda(
-                cfg.def,
-                chosen_lambda,
-                cfg.max_iterations,
-                cfg.kkt_tol,
-                cfg.accelerate,
-                cfg.adaptive_restart,
-                cfg.adaptive_step_size,
-                cfg.record_objective_trace,
-            );
-            total_inner += st.iterations;
-            (chosen_lambda, outer_evals, total_inner, st)
-        }
-    };
+    let (final_lambda, outer_iters, total_iters, stats) =
+        ws.solve_configured(cfg, n_obs_scalars, data_energy);
 
     let spectrum = ws.export_spectrum();
     let fid = ws.export_fid(quad_modes);
@@ -2497,21 +2668,6 @@ pub fn reconstruct_maxent_3d(
             "3D MaxEnt volume size {total_voxels} exceeds MAX_MAXENT_3D_TOTAL_POINTS ({MAX_MAXENT_3D_TOTAL_POINTS})"
         ));
     }
-    if obs_planes.len() != total_voxels {
-        return Err(format!(
-            "3D MaxEnt obs_planes length ({}) does not match nx*n2*n1 ({total_voxels})",
-            obs_planes.len()
-        ));
-    }
-    if mask_2d.len() != plane_len {
-        return Err(format!(
-            "3D MaxEnt mask_2d length ({}) does not match n2*n1 ({plane_len})",
-            mask_2d.len()
-        ));
-    }
-    if !mask_2d.iter().any(|&m| m) {
-        return Err("3D MaxEnt 2D NUS mask has zero sampled points (fail-closed)".to_string());
-    }
     let f2 = n2
         .checked_mul(cfg.zero_fill_factor)
         .ok_or_else(|| "3D MaxEnt f2 overflow".to_string())?;
@@ -2526,6 +2682,36 @@ pub fn reconstruct_maxent_3d(
             "3D MaxEnt plane FFT size {spec_plane_len} exceeds MAX_MAXENT_POINTS ({MAX_MAXENT_POINTS})"
         ));
     }
+    let total_spec_voxels = nx
+        .checked_mul(spec_plane_len)
+        .ok_or_else(|| "3D MaxEnt total spectrum voxel count overflow".to_string())?;
+    if total_spec_voxels > MAX_MAXENT_3D_TOTAL_VOXELS {
+        return Err(format!(
+            "3D MaxEnt total spectrum voxels {total_spec_voxels} ({nx} x {f2} x {f1}) exceeds MAX_MAXENT_3D_TOTAL_VOXELS ({MAX_MAXENT_3D_TOTAL_VOXELS})"
+        ));
+    }
+    let ws_bytes = maxent_2d_workspace_bytes(n2, n1, f2, f1)?;
+    if ws_bytes > MAX_MAXENT_WORKSPACE_BYTES {
+        return Err(format!(
+            "3D MaxEnt per-thread workspace size ({ws_bytes} bytes for {n2}x{n1} -> {f2}x{f1}) exceeds MAX_MAXENT_WORKSPACE_BYTES ({MAX_MAXENT_WORKSPACE_BYTES})"
+        ));
+    }
+    if obs_planes.len() != total_voxels {
+        return Err(format!(
+            "3D MaxEnt obs_planes length ({}) does not match nx*n2*n1 ({total_voxels})",
+            obs_planes.len()
+        ));
+    }
+    if mask_2d.len() != plane_len {
+        return Err(format!(
+            "3D MaxEnt mask_2d length ({}) does not match n2*n1 ({plane_len})",
+            mask_2d.len()
+        ));
+    }
+    let n_sampled = mask_2d.iter().filter(|&&m| m).count();
+    if n_sampled == 0 {
+        return Err("3D MaxEnt 2D NUS mask has zero sampled points (fail-closed)".to_string());
+    }
     for (idx, q) in obs_planes.iter().enumerate() {
         if q.iter().any(|v| !v.is_finite()) {
             return Err(format!(
@@ -2534,36 +2720,76 @@ pub fn reconstruct_maxent_3d(
         }
     }
 
-    // Solve each direct slice's 2D indirect plane (parallel on native, sequential on wasm32)
-    let mut per_plane_results: Vec<Option<Result<MaxEntResult<[f64; 4]>, String>>> =
-        (0..nx).map(|_| None).collect();
+    let n_obs_scalars = 4 * n_sampled;
+    let sigma_eff = effective_noise_sigma(cfg);
+    let mut plane_cfg = cfg.clone();
+    plane_cfg.record_objective_trace = false;
+
+    // Pre-allocate exact bounded output buffers once and reuse one Solve2DWorkspace per thread
+    let mut spectra_planes = vec![[0.0; 4]; total_spec_voxels];
+    let mut fid_planes = vec![[0.0; 4]; total_voxels];
+    let mut diag_slots: Vec<Option<MaxEntPlaneDiagnostics>> = vec![None; nx];
+
+    let solve_chunk = |base_ix: usize,
+                       spec_chunk: &mut [[f64; 4]],
+                       fid_chunk: &mut [[f64; 4]],
+                       diag_chunk: &mut [Option<MaxEntPlaneDiagnostics>]| {
+        let mut ws = Solve2DWorkspace::new_empty(n2, n1, f2, f1, mask_2d);
+        for (offset, diag_slot) in diag_chunk.iter_mut().enumerate() {
+            let ix = base_ix + offset;
+            let obs_slice = &obs_planes[ix * plane_len..(ix + 1) * plane_len];
+            let data_energy = ws.load_plane(obs_slice, quad_modes);
+            let (final_lambda, outer_iters, total_iters, stats) =
+                ws.solve_configured(&plane_cfg, n_obs_scalars, data_energy);
+            let spec_out = &mut spec_chunk[offset * spec_plane_len..(offset + 1) * spec_plane_len];
+            let fid_out = &mut fid_chunk[offset * plane_len..(offset + 1) * plane_len];
+            ws.export_spectrum_into(spec_out);
+            ws.export_fid_into(quad_modes, fid_out);
+            let chi2_reduced = sigma_eff
+                .map(|sigma| stats.data_residual_sq / ((n_obs_scalars as f64) * sigma * sigma));
+            *diag_slot = Some(MaxEntPlaneDiagnostics {
+                direct_index: ix,
+                iterations: stats.iterations,
+                total_iterations: total_iters,
+                outer_iterations: outer_iters,
+                restarts: stats.restarts,
+                converged: stats.converged,
+                kkt_residual_inf: stats.kkt_residual_inf,
+                primal_objective: stats.primal_objective,
+                duality_gap: stats.duality_gap,
+                data_residual_sq: stats.data_residual_sq,
+                chi2_reduced,
+                entropy: stats.entropy,
+                final_lambda,
+            });
+        }
+    };
 
     #[cfg(not(target_arch = "wasm32"))]
     {
+        // Cap worker concurrency so total simultaneous workspace memory stays <= MAX_MAXENT_WORKSPACE_BYTES
+        let max_threads_by_mem = (MAX_MAXENT_WORKSPACE_BYTES / ws_bytes.max(1)).max(1);
         let n_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .min(nx);
+            .min(nx)
+            .min(max_threads_by_mem);
         if n_threads <= 1 {
-            for (ix, slot) in per_plane_results.iter_mut().enumerate() {
-                let slice = &obs_planes[ix * plane_len..(ix + 1) * plane_len];
-                *slot = Some(reconstruct_maxent_2d(
-                    slice, n2, n1, mask_2d, quad_modes, cfg,
-                ));
-            }
+            solve_chunk(0, &mut spectra_planes, &mut fid_planes, &mut diag_slots);
         } else {
             let chunk_size = nx.div_ceil(n_threads);
+            let spec_chunk_len = chunk_size * spec_plane_len;
+            let fid_chunk_len = chunk_size * plane_len;
             std::thread::scope(|s| {
-                for (chunk_idx, chunk) in per_plane_results.chunks_mut(chunk_size).enumerate() {
+                for (chunk_idx, ((spec_chunk, fid_chunk), diag_chunk)) in spectra_planes
+                    .chunks_mut(spec_chunk_len)
+                    .zip(fid_planes.chunks_mut(fid_chunk_len))
+                    .zip(diag_slots.chunks_mut(chunk_size))
+                    .enumerate()
+                {
                     let base_ix = chunk_idx * chunk_size;
                     s.spawn(move || {
-                        for (offset, slot) in chunk.iter_mut().enumerate() {
-                            let ix = base_ix + offset;
-                            let slice = &obs_planes[ix * plane_len..(ix + 1) * plane_len];
-                            *slot = Some(reconstruct_maxent_2d(
-                                slice, n2, n1, mask_2d, quad_modes, cfg,
-                            ));
-                        }
+                        solve_chunk(base_ix, spec_chunk, fid_chunk, diag_chunk);
                     });
                 }
             });
@@ -2571,18 +2797,10 @@ pub fn reconstruct_maxent_3d(
     }
     #[cfg(target_arch = "wasm32")]
     {
-        for (ix, slot) in per_plane_results.iter_mut().enumerate() {
-            let slice = &obs_planes[ix * plane_len..(ix + 1) * plane_len];
-            *slot = Some(reconstruct_maxent_2d(
-                slice, n2, n1, mask_2d, quad_modes, cfg,
-            ));
-        }
+        solve_chunk(0, &mut spectra_planes, &mut fid_planes, &mut diag_slots);
     }
 
-    let mut spectra_planes = Vec::with_capacity(nx * spec_plane_len);
-    let mut fid_planes = Vec::with_capacity(total_voxels);
     let mut plane_diagnostics = Vec::with_capacity(nx);
-
     let mut total_iters = 0usize;
     let mut all_converged = true;
     let mut max_kkt = 0.0_f64;
@@ -2592,38 +2810,22 @@ pub fn reconstruct_maxent_3d(
     let mut sum_chi2 = 0.0_f64;
     let mut chi2_count = 0usize;
 
-    for (ix, maybe_res) in per_plane_results.into_iter().enumerate() {
-        let res = maybe_res
-            .ok_or_else(|| format!("missing 3D MaxEnt result for direct slice {ix}"))??;
-        total_iters += res.iterations;
-        all_converged &= res.converged;
-        if res.kkt_residual_inf > max_kkt {
-            max_kkt = res.kkt_residual_inf;
+    for (ix, maybe_diag) in diag_slots.into_iter().enumerate() {
+        let diag = maybe_diag
+            .ok_or_else(|| format!("missing 3D MaxEnt diagnostics for direct slice {ix}"))?;
+        total_iters += diag.iterations;
+        all_converged &= diag.converged;
+        if diag.kkt_residual_inf > max_kkt {
+            max_kkt = diag.kkt_residual_inf;
         }
-        sum_obj += res.primal_objective;
-        sum_ent += res.entropy;
-        sum_lam += res.final_lambda;
-        if let Some(c2) = res.chi2_reduced {
+        sum_obj += diag.primal_objective;
+        sum_ent += diag.entropy;
+        sum_lam += diag.final_lambda;
+        if let Some(c2) = diag.chi2_reduced {
             sum_chi2 += c2;
             chi2_count += 1;
         }
-        plane_diagnostics.push(MaxEntPlaneDiagnostics {
-            direct_index: ix,
-            iterations: res.iterations,
-            total_iterations: res.total_iterations,
-            outer_iterations: res.outer_iterations,
-            restarts: res.restarts,
-            converged: res.converged,
-            kkt_residual_inf: res.kkt_residual_inf,
-            primal_objective: res.primal_objective,
-            duality_gap: res.duality_gap,
-            data_residual_sq: res.data_residual_sq,
-            chi2_reduced: res.chi2_reduced,
-            entropy: res.entropy,
-            final_lambda: res.final_lambda,
-        });
-        spectra_planes.extend_from_slice(&res.spectrum);
-        fid_planes.extend_from_slice(&res.fid);
+        plane_diagnostics.push(diag);
     }
 
     let nx_f = nx as f64;

@@ -10,9 +10,10 @@ use nmr_core::fid::{Complex64, QuadMode};
 use nmr_core::maxent_nus::{
     dual_to_primal_complex, dual_to_primal_hypercomplex, dual_to_primal_spectrum_1d,
     hoch_hore_entropy_1d, hoch_hore_entropy_2d_hypercomplex, kkt_residual_inf_1d,
-    kkt_residual_inf_2d, poisson_gap_mask_1d, poisson_gap_mask_2d, reconstruct_maxent_1d,
-    reconstruct_maxent_2d, reconstruct_maxent_3d, MaxEntConfig, MaxEntLambdaMode,
-    MAX_MAXENT_POINTS,
+    kkt_residual_inf_2d, maxent_1d_workspace_bytes, maxent_2d_workspace_bytes, poisson_gap_mask_1d,
+    poisson_gap_mask_2d, reconstruct_maxent_1d, reconstruct_maxent_2d, reconstruct_maxent_3d,
+    MaxEntConfig, MaxEntLambdaMode, MAX_MAXENT_3D_TOTAL_VOXELS, MAX_MAXENT_ITERATIONS,
+    MAX_MAXENT_OUTER_ITERATIONS, MAX_MAXENT_POINTS, MAX_MAXENT_WORKSPACE_BYTES,
 };
 use nmr_core::process::{fft_in_place, reconstruct_nus_2d_hypercomplex_ist, NusIstConfig};
 use nmr_core::rng::Rng;
@@ -59,8 +60,8 @@ fn synth_fid_2d_states(n2: usize, n1: usize, peaks: &[(f64, f64, f64, f64, f64)]
     fid
 }
 
-/// Apply `StatesTppi` or `EchoAntiecho` encoding onto a canonical `States` 2D FID (matching NMR
-/// spectrometer acquisition prior to quadrature recombination).
+/// Apply `StatesTppi` or Bruker `fid.rs:1589` `EchoAntiecho` encoding (including the `-i`
+/// sensitivity-enhancement rotation) onto a canonical `States` 2D FID.
 fn encode_2d_quad(
     states_fid: &[[f64; 4]],
     n2: usize,
@@ -72,7 +73,7 @@ fn encode_2d_quad(
     for k2 in 0..n2 {
         for k1 in 0..n1 {
             let mut q = states_fid[k2 * n1 + k1];
-            // Encode axis 1 first, then axis 2 (inverse of quad_to_states order)
+            // Encode axis 1 first, then axis 2 (exact orthogonal inverse of quad_to_states)
             match quad_modes[1] {
                 QuadMode::States => {}
                 QuadMode::StatesTppi => {
@@ -83,10 +84,10 @@ fn encode_2d_quad(
                 QuadMode::EchoAntiecho => {
                     let [cc, cs, sc, ss] = q;
                     q = [
-                        inv_sqrt2 * (cc - ss),
-                        inv_sqrt2 * (cc + ss),
-                        inv_sqrt2 * (sc + cs),
                         inv_sqrt2 * (sc - cs),
+                        inv_sqrt2 * (sc + cs),
+                        inv_sqrt2 * (-cc - ss),
+                        inv_sqrt2 * (-cc + ss),
                     ];
                 }
                 _ => {}
@@ -101,10 +102,10 @@ fn encode_2d_quad(
                 QuadMode::EchoAntiecho => {
                     let [cc, cs, sc, ss] = q;
                     q = [
-                        inv_sqrt2 * (cc - ss),
-                        inv_sqrt2 * (cs + sc),
-                        inv_sqrt2 * (cc + ss),
                         inv_sqrt2 * (cs - sc),
+                        inv_sqrt2 * (-cc - ss),
+                        inv_sqrt2 * (cs + sc),
+                        inv_sqrt2 * (-cc + ss),
                     ];
                 }
                 _ => {}
@@ -182,6 +183,33 @@ fn pearson_corr(a: &[f64], b: &[f64]) -> f64 {
         db += dy * dy;
     }
     num / (da.sqrt() * db.sqrt()).max(1e-30)
+}
+
+/// Exact unscaled ground-truth normalized root-mean-square error: `||est - gt||_2 / ||gt||_2`.
+fn nrmse_unscaled(est: &[f64], gt: &[f64]) -> f64 {
+    assert_eq!(est.len(), gt.len());
+    let num_sq: f64 = est
+        .iter()
+        .zip(gt.iter())
+        .map(|(&e, &g)| (e - g) * (e - g))
+        .sum();
+    let den_sq: f64 = gt.iter().map(|&g| g * g).sum();
+    (num_sq / den_sq.max(1e-30)).sqrt()
+}
+
+/// Exact optimal-scale ground-truth NRMSE: `min_a ||a * est - gt||_2 / ||gt||_2`.
+fn nrmse_scaled(est: &[f64], gt: &[f64]) -> f64 {
+    assert_eq!(est.len(), gt.len());
+    let dot: f64 = est.iter().zip(gt.iter()).map(|(&e, &g)| e * g).sum();
+    let est_sq: f64 = est.iter().map(|&e| e * e).sum();
+    let scale = if est_sq > 1e-30 { dot / est_sq } else { 0.0 };
+    let num_sq: f64 = est
+        .iter()
+        .zip(gt.iter())
+        .map(|(&e, &g)| (scale * e - g) * (scale * e - g))
+        .sum();
+    let den_sq: f64 = gt.iter().map(|&g| g * g).sum();
+    (num_sq / den_sq.max(1e-30)).sqrt()
 }
 
 // ============================================================================
@@ -328,6 +356,7 @@ fn synthetic_self_consistency_kkt_stationarity_2d_all_quad_modes() {
         [QuadMode::StatesTppi, QuadMode::StatesTppi],
         [QuadMode::EchoAntiecho, QuadMode::States],
         [QuadMode::States, QuadMode::EchoAntiecho],
+        [QuadMode::EchoAntiecho, QuadMode::EchoAntiecho],
     ];
 
     let mut ref_spectrum: Option<Vec<[f64; 4]>> = None;
@@ -387,6 +416,118 @@ fn synthetic_self_consistency_kkt_stationarity_2d_all_quad_modes() {
             ref_spectrum = Some(res.spectrum);
         }
     }
+}
+
+#[test]
+fn synthetic_self_consistency_echo_antiecho_matches_fid_rs_phase_convention() {
+    // Independent physical verification of Bruker MC2 = 5 / fid.rs:1589 Echo-Antiecho recombination
+    // (including the -i sensitivity-enhancement rotation so real Bruker data has zero 90-deg error).
+    // Synthesize physical P-type (z0) and N-type (z1) Rance-Kay traces directly without encode_2d_quad:
+    //   z0(k2, k1) = (-i / sqrt(2)) * exp((-1/d2 - i*2pi*f2)*k2) * exp((-1/d1 + i*2pi*f1)*k1)
+    //   z1(k2, k1) = (-i / sqrt(2)) * exp((-1/d2 + i*2pi*f2)*k2) * exp((-1/d1 + i*2pi*f1)*k1)
+    // Under fid.rs:1593-1594 scaled by 1/sqrt(2):
+    //   out_cos = (1/sqrt(2)) * [-(im0 + im1), re0 + re1] = cos(w2*k2) * exp(+i*w1*k1) * env
+    //   out_sin = (1/sqrt(2)) * [re1 - re0, im1 - im0]    = sin(w2*k2) * exp(+i*w1*k1) * env
+    let (n2, n1) = (16usize, 16usize);
+    let (f2_peak, f1_peak) = (0.25_f64, 0.3125_f64);
+    let (d2, d1, amp) = (16.0_f64, 16.0_f64, 8.0_f64);
+    let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
+
+    let mut ea_fid = vec![[0.0; 4]; n2 * n1];
+    let mut recombined_fid_rs = vec![[0.0; 4]; n2 * n1];
+    for k2 in 0..n2 {
+        let e2 = (-(k2 as f64) / d2).exp();
+        let w2 = 2.0 * PI * f2_peak * (k2 as f64);
+        for k1 in 0..n1 {
+            let e1 = amp * (-(k1 as f64) / d1).exp();
+            let w1 = 2.0 * PI * f1_peak * (k1 as f64);
+            let env = inv_sqrt2 * e2 * e1;
+            // -i = exp(-i*pi/2)
+            let phi0 = w1 - w2 - 0.5 * PI;
+            let phi1 = w1 + w2 - 0.5 * PI;
+            let (re0, im0) = (env * phi0.cos(), env * phi0.sin());
+            let (re1, im1) = (env * phi1.cos(), env * phi1.sin());
+            let idx = k2 * n1 + k1;
+            ea_fid[idx] = [re0, im0, re1, im1];
+            // Exact fid.rs:1593-1594 formula (unitary 1/sqrt(2)-scaled):
+            recombined_fid_rs[idx] = [
+                inv_sqrt2 * -(im0 + im1),
+                inv_sqrt2 * (re0 + re1),
+                inv_sqrt2 * (re1 - re0),
+                inv_sqrt2 * (im1 - im0),
+            ];
+        }
+    }
+
+    // Recombined Bruker pair must equal canonical States FID to machine precision
+    let ref_states = synth_fid_2d_states(n2, n1, &[(f2_peak, f1_peak, d2, d1, amp)]);
+    let recomb_err = recombined_fid_rs
+        .iter()
+        .zip(ref_states.iter())
+        .flat_map(|(a, b)| (0..4).map(move |c| (a[c] - b[c]).abs()))
+        .fold(0.0_f64, f64::max);
+    assert!(
+        recomb_err < 1e-13,
+        "Bruker fid.rs:1589 recombination must match canonical States: max_err={recomb_err:.3e}"
+    );
+
+    let mask = poisson_gap_mask_2d(n2, n1, 96, 2.0, 4242).expect("EA mask");
+    let mut obs_ea = vec![[0.0; 4]; n2 * n1];
+    let mut obs_st = vec![[0.0; 4]; n2 * n1];
+    for idx in 0..(n2 * n1) {
+        if mask[idx] {
+            obs_ea[idx] = ea_fid[idx];
+            obs_st[idx] = ref_states[idx];
+        }
+    }
+
+    let mut cfg = MaxEntConfig::fixed(0.1, 10.0);
+    cfg.kkt_tol = 1e-6;
+    cfg.max_iterations = 2000;
+
+    let res_ea = reconstruct_maxent_2d(
+        &obs_ea,
+        n2,
+        n1,
+        &mask,
+        [QuadMode::EchoAntiecho, QuadMode::States],
+        &cfg,
+    )
+    .expect("EchoAntiecho MaxEnt solve");
+    let res_st = reconstruct_maxent_2d(
+        &obs_st,
+        n2,
+        n1,
+        &mask,
+        [QuadMode::States, QuadMode::States],
+        &cfg,
+    )
+    .expect("States MaxEnt solve");
+
+    assert!(res_ea.converged && res_st.converged);
+    let max_spec_diff = res_ea
+        .spectrum
+        .iter()
+        .zip(res_st.spectrum.iter())
+        .flat_map(|(a, b)| (0..4).map(move |c| (a[c] - b[c]).abs()))
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_spec_diff < 1e-4,
+        "EchoAntiecho spectrum must match States with zero 90-deg phase error: max_diff={max_spec_diff:.3e}"
+    );
+
+    // Peak at exact (+f2_peak, +f1_peak) bin must be pure positive absorption (RR >> |RI|, |IR|, |II|)
+    let (f2, f1) = (res_ea.spectrum_shape[0], res_ea.spectrum_shape[1]);
+    let exp_m2 = (f2_peak * f2 as f64).round() as usize % f2;
+    let exp_m1 = (f1_peak * f1 as f64).round() as usize % f1;
+    let peak_q = res_ea.spectrum[exp_m2 * f1 + exp_m1];
+    assert!(
+        peak_q[0] > 5.0
+            && peak_q[0] > 10.0 * peak_q[1].abs()
+            && peak_q[0] > 10.0 * peak_q[2].abs()
+            && peak_q[0] > 10.0 * peak_q[3].abs(),
+        "EchoAntiecho peak at ({exp_m2}, {exp_m1}) must be pure positive absorption (zero 90-deg error), got {peak_q:?}"
+    );
 }
 
 // ============================================================================
@@ -473,37 +614,34 @@ fn synthetic_self_consistency_monotonic_convergence_restart_and_10_to_1_peaks_1d
     let strong_h = re_maxent[bin_strong];
     let weak_h = re_maxent[bin_weak];
 
-    // Off-peak absorptive background RMS away from all 3 Lorentzian peaks
+    // Off-peak ground-truth error RMS away from all 3 Lorentzian peaks (never counting true
+    // Lorentzian tails as artifact!) plus full-spectrum ground-truth NRMSE.
     let peak_bins = [
         bin_strong,
         bin_weak,
         (0.703125 * n_fft as f64).round() as usize,
     ];
-    let bg_rms_of = |spec: &[f64]| -> f64 {
+    let off_peak_err_rms = |est: &[f64], gt: &[f64]| -> f64 {
         let vals: Vec<f64> = (0..n_fft)
             .filter(|&b| peak_bins.iter().all(|&pb| b.abs_diff(pb) > 12))
-            .map(|b| spec[b])
+            .map(|b| est[b] - gt[b])
             .collect();
         (vals.iter().map(|v| v * v).sum::<f64>() / vals.len() as f64).sqrt()
     };
-    let bg_maxent = bg_rms_of(&re_maxent);
-    let bg_dirty = bg_rms_of(&re_dirty);
-    let diff_maxent: Vec<f64> = re_maxent
-        .iter()
-        .zip(re_gt.iter())
-        .map(|(a, b)| a - b)
-        .collect();
-    let artifact_rms = bg_rms_of(&diff_maxent);
+    let artifact_rms_maxent = off_peak_err_rms(&re_maxent, &re_gt);
+    let artifact_rms_dirty = off_peak_err_rms(&re_dirty, &re_gt);
+    let nrmse_maxent = nrmse_unscaled(&re_maxent, &re_gt);
+    let nrmse_dirty = nrmse_unscaled(&re_dirty, &re_gt);
     let r_maxent = pearson_corr(&re_gt, &re_maxent);
     let r_dirty = pearson_corr(&re_gt, &re_dirty);
 
     assert!(
-        weak_h > 10.0 * bg_maxent.max(1e-9) && weak_h > 10.0 * artifact_rms.max(1e-9),
-        "1D 25% NUS MaxEnt failed to recover 10:1 weak peak cleanly: strong={strong_h:.4}, weak={weak_h:.4}, bg_maxent={bg_maxent:.4}, artifact_rms={artifact_rms:.4}, bg_dirty={bg_dirty:.4}"
+        weak_h > 10.0 * artifact_rms_maxent.max(1e-9),
+        "1D 25% NUS MaxEnt failed to recover 10:1 weak peak cleanly above GT error: strong={strong_h:.4}, weak={weak_h:.4}, artifact_rms_maxent={artifact_rms_maxent:.4}, artifact_rms_dirty={artifact_rms_dirty:.4}"
     );
     assert!(
-        bg_maxent < 0.25 * bg_dirty,
-        "1D MaxEnt must suppress off-peak NUS sidelobes vs dirty FT: bg_maxent={bg_maxent:.4} vs bg_dirty={bg_dirty:.4}"
+        artifact_rms_maxent < 0.25 * artifact_rms_dirty && nrmse_maxent < 0.35 * nrmse_dirty,
+        "1D MaxEnt must strongly suppress NUS error vs dirty FT: off_peak_err {artifact_rms_maxent:.4} vs {artifact_rms_dirty:.4}, NRMSE {nrmse_maxent:.4} vs {nrmse_dirty:.4}"
     );
     assert!(
         r_maxent > 0.95 && r_maxent > r_dirty + 0.15,
@@ -722,20 +860,33 @@ fn synthetic_self_consistency_head_to_head_maxent_vs_ist_25pct_nus_2d() {
         let tol = 1e-10 * pair[0].abs().max(1.0);
         assert!(pair[1] <= pair[0] + tol);
     }
+    // Direct MaxEnt frequency-domain spectrum (zero-filled 64x64 with time-domain extrapolation)
+    // and cropped 32x32 mock-FID spectrum transformed identically to ground truth & IST.
     let maxent_rr: Vec<f64> = maxent_res.spectrum.iter().map(|q| q[0]).collect();
+    let maxent_fid_rr = states_fid_to_rr_spectrum(&maxent_res.fid, n2, n1, f2, f1);
 
     // 3. Existing nmr_core::process IST/FISTA baseline
     let ist_cfg = NusIstConfig::default();
     let ist_fid = reconstruct_nus_2d_hypercomplex_ist(&obs, n2, n1, &mask, &ist_cfg);
     let ist_rr = states_fid_to_rr_spectrum(&ist_fid, n2, n1, f2, f1);
 
-    // Compute head-to-head metrics:
-    // (a) Pearson correlation vs ground truth
+    // Honest ground-truth fidelity metrics (never counting true Lorentzian/truncation tails as artifact):
+    // (a) Pearson correlation and exact ground-truth NRMSE (unscaled & optimal-scale)
     let r_dirty = pearson_corr(&gt_rr, &dirty_rr);
-    let r_maxent = pearson_corr(&gt_rr, &maxent_rr);
     let r_ist = pearson_corr(&gt_rr, &ist_rr);
+    let r_maxent_spec = pearson_corr(&gt_rr, &maxent_rr);
+    let r_maxent_fid = pearson_corr(&gt_rr, &maxent_fid_rr);
 
-    // (b) 10:1 weak-peak recovery & off-peak artifact RMS
+    let dirty_nrmse_unscaled = nrmse_unscaled(&dirty_rr, &gt_rr);
+    let dirty_nrmse_scaled = nrmse_scaled(&dirty_rr, &gt_rr);
+    let ist_nrmse_unscaled = nrmse_unscaled(&ist_rr, &gt_rr);
+    let ist_nrmse_scaled = nrmse_scaled(&ist_rr, &gt_rr);
+    let maxent_spec_nrmse_unscaled = nrmse_unscaled(&maxent_rr, &gt_rr);
+    let maxent_spec_nrmse_scaled = nrmse_scaled(&maxent_rr, &gt_rr);
+    let maxent_fid_nrmse_unscaled = nrmse_unscaled(&maxent_fid_rr, &gt_rr);
+    let maxent_fid_nrmse_scaled = nrmse_scaled(&maxent_fid_rr, &gt_rr);
+
+    // (b) Peak-height fidelity vs ground truth & weak-to-strong ratio (nonlinearity disclosure)
     let peak_coords: Vec<(usize, usize)> = peaks
         .iter()
         .map(|&(p2, p1, _, _, _)| {
@@ -745,8 +896,8 @@ fn synthetic_self_consistency_head_to_head_maxent_vs_ist_25pct_nus_2d() {
             )
         })
         .collect();
-    let weak_coord = peak_coords[3];
     let strong_coord = peak_coords[0];
+    let weak_coord = peak_coords[3];
 
     let local_peak = |spec: &[f64], (c2, c1): (usize, usize)| -> f64 {
         let mut best = f64::NEG_INFINITY;
@@ -760,7 +911,7 @@ fn synthetic_self_consistency_head_to_head_maxent_vs_ist_25pct_nus_2d() {
         best
     };
 
-    let bg_rms = |spec: &[f64]| -> f64 {
+    let off_peak_err_rms = |est: &[f64], gt: &[f64]| -> f64 {
         let mut sum_sq = 0.0_f64;
         let mut cnt = 0usize;
         for r in 0..f2 {
@@ -771,8 +922,8 @@ fn synthetic_self_consistency_head_to_head_maxent_vs_ist_25pct_nus_2d() {
                     dr <= 4 && dc <= 4
                 });
                 if !near_peak {
-                    let v = spec[r * f1 + c];
-                    sum_sq += v * v;
+                    let d = est[r * f1 + c] - gt[r * f1 + c];
+                    sum_sq += d * d;
                     cnt += 1;
                 }
             }
@@ -780,53 +931,84 @@ fn synthetic_self_consistency_head_to_head_maxent_vs_ist_25pct_nus_2d() {
         (sum_sq / cnt.max(1) as f64).sqrt()
     };
 
-    let dirty_bg = bg_rms(&dirty_rr);
-    let maxent_bg = bg_rms(&maxent_rr);
-    let ist_bg = bg_rms(&ist_rr);
+    let peak_height_ratio_range = |spec: &[f64]| -> (f64, f64) {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &coord in &peak_coords {
+            let ratio = local_peak(spec, coord) / local_peak(&gt_rr, coord);
+            lo = lo.min(ratio);
+            hi = hi.max(ratio);
+        }
+        (lo, hi)
+    };
 
-    let maxent_weak_snr = local_peak(&maxent_rr, weak_coord) / maxent_bg.max(1e-12);
-    let ist_weak_snr = local_peak(&ist_rr, weak_coord) / ist_bg.max(1e-12);
-    let dirty_weak_snr = local_peak(&dirty_rr, weak_coord) / dirty_bg.max(1e-12);
+    let dirty_err_rms = off_peak_err_rms(&dirty_rr, &gt_rr);
+    let ist_err_rms = off_peak_err_rms(&ist_rr, &gt_rr);
+    let maxent_spec_err_rms = off_peak_err_rms(&maxent_rr, &gt_rr);
+    let maxent_fid_err_rms = off_peak_err_rms(&maxent_fid_rr, &gt_rr);
 
-    let maxent_strong = local_peak(&maxent_rr, strong_coord);
-    let maxent_weak = local_peak(&maxent_rr, weak_coord);
-    let gt_strong = local_peak(&gt_rr, strong_coord);
-    let gt_weak = local_peak(&gt_rr, weak_coord);
+    let (ist_h_lo, ist_h_hi) = peak_height_ratio_range(&ist_rr);
+    let (maxent_spec_h_lo, maxent_spec_h_hi) = peak_height_ratio_range(&maxent_rr);
+    let (maxent_fid_h_lo, maxent_fid_h_hi) = peak_height_ratio_range(&maxent_fid_rr);
+
+    let gt_ws = local_peak(&gt_rr, weak_coord) / local_peak(&gt_rr, strong_coord);
+    let ist_ws = local_peak(&ist_rr, weak_coord) / local_peak(&ist_rr, strong_coord);
+    let maxent_spec_ws = local_peak(&maxent_rr, weak_coord) / local_peak(&maxent_rr, strong_coord);
+    let maxent_fid_ws =
+        local_peak(&maxent_fid_rr, weak_coord) / local_peak(&maxent_fid_rr, strong_coord);
+    let compression_pct = (1.0 - maxent_spec_ws / gt_ws) * 100.0;
 
     eprintln!(
-        "[synthetic self-consistency] 2D 25% NUS benchmark (32x32 -> 64x64, 10:1 peaks, sigma={sigma}):\n\
-         - Dirty NUS: r={r_dirty:.4}, bg_rms={dirty_bg:.4}, weak_SNR={dirty_weak_snr:.1}\n\
-         - IST/FISTA: r={r_ist:.4}, bg_rms={ist_bg:.4}, weak_SNR={ist_weak_snr:.1}\n\
-         - MaxEnt:    r={r_maxent:.4}, bg_rms={maxent_bg:.4}, weak_SNR={maxent_weak_snr:.1}, chi2_nu={:.4}, lambda={:.4}, iters={} (total {}), restarts={}\n\
-         - Amplitude ratio (weak/strong): GT={:.4}, MaxEnt={:.4} (expected slight MaxEnt compression)",
+        "[synthetic self-consistency] 2D 25% NUS ground-truth comparison (32x32 -> 64x64, 10:1 peaks, sigma={sigma}):\n\
+         - Dirty NUS:             r={r_dirty:.4}, NRMSE(unscaled/scaled)={dirty_nrmse_unscaled:.4}/{dirty_nrmse_scaled:.4}, off_peak_err_rms={dirty_err_rms:.4}\n\
+         - IST/FISTA (linear):    r={r_ist:.4}, NRMSE(unscaled/scaled)={ist_nrmse_unscaled:.4}/{ist_nrmse_scaled:.4}, off_peak_err_rms={ist_err_rms:.4}, peak_vs_GT={ist_h_lo:.3}..{ist_h_hi:.3}x, weak/strong={ist_ws:.4}\n\
+         - MaxEnt (64x64 spec):   r={r_maxent_spec:.4}, NRMSE(unscaled/scaled)={maxent_spec_nrmse_unscaled:.4}/{maxent_spec_nrmse_scaled:.4}, off_peak_err_rms={maxent_spec_err_rms:.4}, peak_vs_GT={maxent_spec_h_lo:.3}..{maxent_spec_h_hi:.3}x, weak/strong={maxent_spec_ws:.4} (GT={gt_ws:.4}, compressed {compression_pct:.1}%)\n\
+         - MaxEnt (32x32 mockFID): r={r_maxent_fid:.4}, NRMSE(unscaled/scaled)={maxent_fid_nrmse_unscaled:.4}/{maxent_fid_nrmse_scaled:.4}, off_peak_err_rms={maxent_fid_err_rms:.4}, peak_vs_GT={maxent_fid_h_lo:.3}..{maxent_fid_h_hi:.3}x, weak/strong={maxent_fid_ws:.4}\n\
+         - MaxEnt diagnostics:    chi2_nu={:.4}, lambda={:.4}, iters={} (total {}), restarts={}",
         maxent_res.chi2_reduced.unwrap_or(f64::NAN),
         maxent_res.final_lambda,
         maxent_res.iterations,
         maxent_res.total_iterations,
         maxent_res.restarts,
-        gt_weak / gt_strong,
-        maxent_weak / maxent_strong,
     );
 
+    // Honest linear-fidelity ordering: IST achieves much lower ground-truth NRMSE & near-linear heights
     assert!(
-        r_maxent > 0.96,
-        "MaxEnt 2D 25% NUS correlation r={r_maxent:.4} must exceed 0.96 (dirty={r_dirty:.4}, IST={r_ist:.4})"
+        ist_nrmse_scaled < 0.05 && ist_nrmse_unscaled < 0.05,
+        "IST/FISTA linear ground-truth NRMSE expected < 0.05, got unscaled={ist_nrmse_unscaled:.4}, scaled={ist_nrmse_scaled:.4}"
     );
     assert!(
-        r_maxent > r_dirty + 0.15,
-        "MaxEnt must massively beat dirty NUS: r_maxent={r_maxent:.4} vs r_dirty={r_dirty:.4}"
+        ist_h_lo > 0.85 && ist_h_hi < 1.05,
+        "IST/FISTA peak heights should stay near-linear vs GT: {ist_h_lo:.3}..{ist_h_hi:.3}x"
     );
     assert!(
-        maxent_weak_snr > 12.0,
-        "MaxEnt 10:1 weak peak SNR ({maxent_weak_snr:.2}) must exceed 12"
+        ist_nrmse_scaled < maxent_spec_nrmse_scaled,
+        "Honest check: IST linear NRMSE ({ist_nrmse_scaled:.4}) is lower than nonlinear extrapolated MaxEnt ({maxent_spec_nrmse_scaled:.4})"
+    );
+
+    // MaxEnt strongly improves over dirty NUS and cleanly recovers all 4 peaks including the 10:1 weak peak
+    assert!(
+        r_maxent_spec > 0.96 && r_maxent_spec > r_dirty + 0.15,
+        "MaxEnt 2D 25% NUS correlation r={r_maxent_spec:.4} must exceed 0.96 and beat dirty r={r_dirty:.4}"
     );
     assert!(
-        maxent_bg < 0.35 * dirty_bg,
-        "MaxEnt must suppress off-peak NUS artifacts by >65%: maxent_bg={maxent_bg:.4} vs dirty_bg={dirty_bg:.4}"
+        maxent_spec_nrmse_scaled < dirty_nrmse_scaled && maxent_fid_nrmse_unscaled < dirty_nrmse_unscaled,
+        "MaxEnt must strongly reduce ground-truth NRMSE vs dirty NUS: spec_scaled={maxent_spec_nrmse_scaled:.4} vs dirty={dirty_nrmse_scaled:.4}, fid_unscaled={maxent_fid_nrmse_unscaled:.4} vs dirty={dirty_nrmse_unscaled:.4}"
     );
     assert!(
-        r_ist > 0.90,
-        "IST/FISTA baseline sanity check failed: r_ist={r_ist:.4}"
+        maxent_fid_err_rms < 0.35 * dirty_err_rms,
+        "MaxEnt mock-FID off-peak GT error RMS ({maxent_fid_err_rms:.4}) must strongly suppress dirty error ({dirty_err_rms:.4})"
+    );
+    assert!(
+        local_peak(&maxent_rr, weak_coord) > 10.0 * maxent_spec_err_rms.max(1e-12),
+        "MaxEnt 10:1 weak peak must sit cleanly above off-peak GT error"
+    );
+    // Verify nonlinearity & extrapolation disclosure is present on every result
+    assert!(
+        maxent_res.linearity_note.contains("nonlinear")
+            && maxent_res.linearity_note.contains("extrapolat")
+            && maxent_res.linearity_note.contains("compress"),
+        "linearity_note must disclose nonlinearity, weak-peak compression, and extrapolation"
     );
 }
 
@@ -1091,4 +1273,158 @@ fn synthetic_self_consistency_hostile_inputs_and_overflow_guards() {
         reconstruct_maxent_1d(&[[0.0, 0.0]; 16], &[true; 16], &zero_cfg).expect("zero FID");
     assert!(zero_res.converged);
     assert!(zero_res.spectrum.iter().all(|c| c[0] == 0.0 && c[1] == 0.0));
+}
+
+#[test]
+fn synthetic_self_consistency_hostile_3d_memory_and_iteration_caps() {
+    // Regression test for 22.13:P1-2 (unbounded 3D nx * spec_plane_len & per-thread workspace OOM)
+    // and 22.13:P2-3 (hard MAX_MAXENT_ITERATIONS / MAX_MAXENT_OUTER_ITERATIONS caps).
+    // Every hostile input below MUST fail closed BEFORE allocating with zero OOM.
+
+    // 1. Hostile 3D output explosion: nx = 16_384, n2 = 1, n1 = 1, zf = 1024.
+    //    Time-domain voxels = 16_384 (<= MAX_MAXENT_3D_TOTAL_POINTS), plane FFT = 1_048_576
+    //    (<= MAX_MAXENT_POINTS), obs_planes matches nx*n2*n1, YET nx * spec_plane_len = 17.18B
+    //    hypercomplex voxels (~550 GB) > MAX_MAXENT_3D_TOTAL_VOXELS!
+    let nx_hostile = 16_384usize;
+    let obs_small = vec![[1.0, 0.0, 0.0, 0.0]; nx_hostile];
+    let mut cfg_zf = MaxEntConfig::fixed(0.1, 1.0);
+    cfg_zf.zero_fill_factor = 1024;
+    let err_vox = reconstruct_maxent_3d(
+        &obs_small,
+        nx_hostile,
+        1,
+        1,
+        &[true],
+        [QuadMode::States, QuadMode::States],
+        &cfg_zf,
+    )
+    .expect_err("hostile nx * spec_plane_len > MAX_MAXENT_3D_TOTAL_VOXELS must fail closed");
+    assert!(
+        err_vox.contains("MAX_MAXENT_3D_TOTAL_VOXELS"),
+        "expected MAX_MAXENT_3D_TOTAL_VOXELS error, got: {err_vox}"
+    );
+
+    // 2. Hostile per-thread workspace explosion: nx = 2, n2 = 1, n1 = 1, zf = 1024.
+    //    total_spec_voxels = 2_097_152 (<= MAX_MAXENT_3D_TOTAL_VOXELS), spec_plane_len = 1_048_576
+    //    (<= MAX_MAXENT_POINTS), YET Solve2DWorkspace + export = 268.4 MiB > MAX_MAXENT_WORKSPACE_BYTES!
+    let ws_bytes = maxent_2d_workspace_bytes(1, 1, 1024, 1024).expect("workspace bytes");
+    assert!(
+        ws_bytes > MAX_MAXENT_WORKSPACE_BYTES,
+        "expected 1024x1024 2D workspace ({ws_bytes} B) > MAX_MAXENT_WORKSPACE_BYTES ({MAX_MAXENT_WORKSPACE_BYTES} B)"
+    );
+    let err_ws_3d = reconstruct_maxent_3d(
+        &[[1.0, 0.0, 0.0, 0.0]; 2],
+        2,
+        1,
+        1,
+        &[true],
+        [QuadMode::States, QuadMode::States],
+        &cfg_zf,
+    )
+    .expect_err("hostile 3D per-thread workspace > MAX_MAXENT_WORKSPACE_BYTES must fail closed");
+    assert!(
+        err_ws_3d.contains("MAX_MAXENT_WORKSPACE_BYTES"),
+        "expected MAX_MAXENT_WORKSPACE_BYTES error, got: {err_ws_3d}"
+    );
+    let err_ws_2d = reconstruct_maxent_2d(
+        &[[1.0, 0.0, 0.0, 0.0]],
+        1,
+        1,
+        &[true],
+        [QuadMode::States, QuadMode::States],
+        &cfg_zf,
+    )
+    .expect_err("hostile 2D workspace > MAX_MAXENT_WORKSPACE_BYTES must fail closed");
+    assert!(
+        err_ws_2d.contains("MAX_MAXENT_WORKSPACE_BYTES"),
+        "expected MAX_MAXENT_WORKSPACE_BYTES error, got: {err_ws_2d}"
+    );
+
+    // 3. Checked-mul overflow cases (usize::MAX dimensions / zero_fill_factor)
+    let mut cfg_overflow = MaxEntConfig::fixed(0.1, 1.0);
+    cfg_overflow.zero_fill_factor = usize::MAX;
+    assert!(reconstruct_maxent_3d(
+        &[[1.0, 0.0, 0.0, 0.0]],
+        1,
+        2,
+        2,
+        &[true; 4],
+        [QuadMode::States, QuadMode::States],
+        &cfg_overflow,
+    )
+    .is_err());
+    assert!(reconstruct_maxent_3d(
+        &[],
+        usize::MAX,
+        2,
+        2,
+        &[true; 4],
+        [QuadMode::States, QuadMode::States],
+        &MaxEntConfig::fixed(0.1, 1.0),
+    )
+    .is_err());
+    assert!(maxent_1d_workspace_bytes(usize::MAX, usize::MAX).is_err());
+    assert!(maxent_2d_workspace_bytes(usize::MAX, 2, 2, 2).is_err());
+
+    // 4. Verify constants & exact boundary check for MAX_MAXENT_3D_TOTAL_VOXELS
+    let mut cfg_border = MaxEntConfig::fixed(0.1, 1.0);
+    cfg_border.zero_fill_factor = 64; // spec_plane_len = 4096 (workspace ~1.05 MiB, valid)
+    let nx_over = (MAX_MAXENT_3D_TOTAL_VOXELS / 4096) + 1;
+    let err_border = reconstruct_maxent_3d(
+        &[],
+        nx_over,
+        1,
+        1,
+        &[true],
+        [QuadMode::States, QuadMode::States],
+        &cfg_border,
+    )
+    .expect_err("nx * spec_plane_len just over MAX_MAXENT_3D_TOTAL_VOXELS must fail closed");
+    assert!(
+        err_border.contains("MAX_MAXENT_3D_TOTAL_VOXELS"),
+        "expected MAX_MAXENT_3D_TOTAL_VOXELS error, got: {err_border}"
+    );
+
+    // 5. Hard iteration caps (22.13:P2-3): max_iterations and max_outer_iterations
+    let mut over_iters = MaxEntConfig::fixed(0.1, 1.0);
+    over_iters.max_iterations = MAX_MAXENT_ITERATIONS + 1;
+    assert!(over_iters.validate().is_err());
+    assert!(reconstruct_maxent_1d(&[[1.0, 0.0]; 4], &[true; 4], &over_iters).is_err());
+    assert!(reconstruct_maxent_2d(
+        &[[1.0, 0.0, 0.0, 0.0]; 4],
+        2,
+        2,
+        &[true; 4],
+        [QuadMode::States, QuadMode::States],
+        &over_iters,
+    )
+    .is_err());
+    assert!(reconstruct_maxent_3d(
+        &[[1.0, 0.0, 0.0, 0.0]; 4],
+        1,
+        2,
+        2,
+        &[true; 4],
+        [QuadMode::States, QuadMode::States],
+        &over_iters,
+    )
+    .is_err());
+
+    let mut huge_iters = MaxEntConfig::fixed(0.1, 1.0);
+    huge_iters.max_iterations = usize::MAX;
+    assert!(huge_iters.validate().is_err());
+
+    let over_outer = MaxEntConfig {
+        def: 0.1,
+        lambda_mode: MaxEntLambdaMode::DiscrepancyPrinciple {
+            noise_sigma: 0.1,
+            target_chi2_nu: 1.0,
+            chi2_tol: 0.02,
+            max_outer_iterations: MAX_MAXENT_OUTER_ITERATIONS + 1,
+        },
+        noise_sigma: Some(0.1),
+        ..MaxEntConfig::default()
+    };
+    assert!(over_outer.validate().is_err());
+    assert!(reconstruct_maxent_1d(&[[1.0, 0.0]; 4], &[true; 4], &over_outer).is_err());
 }
