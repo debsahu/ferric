@@ -31,6 +31,7 @@ pub mod fid;
 pub mod idp_propensity;
 pub mod idp_solver;
 pub mod kabsch_sander_ss;
+pub mod legolas_shifts;
 pub mod mcp;
 pub mod metabolomics;
 pub mod methyl_solver;
