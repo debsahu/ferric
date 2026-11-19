@@ -503,6 +503,22 @@ impl Default for ExcitedStateConfig {
     }
 }
 
+/// Diagnostic summarizing reduced-$\chi^2$ consistency under $H_0$ and the top-ranked hypothesis,
+/// explicitly flagging the risk that underestimated experimental error bars (`2x`–`3x`) can cause
+/// false $H_0$ rejection and spurious `UnmodeledSignificantExchange` or non-null ranking.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Chi2ConsistencyDiagnostic {
+    pub h0_reduced_chi2: f64,
+    pub top1_reduced_chi2: f64,
+    pub consistency_upper_bound: f64,
+    pub h0_exceeds_consistency_bound: bool,
+    pub top1_exceeds_consistency_bound: bool,
+    pub implied_error_scale_factor_h0: f64,
+    pub implied_error_scale_factor_top1: f64,
+    #[serde(default)]
+    pub error_scale_warning: Option<String>,
+}
+
 /// Complete Bayesian excited-state structural classification report.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExcitedStateReport {
@@ -535,6 +551,10 @@ pub struct ExcitedStateReport {
     pub ground_max_retained_seq_identity: f64,
     pub ranked_hypotheses: Vec<HypothesisScore>,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub error_scale_warning: Option<String>,
+    #[serde(default)]
+    pub chi2_consistency_diagnostic: Option<Chi2ConsistencyDiagnostic>,
     #[serde(default)]
     pub scope_limits_note: String,
 }
@@ -998,6 +1018,19 @@ pub fn format_excited_state_tsv(report: &ExcitedStateReport) -> String {
         "# ground_exclusion_list_sha256: {}\tmax_retained_seq_identity: {:.4}\n",
         report.ground_exclusion_list_sha256, report.ground_max_retained_seq_identity
     ));
+    if let Some(ref diag) = report.chi2_consistency_diagnostic {
+        out.push_str(&format!(
+            "# chi2_consistency_diagnostic: h0_rchi2={:.4}\ttop1_rchi2={:.4}\tbound={:.4}\timplied_scale_h0={:.2}x\timplied_scale_top1={:.2}x\n",
+            diag.h0_reduced_chi2,
+            diag.top1_reduced_chi2,
+            diag.consistency_upper_bound,
+            diag.implied_error_scale_factor_h0,
+            diag.implied_error_scale_factor_top1
+        ));
+    }
+    if let Some(ref warn) = report.error_scale_warning {
+        out.push_str(&format!("# error_scale_warning: {warn}\n"));
+    }
     out.push_str(
         "rank\thypothesis_code\thypothesis\tk_params\tm_cands\tmax_log_lik\tmarginal_log_lik\tbic\tdelta_bic\t2ln_bf_vs_null\tposterior_weight\treduced_chi2\trmse_ppm\tpearson_r\tspearman_rho\tlocus_summary\n",
     );
@@ -3288,6 +3321,35 @@ pub fn classify_excited_state_with_firewall(
         )
     };
 
+    let consistency_upper_bound =
+        (1.0 + 2.576 * (2.0 / (n_obs.max(1) as f64)).sqrt()).min(cfg.max_reduced_chi2);
+    let h0_exceeds_consistency_bound = h0_reduced_chi2 > consistency_upper_bound;
+    let top1_exceeds_consistency_bound = top_rchi2 > consistency_upper_bound;
+    let implied_error_scale_factor_h0 = h0_reduced_chi2.max(0.0).sqrt();
+    let implied_error_scale_factor_top1 = top_rchi2.max(0.0).sqrt();
+    let emit_error_scale_warning = h0_rejected_by_data
+        || abstention_kind == Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange)
+        || h0_exceeds_consistency_bound
+        || top1_exceeds_consistency_bound;
+    let error_scale_warning = emit_error_scale_warning.then(|| {
+        format!(
+            "Error-scale / chi^2 consistency diagnostic: H0 reduced chi^2_nu={h0_reduced_chi2:.3} (implied error scale ~{implied_error_scale_factor_h0:.2}x), top1 reduced chi^2_nu={top_rchi2:.3} (implied error scale ~{implied_error_scale_factor_top1:.2}x, consistency bound {consistency_upper_bound:.2}). Underestimated experimental error bars (2x-3x) can cause false H0 rejection and spurious UnmodeledSignificantExchange or non-null hypothesis ranking; verify experimental dw_err_ppm calibration on non-exchanging control sites."
+        )
+    });
+    if let Some(ref w) = error_scale_warning {
+        warnings.push(w.clone());
+    }
+    let chi2_consistency_diagnostic = Some(Chi2ConsistencyDiagnostic {
+        h0_reduced_chi2,
+        top1_reduced_chi2: top_rchi2,
+        consistency_upper_bound,
+        h0_exceeds_consistency_bound,
+        top1_exceeds_consistency_bound,
+        implied_error_scale_factor_h0,
+        implied_error_scale_factor_top1,
+        error_scale_warning: error_scale_warning.clone(),
+    });
+
     Ok(ExcitedStateReport {
         verdict,
         verdict_reason,
@@ -3311,6 +3373,8 @@ pub fn classify_excited_state_with_firewall(
         ground_max_retained_seq_identity: pred_a.max_retained_seq_identity,
         ranked_hypotheses: hyps,
         warnings,
+        error_scale_warning,
+        chi2_consistency_diagnostic,
         scope_limits_note: EXCITED_STATE_SCOPE_LIMITS_NOTE.to_string(),
     })
 }

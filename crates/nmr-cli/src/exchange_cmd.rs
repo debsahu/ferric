@@ -1664,6 +1664,9 @@ pub fn run_exchange_state_cli(args: &[String]) -> Result<(), String> {
             report.top1_reduced_chi2,
             op.display()
         );
+        if let Some(ref warn) = report.error_scale_warning {
+            println!("Warning: {warn}");
+        }
     } else {
         print!("{tsv_str}");
     }
