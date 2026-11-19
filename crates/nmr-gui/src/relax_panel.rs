@@ -18,24 +18,153 @@
 use std::collections::BTreeMap;
 
 use eframe::egui;
+use nmr_core::ccr_relax::{
+    compute_full_relax_and_ccr_isotropic, invert_tract_eta_xy_to_tau_m, CcrPhysicsConfig,
+    TractTauMEstimate,
+};
+use nmr_core::dynamics_detectors::{
+    build_dynamics_detectors, experiments_and_observations_from_rates,
+    fit_impact_from_multi_field_rates, log_spaced_grid, select_impact_model_aicc_from_rates,
+    DetectorConfig, DetectorDesign, DetectorFitResult, ImpactConfig, ImpactFitResult,
+};
 use nmr_core::modelfree::{
     extract_nh_unit_vectors_from_chain, fit_modelfree_dataset, group_multifield_rates,
     predict_r1_r2_noe, write_modelfree_tsv_str, DiffusionTensor, DiffusionTensorKind,
     LocalMfParams, ModelFreeConfig, ModelFreeDatasetResult, ModelFreeId, ModelSelectionCriterion,
 };
 use nmr_core::noesy::parse_pdb_str_first_model;
+use nmr_core::peaks::Peak;
+use nmr_core::priors::one_to_three;
 use nmr_core::relax_fit::{
     compute_hetnoe_batch, decay_inputs_from_series, fit_decay_batch_cpu, DecayCurveFit,
     DecayCurveInput, ExpFitConfig, HetNoeInput, HetNoeResult, OffsetModelGate, RelaxPhysicsConfig,
     ResidueRelaxRates,
 };
 use nmr_core::relax_io::{
-    parse_relax_series_nef_str, parse_relax_series_tsv_str, LockedPeakFootprint,
-    RelaxExperimentKind, RelaxSchedule, RelaxSeriesDataset, ResidueRelaxTrace,
+    parse_bruker_delay_token_sec, parse_relax_series_nef_str, parse_relax_series_tsv_str,
+    HetNoeOrder, LockedPeakFootprint, RelaxExperimentKind, RelaxSchedule, RelaxSeriesDataset,
+    ResidueRelaxTrace, TargetPeakSeed,
 };
 use nmr_core::rng::Rng;
+use nmr_core::titration_2d::Peak2d as TitrationPeak2d;
 
 use crate::mol3d_overlay::QuantitativeTrack;
+use crate::workbench_mode::{TYPE_BODY_PX, TYPE_CAPTION_PX};
+
+/// 2D HSQC cross-peak passed from `Assign` mode into [`RelaxPanelState::sync_assigned_hsqc_peaks`]
+/// to seed the locked peak footprint reference for pseudo-3D relaxation integration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Peak2D {
+    /// Direct `1H` chemical shift (ppm).
+    pub h_ppm: f64,
+    /// Indirect `15N` chemical shift (ppm).
+    pub n_ppm: f64,
+    /// Optional 1-based sequence residue ID (e.g. `7` for `T7`).
+    pub seq_id: Option<i32>,
+    /// Optional 3-letter amino-acid code (e.g. `"THR"`).
+    pub res_name: Option<String>,
+    /// Optional human-readable label (e.g. `"T7"` or `"THR7"`).
+    pub label: Option<String>,
+    /// Optional peak height/intensity.
+    pub intensity: Option<f64>,
+}
+
+impl Peak2D {
+    pub fn new(h_ppm: f64, n_ppm: f64) -> Self {
+        Self {
+            h_ppm,
+            n_ppm,
+            seq_id: None,
+            res_name: None,
+            label: None,
+            intensity: None,
+        }
+    }
+
+    pub fn assigned(seq_id: i32, res_name: impl Into<String>, h_ppm: f64, n_ppm: f64) -> Self {
+        Self {
+            h_ppm,
+            n_ppm,
+            seq_id: Some(seq_id),
+            res_name: Some(res_name.into()),
+            label: None,
+            intensity: None,
+        }
+    }
+
+    /// Convert a core HSQC [`Peak`] plus optional solver assignment into a [`Peak2D`] footprint seed.
+    pub fn from_core_peak(peak: &Peak, seq_id: Option<i32>, res_name: Option<&str>) -> Self {
+        Self {
+            h_ppm: peak.h,
+            n_ppm: peak.n,
+            seq_id,
+            res_name: res_name.map(String::from),
+            label: None,
+            intensity: peak.height,
+        }
+    }
+}
+
+impl From<&TitrationPeak2d> for Peak2D {
+    fn from(p: &TitrationPeak2d) -> Self {
+        Self {
+            h_ppm: p.h_ppm,
+            n_ppm: p.n_ppm,
+            seq_id: None,
+            res_name: p.res_name.clone(),
+            label: p.label.clone(),
+            intensity: p.intensity,
+        }
+    }
+}
+
+/// Active sub-tab inside the `Relaxation / S²` studio body.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RelaxStudioSubTab {
+    #[default]
+    CurvesAndModelFree,
+    Pseudo3dImport,
+    DetectorsImpactTract,
+}
+
+impl RelaxStudioSubTab {
+    pub const ALL: [Self; 3] = [
+        Self::CurvesAndModelFree,
+        Self::Pseudo3dImport,
+        Self::DetectorsImpactTract,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CurvesAndModelFree => "Curves & Model-Free",
+            Self::Pseudo3dImport => "Pseudo-3D T1/T2/hetNOE",
+            Self::DetectorsImpactTract => "Detectors / IMPACT / TRACT",
+        }
+    }
+}
+
+/// UI state for one pseudo-3D relaxation folder slot (`T1`, `T2`, or `hetNOE`).
+#[derive(Clone, Debug, Default)]
+pub struct Pseudo3dSlotState {
+    pub dir_path: String,
+    pub delays_text: String,
+    pub loaded_planes: usize,
+    pub fitted_residues: usize,
+    pub warnings: Vec<String>,
+}
+
+/// Compact Phase 22 `TRACT` / CCR ($\eta_{xy}$, $R_{\text{ex}}$-free $\tau_m$, $\kappa_0$) summary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TractSummaryReport {
+    pub field_mhz: f64,
+    pub r_alpha_s_inv: f64,
+    pub r_beta_s_inv: f64,
+    pub eta_xy_s_inv: f64,
+    pub sigma_eta_xy_s_inv: f64,
+    pub tau_m_rigid: TractTauMEstimate,
+    pub tau_m_s2_corrected: Option<TractTauMEstimate>,
+    pub kappa0_sec: f64,
+}
 
 /// Which decay curve family is displayed in the interactive $I(\tau)$ curve canvas.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -64,6 +193,7 @@ pub enum RelaxPanelAction {
 /// Interactive state for the `Relaxation / S²` dynamics studio (`wasm32`-safe).
 #[derive(Clone, Debug)]
 pub struct RelaxPanelState {
+    pub active_sub_tab: RelaxStudioSubTab,
     pub active_decay: ActiveDecayView,
     pub mc_replicates: usize,
     pub offset_gate: OffsetModelGate,
@@ -78,6 +208,26 @@ pub struct RelaxPanelState {
     pub hetnoe_fits: BTreeMap<i32, HetNoeResult>,
     pub aux_field_rates: Vec<Vec<ResidueRelaxRates>>,
     pub modelfree_result: Option<ModelFreeDatasetResult>,
+
+    /// Locked HSQC peak footprints synced from `Assign` mode for pseudo-3D plane integration.
+    pub synced_peak_seeds: Vec<TargetPeakSeed>,
+    pub t1_slot: Pseudo3dSlotState,
+    pub t2_slot: Pseudo3dSlotState,
+    pub hetnoe_slot: Pseudo3dSlotState,
+    pub hetnoe_order: HetNoeOrder,
+    /// Optional unit CPMG cycle time in milliseconds when `t2_slot.delays_text` holds integer `vclist` loop counts.
+    pub t2_vclist_unit_ms: f64,
+
+    /// Phase 22 (`T22.3`) linear optimal-window dynamics detectors design & per-residue responses.
+    pub detector_design: Option<DetectorDesign>,
+    pub detector_fits: BTreeMap<i32, DetectorFitResult>,
+    /// Phase 22 (`T22.4`) `IMPACT` simplex correlation-time decompositions per residue.
+    pub impact_fits: BTreeMap<i32, ImpactFitResult>,
+    /// Phase 22 (`T22.5`) `TRACT` $\alpha/\beta$ rates and $R_{\text{ex}}$-free $\tau_m$ summary.
+    pub tract_r_alpha_input: f64,
+    pub tract_r_beta_input: f64,
+    pub tract_assumed_s2: f64,
+    pub tract_report: Option<TractSummaryReport>,
 
     pub selected_seq_id: Option<i32>,
     pub show_paste_drawer: bool,
@@ -97,6 +247,7 @@ impl Default for RelaxPanelState {
 impl RelaxPanelState {
     pub fn new() -> Self {
         Self {
+            active_sub_tab: RelaxStudioSubTab::CurvesAndModelFree,
             active_decay: ActiveDecayView::R1,
             mc_replicates: 200,
             offset_gate: OffsetModelGate::Disabled,
@@ -110,13 +261,26 @@ impl RelaxPanelState {
             hetnoe_fits: BTreeMap::new(),
             aux_field_rates: Vec::new(),
             modelfree_result: None,
+            synced_peak_seeds: Vec::new(),
+            t1_slot: Pseudo3dSlotState::default(),
+            t2_slot: Pseudo3dSlotState::default(),
+            hetnoe_slot: Pseudo3dSlotState::default(),
+            hetnoe_order: HetNoeOrder::RefFirst,
+            t2_vclist_unit_ms: 0.0,
+            detector_design: None,
+            detector_fits: BTreeMap::new(),
+            impact_fits: BTreeMap::new(),
+            tract_r_alpha_input: 5.5,
+            tract_r_beta_input: 16.5,
+            tract_assumed_s2: 0.85,
+            tract_report: None,
             selected_seq_id: None,
             show_paste_drawer: false,
             paste_series_buf: String::new(),
             exported_tsv_preview: String::new(),
             show_tsv_modal: false,
             status_banner:
-                "Load a relaxation series TSV/NEF or synthesize dual-field 600+800 MHz dynamics."
+                "Load a pseudo-3D Bruker T1/T2/hetNOE folder, TSV/NEF, or synthesize dual-field dynamics."
                     .to_string(),
             last_canvas_rect: None,
         }
@@ -124,6 +288,459 @@ impl RelaxPanelState {
 
     pub fn has_fitted_rates(&self) -> bool {
         !self.r1_fits.is_empty() || !self.r2_fits.is_empty() || !self.hetnoe_fits.is_empty()
+    }
+
+    /// Number of locked HSQC cross-peak footprints currently synced from `Assign` mode.
+    pub fn synced_peak_count(&self) -> usize {
+        self.synced_peak_seeds.len()
+    }
+
+    /// Auto-populate the locked peak footprint reference (`synced_peak_seeds`) directly from
+    /// `Assign` mode's HSQC peaks and protein sequence (accepting 1-letter FASTA/raw strings or
+    /// whitespace/comma-separated 3-letter residue codes).
+    pub fn sync_assigned_hsqc_peaks(&mut self, peaks: &[Peak2D], sequence: &str) -> usize {
+        let seq_3letter = parse_sequence_3letter_tokens(sequence);
+        let mut seeds = Vec::with_capacity(peaks.len());
+        let mut used_ids = std::collections::BTreeSet::new();
+        let mut next_fallback_id = 1_i32;
+
+        for peak in peaks {
+            if !peak.h_ppm.is_finite() || !peak.n_ppm.is_finite() {
+                continue;
+            }
+            let parsed_label_id = peak.label.as_deref().and_then(extract_seq_id_from_label);
+            let mut seq_id = peak.seq_id.or(parsed_label_id).unwrap_or(next_fallback_id);
+            while used_ids.contains(&seq_id) {
+                seq_id = next_fallback_id;
+                next_fallback_id += 1;
+            }
+            used_ids.insert(seq_id);
+            next_fallback_id = next_fallback_id.max(seq_id + 1);
+
+            let res_name = peak
+                .res_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(normalize_res_name_3letter)
+                .or_else(|| {
+                    if seq_id >= 1 {
+                        seq_3letter.get((seq_id - 1) as usize).cloned()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "RES".to_string());
+
+            seeds.push(TargetPeakSeed {
+                seq_id,
+                res_name,
+                atom_h: "H".to_string(),
+                atom_x: "N".to_string(),
+                delta_h_ppm: peak.h_ppm,
+                delta_x_ppm: peak.n_ppm,
+            });
+        }
+
+        let n = seeds.len();
+        self.synced_peak_seeds = seeds;
+        self.status_banner = format!(
+            "Synced {n} locked HSQC peak footprints from Assign mode for pseudo-3D integration."
+        );
+        n
+    }
+
+    /// Parse an optional comma/whitespace/newline-separated `vdlist` or `vclist` delay override
+    /// string into seconds. Returns `Ok(None)` when `raw` is blank so Bruker's on-disk schedule is used.
+    pub fn parse_delays_override_str(
+        raw: &str,
+        vclist_unit_ms: Option<f64>,
+    ) -> Result<Option<Vec<f64>>, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let tokens: Vec<&str> = trimmed
+            .split(|c: char| c.is_ascii_whitespace() || c == ',' || c == ';')
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(tokens.len());
+        let unit_sec = vclist_unit_ms
+            .filter(|&u| u.is_finite() && u > 0.0)
+            .map(|u| u * 1.0e-3);
+        let all_plain_ints =
+            unit_sec.is_some() && tokens.iter().all(|t| t.chars().all(|c| c.is_ascii_digit()));
+        if all_plain_ints {
+            let u = unit_sec.unwrap_or(0.0);
+            for tok in tokens {
+                let n: u32 = tok
+                    .parse()
+                    .map_err(|e| format!("invalid vclist count '{tok}': {e}"))?;
+                out.push((n as f64) * u);
+            }
+        } else {
+            for tok in tokens {
+                let sec = parse_bruker_delay_token_sec(tok)?;
+                out.push(sec);
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Load a native Bruker pseudo-3D relaxation folder (`T1`/`R1`, `T2`/`R2`/`R1rho`, or
+    /// interleaved 2-plane `hetNOE`) via `nmr_core::relax_io`, process all planes with a single
+    /// locked recipe, integrate locked HSQC footprints, and fit decay curves / hetNOE immediately.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_bruker_pseudo3d_series(
+        &mut self,
+        kind: RelaxExperimentKind,
+        dir_path: impl AsRef<std::path::Path>,
+        hetnoe_order: HetNoeOrder,
+        delays_override: Option<&[f64]>,
+    ) -> Result<String, String> {
+        if !matches!(
+            kind,
+            RelaxExperimentKind::R1
+                | RelaxExperimentKind::R2
+                | RelaxExperimentKind::R1rho
+                | RelaxExperimentKind::HetNoe
+        ) {
+            return Err(format!(
+                "unsupported relaxation slot kind '{}' (expected R1, R2, R1rho, or hetNOE)",
+                kind.as_str()
+            ));
+        }
+
+        let path = dir_path.as_ref();
+        if !path.exists() {
+            return Err(format!(
+                "Bruker pseudo-3D folder does not exist: {}",
+                path.display()
+            ));
+        }
+
+        let schedule_override = match delays_override {
+            Some(vals) if !vals.is_empty() => {
+                for (idx, &v) in vals.iter().enumerate() {
+                    if !v.is_finite() || v < 0.0 {
+                        return Err(format!(
+                            "delays_override[{idx}] = {v} must be finite and >= 0 s"
+                        ));
+                    }
+                }
+                Some(RelaxSchedule::VariableDelaysSec {
+                    delays_sec: vals.to_vec(),
+                })
+            }
+            _ => None,
+        };
+
+        let unit_cycle_sec = if matches!(kind, RelaxExperimentKind::R2 | RelaxExperimentKind::R1rho)
+            && self.t2_vclist_unit_ms.is_finite()
+            && self.t2_vclist_unit_ms > 0.0
+        {
+            Some(self.t2_vclist_unit_ms * 1.0e-3)
+        } else {
+            None
+        };
+
+        let raw = nmr_core::relax_io::read_bruker_pseudo3d_with_hetnoe_order(
+            path,
+            None,
+            unit_cycle_sec,
+            schedule_override,
+            hetnoe_order,
+        )?;
+        let n_planes = raw.planes.len();
+        let warnings = raw.warnings.clone();
+        let (planes, _recipe) = nmr_core::relax_io::process_pseudo3d_fids(&raw.planes, None)?;
+
+        let seeds: Vec<TargetPeakSeed> = if !self.synced_peak_seeds.is_empty() {
+            self.synced_peak_seeds.clone()
+        } else {
+            let Some(ref_plane) = planes.first() else {
+                return Err("pseudo-3D folder yielded zero processed 2D planes".to_string());
+            };
+            let picked = nmr_core::picker::pick_hsqc_2d(
+                ref_plane,
+                &nmr_core::picker::PickerConfig::default(),
+            );
+            if picked.is_empty() {
+                return Err(
+                    "No HSQC peaks synced and auto-pick on plane 0 found 0 peaks. Sync HSQC peaks from Assign mode first."
+                        .to_string(),
+                );
+            }
+            picked
+                .iter()
+                .enumerate()
+                .map(|(idx, pk)| TargetPeakSeed {
+                    seq_id: (idx as i32) + 1,
+                    res_name: "RES".to_string(),
+                    atom_h: "H".to_string(),
+                    atom_x: "N".to_string(),
+                    delta_h_ppm: pk.h,
+                    delta_x_ppm: pk.n,
+                })
+                .collect()
+        };
+
+        let ds = nmr_core::relax_io::integrate_relax_planes(
+            raw.name,
+            kind,
+            raw.schedule,
+            &planes,
+            &seeds,
+            &nmr_core::relax_io::RelaxIntegrationConfig::default(),
+        )?;
+        let msg = self.ingest_series_dataset(&ds)?;
+
+        let slot = match kind {
+            RelaxExperimentKind::R1 => &mut self.t1_slot,
+            RelaxExperimentKind::R2 | RelaxExperimentKind::R1rho => &mut self.t2_slot,
+            RelaxExperimentKind::HetNoe => &mut self.hetnoe_slot,
+            _ => &mut self.t1_slot,
+        };
+        slot.dir_path = path.display().to_string();
+        slot.loaded_planes = n_planes;
+        slot.fitted_residues = ds.traces.len();
+        slot.warnings = warnings;
+        Ok(msg)
+    }
+
+    /// Collect all multi-field `ResidueRelaxRates` entries for a given `seq_id` (primary + auxiliary fields).
+    fn multifield_rates_for_seq_id(&self, seq_id: i32) -> Vec<ResidueRelaxRates> {
+        let mut out = Vec::new();
+        if let (Some(r1), Some(r2)) = (self.r1_fits.get(&seq_id), self.r2_fits.get(&seq_id)) {
+            let (hetnoe, sigma_hetnoe) = match self.hetnoe_fits.get(&seq_id) {
+                Some(n) => (Some(n.noe), Some(n.sigma_noe.max(1.0e-4))),
+                None => (None, None),
+            };
+            out.push(ResidueRelaxRates {
+                seq_id,
+                res_name: r1.res_name.clone(),
+                field_mhz: self.primary_field_mhz,
+                r1: r1.rate,
+                sigma_r1: r1.sigma_rate_mc.max(1.0e-4),
+                r2: r2.rate,
+                sigma_r2: r2.sigma_rate_mc.max(1.0e-4),
+                hetnoe,
+                sigma_hetnoe,
+            });
+        }
+        for aux in &self.aux_field_rates {
+            if let Some(entry) = aux.iter().find(|r| r.seq_id == seq_id) {
+                out.push(entry.clone());
+            }
+        }
+        out
+    }
+
+    /// Run Phase 22 (`T22.3`) linear optimal-window dynamics detectors on the currently fitted
+    /// `R1`/`R2`/`hetNOE` rates (including auxiliary fields when loaded).
+    pub fn run_phase22_detectors(&mut self) -> Result<String, String> {
+        let primary = self.primary_rate_table();
+        if primary.is_empty() {
+            return Err(
+                "Fit R1 and R2 rates before running Dynamics Detectors (T22.3)".to_string(),
+            );
+        }
+        let phys = RelaxPhysicsConfig::default();
+        let mut first_design: Option<DetectorDesign> = None;
+        let mut fits = BTreeMap::new();
+
+        for row in &primary {
+            let mf_rates = self.multifield_rates_for_seq_id(row.seq_id);
+            let Ok((exps, obs, cov)) = experiments_and_observations_from_rates(&mf_rates, &phys)
+            else {
+                continue;
+            };
+            let design_for_res = match &first_design {
+                Some(d) if d.experiments.len() == exps.len() => d.clone(),
+                _ => {
+                    let cfg = DetectorConfig {
+                        physics: phys,
+                        grid_points: 120,
+                        max_detectors: exps.len().clamp(1, 5),
+                        ..DetectorConfig::default()
+                    };
+                    let d = build_dynamics_detectors(&exps, &cfg)?;
+                    if first_design.is_none() {
+                        first_design = Some(d.clone());
+                    }
+                    d
+                }
+            };
+            if let Ok(fit) = design_for_res.estimate(&obs, Some(&cov)) {
+                fits.insert(row.seq_id, fit);
+            }
+        }
+
+        let design = first_design
+            .ok_or_else(|| "Unable to build Dynamics Detectors from fitted rates".to_string())?;
+        let k = design.num_detectors;
+        let n_res = fits.len();
+        self.detector_design = Some(design);
+        self.detector_fits = fits;
+        let msg = format!("Computed {k} Dynamics Detectors (T22.3) across {n_res} residues.");
+        self.status_banner.clone_from(&msg);
+        Ok(msg)
+    }
+
+    /// Run Phase 22 (`T22.4`) `IMPACT` simplex correlation-time decomposition directly on the
+    /// fitted `R1`/`R2`/`hetNOE` rates.
+    pub fn run_phase22_impact(&mut self) -> Result<String, String> {
+        let primary = self.primary_rate_table();
+        if primary.is_empty() {
+            return Err("Fit R1, R2, and hetNOE rates before running IMPACT (T22.4)".to_string());
+        }
+        let phys = RelaxPhysicsConfig::default();
+        let cfg = ImpactConfig {
+            mc_replicates: 40,
+            ..ImpactConfig::default()
+        };
+        let fallback_grid = log_spaced_grid(cfg.tau_min_sec, cfg.tau_max_sec, 3)?;
+        let mut out = BTreeMap::new();
+
+        for row in &primary {
+            let mf_rates: Vec<ResidueRelaxRates> = self
+                .multifield_rates_for_seq_id(row.seq_id)
+                .into_iter()
+                .filter(|r| r.hetnoe.is_some())
+                .collect();
+            if mf_rates.is_empty() {
+                continue;
+            }
+            let fit_res = if mf_rates.len() >= 2 {
+                select_impact_model_aicc_from_rates(&mf_rates, &[3, 4, 5], &phys, &cfg)
+                    .map(|sel| sel.best_fit)
+                    .or_else(|_| {
+                        fit_impact_from_multi_field_rates(&mf_rates, &fallback_grid, &phys, &cfg)
+                    })
+            } else {
+                fit_impact_from_multi_field_rates(&mf_rates, &fallback_grid, &phys, &cfg)
+            };
+            if let Ok(fit) = fit_res {
+                out.insert(row.seq_id, fit);
+            }
+        }
+
+        if out.is_empty() {
+            return Err(
+                "IMPACT (T22.4) requires R1, R2, and hetNOE rates for spectral density stacking"
+                    .to_string(),
+            );
+        }
+        let n_res = out.len();
+        self.impact_fits = out;
+        let msg = format!("Converged IMPACT (T22.4) simplex decomposition for {n_res} residues.");
+        self.status_banner.clone_from(&msg);
+        Ok(msg)
+    }
+
+    /// Run Phase 22 (`T22.5`) `TRACT` $R_{\text{ex}}$-free $\tau_m$ inversion from TROSY ($\alpha$)
+    /// and anti-TROSY ($\beta$) transverse decay rates (`R_beta > R_alpha`).
+    pub fn run_phase22_tract(
+        &mut self,
+        r_alpha_s_inv: f64,
+        sigma_r_alpha: f64,
+        r_beta_s_inv: f64,
+        sigma_r_beta: f64,
+    ) -> Result<String, String> {
+        if !r_alpha_s_inv.is_finite() || !r_beta_s_inv.is_finite() || r_beta_s_inv <= r_alpha_s_inv
+        {
+            return Err(
+                "TRACT requires finite rates with R_beta > R_alpha (eta_xy = (R_beta - R_alpha)/2 > 0)"
+                    .to_string(),
+            );
+        }
+        let eta_xy = 0.5 * (r_beta_s_inv - r_alpha_s_inv);
+        let sigma_eta_xy =
+            0.5 * (sigma_r_alpha.max(0.0).powi(2) + sigma_r_beta.max(0.0).powi(2)).sqrt();
+        let phys = CcrPhysicsConfig::default();
+        let tau_m_rigid = invert_tract_eta_xy_to_tau_m(
+            eta_xy,
+            sigma_eta_xy,
+            self.primary_field_mhz,
+            1.0,
+            0.0,
+            &phys,
+        )?;
+        let s2 = self.tract_assumed_s2.clamp(0.2, 1.0);
+        let tau_m_s2_corrected = if s2 < 0.999 {
+            invert_tract_eta_xy_to_tau_m(
+                eta_xy,
+                sigma_eta_xy,
+                self.primary_field_mhz,
+                s2,
+                0.0,
+                &phys,
+            )
+            .ok()
+        } else {
+            None
+        };
+        let kappa0_sec = phys.theoretical_kappa0(self.primary_field_mhz)?;
+        self.tract_r_alpha_input = r_alpha_s_inv;
+        self.tract_r_beta_input = r_beta_s_inv;
+        self.tract_report = Some(TractSummaryReport {
+            field_mhz: self.primary_field_mhz,
+            r_alpha_s_inv,
+            r_beta_s_inv,
+            eta_xy_s_inv: eta_xy,
+            sigma_eta_xy_s_inv: sigma_eta_xy,
+            tau_m_rigid,
+            tau_m_s2_corrected,
+            kappa0_sec,
+        });
+        let msg = format!(
+            "TRACT (T22.5): eta_xy = {eta_xy:.2} s^-1 -> rigid tau_m = {:.2} ns (kappa_0 = {kappa0_sec:.2})",
+            tau_m_rigid.tau_m_sec * 1.0e9
+        );
+        self.status_banner.clone_from(&msg);
+        Ok(msg)
+    }
+
+    /// Run all three Phase 22 analyses (`T22.3` Detectors, `T22.4` IMPACT, and `T22.5` TRACT)
+    /// directly on the currently fitted `R1`/`R2`/`hetNOE` rates.
+    pub fn run_phase22_suite(&mut self) -> Result<String, String> {
+        let det_msg = self.run_phase22_detectors()?;
+        let imp_ok = self.run_phase22_impact().is_ok();
+        // Seed TRACT alpha/beta from fitted Model-Free tau_m when available, else keep user inputs.
+        if let Some(mf) = &self.modelfree_result {
+            let tm = mf.diffusion_tensor.effective_tau_m_sec();
+            let phys = CcrPhysicsConfig::default();
+            if let Ok(obs) = compute_full_relax_and_ccr_isotropic(
+                tm,
+                self.tract_assumed_s2.clamp(0.2, 1.0),
+                0.0,
+                0.0,
+                self.primary_field_mhz,
+                &phys,
+            ) {
+                self.tract_r_alpha_input = obs.r_alpha;
+                self.tract_r_beta_input = obs.r_beta;
+            }
+        }
+        let _ = self.run_phase22_tract(
+            self.tract_r_alpha_input,
+            0.20,
+            self.tract_r_beta_input,
+            0.35,
+        );
+        let msg = format!(
+            "{det_msg} IMPACT: {} residues. TRACT: {}.",
+            if imp_ok { self.impact_fits.len() } else { 0 },
+            self.tract_report
+                .as_ref()
+                .map(|t| format!("tau_m = {:.2} ns", t.tau_m_rigid.tau_m_sec * 1.0e9))
+                .unwrap_or_else(|| "n/a".to_string())
+        );
+        self.status_banner.clone_from(&msg);
+        Ok(msg)
     }
 
     /// Import a relaxation series (`R1`, `R2`/`R1rho`, or `hetNOE`) from TSV or NEF text and fit immediately.
@@ -853,33 +1470,763 @@ impl RelaxPanelState {
 
         ui.separator();
 
-        if !self.has_fitted_rates() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(28.0);
-                ui.label(
-                    egui::RichText::new(
-                        "No relaxation curves loaded yet. Click 'Demo 600+800 MHz' or open 'Advanced Fitting & Export' to paste TSV/NEF.",
-                    )
-                    .size(12.5),
-                );
-            });
-            return actions;
+        // Connected folder-style sub-tabs inside `last_canvas_rect` so the top toolbar stays
+        // well within the <= 12 primary-control budget while giving 1-click access to Curves/M1-M5,
+        // Pseudo-3D Bruker T1/T2/hetNOE import, and Phase 22 Detectors / IMPACT / TRACT.
+        self.draw_studio_sub_tabs(ui);
+
+        match self.active_sub_tab {
+            RelaxStudioSubTab::CurvesAndModelFree => {
+                if !self.has_fitted_rates() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(28.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "No relaxation curves loaded yet. Open 'Pseudo-3D T1/T2/hetNOE', click 'Demo 600+800 MHz', or paste TSV/NEF.",
+                            )
+                            .size(TYPE_BODY_PX),
+                        );
+                    });
+                    return actions;
+                }
+
+                let avail_h = ui.available_height().max(420.0);
+                let decay_h = (avail_h * 0.28).clamp(148.0, 210.0);
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    // 1. Interactive I(tau) mono-exponential decay plot with fitted curve + MC 1-sigma envelope
+                    self.draw_decay_curve_canvas(ui, sequence, seq_ids, decay_h, &mut actions);
+                    ui.add_space(4.0);
+
+                    // 2. Per-residue sequence bar tracks: R1, R2, hetNOE, S^2, R_ex
+                    let track_h = ((ui.available_height() - 42.0) / 5.0).clamp(44.0, 74.0);
+                    self.draw_sequence_tracks_canvas(ui, sequence, seq_ids, track_h, &mut actions);
+                });
+            }
+            RelaxStudioSubTab::Pseudo3dImport => {
+                self.draw_pseudo3d_import_tab(ui, pdb_text, &mut actions);
+            }
+            RelaxStudioSubTab::DetectorsImpactTract => {
+                self.draw_phase22_dynamics_tab(ui, sequence, seq_ids, &mut actions);
+            }
         }
 
-        let avail_h = ui.available_height().max(420.0);
-        let decay_h = (avail_h * 0.28).clamp(148.0, 210.0);
-
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // 1. Interactive I(tau) mono-exponential decay plot with fitted curve + MC 1-sigma envelope
-            self.draw_decay_curve_canvas(ui, sequence, seq_ids, decay_h, &mut actions);
-            ui.add_space(4.0);
-
-            // 2. Per-residue sequence bar tracks: R1, R2, hetNOE, S^2, R_ex
-            let track_h = ((ui.available_height() - 42.0) / 5.0).clamp(44.0, 74.0);
-            self.draw_sequence_tracks_canvas(ui, sequence, seq_ids, track_h, &mut actions);
-        });
-
         actions
+    }
+
+    fn draw_studio_sub_tabs(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            for tab in RelaxStudioSubTab::ALL {
+                let selected = self.active_sub_tab == tab;
+                let fill = if selected {
+                    egui::Color32::from_rgb(16, 22, 32)
+                } else {
+                    egui::Color32::from_rgb(24, 31, 44)
+                };
+                let stroke_col = if selected {
+                    egui::Color32::from_rgb(84, 198, 250)
+                } else {
+                    egui::Color32::from_rgb(56, 70, 92)
+                };
+                let text_col = if selected {
+                    egui::Color32::from_rgb(238, 246, 255)
+                } else {
+                    egui::Color32::from_rgb(172, 188, 210)
+                };
+                let btn = egui::Button::new(
+                    egui::RichText::new(tab.label())
+                        .size(TYPE_CAPTION_PX)
+                        .color(text_col),
+                )
+                .fill(fill)
+                .stroke(egui::Stroke::new(
+                    if selected { 1.4 } else { 1.0 },
+                    stroke_col,
+                ))
+                .corner_radius(egui::CornerRadius {
+                    nw: 5,
+                    ne: 5,
+                    sw: 0,
+                    se: 0,
+                });
+                if ui.add(btn).clicked() {
+                    self.active_sub_tab = tab;
+                }
+            }
+        });
+        let sep_y = ui.cursor().top();
+        let x0 = ui.available_rect_before_wrap().left();
+        let x1 = ui.available_rect_before_wrap().right();
+        ui.painter().line_segment(
+            [egui::pos2(x0, sep_y), egui::pos2(x1, sep_y)],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 60, 80)),
+        );
+        ui.add_space(4.0);
+    }
+
+    fn draw_pseudo3d_import_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        pdb_text: Option<&str>,
+        actions: &mut Vec<RelaxPanelAction>,
+    ) {
+        egui::ScrollArea::vertical()
+            .id_salt("relax_pseudo3d_import_scroll")
+            .show(ui, |ui| {
+                // Locked HSQC footprint readiness banner
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgb(18, 24, 35))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 60, 82)))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new("Locked HSQC Peak Footprint Reference:")
+                                    .size(TYPE_BODY_PX)
+                                    .strong(),
+                            );
+                            if !self.synced_peak_seeds.is_empty() {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(86, 228, 154),
+                                    egui::RichText::new(format!(
+                                        "{} Assign-mode HSQC peaks synced",
+                                        self.synced_peak_seeds.len()
+                                    ))
+                                    .size(TYPE_BODY_PX),
+                                );
+                            } else {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(248, 182, 74),
+                                    egui::RichText::new(
+                                        "0 synced (will auto-pick plane 0 or sync HSQC peaks from Assign)",
+                                    )
+                                    .size(TYPE_CAPTION_PX),
+                                );
+                            }
+                        });
+                    });
+
+                ui.add_space(6.0);
+
+                #[cfg(target_arch = "wasm32")]
+                {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(248, 182, 74),
+                        egui::RichText::new(
+                            "Native Bruker folder loading is available on desktop builds; in WebAssembly use TSV/NEF import or Demo 600+800 MHz.",
+                        )
+                        .size(TYPE_CAPTION_PX),
+                    );
+                    ui.add_space(4.0);
+                }
+
+                // Slot 1: T1 (R1)
+                self.draw_pseudo3d_slot_card(
+                    ui,
+                    "Slot 1 - T1 (R1) Pseudo-3D Folder",
+                    RelaxExperimentKind::R1,
+                    egui::Color32::from_rgb(76, 185, 255),
+                    actions,
+                );
+                ui.add_space(6.0);
+
+                // Slot 2: T2 (R2)
+                self.draw_pseudo3d_slot_card(
+                    ui,
+                    "Slot 2 - T2 (R2) Pseudo-3D Folder",
+                    RelaxExperimentKind::R2,
+                    egui::Color32::from_rgb(255, 162, 68),
+                    actions,
+                );
+                ui.add_space(6.0);
+
+                // Slot 3: hetNOE
+                self.draw_pseudo3d_slot_card(
+                    ui,
+                    "Slot 3 - {1H}-15N hetNOE Pseudo-3D Folder",
+                    RelaxExperimentKind::HetNoe,
+                    egui::Color32::from_rgb(176, 128, 248),
+                    actions,
+                );
+                ui.add_space(8.0);
+
+                // 1-Click Run Model-Free & Phase 22 Bridge
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgb(16, 26, 36))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(52, 86, 108)))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            let ready = !self.r1_fits.is_empty() && !self.r2_fits.is_empty();
+                            let mf_btn = egui::Button::new(
+                                egui::RichText::new("Run Model-Free")
+                                    .size(TYPE_BODY_PX)
+                                    .strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(26, 114, 86));
+                            if ui
+                                .add_enabled(ready, mf_btn)
+                                .on_hover_text(
+                                    "Fit Lipari-Szabo M1-M5 using the fitted R1/R2/hetNOE rates and loaded PDB/AF structure",
+                                )
+                                .clicked()
+                            {
+                                match self.run_modelfree(pdb_text) {
+                                    Ok(msg) => {
+                                        self.active_sub_tab = RelaxStudioSubTab::CurvesAndModelFree;
+                                        actions.push(RelaxPanelAction::StatusMessage(msg));
+                                    }
+                                    Err(e) => self.status_banner = format!("Model-Free error: {e}"),
+                                }
+                            }
+                            if ui
+                                .add_enabled(
+                                    ready,
+                                    egui::Button::new(
+                                        egui::RichText::new("Run Detectors / IMPACT / TRACT")
+                                            .size(TYPE_BODY_PX),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                match self.run_phase22_suite() {
+                                    Ok(msg) => {
+                                        self.active_sub_tab =
+                                            RelaxStudioSubTab::DetectorsImpactTract;
+                                        actions.push(RelaxPanelAction::StatusMessage(msg));
+                                    }
+                                    Err(e) => {
+                                        self.status_banner = format!("Phase 22 dynamics error: {e}")
+                                    }
+                                }
+                            }
+                            let struct_hint = if pdb_text.is_some() {
+                                "PDB/AF N-H vectors active (anisotropic diffusion enabled)"
+                            } else {
+                                "No PDB loaded (isotropic diffusion)"
+                            };
+                            ui.label(
+                                egui::RichText::new(struct_hint)
+                                    .size(TYPE_CAPTION_PX)
+                                    .color(egui::Color32::from_rgb(155, 190, 215)),
+                            );
+                        });
+                    });
+            });
+    }
+
+    fn draw_pseudo3d_slot_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        title: &str,
+        kind: RelaxExperimentKind,
+        accent: egui::Color32,
+        actions: &mut Vec<RelaxPanelAction>,
+    ) {
+        let fitted_count = match kind {
+            RelaxExperimentKind::R1 => self.r1_fits.len(),
+            RelaxExperimentKind::R2 | RelaxExperimentKind::R1rho => self.r2_fits.len(),
+            RelaxExperimentKind::HetNoe => self.hetnoe_fits.len(),
+            _ => 0,
+        };
+        let (dir_buf, delays_buf, loaded_planes, warnings_len) = match kind {
+            RelaxExperimentKind::R1 => (
+                &mut self.t1_slot.dir_path,
+                &mut self.t1_slot.delays_text,
+                self.t1_slot.loaded_planes,
+                self.t1_slot.warnings.len(),
+            ),
+            RelaxExperimentKind::R2 | RelaxExperimentKind::R1rho => (
+                &mut self.t2_slot.dir_path,
+                &mut self.t2_slot.delays_text,
+                self.t2_slot.loaded_planes,
+                self.t2_slot.warnings.len(),
+            ),
+            _ => (
+                &mut self.hetnoe_slot.dir_path,
+                &mut self.hetnoe_slot.delays_text,
+                self.hetnoe_slot.loaded_planes,
+                self.hetnoe_slot.warnings.len(),
+            ),
+        };
+
+        let mut trigger_load = false;
+        egui::Frame::group(ui.style())
+            .fill(egui::Color32::from_rgb(18, 23, 33))
+            .stroke(egui::Stroke::new(1.0, accent.gamma_multiply(0.55)))
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(TYPE_BODY_PX)
+                            .strong()
+                            .color(accent),
+                    );
+                    let badge = if fitted_count > 0 {
+                        format!("{fitted_count} residues fitted ({loaded_planes} planes)")
+                    } else {
+                        "Not loaded".to_string()
+                    };
+                    ui.label(egui::RichText::new(badge).size(TYPE_CAPTION_PX).color(
+                        if fitted_count > 0 {
+                            egui::Color32::from_rgb(98, 228, 160)
+                        } else {
+                            egui::Color32::from_rgb(138, 152, 174)
+                        },
+                    ));
+                    if warnings_len > 0 {
+                        ui.label(
+                            egui::RichText::new(format!("({warnings_len} warnings)"))
+                                .size(TYPE_CAPTION_PX)
+                                .color(egui::Color32::from_rgb(248, 182, 74)),
+                        );
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Bruker Dir:").size(TYPE_CAPTION_PX));
+                    ui.add(
+                        egui::TextEdit::singleline(dir_buf)
+                            .id_salt(format!("relax_dir_{}", kind.as_str()))
+                            .desired_width((ui.available_width() - 135.0).max(140.0))
+                            .font(egui::FontId::monospace(TYPE_CAPTION_PX))
+                            .hint_text("/path/to/bruker/expno (acqus + ser + vdlist/vclist)"),
+                    );
+                    let btn_lbl = match kind {
+                        RelaxExperimentKind::R1 => "Load & Fit T1",
+                        RelaxExperimentKind::R2 | RelaxExperimentKind::R1rho => "Load & Fit T2",
+                        _ => "Load hetNOE",
+                    };
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new(btn_lbl).size(TYPE_CAPTION_PX),
+                        ))
+                        .clicked()
+                    {
+                        trigger_load = true;
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    if kind == RelaxExperimentKind::HetNoe {
+                        ui.label(egui::RichText::new("Plane Order:").size(TYPE_CAPTION_PX));
+                        for (ord, lbl) in [
+                            (HetNoeOrder::RefFirst, "Ref-First"),
+                            (HetNoeOrder::SatFirst, "Sat-First"),
+                            (HetNoeOrder::Auto, "Auto (pulprog)"),
+                        ] {
+                            if ui
+                                .add(egui::Button::selectable(
+                                    self.hetnoe_order == ord,
+                                    egui::RichText::new(lbl).size(TYPE_CAPTION_PX),
+                                ))
+                                .clicked()
+                            {
+                                self.hetnoe_order = ord;
+                            }
+                        }
+                    } else {
+                        let sched_lbl = if kind == RelaxExperimentKind::R1 {
+                            "vdlist delays:"
+                        } else {
+                            "vdlist / vclist:"
+                        };
+                        ui.label(egui::RichText::new(sched_lbl).size(TYPE_CAPTION_PX));
+                        ui.add(
+                            egui::TextEdit::singleline(delays_buf)
+                                .id_salt(format!("relax_delays_{}", kind.as_str()))
+                                .desired_width(240.0)
+                                .font(egui::FontId::monospace(TYPE_CAPTION_PX))
+                                .hint_text("optional override, e.g. 0.01, 0.05, 0.15, 0.4, 0.8"),
+                        );
+                        if matches!(kind, RelaxExperimentKind::R2 | RelaxExperimentKind::R1rho) {
+                            ui.label(
+                                egui::RichText::new("vclist unit (ms):").size(TYPE_CAPTION_PX),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.t2_vclist_unit_ms)
+                                    .range(0.0..=50.0)
+                                    .speed(0.2)
+                                    .fixed_decimals(2),
+                            );
+                        }
+                    }
+                });
+            });
+
+        if trigger_load {
+            let dir_str = match kind {
+                RelaxExperimentKind::R1 => self.t1_slot.dir_path.clone(),
+                RelaxExperimentKind::R2 | RelaxExperimentKind::R1rho => {
+                    self.t2_slot.dir_path.clone()
+                }
+                _ => self.hetnoe_slot.dir_path.clone(),
+            };
+            let delays_str = match kind {
+                RelaxExperimentKind::R1 => self.t1_slot.delays_text.clone(),
+                RelaxExperimentKind::R2 | RelaxExperimentKind::R1rho => {
+                    self.t2_slot.delays_text.clone()
+                }
+                _ => String::new(),
+            };
+            let unit_ms = matches!(kind, RelaxExperimentKind::R2 | RelaxExperimentKind::R1rho)
+                .then_some(self.t2_vclist_unit_ms);
+            match Self::parse_delays_override_str(&delays_str, unit_ms) {
+                Ok(override_opt) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        match self.load_bruker_pseudo3d_series(
+                            kind,
+                            &dir_str,
+                            self.hetnoe_order,
+                            override_opt.as_deref(),
+                        ) {
+                            Ok(msg) => actions.push(RelaxPanelAction::StatusMessage(msg)),
+                            Err(e) => self.status_banner = format!("Pseudo-3D load error: {e}"),
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let _ = (&dir_str, override_opt, actions);
+                        self.status_banner =
+                            "Native Bruker folder loading requires desktop build.".to_string();
+                    }
+                }
+                Err(e) => self.status_banner = format!("Delay schedule parse error: {e}"),
+            }
+        }
+    }
+
+    fn draw_phase22_dynamics_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        sequence: &[String],
+        seq_ids: &[i32],
+        actions: &mut Vec<RelaxPanelAction>,
+    ) {
+        egui::ScrollArea::vertical()
+            .id_salt("relax_phase22_dynamics_scroll")
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let has_r1_r2 = !self.r1_fits.is_empty() && !self.r2_fits.is_empty();
+                    if ui
+                        .add_enabled(
+                            has_r1_r2,
+                            egui::Button::new(
+                                egui::RichText::new("Run Detectors + IMPACT + TRACT")
+                                    .size(TYPE_BODY_PX)
+                                    .strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(28, 92, 118)),
+                        )
+                        .clicked()
+                    {
+                        match self.run_phase22_suite() {
+                            Ok(msg) => actions.push(RelaxPanelAction::StatusMessage(msg)),
+                            Err(e) => self.status_banner = format!("Phase 22 error: {e}"),
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            has_r1_r2,
+                            egui::Button::new(
+                                egui::RichText::new("Detectors (T22.3)").size(TYPE_CAPTION_PX),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        match self.run_phase22_detectors() {
+                            Ok(msg) => actions.push(RelaxPanelAction::StatusMessage(msg)),
+                            Err(e) => self.status_banner = format!("Detectors error: {e}"),
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            has_r1_r2,
+                            egui::Button::new(
+                                egui::RichText::new("IMPACT (T22.4)").size(TYPE_CAPTION_PX),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        match self.run_phase22_impact() {
+                            Ok(msg) => actions.push(RelaxPanelAction::StatusMessage(msg)),
+                            Err(e) => self.status_banner = format!("IMPACT error: {e}"),
+                        }
+                    }
+                });
+
+                ui.add_space(6.0);
+
+                // Section A: T22.3 Dynamics Detectors
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgb(18, 23, 33))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 66, 90)))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "T22.3 - Linear Optimal-Window Dynamics Detectors (rho_n(tau))",
+                            )
+                            .size(TYPE_BODY_PX)
+                            .strong()
+                            .color(egui::Color32::from_rgb(92, 210, 255)),
+                        );
+                        if let Some(design) = &self.detector_design {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} detectors across {} experiments (max overlap {:.3}, cond {:.2})",
+                                    design.num_detectors,
+                                    design.experiments.len(),
+                                    design.max_pairwise_overlap,
+                                    design.transform_condition_number
+                                ))
+                                .size(TYPE_CAPTION_PX)
+                                .color(egui::Color32::from_rgb(172, 192, 214)),
+                            );
+                            draw_detector_windows_canvas(ui, design);
+
+                            let active_sid = self
+                                .selected_seq_id
+                                .filter(|sid| self.detector_fits.contains_key(sid))
+                                .or_else(|| self.detector_fits.keys().next().copied());
+                            if let Some(sid) = active_sid {
+                                if let Some(dfit) = self.detector_fits.get(&sid) {
+                                    let rname = seq_ids
+                                        .iter()
+                                        .position(|&x| x == sid)
+                                        .and_then(|k| sequence.get(k))
+                                        .map(String::as_str)
+                                        .unwrap_or("RES");
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{rname}{sid} detector responses (chi2/dof = {:.2}/{}):",
+                                            dfit.chi2, dfit.dof
+                                        ))
+                                        .size(TYPE_CAPTION_PX)
+                                        .strong(),
+                                    );
+                                    egui::Grid::new("phase22_detector_table")
+                                        .num_columns(4)
+                                        .spacing([12.0, 2.0])
+                                        .striped(true)
+                                        .show(ui, |ui| {
+                                            ui.label(egui::RichText::new("Detector").size(TYPE_CAPTION_PX).strong());
+                                            ui.label(egui::RichText::new("Peak tau (ns)").size(TYPE_CAPTION_PX).strong());
+                                            ui.label(egui::RichText::new("Response").size(TYPE_CAPTION_PX).strong());
+                                            ui.label(egui::RichText::new("FWHM (dec)").size(TYPE_CAPTION_PX).strong());
+                                            ui.end_row();
+                                            for (idx, win) in design.windows.iter().enumerate() {
+                                                let resp = dfit.responses.get(idx).copied().unwrap_or(0.0);
+                                                let sig = dfit.sigmas.get(idx).copied().unwrap_or(0.0);
+                                                ui.label(
+                                                    egui::RichText::new(format!("rho_{idx}"))
+                                                        .monospace()
+                                                        .size(TYPE_CAPTION_PX),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{:.3}",
+                                                        win.peak_tau_sec * 1.0e9
+                                                    ))
+                                                    .monospace()
+                                                    .size(TYPE_CAPTION_PX),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(format!("{resp:.3} +- {sig:.3}"))
+                                                        .monospace()
+                                                        .size(TYPE_CAPTION_PX),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(format!("{:.2}", win.fwhm_decades))
+                                                        .monospace()
+                                                        .size(TYPE_CAPTION_PX),
+                                                );
+                                                ui.end_row();
+                                            }
+                                        });
+                                }
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Fit R1/R2/hetNOE rates and click 'Run Detectors + IMPACT + TRACT' to build timescale detector windows.",
+                                )
+                                .size(TYPE_CAPTION_PX)
+                                .color(egui::Color32::from_rgb(148, 162, 184)),
+                            );
+                        }
+                    });
+
+                ui.add_space(6.0);
+
+                // Section B: T22.4 IMPACT Simplex Decomposition
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgb(18, 23, 33))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(64, 58, 96)))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "T22.4 - IMPACT Simplex Correlation-Time Decomposition",
+                            )
+                            .size(TYPE_BODY_PX)
+                            .strong()
+                            .color(egui::Color32::from_rgb(186, 140, 252)),
+                        );
+                        let active_sid = self
+                            .selected_seq_id
+                            .filter(|sid| self.impact_fits.contains_key(sid))
+                            .or_else(|| self.impact_fits.keys().next().copied());
+                        if let Some(sid) = active_sid {
+                            if let Some(ifit) = self.impact_fits.get(&sid) {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Residue {sid}: M = {} timescales | sum(A) = {:.4} | chi2 = {:.2} | KKT = {:.2e}",
+                                        ifit.tau_grid_sec.len(),
+                                        ifit.sum_amplitudes,
+                                        ifit.chi2,
+                                        ifit.kkt_violation
+                                    ))
+                                    .size(TYPE_CAPTION_PX)
+                                    .color(egui::Color32::from_rgb(176, 192, 214)),
+                                );
+                                egui::Grid::new("phase22_impact_table")
+                                    .num_columns(3)
+                                    .spacing([12.0, 2.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new("tau_m (ns)").size(TYPE_CAPTION_PX).strong());
+                                        ui.label(egui::RichText::new("Weight A_m").size(TYPE_CAPTION_PX).strong());
+                                        ui.label(egui::RichText::new("MC 1-sigma").size(TYPE_CAPTION_PX).strong());
+                                        ui.end_row();
+                                        for (m, (&tau, &amp)) in ifit
+                                            .tau_grid_sec
+                                            .iter()
+                                            .zip(ifit.amplitudes.iter())
+                                            .enumerate()
+                                        {
+                                            let sig = ifit
+                                                .sigma_amplitudes_mc
+                                                .get(m)
+                                                .copied()
+                                                .unwrap_or(0.0);
+                                            ui.label(
+                                                egui::RichText::new(format!("{:.4}", tau * 1.0e9))
+                                                    .monospace()
+                                                    .size(TYPE_CAPTION_PX),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format!("{amp:.3}"))
+                                                    .monospace()
+                                                    .size(TYPE_CAPTION_PX),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format!("{sig:.3}"))
+                                                    .monospace()
+                                                    .size(TYPE_CAPTION_PX),
+                                            );
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Requires fitted R1, R2, and hetNOE rates for spectral-density simplex projection.",
+                                )
+                                .size(TYPE_CAPTION_PX)
+                                .color(egui::Color32::from_rgb(148, 162, 184)),
+                            );
+                        }
+                    });
+
+                ui.add_space(6.0);
+
+                // Section C: T22.5 TRACT R_ex-free tau_m Inversion
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgb(18, 23, 33))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(44, 82, 68)))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "T22.5 - TRACT (TROSY alpha/beta) R_ex-Free tau_m & CCR",
+                            )
+                            .size(TYPE_BODY_PX)
+                            .strong()
+                            .color(egui::Color32::from_rgb(94, 228, 160)),
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new("R_alpha (s^-1):").size(TYPE_CAPTION_PX));
+                            ui.add(
+                                egui::DragValue::new(&mut self.tract_r_alpha_input)
+                                    .range(0.1..=250.0)
+                                    .speed(0.1)
+                                    .fixed_decimals(2),
+                            );
+                            ui.label(egui::RichText::new("R_beta (s^-1):").size(TYPE_CAPTION_PX));
+                            ui.add(
+                                egui::DragValue::new(&mut self.tract_r_beta_input)
+                                    .range(0.2..=400.0)
+                                    .speed(0.1)
+                                    .fixed_decimals(2),
+                            );
+                            ui.label(egui::RichText::new("S^2:").size(TYPE_CAPTION_PX));
+                            ui.add(
+                                egui::DragValue::new(&mut self.tract_assumed_s2)
+                                    .range(0.2..=1.0)
+                                    .speed(0.01)
+                                    .fixed_decimals(2),
+                            );
+                            if ui
+                                .add(egui::Button::new(
+                                    egui::RichText::new("Compute TRACT tau_m")
+                                        .size(TYPE_CAPTION_PX),
+                                ))
+                                .clicked()
+                            {
+                                match self.run_phase22_tract(
+                                    self.tract_r_alpha_input,
+                                    0.20,
+                                    self.tract_r_beta_input,
+                                    0.35,
+                                ) {
+                                    Ok(msg) => actions.push(RelaxPanelAction::StatusMessage(msg)),
+                                    Err(e) => self.status_banner = format!("TRACT error: {e}"),
+                                }
+                            }
+                        });
+                        if let Some(tr) = &self.tract_report {
+                            let s2_txt = tr
+                                .tau_m_s2_corrected
+                                .map(|est| format!(" | S^2-corr tau_m = {:.2} ns", est.tau_m_sec * 1.0e9))
+                                .unwrap_or_default();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "eta_xy = {:.2} +- {:.2} s^-1 | rigid tau_m = {:.2} +- {:.2} ns{s2_txt} | Kroenke kappa_0 = {:.2}",
+                                    tr.eta_xy_s_inv,
+                                    tr.sigma_eta_xy_s_inv,
+                                    tr.tau_m_rigid.tau_m_sec * 1.0e9,
+                                    tr.tau_m_rigid.sigma_tau_m_sec * 1.0e9,
+                                    tr.kappa0_sec
+                                ))
+                                .monospace()
+                                .size(TYPE_CAPTION_PX)
+                                .color(egui::Color32::from_rgb(168, 236, 198)),
+                            );
+                        }
+                    });
+            });
     }
 
     fn draw_decay_curve_canvas(
@@ -1392,6 +2739,143 @@ impl RelaxPanelState {
             ui.add_space(3.0);
         }
     }
+}
+
+fn parse_sequence_3letter_tokens(sequence: &str) -> Vec<String> {
+    let trimmed = sequence.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let non_header_lines: Vec<&str> = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('>') && !l.starts_with(';'))
+        .collect();
+    let joined = non_header_lines.join(" ");
+    let tokens: Vec<&str> = joined
+        .split(|c: char| c.is_ascii_whitespace() || c == ',' || c == ';')
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.len() > 1
+        && tokens
+            .iter()
+            .all(|t| t.len() == 3 && t.chars().all(|c| c.is_ascii_alphabetic()))
+    {
+        return tokens.into_iter().map(|t| t.to_ascii_uppercase()).collect();
+    }
+    let mut out = Vec::new();
+    for line in non_header_lines {
+        for ch in line.chars() {
+            if ch.is_ascii_alphabetic() {
+                out.push(one_to_three(ch.to_ascii_uppercase()).to_string());
+            }
+        }
+    }
+    out
+}
+
+fn normalize_res_name_3letter(raw: &str) -> String {
+    let up = raw.trim().to_ascii_uppercase();
+    if up.len() == 1 {
+        if let Some(ch) = up.chars().next() {
+            return one_to_three(ch).to_string();
+        }
+    }
+    up
+}
+
+fn extract_seq_id_from_label(label: &str) -> Option<i32> {
+    let digits: String = label.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<i32>().ok().filter(|&v| v > 0)
+}
+
+fn draw_detector_windows_canvas(ui: &mut egui::Ui, design: &DetectorDesign) {
+    let desired = egui::vec2(ui.available_width().max(240.0), 108.0);
+    let (rect, _resp) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(14, 19, 27));
+    painter.rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 52, 70)),
+        egui::StrokeKind::Inside,
+    );
+
+    let pad_l = 36.0_f32;
+    let pad_r = 12.0_f32;
+    let pad_t = 10.0_f32;
+    let pad_b = 20.0_f32;
+    let plot = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + pad_l, rect.top() + pad_t),
+        egui::pos2(rect.right() - pad_r, rect.bottom() - pad_b),
+    );
+    if plot.width() <= 10.0 || plot.height() <= 10.0 || design.log10_tau_grid.len() < 2 {
+        return;
+    }
+
+    let z_min = design.log10_tau_grid.first().copied().unwrap_or(-13.0);
+    let z_max = design.log10_tau_grid.last().copied().unwrap_or(-7.0);
+    let z_span = (z_max - z_min).max(1.0e-6);
+
+    let palette = [
+        egui::Color32::from_rgb(76, 206, 252),
+        egui::Color32::from_rgb(92, 232, 154),
+        egui::Color32::from_rgb(248, 178, 68),
+        egui::Color32::from_rgb(196, 132, 252),
+        egui::Color32::from_rgb(246, 108, 118),
+    ];
+
+    for (w_idx, win) in design.windows.iter().enumerate() {
+        let col = palette[w_idx % palette.len()];
+        let pts: Vec<egui::Pos2> = design
+            .log10_tau_grid
+            .iter()
+            .zip(win.sensitivities.iter())
+            .map(|(&z, &rho)| {
+                let fx = ((z - z_min) / z_span).clamp(0.0, 1.0) as f32;
+                let fy = rho.clamp(0.0, 1.05) as f32 / 1.05;
+                egui::pos2(
+                    plot.left() + fx * plot.width(),
+                    plot.bottom() - fy * plot.height(),
+                )
+            })
+            .collect();
+        if pts.len() >= 2 {
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.6, col)));
+        }
+    }
+
+    painter.text(
+        egui::pos2(plot.left() - 4.0, plot.top() + 4.0),
+        egui::Align2::RIGHT_CENTER,
+        "1.0",
+        egui::FontId::monospace(TYPE_CAPTION_PX),
+        egui::Color32::from_rgb(138, 152, 174),
+    );
+    painter.text(
+        egui::pos2(plot.left() - 4.0, plot.bottom()),
+        egui::Align2::RIGHT_CENTER,
+        "0.0",
+        egui::FontId::monospace(TYPE_CAPTION_PX),
+        egui::Color32::from_rgb(138, 152, 174),
+    );
+    painter.text(
+        egui::pos2(plot.left(), plot.bottom() + 10.0),
+        egui::Align2::LEFT_CENTER,
+        format!("10^{z_min:.0}s"),
+        egui::FontId::monospace(TYPE_CAPTION_PX),
+        egui::Color32::from_rgb(138, 152, 174),
+    );
+    painter.text(
+        egui::pos2(plot.right(), plot.bottom() + 10.0),
+        egui::Align2::RIGHT_CENTER,
+        format!("10^{z_max:.0}s"),
+        egui::FontId::monospace(TYPE_CAPTION_PX),
+        egui::Color32::from_rgb(138, 152, 174),
+    );
 }
 
 #[cfg(test)]
