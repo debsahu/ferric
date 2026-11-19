@@ -21,6 +21,7 @@ pub mod classify;
 pub mod cofold_bridge;
 pub mod cpmg;
 pub mod csp;
+pub mod deconv_nd;
 pub mod dihedrals;
 pub mod domain_dock;
 pub mod dosy;
