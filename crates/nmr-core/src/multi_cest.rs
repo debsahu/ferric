@@ -5,15 +5,17 @@
 //! Provenance: Clean-room original implementation strictly from peer-reviewed biomolecular NMR
 //! spectroscopy and numerical analysis literature:
 //! - McConnell, H. M. (*J. Chem. Phys.* 1958, 28, 430–431 — reaction-modified Bloch equations).
-//! - Helgstrand, M., Härd, T. & Allard, P. (*J. Biomol. NMR* 2000, 18, 47–61 — homogeneous
+//! - Helgstrand, M., Härd, T. & Allard, P. (*J. Biomol. NMR* 2000, 18, 49–63 — homogeneous
 //!   `7x7` Cartesian operator basis `[E, M_Ax, M_Ay, M_Az, M_Bx, M_By, M_Bz]^T`).
 //! - Vallurupalli, P., Bouvignies, G. & Kay, L. E. (*J. Am. Chem. Soc.* 2012, 134, 8148–8161 —
 //!   2-state `7x7` homogeneous Bloch–McConnell `CEST` and `B1`-inhomogeneity quadrature).
-//! - Carneiro, M. G., Reddy, J. G., Griesinger, C. & Lee, D. (*J. Biomol. NMR* 2015, 62,
-//!   237–246 — `DANTE-CEST` pulse-train Bloch–McConnell propagator
+//! - Carneiro, M. G., Reddy, J. G., Griesinger, C. & Lee, D. (*J. Biomol. NMR* 2015, 63,
+//!   237–244 — Fourier-transform multi-frequency acceleration of `CEST` acquisition).
+//! - Yuwen, T., Kay, L. E. & Bouvignies, G. (*ChemPhysChem* 2018, 19, 1707–1710 — multi-site
+//!   `DANTE-CEST` pulse-train Bloch–McConnell propagator
 //!   `U = (exp(L_delay * tau_d) * exp(L_pulse * tau_p))^N_pulses`).
-//! - Yuwen, T., Kay, L. E. & Bouvignies, G. (*J. Phys. Chem. Lett.* 2018, 9, 2501–2507 —
-//!   cosine-modulated `cos-CEST` dual-sideband saturation propagator
+//! - Yuwen, T., Bouvignies, G. & Kay, L. E. (*J. Magn. Reson.* 2018, 292, 1–7 — band-selective
+//!   `DANTE-CEST` and cosine-modulated `cos-CEST` dual-sideband saturation propagator
 //!   `omega_1(t) = 2 * omega_{1,eff} * cos(2 * pi * nu_mod * t)`).
 //! - Higham, N. J. (*SIAM J. Matrix Anal. Appl.* 2005, 26, 1179–1193 — scaling-and-squaring
 //!   `[6/6]` Padé matrix exponential).
@@ -219,7 +221,8 @@ pub enum MultiCestScheme {
         /// Continuous-wave RF nutation frequency `nu_1` (`Hz`).
         b1_hz: f64,
     },
-    /// `DANTE-CEST` pulse-train saturation (Carneiro et al., *J. Biomol. NMR* 2015, 62, 237–246):
+    /// `DANTE-CEST` pulse-train saturation (Yuwen, Kay & Bouvignies, *ChemPhysChem* 2018, 19,
+    /// 1707–1710; Yuwen, Bouvignies & Kay, *J. Magn. Reson.* 2018, 292, 1–7):
     /// `U = (exp(L_delay * tau_delay_s) * exp(L_pulse * tau_pulse_s))^n_pulses`.
     Dante {
         /// RF pulse duration `tau_p` per cycle (`s`).
@@ -231,8 +234,9 @@ pub enum MultiCestScheme {
         /// Peak RF nutation frequency `nu_{1,pulse}` during each pulse (`Hz`).
         b1_pulse_hz: f64,
     },
-    /// Cosine-modulated dual-sideband `cos-CEST` saturation (Yuwen, Kay & Bouvignies,
-    /// *J. Phys. Chem. Lett.* 2018, 9, 2501–2507):
+    /// Cosine-modulated dual-sideband `cos-CEST` saturation (Yuwen, Bouvignies & Kay,
+    /// *J. Magn. Reson.* 2018, 292, 1–7; Yuwen, Kay & Bouvignies, *ChemPhysChem* 2018, 19,
+    /// 1707–1710):
     /// `omega_1(t) = 2 * omega_{1,eff} * cos(2 * pi * nu_mod * t)`.
     CosModulated {
         /// Total saturation duration `T_EX` (`s`).
@@ -721,7 +725,7 @@ pub fn compute_multi_cest_e0_inv_i0(p: &MultiCestSimParams) -> Result<(f64, f64)
 }
 
 /// Build the single-cycle `DANTE-CEST` propagator `P_cycle = exp(L_delay * tau_d) * exp(L_pulse * tau_p)`
-/// (Carneiro et al., *J. Biomol. NMR* 2015, 62, 237–246) as identity deviation `P_cycle - I`.
+/// (Yuwen, Kay & Bouvignies, *ChemPhysChem* 2018, 19, 1707–1710) as identity deviation `P_cycle - I`.
 #[allow(clippy::too_many_arguments)]
 pub fn dante_cycle_propagator_m1(
     p_b: f64,
@@ -777,7 +781,7 @@ pub fn dante_cycle_propagator_m1(
 
 /// Build the single-period cosine-modulated `cos-CEST` Trotter propagator over
 /// `T_mod = 1 / mod_freq_hz` with `omega_1(t) = 2 * w1_eff_rad * cos(2 * pi * mod_freq_hz * t)`
-/// (Yuwen, Kay & Bouvignies, *J. Phys. Chem. Lett.* 2018, 9, 2501–2507), returning `P_cycle - I`.
+/// (Yuwen, Bouvignies & Kay, *J. Magn. Reson.* 2018, 292, 1–7), returning `P_cycle - I`.
 #[allow(clippy::too_many_arguments)]
 pub fn cos_cest_cycle_propagator_m1(
     p_b: f64,

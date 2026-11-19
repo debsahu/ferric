@@ -2,20 +2,26 @@
 //!
 //! Wires four core Phase 22 quantitative engines into a unified 4-tab connected-folder workbench
 //! window (`P22ToolsPanel`):
-//! 1. **Deconv 2D/3D (VarPro)** (`nmr_core::deconv_nd`, `T22.1`): Coupled multi-peak separable
+//! 1. **Deconv 2D (VarPro)** (`nmr_core::deconv_nd`, `T22.1`): Coupled multi-peak separable
 //!    Variable Projection (`VarPro`) Voigt/Lorentzian/Gaussian deconvolution on an active 2D
 //!    spectrum ROI window or 1-click overlapped doublet synthetic demo, reporting fitted centers,
 //!    linewidths, amplitudes, volumes, `reduced_chi2`, `crlb_valid`, and fail-closed diagnostics
 //!    (`ActiveBoundHit`, `ModelMisspecified`, `IllConditionedCluster`, `DegeneratePeakPair`).
-//! 2. **MaxEnt NUS** (`nmr_core::maxent_nus`, `T22.13`): Convex accelerated 2D hypercomplex
-//!    Maximum-Entropy non-uniform sampling reconstruction with configurable `lambda` (fixed or
-//!    Morozov discrepancy principle), `def`, `max_iter`, `States` / `States-TPPI` quadrature
-//!    encoding (surfacing the fail-closed error on `EchoAntiecho`), KKT stationarity residual,
-//!    duality gap, and explicit amplitude-nonlinearity disclosure vs linear/IST NUS.
+//!    Heavy solves run off the UI thread on native targets (`std::thread::spawn` + `mpsc`) and use
+//!    bounded fast-cap execution on `wasm32`.
+//! 2. **MaxEnt 2D NUS** (`nmr_core::maxent_nus`, `T22.13`): Convex accelerated 2D hypercomplex
+//!    Maximum-Entropy non-uniform sampling reconstruction from user-supplied 2D NUS interferogram
+//!    TSV (`t1_idx, t2_idx, re_cc, im_cs, im_sc, re_ss` or `t1_idx, re, im`) or the clearly badged
+//!    `[Synthetic 3-Peak Demo]` Poisson-gap generator, with configurable `lambda` (fixed or Morozov
+//!    discrepancy principle), `def`, `max_iter`, `States` / `States-TPPI` quadrature encoding
+//!    (surfacing the fail-closed error on `EchoAntiecho`), KKT stationarity residual, duality gap,
+//!    off-UI-thread native execution, and explicit amplitude-nonlinearity disclosure vs linear/IST NUS.
 //! 3. **ARTSY RDC** (`nmr_core::artsy_rdc`, `T22.9`): Intensity-based TROSY `^1J_NH + ^1D_NH` and
 //!    `^1D_NH +/- sigma` extraction from editable TSV (`seq_id, res_name, i_ref, i_att, sigma`)
-//!    or 1-click synthetic demo, with sortable table, quality flags (`Good`, `NearSaturation`,
-//!    `LowSnr`, `OutOfDomainRatio`), and 1-click Copy TSV.
+//!    or 1-click synthetic demo, with editable isotropic reference `J_iso +/- sigma_J` quadrature
+//!    error propagation (`sigma(D) = sqrt(sigma_JD^2 + sigma_J^2)`), sortable table, quality flags
+//!    (`Good`, `NearSaturation`, `LowSnr`, `OutOfDomainRatio`), isotropic-reference disclosure,
+//!    and 1-click Copy TSV.
 //! 4. **2D PCS & Curie CCR** (`nmr_core::pcs_transfer`, `T22.10`): Unassigned 2D diamagnetic-to-
 //!    paramagnetic `PCS` cone assignment transfer (Kuhn-Munkres minimum-cost matching +
 //!    Sinkhorn-Knopp entropic optimal-transport posteriors + iterative EM Huber-IRLS refinement)
@@ -78,13 +84,112 @@ use crate::vnmrj_rail::draw_folder_tab;
 use crate::workbench_mode::{TYPE_BODY_PX, TYPE_CAPTION_PX, TYPE_HEADER_PX};
 
 // ============================================================================
+// 0. Non-Blocking Native Background Job Slot (with wasm32 Fast-Cap Constants)
+// ============================================================================
+
+/// Default isotropic `^1J_NH` uncertainty (Hz) propagated in quadrature when no per-residue
+/// isotropic reference spectrum is supplied (`171.tools:P1-4`).
+pub const DEFAULT_ARTSY_J_ISO_SIGMA_HZ: f64 = 1.0;
+
+#[cfg(target_arch = "wasm32")]
+const WASM_DECONV_MAX_VOXELS: usize = 1600;
+#[cfg(target_arch = "wasm32")]
+const WASM_DECONV_MAX_ITERS: usize = 80;
+#[cfg(target_arch = "wasm32")]
+const WASM_MAXENT_MAX_POINTS: usize = 1024;
+#[cfg(target_arch = "wasm32")]
+const WASM_MAXENT_MAX_ITERS: usize = 120;
+#[cfg(target_arch = "wasm32")]
+const WASM_MAXENT_MAX_OUTER_ITERS: usize = 10;
+
+#[cfg(not(target_arch = "wasm32"))]
+enum BackgroundPoll<T> {
+    Idle,
+    Pending,
+    Ready(T),
+    Disconnected,
+}
+
+/// Single-flight background compute channel (`std::thread::spawn` + `mpsc::Receiver` on native;
+/// zero-sized idle marker on `wasm32`). Cloning state always resets the transient slot to idle.
+struct BackgroundJobSlot<T> {
+    #[cfg(not(target_arch = "wasm32"))]
+    rx: Option<std::sync::mpsc::Receiver<T>>,
+    #[cfg(target_arch = "wasm32")]
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T> Default for BackgroundJobSlot<T> {
+    fn default() -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            rx: None,
+            #[cfg(target_arch = "wasm32")]
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> Clone for BackgroundJobSlot<T> {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl<T> std::fmt::Debug for BackgroundJobSlot<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_running() {
+            f.write_str("BackgroundJobSlot(Running)")
+        } else {
+            f.write_str("BackgroundJobSlot(Idle)")
+        }
+    }
+}
+
+impl<T> BackgroundJobSlot<T> {
+    fn is_running(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.rx.is_some()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_receiver(&mut self, rx: std::sync::mpsc::Receiver<T>) {
+        self.rx = Some(rx);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll(&mut self) -> BackgroundPoll<T> {
+        let Some(rx) = self.rx.as_ref() else {
+            return BackgroundPoll::Idle;
+        };
+        match rx.try_recv() {
+            Ok(val) => {
+                self.rx = None;
+                BackgroundPoll::Ready(val)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => BackgroundPoll::Pending,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.rx = None;
+                BackgroundPoll::Disconnected
+            }
+        }
+    }
+}
+
+// ============================================================================
 // 1. Public Tab Enum & Theme Palette
 // ============================================================================
 
 /// The four Phase 22 Processing & Structural NMR tool tabs in [`P22ToolsPanel`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum P22ToolTab {
-    /// Coupled 2D/3D multi-peak Voigt/Lorentzian VarPro deconvolution (`T22.1`).
+    /// Coupled 2D multi-peak Voigt/Lorentzian VarPro deconvolution (`T22.1`).
     #[default]
     Deconv2d3d,
     /// Convex accelerated 2D hypercomplex MaxEnt NUS reconstruction (`T22.13`).
@@ -107,8 +212,8 @@ impl P22ToolTab {
     /// Short folder-tab title rendered by [`draw_folder_tab`].
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Deconv2d3d => "Deconv 2D/3D (VarPro)",
-            Self::MaxEntNus => "MaxEnt NUS",
+            Self::Deconv2d3d => "Deconv 2D (VarPro)",
+            Self::MaxEntNus => "MaxEnt 2D NUS",
             Self::ArtsyRdc => "ARTSY RDC",
             Self::PcsCurieCcr => "2D PCS & Curie CCR",
         }
@@ -118,13 +223,13 @@ impl P22ToolTab {
     pub const fn guidance_header(self) -> &'static str {
         match self {
             Self::Deconv2d3d => {
-                "Input: Active 2D spectrum ROI window or synthetic overlapped doublet + editable peak seeds -> Output: Coupled VarPro centers, FWHMs, amplitudes, CRLB SEs, reduced chi2 & fail-closed diagnostics."
+                "Input: Active 2D spectrum ROI window or synthetic overlapped doublet + editable peak seeds -> Output: Coupled 2D VarPro centers, FWHMs, amplitudes, CRLB SEs, reduced chi2 & fail-closed diagnostics."
             }
             Self::MaxEntNus => {
-                "Input: 2D NUS schedule (Poisson-gap demo or pasted t2,t1 list), quadrature mode, lambda & max_iter -> Output: Convex 2D MaxEnt spectrum, KKT residual, duality gap & nonlinearity disclosure."
+                "Input: User 2D NUS interferogram TSV (t1,t2,re_cc,im_cs,im_sc,re_ss or t1,re,im) or [Synthetic 3-Peak Demo] schedule, quad mode & lambda -> Output: Convex 2D MaxEnt spectrum, KKT residual, duality gap & nonlinearity disclosure."
             }
             Self::ArtsyRdc => {
-                "Input: ARTSY peak-intensity TSV (seq_id, res_name, i_ref, i_att, sigma), dephasing T & J_iso -> Output: Sortable |1J_NH + 1D_NH| and 1D_NH +/- sigma table, quality flags & Copy TSV."
+                "Input: ARTSY peak-intensity TSV (seq_id, res_name, i_ref, i_att, sigma), dephasing T & isotropic J_iso +/- sigma_J -> Output: Sortable |1J_NH + 1D_NH| and 1D_NH +/- sigma (quadrature) table, quality flags & Copy TSV."
             }
             Self::PcsCurieCcr => {
                 "Input: Assigned diamagnetic + unassigned paramagnetic 2D peaks (with optional 3D coords & Gamma_CCR) -> Output: Kuhn-Munkres/Sinkhorn PCS transfer + Curie-spin DeltaChi & chi_iso tensor fit."
@@ -193,7 +298,7 @@ impl P22ToolsTheme {
 }
 
 // ============================================================================
-// 2. Tab 1 State: Coupled 2D/3D VarPro Deconvolution (`T22.1`)
+// 2. Tab 1 State: Coupled 2D VarPro Deconvolution (`T22.1`)
 // ============================================================================
 
 /// Data source for 2D VarPro lineshape deconvolution.
@@ -206,7 +311,16 @@ pub enum DeconvDataSource {
     ActiveSpectrum2D,
 }
 
-/// Non-destructively editable state for the `Deconv 2D/3D (VarPro)` tab.
+#[cfg(not(target_arch = "wasm32"))]
+struct DeconvBgOutput {
+    roi: Roi2D,
+    outcome: Result<DeconvResult2D, String>,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct DeconvBgOutput;
+
+/// Non-destructively editable state for the `Deconv 2D (VarPro)` tab.
 #[derive(Clone, Debug)]
 pub struct DeconvTabState {
     pub source: DeconvDataSource,
@@ -243,6 +357,8 @@ pub struct DeconvTabState {
     /// Last status or error message.
     pub status_message: String,
     pub error_message: Option<String>,
+    /// Background native worker slot (`std::thread::spawn` + `mpsc::Receiver`).
+    bg_job: BackgroundJobSlot<DeconvBgOutput>,
 }
 
 impl Default for DeconvTabState {
@@ -292,6 +408,7 @@ impl Default for DeconvTabState {
             result: None,
             status_message: "Click Synthetic Demo or Run 2D VarPro Deconvolution.".to_string(),
             error_message: None,
+            bg_job: BackgroundJobSlot::default(),
         }
     }
 }
@@ -460,18 +577,23 @@ impl DeconvTabState {
             eta_f1: 0.5,
             eta_f2: 0.5,
         }];
+        self.use_known_sigma = false;
         self.source = DeconvDataSource::ActiveSpectrum2D;
     }
 
-    /// Run `nmr_core::deconv_nd::deconvolve_roi_2d` using the current editable ROI and seeds.
-    pub fn run(&mut self, active_2d: Option<&Spectrum2D>) -> Result<(), String> {
-        let roi = match self.source {
+    /// True while a background native 2D VarPro solve is currently running.
+    pub fn is_computing(&self) -> bool {
+        self.bg_job.is_running()
+    }
+
+    fn prepare_roi(&self, active_2d: Option<&Spectrum2D>) -> Result<Roi2D, String> {
+        match self.source {
             DeconvDataSource::SyntheticDemo => {
                 if let Some(existing) = self.last_roi.clone() {
-                    existing
+                    Ok(existing)
                 } else {
                     let (r, _) = self.build_synthetic_doublet_roi()?;
-                    r
+                    Ok(r)
                 }
             }
             DeconvDataSource::ActiveSpectrum2D => {
@@ -484,17 +606,28 @@ impl DeconvTabState {
                     (self.f1_min_ppm, self.f1_max_ppm),
                     (self.f2_min_ppm, self.f2_max_ppm),
                 )
-                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())
             }
-        };
+        }
+    }
 
-        let cfg = self.build_config();
-        self.last_roi = Some(roi.clone());
-        match deconvolve_roi_2d(&roi, &self.seeds, &cfg) {
+    fn apply_outcome(
+        &mut self,
+        roi: Roi2D,
+        outcome: Result<DeconvResult2D, String>,
+        wasm_capped: bool,
+    ) -> Result<(), String> {
+        self.last_roi = Some(roi);
+        match outcome {
             Ok(res) => {
                 let diag_str = format_deconv_diagnostic(res.diagnostic);
+                let cap_note = if wasm_capped {
+                    " [wasm32 fast-cap]"
+                } else {
+                    ""
+                };
                 self.status_message = format!(
-                    "VarPro complete: {} peak(s), {} iters, status={}, chi2_nu={:.3}, CRLB={}",
+                    "VarPro complete{cap_note}: {} peak(s), {} iters, status={}, chi2_nu={:.3}, CRLB={}",
                     res.peaks.len(),
                     res.iterations,
                     diag_str,
@@ -509,12 +642,137 @@ impl DeconvTabState {
                 self.result = Some(res);
                 Ok(())
             }
-            Err(err) => {
-                let msg = err.to_string();
+            Err(msg) => {
+                self.result = None;
                 self.error_message = Some(msg.clone());
                 self.status_message = "VarPro failed closed on input validation.".to_string();
                 Err(msg)
             }
+        }
+    }
+
+    /// Synchronously run `nmr_core::deconv_nd::deconvolve_roi_2d` (deterministic helper for
+    /// headless tests and direct callers). Clears stale results on any `Err(...)`.
+    pub fn run(&mut self, active_2d: Option<&Spectrum2D>) -> Result<(), String> {
+        self.run_sync(active_2d)
+    }
+
+    /// Explicit synchronous execution helper for deterministic headless tests.
+    pub fn run_sync(&mut self, active_2d: Option<&Spectrum2D>) -> Result<(), String> {
+        let roi = match self.prepare_roi(active_2d) {
+            Ok(r) => r,
+            Err(msg) => {
+                self.result = None;
+                self.error_message = Some(msg.clone());
+                self.status_message = "VarPro failed closed on ROI preparation.".to_string();
+                return Err(msg);
+            }
+        };
+        let cfg = self.build_config();
+        let out = deconvolve_roi_2d(&roi, &self.seeds, &cfg).map_err(|e| e.to_string());
+        self.apply_outcome(roi, out, false)
+    }
+
+    /// Launch 2D VarPro deconvolution off the UI thread on native (`std::thread::spawn` + `mpsc`),
+    /// or run bounded fast-cap execution on `wasm32`.
+    pub fn start_run_async(&mut self, active_2d: Option<&Spectrum2D>) {
+        if self.is_computing() {
+            return;
+        }
+        let roi = match self.prepare_roi(active_2d) {
+            Ok(r) => r,
+            Err(msg) => {
+                self.result = None;
+                self.error_message = Some(msg);
+                self.status_message = "VarPro failed closed on ROI preparation.".to_string();
+                return;
+            }
+        };
+        let cfg = self.build_config();
+        let seeds = self.seeds.clone();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.error_message = None;
+            self.status_message =
+                "Computing... (2D VarPro running on background thread)".to_string();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let outcome = deconvolve_roi_2d(&roi, &seeds, &cfg).map_err(|e| e.to_string());
+                let _ = tx.send(DeconvBgOutput { roi, outcome });
+            });
+            self.bg_job.set_receiver(rx);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let voxels = roi.n1().saturating_mul(roi.n2());
+            if voxels > WASM_DECONV_MAX_VOXELS {
+                let msg = format!(
+                    "ROI has {voxels} voxels (exceeds wasm32 fast-cap of {WASM_DECONV_MAX_VOXELS} voxels); narrow the ppm window or run on native desktop."
+                );
+                self.result = None;
+                self.error_message = Some(msg);
+                self.status_message = "VarPro failed closed (wasm32 ROI cap).".to_string();
+                return;
+            }
+            let mut capped_cfg = cfg;
+            let was_capped = capped_cfg.max_iterations > WASM_DECONV_MAX_ITERS;
+            capped_cfg.max_iterations = capped_cfg.max_iterations.min(WASM_DECONV_MAX_ITERS);
+            let outcome = deconvolve_roi_2d(&roi, &seeds, &capped_cfg).map_err(|e| e.to_string());
+            let _ = self.apply_outcome(roi, outcome, was_capped);
+        }
+    }
+
+    /// Load the synthetic overlapped-doublet demo and launch VarPro asynchronously on native
+    /// (bounded fast-cap on `wasm32`).
+    pub fn start_synthetic_demo_async(&mut self) {
+        if self.is_computing() {
+            return;
+        }
+        self.source = DeconvDataSource::SyntheticDemo;
+        self.lineshape = LineshapeKind::PseudoVoigt;
+        self.use_known_sigma = true;
+        self.known_noise_sigma = self.demo_noise_sigma.max(1e-4);
+        self.use_center_shift_bound = false;
+        match self.build_synthetic_doublet_roi() {
+            Ok((roi, seeds)) => {
+                self.seeds = seeds;
+                self.last_roi = Some(roi);
+                self.start_run_async(None);
+            }
+            Err(msg) => {
+                self.result = None;
+                self.error_message = Some(msg);
+                self.status_message = "VarPro synthetic demo build failed.".to_string();
+            }
+        }
+    }
+
+    /// Poll the background native VarPro worker. Returns `true` while still computing so the caller
+    /// schedules `ctx.request_repaint()`.
+    pub fn poll_background(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            match self.bg_job.poll() {
+                BackgroundPoll::Idle => false,
+                BackgroundPoll::Pending => true,
+                BackgroundPoll::Ready(out) => {
+                    let _ = self.apply_outcome(out.roi, out.outcome, false);
+                    false
+                }
+                BackgroundPoll::Disconnected => {
+                    self.result = None;
+                    self.error_message =
+                        Some("2D VarPro background worker terminated unexpectedly.".to_string());
+                    self.status_message = "VarPro background worker disconnected.".to_string();
+                    false
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
         }
     }
 }
@@ -533,10 +791,21 @@ fn format_deconv_diagnostic(diag: DeconvDiagnostic) -> String {
 }
 
 // ============================================================================
-// 3. Tab 2 State: Convex Accelerated MaxEnt NUS (`T22.13`)
+// 3. Tab 2 State: Convex Accelerated MaxEnt 2D NUS (`T22.13`)
 // ============================================================================
 
-/// Regularization policy selector in the MaxEnt NUS tab.
+/// Data source selector in the MaxEnt 2D NUS tab (`171.tools:P1-1`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MaxEntDataSource {
+    /// Built-in `[Synthetic 3-Peak Demo]` hypercomplex FID sampled with editable Poisson-gap schedule.
+    #[default]
+    SyntheticDemo,
+    /// Real user-supplied 2D NUS interferogram TSV (`t1_idx, t2_idx, re_cc, im_cs, im_sc, re_ss`
+    /// or `t1_idx, re, im`).
+    UserDataTsv,
+}
+
+/// Regularization policy selector in the MaxEnt 2D NUS tab.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MaxEntLambdaUiMode {
     #[default]
@@ -544,9 +813,36 @@ pub enum MaxEntLambdaUiMode {
     DiscrepancyPrinciple,
 }
 
-/// Non-destructively editable state for the `MaxEnt NUS` tab.
+/// Validated 2D hypercomplex observation buffer parsed from user-supplied MaxEnt TSV.
+#[derive(Clone, Debug)]
+pub struct ParsedMaxEntTsv {
+    pub obs_quad: Vec<[f64; 4]>,
+    pub mask: Vec<bool>,
+    pub sampled_count: usize,
+}
+
+struct PreparedMaxEntInput {
+    obs_quad: Vec<[f64; 4]>,
+    mask: Vec<bool>,
+    sampled_count: usize,
+    source: MaxEntDataSource,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct MaxEntBgOutput {
+    source: MaxEntDataSource,
+    mask: Vec<bool>,
+    sampled_count: usize,
+    outcome: Result<MaxEntResult<[f64; 4]>, String>,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct MaxEntBgOutput;
+
+/// Non-destructively editable state for the `MaxEnt 2D NUS` tab.
 #[derive(Clone, Debug)]
 pub struct MaxEntTabState {
+    pub data_source: MaxEntDataSource,
     pub n2: usize,
     pub n1: usize,
     pub zero_fill_factor: usize,
@@ -564,8 +860,13 @@ pub struct MaxEntTabState {
     pub kkt_tol: f64,
     pub accelerate: bool,
     pub adaptive_restart: bool,
-    /// Editable 0-based `(t2, t1)` NUS schedule text buffer (one coordinate pair per line).
+    /// Editable 0-based `(t2, t1)` NUS schedule text buffer for `[Synthetic 3-Peak Demo]`.
     pub schedule_text: String,
+    /// Editable user-supplied 2D NUS interferogram TSV (`t1_idx, t2_idx, re_cc, im_cs, im_sc, re_ss`
+    /// or `t1_idx, re, im`).
+    pub user_data_tsv: String,
+    /// Provenance of the currently displayed reconstruction result.
+    pub last_run_source: Option<MaxEntDataSource>,
     /// Last sampled mask used for the preview.
     pub last_mask: Vec<bool>,
     pub last_sampled_count: usize,
@@ -573,11 +874,14 @@ pub struct MaxEntTabState {
     pub result: Option<MaxEntResult<[f64; 4]>>,
     pub status_message: String,
     pub error_message: Option<String>,
+    /// Background native worker slot (`std::thread::spawn` + `mpsc::Receiver`).
+    bg_job: BackgroundJobSlot<MaxEntBgOutput>,
 }
 
 impl Default for MaxEntTabState {
     fn default() -> Self {
         let mut st = Self {
+            data_source: MaxEntDataSource::SyntheticDemo,
             n2: 16,
             n1: 16,
             zero_fill_factor: 2,
@@ -596,13 +900,18 @@ impl Default for MaxEntTabState {
             accelerate: true,
             adaptive_restart: true,
             schedule_text: String::new(),
+            user_data_tsv: String::from(
+                "# Paste 2D NUS interferogram rows: t1_idx, t2_idx, re_cc, im_cs, im_sc, re_ss\n# Or 1D indirect slice (t2_idx=0): t1_idx, re, im\nt1_idx\tt2_idx\tre_cc\tim_cs\tim_sc\tre_ss\n",
+            ),
+            last_run_source: None,
             last_mask: Vec::new(),
             last_sampled_count: 0,
             result: None,
             status_message:
-                "Generate a Poisson-gap schedule or paste (t2, t1) coordinates and run MaxEnt."
+                "Paste your 2D NUS interferogram TSV (User Data TSV) or run the [Synthetic 3-Peak Demo]."
                     .to_string(),
             error_message: None,
+            bg_job: BackgroundJobSlot::default(),
         };
         let _ = st.generate_poisson_gap_schedule();
         st
@@ -761,14 +1070,25 @@ impl MaxEntTabState {
                 max_outer_iterations: 24,
             },
         };
+        let noise_sigma = match self.data_source {
+            MaxEntDataSource::SyntheticDemo => {
+                if self.demo_noise_sigma > 0.0 {
+                    Some(self.demo_noise_sigma)
+                } else {
+                    None
+                }
+            }
+            MaxEntDataSource::UserDataTsv => match self.lambda_ui_mode {
+                MaxEntLambdaUiMode::DiscrepancyPrinciple if self.discrepancy_sigma > 0.0 => {
+                    Some(self.discrepancy_sigma)
+                }
+                _ => None,
+            },
+        };
         MaxEntConfig {
             def: self.def,
             lambda_mode,
-            noise_sigma: if self.demo_noise_sigma > 0.0 {
-                Some(self.demo_noise_sigma)
-            } else {
-                None
-            },
+            noise_sigma,
             max_iterations: self.max_iter.clamp(1, MAX_MAXENT_ITERATIONS),
             kkt_tol: self.kkt_tol,
             accelerate: self.accelerate,
@@ -779,35 +1099,238 @@ impl MaxEntTabState {
         }
     }
 
-    /// Load the 1-click Poisson-gap 2D MaxEnt synthetic demo and execute reconstruction.
-    pub fn load_and_run_synthetic_demo(&mut self) -> Result<(), String> {
-        self.quad_mode_axis2 = QuadMode::States;
-        self.quad_mode_axis1 = QuadMode::States;
-        self.generate_poisson_gap_schedule()?;
-        self.run()
+    /// True while a background native 2D MaxEnt solve is currently running.
+    pub fn is_computing(&self) -> bool {
+        self.bg_job.is_running()
     }
 
-    /// Execute `nmr_core::maxent_nus::reconstruct_maxent_2d` using the current editable schedule
-    /// and quadrature mode (surfacing fail-closed errors such as `EchoAntiecho`).
-    pub fn run(&mut self) -> Result<(), String> {
-        let (mask, count) = match self.parse_schedule_mask() {
+    /// Parse `self.user_data_tsv` into a validated 2D hypercomplex observation buffer `obs_quad`
+    /// (`n2 * n1`), boolean mask, and sampled point count.
+    ///
+    /// Accepts:
+    /// - 6 columns: `t1_idx, t2_idx, re_cc, im_cs, im_sc, re_ss` (full 2D hypercomplex quadrant)
+    /// - 4 columns: `t1_idx, t2_idx, re, im` (mapped to `[re, im, 0, 0]`)
+    /// - 3 columns: `t1_idx, re, im` (1D indirect slice at `t2_idx = 0`, mapped to `[re, im, 0, 0]`)
+    ///
+    /// Optional header rows starting with `t1`/`t2`/`k1`/`k2`/`idx`/`row` are skipped; if a header
+    /// explicitly specifies `t2` first and `t1` second, `(t2_idx, t1_idx)` column order is honored.
+    pub fn parse_user_data_tsv(&self) -> Result<ParsedMaxEntTsv, String> {
+        let n2 = self.n2;
+        let n1 = self.n1;
+        if n2 == 0 || n1 == 0 {
+            return Err("MaxEnt grid dimensions n2 and n1 must both be >= 1".to_string());
+        }
+        let total = n2
+            .checked_mul(n1)
+            .ok_or_else(|| "MaxEnt grid dimensions n2 * n1 overflowed".to_string())?;
+        let mut obs = vec![[0.0_f64; 4]; total];
+        let mut mask = vec![false; total];
+        let mut count = 0usize;
+        let mut t2_first = false;
+
+        for (line_idx, raw_line) in self.user_data_tsv.lines().enumerate() {
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = trimmed
+                .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let first_lower = parts[0].to_ascii_lowercase();
+            if first_lower.starts_with("t1")
+                || first_lower.starts_with("t2")
+                || first_lower.starts_with("k1")
+                || first_lower.starts_with("k2")
+                || first_lower == "idx"
+                || first_lower == "row"
+            {
+                if parts.len() >= 2 {
+                    let second_lower = parts[1].to_ascii_lowercase();
+                    if (first_lower.starts_with("t2") || first_lower.starts_with("k2"))
+                        && (second_lower.starts_with("t1") || second_lower.starts_with("k1"))
+                    {
+                        t2_first = true;
+                    }
+                }
+                continue;
+            }
+
+            let (k1, k2, quad) = match parts.len() {
+                6 => {
+                    let a: usize = parts[0].parse().map_err(|_| {
+                        format!(
+                            "user TSV line {} invalid first index '{}'",
+                            line_idx + 1,
+                            parts[0]
+                        )
+                    })?;
+                    let b: usize = parts[1].parse().map_err(|_| {
+                        format!(
+                            "user TSV line {} invalid second index '{}'",
+                            line_idx + 1,
+                            parts[1]
+                        )
+                    })?;
+                    let (k1, k2) = if t2_first { (b, a) } else { (a, b) };
+                    let re_cc = parse_f64_col(parts[2], "re_cc", line_idx)?;
+                    let im_cs = parse_f64_col(parts[3], "im_cs", line_idx)?;
+                    let im_sc = parse_f64_col(parts[4], "im_sc", line_idx)?;
+                    let re_ss = parse_f64_col(parts[5], "re_ss", line_idx)?;
+                    (k1, k2, [re_cc, im_cs, im_sc, re_ss])
+                }
+                4 => {
+                    let a: usize = parts[0].parse().map_err(|_| {
+                        format!(
+                            "user TSV line {} invalid first index '{}'",
+                            line_idx + 1,
+                            parts[0]
+                        )
+                    })?;
+                    let b: usize = parts[1].parse().map_err(|_| {
+                        format!(
+                            "user TSV line {} invalid second index '{}'",
+                            line_idx + 1,
+                            parts[1]
+                        )
+                    })?;
+                    let (k1, k2) = if t2_first { (b, a) } else { (a, b) };
+                    let re = parse_f64_col(parts[2], "re", line_idx)?;
+                    let im = parse_f64_col(parts[3], "im", line_idx)?;
+                    (k1, k2, [re, im, 0.0, 0.0])
+                }
+                3 => {
+                    let k1: usize = parts[0].parse().map_err(|_| {
+                        format!(
+                            "user TSV line {} invalid t1_idx '{}'",
+                            line_idx + 1,
+                            parts[0]
+                        )
+                    })?;
+                    let re = parse_f64_col(parts[1], "re", line_idx)?;
+                    let im = parse_f64_col(parts[2], "im", line_idx)?;
+                    (k1, 0usize, [re, im, 0.0, 0.0])
+                }
+                other => {
+                    return Err(format!(
+                        "user TSV line {} expected 6 cols (t1_idx t2_idx re_cc im_cs im_sc re_ss), 4 cols (t1_idx t2_idx re im), or 3 cols (t1_idx re im); got {other}",
+                        line_idx + 1
+                    ));
+                }
+            };
+
+            if k1 >= n1 || k2 >= n2 {
+                return Err(format!(
+                    "user TSV line {} coordinate (t1={k1}, t2={k2}) out of bounds for grid n2={n2} x n1={n1}",
+                    line_idx + 1
+                ));
+            }
+            let flat = k2 * n1 + k1;
+            obs[flat] = quad;
+            if !mask[flat] {
+                mask[flat] = true;
+                count += 1;
+            }
+        }
+
+        if count == 0 {
+            return Err(
+                "User MaxEnt TSV contains zero sampled rows (expected t1_idx, t2_idx, re_cc, im_cs, im_sc, re_ss or t1_idx, re, im)."
+                    .to_string(),
+            );
+        }
+        Ok(ParsedMaxEntTsv {
+            obs_quad: obs,
+            mask,
+            sampled_count: count,
+        })
+    }
+
+    /// Populate `self.user_data_tsv` with a concrete editable 6-column 2D hypercomplex FID exported
+    /// from the current Poisson-gap mask and switch `self.data_source` to [`MaxEntDataSource::UserDataTsv`].
+    pub fn populate_user_data_from_demo(&mut self) -> Result<usize, String> {
+        let (mask, _) = match self.parse_schedule_mask() {
             Ok(pair) => pair,
-            Err(err) => {
-                self.error_message = Some(err.clone());
-                self.status_message = "MaxEnt schedule parse error (fail-closed).".to_string();
-                return Err(err);
+            Err(_) => {
+                self.generate_poisson_gap_schedule()?;
+                self.parse_schedule_mask()?
             }
         };
-        let obs_quad = self.synthesize_demo_fid_2d(&mask);
-        let cfg = self.build_config();
-        let quad_modes = [self.quad_mode_axis2, self.quad_mode_axis1];
-        self.last_mask = mask.clone();
-        self.last_sampled_count = count;
+        let obs = self.synthesize_demo_fid_2d(&mask);
+        let mut buf = format!(
+            "# Editable 2D NUS hypercomplex interferogram ({}x{}, {} sampled points)\nt1_idx\tt2_idx\tre_cc\tim_cs\tim_sc\tre_ss\n",
+            self.n2, self.n1, mask.iter().filter(|&&b| b).count()
+        );
+        let mut written = 0usize;
+        for k2 in 0..self.n2 {
+            for k1 in 0..self.n1 {
+                let idx = k2 * self.n1 + k1;
+                if mask[idx] {
+                    let q = obs[idx];
+                    let _ = writeln!(
+                        buf,
+                        "{k1}\t{k2}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+                        q[0], q[1], q[2], q[3]
+                    );
+                    written += 1;
+                }
+            }
+        }
+        self.user_data_tsv = buf;
+        self.data_source = MaxEntDataSource::UserDataTsv;
+        Ok(written)
+    }
 
-        match reconstruct_maxent_2d(&obs_quad, self.n2, self.n1, &mask, quad_modes, &cfg) {
+    fn prepare_inputs(&self) -> Result<PreparedMaxEntInput, String> {
+        match self.data_source {
+            MaxEntDataSource::SyntheticDemo => {
+                let (mask, sampled_count) = self.parse_schedule_mask()?;
+                let obs_quad = self.synthesize_demo_fid_2d(&mask);
+                Ok(PreparedMaxEntInput {
+                    obs_quad,
+                    mask,
+                    sampled_count,
+                    source: MaxEntDataSource::SyntheticDemo,
+                })
+            }
+            MaxEntDataSource::UserDataTsv => {
+                let parsed = self.parse_user_data_tsv()?;
+                Ok(PreparedMaxEntInput {
+                    obs_quad: parsed.obs_quad,
+                    mask: parsed.mask,
+                    sampled_count: parsed.sampled_count,
+                    source: MaxEntDataSource::UserDataTsv,
+                })
+            }
+        }
+    }
+
+    fn apply_outcome(
+        &mut self,
+        source: MaxEntDataSource,
+        mask: Vec<bool>,
+        count: usize,
+        outcome: Result<MaxEntResult<[f64; 4]>, String>,
+        wasm_capped: bool,
+    ) -> Result<(), String> {
+        self.last_mask = mask;
+        self.last_sampled_count = count;
+        match outcome {
             Ok(res) => {
+                let tag = match source {
+                    MaxEntDataSource::SyntheticDemo => "[Synthetic 3-Peak Demo]",
+                    MaxEntDataSource::UserDataTsv => "[User Data TSV]",
+                };
+                let cap_note = if wasm_capped {
+                    " [wasm32 fast-cap]"
+                } else {
+                    ""
+                };
                 self.status_message = format!(
-                    "MaxEnt 2D finished: {} iters, KKT={:.2e}, gap={:.2e}, lambda={:.3}, converged={}",
+                    "{tag} MaxEnt 2D finished{cap_note}: {} iters, KKT={:.2e}, gap={:.2e}, lambda={:.3}, converged={}",
                     res.iterations,
                     res.kkt_residual_inf,
                     res.duality_gap,
@@ -816,13 +1339,195 @@ impl MaxEntTabState {
                 );
                 self.error_message = None;
                 self.result = Some(res);
+                self.last_run_source = Some(source);
                 Ok(())
             }
             Err(err) => {
+                self.result = None;
+                self.last_run_source = None;
                 self.error_message = Some(err.clone());
                 self.status_message = "MaxEnt 2D failed closed (see diagnostic below).".to_string();
                 Err(err)
             }
+        }
+    }
+
+    /// Load the 1-click `[Synthetic 3-Peak Demo]` Poisson-gap 2D MaxEnt demo and execute
+    /// reconstruction synchronously (deterministic helper for tests).
+    pub fn load_and_run_synthetic_demo(&mut self) -> Result<(), String> {
+        self.data_source = MaxEntDataSource::SyntheticDemo;
+        self.quad_mode_axis2 = QuadMode::States;
+        self.quad_mode_axis1 = QuadMode::States;
+        self.generate_poisson_gap_schedule()?;
+        self.run_sync()
+    }
+
+    /// Synchronously execute `nmr_core::maxent_nus::reconstruct_maxent_2d` using the active data
+    /// source (`UserDataTsv` or `[Synthetic 3-Peak Demo]`). Clears stale results on any `Err(...)`.
+    pub fn run(&mut self) -> Result<(), String> {
+        self.run_sync()
+    }
+
+    /// Explicit synchronous execution helper for deterministic headless tests.
+    pub fn run_sync(&mut self) -> Result<(), String> {
+        let prepared = match self.prepare_inputs() {
+            Ok(bundle) => bundle,
+            Err(err) => {
+                self.result = None;
+                self.last_run_source = None;
+                self.error_message = Some(err.clone());
+                self.status_message = "MaxEnt 2D input parse error (fail-closed).".to_string();
+                return Err(err);
+            }
+        };
+        let cfg = self.build_config();
+        let quad_modes = [self.quad_mode_axis2, self.quad_mode_axis1];
+        let out = reconstruct_maxent_2d(
+            &prepared.obs_quad,
+            self.n2,
+            self.n1,
+            &prepared.mask,
+            quad_modes,
+            &cfg,
+        );
+        self.apply_outcome(
+            prepared.source,
+            prepared.mask,
+            prepared.sampled_count,
+            out,
+            false,
+        )
+    }
+
+    /// Launch 2D MaxEnt NUS off the UI thread on native (`std::thread::spawn` + `mpsc`),
+    /// or run bounded fast-cap execution on `wasm32`.
+    pub fn start_run_async(&mut self) {
+        if self.is_computing() {
+            return;
+        }
+        let prepared = match self.prepare_inputs() {
+            Ok(bundle) => bundle,
+            Err(err) => {
+                self.result = None;
+                self.last_run_source = None;
+                self.error_message = Some(err);
+                self.status_message = "MaxEnt 2D input parse error (fail-closed).".to_string();
+                return;
+            }
+        };
+        let PreparedMaxEntInput {
+            obs_quad,
+            mask,
+            sampled_count: count,
+            source,
+        } = prepared;
+        let cfg = self.build_config();
+        let n2 = self.n2;
+        let n1 = self.n1;
+        let quad_modes = [self.quad_mode_axis2, self.quad_mode_axis1];
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.error_message = None;
+            self.status_message =
+                "Computing... (2D MaxEnt running on background thread)".to_string();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let outcome = reconstruct_maxent_2d(&obs_quad, n2, n1, &mask, quad_modes, &cfg);
+                let _ = tx.send(MaxEntBgOutput {
+                    source,
+                    mask,
+                    sampled_count: count,
+                    outcome,
+                });
+            });
+            self.bg_job.set_receiver(rx);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let grid_pts = n2.saturating_mul(n1);
+            if grid_pts > WASM_MAXENT_MAX_POINTS {
+                let msg = format!(
+                    "MaxEnt 2D grid {n2}x{n1} ({grid_pts} pts) exceeds wasm32 fast-cap of {WASM_MAXENT_MAX_POINTS} pts; reduce grid size or run on native desktop."
+                );
+                self.result = None;
+                self.last_run_source = None;
+                self.error_message = Some(msg);
+                self.status_message = "MaxEnt 2D failed closed (wasm32 grid cap).".to_string();
+                return;
+            }
+            let mut capped_cfg = cfg;
+            let mut was_capped = false;
+            if capped_cfg.max_iterations > WASM_MAXENT_MAX_ITERS {
+                capped_cfg.max_iterations = WASM_MAXENT_MAX_ITERS;
+                was_capped = true;
+            }
+            if let MaxEntLambdaMode::DiscrepancyPrinciple {
+                ref mut max_outer_iterations,
+                ..
+            } = capped_cfg.lambda_mode
+            {
+                if *max_outer_iterations > WASM_MAXENT_MAX_OUTER_ITERS {
+                    *max_outer_iterations = WASM_MAXENT_MAX_OUTER_ITERS;
+                    was_capped = true;
+                }
+            }
+            let outcome = reconstruct_maxent_2d(&obs_quad, n2, n1, &mask, quad_modes, &capped_cfg);
+            let _ = self.apply_outcome(source, mask, count, outcome, was_capped);
+        }
+    }
+
+    /// Load the `[Synthetic 3-Peak Demo]` schedule and launch MaxEnt asynchronously on native
+    /// (bounded fast-cap on `wasm32`).
+    pub fn start_synthetic_demo_async(&mut self) {
+        if self.is_computing() {
+            return;
+        }
+        self.data_source = MaxEntDataSource::SyntheticDemo;
+        self.quad_mode_axis2 = QuadMode::States;
+        self.quad_mode_axis1 = QuadMode::States;
+        if let Err(err) = self.generate_poisson_gap_schedule() {
+            self.result = None;
+            self.last_run_source = None;
+            self.error_message = Some(err);
+            self.status_message = "MaxEnt synthetic demo schedule generation failed.".to_string();
+            return;
+        }
+        self.start_run_async();
+    }
+
+    /// Poll the background native MaxEnt worker. Returns `true` while still computing so the caller
+    /// schedules `ctx.request_repaint()`.
+    pub fn poll_background(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            match self.bg_job.poll() {
+                BackgroundPoll::Idle => false,
+                BackgroundPoll::Pending => true,
+                BackgroundPoll::Ready(out) => {
+                    let _ = self.apply_outcome(
+                        out.source,
+                        out.mask,
+                        out.sampled_count,
+                        out.outcome,
+                        false,
+                    );
+                    false
+                }
+                BackgroundPoll::Disconnected => {
+                    self.result = None;
+                    self.last_run_source = None;
+                    self.error_message =
+                        Some("2D MaxEnt background worker terminated unexpectedly.".to_string());
+                    self.status_message = "MaxEnt background worker disconnected.".to_string();
+                    false
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
         }
     }
 }
@@ -872,7 +1577,7 @@ impl Default for ArtsyTabState {
             tsv_input: String::new(),
             dephasing_delay_ms: DEFAULT_ARTSY_DEPHASING_S * 1000.0,
             j_iso_default_hz: DEFAULT_J_NH_ISO_HZ,
-            j_iso_default_sigma_hz: 0.0,
+            j_iso_default_sigma_hz: DEFAULT_ARTSY_J_ISO_SIGMA_HZ,
             scan_ratio_att_over_ref: 1.0,
             delta_r2_s_inv: 0.0,
             sign_convention: RdcSignConvention::SignNormalized,
@@ -945,6 +1650,7 @@ impl ArtsyTabState {
     pub fn load_and_run_synthetic_demo(&mut self) -> Result<(), String> {
         self.dephasing_delay_ms = DEFAULT_ARTSY_DEPHASING_S * 1000.0;
         self.j_iso_default_hz = DEFAULT_J_NH_ISO_HZ;
+        self.j_iso_default_sigma_hz = DEFAULT_ARTSY_J_ISO_SIGMA_HZ;
         self.scan_ratio_att_over_ref = 1.0;
         self.delta_r2_s_inv = 0.0;
         self.populate_synthetic_demo_tsv();
@@ -952,9 +1658,11 @@ impl ArtsyTabState {
     }
 
     /// Parse `self.tsv_input` and compute `^1J_NH + ^1D_NH` & `^1D_NH +/- sigma` for every row.
+    /// Clears stale results whenever validation or parsing returns `Err(...)`.
     pub fn run(&mut self) -> Result<(), String> {
         let cfg = self.build_config();
         if let Err(err) = cfg.validate() {
+            self.results.clear();
             self.error_message = Some(err.clone());
             self.status_message = "ARTSY config validation error.".to_string();
             return Err(err);
@@ -976,6 +1684,7 @@ impl ArtsyTabState {
                     line_idx + 1,
                     cols.len()
                 );
+                self.results.clear();
                 self.error_message = Some(err.clone());
                 return Err(err);
             }
@@ -985,33 +1694,60 @@ impl ArtsyTabState {
             }
             let seq_id: i32 = cols[0].parse().map_err(|_| {
                 let err = format!("line {} invalid seq_id '{}'", line_idx + 1, cols[0]);
+                self.results.clear();
                 self.error_message = Some(err.clone());
                 err
             })?;
             let res_name = cols[1].trim().to_ascii_uppercase();
             let i_ref: f64 = cols[2].parse().map_err(|_| {
                 let err = format!("line {} invalid i_ref '{}'", line_idx + 1, cols[2]);
+                self.results.clear();
                 self.error_message = Some(err.clone());
                 err
             })?;
             let i_att: f64 = cols[3].parse().map_err(|_| {
                 let err = format!("line {} invalid i_att '{}'", line_idx + 1, cols[3]);
+                self.results.clear();
                 self.error_message = Some(err.clone());
                 err
             })?;
             let sigma_ref: f64 = cols[4].parse().map_err(|_| {
                 let err = format!("line {} invalid sigma '{}'", line_idx + 1, cols[4]);
+                self.results.clear();
                 self.error_message = Some(err.clone());
                 err
             })?;
             let sigma_att: f64 = if cols.len() >= 6 {
                 cols[5].parse().map_err(|_| {
                     let err = format!("line {} invalid sigma_att '{}'", line_idx + 1, cols[5]);
+                    self.results.clear();
                     self.error_message = Some(err.clone());
                     err
                 })?
             } else {
                 sigma_ref
+            };
+            let j_iso_override: Option<(f64, f64)> = if cols.len() >= 7 {
+                let j_val: f64 = cols[6].parse().map_err(|_| {
+                    let err = format!("line {} invalid j_iso_hz '{}'", line_idx + 1, cols[6]);
+                    self.results.clear();
+                    self.error_message = Some(err.clone());
+                    err
+                })?;
+                let j_sig: f64 = if cols.len() >= 8 {
+                    cols[7].parse().map_err(|_| {
+                        let err =
+                            format!("line {} invalid sigma_j_iso_hz '{}'", line_idx + 1, cols[7]);
+                        self.results.clear();
+                        self.error_message = Some(err.clone());
+                        err
+                    })?
+                } else {
+                    self.j_iso_default_sigma_hz
+                };
+                Some((j_val, j_sig))
+            } else {
+                None
             };
 
             let pair = ArtsyIntensityPair {
@@ -1020,9 +1756,10 @@ impl ArtsyTabState {
                 sigma_ref,
                 sigma_att,
             };
-            let res =
-                extract_artsy_rdc(seq_id, &res_name, &pair, None, None, &cfg).map_err(|e| {
+            let res = extract_artsy_rdc(seq_id, &res_name, &pair, None, j_iso_override, &cfg)
+                .map_err(|e| {
                     let err = format!("line {} (residue {seq_id} {res_name}): {e}", line_idx + 1);
+                    self.results.clear();
                     self.error_message = Some(err.clone());
                     err
                 })?;
@@ -1031,6 +1768,7 @@ impl ArtsyTabState {
 
         if parsed.is_empty() {
             let err = "ARTSY TSV input contains zero data rows.".to_string();
+            self.results.clear();
             self.error_message = Some(err.clone());
             return Err(err);
         }
@@ -1599,12 +2337,21 @@ impl PcsCcrTabState {
         self.run()
     }
 
+    fn clear_results(&mut self) {
+        self.transfer_result = None;
+        self.em_result = None;
+        self.joint_fit = None;
+        self.ccr_only_fit = None;
+    }
+
     /// Execute Kuhn-Munkres / Sinkhorn PCS transfer and (when 3D coordinates + CCR rates are
     /// present) iterative EM `DeltaChi` and joint `PCS + Gamma_CCR` susceptibility-tensor fitting.
+    /// Clears stale results whenever execution returns `Err(...)`.
     pub fn run(&mut self) -> Result<(), String> {
         let parsed_rows = match self.parse_dia_tsv() {
             Ok(r) => r,
             Err(err) => {
+                self.clear_results();
                 self.error_message = Some(err.clone());
                 return Err(err);
             }
@@ -1612,6 +2359,7 @@ impl PcsCcrTabState {
         let para_peaks = match self.parse_para_tsv() {
             Ok(p) => p,
             Err(err) => {
+                self.clear_results();
                 self.error_message = Some(err.clone());
                 return Err(err);
             }
@@ -1629,17 +2377,19 @@ impl PcsCcrTabState {
                 self.init_euler_deg[1].to_radians(),
                 self.init_euler_deg[2].to_radians(),
             ];
-            Some(
-                delta_chi_tensor_from_spherical(
-                    self.metal_pos,
-                    self.init_dchi_ax,
-                    self.init_dchi_rh,
-                    euler_rad,
-                )
-                .inspect_err(|e| {
+            match delta_chi_tensor_from_spherical(
+                self.metal_pos,
+                self.init_dchi_ax,
+                self.init_dchi_rh,
+                euler_rad,
+            ) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    self.clear_results();
                     self.error_message = Some(e.clone());
-                })?,
-            )
+                    return Err(e);
+                }
+            }
         } else {
             None
         };
@@ -1666,22 +2416,27 @@ impl PcsCcrTabState {
                 ) {
                     Ok(em_res) => (em_res.transfer.clone(), Some(em_res)),
                     Err(err) => {
+                        self.clear_results();
                         self.error_message = Some(err.clone());
                         return Err(err);
                     }
                 }
             }
             _ => {
-                let res = match_pcs_assignment_transfer(
+                let res = match match_pcs_assignment_transfer(
                     &dia_peaks,
                     &para_peaks,
                     init_tensor.as_ref(),
                     Some(self.metal_pos),
                     &transfer_cfg,
-                )
-                .inspect_err(|e| {
-                    self.error_message = Some(e.clone());
-                })?;
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.clear_results();
+                        self.error_message = Some(e.clone());
+                        return Err(e);
+                    }
+                };
                 (res, None)
             }
         };
@@ -1710,15 +2465,19 @@ impl PcsCcrTabState {
         let mut joint_fit = None;
         let mut ccr_only_fit = None;
         if !ccr_obs.is_empty() {
-            let params = CcrPhysicsParams::new(
+            let params = match CcrPhysicsParams::new(
                 self.tau_m_ns,
                 self.proton_mhz,
                 self.temperature_k,
                 self.spin_pair,
-            )
-            .inspect_err(|e| {
-                self.error_message = Some(e.clone());
-            })?;
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.clear_results();
+                    self.error_message = Some(e.clone());
+                    return Err(e);
+                }
+            };
             let min_pcs = if self.fit_pcs_offset { 7 } else { 6 };
             if pcs_obs.len() >= min_pcs {
                 let opts = JointPcsCcrFitOptions {
@@ -1731,6 +2490,7 @@ impl PcsCcrTabState {
                 match fit_joint_pcs_ccr(&pcs_obs, &ccr_obs, self.metal_pos, &params, &opts) {
                     Ok(jf) => joint_fit = Some(jf),
                     Err(err) => {
+                        self.clear_results();
                         self.error_message = Some(err.clone());
                         return Err(err);
                     }
@@ -1743,6 +2503,7 @@ impl PcsCcrTabState {
                 match fit_curie_ccr_chi_iso(&ccr_obs, self.metal_pos, fixed_dc, &params, 5) {
                     Ok(cf) => ccr_only_fit = Some(cf),
                     Err(err) => {
+                        self.clear_results();
                         self.error_message = Some(err.clone());
                         return Err(err);
                     }
@@ -1855,7 +2616,7 @@ fn parse_f64_col(token: &str, name: &str, line_idx: usize) -> Result<f64, String
 // 6. Main Panel Struct & Public Entry Points
 // ============================================================================
 
-/// Tabbed GUI panel wiring `T22.1` (2D/3D VarPro Deconvolution), `T22.13` (Convex MaxEnt NUS),
+/// Tabbed GUI panel wiring `T22.1` (2D VarPro Deconvolution), `T22.13` (Convex MaxEnt 2D NUS),
 /// `T22.9` (ARTSY RDC), and `T22.10` (2D PCS Transfer & Curie CCR).
 #[derive(Clone, Debug)]
 pub struct P22ToolsPanel {
@@ -1863,7 +2624,7 @@ pub struct P22ToolsPanel {
     pub open: bool,
     /// Currently selected folder tab.
     pub active_tab: P22ToolTab,
-    /// Tab 1: Coupled 2D/3D VarPro deconvolution state.
+    /// Tab 1: Coupled 2D VarPro deconvolution state.
     pub deconv: DeconvTabState,
     /// Tab 2: Convex accelerated 2D MaxEnt NUS state.
     pub maxent: MaxEntTabState,
@@ -1930,6 +2691,13 @@ impl P22ToolsPanel {
         active_2d: Option<&Spectrum2D>,
         paper_white: bool,
     ) {
+        // Poll non-blocking native background compute jobs every frame so UI never freezes.
+        let deconv_busy = self.deconv.poll_background();
+        let maxent_busy = self.maxent.poll_background();
+        if deconv_busy || maxent_busy {
+            ui.ctx().request_repaint();
+        }
+
         let theme = P22ToolsTheme::for_mode(paper_white);
 
         ui.label(
@@ -1994,7 +2762,7 @@ impl P22ToolsPanel {
 }
 
 // ============================================================================
-// 7. Tab 1 UI: Coupled 2D/3D VarPro Deconvolution
+// 7. Tab 1 UI: Coupled 2D VarPro Deconvolution
 // ============================================================================
 
 fn show_deconv_tab(
@@ -2003,24 +2771,47 @@ fn show_deconv_tab(
     active_2d: Option<&Spectrum2D>,
     theme: &P22ToolsTheme,
 ) {
+    let busy = st.is_computing();
     // Action bar + data source switcher
     ui.horizontal_wrapped(|ui| {
         if ui
-            .button(
-                egui::RichText::new("Synthetic Demo")
-                    .size(TYPE_BODY_PX)
-                    .strong(),
+            .add_enabled(
+                !busy,
+                egui::Button::new(
+                    egui::RichText::new("Synthetic Demo")
+                        .size(TYPE_BODY_PX)
+                        .strong(),
+                ),
             )
             .on_hover_text("Load overlapped 2D doublet ROI + peak seeds and run VarPro")
             .clicked()
         {
-            let _ = st.load_and_run_synthetic_demo();
+            st.start_synthetic_demo_async();
         }
         if ui
-            .button(egui::RichText::new("Run 2D VarPro Deconvolution").size(TYPE_BODY_PX))
+            .add_enabled(
+                !busy,
+                egui::Button::new(
+                    egui::RichText::new(if busy {
+                        "Computing..."
+                    } else {
+                        "Run 2D VarPro Deconvolution"
+                    })
+                    .size(TYPE_BODY_PX),
+                ),
+            )
             .clicked()
         {
-            let _ = st.run(active_2d);
+            st.start_run_async(active_2d);
+        }
+        if busy {
+            ui.spinner();
+            ui.label(
+                egui::RichText::new("Computing...")
+                    .size(TYPE_CAPTION_PX)
+                    .strong()
+                    .color(theme.accent),
+            );
         }
         ui.separator();
         ui.radio_value(
@@ -2045,6 +2836,16 @@ fn show_deconv_tab(
             }
         });
     });
+
+    if busy {
+        ui.add_space(4.0);
+        show_status_banner(
+            ui,
+            "Computing... (2D VarPro deconvolution running off the UI thread)",
+            theme.guide_bg,
+            theme.accent,
+        );
+    }
 
     ui.add_space(4.0);
 
@@ -2590,37 +3391,142 @@ fn paint_deconv_slice_preview(
 }
 
 // ============================================================================
-// 8. Tab 2 UI: Convex Accelerated MaxEnt NUS (`T22.13`)
+// 8. Tab 2 UI: Convex Accelerated MaxEnt 2D NUS (`T22.13`)
 // ============================================================================
 
 fn show_maxent_tab(ui: &mut egui::Ui, st: &mut MaxEntTabState, theme: &P22ToolsTheme) {
+    let busy = st.is_computing();
     ui.horizontal_wrapped(|ui| {
         if ui
-            .button(
-                egui::RichText::new("Synthetic Demo")
-                    .size(TYPE_BODY_PX)
-                    .strong(),
+            .add_enabled(
+                !busy,
+                egui::Button::new(
+                    egui::RichText::new("Synthetic 3-Peak Demo")
+                        .size(TYPE_BODY_PX)
+                        .strong(),
+                ),
             )
-            .on_hover_text("Generate 2D Poisson-gap schedule and run convex MaxEnt reconstruction")
+            .on_hover_text(
+                "Generate 2D Poisson-gap schedule on built-in synthetic 3-peak FID and run convex MaxEnt",
+            )
             .clicked()
         {
-            let _ = st.load_and_run_synthetic_demo();
+            st.start_synthetic_demo_async();
         }
         if ui
-            .button(egui::RichText::new("Run 2D MaxEnt").size(TYPE_BODY_PX))
+            .add_enabled(
+                !busy,
+                egui::Button::new(
+                    egui::RichText::new(if busy {
+                        "Computing..."
+                    } else {
+                        "Run 2D MaxEnt"
+                    })
+                    .size(TYPE_BODY_PX),
+                ),
+            )
             .clicked()
         {
-            let _ = st.run();
+            st.start_run_async();
         }
-        if ui
-            .button(egui::RichText::new("Regenerate Poisson-Gap Schedule").size(TYPE_CAPTION_PX))
-            .clicked()
-        {
-            let _ = st.generate_poisson_gap_schedule();
+        if busy {
+            ui.spinner();
+            ui.label(
+                egui::RichText::new("Computing...")
+                    .size(TYPE_CAPTION_PX)
+                    .strong()
+                    .color(theme.accent),
+            );
+        }
+        ui.separator();
+        ui.radio_value(
+            &mut st.data_source,
+            MaxEntDataSource::UserDataTsv,
+            egui::RichText::new("User Data TSV").size(TYPE_BODY_PX),
+        );
+        ui.radio_value(
+            &mut st.data_source,
+            MaxEntDataSource::SyntheticDemo,
+            egui::RichText::new("[Synthetic 3-Peak Demo]").size(TYPE_BODY_PX),
+        );
+        match st.data_source {
+            MaxEntDataSource::SyntheticDemo => {
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(
+                            egui::RichText::new("Regenerate Poisson-Gap Schedule")
+                                .size(TYPE_CAPTION_PX),
+                        ),
+                    )
+                    .clicked()
+                {
+                    let _ = st.generate_poisson_gap_schedule();
+                }
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(
+                            egui::RichText::new("Copy Demo FID to User TSV").size(TYPE_CAPTION_PX),
+                        ),
+                    )
+                    .on_hover_text(
+                        "Export the synthetic 3-peak FID into the editable User Data TSV box as a template",
+                    )
+                    .clicked()
+                {
+                    let _ = st.populate_user_data_from_demo();
+                }
+            }
+            MaxEntDataSource::UserDataTsv => {
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(
+                            egui::RichText::new("Load Example 6-Col TSV").size(TYPE_CAPTION_PX),
+                        ),
+                    )
+                    .clicked()
+                {
+                    let _ = st.populate_user_data_from_demo();
+                }
+            }
         }
     });
 
     ui.add_space(4.0);
+
+    // Honest data-source provenance badge (`171.tools:P1-1`)
+    match st.data_source {
+        MaxEntDataSource::SyntheticDemo => {
+            show_status_banner(
+                ui,
+                "[Synthetic 3-Peak Demo] Active input is the built-in 3-peak synthetic hypercomplex FID. Switch to User Data TSV above to reconstruct your own 2D NUS interferogram.",
+                theme.warn_bg,
+                theme.warn_fg,
+            );
+            ui.add_space(4.0);
+        }
+        MaxEntDataSource::UserDataTsv => {
+            show_status_banner(
+                ui,
+                "[User Data TSV] Reconstructing user-supplied 2D NUS interferogram directly via nmr_core::maxent_nus::reconstruct_maxent_2d.",
+                theme.guide_bg,
+                theme.accent,
+            );
+            ui.add_space(4.0);
+        }
+    }
+
+    if busy {
+        show_status_banner(
+            ui,
+            "Computing... (2D MaxEnt NUS running off the UI thread)",
+            theme.guide_bg,
+            theme.accent,
+        );
+        ui.add_space(4.0);
+    }
 
     // Editable MaxEnt configuration card
     egui::Frame::NONE
@@ -2719,31 +3625,53 @@ fn show_maxent_tab(ui: &mut egui::Ui, st: &mut MaxEntTabState, theme: &P22ToolsT
 
     ui.add_space(4.0);
 
-    // Editable NUS schedule buffer
+    // Editable User Data TSV or Synthetic Poisson-Gap Schedule buffer
     egui::Frame::NONE
         .fill(theme.card_bg)
         .stroke(egui::Stroke::new(1.0, theme.border))
         .corner_radius(4.0)
         .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(
-                    "Editable 2D NUS Schedule (0-based 't2 t1' coordinates per line; comments '#')",
-                )
-                .size(TYPE_CAPTION_PX)
-                .strong(),
-            );
-            egui::ScrollArea::vertical()
-                .id_salt("p22_maxent_sched_scroll")
-                .max_height(88.0)
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut st.schedule_text)
-                            .font(egui::FontId::monospace(TYPE_CAPTION_PX))
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(4),
-                    );
-                });
+        .show(ui, |ui| match st.data_source {
+            MaxEntDataSource::UserDataTsv => {
+                ui.label(
+                    egui::RichText::new(
+                        "Editable User 2D NUS Interferogram TSV (t1_idx, t2_idx, re_cc, im_cs, im_sc, re_ss  or  t1_idx, re, im; comments '#')",
+                    )
+                    .size(TYPE_CAPTION_PX)
+                    .strong(),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("p22_maxent_user_tsv_scroll")
+                    .max_height(110.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut st.user_data_tsv)
+                                .font(egui::FontId::monospace(TYPE_CAPTION_PX))
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(5),
+                        );
+                    });
+            }
+            MaxEntDataSource::SyntheticDemo => {
+                ui.label(
+                    egui::RichText::new(
+                        "[Synthetic 3-Peak Demo] Editable 2D NUS Schedule (0-based 't2 t1' coordinates per line; comments '#')",
+                    )
+                    .size(TYPE_CAPTION_PX)
+                    .strong(),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("p22_maxent_sched_scroll")
+                    .max_height(88.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut st.schedule_text)
+                                .font(egui::FontId::monospace(TYPE_CAPTION_PX))
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(4),
+                        );
+                    });
+            }
         });
 
     ui.add_space(4.0);
@@ -2778,6 +3706,11 @@ fn show_maxent_tab(ui: &mut egui::Ui, st: &mut MaxEntTabState, theme: &P22ToolsT
                 let total_grid = (st.n2 * st.n1).max(1);
                 let cov_pct = 100.0 * (st.last_sampled_count as f64) / (total_grid as f64);
                 ui.horizontal_wrapped(|ui| {
+                    let source_badge = match st.last_run_source {
+                        Some(MaxEntDataSource::UserDataTsv) => "[User Data TSV]",
+                        Some(MaxEntDataSource::SyntheticDemo) | None => "[Synthetic 3-Peak Demo]",
+                    };
+                    metric_chip(ui, "Source", source_badge, theme);
                     metric_chip(
                         ui,
                         "KKT ||grad||_inf",
@@ -3048,11 +3981,19 @@ fn show_artsy_tab(ui: &mut egui::Ui, st: &mut ArtsyTabState, theme: &P22ToolsThe
                         .range(1.0..=40.0)
                         .speed(0.05),
                 );
-                ui.label(egui::RichText::new("1J_NH iso (Hz):").size(TYPE_CAPTION_PX));
+                ui.label(egui::RichText::new("J_iso (Hz):").size(TYPE_CAPTION_PX));
                 ui.add(
                     egui::DragValue::new(&mut st.j_iso_default_hz)
                         .range(-120.0..=-60.0)
-                        .speed(0.1),
+                        .speed(0.1)
+                        .max_decimals(2),
+                );
+                ui.label(egui::RichText::new("sigma_J (Hz):").size(TYPE_CAPTION_PX));
+                ui.add(
+                    egui::DragValue::new(&mut st.j_iso_default_sigma_hz)
+                        .range(0.0..=15.0)
+                        .speed(0.05)
+                        .max_decimals(2),
                 );
                 ui.label(egui::RichText::new("Scan ratio N_att/N_ref:").size(TYPE_CAPTION_PX));
                 ui.add(
@@ -3105,7 +4046,7 @@ fn show_artsy_tab(ui: &mut egui::Ui, st: &mut ArtsyTabState, theme: &P22ToolsThe
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new(
-                    "Editable Input TSV (seq_id, res_name, i_ref, i_att, sigma[, sigma_att])",
+                    "Editable Input TSV (seq_id, res_name, i_ref, i_att, sigma[, sigma_att[, j_iso_hz[, sigma_j_hz]]])",
                 )
                 .size(TYPE_CAPTION_PX)
                 .strong(),
@@ -3121,6 +4062,41 @@ fn show_artsy_tab(ui: &mut egui::Ui, st: &mut ArtsyTabState, theme: &P22ToolsThe
                             .desired_rows(5),
                     );
                 });
+        });
+
+    ui.add_space(4.0);
+
+    // Explicit isotropic-reference disclosure (`171.tools:P1-4`)
+    let (disc_bg, disc_fg, disc_body) = if st.j_iso_default_sigma_hz <= 0.0 {
+        (
+            theme.warn_bg,
+            theme.warn_fg,
+            format!(
+                "Warning: sigma_J = 0.00 Hz with uniform J_iso = {:.2} Hz. True ^1J_NH varies by ~+/-1.0 Hz across secondary structure; sigma(D) currently excludes isotropic reference uncertainty unless per-residue j_iso_hz/sigma_j_hz columns are supplied.",
+                st.j_iso_default_hz
+            ),
+        )
+    } else {
+        (
+            theme.guide_bg,
+            theme.text_primary,
+            format!(
+                "Isotropic Reference Disclosure: Without a paired isotropic ARTSY spectrum, ^1D_NH is referenced to J_iso = {:.2} +/- {:.2} Hz and sigma_J is propagated in quadrature: sigma(D) = sqrt(sigma_|J+D|^2 + sigma_J^2) (Fitzkee & Bax 2010). Supply optional columns 7-8 (j_iso_hz, sigma_j_hz) for per-residue isotropic references.",
+                st.j_iso_default_hz, st.j_iso_default_sigma_hz
+            ),
+        )
+    };
+    egui::Frame::NONE
+        .fill(disc_bg)
+        .stroke(egui::Stroke::new(1.0, theme.border))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(8, 5))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(disc_body)
+                    .size(TYPE_CAPTION_PX)
+                    .color(disc_fg),
+            );
         });
 
     ui.add_space(4.0);
