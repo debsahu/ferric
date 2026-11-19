@@ -258,7 +258,13 @@ fn compute_aev(@builtin(global_invocation_id) gid: vec3<u32>) {
                                                 -1.0,
                                                 1.0
                                             );
-                                            theta = acos(clamp(0.95 * cos_t, -0.95, 0.95));
+                                            let scaled_cos = clamp(0.95 * cos_t, -0.95, 0.95);
+                                            // Use atan2(sin, cos) instead of acos(x): Mesa Lavapipe's SPIR-V acos
+                                            // polynomial has ~1e-4 error, amplified by zeta=8 to ~8e-4.
+                                            theta = atan2(
+                                                sqrt(max(0.0, 1.0 - scaled_cos * scaled_cos)),
+                                                scaled_cos
+                                            );
                                         } else {
                                             theta = atan2(length(cross(d_ij, d_ik)), dot(d_ij, d_ik));
                                         }
