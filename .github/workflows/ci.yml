@@ -85,6 +85,8 @@ jobs:
           python3 scripts/verify_p17_preregistration.py --check
           python3 scripts/build_docs_manual.py --self-test
           python3 scripts/build_docs_manual.py --check
+          python3 scripts/check_docs_cli_flags.py --self-test
+          python3 scripts/check_docs_cli_flags.py --check
           python3 scripts/build_interactive_tours.py --self-test
           TOUR_CI_DIR="${RUNNER_TEMP:-/tmp}/ferric_ci_tours"
           rm -rf "$TOUR_CI_DIR"

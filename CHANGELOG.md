@@ -4,6 +4,20 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
+## [Unreleased] — FIX3 change set for Phase 20/21 (In Review — awaiting Claude FINAL APPROVE)
+
+Status: **In Review — awaiting Claude FINAL APPROVE**. Nothing below is approved; the Phase 20/21 `TODO.md` items stay `[ ]`. FIX3 answers the `PHASE21_FINAL_FIX2_CLAUDE_VERDICT` blockers (`21F:B1`, `B6`, `B9`, `B11`, `B12`, `B13`, `B15`, `B19`, `B20`, `N1`, `N2`, ledger claims and the `B2` disclosure). Per the FIX3 rules no slice touched solver scoring, priors, `docs/specs/03-assignment.md` or `.github/workflows/docs.yml`; the six 5-seed gates (`AGENTS.md` DoD) are to be re-run by the reviewer on the merged head.
+
+- **Slice A** (`21F:B1`; `6da3e8f`): one shared `pLDDT` provenance rule (`PlddtProvenanceEvidence::verdict()`) for all four gates (`af_concordance`, `struct_shifts`, `af_assign_priors`, GUI `mol3d_viewer`); a declared `pLDDT` metric without local rows fails closed; the `mol3d_viewer_tests` `60 fps` wall-clock check is now a non-gating diagnostic.
+- **Slice B** (`21F:B6`; `c4c0f55`): water suppression returns `WaterSuppressionOutcome::{Suppressed, NotDetected}` (no-op plus message and no undo entry when no dominant water is found), solvent-aware windows, the same dominance guard in 1D/2D/3D, and disclosed limits (broad water only partly removed; wing bias next to water).
+- **Slice C** (`21F:B9`, `21F:B19`; `c998f57`): allowlist scrub of untrusted strings in every MCP success output (`<non-conforming>` placeholder); fail-closed exchange nucleus set; the error-scale warning uses the exact chi-square quantile on control (`site_role = control`) or spectator sites, and a fired warning downgrades the verdict to `ErrorScaleInconsistent`.
+- **Slice D** (`21F:N1`, `21F:N2`, `B4`/`B5` follow-ups; `1a379a7`): `4.0 Å` C–N chain-join rule with chain-break and stretched-bond warnings; GPU replica selection on one objective (the always-on closure is CPU polish/final ranking only, disclosed); `reentry_closure` energy term and `CLOSURE=` remark; order-independent `PRE` directives with fail-closed duplicates and unknown tags; effective-`tau_c` / `T1e` note.
+- **Slice E** (`21F:B11`, `21F:B12`, `21F:B13`; `6d88337`): working Top-K competitor list in the strip dock; metric renamed to data-plot share (`65.2%` at `1440×900`, `61.1%` at `1280×800`); first-run test on a multi-experiment Bruker folder checks ground-truth placements (known bug: status line over-counts `15/15` vs `13` placed); ubiquitin AF demo rebuilt as one rigid domain with real `BMRB 17769` shifts and `1D3Z` RDCs.
+- **Slice F** (`21F:B15`; `5c086a6`): Mod `02`/`04` tour caption, badge, JS and legend scalars read from the payload; Mod `04` Ch `4` names the fitted `R_ex` sites; Mod `01`/`03` hard-coded literals are listed as known and remain.
+- **Slice G** (`21F:B20`, `21F:B2` disclosure, ledger claims; this commit on `fix3-g-docs`): docs: non-existent flags and constants corrected (`--pre-tau-c`, `--csp-scoring forward`, `--max-contact-dist`, `PCS` metal from the TSV header, `K_SOLOMON_PROTON_NITROXIDE_A6_S2`, `MAX_MCP_STRUCTURE_BYTES`, `AF_NOESY_MAX_SITE_BONUS_NATS = 2.50`, closure `~0.03 Å` observed / `0.15 Å` asserted); new `scripts/check_docs_cli_flags.py` CI self-check (`--self-test`, `--check`) for documented `ferric` flags and cited constants; `T21.4` ablation disclosure (NOESY adds `0` pp; HCP gain from AF alone; `evo-graph` `ECE_10` `0.022 -> 0.137`; sparse-`HNCA` `FORBID` cells opened as a science-track item); doc consequences of slices A–F.
+
+---
+
 ## [0.15.0] — 2026-11-17
 
 ### Multi-Page NMR Workbook UI, Universal 1D/2D/3D Ingest, Water Suppression, Interactive Video Showcase & `nmrassign` Alias Removal
