@@ -88,16 +88,15 @@ use crate::multiplet::{
     analyze_multiplet_region, format_journal_nmr_report, JournalNmrReport, MultipletConfig,
     PublicationStyle, ReportNucleus, ReportedSignal, TextEncoding,
 };
-use crate::nef::read_nef_file;
+use crate::nef::read_nef_str;
 use crate::nmr1d::{
     auto_calibrate_solvent_1d, deconvolve_spectrum_1d, estimate_noise_sigma_1d,
     load_processed_spectrum_1d, match_trace_impurities, pick_peaks_1d, DeconvolveConfig1D,
     PeakPickConfig1D,
 };
-use crate::nmrstar::{read_star_all_atoms, write_star_with_header, Reference};
+use crate::nmrstar::{read_star_str_all_atoms, write_star_with_header, Reference};
 use crate::peaks::{
-    experiment_rules, read_peaks, read_peaks_str, write_peaks, Peak, ALL_EXPERIMENT_NAMES,
-    EXPERIMENT_NAMES,
+    experiment_rules, read_peaks_str, write_peaks, Peak, ALL_EXPERIMENT_NAMES, EXPERIMENT_NAMES,
 };
 use crate::priors::{
     estimate_reference_offsets_detailed, one_to_three, sync_detailed_reference_offsets, Priors,
@@ -954,48 +953,151 @@ pub fn sanitize_mcp_error_message(raw: &str) -> String {
     truncate_printable_ascii(raw, MAX_MCP_ERROR_MESSAGE_CHARS)
 }
 
-/// Sanitize untrusted file/TSV/STAR/NEF/PDB/CIF parser errors by redacting all quoted/backticked
-/// file tokens (`'...'`, `"..."`, `` `...` ``) and oversized unquoted tokens before truncating to
-/// `<= 160` printable ASCII characters, eliminating prompt-injection echo vectors.
-fn sanitize_untrusted_parse_error(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let mut unquoted = String::with_capacity(bytes.len().min(256));
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if matches!(b, b'\'' | b'"' | b'`') {
-            let quote = b;
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
-                    continue;
-                }
-                if bytes[i] == quote {
+/// Closed, static error category enum for structured MCP parse and domain errors.
+/// Guarantees ZERO untrusted file/argument substrings are ever echoed into LLM context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructuredErrorCategory {
+    EmptyInput,
+    MissingHeaderOrColumns,
+    InvalidNumericValue,
+    InvalidSignOrMode,
+    InvalidAtomOrResidue,
+    DuplicateEntry,
+    MissingRequiredField,
+    InsufficientData,
+    ProvenanceOrPlddt,
+    IoFailure,
+    FitOrSolverFailure,
+    InvalidFormat,
+}
+
+impl StructuredErrorCategory {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::EmptyInput => "empty_input",
+            Self::MissingHeaderOrColumns => "missing_header_or_columns",
+            Self::InvalidNumericValue => "invalid_numeric_value",
+            Self::InvalidSignOrMode => "invalid_sign_or_mode",
+            Self::InvalidAtomOrResidue => "invalid_atom_or_residue",
+            Self::DuplicateEntry => "duplicate_entry",
+            Self::MissingRequiredField => "missing_required_field",
+            Self::InsufficientData => "insufficient_data",
+            Self::ProvenanceOrPlddt => "provenance_or_plddt",
+            Self::IoFailure => "io_failure",
+            Self::FitOrSolverFailure => "fit_or_solver_failure",
+            Self::InvalidFormat => "invalid_format",
+        }
+    }
+}
+
+/// Extract a purely numeric positive index following any of `prefixes` (case-insensitive) in `raw`.
+/// Never returns any non-digit substring from `raw`.
+fn extract_numeric_location(raw_lower: &str, prefixes: &[&str]) -> Option<usize> {
+    let bytes = raw_lower.as_bytes();
+    for prefix in prefixes {
+        let mut search_from = 0usize;
+        while let Some(rel) = raw_lower[search_from..].find(prefix) {
+            let start = search_from + rel + prefix.len();
+            // Ensure prefix starts at a word boundary (or start of string)
+            let boundary_ok = search_from + rel == 0
+                || !bytes[search_from + rel - 1].is_ascii_alphanumeric();
+            if boundary_ok {
+                let mut i = start;
+                while i < bytes.len() && matches!(bytes[i], b' ' | b':' | b'=' | b'#') {
                     i += 1;
-                    break;
                 }
-                i += 1;
+                let digit_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i > digit_start {
+                    if let Ok(n) = raw_lower[digit_start..i].parse::<usize>() {
+                        if n > 0 {
+                            return Some(n);
+                        }
+                    }
+                }
             }
-            unquoted.push_str("<redacted>");
-        } else {
-            unquoted.push(if (0x20..=0x7E).contains(&b) {
-                b as char
-            } else {
-                ' '
-            });
-            i += 1;
+            search_from = start.min(raw_lower.len());
         }
     }
-    let mut safe_tokens = Vec::new();
-    for tok in unquoted.split_whitespace() {
-        if tok.len() > 36 && tok != "<redacted>" {
-            safe_tokens.push("<redacted>");
-        } else {
-            safe_tokens.push(tok);
-        }
+    None
+}
+
+/// Classify a parser or domain error into a closed static [`StructuredErrorCategory`].
+fn classify_structured_error_category(raw_lower: &str) -> StructuredErrorCategory {
+    if raw_lower.contains("duplicate") || raw_lower.contains("near-duplicate") {
+        StructuredErrorCategory::DuplicateEntry
+    } else if raw_lower.contains("plddt")
+        || raw_lower.contains("provenance")
+        || raw_lower.contains("b-factor")
+        || raw_lower.contains("bfactor")
+    {
+        StructuredErrorCategory::ProvenanceOrPlddt
+    } else if raw_lower.contains("empty") || raw_lower.contains("zero ") || raw_lower.contains("no rows")
+    {
+        StructuredErrorCategory::EmptyInput
+    } else if raw_lower.contains("header") || raw_lower.contains("column") {
+        StructuredErrorCategory::MissingHeaderOrColumns
+    } else if raw_lower.contains("sign_mode")
+        || raw_lower.contains("sign mode")
+        || raw_lower.contains("unsupported mode")
+    {
+        StructuredErrorCategory::InvalidSignOrMode
+    } else if raw_lower.contains("float")
+        || raw_lower.contains("integer")
+        || raw_lower.contains("finite")
+        || raw_lower.contains("numeric")
+        || raw_lower.contains("nan")
+        || raw_lower.contains("seq_id")
+        || raw_lower.contains("ppm")
+        || raw_lower.contains("invalid digit")
+        || raw_lower.contains("parse")
+    {
+        StructuredErrorCategory::InvalidNumericValue
+    } else if raw_lower.contains("atom") || raw_lower.contains("residue") || raw_lower.contains("amino")
+    {
+        StructuredErrorCategory::InvalidAtomOrResidue
+    } else if raw_lower.contains("missing") || raw_lower.contains("required") {
+        StructuredErrorCategory::MissingRequiredField
+    } else if raw_lower.contains("at least") || raw_lower.contains("insufficient") || raw_lower.contains("too few")
+    {
+        StructuredErrorCategory::InsufficientData
+    } else if raw_lower.contains("failed to read")
+        || raw_lower.contains("failed to open")
+        || raw_lower.contains("failed to write")
+        || raw_lower.contains("no such file")
+        || raw_lower.contains("permission denied")
+    {
+        StructuredErrorCategory::IoFailure
+    } else if raw_lower.contains("converge")
+        || raw_lower.contains("singular")
+        || raw_lower.contains("fit")
+        || raw_lower.contains("solver")
+    {
+        StructuredErrorCategory::FitOrSolverFailure
+    } else {
+        StructuredErrorCategory::InvalidFormat
     }
-    truncate_printable_ascii(&safe_tokens.join(" "), MAX_MCP_ERROR_MESSAGE_CHARS)
+}
+
+/// Format an untrusted parser or domain error as a strictly structured message containing ONLY
+/// static category labels and optional numeric `(line, col)` locations — ZERO untrusted input
+/// substrings are ever echoed (eliminating quote-break and prompt-injection echo vectors).
+fn structured_parse_error(kind: &str, raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    let line = extract_numeric_location(&lower, &["line", "row"]);
+    let col = extract_numeric_location(&lower, &["column", "col", "field"]);
+    let cat = classify_structured_error_category(&lower).as_str();
+    let msg = match (line, col) {
+        (Some(l), Some(c)) => {
+            format!("parse error (line {l}, col {c}, kind: {kind}, category: {cat})")
+        }
+        (Some(l), None) => format!("parse error (line {l}, kind: {kind}, category: {cat})"),
+        (None, Some(c)) => format!("parse error (col {c}, kind: {kind}, category: {cat})"),
+        (None, None) => format!("parse error (kind: {kind}, category: {cat})"),
+    };
+    truncate_printable_ascii(&msg, MAX_MCP_ERROR_MESSAGE_CHARS)
 }
 
 /// Format a `serde_json::Error` using only line/column and structural category (`<= 160` ASCII
@@ -1049,12 +1151,12 @@ fn validate_regular_file_before_read(
 }
 
 /// Validate `symlink_metadata` (`is_file()` & `<= max_bytes`) prior to opening, verify the opened
-/// file descriptor metadata, and read bounded UTF-8 text (`take(max_bytes + 1)`).
-fn read_bounded_regular_file_to_string(
+/// file descriptor metadata, and read bounded raw bytes (`take(max_bytes + 1)`).
+fn read_bounded_regular_file_bytes(
     resolved: &Path,
     display_label: &str,
     max_bytes: u64,
-) -> Result<String, McpCallToolResult> {
+) -> Result<Vec<u8>, McpCallToolResult> {
     let est_len = validate_regular_file_before_read(resolved, display_label, max_bytes)?;
     let file = fs::File::open(resolved).map_err(|_| {
         McpCallToolResult::domain_error("io_error", format!("failed to open '{display_label}'"))
@@ -1092,6 +1194,17 @@ fn read_bounded_regular_file_to_string(
             format!("file '{display_label}' grew beyond maximum allowed size ({max_bytes} bytes)"),
         ));
     }
+    Ok(buf)
+}
+
+/// Validate `symlink_metadata` (`is_file()` & `<= max_bytes`) prior to opening, verify the opened
+/// file descriptor metadata, and read bounded UTF-8 text (`take(max_bytes + 1)`).
+fn read_bounded_regular_file_to_string(
+    resolved: &Path,
+    display_label: &str,
+    max_bytes: u64,
+) -> Result<String, McpCallToolResult> {
+    let buf = read_bounded_regular_file_bytes(resolved, display_label, max_bytes)?;
     String::from_utf8(buf).map_err(|_| {
         McpCallToolResult::domain_error(
             "encoding_error",
@@ -1729,6 +1842,21 @@ impl McpServer {
     }
 
     fn rpc_resources_read(&self, params: Option<Value>) -> Result<Value, JsonRpcError> {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.rpc_resources_read_inner(params)
+        }));
+        match caught {
+            Ok(res) => res,
+            Err(_) => Err(JsonRpcError {
+                code: ERR_INTERNAL_ERROR,
+                message: "internal panic caught while executing resources/read; server state preserved"
+                    .to_string(),
+                data: None,
+            }),
+        }
+    }
+
+    fn rpc_resources_read_inner(&self, params: Option<Value>) -> Result<Value, JsonRpcError> {
         let obj = require_params_object(params, "resources/read")?;
         let Some(uri) = obj.get("uri").and_then(Value::as_str) else {
             return Err(JsonRpcError {
@@ -1737,6 +1865,10 @@ impl McpServer {
                 data: None,
             });
         };
+
+        if self.test_panic_probe_enabled && uri == "nmr://__test_panic_probe" {
+            panic!("simulated internal resources/read panic for MCP catch_unwind guard verification");
+        }
 
         if uri == "nmr://workspace/policy" {
             let root_labels: Vec<String> = self
@@ -1849,32 +1981,37 @@ impl McpServer {
             let resolved = single_root_policy
                 .resolve_sandboxed_path(rel_path)
                 .map_err(|e| e.to_json_rpc_error())?;
-            let meta = fs::metadata(&resolved).map_err(|e| JsonRpcError {
-                code: ERR_RESOURCE_NOT_FOUND,
-                message: format!("failed to stat resource: {e}"),
-                data: None,
-            })?;
-            if !meta.is_file() {
-                return Err(JsonRpcError {
-                    code: ERR_INVALID_PARAMS,
-                    message: "requested resource URI points to a directory, not a file".to_string(),
+            let content = read_bounded_regular_file_to_string(
+                &resolved,
+                rel_path,
+                MAX_RESOURCE_READ_BYTES,
+            )
+            .map_err(|tool_err| {
+                let kind = tool_err
+                    .structured_content
+                    .as_ref()
+                    .and_then(|v| v.get("error"))
+                    .and_then(|e| e.get("kind"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("io_error");
+                let msg = tool_err
+                    .structured_content
+                    .as_ref()
+                    .and_then(|v| v.get("error"))
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("failed to read bounded regular resource file")
+                    .to_string();
+                let code = match kind {
+                    "special_file_rejected" | "file_too_large" => ERR_INVALID_PARAMS,
+                    "io_error" => ERR_RESOURCE_NOT_FOUND,
+                    _ => ERR_INTERNAL_ERROR,
+                };
+                JsonRpcError {
+                    code,
+                    message: msg,
                     data: None,
-                });
-            }
-            if meta.len() > MAX_RESOURCE_READ_BYTES {
-                return Err(JsonRpcError {
-                    code: ERR_INVALID_PARAMS,
-                    message: format!(
-                        "resource exceeds maximum read size ({} > {MAX_RESOURCE_READ_BYTES} bytes)",
-                        meta.len()
-                    ),
-                    data: None,
-                });
-            }
-            let content = fs::read_to_string(&resolved).map_err(|e| JsonRpcError {
-                code: ERR_INTERNAL_ERROR,
-                message: format!("failed to read UTF-8 resource text: {e}"),
-                data: None,
+                }
             })?;
             let mime = if rel_path.ends_with(".tsv") {
                 "text/tab-separated-values"
@@ -1902,6 +2039,21 @@ impl McpServer {
     }
 
     fn rpc_prompts_get(&self, params: Option<Value>) -> Result<Value, JsonRpcError> {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.rpc_prompts_get_inner(params)
+        }));
+        match caught {
+            Ok(res) => res,
+            Err(_) => Err(JsonRpcError {
+                code: ERR_INTERNAL_ERROR,
+                message: "internal panic caught while executing prompts/get; server state preserved"
+                    .to_string(),
+                data: None,
+            }),
+        }
+    }
+
+    fn rpc_prompts_get_inner(&self, params: Option<Value>) -> Result<Value, JsonRpcError> {
         let obj = require_params_object(params, "prompts/get")?;
         let Some(name) = obj.get("name").and_then(Value::as_str) else {
             return Err(JsonRpcError {
@@ -1910,6 +2062,9 @@ impl McpServer {
                 data: None,
             });
         };
+        if self.test_panic_probe_enabled && name == "__test_panic_probe" {
+            panic!("simulated internal prompts/get panic for MCP catch_unwind guard verification");
+        }
         let args: Map<String, Value> = match obj.get("arguments") {
             None | Some(Value::Null) => Map::new(),
             Some(Value::Object(m)) => m.clone(),
@@ -1948,7 +2103,12 @@ impl McpServer {
 
         let inventory = match classify_nmr_workspace(&resolved) {
             Ok(inv) => inv,
-            Err(e) => return McpCallToolResult::domain_error("classify_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "classify_error",
+                    structured_parse_error("classify_error", &e),
+                );
+            }
         };
 
         let mut pulprog_reports = Vec::new();
@@ -2011,10 +2171,24 @@ impl McpServer {
             Ok(p) => p,
             Err(sec) => return sec.to_tool_error_result(),
         };
+        let display_lbl = self.policy.relativize_display_path(&resolved);
+        let text = match read_bounded_regular_file_to_string(
+            &resolved,
+            &display_lbl,
+            MAX_MCP_PHASE21_TEXT_BYTES,
+        ) {
+            Ok(t) => t,
+            Err(err_res) => return err_res,
+        };
 
-        let ref_data = match read_star_all_atoms(&resolved, entity) {
+        let ref_data = match read_star_str_all_atoms(&text, entity) {
             Ok(r) => r,
-            Err(e) => return McpCallToolResult::domain_error("nmrstar_parse_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "nmrstar_parse_error",
+                    structured_parse_error("nmrstar_parse_error", &e),
+                );
+            }
         };
 
         let n_res = ref_data.sequence.len();
@@ -2085,10 +2259,24 @@ impl McpServer {
             Ok(p) => p,
             Err(sec) => return sec.to_tool_error_result(),
         };
+        let display_lbl = self.policy.relativize_display_path(&resolved);
+        let text = match read_bounded_regular_file_to_string(
+            &resolved,
+            &display_lbl,
+            MAX_MCP_PHASE21_TEXT_BYTES,
+        ) {
+            Ok(t) => t,
+            Err(err_res) => return err_res,
+        };
 
-        let peaks = match read_peaks(&resolved) {
+        let peaks = match read_peaks_str(&text) {
             Ok(p) => p,
-            Err(e) => return McpCallToolResult::domain_error("peak_parse_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "peak_parse_error",
+                    structured_parse_error("peak_parse_error", &e),
+                );
+            }
         };
 
         #[derive(Default)]
@@ -2196,25 +2384,58 @@ impl McpServer {
             Ok(p) => p,
             Err(sec) => return sec.to_tool_error_result(),
         };
-        let peaks = match read_peaks(&resolved_peaks) {
+        let peaks_lbl = self.policy.relativize_display_path(&resolved_peaks);
+        let peaks_text = match read_bounded_regular_file_to_string(
+            &resolved_peaks,
+            &peaks_lbl,
+            MAX_MCP_PHASE21_TEXT_BYTES,
+        ) {
+            Ok(t) => t,
+            Err(err_res) => return err_res,
+        };
+        let peaks = match read_peaks_str(&peaks_text) {
             Ok(p) => p,
-            Err(e) => return McpCallToolResult::domain_error("peak_parse_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "peak_parse_error",
+                    structured_parse_error("peak_parse_error", &e),
+                );
+            }
         };
 
         let seq3: Vec<String> = if let Some(seq_text) = args.get("sequence").and_then(Value::as_str)
         {
             match parse_sequence_to_three_letter(seq_text) {
                 Ok(s) => s,
-                Err(e) => return McpCallToolResult::domain_error("sequence_parse_error", e),
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "sequence_parse_error",
+                        structured_parse_error("sequence_parse_error", &e),
+                    );
+                }
             }
         } else if let Some(star_raw) = args.get("star_path").and_then(Value::as_str) {
             let resolved_star = match self.policy.resolve_sandboxed_path(star_raw) {
                 Ok(p) => p,
                 Err(sec) => return sec.to_tool_error_result(),
             };
-            match read_star_all_atoms(&resolved_star, None) {
+            let star_lbl = self.policy.relativize_display_path(&resolved_star);
+            let star_text = match read_bounded_regular_file_to_string(
+                &resolved_star,
+                &star_lbl,
+                MAX_MCP_PHASE21_TEXT_BYTES,
+            ) {
+                Ok(t) => t,
+                Err(err_res) => return err_res,
+            };
+            match read_star_str_all_atoms(&star_text, None) {
                 Ok(r) => r.sequence,
-                Err(e) => return McpCallToolResult::domain_error("nmrstar_parse_error", e),
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "nmrstar_parse_error",
+                        structured_parse_error("nmrstar_parse_error", &e),
+                    );
+                }
             }
         } else {
             return McpCallToolResult::domain_error(
@@ -2225,7 +2446,12 @@ impl McpServer {
 
         let systems = match build_spin_systems(&peaks, &Tolerances::default(), 3, false) {
             Ok(s) => s,
-            Err(e) => return McpCallToolResult::domain_error("spin_system_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "spin_system_error",
+                    structured_parse_error("spin_system_error", &e),
+                );
+            }
         };
 
         let seed = args.get("seed").and_then(Value::as_u64).unwrap_or(0);
@@ -2326,9 +2552,23 @@ impl McpServer {
             Ok(p) => p,
             Err(sec) => return sec.to_tool_error_result(),
         };
-        let shifts = match read_star_all_atoms(&resolved_star, None) {
+        let star_lbl = self.policy.relativize_display_path(&resolved_star);
+        let star_text = match read_bounded_regular_file_to_string(
+            &resolved_star,
+            &star_lbl,
+            MAX_MCP_PHASE21_TEXT_BYTES,
+        ) {
+            Ok(t) => t,
+            Err(err_res) => return err_res,
+        };
+        let shifts = match read_star_str_all_atoms(&star_text, None) {
             Ok(r) => r,
-            Err(e) => return McpCallToolResult::domain_error("nmrstar_parse_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "nmrstar_parse_error",
+                    structured_parse_error("nmrstar_parse_error", &e),
+                );
+            }
         };
 
         let parse_str_list = |key: &str| -> Vec<String> {
@@ -2449,16 +2689,35 @@ impl McpServer {
             if let Some(tsv_text) = args.get("peaks_tsv").and_then(Value::as_str) {
                 match read_peaks_str(tsv_text) {
                     Ok(p) => p,
-                    Err(e) => return McpCallToolResult::domain_error("peak_parse_error", e),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "peak_parse_error",
+                            structured_parse_error("peak_parse_error", &e),
+                        );
+                    }
                 }
             } else if let Some(src_path) = args.get("source_peaks_path").and_then(Value::as_str) {
                 let resolved_src = match self.policy.resolve_sandboxed_path(src_path) {
                     Ok(p) => p,
                     Err(sec) => return sec.to_tool_error_result(),
                 };
-                match read_peaks(&resolved_src) {
+                let src_lbl = self.policy.relativize_display_path(&resolved_src);
+                let src_text = match read_bounded_regular_file_to_string(
+                    &resolved_src,
+                    &src_lbl,
+                    MAX_MCP_PHASE21_TEXT_BYTES,
+                ) {
+                    Ok(t) => t,
+                    Err(err_res) => return err_res,
+                };
+                match read_peaks_str(&src_text) {
                     Ok(p) => p,
-                    Err(e) => return McpCallToolResult::domain_error("peak_parse_error", e),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "peak_parse_error",
+                            structured_parse_error("peak_parse_error", &e),
+                        );
+                    }
                 }
             } else {
                 return McpCallToolResult::domain_error(
@@ -2505,14 +2764,23 @@ impl McpServer {
             if let Err(e) = fs::create_dir_all(parent) {
                 return McpCallToolResult::domain_error(
                     "io_error",
-                    format!("failed to create output directory: {e}"),
+                    structured_parse_error("io_error", &e.to_string()),
                 );
             }
         }
         if let Err(e) = write_peaks(&resolved_out, &curated) {
-            return McpCallToolResult::domain_error("io_error", e);
+            return McpCallToolResult::domain_error(
+                "io_error",
+                structured_parse_error("io_error", &e),
+            );
         }
-        let written_bytes = fs::read(&resolved_out).unwrap_or_default();
+        let out_lbl = self.policy.relativize_display_path(&resolved_out);
+        let written_bytes = read_bounded_regular_file_bytes(
+            &resolved_out,
+            &out_lbl,
+            MAX_MCP_PHASE21_TEXT_BYTES,
+        )
+        .unwrap_or_default();
 
         McpCallToolResult::ok_json(&json!({
             "output_path": self.policy.relativize_display_path(&resolved_out),
@@ -2548,14 +2816,33 @@ impl McpServer {
                     Ok(p) => p,
                     Err(sec) => return sec.to_tool_error_result(),
                 };
-                match read_star_all_atoms(&resolved_src, None) {
+                let src_lbl = self.policy.relativize_display_path(&resolved_src);
+                let src_text = match read_bounded_regular_file_to_string(
+                    &resolved_src,
+                    &src_lbl,
+                    MAX_MCP_PHASE21_TEXT_BYTES,
+                ) {
+                    Ok(t) => t,
+                    Err(err_res) => return err_res,
+                };
+                match read_star_str_all_atoms(&src_text, None) {
                     Ok(r) => r,
-                    Err(e) => return McpCallToolResult::domain_error("nmrstar_parse_error", e),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "nmrstar_parse_error",
+                            structured_parse_error("nmrstar_parse_error", &e),
+                        );
+                    }
                 }
             } else if let Some(seq_str) = args.get("sequence").and_then(Value::as_str) {
                 let seq3 = match parse_sequence_to_three_letter(seq_str) {
                     Ok(s) => s,
-                    Err(e) => return McpCallToolResult::domain_error("sequence_parse_error", e),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "sequence_parse_error",
+                            structured_parse_error("sequence_parse_error", &e),
+                        );
+                    }
                 };
                 let first_seq_id = args
                     .get("first_seq_id")
@@ -2624,7 +2911,7 @@ impl McpServer {
             if let Err(e) = fs::create_dir_all(parent) {
                 return McpCallToolResult::domain_error(
                     "io_error",
-                    format!("failed to create output directory: {e}"),
+                    structured_parse_error("io_error", &e.to_string()),
                 );
             }
         }
@@ -2632,9 +2919,18 @@ impl McpServer {
         let header = args.get("header_comment").and_then(Value::as_str);
         let conf_opt = (!confidence_map.is_empty()).then_some(&confidence_map);
         if let Err(e) = write_star_with_header(&resolved_out, &ref_data, conf_opt, header) {
-            return McpCallToolResult::domain_error("io_error", e);
+            return McpCallToolResult::domain_error(
+                "io_error",
+                structured_parse_error("io_error", &e),
+            );
         }
-        let written_bytes = fs::read(&resolved_out).unwrap_or_default();
+        let out_lbl = self.policy.relativize_display_path(&resolved_out);
+        let written_bytes = read_bounded_regular_file_bytes(
+            &resolved_out,
+            &out_lbl,
+            MAX_MCP_PHASE21_TEXT_BYTES,
+        )
+        .unwrap_or_default();
 
         McpCallToolResult::ok_json(&json!({
             "output_path": self.policy.relativize_display_path(&resolved_out),
@@ -2703,14 +2999,14 @@ impl McpServer {
         match mode.as_str() {
             "relaxation" | "r1" | "r2" => {
                 let first = &resolved_paths[0];
-                let text = match fs::read_to_string(first) {
+                let first_lbl = &display_paths[0];
+                let text = match read_bounded_regular_file_to_string(
+                    first,
+                    first_lbl,
+                    MAX_MCP_PHASE21_TEXT_BYTES,
+                ) {
                     Ok(t) => t,
-                    Err(e) => {
-                        return McpCallToolResult::domain_error(
-                            "io_error",
-                            format!("failed to read relaxation series: {e}"),
-                        );
-                    }
+                    Err(err_res) => return err_res,
                 };
                 let is_nef = first
                     .extension()
@@ -2720,14 +3016,20 @@ impl McpServer {
                     match parse_relax_series_nef_str(&text) {
                         Ok(d) => d,
                         Err(e) => {
-                            return McpCallToolResult::domain_error("relax_parse_error", e);
+                            return McpCallToolResult::domain_error(
+                                "relax_parse_error",
+                                structured_parse_error("relax_parse_error", &e),
+                            );
                         }
                     }
                 } else {
                     match parse_relax_series_tsv_str(&text) {
                         Ok(d) => d,
                         Err(e) => {
-                            return McpCallToolResult::domain_error("relax_parse_error", e);
+                            return McpCallToolResult::domain_error(
+                                "relax_parse_error",
+                                structured_parse_error("relax_parse_error", &e),
+                            );
                         }
                     }
                 };
@@ -2748,7 +3050,12 @@ impl McpServer {
                 let inputs = decay_inputs_from_series(&ds);
                 let fits = match fit_decay_batch_cpu(&inputs, &cfg) {
                     Ok(f) => f,
-                    Err(e) => return McpCallToolResult::domain_error("relax_fit_error", e),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "relax_fit_error",
+                            structured_parse_error("relax_fit_error", &e),
+                        );
+                    }
                 };
                 let mean_rate = if fits.is_empty() {
                     0.0
@@ -2786,19 +3093,23 @@ impl McpServer {
             }
             "cest" | "dest" => {
                 let mut profiles = Vec::new();
-                for p in &resolved_paths {
-                    let text = match fs::read_to_string(p) {
+                for (p, disp) in resolved_paths.iter().zip(display_paths.iter()) {
+                    let text = match read_bounded_regular_file_to_string(
+                        p,
+                        disp,
+                        MAX_MCP_PHASE21_TEXT_BYTES,
+                    ) {
                         Ok(t) => t,
-                        Err(e) => {
-                            return McpCallToolResult::domain_error(
-                                "io_error",
-                                format!("failed to read CEST profile TSV: {e}"),
-                            );
-                        }
+                        Err(err_res) => return err_res,
                     };
                     match read_cest_profiles_tsv(&text) {
                         Ok(mut parsed) => profiles.append(&mut parsed),
-                        Err(e) => return McpCallToolResult::domain_error("cest_parse_error", e),
+                        Err(e) => {
+                            return McpCallToolResult::domain_error(
+                                "cest_parse_error",
+                                structured_parse_error("cest_parse_error", &e),
+                            );
+                        }
                     }
                 }
                 let compute_chi2_surface = args
@@ -2811,7 +3122,12 @@ impl McpServer {
                 };
                 let fit = match fit_cest_global_cpu(&profiles, &cfg) {
                     Ok(r) => r,
-                    Err(e) => return McpCallToolResult::domain_error("cest_fit_error", e),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "cest_fit_error",
+                            structured_parse_error("cest_fit_error", &e),
+                        );
+                    }
                 };
                 McpCallToolResult::ok_json(&json!({
                     "mode": "cest",
@@ -2833,25 +3149,34 @@ impl McpServer {
             }
             "cpmg" => {
                 let mut series = Vec::new();
-                for p in &resolved_paths {
-                    let text = match fs::read_to_string(p) {
+                for (p, disp) in resolved_paths.iter().zip(display_paths.iter()) {
+                    let text = match read_bounded_regular_file_to_string(
+                        p,
+                        disp,
+                        MAX_MCP_PHASE21_TEXT_BYTES,
+                    ) {
                         Ok(t) => t,
-                        Err(e) => {
-                            return McpCallToolResult::domain_error(
-                                "io_error",
-                                format!("failed to read CPMG series TSV: {e}"),
-                            );
-                        }
+                        Err(err_res) => return err_res,
                     };
                     match read_cpmg_series_tsv(&text) {
                         Ok(mut parsed) => series.append(&mut parsed),
-                        Err(e) => return McpCallToolResult::domain_error("cpmg_parse_error", e),
+                        Err(e) => {
+                            return McpCallToolResult::domain_error(
+                                "cpmg_parse_error",
+                                structured_parse_error("cpmg_parse_error", &e),
+                            );
+                        }
                     }
                 }
                 let model = match args.get("cpmg_model").and_then(Value::as_str) {
                     Some(lbl) => match CpmgModel::from_str_label(lbl) {
                         Ok(m) => m,
-                        Err(e) => return McpCallToolResult::domain_error("invalid_arguments", e),
+                        Err(e) => {
+                            return McpCallToolResult::domain_error(
+                                "invalid_arguments",
+                                structured_parse_error("invalid_arguments", &e),
+                            );
+                        }
                     },
                     None => CpmgModel::Baldwin2014,
                 };
@@ -2861,7 +3186,12 @@ impl McpServer {
                 };
                 let fit = match fit_cpmg_global_cpu(&series, &cfg) {
                     Ok(r) => r,
-                    Err(e) => return McpCallToolResult::domain_error("cpmg_fit_error", e),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "cpmg_fit_error",
+                            structured_parse_error("cpmg_fit_error", &e),
+                        );
+                    }
                 };
                 McpCallToolResult::ok_json(&json!({
                     "mode": "cpmg",
@@ -2882,9 +3212,9 @@ impl McpServer {
                     "residues": fit.residues,
                 }))
             }
-            other => McpCallToolResult::domain_error(
+            _ => McpCallToolResult::domain_error(
                 "invalid_arguments",
-                format!("unsupported mode '{other}' (expected 'relaxation', 'cest', or 'cpmg')"),
+                "unsupported mode (expected 'relaxation', 'cest', or 'cpmg')",
             ),
         }
     }
@@ -2899,7 +3229,7 @@ impl McpServer {
         if nucleus_mode != "amide" && nucleus_mode != "methyl" {
             return McpCallToolResult::domain_error(
                 "invalid_arguments",
-                format!("unsupported nucleus_mode '{nucleus_mode}' (expected 'amide' or 'methyl')"),
+                "unsupported nucleus_mode (expected 'amide' or 'methyl')",
             );
         }
 
@@ -2909,9 +3239,23 @@ impl McpServer {
                     Ok(p) => p,
                     Err(sec) => return sec.to_tool_error_result(),
                 };
-                let ref_data = match read_star_all_atoms(&resolved_star, None) {
+                let star_lbl = self.policy.relativize_display_path(&resolved_star);
+                let star_text = match read_bounded_regular_file_to_string(
+                    &resolved_star,
+                    &star_lbl,
+                    MAX_MCP_PHASE21_TEXT_BYTES,
+                ) {
+                    Ok(t) => t,
+                    Err(err_res) => return err_res,
+                };
+                let ref_data = match read_star_str_all_atoms(&star_text, None) {
                     Ok(r) => r,
-                    Err(e) => return McpCallToolResult::domain_error("nmrstar_parse_error", e),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "nmrstar_parse_error",
+                            structured_parse_error("nmrstar_parse_error", &e),
+                        );
+                    }
                 };
                 let mut out = Vec::new();
                 for (res_idx, res_name) in ref_data.sequence.iter().enumerate() {
@@ -2954,18 +3298,23 @@ impl McpServer {
                     Ok(p) => p,
                     Err(sec) => return sec.to_tool_error_result(),
                 };
-                let text = match fs::read_to_string(&resolved_apo) {
+                let apo_lbl = self.policy.relativize_display_path(&resolved_apo);
+                let text = match read_bounded_regular_file_to_string(
+                    &resolved_apo,
+                    &apo_lbl,
+                    MAX_MCP_PHASE21_TEXT_BYTES,
+                ) {
                     Ok(t) => t,
-                    Err(e) => {
-                        return McpCallToolResult::domain_error(
-                            "io_error",
-                            format!("failed to read apo peaks TSV: {e}"),
-                        );
-                    }
+                    Err(err_res) => return err_res,
                 };
                 match parse_assigned_apo_peaks_tsv(&text) {
                     Ok(p) => p,
-                    Err(e) => return McpCallToolResult::domain_error("apo_parse_error", e),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "apo_parse_error",
+                            structured_parse_error("apo_parse_error", &e),
+                        );
+                    }
                 }
             } else {
                 return McpCallToolResult::domain_error(
@@ -3038,9 +3387,23 @@ impl McpServer {
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("step_{}", idx + 1));
 
-            let step_peaks_raw = match read_peaks(&resolved_step) {
+            let step_lbl = self.policy.relativize_display_path(&resolved_step);
+            let step_text = match read_bounded_regular_file_to_string(
+                &resolved_step,
+                &step_lbl,
+                MAX_MCP_PHASE21_TEXT_BYTES,
+            ) {
+                Ok(t) => t,
+                Err(err_res) => return err_res,
+            };
+            let step_peaks_raw = match read_peaks_str(&step_text) {
                 Ok(pk) => pk,
-                Err(e) => return McpCallToolResult::domain_error("peak_parse_error", e),
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "peak_parse_error",
+                        structured_parse_error("peak_parse_error", &e),
+                    );
+                }
             };
             let step_peaks: Vec<UnassignedHsqcPeak> = step_peaks_raw
                 .iter()
@@ -3081,18 +3444,33 @@ impl McpServer {
         let trajectories = if nucleus_mode == "methyl" {
             match track_methyl_hmqc_trajectories(&apo_peaks, &steps, &cfg) {
                 Ok(t) => t,
-                Err(e) => return McpCallToolResult::domain_error("csp_track_error", e),
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "csp_track_error",
+                        structured_parse_error("csp_track_error", &e),
+                    );
+                }
             }
         } else {
             match track_titration_trajectories(&apo_peaks, &steps, &cfg) {
                 Ok(t) => t,
-                Err(e) => return McpCallToolResult::domain_error("csp_track_error", e),
+                Err(e) => {
+                    return McpCallToolResult::domain_error(
+                        "csp_track_error",
+                        structured_parse_error("csp_track_error", &e),
+                    );
+                }
             }
         };
 
         let fit = match fit_csp_global_kd(&trajectories, &cfg) {
             Ok(f) => f,
-            Err(e) => return McpCallToolResult::domain_error("csp_fit_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "csp_fit_error",
+                    structured_parse_error("csp_fit_error", &e),
+                );
+            }
         };
 
         McpCallToolResult::ok_json(&json!({
@@ -3120,13 +3498,26 @@ impl McpServer {
             Ok(p) => p,
             Err(sec) => return sec.to_tool_error_result(),
         };
+        if !resolved.is_dir() {
+            let lbl = self.policy.relativize_display_path(&resolved);
+            if let Err(err_res) =
+                validate_regular_file_before_read(&resolved, &lbl, MAX_MCP_STRUCTURE_BYTES)
+            {
+                return err_res;
+            }
+        }
         let mhz_override = args
             .get("mhz")
             .and_then(Value::as_f64)
             .filter(|v| v.is_finite() && *v > 0.0);
         let mut spec = match load_processed_spectrum_1d(&resolved, mhz_override) {
             Ok(s) => s,
-            Err(e) => return McpCallToolResult::domain_error("nmr1d_load_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "nmr1d_load_error",
+                    structured_parse_error("nmr1d_load_error", &e),
+                );
+            }
         };
 
         let solvent_opt = args
@@ -3144,7 +3535,10 @@ impl McpServer {
                 match auto_calibrate_solvent_1d(&mut spec, solv, 0.25) {
                     Ok(off) => calibration_offset_ppm = Some(off),
                     Err(e) => {
-                        return McpCallToolResult::domain_error("solvent_calibration_error", e);
+                        return McpCallToolResult::domain_error(
+                            "solvent_calibration_error",
+                            structured_parse_error("solvent_calibration_error", &e),
+                        );
                     }
                 }
             }
@@ -3256,7 +3650,7 @@ impl McpServer {
                     Err(e) => {
                         return McpCallToolResult::domain_error(
                             "multiplet_analysis_error",
-                            format!("{e}"),
+                            structured_parse_error("multiplet_analysis_error", &e.to_string()),
                         );
                     }
                 }
@@ -3329,7 +3723,12 @@ impl McpServer {
             args.get("solvent").and_then(Value::as_str).unwrap_or("D2O"),
         ) {
             Ok(s) => s,
-            Err(e) => return McpCallToolResult::domain_error("invalid_arguments", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "invalid_arguments",
+                    structured_parse_error("invalid_arguments", &e),
+                );
+            }
         };
         let temperature_k = args
             .get("temperature_k")
@@ -3342,7 +3741,12 @@ impl McpServer {
                 .unwrap_or("small-molecule"),
         ) {
             Ok(c) => c,
-            Err(e) => return McpCallToolResult::domain_error("invalid_arguments", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "invalid_arguments",
+                    structured_parse_error("invalid_arguments", &e),
+                );
+            }
         };
 
         if resolved.is_dir() {
@@ -3351,7 +3755,10 @@ impl McpServer {
             {
                 Ok(p) => p,
                 Err(e) => {
-                    return McpCallToolResult::domain_error("dosy_parse_error", format!("{e}"));
+                    return McpCallToolResult::domain_error(
+                        "dosy_parse_error",
+                        structured_parse_error("dosy_parse_error", &e.to_string()),
+                    );
                 }
             };
             return McpCallToolResult::ok_json(&json!({
@@ -3383,7 +3790,12 @@ impl McpServer {
         };
         let b_values = match parsed.resolve_b_values() {
             Ok(b) => b,
-            Err(e) => return McpCallToolResult::domain_error("dosy_physics_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "dosy_physics_error",
+                    structured_parse_error("dosy_physics_error", &e),
+                );
+            }
         };
         if parsed.peaks.is_empty() {
             return McpCallToolResult::domain_error(
@@ -3407,10 +3819,10 @@ impl McpServer {
         {
             "aic" => ModelSelectionCriterion::Aic,
             "bic" => ModelSelectionCriterion::Bic,
-            other => {
+            _ => {
                 return McpCallToolResult::domain_error(
                     "invalid_arguments",
-                    format!("unsupported DOSY criterion '{other}' (expected 'bic' or 'aic')"),
+                    "unsupported DOSY criterion (expected 'bic' or 'aic')",
                 );
             }
         };
@@ -3438,13 +3850,16 @@ impl McpServer {
         let ilt_cfg = IltConfig::default();
 
         let mut peak_reports = Vec::with_capacity(parsed.peaks.len());
-        for pk in &parsed.peaks {
+        for (pk_idx, pk) in parsed.peaks.iter().enumerate() {
             let sel = match fit_stejskal_tanner_multi(&b_values, &pk.intensities, &fit_cfg) {
                 Ok(s) => s,
                 Err(e) => {
                     return McpCallToolResult::domain_error(
                         "dosy_fit_error",
-                        format!("peak '{}': {e}", pk.label),
+                        format!(
+                            "peak[{pk_idx}]: {}",
+                            structured_parse_error("dosy_fit_error", &e.to_string())
+                        ),
                     );
                 }
             };
@@ -3473,7 +3888,10 @@ impl McpServer {
                     Err(e) => {
                         return McpCallToolResult::domain_error(
                             "dosy_ilt_error",
-                            format!("peak '{}': {e}", pk.label),
+                            format!(
+                                "peak[{pk_idx}]: {}",
+                                structured_parse_error("dosy_ilt_error", &e.to_string())
+                            ),
                         );
                     }
                 }
@@ -3542,12 +3960,10 @@ impl McpServer {
             "aqueous-minimal" | "aqueous" => BiofluidMaskPreset::AqueousMinimal,
             "serum-plasma" | "serum" | "plasma" => BiofluidMaskPreset::SerumPlasma,
             "urine" => BiofluidMaskPreset::Urine,
-            other => {
+            _ => {
                 return McpCallToolResult::domain_error(
                     "invalid_arguments",
-                    format!(
-                        "unsupported mask_preset '{other}' (expected 'urine', 'serum-plasma', 'aqueous-minimal', or 'none')"
-                    ),
+                    "unsupported mask_preset (expected 'urine', 'serum-plasma', 'aqueous-minimal', or 'none')",
                 );
             }
         };
@@ -3572,12 +3988,10 @@ impl McpServer {
                     min_bucket_snr: 0.0,
                 }
             }
-            other => {
+            _ => {
                 return McpCallToolResult::domain_error(
                     "invalid_arguments",
-                    format!(
-                        "unsupported bucketing '{other}' (expected 'adaptive-intelligent' or 'uniform')"
-                    ),
+                    "unsupported bucketing (expected 'adaptive-intelligent' or 'uniform')",
                 );
             }
         };
@@ -3597,12 +4011,10 @@ impl McpServer {
                 half_window_ppm: 0.08,
             },
             "none" => NormalizationMethod::None,
-            other => {
+            _ => {
                 return McpCallToolResult::domain_error(
                     "invalid_arguments",
-                    format!(
-                        "unsupported normalization '{other}' (expected 'pqn', 'tsa', 'internal-standard', or 'none')"
-                    ),
+                    "unsupported normalization (expected 'pqn', 'tsa', 'internal-standard', or 'none')",
                 );
             }
         };
@@ -3619,12 +4031,10 @@ impl McpServer {
             "uv" | "unit-variance" => ScalingMethod::UnitVariance,
             "mean" | "mean-center" => ScalingMethod::MeanCenter,
             "none" => ScalingMethod::None,
-            other => {
+            _ => {
                 return McpCallToolResult::domain_error(
                     "invalid_arguments",
-                    format!(
-                        "unsupported scaling '{other}' (expected 'pareto', 'uv', 'mean', or 'none')"
-                    ),
+                    "unsupported scaling (expected 'pareto', 'uv', 'mean', or 'none')",
                 );
             }
         };
@@ -3818,10 +4228,22 @@ impl McpServer {
                 Ok(p) => p,
                 Err(sec) => return Err(sec.to_tool_error_result()),
             };
+            if !resolved_spec.is_dir() {
+                let spec_lbl = self.policy.relativize_display_path(&resolved_spec);
+                validate_regular_file_before_read(
+                    &resolved_spec,
+                    &spec_lbl,
+                    MAX_MCP_STRUCTURE_BYTES,
+                )?;
+            }
             let spec = load_processed_spectrum_1d(&resolved_spec, None).map_err(|e| {
                 McpCallToolResult::domain_error(
                     "nmr1d_load_error",
-                    format!("sample '{sample_id}': {e}"),
+                    format!(
+                        "manifest line {}: {}",
+                        line_idx + 1,
+                        structured_parse_error("nmr1d_load_error", &e)
+                    ),
                 )
             })?;
             samples.push(CohortSample1D::new(sample_id, group, spec));
@@ -3842,25 +4264,26 @@ impl McpServer {
             .resolve_sandboxed_path(raw_path)
             .map_err(|sec| sec.to_tool_error_result())?;
         let rel_lbl = self.policy.relativize_display_path(&resolved);
-        validate_regular_file_before_read(&resolved, &rel_lbl, MAX_MCP_PHASE21_TEXT_BYTES)?;
+        let text =
+            read_bounded_regular_file_to_string(&resolved, &rel_lbl, MAX_MCP_PHASE21_TEXT_BYTES)?;
         let is_nef = resolved
             .extension()
             .and_then(|s| s.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("nef"));
         let shifts = if is_nef {
-            read_nef_file(&resolved)
+            read_nef_str(&text)
                 .and_then(|doc| doc.to_reference())
                 .map_err(|e| {
                     McpCallToolResult::domain_error(
                         "nef_parse_error",
-                        sanitize_untrusted_parse_error(&e),
+                        structured_parse_error("nef_parse_error", &e),
                     )
                 })?
         } else {
-            read_star_all_atoms(&resolved, None).map_err(|e| {
+            read_star_str_all_atoms(&text, None).map_err(|e| {
                 McpCallToolResult::domain_error(
                     "nmrstar_parse_error",
-                    sanitize_untrusted_parse_error(&e),
+                    structured_parse_error("nmrstar_parse_error", &e),
                 )
             })?
         };
@@ -4046,7 +4469,7 @@ impl McpServer {
             Err(e) => {
                 return McpCallToolResult::domain_error(
                     "structure_parse_error",
-                    sanitize_untrusted_parse_error(&e),
+                    structured_parse_error("structure_parse_error", &e),
                 );
             }
         };
@@ -4061,7 +4484,7 @@ impl McpServer {
                 Err(e) => {
                     return McpCallToolResult::domain_error(
                         "pae_parse_error",
-                        sanitize_untrusted_parse_error(&e),
+                        structured_parse_error("pae_parse_error", &e),
                     );
                 }
             },
@@ -4073,7 +4496,7 @@ impl McpServer {
                 Err(e) => {
                     return McpCallToolResult::domain_error(
                         "s2_parse_error",
-                        sanitize_untrusted_parse_error(&e),
+                        structured_parse_error("s2_parse_error", &e),
                     );
                 }
             },
@@ -4114,7 +4537,12 @@ impl McpServer {
             &conc_cfg,
         ) {
             Ok(r) => r,
-            Err(e) => return McpCallToolResult::domain_error("af_concordance_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "af_concordance_error",
+                    structured_parse_error("af_concordance_error", &e),
+                );
+            }
         };
 
         let cluster_domains = args
@@ -4131,7 +4559,12 @@ impl McpServer {
                         "domains": part.domains,
                         "linkers": part.linkers,
                     })),
-                    Err(e) => return McpCallToolResult::domain_error("pae_domain_error", e),
+                    Err(e) => {
+                        return McpCallToolResult::domain_error(
+                            "pae_domain_error",
+                            structured_parse_error("pae_domain_error", &e),
+                        );
+                    }
                 }
             }
             _ => None,
@@ -4202,7 +4635,7 @@ impl McpServer {
             Err(e) => {
                 return McpCallToolResult::domain_error(
                     "structure_parse_error",
-                    sanitize_untrusted_parse_error(&e),
+                    structured_parse_error("structure_parse_error", &e),
                 );
             }
         };
@@ -4250,7 +4683,12 @@ impl McpServer {
 
         let report = match predict_structure_shifts_with_firewall(&model, &query, &cfg) {
             Ok(r) => r,
-            Err(e) => return McpCallToolResult::domain_error("struct_shifts_error", e),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "struct_shifts_error",
+                    structured_parse_error("struct_shifts_error", &e),
+                );
+            }
         };
 
         McpCallToolResult::ok_json(&json!({
@@ -4336,7 +4774,7 @@ impl McpServer {
                         "pose_parse_error",
                         format!(
                             "'{rel_lbl}': {}",
-                            sanitize_untrusted_parse_error(&e.to_string())
+                            structured_parse_error("pose_parse_error", &e.to_string())
                         ),
                     );
                 }
@@ -4444,7 +4882,10 @@ impl McpServer {
             let (spec, mol) = match ligand_spec_from_octet_str(smi, Some("smi")) {
                 Ok(pair) => pair,
                 Err(e) => {
-                    return McpCallToolResult::domain_error("ligand_parse_error", e.to_string())
+                    return McpCallToolResult::domain_error(
+                        "ligand_parse_error",
+                        structured_parse_error("ligand_parse_error", &e.to_string()),
+                    );
                 }
             };
             raw_input.ligand_molecules.insert(lid.clone(), mol);
@@ -4470,7 +4911,7 @@ impl McpServer {
                 Err(e) => {
                     return McpCallToolResult::domain_error(
                         "apo_parse_error",
-                        sanitize_untrusted_parse_error(&e),
+                        structured_parse_error("apo_parse_error", &e),
                     );
                 }
             };
@@ -4526,7 +4967,7 @@ impl McpServer {
                     Err(e) => {
                         return McpCallToolResult::domain_error(
                             "csp_parse_error",
-                            sanitize_untrusted_parse_error(&e.to_string()),
+                            structured_parse_error("csp_parse_error", &e.to_string()),
                         );
                     }
                 }
@@ -4544,7 +4985,7 @@ impl McpServer {
                     Err(e) => {
                         return McpCallToolResult::domain_error(
                             "noe_parse_error",
-                            sanitize_untrusted_parse_error(&e.to_string()),
+                            structured_parse_error("noe_parse_error", &e.to_string()),
                         );
                     }
                 }
@@ -4571,7 +5012,7 @@ impl McpServer {
                     Err(e) => {
                         return McpCallToolResult::domain_error(
                             "pre_parse_error",
-                            sanitize_untrusted_parse_error(&e.to_string()),
+                            structured_parse_error("pre_parse_error", &e.to_string()),
                         );
                     }
                 }
@@ -4591,7 +5032,7 @@ impl McpServer {
                     Err(e) => {
                         return McpCallToolResult::domain_error(
                             "rdc_parse_error",
-                            sanitize_untrusted_parse_error(&e.to_string()),
+                            structured_parse_error("rdc_parse_error", &e.to_string()),
                         );
                     }
                 }
@@ -4611,7 +5052,7 @@ impl McpServer {
                     Err(e) => {
                         return McpCallToolResult::domain_error(
                             "pcs_parse_error",
-                            sanitize_untrusted_parse_error(&e.to_string()),
+                            structured_parse_error("pcs_parse_error", &e.to_string()),
                         );
                     }
                 }
@@ -4621,7 +5062,7 @@ impl McpServer {
                 Err(e) => {
                     return McpCallToolResult::domain_error(
                         "restraints_extract_error",
-                        sanitize_untrusted_parse_error(&e.to_string()),
+                        structured_parse_error("restraints_extract_error", &e.to_string()),
                     );
                 }
             }
@@ -4646,7 +5087,7 @@ impl McpServer {
                     Err(e) => {
                         return McpCallToolResult::domain_error(
                             "rdc_parse_error",
-                            sanitize_untrusted_parse_error(&e.to_string()),
+                            structured_parse_error("rdc_parse_error", &e.to_string()),
                         );
                     }
                 }
@@ -4666,7 +5107,7 @@ impl McpServer {
                     Err(e) => {
                         return McpCallToolResult::domain_error(
                             "pcs_parse_error",
-                            sanitize_untrusted_parse_error(&e.to_string()),
+                            structured_parse_error("pcs_parse_error", &e.to_string()),
                         );
                     }
                 }
@@ -4675,7 +5116,12 @@ impl McpServer {
 
         let report = match score_cofold_poses(&poses, &bundle, &score_cfg) {
             Ok(r) => r,
-            Err(e) => return McpCallToolResult::domain_error("cofold_score_error", e.to_string()),
+            Err(e) => {
+                return McpCallToolResult::domain_error(
+                    "cofold_score_error",
+                    structured_parse_error("cofold_score_error", &e.to_string()),
+                );
+            }
         };
 
         let verdict_str = match report.verdict {
@@ -4799,7 +5245,10 @@ impl McpServer {
                     Err(e) => {
                         return McpCallToolResult::domain_error(
                             "alt_structure_parse_error",
-                            format!("'{rel_lbl}': {}", sanitize_untrusted_parse_error(&e)),
+                            format!(
+                                "'{rel_lbl}': {}",
+                                structured_parse_error("alt_structure_parse_error", &e)
+                            ),
                         );
                     }
                 };
@@ -4816,7 +5265,7 @@ impl McpServer {
             Err(e) => {
                 return McpCallToolResult::domain_error(
                     "structure_parse_error",
-                    sanitize_untrusted_parse_error(&e),
+                    structured_parse_error("structure_parse_error", &e),
                 );
             }
         };
@@ -4833,7 +5282,7 @@ impl McpServer {
             Err(e) => {
                 return McpCallToolResult::domain_error(
                     "exchange_parse_error",
-                    sanitize_untrusted_parse_error(&e),
+                    structured_parse_error("exchange_parse_error", &e),
                 );
             }
         };
@@ -4887,7 +5336,7 @@ impl McpServer {
             Err(e) => {
                 return McpCallToolResult::domain_error(
                     "excited_state_error",
-                    sanitize_untrusted_parse_error(&e),
+                    structured_parse_error("excited_state_error", &e),
                 );
             }
         };
@@ -4913,6 +5362,9 @@ impl McpServer {
             "unmodeled_exchange_two_ln_bf_vs_null": report.unmodeled_exchange_two_ln_bf_vs_null,
             "top1_reduced_chi2": report.top1_reduced_chi2,
             "cpmg_prefiltered_significant_only": report.cpmg_prefiltered_significant_only,
+            "error_scale_warning": report.error_scale_warning,
+            "chi2_consistency_diagnostic": report.chi2_consistency_diagnostic,
+            "warnings": report.warnings,
             "scope_limits_note": report.scope_limits_note,
             "enforced_max_seq_identity": max_seq_id,
             "max_retained_seq_identity": report.ground_max_retained_seq_identity,

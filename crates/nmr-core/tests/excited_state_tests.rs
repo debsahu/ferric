@@ -2108,3 +2108,479 @@ fn test_s5_his_p2_cg_shift_backbone_gate_and_unsigned_direction_ambiguity() {
         other => panic!("expected HisTautomerOrProtonation, got {other:?}"),
     }
 }
+
+#[test]
+fn test_fix2_b19_misestimated_error_warning_2x_3x_pure_noise() {
+    let (ubq_model, ubq_shifts) = load_ubiquitin_ground();
+    let fw = ubiquitin_firewall();
+    let cfg = ExcitedStateConfig::default();
+
+    let probe_sids = [4, 12, 18, 19, 20, 25, 28, 31, 45, 68];
+
+    // 1. Well-calibrated 1x pure noise: when ConsistentWithNoise & within chi2 bound, NO false alarm!
+    let mut rng_cal = Rng::new(77_001);
+    let mut cal_obs = Vec::new();
+    for &sid in &probe_sids {
+        let r = ubq_model
+            .residues
+            .iter()
+            .find(|x| x.seq_id == sid)
+            .expect("res");
+        cal_obs.push(ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: sid,
+            res_name: Some(r.res_name.clone()),
+            atom: "N".to_string(),
+            dw_ppm: rng_cal.normal(0.0, 0.08),
+            dw_err_ppm: 0.12,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        });
+        cal_obs.push(ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: sid,
+            res_name: Some(r.res_name.clone()),
+            atom: "CA".to_string(),
+            dw_ppm: rng_cal.normal(0.0, 0.05),
+            dw_err_ppm: 0.08,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        });
+    }
+    let rep_cal = classify_excited_state_with_firewall(
+        Some(&ubq_shifts),
+        &ubq_model,
+        &cal_obs,
+        &[],
+        &fw,
+        &cfg,
+    )
+    .expect("calibrated 1x noise");
+    assert_eq!(
+        rep_cal.abstention_kind,
+        Some(ExcitedStateAbstentionKind::ConsistentWithNoise)
+    );
+    assert!(
+        rep_cal.error_scale_warning.is_none(),
+        "well-calibrated noise within chi2 bound should not emit error_scale_warning: {:?}",
+        rep_cal.error_scale_warning
+    );
+
+    // 2. 2x and 3x misestimated-error pure-noise probes (10 seeds each):
+    //    Whenever H0 is rejected, UnmodeledSignificantExchange is emitted, or chi2_red exceeds
+    //    the consistency bound, `error_scale_warning` and `chi2_consistency_diagnostic` MUST be
+    //    emitted in the report, in `report.warnings`, and in the formatted TSV!
+    for &scale in &[2.0_f64, 3.0_f64] {
+        let mut n_h0_rejected = 0usize;
+        let mut n_warned = 0usize;
+        for seed in 0..10u64 {
+            let mut rng = Rng::new(21_900 + (scale as u64) * 100 + seed);
+            let mut obs = Vec::new();
+            for &sid in &probe_sids {
+                let r = ubq_model
+                    .residues
+                    .iter()
+                    .find(|x| x.seq_id == sid)
+                    .expect("res");
+                obs.push(ExchangeShiftObservation {
+                    chain_id: "A".to_string(),
+                    seq_id: sid,
+                    res_name: Some(r.res_name.clone()),
+                    atom: "N".to_string(),
+                    dw_ppm: rng.normal(0.0, 0.12 * scale),
+                    dw_err_ppm: 0.12,
+                    sign_mode: ExchangeSignMode::Signed,
+                    major_ppm: None,
+                });
+                obs.push(ExchangeShiftObservation {
+                    chain_id: "A".to_string(),
+                    seq_id: sid,
+                    res_name: Some(r.res_name.clone()),
+                    atom: "CA".to_string(),
+                    dw_ppm: rng.normal(0.0, 0.08 * scale),
+                    dw_err_ppm: 0.08,
+                    sign_mode: ExchangeSignMode::Signed,
+                    major_ppm: None,
+                });
+            }
+            let rep = classify_excited_state_with_firewall(
+                Some(&ubq_shifts),
+                &ubq_model,
+                &obs,
+                &[],
+                &fw,
+                &cfg,
+            )
+            .expect("misestimated noise");
+            let diag = rep
+                .chi2_consistency_diagnostic
+                .as_ref()
+                .expect("chi2_consistency_diagnostic must be populated");
+            assert!(diag.h0_reduced_chi2.is_finite() && diag.h0_reduced_chi2 > 0.0);
+            let h0_rejected = rep.abstention_kind
+                == Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange)
+                || diag.h0_exceeds_consistency_bound
+                || diag.top1_exceeds_consistency_bound;
+            if h0_rejected {
+                n_h0_rejected += 1;
+                let warn = rep.error_scale_warning.as_deref().unwrap_or_else(|| {
+                    panic!(
+                        "scale={scale}x seed={seed}: H0 rejected (rchi2={:.3}) without error_scale_warning!",
+                        diag.h0_reduced_chi2
+                    )
+                });
+                assert!(
+                    warn.contains("2x-3x") && warn.contains("UnmodeledSignificantExchange"),
+                    "warning must explain 2x-3x misestimation risk: {warn}"
+                );
+                assert!(
+                    rep.warnings.iter().any(|w| w.contains("Error-scale / chi^2 consistency diagnostic")),
+                    "report.warnings must include error_scale_warning"
+                );
+                let tsv = format_excited_state_tsv(&rep);
+                assert!(tsv.contains("# error_scale_warning:"), "TSV missing error_scale_warning");
+                assert!(
+                    tsv.contains("# chi2_consistency_diagnostic:"),
+                    "TSV missing chi2_consistency_diagnostic"
+                );
+                n_warned += 1;
+            }
+        }
+        assert!(
+            n_h0_rejected >= 7,
+            "expected >=7/10 H0 rejections at {scale}x misestimated error, got {n_h0_rejected}/10"
+        );
+        assert_eq!(
+            n_warned, n_h0_rejected,
+            "every H0 rejection at {scale}x must emit error_scale_warning"
+        );
+    }
+}
+
+#[test]
+fn test_fix2_b19_multiseed_10_recovery_and_rchi2_statistics() {
+    let (ubq_model, ubq_shifts) = load_ubiquitin_ground();
+    let fw = ubiquitin_firewall();
+    let cfg = ExcitedStateConfig::default();
+
+    let struct_cfg = StructShiftConfig {
+        sample_ph: cfg.sample_ph,
+        temperature_kelvin: cfg.temperature_kelvin,
+        include_methyl_ilvmat: true,
+        ..StructShiftConfig::default()
+    };
+
+    let seq_ids: Vec<i32> = ubq_model.residues.iter().map(|r| r.seq_id).collect();
+    let res_names: Vec<String> = ubq_model
+        .residues
+        .iter()
+        .map(|r| r.res_name.clone())
+        .collect();
+    let ca_coords: Vec<[f64; 3]> = ubq_model.residues.iter().map(|r| r.ca).collect();
+    let base_phi: Vec<Option<f64>> = ubq_model.residues.iter().map(|r| r.phi_deg).collect();
+    let base_psi: Vec<Option<f64>> = ubq_model.residues.iter().map(|r| r.psi_deg).collect();
+    let base_chi1: Vec<Option<f64>> = ubq_model.residues.iter().map(|r| r.chi1_deg).collect();
+
+    let make_switched_model =
+        |range: std::ops::RangeInclusive<i32>, target_phi: f64, target_psi: f64| {
+            let mut phi = base_phi.clone();
+            let mut psi = base_psi.clone();
+            for (k, &sid) in seq_ids.iter().enumerate() {
+                if range.contains(&sid) && phi[k].is_some() && psi[k].is_some() {
+                    phi[k] = Some(target_phi);
+                    psi[k] = Some(target_psi);
+                }
+            }
+            StructureModel::from_ca_and_torsions(
+                "A", &seq_ids, &res_names, &ca_coords, &phi, &psi, &base_chi1,
+            )
+            .expect("reconstruct switched conformer")
+        };
+
+    let ground_recon = StructureModel::from_ca_and_torsions(
+        "A", &seq_ids, &res_names, &ca_coords, &base_phi, &base_psi, &base_chi1,
+    )
+    .expect("reconstruct ground");
+    let alt_true = make_switched_model(7..=15, -62.0, -42.0);
+    let alt_decoy1 = make_switched_model(48..=56, -62.0, -42.0);
+
+    let pred_a =
+        predict_structure_shifts_with_firewall(&ubq_model, &fw, &struct_cfg).expect("pred_a");
+    let pred_g_recon =
+        predict_structure_shifts_with_firewall(&ground_recon, &fw, &struct_cfg).unwrap();
+    let pred_b_true = predict_structure_shifts_with_firewall(&alt_true, &fw, &struct_cfg).unwrap();
+
+    let alt_bundle = vec![
+        AltConformerInput {
+            label: "decoy_loop48_56.pdb".to_string(),
+            model: alt_decoy1,
+        },
+        AltConformerInput {
+            label: "native_excited_hairpin7_15.pdb".to_string(),
+            model: alt_true,
+        },
+    ];
+
+    let mut h1_ok = 0usize;
+    let mut h2_ok = 0usize;
+    let mut h3_ok = 0usize;
+    let mut h4_ok = 0usize;
+    let mut h0_clean = 0usize;
+
+    let mut h1_rchi2 = Vec::new();
+    let mut h2_rchi2 = Vec::new();
+    let mut h3_rchi2 = Vec::new();
+    let mut h4_rchi2 = Vec::new();
+    let mut h0_rchi2 = Vec::new();
+
+    // Multi-seed (`seeds 0..10`) evaluation across H1, H2, H3, H4, and H0!
+    for seed in 0..10u64 {
+        let mut rng = Rng::new(20_260_000 + seed);
+
+        // H1: LocalUnfolding (ILE23..GLU34 -> ncIDP coil)
+        let mut h1_obs = Vec::new();
+        for (r_idx, r) in ubq_model.residues.iter().enumerate() {
+            let sid = r.seq_id;
+            if !(22..=35).contains(&sid) && !(3..=7).contains(&sid) {
+                continue;
+            }
+            let w: f64 = if (23..=34).contains(&sid) {
+                1.0
+            } else if sid == 22 || sid == 35 {
+                0.5
+            } else {
+                0.0
+            };
+            let ref_idx = ubq_shifts
+                .seq_ids
+                .iter()
+                .position(|&s| s == sid)
+                .expect("seq_id");
+            for &(atom, exp_sd, fwd_sd) in
+                &[("CA", 0.08_f64, 0.45_f64), ("C", 0.08, 0.50), ("N", 0.12, 0.90)]
+            {
+                if let (Some(&obs_a), Some(bb)) = (
+                    ubq_shifts.shifts.get(&(ref_idx, atom.to_string())),
+                    pred_a.residues[r_idx].backbone.get(atom),
+                ) {
+                    let mean_dw = w * (bb.rc_ppm - obs_a);
+                    let sd = (exp_sd * exp_sd + (w * fwd_sd * 0.4).powi(2)).sqrt();
+                    h1_obs.push(ExchangeShiftObservation {
+                        chain_id: "A".to_string(),
+                        seq_id: sid,
+                        res_name: Some(r.res_name.clone()),
+                        atom: atom.to_string(),
+                        dw_ppm: mean_dw + rng.normal(0.0, sd),
+                        dw_err_ppm: exp_sd,
+                        sign_mode: ExchangeSignMode::Signed,
+                        major_ppm: Some(obs_a),
+                    });
+                }
+            }
+        }
+        let rep1 = classify_excited_state_with_firewall(
+            Some(&ubq_shifts),
+            &ubq_model,
+            &h1_obs,
+            &alt_bundle,
+            &fw,
+            &cfg,
+        )
+        .expect("H1 multi-seed");
+        if rep1.verdict == ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::LocalUnfolding)
+        {
+            h1_ok += 1;
+        }
+        h1_rchi2.push(rep1.top1_reduced_chi2);
+
+        // H2: Xxx-Pro Cis/Trans at PRO19 (trans -> cis, Schubert 2002)
+        let mut h2_obs = Vec::new();
+        for &(sid, res_name, atom, mean_dw, exp_sd) in &[
+            (19, "PRO", "CB", 2.40, 0.08),
+            (19, "PRO", "CG", -2.60, 0.08),
+            (19, "PRO", "CA", -0.55, 0.08),
+            (19, "PRO", "C", -0.85, 0.08),
+            (17, "VAL", "N", -0.52, 0.10),
+            (18, "GLU", "CA", -1.15, 0.08),
+            (18, "GLU", "C", -1.35, 0.08),
+            (18, "GLU", "N", -1.40, 0.12),
+            (20, "SER", "N", -1.80, 0.12),
+            (20, "SER", "H", -0.25, 0.03),
+            (45, "PHE", "N", 0.00, 0.12),
+            (55, "THR", "CA", 0.00, 0.08),
+        ] {
+            h2_obs.push(ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: sid,
+                res_name: Some(res_name.to_string()),
+                atom: atom.to_string(),
+                dw_ppm: mean_dw + rng.normal(0.0, exp_sd),
+                dw_err_ppm: exp_sd,
+                sign_mode: ExchangeSignMode::Signed,
+                major_ppm: None,
+            });
+        }
+        let rep2 = classify_excited_state_with_firewall(
+            Some(&ubq_shifts),
+            &ubq_model,
+            &h2_obs,
+            &alt_bundle,
+            &fw,
+            &cfg,
+        )
+        .expect("H2 multi-seed");
+        if rep2.verdict == ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::XxxProCisTrans)
+        {
+            h2_ok += 1;
+        }
+        h2_rchi2.push(rep2.top1_reduced_chi2);
+
+        // H3: Histidine tautomer flip at HIS68 (NE2-H -> ND1-H)
+        let mut h3_obs = Vec::new();
+        for &(sid, res_name, atom, mean_dw, exp_sd, maj) in &[
+            (68, "HIS", "ND1", -82.0, 0.60, Some(249.5)),
+            (68, "HIS", "NE2", 82.0, 0.60, Some(168.5)),
+            (68, "HIS", "CG", -8.30, 0.20, None),
+            (6, "LYS", "H", 0.10, 0.02, None),
+            (44, "ILE", "H", 0.09, 0.02, None),
+            (67, "LEU", "N", 0.32, 0.08, None),
+            (25, "ASN", "N", 0.00, 0.10, None),
+            (50, "LEU", "CA", 0.00, 0.08, None),
+        ] {
+            h3_obs.push(ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: sid,
+                res_name: Some(res_name.to_string()),
+                atom: atom.to_string(),
+                dw_ppm: mean_dw + rng.normal(0.0, exp_sd),
+                dw_err_ppm: exp_sd,
+                sign_mode: ExchangeSignMode::Signed,
+                major_ppm: maj,
+            });
+        }
+        let rep3 = classify_excited_state_with_firewall(
+            Some(&ubq_shifts),
+            &ubq_model,
+            &h3_obs,
+            &alt_bundle,
+            &fw,
+            &cfg,
+        )
+        .expect("H3 multi-seed");
+        if rep3.verdict
+            == ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::RotamerOrHisTautomerFlip)
+        {
+            h3_ok += 1;
+        }
+        h3_rchi2.push(rep3.top1_reduced_chi2);
+
+        // H4: Alternate 3D conformer (`alt_true`: hairpin 7..=15 -> helix)
+        let mut h4_obs = Vec::new();
+        for sid in (6..=16).chain([48, 52, 65]) {
+            let ra = pred_g_recon.residues.iter().find(|r| r.seq_id == sid);
+            let rb = pred_b_true.residues.iter().find(|r| r.seq_id == sid);
+            if let (Some(a), Some(b)) = (ra, rb) {
+                for &(atom, exp_sd) in &[("CA", 0.10), ("CB", 0.10), ("C", 0.10), ("N", 0.15)] {
+                    if let (Some(ba), Some(bb)) = (a.backbone.get(atom), b.backbone.get(atom)) {
+                        let sa = ba.predicted_ppm;
+                        let sb = bb.predicted_ppm;
+                        h4_obs.push(ExchangeShiftObservation {
+                            chain_id: "A".to_string(),
+                            seq_id: sid,
+                            res_name: Some(a.res_name.clone()),
+                            atom: atom.to_string(),
+                            dw_ppm: (sb - sa) + rng.normal(0.0, exp_sd),
+                            dw_err_ppm: exp_sd,
+                            sign_mode: ExchangeSignMode::Signed,
+                            major_ppm: Some(sa),
+                        });
+                    }
+                }
+            }
+        }
+        let rep4 = classify_excited_state_with_firewall(
+            Some(&ubq_shifts),
+            &ground_recon,
+            &h4_obs,
+            &alt_bundle,
+            &fw,
+            &cfg,
+        )
+        .expect("H4 multi-seed");
+        if rep4.verdict
+            == ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::Alternate3DConformer)
+        {
+            h4_ok += 1;
+        }
+        h4_rchi2.push(rep4.top1_reduced_chi2);
+
+        // H0: Well-calibrated 1x pure noise
+        let mut h0_obs = Vec::new();
+        for sid in [4, 12, 18, 19, 20, 25, 28, 31, 45, 68] {
+            let r = ubq_model
+                .residues
+                .iter()
+                .find(|x| x.seq_id == sid)
+                .expect("res");
+            h0_obs.push(ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: sid,
+                res_name: Some(r.res_name.clone()),
+                atom: "N".to_string(),
+                dw_ppm: rng.normal(0.0, 0.12),
+                dw_err_ppm: 0.12,
+                sign_mode: ExchangeSignMode::Signed,
+                major_ppm: None,
+            });
+            h0_obs.push(ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: sid,
+                res_name: Some(r.res_name.clone()),
+                atom: "CA".to_string(),
+                dw_ppm: rng.normal(0.0, 0.08),
+                dw_err_ppm: 0.08,
+                sign_mode: ExchangeSignMode::Signed,
+                major_ppm: None,
+            });
+        }
+        let rep0 = classify_excited_state_with_firewall(
+            Some(&ubq_shifts),
+            &ubq_model,
+            &h0_obs,
+            &alt_bundle,
+            &fw,
+            &cfg,
+        )
+        .expect("H0 multi-seed");
+        if rep0.verdict == ExcitedStateVerdict::AmbiguousOrUnmodeledState {
+            h0_clean += 1;
+        }
+        h0_rchi2.push(rep0.top1_reduced_chi2);
+    }
+
+    let range_str = |vals: &[f64]| -> (f64, f64, f64) {
+        let mut s = vals.to_vec();
+        s.sort_by(|a, b| a.total_cmp(b));
+        (s[0], s[s.len() / 2], *s.last().unwrap())
+    };
+    let (h1_lo, h1_med, h1_hi) = range_str(&h1_rchi2);
+    let (h2_lo, h2_med, h2_hi) = range_str(&h2_rchi2);
+    let (h3_lo, h3_med, h3_hi) = range_str(&h3_rchi2);
+    let (h4_lo, h4_med, h4_hi) = range_str(&h4_rchi2);
+    let (h0_lo, h0_med, h0_hi) = range_str(&h0_rchi2);
+
+    eprintln!(
+        "B19 10-seed stats (seeds 0..9):\n\
+         H1 LocalUnfolding: {h1_ok}/10, rchi2 min={h1_lo:.3} med={h1_med:.3} max={h1_hi:.3}\n\
+         H2 XxxProCisTrans: {h2_ok}/10, rchi2 min={h2_lo:.3} med={h2_med:.3} max={h2_hi:.3}\n\
+         H3 RotamerOrHis:   {h3_ok}/10, rchi2 min={h3_lo:.3} med={h3_med:.3} max={h3_hi:.3}\n\
+         H4 AltConformer:   {h4_ok}/10, rchi2 min={h4_lo:.3} med={h4_med:.3} max={h4_hi:.3}\n\
+         H0 PureNoise(1x):  {h0_clean}/10 abstain, rchi2 min={h0_lo:.3} med={h0_med:.3} max={h0_hi:.3}"
+    );
+
+    assert!(h1_ok >= 9, "H1 10-seed recovery {h1_ok}/10 < 9/10");
+    assert!(h2_ok >= 9, "H2 10-seed recovery {h2_ok}/10 < 9/10");
+    assert!(h3_ok >= 9, "H3 10-seed recovery {h3_ok}/10 < 9/10");
+    assert!(h4_ok >= 9, "H4 10-seed recovery {h4_ok}/10 < 9/10");
+    assert_eq!(h0_clean, 10, "H0 1x noise false-commit detected ({h0_clean}/10)");
+}

@@ -826,3 +826,94 @@ fn test_s5_exchange_state_cli_e2e_duplicate_rejection_and_abstention() {
         Some(ExcitedStateAbstentionKind::InsufficientDistinctResidues)
     );
 }
+
+#[test]
+fn test_fix2_b19_cli_emits_error_scale_warning_on_misestimated_noise() {
+    use nmr_core::excited_state::{ExcitedStateAbstentionKind, ExcitedStateReport};
+
+    let tmp = ScopedTempDir::new("fix2_b19_cli_error_scale");
+    let root = workspace_root();
+    let star_path = root.join("data/fixtures/bmr17769_ubiquitin_allatom.str");
+    let pdb_path = root.join("data/pdb_refs/1d3z.pdb");
+
+    // 3x misestimated pure-noise observations (stated dw_err_ppm = 0.08..0.12, true scatter ~3x)
+    let exch_tsv = tmp.path.join("noise_3x.tsv");
+    fs::write(
+        &exch_tsv,
+        "chain_id\tseq_id\tres_name\tatom\tdw_ppm\tdw_err_ppm\tsign_mode\n\
+         A\t4\tPHE\tN\t0.42\t0.12\tsigned\n\
+         A\t4\tPHE\tCA\t-0.29\t0.08\tsigned\n\
+         A\t12\tTHR\tN\t-0.38\t0.12\tsigned\n\
+         A\t12\tTHR\tCA\t0.25\t0.08\tsigned\n\
+         A\t25\tASN\tN\t0.44\t0.12\tsigned\n\
+         A\t25\tASN\tCA\t-0.31\t0.08\tsigned\n\
+         A\t45\tPHE\tN\t-0.41\t0.12\tsigned\n\
+         A\t45\tPHE\tCA\t0.27\t0.08\tsigned\n\
+         A\t68\tHIS\tN\t0.39\t0.12\tsigned\n\
+         A\t68\tHIS\tCA\t-0.26\t0.08\tsigned\n",
+    )
+    .unwrap();
+
+    // 1. Stdout TSV mode + JSON output
+    let json_path = tmp.path.join("noise_3x.json");
+    let out_tsv_mode = Command::new(nmrassign_bin())
+        .args([
+            "exchange-state",
+            "--shifts",
+            star_path.to_str().unwrap(),
+            "--structure",
+            pdb_path.to_str().unwrap(),
+            "--exchange",
+            exch_tsv.to_str().unwrap(),
+            "--json-out",
+            json_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run exchange-state stdout mode");
+    assert!(
+        out_tsv_mode.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_tsv_mode.stderr)
+    );
+    let stdout_tsv = String::from_utf8_lossy(&out_tsv_mode.stdout);
+    assert!(
+        stdout_tsv.contains("# chi2_consistency_diagnostic:"),
+        "TSV stdout missing chi2_consistency_diagnostic:\n{stdout_tsv}"
+    );
+    assert!(
+        stdout_tsv.contains("# error_scale_warning:"),
+        "TSV stdout missing error_scale_warning:\n{stdout_tsv}"
+    );
+
+    let rep: ExcitedStateReport =
+        serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert_eq!(
+        rep.abstention_kind,
+        Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange)
+    );
+    assert!(rep.error_scale_warning.is_some());
+    assert!(rep.chi2_consistency_diagnostic.is_some());
+
+    // 2. `-o <file>` summary mode MUST print the error-scale warning to stdout!
+    let out_file = tmp.path.join("out.tsv");
+    let out_file_mode = Command::new(nmrassign_bin())
+        .args([
+            "exchange-state",
+            "--shifts",
+            star_path.to_str().unwrap(),
+            "--structure",
+            pdb_path.to_str().unwrap(),
+            "--exchange",
+            exch_tsv.to_str().unwrap(),
+            "-o",
+            out_file.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run exchange-state -o mode");
+    assert!(out_file_mode.status.success());
+    let stdout_summary = String::from_utf8_lossy(&out_file_mode.stdout);
+    assert!(
+        stdout_summary.contains("Warning: Error-scale / chi^2 consistency diagnostic:"),
+        "-o summary stdout missing Warning line:\n{stdout_summary}"
+    );
+}
