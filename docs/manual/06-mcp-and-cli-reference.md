@@ -142,11 +142,12 @@ ferric nef-export --star ./out/all_atom.str --peaks ./out/peaks.tsv --out ./out/
 ferric nef-import --in ./out/project.nef --out-star ./out/reloaded.str --out-peaks ./out/reloaded.tsv
 
 # AlphaFold concordance, firewalled 3D shift prediction, PAE domain docking & co-folding (Chapter 9)
+# (the PCS metal position comes from the pcs.tsv header: "# metal_pos: x y z" or "# metal_anchor: A:66 CB")
 ferric af-validate --structure ./data/model.cif --pae ./data/pae.json --shifts ./out/assigned.str [--treat-as-model] [--chain A] -o ./out/af_concordance.json
 ferric predict-shifts --structure ./data/model.cif --ph 6.5 --temp-k 298.15 --methyl-ilvmat -o ./out/pred_shifts.str
-ferric structure --pae-domains --af-structure ./data/multidomain.cif --af-pae ./data/pae.json --rdc ./data/rdc_m1.tsv --pcs ./data/pcs.tsv --pcs-metal-xyz 12.4,-4.2,8.1 --pre ./data/pre.tsv --pre-tau-c-ns 9.5 --pre-proton-mhz 600.13 -o ./out/docked.pdb
-ferric cofold export --format boltz2 --fasta ./data/complex.fasta --apo-structure ./data/apo.cif --csp ./out/csp_kd.tsv [--tau-c-ns 8.5] -o ./out/complex.yaml
-ferric cofold score --poses ./out/pose0.cif,./out/pose1.cif --apo-structure ./data/apo.cif --csp ./out/csp_kd.tsv [--tau-c-ns 8.5] -o ./out/pose_scores.json
+ferric structure --pae-domains --af-structure ./data/multidomain.cif --af-pae ./data/pae.json --rdc ./data/rdc_m1.tsv --pcs ./data/pcs.tsv --pre ./data/pre.tsv --pre-tau-c-ns 9.5 --pre-proton-mhz 600.13 -o ./out/docked.pdb
+ferric cofold export --format boltz2 --fasta ./data/complex.fasta --apo-structure ./data/apo.cif --csp ./out/csp_kd.tsv [--pre ./data/pre.tsv --pre-tau-c 8.5 --pre-proton-mhz 600.13] -o ./out/complex.yaml
+ferric cofold score --poses ./out/pose0.cif,./out/pose1.cif --apo-structure ./data/apo.cif --csp ./out/csp_kd.tsv [--pre ./data/pre.tsv --pre-tau-c 8.5 --pre-proton-mhz 600.13] [--csp-scoring burial|forward] -o ./out/pose_scores.json
 ```
 
 #### 4. Dynamics, Chemical Exchange, 1D `qNMR`, `DOSY` & Metabolomics
@@ -461,7 +462,7 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
 | **`vt`** | Spectrum & Contours | View / Contour Threshold Popup | Open interactive base contour floor, geometric step, and level count popover |
 | **`ci`** | Spectrum & Contours | More Signal (`+`) | Increase 1D vertical gain (`×1.25`) or lower 2D/3D contour floor (`÷1.25`) to reveal weak peaks |
 | **`cb`** | Spectrum & Contours | Less Signal (`-`) | Decrease 1D vertical gain (`÷1.25`) or raise 2D/3D contour floor (`×1.25`) to suppress baseline noise |
-| **`ws` / `wu`** | Solvent DSP | Water Suppression / Multi-Level Undo | Apply solvent suppression to the active trace/page or pop the per-spectrum `KeyedSnapshotStack` (`0` cross-cube mutation) |
+| **`ws` / `wu`** | Solvent DSP | Water Suppression / Multi-Level Undo | Apply solvent suppression to the active trace/page or pop the per-spectrum `KeyedSnapshotStack` (`0` cross-cube mutation). If no dominant water peak is found in the solvent's window, nothing changes and no undo entry is pushed ([Chapter 2](02-custom-pulprog-and-dsp.md#4-workbench-water-action-ws-nmr-corewater)) |
 | **`zf` / `oz`** | Zoom & Navigation | Zoom Out to Full Sweep | Reset viewport bounds to the full spectral sweep width (recording history for `zp`) |
 | **`zp`** | Zoom & Navigation | Previous Zoom | Step back through recorded zoom history (including `Shift+drag` and `Double-click` resets) |
 | **`zi` / `zo`** | Zoom & Navigation | Zoom In / Out (`1.25×`) | Zoom into or out of the active 2D, 3D plane, or strip region |

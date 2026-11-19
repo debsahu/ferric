@@ -1,0 +1,5 @@
+# Allowlist for scripts/check_docs_cli_flags.py (kind<TAB>token<TAB>file-glob<TAB>reason).
+# Every entry needs a reason; entries that stop matching are reported as stale.
+flag	--check	docs/manual/index.md	flag of scripts/build_docs_manual.py (named in the preceding code block), not a ferric flag
+flag	--realistic	TODO.md	names the `ferric benchmark --realistic` simulator preset inside result summaries of other subcommands
+const	SWARM_FIX_BRIEF	docs/specs/21-alphafold-integrative-nmr.md	name of a private review brief document (data/private), not a code constant
