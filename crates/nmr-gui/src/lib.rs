@@ -8,6 +8,7 @@
 //! structure viewport, workflow navigation, fuzzy command-palette search, and keyboard
 //! accelerators for native desktop and `wasm32-unknown-unknown` targets.
 
+pub mod about_references_modal;
 pub mod brand_icon;
 pub mod command_palette;
 pub mod contour_painter;
@@ -31,6 +32,7 @@ pub mod ss_ribbon_widget;
 pub mod stack1d_panel;
 pub mod strip_tiler;
 pub mod undo_journal;
+pub mod vnmrj_rail;
 pub mod workbench_mode;
 pub mod workbook;
 pub mod workflow_bar;

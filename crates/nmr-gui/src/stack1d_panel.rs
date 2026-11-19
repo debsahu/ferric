@@ -46,6 +46,10 @@ use crate::label_layout::{
     band_offsets_below, default_offsets_above, place_labels, LabelCandidate,
 };
 use crate::undo_journal::{KeyedSnapshotStack, SpectrumKey};
+use crate::vnmrj_rail::{
+    draw_folder_tab_themed, paint_rail_backdrop, paint_rail_slot, RailColorGroup, RAIL_SLOT_GAP_PX,
+    RAIL_SLOT_SIZE, RAIL_WIDTH_PX,
+};
 use crate::workbench_mode::TYPE_CAPTION_PX;
 
 /// Primary interactive tool mode on the 1D NMR canvas and left vertical tool rail.
@@ -115,6 +119,16 @@ impl ToolMode1d {
         }
     }
 
+    /// VnmrJ functional color-coding family for this 1D mouse mode.
+    pub const fn color_group(self) -> RailColorGroup {
+        match self {
+            Self::Zoom | Self::Pan => RailColorGroup::Navigation,
+            Self::Reference => RailColorGroup::MeasureReference,
+            Self::PeakPick | Self::IntegrateRoi | Self::Multiplet => RailColorGroup::PickQuantify,
+            Self::Phase => RailColorGroup::ProcessingScale,
+        }
+    }
+
     pub const fn tooltip(self) -> &'static str {
         match self {
             Self::Zoom => {
@@ -176,6 +190,7 @@ pub enum Icon1d {
     GainDouble,
     GainHalf,
     WaterSuppress,
+    DeletePeak,
     ThemeToggle,
 }
 
@@ -347,22 +362,15 @@ pub fn paint_1d_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon1d, co
             );
         }
         Icon1d::GainDouble => {
-            painter.text(
-                c,
-                egui::Align2::CENTER_CENTER,
-                "x2",
-                egui::FontId::monospace(TYPE_CAPTION_PX),
-                col,
-            );
+            // Pure-vector vertical scale up ('+' with upward tick)
+            let arm = r * 0.68;
+            painter.line_segment([egui::pos2(c.x - arm, c.y), egui::pos2(c.x + arm, c.y)], sw);
+            painter.line_segment([egui::pos2(c.x, c.y - arm), egui::pos2(c.x, c.y + arm)], sw);
         }
         Icon1d::GainHalf => {
-            painter.text(
-                c,
-                egui::Align2::CENTER_CENTER,
-                "/2",
-                egui::FontId::monospace(TYPE_CAPTION_PX),
-                col,
-            );
+            // Pure-vector vertical scale down ('-')
+            let arm = r * 0.72;
+            painter.line_segment([egui::pos2(c.x - arm, c.y), egui::pos2(c.x + arm, c.y)], sw);
         }
         Icon1d::WaterSuppress => {
             let mut drop_pts = Vec::with_capacity(13);
@@ -384,6 +392,25 @@ pub fn paint_1d_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon1d, co
                     egui::pos2(c.x + r * 0.86, c.y + r * 0.14),
                 ],
                 sw,
+            );
+        }
+        Icon1d::DeletePeak => {
+            // Peak triangle outline with crisp coral/red curate X
+            let k = r * 0.64;
+            painter.line_segment(
+                [egui::pos2(c.x - k, c.y - k), egui::pos2(c.x + k, c.y + k)],
+                egui::Stroke::new(1.6, col),
+            );
+            painter.line_segment(
+                [egui::pos2(c.x + k, c.y - k), egui::pos2(c.x - k, c.y + k)],
+                egui::Stroke::new(1.6, col),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - r * 0.82, c.y + r * 0.82),
+                    egui::pos2(c.x + r * 0.82, c.y + r * 0.82),
+                ],
+                sw_thin,
             );
         }
         Icon1d::ThemeToggle => {
@@ -2605,6 +2632,63 @@ fn nice_nmr_tick_step(span_ppm: f64, target_ticks: usize) -> f64 {
     mult * base
 }
 
+/// Decimate a [`Spectrum1D`] onto `(ppm, intensity)` points over `[lo_ppm, hi_ppm]` for smooth
+/// `60 fps` canvas and SVG rendering without mutating or allocating a full [`Trace1d`].
+fn sample_spectrum1d_for_viewport(
+    spec: &Spectrum1D,
+    lo_ppm: f64,
+    hi_ppm: f64,
+    max_cols: usize,
+) -> Vec<(f64, f64)> {
+    let n = spec.real.len();
+    if n < 2 {
+        return Vec::new();
+    }
+    let lo = lo_ppm.min(hi_ppm);
+    let hi = lo_ppm.max(hi_ppm);
+    let span = (hi - lo).max(1e-9);
+    let mut visible: Vec<(f64, f64)> = Vec::new();
+    for (idx, &val) in spec.real.iter().enumerate() {
+        let p = spec.axis.index_to_ppm(idx as f64);
+        if p >= lo && p <= hi && val.is_finite() {
+            visible.push((p, val));
+        }
+    }
+    if visible.len() <= max_cols.saturating_mul(2).max(64) {
+        return visible;
+    }
+    let cols = max_cols.max(32);
+    let mut min_pt: Vec<Option<(f64, f64)>> = vec![None; cols];
+    let mut max_pt: Vec<Option<(f64, f64)>> = vec![None; cols];
+    for (p, v) in visible {
+        let frac = ((hi - p) / span).clamp(0.0, 0.999_999);
+        let col = (frac * (cols as f64)) as usize;
+        let c = col.min(cols - 1);
+        match min_pt[c] {
+            None => min_pt[c] = Some((p, v)),
+            Some((_, mv)) if v < mv => min_pt[c] = Some((p, v)),
+            _ => {}
+        }
+        match max_pt[c] {
+            None => max_pt[c] = Some((p, v)),
+            Some((_, mv)) if v > mv => max_pt[c] = Some((p, v)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::with_capacity(cols * 2);
+    for c in 0..cols {
+        if let Some(a) = min_pt[c] {
+            out.push(a);
+            if let Some(b) = max_pt[c] {
+                if (b.1 - a.1).abs() > 1e-12 || (b.0 - a.0).abs() > 1e-12 {
+                    out.push(b);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Export the active [`Stack1dState`] viewport as a deterministic, XML-escaped publication SVG
 /// document (`SuperimposedOverlay`, `StackedOffset`, or `DifferenceSpectrum`) with an inverted
 /// NMR chemical-shift ruler.
@@ -2662,9 +2746,20 @@ pub fn export_stack1d_svg(state: &Stack1dState, width: u32, height: u32) -> Stri
         }
     }
 
-    let y_base = pad_t + plot_h * 0.84;
+    let pred_mirror_active = state.show_predicted_overlay
+        && state.predicted_overlay_spectrum.is_some()
+        && state.predicted_overlay_mirror;
+    let y_base = if pred_mirror_active {
+        pad_t + plot_h * 0.56
+    } else {
+        pad_t + plot_h * 0.84
+    };
     let max_int = state.reference_intensity_ceiling().max(1e-12);
-    let y_px_per_unit = (plot_h * 0.70 * state.y_gain) / max_int;
+    let y_px_per_unit = if pred_mirror_active {
+        (plot_h * 0.46 * state.y_gain) / max_int
+    } else {
+        (plot_h * 0.70 * state.y_gain) / max_int
+    };
 
     let _ = writeln!(svg, "  <g clip-path=\"url(#plotClip)\">");
     let vis_indices = state.ordered_visible_trace_indices();
@@ -2726,6 +2821,43 @@ pub fn export_stack1d_svg(state: &Stack1dState, width: u32, height: u32) -> Stri
                 svg,
                 "    <path d=\"{path}\" fill=\"none\" stroke=\"#{r:02x}{g:02x}{b:02x}\" stroke-width=\"1.25\"/>"
             );
+        }
+    }
+    if state.show_predicted_overlay {
+        if let Some(ref pred_spec) = state.predicted_overlay_spectrum {
+            let pred_pts =
+                sample_spectrum1d_for_viewport(pred_spec, lo, hi, plot_w.ceil() as usize);
+            let pred_max = pred_spec
+                .real
+                .iter()
+                .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                .max(1e-12);
+            let pred_amp_px = if state.predicted_overlay_mirror {
+                (pad_t + plot_h - y_base - 6.0).max(20.0) * 0.86
+            } else {
+                plot_h * 0.58
+            };
+            if pred_pts.len() >= 2 {
+                let mut path = String::with_capacity(pred_pts.len() * 16);
+                for (k, &(p, val)) in pred_pts.iter().enumerate() {
+                    let sx = ppm_to_x(p);
+                    let norm_v = val / pred_max;
+                    let sy = if state.predicted_overlay_mirror {
+                        y_base + norm_v * pred_amp_px
+                    } else {
+                        y_base - norm_v * pred_amp_px
+                    };
+                    if k == 0 {
+                        let _ = write!(path, "M{sx:.2},{sy:.2}");
+                    } else {
+                        let _ = write!(path, " L{sx:.2},{sy:.2}");
+                    }
+                }
+                let _ = writeln!(
+                    svg,
+                    "    <path d=\"{path}\" fill=\"none\" stroke=\"#f59e0b\" stroke-width=\"1.3\" stroke-opacity=\"0.92\"/>"
+                );
+            }
         }
     }
     let _ = writeln!(svg, "  </g>");
@@ -2915,6 +3047,28 @@ pub struct Stack1dState {
     last_peak_pick_click: Option<(f64, egui::Pos2, Stack1dUndoSnapshot)>,
     pub show_params_card: bool,
     pub show_journal_card: bool,
+
+    // Predict 1H / 13C popover, amber/mirror predicted overlay, 1-click export & VnmrJ rail state
+    /// Optional SMILES string typed into the 1D `Predict 1H / 13C` quick popover (empty = pull active Octet molecule).
+    pub predict_smiles_input: String,
+    /// Optional active Octet molecule SMILES hint supplied by the host workbench.
+    pub active_octet_smiles_hint: Option<String>,
+    /// Queued prediction request `(smiles_or_empty_for_octet, is_13c)` consumed by the host workbench.
+    pub pending_predict_1d_request: Option<(String, bool)>,
+    /// Optional predicted `1H` or `13C` [`Spectrum1D`] rendered as an amber/mirror overlay on the same ppm scale.
+    pub predicted_overlay_spectrum: Option<Spectrum1D>,
+    /// Human-readable label shown for [`Self::predicted_overlay_spectrum`].
+    pub predicted_overlay_label: String,
+    /// Toggle showing [`Self::predicted_overlay_spectrum`] on the 1D canvas and SVG export.
+    pub show_predicted_overlay: bool,
+    /// Render the predicted overlay inverted below the baseline (`true` = mirror plot, `false` = upright overlay).
+    pub predicted_overlay_mirror: bool,
+    /// Most recent ACS journal report string copied via the 1-Click Export bar.
+    pub last_copied_acs_report: Option<String>,
+    /// Bounding rectangle of the left VnmrJ vertical mouse-mode rail from the most recent frame.
+    pub last_rail_rect: Option<egui::Rect>,
+    /// Per-mode icon slot rectangles on the 1D left VnmrJ vertical rail from the most recent frame.
+    pub last_tool_rail_rects: Vec<(ToolMode1d, egui::Rect)>,
 }
 
 impl std::fmt::Debug for Stack1dState {
@@ -3041,6 +3195,16 @@ impl Default for Stack1dState {
             last_peak_pick_click: None,
             show_params_card: false,
             show_journal_card: false,
+            predict_smiles_input: String::new(),
+            active_octet_smiles_hint: None,
+            pending_predict_1d_request: None,
+            predicted_overlay_spectrum: None,
+            predicted_overlay_label: "Predicted 1H".to_string(),
+            show_predicted_overlay: false,
+            predicted_overlay_mirror: true,
+            last_copied_acs_report: None,
+            last_rail_rect: None,
+            last_tool_rail_rects: Vec::new(),
         }
     }
 }
@@ -4616,6 +4780,98 @@ impl Stack1dState {
             format_journal_nmr_report(&rep, self.journal_style, TextEncoding::Unicode);
     }
 
+    /// Queue a `1H` (`is_13c = false`) or `13C` (`is_13c = true`) 1D spectrum prediction request
+    /// from an explicit SMILES string (or empty string to pull the active Octet molecule).
+    pub fn request_predict_1d(&mut self, smiles: impl Into<String>, is_13c: bool) {
+        let s = smiles.into().trim().to_string();
+        let nuc = if is_13c { "13C" } else { "1H" };
+        if s.is_empty() {
+            self.status_message = format!("Requested {nuc} prediction from active Octet molecule.");
+        } else {
+            self.status_message = format!("Requested {nuc} prediction for SMILES '{s}'.");
+        }
+        self.pending_predict_1d_request = Some((s, is_13c));
+    }
+
+    /// Attach an optional predicted `1H` or `13C` [`Spectrum1D`] overlay and enable amber/mirror rendering.
+    pub fn set_predicted_overlay(&mut self, spec: Spectrum1D, label: impl Into<String>) {
+        let lbl = label.into();
+        self.predicted_overlay_label = if lbl.trim().is_empty() {
+            "Predicted 1D".to_string()
+        } else {
+            lbl
+        };
+        self.predicted_overlay_spectrum = Some(spec);
+        self.show_predicted_overlay = true;
+        self.status_message = format!(
+            "Loaded predicted overlay '{}'.",
+            self.predicted_overlay_label
+        );
+    }
+
+    /// Clear any attached predicted `1H`/`13C` overlay spectrum.
+    pub fn clear_predicted_overlay(&mut self) {
+        self.predicted_overlay_spectrum = None;
+        self.show_predicted_overlay = false;
+        self.status_message = "Cleared predicted 1D overlay.".to_string();
+    }
+
+    /// Build and return a publication-ready ACS journal NMR characterization string for the active
+    /// 1D trace, populating [`Self::formatted_journal_report`] and [`Self::last_copied_acs_report`].
+    pub fn build_acs_journal_string(&mut self) -> String {
+        if self.detected_multiplets.is_empty() && !self.traces.is_empty() {
+            self.refresh_active_trace_peaks_and_multiplets();
+        }
+        let prev_style = self.journal_style;
+        self.journal_style = PublicationStyle::Acs;
+        self.reformat_journal_report();
+        self.journal_style = prev_style;
+
+        let report = if self.formatted_journal_report.trim().is_empty() {
+            let mhz = self.active_obs_mhz();
+            if self.picked_peaks.is_empty() {
+                format!(
+                    "1H NMR ({mhz:.0} MHz, {}): δ (no peaks picked).",
+                    self.solvent_choice
+                )
+            } else {
+                let mut ppms: Vec<String> = self
+                    .picked_peaks
+                    .iter()
+                    .map(|p| format!("{:.2}", p.ppm))
+                    .collect();
+                ppms.truncate(24);
+                format!(
+                    "1H NMR ({mhz:.0} MHz, {}): δ {}.",
+                    self.solvent_choice,
+                    ppms.join(", ")
+                )
+            }
+        } else {
+            self.formatted_journal_report.clone()
+        };
+        self.formatted_journal_report = report.clone();
+        self.last_copied_acs_report = Some(report.clone());
+        self.status_message = "Copied ACS journal NMR string to clipboard.".to_string();
+        report
+    }
+
+    /// Export the active 1D viewport as a deterministic publication SVG and cache it in
+    /// [`Self::last_exported_svg`].
+    pub fn export_current_svg(&mut self, width: u32, height: u32) -> String {
+        let svg = export_stack1d_svg(self, width, height);
+        self.last_exported_svg = Some(svg.clone());
+        self.status_message = format!("Exported {width}x{height} 1D spectrum SVG.");
+        svg
+    }
+
+    /// Look up the last rendered screen rect of a [`ToolMode1d`] slot on the 1D left VnmrJ rail.
+    pub fn tool_rail_slot_rect(&self, mode: ToolMode1d) -> Option<egui::Rect> {
+        self.last_tool_rail_rects
+            .iter()
+            .find_map(|&(m, r)| (m == mode).then_some(r))
+    }
+
     /// Convert visible traces (`>= 3`) into [`CohortSample1D`] records for one-click Metabolomics handoff.
     pub fn build_metabolomics_cohort_samples(&self) -> Vec<CohortSample1D> {
         let vis: Vec<&Trace1d> = self.traces.iter().filter(|t| t.visible).collect();
@@ -4895,6 +5151,219 @@ impl Stack1dState {
     }
 }
 
+/// Render the slim `~38 px` color-coded VnmrJ left vertical mouse-mode rail for the 1D Suite.
+///
+/// Uses the same five functional color groups as the 2D/3D rail:
+/// - **Cyan/Blue** = Navigation (`Zoom`, `Pan`, `Full View`, `Undo Zoom`, `Fit Y`)
+/// - **Amber/Gold** = Measure & Reference (`Reference`)
+/// - **Emerald/Green** = Pick & Quantify (`Integrate`, `Multiplet`, `Peak Pick`)
+/// - **Violet/Purple** = Processing & Scale (`Phase`, `Gain +`, `Gain -`, `Water Suppress`)
+/// - **Coral/Red** = Curate (`Delete Selected Peak / Peak Curation`)
+fn render_left_vnmrj_rail_1d(ui: &mut egui::Ui, state: &mut Stack1dState, paper_white: bool) {
+    #[derive(Clone, Copy)]
+    enum Instant1d {
+        FullView,
+        UndoZoom,
+        FitY,
+        GainDouble,
+        GainHalf,
+        WaterSuppress,
+        DeleteCurate,
+    }
+
+    const INSTANTS: [(Instant1d, Icon1d, RailColorGroup, &str); 7] = [
+        (
+            Instant1d::FullView,
+            Icon1d::FullView,
+            RailColorGroup::Navigation,
+            "Full View (zf) [Navigation]: Reset chemical-shift bounds and vertical gain = 1x",
+        ),
+        (
+            Instant1d::UndoZoom,
+            Icon1d::Undo,
+            RailColorGroup::Navigation,
+            "Undo Zoom (zp) [Navigation]: Return to previous horizontal zoom window",
+        ),
+        (
+            Instant1d::FitY,
+            Icon1d::FitY,
+            RailColorGroup::Navigation,
+            "Fit Y [Navigation]: Auto-scale vertical peak height to ~75% of current window",
+        ),
+        (
+            Instant1d::GainDouble,
+            Icon1d::GainDouble,
+            RailColorGroup::ProcessingScale,
+            "Increase Vertical Scale (+) [Processing & Scale]: Double vertical peak intensity",
+        ),
+        (
+            Instant1d::GainHalf,
+            Icon1d::GainHalf,
+            RailColorGroup::ProcessingScale,
+            "Decrease Vertical Scale (-) [Processing & Scale]: Halve vertical peak intensity",
+        ),
+        (
+            Instant1d::WaterSuppress,
+            Icon1d::WaterSuppress,
+            RailColorGroup::ProcessingScale,
+            "Water Suppress (ws/wu) [Processing & Scale]: Attenuate residual H2O / HDO solvent resonance (click again to undo)",
+        ),
+        (
+            Instant1d::DeleteCurate,
+            Icon1d::DeletePeak,
+            RailColorGroup::Curate,
+            "Curate / Delete Peak [Curate]: Delete selected peak or enter Peak Curate mode (click × on any peak flag)",
+        ),
+    ];
+
+    let pad_y = 4.0_f32;
+    let divider_h = 8.0_f32;
+    let n_modes = ToolMode1d::ALL.len();
+    let n_inst = INSTANTS.len();
+    let total_h = pad_y * 2.0
+        + (n_modes as f32) * RAIL_SLOT_SIZE.y
+        + ((n_modes.saturating_sub(1)) as f32) * RAIL_SLOT_GAP_PX
+        + divider_h
+        + (n_inst as f32) * RAIL_SLOT_SIZE.y
+        + ((n_inst.saturating_sub(1)) as f32) * RAIL_SLOT_GAP_PX;
+
+    let (rail_rect, resp) =
+        ui.allocate_exact_size(egui::vec2(RAIL_WIDTH_PX, total_h), egui::Sense::click());
+    state.last_rail_rect = Some(rail_rect);
+    state.last_tool_rail_rects.clear();
+
+    let painter = ui.painter();
+    paint_rail_backdrop(painter, rail_rect, paper_white);
+
+    let slot_x = rail_rect.center().x - RAIL_SLOT_SIZE.x * 0.5;
+    let mut y = rail_rect.top() + pad_y;
+    let mut mode_slots: Vec<(ToolMode1d, egui::Rect)> = Vec::with_capacity(n_modes);
+    for tm in ToolMode1d::ALL {
+        let r = egui::Rect::from_min_size(egui::pos2(slot_x, y), RAIL_SLOT_SIZE);
+        mode_slots.push((tm, r));
+        state.last_tool_rail_rects.push((tm, r));
+        y += RAIL_SLOT_SIZE.y + RAIL_SLOT_GAP_PX;
+    }
+
+    let div_y = y - RAIL_SLOT_GAP_PX + divider_h * 0.5;
+    let div_col = if paper_white {
+        egui::Color32::from_rgb(203, 213, 225)
+    } else {
+        egui::Color32::from_rgb(51, 65, 85)
+    };
+    painter.line_segment(
+        [
+            egui::pos2(rail_rect.left() + 6.0, div_y),
+            egui::pos2(rail_rect.right() - 6.0, div_y),
+        ],
+        egui::Stroke::new(1.0, div_col),
+    );
+    y = div_y + divider_h * 0.5;
+
+    let mut inst_slots: Vec<(usize, egui::Rect)> = Vec::with_capacity(n_inst);
+    for idx in 0..n_inst {
+        let r = egui::Rect::from_min_size(egui::pos2(slot_x, y), RAIL_SLOT_SIZE);
+        inst_slots.push((idx, r));
+        y += RAIL_SLOT_SIZE.y + RAIL_SLOT_GAP_PX;
+    }
+
+    let hover_pos = resp.hover_pos();
+    let click_pos = if resp.clicked() {
+        resp.interact_pointer_pos()
+            .or_else(|| ui.ctx().pointer_latest_pos())
+    } else {
+        None
+    };
+
+    let mut hovered_tooltip: Option<&'static str> = None;
+
+    for (tm, r) in mode_slots {
+        let hovered = hover_pos.is_some_and(|p| r.contains(p));
+        if hovered {
+            hovered_tooltip = Some(tm.tooltip());
+        }
+        if click_pos.is_some_and(|p| r.contains(p)) {
+            state.select_tool_mode(tm);
+        }
+        let fg = paint_rail_slot(
+            painter,
+            r,
+            tm.color_group(),
+            paper_white,
+            state.tool_mode == tm,
+            hovered,
+            true,
+        );
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(r.center().x + 1.5, r.center().y),
+            egui::vec2(15.0, 15.0),
+        );
+        paint_1d_icon(painter, icon_rect, tm.icon(), fg);
+    }
+
+    for (idx, r) in inst_slots {
+        let (kind, icon, group, tip) = INSTANTS[idx];
+        let enabled = match kind {
+            Instant1d::UndoZoom => !state.zoom_history.is_empty(),
+            Instant1d::WaterSuppress => !state.traces.is_empty(),
+            _ => true,
+        };
+        let active = match kind {
+            Instant1d::WaterSuppress => state.has_water_undo_active(),
+            Instant1d::DeleteCurate => state.selected_peak_idx.is_some(),
+            _ => false,
+        };
+        let hovered = enabled && hover_pos.is_some_and(|p| r.contains(p));
+        if hovered {
+            hovered_tooltip = Some(tip);
+        }
+        if enabled && click_pos.is_some_and(|p| r.contains(p)) {
+            match kind {
+                Instant1d::FullView => state.reset_full_view(),
+                Instant1d::UndoZoom => {
+                    let _ = state.undo_zoom();
+                }
+                Instant1d::FitY => state.fit_y_to_visible_window(),
+                Instant1d::GainDouble => {
+                    state.y_gain = (state.y_gain * 2.0).clamp(0.001, 100_000.0);
+                }
+                Instant1d::GainHalf => {
+                    state.y_gain = (state.y_gain * 0.5).clamp(0.001, 100_000.0);
+                }
+                Instant1d::WaterSuppress => {
+                    if state.has_water_undo_active() {
+                        let _ = state.undo_water_suppression_active_trace();
+                    } else {
+                        state.pending_water_suppress_1d = true;
+                    }
+                }
+                Instant1d::DeleteCurate => {
+                    if let Some(sel) = state.selected_peak_idx {
+                        let _ = state.delete_picked_peak(sel);
+                    } else {
+                        state.select_tool_mode(ToolMode1d::PeakPick);
+                        state.status_message =
+                            "Peak Curate active: click × on any peak flag or press Delete."
+                                .to_string();
+                    }
+                }
+            }
+        }
+        let fg = paint_rail_slot(painter, r, group, paper_white, active, hovered, enabled);
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(r.center().x + 1.5, r.center().y),
+            egui::vec2(15.0, 15.0),
+        );
+        paint_1d_icon(painter, icon_rect, icon, fg);
+    }
+
+    if let Some(tip) = hovered_tooltip {
+        let _ = resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(tip);
+    }
+}
+
 /// Render the self-contained Interactive Multi-Spectrum 1D Comparison, Overlay, Stack, Difference
 /// & Kinetics Array Studio inside `ui`.
 pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
@@ -4912,26 +5381,11 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
 
     let _ = in_workbook;
 
-    // 1. Single consolidated 1D Process toolbar (`<= 12` primary controls, `UI-B2`, `UI-B6`, `UI-B8`):
-    //    Tool selector + Auto-Phase + Baseline + Water + Pick Peaks + Full View + Inspector + Advanced
+    // 1. Single consolidated 1D Process toolbar (`<= 12` primary controls incl. VnmrJ left rail):
+    //    Auto-Phase + Baseline + Water + Pick Peaks + Predict 1H/13C + Overlay Pred + Export SVG +
+    //    Copy ACS + Table + Advanced (10 top controls + 1 left vertical rail = 11 <= 12)
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
-
-        egui::ComboBox::from_id_salt("stack1d_tool_mode_combo")
-            .selected_text(format!("Tool: {}", state.tool_mode.label()))
-            .width(142.0)
-            .show_ui(ui, |ui| {
-                for tm in ToolMode1d::ALL {
-                    let mut chosen = state.tool_mode;
-                    if ui
-                        .selectable_value(&mut chosen, tm, tm.label())
-                        .on_hover_text(tm.tooltip())
-                        .clicked()
-                    {
-                        state.select_tool_mode(chosen);
-                    }
-                }
-            });
 
         if ui
             .button(egui::RichText::new("Auto-Phase").size(12.5))
@@ -4970,12 +5424,143 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
         {
             state.refresh_active_trace_peaks_and_multiplets();
         }
+
+        // Predict 1H / 13C quick popover (SMILES or active Octet molecule)
+        ui.menu_button(egui::RichText::new("Predict 1H/13C").size(12.5), |ui| {
+            ui.set_min_width(275.0);
+            ui.label(
+                egui::RichText::new("Predict 1D Spectrum (SMILES or Active Octet)")
+                    .size(12.5)
+                    .strong(),
+            );
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("SMILES:").size(TYPE_CAPTION_PX));
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.predict_smiles_input)
+                        .id_salt("stack1d_predict_smiles_input")
+                        .hint_text("e.g. CC(=O)Oc1ccccc1C(=O)O (blank = Octet)")
+                        .desired_width(205.0),
+                );
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let typed = state.predict_smiles_input.trim().to_string();
+                let target_smiles = if !typed.is_empty() {
+                    typed
+                } else {
+                    state.active_octet_smiles_hint.clone().unwrap_or_default()
+                };
+                if ui
+                    .button(egui::RichText::new("Predict 1H").size(12.5))
+                    .on_hover_text("Queue 1H chemical-shift spectrum prediction")
+                    .clicked()
+                {
+                    state.request_predict_1d(target_smiles.clone(), false);
+                    ui.close();
+                }
+                if ui
+                    .button(egui::RichText::new("Predict 13C").size(12.5))
+                    .on_hover_text("Queue 13C chemical-shift spectrum prediction")
+                    .clicked()
+                {
+                    state.request_predict_1d(target_smiles, true);
+                    ui.close();
+                }
+            });
+            ui.horizontal(|ui| {
+                let octet_smiles = state.active_octet_smiles_hint.clone().unwrap_or_default();
+                if ui
+                    .button(egui::RichText::new("Use Octet (1H)").size(TYPE_CAPTION_PX))
+                    .on_hover_text("Pull active molecule from Octet Sketcher and predict 1H")
+                    .clicked()
+                {
+                    state.request_predict_1d(octet_smiles.clone(), false);
+                    ui.close();
+                }
+                if ui
+                    .button(egui::RichText::new("Use Octet (13C)").size(TYPE_CAPTION_PX))
+                    .on_hover_text("Pull active molecule from Octet Sketcher and predict 13C")
+                    .clicked()
+                {
+                    state.request_predict_1d(octet_smiles, true);
+                    ui.close();
+                }
+            });
+            if state.predicted_overlay_spectrum.is_some() {
+                ui.separator();
+                ui.checkbox(
+                    &mut state.show_predicted_overlay,
+                    "Overlay Predicted 1H / 13C",
+                );
+                ui.checkbox(
+                    &mut state.predicted_overlay_mirror,
+                    "Amber Mirror Mode (Inverted Below Baseline)",
+                );
+                if ui.button("Clear Predicted Overlay").clicked() {
+                    state.clear_predicted_overlay();
+                    ui.close();
+                }
+            }
+        });
+
+        // Direct Overlay Predicted 1H / 13C toggle pill
+        let has_pred = state.predicted_overlay_spectrum.is_some();
+        let pred_active = has_pred && state.show_predicted_overlay;
+        let pred_txt = if pred_active {
+            egui::RichText::new("Overlay Pred")
+                .size(12.5)
+                .strong()
+                .color(if paper_white {
+                    egui::Color32::from_rgb(180, 83, 9)
+                } else {
+                    egui::Color32::from_rgb(251, 191, 36)
+                })
+        } else {
+            egui::RichText::new("Overlay Pred").size(12.5)
+        };
         if ui
-            .button(egui::RichText::new("Full View").size(12.5))
-            .on_hover_text("Reset chemical-shift bounds and vertical gain = 1x (zf)")
+            .add(egui::Button::selectable(pred_active, pred_txt))
+            .on_hover_text(if has_pred {
+                "Toggle amber/mirror overlay of predicted 1H / 13C spectrum on the same ppm scale"
+            } else {
+                "No predicted spectrum attached yet; use Predict 1H/13C to generate an amber/mirror overlay"
+            })
             .clicked()
         {
-            state.reset_full_view();
+            if has_pred {
+                state.show_predicted_overlay = !state.show_predicted_overlay;
+                state.status_message = if state.show_predicted_overlay {
+                    format!("Showing predicted overlay '{}'.", state.predicted_overlay_label)
+                } else {
+                    "Hidden predicted 1D overlay.".to_string()
+                };
+            } else {
+                let target = if !state.predict_smiles_input.trim().is_empty() {
+                    state.predict_smiles_input.trim().to_string()
+                } else {
+                    state.active_octet_smiles_hint.clone().unwrap_or_default()
+                };
+                state.request_predict_1d(target, false);
+            }
+        }
+
+        // 1-Click Export bar: Export SVG + Copy ACS Journal String
+        if ui
+            .button(egui::RichText::new("Export SVG").size(12.5))
+            .on_hover_text("1-Click Export: copy publication 1200x640 vector SVG to clipboard")
+            .clicked()
+        {
+            let svg = state.export_current_svg(1200, 640);
+            ui.ctx().copy_text(svg);
+        }
+        if ui
+            .button(egui::RichText::new("Copy ACS").size(12.5))
+            .on_hover_text("1-Click Export: copy ACS-formatted NMR journal string to clipboard")
+            .clicked()
+        {
+            let acs = state.build_acs_journal_string();
+            ui.ctx().copy_text(acs);
         }
 
         let insp_summary = if !state.show_1d_analysis_drawer {
@@ -4997,7 +5582,7 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
         };
         egui::ComboBox::from_id_salt("stack1d_inspector_combo")
             .selected_text(insp_summary)
-            .width(148.0)
+            .width(136.0)
             .show_ui(ui, |ui| {
                 if ui
                     .selectable_label(!state.show_1d_analysis_drawer, "Hidden")
@@ -5032,6 +5617,10 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
 
         ui.menu_button(egui::RichText::new("Advanced").size(12.5), |ui| {
             ui.set_min_width(220.0);
+            if ui.button("Full View (zf)").clicked() {
+                state.reset_full_view();
+                ui.close();
+            }
             if ui.button("Fit Y to Window").clicked() {
                 state.fit_y_to_visible_window();
                 ui.close();
@@ -5133,13 +5722,6 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
             }
             if !state.traces.is_empty() {
                 ui.separator();
-                if ui.button("Copy SVG").clicked() {
-                    let svg = export_stack1d_svg(state, 1200, 640);
-                    ui.ctx().copy_text(svg.clone());
-                    state.last_exported_svg = Some(svg);
-                    state.status_message = "Copied 1200x640 vector SVG to clipboard.".to_string();
-                    ui.close();
-                }
                 if state.traces.len() >= 3 && ui.button("Send to Metabolomics").clicked() {
                     state.pending_send_to_metabolomics = true;
                     ui.close();
@@ -5216,6 +5798,8 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
 
     if state.traces.is_empty() {
         state.last_plot_rect = None;
+        state.last_rail_rect = None;
+        state.last_tool_rail_rects.clear();
         ui.add_space(10.0);
         ui.label(
             "No 1D spectra loaded. Drop a Bruker folder, .zip, .jdx, or .ucsf/.usf onto the window to begin.",
@@ -5283,17 +5867,53 @@ pub fn render_stack1d_panel(ui: &mut egui::Ui, state: &mut Stack1dState) {
         _ => {}
     }
 
-    // 2. Full-width 1D Spectrum Canvas (`>= 65%` viewport area, zero side tool rail clutter)
-    paint_interactive_1d_canvas(ui, state, paper_white);
+    // 2. Slim color-coded VnmrJ left vertical rail + 1D Spectrum Canvas (`>= 65%` viewport area)
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        render_left_vnmrj_rail_1d(ui, state, paper_white);
+        paint_interactive_1d_canvas(ui, state, paper_white);
+    });
 
     if !state.show_1d_analysis_drawer {
         return;
     }
 
     ui.add_space(3.0);
+    // Connected folder-style tabs seamlessly joined to the inspector frame below
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        let pk_lbl = format!("Peaks ({})", state.picked_peaks.len());
+        let mp_lbl = format!("Multiplets ({})", state.detected_multiplets.len());
+        let in_lbl = format!("Integrals ({})", state.roi_regions.len());
+        let st_lbl = format!("Stack ({})", state.traces.len());
+        for (tab, label) in [
+            (InspectorTab1d::Peaks, pk_lbl.as_str()),
+            (InspectorTab1d::Multiplets, mp_lbl.as_str()),
+            (InspectorTab1d::Integrals, in_lbl.as_str()),
+            (InspectorTab1d::PhaseBaseline, "Processing"),
+            (InspectorTab1d::MultiTraceStack, st_lbl.as_str()),
+        ] {
+            if draw_folder_tab_themed(ui, label, state.selected_inspector_tab == tab, paper_white)
+                .clicked()
+            {
+                state.selected_inspector_tab = tab;
+            }
+        }
+    });
+    let (drawer_fill, drawer_border) = if paper_white {
+        (
+            egui::Color32::from_rgb(255, 255, 255),
+            egui::Color32::from_rgb(148, 163, 184),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(15, 21, 32),
+            egui::Color32::from_rgb(68, 86, 114),
+        )
+    };
     egui::Frame::group(ui.style())
-        .fill(egui::Color32::from_rgb(15, 21, 32))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 58, 78)))
+        .fill(drawer_fill)
+        .stroke(egui::Stroke::new(1.0, drawer_border))
         .inner_margin(egui::Margin::symmetric(8, 5))
         .show(ui, |ui| match state.selected_inspector_tab {
             InspectorTab1d::Peaks => render_peaks_inspector_tab(ui, state),
@@ -7394,8 +8014,20 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState, pape
     }
 
     let ref_idx = state.safe_ref_trace_idx();
-    let y_base = plot_rect.top() + plot_rect.height() * state.baseline_y_frac;
-    let y_px_per_unit = ((plot_rect.height() as f64) * 0.70 * state.y_gain) / max_int;
+    let pred_mirror_active = state.show_predicted_overlay
+        && state.predicted_overlay_spectrum.is_some()
+        && state.predicted_overlay_mirror
+        && state.view_mode != Stack1dViewMode::Pseudo2dHeatmap;
+    let y_base = if pred_mirror_active {
+        plot_rect.top() + plot_rect.height() * 0.56
+    } else {
+        plot_rect.top() + plot_rect.height() * state.baseline_y_frac
+    };
+    let y_px_per_unit = if pred_mirror_active {
+        ((plot_rect.height() as f64) * 0.46 * state.y_gain) / max_int
+    } else {
+        ((plot_rect.height() as f64) * 0.70 * state.y_gain) / max_int
+    };
 
     // Render Mode Body
     if state.view_mode == Stack1dViewMode::Pseudo2dHeatmap {
@@ -7553,6 +8185,59 @@ fn paint_interactive_1d_canvas(ui: &mut egui::Ui, state: &mut Stack1dState, pape
                         color,
                     );
                 }
+            }
+        }
+
+        // Optional predicted 1H / 13C Spectrum1D overlay in amber/mirror mode on the same ppm scale
+        if state.show_predicted_overlay {
+            if let Some(ref pred_spec) = state.predicted_overlay_spectrum {
+                let pred_pts = sample_spectrum1d_for_viewport(pred_spec, lo, hi, max_cols);
+                let pred_max = pred_spec
+                    .real
+                    .iter()
+                    .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                    .max(1e-12);
+                let pred_col = if paper_white {
+                    egui::Color32::from_rgb(217, 119, 6) // Amber-600
+                } else {
+                    egui::Color32::from_rgb(251, 191, 36) // Amber-400
+                };
+                let pred_amp_px = if state.predicted_overlay_mirror {
+                    ((plot_rect.bottom() - y_base - 8.0).max(24.0) as f64) * 0.86
+                } else {
+                    (plot_rect.height() as f64) * 0.58
+                };
+                if pred_pts.len() >= 2 {
+                    let screen_pred: Vec<egui::Pos2> = pred_pts
+                        .into_iter()
+                        .map(|(p, val)| {
+                            let norm_v = val / pred_max;
+                            let sy = if state.predicted_overlay_mirror {
+                                y_base + (norm_v * pred_amp_px) as f32
+                            } else {
+                                y_base - (norm_v * pred_amp_px) as f32
+                            };
+                            egui::pos2(ppm_to_screen_x(p), sy)
+                        })
+                        .collect();
+                    plot_painter.add(egui::Shape::line(
+                        screen_pred,
+                        egui::Stroke::new(1.35, pred_col),
+                    ));
+                }
+                let badge_txt = if state.predicted_overlay_mirror {
+                    format!("{} (Mirror)", state.predicted_overlay_label)
+                } else {
+                    format!("{} (Overlay)", state.predicted_overlay_label)
+                };
+                let badge_pos = egui::pos2(plot_rect.left() + 8.0, plot_rect.bottom() - 8.0);
+                plot_painter.text(
+                    badge_pos,
+                    egui::Align2::LEFT_BOTTOM,
+                    badge_txt,
+                    egui::FontId::monospace(TYPE_CAPTION_PX),
+                    pred_col,
+                );
             }
         }
     }
