@@ -132,7 +132,7 @@ use nmr_gui::{
     about_references_modal::AboutReferencesModal,
     assign_setup_drawer::{
         AssignProteinRegime, AssignSetupAction, AssignSetupDrawerState, AssignSetupInput,
-        AssignSolverEngine, AssignTriageSummary,
+        AssignSlotAction, AssignSolverEngine, AssignTriageSummary,
     },
     command_palette::CommandPalette,
     contour_painter::{
@@ -1783,6 +1783,7 @@ struct NmrWorkbenchApp {
     hsqc_gen: u64,
     hncacb_3d: Option<Spectrum3D>,
     hnco_3d: Option<Spectrum3D>,
+    hncaco_3d: Option<Spectrum3D>,
     cubes_3d: Vec<Arc<Spectrum3D>>,
     active_cube_idx: Option<usize>,
     cube_slice: Cube3dSliceState,
@@ -1825,7 +1826,7 @@ struct NmrWorkbenchApp {
     about_references_modal: AboutReferencesModal,
     p22_tools_panel: P22ToolsPanel,
     octet_exp_sync_key: (usize, usize),
-    relax_peaks_sync_key: (usize, usize),
+    relax_peaks_sync_key: (usize, usize, u64),
     mcp_last_viewport_key: (u64, i32, i32, i32),
     assign_target_res: usize,
     assign_lock_check: bool,
@@ -2332,6 +2333,7 @@ impl NmrWorkbenchApp {
             hsqc_gen: 1,
             hncacb_3d: None,
             hnco_3d: None,
+            hncaco_3d: None,
             cubes_3d: Vec::new(),
             active_cube_idx: None,
             cube_slice: Cube3dSliceState::default(),
@@ -2372,7 +2374,7 @@ impl NmrWorkbenchApp {
             about_references_modal: AboutReferencesModal::new(),
             p22_tools_panel: P22ToolsPanel::new(),
             octet_exp_sync_key: (0, usize::MAX),
-            relax_peaks_sync_key: (0, 0),
+            relax_peaks_sync_key: (0, 0, u64::MAX),
             mcp_last_viewport_key: (0, 0, 0, -1),
             assign_target_res: 0,
             assign_lock_check: true,
@@ -7706,14 +7708,14 @@ impl NmrWorkbenchApp {
                     }
                     ui.separator();
                     if ui
-                        .button(egui::RichText::new("Deconv 2D/3D (VarPro)...").size(12.0))
+                        .button(egui::RichText::new("Deconv 2D (VarPro)...").size(12.0))
                         .clicked()
                     {
                         ui.close();
                         self.p22_tools_panel.open_tab(P22ToolTab::Deconv2d3d);
                     }
                     if ui
-                        .button(egui::RichText::new("MaxEnt 2D/3D NUS...").size(12.0))
+                        .button(egui::RichText::new("MaxEnt 2D NUS...").size(12.0))
                         .clicked()
                     {
                         ui.close();
@@ -11272,18 +11274,19 @@ impl NmrWorkbenchApp {
                 let locks_snapshot = self.session.state.locked_residues.clone();
                 let links_snapshot = self.session.state.confirmed_links.clone();
                 let strip_actions = {
-                    let hncaco_3d = self.cubes_3d.iter().find(|c| {
-                        let e = c.exp.to_ascii_uppercase();
-                        let n = c.name.to_ascii_uppercase();
-                        e.contains("HN(CA)CO")
-                            || e.contains("HNCACO")
-                            || n.contains("HN(CA)CO")
-                            || n.contains("HNCACO")
+                    let hncaco_3d_ref = self.hncaco_3d.as_ref().or_else(|| {
+                        self.cubes_3d
+                            .iter()
+                            .find(|c| {
+                                let k = Self::normalize_exp_key(&c.exp);
+                                k == "HNCACO"
+                            })
+                            .map(|v| &**v)
                     });
                     let spectra_full = StripSpectra3DFull {
                         aliphatic_3d: self.hncacb_3d.as_ref(),
                         carbonyl_3d: self.hnco_3d.as_ref(),
-                        carbonyl_intra_3d: hncaco_3d.map(|v| &**v),
+                        carbonyl_intra_3d: hncaco_3d_ref,
                     };
                     let tiler_ctx = StripTilerContext {
                         systems: &self.systems,
@@ -12894,9 +12897,14 @@ impl NmrWorkbenchApp {
 
             let mut first_3d_page_idx: Option<usize> = None;
             for (disp_3d, _, s3) in cubes_3d {
-                if s3.exp == "HNCO" || s3.exp == "HNCACO" {
+                let exp_key = Self::normalize_exp_key(&s3.exp);
+                if exp_key == "HNCO" {
                     if self.hnco_3d.is_none() {
                         self.hnco_3d = Some(s3.clone());
+                    }
+                } else if exp_key == "HNCACO" {
+                    if self.hncaco_3d.is_none() {
+                        self.hncaco_3d = Some(s3.clone());
                     }
                 } else if self.hncacb_3d.is_none() {
                     self.hncacb_3d = Some(s3.clone());
@@ -16215,6 +16223,251 @@ impl NmrWorkbenchApp {
         saw_specific
     }
 
+    /// Normalize an NMR experiment label by stripping parentheses, whitespace, dashes, and
+    /// underscores and uppercasing (e.g., `"CBCA(CO)NH"` -> `"CBCACONH"`, `"HN(CO)CA"` -> `"HNCOCA"`,
+    /// `"HN(CA)CO"` -> `"HNCACO"`, `"15N-HSQC"` -> `"HSQC"`).
+    fn normalize_exp_key(exp: &str) -> String {
+        let stripped: String = exp
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        match stripped.as_str() {
+            "HSQC" | "15NHSQC" | "1H15NHSQC" | "NHHSQC" | "TROSYHSQC" | "TROSY" => {
+                "HSQC".to_string()
+            }
+            _ => stripped,
+        }
+    }
+
+    /// Lightweight deterministic fingerprint of `self.assign_res` + `self.systems.len()` so
+    /// downstream panels (e.g., Dynamics / Relax) resync immediately when assignments change.
+    fn assign_res_fingerprint(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mix = |acc: &mut u64, v: u64| {
+            *acc ^= v;
+            *acc = acc.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        mix(&mut h, self.systems.len() as u64);
+        if let Some(ref res) = self.assign_res {
+            mix(&mut h, res.position.len() as u64);
+            for (idx, &pos) in res.position.iter().enumerate() {
+                mix(&mut h, idx as u64);
+                mix(&mut h, (pos as i64) as u64);
+                let c = res.confidence.get(idx).copied().unwrap_or(0.0);
+                mix(&mut h, (c * 10_000.0).round() as i64 as u64);
+            }
+        }
+        h
+    }
+
+    /// Synchronize HSQC peaks into the Dynamics / Relax panel using ONLY verified solver
+    /// assignments (`self.assign_res` + `self.systems`). Unassigned peaks keep `None` rather than
+    /// fabricating sequential residue IDs.
+    fn sync_assigned_hsqc_peaks_to_relax(&mut self) {
+        let seq_str: String = self
+            .sequence
+            .iter()
+            .map(|s| match s.to_ascii_uppercase().as_str() {
+                "ALA" | "A" => 'A',
+                "ARG" | "R" => 'R',
+                "ASN" | "N" => 'N',
+                "ASP" | "D" => 'D',
+                "CYS" | "C" => 'C',
+                "GLN" | "Q" => 'Q',
+                "GLU" | "E" => 'E',
+                "GLY" | "G" => 'G',
+                "HIS" | "H" => 'H',
+                "ILE" | "I" => 'I',
+                "LEU" | "L" => 'L',
+                "LYS" | "K" => 'K',
+                "MET" | "M" => 'M',
+                "PHE" | "F" => 'F',
+                "PRO" | "P" => 'P',
+                "SER" | "S" => 'S',
+                "THR" | "T" => 'T',
+                "TRP" | "W" => 'W',
+                "TYR" | "Y" => 'Y',
+                "VAL" | "V" => 'V',
+                _ => 'X',
+            })
+            .collect();
+
+        // Build list of assigned spin systems: (h_ppm, n_ppm, seq_id, res_name).
+        let mut assigned_roots: Vec<(f64, f64, i32, &str)> = Vec::new();
+        if let Some(ref res) = self.assign_res {
+            for (ss_idx, &pos_i32) in res.position.iter().enumerate() {
+                if pos_i32 < 0 {
+                    continue;
+                }
+                let r = pos_i32 as usize;
+                let Some(ss) = self.systems.get(ss_idx) else {
+                    continue;
+                };
+                let Some(res_name) = self.sequence.get(r) else {
+                    continue;
+                };
+                let seq_id = self.seq_ids.get(r).copied().unwrap_or((r + 1) as i32);
+                assigned_roots.push((ss.h, ss.n, seq_id, res_name.as_str()));
+            }
+        }
+
+        let hsqc_peaks_2d: Vec<nmr_gui::relax_panel::Peak2D> = self
+            .peaks
+            .iter()
+            .filter(|p| Self::normalize_exp_key(&p.exp) == "HSQC")
+            .filter_map(|p| {
+                let mut best: Option<(f64, i32, &str)> = None;
+                for &(sh, sn, seq_id, rname) in &assigned_roots {
+                    let dh = (p.h - sh).abs();
+                    let dn = (p.n - sn).abs();
+                    if dh <= 0.05 && dn <= 0.50 {
+                        let d2 = (dh / 0.03).powi(2) + (dn / 0.30).powi(2);
+                        if best.is_none_or(|(bd2, _, _)| d2 < bd2) {
+                            best = Some((d2, seq_id, rname));
+                        }
+                    }
+                }
+                best.map(|(_, seq_id, rname)| {
+                    nmr_gui::relax_panel::Peak2D::from_core_peak(p, Some(seq_id), Some(rname))
+                })
+            })
+            .collect();
+
+        let _ = self
+            .relax_panel
+            .sync_assigned_hsqc_peaks(&hsqc_peaks_2d, &seq_str);
+    }
+
+    /// Pick 2D HSQC roots and then run real two-pass 3D triple-resonance peak picking across all
+    /// loaded 3D cubes, rebuilding `self.peaks` and `self.systems`.
+    fn pick_all_2d_and_3d_spectra(&mut self, snr_threshold: f64) {
+        self.picker_snr = snr_threshold as f32;
+        if self.hsqc_spec.is_some() {
+            self.pick_2d_roots();
+        }
+        let roots: Vec<Peak> = self
+            .peaks
+            .iter()
+            .filter(|p| Self::normalize_exp_key(&p.exp) == "HSQC")
+            .cloned()
+            .collect();
+        let n_roots = roots.len();
+        let n_cubes = self.cubes_3d.len();
+        if n_cubes > 0 && !roots.is_empty() {
+            let pcfg = PickerConfig {
+                snr_threshold: self.picker_snr,
+                ..PickerConfig::default()
+            };
+            let c_refs: Vec<&Spectrum3D> = self.cubes_3d.iter().map(|c| c.as_ref()).collect();
+            let p3 = pick_triple_3d_two_pass(
+                &c_refs,
+                &roots,
+                &pcfg,
+                &CorroboratedRepickConfig::default(),
+            );
+            let n_3d = p3.len();
+            let mut combined = roots;
+            combined.extend(p3);
+            self.peaks = combined;
+            self.session.state.peaks = self.peaks.clone();
+            if let Ok(sys) = build_spin_systems(&self.peaks, &Tolerances::default(), 3, false) {
+                self.systems = sys;
+            }
+            self.status_msg = format!(
+                "Picked {n_roots} 2D HSQC roots + {n_3d} 3D peaks across {n_cubes} cube(s) (SNR {snr_threshold:.1})"
+            );
+        } else {
+            self.status_msg = format!(
+                "Picked {n_roots} 2D roots ({n_cubes} 3D cube(s) loaded; SNR {snr_threshold:.1})"
+            );
+        }
+    }
+
+    /// Handle a 7-slot 3D assignment data-input mapper action from `AssignSetupDrawerState`.
+    fn apply_assign_slot_action(&mut self, action: AssignSlotAction) {
+        match action {
+            AssignSlotAction::LoadStudyFolder => {
+                self.arm_browser_picker_wakeup();
+                #[cfg(target_arch = "wasm32")]
+                trigger_browser_folder_picker();
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.show_native_global_open_bar = true;
+                }
+                self.status_msg =
+                    "Select a Bruker / NMRPipe / Sparky study folder to batch-load 2D & 3D spectra"
+                        .to_string();
+            }
+            AssignSlotAction::LoadSlotSpectrum(slot) => {
+                self.arm_browser_picker_wakeup();
+                #[cfg(target_arch = "wasm32")]
+                trigger_browser_files_picker();
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.show_native_global_open_bar = true;
+                }
+                self.status_msg =
+                    format!("Select spectrum file or Bruker directory for slot '{slot}'");
+            }
+            AssignSlotAction::ClearSlotSpectrum(slot) => {
+                let target_key = Self::normalize_exp_key(&slot);
+                self.peaks
+                    .retain(|p| Self::normalize_exp_key(&p.exp) != target_key);
+                self.session.state.peaks = self.peaks.clone();
+                if target_key == "HSQC" {
+                    self.hsqc_spec = None;
+                } else {
+                    self.cubes_3d
+                        .retain(|c| Self::normalize_exp_key(&c.exp) != target_key);
+                    if target_key == "HNCACB" {
+                        self.hncacb_3d = None;
+                    } else if target_key == "HNCO" {
+                        self.hnco_3d = None;
+                    } else if target_key == "HNCACO" {
+                        self.hncaco_3d = None;
+                    }
+                }
+                self.status_msg = format!("Cleared slot '{slot}'");
+            }
+            AssignSlotAction::ReassignSlotExperiment { from_slot, to_exp } => {
+                let from_key = Self::normalize_exp_key(&from_slot);
+                let to_key = Self::normalize_exp_key(&to_exp);
+                if from_key == to_key {
+                    return;
+                }
+                for p in &mut self.peaks {
+                    if Self::normalize_exp_key(&p.exp) == from_key {
+                        p.exp = to_exp.clone();
+                    }
+                }
+                self.session.state.peaks = self.peaks.clone();
+                for cube_arc in &mut self.cubes_3d {
+                    if Self::normalize_exp_key(&cube_arc.exp) == from_key {
+                        let mut cloned = (**cube_arc).clone();
+                        cloned.exp = to_exp.clone();
+                        *cube_arc = Arc::new(cloned);
+                    }
+                }
+                // Re-sync dedicated strip cube slots strictly by normalized experiment key.
+                self.hncacb_3d = None;
+                self.hnco_3d = None;
+                self.hncaco_3d = None;
+                for cube_arc in &self.cubes_3d {
+                    let k = Self::normalize_exp_key(&cube_arc.exp);
+                    if k == "HNCO" && self.hnco_3d.is_none() {
+                        self.hnco_3d = Some((**cube_arc).clone());
+                    } else if k == "HNCACO" && self.hncaco_3d.is_none() {
+                        self.hncaco_3d = Some((**cube_arc).clone());
+                    } else if k != "HNCO" && k != "HNCACO" && self.hncacb_3d.is_none() {
+                        self.hncacb_3d = Some((**cube_arc).clone());
+                    }
+                }
+                self.status_msg = format!("Reassigned '{from_slot}' -> '{to_exp}'");
+            }
+        }
+    }
+
     fn draw_v0171_windows_and_bridges(&mut self, ctx: &egui::Context) {
         // 1. In-app About & Verified Scientific References modal + Quantitative NMR Tools window
         self.about_references_modal.show(ctx);
@@ -16234,15 +16487,18 @@ impl NmrWorkbenchApp {
                 "HN(CA)CO",
             ];
             let count_peaks = |name: &str| -> usize {
+                let want = Self::normalize_exp_key(name);
                 self.peaks
                     .iter()
-                    .filter(|p| p.exp.eq_ignore_ascii_case(name))
+                    .filter(|p| Self::normalize_exp_key(&p.exp) == want)
                     .count()
             };
             let has_cube = |name: &str| -> bool {
-                self.cubes_3d
-                    .iter()
-                    .any(|c| c.exp.eq_ignore_ascii_case(name) || c.name.eq_ignore_ascii_case(name))
+                let want = Self::normalize_exp_key(name);
+                self.cubes_3d.iter().any(|c| {
+                    Self::normalize_exp_key(&c.exp) == want
+                        || Self::normalize_exp_key(&c.name) == want
+                })
             };
             for (idx, name) in canonical_names.iter().enumerate() {
                 let pc = count_peaks(name);
@@ -16250,6 +16506,7 @@ impl NmrWorkbenchApp {
                     || (*name == "HSQC" && self.hsqc_spec.is_some())
                     || (*name == "HNCACB" && self.hncacb_3d.is_some())
                     || (*name == "HNCO" && self.hnco_3d.is_some())
+                    || (*name == "HN(CA)CO" && self.hncaco_3d.is_some())
                     || has_cube(name);
                 exp_counts[idx] = (loaded, pc);
             }
@@ -16348,12 +16605,7 @@ impl NmrWorkbenchApp {
                             format!("Applied sequence ({} residues)", self.sequence.len());
                     }
                     AssignSetupAction::PickAllSpectra { snr_threshold } => {
-                        self.picker_snr = snr_threshold as f32;
-                        self.pick_2d_roots();
-                        let n_cubes = self.cubes_3d.len();
-                        self.status_msg = format!(
-                            "Picked 2D roots & refreshed {n_cubes} 3D cube(s) (SNR {snr_threshold:.1})"
-                        );
+                        self.pick_all_2d_and_3d_spectra(snr_threshold);
                     }
                     AssignSetupAction::RunAssignment {
                         engine,
@@ -16377,6 +16629,9 @@ impl NmrWorkbenchApp {
                         self.select_residue_and_sync_strip(res_idx);
                     }
                 }
+            }
+            for slot_act in self.assign_setup_drawer.take_slot_actions() {
+                self.apply_assign_slot_action(slot_act);
             }
         }
 
@@ -16425,7 +16680,7 @@ impl NmrWorkbenchApp {
             self.status_msg = format!("Sent '{label}' to 1D Suite");
         }
 
-        // 4. Open 1D Spectra -> Octet experimental_spectra sync
+        // 4. Open 1D Spectra -> Octet experimental_spectra sync (peak-preserving + real obs_freq_mhz)
         let exp_key = (
             self.stack1d_panel.traces.len(),
             self.stack1d_panel.ref_trace_idx,
@@ -16452,19 +16707,28 @@ impl NmrWorkbenchApp {
                         .map(f64::abs)
                         .fold(0.0f64, f64::max)
                         .max(1e-12);
-                    let stride = (ppms.len() / 1024).max(1);
-                    let custom_trace: Vec<[f64; 2]> = ppms
-                        .iter()
-                        .zip(vals.iter())
-                        .step_by(stride)
-                        .map(|(&x, &y)| [x, (y / max_y).clamp(-0.2, 1.0)])
-                        .collect();
+                    let norm_vals: Vec<f64> =
+                        vals.iter().map(|&y| (y / max_y).clamp(-0.2, 1.0)).collect();
+                    let custom_trace = nmr_core::octet_assign::decimate_trace_peak_preserving(
+                        ppms, &norm_vals, 1024,
+                    );
+                    let default_mhz = if nuc.eq_ignore_ascii_case("13C") {
+                        nmr_core::octet_assign::c13_frequency_mhz(600.0)
+                    } else {
+                        600.0
+                    };
+                    let spectrometer_mhz = tr
+                        .raw_spec
+                        .as_ref()
+                        .map(|a| a.0.axis.obs_mhz)
+                        .filter(|f| f.is_finite() && *f > 0.0)
+                        .unwrap_or(default_mhz);
                     SceneSpectrum1D {
                         origin: [0.0, 0.0],
                         width_mol: 10.0,
                         height_mol: 3.0,
                         nucleus: nuc,
-                        spectrometer_mhz: 600.0,
+                        spectrometer_mhz,
                         ppm_min: if p_min.is_finite() { p_min } else { -0.5 },
                         ppm_max: if p_max.is_finite() { p_max } else { 12.0 },
                         linewidth_hz: 1.5,
@@ -16478,62 +16742,33 @@ impl NmrWorkbenchApp {
                 .collect();
         }
 
-        // 5. 1D Suite `Predict 1H / 13C` quick request bridge
+        // 5. 1D Suite `Predict 1H / 13C` quick request bridge (pure, fail-closed, never clobbers Octet scene)
         if let Some((smiles, is_13c)) = self.stack1d_panel.pending_predict_1d_request.take() {
-            let trimmed = smiles.trim();
-            if !trimmed.is_empty() {
-                if let Ok(mut mol) = parse_smiles(trimmed) {
-                    clean_2d(&mut mol);
-                    let sc = CoreOctetBackendAdapter::mol_with_cip_to_scene(mol);
-                    self.octet_app.set_scene(sc);
+            let proton_mhz = self
+                .stack1d_panel
+                .traces
+                .get(self.stack1d_panel.ref_trace_idx)
+                .and_then(|tr| tr.raw_spec.as_ref())
+                .map(|a| {
+                    let f = a.0.axis.obs_mhz;
+                    if a.0.axis.label.eq_ignore_ascii_case("13C") && f > 0.0 {
+                        f / 0.251_45
+                    } else {
+                        f
+                    }
+                })
+                .filter(|f| f.is_finite() && *f > 0.0)
+                .unwrap_or(600.0);
+            match octet_canvas::predict_1d_from_smiles_standalone(&smiles, is_13c, proton_mhz) {
+                Ok((spec1d, label)) => {
+                    self.stack1d_panel
+                        .set_predicted_overlay(spec1d, label.clone());
+                    self.status_msg = format!("{label} overlay updated in 1D Suite");
+                }
+                Err(err) => {
+                    self.status_msg = format!("1D prediction failed: {err}");
                 }
             }
-            self.octet_app.nmr_tab = if is_13c {
-                octet_canvas::NmrViewTab::Carbon13C
-            } else {
-                octet_canvas::NmrViewTab::Proton1H
-            };
-            self.octet_app.recompute_live_analytics();
-            let scene_spec = self.octet_app.build_active_scene_spectrum_1d();
-            let n_pts = 1024usize;
-            let lo = scene_spec.ppm_min.min(scene_spec.ppm_max);
-            let hi = scene_spec.ppm_min.max(scene_spec.ppm_max);
-            let span = (hi - lo).max(1.0);
-            let gamma = if is_13c { 0.15 } else { 0.018 };
-            let mut data = vec![0.0f64; n_pts];
-            for (i, slot) in data.iter_mut().enumerate() {
-                let t = (i as f64) / ((n_pts - 1) as f64);
-                let x = hi - t * span;
-                let mut y = 0.0f64;
-                for sig in &scene_spec.signals {
-                    let dx = x - sig.ppm;
-                    y += sig.integral / (1.0 + (dx / gamma).powi(2));
-                }
-                *slot = y;
-            }
-            let nuc = if is_13c { "13C" } else { "1H" };
-            let kind = if is_13c {
-                nmr_core::nmr1d::Experiment1DKind::Carbon13Decoupled
-            } else {
-                nmr_core::nmr1d::Experiment1DKind::Proton1D
-            };
-            let axis = nmr_core::spectrum::AxisPpm::from_bounds(
-                nuc,
-                n_pts,
-                hi,
-                lo,
-                scene_spec.spectrometer_mhz,
-            );
-            let spec1d = nmr_core::nmr1d::Spectrum1D::new(
-                format!("Predicted {nuc}"),
-                kind,
-                axis,
-                data,
-                None,
-            );
-            self.stack1d_panel
-                .set_predicted_overlay(spec1d, format!("Predicted {nuc}"));
-            self.status_msg = format!("Predicted {nuc} overlay updated in 1D Suite");
         }
 
         // 6. Metabolomics -> Octet SMILES bridge
@@ -16553,54 +16788,16 @@ impl NmrWorkbenchApp {
             }
         }
 
-        // 7. Assign -> Dynamics (`Relax`) assigned HSQC peak sync
-        let relax_key = (self.peaks.len(), self.sequence.len());
+        // 7. Assign -> Dynamics (`Relax`) assigned HSQC peak sync (real solver assignments only)
+        let relax_key = (
+            self.peaks.len(),
+            self.sequence.len(),
+            self.assign_res_fingerprint(),
+        );
         if self.workbench_mode == WorkbenchMode::Dynamics && relax_key != self.relax_peaks_sync_key
         {
             self.relax_peaks_sync_key = relax_key;
-            let seq_str: String = self
-                .sequence
-                .iter()
-                .map(|s| match s.to_ascii_uppercase().as_str() {
-                    "ALA" | "A" => 'A',
-                    "ARG" | "R" => 'R',
-                    "ASN" | "N" => 'N',
-                    "ASP" | "D" => 'D',
-                    "CYS" | "C" => 'C',
-                    "GLN" | "Q" => 'Q',
-                    "GLU" | "E" => 'E',
-                    "GLY" | "G" => 'G',
-                    "HIS" | "H" => 'H',
-                    "ILE" | "I" => 'I',
-                    "LEU" | "L" => 'L',
-                    "LYS" | "K" => 'K',
-                    "MET" | "M" => 'M',
-                    "PHE" | "F" => 'F',
-                    "PRO" | "P" => 'P',
-                    "SER" | "S" => 'S',
-                    "THR" | "T" => 'T',
-                    "TRP" | "W" => 'W',
-                    "TYR" | "Y" => 'Y',
-                    "VAL" | "V" => 'V',
-                    _ => 'X',
-                })
-                .collect();
-            let hsqc_peaks_2d: Vec<nmr_gui::relax_panel::Peak2D> = self
-                .peaks
-                .iter()
-                .filter(|p| p.exp.eq_ignore_ascii_case("HSQC"))
-                .enumerate()
-                .map(|(idx, p)| {
-                    nmr_gui::relax_panel::Peak2D::from_core_peak(
-                        p,
-                        Some((idx + 1) as i32),
-                        self.sequence.get(idx).map(|s| s.as_str()),
-                    )
-                })
-                .collect();
-            let _ = self
-                .relax_panel
-                .sync_assigned_hsqc_peaks(&hsqc_peaks_2d, &seq_str);
+            self.sync_assigned_hsqc_peaks_to_relax();
         }
     }
 
@@ -17929,6 +18126,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             hsqc_gen: 1,
             hncacb_3d: None,
             hnco_3d: None,
+            hncaco_3d: None,
             cubes_3d: Vec::new(),
             active_cube_idx: None,
             cube_slice: Cube3dSliceState::default(),
@@ -17972,7 +18170,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             about_references_modal: AboutReferencesModal::new(),
             p22_tools_panel: P22ToolsPanel::new(),
             octet_exp_sync_key: (0, usize::MAX),
-            relax_peaks_sync_key: (0, 0),
+            relax_peaks_sync_key: (0, 0, u64::MAX),
             mcp_last_viewport_key: (0, 0, 0, -1),
             assign_target_res: 0,
             assign_lock_check: true,
@@ -20211,5 +20409,102 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             audit_dag.texts.iter().any(|t| t.text.contains("Valid DAG")),
             "expected Valid DAG status banner inside open Workflow DAG Composer window"
         );
+    }
+
+    #[test]
+    fn test_v0171_fix1_main_wiring_assign_relax_hncaco_and_octet_predict() {
+        use super::*;
+        use nmr_core::peaks::Peak;
+        use nmr_core::solver::AssignResult;
+        use nmr_core::spectrum::{AxisPpm, Spectrum3D};
+        use nmr_core::spinsystems::SpinSystem;
+        use std::sync::Arc;
+
+        let mut app = make_headless_test_app();
+
+        // 1. Parenthesis-normalized experiment key matching (171.assign:P1-5).
+        assert_eq!(NmrWorkbenchApp::normalize_exp_key("CBCA(CO)NH"), "CBCACONH");
+        assert_eq!(NmrWorkbenchApp::normalize_exp_key("CBCACONH"), "CBCACONH");
+        assert_eq!(NmrWorkbenchApp::normalize_exp_key("HN(CO)CA"), "HNCOCA");
+        assert_eq!(NmrWorkbenchApp::normalize_exp_key("HN(CA)CO"), "HNCACO");
+        assert_eq!(NmrWorkbenchApp::normalize_exp_key("15N-HSQC"), "HSQC");
+
+        // 2. Assign -> Relax sync uses real assign_res (never fabricates idx+1 when unassigned)
+        //    and invalidates fingerprint when assign_res changes (171.assign:P0-1).
+        app.sequence = vec!["MET".into(), "GLN".into(), "GLY".into()];
+        app.seq_ids = vec![10, 11, 42];
+        app.peaks = vec![Peak {
+            exp: "HSQC".into(),
+            h: 8.32,
+            n: 112.4,
+            c: None,
+            sign: 1,
+            height: Some(1.0e5),
+            volume: None,
+            h2: None,
+        }];
+        app.systems = vec![SpinSystem::new(8.32, 112.4)];
+        app.assign_res = None;
+        let fp_unassigned = app.assign_res_fingerprint();
+        app.sync_assigned_hsqc_peaks_to_relax();
+        assert!(
+            app.relax_panel.synced_peak_seeds.is_empty(),
+            "unassigned HSQC peaks must not fabricate residue IDs in RelaxPanel"
+        );
+
+        app.assign_res = Some(AssignResult {
+            position: vec![2],
+            confidence: vec![0.97],
+            score: 12.3,
+            run_scores: vec![12.3],
+        });
+        let fp_assigned = app.assign_res_fingerprint();
+        assert_ne!(
+            fp_unassigned, fp_assigned,
+            "assign_res_fingerprint must change when solver results update"
+        );
+        app.sync_assigned_hsqc_peaks_to_relax();
+        assert_eq!(app.relax_panel.synced_peak_seeds.len(), 1);
+        assert_eq!(app.relax_panel.synced_peak_seeds[0].seq_id, 42);
+        assert_eq!(app.relax_panel.synced_peak_seeds[0].res_name, "GLY");
+
+        // 3. Reassigning HNCO -> HN(CA)CO routes strictly to hncaco_3d, never hnco_3d (171.assign:P1-7).
+        let dummy_axis_h = AxisPpm::from_bounds("1H", 4, 10.0, 6.0, 600.0);
+        let dummy_axis_n = AxisPpm::from_bounds("15N", 4, 130.0, 105.0, 60.8);
+        let dummy_axis_c = AxisPpm::from_bounds("13C", 4, 180.0, 168.0, 150.9);
+        let cube = Spectrum3D {
+            name: "demo_hnco".into(),
+            exp: "HNCO".into(),
+            axis_x: dummy_axis_h,
+            axis_y: dummy_axis_n,
+            axis_z: dummy_axis_c,
+            data: vec![0.0f32; 64],
+        };
+        app.cubes_3d.clear();
+        app.cubes_3d.push(Arc::new(cube.clone()));
+        app.hnco_3d = Some(cube);
+        app.hncaco_3d = None;
+        app.apply_assign_slot_action(AssignSlotAction::ReassignSlotExperiment {
+            from_slot: "HNCO".into(),
+            to_exp: "HN(CA)CO".into(),
+        });
+        assert!(
+            app.hnco_3d.is_none(),
+            "HN(CA)CO cube must never remain in hnco_3d"
+        );
+        assert!(
+            app.hncaco_3d.is_some(),
+            "HN(CA)CO cube must route into dedicated hncaco_3d slot"
+        );
+
+        // 4. Invalid SMILES in 1D Suite quick predict fails closed without clobbering Octet scene (171.octet:P1-3).
+        let scene_before = app.octet_app.scene.clone();
+        assert!(nmr_gui::octet_canvas::predict_1d_from_smiles_standalone(
+            "NOT_A_SMILES(((",
+            false,
+            600.0
+        )
+        .is_err());
+        assert_eq!(app.octet_app.scene.atoms.len(), scene_before.atoms.len());
     }
 }
