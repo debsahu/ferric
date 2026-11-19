@@ -90,6 +90,33 @@ pub const MIN_TWO_LN_BF_VS_NULL: f64 = 10.0;
 /// Maximum reduced `chi^2_nu` permitted on `H_{(1)}` to commit (`<= 2.5`).
 pub const MAX_COMMITTED_REDUCED_CHI2: f64 = 2.5;
 
+/// One-sided confidence level of the `chi^2_{p, nu}` upper bound used by the error-scale
+/// consistency diagnostic (`p = 0.99`, i.e. a 1% false-alarm rate under correctly stated errors).
+pub const ERROR_SCALE_CHI2_CONFIDENCE: f64 = 0.99;
+
+/// Outlier clip (in robust-scale units) for the internal error-scale check: a best-model residual
+/// is treated as a localized unmodeled-exchange outlier when `|z| > 3.5 * max(1, s_MAD)`, where
+/// `s_MAD = median(|z|) / 0.674490` is the robust (median absolute deviation) scale of the
+/// standardized residuals. `3.5` matches the unmodeled-exchange Bayes-factor threshold. Clipping
+/// relative to the robust scale (sigma clipping) keeps a GLOBAL error under-statement (all `|z|`
+/// inflated, `s_MAD ~ 2-3`) inside the inlier set while removing a few LOCALIZED exchanging sites
+/// (`s_MAD ~ 1`). Under correctly stated Gaussian errors `P(|z| > 3.5) = 4.7e-4` and `E[z^2]`
+/// drops by only `0.6%`, so the `chi^2` bound stays (slightly) conservative.
+pub const ERROR_SCALE_OUTLIER_ABS_Z: f64 = 3.5;
+
+/// A best-model site is a "spectator" (internal error-scale control) when its likelihood sigma is
+/// within `5%` of the stated experimental error, i.e. the forward-model term contributes `< 32%`
+/// of it in quadrature.
+const SPECTATOR_SIGMA_RATIO: f64 = 1.05;
+
+/// Minimum number of inlier spectator sites for the internal error-scale check; with fewer, the
+/// all-site best-model `chi^2` (`nu = n_obs - k`) is used instead.
+pub const MIN_ERROR_SCALE_SPECTATOR_SITES: usize = 5;
+
+/// Median of the half-normal distribution `|N(0, 1)|` (`Phi^{-1}(0.75)`), the MAD consistency
+/// constant.
+const HALF_NORMAL_MEDIAN: f64 = 0.674_489_750_196_081_7;
+
 /// Spatial `CA-CA` cutoff (`8.0 A`) for `H2: XxxProCisTrans` candidate Proline scanning.
 pub const PROLINE_SPATIAL_CUTOFF_ANGSTROM: f64 = 8.0;
 
@@ -401,6 +428,10 @@ pub enum ExcitedStateAbstentionKind {
     ConsistentWithNoise,
     UnmodeledSignificantExchange,
     AmbiguousBetweenMechanisms,
+    /// The stated `dw_err_ppm` are statistically inconsistent with the data (best-model inlier or
+    /// control-site `chi^2_nu` above the `chi^2_{0.99, nu}` bound), so neither a committed
+    /// mechanism nor `UnmodeledSignificantExchange` can be reported as a confident call.
+    ErrorScaleInconsistent,
 }
 
 impl ExcitedStateAbstentionKind {
@@ -411,6 +442,7 @@ impl ExcitedStateAbstentionKind {
             Self::ConsistentWithNoise => "ConsistentWithNoise",
             Self::UnmodeledSignificantExchange => "UnmodeledSignificantExchange",
             Self::AmbiguousBetweenMechanisms => "AmbiguousBetweenMechanisms",
+            Self::ErrorScaleInconsistent => "ErrorScaleInconsistent",
         }
     }
 }
@@ -510,13 +542,64 @@ impl Default for ExcitedStateConfig {
 pub struct Chi2ConsistencyDiagnostic {
     pub h0_reduced_chi2: f64,
     pub top1_reduced_chi2: f64,
+    /// `chi^2_{0.99, nu}/nu` bound for the best-fitting model over all sites (`nu = n_obs - k`).
     pub consistency_upper_bound: f64,
+    /// `H0` reduced `chi^2_nu` above its own `chi^2_{0.99, n_obs}/n_obs` bound. This is evidence of
+    /// exchange OR of under-stated errors and is informational only (it never fires the warning).
     pub h0_exceeds_consistency_bound: bool,
+    /// Best-fitting model reduced `chi^2_nu` above [`Self::consistency_upper_bound`] (all sites).
     pub top1_exceeds_consistency_bound: bool,
     pub implied_error_scale_factor_h0: f64,
     pub implied_error_scale_factor_top1: f64,
     #[serde(default)]
     pub error_scale_warning: Option<String>,
+    /// One-sided confidence level of every `chi^2` bound ([`ERROR_SCALE_CHI2_CONFIDENCE`]).
+    #[serde(default)]
+    pub confidence_level: f64,
+    /// Best-fitting hypothesis and its degrees of freedom `nu = n_obs - k_params`.
+    #[serde(default)]
+    pub top1_hypothesis: Option<ExcitedStateHypothesisKind>,
+    #[serde(default)]
+    pub top1_dof: usize,
+    /// `chi^2_{0.99, n_obs}/n_obs` bound for `H0` (`k = 0`).
+    #[serde(default)]
+    pub h0_consistency_upper_bound: f64,
+    /// Best-model sites predicting `dw = 0` (`sigma_tot <= 1.05 dw_err`): internal controls.
+    #[serde(default)]
+    pub n_spectator_sites: usize,
+    /// Robust scale `s_MAD = median(|z|) / 0.674490` of the best model's spectator residuals.
+    #[serde(default)]
+    pub robust_scale_mad: f64,
+    /// Spectator-site residuals with `|z| > 3.5 * max(1, s_MAD)` excluded as localized outliers.
+    #[serde(default)]
+    pub n_outlier_sites_excluded: usize,
+    /// Reduced `chi^2_nu` of the best model over its inlier spectator sites (predicted `dw = 0`,
+    /// `sigma = dw_err`; `nu = n_inliers`) when `>= 5` inliers form a majority of spectators
+    /// (internal controls); `None` otherwise.
+    #[serde(default)]
+    pub inlier_reduced_chi2: Option<f64>,
+    #[serde(default)]
+    pub inlier_dof: Option<usize>,
+    #[serde(default)]
+    pub inlier_consistency_upper_bound: Option<f64>,
+    /// Supplied non-exchanging control sites (`site_role = control`, expected `dw = 0`).
+    #[serde(default)]
+    pub n_control_sites: usize,
+    #[serde(default)]
+    pub control_reduced_chi2: Option<f64>,
+    #[serde(default)]
+    pub control_consistency_upper_bound: Option<f64>,
+    #[serde(default)]
+    pub control_exceeds_consistency_bound: Option<bool>,
+    /// Which statistic decided [`Self::error_scale_inconsistent`]: `control_sites`,
+    /// `best_model_spectator_inliers`, or `best_model_all_sites`.
+    #[serde(default)]
+    pub error_scale_evidence: String,
+    /// `true` when the stated errors are statistically inconsistent with the data; the verdict is
+    /// then downgraded to [`ExcitedStateAbstentionKind::ErrorScaleInconsistent`] for committed,
+    /// `UnmodeledSignificantExchange` and `ConsistentWithNoise` outcomes.
+    #[serde(default)]
+    pub error_scale_inconsistent: bool,
 }
 
 /// Complete Bayesian excited-state structural classification report.
@@ -633,6 +716,128 @@ pub fn unsigned_folded_student_t5_log_likelihood(
     Ok(ll)
 }
 
+// ----------------------------------------------------------------------------
+// chi^2 distribution (error-scale consistency diagnostic, `21F:B19`)
+// ----------------------------------------------------------------------------
+
+/// Lanczos (`g = 7`, `n = 9`) `ln Gamma(z)` for `z > 0` (Press et al., *Numerical Recipes* 3rd
+/// ed., section 6.1), accurate to `~1e-15` relative.
+fn ln_gamma_lanczos(z: f64) -> f64 {
+    const COEFFS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if z < 0.5 {
+        // Reflection: Gamma(z) Gamma(1 - z) = pi / sin(pi z)
+        return (PI / (PI * z).sin()).ln() - ln_gamma_lanczos(1.0 - z);
+    }
+    let zm = z - 1.0;
+    let mut x = COEFFS[0];
+    for (i, &c) in COEFFS.iter().enumerate().skip(1) {
+        x += c / (zm + i as f64);
+    }
+    let t = zm + 7.5;
+    0.5 * (2.0 * PI).ln() + (zm + 0.5) * t.ln() - t + x.ln()
+}
+
+/// Regularized lower incomplete gamma `P(a, x)` (series for `x < a + 1`, Lentz continued
+/// fraction for the complement otherwise; *Numerical Recipes* section 6.2).
+fn regularized_lower_gamma(a: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let ln_pref = -x + a * x.ln() - ln_gamma_lanczos(a);
+    if x < a + 1.0 {
+        let mut term = 1.0 / a;
+        let mut sum = term;
+        let mut ap = a;
+        for _ in 0..10_000 {
+            ap += 1.0;
+            term *= x / ap;
+            sum += term;
+            if term.abs() < sum.abs() * 1e-16 {
+                break;
+            }
+        }
+        (sum * ln_pref.exp()).clamp(0.0, 1.0)
+    } else {
+        const FPMIN: f64 = 1e-300;
+        let mut b = x + 1.0 - a;
+        let mut c = 1.0 / FPMIN;
+        let mut d = 1.0 / b;
+        let mut h = d;
+        for i in 1..10_000 {
+            let an = -(i as f64) * (i as f64 - a);
+            b += 2.0;
+            d = an * d + b;
+            if d.abs() < FPMIN {
+                d = FPMIN;
+            }
+            c = b + an / c;
+            if c.abs() < FPMIN {
+                c = FPMIN;
+            }
+            d = 1.0 / d;
+            let del = d * c;
+            h *= del;
+            if (del - 1.0).abs() < 1e-16 {
+                break;
+            }
+        }
+        (1.0 - ln_pref.exp() * h).clamp(0.0, 1.0)
+    }
+}
+
+/// Cumulative distribution function of the `chi^2_nu` distribution, `P(nu/2, x/2)`.
+pub fn chi2_cdf(x: f64, dof: f64) -> f64 {
+    if !(x.is_finite() && dof.is_finite()) || dof <= 0.0 || x <= 0.0 {
+        return 0.0;
+    }
+    regularized_lower_gamma(0.5 * dof, 0.5 * x)
+}
+
+/// Exact `p`-quantile `chi^2_{p, nu}` (`P(X <= q) = p`) by bisection on [`chi2_cdf`] to `1e-12`
+/// relative precision. (Wilson & Hilferty 1931 is used only to seed the upper bracket.)
+pub fn chi2_upper_quantile(p: f64, dof: f64) -> f64 {
+    if !(p.is_finite() && dof.is_finite()) || dof <= 0.0 || p <= 0.0 {
+        return 0.0;
+    }
+    let p = p.min(1.0 - 1e-15);
+    // Wilson-Hilferty seed with a generous z (covers p <= 1 - 1e-15)
+    let k = dof;
+    let wh = k * (1.0 - 2.0 / (9.0 * k) + 8.3 * (2.0 / (9.0 * k)).sqrt()).powi(3);
+    let mut hi = wh.max(k + 10.0 * (2.0 * k).sqrt() + 10.0);
+    while chi2_cdf(hi, dof) < p {
+        hi *= 2.0;
+    }
+    let mut lo = 0.0_f64;
+    for _ in 0..400 {
+        let mid = 0.5 * (lo + hi);
+        if chi2_cdf(mid, dof) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if hi - lo <= 1e-12 * hi.max(1e-300) {
+            break;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// Reduced-`chi^2` upper bound `chi^2_{p, nu} / nu` at [`ERROR_SCALE_CHI2_CONFIDENCE`].
+fn reduced_chi2_upper_bound(dof: usize) -> f64 {
+    let nu = dof.max(1) as f64;
+    chi2_upper_quantile(ERROR_SCALE_CHI2_CONFIDENCE, nu) / nu
+}
+
 /// Baseline differential forward-model uncertainty `sigma_{fwd,a}` (ppm) for `Delta_varpi_AB`
 /// (shared across all hypotheses `H0..H4` so spectator residues with `mu_Delta == 0` carry zero
 /// `ln(sigma)` bias between competing models).
@@ -663,6 +868,41 @@ pub fn differential_forward_sigma_ppm(res_name: &str, atom: &str) -> f64 {
 // ============================================================================
 // 2. Atom Normalization, Shift Parsing (`NMR-STAR` / `NEF`) & Exchange TSV I/O
 // ============================================================================
+
+/// Canonical nucleus keys for which the differential forward model has explicit physics
+/// (`differential_forward_sigma_ppm`, ring-current, H-bond, `ncIDP` random-coil, `Xxx-Pro`,
+/// aromatic-rotamer and His-tautomer generators): backbone `N`/`H`/`CA`/`CB`/`C`/`HA(2/3)`,
+/// side-chain carbons, His/Trp ring nitrogens, aromatic ring protons and `ILVMAT` methyl
+/// pseudo-atoms. Any other atom string is rejected (fail closed) instead of being scored with a
+/// generic fallback sigma (`21F:B9`).
+pub const SUPPORTED_EXCHANGE_ATOMS: &[&str] = &[
+    "N", "H", "CA", "CB", "C", "HA", "HA2", "HA3", "CG", "CG1", "CG2", "CD", "CD1", "CD2", "CE",
+    "CE1", "CE2", "CE3", "CZ", "CZ2", "CZ3", "CH2", "ND1", "NE2", "NE1", "HD1", "HD2", "HE1",
+    "HE2", "HZ", "HZ2", "HZ3", "HH2", "HB*", "HG1*", "HG2*", "HD1*", "HD2*", "HE*",
+];
+
+/// Static (non-echoing) error text for an exchange observation whose atom is outside
+/// [`SUPPORTED_EXCHANGE_ATOMS`].
+pub const UNSUPPORTED_EXCHANGE_ATOM_MESSAGE: &str = "unsupported exchange nucleus: atom is not in the supported set (N, H, CA, CB, C, HA/HA2/HA3, side-chain C, His ND1/NE2, Trp NE1, aromatic ring H, methyl HB*/HG1*/HG2*/HD1*/HD2*/HE*)";
+
+/// Whether an already-canonicalized atom key is modeled by the excited-state forward physics.
+pub fn is_supported_exchange_atom(canonical_atom: &str) -> bool {
+    SUPPORTED_EXCHANGE_ATOMS.contains(&canonical_atom)
+}
+
+/// Parser-side check when the residue type may be unknown: accept atoms that are supported
+/// directly or that canonicalize onto a supported methyl / glycine pseudo-atom for some residue.
+fn is_supported_exchange_atom_any_residue(res_name: Option<&str>, raw_atom: &str) -> bool {
+    if is_supported_exchange_atom(&canonicalize_exchange_atom_name(res_name, raw_atom)) {
+        return true;
+    }
+    res_name.is_none()
+        && ["ILE", "LEU", "VAL", "THR", "MET", "ALA", "GLY"]
+            .iter()
+            .any(|rn| {
+                is_supported_exchange_atom(&canonicalize_exchange_atom_name(Some(rn), raw_atom))
+            })
+}
 
 /// Canonicalize IUPAC / spectrometer atom names onto FERRIC's shift keys.
 pub fn canonicalize_exchange_atom_name(res_name: Option<&str>, raw_atom: &str) -> String {
@@ -724,6 +964,10 @@ pub struct ParsedExchangeTable {
     pub observations: Vec<ExchangeShiftObservation>,
     pub cpmg_prefiltered_significant_only: bool,
     pub n_filtered_nonsignificant_cpmg_rows: usize,
+    /// Rows tagged `site_role = control` (or `control = true`): non-exchanging reference sites
+    /// whose fitted `dw` (expected `0`) and stated `dw_err_ppm` calibrate the error scale.
+    #[serde(default)]
+    pub control_observations: Vec<ExchangeShiftObservation>,
 }
 
 /// Parse [`ExchangeShiftObservation`] rows and metadata from TSV text, rejecting any duplicate
@@ -740,6 +984,7 @@ pub fn parse_exchange_observations_tsv_with_meta(
 
     let mut header_map: Option<BTreeMap<String, usize>> = None;
     let mut out = Vec::new();
+    let mut controls = Vec::new();
     let mut seen_keys: BTreeSet<(String, i32, String)> = BTreeSet::new();
     let mut cpmg_prefiltered_significant_only = false;
     let mut n_filtered_nonsignificant_cpmg_rows = 0usize;
@@ -771,6 +1016,7 @@ pub fn parse_exchange_observations_tsv_with_meta(
             }
         }
 
+        let mut is_control = false;
         let obs = if let Some(ref hm) = header_map {
             let get_col = |names: &[&str]| -> Option<&str> {
                 for &nm in names {
@@ -795,6 +1041,19 @@ pub fn parse_exchange_observations_tsv_with_meta(
                 }
             }
 
+            if let Some(role) = get_col(&["site_role", "role"]) {
+                is_control = match role.to_ascii_lowercase().as_str() {
+                    "control" | "reference" | "non_exchanging" => true,
+                    "exchange" | "exchanging" => false,
+                    _ => {
+                        return Err(format!(
+                            "line {line_no}: site_role must be 'exchange' or 'control'"
+                        ));
+                    }
+                };
+            } else if let Some(flag) = get_col(&["control", "is_control"]) {
+                is_control = flag.eq_ignore_ascii_case("true") || flag == "1";
+            }
             let chain_id = get_col(&["chain_id", "chain"]).unwrap_or("A").to_string();
             let seq_str = get_col(&["seq_id", "resi", "res_seq"])
                 .ok_or_else(|| format!("line {line_no}: missing seq_id column"))?;
@@ -803,6 +1062,11 @@ pub fn parse_exchange_observations_tsv_with_meta(
                 .map_err(|e| format!("line {line_no}: invalid seq_id '{seq_str}': {e}"))?;
             let res_name = get_col(&["res_name", "resn", "comp_id"]).map(str::to_ascii_uppercase);
             let raw_atom = get_col(&["atom", "atom_id", "nucleus"]).unwrap_or("N");
+            if !is_supported_exchange_atom_any_residue(res_name.as_deref(), raw_atom) {
+                return Err(format!(
+                    "line {line_no}: {UNSUPPORTED_EXCHANGE_ATOM_MESSAGE}"
+                ));
+            }
             let atom = canonicalize_exchange_atom_name(res_name.as_deref(), raw_atom);
 
             let has_abs_col = get_col(&["abs_dw_ppm"]).is_some();
@@ -887,6 +1151,11 @@ pub fn parse_exchange_observations_tsv_with_meta(
                 .map_err(|e| format!("line {line_no}: invalid seq_id '{}': {e}", cols[0]))?;
             let res_name =
                 (!cols[1].is_empty() && cols[1] != ".").then(|| cols[1].to_ascii_uppercase());
+            if !is_supported_exchange_atom_any_residue(res_name.as_deref(), cols[2]) {
+                return Err(format!(
+                    "line {line_no}: {UNSUPPORTED_EXCHANGE_ATOM_MESSAGE}"
+                ));
+            }
             let atom = canonicalize_exchange_atom_name(res_name.as_deref(), cols[2]);
             let dw_ppm: f64 = cols[3]
                 .parse()
@@ -929,12 +1198,16 @@ pub fn parse_exchange_observations_tsv_with_meta(
             ));
         }
 
-        if out.len() >= MAX_EXCHANGE_OBSERVATIONS {
+        if out.len() + controls.len() >= MAX_EXCHANGE_OBSERVATIONS {
             return Err(format!(
                 "exchange dataset exceeds maximum observation limit ({MAX_EXCHANGE_OBSERVATIONS})"
             ));
         }
-        out.push(obs);
+        if is_control {
+            controls.push(obs);
+        } else {
+            out.push(obs);
+        }
     }
 
     if out.is_empty() {
@@ -944,6 +1217,7 @@ pub fn parse_exchange_observations_tsv_with_meta(
         observations: out,
         cpmg_prefiltered_significant_only,
         n_filtered_nonsignificant_cpmg_rows,
+        control_observations: controls,
     })
 }
 
@@ -1020,12 +1294,21 @@ pub fn format_excited_state_tsv(report: &ExcitedStateReport) -> String {
     ));
     if let Some(ref diag) = report.chi2_consistency_diagnostic {
         out.push_str(&format!(
-            "# chi2_consistency_diagnostic: h0_rchi2={:.4}\ttop1_rchi2={:.4}\tbound={:.4}\timplied_scale_h0={:.2}x\timplied_scale_top1={:.2}x\n",
+            "# chi2_consistency_diagnostic: h0_rchi2={:.4}\ttop1_rchi2={:.4}\ttop1_dof={}\tbound={:.4}\timplied_scale_h0={:.2}x\timplied_scale_top1={:.2}x\tinlier_rchi2={}\tcontrol_rchi2={}\tevidence={}\terror_scale_inconsistent={}\n",
             diag.h0_reduced_chi2,
             diag.top1_reduced_chi2,
+            diag.top1_dof,
             diag.consistency_upper_bound,
             diag.implied_error_scale_factor_h0,
-            diag.implied_error_scale_factor_top1
+            diag.implied_error_scale_factor_top1,
+            diag.inlier_reduced_chi2
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "NA".to_string()),
+            diag.control_reduced_chi2
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "NA".to_string()),
+            diag.error_scale_evidence,
+            diag.error_scale_inconsistent
         ));
     }
     if let Some(ref warn) = report.error_scale_warning {
@@ -2861,6 +3144,53 @@ pub fn classify_excited_state_with_firewall(
     firewall_query: &HomologFirewallQuery,
     cfg: &ExcitedStateConfig,
 ) -> Result<ExcitedStateReport, String> {
+    classify_excited_state_with_controls(
+        ground_shifts,
+        ground_structure,
+        observations,
+        &[],
+        alt_structures,
+        firewall_query,
+        cfg,
+    )
+}
+
+/// Classify an invisible excited protein state, additionally calibrating the stated experimental
+/// error scale on non-exchanging `control_sites` (expected `Delta_varpi = 0`; e.g. rows tagged
+/// `site_role = control` in the exchange TSV). With controls supplied, their
+/// `chi^2 = sum (dw / dw_err)^2` against the `chi^2_{0.99, n_ctrl}` bound decides whether the
+/// stated errors are consistent; otherwise the best model's inlier residuals are used.
+pub fn classify_excited_state_with_controls(
+    ground_shifts: Option<&Reference>,
+    ground_structure: &StructureModel,
+    observations: &[ExchangeShiftObservation],
+    control_sites: &[ExchangeShiftObservation],
+    alt_structures: &[AltConformerInput],
+    firewall_query: &HomologFirewallQuery,
+    cfg: &ExcitedStateConfig,
+) -> Result<ExcitedStateReport, String> {
+    if control_sites.len() > MAX_EXCHANGE_OBSERVATIONS {
+        return Err(format!(
+            "control_sites length ({}) exceeds limit ({MAX_EXCHANGE_OBSERVATIONS})",
+            control_sites.len()
+        ));
+    }
+    let mut control_sum_z2 = 0.0_f64;
+    for (ci, c) in control_sites.iter().enumerate() {
+        if !is_supported_exchange_atom_any_residue(c.res_name.as_deref(), &c.atom) {
+            return Err(format!(
+                "control site #{ci}: {UNSUPPORTED_EXCHANGE_ATOM_MESSAGE}"
+            ));
+        }
+        if !c.dw_ppm.is_finite() || !c.dw_err_ppm.is_finite() || c.dw_err_ppm <= 0.0 {
+            return Err(format!(
+                "control site #{ci} has non-finite dw_ppm or non-positive dw_err_ppm"
+            ));
+        }
+        // Signed: z = dw / err. Unsigned |dw| under no exchange has the same second moment.
+        let z = c.dw_ppm / c.dw_err_ppm;
+        control_sum_z2 += z * z;
+    }
     if ground_structure.residues.is_empty() {
         return Err("ground_structure contains zero residues".to_string());
     }
@@ -2931,6 +3261,11 @@ pub fn classify_excited_state_with_firewall(
     let mut seen_resolved_keys: BTreeSet<(String, i32, String)> = BTreeSet::new();
 
     for (oi, obs) in observations.iter().enumerate() {
+        if !is_supported_exchange_atom_any_residue(obs.res_name.as_deref(), &obs.atom) {
+            return Err(format!(
+                "observation #{oi}: {UNSUPPORTED_EXCHANGE_ATOM_MESSAGE}"
+            ));
+        }
         if !obs.dw_ppm.is_finite() || !obs.dw_err_ppm.is_finite() || obs.dw_err_ppm <= 0.0 {
             return Err(format!(
                 "observation #{oi} (seq_id={}, atom='{}') has invalid dw_ppm={} or dw_err_ppm={}",
@@ -2992,6 +3327,12 @@ pub fn classify_excited_state_with_firewall(
         }
 
         let canon_atom = canonicalize_exchange_atom_name(Some(&r_struct.res_name), &obs.atom);
+        if !is_supported_exchange_atom(&canon_atom) {
+            return Err(format!(
+                "observation #{oi} (seq_id={}): {UNSUPPORTED_EXCHANGE_ATOM_MESSAGE}",
+                obs.seq_id
+            ));
+        }
         if !seen_resolved_keys.insert((
             r_struct.chain_id.clone(),
             r_struct.seq_id,
@@ -3321,21 +3662,149 @@ pub fn classify_excited_state_with_firewall(
         )
     };
 
-    let consistency_upper_bound =
-        (1.0 + 2.576 * (2.0 / (n_obs.max(1) as f64)).sqrt()).min(cfg.max_reduced_chi2);
-    let h0_exceeds_consistency_bound = h0_reduced_chi2 > consistency_upper_bound;
+    // ------------------------------------------------------------------------
+    // Error-scale consistency (`21F:B19`). Evidence of MIS-SPECIFIED errors only:
+    //   (i)  supplied control sites: chi^2_ctrl > chi^2_{0.99, n_ctrl};
+    //   (ii) otherwise the best-fitting model's residuals at its spectator sites (predicted
+    //        Delta_varpi = 0, so sigma = dw_err only) after robust sigma clipping
+    //        (|z| <= 3.5 x max(1, s_MAD)), when >= 5 inliers form a majority of spectators:
+    //        chi^2 > chi^2_{0.99, n_in};
+    //   (iii) otherwise all sites: chi^2 > chi^2_{0.99, n_obs - k}.
+    // H0 rejection is NOT evidence of error mis-scaling (it is what every real detection does).
+    // ------------------------------------------------------------------------
+    let top_k = top.num_params_k;
+    let top_dof = n_obs.saturating_sub(top_k).max(1);
+    let consistency_upper_bound = reduced_chi2_upper_bound(top_dof);
     let top1_exceeds_consistency_bound = top_rchi2 > consistency_upper_bound;
+    let h0_consistency_upper_bound = reduced_chi2_upper_bound(n_obs.max(1));
+    let h0_exceeds_consistency_bound = h0_reduced_chi2 > h0_consistency_upper_bound;
     let implied_error_scale_factor_h0 = h0_reduced_chi2.max(0.0).sqrt();
     let implied_error_scale_factor_top1 = top_rchi2.max(0.0).sqrt();
-    let emit_error_scale_warning = h0_rejected_by_data
-        || abstention_kind == Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange)
-        || h0_exceeds_consistency_bound
-        || top1_exceeds_consistency_bound;
-    let error_scale_warning = emit_error_scale_warning.then(|| {
+
+    // Internal controls: "spectator" sites where the best model predicts no shift, so their
+    // likelihood sigma is purely the stated experimental error (forward-model sigma ramped to
+    // ~0; `sigma_tot <= 1.05 dw_err`). Residuals at sites with a non-zero prediction also carry
+    // the heuristic forward-model error and are therefore NOT evidence about dw_err_ppm.
+    let mut abs_z: Vec<f64> = top
+        .predictions
+        .iter()
+        .filter(|p| p.sigma_tot_ppm <= SPECTATOR_SIGMA_RATIO * p.observed_err_ppm)
+        .map(|p| p.z_residual.abs())
+        .filter(|z| z.is_finite())
+        .collect();
+    let n_spectators = abs_z.len();
+    abs_z.sort_by(|a, b| a.total_cmp(b));
+    let median_abs_z = if abs_z.is_empty() {
+        0.0
+    } else if abs_z.len() % 2 == 1 {
+        abs_z[abs_z.len() / 2]
+    } else {
+        0.5 * (abs_z[abs_z.len() / 2 - 1] + abs_z[abs_z.len() / 2])
+    };
+    let robust_scale_mad = median_abs_z / HALF_NORMAL_MEDIAN;
+    let outlier_clip_abs_z = ERROR_SCALE_OUTLIER_ABS_Z * robust_scale_mad.max(1.0);
+    let inlier_z2: Vec<f64> = abs_z
+        .iter()
+        .filter(|&&z| z <= outlier_clip_abs_z)
+        .map(|z| z * z)
+        .collect();
+    let n_inliers = inlier_z2.len();
+    let n_outlier_sites_excluded = n_spectators.saturating_sub(n_inliers);
+    let inliers_usable =
+        n_inliers >= MIN_ERROR_SCALE_SPECTATOR_SITES && 2 * n_inliers > n_spectators;
+    let (inlier_reduced_chi2, inlier_dof, inlier_consistency_upper_bound) = if inliers_usable {
+        // Spectator residuals are not fitted (mu = 0), so nu = n_inliers.
+        let dof = n_inliers;
+        (
+            Some(inlier_z2.iter().sum::<f64>() / dof as f64),
+            Some(dof),
+            Some(reduced_chi2_upper_bound(dof)),
+        )
+    } else {
+        (None, None, None)
+    };
+
+    let n_control_sites = control_sites.len();
+    let (control_reduced_chi2, control_consistency_upper_bound, control_exceeds_consistency_bound) =
+        if n_control_sites > 0 {
+            let rc = control_sum_z2 / n_control_sites as f64;
+            let b = reduced_chi2_upper_bound(n_control_sites);
+            (Some(rc), Some(b), Some(rc > b))
+        } else {
+            (None, None, None)
+        };
+
+    let (
+        error_scale_inconsistent,
+        error_scale_evidence,
+        evidence_rchi2,
+        evidence_bound,
+        evidence_dof,
+    ) = if let (Some(rc), Some(b), Some(ex)) = (
+        control_reduced_chi2,
+        control_consistency_upper_bound,
+        control_exceeds_consistency_bound,
+    ) {
+        (ex, "control_sites", rc, b, n_control_sites)
+    } else if let (Some(rc), Some(b), Some(dof)) = (
+        inlier_reduced_chi2,
+        inlier_consistency_upper_bound,
+        inlier_dof,
+    ) {
+        (rc > b, "best_model_spectator_inliers", rc, b, dof)
+    } else {
+        (
+            top1_exceeds_consistency_bound,
+            "best_model_all_sites",
+            top_rchi2,
+            consistency_upper_bound,
+            top_dof,
+        )
+    };
+
+    let error_scale_warning = error_scale_inconsistent.then(|| {
+        let evidence_txt = match error_scale_evidence {
+            "control_sites" => format!(
+                "{n_control_sites} non-exchanging control sites have reduced chi^2_nu={evidence_rchi2:.3} > chi^2_{{0.99,{evidence_dof}}}/{evidence_dof}={evidence_bound:.3}"
+            ),
+            "best_model_spectator_inliers" => format!(
+                "best-fitting model {} has reduced chi^2_nu={evidence_rchi2:.3} over its {n_inliers} inlier spectator sites (predicted dw = 0 (|z|<={outlier_clip_abs_z:.2}, i.e. 3.5 x max(1, s_MAD={robust_scale_mad:.2}); {n_outlier_sites_excluded} localized outliers excluded)) > chi^2_{{0.99,{evidence_dof}}}/{evidence_dof}={evidence_bound:.3}",
+                top.kind.as_str()
+            ),
+            _ => format!(
+                "best-fitting model {} has reduced chi^2_nu={evidence_rchi2:.3} over all {n_obs} sites > chi^2_{{0.99,{evidence_dof}}}/{evidence_dof}={evidence_bound:.3}",
+                top.kind.as_str()
+            ),
+        };
         format!(
-            "Error-scale / chi^2 consistency diagnostic: H0 reduced chi^2_nu={h0_reduced_chi2:.3} (implied error scale ~{implied_error_scale_factor_h0:.2}x), top1 reduced chi^2_nu={top_rchi2:.3} (implied error scale ~{implied_error_scale_factor_top1:.2}x, consistency bound {consistency_upper_bound:.2}). Underestimated experimental error bars (2x-3x) can cause false H0 rejection and spurious UnmodeledSignificantExchange or non-null hypothesis ranking; verify experimental dw_err_ppm calibration on non-exchanging control sites."
+            "Error-scale / chi^2 consistency diagnostic: {evidence_txt} (implied error scale ~{:.2}x). The stated dw_err_ppm are statistically inconsistent with the data. Under-stated experimental error bars (e.g. 2x-3x) produce exactly this signature and cause false H0 rejection and spurious UnmodeledSignificantExchange or non-null hypothesis ranking, so no confident call is reported (ErrorScaleInconsistent); calibrate dw_err_ppm on non-exchanging control sites (exchange TSV site_role=control).",
+            evidence_rchi2.max(0.0).sqrt()
         )
     });
+
+    // Downgrade any confident outcome when the stated errors are inconsistent with the data.
+    let (verdict, abstention_kind, verdict_reason) = if error_scale_inconsistent
+        && (verdict.is_committed()
+            || matches!(
+                abstention_kind,
+                Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange)
+                    | Some(ExcitedStateAbstentionKind::ConsistentWithNoise)
+            )) {
+        let pre = match abstention_kind {
+            Some(k) => k.as_str().to_string(),
+            None => verdict.as_str().to_string(),
+        };
+        (
+            ExcitedStateVerdict::AmbiguousOrUnmodeledState,
+            Some(ExcitedStateAbstentionKind::ErrorScaleInconsistent),
+            format!(
+                "ErrorScaleInconsistent: abstained because the stated dw_err_ppm fail the chi^2 consistency check ({error_scale_evidence}: reduced chi^2_nu={evidence_rchi2:.3} > {evidence_bound:.3} at nu={evidence_dof}, p=0.99); the {pre} outcome that would otherwise be reported is equally explained by under-stated error bars and is not a confident call. Pre-check reason: {verdict_reason}"
+            ),
+        )
+    } else {
+        (verdict, abstention_kind, verdict_reason)
+    };
+
     if let Some(ref w) = error_scale_warning {
         warnings.push(w.clone());
     }
@@ -3348,6 +3817,22 @@ pub fn classify_excited_state_with_firewall(
         implied_error_scale_factor_h0,
         implied_error_scale_factor_top1,
         error_scale_warning: error_scale_warning.clone(),
+        confidence_level: ERROR_SCALE_CHI2_CONFIDENCE,
+        top1_hypothesis: Some(top.kind),
+        top1_dof: top_dof,
+        h0_consistency_upper_bound,
+        n_spectator_sites: n_spectators,
+        robust_scale_mad,
+        n_outlier_sites_excluded,
+        inlier_reduced_chi2,
+        inlier_dof,
+        inlier_consistency_upper_bound,
+        n_control_sites,
+        control_reduced_chi2,
+        control_consistency_upper_bound,
+        control_exceeds_consistency_bound,
+        error_scale_evidence: error_scale_evidence.to_string(),
+        error_scale_inconsistent,
     });
 
     Ok(ExcitedStateReport {

@@ -2131,7 +2131,8 @@ fn test_fix2_b19_misestimated_error_warning_2x_3x_pure_noise() {
             seq_id: sid,
             res_name: Some(r.res_name.clone()),
             atom: "N".to_string(),
-            dw_ppm: rng_cal.normal(0.0, 0.08),
+            // FIX3 (21F:B19): errors exactly 1.0x correct (draw sd == stated dw_err_ppm).
+            dw_ppm: rng_cal.normal(0.0, 0.12),
             dw_err_ppm: 0.12,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
@@ -2141,7 +2142,7 @@ fn test_fix2_b19_misestimated_error_warning_2x_3x_pure_noise() {
             seq_id: sid,
             res_name: Some(r.res_name.clone()),
             atom: "CA".to_string(),
-            dw_ppm: rng_cal.normal(0.0, 0.05),
+            dw_ppm: rng_cal.normal(0.0, 0.08),
             dw_err_ppm: 0.08,
             sign_mode: ExchangeSignMode::Signed,
             major_ppm: None,
@@ -2166,13 +2167,12 @@ fn test_fix2_b19_misestimated_error_warning_2x_3x_pure_noise() {
         rep_cal.error_scale_warning
     );
 
-    // 2. 2x and 3x misestimated-error pure-noise probes (10 seeds each):
-    //    Whenever H0 is rejected, UnmodeledSignificantExchange is emitted, or chi2_red exceeds
-    //    the consistency bound, `error_scale_warning` and `chi2_consistency_diagnostic` MUST be
-    //    emitted in the report, in `report.warnings`, and in the formatted TSV!
+    // 2. 2x and 3x under-stated-error pure-noise probes (10 seeds each): the error-scale warning
+    //    MUST fire (best-model chi^2 above the chi^2_{0.99, n - k} bound), it MUST be reported in
+    //    `report.warnings`, the diagnostic and the TSV, and the run MUST NOT be reported as a
+    //    confident `UnmodeledSignificantExchange` (or committed) call (FIX3 21F:B19).
     for &scale in &[2.0_f64, 3.0_f64] {
-        let mut n_h0_rejected = 0usize;
-        let mut n_warned = 0usize;
+        let mut n_warned_and_not_confident = 0usize;
         for seed in 0..10u64 {
             let mut rng = Rng::new(21_900 + (scale as u64) * 100 + seed);
             let mut obs = Vec::new();
@@ -2217,47 +2217,44 @@ fn test_fix2_b19_misestimated_error_warning_2x_3x_pure_noise() {
                 .as_ref()
                 .expect("chi2_consistency_diagnostic must be populated");
             assert!(diag.h0_reduced_chi2.is_finite() && diag.h0_reduced_chi2 > 0.0);
-            let h0_rejected = rep.abstention_kind
-                == Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange)
-                || diag.h0_exceeds_consistency_bound
-                || diag.top1_exceeds_consistency_bound;
-            if h0_rejected {
-                n_h0_rejected += 1;
-                let warn = rep.error_scale_warning.as_deref().unwrap_or_else(|| {
-                    panic!(
-                        "scale={scale}x seed={seed}: H0 rejected (rchi2={:.3}) without error_scale_warning!",
-                        diag.h0_reduced_chi2
-                    )
-                });
-                assert!(
-                    warn.contains("2x-3x") && warn.contains("UnmodeledSignificantExchange"),
-                    "warning must explain 2x-3x misestimation risk: {warn}"
+            let Some(warn) = rep.error_scale_warning.as_deref() else {
+                continue;
+            };
+            assert!(diag.error_scale_inconsistent);
+            assert!(
+                warn.contains("2x-3x") && warn.contains("UnmodeledSignificantExchange"),
+                "warning must explain 2x-3x misestimation risk: {warn}"
+            );
+            assert!(
+                rep.warnings
+                    .iter()
+                    .any(|w| w.contains("Error-scale / chi^2 consistency diagnostic")),
+                "report.warnings must include error_scale_warning"
+            );
+            let tsv = format_excited_state_tsv(&rep);
+            assert!(
+                tsv.contains("# error_scale_warning:"),
+                "TSV missing error_scale_warning"
+            );
+            assert!(
+                tsv.contains("# chi2_consistency_diagnostic:"),
+                "TSV missing chi2_consistency_diagnostic"
+            );
+            let confident_unmodeled = rep.abstention_kind
+                == Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange);
+            if !confident_unmodeled && !rep.verdict.is_committed() {
+                assert_eq!(
+                    rep.abstention_kind,
+                    Some(ExcitedStateAbstentionKind::ErrorScaleInconsistent),
+                    "scale={scale}x seed={seed}: {}",
+                    rep.verdict_reason
                 );
-                assert!(
-                    rep.warnings
-                        .iter()
-                        .any(|w| w.contains("Error-scale / chi^2 consistency diagnostic")),
-                    "report.warnings must include error_scale_warning"
-                );
-                let tsv = format_excited_state_tsv(&rep);
-                assert!(
-                    tsv.contains("# error_scale_warning:"),
-                    "TSV missing error_scale_warning"
-                );
-                assert!(
-                    tsv.contains("# chi2_consistency_diagnostic:"),
-                    "TSV missing chi2_consistency_diagnostic"
-                );
-                n_warned += 1;
+                n_warned_and_not_confident += 1;
             }
         }
         assert!(
-            n_h0_rejected >= 7,
-            "expected >=7/10 H0 rejections at {scale}x misestimated error, got {n_h0_rejected}/10"
-        );
-        assert_eq!(
-            n_warned, n_h0_rejected,
-            "every H0 rejection at {scale}x must emit error_scale_warning"
+            n_warned_and_not_confident >= 9,
+            "{scale}x under-stated errors: warned & non-confident in only {n_warned_and_not_confident}/10 seeds"
         );
     }
 }
@@ -2594,5 +2591,410 @@ fn test_fix2_b19_multiseed_10_recovery_and_rchi2_statistics() {
     assert_eq!(
         h0_clean, 10,
         "H0 1x noise false-commit detected ({h0_clean}/10)"
+    );
+}
+
+// ============================================================================
+// FIX3 21F:B19: chi^2-quantile error-scale diagnostic (informative, not fired by detections)
+// ============================================================================
+
+#[test]
+fn test_fix3_b19_chi2_upper_quantile_matches_reference_table() {
+    use nmr_core::excited_state::chi2_upper_quantile;
+    // Reference chi^2_{p, nu} values (Abramowitz & Stegun Table 26.8 / NIST handbook).
+    for &(p, nu, q) in &[
+        (0.99, 1.0, 6.634_897),
+        (0.99, 2.0, 9.210_340),
+        (0.99, 5.0, 15.086_272),
+        (0.99, 10.0, 23.209_251),
+        (0.99, 20.0, 37.566_235),
+        (0.99, 50.0, 76.153_891),
+        (0.99, 100.0, 135.806_723),
+        (0.95, 10.0, 18.307_038),
+        (0.50, 4.0, 3.356_694),
+    ] {
+        let got = chi2_upper_quantile(p, nu);
+        assert!(
+            (got - q).abs() < 1e-4 * q.max(1.0),
+            "chi2_upper_quantile({p}, {nu}) = {got}, expected {q}"
+        );
+    }
+}
+
+/// Pure-noise (H0) table on 10 ubiquitin residues: `N` (sd 0.12) + `CA` (sd 0.08), with the stated
+/// `dw_err_ppm` equal to `sd / scale` (`scale = 1` is correctly calibrated).
+fn fix3_h0_noise_obs(
+    ubq_model: &StructureModel,
+    rng: &mut Rng,
+    scale: f64,
+) -> Vec<ExchangeShiftObservation> {
+    let mut obs = Vec::new();
+    for sid in [4, 12, 18, 19, 20, 25, 28, 31, 45, 68] {
+        let r = ubq_model
+            .residues
+            .iter()
+            .find(|x| x.seq_id == sid)
+            .expect("res");
+        for &(atom, sd) in &[("N", 0.12_f64), ("CA", 0.08_f64)] {
+            obs.push(ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: sid,
+                res_name: Some(r.res_name.clone()),
+                atom: atom.to_string(),
+                dw_ppm: rng.normal(0.0, sd),
+                dw_err_ppm: sd / scale,
+                sign_mode: ExchangeSignMode::Signed,
+                major_ppm: None,
+            });
+        }
+    }
+    obs
+}
+
+/// Non-exchanging control sites (expected `dw = 0`) with stated errors `sd / scale`.
+fn fix3_control_obs(
+    ubq_model: &StructureModel,
+    rng: &mut Rng,
+    scale: f64,
+) -> Vec<ExchangeShiftObservation> {
+    let mut obs = Vec::new();
+    for sid in [2, 5, 9, 14, 17, 26, 30, 40, 43, 50, 55, 59, 63, 66, 70] {
+        let r = ubq_model
+            .residues
+            .iter()
+            .find(|x| x.seq_id == sid)
+            .expect("res");
+        obs.push(ExchangeShiftObservation {
+            chain_id: "A".to_string(),
+            seq_id: sid,
+            res_name: Some(r.res_name.clone()),
+            atom: "N".to_string(),
+            dw_ppm: rng.normal(0.0, 0.12),
+            dw_err_ppm: 0.12 / scale,
+            sign_mode: ExchangeSignMode::Signed,
+            major_ppm: None,
+        });
+    }
+    obs
+}
+
+#[test]
+fn test_fix3_b19_error_scale_warning_informative_and_blocks_false_calls() {
+    use nmr_core::excited_state::classify_excited_state_with_controls;
+
+    let (ubq_model, ubq_shifts) = load_ubiquitin_ground();
+    let fw = ubiquitin_firewall();
+    let cfg = ExcitedStateConfig::default();
+    let n_seeds: u64 = std::env::var("FERRIC_B19_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
+    let struct_cfg = StructShiftConfig {
+        sample_ph: cfg.sample_ph,
+        temperature_kelvin: cfg.temperature_kelvin,
+        include_methyl_ilvmat: true,
+        ..StructShiftConfig::default()
+    };
+    let pred_a =
+        predict_structure_shifts_with_firewall(&ubq_model, &fw, &struct_cfg).expect("pred_a");
+
+    let mut h1_no_warn = 0usize;
+    let mut h1_commit = 0usize;
+    let mut h0_1x_no_warn = 0usize;
+    let mut h0_2x_ok = 0usize;
+    let mut h0_3x_ok = 0usize;
+    let mut h0_2x_ctrl_ok = 0usize;
+    let mut loc_ctrl_ok = 0usize;
+    let mut loc_no_ctrl_unmod = 0usize;
+
+    for seed in 0..n_seeds {
+        let mut rng = Rng::new(31_190_000 + seed);
+
+        // (a) True-positive H1 LocalUnfolding (ILE23..GLU34 -> ncIDP coil), errors correctly scaled.
+        let mut h1_obs = Vec::new();
+        for (r_idx, r) in ubq_model.residues.iter().enumerate() {
+            let sid = r.seq_id;
+            if !(22..=35).contains(&sid) && !(3..=7).contains(&sid) {
+                continue;
+            }
+            let w: f64 = if (23..=34).contains(&sid) {
+                1.0
+            } else if sid == 22 || sid == 35 {
+                0.5
+            } else {
+                0.0
+            };
+            let ref_idx = ubq_shifts
+                .seq_ids
+                .iter()
+                .position(|&s| s == sid)
+                .expect("seq_id");
+            for &(atom, exp_sd, fwd_sd) in &[
+                ("CA", 0.08_f64, 0.45_f64),
+                ("C", 0.08, 0.50),
+                ("N", 0.12, 0.90),
+            ] {
+                if let (Some(&obs_a), Some(bb)) = (
+                    ubq_shifts.shifts.get(&(ref_idx, atom.to_string())),
+                    pred_a.residues[r_idx].backbone.get(atom),
+                ) {
+                    let mean_dw = w * (bb.rc_ppm - obs_a);
+                    let sd = (exp_sd * exp_sd + (w * fwd_sd * 0.4).powi(2)).sqrt();
+                    h1_obs.push(ExchangeShiftObservation {
+                        chain_id: "A".to_string(),
+                        seq_id: sid,
+                        res_name: Some(r.res_name.clone()),
+                        atom: atom.to_string(),
+                        dw_ppm: mean_dw + rng.normal(0.0, sd),
+                        dw_err_ppm: exp_sd,
+                        sign_mode: ExchangeSignMode::Signed,
+                        major_ppm: Some(obs_a),
+                    });
+                }
+            }
+        }
+        let rep1 = classify_excited_state_with_firewall(
+            Some(&ubq_shifts),
+            &ubq_model,
+            &h1_obs,
+            &[],
+            &fw,
+            &cfg,
+        )
+        .expect("H1");
+        if rep1.error_scale_warning.is_none() {
+            h1_no_warn += 1;
+        }
+        if rep1.verdict
+            == ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::LocalUnfolding)
+        {
+            h1_commit += 1;
+        }
+
+        // (b) H0 with errors exactly 1.0x correct.
+        let obs = fix3_h0_noise_obs(&ubq_model, &mut rng, 1.0);
+        let rep = classify_excited_state_with_firewall(
+            Some(&ubq_shifts),
+            &ubq_model,
+            &obs,
+            &[],
+            &fw,
+            &cfg,
+        )
+        .expect("H0 1x");
+        if rep.error_scale_warning.is_none() && !rep.verdict.is_committed() {
+            h0_1x_no_warn += 1;
+        }
+
+        // (c) H0 with errors under-stated 2x and 3x: warn AND no confident call.
+        for (scale, ctr) in [(2.0, &mut h0_2x_ok), (3.0, &mut h0_3x_ok)] {
+            let obs = fix3_h0_noise_obs(&ubq_model, &mut rng, scale);
+            let rep = classify_excited_state_with_firewall(
+                Some(&ubq_shifts),
+                &ubq_model,
+                &obs,
+                &[],
+                &fw,
+                &cfg,
+            )
+            .expect("H0 misestimated");
+            if rep.error_scale_warning.is_some()
+                && !rep.verdict.is_committed()
+                && rep.abstention_kind == Some(ExcitedStateAbstentionKind::ErrorScaleInconsistent)
+            {
+                *ctr += 1;
+            }
+        }
+
+        // (d) 2x under-stated errors also on supplied control sites: control chi^2 fires the warning.
+        let obs = fix3_h0_noise_obs(&ubq_model, &mut rng, 2.0);
+        let ctrl = fix3_control_obs(&ubq_model, &mut rng, 2.0);
+        let rep = classify_excited_state_with_controls(
+            Some(&ubq_shifts),
+            &ubq_model,
+            &obs,
+            &ctrl,
+            &[],
+            &fw,
+            &cfg,
+        )
+        .expect("H0 2x + controls");
+        let d = rep.chi2_consistency_diagnostic.as_ref().unwrap();
+        if rep.error_scale_warning.is_some()
+            && d.control_exceeds_consistency_bound == Some(true)
+            && rep.abstention_kind == Some(ExcitedStateAbstentionKind::ErrorScaleInconsistent)
+        {
+            h0_2x_ctrl_ok += 1;
+        }
+
+        // (e) Genuine localized unmodeled exchange (3 sites at 20 sigma, 12 noise sites), correct
+        //     errors: with calibrated control sites the call stays a confident
+        //     `UnmodeledSignificantExchange` and NO error-scale warning is raised.
+        let mut loc_obs = Vec::new();
+        for &(sid, rn, dw) in &[(13, "ILE", 2.50), (33, "LYS", -2.50), (58, "ASP", 2.50)] {
+            loc_obs.push(ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: sid,
+                res_name: Some(rn.to_string()),
+                atom: "N".to_string(),
+                dw_ppm: dw,
+                dw_err_ppm: 0.125,
+                sign_mode: ExchangeSignMode::Signed,
+                major_ppm: None,
+            });
+        }
+        for sid in [4, 7, 11, 15, 24, 27, 31, 41, 48, 52, 61, 71] {
+            let r = ubq_model
+                .residues
+                .iter()
+                .find(|x| x.seq_id == sid)
+                .expect("bg");
+            loc_obs.push(ExchangeShiftObservation {
+                chain_id: "A".to_string(),
+                seq_id: sid,
+                res_name: Some(r.res_name.clone()),
+                atom: "N".to_string(),
+                dw_ppm: rng.normal(0.0, 0.125),
+                dw_err_ppm: 0.125,
+                sign_mode: ExchangeSignMode::Signed,
+                major_ppm: None,
+            });
+        }
+        let ctrl = fix3_control_obs(&ubq_model, &mut rng, 1.0);
+        let rep = classify_excited_state_with_controls(
+            Some(&ubq_shifts),
+            &ubq_model,
+            &loc_obs,
+            &ctrl,
+            &[],
+            &fw,
+            &cfg,
+        )
+        .expect("localized + controls");
+        if rep.error_scale_warning.is_none()
+            && rep.abstention_kind == Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange)
+        {
+            loc_ctrl_ok += 1;
+        }
+        let rep = classify_excited_state_with_firewall(
+            Some(&ubq_shifts),
+            &ubq_model,
+            &loc_obs,
+            &[],
+            &fw,
+            &cfg,
+        )
+        .expect("localized");
+        if rep.error_scale_warning.is_none()
+            && rep.abstention_kind == Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange)
+        {
+            loc_no_ctrl_unmod += 1;
+        }
+    }
+
+    eprintln!(
+        "FIX3 B19 error-scale rates over {n_seeds} seeds:\n\
+         (a) H1 true positive, correct errors: no-warn {h1_no_warn}/{n_seeds}, committed H1 {h1_commit}/{n_seeds}\n\
+         (b) H0 errors 1.0x: no-warn & no commit {h0_1x_no_warn}/{n_seeds}\n\
+         (c) H0 errors under-stated 2x: warn & ErrorScaleInconsistent (no confident call) {h0_2x_ok}/{n_seeds}\n\
+         (c) H0 errors under-stated 3x: warn & ErrorScaleInconsistent (no confident call) {h0_3x_ok}/{n_seeds}\n\
+         (d) H0 2x + 2x-understated controls: control-chi2 warn {h0_2x_ctrl_ok}/{n_seeds}\n\
+         (e) localized unmodeled exchange + calibrated controls: confident Unmodeled, no warn {loc_ctrl_ok}/{n_seeds}\n\
+         (e') localized unmodeled exchange, no controls: confident Unmodeled, no warn {loc_no_ctrl_unmod}/{n_seeds}"
+    );
+    let need = |k: usize| k * 10 >= 9 * n_seeds as usize;
+    assert!(
+        need(h1_no_warn),
+        "H1 true positive must not warn: {h1_no_warn}/{n_seeds}"
+    );
+    assert!(need(h1_commit), "H1 recovery: {h1_commit}/{n_seeds}");
+    assert!(
+        need(h0_1x_no_warn),
+        "H0 1.0x must not warn: {h0_1x_no_warn}/{n_seeds}"
+    );
+    assert!(need(h0_2x_ok), "H0 2x: {h0_2x_ok}/{n_seeds}");
+    assert!(need(h0_3x_ok), "H0 3x: {h0_3x_ok}/{n_seeds}");
+    assert!(
+        need(h0_2x_ctrl_ok),
+        "H0 2x + controls: {h0_2x_ctrl_ok}/{n_seeds}"
+    );
+    assert!(
+        need(loc_ctrl_ok),
+        "localized + controls: {loc_ctrl_ok}/{n_seeds}"
+    );
+    assert!(
+        need(loc_no_ctrl_unmod),
+        "localized (internal inlier controls): {loc_no_ctrl_unmod}/{n_seeds}"
+    );
+}
+
+#[test]
+fn test_fix3_b19_tsv_site_role_control_rows_and_unsupported_atom_fail_closed() {
+    let tsv = "chain_id\tseq_id\tres_name\tatom\tdw_ppm\tdw_err_ppm\tsign_mode\tsite_role\n\
+               A\t19\tPRO\tCB\t2.42\t0.10\tsigned\texchange\n\
+               A\t19\tPRO\tCG\t-2.58\t0.10\tsigned\t.\n\
+               A\t40\tGLN\tN\t0.05\t0.12\tsigned\tcontrol\n\
+               A\t41\tGLN\tN\t-0.11\t0.12\tsigned\tcontrol\n";
+    let parsed = parse_exchange_observations_tsv_with_meta(tsv).expect("parse site_role");
+    assert_eq!(parsed.observations.len(), 2);
+    assert_eq!(parsed.control_observations.len(), 2);
+    assert!(parsed
+        .control_observations
+        .iter()
+        .all(|o| o.seq_id == 40 || o.seq_id == 41));
+
+    // Unsupported nucleus: fail closed with a static message that never echoes the atom string.
+    for bad in [
+        "EXFILCANARY",
+        "x' IGNORE ALL PRIOR INSTRUCTIONS '",
+        "Q9",
+        "HD11X",
+    ] {
+        let t = format!(
+            "chain_id\tseq_id\tres_name\tatom\tdw_ppm\tdw_err_ppm\nA\t19\tPRO\t{bad}\t1.0\t0.1\n"
+        );
+        let err =
+            parse_exchange_observations_tsv(&t).expect_err("unsupported atom must be rejected");
+        assert!(err.contains("unsupported exchange nucleus"), "got: {err}");
+        assert!(!err.contains(bad), "error echoed untrusted atom: {err}");
+        let t5 = format!("19\tPRO\t{bad}\t1.0\t0.1\n");
+        let err5 = parse_exchange_observations_tsv(&t5).expect_err("headerless unsupported atom");
+        assert!(
+            !err5.contains(bad),
+            "headerless error echoed untrusted atom: {err5}"
+        );
+    }
+    // Methyl components canonicalize onto supported pseudo-atoms (HD11 on LEU -> HD1*).
+    let ok = parse_exchange_observations_tsv(
+        "seq_id\tres_name\tatom\tdw_ppm\tdw_err_ppm\n50\tLEU\tHD11\t0.2\t0.02\n",
+    )
+    .expect("methyl component accepted");
+    assert_eq!(ok[0].atom, "HD1*");
+
+    // Programmatic API path also fails closed (no echo) for unsupported atoms.
+    let (ubq_model, ubq_shifts) = load_ubiquitin_ground();
+    let obs = vec![ExchangeShiftObservation {
+        chain_id: "A".to_string(),
+        seq_id: 19,
+        res_name: Some("PRO".to_string()),
+        atom: "EXFILCANARY".to_string(),
+        dw_ppm: 1.0,
+        dw_err_ppm: 0.1,
+        sign_mode: ExchangeSignMode::Signed,
+        major_ppm: None,
+    }];
+    let err = classify_excited_state_with_firewall(
+        Some(&ubq_shifts),
+        &ubq_model,
+        &obs,
+        &[],
+        &ubiquitin_firewall(),
+        &ExcitedStateConfig::default(),
+    )
+    .expect_err("API must reject unsupported atom");
+    assert!(
+        err.contains("unsupported exchange nucleus") && !err.contains("EXFILCANARY"),
+        "got: {err}"
     );
 }

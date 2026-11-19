@@ -43,7 +43,7 @@ use nmr_core::csp::{
     UnassignedHsqcPeak, UnassignedTitrationStep,
 };
 use nmr_core::excited_state::{
-    classify_excited_state_with_firewall, format_excited_state_json, format_excited_state_tsv,
+    classify_excited_state_with_controls, format_excited_state_json, format_excited_state_tsv,
     parse_exchange_observations_tsv_with_meta, parse_ground_shifts_str, AltConformerInput,
     ExchangeShiftObservation, ExcitedStateConfig,
 };
@@ -1429,7 +1429,9 @@ pub fn exchange_state_usage() -> &'static str {
      Inputs & Biophysical Hypotheses (H0..H4):\n\
        --shifts | --star <p>       Ground-state assigned chemical shifts (.str or .nef)\n\
        --structure | --pdb <p>     Ground-state 3D structure coordinates (.cif, .mmcif, or .pdb)\n\
-       --exchange | --in <tsv>     CEST (signed), R1rho (signed), or CPMG (unsigned |dw|) TSV (repeatable; duplicate (chain, seq_id, atom) rows rejected)\n\
+       --exchange | --in <tsv>     CEST (signed), R1rho (signed), or CPMG (unsigned |dw|) TSV (repeatable; duplicate (chain, seq_id, atom) rows rejected).\n\
+                                   Optional site_role column: rows tagged 'control' are non-exchanging reference sites (expected dw=0)\n\
+                                   whose chi^2 calibrates dw_err_ppm; atoms outside the supported nucleus set are rejected\n\
        --alt-structures <list>     Comma-separated candidate alternative 3D conformers (.cif/.pdb) for H4\n\
        --ph <f64>                  Sample pH for ncIDP coil & His titration baselines [default: 6.5]\n\
        --temp-k <f64>              Sample temperature in Kelvin [default: 298.15]\n\
@@ -1580,6 +1582,7 @@ pub fn run_exchange_state_cli(args: &[String]) -> Result<(), String> {
     let ground_model = StructureModel::parse_file(&stp, force_bfactor_plddt)?;
 
     let mut all_obs: Vec<ExchangeShiftObservation> = Vec::new();
+    let mut control_obs: Vec<ExchangeShiftObservation> = Vec::new();
     let mut seen_cli_keys: BTreeSet<(String, i32, String)> = BTreeSet::new();
     let mut cpmg_prefiltered = false;
     for ep in &exchange_paths {
@@ -1588,6 +1591,7 @@ pub fn run_exchange_state_cli(args: &[String]) -> Result<(), String> {
         let parsed = parse_exchange_observations_tsv_with_meta(&raw_tsv)
             .map_err(|e| format!("failed to parse exchange TSV '{}': {e}", ep.display()))?;
         cpmg_prefiltered |= parsed.cpmg_prefiltered_significant_only;
+        control_obs.extend(parsed.control_observations);
         for obs in parsed.observations {
             let key = (obs.chain_id.clone(), obs.seq_id, obs.atom.clone());
             if !seen_cli_keys.insert(key) {
@@ -1628,10 +1632,11 @@ pub fn run_exchange_state_cli(args: &[String]) -> Result<(), String> {
         ..ExcitedStateConfig::default()
     };
 
-    let report = classify_excited_state_with_firewall(
+    let report = classify_excited_state_with_controls(
         Some(&ground_ref),
         &ground_model,
         &all_obs,
+        &control_obs,
         &alt_models,
         &fw_query,
         &cfg,
