@@ -1753,6 +1753,8 @@ struct NmrWorkbenchApp {
     stack1d_panel: Stack1dState,
     show_stack1d_panel: bool,
     show_strips_dock: bool,
+    show_strip_details_drawer: bool,
+    last_sequence_ribbon_rect: Option<egui::Rect>,
     show_workflow_guide: bool,
     show_sequence_ribbon: bool,
     paper_white_canvas: bool,
@@ -2295,6 +2297,8 @@ impl NmrWorkbenchApp {
             stack1d_panel: Stack1dState::default(),
             show_stack1d_panel: true,
             show_strips_dock: false,
+            show_strip_details_drawer: false,
+            last_sequence_ribbon_rect: None,
             show_workflow_guide: false,
             show_sequence_ribbon: true,
             paper_white_canvas: true,
@@ -7135,8 +7139,12 @@ impl NmrWorkbenchApp {
             IngestDropOutcome::Workspace(panel) => {
                 let n_exp = panel.inventory.experiments.len();
                 let root = panel.inventory.root_name.clone();
+                let only_seq_aux = panel.inventory.auxiliary_files.iter().all(|f| {
+                    let p = f.relative_path.to_ascii_lowercase();
+                    p.ends_with(".fasta") || p.ends_with(".fa") || p.ends_with(".seq")
+                });
                 let single_direct_exp = n_exp == 1
-                    && panel.inventory.auxiliary_files.is_empty()
+                    && only_seq_aux
                     && matches!(
                         panel.inventory.experiments[0].dimensionality,
                         ExperimentDimensionality::Dim2D
@@ -7749,7 +7757,8 @@ impl NmrWorkbenchApp {
             let cell_w = 38.0_f32;
             let cell_h = 24.0_f32;
             let gap_x = 2.0_f32;
-            let total_w = (self.sequence.len() as f32) * (cell_w + gap_x);
+            let left_pad = 2.0_f32;
+            let total_w = left_pad + (self.sequence.len() as f32) * (cell_w + gap_x) + 2.0;
 
             egui::ScrollArea::horizontal()
                 .id_salt("seq_ribbon_scroll")
@@ -7762,17 +7771,18 @@ impl NmrWorkbenchApp {
                     );
                     let painter = ui.painter_at(strip_rect);
                     let vis_clip = ui.clip_rect();
+                    self.last_sequence_ribbon_rect = Some(strip_rect.intersect(vis_clip));
 
                     for (k, three) in self.sequence.iter().enumerate() {
-                        let x0 = strip_rect.left() + (k as f32) * (cell_w + gap_x);
+                        let x0 = strip_rect.left() + left_pad + (k as f32) * (cell_w + gap_x);
                         let cell_rect = egui::Rect::from_min_size(
                             egui::pos2(x0, strip_rect.top()),
                             egui::vec2(cell_w, cell_h),
                         );
-                        // Skip painting cells that are even partially clipped by horizontal scroll
-                        // so zero clipped text glyphs ever appear at the scroll viewport edges!
+                        // Skip only cells that extend past the scroll viewport edges, while keeping
+                        // the first visible cell (`M1` at `k = 0`) cleanly inside `vis_clip` (`UI-B7`).
                         if cell_rect.right() > vis_clip.right() - 1.0
-                            || cell_rect.left() < vis_clip.left() + 1.0
+                            || cell_rect.left() < vis_clip.left() - 0.5
                         {
                             continue;
                         }
@@ -8574,8 +8584,13 @@ impl NmrWorkbenchApp {
 
         let peak_drag_active = self.workbook.two_d.dragging_peak_idx.is_some()
             || self.cube_slice.dragging_peak_3d_idx.is_some();
-        let primary_pans =
-            !peak_drag_active && (is_compact_mobile || tool_mode == ToolMode2d::Pan || space_down);
+        // `Shift+drag` MUST always draw and apply the 2D zoom box even when the active tool is `Pan` (`UI-C7`, `UI-C18`).
+        let shift_zoom_override = (shift_down || self.workbook.two_d.drag_box_start_pos.is_some())
+            && !space_down
+            && !is_compact_mobile;
+        let primary_pans = !peak_drag_active
+            && !shift_zoom_override
+            && (is_compact_mobile || tool_mode == ToolMode2d::Pan || space_down);
         let pan_dragged = !multi_touch_active
             && !peak_drag_active
             && (response.dragged_by(egui::PointerButton::Secondary)
@@ -8613,7 +8628,9 @@ impl NmrWorkbenchApp {
             && !primary_pans
             && !peak_drag_active
             && response.dragged_by(egui::PointerButton::Primary)
-            && (tool_mode == ToolMode2d::ZoomBox || shift_down);
+            && (tool_mode == ToolMode2d::ZoomBox
+                || shift_down
+                || self.workbook.two_d.drag_box_start_pos.is_some());
         if zoom_drag_active && self.workbook.two_d.drag_box_start_pos.is_none() {
             if let Some(origin) = ui
                 .input(|i| i.pointer.press_origin())
@@ -8720,38 +8737,68 @@ impl NmrWorkbenchApp {
         // - Horizontal trackpad scroll = Pan `F2` horizontally
         if !multi_touch_active {
             if let Some(hover_pos) = response.hover_pos() {
-                let (scroll_x, scroll_y, ctrl_or_cmd, shift_mod) = ui.ctx().input_mut(|i| {
-                    let mut sh = i.modifiers.shift;
-                    let mut cc = i.modifiers.command || i.modifiers.ctrl;
-                    let mut wx = 0.0f32;
-                    let mut wy = 0.0f32;
-                    for ev in &i.events {
-                        if let egui::Event::MouseWheel {
-                            delta, modifiers, ..
-                        } = ev
-                        {
-                            wx += delta.x;
-                            wy += delta.y;
-                            sh |= modifiers.shift;
-                            cc |= modifiers.command || modifiers.ctrl;
+                let (scroll_x, scroll_y, zoom_delta, ctrl_or_cmd, shift_mod) =
+                    ui.ctx().input_mut(|i| {
+                        let mut sh = i.modifiers.shift;
+                        let mut cc = i.modifiers.command || i.modifiers.ctrl;
+                        let zd = i.zoom_delta();
+                        let mut wx = 0.0f32;
+                        let mut wy = 0.0f32;
+                        for ev in &i.events {
+                            if let egui::Event::MouseWheel {
+                                delta, modifiers, ..
+                            } = ev
+                            {
+                                wx += delta.x;
+                                wy += delta.y;
+                                sh |= modifiers.shift;
+                                cc |= modifiers.command || modifiers.ctrl;
+                            }
                         }
+                        let sx = if i.smooth_scroll_delta.x.abs() >= (wx * 16.0).abs() {
+                            i.smooth_scroll_delta.x
+                        } else {
+                            wx * 16.0
+                        };
+                        let sy = if i.smooth_scroll_delta.y.abs() >= (wy * 16.0).abs() {
+                            i.smooth_scroll_delta.y
+                        } else {
+                            wy * 16.0
+                        };
+                        if sx.abs() > 0.05 || sy.abs() > 0.05 {
+                            i.smooth_scroll_delta = egui::Vec2::ZERO;
+                        }
+                        (sx, sy, zd, cc, sh)
+                    });
+                if (zoom_delta - 1.0).abs() > 1e-4 {
+                    let prev = [
+                        self.view_h_left,
+                        self.view_h_right,
+                        self.view_n_top,
+                        self.view_n_bottom,
+                    ];
+                    let zoom = (1.0_f32 / zoom_delta).clamp(0.4, 2.5);
+                    let u = ((hover_pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                    let v = ((hover_pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+                    let anchor_h = self.view_h_left + u * (self.view_h_right - self.view_h_left);
+                    let anchor_n = self.view_n_top + v * (self.view_n_bottom - self.view_n_top);
+                    let clamped = clamp_view_ppm_2d(
+                        [
+                            anchor_h + (self.view_h_left - anchor_h) * zoom,
+                            anchor_h + (self.view_h_right - anchor_h) * zoom,
+                            anchor_n + (self.view_n_top - anchor_n) * zoom,
+                            anchor_n + (self.view_n_bottom - anchor_n) * zoom,
+                        ],
+                        limits,
+                    );
+                    if (clamped[0] - prev[0]).abs() > 1e-6 || (clamped[2] - prev[2]).abs() > 1e-6 {
+                        self.workbook.two_d.push_zoom(prev);
                     }
-                    let sx = if i.smooth_scroll_delta.x.abs() >= (wx * 16.0).abs() {
-                        i.smooth_scroll_delta.x
-                    } else {
-                        wx * 16.0
-                    };
-                    let sy = if i.smooth_scroll_delta.y.abs() >= (wy * 16.0).abs() {
-                        i.smooth_scroll_delta.y
-                    } else {
-                        wy * 16.0
-                    };
-                    if sx.abs() > 0.05 || sy.abs() > 0.05 {
-                        i.smooth_scroll_delta = egui::Vec2::ZERO;
-                    }
-                    (sx, sy, cc, sh)
-                });
-                if !shift_mod
+                    self.view_h_left = clamped[0];
+                    self.view_h_right = clamped[1];
+                    self.view_n_top = clamped[2];
+                    self.view_n_bottom = clamped[3];
+                } else if !shift_mod
                     && !ctrl_or_cmd
                     && scroll_x.abs() > 0.05
                     && scroll_x.abs() > scroll_y.abs()
@@ -10878,17 +10925,86 @@ impl NmrWorkbenchApp {
     }
 
     fn draw_right_inspector(&mut self, ui: &mut egui::Ui) {
+        // Compact 1-control dock header (`Options` menu; `"3D Strips"` in the mode bar toggles the dock)
+        // so opening 3D strips preserves the `<= 12` primary-control budget and `>= 65%` spectrum area (`UI-B2`, `UI-B7`).
         ui.horizontal(|ui| {
-            ui.strong("3D Strip Inspector");
+            ui.strong("3D Strips");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("Close")
-                    .on_hover_text("Hide Right Strip Inspector dock (toggle via 3D Strips or st)")
-                    .clicked()
-                {
-                    self.show_strips_dock = false;
-                    self.responsive_shell.tablet_dock = TabletActiveDock::Hidden;
-                }
+                ui.menu_button("Options", |ui| {
+                    ui.set_min_width(210.0);
+                    if ui.button("Hide 3D Strips (st)").clicked() {
+                        self.show_strips_dock = false;
+                        self.responsive_shell.tablet_dock = TabletActiveDock::Hidden;
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("Strip View").strong());
+                    ui.selectable_value(
+                        &mut self.use_match_finder_strips,
+                        true,
+                        "Match-Finder (i-1 / i / i+1)",
+                    );
+                    ui.selectable_value(
+                        &mut self.use_match_finder_strips,
+                        false,
+                        "Sequential Walk",
+                    );
+                    if ui.button("Assign / Lock Residue (at)").clicked() {
+                        self.show_assign_popover = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("Match-Finder Guides").strong());
+                    ui.horizontal(|ui| {
+                        ui.label("Top-K:");
+                        for k_opt in [1usize, 3, 5, 8] {
+                            if ui
+                                .selectable_label(
+                                    self.strip_tiler.cfg.top_k == k_opt,
+                                    format!("{k_opt}"),
+                                )
+                                .clicked()
+                            {
+                                self.strip_tiler.cfg.top_k = k_opt;
+                            }
+                        }
+                    });
+                    ui.checkbox(&mut self.strip_tiler.show_ca_guides, "CA guides");
+                    ui.checkbox(&mut self.strip_tiler.show_cb_guides, "CB guides");
+                    ui.checkbox(&mut self.strip_tiler.show_c_guides, "C' guides");
+                    ui.checkbox(
+                        &mut self.strip_tiler.cfg.exclude_conflicting_locks,
+                        "Filter conflicting locks",
+                    );
+                    ui.checkbox(
+                        &mut self.strip_tiler.show_footer_buttons,
+                        "Inline Walk/Link/Lock buttons",
+                    );
+                    ui.separator();
+                    ui.label(egui::RichText::new("Inspectors").strong());
+                    ui.checkbox(
+                        &mut self.show_strip_details_drawer,
+                        "Spin System & LLR Details",
+                    );
+                    if ui
+                        .checkbox(&mut self.show_sidechain_inspector, "Sidechain 2D")
+                        .changed()
+                        && self.show_sidechain_inspector
+                        && self.selected_res.is_none()
+                    {
+                        self.selected_res = Some(0);
+                    }
+                    if ui
+                        .checkbox(&mut self.show_propensity_panel, "SSP / d2D")
+                        .changed()
+                        && self.show_propensity_panel
+                    {
+                        self.refresh_propensity_report();
+                        if self.selected_res.is_none() {
+                            self.selected_res = Some(0);
+                        }
+                    }
+                });
             });
         });
         ui.separator();
@@ -10949,45 +11065,6 @@ impl NmrWorkbenchApp {
             }
         }
 
-        // 2. Strip View Mode Switch (`UI-B1`: mode-hijacking studio chips deleted!)
-        ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(
-                &mut self.use_match_finder_strips,
-                true,
-                "Match-Finder (i-1/i/i+1)",
-            );
-            ui.selectable_value(&mut self.use_match_finder_strips, false, "Walk & LLR");
-            if ui.small_button("Assign/Lock (at)").clicked() {
-                self.show_assign_popover = true;
-            }
-        });
-
-        egui::CollapsingHeader::new(egui::RichText::new("Advanced Residue Inspectors").size(12.5))
-            .id_salt("strip_inspector_advanced_residue")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .checkbox(&mut self.show_sidechain_inspector, "Sidechain 2D")
-                        .changed()
-                        && self.show_sidechain_inspector
-                        && self.selected_res.is_none()
-                    {
-                        self.selected_res = Some(0);
-                    }
-                    if ui
-                        .checkbox(&mut self.show_propensity_panel, "SSP / d2D")
-                        .changed()
-                        && self.show_propensity_panel
-                    {
-                        self.refresh_propensity_report();
-                        if self.selected_res.is_none() {
-                            self.selected_res = Some(0);
-                        }
-                    }
-                });
-            });
-
         if self.show_propensity_panel {
             ui.add_space(4.0);
             self.draw_propensity_inspector_drawer(ui);
@@ -11035,7 +11112,6 @@ impl NmrWorkbenchApp {
                 for act in strip_actions {
                     self.handle_strip_tiler_action(act);
                 }
-                ui.separator();
             }
         } else {
             ui.label(
@@ -11051,16 +11127,23 @@ impl NmrWorkbenchApp {
                 (Some(sel_s), "Selected (i)"),
                 (succ_s, "i + 1"),
             ];
-            let strip_h = 275.0f32;
+            let strip_h = if self.show_strip_details_drawer {
+                275.0f32
+            } else {
+                (ui.available_height() - 12.0).clamp(240.0, 740.0)
+            };
             let (strip_rect, _) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width().max(240.0), strip_h),
                 egui::Sense::hover(),
             );
+            self.strip_tiler.last_canvas_rect = Some(strip_rect);
             self.paint_sequential_strips(ui.painter_at(strip_rect), strip_rect, &strip_list);
-            ui.add_space(6.0);
-            ui.separator();
         }
-        ui.add_space(8.0);
+
+        if !self.show_strip_details_drawer {
+            return;
+        }
+        ui.add_space(6.0);
         ui.separator();
 
         // 3. Detailed Spin System Candidate & LLR / Connectivity Inspector
@@ -17081,6 +17164,8 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             stack1d_panel: Stack1dState::default(),
             show_stack1d_panel: false,
             show_strips_dock: false,
+            show_strip_details_drawer: false,
+            last_sequence_ribbon_rect: None,
             show_workflow_guide: false,
             show_sequence_ribbon: true,
             paper_white_canvas: true,
@@ -17922,11 +18007,14 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             unreachable!()
         };
 
-        // 1. Audit all 6 modes + all sub-views (incl. all 4 Structure PAE & Co-Fold tabs!) on full
-        //    NmrWorkbenchApp at 1440x900 (<= 12 controls, >= 65% canvas) & 1280x800 (0 clip/overlap, >= 11px).
-        //    Honest exclusion contract (`UI-B2`, `UI-B6`): exclude ONLY `last_mode_switcher_rect` (6-mode pills),
-        //    `last_global_chrome_rects` (`[Sidebar]`, `[Open]`, `[Cmd+K]`), `sidebar_excl`, `status_bar_rect`,
-        //    and the TRUE plot/canvas rect `viz_r` — NEVER excluding mode-specific header buttons or studio toolbars!
+        // 1. Audit all 6 modes + all sub-views (incl. Assign with 3D Strips OPEN and all 4 Structure
+        //    PAE & Co-Fold tabs!) on full NmrWorkbenchApp at 1440x900 & 1280x800.
+        //    Honest exclusion contract (`UI-B2`, `UI-B6`, `B11`):
+        //    - Exclude ONLY `last_mode_switcher_rect` (6-mode pills), `last_global_chrome_rects`,
+        //      `sidebar_excl`, `status_bar_rect`, and the TRUE spectrum/canvas rect(s) (`viz_r` +
+        //      `strip_tiler.last_canvas_rect` when strips are open).
+        //    - Count the residue strip HONESTLY as `+1` composite interactive widget whenever visible
+        //      (never silently excluded as 0 controls because its scrollable rect exceeds 40,000 px^2).
         let _ = app.integrative_af_panel.load_synthetic_two_domain_demo();
         type ModeAuditCase<'a> = (
             &'a str,
@@ -17934,6 +18022,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             Option<SmallMoleculeView>,
             Option<DynamicsView>,
             Option<nmr_gui::integrative_af_panel::IntegrativeStudioTab>,
+            bool,
             bool,
         );
         use nmr_gui::integrative_af_panel::IntegrativeStudioTab as AfTab;
@@ -17945,6 +18034,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 None,
                 None,
                 true,
+                false,
             ),
             (
                 "Process (2D)",
@@ -17953,14 +18043,25 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 None,
                 None,
                 false,
+                false,
             ),
             (
-                "Assign (2D HSQC)",
+                "Assign (HSQC)",
                 WorkbenchMode::Assign,
                 None,
                 None,
                 None,
                 false,
+                false,
+            ),
+            (
+                "Assign (+3D Strips)",
+                WorkbenchMode::Assign,
+                None,
+                None,
+                None,
+                false,
+                true,
             ),
             (
                 "Structure (3D)",
@@ -17968,6 +18069,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 None,
                 None,
                 None,
+                false,
                 false,
             ),
             (
@@ -17977,6 +18079,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 None,
                 Some(AfTab::ConcordanceSummary),
                 false,
+                false,
             ),
             (
                 "Structure (PAE:Map)",
@@ -17984,6 +18087,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 None,
                 None,
                 Some(AfTab::PaeDomainHeatmap),
+                false,
                 false,
             ),
             (
@@ -17993,6 +18097,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 None,
                 Some(AfTab::CofoldPoseRanker),
                 false,
+                false,
             ),
             (
                 "Structure (PAE:BIC)",
@@ -18000,6 +18105,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 None,
                 None,
                 Some(AfTab::ExcitedStateExplorer),
+                false,
                 false,
             ),
             (
@@ -18009,6 +18115,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 Some(DynamicsView::Relaxation),
                 None,
                 false,
+                false,
             ),
             (
                 "Dynamics (Exch)",
@@ -18016,6 +18123,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 None,
                 Some(DynamicsView::Exchange),
                 None,
+                false,
                 false,
             ),
             (
@@ -18025,6 +18133,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 None,
                 None,
                 false,
+                false,
             ),
             (
                 "SmallMol (DOSY)",
@@ -18032,6 +18141,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 Some(SmallMoleculeView::Dosy),
                 None,
                 None,
+                false,
                 false,
             ),
             (
@@ -18041,10 +18151,11 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 None,
                 None,
                 false,
+                false,
             ),
         ];
 
-        for &(name, mode, sm_opt, dyn_opt, af_tab_opt, force_1d) in mode_cases {
+        for &(name, mode, sm_opt, dyn_opt, af_tab_opt, force_1d, open_strips) in mode_cases {
             if let Some(sv) = sm_opt {
                 app.small_molecule_view = sv;
             }
@@ -18066,6 +18177,13 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                     app.activate_2d_workbook_page(0);
                 }
             }
+            if mode == WorkbenchMode::Assign {
+                app.show_strips_dock = open_strips;
+                if open_strips && app.selected_ss.is_none() && !app.systems.is_empty() {
+                    app.selected_ss = Some(0);
+                }
+            }
+            app.last_sequence_ribbon_rect = None;
 
             let ctx_1440 = egui::Context::default();
             let (out1440, m1440) = run_app_two_passes(&ctx_1440, 1440.0, 900.0, &mut app);
@@ -18096,38 +18214,107 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                     .expect("metabolomics last_canvas_rect"),
                 _ => m1440.active_viz_rect,
             };
+            let strip_canvas_1440 = if open_strips {
+                app.strip_tiler.last_canvas_rect
+            } else {
+                None
+            };
             let mut excl_rects = vec![
                 app.last_mode_switcher_rect,
                 sidebar_excl,
                 m1440.status_bar_rect,
                 viz_r,
             ];
+            if let Some(sr) = strip_canvas_1440 {
+                excl_rects.push(sr);
+            }
             excl_rects.extend_from_slice(&app.last_global_chrome_rects);
-            let ctrls = primary_controls(&ctx_1440, &excl_rects, 40_000.0);
-            let share = viz_r.area() / (1440.0 * 900.0);
+            let raw_ctrls = primary_controls(&ctx_1440, &excl_rects, 40_000.0);
+            let mut ctrl_count = raw_ctrls.len();
+            // Honest residue strip count (`B11`): ensure the sequence ribbon is counted exactly once
+            // as a composite interactive control (never silently dropped as 0 controls if > 40,000 px^2!).
+            if let Some(seq_r) = app.last_sequence_ribbon_rect {
+                let already_counted = raw_ctrls.iter().any(|c| seq_r.contains(c.rect.center()));
+                if !already_counted {
+                    ctrl_count += 1;
+                }
+            }
+            let total_spec_area_1440 =
+                viz_r.area() + strip_canvas_1440.map_or(0.0, |r| r.area());
+            let share = total_spec_area_1440 / (1440.0 * 900.0);
             assert!(
-                ctrls.len() <= MAX_PRIMARY_CONTROLS_PER_MODE,
-                "{name}: expected <= 12 primary controls, got {}",
-                ctrls.len()
+                ctrl_count <= MAX_PRIMARY_CONTROLS_PER_MODE,
+                "{name}: expected <= 12 primary controls (incl. residue strip), got {ctrl_count} (rects={:?})",
+                raw_ctrls.iter().map(|c| c.rect).collect::<Vec<_>>()
             );
             assert!(
                 share >= MIN_CANVAS_AREA_FRACTION,
-                "{name}: expected canvas share >= {MIN_CANVAS_AREA_FRACTION} at 1440x900, got {share:.3} ({viz_r:?})"
+                "{name}: expected spectrum/canvas share >= {MIN_CANVAS_AREA_FRACTION} at 1440x900, got {share:.3} (viz={viz_r:?}, strips={strip_canvas_1440:?})"
             );
+            if mode == WorkbenchMode::Assign {
+                assert!(
+                    audit_1440.texts.iter().any(|t| t.text.contains("M1")),
+                    "{name} at 1440x900 must render unclipped edge residue cell M1"
+                );
+            }
+            if open_strips {
+                let dock_r = m1440.right_dock_rect.expect("strips right dock rect");
+                assert!(
+                    app.strip_tiler.last_column_rects.len() >= 3,
+                    "{name} at 1440x900 must render all 3 strips (i-1, i, i+1), got {}",
+                    app.strip_tiler.last_column_rects.len()
+                );
+                for (ci, col_r) in app.strip_tiler.last_column_rects.iter().enumerate() {
+                    assert!(
+                        col_r.left() >= dock_r.left() - 1.0 && col_r.right() <= dock_r.right() + 1.0,
+                        "{name} at 1440x900 strip #{ci} clipped outside dock: col={col_r:?} dock={dock_r:?}"
+                    );
+                }
+            }
 
             let ctx_1280 = egui::Context::default();
-            let (out1280, _) = run_app_two_passes(&ctx_1280, 1280.0, 800.0, &mut app);
+            let (out1280, m1280) = run_app_two_passes(&ctx_1280, 1280.0, 800.0, &mut app);
             let vp1280 = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
             let audit = audit_text_layout(&out1280.shapes, vp1280);
             println!(
                 "[S9 FULL-APP AUDIT] {:<20} | ctrls={:>2}/12 | canvas_1440={:>5.1}% | clip_1280={} | ovlp_1280={} | min_font={:.1}px",
                 name,
-                ctrls.len(),
+                ctrl_count,
                 share * 100.0,
                 audit.clipped.len(),
                 audit.overlapping.len(),
                 audit.min_font_px
             );
+            if open_strips {
+                let strip_canvas_1280 = app
+                    .strip_tiler
+                    .last_canvas_rect
+                    .expect("1280x800 strip canvas rect");
+                let share_1280 =
+                    (m1280.active_viz_rect.area() + strip_canvas_1280.area()) / (1280.0 * 800.0);
+                assert!(
+                    share_1280 >= MIN_CANVAS_AREA_FRACTION,
+                    "{name} at 1280x800: expected HSQC+3D strips share >= {MIN_CANVAS_AREA_FRACTION}, got {share_1280:.3}"
+                );
+                let dock_r_1280 = m1280.right_dock_rect.expect("1280x800 strips right dock");
+                assert!(
+                    app.strip_tiler.last_column_rects.len() >= 3,
+                    "{name} at 1280x800 must render all 3 strips without clipping"
+                );
+                for (ci, col_r) in app.strip_tiler.last_column_rects.iter().enumerate() {
+                    assert!(
+                        col_r.left() >= dock_r_1280.left() - 1.0
+                            && col_r.right() <= dock_r_1280.right() + 1.0,
+                        "{name} at 1280x800 strip #{ci} clipped outside dock: col={col_r:?} dock={dock_r_1280:?}"
+                    );
+                }
+            }
+            if mode == WorkbenchMode::Assign {
+                assert!(
+                    audit.texts.iter().any(|t| t.text.contains("M1")),
+                    "{name} at 1280x800 must render unclipped edge residue cell M1"
+                );
+            }
             assert!(
                 audit.clipped.is_empty(),
                 "{name} at 1280x800 has clipped text: {:?}",
@@ -18407,24 +18594,32 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             }
         };
 
-        let mut t_sec = 0.1_f64;
-        let mut run_2d =
+        let t_sec = std::cell::Cell::new(0.1_f64);
+        let run_2d_mod = |events: Vec<egui::Event>,
+                          modifiers: egui::Modifiers,
+                          app: &mut NmrWorkbenchApp|
+         -> ResponsiveFrameMetrics {
+            let next_t = t_sec.get() + 0.25;
+            t_sec.set(next_t);
+            let raw = egui::RawInput {
+                screen_rect: Some(vp),
+                time: Some(next_t),
+                events,
+                ..Default::default()
+            };
+            let mut m_out = None;
+            let mut out = ctx.run_ui(raw, |ui| {
+                ui.ctx().input_mut(|i| i.modifiers = modifiers);
+                let mut shell = std::mem::take(&mut app.responsive_shell);
+                m_out = Some(render_responsive_workbench(ui, 300, &mut shell, app));
+                app.responsive_shell = shell;
+            });
+            out.textures_delta.clear();
+            m_out.expect("metrics")
+        };
+        let run_2d =
             |events: Vec<egui::Event>, app: &mut NmrWorkbenchApp| -> ResponsiveFrameMetrics {
-                t_sec += 0.25;
-                let raw = egui::RawInput {
-                    screen_rect: Some(vp),
-                    time: Some(t_sec),
-                    events,
-                    ..Default::default()
-                };
-                let mut m_out = None;
-                let mut out = ctx.run_ui(raw, |ui| {
-                    let mut shell = std::mem::take(&mut app.responsive_shell);
-                    m_out = Some(render_responsive_workbench(ui, 300, &mut shell, app));
-                    app.responsive_shell = shell;
-                });
-                out.textures_delta.clear();
-                m_out.expect("metrics")
+                run_2d_mod(events, egui::Modifiers::NONE, app)
             };
 
         let _ = run_2d(Vec::new(), &mut app);
@@ -18453,7 +18648,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             "Cmd+Z after 2D scroll contour change must restore contour_base"
         );
 
-        // 2. Cmd+Scroll on 2D -> zooms (F2, F1) and pushes zoom history
+        // 2. Cmd+Scroll on 2D -> zooms (F2, F1) and pushes zoom history (BOTH MouseWheel+ctrl AND Event::Zoom!)
         let cmd_mod = egui::Modifiers {
             ctrl: true,
             command: true,
@@ -18461,21 +18656,85 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         };
         let zlen0 = app.workbook.two_d.zoom_history.len();
         let span_h0 = (app.view_h_left - app.view_h_right).abs();
+        let span_n0 = (app.view_n_bottom - app.view_n_top).abs();
         let _ = run_2d(
             vec![egui::Event::PointerMoved(c), wheel_ev(36.0, cmd_mod)],
             &mut app,
         );
         let span_h1 = (app.view_h_left - app.view_h_right).abs();
+        let span_n1 = (app.view_n_bottom - app.view_n_top).abs();
         assert!(
-            span_h1 < span_h0 && app.workbook.two_d.zoom_history.len() > zlen0,
-            "2D Cmd+Scroll must zoom in and push zoom history"
+            span_h1 < span_h0 && span_n1 < span_n0 && app.workbook.two_d.zoom_history.len() > zlen0,
+            "2D Cmd+Scroll must zoom in both F2 & F1 and push zoom history"
         );
 
-        // 3. Shift+Scroll on 2D -> pans F2 horizontally
+        // 2b. Browser Ctrl+Scroll / Pinch (`egui::Event::Zoom`) on 2D -> zooms (F2, F1) (`B10`, fails at f8408b9!)
+        let zlen_z0 = app.workbook.two_d.zoom_history.len();
+        let span_hz0 = (app.view_h_left - app.view_h_right).abs();
+        let span_nz0 = (app.view_n_bottom - app.view_n_top).abs();
+        let _ = run_2d(
+            vec![egui::Event::PointerMoved(c), egui::Event::Zoom(1.35)],
+            &mut app,
+        );
+        let span_hz1 = (app.view_h_left - app.view_h_right).abs();
+        let span_nz1 = (app.view_n_bottom - app.view_n_top).abs();
+        assert!(
+            span_hz1 < span_hz0
+                && span_nz1 < span_nz0
+                && app.workbook.two_d.zoom_history.len() > zlen_z0,
+            "2D Event::Zoom (Ctrl/Cmd+scroll in browser) must zoom both F2 & F1: H {span_hz0}->{span_hz1}, N {span_nz0}->{span_nz1}"
+        );
+
+        // 2c. 2D Shift+drag zoom box while active tool is default `ToolMode2d::Pan` (`B10`, fails at f8408b9!)
+        app.reset_view_to_spec();
+        assert_eq!(
+            app.workbook.two_d.tool_mode,
+            ToolMode2d::Pan,
+            "default 2D tool mode is Pan"
+        );
         let sh_mod = egui::Modifiers {
             shift: true,
             ..Default::default()
         };
+        let zlen_box0 = app.workbook.two_d.zoom_history.len();
+        let span_hb0 = (app.view_h_left - app.view_h_right).abs();
+        let span_nb0 = (app.view_n_bottom - app.view_n_top).abs();
+        let p0 = egui::pos2(c.x - 90.0, c.y - 70.0);
+        let p1 = egui::pos2(c.x + 90.0, c.y + 70.0);
+        let _ = run_2d_mod(
+            vec![
+                egui::Event::PointerMoved(p0),
+                egui::Event::PointerButton {
+                    pos: p0,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: sh_mod,
+                },
+            ],
+            sh_mod,
+            &mut app,
+        );
+        let _ = run_2d_mod(vec![egui::Event::PointerMoved(p1)], sh_mod, &mut app);
+        let _ = run_2d_mod(
+            vec![egui::Event::PointerButton {
+                pos: p1,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: sh_mod,
+            }],
+            sh_mod,
+            &mut app,
+        );
+        let span_hb1 = (app.view_h_left - app.view_h_right).abs();
+        let span_nb1 = (app.view_n_bottom - app.view_n_top).abs();
+        assert!(
+            span_hb1 < span_hb0 * 0.75
+                && span_nb1 < span_nb0 * 0.75
+                && app.workbook.two_d.zoom_history.len() > zlen_box0,
+            "2D Shift+drag MUST zoom even when tool_mode is Pan (not pan!): H {span_hb0:.3}->{span_hb1:.3}, N {span_nb0:.3}->{span_nb1:.3}"
+        );
+
+        // 3. Shift+Scroll on 2D -> pans F2 horizontally
         let hl_pre = app.view_h_left;
         let _ = run_2d(
             vec![egui::Event::PointerMoved(c), wheel_ev(3.0, sh_mod)],
@@ -18548,5 +18807,245 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 "Shift+Scroll on CubePlane3d must step orthogonal 3D plane"
             );
         }
+    }
+
+    #[test]
+    fn test_first_run_bruker_open_process_pick_assign_within_5_real_clicks() {
+        use super::*;
+        use eframe::egui;
+        use nmr_gui::workbench_mode::audit_text_layout;
+
+        // 1. Write a real Bruker 2D HSQC (`pdata/1/{procs, proc2s, 2rr}`) + sequence FASTA to a temp directory
+        let tmp_root = std::env::temp_dir().join(format!(
+            "ferric_b12_first_run_bruker_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_root);
+        let pdata_dir = tmp_root.join("1").join("pdata").join("1");
+        std::fs::create_dir_all(&pdata_dir).expect("create temp Bruker pdata/1 dir");
+
+        let nx = 64usize;
+        let ny = 32usize;
+        let procs = format!(
+            "##TITLE= Synthetic HSQC F2\n\
+             ##$SI= {nx}\n\
+             ##$XDIM= {nx}\n\
+             ##$OFFSET= 10.5\n\
+             ##$SW_p= 3600.0\n\
+             ##$SF= 600.13\n\
+             ##$NC_proc= 0\n\
+             ##$BYTORDP= 0\n\
+             ##$DTYPP= 0\n\
+             ##$AXNUC= <1H>\n\
+             ##END=\n"
+        );
+        let proc2s = format!(
+            "##TITLE= Synthetic HSQC F1\n\
+             ##$SI= {ny}\n\
+             ##$XDIM= {ny}\n\
+             ##$OFFSET= 132.0\n\
+             ##$SW_p= 1824.0\n\
+             ##$SF= 60.81\n\
+             ##$NC_proc= 0\n\
+             ##$BYTORDP= 0\n\
+             ##$DTYPP= 0\n\
+             ##$AXNUC= <15N>\n\
+             ##END=\n"
+        );
+        std::fs::write(pdata_dir.join("procs"), procs).expect("write procs");
+        std::fs::write(pdata_dir.join("proc2s"), proc2s).expect("write proc2s");
+        std::fs::write(
+            tmp_root.join("1").join("acqus"),
+            "##TITLE= HSQC acqus\n##$PULPROG= <hsqcetfpf3gpsi>\n##$NUC1= <1H>\n##$PARMODE= 1\n##END=\n",
+        )
+        .expect("write acqus");
+        std::fs::write(
+            tmp_root.join("1").join("acqu2s"),
+            "##TITLE= HSQC acqu2s\n##$NUC1= <15N>\n##$TD= 32\n##END=\n",
+        )
+        .expect("write acqu2s");
+        std::fs::write(pdata_dir.join("title"), "1H-15N HSQC\n").expect("write title");
+
+        let ax_h = nmr_core::spectrum::AxisPpm::from_bounds("1H", nx, 10.5, 4.5, 600.13);
+        let ax_n = nmr_core::spectrum::AxisPpm::from_bounds("15N", ny, 132.0, 102.0, 60.81);
+        let mut raw_2rr = Vec::with_capacity(nx * ny * 4);
+        let peak_coords = [
+            (8.92_f64, 121.4_f64),
+            (8.45, 118.2),
+            (8.12, 115.6),
+            (7.85, 124.8),
+            (7.55, 119.5),
+            (8.68, 112.4),
+        ];
+        for iy in 0..ny {
+            let n_ppm = ax_n.index_to_ppm(iy as f64);
+            for ix in 0..nx {
+                let h_ppm = ax_h.index_to_ppm(ix as f64);
+                let mut val = 10.0_f64;
+                // Residual water ridge near 4.70 ppm
+                let dw = (h_ppm - 4.70) / 0.08;
+                val += 50_000.0 * (-0.5 * dw * dw).exp();
+                for &(ph, pn) in &peak_coords {
+                    let dh = (h_ppm - ph) / 0.09;
+                    let dn = (n_ppm - pn) / 0.9;
+                    val += 80_000.0 * (-0.5 * (dh * dh + dn * dn)).exp();
+                }
+                raw_2rr.extend_from_slice(&(val.round() as i32).to_le_bytes());
+            }
+        }
+        std::fs::write(pdata_dir.join("2rr"), &raw_2rr).expect("write 2rr");
+        std::fs::write(tmp_root.join("seq.fasta"), ">ubq_frag\nMQIFVKTLTGK\n")
+            .expect("write seq.fasta");
+
+        // 2. Drive the REAL NmrWorkbenchApp headlessly via real egui::RawInput events!
+        let mut app = make_headless_test_app();
+        let ctx = egui::Context::default();
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+        let t_sec = std::cell::Cell::new(0.1_f64);
+        let run_frame = |events: Vec<egui::Event>,
+                         dropped_files: Vec<egui::DroppedFileHandle>,
+                         app: &mut NmrWorkbenchApp|
+         -> egui::FullOutput {
+            let next_t = t_sec.get() + 0.25;
+            t_sec.set(next_t);
+            let raw = egui::RawInput {
+                screen_rect: Some(vp),
+                time: Some(next_t),
+                events,
+                dropped_files,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                app.handle_dropped_files(ui.ctx());
+                let mut shell = std::mem::take(&mut app.responsive_shell);
+                let _ = render_responsive_workbench(ui, 400, &mut shell, app);
+                app.responsive_shell = shell;
+            });
+            out.textures_delta.clear();
+            out
+        };
+
+        let find_button_center = |out: &egui::FullOutput, label: &str| -> egui::Pos2 {
+            let audit = audit_text_layout(&out.shapes, vp);
+            audit
+                .texts
+                .iter()
+                .find(|t| t.text.trim() == label)
+                .map(|t| t.rect.center())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Expected rendered UI button {label:?}, found {:?}",
+                        audit.texts.iter().map(|t| t.text.as_str()).collect::<Vec<_>>()
+                    )
+                })
+        };
+
+        let real_input_actions = std::cell::Cell::new(0usize);
+        let click_label = |label: &str, app: &mut NmrWorkbenchApp| -> egui::FullOutput {
+            let pre = run_frame(Vec::new(), Vec::new(), app);
+            let pos = find_button_center(&pre, label);
+            real_input_actions.set(real_input_actions.get() + 1);
+            let _ = run_frame(
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                Vec::new(),
+                app,
+            );
+            let _ = run_frame(
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                Vec::new(),
+                app,
+            );
+            run_frame(Vec::new(), Vec::new(), app)
+        };
+
+        // Action 1: Drop / Open the real Bruker directory (and sequence) into NmrWorkbenchApp
+        assert!(app.hsqc_spec.is_none());
+        real_input_actions.set(real_input_actions.get() + 1);
+        let _ = run_frame(
+            Vec::new(),
+            vec![nmr_gui::ingest_panel::InMemoryDroppedFile::into_handle(
+                tmp_root.clone(),
+                Vec::new(),
+            )],
+            &mut app,
+        );
+        let _ = run_frame(Vec::new(), Vec::new(), &mut app);
+        assert!(
+            app.hsqc_spec.is_some(),
+            "Action 1 (Open Bruker dir) must load 2D HSQC spectrum (ingest_open={}, status={:?}, exps={:?}, aux={:?})",
+            app.ingest_panel.open,
+            app.status_msg,
+            app.ingest_panel
+                .inventory
+                .experiments
+                .iter()
+                .map(|e| (&e.relative_path, &e.dimensionality, &e.data_state))
+                .collect::<Vec<_>>(),
+            app.ingest_panel
+                .inventory
+                .auxiliary_files
+                .iter()
+                .map(|f| &f.relative_path)
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            !app.sequence.is_empty(),
+            "Action 1 must load sequence from seq.fasta"
+        );
+        app.set_workbench_mode(WorkbenchMode::Process);
+        app.activate_2d_workbook_page(app.workbook.active_2d_idx);
+
+        // Action 2: Real click on "Water" in Process mode
+        assert!(app.water_undo_2d.is_none());
+        let _ = click_label("Water", &mut app);
+        assert!(
+            app.water_undo_2d.is_some(),
+            "Action 2 (Click 'Water') must run 2D water suppression and record undo state"
+        );
+
+        // Action 3: Real click on "Assign" in the mode switcher
+        let _ = click_label("Assign", &mut app);
+        assert_eq!(
+            app.workbench_mode,
+            WorkbenchMode::Assign,
+            "Action 3 (Click 'Assign') must switch workbench to Assign mode"
+        );
+
+        // Action 4: Real click on "Pick Peaks" in Assign mode
+        let _ = click_label("Pick Peaks", &mut app);
+        assert!(
+            app.peaks.len() >= 4,
+            "Action 4 (Click 'Pick Peaks') must pick >= 4 HSQC cross-peaks from real Bruker 2rr, got {}",
+            app.peaks.len()
+        );
+
+        // Action 5: Real click on "Run Assignment" in Assign mode
+        assert!(app.assign_res.is_none());
+        let _ = click_label("Run Assignment", &mut app);
+        assert!(
+            app.assign_res.is_some(),
+            "Action 5 (Click 'Run Assignment') must execute the assignment solver"
+        );
+
+        assert!(
+            real_input_actions.get() <= 5,
+            "Real headless first-run Bruker Open -> Process -> Pick -> Assign must complete in <= 5 actions, took {}",
+            real_input_actions.get()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 }

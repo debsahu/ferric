@@ -541,6 +541,14 @@ pub struct StripTilerPanel {
     pub selected_peak: Option<(usize, usize)>,
     /// Bounding rectangle of the strip plot canvas from the most recent frame.
     pub last_canvas_rect: Option<egui::Rect>,
+    /// Bounding rectangles of each rendered strip column from the most recent frame.
+    pub last_column_rects: Vec<egui::Rect>,
+    /// Compact docked mode (`true` by default): keeps inline controls inside the inspector `Options`
+    /// menu and fits the `i-1 / i / i+1` triplet cleanly to the available dock width without clipping.
+    pub compact_dock_mode: bool,
+    /// Show inline per-column `Walk`/`Link`/`Lock` footer buttons beneath strips (`false` by default;
+    /// all curation actions remain available via right-click context menu on any strip column).
+    pub show_footer_buttons: bool,
     user_resized_height: bool,
     zoom_drag_start_ppm: Option<f64>,
     context_menu_ss_idx: Option<usize>,
@@ -561,6 +569,9 @@ impl Default for StripTilerPanel {
             strip_gain: 1.0,
             selected_peak: None,
             last_canvas_rect: None,
+            last_column_rects: Vec::new(),
+            compact_dock_mode: true,
+            show_footer_buttons: false,
             user_resized_height: false,
             zoom_drag_start_ppm: None,
             context_menu_ss_idx: None,
@@ -680,56 +691,67 @@ impl StripTilerPanel {
             &self.cfg,
         );
 
-        // Top controls bar: Top-K selector + alignment guide toggles
-        ui.horizontal_wrapped(|ui| {
-            let root_ss = &ctx.systems[ctx.active_root];
-            ui.label(
-                egui::RichText::new(format!(
-                    "Strip Match-Finder  •  Root #{} (¹H {:.3}, ¹⁵N {:.2})",
-                    ctx.active_root, root_ss.h, root_ss.n
-                ))
-                .strong(),
-            );
-            ui.separator();
-            ui.label(egui::RichText::new("Top-K:").size(TYPE_CAPTION_PX));
-            for k_opt in [3usize, 5, 8] {
-                if ui
-                    .selectable_label(self.cfg.top_k == k_opt, format!("{k_opt}"))
-                    .clicked()
-                {
-                    self.cfg.top_k = k_opt;
+        // Top controls bar: in compact dock mode, controls live in the inspector Options menu to
+        // preserve the <= 12 primary-control budget and maximize 3D strip plot area (`UI-B2`, `UI-B7`).
+        if !self.compact_dock_mode {
+            ui.horizontal_wrapped(|ui| {
+                let root_ss = &ctx.systems[ctx.active_root];
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Strip Match-Finder  •  Root #{} (¹H {:.3}, ¹⁵N {:.2})",
+                        ctx.active_root, root_ss.h, root_ss.n
+                    ))
+                    .strong(),
+                );
+                ui.separator();
+                ui.label(egui::RichText::new("Top-K:").size(TYPE_CAPTION_PX));
+                for k_opt in [3usize, 5, 8] {
+                    if ui
+                        .selectable_label(self.cfg.top_k == k_opt, format!("{k_opt}"))
+                        .clicked()
+                    {
+                        self.cfg.top_k = k_opt;
+                    }
                 }
-            }
-            ui.separator();
-            ui.checkbox(
-                &mut self.show_ca_guides,
-                egui::RichText::new("Cα")
-                    .color(egui::Color32::from_rgb(75, 215, 255))
-                    .size(TYPE_CAPTION_PX),
-            );
-            ui.checkbox(
-                &mut self.show_cb_guides,
-                egui::RichText::new("Cβ")
-                    .color(egui::Color32::from_rgb(255, 125, 80))
-                    .size(TYPE_CAPTION_PX),
-            );
-            ui.checkbox(
-                &mut self.show_c_guides,
-                egui::RichText::new("C'")
-                    .color(egui::Color32::from_rgb(90, 235, 135))
-                    .size(TYPE_CAPTION_PX),
-            );
-            ui.checkbox(
-                &mut self.cfg.exclude_conflicting_locks,
-                egui::RichText::new("Filter Locks").size(TYPE_CAPTION_PX),
-            );
-        });
+                ui.separator();
+                ui.checkbox(
+                    &mut self.show_ca_guides,
+                    egui::RichText::new("Cα")
+                        .color(egui::Color32::from_rgb(75, 215, 255))
+                        .size(TYPE_CAPTION_PX),
+                );
+                ui.checkbox(
+                    &mut self.show_cb_guides,
+                    egui::RichText::new("Cβ")
+                        .color(egui::Color32::from_rgb(255, 125, 80))
+                        .size(TYPE_CAPTION_PX),
+                );
+                ui.checkbox(
+                    &mut self.show_c_guides,
+                    egui::RichText::new("C'")
+                        .color(egui::Color32::from_rgb(90, 235, 135))
+                        .size(TYPE_CAPTION_PX),
+                );
+                ui.checkbox(
+                    &mut self.cfg.exclude_conflicting_locks,
+                    egui::RichText::new("Filter Locks").size(TYPE_CAPTION_PX),
+                );
+            });
+        }
 
         // Build ordered column list: [p_m ... p_2, p_1, Active(i), q_1, q_2 ... q_n]
-        // so #1 predecessor and #1 successor sit immediately adjacent to Active Root (i).
+        // In compact dock mode, show the primary adjacent triplet `[p_1, Active(i), q_1]`
+        // so all 3 strips fit cleanly inside the docked inspector with zero horizontal clipping.
+        let max_side_cols = if self.compact_dock_mode {
+            1usize
+        } else {
+            self.cfg.top_k
+        };
+        let shown_preds = &matches.predecessors[..matches.predecessors.len().min(max_side_cols)];
+        let shown_succs = &matches.successors[..matches.successors.len().min(max_side_cols)];
         let mut columns: Vec<ColumnRole> =
-            Vec::with_capacity(matches.predecessors.len() + 1 + matches.successors.len());
-        for (idx, cand) in matches.predecessors.iter().cloned().enumerate().rev() {
+            Vec::with_capacity(shown_preds.len() + 1 + shown_succs.len());
+        for (idx, cand) in shown_preds.iter().cloned().enumerate().rev() {
             columns.push(ColumnRole::Predecessor {
                 rank_1based: idx + 1,
                 cand,
@@ -739,21 +761,30 @@ impl StripTilerPanel {
         columns.push(ColumnRole::ActiveRoot {
             ss_idx: ctx.active_root,
         });
-        for (idx, cand) in matches.successors.iter().cloned().enumerate() {
+        for (idx, cand) in shown_succs.iter().cloned().enumerate() {
             columns.push(ColumnRole::Successor {
                 rank_1based: idx + 1,
                 cand,
             });
         }
 
-        let left_axis_w = 50.0f32;
-        let col_w = 124.0f32;
+        let avail_w = ui.available_width().max(220.0);
+        let left_axis_w = if self.compact_dock_mode { 40.0f32 } else { 50.0f32 };
+        let col_w = if self.compact_dock_mode && columns.len() <= 3 {
+            ((avail_w - left_axis_w - 6.0) / (columns.len().max(1) as f32)).clamp(64.0, 124.0)
+        } else {
+            124.0f32
+        };
         if !self.user_resized_height || self.strip_height_px <= 0.0 {
-            self.strip_height_px = (ui.available_height() - 104.0).clamp(220.0, 680.0);
+            let reserve_h = if self.show_footer_buttons { 104.0 } else { 14.0 };
+            self.strip_height_px = (ui.available_height() - reserve_h).clamp(220.0, 680.0);
         }
         let strip_h = self.strip_height_px.clamp(220.0, 680.0);
-        let desired_w = (left_axis_w + (columns.len() as f32) * col_w + 8.0)
-            .max(ui.available_width().max(260.0));
+        let desired_w = if self.compact_dock_mode && columns.len() <= 3 {
+            avail_w
+        } else {
+            (left_axis_w + (columns.len() as f32) * col_w + 8.0).max(avail_w)
+        };
 
         let (ali_nuc, base_ali_range) = if let Some(s3) = ctx.spectra_3d.aliphatic_3d {
             let (_, nuc, bounds) = strip_vertical_axis_metadata(s3);
@@ -780,9 +811,8 @@ impl StripTilerPanel {
         });
         let show_co_band = ctx.spectra_3d.carbonyl_3d.is_some() || ali_nuc != "1H" || has_c_cands;
 
-        egui::ScrollArea::horizontal()
-            .id_salt("strip_tiler_hscroll")
-            .show(ui, |ui| {
+        let no_hscroll = self.compact_dock_mode && columns.len() <= 3;
+        let mut render_strips = |ui: &mut egui::Ui| {
                 // 1. Paint synchronized split-band (C' + CA/CB) strip columns & dashed guides
                 let (canvas_rect, canvas_resp) = ui.allocate_exact_size(
                     egui::vec2(desired_w, strip_h),
@@ -802,8 +832,13 @@ impl StripTilerPanel {
                 };
                 let ali_bot = canvas_rect.bottom() - 8.0;
 
-                let eff_col_w =
-                    ((canvas_rect.width() - left_axis_w - 6.0) / (columns.len() as f32)).max(col_w);
+                let eff_col_w = if no_hscroll {
+                    ((canvas_rect.width() - left_axis_w - 6.0) / (columns.len().max(1) as f32))
+                        .max(40.0)
+                } else {
+                    ((canvas_rect.width() - left_axis_w - 6.0) / (columns.len().max(1) as f32))
+                        .max(col_w)
+                };
 
                 // Interactive indirect-axis zoom (Cmd/Ctrl+Scroll, Shift+drag box, double-click reset),
                 // Shift+Scroll / Space+drag / Right/Middle-drag indirect pan, & plain scroll gain (`UI-C10`, `UI-C18`)
@@ -1150,30 +1185,55 @@ impl StripTilerPanel {
                         })
                         .unwrap_or_else(|| format!("SS#{ss_idx}"));
 
+                    let compact_hdr = self.compact_dock_mode || eff_col_w < 130.0;
                     let (top_label, sub_label, sub_col) = match col {
                         ColumnRole::Predecessor { rank_1based, cand } => (
-                            format!("i−1 #{rank_1based} {res_badge}"),
-                            format!(
-                                "P{:+.1} {:>2.0}% ({}n)",
-                                cand.pair_score,
-                                cand.rel_prob * 100.0,
-                                cand.matched_nuclei
-                            ),
+                            if compact_hdr {
+                                format!("i-1 {res_badge}")
+                            } else {
+                                format!("i−1 #{rank_1based} {res_badge}")
+                            },
+                            if compact_hdr {
+                                format!("P{:+.0} {:.0}%", cand.pair_score, cand.rel_prob * 100.0)
+                            } else {
+                                format!(
+                                    "P{:+.1} {:>2.0}% ({}n)",
+                                    cand.pair_score,
+                                    cand.rel_prob * 100.0,
+                                    cand.matched_nuclei
+                                )
+                            },
                             egui::Color32::from_rgb(185, 215, 250),
                         ),
                         ColumnRole::ActiveRoot { .. } => (
-                            format!("Root(i) {res_badge}"),
-                            format!("¹H {:.2} N {:.1}", ss.h, ss.n),
+                            if compact_hdr {
+                                format!("i {res_badge}")
+                            } else {
+                                format!("Root(i) {res_badge}")
+                            },
+                            if compact_hdr {
+                                format!("{:.2}/{:.0}", ss.h, ss.n)
+                            } else {
+                                format!("¹H {:.2} N {:.1}", ss.h, ss.n)
+                            },
                             egui::Color32::from_rgb(110, 230, 255),
                         ),
                         ColumnRole::Successor { rank_1based, cand } => (
-                            format!("i+1 #{rank_1based} {res_badge}"),
-                            format!(
-                                "P{:+.1} {:>2.0}% ({}n)",
-                                cand.pair_score,
-                                cand.rel_prob * 100.0,
-                                cand.matched_nuclei
-                            ),
+                            if compact_hdr {
+                                format!("i+1 {res_badge}")
+                            } else {
+                                format!("i+1 #{rank_1based} {res_badge}")
+                            },
+                            if compact_hdr {
+                                format!("P{:+.0} {:.0}%", cand.pair_score, cand.rel_prob * 100.0)
+                            } else {
+                                format!(
+                                    "P{:+.1} {:>2.0}% ({}n)",
+                                    cand.pair_score,
+                                    cand.rel_prob * 100.0,
+                                    cand.matched_nuclei
+                                )
+                            },
                             egui::Color32::from_rgb(185, 215, 250),
                         ),
                     };
@@ -1538,7 +1598,10 @@ impl StripTilerPanel {
                     egui::Stroke::new(2.0, grip_col),
                 );
 
-                // 2. Per-column residual summary & 1-click curation action buttons
+                self.last_column_rects = col_rects.iter().map(|(_, r)| *r).collect();
+
+                // 2. Per-column residual summary & 1-click curation action buttons (optional; right-click always available)
+                if self.show_footer_buttons {
                 ui.horizontal(|ui| {
                     ui.add_space(left_axis_w);
                     for col in &columns {
@@ -1602,7 +1665,15 @@ impl StripTilerPanel {
                         });
                     }
                 });
-            });
+                }
+        };
+        if no_hscroll {
+            render_strips(ui);
+        } else {
+            egui::ScrollArea::horizontal()
+                .id_salt("strip_tiler_hscroll")
+                .show(ui, render_strips);
+        }
 
         actions
     }
