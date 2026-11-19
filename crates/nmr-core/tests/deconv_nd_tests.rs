@@ -519,16 +519,20 @@ fn crowded_2d_doublet_triplet_recovery_and_monte_carlo_crlb_covariance() {
     let det = g00 * g11 - g01 * g01;
     let naive_var0 = sigma * sigma * g11 / det;
     let naive_var1 = sigma * sigma * g00 / det;
+    let res_cov = res
+        .amplitude_covariance
+        .as_ref()
+        .expect("converged fit must populate amplitude_covariance");
     assert!(
-        res.amplitude_covariance[0][0] > naive_var0 * 1.5,
+        res_cov[0][0] > naive_var0 * 1.5,
         "full CRLB var0 ({}) should reflect nonlinear overlap inflation over naive fixed-shape ({})",
-        res.amplitude_covariance[0][0],
+        res_cov[0][0],
         naive_var0
     );
     assert!(
-        res.amplitude_covariance[1][1] > naive_var1 * 1.5,
+        res_cov[1][1] > naive_var1 * 1.5,
         "full CRLB var1 ({}) should reflect nonlinear overlap inflation over naive fixed-shape ({})",
-        res.amplitude_covariance[1][1],
+        res_cov[1][1],
         naive_var1
     );
 
@@ -556,7 +560,10 @@ fn crowded_2d_doublet_triplet_recovery_and_monte_carlo_crlb_covariance() {
     ];
     // Evaluate exact theoretical CRLB at ground truth
     let crlb_ref = deconvolve_roi_2d(&clean_doublet, &true_seeds, &cfg).expect("crlb ref");
-    let crlb_cov = &crlb_ref.amplitude_covariance;
+    let crlb_cov = crlb_ref
+        .amplitude_covariance
+        .as_ref()
+        .expect("converged reference fit must populate amplitude_covariance");
 
     for _ in 0..n_mc {
         let mut trial = clean_doublet.clone();
@@ -605,10 +612,14 @@ fn crowded_2d_doublet_triplet_recovery_and_monte_carlo_crlb_covariance() {
         cov_rel01
     );
     // Overlapping doublet amplitudes are strongly negatively correlated
+    let crlb_corr = crlb_ref
+        .amplitude_correlation
+        .as_ref()
+        .expect("converged reference fit must populate amplitude_correlation");
     assert!(
-        crlb_ref.amplitude_correlation[0][1] < -0.5,
+        crlb_corr[0][1] < -0.5,
         "expected strong negative overlap correlation, got {}",
-        crlb_ref.amplitude_correlation[0][1]
+        crlb_corr[0][1]
     );
 
     // Crowded overlapping 2D triplet (~0.75 * FWHM pairwise separation, PseudoVoigt)
@@ -800,6 +811,8 @@ fn coupled_8plane_r2_relaxation_series_beats_naive_peak_picking() {
     assert_eq!(res.diagnostic, DeconvDiagnostic::Converged);
     assert!(res.converged);
     assert!(res.crlb_valid);
+    assert!(res.plane_amplitude_covariances.is_some());
+    assert!(res.plane_amplitude_correlations.is_some());
     assert!((res.reduced_chi2 - 1.0).abs() < 0.25);
 
     // Fit exponential decay rates to VarPro deconvolved amplitudes vs naive peak heights
@@ -1247,11 +1260,18 @@ fn block_schur_covariance_matches_dense_fisher_inverse() {
         }
     }
 
-    assert_eq!(res.full_covariance.len(), p_tot);
+    assert!(res.crlb_valid);
+    let full_cov = res
+        .full_covariance
+        .as_ref()
+        .expect("converged fit must populate full_covariance");
+    assert_eq!(full_cov.len(), p_tot);
     for (i, h_row) in h.iter().enumerate() {
         for j in 0..p_tot {
-            let prod: f64 = (0..p_tot)
-                .map(|k| h_row[k] * res.full_covariance[k][j])
+            let prod: f64 = h_row
+                .iter()
+                .zip(full_cov.iter())
+                .map(|(&h_ik, cov_k)| h_ik * cov_k[j])
                 .sum();
             let target = if i == j { sigma * sigma } else { 0.0 };
             assert!(
@@ -1396,6 +1416,10 @@ fn adversarial_hostile_inputs_and_fail_closed_diagnostics() {
     assert!(res_deg
         .all_diagnostics
         .contains(&DeconvDiagnostic::DegeneratePeakPair));
+    assert!(!res_deg.crlb_valid);
+    assert!(res_deg.amplitude_covariance.is_none());
+    assert!(res_deg.amplitude_correlation.is_none());
+    assert!(res_deg.full_covariance.is_none());
 
     // 9. Ill-conditioned cluster (3 closely spaced collinear peaks separated by 0.30 * FWHM,
     //    above the 0.25 degenerate cutoff, yielding high kappa(Phi) -> triggers IllConditionedCluster)
@@ -1464,6 +1488,10 @@ fn adversarial_hostile_inputs_and_fail_closed_diagnostics() {
     let res_ill = deconvolve_roi_2d(&roi_ill, &ill_seeds, &cfg_ill).expect("ill fit");
     assert_eq!(res_ill.diagnostic, DeconvDiagnostic::IllConditionedCluster);
     assert!(res_ill.basis_condition_number > 10.0);
+    assert!(!res_ill.crlb_valid);
+    assert!(res_ill.amplitude_covariance.is_none());
+    assert!(res_ill.amplitude_correlation.is_none());
+    assert!(res_ill.full_covariance.is_none());
 
     // 10. NonConverged when max_iterations == 1 far from optimum
     let cfg_nc = DeconvConfig {
@@ -1482,6 +1510,10 @@ fn adversarial_hostile_inputs_and_fail_closed_diagnostics() {
     let res_nc = deconvolve_roi_2d(&roi_deg, &far_seed, &cfg_nc).expect("nc fit");
     assert_eq!(res_nc.diagnostic, DeconvDiagnostic::NonConverged);
     assert!(!res_nc.converged);
+    assert!(!res_nc.crlb_valid);
+    assert!(res_nc.amplitude_covariance.is_none());
+    assert!(res_nc.amplitude_correlation.is_none());
+    assert!(res_nc.full_covariance.is_none());
 }
 
 /// `[synthetic self-consistency]` Verify multi-plane (`P = 3`) coupled block-Schur Cramér–Rao
@@ -1999,6 +2031,10 @@ fn fail_closed_pinned_center_and_misspecified_model_diagnostics() {
         DeconvDiagnostic::ModelMisspecified { reduced_chi2 } if *reduced_chi2 > 100.0
     )));
     assert!(!res_pin.crlb_valid);
+    // 22.1:P2-4: invalid Fisher inverses must never be populated when crlb_valid == false.
+    assert!(res_pin.amplitude_covariance.is_none());
+    assert!(res_pin.amplitude_correlation.is_none());
+    assert!(res_pin.full_covariance.is_none());
     assert!(res_pin
         .active_bounds
         .iter()
@@ -2062,14 +2098,30 @@ fn fail_closed_pinned_center_and_misspecified_model_diagnostics() {
         res_mis.diagnostic
     );
     assert!(!res_mis.crlb_valid);
+    assert!(res_mis.amplitude_covariance.is_none());
+    assert!(res_mis.amplitude_correlation.is_none());
+    assert!(res_mis.full_covariance.is_none());
     assert!(res_mis.peaks[0].amplitude_se.is_none());
     assert!(res_mis.peaks[0].volume_se.is_none());
     assert!(res_mis.peaks[0].center_f1_se.is_none());
     assert!(res_mis.peaks[0].fwhm_f1_se.is_none());
 
+    // Documented 22.1:P2-2 caveat: with unknown sigma (noise_sigma: None), reduced_chi2 is 1.0
+    // by construction and an interior misspecified fit still reports Converged.
+    let cfg_misspec_unknown_sigma = DeconvConfig {
+        lineshape: LineshapeKind::Gaussian,
+        noise_sigma: None,
+        ..DeconvConfig::default()
+    };
+    let res_mis_unk =
+        deconvolve_roi_2d(&roi_two, &one_seed, &cfg_misspec_unknown_sigma).expect("mis unk sigma");
+    assert_eq!(res_mis_unk.diagnostic, DeconvDiagnostic::Converged);
+    assert!((res_mis_unk.reduced_chi2 - 1.0).abs() < 1.0e-12);
+
     // -------------------------------------------------------------------------
     // Probe 3A: Active bound WITHOUT known sigma (noise_sigma: None) -> ActiveBoundHit,
-    //           pinned center_f1_se == None while unpinned parameters stay finite & NaN-free.
+    //           pinned center_f1_se == None while unpinned parameters stay finite & NaN-free;
+    //           covariance and correlation matrices suppressed to None because crlb_valid == false.
     // -------------------------------------------------------------------------
     let cfg_pin_unknown_sigma = DeconvConfig {
         lineshape: LineshapeKind::Lorentzian,
@@ -2081,6 +2133,9 @@ fn fail_closed_pinned_center_and_misspecified_model_diagnostics() {
         deconvolve_roi_2d(&roi_pin, &pinned_seed, &cfg_pin_unknown_sigma).expect("pin unk sigma");
     assert_eq!(res_pin_unk.diagnostic, DeconvDiagnostic::ActiveBoundHit);
     assert!(!res_pin_unk.crlb_valid);
+    assert!(res_pin_unk.amplitude_covariance.is_none());
+    assert!(res_pin_unk.amplitude_correlation.is_none());
+    assert!(res_pin_unk.full_covariance.is_none());
     assert!(res_pin_unk.peaks[0].center_f1_se.is_none());
     // Unpinned parameters get finite conditional SEs (never NaN).
     assert!(res_pin_unk.peaks[0]
@@ -2119,6 +2174,9 @@ fn fail_closed_pinned_center_and_misspecified_model_diagnostics() {
     let res_eta_bound = deconvolve_roi_2d(&roi_gauss, &pv_seed, &cfg_pv).expect("eta bound fit");
     assert_eq!(res_eta_bound.diagnostic, DeconvDiagnostic::ActiveBoundHit);
     assert!(!res_eta_bound.crlb_valid);
+    assert!(res_eta_bound.amplitude_covariance.is_none());
+    assert!(res_eta_bound.amplitude_correlation.is_none());
+    assert!(res_eta_bound.full_covariance.is_none());
     assert!(res_eta_bound
         .active_bounds
         .iter()
@@ -2148,6 +2206,9 @@ fn fail_closed_pinned_center_and_misspecified_model_diagnostics() {
         deconvolve_roi_2d(&roi_gauss, &fwhm_seed, &cfg_fwhm_bound).expect("fwhm bound fit");
     assert_eq!(res_fwhm_bound.diagnostic, DeconvDiagnostic::ActiveBoundHit);
     assert!(!res_fwhm_bound.crlb_valid);
+    assert!(res_fwhm_bound.amplitude_covariance.is_none());
+    assert!(res_fwhm_bound.amplitude_correlation.is_none());
+    assert!(res_fwhm_bound.full_covariance.is_none());
     assert!(res_fwhm_bound
         .active_bounds
         .iter()
@@ -2205,6 +2266,9 @@ fn fail_closed_pinned_center_and_misspecified_model_diagnostics() {
     let res_3d_pin = deconvolve_roi_3d(&roi_3d, &pin_seed_3d, &cfg_3d_pin).expect("3d pin fit");
     assert_eq!(res_3d_pin.diagnostic, DeconvDiagnostic::ActiveBoundHit);
     assert!(!res_3d_pin.crlb_valid);
+    assert!(res_3d_pin.amplitude_covariance.is_none());
+    assert!(res_3d_pin.amplitude_correlation.is_none());
+    assert!(res_3d_pin.full_covariance.is_none());
     assert!(res_3d_pin.peaks[0].center_f1_se.is_none());
     assert!(res_3d_pin.peaks[0].amplitude_se.is_none());
 
@@ -2221,6 +2285,8 @@ fn fail_closed_pinned_center_and_misspecified_model_diagnostics() {
         DeconvDiagnostic::ModelMisspecified { reduced_chi2 } if reduced_chi2 > 10.0
     ));
     assert!(!res_series_mis.crlb_valid);
+    assert!(res_series_mis.plane_amplitude_covariances.is_none());
+    assert!(res_series_mis.plane_amplitude_correlations.is_none());
     assert!(res_series_mis.peaks[0]
         .amplitude_se
         .iter()

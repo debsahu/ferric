@@ -129,6 +129,12 @@ pub struct ActiveBound {
 pub enum DeconvDiagnostic {
     /// Optimizer converged cleanly with well-conditioned basis, interior parameters,
     /// distinct peak centers, and acceptable goodness-of-fit.
+    ///
+    /// Note: goodness-of-fit ([`DeconvDiagnostic::ModelMisspecified`]) can only be tested when
+    /// `DeconvConfig::noise_sigma` is `Some(sigma)`. When `noise_sigma` is `None` (unknown $\sigma$),
+    /// $\hat{\sigma}^2 = \mathrm{RSS}/\nu$ is estimated from the residuals so `reduced_chi2` is
+    /// identically `1.0`, and an interior, well-conditioned, converged fit to a misspecified model
+    /// will still report `Converged`.
     Converged,
     /// Basis matrix $\Phi$ or full joint Jacobian exceeded the condition-number guardrail.
     IllConditionedCluster,
@@ -142,6 +148,9 @@ pub enum DeconvDiagnostic {
     ActiveBoundHit,
     /// Known-$\sigma$ reduced chi-squared $\chi^2_\nu$ exceeded the goodness-of-fit threshold
     /// (default $\chi^2_{0.999}(\nu)/\nu$), indicating model misspecification.
+    ///
+    /// Only emitted when `DeconvConfig::noise_sigma` is `Some(sigma)`; with unknown $\sigma$
+    /// (`noise_sigma == None`), `reduced_chi2` is `1.0` by construction and this gate cannot fire.
     ModelMisspecified { reduced_chi2: f64 },
 }
 
@@ -232,7 +241,8 @@ pub struct DeconvConfig {
     pub linewidth_sharing: LinewidthSharing,
     /// Fit the pseudo-Voigt mixing parameter $\eta \in [0, 1]$ (ignored for pure Lorentzian/Gaussian).
     pub fit_mixing: bool,
-    /// Include an additive constant baseline term per plane in the linear projection.
+    /// Include an additive constant offset per plane (flat scalar baseline, not a sloped/linear
+    /// baseline) in the VarPro linear projection.
     pub fit_baseline: bool,
     /// Maximum Levenberg–Marquardt iterations.
     pub max_iterations: usize,
@@ -254,7 +264,10 @@ pub struct DeconvConfig {
     /// Optional known voxel noise standard deviation $\sigma$. When `Some(sigma)`, used to compute
     /// exact theoretical Cramér–Rao covariance $\sigma^2 (J_{\text{full}}^T J_{\text{full}})^{-1}$
     /// and reduced $\chi^2_\nu$ (enabling the [`DeconvDiagnostic::ModelMisspecified`] gate).
-    /// When `None`, $\hat{\sigma}^2 = \mathrm{RSS}/\nu$ is estimated from the fit residuals.
+    /// When `None`, $\hat{\sigma}^2 = \mathrm{RSS}/\nu$ is estimated from the fit residuals so
+    /// `reduced_chi2` is identically `1.0`, the [`DeconvDiagnostic::ModelMisspecified`] gate
+    /// cannot fire, and an interior, well-conditioned misspecified fit still reports
+    /// [`DeconvDiagnostic::Converged`].
     pub noise_sigma: Option<f64>,
     /// Optional explicit upper threshold on reduced $\chi^2_\nu$ when `noise_sigma` is `Some(_)`.
     /// When `None` (default), uses the exact upper-tail critical value
@@ -697,18 +710,26 @@ pub struct FittedPeak3D {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeconvResult2D {
     pub peaks: Vec<FittedPeak2D>,
+    /// Fitted additive constant offset for the plane (`0.0` when `fit_baseline == false`).
     pub baseline: f64,
     pub baseline_se: Option<f64>,
     /// Peak amplitude covariance submatrix ($K \times K$) extracted from the full joint
-    /// $(J_{\text{full}}^T J_{\text{full}})^{-1} \hat{\sigma}^2$ matrix.
-    pub amplitude_covariance: Vec<Vec<f64>>,
-    /// Peak amplitude overlap correlation matrix ($K \times K$, entries in $[-1, 1]$).
-    pub amplitude_correlation: Vec<Vec<f64>>,
-    /// Full joint covariance matrix over `[linear_params..., nonlinear_params...]`.
-    pub full_covariance: Vec<Vec<f64>>,
+    /// $(J_{\text{full}}^T J_{\text{full}})^{-1} \hat{\sigma}^2$ matrix, or `None` when
+    /// `crlb_valid == false` so invalid Fisher inverses are never exposed.
+    pub amplitude_covariance: Option<Vec<Vec<f64>>>,
+    /// Peak amplitude overlap correlation matrix ($K \times K$, entries in $[-1, 1]$), or `None`
+    /// when `crlb_valid == false`.
+    pub amplitude_correlation: Option<Vec<Vec<f64>>>,
+    /// Full joint covariance matrix over `[linear_params..., nonlinear_params...]`, or `None` when
+    /// `crlb_valid == false`.
+    pub full_covariance: Option<Vec<Vec<f64>>>,
     pub rss: f64,
     pub dof: usize,
     pub residual_sigma: f64,
+    /// Reduced chi-squared $\chi^2_\nu = \mathrm{RSS}/(\nu \sigma^2)$ when `noise_sigma` is
+    /// `Some(sigma)`, or identically `1.0` when `noise_sigma` is `None` (unknown $\sigma$, in
+    /// which case model misspecification cannot be detected from $\chi^2_\nu$ and an interior fit
+    /// still reports [`DeconvDiagnostic::Converged`]).
     pub reduced_chi2: f64,
     pub basis_condition_number: f64,
     pub jacobian_condition_number: f64,
@@ -718,6 +739,8 @@ pub struct DeconvResult2D {
     pub active_bounds: Vec<ActiveBound>,
     /// `true` iff the unconstrained full Cramér–Rao covariance satisfies regularity conditions
     /// (converged, interior optimum with no active bounds, well-conditioned, and not misspecified).
+    /// When `false`, `amplitude_covariance`, `amplitude_correlation`, and `full_covariance` are
+    /// suppressed to `None`.
     pub crlb_valid: bool,
     pub iterations: usize,
     pub converged: bool,
@@ -731,14 +754,24 @@ pub struct DeconvResult2D {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeconvResult3D {
     pub peaks: Vec<FittedPeak3D>,
+    /// Fitted additive constant offset for the 3D ROI (`0.0` when `fit_baseline == false`).
     pub baseline: f64,
     pub baseline_se: Option<f64>,
-    pub amplitude_covariance: Vec<Vec<f64>>,
-    pub amplitude_correlation: Vec<Vec<f64>>,
-    pub full_covariance: Vec<Vec<f64>>,
+    /// Peak amplitude covariance submatrix ($K \times K$), or `None` when `crlb_valid == false`.
+    pub amplitude_covariance: Option<Vec<Vec<f64>>>,
+    /// Peak amplitude overlap correlation matrix ($K \times K$, entries in $[-1, 1]$), or `None`
+    /// when `crlb_valid == false`.
+    pub amplitude_correlation: Option<Vec<Vec<f64>>>,
+    /// Full joint covariance matrix over `[linear_params..., nonlinear_params...]`, or `None` when
+    /// `crlb_valid == false`.
+    pub full_covariance: Option<Vec<Vec<f64>>>,
     pub rss: f64,
     pub dof: usize,
     pub residual_sigma: f64,
+    /// Reduced chi-squared $\chi^2_\nu = \mathrm{RSS}/(\nu \sigma^2)$ when `noise_sigma` is
+    /// `Some(sigma)`, or identically `1.0` when `noise_sigma` is `None` (unknown $\sigma$, in
+    /// which case model misspecification cannot be detected from $\chi^2_\nu$ and an interior fit
+    /// still reports [`DeconvDiagnostic::Converged`]).
     pub reduced_chi2: f64,
     pub basis_condition_number: f64,
     pub jacobian_condition_number: f64,
@@ -747,6 +780,8 @@ pub struct DeconvResult3D {
     /// Nonlinear parameters sitting on an active box bound at the solution.
     pub active_bounds: Vec<ActiveBound>,
     /// `true` iff the unconstrained full Cramér–Rao covariance satisfies regularity conditions.
+    /// When `false`, `amplitude_covariance`, `amplitude_correlation`, and `full_covariance` are
+    /// suppressed to `None`.
     pub crlb_valid: bool,
     pub iterations: usize,
     pub converged: bool,
@@ -787,16 +822,24 @@ pub struct PlanePeakSeries {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlaneSeriesDeconvResult {
     pub peaks: Vec<PlanePeakSeries>,
+    /// Fitted additive constant offset per plane (length `P`; all `0.0` when
+    /// `fit_baseline == false`).
     pub baselines: Vec<f64>,
     pub baseline_se: Vec<Option<f64>>,
-    /// Per-plane peak amplitude covariance matrices (`P` matrices of size $K \times K$).
-    pub plane_amplitude_covariances: Vec<Vec<Vec<f64>>>,
-    /// Per-plane peak amplitude correlation matrices (`P` matrices of size $K \times K$).
-    pub plane_amplitude_correlations: Vec<Vec<Vec<f64>>>,
+    /// Per-plane peak amplitude covariance matrices (`P` matrices of size $K \times K$), or `None`
+    /// when `crlb_valid == false` so invalid Fisher inverses are never exposed.
+    pub plane_amplitude_covariances: Option<Vec<Vec<Vec<f64>>>>,
+    /// Per-plane peak amplitude correlation matrices (`P` matrices of size $K \times K$), or `None`
+    /// when `crlb_valid == false`.
+    pub plane_amplitude_correlations: Option<Vec<Vec<Vec<f64>>>>,
     pub rss: f64,
     pub plane_rss: Vec<f64>,
     pub dof: usize,
     pub residual_sigma: f64,
+    /// Reduced chi-squared $\chi^2_\nu = \mathrm{RSS}/(\nu \sigma^2)$ when `noise_sigma` is
+    /// `Some(sigma)`, or identically `1.0` when `noise_sigma` is `None` (unknown $\sigma$, in
+    /// which case model misspecification cannot be detected from $\chi^2_\nu$ and an interior fit
+    /// still reports [`DeconvDiagnostic::Converged`]).
     pub reduced_chi2: f64,
     pub basis_condition_number: f64,
     pub jacobian_condition_number: f64,
@@ -805,6 +848,8 @@ pub struct PlaneSeriesDeconvResult {
     /// Nonlinear parameters sitting on an active box bound at the solution.
     pub active_bounds: Vec<ActiveBound>,
     /// `true` iff the unconstrained full Cramér–Rao covariance satisfies regularity conditions.
+    /// When `false`, `plane_amplitude_covariances` and `plane_amplitude_correlations` are
+    /// suppressed to `None`.
     pub crlb_valid: bool,
     pub iterations: usize,
     pub converged: bool,
@@ -3566,16 +3611,25 @@ pub fn deconvolve_roi_2d(
     } else {
         (0.0, None)
     };
-    let amp_cov = extract_peak_cov_submatrix(lin_cov, n_peaks);
-    let amp_corr = correlation_from_covariance(&amp_cov, n_peaks);
+    let (amplitude_covariance, amplitude_correlation, full_covariance) = if out.crlb_valid {
+        let amp_cov = extract_peak_cov_submatrix(lin_cov, n_peaks);
+        let amp_corr = correlation_from_covariance(&amp_cov, n_peaks);
+        (
+            Some(amp_cov),
+            Some(amp_corr),
+            Some(out.cov.single_plane_full_cov),
+        )
+    } else {
+        (None, None, None)
+    };
 
     Ok(DeconvResult2D {
         peaks,
         baseline,
         baseline_se,
-        amplitude_covariance: amp_cov,
-        amplitude_correlation: amp_corr,
-        full_covariance: out.cov.single_plane_full_cov,
+        amplitude_covariance,
+        amplitude_correlation,
+        full_covariance,
         rss: out.eval.total_rss,
         dof: out.dof,
         residual_sigma: out.residual_sigma,
@@ -3709,16 +3763,25 @@ pub fn deconvolve_roi_3d(
     } else {
         (0.0, None)
     };
-    let amp_cov = extract_peak_cov_submatrix(lin_cov, n_peaks);
-    let amp_corr = correlation_from_covariance(&amp_cov, n_peaks);
+    let (amplitude_covariance, amplitude_correlation, full_covariance) = if out.crlb_valid {
+        let amp_cov = extract_peak_cov_submatrix(lin_cov, n_peaks);
+        let amp_corr = correlation_from_covariance(&amp_cov, n_peaks);
+        (
+            Some(amp_cov),
+            Some(amp_corr),
+            Some(out.cov.single_plane_full_cov),
+        )
+    } else {
+        (None, None, None)
+    };
 
     Ok(DeconvResult3D {
         peaks,
         baseline,
         baseline_se,
-        amplitude_covariance: amp_cov,
-        amplitude_correlation: amp_corr,
-        full_covariance: out.cov.single_plane_full_cov,
+        amplitude_covariance,
+        amplitude_correlation,
+        full_covariance,
         rss: out.eval.total_rss,
         dof: out.dof,
         residual_sigma: out.residual_sigma,
@@ -3857,11 +3920,8 @@ pub fn deconvolve_plane_series_2d(
 
     let mut baselines = Vec::with_capacity(n_planes);
     let mut baseline_se = Vec::with_capacity(n_planes);
-    let mut plane_amplitude_covariances = Vec::with_capacity(n_planes);
-    let mut plane_amplitude_correlations = Vec::with_capacity(n_planes);
 
     for p in 0..n_planes {
-        let lin_cov = &out.cov.plane_linear_cov[p];
         if config.fit_baseline {
             baselines.push(out.eval.plane_amplitudes[p][n_peaks]);
             baseline_se.push(plane_lin_se(p, n_peaks));
@@ -3869,11 +3929,22 @@ pub fn deconvolve_plane_series_2d(
             baselines.push(0.0);
             baseline_se.push(None);
         }
-        let amp_cov = extract_peak_cov_submatrix(lin_cov, n_peaks);
-        let amp_corr = correlation_from_covariance(&amp_cov, n_peaks);
-        plane_amplitude_covariances.push(amp_cov);
-        plane_amplitude_correlations.push(amp_corr);
     }
+
+    let (plane_amplitude_covariances, plane_amplitude_correlations) = if out.crlb_valid {
+        let mut covs = Vec::with_capacity(n_planes);
+        let mut corrs = Vec::with_capacity(n_planes);
+        for p in 0..n_planes {
+            let lin_cov = &out.cov.plane_linear_cov[p];
+            let amp_cov = extract_peak_cov_submatrix(lin_cov, n_peaks);
+            let amp_corr = correlation_from_covariance(&amp_cov, n_peaks);
+            covs.push(amp_cov);
+            corrs.push(amp_corr);
+        }
+        (Some(covs), Some(corrs))
+    } else {
+        (None, None)
+    };
 
     Ok(PlaneSeriesDeconvResult {
         peaks,
