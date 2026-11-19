@@ -1,14 +1,20 @@
-//! WebGPU (`wgpu` + WGSL) batched WaveNet / dilated-convolution `FID-Net` / `FID-Net-2`
+//! WebGPU (`wgpu` + WGSL) batched symmetric dilated-convolution `FID-Net`
 //! compute engine (`GpuFidNet`).
+//!
+//! ## Weight Status
+//! **Untrained architecture (no bundled pretrained weights; requires user-supplied or externally
+//! trained `FIDNET-V1` weights).**
 //!
 //! ## Provenance & License Attribution
 //! Clean-room GPU compute implementation matching `nmr_core::fidnet::FidNetModel` (`f64` CPU
-//! reference) to `< 1e-4`, based on the MIT-licensed `FID-Net` / `FID-Net-2` architecture:
+//! reference) to `< 1e-4`, based on the MIT-licensed `FID-Net` symmetric dilated-convolution
+//! architecture (with optional `input_residual_skip` shortcut; not the full `FID-Net-2`
+//! architecture):
 //! - Karunanithy, G. & Hansen, D. F. (2021), *J. Biomol. NMR* 75, 179–191.
 //! - Karunanithy, G., Mackenzie, H. W. & Hansen, D. F. (2021), *J. Am. Chem. Soc.* 143(41),
 //!   16935–16942.
-//! - Karunanithy, G., Reinstein, J. & Hansen, D. F. (2023), *J. Phys. Chem. Lett.* 14(21),
-//!   4951–4959.
+//! - Karunanithy, G. et al. (2024), *Nat. Commun.*
+//! - Karunanithy, G. et al. (2024), *Sci. Adv.*
 //! - Reference architecture repository: <https://github.com/gogulan-k/FID-Net> (MIT License).
 
 use bytemuck::{Pod, Zeroable};
@@ -34,7 +40,7 @@ struct FidNetParamsGpu {
     skip_ch: u32,
     kernel_size: u32,
     dilation: u32,
-    output_residual: u32,
+    input_residual_skip: u32,
 
     off_stem_w: u32,
     off_stem_b: u32,
@@ -154,7 +160,8 @@ pub fn validate_fidnet_gpu_dispatch_limits(
     Ok(())
 }
 
-/// WebGPU compute engine for batched `FID-Net` / `FID-Net-2` time-domain inference.
+/// WebGPU compute engine for batched symmetric dilated-convolution `FID-Net` time-domain inference
+/// (untrained architecture; requires user-supplied or externally trained `FIDNET-V1` weights).
 pub struct GpuFidNet {
     config: FidNetConfig,
     off_stem_w: u32,
@@ -559,7 +566,7 @@ impl GpuFidNet {
         let res_ch_u32 = self.config.residual_channels as u32;
         let skip_ch_u32 = self.config.skip_channels as u32;
 
-        // Build per-block uniform buffers and ping-ponged bind groups so the entire WaveNet stack
+        // Build per-block uniform buffers and ping-ponged bind groups so the entire dilated stack
         // executes inside a single CommandEncoder submission with strict inter-pass barriers.
         let mut param_bufs = Vec::with_capacity(self.block_offsets.len());
         let mut bind_groups = Vec::with_capacity(self.block_offsets.len());
@@ -579,7 +586,7 @@ impl GpuFidNet {
                 skip_ch: skip_ch_u32,
                 kernel_size: self.config.kernel_size as u32,
                 dilation: dilation as u32,
-                output_residual: u32::from(self.config.output_residual),
+                input_residual_skip: u32::from(self.config.input_residual_skip),
                 off_stem_w: self.off_stem_w,
                 off_stem_b: self.off_stem_b,
                 off_filter_w: offs.filter_w,
@@ -673,7 +680,7 @@ impl GpuFidNet {
             pass.dispatch_workgroups(wg_x, res_ch_u32, batch_u32);
         }
 
-        // 2. Dilated WaveNet blocks
+        // 2. Symmetric dilated convolution blocks
         for bg in &bind_groups {
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

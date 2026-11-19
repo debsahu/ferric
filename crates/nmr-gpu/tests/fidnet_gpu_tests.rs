@@ -1,5 +1,9 @@
-//! `[synthetic self-consistency]` WebGPU (`wgpu` + WGSL) `FID-Net` / `FID-Net-2` numerical
-//! parity tests against `nmr_core::fidnet::FidNetModel` (`f64` CPU reference) and hostile/limit guards.
+//! `[synthetic self-consistency]` WebGPU (`wgpu` + WGSL) symmetric dilated-convolution `FID-Net`
+//! numerical parity tests against `nmr_core::fidnet::FidNetModel` (`f64` CPU reference) and
+//! hostile/limit guards.
+//!
+//! Note: tests exercise the untrained architecture with deterministic random weights (no bundled
+//! pretrained weights).
 
 use nmr_core::fid::Complex64;
 use nmr_core::fidnet::{
@@ -12,7 +16,7 @@ use nmr_gpu::GpuEngine;
 /// `[synthetic self-consistency]` Verify CPU (`f64`) vs WebGPU (`f32`) forward parity
 /// (`max |gpu - cpu| < 1e-4`) across single FIDs and 2D batches covering all task configurations
 /// (NUS with mask channel, virtual decoupling with coupling channel, denoising, asymmetric
-/// `residual_channels != skip_channels`, and `output_residual = true/false`).
+/// `residual_channels != skip_channels`, and `input_residual_skip = true/false`).
 #[test]
 fn test_fidnet_cpu_vs_webgpu_batched_parity() {
     let engine = match GpuEngine::new_headless() {
@@ -36,7 +40,7 @@ fn test_fidnet_cpu_vs_webgpu_batched_parity() {
             skip_channels: 16,
             kernel_size: 5,
             dilations: vec![1, 2, 4, 8],
-            output_residual: true,
+            input_residual_skip: true,
         },
         FidNetConfig {
             task: FidNetTask::VirtualDecoupling,
@@ -46,7 +50,7 @@ fn test_fidnet_cpu_vs_webgpu_batched_parity() {
             skip_channels: 8,
             kernel_size: 7,
             dilations: vec![1, 2, 4, 8, 16],
-            output_residual: false,
+            input_residual_skip: false,
         },
         FidNetConfig {
             task: FidNetTask::Denoising,
@@ -56,7 +60,7 @@ fn test_fidnet_cpu_vs_webgpu_batched_parity() {
             skip_channels: 12,
             kernel_size: 3,
             dilations: vec![1, 2, 4],
-            output_residual: true,
+            input_residual_skip: true,
         },
     ];
 
@@ -172,8 +176,8 @@ fn test_fidnet_cpu_vs_webgpu_batched_parity() {
             }
         }
         println!(
-            "Config {ci} ({:?}, res={}, skip={}, k={}, out_res={}): max |gpu - cpu| = {max_batch_diff:.3e}",
-            cfg.task, cfg.residual_channels, cfg.skip_channels, cfg.kernel_size, cfg.output_residual
+            "Config {ci} ({:?}, res={}, skip={}, k={}, skip_in={}): max |gpu - cpu| = {max_batch_diff:.3e}",
+            cfg.task, cfg.residual_channels, cfg.skip_channels, cfg.kernel_size, cfg.input_residual_skip
         );
         assert!(
             max_batch_diff < 1e-4,

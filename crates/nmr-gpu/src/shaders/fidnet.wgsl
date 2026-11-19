@@ -1,12 +1,18 @@
-// Clean-room WGSL compute shader for batched WaveNet / dilated-convolution `FID-Net` /
-// `FID-Net-2` time-domain NMR inference (NUS reconstruction, virtual J-decoupling, denoising).
+// Clean-room WGSL compute shader for batched symmetric dilated-convolution `FID-Net`
+// time-domain NMR inference (NUS reconstruction, virtual J-decoupling, denoising).
+//
+// Weight Status:
+// Untrained architecture (no bundled pretrained weights; requires user-supplied or externally
+// trained FIDNET-V1 weights).
 //
 // Provenance & License:
 // Clean-room GPU compute implementation matching `nmr_core::fidnet::FidNetModel` (f64 CPU
-// reference) to < 1e-4, based on the MIT-licensed FID-Net / FID-Net-2 architecture:
+// reference) to < 1e-4, based on the MIT-licensed FID-Net symmetric dilated-convolution
+// architecture (with optional `input_residual_skip` shortcut; not the full FID-Net-2 architecture):
 // - Karunanithy, G. & Hansen, D. F. (2021), J. Biomol. NMR 75, 179-191.
 // - Karunanithy, G., Mackenzie, H. W. & Hansen, D. F. (2021), J. Am. Chem. Soc. 143, 16935-16942.
-// - Karunanithy, G., Reinstein, J. & Hansen, D. F. (2023), J. Phys. Chem. Lett. 14, 4951-4959.
+// - Karunanithy, G. et al. (2024), Nat. Commun.
+// - Karunanithy, G. et al. (2024), Sci. Adv.
 // - Reference repository: https://github.com/gogulan-k/FID-Net (MIT License).
 
 struct FidNetParams {
@@ -18,7 +24,7 @@ struct FidNetParams {
     skip_ch: u32,
     kernel_size: u32,
     dilation: u32,
-    output_residual: u32,
+    input_residual_skip: u32,
 
     off_stem_w: u32,
     off_stem_b: u32,
@@ -201,7 +207,7 @@ fn fidnet_head(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var is_ch: u32 = 0u; is_ch < params.skip_ch; is_ch = is_ch + 1u) {
         acc = acc + weights[w_row + is_ch] * z_buf[z_b_base + is_ch * params.t_len + t];
     }
-    if (params.output_residual != 0u) {
+    if (params.input_residual_skip != 0u) {
         acc = acc + input_buf[(b * params.in_ch + o) * params.t_len + t];
     }
     out_buf[(b * 2u + o) * params.t_len + t] = acc;
