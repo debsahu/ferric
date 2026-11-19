@@ -482,8 +482,73 @@ pub fn synthetic_strip_intensity_at_ppm(ss: &SpinSystem, c_ppm: f64) -> f32 {
 pub struct StripSpectra3D<'a> {
     /// Aliphatic `13C` 3D cube (`HNCACB`, `CBCA(CO)NH`, `HNCA`, `HN(CO)CA`).
     pub aliphatic_3d: Option<&'a Spectrum3D>,
-    /// Carbonyl `13C'` 3D cube (`HNCO`, `HN(CA)CO`).
+    /// Carbonyl `13C'` 3D cube (`HNCO`: inter-residue `C'_{i-1}`).
     pub carbonyl_3d: Option<&'a Spectrum3D>,
+}
+
+/// Full 3D strip cube bundle pairing aliphatic (`HNCACB`/`CBCA(CO)NH`/`HNCA`/`HN(CO)CA`) with
+/// both inter-residue carbonyl (`HNCO`: `C'_{i-1}`) and intra+inter carbonyl (`HN(CA)CO`:
+/// `C'_i + C'_{i-1}`) volumetric cubes.
+#[derive(Clone, Copy, Default)]
+pub struct StripSpectra3DFull<'a> {
+    /// Aliphatic `13C` 3D cube (`HNCACB`, `CBCA(CO)NH`, `HNCA`, `HN(CO)CA`).
+    pub aliphatic_3d: Option<&'a Spectrum3D>,
+    /// Inter-residue carbonyl `13C'` 3D cube (`HNCO`, `C'_{i-1}`).
+    pub carbonyl_3d: Option<&'a Spectrum3D>,
+    /// Intra+inter carbonyl `13C'` 3D cube (`HN(CA)CO`, `C'_i + C'_{i-1}`).
+    pub carbonyl_intra_3d: Option<&'a Spectrum3D>,
+}
+
+impl<'a> StripSpectra3DFull<'a> {
+    /// Project down to the legacy 2-cube [`StripSpectra3D`] view.
+    pub const fn to_legacy(self) -> StripSpectra3D<'a> {
+        StripSpectra3D {
+            aliphatic_3d: self.aliphatic_3d,
+            carbonyl_3d: self.carbonyl_3d,
+        }
+    }
+}
+
+impl<'a> From<StripSpectra3D<'a>> for StripSpectra3DFull<'a> {
+    fn from(s: StripSpectra3D<'a>) -> Self {
+        Self {
+            aliphatic_3d: s.aliphatic_3d,
+            carbonyl_3d: s.carbonyl_3d,
+            carbonyl_intra_3d: None,
+        }
+    }
+}
+
+/// Band display selector on the 3D strip header (`CA/CB` | `CO (HNCO/HN(CA)CO)` | `Both`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum StripBandView {
+    /// Full-height aliphatic `CA/CB` strip band only.
+    CaCb,
+    /// Full-height carbonyl `CO` (`167.5-182.5 ppm`) sequential walk (`HNCO` + `HN(CA)CO`).
+    Co,
+    /// Synchronized split-band view (`CO` upper band + `CA/CB` lower band).
+    #[default]
+    Both,
+}
+
+impl StripBandView {
+    pub const ALL: [Self; 3] = [Self::CaCb, Self::Co, Self::Both];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CaCb => "CA/CB",
+            Self::Co => "CO (HNCO/HN(CA)CO)",
+            Self::Both => "Both",
+        }
+    }
+
+    pub const fn compact_label(self) -> &'static str {
+        match self {
+            Self::CaCb => "CA/CB",
+            Self::Co => "CO (HNCO/CA)",
+            Self::Both => "Both",
+        }
+    }
 }
 
 /// Minimum / maximum auto-fit strip canvas height in pixels.
@@ -539,9 +604,14 @@ pub struct StripTilerPanel {
     pub show_c_guides: bool,
     pub c_aliphatic_range: (f64, f64),
     pub c_carbonyl_range: (f64, f64),
+    /// Active strip band selector (`CA/CB` | `CO (HNCO/HN(CA)CO)` | `Both`), controlled by the
+    /// connected folder-style tabs on the 3D strip header.
+    pub band_view: StripBandView,
     pub strip_half_width_h_ppm: f64,
-    /// Shared indirect (`13C`) zoom range across all strips (`None` = full range).
+    /// Shared indirect (`13C`) aliphatic zoom range across all strips (`None` = full range).
     pub indirect_zoom: Option<(f64, f64)>,
+    /// Shared indirect (`13C'`) carbonyl zoom range across all strips (`None` = full range).
+    pub co_indirect_zoom: Option<(f64, f64)>,
     /// Current strip canvas height in pixels (auto-fills available height clamped to
     /// [`STRIP_MIN_HEIGHT_PX`]`..=`[`STRIP_MAX_HEIGHT_PX`], or user-resized).
     pub strip_height_px: f32,
@@ -551,6 +621,8 @@ pub struct StripTilerPanel {
     pub selected_peak: Option<(usize, usize)>,
     /// Bounding rectangle of the strip plot canvas from the most recent frame.
     pub last_canvas_rect: Option<egui::Rect>,
+    /// Bounding rectangles of the three connected folder-style band tabs from the most recent frame.
+    pub last_band_tab_rects: [(StripBandView, egui::Rect); 3],
     /// Bounding rectangles of each rendered strip column from the most recent frame.
     pub last_column_rects: Vec<egui::Rect>,
     /// Data-plot rectangles (the `C'` and `Cα/Cβ` band boxes of every rendered strip) from the most
@@ -591,12 +663,19 @@ impl Default for StripTilerPanel {
             show_c_guides: true,
             c_aliphatic_range: (13.0, 74.0),
             c_carbonyl_range: (167.5, 182.5),
+            band_view: StripBandView::Both,
             strip_half_width_h_ppm: 0.04,
             indirect_zoom: None,
+            co_indirect_zoom: None,
             strip_height_px: 0.0,
             strip_gain: 1.0,
             selected_peak: None,
             last_canvas_rect: None,
+            last_band_tab_rects: [
+                (StripBandView::CaCb, egui::Rect::ZERO),
+                (StripBandView::Co, egui::Rect::ZERO),
+                (StripBandView::Both, egui::Rect::ZERO),
+            ],
             last_column_rects: Vec::new(),
             last_plot_rects: Vec::new(),
             last_column_spin_systems: Vec::new(),
@@ -708,6 +787,35 @@ impl StripTilerPanel {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &StripTilerContext<'_>,
+        crosshair: Option<&mut SyncCrosshair>,
+    ) -> Vec<StripTilerAction> {
+        self.show_with_carbonyl_intra(ui, ctx, None, crosshair)
+    }
+
+    /// Render the strip tiler with an optional `HN(CA)CO` (`carbonyl_intra_3d`) volumetric cube
+    /// paired alongside `ctx.spectra_3d.carbonyl_3d` (`HNCO`) for full `CO` sequential walks.
+    pub fn show_with_carbonyl_intra(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &StripTilerContext<'_>,
+        carbonyl_intra_3d: Option<&Spectrum3D>,
+        crosshair: Option<&mut SyncCrosshair>,
+    ) -> Vec<StripTilerAction> {
+        let spectra_full = StripSpectra3DFull {
+            aliphatic_3d: ctx.spectra_3d.aliphatic_3d,
+            carbonyl_3d: ctx.spectra_3d.carbonyl_3d,
+            carbonyl_intra_3d,
+        };
+        self.show_full(ui, ctx, spectra_full, crosshair)
+    }
+
+    /// Render the strip tiler using an explicit [`StripSpectra3DFull`] cube bundle (`HNCACB`/`HNCA`
+    /// + `HNCO` + `HN(CA)CO`).
+    pub fn show_full(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &StripTilerContext<'_>,
+        spectra_full: StripSpectra3DFull<'_>,
         mut crosshair: Option<&mut SyncCrosshair>,
     ) -> Vec<StripTilerAction> {
         let mut actions = Vec::new();
@@ -831,7 +939,7 @@ impl StripTilerPanel {
 
         let avail_w = ui.available_width().max(220.0);
         let left_axis_w = if self.compact_dock_mode {
-            40.0f32
+            34.0f32
         } else {
             50.0f32
         };
@@ -862,7 +970,7 @@ impl StripTilerPanel {
             (left_axis_w + (columns.len() as f32) * col_w + 8.0).max(avail_w)
         };
 
-        let (ali_nuc, base_ali_range) = if let Some(s3) = ctx.spectra_3d.aliphatic_3d {
+        let (ali_nuc, base_ali_range) = if let Some(s3) = spectra_full.aliphatic_3d {
             let (_, nuc, bounds) = strip_vertical_axis_metadata(s3);
             (nuc, bounds)
         } else {
@@ -875,21 +983,42 @@ impl StripTilerPanel {
             .map(|(a, b)| (a.min(b), a.max(b)))
             .unwrap_or((base_ali_lo, base_ali_hi));
 
-        let (co_nuc, co_range) = if let Some(s3_co) = ctx.spectra_3d.carbonyl_3d {
-            let (_, nuc, bounds) = strip_vertical_axis_metadata(s3_co);
-            (nuc, bounds)
-        } else {
-            ("13C", self.c_carbonyl_range)
-        };
+        let (co_nuc, base_co_range) =
+            if let Some(s3_co) = spectra_full.carbonyl_intra_3d.or(spectra_full.carbonyl_3d) {
+                let (_, nuc, bounds) = strip_vertical_axis_metadata(s3_co);
+                (nuc, bounds)
+            } else {
+                ("13C", self.c_carbonyl_range)
+            };
+        let base_co_lo = base_co_range.0.min(base_co_range.1);
+        let base_co_hi = base_co_range.0.max(base_co_range.1);
+        let co_range = self
+            .co_indirect_zoom
+            .map(|(a, b)| (a.min(b), a.max(b)))
+            .unwrap_or((base_co_lo, base_co_hi));
+
         let has_c_cands = ctx.systems.iter().any(|ss| {
             ss.cands.contains_key(&("C".to_string(), 0))
                 || ss.cands.contains_key(&("C".to_string(), -1))
         });
-        let show_co_band = ctx.spectra_3d.carbonyl_3d.is_some() || ali_nuc != "1H" || has_c_cands;
+        let has_co_data = spectra_full.carbonyl_3d.is_some()
+            || spectra_full.carbonyl_intra_3d.is_some()
+            || ali_nuc != "1H"
+            || has_c_cands;
+        let show_co_band = match self.band_view {
+            StripBandView::CaCb => false,
+            StripBandView::Co => true,
+            StripBandView::Both => has_co_data,
+        };
+        let show_ali_band = match self.band_view {
+            StripBandView::Co => false,
+            StripBandView::CaCb | StripBandView::Both => true,
+        };
+        let co_only = self.band_view == StripBandView::Co;
 
         let no_hscroll = self.compact_dock_mode && columns.len() <= 3;
         let mut render_strips = |ui: &mut egui::Ui| {
-            // 1. Paint synchronized split-band (C' + CA/CB) strip columns & dashed guides
+            // 1. Paint synchronized strip columns, connected folder-style band tabs & dashed guides
             let (canvas_rect, canvas_resp) = ui.allocate_exact_size(
                 egui::vec2(desired_w, strip_h),
                 egui::Sense::click_and_drag(),
@@ -898,15 +1027,166 @@ impl StripTilerPanel {
             let painter = ui.painter_at(canvas_rect);
             painter.rect_filled(canvas_rect, 4.0, egui::Color32::from_rgb(13, 17, 24));
 
-            let header_h = 40.0f32;
-            let co_top = canvas_rect.top() + header_h;
-            let (co_bot, ali_top) = if show_co_band {
-                let cb = co_top + (strip_h * 0.19).clamp(54.0, 96.0);
-                (cb, cb + 10.0)
-            } else {
-                (co_top, co_top)
+            // Connected folder-style band selector tabs (`CA/CB` | `CO (HNCO/HN(CA)CO)` | `Both`)
+            let tab_bar_h = 19.0f32;
+            let tab_bar_rect = egui::Rect::from_min_max(
+                canvas_rect.min,
+                egui::pos2(canvas_rect.right(), canvas_rect.top() + tab_bar_h),
+            );
+            painter.rect_filled(
+                tab_bar_rect,
+                egui::CornerRadius {
+                    nw: 4,
+                    ne: 4,
+                    sw: 0,
+                    se: 0,
+                },
+                egui::Color32::from_rgb(19, 24, 34),
+            );
+
+            let tab_font = egui::FontId::proportional(TYPE_CAPTION_PX);
+            let full_widths: [f32; 3] = StripBandView::ALL.map(|v| {
+                painter
+                    .layout_no_wrap(
+                        v.label().to_string(),
+                        tab_font.clone(),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x
+                    + 12.0
+            });
+            let use_compact_tabs =
+                full_widths.iter().sum::<f32>() + 12.0 > (canvas_rect.width() - 8.0);
+            let mut tab_rects = [
+                (StripBandView::CaCb, egui::Rect::ZERO),
+                (StripBandView::Co, egui::Rect::ZERO),
+                (StripBandView::Both, egui::Rect::ZERO),
+            ];
+            let mut tx = canvas_rect.left() + 4.0;
+            let hover_pos = canvas_resp.hover_pos();
+            let mut hovering_tab = false;
+            let base_y = tab_bar_rect.bottom();
+
+            // Draw baseline seam across the header trough first; active tab paints over it seamlessly.
+            painter.line_segment(
+                [
+                    egui::pos2(canvas_rect.left(), base_y),
+                    egui::pos2(canvas_rect.right(), base_y),
+                ],
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(56, 70, 92)),
+            );
+
+            for (idx, view) in StripBandView::ALL.into_iter().enumerate() {
+                let lbl = if use_compact_tabs {
+                    view.compact_label()
+                } else {
+                    view.label()
+                };
+                let galley =
+                    painter.layout_no_wrap(lbl.to_string(), tab_font.clone(), egui::Color32::WHITE);
+                let tw = (galley.size().x + 12.0).min((canvas_rect.right() - tx - 2.0).max(28.0));
+                let r = egui::Rect::from_min_max(
+                    egui::pos2(tx, canvas_rect.top() + 2.0),
+                    egui::pos2(tx + tw, base_y),
+                );
+                tab_rects[idx] = (view, r);
+                tx += tw + 3.0;
+
+                let is_active = self.band_view == view;
+                let is_hovered = hover_pos.is_some_and(|hp| r.contains(hp));
+                if is_hovered {
+                    hovering_tab = true;
+                }
+                let accent = match view {
+                    StripBandView::CaCb => egui::Color32::from_rgb(75, 215, 255),
+                    StripBandView::Co => egui::Color32::from_rgb(86, 232, 148),
+                    StripBandView::Both => egui::Color32::from_rgb(120, 210, 245),
+                };
+                let fill = if is_active {
+                    egui::Color32::from_rgb(13, 17, 24)
+                } else if is_hovered {
+                    egui::Color32::from_rgb(34, 44, 62)
+                } else {
+                    egui::Color32::from_rgb(24, 31, 44)
+                };
+                let top_radius = egui::CornerRadius {
+                    nw: 4,
+                    ne: 4,
+                    sw: 0,
+                    se: 0,
+                };
+                painter.rect_filled(r, top_radius, fill);
+                let border_col = if is_active {
+                    accent
+                } else {
+                    egui::Color32::from_rgb(64, 78, 102)
+                };
+                // Left, top, and right folder-tab border
+                painter.line_segment(
+                    [
+                        egui::pos2(r.left(), r.bottom()),
+                        egui::pos2(r.left(), r.top() + 2.0),
+                    ],
+                    egui::Stroke::new(1.0, border_col),
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(r.left() + 1.0, r.top()),
+                        egui::pos2(r.right() - 1.0, r.top()),
+                    ],
+                    egui::Stroke::new(if is_active { 1.6 } else { 1.0 }, border_col),
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(r.right(), r.top() + 2.0),
+                        egui::pos2(r.right(), r.bottom()),
+                    ],
+                    egui::Stroke::new(1.0, border_col),
+                );
+                if is_active {
+                    // Seamlessly join active tab into strip body by erasing the bottom baseline
+                    painter.line_segment(
+                        [
+                            egui::pos2(r.left() + 1.0, base_y),
+                            egui::pos2(r.right() - 1.0, base_y),
+                        ],
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(13, 17, 24)),
+                    );
+                }
+                let txt_col = if is_active {
+                    egui::Color32::from_rgb(238, 246, 255)
+                } else if is_hovered {
+                    egui::Color32::from_rgb(212, 226, 244)
+                } else {
+                    egui::Color32::from_rgb(166, 184, 208)
+                };
+                painter.text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    lbl,
+                    tab_font.clone(),
+                    txt_col,
+                );
+            }
+            if hovering_tab {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            self.last_band_tab_rects = tab_rects;
+
+            let col_hdr_top = tab_bar_rect.bottom();
+            let col_hdr_h = 28.0f32;
+            let body_top = col_hdr_top + col_hdr_h;
+            let body_bot = canvas_rect.bottom() - 4.0;
+
+            let (co_top, co_bot, ali_top, ali_bot) = match (show_co_band, show_ali_band) {
+                (true, true) => {
+                    let cb = body_top + ((body_bot - body_top) * 0.21).clamp(48.0, 94.0);
+                    (body_top, cb, cb + 6.0, body_bot)
+                }
+                (true, false) => (body_top, body_bot, body_bot, body_bot),
+                (false, _) => (body_top, body_top, body_top, body_bot),
             };
-            let ali_bot = canvas_rect.bottom() - 8.0;
 
             let eff_col_w = if no_hscroll {
                 ((canvas_rect.width() - left_axis_w - 6.0) / (columns.len().max(1) as f32))
@@ -920,6 +1200,7 @@ impl StripTilerPanel {
             // Shift+Scroll / Space+drag / Right/Middle-drag indirect pan, & plain scroll gain (`UI-C10`, `UI-C18`)
             if canvas_resp.double_clicked() {
                 self.indirect_zoom = None;
+                self.co_indirect_zoom = None;
                 self.zoom_drag_start_ppm = None;
             }
 
@@ -931,8 +1212,15 @@ impl StripTilerPanel {
                 )
             });
 
-            if let Some(hover_pos) = canvas_resp.hover_pos() {
-                if canvas_rect.contains(hover_pos) {
+            let (zoom_band_top, zoom_band_bot, zoom_base_lo, zoom_base_hi, zoom_cur_range) =
+                if co_only {
+                    (co_top, co_bot, base_co_lo, base_co_hi, co_range)
+                } else {
+                    (ali_top, ali_bot, base_ali_lo, base_ali_hi, ali_range)
+                };
+
+            if let Some(hp) = hover_pos {
+                if canvas_rect.contains(hp) && hp.y >= col_hdr_top {
                     let (wheel_sy, smooth_sy, ev_shift, ev_cmd) = ui.input(|i| {
                         let mut wy = 0.0f32;
                         let mut esh = false;
@@ -962,28 +1250,41 @@ impl StripTilerPanel {
                         });
                         if cmd_or_ctrl {
                             let anchor_ppm = SyncCrosshair::strip_y_to_ppm(
-                                ali_range.0,
-                                ali_range.1,
-                                ali_top,
-                                ali_bot,
-                                hover_pos.y.clamp(ali_top, ali_bot),
+                                zoom_cur_range.0,
+                                zoom_cur_range.1,
+                                zoom_band_top,
+                                zoom_band_bot,
+                                hp.y.clamp(zoom_band_top, zoom_band_bot),
                             );
                             let z_factor = (-sy as f64 * 0.0035).exp().clamp(0.4, 2.5);
-                            let new_lo = (anchor_ppm - (anchor_ppm - ali_range.0) * z_factor)
-                                .max(base_ali_lo - 10.0);
-                            let new_hi = (anchor_ppm + (ali_range.1 - anchor_ppm) * z_factor)
-                                .min(base_ali_hi + 10.0);
-                            if new_hi - new_lo >= 0.5 {
-                                self.indirect_zoom = Some((new_lo, new_hi));
+                            let new_lo = (anchor_ppm - (anchor_ppm - zoom_cur_range.0) * z_factor)
+                                .max(zoom_base_lo - 10.0);
+                            let new_hi = (anchor_ppm + (zoom_cur_range.1 - anchor_ppm) * z_factor)
+                                .min(zoom_base_hi + 10.0);
+                            if new_hi - new_lo >= 0.3 {
+                                if co_only {
+                                    self.co_indirect_zoom = Some((new_lo, new_hi));
+                                } else {
+                                    self.indirect_zoom = Some((new_lo, new_hi));
+                                }
                             }
                         } else if shift_held {
-                            let cur = self
-                                .indirect_zoom
-                                .map(|(a, b)| (a.min(b), a.max(b)))
-                                .unwrap_or(ali_range);
+                            let cur = if co_only {
+                                self.co_indirect_zoom
+                            } else {
+                                self.indirect_zoom
+                            }
+                            .map(|(a, b)| (a.min(b), a.max(b)))
+                            .unwrap_or(zoom_cur_range);
                             let span = (cur.1 - cur.0).max(0.5);
-                            let d_ppm = -(sy as f64 / (ali_bot - ali_top).max(1.0) as f64) * span;
-                            self.indirect_zoom = Some((cur.0 + d_ppm, cur.1 + d_ppm));
+                            let d_ppm = -(sy as f64
+                                / (zoom_band_bot - zoom_band_top).max(1.0) as f64)
+                                * span;
+                            if co_only {
+                                self.co_indirect_zoom = Some((cur.0 + d_ppm, cur.1 + d_ppm));
+                            } else {
+                                self.indirect_zoom = Some((cur.0 + d_ppm, cur.1 + d_ppm));
+                            }
                         } else {
                             let g_factor = (sy as f64 * 0.0045).exp().clamp(0.25, 4.0);
                             self.strip_gain = (self.strip_gain * g_factor).clamp(0.1, 50.0);
@@ -992,7 +1293,7 @@ impl StripTilerPanel {
                 }
             }
 
-            // Space+drag or Right/Middle-drag pans the indirect 13C range (`UI-C5`, `UI-C18`)
+            // Space+drag or Right/Middle-drag pans the active indirect 13C range (`UI-C5`, `UI-C18`)
             if !shift_held
                 && ((space_down && canvas_resp.dragged_by(egui::PointerButton::Primary))
                     || canvas_resp.dragged_by(egui::PointerButton::Secondary)
@@ -1000,30 +1301,41 @@ impl StripTilerPanel {
             {
                 let dy = canvas_resp.drag_delta().y;
                 if dy.abs() > 0.1 {
-                    let cur = self
-                        .indirect_zoom
-                        .map(|(a, b)| (a.min(b), a.max(b)))
-                        .unwrap_or(ali_range);
+                    let cur = if co_only {
+                        self.co_indirect_zoom
+                    } else {
+                        self.indirect_zoom
+                    }
+                    .map(|(a, b)| (a.min(b), a.max(b)))
+                    .unwrap_or(zoom_cur_range);
                     let span = (cur.1 - cur.0).max(0.5);
-                    let d_ppm = -(dy as f64 / (ali_bot - ali_top).max(1.0) as f64) * span;
-                    self.indirect_zoom = Some((cur.0 + d_ppm, cur.1 + d_ppm));
+                    let d_ppm =
+                        -(dy as f64 / (zoom_band_bot - zoom_band_top).max(1.0) as f64) * span;
+                    if co_only {
+                        self.co_indirect_zoom = Some((cur.0 + d_ppm, cur.1 + d_ppm));
+                    } else {
+                        self.indirect_zoom = Some((cur.0 + d_ppm, cur.1 + d_ppm));
+                    }
                 }
             }
 
-            let active_ali_range = self
-                .indirect_zoom
-                .map(|(a, b)| (a.min(b), a.max(b)))
-                .unwrap_or(ali_range);
+            let active_zoom_range = if co_only {
+                self.co_indirect_zoom
+            } else {
+                self.indirect_zoom
+            }
+            .map(|(a, b)| (a.min(b), a.max(b)))
+            .unwrap_or(zoom_cur_range);
 
             if canvas_resp.drag_started() && shift_held {
                 if let Some(pos) = canvas_resp.interact_pointer_pos() {
-                    if canvas_rect.contains(pos) {
+                    if canvas_rect.contains(pos) && pos.y >= col_hdr_top {
                         self.zoom_drag_start_ppm = Some(SyncCrosshair::strip_y_to_ppm(
-                            active_ali_range.0,
-                            active_ali_range.1,
-                            ali_top,
-                            ali_bot,
-                            pos.y.clamp(ali_top, ali_bot),
+                            active_zoom_range.0,
+                            active_zoom_range.1,
+                            zoom_band_top,
+                            zoom_band_bot,
+                            pos.y.clamp(zoom_band_top, zoom_band_bot),
                         ));
                     }
                 }
@@ -1032,14 +1344,18 @@ impl StripTilerPanel {
                 if let Some(p0) = self.zoom_drag_start_ppm.take() {
                     if let Some(pos) = canvas_resp.interact_pointer_pos() {
                         let p1 = SyncCrosshair::strip_y_to_ppm(
-                            active_ali_range.0,
-                            active_ali_range.1,
-                            ali_top,
-                            ali_bot,
-                            pos.y.clamp(ali_top, ali_bot),
+                            active_zoom_range.0,
+                            active_zoom_range.1,
+                            zoom_band_top,
+                            zoom_band_bot,
+                            pos.y.clamp(zoom_band_top, zoom_band_bot),
                         );
                         if (p1 - p0).abs() >= 0.25 {
-                            self.indirect_zoom = Some((p0.min(p1), p0.max(p1)));
+                            if co_only {
+                                self.co_indirect_zoom = Some((p0.min(p1), p0.max(p1)));
+                            } else {
+                                self.indirect_zoom = Some((p0.min(p1), p0.max(p1)));
+                            }
                         }
                     }
                 }
@@ -1048,7 +1364,11 @@ impl StripTilerPanel {
             let ali_range = self
                 .indirect_zoom
                 .map(|(a, b)| (a.min(b), a.max(b)))
-                .unwrap_or(active_ali_range);
+                .unwrap_or(ali_range);
+            let co_range = self
+                .co_indirect_zoom
+                .map(|(a, b)| (a.min(b), a.max(b)))
+                .unwrap_or(co_range);
 
             let co_to_y = |ppm: f64| -> f32 {
                 SyncCrosshair::ppm_to_strip_y(co_range.0, co_range.1, co_top, co_bot, ppm)
@@ -1057,25 +1377,33 @@ impl StripTilerPanel {
                 SyncCrosshair::ppm_to_strip_y(ali_range.0, ali_range.1, ali_top, ali_bot, ppm)
             };
 
-            // Axis nucleus badge in top-left gutter
-            let gutter_nuc = if show_co_band && co_nuc != ali_nuc {
+            // Axis nucleus badge in top-left gutter (below connected folder tabs)
+            let gutter_nuc = if co_only {
+                "13C'".to_string()
+            } else if show_co_band && co_nuc != ali_nuc {
                 format!("{}/{}", pretty_nucleus(co_nuc), pretty_nucleus(ali_nuc))
             } else {
                 pretty_nucleus(ali_nuc).to_string()
             };
             painter.text(
-                egui::pos2(canvas_rect.left() + 4.0, canvas_rect.top() + 18.0),
+                egui::pos2(canvas_rect.left() + 3.0, col_hdr_top + 14.0),
                 egui::Align2::LEFT_CENTER,
                 gutter_nuc,
                 egui::FontId::monospace(TYPE_CAPTION_PX),
-                egui::Color32::from_rgb(165, 185, 210),
+                if co_only {
+                    egui::Color32::from_rgb(135, 225, 165)
+                } else {
+                    egui::Color32::from_rgb(165, 185, 210)
+                },
             );
 
             // Draw dynamic carbonyl/upper-band and aliphatic/indirect-band axis ticks
             if show_co_band {
-                for c_tick in compute_nice_strip_ticks(co_range.0, co_range.1, 3) {
+                let target_co_ticks = if co_only { 6 } else { 3 };
+                let co_span = (co_range.1 - co_range.0).abs();
+                for c_tick in compute_nice_strip_ticks(co_range.0, co_range.1, target_co_ticks) {
                     let y = co_to_y(c_tick);
-                    let fmt_lbl = if (co_range.1 - co_range.0).abs() < 6.0 {
+                    let fmt_lbl = if co_span < 8.0 && (c_tick.fract().abs() > 1e-4) {
                         format!("{c_tick:.1}")
                     } else {
                         format!("{c_tick:.0}")
@@ -1085,7 +1413,7 @@ impl StripTilerPanel {
                         egui::Align2::LEFT_CENTER,
                         fmt_lbl,
                         egui::FontId::monospace(TYPE_CAPTION_PX),
-                        egui::Color32::from_rgb(135, 190, 150),
+                        egui::Color32::from_rgb(135, 195, 155),
                     );
                     painter.line_segment(
                         [
@@ -1096,33 +1424,35 @@ impl StripTilerPanel {
                     );
                 }
             }
-            let ali_span = (ali_range.1 - ali_range.0).abs();
-            for c_tick in compute_nice_strip_ticks(ali_range.0, ali_range.1, 6) {
-                let y = ali_to_y(c_tick);
-                let fmt_lbl = if ali_span < 16.0 && (c_tick.fract().abs() > 1e-4) {
-                    format!("{c_tick:.1}")
-                } else {
-                    format!("{c_tick:.0}")
-                };
-                painter.text(
-                    egui::pos2(canvas_rect.left() + 4.0, y),
-                    egui::Align2::LEFT_CENTER,
-                    fmt_lbl,
-                    egui::FontId::monospace(TYPE_CAPTION_PX),
-                    egui::Color32::from_rgb(145, 165, 190),
-                );
-                painter.line_segment(
-                    [
-                        egui::pos2(canvas_rect.left() + left_axis_w, y),
-                        egui::pos2(canvas_rect.right() - 4.0, y),
-                    ],
-                    egui::Stroke::new(0.5, egui::Color32::from_rgb(26, 35, 48)),
-                );
+            if show_ali_band {
+                let ali_span = (ali_range.1 - ali_range.0).abs();
+                for c_tick in compute_nice_strip_ticks(ali_range.0, ali_range.1, 6) {
+                    let y = ali_to_y(c_tick);
+                    let fmt_lbl = if ali_span < 16.0 && (c_tick.fract().abs() > 1e-4) {
+                        format!("{c_tick:.1}")
+                    } else {
+                        format!("{c_tick:.0}")
+                    };
+                    painter.text(
+                        egui::pos2(canvas_rect.left() + 4.0, y),
+                        egui::Align2::LEFT_CENTER,
+                        fmt_lbl,
+                        egui::FontId::monospace(TYPE_CAPTION_PX),
+                        egui::Color32::from_rgb(145, 165, 190),
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(canvas_rect.left() + left_axis_w, y),
+                            egui::pos2(canvas_rect.right() - 4.0, y),
+                        ],
+                        egui::Stroke::new(0.5, egui::Color32::from_rgb(26, 35, 48)),
+                    );
+                }
             }
 
-            // Draw horizontal dashed CA (cyan), CB (orange-red), and C' (green) alignment guides
-            // Left half (Predecessors -> Active Root): anchored at Active Root's (i - 1) shifts
-            // Right half (Active Root -> Successors): anchored at Active Root's (i) shifts
+            // Draw horizontal dashed CA (cyan), CB (orange-red), and C' (emerald/amber) alignment guides
+            // Left half (Predecessors -> Active Root): anchored at Active Root's (i - 1) shifts (C'_{i-1}(i) <-> C'_i(i-1))
+            // Right half (Active Root -> Successors): anchored at Active Root's (i) shifts (C'_i(i) <-> C'_{i-1}(i+1))
             let x_pred_left = canvas_rect.left() + left_axis_w + 2.0;
             let x_center_mid =
                 canvas_rect.left() + left_axis_w + (center_col_idx as f32 + 0.5) * eff_col_w;
@@ -1133,25 +1463,28 @@ impl StripTilerPanel {
             let guide_specs = [
                 (
                     "CA",
-                    self.show_ca_guides,
+                    self.show_ca_guides && show_ali_band,
+                    egui::Color32::from_rgba_unmultiplied(75, 215, 255, 195),
                     egui::Color32::from_rgba_unmultiplied(75, 215, 255, 195),
                     false,
                 ),
                 (
                     "CB",
-                    self.show_cb_guides,
+                    self.show_cb_guides && show_ali_band,
+                    egui::Color32::from_rgba_unmultiplied(255, 120, 75, 195),
                     egui::Color32::from_rgba_unmultiplied(255, 120, 75, 195),
                     false,
                 ),
                 (
                     "C",
-                    self.show_c_guides,
-                    egui::Color32::from_rgba_unmultiplied(90, 235, 135, 195),
+                    self.show_c_guides && show_co_band,
+                    egui::Color32::from_rgba_unmultiplied(255, 198, 72, 210),
+                    egui::Color32::from_rgba_unmultiplied(86, 235, 148, 210),
                     true,
                 ),
             ];
 
-            for (atom, enabled, color, is_carbonyl) in guide_specs {
+            for (atom, enabled, col_im1, col_i, is_carbonyl) in guide_specs {
                 if !enabled {
                     continue;
                 }
@@ -1168,7 +1501,7 @@ impl StripTilerPanel {
                             } else {
                                 ali_to_y(ppm_im1)
                             };
-                            draw_dashed_hline(&painter, x_pred_left, x_center_mid, y, color);
+                            draw_dashed_hline(&painter, x_pred_left, x_center_mid, y, col_im1);
                         }
                     }
                 }
@@ -1184,7 +1517,7 @@ impl StripTilerPanel {
                             } else {
                                 ali_to_y(ppm_i)
                             };
-                            draw_dashed_hline(&painter, x_center_mid, x_succ_right, y, color);
+                            draw_dashed_hline(&painter, x_center_mid, x_succ_right, y, col_i);
                         }
                     }
                 }
@@ -1197,22 +1530,28 @@ impl StripTilerPanel {
 
             // Render each strip column (header, 3D slice or synthetic Gaussian + sticks, click-to-select)
             for (c_idx, col) in columns.iter().enumerate() {
-                let x0 = canvas_rect.left() + left_axis_w + (c_idx as f32) * eff_col_w + 2.5;
-                let x1 = x0 + eff_col_w - 5.0;
+                let x0 = canvas_rect.left() + left_axis_w + (c_idx as f32) * eff_col_w + 1.5;
+                let x1 = x0 + eff_col_w - 3.0;
                 let cx = 0.5 * (x0 + x1);
                 let ss_idx = col.ss_idx();
                 let ss = &ctx.systems[ss_idx];
                 col_rects.push((
                     ss_idx,
                     egui::Rect::from_min_max(
-                        egui::pos2(x0, canvas_rect.top()),
+                        egui::pos2(x0, col_hdr_top),
                         egui::pos2(x1, canvas_rect.bottom()),
                     ),
                 ));
 
                 let is_center = matches!(col, ColumnRole::ActiveRoot { .. });
                 let border_col = match col {
-                    ColumnRole::ActiveRoot { .. } => egui::Color32::from_rgb(95, 210, 255),
+                    ColumnRole::ActiveRoot { .. } => {
+                        if co_only {
+                            egui::Color32::from_rgb(86, 232, 148)
+                        } else {
+                            egui::Color32::from_rgb(95, 210, 255)
+                        }
+                    }
                     ColumnRole::Predecessor { cand, .. } | ColumnRole::Successor { cand, .. }
                         if cand.confirmed_link =>
                     {
@@ -1227,9 +1566,6 @@ impl StripTilerPanel {
                     egui::Rect::from_min_max(egui::pos2(x0, ali_top), egui::pos2(x1, ali_bot));
                 if show_co_band {
                     plot_rects.push(co_box);
-                }
-                plot_rects.push(ali_box);
-                if show_co_band {
                     painter.rect_stroke(
                         co_box,
                         2.0,
@@ -1237,12 +1573,15 @@ impl StripTilerPanel {
                         egui::StrokeKind::Inside,
                     );
                 }
-                painter.rect_stroke(
-                    ali_box,
-                    2.0,
-                    egui::Stroke::new(if is_center { 1.6 } else { 1.0 }, border_col),
-                    egui::StrokeKind::Inside,
-                );
+                if show_ali_band {
+                    plot_rects.push(ali_box);
+                    painter.rect_stroke(
+                        ali_box,
+                        2.0,
+                        egui::Stroke::new(if is_center { 1.6 } else { 1.0 }, border_col),
+                        egui::StrokeKind::Inside,
+                    );
+                }
 
                 // Column header & score subtitle (zero emojis; >= 11 px font)
                 let res_badge = Self::residue_badge(ctx, ss_idx);
@@ -1255,7 +1594,13 @@ impl StripTilerPanel {
                         } else {
                             format!("i−1 #{rank_1based} {res_badge}")
                         },
-                        if compact_hdr && *rank_1based > 1 {
+                        if co_only {
+                            if let Some(dc) = cand.delta_c_ppm {
+                                format!("dC'{dc:+.2}")
+                            } else {
+                                format!("P{:+.0}", cand.pair_score)
+                            }
+                        } else if compact_hdr && *rank_1based > 1 {
                             format!("#{rank_1based} P{:+.0}", cand.pair_score)
                         } else if compact_hdr {
                             format!("P{:+.0} {:.0}%", cand.pair_score, cand.rel_prob * 100.0)
@@ -1267,7 +1612,11 @@ impl StripTilerPanel {
                                 cand.matched_nuclei
                             )
                         },
-                        egui::Color32::from_rgb(185, 215, 250),
+                        if co_only {
+                            egui::Color32::from_rgb(138, 232, 174)
+                        } else {
+                            egui::Color32::from_rgb(185, 215, 250)
+                        },
                     ),
                     ColumnRole::ActiveRoot { .. } => (
                         if compact_hdr {
@@ -1280,7 +1629,11 @@ impl StripTilerPanel {
                         } else {
                             format!("¹H {:.2} N {:.1}", ss.h, ss.n)
                         },
-                        egui::Color32::from_rgb(110, 230, 255),
+                        if co_only {
+                            egui::Color32::from_rgb(110, 238, 165)
+                        } else {
+                            egui::Color32::from_rgb(110, 230, 255)
+                        },
                     ),
                     ColumnRole::Successor { rank_1based, cand } => (
                         if compact_hdr {
@@ -1288,7 +1641,13 @@ impl StripTilerPanel {
                         } else {
                             format!("i+1 #{rank_1based} {res_badge}")
                         },
-                        if compact_hdr && *rank_1based > 1 {
+                        if co_only {
+                            if let Some(dc) = cand.delta_c_ppm {
+                                format!("dC'{dc:+.2}")
+                            } else {
+                                format!("P{:+.0}", cand.pair_score)
+                            }
+                        } else if compact_hdr && *rank_1based > 1 {
                             format!("#{rank_1based} P{:+.0}", cand.pair_score)
                         } else if compact_hdr {
                             format!("P{:+.0} {:.0}%", cand.pair_score, cand.rel_prob * 100.0)
@@ -1300,19 +1659,23 @@ impl StripTilerPanel {
                                 cand.matched_nuclei
                             )
                         },
-                        egui::Color32::from_rgb(185, 215, 250),
+                        if co_only {
+                            egui::Color32::from_rgb(138, 232, 174)
+                        } else {
+                            egui::Color32::from_rgb(185, 215, 250)
+                        },
                     ),
                 };
 
                 painter.text(
-                    egui::pos2(cx, canvas_rect.top() + 11.0),
+                    egui::pos2(cx, col_hdr_top + 7.5),
                     egui::Align2::CENTER_CENTER,
                     top_label,
                     egui::FontId::monospace(TYPE_CAPTION_PX),
                     egui::Color32::from_rgb(232, 242, 255),
                 );
                 painter.text(
-                    egui::pos2(cx, canvas_rect.top() + 27.0),
+                    egui::pos2(cx, col_hdr_top + 20.5),
                     egui::Align2::CENTER_CENTER,
                     sub_label,
                     egui::FontId::monospace(TYPE_CAPTION_PX),
@@ -1322,24 +1685,27 @@ impl StripTilerPanel {
                 // Paint volumetric 3D slice OR synthetic Gaussian strip profile
                 if show_co_band {
                     let co_painter = painter.with_clip_rect(co_box);
-                    self.paint_band_profile(
+                    self.paint_carbonyl_band_profile(
                         &co_painter,
                         co_box,
                         ss,
-                        ctx.spectra_3d.carbonyl_3d,
+                        spectra_full.carbonyl_3d,
+                        spectra_full.carbonyl_intra_3d,
                         co_range,
                         &co_to_y,
                     );
                 }
-                let ali_painter = painter.with_clip_rect(ali_box);
-                self.paint_band_profile(
-                    &ali_painter,
-                    ali_box,
-                    ss,
-                    ctx.spectra_3d.aliphatic_3d,
-                    ali_range,
-                    &ali_to_y,
-                );
+                if show_ali_band {
+                    let ali_painter = painter.with_clip_rect(ali_box);
+                    self.paint_band_profile(
+                        &ali_painter,
+                        ali_box,
+                        ss,
+                        spectra_full.aliphatic_3d,
+                        ali_range,
+                        &ali_to_y,
+                    );
+                }
 
                 // Paint resolved candidate markers: (i) filled circles on left, (i-1) diamonds on right
                 self.paint_spin_system_markers(
@@ -1347,6 +1713,8 @@ impl StripTilerPanel {
                     cx,
                     ss_idx,
                     ss,
+                    show_co_band,
+                    show_ali_band,
                     co_range,
                     ali_range,
                     &co_to_y,
@@ -1355,7 +1723,7 @@ impl StripTilerPanel {
                 );
 
                 // Pointer hover -> update synchronized crosshair
-                if let Some(hp) = canvas_resp.hover_pos() {
+                if let Some(hp) = hover_pos {
                     if (x0..=x1).contains(&hp.x) {
                         if show_co_band && co_box.contains(hp) {
                             let c_ppm = SyncCrosshair::strip_y_to_ppm(
@@ -1364,7 +1732,7 @@ impl StripTilerPanel {
                             if let Some(xh) = crosshair.as_deref_mut() {
                                 xh.update_from_strip_hover(Some(ss.h), Some(ss.n), c_ppm);
                             }
-                        } else if ali_box.contains(hp) {
+                        } else if show_ali_band && ali_box.contains(hp) {
                             let c_ppm = SyncCrosshair::strip_y_to_ppm(
                                 ali_range.0,
                                 ali_range.1,
@@ -1384,8 +1752,12 @@ impl StripTilerPanel {
             if let (Some(p0), Some(cur_pos)) =
                 (self.zoom_drag_start_ppm, canvas_resp.interact_pointer_pos())
             {
-                let y0 = ali_to_y(p0).clamp(ali_top, ali_bot);
-                let y1 = cur_pos.y.clamp(ali_top, ali_bot);
+                let y0 = if co_only {
+                    co_to_y(p0).clamp(co_top, co_bot)
+                } else {
+                    ali_to_y(p0).clamp(ali_top, ali_bot)
+                };
+                let y1 = cur_pos.y.clamp(zoom_band_top, zoom_band_bot);
                 let z_rect = egui::Rect::from_min_max(
                     egui::pos2(x_pred_left, y0.min(y1)),
                     egui::pos2(x_succ_right, y0.max(y1)),
@@ -1399,11 +1771,16 @@ impl StripTilerPanel {
                 );
             }
 
-            // Primary click: peak selection takes priority within 10 px, else header click -> SelectRoot
+            // Primary click: band tab takes first priority, then peak selection within 10 px, else header click -> SelectRoot
             if canvas_resp.clicked_by(egui::PointerButton::Primary) && !canvas_resp.double_clicked()
             {
                 if let Some(cp) = canvas_resp.interact_pointer_pos() {
-                    if let Some(&(m_ss, m_pk, _)) = marker_hits
+                    if let Some((clicked_view, _)) =
+                        tab_rects.iter().find(|(_, r)| r.contains(cp)).copied()
+                    {
+                        self.band_view = clicked_view;
+                        canvas_resp.request_focus();
+                    } else if let Some(&(m_ss, m_pk, _)) = marker_hits
                         .iter()
                         .filter(|(_, _, mp)| mp.distance(cp) <= 10.0)
                         .min_by(|(_, _, a), (_, _, b)| a.distance(cp).total_cmp(&b.distance(cp)))
@@ -1416,8 +1793,8 @@ impl StripTilerPanel {
                                 canvas_rect.left() + left_axis_w + (c_idx as f32) * eff_col_w + 2.5;
                             let x1 = x0 + eff_col_w - 5.0;
                             let hdr_rect = egui::Rect::from_min_max(
-                                egui::pos2(x0, canvas_rect.top()),
-                                egui::pos2(x1, co_top),
+                                egui::pos2(x0, col_hdr_top),
+                                egui::pos2(x1, body_top),
                             );
                             let is_center = matches!(col, ColumnRole::ActiveRoot { .. });
                             if hdr_rect.contains(cp) && !is_center {
@@ -1500,6 +1877,7 @@ impl StripTilerPanel {
                 }
                 if ui.button("Reset Strip Zoom").clicked() {
                     self.indirect_zoom = None;
+                    self.co_indirect_zoom = None;
                     self.strip_gain = 1.0;
                     ui.close();
                 }
@@ -1545,13 +1923,22 @@ impl StripTilerPanel {
                     .clamp(0.1, 50.0);
                 }
                 if pan_up || pan_down {
-                    let cur = self
-                        .indirect_zoom
-                        .map(|(a, b)| (a.min(b), a.max(b)))
-                        .unwrap_or(ali_range);
+                    let cur = if co_only {
+                        self.co_indirect_zoom
+                            .map(|(a, b)| (a.min(b), a.max(b)))
+                            .unwrap_or(co_range)
+                    } else {
+                        self.indirect_zoom
+                            .map(|(a, b)| (a.min(b), a.max(b)))
+                            .unwrap_or(ali_range)
+                    };
                     let step = ((cur.1 - cur.0).abs() * 0.10).max(0.1);
                     let d_ppm = if pan_up { -step } else { step };
-                    self.indirect_zoom = Some((cur.0 + d_ppm, cur.1 + d_ppm));
+                    if co_only {
+                        self.co_indirect_zoom = Some((cur.0 + d_ppm, cur.1 + d_ppm));
+                    } else {
+                        self.indirect_zoom = Some((cur.0 + d_ppm, cur.1 + d_ppm));
+                    }
                 }
                 if esc_pressed {
                     self.selected_peak = None;
@@ -1589,7 +1976,12 @@ impl StripTilerPanel {
                         )
                     });
                     if up_nudge || down_nudge {
-                        let step = ((ali_range.1 - ali_range.0).abs() * 0.005).clamp(0.02, 0.25);
+                        let active_span = if co_only {
+                            (co_range.1 - co_range.0).abs()
+                        } else {
+                            (ali_range.1 - ali_range.0).abs()
+                        };
+                        let step = (active_span * 0.005).clamp(0.02, 0.25);
                         let d_ppm = if up_nudge { -step } else { step };
                         actions.push(StripTilerAction::NudgeStripPeak {
                             strip: sel_strip,
@@ -1620,16 +2012,18 @@ impl StripTilerPanel {
                         );
                     }
                 }
-                if let Some(y_ali) =
-                    xh.project_c_to_strip_y(ali_range.0, ali_range.1, ali_top, ali_bot)
-                {
-                    painter.line_segment(
-                        [
-                            egui::pos2(x_pred_left, y_ali),
-                            egui::pos2(x_succ_right, y_ali),
-                        ],
-                        egui::Stroke::new(1.0, line_col),
-                    );
+                if show_ali_band {
+                    if let Some(y_ali) =
+                        xh.project_c_to_strip_y(ali_range.0, ali_range.1, ali_top, ali_bot)
+                    {
+                        painter.line_segment(
+                            [
+                                egui::pos2(x_pred_left, y_ali),
+                                egui::pos2(x_succ_right, y_ali),
+                            ],
+                            egui::Stroke::new(1.0, line_col),
+                        );
+                    }
                 }
             }
 
@@ -1874,6 +2268,198 @@ impl StripTilerPanel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn paint_carbonyl_band_profile(
+        &self,
+        painter: &egui::Painter,
+        band_box: egui::Rect,
+        ss: &SpinSystem,
+        hnco_3d: Option<&Spectrum3D>,
+        hncaco_3d: Option<&Spectrum3D>,
+        c_range: (f64, f64),
+        c_to_y: &dyn Fn(f64) -> f32,
+    ) {
+        let lo = c_range.0.min(c_range.1);
+        let hi = c_range.0.max(c_range.1);
+        let gain = self.strip_gain as f32;
+        let emerald_rgb = (75u8, 235u8, 145u8);
+        let amber_rgb = (255u8, 198u8, 72u8);
+
+        match (hncaco_3d, hnco_3d) {
+            (Some(s_intra), Some(s_inter)) => {
+                // Paired side-by-side carbonyl lanes: left = HN(CA)CO (C'_i + C'_{i-1}, emerald),
+                // right = HNCO (C'_{i-1}, amber-gold) so intra-residue C'_i peaks stand out immediately.
+                let mid_x = band_box.center().x;
+                let left_lane = egui::Rect::from_min_max(
+                    band_box.min,
+                    egui::pos2(mid_x - 0.5, band_box.bottom()),
+                );
+                let right_lane =
+                    egui::Rect::from_min_max(egui::pos2(mid_x + 0.5, band_box.top()), band_box.max);
+                painter.line_segment(
+                    [
+                        egui::pos2(mid_x, band_box.top() + 1.0),
+                        egui::pos2(mid_x, band_box.bottom() - 1.0),
+                    ],
+                    egui::Stroke::new(0.8, egui::Color32::from_rgb(38, 48, 64)),
+                );
+                self.paint_single_cube_colored(
+                    painter,
+                    left_lane,
+                    ss,
+                    s_intra,
+                    (lo, hi),
+                    c_to_y,
+                    gain,
+                    emerald_rgb,
+                );
+                self.paint_single_cube_colored(
+                    painter,
+                    right_lane,
+                    ss,
+                    s_inter,
+                    (lo, hi),
+                    c_to_y,
+                    gain,
+                    amber_rgb,
+                );
+            }
+            (Some(s_intra), None) => {
+                self.paint_single_cube_colored(
+                    painter,
+                    band_box,
+                    ss,
+                    s_intra,
+                    (lo, hi),
+                    c_to_y,
+                    gain,
+                    emerald_rgb,
+                );
+            }
+            (None, Some(s_inter)) => {
+                self.paint_single_cube_colored(
+                    painter,
+                    band_box,
+                    ss,
+                    s_inter,
+                    (lo, hi),
+                    c_to_y,
+                    gain,
+                    amber_rgb,
+                );
+            }
+            (None, None) => {
+                // Peak-only synthetic paired carbonyl profile: C'_i (emerald, left) & C'_{i-1} (amber, right)
+                let mid_x = band_box.center().x;
+                let n_samples = (band_box.height().round() as usize).clamp(24, 180);
+                let lw = 0.24_f64;
+                for s_idx in 0..=n_samples {
+                    let t = (s_idx as f64) / (n_samples as f64);
+                    let c_ppm = c_range.0 + t * (c_range.1 - c_range.0);
+                    let y = c_to_y(c_ppm);
+                    let mut amp_i = 0.0_f64;
+                    if let Some(cands) = ss.cands.get(&("C".to_string(), 0)) {
+                        for (rank, &(ppm, sup)) in cands.iter().enumerate() {
+                            if sup == 0 && rank > 0 {
+                                continue;
+                            }
+                            let d = (c_ppm - ppm) / lw;
+                            if d.abs() <= 4.2 {
+                                amp_i += (-0.5 * d * d).exp() / ((rank + 1) as f64);
+                            }
+                        }
+                    }
+                    let mut amp_im1 = 0.0_f64;
+                    if let Some(cands) = ss.cands.get(&("C".to_string(), -1)) {
+                        for (rank, &(ppm, sup)) in cands.iter().enumerate() {
+                            if sup == 0 && rank > 0 {
+                                continue;
+                            }
+                            let d = (c_ppm - ppm) / lw;
+                            if d.abs() <= 4.2 {
+                                amp_im1 += (-0.5 * d * d).exp() / ((rank + 1) as f64);
+                            }
+                        }
+                    }
+                    let norm_i = ((amp_i as f32) * gain).clamp(0.0, 1.0);
+                    if norm_i > 0.08 {
+                        let w = norm_i * (band_box.width() * 0.36);
+                        painter.line_segment(
+                            [egui::pos2(mid_x - w, y), egui::pos2(mid_x, y)],
+                            egui::Stroke::new(
+                                1.8,
+                                egui::Color32::from_rgba_unmultiplied(
+                                    emerald_rgb.0,
+                                    emerald_rgb.1,
+                                    emerald_rgb.2,
+                                    (norm_i * 145.0) as u8,
+                                ),
+                            ),
+                        );
+                    }
+                    let norm_im1 = ((amp_im1 as f32) * gain).clamp(0.0, 1.0);
+                    if norm_im1 > 0.08 {
+                        let w = norm_im1 * (band_box.width() * 0.36);
+                        painter.line_segment(
+                            [egui::pos2(mid_x, y), egui::pos2(mid_x + w, y)],
+                            egui::Stroke::new(
+                                1.8,
+                                egui::Color32::from_rgba_unmultiplied(
+                                    amber_rgb.0,
+                                    amber_rgb.1,
+                                    amber_rgb.2,
+                                    (norm_im1 * 145.0) as u8,
+                                ),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_single_cube_colored(
+        &self,
+        painter: &egui::Painter,
+        lane_box: egui::Rect,
+        ss: &SpinSystem,
+        s3: &Spectrum3D,
+        bounds: (f64, f64),
+        c_to_y: &dyn Fn(f64) -> f32,
+        gain: f32,
+        rgb: (u8, u8, u8),
+    ) {
+        let slice = s3.extract_strip(ss.h, ss.n, self.strip_half_width_h_ppm);
+        let max_v = slice.max_abs().max(1.0);
+        let nx = slice.nx().max(1);
+        let col_dx = (lane_box.width() * 0.84) / (nx as f32);
+        for ic in 0..slice.ny() {
+            let c_ppm = slice.axis_y.index_to_ppm(ic as f64);
+            if !(bounds.0..=bounds.1).contains(&c_ppm) {
+                continue;
+            }
+            let y = c_to_y(c_ppm);
+            for ix in 0..nx {
+                let val = slice.get(ix, ic);
+                let norm = ((val.abs() / max_v) * gain).clamp(0.0, 1.0);
+                if norm > 0.14 {
+                    let col = egui::Color32::from_rgba_unmultiplied(
+                        rgb.0,
+                        rgb.1,
+                        rgb.2,
+                        (norm * 160.0) as u8,
+                    );
+                    let px0 = lane_box.left() + lane_box.width() * 0.08 + (ix as f32) * col_dx;
+                    painter.line_segment(
+                        [egui::pos2(px0, y), egui::pos2(px0 + col_dx.max(1.5), y)],
+                        egui::Stroke::new(2.0, col),
+                    );
+                }
+            }
+        }
+    }
+
     fn paint_band_profile(
         &self,
         painter: &egui::Painter,
@@ -1958,6 +2544,8 @@ impl StripTilerPanel {
         cx: f32,
         ss_idx: usize,
         ss: &SpinSystem,
+        show_co_band: bool,
+        show_ali_band: bool,
         co_range: (f64, f64),
         ali_range: (f64, f64),
         co_to_y: &dyn Fn(f64) -> f32,
@@ -1973,9 +2561,18 @@ impl StripTilerPanel {
             let (base_col, is_co) = match atom.as_str() {
                 "CA" => (egui::Color32::from_rgb(75, 225, 255), false),
                 "CB" => (egui::Color32::from_rgb(255, 120, 80), false),
-                "C" => (egui::Color32::from_rgb(90, 235, 135), true),
+                "C" => {
+                    if *off == 0 {
+                        (egui::Color32::from_rgb(75, 235, 145), true)
+                    } else {
+                        (egui::Color32::from_rgb(255, 198, 72), true)
+                    }
+                }
                 _ => continue,
             };
+            if (is_co && !show_co_band) || (!is_co && !show_ali_band) {
+                continue;
+            }
             let Some(&(ppm, sup)) = cands.first() else {
                 continue;
             };
