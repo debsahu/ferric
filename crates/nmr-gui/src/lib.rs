@@ -26,6 +26,7 @@ pub mod metabolomics_panel;
 pub mod mol3d_overlay;
 pub mod mol3d_viewer;
 pub mod octet_canvas;
+pub mod p22_tools_panel;
 pub mod relax_panel;
 pub mod session_io;
 pub mod sidechain_widget;
