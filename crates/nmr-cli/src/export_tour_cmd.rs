@@ -67,6 +67,8 @@ pub const KEYFRAME_TIMES_SEC: [f64; 4] = [2.0, 6.0, 10.0, 14.0];
 const UBIQUITIN_STAR_FIXTURE: &str = include_str!("../../../data/fixtures/synthetic_ubiquitin.str");
 const UBIQUITIN_1UBQ_PDB_FIXTURE: &str =
     include_str!("../../../data/fixtures/ubiquitin_1ubq_xray.pdb");
+/// PDB accession of [`UBIQUITIN_1UBQ_PDB_FIXTURE`] (`data/fixtures/ubiquitin_1ubq_xray.pdb`).
+const UBIQUITIN_1UBQ_PDB_ID: &str = "1UBQ";
 const UBIQUITIN_1D3Z_NOE_FIXTURE: &str =
     include_str!("../../../data/fixtures/ubiquitin_1d3z_exp_noe.tsv");
 const UBIQUITIN_1D3Z_RDC_FIXTURE: &str =
@@ -1703,24 +1705,65 @@ struct StripSliceData {
     neg_pts: Vec<[f64; 2]>,
 }
 
+/// Historical (not live-recomputed) Module 02 solver benchmark disclosure.
+///
+/// Provenance: `CHANGELOG.md` v0.9.0 5-seed release gates (`ferric benchmark --star
+/// data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5` -> evo-graph CPU `98.4%` acc /
+/// `310/315` HC; `ferric real-benchmark --split dev --seeds 5` on `CISD3` `BMRB 51439` ->
+/// `64.4%` acc / `59/59` HC) and the cold BMRB HCP cohort withdrawn under review item `13.1:P1-2`
+/// (`88.25-95.30%` HC precision vs the `94%` gate). Every caption/badge/legend number for these
+/// disclosures is interpolated from this struct via `payload.benchmarks`.
 #[derive(Clone, Copy)]
 struct M02HistoricalBenchmarks {
+    historical_seed_count: u32,
     ubiquitin_realistic_pct: f64,
+    ubiquitin_hc_correct: u32,
+    ubiquitin_hc_total: u32,
+    dev_target: &'static str,
+    dev_target_bmrb_id: u32,
     cisd3_acc_pct: f64,
     cisd3_hc_prec_pct: f64,
+    cisd3_hc_correct: u32,
+    cisd3_hc_total: u32,
     cold_bmrb_hc_min_pct: f64,
     cold_bmrb_hc_max_pct: f64,
     cold_bmrb_gate_pct: f64,
+    cold_bmrb_withdrawal_ref: &'static str,
 }
 
 const M02_HISTORICAL_BENCHMARKS: M02HistoricalBenchmarks = M02HistoricalBenchmarks {
+    historical_seed_count: 5,
     ubiquitin_realistic_pct: 98.4,
+    ubiquitin_hc_correct: 310,
+    ubiquitin_hc_total: 315,
+    dev_target: "CISD3",
+    dev_target_bmrb_id: 51439,
     cisd3_acc_pct: 64.38,
     cisd3_hc_prec_pct: 100.0,
+    cisd3_hc_correct: 59,
+    cisd3_hc_total: 59,
     cold_bmrb_hc_min_pct: 88.25,
     cold_bmrb_hc_max_pct: 95.30,
     cold_bmrb_gate_pct: 94.0,
+    cold_bmrb_withdrawal_ref: "13.1:P1-2",
 };
+
+/// Module 02 high-confidence (HC) tier: calibrated posterior confidence `>= 0.80`
+/// (`docs/specs/03-assignment.md` HC tier; configuration parameter, not a fitted result).
+const M02_HC_CONF_THRESHOLD: f64 = 0.80;
+
+/// Title-case a 3-letter residue code (`"PHE"` -> `"Phe"`) for captions.
+fn title_case_res(res: &str) -> String {
+    let mut out = String::with_capacity(res.len());
+    for (i, ch) in res.chars().enumerate() {
+        if i == 0 {
+            out.extend(ch.to_uppercase());
+        } else {
+            out.extend(ch.to_lowercase());
+        }
+    }
+    out
+}
 
 struct M02SceneData {
     hsqc_pos_contours: Vec<Vec<[f64; 2]>>,
@@ -1734,6 +1777,7 @@ struct M02SceneData {
     evo_acc_pct: f64,
     qc_verdict: String,
     n_high_conf: usize,
+    hc_conf_threshold: f64,
     benchmarks: M02HistoricalBenchmarks,
 }
 
@@ -1768,6 +1812,112 @@ struct M04SceneData {
     r2_over_r1: Vec<f64>,
     s2_vals: Vec<f64>,
     rex_vals: Vec<f64>,
+    fields_mhz: [f64; 2],
+    mc_replicates: usize,
+    rex_threshold: f64,
+    rex_sites: Vec<M04RexSite>,
+    tail_start_seq: i32,
+    last_seq_id: i32,
+}
+
+/// Module 04 synthetic forward-model configuration (simulation parameters, not fitted results).
+/// Spectrometer 1H fields of the dual-field synthetic relaxation set.
+const M04_FIELDS_MHZ: [f64; 2] = [600.0, 800.0];
+/// Parametric Monte Carlo replicates for the Ch 2 decay-curve fits (`ExpFitConfig::mc_replicates`).
+const M04_DECAY_MC_REPLICATES: usize = 100;
+/// Residue whose synthetic R1 decay curves are fitted in Ch 2 (label only; name read from 1UBQ).
+const M04_DECAY_DEMO_SEQ_ID: i32 = 23;
+/// First residue of the simulated flexible C-terminal tail (S^2 ramps down from here).
+const M04_SIM_TAIL_START_SEQ: i32 = 72;
+/// Reporting threshold for a chemical-exchange site: selected model carries R_ex (M3/M4) and
+/// fitted R_ex at the reference field exceeds this value (s^-1).
+const M04_REX_REPORT_THRESHOLD_S_INV: f64 = 0.5;
+
+/// Phase 17 blind real-data gate status disclosed on the Module 04 badge.
+/// Provenance: `TODO.md` `T17.P` (8 pre-registered empirical gates: F10, F11, F13a-c, F14, F16,
+/// F17) with `0` passed after the `17.W2`-`17.W4` single-shot runs; F10 (relaxation) and F11
+/// (raw pseudo-3D `relax_io` ingest) are the gates that cover this module and both remain open.
+struct M04BlindGateStatus {
+    phase: u32,
+    passed: u32,
+    total: u32,
+    open_gates: [&'static str; 2],
+    open_gate_scopes: [&'static str; 2],
+}
+
+const M04_PHASE17_BLIND_GATES: M04BlindGateStatus = M04BlindGateStatus {
+    phase: 17,
+    passed: 0,
+    total: 8,
+    open_gates: ["F10", "F11"],
+    open_gate_scopes: [
+        "real-data relaxation & model-free",
+        "raw pseudo-3D relax_io",
+    ],
+};
+
+/// One residue whose *fitted* model-free selection carries a chemical-exchange term.
+#[derive(Clone, Debug, PartialEq)]
+struct M04RexSite {
+    seq_id: i32,
+    res_name: String,
+    model: String,
+    rex_s_inv: f64,
+}
+
+impl M04RexSite {
+    fn label(&self) -> String {
+        format!("{}{}", title_case_res(&self.res_name), self.seq_id)
+    }
+}
+
+/// Derive R_ex sites from the fitted model-free result (selected model M3/M4 and
+/// `rex_ref_s_inv > M04_REX_REPORT_THRESHOLD_S_INV`).
+fn m04_rex_sites(mf: &nmr_core::modelfree::ModelFreeDatasetResult) -> Vec<M04RexSite> {
+    use nmr_core::modelfree::ModelFreeId;
+    mf.residues
+        .iter()
+        .filter(|r| matches!(r.selected_model, ModelFreeId::M3 | ModelFreeId::M4))
+        .filter(|r| r.params.rex_ref_s_inv > M04_REX_REPORT_THRESHOLD_S_INV)
+        .map(|r| M04RexSite {
+            seq_id: r.seq_id,
+            res_name: r.res_name.clone(),
+            model: r.selected_model.as_str().to_string(),
+            rex_s_inv: r.params.rex_ref_s_inv,
+        })
+        .collect()
+}
+
+/// Caption clause describing the fitted R_ex sites; changes whenever the fit selects differently.
+fn format_m04_rex_clause(sites: &[M04RexSite]) -> String {
+    if sites.is_empty() {
+        return "no R_ex model selected".to_string();
+    }
+    let parts: Vec<String> = sites
+        .iter()
+        .map(|s| format!("{} ({})", s.label(), s.model))
+        .collect();
+    format!("R_ex at {}", parts.join(", "))
+}
+
+/// All Module 04 live computations (shared RNG stream, so run strictly in this order).
+struct M04Fixture {
+    snr_levels: Vec<f64>,
+    locked_ls_bias_pct: Vec<f64>,
+    local_max_bias_pct: Vec<f64>,
+    times_r1: Vec<f64>,
+    curve_600_r1: Vec<f64>,
+    curve_800_r1: Vec<f64>,
+    fit_600: nmr_core::relax_fit::DecayCurveFit,
+    fit_800: nmr_core::relax_fit::DecayCurveFit,
+    decay_res_name: String,
+    fit_mc_replicates: usize,
+    rates_600: Vec<ResidueRelaxRates>,
+    tau_m_sec: f64,
+    d_par_perp: f64,
+    mf_fit: nmr_core::modelfree::ModelFreeDatasetResult,
+    first_seq_id: i32,
+    last_seq_id: i32,
 }
 
 fn build_core_tour_state(module: TourModuleId, seed: u64) -> Result<CoreTourState, String> {
@@ -2152,7 +2302,10 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
         .enumerate()
         .map(|(i, r)| format!("{r}{}", i + 1))
         .collect();
-    let n_high_conf = res_confidences.iter().filter(|&&c| c >= 0.80).count();
+    let n_high_conf = res_confidences
+        .iter()
+        .filter(|&&c| c >= M02_HC_CONF_THRESHOLD)
+        .count();
     let mut n_correct = 0usize;
     let mut n_assignable = 0usize;
     for (k, r) in ref_data.sequence.iter().enumerate() {
@@ -2379,10 +2532,53 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
         .collect();
     let qc_verdict = qc.verdict.as_str().to_string();
     let bm = M02_HISTORICAL_BENCHMARKS;
-    let thr7 = strips.iter().find(|s| s.seq_id == 7);
-    let thr7_cb = thr7.and_then(|s| s.cb_i).unwrap_or(0.0);
-    let thr7_ca = thr7.and_then(|s| s.ca_i).unwrap_or(0.0);
     let n_res_total = ref_data.sequence.len();
+    let n_hsqc_roots = hsqc_roots.len();
+    let hsqc_sf_h_mhz = hsqc_cfg.sf_h_mhz;
+    let ubq_hc_pct =
+        100.0 * f64::from(bm.ubiquitin_hc_correct) / f64::from(bm.ubiquitin_hc_total.max(1));
+    let cisd3_hc_pct_counts =
+        100.0 * f64::from(bm.cisd3_hc_correct) / f64::from(bm.cisd3_hc_total.max(1));
+    let cold_status = format!(
+        "FAILS >={:.0}%; withdrawn under {}",
+        bm.cold_bmrb_gate_pct, bm.cold_bmrb_withdrawal_ref
+    );
+    // Sequential strip walk window (strips are residues 1..=10): start at strips[3], end at the last
+    // strip; the Thr/Ser CB > CA inversion and Gly CB-null anchor are stated only if the data show them.
+    let walk_start_idx = 3.min(strips.len().saturating_sub(1));
+    let walk_start = strips.get(walk_start_idx);
+    let walk_end = strips.last();
+    let cap_label = |s: &StripSliceData| {
+        format!(
+            "{}{}",
+            title_case_res(&ref_data.sequence[(s.seq_id - 1) as usize]),
+            s.seq_id
+        )
+    };
+    let walk_start_label = walk_start.map(cap_label).unwrap_or_default();
+    let walk_end_label = walk_end.map(cap_label).unwrap_or_default();
+    let inversion = strips
+        .iter()
+        .skip(walk_start_idx)
+        .find(|s| matches!((s.cb_i, s.ca_i), (Some(cb), Some(ca)) if cb > ca));
+    let inversion_label = inversion.map(cap_label);
+    let walk_end_cb_null = walk_end.is_some_and(|s| s.cb_i.is_none());
+    let mut ch2_parts = vec!["CA(i)->CA(i-1)".to_string()];
+    if let Some(inv) = inversion {
+        ch2_parts.push(format!(
+            "{} CB={:.1} > CA={:.1} inversion",
+            cap_label(inv),
+            inv.cb_i.unwrap_or(0.0),
+            inv.ca_i.unwrap_or(0.0)
+        ));
+    }
+    if walk_end_cb_null {
+        ch2_parts.push(format!("{walk_end_label} CB-null anchor"));
+    }
+    let ch2_caption = format!(
+        "Walks {walk_start_label} -> {walk_end_label}: {}.",
+        ch2_parts.join(", ")
+    );
 
     let bundle = TourBundle {
         schema_version: TOUR_SCHEMA_VERSION.to_string(),
@@ -2390,27 +2586,34 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
         slug: TourModuleId::M02HsqcStripsSolvers.slug().to_string(),
         title: "2D HSQC, 3D HNCACB Strips & Backbone Solvers".to_string(),
         subtitle: format!(
-            "Live fixture: evo-graph {evo_acc_pct:.1}% / bayes-sa {bayes_acc_pct:.1}% / std {std_acc_pct:.1}% · [Historical disclosure] UBQ --realistic {:.1}%, dev CISD3 {:.2}%/{:.0}% HC, cold BMRB {:.2}-{:.2}% (FAILS >={:.0}%; withdrawn)",
+            "Live fixture: evo-graph {evo_acc_pct:.1}% / bayes-sa {bayes_acc_pct:.1}% / std {std_acc_pct:.1}% · [Historical disclosure] UBQ --realistic {:.1}%, dev {} {:.2}%/{:.0}% HC, cold BMRB {:.2}-{:.2}% ({cold_status})",
             bm.ubiquitin_realistic_pct,
+            bm.dev_target,
             bm.cisd3_acc_pct,
             bm.cisd3_hc_prec_pct,
             bm.cold_bmrb_hc_min_pct,
             bm.cold_bmrb_hc_max_pct,
-            bm.cold_bmrb_gate_pct,
         ),
         manual_chapter: "03-solvers-and-calibration.html".to_string(),
         validation_badge: ValidationBadge {
             kind: "cold_gate_failed_withdrawn".to_string(),
             label: "SYNTHETIC / DEV · COLD HCP GATE FAILED (WITHDRAWN)".to_string(),
             detail: format!(
-                "Live synthetic fixture coverage: evo-graph {evo_acc_pct:.1}%, bayes-sa {bayes_acc_pct:.1}%, standard {std_acc_pct:.1}%. [Historical 5-seed / cold-cohort disclosure]: Synthetic Ubiquitin (--realistic) {:.1}% (310/315); dev CISD3 (BMRB 51439) {:.2}% acc / {:.0}% (59/59) HC; default evo-graph unseen cold micro HC-prec {:.2}-{:.2}% (latest single-shot cold cohort {:.2}% FAILS >= {:.0}% gate; cold HCP claim formally withdrawn under 13.1:P1-2).",
+                "Live synthetic fixture coverage: evo-graph {evo_acc_pct:.1}%, bayes-sa {bayes_acc_pct:.1}%, standard {std_acc_pct:.1}%. [Historical {}-seed / cold-cohort disclosure]: Synthetic Ubiquitin (--realistic) {:.1}% acc / {ubq_hc_pct:.1}% ({}/{}) HC; dev {} (BMRB {}) {:.2}% acc / {cisd3_hc_pct_counts:.0}% ({}/{}) HC; default evo-graph unseen cold micro HC-prec {:.2}-{:.2}% (latest single-shot cold cohort {:.2}% FAILS >= {:.0}% gate; cold HCP claim formally withdrawn under {}).",
+                bm.historical_seed_count,
                 bm.ubiquitin_realistic_pct,
+                bm.ubiquitin_hc_correct,
+                bm.ubiquitin_hc_total,
+                bm.dev_target,
+                bm.dev_target_bmrb_id,
                 bm.cisd3_acc_pct,
-                bm.cisd3_hc_prec_pct,
+                bm.cisd3_hc_correct,
+                bm.cisd3_hc_total,
                 bm.cold_bmrb_hc_min_pct,
                 bm.cold_bmrb_hc_max_pct,
                 bm.cold_bmrb_hc_min_pct,
                 bm.cold_bmrb_gate_pct,
+                bm.cold_bmrb_withdrawal_ref,
             ),
         },
         duration_sec: TOUR_DURATION_SEC,
@@ -2422,18 +2625,16 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
                 start_sec: 0.0,
                 end_sec: 4.0,
                 title: "2D 1H-15N HSQC & Root Picking".to_string(),
-                caption: format!("Ubiquitin ({n_res_total} aa, 600 MHz) positive backbone/NH2 contours + aliased Arg Ne-He negative contours."),
-                metric_pill: format!("{} HSQC roots picked", hsqc_roots.len()),
+                caption: format!("Ubiquitin ({n_res_total} aa, {hsqc_sf_h_mhz:.0} MHz) positive backbone/NH2 contours + aliased Arg Ne-He negative contours."),
+                metric_pill: format!("{n_hsqc_roots} HSQC roots picked"),
             },
             TourChapter {
                 index: 2,
                 start_sec: 4.0,
                 end_sec: 8.0,
                 title: "3D HNCACB Sequential Strip Walk".to_string(),
-                caption: format!(
-                    "Walks Phe4 -> Gly10: CA(i)->CA(i-1), Thr7 CB={thr7_cb:.1} > CA={thr7_ca:.1} inversion, and Gly10 CB-null anchor."
-                ),
-                metric_pill: "Phe4 -> Gly10 sequential walk".to_string(),
+                caption: ch2_caption,
+                metric_pill: format!("{walk_start_label} -> {walk_end_label} sequential walk"),
             },
             TourChapter {
                 index: 3,
@@ -2441,15 +2642,15 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
                 end_sec: 12.0,
                 title: "Solver Cv(T) & Benchmark Range".to_string(),
                 caption: format!(
-                    "Live bayes-sa Cv(T) (T_crit={:.2}, max Cv={:.1}; fixture evo-graph {evo_acc_pct:.1}%, bayes-sa {bayes_acc_pct:.1}%, std {std_acc_pct:.1}%) alongside [historical disclosure]: UBQ --realistic {:.1}%, dev CISD3 {:.2}%/{:.0}% HC, cold BMRB evo-graph {:.2}-{:.2}% (FAILS >={:.0}%; withdrawn).",
+                    "Live bayes-sa Cv(T) (T_crit={:.2}, max Cv={:.1}; fixture evo-graph {evo_acc_pct:.1}%, bayes-sa {bayes_acc_pct:.1}%, std {std_acc_pct:.1}%) alongside [historical disclosure]: UBQ --realistic {:.1}%, dev {} {:.2}%/{:.0}% HC, cold BMRB evo-graph {:.2}-{:.2}% ({cold_status}).",
                     bayes_rep.t_crit,
                     bayes_rep.max_cv,
                     bm.ubiquitin_realistic_pct,
+                    bm.dev_target,
                     bm.cisd3_acc_pct,
                     bm.cisd3_hc_prec_pct,
                     bm.cold_bmrb_hc_min_pct,
                     bm.cold_bmrb_hc_max_pct,
-                    bm.cold_bmrb_gate_pct,
                 ),
                 metric_pill: format!("T_crit={:.2}, max Cv={:.1}", bayes_rep.t_crit, bayes_rep.max_cv),
             },
@@ -2457,9 +2658,9 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
                 index: 4,
                 start_sec: 12.0,
                 end_sec: 16.0,
-                title: "76-Residue QC Confidence Ribbon".to_string(),
-                caption: format!("DatasetQcReport posterior confidence across residues 1..{n_res_total} (>= 0.80 calibrated HC tier)."),
-                metric_pill: format!("QC={qc_verdict} · {n_high_conf}/{n_res_total} >= 0.80"),
+                title: format!("{n_res_total}-Residue QC Confidence Ribbon"),
+                caption: format!("DatasetQcReport posterior confidence across all {n_res_total} residues (>= {M02_HC_CONF_THRESHOLD:.2} calibrated HC tier)."),
+                metric_pill: format!("QC={qc_verdict} · {n_high_conf}/{n_res_total} >= {M02_HC_CONF_THRESHOLD:.2}"),
             },
         ],
         interactive_control: InteractiveControlSpec {
@@ -2504,15 +2705,37 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
             "res_labels": res_labels,
             "qc_verdict": qc_verdict,
             "n_high_conf": n_high_conf,
+            "n_res_total": n_res_total,
+            "n_hsqc_roots": n_hsqc_roots,
+            "hsqc_sf_h_mhz": hsqc_sf_h_mhz,
+            "hc_conf_threshold": M02_HC_CONF_THRESHOLD,
+            "strip_walk": {
+                "start_label": walk_start_label,
+                "end_label": walk_end_label,
+                "inversion_label": inversion_label,
+                "inversion_cb_ppm": inversion.and_then(|s| s.cb_i).map(round4),
+                "inversion_ca_ppm": inversion.and_then(|s| s.ca_i).map(round4),
+                "end_cb_null": walk_end_cb_null,
+            },
             "benchmarks": {
                 "scope": "historical_disclosure",
+                "provenance": "CHANGELOG.md v0.9.0 5-seed release gates; cold BMRB HCP cohort withdrawn under 13.1:P1-2",
+                "historical_seed_count": bm.historical_seed_count,
                 "ubiquitin_realistic_pct": bm.ubiquitin_realistic_pct,
+                "ubiquitin_hc_correct": bm.ubiquitin_hc_correct,
+                "ubiquitin_hc_total": bm.ubiquitin_hc_total,
+                "ubiquitin_hc_prec_pct": round4(ubq_hc_pct),
+                "dev_target": bm.dev_target,
+                "dev_target_bmrb_id": bm.dev_target_bmrb_id,
                 "cisd3_acc_pct": bm.cisd3_acc_pct,
                 "cisd3_hc_prec_pct": bm.cisd3_hc_prec_pct,
+                "cisd3_hc_correct": bm.cisd3_hc_correct,
+                "cisd3_hc_total": bm.cisd3_hc_total,
                 "cold_bmrb_hc_min_pct": bm.cold_bmrb_hc_min_pct,
                 "cold_bmrb_hc_max_pct": bm.cold_bmrb_hc_max_pct,
                 "cold_bmrb_gate_pct": bm.cold_bmrb_gate_pct,
-                "cold_bmrb_status": "FAILS >=94%; withdrawn (13.1:P1-2)",
+                "cold_bmrb_withdrawal_ref": bm.cold_bmrb_withdrawal_ref,
+                "cold_bmrb_status": cold_status,
             }
         }),
     };
@@ -2531,6 +2754,7 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
             evo_acc_pct,
             qc_verdict,
             n_high_conf,
+            hc_conf_threshold: M02_HC_CONF_THRESHOLD,
             benchmarks: bm,
         })),
     })
@@ -2730,7 +2954,7 @@ fn build_m03_state(seed: u64) -> Result<CoreTourState, String> {
     })
 }
 
-fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
+fn compute_m04_fixture(seed: u64) -> Result<M04Fixture, String> {
     let chain = parse_pdb_str_first_model(UBIQUITIN_1UBQ_PDB_FIXTURE)?;
     let nh_vecs = extract_nh_unit_vectors_from_chain(&chain);
     let nh_map: BTreeMap<i32, [f64; 3]> = nh_vecs.iter().copied().collect();
@@ -2787,14 +3011,20 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
         .collect();
     let fit_cfg = ExpFitConfig {
         offset_gate: OffsetModelGate::Disabled,
-        mc_replicates: 100,
+        mc_replicates: M04_DECAY_MC_REPLICATES,
         seed,
         ..ExpFitConfig::default()
     };
+    let decay_res_name = chain
+        .residues
+        .iter()
+        .find(|r| r.seq_id == M04_DECAY_DEMO_SEQ_ID)
+        .map(|r| r.res_name.clone())
+        .ok_or_else(|| format!("1UBQ fixture lacks residue {M04_DECAY_DEMO_SEQ_ID}"))?;
     let fit_600 = fit_decay_curve_cpu(
         &DecayCurveInput {
-            seq_id: 23,
-            res_name: "ILE".to_string(),
+            seq_id: M04_DECAY_DEMO_SEQ_ID,
+            res_name: decay_res_name.clone(),
             times_sec: times_r1.clone(),
             intensities: curve_600_r1.clone(),
             sigmas: vec![1.6; times_r1.len()],
@@ -2803,8 +3033,8 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
     )?;
     let fit_800 = fit_decay_curve_cpu(
         &DecayCurveInput {
-            seq_id: 23,
-            res_name: "ILE".to_string(),
+            seq_id: M04_DECAY_DEMO_SEQ_ID,
+            res_name: decay_res_name.clone(),
             times_sec: times_r1.clone(),
             intensities: curve_800_r1.clone(),
             sigmas: vec![1.4; times_r1.len()],
@@ -2823,8 +3053,8 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
             continue;
         }
         let s_id = res.seq_id;
-        let (true_s2, true_te, true_rex) = if s_id >= 72 {
-            let tail_step = (s_id - 71) as f64;
+        let (true_s2, true_te, true_rex) = if s_id >= M04_SIM_TAIL_START_SEQ {
+            let tail_step = (s_id - (M04_SIM_TAIL_START_SEQ - 1)) as f64;
             ((0.72 - 0.095 * tail_step).clamp(0.24, 0.70), 85.0e-12, 0.0)
         } else if (8..=11).contains(&s_id) {
             (0.68, 45.0e-12, 0.0)
@@ -2842,8 +3072,9 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
         };
 
         let mut fields = Vec::with_capacity(2);
-        for &mhz in &[600.0_f64, 800.0_f64] {
-            let (r1_0, r2_0, noe_0) = predict_r1_r2_noe(&rot_comps, &local, mhz, 600.0, &phys);
+        for &mhz in &M04_FIELDS_MHZ {
+            let (r1_0, r2_0, noe_0) =
+                predict_r1_r2_noe(&rot_comps, &local, mhz, M04_FIELDS_MHZ[0], &phys);
             let r1 = (r1_0 * (1.0 + rng.normal(0.0, 0.008))).max(0.1);
             let r2 = (r2_0 * (1.0 + rng.normal(0.0, 0.008))).max(0.2);
             let noe = noe_0 + rng.normal(0.0, 0.010);
@@ -2858,7 +3089,7 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
                 hetnoe: Some(noe),
                 sigma_hetnoe: Some(0.018),
             };
-            if (mhz - 600.0).abs() < 1.0 {
+            if (mhz - M04_FIELDS_MHZ[0]).abs() < 1.0 {
                 rates_600.push(rr.clone());
             }
             fields.push(rr);
@@ -2882,7 +3113,7 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
         &ModelFreeConfig {
             diffusion_kind: DiffusionTensorKind::Isotropic,
             selection_criterion: MfCriterion::Aic,
-            ref_field_mhz: Some(600.0),
+            ref_field_mhz: Some(M04_FIELDS_MHZ[0]),
             physics: phys,
             enable_model_elimination: true,
             max_outer_iters: 4,
@@ -2890,7 +3121,48 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
             seed,
         },
     )?;
+    let first_seq_id = chain.residues.iter().map(|r| r.seq_id).min().unwrap_or(1);
+    let last_seq_id = chain.residues.iter().map(|r| r.seq_id).max().unwrap_or(1);
 
+    Ok(M04Fixture {
+        snr_levels,
+        locked_ls_bias_pct,
+        local_max_bias_pct,
+        times_r1,
+        curve_600_r1,
+        curve_800_r1,
+        fit_600,
+        fit_800,
+        decay_res_name,
+        fit_mc_replicates: fit_cfg.mc_replicates,
+        rates_600,
+        tau_m_sec: trimmed.tau_m_sec,
+        d_par_perp: axial.anisotropy_ratio,
+        mf_fit,
+        first_seq_id,
+        last_seq_id,
+    })
+}
+
+fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
+    let M04Fixture {
+        snr_levels,
+        locked_ls_bias_pct,
+        local_max_bias_pct,
+        times_r1,
+        curve_600_r1,
+        curve_800_r1,
+        fit_600,
+        fit_800,
+        decay_res_name,
+        fit_mc_replicates,
+        rates_600,
+        tau_m_sec,
+        d_par_perp,
+        mf_fit,
+        first_seq_id,
+        last_seq_id,
+    } = compute_m04_fixture(seed)?;
     let seq_ids: Vec<i32> = mf_fit.residues.iter().map(|r| r.seq_id).collect();
     let r2_over_r1: Vec<f64> = rates_600
         .iter()
@@ -2912,13 +3184,25 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
         .map(|r| format!("{:?}", r.selected_model))
         .collect();
 
-    let tau_m_ns = trimmed.tau_m_sec * 1.0e9;
-    let d_par_perp = axial.anisotropy_ratio;
+    let tau_m_ns = tau_m_sec * 1.0e9;
+    let rex_sites = m04_rex_sites(&mf_fit);
+    let rex_clause = format_m04_rex_clause(&rex_sites);
+    let [field_a_mhz, field_b_mhz] = M04_FIELDS_MHZ;
+    let decay_res_label = format!(
+        "{}{}",
+        title_case_res(&decay_res_name),
+        M04_DECAY_DEMO_SEQ_ID
+    );
+    let gates = &M04_PHASE17_BLIND_GATES;
+    let open_gates = gates.open_gates.join("/");
+    let snr_report_level = snr_levels.last().copied().unwrap_or(0.0);
+    let snr_report_ls_bias_pct = locked_ls_bias_pct.last().copied().unwrap_or(0.0);
+    let snr_report_max_bias_pct = local_max_bias_pct.last().copied().unwrap_or(0.0);
     let core_s2: Vec<f64> = seq_ids
         .iter()
         .zip(s2_vals.iter())
         .filter(|(&sid, _)| {
-            (2..=71).contains(&sid)
+            (2..M04_SIM_TAIL_START_SEQ).contains(&sid)
                 && !(8..=11).contains(&sid)
                 && !(36..=40).contains(&sid)
                 && !(62..=65).contains(&sid)
@@ -2933,76 +3217,7 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
         0.87
     };
 
-    let bundle = TourBundle {
-        schema_version: TOUR_SCHEMA_VERSION.to_string(),
-        module_index: 4,
-        slug: TourModuleId::M04RelaxModelfree.slug().to_string(),
-        title: "15N Relaxation & Lipari-Szabo Model-Free (M1-M5)".to_string(),
-        subtitle: "Synthetic Ubiquitin 600/800 MHz forward-model showcase · Phase 17 F10/F11 blind gates open".to_string(),
-        manual_chapter: "04-dynamics-and-exchange.html".to_string(),
-        validation_badge: ValidationBadge {
-            kind: "synthetic_showcase".to_string(),
-            label: "SYNTHETIC FORWARD-MODEL SHOWCASE (F10/F11 OPEN)".to_string(),
-            detail: "Synthetic forward-model showcase: 0/8 Phase 17 blind real-data gates passed (F10 relax / F11 modelfree remain open in TODO.md).".to_string(),
-        },
-        duration_sec: TOUR_DURATION_SEC,
-        fps: 30,
-        cli_command: "ferric modelfree --r1 r1.tsv --r2 r2.tsv --hetnoe noe.tsv --pdb 1ubq.pdb --diffusion axial".to_string(),
-        chapters: vec![
-            TourChapter {
-                index: 1,
-                start_sec: 0.0,
-                end_sec: 4.0,
-                title: "Locked-Footprint Plane Integration".to_string(),
-                caption: "Linear LS fixed-footprint plane integration stays unbiased at SNR=4 vs naive local-max bias.".to_string(),
-                metric_pill: format!(
-                    "SNR=4 bias: LS {:.1}% vs Max +{:.1}%",
-                    locked_ls_bias_pct.last().copied().unwrap_or(0.0),
-                    local_max_bias_pct.last().copied().unwrap_or(0.0)
-                ),
-            },
-            TourChapter {
-                index: 2,
-                start_sec: 4.0,
-                end_sec: 8.0,
-                title: "Dual-Field R1/R2/hetNOE + MC Fit".to_string(),
-                caption: "600 & 800 MHz VarPro+LM exponential fits with 100-trial parametric Monte Carlo SE.".to_string(),
-                metric_pill: format!(
-                    "600 R1={:.2}+/-{:.2}  800 R1={:.2}+/-{:.2}",
-                    fit_600.rate, fit_600.sigma_rate_mc, fit_800.rate, fit_800.sigma_rate_mc
-                ),
-            },
-            TourChapter {
-                index: 3,
-                start_sec: 8.0,
-                end_sec: 12.0,
-                title: "Kay-Torchia-Bax tau_m & Woessner".to_string(),
-                caption: format!(
-                    "Outlier-trimmed R2/R1 global tau_m={tau_m_ns:.2} ns & Woessner axial D_par/D_perp={d_par_perp:.2} on 1UBQ N-H vectors."
-                ),
-                metric_pill: format!("tau_m={tau_m_ns:.2} ns  D_par/D_perp={d_par_perp:.2}"),
-            },
-            TourChapter {
-                index: 4,
-                start_sec: 12.0,
-                end_sec: 16.0,
-                title: "Lipari-Szabo M1-M5 S^2 Profile".to_string(),
-                caption: format!(
-                    "Ubiquitin 1..76 S^2 profile: rigid core (~{core_s2_mean:.2}), Ile23 R_ex (M3), and flexible C-tail 72..76."
-                ),
-                metric_pill: "SYNTHETIC SHOWCASE (F10/F11 OPEN)".to_string(),
-            },
-        ],
-        interactive_control: InteractiveControlSpec {
-            id: "residue_seq".to_string(),
-            label: "Inspect Residue".to_string(),
-            min: 1.0,
-            max: 76.0,
-            step: 1.0,
-            default_val: 23.0,
-            unit: "seq".to_string(),
-        },
-        payload: json!({
+    let mut m04_payload = json!({
             "snr_levels": snr_levels,
             "locked_ls_bias_pct": locked_ls_bias_pct,
             "local_max_bias_pct": local_max_bias_pct,
@@ -3020,7 +3235,130 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
             "s2_vals": s2_vals,
             "rex_vals": rex_vals,
             "model_ids": model_ids,
-        }),
+    });
+    let m04_extra = json!({
+            "fields_mhz": M04_FIELDS_MHZ,
+            "field_a_mhz": field_a_mhz,
+            "field_b_mhz": field_b_mhz,
+            "fit_mc_replicates": fit_mc_replicates,
+            "decay_demo_seq_id": M04_DECAY_DEMO_SEQ_ID,
+            "decay_demo_res_name": decay_res_name,
+            "decay_demo_label": decay_res_label,
+            "snr_report_level": snr_report_level,
+            "snr_report_ls_bias_pct": snr_report_ls_bias_pct,
+            "snr_report_max_bias_pct": snr_report_max_bias_pct,
+            "pdb_id": UBIQUITIN_1UBQ_PDB_ID,
+            "first_seq_id": first_seq_id,
+            "last_seq_id": last_seq_id,
+            "sim_tail_start_seq": M04_SIM_TAIL_START_SEQ,
+            "core_s2_mean": round4(core_s2_mean),
+            "rex_report_threshold_s_inv": M04_REX_REPORT_THRESHOLD_S_INV,
+            "rex_sites": rex_sites.iter().map(|s| json!({
+                "seq_id": s.seq_id,
+                "res_name": s.res_name,
+                "label": s.label(),
+                "model": s.model,
+                "rex_s_inv": round4(s.rex_s_inv),
+            })).collect::<Vec<_>>(),
+            "rex_clause": rex_clause,
+            "validation_status": {
+                "scope": "todo_md_disclosure",
+                "provenance": "TODO.md T17.P: 8 pre-registered Phase 17 empirical gates, 0 passed after 17.W2-17.W4 single-shot; F10/F11 open",
+                "phase": gates.phase,
+                "blind_gates_passed": gates.passed,
+                "blind_gates_total": gates.total,
+                "open_gates": gates.open_gates,
+                "open_gate_scopes": gates.open_gate_scopes,
+            },
+    });
+    if let (Some(dst), serde_json::Value::Object(src)) = (m04_payload.as_object_mut(), m04_extra) {
+        dst.extend(src);
+    }
+
+    let bundle = TourBundle {
+        schema_version: TOUR_SCHEMA_VERSION.to_string(),
+        module_index: 4,
+        slug: TourModuleId::M04RelaxModelfree.slug().to_string(),
+        title: "15N Relaxation & Lipari-Szabo Model-Free (M1-M5)".to_string(),
+        subtitle: format!(
+            "Synthetic Ubiquitin {field_a_mhz:.0}/{field_b_mhz:.0} MHz forward-model showcase · Phase {} {open_gates} blind gates open",
+            gates.phase
+        ),
+        manual_chapter: "04-dynamics-and-exchange.html".to_string(),
+        validation_badge: ValidationBadge {
+            kind: "synthetic_showcase".to_string(),
+            label: format!("SYNTHETIC FORWARD-MODEL SHOWCASE ({open_gates} OPEN)"),
+            detail: format!(
+                "Synthetic forward-model showcase: {}/{} Phase {} blind real-data gates passed ({} {} / {} {} remain open in TODO.md).",
+                gates.passed,
+                gates.total,
+                gates.phase,
+                gates.open_gates[0],
+                gates.open_gate_scopes[0],
+                gates.open_gates[1],
+                gates.open_gate_scopes[1],
+            ),
+        },
+        duration_sec: TOUR_DURATION_SEC,
+        fps: 30,
+        cli_command: "ferric modelfree --r1 r1.tsv --r2 r2.tsv --hetnoe noe.tsv --pdb 1ubq.pdb --diffusion axial".to_string(),
+        chapters: vec![
+            TourChapter {
+                index: 1,
+                start_sec: 0.0,
+                end_sec: 4.0,
+                title: "Locked-Footprint Plane Integration".to_string(),
+                caption: format!("Linear LS fixed-footprint plane integration stays unbiased at SNR={snr_report_level:.0} vs naive local-max bias."),
+                metric_pill: format!(
+                    "SNR={snr_report_level:.0} bias: LS {snr_report_ls_bias_pct:.1}% vs Max +{snr_report_max_bias_pct:.1}%"
+                ),
+            },
+            TourChapter {
+                index: 2,
+                start_sec: 4.0,
+                end_sec: 8.0,
+                title: "Dual-Field R1/R2/hetNOE + MC Fit".to_string(),
+                caption: format!("{field_a_mhz:.0} & {field_b_mhz:.0} MHz VarPro+LM exponential fits ({decay_res_label}) with {fit_mc_replicates}-trial parametric Monte Carlo SE."),
+                metric_pill: format!(
+                    "{field_a_mhz:.0} R1={:.2}+/-{:.2}  {field_b_mhz:.0} R1={:.2}+/-{:.2}",
+                    fit_600.rate, fit_600.sigma_rate_mc, fit_800.rate, fit_800.sigma_rate_mc
+                ),
+            },
+            TourChapter {
+                index: 3,
+                start_sec: 8.0,
+                end_sec: 12.0,
+                title: "Kay-Torchia-Bax tau_m & Woessner".to_string(),
+                caption: format!(
+                    "Outlier-trimmed R2/R1 global tau_m={tau_m_ns:.2} ns & Woessner axial D_par/D_perp={d_par_perp:.2} on {UBIQUITIN_1UBQ_PDB_ID} N-H vectors."
+                ),
+                metric_pill: format!("tau_m={tau_m_ns:.2} ns  D_par/D_perp={d_par_perp:.2}"),
+            },
+            TourChapter {
+                index: 4,
+                start_sec: 12.0,
+                end_sec: 16.0,
+                title: "Lipari-Szabo M1-M5 S^2 Profile".to_string(),
+                caption: format!(
+                    "Ubiquitin residues {first_seq_id}-{last_seq_id} S^2 profile: rigid core (~{core_s2_mean:.2}), {rex_clause}, and flexible C-tail {M04_SIM_TAIL_START_SEQ}-{last_seq_id}."
+                ),
+                metric_pill: format!("SYNTHETIC SHOWCASE ({open_gates} OPEN)"),
+            },
+        ],
+        interactive_control: InteractiveControlSpec {
+            id: "residue_seq".to_string(),
+            label: "Inspect Residue".to_string(),
+            min: f64::from(first_seq_id),
+            max: f64::from(last_seq_id),
+            step: 1.0,
+            default_val: f64::from(
+                rex_sites
+                    .first()
+                    .map_or(M04_DECAY_DEMO_SEQ_ID, |s| s.seq_id),
+            ),
+            unit: "seq".to_string(),
+        },
+        payload: m04_payload,
     };
 
     Ok(CoreTourState {
@@ -3042,6 +3380,12 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
             r2_over_r1,
             s2_vals,
             rex_vals,
+            fields_mhz: M04_FIELDS_MHZ,
+            mc_replicates: fit_mc_replicates,
+            rex_threshold: M04_REX_REPORT_THRESHOLD_S_INV,
+            rex_sites,
+            tail_start_seq: M04_SIM_TAIL_START_SEQ,
+            last_seq_id,
         })),
     })
 }
@@ -4128,35 +4472,42 @@ fn render_m02_frame(
             c.draw_text(
                 708.0 * sx,
                 122.0 * sy,
-                "HISTORICAL 5-SEED / COLD-COHORT DISCLOSURE",
+                &format!(
+                    "HISTORICAL {}-SEED / COLD-COHORT DISCLOSURE",
+                    d.benchmarks.historical_seed_count
+                ),
                 1.55 * sx,
                 [110, 231, 183, 255],
             );
 
+            let bmk = &d.benchmarks;
             let bars = [
                 (
-                    "Ubiquitin --realistic (5-seed)",
-                    d.benchmarks.ubiquitin_realistic_pct,
+                    format!("Ubiquitin --realistic ({}-seed)", bmk.historical_seed_count),
+                    bmk.ubiquitin_realistic_pct,
                     [52, 211, 153, 255],
                 ),
                 (
-                    "CISD3 BMRB 51439 overall acc",
-                    d.benchmarks.cisd3_acc_pct,
+                    format!(
+                        "{} BMRB {} overall acc",
+                        bmk.dev_target, bmk.dev_target_bmrb_id
+                    ),
+                    bmk.cisd3_acc_pct,
                     [251, 191, 36, 255],
                 ),
                 (
-                    "CISD3 BMRB 51439 HC-prec",
-                    d.benchmarks.cisd3_hc_prec_pct,
+                    format!("{} BMRB {} HC-prec", bmk.dev_target, bmk.dev_target_bmrb_id),
+                    bmk.cisd3_hc_prec_pct,
                     [56, 189, 248, 255],
                 ),
                 (
-                    "Cold BMRB evo-graph min (FAILS)",
-                    d.benchmarks.cold_bmrb_hc_min_pct,
+                    "Cold BMRB evo-graph min (FAILS)".to_string(),
+                    bmk.cold_bmrb_hc_min_pct,
                     [167, 139, 250, 255],
                 ),
                 (
-                    "Cold BMRB evo-graph max",
-                    d.benchmarks.cold_bmrb_hc_max_pct,
+                    "Cold BMRB evo-graph max".to_string(),
+                    bmk.cold_bmrb_hc_max_pct,
                     [167, 139, 250, 255],
                 ),
             ];
@@ -4210,8 +4561,12 @@ fn render_m02_frame(
                 64.0 * sx,
                 122.0 * sy,
                 &format!(
-                    "UBIQUITIN 1..76 SEQUENCE CONFIDENCE RIBBON · QC={} · {}/76 >= 0.80 (acc {:.1}%)",
-                    d.qc_verdict, d.n_high_conf, d.evo_acc_pct
+                    "UBIQUITIN 1..{n_res} SEQUENCE CONFIDENCE RIBBON · QC={} · {}/{n_res} >= {:.2} (acc {:.1}%)",
+                    d.qc_verdict,
+                    d.n_high_conf,
+                    d.hc_conf_threshold,
+                    d.evo_acc_pct,
+                    n_res = d.res_confidences.len()
                 ),
                 1.55 * sx,
                 [110, 231, 183, 255],
@@ -4221,12 +4576,12 @@ fn render_m02_frame(
             let gx1 = 1210.0 * sx;
             let gy0 = 180.0 * sy;
             let gy1 = 530.0 * sy;
-            let hc_y = lerp(gy1, gy0, 0.80);
+            let hc_y = lerp(gy1, gy0, d.hc_conf_threshold);
             c.draw_dashed_line(gx0, hc_y, gx1, hc_y, 8.0, 5.0, 1.6, [251, 191, 36, 220]);
             c.draw_text(
                 gx0 + 6.0,
                 hc_y - 18.0 * sy,
-                "0.80 High-Confidence Gate",
+                &format!("{:.2} High-Confidence Gate", d.hc_conf_threshold),
                 1.3 * sx,
                 [251, 191, 36, 255],
             );
@@ -4663,7 +5018,11 @@ fn render_m04_frame(
             c.draw_text(
                 64.0 * sx,
                 124.0 * sy,
-                "LOCKED-FOOTPRINT PLANE INTEGRATION VS NAIVE LOCAL-MAX BIAS (SNR 80 -> 4)",
+                &format!(
+                    "LOCKED-FOOTPRINT PLANE INTEGRATION VS NAIVE LOCAL-MAX BIAS (SNR {:.0} -> {:.0})",
+                    d.snr_levels.first().copied().unwrap_or(0.0),
+                    d.snr_levels.last().copied().unwrap_or(0.0)
+                ),
                 1.55 * sx,
                 [253, 164, 175, 255],
             );
@@ -4743,7 +5102,10 @@ fn render_m04_frame(
             c.draw_text(
                 64.0 * sx,
                 122.0 * sy,
-                "DUAL-FIELD (600 & 800 MHz) R1 VARPRO+LM DECAY FITS",
+                &format!(
+                    "DUAL-FIELD ({:.0} & {:.0} MHz) R1 VARPRO+LM DECAY FITS",
+                    d.fields_mhz[0], d.fields_mhz[1]
+                ),
                 1.55 * sx,
                 [125, 211, 252, 255],
             );
@@ -4800,7 +5162,7 @@ fn render_m04_frame(
             c.draw_text(
                 904.0 * sx,
                 126.0 * sy,
-                "100-MC BOOTSTRAP FIT",
+                &format!("{}-MC BOOTSTRAP FIT", d.mc_replicates),
                 1.55 * sx,
                 [253, 224, 71, 255],
             );
@@ -4808,8 +5170,8 @@ fn render_m04_frame(
                 904.0 * sx,
                 184.0 * sy,
                 &format!(
-                    "600 MHz R1: {:.3} +/- {:.3} s^-1",
-                    d.fit_600_rate, d.fit_600_se
+                    "{:.0} MHz R1: {:.3} +/- {:.3} s^-1",
+                    d.fields_mhz[0], d.fit_600_rate, d.fit_600_se
                 ),
                 1.35 * sx,
                 [56, 189, 248, 255],
@@ -4818,8 +5180,8 @@ fn render_m04_frame(
                 904.0 * sx,
                 224.0 * sy,
                 &format!(
-                    "800 MHz R1: {:.3} +/- {:.3} s^-1",
-                    d.fit_800_rate, d.fit_800_se
+                    "{:.0} MHz R1: {:.3} +/- {:.3} s^-1",
+                    d.fields_mhz[1], d.fit_800_rate, d.fit_800_se
                 ),
                 1.35 * sx,
                 [251, 191, 36, 255],
@@ -4827,7 +5189,7 @@ fn render_m04_frame(
             c.draw_text(
                 904.0 * sx,
                 280.0 * sy,
-                "Fisher CRLB + 100-trial MC",
+                &format!("Fisher CRLB + {}-trial MC", d.mc_replicates),
                 1.3 * sx,
                 [203, 213, 225, 255],
             );
@@ -4875,11 +5237,13 @@ fn render_m04_frame(
             let prog = smoothstep((local_t / 0.50).clamp(0.0, 1.0));
             let show = ((prog * n as f64).ceil() as usize).clamp(1, n);
             let max_r = d.r2_over_r1.iter().copied().fold(6.0_f64, f64::max);
+            let seq_span = f64::from(d.last_seq_id.max(1));
+            let rex_labels: Vec<String> = d.rex_sites.iter().map(M04RexSite::label).collect();
             for i in 0..show {
-                let x = lerp(gx0, gx1, (d.seq_ids[i] as f64) / 76.0);
+                let x = lerp(gx0, gx1, (d.seq_ids[i] as f64) / seq_span);
                 let y = lerp(gy1, gy0, (d.r2_over_r1[i] / max_r).clamp(0.0, 1.0));
-                let is_rex = d.rex_vals[i] > 0.4;
-                let is_tail = d.seq_ids[i] >= 72;
+                let is_rex = d.rex_vals[i] > d.rex_threshold;
+                let is_tail = d.seq_ids[i] >= d.tail_start_seq;
                 let col = if is_rex {
                     [251, 191, 36, 255]
                 } else if is_tail {
@@ -4892,11 +5256,19 @@ fn render_m04_frame(
             c.draw_text(
                 100.0 * sx,
                 162.0 * sy,
-                "Cyan: Rigid core  Amber: Ile23/25 R_ex outlier  Rose: Flexible C-tail",
+                &format!(
+                    "Cyan: Rigid core  Amber: R_ex > {:.1} s^-1 ({})  Rose: Flexible C-tail",
+                    d.rex_threshold,
+                    if rex_labels.is_empty() {
+                        "none selected".to_string()
+                    } else {
+                        rex_labels.join("/")
+                    }
+                ),
                 1.35 * sx,
                 [226, 232, 240, 255],
             );
-            let lx = lerp(gx0, gx1, (d.seq_ids[show - 1] as f64) / 76.0);
+            let lx = lerp(gx0, gx1, (d.seq_ids[show - 1] as f64) / seq_span);
             let ly = lerp(gy1, gy0, (d.r2_over_r1[show - 1] / max_r).clamp(0.0, 1.0));
             c.draw_spotlight_cursor(lx, ly, t_sec, 1.0);
         }
@@ -4922,7 +5294,10 @@ fn render_m04_frame(
             c.draw_text(
                 64.0 * sx,
                 124.0 * sy,
-                "LIPARI-SZABO M1-M5 S^2 ORDER PARAMETER PROFILE (1..76) · SYNTHETIC SHOWCASE",
+                &format!(
+                    "LIPARI-SZABO M1-M5 S^2 ORDER PARAMETER PROFILE (1..{}) · SYNTHETIC SHOWCASE",
+                    d.last_seq_id
+                ),
                 1.5 * sx,
                 [253, 164, 175, 255],
             );
@@ -4936,23 +5311,24 @@ fn render_m04_frame(
             let n = d.seq_ids.len().max(1);
             let prog = smoothstep((local_t / 0.50).clamp(0.0, 1.0));
             let show = ((prog * n as f64).ceil() as usize).clamp(1, n);
-            let bar_w = (gx1 - gx0) / 78.0;
+            let seq_span = f64::from(d.last_seq_id.max(1));
+            let bar_w = (gx1 - gx0) / (seq_span + 2.0);
             for i in 0..show {
                 let seq = d.seq_ids[i] as f64;
                 let s2 = d.s2_vals[i].clamp(0.0, 1.0);
-                let bx = lerp(gx0, gx1, seq / 76.0) - 0.5 * bar_w;
+                let bx = lerp(gx0, gx1, seq / seq_span) - 0.5 * bar_w;
                 let bh = s2 * (gy1 - gy0);
-                let col = if d.rex_vals[i] > 0.4 {
+                let col = if d.rex_vals[i] > d.rex_threshold {
                     [251, 191, 36, 255]
                 } else {
                     s2_color_rgba(s2)
                 };
                 c.fill_rounded_rect(bx, gy1 - bh, (bar_w - 1.5).max(4.0), bh.max(4.0), 2.5, col);
-                if d.seq_ids[i] == 23 {
+                if let Some(site) = d.rex_sites.iter().find(|s| s.seq_id == d.seq_ids[i]) {
                     c.draw_text(
                         bx - 14.0,
                         gy1 - bh - 20.0 * sy,
-                        "Ile23 R_ex",
+                        &format!("{} R_ex", site.label()),
                         1.25 * sx,
                         [253, 224, 71, 255],
                     );
@@ -4961,11 +5337,16 @@ fn render_m04_frame(
             c.draw_text(
                 100.0 * sx,
                 162.0 * sy,
-                "Amber: M3 Ile23 R_ex | Rose tail (72..76): picosecond-nanosecond flexibility",
+                &format!(
+                    "Amber: {} | Rose tail ({}..{}): picosecond-nanosecond flexibility",
+                    format_m04_rex_clause(&d.rex_sites),
+                    d.tail_start_seq,
+                    d.last_seq_id
+                ),
                 1.35 * sx,
                 [226, 232, 240, 255],
             );
-            let fx = lerp(gx0, gx1, (d.seq_ids[show - 1] as f64) / 76.0);
+            let fx = lerp(gx0, gx1, (d.seq_ids[show - 1] as f64) / seq_span);
             let fy = gy1 - d.s2_vals[show - 1].clamp(0.0, 1.0) * (gy1 - gy0);
             c.draw_spotlight_cursor(fx, fy, t_sec, 1.0);
         }
@@ -5170,5 +5551,312 @@ mod tests {
             !m04.bundle.chapters[2].caption.contains("4.10"),
             "Mod04 ch3 caption must not hardcode 4.10 ns when payload is {tau_m_ns:.4}"
         );
+    }
+
+    /// Non-scalar NMR nomenclature that legitimately contains digits (isotopes, dimensionality,
+    /// rate/model-family names, sequential-connectivity notation). These are removed before the
+    /// B15 digit scan; every *other* digit-bearing token must be interpolated from payload.
+    const B15_NOMENCLATURE: &[&str] = &[
+        "1H-15N", "15N", "13C", "1H", "2D", "3D", "NH2", "(i-1)", "(i)", "R2/R1", "R1/R2", "R1",
+        "R2", "M1-M5", "S^2",
+    ];
+
+    fn b15_tokens(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        for ch in text.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '.' {
+                cur.push(ch);
+            } else if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        out.into_iter()
+            .map(|t| t.trim_matches('.').to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
+    /// Collect numeric and short-string leaves of the payload (objects and arrays of <= 8 items;
+    /// long plotted series are skipped so they cannot launder an arbitrary caption number).
+    fn b15_collect(v: &serde_json::Value, nums: &mut Vec<f64>, strs: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    nums.push(f);
+                }
+            }
+            serde_json::Value::String(s) if s.len() <= 24 => {
+                for t in b15_tokens(s) {
+                    strs.push(t.to_ascii_lowercase());
+                }
+            }
+            serde_json::Value::Array(a) if a.len() <= 8 => {
+                for x in a {
+                    b15_collect(x, nums, strs);
+                }
+            }
+            serde_json::Value::Object(o) => {
+                for x in o.values() {
+                    b15_collect(x, nums, strs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Return every digit-bearing token of `text` that is neither nomenclature nor reproducible
+    /// from a payload scalar (formatted at the token's own precision) or a short payload label.
+    fn b15_unbacked_tokens(text: &str, payload: &serde_json::Value) -> Vec<String> {
+        let mut nums = Vec::new();
+        let mut strs = Vec::new();
+        b15_collect(payload, &mut nums, &mut strs);
+        let mut cleaned = text.to_string();
+        for nom in B15_NOMENCLATURE {
+            cleaned = cleaned.replace(nom, " ");
+        }
+        let mut bad = Vec::new();
+        for tok in b15_tokens(&cleaned) {
+            if !tok.chars().any(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if strs.contains(&tok.to_ascii_lowercase()) {
+                continue;
+            }
+            let is_numeric = tok.chars().all(|c| c.is_ascii_digit() || c == '.');
+            if is_numeric {
+                let decimals = tok.split_once('.').map_or(0, |(_, f)| f.len());
+                if nums
+                    .iter()
+                    .any(|&n| format!("{:.*}", decimals, n.abs()) == tok)
+                {
+                    continue;
+                }
+            }
+            bad.push(tok);
+        }
+        bad
+    }
+
+    fn b15_bundle_texts(b: &TourBundle) -> Vec<(String, String)> {
+        let mut texts = vec![
+            ("title".to_string(), b.title.clone()),
+            ("subtitle".to_string(), b.subtitle.clone()),
+            ("badge.label".to_string(), b.validation_badge.label.clone()),
+            (
+                "badge.detail".to_string(),
+                b.validation_badge.detail.clone(),
+            ),
+        ];
+        for (i, ch) in b.chapters.iter().enumerate() {
+            texts.push((format!("ch{}.title", i + 1), ch.title.clone()));
+            texts.push((format!("ch{}.caption", i + 1), ch.caption.clone()));
+            texts.push((format!("ch{}.metric_pill", i + 1), ch.metric_pill.clone()));
+        }
+        texts
+    }
+
+    #[test]
+    fn test_b15_mod02_mod04_every_caption_digit_is_payload_backed() {
+        for m in [
+            TourModuleId::M02HsqcStripsSolvers,
+            TourModuleId::M04RelaxModelfree,
+        ] {
+            let st = build_core_tour_state(m, CANONICAL_TOUR_SEED).expect("build");
+            let payload = serde_json::to_value(&st.bundle.payload).expect("payload");
+            let mut failures = Vec::new();
+            for (field, text) in b15_bundle_texts(&st.bundle) {
+                let bad = b15_unbacked_tokens(&text, &payload);
+                if !bad.is_empty() {
+                    failures.push(format!("{field}: {bad:?} in {text:?}"));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "{} has caption scalars not interpolated from payload:\n{}",
+                m.slug(),
+                failures.join("\n")
+            );
+        }
+        // Self-check of the scanner: a hard-coded scalar must be caught.
+        let p = json!({"x": 4.0837});
+        assert!(b15_unbacked_tokens("tau_m=4.08 ns", &p).is_empty());
+        assert_eq!(b15_unbacked_tokens("tau_m=4.10 ns", &p), vec!["4.10"]);
+        assert_eq!(
+            b15_unbacked_tokens("Ile23 R_ex (M3)", &p),
+            vec!["Ile23", "M3"]
+        );
+    }
+
+    #[test]
+    fn test_b15_mod04_rex_caption_matches_independent_fixture_fit() {
+        // Independent re-run of the Module 04 fixture fit: derive R_ex sites directly from the
+        // fitted selected_model / rex_ref_s_inv (not via m04_rex_sites) and require the Ch4
+        // caption, payload.rex_sites and the interactive default to agree with the fit.
+        use nmr_core::modelfree::ModelFreeId;
+        let fx = compute_m04_fixture(CANONICAL_TOUR_SEED).expect("Mod04 fixture fit");
+        let independent: Vec<(i32, String, &'static str)> = fx
+            .mf_fit
+            .residues
+            .iter()
+            .filter(|r| {
+                (r.selected_model == ModelFreeId::M3 || r.selected_model == ModelFreeId::M4)
+                    && r.params.rex_ref_s_inv > M04_REX_REPORT_THRESHOLD_S_INV
+            })
+            .map(|r| (r.seq_id, r.res_name.clone(), r.selected_model.as_str()))
+            .collect();
+        let st = build_core_tour_state(TourModuleId::M04RelaxModelfree, CANONICAL_TOUR_SEED)
+            .expect("Mod04 should build");
+        let p4 = serde_json::to_value(&st.bundle.payload).expect("payload");
+        let cap4 = &st.bundle.chapters[3].caption;
+        let sites = p4["rex_sites"].as_array().expect("payload.rex_sites");
+        assert_eq!(
+            sites.len(),
+            independent.len(),
+            "payload.rex_sites vs fit: {sites:?}"
+        );
+        for ((sid, rn, model), site) in independent.iter().zip(sites) {
+            let lbl = format!("{}{sid}", title_case_res(rn));
+            assert_eq!(site["seq_id"].as_i64(), Some(i64::from(*sid)));
+            assert_eq!(site["model"].as_str(), Some(*model));
+            let want = format!("{lbl} ({model})");
+            assert!(
+                cap4.contains(&want),
+                "Mod04 ch4 caption missing fitted {want}: {cap4}"
+            );
+        }
+        // Every model id quoted in the caption must be one the fit actually selected for that residue.
+        for tok in b15_tokens(cap4) {
+            if let Some(stripped) = tok.strip_prefix('M') {
+                if stripped.len() == 1 && stripped.chars().all(|c| c.is_ascii_digit()) {
+                    assert!(
+                        independent.iter().any(|(_, _, m)| *m == tok),
+                        "caption quotes model {tok} that the fit did not select: {cap4}"
+                    );
+                }
+            }
+        }
+        if independent.is_empty() {
+            assert!(cap4.contains("no R_ex model selected"), "{cap4}");
+        }
+        // Caption must change if the fit selects differently.
+        let real = m04_rex_sites(&fx.mf_fit);
+        let mut alt = real.clone();
+        if let Some(first) = alt.first_mut() {
+            first.model = "M4".to_string();
+        }
+        if !real.is_empty() {
+            assert_ne!(format_m04_rex_clause(&real), format_m04_rex_clause(&alt));
+        }
+        assert_eq!(format_m04_rex_clause(&[]), "no R_ex model selected");
+        assert_ne!(
+            format_m04_rex_clause(&real),
+            format_m04_rex_clause(&real[..real.len().saturating_sub(1)])
+        );
+
+        // Live-computation scalars quoted in captions equal the fixture output, not literals.
+        let ch1 = &st.bundle.chapters[0];
+        let snr_last = fx.snr_levels.last().copied().expect("snr levels");
+        assert!(ch1.caption.contains(&format!("SNR={snr_last:.0}")));
+        assert!(ch1.metric_pill.contains(&format!(
+            "LS {:.1}%",
+            fx.locked_ls_bias_pct.last().copied().unwrap_or(f64::NAN)
+        )));
+        let ch2 = &st.bundle.chapters[1];
+        assert!(ch2
+            .caption
+            .contains(&format!("{}-trial", fx.fit_mc_replicates)));
+        assert!(ch2
+            .metric_pill
+            .contains(&format!("R1={:.2}", fx.fit_600.rate)));
+        assert_eq!(
+            p4["decay_demo_res_name"].as_str(),
+            Some(fx.decay_res_name.as_str())
+        );
+        assert_eq!(p4["last_seq_id"].as_i64(), Some(i64::from(fx.last_seq_id)));
+        let tau_ns = fx.tau_m_sec * 1.0e9;
+        assert!(st.bundle.chapters[2]
+            .caption
+            .contains(&format!("tau_m={tau_ns:.2} ns")));
+    }
+
+    #[test]
+    fn test_b15_mod02_historical_counts_consistent_and_live_scalars() {
+        let bm = M02_HISTORICAL_BENCHMARKS;
+        // HC-precision percentages must be reproducible from the disclosed counts.
+        let ubq = 100.0 * f64::from(bm.ubiquitin_hc_correct) / f64::from(bm.ubiquitin_hc_total);
+        assert_eq!(format!("{ubq:.1}"), "98.4");
+        let cisd3 = 100.0 * f64::from(bm.cisd3_hc_correct) / f64::from(bm.cisd3_hc_total);
+        assert!(
+            (cisd3 - bm.cisd3_hc_prec_pct).abs() < 0.05,
+            "{cisd3} vs {}",
+            bm.cisd3_hc_prec_pct
+        );
+        assert!(
+            bm.cold_bmrb_hc_min_pct < bm.cold_bmrb_gate_pct,
+            "cold min must FAIL the gate"
+        );
+
+        let st = build_core_tour_state(TourModuleId::M02HsqcStripsSolvers, CANONICAL_TOUR_SEED)
+            .expect("Mod02 should build");
+        let p2 = serde_json::to_value(&st.bundle.payload).expect("payload");
+        let hsqc_n = p2["hsqc_roots"].as_array().expect("hsqc_roots").len();
+        assert_eq!(p2["n_hsqc_roots"].as_u64(), Some(hsqc_n as u64));
+        assert!(st.bundle.chapters[0]
+            .metric_pill
+            .starts_with(&format!("{hsqc_n} ")));
+        let n_res = p2["res_labels"].as_array().expect("res_labels").len();
+        assert_eq!(p2["n_res_total"].as_u64(), Some(n_res as u64));
+        // n_high_conf recomputed independently from the plotted confidences.
+        let thr = p2["hc_conf_threshold"].as_f64().expect("hc threshold");
+        let n_hc = p2["res_confidences"]
+            .as_array()
+            .expect("res_confidences")
+            .iter()
+            .filter(|c| c.as_f64().unwrap_or(0.0) >= thr)
+            .count();
+        assert!(st.bundle.chapters[3]
+            .metric_pill
+            .contains(&format!("{n_hc}/{n_res} >= {thr:.2}")));
+        // Ch2 inversion claim is stated only when the strip data actually show CB > CA.
+        let strips = p2["strips"].as_array().expect("strips");
+        let walk = &p2["strip_walk"];
+        if let Some(lbl) = walk["inversion_label"].as_str() {
+            let sid: usize = lbl
+                .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+                .parse()
+                .expect("sid");
+            let s = &strips[sid - 1];
+            assert!(
+                s["cb_i"].as_f64() > s["ca_i"].as_f64(),
+                "inversion claimed without CB > CA"
+            );
+            assert!(st.bundle.chapters[1]
+                .caption
+                .contains(&format!("{lbl} CB=")));
+        }
+        let last = strips.last().expect("last strip");
+        assert_eq!(walk["end_cb_null"].as_bool(), Some(last["cb_i"].is_null()));
+    }
+
+    #[test]
+    fn test_b15_report_digit_scan_other_core_modules() {
+        // Informational (not asserted): report un-backed caption digits for Mod01/Mod03.
+        for m in [
+            TourModuleId::M01FidPulprogNus,
+            TourModuleId::M03StructureNoeRdc,
+        ] {
+            let st = build_core_tour_state(m, CANONICAL_TOUR_SEED).expect("build");
+            let payload = serde_json::to_value(&st.bundle.payload).expect("payload");
+            for (field, text) in b15_bundle_texts(&st.bundle) {
+                let bad = b15_unbacked_tokens(&text, &payload);
+                if !bad.is_empty() {
+                    eprintln!("B15-REPORT {} {field}: {bad:?} in {text:?}", m.slug());
+                }
+            }
+        }
     }
 }
