@@ -74,21 +74,34 @@ fn test_headless_concordance_and_pae_domain_heatmap_click_to_mol3d() {
     let (demo_ref, status) = panel
         .load_synthetic_two_domain_demo()
         .expect("load synthetic 2-domain AF demo");
-    assert!(status.contains("Analyzed 52 residues"), "got: {status}");
+    assert!(status.contains("Analyzed 76 residues"), "got: {status}");
     assert!(status.contains("synthetic demo"), "got: {status}");
     assert!(!status.contains("Validated"), "got: {status}");
 
-    // Verify 2 rigid domains were clustered by T21.5 spectral PAE partitioning
+    // Verify 76-residue Ubiquitin PAE matrix & 2 rigid domains clustered by T21.5 spectral PAE partitioning
+    let pae = panel.pae_matrix.as_ref().expect("PAE matrix loaded");
+    assert_eq!(
+        pae.n_residues, 76,
+        "PAE tab must use the consistent 76-residue Ubiquitin model"
+    );
     let part = panel
         .domain_partition
         .as_ref()
         .expect("PAE domain partition");
     assert_eq!(part.domains.len(), 2);
 
-    // Verify Tolman GDO motion test flagged decoupled Domain 2 (`0.48x` scaled RDCs)
+    // Verify Tolman GDO motion test flagged decoupled Domain 2 (`0.48x` scaled RDCs) AND Q_free is strictly finite!
     let gdo = panel.tolman_gdo_report.as_ref().expect("Tolman GDO report");
     assert_eq!(gdo.domain_fits.len(), 2);
     assert!(gdo.min_rho_gdo < 0.70);
+    for fit in &gdo.domain_fits {
+        assert!(
+            fit.q_free.is_finite(),
+            "Domain {} Q_free must be finite (never NaN), got {}",
+            fit.domain_id,
+            fit.q_free
+        );
+    }
 
     let mut crosshair = SyncCrosshair::default();
     let mut seq_ribbon = SequenceRibbonState::new();
@@ -103,8 +116,35 @@ fn test_headless_concordance_and_pae_domain_heatmap_click_to_mol3d() {
         &demo_ref.seq_ids,
     );
     assert!(mol3d.ensemble.is_some());
-    assert_eq!(ss_ribbon.ss3d_track.len(), 52);
-    assert_eq!(ss_ribbon.concordance_summary.classes.len(), 52);
+    assert_eq!(ss_ribbon.ss3d_track.len(), 76);
+    assert_eq!(ss_ribbon.concordance_summary.classes.len(), 76);
+
+    // Verify residues 1..=9 N-terminal beta-strand consistency between 3D view, SS ribbon, and AF concordance (`B13`)
+    let conc = panel
+        .concordance_report
+        .as_ref()
+        .expect("concordance report");
+    assert_eq!(conc.residues.len(), 76);
+    let beta_in_1_to_9_af = conc.residues[0..9]
+        .iter()
+        .filter(|r| r.state4_af.as_str() == "Sheet" || format!("{:?}", r.state4_af) == "Sheet")
+        .count();
+    let beta_in_1_to_9_ribbon = ss_ribbon.ss3d_track[0..9]
+        .iter()
+        .filter(|&&s| matches!(s, nmr_gui::ss_ribbon_widget::SsState4::Sheet))
+        .count();
+    assert!(
+        beta_in_1_to_9_af >= 5,
+        "AF concordance residues 1..=9 must reflect Ubiquitin beta1 strand (not Coil), got {beta_in_1_to_9_af}/9 Sheet: {:?}",
+        conc.residues[0..9]
+            .iter()
+            .map(|r| (r.seq_id, r.state4_af))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        beta_in_1_to_9_ribbon >= 5,
+        "SS ribbon residues 1..=9 must reflect Ubiquitin beta1 strand, got {beta_in_1_to_9_ribbon}/9 Sheet"
+    );
 
     // Render Tab 1 in both Dark Oscilloscope and Paper White modes
     panel.active_tab = IntegrativeStudioTab::ConcordanceSummary;
@@ -114,15 +154,15 @@ fn test_headless_concordance_and_pae_domain_heatmap_click_to_mol3d() {
     // Render Tab 2 (PAE Heatmap) and verify telemetry
     panel.active_tab = IntegrativeStudioTab::PaeDomainHeatmap;
     let _ = run_headless_frame(&ctx, &mut panel, false, Vec::new());
-    assert_eq!(panel.last_telemetry.pae_cells_drawn, 52 * 52);
+    assert_eq!(panel.last_telemetry.pae_cells_drawn, 76 * 76);
     assert_eq!(panel.last_telemetry.pae_domain_boxes_drawn, 2);
     assert!(panel.last_telemetry.gdo_badges_drawn >= 3);
 
-    // Simulate clicking an inter-domain off-diagonal cell `(i ~ 10 in D1, j ~ 40 in D2)` on the PAE heatmap
+    // Simulate clicking an inter-domain off-diagonal cell `(i ~ 10 in D1, j ~ 50 in D2)` on the PAE heatmap
     let pae_rect = panel.last_pae_plot_rect.expect("pae_plot_rect recorded");
     let click_pos = egui::pos2(
-        pae_rect.min.x + pae_rect.width() * (40.5 / 52.0),
-        pae_rect.min.y + pae_rect.height() * (10.5 / 52.0),
+        pae_rect.min.x + pae_rect.width() * (50.5 / 76.0),
+        pae_rect.min.y + pae_rect.height() * (10.5 / 76.0),
     );
     let click_events = vec![
         egui::Event::PointerMoved(click_pos),
@@ -169,7 +209,7 @@ fn test_headless_concordance_and_pae_domain_heatmap_click_to_mol3d() {
     }
     assert_eq!(mol3d.scene_cfg.highlighted_seq_idx, Some(10));
     assert_eq!(mol3d.restraints.len(), 1);
-    assert!(mol3d.restraints[0].label.contains("D1:11 <-> D2:41"));
+    assert!(mol3d.restraints[0].label.contains("D1:11 <-> D2:51"));
 
     // Verify SetMol3dTrack switches to AlphaFoldPlddt and AfNmrConcordance cleanly
     for trk in [
@@ -394,4 +434,49 @@ fn test_pae_heatmap_cached_texture_uploads_once_over_five_frames() {
         let _ = run_headless_frame(&ctx, &mut panel, false, Vec::new());
     }
     assert_eq!(panel.last_telemetry().pae_texture_uploads, 1);
+}
+
+#[test]
+fn test_af_demo_local_synthetic_labels_76aa_and_no_nan() {
+    use nmr_gui::workbench_mode::audit_text_layout;
+
+    let mut panel = IntegrativeAfPanel::new();
+    let (demo_ref, _) = panel
+        .load_synthetic_two_domain_demo()
+        .expect("load 76-aa Ubiquitin synthetic AF demo");
+    assert_eq!(demo_ref.sequence.len(), 76);
+    assert_eq!(panel.pae_matrix.as_ref().expect("pae").n_residues, 76);
+
+    let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+    for tab in IntegrativeStudioTab::ALL {
+        let ctx = egui::Context::default();
+        panel.active_tab = tab;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(vp),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let _ = panel.show(ui, false);
+                });
+            },
+        );
+        out.textures_delta.clear();
+        let audit = audit_text_layout(&out.shapes, vp);
+        let joined: String = audit
+            .texts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            joined.contains("Synthetic Demo"),
+            "AF demo tab {tab:?} must display explicit local 'Synthetic Demo' label: {joined}"
+        );
+        assert!(
+            !joined.contains("NaN"),
+            "AF demo tab {tab:?} must never render NaN (e.g. Q_free=NaN): {joined}"
+        );
+    }
 }

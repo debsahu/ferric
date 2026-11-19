@@ -63,16 +63,17 @@ use nmr_core::excited_state::{
     classify_excited_state, parse_exchange_observations_tsv, ExchangeSignMode, ExcitedStateConfig,
     ExcitedStateReport, ExcitedStateVerdict,
 };
-use nmr_core::nmrstar::Reference;
+use nmr_core::nmrstar::{read_star_str, Reference};
 use nmr_core::rdc::{parse_rdc_tsv_str, RdcMediumSet};
 use nmr_core::struct_shifts::StructureModel;
 
 use crate::contour_painter::SyncCrosshair;
+use crate::demo_preset::{EMBEDDED_SYNTHETIC_UBIQUITIN_STR, EMBEDDED_UBIQUITIN_1UBQ_PDB};
 use crate::mol3d_overlay::{
     ConcordanceTrackClass, DistanceRestraint3d, QuantitativeTrack, RestraintAtomSelector,
     RestraintKind,
 };
-use crate::mol3d_viewer::Mol3dViewerPanel;
+use crate::mol3d_viewer::{parse_pdb_ensemble, Mol3dViewerPanel};
 use crate::sidechain_widget::SequenceRibbonState;
 use crate::ss_ribbon_widget::SsRibbonState;
 
@@ -862,8 +863,9 @@ impl IntegrativeAfPanel {
         self.selected_pose_idx = (!self.pose_rows.is_empty()).then_some(0);
     }
 
-    /// Populate a deterministic 52-residue 2-domain AlphaFold `.cif` + `PAE` JSON + solution NMR
-    /// concordance + Tolman `GDO` + Co-Fold pose + Excited-State demo dataset in memory (`wasm32`-safe).
+    /// Populate a deterministic 76-residue Ubiquitin 2-domain AlphaFold `.cif` + `76 x 76` `PAE`
+    /// JSON + solution NMR concordance + Tolman `GDO` + Co-Fold pose + Excited-State synthetic demo
+    /// dataset in memory (`wasm32`-safe).
     pub fn load_synthetic_two_domain_demo(&mut self) -> Result<(Reference, String), String> {
         let (cif_text, pae_json, demo_ref, rdc_tsv) = build_synthetic_two_domain_af_demo();
         self.structure_input_buf = cif_text;
@@ -873,11 +875,11 @@ impl IntegrativeAfPanel {
         self.is_synthetic_demo = true;
         let msg = self.ingest_from_buffers_inner(Some(&demo_ref))?;
 
-        // Populate deterministic T21.6a Co-Fold preview & multi-pose ranking showcase
+        // Populate deterministic T21.6a Co-Fold preview & multi-pose ranking showcase (76-aa Ubiquitin)
         self.surface_pocket_seq_ids = vec![8, 10, 12, 14, 16, 18];
         self.buried_allosteric_seq_ids = vec![6, 15];
-        self.af3_json_preview = "{\n  \"name\": \"ferric_two_domain_complex\",\n  \"modelSeeds\": [1],\n  \"sequences\": [\n    { \"protein\": { \"id\": \"A\", \"sequence\": \"MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLED\" } },\n    { \"ligand\": { \"id\": \"L\", \"smiles\": \"c1ccc(cc1)C(=O)N\" } }\n  ],\n  \"bondedAtomPairs\": [],\n  \"dialect\": \"alphafold3\",\n  \"version\": 2\n}".to_string();
-        self.boltz2_yaml_preview = "version: 1\nsequences:\n  - protein:\n      id: A\n      sequence: MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLED\n  - ligand:\n      id: L\n      smiles: \"c1ccc(cc1)C(=O)N\"\nconstraints:\n  - pocket:\n      binder: L\n      contacts:\n        - [A, 8]\n        - [A, 10]\n        - [A, 12]\n        - [A, 14]\n        - [A, 16]\n        - [A, 18]\n      max_distance: 6.0\n      force: false\n  - contact:\n      token1: [A, 12]\n      token2: [L, 1]\n      max_distance: 5.5\n      force: false\n".to_string();
+        self.af3_json_preview = "{\n  \"name\": \"ferric_ubiquitin_synthetic_demo_complex\",\n  \"modelSeeds\": [1],\n  \"sequences\": [\n    { \"protein\": { \"id\": \"A\", \"sequence\": \"MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG\" } },\n    { \"ligand\": { \"id\": \"L\", \"smiles\": \"c1ccc(cc1)C(=O)N\" } }\n  ],\n  \"bondedAtomPairs\": [],\n  \"dialect\": \"alphafold3\",\n  \"version\": 2\n}".to_string();
+        self.boltz2_yaml_preview = "version: 1\nsequences:\n  - protein:\n      id: A\n      sequence: MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG\n  - ligand:\n      id: L\n      smiles: \"c1ccc(cc1)C(=O)N\"\nconstraints:\n  - pocket:\n      binder: L\n      contacts:\n        - [A, 8]\n        - [A, 10]\n        - [A, 12]\n        - [A, 14]\n        - [A, 16]\n        - [A, 18]\n      max_distance: 6.0\n      force: false\n  - contact:\n      token1: [A, 12]\n      token2: [L, 1]\n      max_distance: 5.5\n      force: false\n".to_string();
         self.pose_verdict = CofoldRankVerdictView::TopPoseSelected;
         self.pose_rows = vec![
             CofoldPoseRowView {
@@ -1206,7 +1208,7 @@ impl IntegrativeAfPanel {
             if ui
                 .button("Load 2-Domain AF Demo")
                 .on_hover_text(
-                    "Populate a 52-residue 2-domain AlphaFold .cif + PAE JSON + RDC + Co-Fold + Excited-State showcase",
+                    "Populate a 76-residue Ubiquitin AlphaFold .cif + 76x76 PAE JSON + RDC + Co-Fold + Excited-State synthetic demo",
                 )
                 .clicked()
                 && self.load_synthetic_two_domain_demo().is_ok()
@@ -1352,6 +1354,17 @@ impl IntegrativeAfPanel {
         };
 
         // Top metric cards
+        if self.is_synthetic_demo {
+            ui.horizontal_wrapped(|ui| {
+                draw_pill_badge(
+                    ui,
+                    theme.badge_warn_bg,
+                    theme.badge_warn_fg,
+                    "Synthetic Demo (76-aa Ubiquitin AF/NMR concordance)",
+                );
+            });
+            ui.add_space(4.0);
+        }
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
             match rep.summary {
@@ -1532,9 +1545,17 @@ impl IntegrativeAfPanel {
             return;
         }
 
-        // Top row: Tolman GDO badges & F8 single-medium dipolar candor notice
+        // Top row: local Synthetic Demo label + Tolman GDO badges & F8 single-medium dipolar candor notice
         if let Some(ref gdo_rep) = self.tolman_gdo_report {
             ui.horizontal_wrapped(|ui| {
+                if self.is_synthetic_demo {
+                    draw_pill_badge(
+                        ui,
+                        theme.badge_warn_bg,
+                        theme.badge_warn_fg,
+                        "Synthetic Demo (76-aa Ubiquitin)",
+                    );
+                }
                 let (bg, fg, regime_txt) = match gdo_rep.regime {
                     DomainMotionRegime::RigidlyCoupledDomains => (
                         theme.badge_ok_bg,
@@ -1556,14 +1577,18 @@ impl IntegrativeAfPanel {
                 self.last_telemetry.gdo_badges_drawn += 1;
 
                 for fit in &gdo_rep.domain_fits {
+                    let q_free_str = if fit.q_free.is_finite() {
+                        format!("{:.3}", fit.q_free)
+                    } else {
+                        "N/A".to_string()
+                    };
                     let badge = format!(
-                        "D{} ({}) theta={:.4}+/-{:.4} | theta_d/theta_1={:.2} | Q_free={:.3}",
+                        "D{} ({}) theta={:.4}+/-{:.4} | theta_d/theta_1={:.2} | Q_free={q_free_str}",
                         fit.domain_id,
                         fit.medium_id,
                         fit.gdo_theta,
                         fit.gdo_sigma_mc,
                         fit.ratio_to_domain_1,
-                        fit.q_free
                     );
                     draw_pill_badge(ui, theme.card_bg, theme.text_primary, &badge);
                     self.last_telemetry.gdo_badges_drawn += 1;
@@ -1948,6 +1973,14 @@ impl IntegrativeAfPanel {
 
         // Pose Ranker Verdict Banner
         ui.horizontal_wrapped(|ui| {
+            if self.is_synthetic_demo {
+                draw_pill_badge(
+                    ui,
+                    theme.badge_warn_bg,
+                    theme.badge_warn_fg,
+                    "Synthetic Demo Poses",
+                );
+            }
             let (v_bg, v_fg) = match self.pose_verdict {
                 CofoldRankVerdictView::TopPoseSelected => (theme.badge_ok_bg, theme.badge_ok_fg),
                 CofoldRankVerdictView::InconclusiveOrAllViolated => {
@@ -2070,34 +2103,44 @@ impl IntegrativeAfPanel {
         }
 
         // Verdict banner
-        ui.horizontal_wrapped(|ui| match &self.excited_verdict {
-            ExcitedVerdictView::Committed {
-                winner_label,
-                two_ln_bf_12,
-                two_ln_bf_10,
-                reduced_chi2,
-            } => {
-                let mut badge = String::new();
-                let _ = write!(
-                    badge,
-                    "Committed: {winner_label} | 2 ln BF(1,2) = {two_ln_bf_12:.1} | 2 ln BF(1,H0) = {two_ln_bf_10:.1} | chi^2_nu = {reduced_chi2:.2} (N = {})",
-                    self.excited_n_obs
+        ui.horizontal_wrapped(|ui| {
+            if self.is_synthetic_demo {
+                draw_pill_badge(
+                    ui,
+                    theme.badge_warn_bg,
+                    theme.badge_warn_fg,
+                    "Synthetic Demo Bayes Factors",
                 );
-                draw_pill_badge(ui, theme.badge_ok_bg, theme.badge_ok_fg, &badge);
             }
-            ExcitedVerdictView::AmbiguousOrUnmodeledState {
-                reason,
-                two_ln_bf_12,
-                two_ln_bf_10,
-            } => {
-                let mut badge = String::new();
-                let _ = write!(
-                    badge,
-                    "Abstained (AmbiguousOrUnmodeledState): {reason} | 2 ln BF(1,2) = {two_ln_bf_12:.1} | 2 ln BF(1,H0) = {two_ln_bf_10:.1}"
-                );
-                draw_pill_badge(ui, theme.badge_warn_bg, theme.badge_warn_fg, &badge);
+            match &self.excited_verdict {
+                ExcitedVerdictView::Committed {
+                    winner_label,
+                    two_ln_bf_12,
+                    two_ln_bf_10,
+                    reduced_chi2,
+                } => {
+                    let mut badge = String::new();
+                    let _ = write!(
+                        badge,
+                        "Committed: {winner_label} | 2 ln BF(1,2) = {two_ln_bf_12:.1} | 2 ln BF(1,H0) = {two_ln_bf_10:.1} | chi^2_nu = {reduced_chi2:.2} (N = {})",
+                        self.excited_n_obs
+                    );
+                    draw_pill_badge(ui, theme.badge_ok_bg, theme.badge_ok_fg, &badge);
+                }
+                ExcitedVerdictView::AmbiguousOrUnmodeledState {
+                    reason,
+                    two_ln_bf_12,
+                    two_ln_bf_10,
+                } => {
+                    let mut badge = String::new();
+                    let _ = write!(
+                        badge,
+                        "Abstained (AmbiguousOrUnmodeledState): {reason} | 2 ln BF(1,2) = {two_ln_bf_12:.1} | 2 ln BF(1,H0) = {two_ln_bf_10:.1}"
+                    );
+                    draw_pill_badge(ui, theme.badge_warn_bg, theme.badge_warn_fg, &badge);
+                }
+                ExcitedVerdictView::Unrun => {}
             }
-            ExcitedVerdictView::Unrun => {}
         });
         ui.add_space(8.0);
 
@@ -2474,151 +2517,166 @@ fn concordance_class_color(cls: AfNmrConcordanceClass) -> egui::Color32 {
     }
 }
 
-/// Build a self-contained 52-residue 2-domain AlphaFold ModelArchive `.cif` (`_ma_qa_metric_local`
-/// `pLDDT`), `52 x 52` `PAE` JSON (`Domain 1 = 1..23`, `Linker = 24..29`, `Domain 2 = 30..52`),
-/// matching assigned [`Reference`] shifts, and single-medium `N-H` RDC TSV.
+/// Build a self-contained **76-residue Ubiquitin** AlphaFold ModelArchive `.cif` (`_ma_qa_metric_local`
+/// `pLDDT`) using the real `1UBQ` 3D backbone coordinates (so N-terminal residues `1..=7` carry true
+/// β-strand geometry matching the 3D viewer), a `76 x 76` `PAE` JSON (`Domain 1 = 1..35`,
+/// `Linker = 36..40`, `Domain 2 = 41..71`, `Tail = 72..76`), matching 76-residue Ubiquitin
+/// [`Reference`] chemical shifts, and well-conditioned 3D `N-H` RDC TSV (finite `Q_free`).
 fn build_synthetic_two_domain_af_demo() -> (String, String, Reference, String) {
-    const SEQ1: &[u8; 52] = b"MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLED";
-    let aa3_of = |c: u8| -> &'static str {
-        match c {
-            b'A' => "ALA",
-            b'D' => "ASP",
-            b'E' => "GLU",
-            b'F' => "PHE",
-            b'G' => "GLY",
-            b'I' => "ILE",
-            b'K' => "LYS",
-            b'L' => "LEU",
-            b'M' => "MET",
-            b'N' => "ASN",
-            b'P' => "PRO",
-            b'Q' => "GLN",
-            b'R' => "ARG",
-            b'S' => "SER",
-            b'T' => "THR",
-            b'V' => "VAL",
-            _ => "ALA",
-        }
-    };
+    let ens = parse_pdb_ensemble(EMBEDDED_UBIQUITIN_1UBQ_PDB)
+        .expect("embedded 1UBQ PDB must parse for 76-aa AF demo");
+    let demo_ref = read_star_str(EMBEDDED_SYNTHETIC_UBIQUITIN_STR, None)
+        .expect("embedded synthetic_ubiquitin.str must parse for 76-aa AF demo");
 
-    let n = SEQ1.len();
-    let mut seq3 = Vec::with_capacity(n);
-    let mut seq_ids = Vec::with_capacity(n);
-    for (i, &b) in SEQ1.iter().enumerate() {
-        seq3.push(aa3_of(b).to_string());
-        seq_ids.push((i + 1) as i32);
-    }
+    let chain_res = &ens.models[0].chains[0].residues;
+    let n = chain_res.len();
+    debug_assert_eq!(n, 76);
 
-    let mut cif = String::with_capacity(18_000);
-    cif.push_str("data_AF_DEMO_2DOM\n#\n");
+    let mut cif = String::with_capacity(28_000);
+    cif.push_str("data_AF_UBQ76_SYNTHETIC_DEMO\n#\n");
     cif.push_str(
         "loop_\n_ma_qa_metric.id\n_ma_qa_metric.name\n_ma_qa_metric.mode\n_ma_qa_metric.type\n",
     );
     cif.push_str("1 pLDDT local pLDDT\n#\n");
 
-    // Place helical-like backbone geometry per domain with intact C'-N peptide bonds
     cif.push_str("loop_\n_atom_site.group_PDB\n_atom_site.id\n_atom_site.type_symbol\n_atom_site.label_atom_id\n_atom_site.label_comp_id\n_atom_site.label_asym_id\n_atom_site.label_seq_id\n_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\n_atom_site.occupancy\n_atom_site.B_iso_or_equiv\n_atom_site.pdbx_PDB_model_num\n");
 
     let mut plddts = Vec::with_capacity(n);
     let mut atom_id = 1usize;
     let mut nh_rdc_tsv = String::from(
-        "medium_id\tseq_id_1\tres_name_1\tatom_name_1\tseq_id_2\tres_name_2\tatom_name_2\tbond_type\td_obs_hz\tsigma_hz\n",
+        "medium_id\tseq_id_1\tres_name_1\tatom_name_1\tseq_id_2\tres_name_2\tatom_name_2\tbond_type\td_obs_hz\tsigma_hz\td_max_hz\tis_free\n",
     );
 
-    for (i, res) in seq3.iter().enumerate() {
-        let in_d1 = i < 23;
-        let in_d2 = i >= 29;
+    let norm3 = |v: [f64; 3]| -> [f64; 3] {
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-9);
+        [v[0] / len, v[1] / len, v[2] / len]
+    };
+
+    for (i, res) in chain_res.iter().enumerate() {
+        let in_d1 = i < 35;
+        let in_d2 = (40..71).contains(&i);
         let plddt = if in_d1 {
-            92.4 - ((i % 4) as f64) * 1.2
+            93.2 - ((i % 4) as f64) * 1.1
         } else if in_d2 {
-            89.6 - ((i % 5) as f64) * 1.1
+            90.4 - ((i % 5) as f64) * 1.0
         } else {
-            43.5 + ((i % 3) as f64) * 2.5
+            44.5 + ((i % 3) as f64) * 2.2
         };
         plddts.push(plddt);
 
-        let theta = (i as f64) * 1.7453292519943295; // ~100 deg alpha-helix rise
-        let domain_shift_x = if in_d2 { 14.0 } else { 0.0 };
-        let ca_x = domain_shift_x + 2.30 * theta.cos();
-        let ca_y = 2.30 * theta.sin();
-        let ca_z = (i as f64) * 1.50;
-        let n_pos = [
-            ca_x - 0.95 * theta.sin(),
-            ca_y + 0.95 * theta.cos(),
-            ca_z - 0.55,
-        ];
-        let ca_pos = [ca_x, ca_y, ca_z];
-        let c_pos = [
-            ca_x + 0.92 * theta.sin(),
-            ca_y - 0.92 * theta.cos(),
-            ca_z + 0.58,
-        ];
-        let o_pos = [c_pos[0] + 0.35, c_pos[1] - 0.25, c_pos[2] + 1.15];
-        let cb_pos = [
-            ca_x + 1.25 * theta.cos(),
-            ca_y + 1.25 * theta.sin(),
-            ca_z - 0.42,
-        ];
+        let n_pos = res
+            .atom_pos("N")
+            .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+            .unwrap_or([0.0, 0.0, 0.0]);
+        let ca_pos = res
+            .atom_pos("CA")
+            .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+            .unwrap_or([1.45, 0.0, 0.0]);
+        let c_pos = res
+            .atom_pos("C")
+            .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+            .unwrap_or([2.0, 1.4, 0.0]);
+        let o_pos = res
+            .atom_pos("O")
+            .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+            .unwrap_or([1.5, 2.4, 0.0]);
+        let cb_pos = res
+            .atom_pos("CB")
+            .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64]);
+
+        // Idealized planar amide H from C(i-1)-N(i)-CA(i) bisector (real 3D Ubiquitin orientations!)
+        let h_dir = if i > 0 {
+            let prev_c = chain_res[i - 1]
+                .atom_pos("C")
+                .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+                .unwrap_or(ca_pos);
+            let v1 = norm3([
+                n_pos[0] - prev_c[0],
+                n_pos[1] - prev_c[1],
+                n_pos[2] - prev_c[2],
+            ]);
+            let v2 = norm3([
+                n_pos[0] - ca_pos[0],
+                n_pos[1] - ca_pos[1],
+                n_pos[2] - ca_pos[2],
+            ]);
+            norm3([v1[0] + v2[0], v1[1] + v2[1], v1[2] + v2[2]])
+        } else {
+            norm3([
+                n_pos[0] - ca_pos[0],
+                n_pos[1] - ca_pos[1],
+                n_pos[2] - ca_pos[2],
+            ])
+        };
         let h_pos = [
-            n_pos[0] - 0.48 * theta.cos(),
-            n_pos[1] - 0.48 * theta.sin(),
-            n_pos[2] - 0.88,
+            n_pos[0] + 1.01 * h_dir[0],
+            n_pos[1] + 1.01 * h_dir[1],
+            n_pos[2] + 1.01 * h_dir[2],
         ];
 
-        let sid = i + 1;
+        let sid = res.seq_id;
+        let rname = res.res_name.as_str();
         let mut emit_atom = |aname: &str, elem: &str, p: [f64; 3]| {
             let _ = writeln!(
                 cif,
-                "ATOM {atom_id} {elem} {aname} {res} A {sid} {:.3} {:.3} {:.3} 1.00 {plddt:.2} 1",
+                "ATOM {atom_id} {elem} {aname} {rname} A {sid} {:.3} {:.3} {:.3} 1.00 {plddt:.2} 1",
                 p[0], p[1], p[2]
             );
             atom_id += 1;
         };
         emit_atom("N", "N", n_pos);
-        if res != "PRO" {
+        if rname != "PRO" {
             emit_atom("H", "H", h_pos);
         }
         emit_atom("CA", "C", ca_pos);
         emit_atom("C", "C", c_pos);
         emit_atom("O", "O", o_pos);
-        if res != "GLY" {
-            emit_atom("CB", "C", cb_pos);
+        if let Some(cb) = cb_pos {
+            if rname != "GLY" {
+                emit_atom("CB", "C", cb);
+            }
         }
 
-        // Synthetic axial Saupe tensor RDCs (Da = 10 Hz, R = 0.2; Domain 2 scaled by 0.55 for decoupled motion showcase)
-        if res != "PRO" && (in_d1 || in_d2) {
-            let dx = h_pos[0] - n_pos[0];
-            let dy = h_pos[1] - n_pos[1];
-            let dz = h_pos[2] - n_pos[2];
-            let r2 = (dx * dx + dy * dy + dz * dz).max(1e-9);
-            let ux = dx / r2.sqrt();
-            let uy = dy / r2.sqrt();
-            let uz = dz / r2.sqrt();
+        // Synthetic axial Saupe tensor RDCs computed on real 3D 1UBQ N-H vectors (full-rank Saupe fit -> finite Q_free!).
+        // Domain 2 is scaled by 0.48x to demonstrate Tolman GDO decoupled inter-domain motion.
+        if rname != "PRO" && (in_d1 || in_d2) {
+            let [ux, uy, uz] = h_dir;
             let scale = if in_d2 { 0.48 } else { 1.0 };
-            let rdc_val = scale * 10.0 * ((3.0 * uz * uz - 1.0) + 0.30 * (ux * ux - uy * uy));
+            let noise = (((i * 7 + 3) % 5) as f64 - 2.0) * 0.08;
+            let rdc_val =
+                scale * 10.0 * ((3.0 * uz * uz - 1.0) + 0.30 * (ux * ux - uy * uy)) + noise;
+            // Hold out ~20% of residues per domain (`is_free = 1`) for honest Cornilescu Q_free cross-validation.
+            let is_free = if i % 5 == 2 { 1 } else { 0 };
             let _ = writeln!(
                 nh_rdc_tsv,
-                "pf1\t{sid}\t{res}\tN\t{sid}\t{res}\tH\t1D_NH\t{rdc_val:.3}\t0.20"
+                "pf1\t{sid}\t{rname}\tN\t{sid}\t{rname}\tH\t1D_NH\t{rdc_val:.3}\t0.25\t21.70\t{is_free}"
             );
         }
     }
     cif.push_str("#\nloop_\n_ma_qa_metric_local.ordinal_id\n_ma_qa_metric_local.model_id\n_ma_qa_metric_local.label_asym_id\n_ma_qa_metric_local.label_seq_id\n_ma_qa_metric_local.label_comp_id\n_ma_qa_metric_local.metric_id\n_ma_qa_metric_local.metric_value\n");
     for (i, &pv) in plddts.iter().enumerate() {
-        let _ = writeln!(cif, "{} 1 A {} {} 1 {pv:.2}", i + 1, i + 1, seq3[i]);
+        let r = &chain_res[i];
+        let _ = writeln!(
+            cif,
+            "{} 1 A {} {} 1 {pv:.2}",
+            i + 1,
+            r.seq_id,
+            r.res_name
+        );
     }
     cif.push_str("#\n");
 
-    // Build 52 x 52 AFDB v4 PAE JSON (`0..31.75 A`)
-    let mut pae_json = String::with_capacity(24_000);
+    // Build 76 x 76 AFDB v4 PAE JSON (`0..31.75 A`): D1 = 1..35, Linker = 36..40, D2 = 41..71, Tail = 72..76
+    let mut pae_json = String::with_capacity(48_000);
     pae_json.push_str("[{\"max_predicted_aligned_error\":31.75,\"predicted_aligned_error\":[");
     for i in 0..n {
         if i > 0 {
             pae_json.push(',');
         }
         pae_json.push('[');
-        let d_i = if i < 23 {
+        let d_i = if i < 35 {
             1
-        } else if i >= 29 {
+        } else if (40..71).contains(&i) {
             2
         } else {
             0
@@ -2627,9 +2685,9 @@ fn build_synthetic_two_domain_af_demo() -> (String, String, Reference, String) {
             if j > 0 {
                 pae_json.push(',');
             }
-            let d_j = if j < 23 {
+            let d_j = if j < 35 {
                 1
-            } else if j >= 29 {
+            } else if (40..71).contains(&j) {
                 2
             } else {
                 0
@@ -2637,7 +2695,7 @@ fn build_synthetic_two_domain_af_demo() -> (String, String, Reference, String) {
             let v = if i == j {
                 0.50
             } else if d_i != 0 && d_i == d_j {
-                (1.60 + (i.abs_diff(j) as f64) * 0.11).min(4.20)
+                (1.50 + (i.abs_diff(j) as f64) * 0.08).min(4.20)
             } else if d_i == 0 || d_j == 0 {
                 24.50
             } else {
@@ -2648,27 +2706,6 @@ fn build_synthetic_two_domain_af_demo() -> (String, String, Reference, String) {
         pae_json.push(']');
     }
     pae_json.push_str("]}]");
-
-    // Build assigned NMR shifts (`Reference`): helical secondary shifts in D1 & D2, coil shifts in linker 24..29,
-    // plus a planted conditional-folding segment at 19..22 (high pLDDT in AF, coil-like shifts in NMR).
-    let mut demo_ref = Reference::new(seq3.clone(), seq_ids);
-    for (i, res) in seq3.iter().enumerate() {
-        let is_linker_or_morf = (19..29).contains(&i);
-        let (ca_off, cb_off, c_off, h_off, n_off) = if is_linker_or_morf {
-            (0.05, 0.02, 0.04, 0.0, 0.0)
-        } else {
-            (3.10, -0.45, 2.15, -0.25, -1.60)
-        };
-        if res != "PRO" {
-            demo_ref.shifts.insert((i, "H".to_string()), 8.20 + h_off);
-            demo_ref.shifts.insert((i, "N".to_string()), 120.0 + n_off);
-        }
-        demo_ref.shifts.insert((i, "CA".to_string()), 54.5 + ca_off);
-        demo_ref.shifts.insert((i, "C".to_string()), 175.8 + c_off);
-        if res != "GLY" {
-            demo_ref.shifts.insert((i, "CB".to_string()), 31.0 + cb_off);
-        }
-    }
 
     (cif, pae_json, demo_ref, nh_rdc_tsv)
 }

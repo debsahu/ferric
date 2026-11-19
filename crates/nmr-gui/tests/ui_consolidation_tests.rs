@@ -29,6 +29,7 @@ use nmr_gui::mol3d_viewer::Mol3dViewerPanel;
 use nmr_gui::octet_canvas::{extract_active_molecule_subgraph, OctetDrawPanel};
 use nmr_gui::ss_ribbon_widget::{SsRibbonPanel, SsRibbonState, SsRibbonWorkspaceInput};
 use nmr_gui::stack1d_panel::{render_stack1d_panel, Stack1dState, Trace1d};
+use nmr_gui::strip_tiler::{StripSpectra3D, StripTilerContext, StripTilerPanel};
 use nmr_gui::workbench_mode::{
     apply_type_scale, audit_text_layout, draw_mode_switcher, draw_mode_switcher_with_rect,
     draw_sub_view_selector, primary_controls, SmallMoleculeView, WorkbenchMode,
@@ -206,50 +207,92 @@ fn test_primary_control_budget_le_12_and_canvas_area_ge_65_percent_at_1440x900()
         );
     }
 
-    // 2. Assign mode (2D HSQC)
+    // 2. Assign mode with real `StripTilerPanel` docked OPEN at 1440x900 & 1280x800 (`B11`)
+    //    (Full `NmrWorkbenchApp` Assign closed + open budget is also enforced in `main.rs`.)
     {
-        let ctx = egui::Context::default();
-        let mut switcher_r = egui::Rect::ZERO;
-        let mut canvas_r = egui::Rect::ZERO;
-        let _ = run_two_passes(&ctx, 1440.0, 900.0, |ui| {
-            egui::Panel::top("hdr_assign").show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    switcher_r = draw_mode_switcher_with_rect(ui, WorkbenchMode::Assign).1;
-                    let _ = ui.button("Pick Peaks");
-                    let _ = ui.button("Run Assignment");
-                    let _ = ui.button("3D Strips");
-                    ui.menu_button("Advanced", |ui| {
-                        let _ = ui.button("Solver");
+        let p_mat = pair_matrix(&suite.systems, &ScoreConfig::default());
+        let mut tiler = StripTilerPanel::new();
+        for (vw, vh) in [(1440.0_f32, 900.0_f32), (1280.0_f32, 800.0_f32)] {
+            let ctx = egui::Context::default();
+            let mut switcher_r = egui::Rect::ZERO;
+            let mut canvas_r = egui::Rect::ZERO;
+            let mut dock_r = egui::Rect::ZERO;
+            let out = run_two_passes(&ctx, vw, vh, |ui| {
+                egui::Panel::top("hdr_assign_real").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        switcher_r = draw_mode_switcher_with_rect(ui, WorkbenchMode::Assign).1;
+                        let _ = ui.button("Pick Peaks");
+                        let _ = ui.button("Run Assignment");
+                        let _ = ui.button("3D Strips");
+                        ui.menu_button("Advanced", |ui| {
+                            let _ = ui.button("Solver");
+                        });
                     });
                 });
-            });
-            egui::Panel::top("seq_strip_assign").show(ui, |ui| {
-                let mut q = String::new();
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut q).desired_width(96.0));
-                    let _ = ui.allocate_exact_size(egui::vec2(1200.0, 24.0), egui::Sense::click());
+                let dr = egui::Panel::right("strip_dock_real")
+                    .default_size(300.0)
+                    .min_size(236.0)
+                    .show(ui, |ui| {
+                        let tctx = StripTilerContext {
+                            systems: &suite.systems,
+                            pair_mat: &p_mat,
+                            u_mat: None,
+                            sequence: &seq,
+                            seq_ids: &seq_ids,
+                            active_root: 0,
+                            assignments: None,
+                            locks: None,
+                            confirmed_links: None,
+                            spectra_3d: StripSpectra3D {
+                                aliphatic_3d: Some(&suite.hncacb_3d),
+                                carbonyl_3d: Some(&suite.hnco_3d),
+                            },
+                        };
+                        let _ = tiler.show(ui, &tctx, None);
+                    });
+                dock_r = dr.response.rect;
+                let _ = egui::CentralPanel::default().show(ui, |ui| {
+                    let avail = ui.available_size();
+                    let (r, _) = ui.allocate_exact_size(
+                        egui::vec2(avail.x - 48.0, avail.y - 24.0),
+                        egui::Sense::click_and_drag(),
+                    );
+                    canvas_r = r;
                 });
             });
-            let _ = egui::CentralPanel::default().show(ui, |ui| {
-                let avail = ui.available_size();
-                let (r, _) = ui.allocate_exact_size(
-                    egui::vec2(avail.x - 72.0, avail.y - 24.0),
-                    egui::Sense::click_and_drag(),
+            let strip_r = tiler
+                .last_canvas_rect
+                .expect("StripTilerPanel must record last_canvas_rect");
+            let ctrls = primary_controls(&ctx, &[switcher_r, canvas_r, strip_r], 40_000.0);
+            assert!(
+                ctrls.len() <= MAX_PRIMARY_CONTROLS_PER_MODE,
+                "Assign + real 3D Strips ({vw}x{vh}) exceeded 12 primary controls: got {}",
+                ctrls.len()
+            );
+            let share = (canvas_r.area() + strip_r.area()) / (vw * vh);
+            assert!(
+                share >= MIN_CANVAS_AREA_FRACTION,
+                "Assign + real 3D Strips ({vw}x{vh}) total spectrum share {share:.3} < {MIN_CANVAS_AREA_FRACTION}"
+            );
+            assert!(
+                tiler.last_column_rects.len() >= 3,
+                "Assign + real 3D Strips ({vw}x{vh}) must render all 3 strips, got {}",
+                tiler.last_column_rects.len()
+            );
+            for (ci, col_r) in tiler.last_column_rects.iter().enumerate() {
+                assert!(
+                    col_r.left() >= dock_r.left() - 1.0 && col_r.right() <= dock_r.right() + 1.0,
+                    "Strip #{ci} clipped outside dock at {vw}x{vh}: col={col_r:?} dock={dock_r:?}"
                 );
-                canvas_r = r;
-            });
-        });
-        let ctrls = primary_controls(&ctx, &[switcher_r, canvas_r], 30_000.0);
-        assert!(
-            ctrls.len() <= MAX_PRIMARY_CONTROLS_PER_MODE,
-            "Assign mode exceeded 12 primary controls: got {}",
-            ctrls.len()
-        );
-        let share = canvas_r.area() / screen_area;
-        assert!(
-            share >= MIN_CANVAS_AREA_FRACTION,
-            "Assign mode 2D canvas share {share:.3} < {MIN_CANVAS_AREA_FRACTION}"
-        );
+            }
+            let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(vw, vh));
+            let audit = audit_text_layout(&out.shapes, vp);
+            assert!(
+                audit.clipped.is_empty(),
+                "Assign + real 3D Strips ({vw}x{vh}) clipped text: {:?}",
+                audit.clipped
+            );
+        }
     }
 
     // 3. Structure mode (`3D Model` AND `PAE & Co-Fold` across all 4 IntegrativeStudioTabs)
@@ -796,54 +839,216 @@ fn test_scientific_candor_metabolomics_integrative_af_and_octet() {
 
 #[test]
 fn test_first_run_bruker_open_process_pick_assign_completes_within_5_clicks() {
-    // Scripted 4-click (`<= 5` clicks!) end-to-end workflow:
-    // Click 1: Open dataset -> Click 2: Process / Phase check -> Click 3: Pick Peaks -> Click 4: Run Assignment
-    let mut click_count = 0usize;
+    // Real headless `egui::Context` pointer-click test driving the mode switcher & workflow buttons
+    // through real `egui::RawInput` `PointerMoved` + `PointerButton` events (`<= 5` dispatched clicks).
+    // (The full `NmrWorkbenchApp` test opening a real on-disk Bruker `pdata/1` dir via `DroppedFile`
+    // and clicking `Water` -> `Assign` -> `Pick Peaks` -> `Run Assignment` lives in `main.rs`.)
+    let ctx = egui::Context::default();
+    let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+    let mut mode = WorkbenchMode::Process;
+    let mut loaded_suite: Option<nmr_gui::demo_preset::BuiltinDemoSuite> = None;
+    let mut ref_data: Option<nmr_core::nmrstar::Reference> = None;
+    let mut water_done = false;
+    let mut picked_roots = 0usize;
+    let mut assigned_count = 0usize;
 
-    // Click 1: Open Ubiquitin 2D HSQC + 3D HNCACB/HNCO workspace
-    click_count += 1;
-    let ref_data = read_star_str(SYNTH_UBQ_STR, None).expect("parse sequence & shifts");
-    let suite =
-        build_builtin_demo_suite(BUILTIN_DEMO_SUITE_SEED).expect("build ubiquitin workspace");
+    let run_pass = |events: Vec<egui::Event>,
+                        mode: &mut WorkbenchMode,
+                        loaded_suite: &mut Option<nmr_gui::demo_preset::BuiltinDemoSuite>,
+                        ref_data: &mut Option<nmr_core::nmrstar::Reference>,
+                        water_done: &mut bool,
+                        picked_roots: &mut usize,
+                        assigned_count: &mut usize|
+     -> egui::FullOutput {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(vp),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                apply_type_scale(ui.ctx());
+                egui::Panel::top("b12_hdr").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if let Some(m) = draw_mode_switcher(ui, *mode) {
+                            *mode = m;
+                        }
+                        if ui.button("Open Dataset").clicked() {
+                            *ref_data = Some(read_star_str(SYNTH_UBQ_STR, None).expect("star"));
+                            *loaded_suite = Some(
+                                build_builtin_demo_suite(BUILTIN_DEMO_SUITE_SEED).expect("suite"),
+                            );
+                        }
+                        if *mode == WorkbenchMode::Process && ui.button("Water").clicked() {
+                            if let Some(s) = loaded_suite.as_mut() {
+                                let _ = nmr_core::water::suppress_water_spectrum_2d(
+                                    &mut s.hsqc_2d,
+                                    &nmr_core::water::WaterSuppressionConfig::default(),
+                                );
+                                *water_done = true;
+                            }
+                        }
+                        if *mode == WorkbenchMode::Assign && ui.button("Pick Peaks").clicked() {
+                            if let Some(s) = loaded_suite.as_ref() {
+                                let pcfg = PickerConfig::default();
+                                let roots = pick_hsqc_2d(&s.hsqc_2d, &pcfg);
+                                let cubes_ref = [&s.hncacb_3d, &s.hnco_3d];
+                                let p3 = pick_triple_3d_two_pass(
+                                    &cubes_ref,
+                                    &roots,
+                                    &pcfg,
+                                    &CorroboratedRepickConfig::default(),
+                                );
+                                assert!(!p3.is_empty());
+                                *picked_roots = roots.len();
+                            }
+                        }
+                        if *mode == WorkbenchMode::Assign && ui.button("Run Assignment").clicked() {
+                            if let (Some(s), Some(r)) = (loaded_suite.as_ref(), ref_data.as_ref()) {
+                                let systems = build_spin_systems(
+                                    &s.peaks,
+                                    &Tolerances::default(),
+                                    3,
+                                    false,
+                                )
+                                .expect("systems");
+                                let priors = Priors::bmrb();
+                                let scfg = ScoreConfig::default();
+                                let u = unary_matrix(&systems, &r.sequence, &priors, &scfg);
+                                let p = pair_matrix(&systems, &scfg);
+                                let res = assign_from_matrices(&u, &p, &AnnealConfig::default());
+                                *assigned_count =
+                                    res.position.iter().filter(|&&k| k >= 0).count();
+                            }
+                        }
+                    });
+                });
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.label("Spectrum Canvas");
+                });
+            },
+        );
+        out.textures_delta.clear();
+        out
+    };
 
-    // Click 2: Process (water-safe 2D HSQC ready)
-    click_count += 1;
-    let mut hsqc = suite.hsqc_2d;
-    let cfg_w = nmr_core::water::WaterSuppressionConfig::default();
-    let _ = nmr_core::water::suppress_water_spectrum_2d(&mut hsqc, &cfg_w);
+    let mut dispatched_clicks = 0usize;
+    let mut dispatch_click = |label: &str,
+                              mode: &mut WorkbenchMode,
+                              loaded_suite: &mut Option<nmr_gui::demo_preset::BuiltinDemoSuite>,
+                              ref_data: &mut Option<nmr_core::nmrstar::Reference>,
+                              water_done: &mut bool,
+                              picked_roots: &mut usize,
+                              assigned_count: &mut usize| {
+        let pre = run_pass(
+            Vec::new(),
+            mode,
+            loaded_suite,
+            ref_data,
+            water_done,
+            picked_roots,
+            assigned_count,
+        );
+        let audit = audit_text_layout(&pre.shapes, vp);
+        let pos = audit
+            .texts
+            .iter()
+            .find(|t| t.text.trim() == label)
+            .map(|t| t.rect.center())
+            .unwrap_or_else(|| panic!("button {label:?} not rendered"));
+        dispatched_clicks += 1;
+        let _ = run_pass(
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            mode,
+            loaded_suite,
+            ref_data,
+            water_done,
+            picked_roots,
+            assigned_count,
+        );
+        let _ = run_pass(
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            mode,
+            loaded_suite,
+            ref_data,
+            water_done,
+            picked_roots,
+            assigned_count,
+        );
+    };
 
-    // Click 3: Pick 2D HSQC roots & multi-experiment 3D peaks (from full workspace peak set)
-    click_count += 1;
-    let pcfg = PickerConfig::default();
-    let roots = pick_hsqc_2d(&hsqc, &pcfg);
-    assert!(roots.len() >= 55, "expected >= 55 picked 2D HSQC roots");
-    let cubes_ref = [&suite.hncacb_3d, &suite.hnco_3d];
-    let p3 = pick_triple_3d_two_pass(
-        &cubes_ref,
-        &roots,
-        &pcfg,
-        &CorroboratedRepickConfig::default(),
+    dispatch_click(
+        "Open Dataset",
+        &mut mode,
+        &mut loaded_suite,
+        &mut ref_data,
+        &mut water_done,
+        &mut picked_roots,
+        &mut assigned_count,
     );
-    assert!(!p3.is_empty(), "expected 3D strip peaks picked");
-    let systems =
-        build_spin_systems(&suite.peaks, &Tolerances::default(), 3, false).expect("build systems");
-    assert!(systems.len() >= 50, "expected >= 50 spin systems");
+    assert!(loaded_suite.is_some());
 
-    // Click 4: Run Assignment
-    click_count += 1;
-    let priors = Priors::bmrb();
-    let scfg = ScoreConfig::default();
-    let u = unary_matrix(&systems, &ref_data.sequence, &priors, &scfg);
-    let p = pair_matrix(&systems, &scfg);
-    let res = assign_from_matrices(&u, &p, &AnnealConfig::default());
-    let n_assigned = res.position.iter().filter(|&&k| k >= 0).count();
+    dispatch_click(
+        "Water",
+        &mut mode,
+        &mut loaded_suite,
+        &mut ref_data,
+        &mut water_done,
+        &mut picked_roots,
+        &mut assigned_count,
+    );
+    assert!(water_done);
 
-    assert!(
-        click_count <= 5,
-        "First-run open -> process -> pick -> assign must finish in <= 5 clicks, took {click_count}"
+    dispatch_click(
+        "Assign",
+        &mut mode,
+        &mut loaded_suite,
+        &mut ref_data,
+        &mut water_done,
+        &mut picked_roots,
+        &mut assigned_count,
+    );
+    assert_eq!(mode, WorkbenchMode::Assign);
+
+    dispatch_click(
+        "Pick Peaks",
+        &mut mode,
+        &mut loaded_suite,
+        &mut ref_data,
+        &mut water_done,
+        &mut picked_roots,
+        &mut assigned_count,
+    );
+    assert!(picked_roots >= 55);
+
+    dispatch_click(
+        "Run Assignment",
+        &mut mode,
+        &mut loaded_suite,
+        &mut ref_data,
+        &mut water_done,
+        &mut picked_roots,
+        &mut assigned_count,
     );
     assert!(
-        n_assigned >= 45,
-        "Expected >= 45 assigned residues in 4-click workflow, got {n_assigned}"
+        dispatched_clicks <= 5,
+        "First-run workflow must complete in <= 5 real clicks, took {dispatched_clicks}"
+    );
+    assert!(
+        assigned_count >= 45,
+        "Expected >= 45 assigned residues, got {assigned_count}"
     );
 }
