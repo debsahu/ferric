@@ -62,12 +62,22 @@ impl AssignProteinRegime {
     }
 }
 
-/// One row of the Step 2 spectra & picked peaks checklist.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One row of the Step 2 7-slot spectra & picked peaks data-input mapper.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExperimentChecklistRow {
+    /// Canonical backbone slot label (`HSQC`, `HNCACB`, `CBCA(CO)NH`, `HNCA`, `HN(CO)CA`, `HNCO`,
+    /// `HN(CA)CO`).
     pub exp_name: String,
+    /// True when a spectrum or peak list is loaded for this slot.
     pub loaded: bool,
+    /// Real picked peak count for this slot.
     pub peak_count: usize,
+    /// Optional loaded source filename / folder / expno label (shown when loaded).
+    pub source_label: Option<String>,
+    /// Optional Bruker `PULPROG` or pulse-sequence tag (shown alongside or in place of source).
+    pub pulprog: Option<String>,
+    /// Optional 3D-to-HSQC amide registration drift `(delta_h_ppm, delta_n_ppm)` in ppm.
+    pub registration_drift_ppm: Option<(f64, f64)>,
 }
 
 impl ExperimentChecklistRow {
@@ -76,6 +86,50 @@ impl ExperimentChecklistRow {
             exp_name: exp_name.into(),
             loaded,
             peak_count,
+            source_label: None,
+            pulprog: None,
+            registration_drift_ppm: None,
+        }
+    }
+
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        let s = source.into();
+        self.source_label = if s.trim().is_empty() { None } else { Some(s) };
+        self
+    }
+
+    pub fn with_pulprog(mut self, pulprog: impl Into<String>) -> Self {
+        let s = pulprog.into();
+        self.pulprog = if s.trim().is_empty() { None } else { Some(s) };
+        self
+    }
+
+    pub fn with_registration_drift(mut self, delta_h_ppm: f64, delta_n_ppm: f64) -> Self {
+        if delta_h_ppm.is_finite() && delta_n_ppm.is_finite() {
+            self.registration_drift_ppm = Some((delta_h_ppm, delta_n_ppm));
+        }
+        self
+    }
+
+    /// Human-readable loaded source / `pulprog` summary, or `"Not loaded"` when empty.
+    pub fn display_source(&self) -> String {
+        if !self.loaded {
+            return "Not loaded".to_string();
+        }
+        match (
+            self.source_label
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+            self.pulprog
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        ) {
+            (Some(src), Some(pp)) if !src.eq_ignore_ascii_case(pp) => format!("{src} ({pp})"),
+            (Some(src), _) => src.to_string(),
+            (None, Some(pp)) => pp.to_string(),
+            (None, None) => "Loaded".to_string(),
         }
     }
 }
@@ -222,6 +276,20 @@ pub enum AssignSetupAction {
     JumpToResidue(usize),
 }
 
+/// Interactive 7-slot 3D data-input mapper actions emitted by Step 2 of [`AssignSetupDrawerState`],
+/// drained by the host workbench via [`AssignSetupDrawerState::take_slot_actions`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssignSlotAction {
+    /// User clicked `Load Study Folder...` to batch-load a multi-experiment study directory.
+    LoadStudyFolder,
+    /// User clicked `Load...` on a canonical backbone slot (e.g. `"HNCACB"`).
+    LoadSlotSpectrum(String),
+    /// User clicked `Clear` on a loaded canonical backbone slot (e.g. `"HNCO"`).
+    ClearSlotSpectrum(String),
+    /// User overrode the experiment-type assignment of a loaded slot via its ComboBox.
+    ReassignSlotExperiment { from_slot: String, to_exp: String },
+}
+
 /// Parse an inline 1-letter amino acid sequence or FASTA block into a validated uppercase 1-letter
 /// sequence string (`ACDEFGHIKLMNPQRSTVWY`). Rejects empty input or invalid letters fail-closed.
 pub fn parse_inline_sequence(raw: &str) -> Result<String, String> {
@@ -295,6 +363,8 @@ pub struct AssignSetupDrawerState {
     pub validation_error: Option<String>,
     /// Bounding rect from the most recent rendered frame.
     pub last_drawer_rect: Option<egui::Rect>,
+    /// Slot-level data-input mapper actions emitted during the most recent rendered frame.
+    pending_slot_actions: Vec<AssignSlotAction>,
 }
 
 impl Default for AssignSetupDrawerState {
@@ -316,7 +386,13 @@ impl AssignSetupDrawerState {
             triage_cursor: 0,
             validation_error: None,
             last_drawer_rect: None,
+            pending_slot_actions: Vec::new(),
         }
+    }
+
+    /// Drain all Step 2 7-slot data-input mapper actions emitted during the last frame.
+    pub fn take_slot_actions(&mut self) -> Vec<AssignSlotAction> {
+        std::mem::take(&mut self.pending_slot_actions)
     }
 
     /// Render the drawer inside a collapsible floating `egui::Window` when `self.open` is true.
@@ -328,6 +404,7 @@ impl AssignSetupDrawerState {
         let mut actions = Vec::new();
         if !self.open {
             self.last_drawer_rect = None;
+            self.pending_slot_actions.clear();
             return actions;
         }
         let mut keep_open = self.open;
@@ -335,8 +412,8 @@ impl AssignSetupDrawerState {
             .open(&mut keep_open)
             .collapsible(true)
             .resizable(true)
-            .default_width(360.0)
-            .min_width(300.0)
+            .default_width(420.0)
+            .min_width(340.0)
             .show(ctx, |ui| {
                 actions = self.show_contents(ui, input);
             });
@@ -355,6 +432,7 @@ impl AssignSetupDrawerState {
         input: &AssignSetupInput,
     ) -> Vec<AssignSetupAction> {
         let mut actions = Vec::new();
+        self.pending_slot_actions.clear();
 
         let inner = ui.vertical(|ui| {
             ui.horizontal(|ui| {
@@ -382,31 +460,36 @@ impl AssignSetupDrawerState {
 
             ui.separator();
 
-            // ================================================================
-            // Step 1 — Sequence
-            // ================================================================
-            self.render_step1_sequence(ui, input, &mut actions);
-            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .id_salt("assign_setup_drawer_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // ================================================================
+                    // Step 1 — Sequence
+                    // ================================================================
+                    self.render_step1_sequence(ui, input, &mut actions);
+                    ui.add_space(6.0);
 
-            // ================================================================
-            // Step 2 — Spectra & Peaks Checklist
-            // ================================================================
-            self.render_step2_spectra(ui, input, &mut actions);
-            ui.add_space(6.0);
+                    // ================================================================
+                    // Step 2 — Spectra & Peaks 7-Slot Data Input Mapper
+                    // ================================================================
+                    self.render_step2_spectra(ui, input, &mut actions);
+                    ui.add_space(6.0);
 
-            // ================================================================
-            // Step 3 — Solve & Triage
-            // ================================================================
-            self.render_step3_solve_and_triage(ui, input, &mut actions);
+                    // ================================================================
+                    // Step 3 — Solve & Triage
+                    // ================================================================
+                    self.render_step3_solve_and_triage(ui, input, &mut actions);
 
-            if !input.last_status.is_empty() {
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(&input.last_status)
-                        .size(TYPE_CAPTION_PX)
-                        .color(egui::Color32::from_rgb(155, 195, 225)),
-                );
-            }
+                    if !input.last_status.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(&input.last_status)
+                                .size(TYPE_CAPTION_PX)
+                                .color(egui::Color32::from_rgb(155, 195, 225)),
+                        );
+                    }
+                });
         });
 
         self.last_drawer_rect = Some(inner.response.rect);
@@ -540,55 +623,45 @@ impl AssignSetupDrawerState {
                 });
                 ui.add_space(4.0);
 
-                egui::Grid::new("assign_setup_spectra_checklist")
-                    .num_columns(3)
-                    .spacing([10.0, 3.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("Experiment")
-                                .size(TYPE_CAPTION_PX)
-                                .strong(),
-                        );
-                        ui.label(egui::RichText::new("Status").size(TYPE_CAPTION_PX).strong());
-                        ui.label(egui::RichText::new("Peaks").size(TYPE_CAPTION_PX).strong());
-                        ui.end_row();
+                // Top batch actions: Load Study Folder + Pick All (2D + 3D)
+                ui.horizontal_wrapped(|ui| {
+                    let study_btn = egui::Button::new(
+                        egui::RichText::new("Load Study Folder...")
+                            .size(TYPE_CAPTION_PX)
+                            .strong(),
+                    )
+                    .fill(egui::Color32::from_rgb(34, 52, 78));
+                    if ui
+                        .add(study_btn)
+                        .on_hover_text(
+                            "Select a study directory to auto-discover and map Bruker, NMRPipe, or Sparky 2D/3D backbone spectra",
+                        )
+                        .clicked()
+                    {
+                        self.pending_slot_actions
+                            .push(AssignSlotAction::LoadStudyFolder);
+                    }
 
-                        for row in &rows {
-                            ui.label(
-                                egui::RichText::new(&row.exp_name)
-                                    .monospace()
-                                    .size(TYPE_CAPTION_PX),
-                            );
-                            if row.loaded {
-                                ui.label(
-                                    egui::RichText::new("Loaded")
-                                        .size(TYPE_CAPTION_PX)
-                                        .color(egui::Color32::from_rgb(86, 224, 152)),
-                                );
-                            } else {
-                                ui.label(
-                                    egui::RichText::new("Not loaded")
-                                        .size(TYPE_CAPTION_PX)
-                                        .color(egui::Color32::from_rgb(126, 140, 160)),
-                                );
-                            }
-                            let pk_col = if row.peak_count > 0 {
-                                egui::Color32::from_rgb(218, 232, 248)
-                            } else {
-                                egui::Color32::from_rgb(126, 140, 160)
-                            };
-                            ui.label(
-                                egui::RichText::new(format!("{}", row.peak_count))
-                                    .monospace()
-                                    .size(TYPE_CAPTION_PX)
-                                    .color(pk_col),
-                            );
-                            ui.end_row();
-                        }
-                    });
+                    let pick_btn = egui::Button::new(
+                        egui::RichText::new("Pick All (2D + 3D)")
+                            .size(TYPE_CAPTION_PX)
+                            .strong(),
+                    )
+                    .fill(egui::Color32::from_rgb(28, 72, 92));
+                    if ui
+                        .add(pick_btn)
+                        .on_hover_text(
+                            "Pick 2D HSQC roots and all loaded 3D triple-resonance cubes in one pass",
+                        )
+                        .clicked()
+                    {
+                        actions.push(AssignSetupAction::PickAllSpectra {
+                            snr_threshold: self.snr_threshold,
+                        });
+                    }
+                });
 
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("SNR:").size(TYPE_CAPTION_PX));
                     ui.add(
@@ -598,23 +671,187 @@ impl AssignSetupDrawerState {
                     );
                 });
                 ui.add_space(4.0);
-                let pick_btn = egui::Button::new(
-                    egui::RichText::new("Pick All (2D + 3D)")
-                        .size(TYPE_BODY_PX)
-                        .strong(),
-                )
-                .fill(egui::Color32::from_rgb(28, 72, 92))
-                .min_size(egui::vec2(ui.available_width().max(140.0), 28.0));
-                if ui
-                    .add(pick_btn)
-                    .on_hover_text(
-                        "Pick 2D HSQC roots and all loaded 3D triple-resonance strips in one pass",
-                    )
-                    .clicked()
-                {
-                    actions.push(AssignSetupAction::PickAllSpectra {
-                        snr_threshold: self.snr_threshold,
-                    });
+
+                // Interactive 7-slot backbone spectrum data-input mapper
+                for (row_idx, row) in rows.iter().enumerate() {
+                    let row_bg = if row_idx % 2 == 0 {
+                        egui::Color32::from_rgb(22, 28, 40)
+                    } else {
+                        egui::Color32::from_rgb(17, 22, 32)
+                    };
+                    egui::Frame::new()
+                        .fill(row_bg)
+                        .stroke(egui::Stroke::new(
+                            0.8,
+                            if row.loaded {
+                                egui::Color32::from_rgb(44, 78, 72)
+                            } else {
+                                egui::Color32::from_rgb(34, 42, 56)
+                            },
+                        ))
+                        .corner_radius(3.0)
+                        .inner_margin(egui::Margin::symmetric(6, 3))
+                        .show(ui, |ui| {
+                            // Line 1: Canonical slot name, real picked peak count, per-slot Load/Clear
+                            ui.horizontal(|ui| {
+                                let slot_col = if row.loaded {
+                                    egui::Color32::from_rgb(86, 224, 152)
+                                } else {
+                                    egui::Color32::from_rgb(156, 170, 190)
+                                };
+                                ui.label(
+                                    egui::RichText::new(&row.exp_name)
+                                        .monospace()
+                                        .strong()
+                                        .size(TYPE_CAPTION_PX)
+                                        .color(slot_col),
+                                );
+                                let pk_col = if row.peak_count > 0 {
+                                    egui::Color32::from_rgb(218, 232, 248)
+                                } else {
+                                    egui::Color32::from_rgb(126, 140, 160)
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!("{} pk", row.peak_count))
+                                        .monospace()
+                                        .size(TYPE_CAPTION_PX)
+                                        .color(pk_col),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add_enabled(
+                                                row.loaded,
+                                                egui::Button::new(
+                                                    egui::RichText::new("Clear")
+                                                        .size(TYPE_CAPTION_PX),
+                                                ),
+                                            )
+                                            .on_hover_text(format!(
+                                                "Remove loaded spectrum from {} slot",
+                                                row.exp_name
+                                            ))
+                                            .clicked()
+                                        {
+                                            self.pending_slot_actions.push(
+                                                AssignSlotAction::ClearSlotSpectrum(
+                                                    row.exp_name.clone(),
+                                                ),
+                                            );
+                                        }
+                                        if ui
+                                            .add(egui::Button::new(
+                                                egui::RichText::new("Load...")
+                                                    .size(TYPE_CAPTION_PX),
+                                            ))
+                                            .on_hover_text(format!(
+                                                "Load a spectrum or peak list into {} slot",
+                                                row.exp_name
+                                            ))
+                                            .clicked()
+                                        {
+                                            self.pending_slot_actions.push(
+                                                AssignSlotAction::LoadSlotSpectrum(
+                                                    row.exp_name.clone(),
+                                                ),
+                                            );
+                                        }
+                                    },
+                                );
+                            });
+
+                            // Line 2: Loaded source / pulprog + experiment-type override ComboBox
+                            ui.horizontal(|ui| {
+                                let full_src = row.display_source();
+                                let short_src = truncate_slot_label(&full_src, 24);
+                                let src_col = if row.loaded {
+                                    egui::Color32::from_rgb(176, 206, 232)
+                                } else {
+                                    egui::Color32::from_rgb(122, 136, 156)
+                                };
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(short_src)
+                                            .monospace()
+                                            .size(TYPE_CAPTION_PX)
+                                            .color(src_col),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Extend),
+                                )
+                                .on_hover_text(full_src);
+
+                                if row.loaded {
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            egui::ComboBox::from_id_salt(format!(
+                                                "assign_slot_exp_override_{}",
+                                                row.exp_name
+                                            ))
+                                            .width(98.0)
+                                            .selected_text(
+                                                egui::RichText::new(&row.exp_name)
+                                                    .monospace()
+                                                    .size(TYPE_CAPTION_PX),
+                                            )
+                                            .show_ui(ui, |ui| {
+                                                for &cand in &CANONICAL_BACKBONE_EXPERIMENTS {
+                                                    let is_cur =
+                                                        cand.eq_ignore_ascii_case(&row.exp_name);
+                                                    if ui
+                                                        .selectable_label(
+                                                            is_cur,
+                                                            egui::RichText::new(cand)
+                                                                .monospace()
+                                                                .size(TYPE_CAPTION_PX),
+                                                        )
+                                                        .clicked()
+                                                        && !is_cur
+                                                    {
+                                                        self.pending_slot_actions.push(
+                                                            AssignSlotAction::ReassignSlotExperiment {
+                                                                from_slot: row.exp_name.clone(),
+                                                                to_exp: cand.to_string(),
+                                                            },
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        },
+                                    );
+                                }
+                            });
+
+                            // Optional Line 3: 3D-to-HSQC registration drift readout
+                            if let Some((dh, dn)) = row.registration_drift_ppm {
+                                if dh.is_finite() && dn.is_finite() {
+                                    let warn_drift = dh.abs() > 0.03 || dn.abs() > 0.25;
+                                    let drift_col = if warn_drift {
+                                        egui::Color32::from_rgb(248, 182, 74)
+                                    } else {
+                                        egui::Color32::from_rgb(126, 214, 186)
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!(
+                                                    "Drift: ΔH {dh:+.3} ΔN {dn:+.2} ppm"
+                                                ))
+                                                .monospace()
+                                                .size(TYPE_CAPTION_PX)
+                                                .color(drift_col),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Extend),
+                                        )
+                                        .on_hover_text(
+                                            "3D-to-HSQC amide registration drift (ppm)",
+                                        );
+                                    });
+                                }
+                            }
+                        });
+                    ui.add_space(2.0);
                 }
             });
     }
@@ -672,15 +909,29 @@ impl AssignSetupDrawerState {
                 });
 
                 ui.horizontal_wrapped(|ui| {
-                    let af_label = if input.has_af_structure {
-                        "Use AF Structure Priors (PDB loaded)"
+                    if input.has_af_structure {
+                        ui.checkbox(
+                            &mut self.use_af_priors,
+                            egui::RichText::new("Use AF Structure Priors (PDB loaded)")
+                                .size(TYPE_CAPTION_PX),
+                        )
+                        .on_hover_text(
+                            "Apply structure-informed secondary-structure priors from the loaded AlphaFold/PDB model",
+                        );
                     } else {
-                        "Use AF Structure Priors"
-                    };
-                    ui.checkbox(
-                        &mut self.use_af_priors,
-                        egui::RichText::new(af_label).size(TYPE_CAPTION_PX),
-                    );
+                        let mut disabled_af = false;
+                        ui.add_enabled(
+                            false,
+                            egui::Checkbox::new(
+                                &mut disabled_af,
+                                egui::RichText::new("Use AF Structure Priors (no PDB/AF loaded)")
+                                    .size(TYPE_CAPTION_PX),
+                            ),
+                        )
+                        .on_disabled_hover_text(
+                            "Load an AlphaFold or PDB structure first to activate structure-informed priors.",
+                        );
+                    }
                 });
 
                 ui.add_space(6.0);
@@ -705,7 +956,7 @@ impl AssignSetupDrawerState {
                     actions.push(AssignSetupAction::RunAssignment {
                         engine: self.engine,
                         regime: self.regime,
-                        use_af_priors: self.use_af_priors,
+                        use_af_priors: self.use_af_priors && input.has_af_structure,
                     });
                 }
 
@@ -797,6 +1048,16 @@ impl AssignSetupDrawerState {
                     }
                 }
             });
+    }
+}
+
+fn truncate_slot_label(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars || max_chars <= 3 {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max_chars - 3).collect();
+        format!("{head}...")
     }
 }
 
