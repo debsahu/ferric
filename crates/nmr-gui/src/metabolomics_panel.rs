@@ -9,6 +9,13 @@
 //! Cloarec et al. *Anal. Chem.* 2005; CC0 `BMRB` metabolomics reference library).
 
 use eframe::egui;
+use nmr_core::metabolite_db::{
+    extract_stocsy_cluster_query_peaks, query_offline_metabolites,
+    synthesize_reference_spectrum_1d, MetaboliteEntry, MetaboliteMatch, MetaboliteNucleus,
+    QueryPeak, ReferenceSpectrum1D, DEFAULT_STOCSY_CLUSTER_MIN_R,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_core::metabolite_db::{query_online_bmrb_and_npmrd, OnlineQuerySources};
 use nmr_core::metabolomics::{
     compute_stocsy, export_biomarker_ranking_csv, export_bucket_table_csv,
     export_study_summary_json, generate_demo_biofluid_cohort, run_metabolomics_pipeline,
@@ -100,6 +107,22 @@ pub struct MetabolomicsStudioPanel {
     pub show_bucket_boundaries: bool,
     pub auto_zoom_on_select: bool,
     pub show_biomarker_table: bool,
+    /// Toggle for the `Identify Metabolite (BMRB-BMSE)` drawer below the main quadrants.
+    pub show_identify_panel: bool,
+    /// Query nucleus for metabolite identification (`1H` by default).
+    pub identify_nucleus: MetaboliteNucleus,
+    /// Chemical-shift matching tolerance in ppm for metabolite identification.
+    pub identify_tol_ppm: f64,
+    /// Opt-in desktop online search flag (`BMRB v2` + `NP-MRD`); strictly `false` by default.
+    pub include_online_search: bool,
+    /// Ranked candidate hits from the latest offline (and opt-in online) metabolite search.
+    pub identify_results: Vec<MetaboliteMatch>,
+    /// Status message for the metabolite identification panel.
+    pub identify_status: String,
+    /// Synthesized 1D reference spectrum currently overlaid onto Quadrant A.
+    pub active_reference_overlay: Option<ReferenceSpectrum1D>,
+    /// Pending `SMILES` string queued by the 1-click `Send to Octet` action.
+    pub pending_send_smiles_to_octet: Option<String>,
     /// True when the currently loaded cohort came from the built-in synthetic biofluid generator.
     pub is_synthetic_demo_cohort: bool,
 
@@ -136,6 +159,16 @@ impl MetabolomicsStudioPanel {
             show_bucket_boundaries: true,
             auto_zoom_on_select: true,
             show_biomarker_table: false,
+            show_identify_panel: false,
+            identify_nucleus: MetaboliteNucleus::H1,
+            identify_tol_ppm: 0.03,
+            include_online_search: false,
+            identify_results: Vec::new(),
+            identify_status:
+                "Click 'Query Picked 1D Peaks' or 'Query STOCSY (r >= 0.85)' to search offline CC0 BMRB-BMSE index."
+                    .to_string(),
+            active_reference_overlay: None,
+            pending_send_smiles_to_octet: None,
             is_synthetic_demo_cohort: false,
             view_ppm_bounds: view_bounds,
             status_banner:
@@ -246,6 +279,171 @@ impl MetabolomicsStudioPanel {
         }
     }
 
+    /// Find the cohort-mean peak apex ppm inside a bucket window, falling back to `center_ppm`.
+    fn bucket_apex_ppm(
+        study: &MetabolomicsStudyResult,
+        low_ppm: f64,
+        high_ppm: f64,
+        fallback: f64,
+    ) -> f64 {
+        let m = study.common_ppm_grid.len();
+        if m == 0 || study.aligned_spectra.is_empty() {
+            return fallback;
+        }
+        let i_start = study.common_ppm_grid.partition_point(|&p| p > high_ppm);
+        let i_end = study
+            .common_ppm_grid
+            .partition_point(|&p| p >= low_ppm)
+            .saturating_sub(1)
+            .min(m.saturating_sub(1));
+        if i_start > i_end || i_end >= m {
+            return fallback;
+        }
+        let mut best_ppm = fallback;
+        let mut best_val = f64::NEG_INFINITY;
+        for idx in i_start..=i_end {
+            let mut sum = 0.0_f64;
+            for (si, row) in study.aligned_spectra.iter().enumerate() {
+                let df = study
+                    .dilution_factors
+                    .get(si)
+                    .copied()
+                    .unwrap_or(1.0)
+                    .max(1e-15);
+                if let Some(&v) = row.get(idx) {
+                    sum += v / df;
+                }
+            }
+            if sum > best_val {
+                best_val = sum;
+                best_ppm = study.common_ppm_grid[idx];
+            }
+        }
+        best_ppm
+    }
+
+    /// Extract picked 1D peaks from the active cohort study (bucket apex positions).
+    pub fn extract_picked_1d_query_peaks(&self) -> Vec<QueryPeak> {
+        let Some(ref study) = self.study else {
+            return Vec::new();
+        };
+        study
+            .buckets
+            .iter()
+            .map(|b| {
+                let apex = Self::bucket_apex_ppm(study, b.low_ppm, b.high_ppm, b.center_ppm);
+                QueryPeak::from_ppm(apex)
+            })
+            .collect()
+    }
+
+    /// Extract active `STOCSY` correlated peaks (`r >= min_r`, default `0.85`) refined to apex ppm.
+    pub fn extract_stocsy_query_peaks(&self, min_r: f64) -> Vec<QueryPeak> {
+        let (Some(ref study), Some(ref st)) = (&self.study, &self.active_stocsy) else {
+            return Vec::new();
+        };
+        let mut peaks = extract_stocsy_cluster_query_peaks(&study.buckets, st, min_r);
+        for qp in &mut peaks {
+            if let Some(b) = study.buckets.iter().min_by(|a, b| {
+                (a.center_ppm - qp.ppm)
+                    .abs()
+                    .total_cmp(&(b.center_ppm - qp.ppm).abs())
+            }) {
+                qp.ppm = Self::bucket_apex_ppm(study, b.low_ppm, b.high_ppm, b.center_ppm);
+            }
+        }
+        peaks
+    }
+
+    fn run_identify_query(&mut self, query_peaks: &[QueryPeak], origin_label: &str) {
+        if query_peaks.is_empty() {
+            self.identify_results.clear();
+            self.identify_status = format!("No peaks available for {origin_label}.");
+            return;
+        }
+        let tol = self.identify_tol_ppm.clamp(0.005, 2.0);
+        #[allow(unused_mut)]
+        let mut results = query_offline_metabolites(query_peaks, self.identify_nucleus, tol, 12);
+        let offline_count = results.len();
+        #[allow(unused_mut)]
+        let mut online_note = String::new();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.include_online_search {
+            match query_online_bmrb_and_npmrd(
+                query_peaks,
+                self.identify_nucleus,
+                tol,
+                OnlineQuerySources::all(),
+            ) {
+                Ok(online_hits) => {
+                    let mut added = 0usize;
+                    for hit in online_hits {
+                        let dup = results.iter().any(|r| {
+                            r.entry.source == hit.entry.source
+                                && r.entry.bmse_id == hit.entry.bmse_id
+                        });
+                        if !dup {
+                            results.push(hit);
+                            added += 1;
+                        }
+                    }
+                    results.sort_by(|a, b| {
+                        b.score
+                            .total_cmp(&a.score)
+                            .then_with(|| a.mean_abs_error_ppm.total_cmp(&b.mean_abs_error_ppm))
+                    });
+                    results.truncate(16);
+                    online_note = format!(" (+{added} online BMRB/NP-MRD)");
+                }
+                Err(e) => {
+                    online_note = format!(" | Online unavailable: {e}");
+                }
+            }
+        }
+
+        self.identify_status = format!(
+            "{origin_label} ({} peaks, tol {:.3} ppm): {} offline CC0 hits{online_note}",
+            query_peaks.len(),
+            tol,
+            offline_count
+        );
+        self.identify_results = results;
+    }
+
+    /// 1-click metabolite identification from picked 1D cohort peaks.
+    pub fn identify_from_picked_peaks(&mut self) {
+        let peaks = self.extract_picked_1d_query_peaks();
+        self.run_identify_query(&peaks, "Picked 1D Peaks");
+    }
+
+    /// 1-click metabolite identification from active `STOCSY` correlated peaks (`r >= 0.85`).
+    pub fn identify_from_stocsy_cluster(&mut self) {
+        let peaks = self.extract_stocsy_query_peaks(DEFAULT_STOCSY_CLUSTER_MIN_R);
+        self.run_identify_query(&peaks, "STOCSY Cluster (r >= 0.85)");
+    }
+
+    /// Synthesize and activate a 1D reference overlay curve + stick list on Quadrant A.
+    pub fn set_reference_overlay(&mut self, entry: &MetaboliteEntry) {
+        let obs_mhz = self
+            .samples
+            .first()
+            .map(|s| s.spectrum.axis.obs_mhz)
+            .filter(|&m| m.is_finite() && m > 10.0)
+            .unwrap_or(600.0);
+        let spec = synthesize_reference_spectrum_1d(entry, self.identify_nucleus, obs_mhz, 2048);
+        self.status_banner = format!(
+            "Reference overlay active: {} ({}) at {:.1} MHz",
+            entry.name, entry.bmse_id, obs_mhz
+        );
+        self.active_reference_overlay = Some(spec);
+    }
+
+    /// Clear any active candidate reference spectrum overlay from Quadrant A.
+    pub fn clear_reference_overlay(&mut self) {
+        self.active_reference_overlay = None;
+    }
+
     /// Render the complete 4-Quadrant Metabolomics & Biomarker Discovery Studio.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.last_plot_rects = [None; 3];
@@ -265,10 +463,17 @@ impl MetabolomicsStudioPanel {
         } else {
             0.0
         };
-        let plots_avail_h =
-            (avail.y - table_h - if self.show_biomarker_table { 6.0 } else { 2.0 }).max(320.0);
-        let row1_h = (plots_avail_h * 0.52).max(165.0);
-        let row2_h = (plots_avail_h - row1_h - 4.0).max(155.0);
+        let identify_h = if self.show_identify_panel {
+            (avail.y * 0.23).clamp(132.0, 195.0)
+        } else {
+            0.0
+        };
+        let drawer_pad = if self.show_biomarker_table { 4.0 } else { 0.0 }
+            + if self.show_identify_panel { 4.0 } else { 0.0 }
+            + 2.0;
+        let plots_avail_h = (avail.y - table_h - identify_h - drawer_pad).max(260.0);
+        let row1_h = (plots_avail_h * 0.52).max(135.0);
+        let row2_h = (plots_avail_h - row1_h - 4.0).max(120.0);
         let half_w = ((full_w - 6.0) * 0.5).max(240.0);
 
         // Row 1: Full-width Quadrant A (1D Spectral Overlay & Live STOCSY Trace)
@@ -309,6 +514,18 @@ impl MetabolomicsStudioPanel {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     self.draw_quadrant_d_biomarker_table(ui, egui::vec2(full_w, table_h));
+                },
+            );
+        }
+
+        // Row 4: Identify Metabolite (BMRB-BMSE) Offline + Opt-In Online Drawer
+        if self.show_identify_panel {
+            ui.add_space(4.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(full_w, identify_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    self.draw_identify_metabolite_section(ui, egui::vec2(full_w, identify_h));
                 },
             );
         }
@@ -494,6 +711,16 @@ impl MetabolomicsStudioPanel {
                         .clicked()
                     {
                         self.show_biomarker_table = !self.show_biomarker_table;
+                    }
+
+                    if ui
+                        .selectable_label(self.show_identify_panel, "Identify (BMRB-BMSE)")
+                        .on_hover_text(
+                            "Open offline CC0 BMRB-BMSE & opt-in BMRB/NP-MRD metabolite identification drawer",
+                        )
+                        .clicked()
+                    {
+                        self.show_identify_panel = !self.show_identify_panel;
                     }
                 });
 
@@ -1132,6 +1359,66 @@ impl MetabolomicsStudioPanel {
                                 }
                             }
                         }
+                    }
+                }
+
+                // 2b. Optional 1-click candidate reference spectrum overlay (sticks + Lorentzian curve)
+                if let Some(ref overlay) = self.active_reference_overlay {
+                    if overlay.nucleus == MetaboliteNucleus::H1 {
+                        let stick_col = egui::Color32::from_rgba_unmultiplied(52, 211, 153, 145);
+                        let curve_col = egui::Color32::from_rgb(52, 211, 153);
+                        let max_h = plot_rect.height() * 0.82;
+
+                        for &(sppm, sh) in &overlay.sticks {
+                            if sppm < v_lo || sppm > v_hi {
+                                continue;
+                            }
+                            let sx = ppm_to_x(sppm);
+                            let sy = plot_rect.bottom() - (sh.clamp(0.0, 1.0) as f32) * max_h;
+                            painter.line_segment(
+                                [egui::pos2(sx, plot_rect.bottom()), egui::pos2(sx, sy)],
+                                egui::Stroke::new(1.2, stick_col),
+                            );
+                        }
+
+                        let n_ov = overlay.ppm_grid.len();
+                        if n_ov > 1 && overlay.intensities.len() == n_ov {
+                            let ov_start = overlay.ppm_grid.partition_point(|&p| p > v_hi);
+                            let ov_end = overlay
+                                .ppm_grid
+                                .partition_point(|&p| p >= v_lo)
+                                .saturating_sub(1)
+                                .min(n_ov.saturating_sub(1));
+                            if ov_start < ov_end {
+                                let max_cols = (plot_rect.width().ceil() as usize).max(160);
+                                let ov_stride = ((ov_end - ov_start) / max_cols).max(1);
+                                let mut pts =
+                                    Vec::with_capacity((ov_end - ov_start) / ov_stride + 2);
+                                let mut idx = ov_start;
+                                while idx <= ov_end {
+                                    let y_val = overlay.intensities[idx].clamp(0.0, 1.0) as f32;
+                                    pts.push(egui::pos2(
+                                        ppm_to_x(overlay.ppm_grid[idx]),
+                                        plot_rect.bottom() - y_val * max_h,
+                                    ));
+                                    idx += ov_stride;
+                                }
+                                if pts.len() >= 2 {
+                                    painter.add(egui::Shape::line(
+                                        pts,
+                                        egui::Stroke::new(1.6, curve_col),
+                                    ));
+                                }
+                            }
+                        }
+
+                        painter.text(
+                            egui::pos2(rect.right() - 10.0, rect.top() + 4.0),
+                            egui::Align2::RIGHT_TOP,
+                            format!("Ref Overlay: {} ({})", overlay.name, overlay.bmse_id),
+                            egui::FontId::monospace(11.0),
+                            egui::Color32::from_rgb(110, 231, 183),
+                        );
                     }
                 }
 
@@ -1898,6 +2185,241 @@ impl MetabolomicsStudioPanel {
             self.select_bucket_and_run_stocsy(bi, zoom);
         }
     }
+
+    // ========================================================================
+    // Identify Metabolite (BMRB-BMSE) Offline + Opt-In Desktop Online Drawer
+    // ========================================================================
+
+    fn draw_identify_metabolite_section(&mut self, ui: &mut egui::Ui, size: egui::Vec2) {
+        let mut trigger_picked = false;
+        let mut trigger_stocsy = false;
+        let mut trigger_clear_overlay = false;
+        let mut selected_overlay: Option<MetaboliteEntry> = None;
+        let mut selected_octet_smiles: Option<(String, String)> = None;
+
+        let active_overlay_id = self
+            .active_reference_overlay
+            .as_ref()
+            .map(|o| o.bmse_id.clone());
+
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(14, 18, 26))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(42, 54, 74)))
+            .corner_radius(5.0)
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.set_min_size(size - egui::vec2(16.0, 8.0));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("Identify Metabolite (BMRB-BMSE)")
+                            .size(12.5)
+                            .strong()
+                            .color(egui::Color32::from_rgb(135, 215, 255)),
+                    );
+                    ui.separator();
+
+                    if ui
+                        .button(egui::RichText::new("Query Picked 1D Peaks").size(11.5))
+                        .on_hover_text(
+                            "Match all picked 1D cohort peaks against the offline CC0 BMRB-BMSE index",
+                        )
+                        .clicked()
+                    {
+                        trigger_picked = true;
+                    }
+
+                    let has_stocsy = self.active_stocsy.is_some();
+                    if ui
+                        .add_enabled(
+                            has_stocsy,
+                            egui::Button::new(
+                                egui::RichText::new("Query STOCSY (r >= 0.85)").size(11.5),
+                            ),
+                        )
+                        .on_hover_text(
+                            "Match active STOCSY correlated peak cluster (r >= 0.85) against BMRB-BMSE",
+                        )
+                        .clicked()
+                    {
+                        trigger_stocsy = true;
+                    }
+
+                    ui.label(egui::RichText::new("Tol (ppm):").size(11.0));
+                    ui.add(
+                        egui::DragValue::new(&mut self.identify_tol_ppm)
+                            .range(0.005..=0.50)
+                            .speed(0.002)
+                            .fixed_decimals(3),
+                    );
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    ui.checkbox(
+                        &mut self.include_online_search,
+                        egui::RichText::new("Include Online Search (BMRB + NP-MRD)").size(11.5),
+                    )
+                    .on_hover_text(
+                        "Opt-in HTTPS query to api.bmrb.io and np-mrd.org (5 s timeout, 4 MiB cap; never runs automatically)",
+                    );
+
+                    if active_overlay_id.is_some()
+                        && ui
+                            .button(egui::RichText::new("Clear Overlay").size(11.0))
+                            .clicked()
+                    {
+                        trigger_clear_overlay = true;
+                    }
+                });
+
+                ui.label(
+                    egui::RichText::new(&self.identify_status)
+                        .size(11.0)
+                        .monospace()
+                        .color(egui::Color32::from_rgb(176, 198, 224)),
+                );
+
+                egui::ScrollArea::vertical()
+                    .id_salt("metabolomics_identify_table_scroll")
+                    .max_height((ui.available_height() - 2.0).max(60.0))
+                    .show(ui, |ui| {
+                        egui::Grid::new("metabolomics_identify_grid")
+                            .striped(true)
+                            .spacing([12.0, 2.0])
+                            .show(ui, |ui| {
+                                for hdr in [
+                                    "#",
+                                    "BMSE ID",
+                                    "Metabolite",
+                                    "Score",
+                                    "Matched/Total",
+                                    "Mean d(ppm)",
+                                    "Source",
+                                    "Actions",
+                                ] {
+                                    ui.label(
+                                        egui::RichText::new(hdr)
+                                            .size(11.0)
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(148, 184, 226)),
+                                    );
+                                }
+                                ui.end_row();
+
+                                for (rank, hit) in self.identify_results.iter().take(12).enumerate()
+                                {
+                                    let is_overlaid = active_overlay_id.as_deref()
+                                        == Some(hit.entry.bmse_id.as_str());
+                                    let row_col = if is_overlaid {
+                                        egui::Color32::from_rgb(110, 231, 183)
+                                    } else {
+                                        egui::Color32::from_rgb(226, 232, 240)
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(format!("{:>2}", rank + 1))
+                                            .size(11.0)
+                                            .monospace()
+                                            .color(row_col),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(&hit.entry.bmse_id)
+                                            .size(11.0)
+                                            .monospace()
+                                            .color(row_col),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(&hit.entry.name)
+                                            .size(11.0)
+                                            .strong()
+                                            .color(row_col),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!("{:.3}", hit.score))
+                                            .size(11.0)
+                                            .monospace()
+                                            .color(if hit.score >= 0.80 {
+                                                egui::Color32::from_rgb(134, 239, 172)
+                                            } else {
+                                                egui::Color32::from_rgb(203, 213, 225)
+                                            }),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{}/{}",
+                                            hit.matched_ref_peaks, hit.total_ref_peaks
+                                        ))
+                                        .size(11.0)
+                                        .monospace(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{:.4}",
+                                            hit.mean_abs_error_ppm
+                                        ))
+                                        .size(11.0)
+                                        .monospace(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(hit.entry.source.label())
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(160, 182, 208)),
+                                    );
+
+                                    ui.horizontal(|ui| {
+                                        let ov_lbl = if is_overlaid {
+                                            "Overlay [On]"
+                                        } else {
+                                            "Overlay"
+                                        };
+                                        if ui
+                                            .button(egui::RichText::new(ov_lbl).size(11.0))
+                                            .on_hover_text(
+                                                "Synthesize 1D reference sticks and Lorentzian curve onto Quadrant A",
+                                            )
+                                            .clicked()
+                                        {
+                                            selected_overlay = Some(hit.entry.clone());
+                                        }
+                                        let has_smiles = !hit.entry.smiles.trim().is_empty();
+                                        if ui
+                                            .add_enabled(
+                                                has_smiles,
+                                                egui::Button::new(
+                                                    egui::RichText::new("Send to Octet").size(11.0),
+                                                ),
+                                            )
+                                            .on_hover_text(
+                                                "Queue metabolite SMILES to open in the Octet-Draw 2D structure editor",
+                                            )
+                                            .clicked()
+                                        {
+                                            selected_octet_smiles = Some((
+                                                hit.entry.name.clone(),
+                                                hit.entry.smiles.clone(),
+                                            ));
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+
+        if trigger_picked {
+            self.identify_from_picked_peaks();
+        }
+        if trigger_stocsy {
+            self.identify_from_stocsy_cluster();
+        }
+        if trigger_clear_overlay {
+            self.clear_reference_overlay();
+        }
+        if let Some(entry) = selected_overlay {
+            self.set_reference_overlay(&entry);
+        }
+        if let Some((name, smiles)) = selected_octet_smiles {
+            self.pending_send_smiles_to_octet = Some(smiles);
+            self.status_banner = format!("Queued {name} SMILES for Octet-Draw workbench.");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1994,5 +2516,77 @@ mod tests {
             });
         });
         out3.textures_delta.clear();
+    }
+
+    #[test]
+    fn test_identify_metabolite_drawer_stocsy_overlay_and_send_to_octet_headless() {
+        let ctx = egui::Context::default();
+        let mut studio = MetabolomicsStudioPanel::default();
+        assert!(
+            !studio.include_online_search,
+            "online search must be opt-in (false by default)"
+        );
+        assert!(studio.pending_send_smiles_to_octet.is_none());
+
+        studio.config.n_permutations = 10;
+        studio.load_demo_cohort();
+        studio.show_identify_panel = true;
+
+        // 1. Identify from all picked 1D cohort peaks
+        studio.identify_from_picked_peaks();
+        assert!(
+            !studio.identify_results.is_empty(),
+            "picked 1D peak identification should return offline CC0 BMRB-BMSE candidates"
+        );
+
+        // 2. Select L-Lactate 1.33 ppm driver and identify from active STOCSY cluster (r >= 0.85)
+        let lac_idx = studio
+            .study
+            .as_ref()
+            .expect("study loaded")
+            .buckets
+            .iter()
+            .min_by(|a, b| {
+                (a.center_ppm - 1.330)
+                    .abs()
+                    .total_cmp(&(b.center_ppm - 1.330).abs())
+            })
+            .expect("lactate bucket")
+            .index;
+        studio.select_bucket_and_run_stocsy(lac_idx, false);
+        studio.identify_from_stocsy_cluster();
+        let top = studio
+            .identify_results
+            .first()
+            .expect("top STOCSY metabolite hit")
+            .clone();
+        assert_eq!(top.entry.name, "L-Lactate");
+        assert_eq!(top.entry.bmse_id, "bmse000036");
+
+        // 3. Activate 1-click reference overlay & simulate Send to Octet handoff
+        studio.set_reference_overlay(&top.entry);
+        assert!(studio.active_reference_overlay.is_some());
+        studio.pending_send_smiles_to_octet = Some(top.entry.smiles.clone());
+        assert_eq!(
+            studio.pending_send_smiles_to_octet.as_deref(),
+            Some("C[C@H](O)C(=O)O")
+        );
+
+        // 4. Render with Identify drawer open + active reference overlay at 1440x900
+        let raw_in = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw_in, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                studio.ui(ui);
+            });
+        });
+        out.textures_delta.clear();
+        assert!(studio.last_plot_rects[0].is_some());
+        assert!(studio.last_canvas_rect.is_some());
     }
 }
