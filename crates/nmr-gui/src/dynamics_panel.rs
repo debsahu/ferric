@@ -1379,14 +1379,11 @@ impl DynamicsStudioPanel {
             return self.load_multi_cest_synthetic_demo(target);
         }
 
-        // Update schemes & physical metadata from current editable controls while preserving user data
+        // Update schemes & physical metadata from current editable controls while preserving each
+        // imported profile's own effective B1 (NEVER overwrite profile 0 with the demo slider).
         let mut updated = Vec::with_capacity(existing_profiles.len());
-        for (idx, mut prof) in existing_profiles.into_iter().enumerate() {
-            let b1_eff = if idx == 0 {
-                self.multi_cest.b1_hz
-            } else {
-                prof.scheme.effective_b1_hz().max(0.1)
-            };
+        for mut prof in existing_profiles {
+            let b1_eff = prof.scheme.effective_b1_hz().max(0.0);
             let scheme = match self.build_multi_cest_scheme(target, b1_eff) {
                 Ok(s) => s,
                 Err(e) => {
@@ -2476,24 +2473,42 @@ impl DynamicsStudioPanel {
             }
 
             ui.separator();
+            let active_imported_b1s: Vec<f64> = if !is_demo {
+                let profs = match scheme_tab {
+                    CestSchemeTab::DanteCest => &self.multi_cest.dante_profiles,
+                    CestSchemeTab::CosCest => &self.multi_cest.cos_profiles,
+                    CestSchemeTab::CwCest => &[][..],
+                };
+                profs.iter().map(|p| p.scheme.effective_b1_hz()).collect()
+            } else {
+                Vec::new()
+            };
+            let b1_desc = if active_imported_b1s.is_empty() {
+                format!("{:.1} Hz", self.multi_cest.b1_hz)
+            } else if active_imported_b1s.len() == 1 {
+                format!("{:.1} Hz", active_imported_b1s[0])
+            } else {
+                let parts: Vec<String> = active_imported_b1s
+                    .iter()
+                    .map(|v| format!("{v:.1}"))
+                    .collect();
+                format!("[{}] Hz", parts.join(", "))
+            };
             let param_summary = match scheme_tab {
                 CestSchemeTab::DanteCest => {
                     let comb_hz = f64::from(self.multi_cest.n_pulses.max(1))
                         / self.multi_cest.t_ex_s.max(1e-6);
                     format!(
-                        "B1 = {:.1} Hz | T_EX = {:.2} s | N_pulses = {} | comb = {:.0} Hz",
-                        self.multi_cest.b1_hz, self.multi_cest.t_ex_s, self.multi_cest.n_pulses, comb_hz
+                        "B1 = {b1_desc} | T_EX = {:.2} s | N_pulses = {} | comb = {:.0} Hz",
+                        self.multi_cest.t_ex_s, self.multi_cest.n_pulses, comb_hz
                     )
                 }
                 CestSchemeTab::CosCest => {
                     let sb_ppm =
                         self.multi_cest.mod_freq_hz / self.multi_cest.larmor_mhz.max(1.0);
                     format!(
-                        "nu_mod = {:.0} Hz (±{:.2} ppm) | B1 = {:.1} Hz | T_EX = {:.2} s",
-                        self.multi_cest.mod_freq_hz,
-                        sb_ppm,
-                        self.multi_cest.b1_hz,
-                        self.multi_cest.t_ex_s
+                        "nu_mod = {:.0} Hz (±{:.2} ppm) | B1 = {b1_desc} | T_EX = {:.2} s",
+                        self.multi_cest.mod_freq_hz, sb_ppm, self.multi_cest.t_ex_s
                     )
                 }
                 CestSchemeTab::CwCest => String::new(),
@@ -2525,6 +2540,9 @@ impl DynamicsStudioPanel {
                             .speed(0.5)
                             .range(1.0..=200.0)
                             .suffix(" Hz"),
+                    )
+                    .on_hover_text(
+                        "Effective B1 for synthetic demos or 3-column TSV imports; imported profiles with per-profile B1 keep their own B1 on refit",
                     );
                     ui.checkbox(&mut self.multi_cest.use_dual_b1, "Dual B1");
                     if self.multi_cest.use_dual_b1 {

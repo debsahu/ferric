@@ -364,6 +364,96 @@ fn test_t226_multi_cest_tsv_import_and_honest_crlb_unavailable_on_flat_profile()
 }
 
 #[test]
+fn test_t226_dante_and_cos_cest_refit_preserves_imported_dual_b1() {
+    // 171.assign:P1-4 regression: refitting imported multi-B1 ([14, 28] Hz) DANTE-CEST and
+    // cos-CEST profiles MUST preserve each profile's own B1 and NEVER overwrite profile 0 with
+    // `panel.multi_cest.b1_hz` (the demo slider).
+    for scheme_tab in [CestSchemeTab::DanteCest, CestSchemeTab::CosCest] {
+        let mut panel = DynamicsStudioPanel::new();
+        panel.active_tab = DynamicsStudioTab::CestDest;
+        panel.cest_scheme_tab = scheme_tab;
+        panel.multi_cest.larmor_mhz = 60.8106;
+        panel.multi_cest.major_ppm = 118.0;
+        panel.multi_cest.b1_inhomogeneity_frac = 0.0;
+        panel.multi_cest.n_b1_quad = 1;
+
+        let offsets: Vec<f64> = (-24..=24).map(|k| 118.0 + 0.25 * (k as f64)).collect();
+        let true_dw = 4.20;
+        let mut tsv = String::from("offset_ppm\tintensity\tsigma\tb1_hz\n");
+        for &b1 in &[14.0_f64, 28.0_f64] {
+            let scheme = panel
+                .build_multi_cest_scheme(scheme_tab, b1)
+                .expect("build scheme");
+            let sim = simulate_multi_cest_profile(
+                &MultiCestSimParams {
+                    p_b: 0.025,
+                    k_ex_s_inv: 180.0,
+                    major_ppm: 118.0,
+                    dw_ab_ppm: true_dw,
+                    r1a_s_inv: 1.3,
+                    r2a_s_inv: 14.0,
+                    r1b_s_inv: 1.3,
+                    r2b_s_inv: 20.0,
+                    larmor_mhz: 60.8106,
+                    b1_inhomogeneity_frac: 0.0,
+                    n_b1_quad: 1,
+                    normalization: CestNormalization::ZeroTimePhaseCycled,
+                    scheme,
+                },
+                &offsets,
+            )
+            .expect("simulate profile");
+            for (&x, &y) in offsets.iter().zip(sim.iter()) {
+                tsv.push_str(&format!("{x:.4}\t{y:.6}\t0.004\t{b1:.1}\n"));
+            }
+        }
+
+        panel
+            .import_multi_cest_tsv(scheme_tab, &tsv)
+            .expect("import dual-B1 TSV");
+
+        // Move slider far away (40 Hz) and refit — imported [14, 28] Hz MUST remain intact!
+        panel.multi_cest.b1_hz = 40.0;
+        panel
+            .fit_multi_cest_2state(scheme_tab)
+            .expect("refit imported dual-B1 profiles");
+
+        let (profiles, fit_opt) = match scheme_tab {
+            CestSchemeTab::DanteCest => (
+                &panel.multi_cest.dante_profiles,
+                panel.multi_cest.dante_fit.as_ref(),
+            ),
+            CestSchemeTab::CosCest => (
+                &panel.multi_cest.cos_profiles,
+                panel.multi_cest.cos_fit.as_ref(),
+            ),
+            CestSchemeTab::CwCest => unreachable!(),
+        };
+        assert_eq!(profiles.len(), 2);
+        let b1s: Vec<f64> = profiles
+            .iter()
+            .map(|p| p.scheme.effective_b1_hz())
+            .collect();
+        assert!(
+            (b1s[0] - 14.0).abs() < 1e-6 && (b1s[1] - 28.0).abs() < 1e-6,
+            "{scheme_tab:?}: imported B1 [14, 28] Hz corrupted on refit to {:?}",
+            b1s
+        );
+        let fit = fit_opt.expect("refit result present");
+        assert!(
+            fit.reduced_chi2 < 5.0,
+            "{scheme_tab:?}: refit reduced_chi2 exploded to {} (B1 corruption?)",
+            fit.reduced_chi2
+        );
+        assert!(
+            (fit.params.dw_ab_ppm - true_dw).abs() < 0.15,
+            "{scheme_tab:?}: refit dw_ab_ppm drifted to {} vs true {true_dw}",
+            fit.params.dw_ab_ppm
+        );
+    }
+}
+
+#[test]
 fn test_t228_titration_2d_folder_tab_demo_tracking_regime_and_lineshape_fit() {
     let ctx = egui::Context::default();
     let mut panel = DynamicsStudioPanel::new();

@@ -18,10 +18,7 @@
 use std::collections::BTreeMap;
 
 use eframe::egui;
-use nmr_core::ccr_relax::{
-    compute_full_relax_and_ccr_isotropic, invert_tract_eta_xy_to_tau_m, CcrPhysicsConfig,
-    TractTauMEstimate,
-};
+use nmr_core::ccr_relax::{invert_tract_eta_xy_to_tau_m, CcrPhysicsConfig, TractTauMEstimate};
 use nmr_core::dynamics_detectors::{
     build_dynamics_detectors, experiments_and_observations_from_rates,
     fit_impact_from_multi_field_rates, log_spaced_grid, select_impact_model_aicc_from_rates,
@@ -153,6 +150,10 @@ pub struct Pseudo3dSlotState {
     pub warnings: Vec<String>,
 }
 
+/// Fail-closed error message when TRACT is requested without experimental TROSY/anti-TROSY rates.
+pub const TRACT_MISSING_RATES_ERR: &str =
+    "TRACT requires experimental TROSY (Rα) and anti-TROSY (Rβ) decay rates";
+
 /// Compact Phase 22 `TRACT` / CCR ($\eta_{xy}$, $R_{\text{ex}}$-free $\tau_m$, $\kappa_0$) summary.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TractSummaryReport {
@@ -223,9 +224,16 @@ pub struct RelaxPanelState {
     pub detector_fits: BTreeMap<i32, DetectorFitResult>,
     /// Phase 22 (`T22.4`) `IMPACT` simplex correlation-time decompositions per residue.
     pub impact_fits: BTreeMap<i32, ImpactFitResult>,
-    /// Phase 22 (`T22.5`) `TRACT` $\alpha/\beta$ rates and $R_{\text{ex}}$-free $\tau_m$ summary.
-    pub tract_r_alpha_input: f64,
-    pub tract_r_beta_input: f64,
+    /// Phase 22 (`T22.5`) `TRACT` experimental TROSY ($\alpha$) and anti-TROSY ($\beta$) decay rates
+    /// and uncertainties (`None` until explicitly supplied by the user — never placeholder values).
+    pub tract_r_alpha_input: Option<f64>,
+    pub tract_sigma_alpha_input: Option<f64>,
+    pub tract_r_beta_input: Option<f64>,
+    pub tract_sigma_beta_input: Option<f64>,
+    pub tract_r_alpha_text: String,
+    pub tract_sigma_alpha_text: String,
+    pub tract_r_beta_text: String,
+    pub tract_sigma_beta_text: String,
     pub tract_assumed_s2: f64,
     pub tract_report: Option<TractSummaryReport>,
 
@@ -265,13 +273,19 @@ impl RelaxPanelState {
             t1_slot: Pseudo3dSlotState::default(),
             t2_slot: Pseudo3dSlotState::default(),
             hetnoe_slot: Pseudo3dSlotState::default(),
-            hetnoe_order: HetNoeOrder::RefFirst,
+            hetnoe_order: HetNoeOrder::Auto,
             t2_vclist_unit_ms: 0.0,
             detector_design: None,
             detector_fits: BTreeMap::new(),
             impact_fits: BTreeMap::new(),
-            tract_r_alpha_input: 5.5,
-            tract_r_beta_input: 16.5,
+            tract_r_alpha_input: None,
+            tract_sigma_alpha_input: None,
+            tract_r_beta_input: None,
+            tract_sigma_beta_input: None,
+            tract_r_alpha_text: String::new(),
+            tract_sigma_alpha_text: String::new(),
+            tract_r_beta_text: String::new(),
+            tract_sigma_beta_text: String::new(),
             tract_assumed_s2: 0.85,
             tract_report: None,
             selected_seq_id: None,
@@ -368,13 +382,20 @@ impl RelaxPanelState {
             return Ok(None);
         }
         let mut out = Vec::with_capacity(tokens.len());
-        let unit_sec = vclist_unit_ms
-            .filter(|&u| u.is_finite() && u > 0.0)
-            .map(|u| u * 1.0e-3);
-        let all_plain_ints =
-            unit_sec.is_some() && tokens.iter().all(|t| t.chars().all(|c| c.is_ascii_digit()));
+        let all_plain_ints = tokens
+            .iter()
+            .all(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()));
         if all_plain_ints {
-            let u = unit_sec.unwrap_or(0.0);
+            let unit_ms = match vclist_unit_ms {
+                Some(u) if u.is_finite() && u > 0.0 => u,
+                _ => {
+                    return Err(
+                        "Plain integer vclist loop counts require an explicit positive CPMG cycle duration (cpmg_cycle_ms > 0.0 ms); set CPMG cycle duration or use explicit units ('s'/'ms') / decimal seconds."
+                            .to_string(),
+                    );
+                }
+            };
+            let u = unit_ms * 1.0e-3;
             for tok in tokens {
                 let n: u32 = tok
                     .parse()
@@ -641,8 +662,93 @@ impl RelaxPanelState {
         Ok(msg)
     }
 
-    /// Run Phase 22 (`T22.5`) `TRACT` $R_{\text{ex}}$-free $\tau_m$ inversion from TROSY ($\alpha$)
-    /// and anti-TROSY ($\beta$) transverse decay rates (`R_beta > R_alpha`).
+    /// Record explicit experimental TROSY (`Rα ± σ_α`) and anti-TROSY (`Rβ ± σ_β`) decay rates
+    /// (s⁻¹) for Phase 22 (`T22.5`) `TRACT` analysis.
+    pub fn set_tract_experimental_rates(
+        &mut self,
+        r_alpha_s_inv: f64,
+        sigma_r_alpha: f64,
+        r_beta_s_inv: f64,
+        sigma_r_beta: f64,
+    ) {
+        self.tract_r_alpha_input = Some(r_alpha_s_inv);
+        self.tract_sigma_alpha_input = Some(sigma_r_alpha);
+        self.tract_r_beta_input = Some(r_beta_s_inv);
+        self.tract_sigma_beta_input = Some(sigma_r_beta);
+        self.tract_r_alpha_text = format!("{r_alpha_s_inv:.3}");
+        self.tract_sigma_alpha_text = format!("{sigma_r_alpha:.3}");
+        self.tract_r_beta_text = format!("{r_beta_s_inv:.3}");
+        self.tract_sigma_beta_text = format!("{sigma_r_beta:.3}");
+    }
+
+    /// Parse experimental TRACT rates from a 4-column TSV/whitespace string
+    /// (`r_alpha  sigma_alpha  r_beta  sigma_beta`, optional header/comment lines) and run TRACT.
+    pub fn import_tract_rates_tsv(&mut self, raw: &str) -> Result<String, String> {
+        let mut parsed: Option<(f64, f64, f64, f64)> = None;
+        for (line_idx, raw_line) in raw.lines().enumerate() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let cols: Vec<&str> = line
+                .split(|c: char| c.is_ascii_whitespace() || c == ',' || c == ';')
+                .filter(|s| !s.is_empty())
+                .collect();
+            if cols.len() >= 4 && cols[0].eq_ignore_ascii_case("r_alpha") {
+                continue;
+            }
+            if cols.len() < 4 {
+                self.tract_report = None;
+                return Err(format!(
+                    "TRACT TSV line {}: expected 4 numeric columns (r_alpha sigma_alpha r_beta sigma_beta)",
+                    line_idx + 1
+                ));
+            }
+            let ra: f64 = cols[0].parse().map_err(|e| {
+                self.tract_report = None;
+                format!(
+                    "TRACT TSV line {}: invalid R_alpha '{}': {e}",
+                    line_idx + 1,
+                    cols[0]
+                )
+            })?;
+            let sa: f64 = cols[1].parse().map_err(|e| {
+                self.tract_report = None;
+                format!(
+                    "TRACT TSV line {}: invalid sigma_alpha '{}': {e}",
+                    line_idx + 1,
+                    cols[1]
+                )
+            })?;
+            let rb: f64 = cols[2].parse().map_err(|e| {
+                self.tract_report = None;
+                format!(
+                    "TRACT TSV line {}: invalid R_beta '{}': {e}",
+                    line_idx + 1,
+                    cols[2]
+                )
+            })?;
+            let sb: f64 = cols[3].parse().map_err(|e| {
+                self.tract_report = None;
+                format!(
+                    "TRACT TSV line {}: invalid sigma_beta '{}': {e}",
+                    line_idx + 1,
+                    cols[3]
+                )
+            })?;
+            parsed = Some((ra, sa, rb, sb));
+            break;
+        }
+        let Some((ra, sa, rb, sb)) = parsed else {
+            self.tract_report = None;
+            return Err(TRACT_MISSING_RATES_ERR.to_string());
+        };
+        self.run_phase22_tract(ra, sa, rb, sb)
+    }
+
+    /// Run Phase 22 (`T22.5`) `TRACT` $R_{\text{ex}}$-free $\tau_m$ inversion from experimental
+    /// TROSY ($\alpha$) and anti-TROSY ($\beta$) transverse decay rates and explicit uncertainties
+    /// (`R_beta > R_alpha > 0`, `sigma >= 0`). Fails closed and clears stale reports on invalid input.
     pub fn run_phase22_tract(
         &mut self,
         r_alpha_s_inv: f64,
@@ -650,25 +756,45 @@ impl RelaxPanelState {
         r_beta_s_inv: f64,
         sigma_r_beta: f64,
     ) -> Result<String, String> {
-        if !r_alpha_s_inv.is_finite() || !r_beta_s_inv.is_finite() || r_beta_s_inv <= r_alpha_s_inv
+        if !r_alpha_s_inv.is_finite()
+            || !r_beta_s_inv.is_finite()
+            || r_alpha_s_inv <= 0.0
+            || r_beta_s_inv <= r_alpha_s_inv
         {
+            self.tract_report = None;
             return Err(
-                "TRACT requires finite rates with R_beta > R_alpha (eta_xy = (R_beta - R_alpha)/2 > 0)"
+                "TRACT requires finite positive rates with R_beta > R_alpha (eta_xy = (R_beta - R_alpha)/2 > 0)"
+                    .to_string(),
+            );
+        }
+        if !sigma_r_alpha.is_finite()
+            || !sigma_r_beta.is_finite()
+            || sigma_r_alpha < 0.0
+            || sigma_r_beta < 0.0
+        {
+            self.tract_report = None;
+            return Err(
+                "TRACT requires finite non-negative experimental uncertainties (sigma_alpha >= 0, sigma_beta >= 0)"
                     .to_string(),
             );
         }
         let eta_xy = 0.5 * (r_beta_s_inv - r_alpha_s_inv);
-        let sigma_eta_xy =
-            0.5 * (sigma_r_alpha.max(0.0).powi(2) + sigma_r_beta.max(0.0).powi(2)).sqrt();
+        let sigma_eta_xy = 0.5 * (sigma_r_alpha.powi(2) + sigma_r_beta.powi(2)).sqrt();
         let phys = CcrPhysicsConfig::default();
-        let tau_m_rigid = invert_tract_eta_xy_to_tau_m(
+        let tau_m_rigid = match invert_tract_eta_xy_to_tau_m(
             eta_xy,
             sigma_eta_xy,
             self.primary_field_mhz,
             1.0,
             0.0,
             &phys,
-        )?;
+        ) {
+            Ok(est) => est,
+            Err(e) => {
+                self.tract_report = None;
+                return Err(e);
+            }
+        };
         let s2 = self.tract_assumed_s2.clamp(0.2, 1.0);
         let tau_m_s2_corrected = if s2 < 0.999 {
             invert_tract_eta_xy_to_tau_m(
@@ -683,9 +809,14 @@ impl RelaxPanelState {
         } else {
             None
         };
-        let kappa0_sec = phys.theoretical_kappa0(self.primary_field_mhz)?;
-        self.tract_r_alpha_input = r_alpha_s_inv;
-        self.tract_r_beta_input = r_beta_s_inv;
+        let kappa0_sec = match phys.theoretical_kappa0(self.primary_field_mhz) {
+            Ok(k) => k,
+            Err(e) => {
+                self.tract_report = None;
+                return Err(e);
+            }
+        };
+        self.set_tract_experimental_rates(r_alpha_s_inv, sigma_r_alpha, r_beta_s_inv, sigma_r_beta);
         self.tract_report = Some(TractSummaryReport {
             field_mhz: self.primary_field_mhz,
             r_alpha_s_inv,
@@ -697,47 +828,99 @@ impl RelaxPanelState {
             kappa0_sec,
         });
         let msg = format!(
-            "TRACT (T22.5): eta_xy = {eta_xy:.2} s^-1 -> rigid tau_m = {:.2} ns (kappa_0 = {kappa0_sec:.2})",
+            "TRACT (T22.5): eta_xy = {eta_xy:.2} +- {sigma_eta_xy:.2} s^-1 -> rigid tau_m = {:.2} ns (kappa_0 = {kappa0_sec:.2})",
             tau_m_rigid.tau_m_sec * 1.0e9
         );
         self.status_banner.clone_from(&msg);
         Ok(msg)
     }
 
-    /// Run all three Phase 22 analyses (`T22.3` Detectors, `T22.4` IMPACT, and `T22.5` TRACT)
-    /// directly on the currently fitted `R1`/`R2`/`hetNOE` rates.
+    /// Resolve explicit experimental TROSY (`Rα ± σ_α`) and anti-TROSY (`Rβ ± σ_β`) inputs from the
+    /// UI text boxes (or programmatic `Option<f64>` fields) and run `TRACT`. Fails closed with
+    /// [`TRACT_MISSING_RATES_ERR`] when experimental rates are absent.
+    pub fn run_phase22_tract_from_inputs(&mut self) -> Result<String, String> {
+        let parse_opt =
+            |txt: &str, fallback: Option<f64>, label: &str| -> Result<Option<f64>, String> {
+                let trimmed = txt.trim();
+                if trimmed.is_empty() {
+                    Ok(fallback)
+                } else {
+                    let v: f64 = trimmed
+                        .parse()
+                        .map_err(|e| format!("TRACT invalid {label} '{trimmed}': {e}"))?;
+                    Ok(Some(v))
+                }
+            };
+        let ra = match parse_opt(
+            &self.tract_r_alpha_text,
+            self.tract_r_alpha_input,
+            "R_alpha",
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                self.tract_report = None;
+                return Err(e);
+            }
+        };
+        let rb = match parse_opt(&self.tract_r_beta_text, self.tract_r_beta_input, "R_beta") {
+            Ok(v) => v,
+            Err(e) => {
+                self.tract_report = None;
+                return Err(e);
+            }
+        };
+        let (Some(r_alpha), Some(r_beta)) = (ra, rb) else {
+            self.tract_report = None;
+            return Err(TRACT_MISSING_RATES_ERR.to_string());
+        };
+        let sa = match parse_opt(
+            &self.tract_sigma_alpha_text,
+            self.tract_sigma_alpha_input,
+            "sigma_alpha",
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                self.tract_report = None;
+                return Err(e);
+            }
+        };
+        let sb = match parse_opt(
+            &self.tract_sigma_beta_text,
+            self.tract_sigma_beta_input,
+            "sigma_beta",
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                self.tract_report = None;
+                return Err(e);
+            }
+        };
+        let (Some(sigma_alpha), Some(sigma_beta)) = (sa, sb) else {
+            self.tract_report = None;
+            return Err(format!(
+                "{TRACT_MISSING_RATES_ERR} with explicit uncertainties (σ_α, σ_β >= 0)"
+            ));
+        };
+        self.run_phase22_tract(r_alpha, sigma_alpha, r_beta, sigma_beta)
+    }
+
+    /// Run Phase 22 analyses (`T22.3` Detectors, `T22.4` IMPACT, and `T22.5` TRACT when
+    /// experimental TROSY/anti-TROSY rates are supplied) on the currently fitted `R1`/`R2`/`hetNOE`
+    /// rates. Never fabricates placeholder TRACT rates or Model-Free round-trips.
     pub fn run_phase22_suite(&mut self) -> Result<String, String> {
         let det_msg = self.run_phase22_detectors()?;
         let imp_ok = self.run_phase22_impact().is_ok();
-        // Seed TRACT alpha/beta from fitted Model-Free tau_m when available, else keep user inputs.
-        if let Some(mf) = &self.modelfree_result {
-            let tm = mf.diffusion_tensor.effective_tau_m_sec();
-            let phys = CcrPhysicsConfig::default();
-            if let Ok(obs) = compute_full_relax_and_ccr_isotropic(
-                tm,
-                self.tract_assumed_s2.clamp(0.2, 1.0),
-                0.0,
-                0.0,
-                self.primary_field_mhz,
-                &phys,
-            ) {
-                self.tract_r_alpha_input = obs.r_alpha;
-                self.tract_r_beta_input = obs.r_beta;
-            }
-        }
-        let _ = self.run_phase22_tract(
-            self.tract_r_alpha_input,
-            0.20,
-            self.tract_r_beta_input,
-            0.35,
-        );
-        let msg = format!(
-            "{det_msg} IMPACT: {} residues. TRACT: {}.",
-            if imp_ok { self.impact_fits.len() } else { 0 },
-            self.tract_report
+        let tract_status = match self.run_phase22_tract_from_inputs() {
+            Ok(_) => self
+                .tract_report
                 .as_ref()
                 .map(|t| format!("tau_m = {:.2} ns", t.tau_m_rigid.tau_m_sec * 1.0e9))
-                .unwrap_or_else(|| "n/a".to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+            Err(e) => format!("not run ({e})"),
+        };
+        let msg = format!(
+            "{det_msg} IMPACT: {} residues. TRACT: {tract_status}.",
+            if imp_ok { self.impact_fits.len() } else { 0 },
         );
         self.status_banner.clone_from(&msg);
         Ok(msg)
@@ -1815,16 +1998,29 @@ impl RelaxPanelState {
                 ui.horizontal_wrapped(|ui| {
                     if kind == RelaxExperimentKind::HetNoe {
                         ui.label(egui::RichText::new("Plane Order:").size(TYPE_CAPTION_PX));
-                        for (ord, lbl) in [
-                            (HetNoeOrder::RefFirst, "Ref-First"),
-                            (HetNoeOrder::SatFirst, "Sat-First"),
-                            (HetNoeOrder::Auto, "Auto (pulprog)"),
+                        for (ord, lbl, tip) in [
+                            (
+                                HetNoeOrder::Auto,
+                                "Auto (pulprog)",
+                                "Fail-closed default: prove saturated-vs-reference order from pulseprogram, or fail if ambiguous",
+                            ),
+                            (
+                                HetNoeOrder::RefFirst,
+                                "Ref-First",
+                                "Explicitly assert plane 0 = reference (unsaturated) and plane 1 = saturated",
+                            ),
+                            (
+                                HetNoeOrder::SatFirst,
+                                "Sat-First",
+                                "Explicitly assert plane 0 = saturated and plane 1 = reference (unsaturated)",
+                            ),
                         ] {
                             if ui
                                 .add(egui::Button::selectable(
                                     self.hetnoe_order == ord,
                                     egui::RichText::new(lbl).size(TYPE_CAPTION_PX),
                                 ))
+                                .on_hover_text(tip)
                                 .clicked()
                             {
                                 self.hetnoe_order = ord;
@@ -1846,13 +2042,16 @@ impl RelaxPanelState {
                         );
                         if matches!(kind, RelaxExperimentKind::R2 | RelaxExperimentKind::R1rho) {
                             ui.label(
-                                egui::RichText::new("vclist unit (ms):").size(TYPE_CAPTION_PX),
+                                egui::RichText::new("CPMG cycle (ms):").size(TYPE_CAPTION_PX),
                             );
                             ui.add(
                                 egui::DragValue::new(&mut self.t2_vclist_unit_ms)
                                     .range(0.0..=50.0)
                                     .speed(0.2)
                                     .fixed_decimals(2),
+                            )
+                            .on_hover_text(
+                                "Explicit positive CPMG cycle duration (ms) required when vclist contains plain integer loop counts (e.g. 2 4 8 16)",
                             );
                         }
                     }
@@ -2167,20 +2366,62 @@ impl RelaxPanelState {
                             .color(egui::Color32::from_rgb(94, 228, 160)),
                         );
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(egui::RichText::new("R_alpha (s^-1):").size(TYPE_CAPTION_PX));
-                            ui.add(
-                                egui::DragValue::new(&mut self.tract_r_alpha_input)
-                                    .range(0.1..=250.0)
-                                    .speed(0.1)
-                                    .fixed_decimals(2),
-                            );
-                            ui.label(egui::RichText::new("R_beta (s^-1):").size(TYPE_CAPTION_PX));
-                            ui.add(
-                                egui::DragValue::new(&mut self.tract_r_beta_input)
-                                    .range(0.2..=400.0)
-                                    .speed(0.1)
-                                    .fixed_decimals(2),
-                            );
+                            ui.label(egui::RichText::new("Rα (s⁻¹):").size(TYPE_CAPTION_PX));
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.tract_r_alpha_text)
+                                        .id_salt("tract_r_alpha_input")
+                                        .desired_width(54.0)
+                                        .font(egui::FontId::monospace(TYPE_CAPTION_PX))
+                                        .hint_text("req."),
+                                )
+                                .changed()
+                            {
+                                self.tract_r_alpha_input =
+                                    self.tract_r_alpha_text.trim().parse::<f64>().ok();
+                            }
+                            ui.label(egui::RichText::new("± σ_α:").size(TYPE_CAPTION_PX));
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.tract_sigma_alpha_text)
+                                        .id_salt("tract_sigma_alpha_input")
+                                        .desired_width(50.0)
+                                        .font(egui::FontId::monospace(TYPE_CAPTION_PX))
+                                        .hint_text("req."),
+                                )
+                                .changed()
+                            {
+                                self.tract_sigma_alpha_input =
+                                    self.tract_sigma_alpha_text.trim().parse::<f64>().ok();
+                            }
+                            ui.label(egui::RichText::new("Rβ (s⁻¹):").size(TYPE_CAPTION_PX));
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.tract_r_beta_text)
+                                        .id_salt("tract_r_beta_input")
+                                        .desired_width(54.0)
+                                        .font(egui::FontId::monospace(TYPE_CAPTION_PX))
+                                        .hint_text("req."),
+                                )
+                                .changed()
+                            {
+                                self.tract_r_beta_input =
+                                    self.tract_r_beta_text.trim().parse::<f64>().ok();
+                            }
+                            ui.label(egui::RichText::new("± σ_β:").size(TYPE_CAPTION_PX));
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.tract_sigma_beta_text)
+                                        .id_salt("tract_sigma_beta_input")
+                                        .desired_width(50.0)
+                                        .font(egui::FontId::monospace(TYPE_CAPTION_PX))
+                                        .hint_text("req."),
+                                )
+                                .changed()
+                            {
+                                self.tract_sigma_beta_input =
+                                    self.tract_sigma_beta_text.trim().parse::<f64>().ok();
+                            }
                             ui.label(egui::RichText::new("S^2:").size(TYPE_CAPTION_PX));
                             ui.add(
                                 egui::DragValue::new(&mut self.tract_assumed_s2)
@@ -2195,12 +2436,7 @@ impl RelaxPanelState {
                                 ))
                                 .clicked()
                             {
-                                match self.run_phase22_tract(
-                                    self.tract_r_alpha_input,
-                                    0.20,
-                                    self.tract_r_beta_input,
-                                    0.35,
-                                ) {
+                                match self.run_phase22_tract_from_inputs() {
                                     Ok(msg) => actions.push(RelaxPanelAction::StatusMessage(msg)),
                                     Err(e) => self.status_banner = format!("TRACT error: {e}"),
                                 }
@@ -2223,6 +2459,14 @@ impl RelaxPanelState {
                                 .monospace()
                                 .size(TYPE_CAPTION_PX)
                                 .color(egui::Color32::from_rgb(168, 236, 198)),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new(
+                                    "TRACT requires experimental TROSY (Rα) and anti-TROSY (Rβ) decay rates (with σ_α, σ_β).",
+                                )
+                                .size(TYPE_CAPTION_PX)
+                                .color(egui::Color32::from_rgb(148, 162, 184)),
                             );
                         }
                     });
