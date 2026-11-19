@@ -34,7 +34,7 @@ use crate::contour_painter::{default_overlay_palette, OverlayLayerSpec, SyncCros
 use crate::stack1d_panel::{default_trace_color, RoiRegion1d, Stack1dState, Trace1d};
 
 /// Default width in logical pixels of the collapsible left `"Spectra"` workbook sidebar on Desktop.
-pub const WORKBOOK_SIDEBAR_DEFAULT_WIDTH: f32 = 168.0;
+pub const WORKBOOK_SIDEBAR_DEFAULT_WIDTH: f32 = 136.0;
 
 /// Exact width in logical pixels of the slim vertical left tool rail on 1D and 2D spectrum canvases.
 pub const CANVAS_TOOL_RAIL_WIDTH: f32 = 38.0;

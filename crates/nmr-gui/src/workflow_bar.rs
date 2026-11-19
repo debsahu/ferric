@@ -3151,7 +3151,7 @@ fn render_desktop_full_shell<H: ResponsiveWorkbenchHost>(
         egui::Panel::left("workbook_spectra_sidebar")
             .frame(sb_frame)
             .default_size(crate::workbook::WORKBOOK_SIDEBAR_DEFAULT_WIDTH)
-            .min_size(168.0)
+            .min_size(132.0)
             .max_size(272.0)
             .resizable(true)
             .show(ui, |ui| {
@@ -3175,7 +3175,7 @@ fn render_desktop_full_shell<H: ResponsiveWorkbenchHost>(
             let sb_open = host.show_workbook_sidebar();
             if host.show_strips_dock() && !host.is_1d_full_canvas() {
                 let r_resp = egui::Panel::right("right_strip_inspector")
-                    .default_size(if sb_open { 276.0 } else { 300.0 })
+                    .default_size(if sb_open { 244.0 } else { 300.0 })
                     .min_size(236.0)
                     .show(ui, |ui| {
                         host.draw_strips_inspector_view(ui);

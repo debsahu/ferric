@@ -8364,7 +8364,7 @@ impl NmrWorkbenchApp {
         // Color-coded VnmrJ-style left vertical mouse-mode icon rail (`v0.17.1`)
         let show_vnmrj_rail = !is_compact_mobile && outer_rect.width() >= 340.0;
         let stage_rect = if show_vnmrj_rail {
-            let rail_gutter = RAIL_WIDTH_PX + 4.0;
+            let rail_gutter = RAIL_WIDTH_PX + 1.0;
             let rail_host = egui::Rect::from_min_max(
                 outer_rect.min,
                 egui::pos2(outer_rect.left() + RAIL_WIDTH_PX, outer_rect.bottom()),
@@ -8438,10 +8438,10 @@ impl NmrWorkbenchApp {
             && self.workbook.two_d.show_projections
             && stage_rect.width() >= 280.0
             && stage_rect.height() >= 240.0;
-        let ruler_bottom_h = if is_compact_mobile { 0.0 } else { 24.0 };
+        let ruler_bottom_h = if is_compact_mobile { 0.0 } else { 20.0 };
         // F1 ruler: numeric ticks only (the nucleus tag sits on its own line under the first tick),
-        // so 52 px suffices for `121.25`-style labels and the contour plot keeps the width (`21F:B11`).
-        let ruler_right_w = if is_compact_mobile { 0.0 } else { 52.0 };
+        // so 44 px suffices for `121.25`-style labels and the contour plot keeps the width (`21F:B11`).
+        let ruler_right_w = if is_compact_mobile { 0.0 } else { 44.0 };
         let gap = if show_proj { 4.0 } else { 0.0 };
         let marg_sz = if show_proj { MARGINAL_2D_STRIP_PX } else { 0.0 };
 
