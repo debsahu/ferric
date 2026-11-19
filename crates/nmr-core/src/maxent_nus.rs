@@ -20,9 +20,9 @@
 //!   Discrepancy principle for selecting the regularization parameter $\lambda$ such that
 //!   $\chi^2_\nu = \|\mathcal{M}\mathcal{F}^{-1}\mathbf{f} - \mathbf{d}\|_2^2 / (N_{\text{obs}} \sigma^2) \approx 1$.
 //! - States, D. J., Haberkorn, R. A. & Ruben, D. J. (*J. Magn. Reson.* **1982**, 48, 286–292);
-//!   Marion, D., Ikura, M., Tschudin, R. & Bax, A. (*J. Magn. Reson.* **1989**, 85, 393–399);
-//!   Kay, L. E., Keifer, P. & Saarinen, T. (*J. Am. Chem. Soc.* **1992**, 114, 10663–10665) —
-//!   Hypercomplex `States`, `States-TPPI`, and `Echo-Antiecho` indirect quadrature encoding.
+//!   Marion, D., Ikura, M., Tschudin, R. & Bax, A. (*J. Magn. Reson.* **1989**, 85, 393–399) —
+//!   Hypercomplex `States` and `States-TPPI` indirect quadrature encoding (`Echo-AntiEcho`
+//!   data must be recombined along the directly detected dimension via `nmr_core::fid` first).
 //! - Hyberts, S. G., Takeuchi, K. & Wagner, G. (*J. Am. Chem. Soc.* **2010**, 132, 2145–2147) —
 //!   Sinusoidally weighted Poisson-gap non-uniform sampling schedules.
 //!
@@ -680,9 +680,12 @@ pub fn maxent_2d_workspace_bytes(
 
 fn validate_hypercomplex_quad_mode(mode: QuadMode, axis_desc: &str) -> Result<(), String> {
     match mode {
-        QuadMode::States | QuadMode::StatesTppi | QuadMode::EchoAntiecho => Ok(()),
+        QuadMode::States | QuadMode::StatesTppi => Ok(()),
+        QuadMode::EchoAntiecho => Err(format!(
+            "unsupported hypercomplex QuadMode EchoAntiecho on {axis_desc}: MaxEnt only accepts States or StatesTppi indirect planes; recombine Echo-AntiEcho data to States/States-TPPI via nmr_core::fid before calling MaxEnt"
+        )),
         other => Err(format!(
-            "unsupported hypercomplex QuadMode {other:?} on {axis_desc}; expected States, StatesTppi, or EchoAntiecho"
+            "unsupported hypercomplex QuadMode {other:?} on {axis_desc}; expected States or StatesTppi"
         )),
     }
 }
@@ -863,106 +866,35 @@ fn fft_2d_unitary(
 }
 
 /// Isometric quadrature conversion of a single 2D hypercomplex sample `[q00, q01, q10, q11]` at
-/// grid index `(k2, k1)` from `quad_modes = [mode2, mode1]` into canonical `States` `[cc, cs, sc, ss]`.
+/// grid index `(k2, k1)` from `quad_modes = [mode2, mode1]` (`States` or `StatesTppi`, validated
+/// by [`validate_hypercomplex_quad_mode`]) into canonical `States` `[cc, cs, sc, ss]`.
 ///
-/// ## Echo-Antiecho Phase Convention (Aligned with `fid.rs::recombine_quad_pair`)
-/// For a Rance–Kay sensitivity-enhanced Echo-Antiecho pair `(z0, z1)` where `z0 = (re0, im0)`
-/// and `z1 = (re1, im1)`, this applies the exact unitary (`1 / sqrt(2)`-scaled) Bruker TopSpin
-/// `MC2 = 5` recombination matching `crate::fid::recombine_quad_pair`:
-/// - `out_cos = (1 / sqrt(2)) * [-(im0 + im1), re0 + re1]` (`-i` rotation in Bruker conjugate rep / `+i` in `(re, im)`)
-/// - `out_sin = (1 / sqrt(2)) * [re1 - re0, im1 - im0]`
-///
-/// This removes the 90° sensitivity-enhancement phase offset on real Bruker Echo-Antiecho data
-/// while remaining strictly orthogonal (`M^T M = I`), preserving Euclidean noise variance and
-/// Hoch–Hore entropy invariance.
+/// `EchoAntiecho` data must be recombined to `States`/`StatesTppi` along the directly detected
+/// dimension via `nmr_core::fid` before calling MaxEnt and is rejected fail-closed at entry.
 #[inline]
 fn quad_to_states(mut q: [f64; 4], k2: usize, k1: usize, quad_modes: [QuadMode; 2]) -> [f64; 4] {
-    let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
     // Axis 2 (outer)
-    match quad_modes[0] {
-        QuadMode::States => {}
-        QuadMode::StatesTppi => {
-            if k2 % 2 == 1 {
-                q = [-q[0], -q[1], -q[2], -q[3]];
-            }
-        }
-        QuadMode::EchoAntiecho => {
-            // z0 = [q00, q01], z1 = [q10, q11] -> out_cos = [cc, cs], out_sin = [sc, ss]
-            // Unitary Bruker MC2 = 5 / fid.rs::recombine_quad_pair with -i rotation
-            q = [
-                inv_sqrt2 * -(q[1] + q[3]),
-                inv_sqrt2 * (q[0] + q[2]),
-                inv_sqrt2 * (q[2] - q[0]),
-                inv_sqrt2 * (q[3] - q[1]),
-            ];
-        }
-        QuadMode::Qf | QuadMode::Dqd => {}
+    if matches!(quad_modes[0], QuadMode::StatesTppi) && k2 % 2 == 1 {
+        q = [-q[0], -q[1], -q[2], -q[3]];
     }
     // Axis 1 (inner)
-    match quad_modes[1] {
-        QuadMode::States => {}
-        QuadMode::StatesTppi => {
-            if k1 % 2 == 1 {
-                q = [-q[0], -q[1], -q[2], -q[3]];
-            }
-        }
-        QuadMode::EchoAntiecho => {
-            // z0 = [q00, q10], z1 = [q01, q11] -> out_cos = [cc, sc], out_sin = [cs, ss]
-            // Unitary Bruker MC2 = 5 / fid.rs::recombine_quad_pair with -i rotation
-            q = [
-                inv_sqrt2 * -(q[2] + q[3]),
-                inv_sqrt2 * (q[1] - q[0]),
-                inv_sqrt2 * (q[0] + q[1]),
-                inv_sqrt2 * (q[3] - q[2]),
-            ];
-        }
-        QuadMode::Qf | QuadMode::Dqd => {}
+    if matches!(quad_modes[1], QuadMode::StatesTppi) && k1 % 2 == 1 {
+        q = [-q[0], -q[1], -q[2], -q[3]];
     }
     q
 }
 
 /// Exact orthogonal inverse (`M^T = M^{-1}`) of [`quad_to_states`]: converts canonical `States`
-/// `[cc, cs, sc, ss]` back to `quad_modes = [mode2, mode1]`.
+/// `[cc, cs, sc, ss]` back to `quad_modes = [mode2, mode1]` (`States` or `StatesTppi`).
 #[inline]
 fn states_to_quad(mut q: [f64; 4], k2: usize, k1: usize, quad_modes: [QuadMode; 2]) -> [f64; 4] {
-    let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
     // Invert Axis 1 first (reverse order of forward transform)
-    match quad_modes[1] {
-        QuadMode::States => {}
-        QuadMode::StatesTppi => {
-            if k1 % 2 == 1 {
-                q = [-q[0], -q[1], -q[2], -q[3]];
-            }
-        }
-        QuadMode::EchoAntiecho => {
-            let [cc, cs, sc, ss] = q;
-            q = [
-                inv_sqrt2 * (sc - cs),
-                inv_sqrt2 * (sc + cs),
-                inv_sqrt2 * (-cc - ss),
-                inv_sqrt2 * (-cc + ss),
-            ];
-        }
-        QuadMode::Qf | QuadMode::Dqd => {}
+    if matches!(quad_modes[1], QuadMode::StatesTppi) && k1 % 2 == 1 {
+        q = [-q[0], -q[1], -q[2], -q[3]];
     }
     // Invert Axis 2
-    match quad_modes[0] {
-        QuadMode::States => {}
-        QuadMode::StatesTppi => {
-            if k2 % 2 == 1 {
-                q = [-q[0], -q[1], -q[2], -q[3]];
-            }
-        }
-        QuadMode::EchoAntiecho => {
-            let [cc, cs, sc, ss] = q;
-            q = [
-                inv_sqrt2 * (cs - sc),
-                inv_sqrt2 * (-cc - ss),
-                inv_sqrt2 * (cs + sc),
-                inv_sqrt2 * (-cc + ss),
-            ];
-        }
-        QuadMode::Qf | QuadMode::Dqd => {}
+    if matches!(quad_modes[0], QuadMode::StatesTppi) && k2 % 2 == 1 {
+        q = [-q[0], -q[1], -q[2], -q[3]];
     }
     q
 }
@@ -1628,7 +1560,7 @@ pub fn kkt_residual_inf_1d(
 }
 
 // ============================================================================
-// 2D Hypercomplex MaxEnt Solver (States / States-TPPI / Echo-Antiecho)
+// 2D Hypercomplex MaxEnt Solver (States / States-TPPI)
 // ============================================================================
 
 struct Solve2DWorkspace {
@@ -2439,14 +2371,16 @@ impl Solve2DWorkspace {
 
 /// Reconstruct a 2D hypercomplex NUS indirect plane `obs_quad[k2 * n1 + k1] = [q00, q01, q10, q11]`
 /// sampled on `mask[k2 * n1 + k1]` with quadrature modes `quad_modes = [axis2_mode, axis1_mode]`
-/// (`States`, `StatesTppi`, or `EchoAntiecho`) using clean-room Convex Accelerated MaxEnt.
+/// (`States` or `StatesTppi`) using clean-room Convex Accelerated MaxEnt.
 ///
-/// The solver converts `obs_quad` isometrically to canonical `States` `(cc, cs, sc, ss)` (for
-/// `EchoAntiecho`, using the unitary Bruker `MC2 = 5` / `fid.rs::recombine_quad_pair` convention
-/// including its `-i` sensitivity-enhancement rotation), solves the exact quaternion/bicomplex
-/// Hoch–Hore entropy convex program, returns the pure-absorption canonical 2D hypercomplex
-/// spectrum `[RR, RI, IR, II]` in `result.spectrum`, and returns the reconstructed time-domain
-/// mock FID in the caller's input `quad_modes` encoding in `result.fid`.
+/// `EchoAntiecho` data must be recombined to `States`/`StatesTppi` along the directly detected
+/// dimension via `nmr_core::fid` before calling MaxEnt; passing `QuadMode::EchoAntiecho` returns
+/// `Err(...)` fail-closed.
+///
+/// The solver converts `obs_quad` isometrically to canonical `States` `(cc, cs, sc, ss)`, solves
+/// the exact quaternion/bicomplex Hoch–Hore entropy convex program, returns the pure-absorption
+/// canonical 2D hypercomplex spectrum `[RR, RI, IR, II]` in `result.spectrum`, and returns the
+/// reconstructed time-domain mock FID in the caller's input `quad_modes` encoding in `result.fid`.
 pub fn reconstruct_maxent_2d(
     obs_quad: &[[f64; 4]],
     n2: usize,
@@ -2639,6 +2573,9 @@ pub fn kkt_residual_inf_2d(
 /// Reconstruct a 3D NMR volume of `nx` direct-dimension frequency slices, where each slice
 /// `ix in 0..nx` is a 2D hypercomplex indirect plane `(n2, n1)` of `[q00, q01, q10, q11]`
 /// sampled on the shared 2D NUS mask `mask_2d[k2 * n1 + k1]`.
+///
+/// `quad_modes` accepts `States` or `StatesTppi`; `EchoAntiecho` is rejected fail-closed
+/// (recombine Echo-AntiEcho data to `States`/`StatesTppi` via `nmr_core::fid` first).
 ///
 /// Layout of `obs_planes`: row-major `(ix, k2, k1)` with `obs_planes.len() == nx * n2 * n1`.
 /// Runs slices in parallel via `std::thread::scope` on native targets and sequentially on `wasm32`.

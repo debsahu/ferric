@@ -60,55 +60,23 @@ fn synth_fid_2d_states(n2: usize, n1: usize, peaks: &[(f64, f64, f64, f64, f64)]
     fid
 }
 
-/// Apply `StatesTppi` or Bruker `fid.rs:1589` `EchoAntiecho` encoding (including the `-i`
-/// sensitivity-enhancement rotation) onto a canonical `States` 2D FID.
+/// Apply `States` or `StatesTppi` encoding onto a canonical `States` 2D FID.
 fn encode_2d_quad(
     states_fid: &[[f64; 4]],
     n2: usize,
     n1: usize,
     quad_modes: [QuadMode; 2],
 ) -> Vec<[f64; 4]> {
-    let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
     let mut out = vec![[0.0; 4]; n2 * n1];
     for k2 in 0..n2 {
         for k1 in 0..n1 {
             let mut q = states_fid[k2 * n1 + k1];
             // Encode axis 1 first, then axis 2 (exact orthogonal inverse of quad_to_states)
-            match quad_modes[1] {
-                QuadMode::States => {}
-                QuadMode::StatesTppi => {
-                    if k1 % 2 == 1 {
-                        q = [-q[0], -q[1], -q[2], -q[3]];
-                    }
-                }
-                QuadMode::EchoAntiecho => {
-                    let [cc, cs, sc, ss] = q;
-                    q = [
-                        inv_sqrt2 * (sc - cs),
-                        inv_sqrt2 * (sc + cs),
-                        inv_sqrt2 * (-cc - ss),
-                        inv_sqrt2 * (-cc + ss),
-                    ];
-                }
-                _ => {}
+            if matches!(quad_modes[1], QuadMode::StatesTppi) && k1 % 2 == 1 {
+                q = [-q[0], -q[1], -q[2], -q[3]];
             }
-            match quad_modes[0] {
-                QuadMode::States => {}
-                QuadMode::StatesTppi => {
-                    if k2 % 2 == 1 {
-                        q = [-q[0], -q[1], -q[2], -q[3]];
-                    }
-                }
-                QuadMode::EchoAntiecho => {
-                    let [cc, cs, sc, ss] = q;
-                    q = [
-                        inv_sqrt2 * (cs - sc),
-                        inv_sqrt2 * (-cc - ss),
-                        inv_sqrt2 * (cs + sc),
-                        inv_sqrt2 * (-cc + ss),
-                    ];
-                }
-                _ => {}
+            if matches!(quad_modes[0], QuadMode::StatesTppi) && k2 % 2 == 1 {
+                q = [-q[0], -q[1], -q[2], -q[3]];
             }
             out[k2 * n1 + k1] = q;
         }
@@ -354,9 +322,6 @@ fn synthetic_self_consistency_kkt_stationarity_2d_all_quad_modes() {
         [QuadMode::StatesTppi, QuadMode::States],
         [QuadMode::States, QuadMode::StatesTppi],
         [QuadMode::StatesTppi, QuadMode::StatesTppi],
-        [QuadMode::EchoAntiecho, QuadMode::States],
-        [QuadMode::States, QuadMode::EchoAntiecho],
-        [QuadMode::EchoAntiecho, QuadMode::EchoAntiecho],
     ];
 
     let mut ref_spectrum: Option<Vec<[f64; 4]>> = None;
@@ -401,7 +366,7 @@ fn synthetic_self_consistency_kkt_stationarity_2d_all_quad_modes() {
         let ent = hoch_hore_entropy_2d_hypercomplex(&res.spectrum, def).expect("2D entropy");
         assert!((ent - res.entropy).abs() < 1e-9);
 
-        // Canonical hypercomplex spectra across States / States-TPPI / Echo-Antiecho must match!
+        // Canonical hypercomplex spectra across States / States-TPPI must match!
         if let Some(ref base) = ref_spectrum {
             let max_diff = base
                 .iter()
@@ -419,115 +384,65 @@ fn synthetic_self_consistency_kkt_stationarity_2d_all_quad_modes() {
 }
 
 #[test]
-fn synthetic_self_consistency_echo_antiecho_matches_fid_rs_phase_convention() {
-    // Independent physical verification of Bruker MC2 = 5 / fid.rs:1589 Echo-Antiecho recombination
-    // (including the -i sensitivity-enhancement rotation so real Bruker data has zero 90-deg error).
-    // Synthesize physical P-type (z0) and N-type (z1) Rance-Kay traces directly without encode_2d_quad:
-    //   z0(k2, k1) = (-i / sqrt(2)) * exp((-1/d2 - i*2pi*f2)*k2) * exp((-1/d1 + i*2pi*f1)*k1)
-    //   z1(k2, k1) = (-i / sqrt(2)) * exp((-1/d2 + i*2pi*f2)*k2) * exp((-1/d1 + i*2pi*f1)*k1)
-    // Under fid.rs:1593-1594 scaled by 1/sqrt(2):
-    //   out_cos = (1/sqrt(2)) * [-(im0 + im1), re0 + re1] = cos(w2*k2) * exp(+i*w1*k1) * env
-    //   out_sin = (1/sqrt(2)) * [re1 - re0, im1 - im0]    = sin(w2*k2) * exp(+i*w1*k1) * env
-    let (n2, n1) = (16usize, 16usize);
-    let (f2_peak, f1_peak) = (0.25_f64, 0.3125_f64);
-    let (d2, d1, amp) = (16.0_f64, 16.0_f64, 8.0_f64);
-    let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
+fn synthetic_self_consistency_echo_antiecho_rejected_fail_closed() {
+    // Regression test for 22.13:P2-2: Echo-AntiEcho recombination acts along the directly
+    // detected dimension (in `nmr_core::fid`), not an indirect hypercomplex partner axis.
+    // MaxEnt must fail closed on `QuadMode::EchoAntiecho` across all 2D/3D entry points
+    // and instruct callers to recombine to States/States-TPPI via `nmr_core::fid` first.
+    let (n2, n1) = (8usize, 8usize);
+    let obs_2d = vec![[1.0, 0.0, 0.0, 0.0]; n2 * n1];
+    let obs_3d = vec![[1.0, 0.0, 0.0, 0.0]; 2 * n2 * n1];
+    let spec_2d = vec![[0.0; 4]; (2 * n2) * (2 * n1)];
+    let mask = vec![true; n2 * n1];
+    let cfg = MaxEntConfig::fixed(0.1, 1.0);
 
-    let mut ea_fid = vec![[0.0; 4]; n2 * n1];
-    let mut recombined_fid_rs = vec![[0.0; 4]; n2 * n1];
-    for k2 in 0..n2 {
-        let e2 = (-(k2 as f64) / d2).exp();
-        let w2 = 2.0 * PI * f2_peak * (k2 as f64);
-        for k1 in 0..n1 {
-            let e1 = amp * (-(k1 as f64) / d1).exp();
-            let w1 = 2.0 * PI * f1_peak * (k1 as f64);
-            let env = inv_sqrt2 * e2 * e1;
-            // -i = exp(-i*pi/2)
-            let phi0 = w1 - w2 - 0.5 * PI;
-            let phi1 = w1 + w2 - 0.5 * PI;
-            let (re0, im0) = (env * phi0.cos(), env * phi0.sin());
-            let (re1, im1) = (env * phi1.cos(), env * phi1.sin());
-            let idx = k2 * n1 + k1;
-            ea_fid[idx] = [re0, im0, re1, im1];
-            // Exact fid.rs:1593-1594 formula (unitary 1/sqrt(2)-scaled):
-            recombined_fid_rs[idx] = [
-                inv_sqrt2 * -(im0 + im1),
-                inv_sqrt2 * (re0 + re1),
-                inv_sqrt2 * (re1 - re0),
-                inv_sqrt2 * (im1 - im0),
-            ];
-        }
-    }
-
-    // Recombined Bruker pair must equal canonical States FID to machine precision
-    let ref_states = synth_fid_2d_states(n2, n1, &[(f2_peak, f1_peak, d2, d1, amp)]);
-    let recomb_err = recombined_fid_rs
-        .iter()
-        .zip(ref_states.iter())
-        .flat_map(|(a, b)| (0..4).map(move |c| (a[c] - b[c]).abs()))
-        .fold(0.0_f64, f64::max);
-    assert!(
-        recomb_err < 1e-13,
-        "Bruker fid.rs:1589 recombination must match canonical States: max_err={recomb_err:.3e}"
-    );
-
-    let mask = poisson_gap_mask_2d(n2, n1, 96, 2.0, 4242).expect("EA mask");
-    let mut obs_ea = vec![[0.0; 4]; n2 * n1];
-    let mut obs_st = vec![[0.0; 4]; n2 * n1];
-    for idx in 0..(n2 * n1) {
-        if mask[idx] {
-            obs_ea[idx] = ea_fid[idx];
-            obs_st[idx] = ref_states[idx];
-        }
-    }
-
-    let mut cfg = MaxEntConfig::fixed(0.1, 10.0);
-    cfg.kkt_tol = 1e-6;
-    cfg.max_iterations = 2000;
-
-    let res_ea = reconstruct_maxent_2d(
-        &obs_ea,
-        n2,
-        n1,
-        &mask,
+    let rejected_cases = [
         [QuadMode::EchoAntiecho, QuadMode::States],
-        &cfg,
-    )
-    .expect("EchoAntiecho MaxEnt solve");
-    let res_st = reconstruct_maxent_2d(
-        &obs_st,
-        n2,
-        n1,
-        &mask,
-        [QuadMode::States, QuadMode::States],
-        &cfg,
-    )
-    .expect("States MaxEnt solve");
+        [QuadMode::States, QuadMode::EchoAntiecho],
+        [QuadMode::EchoAntiecho, QuadMode::StatesTppi],
+        [QuadMode::StatesTppi, QuadMode::EchoAntiecho],
+        [QuadMode::EchoAntiecho, QuadMode::EchoAntiecho],
+    ];
 
-    assert!(res_ea.converged && res_st.converged);
-    let max_spec_diff = res_ea
-        .spectrum
-        .iter()
-        .zip(res_st.spectrum.iter())
-        .flat_map(|(a, b)| (0..4).map(move |c| (a[c] - b[c]).abs()))
-        .fold(0.0_f64, f64::max);
-    assert!(
-        max_spec_diff < 1e-4,
-        "EchoAntiecho spectrum must match States with zero 90-deg phase error: max_diff={max_spec_diff:.3e}"
-    );
+    for modes in rejected_cases {
+        let err_2d = reconstruct_maxent_2d(&obs_2d, n2, n1, &mask, modes, &cfg)
+            .expect_err("reconstruct_maxent_2d must reject EchoAntiecho fail-closed");
+        assert!(
+            err_2d.contains("EchoAntiecho")
+                && err_2d.contains("States")
+                && err_2d.contains("nmr_core::fid"),
+            "2D EchoAntiecho error for {modes:?} must direct callers to nmr_core::fid States recombination, got: {err_2d}"
+        );
 
-    // Peak at exact (+f2_peak, +f1_peak) bin must be pure positive absorption (RR >> |RI|, |IR|, |II|)
-    let (f2, f1) = (res_ea.spectrum_shape[0], res_ea.spectrum_shape[1]);
-    let exp_m2 = (f2_peak * f2 as f64).round() as usize % f2;
-    let exp_m1 = (f1_peak * f1 as f64).round() as usize % f1;
-    let peak_q = res_ea.spectrum[exp_m2 * f1 + exp_m1];
-    assert!(
-        peak_q[0] > 5.0
-            && peak_q[0] > 10.0 * peak_q[1].abs()
-            && peak_q[0] > 10.0 * peak_q[2].abs()
-            && peak_q[0] > 10.0 * peak_q[3].abs(),
-        "EchoAntiecho peak at ({exp_m2}, {exp_m1}) must be pure positive absorption (zero 90-deg error), got {peak_q:?}"
-    );
+        let err_kkt = kkt_residual_inf_2d(
+            &spec_2d,
+            2 * n2,
+            2 * n1,
+            &obs_2d,
+            n2,
+            n1,
+            &mask,
+            modes,
+            0.1,
+            1.0,
+        )
+        .expect_err("kkt_residual_inf_2d must reject EchoAntiecho fail-closed");
+        assert!(
+            err_kkt.contains("EchoAntiecho")
+                && err_kkt.contains("States")
+                && err_kkt.contains("nmr_core::fid"),
+            "2D KKT EchoAntiecho error for {modes:?} must direct callers to nmr_core::fid States recombination, got: {err_kkt}"
+        );
+
+        let err_3d = reconstruct_maxent_3d(&obs_3d, 2, n2, n1, &mask, modes, &cfg)
+            .expect_err("reconstruct_maxent_3d must reject EchoAntiecho fail-closed");
+        assert!(
+            err_3d.contains("EchoAntiecho")
+                && err_3d.contains("States")
+                && err_3d.contains("nmr_core::fid"),
+            "3D EchoAntiecho error for {modes:?} must direct callers to nmr_core::fid States recombination, got: {err_3d}"
+        );
+    }
 }
 
 // ============================================================================
