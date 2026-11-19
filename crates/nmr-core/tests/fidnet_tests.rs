@@ -22,7 +22,7 @@ use nmr_core::fidnet::{
     FidNetBundleMetadata, FidNetConfig, FidNetError, FidNetInferenceConfig, FidNetModel,
     FidNetTask, FidNetTrainExample, FidNetWeightBundle, FidNetWeights, SyntheticFidSpec,
     SyntheticSpin, FIDNET_BUNDLE_FORMAT_VERSION, FIDNET_WEIGHTS_STATUS, MAX_FIDNET_CHANNELS,
-    MAX_FIDNET_INFERENCE_ACTIVATION_BYTES, MAX_FIDNET_LENGTH,
+    MAX_FIDNET_INFERENCE_ACTIVATION_BYTES, MAX_FIDNET_LENGTH, MIN_FIDNET_OBSERVED_POINTS,
 };
 use nmr_core::process::{reconstruct_nus_1d_ist, NusIstConfig};
 use nmr_core::rng::Rng;
@@ -655,11 +655,15 @@ fn test_fidnet_bundle_integrity_hostile_inputs_and_abstention() {
         Err(FidNetError::InvalidConfig(_))
     ));
 
-    // 8. NaN & oversized FID rejection (hard error on forward_fid + abstention on infer_fid_with_diagnostics)
+    // 8. NaN & oversized FID rejection (hard error on forward_fid_with_options + abstention on infer_fid_with_diagnostics)
     let mut nan_fid: Vec<Complex64> = vec![[1.0, 0.0]; 16];
     nan_fid[5][1] = f64::NAN;
     assert!(matches!(
         model.forward_fid(&nan_fid, None, None),
+        Err(FidNetError::UntrainedWeights(_))
+    ));
+    assert!(matches!(
+        model.forward_fid_with_options(&nan_fid, None, None, true),
         Err(FidNetError::NonFiniteInput(_))
     ));
     let nan_out =
@@ -672,7 +676,7 @@ fn test_fidnet_bundle_integrity_hostile_inputs_and_abstention() {
 
     let huge_fid = vec![[0.0, 0.0]; MAX_FIDNET_LENGTH + 1];
     assert!(matches!(
-        model.forward_fid(&huge_fid, None, None),
+        model.forward_fid_with_options(&huge_fid, None, None, true),
         Err(FidNetError::OversizedFid { .. })
     ));
     let huge_out =
@@ -709,6 +713,7 @@ fn test_fidnet_bundle_integrity_hostile_inputs_and_abstention() {
         None,
         &FidNetInferenceConfig {
             max_data_inconsistency_rel: 0.25,
+            allow_untrained_for_testing: true,
             ..FidNetInferenceConfig::default()
         },
     );
@@ -740,6 +745,7 @@ fn test_fidnet_bundle_integrity_hostile_inputs_and_abstention() {
         None,
         &FidNetInferenceConfig {
             min_input_snr: 1.5,
+            allow_untrained_for_testing: true,
             ..FidNetInferenceConfig::default()
         },
     );
@@ -753,7 +759,7 @@ fn test_fidnet_bundle_integrity_hostile_inputs_and_abstention() {
         ood_out.diagnostic
     );
 
-    // 11. Honest untrained-architecture disclosure in default bundle metadata (22.2:P1-1)
+    // 11. Honest untrained-architecture disclosure & verified Sci. Adv. citation (Shukla et al.)
     let default_meta = FidNetBundleMetadata::default();
     assert!(
         default_meta.description.contains(FIDNET_WEIGHTS_STATUS),
@@ -763,6 +769,16 @@ fn test_fidnet_bundle_integrity_hostile_inputs_and_abstention() {
         !default_meta.provenance.contains("Reinstein")
             && !default_meta.provenance.contains("Phys. Chem. Lett."),
         "metadata must not contain fabricated JPCL 2023 citation"
+    );
+    assert!(
+        default_meta
+            .provenance
+            .contains("Shukla et al., Sci. Adv. 2024")
+            && !default_meta
+                .provenance
+                .contains("Karunanithy et al., Sci. Adv. 2024"),
+        "Sci. Adv. 2024 first author must be Shukla et al., got: {}",
+        default_meta.provenance
     );
 
     // 12. Truncated binary bundle claiming large param count fails cleanly without pre-allocating (22.2:P2-1)
@@ -939,6 +955,7 @@ fn test_fidnet_states_2d_and_3d_signed_frequency_preservation() {
     let id_model = FidNetModel::new(id_cfg, id_weights).expect("id model");
     let inf_cfg = FidNetInferenceConfig {
         uncertainty_passes: 2,
+        allow_untrained_for_testing: true,
         ..FidNetInferenceConfig::default()
     };
 
@@ -1143,10 +1160,11 @@ fn test_fidnet_cache_free_inference_parity_and_memory_budget() {
             .forward_features_with_cache(&x_in, spec.len)
             .expect("cached forward");
         let cache_free = model
-            .forward_fid_inference(
+            .forward_fid_inference_with_options(
                 &s.observed,
                 s.nus_mask.as_deref(),
                 s.coupling_channel.as_deref(),
+                true,
             )
             .expect("cache-free inference");
         assert_eq!(cached.output.len(), cache_free.len());
@@ -1226,6 +1244,10 @@ fn test_fidnet_abstention_uncertainty_truncated_fid_and_denoising_gate() {
         FidNetWeights::zeros(&id_cfg).expect("zeros"),
     )
     .expect("id model");
+    let test_inf_cfg = FidNetInferenceConfig {
+        allow_untrained_for_testing: true,
+        ..FidNetInferenceConfig::default()
+    };
 
     for &noise_sigma in &[0.0_f64, 0.01_f64] {
         let trunc_spec = SyntheticFidSpec {
@@ -1244,12 +1266,7 @@ fn test_fidnet_abstention_uncertainty_truncated_fid_and_denoising_gate() {
             seed: 31415,
         };
         let trunc = generate_synthetic_fid(&trunc_spec).expect("gen truncated fid");
-        let out = id_model.infer_fid_with_diagnostics(
-            &trunc.observed,
-            None,
-            None,
-            &FidNetInferenceConfig::default(),
-        );
+        let out = id_model.infer_fid_with_diagnostics(&trunc.observed, None, None, &test_inf_cfg);
         assert!(
             !out.diagnostic
                 .abstain_reasons
@@ -1283,12 +1300,8 @@ fn test_fidnet_abstention_uncertainty_truncated_fid_and_denoising_gate() {
             seed,
         };
         let pure_noise = generate_synthetic_fid(&noise_spec).expect("pure noise");
-        let out = id_model.infer_fid_with_diagnostics(
-            &pure_noise.observed,
-            None,
-            None,
-            &FidNetInferenceConfig::default(),
-        );
+        let out =
+            id_model.infer_fid_with_diagnostics(&pure_noise.observed, None, None, &test_inf_cfg);
         if out
             .diagnostic
             .abstain_reasons
@@ -1345,6 +1358,7 @@ fn test_fidnet_abstention_uncertainty_truncated_fid_and_denoising_gate() {
             uncertainty_passes: 4,
             uncertainty_jitter_rel: 0.02,
             max_uncertainty_rel: 0.20,
+            allow_untrained_for_testing: true,
             ..FidNetInferenceConfig::default()
         },
     );
@@ -1449,6 +1463,7 @@ fn test_fidnet_2d_and_3d_indirect_column_application() {
     let model = FidNetModel::init_random(cfg, 999).expect("init model");
     let inf_cfg = FidNetInferenceConfig {
         uncertainty_passes: 2,
+        allow_untrained_for_testing: true,
         ..FidNetInferenceConfig::default()
     };
 
@@ -1541,4 +1556,332 @@ fn test_fidnet_2d_and_3d_indirect_column_application() {
     let cc = build_coupling_channel(16, 35.0, 1000.0).expect("coupling channel");
     assert_eq!(cc.len(), 16);
     assert!((cc[0] - 1.0).abs() < 1e-12);
+}
+
+/// `[synthetic self-consistency]` Regression test for Round-2 P2 `weights_trained` fail-closed gate:
+/// 1. Untrained `init_random` and `new` models carry `weights_trained == false` and fail closed on
+///    default `forward_fid`, `forward_fid_inference`, `forward_features_inference`,
+///    `infer_fid_with_diagnostics`, and 2D/3D batch helpers unless `allow_untrained_for_testing` is
+///    explicitly enabled.
+/// 2. `FIDNET-V1` JSON and binary bundles preserve `weights_trained` under SHA-256 and reject
+///    forged `weights_trained: false -> true` edits with `ChecksumMismatch`.
+/// 3. Training via `train_fidnet_step` marks `weights_trained = true`, unlocking default inference
+///    and preserving `weights_trained == true` across JSON/binary bundle round-trips.
+#[test]
+fn test_fidnet_weights_trained_fail_closed_gate() {
+    let cfg = FidNetConfig::nus_default(4, 4);
+    let untrained_rand = FidNetModel::init_random(cfg.clone(), 12345).expect("init_random");
+    let untrained_zero =
+        FidNetModel::new(cfg.clone(), FidNetWeights::zeros(&cfg).expect("zeros")).expect("new");
+    assert!(!untrained_rand.weights_trained && !untrained_rand.is_trained());
+    assert!(!untrained_zero.weights_trained && !untrained_zero.is_trained());
+
+    let spec = SyntheticFidSpec {
+        len: 32,
+        sw_hz: 1000.0,
+        spins: vec![SyntheticSpin {
+            freq_hz: 110.0,
+            r2_hz: 12.0,
+            amplitude: 1.0,
+            phase_rad: 0.0,
+            j_coupling_hz: 0.0,
+        }],
+        noise_sigma: 0.01,
+        nus_fraction: Some(0.5),
+        conditioning_j_hz: None,
+        seed: 2222,
+    };
+    let sample = generate_synthetic_fid(&spec).expect("gen sample");
+    let mask = sample.nus_mask.as_deref();
+    let x_in = untrained_rand
+        .build_input_features(&sample.observed, mask, None)
+        .expect("build features");
+
+    // 1. Default low-level inference paths MUST fail closed on untrained models.
+    assert!(matches!(
+        untrained_rand.forward_fid(&sample.observed, mask, None),
+        Err(FidNetError::UntrainedWeights(_))
+    ));
+    assert!(matches!(
+        untrained_rand.forward_fid_inference(&sample.observed, mask, None),
+        Err(FidNetError::UntrainedWeights(_))
+    ));
+    assert!(matches!(
+        untrained_rand.forward_features_inference(&x_in, spec.len),
+        Err(FidNetError::UntrainedWeights(_))
+    ));
+    assert!(matches!(
+        untrained_zero.forward_fid(&sample.observed, mask, None),
+        Err(FidNetError::UntrainedWeights(_))
+    ));
+
+    // 2. Default certified diagnostic inference MUST abstain fail-closed with UntrainedWeights.
+    let default_cfg = FidNetInferenceConfig::default();
+    assert!(!default_cfg.allow_untrained_for_testing);
+    let diag_out =
+        untrained_rand.infer_fid_with_diagnostics(&sample.observed, mask, None, &default_cfg);
+    assert!(diag_out.diagnostic.abstained);
+    assert_eq!(
+        diag_out.diagnostic.abstain_reasons,
+        vec![AbstainReason::UntrainedWeights]
+    );
+    assert!(diag_out.diagnostic.estimated_input_snr.is_finite());
+    assert!(diag_out
+        .reconstructed
+        .iter()
+        .all(|&[r, i]| r == 0.0 && i == 0.0));
+
+    // 3. Default 2D/3D batch helpers MUST fail closed with UntrainedWeights.
+    let cols_2d = vec![sample.observed.clone()];
+    assert!(matches!(
+        apply_fidnet_2d_columns(&untrained_rand, &cols_2d, mask, None, &default_cfg),
+        Err(FidNetError::UntrainedWeights(_))
+    ));
+    let fid2d = encode_physical_states_fid2d(2, 4000.0, 200.0, 10.0, 16, 1000.0, 150.0, 8.0, None);
+    assert!(matches!(
+        apply_fidnet_fid2d_indirect(&untrained_rand, &fid2d, None, &default_cfg),
+        Err(FidNetError::UntrainedWeights(_))
+    ));
+    let planes_3d = vec![cols_2d.clone()];
+    assert!(matches!(
+        apply_fidnet_3d_columns(&untrained_rand, &planes_3d, mask, None, &default_cfg),
+        Err(FidNetError::UntrainedWeights(_))
+    ));
+    let fid3d =
+        encode_physical_states_fid3d(2, 4000.0, 200.0, 16, 1000.0, 150.0, 16, 1000.0, -200.0);
+    assert!(matches!(
+        apply_fidnet_fid3d_indirect(
+            &untrained_rand,
+            &fid3d,
+            Fid3DIndirectAxis::AxisY,
+            None,
+            &default_cfg,
+        ),
+        Err(FidNetError::UntrainedWeights(_))
+    ));
+
+    // 4. Explicit opt-in allow_untrained_for_testing=true unlocks architecture/parity testing.
+    let opt_in_out = untrained_rand
+        .forward_fid_with_options(&sample.observed, mask, None, true)
+        .expect("opt-in forward_fid_with_options");
+    assert_eq!(opt_in_out.len(), spec.len);
+    let opt_in_cfg = FidNetInferenceConfig {
+        allow_untrained_for_testing: true,
+        ..default_cfg
+    };
+    let opt_in_diag =
+        untrained_rand.infer_fid_with_diagnostics(&sample.observed, mask, None, &opt_in_cfg);
+    assert!(!opt_in_diag
+        .diagnostic
+        .abstain_reasons
+        .contains(&AbstainReason::UntrainedWeights));
+
+    // 5. Bundle integrity: untrained bundle carries weights_trained=false; forging true fails SHA-256.
+    let untrained_bundle = untrained_rand
+        .to_bundle(FidNetBundleMetadata::default())
+        .expect("to_bundle");
+    assert!(!untrained_bundle.weights_trained);
+    let json = untrained_bundle.to_json().expect("to_json");
+    assert!(json.contains("\"weights_trained\": false"));
+    let forged_json = json.replacen("\"weights_trained\": false", "\"weights_trained\": true", 1);
+    assert!(matches!(
+        FidNetWeightBundle::from_json(&forged_json),
+        Err(FidNetError::ChecksumMismatch { .. })
+    ));
+    let mut forged_bytes = untrained_bundle.to_bytes().expect("to_bytes");
+    // Byte 12 is the 5th flag byte (weights_trained) right after 8-byte magic + 4 config flags.
+    assert_eq!(forged_bytes[12], 0);
+    forged_bytes[12] = 1;
+    assert!(matches!(
+        FidNetWeightBundle::from_bytes(&forged_bytes),
+        Err(FidNetError::ChecksumMismatch { .. })
+    ));
+
+    // 6. Training via train_fidnet_step transitions weights_trained to true and unlocks default inference.
+    let mut trained = untrained_rand;
+    let mut adam = FidNetAdamState::new(&cfg, FidNetAdamConfig::default()).expect("adam");
+    let train_batch = vec![FidNetTrainExample {
+        input_fid: sample.observed.clone(),
+        nus_mask: sample.nus_mask.clone(),
+        coupling_channel: None,
+        target_fid: sample.clean_singlet.clone(),
+        loss_weights: None,
+    }];
+    let _loss = train_fidnet_step(&mut trained, &mut adam, &train_batch).expect("train step");
+    assert!(trained.weights_trained && trained.is_trained());
+
+    let pred = trained
+        .forward_fid(&sample.observed, mask, None)
+        .expect("default forward_fid must succeed after training");
+    assert_eq!(pred.len(), spec.len);
+    let trained_diag =
+        trained.infer_fid_with_diagnostics(&sample.observed, mask, None, &default_cfg);
+    assert!(!trained_diag
+        .diagnostic
+        .abstain_reasons
+        .contains(&AbstainReason::UntrainedWeights));
+
+    // Trained bundle round-trips weights_trained == true across both JSON and binary formats.
+    let trained_bundle = trained
+        .to_bundle(FidNetBundleMetadata::default())
+        .expect("trained to_bundle");
+    assert!(trained_bundle.weights_trained);
+    let restored_json = FidNetModel::from_bundle(
+        &FidNetWeightBundle::from_json(&trained_bundle.to_json().expect("json"))
+            .expect("from_json"),
+    )
+    .expect("from_bundle json");
+    assert!(restored_json.weights_trained);
+    let restored_bin = FidNetModel::from_bundle(
+        &FidNetWeightBundle::from_bytes(&trained_bundle.to_bytes().expect("bytes"))
+            .expect("from_bytes"),
+    )
+    .expect("from_bundle bin");
+    assert!(restored_bin.weights_trained);
+    assert!(restored_bin
+        .forward_fid(&sample.observed, mask, None)
+        .is_ok());
+}
+
+/// `[synthetic self-consistency]` Regression test for Round-2 P2 `< 8` observed points SNR edge case:
+/// when fewer than `MIN_FIDNET_OBSERVED_POINTS` (`8`) observed points are present (whether via a
+/// short FID or a sparse/all-false NUS mask on a longer FID), `estimated_input_snr` MUST be finite
+/// (never `∞`) and `infer_fid_with_diagnostics` MUST abstain fail-closed with
+/// `AbstainReason::OutOfDistributionNoise`.
+#[test]
+fn test_fidnet_fewer_than_8_observed_points_abstains_finite_snr() {
+    assert_eq!(MIN_FIDNET_OBSERVED_POINTS, 8);
+    let id_cfg = FidNetConfig::nus_default(4, 4);
+    let id_model = FidNetModel::new(
+        id_cfg.clone(),
+        FidNetWeights::zeros(&id_cfg).expect("zeros"),
+    )
+    .expect("id model");
+    let inf_cfg = FidNetInferenceConfig {
+        allow_untrained_for_testing: true,
+        ..FidNetInferenceConfig::default()
+    };
+
+    // 1. Short uniform FIDs with len in {1, 4, 7} (< 8 observed points)
+    for len in [1usize, 4, 7] {
+        let spec = SyntheticFidSpec {
+            len,
+            sw_hz: 1000.0,
+            spins: vec![SyntheticSpin {
+                freq_hz: 120.0,
+                r2_hz: 5.0,
+                amplitude: 1.0,
+                phase_rad: 0.0,
+                j_coupling_hz: 0.0,
+            }],
+            noise_sigma: 0.0,
+            nus_fraction: None,
+            conditioning_j_hz: None,
+            seed: 7700 + len as u64,
+        };
+        let sample = generate_synthetic_fid(&spec).expect("gen short fid");
+        let out = id_model.infer_fid_with_diagnostics(&sample.observed, None, None, &inf_cfg);
+        assert!(
+            out.diagnostic.estimated_input_snr.is_finite(),
+            "len={len} (< 8 obs pts) must never report infinite/NaN SNR, got {}",
+            out.diagnostic.estimated_input_snr
+        );
+        assert!(
+            out.diagnostic.abstained,
+            "len={len} (< 8 obs pts) must abstain fail-closed: {:?}",
+            out.diagnostic
+        );
+        assert!(
+            out.diagnostic
+                .abstain_reasons
+                .contains(&AbstainReason::OutOfDistributionNoise),
+            "len={len} (< 8 obs pts) must report OutOfDistributionNoise, got {:?}",
+            out.diagnostic
+        );
+    }
+
+    // 2. Longer FIDs (len = 64) with sparse NUS masks having 0, 1, 5, or 7 observed points (< 8)
+    let long_spec = SyntheticFidSpec {
+        len: 64,
+        sw_hz: 1000.0,
+        spins: vec![SyntheticSpin {
+            freq_hz: 120.0,
+            r2_hz: 5.0,
+            amplitude: 1.0,
+            phase_rad: 0.0,
+            j_coupling_hz: 0.0,
+        }],
+        noise_sigma: 0.0,
+        nus_fraction: None,
+        conditioning_j_hz: None,
+        seed: 7800,
+    };
+    let long_sample = generate_synthetic_fid(&long_spec).expect("gen long fid");
+    for n_obs in [0usize, 1, 5, 7] {
+        let mut mask = vec![false; long_spec.len];
+        for slot in mask.iter_mut().take(n_obs) {
+            *slot = true;
+        }
+        let observed: Vec<Complex64> = long_sample
+            .clean_singlet
+            .iter()
+            .zip(mask.iter())
+            .map(|(&v, &m)| if m { v } else { [0.0, 0.0] })
+            .collect();
+        let out = id_model.infer_fid_with_diagnostics(&observed, Some(&mask), None, &inf_cfg);
+        assert!(
+            out.diagnostic.estimated_input_snr.is_finite(),
+            "n_obs={n_obs} (< 8) must never report infinite/NaN SNR, got {}",
+            out.diagnostic.estimated_input_snr
+        );
+        assert!(
+            out.diagnostic.abstained,
+            "n_obs={n_obs} (< 8) must abstain fail-closed: {:?}",
+            out.diagnostic
+        );
+        assert!(
+            out.diagnostic
+                .abstain_reasons
+                .contains(&AbstainReason::OutOfDistributionNoise),
+            "n_obs={n_obs} (< 8) must report OutOfDistributionNoise, got {:?}",
+            out.diagnostic
+        );
+    }
+
+    // 3. Exact boundary n_obs == 8 on a clean FID: finite positive SNR (not 0, not ∞) and does not
+    // falsely abstain for < 8 observed points.
+    let boundary_spec = SyntheticFidSpec {
+        len: 16,
+        sw_hz: 1000.0,
+        spins: vec![SyntheticSpin {
+            freq_hz: 125.0,
+            r2_hz: 5.0,
+            amplitude: 1.0,
+            phase_rad: 0.0,
+            j_coupling_hz: 0.0,
+        }],
+        noise_sigma: 0.0,
+        nus_fraction: None,
+        conditioning_j_hz: None,
+        seed: 7900,
+    };
+    let boundary = generate_synthetic_fid(&boundary_spec).expect("gen boundary fid");
+    let mut mask_8 = vec![false; boundary_spec.len];
+    for i in (0..boundary_spec.len).step_by(2) {
+        mask_8[i] = true;
+    }
+    assert_eq!(mask_8.iter().filter(|&&b| b).count(), 8);
+    let obs_8: Vec<Complex64> = boundary
+        .clean_singlet
+        .iter()
+        .zip(mask_8.iter())
+        .map(|(&v, &m)| if m { v } else { [0.0, 0.0] })
+        .collect();
+    let out_8 = id_model.infer_fid_with_diagnostics(&obs_8, Some(&mask_8), None, &inf_cfg);
+    assert!(
+        out_8.diagnostic.estimated_input_snr.is_finite()
+            && out_8.diagnostic.estimated_input_snr > 0.0,
+        "boundary n_obs == 8 clean FID should report finite positive SNR, got {}",
+        out_8.diagnostic.estimated_input_snr
+    );
 }

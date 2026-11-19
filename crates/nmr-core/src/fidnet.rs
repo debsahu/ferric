@@ -20,7 +20,7 @@
 //!   16935–16942 ("Virtual Homonuclear Decoupling in Direct Detection Nuclear Magnetic
 //!   Resonance Experiments Using Deep Neural Networks").
 //! - Karunanithy, G. et al. (2024), *Nat. Commun.* (upstream `FID-Net` family reference).
-//! - Karunanithy, G. et al. (2024), *Sci. Adv.* (upstream `FID-Net` family reference).
+//! - Shukla et al. (2024), *Sci. Adv.* (upstream `FID-Net` family reference).
 //! - Reference architecture repository: <https://github.com/gogulan-k/FID-Net> (MIT License).
 //! - Gated dilated convolution block inspiration: van den Oord, A. et al. (2016),
 //!   *arXiv:1609.03499* (adapted to non-causal symmetric dilated 1D convolutions in `FID-Net`).
@@ -84,6 +84,10 @@ pub const MAX_FIDNET_JSON_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum batch size for multi-column inference.
 pub const MAX_FIDNET_BATCH: usize = 65_536;
 
+/// Minimum number of observed (sampled) time-domain points required for spectral SNR estimation;
+/// inputs with fewer observed points report finite `0.0` SNR and abstain fail-closed.
+pub const MIN_FIDNET_OBSERVED_POINTS: usize = 8;
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -93,6 +97,7 @@ pub const MAX_FIDNET_BATCH: usize = 65_536;
 pub enum FidNetError {
     InvalidConfig(String),
     InvalidWeights(String),
+    UntrainedWeights(String),
     UnsupportedFormatVersion(String),
     ChecksumMismatch { expected: String, actual: String },
     SerializationError(String),
@@ -107,6 +112,10 @@ impl fmt::Display for FidNetError {
         match self {
             Self::InvalidConfig(msg) => write!(f, "invalid FID-Net config: {msg}"),
             Self::InvalidWeights(msg) => write!(f, "invalid FID-Net weights: {msg}"),
+            Self::UntrainedWeights(msg) => write!(
+                f,
+                "refusing FID-Net inference with untrained weights ({msg}); load verified trained FIDNET-V1 weights or set allow_untrained_for_testing=true for architecture/parity testing"
+            ),
             Self::UnsupportedFormatVersion(v) => {
                 write!(f, "unsupported FID-Net bundle format version: {v}")
             }
@@ -783,7 +792,7 @@ impl Default for FidNetBundleMetadata {
                 "FERRIC pure-Rust symmetric dilated-convolution FID-Net model ({FIDNET_WEIGHTS_STATUS})"
             ),
             license: "MIT".to_string(),
-            provenance: "Clean-room implementation of FID-Net symmetric dilated-convolution architecture (Karunanithy & Hansen, J. Biomol. NMR 2021; Karunanithy, Mackenzie & Hansen, JACS 2021; Karunanithy et al., Nat. Commun. 2024; Karunanithy et al., Sci. Adv. 2024; https://github.com/gogulan-k/FID-Net, MIT); untrained architecture with no bundled pretrained weights".to_string(),
+            provenance: "Clean-room implementation of FID-Net symmetric dilated-convolution architecture (Karunanithy & Hansen, J. Biomol. NMR 2021; Karunanithy, Mackenzie & Hansen, JACS 2021; Karunanithy et al., Nat. Commun. 2024; Shukla et al., Sci. Adv. 2024; https://github.com/gogulan-k/FID-Net, MIT); untrained architecture with no bundled pretrained weights".to_string(),
         }
     }
 }
@@ -1023,12 +1032,16 @@ impl FidNetWeightsF32 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FidNetWeightBundle {
     pub format_version: String,
+    /// `true` ONLY when weights were trained (via `train_fidnet_step` or external training);
+    /// `false` for untrained / randomly initialized architectures. Protected by `sha256`.
+    #[serde(default)]
+    pub weights_trained: bool,
     pub config: FidNetConfig,
     #[serde(default)]
     pub metadata: FidNetBundleMetadata,
     pub weights: FidNetWeightsF32,
     /// Lowercase 64-character hex FIPS 180-4 SHA-256 in-band integrity checksum over canonical
-    /// header + config + IEEE-754 `f32` weights.
+    /// header + `weights_trained` + config + IEEE-754 `f32` weights.
     pub sha256: String,
 }
 
@@ -1052,11 +1065,12 @@ fn task_from_tag_u8(tag: u8) -> Result<FidNetTask, FidNetError> {
 }
 
 /// Compute canonical FIPS 180-4 SHA-256 in-band integrity digest over format version,
-/// architecture config, and IEEE-754 `f32` weights.
+/// `weights_trained` flag, architecture config, and IEEE-754 `f32` weights.
 pub fn compute_fidnet_bundle_sha256(
     format_version: &str,
     config: &FidNetConfig,
     weights: &FidNetWeightsF32,
+    weights_trained: bool,
 ) -> Result<String, FidNetError> {
     weights.validate(config)?;
     let mut payload = Vec::new();
@@ -1066,6 +1080,7 @@ pub fn compute_fidnet_bundle_sha256(
     payload.push(u8::from(config.use_mask_channel));
     payload.push(u8::from(config.use_coupling_channel));
     payload.push(u8::from(config.input_residual_skip));
+    payload.push(u8::from(weights_trained));
     payload.extend_from_slice(&(config.residual_channels as u32).to_le_bytes());
     payload.extend_from_slice(&(config.skip_channels as u32).to_le_bytes());
     payload.extend_from_slice(&(config.kernel_size as u32).to_le_bytes());
@@ -1082,17 +1097,34 @@ pub fn compute_fidnet_bundle_sha256(
 }
 
 impl FidNetWeightBundle {
-    /// Construct a verified `FIDNET-V1` bundle from `config` and `f64` weights.
+    /// Construct a verified `FIDNET-V1` bundle from `config` and `f64` weights, defaulting to
+    /// `weights_trained = false` (fail-closed).
     pub fn new(
         config: FidNetConfig,
         weights: &FidNetWeights,
         metadata: FidNetBundleMetadata,
     ) -> Result<Self, FidNetError> {
+        Self::new_with_trained_flag(config, weights, metadata, false)
+    }
+
+    /// Construct a verified `FIDNET-V1` bundle with an explicit `weights_trained` status flag
+    /// covered by the SHA-256 integrity checksum.
+    pub fn new_with_trained_flag(
+        config: FidNetConfig,
+        weights: &FidNetWeights,
+        metadata: FidNetBundleMetadata,
+        weights_trained: bool,
+    ) -> Result<Self, FidNetError> {
         let weights_f32 = FidNetWeightsF32::from_f64(&config, weights)?;
-        let sha256 =
-            compute_fidnet_bundle_sha256(FIDNET_BUNDLE_FORMAT_VERSION, &config, &weights_f32)?;
+        let sha256 = compute_fidnet_bundle_sha256(
+            FIDNET_BUNDLE_FORMAT_VERSION,
+            &config,
+            &weights_f32,
+            weights_trained,
+        )?;
         Ok(Self {
             format_version: FIDNET_BUNDLE_FORMAT_VERSION.to_string(),
+            weights_trained,
             config,
             metadata,
             weights: weights_f32,
@@ -1100,15 +1132,20 @@ impl FidNetWeightBundle {
         })
     }
 
-    /// Verify version, architecture caps, weight shapes/finiteness, and in-band SHA-256 digest.
+    /// Verify version, architecture caps, weight shapes/finiteness, `weights_trained`, and
+    /// in-band SHA-256 digest.
     pub fn verify(&self) -> Result<(), FidNetError> {
         if self.format_version != FIDNET_BUNDLE_FORMAT_VERSION {
             return Err(FidNetError::UnsupportedFormatVersion(
                 self.format_version.clone(),
             ));
         }
-        let actual =
-            compute_fidnet_bundle_sha256(&self.format_version, &self.config, &self.weights)?;
+        let actual = compute_fidnet_bundle_sha256(
+            &self.format_version,
+            &self.config,
+            &self.weights,
+            self.weights_trained,
+        )?;
         if actual != self.sha256 {
             return Err(FidNetError::ChecksumMismatch {
                 expected: self.sha256.clone(),
@@ -1150,6 +1187,7 @@ impl FidNetWeightBundle {
         out.push(u8::from(self.config.use_mask_channel));
         out.push(u8::from(self.config.use_coupling_channel));
         out.push(u8::from(self.config.input_residual_skip));
+        out.push(u8::from(self.weights_trained));
         out.extend_from_slice(&(self.config.residual_channels as u32).to_le_bytes());
         out.extend_from_slice(&(self.config.skip_channels as u32).to_le_bytes());
         out.extend_from_slice(&(self.config.kernel_size as u32).to_le_bytes());
@@ -1187,7 +1225,7 @@ impl FidNetWeightBundle {
                 magic
             )));
         }
-        let flags = read_exact(&mut pos, 4)?;
+        let flags = read_exact(&mut pos, 5)?;
         let task = task_from_tag_u8(flags[0])?;
         let use_mask_channel = match flags[1] {
             0 => false,
@@ -1209,6 +1247,15 @@ impl FidNetWeightBundle {
             v => {
                 return Err(FidNetError::InvalidConfig(format!(
                     "invalid input_residual_skip flag {v}"
+                )))
+            }
+        };
+        let weights_trained = match flags[4] {
+            0 => false,
+            1 => true,
+            v => {
+                return Err(FidNetError::InvalidConfig(format!(
+                    "invalid weights_trained flag {v}"
                 )))
             }
         };
@@ -1290,6 +1337,7 @@ impl FidNetWeightBundle {
         let weights = FidNetWeightsF32::from_flat_slice(&config, &flat)?;
         let bundle = Self {
             format_version: FIDNET_BUNDLE_FORMAT_VERSION.to_string(),
+            weights_trained,
             config,
             metadata: FidNetBundleMetadata::default(),
             weights,
@@ -1385,6 +1433,11 @@ pub fn build_coupling_channel(len: usize, j_hz: f64, sw_hz: f64) -> Result<Vec<f
 pub struct FidNetModel {
     pub config: FidNetConfig,
     pub weights: FidNetWeights,
+    /// `true` ONLY when weights have been trained via `train_fidnet_step` or loaded from a
+    /// verified trained `FIDNET-V1` bundle. Untrained / randomly initialized models keep this
+    /// `false` and fail closed on default inference unless `allow_untrained_for_testing` is
+    /// explicitly enabled.
+    pub weights_trained: bool,
 }
 
 /// Intermediate activation cache for a single block (used by exact backpropagation).
@@ -1417,27 +1470,41 @@ pub type FidNetGradients = FidNetWeights;
 
 impl FidNetModel {
     /// Construct and validate a `FidNetModel` from `config` and `weights`.
+    ///
+    /// Defaults to `weights_trained = false` (fail-closed on default inference until trained via
+    /// `train_fidnet_step` or loaded from a verified trained `FIDNET-V1` bundle).
     pub fn new(config: FidNetConfig, weights: FidNetWeights) -> Result<Self, FidNetError> {
         weights.validate(&config)?;
-        Ok(Self { config, weights })
+        Ok(Self {
+            config,
+            weights,
+            weights_trained: false,
+        })
     }
 
     /// Initialize a new `FidNetModel` with deterministic random Xavier/Glorot weights.
     ///
-    /// Note: this produces an **untrained** model for training or testing; no pretrained weights
-    /// are bundled in this crate.
+    /// Note: this produces an **untrained** model (`weights_trained = false`) for training or
+    /// testing; no pretrained weights are bundled in this crate. Default inference fails closed
+    /// unless `allow_untrained_for_testing` is explicitly enabled.
     pub fn init_random(config: FidNetConfig, seed: u64) -> Result<Self, FidNetError> {
         let weights = FidNetWeights::init_xavier(&config, seed)?;
-        Ok(Self { config, weights })
+        Ok(Self {
+            config,
+            weights,
+            weights_trained: false,
+        })
     }
 
-    /// Construct a `FidNetModel` from a verified `FIDNET-V1` weight bundle.
+    /// Construct a `FidNetModel` from a verified `FIDNET-V1` weight bundle, preserving its
+    /// integrity-protected `weights_trained` status.
     pub fn from_bundle(bundle: &FidNetWeightBundle) -> Result<Self, FidNetError> {
         bundle.verify()?;
         let weights = bundle.weights.to_f64(&bundle.config)?;
         Ok(Self {
             config: bundle.config.clone(),
             weights,
+            weights_trained: bundle.weights_trained,
         })
     }
 
@@ -1446,7 +1513,28 @@ impl FidNetModel {
         &self,
         metadata: FidNetBundleMetadata,
     ) -> Result<FidNetWeightBundle, FidNetError> {
-        FidNetWeightBundle::new(self.config.clone(), &self.weights, metadata)
+        FidNetWeightBundle::new_with_trained_flag(
+            self.config.clone(),
+            &self.weights,
+            metadata,
+            self.weights_trained,
+        )
+    }
+
+    /// Returns `true` iff this model carries trained weights (rather than random/untrained init).
+    #[inline]
+    pub fn is_trained(&self) -> bool {
+        self.weights_trained
+    }
+
+    #[inline]
+    fn check_trained_gate(&self, allow_untrained_for_testing: bool) -> Result<(), FidNetError> {
+        if !self.weights_trained && !allow_untrained_for_testing {
+            return Err(FidNetError::UntrainedWeights(
+                FIDNET_WEIGHTS_STATUS.to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Assemble channel-major `[in_ch * T]` input features from a complex FID and optional
@@ -1542,14 +1630,30 @@ impl FidNetModel {
     /// Execute the exact cache-free `f64` inference forward pass on pre-packed channel-major
     /// features `[in_ch * T]`.
     ///
-    /// Uses O(1) working buffers with respect to network depth (ping-ponged residual state,
-    /// per-channel row scratch, and in-place skip accumulator) instead of retaining per-block
-    /// backpropagation caches. Enforces `MAX_FIDNET_INFERENCE_ACTIVATION_BYTES` before allocating.
+    /// **Fails closed** with `Err(FidNetError::UntrainedWeights(_))` when `!self.weights_trained`.
+    /// For architecture or numerical parity tests on randomly initialized weights, call
+    /// [`Self::forward_features_inference_with_options`] with `allow_untrained_for_testing = true`.
     pub fn forward_features_inference(
         &self,
         x_in: &[f64],
         t_len: usize,
     ) -> Result<Vec<Complex64>, FidNetError> {
+        self.forward_features_inference_with_options(x_in, t_len, false)
+    }
+
+    /// Execute the exact cache-free `f64` inference forward pass on pre-packed channel-major
+    /// features `[in_ch * T]` with an explicit test-only `allow_untrained_for_testing` opt-in.
+    ///
+    /// Uses O(1) working buffers with respect to network depth (ping-ponged residual state,
+    /// per-channel row scratch, and in-place skip accumulator) instead of retaining per-block
+    /// backpropagation caches. Enforces `MAX_FIDNET_INFERENCE_ACTIVATION_BYTES` before allocating.
+    pub fn forward_features_inference_with_options(
+        &self,
+        x_in: &[f64],
+        t_len: usize,
+        allow_untrained_for_testing: bool,
+    ) -> Result<Vec<Complex64>, FidNetError> {
+        self.check_trained_gate(allow_untrained_for_testing)?;
         self.weights.validate_shapes(&self.config)?;
         let in_ch = self.config.in_channels();
         if t_len == 0 {
@@ -1723,14 +1827,29 @@ impl FidNetModel {
 
     /// Execute the cache-free `f64` inference forward pass on a complex FID (no backprop cache
     /// allocated, no input scaling or abstention post-processing).
+    ///
+    /// **Fails closed** with `Err(FidNetError::UntrainedWeights(_))` when `!self.weights_trained`.
     pub fn forward_fid_inference(
         &self,
         fid: &[Complex64],
         nus_mask: Option<&[bool]>,
         coupling_channel: Option<&[f64]>,
     ) -> Result<Vec<Complex64>, FidNetError> {
+        self.forward_fid_inference_with_options(fid, nus_mask, coupling_channel, false)
+    }
+
+    /// Execute the cache-free `f64` inference forward pass on a complex FID with an explicit
+    /// test-only `allow_untrained_for_testing` opt-in.
+    pub fn forward_fid_inference_with_options(
+        &self,
+        fid: &[Complex64],
+        nus_mask: Option<&[bool]>,
+        coupling_channel: Option<&[f64]>,
+        allow_untrained_for_testing: bool,
+    ) -> Result<Vec<Complex64>, FidNetError> {
+        self.check_trained_gate(allow_untrained_for_testing)?;
         let x_in = self.build_input_features(fid, nus_mask, coupling_channel)?;
-        self.forward_features_inference(&x_in, fid.len())
+        self.forward_features_inference_with_options(&x_in, fid.len(), allow_untrained_for_testing)
     }
 
     /// Execute the exact `f64` forward pass on pre-packed channel-major features `[in_ch * T]`,
@@ -1944,6 +2063,8 @@ impl FidNetModel {
 
     /// Execute raw cache-free forward inference on a complex FID (alias for
     /// [`Self::forward_fid_inference`]; no backprop cache, input scaling, or abstention).
+    ///
+    /// **Fails closed** with `Err(FidNetError::UntrainedWeights(_))` when `!self.weights_trained`.
     pub fn forward_fid(
         &self,
         fid: &[Complex64],
@@ -1951,6 +2072,24 @@ impl FidNetModel {
         coupling_channel: Option<&[f64]>,
     ) -> Result<Vec<Complex64>, FidNetError> {
         self.forward_fid_inference(fid, nus_mask, coupling_channel)
+    }
+
+    /// Execute raw cache-free forward inference on a complex FID with an explicit test-only
+    /// `allow_untrained_for_testing` opt-in (alias for
+    /// [`Self::forward_fid_inference_with_options`]).
+    pub fn forward_fid_with_options(
+        &self,
+        fid: &[Complex64],
+        nus_mask: Option<&[bool]>,
+        coupling_channel: Option<&[f64]>,
+        allow_untrained_for_testing: bool,
+    ) -> Result<Vec<Complex64>, FidNetError> {
+        self.forward_fid_inference_with_options(
+            fid,
+            nus_mask,
+            coupling_channel,
+            allow_untrained_for_testing,
+        )
     }
 
     /// Exact analytical backpropagation for weighted complex MSE loss:
@@ -2319,6 +2458,7 @@ pub fn train_fidnet_step(
     }
 
     model.weights = FidNetWeights::from_flat_slice(&model.config, &params)?;
+    model.weights_trained = true;
     Ok(total_loss)
 }
 
@@ -2620,6 +2760,9 @@ pub enum AbstainReason {
     /// Multi-pass perturbation epistemic uncertainty (`uncertainty_rms / obs_rms`) exceeds
     /// `FidNetInferenceConfig::max_uncertainty_rel`.
     HighUncertainty,
+    /// Model weights are untrained (`weights_trained == false`) and `allow_untrained_for_testing`
+    /// is `false`.
+    UntrainedWeights,
 }
 
 /// Configuration for certified `FID-Net` inference with data-consistency, uncertainty, and OOD
@@ -2648,6 +2791,12 @@ pub struct FidNetInferenceConfig {
     pub max_uncertainty_rel: f64,
     /// Deterministic RNG seed for multi-pass diagnostic perturbations.
     pub uncertainty_seed: u64,
+    /// Explicit test-only opt-in to execute inference on an untrained / randomly initialized
+    /// `FID-Net` architecture (e.g. for States hypercomplex or CPU/GPU numerical parity tests).
+    ///
+    /// Defaults to `false`: standard inference fails closed whenever `!model.weights_trained`.
+    #[serde(default)]
+    pub allow_untrained_for_testing: bool,
 }
 
 impl Default for FidNetInferenceConfig {
@@ -2662,6 +2811,7 @@ impl Default for FidNetInferenceConfig {
             uncertainty_jitter_rel: 0.01,
             max_uncertainty_rel: 0.25,
             uncertainty_seed: 0xF1D4_E700_0000_0001,
+            allow_untrained_for_testing: false,
         }
     }
 }
@@ -2746,7 +2896,12 @@ fn spectral_snr_and_sigma_with_window(
             0.0
         }
     } else {
-        max_mag / expected_noise_peak
+        let ratio = max_mag / expected_noise_peak;
+        if ratio.is_finite() {
+            ratio.clamp(0.0, 1e6)
+        } else {
+            1e6
+        }
     };
     (snr, sigma_hat)
 }
@@ -2756,7 +2911,9 @@ fn spectral_snr_and_sigma_with_window(
 ///
 /// Using Hann + one-sided cosine-bell windowed spectra avoids falsely flagging clean truncated
 /// slowly-decaying FIDs (`R2 = 3 Hz`, `N = 64`) as out-of-distribution noise while reliably
-/// flagging pure white thermal noise (`SNR ~ 0.8..1.0 < 1.25`).
+/// flagging pure white thermal noise (`SNR ~ 0.8..1.0 < 1.25`). Inputs with fewer than
+/// `MIN_FIDNET_OBSERVED_POINTS` (`8`) observed points return finite `0.0` SNR (never `∞`) so
+/// inference abstains fail-closed.
 fn estimate_fid_snr_noise_and_energy(
     fid: &[Complex64],
     nus_mask: Option<&[bool]>,
@@ -2773,8 +2930,8 @@ fn estimate_fid_snr_noise_and_energy(
     if n_obs == 0 {
         return (0.0, 0.0, 0.0, 0);
     }
-    if n_obs < 8 || fid.len() < 8 {
-        return (f64::INFINITY, 0.0, obs_energy, n_obs);
+    if n_obs < MIN_FIDNET_OBSERVED_POINTS || fid.len() < MIN_FIDNET_OBSERVED_POINTS {
+        return (0.0, 0.0, obs_energy, n_obs);
     }
     if obs_energy <= 1e-30 {
         return (0.0, 0.0, 0.0, n_obs);
@@ -2849,7 +3006,22 @@ impl FidNetModel {
             };
         }
 
-        // 3. Estimate spectral SNR, thermal noise floor, and RMS normalization scale on measured points
+        // 3. Fail-closed gate for untrained weights unless explicitly opted-in for testing
+        if !self.weights_trained && !cfg.allow_untrained_for_testing {
+            return FidNetInferenceOutput {
+                reconstructed: vec![[0.0; 2]; fid.len()],
+                diagnostic: FidNetDiagnostic {
+                    measured_data_residual_rel: f64::INFINITY,
+                    estimated_input_snr: 0.0,
+                    energy_conservation_ratio: 0.0,
+                    uncertainty_rms: 0.0,
+                    abstained: true,
+                    abstain_reasons: vec![AbstainReason::UntrainedWeights],
+                },
+            };
+        }
+
+        // 4. Estimate spectral SNR, thermal noise floor, and RMS normalization scale on measured points
         let (est_snr, est_noise_sigma, obs_energy, n_obs) =
             estimate_fid_snr_noise_and_energy(fid, nus_mask);
         let obs_rms = if n_obs > 0 {
@@ -2869,7 +3041,12 @@ impl FidNetModel {
             .map(|&[re, im]| [re * inv_scale, im * inv_scale])
             .collect();
 
-        let recon_norm = match self.forward_fid_inference(&norm_fid, nus_mask, coupling_channel) {
+        let recon_norm = match self.forward_fid_inference_with_options(
+            &norm_fid,
+            nus_mask,
+            coupling_channel,
+            cfg.allow_untrained_for_testing,
+        ) {
             Ok(v) => v,
             Err(_) => {
                 return FidNetInferenceOutput {
@@ -2891,7 +3068,7 @@ impl FidNetModel {
             .map(|&[re, im]| [re * scale, im * scale])
             .collect();
 
-        // 4. Multi-pass perturbation epistemic uncertainty check (cache-free inference)
+        // 5. Multi-pass perturbation epistemic uncertainty check (cache-free inference)
         let mut uncertainty_rms = 0.0;
         if cfg.uncertainty_passes > 0 && cfg.uncertainty_jitter_rel > 0.0 && obs_rms > 1e-12 {
             let mut rng = Rng::new(cfg.uncertainty_seed);
@@ -2906,7 +3083,12 @@ impl FidNetModel {
                         sample[1] += rng.normal(0.0, cfg.uncertainty_jitter_rel);
                     }
                 }
-                if let Ok(p_out) = self.forward_fid_inference(&pert, nus_mask, coupling_channel) {
+                if let Ok(p_out) = self.forward_fid_inference_with_options(
+                    &pert,
+                    nus_mask,
+                    coupling_channel,
+                    cfg.allow_untrained_for_testing,
+                ) {
                     let mut pass_dev = 0.0;
                     for t in 0..fid.len() {
                         let dr = (p_out[t][0] - recon_norm[t][0]) * scale;
@@ -2996,7 +3178,8 @@ impl FidNetModel {
             }
             FidNetTask::VirtualDecoupling => {}
         }
-        if est_snr < cfg.min_input_snr && obs_energy > 1e-24 {
+        if n_obs < MIN_FIDNET_OBSERVED_POINTS || (est_snr < cfg.min_input_snr && obs_energy > 1e-24)
+        {
             abstain_reasons.push(AbstainReason::OutOfDistributionNoise);
         }
         if obs_energy > 1e-24
@@ -3191,6 +3374,7 @@ pub fn apply_fidnet_2d_columns(
     coupling_channel: Option<&[f64]>,
     cfg: &FidNetInferenceConfig,
 ) -> Result<Vec<FidNetInferenceOutput>, FidNetError> {
+    model.check_trained_gate(cfg.allow_untrained_for_testing)?;
     if columns.len() > MAX_FIDNET_BATCH {
         return Err(FidNetError::InvalidConfig(format!(
             "2D batch size {} exceeds MAX_FIDNET_BATCH ({MAX_FIDNET_BATCH})",
@@ -3218,6 +3402,7 @@ pub fn apply_fidnet_fid2d_indirect(
     coupling_channel: Option<&[f64]>,
     cfg: &FidNetInferenceConfig,
 ) -> Result<(Fid2D, Vec<FidNetDiagnostic>), FidNetError> {
+    model.check_trained_gate(cfg.allow_untrained_for_testing)?;
     if !fid.axis_y.states_recombined || fid.axis_y.quad_mode == QuadMode::Qf {
         return Err(FidNetError::InvalidConfig(format!(
             "apply_fidnet_fid2d_indirect requires States-recombined hypercomplex axis_y ('{}', quad_mode={:?})",
@@ -3299,6 +3484,7 @@ pub fn apply_fidnet_3d_columns(
     coupling_channel: Option<&[f64]>,
     cfg: &FidNetInferenceConfig,
 ) -> Result<Vec<Vec<FidNetInferenceOutput>>, FidNetError> {
+    model.check_trained_gate(cfg.allow_untrained_for_testing)?;
     let total_cols: usize = planes.iter().map(Vec::len).sum();
     if total_cols > MAX_FIDNET_BATCH {
         return Err(FidNetError::InvalidConfig(format!(
@@ -3327,6 +3513,7 @@ pub fn apply_fidnet_fid3d_indirect(
     coupling_channel: Option<&[f64]>,
     cfg: &FidNetInferenceConfig,
 ) -> Result<(Fid3D, Vec<FidNetDiagnostic>), FidNetError> {
+    model.check_trained_gate(cfg.allow_untrained_for_testing)?;
     let n0 = fid.axis_x.complex_points;
     let n1 = fid.axis_y.complex_points;
     let n2 = fid.axis_z.complex_points;

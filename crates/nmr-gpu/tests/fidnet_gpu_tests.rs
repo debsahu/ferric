@@ -7,7 +7,8 @@
 
 use nmr_core::fid::Complex64;
 use nmr_core::fidnet::{
-    generate_synthetic_fid, FidNetConfig, FidNetModel, FidNetTask, SyntheticFidSpec, SyntheticSpin,
+    generate_synthetic_fid, train_fidnet_step, FidNetAdamConfig, FidNetAdamState, FidNetConfig,
+    FidNetModel, FidNetTask, FidNetTrainExample, SyntheticFidSpec, SyntheticSpin,
     MAX_FIDNET_LENGTH,
 };
 use nmr_gpu::fidnet_gpu::{validate_fidnet_gpu_dispatch_limits, GpuFidNet};
@@ -69,7 +70,13 @@ fn test_fidnet_cpu_vs_webgpu_batched_parity() {
 
     for (ci, cfg) in configs.iter().enumerate() {
         let model = FidNetModel::init_random(cfg.clone(), 1234 + ci as u64).expect("init model");
-        let gpu_model = GpuFidNet::from_model(&engine, &model).expect("GpuFidNet::from_model");
+        assert!(
+            GpuFidNet::from_model(&engine, &model).is_err(),
+            "GpuFidNet::from_model must fail closed for untrained random-init weights"
+        );
+        let gpu_model = GpuFidNet::from_model_with_options(&engine, &model, true)
+            .expect("GpuFidNet::from_model_with_options");
+        assert!(!gpu_model.weights_trained());
 
         let mut fids = Vec::with_capacity(batch_size);
         let mut masks = Vec::with_capacity(batch_size);
@@ -127,10 +134,11 @@ fn test_fidnet_cpu_vs_webgpu_batched_parity() {
 
         // 1. Single-FID parity check
         let cpu_single = model
-            .forward_fid(
+            .forward_fid_with_options(
                 &fids[0],
                 mask_arg.map(|m| m[0].as_slice()),
                 cc_arg.map(|c| c[0].as_slice()),
+                true,
             )
             .expect("cpu single forward");
         let gpu_single = gpu_model
@@ -162,10 +170,11 @@ fn test_fidnet_cpu_vs_webgpu_batched_parity() {
         let mut max_batch_diff = 0.0f64;
         for bi in 0..batch_size {
             let cpu_out = model
-                .forward_fid(
+                .forward_fid_with_options(
                     &fids[bi],
                     mask_arg.map(|m| m[bi].as_slice()),
                     cc_arg.map(|c| c[bi].as_slice()),
+                    true,
                 )
                 .expect("cpu batch item forward");
             assert_eq!(cpu_out.len(), gpu_batch[bi].len());
@@ -218,8 +227,16 @@ fn test_fidnet_gpu_limits_and_hostile_input_guards() {
             return;
         }
     };
-    let model = FidNetModel::init_random(cfg, 8080).expect("init model");
-    let gpu = GpuFidNet::from_model(&engine, &model).expect("GpuFidNet::from_model");
+    let mut model = FidNetModel::init_random(cfg.clone(), 8080).expect("init model");
+    let untrained_err = GpuFidNet::from_model(&engine, &model)
+        .err()
+        .expect("GpuFidNet::from_model must reject untrained weights");
+    assert!(
+        untrained_err.to_ascii_lowercase().contains("untrained"),
+        "expected untrained error message, got: {untrained_err}"
+    );
+    let gpu = GpuFidNet::from_model_with_options(&engine, &model, true)
+        .expect("GpuFidNet::from_model_with_options");
 
     // Empty batch -> Ok(empty) without allocating 0-byte GPU buffers
     let empty_res = gpu
@@ -253,4 +270,52 @@ fn test_fidnet_gpu_limits_and_hostile_input_guards() {
     // Oversized FID -> Err
     let huge = vec![[0.0, 0.0]; MAX_FIDNET_LENGTH + 1];
     assert!(gpu.forward_fid_gpu(&engine, &huge, None, None).is_err());
+
+    // 3. After a training step, weights_trained == true unlocks default GpuFidNet::from_model
+    let spec = SyntheticFidSpec {
+        len: 32,
+        sw_hz: 1000.0,
+        spins: vec![SyntheticSpin {
+            freq_hz: 90.0,
+            r2_hz: 12.0,
+            amplitude: 1.0,
+            phase_rad: 0.0,
+            j_coupling_hz: 0.0,
+        }],
+        noise_sigma: 0.02,
+        nus_fraction: Some(0.5),
+        conditioning_j_hz: None,
+        seed: 9191,
+    };
+    let sample = generate_synthetic_fid(&spec).expect("gen sample");
+    let mut adam = FidNetAdamState::new(&cfg, FidNetAdamConfig::default()).expect("adam");
+    let batch = vec![FidNetTrainExample {
+        input_fid: sample.observed.clone(),
+        nus_mask: sample.nus_mask.clone(),
+        coupling_channel: None,
+        target_fid: sample.clean_singlet.clone(),
+        loss_weights: None,
+    }];
+    let _loss = train_fidnet_step(&mut model, &mut adam, &batch).expect("train step");
+    assert!(model.weights_trained);
+    let trained_gpu = GpuFidNet::from_model(&engine, &model)
+        .expect("default GpuFidNet::from_model must succeed after training");
+    assert!(trained_gpu.weights_trained());
+    let mask = sample.nus_mask.as_deref();
+    let cpu_out = model
+        .forward_fid(&sample.observed, mask, None)
+        .expect("cpu trained forward");
+    let gpu_out = trained_gpu
+        .forward_fid_gpu(&engine, &sample.observed, mask, None)
+        .expect("gpu trained forward");
+    let max_diff = cpu_out
+        .iter()
+        .zip(gpu_out.iter())
+        .fold(0.0_f64, |acc, (c, g)| {
+            acc.max((c[0] - g[0]).abs()).max((c[1] - g[1]).abs())
+        });
+    assert!(
+        max_diff < 1e-4,
+        "trained GPU vs CPU parity failed: max_diff={max_diff:.3e}"
+    );
 }

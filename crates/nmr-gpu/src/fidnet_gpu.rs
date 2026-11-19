@@ -14,14 +14,14 @@
 //! - Karunanithy, G., Mackenzie, H. W. & Hansen, D. F. (2021), *J. Am. Chem. Soc.* 143(41),
 //!   16935–16942.
 //! - Karunanithy, G. et al. (2024), *Nat. Commun.*
-//! - Karunanithy, G. et al. (2024), *Sci. Adv.*
+//! - Shukla et al. (2024), *Sci. Adv.*
 //! - Reference architecture repository: <https://github.com/gogulan-k/FID-Net> (MIT License).
 
 use bytemuck::{Pod, Zeroable};
 use nmr_core::fid::Complex64;
 use nmr_core::fidnet::{
-    FidNetBlockOffsets, FidNetConfig, FidNetModel, FidNetPackedWeightsF32, MAX_FIDNET_BATCH,
-    MAX_FIDNET_LENGTH,
+    FidNetBlockOffsets, FidNetConfig, FidNetModel, FidNetPackedWeightsF32, FIDNET_WEIGHTS_STATUS,
+    MAX_FIDNET_BATCH, MAX_FIDNET_LENGTH,
 };
 use wgpu::util::DeviceExt;
 
@@ -164,6 +164,7 @@ pub fn validate_fidnet_gpu_dispatch_limits(
 /// (untrained architecture; requires user-supplied or externally trained `FIDNET-V1` weights).
 pub struct GpuFidNet {
     config: FidNetConfig,
+    weights_trained: bool,
     off_stem_w: u32,
     off_stem_b: u32,
     block_offsets: Vec<FidNetBlockOffsets>,
@@ -183,7 +184,26 @@ pub struct GpuFidNet {
 
 impl GpuFidNet {
     /// Compile the `fidnet.wgsl` compute pipelines and upload validated `f32` model weights to GPU.
+    ///
+    /// **Fails closed** when `!model.weights_trained`. For architecture or CPU/GPU numerical parity
+    /// testing on randomly initialized weights, call [`Self::from_model_with_options`] with
+    /// `allow_untrained_for_testing = true`.
     pub fn from_model(engine: &GpuEngine, model: &FidNetModel) -> Result<Self, String> {
+        Self::from_model_with_options(engine, model, false)
+    }
+
+    /// Compile the `fidnet.wgsl` compute pipelines and upload validated `f32` model weights to GPU
+    /// with an explicit test-only `allow_untrained_for_testing` opt-in.
+    pub fn from_model_with_options(
+        engine: &GpuEngine,
+        model: &FidNetModel,
+        allow_untrained_for_testing: bool,
+    ) -> Result<Self, String> {
+        if !model.weights_trained && !allow_untrained_for_testing {
+            return Err(format!(
+                "refusing GPU FID-Net initialization with untrained weights ({FIDNET_WEIGHTS_STATUS}); load verified trained FIDNET-V1 weights or call GpuFidNet::from_model_with_options(..., true) for numerical parity testing"
+            ));
+        }
         let packed: FidNetPackedWeightsF32 = model
             .weights
             .pack_f32(&model.config)
@@ -295,6 +315,7 @@ impl GpuFidNet {
 
         Ok(Self {
             config: model.config.clone(),
+            weights_trained: model.weights_trained,
             off_stem_w: packed.off_stem_w,
             off_stem_b: packed.off_stem_b,
             block_offsets: packed.block_offsets,
@@ -316,6 +337,12 @@ impl GpuFidNet {
     /// Reference to the model architecture configuration uploaded to this GPU instance.
     pub fn config(&self) -> &FidNetConfig {
         &self.config
+    }
+
+    /// Returns `true` iff the uploaded model weights carried `weights_trained == true`.
+    #[inline]
+    pub fn weights_trained(&self) -> bool {
+        self.weights_trained
     }
 
     /// Execute batched `FID-Net` forward inference asynchronously on WebGPU (`wasm32`-compatible).
