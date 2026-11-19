@@ -515,7 +515,7 @@ fn independent_physical_perturbation_csp(
 }
 
 #[test]
-fn non_circular_synthetic_benchmark_and_ablations_across_1d3z_apo_and_1ubq_poses() {
+fn synthetic_self_consistency_benchmark_and_ablations_across_1d3z_apo_and_1ubq_poses() {
     // Distinct experimental structures (`A7`): solution NMR `1D3Z` Model 1 as apo receptor vs X-ray `1UBQ` poses!
     let apo_1d3z_raw = std::fs::read_to_string(ubq_1d3z_nmr_path()).expect("read 1D3Z NMR PDB");
     let apo_1d3z_text: String = match apo_1d3z_raw.find("\nENDMDL") {
@@ -668,7 +668,7 @@ fn non_circular_synthetic_benchmark_and_ablations_across_1d3z_apo_and_1ubq_poses
     // (1) `bundle_csp_only`: ZERO NOEs, ZERO PREs (realistic CSP-only screening!)
     // (2) `bundle_csp_noe`: CSPs + discrete Wuethrich NOE classes (`scoring_only: true` for SMILES ligand)
     let base_input = CofoldRestraintInput {
-        job_name: "ubq_non_circular_benchmark".to_string(),
+        job_name: "ubq_synthetic_self_consistency_benchmark".to_string(),
         entities: vec![
             CofoldEntitySpec::Polymer {
                 kind: CofoldPolymerKind::Protein,
@@ -759,7 +759,7 @@ fn non_circular_synthetic_benchmark_and_ablations_across_1d3z_apo_and_1ubq_poses
         poses.push(p);
     }
 
-    // Verify a-priori `DEFAULT_MIN_CSP_ROC_AUC` == 0.65 (non-tuned Mann-Whitney enrichment guard)
+    // Verify conventional `DEFAULT_MIN_CSP_ROC_AUC` == 0.65 (Mann-Whitney enrichment guard)
     assert!((DEFAULT_MIN_CSP_ROC_AUC - 0.65).abs() < 1e-12);
 
     let cfg_burial = PoseScoreConfig {
@@ -819,7 +819,7 @@ fn non_circular_synthetic_benchmark_and_ablations_across_1d3z_apo_and_1ubq_poses
         .expect("CSP-only funnel rho");
     assert!(
         auc_csp_only >= DEFAULT_MIN_CSP_ROC_AUC,
-        "CSP-only near-native ROC AUC ({auc_csp_only:.4}) must exceed a-priori 0.65"
+        "CSP-only near-native ROC AUC ({auc_csp_only:.4}) must exceed DEFAULT_MIN_CSP_ROC_AUC (0.65)"
     );
     assert!(
         pval_csp_only < 0.05,
@@ -876,9 +876,9 @@ fn non_circular_synthetic_benchmark_and_ablations_across_1d3z_apo_and_1ubq_poses
     assert_eq!(decoy_report.n_admissible_poses, 0);
 
     println!(
-        "[S4 non-circular ablations] 1D3Z-vs-1UBQ CA_dRMSD={ca_drmsd_apo_vs_xray:.3} A | \
+        "[S4 synthetic self-consistency ablations] 1D3Z-vs-1UBQ CA_dRMSD={ca_drmsd_apo_vs_xray:.3} A | \
          (a) rho_burial={rho_burial:.4} vs rho_forward={rho_forward:.4} | \
-         (b) CSP-only top={} auc={auc_csp_only:.4} p={pval_csp_only:.3e} funnel_rho={funnel_csp_only:.4} decoy_only_admissible={}/9 | \
+         (b) CSP-only top={} auc={auc_csp_only:.4} funnel_rho={funnel_csp_only:.4} decoy_only_admissible={}/9 | \
          (c) CSP+discrete-NOE top={} funnel_rho={funnel_csp_noe:.4} decoy_only_admissible={}/9",
         rep_csp_burial.top_pose_id.as_deref().unwrap_or("NONE"),
         decoy_csp_only_report.n_admissible_poses,
@@ -1866,5 +1866,92 @@ fn p1_10_11_p2_schema_hygiene_smiles_bonded_yaml_af3_chains_noncanonical_aa_five
     assert!(
         (ratio - (0.90 / 0.43)).abs() < 0.15,
         "1-N pyrrole (0.90) vs 2-N imidazole (0.43) ring-current ratio must be ~2.09, got {ratio:.3} ({dh_pyr:.4} vs {dh_imi:.4})"
+    );
+}
+
+#[test]
+fn test_21f_b18_pre_requires_explicit_proton_mhz_and_warns_on_14a_mtsl_drop() {
+    // Regression test for `21F:B18`:
+    // 1. `Gamma_2` PRE TSV with `# tau_c_ns:` but NO `# proton_mhz:` MUST fail closed (no silent 600 MHz default!).
+    // 2. Explicit `# proton_mhz: 800.0` succeeds and echoes `800.0 MHz` in both the restraint and bundle diagnostics.
+    // 3. Default `14.0 A` Boltz-2 contact export ceiling emits an explicit `WARNING:` diagnostic when
+    //    tether-padded MTSL `Gamma_2` PRE restraints are dropped from Boltz-2 export!
+    let pre_no_mhz = "# anchor: B 12 CB\n# tau_c_ns: 10.0\n# mode: gamma2\nA\t8\tH\t500.0\t10.0\n";
+    let err = parse_intermolecular_pre_tsv_str(pre_no_mhz, None, "A", 1.5)
+        .expect_err("21F:B18: Gamma_2 PRE without explicit proton_mhz must fail closed");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("proton_mhz"),
+        "error must mention proton_mhz, got: {err_msg}"
+    );
+
+    let pre_800 =
+        "# anchor: B 12 CB\n# tau_c_ns: 10.0\n# proton_mhz: 800.0\n# mode: gamma2\nA\t8\tH\t500.0\t10.0\n";
+    let pres = parse_intermolecular_pre_tsv_str(pre_800, None, "A", 1.5)
+        .expect("explicit tau_c_ns + proton_mhz must succeed");
+    assert_eq!(pres.len(), 1);
+    assert_eq!(pres[0].pre_proton_mhz, Some(800.0));
+    assert!(
+        pres[0].upper_a > 14.0,
+        "even 500 s^-1 MTSL PRE with 6.0 A tether + 1.5 A margin exceeds 14.0 A (got {:.2} A)",
+        pres[0].upper_a
+    );
+
+    let ubq_pdb = std::fs::read_to_string(ubq_fixture_path()).expect("read 1UBQ");
+    let apo = StructureModel::parse_str(&ubq_pdb, Some("pdb"), false).expect("parse 1UBQ");
+    let apo_seq: String = apo
+        .residues
+        .iter()
+        .filter(|r| r.chain_id == "A")
+        .map(|r| match r.res_name.as_str() {
+            "ALA" => 'A', "ARG" => 'R', "ASN" => 'N', "ASP" => 'D', "CYS" => 'C',
+            "GLN" => 'Q', "GLU" => 'E', "GLY" => 'G', "HIS" => 'H', "ILE" => 'I',
+            "LEU" => 'L', "LYS" => 'K', "MET" => 'M', "PHE" => 'F', "PRO" => 'P',
+            "SER" => 'S', "THR" => 'T', "TRP" => 'W', "TYR" => 'Y', "VAL" => 'V',
+            _ => 'X',
+        })
+        .collect();
+    let bundle = extract_nmr_interface_restraints(
+        &CofoldRestraintInput {
+            job_name: "b18_mtsl_pre_drop_diag".to_string(),
+            entities: vec![
+                CofoldEntitySpec::Polymer {
+                    kind: CofoldPolymerKind::Protein,
+                    chain_id: "A".to_string(),
+                    sequence: apo_seq,
+                },
+                CofoldEntitySpec::Polymer {
+                    kind: CofoldPolymerKind::Protein,
+                    chain_id: "B".to_string(),
+                    sequence: "AAAAAAAAAAAAAAAAAAAA".to_string(),
+                },
+            ],
+            receptor_chain_id: Some("A".to_string()),
+            binder_chain_id: Some("B".to_string()),
+            apo_receptor_model: Some(apo),
+            raw_distance_restraints: pres,
+            ..CofoldRestraintInput::default()
+        },
+        &CofoldRestraintExtractConfig::default(),
+    )
+    .expect("extract bundle");
+
+    assert_eq!(bundle.distance_restraints[0].exported_contact_max_distance_a, None);
+    assert_eq!(bundle.distance_restraints[0].pre_proton_mhz, Some(800.0));
+    assert!(
+        bundle
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("proton_mhz=800.0 MHz")),
+        "bundle diagnostics must echo explicit proton_mhz=800.0 MHz, got: {:?}",
+        bundle.diagnostics
+    );
+    assert!(
+        bundle
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("WARNING:") && d.contains("Solomon Gamma2 PRE") && d.contains("14.0 A")),
+        "bundle diagnostics must emit explicit WARNING when default 14.0 A ceiling drops MTSL PRE restraints, got: {:?}",
+        bundle.diagnostics
     );
 }

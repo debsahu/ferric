@@ -27,12 +27,14 @@ use nmr_core::domain_dock::{
     format_domain_dock_json, format_domain_dock_tsv, parse_domain_noe_tsv_str,
     parse_domain_pcs_tsv_str, parse_domain_pre_tsv_str, parse_domain_pre_tsv_str_with_defaults,
     parse_domain_rdc_tsv_str, partition_domain_stratified_pcs_free_set,
-    partition_domain_stratified_rdc_free_set, quat_apply_world_rot_step, read_domain_rdc_tsv,
+    partition_domain_stratified_rdc_free_set, prepare_domain_dock_inputs_full,
+    quat_apply_world_rot_step, read_domain_rdc_tsv,
     solomon_gamma2_to_distance_bounds, ChainSeqIndex, DipolarObservabilityRegime, DomainDockConfig,
     DomainDockEnergyWeights, DomainDockQualityVerdict, DomainLinkerKinematics, DomainMotionRegime,
     DomainPcsRestraint, DomainPcsTagSet, DomainPreRestraint, DomainPreSiteSet, PaeClusterConfig,
     PaeDomainPartition, PreRestraintKind, PreparedDomainDockRestraints, ResidueDomainRole,
-    CODATA_ELECTRON_G_FACTOR, K_SOLOMON_PROTON_NITROXIDE_A6_S2,
+    CODATA_ELECTRON_G_FACTOR, DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM,
+    K_SOLOMON_PROTON_NITROXIDE_A6_S2,
 };
 use nmr_core::noesy::{
     parse_pdb_first_model, v_add, v_dist, v_norm, v_scale, v_sub, v_unit,
@@ -2770,5 +2772,287 @@ fn test_p1_7_non_circular_real_experimental_rdcs_and_intra_domain_noise_docking(
     assert_eq!(
         res_noisy.report.quality_verdict,
         DomainDockQualityVerdict::PassedAllChecks
+    );
+}
+
+#[test]
+fn test_21f_b4_gd3_spin_7_2_preserves_per_site_k_pre_cpu() {
+    // Regression test for `21F:B4`: `prepare_domain_dock_pipeline` MUST NOT overwrite per-site
+    // Solomon `k_pre_a6_s1` (e.g. Gd3+ `S=7/2`, 21x larger than S=1/2 nitroxide) with S=1/2!
+    // Fails at `f8408b9` where `*k_pre_a6_s1 < 1.0e12` always fired.
+    let (native_model, _pae, part) = build_two_domain_ubq_kh3_benchmark();
+    let kin = DomainLinkerKinematics::from_af_model(&native_model, &part).unwrap();
+    let (slots0, _) = kin.forward_slots_and_block_frames(&kin.initial_state());
+
+    let h95 = slots0[94 * 7 + 1].0;
+    let r_true = 16.0_f64;
+    let gd_pos = [h95[0] - r_true, h95[1], h95[2]];
+    let k_nitro = compute_solomon_k_pre_a6_s1(10.0, 600.0, 0.5, CODATA_ELECTRON_G_FACTOR).unwrap();
+    let k_gd = compute_solomon_k_pre_a6_s1(10.0, 600.0, 3.5, CODATA_ELECTRON_G_FACTOR).unwrap();
+    assert!(
+        ((k_gd / k_nitro) - 21.0).abs() < 1e-10,
+        "Gd3+ S=7/2 K_PRE must be exactly 21x nitroxide S=1/2"
+    );
+
+    let g2_gd =
+        evaluate_solomon_gamma2_s1(r_true, 10.0, 600.0, 3.5, CODATA_ELECTRON_G_FACTOR).unwrap();
+    let tsv = format!(
+        "# site_pos: {:.4} {:.4} {:.4}\n# site_domain: 1\n# tau_c_ns: 10.0\n# proton_mhz: 600.0\n# spin_s: 3.5\nseq_id\tatom_name\tgamma2_s1\tsigma_s1\n{}\tH\t{:.6}\t1.0\n",
+        gd_pos[0], gd_pos[1], gd_pos[2], kin.residues[94].seq_id, g2_gd
+    );
+    let parsed_sites = parse_domain_pre_tsv_str(&tsv).unwrap();
+    assert_eq!(parsed_sites.len(), 1);
+
+    let cfg = DomainDockConfig {
+        allow_underdetermined_single_medium: true,
+        ..Default::default()
+    };
+    let mut empty_rdcs = Vec::new();
+    let pipe = prepare_domain_dock_inputs_full(
+        &kin,
+        &part,
+        &mut empty_rdcs,
+        &[],
+        &parsed_sites,
+        &[],
+        &cfg,
+    )
+    .unwrap();
+    assert_eq!(pipe.prep.pre_terms.len(), 1);
+    let kept_k = pipe.prep.pre_terms[0].k_pre_a6_s1;
+    let rel_err = (kept_k - k_gd).abs() / k_gd;
+    assert!(
+        rel_err < 1e-10,
+        "21F:B4 regression: Gd3+ S=7/2 k_pre_a6_s1 was overwritten (got {kept_k:.6e}, expected {k_gd:.6e}, nitroxide={k_nitro:.6e})"
+    );
+
+    let w_pre_only = DomainDockEnergyWeights {
+        w_rdc: 0.0,
+        w_pcs: 0.0,
+        w_pre: 1.0,
+        w_noe: 0.0,
+        noe_soft_window: 3.0,
+        w_vdw: 0.0,
+        vdw_scale: 1.0,
+        w_rama: 0.0,
+    };
+    let (eb, _) = evaluate_domain_dock_fixed_saupe_cpu(
+        &kin,
+        &pipe.prep,
+        &kin.initial_state(),
+        &[],
+        &w_pre_only,
+    );
+    assert!(
+        eb.pre < 1.0e-10,
+        "21F:B4 regression: Gd3+ PRE energy at exact r = {r_true} A must vanish, got {:.6e}",
+        eb.pre
+    );
+}
+
+#[test]
+fn test_21f_b5_discontinuous_insertion_enforces_reentry_peptide_bond_closure() {
+    // Regression test for `21F:B5`: docked discontinuous insertion domains MUST keep the re-entry
+    // peptide bond C'_{s_1-1}-N_{s_1} closed (`|d(C, N) - 1.33 A| <= 0.15 A`) BOTH with default
+    // `w_rama` AND when `w_rama == 0.0`, while reporting `max_reentry_cn_err_a` and preserving
+    // `0.000 A` intra-domain rigidity. Fails at `f8408b9` (1.29 A C-N bond break).
+    let ubq = parse_pdb_first_model(repo_root().join("data/fixtures/ubiquitin_1ubq_xray.pdb"))
+        .expect("parse 1UBQ");
+    let n = ubq.residues.len();
+    let mut true_dom = vec![0usize; n];
+    for d in true_dom.iter_mut().take(22) {
+        *d = 1;
+    }
+    for d in true_dom.iter_mut().take(46).skip(26) {
+        *d = 2;
+    }
+    for d in true_dom.iter_mut().take(72).skip(50) {
+        *d = 1;
+    }
+    let plddt: Vec<f64> = true_dom
+        .iter()
+        .map(|&d| if d == 0 { 60.0 } else { 93.0 })
+        .collect();
+    let pae = build_synthetic_pae(n, &true_dom, 2105, 2.0, 24.5);
+    let cif = serialize_chain_to_af_mmcif("ubq_insertion_b5", &ubq, &plddt, None);
+    let model = parse_af_structure_model_str(&cif, &AfIngestOptions::default()).unwrap();
+    let seq_ids = model.seq_ids();
+    let part = cluster_pae_domains(
+        &pae,
+        Some(&plddt),
+        Some(&seq_ids),
+        None,
+        &PaeClusterConfig::default(),
+    )
+    .unwrap();
+    let kin = DomainLinkerKinematics::from_af_model(&model, &part).unwrap();
+    assert!(kin.has_reentry_blocks());
+
+    let ch0 = kin.build_pdb_chain(&kin.initial_state());
+    let s1 = saupe_matrix_from_pas(-13.0, 0.31, [24.0, 52.0, 104.0]);
+    let s2 = saupe_matrix_from_pas(14.5, 0.45, [112.0, 76.0, 35.0]);
+    let med1 = simulate_domain_rdc_medium(&ch0, "ins_m1", &s1, &s1, 77, (-1, -1), 0.0, 811);
+    let med2 = simulate_domain_rdc_medium(&ch0, "ins_m2", &s2, &s2, 77, (-1, -1), 0.0, 812);
+
+    let metal_d1 = v_add(ubq.residues[60].ca, [3.0, -2.5, 2.8]);
+    let mut pcs_rows = Vec::new();
+    for (idx, r) in ubq.residues.iter().enumerate() {
+        if true_dom[idx] != 0 {
+            if let Some(h) = r.h {
+                if v_dist(h, metal_d1) > 6.0 {
+                    let pv = predict_pcs_spherical_ppm(h, metal_d1, 28.0, 8.0, [0.4, 1.0, 1.8]);
+                    pcs_rows.push(DomainPcsRestraint {
+                        tag_id: "d1_ln".to_string(),
+                        chain_id: None,
+                        seq_id: r.seq_id,
+                        atom_name: "H".to_string(),
+                        pcs_obs_ppm: pv,
+                        sigma_ppm: 0.03,
+                        is_free: false,
+                    });
+                }
+            }
+        }
+    }
+    let pcs_tag = DomainPcsTagSet {
+        tag_id: "d1_ln".to_string(),
+        metal_pos_initial: Some(metal_d1),
+        anchor_chain_id: None,
+        anchor_residue_atom: None,
+        host_domain_id: Some(1),
+        pre_fitted_tensor: None,
+        refine_metal_pos: false,
+        metal_search_radius_a: None,
+        restraints: pcs_rows,
+    };
+
+    // Perturb linker so re-entry C'_{49}-N_{50} starts broken before docking
+    let mut st_start = kin.initial_state();
+    st_start.psi_rad[23] += 0.40;
+    st_start.phi_rad[24] -= 0.35;
+    st_start.psi_rad[46] += 0.30;
+    let start_chain = kin.build_pdb_chain(&st_start);
+    let start_cif = serialize_chain_to_af_mmcif("ubq_insertion_b5_start", &start_chain, &plddt, None);
+    let start_af = parse_af_structure_model_str(&start_cif, &AfIngestOptions::default()).unwrap();
+
+    for (label, w_rama) in [("default_w_rama", 0.45_f64), ("zero_w_rama", 0.0_f64)] {
+        let mut weights = DomainDockEnergyWeights::default();
+        weights.w_rama = w_rama;
+        let cfg = DomainDockConfig {
+            weights,
+            ensemble_size: 2,
+            n_replicas: 16,
+            anneal_steps: 24,
+            lbfgs_iters: 100,
+            ..Default::default()
+        };
+        let docked = dock_domains_cpu(
+            &start_af,
+            &pae,
+            &[med1.clone(), med2.clone()],
+            &[pcs_tag.clone()],
+            &[],
+            &[],
+            &cfg,
+        )
+        .unwrap();
+        let cn_dist = v_dist(docked.chains[0].residues[49].c, docked.chains[0].residues[50].n);
+        let cn_err = (cn_dist - 1.33).abs();
+        assert!(
+            cn_err <= 0.15,
+            "21F:B5 ({label}): re-entry peptide bond C49-N50 = {cn_dist:.4} A (|d - 1.33| = {cn_err:.4} A > 0.15 A)"
+        );
+        assert!(
+            docked.report.max_reentry_cn_err_a <= 0.15,
+            "21F:B5 ({label}): report.max_reentry_cn_err_a = {:.4} A > 0.15 A",
+            docked.report.max_reentry_cn_err_a
+        );
+        assert!(
+            docked.conformers[0].max_reentry_cn_err_a <= 0.15,
+            "21F:B5 ({label}): conformer.max_reentry_cn_err_a = {:.4} A > 0.15 A",
+            docked.conformers[0].max_reentry_cn_err_a
+        );
+        assert!(
+            docked.report.max_intra_domain_rmsd_angstrom < 1.0e-12,
+            "21F:B5 ({label}): intra-domain drift = {:.3e} A",
+            docked.report.max_intra_domain_rmsd_angstrom
+        );
+        assert!(
+            format_domain_dock_tsv(&docked.report).contains("max_reentry_cn_err_a"),
+            "TSV report must include max_reentry_cn_err_a"
+        );
+    }
+}
+
+#[test]
+fn test_21f_b18_default_mtsl_tether_allowance_applied_to_anchored_sites() {
+    // Regression test for `21F:B18`: `DomainDockConfig::default().mtsl_tether_allowance_a` must
+    // equal `DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM` (`6.0 A`), and `# site_anchor` PRE sites
+    // without an explicit per-site override must inherit the `6.0 A` MTSL tether allowance!
+    // Fails at `f8408b9` where `DomainDockConfig::default().mtsl_tether_allowance_a == 0.0`.
+    assert!(
+        (DomainDockConfig::default().mtsl_tether_allowance_a
+            - DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM)
+            .abs()
+            < 1e-12,
+        "DomainDockConfig::default().mtsl_tether_allowance_a must be DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM (6.0 A)"
+    );
+
+    let (native_model, _pae, part) = build_two_domain_ubq_kh3_benchmark();
+    let kin = DomainLinkerKinematics::from_af_model(&native_model, &part).unwrap();
+    let (slots0, _) = kin.forward_slots_and_block_frames(&kin.initial_state());
+    let anchor_ca = slots0[20 * 7 + 2].0; // residue index 20 (seq_id 21) in Domain 1
+    let h95 = slots0[94 * 7 + 1].0; // residue index 94 (seq_id 95) in Domain 2
+    let r_actual = v_dist(anchor_ca, h95);
+    // Set DistanceBounds upper bound 4.5 A below `r_actual`: without 6.0 A MTSL tether allowance,
+    // `r_actual > upper_a` incurs a large penalty; with the 6.0 A default tether pad, `r_actual <= upper_a + 6.0` -> 0.0 energy!
+    let pre_anchored = DomainPreSiteSet {
+        site_id: "mtsl_anchor_default".to_string(),
+        site_pos_initial: None,
+        anchor_chain_id: None,
+        anchor_residue_atom: Some((kin.residues[20].seq_id, "CA".to_string())),
+        host_domain_id: Some(1),
+        tau_c_ns: None,
+        proton_mhz: None,
+        mtsl_tether_allowance_a: None,
+        restraints: vec![DomainPreRestraint {
+            site_id: "mtsl_anchor_default".to_string(),
+            chain_id: None,
+            seq_id: kin.residues[94].seq_id,
+            atom_name: "H".to_string(),
+            kind: PreRestraintKind::DistanceBounds {
+                lower_a: (r_actual - 8.0).max(2.0),
+                upper_a: (r_actual - 4.5).max(3.0),
+                sigma_a: 1.0,
+            },
+        }],
+    };
+
+    let prep = PreparedDomainDockRestraints::compile(
+        &kin,
+        &part,
+        &[],
+        &[],
+        &[pre_anchored],
+        &[],
+        None,
+    )
+    .unwrap();
+    let w_pre_only = DomainDockEnergyWeights {
+        w_rdc: 0.0,
+        w_pcs: 0.0,
+        w_pre: 1.0,
+        w_noe: 0.0,
+        noe_soft_window: 3.0,
+        w_vdw: 0.0,
+        vdw_scale: 1.0,
+        w_rama: 0.0,
+    };
+    let (eb, _) =
+        evaluate_domain_dock_fixed_saupe_cpu(&kin, &prep, &kin.initial_state(), &[], &w_pre_only);
+    assert_eq!(
+        eb.pre, 0.0,
+        "21F:B18: anchored MTSL PRE site must inherit 6.0 A default tether allowance (r={r_actual:.2} A <= upper+6.0 A), got E_pre={:.4}",
+        eb.pre
     );
 }

@@ -25,7 +25,8 @@ use nmr_core::af_concordance::{
 use nmr_core::domain_dock::{
     cluster_pae_domains, cluster_pae_domains_for_model, compute_solomon_k_pre_a6_s1,
     evaluate_domain_dock_fixed_saupe_cpu, evaluate_solomon_gamma2_s1, parse_domain_pcs_tsv_str,
-    parse_domain_pre_tsv_str, partition_domain_stratified_rdc_free_set, quat_apply_world_rot_step,
+    parse_domain_pre_tsv_str, partition_domain_stratified_rdc_free_set,
+    prepare_domain_dock_inputs_full, quat_apply_world_rot_step,
     DomainDockConfig, DomainDockEnergyWeights, DomainLinkerKinematics, DomainPcsRestraint,
     DomainPcsTagSet, DomainPreRestraint, DomainPreSiteSet, PaeClusterConfig, PaeDomainPartition,
     PreRestraintKind, PreparedDomainDockRestraints, CODATA_ELECTRON_G_FACTOR,
@@ -1399,5 +1400,89 @@ fn test_webgpu_p0_4_discontinuous_insertion_domain_parity_and_zero_drift() {
         gpu_dock.report.max_intra_domain_rmsd_angstrom < 1.0e-12,
         "WebGPU discontinuous insertion domain internal drift = {:.3e} A",
         gpu_dock.report.max_intra_domain_rmsd_angstrom
+    );
+    assert!(
+        gpu_dock.report.max_reentry_cn_err_a <= 0.15,
+        "21F:B5 WebGPU discontinuous insertion re-entry C-N error = {:.4} A > 0.15 A",
+        gpu_dock.report.max_reentry_cn_err_a
+    );
+}
+
+#[test]
+fn test_21f_b4_gd3_spin_7_2_preserves_per_site_k_pre_gpu() {
+    // Regression test for `21F:B4` on WebGPU: `prepare_domain_dock_pipeline` must preserve
+    // per-site Gd3+ `S=7/2` `k_pre_a6_s1` (21x nitroxide) all the way into `evaluate_domain_dock_batch_gpu`!
+    // Fails at `f8408b9` where `*k_pre_a6_s1 < 1.0e12` overwrote Gd3+ K with S=1/2 nitroxide.
+    let Some(engine) = require_headless_gpu(None) else {
+        return;
+    };
+    let (model, _pae, part) = build_two_domain_fixture();
+    let kin = DomainLinkerKinematics::from_af_model(&model, &part).unwrap();
+    let mut st0 = kin.initial_state();
+    for i in 0..kin.residues.len() {
+        st0.phi_rad[i] = (st0.phi_rad[i] as f32) as f64;
+        st0.psi_rad[i] = (st0.psi_rad[i] as f32) as f64;
+        st0.omega_rad[i] = (st0.omega_rad[i] as f32) as f64;
+    }
+    let (slots0, _) = kin.forward_slots_and_block_frames(&st0);
+    let h_idx = 94usize;
+    let h_pos = slots0[h_idx * 7 + 1].0;
+    let r_true = 16.0_f64;
+    let gd_pos = [h_pos[0] - r_true, h_pos[1], h_pos[2]];
+
+    let k_gd = compute_solomon_k_pre_a6_s1(10.0, 600.0, 3.5, CODATA_ELECTRON_G_FACTOR).unwrap();
+    let g2_gd =
+        evaluate_solomon_gamma2_s1(r_true, 10.0, 600.0, 3.5, CODATA_ELECTRON_G_FACTOR).unwrap();
+    let tsv = format!(
+        "# site_pos: {:.4} {:.4} {:.4}\n# site_domain: 1\n# tau_c_ns: 10.0\n# proton_mhz: 600.0\n# spin_s: 3.5\nseq_id\tatom_name\tgamma2_s1\tsigma_s1\n{}\tH\t{:.6}\t1.0\n",
+        gd_pos[0], gd_pos[1], gd_pos[2], kin.residues[h_idx].seq_id, g2_gd
+    );
+    let pre_sites = parse_domain_pre_tsv_str(&tsv).unwrap();
+
+    let cfg = DomainDockConfig {
+        allow_underdetermined_single_medium: true,
+        ..Default::default()
+    };
+    let mut empty_rdcs = Vec::new();
+    let pipe =
+        prepare_domain_dock_inputs_full(&kin, &part, &mut empty_rdcs, &[], &pre_sites, &[], &cfg)
+            .unwrap();
+    assert!(
+        ((pipe.prep.pre_terms[0].k_pre_a6_s1 - k_gd).abs() / k_gd) < 1e-10,
+        "21F:B4 GPU prep: Gd3+ K_PRE overwritten ({:.6e} vs {:.6e})",
+        pipe.prep.pre_terms[0].k_pre_a6_s1,
+        k_gd
+    );
+
+    let w_pre_only = DomainDockEnergyWeights {
+        w_rdc: 0.0,
+        w_pcs: 0.0,
+        w_pre: 1.0,
+        w_noe: 0.0,
+        noe_soft_window: 3.0,
+        w_vdw: 0.0,
+        vdw_scale: 1.0,
+        w_rama: 0.0,
+    };
+    let rep_in = DomainDockGpuReplicaInput {
+        state: st0.clone(),
+        saupe_matrices: Vec::new(),
+    };
+    let gpu_out =
+        evaluate_domain_dock_batch_gpu(&engine, &kin, &pipe.prep, &[rep_in], &w_pre_only).unwrap();
+    let (eb_gpu, _) = &gpu_out[0];
+    let (eb_cpu, _) =
+        evaluate_domain_dock_fixed_saupe_cpu(&kin, &pipe.prep, &st0, &[], &w_pre_only);
+    assert!(
+        eb_gpu.pre < 1.0e-4,
+        "21F:B4 WebGPU Gd3+ PRE energy at exact r = {r_true} A must vanish, got {:.6e}",
+        eb_gpu.pre
+    );
+    let diff = (eb_gpu.pre - eb_cpu.pre).abs();
+    assert!(
+        diff < 1.0e-4,
+        "21F:B4 WebGPU vs CPU Gd3+ PRE parity failed: gpu={:.6e} cpu={:.6e}",
+        eb_gpu.pre,
+        eb_cpu.pre
     );
 }
