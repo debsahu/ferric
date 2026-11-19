@@ -9,10 +9,31 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::evaluate::to_reference;
+use crate::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
+use crate::metabolomics::{
+    export_bucket_table_csv, export_study_summary_json, generate_demo_biofluid_cohort,
+    preprocess_cohort_1d, run_metabolomics_pipeline, CohortSample1D, MetabolomicsPipelineConfig,
+    MetabolomicsStudyResult,
+};
+use crate::nef::{read_nef_str, write_nef_str, NefDocument};
+use crate::nmrstar::{read_star_str, Reference};
+use crate::peaks::{read_peaks_str, Peak};
+use crate::picker::{pick_hsqc_2d, PickerConfig};
+use crate::priors::{one_to_three, Priors};
+use crate::report::{generate_quality_report_html, predict_csi_dihedrals, ReportInput};
+use crate::simulate::{render_hsqc_2d, simulate, SimConfig, SpectrumRenderConfig};
+use crate::solver::{assign, AnnealConfig, ScoreConfig};
+use crate::spectrum::Spectrum2D;
+use crate::spinsystems::{build_spin_systems, Tolerances};
 use crate::torsion_db::sha256_hex;
+
+const EMBEDDED_DAG_DEMO_UBIQUITIN_STAR: &str =
+    include_str!("../../../data/fixtures/synthetic_ubiquitin.str");
 
 /// Canonical manifest schema identifier.
 pub const DAG_MANIFEST_SCHEMA: &str = "ferric-dag-v1";
@@ -756,6 +777,9 @@ pub enum DagError {
     CycleDetected {
         cycle_nodes: Vec<String>,
     },
+    ManifestIntegrityMismatch {
+        reason: String,
+    },
     ExecutionFailed {
         node_id: String,
         reason: String,
@@ -835,6 +859,9 @@ impl fmt::Display for DagError {
             }
             DagError::CycleDetected { cycle_nodes } => {
                 write!(f, "Cycle detected involving: {}", cycle_nodes.join(", "))
+            }
+            DagError::ManifestIntegrityMismatch { reason } => {
+                write!(f, "Manifest integrity mismatch: {reason}")
             }
             DagError::ExecutionFailed { node_id, reason } => {
                 write!(f, "Execution failed at node '{node_id}': {reason}")
@@ -1731,9 +1758,145 @@ pub fn compile_dag_manifest(dag: &WorkflowDag) -> Result<DagManifest, DagError> 
     })
 }
 
+/// Fail-closed integrity verification of a compiled [`DagManifest`]:
+/// 1. Verifies schema identifier, hostile bounds, and valid graph structure/parameters.
+/// 2. Recomputes canonical Kahn topological ordering, canonical sorted edges, every input
+///    binding (`upstream_sha256` & `port_type`), every `node_sha256`, and `manifest_sha256`.
+/// 3. Rejects any forged hash, parameter tampering, altered edge/input binding, or
+///    non-topological / reversed node ordering with [`DagError::ManifestIntegrityMismatch`].
+pub fn verify_dag_manifest(manifest: &DagManifest) -> Result<(), DagError> {
+    if manifest.schema != DAG_MANIFEST_SCHEMA {
+        return Err(DagError::ManifestIntegrityMismatch {
+            reason: format!(
+                "unsupported manifest schema '{}'; expected '{DAG_MANIFEST_SCHEMA}'",
+                manifest.schema
+            ),
+        });
+    }
+    if manifest.nodes.is_empty() {
+        return Err(DagError::ManifestIntegrityMismatch {
+            reason: "manifest contains zero nodes".to_string(),
+        });
+    }
+    if manifest.nodes.len() > MAX_DAG_NODES {
+        return Err(DagError::ManifestIntegrityMismatch {
+            reason: format!(
+                "manifest node count {} exceeds maximum {MAX_DAG_NODES}",
+                manifest.nodes.len()
+            ),
+        });
+    }
+    if manifest.edges.len() > MAX_DAG_EDGES {
+        return Err(DagError::ManifestIntegrityMismatch {
+            reason: format!(
+                "manifest edge count {} exceeds maximum {MAX_DAG_EDGES}",
+                manifest.edges.len()
+            ),
+        });
+    }
+    if manifest.topological_order.len() != manifest.nodes.len() {
+        return Err(DagError::ManifestIntegrityMismatch {
+            reason: format!(
+                "topological_order length {} does not match node count {}",
+                manifest.topological_order.len(),
+                manifest.nodes.len()
+            ),
+        });
+    }
+
+    let reconstructed = WorkflowDag {
+        name: manifest.workflow_name.clone(),
+        description: String::new(),
+        nodes: manifest
+            .nodes
+            .iter()
+            .map(|n| DagNode {
+                id: n.id.clone(),
+                kind: n.kind,
+                label: n.label.clone(),
+                params: n.params.clone(),
+                position: [0.0, 0.0],
+            })
+            .collect(),
+        edges: manifest.edges.clone(),
+    };
+
+    let expected =
+        compile_dag_manifest(&reconstructed).map_err(|e| DagError::ManifestIntegrityMismatch {
+            reason: format!("manifest graph validation failed: {e}"),
+        })?;
+
+    if manifest.topological_order != expected.topological_order {
+        return Err(DagError::ManifestIntegrityMismatch {
+            reason: "topological_order does not match canonical Kahn topological order".to_string(),
+        });
+    }
+    if manifest.edges != expected.edges {
+        return Err(DagError::ManifestIntegrityMismatch {
+            reason: "manifest edges do not match canonical sorted edge list".to_string(),
+        });
+    }
+    if manifest.nodes.len() != expected.nodes.len() {
+        return Err(DagError::ManifestIntegrityMismatch {
+            reason: "manifest node count mismatch".to_string(),
+        });
+    }
+
+    for (idx, (actual, exp)) in manifest.nodes.iter().zip(expected.nodes.iter()).enumerate() {
+        if actual.id != exp.id {
+            return Err(DagError::ManifestIntegrityMismatch {
+                reason: format!(
+                    "node ordering mismatch at step {idx}: expected '{}', found '{}'",
+                    exp.id, actual.id
+                ),
+            });
+        }
+        if actual.kind != exp.kind {
+            return Err(DagError::ManifestIntegrityMismatch {
+                reason: format!(
+                    "node kind mismatch for '{}': expected '{}', found '{}'",
+                    exp.id,
+                    exp.kind.canonical_id(),
+                    actual.kind.canonical_id()
+                ),
+            });
+        }
+        if actual.inputs != exp.inputs {
+            return Err(DagError::ManifestIntegrityMismatch {
+                reason: format!(
+                    "compiled input bindings mismatch for node '{}' (possible tampered upstream_sha256 or port binding)",
+                    exp.id
+                ),
+            });
+        }
+        if actual.node_sha256 != exp.node_sha256 {
+            return Err(DagError::ManifestIntegrityMismatch {
+                reason: format!(
+                    "node_sha256 mismatch for node '{}': expected '{}', found '{}'",
+                    exp.id, exp.node_sha256, actual.node_sha256
+                ),
+            });
+        }
+    }
+
+    if manifest.manifest_sha256 != expected.manifest_sha256 {
+        return Err(DagError::ManifestIntegrityMismatch {
+            reason: format!(
+                "manifest_sha256 mismatch: expected '{}', found '{}'",
+                expected.manifest_sha256, manifest.manifest_sha256
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 /// Execute a compiled [`DagManifest`] in deterministic topological order using a
 /// caller-supplied pure/mockable stage `runner`, reusing cached upstream artifacts
 /// keyed by `node_sha256`.
+///
+/// Fail-closed: calls [`verify_dag_manifest`] BEFORE consulting `cache` or executing
+/// any stage, rejecting forged hashes or non-topological / reversed node ordering.
 pub fn execute_dag_manifest<F>(
     manifest: &DagManifest,
     cache: &mut DagArtifactCache,
@@ -1742,12 +1905,17 @@ pub fn execute_dag_manifest<F>(
 where
     F: FnMut(&CompiledDagNode, &[&CachedArtifact]) -> Result<String, DagError>,
 {
+    verify_dag_manifest(manifest)?;
+
     let mut steps = Vec::with_capacity(manifest.nodes.len());
     let mut executed_count = 0usize;
     let mut cache_hit_count = 0usize;
 
     for (step_index, node) in manifest.nodes.iter().enumerate() {
-        if let Some(cached) = cache.get(&node.node_sha256) {
+        if let Some(cached) = cache
+            .get(&node.node_sha256)
+            .filter(|art| art.kind == node.kind)
+        {
             cache_hit_count += 1;
             steps.push(DagStepProvenance {
                 step_index,
@@ -1820,6 +1988,870 @@ pub fn execute_dag_manifest_dry_run(
     })
 }
 
+/// Inputs and execution options for real `nmr-core` stage execution of a compiled [`DagManifest`].
+#[derive(Debug, Clone, Default)]
+pub struct DagRunOptions {
+    /// Optional NMR-STAR text supplying reference sequence and shifts.
+    pub star_text: Option<String>,
+    /// Optional TSV peak list text (`experiment\tH\tN\tC\tsign...`).
+    pub peaks_tsv: Option<String>,
+    /// Optional NEF v1.1 text supplying molecular system and/or spectrum peaks.
+    pub nef_text: Option<String>,
+    /// Optional raw 1-letter or FASTA amino-acid sequence.
+    pub sequence: Option<String>,
+    /// Optional sandboxed root directory for resolving relative `dataset_path` node parameters.
+    pub data_root: Option<PathBuf>,
+    /// Optional output directory where `ExportNefReport` writes real artifacts.
+    pub output_dir: Option<PathBuf>,
+    /// When `true` and no explicit inline or disk inputs are found, use deterministic built-in
+    /// synthetic fixtures (tagged explicitly in provenance summaries).
+    pub use_demo_fixture: bool,
+    /// Deterministic PRNG seed for spectral simulation and solver stages.
+    pub seed: u64,
+    /// Optional cap on solver replicas (defaults to bounded deterministic count `8`).
+    pub max_runs: Option<usize>,
+    /// Optional cap on solver steps per spin system (defaults to `400`).
+    pub max_steps_per_system: Option<usize>,
+}
+
+/// Real artifacts, metrics, and provenance trace produced by [`execute_dag_manifest_real`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DagRunOutput {
+    pub trace: DagExecutionTrace,
+    pub artifacts: BTreeMap<String, String>,
+    pub written_files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nef_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_html: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics_json: Option<serde_json::Value>,
+}
+
+struct DagRealRuntime {
+    reference: Option<Reference>,
+    sequence: Vec<String>,
+    seq_ids: Vec<i32>,
+    peaks: Vec<Peak>,
+    spectrum_2d: Option<Spectrum2D>,
+    pred_ref: Option<Reference>,
+    confidence: BTreeMap<usize, f64>,
+    n_spin_systems: usize,
+    n_assigned: usize,
+    n_high_confidence: usize,
+    solver_score: Option<f64>,
+    metabolomics_cohort: Option<Vec<CohortSample1D>>,
+    metabolomics_study: Option<MetabolomicsStudyResult>,
+    source_tag: String,
+    artifacts: BTreeMap<String, String>,
+    written_files: Vec<String>,
+    nef_text: Option<String>,
+    report_html: Option<String>,
+    metrics_json: Option<serde_json::Value>,
+}
+
+impl DagRealRuntime {
+    fn new() -> Self {
+        Self {
+            reference: None,
+            sequence: Vec::new(),
+            seq_ids: Vec::new(),
+            peaks: Vec::new(),
+            spectrum_2d: None,
+            pred_ref: None,
+            confidence: BTreeMap::new(),
+            n_spin_systems: 0,
+            n_assigned: 0,
+            n_high_confidence: 0,
+            solver_score: None,
+            metabolomics_cohort: None,
+            metabolomics_study: None,
+            source_tag: String::new(),
+            artifacts: BTreeMap::new(),
+            written_files: Vec::new(),
+            nef_text: None,
+            report_html: None,
+            metrics_json: None,
+        }
+    }
+
+    fn parse_sequence_text(raw: &str) -> Result<(Vec<String>, Vec<i32>), String> {
+        let letters: String = raw
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with('>') && !t.starts_with(';') && !t.starts_with('#')
+            })
+            .flat_map(str::chars)
+            .filter(|c| c.is_ascii_alphabetic())
+            .collect();
+        if letters.is_empty() {
+            return Err("sequence contains no amino-acid letters".to_string());
+        }
+        let mut seq = Vec::with_capacity(letters.len());
+        for ch in letters.chars() {
+            let three = one_to_three(ch);
+            if three == "UNK" {
+                return Err(format!("unrecognized amino-acid letter '{ch}'"));
+            }
+            seq.push(three.to_string());
+        }
+        let seq_ids: Vec<i32> = (1..=(seq.len() as i32)).collect();
+        Ok((seq, seq_ids))
+    }
+
+    fn resolve_sandboxed_input_path(
+        node_id: &str,
+        data_root: &Path,
+        rel_path: &str,
+    ) -> Result<Option<PathBuf>, DagError> {
+        validate_safe_relative_path(node_id, "dataset_path", rel_path)?;
+        let Ok(canon_root) = std::fs::canonicalize(data_root) else {
+            return Ok(None);
+        };
+        let joined = canon_root.join(rel_path);
+        if !joined.exists() {
+            return Ok(None);
+        }
+        let canon_target =
+            std::fs::canonicalize(&joined).map_err(|e| DagError::ExecutionFailed {
+                node_id: node_id.to_string(),
+                reason: format!("failed to canonicalize dataset path '{rel_path}': {e}"),
+            })?;
+        if !canon_target.starts_with(&canon_root) {
+            return Err(DagError::ExecutionFailed {
+                node_id: node_id.to_string(),
+                reason: format!("dataset path '{rel_path}' escapes sandboxed data_root"),
+            });
+        }
+        Ok(Some(canon_target))
+    }
+
+    fn load_inputs_if_needed(
+        &mut self,
+        node_id: &str,
+        dataset_path: Option<&str>,
+        is_metabolomics: bool,
+        opts: &DagRunOptions,
+    ) -> Result<String, DagError> {
+        if !self.source_tag.is_empty() {
+            return Ok(self.source_tag.clone());
+        }
+
+        let mut loaded_parts = Vec::new();
+
+        // 1. Optional sandboxed disk dataset_path under `opts.data_root`
+        if let (Some(root), Some(rel)) = (opts.data_root.as_deref(), dataset_path) {
+            if let Some(path) = Self::resolve_sandboxed_input_path(node_id, root, rel)? {
+                if path.is_file() {
+                    let ext = path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_ascii_lowercase)
+                        .unwrap_or_default();
+                    let text =
+                        std::fs::read_to_string(&path).map_err(|e| DagError::ExecutionFailed {
+                            node_id: node_id.to_string(),
+                            reason: format!("failed to read '{}': {e}", path.display()),
+                        })?;
+                    if ext == "str" || text.contains("_Atom_chem_shift.") {
+                        let r =
+                            read_star_str(&text, None).map_err(|e| DagError::ExecutionFailed {
+                                node_id: node_id.to_string(),
+                                reason: format!("invalid NMR-STAR file '{rel}': {e}"),
+                            })?;
+                        self.sequence = r.sequence.clone();
+                        self.seq_ids = r.seq_ids.clone();
+                        loaded_parts.push(format!(
+                            "file_star({}) residues={} shifts={}",
+                            rel,
+                            r.sequence.len(),
+                            r.shifts.len()
+                        ));
+                        self.reference = Some(r);
+                    } else if ext == "nef" || text.contains("data_nef_") {
+                        let doc = read_nef_str(&text).map_err(|e| DagError::ExecutionFailed {
+                            node_id: node_id.to_string(),
+                            reason: format!("invalid NEF file '{rel}': {e}"),
+                        })?;
+                        let r = doc.to_reference().map_err(|e| DagError::ExecutionFailed {
+                            node_id: node_id.to_string(),
+                            reason: format!("failed to extract reference from NEF '{rel}': {e}"),
+                        })?;
+                        self.sequence = r.sequence.clone();
+                        self.seq_ids = r.seq_ids.clone();
+                        self.peaks = doc.to_peaks();
+                        loaded_parts.push(format!(
+                            "file_nef({}) residues={} peaks={}",
+                            rel,
+                            r.sequence.len(),
+                            self.peaks.len()
+                        ));
+                        self.reference = Some(r);
+                    } else if ext == "tsv" {
+                        let pks = read_peaks_str(&text).map_err(|e| DagError::ExecutionFailed {
+                            node_id: node_id.to_string(),
+                            reason: format!("invalid peaks TSV '{rel}': {e}"),
+                        })?;
+                        loaded_parts.push(format!("file_peaks({}) count={}", rel, pks.len()));
+                        self.peaks = pks;
+                    }
+                } else if path.is_dir() {
+                    // Check for known NMR-STAR / NEF / TSV files inside the dataset directory
+                    if let Ok(entries) = std::fs::read_dir(&path) {
+                        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                        paths.sort();
+                        for fpath in paths {
+                            if !fpath.is_file() {
+                                continue;
+                            }
+                            let ext = fpath
+                                .extension()
+                                .and_then(|s| s.to_str())
+                                .map(str::to_ascii_lowercase)
+                                .unwrap_or_default();
+                            if ext == "str" && self.reference.is_none() {
+                                if let Ok(txt) = std::fs::read_to_string(&fpath) {
+                                    if let Ok(r) = read_star_str(&txt, None) {
+                                        self.sequence = r.sequence.clone();
+                                        self.seq_ids = r.seq_ids.clone();
+                                        loaded_parts.push(format!(
+                                            "dir_star residues={} shifts={}",
+                                            r.sequence.len(),
+                                            r.shifts.len()
+                                        ));
+                                        self.reference = Some(r);
+                                    }
+                                }
+                            } else if ext == "tsv" && self.peaks.is_empty() {
+                                if let Ok(txt) = std::fs::read_to_string(&fpath) {
+                                    if let Ok(pks) = read_peaks_str(&txt) {
+                                        loaded_parts.push(format!("dir_peaks count={}", pks.len()));
+                                        self.peaks = pks;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Explicit inline payloads (`star_text`, `nef_text`, `peaks_tsv`, `sequence`)
+        if let Some(star_txt) = opts.star_text.as_deref().filter(|s| !s.trim().is_empty()) {
+            let r = read_star_str(star_txt, None).map_err(|e| DagError::ExecutionFailed {
+                node_id: node_id.to_string(),
+                reason: format!("invalid inline NMR-STAR input: {e}"),
+            })?;
+            self.sequence = r.sequence.clone();
+            self.seq_ids = r.seq_ids.clone();
+            loaded_parts.push(format!(
+                "inline_star residues={} shifts={}",
+                r.sequence.len(),
+                r.shifts.len()
+            ));
+            self.reference = Some(r);
+        }
+        if let Some(nef_txt) = opts.nef_text.as_deref().filter(|s| !s.trim().is_empty()) {
+            let doc = read_nef_str(nef_txt).map_err(|e| DagError::ExecutionFailed {
+                node_id: node_id.to_string(),
+                reason: format!("invalid inline NEF input: {e}"),
+            })?;
+            let r = doc.to_reference().map_err(|e| DagError::ExecutionFailed {
+                node_id: node_id.to_string(),
+                reason: format!("failed to extract reference from inline NEF: {e}"),
+            })?;
+            if self.sequence.is_empty() {
+                self.sequence = r.sequence.clone();
+                self.seq_ids = r.seq_ids.clone();
+            }
+            if self.reference.is_none() {
+                self.reference = Some(r);
+            }
+            let nef_peaks = doc.to_peaks();
+            if !nef_peaks.is_empty() && self.peaks.is_empty() {
+                self.peaks = nef_peaks;
+            }
+            loaded_parts.push(format!("inline_nef peaks={}", self.peaks.len()));
+        }
+        if let Some(tsv) = opts.peaks_tsv.as_deref().filter(|s| !s.trim().is_empty()) {
+            let pks = read_peaks_str(tsv).map_err(|e| DagError::ExecutionFailed {
+                node_id: node_id.to_string(),
+                reason: format!("invalid inline peaks TSV: {e}"),
+            })?;
+            loaded_parts.push(format!("inline_peaks count={}", pks.len()));
+            self.peaks = pks;
+        }
+        if let Some(seq_txt) = opts.sequence.as_deref().filter(|s| !s.trim().is_empty()) {
+            let (seq, sids) =
+                Self::parse_sequence_text(seq_txt).map_err(|e| DagError::ExecutionFailed {
+                    node_id: node_id.to_string(),
+                    reason: format!("invalid inline sequence: {e}"),
+                })?;
+            loaded_parts.push(format!("inline_seq residues={}", seq.len()));
+            self.sequence = seq;
+            self.seq_ids = sids;
+        }
+
+        // 3. Explicit synthetic demo fixture fallback ONLY when `use_demo_fixture` is enabled
+        if loaded_parts.is_empty() && opts.use_demo_fixture {
+            if is_metabolomics {
+                let cohort = generate_demo_biofluid_cohort(opts.seed);
+                loaded_parts.push(format!(
+                    "demo_fixture_metabolomics samples={}",
+                    cohort.len()
+                ));
+                self.metabolomics_cohort = Some(cohort);
+            } else {
+                let r = read_star_str(EMBEDDED_DAG_DEMO_UBIQUITIN_STAR, None).map_err(|e| {
+                    DagError::ExecutionFailed {
+                        node_id: node_id.to_string(),
+                        reason: format!("failed to load embedded demo ubiquitin fixture: {e}"),
+                    }
+                })?;
+                self.sequence = r.sequence.clone();
+                self.seq_ids = r.seq_ids.clone();
+                loaded_parts.push(format!(
+                    "demo_fixture_ubiquitin residues={} shifts={}",
+                    r.sequence.len(),
+                    r.shifts.len()
+                ));
+                self.reference = Some(r);
+            }
+        }
+
+        if loaded_parts.is_empty() {
+            let ds = dataset_path.unwrap_or("<unspecified>");
+            return Err(DagError::ExecutionFailed {
+                node_id: node_id.to_string(),
+                reason: format!(
+                    "no input dataset available for '{ds}'; supply star_text/peaks_tsv/nef_text, --data-dir containing the dataset, --demo (use_demo_fixture=true), or --dry-run"
+                ),
+            });
+        }
+
+        self.source_tag = loaded_parts.join("; ");
+        Ok(self.source_tag.clone())
+    }
+
+    fn ensure_processed(&mut self, node_id: &str, opts: &DagRunOptions) -> Result<(), DagError> {
+        if self.spectrum_2d.is_some()
+            || !self.peaks.is_empty()
+            || self.metabolomics_cohort.is_some()
+        {
+            return Ok(());
+        }
+        if let Some(ref ref_data) = self.reference {
+            let (sim_peaks, _) = simulate(
+                ref_data,
+                &SimConfig {
+                    seed: opts.seed,
+                    ..SimConfig::default()
+                },
+            );
+            let rcfg = SpectrumRenderConfig {
+                nx_h: 128,
+                ny_n: 64,
+                ..SpectrumRenderConfig::default()
+            };
+            let hsqc = render_hsqc_2d(&sim_peaks, &rcfg);
+            self.peaks = sim_peaks;
+            self.spectrum_2d = Some(hsqc);
+            return Ok(());
+        }
+        Err(DagError::ExecutionFailed {
+            node_id: node_id.to_string(),
+            reason: "no spectrum, reference shifts, or peak list available for processing"
+                .to_string(),
+        })
+    }
+
+    fn write_safe_output_file(
+        node_id: &str,
+        out_dir: &Path,
+        rel_path: &str,
+        content: &str,
+    ) -> Result<String, DagError> {
+        validate_safe_relative_path(node_id, "output_path", rel_path)?;
+        std::fs::create_dir_all(out_dir).map_err(|e| DagError::ExecutionFailed {
+            node_id: node_id.to_string(),
+            reason: format!("failed to create output directory: {e}"),
+        })?;
+        let canon_out = std::fs::canonicalize(out_dir).map_err(|e| DagError::ExecutionFailed {
+            node_id: node_id.to_string(),
+            reason: format!("failed to canonicalize output directory: {e}"),
+        })?;
+        let target = canon_out.join(rel_path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| DagError::ExecutionFailed {
+                node_id: node_id.to_string(),
+                reason: format!("failed to create output parent directory: {e}"),
+            })?;
+            let canon_parent =
+                std::fs::canonicalize(parent).map_err(|e| DagError::ExecutionFailed {
+                    node_id: node_id.to_string(),
+                    reason: format!("failed to canonicalize output parent directory: {e}"),
+                })?;
+            if !canon_parent.starts_with(&canon_out) {
+                return Err(DagError::ExecutionFailed {
+                    node_id: node_id.to_string(),
+                    reason: format!("output path '{rel_path}' escapes output directory"),
+                });
+            }
+        }
+        std::fs::write(&target, content).map_err(|e| DagError::ExecutionFailed {
+            node_id: node_id.to_string(),
+            reason: format!("failed to write artifact '{rel_path}': {e}"),
+        })?;
+        Ok(rel_path.to_string())
+    }
+}
+
+/// Execute a compiled [`DagManifest`] deterministically against real `nmr-core` processing,
+/// peak-picking, backbone-assignment, metabolomics-chemometrics, and NEF/HTML export engines.
+///
+/// Always performs fail-closed [`verify_dag_manifest`] integrity checking BEFORE consulting
+/// `cache` or running any stage.
+pub fn execute_dag_manifest_real(
+    manifest: &DagManifest,
+    cache: &mut DagArtifactCache,
+    opts: &DagRunOptions,
+) -> Result<DagRunOutput, DagError> {
+    let is_metabolomics_pipeline = manifest
+        .nodes
+        .iter()
+        .any(|n| n.kind == NodeKind::MetabolomicsChemometrics);
+    let ingest_dataset_path: Option<String> = manifest
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::IngestBrukerVarian)
+        .and_then(|n| n.params.get("dataset_path"))
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned);
+
+    let mut rt = DagRealRuntime::new();
+
+    let trace = execute_dag_manifest(manifest, cache, |node, _upstream| match node.kind {
+        NodeKind::IngestBrukerVarian => {
+            let ds = node.params.get("dataset_path").and_then(|v| v.as_str());
+            let info = rt.load_inputs_if_needed(&node.id, ds, is_metabolomics_pipeline, opts)?;
+            let vendor = node
+                .params
+                .get("vendor")
+                .and_then(|v| v.as_str())
+                .unwrap_or("bruker");
+            Ok(format!("ingest vendor={vendor} {info}"))
+        }
+        NodeKind::ProcessFidNus => {
+            rt.load_inputs_if_needed(
+                &node.id,
+                ingest_dataset_path.as_deref(),
+                is_metabolomics_pipeline,
+                opts,
+            )?;
+            let nus = node
+                .params
+                .get("nus_method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ist");
+            let zf = node
+                .params
+                .get("zero_fill_factor")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2);
+            if let Some(ref cohort) = rt.metabolomics_cohort {
+                let cfg = MetabolomicsPipelineConfig::default();
+                let (grid, masked, _, _, _) = preprocess_cohort_1d(cohort, &cfg);
+                let active_pts = masked.iter().filter(|&&m| !m).count();
+                Ok(format!(
+                    "process_1d_cohort samples={} grid_pts={} active_pts={} zf={zf}",
+                    cohort.len(),
+                    grid.len(),
+                    active_pts
+                ))
+            } else {
+                rt.ensure_processed(&node.id, opts)?;
+                if let Some(ref spec) = rt.spectrum_2d {
+                    Ok(format!(
+                        "process_2d_hsqc grid={}x{} peaks={} nus={nus} zf={zf}",
+                        spec.axis_x.size,
+                        spec.axis_y.size,
+                        rt.peaks.len()
+                    ))
+                } else {
+                    Ok(format!(
+                        "process_passthrough peaks={} nus={nus} zf={zf}",
+                        rt.peaks.len()
+                    ))
+                }
+            }
+        }
+        NodeKind::PeakPick => {
+            rt.load_inputs_if_needed(
+                &node.id,
+                ingest_dataset_path.as_deref(),
+                is_metabolomics_pipeline,
+                opts,
+            )?;
+            rt.ensure_processed(&node.id, opts)?;
+            let snr = node
+                .params
+                .get("snr_threshold")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(5.0);
+            let hsqc_picked = if let Some(ref spec) = rt.spectrum_2d {
+                let cfg = PickerConfig {
+                    snr_threshold: snr as f32,
+                    ..PickerConfig::default()
+                };
+                pick_hsqc_2d(spec, &cfg).len()
+            } else {
+                rt.peaks.iter().filter(|p| p.exp == "HSQC").count()
+            };
+            Ok(format!(
+                "peak_pick hsqc_picked={hsqc_picked} total_peaks={} snr={snr:.2}",
+                rt.peaks.len()
+            ))
+        }
+        NodeKind::DeconvolveNd => {
+            rt.load_inputs_if_needed(
+                &node.id,
+                ingest_dataset_path.as_deref(),
+                is_metabolomics_pipeline,
+                opts,
+            )?;
+            rt.ensure_processed(&node.id, opts)?;
+            let lineshape = node
+                .params
+                .get("lineshape")
+                .and_then(|v| v.as_str())
+                .unwrap_or("voigt");
+            Ok(format!(
+                "deconvolve_nd lineshape={lineshape} peaks={}",
+                rt.peaks.len()
+            ))
+        }
+        NodeKind::BackboneAssign => {
+            rt.load_inputs_if_needed(
+                &node.id,
+                ingest_dataset_path.as_deref(),
+                is_metabolomics_pipeline,
+                opts,
+            )?;
+            rt.ensure_processed(&node.id, opts)?;
+            if rt.sequence.is_empty() {
+                return Err(DagError::ExecutionFailed {
+                    node_id: node.id.clone(),
+                    reason: "BackboneAssign requires a non-empty protein sequence".to_string(),
+                });
+            }
+            if rt.peaks.is_empty() {
+                return Err(DagError::ExecutionFailed {
+                    node_id: node.id.clone(),
+                    reason: "BackboneAssign requires non-empty NMR peak lists".to_string(),
+                });
+            }
+            let solver_name = node
+                .params
+                .get("solver")
+                .and_then(|v| v.as_str())
+                .unwrap_or("evo_graph");
+            let priors = Priors::default();
+            let runs = opts.max_runs.unwrap_or(8).clamp(1, 64);
+            let steps = opts.max_steps_per_system.unwrap_or(400).clamp(100, 4000);
+
+            let (systems, assign_res) = if solver_name == "standard" {
+                let systems = build_spin_systems(&rt.peaks, &Tolerances::default(), 3, false)
+                    .map_err(|e| DagError::ExecutionFailed {
+                        node_id: node.id.clone(),
+                        reason: format!("spin-system assembly failed: {e}"),
+                    })?;
+                let anneal_cfg = AnnealConfig {
+                    runs,
+                    steps_per_system: steps,
+                    seed: opts.seed,
+                    ..AnnealConfig::default()
+                };
+                let res = assign(
+                    &systems,
+                    &rt.sequence,
+                    &priors,
+                    &ScoreConfig::default(),
+                    &anneal_cfg,
+                );
+                (systems, res)
+            } else {
+                let evo_cfg = EvoGraphConfig {
+                    population_size: runs.clamp(4, 32),
+                    num_islands: runs.clamp(2, 8),
+                    generations: 3,
+                    steps_per_system_per_gen: (steps / 2).clamp(100, 800),
+                    seed: opts.seed,
+                    ..EvoGraphConfig::default()
+                };
+                let (systems, res, _) =
+                    assign_evo_graph_from_peaks(&rt.peaks, &rt.sequence, &priors, &evo_cfg);
+                (systems, res)
+            };
+
+            let (pred_ref, conf) = to_reference(
+                &assign_res,
+                &systems,
+                &rt.sequence,
+                &rt.seq_ids,
+                0.0,
+                Some(&priors),
+            );
+            let mut n_assigned = 0usize;
+            let mut n_hc = 0usize;
+            for (s, &pos) in assign_res.position.iter().enumerate() {
+                if pos >= 0 {
+                    n_assigned += 1;
+                    if assign_res.confidence.get(s).copied().unwrap_or(0.0) >= 0.80 {
+                        n_hc += 1;
+                    }
+                }
+            }
+            rt.n_spin_systems = systems.len();
+            rt.n_assigned = n_assigned;
+            rt.n_high_confidence = n_hc;
+            rt.solver_score = Some(assign_res.score);
+            rt.pred_ref = Some(pred_ref);
+            rt.confidence = conf;
+            rt.metrics_json = Some(serde_json::json!({
+                "solver": solver_name,
+                "n_residues": rt.sequence.len(),
+                "n_peaks": rt.peaks.len(),
+                "n_spin_systems": rt.n_spin_systems,
+                "n_assigned": rt.n_assigned,
+                "n_high_confidence": rt.n_high_confidence,
+                "solver_score": assign_res.score,
+            }));
+
+            Ok(format!(
+                "backbone_assign solver={solver_name} residues={} spin_systems={} assigned={} high_conf={} score={:.2}",
+                rt.sequence.len(),
+                rt.n_spin_systems,
+                rt.n_assigned,
+                rt.n_high_confidence,
+                assign_res.score
+            ))
+        }
+        NodeKind::MetabolomicsChemometrics => {
+            rt.load_inputs_if_needed(&node.id, ingest_dataset_path.as_deref(), true, opts)?;
+            let cohort =
+                rt.metabolomics_cohort
+                    .as_ref()
+                    .ok_or_else(|| DagError::ExecutionFailed {
+                        node_id: node.id.clone(),
+                        reason: "MetabolomicsChemometrics requires a 1D NMR cohort".to_string(),
+                    })?;
+            let mut cfg = MetabolomicsPipelineConfig::default();
+            if let Some(n_comp) = node.params.get("n_components").and_then(|v| v.as_u64()) {
+                cfg.pca_components = (n_comp as usize).clamp(1, 8);
+            }
+            let study = run_metabolomics_pipeline(cohort, &cfg);
+            let pc1 = study
+                .pca
+                .explained_variance_ratio
+                .first()
+                .copied()
+                .unwrap_or(0.0);
+            let n_samples = study.sample_ids.len();
+            let n_buckets = study.buckets.len();
+            let n_biomarkers = study.biomarkers.len();
+            rt.metrics_json = Some(serde_json::json!({
+                "n_samples": n_samples,
+                "n_buckets": n_buckets,
+                "pca_pc1_explained_variance": pc1,
+                "n_biomarkers": n_biomarkers,
+            }));
+            rt.metabolomics_study = Some(study);
+            Ok(format!(
+                "metabolomics_chemometrics samples={n_samples} buckets={n_buckets} pc1_var={pc1:.4} biomarkers={n_biomarkers}"
+            ))
+        }
+        NodeKind::DynamicsRelax => {
+            rt.load_inputs_if_needed(
+                &node.id,
+                ingest_dataset_path.as_deref(),
+                is_metabolomics_pipeline,
+                opts,
+            )?;
+            rt.ensure_processed(&node.id, opts)?;
+            let field_mhz = node
+                .params
+                .get("field_mhz")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(800.0);
+            let hsqc_count = rt.peaks.iter().filter(|p| p.exp == "HSQC").count();
+            Ok(format!(
+                "dynamics_relax field_mhz={field_mhz:.1} hsqc_roots={hsqc_count} total_peaks={}",
+                rt.peaks.len()
+            ))
+        }
+        NodeKind::ExchangeCestCpmg => {
+            rt.load_inputs_if_needed(
+                &node.id,
+                ingest_dataset_path.as_deref(),
+                is_metabolomics_pipeline,
+                opts,
+            )?;
+            rt.ensure_processed(&node.id, opts)?;
+            let b1_hz = node
+                .params
+                .get("b1_hz")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(25.0);
+            let hsqc_count = rt.peaks.iter().filter(|p| p.exp == "HSQC").count();
+            Ok(format!(
+                "exchange_cest_cpmg b1_hz={b1_hz:.1} hsqc_roots={hsqc_count} total_peaks={}",
+                rt.peaks.len()
+            ))
+        }
+        NodeKind::SidechainAssign | NodeKind::Titration2d | NodeKind::StructureFoldDock => {
+            rt.load_inputs_if_needed(
+                &node.id,
+                ingest_dataset_path.as_deref(),
+                is_metabolomics_pipeline,
+                opts,
+            )?;
+            let n_res = rt.sequence.len();
+            let n_pks = rt.peaks.len();
+            Ok(format!(
+                "{} residues={n_res} peaks={n_pks}",
+                node.kind.canonical_id()
+            ))
+        }
+        NodeKind::ExportNefReport => {
+            let out_rel = node
+                .params
+                .get("output_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("reports/ferric_bundle.nef");
+
+            if let Some(ref study) = rt.metabolomics_study {
+                let summary_json = export_study_summary_json(study, 10).map_err(|e| {
+                    DagError::ExecutionFailed {
+                        node_id: node.id.clone(),
+                        reason: format!("failed to serialize metabolomics study JSON: {e}"),
+                    }
+                })?;
+                let csv = export_bucket_table_csv(study);
+                let json_sha = sha256_hex(summary_json.as_bytes());
+                let csv_sha = sha256_hex(csv.as_bytes());
+                rt.artifacts
+                    .insert("metabolomics_summary.json".to_string(), json_sha.clone());
+                rt.artifacts
+                    .insert("metabolomics_buckets.csv".to_string(), csv_sha);
+                if let Some(out_dir) = opts.output_dir.as_deref() {
+                    let written = DagRealRuntime::write_safe_output_file(
+                        &node.id,
+                        out_dir,
+                        out_rel,
+                        &summary_json,
+                    )?;
+                    rt.written_files.push(written);
+                    let csv_rel = format!("{out_rel}.buckets.csv");
+                    let written_csv =
+                        DagRealRuntime::write_safe_output_file(&node.id, out_dir, &csv_rel, &csv)?;
+                    rt.written_files.push(written_csv);
+                }
+                let short_sha: String = json_sha.chars().take(12).collect();
+                Ok(format!(
+                    "export_metabolomics json_bytes={} csv_bytes={} sha256={short_sha}",
+                    summary_json.len(),
+                    csv.len()
+                ))
+            } else {
+                let export_ref =
+                    rt.pred_ref
+                        .as_ref()
+                        .or(rt.reference.as_ref())
+                        .ok_or_else(|| DagError::ExecutionFailed {
+                            node_id: node.id.clone(),
+                            reason: "ExportNefReport has no assigned or reference shifts to export"
+                                .to_string(),
+                        })?;
+                let conf_opt = if rt.confidence.is_empty() {
+                    None
+                } else {
+                    Some(&rt.confidence)
+                };
+                let nef_doc = NefDocument::from_reference_and_peaks(
+                    &manifest.workflow_name,
+                    export_ref,
+                    conf_opt,
+                    &rt.peaks,
+                );
+                let nef_str = write_nef_str(&nef_doc);
+                let nef_sha = sha256_hex(nef_str.as_bytes());
+
+                let mut report_in = ReportInput::new(
+                    &manifest.workflow_name,
+                    export_ref.clone(),
+                    rt.confidence.clone(),
+                );
+                report_in.n_peaks = Some(rt.peaks.len());
+                if rt.n_spin_systems > 0 {
+                    report_in.n_spin_systems = Some(rt.n_spin_systems);
+                }
+                report_in.solver_score = rt.solver_score;
+                report_in.dihedrals = predict_csi_dihedrals(export_ref);
+                let html = generate_quality_report_html(&report_in);
+                let html_sha = sha256_hex(html.as_bytes());
+
+                rt.artifacts.insert(out_rel.to_string(), nef_sha.clone());
+                rt.artifacts.insert("report.html".to_string(), html_sha);
+                if let Some(out_dir) = opts.output_dir.as_deref() {
+                    let written_nef = DagRealRuntime::write_safe_output_file(
+                        &node.id, out_dir, out_rel, &nef_str,
+                    )?;
+                    rt.written_files.push(written_nef);
+                    let html_rel = format!("{out_rel}.report.html");
+                    let written_html = DagRealRuntime::write_safe_output_file(
+                        &node.id, out_dir, &html_rel, &html,
+                    )?;
+                    rt.written_files.push(written_html);
+                }
+                let short_sha: String = nef_sha.chars().take(12).collect();
+                let nef_len = nef_str.len();
+                let html_len = html.len();
+                rt.nef_text = Some(nef_str);
+                rt.report_html = Some(html);
+                Ok(format!(
+                    "export_nef_report nef_bytes={nef_len} html_bytes={html_len} sha256={short_sha}"
+                ))
+            }
+        }
+    })?;
+
+    Ok(DagRunOutput {
+        trace,
+        artifacts: rt.artifacts,
+        written_files: rt.written_files,
+        nef_text: rt.nef_text,
+        report_html: rt.report_html,
+        metrics_json: rt.metrics_json,
+    })
+}
+
+/// Look up a built-in canonical NMR workflow preset by short name (`backbone`, `dynamics`, `metabolomics`).
+pub fn preset_by_name(name: &str) -> Option<WorkflowDag> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "backbone" | "backbone_assignment" | "backbone-assignment" => {
+            Some(preset_backbone_assignment_dag())
+        }
+        "dynamics" | "dynamics_relax_cest" | "dynamics-relax-cest" => {
+            Some(preset_dynamics_relax_cest_dag())
+        }
+        "metabolomics" | "metabolomics_1d" | "metabolomics-1d" => {
+            Some(preset_metabolomics_1d_dag())
+        }
+        _ => None,
+    }
+}
+
 /// Serialize a [`WorkflowDag`] to pretty-printed JSON respecting [`MAX_DAG_JSON_BYTES`].
 pub fn dag_to_json(dag: &WorkflowDag) -> Result<String, DagError> {
     let encoded = serde_json::to_string_pretty(dag).map_err(|e| DagError::JsonParseError {
@@ -1859,6 +2891,23 @@ pub fn manifest_to_json(manifest: &DagManifest) -> Result<String, DagError> {
         });
     }
     Ok(encoded)
+}
+
+/// Parse a compiled [`DagManifest`] from JSON with a fail-closed [`MAX_DAG_JSON_BYTES`] cap
+/// and mandatory full cryptographic + topological integrity verification via [`verify_dag_manifest`].
+pub fn manifest_from_json(json: &str) -> Result<DagManifest, DagError> {
+    if json.len() > MAX_DAG_JSON_BYTES {
+        return Err(DagError::JsonTooLarge {
+            bytes: json.len(),
+            max: MAX_DAG_JSON_BYTES,
+        });
+    }
+    let manifest: DagManifest =
+        serde_json::from_str(json).map_err(|e| DagError::JsonParseError {
+            message: e.to_string(),
+        })?;
+    verify_dag_manifest(&manifest)?;
+    Ok(manifest)
 }
 
 /// Built-in canonical preset: Protein Backbone Assignment (`Ingest -> Process -> Pick -> Assign -> Export`).

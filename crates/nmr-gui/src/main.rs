@@ -186,6 +186,7 @@ use nmr_gui::{
         MobileWorkspaceFamily, ResponsiveShellState, ResponsiveWorkbenchHost, TabletActiveDock,
         WorkbenchAction, WorkspaceReadiness, MOBILE_TOUCH_MIN_HEIGHT,
     },
+    workflow_dag_panel::{WorkflowDagAction, WorkflowDagPanel},
 };
 use octet_canvas::{IoFormat, MolecularPropertiesSummary, OctetBackendAdapter, OctetDrawPanel};
 
@@ -1808,6 +1809,8 @@ struct NmrWorkbenchApp {
     show_mcp_bridge_window: bool,
     integrative_af_panel: IntegrativeAfPanel,
     show_integrative_af_window: bool,
+    workflow_dag_panel: WorkflowDagPanel,
+    show_workflow_dag_window: bool,
     mcp_last_viewport_key: (u64, i32, i32, i32),
     assign_target_res: usize,
     assign_lock_check: bool,
@@ -2348,6 +2351,8 @@ impl NmrWorkbenchApp {
             show_mcp_bridge_window: false,
             integrative_af_panel: IntegrativeAfPanel::new(),
             show_integrative_af_window: false,
+            workflow_dag_panel: WorkflowDagPanel::new(),
+            show_workflow_dag_window: false,
             mcp_last_viewport_key: (0, 0, 0, -1),
             assign_target_res: 0,
             assign_lock_check: true,
@@ -7583,6 +7588,10 @@ impl NmrWorkbenchApp {
                             ui.close();
                             self.show_text_io_modal = true;
                         }
+                        if ui.button("Workflow DAG Composer...").clicked() {
+                            ui.close();
+                            self.show_workflow_dag_window = true;
+                        }
                         #[cfg(not(target_arch = "wasm32"))]
                         if ui.button("MCP Live Bridge...").clicked() {
                             ui.close();
@@ -7638,7 +7647,7 @@ impl NmrWorkbenchApp {
             let now_ms = ctx.input(|i| (i.time.max(0.0) * 1000.0).round() as u64);
             self.chord_dispatcher.draw_status_bar_indicator(ui, now_ms);
 
-            // Right: minimal global actions (`Open`, `Cmd+K`)
+            // Right: minimal global actions (`Tools`, `Open`, `Cmd+K`)
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 5.0;
 
@@ -7654,6 +7663,33 @@ impl NmrWorkbenchApp {
                 if cmdk_resp.clicked() {
                     self.command_palette.open = !self.command_palette.open;
                 }
+
+                let tools_resp = ui.menu_button(egui::RichText::new("Tools").size(12.0), |ui| {
+                    ui.set_min_width(210.0);
+                    if ui
+                        .button(egui::RichText::new("Workflow DAG Composer").size(12.0))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.show_workflow_dag_window = !self.show_workflow_dag_window;
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if ui
+                        .button(egui::RichText::new("MCP Live Bridge...").size(12.0))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.show_mcp_bridge_window = true;
+                    }
+                    if ui
+                        .button(egui::RichText::new("Paste NMR-STAR / TSV...").size(12.0))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.show_text_io_modal = true;
+                    }
+                });
+                self.last_global_chrome_rects.push(tools_resp.response.rect);
 
                 let open_resp = chrome_icon_button(
                     ui,
@@ -13939,9 +13975,69 @@ impl NmrWorkbenchApp {
             }
         }
 
-        // 2. `Cmd/Ctrl+K` Fuzzy Command Palette (`T09.3`)
+        // 2. `Cmd/Ctrl+K` Fuzzy Command Palette (`T09.3`) + `"Workflow DAG Composer"` quick action (`T22.11`)
+        if self.command_palette.open {
+            let dag_query_match = Self::query_matches_workflow_dag(&self.command_palette.query);
+            let palette_hits = self.command_palette.search(&self.command_palette.query);
+            if dag_query_match && palette_hits.is_empty() {
+                let enter_pressed =
+                    ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                if enter_pressed {
+                    self.command_palette.close_palette();
+                    self.show_workflow_dag_window = true;
+                    self.status_msg = "Opened Workflow DAG Composer".to_string();
+                }
+            }
+        }
         if let Some(pal_act) = self.command_palette.show(ctx) {
             self.dispatch_workbench_action(ctx, pal_act);
+        }
+        if self.command_palette.open {
+            let dag_query_match = Self::query_matches_workflow_dag(&self.command_palette.query);
+            let show_strip = self.command_palette.query.trim().is_empty() || dag_query_match;
+            if show_strip {
+                let mut launch_dag = false;
+                egui::Window::new("Workbench Tools")
+                    .id(egui::Id::unique("nmr_command_palette_dag_quick_tool"))
+                    .title_bar(false)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 502.0))
+                    .fixed_size(egui::vec2(660.0, 38.0))
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("[Tools]")
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(130, 195, 235)),
+                            );
+                            let btn_text = if dag_query_match {
+                                "Workflow DAG Composer (Enter)"
+                            } else {
+                                "Workflow DAG Composer"
+                            };
+                            if ui
+                                .button(egui::RichText::new(btn_text).size(12.5).strong())
+                                .clicked()
+                            {
+                                launch_dag = true;
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "Typed node-and-port NMR workflow DAG compiler & ferric-dag-v1 manifest",
+                                )
+                                .size(11.0)
+                                .weak(),
+                            );
+                        });
+                    });
+                if launch_dag {
+                    self.command_palette.close_palette();
+                    self.show_workflow_dag_window = true;
+                    self.status_msg = "Opened Workflow DAG Composer".to_string();
+                }
+            }
         }
 
         // 3. `?` Keyboard Accelerator Cheat-Sheet (`T09.4`)
@@ -14773,7 +14869,8 @@ impl eframe::App for NmrWorkbenchApp {
             || self.show_text_io_modal
             || self.show_assign_popover
             || self.show_contour_modal
-            || self.show_mcp_bridge_window;
+            || self.show_mcp_bridge_window
+            || self.show_workflow_dag_window;
         let chord_actions = self
             .chord_dispatcher
             .handle_egui_input(&ctx, suppress_chords);
@@ -14806,6 +14903,7 @@ impl eframe::App for NmrWorkbenchApp {
         self.draw_text_io_window(&ctx);
         self.draw_phase9_modals(&ctx);
         self.draw_mcp_bridge_window(&ctx);
+        self.draw_workflow_dag_window(&ctx);
         self.draw_integrative_af_window(&ctx);
 
         // 5. Responsive Workbench Shell (`CompactMobile < 680`, `TabletSplit 680..1024`, `DesktopFull >= 1024`)
@@ -15934,6 +16032,72 @@ impl NmrWorkbenchApp {
             if let Some(cmd) = resp.redone_command {
                 let summary = cmd.summary();
                 self.sync_app_from_mcp_snapshot(&format!("Redid AI action: {summary}"));
+            }
+        }
+    }
+
+    fn query_matches_workflow_dag(query: &str) -> bool {
+        let trimmed = query.trim().to_ascii_lowercase();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let haystack = "workflow dag composer pipeline manifest";
+        let mut saw_specific = false;
+        for tok in trimmed.split_whitespace() {
+            if !haystack.contains(tok) {
+                return false;
+            }
+            if matches!(
+                tok,
+                "dag" | "workflow" | "composer" | "manifest" | "pipeline"
+            ) || tok.starts_with("dag")
+                || tok.starts_with("comp")
+                || tok.starts_with("work")
+            {
+                saw_specific = true;
+            }
+        }
+        saw_specific
+    }
+
+    fn draw_workflow_dag_window(&mut self, ctx: &egui::Context) {
+        if !self.show_workflow_dag_window {
+            return;
+        }
+        let mut open = self.show_workflow_dag_window;
+        let max_w = (ctx.content_rect().width() - 24.0).max(480.0);
+        let max_h = (ctx.content_rect().height() - 48.0).max(420.0);
+        let mut actions = Vec::new();
+        egui::Window::new("Workflow DAG Composer")
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(true)
+            .default_size(egui::vec2(1240.0_f32.min(max_w), 740.0_f32.min(max_h)))
+            .max_width(max_w)
+            .max_height(max_h)
+            .show(ctx, |ui| {
+                actions = self.workflow_dag_panel.show(ui, self.paper_white_canvas);
+            });
+        self.show_workflow_dag_window = open;
+        for act in actions {
+            match act {
+                WorkflowDagAction::PresetLoaded(preset) => {
+                    self.status_msg = format!("Workflow DAG preset loaded: {}", preset.label());
+                }
+                WorkflowDagAction::DryRunCompleted {
+                    manifest_sha256,
+                    executed,
+                    cache_hits,
+                } => {
+                    let short_sha: String = manifest_sha256.chars().take(12).collect();
+                    self.status_msg = format!(
+                        "Workflow DAG run ({short_sha}): {executed} executed, {cache_hits} cached"
+                    );
+                }
+                WorkflowDagAction::EdgeRejected(msg) => {
+                    self.status_msg = format!("Workflow DAG edge rejected: {msg}");
+                }
+                _ => {}
             }
         }
     }
@@ -17258,6 +17422,8 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             show_mcp_bridge_window: false,
             integrative_af_panel: IntegrativeAfPanel::new(),
             show_integrative_af_window: false,
+            workflow_dag_panel: WorkflowDagPanel::new(),
+            show_workflow_dag_window: false,
             mcp_last_viewport_key: (0, 0, 0, -1),
             assign_target_res: 0,
             assign_lock_check: true,
@@ -19333,5 +19499,168 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         );
 
         let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn test_p1_2_workflow_dag_composer_reachable_from_tools_menu_and_command_palette() {
+        use super::*;
+        use eframe::egui;
+        use nmr_gui::workbench_mode::{audit_text_layout, MIN_FONT_PX};
+        use nmr_gui::workflow_dag_panel::DagPresetKind;
+
+        let mut app = make_headless_test_app();
+        app.load_builtin_demo_suite();
+        assert!(!app.show_workflow_dag_window);
+
+        let ctx = egui::Context::default();
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+        let run_frame = |ctx: &egui::Context,
+                         app: &mut NmrWorkbenchApp,
+                         events: Vec<egui::Event>|
+         -> egui::FullOutput {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(vp),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let c = ui.ctx().clone();
+                    app.draw_phase9_modals(&c);
+                    app.draw_workflow_dag_window(&c);
+                    let mut shell = std::mem::take(&mut app.responsive_shell);
+                    let _ = render_responsive_workbench(ui, 200, &mut shell, app);
+                    app.responsive_shell = shell;
+                },
+            );
+            out.textures_delta.clear();
+            out
+        };
+
+        // 1. Reachability via `Tools` menu -> `Workflow DAG Composer`
+        let _ = run_frame(&ctx, &mut app, Vec::new());
+        let out0 = run_frame(&ctx, &mut app, Vec::new());
+        let audit0 = audit_text_layout(&out0.shapes, vp);
+        let tools_btn = audit0
+            .texts
+            .iter()
+            .find(|t| t.text.trim() == "Tools")
+            .expect("header must render Tools menu button");
+        let tools_pos = tools_btn.rect.center();
+        let _ = run_frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(tools_pos),
+                egui::Event::PointerButton {
+                    pos: tools_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: tools_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let out_menu = run_frame(&ctx, &mut app, Vec::new());
+        let audit_menu = audit_text_layout(&out_menu.shapes, vp);
+        let dag_item = audit_menu
+            .texts
+            .iter()
+            .find(|t| t.text.contains("Workflow DAG Composer"))
+            .expect("Tools menu must contain Workflow DAG Composer item");
+        let dag_pos = dag_item.rect.center();
+        let _ = run_frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(dag_pos),
+                egui::Event::PointerButton {
+                    pos: dag_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: dag_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            app.show_workflow_dag_window,
+            "clicking Tools -> Workflow DAG Composer must open WorkflowDagPanel window"
+        );
+
+        // 2. Reachability via `Cmd/Ctrl+K` Command Palette -> `"Workflow DAG Composer"` + Enter
+        app.show_workflow_dag_window = false;
+        app.command_palette.open_palette();
+        app.command_palette.set_query("Workflow DAG Composer");
+        let _ = run_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            app.show_workflow_dag_window,
+            "Cmd/Ctrl+K query 'Workflow DAG Composer' + Enter must open WorkflowDagPanel window"
+        );
+        assert!(!app.command_palette.open);
+
+        // 3. Load a preset inside the open NmrWorkbenchApp WorkflowDagPanel & verify compiled manifest
+        app.workflow_dag_panel.load_preset(DagPresetKind::Dynamics);
+        let _ = run_frame(&ctx, &mut app, Vec::new());
+        let out_dag = run_frame(&ctx, &mut app, Vec::new());
+        let manifest = app
+            .workflow_dag_panel
+            .compiled_result
+            .as_ref()
+            .expect("Dynamics preset must compile to a valid ferric-dag-v1 manifest");
+        assert_eq!(manifest.schema, "ferric-dag-v1");
+        assert_eq!(manifest.manifest_sha256.len(), 64);
+        assert_eq!(manifest.nodes.len(), 6);
+        assert!(app.workflow_dag_panel.last_telemetry.is_valid);
+        assert_eq!(app.workflow_dag_panel.last_telemetry.nodes_drawn, 6);
+
+        let trace1 = app
+            .workflow_dag_panel
+            .run_dry_run()
+            .expect("dry run succeeds");
+        assert_eq!(trace1.executed_count, 6);
+        let trace2 = app
+            .workflow_dag_panel
+            .run_dry_run()
+            .expect("cached dry run succeeds");
+        assert_eq!(trace2.cache_hit_count, 6);
+
+        let audit_dag = audit_text_layout(&out_dag.shapes, vp);
+        assert!(
+            audit_dag.min_font_px >= MIN_FONT_PX - 1e-3,
+            "font floor violated with Workflow DAG Composer open: {}",
+            audit_dag.min_font_px
+        );
+        assert!(
+            audit_dag
+                .texts
+                .iter()
+                .any(|t| t.text.contains("Workflow DAG Composer")),
+            "expected open Workflow DAG Composer window title"
+        );
+        assert!(
+            audit_dag.texts.iter().any(|t| t.text.contains("Valid DAG")),
+            "expected Valid DAG status banner inside open Workflow DAG Composer window"
+        );
     }
 }

@@ -478,6 +478,7 @@ fn test_theme_palette_zero_emojis_and_no_panics_in_production_sources() {
             "workflow_dag_panel.rs",
             include_str!("../src/workflow_dag_panel.rs"),
         ),
+        ("dag_cmd.rs", include_str!("../../nmr-cli/src/dag_cmd.rs")),
     ] {
         for forbidden in [".unwrap(", ".expect(", "panic!(", "unsafe "] {
             assert!(

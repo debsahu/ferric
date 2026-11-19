@@ -7,10 +7,12 @@ use std::collections::BTreeMap;
 
 use nmr_core::workflow_dag::{
     compile_dag_manifest, dag_from_json, dag_to_json, execute_dag_manifest,
-    execute_dag_manifest_dry_run, manifest_to_json, preset_backbone_assignment_dag,
-    preset_dynamics_relax_cest_dag, preset_metabolomics_1d_dag, validate_candidate_edge,
-    validate_dag, DagArtifactCache, DagEdge, DagError, DagNode, NodeKind, PortDirection, PortType,
-    StepStatus, WorkflowDag, DAG_MANIFEST_SCHEMA, MAX_DAG_EDGES, MAX_DAG_JSON_BYTES, MAX_DAG_NODES,
+    execute_dag_manifest_dry_run, execute_dag_manifest_real, manifest_from_json, manifest_to_json,
+    preset_backbone_assignment_dag, preset_by_name, preset_dynamics_relax_cest_dag,
+    preset_metabolomics_1d_dag, validate_candidate_edge, validate_dag, verify_dag_manifest,
+    CachedArtifact, DagArtifactCache, DagEdge, DagError, DagNode, DagRunOptions, NodeKind,
+    PortDirection, PortType, StepStatus, WorkflowDag, DAG_MANIFEST_SCHEMA, MAX_DAG_EDGES,
+    MAX_DAG_JSON_BYTES, MAX_DAG_NODES,
 };
 
 fn is_valid_sha256_hex(s: &str) -> bool {
@@ -447,7 +449,7 @@ fn test_hostile_bounds_control_chars_and_path_traversal_rejected() {
 }
 
 #[test]
-fn test_adversarial_multibyte_utf8_manifest_sha_no_panic() {
+fn test_adversarial_multibyte_utf8_manifest_sha_fails_closed_without_panic() {
     let mut manifest =
         compile_dag_manifest(&preset_metabolomics_1d_dag()).expect("compile metabolomics preset");
     // Multi-byte UTF-8 character straddling byte offset 12 (11 ASCII bytes + 2-byte U+00E9)
@@ -457,10 +459,208 @@ fn test_adversarial_multibyte_utf8_manifest_sha_no_panic() {
     manifest.nodes[0].node_sha256 = crafted_sha;
 
     let mut cache = DagArtifactCache::new();
-    let trace =
-        execute_dag_manifest_dry_run(&manifest, &mut cache).expect("dry-run must not panic");
-    assert_eq!(trace.executed_count, manifest.nodes.len());
-    assert!(trace.steps[0].summary.contains("aaaaaaaaaaa\u{00E9}"));
+    let err = execute_dag_manifest_dry_run(&manifest, &mut cache)
+        .expect_err("forged multibyte UTF-8 manifest digest must fail closed");
+    assert!(
+        matches!(err, DagError::ManifestIntegrityMismatch { .. }),
+        "expected ManifestIntegrityMismatch, got {err:?}"
+    );
+    assert!(err.to_string().contains("aaaaaaaaaaa\u{00E9}"));
+}
+
+#[test]
+fn test_p1_3_manifest_integrity_rejects_reversed_nodes_forged_hashes_and_reloads_cleanly() {
+    let dag = preset_backbone_assignment_dag();
+    let manifest = compile_dag_manifest(&dag).expect("compile backbone preset");
+
+    // 1. Claude's exact adversarial probe:
+    //    Reverse nodes AND set every node_sha256 = "forged" with a pre-poisoned cache.
+    //    MUST fail closed with Err(DagError::ManifestIntegrityMismatch), NEVER Ok(executed=1, cache_hit=4).
+    let mut forged = manifest.clone();
+    forged.nodes.reverse();
+    for node in &mut forged.nodes {
+        node.node_sha256 = "forged".to_string();
+    }
+    let mut poisoned_cache = DagArtifactCache::new();
+    poisoned_cache.insert(CachedArtifact {
+        node_sha256: "forged".to_string(),
+        kind: NodeKind::ExportNefReport,
+        output_digest: "stale".to_string(),
+        summary: "stale cached output".to_string(),
+    });
+    assert!(
+        matches!(
+            execute_dag_manifest_dry_run(&forged, &mut poisoned_cache),
+            Err(DagError::ManifestIntegrityMismatch { .. })
+        ),
+        "reversed + forged node_sha256 manifest must be rejected fail-closed"
+    );
+
+    // 2. Reversed nodes alone (even with valid node_sha256 values) must be rejected
+    let mut reversed_only = manifest.clone();
+    reversed_only.nodes.reverse();
+    assert!(matches!(
+        verify_dag_manifest(&reversed_only),
+        Err(DagError::ManifestIntegrityMismatch { .. })
+    ));
+    assert!(matches!(
+        execute_dag_manifest_dry_run(&reversed_only, &mut poisoned_cache),
+        Err(DagError::ManifestIntegrityMismatch { .. })
+    ));
+
+    // 3. Forged manifest_sha256 alone must be rejected
+    let mut forged_manifest_sha = manifest.clone();
+    forged_manifest_sha.manifest_sha256 = "0".repeat(64);
+    assert!(matches!(
+        execute_dag_manifest_dry_run(&forged_manifest_sha, &mut poisoned_cache),
+        Err(DagError::ManifestIntegrityMismatch { .. })
+    ));
+
+    // 4. Mutated node param without recompiling must be rejected
+    let mut mutated_param = manifest.clone();
+    mutated_param.nodes[2]
+        .params
+        .insert("snr_threshold".to_string(), serde_json::json!(99.0));
+    assert!(matches!(
+        execute_dag_manifest_dry_run(&mutated_param, &mut poisoned_cache),
+        Err(DagError::ManifestIntegrityMismatch { .. })
+    ));
+
+    // 5. Tampered upstream_sha256 input binding must be rejected
+    let mut tampered_binding = manifest.clone();
+    tampered_binding.nodes[1].inputs[0].upstream_sha256 = "deadbeef".to_string();
+    assert!(matches!(
+        execute_dag_manifest_dry_run(&tampered_binding, &mut poisoned_cache),
+        Err(DagError::ManifestIntegrityMismatch { .. })
+    ));
+
+    // 6. manifest_to_json -> manifest_from_json round-trip verifies integrity and re-executes cleanly
+    let json = manifest_to_json(&manifest).expect("serialize valid manifest");
+    let reloaded = manifest_from_json(&json).expect("reload and verify valid manifest");
+    assert_eq!(reloaded, manifest);
+
+    let mut clean_cache = DagArtifactCache::new();
+    let t1 = execute_dag_manifest_dry_run(&reloaded, &mut clean_cache).expect("run 1");
+    assert_eq!(t1.executed_count, 5);
+    assert_eq!(t1.cache_hit_count, 0);
+    let t2 = execute_dag_manifest_dry_run(&reloaded, &mut clean_cache).expect("run 2");
+    assert_eq!(t2.executed_count, 0);
+    assert_eq!(t2.cache_hit_count, 5);
+
+    // 7. manifest_from_json rejects forged JSON and oversized JSON fail-closed
+    let forged_json = manifest_to_json(&forged).expect("serialize forged manifest for probe");
+    assert!(matches!(
+        manifest_from_json(&forged_json),
+        Err(DagError::ManifestIntegrityMismatch { .. })
+    ));
+    let huge_json = " ".repeat(MAX_DAG_JSON_BYTES + 1);
+    assert_eq!(
+        manifest_from_json(&huge_json),
+        Err(DagError::JsonTooLarge {
+            bytes: MAX_DAG_JSON_BYTES + 1,
+            max: MAX_DAG_JSON_BYTES,
+        })
+    );
+}
+
+#[test]
+fn test_real_stage_execution_backbone_and_metabolomics_and_fail_closed_missing_input() {
+    assert!(preset_by_name("backbone").is_some());
+    assert!(preset_by_name("dynamics").is_some());
+    assert!(preset_by_name("metabolomics").is_some());
+    assert!(preset_by_name("unknown").is_none());
+
+    // 1. Fail-closed when no input data, no demo fixture, and not dry-run
+    let bb_manifest =
+        compile_dag_manifest(&preset_backbone_assignment_dag()).expect("compile backbone");
+    let mut empty_cache = DagArtifactCache::new();
+    let missing_err =
+        execute_dag_manifest_real(&bb_manifest, &mut empty_cache, &DagRunOptions::default())
+            .expect_err("must fail closed without input data or demo flag");
+    assert!(matches!(missing_err, DagError::ExecutionFailed { .. }));
+
+    // 2. Real execution on synthetic_ubiquitin.str with real output directory artifacts
+    let star_text = include_str!("../../../data/fixtures/synthetic_ubiquitin.str").to_string();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("ferric_dag_real_core_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let opts = DagRunOptions {
+        star_text: Some(star_text),
+        output_dir: Some(tmp_dir.clone()),
+        seed: 0,
+        max_runs: Some(4),
+        max_steps_per_system: Some(250),
+        ..DagRunOptions::default()
+    };
+    let mut cache = DagArtifactCache::new();
+    let out1 = execute_dag_manifest_real(&bb_manifest, &mut cache, &opts)
+        .expect("real backbone DAG execution");
+    assert_eq!(out1.trace.executed_count, 5);
+    assert_eq!(out1.trace.cache_hit_count, 0);
+    assert!(
+        out1.trace.steps[2]
+            .summary
+            .contains("peak_pick hsqc_picked="),
+        "PeakPick must report real 2D HSQC pick count: {}",
+        out1.trace.steps[2].summary
+    );
+    assert!(
+        out1.trace.steps[3].summary.contains("backbone_assign"),
+        "BackboneAssign must run real solver: {}",
+        out1.trace.steps[3].summary
+    );
+    let nef_txt = out1.nef_text.as_deref().expect("real NEF text generated");
+    assert!(nef_txt.contains("data_nef_"));
+    let html_txt = out1
+        .report_html
+        .as_deref()
+        .expect("real HTML quality report generated");
+    assert!(html_txt.contains("<html") || html_txt.contains("<!DOCTYPE html>"));
+    assert_eq!(out1.written_files.len(), 2);
+    for rel in &out1.written_files {
+        let fpath = tmp_dir.join(rel);
+        assert!(
+            fpath.is_file(),
+            "expected written artifact {}",
+            fpath.display()
+        );
+    }
+    let metrics = out1.metrics_json.as_ref().expect("real metrics_json");
+    assert_eq!(metrics["n_residues"].as_u64(), Some(76));
+    assert!(metrics["n_assigned"].as_u64().unwrap_or(0) > 10);
+
+    // Repeat run hits cache for all 5 stages
+    let out2 = execute_dag_manifest_real(&bb_manifest, &mut cache, &opts)
+        .expect("cached repeat real backbone DAG execution");
+    assert_eq!(out2.trace.executed_count, 0);
+    assert_eq!(out2.trace.cache_hit_count, 5);
+
+    // 3. Real metabolomics 1D chemometrics execution with explicit demo fixture
+    let metab_manifest =
+        compile_dag_manifest(&preset_metabolomics_1d_dag()).expect("compile metabolomics");
+    let mut metab_cache = DagArtifactCache::new();
+    let metab_out = execute_dag_manifest_real(
+        &metab_manifest,
+        &mut metab_cache,
+        &DagRunOptions {
+            use_demo_fixture: true,
+            seed: 42,
+            ..DagRunOptions::default()
+        },
+    )
+    .expect("real metabolomics DAG execution");
+    assert_eq!(metab_out.trace.executed_count, 4);
+    assert!(metab_out
+        .artifacts
+        .contains_key("metabolomics_summary.json"));
+    let m_metrics = metab_out
+        .metrics_json
+        .as_ref()
+        .expect("metabolomics metrics_json");
+    assert!(m_metrics["n_samples"].as_u64().unwrap_or(0) >= 8);
+    assert!(m_metrics["n_buckets"].as_u64().unwrap_or(0) > 10);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 #[test]
