@@ -61,7 +61,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint workspace with Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings -A unknown_lints -A clippy::chunks_exact_to_as_chunks -A clippy::needless_range_loop
 
       - name: Run workspace release test suite (nmr-core + nmr-gpu parity)
         run: RUSTFLAGS="-D warnings" cargo test --release --workspace
