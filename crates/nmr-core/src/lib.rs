@@ -74,6 +74,7 @@ pub mod spinsystems;
 pub mod stereospec;
 pub mod struct_shifts;
 pub mod structure;
+pub mod titration_2d;
 pub mod topology;
 pub mod torsion_db;
 pub mod water;
