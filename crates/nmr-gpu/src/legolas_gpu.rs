@@ -11,12 +11,13 @@
 //!   DOI: `10.1039/C6SC05720A`) — ANI-1 radial and modified angular `AEV` descriptors.
 //! - Behler, J. & Parrinello, M. (*Phys. Rev. Lett.* **2007**, 98, 146401).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bytemuck::{Pod, Zeroable};
 use nmr_core::legolas_shifts::{
-    validate_atoms, AevConfig, AtomShiftPrediction, LegolasAtom, LegolasMlp, LegolasModel,
-    NucleusEnsemble, NucleusShiftEstimate, TargetNucleus,
+    validate_atoms, AevConfig, AtomShiftPrediction, LegolasAtom, LegolasError, LegolasMlp,
+    LegolasModel, LegolasPredictOptions, NucleusEnsemble, NucleusShiftEstimate, TargetNucleus,
+    MAX_LEGOLAS_ATOMS_PER_CELL, MAX_LEGOLAS_NEIGHBORS_PER_ATOM, MIN_PAIR_DIST_ANGSTROM,
 };
 use wgpu::util::DeviceExt;
 
@@ -43,7 +44,7 @@ struct AevParamsGpu {
     n_zeta: u32,
     n_theta: u32,
     rad_dim: u32,
-    _pad0: u32,
+    angular_formula: u32,
     r_cut_radial: f32,
     r_cut_angular: f32,
     _pad1: f32,
@@ -142,6 +143,88 @@ struct PreparedAtomScene {
     bucket_starts: Vec<u32>,
     sorted_atoms: Vec<u32>,
     bucket_mask: u32,
+    cells: HashMap<(i32, i32, i32), Vec<usize>>,
+}
+
+impl PreparedAtomScene {
+    /// Enforce `MAX_LEGOLAS_NEIGHBORS_PER_ATOM` for every queried atom prior to GPU dispatch
+    /// (`22.12:P2-2`), preventing quadratic angular TDR hangs on dense hostile coordinate inputs.
+    fn validate_query_neighbor_caps(
+        &self,
+        atoms: &[LegolasAtom],
+        query_indices: &[usize],
+        cfg: &AevConfig,
+    ) -> Result<(), String> {
+        let r_cut_rad_sq = cfg.r_cut_radial * cfg.r_cut_radial;
+        let r_cut_ang_sq = cfg.r_cut_angular * cfg.r_cut_angular;
+        let min_dist_sq = MIN_PAIR_DIST_ANGSTROM * MIN_PAIR_DIST_ANGSTROM;
+
+        for &q in query_indices {
+            if q >= atoms.len() {
+                return Err(format!(
+                    "query atom index {q} out of range (n_atoms={})",
+                    atoms.len()
+                ));
+            }
+            let c = self.gpu_cells[q];
+            let mut coarse_total = 0usize;
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        if let Some(bucket) = self.cells.get(&(c.cx + dx, c.cy + dy, c.cz + dz)) {
+                            coarse_total = coarse_total.saturating_add(bucket.len());
+                        }
+                    }
+                }
+            }
+            if coarse_total <= MAX_LEGOLAS_NEIGHBORS_PER_ATOM {
+                continue;
+            }
+            let pos_i = atoms[q].position;
+            let mut rad_count = 0usize;
+            let mut ang_count = 0usize;
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let Some(bucket) = self.cells.get(&(c.cx + dx, c.cy + dy, c.cz + dz))
+                        else {
+                            continue;
+                        };
+                        for &j in bucket {
+                            if j == q {
+                                continue;
+                            }
+                            let pos_j = atoms[j].position;
+                            let vx = pos_j[0] - pos_i[0];
+                            let vy = pos_j[1] - pos_i[1];
+                            let vz = pos_j[2] - pos_i[2];
+                            let r_sq = vx * vx + vy * vy + vz * vz;
+                            if r_sq <= min_dist_sq {
+                                continue;
+                            }
+                            if r_sq <= r_cut_rad_sq {
+                                rad_count += 1;
+                                if rad_count > MAX_LEGOLAS_NEIGHBORS_PER_ATOM {
+                                    return Err(format!(
+                                        "atom {q} radial neighbor count exceeds MAX_LEGOLAS_NEIGHBORS_PER_ATOM ({MAX_LEGOLAS_NEIGHBORS_PER_ATOM})"
+                                    ));
+                                }
+                            }
+                            if r_sq <= r_cut_ang_sq {
+                                ang_count += 1;
+                                if ang_count > MAX_LEGOLAS_NEIGHBORS_PER_ATOM {
+                                    return Err(format!(
+                                        "atom {q} angular neighbor count exceeds MAX_LEGOLAS_NEIGHBORS_PER_ATOM ({MAX_LEGOLAS_NEIGHBORS_PER_ATOM})"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn prepare_atom_scene(atoms: &[LegolasAtom], cfg: &AevConfig) -> Result<PreparedAtomScene, String> {
@@ -175,6 +258,7 @@ fn prepare_atom_scene(atoms: &[LegolasAtom], cfg: &AevConfig) -> Result<Prepared
     let mut gpu_cells = Vec::with_capacity(n);
     let mut atom_buckets = Vec::with_capacity(n);
     let mut counts = vec![0u32; num_buckets];
+    let mut cells: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::with_capacity(n);
 
     for (idx, a) in atoms.iter().enumerate() {
         let rx = a.position[0] - centroid[0];
@@ -197,6 +281,15 @@ fn prepare_atom_scene(atoms: &[LegolasAtom], cfg: &AevConfig) -> Result<Prepared
         let cx = cx_f as i32;
         let cy = cy_f as i32;
         let cz = cz_f as i32;
+
+        let cell_entry = cells.entry((cx, cy, cz)).or_default();
+        cell_entry.push(idx);
+        if cell_entry.len() > MAX_LEGOLAS_ATOMS_PER_CELL {
+            return Err(format!(
+                "GPU spatial cell ({cx}, {cy}, {cz}) occupancy ({}) exceeds MAX_LEGOLAS_ATOMS_PER_CELL ({MAX_LEGOLAS_ATOMS_PER_CELL}; MAX_LEGOLAS_NEIGHBORS_PER_ATOM = {MAX_LEGOLAS_NEIGHBORS_PER_ATOM})",
+                cell_entry.len()
+            ));
+        }
 
         gpu_atoms.push(GpuAtom {
             x: rx as f32,
@@ -239,6 +332,7 @@ fn prepare_atom_scene(atoms: &[LegolasAtom], cfg: &AevConfig) -> Result<Prepared
         bucket_starts,
         sorted_atoms,
         bucket_mask,
+        cells,
     })
 }
 
@@ -468,7 +562,7 @@ impl<'a> LegolasGpuEngine<'a> {
                 .map_err(|_| "n_theta exceeds u32".to_string())?,
             rad_dim: u32::try_from(cfg.radial_dim())
                 .map_err(|_| "rad_dim exceeds u32".to_string())?,
-            _pad0: 0,
+            angular_formula: cfg.angular_formula.gpu_code(),
             r_cut_radial: cfg.r_cut_radial as f32,
             r_cut_angular: cfg.r_cut_angular as f32,
             _pad1: 0.0,
@@ -848,6 +942,7 @@ impl<'a> LegolasGpuEngine<'a> {
             return Ok(Vec::new());
         }
         let scene = prepare_atom_scene(atoms, cfg)?;
+        scene.validate_query_neighbor_caps(atoms, query_indices, cfg)?;
         let aev_dim = cfg.total_dim();
         let aev_buf = self.dispatch_aev_into_buffer(&scene, query_indices, cfg)?;
         let flat: Vec<f32> = self
@@ -940,15 +1035,35 @@ impl<'a> LegolasGpuEngine<'a> {
 
     /// Async (`wasm32`-compatible) end-to-end WebGPU `AEV + MLP` backbone chemical-shift prediction.
     ///
-    /// Keeps computed AEV tensors resident on GPU between `compute_aev` and `mlp_layer_forward`
-    /// and returns predictions in exact atom-index order matching `LegolasModel::predict_atoms`.
-    pub async fn predict_atoms_gpu_async(
+    /// **Fails closed** with `Err(LegolasError::UntrainedWeights { .. })` whenever
+    /// `!model.metadata.weights_trained` (`22.12:P1-1`).
+    pub async fn predict_shifts_gpu_async(
         &self,
         model: &LegolasModel,
         atoms: &[LegolasAtom],
-    ) -> Result<Vec<AtomShiftPrediction>, String> {
-        model.validate()?;
-        validate_atoms(atoms)?;
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        self.predict_shifts_gpu_with_options_async(model, atoms, &LegolasPredictOptions::default())
+            .await
+    }
+
+    /// Async (`wasm32`-compatible) end-to-end WebGPU `AEV + MLP` backbone chemical-shift prediction
+    /// with explicit inference options.
+    ///
+    /// Keeps computed AEV tensors resident on GPU between `compute_aev` and `mlp_layer_forward`
+    /// and returns predictions in exact atom-index order matching `LegolasModel::predict_shifts`.
+    pub async fn predict_shifts_gpu_with_options_async(
+        &self,
+        model: &LegolasModel,
+        atoms: &[LegolasAtom],
+        options: &LegolasPredictOptions,
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        model.validate().map_err(LegolasError::Validation)?;
+        if !model.metadata.weights_trained && !options.allow_untrained_for_testing {
+            return Err(LegolasError::UntrainedWeights {
+                provenance: model.metadata.weights_provenance.clone(),
+            });
+        }
+        validate_atoms(atoms).map_err(LegolasError::Validation)?;
 
         let mut by_nucleus: BTreeMap<TargetNucleus, Vec<usize>> = BTreeMap::new();
         for (idx, atom) in atoms.iter().enumerate() {
@@ -962,7 +1077,13 @@ impl<'a> LegolasGpuEngine<'a> {
             return Ok(Vec::new());
         }
 
-        let scene = prepare_atom_scene(atoms, &model.aev_config)?;
+        let scene =
+            prepare_atom_scene(atoms, &model.aev_config).map_err(LegolasError::Validation)?;
+        for indices in by_nucleus.values() {
+            scene
+                .validate_query_neighbor_caps(atoms, indices, &model.aev_config)
+                .map_err(LegolasError::Validation)?;
+        }
         let mut results: Vec<AtomShiftPrediction> = Vec::new();
 
         for (nuc, indices) in by_nucleus {
@@ -980,10 +1101,13 @@ impl<'a> LegolasGpuEngine<'a> {
             let chunk_q = (MAX_MLP_JOBS_PER_DISPATCH / jobs_per_query).max(1);
 
             for chunk in indices.chunks(chunk_q) {
-                let aev_buf = self.dispatch_aev_into_buffer(&scene, chunk, &model.aev_config)?;
+                let aev_buf = self
+                    .dispatch_aev_into_buffer(&scene, chunk, &model.aev_config)
+                    .map_err(LegolasError::Gpu)?;
                 let estimates = self
                     .evaluate_ensemble_on_aev_buffer(ens, &aev_buf, chunk.len())
-                    .await?;
+                    .await
+                    .map_err(LegolasError::Gpu)?;
                 for (&atom_idx, estimate) in chunk.iter().zip(estimates) {
                     let atom = &atoms[atom_idx];
                     results.push(AtomShiftPrediction {
@@ -1000,13 +1124,67 @@ impl<'a> LegolasGpuEngine<'a> {
         Ok(results)
     }
 
-    /// Synchronous native end-to-end WebGPU `AEV + MLP` backbone chemical-shift prediction.
+    /// Synchronous native end-to-end WebGPU `AEV + MLP` backbone chemical-shift prediction
+    /// (fails closed on untrained weights).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn predict_shifts_gpu(
+        &self,
+        model: &LegolasModel,
+        atoms: &[LegolasAtom],
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        pollster::block_on(self.predict_shifts_gpu_async(model, atoms))
+    }
+
+    /// Synchronous native end-to-end WebGPU `AEV + MLP` prediction with explicit options.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn predict_shifts_gpu_with_options(
+        &self,
+        model: &LegolasModel,
+        atoms: &[LegolasAtom],
+        options: &LegolasPredictOptions,
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        pollster::block_on(self.predict_shifts_gpu_with_options_async(model, atoms, options))
+    }
+
+    /// Async (`wasm32`-compatible) alias for `predict_shifts_gpu_async` (fails closed on untrained
+    /// weights).
+    pub async fn predict_atoms_gpu_async(
+        &self,
+        model: &LegolasModel,
+        atoms: &[LegolasAtom],
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        self.predict_shifts_gpu_async(model, atoms).await
+    }
+
+    /// Async (`wasm32`-compatible) alias for `predict_shifts_gpu_with_options_async`.
+    pub async fn predict_atoms_gpu_with_options_async(
+        &self,
+        model: &LegolasModel,
+        atoms: &[LegolasAtom],
+        options: &LegolasPredictOptions,
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        self.predict_shifts_gpu_with_options_async(model, atoms, options)
+            .await
+    }
+
+    /// Synchronous native alias for `predict_shifts_gpu` (fails closed on untrained weights).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn predict_atoms_gpu(
         &self,
         model: &LegolasModel,
         atoms: &[LegolasAtom],
-    ) -> Result<Vec<AtomShiftPrediction>, String> {
-        pollster::block_on(self.predict_atoms_gpu_async(model, atoms))
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        self.predict_shifts_gpu(model, atoms)
+    }
+
+    /// Synchronous native alias for `predict_shifts_gpu_with_options`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn predict_atoms_gpu_with_options(
+        &self,
+        model: &LegolasModel,
+        atoms: &[LegolasAtom],
+        options: &LegolasPredictOptions,
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        self.predict_shifts_gpu_with_options(model, atoms, options)
     }
 }

@@ -42,8 +42,20 @@ pub const NUM_SPECIES: usize = 5;
 /// Number of unordered neighbor species pairs `C(5 + 1, 2) = 15`.
 pub const NUM_SPECIES_PAIRS: usize = 15;
 
+/// Canonical provenance string carried by untrained / randomly initialized architectures
+/// without bundled upstream weights (`22.12:P1-1`).
+pub const UNTRAINED_WEIGHTS_PROVENANCE: &str = "untrained-architecture-no-bundled-weights";
+
 /// Hard DoS ceiling on atom count accepted by `LEGOLAS` AEV and shift evaluation.
 pub const MAX_LEGOLAS_ATOMS: usize = 65_536;
+
+/// Hard DoS ceiling on radial or angular neighbors per query atom (`22.12:P2-2`), preventing
+/// `O(N^2)` three-body angular blowup on dense hostile coordinate inputs.
+pub const MAX_LEGOLAS_NEIGHBORS_PER_ATOM: usize = 256;
+
+/// Hard DoS ceiling on atoms occupying a single spatial hash cell (`22.12:P2-2`), preventing
+/// coincident-atom bucket-scan quadratic blowup on hostile coordinate inputs.
+pub const MAX_LEGOLAS_ATOMS_PER_CELL: usize = 1024;
 
 /// Hard coordinate magnitude cap (Angstroms) preventing integer cell-index overflow on hostile input.
 pub const MAX_LEGOLAS_COORD_ANGSTROM: f64 = 1_000_000.0;
@@ -65,6 +77,47 @@ pub const MAX_LEGOLAS_AEV_DIM: usize = 4096;
 
 /// Minimum nonzero interatomic distance (Angstroms) guarded against coincident-atom `0/0`.
 pub const MIN_PAIR_DIST_ANGSTROM: f64 = 1e-12;
+
+/// Structured errors returned by `LEGOLAS` chemical-shift prediction and validation (`22.12:P1-1`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LegolasError {
+    /// Refused to predict chemical shifts from an untrained / randomly initialized model without
+    /// verified trained weights.
+    UntrainedWeights { provenance: String },
+    /// Configuration, coordinate, neighbor-cap, or model validation failed.
+    Validation(String),
+    /// Weight bundle serialization, deserialization, or SHA-256 verification failed.
+    Bundle(String),
+    /// WebGPU device-limit or compute dispatch error.
+    Gpu(String),
+}
+
+impl std::fmt::Display for LegolasError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UntrainedWeights { provenance } => write!(
+                f,
+                "refusing LEGOLAS chemical-shift prediction with untrained weights (weights_provenance={provenance:?}); load verified trained weights or opt into allow_untrained_for_testing for numerical parity tests"
+            ),
+            Self::Validation(msg) => write!(f, "LEGOLAS validation error: {msg}"),
+            Self::Bundle(msg) => write!(f, "LEGOLAS bundle error: {msg}"),
+            Self::Gpu(msg) => write!(f, "LEGOLAS GPU error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for LegolasError {}
+
+/// Explicit inference options for `LegolasModel` / `LegolasGpuEngine`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct LegolasPredictOptions {
+    /// Explicit test-only opt-in to run forward inference on an untrained / random-initialized
+    /// architecture (e.g. for SE(3) or CPU/GPU numerical parity checks).
+    ///
+    /// Defaults to `false`: standard inference MUST fail closed with
+    /// `Err(LegolasError::UntrainedWeights { .. })` when `!model.metadata.weights_trained`.
+    pub allow_untrained_for_testing: bool,
+}
 
 /// Biomolecular chemical element species resolved by ANI-AEV radial and angular channels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -113,14 +166,148 @@ impl Species {
         }
     }
 
-    /// Infer biomolecular species (`H`, `C`, `N`, `O`, `S`) from a PDB/mmCIF atom or element name.
-    pub fn from_atom_or_element_name(name: &str) -> Option<Self> {
+    /// Parse an explicit PDB/mmCIF element symbol (`cols 77-78` or `_atom_site.type_symbol`)
+    /// into one of the five biomolecular ANI species (`H`, `C`, `N`, `O`, `S`).
+    ///
+    /// Rejects all 2-character metal/halide/metalloid symbols (`NA`, `CA`, `MG`, `ZN`, `FE`,
+    /// `CL`, `BR`, `CU`, `SE`, `CO`, `CD`, `NI`, `HG`, `OS`, etc.) as `None`.
+    pub fn from_element_symbol(element: &str) -> Option<Self> {
+        let trimmed = element.trim();
+        let sym = trimmed.trim_end_matches(|c: char| c.is_ascii_digit() || c == '+' || c == '-');
+        if sym.is_empty() {
+            return None;
+        }
+        let up = sym.to_ascii_uppercase();
+        match up.as_str() {
+            "H" | "D" => Some(Self::H),
+            "C" => Some(Self::C),
+            "N" => Some(Self::N),
+            "O" => Some(Self::O),
+            "S" => Some(Self::S),
+            _ => None,
+        }
+    }
+
+    /// Infer biomolecular species (`H`, `C`, `N`, `O`, `S`) from full PDB/mmCIF atom context.
+    ///
+    /// Precedence:
+    /// 1. Explicit `element` column (`cols 77-78` / `_atom_site.type_symbol`) when present and non-empty.
+    /// 2. For `HETATM` records or non-standard-amino-acid residues (e.g. `CA`, `NA`, `MG`, `ZN`,
+    ///    `FE`, `CL`, `BR`, `CU`), 2-character element symbols are checked before 1-character
+    ///    fallback so ions are never misparsed as `C` or `N`.
+    /// 3. For standard polymer amino-acid `ATOM` records, unambiguous 2-character non-biomolecular
+    ///    elements (`NA`, `CL`, `CU`, `CO`, `SE`, `MG`, `ZN`, `FE`, `BR`, etc.) and left-aligned
+    ///    4-character PDB 2-letter element fields (`"CA  "`) are still rejected before falling back
+    ///    to the leading element letter (`CA`/`CD`/`CE` -> `C`, `NE`/`ND1` -> `N`, `HG`/`HE` -> `H`).
+    pub fn from_pdb_atom(
+        element: Option<&str>,
+        atom_name: &str,
+        residue_name: Option<&str>,
+        is_hetatm: bool,
+    ) -> Option<Self> {
+        if let Some(el) = element.map(str::trim).filter(|s| !s.is_empty()) {
+            return Self::from_element_symbol(el);
+        }
+        let is_std_aa = residue_name.is_some_and(is_standard_amino_acid_residue);
+        if is_hetatm || (residue_name.is_some() && !is_std_aa) {
+            return Self::from_hetatm_or_ion_name(atom_name);
+        }
+        Self::from_atom_or_element_name(atom_name)
+    }
+
+    /// Infer biomolecular species from a `HETATM` / ion atom name, checking all 2-character
+    /// periodic-table symbols (including `CA`, `NA`, `CL`, `CU`, `CO`, `CD`, `CE`, `NE`, `ND`,
+    /// `HE`, `HG`, `SE`, `OS`, `MG`, `ZN`, `FE`, `BR`, etc.) before 1-character fallback.
+    fn from_hetatm_or_ion_name(name: &str) -> Option<Self> {
         let trimmed = name.trim();
-        let first_alpha = trimmed
-            .bytes()
-            .find(|b| b.is_ascii_alphabetic())
-            .map(|b| b.to_ascii_uppercase())?;
-        match first_alpha {
+        if trimmed.is_empty() {
+            return None;
+        }
+        let up = trimmed.to_ascii_uppercase();
+        let bytes = up.as_bytes();
+        // Leading digit + H/D (e.g. "1H", "2H2") is a hydrogen naming convention.
+        if bytes.len() >= 2 && bytes[0].is_ascii_digit() {
+            return match bytes[1] {
+                b'H' | b'D' => Some(Self::H),
+                _ => None,
+            };
+        }
+        let alpha_prefix: String = up.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+        if alpha_prefix.is_empty() {
+            return None;
+        }
+        if alpha_prefix.len() >= 2 && is_two_char_non_hcnos_element(&alpha_prefix[..2]) {
+            return None;
+        }
+        match alpha_prefix.as_bytes()[0] {
+            b'H' | b'D' => Some(Self::H),
+            b'C' => Some(Self::C),
+            b'N' => Some(Self::N),
+            b'O' => Some(Self::O),
+            b'S' => Some(Self::S),
+            _ => None,
+        }
+    }
+
+    /// Infer biomolecular species (`H`, `C`, `N`, `O`, `S`) from a PDB/mmCIF atom or element name.
+    ///
+    /// Checks PDB fixed-column left-aligned 2-char ions (e.g. `"CA  "` vs `" CA "`) and
+    /// unambiguous 2-character metal/halide/metalloid symbols (`NA`, `CL`, `CU`, `CO`, `CR`,
+    /// `CS`, `MG`, `ZN`, `FE`, `BR`, `NI`, `SE`, `SI`, `SR`, `SN`, `SB`, `SC`, `SM`, `OS`, `HF`,
+    /// etc.) before falling back to the 1-character biomolecular symbol. When an explicit
+    /// PDB/mmCIF `element` column or `HETATM` flag is available, prefer `Self::from_pdb_atom` or
+    /// `Self::from_element_symbol`.
+    pub fn from_atom_or_element_name(name: &str) -> Option<Self> {
+        // PDB 4-char fixed-width convention: cols 13-14 left-aligned 2-letter element with
+        // trailing spaces ("CA  " = Calcium ion; whereas " CA " = alpha-carbon).
+        if name.len() == 4 {
+            let b = name.as_bytes();
+            if b[0].is_ascii_alphabetic()
+                && b[1].is_ascii_alphabetic()
+                && b[2] == b' '
+                && b[3] == b' '
+            {
+                let sym = format!(
+                    "{}{}",
+                    (b[0] as char).to_ascii_uppercase(),
+                    (b[1] as char).to_ascii_uppercase()
+                );
+                if is_two_char_non_hcnos_element(&sym) {
+                    return None;
+                }
+            }
+        }
+
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let up = trimmed.to_ascii_uppercase();
+        let bytes = up.as_bytes();
+
+        // Leading digit (e.g. "1HB", "2HD1", "3HG2") is standard PDB proton nomenclature.
+        if bytes[0].is_ascii_digit() {
+            let first_alpha = bytes.iter().copied().find(|b| b.is_ascii_alphabetic())?;
+            return match first_alpha {
+                b'H' | b'D' => Some(Self::H),
+                _ => None,
+            };
+        }
+
+        let alpha_prefix: String = up.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+        if alpha_prefix.is_empty() {
+            return None;
+        }
+
+        // Reject unambiguous 2-character metal/halide/metalloid symbols that never occur as
+        // standard protein backbone/sidechain atom names before 1-character fallback.
+        if alpha_prefix.len() >= 2
+            && is_unambiguous_two_char_non_protein_element(&alpha_prefix[..2])
+        {
+            return None;
+        }
+
+        match alpha_prefix.as_bytes()[0] {
             b'H' | b'D' => Some(Self::H),
             b'C' => Some(Self::C),
             b'N' => Some(Self::N),
@@ -141,6 +328,112 @@ impl Species {
         let (lo, hi) = if ia <= ib { (ia, ib) } else { (ib, ia) };
         (lo * (2 * NUM_SPECIES + 1 - lo)) / 2 + (hi - lo)
     }
+}
+
+/// True for standard proteinogenic amino-acid 3-letter residue codes (plus common protonation
+/// and NMR/crystallographic aliases like `HID`, `HIE`, `HIP`, `CYX`, `MSE`).
+fn is_standard_amino_acid_residue(res_name: &str) -> bool {
+    let up = res_name.trim().to_ascii_uppercase();
+    matches!(
+        up.as_str(),
+        "ALA"
+            | "ARG"
+            | "ASN"
+            | "ASP"
+            | "CYS"
+            | "GLN"
+            | "GLU"
+            | "GLY"
+            | "HIS"
+            | "ILE"
+            | "LEU"
+            | "LYS"
+            | "MET"
+            | "PHE"
+            | "PRO"
+            | "SER"
+            | "THR"
+            | "TRP"
+            | "TYR"
+            | "VAL"
+            | "HID"
+            | "HIE"
+            | "HIP"
+            | "HSD"
+            | "HSE"
+            | "HSP"
+            | "CYX"
+            | "CYM"
+            | "ASH"
+            | "GLH"
+            | "LYN"
+            | "MSE"
+            | "SEC"
+            | "PYL"
+    )
+}
+
+/// Two-character periodic-table element symbols that are NOT in `{H, C, N, O, S}` and can never
+/// appear as valid standard protein atom names (`NA`, `CL`, `CU`, `CO`, `SE`, `MG`, `ZN`, `FE`,
+/// `BR`, etc.).
+fn is_unambiguous_two_char_non_protein_element(sym2: &str) -> bool {
+    matches!(
+        sym2,
+        "NA" | "CL"
+            | "CU"
+            | "CO"
+            | "CR"
+            | "CS"
+            | "CF"
+            | "CM"
+            | "CN"
+            | "MG"
+            | "ZN"
+            | "FE"
+            | "BR"
+            | "NI"
+            | "NB"
+            | "NP"
+            | "NO"
+            | "SE"
+            | "SI"
+            | "SR"
+            | "SN"
+            | "SB"
+            | "SC"
+            | "SM"
+            | "OS"
+            | "HF"
+            | "MN"
+            | "MO"
+            | "BA"
+            | "BE"
+            | "BI"
+            | "AG"
+            | "AL"
+            | "AR"
+            | "AS"
+            | "AU"
+            | "LI"
+            | "PB"
+            | "PD"
+            | "PT"
+            | "RB"
+            | "RU"
+            | "TI"
+            | "TL"
+            | "XE"
+            | "ZR"
+    )
+}
+
+/// Complete set of two-character periodic-table element symbols relevant to `HETATM` / ion /
+/// explicit-element parsing (includes `CA`, `CD`, `CE`, `NE`, `ND`, `HE`, `HG`, `HO`, which
+/// collide with standard protein atom names like alpha/delta/epsilon carbon or amide/sidechain
+/// protons/nitrogens only inside polymer `ATOM` records).
+fn is_two_char_non_hcnos_element(sym2: &str) -> bool {
+    is_unambiguous_two_char_non_protein_element(sym2)
+        || matches!(sym2, "CA" | "CD" | "CE" | "NE" | "ND" | "HE" | "HG" | "HO")
 }
 
 /// Six canonical protein backbone NMR target nuclei predicted by `LEGOLAS`.
@@ -299,6 +592,45 @@ impl LegolasAtom {
     }
 }
 
+/// Angular evaluation convention for ANI-AEV three-body angles `theta_ijk`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AngularFormula {
+    /// Exact geometric angle `atan2(||d_ij x d_ik||, d_ij . d_ik)` (Kahan's formula; matches
+    /// exact Smith et al. 2017 derivation to machine epsilon).
+    #[default]
+    ExactAtan2,
+    /// TorchANI / upstream LEGOLAS numerical convention `acos(0.95 * cos(theta_ijk))`
+    /// (Gao et al. *J. Chem. Inf. Model.* 2020), keeping `d(acos)/d(cos)` bounded away from `+-1`.
+    TorchAniAcos095,
+}
+
+impl AngularFormula {
+    #[inline]
+    pub const fn gpu_code(self) -> u32 {
+        match self {
+            Self::ExactAtan2 => 0,
+            Self::TorchAniAcos095 => 1,
+        }
+    }
+
+    #[inline]
+    pub const fn bin_code(self) -> u8 {
+        match self {
+            Self::ExactAtan2 => 0,
+            Self::TorchAniAcos095 => 1,
+        }
+    }
+
+    #[inline]
+    pub const fn from_bin_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::ExactAtan2),
+            1 => Some(Self::TorchAniAcos095),
+            _ => None,
+        }
+    }
+}
+
 /// Parameterization of the ANI-1 / LEGOLAS radial and modified angular Atomic Environment Vector.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AevConfig {
@@ -318,11 +650,15 @@ pub struct AevConfig {
     pub zeta_angular: Vec<f64>,
     /// Angular phase shifts `theta_s` in radians.
     pub theta_s_angular: Vec<f64>,
+    /// Three-body angle convention (`ExactAtan2` vs TorchANI `acos(0.95 * cos(theta))`).
+    #[serde(default)]
+    pub angular_formula: AngularFormula,
 }
 
 impl AevConfig {
     /// Standard ANI-1 / LEGOLAS 5-species (`H, C, N, O, S`) AEV configuration:
-    /// `5 * 16 = 80` radial + `15 * 4 * 8 = 480` angular = `560` total features.
+    /// `5 * 16 = 80` radial + `15 * 4 * 8 = 480` angular = `560` total features
+    /// (exact geometric `atan2` angle convention).
     pub fn ani1_standard() -> Self {
         let r_cut_radial = 5.2;
         let r_cut_angular = 3.5;
@@ -347,11 +683,20 @@ impl AevConfig {
             rs_angular,
             zeta_angular: vec![32.0],
             theta_s_angular,
+            angular_formula: AngularFormula::ExactAtan2,
         }
     }
 
+    /// Standard ANI-1x / TorchANI / upstream LEGOLAS 5-species (`H, C, N, O, S`) AEV configuration
+    /// using TorchANI's `acos(0.95 * cos(theta))` angular convention (ready for upstream weight
+    /// loading).
+    pub fn torchani_standard() -> Self {
+        Self::ani1_standard().with_angular_formula(AngularFormula::TorchAniAcos095)
+    }
+
     /// Compact 5-species (`H, C, N, O, S`) AEV configuration for fast CPU/GPU evaluation and
-    /// online training (`5 * 8 = 40` radial + `15 * 3 * 4 = 180` angular = `220` total features).
+    /// synthetic self-consistency testing (`5 * 8 = 40` radial + `15 * 3 * 4 = 180` angular = `220`
+    /// total features).
     pub fn compact() -> Self {
         let r_cut_radial = 5.2;
         let r_cut_angular = 3.5;
@@ -376,7 +721,14 @@ impl AevConfig {
             rs_angular,
             zeta_angular: vec![16.0],
             theta_s_angular,
+            angular_formula: AngularFormula::ExactAtan2,
         }
+    }
+
+    /// Return a copy of this `AevConfig` using the specified `AngularFormula`.
+    pub fn with_angular_formula(mut self, angular_formula: AngularFormula) -> Self {
+        self.angular_formula = angular_formula;
+        self
     }
 
     #[inline]
@@ -584,11 +936,19 @@ fn evaluate_single_aev_from_neighbors(
     for (a, nj) in ang_nbrs.iter().enumerate() {
         for nk in ang_nbrs.iter().skip(a + 1) {
             let dot = nj.dx * nk.dx + nj.dy * nk.dy + nj.dz * nk.dz;
-            let cx = nj.dy * nk.dz - nj.dz * nk.dy;
-            let cy = nj.dz * nk.dx - nj.dx * nk.dz;
-            let cz = nj.dx * nk.dy - nj.dy * nk.dx;
-            let cross_norm = (cx * cx + cy * cy + cz * cz).sqrt();
-            let theta = cross_norm.atan2(dot);
+            let theta = match cfg.angular_formula {
+                AngularFormula::ExactAtan2 => {
+                    let cx = nj.dy * nk.dz - nj.dz * nk.dy;
+                    let cy = nj.dz * nk.dx - nj.dx * nk.dz;
+                    let cz = nj.dx * nk.dy - nj.dy * nk.dx;
+                    let cross_norm = (cx * cx + cy * cy + cz * cz).sqrt();
+                    cross_norm.atan2(dot)
+                }
+                AngularFormula::TorchAniAcos095 => {
+                    let cos_t = (dot / (nj.r * nk.r).max(1e-24)).clamp(-1.0, 1.0);
+                    (0.95 * cos_t).clamp(-0.95, 0.95).acos()
+                }
+            };
             let r_mid = 0.5 * (nj.r + nk.r);
             let fc_prod = nj.fc_ang * nk.fc_ang;
             let pair_idx = Species::pair_index(nj.species, nk.species);
@@ -660,7 +1020,14 @@ pub fn compute_aevs_for_indices(
     let mut cells: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::with_capacity(atoms.len());
     for (idx, atom) in atoms.iter().enumerate() {
         let key = cell_coords(atom.position, inv_cell_size);
-        cells.entry(key).or_default().push(idx);
+        let bucket = cells.entry(key).or_default();
+        bucket.push(idx);
+        if bucket.len() > MAX_LEGOLAS_ATOMS_PER_CELL {
+            return Err(format!(
+                "spatial cell {key:?} occupancy ({}) exceeds MAX_LEGOLAS_ATOMS_PER_CELL ({MAX_LEGOLAS_ATOMS_PER_CELL}; MAX_LEGOLAS_NEIGHBORS_PER_ATOM = {MAX_LEGOLAS_NEIGHBORS_PER_ATOM})",
+                bucket.len()
+            ));
+        }
     }
 
     let mut out = Vec::with_capacity(query_indices.len());
@@ -696,12 +1063,22 @@ pub fn compute_aevs_for_indices(
                             if r <= cfg.r_cut_radial {
                                 let fc_r = cosine_cutoff(r, cfg.r_cut_radial);
                                 if fc_r > 0.0 {
+                                    if rad_nbrs.len() >= MAX_LEGOLAS_NEIGHBORS_PER_ATOM {
+                                        return Err(format!(
+                                            "atom {i} radial neighbor count exceeds MAX_LEGOLAS_NEIGHBORS_PER_ATOM ({MAX_LEGOLAS_NEIGHBORS_PER_ATOM})"
+                                        ));
+                                    }
                                     rad_nbrs.push((atoms[j].species, r, fc_r));
                                 }
                             }
                             if r <= cfg.r_cut_angular {
                                 let fc_a = cosine_cutoff(r, cfg.r_cut_angular);
                                 if fc_a > 0.0 {
+                                    if ang_nbrs.len() >= MAX_LEGOLAS_NEIGHBORS_PER_ATOM {
+                                        return Err(format!(
+                                            "atom {i} angular neighbor count exceeds MAX_LEGOLAS_NEIGHBORS_PER_ATOM ({MAX_LEGOLAS_NEIGHBORS_PER_ATOM})"
+                                        ));
+                                    }
                                     ang_nbrs.push(AngularNeighbor {
                                         species: atoms[j].species,
                                         dx: vx,
@@ -772,12 +1149,22 @@ pub fn compute_aevs_bruteforce_reference(
             if r <= cfg.r_cut_radial {
                 let fc_r = cosine_cutoff(r, cfg.r_cut_radial);
                 if fc_r > 0.0 {
+                    if rad_nbrs.len() >= MAX_LEGOLAS_NEIGHBORS_PER_ATOM {
+                        return Err(format!(
+                            "atom {i} radial neighbor count exceeds MAX_LEGOLAS_NEIGHBORS_PER_ATOM ({MAX_LEGOLAS_NEIGHBORS_PER_ATOM})"
+                        ));
+                    }
                     rad_nbrs.push((aj.species, r, fc_r));
                 }
             }
             if r <= cfg.r_cut_angular {
                 let fc_a = cosine_cutoff(r, cfg.r_cut_angular);
                 if fc_a > 0.0 {
+                    if ang_nbrs.len() >= MAX_LEGOLAS_NEIGHBORS_PER_ATOM {
+                        return Err(format!(
+                            "atom {i} angular neighbor count exceeds MAX_LEGOLAS_NEIGHBORS_PER_ATOM ({MAX_LEGOLAS_NEIGHBORS_PER_ATOM})"
+                        ));
+                    }
                     ang_nbrs.push(AngularNeighbor {
                         species: aj.species,
                         dx: vx,
@@ -1231,6 +1618,21 @@ impl NucleusEnsemble {
     }
 }
 
+fn validate_trained_weights_provenance(provenance: &str) -> Result<(), String> {
+    let trimmed = provenance.trim();
+    if trimmed.is_empty() {
+        return Err("trained LEGOLAS weights_provenance must be non-empty".to_string());
+    }
+    if trimmed.eq_ignore_ascii_case(UNTRAINED_WEIGHTS_PROVENANCE)
+        || trimmed.to_ascii_lowercase().starts_with("untrained")
+    {
+        return Err(format!(
+            "weights_trained=true contradicts untrained weights_provenance {trimmed:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Descriptive metadata embedded in a `LEGOLAS-V1` model bundle.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegolasModelMetadata {
@@ -1238,16 +1640,48 @@ pub struct LegolasModelMetadata {
     pub provenance: String,
     pub license: String,
     pub ferric_version: String,
+    /// `true` ONLY when numerical weights were trained or loaded from a verified trained bundle.
+    /// Randomly initialized / architecture-only models MUST keep this `false` (`22.12:P1-1`).
+    pub weights_trained: bool,
+    /// Explicit provenance tag for the numerical weights (e.g.
+    /// `"untrained-architecture-no-bundled-weights"` for random initialization).
+    pub weights_provenance: String,
 }
 
 impl Default for LegolasModelMetadata {
     fn default() -> Self {
+        Self::untrained()
+    }
+}
+
+impl LegolasModelMetadata {
+    /// Honest metadata for an untrained / randomly initialized `LEGOLAS` architecture without
+    /// bundled upstream weights (`22.12:P1-1`).
+    pub fn untrained() -> Self {
         Self {
-            model_name: "legolas-ani-aev-backbone".to_string(),
-            provenance: "Clean-room LEGOLAS ANI-AEV (Darrows et al. JCTC 2025; Smith et al. Chem. Sci. 2017)".to_string(),
+            model_name: "legolas-ani-aev-backbone-untrained".to_string(),
+            provenance:
+                "Clean-room LEGOLAS ANI-AEV architecture (untrained; no bundled upstream weights)"
+                    .to_string(),
             license: "MIT".to_string(),
             ferric_version: crate::VERSION.to_string(),
+            weights_trained: false,
+            weights_provenance: UNTRAINED_WEIGHTS_PROVENANCE.to_string(),
         }
+    }
+
+    /// Metadata for a model carrying trained weights with explicit provenance.
+    pub fn trained(weights_provenance: impl Into<String>) -> Result<Self, String> {
+        let wp = weights_provenance.into();
+        validate_trained_weights_provenance(&wp)?;
+        Ok(Self {
+            model_name: "legolas-ani-aev-backbone".to_string(),
+            provenance: "Clean-room LEGOLAS ANI-AEV architecture (Darrows et al. JCTC 2025; Smith et al. Chem. Sci. 2017)".to_string(),
+            license: "MIT".to_string(),
+            ferric_version: crate::VERSION.to_string(),
+            weights_trained: true,
+            weights_provenance: wp,
+        })
     }
 }
 
@@ -1258,6 +1692,9 @@ pub struct LegolasModel {
     pub ensembles: BTreeMap<TargetNucleus, NucleusEnsemble>,
     pub metadata: LegolasModelMetadata,
 }
+
+/// Ergonomic alias for `LegolasModel` as a shift predictor.
+pub type LegolasPredictor = LegolasModel;
 
 /// Predicted chemical shift for one tagged target atom.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1272,13 +1709,20 @@ pub struct AtomShiftPrediction {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LegolasWeightBundle {
     pub format: String,
+    pub weights_trained: bool,
+    pub weights_provenance: String,
     pub payload_sha256: String,
     pub model: LegolasModel,
 }
 
 impl LegolasModel {
-    /// Construct a deterministically seeded model covering all 6 backbone nuclei
+    /// Construct a deterministically seeded **untrained** model covering all 6 backbone nuclei
     /// (`H^N`, `15N`, `13CA`, `13CB`, `13C'`, `1HA`).
+    ///
+    /// Carries `weights_trained = false` and `weights_provenance =
+    /// "untrained-architecture-no-bundled-weights"`. Default prediction calls (`predict_shifts`,
+    /// `predict_atoms`, `predict_structure_model`) fail closed with
+    /// `Err(LegolasError::UntrainedWeights)` until verified trained weights are loaded or trained.
     pub fn new_seeded_all_backbone(
         aev_config: AevConfig,
         hidden_dims: &[usize],
@@ -1305,13 +1749,53 @@ impl LegolasModel {
         Ok(Self {
             aev_config,
             ensembles,
-            metadata: LegolasModelMetadata::default(),
+            metadata: LegolasModelMetadata::untrained(),
         })
     }
 
-    /// Validate AEV config, every nucleus ensemble, layer dimensions, and finiteness.
+    /// Explicit alias for `new_seeded_all_backbone`, emphasizing random untrained initialization.
+    pub fn init_random_all_backbone(
+        aev_config: AevConfig,
+        hidden_dims: &[usize],
+        activation: ActivationKind,
+        n_members: usize,
+        base_seed: u64,
+    ) -> Result<Self, String> {
+        Self::new_seeded_all_backbone(aev_config, hidden_dims, activation, n_members, base_seed)
+    }
+
+    /// True if this model carries verified trained weights (rather than untrained random init).
+    #[inline]
+    pub fn is_trained(&self) -> bool {
+        self.metadata.weights_trained
+    }
+
+    /// Return the explicit weight provenance string recorded in metadata.
+    #[inline]
+    pub fn weights_provenance(&self) -> &str {
+        &self.metadata.weights_provenance
+    }
+
+    /// Mark this model's weights as trained with an explicit non-empty provenance tag.
+    pub fn mark_weights_trained(
+        &mut self,
+        weights_provenance: impl Into<String>,
+    ) -> Result<(), String> {
+        let meta = LegolasModelMetadata::trained(weights_provenance)?;
+        self.metadata = meta;
+        Ok(())
+    }
+
+    /// Validate AEV config, metadata consistency, every nucleus ensemble, layer dimensions, and finiteness.
     pub fn validate(&self) -> Result<(), String> {
         self.aev_config.validate()?;
+        if self.metadata.weights_trained {
+            validate_trained_weights_provenance(&self.metadata.weights_provenance)?;
+        } else if self.metadata.weights_provenance.trim().is_empty() {
+            return Err(
+                "untrained LEGOLAS model must carry non-empty weights_provenance".to_string(),
+            );
+        }
         if self.ensembles.is_empty() {
             return Err("LegolasModel must contain at least one nucleus ensemble".to_string());
         }
@@ -1330,9 +1814,33 @@ impl LegolasModel {
 
     /// Predict backbone chemical shifts and epistemic ensemble uncertainties for all atoms in
     /// `atoms` that carry a `target_nucleus` present in `self.ensembles`.
-    pub fn predict_atoms(&self, atoms: &[LegolasAtom]) -> Result<Vec<AtomShiftPrediction>, String> {
-        self.validate()?;
-        validate_atoms(atoms)?;
+    ///
+    /// **Fails closed** with `Err(LegolasError::UntrainedWeights { .. })` whenever
+    /// `!self.metadata.weights_trained` (`22.12:P1-1`).
+    pub fn predict_shifts(
+        &self,
+        atoms: &[LegolasAtom],
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        self.predict_shifts_with_options(atoms, &LegolasPredictOptions::default())
+    }
+
+    /// Predict backbone chemical shifts with explicit inference options.
+    ///
+    /// Fails closed with `Err(LegolasError::UntrainedWeights { .. })` unless either
+    /// `self.metadata.weights_trained` is `true` or `options.allow_untrained_for_testing` is
+    /// explicitly enabled for numerical/parity testing.
+    pub fn predict_shifts_with_options(
+        &self,
+        atoms: &[LegolasAtom],
+        options: &LegolasPredictOptions,
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        self.validate().map_err(LegolasError::Validation)?;
+        if !self.metadata.weights_trained && !options.allow_untrained_for_testing {
+            return Err(LegolasError::UntrainedWeights {
+                provenance: self.metadata.weights_provenance.clone(),
+            });
+        }
+        validate_atoms(atoms).map_err(LegolasError::Validation)?;
 
         let mut query_indices = Vec::new();
         for (idx, atom) in atoms.iter().enumerate() {
@@ -1346,7 +1854,8 @@ impl LegolasModel {
             return Ok(Vec::new());
         }
 
-        let aevs = compute_aevs_for_indices(atoms, &query_indices, &self.aev_config)?;
+        let aevs = compute_aevs_for_indices(atoms, &query_indices, &self.aev_config)
+            .map_err(LegolasError::Validation)?;
         let mut preds = Vec::with_capacity(query_indices.len());
         for (&atom_idx, aev) in query_indices.iter().zip(aevs.iter()) {
             let atom = &atoms[atom_idx];
@@ -1356,7 +1865,7 @@ impl LegolasModel {
             let Some(ens) = self.ensembles.get(&nuc) else {
                 continue;
             };
-            let estimate = ens.predict_aev(aev)?;
+            let estimate = ens.predict_aev(aev).map_err(LegolasError::Validation)?;
             preds.push(AtomShiftPrediction {
                 atom_index: atom_idx,
                 residue_seq_id: atom.residue_seq_id,
@@ -1367,13 +1876,41 @@ impl LegolasModel {
         Ok(preds)
     }
 
-    /// Extract all `H, C, N, O, S` coordinates from a `StructureModel` and predict backbone shifts.
+    /// Predict backbone chemical shifts for `atoms` (alias for `predict_shifts`; fails closed on
+    /// untrained weights).
+    pub fn predict_atoms(
+        &self,
+        atoms: &[LegolasAtom],
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        self.predict_shifts(atoms)
+    }
+
+    /// Predict backbone chemical shifts for `atoms` with explicit inference options.
+    pub fn predict_atoms_with_options(
+        &self,
+        atoms: &[LegolasAtom],
+        options: &LegolasPredictOptions,
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        self.predict_shifts_with_options(atoms, options)
+    }
+
+    /// Extract all `H, C, N, O, S` coordinates from a `StructureModel` and predict backbone shifts
+    /// (fails closed on untrained weights).
     pub fn predict_structure_model(
         &self,
         model: &StructureModel,
-    ) -> Result<Vec<AtomShiftPrediction>, String> {
-        let atoms = extract_atoms_from_structure_model(model)?;
-        self.predict_atoms(&atoms)
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        self.predict_structure_model_with_options(model, &LegolasPredictOptions::default())
+    }
+
+    /// Extract coordinates from a `StructureModel` and predict backbone shifts with explicit options.
+    pub fn predict_structure_model_with_options(
+        &self,
+        model: &StructureModel,
+        options: &LegolasPredictOptions,
+    ) -> Result<Vec<AtomShiftPrediction>, LegolasError> {
+        let atoms = extract_atoms_from_structure_model(model).map_err(LegolasError::Validation)?;
+        self.predict_shifts_with_options(&atoms, options)
     }
 
     /// Compute the deterministic lowercase hex SHA-256 checksum of this model's canonical payload.
@@ -1392,6 +1929,8 @@ impl LegolasModel {
         let payload_sha256 = sha256_hex(compact_model.as_bytes());
         let bundle = LegolasWeightBundle {
             format: LEGOLAS_BUNDLE_FORMAT_V1.to_string(),
+            weights_trained: self.metadata.weights_trained,
+            weights_provenance: self.metadata.weights_provenance.clone(),
             payload_sha256,
             model: self.clone(),
         };
@@ -1406,8 +1945,8 @@ impl LegolasModel {
         Ok(json)
     }
 
-    /// Deserialize and verify a `LEGOLAS-V1` JSON bundle (format, size cap, schema, finiteness,
-    /// and SHA-256 payload integrity).
+    /// Deserialize and verify a `LEGOLAS-V1` JSON bundle (format, size cap, schema, metadata
+    /// consistency, finiteness, and SHA-256 payload integrity).
     pub fn from_json_bundle(json: &str) -> Result<Self, String> {
         if json.len() > MAX_LEGOLAS_BUNDLE_BYTES {
             return Err(format!(
@@ -1423,6 +1962,18 @@ impl LegolasModel {
             return Err(format!(
                 "unsupported LEGOLAS bundle format {:?} (expected {LEGOLAS_BUNDLE_FORMAT_V1:?})",
                 bundle.format
+            ));
+        }
+        if bundle.weights_trained != bundle.model.metadata.weights_trained {
+            return Err(format!(
+                "LEGOLAS-V1 bundle weights_trained ({}) disagrees with model.metadata.weights_trained ({})",
+                bundle.weights_trained, bundle.model.metadata.weights_trained
+            ));
+        }
+        if bundle.weights_provenance != bundle.model.metadata.weights_provenance {
+            return Err(format!(
+                "LEGOLAS-V1 bundle weights_provenance ({:?}) disagrees with model.metadata.weights_provenance ({:?})",
+                bundle.weights_provenance, bundle.model.metadata.weights_provenance
             ));
         }
         if bundle.payload_sha256 != computed_sha {
@@ -1512,7 +2063,8 @@ pub fn extract_atoms_from_structure_model(
 
         for (raw_name, &pos) in &res.atoms {
             let norm = raw_name.trim().to_ascii_uppercase();
-            let Some(sp) = Species::from_atom_or_element_name(&norm) else {
+            let Some(sp) = Species::from_pdb_atom(None, raw_name, Some(&res.res_name), false)
+            else {
                 continue;
             };
             let target = match norm.as_str() {
@@ -1778,6 +2330,8 @@ pub fn canonical_payload_bytes(model: &LegolasModel) -> Result<Vec<u8>, String> 
     push_str_le(&mut buf, &model.metadata.provenance)?;
     push_str_le(&mut buf, &model.metadata.license)?;
     push_str_le(&mut buf, &model.metadata.ferric_version)?;
+    buf.push(u8::from(model.metadata.weights_trained));
+    push_str_le(&mut buf, &model.metadata.weights_provenance)?;
 
     // AEV config
     push_f64_le(&mut buf, model.aev_config.r_cut_radial);
@@ -1788,6 +2342,7 @@ pub fn canonical_payload_bytes(model: &LegolasModel) -> Result<Vec<u8>, String> 
     push_f64_slice_le(&mut buf, &model.aev_config.rs_angular)?;
     push_f64_slice_le(&mut buf, &model.aev_config.zeta_angular)?;
     push_f64_slice_le(&mut buf, &model.aev_config.theta_s_angular)?;
+    buf.push(model.aev_config.angular_formula.bin_code());
 
     // Ensembles in deterministic BTreeMap key order
     let n_ens = u32::try_from(model.ensembles.len())
@@ -1906,11 +2461,28 @@ fn decode_canonical_payload_bytes(payload: &[u8]) -> Result<LegolasModel, String
             "unsupported binary payload format {format:?} (expected {LEGOLAS_BUNDLE_FORMAT_V1:?})"
         ));
     }
+    let model_name = cur.read_str(512)?;
+    let provenance = cur.read_str(2048)?;
+    let license = cur.read_str(256)?;
+    let ferric_version = cur.read_str(64)?;
+    let trained_flag = cur.read_u8()?;
+    let weights_trained = match trained_flag {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(format!(
+                "invalid weights_trained flag {trained_flag} in binary payload (expected 0 or 1)"
+            ));
+        }
+    };
+    let weights_provenance = cur.read_str(512)?;
     let metadata = LegolasModelMetadata {
-        model_name: cur.read_str(512)?,
-        provenance: cur.read_str(2048)?,
-        license: cur.read_str(256)?,
-        ferric_version: cur.read_str(64)?,
+        model_name,
+        provenance,
+        license,
+        ferric_version,
+        weights_trained,
+        weights_provenance,
     };
 
     let r_cut_radial = cur.read_f64_le()?;
@@ -1921,6 +2493,9 @@ fn decode_canonical_payload_bytes(payload: &[u8]) -> Result<LegolasModel, String
     let rs_angular = cur.read_f64_vec(MAX_LEGOLAS_AEV_DIM)?;
     let zeta_angular = cur.read_f64_vec(MAX_LEGOLAS_AEV_DIM)?;
     let theta_s_angular = cur.read_f64_vec(MAX_LEGOLAS_AEV_DIM)?;
+    let ang_code = cur.read_u8()?;
+    let angular_formula = AngularFormula::from_bin_code(ang_code)
+        .ok_or_else(|| format!("invalid angular_formula code {ang_code} in binary payload"))?;
     let aev_config = AevConfig {
         r_cut_radial,
         r_cut_angular,
@@ -1930,6 +2505,7 @@ fn decode_canonical_payload_bytes(payload: &[u8]) -> Result<LegolasModel, String
         rs_angular,
         zeta_angular,
         theta_s_angular,
+        angular_formula,
     };
     aev_config.validate()?;
 

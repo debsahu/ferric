@@ -8,8 +8,9 @@ use std::path::PathBuf;
 
 use nmr_core::legolas_shifts::{
     compute_aevs_for_indices, extract_atoms_from_structure_model, train_nucleus_ensemble,
-    ActivationKind, AevConfig, LegolasAtom, LegolasMlp, LegolasModel, LegolasModelMetadata,
-    LegolasTrainConfig, NucleusEnsemble, Species, TargetNucleus,
+    ActivationKind, AevConfig, LegolasAtom, LegolasError, LegolasMlp, LegolasModel,
+    LegolasModelMetadata, LegolasPredictOptions, LegolasTrainConfig, NucleusEnsemble, Species,
+    TargetNucleus, MAX_LEGOLAS_ATOMS, MAX_LEGOLAS_NEIGHBORS_PER_ATOM, UNTRAINED_WEIGHTS_PROVENANCE,
 };
 use nmr_core::struct_shifts::StructureModel;
 use nmr_gpu::legolas_gpu::LegolasGpuEngine;
@@ -97,6 +98,9 @@ fn test_legolas_gpu_aev_and_ensemble_mlp_parity_all_activations() {
     );
 
     // 2. End-to-end AEV + Ensemble MLP parity for CELU, GELU, and SiLU across all 6 nuclei
+    let test_opts = LegolasPredictOptions {
+        allow_untrained_for_testing: true,
+    };
     let activations = [
         ActivationKind::Celu { alpha: 0.1 },
         ActivationKind::Gelu,
@@ -112,9 +116,22 @@ fn test_legolas_gpu_aev_and_ensemble_mlp_parity_all_activations() {
         )
         .expect("seeded model");
 
-        let cpu_preds = model.predict_atoms(&atoms).expect("CPU predict_atoms");
+        // Regression guard (22.12:P1-1): default GPU predict_shifts_gpu MUST fail closed on untrained weights!
+        let err = legolas_gpu
+            .predict_shifts_gpu(&model, &atoms)
+            .expect_err("untrained model must fail closed on default predict_shifts_gpu");
+        assert_eq!(
+            err,
+            LegolasError::UntrainedWeights {
+                provenance: UNTRAINED_WEIGHTS_PROVENANCE.to_string()
+            }
+        );
+
+        let cpu_preds = model
+            .predict_atoms_with_options(&atoms, &test_opts)
+            .expect("CPU predict_atoms");
         let gpu_preds = legolas_gpu
-            .predict_atoms_gpu(&model, &atoms)
+            .predict_atoms_gpu_with_options(&model, &atoms, &test_opts)
             .expect("GPU predict_atoms_gpu");
         assert_eq!(cpu_preds.len(), gpu_preds.len());
         assert!(
@@ -227,9 +244,14 @@ fn test_legolas_gpu_se3_large_translation_and_rotation_parity() {
     )
     .expect("model");
 
-    let cpu_base = model.predict_atoms(&base_atoms).expect("CPU base");
+    let test_opts = LegolasPredictOptions {
+        allow_untrained_for_testing: true,
+    };
+    let cpu_base = model
+        .predict_atoms_with_options(&base_atoms, &test_opts)
+        .expect("CPU base");
     let gpu_moved = legolas_gpu
-        .predict_atoms_gpu(&model, &moved_atoms)
+        .predict_atoms_gpu_with_options(&model, &moved_atoms, &test_opts)
         .expect("GPU moved");
 
     assert_eq!(cpu_base.len(), gpu_moved.len());
@@ -302,7 +324,10 @@ fn test_legolas_gpu_trained_bundle_and_heterogeneous_ensemble_parity() {
     let model = LegolasModel {
         aev_config: cfg,
         ensembles,
-        metadata: LegolasModelMetadata::default(),
+        metadata: LegolasModelMetadata::trained(
+            "synthetic-aev-oracle-parity-test [synthetic self-consistency; not BMRB empirical validation]",
+        )
+        .expect("trained metadata"),
     };
 
     // Roundtrip through both JSON and binary LEGOLAS-V1 bundles
@@ -311,9 +336,9 @@ fn test_legolas_gpu_trained_bundle_and_heterogeneous_ensemble_parity() {
     let bin = reloaded.to_binary_bundle().expect("bin bundle");
     let reloaded_bin = LegolasModel::from_binary_bundle(&bin).expect("reload bin");
 
-    let cpu_preds = reloaded_bin.predict_atoms(&atoms).expect("CPU preds");
+    let cpu_preds = reloaded_bin.predict_shifts(&atoms).expect("CPU preds");
     let gpu_preds = legolas_gpu
-        .predict_atoms_gpu(&reloaded_bin, &atoms)
+        .predict_shifts_gpu(&reloaded_bin, &atoms)
         .expect("GPU preds");
     assert_eq!(cpu_preds.len(), gpu_preds.len());
     assert!(!cpu_preds.is_empty());
@@ -326,5 +351,84 @@ fn test_legolas_gpu_trained_bundle_and_heterogeneous_ensemble_parity() {
     assert!(
         max_diff < 1e-4,
         "GPU trained/heterogeneous bundle parity diff {max_diff:.3e} >= 1e-4"
+    );
+}
+
+#[test]
+fn test_legolas_gpu_torchani_acos095_parity_and_neighbor_cap() {
+    // [synthetic self-consistency] Verify WebGPU parity (< 1e-4) for TorchANI's
+    // acos(0.95 * cos(theta)) angular convention AND fail-closed neighbor/cell DoS caps (22.12:P2-2).
+    let engine = match GpuEngine::new_headless() {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("Skipping WebGPU LEGOLAS TorchANI test (no GPU adapter available): {err}");
+            return;
+        }
+    };
+    let legolas_gpu = LegolasGpuEngine::new(&engine);
+
+    let pdb = fixture_path("ubiquitin_1ubq_xray.pdb");
+    let struct_model = StructureModel::parse_file(&pdb, false).expect("parse 1UBQ PDB");
+    let atoms = extract_atoms_from_structure_model(&struct_model).expect("extract 1UBQ");
+    let query_indices: Vec<usize> = atoms
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| a.target_nucleus.map(|_| i))
+        .take(80)
+        .collect();
+
+    let cfg_torch = AevConfig::torchani_standard();
+    let cpu_aevs = compute_aevs_for_indices(&atoms, &query_indices, &cfg_torch).expect("CPU AEVs");
+    let gpu_aevs = legolas_gpu
+        .compute_aevs_gpu(&atoms, &query_indices, &cfg_torch)
+        .expect("GPU AEVs");
+
+    let mut max_diff = 0.0_f64;
+    for (ca, ga) in cpu_aevs.iter().zip(gpu_aevs.iter()) {
+        for (&c, &g) in ca.iter().zip(ga.iter()) {
+            assert!(g.is_finite());
+            max_diff = max_diff.max((c - (g as f64)).abs());
+        }
+    }
+    println!(
+        "LEGOLAS TorchANI acos(0.95*cos) CPU f64 vs WebGPU f32 (1UBQ, {} queries, 560 dims): max_diff = {max_diff:.3e}",
+        query_indices.len()
+    );
+    assert!(
+        max_diff < 1e-4,
+        "GPU TorchANI AEV max diff {max_diff:.3e} >= 1e-4"
+    );
+
+    // Dense > MAX_LEGOLAS_NEIGHBORS_PER_ATOM cluster must fail closed before GPU dispatch
+    let dense_n = MAX_LEGOLAS_NEIGHBORS_PER_ATOM + 16;
+    let dense_cluster: Vec<LegolasAtom> = (0..dense_n)
+        .map(|i| {
+            let t = i as f64;
+            LegolasAtom::new(
+                Species::C,
+                [
+                    0.01 * (t % 17.0),
+                    0.01 * ((t / 17.0).floor() % 17.0),
+                    0.01 * (t / 289.0).floor(),
+                ],
+            )
+        })
+        .collect();
+    let dense_err = legolas_gpu
+        .compute_aevs_gpu(&dense_cluster, &[0], &AevConfig::compact())
+        .expect_err("GPU must fail closed on dense > MAX_LEGOLAS_NEIGHBORS_PER_ATOM input");
+    assert!(
+        dense_err.contains("MAX_LEGOLAS_NEIGHBORS_PER_ATOM"),
+        "unexpected GPU error: {dense_err}"
+    );
+
+    // Dense 65,536-atom hostile cluster must fail closed before GPU dispatch
+    let hostile_65k = vec![LegolasAtom::new(Species::C, [0.0, 0.0, 0.0]); MAX_LEGOLAS_ATOMS];
+    let err_65k = legolas_gpu
+        .compute_aevs_gpu(&hostile_65k, &[0], &AevConfig::compact())
+        .expect_err("GPU must fail closed on dense 65k-atom hostile input");
+    assert!(
+        err_65k.contains("MAX_LEGOLAS_ATOMS_PER_CELL"),
+        "unexpected GPU error: {err_65k}"
     );
 }

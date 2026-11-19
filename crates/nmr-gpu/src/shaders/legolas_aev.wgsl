@@ -22,7 +22,7 @@ struct AevParamsGpu {
     n_zeta: u32,
     n_theta: u32,
     rad_dim: u32,
-    _pad0: u32,
+    angular_formula: u32,
     r_cut_radial: f32,
     r_cut_angular: f32,
     _pad1: f32,
@@ -251,7 +251,17 @@ fn compute_aev(@builtin(global_invocation_id) gid: vec3<u32>) {
                                             continue;
                                         }
 
-                                        let theta = atan2(length(cross(d_ij, d_ik)), dot(d_ij, d_ik));
+                                        var theta: f32;
+                                        if (aev_params.angular_formula == 1u) {
+                                            let cos_t = clamp(
+                                                dot(d_ij, d_ik) / max(r_ij * r_ik, 1e-12),
+                                                -1.0,
+                                                1.0
+                                            );
+                                            theta = acos(clamp(0.95 * cos_t, -0.95, 0.95));
+                                        } else {
+                                            theta = atan2(length(cross(d_ij, d_ik)), dot(d_ij, d_ik));
+                                        }
                                         let r_mid = 0.5 * (r_ij + r_ik);
                                         let fc_prod = fc_a_j * fc_a_k;
                                         let pair_idx = species_pair_index(aj.species, ak.species);

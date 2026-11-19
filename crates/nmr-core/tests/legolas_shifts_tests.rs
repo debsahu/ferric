@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use nmr_core::legolas_shifts::{
     compute_aevs_bruteforce_reference, compute_aevs_for_indices, compute_all_aevs, cosine_cutoff,
     extract_atoms_from_structure_model, mlp_forward_and_gradients, train_nucleus_ensemble,
-    ActivationKind, AevConfig, LegolasAtom, LegolasMlp, LegolasModel, LegolasTrainConfig,
-    NucleusEnsemble, Species, TargetNucleus, MAX_LEGOLAS_ATOMS,
+    ActivationKind, AevConfig, AngularFormula, LegolasAtom, LegolasError, LegolasMlp, LegolasModel,
+    LegolasModelMetadata, LegolasPredictOptions, LegolasTrainConfig, NucleusEnsemble, Species,
+    TargetNucleus, MAX_LEGOLAS_ATOMS, MAX_LEGOLAS_NEIGHBORS_PER_ATOM, UNTRAINED_WEIGHTS_PROVENANCE,
 };
 use nmr_core::rng::Rng;
 use nmr_core::struct_shifts::StructureModel;
@@ -169,9 +170,14 @@ fn test_aev_and_shifts_exact_se3_and_permutation_invariance() {
         2026_1119,
     )
     .expect("seeded model");
+    let test_opts = LegolasPredictOptions {
+        allow_untrained_for_testing: true,
+    };
 
     let base_aevs = compute_all_aevs(&atoms, &cfg).expect("base AEVs");
-    let base_preds = model.predict_atoms(&atoms).expect("base predictions");
+    let base_preds = model
+        .predict_atoms_with_options(&atoms, &test_opts)
+        .expect("base predictions");
     assert!(base_preds.len() >= 40, "expected backbone predictions");
 
     // 1. Arbitrary 3D translation + SO(3) rotation
@@ -189,7 +195,7 @@ fn test_aev_and_shifts_exact_se3_and_permutation_invariance() {
 
     let se3_aevs = compute_all_aevs(&transformed, &cfg).expect("SE(3) AEVs");
     let se3_preds = model
-        .predict_atoms(&transformed)
+        .predict_atoms_with_options(&transformed, &test_opts)
         .expect("SE(3) predictions");
 
     let mut max_aev_se3 = 0.0_f64;
@@ -230,7 +236,7 @@ fn test_aev_and_shifts_exact_se3_and_permutation_invariance() {
     let permuted_atoms: Vec<LegolasAtom> = perm.iter().map(|&old| atoms[old].clone()).collect();
     let perm_aevs = compute_all_aevs(&permuted_atoms, &cfg).expect("permuted AEVs");
     let perm_preds = model
-        .predict_atoms(&permuted_atoms)
+        .predict_atoms_with_options(&permuted_atoms, &test_opts)
         .expect("permuted predictions");
 
     let mut max_aev_perm = 0.0_f64;
@@ -403,11 +409,13 @@ fn test_mlp_backprop_finite_difference_gradients_all_activations() {
 }
 
 #[test]
-fn test_online_adam_training_and_ensemble_epistemic_uncertainty() {
-    // [synthetic self-consistency] / [dev-set]:
-    // Train a compact E=5 LEGOLAS CELU ensemble on multi-conformer 1UBQ CA geometries using real
-    // analytical-backprop Adam, verifying MSE & RMSE reduction and epistemic uncertainty widening
-    // on perturbed out-of-distribution geometries.
+fn test_synthetic_aev_oracle_backprop_and_adam_convergence() {
+    // Synthetic AEV-oracle backpropagation & Adam convergence check
+    // [synthetic self-consistency; not BMRB empirical validation]:
+    // Fits a compact E=5 CELU ensemble to a deterministic synthetic linear+tanh oracle over
+    // jittered 1UBQ CA AEVs (14 residues, 0.04 A jitter), verifying Adam optimization convergence
+    // and ensemble variance widening on strongly distorted OOD geometries. This checks gradient
+    // and optimizer mechanics only; it is NOT empirical BMRB chemical-shift validation.
     let pdb = fixture_path("ubiquitin_1ubq_xray.pdb");
     let struct_model = StructureModel::parse_file(&pdb, false).expect("parse 1UBQ PDB");
     let base_atoms = extract_atoms_from_structure_model(&struct_model).expect("extract 1UBQ atoms");
@@ -564,12 +572,24 @@ fn test_legolas_v1_json_and_binary_bundle_roundtrip_and_hostile_rejection() {
     )
     .expect("model");
     let atoms = synthetic_five_species_cluster();
-    let ref_preds = model.predict_atoms(&atoms).expect("ref preds");
+    let test_opts = LegolasPredictOptions {
+        allow_untrained_for_testing: true,
+    };
+    let ref_preds = model
+        .predict_atoms_with_options(&atoms, &test_opts)
+        .expect("ref preds");
 
     // 1. JSON roundtrip (both pretty-printed and minified preserve SHA-256 integrity)
     let json = model.to_json_bundle().expect("serialize JSON");
     let loaded_json = LegolasModel::from_json_bundle(&json).expect("deserialize JSON");
-    let json_preds = loaded_json.predict_atoms(&atoms).expect("json preds");
+    assert!(!loaded_json.is_trained());
+    assert_eq!(
+        loaded_json.weights_provenance(),
+        UNTRAINED_WEIGHTS_PROVENANCE
+    );
+    let json_preds = loaded_json
+        .predict_atoms_with_options(&atoms, &test_opts)
+        .expect("json preds");
     for (a, b) in ref_preds.iter().zip(json_preds.iter()) {
         assert!((a.estimate.mean_ppm - b.estimate.mean_ppm).abs() < 1e-13);
         assert!((a.estimate.sigma_ens_ppm - b.estimate.sigma_ens_ppm).abs() < 1e-13);
@@ -584,12 +604,22 @@ fn test_legolas_v1_json_and_binary_bundle_roundtrip_and_hostile_rejection() {
         loaded_bin.payload_sha256().expect("sha2")
     );
 
-    // 3. Tamper detection (JSON)
+    // 3. Tamper detection (JSON: payload & outer envelope)
     let tampered_json = json.replacen("\"output_mean\": 8.25", "\"output_mean\": 8.26", 1);
     assert_ne!(tampered_json, json, "expected tamper replacement to apply");
     let err = LegolasModel::from_json_bundle(&tampered_json)
         .expect_err("tampered JSON must fail SHA-256 verification");
     assert!(err.contains("SHA-256"), "unexpected error: {err}");
+
+    let forged_envelope =
+        json.replacen("\"weights_trained\": false", "\"weights_trained\": true", 1);
+    assert_ne!(forged_envelope, json);
+    let env_err = LegolasModel::from_json_bundle(&forged_envelope)
+        .expect_err("forging outer bundle weights_trained must fail validation");
+    assert!(
+        env_err.contains("weights_trained"),
+        "unexpected error: {env_err}"
+    );
 
     // 4. Tamper detection (binary)
     let mut tampered_bin = bin.clone();
@@ -629,14 +659,360 @@ fn test_legolas_v1_json_and_binary_bundle_roundtrip_and_hostile_rejection() {
     // 7. Hostile atom count & coordinate caps
     let mut nan_atoms = atoms.clone();
     nan_atoms[0].position[1] = f64::NAN;
-    assert!(model.predict_atoms(&nan_atoms).is_err());
+    assert!(model
+        .predict_atoms_with_options(&nan_atoms, &test_opts)
+        .is_err());
 
     let mut huge_coord_atoms = atoms.clone();
     huge_coord_atoms[0].position[0] = 1e9;
-    assert!(model.predict_atoms(&huge_coord_atoms).is_err());
+    assert!(model
+        .predict_atoms_with_options(&huge_coord_atoms, &test_opts)
+        .is_err());
 
     let oversized = vec![LegolasAtom::new(Species::C, [0.0, 0.0, 0.0]); MAX_LEGOLAS_ATOMS + 1];
     let cap_err = compute_aevs_for_indices(&oversized, &[0], &cfg)
         .expect_err("oversized atom slice must fail MAX_LEGOLAS_ATOMS cap");
     assert!(cap_err.contains("MAX_LEGOLAS_ATOMS"));
+}
+
+#[test]
+fn test_untrained_model_fails_closed_on_default_predict_shifts() {
+    // Regression test for 22.12:P1-1: untrained / init_random predictors MUST carry
+    // weights_trained=false, weights_provenance="untrained-architecture-no-bundled-weights",
+    // and fail closed with Err(LegolasError::UntrainedWeights) on default predict_shifts,
+    // predict_atoms, and predict_structure_model.
+    let cfg = AevConfig::compact();
+    let mut model = LegolasModel::init_random_all_backbone(
+        cfg,
+        &[16, 8],
+        ActivationKind::Celu { alpha: 0.1 },
+        3,
+        12345,
+    )
+    .expect("init_random model");
+    assert!(!model.is_trained());
+    assert_eq!(model.weights_provenance(), UNTRAINED_WEIGHTS_PROVENANCE);
+    assert!(!model.metadata.weights_trained);
+    assert_eq!(
+        model.metadata.weights_provenance,
+        "untrained-architecture-no-bundled-weights"
+    );
+
+    let atoms = synthetic_five_species_cluster();
+    let err_shifts = model
+        .predict_shifts(&atoms)
+        .expect_err("untrained model must fail closed on predict_shifts");
+    assert_eq!(
+        err_shifts,
+        LegolasError::UntrainedWeights {
+            provenance: UNTRAINED_WEIGHTS_PROVENANCE.to_string()
+        }
+    );
+
+    let err_atoms = model
+        .predict_atoms(&atoms)
+        .expect_err("untrained model must fail closed on predict_atoms");
+    assert!(matches!(err_atoms, LegolasError::UntrainedWeights { .. }));
+
+    let pdb = fixture_path("ubiquitin_1ubq_xray.pdb");
+    let struct_model = StructureModel::parse_file(&pdb, false).expect("parse 1UBQ PDB");
+    let err_struct = model
+        .predict_structure_model(&struct_model)
+        .expect_err("untrained model must fail closed on predict_structure_model");
+    assert!(matches!(err_struct, LegolasError::UntrainedWeights { .. }));
+
+    // Untrained bundle roundtrip must stay untrained and continue failing closed
+    let json = model.to_json_bundle().expect("serialize untrained JSON");
+    assert!(json.contains("\"weights_trained\": false"));
+    assert!(json.contains(UNTRAINED_WEIGHTS_PROVENANCE));
+    let reloaded_json = LegolasModel::from_json_bundle(&json).expect("reload untrained JSON");
+    assert!(matches!(
+        reloaded_json.predict_shifts(&atoms),
+        Err(LegolasError::UntrainedWeights { .. })
+    ));
+
+    let bin = model.to_binary_bundle().expect("serialize untrained bin");
+    let reloaded_bin = LegolasModel::from_binary_bundle(&bin).expect("reload untrained bin");
+    assert!(matches!(
+        reloaded_bin.predict_shifts(&atoms),
+        Err(LegolasError::UntrainedWeights { .. })
+    ));
+
+    // Contradictory metadata (weights_trained=true with untrained provenance) must fail validation
+    let mut bad_meta = model.clone();
+    bad_meta.metadata.weights_trained = true;
+    assert!(bad_meta.validate().is_err());
+    assert!(LegolasModelMetadata::trained("").is_err());
+    assert!(LegolasModelMetadata::trained(UNTRAINED_WEIGHTS_PROVENANCE).is_err());
+
+    // Explicit opt-in allows numerical testing on untrained weights
+    let opt_preds = model
+        .predict_shifts_with_options(
+            &atoms,
+            &LegolasPredictOptions {
+                allow_untrained_for_testing: true,
+            },
+        )
+        .expect("opt-in testing prediction");
+    assert!(!opt_preds.is_empty());
+
+    // Marking weights trained with verified provenance enables default predict_shifts & survives bundles
+    model
+        .mark_weights_trained("synthetic-unit-test-trained-provenance")
+        .expect("mark trained");
+    assert!(model.is_trained());
+    let trained_preds = model
+        .predict_shifts(&atoms)
+        .expect("trained predict_shifts");
+    assert_eq!(trained_preds.len(), opt_preds.len());
+
+    let trained_bin = model.to_binary_bundle().expect("serialize trained bin");
+    let reloaded_trained = LegolasModel::from_binary_bundle(&trained_bin).expect("reload trained");
+    assert!(reloaded_trained.is_trained());
+    assert_eq!(
+        reloaded_trained.weights_provenance(),
+        "synthetic-unit-test-trained-provenance"
+    );
+    assert!(reloaded_trained.predict_shifts(&atoms).is_ok());
+}
+
+#[test]
+fn test_species_element_parsing_rejects_metal_ions_and_preserves_protein_atoms() {
+    // Regression test for P2 element-from-atom-name parsing (legolas_shifts.rs:117):
+    // Metal ions and halides (NA, CA HETATM/ion, MG, ZN, FE, CL, BR, CU, SE, etc.) must NEVER
+    // be misparsed as N, C, or S.
+
+    // 1. Explicit element column (PDB cols 77-78 / mmCIF _atom_site.type_symbol)
+    assert_eq!(Species::from_element_symbol("H"), Some(Species::H));
+    assert_eq!(Species::from_element_symbol("D"), Some(Species::H));
+    assert_eq!(Species::from_element_symbol("C"), Some(Species::C));
+    assert_eq!(Species::from_element_symbol("N1+"), Some(Species::N));
+    assert_eq!(Species::from_element_symbol("O1-"), Some(Species::O));
+    assert_eq!(Species::from_element_symbol("S"), Some(Species::S));
+    for ion in [
+        "NA", "NA+", "CA", "CA2+", "MG", "MG2+", "ZN", "ZN2+", "FE", "FE3+", "CL", "CL-", "BR",
+        "CU", "CU2+", "CO", "NI", "SE", "HG", "OS", "CD", "CS", "MN", "K", "P",
+    ] {
+        assert_eq!(
+            Species::from_element_symbol(ion),
+            None,
+            "explicit element symbol {ion:?} must not map to HCNOS"
+        );
+    }
+
+    // 2. Full PDB/mmCIF context: explicit element column wins over atom name
+    assert_eq!(
+        Species::from_pdb_atom(Some("CA"), "CA", Some("CA"), true),
+        None
+    );
+    assert_eq!(
+        Species::from_pdb_atom(Some("C"), "CA", Some("ALA"), false),
+        Some(Species::C)
+    );
+    assert_eq!(
+        Species::from_pdb_atom(Some("NA"), "NA", Some("NA"), true),
+        None
+    );
+
+    // 3. HETATM / ion residues without element column must check 2-char symbols first
+    for (atom, res) in [
+        ("NA", "NA"),
+        ("CA", "CA"),
+        ("MG", "MG"),
+        ("ZN", "ZN"),
+        ("FE", "FE"),
+        ("CL", "CL"),
+        ("BR", "BR"),
+        ("CU", "CU"),
+        ("CO", "CO"),
+        ("NI", "NI"),
+        ("HG", "HG"),
+        ("OS", "OS"),
+        ("SE", "MSE"),
+    ] {
+        assert_eq!(
+            Species::from_pdb_atom(None, atom, Some(res), true),
+            None,
+            "HETATM ion ({atom}, {res}) must not map to HCNOS"
+        );
+    }
+    // Non-standard ion residue even with is_hetatm=false
+    assert_eq!(Species::from_pdb_atom(None, "CA", Some("CA"), false), None);
+    assert_eq!(Species::from_pdb_atom(None, "NA", Some("NA"), false), None);
+
+    // 4. Standard protein amino acid ATOM records retain all valid HCNOS sidechain/backbone atoms
+    assert_eq!(
+        Species::from_pdb_atom(None, "CA", Some("ALA"), false),
+        Some(Species::C)
+    );
+    assert_eq!(
+        Species::from_pdb_atom(None, "CD", Some("PRO"), false),
+        Some(Species::C)
+    );
+    assert_eq!(
+        Species::from_pdb_atom(None, "CE", Some("LYS"), false),
+        Some(Species::C)
+    );
+    assert_eq!(
+        Species::from_pdb_atom(None, "NE", Some("ARG"), false),
+        Some(Species::N)
+    );
+    assert_eq!(
+        Species::from_pdb_atom(None, "ND1", Some("HIS"), false),
+        Some(Species::N)
+    );
+    assert_eq!(
+        Species::from_pdb_atom(None, "SG", Some("CYS"), false),
+        Some(Species::S)
+    );
+    assert_eq!(
+        Species::from_pdb_atom(None, "HG", Some("SER"), false),
+        Some(Species::H)
+    );
+    assert_eq!(
+        Species::from_pdb_atom(None, "HE", Some("ARG"), false),
+        Some(Species::H)
+    );
+    assert_eq!(
+        Species::from_pdb_atom(None, "1HB", Some("ALA"), false),
+        Some(Species::H)
+    );
+    // Selenomethionine SE must NOT be misparsed as Sulfur!
+    assert_eq!(Species::from_pdb_atom(None, "SE", Some("MSE"), false), None);
+
+    // 5. Standalone from_atom_or_element_name rejects unambiguous 2-char ions and left-aligned PDB "CA  "
+    for sym in [
+        "NA", "MG", "ZN", "FE", "CL", "BR", "CU", "CO", "NI", "SE", "OS", "CA  ",
+    ] {
+        assert_eq!(
+            Species::from_atom_or_element_name(sym),
+            None,
+            "standalone name {sym:?} must not map to HCNOS"
+        );
+    }
+    assert_eq!(Species::from_atom_or_element_name(" CA "), Some(Species::C));
+}
+
+#[test]
+fn test_torchani_acos095_angular_formula_and_neighbor_dos_cap() {
+    // 1. Verify TorchANI acos(0.95 * cos(theta)) angular convention (P2 prep for upstream weights)
+    let atoms = synthetic_five_species_cluster();
+    let indices: Vec<usize> = (0..atoms.len()).collect();
+    let cfg_exact = AevConfig::ani1_standard();
+    let cfg_torch = AevConfig::torchani_standard();
+    assert_eq!(cfg_exact.angular_formula, AngularFormula::ExactAtan2);
+    assert_eq!(cfg_torch.angular_formula, AngularFormula::TorchAniAcos095);
+
+    let aev_exact = compute_aevs_for_indices(&atoms, &indices, &cfg_exact).expect("exact AEV");
+    let aev_torch = compute_aevs_for_indices(&atoms, &indices, &cfg_torch).expect("torchani AEV");
+    let aev_torch_bf =
+        compute_aevs_bruteforce_reference(&atoms, &indices, &cfg_torch).expect("torchani BF");
+
+    // Radial block must be identical; angular block must match brute-force < 1e-13 and differ from exact atan2
+    let mut max_rad_diff = 0.0_f64;
+    let mut max_ang_vs_exact = 0.0_f64;
+    let mut max_torch_bf_diff = 0.0_f64;
+    let rad_dim = cfg_torch.radial_dim();
+    for ((e, t), tb) in aev_exact
+        .iter()
+        .zip(aev_torch.iter())
+        .zip(aev_torch_bf.iter())
+    {
+        for k in 0..rad_dim {
+            max_rad_diff = max_rad_diff.max((e[k] - t[k]).abs());
+        }
+        for k in rad_dim..cfg_torch.total_dim() {
+            max_ang_vs_exact = max_ang_vs_exact.max((e[k] - t[k]).abs());
+            max_torch_bf_diff = max_torch_bf_diff.max((t[k] - tb[k]).abs());
+        }
+    }
+    assert!(max_rad_diff < 1e-15, "radial block must match exactly");
+    assert!(
+        max_torch_bf_diff < 1e-13,
+        "TorchANI cell-list vs brute-force diff {max_torch_bf_diff:.3e}"
+    );
+    assert!(
+        max_ang_vs_exact > 1e-3,
+        "expected distinct angular channel values under TorchANI acos(0.95*cos)"
+    );
+
+    // TorchANI angular_formula must survive JSON & binary bundle roundtrip
+    let model = LegolasModel::init_random_all_backbone(
+        cfg_torch.clone(),
+        &[8],
+        ActivationKind::Celu { alpha: 0.1 },
+        1,
+        42,
+    )
+    .expect("torchani model");
+    let json = model.to_json_bundle().expect("json");
+    let from_json = LegolasModel::from_json_bundle(&json).expect("reload json");
+    assert_eq!(
+        from_json.aev_config.angular_formula,
+        AngularFormula::TorchAniAcos095
+    );
+    let bin = model.to_binary_bundle().expect("bin");
+    let from_bin = LegolasModel::from_binary_bundle(&bin).expect("reload bin");
+    assert_eq!(
+        from_bin.aev_config.angular_formula,
+        AngularFormula::TorchAniAcos095
+    );
+
+    // 2. Regression test for 22.12:P2-2: neighbor cap prevents O(N^2) angular CPU DoS
+    let cfg_compact = AevConfig::compact();
+    let dense_n = MAX_LEGOLAS_NEIGHBORS_PER_ATOM + 20;
+    let dense_cluster: Vec<LegolasAtom> = (0..dense_n)
+        .map(|i| {
+            let t = i as f64;
+            LegolasAtom::new(
+                Species::C,
+                [
+                    0.01 * (t % 17.0),
+                    0.01 * ((t / 17.0).floor() % 17.0),
+                    0.01 * (t / 289.0).floor(),
+                ],
+            )
+        })
+        .collect();
+    let err_cell = compute_aevs_for_indices(&dense_cluster, &[0], &cfg_compact)
+        .expect_err("dense cluster > MAX_LEGOLAS_NEIGHBORS_PER_ATOM must fail closed");
+    assert!(
+        err_cell.contains("MAX_LEGOLAS_NEIGHBORS_PER_ATOM"),
+        "unexpected error: {err_cell}"
+    );
+    let err_bf = compute_aevs_bruteforce_reference(&dense_cluster, &[0], &cfg_compact)
+        .expect_err("dense cluster > MAX_LEGOLAS_NEIGHBORS_PER_ATOM must fail closed in BF");
+    assert!(
+        err_bf.contains("MAX_LEGOLAS_NEIGHBORS_PER_ATOM"),
+        "unexpected error: {err_bf}"
+    );
+
+    // 3. Hostile 65,536-atom dense cluster & coincident-atom DoS probe must fail fast
+    let hostile_65k: Vec<LegolasAtom> = (0..MAX_LEGOLAS_ATOMS)
+        .map(|i| {
+            LegolasAtom::new(
+                Species::C,
+                [
+                    1e-4 * ((i % 64) as f64),
+                    1e-4 * (((i / 64) % 64) as f64),
+                    1e-4 * ((i / 4096) as f64),
+                ],
+            )
+        })
+        .collect();
+    let err_65k = compute_aevs_for_indices(&hostile_65k, &[0], &cfg_compact)
+        .expect_err("dense 65k-atom hostile input must fail closed immediately");
+    assert!(
+        err_65k.contains("MAX_LEGOLAS_NEIGHBORS_PER_ATOM")
+            || err_65k.contains("MAX_LEGOLAS_ATOMS_PER_CELL"),
+        "unexpected error: {err_65k}"
+    );
+
+    let coincident_65k = vec![LegolasAtom::new(Species::C, [0.0, 0.0, 0.0]); MAX_LEGOLAS_ATOMS];
+    let err_coinc = compute_aevs_for_indices(&coincident_65k, &[0], &cfg_compact)
+        .expect_err("65k coincident atoms must fail closed immediately");
+    assert!(
+        err_coinc.contains("MAX_LEGOLAS_ATOMS_PER_CELL"),
+        "unexpected error: {err_coinc}"
+    );
 }
