@@ -1122,11 +1122,15 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
             }
             let key_low = tok.text.to_ascii_lowercase();
             let val = tokens[idx + 1].text.trim();
-            if key_low.starts_with("_ma_protocol_step.")
-                || key_low.starts_with("_ma_data.")
-                || key_low.starts_with("_ma_model_list.")
-            {
-                has_computational_marker = true;
+            // Do NOT treat generic ModelArchive blocks (`_ma_protocol_step`, `_ma_data`,
+            // `_ma_model_list`) as pLDDT provenance (`21F:B1`): e.g. SWISS-MODEL/QMEANDisCo
+            // ModelArchive entries carry those blocks while storing non-pLDDT scores in B_iso.
+            // Recognize explicit AFDB/ColabFold software headers only.
+            if key_low.starts_with("_software.") && key_low.ends_with(".name") {
+                let up = val.to_ascii_uppercase();
+                if up.contains("ALPHAFOLD") || up.contains("COLABFOLD") || up.contains("BOLTZ") {
+                    has_computational_marker = true;
+                }
             }
             match key_low.as_str() {
                 "_entry.id" if val != "." && val != "?" && !val.is_empty() => {
@@ -1172,13 +1176,6 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
             if ncols == 0 {
                 return Err("mmCIF loop_ contains zero column headers".to_string());
             }
-            if headers.iter().any(|h| {
-                h.starts_with("_ma_protocol_step.")
-                    || h.starts_with("_ma_data.")
-                    || h.starts_with("_ma_model_list.")
-            }) {
-                has_computational_marker = true;
-            }
 
             let find_col = |cands: &[&str]| -> Option<usize> {
                 cands
@@ -1193,6 +1190,7 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
                 .any(|h| h.starts_with("_ma_qa_metric_local."));
             let is_exptl = headers.iter().any(|h| h.starts_with("_exptl."));
             let is_struct_ref = headers.iter().any(|h| h.starts_with("_struct_ref."));
+            let is_software = headers.iter().any(|h| h.starts_with("_software."));
 
             // Collect rows strictly checking exact `ncols` alignment before next control token
             let mut rows: Vec<&[CifTok]> = Vec::new();
@@ -1247,6 +1245,18 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
                             if !acc.is_empty() && acc != "." && acc != "?" {
                                 detected_uniprot_id = Some(acc);
                             }
+                        }
+                    }
+                }
+            } else if is_software {
+                if let Some(c_name) = find_col(&["_software.name"]) {
+                    for r in &rows {
+                        let up = r[c_name].text.trim().to_ascii_uppercase();
+                        if up.contains("ALPHAFOLD")
+                            || up.contains("COLABFOLD")
+                            || up.contains("BOLTZ")
+                        {
+                            has_computational_marker = true;
                         }
                     }
                 }
@@ -1463,6 +1473,10 @@ fn parse_mmcif_af_model(text: &str, opts: &AfIngestOptions) -> Result<AfStructur
         .collect();
     if !plddt_ids.is_empty() {
         has_computational_marker = true;
+    } else if !ma_metric_defs.is_empty() {
+        // File explicitly declared `_ma_qa_metric` entries (e.g. QMEANDisCo) with NO local pLDDT:
+        // never fall back to interpreting B-factors as pLDDT (`21F:B1`).
+        has_computational_marker = false;
     }
 
     let (ma_local_plddt, ma_local_by_seq) = if !ma_local_rows.is_empty() {

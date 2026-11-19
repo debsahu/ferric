@@ -89,13 +89,21 @@ pub const STUDENT_T4_NORM_CONST: f64 = 0.375;
 /// Shared per-observation log-ratio floor (identical to the sequence-only `llr` floor).
 pub const AF_LLR_FLOOR_NATS: f64 = -12.0;
 
-/// Out-of-sample `T21.2` RMSE scale floor `[H, N, CA, CB, C']` in ppm (`21.W2:P1-2`, `P2-2`).
+/// `[dev-set]` `T21.2` leave-one-protein-out RMSE scale floor `[H, N, CA, CB, C']` in ppm
+/// (`21.W2:P1-2`, `P2-2`, `21F:B3`).
 ///
-/// Grounded in `T21.2` leave-one-protein-out RMSEs (`H^N 0.505`, `N 2.804`, `CA 0.985`,
-/// `CB 1.140`, `C' 1.009` ppm; dev-set evidence per `21.W1:P1-3`), rounded up. `sigma_AF` never
-/// shrinks below these floors and widens monotonically toward `max(sigma_oos, sd_BMRB)` as
-/// `pLDDT` drops: `sigma_AF^2 = w^2 sigma_oos^2 + (1 - w^2) max(sigma_oos, sd_BMRB)^2`.
-pub const AF_SIGMA_OOS_PPM: [f64; 5] = [0.52, 2.80, 1.05, 1.20, 1.05];
+/// Grounded in `T21.2` **dev-set** leave-one-protein-out RMSEs (`H^N 0.505`, `N 2.804`,
+/// `CA 0.985`, `CB 1.140`, `C' 1.009` ppm; dev-set evidence per `21.W1:P1-3`), rounded up.
+/// Floors `T21.2`'s per-residue predictive uncertainty `sigma_hat = pred_b.predicted_sigma_ppm`
+/// so `sigma_AF` never shrinks below either `sigma_hat` or this `[dev-set]` floor and widens
+/// monotonically toward `max(sigma_base, sd_BMRB)` as `pLDDT` drops:
+/// `sigma_base = max(sigma_hat, AF_SIGMA_DEV_SET_PPM[a])`,
+/// `sigma_AF^2 = w^2 sigma_base^2 + (1 - w^2) max(sigma_base, sd_BMRB)^2`.
+pub const AF_SIGMA_DEV_SET_PPM: [f64; 5] = [0.52, 2.80, 1.05, 1.20, 1.05];
+
+/// Backwards-compatible alias for [`AF_SIGMA_DEV_SET_PPM`] (`[dev-set]` `T21.2` LOPO RMSE floor;
+/// NOT an independent held-out out-of-sample benchmark).
+pub const AF_SIGMA_OOS_PPM: [f64; 5] = AF_SIGMA_DEV_SET_PPM;
 
 /// Maximum amide-proton distance `d(H^N_j, H^N_k) <= 5.5 A` for admitting a pair into `C_AF`.
 pub const AF_NOESY_MAX_DIST_ANGSTROM: f64 = 5.5;
@@ -165,28 +173,34 @@ fn is_experimental_method_token(s: &str) -> bool {
         || up.contains("NEUTRON")
 }
 
-/// Positive-evidence check that a coordinate text is a predicted model (`21.W2:P1-3`).
+/// Positive-evidence check that a coordinate text is a predicted model (`21.W2:P1-3`, `21F:B1`).
 ///
 /// Local fail-closed stand-in matching `S2`'s `require_predicted_model()` contract: returns `true`
 /// ONLY for non-experimental mmCIF text carrying either:
-/// 1. a `_ma_qa_metric` entry whose `name` is explicitly `pLDDT` (case-insensitive; rejecting
-///    `QMEANDisCo` and other non-`pLDDT` metrics) paired with matching `_ma_qa_metric_local` rows, or
-/// 2. a verified ModelArchive/AFDB `_ma_protocol_step` / `_entry.id AF-*` mmCIF block with
-///    non-constant finite `_atom_site.B_iso_or_equiv` values in `[0, 100]` (rejecting all-zero and
-///    all-`0.5` constant B-factors).
+/// 1. a `_ma_qa_metric` entry whose `name` is explicitly `pLDDT` (case-insensitive, non-global;
+///    rejecting `QMEANDisCo` and other non-`pLDDT` metrics) paired with matching
+///    `_ma_qa_metric_local` rows (or non-constant finite `_atom_site.B_iso_or_equiv` in `[0, 100]`), or
+/// 2. a recognized AFDB/ColabFold header (`data_AF-*`, `_entry.id AF-*`, or `_software.name`
+///    naming `AlphaFold`/`ColabFold`/`Boltz`) with non-constant finite `_atom_site.B_iso_or_equiv`
+///    values in `[0, 100]` and no conflicting non-`pLDDT` `_ma_qa_metric` declaration.
 ///
-/// Headerless PDBs, `EXPDTA`/`_exptl` experimental files (`1D3Z`, `1UBQ`), `CRYST1` unit cells,
+/// Generic ModelArchive blocks (`_ma_protocol_step`, `_ma_data`, `_ma_model_list`), headerless
+/// PDBs, `EXPDTA`/`_exptl` experimental files (`1D3Z`, `1UBQ`), `CRYST1` unit cells,
 /// `REMARK`/title mentions of AlphaFold, and raw `B <= 100` PDBs all return `false`.
 pub fn text_has_predicted_model_evidence(text: &str) -> bool {
+    classify_predicted_model_evidence(text).is_some()
+}
+
+fn classify_predicted_model_evidence(text: &str) -> Option<&'static str> {
     let lines: Vec<&str> = text.lines().map(str::trim).collect();
     if lines.is_empty() {
-        return false;
+        return None;
     }
 
     // Reject any PDB or mmCIF declaring experimental provenance or crystallographic unit cells.
     for &line in &lines {
         if line.starts_with("EXPDTA") && is_experimental_method_token(line) {
-            return false;
+            return None;
         }
         if line.starts_with("CRYST1") && line.len() >= 33 {
             if let (Ok(a), Ok(b), Ok(c)) = (
@@ -195,21 +209,23 @@ pub fn text_has_predicted_model_evidence(text: &str) -> bool {
                 line[24..33].trim().parse::<f64>(),
             ) {
                 if a > 2.5 && b > 2.5 && c > 2.5 {
-                    return false;
+                    return None;
                 }
             }
         }
         if let Some(rest) = line.strip_prefix("_exptl.method") {
             if is_experimental_method_token(rest) {
-                return false;
+                return None;
             }
         }
     }
 
     let mut has_mmcif_data = false;
-    let mut has_ma_protocol_or_af_entry = false;
+    let mut has_recognized_af_header = false;
+    let mut saw_ma_qa_metric = false;
     let mut plddt_metric_ids: Vec<String> = Vec::new();
     let mut has_kv_plddt_metric = false;
+    let mut kv_ma_mode_global = false;
     let mut has_matching_local_plddt = false;
     let mut b_min = f64::INFINITY;
     let mut b_max = f64::NEG_INFINITY;
@@ -219,22 +235,39 @@ pub fn text_has_predicted_model_evidence(text: &str) -> bool {
     let mut i = 0usize;
     while i < lines.len() {
         let line = lines[i];
-        if line.starts_with("data_") {
+        if let Some(rest) = line.strip_prefix("data_") {
             has_mmcif_data = true;
+            if rest.trim().to_ascii_uppercase().starts_with("AF-") {
+                has_recognized_af_header = true;
+            }
         }
         if let Some(rest) = line.strip_prefix("_entry.id") {
             let val = rest.trim().trim_matches(|c| c == '\'' || c == '"');
             if val.to_ascii_uppercase().starts_with("AF-") {
-                has_ma_protocol_or_af_entry = true;
+                has_recognized_af_header = true;
             }
         }
-        if line.starts_with("_ma_protocol_step.") {
-            has_ma_protocol_or_af_entry = true;
+        if let Some(rest) = line.strip_prefix("_software.name") {
+            let up = rest
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .to_ascii_uppercase();
+            if up.contains("ALPHAFOLD") || up.contains("COLABFOLD") || up.contains("BOLTZ") {
+                has_recognized_af_header = true;
+            }
         }
         if let Some(rest) = line.strip_prefix("_ma_qa_metric.name") {
+            saw_ma_qa_metric = true;
             let val = rest.trim().trim_matches(|c| c == '\'' || c == '"');
-            if val.eq_ignore_ascii_case("pLDDT") {
+            if val.to_ascii_lowercase().contains("plddt") {
                 has_kv_plddt_metric = true;
+            }
+        }
+        if let Some(rest) = line.strip_prefix("_ma_qa_metric.mode") {
+            saw_ma_qa_metric = true;
+            let val = rest.trim().trim_matches(|c| c == '\'' || c == '"');
+            if val.to_ascii_lowercase().contains("global") {
+                kv_ma_mode_global = true;
             }
         }
 
@@ -264,15 +297,44 @@ pub fn text_has_predicted_model_evidence(text: &str) -> bool {
                         break;
                     }
                     if m_col.is_some() && is_experimental_method_token(row) {
-                        return false;
+                        return None;
                     }
                     j += 1;
                 }
                 i = j;
                 continue;
-            } else if first_low.starts_with("_ma_protocol_step.") {
-                has_ma_protocol_or_af_entry = true;
+            } else if first_low.starts_with("_software.") {
+                let n_col = cols
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case("_software.name"));
+                while j < lines.len() {
+                    let row = lines[j];
+                    if row.is_empty()
+                        || row.starts_with('#')
+                        || row.starts_with('_')
+                        || row.eq_ignore_ascii_case("loop_")
+                        || row.eq_ignore_ascii_case("stop_")
+                    {
+                        break;
+                    }
+                    let toks = split_cif_row_tokens(row);
+                    if toks.len() == cols.len() {
+                        if let Some(nm) = n_col.and_then(|c| toks.get(c)) {
+                            let up = nm.to_ascii_uppercase();
+                            if up.contains("ALPHAFOLD")
+                                || up.contains("COLABFOLD")
+                                || up.contains("BOLTZ")
+                            {
+                                has_recognized_af_header = true;
+                            }
+                        }
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
             } else if first_low.starts_with("_ma_qa_metric.") {
+                saw_ma_qa_metric = true;
                 let id_col = cols
                     .iter()
                     .position(|c| c.eq_ignore_ascii_case("_ma_qa_metric.id"));
@@ -296,10 +358,10 @@ pub fn text_has_predicted_model_evidence(text: &str) -> bool {
                     if toks.len() == cols.len() {
                         let name_ok = name_col
                             .and_then(|c| toks.get(c))
-                            .is_some_and(|t| t.eq_ignore_ascii_case("pLDDT"));
+                            .is_some_and(|t| t.to_ascii_lowercase().contains("plddt"));
                         let mode_ok = mode_col
                             .and_then(|c| toks.get(c))
-                            .is_none_or(|t| t.eq_ignore_ascii_case("local"));
+                            .is_none_or(|t| !t.to_ascii_lowercase().contains("global"));
                         if name_ok && mode_ok {
                             if let Some(ic) = id_col.and_then(|c| toks.get(c)) {
                                 plddt_metric_ids.push((*ic).to_string());
@@ -332,15 +394,16 @@ pub fn text_has_predicted_model_evidence(text: &str) -> bool {
                         }
                         let toks = split_cif_row_tokens(row);
                         if toks.len() == cols.len() {
+                            let kv_local_plddt = has_kv_plddt_metric && !kv_ma_mode_global;
                             let id_matches = match mid_col {
                                 Some(mc) => {
                                     (!plddt_metric_ids.is_empty()
                                         && toks.get(mc).is_some_and(|id| {
                                             plddt_metric_ids.iter().any(|p| p == id)
                                         }))
-                                        || (plddt_metric_ids.is_empty() && has_kv_plddt_metric)
+                                        || (plddt_metric_ids.is_empty() && kv_local_plddt)
                                 }
-                                None => has_kv_plddt_metric || !plddt_metric_ids.is_empty(),
+                                None => kv_local_plddt || !plddt_metric_ids.is_empty(),
                             };
                             let val_ok = val_col
                                 .and_then(|vc| toks.get(vc))
@@ -395,12 +458,21 @@ pub fn text_has_predicted_model_evidence(text: &str) -> bool {
     }
 
     if !has_mmcif_data {
-        return false;
+        return None;
     }
     if has_matching_local_plddt {
-        return true;
+        return Some("mmCIF _ma_qa_metric (name=pLDDT) + _ma_qa_metric_local values");
     }
-    has_ma_protocol_or_af_entry && !b_out_of_range && b_count >= 2 && (b_max - b_min) > 1.0e-3
+    let has_valid_bfactor = !b_out_of_range && b_count >= 2 && (b_max - b_min) > 1.0e-3;
+    let has_local_plddt_def =
+        !plddt_metric_ids.is_empty() || (has_kv_plddt_metric && !kv_ma_mode_global);
+    if has_valid_bfactor && has_local_plddt_def {
+        return Some("mmCIF _ma_qa_metric (name=pLDDT) + non-constant B_iso_or_equiv pLDDT");
+    }
+    if has_valid_bfactor && has_recognized_af_header && !saw_ma_qa_metric {
+        return Some("mmCIF recognized AFDB/ColabFold header + non-constant B_iso_or_equiv pLDDT");
+    }
+    None
 }
 
 fn split_cif_row_tokens(row: &str) -> Vec<&str> {
@@ -897,10 +969,15 @@ impl AfAssignPriors {
                 if !pred_b.predicted_ppm.is_finite() {
                     continue;
                 }
-                let s_oos = AF_SIGMA_OOS_PPM[atom_idx];
-                let s_wide = s_oos.max(sd_bmrb);
+                let s_floor = AF_SIGMA_DEV_SET_PPM[atom_idx];
+                let s_base = if pred_b.predicted_sigma_ppm.is_finite() {
+                    pred_b.predicted_sigma_ppm.max(s_floor)
+                } else {
+                    s_floor
+                };
+                let s_wide = s_base.max(sd_bmrb);
                 let w2 = w_af * w_af;
-                let sigma_af = (w2 * s_oos * s_oos + (1.0 - w2) * s_wide * s_wide).sqrt();
+                let sigma_af = (w2 * s_base * s_base + (1.0 - w2) * s_wide * s_wide).sqrt();
                 atom_priors[k * 5 + atom_idx] = AfResidueAtomPrior {
                     present: true,
                     mu_af_ppm: pred_b.predicted_ppm,
@@ -1213,7 +1290,7 @@ impl AfAssignPriors {
         firewall_query: &HomologFirewallQuery,
         cfg: &AfAssignConfig,
     ) -> Result<Self, String> {
-        let has_evidence = text_has_predicted_model_evidence(structure_text);
+        let evidence_label = classify_predicted_model_evidence(structure_text);
         if !cfg.treat_as_model {
             let af_check = crate::af_concordance::parse_af_structure_model_str(
                 structure_text,
@@ -1223,13 +1300,13 @@ impl AfAssignPriors {
                 },
             )?;
             crate::af_concordance::require_predicted_model(&af_check, false)?;
-            if !has_evidence {
+            if evidence_label.is_none() {
                 return Err(
                     "--af-structure refused: no positive predicted-model evidence (an mmCIF \
-                     `_ma_qa_metric` named pLDDT with `_ma_qa_metric_local` values, or verified \
-                     AFDB/ModelArchive block with non-constant pLDDT). Headerless, experimental \
-                     (X-ray / solution NMR / EM) and REMARK-only files are not treated as models; \
-                     pass --treat-as-model to use the coordinates explicitly as a native-structure oracle"
+                     `_ma_qa_metric` named pLDDT with `_ma_qa_metric_local` values, or recognized \
+                     AFDB/ColabFold header with non-constant pLDDT). Generic ModelArchive blocks, \
+                     headerless, experimental (X-ray / solution NMR / EM), and REMARK-only files \
+                     are not treated as models; pass --treat-as-model to opt in explicitly"
                         .to_string(),
                 );
             }
@@ -1253,9 +1330,8 @@ impl AfAssignPriors {
             firewall_query,
             cfg,
         )?;
-        if has_evidence {
-            out.model_evidence =
-                "mmCIF _ma_qa_metric (name=pLDDT) + _ma_qa_metric_local values".to_string();
+        if let Some(ev) = evidence_label {
+            out.model_evidence = ev.to_string();
         }
         Ok(out)
     }
@@ -1775,11 +1851,11 @@ pub fn estimate_af_shift_offsets_from_predictions(
     let obs_cb = collect_carbon_obs("CB", 8.0, 78.0);
     let obs_c = collect_carbon_obs("C", 160.0, 190.0);
 
-    let preds_h = collect_preds("H", AF_SIGMA_OOS_PPM[0], true, false);
-    let preds_n = collect_preds("N", AF_SIGMA_OOS_PPM[1], true, false);
-    let preds_ca = collect_preds("CA", AF_SIGMA_OOS_PPM[2], false, false);
-    let preds_cb = collect_preds("CB", AF_SIGMA_OOS_PPM[3], false, true);
-    let preds_c = collect_preds("C", AF_SIGMA_OOS_PPM[4], false, false);
+    let preds_h = collect_preds("H", AF_SIGMA_DEV_SET_PPM[0], true, false);
+    let preds_n = collect_preds("N", AF_SIGMA_DEV_SET_PPM[1], true, false);
+    let preds_ca = collect_preds("CA", AF_SIGMA_DEV_SET_PPM[2], false, false);
+    let preds_cb = collect_preds("CB", AF_SIGMA_DEV_SET_PPM[3], false, true);
+    let preds_c = collect_preds("C", AF_SIGMA_DEV_SET_PPM[4], false, false);
 
     let h = fit_single_channel_profile_huber_irls(&obs_h, &preds_h, 2.5, 0.01, 5.0, 0.30);
     let n = fit_single_channel_profile_huber_irls(&obs_n, &preds_n, 12.0, 0.05, 40.0, 1.50);

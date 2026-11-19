@@ -10,8 +10,8 @@ use nmr_core::af_assign_priors::{
     af_require_predicted_model, ell_student_t4, estimate_af_shift_offsets,
     estimate_af_shift_offsets_from_predictions, parse_noesy_15n_peaks_str,
     text_has_predicted_model_evidence, AfAssignConfig, AfAssignPriors, Noesy15nPeak,
-    AF_NOESY_MAX_SEQ_BONUS_NATS, AF_NOESY_MAX_SITE_BONUS_NATS, AF_SIGMA_OOS_PPM,
-    DEFAULT_AF_CLAMP_NATS, DEFAULT_AF_WEIGHT,
+    AF_NOESY_MAX_SEQ_BONUS_NATS, AF_NOESY_MAX_SITE_BONUS_NATS, AF_SIGMA_DEV_SET_PPM,
+    AF_SIGMA_OOS_PPM, DEFAULT_AF_CLAMP_NATS, DEFAULT_AF_WEIGHT,
 };
 use nmr_core::af_concordance::{parse_pae_json_file, parse_pae_json_str};
 use nmr_core::bayes_sa::{solve_bayes_sa_from_peaks, BayesSaConfig};
@@ -749,6 +749,12 @@ fn test_student_t4_clamping_plddt_decay_and_120deg_corrupted_12aa_loop_gate() {
     println!(
         "[120-deg 12-aa Loop Gate (SPARSE HNCA-only, 5 seeds, ceiling={ceiling:.2} nats)] overall: {sp_base_ok}/{sp_total} ({sp_base_pct:.2}%) -> {sp_corr_ok}/{sp_total} ({sp_corr_pct:.2}%) | loop(40..52): {sp_loop_base_ok}/{sp_loop_total} ({sp_loop_base_pct:.2}%) -> {sp_loop_corr_ok}/{sp_loop_total} ({sp_loop_corr_pct:.2}%) | HC: base {sp_hc_base_ok}/{sp_hc_base_tot} vs corr {sp_hc_corr_ok}/{sp_hc_corr_tot}"
     );
+    if let Ok(path) = std::env::var("FERRIC_WRITE_T21_4_LOOP_JSON") {
+        let json = format!(
+            "{{\n  \"full_triple_resonance\": {{\n    \"seeds\": [0, 1, 2],\n    \"total_assignable\": {total_assignable},\n    \"max_abs_delta_u_nats\": {max_abs_delta_u:.6},\n    \"ceiling_nats\": {ceiling:.6},\n    \"standard\": {{ \"baseline_correct\": {base_std_correct}, \"corrupted_correct\": {corr_std_correct} }},\n    \"evo_graph\": {{ \"baseline_correct\": {base_evo_correct}, \"corrupted_correct\": {corr_evo_correct} }}\n  }},\n  \"sparse_hnca_only\": {{\n    \"seeds\": [0, 1, 2, 3, 4],\n    \"total_assignable\": {sp_total},\n    \"loop_assignable\": {sp_loop_total},\n    \"overall_baseline_correct\": {sp_base_ok},\n    \"overall_baseline_pct\": {sp_base_pct:.4},\n    \"overall_corrupted_correct\": {sp_corr_ok},\n    \"overall_corrupted_pct\": {sp_corr_pct:.4},\n    \"loop_baseline_correct\": {sp_loop_base_ok},\n    \"loop_baseline_pct\": {sp_loop_base_pct:.4},\n    \"loop_corrupted_correct\": {sp_loop_corr_ok},\n    \"loop_corrupted_pct\": {sp_loop_corr_pct:.4},\n    \"hc_baseline_correct\": {sp_hc_base_ok},\n    \"hc_baseline_total\": {sp_hc_base_tot},\n    \"hc_corrupted_correct\": {sp_hc_corr_ok},\n    \"hc_corrupted_total\": {sp_hc_corr_tot}\n  }}\n}}\n"
+        );
+        fs::write(&path, json).expect("write FERRIC_WRITE_T21_4_LOOP_JSON");
+    }
     assert!(
         sp_corr_ok + 6 >= sp_base_ok,
         "sparse HNCA 120-deg corrupted AF loop caused excessive overall harm ({sp_corr_ok} < {sp_base_ok} - 6)"
@@ -973,11 +979,25 @@ fn test_sparse_cb_stripped_hnca_plus_15n_noesy_ablations_and_cli() {
     let mut total_assignable = 0usize;
 
     let mut plain_confs_correct: Vec<(f64, bool)> = Vec::new();
+    let mut af_only_confs_correct: Vec<(f64, bool)> = Vec::new();
+    let mut noesy_only_confs_correct: Vec<(f64, bool)> = Vec::new();
     let mut both_confs_correct: Vec<(f64, bool)> = Vec::new();
+    let mut evo_plain_confs_correct: Vec<(f64, bool)> = Vec::new();
+    let mut evo_af_only_confs_correct: Vec<(f64, bool)> = Vec::new();
+    let mut evo_noesy_only_confs_correct: Vec<(f64, bool)> = Vec::new();
+    let mut evo_both_confs_correct: Vec<(f64, bool)> = Vec::new();
     let mut plain_hc_ok = 0usize;
     let mut plain_hc_tot = 0usize;
+    let mut af_only_hc_ok = 0usize;
+    let mut af_only_hc_tot = 0usize;
+    let mut noesy_only_hc_ok = 0usize;
+    let mut noesy_only_hc_tot = 0usize;
     let mut both_hc_ok = 0usize;
     let mut both_hc_tot = 0usize;
+    let mut evo_plain_hc_ok = 0usize;
+    let mut evo_plain_hc_tot = 0usize;
+    let mut evo_both_hc_ok = 0usize;
+    let mut evo_both_hc_tot = 0usize;
 
     for &seed in &seeds {
         let (peaks, truth) = simulate(
@@ -1075,13 +1095,19 @@ fn test_sparse_cb_stripped_hnca_plus_15n_noesy_ablations_and_cli() {
         );
 
         let m_plain = score(&res_std_plain, &truth, 0.8);
+        let m_af = score(&res_std_af, &truth, 0.8);
+        let m_noesy = score(&res_std_noesy, &truth, 0.8);
         let m_both = score(&res_std_both, &truth, 0.8);
         plain_std_ok += m_plain.correct;
-        af_only_std_ok += score(&res_std_af, &truth, 0.8).correct;
-        noesy_only_std_ok += score(&res_std_noesy, &truth, 0.8).correct;
+        af_only_std_ok += m_af.correct;
+        noesy_only_std_ok += m_noesy.correct;
         both_std_ok += m_both.correct;
         plain_hc_ok += m_plain.hc_correct;
         plain_hc_tot += m_plain.hc_assigned;
+        af_only_hc_ok += m_af.hc_correct;
+        af_only_hc_tot += m_af.hc_assigned;
+        noesy_only_hc_ok += m_noesy.hc_correct;
+        noesy_only_hc_tot += m_noesy.hc_assigned;
         both_hc_ok += m_both.hc_correct;
         both_hc_tot += m_both.hc_assigned;
 
@@ -1089,6 +1115,10 @@ fn test_sparse_cb_stripped_hnca_plus_15n_noesy_ablations_and_cli() {
             if t >= 0 {
                 plain_confs_correct
                     .push((res_std_plain.confidence[i], res_std_plain.position[i] == t));
+                af_only_confs_correct
+                    .push((res_std_af.confidence[i], res_std_af.position[i] == t));
+                noesy_only_confs_correct
+                    .push((res_std_noesy.confidence[i], res_std_noesy.position[i] == t));
                 both_confs_correct
                     .push((res_std_both.confidence[i], res_std_both.position[i] == t));
             }
@@ -1133,18 +1163,52 @@ fn test_sparse_cb_stripped_hnca_plus_15n_noesy_ablations_and_cli() {
             },
         );
         let truth_of = |kept: &[usize]| -> Vec<i32> { kept.iter().map(|&i| truth[i]).collect() };
-        let m_evo_plain = score(&res_evo_plain, &truth_of(&rep_base.kept_hsqc_indices), 0.8);
+        let t_evo_plain = truth_of(&rep_base.kept_hsqc_indices);
+        let t_evo_af = truth_of(&rep_af.kept_hsqc_indices);
+        let t_evo_noesy = truth_of(&rep_noesy.kept_hsqc_indices);
+        let t_evo_both = truth_of(&rep_both.kept_hsqc_indices);
+        let m_evo_plain = score(&res_evo_plain, &t_evo_plain, 0.8);
+        let m_evo_af = score(&res_evo_af, &t_evo_af, 0.8);
+        let m_evo_noesy = score(&res_evo_noesy, &t_evo_noesy, 0.8);
+        let m_evo_both = score(&res_evo_both, &t_evo_both, 0.8);
         plain_evo_ok += m_evo_plain.correct;
-        af_only_evo_ok += score(&res_evo_af, &truth_of(&rep_af.kept_hsqc_indices), 0.8).correct;
-        noesy_only_evo_ok +=
-            score(&res_evo_noesy, &truth_of(&rep_noesy.kept_hsqc_indices), 0.8).correct;
-        both_evo_ok += score(&res_evo_both, &truth_of(&rep_both.kept_hsqc_indices), 0.8).correct;
+        af_only_evo_ok += m_evo_af.correct;
+        noesy_only_evo_ok += m_evo_noesy.correct;
+        both_evo_ok += m_evo_both.correct;
+        evo_plain_hc_ok += m_evo_plain.hc_correct;
+        evo_plain_hc_tot += m_evo_plain.hc_assigned;
+        evo_both_hc_ok += m_evo_both.hc_correct;
+        evo_both_hc_tot += m_evo_both.hc_assigned;
         total_assignable += m_evo_plain.assignable;
+
+        let push_evo = |res: &nmr_core::solver::AssignResult,
+                        tr: &[i32],
+                        out: &mut Vec<(f64, bool)>| {
+            for (i, &t) in tr.iter().enumerate() {
+                if t >= 0 {
+                    out.push((res.confidence[i], res.position[i] == t));
+                }
+            }
+        };
+        push_evo(&res_evo_plain, &t_evo_plain, &mut evo_plain_confs_correct);
+        push_evo(&res_evo_af, &t_evo_af, &mut evo_af_only_confs_correct);
+        push_evo(
+            &res_evo_noesy,
+            &t_evo_noesy,
+            &mut evo_noesy_only_confs_correct,
+        );
+        push_evo(&res_evo_both, &t_evo_both, &mut evo_both_confs_correct);
     }
 
     let pct = |c: usize| 100.0 * (c as f64) / (total_assignable as f64);
     let ece10_plain = compute_ece10(&plain_confs_correct);
+    let ece10_af_only = compute_ece10(&af_only_confs_correct);
+    let ece10_noesy_only = compute_ece10(&noesy_only_confs_correct);
     let ece10_both = compute_ece10(&both_confs_correct);
+    let evo_ece10_plain = compute_ece10(&evo_plain_confs_correct);
+    let evo_ece10_af_only = compute_ece10(&evo_af_only_confs_correct);
+    let evo_ece10_noesy_only = compute_ece10(&evo_noesy_only_confs_correct);
+    let evo_ece10_both = compute_ece10(&evo_both_confs_correct);
     let hcp_plain = 100.0 * (plain_hc_ok as f64) / (plain_hc_tot.max(1) as f64);
     let hcp_both = 100.0 * (both_hc_ok as f64) / (both_hc_tot.max(1) as f64);
 
@@ -1171,8 +1235,22 @@ fn test_sparse_cb_stripped_hnca_plus_15n_noesy_ablations_and_cli() {
         pct(both_evo_ok) - pct(noesy_only_evo_ok),
     );
     println!(
-        "  calibration: plain ECE_10={ece10_plain:.4}, HCP={hcp_plain:.2}% ({plain_hc_ok}/{plain_hc_tot}) | af+noesy ECE_10={ece10_both:.4}, HCP={hcp_both:.2}% ({both_hc_ok}/{both_hc_tot})"
+        "  calibration: std plain ECE_10={ece10_plain:.4}, HCP={hcp_plain:.2}% ({plain_hc_ok}/{plain_hc_tot}) | std af+noesy ECE_10={ece10_both:.4}, HCP={hcp_both:.2}% ({both_hc_ok}/{both_hc_tot}) | evo plain ECE_10={evo_ece10_plain:.4} ({evo_plain_hc_ok}/{evo_plain_hc_tot}) | evo af+noesy ECE_10={evo_ece10_both:.4} ({evo_both_hc_ok}/{evo_both_hc_tot})"
     );
+    if let Ok(path) = std::env::var("FERRIC_WRITE_T21_4_ABLATION_JSON") {
+        let json = format!(
+            "{{\n  \"arm_order\": [\"plain\", \"af_shift_only\", \"seq_noesy_only\", \"af_shift_plus_noesy\"],\n  \"seeds\": [0, 1, 2],\n  \"total_assignable\": {total_assignable},\n  \"standard\": {{\n    \"plain\": {{ \"correct\": {plain_std_ok}, \"pct\": {:.4}, \"hc_correct\": {plain_hc_ok}, \"hc_total\": {plain_hc_tot}, \"ece10\": {ece10_plain:.6} }},\n    \"af_shift_only\": {{ \"correct\": {af_only_std_ok}, \"pct\": {:.4}, \"hc_correct\": {af_only_hc_ok}, \"hc_total\": {af_only_hc_tot}, \"ece10\": {ece10_af_only:.6} }},\n    \"seq_noesy_only\": {{ \"correct\": {noesy_only_std_ok}, \"pct\": {:.4}, \"hc_correct\": {noesy_only_hc_ok}, \"hc_total\": {noesy_only_hc_tot}, \"ece10\": {ece10_noesy_only:.6} }},\n    \"af_shift_plus_noesy\": {{ \"correct\": {both_std_ok}, \"pct\": {:.4}, \"hc_correct\": {both_hc_ok}, \"hc_total\": {both_hc_tot}, \"ece10\": {ece10_both:.6} }}\n  }},\n  \"evo_graph\": {{\n    \"plain\": {{ \"correct\": {plain_evo_ok}, \"pct\": {:.4}, \"hc_correct\": {evo_plain_hc_ok}, \"hc_total\": {evo_plain_hc_tot}, \"ece10\": {evo_ece10_plain:.6} }},\n    \"af_shift_only\": {{ \"correct\": {af_only_evo_ok}, \"pct\": {:.4}, \"ece10\": {evo_ece10_af_only:.6} }},\n    \"seq_noesy_only\": {{ \"correct\": {noesy_only_evo_ok}, \"pct\": {:.4}, \"ece10\": {evo_ece10_noesy_only:.6} }},\n    \"af_shift_plus_noesy\": {{ \"correct\": {both_evo_ok}, \"pct\": {:.4}, \"hc_correct\": {evo_both_hc_ok}, \"hc_total\": {evo_both_hc_tot}, \"ece10\": {evo_ece10_both:.6} }}\n  }}\n}}\n",
+            pct(plain_std_ok),
+            pct(af_only_std_ok),
+            pct(noesy_only_std_ok),
+            pct(both_std_ok),
+            pct(plain_evo_ok),
+            pct(af_only_evo_ok),
+            pct(noesy_only_evo_ok),
+            pct(both_evo_ok),
+        );
+        fs::write(&path, json).expect("write FERRIC_WRITE_T21_4_ABLATION_JSON");
+    }
     assert!(
         both_std_ok >= plain_std_ok && both_evo_ok >= plain_evo_ok,
         "AF+NOESY must not regress below plain sequence-only baseline"
@@ -1350,6 +1428,81 @@ fn test_p1_3_fail_closed_model_provenance_rejects_experimental_and_headerless() 
     let (af_cif_path, _) = real_af_ubiquitin_paths(&root);
     let real_af_cif_txt = fs::read_to_string(&af_cif_path).expect("read AF-P0CG48-F1 v6 cif");
     assert!(text_has_predicted_model_evidence(&real_af_cif_txt));
+
+    // `21F:B1` regression: real-shaped ModelArchive QMEANDisCo mmCIF with `_ma_protocol_step`,
+    // `_ma_data`, `_ma_model_list`, AND non-constant `_atom_site.B_iso_or_equiv` in `[0, 1]`
+    // must be rejected by BOTH `text_has_predicted_model_evidence` AND `AfAssignPriors::from_structure_strs`!
+    // Fails at `f8408b9`.
+    let qmean_real_shaped_cif = "\
+data_MA-BAK-CEPC-0001
+_entry.id MA-BAK-CEPC-0001
+_ma_data.id 1
+_ma_data.name 'SWISS-MODEL entry'
+_ma_model_list.ordinal_id 1
+_ma_model_list.model_name 'SWISS-MODEL QMEANDisCo'
+loop_
+_ma_protocol_step.ordinal_id
+_ma_protocol_step.protocol_id
+_ma_protocol_step.step_id
+_ma_protocol_step.method_type
+1 1 1 'template search'
+2 1 2 'modeling'
+#
+loop_
+_ma_qa_metric.id
+_ma_qa_metric.name
+_ma_qa_metric.type
+_ma_qa_metric.mode
+1 QMEANDisCo other local
+#
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_seq_id
+_atom_site.auth_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.B_iso_or_equiv
+ATOM 1 N ALA A 1 1 0.0 0.0 0.0 0.924
+ATOM 2 CA ALA A 1 1 1.46 0.0 0.0 0.924
+ATOM 3 C ALA A 1 1 2.0 1.4 0.0 0.924
+ATOM 4 N GLY A 2 2 3.2 1.2 0.0 0.781
+ATOM 5 CA GLY A 2 2 4.5 1.8 0.0 0.781
+ATOM 6 C GLY A 2 2 5.2 0.6 0.0 0.781
+#
+loop_
+_ma_qa_metric_local.label_asym_id
+_ma_qa_metric_local.label_seq_id
+_ma_qa_metric_local.metric_id
+_ma_qa_metric_local.metric_value
+A 1 1 0.924
+A 2 1 0.781
+#
+";
+    assert!(
+        !text_has_predicted_model_evidence(qmean_real_shaped_cif),
+        "text_has_predicted_model_evidence must reject real-shaped ModelArchive QMEANDisCo mmCIF"
+    );
+    let seq2 = vec!["ALA".to_string(), "GLY".to_string()];
+    let fw_empty = HomologFirewallQuery::default();
+    let res_qm = AfAssignPriors::from_strs(
+        qmean_real_shaped_cif,
+        Some("cif"),
+        &seq2,
+        Some(&[1, 2]),
+        None,
+        None,
+        &fw_empty,
+        &AfAssignConfig::default(),
+    );
+    assert!(
+        res_qm.is_err(),
+        "AfAssignPriors::from_structure_strs must fail closed on ModelArchive QMEANDisCo mmCIF"
+    );
 }
 
 #[test]
@@ -1427,14 +1580,15 @@ fn test_p2_2_oos_sigma_floor_and_monotonic_widening_with_plddt() {
     let af70 = build_at_plddt(70.0);
     let af45 = build_at_plddt(45.0);
 
-    for (a, &floor_ppm) in AF_SIGMA_OOS_PPM.iter().enumerate() {
+    assert_eq!(AF_SIGMA_OOS_PPM, AF_SIGMA_DEV_SET_PPM);
+    for (a, &floor_ppm) in AF_SIGMA_DEV_SET_PPM.iter().enumerate() {
         let p95 = af95.atom_prior(20, a);
         let p70 = af70.atom_prior(20, a);
         let p45 = af45.atom_prior(20, a);
         assert!(p95.present && p70.present && p45.present);
         assert!(
             p95.sigma_af_ppm >= floor_ppm - 1e-12,
-            "atom {a} sigma at pLDDT=95 ({}) below OOS floor {}",
+            "atom {a} sigma at pLDDT=95 ({}) below [dev-set] floor {}",
             p95.sigma_af_ppm,
             floor_ppm
         );
@@ -1451,6 +1605,48 @@ fn test_p2_2_oos_sigma_floor_and_monotonic_widening_with_plddt() {
             p70.sigma_af_ppm
         );
     }
+
+    // `21F:B3` regression: T21.2 per-residue `sigma_hat = pred_b.predicted_sigma_ppm` MUST be
+    // floored by `AF_SIGMA_DEV_SET_PPM` (not silently discarded!). At `f8408b9`, `sigma_hat` was
+    // ignored so high-pLDDT residues always got `sigma_af == AF_SIGMA_DEV_SET_PPM[a]` even when
+    // T21.2 predicted a larger `sigma_hat`.
+    let atom_names = ["H", "N", "CA", "CB", "C"];
+    let mut n_exceeding_floor = 0usize;
+    for k in 0..af95.sequence_len() {
+        let Some(si) = af95.seq_to_struct[k] else {
+            continue;
+        };
+        let pred_r = &af95.shift_report.residues[si];
+        for (a, &aname) in atom_names.iter().enumerate() {
+            let pr = af95.atom_prior(k, a);
+            if !pr.present {
+                continue;
+            }
+            let pred_b = &pred_r.backbone[aname];
+            assert!(
+                pr.sigma_af_ppm >= pred_b.predicted_sigma_ppm - 1e-12,
+                "residue {k} atom {aname}: sigma_af ({:.4}) < T21.2 sigma_hat ({:.4})",
+                pr.sigma_af_ppm,
+                pred_b.predicted_sigma_ppm
+            );
+            if pred_b.predicted_sigma_ppm > AF_SIGMA_DEV_SET_PPM[a] + 1e-4
+                && af95.plddt_per_residue[k] >= 90.0
+            {
+                assert!(
+                    pr.sigma_af_ppm > AF_SIGMA_DEV_SET_PPM[a] + 1e-4,
+                    "residue {k} atom {aname}: sigma_hat ({:.4}) > floor ({:.4}) was discarded (sigma_af={:.4})",
+                    pred_b.predicted_sigma_ppm,
+                    AF_SIGMA_DEV_SET_PPM[a],
+                    pr.sigma_af_ppm
+                );
+                n_exceeding_floor += 1;
+            }
+        }
+    }
+    assert!(
+        n_exceeding_floor > 0,
+        "expected at least one high-pLDDT residue/atom with T21.2 sigma_hat > AF_SIGMA_DEV_SET_PPM"
+    );
 }
 
 #[test]
