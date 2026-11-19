@@ -14,6 +14,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod af_assign_priors;
 pub mod af_concordance;
 pub mod aromatic;
+pub mod artsy_rdc;
 pub mod bayes_sa;
 pub mod c13_detected;
 pub mod cest;
