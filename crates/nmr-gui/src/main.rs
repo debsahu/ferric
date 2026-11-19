@@ -14229,6 +14229,15 @@ impl NmrWorkbenchApp {
         }
     }
 
+    /// Status line for a water action that found no dominant water (`21F:B6`): nothing changed
+    /// and no undo entry was recorded.
+    fn water_not_detected_status(nd: &nmr_core::water::WaterNotDetected) -> String {
+        format!(
+            "No dominant water peak detected in {:.2}–{:.2} ppm for solvent {}; nothing changed ({})",
+            nd.window_lo_ppm, nd.window_hi_ppm, nd.solvent_label, nd.reason
+        )
+    }
+
     fn suppress_water_active_1d(&mut self) {
         if self.stack1d_panel.traces.is_empty() {
             self.status_msg = "No 1D trace loaded for water suppression".to_string();
@@ -14252,9 +14261,18 @@ impl NmrWorkbenchApp {
         if spec.len() < 8 {
             return;
         }
-        self.drain_1d_undo_into_journal();
         let cfg = nmr_core::water::WaterSuppressionConfig::default();
-        let center_ppm = nmr_core::water::suppress_water_spectrum_1d(&mut spec, &cfg);
+        let center_ppm = match nmr_core::water::suppress_water_spectrum_1d(&mut spec, &cfg) {
+            nmr_core::water::WaterSuppressionOutcome::Suppressed { center_ppm, .. } => center_ppm,
+            nmr_core::water::WaterSuppressionOutcome::NotDetected(nd) => {
+                // Honest no-op: trace untouched, no undo entry, no success message.
+                let msg = Self::water_not_detected_status(&nd);
+                self.stack1d_panel.status_message = msg.clone();
+                self.status_msg = msg;
+                return;
+            }
+        };
+        self.drain_1d_undo_into_journal();
         self.stack1d_panel.push_water_undo_active(orig_spec);
         self.drain_1d_undo_into_journal();
         self.stack1d_panel.traces[idx].raw_spec = Some(AttachedSpectrum1d(spec.clone()));
@@ -14284,9 +14302,20 @@ impl NmrWorkbenchApp {
                     );
                     return;
                 }
-                self.drain_1d_undo_into_journal();
                 let cfg = nmr_core::water::WaterSuppressionConfig::default();
                 let snapshot = Arc::clone(&self.cubes_3d[c_idx]);
+                let mut suppressed_cube = (*snapshot).clone();
+                let reported_ppm =
+                    match nmr_core::water::suppress_water_3d(&mut suppressed_cube, &cfg) {
+                        nmr_core::water::WaterSuppressionOutcome::Suppressed {
+                            center_ppm, ..
+                        } => center_ppm,
+                        nmr_core::water::WaterSuppressionOutcome::NotDetected(nd) => {
+                            self.status_msg = Self::water_not_detected_status(&nd);
+                            return;
+                        }
+                    };
+                self.drain_1d_undo_into_journal();
                 let key3 = self.active_3d_water_key(c_idx);
                 self.water_undo_stack_3d
                     .push(key3.clone(), Arc::clone(&snapshot));
@@ -14300,9 +14329,8 @@ impl NmrWorkbenchApp {
                     },
                 );
                 self.water_undo_3d = Some(snapshot);
-                let cube_mut = Arc::make_mut(&mut self.cubes_3d[c_idx]);
-                let reported_ppm = nmr_core::water::suppress_water_3d(cube_mut, &cfg);
-                let updated_cube = cube_mut.clone();
+                self.cubes_3d[c_idx] = Arc::new(suppressed_cube);
+                let updated_cube = (*self.cubes_3d[c_idx]).clone();
                 if self
                     .hncacb_3d
                     .as_ref()
@@ -14350,10 +14378,16 @@ impl NmrWorkbenchApp {
         }
         // `v0150:P1-6`: 2D water suppression touches ONLY the active 2D spectrum page — NEVER
         // mutating loaded 3D HNCACB / HNCO / cubes_3d!
-        self.drain_1d_undo_into_journal();
         let mut s2 = orig_2d.clone();
         let cfg = nmr_core::water::WaterSuppressionConfig::default();
-        let reported_ppm = nmr_core::water::suppress_water_spectrum_2d(&mut s2, &cfg);
+        let reported_ppm = match nmr_core::water::suppress_water_spectrum_2d(&mut s2, &cfg) {
+            nmr_core::water::WaterSuppressionOutcome::Suppressed { center_ppm, .. } => center_ppm,
+            nmr_core::water::WaterSuppressionOutcome::NotDetected(nd) => {
+                self.status_msg = Self::water_not_detected_status(&nd);
+                return;
+            }
+        };
+        self.drain_1d_undo_into_journal();
 
         let key2 = self.active_2d_water_key();
         let page_idx = self.workbook.active_2d_idx;
@@ -17960,13 +17994,81 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         app.dispatch_workbench_action(&ctx, WorkbenchAction::DeleteSelectedPeaks);
         assert!(app.peaks_3d.is_empty());
 
-        // 3D water suppression (`ws`) + lossless undo (`wu`)
+        // 3D water suppression (`ws`) + lossless undo (`wu`). `21F:B6`: this synthetic H(CCO)NH
+        // cube has no water line near 4.7 ppm, so `ws` must be an honest no-op (no snapshot).
         let orig_cube_data = app.cubes_3d[0].data.clone();
         app.dispatch_workbench_action(&ctx, WorkbenchAction::SuppressWaterPeak);
-        assert!(app.water_undo_3d.is_some());
+        assert!(app.water_undo_3d.is_none());
+        assert!(app
+            .status_msg
+            .starts_with("No dominant water peak detected"));
+        assert_eq!(app.cubes_3d[0].data, orig_cube_data);
         app.dispatch_workbench_action(&ctx, WorkbenchAction::UndoWaterSuppression);
         assert!(app.water_undo_3d.is_none());
         assert_eq!(app.cubes_3d[0].data, orig_cube_data);
+    }
+
+    /// `21F:B6`: the 1D Water action on a spectrum without a dominant water peak must leave the
+    /// trace untouched, record no undo entry and say so (no "Suppressed ... at 4.700 ppm").
+    #[test]
+    fn test_b6_water_action_without_dominant_water_is_honest_noop() {
+        use super::*;
+        let mut app = make_headless_test_app();
+        app.load_builtin_demo_suite();
+        app.set_workbench_mode(WorkbenchMode::Process);
+        app.activate_1d_workbook_page(0);
+        let ax = nmr_core::spectrum::AxisPpm::from_bounds("1H", 256, 10.0, 0.0, 600.0);
+        let make = |name: &str, solvent: Option<&str>, singlet_480: f64| {
+            let mut y = vec![0.02_f64; 256];
+            for (k, slot) in y.iter_mut().enumerate() {
+                let ppm = ax.index_to_ppm(k as f64);
+                *slot += 3.0 * (-0.5 * ((ppm - 1.25) / 0.015).powi(2)).exp();
+                *slot += 2.0 * (-0.5 * ((ppm - 7.26) / 0.015).powi(2)).exp();
+                *slot += singlet_480 * (-0.5 * ((ppm - 4.80) / 0.03).powi(2)).exp();
+            }
+            let mut s = nmr_core::nmr1d::Spectrum1D::new(
+                name,
+                nmr_core::nmr1d::Experiment1DKind::Proton1D,
+                ax.clone(),
+                y,
+                None,
+            );
+            s.solvent = solvent.map(str::to_string);
+            s
+        };
+        // (a) no signal near water at all; (b) CDCl3 sample with a dominant 4.80 ppm solute singlet.
+        for (spec, solvent_txt) in [
+            (make("dry_1h", None, 0.0), "unknown"),
+            (make("cdcl3_singlet", Some("CDCl3"), 12.0), "CDCl3"),
+        ] {
+            app.stack1d_panel.load_user_spectra(vec![spec]);
+            app.drain_1d_undo_into_journal();
+            let undo_before = app.undo_journal.undo_len();
+            let tr_before = app.stack1d_panel.traces[0].intensities().to_vec();
+            app.suppress_water_active_1d();
+            assert_eq!(
+                app.stack1d_panel.traces[0].intensities(),
+                tr_before.as_slice(),
+                "{solvent_txt}: trace must be untouched"
+            );
+            app.drain_1d_undo_into_journal();
+            assert_eq!(
+                app.undo_journal.undo_len(),
+                undo_before,
+                "{solvent_txt}: no undo entry for a no-op"
+            );
+            assert!(!app.stack1d_panel.has_water_undo_active());
+            assert!(
+                app.status_msg
+                    .starts_with("No dominant water peak detected in")
+                    && app
+                        .status_msg
+                        .contains(&format!("for solvent {solvent_txt}; nothing changed"))
+                    && !app.status_msg.contains("Suppressed"),
+                "{solvent_txt}: dishonest status {:?}",
+                app.status_msg
+            );
+        }
     }
 
     #[test]
@@ -18430,8 +18532,15 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             hncacb_orig,
             "2D ws on NmrWorkbenchApp must NEVER mutate hncacb_3d (`v0150:P1-6`)"
         );
+        // `21F:B6`: a second `ws` finds no dominant water left -> honest no-op, no extra undo level,
+        // so a single `wu` restores the original.
         app.suppress_water_active_spectrum();
-        app.undo_water_suppression_active();
+        assert!(
+            app.status_msg
+                .starts_with("No dominant water peak detected"),
+            "second ws: {}",
+            app.status_msg
+        );
         assert_eq!(app.hsqc_spec.as_ref().unwrap().data, hsqc_ws1);
         app.undo_water_suppression_active();
         assert_eq!(app.hsqc_spec.as_ref().unwrap().data, hsqc_orig);
@@ -18521,7 +18630,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         let mut y_1d = vec![0.02_f64; 256];
         for (k, slot) in y_1d.iter_mut().enumerate() {
             let ppm = ax_1d.index_to_ppm(k as f64);
-            *slot += 40.0 * (-0.5 * ((ppm - 4.70) / 0.03).powi(2)).exp();
+            *slot += 12.0 * (-0.5 * ((ppm - 4.70) / 0.03).powi(2)).exp();
             *slot += 3.0 * (-0.5 * ((ppm - 1.25) / 0.015).powi(2)).exp();
         }
         let spec_1d = nmr_core::nmr1d::Spectrum1D::new(

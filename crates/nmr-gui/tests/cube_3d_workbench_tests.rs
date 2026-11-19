@@ -332,7 +332,10 @@ fn test_multi_page_1d_2d_hsqc_3d_sync_and_lossless_3d_water_undo() {
 
     // 3D Water suppression (`ws`) + lossless undo (`wu`) on Cube3d page
     let wcfg = WaterSuppressionConfig::default();
-    let carrier = wb.pages_2d[cube_page].suppress_water_on_3d_cube(&mut cube, &wcfg);
+    let carrier = wb.pages_2d[cube_page]
+        .suppress_water_on_3d_cube(&mut cube, &wcfg)
+        .center_ppm()
+        .expect("3D water wall must be detected and suppressed");
     assert!((carrier - 4.70).abs() < 0.25);
     assert!(
         cube.get(ix_water, iy_amide, iz_ali).abs() < 200.0,

@@ -28,7 +28,7 @@ use nmr_core::picker::{
     sample_cube_3d_trilinear, snap_cube_3d_extremum, Cube3dPickerConfig, CubePeak3D,
 };
 use nmr_core::spectrum::{AxisPpm, Spectrum2D, Spectrum3D};
-use nmr_core::water::{suppress_water_3d, WaterSuppressionConfig};
+use nmr_core::water::{suppress_water_3d, WaterSuppressionConfig, WaterSuppressionOutcome};
 
 use crate::contour_painter::{default_overlay_palette, OverlayLayerSpec, SyncCrosshair};
 use crate::stack1d_panel::{default_trace_color, RoiRegion1d, Stack1dState, Trace1d};
@@ -2210,21 +2210,28 @@ impl Stored2dPage {
     ///
     /// Multi-level (`v0150:P1-6`): repeated `ws` calls push onto `water_undo_3d_stack` (bounded on
     /// `wasm32`) so `ws, ws, wu, wu` restores the intermediate and then the original cube.
+    ///
+    /// `21F:B6`: when no dominant water is detected the cube is untouched and no undo level is
+    /// pushed (the `NotDetected` outcome is returned).
     pub fn suppress_water_on_3d_cube(
         &mut self,
         s3: &mut Spectrum3D,
         cfg: &WaterSuppressionConfig,
-    ) -> f64 {
+    ) -> WaterSuppressionOutcome {
+        let snapshot = s3.clone();
+        let outcome = suppress_water_3d(s3, cfg);
+        if !outcome.is_suppressed() {
+            return outcome;
+        }
         let cap = crate::undo_journal::default_snapshot_depth();
         if self.water_undo_3d_stack.len() >= cap {
             let excess = self.water_undo_3d_stack.len() + 1 - cap;
             self.water_undo_3d_stack.drain(0..excess);
         }
-        self.water_undo_3d_stack.push(s3.clone());
+        self.water_undo_3d_stack.push(snapshot);
         self.water_undo_3d = self.water_undo_3d_stack.last().cloned();
-        let carrier = suppress_water_3d(s3, cfg);
         self.refresh_from_3d_cube(s3, false);
-        carrier
+        outcome
     }
 
     /// Losslessly restore `s3` prior to the most recent 3D water suppression (`wu`) and refresh.

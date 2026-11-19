@@ -21,8 +21,21 @@
 //!   transform reconstruction of the dispersion channel from real-only frequency spectra (`1r`,
 //!   `2rr`, `3rrr`, `.ucsf`).
 //! - Gottlieb, H. E., Kotlyar, V., & Nudelman, A. (*J. Org. Chem.* **1997**, 62, 7512–7515);
-//!   Fulmer, G. R., et al. (*Organometallics* **2010**, 29, 2176–2179) — residual water chemical
-//!   shifts in aqueous ($\sim 4.70\text{ ppm}$) and $\text{DMSO-}d_6$ ($\sim 3.33\text{ ppm}$) solutions.
+//!   Fulmer, G. R., et al. (*Organometallics* **2010**, 29, 2176–2179) — dissolved-water chemical
+//!   shifts by solvent ([`residual_water_window`]: H2O/D2O 4.79 with a 4.55–5.05 ppm temperature
+//!   window, DMSO-d6 3.33, CDCl3 1.56, CD3OD 4.87, acetone-d6 2.84, CD3CN 2.13, C6D6 0.40, …).
+//!
+//! **Detection is guarded, and a miss is reported (`21F:B6`).** Auto-detection only suppresses a
+//! peak that dominates the spectrum (see `assess_water_in_window` for the rule). When no dominant
+//! water is found, every `suppress_water_spectrum_*` call returns
+//! [`WaterSuppressionOutcome::NotDetected`] and leaves the data bit-identical. Set
+//! [`WaterSuppressionConfig::water_ppm`] to override detection by hand.
+//!
+//! **Selectivity limit.** The Marion–Ikura–Bax stopband (`half_width_hz`, default 35 Hz) removes
+//! the water core only. Wings of a strong or phase-distorted water line further than about 0.1
+//! ppm away stay in place and bias the far-baseline heights of nearby solute lines, e.g.
+//! beta-glucose H1 at 4.64 ppm next to HDO at 4.79 ppm. The solute lines themselves are
+//! preserved.
 
 use std::f64::consts::PI;
 
@@ -42,7 +55,8 @@ const KLEVIT_MEDIAN_WINDOW_PTS: usize = 65;
 /// (adapted from Marion, Ikura & Bax 1989) and Klevit (1985) $t_1$-ridge median subtraction.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WaterSuppressionConfig {
-    /// Explicit solvent chemical shift in ppm (`None` = auto-detect via [`detect_water_ppm`]).
+    /// Manual override: explicit water chemical shift in ppm (`None` = solvent-aware, dominance-guarded
+    /// auto-detection via [`detect_dominant_water`]).
     pub water_ppm: Option<f64>,
     /// Nominal outer half-width parameter for the solvent stopband in Hz (`35.0 Hz` default).
     /// The effective 95%-retention stopband half-width scales with the axis digital resolution
@@ -93,27 +107,6 @@ fn median_slice_mut(vals: &mut [f64]) -> f64 {
     let mid = vals.len() / 2;
     let (_, &mut m, _) = vals.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
     m
-}
-
-fn robust_abs_mad_and_max(profile: &[f64]) -> (f64, f64) {
-    if profile.is_empty() {
-        return (0.0, 0.0);
-    }
-    let mut abs_vals: Vec<f64> = Vec::with_capacity(profile.len());
-    let mut gmax = 0.0_f64;
-    for &v in profile {
-        let av = if v.is_finite() { v.abs() } else { 0.0 };
-        if av > gmax {
-            gmax = av;
-        }
-        abs_vals.push(av);
-    }
-    let med = median_slice_mut(&mut abs_vals);
-    for v in &mut abs_vals {
-        *v = (*v - med).abs();
-    }
-    let sigma = 1.4826 * median_slice_mut(&mut abs_vals);
-    (sigma, gmax)
 }
 
 /// Find `(peak_abs, refined_ppm)` inside `[lo_ppm, hi_ppm]` on `axis` using a phase-invariant
@@ -181,121 +174,380 @@ fn find_band_extremum(
     Some((best_abs, refined_ppm))
 }
 
-/// Maximum absolute value in `profile` strictly outside `[lo_ppm, hi_ppm]`.
-fn max_outside_band(axis: &AxisPpm, profile: &[f64], lo_ppm: f64, hi_ppm: f64) -> f64 {
-    let n = axis.size.min(profile.len());
-    let (lo, hi) = (lo_ppm.min(hi_ppm), lo_ppm.max(hi_ppm));
-    let mut best = 0.0_f64;
-    for (i, &v) in profile.iter().take(n).enumerate() {
-        if !v.is_finite() {
-            continue;
-        }
-        let ppm = axis.index_to_ppm(i as f64);
-        if !(lo..=hi).contains(&ppm) {
-            best = best.max(v.abs());
-        }
-    }
-    best
+// ---------------------------------------------------------------------------------------------
+// Solvent-aware residual-water search windows
+// ---------------------------------------------------------------------------------------------
+
+/// Aqueous ($\text{H}_2\text{O}$ / $\text{D}_2\text{O}$ / $\text{HDO}$) residual-water search window in ppm.
+///
+/// Gottlieb, Kotlyar & Nudelman (*J. Org. Chem.* **1997**, 62, 7512–7515, Table 1 and text) give
+/// $\delta(\text{HDO}) = 4.79\text{ ppm}$ in $\text{D}_2\text{O}$ at 25 °C and the temperature
+/// dependence $\delta = 5.060 - 0.0122\,T + 2.11\times10^{-5}\,T^2$ ($T$ in °C), i.e. about
+/// `5.00 ppm` at 5 °C and `4.55 ppm` at ~45 °C. `4.55..=5.05 ppm` therefore covers routine
+/// biomolecular temperatures (5–45 °C) plus the usual ±0.01–0.02 ppm referencing spread.
+pub const AQUEOUS_WATER_WINDOW_PPM: (f64, f64) = (4.55, 5.05);
+
+/// Nominal aqueous water / carrier shift used by [`detect_water_ppm`]'s legacy fallback.
+const AQUEOUS_NOMINAL_FALLBACK_PPM: f64 = 4.70;
+
+/// Half-width (ppm) of the residual-water search window in organic deuterated solvents.
+///
+/// The dissolved-water shift in organic solvents moves with water content, temperature and
+/// solute H-bonding (Gottlieb et al. 1997 note this explicitly for the `H2O` row of Table 1), so
+/// the window is centred on the tabulated value and opened by ±0.15 ppm.
+pub const ORGANIC_WATER_WINDOW_HALF_WIDTH_PPM: f64 = 0.15;
+
+/// Solvent context used to choose where residual water may legitimately appear.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResidualWaterWindow {
+    /// Human-readable solvent label (e.g. `"CDCl3"`, `"H2O/D2O"`, `"unknown"`).
+    pub solvent_label: String,
+    /// Literature dissolved-water shift at 298 K (`None` for unknown solvents).
+    pub literature_ppm: Option<f64>,
+    /// Search window `(lo_ppm, hi_ppm)` for the residual water candidate.
+    pub lo_ppm: f64,
+    pub hi_ppm: f64,
+    /// `true` when the solvent hint was not recognised (aqueous window + DMSO fallback are tried,
+    /// both under the dominance guard).
+    pub unknown_solvent: bool,
+    /// `true` for aqueous samples (and for unknown solvents, which use the aqueous window).
+    pub aqueous_window: bool,
 }
 
-/// Detect a dominant residual water / HDO chemical shift (in ppm) along `axis` from 1D `profile`.
+fn clean_solvent_hint(hint: &str) -> String {
+    hint.trim_matches(['<', '>', '"', '\'', ' '])
+        .trim()
+        .to_string()
+}
+
+/// Resolve the residual-water search window for a solvent hint.
 ///
-/// Unlike [`detect_water_ppm`], which falls back to `4.70 ppm` (or `3.33 ppm` for DMSO) when no
-/// dominant solvent resonance is present, this returns `None` when no candidate peak dominates the
-/// spectrum. Requiring spectral dominance (`> 6 * sigma`, `>= 0.50 * global_max`, and `> 5x` the
-/// tallest peak outside `±0.15 ppm` of the candidate) prevents auto-detection from deleting solute
-/// resonances inside `4.60..=5.00 ppm` (e.g. β-glucose anomeric H1 at `4.64 ppm` in dry or D2O
-/// samples) when no dominant residual water peak is present.
+/// Dissolved $\text{H}_2\text{O}$ shifts come from the deuterated-solvent reference table in
+/// [`crate::nmr1d::lookup_deuterated_solvent`] (`h2o_h1_ppm`), which reproduces Gottlieb et al.
+/// 1997 Table 1 (`CDCl3` 1.56, acetone-d6 2.84, DMSO-d6 3.33, `C6D6` 0.40, `CD3CN` 2.13,
+/// `CD3OD` 4.87, `D2O` 4.79) and Fulmer et al. (*Organometallics* **2010**, 29, 2176–2179,
+/// Table 1: THF-d8 2.46, `CD2Cl2` 1.52, toluene-d8 0.43). Aqueous samples (`H2O`, `D2O`,
+/// `H2O+D2O`, …) use [`AQUEOUS_WATER_WINDOW_PPM`]; organic solvents use the tabulated value
+/// ± [`ORGANIC_WATER_WINDOW_HALF_WIDTH_PPM`]; unrecognised / absent hints use the aqueous window.
+pub fn residual_water_window(solvent_hint: Option<&str>) -> ResidualWaterWindow {
+    let raw = solvent_hint.map(clean_solvent_hint).unwrap_or_default();
+    let aqueous = |label: &str| ResidualWaterWindow {
+        solvent_label: label.to_string(),
+        literature_ppm: Some(4.79),
+        lo_ppm: AQUEOUS_WATER_WINDOW_PPM.0,
+        hi_ppm: AQUEOUS_WATER_WINDOW_PPM.1,
+        unknown_solvent: false,
+        aqueous_window: true,
+    };
+    if raw.is_empty() {
+        return ResidualWaterWindow {
+            unknown_solvent: true,
+            literature_ppm: None,
+            ..aqueous("unknown")
+        };
+    }
+    if crate::nmr1d::is_aqueous_solvent_label(&raw) {
+        return aqueous(&raw);
+    }
+    if let Some(entry) = crate::nmr1d::lookup_deuterated_solvent(&raw) {
+        if entry.canonical_name.eq_ignore_ascii_case("D2O") {
+            return aqueous(entry.canonical_name);
+        }
+        let w = entry.h2o_h1_ppm;
+        return ResidualWaterWindow {
+            solvent_label: entry.canonical_name.to_string(),
+            literature_ppm: Some(w),
+            lo_ppm: w - ORGANIC_WATER_WINDOW_HALF_WIDTH_PPM,
+            hi_ppm: w + ORGANIC_WATER_WINDOW_HALF_WIDTH_PPM,
+            unknown_solvent: false,
+            aqueous_window: false,
+        };
+    }
+    ResidualWaterWindow {
+        unknown_solvent: true,
+        literature_ppm: None,
+        ..aqueous(&format!("unknown ({raw})"))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dominance rule
+// ---------------------------------------------------------------------------------------------
+
+/// Candidate must exceed this many robust noise sigmas ($1.4826\,\text{MAD}$) above baseline.
+pub const WATER_MIN_SNR: f64 = 10.0;
+/// Candidate must be at least this many times taller than the tallest solute peak outside the
+/// linewidth-adaptive exclusion zone (rule A).
+pub const WATER_MIN_RATIO_TO_TALLEST_SOLUTE: f64 = 3.0;
+/// Rule B (crowded spectra): at least this many times the median of the top-N solute peaks …
+pub const WATER_MIN_RATIO_TO_TOP_N_MEDIAN: f64 = 10.0;
+/// … and at least this many times the tallest solute peak.
+pub const WATER_MIN_RATIO_TO_TALLEST_RULE_B: f64 = 2.0;
+/// Number of tallest significant solute peaks whose median defines the rule-B reference.
+pub const WATER_TOP_N_SOLUTE_PEAKS: usize = 5;
+/// Exclusion zone half-width = max(0.15 ppm, this × the candidate's half width at half height).
+/// A Lorentzian falls to $1/(1+12^2) \approx 0.7\%$ of its height at 12 HWHM, so the wings of a
+/// broad (radiation-damped, FWHM ≥ 100 Hz) water line are not mistaken for solute peaks.
+pub const WATER_EXCLUSION_HWHM_MULTIPLE: f64 = 12.0;
+/// Minimum exclusion zone half-width (ppm).
+pub const WATER_MIN_EXCLUSION_PPM: f64 = 0.15;
+/// Solute local maxima must exceed this many noise sigmas to count as peaks.
+const SOLUTE_PEAK_MIN_SNR: f64 = 5.0;
+
+/// Why automatic water detection declined to suppress anything.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WaterNotDetected {
+    /// Solvent label used for the search window.
+    pub solvent_label: String,
+    /// Search window searched (ppm).
+    pub window_lo_ppm: f64,
+    pub window_hi_ppm: f64,
+    /// Short human-readable explanation of which part of the dominance rule failed.
+    pub reason: String,
+}
+
+impl std::fmt::Display for WaterNotDetected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "No dominant water peak detected in {:.2}–{:.2} ppm for solvent {} ({})",
+            self.window_lo_ppm, self.window_hi_ppm, self.solvent_label, self.reason
+        )
+    }
+}
+
+/// Result of a 1D / 2D / 3D water-suppression call.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WaterSuppressionOutcome {
+    /// Water was suppressed at `center_ppm`; the data were modified. `auto_detected` is `false`
+    /// when the centre came from the manual override [`WaterSuppressionConfig::water_ppm`].
+    Suppressed {
+        center_ppm: f64,
+        auto_detected: bool,
+    },
+    /// Nothing was changed: no dominant residual water peak was found (or the requested water
+    /// position is not on a processable 1H axis). The data are bit-identical to the input.
+    NotDetected(WaterNotDetected),
+}
+
+impl WaterSuppressionOutcome {
+    /// Suppression centre in ppm, or `None` when nothing was changed.
+    pub fn center_ppm(&self) -> Option<f64> {
+        match self {
+            Self::Suppressed { center_ppm, .. } => Some(*center_ppm),
+            Self::NotDetected(_) => None,
+        }
+    }
+
+    /// `true` when the data were modified.
+    pub fn is_suppressed(&self) -> bool {
+        matches!(self, Self::Suppressed { .. })
+    }
+
+    fn not_applied(solvent_label: &str, lo: f64, hi: f64, reason: impl Into<String>) -> Self {
+        Self::NotDetected(WaterNotDetected {
+            solvent_label: solvent_label.to_string(),
+            window_lo_ppm: lo,
+            window_hi_ppm: hi,
+            reason: reason.into(),
+        })
+    }
+}
+
+fn median_of(vals: &[f64]) -> f64 {
+    let mut v: Vec<f64> = vals.iter().copied().filter(|x| x.is_finite()).collect();
+    median_slice_mut(&mut v)
+}
+
+/// Assess whether the largest signal inside `[lo, hi]` is a dominant residual-water line.
+///
+/// `profile` is a 1D trace (or a 1H projection of a 2D/3D spectrum). `candidate_mask`, when
+/// given, restricts which points may be the water candidate (used by 2D/3D to require that the
+/// water ridge persists across indirect rows) while the solute comparison still uses every point
+/// of `profile`.
+///
+/// **Dominance rule** (all heights are $|p - b|$ with $b$ the profile median baseline, $\sigma$ =
+/// $1.4826\,\mathrm{MAD}$):
+/// 1. Candidate $W$ = the largest point in the window; its half width at half height
+///    (HWHM) is measured by walking out from the maximum (the wider side is used, so dispersive
+///    `1r` water is treated conservatively).
+/// 2. $W > 10\sigma$ ([`WATER_MIN_SNR`]).
+/// 3. Solute peaks = strict local maxima $> 5\sigma$ outside the exclusion zone
+///    $|\delta - \delta_W| \le \max(0.15, 12\,\mathrm{HWHM})$ ppm.
+/// 4. Dominant iff (A) $W \ge 3\times$ the tallest solute peak, or (B) at least 5 solute peaks
+///    exist, $W \ge 2\times$ the tallest and $W \ge 10\times$ the median of the 5 tallest. With no
+///    significant solute peak outside the zone, step 2 alone decides.
+fn assess_water_in_window(
+    axis: &AxisPpm,
+    profile: &[f64],
+    candidate_mask: Option<&[bool]>,
+    lo: f64,
+    hi: f64,
+) -> Result<f64, String> {
+    let n = axis.size.min(profile.len());
+    if n < 3 {
+        return Err("profile too short".to_string());
+    }
+    let (lo, hi) = (lo.min(hi), lo.max(hi));
+    if hi < axis.min_ppm() || lo > axis.max_ppm() {
+        return Err("search window is outside the spectral width".to_string());
+    }
+    let base = median_of(&profile[..n]);
+    let heights: Vec<f64> = profile[..n]
+        .iter()
+        .map(|&v| if v.is_finite() { (v - base).abs() } else { 0.0 })
+        .collect();
+    let sigma = 1.4826 * median_of(&heights);
+
+    let mut cand_heights = heights.clone();
+    if let Some(mask) = candidate_mask {
+        for (h, &ok) in cand_heights.iter_mut().zip(mask.iter()) {
+            if !ok {
+                *h = 0.0;
+            }
+        }
+    }
+    let Some((amp, center_ppm)) = find_band_extremum(axis, &cand_heights, lo, hi) else {
+        return Err("search window is outside the spectral width".to_string());
+    };
+    if amp <= 0.0 {
+        return Err("no signal in the search window".to_string());
+    }
+    if amp <= WATER_MIN_SNR * sigma {
+        return Err(format!(
+            "tallest in-window signal is only {:.1} noise sigma (needs > {WATER_MIN_SNR:.0})",
+            amp / sigma.max(1e-300)
+        ));
+    }
+
+    // Half width at half height of the candidate (wider side, in points).
+    let peak_idx = {
+        let mut best = 0usize;
+        let mut best_v = -1.0_f64;
+        for (i, &h) in cand_heights.iter().enumerate() {
+            let p = axis.index_to_ppm(i as f64);
+            if (lo..=hi).contains(&p) && h > best_v {
+                best_v = h;
+                best = i;
+            }
+        }
+        best
+    };
+    let half = 0.5 * heights[peak_idx];
+    let mut left = 0usize;
+    while peak_idx > left && heights[peak_idx - left - 1] >= half {
+        left += 1;
+    }
+    let mut right = 0usize;
+    while peak_idx + right + 1 < n && heights[peak_idx + right + 1] >= half {
+        right += 1;
+    }
+    let hwhm_pts = (left.max(right) as f64) + 0.5;
+    let hwhm_ppm = hwhm_pts * axis.step_ppm.abs();
+    let excl_ppm = WATER_MIN_EXCLUSION_PPM.max(WATER_EXCLUSION_HWHM_MULTIPLE * hwhm_ppm);
+    let peak_ppm = axis.index_to_ppm(peak_idx as f64);
+
+    let solute_gate = SOLUTE_PEAK_MIN_SNR * sigma;
+    let mut solute: Vec<f64> = Vec::new();
+    for i in 1..n - 1 {
+        let h = heights[i];
+        if h > heights[i - 1] && h >= heights[i + 1] && h > solute_gate {
+            let p = axis.index_to_ppm(i as f64);
+            if (p - peak_ppm).abs() > excl_ppm {
+                solute.push(h);
+            }
+        }
+    }
+    solute.sort_by(|a, b| b.total_cmp(a));
+    let tallest = solute.first().copied().unwrap_or(0.0);
+    let rule_a = amp >= WATER_MIN_RATIO_TO_TALLEST_SOLUTE * tallest;
+    let rule_b = solute.len() >= WATER_TOP_N_SOLUTE_PEAKS && {
+        let top = &solute[..WATER_TOP_N_SOLUTE_PEAKS];
+        let med_top = top[WATER_TOP_N_SOLUTE_PEAKS / 2];
+        amp >= WATER_MIN_RATIO_TO_TALLEST_RULE_B * tallest
+            && amp >= WATER_MIN_RATIO_TO_TOP_N_MEDIAN * med_top
+    };
+    if rule_a || rule_b {
+        Ok(center_ppm)
+    } else {
+        Err(format!(
+            "tallest in-window signal at {center_ppm:.3} ppm is only {:.2}x the tallest solute \
+             peak outside ±{excl_ppm:.2} ppm (needs >= {WATER_MIN_RATIO_TO_TALLEST_SOLUTE:.0}x)",
+            amp / tallest.max(1e-300)
+        ))
+    }
+}
+
+/// Solvent-aware, dominance-guarded residual-water detection on a 1D profile (or a 1H
+/// projection). Returns the refined water centre in ppm, or a [`WaterNotDetected`] explaining
+/// why nothing should be suppressed. See [`assess_water_in_window`] for the rule.
+///
+/// Unknown / absent solvent: the aqueous window is tried first, then (for un-hinted `.ucsf`
+/// DMSO-d6 data) the DMSO-d6 window, both under the same dominance guard. A dominant
+/// solute singlet inside `4.55..=5.05 ppm` with no solvent hint is indistinguishable from water
+/// by this rule; supply a solvent hint or an explicit [`WaterSuppressionConfig::water_ppm`].
+pub fn detect_dominant_water(
+    axis: &AxisPpm,
+    profile: &[f64],
+    solvent_hint: Option<&str>,
+) -> Result<f64, WaterNotDetected> {
+    detect_dominant_water_masked(axis, profile, None, solvent_hint)
+}
+
+fn detect_dominant_water_masked(
+    axis: &AxisPpm,
+    profile: &[f64],
+    candidate_mask: Option<&[bool]>,
+    solvent_hint: Option<&str>,
+) -> Result<f64, WaterNotDetected> {
+    let win = residual_water_window(solvent_hint);
+    let primary = assess_water_in_window(axis, profile, candidate_mask, win.lo_ppm, win.hi_ppm);
+    match primary {
+        Ok(ppm) => Ok(ppm),
+        Err(reason) => {
+            if win.unknown_solvent {
+                let dmso = residual_water_window(Some("DMSO-d6"));
+                if let Ok(ppm) =
+                    assess_water_in_window(axis, profile, candidate_mask, dmso.lo_ppm, dmso.hi_ppm)
+                {
+                    return Ok(ppm);
+                }
+            }
+            Err(WaterNotDetected {
+                solvent_label: win.solvent_label,
+                window_lo_ppm: win.lo_ppm,
+                window_hi_ppm: win.hi_ppm,
+                reason,
+            })
+        }
+    }
+}
+
+/// Option-returning convenience wrapper over [`detect_dominant_water`].
 pub fn detect_dominant_water_ppm(
     axis: &AxisPpm,
     profile: &[f64],
     solvent_hint: Option<&str>,
 ) -> Option<f64> {
-    let hint_low = solvent_hint.unwrap_or("").trim().to_ascii_lowercase();
-    let is_dmso_hint = hint_low.contains("dmso");
-    let is_aqueous_hint =
-        hint_low.contains("h2o") || hint_low.contains("d2o") || hint_low.contains("water");
-
-    let n = axis.size.min(profile.len());
-    if n == 0 {
-        return None;
-    }
-
-    let (sigma, global_max) = robust_abs_mad_and_max(&profile[..n]);
-    if global_max <= 0.0 {
-        return None;
-    }
-
-    let h2o_cand = find_band_extremum(axis, &profile[..n], 4.60, 5.00);
-    let dmso_cand = find_band_extremum(axis, &profile[..n], 3.22, 3.48);
-    let sig_gate = (6.0 * sigma).max(1e-30);
-
-    if is_dmso_hint {
-        if let Some((dmso_amp, dmso_ppm)) = dmso_cand {
-            let outside_dmso =
-                max_outside_band(axis, &profile[..n], dmso_ppm - 0.15, dmso_ppm + 0.15);
-            if dmso_amp > sig_gate && dmso_amp >= 0.50 * global_max && dmso_amp > 5.0 * outside_dmso
-            {
-                return Some(dmso_ppm);
-            }
-        }
-        return None;
-    }
-
-    let h2o_amp = h2o_cand.map(|c| c.0).unwrap_or(0.0);
-    let dmso_amp = dmso_cand.map(|c| c.0).unwrap_or(0.0);
-
-    // Un-hinted DMSO-d6 detection (e.g. `.ucsf` files without solvent header):
-    // When no strong ~4.70 ppm solvent peak exists (`h2o_amp < 0.15 * global_max`) and a dominant
-    // water singlet in `3.22..3.48 ppm` dominates both the spectrum (`>= 0.50 * global_max`) and
-    // outside peaks by > 5x, select the ~3.33 ppm DMSO water peak.
-    if !is_aqueous_hint {
-        if let Some((_, dmso_ppm)) = dmso_cand {
-            if dmso_amp > sig_gate
-                && dmso_amp >= 0.50 * global_max
-                && h2o_amp < 0.15 * global_max
-                && dmso_amp > 5.0 * h2o_amp
-            {
-                let outside_dmso =
-                    max_outside_band(axis, &profile[..n], dmso_ppm - 0.15, dmso_ppm + 0.15);
-                if dmso_amp > 5.0 * outside_dmso {
-                    return Some(dmso_ppm);
-                }
-            }
-        }
-    }
-
-    // Aqueous H2O / HDO dominance check in `4.60..=5.00 ppm`:
-    // Require the candidate to dominate the spectrum (`> 6 * sigma`, `>= 0.50 * global_max`, and
-    // `> 5x` the tallest peak outside `±0.15 ppm`) so dry / D2O solute resonances such as
-    // β-glucose anomeric H1 (`4.64 ppm`) are never mistaken for residual water.
-    if let Some((amp, h2o_ppm)) = h2o_cand {
-        let outside_h2o = max_outside_band(axis, &profile[..n], h2o_ppm - 0.15, h2o_ppm + 0.15);
-        if amp > sig_gate && amp >= 0.50 * global_max && amp > 5.0 * outside_h2o {
-            return Some(h2o_ppm);
-        }
-    }
-
-    None
+    detect_dominant_water(axis, profile, solvent_hint).ok()
 }
 
-/// Detect the dominant residual water / HDO chemical shift (in ppm) along `axis` from 1D `profile`:
-/// - Searches `4.60..=5.00 ppm` for a dominant aqueous $\text{H}_2\text{O}/\text{D}_2\text{O}$
-///   peak ($\sim 4.70\text{ ppm}$).
-/// - Searches `3.22..=3.48 ppm` when `solvent_hint` indicates `DMSO` (`"DMSO"`, `"DMSO-d6"`, etc.)
-///   or when no strong `4.7 ppm` water peak is present and a dominant solvent singlet sits near
-///   `3.33 ppm` (Gottlieb et al. 1997; Fulmer et al. 2010).
-/// - Falls back to `4.70 ppm` (or `3.33 ppm` for DMSO hints) when `profile` is empty, flat noise,
-///   or contains no dominant solvent peak (e.g. dry or D2O solute-only spectra).
+/// Legacy helper returning a water position even when none is dominant: the detected dominant
+/// water, else the solvent's literature water shift when it lies on `axis` (organic solvents),
+/// else the nominal aqueous `4.70 ppm`. **Do not use the fallback value to decide whether to
+/// suppress** — the `suppress_water_spectrum_*` functions use [`detect_dominant_water`] and
+/// return [`WaterSuppressionOutcome::NotDetected`] instead. Kept for peak-picker exclusion bands.
 pub fn detect_water_ppm(axis: &AxisPpm, profile: &[f64], solvent_hint: Option<&str>) -> f64 {
     if let Some(ppm) = detect_dominant_water_ppm(axis, profile, solvent_hint) {
         return ppm;
     }
-    let hint_low = solvent_hint.unwrap_or("").trim().to_ascii_lowercase();
-    if hint_low.contains("dmso") && axis.min_ppm() <= 3.33 && axis.max_ppm() >= 3.33 {
-        return 3.33;
+    let win = residual_water_window(solvent_hint);
+    if let (false, Some(lit)) = (win.aqueous_window, win.literature_ppm) {
+        if axis.min_ppm() <= lit && axis.max_ppm() >= lit {
+            return lit;
+        }
     }
-    4.70
+    AQUEOUS_NOMINAL_FALLBACK_PPM
 }
 
 fn is_proton_axis(axis: &AxisPpm) -> bool {
@@ -735,38 +987,42 @@ where
 /// Suppress the solvent / water peak in a processed 1D spectrum (`Spectrum1D`) in place via causal
 /// Hilbert reconstruction (when `spec.imag` is `None`), carrier-shifted Marion–Ikura–Bax (1989)
 /// Gaussian time-domain convolution subtraction (`radius <= valid_len / 4`), and smooth raised-cosine
-/// residual notch polish inside the immediate water core. Returns the detected or configured `water_ppm`.
-pub fn suppress_water_spectrum_1d(spec: &mut Spectrum1D, cfg: &WaterSuppressionConfig) -> f64 {
-    let water_ppm = match cfg.water_ppm {
-        Some(w) => w,
-        None => {
-            if let Some(w) =
-                detect_dominant_water_ppm(&spec.axis, &spec.real, spec.solvent.as_deref())
-            {
-                w
-            } else {
-                // No dominant solvent peak detected in auto-detect mode: skip suppression
-                // rather than attenuating solute resonances in 4.60..=5.00 ppm (e.g. β-glucose
-                // anomeric H1 at 4.64 ppm in dry or D2O samples).
-                let hint_low = spec
-                    .solvent
-                    .as_deref()
-                    .unwrap_or("")
-                    .trim()
-                    .to_ascii_lowercase();
-                if hint_low.contains("dmso")
-                    && spec.axis.min_ppm() <= 3.33
-                    && spec.axis.max_ppm() >= 3.33
-                {
-                    return 3.33;
-                }
-                return 4.70;
-            }
-        }
+/// residual notch polish inside the immediate water core.
+///
+/// With `cfg.water_ppm = None` the centre comes from the solvent-aware, dominance-guarded
+/// [`detect_dominant_water`] (using `spec.solvent`). When no dominant water is found, or the
+/// centre is off-axis, `spec` is left bit-identical and
+/// [`WaterSuppressionOutcome::NotDetected`] is returned — callers must not report success or
+/// record an undo step in that case.
+pub fn suppress_water_spectrum_1d(
+    spec: &mut Spectrum1D,
+    cfg: &WaterSuppressionConfig,
+) -> WaterSuppressionOutcome {
+    let win = residual_water_window(spec.solvent.as_deref());
+    let (water_ppm, auto_detected) = match cfg.water_ppm {
+        Some(w) => (w, false),
+        None => match detect_dominant_water(&spec.axis, &spec.real, spec.solvent.as_deref()) {
+            Ok(w) => (w, true),
+            Err(nd) => return WaterSuppressionOutcome::NotDetected(nd),
+        },
     };
     if spec.len() < 8 {
-        return water_ppm;
+        return WaterSuppressionOutcome::not_applied(
+            &win.solvent_label,
+            win.lo_ppm,
+            win.hi_ppm,
+            "trace has fewer than 8 points",
+        );
     }
+    if !water_overlaps_axis(&spec.axis, water_ppm, cfg.half_width_hz) {
+        return WaterSuppressionOutcome::not_applied(
+            &win.solvent_label,
+            water_ppm,
+            water_ppm,
+            format!("water position {water_ppm:.3} ppm is outside the spectral width"),
+        );
+    }
+    let before_real = spec.real.clone();
     let was_real_only = spec.imag.is_none();
     if was_real_only {
         hilbert_reconstruct_imaginary_1d(spec);
@@ -785,11 +1041,31 @@ pub fn suppress_water_spectrum_1d(spec: &mut Spectrum1D, cfg: &WaterSuppressionC
         &mut work,
         &mut orig_td,
     );
-    water_ppm
+    let unchanged = spec
+        .real
+        .iter()
+        .zip(before_real.iter())
+        .all(|(a, b)| a.to_bits() == b.to_bits());
+    if unchanged {
+        // The trace-level core/shoulder guard found no line centred at `water_ppm`.
+        if was_real_only {
+            spec.imag = None;
+        }
+        return WaterSuppressionOutcome::not_applied(
+            &win.solvent_label,
+            water_ppm,
+            water_ppm,
+            format!("no water line centred at {water_ppm:.3} ppm on this trace"),
+        );
+    }
+    WaterSuppressionOutcome::Suppressed {
+        center_ppm: water_ppm,
+        auto_detected,
+    }
 }
 
 /// Suppress the solvent / water resonance and indirect $t_1$-noise ridges in a processed 2D spectrum
-/// (`Spectrum2D`) in place, returning the detected or configured `water_ppm`:
+/// (`Spectrum2D`) in place, returning a [`WaterSuppressionOutcome`] (`NotDetected` = data bit-identical):
 /// 1. Along direct `F2` (`axis_x`, when `${}^{1}\text{H}$ or `cfg.water_ppm.is_some()`): real-to-causal
 ///    Hilbert -> IFFT -> Marion–Ikura–Bax (1989) Gaussian time-domain water subtraction (`radius <= valid_len / 4`)
 ///    + smooth core residual polish on rows containing a dominant solvent peak.
@@ -799,23 +1075,31 @@ pub fn suppress_water_spectrum_1d(spec: &mut Spectrum1D, cfg: &WaterSuppressionC
 /// 3. When opt-in `cfg.suppress_homonuclear_f1` is enabled and `axis_y` is also `${}^{1}\text{H}$ (`NOESY`, `TOCSY`,
 ///    `COSY`, `ROESY`): symmetric `F1` column Marion–Ikura–Bax + `F2` row `65`-pt sliding-median ridge subtraction
 ///    along $|F_1 - \delta_{\text{water}}|$.
-pub fn suppress_water_spectrum_2d(spec: &mut Spectrum2D, cfg: &WaterSuppressionConfig) -> f64 {
+pub fn suppress_water_spectrum_2d(
+    spec: &mut Spectrum2D,
+    cfg: &WaterSuppressionConfig,
+) -> WaterSuppressionOutcome {
     let nx = spec.axis_x.size;
     let ny = spec.axis_y.size;
     let x_is_h = is_proton_axis(&spec.axis_x);
     let y_is_h = is_proton_axis(&spec.axis_y);
+    let win = residual_water_window(None);
+    let have_data = nx > 0 && ny > 0 && spec.data.len() >= nx * ny;
 
-    // Build row-persistent solvent profile: require at least 25% of indirect rows (`q75 > 0`)
-    // to carry signal at column `ix` (or homonuclear diagonal `(ix, iy)` dominance) so an isolated
-    // off-water cross-peak at e.g. `(F2 = 4.65, F1 = 2.00)` on a water-free 2D spectrum is never
-    // mistaken for residual water, while a true `(4.70, 4.70)` volcano + ridge peaks sharply at 4.70.
+    // Dominance-guarded detection on the 1H projection (sum of |rows| / |columns|). Candidate
+    // points must additionally be row-persistent: at least 25% of indirect rows (`q75 > 0`) carry
+    // signal at column `ix`, so an isolated off-water cross-peak at e.g. `(F2 = 4.65, F1 = 2.00)`
+    // on a water-free 2D spectrum is never mistaken for residual water, while a true
+    // `(4.70, 4.70)` volcano + t1 ridge peaks sharply at 4.70. The solute comparison of the
+    // dominance rule uses the full (ungated) projection.
     let water_ppm = if let Some(w) = cfg.water_ppm {
         w
-    } else if nx > 0 && ny > 0 && spec.data.len() >= nx * ny && (x_is_h || !y_is_h) {
+    } else if have_data && (x_is_h || !y_is_h) {
         let mut prof_x = vec![0.0_f64; nx];
+        let mut mask_x = vec![false; nx];
         let mut col_tmp = vec![0.0_f64; ny];
         let q75_idx = ((ny * 3) / 4).min(ny - 1);
-        for (ix, px) in prof_x.iter_mut().enumerate() {
+        for (ix, (px, mx)) in prof_x.iter_mut().zip(mask_x.iter_mut()).enumerate() {
             let mut col_sum = 0.0_f64;
             for (iy, ct) in col_tmp.iter_mut().enumerate() {
                 let v = spec.data[iy * nx + ix];
@@ -825,17 +1109,20 @@ pub fn suppress_water_spectrum_2d(spec: &mut Spectrum2D, cfg: &WaterSuppressionC
             }
             let (_, &mut q75, _) = col_tmp.select_nth_unstable_by(q75_idx, |a, b| a.total_cmp(b));
             let mean_abs = col_sum / (ny as f64);
+            *px = col_sum;
             // Isolated cross-peaks occupy << 25% of rows (`q75` near zero relative to `mean_abs`).
-            if q75 >= 0.05 * mean_abs {
-                *px = col_sum;
-            }
+            *mx = q75 >= 0.05 * mean_abs;
         }
-        detect_water_ppm(&spec.axis_x, &prof_x, None)
-    } else if nx > 0 && ny > 0 && spec.data.len() >= nx * ny && y_is_h {
+        match detect_dominant_water_masked(&spec.axis_x, &prof_x, Some(&mask_x), None) {
+            Ok(w) => w,
+            Err(nd) => return WaterSuppressionOutcome::NotDetected(nd),
+        }
+    } else if have_data && y_is_h {
         let mut prof_y = vec![0.0_f64; ny];
+        let mut mask_y = vec![false; ny];
         let mut row_tmp = vec![0.0_f64; nx];
         let q75_idx = ((nx * 3) / 4).min(nx - 1);
-        for (iy, py) in prof_y.iter_mut().enumerate() {
+        for (iy, (py, my)) in prof_y.iter_mut().zip(mask_y.iter_mut()).enumerate() {
             let row = &spec.data[iy * nx..(iy + 1) * nx];
             let mut row_sum = 0.0_f64;
             for (rt, &v) in row_tmp.iter_mut().zip(row.iter()) {
@@ -845,18 +1132,32 @@ pub fn suppress_water_spectrum_2d(spec: &mut Spectrum2D, cfg: &WaterSuppressionC
             }
             let (_, &mut q75, _) = row_tmp.select_nth_unstable_by(q75_idx, |a, b| a.total_cmp(b));
             let mean_abs = row_sum / (nx as f64);
-            if q75 >= 0.05 * mean_abs {
-                *py = row_sum;
-            }
+            *py = row_sum;
+            *my = q75 >= 0.05 * mean_abs;
         }
-        detect_water_ppm(&spec.axis_y, &prof_y, None)
+        match detect_dominant_water_masked(&spec.axis_y, &prof_y, Some(&mask_y), None) {
+            Ok(w) => w,
+            Err(nd) => return WaterSuppressionOutcome::NotDetected(nd),
+        }
     } else {
-        4.70
+        return WaterSuppressionOutcome::not_applied(
+            &win.solvent_label,
+            win.lo_ppm,
+            win.hi_ppm,
+            "empty 2D spectrum",
+        );
     };
+    let auto_detected = cfg.water_ppm.is_none();
 
     if nx < 8 || ny == 0 || spec.data.len() < nx * ny {
-        return water_ppm;
+        return WaterSuppressionOutcome::not_applied(
+            &win.solvent_label,
+            water_ppm,
+            water_ppm,
+            "2D spectrum too small to process",
+        );
     }
+    let before = spec.data.clone();
 
     let process_x = x_is_h || cfg.water_ppm.is_some();
     if process_x && water_overlaps_axis(&spec.axis_x, water_ppm, cfg.half_width_hz) {
@@ -1017,30 +1318,68 @@ pub fn suppress_water_spectrum_2d(spec: &mut Spectrum2D, cfg: &WaterSuppressionC
         }
     }
 
-    water_ppm
+    finish_nd_outcome(&before, &spec.data, water_ppm, auto_detected, &win)
+}
+
+/// Report `Suppressed` only when the data actually changed; otherwise `NotDetected` (bit-identical).
+fn finish_nd_outcome(
+    before: &[f32],
+    after: &[f32],
+    water_ppm: f64,
+    auto_detected: bool,
+    win: &ResidualWaterWindow,
+) -> WaterSuppressionOutcome {
+    let unchanged = before.len() == after.len()
+        && before
+            .iter()
+            .zip(after.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+    if unchanged {
+        WaterSuppressionOutcome::not_applied(
+            &win.solvent_label,
+            water_ppm,
+            water_ppm,
+            format!(
+                "no water line centred at {water_ppm:.3} ppm on a processable 1H axis \
+                 (direct axis not 1H, or no trace carried a line there)"
+            ),
+        )
+    } else {
+        WaterSuppressionOutcome::Suppressed {
+            center_ppm: water_ppm,
+            auto_detected,
+        }
+    }
 }
 
 /// Suppress the solvent / water resonance and indirect $t_1$/$t_2$ water-slab ridges in a 3D
-/// spectrum (`Spectrum3D`) in place, returning the detected or configured `water_ppm`:
+/// spectrum (`Spectrum3D`) in place, returning a [`WaterSuppressionOutcome`] (`NotDetected` = data bit-identical):
 /// 1. Applies `F3` (`axis_x`) Marion–Ikura–Bax (1989) row water subtraction + smooth residual polish
 ///    across all `(iy, iz)` traces in parallel.
 /// 2. Applies Klevit (1985) sliding-median ridge subtraction across the indirect `(iy, iz)` planes
 ///    inside the `F3` water slab $|F_3 - \delta_{\text{water}}| \le 3.0 \times (\text{half\_width\_hz} / \text{obs\_mhz})$.
-pub fn suppress_water_spectrum_3d(spec: &mut Spectrum3D, cfg: &WaterSuppressionConfig) -> f64 {
+pub fn suppress_water_spectrum_3d(
+    spec: &mut Spectrum3D,
+    cfg: &WaterSuppressionConfig,
+) -> WaterSuppressionOutcome {
     let nx = spec.axis_x.size;
     let ny = spec.axis_y.size;
     let nz = spec.axis_z.size;
     let total_rows = ny.saturating_mul(nz);
     let total_elems = total_rows.saturating_mul(nx);
     let x_is_h = is_proton_axis(&spec.axis_x);
+    let win = residual_water_window(None);
 
+    // Dominance-guarded detection on the direct-axis projection (sum of |F3 rows|), with the
+    // candidate restricted to row-persistent columns (`q75 >= 0.05 * mean`), as in 2D.
     let water_ppm = if let Some(w) = cfg.water_ppm {
         w
     } else if nx > 0 && total_rows > 0 && spec.data.len() >= total_elems {
         let mut prof_x = vec![0.0_f64; nx];
+        let mut mask_x = vec![true; nx];
         if total_rows >= 4 {
             let mut col = Vec::with_capacity(total_rows);
-            for (ix, px_slot) in prof_x.iter_mut().enumerate().take(nx) {
+            for (ix, (px_slot, m_slot)) in prof_x.iter_mut().zip(mask_x.iter_mut()).enumerate() {
                 col.clear();
                 let mut sum_abs = 0.0_f64;
                 for r in 0..total_rows {
@@ -1051,14 +1390,14 @@ pub fn suppress_water_spectrum_3d(spec: &mut Spectrum3D, cfg: &WaterSuppressionC
                         col.push(a);
                     }
                 }
+                *px_slot = sum_abs;
+                *m_slot = false;
                 if !col.is_empty() {
                     let q75_idx = (3 * col.len()) / 4;
                     let (_, &mut q75, _) =
                         col.select_nth_unstable_by(q75_idx, |a, b| a.total_cmp(b));
                     let mean_abs = sum_abs / (col.len() as f64);
-                    if q75 >= 0.05 * mean_abs {
-                        *px_slot = sum_abs;
-                    }
+                    *m_slot = q75 >= 0.05 * mean_abs;
                 }
             }
         } else {
@@ -1070,14 +1409,29 @@ pub fn suppress_water_spectrum_3d(spec: &mut Spectrum3D, cfg: &WaterSuppressionC
                 }
             }
         }
-        detect_water_ppm(&spec.axis_x, &prof_x, None)
+        match detect_dominant_water_masked(&spec.axis_x, &prof_x, Some(&mask_x), None) {
+            Ok(w) => w,
+            Err(nd) => return WaterSuppressionOutcome::NotDetected(nd),
+        }
     } else {
-        4.70
+        return WaterSuppressionOutcome::not_applied(
+            &win.solvent_label,
+            win.lo_ppm,
+            win.hi_ppm,
+            "empty 3D spectrum",
+        );
     };
+    let auto_detected = cfg.water_ppm.is_none();
 
     if nx < 8 || total_rows == 0 || spec.data.len() < total_elems {
-        return water_ppm;
+        return WaterSuppressionOutcome::not_applied(
+            &win.solvent_label,
+            water_ppm,
+            water_ppm,
+            "3D spectrum too small to process",
+        );
     }
+    let before = spec.data.clone();
 
     let process_x = x_is_h || cfg.water_ppm.is_some();
     if process_x && water_overlaps_axis(&spec.axis_x, water_ppm, cfg.half_width_hz) {
@@ -1150,13 +1504,16 @@ pub fn suppress_water_spectrum_3d(spec: &mut Spectrum3D, cfg: &WaterSuppressionC
         }
     }
 
-    water_ppm
+    finish_nd_outcome(&before, &spec.data, water_ppm, auto_detected, &win)
 }
 
 /// Alias for [`suppress_water_spectrum_3d`]: suppress residual water and indirect $t_1$/$t_2$
-/// water-slab ridges across a 3D spectrum (`Spectrum3D`) in place, returning `water_ppm`.
+/// water-slab ridges across a 3D spectrum (`Spectrum3D`) in place, returning a [`WaterSuppressionOutcome`].
 #[inline]
-pub fn suppress_water_3d(spec: &mut Spectrum3D, cfg: &WaterSuppressionConfig) -> f64 {
+pub fn suppress_water_3d(
+    spec: &mut Spectrum3D,
+    cfg: &WaterSuppressionConfig,
+) -> WaterSuppressionOutcome {
     suppress_water_spectrum_3d(spec, cfg)
 }
 
@@ -1247,7 +1604,9 @@ mod tests {
         assert!(raw_water_max > 100.0 * ref_ha_amp);
 
         let cfg = WaterSuppressionConfig::default();
-        let used_w = suppress_water_spectrum_1d(&mut spec_1r, &cfg);
+        let used_w = suppress_water_spectrum_1d(&mut spec_1r, &cfg)
+            .center_ppm()
+            .expect("dominant water must be suppressed");
         assert!((used_w - 4.700).abs() < 0.01, "used_w={used_w}");
 
         // Measure far-away peak-free baseline (around 1.0 ppm) so we measure residual deviation
@@ -1347,7 +1706,9 @@ mod tests {
         let ix_hb = spec.axis_x.ppm_to_index(8.20).round() as usize;
         let iy_hb = spec.axis_y.ppm_to_index(2.10).round() as usize;
         let pre_hb = spec.get(ix_hb, iy_hb);
-        let used_w = suppress_water_spectrum_2d(&mut spec, &WaterSuppressionConfig::default());
+        let used_w = suppress_water_spectrum_2d(&mut spec, &WaterSuppressionConfig::default())
+            .center_ppm()
+            .expect("dominant water must be suppressed");
         assert!((used_w - 4.70).abs() < 0.03, "used_w={used_w}");
 
         let ix_w = spec.axis_x.ppm_to_index(4.70).round() as usize;
@@ -1418,7 +1779,9 @@ mod tests {
         let ix_w = cube.axis_x.ppm_to_index(4.70).round() as usize;
         let ix_hn = cube.axis_x.ppm_to_index(8.35).round() as usize;
         let pre_hn_amp = cube.get(ix_hn, 8, 8) - cube.get(ix_hn, 4, 4);
-        let used_w = suppress_water_spectrum_3d(&mut cube, &WaterSuppressionConfig::default());
+        let used_w = suppress_water_spectrum_3d(&mut cube, &WaterSuppressionConfig::default())
+            .center_ppm()
+            .expect("dominant water must be suppressed");
         assert!((used_w - 4.70).abs() < 0.04, "used_w={used_w}");
 
         assert!(cube.get(ix_w, 4, 4).abs() < 2.0);
@@ -1473,7 +1836,9 @@ mod tests {
         let pre_ali = cube.get(ix_hn, 5, iz_ali);
         let pre_ha = cube.get(ix_hn, 5, iz_ha);
 
-        let w_ppm = suppress_water_3d(&mut cube, &WaterSuppressionConfig::default());
+        let w_ppm = suppress_water_3d(&mut cube, &WaterSuppressionConfig::default())
+            .center_ppm()
+            .expect("dominant water must be suppressed");
         assert!((w_ppm - 4.70).abs() < 0.05);
         assert!(cube.get(ix_w, 5, iz_ali).abs() < 5.0);
         assert!(cube.get(ix_hn, 5, iz_ali) > 0.96 * pre_ali);
