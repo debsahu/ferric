@@ -1737,9 +1737,23 @@ mod tests {
         }
         let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
         let mean_ms = (t0.elapsed().as_secs_f64() * 1000.0) / (frames as f64);
+        let adapter_lower = gpu.adapter_name.to_ascii_lowercase();
+        let is_software_adapter = adapter_lower.contains("llvmpipe")
+            || adapter_lower.contains("lavapipe")
+            || adapter_lower.contains("swiftshader")
+            || adapter_lower.contains("warp");
+        // Strict 60 fps (< 16.67 ms/frame) gate on hardware GPUs in release builds;
+        // unoptimized debug builds or CPU software Vulkan (Mesa Lavapipe) get a 100 ms budget.
+        let budget_ms = if cfg!(debug_assertions) || is_software_adapter {
+            100.0
+        } else {
+            16.67
+        };
         assert!(
-            mean_ms < 16.67,
-            "Expected >= 60 fps (< 16.67 ms/frame) for 4x 2048x1024 overlays, got {mean_ms:.3} ms/frame"
+            mean_ms < budget_ms,
+            "Expected < {budget_ms:.2} ms/frame for 4x 2048x1024 overlays (debug={}, software_gpu={is_software_adapter}, adapter={}), got {mean_ms:.3} ms/frame",
+            cfg!(debug_assertions),
+            gpu.adapter_name
         );
     }
 }
