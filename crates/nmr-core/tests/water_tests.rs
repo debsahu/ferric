@@ -52,7 +52,7 @@ fn test_b6_dry_d2o_beta_glucose_4p64_ppm_preserved_without_dominant_water() {
         let post_beta_amp = spec.real[idx_beta] - spec.real[idx_base];
         let retention = post_beta_amp / ref_beta_amp;
         assert!(
-            retention >= 0.99 && retention <= 1.01,
+            (0.99..=1.01).contains(&retention),
             "B6 regression: 4.64 ppm beta-glucose anomeric proton must retain >=99% amplitude \
              when no dominant water peak is present (solvent={solvent_opt:?}), got {:.4}%",
             retention * 100.0
@@ -136,7 +136,7 @@ fn test_b6_genuine_dominant_water_still_suppressed_with_beta_glucose_present() {
     let post_beta = spec_wet.real[idx_beta] - far_base;
     let retention = post_beta / ref_beta;
     assert!(
-        retention >= 0.95 && retention <= 1.05,
+        (0.95..=1.05).contains(&retention),
         "4.64 ppm beta-glucose peak 0.08 ppm from water must retain >=95%, got {:.2}%",
         retention * 100.0
     );

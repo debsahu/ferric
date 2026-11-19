@@ -2940,9 +2940,7 @@ fn test_b7_raw_3d_ipap_c_cbcanco_and_c_canco_fail_closed_while_splitcomb_loads()
             &ser_split,
             false,
         )
-        .expect(&format!(
-            "already-splitcomb 3D {pulprog} must load cleanly"
-        ));
+        .unwrap_or_else(|e| panic!("already-splitcomb 3D {pulprog} must load cleanly: {e}"));
         assert_eq!(fid_split.axis_z.complex_points, 32);
     }
 }

@@ -23,8 +23,8 @@ use nmr_core::cofold_bridge::{
     score_cofold_poses, Af3ExportConfig, Boltz2ExportConfig, BondedAtomPairSpec, BondedAtomRef,
     CofoldConfidenceMetadata, CofoldEntitySpec, CofoldLigandSpec, CofoldPolymerKind,
     CofoldRestraintBundle, CofoldRestraintExtractConfig, CofoldRestraintInput, CspScoringMode,
-    PoseScoreConfig, PoseVerdict, StructurePoseInput, BOLTZ2_MAX_DISTANCE_A,
-    BOLTZ2_MIN_DISTANCE_A, MAX_COFOLD_INPUT_BYTES,
+    PoseScoreConfig, PoseVerdict, StructurePoseInput, BOLTZ2_MAX_DISTANCE_A, BOLTZ2_MIN_DISTANCE_A,
+    MAX_COFOLD_INPUT_BYTES,
 };
 use nmr_core::struct_shifts::StructureModel;
 

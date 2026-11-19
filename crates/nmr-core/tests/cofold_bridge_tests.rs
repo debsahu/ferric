@@ -1904,10 +1904,26 @@ fn test_21f_b18_pre_requires_explicit_proton_mhz_and_warns_on_14a_mtsl_drop() {
         .iter()
         .filter(|r| r.chain_id == "A")
         .map(|r| match r.res_name.as_str() {
-            "ALA" => 'A', "ARG" => 'R', "ASN" => 'N', "ASP" => 'D', "CYS" => 'C',
-            "GLN" => 'Q', "GLU" => 'E', "GLY" => 'G', "HIS" => 'H', "ILE" => 'I',
-            "LEU" => 'L', "LYS" => 'K', "MET" => 'M', "PHE" => 'F', "PRO" => 'P',
-            "SER" => 'S', "THR" => 'T', "TRP" => 'W', "TYR" => 'Y', "VAL" => 'V',
+            "ALA" => 'A',
+            "ARG" => 'R',
+            "ASN" => 'N',
+            "ASP" => 'D',
+            "CYS" => 'C',
+            "GLN" => 'Q',
+            "GLU" => 'E',
+            "GLY" => 'G',
+            "HIS" => 'H',
+            "ILE" => 'I',
+            "LEU" => 'L',
+            "LYS" => 'K',
+            "MET" => 'M',
+            "PHE" => 'F',
+            "PRO" => 'P',
+            "SER" => 'S',
+            "THR" => 'T',
+            "TRP" => 'W',
+            "TYR" => 'Y',
+            "VAL" => 'V',
             _ => 'X',
         })
         .collect();
@@ -1936,7 +1952,10 @@ fn test_21f_b18_pre_requires_explicit_proton_mhz_and_warns_on_14a_mtsl_drop() {
     )
     .expect("extract bundle");
 
-    assert_eq!(bundle.distance_restraints[0].exported_contact_max_distance_a, None);
+    assert_eq!(
+        bundle.distance_restraints[0].exported_contact_max_distance_a,
+        None
+    );
     assert_eq!(bundle.distance_restraints[0].pre_proton_mhz, Some(800.0));
     assert!(
         bundle

@@ -853,12 +853,12 @@ fn test_first_run_bruker_open_process_pick_assign_completes_within_5_clicks() {
     let mut assigned_count = 0usize;
 
     let run_pass = |events: Vec<egui::Event>,
-                        mode: &mut WorkbenchMode,
-                        loaded_suite: &mut Option<nmr_gui::demo_preset::BuiltinDemoSuite>,
-                        ref_data: &mut Option<nmr_core::nmrstar::Reference>,
-                        water_done: &mut bool,
-                        picked_roots: &mut usize,
-                        assigned_count: &mut usize|
+                    mode: &mut WorkbenchMode,
+                    loaded_suite: &mut Option<nmr_gui::demo_preset::BuiltinDemoSuite>,
+                    ref_data: &mut Option<nmr_core::nmrstar::Reference>,
+                    water_done: &mut bool,
+                    picked_roots: &mut usize,
+                    assigned_count: &mut usize|
      -> egui::FullOutput {
         let mut out = ctx.run_ui(
             egui::RawInput {
@@ -905,20 +905,15 @@ fn test_first_run_bruker_open_process_pick_assign_completes_within_5_clicks() {
                         }
                         if *mode == WorkbenchMode::Assign && ui.button("Run Assignment").clicked() {
                             if let (Some(s), Some(r)) = (loaded_suite.as_ref(), ref_data.as_ref()) {
-                                let systems = build_spin_systems(
-                                    &s.peaks,
-                                    &Tolerances::default(),
-                                    3,
-                                    false,
-                                )
-                                .expect("systems");
+                                let systems =
+                                    build_spin_systems(&s.peaks, &Tolerances::default(), 3, false)
+                                        .expect("systems");
                                 let priors = Priors::bmrb();
                                 let scfg = ScoreConfig::default();
                                 let u = unary_matrix(&systems, &r.sequence, &priors, &scfg);
                                 let p = pair_matrix(&systems, &scfg);
                                 let res = assign_from_matrices(&u, &p, &AnnealConfig::default());
-                                *assigned_count =
-                                    res.position.iter().filter(|&&k| k >= 0).count();
+                                *assigned_count = res.position.iter().filter(|&&k| k >= 0).count();
                             }
                         }
                     });

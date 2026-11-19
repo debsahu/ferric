@@ -2656,13 +2656,7 @@ fn build_synthetic_two_domain_af_demo() -> (String, String, Reference, String) {
     cif.push_str("#\nloop_\n_ma_qa_metric_local.ordinal_id\n_ma_qa_metric_local.model_id\n_ma_qa_metric_local.label_asym_id\n_ma_qa_metric_local.label_seq_id\n_ma_qa_metric_local.label_comp_id\n_ma_qa_metric_local.metric_id\n_ma_qa_metric_local.metric_value\n");
     for (i, &pv) in plddts.iter().enumerate() {
         let r = &chain_res[i];
-        let _ = writeln!(
-            cif,
-            "{} 1 A {} {} 1 {pv:.2}",
-            i + 1,
-            r.seq_id,
-            r.res_name
-        );
+        let _ = writeln!(cif, "{} 1 A {} {} 1 {pv:.2}", i + 1, r.seq_id, r.res_name);
     }
     cif.push_str("#\n");
 

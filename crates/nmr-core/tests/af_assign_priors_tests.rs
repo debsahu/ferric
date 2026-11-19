@@ -1115,8 +1115,7 @@ fn test_sparse_cb_stripped_hnca_plus_15n_noesy_ablations_and_cli() {
             if t >= 0 {
                 plain_confs_correct
                     .push((res_std_plain.confidence[i], res_std_plain.position[i] == t));
-                af_only_confs_correct
-                    .push((res_std_af.confidence[i], res_std_af.position[i] == t));
+                af_only_confs_correct.push((res_std_af.confidence[i], res_std_af.position[i] == t));
                 noesy_only_confs_correct
                     .push((res_std_noesy.confidence[i], res_std_noesy.position[i] == t));
                 both_confs_correct
@@ -1181,15 +1180,14 @@ fn test_sparse_cb_stripped_hnca_plus_15n_noesy_ablations_and_cli() {
         evo_both_hc_tot += m_evo_both.hc_assigned;
         total_assignable += m_evo_plain.assignable;
 
-        let push_evo = |res: &nmr_core::solver::AssignResult,
-                        tr: &[i32],
-                        out: &mut Vec<(f64, bool)>| {
-            for (i, &t) in tr.iter().enumerate() {
-                if t >= 0 {
-                    out.push((res.confidence[i], res.position[i] == t));
+        let push_evo =
+            |res: &nmr_core::solver::AssignResult, tr: &[i32], out: &mut Vec<(f64, bool)>| {
+                for (i, &t) in tr.iter().enumerate() {
+                    if t >= 0 {
+                        out.push((res.confidence[i], res.position[i] == t));
+                    }
                 }
-            }
-        };
+            };
         push_evo(&res_evo_plain, &t_evo_plain, &mut evo_plain_confs_correct);
         push_evo(&res_evo_af, &t_evo_af, &mut evo_af_only_confs_correct);
         push_evo(

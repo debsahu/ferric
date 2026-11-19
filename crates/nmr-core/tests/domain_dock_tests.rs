@@ -28,13 +28,12 @@ use nmr_core::domain_dock::{
     parse_domain_pcs_tsv_str, parse_domain_pre_tsv_str, parse_domain_pre_tsv_str_with_defaults,
     parse_domain_rdc_tsv_str, partition_domain_stratified_pcs_free_set,
     partition_domain_stratified_rdc_free_set, prepare_domain_dock_inputs_full,
-    quat_apply_world_rot_step, read_domain_rdc_tsv,
-    solomon_gamma2_to_distance_bounds, ChainSeqIndex, DipolarObservabilityRegime, DomainDockConfig,
-    DomainDockEnergyWeights, DomainDockQualityVerdict, DomainLinkerKinematics, DomainMotionRegime,
-    DomainPcsRestraint, DomainPcsTagSet, DomainPreRestraint, DomainPreSiteSet, PaeClusterConfig,
-    PaeDomainPartition, PreRestraintKind, PreparedDomainDockRestraints, ResidueDomainRole,
-    CODATA_ELECTRON_G_FACTOR, DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM,
-    K_SOLOMON_PROTON_NITROXIDE_A6_S2,
+    quat_apply_world_rot_step, read_domain_rdc_tsv, solomon_gamma2_to_distance_bounds,
+    ChainSeqIndex, DipolarObservabilityRegime, DomainDockConfig, DomainDockEnergyWeights,
+    DomainDockQualityVerdict, DomainLinkerKinematics, DomainMotionRegime, DomainPcsRestraint,
+    DomainPcsTagSet, DomainPreRestraint, DomainPreSiteSet, PaeClusterConfig, PaeDomainPartition,
+    PreRestraintKind, PreparedDomainDockRestraints, ResidueDomainRole, CODATA_ELECTRON_G_FACTOR,
+    DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM, K_SOLOMON_PROTON_NITROXIDE_A6_S2,
 };
 use nmr_core::noesy::{
     parse_pdb_first_model, v_add, v_dist, v_norm, v_scale, v_sub, v_unit,
@@ -2932,12 +2931,15 @@ fn test_21f_b5_discontinuous_insertion_enforces_reentry_peptide_bond_closure() {
     st_start.phi_rad[24] -= 0.35;
     st_start.psi_rad[46] += 0.30;
     let start_chain = kin.build_pdb_chain(&st_start);
-    let start_cif = serialize_chain_to_af_mmcif("ubq_insertion_b5_start", &start_chain, &plddt, None);
+    let start_cif =
+        serialize_chain_to_af_mmcif("ubq_insertion_b5_start", &start_chain, &plddt, None);
     let start_af = parse_af_structure_model_str(&start_cif, &AfIngestOptions::default()).unwrap();
 
     for (label, w_rama) in [("default_w_rama", 0.45_f64), ("zero_w_rama", 0.0_f64)] {
-        let mut weights = DomainDockEnergyWeights::default();
-        weights.w_rama = w_rama;
+        let weights = DomainDockEnergyWeights {
+            w_rama,
+            ..Default::default()
+        };
         let cfg = DomainDockConfig {
             weights,
             ensemble_size: 2,
@@ -2950,13 +2952,16 @@ fn test_21f_b5_discontinuous_insertion_enforces_reentry_peptide_bond_closure() {
             &start_af,
             &pae,
             &[med1.clone(), med2.clone()],
-            &[pcs_tag.clone()],
+            std::slice::from_ref(&pcs_tag),
             &[],
             &[],
             &cfg,
         )
         .unwrap();
-        let cn_dist = v_dist(docked.chains[0].residues[49].c, docked.chains[0].residues[50].n);
+        let cn_dist = v_dist(
+            docked.chains[0].residues[49].c,
+            docked.chains[0].residues[50].n,
+        );
         let cn_err = (cn_dist - 1.33).abs();
         assert!(
             cn_err <= 0.15,
@@ -3028,16 +3033,9 @@ fn test_21f_b18_default_mtsl_tether_allowance_applied_to_anchored_sites() {
         }],
     };
 
-    let prep = PreparedDomainDockRestraints::compile(
-        &kin,
-        &part,
-        &[],
-        &[],
-        &[pre_anchored],
-        &[],
-        None,
-    )
-    .unwrap();
+    let prep =
+        PreparedDomainDockRestraints::compile(&kin, &part, &[], &[], &[pre_anchored], &[], None)
+            .unwrap();
     let w_pre_only = DomainDockEnergyWeights {
         w_rdc: 0.0,
         w_pcs: 0.0,

@@ -26,10 +26,10 @@ use nmr_core::domain_dock::{
     cluster_pae_domains, cluster_pae_domains_for_model, compute_solomon_k_pre_a6_s1,
     evaluate_domain_dock_fixed_saupe_cpu, evaluate_solomon_gamma2_s1, parse_domain_pcs_tsv_str,
     parse_domain_pre_tsv_str, partition_domain_stratified_rdc_free_set,
-    prepare_domain_dock_inputs_full, quat_apply_world_rot_step,
-    DomainDockConfig, DomainDockEnergyWeights, DomainLinkerKinematics, DomainPcsRestraint,
-    DomainPcsTagSet, DomainPreRestraint, DomainPreSiteSet, PaeClusterConfig, PaeDomainPartition,
-    PreRestraintKind, PreparedDomainDockRestraints, CODATA_ELECTRON_G_FACTOR,
+    prepare_domain_dock_inputs_full, quat_apply_world_rot_step, DomainDockConfig,
+    DomainDockEnergyWeights, DomainLinkerKinematics, DomainPcsRestraint, DomainPcsTagSet,
+    DomainPreRestraint, DomainPreSiteSet, PaeClusterConfig, PaeDomainPartition, PreRestraintKind,
+    PreparedDomainDockRestraints, CODATA_ELECTRON_G_FACTOR,
 };
 use nmr_core::noesy::{
     parse_pdb_first_model, reconstruct_ca_substituents, v_add, v_dist, v_norm, v_scale, v_sub,

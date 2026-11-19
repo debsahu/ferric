@@ -18239,8 +18239,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                     ctrl_count += 1;
                 }
             }
-            let total_spec_area_1440 =
-                viz_r.area() + strip_canvas_1440.map_or(0.0, |r| r.area());
+            let total_spec_area_1440 = viz_r.area() + strip_canvas_1440.map_or(0.0, |r| r.area());
             let share = total_spec_area_1440 / (1440.0 * 900.0);
             assert!(
                 ctrl_count <= MAX_PRIMARY_CONTROLS_PER_MODE,
@@ -18522,7 +18521,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         let mut y_1d = vec![0.02_f64; 256];
         for (k, slot) in y_1d.iter_mut().enumerate() {
             let ppm = ax_1d.index_to_ppm(k as f64);
-            *slot += 12.0 * (-0.5 * ((ppm - 4.70) / 0.03).powi(2)).exp();
+            *slot += 40.0 * (-0.5 * ((ppm - 4.70) / 0.03).powi(2)).exp();
             *slot += 3.0 * (-0.5 * ((ppm - 1.25) / 0.015).powi(2)).exp();
         }
         let spec_1d = nmr_core::nmr1d::Spectrum1D::new(
@@ -18935,7 +18934,11 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 .unwrap_or_else(|| {
                     panic!(
                         "Expected rendered UI button {label:?}, found {:?}",
-                        audit.texts.iter().map(|t| t.text.as_str()).collect::<Vec<_>>()
+                        audit
+                            .texts
+                            .iter()
+                            .map(|t| t.text.as_str())
+                            .collect::<Vec<_>>()
                     )
                 })
         };

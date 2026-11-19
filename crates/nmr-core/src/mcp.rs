@@ -999,8 +999,8 @@ fn extract_numeric_location(raw_lower: &str, prefixes: &[&str]) -> Option<usize>
         while let Some(rel) = raw_lower[search_from..].find(prefix) {
             let start = search_from + rel + prefix.len();
             // Ensure prefix starts at a word boundary (or start of string)
-            let boundary_ok = search_from + rel == 0
-                || !bytes[search_from + rel - 1].is_ascii_alphanumeric();
+            let boundary_ok =
+                search_from + rel == 0 || !bytes[search_from + rel - 1].is_ascii_alphanumeric();
             if boundary_ok {
                 let mut i = start;
                 while i < bytes.len() && matches!(bytes[i], b' ' | b':' | b'=' | b'#') {
@@ -1034,7 +1034,9 @@ fn classify_structured_error_category(raw_lower: &str) -> StructuredErrorCategor
         || raw_lower.contains("bfactor")
     {
         StructuredErrorCategory::ProvenanceOrPlddt
-    } else if raw_lower.contains("empty") || raw_lower.contains("zero ") || raw_lower.contains("no rows")
+    } else if raw_lower.contains("empty")
+        || raw_lower.contains("zero ")
+        || raw_lower.contains("no rows")
     {
         StructuredErrorCategory::EmptyInput
     } else if raw_lower.contains("header") || raw_lower.contains("column") {
@@ -1055,12 +1057,16 @@ fn classify_structured_error_category(raw_lower: &str) -> StructuredErrorCategor
         || raw_lower.contains("parse")
     {
         StructuredErrorCategory::InvalidNumericValue
-    } else if raw_lower.contains("atom") || raw_lower.contains("residue") || raw_lower.contains("amino")
+    } else if raw_lower.contains("atom")
+        || raw_lower.contains("residue")
+        || raw_lower.contains("amino")
     {
         StructuredErrorCategory::InvalidAtomOrResidue
     } else if raw_lower.contains("missing") || raw_lower.contains("required") {
         StructuredErrorCategory::MissingRequiredField
-    } else if raw_lower.contains("at least") || raw_lower.contains("insufficient") || raw_lower.contains("too few")
+    } else if raw_lower.contains("at least")
+        || raw_lower.contains("insufficient")
+        || raw_lower.contains("too few")
     {
         StructuredErrorCategory::InsufficientData
     } else if raw_lower.contains("failed to read")
@@ -1849,8 +1855,9 @@ impl McpServer {
             Ok(res) => res,
             Err(_) => Err(JsonRpcError {
                 code: ERR_INTERNAL_ERROR,
-                message: "internal panic caught while executing resources/read; server state preserved"
-                    .to_string(),
+                message:
+                    "internal panic caught while executing resources/read; server state preserved"
+                        .to_string(),
                 data: None,
             }),
         }
@@ -1867,7 +1874,9 @@ impl McpServer {
         };
 
         if self.test_panic_probe_enabled && uri == "nmr://__test_panic_probe" {
-            panic!("simulated internal resources/read panic for MCP catch_unwind guard verification");
+            panic!(
+                "simulated internal resources/read panic for MCP catch_unwind guard verification"
+            );
         }
 
         if uri == "nmr://workspace/policy" {
@@ -1981,38 +1990,35 @@ impl McpServer {
             let resolved = single_root_policy
                 .resolve_sandboxed_path(rel_path)
                 .map_err(|e| e.to_json_rpc_error())?;
-            let content = read_bounded_regular_file_to_string(
-                &resolved,
-                rel_path,
-                MAX_RESOURCE_READ_BYTES,
-            )
-            .map_err(|tool_err| {
-                let kind = tool_err
-                    .structured_content
-                    .as_ref()
-                    .and_then(|v| v.get("error"))
-                    .and_then(|e| e.get("kind"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("io_error");
-                let msg = tool_err
-                    .structured_content
-                    .as_ref()
-                    .and_then(|v| v.get("error"))
-                    .and_then(|e| e.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("failed to read bounded regular resource file")
-                    .to_string();
-                let code = match kind {
-                    "special_file_rejected" | "file_too_large" => ERR_INVALID_PARAMS,
-                    "io_error" => ERR_RESOURCE_NOT_FOUND,
-                    _ => ERR_INTERNAL_ERROR,
-                };
-                JsonRpcError {
-                    code,
-                    message: msg,
-                    data: None,
-                }
-            })?;
+            let content =
+                read_bounded_regular_file_to_string(&resolved, rel_path, MAX_RESOURCE_READ_BYTES)
+                    .map_err(|tool_err| {
+                    let kind = tool_err
+                        .structured_content
+                        .as_ref()
+                        .and_then(|v| v.get("error"))
+                        .and_then(|e| e.get("kind"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("io_error");
+                    let msg = tool_err
+                        .structured_content
+                        .as_ref()
+                        .and_then(|v| v.get("error"))
+                        .and_then(|e| e.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("failed to read bounded regular resource file")
+                        .to_string();
+                    let code = match kind {
+                        "special_file_rejected" | "file_too_large" => ERR_INVALID_PARAMS,
+                        "io_error" => ERR_RESOURCE_NOT_FOUND,
+                        _ => ERR_INTERNAL_ERROR,
+                    };
+                    JsonRpcError {
+                        code,
+                        message: msg,
+                        data: None,
+                    }
+                })?;
             let mime = if rel_path.ends_with(".tsv") {
                 "text/tab-separated-values"
             } else {
@@ -2046,8 +2052,9 @@ impl McpServer {
             Ok(res) => res,
             Err(_) => Err(JsonRpcError {
                 code: ERR_INTERNAL_ERROR,
-                message: "internal panic caught while executing prompts/get; server state preserved"
-                    .to_string(),
+                message:
+                    "internal panic caught while executing prompts/get; server state preserved"
+                        .to_string(),
                 data: None,
             }),
         }
@@ -2775,12 +2782,9 @@ impl McpServer {
             );
         }
         let out_lbl = self.policy.relativize_display_path(&resolved_out);
-        let written_bytes = read_bounded_regular_file_bytes(
-            &resolved_out,
-            &out_lbl,
-            MAX_MCP_PHASE21_TEXT_BYTES,
-        )
-        .unwrap_or_default();
+        let written_bytes =
+            read_bounded_regular_file_bytes(&resolved_out, &out_lbl, MAX_MCP_PHASE21_TEXT_BYTES)
+                .unwrap_or_default();
 
         McpCallToolResult::ok_json(&json!({
             "output_path": self.policy.relativize_display_path(&resolved_out),
@@ -2925,12 +2929,9 @@ impl McpServer {
             );
         }
         let out_lbl = self.policy.relativize_display_path(&resolved_out);
-        let written_bytes = read_bounded_regular_file_bytes(
-            &resolved_out,
-            &out_lbl,
-            MAX_MCP_PHASE21_TEXT_BYTES,
-        )
-        .unwrap_or_default();
+        let written_bytes =
+            read_bounded_regular_file_bytes(&resolved_out, &out_lbl, MAX_MCP_PHASE21_TEXT_BYTES)
+                .unwrap_or_default();
 
         McpCallToolResult::ok_json(&json!({
             "output_path": self.policy.relativize_display_path(&resolved_out),

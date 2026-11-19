@@ -2234,11 +2234,16 @@ fn test_fix2_b19_misestimated_error_warning_2x_3x_pure_noise() {
                     "warning must explain 2x-3x misestimation risk: {warn}"
                 );
                 assert!(
-                    rep.warnings.iter().any(|w| w.contains("Error-scale / chi^2 consistency diagnostic")),
+                    rep.warnings
+                        .iter()
+                        .any(|w| w.contains("Error-scale / chi^2 consistency diagnostic")),
                     "report.warnings must include error_scale_warning"
                 );
                 let tsv = format_excited_state_tsv(&rep);
-                assert!(tsv.contains("# error_scale_warning:"), "TSV missing error_scale_warning");
+                assert!(
+                    tsv.contains("# error_scale_warning:"),
+                    "TSV missing error_scale_warning"
+                );
                 assert!(
                     tsv.contains("# chi2_consistency_diagnostic:"),
                     "TSV missing chi2_consistency_diagnostic"
@@ -2356,9 +2361,11 @@ fn test_fix2_b19_multiseed_10_recovery_and_rchi2_statistics() {
                 .iter()
                 .position(|&s| s == sid)
                 .expect("seq_id");
-            for &(atom, exp_sd, fwd_sd) in
-                &[("CA", 0.08_f64, 0.45_f64), ("C", 0.08, 0.50), ("N", 0.12, 0.90)]
-            {
+            for &(atom, exp_sd, fwd_sd) in &[
+                ("CA", 0.08_f64, 0.45_f64),
+                ("C", 0.08, 0.50),
+                ("N", 0.12, 0.90),
+            ] {
                 if let (Some(&obs_a), Some(bb)) = (
                     ubq_shifts.shifts.get(&(ref_idx, atom.to_string())),
                     pred_a.residues[r_idx].backbone.get(atom),
@@ -2387,7 +2394,8 @@ fn test_fix2_b19_multiseed_10_recovery_and_rchi2_statistics() {
             &cfg,
         )
         .expect("H1 multi-seed");
-        if rep1.verdict == ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::LocalUnfolding)
+        if rep1.verdict
+            == ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::LocalUnfolding)
         {
             h1_ok += 1;
         }
@@ -2429,7 +2437,8 @@ fn test_fix2_b19_multiseed_10_recovery_and_rchi2_statistics() {
             &cfg,
         )
         .expect("H2 multi-seed");
-        if rep2.verdict == ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::XxxProCisTrans)
+        if rep2.verdict
+            == ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::XxxProCisTrans)
         {
             h2_ok += 1;
         }
@@ -2582,5 +2591,8 @@ fn test_fix2_b19_multiseed_10_recovery_and_rchi2_statistics() {
     assert!(h2_ok >= 9, "H2 10-seed recovery {h2_ok}/10 < 9/10");
     assert!(h3_ok >= 9, "H3 10-seed recovery {h3_ok}/10 < 9/10");
     assert!(h4_ok >= 9, "H4 10-seed recovery {h4_ok}/10 < 9/10");
-    assert_eq!(h0_clean, 10, "H0 1x noise false-commit detected ({h0_clean}/10)");
+    assert_eq!(
+        h0_clean, 10,
+        "H0 1x noise false-commit detected ({h0_clean}/10)"
+    );
 }

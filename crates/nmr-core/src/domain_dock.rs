@@ -4316,12 +4316,10 @@ impl DomainLinkerKinematics {
                         )
                     } else {
                         let rc_n = raw_cn.clamp(1.10, 2.50);
-                        let a_cacn =
-                            interior_angle_rad(prev.ca, prev.c, r_pdb.n, ANGLE_CA_C_N_DEG);
+                        let a_cacn = interior_angle_rad(prev.ca, prev.c, r_pdb.n, ANGLE_CA_C_N_DEG);
                         let a_cnca =
                             interior_angle_rad(prev.c, r_pdb.n, r_pdb.ca, ANGLE_C_N_CA_DEG);
-                        let ph =
-                            calc_dihedral_deg(prev.c, r_pdb.n, r_pdb.ca, r_pdb.c).to_radians();
+                        let ph = calc_dihedral_deg(prev.c, r_pdb.n, r_pdb.ca, r_pdb.c).to_radians();
                         (rc_n, a_cacn, rn_ca, a_cnca, ph)
                     }
                 } else {
@@ -8236,8 +8234,7 @@ pub fn polish_domain_dock_state_lbfgs(
             max_iters.max(80),
             4000.0_f64.max(base_k_loop),
         );
-        if kin.max_reentry_cn_err_angstrom(&closed_state)
-            < kin.max_reentry_cn_err_angstrom(&state)
+        if kin.max_reentry_cn_err_angstrom(&closed_state) < kin.max_reentry_cn_err_angstrom(&state)
         {
             state = closed_state;
             eb = evaluate_domain_dock_state_cpu(kin, prep, &state, weights).0;

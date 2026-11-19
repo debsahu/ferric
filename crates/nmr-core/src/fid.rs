@@ -3657,12 +3657,7 @@ pub fn read_bruker_fid_3d_from_bytes(
 
     let mut own_meta_refs: Vec<&str> = vec![acqus_txt, acqu2s_txt, acqu3s_txt];
     for opt in [
-        acqu_txt,
-        acqu2_txt,
-        acqu3_txt,
-        procs_txt,
-        proc2s_txt,
-        proc3s_txt,
+        acqu_txt, acqu2_txt, acqu3_txt, procs_txt, proc2s_txt, proc3s_txt,
     ]
     .into_iter()
     .flatten()

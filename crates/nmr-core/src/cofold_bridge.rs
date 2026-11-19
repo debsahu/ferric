@@ -2607,10 +2607,7 @@ pub fn extract_nmr_interface_restraints(
         if is_pre_gamma2 {
             total_pre_gamma2 += 1;
             if let Some(mhz) = raw.pre_proton_mhz {
-                if !pre_proton_mhz_seen
-                    .iter()
-                    .any(|&x| (x - mhz).abs() < 1e-6)
-                {
+                if !pre_proton_mhz_seen.iter().any(|&x| (x - mhz).abs() < 1e-6) {
                     pre_proton_mhz_seen.push(mhz);
                 }
             }
