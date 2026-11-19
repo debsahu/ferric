@@ -3210,17 +3210,22 @@ impl Default for Stack1dState {
 }
 
 impl Stack1dState {
-    /// Active reference spectrometer observe frequency in MHz (fallback `500.0 MHz`).
-    pub fn active_obs_mhz(&self) -> f64 {
+    /// Active reference spectrometer observe frequency in MHz (`None` when unannotated / unknown).
+    pub fn active_measured_obs_mhz(&self) -> Option<f64> {
         if self.traces.is_empty() {
-            return 500.0;
+            return None;
         }
         let idx = self.safe_ref_trace_idx();
         self.traces
             .get(idx)
             .and_then(|t| t.raw_spec.as_ref())
-            .map(|att| att.0.axis.obs_mhz.max(60.0))
-            .unwrap_or(500.0)
+            .map(|att| att.0.axis.obs_mhz)
+            .filter(|f| f.is_finite() && *f > 0.0)
+    }
+
+    /// Active reference spectrometer observe frequency in MHz (fallback `500.0 MHz` for Hz-axis display).
+    pub fn active_obs_mhz(&self) -> f64 {
+        self.active_measured_obs_mhz().unwrap_or(500.0)
     }
 
     /// Active reference nucleus (`1H` fallback when unannotated).
@@ -3234,6 +3239,93 @@ impl Stack1dState {
             .and_then(|t| t.raw_spec.as_ref())
             .map(|att| att.0.experiment.nucleus())
             .unwrap_or(Nucleus1D::H1)
+    }
+
+    /// Resolve `(ReportNucleus, proton_decoupled, measured_obs_mhz, solvent_opt)` from the active
+    /// 1D trace without fabricating unknown frequency or forcing `1H` on heteronuclear traces.
+    fn active_report_metadata(&self) -> (ReportNucleus, bool, Option<f64>, Option<String>) {
+        let idx = self.safe_ref_trace_idx();
+        let trace_opt = self.traces.get(idx);
+        if let Some(att) = trace_opt.and_then(|t| t.raw_spec.as_ref()) {
+            let (rn, dec) = match &att.0.experiment {
+                Experiment1DKind::Proton1D => (ReportNucleus::H1, false),
+                Experiment1DKind::Carbon13Decoupled => (ReportNucleus::C13, true),
+                Experiment1DKind::Dept90 | Experiment1DKind::Dept135 => (ReportNucleus::C13, false),
+                Experiment1DKind::Fluorine19 => (ReportNucleus::F19, false),
+                Experiment1DKind::Phosphorus31 => (ReportNucleus::P31, false),
+                Experiment1DKind::Custom(nuc1d) => match nuc1d {
+                    Nucleus1D::H1 => (ReportNucleus::H1, false),
+                    Nucleus1D::C13 => (ReportNucleus::C13, true),
+                    Nucleus1D::F19 => (ReportNucleus::F19, false),
+                    Nucleus1D::P31 => (ReportNucleus::P31, false),
+                    Nucleus1D::N15 => (ReportNucleus::N15, false),
+                    Nucleus1D::Other(name) => {
+                        let up = name.to_ascii_uppercase();
+                        let rn = ReportNucleus::from_ascii_token(name)
+                            .or_else(|| ReportNucleus::from_ascii_token(&att.0.axis.label))
+                            .or_else(|| {
+                                if up.contains("13C") || up.contains("C13") || up.contains("DEPT") {
+                                    Some(ReportNucleus::C13)
+                                } else if up.contains("19F") || up.contains("F19") {
+                                    Some(ReportNucleus::F19)
+                                } else if up.contains("31P") || up.contains("P31") {
+                                    Some(ReportNucleus::P31)
+                                } else if up.contains("15N") || up.contains("N15") {
+                                    Some(ReportNucleus::N15)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(ReportNucleus::H1);
+                        let dec =
+                            rn == ReportNucleus::C13 && (up.contains("{1H}") || up.contains("DEC"));
+                        (rn, dec)
+                    }
+                },
+            };
+            let mhz = (att.0.axis.obs_mhz.is_finite() && att.0.axis.obs_mhz > 0.0)
+                .then_some(att.0.axis.obs_mhz);
+            let solv = att
+                .0
+                .solvent
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    let s = self.solvent_choice.trim();
+                    (!s.is_empty()).then(|| s.to_string())
+                });
+            return (rn, dec, mhz, solv);
+        }
+
+        let (rn, dec) = if let Some(tr) = trace_opt {
+            let up = tr.label.to_ascii_uppercase();
+            let max_ppm = tr
+                .ppm
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold(f64::NEG_INFINITY, f64::max);
+            if up.contains("13C") || up.contains("C13") || up.contains("DEPT") || max_ppm > 30.0 {
+                (ReportNucleus::C13, !up.contains("DEPT"))
+            } else if up.contains("19F") || up.contains("F19") {
+                (ReportNucleus::F19, false)
+            } else if up.contains("31P") || up.contains("P31") {
+                (ReportNucleus::P31, false)
+            } else if up.contains("15N") || up.contains("N15") {
+                (ReportNucleus::N15, false)
+            } else {
+                (ReportNucleus::H1, false)
+            }
+        } else {
+            (ReportNucleus::H1, false)
+        };
+        let solv = {
+            let s = self.solvent_choice.trim();
+            (!s.is_empty()).then(|| s.to_string())
+        };
+        (rn, dec, None, solv)
     }
 
     /// Push the current `[view_ppm_min, view_ppm_max]` onto `zoom_history` and zoom horizontally into `[ppm_a, ppm_b]`.
@@ -4277,14 +4369,19 @@ impl Stack1dState {
             if tr.ppm.len() >= 2 {
                 let first = tr.ppm[0] + tr.shift_offset_ppm;
                 let last = *tr.ppm.last().unwrap_or(&tr.ppm[0]) + tr.shift_offset_ppm;
-                let axis = AxisPpm::from_bounds("1H", tr.ppm.len(), first, last, 500.0);
-                let mut sp = Spectrum1D::new(
-                    tr.label.clone(),
-                    Experiment1DKind::Proton1D,
-                    axis,
-                    tr.intensities.clone(),
-                    None,
-                );
+                let up = tr.label.to_ascii_uppercase();
+                let is_c13 = up.contains("13C")
+                    || up.contains("C13")
+                    || up.contains("DEPT")
+                    || first.max(last) > 30.0;
+                let (nuc_str, kind, default_mhz) = if is_c13 {
+                    ("13C", Experiment1DKind::Carbon13Decoupled, 0.0)
+                } else {
+                    ("1H", Experiment1DKind::Proton1D, 0.0)
+                };
+                let axis = AxisPpm::from_bounds(nuc_str, tr.ppm.len(), first, last, default_mhz);
+                let mut sp =
+                    Spectrum1D::new(tr.label.clone(), kind, axis, tr.intensities.clone(), None);
                 hilbert_reconstruct_imaginary_1d(&mut sp);
                 self.traces[idx].raw_spec = Some(AttachedSpectrum1d(sp));
             }
@@ -4552,7 +4649,11 @@ impl Stack1dState {
             apply_phase_1d(&mut working, ph0, ph1, piv);
         }
 
-        let mhz = working.axis.obs_mhz.max(60.0);
+        let mhz = if working.axis.obs_mhz.is_finite() && working.axis.obs_mhz > 0.0 {
+            working.axis.obs_mhz
+        } else {
+            500.0
+        };
         let nuc = working.experiment.nucleus();
         let solv_name = working
             .solvent
@@ -4688,7 +4789,7 @@ impl Stack1dState {
 
         let total_area: f64 = areas.iter().sum();
         let mut norm_integrals = Vec::with_capacity(areas.len());
-        if self.target_total_protons > 0.0 && total_area > 1e-12 {
+        if nuc == Nucleus1D::H1 && self.target_total_protons > 0.0 && total_area > 1e-12 {
             for (an, &area) in analyses.iter_mut().zip(&areas) {
                 let h_est = (area / total_area) * self.target_total_protons;
                 an.proton_count = Some(h_est.round().max(1.0) as usize);
@@ -4726,71 +4827,135 @@ impl Stack1dState {
         }
     }
 
+    /// Format an honest ACS NMR header prefix (`¹H NMR (400 MHz, CDCl3)`, `¹³C{¹H} NMR (100.6 MHz)`,
+    /// `¹H NMR`, etc.) omitting any unknown frequency or solvent cleanly.
+    fn format_honest_nmr_header(
+        nuc: ReportNucleus,
+        decoupled: bool,
+        mhz_opt: Option<f64>,
+        solv_opt: Option<&str>,
+    ) -> String {
+        let nuc_str = match (nuc, decoupled) {
+            (ReportNucleus::H1, _) => "¹H NMR",
+            (ReportNucleus::C13, true) => "¹³C{¹H} NMR",
+            (ReportNucleus::C13, false) => "¹³C NMR",
+            (ReportNucleus::F19, _) => "¹⁹F NMR",
+            (ReportNucleus::P31, _) => "³¹P NMR",
+            (ReportNucleus::N15, _) => "¹⁵N NMR",
+        };
+        let freq_str = mhz_opt.filter(|f| f.is_finite() && *f > 0.0).map(|mhz| {
+            if (mhz - mhz.round()).abs() < 0.05 {
+                format!("{} MHz", mhz.round() as i64)
+            } else {
+                format!("{mhz:.1} MHz")
+            }
+        });
+        let solv_str = solv_opt.map(str::trim).filter(|s| !s.is_empty());
+        match (freq_str, solv_str) {
+            (Some(f), Some(s)) => format!("{nuc_str} ({f}, {s})"),
+            (Some(f), None) => format!("{nuc_str} ({f})"),
+            (None, Some(s)) => format!("{nuc_str} ({s})"),
+            (None, None) => nuc_str.to_string(),
+        }
+    }
+
     /// Regenerate `self.formatted_journal_report` from `self.detected_multiplets` under `self.journal_style`.
     pub fn reformat_journal_report(&mut self) {
         if self.detected_multiplets.is_empty() {
             self.formatted_journal_report.clear();
             return;
         }
-        let idx = self.safe_ref_trace_idx();
-        let (nuc, decoupled, mhz, solv) = self
-            .traces
-            .get(idx)
-            .and_then(|t| t.raw_spec.as_ref())
-            .map(|att| {
-                let rn = match att.0.experiment {
-                    Experiment1DKind::Proton1D => ReportNucleus::H1,
-                    Experiment1DKind::Carbon13Decoupled
-                    | Experiment1DKind::Dept90
-                    | Experiment1DKind::Dept135 => ReportNucleus::C13,
-                    Experiment1DKind::Fluorine19 => ReportNucleus::F19,
-                    Experiment1DKind::Phosphorus31 => ReportNucleus::P31,
-                    Experiment1DKind::Custom(_) => ReportNucleus::H1,
-                };
-                let dec = matches!(att.0.experiment, Experiment1DKind::Carbon13Decoupled);
-                let s = att
-                    .0
-                    .solvent
-                    .clone()
-                    .unwrap_or_else(|| self.solvent_choice.clone());
-                (rn, dec, att.0.axis.obs_mhz.max(60.0), s)
-            })
-            .unwrap_or((ReportNucleus::H1, false, 500.0, self.solvent_choice.clone()));
+        let (nuc, decoupled, mhz_opt, solv_opt) = self.active_report_metadata();
 
         let signals: Vec<ReportedSignal> = self
             .detected_multiplets
             .iter()
+            .filter(|an| an.center_ppm.is_finite())
             .map(|an| {
-                if decoupled {
+                if decoupled || nuc == ReportNucleus::C13 {
                     ReportedSignal::new_decoupled(an.center_ppm)
                 } else {
                     ReportedSignal::from_analysis(an, an.proton_count, None)
                 }
             })
             .collect();
+        if signals.is_empty() {
+            self.formatted_journal_report.clear();
+            return;
+        }
 
-        let rep = JournalNmrReport {
-            nucleus: nuc,
-            proton_decoupled: decoupled,
-            mhz,
-            solvent: solv,
-            signals,
-        };
-        self.formatted_journal_report =
-            format_journal_nmr_report(&rep, self.journal_style, TextEncoding::Unicode);
+        if let (Some(mhz), Some(solv)) = (mhz_opt, solv_opt.as_ref()) {
+            let rep = JournalNmrReport {
+                nucleus: nuc,
+                proton_decoupled: decoupled,
+                mhz,
+                solvent: solv.clone(),
+                signals,
+            };
+            self.formatted_journal_report =
+                format_journal_nmr_report(&rep, self.journal_style, TextEncoding::Unicode);
+        } else {
+            // Format signal list via core formatter, then attach honest header omitting unknown MHz/solvent
+            let rep = JournalNmrReport {
+                nucleus: nuc,
+                proton_decoupled: decoupled,
+                mhz: mhz_opt.unwrap_or(500.0),
+                solvent: solv_opt.clone().unwrap_or_else(|| "UNKNOWN".to_string()),
+                signals,
+            };
+            let full = format_journal_nmr_report(&rep, self.journal_style, TextEncoding::Unicode);
+            let header =
+                Self::format_honest_nmr_header(nuc, decoupled, mhz_opt, solv_opt.as_deref());
+            self.formatted_journal_report = if let Some((_, tail)) = full.split_once(" δ ") {
+                format!("{header} δ {tail}")
+            } else if let Some((_, tail)) = full.split_once(": δ ") {
+                format!("{header}: δ {tail}")
+            } else {
+                full
+            };
+        }
     }
 
     /// Queue a `1H` (`is_13c = false`) or `13C` (`is_13c = true`) 1D spectrum prediction request
     /// from an explicit SMILES string (or empty string to pull the active Octet molecule).
+    ///
+    /// Fails closed on invalid non-empty SMILES without queueing a broken request.
     pub fn request_predict_1d(&mut self, smiles: impl Into<String>, is_13c: bool) {
         let s = smiles.into().trim().to_string();
         let nuc = if is_13c { "13C" } else { "1H" };
         if s.is_empty() {
             self.status_message = format!("Requested {nuc} prediction from active Octet molecule.");
-        } else {
-            self.status_message = format!("Requested {nuc} prediction for SMILES '{s}'.");
+            self.pending_predict_1d_request = Some((s, is_13c));
+            return;
         }
+        if let Err(err) = nmr_core::octet_mol::parse_smiles(&s) {
+            self.pending_predict_1d_request = None;
+            self.status_message = format!("Invalid SMILES '{s}': {err}");
+            return;
+        }
+        self.status_message = format!("Requested {nuc} prediction for SMILES '{s}'.");
         self.pending_predict_1d_request = Some((s, is_13c));
+    }
+
+    /// Predict a `1H` or `13C` overlay directly from a SMILES string using the pure non-clobbering
+    /// standalone predictor (`octet_canvas::predict_1d_from_smiles_standalone`), failing closed on
+    /// invalid SMILES without touching the Octet canvas scene.
+    pub fn predict_1d_overlay_from_smiles(
+        &mut self,
+        smiles: &str,
+        is_13c: bool,
+    ) -> Result<(), String> {
+        let proton_mhz = match self.active_report_metadata() {
+            (ReportNucleus::C13, _, Some(c_mhz), _) if c_mhz > 0.0 => {
+                c_mhz / nmr_core::octet_assign::C13_TO_H1_LARMOR_RATIO
+            }
+            (_, _, Some(h_mhz), _) if h_mhz > 0.0 => h_mhz,
+            _ => 500.0,
+        };
+        let (spec, label) =
+            crate::octet_canvas::predict_1d_from_smiles_standalone(smiles, is_13c, proton_mhz)?;
+        self.set_predicted_overlay(spec, label);
+        Ok(())
     }
 
     /// Attach an optional predicted `1H` or `13C` [`Spectrum1D`] overlay and enable amber/mirror rendering.
@@ -4828,24 +4993,26 @@ impl Stack1dState {
         self.journal_style = prev_style;
 
         let report = if self.formatted_journal_report.trim().is_empty() {
-            let mhz = self.active_obs_mhz();
-            if self.picked_peaks.is_empty() {
-                format!(
-                    "1H NMR ({mhz:.0} MHz, {}): δ (no peaks picked).",
-                    self.solvent_choice
-                )
+            let (nuc, decoupled, mhz_opt, solv_opt) = self.active_report_metadata();
+            let header =
+                Self::format_honest_nmr_header(nuc, decoupled, mhz_opt, solv_opt.as_deref());
+            let decimals = nuc.default_shift_decimals();
+            let mut finite_ppms: Vec<f64> = self
+                .picked_peaks
+                .iter()
+                .map(|p| p.ppm)
+                .filter(|p| p.is_finite())
+                .collect();
+            finite_ppms.sort_by(|a, b| b.total_cmp(a));
+            finite_ppms.truncate(24);
+            if finite_ppms.is_empty() {
+                format!("{header} δ (no peaks picked).")
             } else {
-                let mut ppms: Vec<String> = self
-                    .picked_peaks
-                    .iter()
-                    .map(|p| format!("{:.2}", p.ppm))
+                let ppms: Vec<String> = finite_ppms
+                    .into_iter()
+                    .map(|p| format!("{p:.decimals$}"))
                     .collect();
-                ppms.truncate(24);
-                format!(
-                    "1H NMR ({mhz:.0} MHz, {}): δ {}.",
-                    self.solvent_choice,
-                    ppms.join(", ")
-                )
+                format!("{header} δ {}.", ppms.join(", "))
             }
         } else {
             self.formatted_journal_report.clone()
@@ -10411,5 +10578,104 @@ mod tests {
         let sel = state.selected_peak_idx.expect("selected");
         assert!(state.picked_peaks[sel].ppm > p0_before);
         assert_eq!(state.drain_pending_undo().len(), 1);
+    }
+
+    #[test]
+    fn p0_1_stack1d_copy_acs_uses_real_nucleus_and_frequency() {
+        // 1. 100.6 MHz 13C{1H} spectrum (400 MHz magnet) -> must report 13C{1H} and 100.6 MHz, never 1H / 600 MHz!
+        let n = 4096usize;
+        let c13_mhz = 100.6_f64;
+        let axis = AxisPpm::from_bounds("13C", n, 200.0, 0.0, c13_mhz);
+        let ppm: Vec<f64> = (0..n).map(|i| axis.index_to_ppm(i as f64)).collect();
+        let mut y = vec![0.0_f64; n];
+        for &shift in &[171.1, 60.4, 21.0, 14.2] {
+            add_lorentzian(&mut y, &ppm, shift, 0.12, 5.0);
+        }
+        let mut spec_13c = Spectrum1D::new(
+            "ethyl_acetate_13c",
+            Experiment1DKind::Carbon13Decoupled,
+            axis,
+            y,
+            None,
+        );
+        spec_13c.solvent = Some("CDCl3".to_string());
+
+        let mut state = Stack1dState::default();
+        state.load_user_spectra(vec![spec_13c]);
+        let acs_13c = state.build_acs_journal_string();
+        assert!(
+            acs_13c.starts_with("¹³C{¹H} NMR (100.6 MHz"),
+            "13C Copy ACS must use real 13C nucleus and 100.6 MHz frequency: {acs_13c}"
+        );
+        assert!(!acs_13c.contains("1H NMR"));
+        assert!(!acs_13c.contains("¹H NMR"));
+        assert!(!acs_13c.contains("600 MHz"));
+        assert!(!acs_13c.contains("500 MHz"));
+        assert!(!acs_13c.contains("): δ"));
+        assert!(acs_13c.contains("171.1") && acs_13c.contains("14.2"));
+
+        // 2. Fallback path when no multiplets are detected (e.g. empty peak list on 13C)
+        state.detected_multiplets.clear();
+        state.picked_peaks.clear();
+        state.formatted_journal_report.clear();
+        let mut empty_c13 = Stack1dState::default();
+        let flat_axis = AxisPpm::from_bounds("13C", 512, 200.0, 0.0, 125.76);
+        let mut flat_spec = Spectrum1D::new(
+            "blank_13c",
+            Experiment1DKind::Carbon13Decoupled,
+            flat_axis,
+            vec![0.0; 512],
+            None,
+        );
+        flat_spec.solvent = Some("DMSO-d6".to_string());
+        empty_c13.load_user_spectra(vec![flat_spec]);
+        let acs_empty = empty_c13.build_acs_journal_string();
+        assert!(
+            acs_empty.starts_with("¹³C{¹H} NMR (125.8 MHz, DMSO-d6) δ "),
+            "Empty 13C fallback must preserve 13C nucleus, real MHz, and no colon: {acs_empty}"
+        );
+
+        // 3. 400 MHz 1H spectrum -> must report 400 MHz, never 500/600 MHz
+        let axis_1h = AxisPpm::from_bounds("1H", n, 10.0, 0.0, 400.0);
+        let ppm_1h: Vec<f64> = (0..n).map(|i| axis_1h.index_to_ppm(i as f64)).collect();
+        let mut y_1h = vec![0.0_f64; n];
+        add_lorentzian(&mut y_1h, &ppm_1h, 2.05, 0.006, 3.0);
+        let mut spec_1h =
+            Spectrum1D::new("ea_1h_400", Experiment1DKind::Proton1D, axis_1h, y_1h, None);
+        spec_1h.solvent = Some("CDCl3".to_string());
+        let mut state_1h = Stack1dState::default();
+        state_1h.load_user_spectra(vec![spec_1h]);
+        let acs_1h = state_1h.build_acs_journal_string();
+        assert!(
+            acs_1h.starts_with("¹H NMR (400 MHz"),
+            "1H Copy ACS must report 400 MHz: {acs_1h}"
+        );
+        assert!(!acs_1h.contains("500 MHz") && !acs_1h.contains("600 MHz"));
+    }
+
+    #[test]
+    fn p1_3_request_predict_1d_fails_closed_on_invalid_smiles() {
+        let mut state = Stack1dState::default();
+        state.request_predict_1d("C((not-valid-smiles!!!", false);
+        assert!(
+            state.pending_predict_1d_request.is_none(),
+            "Invalid SMILES must fail closed and not queue prediction"
+        );
+        assert!(state.status_message.contains("Invalid SMILES"));
+
+        // Standalone overlay helper also fails closed on invalid SMILES and succeeds on valid SMILES
+        assert!(state
+            .predict_1d_overlay_from_smiles("C((bad!!!", false)
+            .is_err());
+        assert!(state.predicted_overlay_spectrum.is_none());
+
+        state
+            .predict_1d_overlay_from_smiles("CCOC(=O)C", true)
+            .expect("valid ethyl acetate 13C prediction");
+        let ov = state
+            .predicted_overlay_spectrum
+            .as_ref()
+            .expect("overlay attached");
+        assert!((ov.axis.obs_mhz - 500.0 * 0.251_45).abs() < 1e-4);
     }
 }

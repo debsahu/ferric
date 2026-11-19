@@ -15,11 +15,15 @@ use eframe::egui;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::f64::consts::PI;
 
+use nmr_core::octet_analyt::nmr_predict::{predict_nmr, NmrNucleus};
+use nmr_core::octet_analyt::AnalytMol;
 use nmr_core::octet_assign::{
-    auto_assign_1d_to_structure_with_locks, extract_experimental_peaks_from_spectrum,
+    auto_assign_1d_to_structure_with_locks, c13_frequency_mhz, decimate_trace_peak_preserving,
+    deduplicate_couplings_hz, extract_experimental_peaks_from_spectrum,
     format_acs_with_atom_labels, is_carbon_nucleus, predicted_groups_from_signals,
     swap_or_lock_assignment, AutoAssign1DResult,
 };
+use nmr_core::octet_mol::{expand_abbreviations, parse_smiles};
 use nmr_core::octet_render::{
     build_peptide_scene, chair_sprout_vectors, compile_scene_primitives, expand_multiplet_lines_hz,
     flatten_path_commands, fuse_polygon_on_bond, implicit_hydrogens, parse_peptide_sequence,
@@ -383,6 +387,9 @@ pub struct OctetDrawPanel {
     pub pending_send_to_1d: Option<SceneSpectrum1D>,
     /// Collected experimental 1D spectra (`1H` / `13C`) available for overlay, mirror, and auto-assign.
     pub experimental_spectra: Vec<SceneSpectrum1D>,
+    /// Optional measured experimental NMR solvent (e.g. `Some("CDCl3".into())`); `None` when unknown
+    /// (never fabricated in ACS output).
+    pub experimental_solvent: Option<String>,
     /// Active index into `experimental_spectra` (`None` = predicted only).
     pub selected_experimental_idx: Option<usize>,
     /// When true, mirror experimental trace inverted below midline; when false, overlay upward.
@@ -469,6 +476,7 @@ impl OctetDrawPanel {
             cached_13c: Vec::new(),
             pending_send_to_1d: None,
             experimental_spectra: Vec::new(),
+            experimental_solvent: None,
             selected_experimental_idx: None,
             mirror_experimental: false,
             auto_assign_result: None,
@@ -502,11 +510,23 @@ impl OctetDrawPanel {
         &self.scene
     }
 
-    /// Replace the active [`RenderScene`] (recording an undo snapshot).
+    /// Clear transient 1D assignment, hover, highlight, and swap state whenever the scene changes.
+    fn clear_stale_assignment_and_hover_state(&mut self) {
+        self.highlighted_nmr_atoms.clear();
+        self.hover_target = None;
+        self.hovered_atom_idx = None;
+        self.hovered_peak_idx = None;
+        self.swap_source_group = None;
+        self.auto_assign_result = None;
+    }
+
+    /// Replace the active [`RenderScene`] (recording an undo snapshot) and clear any stale
+    /// auto-assignment, hover, or lock-swap state from the previous structure.
     pub fn set_scene(&mut self, new_scene: RenderScene) {
         self.push_undo();
         self.scene = new_scene;
         self.selected_atoms.clear();
+        self.clear_stale_assignment_and_hover_state();
         self.active_molecule_index = 0;
         self.scene_dirty = true;
         self.fit_camera_to_scene();
@@ -528,6 +548,7 @@ impl OctetDrawPanel {
             self.redo_stack.push(self.scene.clone());
             self.scene = prev;
             self.selected_atoms.clear();
+            self.clear_stale_assignment_and_hover_state();
             self.scene_dirty = true;
             self.recompute_live_analytics();
             self.status_msg = format!("Undo ({} steps remaining)", self.undo_stack.len());
@@ -539,6 +560,7 @@ impl OctetDrawPanel {
             self.undo_stack.push(self.scene.clone());
             self.scene = nxt;
             self.selected_atoms.clear();
+            self.clear_stale_assignment_and_hover_state();
             self.scene_dirty = true;
             self.recompute_live_analytics();
             self.status_msg = format!("Redo ({} steps remaining)", self.redo_stack.len());
@@ -1054,6 +1076,16 @@ impl OctetDrawPanel {
         self.status_msg = format!("Queued predicted {nuc} spectrum for 1D Suite");
     }
 
+    /// Predict a `1H` or `13C` 1D NMR spectrum from an explicit SMILES string strictly fail-closed
+    /// (`Err` on empty/invalid SMILES) WITHOUT mutating or replacing `self.scene`.
+    pub fn predict_1d_from_smiles_standalone(
+        smiles: &str,
+        is_13c: bool,
+        proton_mhz: f64,
+    ) -> Result<(nmr_core::nmr1d::Spectrum1D, String), String> {
+        predict_1d_from_smiles_standalone(smiles, is_13c, proton_mhz)
+    }
+
     /// Run optimal Kuhn-Munkres (Hungarian) 1D experimental-to-structure auto-assignment
     /// between the currently selected experimental spectrum and the active molecule's predicted signals.
     pub fn run_auto_assign_1d(&mut self) {
@@ -1078,9 +1110,9 @@ impl OctetDrawPanel {
             self.recompute_live_analytics();
         }
 
-        let (nucleus, freq_mhz, pred_signals) = match self.nmr_tab {
-            NmrViewTab::Proton1H => ("1H", self.spectrometer_mhz, &self.cached_1h),
-            NmrViewTab::Carbon13C => ("13C", self.spectrometer_mhz * 0.251_45, &self.cached_13c),
+        let (nucleus, pred_signals) = match self.nmr_tab {
+            NmrViewTab::Proton1H => ("1H", &self.cached_1h),
+            NmrViewTab::Carbon13C => ("13C", &self.cached_13c),
         };
         let pred_groups = predicted_groups_from_signals(pred_signals, nucleus);
         let exp_peaks = extract_experimental_peaks_from_spectrum(&exp_spec);
@@ -1096,16 +1128,26 @@ impl OctetDrawPanel {
             .map(|prev| prev.locked_pairs())
             .unwrap_or_default();
 
+        // Preserve measured experimental spectrometer frequency (never fall back to predicted
+        // slider or fabricate 600 MHz / CDCl3). If a proton frequency (> 350 MHz) was attached to
+        // a 13C trace, convert via the exact 13C/1H gyromagnetic ratio (0.25145).
+        let exp_mhz = if exp_spec.spectrometer_mhz.is_finite() && exp_spec.spectrometer_mhz > 0.0 {
+            if exp_is_c13 && exp_spec.spectrometer_mhz > 350.0 {
+                c13_frequency_mhz(exp_spec.spectrometer_mhz)
+            } else {
+                exp_spec.spectrometer_mhz
+            }
+        } else {
+            0.0
+        };
+        let exp_solvent = self.experimental_solvent.as_deref().unwrap_or("");
+
         let res = auto_assign_1d_to_structure_with_locks(
             &pred_groups,
             &exp_peaks,
             nucleus,
-            if exp_spec.spectrometer_mhz > 0.0 {
-                exp_spec.spectrometer_mhz
-            } else {
-                freq_mhz
-            },
-            "CDCl3",
+            exp_mhz,
+            exp_solvent,
             &locks,
         );
         self.status_msg = format!(
@@ -1181,6 +1223,8 @@ impl OctetDrawPanel {
                 self.cached_props = compute_builtin_properties(&sub);
             }
             if let Some((mut h1, mut c13)) = ad.predict_nmr_1h_13c(&sub, self.spectrometer_mhz) {
+                sanitize_predicted_signals(&mut h1, &sub, false);
+                sanitize_predicted_signals(&mut c13, &sub, true);
                 remap_signal_atoms_to_parent(&mut h1, &parent_map);
                 remap_signal_atoms_to_parent(&mut c13, &parent_map);
                 self.cached_1h = h1;
@@ -1450,6 +1494,7 @@ impl OctetDrawPanel {
                         {
                             self.active_molecule_index = idx;
                             self.selected_atoms.clear();
+                            self.clear_stale_assignment_and_hover_state();
                             self.recompute_live_analytics();
                         }
                     }
@@ -4017,12 +4062,12 @@ impl OctetDrawPanel {
                         if let Some(pk) = nearest_exp_pk {
                             next_hovered_peak = Some(pk.peak_idx);
                             if let Some(res) = &active_assign {
-                                if let Some(asgn) = res.assignment_for_peak(pk.peak_idx) {
+                                for asgn in res.assignments_for_peak(pk.peak_idx) {
                                     for &ai in &asgn.atom_indices {
                                         self.highlighted_nmr_atoms.insert(ai);
                                     }
-                                    if let Some(&first_ai) = asgn.atom_indices.first() {
-                                        next_hovered_atom = Some(first_ai);
+                                    if next_hovered_atom.is_none() {
+                                        next_hovered_atom = asgn.atom_indices.first().copied();
                                     }
                                 }
                             }
@@ -4940,17 +4985,168 @@ fn draw_folder_tab(
     (rect, resp.clicked())
 }
 
-fn format_experimental_spectrum_label(idx: usize, sp: &SceneSpectrum1D) -> String {
-    let nuc = if is_carbon_nucleus(&sp.nucleus) {
-        "13C"
+/// Pure, fail-closed, non-clobbering 1D NMR (`1H` / `13C`) spectrum predictor from a SMILES string.
+///
+/// Parses `smiles` strictly fail-closed (`Err` on empty or malformed SMILES), computes chemical
+/// shifts and couplings using `nmr_core::octet_analyt::nmr_predict::predict_nmr` with the exact
+/// nucleus Larmor frequency (`proton_mhz` for `1H`, `0.25145 * proton_mhz` for `13C`), and
+/// synthesizes a high-resolution [`nmr_core::nmr1d::Spectrum1D`] WITHOUT touching any Octet scene.
+pub fn predict_1d_from_smiles_standalone(
+    smiles: &str,
+    is_13c: bool,
+    proton_mhz: f64,
+) -> Result<(nmr_core::nmr1d::Spectrum1D, String), String> {
+    let trimmed = smiles.trim();
+    if trimmed.is_empty() {
+        return Err("SMILES string is empty".to_string());
+    }
+    if !proton_mhz.is_finite() || proton_mhz <= 0.0 {
+        return Err("Spectrometer proton frequency (MHz) must be finite and positive".to_string());
+    }
+
+    let mut mol = parse_smiles(trimmed).map_err(|e| format!("Invalid SMILES '{trimmed}': {e}"))?;
+    if mol.atoms.is_empty() {
+        return Err(format!("SMILES '{trimmed}' produced an empty molecule"));
+    }
+    let _ = expand_abbreviations(&mut mol);
+    let amol = AnalytMol::from(&mol);
+
+    let (nucleus_enum, nuc_str, obs_mhz, ppm_lo, ppm_hi, kind) = if is_13c {
+        (
+            NmrNucleus::C13,
+            "13C",
+            c13_frequency_mhz(proton_mhz),
+            0.0_f64,
+            220.0_f64,
+            nmr_core::nmr1d::Experiment1DKind::Carbon13Decoupled,
+        )
     } else {
-        "1H"
+        (
+            NmrNucleus::H1,
+            "1H",
+            proton_mhz,
+            -0.5_f64,
+            11.5_f64,
+            nmr_core::nmr1d::Experiment1DKind::Proton1D,
+        )
     };
-    let mhz = sp.spectrometer_mhz.round().max(1.0) as usize;
-    if let Some(t) = sp.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        format!("{t} ({nuc}, {mhz} MHz)")
+
+    let pred = predict_nmr(&amol, nucleus_enum, None, None);
+    let n_pts = 8192_usize;
+    let span = (ppm_hi - ppm_lo).max(1.0);
+    let lw_hz = if is_13c { 2.5 } else { 1.4 };
+    let gamma = (0.5 * lw_hz / obs_mhz.max(10.0)).max(span / (n_pts as f64) * 2.5);
+
+    let mut sublines: Vec<(f64, f64)> = Vec::new();
+    for sig in &pred.signals {
+        if !sig.shift_ppm.is_finite() {
+            continue;
+        }
+        let area = (sig.nuclei as f64).max(1.0);
+        if is_13c {
+            sublines.push((sig.shift_ppm, area));
+        } else {
+            let mult = sig.multiplicity();
+            let raw_js: Vec<f64> = sig.couplings.iter().map(|c| c.j_hz).collect();
+            let unique_js = deduplicate_couplings_hz(&raw_js);
+            for (dhz, amp) in expand_multiplet_lines_hz(&mult, &unique_js) {
+                sublines.push((sig.shift_ppm + dhz / obs_mhz, amp * area));
+            }
+        }
+    }
+
+    let mut data = vec![0.0_f64; n_pts];
+    for (i, slot) in data.iter_mut().enumerate() {
+        let x = ppm_hi - (i as f64 / (n_pts - 1) as f64) * span;
+        let mut y = 0.0_f64;
+        for &(center, amp) in &sublines {
+            let d = (x - center) / gamma;
+            if d.abs() < 40.0 {
+                y += amp / (1.0 + d * d);
+            }
+        }
+        *slot = y;
+    }
+
+    let label = format!("Predicted {nuc_str} ({trimmed}, {:.0} MHz)", obs_mhz);
+    let axis = nmr_core::spectrum::AxisPpm::from_bounds(nuc_str, n_pts, ppm_hi, ppm_lo, obs_mhz);
+    let spec = nmr_core::nmr1d::Spectrum1D::new(label.clone(), kind, axis, data, None);
+    Ok((spec, label))
+}
+
+/// Sanitize predicted [`SpectrumSignal1D`] items returned by a backend adapter:
+/// - Filter out non-finite chemical shifts
+/// - Deduplicate repeated scalar `J`-couplings (`[7.0, 7.0, 7.0]` -> `[7.0]`)
+/// - Replace bare nuclei-count labels (`"2H"`, `"3H"`, `"1C"`) with true atom-group labels (`H-3`, `C-1`).
+fn sanitize_predicted_signals(
+    signals: &mut Vec<SpectrumSignal1D>,
+    sub: &RenderScene,
+    is_c13: bool,
+) {
+    signals.retain(|s| s.ppm.is_finite());
+    for (idx, sig) in signals.iter_mut().enumerate() {
+        sig.couplings_hz = deduplicate_couplings_hz(&sig.couplings_hz);
+        let is_bare_count = sig.assignment_label.as_deref().is_none_or(|raw| {
+            let t = raw.trim();
+            if t.is_empty() {
+                return true;
+            }
+            let suf = if is_c13 { 'C' } else { 'H' };
+            let mut ch = t.chars();
+            ch.next_back().is_some_and(|c| c.eq_ignore_ascii_case(&suf))
+                && !ch.as_str().is_empty()
+                && ch.as_str().chars().all(|c| c.is_ascii_digit())
+        });
+        if is_bare_count {
+            let prefix = if is_c13 { "C" } else { "H" };
+            let lbl = if let Some(&first_ai) = sig.atom_indices.first() {
+                if sig.atom_indices.len() == 1 {
+                    let elem = sub
+                        .atoms
+                        .get(first_ai)
+                        .map(|a| a.label.as_str())
+                        .unwrap_or(prefix);
+                    if !is_c13 && elem != "C" && !elem.is_empty() {
+                        format!("{elem}H-{}", first_ai + 1)
+                    } else {
+                        format!("{prefix}-{}", first_ai + 1)
+                    }
+                } else {
+                    let mut sorted = sig.atom_indices.clone();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    let nums: Vec<String> = sorted.iter().map(|i| (i + 1).to_string()).collect();
+                    format!("{prefix}-{}", nums.join("/"))
+                }
+            } else {
+                format!("{prefix}-{}", idx + 1)
+            };
+            sig.assignment_label = Some(lbl);
+        }
+    }
+}
+
+fn format_experimental_spectrum_label(idx: usize, sp: &SceneSpectrum1D) -> String {
+    let is_c13 = is_carbon_nucleus(&sp.nucleus);
+    let nuc = if is_c13 { "13C" } else { "1H" };
+    let freq_part = if sp.spectrometer_mhz.is_finite() && sp.spectrometer_mhz > 0.0 {
+        let mhz = if is_c13 && sp.spectrometer_mhz > 350.0 {
+            c13_frequency_mhz(sp.spectrometer_mhz)
+        } else {
+            sp.spectrometer_mhz
+        };
+        Some(format!("{} MHz", mhz.round().max(1.0) as usize))
     } else {
-        format!("Exp #{} ({nuc}, {mhz} MHz)", idx + 1)
+        None
+    };
+    let meta = match freq_part {
+        Some(f) => format!("{nuc}, {f}"),
+        None => nuc.to_string(),
+    };
+    if let Some(t) = sp.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        format!("{t} ({meta})")
+    } else {
+        format!("Exp #{} ({meta})", idx + 1)
     }
 }
 
@@ -4984,10 +5180,11 @@ fn build_experimental_trace_screen_pts(
                 .map(|p| p[1].abs())
                 .fold(1e-9_f64, f64::max)
                 .max(1e-9);
-            let step = (pts.len() / 512).max(1);
-            return pts
+            let ppms: Vec<f64> = pts.iter().map(|p| p[0]).collect();
+            let ys: Vec<f64> = pts.iter().map(|p| p[1]).collect();
+            let decimated = decimate_trace_peak_preserving(&ppms, &ys, 512);
+            return decimated
                 .into_iter()
-                .step_by(step)
                 .map(|[ppm, y]| {
                     let norm = (y.max(0.0) / ymax).clamp(0.0, 1.0) as f32;
                     egui::pos2(ppm_to_x(ppm), base_y + dir * norm * h_amp)
@@ -6693,9 +6890,40 @@ fn import_builtin_jcamp_dx(jdx: &str, current_scene: &RenderScene) -> Result<Ren
     }
     let mut parsed_signals = Vec::new();
     let mut in_peaks = false;
+    let mut obs_mhz = 0.0_f64;
+    let mut nucleus = "1H".to_string();
+    let mut title: Option<String> = None;
     for line in jdx.lines() {
         let t = line.trim();
-        if t.starts_with("##PEAK TABLE") || t.starts_with("##XYDATA") {
+        let up = t.to_ascii_uppercase();
+        if let Some(rest) = up.strip_prefix("##.OBSERVE FREQUENCY=") {
+            if let Ok(v) = rest.trim().parse::<f64>() {
+                if v.is_finite() && v > 0.0 {
+                    obs_mhz = v;
+                }
+            }
+            in_peaks = false;
+            continue;
+        }
+        if let Some(rest) = up.strip_prefix("##.OBSERVE NUCLEUS=") {
+            let cleaned = rest.trim().trim_start_matches('^');
+            if !cleaned.is_empty() {
+                nucleus = cleaned.to_string();
+            }
+            in_peaks = false;
+            continue;
+        }
+        if up.starts_with("##TITLE=") {
+            if let Some((_, rhs)) = t.split_once('=') {
+                let s = rhs.trim();
+                if !s.is_empty() {
+                    title = Some(s.to_string());
+                }
+            }
+            in_peaks = false;
+            continue;
+        }
+        if up.starts_with("##PEAK TABLE") || up.starts_with("##XYDATA") {
             in_peaks = true;
             continue;
         }
@@ -6710,31 +6938,34 @@ fn import_builtin_jcamp_dx(jdx: &str, current_scene: &RenderScene) -> Result<Ren
                 .collect();
             if parts.len() >= 2 {
                 if let (Ok(ppm), Ok(y)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                    parsed_signals.push(SpectrumSignal1D {
-                        ppm,
-                        multiplicity: "s".to_string(),
-                        couplings_hz: vec![],
-                        integral: (y / 100.0).clamp(0.5, 9.0),
-                        atom_indices: vec![],
-                        assignment_label: None,
-                    });
+                    if ppm.is_finite() && y.is_finite() {
+                        parsed_signals.push(SpectrumSignal1D {
+                            ppm,
+                            multiplicity: String::new(),
+                            couplings_hz: vec![],
+                            integral: 0.0,
+                            atom_indices: vec![],
+                            assignment_label: None,
+                        });
+                    }
                 }
             }
         }
     }
+    let is_c13 = is_carbon_nucleus(&nucleus);
     let mut next_scene = current_scene.clone();
     next_scene.spectra_1d.push(SceneSpectrum1D {
         origin: [-5.0, -5.0],
         width_mol: 10.0,
         height_mol: 3.4,
-        nucleus: "1H".to_string(),
-        spectrometer_mhz: 500.0,
-        ppm_min: -0.5,
-        ppm_max: 11.0,
+        nucleus,
+        spectrometer_mhz: obs_mhz,
+        ppm_min: if is_c13 { 0.0 } else { -0.5 },
+        ppm_max: if is_c13 { 220.0 } else { 11.0 },
         linewidth_hz: 1.5,
-        show_integrals: true,
+        show_integrals: !is_c13,
         show_peak_labels: true,
-        title: Some("Imported JCAMP-DX 1D NMR".to_string()),
+        title: title.or_else(|| Some("Imported JCAMP-DX 1D NMR".to_string())),
         signals: parsed_signals,
         custom_trace: Vec::new(),
     });
@@ -7166,5 +7397,128 @@ mod tests {
         });
         up_out.textures_delta.clear();
         assert_eq!(panel.nmr_tab, NmrViewTab::Carbon13C);
+    }
+
+    #[test]
+    fn p1_3_set_scene_clears_stale_auto_assign_and_hover_state() {
+        let mut panel = OctetDrawPanel::new();
+        let exp_signals: Vec<SpectrumSignal1D> = panel
+            .cached_1h
+            .iter()
+            .map(|s| {
+                let mut e = s.clone();
+                e.ppm += 0.02;
+                e.atom_indices.clear();
+                e.assignment_label = None;
+                e
+            })
+            .collect();
+        panel.experimental_spectra.push(SceneSpectrum1D {
+            origin: [0.0, 0.0],
+            width_mol: 10.0,
+            height_mol: 3.4,
+            nucleus: "1H".to_string(),
+            spectrometer_mhz: 400.0,
+            ppm_min: -0.5,
+            ppm_max: 11.5,
+            linewidth_hz: 1.4,
+            show_integrals: true,
+            show_peak_labels: true,
+            title: Some("Exp 400 MHz".to_string()),
+            signals: exp_signals,
+            custom_trace: Vec::new(),
+        });
+        panel.selected_experimental_idx = Some(0);
+        panel.run_auto_assign_1d();
+        assert!(panel.auto_assign_result.is_some());
+
+        // Populate hover, highlight, and swap state
+        panel.hovered_atom_idx = Some(0);
+        panel.hovered_peak_idx = Some(0);
+        panel.highlighted_nmr_atoms.insert(0);
+        panel.swap_source_group = Some(0);
+
+        // Replacing the scene must clear ALL stale auto-assign / hover / swap state
+        panel.set_scene(RenderScene::new());
+        assert!(panel.auto_assign_result.is_none());
+        assert!(panel.hovered_atom_idx.is_none());
+        assert!(panel.hovered_peak_idx.is_none());
+        assert!(panel.hover_target.is_none());
+        assert!(panel.highlighted_nmr_atoms.is_empty());
+        assert!(panel.swap_source_group.is_none());
+    }
+
+    #[test]
+    fn p1_3_predict_1d_from_smiles_standalone_fails_closed_and_preserves_scene() {
+        let panel = OctetDrawPanel::new();
+        let scene_snapshot = panel.scene.clone();
+
+        // Invalid / empty SMILES must return Err fail-closed
+        assert!(predict_1d_from_smiles_standalone("", false, 400.0).is_err());
+        assert!(predict_1d_from_smiles_standalone("C((invalid!!!", false, 400.0).is_err());
+        assert!(predict_1d_from_smiles_standalone("CCOC(=O)C", false, 0.0).is_err());
+        assert!(predict_1d_from_smiles_standalone("CCOC(=O)C", false, f64::NAN).is_err());
+
+        // Valid ethyl acetate SMILES produces 1H at 400 MHz and 13C at 100.58 MHz without mutating panel.scene
+        let (spec_1h, lbl_1h) =
+            OctetDrawPanel::predict_1d_from_smiles_standalone("CCOC(=O)C", false, 400.0)
+                .expect("valid 1H prediction");
+        assert!((spec_1h.axis.obs_mhz - 400.0).abs() < 1e-6);
+        assert!(lbl_1h.contains("1H") && lbl_1h.contains("400 MHz"));
+        assert!(spec_1h.real.iter().copied().fold(0.0_f64, f64::max) > 0.0);
+
+        let (spec_13c, lbl_13c) =
+            OctetDrawPanel::predict_1d_from_smiles_standalone("CCOC(=O)C", true, 400.0)
+                .expect("valid 13C prediction");
+        assert!((spec_13c.axis.obs_mhz - 400.0 * 0.251_45).abs() < 1e-6);
+        assert!(lbl_13c.contains("13C") && lbl_13c.contains("101 MHz"));
+        assert!(spec_13c.real.iter().copied().fold(0.0_f64, f64::max) > 0.0);
+
+        // User's Octet scene is untouched
+        assert_eq!(panel.scene, scene_snapshot);
+    }
+
+    #[test]
+    fn p0_1_octet_auto_assign_omits_unknown_solvent_and_uses_c13_larmor_frequency() {
+        let mut panel = OctetDrawPanel::new();
+        assert_eq!(panel.experimental_solvent, None);
+
+        // 13C spectrum accidentally tagged with 600 MHz proton frequency -> converted to 150.87 MHz 13C!
+        let exp_13c_sigs: Vec<SpectrumSignal1D> = panel
+            .cached_13c
+            .iter()
+            .map(|s| SpectrumSignal1D {
+                ppm: s.ppm + 0.1,
+                multiplicity: String::new(),
+                couplings_hz: vec![],
+                integral: 0.0,
+                atom_indices: vec![],
+                assignment_label: None,
+            })
+            .collect();
+        panel.experimental_spectra.push(SceneSpectrum1D {
+            origin: [0.0, 0.0],
+            width_mol: 10.0,
+            height_mol: 3.4,
+            nucleus: "13C".to_string(),
+            spectrometer_mhz: 600.0,
+            ppm_min: 0.0,
+            ppm_max: 220.0,
+            linewidth_hz: 2.0,
+            show_integrals: false,
+            show_peak_labels: true,
+            title: Some("Collected 13C".to_string()),
+            signals: exp_13c_sigs,
+            custom_trace: Vec::new(),
+        });
+        panel.selected_experimental_idx = Some(0);
+        panel.run_auto_assign_1d();
+        let res = panel.auto_assign_result.as_ref().expect("13C result");
+        assert!((res.spectrometer_mhz - 600.0 * 0.251_45).abs() < 1e-4);
+        assert_eq!(res.experimental_solvent, None);
+        let acs = format_acs_with_atom_labels(res);
+        assert!(acs.starts_with("¹³C NMR (151 MHz) δ "), "Got: {acs}");
+        assert!(!acs.contains("600 MHz"));
+        assert!(!acs.contains("CDCl3"));
     }
 }

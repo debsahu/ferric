@@ -4,8 +4,9 @@
 //! Provenance: Clean-room test suite for FERRIC (`nmr-core`).
 
 use nmr_core::octet_assign::{
-    auto_assign_1d_to_structure, auto_assign_1d_to_structure_with_locks,
-    extract_experimental_peaks_from_spectrum, format_acs_with_atom_labels,
+    auto_assign_1d_to_structure, auto_assign_1d_to_structure_with_locks, c13_frequency_mhz,
+    decimate_trace_peak_preserving, extract_experimental_peaks_from_spectrum,
+    extract_experimental_peaks_full_res, format_acs_with_atom_labels,
     predicted_groups_from_signals, swap_or_lock_assignment, ExperimentalPeak1D, PredictedGroup1D,
 };
 use nmr_core::octet_render::{SceneSpectrum1D, SpectrumSignal1D};
@@ -585,4 +586,389 @@ fn extract_experimental_peaks_from_raw_custom_trace() {
     assert!((peaks[0].ppm - 7.40).abs() < 0.015);
     assert!((peaks[1].ppm - 3.85).abs() < 0.015);
     assert!((peaks[2].ppm - 1.25).abs() < 0.015);
+}
+
+#[test]
+fn p0_1_honest_experimental_acs_omits_unmeasured_fields_and_rejects_nan() {
+    // Ethyl acetate predicted signals (intentionally carrying bare nuclei-count labels "2H"/"3H"
+    // and repeated J=[7.0, 7.0, 7.0] as previously emitted by the backend adapter).
+    let pred_signals = vec![
+        SpectrumSignal1D {
+            ppm: 4.12,
+            multiplicity: "q".to_string(),
+            couplings_hz: vec![7.0, 7.0, 7.0],
+            integral: 2.0,
+            atom_indices: vec![2],
+            assignment_label: Some("2H".to_string()),
+        },
+        SpectrumSignal1D {
+            ppm: 2.05,
+            multiplicity: "s".to_string(),
+            couplings_hz: vec![],
+            integral: 3.0,
+            atom_indices: vec![0],
+            assignment_label: Some("3H".to_string()),
+        },
+        SpectrumSignal1D {
+            ppm: 1.26,
+            multiplicity: "t".to_string(),
+            couplings_hz: vec![7.0, 7.0],
+            integral: 3.0,
+            atom_indices: vec![3],
+            assignment_label: Some("3H".to_string()),
+        },
+        // Non-finite predicted shift must be excluded cleanly
+        SpectrumSignal1D {
+            ppm: f64::NAN,
+            multiplicity: "s".to_string(),
+            couplings_hz: vec![],
+            integral: 1.0,
+            atom_indices: vec![4],
+            assignment_label: Some("Bad".to_string()),
+        },
+    ];
+    let pred = predicted_groups_from_signals(&pred_signals, "1H");
+    assert_eq!(
+        pred.len(),
+        3,
+        "NaN predicted signal must be filtered out cleanly"
+    );
+    // Labels must be true atom-group labels, never bare nuclei counts
+    assert_eq!(pred[0].label, "H-3");
+    assert_eq!(pred[1].label, "H-1");
+    assert_eq!(pred[2].label, "H-4");
+    assert_eq!(pred[0].couplings_hz, vec![7.0]);
+
+    // Case A: Raw trace peaks with NO measured multiplicity/J/integral + unknown solvent & MHz
+    let raw_exp = vec![
+        ExperimentalPeak1D {
+            peak_idx: 0,
+            ppm: 4.13,
+            integral: None,
+            multiplicity: None,
+            couplings_hz: vec![],
+            intensity: 0.7,
+        },
+        ExperimentalPeak1D {
+            peak_idx: 1,
+            ppm: 2.04,
+            integral: None,
+            multiplicity: None,
+            couplings_hz: vec![],
+            intensity: 1.0,
+        },
+        ExperimentalPeak1D {
+            peak_idx: 2,
+            ppm: 1.25,
+            integral: None,
+            multiplicity: None,
+            couplings_hz: vec![],
+            intensity: 0.9,
+        },
+        // NaN experimental peak must never be assigned or emitted as "0.00" / "NaN"
+        ExperimentalPeak1D {
+            peak_idx: 3,
+            ppm: f64::NAN,
+            integral: Some(1.0),
+            multiplicity: Some("s".to_string()),
+            couplings_hz: vec![],
+            intensity: 1.0,
+        },
+    ];
+    let res_unknown = auto_assign_1d_to_structure(&pred, &raw_exp, "1H", 0.0, "");
+    assert_eq!(res_unknown.matched_count, 3);
+    assert_eq!(res_unknown.experimental_solvent, None);
+    let acs_unknown = format_acs_with_atom_labels(&res_unknown);
+    assert_eq!(acs_unknown, "¹H NMR δ 4.13 (H-3), 2.04 (H-1), 1.25 (H-4).");
+    assert!(!acs_unknown.contains("600 MHz"));
+    assert!(!acs_unknown.contains("500 MHz"));
+    assert!(!acs_unknown.contains("CDCl3"));
+    assert!(!acs_unknown.contains("J ="));
+    assert!(!acs_unknown.contains("NaN"));
+    assert!(!acs_unknown.contains("2H, 2H"));
+
+    // Case B: Known 400 MHz, unknown solvent -> "¹H NMR (400 MHz) δ ..."
+    let res_400 = auto_assign_1d_to_structure(&pred, &raw_exp, "1H", 400.0, "");
+    let acs_400 = format_acs_with_atom_labels(&res_400);
+    assert!(
+        acs_400.starts_with("¹H NMR (400 MHz) δ "),
+        "Expected 400 MHz header without fabricated solvent: {acs_400}"
+    );
+    assert!(!acs_400.contains("CDCl3"));
+
+    // Case C: Measured experimental multiplicity, repeated J, and integral -> deduplicated J and no "2H, 2H"
+    let measured_exp = vec![
+        ExperimentalPeak1D {
+            peak_idx: 0,
+            ppm: 4.13,
+            integral: Some(2.0),
+            multiplicity: Some("q".to_string()),
+            couplings_hz: vec![7.0, 7.0, 7.0],
+            intensity: 0.7,
+        },
+        ExperimentalPeak1D {
+            peak_idx: 1,
+            ppm: 2.04,
+            integral: Some(3.0),
+            multiplicity: Some("s".to_string()),
+            couplings_hz: vec![],
+            intensity: 1.0,
+        },
+        ExperimentalPeak1D {
+            peak_idx: 2,
+            ppm: 1.25,
+            integral: Some(3.0),
+            multiplicity: Some("t".to_string()),
+            couplings_hz: vec![7.0, 7.0],
+            intensity: 0.9,
+        },
+    ];
+    let res_meas = auto_assign_1d_to_structure(&pred, &measured_exp, "1H", 400.0, "CDCl3");
+    let acs_meas = format_acs_with_atom_labels(&res_meas);
+    assert_eq!(
+        acs_meas,
+        "¹H NMR (400 MHz, CDCl3) δ 4.13 (q, J = 7.0 Hz, 2H, H-3), 2.04 (s, 3H, H-1), 1.25 (t, J = 7.0 Hz, 3H, H-4)."
+    );
+    assert!(!acs_meas.contains("7.0, 7.0"));
+    assert!(!acs_meas.contains("2H, 2H"));
+
+    // Case D: 13C Larmor frequency helper (0.25145 * proton_mhz)
+    let c13_mhz = c13_frequency_mhz(400.0);
+    assert!((c13_mhz - 100.58).abs() < 1e-6);
+    let c_pred = vec![PredictedGroup1D {
+        group_idx: 0,
+        atom_indices: vec![1],
+        label: "1C".to_string(),
+        shift_ppm: 171.1,
+        sd_ppm: 4.0,
+        expected_integral: 1.0,
+        multiplicity: "s".to_string(),
+        couplings_hz: vec![],
+    }];
+    let c_exp = vec![ExperimentalPeak1D {
+        peak_idx: 0,
+        ppm: 171.0,
+        integral: None,
+        multiplicity: None,
+        couplings_hz: vec![],
+        intensity: 1.0,
+    }];
+    let c_res = auto_assign_1d_to_structure(&c_pred, &c_exp, "13C", c13_mhz, "");
+    let c_acs = format_acs_with_atom_labels(&c_res);
+    assert_eq!(c_acs, "¹³C NMR (101 MHz) δ 171.0 (C-2).");
+}
+
+#[test]
+fn p1_1_full_res_and_peak_preserving_decimation_detect_all_three_sharp_singlets_600mhz_64k() {
+    // 600 MHz 64k-point 1H spectrum with 3 sharp 0.8 Hz FWHM Lorentzian singlets.
+    // Naive `.step_by(65536 / 1024)` stride decimation drops 2 of 3 sharp singlets;
+    // both `extract_experimental_peaks_full_res` and `decimate_trace_peak_preserving` must detect 3/3!
+    let n = 65_536_usize;
+    let freq_mhz = 600.0_f64;
+    let fwhm_hz = 0.8_f64;
+    let gamma_ppm = (0.5 * fwhm_hz) / freq_mhz; // 0.0006667 ppm HWHM
+    let true_singlets = [(7.260, 1.0), (3.752, 0.85), (1.248, 0.92)];
+
+    let ppm_hi = 11.5_f64;
+    let ppm_lo = -0.5_f64;
+    let mut ppms = Vec::with_capacity(n);
+    let mut ys = Vec::with_capacity(n);
+    for k in 0..n {
+        let p = ppm_hi - (k as f64 / (n - 1) as f64) * (ppm_hi - ppm_lo);
+        let mut y = 0.0;
+        for &(center, amp) in &true_singlets {
+            let d = (p - center) / gamma_ppm;
+            if d.abs() < 60.0 {
+                y += amp / (1.0 + d * d);
+            }
+        }
+        ppms.push(p);
+        ys.push(y);
+    }
+
+    // 1. Direct full-resolution extraction
+    let peaks_full = extract_experimental_peaks_full_res(&ppms, &ys, "1H");
+    assert_eq!(
+        peaks_full.len(),
+        3,
+        "Full-res extraction must detect all 3/3 sharp 0.8 Hz singlets, got {peaks_full:?}"
+    );
+    for (pk, &(expected_ppm, _)) in peaks_full.iter().zip(true_singlets.iter()) {
+        assert!(
+            (pk.ppm - expected_ppm).abs() < 0.002,
+            "Expected peak near {expected_ppm:.3}, got {:.4}",
+            pk.ppm
+        );
+        assert!(pk.multiplicity.is_none());
+        assert!(pk.integral.is_none());
+        assert!(pk.couplings_hz.is_empty());
+    }
+
+    // 2. Peak-preserving min-max envelope decimation -> SceneSpectrum1D extraction
+    let decimated = decimate_trace_peak_preserving(&ppms, &ys, 1024);
+    assert!(decimated.len() <= 2048);
+    let spec = SceneSpectrum1D {
+        origin: [0.0, 0.0],
+        width_mol: 10.0,
+        height_mol: 3.0,
+        nucleus: "1H".to_string(),
+        spectrometer_mhz: freq_mhz,
+        ppm_min: ppm_lo,
+        ppm_max: ppm_hi,
+        linewidth_hz: fwhm_hz,
+        show_integrals: false,
+        show_peak_labels: false,
+        title: Some("600 MHz 64k Sharp Singlets".to_string()),
+        signals: Vec::new(),
+        custom_trace: decimated,
+    };
+    let peaks_dec = extract_experimental_peaks_from_spectrum(&spec);
+    assert_eq!(
+        peaks_dec.len(),
+        3,
+        "Peak-preserving decimation must also retain all 3/3 sharp 0.8 Hz singlets, got {peaks_dec:?}"
+    );
+    for (pk, &(expected_ppm, _)) in peaks_dec.iter().zip(true_singlets.iter()) {
+        assert!(
+            (pk.ppm - expected_ppm).abs() < 0.002,
+            "Decimated peak expected near {expected_ppm:.3}, got {:.4}",
+            pk.ppm
+        );
+    }
+}
+
+#[test]
+fn p1_2_toluene_5h_composite_aromatic_multiplet_assigns_all_constituent_groups() {
+    // Toluene predicted 1H groups: o-ArH (2H), m-ArH (2H), p-ArH (1H), CH3 (3H) = 8H total
+    let pred = vec![
+        PredictedGroup1D {
+            group_idx: 0,
+            atom_indices: vec![1, 5],
+            label: "o-ArH".to_string(),
+            shift_ppm: 7.17,
+            sd_ppm: 0.35,
+            expected_integral: 2.0,
+            multiplicity: "d".to_string(),
+            couplings_hz: vec![7.5],
+        },
+        PredictedGroup1D {
+            group_idx: 1,
+            atom_indices: vec![2, 4],
+            label: "m-ArH".to_string(),
+            shift_ppm: 7.25,
+            sd_ppm: 0.35,
+            expected_integral: 2.0,
+            multiplicity: "t".to_string(),
+            couplings_hz: vec![7.5],
+        },
+        PredictedGroup1D {
+            group_idx: 2,
+            atom_indices: vec![3],
+            label: "p-ArH".to_string(),
+            shift_ppm: 7.15,
+            sd_ppm: 0.35,
+            expected_integral: 1.0,
+            multiplicity: "t".to_string(),
+            couplings_hz: vec![7.4],
+        },
+        PredictedGroup1D {
+            group_idx: 3,
+            atom_indices: vec![6],
+            label: "CH3".to_string(),
+            shift_ppm: 2.34,
+            sd_ppm: 0.35,
+            expected_integral: 3.0,
+            multiplicity: "s".to_string(),
+            couplings_hz: vec![],
+        },
+    ];
+
+    // Overlapping experimental 5H aromatic multiplet + 3H methyl singlet + trace CDCl3 peak
+    let exp = vec![
+        ExperimentalPeak1D {
+            peak_idx: 0,
+            ppm: 7.22,
+            integral: Some(5.0),
+            multiplicity: Some("m".to_string()),
+            couplings_hz: vec![],
+            intensity: 5.0,
+        },
+        ExperimentalPeak1D {
+            peak_idx: 1,
+            ppm: 2.35,
+            integral: Some(3.0),
+            multiplicity: Some("s".to_string()),
+            couplings_hz: vec![],
+            intensity: 3.0,
+        },
+        ExperimentalPeak1D {
+            peak_idx: 2,
+            ppm: 7.26,
+            integral: Some(0.15),
+            multiplicity: Some("s".to_string()),
+            couplings_hz: vec![],
+            intensity: 0.15,
+        },
+    ];
+
+    let res = auto_assign_1d_to_structure(&pred, &exp, "1H", 400.0, "CDCl3");
+    assert_eq!(
+        res.matched_count, 4,
+        "All 4 toluene groups (2H+2H+1H aromatic + 3H CH3) must be matched, got {:?}",
+        res.assignments
+    );
+    assert_eq!(res.assignments[0].peak_idx, Some(0)); // o-ArH -> 5H multiplet
+    assert_eq!(res.assignments[1].peak_idx, Some(0)); // m-ArH -> 5H multiplet
+    assert_eq!(res.assignments[2].peak_idx, Some(0)); // p-ArH -> 5H multiplet
+    assert_eq!(res.assignments[3].peak_idx, Some(1)); // CH3   -> 3H singlet
+    assert_eq!(
+        res.unassigned_peaks,
+        vec![2],
+        "Trace CDCl3 solvent peak must remain unassigned"
+    );
+    assert_eq!(res.assignments_for_peak(0).len(), 3);
+
+    // ACS string must merge all 3 aromatic groups under ONE 7.22 (m, 5H, ...) entry
+    let acs = format_acs_with_atom_labels(&res);
+    assert_eq!(
+        acs,
+        "¹H NMR (400 MHz, CDCl3) δ 7.22 (m, 5H, o-ArH, m-ArH, p-ArH), 2.35 (s, 3H, CH3)."
+    );
+
+    // Negative guard: a 1H experimental peak must NOT absorb two 1H groups
+    let two_1h = vec![
+        PredictedGroup1D {
+            group_idx: 0,
+            atom_indices: vec![0],
+            label: "H-1".to_string(),
+            shift_ppm: 7.20,
+            sd_ppm: 0.35,
+            expected_integral: 1.0,
+            multiplicity: "d".to_string(),
+            couplings_hz: vec![7.5],
+        },
+        PredictedGroup1D {
+            group_idx: 1,
+            atom_indices: vec![1],
+            label: "H-2".to_string(),
+            shift_ppm: 7.22,
+            sd_ppm: 0.35,
+            expected_integral: 1.0,
+            multiplicity: "d".to_string(),
+            couplings_hz: vec![7.5],
+        },
+    ];
+    let single_1h_peak = vec![ExperimentalPeak1D {
+        peak_idx: 0,
+        ppm: 7.21,
+        integral: Some(1.0),
+        multiplicity: Some("d".to_string()),
+        couplings_hz: vec![7.5],
+        intensity: 1.0,
+    }];
+    let res_1h = auto_assign_1d_to_structure(&two_1h, &single_1h_peak, "1H", 400.0, "CDCl3");
+    assert_eq!(
+        res_1h.matched_count, 1,
+        "A 1H peak must not absorb a second 1H group"
+    );
 }
