@@ -29,6 +29,7 @@ pub mod evaluate;
 pub mod evo_graph;
 pub mod excited_state;
 pub mod fid;
+pub mod fidnet;
 pub mod idp_propensity;
 pub mod idp_solver;
 pub mod kabsch_sander_ss;
