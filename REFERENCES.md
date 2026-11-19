@@ -14,14 +14,14 @@ Every peer-reviewed article, proceedings paper, preprint, and book entry in Sect
 | 1. Backbone, Sidechain & Paramagnetic Assignment | 83 |
 | 2. FID Processing, Water Suppression, NUS & Deconvolution | 46 |
 | 3. Spin Relaxation & Protein Dynamics | 23 |
-| 4. Chemical Exchange (`CEST` / `CPMG`) & Titration Lineshapes | 19 |
+| 4. Chemical Exchange (`CEST` / `CPMG`) & Titration Lineshapes | 20 |
 | 5. Structural NMR (`RDC`, `PCS`, `PRE`, `NOE`, `ARTSY`) & AlphaFold Integrative Modeling | 81 |
 | 6. 1D Small-Molecule NMR, `DOSY` & Metabolomics | 60 |
 | 7. Neural NMR Architectures (`FID-Net`, `LEGOLAS`) & Deep-Learning Peak Picking | 12 |
 | 8. Open Data Repositories, Interchange Standards & Core Computational Foundations | 21 |
-| **Total Full-Metadata Crossref-Verified Works** | **345** |
+| **Total Full-Metadata Crossref-Verified Works** | **346** |
 | Crossref DOI-Verified Reference Books (Section 9, container-level metadata) | 2 |
-| **Grand Total Crossref-Verified DOIs** | **347** |
+| **Grand Total Crossref-Verified DOIs** | **348** |
 
 ---
 
@@ -214,6 +214,7 @@ Bloch–McConnell exchange formalisms, `[6/6]` Padé matrix exponentials, 2-/3-s
 - **Carneiro, Marta G.; Reddy, Jithender G.; Griesinger, Christian; & Lee, Donghan** (2015). "Speeding-up exchange-mediated saturation transfer experiments by Fourier transform." *J Biomol NMR*, **63**(3), 237-244. DOI: [10.1007/s10858-015-9985-9](https://doi.org/10.1007/s10858-015-9985-9)
 - **Waudby, Christopher A.; Ramos, Andres; Cabrita, Lisa D.; & Christodoulou, John** (2016). "Two-Dimensional NMR Lineshape Analysis." *Sci Rep*, **6**(1), 24826. DOI: [10.1038/srep24826](https://doi.org/10.1038/srep24826)
 - **Vallurupalli, Pramodh; Sekhar, Ashok; Yuwen, Tairan; & Kay, Lewis E.** (2017). "Probing conformational dynamics in biomolecules via chemical exchange saturation transfer: a primer." *J Biomol NMR*, **67**(4), 243-271. DOI: [10.1007/s10858-017-0099-4](https://doi.org/10.1007/s10858-017-0099-4)
+- **Yuwen, Tairan; Bouvignies, Guillaume; & Kay, Lewis E.** (2018). "Exploring methods to expedite the recording of CEST datasets using selective pulse excitation." *Journal of Magnetic Resonance*, **292**, 1-7. DOI: [10.1016/j.jmr.2018.04.013](https://doi.org/10.1016/j.jmr.2018.04.013)
 - **Yuwen, Tairan; Kay, Lewis E.; & Bouvignies, Guillaume** (2018). "Dramatic Decrease in CEST Measurement Times Using Multi-Site Excitation." *ChemPhysChem*, **19**(14), 1707-1710. DOI: [10.1002/cphc.201800249](https://doi.org/10.1002/cphc.201800249)
 
 ## 5. Structural NMR (`RDC`, `PCS`, `PRE`, `NOE`, `ARTSY`) & AlphaFold Integrative Modeling

@@ -2,6 +2,9 @@
 //! typography (`>= 11.0 px`), and zero-emoji / zero-panic source hygiene tests for
 //! `nmr_gui::p22_tools_panel` (`T22.1`, `T22.13`, `T22.9`, `T22.10`).
 
+use std::f64::consts::PI;
+use std::time::{Duration, Instant};
+
 use eframe::egui;
 use nmr_core::artsy_rdc::ArtsyQualityFlag;
 use nmr_core::deconv_nd::{DeconvDiagnostic, LineshapeKind, PeakSeed2D};
@@ -10,7 +13,8 @@ use nmr_core::maxent_nus::MAXENT_LINEARITY_DISCLOSURE;
 use nmr_core::pcs_transfer::PcsMatchStatus;
 use nmr_core::spectrum::{AxisPpm, Spectrum2D};
 use nmr_gui::p22_tools_panel::{
-    ArtsySortColumn, DeconvDataSource, MaxEntLambdaUiMode, P22ToolTab, P22ToolsPanel, PcsCcrMode,
+    ArtsySortColumn, DeconvDataSource, MaxEntDataSource, MaxEntLambdaUiMode, P22ToolTab,
+    P22ToolsPanel, PcsCcrMode, DEFAULT_ARTSY_J_ISO_SIGMA_HZ,
 };
 use nmr_gui::workbench_mode::{apply_type_scale, audit_text_layout, MIN_FONT_PX};
 
@@ -238,6 +242,11 @@ fn test_tab2_maxent_nus_states_tppi_fail_closed_echo_antiecho_and_disclosure() {
         "expected EchoAntiecho fail-closed explanation, got: {err}"
     );
     assert!(panel.maxent.error_message.is_some());
+    assert!(
+        panel.maxent.result.is_none(),
+        "stale MaxEnt result must be cleared when run returns Err"
+    );
+    assert!(panel.maxent.last_run_source.is_none());
     assert_eq!(
         panel.maxent.schedule_text, saved_schedule,
         "fail-closed error must never wipe user schedule"
@@ -502,4 +511,307 @@ fn test_all_four_folder_tabs_render_and_preserve_non_destructive_edits() {
     assert!((panel.maxent.lambda - 7.5).abs() < 1e-12);
     assert!((panel.artsy.dephasing_delay_ms - 11.2).abs() < 1e-12);
     assert!((panel.pcs_ccr.tau_m_ns - 9.25).abs() < 1e-12);
+}
+
+#[test]
+fn test_p1_2_accurate_2d_tab_labels_no_false_3d_claim() {
+    assert_eq!(P22ToolTab::Deconv2d3d.label(), "Deconv 2D (VarPro)");
+    assert_eq!(P22ToolTab::MaxEntNus.label(), "MaxEnt 2D NUS");
+    for tab in P22ToolTab::ALL {
+        let lbl = tab.label();
+        assert!(
+            !lbl.contains("3D") && !lbl.contains("2D/3D"),
+            "tab label '{lbl}' must not claim 3D where only 2D is wired"
+        );
+    }
+}
+
+#[test]
+fn test_p1_1_maxent_user_data_tsv_and_honest_synthetic_demo_badge() {
+    let ctx = egui::Context::default();
+    let mut panel = P22ToolsPanel::new();
+    panel.open_tab(P22ToolTab::MaxEntNus);
+
+    // 1. Synthetic demo is explicitly badged [Synthetic 3-Peak Demo]
+    panel
+        .maxent
+        .load_and_run_synthetic_demo()
+        .expect("synthetic demo run");
+    assert_eq!(
+        panel.maxent.last_run_source,
+        Some(MaxEntDataSource::SyntheticDemo)
+    );
+    assert!(
+        panel
+            .maxent
+            .status_message
+            .contains("[Synthetic 3-Peak Demo]"),
+        "synthetic demo status must carry [Synthetic 3-Peak Demo] badge: {}",
+        panel.maxent.status_message
+    );
+
+    // 2. Real user-supplied 6-column 2D hypercomplex TSV (t1_idx, t2_idx, re_cc, im_cs, im_sc, re_ss)
+    panel.maxent.n2 = 8;
+    panel.maxent.n1 = 8;
+    panel.maxent.zero_fill_factor = 1;
+    panel.maxent.quad_mode_axis2 = QuadMode::States;
+    panel.maxent.quad_mode_axis1 = QuadMode::States;
+    panel.maxent.lambda_ui_mode = MaxEntLambdaUiMode::Fixed;
+    panel.maxent.lambda = 15.0;
+    panel.maxent.data_source = MaxEntDataSource::UserDataTsv;
+
+    // Synthesize a single-peak user FID at normalized frequencies (f2 = 0.25, f1 = 0.50)
+    // corresponding to discrete DFT bin (2, 4) on an 8x8 grid — distinct from the 3-peak demo.
+    let mut tsv = String::from("t1_idx\tt2_idx\tre_cc\tim_cs\tim_sc\tre_ss\n");
+    for k2 in 0..8usize {
+        for k1 in 0..8usize {
+            if (k1 + k2) % 3 == 2 && !(k1 == 0 && k2 == 0) {
+                continue; // 67% NUS subset
+            }
+            let t2 = k2 as f64;
+            let t1 = k1 as f64;
+            let env = (-0.06 * t2 - 0.06 * t1).exp();
+            let ph2 = 2.0 * PI * 0.25 * t2;
+            let ph1 = 2.0 * PI * 0.50 * t1;
+            let re_cc = env * ph2.cos() * ph1.cos();
+            let im_cs = env * ph2.cos() * ph1.sin();
+            let im_sc = env * ph2.sin() * ph1.cos();
+            let re_ss = env * ph2.sin() * ph1.sin();
+            tsv.push_str(&format!(
+                "{k1}\t{k2}\t{re_cc:.6}\t{im_cs:.6}\t{im_sc:.6}\t{re_ss:.6}\n"
+            ));
+        }
+    }
+    panel.maxent.user_data_tsv = tsv;
+    panel
+        .maxent
+        .run_sync()
+        .expect("MaxEnt 2D reconstruction on real 6-column user TSV");
+    assert_eq!(
+        panel.maxent.last_run_source,
+        Some(MaxEntDataSource::UserDataTsv)
+    );
+    assert!(panel.maxent.status_message.contains("[User Data TSV]"));
+    let user_res = panel.maxent.result.as_ref().expect("user MaxEnt result");
+    assert_eq!(user_res.spectrum_shape, vec![8, 8]);
+
+    // Locate dominant RR peak in user spectrum — verify it sits at the user's frequency bin (2, 4)
+    let mut best_bin = (0usize, 0usize);
+    let mut best_val = f64::NEG_INFINITY;
+    for m2 in 0..8 {
+        for m1 in 0..8 {
+            let v = user_res.spectrum[m2 * 8 + m1][0].abs();
+            if v > best_val {
+                best_val = v;
+                best_bin = (m2, m1);
+            }
+        }
+    }
+    assert_eq!(
+        best_bin,
+        (2, 4),
+        "user 6-col TSV peak must reconstruct at (2, 4), got {best_bin:?}"
+    );
+
+    // Render User Data TSV mode in both Dark and Paper White themes
+    for pw in [false, true] {
+        let out = run_contents_frame(&ctx, &mut panel, None, pw);
+        assert!(
+            audit_text_layout(&out.shapes, CONTENTS_VIEWPORT).min_font_px >= MIN_FONT_PX - 1e-3
+        );
+    }
+
+    // 3. Real user-supplied 3-column TSV (t1_idx, re, im) on t2_idx = 0
+    let mut tsv3 = String::from("t1_idx\tre\tim\n");
+    for k1 in 0..8usize {
+        let ph1 = 2.0 * PI * 0.25 * (k1 as f64);
+        let env = (-0.08 * (k1 as f64)).exp();
+        tsv3.push_str(&format!(
+            "{k1}\t{:.6}\t{:.6}\n",
+            env * ph1.cos(),
+            env * ph1.sin()
+        ));
+    }
+    panel.maxent.user_data_tsv = tsv3;
+    panel
+        .maxent
+        .run_sync()
+        .expect("MaxEnt 2D reconstruction on 3-column user TSV");
+    assert_eq!(
+        panel.maxent.last_run_source,
+        Some(MaxEntDataSource::UserDataTsv)
+    );
+    assert!(panel.maxent.result.is_some());
+
+    // 4. Malformed user TSV fails closed and clears stale result
+    panel.maxent.user_data_tsv = "t1_idx\tre\tim\n0\tNaN\t0.0\n".to_string();
+    assert!(panel.maxent.run_sync().is_err());
+    assert!(
+        panel.maxent.result.is_none(),
+        "stale MaxEnt result must be cleared on user TSV error"
+    );
+    assert!(panel.maxent.last_run_source.is_none());
+}
+
+#[test]
+fn test_p1_3_off_ui_thread_background_compute_deconv_and_maxent() {
+    let ctx = egui::Context::default();
+    let mut panel = P22ToolsPanel::new();
+
+    // 1. Deconv 2D background thread lifecycle
+    panel.open_tab(P22ToolTab::Deconv2d3d);
+    panel.deconv.start_synthetic_demo_async();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while panel.deconv.is_computing() {
+        assert!(
+            Instant::now() < deadline,
+            "Deconv background worker timed out"
+        );
+        let out = run_contents_frame(&ctx, &mut panel, None, false);
+        assert!(
+            audit_text_layout(&out.shapes, CONTENTS_VIEWPORT).min_font_px >= MIN_FONT_PX - 1e-3
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let dres = panel
+        .deconv
+        .result
+        .as_ref()
+        .expect("Deconv background result should arrive via mpsc");
+    assert_eq!(dres.peaks.len(), 2);
+    assert_eq!(dres.diagnostic, DeconvDiagnostic::Converged);
+
+    // 2. MaxEnt 2D background thread lifecycle
+    panel.open_tab(P22ToolTab::MaxEntNus);
+    panel.maxent.n2 = 16;
+    panel.maxent.n1 = 16;
+    panel.maxent.start_synthetic_demo_async();
+    let deadline2 = Instant::now() + Duration::from_secs(15);
+    while panel.maxent.is_computing() {
+        assert!(
+            Instant::now() < deadline2,
+            "MaxEnt background worker timed out"
+        );
+        let out = run_contents_frame(&ctx, &mut panel, None, true);
+        assert!(
+            audit_text_layout(&out.shapes, CONTENTS_VIEWPORT).min_font_px >= MIN_FONT_PX - 1e-3
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mres = panel
+        .maxent
+        .result
+        .as_ref()
+        .expect("MaxEnt background result should arrive via mpsc");
+    assert!(mres.kkt_residual_inf.is_finite());
+    assert_eq!(
+        panel.maxent.last_run_source,
+        Some(MaxEntDataSource::SyntheticDemo)
+    );
+
+    // 3. Stale Deconv result cleared on ActiveSpectrum2D error when no spectrum is loaded
+    panel.deconv.source = DeconvDataSource::ActiveSpectrum2D;
+    assert!(panel.deconv.run_sync(None).is_err());
+    assert!(
+        panel.deconv.result.is_none(),
+        "stale Deconv result must be cleared on error"
+    );
+}
+
+#[test]
+fn test_p1_4_artsy_editable_j_iso_and_sigma_j_quadrature_propagation() {
+    let ctx = egui::Context::default();
+    let mut panel = P22ToolsPanel::new();
+    panel.open_tab(P22ToolTab::ArtsyRdc);
+
+    // Default J_iso = -93.0 Hz and sigma_J = 1.0 Hz (never silently 0.0)
+    assert!((panel.artsy.j_iso_default_hz - (-93.0)).abs() < 1e-12);
+    assert!(
+        (panel.artsy.j_iso_default_sigma_hz - DEFAULT_ARTSY_J_ISO_SIGMA_HZ).abs() < 1e-12
+            && panel.artsy.j_iso_default_sigma_hz > 0.0,
+        "default sigma_J must be 1.0 Hz, not 0.0"
+    );
+
+    panel
+        .artsy
+        .load_and_run_synthetic_demo()
+        .expect("ARTSY demo with default sigma_J = 1.0 Hz");
+    let r2_default = panel
+        .artsy
+        .results
+        .iter()
+        .find(|r| r.seq_id == 2)
+        .expect("residue 2")
+        .clone();
+    let sig_jd = r2_default
+        .aligned
+        .sigma_analytical_hz
+        .expect("analytical sigma_|J+D|");
+    let sig_d_1 = r2_default.sigma_d_nh_hz.expect("sigma(D) with sigma_J=1");
+    let expected_1 = sig_jd.hypot(1.0);
+    assert!(
+        (sig_d_1 - expected_1).abs() < 1e-9,
+        "sigma(D)={sig_d_1} must equal sqrt(sigma_JD^2 + 1.0^2)={expected_1}"
+    );
+    assert!(
+        sig_d_1 > sig_jd,
+        "quadrature propagation must strictly increase sigma(D) above sigma_JD"
+    );
+
+    // Increase sigma_J to 2.5 Hz and shift J_iso to -91.0 Hz
+    panel.artsy.j_iso_default_hz = -91.0;
+    panel.artsy.j_iso_default_sigma_hz = 2.5;
+    panel
+        .artsy
+        .run()
+        .expect("ARTSY run with edited J_iso & sigma_J");
+    let r2_edited = panel
+        .artsy
+        .results
+        .iter()
+        .find(|r| r.seq_id == 2)
+        .expect("residue 2 edited")
+        .clone();
+    let expected_25 = sig_jd.hypot(2.5);
+    assert!(
+        (r2_edited.sigma_d_nh_hz.expect("sigma_2.5") - expected_25).abs() < 1e-9,
+        "sigma(D) must match sqrt(sigma_JD^2 + 2.5^2)"
+    );
+    assert!(
+        ((r2_edited.d_nh_hz.expect("d_edited") - r2_default.d_nh_hz.expect("d_def")).abs() - 2.0)
+            .abs()
+            < 1e-6,
+        "shifting J_iso by 2 Hz must shift extracted D_NH by 2 Hz"
+    );
+
+    // Render with both sigma_J > 0 (disclosure) and sigma_J == 0 (warning disclosure)
+    let out_pos = run_contents_frame(&ctx, &mut panel, None, false);
+    assert!(
+        audit_text_layout(&out_pos.shapes, CONTENTS_VIEWPORT).min_font_px >= MIN_FONT_PX - 1e-3
+    );
+
+    panel.artsy.j_iso_default_sigma_hz = 0.0;
+    panel
+        .artsy
+        .run()
+        .expect("ARTSY run with explicit sigma_J = 0");
+    let r2_zero = panel
+        .artsy
+        .results
+        .iter()
+        .find(|r| r.seq_id == 2)
+        .expect("residue 2 sigma_J=0");
+    assert!((r2_zero.sigma_d_nh_hz.expect("sig0") - sig_jd).abs() < 1e-9);
+    let out_zero = run_contents_frame(&ctx, &mut panel, None, true);
+    assert!(
+        audit_text_layout(&out_zero.shapes, CONTENTS_VIEWPORT).min_font_px >= MIN_FONT_PX - 1e-3
+    );
+
+    // Negative sigma_J fails closed and clears stale results
+    panel.artsy.j_iso_default_sigma_hz = -0.5;
+    assert!(panel.artsy.run().is_err());
+    assert!(
+        panel.artsy.results.is_empty(),
+        "stale ARTSY results must be cleared on error"
+    );
 }

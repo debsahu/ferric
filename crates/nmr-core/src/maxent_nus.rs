@@ -10,7 +10,7 @@
 //!   spectra, default scale parameter `def`, and amplitude nonlinearity analysis.
 //! - Beck, A. & Teboulle, M. (*SIAM J. Imaging Sci.* **2009**, 2, 183–202) —
 //!   Fast Iterative Shrinkage-Thresholding Algorithm (`FISTA`) with Lipschitz backtracking.
-//! - Scheinberg, K., Goldfarb, D. & Bai, X. (*Math. Program.* **2014**, 146, 333–359) —
+//! - Scheinberg, K., Goldfarb, D. & Bai, X. (*Found. Comput. Math.* **2014**, 14, 389–417) —
 //!   Adaptive Lipschitz step-size continuation for accelerated proximal-gradient methods.
 //! - O'Donoghue, B. & Candès, E. (*Found. Comput. Math.* **2015**, 15, 715–732) —
 //!   Adaptive gradient restart for accelerated first-order optimization.
