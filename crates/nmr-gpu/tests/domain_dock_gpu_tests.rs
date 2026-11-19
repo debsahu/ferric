@@ -43,9 +43,9 @@ use nmr_core::rdc::{
 use nmr_core::rng::Rng;
 use nmr_core::structure::{backbone_rmsd_between_chains, kabsch_transform, nerf_place_atom};
 use nmr_gpu::domain_dock_gpu::{
-    dock_domains_gpu, evaluate_domain_dock_batch_gpu, validate_domain_dock_gpu_limits,
-    validate_domain_dock_gpu_limits_raw, DomainDockGpuReplicaInput, MAX_DOMAIN_DOCK_GPU_RESIDUES,
-    MAX_DOMAIN_DOCK_REPLICAS_PER_DISPATCH,
+    anneal_domain_dock_replicas_gpu, dock_domains_gpu, evaluate_domain_dock_batch_gpu,
+    validate_domain_dock_gpu_limits, validate_domain_dock_gpu_limits_raw,
+    DomainDockGpuReplicaInput, MAX_DOMAIN_DOCK_GPU_RESIDUES, MAX_DOMAIN_DOCK_REPLICAS_PER_DISPATCH,
 };
 use nmr_gpu::GpuEngine;
 
@@ -1484,5 +1484,152 @@ fn test_21f_b4_gd3_spin_7_2_preserves_per_site_k_pre_gpu() {
         "21F:B4 WebGPU vs CPU Gd3+ PRE parity failed: gpu={:.6e} cpu={:.6e}",
         eb_gpu.pre,
         eb_cpu.pre
+    );
+}
+
+#[test]
+fn test_fix3_n2_gpu_replica_bookkeeping_uses_one_objective() {
+    // `21F:N2`: per-replica best-energy bookkeeping must compare like with like. At `b5e87a3` the
+    // seeds were scored with the host objective (always-on re-entry closure, k >= 500) and then
+    // compared against GPU energies whose closure is `k_loop = 25 * w_rama` (= 0 at w_rama = 0),
+    // so every seed looked thousands of units worse than any annealed state. Seeds must now be
+    // scored with the GPU search objective, and `best_energies[r]` must equal that objective at
+    // `best_states[r]` and never exceed the seed energy.
+    let Some(engine) = require_headless_gpu(Some(wgpu::Limits::default())) else {
+        return;
+    };
+    let root = workspace_root();
+    let ubq = parse_pdb_first_model(root.join("data/fixtures/ubiquitin_1ubq_xray.pdb")).unwrap();
+    let n = ubq.residues.len();
+    let mut true_dom = vec![0usize; n];
+    for d in &mut true_dom[0..22] {
+        *d = 1;
+    }
+    for d in &mut true_dom[26..46] {
+        *d = 2;
+    }
+    for d in &mut true_dom[50..72] {
+        *d = 1;
+    }
+    let mut plddt = vec![92.0_f64; n];
+    for p in &mut plddt[22..26] {
+        *p = 54.0;
+    }
+    for p in &mut plddt[46..50] {
+        *p = 54.0;
+    }
+    for p in &mut plddt[72..76] {
+        *p = 48.0;
+    }
+    let pae = build_pae(n, &true_dom, 2104);
+    let cif0 = serialize_chain_mmcif("ubq_n2_ref", &ubq, &plddt);
+    let model0 = parse_af_structure_model_str(&cif0, &AfIngestOptions::default()).unwrap();
+    let seq_ids = model0.seq_ids();
+    let part = cluster_pae_domains(
+        &pae,
+        Some(&plddt),
+        Some(&seq_ids),
+        None,
+        &PaeClusterConfig::default(),
+    )
+    .unwrap();
+    let kin0 = DomainLinkerKinematics::from_af_model(&model0, &part).unwrap();
+    let ch0 = kin0.build_pdb_chain(&kin0.initial_state());
+    // Broken re-entry C'49-N50 in the input (21F:B5 probe), so the host closure term is large.
+    let mut st = kin0.initial_state();
+    st.psi_rad[23] += 0.40;
+    st.phi_rad[24] -= 0.35;
+    st.psi_rad[46] += 0.30;
+    let start_chain = kin0.build_pdb_chain(&st);
+    let cif = serialize_chain_mmcif("ubq_n2_start", &start_chain, &plddt);
+    let model = parse_af_structure_model_str(&cif, &AfIngestOptions::default()).unwrap();
+    let kin = DomainLinkerKinematics::from_af_model(&model, &part).unwrap();
+    assert!(kin.has_reentry_blocks());
+
+    let s1 = saupe_matrix_from_pas(-12.5, 0.30, [24.0, 52.0, 104.0]);
+    let s2 = saupe_matrix_from_pas(14.0, 0.44, [112.0, 76.0, 35.0]);
+    let mut media = vec![
+        simulate_rdc_medium(&ch0, "m1", &s1, (-1, -1), 0.0, 811),
+        simulate_rdc_medium(&ch0, "m2", &s2, (-1, -1), 0.0, 812),
+    ];
+    let metal_d1 = v_add(ch0.residues[60].ca, [3.0, -2.5, 2.8]);
+    let mut pcs_tsv = format!(
+        "# metal_pos: {:.4} {:.4} {:.4}\n# metal_domain: 1\nseq_id\tatom_name\tpcs_ppm\tsigma_ppm\n",
+        metal_d1[0], metal_d1[1], metal_d1[2]
+    );
+    for (idx, r) in ch0.residues.iter().enumerate() {
+        if true_dom[idx] != 0 {
+            if let Some(h) = r.h {
+                if v_dist(h, metal_d1) > 6.0 {
+                    let pv = predict_pcs_spherical_ppm(h, metal_d1, 28.0, 8.0, [0.4, 1.0, 1.8]);
+                    pcs_tsv.push_str(&format!("{}\tH\t{pv:.5}\t0.03\n", r.seq_id));
+                }
+            }
+        }
+    }
+    let pcs_tags = parse_domain_pcs_tsv_str(&pcs_tsv).unwrap();
+
+    let cfg = DomainDockConfig {
+        weights: DomainDockEnergyWeights {
+            w_rama: 0.0,
+            ..Default::default()
+        },
+        n_replicas: 16,
+        anneal_steps: 8,
+        ..Default::default()
+    };
+    let pipe = prepare_domain_dock_inputs_full(&kin, &part, &mut media, &pcs_tags, &[], &[], &cfg)
+        .unwrap();
+    let prep = &pipe.prep;
+    let out = anneal_domain_dock_replicas_gpu(&engine, &kin, &part, prep, &cfg, 16).unwrap();
+    assert_eq!(out.seed_energies.len(), out.seed_states.len());
+    assert_eq!(out.best_energies.len(), out.best_states.len());
+
+    // Full-ramp search weights (vdW ramp factors at ramp = 1).
+    let mut w_full = cfg.weights;
+    w_full.w_vdw = cfg.weights.w_vdw * (0.20 + 0.80);
+    w_full.vdw_scale = cfg.weights.vdw_scale * (0.78 + 0.22);
+    let search_objective = |s: &nmr_core::domain_dock::DomainDockState| -> f64 {
+        let saupe = {
+            let (slots, _) = kin.forward_slots_and_block_frames(s);
+            prep.fit_global_saupe_matrices_on_slots(&slots)
+        };
+        evaluate_domain_dock_fixed_saupe_cpu(&kin, prep, s, &saupe, &w_full)
+            .0
+            .total
+    };
+
+    let mut max_closure_gap = 0.0_f64;
+    for (r, seed) in out.seed_states.iter().enumerate() {
+        let e_search = search_objective(seed);
+        let e_host =
+            nmr_core::domain_dock::evaluate_domain_dock_state_cpu(&kin, prep, seed, &w_full)
+                .0
+                .total;
+        max_closure_gap = max_closure_gap.max(e_host - e_search);
+        let rel = (out.seed_energies[r] - e_search).abs() / e_search.abs().max(1.0);
+        assert!(
+            rel < 1.0e-4,
+            "21F:N2 replica {r}: seed energy {:.6} is not the GPU search objective {e_search:.6} (host closure objective = {e_host:.6}, rel = {rel:.3e})",
+            out.seed_energies[r]
+        );
+        assert!(
+            out.best_energies[r] <= out.seed_energies[r],
+            "21F:N2 replica {r}: best energy {:.6} > seed energy {:.6}",
+            out.best_energies[r],
+            out.seed_energies[r]
+        );
+        let e_best = search_objective(&out.best_states[r]);
+        let rel_b = (out.best_energies[r] - e_best).abs() / e_best.abs().max(1.0);
+        assert!(
+            rel_b < 1.0e-4,
+            "21F:N2 replica {r}: best energy {:.6} != search objective at best state {e_best:.6}",
+            out.best_energies[r]
+        );
+    }
+    // The probe must actually exercise the two-objective gap (host closure >> 0 on broken seeds).
+    assert!(
+        max_closure_gap > 1.0,
+        "probe did not exercise the closure-objective gap (max host - search = {max_closure_gap:.4})"
     );
 }

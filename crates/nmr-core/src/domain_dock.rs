@@ -108,6 +108,23 @@ pub const DEFAULT_LANTHANIDE_ANCHOR_OFFSET_ANGSTROM: f64 = 7.0;
 /// 3D paramagnetic center (`Battiste & Wagner 2000`; `Iwahara, Schwieters & Clore 2004`).
 pub const DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM: f64 = 6.0;
 
+/// Maximum input $d(C'_{i-1}, N_i)$ (`4.0 Å`) at which two same-chain residues with consecutive
+/// `seq_id`s are still treated as covalently bonded by [`DomainLinkerKinematics`] (`FIX3 21F:N1`).
+///
+/// Rationale: a real peptide bond is `1.33 ± 0.03 Å` (1UBQ X-ray: `1.28–1.36 Å`), while input
+/// models perturbed in the linker (low-pLDDT AF linkers, or the `21F:B5` perturbed re-entry probe at
+/// `3.35 Å`) can carry stretched-but-bonded C–N links of a few Å. Beyond `4.0 Å` no stretched
+/// peptide bond is plausible, so the residues are separated by missing residues (a renumbered model
+/// or unmodelled gap) and the break is kept (no fabricated `1.329 Å` bond, no clamp "bond").
+/// Caveat: one deleted residue spans `C'_{i-1}..N_{i+1} = 2.96–4.67 Å` in 1UBQ, so a single-residue
+/// deletion with renumbering can fall below this threshold; every join above
+/// [`PEPTIDE_C_N_STRETCH_WARN_ANGSTROM`] is therefore reported as a warning rather than silent.
+pub const MAX_PEPTIDE_JOIN_C_N_ANGSTROM: f64 = 4.0;
+
+/// Input $d(C'_{i-1}, N_i)$ (`2.0 Å`, ~50 % beyond the ideal `1.329 Å`) above which a joined peptide
+/// link is reported as a stretched-bond warning by [`DomainLinkerKinematics`] (`FIX3 21F:N1`).
+pub const PEPTIDE_C_N_STRETCH_WARN_ANGSTROM: f64 = 2.0;
+
 /// CODATA 2018/2022 vacuum magnetic permeability factor $\mu_0 / (4\pi) = 10^{-7}\text{ T}\cdot\text{m}\cdot\text{A}^{-1}$.
 pub const CODATA_MU0_OVER_4PI_SI: f64 = 1.0e-7;
 
@@ -3184,6 +3201,17 @@ pub fn read_domain_pre_tsv_with_defaults(
 /// - `# g_factor: <f64>` (optional electronic $g$, default CODATA `g_e = 2.0023193`)
 /// - `# mtsl_tether_allowance_a: <f64>` (optional flexible-linker allowance in Å, e.g. `6.0`)
 /// - `# mode: gamma2 | bounds`
+///
+/// Every directive except `# mode` also accepts a per-site `[<site_id>]` tag. Directives are
+/// order-independent (they apply to all rows wherever they appear in the file); a conflicting
+/// duplicate of the same directive/tag, or a tag that matches no PRE `site_id`, is an `Err`
+/// (`FIX3 21F:B4` follow-up).
+///
+/// For high-spin metal centres (`Gd³⁺` $S = 7/2$, `Mn²⁺` $S = 5/2$) `tau_c_ns` must be the
+/// *effective* electron–nuclear correlation time $1/\tau_c = 1/\tau_r + 1/T_{1e}$ (plus $1/\tau_M$ for
+/// exchanging ligands): no electron-relaxation ($T_{1e}$) model is applied automatically, so
+/// supplying the bare rotational $\tau_r$ overestimates $K_{\text{PRE}}$ whenever $T_{1e}$ is
+/// comparable to $\tau_r$ (always reported in `candor_notes` for $S > 1/2$ sites).
 pub fn parse_domain_pre_tsv_str(text: &str) -> Result<Vec<DomainPreSiteSet>, String> {
     parse_domain_pre_tsv_str_with_defaults(text, None, None, None)
 }
@@ -3215,188 +3243,228 @@ pub fn parse_domain_pre_tsv_str_with_defaults(
     let mut site_order: Vec<String> = Vec::new();
     let mut site_rows: BTreeMap<String, Vec<DomainPreRestraint>> = BTreeMap::new();
 
-    for (line_idx, raw_line) in text.lines().enumerate() {
-        let line_no = line_idx + 1;
-        let trimmed = raw_line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some(comment) = trimmed.strip_prefix('#') {
-            let c = comment.trim();
-            if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "site_pos") {
-                let nums: Vec<&str> = rest
-                    .split([',', ' ', '\t'])
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if nums.len() != 3 {
-                    return Err(format!(
-                        "PRE line {line_no}: # site_pos expects 3 coordinates, got '{rest}'"
-                    ));
-                }
-                let x = parse_finite_f64(nums[0], "site_x", line_no)?;
-                let y = parse_finite_f64(nums[1], "site_y", line_no)?;
-                let z = parse_finite_f64(nums[2], "site_z", line_no)?;
-                site_pos_map.insert(k_site, [x, y, z]);
-            } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "site_anchor") {
-                let (ach, sid, aname) = parse_anchor_spec(rest, "PRE", line_no)?;
-                site_anchor_map.insert(k_site, (ach, sid, aname));
-            } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "site_domain") {
-                let d_id: usize = rest.trim().parse().map_err(|e| {
-                    format!("PRE line {line_no}: invalid # site_domain '{rest}': {e}")
-                })?;
-                if d_id == 0 {
-                    return Err(format!(
-                        "PRE line {line_no}: # site_domain must be >= 1 (1-based)"
-                    ));
-                }
-                site_dom_map.insert(k_site, d_id);
-            } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "tau_c_ns")
-                .or_else(|| parse_directive_key_and_tag(c, "tau_c"))
-            {
-                let tc = parse_finite_f64(rest.trim(), "tau_c_ns", line_no)?;
-                if tc <= 0.0 {
-                    return Err(format!("PRE line {line_no}: # tau_c_ns ({tc}) must be > 0"));
-                }
-                tau_c_map.insert(k_site, tc);
-            } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "proton_mhz")
-                .or_else(|| parse_directive_key_and_tag(c, "field_mhz"))
-                .or_else(|| parse_directive_key_and_tag(c, "omega_h_mhz"))
-            {
-                let mhz = parse_finite_f64(rest.trim(), "proton_mhz", line_no)?;
-                if mhz <= 0.0 {
-                    return Err(format!(
-                        "PRE line {line_no}: # proton_mhz ({mhz}) must be > 0"
-                    ));
-                }
-                mhz_map.insert(k_site, mhz);
-            } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "spin_s") {
-                let s_val = parse_finite_f64(rest.trim(), "spin_s", line_no)?;
-                if s_val <= 0.0 {
-                    return Err(format!("PRE line {line_no}: # spin_s must be > 0"));
-                }
-                spin_s_map.insert(k_site, s_val);
-            } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "g_factor") {
-                let g_val = parse_finite_f64(rest.trim(), "g_factor", line_no)?;
-                if g_val <= 0.0 {
-                    return Err(format!("PRE line {line_no}: # g_factor must be > 0"));
-                }
-                g_factor_map.insert(k_site, g_val);
-            } else if let Some((k_site, rest)) =
-                parse_directive_key_and_tag(c, "mtsl_tether_allowance_a")
-                    .or_else(|| parse_directive_key_and_tag(c, "tether_allowance_a"))
-            {
-                let tv = parse_finite_f64(rest.trim(), "mtsl_tether_allowance_a", line_no)?;
-                if tv < 0.0 {
-                    return Err(format!(
-                        "PRE line {line_no}: # mtsl_tether_allowance_a ({tv}) must be >= 0"
-                    ));
-                }
-                tether_map.insert(k_site, tv);
-            } else if parse_directive_key_and_tag(c, "k_pre").is_some() {
-                saw_legacy_k_pre = true;
-            } else if let Some((_, rest)) = parse_directive_key_and_tag(c, "mode") {
-                bounds_mode = rest.trim().eq_ignore_ascii_case("bounds");
-            }
-            continue;
-        }
+    let mut mode_directive: Option<(bool, usize)> = None;
 
-        let cols: Vec<&str> = if trimmed.contains('\t') {
-            trimmed.split('\t').map(str::trim).collect()
-        } else {
-            trimmed.split_whitespace().collect()
-        };
-        let low0 = cols[0].to_ascii_lowercase();
-        if matches!(low0.as_str(), "site_id" | "tag_id") {
-            has_site_col = true;
-            has_chain_col = cols
-                .get(1)
-                .is_some_and(|c| matches!(c.to_ascii_lowercase().as_str(), "chain_id" | "chain"));
-            if cols.iter().any(|c| c.eq_ignore_ascii_case("lower_a")) {
-                bounds_mode = true;
+    // Two passes (`FIX3 21F:B4` follow-up): pass 0 reads every `#` directive in the file, pass 1
+    // parses data rows. Directives therefore apply to all rows regardless of their position (a
+    // `# spin_s:` after the data no longer silently leaves earlier rows at S = 1/2), and a
+    // conflicting duplicate of the same directive/tag fails closed instead of being order-resolved.
+    for pass in 0..2 {
+        for (line_idx, raw_line) in text.lines().enumerate() {
+            let line_no = line_idx + 1;
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() {
+                continue;
             }
-            continue;
-        }
-        if matches!(low0.as_str(), "chain_id" | "chain") {
-            has_chain_col = true;
-            if cols.iter().any(|c| c.eq_ignore_ascii_case("lower_a")) {
-                bounds_mode = true;
+            if let Some(comment) = trimmed.strip_prefix('#') {
+                if pass == 1 {
+                    continue;
+                }
+                let c = comment.trim();
+                if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "site_pos") {
+                    let nums: Vec<&str> = rest
+                        .split([',', ' ', '\t'])
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if nums.len() != 3 {
+                        return Err(format!(
+                            "PRE line {line_no}: # site_pos expects 3 coordinates, got '{rest}'"
+                        ));
+                    }
+                    let x = parse_finite_f64(nums[0], "site_x", line_no)?;
+                    let y = parse_finite_f64(nums[1], "site_y", line_no)?;
+                    let z = parse_finite_f64(nums[2], "site_z", line_no)?;
+                    insert_pre_directive(
+                        &mut site_pos_map,
+                        k_site,
+                        [x, y, z],
+                        "site_pos",
+                        line_no,
+                    )?;
+                } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "site_anchor") {
+                    let (ach, sid, aname) = parse_anchor_spec(rest, "PRE", line_no)?;
+                    insert_pre_directive(
+                        &mut site_anchor_map,
+                        k_site,
+                        (ach, sid, aname),
+                        "site_anchor",
+                        line_no,
+                    )?;
+                } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "site_domain") {
+                    let d_id: usize = rest.trim().parse().map_err(|e| {
+                        format!("PRE line {line_no}: invalid # site_domain '{rest}': {e}")
+                    })?;
+                    if d_id == 0 {
+                        return Err(format!(
+                            "PRE line {line_no}: # site_domain must be >= 1 (1-based)"
+                        ));
+                    }
+                    insert_pre_directive(&mut site_dom_map, k_site, d_id, "site_domain", line_no)?;
+                } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "tau_c_ns")
+                    .or_else(|| parse_directive_key_and_tag(c, "tau_c"))
+                {
+                    let tc = parse_finite_f64(rest.trim(), "tau_c_ns", line_no)?;
+                    if tc <= 0.0 {
+                        return Err(format!("PRE line {line_no}: # tau_c_ns ({tc}) must be > 0"));
+                    }
+                    insert_pre_directive(&mut tau_c_map, k_site, tc, "tau_c_ns", line_no)?;
+                } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "proton_mhz")
+                    .or_else(|| parse_directive_key_and_tag(c, "field_mhz"))
+                    .or_else(|| parse_directive_key_and_tag(c, "omega_h_mhz"))
+                {
+                    let mhz = parse_finite_f64(rest.trim(), "proton_mhz", line_no)?;
+                    if mhz <= 0.0 {
+                        return Err(format!(
+                            "PRE line {line_no}: # proton_mhz ({mhz}) must be > 0"
+                        ));
+                    }
+                    insert_pre_directive(&mut mhz_map, k_site, mhz, "proton_mhz", line_no)?;
+                } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "spin_s") {
+                    let s_val = parse_finite_f64(rest.trim(), "spin_s", line_no)?;
+                    if s_val <= 0.0 {
+                        return Err(format!("PRE line {line_no}: # spin_s must be > 0"));
+                    }
+                    insert_pre_directive(&mut spin_s_map, k_site, s_val, "spin_s", line_no)?;
+                } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "g_factor") {
+                    let g_val = parse_finite_f64(rest.trim(), "g_factor", line_no)?;
+                    if g_val <= 0.0 {
+                        return Err(format!("PRE line {line_no}: # g_factor must be > 0"));
+                    }
+                    insert_pre_directive(&mut g_factor_map, k_site, g_val, "g_factor", line_no)?;
+                } else if let Some((k_site, rest)) =
+                    parse_directive_key_and_tag(c, "mtsl_tether_allowance_a")
+                        .or_else(|| parse_directive_key_and_tag(c, "tether_allowance_a"))
+                {
+                    let tv = parse_finite_f64(rest.trim(), "mtsl_tether_allowance_a", line_no)?;
+                    if tv < 0.0 {
+                        return Err(format!(
+                            "PRE line {line_no}: # mtsl_tether_allowance_a ({tv}) must be >= 0"
+                        ));
+                    }
+                    insert_pre_directive(
+                        &mut tether_map,
+                        k_site,
+                        tv,
+                        "mtsl_tether_allowance_a",
+                        line_no,
+                    )?;
+                } else if parse_directive_key_and_tag(c, "k_pre").is_some() {
+                    saw_legacy_k_pre = true;
+                } else if let Some((_, rest)) = parse_directive_key_and_tag(c, "mode") {
+                    let is_bounds = rest.trim().eq_ignore_ascii_case("bounds");
+                    if let Some((prev, prev_line)) = mode_directive {
+                        if prev != is_bounds {
+                            return Err(format!(
+                            "PRE line {line_no}: conflicting duplicate `# mode` directive (line {prev_line} set a different mode)"
+                        ));
+                        }
+                    }
+                    mode_directive = Some((is_bounds, line_no));
+                    bounds_mode = is_bounds;
+                }
+                continue;
             }
-            continue;
-        }
-        if matches!(low0.as_str(), "seq_id" | "resid" | "residue") {
-            if cols.iter().any(|c| c.eq_ignore_ascii_case("lower_a")) {
-                bounds_mode = true;
+            if pass == 0 {
+                continue;
             }
-            continue;
-        }
 
-        let (site_id, rem0): (String, &[&str]) = if has_site_col {
-            if cols.len() < 5 {
-                return Err(format!(
-                    "PRE line {line_no}: expected at least 5 columns with site_id, got {}",
-                    cols.len()
-                ));
+            let cols: Vec<&str> = if trimmed.contains('\t') {
+                trimmed.split('\t').map(str::trim).collect()
+            } else {
+                trimmed.split_whitespace().collect()
+            };
+            let low0 = cols[0].to_ascii_lowercase();
+            if matches!(low0.as_str(), "site_id" | "tag_id") {
+                has_site_col = true;
+                has_chain_col = cols.get(1).is_some_and(|c| {
+                    matches!(c.to_ascii_lowercase().as_str(), "chain_id" | "chain")
+                });
+                if cols.iter().any(|c| c.eq_ignore_ascii_case("lower_a")) {
+                    bounds_mode = true;
+                }
+                continue;
             }
-            (cols[0].to_string(), &cols[1..])
-        } else {
-            ("pre1".to_string(), &cols[..])
-        };
+            if matches!(low0.as_str(), "chain_id" | "chain") {
+                has_chain_col = true;
+                if cols.iter().any(|c| c.eq_ignore_ascii_case("lower_a")) {
+                    bounds_mode = true;
+                }
+                continue;
+            }
+            if matches!(low0.as_str(), "seq_id" | "resid" | "residue") {
+                if cols.iter().any(|c| c.eq_ignore_ascii_case("lower_a")) {
+                    bounds_mode = true;
+                }
+                continue;
+            }
 
-        let (col_chain_opt, rem): (Option<String>, &[&str]) = if has_chain_col {
-            if rem0.len() < 5 {
-                return Err(format!(
+            let (site_id, rem0): (String, &[&str]) = if has_site_col {
+                if cols.len() < 5 {
+                    return Err(format!(
+                        "PRE line {line_no}: expected at least 5 columns with site_id, got {}",
+                        cols.len()
+                    ));
+                }
+                (cols[0].to_string(), &cols[1..])
+            } else {
+                ("pre1".to_string(), &cols[..])
+            };
+
+            let (col_chain_opt, rem): (Option<String>, &[&str]) = if has_chain_col {
+                if rem0.len() < 5 {
+                    return Err(format!(
                     "PRE line {line_no}: expected chain_id, seq_id, atom_name, and 2 numeric columns"
                 ));
-            }
-            let ch = Some(rem0[0].to_string()).filter(|s| !s.is_empty() && s != ".");
-            (ch, &rem0[1..])
-        } else {
-            (None, rem0)
-        };
+                }
+                let ch = Some(rem0[0].to_string()).filter(|s| !s.is_empty() && s != ".");
+                (ch, &rem0[1..])
+            } else {
+                (None, rem0)
+            };
 
-        if rem.len() < 4 {
-            return Err(format!(
-                "PRE line {line_no}: expected seq_id, atom_name, and 2 numeric columns"
-            ));
-        }
-        let (tok_chain, seq_id) = parse_chain_seq_token(rem[0], "PRE", line_no)?;
-        let chain_id = tok_chain.or(col_chain_opt);
-        let atom_name = normalize_rdc_atom_name(rem[1]).to_string();
-
-        let eff_tau_c = tau_c_map
-            .get(&site_id)
-            .or_else(|| tau_c_map.get(""))
-            .copied()
-            .or(cli_tau_c_ns);
-        let eff_mhz = mhz_map
-            .get(&site_id)
-            .or_else(|| mhz_map.get(""))
-            .copied()
-            .or(cli_proton_mhz);
-
-        let kind = if bounds_mode {
-            let lower_a = parse_finite_f64(rem[2], "lower_a", line_no)?;
-            let upper_a = parse_finite_f64(rem[3], "upper_a", line_no)?;
-            if lower_a <= 0.0 || upper_a < lower_a {
+            if rem.len() < 4 {
                 return Err(format!(
-                    "PRE line {line_no}: invalid distance bounds [{lower_a}, {upper_a}]"
+                    "PRE line {line_no}: expected seq_id, atom_name, and 2 numeric columns"
                 ));
             }
-            let sigma_a = parse_pos_sigma_opt(rem.get(4).copied(), 1.0, line_no)?;
-            PreRestraintKind::DistanceBounds {
-                lower_a,
-                upper_a,
-                sigma_a,
-            }
-        } else {
-            let gamma2_obs_s1 = parse_finite_f64(rem[2], "gamma2_s1", line_no)?;
-            if gamma2_obs_s1 < 0.0 {
-                return Err(format!(
-                    "PRE line {line_no}: gamma2_s1 ({gamma2_obs_s1}) must be >= 0"
-                ));
-            }
-            let sigma_s1 = parse_pos_sigma_opt(rem.get(3).copied(), 2.0, line_no)?;
-            let tau_c_ns = eff_tau_c.ok_or_else(|| {
+            let (tok_chain, seq_id) = parse_chain_seq_token(rem[0], "PRE", line_no)?;
+            let chain_id = tok_chain.or(col_chain_opt);
+            let atom_name = normalize_rdc_atom_name(rem[1]).to_string();
+
+            let eff_tau_c = tau_c_map
+                .get(&site_id)
+                .or_else(|| tau_c_map.get(""))
+                .copied()
+                .or(cli_tau_c_ns);
+            let eff_mhz = mhz_map
+                .get(&site_id)
+                .or_else(|| mhz_map.get(""))
+                .copied()
+                .or(cli_proton_mhz);
+
+            let kind = if bounds_mode {
+                let lower_a = parse_finite_f64(rem[2], "lower_a", line_no)?;
+                let upper_a = parse_finite_f64(rem[3], "upper_a", line_no)?;
+                if lower_a <= 0.0 || upper_a < lower_a {
+                    return Err(format!(
+                        "PRE line {line_no}: invalid distance bounds [{lower_a}, {upper_a}]"
+                    ));
+                }
+                let sigma_a = parse_pos_sigma_opt(rem.get(4).copied(), 1.0, line_no)?;
+                PreRestraintKind::DistanceBounds {
+                    lower_a,
+                    upper_a,
+                    sigma_a,
+                }
+            } else {
+                let gamma2_obs_s1 = parse_finite_f64(rem[2], "gamma2_s1", line_no)?;
+                if gamma2_obs_s1 < 0.0 {
+                    return Err(format!(
+                        "PRE line {line_no}: gamma2_s1 ({gamma2_obs_s1}) must be >= 0"
+                    ));
+                }
+                let sigma_s1 = parse_pos_sigma_opt(rem.get(3).copied(), 2.0, line_no)?;
+                let tau_c_ns = eff_tau_c.ok_or_else(|| {
                 if saw_legacy_k_pre {
                     format!(
                         "PRE line {line_no}: `# k_pre` without explicit rotational correlation time is retired; specify mandatory `# tau_c_ns: <ns>` and `# proton_mhz: <MHz>` (or `--pre-tau-c-ns` / `--pre-proton-mhz`)"
@@ -3407,47 +3475,72 @@ pub fn parse_domain_pre_tsv_str_with_defaults(
                     )
                 }
             })?;
-            let proton_mhz = eff_mhz.ok_or_else(|| {
+                let proton_mhz = eff_mhz.ok_or_else(|| {
                 format!(
                     "PRE line {line_no}: Solomon Gamma2 PRE restraints require mandatory `# proton_mhz: <MHz>` (or `--pre-proton-mhz <MHz>`) alongside tau_c_ns={tau_c_ns}"
                 )
             })?;
-            let spin_s_eff = spin_s_map
-                .get(&site_id)
-                .or_else(|| spin_s_map.get(""))
-                .copied()
-                .unwrap_or(0.5);
-            let g_factor_eff = g_factor_map
-                .get(&site_id)
-                .or_else(|| g_factor_map.get(""))
-                .copied()
-                .unwrap_or(CODATA_ELECTRON_G_FACTOR);
-            let k_pre_a6_s1 =
-                compute_solomon_k_pre_a6_s1(tau_c_ns, proton_mhz, spin_s_eff, g_factor_eff)?;
-            PreRestraintKind::Gamma2Rate {
-                gamma2_obs_s1,
-                sigma_s1,
-                k_pre_a6_s1,
-            }
-        };
+                let spin_s_eff = spin_s_map
+                    .get(&site_id)
+                    .or_else(|| spin_s_map.get(""))
+                    .copied()
+                    .unwrap_or(0.5);
+                let g_factor_eff = g_factor_map
+                    .get(&site_id)
+                    .or_else(|| g_factor_map.get(""))
+                    .copied()
+                    .unwrap_or(CODATA_ELECTRON_G_FACTOR);
+                let k_pre_a6_s1 =
+                    compute_solomon_k_pre_a6_s1(tau_c_ns, proton_mhz, spin_s_eff, g_factor_eff)?;
+                PreRestraintKind::Gamma2Rate {
+                    gamma2_obs_s1,
+                    sigma_s1,
+                    k_pre_a6_s1,
+                }
+            };
 
-        if !site_rows.contains_key(&site_id) {
-            site_order.push(site_id.clone());
+            if !site_rows.contains_key(&site_id) {
+                site_order.push(site_id.clone());
+            }
+            site_rows
+                .entry(site_id.clone())
+                .or_default()
+                .push(DomainPreRestraint {
+                    site_id,
+                    chain_id,
+                    seq_id,
+                    atom_name,
+                    kind,
+                });
         }
-        site_rows
-            .entry(site_id.clone())
-            .or_default()
-            .push(DomainPreRestraint {
-                site_id,
-                chain_id,
-                seq_id,
-                atom_name,
-                kind,
-            });
     }
 
     if site_order.is_empty() {
         return Err("PRE TSV contains zero restraints".to_string());
+    }
+
+    // Fail closed on per-site `# <directive>[tag]` tags that match no PRE site_id (`FIX3 21F:B4`
+    // follow-up): a typo such as `# spin_s[gdl]` would otherwise silently fall back to the global
+    // value or the S = 1/2 nitroxide default, re-creating the 21x Gd3+ K_PRE bias.
+    let known_sites = site_order.join(", ");
+    let tag_sets: [(&str, Vec<&String>); 8] = [
+        ("site_pos", site_pos_map.keys().collect()),
+        ("site_anchor", site_anchor_map.keys().collect()),
+        ("site_domain", site_dom_map.keys().collect()),
+        ("tau_c_ns", tau_c_map.keys().collect()),
+        ("proton_mhz", mhz_map.keys().collect()),
+        ("mtsl_tether_allowance_a", tether_map.keys().collect()),
+        ("spin_s", spin_s_map.keys().collect()),
+        ("g_factor", g_factor_map.keys().collect()),
+    ];
+    for (directive, keys) in &tag_sets {
+        for tag in keys {
+            if !tag.is_empty() && !site_rows.contains_key(*tag) {
+                return Err(format!(
+                    "PRE TSV: `# {directive}[{tag}]` tag '{tag}' does not match any PRE site_id (known site_id(s): {known_sites}); refusing to fall back to the global/default value"
+                ));
+            }
+        }
     }
 
     let mut out = Vec::with_capacity(site_order.len());
@@ -3719,6 +3812,31 @@ pub fn parse_domain_noe_tsv_str(
     Ok(out)
 }
 
+/// Insert a PRE header directive value, failing closed on a conflicting duplicate of the same
+/// directive and tag (directives are order-independent, so "last wins" would be ambiguous).
+fn insert_pre_directive<T: PartialEq + std::fmt::Debug>(
+    map: &mut BTreeMap<String, T>,
+    tag: String,
+    val: T,
+    directive: &str,
+    line_no: usize,
+) -> Result<(), String> {
+    if let Some(prev) = map.get(&tag) {
+        if *prev != val {
+            let shown = if tag.is_empty() {
+                format!("# {directive}")
+            } else {
+                format!("# {directive}[{tag}]")
+            };
+            return Err(format!(
+                "PRE line {line_no}: conflicting duplicate `{shown}` directive ({val:?} vs earlier {prev:?})"
+            ));
+        }
+    }
+    map.insert(tag, val);
+    Ok(())
+}
+
 fn parse_directive_key_and_tag<'a>(comment: &'a str, key: &str) -> Option<(String, &'a str)> {
     let rest = comment.strip_prefix(key)?;
     if let Some(after_colon) = rest.strip_prefix(':') {
@@ -3855,6 +3973,10 @@ pub struct DomainLinkerKinematics {
     pub active_linker_residues: Vec<usize>,
     /// Reference input `PdbChain` per rigid domain for exact `0.000 Å` intra-domain RMSD verification.
     pub ref_chain: PdbChain,
+    /// User-visible chain-topology warnings (kept chain breaks between consecutively numbered
+    /// residues, stretched joined C–N links; `FIX3 21F:N1`), propagated into
+    /// `DomainDockReport::candor_notes` and CLI stderr.
+    pub chain_topology_warnings: Vec<String>,
 }
 
 /// Dynamical state vector $(\boldsymbol{\theta}_{\text{link}}, \{\mathbf{q}_c, \mathbf{t}_c\})$ of a multi-domain replica.
@@ -3897,7 +4019,8 @@ impl Default for DomainDockEnergyWeights {
     }
 }
 
-/// Full 7-component energy breakdown of a multi-domain docking state.
+/// Full energy breakdown of a multi-domain docking state
+/// (`total = rdc + pcs + pre + noe + vdw + rama + reentry_closure`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DomainDockEnergyBreakdown {
     pub total: f64,
@@ -3906,7 +4029,12 @@ pub struct DomainDockEnergyBreakdown {
     pub pre: f64,
     pub noe: f64,
     pub vdw: f64,
+    /// Weighted linker Ramachandran term only (`w_rama * V_rama`; `0` when `w_rama == 0`).
     pub rama: f64,
+    /// Covalent re-entry peptide-bond loop-closure penalty `0.5 k_loop |Δx|²` across discontinuous
+    /// insertion-domain re-entry boundaries (`21F:B5`; booked separately from `rama`, `FIX3`).
+    #[serde(default)]
+    pub reentry_closure: f64,
 }
 
 /// Analytical torsion and multi-chain $\mathfrak{se}(3)$ gradients at a `DomainDockState`.
@@ -4160,19 +4288,50 @@ impl DomainLinkerKinematics {
         };
         let ref_chain = tmp_model.to_pdb_chain();
 
-        // Identify contiguous polymer chains (split by `chain_id` OR physical chain break `d(C_{i-1}, N_i) > 2.5 Å`)
+        // Identify contiguous polymer chains. Two same-`chain_id` neighbours are joined by a peptide
+        // bond when `d(C_{i-1}, N_i) <= 2.5 Å` (bonded whatever the numbering), or when their
+        // `seq_id`s are consecutive AND `d(C_{i-1}, N_i) <= MAX_PEPTIDE_JOIN_C_N_ANGSTROM` (`4.0 Å`,
+        // stretched-but-bonded). Consecutive numbering alone never bonds a genuine gap (`FIX3 21F:N1`:
+        // missing residues in a renumbered model would otherwise get a fabricated `1.329 Å` re-entry
+        // bond, or a `2.50 Å` clamp "bond" that displaces the initial linker coordinates).
         let mut chain_ranges: Vec<(usize, usize)> = Vec::new();
         let mut chain_ids: Vec<String> = Vec::new();
         let mut res_chain_idx = vec![0usize; l];
+        let mut chain_topology_warnings: Vec<String> = Vec::new();
+        let describe = |i: usize| -> String {
+            let r = &af_residues[i];
+            let cid = if r.chain_id.trim().is_empty() {
+                "_"
+            } else {
+                r.chain_id.trim()
+            };
+            format!("{cid}:{}{}", ref_chain.residues[i].res_name, r.seq_id)
+        };
         let mut c_start = 0usize;
         while c_start < l {
             let cid = af_residues[c_start].chain_id.clone();
             let mut c_end = c_start + 1;
-            while c_end < l
-                && af_residues[c_end].chain_id == cid
-                && (v_dist(ref_chain.residues[c_end - 1].c, ref_chain.residues[c_end].n) <= 2.5
-                    || af_residues[c_end].seq_id == af_residues[c_end - 1].seq_id + 1)
-            {
+            while c_end < l && af_residues[c_end].chain_id == cid {
+                let d_cn = v_dist(ref_chain.residues[c_end - 1].c, ref_chain.residues[c_end].n);
+                let consecutive = af_residues[c_end].seq_id == af_residues[c_end - 1].seq_id + 1;
+                let joined = d_cn <= 2.5 || (consecutive && d_cn <= MAX_PEPTIDE_JOIN_C_N_ANGSTROM);
+                if !joined {
+                    if consecutive {
+                        chain_topology_warnings.push(format!(
+                            "Chain-break warning [21F:N1]: residues {} and {} are numbered consecutively but the input C-N distance is {d_cn:.2} A (> {MAX_PEPTIDE_JOIN_C_N_ANGSTROM:.1} A peptide-join threshold); treated as a chain break with missing residues (no peptide bond or closure restraint is applied across it). If no residues are missing, the input coordinates are broken.",
+                            describe(c_end - 1),
+                            describe(c_end)
+                        ));
+                    }
+                    break;
+                }
+                if d_cn > PEPTIDE_C_N_STRETCH_WARN_ANGSTROM {
+                    chain_topology_warnings.push(format!(
+                        "Stretched-bond warning [21F:N1]: residues {} and {} are joined by a stretched input C-N distance of {d_cn:.2} A (ideal 1.33 A; joined because <= {MAX_PEPTIDE_JOIN_C_N_ANGSTROM:.1} A with consecutive numbering). If residues are missing between them, renumber the model so the gap is explicit.",
+                        describe(c_end - 1),
+                        describe(c_end)
+                    ));
+                }
                 c_end += 1;
             }
             let c_idx = chain_ranges.len();
@@ -4451,6 +4610,7 @@ impl DomainLinkerKinematics {
             ref_omega_rad,
             active_linker_residues,
             ref_chain,
+            chain_topology_warnings,
         })
     }
 
@@ -6513,7 +6673,7 @@ fn evaluate_domain_dock_on_precomputed_slots(
             let seg_master = 2 * kin.rigid_blocks[blk.master_block_id].start_res + 1;
             for (p_lp, p_rg) in [(n_loop, n_rig), (ca_loop, ca_rig), (c_loop, c_rig)] {
                 let df = v_sub(p_lp, p_rg);
-                eb.rama += 0.5 * k_loop * v_dot(df, df);
+                eb.reentry_closure += 0.5 * k_loop * v_dot(df, df);
                 let g_lp = v_scale(df, k_loop);
                 add_seg_ft(&mut seg_force, &mut seg_torque, slots, seg_loop, p_lp, g_lp);
                 add_seg_ft(
@@ -6639,7 +6799,7 @@ fn evaluate_domain_dock_on_precomputed_slots(
         }
     }
 
-    eb.total = eb.rdc + eb.pcs + eb.pre + eb.noe + eb.vdw + eb.rama;
+    eb.total = eb.rdc + eb.pcs + eb.pre + eb.noe + eb.vdw + eb.rama + eb.reentry_closure;
     (
         eb,
         DomainDockGradient {
@@ -8567,6 +8727,7 @@ pub fn prepare_domain_dock_inputs_full(
 
     // 1. Mandatory `tau_c_ns` + `proton_mhz` check on all Solomon `Gamma2Rate` PRE restraints (`21.W3:P0-4`)
     let mut normalized_pre_sites = pre_sites.to_vec();
+    let mut pre_spin_notes: Vec<String> = Vec::new();
     for ps in &mut normalized_pre_sites {
         let has_gamma2 = ps
             .restraints
@@ -8609,6 +8770,26 @@ pub fn prepare_domain_dock_inputs_full(
                         *k_pre_a6_s1 = default_exact_k;
                     }
                 }
+            }
+            // High-spin metal centres (K_PRE above the S = 1/2 nitroxide value at the same tau_c and
+            // field, e.g. Gd3+ S = 7/2 = 21x, Mn2+ S = 5/2 = 11.67x): the Solomon tau_c must be the
+            // EFFECTIVE correlation time 1/tau_c = 1/tau_r + 1/T1e (+ 1/tau_M). No T1e model is applied
+            // automatically, so disclose it (`FIX3 21F:B4` follow-up).
+            let max_ratio = ps
+                .restraints
+                .iter()
+                .filter_map(|r| match r.kind {
+                    PreRestraintKind::Gamma2Rate { k_pre_a6_s1, .. } => {
+                        Some(k_pre_a6_s1 / default_exact_k)
+                    }
+                    _ => None,
+                })
+                .fold(0.0_f64, f64::max);
+            if max_ratio > 1.0 + 1.0e-6 {
+                pre_spin_notes.push(format!(
+                    "PRE candor [21F:B4]: site '{}' uses K_PRE = {max_ratio:.2}x the S=1/2 nitroxide value (high-spin centre, e.g. Gd3+ S=7/2 = 21x, Mn2+ S=5/2 = 11.67x). tau_c_ns = {tc} ns is used as the effective correlation time 1/tau_c = 1/tau_r + 1/T1e; no electron-relaxation (T1e) model is applied, so a bare rotational tau_r overestimates K_PRE (and the fitted distances) when T1e is comparable to tau_r.",
+                    ps.site_id
+                ));
             }
         }
     }
@@ -8727,7 +8908,7 @@ pub fn prepare_domain_dock_inputs_full(
         || (prep.pcs_terms.len() + prep.pre_terms.len() + prep.noe_terms.len() >= 4);
 
     // 6. Pre-dock intra-domain coordinate consistency gate (`21.W2:P1-6`)
-    let mut extra_candor_notes = Vec::new();
+    let mut extra_candor_notes = pre_spin_notes;
     if n_excluded_flexible_rdcs > 0 {
         extra_candor_notes.push(format!(
             "Static-tensor hygiene [21.W2:P1-4]: excluded {n_excluded_flexible_rdcs} flexible-linker, terminal-tail, inter-domain, or low-pLDDT (< {min_plddt:.0}) RDC(s) from both static Saupe SVD and held-out RdcFree cross-validation."
@@ -9170,6 +9351,7 @@ pub fn finalize_domain_dock_pipeline(
         best_chain,
         &cseq,
     );
+    candor_notes.extend(kin.chain_topology_warnings.iter().cloned());
     candor_notes.extend(pipe.extra_candor_notes);
     if let Some(ref w_msg) = pipe.tolman_gdo.warning_message {
         candor_notes.push(w_msg.clone());
@@ -9510,14 +9692,15 @@ pub fn format_docked_pdb_ensemble(result: &DomainDockResult, title: &str) -> Str
             .forward_slots_and_block_frames(&conf.state);
         out.push_str(&format!("MODEL     {:>4}\n", conf.model_index));
         out.push_str(&format!(
-            "REMARK   4 ENERGY TOTAL={:.3} RDC={:.3} PCS={:.3} PRE={:.3} NOE={:.3} VDW={:.3} RAMA={:.3}\n",
+            "REMARK   4 ENERGY TOTAL={:.3} RDC={:.3} PCS={:.3} PRE={:.3} NOE={:.3} VDW={:.3} RAMA={:.3} CLOSURE={:.3}\n",
             conf.energy.total,
             conf.energy.rdc,
             conf.energy.pcs,
             conf.energy.pre,
             conf.energy.noe,
             conf.energy.vdw,
-            conf.energy.rama
+            conf.energy.rama,
+            conf.energy.reentry_closure
         ));
 
         let mut serial = 1usize;
