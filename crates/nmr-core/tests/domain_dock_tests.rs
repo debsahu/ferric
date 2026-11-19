@@ -34,6 +34,7 @@ use nmr_core::domain_dock::{
     DomainPcsTagSet, DomainPreRestraint, DomainPreSiteSet, PaeClusterConfig, PaeDomainPartition,
     PreRestraintKind, PreparedDomainDockRestraints, ResidueDomainRole, CODATA_ELECTRON_G_FACTOR,
     DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM, K_SOLOMON_PROTON_NITROXIDE_A6_S2,
+    MAX_PEPTIDE_JOIN_C_N_ANGSTROM,
 };
 use nmr_core::noesy::{
     parse_pdb_first_model, v_add, v_dist, v_norm, v_scale, v_sub, v_unit,
@@ -2963,6 +2964,21 @@ fn test_21f_b5_discontinuous_insertion_enforces_reentry_peptide_bond_closure() {
             docked.chains[0].residues[50].n,
         );
         let cn_err = (cn_dist - 1.33).abs();
+        let ens_max_cn_err = docked
+            .conformers
+            .iter()
+            .map(|c| c.max_reentry_cn_err_a)
+            .fold(0.0_f64, f64::max);
+        eprintln!(
+            "21F:B5 ({label}): max_reentry_cn_err_a model 1 = {:.4} A, max over {} ensemble members = {ens_max_cn_err:.4} A (per model: {:?})",
+            docked.conformers[0].max_reentry_cn_err_a,
+            docked.conformers.len(),
+            docked
+                .conformers
+                .iter()
+                .map(|c| format!("{:.4}", c.max_reentry_cn_err_a))
+                .collect::<Vec<_>>()
+        );
         assert!(
             cn_err <= 0.15,
             "21F:B5 ({label}): re-entry peptide bond C49-N50 = {cn_dist:.4} A (|d - 1.33| = {cn_err:.4} A > 0.15 A)"
@@ -3053,4 +3069,405 @@ fn test_21f_b18_default_mtsl_tether_allowance_applied_to_anchored_sites() {
         "21F:B18: anchored MTSL PRE site must inherit 6.0 A default tether allowance (r={r_actual:.2} A <= upper+6.0 A), got E_pre={:.4}",
         eb.pre
     );
+}
+
+// ---- FIX3 slice D: 21F:N1 sequentially numbered chain gaps, B4/B5 follow-ups ----
+
+/// Translate residues `from..` of `chain` rigidly along the `C'_{from-1} -> N_{from}` direction so
+/// that the input C-N distance across the cut becomes exactly `gap_a` while `seq_id`s stay
+/// consecutive (a renumbered model with missing residues).
+fn ubq_with_sequential_gap(chain: &PdbChain, from: usize, gap_a: f64) -> PdbChain {
+    let mut out = chain.clone();
+    let c_prev = chain.residues[from - 1].c;
+    let n_cur = chain.residues[from].n;
+    let d0 = v_dist(c_prev, n_cur);
+    let shift = v_scale(v_unit(v_sub(n_cur, c_prev)), gap_a - d0);
+    let mv = |p: Vec3| v_add(p, shift);
+    for r in out.residues.iter_mut().skip(from) {
+        r.n = mv(r.n);
+        r.ca = mv(r.ca);
+        r.c = mv(r.c);
+        r.o = mv(r.o);
+        r.ha = mv(r.ha);
+        r.h = r.h.map(mv);
+        r.ha2 = r.ha2.map(mv);
+        r.ha3 = r.ha3.map(mv);
+        r.cb = r.cb.map(mv);
+        r.qb = r.qb.map(mv);
+    }
+    for w in out.residues.windows(2) {
+        assert_eq!(
+            w[1].seq_id,
+            w[0].seq_id + 1,
+            "gapped model must stay sequential"
+        );
+    }
+    out
+}
+
+/// `1UBQ` insertion-domain topology of `21F:B5` (`D1 = [0..22] ∪ [50..72]`, `D2 = [26..46]`)
+/// rebuilt on `chain`, returning `(af_model, pae, partition, rdc_media, pcs_tag)` with restraints
+/// simulated from `chain` itself (the docking truth is the gapped input).
+fn build_insertion_case_on_chain(
+    chain: &PdbChain,
+    label: &str,
+) -> (
+    nmr_core::af_concordance::AfStructureModel,
+    PaeMatrix,
+    PaeDomainPartition,
+    Vec<RdcMediumSet>,
+    DomainPcsTagSet,
+) {
+    let n = chain.residues.len();
+    let mut true_dom = vec![0usize; n];
+    for d in true_dom.iter_mut().take(22) {
+        *d = 1;
+    }
+    for d in true_dom.iter_mut().take(46).skip(26) {
+        *d = 2;
+    }
+    for d in true_dom.iter_mut().take(72).skip(50) {
+        *d = 1;
+    }
+    let plddt: Vec<f64> = true_dom
+        .iter()
+        .map(|&d| if d == 0 { 60.0 } else { 93.0 })
+        .collect();
+    let pae = build_synthetic_pae(n, &true_dom, 2105, 2.0, 24.5);
+    let cif = serialize_chain_to_af_mmcif(label, chain, &plddt, None);
+    let model = parse_af_structure_model_str(&cif, &AfIngestOptions::default()).unwrap();
+    let seq_ids = model.seq_ids();
+    let part = cluster_pae_domains(
+        &pae,
+        Some(&plddt),
+        Some(&seq_ids),
+        None,
+        &PaeClusterConfig::default(),
+    )
+    .unwrap();
+    let ch_in = model.to_pdb_chain();
+    let s1 = saupe_matrix_from_pas(-13.0, 0.31, [24.0, 52.0, 104.0]);
+    let s2 = saupe_matrix_from_pas(14.5, 0.45, [112.0, 76.0, 35.0]);
+    let med1 = simulate_domain_rdc_medium(&ch_in, "gap_m1", &s1, &s1, 77, (-1, -1), 0.0, 811);
+    let med2 = simulate_domain_rdc_medium(&ch_in, "gap_m2", &s2, &s2, 77, (-1, -1), 0.0, 812);
+    let metal_d1 = v_add(ch_in.residues[60].ca, [3.0, -2.5, 2.8]);
+    let mut pcs_rows = Vec::new();
+    for (idx, r) in ch_in.residues.iter().enumerate() {
+        if true_dom[idx] != 0 {
+            if let Some(h) = r.h {
+                if v_dist(h, metal_d1) > 6.0 {
+                    let pv = predict_pcs_spherical_ppm(h, metal_d1, 28.0, 8.0, [0.4, 1.0, 1.8]);
+                    pcs_rows.push(DomainPcsRestraint {
+                        tag_id: "d1_ln".to_string(),
+                        chain_id: None,
+                        seq_id: r.seq_id,
+                        atom_name: "H".to_string(),
+                        pcs_obs_ppm: pv,
+                        sigma_ppm: 0.03,
+                        is_free: false,
+                    });
+                }
+            }
+        }
+    }
+    let pcs_tag = DomainPcsTagSet {
+        tag_id: "d1_ln".to_string(),
+        metal_pos_initial: Some(metal_d1),
+        anchor_chain_id: None,
+        anchor_residue_atom: None,
+        host_domain_id: Some(1),
+        pre_fitted_tensor: None,
+        refine_metal_pos: false,
+        metal_search_radius_a: None,
+        restraints: pcs_rows,
+    };
+    (model, pae, part, vec![med1, med2], pcs_tag)
+}
+
+fn assert_initial_state_reproduces_input(kin: &DomainLinkerKinematics, label: &str) {
+    let rebuilt = kin.build_pdb_chain(&kin.initial_state());
+    let mut max_d = 0.0_f64;
+    let mut worst = 0usize;
+    for (i, (a, b)) in rebuilt
+        .residues
+        .iter()
+        .zip(kin.ref_chain.residues.iter())
+        .enumerate()
+    {
+        for (p, q) in [(a.n, b.n), (a.ca, b.ca), (a.c, b.c)] {
+            let d = v_dist(p, q);
+            if d > max_d {
+                max_d = d;
+                worst = i;
+            }
+        }
+    }
+    assert!(
+        max_d < 1.0e-6,
+        "21F:N1 ({label}): initial state displaced backbone atom of residue index {worst} by {max_d:.4} A from the input coordinates"
+    );
+}
+
+fn run_sequential_gap_case(gap_from: usize, label: &str) {
+    let ubq = parse_pdb_first_model(repo_root().join("data/fixtures/ubiquitin_1ubq_xray.pdb"))
+        .expect("parse 1UBQ");
+    let gapped = ubq_with_sequential_gap(&ubq, gap_from, 15.0);
+    let (model, pae, part, media, pcs_tag) = build_insertion_case_on_chain(&gapped, label);
+    let kin = DomainLinkerKinematics::from_af_model(&model, &part).unwrap();
+    let d_in = v_dist(
+        kin.ref_chain.residues[gap_from - 1].c,
+        kin.ref_chain.residues[gap_from].n,
+    );
+    assert!((d_in - 15.0).abs() < 1e-2, "probe gap = {d_in:.3} A");
+
+    // (1) No fabricated peptide bond: the gap is a chain break in the kinematic topology.
+    assert!(
+        kin.residues[gap_from].is_chain_start,
+        "21F:N1 ({label}): residue index {gap_from} (C-N = {d_in:.2} A, consecutive seq_id) was joined by a fabricated peptide bond (chain_ranges = {:?})",
+        kin.chain_ranges
+    );
+    assert_eq!(
+        kin.chain_ranges.len(),
+        2,
+        "{label}: expected exactly one kept chain break"
+    );
+    // No closure restraint across the broken boundary (initial-state closure error is 0).
+    assert!(
+        kin.max_reentry_cn_err_angstrom(&kin.initial_state()) < 1.0e-9,
+        "21F:N1 ({label}): closure restraint spans the kept chain break"
+    );
+    // (2) Initial state reproduces the input coordinates exactly (no clamp "bond" displacement).
+    assert_initial_state_reproduces_input(&kin, label);
+
+    // (3) Warning names both residues and the distance, and reaches the docking report.
+    let s_prev = kin.residues[gap_from - 1].seq_id;
+    let s_cur = kin.residues[gap_from].seq_id;
+    let has_warning = |notes: &[String]| {
+        notes.iter().any(|w| {
+            w.contains("21F:N1")
+                && w.contains(&format!("{s_prev} and"))
+                && w.contains(&format!("{s_cur} are numbered consecutively"))
+                && w.contains("15.00 A")
+        })
+    };
+    assert!(
+        has_warning(&kin.chain_topology_warnings),
+        "21F:N1 ({label}): missing chain-break warning, got {:?}",
+        kin.chain_topology_warnings
+    );
+    let cfg = DomainDockConfig {
+        ensemble_size: 1,
+        n_replicas: 8,
+        anneal_steps: 12,
+        lbfgs_iters: 40,
+        ..Default::default()
+    };
+    let docked = dock_domains_cpu(
+        &model,
+        &pae,
+        &media,
+        std::slice::from_ref(&pcs_tag),
+        &[],
+        &[],
+        &cfg,
+    )
+    .unwrap();
+    assert!(
+        has_warning(&docked.report.candor_notes),
+        "21F:N1 ({label}): chain-break warning missing from report.candor_notes: {:?}",
+        docked.report.candor_notes
+    );
+    let d_docked = v_dist(
+        docked.chains[0].residues[gap_from - 1].c,
+        docked.chains[0].residues[gap_from].n,
+    );
+    assert!(
+        d_docked > MAX_PEPTIDE_JOIN_C_N_ANGSTROM,
+        "21F:N1 ({label}): docking closed the 15 A gap into a {d_docked:.3} A C-N 'bond'"
+    );
+}
+
+#[test]
+fn test_fix3_n1_sequential_gap_at_reentry_boundary_is_not_bonded() {
+    // 15 A gap between seq 50 and 51 (index 49 -> 50 = D1 re-entry start), numbering consecutive.
+    // Fails at `b5e87a3`: joined into one chain and closed with an ideal 1.329 A re-entry bond.
+    run_sequential_gap_case(50, "reentry_gap");
+}
+
+#[test]
+fn test_fix3_n1_sequential_gap_in_linker_is_not_bonded() {
+    // 15 A gap between seq 24 and 25 (index 23 -> 24, inside linker 22..26), numbering consecutive.
+    // Fails at `b5e87a3`: joined with a 2.50 A clamp "bond" that moves the initial-state CA ~13 A.
+    run_sequential_gap_case(24, "linker_gap");
+}
+
+fn gd_pre_tsv_rows(seq_a: i32, seq_b: i32) -> String {
+    format!("site_id\tseq_id\tatom_name\tgamma2_s1\tsigma_s1\ngd1\t{seq_a}\tH\t20.0\t1.0\ngd1\t{seq_b}\tH\t15.0\t1.0\n")
+}
+
+fn pre_k_values(sites: &[DomainPreSiteSet]) -> Vec<f64> {
+    sites
+        .iter()
+        .flat_map(|s| s.restraints.iter())
+        .map(|r| match r.kind {
+            PreRestraintKind::Gamma2Rate { k_pre_a6_s1, .. } => k_pre_a6_s1,
+            _ => panic!("expected Gamma2Rate"),
+        })
+        .collect()
+}
+
+#[test]
+fn test_fix3_b4_pre_unknown_per_site_spin_or_g_tag_fails_closed() {
+    // A typo in a per-site `# spin_s[tag]` / `# g_factor[tag]` must not silently fall back to the
+    // S = 1/2 nitroxide default (re-creating the 21F:B4 21x K_PRE bias). Fails at `b5e87a3`.
+    let head = "# site_pos: 1.0 2.0 3.0\n# site_domain: 1\n# tau_c_ns: 10.0\n# proton_mhz: 600.0\n";
+    let rows = gd_pre_tsv_rows(30, 31);
+    let ok = format!("{head}# spin_s[gd1]: 3.5\n{rows}");
+    let k_ok = pre_k_values(&parse_domain_pre_tsv_str(&ok).unwrap());
+    let k_gd = compute_solomon_k_pre_a6_s1(10.0, 600.0, 3.5, CODATA_ELECTRON_G_FACTOR).unwrap();
+    assert!(k_ok.iter().all(|k| ((k - k_gd) / k_gd).abs() < 1e-12));
+
+    for (directive, label) in [
+        ("# spin_s[gdl]: 3.5\n", "spin_s"),
+        ("# g_factor[Gd1]: 1.99\n", "g_factor"),
+        ("# tau_c_ns[gd2]: 12.0\n", "tau_c_ns"),
+    ] {
+        let typo = format!("{head}{directive}{rows}");
+        let err = parse_domain_pre_tsv_str(&typo).expect_err(&format!(
+            "21F:B4 follow-up: unknown per-site `{label}` tag must fail closed"
+        ));
+        assert!(
+            err.contains("does not match any PRE site_id") && err.contains("gd1"),
+            "{label}: error must name the bad tag and the known site IDs, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_fix3_b4_pre_global_spin_directives_are_order_independent() {
+    // `# spin_s:` (and the other global/per-site directives) must apply to every row regardless of
+    // its position in the file. Fails at `b5e87a3`, where rows parsed before the directive got S = 1/2.
+    let head = "# site_pos: 1.0 2.0 3.0\n# site_domain: 1\n# tau_c_ns: 10.0\n# proton_mhz: 600.0\n";
+    let rows = gd_pre_tsv_rows(30, 31);
+    let k_gd = compute_solomon_k_pre_a6_s1(10.0, 600.0, 3.5, CODATA_ELECTRON_G_FACTOR).unwrap();
+    for (label, text) in [
+        ("before", format!("{head}# spin_s: 3.5\n{rows}")),
+        ("after", format!("{head}{rows}# spin_s: 3.5\n")),
+        ("tagged_after", format!("{head}{rows}# spin_s[gd1]: 3.5\n")),
+        (
+            "all_after",
+            format!("{rows}# spin_s: 3.5\n# tau_c_ns: 10.0\n# proton_mhz: 600.0\n# site_pos: 1.0 2.0 3.0\n# site_domain: 1\n"),
+        ),
+    ] {
+        let sites = parse_domain_pre_tsv_str(&text).unwrap();
+        let ks = pre_k_values(&sites);
+        assert_eq!(ks.len(), 2);
+        for k in ks {
+            assert!(
+                ((k - k_gd) / k_gd).abs() < 1e-12,
+                "21F:B4 follow-up ({label}): K_PRE = {k:.6e}, expected Gd3+ S=7/2 {k_gd:.6e}"
+            );
+        }
+    }
+    // Conflicting duplicate directives are ambiguous under order independence: fail closed.
+    let dup = format!("{head}# spin_s: 3.5\n{rows}# spin_s: 0.5\n");
+    let err = parse_domain_pre_tsv_str(&dup).expect_err("conflicting duplicate # spin_s must fail");
+    assert!(err.contains("conflicting"), "got: {err}");
+}
+
+#[test]
+fn test_fix3_b4_high_spin_pre_site_reports_effective_tau_c_caveat() {
+    // Gd3+/Mn2+ PRE sites must carry a report note that tau_c is the effective correlation time
+    // (1/tau_c = 1/tau_r + 1/T1e) with no automatic T1e model.
+    let (native_model, _pae, part) = build_two_domain_ubq_kh3_benchmark();
+    let kin = DomainLinkerKinematics::from_af_model(&native_model, &part).unwrap();
+    let tsv = format!(
+        "# site_pos: 1.0 2.0 3.0\n# site_domain: 1\n# tau_c_ns: 10.0\n# proton_mhz: 600.0\n# spin_s: 3.5\nseq_id\tatom_name\tgamma2_s1\tsigma_s1\n{}\tH\t20.0\t1.0\n",
+        kin.residues[94].seq_id
+    );
+    let sites = parse_domain_pre_tsv_str(&tsv).unwrap();
+    let cfg = DomainDockConfig {
+        allow_underdetermined_single_medium: true,
+        ..Default::default()
+    };
+    let mut empty_rdcs = Vec::new();
+    let pipe =
+        prepare_domain_dock_inputs_full(&kin, &part, &mut empty_rdcs, &[], &sites, &[], &cfg)
+            .unwrap();
+    assert!(
+        pipe.extra_candor_notes
+            .iter()
+            .any(|n| n.contains("effective") && n.contains("T1e") && n.contains("pre1")),
+        "missing effective-tau_c / T1e caveat for S=7/2 site: {:?}",
+        pipe.extra_candor_notes
+    );
+    // A plain S = 1/2 nitroxide site does not get the high-spin caveat.
+    let tsv_half = tsv.replace("# spin_s: 3.5\n", "");
+    let sites_half = parse_domain_pre_tsv_str(&tsv_half).unwrap();
+    let pipe_half =
+        prepare_domain_dock_inputs_full(&kin, &part, &mut empty_rdcs, &[], &sites_half, &[], &cfg)
+            .unwrap();
+    assert!(!pipe_half
+        .extra_candor_notes
+        .iter()
+        .any(|n| n.contains("T1e")));
+}
+
+#[test]
+fn test_fix3_b5_reentry_closure_energy_has_own_breakdown_field() {
+    // The always-on re-entry closure energy must not be booked into `rama`: at `w_rama = 0` the
+    // breakdown shows `rama == 0` and the closure in `reentry_closure`, with an unchanged total.
+    // Fails at `b5e87a3` (closure booked into `eb.rama`).
+    let ubq = parse_pdb_first_model(repo_root().join("data/fixtures/ubiquitin_1ubq_xray.pdb"))
+        .expect("parse 1UBQ");
+    let (model0, _pae0, part0, _m0, _p0) = build_insertion_case_on_chain(&ubq, "b5_ref");
+    let kin0 = DomainLinkerKinematics::from_af_model(&model0, &part0).unwrap();
+    let mut st = kin0.initial_state();
+    st.psi_rad[23] += 0.40;
+    st.phi_rad[24] -= 0.35;
+    st.psi_rad[46] += 0.30;
+    let start_chain = kin0.build_pdb_chain(&st);
+    let d_start = v_dist(start_chain.residues[49].c, start_chain.residues[50].n);
+    eprintln!("21F:B5 perturbed start model C49-N50 = {d_start:.3} A");
+    let (model, _pae, part, media, pcs_tag) = build_insertion_case_on_chain(&start_chain, "b5");
+    let kin = DomainLinkerKinematics::from_af_model(&model, &part).unwrap();
+    assert!(kin.has_reentry_blocks());
+    assert!(
+        !kin.residues[50].is_chain_start,
+        "stretched {d_start:.2} A re-entry link must stay joined"
+    );
+    let mut rdc_media = media;
+    let w0 = DomainDockEnergyWeights {
+        w_rama: 0.0,
+        ..Default::default()
+    };
+    let cfg = DomainDockConfig {
+        weights: w0,
+        ..Default::default()
+    };
+    let pipe = prepare_domain_dock_inputs_full(
+        &kin,
+        &part,
+        &mut rdc_media,
+        std::slice::from_ref(&pcs_tag),
+        &[],
+        &[],
+        &cfg,
+    )
+    .unwrap();
+    let st0 = kin.initial_state();
+    assert!(kin.max_reentry_cn_err_angstrom(&st0) > 0.05);
+    let (eb, _) =
+        nmr_core::domain_dock::evaluate_domain_dock_state_cpu(&kin, &pipe.prep, &st0, &w0);
+    assert_eq!(
+        eb.rama, 0.0,
+        "21F:B5 follow-up: w_rama = 0 must give rama = 0 (closure booked into rama: {:.4})",
+        eb.rama
+    );
+    assert!(
+        eb.reentry_closure > 0.0,
+        "closure energy must be reported separately"
+    );
+    let sum = eb.rdc + eb.pcs + eb.pre + eb.noe + eb.vdw + eb.rama + eb.reentry_closure;
+    assert!((eb.total - sum).abs() <= 1e-9 * eb.total.abs().max(1.0));
 }

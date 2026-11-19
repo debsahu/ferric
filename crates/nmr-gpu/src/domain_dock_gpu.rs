@@ -943,6 +943,7 @@ async fn dispatch_domain_dock_chunk_async(
             noe: e1[0] as f64,
             vdw: e1[1] as f64,
             rama: e1[2] as f64,
+            reentry_closure: e1[3] as f64,
         };
         let g_off = ci * grad_stride;
         let mut gp = Vec::with_capacity(l);
@@ -1093,6 +1094,210 @@ pub fn dock_domains_multi_chain_gpu(
     ))
 }
 
+/// Replica bookkeeping returned by [`anneal_domain_dock_replicas_gpu_async`].
+///
+/// All energies are the GPU SEARCH objective: `nmr_core::domain_dock::evaluate_domain_dock_fixed_saupe_cpu`-equivalent
+/// composite energy with per-state VarPro-fitted Saupe matrices and the kernel's
+/// `k_loop = 25 * w_rama` re-entry closure (0 at `w_rama = 0`). It excludes the host's always-on
+/// closure (`k >= 500`, `21F:B5`), which only the host `L-BFGS` polish and the final
+/// [`select_and_polish_top_states`] ranking apply (`FIX3 21F:N2`).
+#[derive(Clone, Debug)]
+pub struct DomainDockGpuAnnealOutcome {
+    /// Multi-start seed states (`generate_domain_dock_seed_states`).
+    pub seed_states: Vec<DomainDockState>,
+    /// GPU search-objective total energy of each seed state at full-ramp weights.
+    pub seed_energies: Vec<f64>,
+    /// Lowest-energy state visited per replica (seed included) at full-ramp weights.
+    pub best_states: Vec<DomainDockState>,
+    /// GPU search-objective total energy of `best_states[r]` (`<= seed_energies[r]`).
+    pub best_energies: Vec<f64>,
+}
+
+/// Per-step annealing weights (`ramp` in `[0, 1]`; `ramp = 1` gives the full search weights).
+fn annealing_step_weights(base: &DomainDockEnergyWeights, ramp: f64) -> DomainDockEnergyWeights {
+    let mut w = *base;
+    w.w_vdw = base.w_vdw * (0.20 + 0.80 * ramp * ramp);
+    w.vdw_scale = base.vdw_scale * (0.78 + 0.22 * ramp);
+    w
+}
+
+/// Evaluate the GPU search objective (per-state VarPro Saupe fit on host, then one kernel pass).
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_states_gpu_search_objective(
+    engine: &GpuEngine,
+    gpu_pipe: &DomainDockGpuPipeline,
+    kin: &DomainLinkerKinematics,
+    prep: &PreparedDomainDockRestraints,
+    sf_buf: &wgpu::Buffer,
+    si_buf: &wgpu::Buffer,
+    states: &[DomainDockState],
+    weights: &DomainDockEnergyWeights,
+    chunk_cap: usize,
+) -> Result<Vec<(DomainDockEnergyBreakdown, DomainDockGradient)>, String> {
+    let mut gpu_inputs: Vec<DomainDockGpuReplicaInput> = Vec::with_capacity(states.len());
+    for st in states {
+        let saupe = if weights.w_rdc > 0.0 && prep.n_media > 0 {
+            let (slots, _) = kin.forward_slots_and_block_frames(st);
+            prep.fit_global_saupe_matrices_on_slots(&slots)
+        } else {
+            vec![[[0.0; 3]; 3]; prep.n_media]
+        };
+        gpu_inputs.push(DomainDockGpuReplicaInput {
+            state: st.clone(),
+            saupe_matrices: saupe,
+        });
+    }
+    let mut gpu_outs = Vec::with_capacity(states.len());
+    for chunk in gpu_inputs.chunks(chunk_cap.max(1)) {
+        let sub = dispatch_domain_dock_chunk_async(
+            engine, gpu_pipe, kin, prep, sf_buf, si_buf, chunk, weights,
+        )
+        .await?;
+        gpu_outs.extend(sub);
+    }
+    Ok(gpu_outs)
+}
+
+/// WebGPU multi-replica heavy-ball annealing over `n_rep` seed states, tracking each replica's
+/// lowest GPU-search-objective state at full-ramp weights (see [`DomainDockGpuAnnealOutcome`]).
+pub async fn anneal_domain_dock_replicas_gpu_async(
+    engine: &GpuEngine,
+    kin: &DomainLinkerKinematics,
+    partition: &PaeDomainPartition,
+    prep: &PreparedDomainDockRestraints,
+    cfg: &DomainDockConfig,
+    n_rep: usize,
+) -> Result<DomainDockGpuAnnealOutcome, String> {
+    let mut states =
+        generate_domain_dock_seed_states(kin, partition, prep, &cfg.weights, n_rep, cfg.seed);
+
+    let lim = engine.device.limits();
+    let chunk_cap = pick_chunk_size_for_device(&lim, states.len(), kin, prep)?;
+
+    let gpu_pipe = DomainDockGpuPipeline::new(&engine.device);
+    let (sf_data, si_data) = pack_static_buffers(kin, prep);
+    let sf_buf = engine
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("nmr-domain-dock-sf"),
+            contents: bytemuck::cast_slice(&sf_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+    let si_buf = engine
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("nmr-domain-dock-si"),
+            contents: bytemuck::cast_slice(&si_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+    let l = kin.residues.len();
+    let nc = kin.chain_ranges.len();
+    let mut vel_phi = vec![vec![0.0_f64; l]; states.len()];
+    let mut vel_psi = vec![vec![0.0_f64; l]; states.len()];
+    let mut vel_rot = vec![vec![[0.0_f64; 3]; nc]; states.len()];
+    let mut vel_trans = vec![vec![[0.0_f64; 3]; nc]; states.len()];
+    // Seed the per-replica best-energy bookkeeping with the SAME objective the kernel minimises
+    // and that `best_energies` is later compared against (`FIX3 21F:N2`): one GPU pass over the
+    // seed states at the full-ramp weights. The host `evaluate_domain_dock_state_cpu` objective
+    // adds the always-on re-entry closure (`k >= 500`) that the kernel omits, so seeding with it
+    // made every seed look worse than any annealed state and the kept replica depend on which
+    // objective scored it. Closure is enforced afterwards by the host polish + final ranking.
+    let full_w = annealing_step_weights(&cfg.weights, 1.0);
+    let seed_gpu = evaluate_states_gpu_search_objective(
+        engine, &gpu_pipe, kin, prep, &sf_buf, &si_buf, &states, &full_w, chunk_cap,
+    )
+    .await?;
+    let seed_energies: Vec<f64> = seed_gpu.iter().map(|(eb, _)| eb.total).collect();
+    let seed_states = states.clone();
+    let mut best_states = states.clone();
+    let mut best_energies = seed_energies.clone();
+
+    let total_steps = cfg.anneal_steps.max(1);
+    for step in 0..total_steps {
+        let prog = if total_steps > 1 {
+            (step as f64) / ((total_steps - 1) as f64)
+        } else {
+            1.0
+        };
+        let ramp = (prog / 0.65).min(1.0);
+        let cur_w = annealing_step_weights(&cfg.weights, ramp);
+
+        let gpu_outs = evaluate_states_gpu_search_objective(
+            engine, &gpu_pipe, kin, prep, &sf_buf, &si_buf, &states, &cur_w, chunk_cap,
+        )
+        .await?;
+
+        for (ri, ((eb, gr), st)) in gpu_outs.into_iter().zip(states.iter_mut()).enumerate() {
+            if ramp >= 1.0 && eb.total < best_energies[ri] {
+                best_energies[ri] = eb.total;
+                best_states[ri] = st.clone();
+            }
+
+            let mut g2 = 0.0_f64;
+            for &i in &kin.active_linker_residues {
+                g2 += gr.grad_phi[i] * gr.grad_phi[i] + gr.grad_psi[i] * gr.grad_psi[i];
+            }
+            for c_idx in 1..nc {
+                g2 += v_dot(gr.grad_chain_rot[c_idx], gr.grad_chain_rot[c_idx])
+                    + v_dot(gr.grad_chain_trans[c_idx], gr.grad_chain_trans[c_idx]);
+            }
+            let g_norm = g2.sqrt().max(1.0);
+            let lr = (0.025 * (1.0 - 0.65 * prog)) / (1.0 + 0.25 * g_norm);
+            let mom = 0.45 * (1.0 - 0.40 * prog);
+
+            for &i in &kin.active_linker_residues {
+                if kin.residues[i].phi_active {
+                    vel_phi[ri][i] = mom * vel_phi[ri][i] - lr * gr.grad_phi[i];
+                    st.phi_rad[i] =
+                        wrap_rad_host(st.phi_rad[i] + vel_phi[ri][i].clamp(-0.04, 0.04));
+                }
+                if kin.residues[i].psi_active {
+                    vel_psi[ri][i] = mom * vel_psi[ri][i] - lr * gr.grad_psi[i];
+                    st.psi_rad[i] =
+                        wrap_rad_host(st.psi_rad[i] + vel_psi[ri][i].clamp(-0.04, 0.04));
+                }
+            }
+            for c_idx in 1..nc {
+                for ax in 0..3 {
+                    vel_rot[ri][c_idx][ax] =
+                        mom * vel_rot[ri][c_idx][ax] - lr * gr.grad_chain_rot[c_idx][ax];
+                    vel_trans[ri][c_idx][ax] = mom * vel_trans[ri][c_idx][ax]
+                        - (4.0 * lr) * gr.grad_chain_trans[c_idx][ax];
+                    st.chain_trans[c_idx][ax] += vel_trans[ri][c_idx][ax].clamp(-0.6, 0.6);
+                }
+                let domg = [
+                    vel_rot[ri][c_idx][0].clamp(-0.08, 0.08),
+                    vel_rot[ri][c_idx][1].clamp(-0.08, 0.08),
+                    vel_rot[ri][c_idx][2].clamp(-0.08, 0.08),
+                ];
+                st.chain_quats[c_idx] = quat_apply_world_rot_step(st.chain_quats[c_idx], domg);
+            }
+        }
+    }
+    Ok(DomainDockGpuAnnealOutcome {
+        seed_states,
+        seed_energies,
+        best_states,
+        best_energies,
+    })
+}
+
+/// Synchronous native wrapper around [`anneal_domain_dock_replicas_gpu_async`].
+#[cfg(not(target_arch = "wasm32"))]
+pub fn anneal_domain_dock_replicas_gpu(
+    engine: &GpuEngine,
+    kin: &DomainLinkerKinematics,
+    partition: &PaeDomainPartition,
+    prep: &PreparedDomainDockRestraints,
+    cfg: &DomainDockConfig,
+    n_rep: usize,
+) -> Result<DomainDockGpuAnnealOutcome, String> {
+    pollster::block_on(anneal_domain_dock_replicas_gpu_async(
+        engine, kin, partition, prep, cfg, n_rep,
+    ))
+}
+
 /// Run WebGPU multi-replica annealing + host `f64` `L-BFGS` polish on a pre-built `DomainLinkerKinematics`.
 #[allow(clippy::too_many_arguments)]
 pub async fn dock_domains_with_kinematics_gpu_async(
@@ -1134,127 +1339,10 @@ pub async fn dock_domains_with_kinematics_gpu_async(
         vec![(st0, eb0)]
     } else {
         let n_rep = cfg.n_replicas.max(n_ens);
-        let mut states =
-            generate_domain_dock_seed_states(&kin, &partition, prep, &cfg.weights, n_rep, cfg.seed);
-
-        let lim = engine.device.limits();
-        let chunk_cap = pick_chunk_size_for_device(&lim, states.len(), &kin, prep)?;
-
-        let gpu_pipe = DomainDockGpuPipeline::new(&engine.device);
-        let (sf_data, si_data) = pack_static_buffers(&kin, prep);
-        let sf_buf = engine
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("nmr-domain-dock-sf"),
-                contents: bytemuck::cast_slice(&sf_data),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let si_buf = engine
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("nmr-domain-dock-si"),
-                contents: bytemuck::cast_slice(&si_data),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-        let l = kin.residues.len();
-        let nc = kin.chain_ranges.len();
-        let mut vel_phi = vec![vec![0.0_f64; l]; states.len()];
-        let mut vel_psi = vec![vec![0.0_f64; l]; states.len()];
-        let mut vel_rot = vec![vec![[0.0_f64; 3]; nc]; states.len()];
-        let mut vel_trans = vec![vec![[0.0_f64; 3]; nc]; states.len()];
-        let mut best_states = states.clone();
-        let mut best_energies: Vec<f64> = states
-            .iter()
-            .map(|s| {
-                nmr_core::domain_dock::evaluate_domain_dock_state_cpu(&kin, prep, s, &cfg.weights)
-                    .0
-                    .total
-            })
-            .collect();
-
-        let total_steps = cfg.anneal_steps.max(1);
-        for step in 0..total_steps {
-            let prog = if total_steps > 1 {
-                (step as f64) / ((total_steps - 1) as f64)
-            } else {
-                1.0
-            };
-            let ramp = (prog / 0.65).min(1.0);
-            let mut cur_w = cfg.weights;
-            cur_w.w_vdw = cfg.weights.w_vdw * (0.20 + 0.80 * ramp * ramp);
-            cur_w.vdw_scale = cfg.weights.vdw_scale * (0.78 + 0.22 * ramp);
-
-            let mut gpu_inputs: Vec<DomainDockGpuReplicaInput> = Vec::with_capacity(states.len());
-            for st in &states {
-                let saupe = if cur_w.w_rdc > 0.0 && prep.n_media > 0 {
-                    let (slots, _) = kin.forward_slots_and_block_frames(st);
-                    prep.fit_global_saupe_matrices_on_slots(&slots)
-                } else {
-                    vec![[[0.0; 3]; 3]; prep.n_media]
-                };
-                gpu_inputs.push(DomainDockGpuReplicaInput {
-                    state: st.clone(),
-                    saupe_matrices: saupe,
-                });
-            }
-
-            let mut gpu_outs = Vec::with_capacity(states.len());
-            for chunk in gpu_inputs.chunks(chunk_cap) {
-                let sub = dispatch_domain_dock_chunk_async(
-                    engine, &gpu_pipe, &kin, prep, &sf_buf, &si_buf, chunk, &cur_w,
-                )
+        let anneal =
+            anneal_domain_dock_replicas_gpu_async(engine, &kin, &partition, prep, cfg, n_rep)
                 .await?;
-                gpu_outs.extend(sub);
-            }
-
-            for (ri, ((eb, gr), st)) in gpu_outs.into_iter().zip(states.iter_mut()).enumerate() {
-                if ramp >= 1.0 && eb.total < best_energies[ri] {
-                    best_energies[ri] = eb.total;
-                    best_states[ri] = st.clone();
-                }
-
-                let mut g2 = 0.0_f64;
-                for &i in &kin.active_linker_residues {
-                    g2 += gr.grad_phi[i] * gr.grad_phi[i] + gr.grad_psi[i] * gr.grad_psi[i];
-                }
-                for c_idx in 1..nc {
-                    g2 += v_dot(gr.grad_chain_rot[c_idx], gr.grad_chain_rot[c_idx])
-                        + v_dot(gr.grad_chain_trans[c_idx], gr.grad_chain_trans[c_idx]);
-                }
-                let g_norm = g2.sqrt().max(1.0);
-                let lr = (0.025 * (1.0 - 0.65 * prog)) / (1.0 + 0.25 * g_norm);
-                let mom = 0.45 * (1.0 - 0.40 * prog);
-
-                for &i in &kin.active_linker_residues {
-                    if kin.residues[i].phi_active {
-                        vel_phi[ri][i] = mom * vel_phi[ri][i] - lr * gr.grad_phi[i];
-                        st.phi_rad[i] =
-                            wrap_rad_host(st.phi_rad[i] + vel_phi[ri][i].clamp(-0.04, 0.04));
-                    }
-                    if kin.residues[i].psi_active {
-                        vel_psi[ri][i] = mom * vel_psi[ri][i] - lr * gr.grad_psi[i];
-                        st.psi_rad[i] =
-                            wrap_rad_host(st.psi_rad[i] + vel_psi[ri][i].clamp(-0.04, 0.04));
-                    }
-                }
-                for c_idx in 1..nc {
-                    for ax in 0..3 {
-                        vel_rot[ri][c_idx][ax] =
-                            mom * vel_rot[ri][c_idx][ax] - lr * gr.grad_chain_rot[c_idx][ax];
-                        vel_trans[ri][c_idx][ax] = mom * vel_trans[ri][c_idx][ax]
-                            - (4.0 * lr) * gr.grad_chain_trans[c_idx][ax];
-                        st.chain_trans[c_idx][ax] += vel_trans[ri][c_idx][ax].clamp(-0.6, 0.6);
-                    }
-                    let domg = [
-                        vel_rot[ri][c_idx][0].clamp(-0.08, 0.08),
-                        vel_rot[ri][c_idx][1].clamp(-0.08, 0.08),
-                        vel_rot[ri][c_idx][2].clamp(-0.08, 0.08),
-                    ];
-                    st.chain_quats[c_idx] = quat_apply_world_rot_step(st.chain_quats[c_idx], domg);
-                }
-            }
-        }
+        let best_states = anneal.best_states;
 
         select_and_polish_top_states(
             &kin,

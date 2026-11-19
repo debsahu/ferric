@@ -499,6 +499,7 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
     var e_noe: f32 = 0.0;
     var e_vdw: f32 = 0.0;
     var e_rama: f32 = 0.0;
+    var e_loop: f32 = 0.0;
 
     // 2. Working RDC potential & forces (accumulating intra-domain pure torque onto `master_block_id`)
     if (params.w_rdc > 0.0 && params.n_rdc_terms > 0u) {
@@ -1058,6 +1059,10 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // 6c. Cyclic covalent peptide loop-closure restraint across re-entry rigid-block boundaries (`21.W2:P0-4`)
+    //     GPU SEARCH objective: `k_loop = 25 * w_rama` (0 at `w_rama = 0`), identical to the host
+    //     `evaluate_domain_dock_fixed_saupe_cpu` parity reference. It deliberately EXCLUDES the host's
+    //     always-on closure (`k >= 500`, `21F:B5`), which is enforced in the host f64 L-BFGS polish and
+    //     final ranking; replica best-energy bookkeeping uses this objective only (`FIX3 21F:N2`).
     let w_rama = params.w_rama;
     if (w_rama > 0.0) {
         let k_loop = 25.0 * w_rama;
@@ -1104,19 +1109,19 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
             let seg_master = 2u * m_start + 1u;
 
             let dn = n_loop - n_rig;
-            e_rama = e_rama + 0.5 * k_loop * dot(dn, dn);
+            e_loop = e_loop + 0.5 * k_loop * dot(dn, dn);
             let gn = dn * k_loop;
             add_seg_grad_dock(atom_base, force_base, torque_base, seg_loop, n_loop, gn);
             add_seg_grad_dock(atom_base, force_base, torque_base, seg_master, n_rig, -gn);
 
             let dca = ca_loop - ca_rig;
-            e_rama = e_rama + 0.5 * k_loop * dot(dca, dca);
+            e_loop = e_loop + 0.5 * k_loop * dot(dca, dca);
             let gca = dca * k_loop;
             add_seg_grad_dock(atom_base, force_base, torque_base, seg_loop, ca_loop, gca);
             add_seg_grad_dock(atom_base, force_base, torque_base, seg_master, ca_rig, -gca);
 
             let dc = c_loop - c_rig;
-            e_rama = e_rama + 0.5 * k_loop * dot(dc, dc);
+            e_loop = e_loop + 0.5 * k_loop * dot(dc, dc);
             let gc = dc * k_loop;
             add_seg_grad_dock(atom_base, force_base, torque_base, seg_loop, c_loop, gc);
             add_seg_grad_dock(atom_base, force_base, torque_base, seg_master, c_rig, -gc);
@@ -1235,7 +1240,8 @@ fn eval_domain_dock_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    let total_e = e_rdc + e_pcs + e_pre + e_noe + e_vdw + e_rama;
+    // `e_loop` = re-entry loop-closure energy, reported separately from `e_rama` (`.w` slot, FIX3).
+    let total_e = e_rdc + e_pcs + e_pre + e_noe + e_vdw + e_rama + e_loop;
     energies_out[2u * conf_idx + 0u] = vec4<f32>(total_e, e_rdc, e_pcs, e_pre);
-    energies_out[2u * conf_idx + 1u] = vec4<f32>(e_noe, e_vdw, e_rama, 0.0);
+    energies_out[2u * conf_idx + 1u] = vec4<f32>(e_noe, e_vdw, e_rama, e_loop);
 }
