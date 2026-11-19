@@ -81,6 +81,7 @@ pub mod titration_2d;
 pub mod topology;
 pub mod torsion_db;
 pub mod water;
+pub mod workflow_dag;
 
 // ============================================================================
 // Seamless Interoperability Bridges: `octet_mol` <-> `octet_analyt` <-> `octet_render`

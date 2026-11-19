@@ -33,11 +33,20 @@ use crate::report::{
 use crate::simulate::{simulate, SimConfig};
 use crate::solver::{assign, AnnealConfig, ScoreConfig};
 use crate::spinsystems::{build_spin_systems, Tolerances};
+use crate::torsion_db::sha256_hex;
+use crate::workflow_dag::{
+    compile_dag_manifest, dag_from_json, execute_dag_manifest_dry_run, execute_dag_manifest_real,
+    manifest_to_json, validate_dag, verify_dag_manifest, DagArtifactCache, DagManifest,
+    DagRunOptions, WorkflowDag, MAX_DAG_JSON_BYTES,
+};
 
 const EMBEDDED_UBIQUITIN_STAR: &str =
     include_str!("../../../data/fixtures/synthetic_ubiquitin.str");
 
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+const MAX_DAG_RUN_HTTP_BODY_BYTES: usize = 4 * MAX_DAG_JSON_BYTES; // 4 MiB
+const MAX_SERVICE_DAG_CACHE_BUCKETS: usize = 16;
+const MAX_SERVICE_DAG_CACHE_ENTRIES: usize = 256;
 
 /// Payload accepted by `POST /api/v1/jobs`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -123,6 +132,48 @@ pub struct JobRecord {
     pub artifacts: Option<JobArtifacts>,
 }
 
+/// Payload accepted by `POST /api/v1/dag/run`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DagRunRequest {
+    /// Compiled `ferric-dag-v1` manifest to verify and execute deterministically.
+    #[serde(default)]
+    pub manifest: Option<DagManifest>,
+    /// Declarative `WorkflowDag` to validate, compile, and execute.
+    #[serde(default)]
+    pub dag: Option<WorkflowDag>,
+    /// Optional inline NMR-STAR text for real `nmr-core` stage execution.
+    #[serde(default)]
+    pub star_text: Option<String>,
+    /// Optional inline TSV peak list for real `nmr-core` stage execution.
+    #[serde(default)]
+    pub peaks_tsv: Option<String>,
+    /// Optional inline NEF v1.1 text for real `nmr-core` stage execution.
+    #[serde(default)]
+    pub nef_text: Option<String>,
+    /// Optional inline 1-letter / FASTA sequence for real stage execution.
+    #[serde(default)]
+    pub sequence: Option<String>,
+    /// When `true`, runs deterministic dry-run after full manifest integrity verification.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// When `true` and no inline inputs are supplied, uses deterministic synthetic demo fixtures.
+    #[serde(default)]
+    pub use_demo_fixture: bool,
+    /// Explicit opt-in allowing synthetic peak/2D spectrum simulation from reference shifts
+    /// (defaults to `false`; stamps NEF, HTML, and trace with `[SIMULATION_DEMO: ...]`).
+    #[serde(default)]
+    pub allow_simulation_demo: bool,
+    /// Deterministic PRNG seed (defaults to 0).
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Optional bounded solver replica count (`1..=64`).
+    #[serde(default)]
+    pub max_runs: Option<usize>,
+    /// Optional bounded solver steps per spin system (`100..=4000`).
+    #[serde(default)]
+    pub max_steps_per_system: Option<usize>,
+}
+
 struct SharedState {
     storage_dir: PathBuf,
     inspect_root: Option<PathBuf>,
@@ -131,6 +182,7 @@ struct SharedState {
     jobs: Mutex<BTreeMap<String, JobRecord>>,
     job_order: Mutex<Vec<String>>,
     job_tx: Mutex<Option<mpsc::Sender<String>>>,
+    dag_caches: Mutex<BTreeMap<String, DagArtifactCache>>,
     next_id: AtomicU64,
     shutdown: AtomicBool,
 }
@@ -281,6 +333,7 @@ impl ServiceServer {
             jobs: Mutex::new(existing_jobs),
             job_order: Mutex::new(existing_order),
             job_tx: Mutex::new(Some(tx)),
+            dag_caches: Mutex::new(BTreeMap::new()),
             next_id: AtomicU64::new(max_num + 1),
             shutdown: AtomicBool::new(false),
         });
@@ -765,6 +818,39 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<SharedState>) -> Result<
             state,
             &cors_extra,
         ),
+        ("POST", "/api/v1/dag/validate") => {
+            if !is_json_content_type(&req.content_type) {
+                return write_json_error(
+                    &mut stream,
+                    415,
+                    "Unsupported Media Type",
+                    "POST /api/v1/dag/validate requires Content-Type: application/json",
+                );
+            }
+            handle_dag_validate(&mut stream, &req.body, &cors_extra)
+        }
+        ("POST", "/api/v1/dag/compile") => {
+            if !is_json_content_type(&req.content_type) {
+                return write_json_error(
+                    &mut stream,
+                    415,
+                    "Unsupported Media Type",
+                    "POST /api/v1/dag/compile requires Content-Type: application/json",
+                );
+            }
+            handle_dag_compile(&mut stream, &req.body, &cors_extra)
+        }
+        ("POST", "/api/v1/dag/run") => {
+            if !is_json_content_type(&req.content_type) {
+                return write_json_error(
+                    &mut stream,
+                    415,
+                    "Unsupported Media Type",
+                    "POST /api/v1/dag/run requires Content-Type: application/json",
+                );
+            }
+            handle_dag_run(&mut stream, &req.body, state, &cors_extra)
+        }
         ("POST", "/api/v1/jobs") => {
             if !is_json_content_type(&req.content_type) {
                 return write_json_error(
@@ -929,6 +1015,256 @@ fn handle_inspect(
             "InspectRequest must specify 'entries' (or 'path' when --inspect-root is enabled)",
         )
     }
+}
+
+fn parse_dag_request_body(body: &[u8]) -> Result<WorkflowDag, (u16, &'static str, String)> {
+    if body.is_empty() {
+        return Err((
+            400,
+            "Bad Request",
+            "request body must contain a WorkflowDag JSON object".to_string(),
+        ));
+    }
+    if body.len() > MAX_DAG_JSON_BYTES {
+        return Err((
+            413,
+            "Payload Too Large",
+            format!(
+                "DAG JSON body ({} bytes) exceeds maximum {} bytes",
+                body.len(),
+                MAX_DAG_JSON_BYTES
+            ),
+        ));
+    }
+    let text = std::str::from_utf8(body).map_err(|e| {
+        (
+            400,
+            "Bad Request",
+            format!("DAG JSON body is not valid UTF-8: {e}"),
+        )
+    })?;
+    #[derive(Deserialize)]
+    struct WrappedDag {
+        dag: WorkflowDag,
+    }
+    if let Ok(wrapped) = serde_json::from_str::<WrappedDag>(text) {
+        return Ok(wrapped.dag);
+    }
+    dag_from_json(text).map_err(|e| (400, "Bad Request", e.to_string()))
+}
+
+fn handle_dag_validate(
+    stream: &mut TcpStream,
+    body: &[u8],
+    cors_extra: &[(&str, &str)],
+) -> Result<(), String> {
+    let dag = match parse_dag_request_body(body) {
+        Ok(d) => d,
+        Err((code, status, msg)) => return write_json_error(stream, code, status, &msg),
+    };
+    #[derive(Serialize)]
+    struct ValidateResp {
+        valid: bool,
+        workflow_name: String,
+        node_count: usize,
+        edge_count: usize,
+        topological_order: Vec<String>,
+    }
+    match validate_dag(&dag) {
+        Ok(v) => write_json_with_headers(
+            stream,
+            200,
+            "OK",
+            cors_extra,
+            &ValidateResp {
+                valid: true,
+                workflow_name: dag.name,
+                node_count: dag.nodes.len(),
+                edge_count: dag.edges.len(),
+                topological_order: v.topological_order,
+            },
+        ),
+        Err(e) => write_json_error(stream, 400, "Bad Request", &e.to_string()),
+    }
+}
+
+fn handle_dag_compile(
+    stream: &mut TcpStream,
+    body: &[u8],
+    cors_extra: &[(&str, &str)],
+) -> Result<(), String> {
+    let dag = match parse_dag_request_body(body) {
+        Ok(d) => d,
+        Err((code, status, msg)) => return write_json_error(stream, code, status, &msg),
+    };
+    match compile_dag_manifest(&dag) {
+        Ok(manifest) => {
+            if let Err(e) = manifest_to_json(&manifest) {
+                return write_json_error(stream, 413, "Payload Too Large", &e.to_string());
+            }
+            write_json_with_headers(stream, 200, "OK", cors_extra, &manifest)
+        }
+        Err(e) => write_json_error(stream, 400, "Bad Request", &e.to_string()),
+    }
+}
+
+fn compute_dag_run_input_fingerprint(req: &DagRunRequest) -> String {
+    let mut material = String::new();
+    material.push_str(if req.dry_run { "dry=1;" } else { "dry=0;" });
+    material.push_str(if req.use_demo_fixture {
+        "demo=1;"
+    } else {
+        "demo=0;"
+    });
+    material.push_str(if req.allow_simulation_demo {
+        "allow_sim=1;"
+    } else {
+        "allow_sim=0;"
+    });
+    material.push_str(&format!("seed={};", req.seed.unwrap_or(0)));
+    material.push_str(&format!("runs={:?};", req.max_runs));
+    material.push_str(&format!("steps={:?};", req.max_steps_per_system));
+    for (tag, opt) in [
+        ("star", req.star_text.as_deref()),
+        ("peaks", req.peaks_tsv.as_deref()),
+        ("nef", req.nef_text.as_deref()),
+        ("seq", req.sequence.as_deref()),
+    ] {
+        if let Some(txt) = opt {
+            material.push_str(tag);
+            material.push('=');
+            material.push_str(&sha256_hex(txt.as_bytes()));
+            material.push(';');
+        }
+    }
+    sha256_hex(material.as_bytes())
+}
+
+fn handle_dag_run(
+    stream: &mut TcpStream,
+    body: &[u8],
+    state: &Arc<SharedState>,
+    cors_extra: &[(&str, &str)],
+) -> Result<(), String> {
+    if body.is_empty() {
+        return write_json_error(
+            stream,
+            400,
+            "Bad Request",
+            "POST /api/v1/dag/run requires a JSON DagRunRequest body",
+        );
+    }
+    if body.len() > MAX_DAG_RUN_HTTP_BODY_BYTES {
+        return write_json_error(
+            stream,
+            413,
+            "Payload Too Large",
+            &format!(
+                "DAG run request body ({} bytes) exceeds maximum {} bytes",
+                body.len(),
+                MAX_DAG_RUN_HTTP_BODY_BYTES
+            ),
+        );
+    }
+
+    let run_req: DagRunRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json_error(
+                stream,
+                400,
+                "Bad Request",
+                &format!("invalid JSON DagRunRequest: {e}"),
+            );
+        }
+    };
+
+    let manifest = if let Some(m) = run_req.manifest.clone() {
+        if let Err(e) = verify_dag_manifest(&m) {
+            return write_json_error(stream, 400, "Bad Request", &e.to_string());
+        }
+        m
+    } else if let Some(ref d) = run_req.dag {
+        match compile_dag_manifest(d) {
+            Ok(m) => m,
+            Err(e) => return write_json_error(stream, 400, "Bad Request", &e.to_string()),
+        }
+    } else {
+        return write_json_error(
+            stream,
+            400,
+            "Bad Request",
+            "DagRunRequest must specify either 'manifest' or 'dag'",
+        );
+    };
+
+    let fingerprint = compute_dag_run_input_fingerprint(&run_req);
+    let mut cache = state
+        .dag_caches
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&fingerprint).cloned())
+        .unwrap_or_default();
+
+    let resp_payload = if run_req.dry_run {
+        match execute_dag_manifest_dry_run(&manifest, &mut cache) {
+            Ok(trace) => serde_json::json!({
+                "trace": trace,
+                "artifacts": {},
+                "written_files": [],
+            }),
+            Err(e) => return write_json_error(stream, 400, "Bad Request", &e.to_string()),
+        }
+    } else {
+        let opts = DagRunOptions {
+            star_text: run_req.star_text.clone(),
+            peaks_tsv: run_req.peaks_tsv.clone(),
+            nef_text: run_req.nef_text.clone(),
+            sequence: run_req.sequence.clone(),
+            // Strictly in-memory over HTTP: never allow arbitrary host filesystem reads/writes.
+            data_root: None,
+            output_dir: None,
+            use_demo_fixture: run_req.use_demo_fixture,
+            allow_simulation_demo: run_req.allow_simulation_demo,
+            seed: run_req.seed.unwrap_or(0),
+            max_runs: run_req.max_runs.map(|v| v.clamp(1, 64)),
+            max_steps_per_system: run_req.max_steps_per_system.map(|v| v.clamp(100, 4000)),
+        };
+        match execute_dag_manifest_real(&manifest, &mut cache, &opts) {
+            Ok(out) => serde_json::json!({
+                "trace": out.trace,
+                "artifacts": out.artifacts,
+                "written_files": out.written_files,
+                "nef_text": out.nef_text,
+                "report_html": out.report_html,
+                "metrics": out.metrics_json,
+            }),
+            Err(e) => return write_json_error(stream, 400, "Bad Request", &e.to_string()),
+        }
+    };
+
+    // Persist bounded content-addressed cache bucket for deterministic incremental reuse.
+    if let Ok(mut caches) = state.dag_caches.lock() {
+        if cache.len() > MAX_SERVICE_DAG_CACHE_ENTRIES {
+            while cache.entries.len() > MAX_SERVICE_DAG_CACHE_ENTRIES {
+                let first_key = cache.entries.keys().next().cloned();
+                if let Some(k) = first_key {
+                    cache.entries.remove(&k);
+                } else {
+                    break;
+                }
+            }
+        }
+        if !caches.contains_key(&fingerprint) && caches.len() >= MAX_SERVICE_DAG_CACHE_BUCKETS {
+            let oldest = caches.keys().next().cloned();
+            if let Some(k) = oldest {
+                caches.remove(&k);
+            }
+        }
+        caches.insert(fingerprint, cache);
+    }
+
+    write_json_with_headers(stream, 200, "OK", cors_extra, &resp_payload)
 }
 
 fn handle_submit_job(
@@ -1877,3 +2213,324 @@ pollJobs();
 </body>
 </html>
 "##;
+
+#[cfg(test)]
+mod dag_service_tests {
+    use super::*;
+    use crate::nmrstar::read_star_str;
+    use crate::peaks::Peak;
+    use crate::simulate::{simulate, SimConfig};
+    use crate::workflow_dag::{
+        preset_backbone_assignment_dag, preset_dynamics_relax_cest_dag, preset_metabolomics_1d_dag,
+        DagEdge, DagNode, NodeKind, SIMULATION_DEMO_PROVENANCE_TAG,
+    };
+
+    fn format_peaks_tsv(peaks: &[Peak]) -> String {
+        let mut out = String::from("experiment\tH\tN\tC\tsign\theight\n");
+        for p in peaks {
+            let c_str =
+                p.c.map(|v| format!("{v:.4}"))
+                    .unwrap_or_else(|| ".".to_string());
+            let h_str = p
+                .height
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "100.0".to_string());
+            out.push_str(&format!(
+                "{}\t{:.4}\t{:.4}\t{c_str}\t{}\t{h_str}\n",
+                p.exp, p.h, p.n, p.sign
+            ));
+        }
+        out
+    }
+
+    fn http_post_json(
+        addr: SocketAddr,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).expect("connect to test service");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .expect("set read timeout");
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).expect("write head");
+        stream.write_all(body).expect("write body");
+        stream.flush().expect("flush");
+
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read response");
+        let full = String::from_utf8_lossy(&raw).into_owned();
+        let (hdr, resp_body) = full.split_once("\r\n\r\n").expect("valid HTTP response");
+        let status = hdr
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<u16>().ok())
+            .expect("HTTP status code");
+        (status, resp_body.to_string())
+    }
+
+    #[test]
+    fn test_service_dag_validate_compile_run_caching_and_integrity_rejection() {
+        let tmp =
+            std::env::temp_dir().join(format!("ferric_service_dag_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let mut handle =
+            spawn_background_server("127.0.0.1:0", tmp.clone()).expect("spawn test service");
+        let addr = handle.local_addr();
+
+        let bb_dag = preset_backbone_assignment_dag();
+        let bb_dag_json = serde_json::to_vec(&bb_dag).expect("serialize backbone DAG");
+
+        // 1. Content-Type enforcement (`415`)
+        let (status_415, _) =
+            http_post_json(addr, "/api/v1/dag/validate", "text/plain", &bb_dag_json);
+        assert_eq!(status_415, 415);
+
+        // 2. Oversized body cap enforcement (`413`)
+        let oversized = vec![b' '; MAX_DAG_JSON_BYTES + 16];
+        let (status_413, _) =
+            http_post_json(addr, "/api/v1/dag/validate", "application/json", &oversized);
+        assert_eq!(status_413, 413);
+
+        // 3. `/api/v1/dag/validate` valid & invalid DAG
+        let (st_val, body_val) = http_post_json(
+            addr,
+            "/api/v1/dag/validate",
+            "application/json",
+            &bb_dag_json,
+        );
+        assert_eq!(st_val, 200, "validate response: {body_val}");
+        let val_json: serde_json::Value = serde_json::from_str(&body_val).expect("parse validate");
+        assert_eq!(val_json["valid"], serde_json::Value::Bool(true));
+        assert_eq!(val_json["node_count"], serde_json::Value::from(5));
+
+        let bad_dag = WorkflowDag {
+            name: "TypeMismatch".to_string(),
+            description: String::new(),
+            nodes: vec![
+                DagNode::new("ingest", NodeKind::IngestBrukerVarian, "Ingest"),
+                DagNode::new("chem", NodeKind::MetabolomicsChemometrics, "Chem"),
+            ],
+            edges: vec![DagEdge::new("ingest", "raw_fid", "chem", "spectrum_1d")],
+        };
+        let (st_bad, _) = http_post_json(
+            addr,
+            "/api/v1/dag/validate",
+            "application/json",
+            &serde_json::to_vec(&bad_dag).expect("bad dag"),
+        );
+        assert_eq!(st_bad, 400);
+
+        // 4. `/api/v1/dag/compile` returns verified ferric-dag-v1 manifest
+        let (st_comp, body_comp) = http_post_json(
+            addr,
+            "/api/v1/dag/compile",
+            "application/json",
+            &bb_dag_json,
+        );
+        assert_eq!(st_comp, 200, "compile response: {body_comp}");
+        let manifest: DagManifest = serde_json::from_str(&body_comp).expect("parse manifest");
+        assert_eq!(manifest.schema, "ferric-dag-v1");
+
+        // 5a. `/api/v1/dag/run` with `star_text` alone and `allow_simulation_demo: false`
+        //     MUST fail closed (`400`) — never silently simulate peaks from reference shifts.
+        let silent_sim_req = DagRunRequest {
+            manifest: Some(manifest.clone()),
+            dag: None,
+            star_text: Some(EMBEDDED_UBIQUITIN_STAR.to_string()),
+            peaks_tsv: None,
+            nef_text: None,
+            sequence: None,
+            dry_run: false,
+            use_demo_fixture: false,
+            allow_simulation_demo: false,
+            seed: Some(0),
+            max_runs: Some(4),
+            max_steps_per_system: Some(250),
+        };
+        let (st_silent, body_silent) = http_post_json(
+            addr,
+            "/api/v1/dag/run",
+            "application/json",
+            &serde_json::to_vec(&silent_sim_req).expect("serialize silent sim req"),
+        );
+        assert_eq!(
+            st_silent, 400,
+            "ProcessFidNus without peaks or allow_simulation_demo must fail closed: {body_silent}"
+        );
+        assert!(
+            body_silent.contains("allow_simulation_demo"),
+            "expected allow_simulation_demo explanation, got: {body_silent}"
+        );
+
+        // 5b. `/api/v1/dag/run` with supplied measured peaks + sequence (no simulation demo),
+        //     called twice identically -> 100% idempotent (Probe d: BOTH return identical
+        //     non-null `nef_text`, `report_html`, `artifacts`, and `metrics`).
+        let ubq_ref = read_star_str(EMBEDDED_UBIQUITIN_STAR, None).expect("parse ubiquitin");
+        let (ubq_peaks, _) = simulate(&ubq_ref, &SimConfig::default());
+        let ubq_peaks_tsv = format_peaks_tsv(&ubq_peaks);
+        let run_req = DagRunRequest {
+            manifest: Some(manifest.clone()),
+            dag: None,
+            star_text: None,
+            peaks_tsv: Some(ubq_peaks_tsv),
+            nef_text: None,
+            sequence: Some(ubq_ref.one_letter()),
+            dry_run: false,
+            use_demo_fixture: false,
+            allow_simulation_demo: false,
+            seed: Some(0),
+            max_runs: Some(4),
+            max_steps_per_system: Some(250),
+        };
+        let run_body = serde_json::to_vec(&run_req).expect("serialize run req");
+        let (st_run1, body_run1) =
+            http_post_json(addr, "/api/v1/dag/run", "application/json", &run_body);
+        assert_eq!(st_run1, 200, "run 1 response: {body_run1}");
+        let r1: serde_json::Value = serde_json::from_str(&body_run1).expect("parse run 1");
+        assert_eq!(r1["trace"]["executed_count"], serde_json::Value::from(5));
+        assert_eq!(r1["trace"]["cache_hit_count"], serde_json::Value::from(0));
+        let nef1 = r1["nef_text"]
+            .as_str()
+            .expect("call 1 must return non-null nef_text");
+        assert!(nef1.contains("data_nef_"));
+        assert!(
+            !nef1.contains(SIMULATION_DEMO_PROVENANCE_TAG),
+            "measured-peaks run must NOT carry SIMULATION_DEMO tag"
+        );
+        assert!(r1["report_html"].as_str().is_some());
+        assert!(r1["metrics"]["n_assigned"].as_u64().unwrap_or(0) > 10);
+
+        let (st_run2, body_run2) =
+            http_post_json(addr, "/api/v1/dag/run", "application/json", &run_body);
+        assert_eq!(st_run2, 200, "run 2 response: {body_run2}");
+        let r2: serde_json::Value = serde_json::from_str(&body_run2).expect("parse run 2");
+        assert_eq!(r2["trace"]["executed_count"], serde_json::Value::from(0));
+        assert_eq!(r2["trace"]["cache_hit_count"], serde_json::Value::from(5));
+        assert_eq!(
+            r2["nef_text"], r1["nef_text"],
+            "repeat POST /api/v1/dag/run must return identical non-null nef_text"
+        );
+        assert_eq!(
+            r2["report_html"], r1["report_html"],
+            "repeat POST /api/v1/dag/run must return identical non-null report_html"
+        );
+        assert_eq!(
+            r2["artifacts"], r1["artifacts"],
+            "repeat POST /api/v1/dag/run must return identical artifacts"
+        );
+        assert_eq!(
+            r2["metrics"], r1["metrics"],
+            "repeat POST /api/v1/dag/run must return identical metrics"
+        );
+
+        // 5c. `/api/v1/dag/run` with `allow_simulation_demo: true` stamps NEF, HTML, and trace,
+        //     and is also 100% idempotent on repeat calls.
+        let demo_req = DagRunRequest {
+            manifest: Some(manifest.clone()),
+            allow_simulation_demo: true,
+            use_demo_fixture: true,
+            seed: Some(0),
+            max_runs: Some(4),
+            max_steps_per_system: Some(250),
+            ..DagRunRequest::default()
+        };
+        let demo_body = serde_json::to_vec(&demo_req).expect("serialize demo req");
+        let (st_d1, body_d1) =
+            http_post_json(addr, "/api/v1/dag/run", "application/json", &demo_body);
+        assert_eq!(st_d1, 200, "demo 1 response: {body_d1}");
+        let d1: serde_json::Value = serde_json::from_str(&body_d1).expect("parse demo 1");
+        assert!(d1["nef_text"]
+            .as_str()
+            .is_some_and(|s| s.contains(SIMULATION_DEMO_PROVENANCE_TAG)));
+        assert!(d1["report_html"]
+            .as_str()
+            .is_some_and(|s| s.contains(SIMULATION_DEMO_PROVENANCE_TAG)));
+        let (st_d2, body_d2) =
+            http_post_json(addr, "/api/v1/dag/run", "application/json", &demo_body);
+        assert_eq!(st_d2, 200, "demo 2 response: {body_d2}");
+        let d2: serde_json::Value = serde_json::from_str(&body_d2).expect("parse demo 2");
+        assert_eq!(d2["trace"]["executed_count"], serde_json::Value::from(0));
+        assert_eq!(d2["trace"]["cache_hit_count"], serde_json::Value::from(5));
+        assert_eq!(d2["nef_text"], d1["nef_text"]);
+        assert_eq!(d2["artifacts"], d1["artifacts"]);
+
+        // 6. `/api/v1/dag/run` rejects tampered manifest (reversed nodes + forged node_sha256)
+        let mut forged = manifest.clone();
+        forged.nodes.reverse();
+        for n in &mut forged.nodes {
+            n.node_sha256 = "forged".to_string();
+        }
+        let forged_req = DagRunRequest {
+            manifest: Some(forged),
+            dry_run: true,
+            ..DagRunRequest::default()
+        };
+        let (st_forged, body_forged) = http_post_json(
+            addr,
+            "/api/v1/dag/run",
+            "application/json",
+            &serde_json::to_vec(&forged_req).expect("serialize forged req"),
+        );
+        assert_eq!(st_forged, 400, "forged manifest must return 400");
+        assert!(
+            body_forged.contains("Manifest integrity mismatch"),
+            "expected integrity mismatch error, got: {body_forged}"
+        );
+
+        // 6b. `/api/v1/dag/run` fails closed (`400`) on non-wired stages (`dynamics` preset)
+        let dyn_req = DagRunRequest {
+            dag: Some(preset_dynamics_relax_cest_dag()),
+            allow_simulation_demo: true,
+            use_demo_fixture: true,
+            dry_run: false,
+            ..DagRunRequest::default()
+        };
+        let (st_dyn, body_dyn) = http_post_json(
+            addr,
+            "/api/v1/dag/run",
+            "application/json",
+            &serde_json::to_vec(&dyn_req).expect("serialize dyn req"),
+        );
+        assert_eq!(
+            st_dyn, 400,
+            "non-executable dynamics stage must fail closed"
+        );
+        assert!(
+            body_dyn.contains("not executable"),
+            "expected not executable error, got: {body_dyn}"
+        );
+
+        // 7. `/api/v1/dag/run` real metabolomics demo execution + idempotent cache hit
+        let metab_req = DagRunRequest {
+            dag: Some(preset_metabolomics_1d_dag()),
+            use_demo_fixture: true,
+            allow_simulation_demo: true,
+            seed: Some(7),
+            ..DagRunRequest::default()
+        };
+        let metab_body = serde_json::to_vec(&metab_req).expect("serialize metab req");
+        let (st_metab, body_metab) =
+            http_post_json(addr, "/api/v1/dag/run", "application/json", &metab_body);
+        assert_eq!(st_metab, 200, "metab response: {body_metab}");
+        let rm: serde_json::Value = serde_json::from_str(&body_metab).expect("parse metab");
+        assert_eq!(rm["trace"]["executed_count"], serde_json::Value::from(4));
+        assert!(rm["metrics"]["n_samples"].as_u64().unwrap_or(0) >= 8);
+        let (st_metab2, body_metab2) =
+            http_post_json(addr, "/api/v1/dag/run", "application/json", &metab_body);
+        assert_eq!(st_metab2, 200, "metab 2 response: {body_metab2}");
+        let rm2: serde_json::Value = serde_json::from_str(&body_metab2).expect("parse metab 2");
+        assert_eq!(rm2["trace"]["executed_count"], serde_json::Value::from(0));
+        assert_eq!(rm2["trace"]["cache_hit_count"], serde_json::Value::from(4));
+        assert_eq!(rm2["artifacts"], rm["artifacts"]);
+        assert_eq!(rm2["metrics"], rm["metrics"]);
+
+        handle.shutdown();
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
