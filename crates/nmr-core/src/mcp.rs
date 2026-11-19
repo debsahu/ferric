@@ -42,7 +42,8 @@
 //!   12352–12360); Kass, R. E. & Raftery, A. E. (*J. Am. Stat. Assoc.* 1995, 90, 773–795) —
 //!   Phase 21 AlphaFold concordance, 3D shift prediction, co-fold pose scoring, and excited states.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
@@ -77,7 +78,7 @@ use crate::dosy::{
     SoluteCompactnessClass, VarianDosyOverrides, ILT_ARTIFACT_CAVEAT,
 };
 use crate::excited_state::{
-    classify_excited_state_with_firewall, parse_exchange_observations_tsv_with_meta,
+    classify_excited_state_with_controls, parse_exchange_observations_tsv_with_meta,
     AltConformerInput, ExcitedStateConfig, MAX_ALT_STRUCTURES,
 };
 use crate::metabolomics::{
@@ -637,7 +638,12 @@ impl McpSecurityPolicy {
     pub fn relativize_display_path(&self, resolved: &Path) -> String {
         for (idx, root) in self.allowed_roots.iter().enumerate() {
             if let Ok(rel) = resolved.strip_prefix(root) {
-                let rel_str = path_to_forward_slashes(rel);
+                let raw_rel = path_to_forward_slashes(rel);
+                let rel_str = if raw_rel.is_empty() {
+                    raw_rel
+                } else {
+                    sanitize_untrusted_path_label(&raw_rel)
+                };
                 let label = if rel_str.is_empty() { "." } else { &rel_str };
                 return if self.allowed_roots.len() == 1 {
                     label.to_string()
@@ -649,8 +655,8 @@ impl McpSecurityPolicy {
         resolved
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or(".")
-            .to_string()
+            .map(sanitize_untrusted_path_label)
+            .unwrap_or_else(|| ".".to_string())
     }
 
     fn resolve_internal(
@@ -945,6 +951,247 @@ fn truncate_printable_ascii(raw: &str, max_chars: usize) -> String {
         format!("{}...", &trimmed[..max_chars - 3])
     } else {
         trimmed[..max_chars].to_string()
+    }
+}
+
+/// Static placeholder substituted for any untrusted (file-, directory- or header-derived) string
+/// that fails the MCP output allowlist, so attacker-controlled content never reaches LLM context.
+pub const MCP_NON_CONFORMING_PLACEHOLDER: &str = "<non-conforming>";
+
+/// Maximum length of an untrusted identifier (pulse program, residue/atom/chain label, sample id)
+/// that may be echoed verbatim in MCP tool output (`64`).
+pub const MAX_MCP_UNTRUSTED_LABEL_CHARS: usize = 64;
+
+/// Maximum length of one untrusted path component (file or directory name) echoed in MCP output.
+pub const MAX_MCP_UNTRUSTED_PATH_COMPONENT_CHARS: usize = 64;
+
+/// Allowlist check for an untrusted identifier: `^[A-Za-z0-9_.+*-]{1,64}$` (`*` admits IUPAC
+/// pseudo-atoms such as `HD1*`). No whitespace, quotes, brackets, control or non-ASCII characters.
+pub fn is_conforming_untrusted_label(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= MAX_MCP_UNTRUSTED_LABEL_CHARS
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'*' | b'-'))
+}
+
+/// Return `raw` (trimmed) when it passes [`is_conforming_untrusted_label`], else
+/// [`MCP_NON_CONFORMING_PLACEHOLDER`].
+pub fn sanitize_untrusted_label(raw: &str) -> String {
+    let t = raw.trim();
+    if is_conforming_untrusted_label(t) {
+        t.to_string()
+    } else {
+        MCP_NON_CONFORMING_PLACEHOLDER.to_string()
+    }
+}
+
+/// Allowlist-validate a Bruker / Varian pulse program name: one pair of enclosing Bruker `<...>`
+/// brackets is stripped, then the name must match `^[A-Za-z0-9_.+-]{1,64}$`; otherwise
+/// [`MCP_NON_CONFORMING_PLACEHOLDER`] is returned.
+pub fn sanitize_untrusted_pulse_program_name(raw: &str) -> String {
+    let t = raw.trim();
+    let inner = t
+        .strip_prefix('<')
+        .and_then(|x| x.strip_suffix('>'))
+        .unwrap_or(t)
+        .trim();
+    let ok = !inner.is_empty()
+        && inner.len() <= MAX_MCP_UNTRUSTED_LABEL_CHARS
+        && inner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-'));
+    if ok {
+        inner.to_string()
+    } else {
+        MCP_NON_CONFORMING_PLACEHOLDER.to_string()
+    }
+}
+
+fn is_conforming_path_component(comp: &str) -> bool {
+    !comp.is_empty()
+        && comp.len() <= MAX_MCP_UNTRUSTED_PATH_COMPONENT_CHARS
+        && comp
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-'))
+}
+
+/// Sanitize a `/`-separated workspace-relative display path: every component must match
+/// `^[A-Za-z0-9_.+-]{1,64}$`, otherwise that component is replaced by
+/// [`MCP_NON_CONFORMING_PLACEHOLDER`] (file and directory names are attacker-controllable).
+pub fn sanitize_untrusted_path_label(raw: &str) -> String {
+    if raw.is_empty() {
+        return MCP_NON_CONFORMING_PLACEHOLDER.to_string();
+    }
+    raw.split('/')
+        .map(|comp| {
+            if is_conforming_path_component(comp) {
+                comp
+            } else {
+                MCP_NON_CONFORMING_PLACEHOLDER
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Characters that are never echoed in MCP tool output: C0/C1 controls other than `\n` / `\t`,
+/// Unicode bidirectional overrides/isolates, zero-width and other format (`Cf`) characters, and
+/// line/paragraph separators.
+fn is_forbidden_output_char(ch: char) -> bool {
+    (ch.is_control() && ch != '\n' && ch != '\t')
+        || matches!(
+            ch,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+        )
+}
+
+/// Per-`tools/call` registry of untrusted strings parsed from workspace files (residue / atom /
+/// chain labels, sample ids, pulse program names, file names, header fields) that FAIL the
+/// identifier allowlist. Every registered value is scrubbed from the success-path output before
+/// it is returned, including occurrences embedded inside server-generated prose (warnings,
+/// reasons, reports).
+#[derive(Clone, Debug, Default)]
+struct UntrustedTaintSet {
+    values: BTreeSet<String>,
+}
+
+/// Object keys in parsed-input structs that hold server/parser-generated prose (never harvested
+/// as taint; their embedded untrusted substrings are scrubbed via the other harvested fields).
+const TAINT_HARVEST_SKIP_KEYS: &[&str] = &[
+    "diagnostics",
+    "warnings",
+    "processing_warnings",
+    "notes",
+    "caveat",
+    "coord_text",
+    "message",
+    "summary",
+    "missing_input_hints",
+];
+
+impl UntrustedTaintSet {
+    fn add(&mut self, raw: &str) {
+        let t = raw.trim();
+        if !t.is_empty() && !is_conforming_untrusted_label(t) {
+            self.values.insert(t.to_string());
+            if t.len() != raw.len() {
+                self.values.insert(raw.to_string());
+            }
+        }
+    }
+
+    fn add_path_components(&mut self, raw: &str) {
+        for comp in raw.split(['/', '\\']) {
+            if !comp.is_empty() && !is_conforming_path_component(comp) {
+                self.values.insert(comp.to_string());
+                self.add(comp);
+            }
+        }
+    }
+
+    fn harvest_value(&mut self, v: &Value) {
+        match v {
+            Value::String(s) => self.add(s),
+            Value::Array(a) => a.iter().for_each(|x| self.harvest_value(x)),
+            Value::Object(m) => {
+                for (k, x) in m {
+                    self.add(k);
+                    if !TAINT_HARVEST_SKIP_KEYS.contains(&k.as_str()) {
+                        self.harvest_value(x);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scrub_string(&self, s: &str) -> String {
+        if s.chars().any(is_forbidden_output_char) {
+            return MCP_NON_CONFORMING_PLACEHOLDER.to_string();
+        }
+        // Any string passing the identifier allowlist cannot contain a non-conforming taint
+        // (taints fail the allowlist through a disallowed character or by exceeding 64 chars).
+        if is_conforming_untrusted_label(s) || self.values.is_empty() {
+            return s.to_string();
+        }
+        if self.values.contains(s) || self.values.contains(s.trim()) {
+            return MCP_NON_CONFORMING_PLACEHOLDER.to_string();
+        }
+        let mut out = s.to_string();
+        // Longest taints first so overlapping prefixes are removed in full.
+        let mut ordered: Vec<&String> = self
+            .values
+            .iter()
+            .filter(|t| t.chars().count() >= 3)
+            .collect();
+        ordered.sort_by_key(|t| std::cmp::Reverse(t.len()));
+        for t in ordered {
+            if out.contains(t.as_str()) {
+                out = out.replace(t.as_str(), MCP_NON_CONFORMING_PLACEHOLDER);
+            }
+        }
+        out
+    }
+
+    fn scrub_value(&self, v: &mut Value) {
+        match v {
+            Value::String(s) => {
+                let cleaned = self.scrub_string(s);
+                if cleaned != *s {
+                    *s = cleaned;
+                }
+            }
+            Value::Array(a) => a.iter_mut().for_each(|x| self.scrub_value(x)),
+            Value::Object(m) => {
+                let old = std::mem::take(m);
+                for (k, mut x) in old {
+                    self.scrub_value(&mut x);
+                    let mut nk = self.scrub_string(&k);
+                    if nk != k {
+                        let base = nk.clone();
+                        let mut n = 2usize;
+                        while m.contains_key(&nk) {
+                            nk = format!("{base}#{n}");
+                            n += 1;
+                        }
+                    }
+                    m.insert(nk, x);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Scrub a successful `tools/call` result: remove every registered untrusted string and every
+/// forbidden control/bidi/format character from `structuredContent`, then re-render the JSON text
+/// content block from the scrubbed payload so both views stay consistent.
+fn scrub_untrusted_tool_output(result: &mut McpCallToolResult, taint: &UntrustedTaintSet) {
+    let Some(sc) = result.structured_content.as_mut() else {
+        return;
+    };
+    let original_pretty = serde_json::to_string_pretty(sc).ok();
+    taint.scrub_value(sc);
+    let new_pretty = serde_json::to_string_pretty(sc).ok();
+    for block in &mut result.content {
+        if let McpContentBlock::Text { text } = block {
+            if original_pretty.as_deref() == Some(text.as_str()) {
+                if let Some(ref np) = new_pretty {
+                    *text = np.clone();
+                }
+            } else {
+                *text = taint.scrub_string(text);
+            }
+        }
     }
 }
 
@@ -1449,6 +1696,8 @@ pub struct McpServer {
     negotiated_protocol_version: String,
     client_name: Option<String>,
     test_panic_probe_enabled: bool,
+    /// Untrusted strings harvested from workspace inputs during the current `tools/call`.
+    untrusted_taint: RefCell<UntrustedTaintSet>,
 }
 
 impl McpServer {
@@ -1459,6 +1708,36 @@ impl McpServer {
             negotiated_protocol_version: MCP_PROTOCOL_VERSION.to_string(),
             client_name: None,
             test_panic_probe_enabled: false,
+            untrusted_taint: RefCell::new(UntrustedTaintSet::default()),
+        }
+    }
+
+    /// Register one untrusted, file-derived string for success-path output scrubbing.
+    fn taint(&self, raw: &str) {
+        self.untrusted_taint.borrow_mut().add(raw);
+    }
+
+    /// Register every non-conforming component of an untrusted (workspace file/directory) path.
+    fn taint_path(&self, raw: &str) {
+        self.untrusted_taint.borrow_mut().add_path_components(raw);
+    }
+
+    /// Register every string leaf / map key of a parsed (attacker-controllable) input structure,
+    /// skipping parser-generated prose fields ([`TAINT_HARVEST_SKIP_KEYS`]).
+    fn taint_serialized<T: Serialize>(&self, parsed: &T) {
+        if let Ok(v) = serde_json::to_value(parsed) {
+            self.untrusted_taint.borrow_mut().harvest_value(&v);
+        }
+    }
+
+    /// Register residue names and shift atom names of a parsed NMR-STAR / NEF reference.
+    fn taint_reference(&self, r: &Reference) {
+        let mut t = self.untrusted_taint.borrow_mut();
+        for rn in &r.sequence {
+            t.add(rn);
+        }
+        for (_, atom) in r.shifts.keys().chain(r.ambiguity_codes.keys()) {
+            t.add(atom);
         }
     }
 
@@ -1758,6 +2037,7 @@ impl McpServer {
             });
         }
 
+        self.untrusted_taint.replace(UntrustedTaintSet::default());
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match name {
             "inspect_nmr_directory" => self.tool_inspect_nmr_directory(&args_map),
             "read_nmrstar_summary" => self.tool_read_nmrstar_summary(&args_map),
@@ -1781,13 +2061,18 @@ impl McpServer {
             _ => McpCallToolResult::domain_error("invalid_arguments", "unknown MCP tool"),
         }));
 
-        let result = match caught {
+        let mut result = match caught {
             Ok(res) => res,
             Err(_) => McpCallToolResult::domain_error(
                 "internal_tool_panic",
                 format!("internal panic caught while executing MCP tool '{name}'; server state preserved"),
             ),
         };
+        // `21F:B9`: success paths never echo attacker-controlled workspace strings verbatim.
+        let taint = self.untrusted_taint.replace(UntrustedTaintSet::default());
+        if result.is_error != Some(true) {
+            scrub_untrusted_tool_output(&mut result, &taint);
+        }
 
         serde_json::to_value(result).map_err(|e| JsonRpcError {
             code: ERR_INTERNAL_ERROR,
@@ -2118,34 +2403,106 @@ impl McpServer {
             }
         };
 
+        // `21F:B9`: every directory/file name, `##$PULPROG=`, `##TITLE=` and axis label below is
+        // attacker-controllable workspace content. Register the raw values as taint (so they are
+        // also scrubbed from any prose warnings/notes) and emit allowlisted forms only.
+        self.taint_path(&inventory.root_name);
+        let experiments_json: Vec<Value> = inventory
+            .experiments
+            .iter()
+            .map(|exp| {
+                self.taint_path(&exp.relative_path);
+                self.taint_path(&exp.display_name);
+                if let Some(ref pp) = exp.pulse_program {
+                    self.taint(pp);
+                }
+                if let Some(ref t) = exp.title {
+                    self.taint(t);
+                }
+                let axes: Vec<Value> = exp
+                    .axes
+                    .iter()
+                    .map(|ax| {
+                        self.taint(&ax.label);
+                        self.taint(&ax.nucleus);
+                        json!({
+                            "label": sanitize_untrusted_label(&ax.label),
+                            "nucleus": sanitize_untrusted_label(&ax.nucleus),
+                            "points": ax.points,
+                            "sw_ppm": ax.sw_ppm,
+                            "carrier_ppm": ax.carrier_ppm,
+                            "obs_mhz": ax.obs_mhz,
+                            "quadrature": ax.quadrature,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "relative_path": sanitize_untrusted_path_label(&exp.relative_path),
+                    "display_name": sanitize_untrusted_path_label(&exp.display_name),
+                    "vendor": exp.vendor,
+                    "dimensionality": exp.dimensionality,
+                    "data_state": exp.data_state,
+                    "spectrometer_mhz": exp.spectrometer_mhz,
+                    "axes": axes,
+                    "quadrature_badge": exp.quadrature_badge,
+                    "nus": exp.nus,
+                    "pulse_class": exp.pulse_class,
+                    "pulse_program": exp.pulse_program.as_deref().map(sanitize_untrusted_pulse_program_name),
+                    "title": exp.title.as_deref().map(sanitize_untrusted_label),
+                    "raw_signal_bytes": exp.raw_signal_bytes,
+                    "processed_bytes": exp.processed_bytes,
+                    "selected_by_default": exp.selected_by_default,
+                    "notes": exp.notes,
+                })
+            })
+            .collect();
+        let auxiliary_json: Vec<Value> = inventory
+            .auxiliary_files
+            .iter()
+            .map(|aux| {
+                self.taint_path(&aux.relative_path);
+                json!({
+                    "relative_path": sanitize_untrusted_path_label(&aux.relative_path),
+                    "vendor": aux.vendor,
+                    "total_bytes": aux.total_bytes,
+                    "summary": aux.summary,
+                })
+            })
+            .collect();
+
         let mut pulprog_reports = Vec::new();
+        let mut report_for = |rel: &str,
+                              interp: &crate::pulprog::PulprogInterpretation,
+                              full: bool| {
+            // Harvest everything parsed from `acqus` / `pulseprogram` (defines, includes, shapes,
+            // CPD programs, nuclei) except the interpreter's own prose warnings.
+            self.taint_serialized(interp);
+            self.taint(&interp.pulse_program_name);
+            let mut row = json!({
+                "relative_path": sanitize_untrusted_path_label(rel),
+                "vendor": interp.vendor,
+                "pulse_program": sanitize_untrusted_pulse_program_name(&interp.pulse_program_name),
+                "dimensionality": interp.dimensionality,
+                "pseudo_3d_order": interp.pseudo_3d_order,
+                "pseudo_3d_list_kind": interp.pseudo_3d_list_kind.as_deref().map(sanitize_untrusted_label),
+                "warnings": interp.warnings,
+            });
+            if full {
+                row["transfer_graph"] = json!(interp.transfer_graph);
+            } else {
+                row["deduced_family"] = json!(interp.transfer_graph.deduced_family);
+            }
+            pulprog_reports.push(row);
+        };
         if decode_pulprog && resolved.is_dir() {
             if let Ok(interp) = interpret_experiment_dir(&resolved) {
-                pulprog_reports.push(json!({
-                    "relative_path": ".",
-                    "vendor": interp.vendor,
-                    "pulse_program": interp.pulse_program_name,
-                    "dimensionality": interp.dimensionality,
-                    "pseudo_3d_order": interp.pseudo_3d_order,
-                    "pseudo_3d_list_kind": interp.pseudo_3d_list_kind,
-                    "transfer_graph": interp.transfer_graph,
-                    "warnings": interp.warnings,
-                }));
+                report_for(".", &interp, true);
             } else {
                 for exp in inventory.experiments.iter().take(16) {
                     let sub = resolved.join(&exp.relative_path);
                     if sub.is_dir() {
                         if let Ok(interp) = interpret_experiment_dir(&sub) {
-                            pulprog_reports.push(json!({
-                                "relative_path": exp.relative_path,
-                                "vendor": interp.vendor,
-                                "pulse_program": interp.pulse_program_name,
-                                "dimensionality": interp.dimensionality,
-                                "pseudo_3d_order": interp.pseudo_3d_order,
-                                "pseudo_3d_list_kind": interp.pseudo_3d_list_kind,
-                                "deduced_family": interp.transfer_graph.deduced_family,
-                                "warnings": interp.warnings,
-                            }));
+                            report_for(&exp.relative_path, &interp, false);
                         }
                     }
                 }
@@ -2154,12 +2511,12 @@ impl McpServer {
 
         McpCallToolResult::ok_json(&json!({
             "workspace_path": self.policy.relativize_display_path(&resolved),
-            "root_name": inventory.root_name,
+            "root_name": sanitize_untrusted_path_label(&inventory.root_name),
             "problem_regime": inventory.problem_regime,
             "secondary_regimes": inventory.secondary_regimes,
             "experiment_count": inventory.experiments.len(),
-            "experiments": inventory.experiments,
-            "auxiliary_files": inventory.auxiliary_files,
+            "experiments": experiments_json,
+            "auxiliary_files": auxiliary_json,
             "missing_input_hints": inventory.missing_input_hints,
             "pulprog_interpretations": pulprog_reports,
         }))
@@ -2198,6 +2555,7 @@ impl McpServer {
             }
         };
 
+        self.taint_reference(&ref_data);
         let n_res = ref_data.sequence.len();
         let n_prolines = ref_data.sequence.iter().filter(|r| *r == "PRO").count();
         let n_assignable_amides = (1..n_res)
@@ -2451,6 +2809,9 @@ impl McpServer {
             );
         };
 
+        for rn in &seq3 {
+            self.taint(rn);
+        }
         let systems = match build_spin_systems(&peaks, &Tolerances::default(), 3, false) {
             Ok(s) => s,
             Err(e) => {
@@ -2578,6 +2939,7 @@ impl McpServer {
             }
         };
 
+        self.taint_reference(&shifts);
         let parse_str_list = |key: &str| -> Vec<String> {
             args.get(key)
                 .and_then(Value::as_array)
@@ -2911,6 +3273,7 @@ impl McpServer {
             }
         }
 
+        self.taint_reference(&ref_data);
         if let Some(parent) = resolved_out.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
                 return McpCallToolResult::domain_error(
@@ -3034,6 +3397,7 @@ impl McpServer {
                         }
                     }
                 };
+                self.taint_serialized(&ds);
                 let mc_replicates = args
                     .get("mc_replicates")
                     .and_then(Value::as_u64)
@@ -3113,6 +3477,7 @@ impl McpServer {
                         }
                     }
                 }
+                self.taint_serialized(&profiles);
                 let compute_chi2_surface = args
                     .get("compute_chi2_surface")
                     .and_then(Value::as_bool)
@@ -3181,6 +3546,7 @@ impl McpServer {
                     },
                     None => CpmgModel::Baldwin2014,
                 };
+                self.taint_serialized(&series);
                 let cfg = CpmgFitConfig {
                     model,
                     ..CpmgFitConfig::default()
@@ -3258,6 +3624,7 @@ impl McpServer {
                         );
                     }
                 };
+                self.taint_reference(&ref_data);
                 let mut out = Vec::new();
                 for (res_idx, res_name) in ref_data.sequence.iter().enumerate() {
                     if nucleus_mode == "amide" && res_name == "PRO" {
@@ -3330,6 +3697,7 @@ impl McpServer {
                 "zero assigned apo peaks extracted from reference file",
             );
         }
+        self.taint_serialized(&apo_peaks);
 
         let Some(steps_arr) = args.get("steps").and_then(Value::as_array) else {
             return McpCallToolResult::domain_error(
@@ -3521,6 +3889,10 @@ impl McpServer {
             }
         };
 
+        self.taint(&spec.name);
+        if let Some(ref file_solvent) = spec.solvent {
+            self.taint(file_solvent);
+        }
         let solvent_opt = args
             .get("solvent")
             .and_then(Value::as_str)
@@ -3762,6 +4134,7 @@ impl McpServer {
                     );
                 }
             };
+            self.taint_serialized(&exp_params);
             return McpCallToolResult::ok_json(&json!({
                 "path": self.policy.relativize_display_path(&resolved),
                 "mode": "directory_schedule",
@@ -3803,6 +4176,9 @@ impl McpServer {
                 "invalid_arguments",
                 "DOSY JSON dataset contains zero peak decay traces",
             );
+        }
+        for pk in &parsed.peaks {
+            self.taint(&pk.label);
         }
 
         let max_components = args
@@ -3939,6 +4315,17 @@ impl McpServer {
             Ok(s) => s,
             Err(err_res) => return err_res,
         };
+        for smp in &samples {
+            self.taint(&smp.id);
+            self.taint(&smp.group);
+            self.taint(&smp.spectrum.name);
+            if let Some(ref solv) = smp.spectrum.solvent {
+                self.taint(solv);
+            }
+            for cov in smp.covariates.keys() {
+                self.taint(cov);
+            }
+        }
         if samples.len() < 4 {
             return McpCallToolResult::domain_error(
                 "invalid_arguments",
@@ -4212,6 +4599,7 @@ impl McpServer {
             let sample_id = cols[0];
             let group = cols[1];
             let raw_spec_path = cols[2];
+            self.taint_path(raw_spec_path);
 
             // Validate lexical components directly on the manifest entry first so `..` or credential
             // segments inside a manifest are always caught even when joined with `parent_dir`.
@@ -4288,6 +4676,7 @@ impl McpServer {
                 )
             })?
         };
+        self.taint_reference(&shifts);
         Ok((resolved, shifts))
     }
 
@@ -4530,6 +4919,8 @@ impl McpServer {
             firewall_max_seq_identity: max_seq_id,
         };
 
+        self.taint_serialized(&af_model);
+        self.taint_serialized(&s2_opt);
         let report = match evaluate_af_nmr_concordance(
             &af_model,
             &shifts,
@@ -4682,6 +5073,7 @@ impl McpServer {
             ..StructShiftConfig::default()
         };
 
+        self.taint_serialized(&model);
         let report = match predict_structure_shifts_with_firewall(&model, &query, &cfg) {
             Ok(r) => r,
             Err(e) => {
@@ -4918,6 +5310,7 @@ impl McpServer {
             };
             score_cfg.apo_receptor_coord_text = Some(txt);
             score_cfg.apo_receptor_format_hint = ext;
+            self.taint_serialized(&model);
             raw_input.apo_receptor_model = Some(model);
         }
 
@@ -5115,6 +5508,11 @@ impl McpServer {
             }
         }
 
+        for pose in &poses {
+            self.taint(&pose.pose_id);
+            self.taint_serialized(pose);
+        }
+        self.taint_serialized(&bundle);
         let report = match score_cofold_poses(&poses, &bundle, &score_cfg) {
             Ok(r) => r,
             Err(e) => {
@@ -5246,10 +5644,7 @@ impl McpServer {
                     Err(e) => {
                         return McpCallToolResult::domain_error(
                             "alt_structure_parse_error",
-                            format!(
-                                "'{rel_lbl}': {}",
-                                structured_parse_error("alt_structure_parse_error", &e)
-                            ),
+                            structured_parse_error("alt_structure_parse_error", &e),
                         );
                     }
                 };
@@ -5324,11 +5719,17 @@ impl McpServer {
             ..ExcitedStateConfig::default()
         };
 
+        self.taint_serialized(&parsed_exch);
+        self.taint_serialized(&ground_structure);
+        for alt in &alt_conformers {
+            self.taint_serialized(&alt.model);
+        }
         let ground_shifts_ref = shifts_opt.as_ref().map(|(_, r)| r);
-        let report = match classify_excited_state_with_firewall(
+        let report = match classify_excited_state_with_controls(
             ground_shifts_ref,
             &ground_structure,
             &parsed_exch.observations,
+            &parsed_exch.control_observations,
             &alt_conformers,
             &query,
             &cfg,
@@ -7375,7 +7776,7 @@ fn builtin_tool_descriptors() -> Vec<McpToolDescriptor> {
                     },
                     "exchange_path": {
                         "type": "string",
-                        "description": "Sandboxed workspace path to the CEST / CPMG / R1rho differential shift TSV."
+                        "description": "Sandboxed workspace path to the CEST / CPMG / R1rho differential shift TSV. Optional site_role column: rows tagged 'control' are non-exchanging reference sites (expected dw = 0) whose chi^2 calibrates dw_err_ppm. Atoms outside the supported nucleus set are rejected."
                     },
                     "alt_structure_paths": {
                         "type": "array",

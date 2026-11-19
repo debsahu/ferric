@@ -887,12 +887,24 @@ fn test_fix2_b19_cli_emits_error_scale_warning_on_misestimated_noise() {
 
     let rep: ExcitedStateReport =
         serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+    // FIX3 (21F:B19): 3x under-stated errors MUST NOT be reported as a confident
+    // `UnmodeledSignificantExchange` call; the run abstains as `ErrorScaleInconsistent`.
     assert_eq!(
         rep.abstention_kind,
-        Some(ExcitedStateAbstentionKind::UnmodeledSignificantExchange)
+        Some(ExcitedStateAbstentionKind::ErrorScaleInconsistent),
+        "reason: {}",
+        rep.verdict_reason
     );
+    assert!(!rep.verdict.is_committed());
+    assert!(rep.verdict_reason.starts_with("ErrorScaleInconsistent:"));
     assert!(rep.error_scale_warning.is_some());
-    assert!(rep.chi2_consistency_diagnostic.is_some());
+    let diag = rep
+        .chi2_consistency_diagnostic
+        .as_ref()
+        .expect("diagnostic");
+    assert!(diag.error_scale_inconsistent);
+    assert!((diag.confidence_level - 0.99).abs() < 1e-12);
+    assert!(stdout_tsv.contains("error_scale_inconsistent=true"));
 
     // 2. `-o <file>` summary mode MUST print the error-scale warning to stdout!
     let out_file = tmp.path.join("out.tsv");
@@ -915,5 +927,110 @@ fn test_fix2_b19_cli_emits_error_scale_warning_on_misestimated_noise() {
     assert!(
         stdout_summary.contains("Warning: Error-scale / chi^2 consistency diagnostic:"),
         "-o summary stdout missing Warning line:\n{stdout_summary}"
+    );
+}
+
+#[test]
+fn test_fix3_b19_cli_true_positive_no_warning_and_control_site_calibration() {
+    use nmr_core::excited_state::{
+        ExcitedStateAbstentionKind, ExcitedStateHypothesisKind, ExcitedStateReport,
+        ExcitedStateVerdict,
+    };
+
+    let tmp = ScopedTempDir::new("fix3_b19_cli_controls");
+    let root = workspace_root();
+    let star_path = root.join("data/fixtures/bmr17769_ubiquitin_allatom.str");
+    let pdb_path = root.join("data/pdb_refs/1d3z.pdb");
+    let pro19 = "A\t19\tPRO\tCB\t2.40\t0.08\tsigned\texchange\n\
+                 A\t19\tPRO\tCG\t-2.60\t0.08\tsigned\texchange\n\
+                 A\t18\tGLU\tCA\t1.15\t0.08\tunsigned\texchange\n\
+                 A\t18\tGLU\tC\t1.35\t0.08\tunsigned\texchange\n\
+                 A\t20\tSER\tN\t-1.85\t0.12\tsigned\texchange\n\
+                 A\t21\tASP\tN\t0.48\t0.10\tunsigned\texchange\n";
+    let hdr = "chain_id\tseq_id\tres_name\tatom\tdw_ppm\tdw_err_ppm\tsign_mode\tsite_role\n";
+
+    let run = |name: &str, body: String| -> ExcitedStateReport {
+        let tsv = tmp.path.join(format!("{name}.tsv"));
+        fs::write(&tsv, body).unwrap();
+        let json_path = tmp.path.join(format!("{name}.json"));
+        let out = Command::new(nmrassign_bin())
+            .args([
+                "exchange-state",
+                "--shifts",
+                star_path.to_str().unwrap(),
+                "--structure",
+                pdb_path.to_str().unwrap(),
+                "--exchange",
+                tsv.to_str().unwrap(),
+                "--exclude-pdb",
+                "1D3Z,1UBQ",
+                "--exclude-bmrb",
+                "17769,6457",
+                "--json-out",
+                json_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run exchange-state");
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap()
+    };
+
+    // 1. True-positive Pro19 trans->cis with correctly stated errors: committed, NO warning.
+    let rep = run("tp", format!("{hdr}{pro19}"));
+    assert_eq!(
+        rep.verdict,
+        ExcitedStateVerdict::Committed(ExcitedStateHypothesisKind::XxxProCisTrans),
+        "{}",
+        rep.verdict_reason
+    );
+    assert!(
+        rep.error_scale_warning.is_none(),
+        "{:?}",
+        rep.error_scale_warning
+    );
+    assert!(
+        !rep.chi2_consistency_diagnostic
+            .as_ref()
+            .unwrap()
+            .error_scale_inconsistent
+    );
+
+    // 2. Same data + calibrated control sites (|dw| ~ 1 sigma): still committed, no warning.
+    let calibrated = "A\t40\tGLN\tN\t0.10\t0.12\tsigned\tcontrol\n\
+                      A\t41\tGLN\tN\t-0.15\t0.12\tsigned\tcontrol\n\
+                      A\t42\tARG\tN\t0.06\t0.12\tsigned\tcontrol\n\
+                      A\t43\tLEU\tN\t-0.12\t0.12\tsigned\tcontrol\n\
+                      A\t50\tLEU\tN\t0.14\t0.12\tsigned\tcontrol\n\
+                      A\t55\tTHR\tN\t-0.08\t0.12\tsigned\tcontrol\n";
+    let rep = run("tp_ctrl", format!("{hdr}{pro19}{calibrated}"));
+    let diag = rep.chi2_consistency_diagnostic.as_ref().unwrap();
+    assert_eq!(diag.n_control_sites, 6);
+    assert_eq!(diag.error_scale_evidence, "control_sites");
+    assert_eq!(diag.control_exceeds_consistency_bound, Some(false));
+    assert!(rep.verdict.is_committed(), "{}", rep.verdict_reason);
+    assert_eq!(
+        rep.n_observations, 6,
+        "control rows must not be scored as exchange observations"
+    );
+
+    // 3. Same data + control sites whose errors are under-stated ~3x: the call is downgraded.
+    let understated = "A\t40\tGLN\tN\t0.36\t0.12\tsigned\tcontrol\n\
+                       A\t41\tGLN\tN\t-0.41\t0.12\tsigned\tcontrol\n\
+                       A\t42\tARG\tN\t0.33\t0.12\tsigned\tcontrol\n\
+                       A\t43\tLEU\tN\t-0.38\t0.12\tsigned\tcontrol\n\
+                       A\t50\tLEU\tN\t0.40\t0.12\tsigned\tcontrol\n\
+                       A\t55\tTHR\tN\t-0.35\t0.12\tsigned\tcontrol\n";
+    let rep = run("tp_bad_ctrl", format!("{hdr}{pro19}{understated}"));
+    let diag = rep.chi2_consistency_diagnostic.as_ref().unwrap();
+    assert_eq!(diag.control_exceeds_consistency_bound, Some(true));
+    assert!(rep.error_scale_warning.is_some());
+    assert!(!rep.verdict.is_committed());
+    assert_eq!(
+        rep.abstention_kind,
+        Some(ExcitedStateAbstentionKind::ErrorScaleInconsistent)
     );
 }
