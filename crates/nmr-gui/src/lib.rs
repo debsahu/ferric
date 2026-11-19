@@ -34,3 +34,4 @@ pub mod undo_journal;
 pub mod workbench_mode;
 pub mod workbook;
 pub mod workflow_bar;
+pub mod workflow_dag_panel;
