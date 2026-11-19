@@ -5,6 +5,10 @@
 
 use std::collections::BTreeMap;
 
+use nmr_core::nmrstar::read_star_str;
+use nmr_core::peaks::Peak;
+use nmr_core::simulate::{render_hsqc_2d, simulate, SimConfig, SpectrumRenderConfig};
+use nmr_core::spectrum::write_nmrpipe_2d;
 use nmr_core::workflow_dag::{
     compile_dag_manifest, dag_from_json, dag_to_json, execute_dag_manifest,
     execute_dag_manifest_dry_run, execute_dag_manifest_real, manifest_from_json, manifest_to_json,
@@ -12,8 +16,26 @@ use nmr_core::workflow_dag::{
     preset_metabolomics_1d_dag, validate_candidate_edge, validate_dag, verify_dag_manifest,
     CachedArtifact, DagArtifactCache, DagEdge, DagError, DagNode, DagRunOptions, NodeKind,
     PortDirection, PortType, StepStatus, WorkflowDag, DAG_MANIFEST_SCHEMA, MAX_DAG_EDGES,
-    MAX_DAG_JSON_BYTES, MAX_DAG_NODES,
+    MAX_DAG_JSON_BYTES, MAX_DAG_NODES, SIMULATION_DEMO_PROVENANCE_TAG,
 };
+
+fn format_peaks_tsv(peaks: &[Peak]) -> String {
+    let mut out = String::from("experiment\tH\tN\tC\tsign\theight\n");
+    for p in peaks {
+        let c_str =
+            p.c.map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| ".".to_string());
+        let h_str = p
+            .height
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "100.0".to_string());
+        out.push_str(&format!(
+            "{}\t{:.4}\t{:.4}\t{c_str}\t{}\t{h_str}\n",
+            p.exp, p.h, p.n, p.sign
+        ));
+    }
+    out
+}
 
 fn is_valid_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
@@ -483,10 +505,14 @@ fn test_p1_3_manifest_integrity_rejects_reversed_nodes_forged_hashes_and_reloads
     }
     let mut poisoned_cache = DagArtifactCache::new();
     poisoned_cache.insert(CachedArtifact {
+        cache_key: "forged".to_string(),
         node_sha256: "forged".to_string(),
         kind: NodeKind::ExportNefReport,
+        input_fingerprint: "dry_run".to_string(),
+        dry_run: true,
         output_digest: "stale".to_string(),
         summary: "stale cached output".to_string(),
+        payload_json: None,
     });
     assert!(
         matches!(
@@ -579,7 +605,9 @@ fn test_real_stage_execution_backbone_and_metabolomics_and_fail_closed_missing_i
             .expect_err("must fail closed without input data or demo flag");
     assert!(matches!(missing_err, DagError::ExecutionFailed { .. }));
 
-    // 2. Real execution on synthetic_ubiquitin.str with real output directory artifacts
+    // 2. Real execution on synthetic_ubiquitin.str with explicit `allow_simulation_demo: true`
+    //    stamps NEF, HTML, and trace with `SIMULATION_DEMO_PROVENANCE_TAG`, and repeat run restores
+    //    byte-identical artifacts from cache.
     let star_text = include_str!("../../../data/fixtures/synthetic_ubiquitin.str").to_string();
     let tmp_dir =
         std::env::temp_dir().join(format!("ferric_dag_real_core_test_{}", std::process::id()));
@@ -587,6 +615,7 @@ fn test_real_stage_execution_backbone_and_metabolomics_and_fail_closed_missing_i
     let opts = DagRunOptions {
         star_text: Some(star_text),
         output_dir: Some(tmp_dir.clone()),
+        allow_simulation_demo: true,
         seed: 0,
         max_runs: Some(4),
         max_steps_per_system: Some(250),
@@ -594,7 +623,7 @@ fn test_real_stage_execution_backbone_and_metabolomics_and_fail_closed_missing_i
     };
     let mut cache = DagArtifactCache::new();
     let out1 = execute_dag_manifest_real(&bb_manifest, &mut cache, &opts)
-        .expect("real backbone DAG execution");
+        .expect("real backbone DAG execution with allow_simulation_demo");
     assert_eq!(out1.trace.executed_count, 5);
     assert_eq!(out1.trace.cache_hit_count, 0);
     assert!(
@@ -609,13 +638,28 @@ fn test_real_stage_execution_backbone_and_metabolomics_and_fail_closed_missing_i
         "BackboneAssign must run real solver: {}",
         out1.trace.steps[3].summary
     );
+    assert!(
+        out1.trace.steps[1]
+            .summary
+            .contains(SIMULATION_DEMO_PROVENANCE_TAG),
+        "ProcessFidNus trace must carry SIMULATION_DEMO tag: {}",
+        out1.trace.steps[1].summary
+    );
     let nef_txt = out1.nef_text.as_deref().expect("real NEF text generated");
     assert!(nef_txt.contains("data_nef_"));
+    assert!(
+        nef_txt.contains(SIMULATION_DEMO_PROVENANCE_TAG),
+        "NEF provenance must carry SIMULATION_DEMO tag"
+    );
     let html_txt = out1
         .report_html
         .as_deref()
         .expect("real HTML quality report generated");
     assert!(html_txt.contains("<html") || html_txt.contains("<!DOCTYPE html>"));
+    assert!(
+        html_txt.contains(SIMULATION_DEMO_PROVENANCE_TAG),
+        "HTML report must carry SIMULATION_DEMO tag"
+    );
     assert_eq!(out1.written_files.len(), 2);
     for rel in &out1.written_files {
         let fpath = tmp_dir.join(rel);
@@ -629,11 +673,15 @@ fn test_real_stage_execution_backbone_and_metabolomics_and_fail_closed_missing_i
     assert_eq!(metrics["n_residues"].as_u64(), Some(76));
     assert!(metrics["n_assigned"].as_u64().unwrap_or(0) > 10);
 
-    // Repeat run hits cache for all 5 stages
+    // Repeat run hits cache for all 5 stages AND restores byte-identical real outputs
     let out2 = execute_dag_manifest_real(&bb_manifest, &mut cache, &opts)
         .expect("cached repeat real backbone DAG execution");
     assert_eq!(out2.trace.executed_count, 0);
     assert_eq!(out2.trace.cache_hit_count, 5);
+    assert_eq!(out2.nef_text, out1.nef_text);
+    assert_eq!(out2.report_html, out1.report_html);
+    assert_eq!(out2.artifacts, out1.artifacts);
+    assert_eq!(out2.metrics_json, out1.metrics_json);
 
     // 3. Real metabolomics 1D chemometrics execution with explicit demo fixture
     let metab_manifest =
@@ -644,6 +692,7 @@ fn test_real_stage_execution_backbone_and_metabolomics_and_fail_closed_missing_i
         &mut metab_cache,
         &DagRunOptions {
             use_demo_fixture: true,
+            allow_simulation_demo: true,
             seed: 42,
             ..DagRunOptions::default()
         },
@@ -822,4 +871,554 @@ fn test_all_12_node_kinds_all_13_port_types_and_json_roundtrip() {
         validate_candidate_edge(&dag, &DagEdge::new("titr", "peaks", "deconv", "seed_peaks")),
         Err(DagError::InputPortAlreadyConnected { .. })
     ));
+}
+
+#[test]
+fn test_p1_1_process_fid_fail_closed_peak_pick_passthrough_and_non_wired_stages_fail_closed() {
+    // 1. ProcessFidNus MUST fail closed on reference-only STAR without `allow_simulation_demo: true`.
+    let bb_manifest =
+        compile_dag_manifest(&preset_backbone_assignment_dag()).expect("compile backbone");
+    let gb1_star = include_str!("../../../data/fixtures/gb1_bmr7280_shifts.str").to_string();
+    let mut cache = DagArtifactCache::new();
+    let err = execute_dag_manifest_real(
+        &bb_manifest,
+        &mut cache,
+        &DagRunOptions {
+            star_text: Some(gb1_star.clone()),
+            allow_simulation_demo: false,
+            ..DagRunOptions::default()
+        },
+    )
+    .expect_err(
+        "ProcessFidNus must refuse to simulate peaks from STAR without allow_simulation_demo",
+    );
+    assert!(
+        matches!(err, DagError::ExecutionFailed { ref node_id, ref reason }
+            if node_id == "process" && reason.contains("allow_simulation_demo")),
+        "unexpected error: {err:?}"
+    );
+
+    // 2. Real 2D spectrum (.ft2) + measured 3D peaks (NO HSQC in peaks_tsv) + sequence,
+    //    with `allow_simulation_demo: false`: PeakPick picks 2D HSQC and passes picked peaks
+    //    into BackboneAssign (never discarded!).
+    let gb1_ref = read_star_str(&gb1_star, None).expect("parse GB1 STAR");
+    let (all_peaks, _) = simulate(&gb1_ref, &SimConfig::default());
+    let hsqc_2d = render_hsqc_2d(
+        &all_peaks,
+        &SpectrumRenderConfig {
+            nx_h: 256,
+            ny_n: 128,
+            ..SpectrumRenderConfig::default()
+        },
+    );
+    let triple_only: Vec<Peak> = all_peaks
+        .iter()
+        .filter(|p| p.exp != "HSQC")
+        .cloned()
+        .collect();
+    assert!(!triple_only.is_empty());
+    let triple_only_tsv = format_peaks_tsv(&triple_only);
+
+    let data_root =
+        std::env::temp_dir().join(format!("ferric_dag_p1_1_data_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_root);
+    let ds_dir = data_root.join("datasets/backbone_3d");
+    std::fs::create_dir_all(&ds_dir).expect("create dataset dir");
+    write_nmrpipe_2d(ds_dir.join("hsqc.ft2"), &hsqc_2d).expect("write real 2D NMRPipe spectrum");
+
+    let real_opts = DagRunOptions {
+        peaks_tsv: Some(triple_only_tsv.clone()),
+        sequence: Some(gb1_ref.one_letter()),
+        data_root: Some(data_root.clone()),
+        allow_simulation_demo: false,
+        seed: 0,
+        max_runs: Some(4),
+        max_steps_per_system: Some(250),
+        ..DagRunOptions::default()
+    };
+    let mut real_cache = DagArtifactCache::new();
+    let real_out = execute_dag_manifest_real(&bb_manifest, &mut real_cache, &real_opts)
+        .expect("real 2D spectrum + 3D peaks run must succeed without simulation demo");
+    let real_metrics = real_out.metrics_json.as_ref().expect("metrics");
+    assert_eq!(real_metrics["n_residues"].as_u64(), Some(56));
+    assert_eq!(real_metrics["simulation_demo"].as_bool(), Some(false));
+    let n_ss_picked = real_metrics["n_spin_systems"].as_u64().unwrap_or(0);
+    assert!(
+        n_ss_picked > 20,
+        "BackboneAssign must consume HSQC peaks picked by PeakPick (got {n_ss_picked} spin systems)"
+    );
+    assert!(
+        real_metrics["n_assigned"].as_u64().unwrap_or(0) > 10,
+        "BackboneAssign must assign residues from picked 2D HSQC roots"
+    );
+    let real_nef = real_out.nef_text.as_deref().expect("NEF text");
+    assert!(!real_nef.contains(SIMULATION_DEMO_PROVENANCE_TAG));
+
+    // Raising PeakPick `snr_threshold` to `1e6` yields 0 picked HSQC peaks -> 0 spin systems,
+    // proving PeakPick output is actually passed into BackboneAssign and NEVER discarded.
+    let mut high_snr_dag = preset_backbone_assignment_dag();
+    let pick_node = high_snr_dag
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == "pick")
+        .expect("pick node");
+    pick_node
+        .params
+        .insert("snr_threshold".to_string(), serde_json::json!(1_000_000.0));
+    let high_snr_manifest = compile_dag_manifest(&high_snr_dag).expect("compile high-snr DAG");
+    let high_snr_out = execute_dag_manifest_real(&high_snr_manifest, &mut real_cache, &real_opts)
+        .expect("high-snr run executes");
+    assert!(
+        high_snr_out.trace.steps[2]
+            .summary
+            .contains("hsqc_picked=0"),
+        "expected 0 picked HSQC peaks at SNR=1e6: {}",
+        high_snr_out.trace.steps[2].summary
+    );
+    assert_eq!(
+        high_snr_out
+            .metrics_json
+            .as_ref()
+            .and_then(|m| m["n_spin_systems"].as_u64()),
+        Some(0),
+        "0 picked HSQC peaks must yield 0 spin systems in BackboneAssign"
+    );
+    let _ = std::fs::remove_dir_all(&data_root);
+
+    // 3. ALL 6 non-wired stages MUST fail closed with `DagError::StageNotExecutable`!
+    let dyn_manifest =
+        compile_dag_manifest(&preset_dynamics_relax_cest_dag()).expect("compile dynamics");
+    let mut dyn_cache = DagArtifactCache::new();
+    let dyn_err = execute_dag_manifest_real(
+        &dyn_manifest,
+        &mut dyn_cache,
+        &DagRunOptions {
+            allow_simulation_demo: true,
+            use_demo_fixture: true,
+            ..DagRunOptions::default()
+        },
+    )
+    .expect_err("dynamics preset must fail closed on non-wired stages");
+    assert!(
+        matches!(
+            dyn_err,
+            DagError::StageNotExecutable {
+                stage: NodeKind::ExchangeCestCpmg | NodeKind::DynamicsRelax,
+                ..
+            }
+        ),
+        "expected StageNotExecutable, got {dyn_err:?}"
+    );
+
+    let non_wired_cases: Vec<(NodeKind, WorkflowDag)> = vec![
+        (
+            NodeKind::DeconvolveNd,
+            WorkflowDag {
+                name: "Deconv".to_string(),
+                description: String::new(),
+                nodes: vec![
+                    DagNode::new("ingest", NodeKind::IngestBrukerVarian, "Ingest"),
+                    DagNode::new("pick", NodeKind::PeakPick, "Pick"),
+                    DagNode::new("deconv", NodeKind::DeconvolveNd, "Deconv"),
+                ],
+                edges: vec![
+                    DagEdge::new("ingest", "spectrum_2d", "pick", "spectrum_2d"),
+                    DagEdge::new("pick", "peaks", "deconv", "seed_peaks"),
+                ],
+            },
+        ),
+        (
+            NodeKind::DynamicsRelax,
+            WorkflowDag {
+                name: "Relax".to_string(),
+                description: String::new(),
+                nodes: vec![
+                    DagNode::new("ingest", NodeKind::IngestBrukerVarian, "Ingest"),
+                    DagNode::new("pick", NodeKind::PeakPick, "Pick"),
+                    DagNode::new("relax", NodeKind::DynamicsRelax, "Relax"),
+                ],
+                edges: vec![
+                    DagEdge::new("ingest", "spectrum_2d", "pick", "spectrum_2d"),
+                    DagEdge::new("pick", "peaks", "relax", "peaks"),
+                ],
+            },
+        ),
+        (
+            NodeKind::ExchangeCestCpmg,
+            WorkflowDag {
+                name: "Exchange".to_string(),
+                description: String::new(),
+                nodes: vec![
+                    DagNode::new("ingest", NodeKind::IngestBrukerVarian, "Ingest"),
+                    DagNode::new("pick", NodeKind::PeakPick, "Pick"),
+                    DagNode::new("exch", NodeKind::ExchangeCestCpmg, "Exch"),
+                ],
+                edges: vec![
+                    DagEdge::new("ingest", "spectrum_2d", "pick", "spectrum_2d"),
+                    DagEdge::new("pick", "peaks", "exch", "peaks"),
+                ],
+            },
+        ),
+        (
+            NodeKind::SidechainAssign,
+            WorkflowDag {
+                name: "Sidechain".to_string(),
+                description: String::new(),
+                nodes: vec![
+                    DagNode::new("ingest", NodeKind::IngestBrukerVarian, "Ingest"),
+                    DagNode::new("pick", NodeKind::PeakPick, "Pick"),
+                    DagNode::new("bb", NodeKind::BackboneAssign, "BB"),
+                    DagNode::new("sc", NodeKind::SidechainAssign, "SC"),
+                ],
+                edges: vec![
+                    DagEdge::new("ingest", "spectrum_2d", "pick", "spectrum_2d"),
+                    DagEdge::new("pick", "peaks", "bb", "peaks"),
+                    DagEdge::new("bb", "assignments", "sc", "assignments"),
+                ],
+            },
+        ),
+        (
+            NodeKind::Titration2d,
+            WorkflowDag {
+                name: "Titration".to_string(),
+                description: String::new(),
+                nodes: vec![
+                    DagNode::new("ingest", NodeKind::IngestBrukerVarian, "Ingest"),
+                    DagNode::new("titr", NodeKind::Titration2d, "Titr"),
+                ],
+                edges: vec![DagEdge::new("ingest", "spectrum_2d", "titr", "spectrum_2d")],
+            },
+        ),
+        (
+            NodeKind::StructureFoldDock,
+            WorkflowDag {
+                name: "Fold".to_string(),
+                description: String::new(),
+                nodes: vec![
+                    DagNode::new("ingest", NodeKind::IngestBrukerVarian, "Ingest"),
+                    DagNode::new("titr", NodeKind::Titration2d, "Titr"),
+                    DagNode::new("fold", NodeKind::StructureFoldDock, "Fold"),
+                ],
+                edges: vec![
+                    DagEdge::new("ingest", "spectrum_2d", "titr", "spectrum_2d"),
+                    DagEdge::new("titr", "restraints", "fold", "restraints"),
+                ],
+            },
+        ),
+    ];
+
+    assert!(!NodeKind::StructureFoldDock.is_real_executable());
+    for (expected_stage, dag) in non_wired_cases {
+        assert!(!expected_stage.is_real_executable());
+        let manifest = compile_dag_manifest(&dag).expect("compile non-wired stage DAG");
+        let mut c = DagArtifactCache::new();
+        let err = execute_dag_manifest_real(
+            &manifest,
+            &mut c,
+            &DagRunOptions {
+                allow_simulation_demo: true,
+                use_demo_fixture: true,
+                ..DagRunOptions::default()
+            },
+        )
+        .expect_err("non-wired stage must fail closed in real execution");
+        assert!(
+            matches!(err, DagError::StageNotExecutable { .. }),
+            "stage {expected_stage:?} must fail with StageNotExecutable, got {err:?}"
+        );
+        // Dry-run still works cleanly for graph topology validation
+        let dry = execute_dag_manifest_dry_run(&manifest, &mut c)
+            .expect("dry-run must still work on non-wired stages");
+        assert_eq!(dry.executed_count, manifest.nodes.len());
+    }
+}
+
+#[test]
+fn test_p1_4_cache_keying_dry_run_isolation_input_change_and_downstream_export_change() {
+    let bb_dag = preset_backbone_assignment_dag();
+    let bb_manifest = compile_dag_manifest(&bb_dag).expect("compile backbone");
+    let gb1_star = include_str!("../../../data/fixtures/gb1_bmr7280_shifts.str").to_string();
+
+    let mut shared_cache = DagArtifactCache::new();
+
+    // Probe (b): Dry run followed by real run on the SAME cache -> real run executes all 5
+    // stages and emits real NEF & HTML (dry run NEVER poisons real cache).
+    let dry_trace = execute_dag_manifest_dry_run(&bb_manifest, &mut shared_cache)
+        .expect("dry run populates dry_run=true entries");
+    assert_eq!(dry_trace.executed_count, 5);
+    assert_eq!(dry_trace.cache_hit_count, 0);
+
+    let ubq_demo_opts = DagRunOptions {
+        use_demo_fixture: true,
+        allow_simulation_demo: true,
+        seed: 0,
+        max_runs: Some(4),
+        max_steps_per_system: Some(250),
+        ..DagRunOptions::default()
+    };
+    let ubq_out = execute_dag_manifest_real(&bb_manifest, &mut shared_cache, &ubq_demo_opts)
+        .expect("real run after dry run must execute all 5 stages");
+    assert_eq!(ubq_out.trace.executed_count, 5);
+    assert_eq!(ubq_out.trace.cache_hit_count, 0);
+    assert_eq!(
+        ubq_out
+            .metrics_json
+            .as_ref()
+            .and_then(|m| m["n_residues"].as_u64()),
+        Some(76)
+    );
+    let ubq_nef = ubq_out.nef_text.as_deref().expect("ubiquitin NEF");
+    assert!(ubq_nef.contains("data_nef_"));
+    assert!(ubq_out.report_html.is_some());
+
+    // Probe (a): Warm ubiquitin demo cache followed by GB1 on SAME cache -> 100% cache miss,
+    // runs GB1, emits GB1 NEF (56 residues, NOT ubiquitin's 76!) and GB1 trace.
+    let gb1_demo_opts = DagRunOptions {
+        star_text: Some(gb1_star.clone()),
+        allow_simulation_demo: true,
+        seed: 0,
+        max_runs: Some(4),
+        max_steps_per_system: Some(250),
+        ..DagRunOptions::default()
+    };
+    let gb1_out = execute_dag_manifest_real(&bb_manifest, &mut shared_cache, &gb1_demo_opts)
+        .expect("GB1 run on ubiquitin-warmed cache must miss and run GB1");
+    assert_eq!(gb1_out.trace.executed_count, 5);
+    assert_eq!(gb1_out.trace.cache_hit_count, 0);
+    assert!(gb1_out.trace.steps[0].summary.contains("residues=56"));
+    assert_eq!(
+        gb1_out
+            .metrics_json
+            .as_ref()
+            .and_then(|m| m["n_residues"].as_u64()),
+        Some(56)
+    );
+    let gb1_nef = gb1_out.nef_text.as_deref().expect("GB1 NEF");
+    assert_ne!(gb1_nef, ubq_nef);
+
+    // Probe (a) fail-closed check: GB1 STAR without `--demo` / `--peaks` on SAME cache MUST miss
+    // and fail closed (never return ubiquitin or GB1-demo cached hits!).
+    let gb1_no_demo_err = execute_dag_manifest_real(
+        &bb_manifest,
+        &mut shared_cache,
+        &DagRunOptions {
+            star_text: Some(gb1_star),
+            allow_simulation_demo: false,
+            seed: 0,
+            max_runs: Some(4),
+            max_steps_per_system: Some(250),
+            ..DagRunOptions::default()
+        },
+    )
+    .expect_err("GB1 without peaks or allow_simulation_demo must miss cache and fail closed");
+    assert!(matches!(gb1_no_demo_err, DagError::ExecutionFailed { .. }));
+
+    // Probe (c): Warm cache + downstream-only export parameter change -> restores upstream shifts
+    // & peaks from cache (4 cache hits) and re-runs ONLY export (1 executed) cleanly!
+    let mut modified_dag = bb_dag.clone();
+    let export_node = modified_dag
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == "export")
+        .expect("export node");
+    export_node.params.insert(
+        "output_path".to_string(),
+        serde_json::json!("reports/gb1_renamed_v2.nef"),
+    );
+    let modified_manifest = compile_dag_manifest(&modified_dag).expect("compile modified export");
+
+    let tmp_out = std::env::temp_dir().join(format!(
+        "ferric_dag_p1_4_export_change_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_out);
+    let mut gb1_export_opts = gb1_demo_opts.clone();
+    gb1_export_opts.output_dir = Some(tmp_out.clone());
+
+    let reexport_out =
+        execute_dag_manifest_real(&modified_manifest, &mut shared_cache, &gb1_export_opts)
+            .expect("downstream-only export change must restore upstream state and succeed");
+    assert_eq!(reexport_out.trace.cache_hit_count, 4);
+    assert_eq!(reexport_out.trace.executed_count, 1);
+    assert_eq!(reexport_out.trace.steps[4].node_id, "export");
+    assert_eq!(reexport_out.trace.steps[4].status, StepStatus::Executed);
+    assert_eq!(reexport_out.nef_text.as_deref(), Some(gb1_nef));
+    assert!(tmp_out.join("reports/gb1_renamed_v2.nef").is_file());
+    assert!(tmp_out
+        .join("reports/gb1_renamed_v2.nef.report.html")
+        .is_file());
+
+    // Repeat identical run on `modified_manifest` into a fresh directory -> 5 cache hits AND
+    // still writes the restored NEF & HTML files to the new output_dir!
+    let tmp_out2 = std::env::temp_dir().join(format!(
+        "ferric_dag_p1_4_export_cached_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_out2);
+    gb1_export_opts.output_dir = Some(tmp_out2.clone());
+    let cached_out =
+        execute_dag_manifest_real(&modified_manifest, &mut shared_cache, &gb1_export_opts)
+            .expect("full cache hit must restore and emit files");
+    assert_eq!(cached_out.trace.cache_hit_count, 5);
+    assert_eq!(cached_out.trace.executed_count, 0);
+    assert_eq!(cached_out.nef_text, reexport_out.nef_text);
+    assert_eq!(cached_out.report_html, reexport_out.report_html);
+    assert_eq!(cached_out.artifacts, reexport_out.artifacts);
+    assert_eq!(
+        std::fs::read_to_string(tmp_out2.join("reports/gb1_renamed_v2.nef"))
+            .expect("cached NEF written"),
+        gb1_nef
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_out);
+    let _ = std::fs::remove_dir_all(&tmp_out2);
+}
+
+#[test]
+fn test_p2_1_p2_2_p2_3_traversal_numeric_canonicalization_and_symlink_rejection() {
+    // P2-1: Path traversal & absolute paths rejected in ALL string params (even non-path keys
+    // like `notes`, `tag`, nested arrays, and nested objects).
+    for (key, val) in [
+        ("notes", serde_json::json!("../secret/file")),
+        ("tag", serde_json::json!("/etc/passwd")),
+        ("custom", serde_json::json!("a/../../b")),
+        ("win_drive", serde_json::json!("C:/Users/secret")),
+        ("backslash", serde_json::json!("foo\\bar")),
+        ("list_param", serde_json::json!(["safe", "../escape"])),
+        (
+            "nested_obj",
+            serde_json::json!({"meta": {"comment": "/abs/path"}}),
+        ),
+    ] {
+        let mut dag = preset_metabolomics_1d_dag();
+        dag.nodes[0].params.insert(key.to_string(), val);
+        assert!(
+            matches!(validate_dag(&dag), Err(DagError::InvalidParam { .. })),
+            "P2-1: expected traversal/absolute string in key '{key}' to be rejected"
+        );
+    }
+
+    // P2-2: Numeric JSON canonicalization: `5` and `5.0`, `2` and `2.0`, `0` and `-0.0` hash identically.
+    let mut dag_int = preset_backbone_assignment_dag();
+    let mut dag_flt = preset_backbone_assignment_dag();
+    dag_int.nodes[1]
+        .params
+        .insert("zero_fill_factor".to_string(), serde_json::json!(2));
+    dag_flt.nodes[1]
+        .params
+        .insert("zero_fill_factor".to_string(), serde_json::json!(2.0));
+    dag_int.nodes[2]
+        .params
+        .insert("snr_threshold".to_string(), serde_json::json!(5));
+    dag_flt.nodes[2]
+        .params
+        .insert("snr_threshold".to_string(), serde_json::json!(5.0));
+    dag_int.nodes[3]
+        .params
+        .insert("seeds".to_string(), serde_json::json!(5));
+    dag_flt.nodes[3]
+        .params
+        .insert("seeds".to_string(), serde_json::json!(5.0));
+    dag_int.nodes[0]
+        .params
+        .insert("offset".to_string(), serde_json::json!(0));
+    dag_flt.nodes[0]
+        .params
+        .insert("offset".to_string(), serde_json::json!(-0.0));
+
+    let m_int = compile_dag_manifest(&dag_int).expect("compile int DAG");
+    let m_flt = compile_dag_manifest(&dag_flt).expect("compile float DAG");
+    assert_eq!(
+        m_int.manifest_sha256, m_flt.manifest_sha256,
+        "P2-2: integer 5 and float 5.0 must produce identical manifest_sha256"
+    );
+    for (ni, nf) in m_int.nodes.iter().zip(m_flt.nodes.iter()) {
+        assert_eq!(
+            ni.node_sha256, nf.node_sha256,
+            "P2-2: node '{}' hash differed between int and float",
+            ni.id
+        );
+    }
+
+    // P2-3: Symlink at final output component AND symlink at parent directory component
+    // MUST be rejected BEFORE `create_dir` / `write`, leaving outside targets untouched.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("ferric_dag_p2_3_sym_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let outside_dir = base.join("outside");
+        let out_dir = base.join("out_dir");
+        std::fs::create_dir_all(&outside_dir).expect("create outside");
+        std::fs::create_dir_all(out_dir.join("reports")).expect("create out_dir/reports");
+
+        // Case 1: Planted symlink at the FINAL file component
+        let victim = outside_dir.join("victim.txt");
+        std::fs::write(&victim, "DO_NOT_OVERWRITE").expect("write victim");
+        symlink(&victim, out_dir.join("reports/backbone_assignments.nef"))
+            .expect("plant final symlink");
+
+        let manifest =
+            compile_dag_manifest(&preset_backbone_assignment_dag()).expect("compile backbone");
+        let mut cache = DagArtifactCache::new();
+        let sym_err = execute_dag_manifest_real(
+            &manifest,
+            &mut cache,
+            &DagRunOptions {
+                use_demo_fixture: true,
+                allow_simulation_demo: true,
+                output_dir: Some(out_dir.clone()),
+                seed: 0,
+                max_runs: Some(4),
+                max_steps_per_system: Some(200),
+                ..DagRunOptions::default()
+            },
+        )
+        .expect_err("P2-3: planted final-component symlink must be rejected");
+        assert!(
+            matches!(sym_err, DagError::ExecutionFailed { ref reason, .. } if reason.contains("symlink")),
+            "expected symlink rejection error, got {sym_err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read victim"),
+            "DO_NOT_OVERWRITE",
+            "victim file outside output_dir must NEVER be overwritten"
+        );
+
+        // Case 2: Planted symlink at an INTERMEDIATE directory component before nested subdir
+        let out_dir2 = base.join("out_dir2");
+        std::fs::create_dir_all(&out_dir2).expect("create out_dir2");
+        symlink(&outside_dir, out_dir2.join("reports")).expect("plant dir symlink");
+        let mut nested_dag = preset_backbone_assignment_dag();
+        nested_dag.nodes[4].params.insert(
+            "output_path".to_string(),
+            serde_json::json!("reports/nested_escape/out.nef"),
+        );
+        let nested_manifest = compile_dag_manifest(&nested_dag).expect("compile nested DAG");
+        let dir_sym_err = execute_dag_manifest_real(
+            &nested_manifest,
+            &mut cache,
+            &DagRunOptions {
+                use_demo_fixture: true,
+                allow_simulation_demo: true,
+                output_dir: Some(out_dir2.clone()),
+                seed: 0,
+                max_runs: Some(4),
+                max_steps_per_system: Some(200),
+                ..DagRunOptions::default()
+            },
+        )
+        .expect_err("P2-3: planted directory symlink must be rejected before creating subdir");
+        assert!(
+            matches!(dir_sym_err, DagError::ExecutionFailed { ref reason, .. } if reason.contains("symlink")),
+            "expected directory symlink rejection error, got {dir_sym_err:?}"
+        );
+        assert!(
+            !outside_dir.join("nested_escape").exists(),
+            "P2-3: containment check must run BEFORE creating subdirectories inside symlink target"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

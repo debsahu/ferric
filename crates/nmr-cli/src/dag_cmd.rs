@@ -11,11 +11,12 @@ use std::path::{Path, PathBuf};
 use nmr_core::workflow_dag::{
     compile_dag_manifest, dag_from_json, dag_to_json, execute_dag_manifest_dry_run,
     execute_dag_manifest_real, manifest_from_json, manifest_to_json, preset_by_name, validate_dag,
-    DagArtifactCache, DagManifest, DagRunOptions, StepStatus, MAX_DAG_JSON_BYTES,
+    write_safe_output_file, DagArtifactCache, DagManifest, DagRunOptions, StepStatus,
+    MAX_DAG_JSON_BYTES,
 };
 
 const MAX_INPUT_DATA_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
-const MAX_CACHE_JSON_BYTES: usize = 4 * MAX_DAG_JSON_BYTES;
+const MAX_CACHE_JSON_BYTES: usize = 32 * MAX_DAG_JSON_BYTES; // 32 MiB
 
 fn dag_usage() -> &'static str {
     "Usage:\n  \
@@ -52,6 +53,14 @@ fn read_bounded_utf8(path: &Path, max_bytes: usize, label: &str) -> Result<Strin
 }
 
 fn write_text_file(path: &Path, content: &str, label: &str) -> Result<(), String> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to write {label} through symlink '{}'",
+                path.display()
+            ));
+        }
+    }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| {
@@ -456,6 +465,7 @@ fn cmd_dag_run(args: &[String]) -> Result<(), String> {
         data_root: data_dir,
         output_dir: out_dir.clone(),
         use_demo_fixture: demo,
+        allow_simulation_demo: demo,
         seed,
         max_runs,
         max_steps_per_system: max_steps,
@@ -484,7 +494,8 @@ fn cmd_dag_run(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("failed to serialize DAG run trace JSON: {e}"))?;
 
     if let Some(ref od) = out_dir {
-        write_text_file(&od.join("dag_trace.json"), &trace_json, "dag_trace.json")?;
+        write_safe_output_file("cli_trace", od, "dag_trace.json", &trace_json)
+            .map_err(|e| e.to_string())?;
     }
     if let Some(ref jp) = json_out {
         write_text_file(jp, &trace_json, "trace JSON")?;

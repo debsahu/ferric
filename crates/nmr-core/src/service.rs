@@ -159,6 +159,10 @@ pub struct DagRunRequest {
     /// When `true` and no inline inputs are supplied, uses deterministic synthetic demo fixtures.
     #[serde(default)]
     pub use_demo_fixture: bool,
+    /// Explicit opt-in allowing synthetic peak/2D spectrum simulation from reference shifts
+    /// (defaults to `false`; stamps NEF, HTML, and trace with `[SIMULATION_DEMO: ...]`).
+    #[serde(default)]
+    pub allow_simulation_demo: bool,
     /// Deterministic PRNG seed (defaults to 0).
     #[serde(default)]
     pub seed: Option<u64>,
@@ -1112,6 +1116,11 @@ fn compute_dag_run_input_fingerprint(req: &DagRunRequest) -> String {
     } else {
         "demo=0;"
     });
+    material.push_str(if req.allow_simulation_demo {
+        "allow_sim=1;"
+    } else {
+        "allow_sim=0;"
+    });
     material.push_str(&format!("seed={};", req.seed.unwrap_or(0)));
     material.push_str(&format!("runs={:?};", req.max_runs));
     material.push_str(&format!("steps={:?};", req.max_steps_per_system));
@@ -1216,6 +1225,7 @@ fn handle_dag_run(
             data_root: None,
             output_dir: None,
             use_demo_fixture: run_req.use_demo_fixture,
+            allow_simulation_demo: run_req.allow_simulation_demo,
             seed: run_req.seed.unwrap_or(0),
             max_runs: run_req.max_runs.map(|v| v.clamp(1, 64)),
             max_steps_per_system: run_req.max_steps_per_system.map(|v| v.clamp(100, 4000)),
@@ -2207,9 +2217,31 @@ pollJobs();
 #[cfg(test)]
 mod dag_service_tests {
     use super::*;
+    use crate::nmrstar::read_star_str;
+    use crate::peaks::Peak;
+    use crate::simulate::{simulate, SimConfig};
     use crate::workflow_dag::{
-        preset_backbone_assignment_dag, preset_metabolomics_1d_dag, DagEdge, DagNode, NodeKind,
+        preset_backbone_assignment_dag, preset_dynamics_relax_cest_dag, preset_metabolomics_1d_dag,
+        DagEdge, DagNode, NodeKind, SIMULATION_DEMO_PROVENANCE_TAG,
     };
+
+    fn format_peaks_tsv(peaks: &[Peak]) -> String {
+        let mut out = String::from("experiment\tH\tN\tC\tsign\theight\n");
+        for p in peaks {
+            let c_str =
+                p.c.map(|v| format!("{v:.4}"))
+                    .unwrap_or_else(|| ".".to_string());
+            let h_str = p
+                .height
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "100.0".to_string());
+            out.push_str(&format!(
+                "{}\t{:.4}\t{:.4}\t{c_str}\t{}\t{h_str}\n",
+                p.exp, p.h, p.n, p.sign
+            ));
+        }
+        out
+    }
 
     fn http_post_json(
         addr: SocketAddr,
@@ -2305,8 +2337,9 @@ mod dag_service_tests {
         let manifest: DagManifest = serde_json::from_str(&body_comp).expect("parse manifest");
         assert_eq!(manifest.schema, "ferric-dag-v1");
 
-        // 5. `/api/v1/dag/run` real execution with inline ubiquitin NMR-STAR + cache hit on repeat
-        let run_req = DagRunRequest {
+        // 5a. `/api/v1/dag/run` with `star_text` alone and `allow_simulation_demo: false`
+        //     MUST fail closed (`400`) — never silently simulate peaks from reference shifts.
+        let silent_sim_req = DagRunRequest {
             manifest: Some(manifest.clone()),
             dag: None,
             star_text: Some(EMBEDDED_UBIQUITIN_STAR.to_string()),
@@ -2315,6 +2348,42 @@ mod dag_service_tests {
             sequence: None,
             dry_run: false,
             use_demo_fixture: false,
+            allow_simulation_demo: false,
+            seed: Some(0),
+            max_runs: Some(4),
+            max_steps_per_system: Some(250),
+        };
+        let (st_silent, body_silent) = http_post_json(
+            addr,
+            "/api/v1/dag/run",
+            "application/json",
+            &serde_json::to_vec(&silent_sim_req).expect("serialize silent sim req"),
+        );
+        assert_eq!(
+            st_silent, 400,
+            "ProcessFidNus without peaks or allow_simulation_demo must fail closed: {body_silent}"
+        );
+        assert!(
+            body_silent.contains("allow_simulation_demo"),
+            "expected allow_simulation_demo explanation, got: {body_silent}"
+        );
+
+        // 5b. `/api/v1/dag/run` with supplied measured peaks + sequence (no simulation demo),
+        //     called twice identically -> 100% idempotent (Probe d: BOTH return identical
+        //     non-null `nef_text`, `report_html`, `artifacts`, and `metrics`).
+        let ubq_ref = read_star_str(EMBEDDED_UBIQUITIN_STAR, None).expect("parse ubiquitin");
+        let (ubq_peaks, _) = simulate(&ubq_ref, &SimConfig::default());
+        let ubq_peaks_tsv = format_peaks_tsv(&ubq_peaks);
+        let run_req = DagRunRequest {
+            manifest: Some(manifest.clone()),
+            dag: None,
+            star_text: None,
+            peaks_tsv: Some(ubq_peaks_tsv),
+            nef_text: None,
+            sequence: Some(ubq_ref.one_letter()),
+            dry_run: false,
+            use_demo_fixture: false,
+            allow_simulation_demo: false,
             seed: Some(0),
             max_runs: Some(4),
             max_steps_per_system: Some(250),
@@ -2326,9 +2395,15 @@ mod dag_service_tests {
         let r1: serde_json::Value = serde_json::from_str(&body_run1).expect("parse run 1");
         assert_eq!(r1["trace"]["executed_count"], serde_json::Value::from(5));
         assert_eq!(r1["trace"]["cache_hit_count"], serde_json::Value::from(0));
-        assert!(r1["nef_text"]
+        let nef1 = r1["nef_text"]
             .as_str()
-            .is_some_and(|s| s.contains("data_nef_")));
+            .expect("call 1 must return non-null nef_text");
+        assert!(nef1.contains("data_nef_"));
+        assert!(
+            !nef1.contains(SIMULATION_DEMO_PROVENANCE_TAG),
+            "measured-peaks run must NOT carry SIMULATION_DEMO tag"
+        );
+        assert!(r1["report_html"].as_str().is_some());
         assert!(r1["metrics"]["n_assigned"].as_u64().unwrap_or(0) > 10);
 
         let (st_run2, body_run2) =
@@ -2337,6 +2412,53 @@ mod dag_service_tests {
         let r2: serde_json::Value = serde_json::from_str(&body_run2).expect("parse run 2");
         assert_eq!(r2["trace"]["executed_count"], serde_json::Value::from(0));
         assert_eq!(r2["trace"]["cache_hit_count"], serde_json::Value::from(5));
+        assert_eq!(
+            r2["nef_text"], r1["nef_text"],
+            "repeat POST /api/v1/dag/run must return identical non-null nef_text"
+        );
+        assert_eq!(
+            r2["report_html"], r1["report_html"],
+            "repeat POST /api/v1/dag/run must return identical non-null report_html"
+        );
+        assert_eq!(
+            r2["artifacts"], r1["artifacts"],
+            "repeat POST /api/v1/dag/run must return identical artifacts"
+        );
+        assert_eq!(
+            r2["metrics"], r1["metrics"],
+            "repeat POST /api/v1/dag/run must return identical metrics"
+        );
+
+        // 5c. `/api/v1/dag/run` with `allow_simulation_demo: true` stamps NEF, HTML, and trace,
+        //     and is also 100% idempotent on repeat calls.
+        let demo_req = DagRunRequest {
+            manifest: Some(manifest.clone()),
+            allow_simulation_demo: true,
+            use_demo_fixture: true,
+            seed: Some(0),
+            max_runs: Some(4),
+            max_steps_per_system: Some(250),
+            ..DagRunRequest::default()
+        };
+        let demo_body = serde_json::to_vec(&demo_req).expect("serialize demo req");
+        let (st_d1, body_d1) =
+            http_post_json(addr, "/api/v1/dag/run", "application/json", &demo_body);
+        assert_eq!(st_d1, 200, "demo 1 response: {body_d1}");
+        let d1: serde_json::Value = serde_json::from_str(&body_d1).expect("parse demo 1");
+        assert!(d1["nef_text"]
+            .as_str()
+            .is_some_and(|s| s.contains(SIMULATION_DEMO_PROVENANCE_TAG)));
+        assert!(d1["report_html"]
+            .as_str()
+            .is_some_and(|s| s.contains(SIMULATION_DEMO_PROVENANCE_TAG)));
+        let (st_d2, body_d2) =
+            http_post_json(addr, "/api/v1/dag/run", "application/json", &demo_body);
+        assert_eq!(st_d2, 200, "demo 2 response: {body_d2}");
+        let d2: serde_json::Value = serde_json::from_str(&body_d2).expect("parse demo 2");
+        assert_eq!(d2["trace"]["executed_count"], serde_json::Value::from(0));
+        assert_eq!(d2["trace"]["cache_hit_count"], serde_json::Value::from(5));
+        assert_eq!(d2["nef_text"], d1["nef_text"]);
+        assert_eq!(d2["artifacts"], d1["artifacts"]);
 
         // 6. `/api/v1/dag/run` rejects tampered manifest (reversed nodes + forged node_sha256)
         let mut forged = manifest.clone();
@@ -2361,23 +2483,52 @@ mod dag_service_tests {
             "expected integrity mismatch error, got: {body_forged}"
         );
 
-        // 7. `/api/v1/dag/run` real metabolomics demo execution
-        let metab_req = DagRunRequest {
-            dag: Some(preset_metabolomics_1d_dag()),
+        // 6b. `/api/v1/dag/run` fails closed (`400`) on non-wired stages (`dynamics` preset)
+        let dyn_req = DagRunRequest {
+            dag: Some(preset_dynamics_relax_cest_dag()),
+            allow_simulation_demo: true,
             use_demo_fixture: true,
-            seed: Some(7),
+            dry_run: false,
             ..DagRunRequest::default()
         };
-        let (st_metab, body_metab) = http_post_json(
+        let (st_dyn, body_dyn) = http_post_json(
             addr,
             "/api/v1/dag/run",
             "application/json",
-            &serde_json::to_vec(&metab_req).expect("serialize metab req"),
+            &serde_json::to_vec(&dyn_req).expect("serialize dyn req"),
         );
+        assert_eq!(
+            st_dyn, 400,
+            "non-executable dynamics stage must fail closed"
+        );
+        assert!(
+            body_dyn.contains("not executable"),
+            "expected not executable error, got: {body_dyn}"
+        );
+
+        // 7. `/api/v1/dag/run` real metabolomics demo execution + idempotent cache hit
+        let metab_req = DagRunRequest {
+            dag: Some(preset_metabolomics_1d_dag()),
+            use_demo_fixture: true,
+            allow_simulation_demo: true,
+            seed: Some(7),
+            ..DagRunRequest::default()
+        };
+        let metab_body = serde_json::to_vec(&metab_req).expect("serialize metab req");
+        let (st_metab, body_metab) =
+            http_post_json(addr, "/api/v1/dag/run", "application/json", &metab_body);
         assert_eq!(st_metab, 200, "metab response: {body_metab}");
         let rm: serde_json::Value = serde_json::from_str(&body_metab).expect("parse metab");
         assert_eq!(rm["trace"]["executed_count"], serde_json::Value::from(4));
         assert!(rm["metrics"]["n_samples"].as_u64().unwrap_or(0) >= 8);
+        let (st_metab2, body_metab2) =
+            http_post_json(addr, "/api/v1/dag/run", "application/json", &metab_body);
+        assert_eq!(st_metab2, 200, "metab 2 response: {body_metab2}");
+        let rm2: serde_json::Value = serde_json::from_str(&body_metab2).expect("parse metab 2");
+        assert_eq!(rm2["trace"]["executed_count"], serde_json::Value::from(0));
+        assert_eq!(rm2["trace"]["cache_hit_count"], serde_json::Value::from(4));
+        assert_eq!(rm2["artifacts"], rm["artifacts"]);
+        assert_eq!(rm2["metrics"], rm["metrics"]);
 
         handle.shutdown();
         let _ = fs::remove_dir_all(&tmp);
