@@ -8,11 +8,12 @@
 //! (*J. Biomol. NMR* 1995), and Cramér (1946) / Rao (1945).
 
 use nmr_core::deconv_nd::{
-    deconvolve_plane_series_2d, deconvolve_roi_2d, deconvolve_roi_3d, eval_lineshape_1d,
-    eval_varpro_residual_and_jacobian_2d, eval_varpro_residual_and_jacobian_3d, lineshape_area_1d,
-    synthesize_roi_2d, synthesize_roi_3d, thompson_cox_hastings_voigt, DeconvConfig,
-    DeconvDiagnostic, DeconvError, LineshapeKind, LinewidthSharing, PeakModel2D, PeakModel3D,
-    PeakSeed2D, PeakSeed3D, PlaneSeries2D, Roi2D, Roi3D, MAX_DECONV_PEAKS_PER_CLUSTER,
+    chi2_reduced_critical_0999, deconvolve_plane_series_2d, deconvolve_roi_2d, deconvolve_roi_3d,
+    eval_lineshape_1d, eval_varpro_residual_and_jacobian_2d, eval_varpro_residual_and_jacobian_3d,
+    lineshape_area_1d, synthesize_roi_2d, synthesize_roi_3d, thompson_cox_hastings_voigt,
+    BoundSide, DeconvConfig, DeconvDiagnostic, DeconvError, LineshapeKind, LinewidthSharing,
+    PeakModel2D, PeakModel3D, PeakSeed2D, PeakSeed3D, PlaneSeries2D, Roi2D, Roi3D,
+    MAX_DECONV_HESSIAN_ELEMS, MAX_DECONV_JACOBIAN_ELEMS, MAX_DECONV_PEAKS_PER_CLUSTER,
     MAX_DECONV_PLANES, MAX_DECONV_VOXELS,
 };
 use nmr_core::relax_fit::{fit_decay_curve_cpu, DecayCurveInput, ExpFitConfig, OffsetModelGate};
@@ -798,6 +799,7 @@ fn coupled_8plane_r2_relaxation_series_beats_naive_peak_picking() {
     let res = deconvolve_plane_series_2d(&series, &seeds, &cfg).expect("plane series deconv");
     assert_eq!(res.diagnostic, DeconvDiagnostic::Converged);
     assert!(res.converged);
+    assert!(res.crlb_valid);
     assert!((res.reduced_chi2 - 1.0).abs() < 0.25);
 
     // Fit exponential decay rates to VarPro deconvolved amplitudes vs naive peak heights
@@ -808,13 +810,24 @@ fn coupled_8plane_r2_relaxation_series_beats_naive_peak_picking() {
         max_rate_s_inv: 200.0,
     };
 
+    let sigmas_slow: Vec<f64> = res.peaks[0]
+        .amplitude_se
+        .iter()
+        .map(|s| s.expect("valid CRLB SE for converged slow peak"))
+        .collect();
+    let sigmas_fast: Vec<f64> = res.peaks[1]
+        .amplitude_se
+        .iter()
+        .map(|s| s.expect("valid CRLB SE for converged fast peak"))
+        .collect();
+
     let fit_vp_slow = fit_decay_curve_cpu(
         &DecayCurveInput {
             seq_id: 1,
             res_name: "ALA".to_string(),
             times_sec: delays.clone(),
             intensities: res.peaks[0].amplitudes.clone(),
-            sigmas: res.peaks[0].amplitude_se.clone(),
+            sigmas: sigmas_slow,
         },
         &exp_cfg,
     )
@@ -825,7 +838,7 @@ fn coupled_8plane_r2_relaxation_series_beats_naive_peak_picking() {
             res_name: "GLY".to_string(),
             times_sec: delays.clone(),
             intensities: res.peaks[1].amplitudes.clone(),
-            sigmas: res.peaks[1].amplitude_se.clone(),
+            sigmas: sigmas_fast,
         },
         &exp_cfg,
     )
@@ -1574,7 +1587,8 @@ fn multi_plane_coupled_crlb_matches_monte_carlo_and_estimated_sigma() {
             let emp_se = (vals.iter().map(|&x| (x - mean).powi(2)).sum::<f64>()
                 / ((n_mc - 1) as f64))
                 .sqrt();
-            let crlb_se = ref_res.peaks[k].amplitude_se[p];
+            let crlb_se = ref_res.peaks[k].amplitude_se[p]
+                .expect("valid CRLB SE on noiseless interior reference");
             let rel = (emp_se - crlb_se).abs() / crlb_se;
             assert!(
                 rel <= 0.15,
@@ -1767,4 +1781,449 @@ fn rank_deficient_coincident_peaks_projector_matches_exact_rank1_formula() {
         err < 1.0e-12,
         "rank-1 coincident-peak VarPro Jacobian mismatch: rel_l2={err:.3e}"
     );
+}
+
+/// `[synthetic self-consistency]` Regression test (`22.1:P1-1`): verify joint Jacobian
+/// (`n_nl * total_obs`) and LM Hessian (`n_nl * n_nl`) memory budgets fail closed BEFORE any
+/// allocation on both Claude's ~26 GB shared-sharing probe and ~2.2 TB `Independent` probe, as
+/// well as a Hessian-only overflow probe and the 3D Jacobian entry point.
+#[test]
+fn memory_budget_caps_jacobian_and_hessian_before_allocation() {
+    let seed = PeakSeed2D {
+        center_f1: 5.0,
+        center_f2: 5.0,
+        fwhm_f1: 2.0,
+        fwhm_f2: 2.0,
+        eta_f1: 0.5,
+        eta_f2: 0.5,
+    };
+
+    // Build a valid 256-plane x 65_536-voxel series (each plane passes individual caps:
+    // n_planes == MAX_DECONV_PLANES, m == MAX_DECONV_VOXELS, n_peaks == MAX_DECONV_PEAKS_PER_CLUSTER).
+    let mut base_plane = vec![0.0_f64; MAX_DECONV_VOXELS];
+    base_plane[0] = 1.0;
+    let huge_series = PlaneSeries2D {
+        coords_f1: linspace(0.0, 255.0, 256),
+        coords_f2: linspace(0.0, 255.0, 256),
+        plane_values: vec![base_plane; MAX_DECONV_PLANES],
+        plane_coords: Vec::new(),
+    };
+    let max_seeds = vec![seed; MAX_DECONV_PEAKS_PER_CLUSTER];
+
+    // 1. Shared-sharing ~26 GB probe:
+    //    n_nl = 32 * 6 = 192, total_obs = 256 * 65_536 = 16_777_216
+    //    jac_elems = 3_221_225_472 (~25.8 GB f64) >> MAX_DECONV_JACOBIAN_ELEMS
+    let cfg_shared = DeconvConfig {
+        lineshape: LineshapeKind::PseudoVoigt,
+        linewidth_sharing: LinewidthSharing::SharedAcrossPlanes,
+        fit_mixing: true,
+        ..DeconvConfig::default()
+    };
+    let err_shared = deconvolve_plane_series_2d(&huge_series, &max_seeds, &cfg_shared);
+    assert_eq!(
+        err_shared,
+        Err(DeconvError::MemoryBudgetExceeded {
+            matrix: "varpro_jacobian".to_string(),
+            elements: 192 * MAX_DECONV_PLANES * MAX_DECONV_VOXELS,
+            max_elements: MAX_DECONV_JACOBIAN_ELEMS,
+        })
+    );
+
+    // 2. Independent ~2.2 TB Jacobian / 272M-elem Hessian probe:
+    //    n_nl = 32*2 + 256*32*2 + 32*2 = 16_512, total_obs = 16_777_216
+    //    jac_elems = 277_025_390_592 >> MAX_DECONV_JACOBIAN_ELEMS
+    let cfg_indep = DeconvConfig {
+        lineshape: LineshapeKind::PseudoVoigt,
+        linewidth_sharing: LinewidthSharing::Independent,
+        fit_mixing: true,
+        ..DeconvConfig::default()
+    };
+    let err_indep = deconvolve_plane_series_2d(&huge_series, &max_seeds, &cfg_indep);
+    assert_eq!(
+        err_indep,
+        Err(DeconvError::MemoryBudgetExceeded {
+            matrix: "varpro_jacobian".to_string(),
+            elements: 16_512 * MAX_DECONV_PLANES * MAX_DECONV_VOXELS,
+            max_elements: MAX_DECONV_JACOBIAN_ELEMS,
+        })
+    );
+
+    // 3. Hessian-specific cap probe: Jacobian fits (5_263_360 <= 8_000_000),
+    //    but Hessian n_nl^2 = 1_028^2 = 1_056_784 > MAX_DECONV_HESSIAN_ELEMS.
+    let mut small_plane = vec![0.0_f64; 20];
+    small_plane[0] = 1.0;
+    let hess_series = PlaneSeries2D {
+        coords_f1: linspace(0.0, 3.0, 4),
+        coords_f2: linspace(0.0, 4.0, 5),
+        plane_values: vec![small_plane; MAX_DECONV_PLANES],
+        plane_coords: Vec::new(),
+    };
+    let cfg_hess = DeconvConfig {
+        lineshape: LineshapeKind::Lorentzian,
+        linewidth_sharing: LinewidthSharing::Independent,
+        fit_mixing: false,
+        ..DeconvConfig::default()
+    };
+    let err_hess = deconvolve_plane_series_2d(&hess_series, &[seed; 2], &cfg_hess);
+    assert_eq!(
+        err_hess,
+        Err(DeconvError::MemoryBudgetExceeded {
+            matrix: "lm_hessian".to_string(),
+            elements: 1_028 * 1_028,
+            max_elements: MAX_DECONV_HESSIAN_ELEMS,
+        })
+    );
+
+    // 4. 3D Jacobian entry point also enforces MAX_DECONV_JACOBIAN_ELEMS before allocation:
+    //    m = 32*32*64 = 65_536, n_peaks = 32 PseudoVoigt -> n_nl = 288 -> 18_874_368 > 8_000_000.
+    let mut vals_3d = vec![0.0_f64; MAX_DECONV_VOXELS];
+    vals_3d[0] = 1.0;
+    let roi_3d = Roi3D::from_grid(32, 32, 64, vals_3d).expect("32x32x64 grid");
+    let seed3 = PeakSeed3D {
+        center_f1: 16.0,
+        center_f2: 16.0,
+        center_f3: 32.0,
+        fwhm_f1: 2.0,
+        fwhm_f2: 2.0,
+        fwhm_f3: 2.0,
+        eta_f1: 0.5,
+        eta_f2: 0.5,
+        eta_f3: 0.5,
+    };
+    let err_3d = eval_varpro_residual_and_jacobian_3d(
+        &roi_3d,
+        &[seed3; MAX_DECONV_PEAKS_PER_CLUSTER],
+        &cfg_shared,
+    );
+    assert_eq!(
+        err_3d,
+        Err(DeconvError::MemoryBudgetExceeded {
+            matrix: "varpro_jacobian".to_string(),
+            elements: 288 * MAX_DECONV_VOXELS,
+            max_elements: MAX_DECONV_JACOBIAN_ELEMS,
+        })
+    );
+}
+
+/// `[synthetic self-consistency]` Verify exact upper-tail critical reduced chi-squared
+/// $\chi^2_{0.999}(\nu) / \nu$ against reference $\chi^2$ quantiles across 5 decades of DOF.
+#[test]
+fn chi2_critical_reduced_0999_matches_reference_tables() {
+    // Textbook chi^2_{0.999}(nu) values divided by nu:
+    let reference: [(usize, f64); 7] = [
+        (1, 10.827_566_17 / 1.0),
+        (2, 13.815_510_56 / 2.0),
+        (5, 20.515_005_65 / 5.0),
+        (10, 29.588_298_45 / 10.0),
+        (50, 86.660_815_40 / 50.0),
+        (100, 149.449_252_77 / 100.0),
+        (1000, 1_143.917_38 / 1000.0),
+    ];
+    for (dof, expected) in reference {
+        let got = chi2_reduced_critical_0999(dof);
+        let rel = (got - expected).abs() / expected;
+        assert!(
+            rel < 1.0e-5,
+            "dof={dof}: got {got:.8}, expected {expected:.8}, rel={rel:.3e}"
+        );
+    }
+    // Very large DOF (> 10_000) Wilson–Hilferty asymptotic branch stays finite and close to 1.0.
+    let large = chi2_reduced_critical_0999(100_000);
+    assert!(large > 1.01 && large < 1.02, "dof=100000 gave {large}");
+}
+
+/// `[synthetic self-consistency]` Regression test (`22.1:P1-2`): verify fail-closed diagnostics
+/// and CRLB suppression on:
+/// 1. Claude Probe A: center pinned at `max_center_shift_fwhm` bound with known $\sigma$ and
+///    $\chi^2_\nu \gg 100$ (emits `ActiveBoundHit` + `ModelMisspecified`, NOT `Converged`, and
+///    reports `None` for pinned center SE and misspecified amplitude SE).
+/// 2. Claude Probe B: two peaks fitted with one peak at known $\sigma$ with strictly interior
+///    parameters (emits `ModelMisspecified { reduced_chi2 }`, NOT `Converged`, `crlb_valid == false`,
+///    no bogus CRLB SEs).
+/// 3. Active bound hit without model misspecification (`noise_sigma: None` pinned center,
+///    PseudoVoigt `eta` pinned at `0.0` on pure Gaussian, and `min_fwhm` / `max_fwhm` bound).
+/// 4. 3D ROI and coupled multi-plane series fail-closed propagation.
+#[test]
+fn fail_closed_pinned_center_and_misspecified_model_diagnostics() {
+    let c1 = linspace(0.0, 20.0, 21);
+    let c2 = linspace(0.0, 20.0, 21);
+
+    // -------------------------------------------------------------------------
+    // Probe 1: Pinned center at `max_center_shift_fwhm` with known sigma (reduced chi^2 ~ 800+)
+    // -------------------------------------------------------------------------
+    let single_true = [PeakModel2D {
+        amplitude: 100.0,
+        center_f1: 10.0,
+        center_f2: 10.0,
+        fwhm_f1: 3.0,
+        fwhm_f2: 3.0,
+        eta_f1: 1.0,
+        eta_f2: 1.0,
+    }];
+    let mut roi_pin =
+        synthesize_roi_2d(&c1, &c2, LineshapeKind::Lorentzian, &single_true, 0.0).expect("synth");
+    let sigma = 0.25;
+    let mut rng = Rng::new(2026_2211);
+    for v in &mut roi_pin.values {
+        *v += rng.normal(0.0, sigma);
+    }
+    // Seed F1 center at 8.0 with max_center_shift_fwhm = 0.25 -> F1 boxed to [7.25, 8.75],
+    // preventing the optimizer from reaching true center 10.0.
+    let pinned_seed = [PeakSeed2D {
+        center_f1: 8.0,
+        center_f2: 10.0,
+        fwhm_f1: 3.0,
+        fwhm_f2: 3.0,
+        eta_f1: 1.0,
+        eta_f2: 1.0,
+    }];
+    let cfg_pin = DeconvConfig {
+        lineshape: LineshapeKind::Lorentzian,
+        noise_sigma: Some(sigma),
+        max_center_shift_fwhm: Some(0.25),
+        ..DeconvConfig::default()
+    };
+    let res_pin = deconvolve_roi_2d(&roi_pin, &pinned_seed, &cfg_pin).expect("pinned fit");
+    assert_ne!(res_pin.diagnostic, DeconvDiagnostic::Converged);
+    assert_eq!(res_pin.diagnostic, DeconvDiagnostic::ActiveBoundHit);
+    assert!(res_pin
+        .all_diagnostics
+        .contains(&DeconvDiagnostic::ActiveBoundHit));
+    assert!(
+        res_pin.reduced_chi2 > 100.0,
+        "expected huge reduced_chi2 from pinned center, got {}",
+        res_pin.reduced_chi2
+    );
+    assert!(res_pin.all_diagnostics.iter().any(|d| matches!(
+        d,
+        DeconvDiagnostic::ModelMisspecified { reduced_chi2 } if *reduced_chi2 > 100.0
+    )));
+    assert!(!res_pin.crlb_valid);
+    assert!(res_pin
+        .active_bounds
+        .iter()
+        .any(|b| b.param_name == "peak[0].center_f1" && b.side == BoundSide::Upper));
+    assert!((res_pin.peaks[0].center_f1 - 8.75).abs() < 1.0e-9);
+    // Pinned center and misspecified fit must NOT report bogus CRLB SEs!
+    assert!(res_pin.peaks[0].center_f1_se.is_none());
+    assert!(res_pin.peaks[0].amplitude_se.is_none());
+    assert!(res_pin.peaks[0].volume_se.is_none());
+
+    // -------------------------------------------------------------------------
+    // Probe 2: Two peaks fitted with one peak at known sigma (interior optimum -> ModelMisspecified)
+    // -------------------------------------------------------------------------
+    let two_true = [
+        PeakModel2D {
+            amplitude: 80.0,
+            center_f1: 7.5,
+            center_f2: 10.0,
+            fwhm_f1: 2.8,
+            fwhm_f2: 2.8,
+            eta_f1: 0.0,
+            eta_f2: 0.0,
+        },
+        PeakModel2D {
+            amplitude: 80.0,
+            center_f1: 12.5,
+            center_f2: 10.0,
+            fwhm_f1: 2.8,
+            fwhm_f2: 2.8,
+            eta_f1: 0.0,
+            eta_f2: 0.0,
+        },
+    ];
+    let mut roi_two =
+        synthesize_roi_2d(&c1, &c2, LineshapeKind::Gaussian, &two_true, 0.0).expect("synth two");
+    for v in &mut roi_two.values {
+        *v += rng.normal(0.0, sigma);
+    }
+    let one_seed = [PeakSeed2D {
+        center_f1: 10.0,
+        center_f2: 10.0,
+        fwhm_f1: 4.0,
+        fwhm_f2: 2.8,
+        eta_f1: 0.0,
+        eta_f2: 0.0,
+    }];
+    let cfg_misspec = DeconvConfig {
+        lineshape: LineshapeKind::Gaussian,
+        noise_sigma: Some(sigma),
+        ..DeconvConfig::default()
+    };
+    let res_mis = deconvolve_roi_2d(&roi_two, &one_seed, &cfg_misspec).expect("misspec fit");
+    assert!(res_mis.active_bounds.is_empty());
+    assert_ne!(res_mis.diagnostic, DeconvDiagnostic::Converged);
+    assert!(
+        matches!(
+            res_mis.diagnostic,
+            DeconvDiagnostic::ModelMisspecified { reduced_chi2 } if reduced_chi2 > 10.0
+        ),
+        "expected ModelMisspecified for 2-peak data fitted with 1 peak, got {:?}",
+        res_mis.diagnostic
+    );
+    assert!(!res_mis.crlb_valid);
+    assert!(res_mis.peaks[0].amplitude_se.is_none());
+    assert!(res_mis.peaks[0].volume_se.is_none());
+    assert!(res_mis.peaks[0].center_f1_se.is_none());
+    assert!(res_mis.peaks[0].fwhm_f1_se.is_none());
+
+    // -------------------------------------------------------------------------
+    // Probe 3A: Active bound WITHOUT known sigma (noise_sigma: None) -> ActiveBoundHit,
+    //           pinned center_f1_se == None while unpinned parameters stay finite & NaN-free.
+    // -------------------------------------------------------------------------
+    let cfg_pin_unknown_sigma = DeconvConfig {
+        lineshape: LineshapeKind::Lorentzian,
+        noise_sigma: None,
+        max_center_shift_fwhm: Some(0.25),
+        ..DeconvConfig::default()
+    };
+    let res_pin_unk =
+        deconvolve_roi_2d(&roi_pin, &pinned_seed, &cfg_pin_unknown_sigma).expect("pin unk sigma");
+    assert_eq!(res_pin_unk.diagnostic, DeconvDiagnostic::ActiveBoundHit);
+    assert!(!res_pin_unk.crlb_valid);
+    assert!(res_pin_unk.peaks[0].center_f1_se.is_none());
+    // Unpinned parameters get finite conditional SEs (never NaN).
+    assert!(res_pin_unk.peaks[0]
+        .center_f2_se
+        .is_some_and(|v| v.is_finite() && v > 0.0));
+
+    // -------------------------------------------------------------------------
+    // Probe 3B: PseudoVoigt mixing eta pinned at 0.0 on pure Gaussian data -> ActiveBoundHit,
+    //           eta_f1_se / eta_f2_se / volume_se == None (volume depends on pinned eta).
+    // -------------------------------------------------------------------------
+    let pure_gauss = [PeakModel2D {
+        amplitude: 80.0,
+        center_f1: 10.0,
+        center_f2: 10.0,
+        fwhm_f1: 3.0,
+        fwhm_f2: 3.0,
+        eta_f1: 0.0,
+        eta_f2: 0.0,
+    }];
+    let roi_gauss =
+        synthesize_roi_2d(&c1, &c2, LineshapeKind::Gaussian, &pure_gauss, 0.0).expect("gauss");
+    let pv_seed = [PeakSeed2D {
+        center_f1: 10.0,
+        center_f2: 10.0,
+        fwhm_f1: 3.0,
+        fwhm_f2: 3.0,
+        eta_f1: 0.2,
+        eta_f2: 0.2,
+    }];
+    let cfg_pv = DeconvConfig {
+        lineshape: LineshapeKind::PseudoVoigt,
+        fit_mixing: true,
+        noise_sigma: Some(0.25),
+        ..DeconvConfig::default()
+    };
+    let res_eta_bound = deconvolve_roi_2d(&roi_gauss, &pv_seed, &cfg_pv).expect("eta bound fit");
+    assert_eq!(res_eta_bound.diagnostic, DeconvDiagnostic::ActiveBoundHit);
+    assert!(!res_eta_bound.crlb_valid);
+    assert!(res_eta_bound
+        .active_bounds
+        .iter()
+        .any(|b| b.param_name == "peak[0].eta_f1" && b.side == BoundSide::Lower));
+    assert!(res_eta_bound.peaks[0].eta_f1_se.is_none());
+    assert!(res_eta_bound.peaks[0].volume_se.is_none());
+
+    // -------------------------------------------------------------------------
+    // Probe 3C: min/max FWHM box bound hit -> ActiveBoundHit, fwhm_se == None, volume_se == None
+    //           and max_reduced_chi2 validation check.
+    // -------------------------------------------------------------------------
+    let cfg_fwhm_bound = DeconvConfig {
+        lineshape: LineshapeKind::Gaussian,
+        noise_sigma: None,
+        max_fwhm_span_frac: 0.1, // caps FWHM at 0.1 * 20 = 2.0 < true 3.0
+        ..DeconvConfig::default()
+    };
+    let fwhm_seed = [PeakSeed2D {
+        center_f1: 10.0,
+        center_f2: 10.0,
+        fwhm_f1: 1.8,
+        fwhm_f2: 1.8,
+        eta_f1: 0.0,
+        eta_f2: 0.0,
+    }];
+    let res_fwhm_bound =
+        deconvolve_roi_2d(&roi_gauss, &fwhm_seed, &cfg_fwhm_bound).expect("fwhm bound fit");
+    assert_eq!(res_fwhm_bound.diagnostic, DeconvDiagnostic::ActiveBoundHit);
+    assert!(!res_fwhm_bound.crlb_valid);
+    assert!(res_fwhm_bound
+        .active_bounds
+        .iter()
+        .any(|b| b.param_name == "peak[0].fwhm_f1" && b.side == BoundSide::Upper));
+    assert!(res_fwhm_bound.peaks[0].fwhm_f1_se.is_none());
+    assert!(res_fwhm_bound.peaks[0].volume_se.is_none());
+
+    let bad_chi2_cfg = DeconvConfig {
+        max_reduced_chi2: Some(0.0),
+        ..DeconvConfig::default()
+    };
+    assert!(matches!(
+        deconvolve_roi_2d(&roi_gauss, &fwhm_seed, &bad_chi2_cfg),
+        Err(DeconvError::InvalidParameter(_))
+    ));
+
+    // -------------------------------------------------------------------------
+    // Probe 4: 3D ROI and PlaneSeries2D fail-closed propagation
+    // -------------------------------------------------------------------------
+    let c3 = linspace(0.0, 10.0, 11);
+    let true_3d = [PeakModel3D {
+        amplitude: 50.0,
+        center_f1: 5.0,
+        center_f2: 5.0,
+        center_f3: 5.0,
+        fwhm_f1: 2.2,
+        fwhm_f2: 2.2,
+        fwhm_f3: 2.2,
+        eta_f1: 0.0,
+        eta_f2: 0.0,
+        eta_f3: 0.0,
+    }];
+    let mut roi_3d =
+        synthesize_roi_3d(&c3, &c3, &c3, LineshapeKind::Gaussian, &true_3d, 0.0).expect("synth 3d");
+    for v in &mut roi_3d.values {
+        *v += rng.normal(0.0, 0.1);
+    }
+    let pin_seed_3d = [PeakSeed3D {
+        center_f1: 3.5,
+        center_f2: 5.0,
+        center_f3: 5.0,
+        fwhm_f1: 2.2,
+        fwhm_f2: 2.2,
+        fwhm_f3: 2.2,
+        eta_f1: 0.0,
+        eta_f2: 0.0,
+        eta_f3: 0.0,
+    }];
+    let cfg_3d_pin = DeconvConfig {
+        lineshape: LineshapeKind::Gaussian,
+        noise_sigma: Some(0.1),
+        max_center_shift_fwhm: Some(0.2),
+        ..DeconvConfig::default()
+    };
+    let res_3d_pin = deconvolve_roi_3d(&roi_3d, &pin_seed_3d, &cfg_3d_pin).expect("3d pin fit");
+    assert_eq!(res_3d_pin.diagnostic, DeconvDiagnostic::ActiveBoundHit);
+    assert!(!res_3d_pin.crlb_valid);
+    assert!(res_3d_pin.peaks[0].center_f1_se.is_none());
+    assert!(res_3d_pin.peaks[0].amplitude_se.is_none());
+
+    let series_mis = PlaneSeries2D {
+        coords_f1: c1,
+        coords_f2: c2,
+        plane_values: vec![roi_two.values.clone(), roi_two.values],
+        plane_coords: vec![0.0, 1.0],
+    };
+    let res_series_mis =
+        deconvolve_plane_series_2d(&series_mis, &one_seed, &cfg_misspec).expect("series mis");
+    assert!(matches!(
+        res_series_mis.diagnostic,
+        DeconvDiagnostic::ModelMisspecified { reduced_chi2 } if reduced_chi2 > 10.0
+    ));
+    assert!(!res_series_mis.crlb_valid);
+    assert!(res_series_mis.peaks[0]
+        .amplitude_se
+        .iter()
+        .all(Option::is_none));
+    assert!(res_series_mis.peaks[0].center_f1_se.is_none());
 }
