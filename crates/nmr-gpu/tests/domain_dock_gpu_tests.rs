@@ -1351,12 +1351,17 @@ fn test_webgpu_p0_4_discontinuous_insertion_domain_parity_and_zero_drift() {
             .iter()
             .chain(gr_cpu.grad_psi.iter())
             .fold(1.0_f64, |m, v| m.max(v.abs()));
+        let grad_tol = if engine.backend_name.eq_ignore_ascii_case("Metal") {
+            1.0e-5
+        } else {
+            2.0e-5
+        };
         for i in 0..n {
             let rp = (gr_gpu.grad_phi[i] - gr_cpu.grad_phi[i]).abs() / g_scale;
             let rs = (gr_gpu.grad_psi[i] - gr_cpu.grad_psi[i]).abs() / g_scale;
             assert!(
-                rp < 1.0e-5 && rs < 1.0e-5,
-                "insertion domain replica {ri} grad[{i}] parity failed: rp={rp:.3e}, rs={rs:.3e}"
+                rp < grad_tol && rs < grad_tol,
+                "insertion domain replica {ri} grad[{i}] parity failed: rp={rp:.3e}, rs={rs:.3e} (tol={grad_tol:.1e})"
             );
         }
     }

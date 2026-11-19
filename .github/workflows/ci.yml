@@ -64,7 +64,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings -A unknown_lints -A clippy::chunks_exact_to_as_chunks -A clippy::needless_range_loop
 
       - name: Run workspace release test suite (nmr-core + nmr-gpu parity)
-        run: RUSTFLAGS="-D warnings" cargo test --release --workspace
+        run: |
+          RUSTFLAGS="-D warnings" cargo test --release -p nmr-core -p nmr-gui -p nmr-cli
+          RUSTFLAGS="-D warnings" cargo test --release -p nmr-gpu -- --test-threads=1
 
       - name: Verify S1 golden 5c4e87d CPU & WebGPU U/P matrix snapshots
         run: cargo test --release -p nmr-gpu --test af_assign_gpu_tests
@@ -178,7 +180,9 @@ jobs:
           CARGO_PROFILE_TEST_OPT_LEVEL: "1"
           CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
           CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
-        run: cargo test --workspace
+        run: |
+          cargo test -p nmr-core -p nmr-gui -p nmr-cli
+          cargo test -p nmr-gpu -- --test-threads=1
 
   wasm-check:
     name: WebAssembly + WebGPU GUI Check (wasm32-unknown-unknown)
