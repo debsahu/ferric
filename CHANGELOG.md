@@ -4,11 +4,11 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
-## [Unreleased] — Phase 22 (`T22.1`–`T22.13`, awaiting Claude FINAL `phase=22` marker for `v0.17.0`)
+## [0.17.0] — 2026-11-19
 
 ### Phase 22 — Quantitative Spectroscopy, Relaxation Physics, Neural Inference Architectures & Typed DAG Workflow Engine (`T22.1`–`T22.13`)
 
-Status: **All 13/13 slices `APPROVE_WITH_FOLLOWUPS` by Claude (Rounds 1–3); awaiting Claude FINAL `phase=22` marker and green CI before tagging `v0.17.0`**. Zero changes to solver scoring, priors, `docs/specs/03-assignment.md`, or `.github/workflows/docs.yml`. All new modules are validated on **synthetic self-consistency benchmarks** (no cold real-data empirical validation claims); CLI/GUI/HTTP reachability covers `T22.11` (`ferric dag`, `/api/v1/dag/*`, `WorkflowDagPanel`), while the 9 new quantitative/neural core modules are library-level (`nmr-core` / `nmr-gpu`) with CLI/GUI wiring tracked as P2 follow-ups in `TODO.md`.
+- **Release Provenance**: Claude FINAL `phase=22` approval received across all 13/13 tasks (`T22.1`–`T22.13`); full workspace release suite verified at **972 passed, 0 failed, 7 ignored** (`f51dab5`), `fmt`, `clippy -D warnings`, `wasm32-unknown-unknown`, `verify_p17_preregistration --check` (`8/8`), `check_docs_cli_flags --check` (`44` subcommands), and `build_docs_manual --check` (`10` pages) all PASS. Zero changes to solver scoring, priors, `docs/specs/03-assignment.md`, or `.github/workflows/docs.yml`. All new modules are validated on **synthetic self-consistency benchmarks** (no cold real-data empirical validation claims); CLI/GUI/HTTP reachability in `v0.17.0` covers `T22.11` (`ferric dag`, `/api/v1/dag/*`, `WorkflowDagPanel`), while the 9 new quantitative/neural core modules are library-level (`nmr-core` / `nmr-gpu`) with CLI/GUI wiring tracked as P2 follow-ups in `TODO.md`.
 
 - **Wave `22.W1` — Multi-Dimensional Lineshape Deconvolution, Time-Domain `FID-Net` & Convex MaxEnt NUS (`T22.1`, `T22.2`, `T22.13`)**:
   - **`T22.1` (`nmr-core::deconv_nd`)**: Coupled 2D/3D multi-peak Voigt/Lorentzian/Gaussian lineshape deconvolution via full Golub–Pereyra separable variable-projection (`VarPro`) nonlinear least squares with block-Schur Cramér–Rao amplitude covariance, joint Jacobian/Hessian pre-allocation caps (`MAX_DECONV_JACOBIAN_ELEMS = 8M`, `MAX_DECONV_HESSIAN_ELEMS = 1M`), active-bound (`ActiveBoundHit`) and exact known-$\sigma$ $\chi^2_\nu$ (`ModelMisspecified`) fail-closed diagnostics that suppress covariance/correlation matrices (`None`) when `crlb_valid == false`, and constant-offset-per-plane baselines (known-$\sigma$ limitation documented).
