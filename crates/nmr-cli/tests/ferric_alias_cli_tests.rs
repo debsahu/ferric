@@ -63,5 +63,9 @@ fn test_ferric_version_output_exact_format_and_empty_stderr() {
         line.starts_with(&expected_prefix) && line.ends_with(") \u{2014} Rust + WebGPU"),
         "unexpected --version output: {line:?}"
     );
-    assert!(line.contains("0.15.0"), "expected v0.15.0 in {line:?}");
+    assert!(
+        line.contains(nmr_core::VERSION),
+        "expected nmr_core::VERSION ({}) in {line:?}",
+        nmr_core::VERSION
+    );
 }
