@@ -1,0 +1,3734 @@
+//! Pure-Rust Symmetric Dilated-Convolution Time-Domain `FID-Net` Engine
+//! for Non-Uniform Sampling (NUS) reconstruction, virtual homonuclear $J$-decoupling, and
+//! complex time-domain FID denoising.
+//!
+//! ## Weight Status (Important)
+//! **Untrained architecture (no bundled pretrained weights; requires user-supplied or externally
+//! trained `FIDNET-V1` weights).** `FidNetModel::init_random` produces deterministic random
+//! Xavier/Glorot initializations for training or testing; no pretrained production weights are
+//! shipped in this crate.
+//!
+//! ## Provenance & License Attribution
+//! Clean-room pure-Rust implementation of the MIT-licensed `FID-Net` symmetric dilated-convolution
+//! gated-activation time-domain NMR architecture (with an optional direct input residual skip
+//! connection `input_residual_skip`, which is a skip-connection option on the `FID-Net` backbone
+//! and NOT the full `FID-Net-2` architecture):
+//! - Karunanithy, G. & Hansen, D. F. (2021), *J. Biomol. NMR* 75, 179–191
+//!   ("FID-Net: A versatile deep neural network architecture for NMR spectral reconstruction
+//!   and virtual decoupling").
+//! - Karunanithy, G., Mackenzie, H. W. & Hansen, D. F. (2021), *J. Am. Chem. Soc.* 143(41),
+//!   16935–16942 ("Virtual Homonuclear Decoupling in Direct Detection Nuclear Magnetic
+//!   Resonance Experiments Using Deep Neural Networks").
+//! - Karunanithy, G. et al. (2024), *Nat. Commun.* (upstream `FID-Net` family reference).
+//! - Shukla et al. (2024), *Sci. Adv.* (upstream `FID-Net` family reference).
+//! - Reference architecture repository: <https://github.com/gogulan-k/FID-Net> (MIT License).
+//! - Gated dilated convolution block inspiration: van den Oord, A. et al. (2016),
+//!   *arXiv:1609.03499* (adapted to non-causal symmetric dilated 1D convolutions in `FID-Net`).
+//! - Sine-weighted Poisson-gap NUS schedule generation: Hyberts, S. G., Takeuchi, K. &
+//!   Wagner, G. (2010), *J. Am. Chem. Soc.* 132(7), 2145–2147.
+//! - Adaptive moment estimation (`Adam`) optimizer: Kingma, D. P. & Ba, J. (2015), *ICLR*.
+
+use std::f64::consts::{PI, TAU};
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::fid::{Complex64, Fid2D, Fid3D, QuadMode};
+use crate::ops::fft_arbitrary_in_place;
+use crate::rng::Rng;
+use crate::torsion_db::sha256_hex;
+
+// ============================================================================
+// Constants & Hostile-Input Caps
+// ============================================================================
+
+/// Explicit weight-status disclosure string for metadata and diagnostics.
+pub const FIDNET_WEIGHTS_STATUS: &str = "untrained architecture (no bundled pretrained weights; requires user-supplied or externally trained FIDNET-V1 weights)";
+
+/// Canonical version identifier for serialized `FID-Net` weight bundles.
+pub const FIDNET_BUNDLE_FORMAT_VERSION: &str = "FIDNET-V1";
+
+/// Binary magic prefix for compact `FIDNET-V1` binary weight bundles.
+pub const FIDNET_BINARY_MAGIC: &[u8; 8] = b"FIDNET1\0";
+
+/// Maximum supported complex time-domain length per 1D FID.
+pub const MAX_FIDNET_LENGTH: usize = 65_536;
+
+/// Maximum residual or skip channel width permitted in a `FidNetConfig`.
+pub const MAX_FIDNET_CHANNELS: usize = 256;
+
+/// Maximum number of symmetric dilated convolution blocks permitted in a `FidNetConfig`.
+pub const MAX_FIDNET_BLOCKS: usize = 64;
+
+/// Maximum 1D dilated kernel width permitted in a `FidNetConfig`.
+pub const MAX_FIDNET_KERNEL_SIZE: usize = 31;
+
+/// Maximum per-block dilation factor permitted in a `FidNetConfig`.
+pub const MAX_FIDNET_DILATION: usize = 4_096;
+
+/// Maximum total scalar parameter count permitted in a `FidNetWeights` bundle
+/// (guards against hostile allocation bombs).
+pub const MAX_FIDNET_PARAMS: usize = 16_777_216;
+
+/// Maximum working activation memory (in bytes) permitted for cache-free 1D inference
+/// at `MAX_FIDNET_LENGTH` (enforced in `FidNetConfig::validate()` so wide configs such as
+/// `C = 256, K = 1, 64 blocks` fail closed before allocating).
+pub const MAX_FIDNET_INFERENCE_ACTIVATION_BYTES: usize = 256 * 1024 * 1024;
+
+/// Maximum activation-cache memory (in bytes) permitted for a single backpropagation forward pass.
+pub const MAX_FIDNET_TRAINING_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Maximum JSON byte length accepted by `FidNetWeightBundle::from_json`.
+pub const MAX_FIDNET_JSON_BYTES: usize = 256 * 1024 * 1024;
+
+/// Maximum batch size for multi-column inference.
+pub const MAX_FIDNET_BATCH: usize = 65_536;
+
+/// Minimum number of observed (sampled) time-domain points required for spectral SNR estimation;
+/// inputs with fewer observed points report finite `0.0` SNR and abstain fail-closed.
+pub const MIN_FIDNET_OBSERVED_POINTS: usize = 8;
+
+// ============================================================================
+// Errors
+// ============================================================================
+
+/// Errors returned by `FID-Net` configuration, serialization, training, and inference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FidNetError {
+    InvalidConfig(String),
+    InvalidWeights(String),
+    UntrainedWeights(String),
+    UnsupportedFormatVersion(String),
+    ChecksumMismatch { expected: String, actual: String },
+    SerializationError(String),
+    NonFiniteInput(String),
+    OversizedFid { len: usize, max_len: usize },
+    EmptyInput(String),
+    ShapeMismatch(String),
+}
+
+impl fmt::Display for FidNetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(msg) => write!(f, "invalid FID-Net config: {msg}"),
+            Self::InvalidWeights(msg) => write!(f, "invalid FID-Net weights: {msg}"),
+            Self::UntrainedWeights(msg) => write!(
+                f,
+                "refusing FID-Net inference with untrained weights ({msg}); load verified trained FIDNET-V1 weights or set allow_untrained_for_testing=true for architecture/parity testing"
+            ),
+            Self::UnsupportedFormatVersion(v) => {
+                write!(f, "unsupported FID-Net bundle format version: {v}")
+            }
+            Self::ChecksumMismatch { expected, actual } => write!(
+                f,
+                "FID-Net weight bundle SHA-256 mismatch (expected {expected}, got {actual})"
+            ),
+            Self::SerializationError(msg) => write!(f, "FID-Net serialization error: {msg}"),
+            Self::NonFiniteInput(msg) => write!(f, "non-finite FID-Net input: {msg}"),
+            Self::OversizedFid { len, max_len } => {
+                write!(f, "FID length {len} exceeds MAX_FIDNET_LENGTH ({max_len})")
+            }
+            Self::EmptyInput(msg) => write!(f, "empty FID-Net input: {msg}"),
+            Self::ShapeMismatch(msg) => write!(f, "FID-Net shape mismatch: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for FidNetError {}
+
+// ============================================================================
+// Task, Configuration, Weights & Bundle Serialization
+// ============================================================================
+
+/// Target time-domain NMR task performed by a `FID-Net` model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FidNetTask {
+    /// Non-uniformly sampled (NUS) time-domain reconstruction.
+    NusReconstruction,
+    /// Virtual homonuclear scalar-coupling ($J$) decoupling (e.g. $^{13}\text{C}\text{–}^{13}\text{C}$ or $^1\text{H}\text{–}^1\text{H}$).
+    VirtualDecoupling,
+    /// Time-domain thermal noise suppression.
+    Denoising,
+}
+
+/// Architectural configuration for a symmetric dilated-convolution `FID-Net` model
+/// (untrained architecture; requires user-supplied or externally trained `FIDNET-V1` weights).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FidNetConfig {
+    /// Target NMR task.
+    pub task: FidNetTask,
+    /// Whether an explicit binary NUS sampling mask channel `m(t) ∈ {0, 1}` is appended.
+    pub use_mask_channel: bool,
+    /// Whether an explicit scalar-coupling conditioning channel `c(t)` is appended.
+    pub use_coupling_channel: bool,
+    /// Hidden channel count `C` inside the symmetric dilated residual stack.
+    pub residual_channels: usize,
+    /// Channel count `S` of the skip-connection accumulator and post-processing head.
+    pub skip_channels: usize,
+    /// Odd 1D convolution kernel size `K` (symmetric padding radius `(K - 1) / 2`).
+    pub kernel_size: usize,
+    /// Per-block dilation schedule (e.g. `[1, 2, 4, 8, 16]`).
+    pub dilations: Vec<usize>,
+    /// If `true`, adds the input complex FID `[Re(t), Im(t)]` directly to the linear output head.
+    /// This is a residual skip-connection option on the `FID-Net` dilated-convolution backbone,
+    /// NOT the full `FID-Net-2` architecture.
+    pub input_residual_skip: bool,
+}
+
+impl FidNetConfig {
+    /// Compact default configuration for NUS reconstruction (`[Re, Im, mask]`).
+    pub fn nus_default(residual_channels: usize, skip_channels: usize) -> Self {
+        Self {
+            task: FidNetTask::NusReconstruction,
+            use_mask_channel: true,
+            use_coupling_channel: false,
+            residual_channels,
+            skip_channels,
+            kernel_size: 5,
+            dilations: vec![1, 2, 4, 8],
+            input_residual_skip: true,
+        }
+    }
+
+    /// Compact default configuration for virtual homonuclear decoupling (`[Re, Im, j_cond]`).
+    pub fn virtual_decoupling_default(residual_channels: usize, skip_channels: usize) -> Self {
+        Self {
+            task: FidNetTask::VirtualDecoupling,
+            use_mask_channel: false,
+            use_coupling_channel: true,
+            residual_channels,
+            skip_channels,
+            kernel_size: 5,
+            dilations: vec![1, 2, 4, 8],
+            input_residual_skip: true,
+        }
+    }
+
+    /// Compact default configuration for time-domain denoising (`[Re, Im]`).
+    pub fn denoising_default(residual_channels: usize, skip_channels: usize) -> Self {
+        Self {
+            task: FidNetTask::Denoising,
+            use_mask_channel: false,
+            use_coupling_channel: false,
+            residual_channels,
+            skip_channels,
+            kernel_size: 5,
+            dilations: vec![1, 2, 4, 8],
+            input_residual_skip: true,
+        }
+    }
+
+    /// Number of input channels (`2` for `[Re, Im]` + optional mask + optional coupling).
+    #[inline]
+    pub fn in_channels(&self) -> usize {
+        2 + usize::from(self.use_mask_channel) + usize::from(self.use_coupling_channel)
+    }
+
+    /// Number of symmetric dilated residual blocks.
+    #[inline]
+    pub fn num_blocks(&self) -> usize {
+        self.dilations.len()
+    }
+
+    /// Symmetric receptive field half-width in time points.
+    #[inline]
+    pub fn receptive_field_radius(&self) -> usize {
+        let half_k = self.kernel_size / 2;
+        self.dilations.iter().fold(0usize, |acc, &d| {
+            acc.saturating_add(half_k.saturating_mul(d))
+        })
+    }
+
+    /// Working activation memory (in bytes) required by the cache-free `f64` inference path
+    /// (`forward_features_inference`) for a single 1D FID of length `t_len`.
+    pub fn inference_activation_bytes(&self, t_len: usize) -> Result<usize, FidNetError> {
+        // Buffers: x_in (in_ch*T), h_cur/h_next/z (3*C*T), skip_sum/h1 (2*S*T),
+        // f_row/g_row (2*T), output Complex64 (2*T).
+        let res_part = self.residual_channels.checked_mul(3).ok_or_else(|| {
+            FidNetError::InvalidConfig("inference activation residual channel overflow".into())
+        })?;
+        let skip_part = self.skip_channels.checked_mul(2).ok_or_else(|| {
+            FidNetError::InvalidConfig("inference activation skip channel overflow".into())
+        })?;
+        let total_channels = self
+            .in_channels()
+            .checked_add(res_part)
+            .and_then(|v| v.checked_add(skip_part))
+            .and_then(|v| v.checked_add(4))
+            .ok_or_else(|| {
+                FidNetError::InvalidConfig("inference activation channel count overflow".into())
+            })?;
+        total_channels
+            .checked_mul(t_len)
+            .and_then(|v| v.checked_mul(std::mem::size_of::<f64>()))
+            .ok_or_else(|| {
+                FidNetError::InvalidConfig("inference activation byte count overflow".into())
+            })
+    }
+
+    /// Activation-cache memory (in bytes) required by `forward_features_with_cache` (training
+    /// backpropagation) for a single 1D FID of length `t_len`.
+    pub fn training_cache_bytes(&self, t_len: usize) -> Result<usize, FidNetError> {
+        // Buffers: x_in (in_ch*T), h_states ((B+1)*C*T), per-block f_pre/g_pre/tf/sg/z (5*B*C*T),
+        // skip_sum/skip_act/h1_pre/h1_act (4*S*T), output (2*T).
+        let blocks_factor = self
+            .num_blocks()
+            .checked_mul(6)
+            .and_then(|v| v.checked_add(1))
+            .ok_or_else(|| {
+                FidNetError::InvalidConfig("training cache block count overflow".into())
+            })?;
+        let res_part = blocks_factor
+            .checked_mul(self.residual_channels)
+            .ok_or_else(|| {
+                FidNetError::InvalidConfig("training cache residual channel overflow".into())
+            })?;
+        let skip_part = self.skip_channels.checked_mul(4).ok_or_else(|| {
+            FidNetError::InvalidConfig("training cache skip channel overflow".into())
+        })?;
+        let total_channels = self
+            .in_channels()
+            .checked_add(res_part)
+            .and_then(|v| v.checked_add(skip_part))
+            .and_then(|v| v.checked_add(2))
+            .ok_or_else(|| {
+                FidNetError::InvalidConfig("training cache channel count overflow".into())
+            })?;
+        total_channels
+            .checked_mul(t_len)
+            .and_then(|v| v.checked_mul(std::mem::size_of::<f64>()))
+            .ok_or_else(|| FidNetError::InvalidConfig("training cache byte count overflow".into()))
+    }
+
+    /// Total scalar parameter count implied by this architecture (checked against overflow).
+    pub fn parameter_count(&self) -> Result<usize, FidNetError> {
+        let in_ch = self.in_channels();
+        let c = self.residual_channels;
+        let s = self.skip_channels;
+        let k = self.kernel_size;
+        let n_blocks = self.dilations.len();
+
+        let stem = c
+            .checked_mul(in_ch)
+            .and_then(|v| v.checked_add(c))
+            .ok_or_else(|| FidNetError::InvalidConfig("stem parameter count overflow".into()))?;
+        let conv_w = c
+            .checked_mul(c)
+            .and_then(|v| v.checked_mul(k))
+            .ok_or_else(|| FidNetError::InvalidConfig("block conv weight count overflow".into()))?;
+        let res_w = c
+            .checked_mul(c)
+            .ok_or_else(|| FidNetError::InvalidConfig("block res weight count overflow".into()))?;
+        let skip_w = s
+            .checked_mul(c)
+            .ok_or_else(|| FidNetError::InvalidConfig("block skip weight count overflow".into()))?;
+        // Per block: filter_w + filter_b + gate_w + gate_b + res_w + res_b + skip_w + skip_b
+        let per_block = conv_w
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(c.checked_mul(3)?))
+            .and_then(|v| v.checked_add(res_w))
+            .and_then(|v| v.checked_add(skip_w))
+            .and_then(|v| v.checked_add(s))
+            .ok_or_else(|| FidNetError::InvalidConfig("block parameter count overflow".into()))?;
+        let all_blocks = per_block
+            .checked_mul(n_blocks)
+            .ok_or_else(|| FidNetError::InvalidConfig("total blocks parameter overflow".into()))?;
+        // Head: head1_w (s*s) + head1_b (s) + out_w (2*s) + out_b (2)
+        let head = s
+            .checked_mul(s)
+            .and_then(|v| v.checked_add(s))
+            .and_then(|v| v.checked_add(s.checked_mul(2)?))
+            .and_then(|v| v.checked_add(2))
+            .ok_or_else(|| FidNetError::InvalidConfig("head parameter count overflow".into()))?;
+
+        stem.checked_add(all_blocks)
+            .and_then(|v| v.checked_add(head))
+            .ok_or_else(|| FidNetError::InvalidConfig("total parameter count overflow".into()))
+    }
+
+    /// Validate all structural dimensions, parameter caps, and max-length inference activation
+    /// memory budget (`MAX_FIDNET_INFERENCE_ACTIVATION_BYTES`).
+    pub fn validate(&self) -> Result<(), FidNetError> {
+        if self.residual_channels == 0 || self.residual_channels > MAX_FIDNET_CHANNELS {
+            return Err(FidNetError::InvalidConfig(format!(
+                "residual_channels={} must be in 1..={MAX_FIDNET_CHANNELS}",
+                self.residual_channels
+            )));
+        }
+        if self.skip_channels == 0 || self.skip_channels > MAX_FIDNET_CHANNELS {
+            return Err(FidNetError::InvalidConfig(format!(
+                "skip_channels={} must be in 1..={MAX_FIDNET_CHANNELS}",
+                self.skip_channels
+            )));
+        }
+        if self.kernel_size == 0
+            || self.kernel_size > MAX_FIDNET_KERNEL_SIZE
+            || self.kernel_size.is_multiple_of(2)
+        {
+            return Err(FidNetError::InvalidConfig(format!(
+                "kernel_size={} must be an odd integer in 1..={MAX_FIDNET_KERNEL_SIZE}",
+                self.kernel_size
+            )));
+        }
+        if self.dilations.is_empty() || self.dilations.len() > MAX_FIDNET_BLOCKS {
+            return Err(FidNetError::InvalidConfig(format!(
+                "num_blocks={} must be in 1..={MAX_FIDNET_BLOCKS}",
+                self.dilations.len()
+            )));
+        }
+        for (idx, &d) in self.dilations.iter().enumerate() {
+            if d == 0 || d > MAX_FIDNET_DILATION {
+                return Err(FidNetError::InvalidConfig(format!(
+                    "dilations[{idx}]={d} must be in 1..={MAX_FIDNET_DILATION}"
+                )));
+            }
+        }
+        let total = self.parameter_count()?;
+        if total > MAX_FIDNET_PARAMS {
+            return Err(FidNetError::InvalidConfig(format!(
+                "parameter count {total} exceeds MAX_FIDNET_PARAMS ({MAX_FIDNET_PARAMS})"
+            )));
+        }
+        let max_inf_bytes = self.inference_activation_bytes(MAX_FIDNET_LENGTH)?;
+        if max_inf_bytes > MAX_FIDNET_INFERENCE_ACTIVATION_BYTES {
+            return Err(FidNetError::InvalidConfig(format!(
+                "max-length inference activation memory {max_inf_bytes} B exceeds MAX_FIDNET_INFERENCE_ACTIVATION_BYTES ({MAX_FIDNET_INFERENCE_ACTIVATION_BYTES} B)"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Weights for a single symmetric dilated gated-activation convolution block.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FidNetBlockWeights {
+    /// Filter dilated 1D convolution weights `[C, C, K]`, flattened `(out_c * C + in_c) * K + m`.
+    pub filter_w: Vec<f64>,
+    /// Filter convolution bias `[C]`.
+    pub filter_b: Vec<f64>,
+    /// Gate dilated 1D convolution weights `[C, C, K]`, flattened `(out_c * C + in_c) * K + m`.
+    pub gate_w: Vec<f64>,
+    /// Gate convolution bias `[C]`.
+    pub gate_b: Vec<f64>,
+    /// `1×1` residual projection weights `[C, C]`, flattened `out_c * C + in_c`.
+    pub res_w: Vec<f64>,
+    /// `1×1` residual projection bias `[C]`.
+    pub res_b: Vec<f64>,
+    /// `1×1` skip projection weights `[S, C]`, flattened `out_s * C + in_c`.
+    pub skip_w: Vec<f64>,
+    /// `1×1` skip projection bias `[S]`.
+    pub skip_b: Vec<f64>,
+}
+
+/// Complete trainable parameter set for a `FID-Net` model (untrained until trained or loaded
+/// from an externally trained `FIDNET-V1` bundle).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FidNetWeights {
+    /// Input `1×1` stem weights `[C, in_ch]`, flattened `c * in_ch + ic`.
+    pub stem_w: Vec<f64>,
+    /// Input `1×1` stem bias `[C]`.
+    pub stem_b: Vec<f64>,
+    /// Stack of symmetric dilated gated-activation convolution blocks.
+    pub blocks: Vec<FidNetBlockWeights>,
+    /// First `1×1` post-skip head weights `[S, S]`, flattened `s_out * S + s_in`.
+    pub head1_w: Vec<f64>,
+    /// First `1×1` post-skip head bias `[S]`.
+    pub head1_b: Vec<f64>,
+    /// Final `1×1` linear complex output weights `[2, S]`, flattened `o * S + s`.
+    pub out_w: Vec<f64>,
+    /// Final `1×1` linear complex output bias `[2]`.
+    pub out_b: Vec<f64>,
+}
+
+/// Flat `f32` weight packing and byte-aligned offsets shared with the WebGPU `fidnet.wgsl` shader.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FidNetPackedWeightsF32 {
+    pub data: Vec<f32>,
+    pub off_stem_w: u32,
+    pub off_stem_b: u32,
+    pub block_offsets: Vec<FidNetBlockOffsets>,
+    pub off_head1_w: u32,
+    pub off_head1_b: u32,
+    pub off_out_w: u32,
+    pub off_out_b: u32,
+}
+
+/// Scalar element offsets (in `f32` units) into `FidNetPackedWeightsF32::data` for a single block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FidNetBlockOffsets {
+    pub filter_w: u32,
+    pub filter_b: u32,
+    pub gate_w: u32,
+    pub gate_b: u32,
+    pub res_w: u32,
+    pub res_b: u32,
+    pub skip_w: u32,
+    pub skip_b: u32,
+}
+
+impl FidNetWeights {
+    /// Allocate zero-initialized weights matching `config`.
+    pub fn zeros(config: &FidNetConfig) -> Result<Self, FidNetError> {
+        config.validate()?;
+        let in_ch = config.in_channels();
+        let c = config.residual_channels;
+        let s = config.skip_channels;
+        let k = config.kernel_size;
+        let mut blocks = Vec::with_capacity(config.num_blocks());
+        for _ in 0..config.num_blocks() {
+            blocks.push(FidNetBlockWeights {
+                filter_w: vec![0.0; c * c * k],
+                filter_b: vec![0.0; c],
+                gate_w: vec![0.0; c * c * k],
+                gate_b: vec![0.0; c],
+                res_w: vec![0.0; c * c],
+                res_b: vec![0.0; c],
+                skip_w: vec![0.0; s * c],
+                skip_b: vec![0.0; s],
+            });
+        }
+        Ok(Self {
+            stem_w: vec![0.0; c * in_ch],
+            stem_b: vec![0.0; c],
+            blocks,
+            head1_w: vec![0.0; s * s],
+            head1_b: vec![0.0; s],
+            out_w: vec![0.0; 2 * s],
+            out_b: vec![0.0; 2],
+        })
+    }
+
+    /// Deterministic Xavier/Glorot initialization suitable for stable symmetric dilated-convolution
+    /// optimization (untrained random weights; NOT pretrained).
+    pub fn init_xavier(config: &FidNetConfig, seed: u64) -> Result<Self, FidNetError> {
+        config.validate()?;
+        let mut rng = Rng::new(seed);
+        let in_ch = config.in_channels();
+        let c = config.residual_channels;
+        let s = config.skip_channels;
+        let k = config.kernel_size;
+        let n_blocks = config.num_blocks();
+
+        let mut sample_vec =
+            |len: usize, sd: f64| -> Vec<f64> { (0..len).map(|_| rng.normal(0.0, sd)).collect() };
+
+        let stem_sd = (2.0 / (in_ch + c) as f64).sqrt();
+        let conv_sd = (1.0 / (c * k) as f64).sqrt();
+        let res_sd = (1.0 / (2 * c * n_blocks.max(1)) as f64).sqrt();
+        let skip_sd = (1.0 / ((c + s) * n_blocks.max(1)) as f64).sqrt();
+        let head1_sd = (2.0 / (s + s) as f64).sqrt();
+        let out_sd = if config.input_residual_skip {
+            0.1 * (1.0 / (s + 2) as f64).sqrt()
+        } else {
+            (2.0 / (s + 2) as f64).sqrt()
+        };
+
+        let mut blocks = Vec::with_capacity(n_blocks);
+        for _ in 0..n_blocks {
+            blocks.push(FidNetBlockWeights {
+                filter_w: sample_vec(c * c * k, conv_sd),
+                filter_b: vec![0.0; c],
+                gate_w: sample_vec(c * c * k, conv_sd),
+                gate_b: vec![0.0; c],
+                res_w: sample_vec(c * c, res_sd),
+                res_b: vec![0.0; c],
+                skip_w: sample_vec(s * c, skip_sd),
+                skip_b: vec![0.0; s],
+            });
+        }
+
+        Ok(Self {
+            stem_w: sample_vec(c * in_ch, stem_sd),
+            stem_b: vec![0.0; c],
+            blocks,
+            head1_w: sample_vec(s * s, head1_sd),
+            head1_b: vec![0.0; s],
+            out_w: sample_vec(2 * s, out_sd),
+            out_b: vec![0.0; 2],
+        })
+    }
+
+    /// Lightweight O(num_blocks) shape check ensuring all weight slices match `config` lengths.
+    pub fn validate_shapes(&self, config: &FidNetConfig) -> Result<(), FidNetError> {
+        config.validate()?;
+        let in_ch = config.in_channels();
+        let c = config.residual_channels;
+        let s = config.skip_channels;
+        let k = config.kernel_size;
+
+        let check_len = |name: &str, v: &[f64], expected: usize| -> Result<(), FidNetError> {
+            if v.len() != expected {
+                return Err(FidNetError::InvalidWeights(format!(
+                    "{name} length {} does not match expected {expected}",
+                    v.len()
+                )));
+            }
+            Ok(())
+        };
+
+        check_len("stem_w", &self.stem_w, c * in_ch)?;
+        check_len("stem_b", &self.stem_b, c)?;
+        if self.blocks.len() != config.num_blocks() {
+            return Err(FidNetError::InvalidWeights(format!(
+                "blocks length {} does not match dilations length {}",
+                self.blocks.len(),
+                config.num_blocks()
+            )));
+        }
+        for (bi, blk) in self.blocks.iter().enumerate() {
+            check_len(&format!("blocks[{bi}].filter_w"), &blk.filter_w, c * c * k)?;
+            check_len(&format!("blocks[{bi}].filter_b"), &blk.filter_b, c)?;
+            check_len(&format!("blocks[{bi}].gate_w"), &blk.gate_w, c * c * k)?;
+            check_len(&format!("blocks[{bi}].gate_b"), &blk.gate_b, c)?;
+            check_len(&format!("blocks[{bi}].res_w"), &blk.res_w, c * c)?;
+            check_len(&format!("blocks[{bi}].res_b"), &blk.res_b, c)?;
+            check_len(&format!("blocks[{bi}].skip_w"), &blk.skip_w, s * c)?;
+            check_len(&format!("blocks[{bi}].skip_b"), &blk.skip_b, s)?;
+        }
+        check_len("head1_w", &self.head1_w, s * s)?;
+        check_len("head1_b", &self.head1_b, s)?;
+        check_len("out_w", &self.out_w, 2 * s)?;
+        check_len("out_b", &self.out_b, 2)?;
+        Ok(())
+    }
+
+    /// Validate that every weight tensor has exact shape matching `config` and contains only finite values.
+    pub fn validate(&self, config: &FidNetConfig) -> Result<(), FidNetError> {
+        config.validate()?;
+        let in_ch = config.in_channels();
+        let c = config.residual_channels;
+        let s = config.skip_channels;
+        let k = config.kernel_size;
+
+        let check_slice = |name: &str, v: &[f64], expected: usize| -> Result<(), FidNetError> {
+            if v.len() != expected {
+                return Err(FidNetError::InvalidWeights(format!(
+                    "{name} length {} does not match expected {expected}",
+                    v.len()
+                )));
+            }
+            if let Some((idx, &val)) = v.iter().enumerate().find(|(_, x)| !x.is_finite()) {
+                return Err(FidNetError::InvalidWeights(format!(
+                    "{name}[{idx}] is non-finite ({val})"
+                )));
+            }
+            Ok(())
+        };
+
+        check_slice("stem_w", &self.stem_w, c * in_ch)?;
+        check_slice("stem_b", &self.stem_b, c)?;
+        if self.blocks.len() != config.num_blocks() {
+            return Err(FidNetError::InvalidWeights(format!(
+                "blocks length {} does not match dilations length {}",
+                self.blocks.len(),
+                config.num_blocks()
+            )));
+        }
+        for (bi, blk) in self.blocks.iter().enumerate() {
+            check_slice(&format!("blocks[{bi}].filter_w"), &blk.filter_w, c * c * k)?;
+            check_slice(&format!("blocks[{bi}].filter_b"), &blk.filter_b, c)?;
+            check_slice(&format!("blocks[{bi}].gate_w"), &blk.gate_w, c * c * k)?;
+            check_slice(&format!("blocks[{bi}].gate_b"), &blk.gate_b, c)?;
+            check_slice(&format!("blocks[{bi}].res_w"), &blk.res_w, c * c)?;
+            check_slice(&format!("blocks[{bi}].res_b"), &blk.res_b, c)?;
+            check_slice(&format!("blocks[{bi}].skip_w"), &blk.skip_w, s * c)?;
+            check_slice(&format!("blocks[{bi}].skip_b"), &blk.skip_b, s)?;
+        }
+        check_slice("head1_w", &self.head1_w, s * s)?;
+        check_slice("head1_b", &self.head1_b, s)?;
+        check_slice("out_w", &self.out_w, 2 * s)?;
+        check_slice("out_b", &self.out_b, 2)?;
+        Ok(())
+    }
+
+    /// Pack all weights into a contiguous `f32` buffer with exact offsets for WebGPU execution.
+    pub fn pack_f32(&self, config: &FidNetConfig) -> Result<FidNetPackedWeightsF32, FidNetError> {
+        self.validate(config)?;
+        let total = config.parameter_count()?;
+        let mut data = Vec::with_capacity(total);
+
+        let push_slice = |dst: &mut Vec<f32>, src: &[f64]| -> Result<u32, FidNetError> {
+            let off = u32::try_from(dst.len()).map_err(|_| {
+                FidNetError::InvalidWeights("packed f32 weight offset exceeds u32::MAX".into())
+            })?;
+            for &v in src {
+                let vf = v as f32;
+                if !vf.is_finite() {
+                    return Err(FidNetError::InvalidWeights(format!(
+                        "weight {v} overflows f32 during GPU packing"
+                    )));
+                }
+                dst.push(vf);
+            }
+            Ok(off)
+        };
+
+        let off_stem_w = push_slice(&mut data, &self.stem_w)?;
+        let off_stem_b = push_slice(&mut data, &self.stem_b)?;
+        let mut block_offsets = Vec::with_capacity(self.blocks.len());
+        for blk in &self.blocks {
+            block_offsets.push(FidNetBlockOffsets {
+                filter_w: push_slice(&mut data, &blk.filter_w)?,
+                filter_b: push_slice(&mut data, &blk.filter_b)?,
+                gate_w: push_slice(&mut data, &blk.gate_w)?,
+                gate_b: push_slice(&mut data, &blk.gate_b)?,
+                res_w: push_slice(&mut data, &blk.res_w)?,
+                res_b: push_slice(&mut data, &blk.res_b)?,
+                skip_w: push_slice(&mut data, &blk.skip_w)?,
+                skip_b: push_slice(&mut data, &blk.skip_b)?,
+            });
+        }
+        let off_head1_w = push_slice(&mut data, &self.head1_w)?;
+        let off_head1_b = push_slice(&mut data, &self.head1_b)?;
+        let off_out_w = push_slice(&mut data, &self.out_w)?;
+        let off_out_b = push_slice(&mut data, &self.out_b)?;
+
+        Ok(FidNetPackedWeightsF32 {
+            data,
+            off_stem_w,
+            off_stem_b,
+            block_offsets,
+            off_head1_w,
+            off_head1_b,
+            off_out_w,
+            off_out_b,
+        })
+    }
+
+    /// Flatten all scalar parameters in canonical order into `Vec<f64>`.
+    pub fn to_flat_vec(&self) -> Vec<f64> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.stem_w);
+        out.extend_from_slice(&self.stem_b);
+        for blk in &self.blocks {
+            out.extend_from_slice(&blk.filter_w);
+            out.extend_from_slice(&blk.filter_b);
+            out.extend_from_slice(&blk.gate_w);
+            out.extend_from_slice(&blk.gate_b);
+            out.extend_from_slice(&blk.res_w);
+            out.extend_from_slice(&blk.res_b);
+            out.extend_from_slice(&blk.skip_w);
+            out.extend_from_slice(&blk.skip_b);
+        }
+        out.extend_from_slice(&self.head1_w);
+        out.extend_from_slice(&self.head1_b);
+        out.extend_from_slice(&self.out_w);
+        out.extend_from_slice(&self.out_b);
+        out
+    }
+
+    /// Reconstruct `FidNetWeights` from a canonical flat `f64` vector.
+    pub fn from_flat_slice(config: &FidNetConfig, flat: &[f64]) -> Result<Self, FidNetError> {
+        config.validate()?;
+        let expected = config.parameter_count()?;
+        if flat.len() != expected {
+            return Err(FidNetError::InvalidWeights(format!(
+                "flat weight slice length {} does not match expected {expected}",
+                flat.len()
+            )));
+        }
+        let in_ch = config.in_channels();
+        let c = config.residual_channels;
+        let s = config.skip_channels;
+        let k = config.kernel_size;
+        let mut cursor = 0usize;
+        let mut take = |n: usize| -> Result<Vec<f64>, FidNetError> {
+            let end = cursor
+                .checked_add(n)
+                .ok_or_else(|| FidNetError::InvalidWeights("weight cursor overflow".into()))?;
+            let slice = flat.get(cursor..end).ok_or_else(|| {
+                FidNetError::InvalidWeights("unexpected end of flat weights".into())
+            })?;
+            cursor = end;
+            Ok(slice.to_vec())
+        };
+
+        let stem_w = take(c * in_ch)?;
+        let stem_b = take(c)?;
+        let mut blocks = Vec::with_capacity(config.num_blocks());
+        for _ in 0..config.num_blocks() {
+            blocks.push(FidNetBlockWeights {
+                filter_w: take(c * c * k)?,
+                filter_b: take(c)?,
+                gate_w: take(c * c * k)?,
+                gate_b: take(c)?,
+                res_w: take(c * c)?,
+                res_b: take(c)?,
+                skip_w: take(s * c)?,
+                skip_b: take(s)?,
+            });
+        }
+        let head1_w = take(s * s)?;
+        let head1_b = take(s)?;
+        let out_w = take(2 * s)?;
+        let out_b = take(2)?;
+
+        let weights = Self {
+            stem_w,
+            stem_b,
+            blocks,
+            head1_w,
+            head1_b,
+            out_w,
+            out_b,
+        };
+        weights.validate(config)?;
+        Ok(weights)
+    }
+}
+
+/// Optional provenance metadata embedded in a `FIDNET-V1` weight bundle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FidNetBundleMetadata {
+    pub description: String,
+    pub license: String,
+    pub provenance: String,
+}
+
+impl Default for FidNetBundleMetadata {
+    fn default() -> Self {
+        Self {
+            description: format!(
+                "FERRIC pure-Rust symmetric dilated-convolution FID-Net model ({FIDNET_WEIGHTS_STATUS})"
+            ),
+            license: "MIT".to_string(),
+            provenance: "Clean-room implementation of FID-Net symmetric dilated-convolution architecture (Karunanithy & Hansen, J. Biomol. NMR 2021; Karunanithy, Mackenzie & Hansen, JACS 2021; Karunanithy et al., Nat. Commun. 2024; Shukla et al., Sci. Adv. 2024; https://github.com/gogulan-k/FID-Net, MIT); untrained architecture with no bundled pretrained weights".to_string(),
+        }
+    }
+}
+
+/// Weights for a single symmetric dilated gated-activation convolution block in canonical IEEE-754
+/// `f32` bundle precision (0-ULP JSON and binary round-trip, identical to WebGPU execution precision).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FidNetBlockWeightsF32 {
+    pub filter_w: Vec<f32>,
+    pub filter_b: Vec<f32>,
+    pub gate_w: Vec<f32>,
+    pub gate_b: Vec<f32>,
+    pub res_w: Vec<f32>,
+    pub res_b: Vec<f32>,
+    pub skip_w: Vec<f32>,
+    pub skip_b: Vec<f32>,
+}
+
+/// Complete serialized parameter set in canonical IEEE-754 `f32` bundle precision.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FidNetWeightsF32 {
+    pub stem_w: Vec<f32>,
+    pub stem_b: Vec<f32>,
+    pub blocks: Vec<FidNetBlockWeightsF32>,
+    pub head1_w: Vec<f32>,
+    pub head1_b: Vec<f32>,
+    pub out_w: Vec<f32>,
+    pub out_b: Vec<f32>,
+}
+
+impl FidNetWeightsF32 {
+    /// Narrow validated `f64` training weights into canonical `f32` bundle weights.
+    pub fn from_f64(config: &FidNetConfig, src: &FidNetWeights) -> Result<Self, FidNetError> {
+        src.validate(config)?;
+        let narrow = |v: &[f64], name: &str| -> Result<Vec<f32>, FidNetError> {
+            let mut out = Vec::with_capacity(v.len());
+            for (idx, &x) in v.iter().enumerate() {
+                let xf = x as f32;
+                if !xf.is_finite() {
+                    return Err(FidNetError::InvalidWeights(format!(
+                        "{name}[{idx}] ({x}) overflows f32"
+                    )));
+                }
+                out.push(if xf == 0.0 { 0.0 } else { xf });
+            }
+            Ok(out)
+        };
+        let mut blocks = Vec::with_capacity(src.blocks.len());
+        for (bi, blk) in src.blocks.iter().enumerate() {
+            blocks.push(FidNetBlockWeightsF32 {
+                filter_w: narrow(&blk.filter_w, &format!("blocks[{bi}].filter_w"))?,
+                filter_b: narrow(&blk.filter_b, &format!("blocks[{bi}].filter_b"))?,
+                gate_w: narrow(&blk.gate_w, &format!("blocks[{bi}].gate_w"))?,
+                gate_b: narrow(&blk.gate_b, &format!("blocks[{bi}].gate_b"))?,
+                res_w: narrow(&blk.res_w, &format!("blocks[{bi}].res_w"))?,
+                res_b: narrow(&blk.res_b, &format!("blocks[{bi}].res_b"))?,
+                skip_w: narrow(&blk.skip_w, &format!("blocks[{bi}].skip_w"))?,
+                skip_b: narrow(&blk.skip_b, &format!("blocks[{bi}].skip_b"))?,
+            });
+        }
+        Ok(Self {
+            stem_w: narrow(&src.stem_w, "stem_w")?,
+            stem_b: narrow(&src.stem_b, "stem_b")?,
+            blocks,
+            head1_w: narrow(&src.head1_w, "head1_w")?,
+            head1_b: narrow(&src.head1_b, "head1_b")?,
+            out_w: narrow(&src.out_w, "out_w")?,
+            out_b: narrow(&src.out_b, "out_b")?,
+        })
+    }
+
+    /// Widen validated `f32` bundle weights into `f64` reference weights.
+    pub fn to_f64(&self, config: &FidNetConfig) -> Result<FidNetWeights, FidNetError> {
+        self.validate(config)?;
+        let widen = |v: &[f32]| -> Vec<f64> { v.iter().map(|&x| f64::from(x)).collect() };
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|blk| FidNetBlockWeights {
+                filter_w: widen(&blk.filter_w),
+                filter_b: widen(&blk.filter_b),
+                gate_w: widen(&blk.gate_w),
+                gate_b: widen(&blk.gate_b),
+                res_w: widen(&blk.res_w),
+                res_b: widen(&blk.res_b),
+                skip_w: widen(&blk.skip_w),
+                skip_b: widen(&blk.skip_b),
+            })
+            .collect();
+        Ok(FidNetWeights {
+            stem_w: widen(&self.stem_w),
+            stem_b: widen(&self.stem_b),
+            blocks,
+            head1_w: widen(&self.head1_w),
+            head1_b: widen(&self.head1_b),
+            out_w: widen(&self.out_w),
+            out_b: widen(&self.out_b),
+        })
+    }
+
+    /// Validate that every `f32` weight tensor matches `config` dimensions and is finite.
+    pub fn validate(&self, config: &FidNetConfig) -> Result<(), FidNetError> {
+        config.validate()?;
+        let in_ch = config.in_channels();
+        let c = config.residual_channels;
+        let s = config.skip_channels;
+        let k = config.kernel_size;
+
+        let check_slice = |name: &str, v: &[f32], expected: usize| -> Result<(), FidNetError> {
+            if v.len() != expected {
+                return Err(FidNetError::InvalidWeights(format!(
+                    "{name} length {} does not match expected {expected}",
+                    v.len()
+                )));
+            }
+            if let Some((idx, &val)) = v.iter().enumerate().find(|(_, x)| !x.is_finite()) {
+                return Err(FidNetError::InvalidWeights(format!(
+                    "{name}[{idx}] is non-finite ({val})"
+                )));
+            }
+            Ok(())
+        };
+
+        check_slice("stem_w", &self.stem_w, c * in_ch)?;
+        check_slice("stem_b", &self.stem_b, c)?;
+        if self.blocks.len() != config.num_blocks() {
+            return Err(FidNetError::InvalidWeights(format!(
+                "blocks length {} does not match dilations length {}",
+                self.blocks.len(),
+                config.num_blocks()
+            )));
+        }
+        for (bi, blk) in self.blocks.iter().enumerate() {
+            check_slice(&format!("blocks[{bi}].filter_w"), &blk.filter_w, c * c * k)?;
+            check_slice(&format!("blocks[{bi}].filter_b"), &blk.filter_b, c)?;
+            check_slice(&format!("blocks[{bi}].gate_w"), &blk.gate_w, c * c * k)?;
+            check_slice(&format!("blocks[{bi}].gate_b"), &blk.gate_b, c)?;
+            check_slice(&format!("blocks[{bi}].res_w"), &blk.res_w, c * c)?;
+            check_slice(&format!("blocks[{bi}].res_b"), &blk.res_b, c)?;
+            check_slice(&format!("blocks[{bi}].skip_w"), &blk.skip_w, s * c)?;
+            check_slice(&format!("blocks[{bi}].skip_b"), &blk.skip_b, s)?;
+        }
+        check_slice("head1_w", &self.head1_w, s * s)?;
+        check_slice("head1_b", &self.head1_b, s)?;
+        check_slice("out_w", &self.out_w, 2 * s)?;
+        check_slice("out_b", &self.out_b, 2)?;
+        Ok(())
+    }
+
+    /// Flatten all `f32` bundle parameters in canonical order.
+    pub fn to_flat_vec(&self) -> Vec<f32> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.stem_w);
+        out.extend_from_slice(&self.stem_b);
+        for blk in &self.blocks {
+            out.extend_from_slice(&blk.filter_w);
+            out.extend_from_slice(&blk.filter_b);
+            out.extend_from_slice(&blk.gate_w);
+            out.extend_from_slice(&blk.gate_b);
+            out.extend_from_slice(&blk.res_w);
+            out.extend_from_slice(&blk.res_b);
+            out.extend_from_slice(&blk.skip_w);
+            out.extend_from_slice(&blk.skip_b);
+        }
+        out.extend_from_slice(&self.head1_w);
+        out.extend_from_slice(&self.head1_b);
+        out.extend_from_slice(&self.out_w);
+        out.extend_from_slice(&self.out_b);
+        out
+    }
+
+    /// Reconstruct `FidNetWeightsF32` from a canonical flat `f32` slice.
+    pub fn from_flat_slice(config: &FidNetConfig, flat: &[f32]) -> Result<Self, FidNetError> {
+        config.validate()?;
+        let expected = config.parameter_count()?;
+        if flat.len() != expected {
+            return Err(FidNetError::InvalidWeights(format!(
+                "flat f32 weight slice length {} does not match expected {expected}",
+                flat.len()
+            )));
+        }
+        let in_ch = config.in_channels();
+        let c = config.residual_channels;
+        let s = config.skip_channels;
+        let k = config.kernel_size;
+        let mut cursor = 0usize;
+        let mut take = |n: usize| -> Result<Vec<f32>, FidNetError> {
+            let end = cursor
+                .checked_add(n)
+                .ok_or_else(|| FidNetError::InvalidWeights("weight cursor overflow".into()))?;
+            let slice = flat.get(cursor..end).ok_or_else(|| {
+                FidNetError::InvalidWeights("unexpected end of flat weights".into())
+            })?;
+            cursor = end;
+            Ok(slice.to_vec())
+        };
+
+        let stem_w = take(c * in_ch)?;
+        let stem_b = take(c)?;
+        let mut blocks = Vec::with_capacity(config.num_blocks());
+        for _ in 0..config.num_blocks() {
+            blocks.push(FidNetBlockWeightsF32 {
+                filter_w: take(c * c * k)?,
+                filter_b: take(c)?,
+                gate_w: take(c * c * k)?,
+                gate_b: take(c)?,
+                res_w: take(c * c)?,
+                res_b: take(c)?,
+                skip_w: take(s * c)?,
+                skip_b: take(s)?,
+            });
+        }
+        let head1_w = take(s * s)?;
+        let head1_b = take(s)?;
+        let out_w = take(2 * s)?;
+        let out_b = take(2)?;
+
+        let weights = Self {
+            stem_w,
+            stem_b,
+            blocks,
+            head1_w,
+            head1_b,
+            out_w,
+            out_b,
+        };
+        weights.validate(config)?;
+        Ok(weights)
+    }
+}
+
+/// Strictly versioned `FIDNET-V1` weight bundle with an in-band SHA-256 integrity checksum.
+///
+/// Note: `sha256` is an in-band integrity checksum that detects corruption or accidental
+/// truncation; it is NOT a cryptographic trust anchor or signature. Callers requiring
+/// authenticity should verify `bundle.sha256` against an out-of-band expected digest.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FidNetWeightBundle {
+    pub format_version: String,
+    /// `true` ONLY when weights were trained (via `train_fidnet_step` or external training);
+    /// `false` for untrained / randomly initialized architectures. Protected by `sha256`.
+    #[serde(default)]
+    pub weights_trained: bool,
+    pub config: FidNetConfig,
+    #[serde(default)]
+    pub metadata: FidNetBundleMetadata,
+    pub weights: FidNetWeightsF32,
+    /// Lowercase 64-character hex FIPS 180-4 SHA-256 in-band integrity checksum over canonical
+    /// header + `weights_trained` + config + IEEE-754 `f32` weights.
+    pub sha256: String,
+}
+
+fn task_tag_u8(task: FidNetTask) -> u8 {
+    match task {
+        FidNetTask::NusReconstruction => 1,
+        FidNetTask::VirtualDecoupling => 2,
+        FidNetTask::Denoising => 3,
+    }
+}
+
+fn task_from_tag_u8(tag: u8) -> Result<FidNetTask, FidNetError> {
+    match tag {
+        1 => Ok(FidNetTask::NusReconstruction),
+        2 => Ok(FidNetTask::VirtualDecoupling),
+        3 => Ok(FidNetTask::Denoising),
+        other => Err(FidNetError::InvalidConfig(format!(
+            "unknown FidNetTask tag {other}"
+        ))),
+    }
+}
+
+/// Compute canonical FIPS 180-4 SHA-256 in-band integrity digest over format version,
+/// `weights_trained` flag, architecture config, and IEEE-754 `f32` weights.
+pub fn compute_fidnet_bundle_sha256(
+    format_version: &str,
+    config: &FidNetConfig,
+    weights: &FidNetWeightsF32,
+    weights_trained: bool,
+) -> Result<String, FidNetError> {
+    weights.validate(config)?;
+    let mut payload = Vec::new();
+    payload.extend_from_slice(format_version.as_bytes());
+    payload.push(0);
+    payload.push(task_tag_u8(config.task));
+    payload.push(u8::from(config.use_mask_channel));
+    payload.push(u8::from(config.use_coupling_channel));
+    payload.push(u8::from(config.input_residual_skip));
+    payload.push(u8::from(weights_trained));
+    payload.extend_from_slice(&(config.residual_channels as u32).to_le_bytes());
+    payload.extend_from_slice(&(config.skip_channels as u32).to_le_bytes());
+    payload.extend_from_slice(&(config.kernel_size as u32).to_le_bytes());
+    payload.extend_from_slice(&(config.dilations.len() as u32).to_le_bytes());
+    for &d in &config.dilations {
+        payload.extend_from_slice(&(d as u32).to_le_bytes());
+    }
+    for val in weights.to_flat_vec() {
+        // Canonicalize -0.0 to +0.0 for deterministic cross-platform hashing.
+        let canon = if val == 0.0 { 0.0 } else { val };
+        payload.extend_from_slice(&canon.to_bits().to_le_bytes());
+    }
+    Ok(sha256_hex(&payload))
+}
+
+impl FidNetWeightBundle {
+    /// Construct a verified `FIDNET-V1` bundle from `config` and `f64` weights, defaulting to
+    /// `weights_trained = false` (fail-closed).
+    pub fn new(
+        config: FidNetConfig,
+        weights: &FidNetWeights,
+        metadata: FidNetBundleMetadata,
+    ) -> Result<Self, FidNetError> {
+        Self::new_with_trained_flag(config, weights, metadata, false)
+    }
+
+    /// Construct a verified `FIDNET-V1` bundle with an explicit `weights_trained` status flag
+    /// covered by the SHA-256 integrity checksum.
+    pub fn new_with_trained_flag(
+        config: FidNetConfig,
+        weights: &FidNetWeights,
+        metadata: FidNetBundleMetadata,
+        weights_trained: bool,
+    ) -> Result<Self, FidNetError> {
+        let weights_f32 = FidNetWeightsF32::from_f64(&config, weights)?;
+        let sha256 = compute_fidnet_bundle_sha256(
+            FIDNET_BUNDLE_FORMAT_VERSION,
+            &config,
+            &weights_f32,
+            weights_trained,
+        )?;
+        Ok(Self {
+            format_version: FIDNET_BUNDLE_FORMAT_VERSION.to_string(),
+            weights_trained,
+            config,
+            metadata,
+            weights: weights_f32,
+            sha256,
+        })
+    }
+
+    /// Verify version, architecture caps, weight shapes/finiteness, `weights_trained`, and
+    /// in-band SHA-256 digest.
+    pub fn verify(&self) -> Result<(), FidNetError> {
+        if self.format_version != FIDNET_BUNDLE_FORMAT_VERSION {
+            return Err(FidNetError::UnsupportedFormatVersion(
+                self.format_version.clone(),
+            ));
+        }
+        let actual = compute_fidnet_bundle_sha256(
+            &self.format_version,
+            &self.config,
+            &self.weights,
+            self.weights_trained,
+        )?;
+        if actual != self.sha256 {
+            return Err(FidNetError::ChecksumMismatch {
+                expected: self.sha256.clone(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    /// Serialize bundle to JSON (`FIDNET-V1`).
+    pub fn to_json(&self) -> Result<String, FidNetError> {
+        self.verify()?;
+        serde_json::to_string_pretty(self)
+            .map_err(|e| FidNetError::SerializationError(e.to_string()))
+    }
+
+    /// Deserialize and strictly verify a `FIDNET-V1` JSON bundle (bounded by `MAX_FIDNET_JSON_BYTES`).
+    pub fn from_json(json: &str) -> Result<Self, FidNetError> {
+        if json.len() > MAX_FIDNET_JSON_BYTES {
+            return Err(FidNetError::SerializationError(format!(
+                "JSON bundle length {} B exceeds MAX_FIDNET_JSON_BYTES ({MAX_FIDNET_JSON_BYTES} B)",
+                json.len()
+            )));
+        }
+        let bundle: Self = serde_json::from_str(json)
+            .map_err(|e| FidNetError::SerializationError(e.to_string()))?;
+        bundle.verify()?;
+        Ok(bundle)
+    }
+
+    /// Serialize bundle to compact deterministic `FIDNET-V1` binary bytes.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FidNetError> {
+        self.verify()?;
+        let flat = self.weights.to_flat_vec();
+        let mut out =
+            Vec::with_capacity(64 + self.config.dilations.len() * 4 + flat.len() * 4 + 64);
+        out.extend_from_slice(FIDNET_BINARY_MAGIC);
+        out.push(task_tag_u8(self.config.task));
+        out.push(u8::from(self.config.use_mask_channel));
+        out.push(u8::from(self.config.use_coupling_channel));
+        out.push(u8::from(self.config.input_residual_skip));
+        out.push(u8::from(self.weights_trained));
+        out.extend_from_slice(&(self.config.residual_channels as u32).to_le_bytes());
+        out.extend_from_slice(&(self.config.skip_channels as u32).to_le_bytes());
+        out.extend_from_slice(&(self.config.kernel_size as u32).to_le_bytes());
+        out.extend_from_slice(&(self.config.dilations.len() as u32).to_le_bytes());
+        for &d in &self.config.dilations {
+            out.extend_from_slice(&(d as u32).to_le_bytes());
+        }
+        out.extend_from_slice(&(flat.len() as u64).to_le_bytes());
+        for &v in &flat {
+            let canon = if v == 0.0 { 0.0 } else { v };
+            out.extend_from_slice(&canon.to_bits().to_le_bytes());
+        }
+        out.extend_from_slice(self.sha256.as_bytes());
+        Ok(out)
+    }
+
+    /// Deserialize and strictly verify a compact `FIDNET-V1` binary bundle.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, FidNetError> {
+        let mut pos = 0usize;
+        let read_exact = |p: &mut usize, n: usize| -> Result<&[u8], FidNetError> {
+            let end = p
+                .checked_add(n)
+                .ok_or_else(|| FidNetError::SerializationError("binary cursor overflow".into()))?;
+            let slice = bytes
+                .get(*p..end)
+                .ok_or_else(|| FidNetError::SerializationError("truncated binary bundle".into()))?;
+            *p = end;
+            Ok(slice)
+        };
+
+        let magic = read_exact(&mut pos, 8)?;
+        if magic != FIDNET_BINARY_MAGIC {
+            return Err(FidNetError::UnsupportedFormatVersion(format!(
+                "invalid binary magic {:?}",
+                magic
+            )));
+        }
+        let flags = read_exact(&mut pos, 5)?;
+        let task = task_from_tag_u8(flags[0])?;
+        let use_mask_channel = match flags[1] {
+            0 => false,
+            1 => true,
+            v => return Err(FidNetError::InvalidConfig(format!("invalid mask flag {v}"))),
+        };
+        let use_coupling_channel = match flags[2] {
+            0 => false,
+            1 => true,
+            v => {
+                return Err(FidNetError::InvalidConfig(format!(
+                    "invalid coupling flag {v}"
+                )))
+            }
+        };
+        let input_residual_skip = match flags[3] {
+            0 => false,
+            1 => true,
+            v => {
+                return Err(FidNetError::InvalidConfig(format!(
+                    "invalid input_residual_skip flag {v}"
+                )))
+            }
+        };
+        let weights_trained = match flags[4] {
+            0 => false,
+            1 => true,
+            v => {
+                return Err(FidNetError::InvalidConfig(format!(
+                    "invalid weights_trained flag {v}"
+                )))
+            }
+        };
+
+        let read_u32 = |p: &mut usize| -> Result<u32, FidNetError> {
+            let s = read_exact(p, 4)?;
+            Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        };
+        let read_u64 = |p: &mut usize| -> Result<u64, FidNetError> {
+            let s = read_exact(p, 8)?;
+            Ok(u64::from_le_bytes([
+                s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+            ]))
+        };
+
+        let residual_channels = read_u32(&mut pos)? as usize;
+        let skip_channels = read_u32(&mut pos)? as usize;
+        let kernel_size = read_u32(&mut pos)? as usize;
+        let num_blocks = read_u32(&mut pos)? as usize;
+        if num_blocks == 0 || num_blocks > MAX_FIDNET_BLOCKS {
+            return Err(FidNetError::InvalidConfig(format!(
+                "num_blocks={num_blocks} out of range 1..={MAX_FIDNET_BLOCKS}"
+            )));
+        }
+        let mut dilations = Vec::with_capacity(num_blocks);
+        for _ in 0..num_blocks {
+            dilations.push(read_u32(&mut pos)? as usize);
+        }
+
+        let config = FidNetConfig {
+            task,
+            use_mask_channel,
+            use_coupling_channel,
+            residual_channels,
+            skip_channels,
+            kernel_size,
+            dilations,
+            input_residual_skip,
+        };
+        config.validate()?;
+
+        let n_params_u64 = read_u64(&mut pos)?;
+        let expected_params = config.parameter_count()?;
+        if n_params_u64 != expected_params as u64 {
+            return Err(FidNetError::InvalidWeights(format!(
+                "binary bundle declares {n_params_u64} params, expected {expected_params}"
+            )));
+        }
+
+        // Verify exact remaining byte count BEFORE allocating `flat` (prevents pre-allocation on truncated inputs).
+        let required_tail = expected_params
+            .checked_mul(4)
+            .and_then(|v| v.checked_add(64))
+            .ok_or_else(|| FidNetError::SerializationError("binary bundle size overflow".into()))?;
+        let remaining = bytes.len().saturating_sub(pos);
+        if remaining != required_tail {
+            return Err(FidNetError::SerializationError(format!(
+                "binary bundle remaining byte length {remaining} != expected {required_tail}"
+            )));
+        }
+
+        let mut flat = Vec::with_capacity(expected_params);
+        for _ in 0..expected_params {
+            let bits = read_u32(&mut pos)?;
+            let val = f32::from_bits(bits);
+            if !val.is_finite() {
+                return Err(FidNetError::InvalidWeights(
+                    "non-finite f32 weight in binary bundle".into(),
+                ));
+            }
+            flat.push(val);
+        }
+
+        let sha_bytes = read_exact(&mut pos, 64)?;
+        let sha256 = std::str::from_utf8(sha_bytes)
+            .map_err(|e| FidNetError::SerializationError(format!("invalid UTF-8 sha256: {e}")))?
+            .to_string();
+
+        let weights = FidNetWeightsF32::from_flat_slice(&config, &flat)?;
+        let bundle = Self {
+            format_version: FIDNET_BUNDLE_FORMAT_VERSION.to_string(),
+            weights_trained,
+            config,
+            metadata: FidNetBundleMetadata::default(),
+            weights,
+            sha256,
+        };
+        bundle.verify()?;
+        Ok(bundle)
+    }
+}
+
+// ============================================================================
+// Overflow-Safe Activations (Matched Identically by WebGPU fidnet.wgsl)
+// ============================================================================
+
+/// Overflow-safe clamped `tanh` matching WebGPU `fidnet.wgsl` (`exp` only called on `<= 0`).
+#[inline]
+pub fn safe_tanh(x: f64) -> f64 {
+    let xc = x.clamp(-10.0, 10.0);
+    if xc >= 0.0 {
+        let e = (-2.0 * xc).exp();
+        (1.0 - e) / (1.0 + e)
+    } else {
+        let e = (2.0 * xc).exp();
+        (e - 1.0) / (e + 1.0)
+    }
+}
+
+/// Exact derivative of `safe_tanh(x)` given `t = safe_tanh(x)`.
+#[inline]
+fn safe_tanh_deriv(x: f64, t: f64) -> f64 {
+    if x.abs() >= 10.0 {
+        0.0
+    } else {
+        1.0 - t * t
+    }
+}
+
+/// Overflow-safe clamped logistic sigmoid matching WebGPU `fidnet.wgsl` (`exp` only called on `<= 0`).
+#[inline]
+pub fn safe_sigmoid(x: f64) -> f64 {
+    let xc = x.clamp(-20.0, 20.0);
+    if xc >= 0.0 {
+        1.0 / (1.0 + (-xc).exp())
+    } else {
+        let e = xc.exp();
+        e / (1.0 + e)
+    }
+}
+
+/// Exact derivative of `safe_sigmoid(x)` given `s = safe_sigmoid(x)`.
+#[inline]
+fn safe_sigmoid_deriv(x: f64, s: f64) -> f64 {
+    if x.abs() >= 20.0 {
+        0.0
+    } else {
+        s * (1.0 - s)
+    }
+}
+
+/// Build the normalized scalar-coupling phase-modulation conditioning channel `cos(pi * J * t)`
+/// for virtual homonuclear decoupling (`t = k / sw_hz`).
+pub fn build_coupling_channel(len: usize, j_hz: f64, sw_hz: f64) -> Result<Vec<f64>, FidNetError> {
+    if len == 0 {
+        return Err(FidNetError::EmptyInput(
+            "coupling channel length must be > 0".into(),
+        ));
+    }
+    if len > MAX_FIDNET_LENGTH {
+        return Err(FidNetError::OversizedFid {
+            len,
+            max_len: MAX_FIDNET_LENGTH,
+        });
+    }
+    if !j_hz.is_finite() || !sw_hz.is_finite() || sw_hz <= 0.0 {
+        return Err(FidNetError::NonFiniteInput(format!(
+            "invalid coupling parameters j_hz={j_hz}, sw_hz={sw_hz}"
+        )));
+    }
+    let dt = 1.0 / sw_hz;
+    Ok((0..len)
+        .map(|k| (PI * j_hz * (k as f64) * dt).cos())
+        .collect())
+}
+
+// ============================================================================
+// Core FID-Net Model, Forward Pass & Exact Analytical Backpropagation
+// ============================================================================
+
+/// Complete symmetric dilated-convolution `FID-Net` model
+/// (untrained architecture unless loaded from externally trained `FIDNET-V1` weights or trained
+/// via `train_fidnet_step`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FidNetModel {
+    pub config: FidNetConfig,
+    pub weights: FidNetWeights,
+    /// `true` ONLY when weights have been trained via `train_fidnet_step` or loaded from a
+    /// verified trained `FIDNET-V1` bundle. Untrained / randomly initialized models keep this
+    /// `false` and fail closed on default inference unless `allow_untrained_for_testing` is
+    /// explicitly enabled.
+    pub weights_trained: bool,
+}
+
+/// Intermediate activation cache for a single block (used by exact backpropagation).
+#[derive(Clone, Debug)]
+pub struct FidNetBlockCache {
+    pub f_pre: Vec<f64>,
+    pub g_pre: Vec<f64>,
+    pub tf: Vec<f64>,
+    pub sg: Vec<f64>,
+    pub z: Vec<f64>,
+}
+
+/// Full forward-pass activation cache for exact analytical backpropagation.
+#[derive(Clone, Debug)]
+pub struct FidNetCache {
+    pub len: usize,
+    pub x_in: Vec<f64>,
+    /// Residual stream states `h[0..=num_blocks]`, each `[C * T]`.
+    pub h_states: Vec<Vec<f64>>,
+    pub blocks: Vec<FidNetBlockCache>,
+    pub skip_sum: Vec<f64>,
+    pub skip_act: Vec<f64>,
+    pub h1_pre: Vec<f64>,
+    pub h1_act: Vec<f64>,
+    pub output: Vec<Complex64>,
+}
+
+/// Analytical parameter gradients matching the exact structure of `FidNetWeights`.
+pub type FidNetGradients = FidNetWeights;
+
+impl FidNetModel {
+    /// Construct and validate a `FidNetModel` from `config` and `weights`.
+    ///
+    /// Defaults to `weights_trained = false` (fail-closed on default inference until trained via
+    /// `train_fidnet_step` or loaded from a verified trained `FIDNET-V1` bundle).
+    pub fn new(config: FidNetConfig, weights: FidNetWeights) -> Result<Self, FidNetError> {
+        weights.validate(&config)?;
+        Ok(Self {
+            config,
+            weights,
+            weights_trained: false,
+        })
+    }
+
+    /// Initialize a new `FidNetModel` with deterministic random Xavier/Glorot weights.
+    ///
+    /// Note: this produces an **untrained** model (`weights_trained = false`) for training or
+    /// testing; no pretrained weights are bundled in this crate. Default inference fails closed
+    /// unless `allow_untrained_for_testing` is explicitly enabled.
+    pub fn init_random(config: FidNetConfig, seed: u64) -> Result<Self, FidNetError> {
+        let weights = FidNetWeights::init_xavier(&config, seed)?;
+        Ok(Self {
+            config,
+            weights,
+            weights_trained: false,
+        })
+    }
+
+    /// Construct a `FidNetModel` from a verified `FIDNET-V1` weight bundle, preserving its
+    /// integrity-protected `weights_trained` status.
+    pub fn from_bundle(bundle: &FidNetWeightBundle) -> Result<Self, FidNetError> {
+        bundle.verify()?;
+        let weights = bundle.weights.to_f64(&bundle.config)?;
+        Ok(Self {
+            config: bundle.config.clone(),
+            weights,
+            weights_trained: bundle.weights_trained,
+        })
+    }
+
+    /// Export this model as a verified `FIDNET-V1` weight bundle with SHA-256 in-band checksum.
+    pub fn to_bundle(
+        &self,
+        metadata: FidNetBundleMetadata,
+    ) -> Result<FidNetWeightBundle, FidNetError> {
+        FidNetWeightBundle::new_with_trained_flag(
+            self.config.clone(),
+            &self.weights,
+            metadata,
+            self.weights_trained,
+        )
+    }
+
+    /// Returns `true` iff this model carries trained weights (rather than random/untrained init).
+    #[inline]
+    pub fn is_trained(&self) -> bool {
+        self.weights_trained
+    }
+
+    #[inline]
+    fn check_trained_gate(&self, allow_untrained_for_testing: bool) -> Result<(), FidNetError> {
+        if !self.weights_trained && !allow_untrained_for_testing {
+            return Err(FidNetError::UntrainedWeights(
+                FIDNET_WEIGHTS_STATUS.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Assemble channel-major `[in_ch * T]` input features from a complex FID and optional
+    /// NUS mask / coupling conditioning channels, validating length and finiteness.
+    pub fn build_input_features(
+        &self,
+        fid: &[Complex64],
+        nus_mask: Option<&[bool]>,
+        coupling_channel: Option<&[f64]>,
+    ) -> Result<Vec<f64>, FidNetError> {
+        let t_len = fid.len();
+        if t_len == 0 {
+            return Err(FidNetError::EmptyInput("input FID is empty".into()));
+        }
+        if t_len > MAX_FIDNET_LENGTH {
+            return Err(FidNetError::OversizedFid {
+                len: t_len,
+                max_len: MAX_FIDNET_LENGTH,
+            });
+        }
+        for (i, &[re, im]) in fid.iter().enumerate() {
+            if !re.is_finite() || !im.is_finite() {
+                return Err(FidNetError::NonFiniteInput(format!(
+                    "FID sample [{i}] = ({re}, {im}) is non-finite"
+                )));
+            }
+        }
+        if self.config.use_mask_channel {
+            if let Some(mask) = nus_mask {
+                if mask.len() != t_len {
+                    return Err(FidNetError::ShapeMismatch(format!(
+                        "nus_mask length {} != FID length {t_len}",
+                        mask.len()
+                    )));
+                }
+            }
+        }
+        if self.config.use_coupling_channel {
+            if let Some(cc) = coupling_channel {
+                if cc.len() != t_len {
+                    return Err(FidNetError::ShapeMismatch(format!(
+                        "coupling_channel length {} != FID length {t_len}",
+                        cc.len()
+                    )));
+                }
+                if let Some((i, &v)) = cc.iter().enumerate().find(|(_, x)| !x.is_finite()) {
+                    return Err(FidNetError::NonFiniteInput(format!(
+                        "coupling_channel[{i}] = {v} is non-finite"
+                    )));
+                }
+            }
+        }
+
+        let in_ch = self.config.in_channels();
+        let mut x_in = vec![0.0; in_ch * t_len];
+        for t in 0..t_len {
+            x_in[t] = fid[t][0];
+            x_in[t_len + t] = fid[t][1];
+        }
+        let mut ch = 2usize;
+        if self.config.use_mask_channel {
+            let base = ch * t_len;
+            match nus_mask {
+                Some(mask) => {
+                    for (t, &sampled) in mask.iter().enumerate() {
+                        x_in[base + t] = if sampled { 1.0 } else { 0.0 };
+                    }
+                }
+                None => {
+                    for t in 0..t_len {
+                        x_in[base + t] = 1.0;
+                    }
+                }
+            }
+            ch += 1;
+        }
+        if self.config.use_coupling_channel {
+            let base = ch * t_len;
+            match coupling_channel {
+                Some(cc) => {
+                    x_in[base..base + t_len].copy_from_slice(cc);
+                }
+                None => {
+                    for t in 0..t_len {
+                        x_in[base + t] = 1.0;
+                    }
+                }
+            }
+        }
+        Ok(x_in)
+    }
+
+    /// Execute the exact cache-free `f64` inference forward pass on pre-packed channel-major
+    /// features `[in_ch * T]`.
+    ///
+    /// **Fails closed** with `Err(FidNetError::UntrainedWeights(_))` when `!self.weights_trained`.
+    /// For architecture or numerical parity tests on randomly initialized weights, call
+    /// [`Self::forward_features_inference_with_options`] with `allow_untrained_for_testing = true`.
+    pub fn forward_features_inference(
+        &self,
+        x_in: &[f64],
+        t_len: usize,
+    ) -> Result<Vec<Complex64>, FidNetError> {
+        self.forward_features_inference_with_options(x_in, t_len, false)
+    }
+
+    /// Execute the exact cache-free `f64` inference forward pass on pre-packed channel-major
+    /// features `[in_ch * T]` with an explicit test-only `allow_untrained_for_testing` opt-in.
+    ///
+    /// Uses O(1) working buffers with respect to network depth (ping-ponged residual state,
+    /// per-channel row scratch, and in-place skip accumulator) instead of retaining per-block
+    /// backpropagation caches. Enforces `MAX_FIDNET_INFERENCE_ACTIVATION_BYTES` before allocating.
+    pub fn forward_features_inference_with_options(
+        &self,
+        x_in: &[f64],
+        t_len: usize,
+        allow_untrained_for_testing: bool,
+    ) -> Result<Vec<Complex64>, FidNetError> {
+        self.check_trained_gate(allow_untrained_for_testing)?;
+        self.weights.validate_shapes(&self.config)?;
+        let in_ch = self.config.in_channels();
+        if t_len == 0 {
+            return Err(FidNetError::EmptyInput("t_len must be > 0".into()));
+        }
+        if t_len > MAX_FIDNET_LENGTH {
+            return Err(FidNetError::OversizedFid {
+                len: t_len,
+                max_len: MAX_FIDNET_LENGTH,
+            });
+        }
+        let expected_in = in_ch
+            .checked_mul(t_len)
+            .ok_or_else(|| FidNetError::ShapeMismatch("in_ch * t_len overflow".into()))?;
+        if x_in.len() != expected_in {
+            return Err(FidNetError::ShapeMismatch(format!(
+                "feature buffer length {} != in_ch ({in_ch}) * t_len ({t_len})",
+                x_in.len()
+            )));
+        }
+        if let Some((i, &v)) = x_in.iter().enumerate().find(|(_, x)| !x.is_finite()) {
+            return Err(FidNetError::NonFiniteInput(format!(
+                "x_in[{i}] = {v} is non-finite"
+            )));
+        }
+        let act_bytes = self.config.inference_activation_bytes(t_len)?;
+        if act_bytes > MAX_FIDNET_INFERENCE_ACTIVATION_BYTES {
+            return Err(FidNetError::InvalidConfig(format!(
+                "inference activation memory {act_bytes} B exceeds MAX_FIDNET_INFERENCE_ACTIVATION_BYTES ({MAX_FIDNET_INFERENCE_ACTIVATION_BYTES} B)"
+            )));
+        }
+
+        let c = self.config.residual_channels;
+        let s = self.config.skip_channels;
+        let k = self.config.kernel_size;
+        let radius = (k / 2) as isize;
+
+        // 1. Stem 1x1 projection: [in_ch, T] -> h_cur [C, T]
+        let mut h_cur = vec![0.0; c * t_len];
+        for oc in 0..c {
+            let bias = self.weights.stem_b[oc];
+            let dst = &mut h_cur[oc * t_len..(oc + 1) * t_len];
+            dst.fill(bias);
+            for ic in 0..in_ch {
+                let w = self.weights.stem_w[oc * in_ch + ic];
+                let src = &x_in[ic * t_len..(ic + 1) * t_len];
+                for t in 0..t_len {
+                    dst[t] += w * src[t];
+                }
+            }
+        }
+
+        // Reusable ping-pong and scratch buffers (depth-independent memory footprint)
+        let mut h_next = vec![0.0; c * t_len];
+        let mut z = vec![0.0; c * t_len];
+        let mut f_row = vec![0.0; t_len];
+        let mut g_row = vec![0.0; t_len];
+        let mut skip_sum = vec![0.0; s * t_len];
+
+        // 2. Stack of symmetric dilated gated-activation convolution blocks
+        for (&dilation, blk) in self.config.dilations.iter().zip(self.weights.blocks.iter()) {
+            let d_isize = dilation as isize;
+
+            for oc in 0..c {
+                f_row.fill(blk.filter_b[oc]);
+                g_row.fill(blk.gate_b[oc]);
+
+                for ic in 0..c {
+                    let src_row = &h_cur[ic * t_len..(ic + 1) * t_len];
+                    let w_base = (oc * c + ic) * k;
+                    for m in 0..k {
+                        let wf = blk.filter_w[w_base + m];
+                        let wg = blk.gate_w[w_base + m];
+                        let offset = (m as isize - radius) * d_isize;
+                        let t_start = if offset < 0 { (-offset) as usize } else { 0 };
+                        let t_end = if offset > 0 {
+                            t_len.saturating_sub(offset as usize)
+                        } else {
+                            t_len
+                        };
+                        if t_start < t_end {
+                            for t in t_start..t_end {
+                                let src_idx = (t as isize + offset) as usize;
+                                let v = src_row[src_idx];
+                                f_row[t] += wf * v;
+                                g_row[t] += wg * v;
+                            }
+                        }
+                    }
+                }
+
+                let z_row = &mut z[oc * t_len..(oc + 1) * t_len];
+                for t in 0..t_len {
+                    z_row[t] = safe_tanh(f_row[t]) * safe_sigmoid(g_row[t]);
+                }
+            }
+
+            // Residual 1x1 projection + residual bypass into h_next
+            h_next.copy_from_slice(&h_cur);
+            for oc in 0..c {
+                let rb = blk.res_b[oc];
+                let dst = &mut h_next[oc * t_len..(oc + 1) * t_len];
+                for v in dst.iter_mut() {
+                    *v += rb;
+                }
+                for ic in 0..c {
+                    let wr = blk.res_w[oc * c + ic];
+                    let z_row = &z[ic * t_len..(ic + 1) * t_len];
+                    for t in 0..t_len {
+                        dst[t] += wr * z_row[t];
+                    }
+                }
+            }
+
+            // Skip 1x1 projection accumulated into skip_sum
+            for os in 0..s {
+                let sb = blk.skip_b[os];
+                let dst = &mut skip_sum[os * t_len..(os + 1) * t_len];
+                for v in dst.iter_mut() {
+                    *v += sb;
+                }
+                for ic in 0..c {
+                    let ws = blk.skip_w[os * c + ic];
+                    let z_row = &z[ic * t_len..(ic + 1) * t_len];
+                    for t in 0..t_len {
+                        dst[t] += ws * z_row[t];
+                    }
+                }
+            }
+
+            std::mem::swap(&mut h_cur, &mut h_next);
+        }
+
+        // 3. Output head: ReLU(skip_sum) -> 1x1 -> ReLU -> 1x1 linear -> [Re, Im]
+        for v in &mut skip_sum {
+            *v = v.max(0.0);
+        }
+        let mut h1 = vec![0.0; s * t_len];
+        for os in 0..s {
+            let hb = self.weights.head1_b[os];
+            let dst = &mut h1[os * t_len..(os + 1) * t_len];
+            dst.fill(hb);
+            for is in 0..s {
+                let wh = self.weights.head1_w[os * s + is];
+                let src = &skip_sum[is * t_len..(is + 1) * t_len];
+                for t in 0..t_len {
+                    dst[t] += wh * src[t];
+                }
+            }
+            for v in dst.iter_mut() {
+                *v = v.max(0.0);
+            }
+        }
+
+        let mut output = vec![[0.0; 2]; t_len];
+        for (o, out_b) in self.weights.out_b.iter().enumerate() {
+            for t in 0..t_len {
+                let mut acc = *out_b;
+                for is in 0..s {
+                    acc += self.weights.out_w[o * s + is] * h1[is * t_len + t];
+                }
+                if self.config.input_residual_skip {
+                    acc += x_in[o * t_len + t];
+                }
+                output[t][o] = acc;
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// Execute the cache-free `f64` inference forward pass on a complex FID (no backprop cache
+    /// allocated, no input scaling or abstention post-processing).
+    ///
+    /// **Fails closed** with `Err(FidNetError::UntrainedWeights(_))` when `!self.weights_trained`.
+    pub fn forward_fid_inference(
+        &self,
+        fid: &[Complex64],
+        nus_mask: Option<&[bool]>,
+        coupling_channel: Option<&[f64]>,
+    ) -> Result<Vec<Complex64>, FidNetError> {
+        self.forward_fid_inference_with_options(fid, nus_mask, coupling_channel, false)
+    }
+
+    /// Execute the cache-free `f64` inference forward pass on a complex FID with an explicit
+    /// test-only `allow_untrained_for_testing` opt-in.
+    pub fn forward_fid_inference_with_options(
+        &self,
+        fid: &[Complex64],
+        nus_mask: Option<&[bool]>,
+        coupling_channel: Option<&[f64]>,
+        allow_untrained_for_testing: bool,
+    ) -> Result<Vec<Complex64>, FidNetError> {
+        self.check_trained_gate(allow_untrained_for_testing)?;
+        let x_in = self.build_input_features(fid, nus_mask, coupling_channel)?;
+        self.forward_features_inference_with_options(&x_in, fid.len(), allow_untrained_for_testing)
+    }
+
+    /// Execute the exact `f64` forward pass on pre-packed channel-major features `[in_ch * T]`,
+    /// returning the reconstructed complex FID and full activation cache for backpropagation.
+    pub fn forward_features_with_cache(
+        &self,
+        x_in: &[f64],
+        t_len: usize,
+    ) -> Result<FidNetCache, FidNetError> {
+        self.weights.validate_shapes(&self.config)?;
+        let in_ch = self.config.in_channels();
+        if t_len == 0 {
+            return Err(FidNetError::EmptyInput("t_len must be > 0".into()));
+        }
+        if t_len > MAX_FIDNET_LENGTH {
+            return Err(FidNetError::OversizedFid {
+                len: t_len,
+                max_len: MAX_FIDNET_LENGTH,
+            });
+        }
+        let expected_in = in_ch
+            .checked_mul(t_len)
+            .ok_or_else(|| FidNetError::ShapeMismatch("in_ch * t_len overflow".into()))?;
+        if x_in.len() != expected_in {
+            return Err(FidNetError::ShapeMismatch(format!(
+                "feature buffer length {} != in_ch ({in_ch}) * t_len ({t_len})",
+                x_in.len()
+            )));
+        }
+        if let Some((i, &v)) = x_in.iter().enumerate().find(|(_, x)| !x.is_finite()) {
+            return Err(FidNetError::NonFiniteInput(format!(
+                "x_in[{i}] = {v} is non-finite"
+            )));
+        }
+        let cache_bytes = self.config.training_cache_bytes(t_len)?;
+        if cache_bytes > MAX_FIDNET_TRAINING_CACHE_BYTES {
+            return Err(FidNetError::InvalidConfig(format!(
+                "backprop cache memory {cache_bytes} B exceeds MAX_FIDNET_TRAINING_CACHE_BYTES ({MAX_FIDNET_TRAINING_CACHE_BYTES} B); use forward_fid_inference for cache-free inference"
+            )));
+        }
+
+        let c = self.config.residual_channels;
+        let s = self.config.skip_channels;
+        let k = self.config.kernel_size;
+        let radius = (k / 2) as isize;
+        let n_blocks = self.config.num_blocks();
+
+        // 1. Stem 1x1 projection: [in_ch, T] -> [C, T]
+        let mut h0 = vec![0.0; c * t_len];
+        for oc in 0..c {
+            let bias = self.weights.stem_b[oc];
+            let dst = &mut h0[oc * t_len..(oc + 1) * t_len];
+            dst.fill(bias);
+            for ic in 0..in_ch {
+                let w = self.weights.stem_w[oc * in_ch + ic];
+                let src = &x_in[ic * t_len..(ic + 1) * t_len];
+                for t in 0..t_len {
+                    dst[t] += w * src[t];
+                }
+            }
+        }
+
+        let mut h_states = Vec::with_capacity(n_blocks + 1);
+        h_states.push(h0);
+        let mut block_caches = Vec::with_capacity(n_blocks);
+        let mut skip_sum = vec![0.0; s * t_len];
+
+        // 2. Stack of symmetric dilated gated-activation convolution blocks
+        for (bi, (&dilation, blk)) in self
+            .config
+            .dilations
+            .iter()
+            .zip(self.weights.blocks.iter())
+            .enumerate()
+        {
+            let h_in = &h_states[bi];
+            let d_isize = dilation as isize;
+            let mut f_pre = vec![0.0; c * t_len];
+            let mut g_pre = vec![0.0; c * t_len];
+
+            for oc in 0..c {
+                let fb = blk.filter_b[oc];
+                let gb = blk.gate_b[oc];
+                let f_row = &mut f_pre[oc * t_len..(oc + 1) * t_len];
+                let g_row = &mut g_pre[oc * t_len..(oc + 1) * t_len];
+                f_row.fill(fb);
+                g_row.fill(gb);
+
+                for ic in 0..c {
+                    let src_row = &h_in[ic * t_len..(ic + 1) * t_len];
+                    let w_base = (oc * c + ic) * k;
+                    for m in 0..k {
+                        let wf = blk.filter_w[w_base + m];
+                        let wg = blk.gate_w[w_base + m];
+                        let offset = (m as isize - radius) * d_isize;
+                        let t_start = if offset < 0 { (-offset) as usize } else { 0 };
+                        let t_end = if offset > 0 {
+                            t_len.saturating_sub(offset as usize)
+                        } else {
+                            t_len
+                        };
+                        if t_start < t_end {
+                            for t in t_start..t_end {
+                                let src_idx = (t as isize + offset) as usize;
+                                let v = src_row[src_idx];
+                                f_row[t] += wf * v;
+                                g_row[t] += wg * v;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut tf = vec![0.0; c * t_len];
+            let mut sg = vec![0.0; c * t_len];
+            let mut z = vec![0.0; c * t_len];
+            for idx in 0..(c * t_len) {
+                let t_val = safe_tanh(f_pre[idx]);
+                let s_val = safe_sigmoid(g_pre[idx]);
+                tf[idx] = t_val;
+                sg[idx] = s_val;
+                z[idx] = t_val * s_val;
+            }
+
+            // Residual 1x1 projection + residual bypass
+            let mut h_next = h_in.clone();
+            for oc in 0..c {
+                let rb = blk.res_b[oc];
+                let dst = &mut h_next[oc * t_len..(oc + 1) * t_len];
+                for v in dst.iter_mut() {
+                    *v += rb;
+                }
+                for ic in 0..c {
+                    let wr = blk.res_w[oc * c + ic];
+                    let z_row = &z[ic * t_len..(ic + 1) * t_len];
+                    for t in 0..t_len {
+                        dst[t] += wr * z_row[t];
+                    }
+                }
+            }
+
+            // Skip 1x1 projection accumulated into skip_sum
+            for os in 0..s {
+                let sb = blk.skip_b[os];
+                let dst = &mut skip_sum[os * t_len..(os + 1) * t_len];
+                for v in dst.iter_mut() {
+                    *v += sb;
+                }
+                for ic in 0..c {
+                    let ws = blk.skip_w[os * c + ic];
+                    let z_row = &z[ic * t_len..(ic + 1) * t_len];
+                    for t in 0..t_len {
+                        dst[t] += ws * z_row[t];
+                    }
+                }
+            }
+
+            h_states.push(h_next);
+            block_caches.push(FidNetBlockCache {
+                f_pre,
+                g_pre,
+                tf,
+                sg,
+                z,
+            });
+        }
+
+        // 3. Output head: ReLU(skip_sum) -> 1x1 -> ReLU -> 1x1 linear -> [Re, Im]
+        let skip_act: Vec<f64> = skip_sum.iter().map(|&v| v.max(0.0)).collect();
+        let mut h1_pre = vec![0.0; s * t_len];
+        for os in 0..s {
+            let hb = self.weights.head1_b[os];
+            let dst = &mut h1_pre[os * t_len..(os + 1) * t_len];
+            dst.fill(hb);
+            for is in 0..s {
+                let wh = self.weights.head1_w[os * s + is];
+                let src = &skip_act[is * t_len..(is + 1) * t_len];
+                for t in 0..t_len {
+                    dst[t] += wh * src[t];
+                }
+            }
+        }
+        let h1_act: Vec<f64> = h1_pre.iter().map(|&v| v.max(0.0)).collect();
+
+        let mut output = vec![[0.0; 2]; t_len];
+        for (o, out_b) in self.weights.out_b.iter().enumerate() {
+            for t in 0..t_len {
+                let mut acc = *out_b;
+                for is in 0..s {
+                    acc += self.weights.out_w[o * s + is] * h1_act[is * t_len + t];
+                }
+                if self.config.input_residual_skip {
+                    acc += x_in[o * t_len + t];
+                }
+                output[t][o] = acc;
+            }
+        }
+
+        Ok(FidNetCache {
+            len: t_len,
+            x_in: x_in.to_vec(),
+            h_states,
+            blocks: block_caches,
+            skip_sum,
+            skip_act,
+            h1_pre,
+            h1_act,
+            output,
+        })
+    }
+
+    /// Execute raw cache-free forward inference on a complex FID (alias for
+    /// [`Self::forward_fid_inference`]; no backprop cache, input scaling, or abstention).
+    ///
+    /// **Fails closed** with `Err(FidNetError::UntrainedWeights(_))` when `!self.weights_trained`.
+    pub fn forward_fid(
+        &self,
+        fid: &[Complex64],
+        nus_mask: Option<&[bool]>,
+        coupling_channel: Option<&[f64]>,
+    ) -> Result<Vec<Complex64>, FidNetError> {
+        self.forward_fid_inference(fid, nus_mask, coupling_channel)
+    }
+
+    /// Execute raw cache-free forward inference on a complex FID with an explicit test-only
+    /// `allow_untrained_for_testing` opt-in (alias for
+    /// [`Self::forward_fid_inference_with_options`]).
+    pub fn forward_fid_with_options(
+        &self,
+        fid: &[Complex64],
+        nus_mask: Option<&[bool]>,
+        coupling_channel: Option<&[f64]>,
+        allow_untrained_for_testing: bool,
+    ) -> Result<Vec<Complex64>, FidNetError> {
+        self.forward_fid_inference_with_options(
+            fid,
+            nus_mask,
+            coupling_channel,
+            allow_untrained_for_testing,
+        )
+    }
+
+    /// Exact analytical backpropagation for weighted complex MSE loss:
+    /// `L = (1 / (2 * T)) * sum_t w_t * ((re_pred - re_tgt)^2 + (im_pred - im_tgt)^2)`.
+    pub fn backward_mse(
+        &self,
+        cache: &FidNetCache,
+        target: &[Complex64],
+        loss_weights: Option<&[f64]>,
+    ) -> Result<(f64, FidNetGradients), FidNetError> {
+        let t_len = cache.len;
+        if target.len() != t_len {
+            return Err(FidNetError::ShapeMismatch(format!(
+                "target length {} != cached FID length {t_len}",
+                target.len()
+            )));
+        }
+        if let Some(lw) = loss_weights {
+            if lw.len() != t_len {
+                return Err(FidNetError::ShapeMismatch(format!(
+                    "loss_weights length {} != cached FID length {t_len}",
+                    lw.len()
+                )));
+            }
+        }
+
+        let in_ch = self.config.in_channels();
+        let c = self.config.residual_channels;
+        let s = self.config.skip_channels;
+        let k = self.config.kernel_size;
+        let radius = (k / 2) as isize;
+        let inv_t = 1.0 / (t_len as f64);
+
+        let mut grads = FidNetWeights::zeros(&self.config)?;
+
+        // 1. Output MSE loss & dL/dy
+        let mut loss = 0.0;
+        let mut d_y = vec![0.0; 2 * t_len];
+        for t in 0..t_len {
+            let wt = loss_weights.map_or(1.0, |lw| lw[t]);
+            if !wt.is_finite() || !target[t][0].is_finite() || !target[t][1].is_finite() {
+                return Err(FidNetError::NonFiniteInput(format!(
+                    "non-finite target or weight at t={t}"
+                )));
+            }
+            let diff_re = cache.output[t][0] - target[t][0];
+            let diff_im = cache.output[t][1] - target[t][1];
+            loss += 0.5 * inv_t * wt * (diff_re * diff_re + diff_im * diff_im);
+            d_y[t] = inv_t * wt * diff_re;
+            d_y[t_len + t] = inv_t * wt * diff_im;
+        }
+
+        // 2. Output 1x1 linear layer backward
+        let mut d_h1_act = vec![0.0; s * t_len];
+        for o in 0..2 {
+            let dy_row = &d_y[o * t_len..(o + 1) * t_len];
+            let mut b_acc = 0.0;
+            for &v in dy_row {
+                b_acc += v;
+            }
+            grads.out_b[o] += b_acc;
+            for is in 0..s {
+                let h1_row = &cache.h1_act[is * t_len..(is + 1) * t_len];
+                let w_val = self.weights.out_w[o * s + is];
+                let dh1_row = &mut d_h1_act[is * t_len..(is + 1) * t_len];
+                let mut w_acc = 0.0;
+                for t in 0..t_len {
+                    w_acc += dy_row[t] * h1_row[t];
+                    dh1_row[t] += w_val * dy_row[t];
+                }
+                grads.out_w[o * s + is] += w_acc;
+            }
+        }
+
+        // 3. Head1 ReLU + 1x1 backward
+        let mut d_h1_pre = vec![0.0; s * t_len];
+        for idx in 0..(s * t_len) {
+            if cache.h1_pre[idx] > 0.0 {
+                d_h1_pre[idx] = d_h1_act[idx];
+            }
+        }
+        let mut d_skip_act = vec![0.0; s * t_len];
+        for os in 0..s {
+            let dh_row = &d_h1_pre[os * t_len..(os + 1) * t_len];
+            let mut b_acc = 0.0;
+            for &v in dh_row {
+                b_acc += v;
+            }
+            grads.head1_b[os] += b_acc;
+            for is in 0..s {
+                let sa_row = &cache.skip_act[is * t_len..(is + 1) * t_len];
+                let w_val = self.weights.head1_w[os * s + is];
+                let dsa_row = &mut d_skip_act[is * t_len..(is + 1) * t_len];
+                let mut w_acc = 0.0;
+                for t in 0..t_len {
+                    w_acc += dh_row[t] * sa_row[t];
+                    dsa_row[t] += w_val * dh_row[t];
+                }
+                grads.head1_w[os * s + is] += w_acc;
+            }
+        }
+
+        // 4. Skip ReLU backward
+        let mut d_skip_sum = vec![0.0; s * t_len];
+        for idx in 0..(s * t_len) {
+            if cache.skip_sum[idx] > 0.0 {
+                d_skip_sum[idx] = d_skip_act[idx];
+            }
+        }
+
+        // 5. Symmetric dilated convolution blocks backward (reverse order)
+        let mut d_h = vec![0.0; c * t_len];
+        for bi in (0..self.config.num_blocks()).rev() {
+            let blk_w = &self.weights.blocks[bi];
+            let blk_g = &mut grads.blocks[bi];
+            let blk_c = &cache.blocks[bi];
+            let h_in = &cache.h_states[bi];
+            let d_isize = self.config.dilations[bi] as isize;
+
+            let mut d_z = vec![0.0; c * t_len];
+
+            // Skip 1x1 backward
+            for os in 0..s {
+                let ds_row = &d_skip_sum[os * t_len..(os + 1) * t_len];
+                let mut b_acc = 0.0;
+                for &v in ds_row {
+                    b_acc += v;
+                }
+                blk_g.skip_b[os] += b_acc;
+                for ic in 0..c {
+                    let z_row = &blk_c.z[ic * t_len..(ic + 1) * t_len];
+                    let w_val = blk_w.skip_w[os * c + ic];
+                    let dz_row = &mut d_z[ic * t_len..(ic + 1) * t_len];
+                    let mut w_acc = 0.0;
+                    for t in 0..t_len {
+                        w_acc += ds_row[t] * z_row[t];
+                        dz_row[t] += w_val * ds_row[t];
+                    }
+                    blk_g.skip_w[os * c + ic] += w_acc;
+                }
+            }
+
+            // Residual 1x1 backward
+            for oc in 0..c {
+                let dh_row = &d_h[oc * t_len..(oc + 1) * t_len];
+                let mut b_acc = 0.0;
+                for &v in dh_row {
+                    b_acc += v;
+                }
+                blk_g.res_b[oc] += b_acc;
+                for ic in 0..c {
+                    let z_row = &blk_c.z[ic * t_len..(ic + 1) * t_len];
+                    let w_val = blk_w.res_w[oc * c + ic];
+                    let dz_row = &mut d_z[ic * t_len..(ic + 1) * t_len];
+                    let mut w_acc = 0.0;
+                    for t in 0..t_len {
+                        w_acc += dh_row[t] * z_row[t];
+                        dz_row[t] += w_val * dh_row[t];
+                    }
+                    blk_g.res_w[oc * c + ic] += w_acc;
+                }
+            }
+
+            // Gated activation backward: z = tanh(f) * sigmoid(g)
+            let mut d_f = vec![0.0; c * t_len];
+            let mut d_g = vec![0.0; c * t_len];
+            for idx in 0..(c * t_len) {
+                let dz = d_z[idx];
+                d_f[idx] = dz * blk_c.sg[idx] * safe_tanh_deriv(blk_c.f_pre[idx], blk_c.tf[idx]);
+                d_g[idx] = dz * blk_c.tf[idx] * safe_sigmoid_deriv(blk_c.g_pre[idx], blk_c.sg[idx]);
+            }
+
+            // Residual bypass gradient + dilated filter & gate conv backward
+            let mut d_h_prev = d_h;
+            for oc in 0..c {
+                let df_row = &d_f[oc * t_len..(oc + 1) * t_len];
+                let dg_row = &d_g[oc * t_len..(oc + 1) * t_len];
+                let mut fb_acc = 0.0;
+                let mut gb_acc = 0.0;
+                for t in 0..t_len {
+                    fb_acc += df_row[t];
+                    gb_acc += dg_row[t];
+                }
+                blk_g.filter_b[oc] += fb_acc;
+                blk_g.gate_b[oc] += gb_acc;
+
+                for ic in 0..c {
+                    let h_row = &h_in[ic * t_len..(ic + 1) * t_len];
+                    let dh_prev_row = &mut d_h_prev[ic * t_len..(ic + 1) * t_len];
+                    let w_base = (oc * c + ic) * k;
+                    for m in 0..k {
+                        let wf = blk_w.filter_w[w_base + m];
+                        let wg = blk_w.gate_w[w_base + m];
+                        let offset = (m as isize - radius) * d_isize;
+                        let t_start = if offset < 0 { (-offset) as usize } else { 0 };
+                        let t_end = if offset > 0 {
+                            t_len.saturating_sub(offset as usize)
+                        } else {
+                            t_len
+                        };
+                        if t_start < t_end {
+                            let mut fw_acc = 0.0;
+                            let mut gw_acc = 0.0;
+                            for t in t_start..t_end {
+                                let src_idx = (t as isize + offset) as usize;
+                                let hv = h_row[src_idx];
+                                let dfv = df_row[t];
+                                let dgv = dg_row[t];
+                                fw_acc += dfv * hv;
+                                gw_acc += dgv * hv;
+                                dh_prev_row[src_idx] += wf * dfv + wg * dgv;
+                            }
+                            blk_g.filter_w[w_base + m] += fw_acc;
+                            blk_g.gate_w[w_base + m] += gw_acc;
+                        }
+                    }
+                }
+            }
+            d_h = d_h_prev;
+        }
+
+        // 6. Stem 1x1 backward
+        for oc in 0..c {
+            let dh_row = &d_h[oc * t_len..(oc + 1) * t_len];
+            let mut b_acc = 0.0;
+            for &v in dh_row {
+                b_acc += v;
+            }
+            grads.stem_b[oc] += b_acc;
+            for ic in 0..in_ch {
+                let x_row = &cache.x_in[ic * t_len..(ic + 1) * t_len];
+                let mut w_acc = 0.0;
+                for t in 0..t_len {
+                    w_acc += dh_row[t] * x_row[t];
+                }
+                grads.stem_w[oc * in_ch + ic] += w_acc;
+            }
+        }
+
+        Ok((loss, grads))
+    }
+}
+
+// ============================================================================
+// Adam Optimizer & Training Step
+// ============================================================================
+
+/// Configuration for the `Adam` stochastic gradient optimizer (Kingma & Ba 2015).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FidNetAdamConfig {
+    pub lr: f64,
+    pub beta1: f64,
+    pub beta2: f64,
+    pub eps: f64,
+    pub weight_decay: f64,
+    pub max_grad_norm: f64,
+}
+
+impl Default for FidNetAdamConfig {
+    fn default() -> Self {
+        Self {
+            lr: 5e-3,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+            max_grad_norm: 5.0,
+        }
+    }
+}
+
+/// Persistent first/second moment state for `Adam` optimization of a `FidNetModel`.
+#[derive(Clone, Debug)]
+pub struct FidNetAdamState {
+    pub cfg: FidNetAdamConfig,
+    pub step: u64,
+    pub m: Vec<f64>,
+    pub v: Vec<f64>,
+}
+
+impl FidNetAdamState {
+    pub fn new(config: &FidNetConfig, cfg: FidNetAdamConfig) -> Result<Self, FidNetError> {
+        let n_params = config.parameter_count()?;
+        Ok(Self {
+            cfg,
+            step: 0,
+            m: vec![0.0; n_params],
+            v: vec![0.0; n_params],
+        })
+    }
+}
+
+/// Single training example for `train_fidnet_step`.
+#[derive(Clone, Debug)]
+pub struct FidNetTrainExample {
+    pub input_fid: Vec<Complex64>,
+    pub nus_mask: Option<Vec<bool>>,
+    pub coupling_channel: Option<Vec<f64>>,
+    pub target_fid: Vec<Complex64>,
+    pub loss_weights: Option<Vec<f64>>,
+}
+
+/// Execute one exact analytical-backpropagation Adam optimization step over a mini-batch
+/// of time-domain FIDs, returning the mean batch MSE loss.
+pub fn train_fidnet_step(
+    model: &mut FidNetModel,
+    adam: &mut FidNetAdamState,
+    batch: &[FidNetTrainExample],
+) -> Result<f64, FidNetError> {
+    if batch.is_empty() {
+        return Err(FidNetError::EmptyInput(
+            "training mini-batch must not be empty".into(),
+        ));
+    }
+    let n_params = model.config.parameter_count()?;
+    if adam.m.len() != n_params || adam.v.len() != n_params {
+        return Err(FidNetError::ShapeMismatch(format!(
+            "Adam state length ({}, {}) != model parameter count {n_params}",
+            adam.m.len(),
+            adam.v.len()
+        )));
+    }
+
+    let mut acc_grad = vec![0.0; n_params];
+    let mut total_loss = 0.0;
+    let inv_batch = 1.0 / (batch.len() as f64);
+
+    for ex in batch {
+        let x_in = model.build_input_features(
+            &ex.input_fid,
+            ex.nus_mask.as_deref(),
+            ex.coupling_channel.as_deref(),
+        )?;
+        let cache = model.forward_features_with_cache(&x_in, ex.input_fid.len())?;
+        let (loss, g) = model.backward_mse(&cache, &ex.target_fid, ex.loss_weights.as_deref())?;
+        total_loss += loss * inv_batch;
+        let flat_g = g.to_flat_vec();
+        for (dst, &gv) in acc_grad.iter_mut().zip(flat_g.iter()) {
+            *dst += gv * inv_batch;
+        }
+    }
+
+    // Global L2 gradient clipping for stability
+    let grad_norm = acc_grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+    if adam.cfg.max_grad_norm > 0.0 && grad_norm > adam.cfg.max_grad_norm {
+        let scale = adam.cfg.max_grad_norm / grad_norm;
+        for g in &mut acc_grad {
+            *g *= scale;
+        }
+    }
+
+    adam.step = adam.step.saturating_add(1);
+    let b1 = adam.cfg.beta1;
+    let b2 = adam.cfg.beta2;
+    let bc1 = 1.0 - b1.powi(adam.step.min(i32::MAX as u64) as i32);
+    let bc2 = 1.0 - b2.powi(adam.step.min(i32::MAX as u64) as i32);
+
+    let mut params = model.weights.to_flat_vec();
+    for i in 0..n_params {
+        let g = acc_grad[i] + adam.cfg.weight_decay * params[i];
+        adam.m[i] = b1 * adam.m[i] + (1.0 - b1) * g;
+        adam.v[i] = b2 * adam.v[i] + (1.0 - b2) * g * g;
+        let m_hat = adam.m[i] / bc1;
+        let v_hat = adam.v[i] / bc2;
+        params[i] -= adam.cfg.lr * m_hat / (v_hat.sqrt() + adam.cfg.eps);
+    }
+
+    model.weights = FidNetWeights::from_flat_slice(&model.config, &params)?;
+    model.weights_trained = true;
+    Ok(total_loss)
+}
+
+// ============================================================================
+// Synthetic Spin-Hamiltonian FID Generator & Poisson-Gap NUS Schedule
+// ============================================================================
+
+/// Parameters of a single synthetic NMR resonance in a time-domain spin-Hamiltonian FID.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SyntheticSpin {
+    /// Resonance offset frequency in Hz (typically in `[-sw_hz / 2, sw_hz / 2]`).
+    pub freq_hz: f64,
+    /// Transverse relaxation rate $R_2$ in $\text{s}^{-1}$ (`>= 0`).
+    pub r2_hz: f64,
+    /// Signal amplitude magnitude (`>= 0`).
+    pub amplitude: f64,
+    /// Zero-order phase in radians.
+    pub phase_rad: f64,
+    /// Homonuclear scalar coupling constant $J$ in Hz (`0.0` for uncoupled singlet,
+    /// e.g. `35.0` Hz for $^1J_{\text{C}\alpha\text{C}\beta}$ or `7.0` Hz for $^3J_{\text{HH}}$).
+    pub j_coupling_hz: f64,
+}
+
+/// Specification for generating a synthetic complex NMR FID with optional noise, $J$-coupling,
+/// and sine-weighted Poisson-gap NUS mask.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SyntheticFidSpec {
+    pub len: usize,
+    pub sw_hz: f64,
+    pub spins: Vec<SyntheticSpin>,
+    pub noise_sigma: f64,
+    /// Optional target NUS sampling density in `(0.0, 1.0]`; `None` generates uniform sampling.
+    pub nus_fraction: Option<f64>,
+    /// Reference coupling constant in Hz for generating the optional conditioning channel.
+    pub conditioning_j_hz: Option<f64>,
+    pub seed: u64,
+}
+
+/// Generated synthetic time-domain NMR dataset with ground-truth clean singlet, clean coupled FID,
+/// and noisy / NUS-masked observed FID.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyntheticFidSample {
+    /// Ground-truth noiseless, uncoupled (singlet), uniformly sampled complex FID.
+    pub clean_singlet: Vec<Complex64>,
+    /// Ground-truth noiseless, uniformly sampled FID including $\cos(\pi J t)$ modulation.
+    pub clean_coupled: Vec<Complex64>,
+    /// Observed complex FID (coupled + complex Gaussian noise, zeroed at unsampled NUS points).
+    pub observed: Vec<Complex64>,
+    /// Optional binary NUS sampling mask (`true` = measured, `false` = unsampled).
+    pub nus_mask: Option<Vec<bool>>,
+    /// Optional coupling-constant conditioning channel `cos(pi * J_ref * t)`.
+    pub coupling_channel: Option<Vec<f64>>,
+}
+
+/// Generate a sine-weighted Poisson-gap NUS binary mask (Hyberts, Takeuchi & Wagner, *JACS* 2010),
+/// always sampling `t = 0` and tuning the gap-rate parameter via deterministic bisection to hit
+/// `target_fraction` accurately.
+pub fn generate_poisson_gap_nus_mask(
+    len: usize,
+    target_fraction: f64,
+    seed: u64,
+) -> Result<Vec<bool>, FidNetError> {
+    if len == 0 {
+        return Err(FidNetError::EmptyInput(
+            "NUS mask length must be > 0".into(),
+        ));
+    }
+    if len > MAX_FIDNET_LENGTH {
+        return Err(FidNetError::OversizedFid {
+            len,
+            max_len: MAX_FIDNET_LENGTH,
+        });
+    }
+    if !target_fraction.is_finite() || target_fraction <= 0.0 || target_fraction > 1.0 {
+        return Err(FidNetError::InvalidConfig(format!(
+            "target_fraction={target_fraction} must be in (0.0, 1.0]"
+        )));
+    }
+    let target_count = ((len as f64) * target_fraction)
+        .round()
+        .clamp(1.0, len as f64) as usize;
+    if target_count == len {
+        return Ok(vec![true; len]);
+    }
+    if target_count == 1 {
+        let mut mask = vec![false; len];
+        mask[0] = true;
+        return Ok(mask);
+    }
+
+    let sample_with_scale = |scale: f64, trial_seed: u64| -> Vec<usize> {
+        let mut rng = Rng::new(trial_seed);
+        let mut idxs = Vec::with_capacity(target_count + 8);
+        let mut pos = 0usize;
+        while pos < len {
+            idxs.push(pos);
+            let frac = (pos as f64 + 0.5) / (len as f64);
+            // Sine-weighted gap rate: denser at early t where SNR is highest.
+            let sin_w = (0.5 * PI * frac).sin();
+            let lambda = (scale * sin_w).max(0.0);
+            let gap = rng.poisson(lambda);
+            pos = pos.saturating_add(1).saturating_add(gap);
+        }
+        idxs
+    };
+
+    // Binary search on gap scale parameter to match target_count closely.
+    let mut lo = 0.0f64;
+    let mut hi = (len as f64) / (target_count as f64).max(1.0) * 6.0;
+    let mut best_idxs = sample_with_scale(hi * 0.5, seed);
+    let mut best_err = best_idxs.len().abs_diff(target_count);
+
+    for iter in 0..24u64 {
+        let mid = 0.5 * (lo + hi);
+        let idxs = sample_with_scale(
+            mid,
+            seed.wrapping_add(iter.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+        );
+        let err = idxs.len().abs_diff(target_count);
+        if err < best_err {
+            best_err = err;
+            best_idxs = idxs.clone();
+        }
+        if idxs.len() > target_count {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    let mut mask = vec![false; len];
+    for idx in best_idxs {
+        if idx < len {
+            mask[idx] = true;
+        }
+    }
+    mask[0] = true;
+
+    // Fine deterministic adjustment to hit exact target_count while preserving mask[0] = true.
+    let mut current = mask.iter().filter(|&&b| b).count();
+    let mut rng = Rng::new(seed ^ 0xA5A5_5A5A_1234_5678);
+    if current < target_count {
+        let mut unsampled: Vec<usize> = (1..len).filter(|&i| !mask[i]).collect();
+        while current < target_count && !unsampled.is_empty() {
+            let pick = rng.usize(unsampled.len());
+            let idx = unsampled.swap_remove(pick);
+            mask[idx] = true;
+            current += 1;
+        }
+    } else if current > target_count {
+        let mut sampled: Vec<usize> = (1..len).filter(|&i| mask[i]).collect();
+        while current > target_count && !sampled.is_empty() {
+            let pick = rng.usize(sampled.len());
+            let idx = sampled.swap_remove(pick);
+            mask[idx] = false;
+            current -= 1;
+        }
+    }
+
+    Ok(mask)
+}
+
+/// Generate a synthetic multi-spin complex NMR FID from physical spin-Hamiltonian parameters
+/// (resonance frequencies, $R_2$ decay rates, homonuclear $J$-splittings, complex Gaussian noise,
+/// and optional sine-weighted Poisson-gap NUS mask).
+pub fn generate_synthetic_fid(spec: &SyntheticFidSpec) -> Result<SyntheticFidSample, FidNetError> {
+    if spec.len == 0 {
+        return Err(FidNetError::EmptyInput(
+            "synthetic FID length must be > 0".into(),
+        ));
+    }
+    if spec.len > MAX_FIDNET_LENGTH {
+        return Err(FidNetError::OversizedFid {
+            len: spec.len,
+            max_len: MAX_FIDNET_LENGTH,
+        });
+    }
+    if !spec.sw_hz.is_finite() || spec.sw_hz <= 0.0 {
+        return Err(FidNetError::InvalidConfig(format!(
+            "sw_hz={} must be finite and > 0",
+            spec.sw_hz
+        )));
+    }
+    if !spec.noise_sigma.is_finite() || spec.noise_sigma < 0.0 {
+        return Err(FidNetError::InvalidConfig(format!(
+            "noise_sigma={} must be finite and >= 0",
+            spec.noise_sigma
+        )));
+    }
+    for (idx, sp) in spec.spins.iter().enumerate() {
+        if !sp.freq_hz.is_finite()
+            || !sp.r2_hz.is_finite()
+            || sp.r2_hz < 0.0
+            || !sp.amplitude.is_finite()
+            || !sp.phase_rad.is_finite()
+            || !sp.j_coupling_hz.is_finite()
+        {
+            return Err(FidNetError::InvalidConfig(format!(
+                "invalid spin[{idx}] parameters: {sp:?}"
+            )));
+        }
+    }
+
+    let dt = 1.0 / spec.sw_hz;
+    let mut clean_singlet = vec![[0.0; 2]; spec.len];
+    let mut clean_coupled = vec![[0.0; 2]; spec.len];
+
+    for (k, (cs, cc)) in clean_singlet
+        .iter_mut()
+        .zip(clean_coupled.iter_mut())
+        .enumerate()
+    {
+        let t = (k as f64) * dt;
+        let mut s_re = 0.0;
+        let mut s_im = 0.0;
+        let mut c_re = 0.0;
+        let mut c_im = 0.0;
+        for sp in &spec.spins {
+            let decay = sp.amplitude * (-sp.r2_hz * t).exp();
+            let angle = TAU * sp.freq_hz * t + sp.phase_rad;
+            let (sin_a, cos_a) = angle.sin_cos();
+            let base_re = decay * cos_a;
+            let base_im = decay * sin_a;
+            s_re += base_re;
+            s_im += base_im;
+
+            let j_mod = if sp.j_coupling_hz != 0.0 {
+                (PI * sp.j_coupling_hz * t).cos()
+            } else {
+                1.0
+            };
+            c_re += base_re * j_mod;
+            c_im += base_im * j_mod;
+        }
+        *cs = [s_re, s_im];
+        *cc = [c_re, c_im];
+    }
+
+    let nus_mask = match spec.nus_fraction {
+        Some(frac) => Some(generate_poisson_gap_nus_mask(
+            spec.len,
+            frac,
+            spec.seed.wrapping_add(0x517C_C1B7_2722_0A95),
+        )?),
+        None => None,
+    };
+
+    let mut rng = Rng::new(spec.seed);
+    let mut observed = vec![[0.0; 2]; spec.len];
+    for t in 0..spec.len {
+        let sampled = nus_mask.as_ref().is_none_or(|m| m[t]);
+        if sampled {
+            let n_re = if spec.noise_sigma > 0.0 {
+                rng.normal(0.0, spec.noise_sigma)
+            } else {
+                0.0
+            };
+            let n_im = if spec.noise_sigma > 0.0 {
+                rng.normal(0.0, spec.noise_sigma)
+            } else {
+                0.0
+            };
+            observed[t] = [clean_coupled[t][0] + n_re, clean_coupled[t][1] + n_im];
+        }
+    }
+
+    let coupling_channel = match spec.conditioning_j_hz {
+        Some(j_hz) => Some(build_coupling_channel(spec.len, j_hz, spec.sw_hz)?),
+        None => None,
+    };
+
+    Ok(SyntheticFidSample {
+        clean_singlet,
+        clean_coupled,
+        observed,
+        nus_mask,
+        coupling_channel,
+    })
+}
+
+// ============================================================================
+// Uncertainty, Energy Conservation & Artifact-Abstention Diagnostics
+// ============================================================================
+
+/// Explicit reason(s) why `FID-Net` abstained from certifying a neural reconstruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AbstainReason {
+    /// Neural reconstruction violates measured time-domain data consistency beyond threshold
+    /// (for `Denoising`, beyond the estimated thermal noise floor + tolerance).
+    DataInconsistency,
+    /// Input FID exhibits out-of-distribution thermal noise / insufficient spectral peak SNR.
+    OutOfDistributionNoise,
+    /// Input FID or conditioning channel contains `NaN` or `±Inf`.
+    NonFiniteInput,
+    /// Input FID is empty or exceeds `MAX_FIDNET_LENGTH`.
+    OversizedFid,
+    /// Reconstructed Parseval energy anomalously diverges from expected input energy.
+    EnergyAnomaly,
+    /// Multi-pass perturbation epistemic uncertainty (`uncertainty_rms / obs_rms`) exceeds
+    /// `FidNetInferenceConfig::max_uncertainty_rel`.
+    HighUncertainty,
+    /// Model weights are untrained (`weights_trained == false`) and `allow_untrained_for_testing`
+    /// is `false`.
+    UntrainedWeights,
+}
+
+/// Configuration for certified `FID-Net` inference with data-consistency, uncertainty, and OOD
+/// abstention checks.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FidNetInferenceConfig {
+    /// Automatically scale input FID by RMS of observed samples and rescale output back.
+    pub normalize_input: bool,
+    /// Maximum tolerated relative L2 residual on measured time points
+    /// (`||pred_obs - meas_obs||_2 / ||meas_obs||_2`, or excess above the estimated thermal
+    /// noise floor for `FidNetTask::Denoising`) before emitting `DataInconsistency`.
+    pub max_data_inconsistency_rel: f64,
+    /// Minimum Rayleigh-calibrated excess spectral peak SNR (`peak / expected_noise_max`)
+    /// before emitting `OutOfDistributionNoise`.
+    pub min_input_snr: f64,
+    /// Maximum tolerated ratio of reconstructed energy to (sampling-density-corrected) input energy.
+    pub max_energy_ratio: f64,
+    /// Minimum tolerated ratio of reconstructed energy to input energy (for non-trivial inputs).
+    pub min_energy_ratio: f64,
+    /// Number of perturbed diagnostic passes (`0` disables multi-pass epistemic variance check).
+    pub uncertainty_passes: usize,
+    /// Relative Gaussian perturbation amplitude used during multi-pass uncertainty estimation.
+    pub uncertainty_jitter_rel: f64,
+    /// Maximum tolerated relative perturbation RMS uncertainty (`uncertainty_rms / obs_rms`)
+    /// before emitting `AbstainReason::HighUncertainty`.
+    pub max_uncertainty_rel: f64,
+    /// Deterministic RNG seed for multi-pass diagnostic perturbations.
+    pub uncertainty_seed: u64,
+    /// Explicit test-only opt-in to execute inference on an untrained / randomly initialized
+    /// `FID-Net` architecture (e.g. for States hypercomplex or CPU/GPU numerical parity tests).
+    ///
+    /// Defaults to `false`: standard inference fails closed whenever `!model.weights_trained`.
+    #[serde(default)]
+    pub allow_untrained_for_testing: bool,
+}
+
+impl Default for FidNetInferenceConfig {
+    fn default() -> Self {
+        Self {
+            normalize_input: true,
+            max_data_inconsistency_rel: 0.35,
+            min_input_snr: 1.25,
+            max_energy_ratio: 10.0,
+            min_energy_ratio: 0.05,
+            uncertainty_passes: 4,
+            uncertainty_jitter_rel: 0.01,
+            max_uncertainty_rel: 0.25,
+            uncertainty_seed: 0xF1D4_E700_0000_0001,
+            allow_untrained_for_testing: false,
+        }
+    }
+}
+
+/// Quantitative diagnostic and abstention certificate emitted alongside every `FID-Net` inference.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FidNetDiagnostic {
+    /// Relative L2 discrepancy on measured (observed) time-domain points.
+    pub measured_data_residual_rel: f64,
+    /// Rayleigh-calibrated excess spectral peak SNR (distinguishes clean truncated FIDs from
+    /// pure white thermal noise without relying on time-domain decay).
+    pub estimated_input_snr: f64,
+    /// Ratio of reconstructed Parseval spectral energy to sampling-density-corrected input energy.
+    pub energy_conservation_ratio: f64,
+    /// Multi-pass epistemic/perturbation RMS uncertainty (`0.0` when `uncertainty_passes == 0`).
+    pub uncertainty_rms: f64,
+    /// `true` iff one or more `AbstainReason` guards triggered.
+    pub abstained: bool,
+    /// Ordered list of triggered abstention reasons (empty iff `!abstained`).
+    pub abstain_reasons: Vec<AbstainReason>,
+}
+
+/// Output of certified `FID-Net` inference on a single complex 1D FID.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FidNetInferenceOutput {
+    pub reconstructed: Vec<Complex64>,
+    pub diagnostic: FidNetDiagnostic,
+}
+
+fn median_f64_in_place(vals: &mut [f64]) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    vals.sort_by(|a, b| a.total_cmp(b));
+    let mid = vals.len() / 2;
+    if vals.len().is_multiple_of(2) {
+        0.5 * (vals[mid - 1] + vals[mid])
+    } else {
+        vals[mid]
+    }
+}
+
+fn spectral_snr_and_sigma_with_window(
+    fid: &[Complex64],
+    nus_mask: Option<&[bool]>,
+    window: &[f64],
+) -> (f64, f64) {
+    let n = fid.len();
+    let mut w_sq_sum = 0.0;
+    for (t, &w) in window.iter().enumerate() {
+        let sampled = nus_mask.is_none_or(|m| m.get(t).copied().unwrap_or(false));
+        if sampled {
+            w_sq_sum += w * w;
+        }
+    }
+    if w_sq_sum <= 1e-30 {
+        return (0.0, 0.0);
+    }
+    let inv_norm = 1.0 / w_sq_sum.sqrt();
+    let mut buf = vec![[0.0; 2]; n];
+    for t in 0..n {
+        let sampled = nus_mask.is_none_or(|m| m.get(t).copied().unwrap_or(false));
+        if sampled {
+            let wt = window[t] * inv_norm;
+            buf[t] = [fid[t][0] * wt, fid[t][1] * wt];
+        }
+    }
+    fft_arbitrary_in_place(&mut buf, false);
+    let mut mags: Vec<f64> = buf.iter().map(|&[re, im]| re.hypot(im)).collect();
+    let max_mag = mags.iter().copied().fold(0.0_f64, f64::max);
+    let med_mag = median_f64_in_place(&mut mags);
+    // For complex Gaussian noise N(0, sigma^2) + i N(0, sigma^2) under a unit-L2 window,
+    // |X[m]| ~ Rayleigh(sigma), so median(|X|) = sigma * sqrt(2 ln 2).
+    let rayleigh_med_factor = (2.0 * 2.0_f64.ln()).sqrt();
+    let sigma_hat = med_mag / rayleigh_med_factor;
+    // Extreme-value white-noise peak across N Rayleigh bins scales as sigma * sqrt(2 * (ln(N) + 1)).
+    let expected_noise_peak = sigma_hat * (2.0 * ((n as f64).ln().max(1.0) + 1.0)).sqrt();
+    let snr = if expected_noise_peak <= 1e-15 {
+        if max_mag > 1e-15 {
+            1e6
+        } else {
+            0.0
+        }
+    } else {
+        let ratio = max_mag / expected_noise_peak;
+        if ratio.is_finite() {
+            ratio.clamp(0.0, 1e6)
+        } else {
+            1e6
+        }
+    };
+    (snr, sigma_hat)
+}
+
+/// Estimate Rayleigh-calibrated excess spectral peak SNR, per-component thermal noise standard
+/// deviation `sigma_hat`, observed signal energy, and observed point count.
+///
+/// Using Hann + one-sided cosine-bell windowed spectra avoids falsely flagging clean truncated
+/// slowly-decaying FIDs (`R2 = 3 Hz`, `N = 64`) as out-of-distribution noise while reliably
+/// flagging pure white thermal noise (`SNR ~ 0.8..1.0 < 1.25`). Inputs with fewer than
+/// `MIN_FIDNET_OBSERVED_POINTS` (`8`) observed points return finite `0.0` SNR (never `∞`) so
+/// inference abstains fail-closed.
+fn estimate_fid_snr_noise_and_energy(
+    fid: &[Complex64],
+    nus_mask: Option<&[bool]>,
+) -> (f64, f64, f64, usize) {
+    let mut obs_energy = 0.0;
+    let mut n_obs = 0usize;
+    for (t, &[re, im]) in fid.iter().enumerate() {
+        let sampled = nus_mask.is_none_or(|m| m.get(t).copied().unwrap_or(false));
+        if sampled {
+            obs_energy += re * re + im * im;
+            n_obs += 1;
+        }
+    }
+    if n_obs == 0 {
+        return (0.0, 0.0, 0.0, 0);
+    }
+    if n_obs < MIN_FIDNET_OBSERVED_POINTS || fid.len() < MIN_FIDNET_OBSERVED_POINTS {
+        return (0.0, 0.0, obs_energy, n_obs);
+    }
+    if obs_energy <= 1e-30 {
+        return (0.0, 0.0, 0.0, n_obs);
+    }
+
+    let n = fid.len();
+    let hann: Vec<f64> = (0..n)
+        .map(|t| 0.5 * (1.0 - (TAU * ((t as f64) + 0.5) / (n as f64)).cos()))
+        .collect();
+    let cos_bell: Vec<f64> = (0..n)
+        .map(|t| (0.5 * PI * (t as f64) / (n as f64)).cos())
+        .collect();
+
+    let (snr_hann, sigma_hann) = spectral_snr_and_sigma_with_window(fid, nus_mask, &hann);
+    let (snr_cos, sigma_cos) = spectral_snr_and_sigma_with_window(fid, nus_mask, &cos_bell);
+
+    // Hann suppresses truncation sidelobes for slow-decay / truncated FIDs; cosine-bell preserves
+    // t=0 for fast-decaying and NUS FIDs. Pure white noise stays near ~0.9 under both windows.
+    let est_snr = snr_hann.max(snr_cos);
+    let est_sigma = sigma_hann.min(sigma_cos);
+    (est_snr, est_sigma, obs_energy, n_obs)
+}
+
+impl FidNetModel {
+    /// Run certified `FID-Net` inference (using the cache-free inference path) with input
+    /// normalization, measured-point data-consistency verification, Parseval energy conservation
+    /// check, multi-pass perturbation uncertainty estimation, and explicit artifact abstention
+    /// (`FidNetDiagnostic`).
+    ///
+    /// Hostile inputs (`NaN`/`Inf`, empty, or `len > MAX_FIDNET_LENGTH`) never panic; they return
+    /// an abstained `FidNetInferenceOutput` tagged with `NonFiniteInput` / `OversizedFid`.
+    pub fn infer_fid_with_diagnostics(
+        &self,
+        fid: &[Complex64],
+        nus_mask: Option<&[bool]>,
+        coupling_channel: Option<&[f64]>,
+        cfg: &FidNetInferenceConfig,
+    ) -> FidNetInferenceOutput {
+        // 1. Guard empty / oversized FID
+        if fid.is_empty() || fid.len() > MAX_FIDNET_LENGTH {
+            return FidNetInferenceOutput {
+                reconstructed: Vec::new(),
+                diagnostic: FidNetDiagnostic {
+                    measured_data_residual_rel: f64::INFINITY,
+                    estimated_input_snr: 0.0,
+                    energy_conservation_ratio: 0.0,
+                    uncertainty_rms: 0.0,
+                    abstained: true,
+                    abstain_reasons: vec![AbstainReason::OversizedFid],
+                },
+            };
+        }
+
+        // 2. Guard non-finite samples or conditioning channel
+        let fid_non_finite = fid
+            .iter()
+            .any(|&[re, im]| !re.is_finite() || !im.is_finite());
+        let cc_non_finite = coupling_channel
+            .is_some_and(|cc| cc.len() != fid.len() || cc.iter().any(|v| !v.is_finite()));
+        let mask_bad_len = nus_mask.is_some_and(|m| m.len() != fid.len());
+        if fid_non_finite || cc_non_finite || mask_bad_len {
+            return FidNetInferenceOutput {
+                reconstructed: vec![[0.0; 2]; fid.len()],
+                diagnostic: FidNetDiagnostic {
+                    measured_data_residual_rel: f64::INFINITY,
+                    estimated_input_snr: 0.0,
+                    energy_conservation_ratio: 0.0,
+                    uncertainty_rms: 0.0,
+                    abstained: true,
+                    abstain_reasons: vec![AbstainReason::NonFiniteInput],
+                },
+            };
+        }
+
+        // 3. Fail-closed gate for untrained weights unless explicitly opted-in for testing
+        if !self.weights_trained && !cfg.allow_untrained_for_testing {
+            return FidNetInferenceOutput {
+                reconstructed: vec![[0.0; 2]; fid.len()],
+                diagnostic: FidNetDiagnostic {
+                    measured_data_residual_rel: f64::INFINITY,
+                    estimated_input_snr: 0.0,
+                    energy_conservation_ratio: 0.0,
+                    uncertainty_rms: 0.0,
+                    abstained: true,
+                    abstain_reasons: vec![AbstainReason::UntrainedWeights],
+                },
+            };
+        }
+
+        // 4. Estimate spectral SNR, thermal noise floor, and RMS normalization scale on measured points
+        let (est_snr, est_noise_sigma, obs_energy, n_obs) =
+            estimate_fid_snr_noise_and_energy(fid, nus_mask);
+        let obs_rms = if n_obs > 0 {
+            (obs_energy / (n_obs as f64)).sqrt()
+        } else {
+            0.0
+        };
+        let scale = if cfg.normalize_input && obs_rms > 1e-12 {
+            obs_rms
+        } else {
+            1.0
+        };
+        let inv_scale = 1.0 / scale;
+
+        let norm_fid: Vec<Complex64> = fid
+            .iter()
+            .map(|&[re, im]| [re * inv_scale, im * inv_scale])
+            .collect();
+
+        let recon_norm = match self.forward_fid_inference_with_options(
+            &norm_fid,
+            nus_mask,
+            coupling_channel,
+            cfg.allow_untrained_for_testing,
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                return FidNetInferenceOutput {
+                    reconstructed: vec![[0.0; 2]; fid.len()],
+                    diagnostic: FidNetDiagnostic {
+                        measured_data_residual_rel: f64::INFINITY,
+                        estimated_input_snr: est_snr,
+                        energy_conservation_ratio: 0.0,
+                        uncertainty_rms: 0.0,
+                        abstained: true,
+                        abstain_reasons: vec![AbstainReason::NonFiniteInput],
+                    },
+                };
+            }
+        };
+
+        let reconstructed: Vec<Complex64> = recon_norm
+            .iter()
+            .map(|&[re, im]| [re * scale, im * scale])
+            .collect();
+
+        // 5. Multi-pass perturbation epistemic uncertainty check (cache-free inference)
+        let mut uncertainty_rms = 0.0;
+        if cfg.uncertainty_passes > 0 && cfg.uncertainty_jitter_rel > 0.0 && obs_rms > 1e-12 {
+            let mut rng = Rng::new(cfg.uncertainty_seed);
+            let mut sum_sq_dev = 0.0;
+            let mut valid_passes = 0usize;
+            for _ in 0..cfg.uncertainty_passes {
+                let mut pert = norm_fid.clone();
+                for (t, sample) in pert.iter_mut().enumerate() {
+                    let sampled = nus_mask.is_none_or(|m| m[t]);
+                    if sampled {
+                        sample[0] += rng.normal(0.0, cfg.uncertainty_jitter_rel);
+                        sample[1] += rng.normal(0.0, cfg.uncertainty_jitter_rel);
+                    }
+                }
+                if let Ok(p_out) = self.forward_fid_inference_with_options(
+                    &pert,
+                    nus_mask,
+                    coupling_channel,
+                    cfg.allow_untrained_for_testing,
+                ) {
+                    let mut pass_dev = 0.0;
+                    for t in 0..fid.len() {
+                        let dr = (p_out[t][0] - recon_norm[t][0]) * scale;
+                        let di = (p_out[t][1] - recon_norm[t][1]) * scale;
+                        pass_dev += dr * dr + di * di;
+                    }
+                    sum_sq_dev += pass_dev / (fid.len() as f64);
+                    valid_passes += 1;
+                }
+            }
+            if valid_passes > 0 {
+                uncertainty_rms = (sum_sq_dev / (valid_passes as f64)).sqrt();
+            }
+        }
+
+        // 5. Measured-point data-consistency residual
+        let mut obs_err_sq = 0.0;
+        for t in 0..fid.len() {
+            let sampled = nus_mask.is_none_or(|m| m[t]);
+            if sampled {
+                let dr = reconstructed[t][0] - fid[t][0];
+                let di = reconstructed[t][1] - fid[t][1];
+                obs_err_sq += dr * dr + di * di;
+            }
+        }
+        let measured_data_residual_rel = if obs_energy > 1e-24 {
+            (obs_err_sq / obs_energy).sqrt()
+        } else if obs_err_sq > 1e-24 {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+
+        // 6. Parseval energy conservation ratio (accounting for NUS sampling fraction)
+        let recon_energy: f64 = reconstructed
+            .iter()
+            .map(|&[re, im]| re * re + im * im)
+            .sum();
+        let sampling_frac = if !fid.is_empty() {
+            (n_obs as f64) / (fid.len() as f64)
+        } else {
+            1.0
+        };
+        let expected_full_energy = if sampling_frac > 0.0 {
+            obs_energy / sampling_frac
+        } else {
+            0.0
+        };
+        let energy_conservation_ratio = if expected_full_energy > 1e-24 {
+            recon_energy / expected_full_energy
+        } else if recon_energy > 1e-24 {
+            f64::INFINITY
+        } else {
+            1.0
+        };
+
+        // 7. Assemble abstention reasons
+        let mut abstain_reasons = Vec::new();
+        if !reconstructed
+            .iter()
+            .all(|&[re, im]| re.is_finite() && im.is_finite())
+        {
+            abstain_reasons.push(AbstainReason::NonFiniteInput);
+        }
+        // Data-consistency check:
+        // - For `NusReconstruction`, measured samples should remain consistent with `fid`.
+        // - For `Denoising`, removing thermal noise MUST differ from the noisy input by
+        //   ~sqrt(2) * sigma_noise per complex point; only flag excess discrepancy beyond the
+        //   estimated thermal noise allowance (1.25 * sqrt(2) * sigma_hat / obs_rms).
+        // - For `VirtualDecoupling`, the network intentionally removes cos(pi J t) modulation.
+        match self.config.task {
+            FidNetTask::NusReconstruction => {
+                if measured_data_residual_rel > cfg.max_data_inconsistency_rel {
+                    abstain_reasons.push(AbstainReason::DataInconsistency);
+                }
+            }
+            FidNetTask::Denoising => {
+                let expected_noise_rel = if obs_rms > 1e-12 && est_noise_sigma.is_finite() {
+                    (1.25 * 2.0_f64.sqrt() * est_noise_sigma / obs_rms).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let excess_residual = (measured_data_residual_rel - expected_noise_rel).max(0.0);
+                if excess_residual > cfg.max_data_inconsistency_rel {
+                    abstain_reasons.push(AbstainReason::DataInconsistency);
+                }
+            }
+            FidNetTask::VirtualDecoupling => {}
+        }
+        if n_obs < MIN_FIDNET_OBSERVED_POINTS || (est_snr < cfg.min_input_snr && obs_energy > 1e-24)
+        {
+            abstain_reasons.push(AbstainReason::OutOfDistributionNoise);
+        }
+        if obs_energy > 1e-24
+            && (energy_conservation_ratio > cfg.max_energy_ratio
+                || energy_conservation_ratio < cfg.min_energy_ratio)
+        {
+            abstain_reasons.push(AbstainReason::EnergyAnomaly);
+        }
+        if cfg.uncertainty_passes > 0 && obs_rms > 1e-12 {
+            let rel_unc = uncertainty_rms / obs_rms;
+            if !rel_unc.is_finite() || rel_unc > cfg.max_uncertainty_rel {
+                abstain_reasons.push(AbstainReason::HighUncertainty);
+            }
+        }
+
+        let abstained = !abstain_reasons.is_empty();
+        FidNetInferenceOutput {
+            reconstructed,
+            diagnostic: FidNetDiagnostic {
+                measured_data_residual_rel,
+                estimated_input_snr: est_snr,
+                energy_conservation_ratio,
+                uncertainty_rms,
+                abstained,
+                abstain_reasons,
+            },
+        }
+    }
+}
+
+// ============================================================================
+// 2D & 3D States Hypercomplex Indirect-Column Batch Application
+// ============================================================================
+
+/// Selector for which indirect axis of a 3D hypercomplex `Fid3D` to process with `FID-Net`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fid3DIndirectAxis {
+    /// Indirect axis `F2` (`axis_y`, length `axis_y.complex_points`).
+    AxisY,
+    /// Indirect axis `F1` (`axis_z`, length `axis_z.complex_points`).
+    AxisZ,
+}
+
+/// Extract a true complex indirect-dimension $t_1$ States interferogram
+/// `S_cos(k1, ix)[dir_ch] + i * S_sin(k1, ix)[dir_ch]` from a States-recombined 2D `Fid2D`
+/// for direct point `ix in 0..axis_x.complex_points` and direct quadrature component
+/// `dir_ch in {0 (Re_direct), 1 (Im_direct)}`.
+///
+/// Pairing the cosine and sine traces preserves the sign of the indirect frequency `±f1`
+/// (signals at `+f1` and `-f1` form exact complex conjugates).
+pub fn extract_fid2d_states_interferogram(
+    fid: &Fid2D,
+    ix: usize,
+    dir_ch: usize,
+) -> Result<Vec<Complex64>, FidNetError> {
+    if dir_ch >= 2 {
+        return Err(FidNetError::InvalidConfig(format!(
+            "dir_ch={dir_ch} must be 0 (Re_direct) or 1 (Im_direct)"
+        )));
+    }
+    if !fid.axis_y.states_recombined || fid.axis_y.quad_mode == QuadMode::Qf {
+        return Err(FidNetError::InvalidConfig(format!(
+            "Fid2D indirect axis '{}' (quad_mode={:?}) requires States-recombined hypercomplex input",
+            fid.axis_y.label, fid.axis_y.quad_mode
+        )));
+    }
+    let n0 = fid.axis_x.complex_points;
+    let n1 = fid.axis_y.complex_points;
+    if n0 == 0 || n1 == 0 {
+        return Err(FidNetError::EmptyInput(
+            "Fid2D dimensions must be non-zero".into(),
+        ));
+    }
+    if ix >= n0 {
+        return Err(FidNetError::ShapeMismatch(format!(
+            "direct index ix={ix} out of bounds for n0={n0}"
+        )));
+    }
+    let expected_len = n1
+        .checked_mul(2)
+        .and_then(|v| v.checked_mul(n0))
+        .ok_or_else(|| FidNetError::ShapeMismatch("Fid2D dimensions overflow".into()))?;
+    if fid.data.len() != expected_len {
+        return Err(FidNetError::ShapeMismatch(format!(
+            "Fid2D data length {} != n1({n1}) * 2 * n0({n0})",
+            fid.data.len()
+        )));
+    }
+    let mut col = Vec::with_capacity(n1);
+    for k1 in 0..n1 {
+        let s_cos = fid.data[(k1 * 2) * n0 + ix][dir_ch];
+        let s_sin = fid.data[(k1 * 2 + 1) * n0 + ix][dir_ch];
+        col.push([s_cos, s_sin]);
+    }
+    Ok(col)
+}
+
+/// Extract a true complex indirect-dimension States interferogram from a States-recombined 3D
+/// `Fid3D` along `axis`:
+/// - `AxisY` (`t1`): fixes `(k2 = fixed_k, c2 = fixed_c, ix, dir_ch)` and pairs `c1 = 0` (cos)
+///   with `c1 = 1` (sin) into `[S_{c2,cos}(k2, k1, ix)[dir_ch], S_{c2,sin}(k2, k1, ix)[dir_ch]]`.
+/// - `AxisZ` (`t2`): fixes `(k1 = fixed_k, c1 = fixed_c, ix, dir_ch)` and pairs `c2 = 0` (cos)
+///   with `c2 = 1` (sin) into `[S_{cos,c1}(k2, k1, ix)[dir_ch], S_{sin,c1}(k2, k1, ix)[dir_ch]]`.
+pub fn extract_fid3d_states_interferogram(
+    fid: &Fid3D,
+    axis: Fid3DIndirectAxis,
+    fixed_k: usize,
+    fixed_c: usize,
+    ix: usize,
+    dir_ch: usize,
+) -> Result<Vec<Complex64>, FidNetError> {
+    if fixed_c >= 2 || dir_ch >= 2 {
+        return Err(FidNetError::InvalidConfig(format!(
+            "fixed_c={fixed_c} and dir_ch={dir_ch} must be in 0..=1"
+        )));
+    }
+    let n0 = fid.axis_x.complex_points;
+    let n1 = fid.axis_y.complex_points;
+    let n2 = fid.axis_z.complex_points;
+    if n0 == 0 || n1 == 0 || n2 == 0 {
+        return Err(FidNetError::EmptyInput(
+            "Fid3D dimensions must be non-zero".into(),
+        ));
+    }
+    if ix >= n0 {
+        return Err(FidNetError::ShapeMismatch(format!(
+            "direct index ix={ix} out of bounds for n0={n0}"
+        )));
+    }
+    let expected_len = n2
+        .checked_mul(2)
+        .and_then(|v| v.checked_mul(n1))
+        .and_then(|v| v.checked_mul(2))
+        .and_then(|v| v.checked_mul(n0))
+        .ok_or_else(|| FidNetError::ShapeMismatch("Fid3D dimensions overflow".into()))?;
+    if fid.data.len() != expected_len {
+        return Err(FidNetError::ShapeMismatch(format!(
+            "Fid3D data length {} != n2({n2})*2*n1({n1})*2*n0({n0})",
+            fid.data.len()
+        )));
+    }
+
+    match axis {
+        Fid3DIndirectAxis::AxisY => {
+            if !fid.axis_y.states_recombined || fid.axis_y.quad_mode == QuadMode::Qf {
+                return Err(FidNetError::InvalidConfig(format!(
+                    "Fid3D AxisY '{}' (quad_mode={:?}) requires States-recombined hypercomplex input",
+                    fid.axis_y.label, fid.axis_y.quad_mode
+                )));
+            }
+            if fixed_k >= n2 {
+                return Err(FidNetError::ShapeMismatch(format!(
+                    "fixed_k={fixed_k} out of bounds for n2={n2}"
+                )));
+            }
+            let mut col = Vec::with_capacity(n1);
+            for k1 in 0..n1 {
+                let idx_cos = (((fixed_k * 2 + fixed_c) * n1 + k1) * 2) * n0 + ix;
+                let idx_sin = (((fixed_k * 2 + fixed_c) * n1 + k1) * 2 + 1) * n0 + ix;
+                col.push([fid.data[idx_cos][dir_ch], fid.data[idx_sin][dir_ch]]);
+            }
+            Ok(col)
+        }
+        Fid3DIndirectAxis::AxisZ => {
+            if !fid.axis_z.states_recombined || fid.axis_z.quad_mode == QuadMode::Qf {
+                return Err(FidNetError::InvalidConfig(format!(
+                    "Fid3D AxisZ '{}' (quad_mode={:?}) requires States-recombined hypercomplex input",
+                    fid.axis_z.label, fid.axis_z.quad_mode
+                )));
+            }
+            if fixed_k >= n1 {
+                return Err(FidNetError::ShapeMismatch(format!(
+                    "fixed_k={fixed_k} out of bounds for n1={n1}"
+                )));
+            }
+            let mut col = Vec::with_capacity(n2);
+            for k2 in 0..n2 {
+                let idx_cos = (((k2 * 2) * n1 + fixed_k) * 2 + fixed_c) * n0 + ix;
+                let idx_sin = (((k2 * 2 + 1) * n1 + fixed_k) * 2 + fixed_c) * n0 + ix;
+                col.push([fid.data[idx_cos][dir_ch], fid.data[idx_sin][dir_ch]]);
+            }
+            Ok(col)
+        }
+    }
+}
+
+/// Apply a `FidNetModel` across a 2D batch of pre-extracted complex indirect columns (`[n_cols][t1_len]`).
+pub fn apply_fidnet_2d_columns(
+    model: &FidNetModel,
+    columns: &[Vec<Complex64>],
+    nus_mask: Option<&[bool]>,
+    coupling_channel: Option<&[f64]>,
+    cfg: &FidNetInferenceConfig,
+) -> Result<Vec<FidNetInferenceOutput>, FidNetError> {
+    model.check_trained_gate(cfg.allow_untrained_for_testing)?;
+    if columns.len() > MAX_FIDNET_BATCH {
+        return Err(FidNetError::InvalidConfig(format!(
+            "2D batch size {} exceeds MAX_FIDNET_BATCH ({MAX_FIDNET_BATCH})",
+            columns.len()
+        )));
+    }
+    let mut outputs = Vec::with_capacity(columns.len());
+    for col in columns {
+        outputs.push(model.infer_fid_with_diagnostics(col, nus_mask, coupling_channel, cfg));
+    }
+    Ok(outputs)
+}
+
+/// Apply a `FidNetModel` directly along the indirect `axis_y` (`F1`) columns of a States-recombined
+/// 2D hypercomplex `Fid2D`.
+///
+/// For each direct point `ix in 0..n0` and direct quadrature channel `dir_ch in {0 (Re_direct),
+/// 1 (Im_direct)}`, pairs the States cosine and sine traces into the true complex indirect
+/// interferogram `S_cos(t1)[dir_ch] + i * S_sin(t1)[dir_ch]` (preserving the sign of `±f1`),
+/// runs `FID-Net`, and writes the reconstructed real/imaginary parts back into the cosine/sine
+/// traces respectively.
+pub fn apply_fidnet_fid2d_indirect(
+    model: &FidNetModel,
+    fid: &Fid2D,
+    coupling_channel: Option<&[f64]>,
+    cfg: &FidNetInferenceConfig,
+) -> Result<(Fid2D, Vec<FidNetDiagnostic>), FidNetError> {
+    model.check_trained_gate(cfg.allow_untrained_for_testing)?;
+    if !fid.axis_y.states_recombined || fid.axis_y.quad_mode == QuadMode::Qf {
+        return Err(FidNetError::InvalidConfig(format!(
+            "apply_fidnet_fid2d_indirect requires States-recombined hypercomplex axis_y ('{}', quad_mode={:?})",
+            fid.axis_y.label, fid.axis_y.quad_mode
+        )));
+    }
+    let n0 = fid.axis_x.complex_points;
+    let n1 = fid.axis_y.complex_points;
+    if n0 == 0 || n1 == 0 {
+        return Err(FidNetError::EmptyInput(
+            "Fid2D dimensions must be non-zero".into(),
+        ));
+    }
+    let expected_len = n1
+        .checked_mul(2)
+        .and_then(|v| v.checked_mul(n0))
+        .ok_or_else(|| FidNetError::ShapeMismatch("Fid2D dimensions overflow".into()))?;
+    if fid.data.len() != expected_len {
+        return Err(FidNetError::ShapeMismatch(format!(
+            "Fid2D data length {} != n1({n1}) * 2 * n0({n0})",
+            fid.data.len()
+        )));
+    }
+    if let Some(m) = fid.nus_mask.as_deref() {
+        if m.len() != n1 {
+            return Err(FidNetError::ShapeMismatch(format!(
+                "Fid2D nus_mask length {} != n1({n1})",
+                m.len()
+            )));
+        }
+    }
+    let n_cols = n0
+        .checked_mul(2)
+        .ok_or_else(|| FidNetError::ShapeMismatch("Fid2D column count overflow".into()))?;
+    if n_cols > MAX_FIDNET_BATCH {
+        return Err(FidNetError::InvalidConfig(format!(
+            "Fid2D indirect column count {n_cols} exceeds MAX_FIDNET_BATCH ({MAX_FIDNET_BATCH})"
+        )));
+    }
+
+    let mut out_fid = fid.clone();
+    let mut diags = Vec::with_capacity(n_cols);
+    let mut col_buf = vec![[0.0; 2]; n1];
+
+    for dir_ch in 0..2 {
+        for ix in 0..n0 {
+            for (k1, slot) in col_buf.iter_mut().enumerate() {
+                let s_cos = fid.data[(k1 * 2) * n0 + ix][dir_ch];
+                let s_sin = fid.data[(k1 * 2 + 1) * n0 + ix][dir_ch];
+                *slot = [s_cos, s_sin];
+            }
+            let res = model.infer_fid_with_diagnostics(
+                &col_buf,
+                fid.nus_mask.as_deref(),
+                coupling_channel,
+                cfg,
+            );
+            if res.reconstructed.len() == n1 {
+                for (k1, &[re_t1, im_t1]) in res.reconstructed.iter().enumerate() {
+                    out_fid.data[(k1 * 2) * n0 + ix][dir_ch] = re_t1;
+                    out_fid.data[(k1 * 2 + 1) * n0 + ix][dir_ch] = im_t1;
+                }
+            }
+            diags.push(res.diagnostic);
+        }
+    }
+    if model.config.task == FidNetTask::NusReconstruction {
+        out_fid.nus_mask = None;
+    }
+    Ok((out_fid, diags))
+}
+
+/// Apply a `FidNetModel` across a 3D collection of pre-extracted complex indirect columns
+/// (`[n_planes][n_cols][t_len]`).
+pub fn apply_fidnet_3d_columns(
+    model: &FidNetModel,
+    planes: &[Vec<Vec<Complex64>>],
+    nus_mask: Option<&[bool]>,
+    coupling_channel: Option<&[f64]>,
+    cfg: &FidNetInferenceConfig,
+) -> Result<Vec<Vec<FidNetInferenceOutput>>, FidNetError> {
+    model.check_trained_gate(cfg.allow_untrained_for_testing)?;
+    let total_cols: usize = planes.iter().map(Vec::len).sum();
+    if total_cols > MAX_FIDNET_BATCH {
+        return Err(FidNetError::InvalidConfig(format!(
+            "3D batch column count {total_cols} exceeds MAX_FIDNET_BATCH ({MAX_FIDNET_BATCH})"
+        )));
+    }
+    let mut out_planes = Vec::with_capacity(planes.len());
+    for plane in planes {
+        let mut out_cols = Vec::with_capacity(plane.len());
+        for col in plane {
+            out_cols.push(model.infer_fid_with_diagnostics(col, nus_mask, coupling_channel, cfg));
+        }
+        out_planes.push(out_cols);
+    }
+    Ok(out_planes)
+}
+
+/// Apply a `FidNetModel` along either indirect axis (`AxisY` = `F2`, `AxisZ` = `F1`) of a
+/// States-recombined 3D hypercomplex `Fid3D`, constructing true complex States interferograms
+/// (`S_cos + i * S_sin`) along the target indirect axis for every `(fixed_indirect_comp, ix,
+/// dir_ch)` channel so the sign of `±f1` / `±f2` is preserved.
+pub fn apply_fidnet_fid3d_indirect(
+    model: &FidNetModel,
+    fid: &Fid3D,
+    axis: Fid3DIndirectAxis,
+    coupling_channel: Option<&[f64]>,
+    cfg: &FidNetInferenceConfig,
+) -> Result<(Fid3D, Vec<FidNetDiagnostic>), FidNetError> {
+    model.check_trained_gate(cfg.allow_untrained_for_testing)?;
+    let n0 = fid.axis_x.complex_points;
+    let n1 = fid.axis_y.complex_points;
+    let n2 = fid.axis_z.complex_points;
+    if n0 == 0 || n1 == 0 || n2 == 0 {
+        return Err(FidNetError::EmptyInput(
+            "Fid3D dimensions must be non-zero".into(),
+        ));
+    }
+    let expected_len = n2
+        .checked_mul(2)
+        .and_then(|v| v.checked_mul(n1))
+        .and_then(|v| v.checked_mul(2))
+        .and_then(|v| v.checked_mul(n0))
+        .ok_or_else(|| FidNetError::ShapeMismatch("Fid3D dimensions overflow".into()))?;
+    if fid.data.len() != expected_len {
+        return Err(FidNetError::ShapeMismatch(format!(
+            "Fid3D data length {} != n2({n2})*2*n1({n1})*2*n0({n0})",
+            fid.data.len()
+        )));
+    }
+    let expected_mask_len = n2
+        .checked_mul(n1)
+        .ok_or_else(|| FidNetError::ShapeMismatch("Fid3D mask dimensions overflow".into()))?;
+    if let Some(m) = fid.nus_mask.as_deref() {
+        if m.len() != expected_mask_len {
+            return Err(FidNetError::ShapeMismatch(format!(
+                "Fid3D nus_mask length {} != n2({n2}) * n1({n1})",
+                m.len()
+            )));
+        }
+    }
+
+    let mut out_fid = fid.clone();
+    let mut diags = Vec::new();
+
+    match axis {
+        Fid3DIndirectAxis::AxisY => {
+            if !fid.axis_y.states_recombined || fid.axis_y.quad_mode == QuadMode::Qf {
+                return Err(FidNetError::InvalidConfig(format!(
+                    "apply_fidnet_fid3d_indirect(AxisY) requires States-recombined hypercomplex axis_y ('{}', quad_mode={:?})",
+                    fid.axis_y.label, fid.axis_y.quad_mode
+                )));
+            }
+            let n_cols = n2
+                .checked_mul(4)
+                .and_then(|v| v.checked_mul(n0))
+                .ok_or_else(|| {
+                    FidNetError::ShapeMismatch("Fid3D AxisY column count overflow".into())
+                })?;
+            if n_cols > MAX_FIDNET_BATCH {
+                return Err(FidNetError::InvalidConfig(format!(
+                    "Fid3D AxisY column count {n_cols} exceeds MAX_FIDNET_BATCH ({MAX_FIDNET_BATCH})"
+                )));
+            }
+            diags.reserve(n_cols);
+            let mut col_buf = vec![[0.0; 2]; n1];
+            let mut mask_buf = vec![true; n1];
+            for k2 in 0..n2 {
+                let row_mask = fid.nus_mask.as_ref().map(|m| {
+                    mask_buf.copy_from_slice(&m[k2 * n1..(k2 + 1) * n1]);
+                    mask_buf.as_slice()
+                });
+                for c2 in 0..2 {
+                    for dir_ch in 0..2 {
+                        for ix in 0..n0 {
+                            for (k1, slot) in col_buf.iter_mut().enumerate() {
+                                let idx_cos = (((k2 * 2 + c2) * n1 + k1) * 2) * n0 + ix;
+                                let idx_sin = (((k2 * 2 + c2) * n1 + k1) * 2 + 1) * n0 + ix;
+                                *slot = [fid.data[idx_cos][dir_ch], fid.data[idx_sin][dir_ch]];
+                            }
+                            let res = model.infer_fid_with_diagnostics(
+                                &col_buf,
+                                row_mask,
+                                coupling_channel,
+                                cfg,
+                            );
+                            if res.reconstructed.len() == n1 {
+                                for (k1, &[re_t1, im_t1]) in res.reconstructed.iter().enumerate() {
+                                    let idx_cos = (((k2 * 2 + c2) * n1 + k1) * 2) * n0 + ix;
+                                    let idx_sin = (((k2 * 2 + c2) * n1 + k1) * 2 + 1) * n0 + ix;
+                                    out_fid.data[idx_cos][dir_ch] = re_t1;
+                                    out_fid.data[idx_sin][dir_ch] = im_t1;
+                                }
+                            }
+                            diags.push(res.diagnostic);
+                        }
+                    }
+                }
+            }
+        }
+        Fid3DIndirectAxis::AxisZ => {
+            if !fid.axis_z.states_recombined || fid.axis_z.quad_mode == QuadMode::Qf {
+                return Err(FidNetError::InvalidConfig(format!(
+                    "apply_fidnet_fid3d_indirect(AxisZ) requires States-recombined hypercomplex axis_z ('{}', quad_mode={:?})",
+                    fid.axis_z.label, fid.axis_z.quad_mode
+                )));
+            }
+            let n_cols = n1
+                .checked_mul(4)
+                .and_then(|v| v.checked_mul(n0))
+                .ok_or_else(|| {
+                    FidNetError::ShapeMismatch("Fid3D AxisZ column count overflow".into())
+                })?;
+            if n_cols > MAX_FIDNET_BATCH {
+                return Err(FidNetError::InvalidConfig(format!(
+                    "Fid3D AxisZ column count {n_cols} exceeds MAX_FIDNET_BATCH ({MAX_FIDNET_BATCH})"
+                )));
+            }
+            diags.reserve(n_cols);
+            let mut col_buf = vec![[0.0; 2]; n2];
+            let mut mask_buf = vec![true; n2];
+            for k1 in 0..n1 {
+                let col_mask = fid.nus_mask.as_ref().map(|m| {
+                    for k2 in 0..n2 {
+                        mask_buf[k2] = m[k2 * n1 + k1];
+                    }
+                    mask_buf.as_slice()
+                });
+                for c1 in 0..2 {
+                    for dir_ch in 0..2 {
+                        for ix in 0..n0 {
+                            for (k2, slot) in col_buf.iter_mut().enumerate() {
+                                let idx_cos = (((k2 * 2) * n1 + k1) * 2 + c1) * n0 + ix;
+                                let idx_sin = (((k2 * 2 + 1) * n1 + k1) * 2 + c1) * n0 + ix;
+                                *slot = [fid.data[idx_cos][dir_ch], fid.data[idx_sin][dir_ch]];
+                            }
+                            let res = model.infer_fid_with_diagnostics(
+                                &col_buf,
+                                col_mask,
+                                coupling_channel,
+                                cfg,
+                            );
+                            if res.reconstructed.len() == n2 {
+                                for (k2, &[re_t2, im_t2]) in res.reconstructed.iter().enumerate() {
+                                    let idx_cos = (((k2 * 2) * n1 + k1) * 2 + c1) * n0 + ix;
+                                    let idx_sin = (((k2 * 2 + 1) * n1 + k1) * 2 + c1) * n0 + ix;
+                                    out_fid.data[idx_cos][dir_ch] = re_t2;
+                                    out_fid.data[idx_sin][dir_ch] = im_t2;
+                                }
+                            }
+                            diags.push(res.diagnostic);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((out_fid, diags))
+}
+
+// ============================================================================
+// Quantitative Signal / Spectral Quality Metrics
+// ============================================================================
+
+/// Compute complex time-domain mean squared error `(1 / (2*T)) * sum_t |a[t] - b[t]|^2`.
+pub fn compute_fid_mse(reference: &[Complex64], estimate: &[Complex64]) -> f64 {
+    if reference.is_empty() || reference.len() != estimate.len() {
+        return f64::INFINITY;
+    }
+    let sum_sq: f64 = reference
+        .iter()
+        .zip(estimate.iter())
+        .map(|(&[ar, ai], &[br, bi])| {
+            let dr = ar - br;
+            let di = ai - bi;
+            dr * dr + di * di
+        })
+        .sum();
+    sum_sq / (2.0 * reference.len() as f64)
+}
+
+/// Compute signal-to-reconstruction-error ratio in dB: `10 * log10(||ref||^2 / ||est - ref||^2)`.
+pub fn compute_fid_snr_db(reference: &[Complex64], estimate: &[Complex64]) -> f64 {
+    if reference.is_empty() || reference.len() != estimate.len() {
+        return f64::NEG_INFINITY;
+    }
+    let sig_energy: f64 = reference.iter().map(|&[r, i]| r * r + i * i).sum();
+    let err_energy: f64 = reference
+        .iter()
+        .zip(estimate.iter())
+        .map(|(&[ar, ai], &[br, bi])| {
+            let dr = ar - br;
+            let di = ai - bi;
+            dr * dr + di * di
+        })
+        .sum();
+    if err_energy <= 1e-30 {
+        return 300.0;
+    }
+    if sig_energy <= 1e-30 {
+        return f64::NEG_INFINITY;
+    }
+    10.0 * (sig_energy / err_energy).log10()
+}
+
+/// Compute centered 1D magnitude spectrum of a complex FID (with optional zero-fill factor `>= 1`).
+pub fn fid_to_magnitude_spectrum(fid: &[Complex64], zero_fill_factor: usize) -> Vec<f64> {
+    if fid.is_empty() {
+        return Vec::new();
+    }
+    let zf = zero_fill_factor.max(1);
+    let n = fid.len() * zf;
+    let mut buf = vec![[0.0; 2]; n];
+    buf[..fid.len()].copy_from_slice(fid);
+    // Apply half-weight on t = 0 (standard NMR Fourier baseline convention)
+    buf[0][0] *= 0.5;
+    buf[0][1] *= 0.5;
+    fft_arbitrary_in_place(&mut buf, false);
+    // FFT shift so DC (0 Hz) is centered at n/2
+    let half = n / 2;
+    let mut mag = vec![0.0; n];
+    for (i, &[re, im]) in buf.iter().enumerate() {
+        let shifted = (i + half) % n;
+        mag[shifted] = re.hypot(im);
+    }
+    mag
+}

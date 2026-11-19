@@ -9,6 +9,7 @@
 pub mod af_assign_cmd;
 pub mod af_validate_cmd;
 pub mod cofold_cmd;
+pub mod dag_cmd;
 pub mod domain_dock_cmd;
 pub mod dosy_cmd;
 pub mod exchange_cmd;
@@ -246,6 +247,7 @@ fn usage() -> String {
        ferric mcp-config      --client antigravity|claude-desktop|cursor [--root <dir> ...] [--mode read-only|read-write] [--bridge-port <port>] [-o <out.json>]\n\
        ferric dosy            fit|ilt|mw [--in <decay.tsv|json> | --exp-dir <bruker_or_varian_dir> | --demo] [--engine cpu|gpu|auto] [--criterion bic|aic] [--max-components 3] [-o <out.tsv|json>]\n\
        ferric metabolomics    bin|pca|oplsda|stocsy [--in <study.json|buckets.csv> | --cohort <json> | --manifest <tsv> | --demo] [-o <out>]\n\
+       ferric dag             preset|validate|compile|run [--in <dag_or_manifest.json>] [-o <out.json>] [--out-dir <dir>] [--star <ref.str>] [--peaks <peaks.tsv>] [--nef <proj.nef>] [--cache <cache.json>] [--dry-run] [--demo]\n\
        ferric export-fig      --out-dir <dir> [--panel all|hsqc|strips|pdb-s2|nmr1d-stack|dosy|metabolomics|exchange|octet]\n\
        ferric export-tour     --out-dir <dir> [--module all|01..08|<slug>] [--render-videos] [--keyframes-only] [--width 1280] [--height 720] [--fps 30]\n\
        ferric chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}}>] [--solvent CDCl3] [--mhz 400]\n",
@@ -8412,6 +8414,7 @@ fn main() {
         "mcp-config" => mcp_cmd::run_mcp_config_cli(&args[1..]),
         "dosy" => dosy_cmd::run_dosy_cli(&args[1..]),
         "metabolomics" | "metab" => metabolomics_cmd::run_metabolomics_cli(&args[1..]),
+        "dag" => dag_cmd::run_dag_cli(&args[1..]),
         "export-fig" => export_fig_cmd::run_export_fig_cli(&args[1..]),
         "export-tour" => export_tour_cmd::run_export_tour_cli_with_chem(
             &args[1..],
