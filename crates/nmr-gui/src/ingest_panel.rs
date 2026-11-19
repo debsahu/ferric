@@ -1011,10 +1011,7 @@ impl IngestPanelState {
             .iter()
             .filter(|h| {
                 let low = h.to_ascii_lowercase();
-                if (has_seq || seq_free) && (low.contains("sequence") || low.contains("fasta")) {
-                    return false;
-                }
-                true
+                !((has_seq || seq_free) && (low.contains("sequence") || low.contains("fasta")))
             })
             .cloned()
             .collect();
