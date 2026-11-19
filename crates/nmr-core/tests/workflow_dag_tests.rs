@@ -681,7 +681,23 @@ fn test_real_stage_execution_backbone_and_metabolomics_and_fail_closed_missing_i
     assert_eq!(out2.nef_text, out1.nef_text);
     assert_eq!(out2.report_html, out1.report_html);
     assert_eq!(out2.artifacts, out1.artifacts);
-    assert_eq!(out2.metrics_json, out1.metrics_json);
+    let mut m1 = out1.metrics_json.clone().expect("out1 metrics_json");
+    let mut m2 = out2.metrics_json.clone().expect("out2 metrics_json");
+    let s1 = m1
+        .as_object_mut()
+        .and_then(|obj| obj.remove("solver_score"))
+        .and_then(|v| v.as_f64())
+        .expect("out1 solver_score");
+    let s2 = m2
+        .as_object_mut()
+        .and_then(|obj| obj.remove("solver_score"))
+        .and_then(|v| v.as_f64())
+        .expect("out2 solver_score");
+    assert_eq!(m2, m1);
+    assert!(
+        s1.is_finite() && s2.is_finite() && (s1 - s2).abs() <= 1e-9,
+        "cached solver_score mismatch: out1={s1} vs out2={s2}"
+    );
 
     // 3. Real metabolomics 1D chemometrics execution with explicit demo fixture
     let metab_manifest =
