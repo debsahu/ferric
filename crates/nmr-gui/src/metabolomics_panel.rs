@@ -6,11 +6,12 @@
 //! `nmr_core::metabolomics` (Savorani et al. *J. Magn. Reson.* 2010; De Meyer et al. *Anal. Chem.*
 //! 2008; Dieterle et al. *Anal. Chem.* 2006; Trygg & Wold *J. Chemom.* 2002; Bylesjö et al.
 //! *J. Chemom.* 2006; Westerhuis et al. *Metabolomics* 2008; Wiklund et al. *Anal. Chem.* 2008;
-//! Cloarec et al. *Anal. Chem.* 2005; CC0 `BMRB` metabolomics reference library).
+//! Cloarec et al. *Anal. Chem.* 2005; `BMRB-BMSE` metabolomics reference library: free access,
+//! © UConn Health, acknowledgement requested).
 
 use eframe::egui;
 use nmr_core::metabolite_db::{
-    extract_stocsy_cluster_query_peaks, query_offline_metabolites,
+    extract_stocsy_cluster_query_peaks, npmrd_web_search_url, query_offline_metabolites,
     synthesize_reference_spectrum_1d, MetaboliteEntry, MetaboliteMatch, MetaboliteNucleus,
     QueryPeak, ReferenceSpectrum1D, DEFAULT_STOCSY_CLUSTER_MIN_R,
 };
@@ -93,6 +94,17 @@ fn group_color(group_idx: usize) -> egui::Color32 {
     PALETTE[group_idx % PALETTE.len()]
 }
 
+/// Completed background result from an opt-in desktop `BMRB v2` online query.
+#[cfg(not(target_arch = "wasm32"))]
+struct OnlineIdentifyOutcome {
+    generation: u64,
+    origin_label: String,
+    n_peaks: usize,
+    tol_ppm: f64,
+    offline_count: usize,
+    result: Result<Vec<MetaboliteMatch>, String>,
+}
+
 /// Interactive state for the 4-Quadrant Metabolomics & Biomarker Discovery Studio.
 pub struct MetabolomicsStudioPanel {
     pub samples: Vec<CohortSample1D>,
@@ -113,12 +125,21 @@ pub struct MetabolomicsStudioPanel {
     pub identify_nucleus: MetaboliteNucleus,
     /// Chemical-shift matching tolerance in ppm for metabolite identification.
     pub identify_tol_ppm: f64,
-    /// Opt-in desktop online search flag (`BMRB v2` + `NP-MRD`); strictly `false` by default.
+    /// Opt-in desktop online search flag (`BMRB v2` REST API); strictly `false` by default.
     pub include_online_search: bool,
     /// Ranked candidate hits from the latest offline (and opt-in online) metabolite search.
     pub identify_results: Vec<MetaboliteMatch>,
     /// Status message for the metabolite identification panel.
     pub identify_status: String,
+    /// Non-blocking channel receiver for background desktop `BMRB v2` online queries.
+    #[cfg(not(target_arch = "wasm32"))]
+    online_query_rx: Option<std::sync::mpsc::Receiver<OnlineIdentifyOutcome>>,
+    /// True while a background desktop `BMRB v2` online query thread is in flight.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub online_query_in_flight: bool,
+    /// Monotonic generation counter to discard stale background online responses.
+    #[cfg(not(target_arch = "wasm32"))]
+    online_query_generation: u64,
     /// Synthesized 1D reference spectrum currently overlaid onto Quadrant A.
     pub active_reference_overlay: Option<ReferenceSpectrum1D>,
     /// Pending `SMILES` string queued by the 1-click `Send to Octet` action.
@@ -165,8 +186,14 @@ impl MetabolomicsStudioPanel {
             include_online_search: false,
             identify_results: Vec::new(),
             identify_status:
-                "Click 'Query Picked 1D Peaks' or 'Query STOCSY (r >= 0.85)' to search offline CC0 BMRB-BMSE index."
+                "Click 'Query Picked 1D Peaks' or 'Query STOCSY (r >= 0.85)' to search offline BMRB-BMSE index."
                     .to_string(),
+            #[cfg(not(target_arch = "wasm32"))]
+            online_query_rx: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            online_query_in_flight: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            online_query_generation: 0,
             active_reference_overlay: None,
             pending_send_smiles_to_octet: None,
             is_synthetic_demo_cohort: false,
@@ -322,19 +349,158 @@ impl MetabolomicsStudioPanel {
         best_ppm
     }
 
-    /// Extract picked 1D peaks from the active cohort study (bucket apex positions).
+    /// Extract genuine 1D local-maxima peaks above robust MAD-estimated SNR threshold from the
+    /// dilution-normalized cohort-mean spectrum, coalescing multiplet fine-structure lines into
+    /// their intensity-weighted centroid ppm (never sending raw bucket apices).
     pub fn extract_picked_1d_query_peaks(&self) -> Vec<QueryPeak> {
         let Some(ref study) = self.study else {
             return Vec::new();
         };
-        study
-            .buckets
+        let m = study.common_ppm_grid.len();
+        let n_samples = study.aligned_spectra.len();
+        if m < 3 || n_samples == 0 {
+            return Vec::new();
+        }
+
+        // 1. Dilution-normalized cohort mean spectrum (masked regions zeroed).
+        let mut mean_spec = vec![0.0_f64; m];
+        let mut unmasked_vals = Vec::with_capacity(m);
+        for (idx, mean_slot) in mean_spec.iter_mut().enumerate() {
+            if study.masked_grid_points.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let mut sum = 0.0_f64;
+            let mut cnt = 0usize;
+            for (si, row) in study.aligned_spectra.iter().enumerate() {
+                if let Some(&v) = row.get(idx) {
+                    if v.is_finite() {
+                        let df = study
+                            .dilution_factors
+                            .get(si)
+                            .copied()
+                            .unwrap_or(1.0)
+                            .max(1e-15);
+                        sum += v / df;
+                        cnt += 1;
+                    }
+                }
+            }
+            if cnt > 0 {
+                let y = sum / (cnt as f64);
+                *mean_slot = y;
+                unmasked_vals.push(y);
+            }
+        }
+        if unmasked_vals.len() < 8 {
+            return Vec::new();
+        }
+
+        // 2. Robust baseline & noise floor via median and MAD over unmasked points.
+        unmasked_vals.sort_by(|a, b| a.total_cmp(b));
+        let baseline = unmasked_vals[unmasked_vals.len() / 2];
+        let max_val = *unmasked_vals.last().unwrap_or(&baseline);
+        let dynamic_range = (max_val - baseline).max(0.0);
+        if dynamic_range <= 1e-15 {
+            return Vec::new();
+        }
+
+        let mut abs_devs: Vec<f64> = unmasked_vals
             .iter()
-            .map(|b| {
-                let apex = Self::bucket_apex_ppm(study, b.low_ppm, b.high_ppm, b.center_ppm);
-                QueryPeak::from_ppm(apex)
+            .map(|&v| (v - baseline).abs())
+            .collect();
+        abs_devs.sort_by(|a, b| a.total_cmp(b));
+        let mad = abs_devs[abs_devs.len() / 2];
+        let sigma_noise = (1.4826 * mad).max(1e-9 * dynamic_range);
+
+        // Require >= 5*sigma above baseline AND >= 1.5% of tallest peak above baseline.
+        let snr_threshold = baseline + (5.0 * sigma_noise).max(0.015 * dynamic_range);
+        let min_prominence = (3.0 * sigma_noise).max(0.010 * dynamic_range);
+
+        // 3. Detect strict local maxima with local prominence over +-0.03 ppm neighborhood.
+        let grid_step = if m > 1 {
+            (study.common_ppm_grid[0] - study.common_ppm_grid[m - 1]).abs() / ((m - 1) as f64)
+        } else {
+            0.001
+        }
+        .max(1e-5);
+        let prom_half_win = ((0.035 / grid_step).round() as usize).clamp(2, 64);
+
+        let mut raw_peaks: Vec<(f64, f64)> = Vec::new();
+        for i in 1..(m - 1) {
+            if study.masked_grid_points.get(i).copied().unwrap_or(false)
+                || study
+                    .masked_grid_points
+                    .get(i - 1)
+                    .copied()
+                    .unwrap_or(false)
+                || study
+                    .masked_grid_points
+                    .get(i + 1)
+                    .copied()
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            let y = mean_spec[i];
+            if y < snr_threshold {
+                continue;
+            }
+            let is_local_max = (y >= mean_spec[i - 1] && y > mean_spec[i + 1])
+                || (y > mean_spec[i - 1] && y >= mean_spec[i + 1]);
+            if !is_local_max {
+                continue;
+            }
+            // Local prominence: peak must exceed min valley on BOTH sides within window.
+            let lo_idx = i.saturating_sub(prom_half_win);
+            let hi_idx = (i + prom_half_win).min(m - 1);
+            let left_min = mean_spec[lo_idx..i].iter().copied().fold(y, f64::min);
+            let right_min = mean_spec[(i + 1)..=hi_idx]
+                .iter()
+                .copied()
+                .fold(y, f64::min);
+            let prominence = (y - left_min).min(y - right_min);
+            if prominence >= min_prominence {
+                let height = (y - baseline).max(0.0);
+                raw_peaks.push((study.common_ppm_grid[i], height));
+            }
+        }
+        if raw_peaks.is_empty() {
+            return Vec::new();
+        }
+
+        // 4. Coalesce adjacent fine-structure multiplet lines (gap <= 0.022 ppm) into one
+        //    intensity-weighted centroid peak per multiplet.
+        raw_peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let coalesce_gap_ppm = 0.022;
+        let mut clusters: Vec<Vec<(f64, f64)>> = Vec::new();
+        for (ppm, h) in raw_peaks {
+            if let Some(last_cluster) = clusters.last_mut() {
+                let prev_ppm = last_cluster.last().map(|x| x.0).unwrap_or(ppm);
+                if (ppm - prev_ppm).abs() <= coalesce_gap_ppm {
+                    last_cluster.push((ppm, h));
+                    continue;
+                }
+            }
+            clusters.push(vec![(ppm, h)]);
+        }
+
+        let mut picked: Vec<QueryPeak> = clusters
+            .into_iter()
+            .map(|cl| {
+                let sum_h: f64 = cl.iter().map(|&(_, h)| h).sum();
+                let centroid = if sum_h > 1e-18 {
+                    cl.iter().map(|&(p, h)| p * h).sum::<f64>() / sum_h
+                } else {
+                    cl[0].0
+                };
+                let mut qp = QueryPeak::from_ppm(centroid);
+                qp.intensity = Some(sum_h);
+                qp
             })
-            .collect()
+            .collect();
+        // Order descending by ppm to match NMR axis convention.
+        picked.sort_by(|a, b| b.ppm.total_cmp(&a.ppm));
+        picked
     }
 
     /// Extract active `STOCSY` correlated peaks (`r >= min_r`, default `0.85`) refined to apex ppm.
@@ -355,60 +521,114 @@ impl MetabolomicsStudioPanel {
         peaks
     }
 
+    /// Non-blocking poll for any completed background desktop `BMRB v2` online query.
+    /// Returns `true` while a background query is still in flight.
+    pub fn poll_online_identify_results(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::sync::mpsc::TryRecvError;
+            let outcome = match self.online_query_rx.as_ref() {
+                Some(rx) => match rx.try_recv() {
+                    Ok(out) => Some(Ok(out)),
+                    Err(TryRecvError::Empty) => return self.online_query_in_flight,
+                    Err(TryRecvError::Disconnected) => Some(Err(())),
+                },
+                None => return false,
+            };
+            self.online_query_rx = None;
+            self.online_query_in_flight = false;
+            if let Some(Ok(out)) = outcome {
+                if out.generation != self.online_query_generation {
+                    return false;
+                }
+                let online_note = match out.result {
+                    Ok(online_hits) => {
+                        let mut added = 0usize;
+                        for hit in online_hits {
+                            let dup = self.identify_results.iter().any(|r| {
+                                r.entry.source == hit.entry.source
+                                    && r.entry.bmse_id == hit.entry.bmse_id
+                            });
+                            if !dup {
+                                self.identify_results.push(hit);
+                                added += 1;
+                            }
+                        }
+                        self.identify_results.sort_by(|a, b| {
+                            b.score
+                                .total_cmp(&a.score)
+                                .then_with(|| b.matched_ref_peaks.cmp(&a.matched_ref_peaks))
+                                .then_with(|| a.mean_abs_error_ppm.total_cmp(&b.mean_abs_error_ppm))
+                                .then_with(|| a.entry.bmse_id.cmp(&b.entry.bmse_id))
+                        });
+                        self.identify_results.truncate(16);
+                        format!(" (+{added} online BMRB v2)")
+                    }
+                    Err(e) => format!(" | Online unavailable: {e}"),
+                };
+                self.identify_status = format!(
+                    "{} ({} peaks, tol {:.3} ppm): {} offline BMRB-BMSE hits{online_note}",
+                    out.origin_label, out.n_peaks, out.tol_ppm, out.offline_count
+                );
+            }
+            false
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+
     fn run_identify_query(&mut self, query_peaks: &[QueryPeak], origin_label: &str) {
         if query_peaks.is_empty() {
             self.identify_results.clear();
-            self.identify_status = format!("No peaks available for {origin_label}.");
+            self.identify_status = format!("No peaks above SNR threshold for {origin_label}.");
             return;
         }
         let tol = self.identify_tol_ppm.clamp(0.005, 2.0);
-        #[allow(unused_mut)]
-        let mut results = query_offline_metabolites(query_peaks, self.identify_nucleus, tol, 12);
+        let results = query_offline_metabolites(query_peaks, self.identify_nucleus, tol, 12);
         let offline_count = results.len();
-        #[allow(unused_mut)]
-        let mut online_note = String::new();
+        self.identify_results = results;
 
         #[cfg(not(target_arch = "wasm32"))]
         if self.include_online_search {
-            match query_online_bmrb_and_npmrd(
-                query_peaks,
-                self.identify_nucleus,
-                tol,
-                OnlineQuerySources::all(),
-            ) {
-                Ok(online_hits) => {
-                    let mut added = 0usize;
-                    for hit in online_hits {
-                        let dup = results.iter().any(|r| {
-                            r.entry.source == hit.entry.source
-                                && r.entry.bmse_id == hit.entry.bmse_id
-                        });
-                        if !dup {
-                            results.push(hit);
-                            added += 1;
-                        }
-                    }
-                    results.sort_by(|a, b| {
-                        b.score
-                            .total_cmp(&a.score)
-                            .then_with(|| a.mean_abs_error_ppm.total_cmp(&b.mean_abs_error_ppm))
-                    });
-                    results.truncate(16);
-                    online_note = format!(" (+{added} online BMRB/NP-MRD)");
-                }
-                Err(e) => {
-                    online_note = format!(" | Online unavailable: {e}");
-                }
-            }
+            self.online_query_generation = self.online_query_generation.wrapping_add(1);
+            let gen_id = self.online_query_generation;
+            let peaks_owned = query_peaks.to_vec();
+            let nucleus = self.identify_nucleus;
+            let origin_owned = origin_label.to_string();
+            let n_peaks = peaks_owned.len();
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.online_query_rx = Some(rx);
+            self.online_query_in_flight = true;
+            self.identify_status = format!(
+                "{origin_label} ({n_peaks} peaks, tol {tol:.3} ppm): {offline_count} offline BMRB-BMSE hits | Querying BMRB v2 online in background..."
+            );
+            std::thread::spawn(move || {
+                let res = query_online_bmrb_and_npmrd(
+                    &peaks_owned,
+                    nucleus,
+                    tol,
+                    OnlineQuerySources::bmrb_only(),
+                );
+                let _ = tx.send(OnlineIdentifyOutcome {
+                    generation: gen_id,
+                    origin_label: origin_owned,
+                    n_peaks,
+                    tol_ppm: tol,
+                    offline_count,
+                    result: res,
+                });
+            });
+            return;
         }
 
         self.identify_status = format!(
-            "{origin_label} ({} peaks, tol {:.3} ppm): {} offline CC0 hits{online_note}",
+            "{origin_label} ({} peaks, tol {:.3} ppm): {} offline BMRB-BMSE hits",
             query_peaks.len(),
             tol,
             offline_count
         );
-        self.identify_results = results;
     }
 
     /// 1-click metabolite identification from picked 1D cohort peaks.
@@ -446,6 +666,10 @@ impl MetabolomicsStudioPanel {
 
     /// Render the complete 4-Quadrant Metabolomics & Biomarker Discovery Studio.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        if self.poll_online_identify_results() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
         self.last_plot_rects = [None; 3];
         self.last_canvas_rect = None;
         self.draw_top_toolbar(ui);
@@ -557,7 +781,7 @@ impl MetabolomicsStudioPanel {
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(
-                            "Interval FFT Peak Alignment | Adaptive Intelligent Binning | PQN Normalization | PCA / OPLS-DA | S-Plot / Volcano | Live STOCSY + 28-Metabolite CC0 BMRB Library",
+                            "Interval FFT Peak Alignment | Adaptive Intelligent Binning | PQN Normalization | PCA / OPLS-DA | S-Plot / Volcano | Live STOCSY + BMRB-BMSE Library",
                         )
                         .size(12.5),
                     );
@@ -716,7 +940,7 @@ impl MetabolomicsStudioPanel {
                     if ui
                         .selectable_label(self.show_identify_panel, "Identify (BMRB-BMSE)")
                         .on_hover_text(
-                            "Open offline CC0 BMRB-BMSE & opt-in BMRB/NP-MRD metabolite identification drawer",
+                            "Open offline BMRB-BMSE & opt-in BMRB v2 metabolite identification drawer",
                         )
                         .clicked()
                     {
@@ -2221,7 +2445,7 @@ impl MetabolomicsStudioPanel {
                     if ui
                         .button(egui::RichText::new("Query Picked 1D Peaks").size(11.5))
                         .on_hover_text(
-                            "Match all picked 1D cohort peaks against the offline CC0 BMRB-BMSE index",
+                            "Pick genuine 1D local-maxima peaks above SNR threshold and match against the offline BMRB-BMSE index",
                         )
                         .clicked()
                     {
@@ -2255,10 +2479,18 @@ impl MetabolomicsStudioPanel {
                     #[cfg(not(target_arch = "wasm32"))]
                     ui.checkbox(
                         &mut self.include_online_search,
-                        egui::RichText::new("Include Online Search (BMRB + NP-MRD)").size(11.5),
+                        egui::RichText::new("Include Online Search (BMRB v2)").size(11.5),
                     )
                     .on_hover_text(
-                        "Opt-in HTTPS query to api.bmrb.io and np-mrd.org (5 s timeout, 4 MiB cap; never runs automatically)",
+                        "Opt-in background HTTPS query to api.bmrb.io (curl -q, 5 s timeout, 4 MiB cap; never blocks UI or runs automatically)",
+                    );
+
+                    ui.hyperlink_to(
+                        egui::RichText::new("NP-MRD Web Search").size(11.0),
+                        npmrd_web_search_url(),
+                    )
+                    .on_hover_text(
+                        "Open NP-MRD (CC-BY-4.0) web portal at https://np-mrd.org/ in your browser",
                     );
 
                     if active_overlay_id.is_some()
@@ -2341,13 +2573,18 @@ impl MetabolomicsStudioPanel {
                                                 egui::Color32::from_rgb(203, 213, 225)
                                             }),
                                     );
-                                    ui.label(
-                                        egui::RichText::new(format!(
+                                    let matched_lbl = if hit.total_ref_peaks > 0 {
+                                        format!(
                                             "{}/{}",
                                             hit.matched_ref_peaks, hit.total_ref_peaks
-                                        ))
-                                        .size(11.0)
-                                        .monospace(),
+                                        )
+                                    } else {
+                                        format!("{}/?", hit.matched_ref_peaks)
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(matched_lbl)
+                                            .size(11.0)
+                                            .monospace(),
                                     );
                                     ui.label(
                                         egui::RichText::new(format!(
@@ -2532,11 +2769,11 @@ mod tests {
         studio.load_demo_cohort();
         studio.show_identify_panel = true;
 
-        // 1. Identify from all picked 1D cohort peaks
+        // 1. Identify from genuine picked 1D local-maxima cohort peaks
         studio.identify_from_picked_peaks();
         assert!(
             !studio.identify_results.is_empty(),
-            "picked 1D peak identification should return offline CC0 BMRB-BMSE candidates"
+            "picked 1D peak identification should return offline BMRB-BMSE candidates"
         );
 
         // 2. Select L-Lactate 1.33 ppm driver and identify from active STOCSY cluster (r >= 0.85)
@@ -2560,8 +2797,8 @@ mod tests {
             .first()
             .expect("top STOCSY metabolite hit")
             .clone();
-        assert_eq!(top.entry.name, "L-Lactate");
-        assert_eq!(top.entry.bmse_id, "bmse000036");
+        assert_eq!(top.entry.bmse_id, "bmse000208");
+        assert_eq!(top.entry.name, "L-(+) Lactic acid");
 
         // 3. Activate 1-click reference overlay & simulate Send to Octet handoff
         studio.set_reference_overlay(&top.entry);
@@ -2569,7 +2806,7 @@ mod tests {
         studio.pending_send_smiles_to_octet = Some(top.entry.smiles.clone());
         assert_eq!(
             studio.pending_send_smiles_to_octet.as_deref(),
-            Some("C[C@H](O)C(=O)O")
+            Some("C[C@@H](C(=O)O)O")
         );
 
         // 4. Render with Identify drawer open + active reference overlay at 1440x900
@@ -2588,5 +2825,114 @@ mod tests {
         out.textures_delta.clear();
         assert!(studio.last_plot_rects[0].is_some());
         assert!(studio.last_canvas_rect.is_some());
+    }
+
+    #[test]
+    fn test_picked_1d_peaks_uses_local_maxima_above_snr_not_bucket_comb() {
+        use nmr_core::nmr1d::{Experiment1DKind, Spectrum1D};
+        use nmr_core::rng::Rng;
+        use nmr_core::spectrum::AxisPpm;
+
+        // Build a 6-sample cohort containing ONLY L-(+) Lactic acid (1.318 doublet + 4.101 quartet)
+        // plus baseline noise, and use dense Uniform 0.04 ppm bucketing (min_bucket_snr = 0.0)
+        // which produces ~180+ uniform buckets across 0.5..9.5 ppm.
+        let n_pts = 4096usize;
+        let axis = AxisPpm::from_bounds("1H", n_pts, 9.5, 0.5, 600.0);
+        let mut rng = Rng::new(20261119);
+        let mut samples = Vec::new();
+        for s in 0..6 {
+            let mut real = vec![0.0_f64; n_pts];
+            let scale = if s < 3 { 1.0 } else { 2.0 };
+            let gamma = 0.0025_f64;
+            let g2 = gamma * gamma;
+            for (k, slot) in real.iter_mut().enumerate() {
+                let ppm = axis.index_to_ppm(k as f64);
+                let mut y = rng.normal(0.0, 0.003);
+                // Doublet at 1.318 ppm (J = 7.5 Hz @ 600 MHz -> +-0.00625 ppm)
+                for &c in &[1.31175, 1.32425] {
+                    let d = ppm - c;
+                    y += scale * 1.5 * g2 / (d * d + g2);
+                }
+                // Quartet at 4.101 ppm (J = 7.0 Hz @ 600 MHz -> step 0.01167 ppm)
+                for &(c, w) in &[
+                    (4.0835, 0.125),
+                    (4.0952, 0.375),
+                    (4.1068, 0.375),
+                    (4.1185, 0.125),
+                ] {
+                    let d = ppm - c;
+                    y += scale * w * 1.0 * g2 / (d * d + g2);
+                }
+                *slot = y;
+            }
+            let spec = Spectrum1D::new(
+                format!("S{s}"),
+                Experiment1DKind::Proton1D,
+                axis.clone(),
+                real,
+                None,
+            );
+            samples.push(CohortSample1D::new(
+                format!("S{s}"),
+                if s < 3 { "Control" } else { "Case" },
+                spec,
+            ));
+        }
+
+        let mut studio = MetabolomicsStudioPanel::default();
+        studio.config.n_permutations = 5;
+        studio.config.alignment = AlignmentMode::Disabled;
+        studio.config.bucketing = BucketingMethod::Uniform {
+            bin_width_ppm: 0.04,
+            min_bucket_snr: 0.0,
+        };
+        studio.set_cohort_and_run(samples);
+
+        let n_buckets = studio.study.as_ref().expect("study").buckets.len();
+        assert!(
+            n_buckets > 100,
+            "uniform 0.04 ppm bucketing should create >100 buckets (got {n_buckets})"
+        );
+
+        let picked = studio.extract_picked_1d_query_peaks();
+        assert_eq!(
+            picked.len(),
+            2,
+            "genuine local-maxima peak picker must extract ONLY the 2 real resonances (not {n_buckets} bucket apices!), got {picked:?}"
+        );
+        assert!(picked.iter().any(|p| (p.ppm - 1.318).abs() < 0.015));
+        assert!(picked.iter().any(|p| (p.ppm - 4.101).abs() < 0.015));
+
+        studio.identify_from_picked_peaks();
+        let top = studio
+            .identify_results
+            .first()
+            .expect("top picked-peaks hit");
+        assert_eq!(top.entry.bmse_id, "bmse000208");
+        assert_eq!(top.entry.name, "L-(+) Lactic acid");
+
+        // Pure-noise cohort must extract 0 peaks (never a dense bucket comb)
+        let mut noise_samples = Vec::new();
+        for s in 0..4 {
+            let real: Vec<f64> = (0..n_pts).map(|_| rng.normal(0.0, 0.005)).collect();
+            noise_samples.push(CohortSample1D::new(
+                format!("N{s}"),
+                if s < 2 { "A" } else { "B" },
+                Spectrum1D::new(
+                    format!("N{s}"),
+                    Experiment1DKind::Proton1D,
+                    axis.clone(),
+                    real,
+                    None,
+                ),
+            ));
+        }
+        studio.set_cohort_and_run(noise_samples);
+        let noise_picked = studio.extract_picked_1d_query_peaks();
+        assert!(
+            noise_picked.len() <= 2,
+            "pure-noise spectrum must not produce a dense bucket comb (got {} peaks)",
+            noise_picked.len()
+        );
     }
 }

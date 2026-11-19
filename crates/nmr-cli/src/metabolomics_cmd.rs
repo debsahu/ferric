@@ -5,12 +5,13 @@
 //! Normalization (`PQN`), Pareto/UV/Mean scaling, PCA Hotelling $T^2$ & $Q$-residual outlier
 //! diagnostics, leak-free NIPALS `OPLS-DA` with stratified $k$-fold $Q^2$ & permutation
 //! anti-overfitting validation, `VIP` / Wiklund `S-plot` / `BH-FDR` Volcano biomarker ranking,
-//! and 1D/2D `STOCSY` structural correlation matched against the public-domain CC0 `BMRB` library.
+//! and 1D/2D `STOCSY` structural correlation matched against the open-access `BMRB` library.
 //!
 //! # Literature & Clean-Room Provenance
 //! Original clean-room implementation of `docs/specs/20-metabolomics-chemometrics.md` (`T14.5`)
-//! derived strictly from peer-reviewed literature and CC0 `BMRB` reference data (zero proprietary
-//! or copyleft chemometrics packages consulted):
+//! derived strictly from peer-reviewed literature and `BMRB` reference data (free access,
+//! © UConn Health, acknowledgement requested; zero proprietary or copyleft chemometrics
+//! packages consulted):
 //! - Savorani, F., Tomasi, G. & Engelsen, S. B. (*J. Magn. Reson.* **2010**, 202, 190–202).
 //! - Holmes, E. et al. (*Anal. Biochem.* **1994**, 220, 284–296).
 //! - De Meyer, T. et al. (*Anal. Chem.* **2008**, 80, 3783–3790).
@@ -23,7 +24,7 @@
 //! - Wiklund, S. et al. (*Anal. Chem.* **2008**, 80, 115–122) & Benjamini, Y. & Hochberg, Y.
 //!   (*J. R. Stat. Soc. B* **1995**, 57, 289–300).
 //! - Cloarec, O. et al. (*Anal. Chem.* **2005**, 77, 1282–1289) & Ulrich, E. L. et al.
-//!   (*Nucleic Acids Res.* **2008**, 36, D402–D408, CC0 `BMRB` archive).
+//!   (*Nucleic Acids Res.* **2008**, 36, D402–D408, `BMRB` archive: free access, © UConn Health).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -32,8 +33,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use nmr_core::metabolite_db::{
-    query_offline_metabolites, query_online_bmrb_and_npmrd, MetaboliteMatch, MetaboliteNucleus,
-    OnlineQuerySources, QueryPeak,
+    npmrd_web_search_url, query_offline_metabolites, query_online_bmrb_and_npmrd, MetaboliteMatch,
+    MetaboliteNucleus, OnlineQuerySources, QueryPeak, MAX_METABOLITE_TOL_PPM,
 };
 use nmr_core::metabolomics::{
     align_cohort_interval_fft, bucket_cohort_spectra, compute_stocsy, compute_stocsy_at_ppm,
@@ -194,11 +195,11 @@ USAGE:
   ferric metabolomics stocsy   [--in study.json|buckets.csv | COHORT_INPUTS] --driver-ppm <PPM> [-o stocsy.json]
   ferric metabolomics identify --peaks <PPM1,PPM2,...> [--nucleus 1h|13c] [--tol 0.03] [--online] [-o hits.json]
 
-IDENTIFY OPTIONS (BMRB-BMSE CC0 Offline + Opt-In BMRB v2 / NP-MRD Online):
+IDENTIFY OPTIONS (BMRB-BMSE Offline + Opt-In BMRB v2 Online; NP-MRD web: https://np-mrd.org/):
   --peaks <PPM1,PPM2,...>      Comma-separated chemical shifts in ppm (repeatable)
   --nucleus <1h|13c>           Target NMR nucleus: 1h (default) or 13c
-  --tol <PPM>                  Shift matching tolerance in ppm (default: 0.03 for 1H, 0.50 for 13C)
-  --online                     Opt-in live HTTPS query to api.bmrb.io (BMRB v2) and np-mrd.org (NP-MRD)
+  --tol <PPM>                  Shift matching tolerance in ppm in (0.0, 2.0] (default: 0.03 for 1H, 0.50 for 13C)
+  --online                     Opt-in live HTTPS query to api.bmrb.io (BMRB v2 REST API)
   --top <K>                    Maximum number of ranked metabolite matches to output (default: 10)
   -o, --out <PATH>             Optional output path (.json, .csv, or .tsv)
 
@@ -2101,6 +2102,18 @@ fn parse_peaks_csv(raw: &str) -> Result<Vec<f64>, String> {
     Ok(out)
 }
 
+fn escape_delimited_field(raw: &str, sep: char) -> String {
+    if sep == ',' {
+        if raw.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", raw.replace('"', "\"\""))
+        } else {
+            raw.to_string()
+        }
+    } else {
+        raw.replace(['\t', '\n', '\r'], " ")
+    }
+}
+
 fn cmd_identify(args: &[String]) -> Result<(), String> {
     let mut peaks_ppm: Vec<f64> = Vec::new();
     let mut nucleus = MetaboliteNucleus::H1;
@@ -2126,8 +2139,10 @@ fn cmd_identify(args: &[String]) -> Result<(), String> {
             }
             "--tol" => {
                 let tol = parse_f64_flag(next_arg(args, &mut i, "--tol")?, "--tol")?;
-                if tol <= 0.0 {
-                    return Err("--tol must be > 0".to_string());
+                if tol <= 0.0 || tol > MAX_METABOLITE_TOL_PPM {
+                    return Err(format!(
+                        "--tol must be in (0.0, {MAX_METABOLITE_TOL_PPM}] ppm (got {tol})"
+                    ));
                 }
                 tol_override = Some(tol);
             }
@@ -2165,8 +2180,12 @@ fn cmd_identify(args: &[String]) -> Result<(), String> {
     let mut online_error: Option<String> = None;
 
     if online {
-        match query_online_bmrb_and_npmrd(&query_peaks, nucleus, tol_ppm, OnlineQuerySources::all())
-        {
+        match query_online_bmrb_and_npmrd(
+            &query_peaks,
+            nucleus,
+            tol_ppm,
+            OnlineQuerySources::bmrb_only(),
+        ) {
             Ok(online_hits) => {
                 for hit in online_hits {
                     let dup = matches.iter().any(|m| {
@@ -2179,13 +2198,14 @@ fn cmd_identify(args: &[String]) -> Result<(), String> {
                 matches.sort_by(|a, b| {
                     b.score
                         .total_cmp(&a.score)
+                        .then_with(|| b.matched_ref_peaks.cmp(&a.matched_ref_peaks))
                         .then_with(|| a.mean_abs_error_ppm.total_cmp(&b.mean_abs_error_ppm))
                         .then_with(|| a.entry.bmse_id.cmp(&b.entry.bmse_id))
                 });
                 matches.truncate(top_k);
             }
             Err(e) => {
-                eprintln!("Warning: online metabolite search unavailable ({e})");
+                eprintln!("Warning: online BMRB v2 metabolite search unavailable ({e})");
                 online_error = Some(e);
             }
         }
@@ -2215,15 +2235,15 @@ fn cmd_identify(args: &[String]) -> Result<(), String> {
                 tbl.push_str(&format!(
                     "{}{sep}{}{sep}{}{sep}{}{sep}{:.4}{sep}{}{sep}{}{sep}{:.4}{sep}{}{sep}{}\n",
                     idx + 1,
-                    m.entry.bmse_id,
-                    m.entry.name,
-                    m.entry.formula,
+                    escape_delimited_field(&m.entry.bmse_id, sep),
+                    escape_delimited_field(&m.entry.name, sep),
+                    escape_delimited_field(&m.entry.formula, sep),
                     m.score,
                     m.matched_ref_peaks,
                     m.total_ref_peaks,
                     m.mean_abs_error_ppm,
-                    m.entry.source.label(),
-                    m.entry.smiles
+                    escape_delimited_field(m.entry.source.label(), sep),
+                    escape_delimited_field(&m.entry.smiles, sep),
                 ));
             }
             write_parent_and_file(p, &tbl)?;
@@ -2235,16 +2255,17 @@ fn cmd_identify(args: &[String]) -> Result<(), String> {
     }
 
     println!(
-        "Metabolite Identification ({}, tol={:.4} ppm, query_peaks={}, online={}): {} matches",
+        "Metabolite Identification ({}, tol={:.4} ppm, query_peaks={}, online={}): {} matches (NP-MRD web search: {})",
         report.nucleus,
         report.tol_ppm,
         report.query_peaks_ppm.len(),
         report.online_requested,
-        report.matches.len()
+        report.matches.len(),
+        npmrd_web_search_url(),
     );
     for (idx, m) in report.matches.iter().enumerate() {
         println!(
-            "  #{:<2} {:<12} {:<20} score={:.3}  matched={}/{}  mean_err={:.4}ppm  [{}]",
+            "  #{:<2} {:<12} {:<24} score={:.3}  matched={}/{}  mean_err={:.4}ppm  [{}]",
             idx + 1,
             m.entry.bmse_id,
             m.entry.name,
@@ -2289,7 +2310,7 @@ mod identify_tests {
         let args: Vec<String> = vec![
             "identify".into(),
             "--peaks".into(),
-            "1.330,4.110".into(),
+            "1.318,4.101".into(),
             "--nucleus".into(),
             "1h".into(),
             "--tol".into(),
@@ -2297,7 +2318,7 @@ mod identify_tests {
             "-o".into(),
             tmp.to_string_lossy().into_owned(),
         ];
-        run_metabolomics_cli(&args).expect("identify 1H Lactate succeeds");
+        run_metabolomics_cli(&args).expect("identify 1H L-(+) Lactic acid succeeds");
         let body = fs::read_to_string(&tmp).expect("read identify json");
         let _ = fs::remove_file(&tmp);
         let parsed: IdentifyCliReportJson =
@@ -2305,15 +2326,19 @@ mod identify_tests {
         assert_eq!(parsed.nucleus, "1H");
         assert!(!parsed.online_requested);
         assert_eq!(
+            parsed.matches.first().map(|m| m.entry.bmse_id.as_str()),
+            Some("bmse000208")
+        );
+        assert_eq!(
             parsed.matches.first().map(|m| m.entry.name.as_str()),
-            Some("L-Lactate")
+            Some("L-(+) Lactic acid")
         );
 
-        // 13C query
+        // 13C query (L-Alanine bmse000028)
         let args_c13: Vec<String> = vec![
             "identify".into(),
             "--peaks".into(),
-            "18.9,53.3,178.5".into(),
+            "18.83,53.20,178.56".into(),
             "--nucleus".into(),
             "13c".into(),
             "--tol".into(),
@@ -2321,18 +2346,30 @@ mod identify_tests {
         ];
         run_metabolomics_cli(&args_c13).expect("identify 13C Alanine succeeds");
 
+        // CSV escaping check (compound names like "N,N-Dimethylglycine" contain commas!)
+        assert_eq!(
+            escape_delimited_field("N,N-Dimethylglycine", ','),
+            "\"N,N-Dimethylglycine\""
+        );
+        assert_eq!(escape_delimited_field("a\tb\nc", '\t'), "a b c");
+
         // Missing --peaks must error cleanly
         let bad: Vec<String> = vec!["identify".into()];
         assert!(run_metabolomics_cli(&bad).is_err());
 
-        // Invalid --tol must error cleanly
-        let bad_tol: Vec<String> = vec![
-            "identify".into(),
-            "--peaks".into(),
-            "1.33".into(),
-            "--tol".into(),
-            "-0.01".into(),
-        ];
-        assert!(run_metabolomics_cli(&bad_tol).is_err());
+        // Invalid or unbounded --tol (> 2.0 ppm) must error cleanly
+        for bad_val in ["-0.01", "0.0", "2.5", "1e300"] {
+            let bad_tol: Vec<String> = vec![
+                "identify".into(),
+                "--peaks".into(),
+                "1.318".into(),
+                "--tol".into(),
+                bad_val.into(),
+            ];
+            assert!(
+                run_metabolomics_cli(&bad_tol).is_err(),
+                "expected --tol {bad_val} to be rejected"
+            );
+        }
     }
 }
