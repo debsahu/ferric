@@ -31,6 +31,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use nmr_core::metabolite_db::{
+    query_offline_metabolites, query_online_bmrb_and_npmrd, MetaboliteMatch, MetaboliteNucleus,
+    OnlineQuerySources, QueryPeak,
+};
 use nmr_core::metabolomics::{
     align_cohort_interval_fft, bucket_cohort_spectra, compute_stocsy, compute_stocsy_at_ppm,
     export_biomarker_ranking_csv, export_bucket_table_csv, fit_opls_da_with_options, fit_pca,
@@ -169,15 +173,34 @@ pub struct Stocsy2dMatrixJson {
     pub covariance_matrix: Vec<Vec<f64>>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdentifyCliReportJson {
+    pub nucleus: String,
+    pub tol_ppm: f64,
+    pub query_peaks_ppm: Vec<f64>,
+    pub online_requested: bool,
+    pub online_error: Option<String>,
+    pub matches: Vec<MetaboliteMatch>,
+}
+
 pub fn metabolomics_usage() -> &'static str {
     "\
 ferric metabolomics — 1D NMR Untargeted Metabolomics, Chemometrics & STOCSY (T14.5)
 
 USAGE:
-  ferric metabolomics bin     [COHORT_INPUTS] [PREPROCESS_OPTIONS] [-o buckets.csv] [--study-out study.json]
-  ferric metabolomics pca     [--in study.json|buckets.csv | COHORT_INPUTS] [--components 5] [-o pca.json]
-  ferric metabolomics oplsda  [--in study.json|buckets.csv | COHORT_INPUTS] [--ortho 1] [--cv-folds 7] [--permutations 100] [-o oplsda.json]
-  ferric metabolomics stocsy  [--in study.json|buckets.csv | COHORT_INPUTS] --driver-ppm <PPM> [-o stocsy.json]
+  ferric metabolomics bin      [COHORT_INPUTS] [PREPROCESS_OPTIONS] [-o buckets.csv] [--study-out study.json]
+  ferric metabolomics pca      [--in study.json|buckets.csv | COHORT_INPUTS] [--components 5] [-o pca.json]
+  ferric metabolomics oplsda   [--in study.json|buckets.csv | COHORT_INPUTS] [--ortho 1] [--cv-folds 7] [--permutations 100] [-o oplsda.json]
+  ferric metabolomics stocsy   [--in study.json|buckets.csv | COHORT_INPUTS] --driver-ppm <PPM> [-o stocsy.json]
+  ferric metabolomics identify --peaks <PPM1,PPM2,...> [--nucleus 1h|13c] [--tol 0.03] [--online] [-o hits.json]
+
+IDENTIFY OPTIONS (BMRB-BMSE CC0 Offline + Opt-In BMRB v2 / NP-MRD Online):
+  --peaks <PPM1,PPM2,...>      Comma-separated chemical shifts in ppm (repeatable)
+  --nucleus <1h|13c>           Target NMR nucleus: 1h (default) or 13c
+  --tol <PPM>                  Shift matching tolerance in ppm (default: 0.03 for 1H, 0.50 for 13C)
+  --online                     Opt-in live HTTPS query to api.bmrb.io (BMRB v2) and np-mrd.org (NP-MRD)
+  --top <K>                    Maximum number of ranked metabolite matches to output (default: 10)
+  -o, --out <PATH>             Optional output path (.json, .csv, or .tsv)
 
 COHORT INPUTS (for bin, or direct on-the-fly cohort execution in pca/oplsda/stocsy):
   --cohort <PATH.json>         JSON array of CohortSample1D records
@@ -2060,6 +2083,181 @@ fn cmd_stocsy(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_peaks_csv(raw: &str) -> Result<Vec<f64>, String> {
+    let mut out = Vec::new();
+    for tok in raw.split([',', ';', ' ']) {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let v = parse_f64_flag(t, "--peaks")?;
+        out.push(v);
+    }
+    if out.is_empty() {
+        return Err(
+            "expected at least one numeric ppm value in --peaks <ppm1,ppm2,...>".to_string(),
+        );
+    }
+    Ok(out)
+}
+
+fn cmd_identify(args: &[String]) -> Result<(), String> {
+    let mut peaks_ppm: Vec<f64> = Vec::new();
+    let mut nucleus = MetaboliteNucleus::H1;
+    let mut tol_override: Option<f64> = None;
+    let mut online = false;
+    let mut top_k: usize = 10;
+    let mut out_path: Option<PathBuf> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" | "help" => {
+                print!("{}", metabolomics_usage());
+                return Ok(());
+            }
+            "--peaks" => {
+                let raw = next_arg(args, &mut i, "--peaks")?;
+                peaks_ppm.extend(parse_peaks_csv(raw)?);
+            }
+            "--nucleus" => {
+                let raw = next_arg(args, &mut i, "--nucleus")?;
+                nucleus = MetaboliteNucleus::parse(raw)?;
+            }
+            "--tol" => {
+                let tol = parse_f64_flag(next_arg(args, &mut i, "--tol")?, "--tol")?;
+                if tol <= 0.0 {
+                    return Err("--tol must be > 0".to_string());
+                }
+                tol_override = Some(tol);
+            }
+            "--online" => {
+                online = true;
+            }
+            "--top" => {
+                top_k = parse_usize_flag(next_arg(args, &mut i, "--top")?, "--top")?.max(1);
+            }
+            "-o" | "--out" | "--output" => {
+                let flag = args[i].as_str();
+                out_path = Some(PathBuf::from(next_arg(args, &mut i, flag)?));
+            }
+            other => {
+                return Err(format!(
+                    "unrecognized flag {other:?} for `ferric metabolomics identify`\n\n{}",
+                    metabolomics_usage()
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    if peaks_ppm.is_empty() {
+        return Err(
+            "missing required --peaks <ppm1,ppm2,...> for `ferric metabolomics identify`"
+                .to_string(),
+        );
+    }
+
+    let tol_ppm = tol_override.unwrap_or_else(|| nucleus.default_tol_ppm());
+    let query_peaks: Vec<QueryPeak> = peaks_ppm.iter().copied().map(QueryPeak::from_ppm).collect();
+
+    let mut matches = query_offline_metabolites(&query_peaks, nucleus, tol_ppm, top_k);
+    let mut online_error: Option<String> = None;
+
+    if online {
+        match query_online_bmrb_and_npmrd(&query_peaks, nucleus, tol_ppm, OnlineQuerySources::all())
+        {
+            Ok(online_hits) => {
+                for hit in online_hits {
+                    let dup = matches.iter().any(|m| {
+                        m.entry.source == hit.entry.source && m.entry.bmse_id == hit.entry.bmse_id
+                    });
+                    if !dup {
+                        matches.push(hit);
+                    }
+                }
+                matches.sort_by(|a, b| {
+                    b.score
+                        .total_cmp(&a.score)
+                        .then_with(|| a.mean_abs_error_ppm.total_cmp(&b.mean_abs_error_ppm))
+                        .then_with(|| a.entry.bmse_id.cmp(&b.entry.bmse_id))
+                });
+                matches.truncate(top_k);
+            }
+            Err(e) => {
+                eprintln!("Warning: online metabolite search unavailable ({e})");
+                online_error = Some(e);
+            }
+        }
+    }
+
+    let report = IdentifyCliReportJson {
+        nucleus: nucleus.as_str().to_string(),
+        tol_ppm,
+        query_peaks_ppm: peaks_ppm,
+        online_requested: online,
+        online_error,
+        matches,
+    };
+
+    if let Some(ref p) = out_path {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "csv" || ext == "tsv" {
+            let sep = if ext == "csv" { ',' } else { '\t' };
+            let mut tbl = format!(
+                "rank{sep}bmse_id{sep}name{sep}formula{sep}score{sep}matched_peaks{sep}total_ref_peaks{sep}mean_abs_err_ppm{sep}source{sep}smiles\n"
+            );
+            for (idx, m) in report.matches.iter().enumerate() {
+                tbl.push_str(&format!(
+                    "{}{sep}{}{sep}{}{sep}{}{sep}{:.4}{sep}{}{sep}{}{sep}{:.4}{sep}{}{sep}{}\n",
+                    idx + 1,
+                    m.entry.bmse_id,
+                    m.entry.name,
+                    m.entry.formula,
+                    m.score,
+                    m.matched_ref_peaks,
+                    m.total_ref_peaks,
+                    m.mean_abs_error_ppm,
+                    m.entry.source.label(),
+                    m.entry.smiles
+                ));
+            }
+            write_parent_and_file(p, &tbl)?;
+        } else {
+            let js = serde_json::to_string_pretty(&report)
+                .map_err(|e| format!("failed serializing identify JSON: {e}"))?;
+            write_parent_and_file(p, &js)?;
+        }
+    }
+
+    println!(
+        "Metabolite Identification ({}, tol={:.4} ppm, query_peaks={}, online={}): {} matches",
+        report.nucleus,
+        report.tol_ppm,
+        report.query_peaks_ppm.len(),
+        report.online_requested,
+        report.matches.len()
+    );
+    for (idx, m) in report.matches.iter().enumerate() {
+        println!(
+            "  #{:<2} {:<12} {:<20} score={:.3}  matched={}/{}  mean_err={:.4}ppm  [{}]",
+            idx + 1,
+            m.entry.bmse_id,
+            m.entry.name,
+            m.score,
+            m.matched_ref_peaks,
+            m.total_ref_peaks,
+            m.mean_abs_error_ppm,
+            m.entry.source.label()
+        );
+    }
+    Ok(())
+}
+
 pub fn run_metabolomics_cli(args: &[String]) -> Result<(), String> {
     if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
         print!("{}", metabolomics_usage());
@@ -2070,9 +2268,71 @@ pub fn run_metabolomics_cli(args: &[String]) -> Result<(), String> {
         "pca" => cmd_pca(&args[1..]),
         "oplsda" | "opls-da" | "opls" => cmd_oplsda(&args[1..]),
         "stocsy" => cmd_stocsy(&args[1..]),
+        "identify" | "id" => cmd_identify(&args[1..]),
         other => Err(format!(
-            "unknown `ferric metabolomics` subcommand {other:?} (expected bin, pca, oplsda, or stocsy)\n\n{}",
+            "unknown `ferric metabolomics` subcommand {other:?} (expected bin, pca, oplsda, stocsy, or identify)\n\n{}",
             metabolomics_usage()
         )),
+    }
+}
+
+#[cfg(test)]
+mod identify_tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_metabolomics_identify_offline_1h_and_13c_and_error_cases() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ferric_metab_identify_test_{}.json",
+            std::process::id()
+        ));
+        let args: Vec<String> = vec![
+            "identify".into(),
+            "--peaks".into(),
+            "1.330,4.110".into(),
+            "--nucleus".into(),
+            "1h".into(),
+            "--tol".into(),
+            "0.03".into(),
+            "-o".into(),
+            tmp.to_string_lossy().into_owned(),
+        ];
+        run_metabolomics_cli(&args).expect("identify 1H Lactate succeeds");
+        let body = fs::read_to_string(&tmp).expect("read identify json");
+        let _ = fs::remove_file(&tmp);
+        let parsed: IdentifyCliReportJson =
+            serde_json::from_str(&body).expect("deserialize IdentifyCliReportJson");
+        assert_eq!(parsed.nucleus, "1H");
+        assert!(!parsed.online_requested);
+        assert_eq!(
+            parsed.matches.first().map(|m| m.entry.name.as_str()),
+            Some("L-Lactate")
+        );
+
+        // 13C query
+        let args_c13: Vec<String> = vec![
+            "identify".into(),
+            "--peaks".into(),
+            "18.9,53.3,178.5".into(),
+            "--nucleus".into(),
+            "13c".into(),
+            "--tol".into(),
+            "0.5".into(),
+        ];
+        run_metabolomics_cli(&args_c13).expect("identify 13C Alanine succeeds");
+
+        // Missing --peaks must error cleanly
+        let bad: Vec<String> = vec!["identify".into()];
+        assert!(run_metabolomics_cli(&bad).is_err());
+
+        // Invalid --tol must error cleanly
+        let bad_tol: Vec<String> = vec![
+            "identify".into(),
+            "--peaks".into(),
+            "1.33".into(),
+            "--tol".into(),
+            "-0.01".into(),
+        ];
+        assert!(run_metabolomics_cli(&bad_tol).is_err());
     }
 }

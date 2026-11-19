@@ -39,6 +39,7 @@ pub mod kabsch_sander_ss;
 pub mod legolas_shifts;
 pub mod maxent_nus;
 pub mod mcp;
+pub mod metabolite_db;
 pub mod metabolomics;
 pub mod methyl_solver;
 pub mod methyl_trosy;
