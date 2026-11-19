@@ -1703,6 +1703,25 @@ struct StripSliceData {
     neg_pts: Vec<[f64; 2]>,
 }
 
+#[derive(Clone, Copy)]
+struct M02HistoricalBenchmarks {
+    ubiquitin_realistic_pct: f64,
+    cisd3_acc_pct: f64,
+    cisd3_hc_prec_pct: f64,
+    cold_bmrb_hc_min_pct: f64,
+    cold_bmrb_hc_max_pct: f64,
+    cold_bmrb_gate_pct: f64,
+}
+
+const M02_HISTORICAL_BENCHMARKS: M02HistoricalBenchmarks = M02HistoricalBenchmarks {
+    ubiquitin_realistic_pct: 98.4,
+    cisd3_acc_pct: 64.38,
+    cisd3_hc_prec_pct: 100.0,
+    cold_bmrb_hc_min_pct: 88.25,
+    cold_bmrb_hc_max_pct: 95.30,
+    cold_bmrb_gate_pct: 94.0,
+};
+
 struct M02SceneData {
     hsqc_pos_contours: Vec<Vec<[f64; 2]>>,
     hsqc_neg_contours: Vec<Vec<[f64; 2]>>,
@@ -1715,6 +1734,7 @@ struct M02SceneData {
     evo_acc_pct: f64,
     qc_verdict: String,
     n_high_conf: usize,
+    benchmarks: M02HistoricalBenchmarks,
 }
 
 struct M03SceneData {
@@ -1943,6 +1963,14 @@ exit\n";
         nus_residual_l1.push((l1_err * 1000.0).round() / 1000.0);
     }
 
+    let nus_sampled = nus_mask.iter().filter(|&&b| b).count();
+    let nus_total = nus_mask.len();
+    let nus_pct = if nus_total > 0 {
+        ((100.0 * nus_sampled as f64) / (nus_total as f64)).round() as usize
+    } else {
+        0
+    };
+
     let bundle = TourBundle {
         schema_version: TOUR_SCHEMA_VERSION.to_string(),
         module_index: 1,
@@ -1980,8 +2008,8 @@ exit\n";
                 start_sec: 8.0,
                 end_sec: 12.0,
                 title: "25% Poisson-Gap NUS & PSF Ridges".to_string(),
-                caption: "Only 16/64 indirect samples acquired; zero-fill FFT creates severe point-spread sidelobe artifacts.".to_string(),
-                metric_pill: "25% sampling (16/64 pts)".to_string(),
+                caption: format!("Only {nus_sampled}/{nus_total} indirect samples acquired; zero-fill FFT creates severe point-spread sidelobe artifacts."),
+                metric_pill: format!("{nus_pct}% sampling ({nus_sampled}/{nus_total} pts)"),
             },
             TourChapter {
                 index: 4,
@@ -2350,18 +2378,40 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
         .map(|s| round4(s.mean_energy))
         .collect();
     let qc_verdict = qc.verdict.as_str().to_string();
+    let bm = M02_HISTORICAL_BENCHMARKS;
+    let thr7 = strips.iter().find(|s| s.seq_id == 7);
+    let thr7_cb = thr7.and_then(|s| s.cb_i).unwrap_or(0.0);
+    let thr7_ca = thr7.and_then(|s| s.ca_i).unwrap_or(0.0);
+    let n_res_total = ref_data.sequence.len();
 
     let bundle = TourBundle {
         schema_version: TOUR_SCHEMA_VERSION.to_string(),
         module_index: 2,
         slug: TourModuleId::M02HsqcStripsSolvers.slug().to_string(),
         title: "2D HSQC, 3D HNCACB Strips & Backbone Solvers".to_string(),
-        subtitle: "Synthetic UBQ (--realistic) 98.4% · Dev CISD3 64.38%/100% HC · Cold BMRB evo-graph 88.25-95.30% (FAILS >=94%; withdrawn)".to_string(),
+        subtitle: format!(
+            "Live fixture: evo-graph {evo_acc_pct:.1}% / bayes-sa {bayes_acc_pct:.1}% / std {std_acc_pct:.1}% · [Historical disclosure] UBQ --realistic {:.1}%, dev CISD3 {:.2}%/{:.0}% HC, cold BMRB {:.2}-{:.2}% (FAILS >={:.0}%; withdrawn)",
+            bm.ubiquitin_realistic_pct,
+            bm.cisd3_acc_pct,
+            bm.cisd3_hc_prec_pct,
+            bm.cold_bmrb_hc_min_pct,
+            bm.cold_bmrb_hc_max_pct,
+            bm.cold_bmrb_gate_pct,
+        ),
         manual_chapter: "03-solvers-and-calibration.html".to_string(),
         validation_badge: ValidationBadge {
             kind: "cold_gate_failed_withdrawn".to_string(),
             label: "SYNTHETIC / DEV · COLD HCP GATE FAILED (WITHDRAWN)".to_string(),
-            detail: "Synthetic Ubiquitin (--realistic) 98.4% (310/315); dev CISD3 (BMRB 51439) 64.38% acc / 100% (59/59) HC; default evo-graph unseen cold micro HC-prec 88.25-95.30% (latest single-shot cold cohort 88.25% FAILS >= 94% gate; cold HCP claim formally withdrawn under 13.1:P1-2).".to_string(),
+            detail: format!(
+                "Live synthetic fixture coverage: evo-graph {evo_acc_pct:.1}%, bayes-sa {bayes_acc_pct:.1}%, standard {std_acc_pct:.1}%. [Historical 5-seed / cold-cohort disclosure]: Synthetic Ubiquitin (--realistic) {:.1}% (310/315); dev CISD3 (BMRB 51439) {:.2}% acc / {:.0}% (59/59) HC; default evo-graph unseen cold micro HC-prec {:.2}-{:.2}% (latest single-shot cold cohort {:.2}% FAILS >= {:.0}% gate; cold HCP claim formally withdrawn under 13.1:P1-2).",
+                bm.ubiquitin_realistic_pct,
+                bm.cisd3_acc_pct,
+                bm.cisd3_hc_prec_pct,
+                bm.cold_bmrb_hc_min_pct,
+                bm.cold_bmrb_hc_max_pct,
+                bm.cold_bmrb_hc_min_pct,
+                bm.cold_bmrb_gate_pct,
+            ),
         },
         duration_sec: TOUR_DURATION_SEC,
         fps: 30,
@@ -2372,7 +2422,7 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
                 start_sec: 0.0,
                 end_sec: 4.0,
                 title: "2D 1H-15N HSQC & Root Picking".to_string(),
-                caption: "Ubiquitin (76 aa, 600 MHz) positive backbone/NH2 contours + aliased Arg Ne-He negative contours.".to_string(),
+                caption: format!("Ubiquitin ({n_res_total} aa, 600 MHz) positive backbone/NH2 contours + aliased Arg Ne-He negative contours."),
                 metric_pill: format!("{} HSQC roots picked", hsqc_roots.len()),
             },
             TourChapter {
@@ -2380,7 +2430,9 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
                 start_sec: 4.0,
                 end_sec: 8.0,
                 title: "3D HNCACB Sequential Strip Walk".to_string(),
-                caption: "Walks Phe4 -> Gly10: CA(i)->CA(i-1), Thr7 CB=69.5 > CA inversion, and Gly10 CB-null anchor.".to_string(),
+                caption: format!(
+                    "Walks Phe4 -> Gly10: CA(i)->CA(i-1), Thr7 CB={thr7_cb:.1} > CA={thr7_ca:.1} inversion, and Gly10 CB-null anchor."
+                ),
                 metric_pill: "Phe4 -> Gly10 sequential walk".to_string(),
             },
             TourChapter {
@@ -2388,7 +2440,17 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
                 start_sec: 8.0,
                 end_sec: 12.0,
                 title: "Solver Cv(T) & Benchmark Range".to_string(),
-                caption: "bayes-sa Cv(T) alongside synthetic UBQ (98.4%), dev CISD3 (64.38%/100% HC), and cold BMRB evo-graph 88.25-95.30% (FAILS >=94%; withdrawn).".to_string(),
+                caption: format!(
+                    "Live bayes-sa Cv(T) (T_crit={:.2}, max Cv={:.1}; fixture evo-graph {evo_acc_pct:.1}%, bayes-sa {bayes_acc_pct:.1}%, std {std_acc_pct:.1}%) alongside [historical disclosure]: UBQ --realistic {:.1}%, dev CISD3 {:.2}%/{:.0}% HC, cold BMRB evo-graph {:.2}-{:.2}% (FAILS >={:.0}%; withdrawn).",
+                    bayes_rep.t_crit,
+                    bayes_rep.max_cv,
+                    bm.ubiquitin_realistic_pct,
+                    bm.cisd3_acc_pct,
+                    bm.cisd3_hc_prec_pct,
+                    bm.cold_bmrb_hc_min_pct,
+                    bm.cold_bmrb_hc_max_pct,
+                    bm.cold_bmrb_gate_pct,
+                ),
                 metric_pill: format!("T_crit={:.2}, max Cv={:.1}", bayes_rep.t_crit, bayes_rep.max_cv),
             },
             TourChapter {
@@ -2396,8 +2458,8 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
                 start_sec: 12.0,
                 end_sec: 16.0,
                 title: "76-Residue QC Confidence Ribbon".to_string(),
-                caption: "DatasetQcReport posterior confidence across residues 1..76 (>= 0.80 calibrated HC tier).".to_string(),
-                metric_pill: format!("QC={qc_verdict} · {n_high_conf}/76 >= 0.80"),
+                caption: format!("DatasetQcReport posterior confidence across residues 1..{n_res_total} (>= 0.80 calibrated HC tier)."),
+                metric_pill: format!("QC={qc_verdict} · {n_high_conf}/{n_res_total} >= 0.80"),
             },
         ],
         interactive_control: InteractiveControlSpec {
@@ -2443,11 +2505,14 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
             "qc_verdict": qc_verdict,
             "n_high_conf": n_high_conf,
             "benchmarks": {
-                "ubiquitin_realistic_pct": 98.4,
-                "cisd3_acc_pct": 64.38,
-                "cisd3_hc_prec_pct": 100.0,
-                "cold_bmrb_hc_min_pct": 86.18,
-                "cold_bmrb_hc_max_pct": 96.31,
+                "scope": "historical_disclosure",
+                "ubiquitin_realistic_pct": bm.ubiquitin_realistic_pct,
+                "cisd3_acc_pct": bm.cisd3_acc_pct,
+                "cisd3_hc_prec_pct": bm.cisd3_hc_prec_pct,
+                "cold_bmrb_hc_min_pct": bm.cold_bmrb_hc_min_pct,
+                "cold_bmrb_hc_max_pct": bm.cold_bmrb_hc_max_pct,
+                "cold_bmrb_gate_pct": bm.cold_bmrb_gate_pct,
+                "cold_bmrb_status": "FAILS >=94%; withdrawn (13.1:P1-2)",
             }
         }),
     };
@@ -2466,6 +2531,7 @@ fn build_m02_state(seed: u64) -> Result<CoreTourState, String> {
             evo_acc_pct,
             qc_verdict,
             n_high_conf,
+            benchmarks: bm,
         })),
     })
 }
@@ -2571,17 +2637,20 @@ fn build_m03_state(seed: u64) -> Result<CoreTourState, String> {
         .map(|p| (p.d_obs_norm_nh_hz, p.d_calc_norm_nh_hz, p.is_free, p.seq_id))
         .collect();
 
+    let f8_holdout_note =
+        "F8: unseen 1KHM -> 1ZZK improves NOE-only on 5/5 seeds (1.86-4.14 A), 0/5 < 1.80 A";
+
     let bundle = TourBundle {
         schema_version: TOUR_SCHEMA_VERSION.to_string(),
         module_index: 3,
         slug: TourModuleId::M03StructureNoeRdc.slug().to_string(),
         title: "3D Structure Folding, 1D3Z NOEs & Saupe RDCs".to_string(),
-        subtitle: "Dev 1D3Z/1UBQ · F8 unseen 1KHM->1ZZK improves NOE-only 5/5 (1.86-4.14 A), 0/5 < 1.80 A".to_string(),
+        subtitle: format!("Dev 1D3Z/1UBQ · {f8_holdout_note}"),
         manual_chapter: "01-quickstart-and-workflows.html".to_string(),
         validation_badge: ValidationBadge {
             kind: "cold_holdout_disclosed".to_string(),
             label: "DEV 1D3Z + UNSEEN 1KHM HOLDOUT DISCLOSED (F8)".to_string(),
-            detail: "F8 disclosed: unseen cold 1KHM -> 1ZZK improves NOE-only on 5/5 seeds (1.86-4.14 A), 0/5 < 1.80 A. Dev benchmark uses 1D3Z / 1UBQ.".to_string(),
+            detail: format!("{f8_holdout_note}. Dev benchmark uses 1D3Z / 1UBQ."),
         },
         duration_sec: TOUR_DURATION_SEC,
         fps: 30,
@@ -2608,7 +2677,7 @@ fn build_m03_state(seed: u64) -> Result<CoreTourState, String> {
                 start_sec: 8.0,
                 end_sec: 12.0,
                 title: "Saupe Tensor & Q_free + F8 Holdout".to_string(),
-                caption: "ByPeptidePlane Q_free RDC correlation on 1D3Z; F8 discloses unseen 1KHM->1ZZK (1.86-4.14 A, 0/5 < 1.80 A).".to_string(),
+                caption: format!("ByPeptidePlane Q_free RDC correlation on 1D3Z; {f8_holdout_note}."),
                 metric_pill: format!("Q_work={:.3}  Q_free={:.3}", first_med.q_work, first_med.q_free),
             },
             TourChapter {
@@ -2639,7 +2708,7 @@ fn build_m03_state(seed: u64) -> Result<CoreTourState, String> {
             "q_free": round4(first_med.q_free),
             "da_nh_hz": round4(first_med.da_nh_hz),
             "rhombicity": round4(first_med.rhombicity),
-            "f8_holdout_note": "F8: unseen 1KHM -> 1ZZK improves NOE-only on 5/5 seeds (1.86-4.14 A), 0/5 < 1.80 A",
+            "f8_holdout_note": f8_holdout_note,
         }),
     };
 
@@ -2845,6 +2914,24 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
 
     let tau_m_ns = trimmed.tau_m_sec * 1.0e9;
     let d_par_perp = axial.anisotropy_ratio;
+    let core_s2: Vec<f64> = seq_ids
+        .iter()
+        .zip(s2_vals.iter())
+        .filter(|(&sid, _)| {
+            (2..=71).contains(&sid)
+                && !(8..=11).contains(&sid)
+                && !(36..=40).contains(&sid)
+                && !(62..=65).contains(&sid)
+                && sid != 23
+                && sid != 25
+        })
+        .map(|(_, &s2)| s2)
+        .collect();
+    let core_s2_mean = if !core_s2.is_empty() {
+        core_s2.iter().sum::<f64>() / (core_s2.len() as f64)
+    } else {
+        0.87
+    };
 
     let bundle = TourBundle {
         schema_version: TOUR_SCHEMA_VERSION.to_string(),
@@ -2890,7 +2977,9 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
                 start_sec: 8.0,
                 end_sec: 12.0,
                 title: "Kay-Torchia-Bax tau_m & Woessner".to_string(),
-                caption: "Outlier-trimmed R2/R1 global tau_m & Woessner axial D_par/D_perp on 1UBQ N-H vectors.".to_string(),
+                caption: format!(
+                    "Outlier-trimmed R2/R1 global tau_m={tau_m_ns:.2} ns & Woessner axial D_par/D_perp={d_par_perp:.2} on 1UBQ N-H vectors."
+                ),
                 metric_pill: format!("tau_m={tau_m_ns:.2} ns  D_par/D_perp={d_par_perp:.2}"),
             },
             TourChapter {
@@ -2898,7 +2987,9 @@ fn build_m04_state(seed: u64) -> Result<CoreTourState, String> {
                 start_sec: 12.0,
                 end_sec: 16.0,
                 title: "Lipari-Szabo M1-M5 S^2 Profile".to_string(),
-                caption: "Ubiquitin 1..76 S^2 profile: rigid core (~0.87), Ile23 R_ex (M3), and flexible C-tail 72..76.".to_string(),
+                caption: format!(
+                    "Ubiquitin 1..76 S^2 profile: rigid core (~{core_s2_mean:.2}), Ile23 R_ex (M3), and flexible C-tail 72..76."
+                ),
                 metric_pill: "SYNTHETIC SHOWCASE (F10/F11 OPEN)".to_string(),
             },
         ],
@@ -4037,31 +4128,35 @@ fn render_m02_frame(
             c.draw_text(
                 708.0 * sx,
                 122.0 * sy,
-                "5-SEED BENCHMARK DISCLOSURE",
-                1.65 * sx,
+                "HISTORICAL 5-SEED / COLD-COHORT DISCLOSURE",
+                1.55 * sx,
                 [110, 231, 183, 255],
             );
 
             let bars = [
                 (
                     "Ubiquitin --realistic (5-seed)",
-                    98.4_f64,
+                    d.benchmarks.ubiquitin_realistic_pct,
                     [52, 211, 153, 255],
                 ),
                 (
                     "CISD3 BMRB 51439 overall acc",
-                    64.38_f64,
+                    d.benchmarks.cisd3_acc_pct,
                     [251, 191, 36, 255],
                 ),
-                ("CISD3 BMRB 51439 HC-prec", 100.0_f64, [56, 189, 248, 255]),
                 (
-                    "Cold BMRB HC-prec low bound",
-                    86.18_f64,
+                    "CISD3 BMRB 51439 HC-prec",
+                    d.benchmarks.cisd3_hc_prec_pct,
+                    [56, 189, 248, 255],
+                ),
+                (
+                    "Cold BMRB evo-graph min (FAILS)",
+                    d.benchmarks.cold_bmrb_hc_min_pct,
                     [167, 139, 250, 255],
                 ),
                 (
-                    "Cold BMRB HC-prec high bound",
-                    96.31_f64,
+                    "Cold BMRB evo-graph max",
+                    d.benchmarks.cold_bmrb_hc_max_pct,
                     [167, 139, 250, 255],
                 ),
             ];
@@ -4979,5 +5074,101 @@ mod tests {
         assert!(gly10["ca_im1"].is_number(), "Gly10 missing ca_im1");
         assert!(gly10["cb_im1"].is_number(), "Gly10 missing cb_im1");
         assert_eq!(strips[6]["cb_i_sign"].as_i64(), Some(-1));
+    }
+
+    #[test]
+    fn test_b15_mod02_and_mod04_caption_payload_consistency() {
+        // Module 02: payload.benchmarks must match subtitle, badge detail, and Ch3 caption,
+        // carry explicit historical_disclosure scope, and Ch2 Thr7 CB/CA must match strips[6].
+        let m02 = build_core_tour_state(TourModuleId::M02HsqcStripsSolvers, CANONICAL_TOUR_SEED)
+            .expect("Mod02 should build");
+        let p2: serde_json::Value =
+            serde_json::to_value(&m02.bundle.payload).expect("Mod02 payload serialize");
+        let bm = &p2["benchmarks"];
+        assert_eq!(bm["scope"].as_str(), Some("historical_disclosure"));
+        let ubq = bm["ubiquitin_realistic_pct"].as_f64().expect("ubq");
+        let cisd3_acc = bm["cisd3_acc_pct"].as_f64().expect("cisd3_acc");
+        let cisd3_hc = bm["cisd3_hc_prec_pct"].as_f64().expect("cisd3_hc");
+        let cold_min = bm["cold_bmrb_hc_min_pct"].as_f64().expect("cold_min");
+        let cold_max = bm["cold_bmrb_hc_max_pct"].as_f64().expect("cold_max");
+        assert!((cold_min - 88.25).abs() < 1e-6);
+        assert!((cold_max - 95.30).abs() < 1e-6);
+
+        let cold_range = format!("{cold_min:.2}-{cold_max:.2}%");
+        let ubq_str = format!("{ubq:.1}%");
+        let cisd3_str = format!("{cisd3_acc:.2}%");
+        let cisd3_hc_str = format!("{cisd3_hc:.0}% HC");
+        for (field_name, text) in [
+            ("subtitle", m02.bundle.subtitle.as_str()),
+            ("badge.detail", m02.bundle.validation_badge.detail.as_str()),
+            ("ch3.caption", m02.bundle.chapters[2].caption.as_str()),
+        ] {
+            assert!(
+                text.contains(&cold_range),
+                "Mod02 {field_name} missing cold range {cold_range}: {text}"
+            );
+            assert!(
+                text.contains(&ubq_str),
+                "Mod02 {field_name} missing {ubq_str}: {text}"
+            );
+            assert!(
+                text.contains(&cisd3_str),
+                "Mod02 {field_name} missing {cisd3_str}: {text}"
+            );
+            assert!(
+                !text.contains("86.18") && !text.contains("96.31"),
+                "Mod02 {field_name} contains stale 86.18/96.31 range: {text}"
+            );
+        }
+        assert!(
+            m02.bundle.chapters[2].caption.contains(&cisd3_hc_str),
+            "Mod02 ch3 caption missing {cisd3_hc_str}"
+        );
+        // Live fixture coverage must also appear in Ch3 caption matching payload
+        let evo_acc = p2["evo_acc_pct"].as_f64().expect("evo_acc_pct");
+        let evo_str = format!("evo-graph {evo_acc:.1}%");
+        assert!(
+            m02.bundle.chapters[2].caption.contains(&evo_str),
+            "Mod02 ch3 caption missing live {evo_str}: {}",
+            m02.bundle.chapters[2].caption
+        );
+        // Thr7 CB and CA in Ch2 caption must match strips[6]
+        let thr7_cb = p2["strips"][6]["cb_i"].as_f64().expect("Thr7 cb_i");
+        let thr7_ca = p2["strips"][6]["ca_i"].as_f64().expect("Thr7 ca_i");
+        let thr7_expected = format!("Thr7 CB={thr7_cb:.1} > CA={thr7_ca:.1}");
+        assert!(
+            m02.bundle.chapters[1].caption.contains(&thr7_expected),
+            "Mod02 ch2 caption missing {thr7_expected}: {}",
+            m02.bundle.chapters[1].caption
+        );
+
+        // Module 04: Ch3 caption & metric_pill must match payload.tau_m_ns to 2 decimals
+        let m04 = build_core_tour_state(TourModuleId::M04RelaxModelfree, CANONICAL_TOUR_SEED)
+            .expect("Mod04 should build");
+        let p4: serde_json::Value =
+            serde_json::to_value(&m04.bundle.payload).expect("Mod04 payload serialize");
+        let tau_m_ns = p4["tau_m_ns"].as_f64().expect("tau_m_ns");
+        let d_par_perp = p4["d_par_perp"].as_f64().expect("d_par_perp");
+        let tau_str = format!("tau_m={tau_m_ns:.2} ns");
+        let aniso_str = format!("D_par/D_perp={d_par_perp:.2}");
+        assert!(
+            m04.bundle.chapters[2].caption.contains(&tau_str),
+            "Mod04 ch3 caption missing {tau_str}: {}",
+            m04.bundle.chapters[2].caption
+        );
+        assert!(
+            m04.bundle.chapters[2].caption.contains(&aniso_str),
+            "Mod04 ch3 caption missing {aniso_str}: {}",
+            m04.bundle.chapters[2].caption
+        );
+        assert!(
+            m04.bundle.chapters[2].metric_pill.contains(&tau_str),
+            "Mod04 ch3 metric_pill missing {tau_str}: {}",
+            m04.bundle.chapters[2].metric_pill
+        );
+        assert!(
+            !m04.bundle.chapters[2].caption.contains("4.10"),
+            "Mod04 ch3 caption must not hardcode 4.10 ns when payload is {tau_m_ns:.4}"
+        );
     }
 }
