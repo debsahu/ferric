@@ -1029,11 +1029,12 @@ fn householder_qr(a_cols: &[Vec<f64>], m: usize) -> (Vec<Vec<f64>>, Vec<Vec<f64>
     if n == 0 || m == 0 {
         return (Vec::new(), Vec::new());
     }
+    let k_max = m.min(n);
     let mut w: Vec<Vec<f64>> = a_cols.to_vec();
-    let mut vs: Vec<Vec<f64>> = Vec::with_capacity(n);
-    let mut betas: Vec<f64> = vec![0.0; n];
+    let mut vs: Vec<Vec<f64>> = Vec::with_capacity(k_max);
+    let mut betas: Vec<f64> = vec![0.0; k_max];
 
-    for k in 0..n {
+    for k in 0..k_max {
         let len = m - k;
         let mut norm_sq = 0.0;
         for i in k..m {
@@ -1080,24 +1081,25 @@ fn householder_qr(a_cols: &[Vec<f64>], m: usize) -> (Vec<Vec<f64>>, Vec<Vec<f64>
 
     let mut r_cols = vec![vec![0.0; n]; n];
     for j in 0..n {
-        for i in 0..=j {
+        let i_end = (j + 1).min(k_max);
+        for i in 0..i_end {
             r_cols[j][i] = w[j][i];
         }
     }
 
     // Reconstruct thin Q (m x n) by applying reflections in reverse order.
     let mut q_cols = vec![vec![0.0; m]; n];
-    for j in 0..n {
+    for j in 0..k_max {
         q_cols[j][j] = 1.0;
     }
-    for k in (0..n).rev() {
+    for k in (0..k_max).rev() {
         let beta = betas[k];
         if beta == 0.0 {
             continue;
         }
         let v = &vs[k];
         let len = m - k;
-        for j in k..n {
+        for j in k..k_max {
             let mut dot = 0.0;
             for i in 0..len {
                 dot += v[i] * q_cols[j][k + i];
@@ -1364,12 +1366,13 @@ impl ThinSvd {
         out
     }
 
-    /// Compute orthogonal projection $P_A^\perp v = v - U (U^T v)$.
-    fn project_perp(&self, v: &[f64]) -> Vec<f64> {
+    /// Compute orthogonal projection $P_A^\perp v = v - U_r (U_r^T v)$ over retained singular
+    /// directions (`s_inv[j] > 0.0`) so completed nullspace columns never corrupt $\operatorname{Range}(A)^\perp$.
+    fn project_perp(&self, v: &[f64], s_inv: &[f64]) -> Vec<f64> {
         let utv = self.u_transpose_mul(v);
         let mut out = v.to_vec();
         for (j, &coeff) in utv.iter().enumerate() {
-            if coeff == 0.0 {
+            if s_inv[j] == 0.0 || coeff == 0.0 {
                 continue;
             }
             let uj = &self.u_cols[j];
@@ -2076,7 +2079,7 @@ fn eval_varpro_system(
                 // Exact Golub–Pereyra (1973) VarPro Jacobian column for yhat = Phi * Phi^+ * y:
                 //   d(yhat)/d(theta_j) = P_Phi^\perp (D_j a) + (Phi^+)^T (D_j^T r)
                 let term1 = if let Some(ref v) = d_a[j] {
-                    svd.project_perp(v)
+                    svd.project_perp(v, s_inv)
                 } else {
                     vec![0.0; m]
                 };
@@ -2200,18 +2203,19 @@ fn compute_full_crlb_covariance(
             }
         }
 
-        // Project each column j of J_theta^(p):
-        //   E_p[:, j] = U_p^T J_theta^(p)[:, j]  (length n_lin)
-        //   F_p[:, j] = J_theta^(p)[:, j] - U_p E_p[:, j]  (length m)
+        // Project each column j of J_theta^(p) over retained singular directions (s_inv[l] > 0.0):
+        //   E_p[l, j] = U_p[:, l]^T J_theta^(p)[:, j]  if s_inv[l] > 0 else 0
+        //   F_p[:, j] = J_theta^(p)[:, j] - sum_{l: s_inv[l] > 0} E_p[l, j] U_p[:, l]
         let mut e_p = vec![vec![0.0; n_nl]; n_lin];
         let mut f_p_cols = Vec::with_capacity(n_nl);
         for j in 0..n_nl {
             let utj = svd.u_transpose_mul(&j_theta_cols[j]);
-            for l in 0..n_lin {
-                e_p[l][j] = utj[l];
-            }
             let mut fj = j_theta_cols[j].clone();
             for (l, &coeff) in utj.iter().enumerate() {
+                if s_inv[l] == 0.0 {
+                    continue;
+                }
+                e_p[l][j] = coeff;
                 if coeff == 0.0 {
                     continue;
                 }
@@ -2891,6 +2895,13 @@ pub fn eval_varpro_residual_and_jacobian_2d(
     let fwhms: Vec<Vec<f64>> = seeds.iter().map(|s| vec![s.fwhm_f1, s.fwhm_f2]).collect();
     let etas: Vec<Vec<f64>> = seeds.iter().map(|s| vec![s.eta_f1, s.eta_f2]).collect();
     validate_seeds_and_values(&roi.values, &centers, &fwhms, &etas, config)?;
+    let n_lin = seeds.len() + usize::from(config.fit_baseline);
+    if m < n_lin {
+        return Err(DeconvError::InsufficientDegreesOfFreedom {
+            observations: m,
+            parameters: n_lin,
+        });
+    }
     let (layout, theta) =
         ParamLayout::build(1, seeds.len(), &[ax1, ax2], &centers, &fwhms, &etas, config)?;
     let coords: [&[f64]; 2] = [&roi.coords_f1, &roi.coords_f2];
@@ -2940,6 +2951,13 @@ pub fn eval_varpro_residual_and_jacobian_3d(
         .map(|s| vec![s.eta_f1, s.eta_f2, s.eta_f3])
         .collect();
     validate_seeds_and_values(&roi.values, &centers, &fwhms, &etas, config)?;
+    let n_lin = seeds.len() + usize::from(config.fit_baseline);
+    if m < n_lin {
+        return Err(DeconvError::InsufficientDegreesOfFreedom {
+            observations: m,
+            parameters: n_lin,
+        });
+    }
     let (layout, theta) = ParamLayout::build(
         1,
         seeds.len(),

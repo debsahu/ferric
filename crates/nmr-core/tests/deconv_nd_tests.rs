@@ -1609,3 +1609,162 @@ fn multi_plane_coupled_crlb_matches_monte_carlo_and_estimated_sigma() {
     assert!((est_res.residual_sigma - sigma).abs() / sigma < 0.15);
     assert!((est_res.reduced_chi2 - 1.0).abs() < 1.0e-12);
 }
+
+/// `[synthetic self-consistency]` Regression test: `eval_varpro_residual_and_jacobian_{2d,3d}`
+/// fail closed with `Err(DeconvError::InsufficientDegreesOfFreedom)` when `m < n_lin` instead of
+/// panicking inside Householder QR.
+#[test]
+fn eval_varpro_jacobian_rejects_underdetermined_m_lt_n_lin() {
+    let tiny_2d = Roi2D::from_grid(2, 2, vec![1.0, 2.0, 3.0, 4.0]).expect("2x2 grid");
+    let seed2 = PeakSeed2D {
+        center_f1: 0.5,
+        center_f2: 0.5,
+        fwhm_f1: 1.0,
+        fwhm_f2: 1.0,
+        eta_f1: 0.5,
+        eta_f2: 0.5,
+    };
+    let cfg_no_base = DeconvConfig::default();
+    let cfg_base = DeconvConfig {
+        fit_baseline: true,
+        ..DeconvConfig::default()
+    };
+
+    // m = 4 < n_lin = 5 (5 peaks, no baseline)
+    assert_eq!(
+        eval_varpro_residual_and_jacobian_2d(&tiny_2d, &[seed2; 5], &cfg_no_base),
+        Err(DeconvError::InsufficientDegreesOfFreedom {
+            observations: 4,
+            parameters: 5,
+        })
+    );
+    // m = 4 < n_lin = 5 (4 peaks + baseline)
+    assert_eq!(
+        eval_varpro_residual_and_jacobian_2d(&tiny_2d, &[seed2; 4], &cfg_base),
+        Err(DeconvError::InsufficientDegreesOfFreedom {
+            observations: 4,
+            parameters: 5,
+        })
+    );
+
+    let tiny_3d =
+        Roi3D::from_grid(2, 2, 2, (1..=8).map(|i| i as f64).collect()).expect("2x2x2 grid");
+    let seed3 = PeakSeed3D {
+        center_f1: 0.5,
+        center_f2: 0.5,
+        center_f3: 0.5,
+        fwhm_f1: 1.0,
+        fwhm_f2: 1.0,
+        fwhm_f3: 1.0,
+        eta_f1: 0.5,
+        eta_f2: 0.5,
+        eta_f3: 0.5,
+    };
+    // m = 8 < n_lin = 9 (9 peaks, no baseline)
+    assert_eq!(
+        eval_varpro_residual_and_jacobian_3d(&tiny_3d, &[seed3; 9], &cfg_no_base),
+        Err(DeconvError::InsufficientDegreesOfFreedom {
+            observations: 8,
+            parameters: 9,
+        })
+    );
+    // m = 8 < n_lin = 9 (8 peaks + baseline)
+    assert_eq!(
+        eval_varpro_residual_and_jacobian_3d(&tiny_3d, &[seed3; 8], &cfg_base),
+        Err(DeconvError::InsufficientDegreesOfFreedom {
+            observations: 8,
+            parameters: 9,
+        })
+    );
+}
+
+/// `[synthetic self-consistency]` Regression test: on an exact coincident-peak rank-1 basis
+/// $\Phi = [\phi, \phi]$, `project_perp` must project out ONLY the retained rank-1 direction
+/// $\mathbf{u}_0 = \phi / \|\phi\|_2$ (never completed nullspace vectors), matching the exact
+/// closed-form rank-1 VarPro Jacobian to `< 1e-12`.
+#[test]
+fn rank_deficient_coincident_peaks_projector_matches_exact_rank1_formula() {
+    let c1 = linspace(0.0, 10.0, 11);
+    let c2 = linspace(0.0, 10.0, 11);
+    let mu1 = 4.7;
+    let mu2 = 5.3;
+    let fw1 = 2.6;
+    let fw2 = 2.2;
+
+    let mut roi = synthesize_roi_2d(
+        &c1,
+        &c2,
+        LineshapeKind::Gaussian,
+        &[PeakModel2D {
+            amplitude: 40.0,
+            center_f1: mu1,
+            center_f2: mu2,
+            fwhm_f1: fw1,
+            fwhm_f2: fw2,
+            eta_f1: 0.0,
+            eta_f2: 0.0,
+        }],
+        0.0,
+    )
+    .expect("synth");
+    // Add deterministic noise so residual r != 0 (tests both P_Phi^perp and (Phi^+)^T terms).
+    let mut rng = Rng::new(2026_2210);
+    for v in &mut roi.values {
+        *v += rng.normal(0.0, 0.5);
+    }
+
+    let exact_seed = PeakSeed2D {
+        center_f1: mu1,
+        center_f2: mu2,
+        fwhm_f1: fw1,
+        fwhm_f2: fw2,
+        eta_f1: 0.0,
+        eta_f2: 0.0,
+    };
+    let cfg = DeconvConfig {
+        lineshape: LineshapeKind::Gaussian,
+        linewidth_sharing: LinewidthSharing::SharedAcrossPlanes,
+        fit_baseline: false,
+        ..DeconvConfig::default()
+    };
+
+    let (yhat, resid, jac, kappa) =
+        eval_varpro_residual_and_jacobian_2d(&roi, &[exact_seed, exact_seed], &cfg)
+            .expect("coincident eval");
+    assert!(!kappa.is_finite() || kappa > 1.0e12);
+
+    // Closed-form rank-1 basis phi and derivative d = d(phi)/d(mu1)
+    let m = roi.values.len();
+    let mut phi = vec![0.0; m];
+    let mut d_mu1 = vec![0.0; m];
+    for (i1, &x1) in c1.iter().enumerate() {
+        let e1 = eval_lineshape_1d(LineshapeKind::Gaussian, x1, mu1, fw1, 0.0);
+        for (i2, &x2) in c2.iter().enumerate() {
+            let e2 = eval_lineshape_1d(LineshapeKind::Gaussian, x2, mu2, fw2, 0.0);
+            let idx = i1 * c2.len() + i2;
+            phi[idx] = e1.value * e2.value;
+            d_mu1[idx] = e1.d_mu * e2.value;
+        }
+    }
+
+    let phi_sq: f64 = phi.iter().map(|&x| x * x).sum();
+    let phi_y: f64 = phi
+        .iter()
+        .zip(roi.values.iter())
+        .map(|(&p, &y)| p * y)
+        .sum();
+    let a0 = phi_y / (2.0 * phi_sq);
+    let expected_yhat: Vec<f64> = phi.iter().map(|&p| (phi_y / phi_sq) * p).collect();
+    assert!(rel_l2_err(&yhat, &expected_yhat) < 1.0e-12);
+
+    let phi_d: f64 = phi.iter().zip(d_mu1.iter()).map(|(&p, &d)| p * d).sum();
+    let d_r: f64 = d_mu1.iter().zip(resid.iter()).map(|(&d, &r)| d * r).sum();
+    let expected_j0: Vec<f64> = (0..m)
+        .map(|i| a0 * (d_mu1[i] - (phi_d / phi_sq) * phi[i]) + (d_r / (2.0 * phi_sq)) * phi[i])
+        .collect();
+    let err = rel_l2_err(&jac[0], &expected_j0);
+    assert!(
+        err < 1.0e-12,
+        "rank-1 coincident-peak VarPro Jacobian mismatch: rel_l2={err:.3e}"
+    );
+}
