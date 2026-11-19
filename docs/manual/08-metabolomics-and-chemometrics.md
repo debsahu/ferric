@@ -3,7 +3,7 @@
 FERRIC includes a clean-room untargeted 1D biofluid and mixture metabolomics engine (`nmr-core::metabolomics`, `ferric metabolomics`, MCP tool `run_metabolomics_chemometrics`, and the 4-quadrant **`🧪 Metabolomics`** workbench studio in `nmr-gui::metabolomics_panel`). Every stage—from interval FFT peak alignment and Adaptive Intelligent Binning (`AI-Binning`) through Probabilistic Quotient Normalization (`PQN`), unsupervised `PCA` outlier diagnostics, leak-free stratified `k`-fold `OPLS-DA`, and Statistical Total Correlation Spectroscopy (`STOCSY`)—runs deterministically in pure `f64` Rust on both desktop and `wasm32-unknown-unknown`.
 
 > [!IMPORTANT] Validation Scope (Synthetic Forward-Model Self-Consistency)
-> All `T14.5` metabolomics and chemometrics benchmarks reported in this chapter are **synthetic forward-model self-consistency evaluations** constructed from multi-multiplet biofluid cohorts (28-metabolite `CC0 1.0` BMRB chemical shift library, `3x` biological urine dilution factors, `±0.025 ppm` ionic-strength/pH peak drift, injected biomarker fold changes, and pure-noise null cohorts). **`0` real clinical or `MetaboLights` (`MTBLS1` / human urine or serum) raw cohort datasets have been evaluated end-to-end yet**; external repository cohort benchmarking is tracked openly as follow-up **`F17`**.
+> All `T14.5` metabolomics and chemometrics benchmarks reported in this chapter are **synthetic forward-model self-consistency evaluations** constructed from multi-multiplet biofluid cohorts (28-metabolite BMRB chemical shift library, `3x` biological urine dilution factors, `±0.025 ppm` ionic-strength/pH peak drift, injected biomarker fold changes, and pure-noise null cohorts). **`0` real clinical or `MetaboLights` (`MTBLS1` / human urine or serum) raw cohort datasets have been evaluated end-to-end yet**; external repository cohort benchmarking is tracked openly as follow-up **`F17`**.
 
 > [!TIP] Interactive Tour & HD Video (SYNTHETIC & PROTOCOL SHOWCASE · `F17`/`F18` Open)
 > Launch **[Module 08: Metabolomics, STOCSY & MCP](tours/08_metabolomics_mcp.html)** (`60 fps` live `STOCSY` driver-bucket explorer + `1280×720` HD video; synthetic & protocol showcase), or browse **[All 8 Module Tours](tours/index.html)**.
@@ -115,7 +115,7 @@ Every `OPLS-DA` run produces three complementary feature-selection tables so cov
 
 ---
 
-## `STOCSY` Spin-System Connectivity & `CC0` BMRB Annotation
+## `STOCSY` Spin-System Connectivity & BMRB Annotation
 
 ### Statistical Total Correlation Spectroscopy (`Cloarec et al. 2005`)
 
@@ -127,9 +127,9 @@ Plotting covariance $c_j$ as trace height (preserving authentic NMR multiplet sh
 - **Intramolecular resonances on the same metabolite ($r_j^2 \ge 0.85$)**: Co-vary linearly in exact stoichiometric peak-area ratios across every subject (e.g., driving the `L-lactate` methyl doublet at `1.33 ppm` illuminates its `4.11 ppm` methine quartet at $r^2 > 0.90$).
 - **Intermolecular biochemical pathway correlations ($0.35 \le r_j^2 < 0.80$)**: Positive or negative covariance (`c_j < 0`) between co-regulated or substrate/product metabolites (e.g., glycolysis vs ketogenesis).
 
-### Built-In `CC0 1.0` BMRB Biofluid Reference Library
+### Built-In BMRB Biofluid Reference Library
 
-`match_metabolite_library_1h` cross-references top `OPLS-DA` biomarkers and high-$r^2$ `STOCSY` spin-system clusters (`|r| >= 0.80`) against an embedded **28-metabolite `CC0 1.0` BMRB aqueous (`D2O`, `pH 7.0–7.4`, `DSS`) reference table** (Ulrich et al. *Nucleic Acids Res.* 2008), including `L-Lactate`, `L-Alanine`, `L-Valine`, `L-Leucine`, `L-Isoleucine`, `Citrate`, `Succinate`, `Pyruvate`, `2-Oxoglutarate`, `Fumarate`, `Creatine`, `Creatinine`, `Trimethylamine N-oxide (TMAO)`, `Taurine`, `Glycine`, `Betaine`, `Choline`, `D-Glucose` ($\alpha$/$\beta$ anomers), `Acetoacetate`, `3-Hydroxybutyrate`, `Acetate`, `Formate`, `Hippurate`, `3-Indoxylsulfate`, `L-Glutamine`, `L-Glutamate`, `L-Histidine`, and `L-Phenylalanine`—reporting chemical shift delta (`ppm`), multiplicity expectation, and multi-peak spin-system hit fraction.
+`match_metabolite_library_1h` cross-references top `OPLS-DA` biomarkers and high-$r^2$ `STOCSY` spin-system clusters (`|r| >= 0.80`) against an embedded **28-metabolite BMRB aqueous (`D2O`, `pH 7.0–7.4`, `DSS`) reference table** (Ulrich et al. *Nucleic Acids Res.* 2008), including `L-Lactate`, `L-Alanine`, `L-Valine`, `L-Leucine`, `L-Isoleucine`, `Citrate`, `Succinate`, `Pyruvate`, `2-Oxoglutarate`, `Fumarate`, `Creatine`, `Creatinine`, `Trimethylamine N-oxide (TMAO)`, `Taurine`, `Glycine`, `Betaine`, `Choline`, `D-Glucose` ($\alpha$/$\beta$ anomers), `Acetoacetate`, `3-Hydroxybutyrate`, `Acetate`, `Formate`, `Hippurate`, `3-Indoxylsulfate`, `L-Glutamine`, `L-Glutamate`, `L-Histidine`, and `L-Phenylalanine`—reporting chemical shift delta (`ppm`), multiplicity expectation, and multi-peak spin-system hit fraction.
 
 ---
 
@@ -169,7 +169,7 @@ ferric metabolomics oplsda \
   --permutations 200 \
   --seed 42
 
-# 4. Driver-peak STOCSY connectivity + CC0 BMRB candidate annotation around 1.33 ppm
+# 4. Driver-peak STOCSY connectivity + BMRB candidate annotation around 1.33 ppm
 ferric metabolomics stocsy \
   --in cohort_buckets.csv \
   --driver-ppm 1.33 \
@@ -185,7 +185,7 @@ Switch to the **`🧪 Metabolomics`** tab in `ferric-gui` (or click **`🚀 Load
 1. **Top-Left — `PCA` Scores & Hotelling's $T^2$ Ellipse**: Group-colored `PC1` vs `PC2` scatter plot with interactive `95%` confidence ellipse and hoverable sample outlier diagnostics ($T^2_i$, $Q_i$).
 2. **Top-Right — `OPLS-DA` Predictive vs Orthogonal Scores ($t_p$ vs $t_{o1}$)**: Displays out-of-fold $Q^2$, $R^2 Y$, $R^2 X$, label-permutation $p_{\text{perm}}$ histogram, and an automatic overfitting guard banner whenever $Q^2 < 0.40$ or $p_{\text{perm}} > 0.05$.
 3. **Bottom-Left — Interactive Wiklund `S-Plot` / `BH-FDR` Volcano Toggle**: Click any biomarker point in the `S-plot` ($p(\text{cov})$ vs $p(\text{corr})$) or Volcano ($\log_2 \text{FC}$ vs $-\log_{10} q_{\text{BH}}$) to lock that chemical shift as the active **`STOCSY` driver peak**.
-4. **Bottom-Right — Live `STOCSY` Covariance Spectrum & `CC0` BMRB Tag Drawer**: Renders covariance $c(\delta)$ colored continuously from gray ($r^2 = 0$) through cyan/gold to crimson ($r^2 \to 1.0$), listing ranked `CC0 1.0` BMRB biofluid metabolite candidates matching the correlated multiplet cluster.
+4. **Bottom-Right — Live `STOCSY` Covariance Spectrum & BMRB Tag Drawer**: Renders covariance $c(\delta)$ colored continuously from gray ($r^2 = 0$) through cyan/gold to crimson ($r^2 \to 1.0$), listing ranked BMRB biofluid metabolite candidates matching the correlated multiplet cluster.
 
 ![Untargeted 1D metabolomics PCA, OPLS-DA S-plot and STOCSY showcase](../assets/06_metabolomics_oplsda_stocsy.svg)
 *Figure 8.1: Deterministic `ferric export-fig --panel metabolomics` 4-panel cohort showcase displaying `AI-Binning`/`PQN` `PCA` scores with `95%` Hotelling $T^2$ ellipse, leak-free `OPLS-DA` Wiklund `S-plot`, and `L-Lactate` `1.33 ppm` driver `STOCSY` covariance trace (synthetic forward-model showcase).*

@@ -4,8 +4,8 @@
 //!
 //! Provenance: Clean-room original implementation strictly from peer-reviewed NMR spectroscopy
 //! and numerical optimization literature:
-//! - Waudby, C. A., Ramos, A., Cabrita, L. D. & Christodoulou, J. (*PLOS ONE* 2016, 11,
-//!   e0163803 — Two-Dimensional NMR Lineshape Analysis of Protein–Ligand Interactions:
+//! - Waudby, C. A., Ramos, A., Cabrita, L. D. & Christodoulou, J. (*Sci. Rep.* 2016, 6,
+//!   24826, DOI: 10.1038/srep24826 — Two-Dimensional NMR Lineshape Analysis of Protein–Ligand Interactions:
 //!   coupled 2D Bloch–McConnell HSQC lineshape simulation and global fitting of `K_d`,
 //!   `k_off`, `Delta_omega_H`, and `Delta_omega_N`).
 //! - McConnell, H. M. (*J. Chem. Phys.* 1958, 28, 430–431 — coupled Bloch equations with

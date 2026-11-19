@@ -3144,8 +3144,8 @@ impl Default for Stack1dState {
             pending_send_to_metabolomics: false,
             phc0_deg: 0.0,
             phc1_deg: 0.0,
-            solvent_choice: "CDCl3".to_string(),
-            target_total_protons: 10.0,
+            solvent_choice: String::new(),
+            target_total_protons: 0.0,
             journal_style: PublicationStyle::Acs,
             detected_multiplets: Vec::new(),
             detected_multiplet_integrals: Vec::new(),
@@ -6752,10 +6752,16 @@ fn render_phase_baseline_inspector_tab(ui: &mut egui::Ui, state: &mut Stack1dSta
     ui.add_space(2.0);
     ui.horizontal_wrapped(|ui| {
         ui.strong("Solvent Ref:");
+        let solvent_display = if state.solvent_choice.trim().is_empty() {
+            "Unspecified"
+        } else {
+            state.solvent_choice.as_str()
+        };
         egui::ComboBox::from_id_salt("stack1d_solvent_combo")
-            .selected_text(&state.solvent_choice)
+            .selected_text(solvent_display)
             .width(105.0)
             .show_ui(ui, |ui| {
+                ui.selectable_value(&mut state.solvent_choice, String::new(), "Unspecified");
                 for s in ["CDCl3", "DMSO-d6", "D2O", "CD3OD", "Acetone-d6", "C6D6"] {
                     ui.selectable_value(&mut state.solvent_choice, s.to_string(), s);
                 }

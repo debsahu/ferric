@@ -14,7 +14,7 @@
 //! - Kroenke, C. D., Loria, J. P., Cavanagh, J., Rance, M. & Palmer, A. G. III (*J. Am. Chem.
 //!   Soc.* **1998**, 120, 7905–7915) — separation of $\mu\text{s–ms}$ chemical exchange
 //!   $R_{\text{ex}}$ from transverse auto-relaxation via $\kappa = R_2 / \eta_{xy}$.
-//! - Lee, D., Hilty, C., Wider, G. & Wüthrich, K. (*J. Biomol. NMR* **2006**, 35, 195–201) —
+//! - Lee, D., Hilty, C., Wider, G. & Wüthrich, K. (*J. Magn. Reson.* **2006**, 178, 72–76) —
 //!   `TRACT` (TROSY for rotational correlation times) $\alpha/\beta$ transverse decay difference
 //!   $R_\beta - R_\alpha = 2\eta_{xy}$ and exact cubic inversion for $R_{\text{ex}}$-free $\tau_m$.
 

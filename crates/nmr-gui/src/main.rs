@@ -16312,27 +16312,42 @@ impl NmrWorkbenchApp {
             }
         }
 
-        let hsqc_peaks_2d: Vec<nmr_gui::relax_panel::Peak2D> = self
+        // Strictly one-to-one greedy nearest-neighbor matching between HSQC peaks and assigned
+        // spin systems within (|ΔH| <= 0.05 ppm, |ΔN| <= 0.50 ppm) so two nearby HSQC peaks can
+        // never both map to the same residue or spill onto a neighbor's seq_id.
+        let hsqc_peaks: Vec<&Peak> = self
             .peaks
             .iter()
             .filter(|p| Self::normalize_exp_key(&p.exp) == "HSQC")
-            .filter_map(|p| {
-                let mut best: Option<(f64, i32, &str)> = None;
-                for &(sh, sn, seq_id, rname) in &assigned_roots {
-                    let dh = (p.h - sh).abs();
-                    let dn = (p.n - sn).abs();
-                    if dh <= 0.05 && dn <= 0.50 {
-                        let d2 = (dh / 0.03).powi(2) + (dn / 0.30).powi(2);
-                        if best.is_none_or(|(bd2, _, _)| d2 < bd2) {
-                            best = Some((d2, seq_id, rname));
-                        }
-                    }
-                }
-                best.map(|(_, seq_id, rname)| {
-                    nmr_gui::relax_panel::Peak2D::from_core_peak(p, Some(seq_id), Some(rname))
-                })
-            })
             .collect();
+        let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+        for (pi, p) in hsqc_peaks.iter().enumerate() {
+            for (ri, &(sh, sn, _, _)) in assigned_roots.iter().enumerate() {
+                let dh = (p.h - sh).abs();
+                let dn = (p.n - sn).abs();
+                if dh <= 0.05 && dn <= 0.50 {
+                    let d2 = (dh / 0.03).powi(2) + (dn / 0.30).powi(2);
+                    pairs.push((d2, pi, ri));
+                }
+            }
+        }
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut used_peaks = vec![false; hsqc_peaks.len()];
+        let mut used_seq_ids = std::collections::BTreeSet::new();
+        let mut hsqc_peaks_2d: Vec<nmr_gui::relax_panel::Peak2D> = Vec::new();
+        for (_, pi, ri) in pairs {
+            let (_, _, seq_id, rname) = assigned_roots[ri];
+            if used_peaks[pi] || !used_seq_ids.insert(seq_id) {
+                continue;
+            }
+            used_peaks[pi] = true;
+            hsqc_peaks_2d.push(nmr_gui::relax_panel::Peak2D::from_core_peak(
+                hsqc_peaks[pi],
+                Some(seq_id),
+                Some(rname),
+            ));
+        }
 
         let _ = self
             .relax_panel
@@ -16340,7 +16355,8 @@ impl NmrWorkbenchApp {
     }
 
     /// Pick 2D HSQC roots and then run real two-pass 3D triple-resonance peak picking across all
-    /// loaded 3D cubes, rebuilding `self.peaks` and `self.systems`.
+    /// loaded 3D cubes, rebuilding `self.peaks`, `self.systems`, `self.u_mat`/`self.p_mat`, and
+    /// invalidating stale `self.assign_res`.
     fn pick_all_2d_and_3d_spectra(&mut self, snr_threshold: f64) {
         self.picker_snr = snr_threshold as f32;
         if self.hsqc_spec.is_some() {
@@ -16371,16 +16387,68 @@ impl NmrWorkbenchApp {
             combined.extend(p3);
             self.peaks = combined;
             self.session.state.peaks = self.peaks.clone();
-            if let Ok(sys) = build_spin_systems(&self.peaks, &Tolerances::default(), 3, false) {
-                self.systems = sys;
-            }
+            self.assign_res = None;
+            self.relax_peaks_sync_key = (usize::MAX, usize::MAX, 0);
+            self.rebuild_systems_and_matrices();
             self.status_msg = format!(
                 "Picked {n_roots} 2D HSQC roots + {n_3d} 3D peaks across {n_cubes} cube(s) (SNR {snr_threshold:.1})"
             );
         } else {
+            self.assign_res = None;
+            self.relax_peaks_sync_key = (usize::MAX, usize::MAX, 0);
+            if !self.peaks.is_empty() {
+                self.rebuild_systems_and_matrices();
+            } else {
+                self.systems.clear();
+                self.u_mat = None;
+                self.p_mat = None;
+            }
             self.status_msg = format!(
                 "Picked {n_roots} 2D roots ({n_cubes} 3D cube(s) loaded; SNR {snr_threshold:.1})"
             );
+        }
+    }
+
+    /// Consume any queued `1D Suite` `Predict 1H / 13C` request:
+    /// - Empty SMILES (`"Use Octet (1H/13C)"`, blank-SMILES Predict, Overlay Pred): synthesizes
+    ///   directly from the current `self.octet_app` canvas scene without mutating it.
+    /// - Non-empty SMILES: runs pure fail-closed `predict_1d_from_smiles_standalone`, rejecting
+    ///   invalid SMILES cleanly without mutating `self.octet_app.scene`.
+    fn handle_pending_predict_1d_request(&mut self) {
+        let Some((smiles, is_13c)) = self.stack1d_panel.pending_predict_1d_request.take() else {
+            return;
+        };
+        let proton_mhz = self
+            .stack1d_panel
+            .traces
+            .get(self.stack1d_panel.ref_trace_idx)
+            .and_then(|tr| tr.raw_spec.as_ref())
+            .map(|a| {
+                let f = a.0.axis.obs_mhz;
+                if a.0.axis.label.eq_ignore_ascii_case("13C") && f > 0.0 {
+                    f / 0.251_45
+                } else {
+                    f
+                }
+            })
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .unwrap_or(600.0);
+
+        let pred_res = if smiles.trim().is_empty() {
+            self.octet_app
+                .predict_1d_from_current_scene(is_13c, proton_mhz)
+        } else {
+            octet_canvas::predict_1d_from_smiles_standalone(&smiles, is_13c, proton_mhz)
+        };
+        match pred_res {
+            Ok((spec1d, label)) => {
+                self.stack1d_panel
+                    .set_predicted_overlay(spec1d, label.clone());
+                self.status_msg = format!("{label} overlay updated in 1D Suite");
+            }
+            Err(err) => {
+                self.status_msg = format!("1D prediction failed: {err}");
+            }
         }
     }
 
@@ -16438,14 +16506,14 @@ impl NmrWorkbenchApp {
                 }
                 for p in &mut self.peaks {
                     if Self::normalize_exp_key(&p.exp) == from_key {
-                        p.exp = to_exp.clone();
+                        p.exp = to_key.clone();
                     }
                 }
                 self.session.state.peaks = self.peaks.clone();
                 for cube_arc in &mut self.cubes_3d {
                     if Self::normalize_exp_key(&cube_arc.exp) == from_key {
                         let mut cloned = (**cube_arc).clone();
-                        cloned.exp = to_exp.clone();
+                        cloned.exp = to_key.clone();
                         *cube_arc = Arc::new(cloned);
                     }
                 }
@@ -16463,7 +16531,12 @@ impl NmrWorkbenchApp {
                         self.hncacb_3d = Some((**cube_arc).clone());
                     }
                 }
-                self.status_msg = format!("Reassigned '{from_slot}' -> '{to_exp}'");
+                self.assign_res = None;
+                self.relax_peaks_sync_key = (usize::MAX, usize::MAX, 0);
+                if !self.peaks.is_empty() {
+                    self.rebuild_systems_and_matrices();
+                }
+                self.status_msg = format!("Reassigned '{from_slot}' -> '{to_exp}' ({to_key})");
             }
         }
     }
@@ -16742,34 +16815,8 @@ impl NmrWorkbenchApp {
                 .collect();
         }
 
-        // 5. 1D Suite `Predict 1H / 13C` quick request bridge (pure, fail-closed, never clobbers Octet scene)
-        if let Some((smiles, is_13c)) = self.stack1d_panel.pending_predict_1d_request.take() {
-            let proton_mhz = self
-                .stack1d_panel
-                .traces
-                .get(self.stack1d_panel.ref_trace_idx)
-                .and_then(|tr| tr.raw_spec.as_ref())
-                .map(|a| {
-                    let f = a.0.axis.obs_mhz;
-                    if a.0.axis.label.eq_ignore_ascii_case("13C") && f > 0.0 {
-                        f / 0.251_45
-                    } else {
-                        f
-                    }
-                })
-                .filter(|f| f.is_finite() && *f > 0.0)
-                .unwrap_or(600.0);
-            match octet_canvas::predict_1d_from_smiles_standalone(&smiles, is_13c, proton_mhz) {
-                Ok((spec1d, label)) => {
-                    self.stack1d_panel
-                        .set_predicted_overlay(spec1d, label.clone());
-                    self.status_msg = format!("{label} overlay updated in 1D Suite");
-                }
-                Err(err) => {
-                    self.status_msg = format!("1D prediction failed: {err}");
-                }
-            }
-        }
+        // 5. 1D Suite `Predict 1H / 13C` quick request bridge (uses current Octet scene when SMILES blank; fail-closed otherwise)
+        self.handle_pending_predict_1d_request();
 
         // 6. Metabolomics -> Octet SMILES bridge
         if let Some(smiles) = self.metabolomics_panel.pending_send_smiles_to_octet.take() {
@@ -20429,20 +20476,43 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         assert_eq!(NmrWorkbenchApp::normalize_exp_key("HN(CA)CO"), "HNCACO");
         assert_eq!(NmrWorkbenchApp::normalize_exp_key("15N-HSQC"), "HSQC");
 
-        // 2. Assign -> Relax sync uses real assign_res (never fabricates idx+1 when unassigned)
-        //    and invalidates fingerprint when assign_res changes (171.assign:P0-1).
+        // 2. Assign -> Relax sync uses real assign_res (never fabricates idx+1 when unassigned),
+        //    is strictly one-to-one (two nearby HSQC peaks near residue 42 never spill onto 43),
+        //    and invalidates fingerprint when assign_res changes (171.assign:P0-1 / P0-1b).
         app.sequence = vec!["MET".into(), "GLN".into(), "GLY".into()];
         app.seq_ids = vec![10, 11, 42];
-        app.peaks = vec![Peak {
-            exp: "HSQC".into(),
-            h: 8.32,
-            n: 112.4,
-            c: None,
-            sign: 1,
-            height: Some(1.0e5),
-            volume: None,
-            h2: None,
-        }];
+        app.peaks = vec![
+            Peak {
+                exp: "HSQC".into(),
+                h: 8.32,
+                n: 112.4,
+                c: None,
+                sign: 1,
+                height: Some(1.0e5),
+                volume: None,
+                h2: None,
+            },
+            Peak {
+                exp: "HSQC".into(),
+                h: 8.33,
+                n: 112.45,
+                c: None,
+                sign: 1,
+                height: Some(8.0e4),
+                volume: None,
+                h2: None,
+            },
+            Peak {
+                exp: "HNCO".into(),
+                h: 8.32,
+                n: 112.4,
+                c: Some(174.2),
+                sign: 1,
+                height: Some(5.0e4),
+                volume: None,
+                h2: None,
+            },
+        ];
         app.systems = vec![SpinSystem::new(8.32, 112.4)];
         app.assign_res = None;
         let fp_unassigned = app.assign_res_fingerprint();
@@ -20464,11 +20534,36 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             "assign_res_fingerprint must change when solver results update"
         );
         app.sync_assigned_hsqc_peaks_to_relax();
-        assert_eq!(app.relax_panel.synced_peak_seeds.len(), 1);
+        assert_eq!(
+            app.relax_panel.synced_peak_seeds.len(),
+            1,
+            "two nearby HSQC peaks within tolerance of residue 42 must match strictly one-to-one"
+        );
         assert_eq!(app.relax_panel.synced_peak_seeds[0].seq_id, 42);
         assert_eq!(app.relax_panel.synced_peak_seeds[0].res_name, "GLY");
+        assert!(
+            (app.relax_panel.synced_peak_seeds[0].delta_h_ppm - 8.32).abs() < 1e-6,
+            "closer HSQC peak (8.32 ppm) must win the one-to-one match"
+        );
 
-        // 3. Reassigning HNCO -> HN(CA)CO routes strictly to hncaco_3d, never hnco_3d (171.assign:P1-7).
+        // RelaxPanel::sync_assigned_hsqc_peaks must drop duplicates and unassigned peaks directly.
+        let dup_peaks = vec![
+            nmr_gui::relax_panel::Peak2D::from_core_peak(&app.peaks[0], Some(42), Some("GLY")),
+            nmr_gui::relax_panel::Peak2D::from_core_peak(&app.peaks[1], Some(42), Some("GLY")),
+            nmr_gui::relax_panel::Peak2D::from_core_peak(&app.peaks[1], None, None),
+        ];
+        let synced_cnt = app.relax_panel.sync_assigned_hsqc_peaks(&dup_peaks, "MQG");
+        assert_eq!(
+            synced_cnt, 1,
+            "duplicate seq_id and unassigned peaks must be dropped, never synthesized into 43/1"
+        );
+        assert!(app
+            .relax_panel
+            .status_banner
+            .contains("dropped 1 duplicate"));
+
+        // 3. Reassigning HNCO -> HN(CA)CO writes canonical "HNCACO" (accepted by core
+        //    ExpSignKey::from_peak) and routes strictly to hncaco_3d, never hnco_3d (171.assign:P1-7/P1-8).
         let dummy_axis_h = AxisPpm::from_bounds("1H", 4, 10.0, 6.0, 600.0);
         let dummy_axis_n = AxisPpm::from_bounds("15N", 4, 130.0, 105.0, 60.8);
         let dummy_axis_c = AxisPpm::from_bounds("13C", 4, 180.0, 168.0, 150.9);
@@ -20496,15 +20591,71 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             app.hncaco_3d.is_some(),
             "HN(CA)CO cube must route into dedicated hncaco_3d slot"
         );
+        assert_eq!(
+            app.cubes_3d[0].exp, "HNCACO",
+            "reassigned cube.exp must be canonical HNCACO for core solver"
+        );
+        assert!(
+            app.peaks.iter().any(|p| p.exp == "HNCACO"),
+            "reassigned peak.exp must be canonical HNCACO so core ExpSignKey retains intra-residue C'"
+        );
+        assert!(
+            app.assign_res.is_none(),
+            "reassigning experiment slots must invalidate stale assign_res"
+        );
 
-        // 4. Invalid SMILES in 1D Suite quick predict fails closed without clobbering Octet scene (171.octet:P1-3).
+        // 4. Pick All rebuilds systems & scoring matrices and invalidates stale assign_res (171.assign:P1-6b).
+        app.assign_res = Some(AssignResult {
+            position: vec![0],
+            confidence: vec![0.9],
+            score: 5.0,
+            run_scores: vec![5.0],
+        });
+        app.u_mat = None;
+        app.p_mat = None;
+        app.cubes_3d.clear();
+        app.pick_all_2d_and_3d_spectra(5.0);
+        assert!(
+            app.assign_res.is_none(),
+            "pick_all_2d_and_3d_spectra must invalidate stale assign_res"
+        );
+        assert!(
+            app.u_mat.is_some() && app.p_mat.is_some(),
+            "pick_all_2d_and_3d_spectra must rebuild scoring matrices u_mat and p_mat"
+        );
+
+        // 5. 1D Suite quick predict request bridge (171.octet:P1-4):
+        //    (a) Blank SMILES ("Use Octet (1H/13C)") succeeds using current Octet scene without clobbering it.
+        //    (b) Invalid SMILES fails closed without clobbering Octet scene.
         let scene_before = app.octet_app.scene.clone();
-        assert!(nmr_gui::octet_canvas::predict_1d_from_smiles_standalone(
-            "NOT_A_SMILES(((",
-            false,
-            600.0
-        )
-        .is_err());
+        let tab_before = app.octet_app.nmr_tab;
+        app.stack1d_panel.predicted_overlay_spectrum = None;
+        app.stack1d_panel.pending_predict_1d_request = Some((String::new(), false));
+        app.handle_pending_predict_1d_request();
+        assert!(
+            app.stack1d_panel.predicted_overlay_spectrum.is_some(),
+            "blank-SMILES 'Use Octet (1H)' bridge request must populate predicted overlay from current Octet scene"
+        );
         assert_eq!(app.octet_app.scene.atoms.len(), scene_before.atoms.len());
+        assert_eq!(app.octet_app.nmr_tab, tab_before);
+
+        app.stack1d_panel.pending_predict_1d_request = Some(("NOT_A_SMILES(((".to_string(), false));
+        app.handle_pending_predict_1d_request();
+        assert!(
+            app.status_msg.contains("1D prediction failed"),
+            "invalid SMILES must fail closed with an error status"
+        );
+        assert_eq!(app.octet_app.scene.atoms.len(), scene_before.atoms.len());
+
+        // 6. 1D Suite default Copy ACS omits unmeasured solvent & uncalibrated proton counts (171.octet:P1-5).
+        let default_1d = nmr_gui::stack1d_panel::Stack1dState::default();
+        assert!(
+            default_1d.solvent_choice.is_empty(),
+            "Stack1dState must not default to fabricated CDCl3 solvent"
+        );
+        assert_eq!(
+            default_1d.target_total_protons, 0.0,
+            "Stack1dState must not default to fabricated 10.0 total protons"
+        );
     }
 }

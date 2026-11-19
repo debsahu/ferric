@@ -14,17 +14,17 @@
 //! - McConnell, H. M. (*J. Chem. Phys.* 1958, 28, 430–431), Vallurupalli, P., Bouvignies, G. &
 //!   Kay, L. E. (*J. Am. Chem. Soc.* 2012, 134, 8148–8161), Fawzi, N. L. et al. (*Nature* 2011,
 //!   480, 268–272), and Higham, N. J. (*SIAM J. Matrix Anal. Appl.* 2005, 26, 1179–1193) — `CEST`/`DEST`.
-//! - Carneiro, M. G., Reddy, J. G., Griesinger, C. & Lee, D. (*J. Biomol. NMR* 2015, 62, 237–246 —
-//!   `DANTE-CEST` pulse-train Bloch–McConnell propagator).
-//! - Yuwen, T., Kay, L. E. & Bouvignies, G. (*J. Phys. Chem. Lett.* 2018, 9, 2501–2507 —
-//!   cosine-modulated `cos-CEST` dual-sideband saturation propagator).
+//! - Yuwen, T., Bouvignies, G. & Kay, L. E. (*ChemPhysChem* 2018, 19, 1707–1710,
+//!   DOI: 10.1002/cphc.201800249 — `DANTE-CEST` pulse-train Bloch–McConnell propagator).
+//! - Yuwen, T., Kay, L. E. & Bouvignies, G. (*J. Magn. Reson.* 2018, 292, 1–7,
+//!   DOI: 10.1016/j.jmr.2018.04.013 — cosine-modulated `cos-CEST` dual-sideband saturation propagator).
 //! - Luz, Z. & Meiboom, S. (*J. Chem. Phys.* 1963, 39, 366–370), Carver, J. P. & Richards, R. E.
 //!   (*J. Magn. Reson.* 1972, 6, 89–105), Baldwin, A. J. (*J. Magn. Reson.* 2014, 244, 114–124),
 //!   and Trott, O. & Palmer, A. G. III (*J. Magn. Reson.* 2002, 154, 157–160) — `CPMG` & `R1rho`.
 //! - Williamson, M. P. (*Prog. Nucl. Magn. Reson. Spectrosc.* 2013, 73, 1–16 — amide `CSP`,
 //!   iterative `2 sigma` threshold, exchange regimes, and quadratic tight-binding `K_d` isotherms).
-//! - Waudby, C. A., Ramos, A., Cabrita, L. D. & Christodoulou, J. (*PLOS ONE* 2016, 11, e0163803 —
-//!   coupled 2D Bloch–McConnell HSQC titration lineshape analysis) and Kuhn, H. W. (*Naval Res.
+//! - Waudby, C. A., Ramos, A., Cabrita, L. D. & Christodoulou, J. (*Sci. Rep.* 2016, 6, 24826,
+//!   DOI: 10.1038/srep24826 — coupled 2D Bloch–McConnell HSQC titration lineshape analysis) and Kuhn, H. W. (*Naval Res.
 //!   Logist. Quart.* 1955, 2, 83–97) / Munkres, J. (*J. Soc. Indust. Appl. Math.* 1957, 5, 32–38).
 
 use std::collections::BTreeMap;

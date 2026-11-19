@@ -6680,7 +6680,7 @@ fn builtin_prompt_descriptors() -> Vec<McpPromptDescriptor> {
         },
         McpPromptDescriptor {
             name: "analyze-metabolomics-cohort".to_string(),
-            description: "Guided untargeted 1D NMR biofluid metabolomics workflow covering solvent/urea masking, AI-Binning, PQN normalization, PCA outlier screening, leak-free OPLS-DA permutation validation, and STOCSY CC0 BMRB matching.".to_string(),
+            description: "Guided untargeted 1D NMR biofluid metabolomics workflow covering solvent/urea masking, AI-Binning, PQN normalization, PCA outlier screening, leak-free OPLS-DA permutation validation, and STOCSY BMRB matching.".to_string(),
             arguments: vec![
                 McpPromptArgument {
                     name: "workspace_path".to_string(),
@@ -6860,7 +6860,7 @@ fn build_spectroscopist_prompt(
                         1. Inspect '{ws}' with `inspect_nmr_directory` and run `run_metabolomics_chemometrics` on '{cohort}' with `mask_preset: '{biofluid}'`, `bucketing: 'adaptive-intelligent'` (De Meyer 2008 valley-seeking `AI-Binning`), `normalization: 'pqn'` (Dieterle 2006 Probabilistic Quotient Normalization), and `scaling: 'pareto'`.\n\
                         2. Screen unsupervised `PCA` scores against the 95% Hotelling $T^2$ ellipse and Jackson-Mudholkar $Q$-residual threshold before interpreting supervised models.\n\
                         3. Verify leak-free stratified $k$-fold `OPLS-DA` cross-validated $Q^2$ and Westerhuis (2008) label-permutation $p$-value (`is_validated == true`) so small-$N$/large-$P$ class separation is never overclaimed.\n\
-                        4. Cross-check top `VIP` / Wiklund `S-plot` / Benjamini-Hochberg `FDR` biomarkers with Cloarec (2005) `STOCSY` covarying intra-metabolite multiplets (`stocsy_driver_ppm`) matched against the CC0 `BMRB` biofluid reference library, noting matrix/pH shift caveats."
+                        4. Cross-check top `VIP` / Wiklund `S-plot` / Benjamini-Hochberg `FDR` biomarkers with Cloarec (2005) `STOCSY` covarying intra-metabolite multiplets (`stocsy_driver_ppm`) matched against the BMRB biofluid reference library, noting matrix/pH shift caveats."
                     )),
                 }],
             })
@@ -7451,7 +7451,7 @@ fn builtin_tool_descriptors() -> Vec<McpToolDescriptor> {
         },
         McpToolDescriptor {
             name: "run_metabolomics_chemometrics".to_string(),
-            description: "Run untargeted 1D NMR metabolomics chemometrics on a sandboxed cohort JSON or manifest TSV: AI-Binning, PQN normalization, Pareto PCA, leak-free OPLS-DA permutation validation, and STOCSY CC0 BMRB matching.".to_string(),
+            description: "Run untargeted 1D NMR metabolomics chemometrics on a sandboxed cohort JSON or manifest TSV: AI-Binning, PQN normalization, Pareto PCA, leak-free OPLS-DA permutation validation, and STOCSY BMRB matching.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

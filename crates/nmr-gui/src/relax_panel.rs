@@ -212,6 +212,8 @@ pub struct RelaxPanelState {
 
     /// Locked HSQC peak footprints synced from `Assign` mode for pseudo-3D plane integration.
     pub synced_peak_seeds: Vec<TargetPeakSeed>,
+    /// Synthetic pick IDs created by unassigned plane-0 auto-picking (never exported onto 3D PDB residues).
+    pub unassigned_pick_ids: std::collections::BTreeSet<i32>,
     pub t1_slot: Pseudo3dSlotState,
     pub t2_slot: Pseudo3dSlotState,
     pub hetnoe_slot: Pseudo3dSlotState,
@@ -270,6 +272,7 @@ impl RelaxPanelState {
             aux_field_rates: Vec::new(),
             modelfree_result: None,
             synced_peak_seeds: Vec::new(),
+            unassigned_pick_ids: std::collections::BTreeSet::new(),
             t1_slot: Pseudo3dSlotState::default(),
             t2_slot: Pseudo3dSlotState::default(),
             hetnoe_slot: Pseudo3dSlotState::default(),
@@ -316,20 +319,22 @@ impl RelaxPanelState {
         let seq_3letter = parse_sequence_3letter_tokens(sequence);
         let mut seeds = Vec::with_capacity(peaks.len());
         let mut used_ids = std::collections::BTreeSet::new();
-        let mut next_fallback_id = 1_i32;
+        let mut skipped_unassigned = 0usize;
+        let mut skipped_duplicates = 0usize;
 
         for peak in peaks {
             if !peak.h_ppm.is_finite() || !peak.n_ppm.is_finite() {
                 continue;
             }
             let parsed_label_id = peak.label.as_deref().and_then(extract_seq_id_from_label);
-            let mut seq_id = peak.seq_id.or(parsed_label_id).unwrap_or(next_fallback_id);
-            while used_ids.contains(&seq_id) {
-                seq_id = next_fallback_id;
-                next_fallback_id += 1;
+            let Some(seq_id) = peak.seq_id.or(parsed_label_id) else {
+                skipped_unassigned += 1;
+                continue;
+            };
+            if !used_ids.insert(seq_id) {
+                skipped_duplicates += 1;
+                continue;
             }
-            used_ids.insert(seq_id);
-            next_fallback_id = next_fallback_id.max(seq_id + 1);
 
             let res_name = peak
                 .res_name
@@ -358,9 +363,16 @@ impl RelaxPanelState {
 
         let n = seeds.len();
         self.synced_peak_seeds = seeds;
-        self.status_banner = format!(
-            "Synced {n} locked HSQC peak footprints from Assign mode for pseudo-3D integration."
-        );
+        self.unassigned_pick_ids.clear();
+        if skipped_duplicates > 0 || skipped_unassigned > 0 {
+            self.status_banner = format!(
+                "Synced {n} assigned HSQC peak footprints (dropped {skipped_duplicates} duplicate seq_id(s), {skipped_unassigned} unassigned peak(s))."
+            );
+        } else {
+            self.status_banner = format!(
+                "Synced {n} locked HSQC peak footprints from Assign mode for pseudo-3D integration."
+            );
+        }
         n
     }
 
@@ -476,10 +488,11 @@ impl RelaxPanelState {
             hetnoe_order,
         )?;
         let n_planes = raw.planes.len();
-        let warnings = raw.warnings.clone();
+        let mut warnings = raw.warnings.clone();
         let (planes, _recipe) = nmr_core::relax_io::process_pseudo3d_fids(&raw.planes, None)?;
 
         let seeds: Vec<TargetPeakSeed> = if !self.synced_peak_seeds.is_empty() {
+            self.unassigned_pick_ids.clear();
             self.synced_peak_seeds.clone()
         } else {
             let Some(ref_plane) = planes.first() else {
@@ -495,18 +508,24 @@ impl RelaxPanelState {
                         .to_string(),
                 );
             }
-            picked
-                .iter()
-                .enumerate()
-                .map(|(idx, pk)| TargetPeakSeed {
-                    seq_id: (idx as i32) + 1,
-                    res_name: "RES".to_string(),
+            warnings.push(format!(
+                "No assigned HSQC peaks synced: integrated {} unassigned plane-0 picks (blocked from 3D structure export until assigned).",
+                picked.len()
+            ));
+            let mut auto_seeds = Vec::with_capacity(picked.len());
+            for (idx, pk) in picked.iter().enumerate() {
+                let synthetic_id = (idx as i32) + 1;
+                self.unassigned_pick_ids.insert(synthetic_id);
+                auto_seeds.push(TargetPeakSeed {
+                    seq_id: synthetic_id,
+                    res_name: "PK".to_string(),
                     atom_h: "H".to_string(),
                     atom_x: "N".to_string(),
                     delta_h_ppm: pk.h,
                     delta_x_ppm: pk.n,
-                })
-                .collect()
+                });
+            }
+            auto_seeds
         };
 
         let ds = nmr_core::relax_io::integrate_relax_planes(
@@ -1385,14 +1404,22 @@ impl RelaxPanelState {
         let mut rex_by_seq_idx = BTreeMap::new();
         let mut rex_max = 1.0_f64;
 
-        for (pos, r) in mf.residues.iter().enumerate() {
-            let idx = id_to_idx.get(&r.seq_id).copied().unwrap_or(pos);
+        for r in &mf.residues {
+            if self.unassigned_pick_ids.contains(&r.seq_id) {
+                continue;
+            }
+            let Some(&idx) = id_to_idx.get(&r.seq_id) else {
+                continue;
+            };
             s2_by_seq_idx.insert(idx, r.params.s2.clamp(0.0, 1.0));
             let rex = r.params.rex_ref_s_inv.max(0.0);
             if rex > 1.0e-4 {
                 rex_by_seq_idx.insert(idx, rex);
                 rex_max = rex_max.max(rex);
             }
+        }
+        if s2_by_seq_idx.is_empty() && rex_by_seq_idx.is_empty() {
+            return None;
         }
 
         Some(RelaxPanelAction::ExportTo3dTrack {

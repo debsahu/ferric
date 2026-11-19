@@ -6,7 +6,7 @@
 //! spectral-density decomposition, and convex optimization literature (zero external GPL, AGPL,
 //! or proprietary/academic-licence software consulted; zero external product names in identifiers):
 //! - Smith, A. A., Ernst, M. & Meier, B. H. (*J. Chem. Phys.* **2018**, 148, 044110) and
-//!   Smith, A. A., Zumpfe, K. & Meier, B. H. (*J. Chem. Phys.* **2019**, 151, 034102) —
+//!   Smith, A. A., Ernst, M., Meier, B. H. & Ferrage, F. (*J. Chem. Phys.* **2019**, 151, 034102) —
 //!   linear optimal-window model-free timescale dynamics detectors $\rho_n(\tau)$ from SVD of
 //!   the relaxation sensitivity matrix $R_i(\tau)$, localized non-negative unit-peak windows,
 //!   analytical error propagation, and back-calculated relaxation residuals.
@@ -494,7 +494,7 @@ pub fn experiments_and_observations_from_rates(
 
 // ============================================================================
 // T22.3 — Linear Optimal-Window Model-Free Timescale Dynamics Detectors
-// (Smith, Ernst & Meier 2018; Smith, Zumpfe & Meier 2019)
+// (Smith, Ernst & Meier 2018; Smith, Ernst, Meier & Ferrage 2019)
 // ============================================================================
 
 /// Configuration for linear optimal-window [`build_dynamics_detectors`].
@@ -805,7 +805,7 @@ impl DetectorDesign {
 
 /// Construct a bank of $K$ maximally localized, non-negative, unit-peak linear dynamics detectors
 /// $\rho_n(\tau)$ from an arbitrary set of multi-field $^{15}\text{N}$ relaxation experiments
-/// (Smith, Ernst & Meier 2018; Smith, Zumpfe & Meier 2019).
+/// (Smith, Ernst & Meier 2018; Smith, Ernst, Meier & Ferrage 2019).
 pub fn build_dynamics_detectors(
     experiments: &[RelaxExperiment],
     cfg: &DetectorConfig,

@@ -5074,6 +5074,95 @@ pub fn predict_1d_from_smiles_standalone(
     Ok((spec, label))
 }
 
+impl OctetDrawPanel {
+    /// Synthesize a high-resolution predicted `1H` or `13C` [`nmr_core::nmr1d::Spectrum1D`]
+    /// directly from the currently drawn Octet canvas molecule without mutating `self.scene` or
+    /// `self.nmr_tab`. Used by the 1D Suite `"Use Octet (1H/13C)"` and blank-SMILES overlay bridge.
+    pub fn predict_1d_from_current_scene(
+        &self,
+        is_13c: bool,
+        proton_mhz: f64,
+    ) -> Result<(nmr_core::nmr1d::Spectrum1D, String), String> {
+        if !proton_mhz.is_finite() || proton_mhz <= 0.0 {
+            return Err(
+                "Spectrometer proton frequency (MHz) must be finite and positive".to_string(),
+            );
+        }
+        let signals = if is_13c {
+            &self.cached_13c
+        } else {
+            &self.cached_1h
+        };
+        if signals.is_empty() {
+            return Err(format!(
+                "No {} NMR signals predicted for the current Octet canvas structure",
+                if is_13c { "13C" } else { "1H" }
+            ));
+        }
+
+        let (nuc_str, obs_mhz, ppm_lo, ppm_hi, kind) = if is_13c {
+            (
+                "13C",
+                c13_frequency_mhz(proton_mhz),
+                0.0_f64,
+                220.0_f64,
+                nmr_core::nmr1d::Experiment1DKind::Carbon13Decoupled,
+            )
+        } else {
+            (
+                "1H",
+                proton_mhz,
+                -0.5_f64,
+                11.5_f64,
+                nmr_core::nmr1d::Experiment1DKind::Proton1D,
+            )
+        };
+
+        let n_pts = 8192_usize;
+        let span = (ppm_hi - ppm_lo).max(1.0);
+        let lw_hz = if is_13c { 2.5 } else { 1.4 };
+        let gamma = (0.5 * lw_hz / obs_mhz.max(10.0)).max(span / (n_pts as f64) * 2.5);
+
+        let mut sublines: Vec<(f64, f64)> = Vec::new();
+        for sig in signals {
+            if !sig.ppm.is_finite() {
+                continue;
+            }
+            let area = sig.integral.max(1.0);
+            if is_13c {
+                sublines.push((sig.ppm, area));
+            } else {
+                let unique_js = deduplicate_couplings_hz(&sig.couplings_hz);
+                for (dhz, amp) in expand_multiplet_lines_hz(&sig.multiplicity, &unique_js) {
+                    sublines.push((sig.ppm + dhz / obs_mhz, amp * area));
+                }
+            }
+        }
+        if sublines.is_empty() {
+            return Err("Current Octet structure has no finite predicted signals".to_string());
+        }
+
+        let mut data = vec![0.0_f64; n_pts];
+        for (i, slot) in data.iter_mut().enumerate() {
+            let x = ppm_hi - (i as f64 / (n_pts - 1) as f64) * span;
+            let mut y = 0.0_f64;
+            for &(center, amp) in &sublines {
+                let d = (x - center) / gamma;
+                if d.abs() < 40.0 {
+                    y += amp / (1.0 + d * d);
+                }
+            }
+            *slot = y;
+        }
+
+        let label = format!("Predicted {nuc_str} (Octet, {:.0} MHz)", obs_mhz);
+        let axis =
+            nmr_core::spectrum::AxisPpm::from_bounds(nuc_str, n_pts, ppm_hi, ppm_lo, obs_mhz);
+        let spec = nmr_core::nmr1d::Spectrum1D::new(label.clone(), kind, axis, data, None);
+        Ok((spec, label))
+    }
+}
+
 /// Sanitize predicted [`SpectrumSignal1D`] items returned by a backend adapter:
 /// - Filter out non-finite chemical shifts
 /// - Deduplicate repeated scalar `J`-couplings (`[7.0, 7.0, 7.0]` -> `[7.0]`)
