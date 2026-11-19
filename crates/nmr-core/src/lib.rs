@@ -51,6 +51,7 @@ pub mod nmr1d;
 pub mod nmrstar;
 pub mod noesy;
 pub mod octet_analyt;
+pub mod octet_assign;
 pub mod octet_mol;
 pub mod octet_render;
 pub mod ops;
