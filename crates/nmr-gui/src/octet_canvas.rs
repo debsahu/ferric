@@ -15,6 +15,11 @@ use eframe::egui;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::f64::consts::PI;
 
+use nmr_core::octet_assign::{
+    auto_assign_1d_to_structure_with_locks, extract_experimental_peaks_from_spectrum,
+    format_acs_with_atom_labels, is_carbon_nucleus, predicted_groups_from_signals,
+    swap_or_lock_assignment, AutoAssign1DResult,
+};
 use nmr_core::octet_render::{
     build_peptide_scene, chair_sprout_vectors, compile_scene_primitives, expand_multiplet_lines_hz,
     flatten_path_commands, fuse_polygon_on_bond, implicit_hydrogens, parse_peptide_sequence,
@@ -363,11 +368,33 @@ pub struct OctetDrawPanel {
     pub total_molecules: usize,
     /// Last rendered interactive canvas `Rect` (for viewport layout verification).
     pub last_canvas_rect: Option<egui::Rect>,
+    /// Last rendered left vertical vector icon rail `Rect`.
+    pub last_tool_rail_rect: Option<egui::Rect>,
+    /// Hit rects for the 16 geometric vector tool buttons on the left rail.
+    pub last_tool_slot_rects: Vec<(DrawTool, egui::Rect)>,
+    /// Hit rects for the connected `[1H NMR, 13C{1H} NMR]` folder tabs.
+    pub last_nmr_tab_rects: [Option<egui::Rect>; 2],
     secondary_drag_accum: f32,
     pub cached_props: MolecularPropertiesSummary,
     pub cached_stoich: Vec<StoichiometryRow>,
     pub cached_1h: Vec<SpectrumSignal1D>,
     pub cached_13c: Vec<SpectrumSignal1D>,
+    /// Pending predicted 1D spectrum queued by `Send to 1D Suite` for `main.rs` to consume.
+    pub pending_send_to_1d: Option<SceneSpectrum1D>,
+    /// Collected experimental 1D spectra (`1H` / `13C`) available for overlay, mirror, and auto-assign.
+    pub experimental_spectra: Vec<SceneSpectrum1D>,
+    /// Active index into `experimental_spectra` (`None` = predicted only).
+    pub selected_experimental_idx: Option<usize>,
+    /// When true, mirror experimental trace inverted below midline; when false, overlay upward.
+    pub mirror_experimental: bool,
+    /// Latest experimental-to-structure 1D Hungarian auto-assignment result.
+    pub auto_assign_result: Option<AutoAssign1DResult>,
+    /// Currently hovered atom index (synchronized between 2D canvas and 1D NMR inspector).
+    pub hovered_atom_idx: Option<usize>,
+    /// Currently hovered experimental peak index in the 1D NMR inspector.
+    pub hovered_peak_idx: Option<usize>,
+    /// Pending source predicted group index during click-to-swap manual override.
+    swap_source_group: Option<usize>,
     scene_dirty: bool,
 
     /// Status message displayed in the studio footer/header.
@@ -432,11 +459,22 @@ impl OctetDrawPanel {
             active_molecule_index: 0,
             total_molecules: 0,
             last_canvas_rect: None,
+            last_tool_rail_rect: None,
+            last_tool_slot_rects: Vec::new(),
+            last_nmr_tab_rects: [None, None],
             secondary_drag_accum: 0.0,
             cached_props: MolecularPropertiesSummary::default(),
             cached_stoich: Vec::new(),
             cached_1h: Vec::new(),
             cached_13c: Vec::new(),
+            pending_send_to_1d: None,
+            experimental_spectra: Vec::new(),
+            selected_experimental_idx: None,
+            mirror_experimental: false,
+            auto_assign_result: None,
+            hovered_atom_idx: None,
+            hovered_peak_idx: None,
+            swap_source_group: None,
             scene_dirty: true,
             status_msg: "Octet Chemical Studio ready - click/drag to draw bonds, right-click for canvas menu, V to select, 1/2/3/W/H for bond styles.".to_string(),
             backend: None,
@@ -943,15 +981,17 @@ impl OctetDrawPanel {
         self.status_msg = format!("Generated SMILES: {smi}");
     }
 
-    /// Embed the live predicted 1D NMR spectrum (`¹H` or `¹³C`) directly onto the drawing canvas
-    /// so SVG, PDF 1.4, and PNG exports include the publication 1D NMR plot underneath the structure!
-    pub fn embed_1d_spectrum_on_canvas(&mut self) {
-        self.recompute_live_analytics();
-        self.push_undo();
+    /// Construct a [`SceneSpectrum1D`] snapshot of the active live predicted spectrum (`1H` or `13C`).
+    pub fn build_active_scene_spectrum_1d(&self) -> SceneSpectrum1D {
         let min_y = self.scene.atoms.iter().map(|a| a.y).fold(0.0_f64, f64::min);
         let cx = self.scene.atom_centroid()[0];
+        let formula = if self.cached_props.formula_hill.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", self.cached_props.formula_hill)
+        };
 
-        let spec_plot = match self.nmr_tab {
+        match self.nmr_tab {
             NmrViewTab::Proton1H => SceneSpectrum1D {
                 origin: [cx - 5.0, min_y - 4.8],
                 width_mol: 10.0,
@@ -964,7 +1004,7 @@ impl OctetDrawPanel {
                 show_integrals: true,
                 show_peak_labels: true,
                 title: Some(format!(
-                    "Predicted 1H NMR ({:.0} MHz)",
+                    "Predicted 1H NMR{formula} ({:.0} MHz)",
                     self.spectrometer_mhz
                 )),
                 signals: self.cached_1h.clone(),
@@ -982,19 +1022,127 @@ impl OctetDrawPanel {
                 show_integrals: false,
                 show_peak_labels: true,
                 title: Some(format!(
-                    "Predicted 13C{{1H}} NMR ({:.0} MHz)",
+                    "Predicted 13C{{1H}} NMR{formula} ({:.0} MHz)",
                     self.spectrometer_mhz * 0.251_45
                 )),
                 signals: self.cached_13c.clone(),
                 custom_trace: Vec::new(),
             },
-        };
+        }
+    }
+
+    /// Embed the live predicted 1D NMR spectrum (`1H` or `13C`) directly onto the drawing canvas
+    /// so SVG, PDF 1.4, and PNG exports include the publication 1D NMR plot underneath the structure!
+    pub fn embed_1d_spectrum_on_canvas(&mut self) {
+        self.recompute_live_analytics();
+        self.push_undo();
+        let spec_plot = self.build_active_scene_spectrum_1d();
         self.scene
             .spectra_1d
             .retain(|s| s.nucleus != spec_plot.nucleus);
         self.scene.spectra_1d.push(spec_plot);
         self.fit_camera_to_scene();
         self.status_msg = "Embedded 1D NMR spectrum plot onto publication canvas".to_string();
+    }
+
+    /// Queue the active predicted 1D NMR spectrum for the main 1D Processing Suite (`main.rs` consumes `pending_send_to_1d`).
+    pub fn send_active_1d_to_suite(&mut self) {
+        self.recompute_live_analytics();
+        let spec = self.build_active_scene_spectrum_1d();
+        let nuc = spec.nucleus.clone();
+        self.pending_send_to_1d = Some(spec);
+        self.status_msg = format!("Queued predicted {nuc} spectrum for 1D Suite");
+    }
+
+    /// Run optimal Kuhn-Munkres (Hungarian) 1D experimental-to-structure auto-assignment
+    /// between the currently selected experimental spectrum and the active molecule's predicted signals.
+    pub fn run_auto_assign_1d(&mut self) {
+        let Some(exp_idx) = self.selected_experimental_idx else {
+            self.status_msg = "Select an experimental 1D spectrum first".to_string();
+            return;
+        };
+        let Some(exp_spec) = self.experimental_spectra.get(exp_idx).cloned() else {
+            self.selected_experimental_idx = None;
+            self.status_msg =
+                "Selected experimental 1D spectrum is no longer available".to_string();
+            return;
+        };
+
+        let exp_is_c13 = is_carbon_nucleus(&exp_spec.nucleus);
+        self.nmr_tab = if exp_is_c13 {
+            NmrViewTab::Carbon13C
+        } else {
+            NmrViewTab::Proton1H
+        };
+        if self.scene_dirty {
+            self.recompute_live_analytics();
+        }
+
+        let (nucleus, freq_mhz, pred_signals) = match self.nmr_tab {
+            NmrViewTab::Proton1H => ("1H", self.spectrometer_mhz, &self.cached_1h),
+            NmrViewTab::Carbon13C => ("13C", self.spectrometer_mhz * 0.251_45, &self.cached_13c),
+        };
+        let pred_groups = predicted_groups_from_signals(pred_signals, nucleus);
+        let exp_peaks = extract_experimental_peaks_from_spectrum(&exp_spec);
+
+        let locks: Vec<(usize, usize)> = self
+            .auto_assign_result
+            .as_ref()
+            .filter(|prev| {
+                prev.nucleus == nucleus
+                    && prev.predicted_groups.len() == pred_groups.len()
+                    && prev.experimental_peaks.len() == exp_peaks.len()
+            })
+            .map(|prev| prev.locked_pairs())
+            .unwrap_or_default();
+
+        let res = auto_assign_1d_to_structure_with_locks(
+            &pred_groups,
+            &exp_peaks,
+            nucleus,
+            if exp_spec.spectrometer_mhz > 0.0 {
+                exp_spec.spectrometer_mhz
+            } else {
+                freq_mhz
+            },
+            "CDCl3",
+            &locks,
+        );
+        self.status_msg = format!(
+            "Auto-assigned {}/{} {} groups (RMSD {:.2} ppm, Conf {:.0}%)",
+            res.matched_count,
+            res.assignments.len(),
+            res.nucleus,
+            res.rmsd_ppm,
+            res.mean_confidence * 100.0
+        );
+        self.swap_source_group = None;
+        self.auto_assign_result = Some(res);
+    }
+
+    /// Manually swap, assign, or lock/unlock an experimental peak on `self.auto_assign_result`.
+    pub fn swap_or_lock_nmr_assignment(
+        &mut self,
+        group_idx: usize,
+        target_peak_idx: Option<usize>,
+        lock: bool,
+    ) {
+        let Some(res) = self.auto_assign_result.as_mut() else {
+            return;
+        };
+        match swap_or_lock_assignment(res, group_idx, target_peak_idx, lock) {
+            Ok(()) => {
+                self.status_msg = format!(
+                    "Updated assignment (matched {}/{}, RMSD {:.2} ppm)",
+                    res.matched_count,
+                    res.assignments.len(),
+                    res.rmsd_ppm
+                );
+            }
+            Err(e) => {
+                self.status_msg = format!("Assignment override error: {e}");
+            }
+        }
     }
 
     // ========================================================================
@@ -1164,6 +1312,15 @@ impl OctetDrawPanel {
 
         match imported {
             Ok(sc) => {
+                if self.selected_io_format == IoFormat::JcampDx {
+                    if let Some(last_spec) = sc.spectra_1d.last().cloned() {
+                        self.experimental_spectra.push(last_spec);
+                        self.selected_experimental_idx =
+                            Some(self.experimental_spectra.len().saturating_sub(1));
+                        self.show_bottom_nmr_panel = true;
+                        self.auto_assign_result = None;
+                    }
+                }
                 self.set_scene(sc);
                 self.status_msg = format!("Imported {}", self.selected_io_format.label());
             }
@@ -1206,6 +1363,15 @@ impl OctetDrawPanel {
             });
         });
 
+        if self.show_bottom_nmr_panel {
+            egui::Panel::bottom("octet_bottom_nmr_inspector")
+                .default_size(220.0)
+                .min_size(180.0)
+                .show(ui, |ui| {
+                    self.draw_bottom_nmr_inspector(ui);
+                });
+        }
+
         if self.show_right_drawer {
             egui::Panel::right("octet_right_props_drawer")
                 .default_size(225.0)
@@ -1216,14 +1382,31 @@ impl OctetDrawPanel {
                 });
         }
 
-        if self.show_bottom_nmr_panel {
-            egui::Panel::bottom("octet_bottom_nmr_inspector")
-                .default_size(165.0)
-                .min_size(135.0)
-                .show(ui, |ui| {
-                    self.draw_bottom_nmr_inspector(ui);
-                });
-        }
+        let dark_mode = ui.visuals().dark_mode;
+        let rail_bg = if dark_mode {
+            egui::Color32::from_rgb(20, 27, 40)
+        } else {
+            egui::Color32::from_rgb(244, 247, 251)
+        };
+        let rail_border = if dark_mode {
+            egui::Color32::from_rgb(51, 65, 85)
+        } else {
+            egui::Color32::from_rgb(203, 213, 225)
+        };
+        egui::Panel::left("octet_left_tool_rail")
+            .default_size(40.0)
+            .min_size(40.0)
+            .max_size(42.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(rail_bg)
+                    .stroke(egui::Stroke::new(1.0, rail_border))
+                    .inner_margin(egui::Margin::ZERO),
+            )
+            .show(ui, |ui| {
+                self.draw_left_vector_tool_rail(ui);
+            });
 
         egui::CentralPanel::default().show(ui, |ui| {
             self.draw_interactive_canvas(ui);
@@ -1231,8 +1414,9 @@ impl OctetDrawPanel {
     }
 
     fn draw_top_workflow_bar(&mut self, ui: &mut egui::Ui) {
-        // <= 6 primary toolbar controls (Undo/Redo/Clear live in Advanced & right-click menu):
-        // Clean 2D, Tool, Active Molecule, Inspector, 1D NMR, Import/Export
+        // <= 5 primary toolbar controls (drawing tools live in the ChemDraw-style left vector icon rail;
+        // Undo/Redo/Clear/Extras live in Advanced Tools & Templates and right-click context menu):
+        // Clean 2D, Active Molecule, Inspector, 1D NMR, Import/Export
         ui.horizontal_wrapped(|ui| {
             if ui
                 .button(egui::RichText::new("Clean 2D").size(12.5))
@@ -1243,97 +1427,6 @@ impl OctetDrawPanel {
             }
 
             ui.separator();
-
-            ui.label(egui::RichText::new("Tool:").size(12.5));
-            let cur_tool_lbl = self.active_tool.short_label();
-            egui::ComboBox::from_id_salt("octet_primary_tool_combo")
-                .selected_text(egui::RichText::new(cur_tool_lbl).size(12.5))
-                .show_ui(ui, |ui| {
-                    let primary_tools = [
-                        ("Select (V)", DrawTool::SelectBox),
-                        ("Lasso", DrawTool::Lasso),
-                        ("Pan", DrawTool::Pan),
-                        ("Eraser", DrawTool::Eraser),
-                        (
-                            "Single Bond (1)",
-                            DrawTool::Bond {
-                                order: BondOrder::Single,
-                                stereo: BondStereo::None,
-                            },
-                        ),
-                        (
-                            "Double Bond (2)",
-                            DrawTool::Bond {
-                                order: BondOrder::Double,
-                                stereo: BondStereo::None,
-                            },
-                        ),
-                        (
-                            "Triple Bond (3)",
-                            DrawTool::Bond {
-                                order: BondOrder::Triple,
-                                stereo: BondStereo::None,
-                            },
-                        ),
-                        (
-                            "Up Wedge (W)",
-                            DrawTool::Bond {
-                                order: BondOrder::Single,
-                                stereo: BondStereo::UpWedge,
-                            },
-                        ),
-                        (
-                            "Down Hash (H)",
-                            DrawTool::Bond {
-                                order: BondOrder::Single,
-                                stereo: BondStereo::DownHash,
-                            },
-                        ),
-                        ("Chain 120 deg", DrawTool::Chain),
-                        (
-                            "Benzene Ring",
-                            DrawTool::RingStamp {
-                                template_id: "benzene".to_string(),
-                            },
-                        ),
-                        (
-                            "6-Ring",
-                            DrawTool::RingStamp {
-                                template_id: "cyclohexane".to_string(),
-                            },
-                        ),
-                        (
-                            "5-Ring",
-                            DrawTool::RingStamp {
-                                template_id: "cyclopentane".to_string(),
-                            },
-                        ),
-                        (
-                            "Reaction Arrow",
-                            DrawTool::ReactionArrow {
-                                kind: ArrowKind::Solid,
-                            },
-                        ),
-                        (
-                            "Curved Arrow (2e-)",
-                            DrawTool::CurvedArrow {
-                                kind: PushingArrowKind::FullTwoElectron,
-                            },
-                        ),
-                        ("Text Label", DrawTool::TextLabel),
-                    ];
-                    for (lbl, target) in primary_tools {
-                        if ui
-                            .selectable_label(
-                                self.active_tool == target,
-                                egui::RichText::new(lbl).size(12.5),
-                            )
-                            .clicked()
-                        {
-                            self.active_tool = target;
-                        }
-                    }
-                });
 
             let n_mols = self.total_molecules.max(1);
             let cur_mol_idx = self.active_molecule_index.min(n_mols - 1);
@@ -1383,6 +1476,148 @@ impl OctetDrawPanel {
                 self.show_io_modal = !self.show_io_modal;
             }
         });
+    }
+
+    /// ChemDraw-style left vertical vector icon rail (~40 px wide, 16 tools, pure `egui::Painter`
+    /// geometric vector icons, zero emojis, single composite interactive widget).
+    fn draw_left_vector_tool_rail(&mut self, ui: &mut egui::Ui) {
+        let specs = rail_tool_specs();
+        let avail = ui.available_size();
+        let rail_w = avail.x.clamp(38.0, 42.0);
+        let n_tools = specs.len() as f32;
+        let n_dividers = 3.0_f32;
+        let divider_gap = 7.0_f32;
+        let pad_top = 4.0_f32;
+        let pad_bot = 4.0_f32;
+        let btn_h =
+            ((avail.y - pad_top - pad_bot - n_dividers * divider_gap) / n_tools).clamp(22.0, 32.0);
+        let total_h = (pad_top + pad_bot + n_tools * btn_h + n_dividers * divider_gap)
+            .min(avail.y.max(200.0));
+
+        let (rail_rect, response) =
+            ui.allocate_exact_size(egui::vec2(rail_w, total_h), egui::Sense::click());
+        self.last_tool_rail_rect = Some(rail_rect);
+        self.last_tool_slot_rects.clear();
+
+        let painter = ui.painter_at(rail_rect);
+        let dark = ui.visuals().dark_mode;
+
+        let active_bg = if dark {
+            egui::Color32::from_rgb(30, 58, 138)
+        } else {
+            egui::Color32::from_rgb(219, 234, 254)
+        };
+        let active_border = if dark {
+            egui::Color32::from_rgb(96, 165, 250)
+        } else {
+            egui::Color32::from_rgb(37, 99, 235)
+        };
+        let active_fg = if dark {
+            egui::Color32::from_rgb(224, 242, 254)
+        } else {
+            egui::Color32::from_rgb(29, 78, 216)
+        };
+        let hover_bg = if dark {
+            egui::Color32::from_rgb(41, 53, 72)
+        } else {
+            egui::Color32::from_rgb(226, 232, 240)
+        };
+        let hover_border = if dark {
+            egui::Color32::from_rgb(100, 116, 139)
+        } else {
+            egui::Color32::from_rgb(148, 163, 184)
+        };
+        let idle_fg = if dark {
+            egui::Color32::from_rgb(226, 232, 240)
+        } else {
+            egui::Color32::from_rgb(30, 41, 59)
+        };
+        let divider_col = if dark {
+            egui::Color32::from_rgb(51, 65, 85)
+        } else {
+            egui::Color32::from_rgb(203, 213, 225)
+        };
+
+        let hover_pos = response.hover_pos();
+        let click_pos = response
+            .clicked()
+            .then(|| response.interact_pointer_pos())
+            .flatten();
+        let mut hovered_spec: Option<usize> = None;
+
+        let mut y = rail_rect.top() + pad_top;
+        for (idx, spec) in specs.iter().enumerate() {
+            // Insert subtle group dividers after Eraser (4), Chain (10), and Cyclopentane (13)
+            if idx == 4 || idx == 10 || idx == 13 {
+                let div_y = y + 0.5 * divider_gap;
+                painter.line_segment(
+                    [
+                        egui::pos2(rail_rect.left() + 6.0, div_y),
+                        egui::pos2(rail_rect.right() - 6.0, div_y),
+                    ],
+                    egui::Stroke::new(1.0, divider_col),
+                );
+                y += divider_gap;
+            }
+
+            let slot_rect = egui::Rect::from_min_size(
+                egui::pos2(rail_rect.left() + 4.0, y + 1.0),
+                egui::vec2((rail_rect.width() - 8.0).max(24.0), (btn_h - 2.0).max(18.0)),
+            );
+            y += btn_h;
+
+            self.last_tool_slot_rects
+                .push((spec.tool.clone(), slot_rect));
+
+            let is_active = self.active_tool == spec.tool;
+            let is_hovered = hover_pos.is_some_and(|hp| slot_rect.contains(hp));
+            if is_hovered {
+                hovered_spec = Some(idx);
+            }
+            if let Some(cp) = click_pos {
+                if slot_rect.contains(cp) {
+                    self.active_tool = spec.tool.clone();
+                    self.status_msg = format!("Tool: {} [{}]", spec.name, spec.shortcut);
+                }
+            }
+
+            if is_active {
+                painter.rect_filled(slot_rect, 4.0, active_bg);
+                painter.rect_stroke(
+                    slot_rect,
+                    4.0,
+                    egui::Stroke::new(1.5, active_border),
+                    egui::StrokeKind::Inside,
+                );
+            } else if is_hovered {
+                painter.rect_filled(slot_rect, 4.0, hover_bg);
+                painter.rect_stroke(
+                    slot_rect,
+                    4.0,
+                    egui::Stroke::new(1.0, hover_border),
+                    egui::StrokeKind::Inside,
+                );
+            }
+
+            let icon_fg = if is_active { active_fg } else { idle_fg };
+            let icon_side = slot_rect.width().min(slot_rect.height()) * 0.72;
+            let icon_rect =
+                egui::Rect::from_center_size(slot_rect.center(), egui::vec2(icon_side, icon_side));
+            paint_rail_tool_icon(&painter, icon_rect, spec.icon, icon_fg);
+        }
+
+        if let Some(h_idx) = hovered_spec {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            let spec = &specs[h_idx];
+            response.on_hover_ui_at_pointer(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} ({})", spec.name, spec.shortcut))
+                        .size(12.0)
+                        .strong(),
+                );
+                ui.label(egui::RichText::new(spec.hint).size(11.0).weak());
+            });
+        }
     }
 
     fn molecule_display_label(&self, idx: usize) -> String {
@@ -2015,6 +2250,20 @@ impl OctetDrawPanel {
                         stereo: BondStereo::DownHash,
                     };
                 }
+            } else if i.key_pressed(egui::Key::Escape) {
+                self.swap_source_group = None;
+            } else if !atom_targeted && i.key_pressed(egui::Key::L) {
+                self.active_tool = DrawTool::Lasso;
+            } else if !atom_targeted && i.key_pressed(egui::Key::T) {
+                self.active_tool = DrawTool::TextLabel;
+            } else if !atom_targeted && i.key_pressed(egui::Key::Num5) {
+                self.active_tool = DrawTool::RingStamp {
+                    template_id: "cyclopentane".to_string(),
+                };
+            } else if !atom_targeted && i.key_pressed(egui::Key::Num6) {
+                self.active_tool = DrawTool::RingStamp {
+                    template_id: "cyclohexane".to_string(),
+                };
             } else if atom_targeted {
                 // ChemDraw Atom Hotkeys on hovered / selected atom (`C, N, O, S, P, F, I, B, K, H`)!
                 for (key, sym) in [
@@ -2090,8 +2339,21 @@ impl OctetDrawPanel {
         if let Some(hp) = response.hover_pos() {
             let pm = screen_to_mol(hp, self.cam_center_mol, self.pixels_per_bond);
             self.hover_target = self.hit_test_scene(pm);
+            if let Some(HoverTarget::Atom(ai)) = self.hover_target {
+                self.hovered_atom_idx = Some(ai);
+                if let Some(res) = &self.auto_assign_result {
+                    if let Some(asgn) = res.assignment_for_atom(ai) {
+                        self.hovered_peak_idx = asgn.peak_idx;
+                    }
+                }
+            } else if !self.show_bottom_nmr_panel {
+                self.hovered_atom_idx = None;
+            }
         } else {
             self.hover_target = None;
+            if !self.show_bottom_nmr_panel {
+                self.hovered_atom_idx = None;
+            }
         }
 
         // Keyboard shortcuts & atom hotkeys
@@ -2239,6 +2501,23 @@ impl OctetDrawPanel {
                     0.38 * cur_ppb,
                     egui::Color32::from_rgba_unmultiplied(250, 204, 21, 130),
                 );
+                painter.circle_stroke(
+                    sp,
+                    0.38 * cur_ppb,
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(217, 119, 6)),
+                );
+            }
+        }
+        if let Some(hai) = self.hovered_atom_idx {
+            if !self.highlighted_nmr_atoms.contains(&hai) {
+                if let Some(a) = self.scene.atoms.get(hai) {
+                    let sp = mol_to_screen(a.x, a.y, cur_cam, cur_ppb);
+                    painter.circle_filled(
+                        sp,
+                        0.36 * cur_ppb,
+                        egui::Color32::from_rgba_unmultiplied(251, 146, 60, 80),
+                    );
+                }
             }
         }
         for &ai in &self.selected_atoms {
@@ -2320,10 +2599,34 @@ impl OctetDrawPanel {
             egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225)),
             egui::StrokeKind::Inside,
         );
+        let hud_line = if let Some(hai) = self.hovered_atom_idx {
+            if let Some(asgn) = self
+                .auto_assign_result
+                .as_ref()
+                .and_then(|r| r.assignment_for_atom(hai))
+            {
+                if let Some(exp_ppm) = asgn.experimental_ppm {
+                    format!(
+                        "{} | {} -> Exp {:.2} ppm (Pred {:.2}, Conf {:.0}%)",
+                        self.status_msg,
+                        asgn.label,
+                        exp_ppm,
+                        asgn.predicted_ppm,
+                        asgn.confidence * 100.0
+                    )
+                } else {
+                    self.status_msg.clone()
+                }
+            } else {
+                self.status_msg.clone()
+            }
+        } else {
+            self.status_msg.clone()
+        };
         painter.text(
             egui::pos2(rect.left() + 8.0, rect.bottom() - 6.0),
             egui::Align2::LEFT_BOTTOM,
-            &self.status_msg,
+            &hud_line,
             egui::FontId::proportional(11.5),
             egui::Color32::from_rgb(51, 65, 85),
         );
@@ -3187,231 +3490,819 @@ impl OctetDrawPanel {
 
     fn draw_bottom_nmr_inspector(&mut self, ui: &mut egui::Ui) {
         self.highlighted_nmr_atoms.clear();
-        // If user is hovering an atom on the structure canvas, highlight its peak in the 1D spectrum!
         let hovered_canvas_atom = match self.hover_target {
             Some(HoverTarget::Atom(ai)) => Some(ai),
             _ => None,
         };
+        let mut next_hovered_atom = hovered_canvas_atom;
+        let mut next_hovered_peak: Option<usize> = None;
+
+        // If hovering an atom on the 2D canvas, pre-resolve its assigned experimental peak
+        if let Some(hai) = hovered_canvas_atom {
+            if let Some(asgn) = self
+                .auto_assign_result
+                .as_ref()
+                .and_then(|r| r.assignment_for_atom(hai))
+            {
+                next_hovered_peak = asgn.peak_idx;
+            }
+        }
+
+        let dark = ui.visuals().dark_mode;
+        let body_bg = if dark {
+            egui::Color32::from_rgb(20, 28, 44)
+        } else {
+            egui::Color32::from_rgb(248, 250, 252)
+        };
+        let inactive_tab_bg = if dark {
+            egui::Color32::from_rgb(30, 41, 59)
+        } else {
+            egui::Color32::from_rgb(226, 232, 240)
+        };
+        let inactive_tab_hover = if dark {
+            egui::Color32::from_rgb(41, 55, 78)
+        } else {
+            egui::Color32::from_rgb(212, 222, 236)
+        };
+        let border_col = if dark {
+            egui::Color32::from_rgb(71, 85, 105)
+        } else {
+            egui::Color32::from_rgb(148, 163, 184)
+        };
+        let accent_col = if dark {
+            egui::Color32::from_rgb(56, 189, 248)
+        } else {
+            egui::Color32::from_rgb(37, 99, 235)
+        };
+        let active_text_col = if dark {
+            egui::Color32::from_rgb(241, 245, 249)
+        } else {
+            egui::Color32::from_rgb(15, 23, 42)
+        };
+        let inactive_text_col = if dark {
+            egui::Color32::from_rgb(148, 163, 184)
+        } else {
+            egui::Color32::from_rgb(51, 65, 85)
+        };
+
+        let mut active_tab_rect: Option<egui::Rect> = None;
+        let mut do_embed = false;
+        let mut do_send_1d = false;
+        let mut do_run_auto_assign = false;
+        let mut do_copy_acs = false;
+        let mut pending_swap: Option<(usize, Option<usize>, bool)> = None;
+
+        // Top row: Real connected folder-style tabs (`1H NMR` | `13C{1H} NMR`) + compact controls
+        let prev_spacing_y = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = 0.0;
 
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
             ui.label(
                 egui::RichText::new("Live Predicted 1D NMR")
-                    .size(12.5)
+                    .size(12.0)
                     .strong(),
             );
-            ui.selectable_value(
-                &mut self.nmr_tab,
-                NmrViewTab::Proton1H,
-                egui::RichText::new("1H NMR").size(12.5),
+            ui.add_space(4.0);
+
+            let (r_1h, clicked_1h) = draw_folder_tab(
+                ui,
+                "1H NMR",
+                78.0,
+                25.0,
+                self.nmr_tab == NmrViewTab::Proton1H,
+                body_bg,
+                inactive_tab_bg,
+                inactive_tab_hover,
+                border_col,
+                accent_col,
+                active_text_col,
+                inactive_text_col,
             );
-            ui.selectable_value(
-                &mut self.nmr_tab,
-                NmrViewTab::Carbon13C,
-                egui::RichText::new("13C{1H} NMR").size(12.5),
+            self.last_nmr_tab_rects[0] = Some(r_1h);
+            if clicked_1h {
+                self.nmr_tab = NmrViewTab::Proton1H;
+                self.swap_source_group = None;
+            }
+            if self.nmr_tab == NmrViewTab::Proton1H {
+                active_tab_rect = Some(r_1h);
+            }
+
+            let (r_13c, clicked_13c) = draw_folder_tab(
+                ui,
+                "13C{1H} NMR",
+                110.0,
+                25.0,
+                self.nmr_tab == NmrViewTab::Carbon13C,
+                body_bg,
+                inactive_tab_bg,
+                inactive_tab_hover,
+                border_col,
+                accent_col,
+                active_text_col,
+                inactive_text_col,
             );
+            self.last_nmr_tab_rects[1] = Some(r_13c);
+            if clicked_13c {
+                self.nmr_tab = NmrViewTab::Carbon13C;
+                self.swap_source_group = None;
+            }
+            if self.nmr_tab == NmrViewTab::Carbon13C {
+                active_tab_rect = Some(r_13c);
+            }
+
+            ui.add_space(8.0);
             if ui
                 .add(
-                    egui::Slider::new(&mut self.spectrometer_mhz, 60.0..=900.0)
-                        .text("MHz")
+                    egui::DragValue::new(&mut self.spectrometer_mhz)
+                        .speed(10.0)
+                        .range(60.0..=900.0)
+                        .suffix(" MHz")
                         .fixed_decimals(0),
                 )
+                .on_hover_text("1H spectrometer frequency (MHz)")
                 .changed()
             {
                 self.recompute_live_analytics();
             }
+
             if ui
-                .button(egui::RichText::new("Embed 1D Plot on Canvas").size(11.5))
-                .on_hover_text("Insert publication 1D NMR spectrum directly onto the drawing canvas for SVG/PDF/PNG export")
+                .button(egui::RichText::new("Embed on Canvas").size(11.5))
+                .on_hover_text(
+                    "Insert publication 1D NMR spectrum onto the drawing canvas for SVG/PDF/PNG export",
+                )
                 .clicked()
             {
-                self.embed_1d_spectrum_on_canvas();
+                do_embed = true;
+            }
+            if ui
+                .button(egui::RichText::new("Send to 1D Suite").size(11.5))
+                .on_hover_text(
+                    "Send predicted 1D NMR spectrum to the main 1D Processing & Analysis Suite",
+                )
+                .clicked()
+            {
+                do_send_1d = true;
             }
         });
 
-        let signals = match self.nmr_tab {
-            NmrViewTab::Proton1H => &self.cached_1h,
-            NmrViewTab::Carbon13C => &self.cached_13c,
-        };
+        ui.spacing_mut().item_spacing.y = prev_spacing_y;
 
-        ui.columns(2, |cols| {
-            // Left column: Interactive 1D Lorentzian Multiplet Spectrum Plot
-            let avail = cols[0].available_size();
-            let plot_size = egui::vec2(avail.x.max(180.0), avail.y.max(110.0));
-            let (rect, resp) = cols[0].allocate_exact_size(plot_size, egui::Sense::hover());
-            let painter = cols[0].painter_at(rect);
-            painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(15, 23, 42));
+        // Connected Spectrum Body Container (seamlessly joined to the active folder tab above!)
+        let body_resp = egui::Frame::new()
+            .fill(body_bg)
+            .stroke(egui::Stroke::new(1.0, border_col))
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                // Experimental Overlay / Mirror & Fit & Auto-Assign Bar
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(egui::RichText::new("Experimental:").size(11.5).strong());
 
-            let (ppm_lo, ppm_hi) = match self.nmr_tab {
-                NmrViewTab::Proton1H => (-0.5_f64, 11.5_f64),
-                NmrViewTab::Carbon13C => (0.0_f64, 220.0_f64),
-            };
-            let span = ppm_hi - ppm_lo;
-            let axis_y = rect.bottom() - 18.0;
-            let top_y = rect.top() + 12.0;
-            let h_amp = (axis_y - top_y - 4.0).max(20.0);
-
-            let ppm_to_x = |ppm: f64| -> f32 {
-                let u = ((ppm_hi - ppm) / span).clamp(0.0, 1.0) as f32;
-                rect.left() + 8.0 + u * (rect.width() - 16.0)
-            };
-
-            // Synthesize live Lorentzian trace
-            let n_pts = 380_usize;
-            let freq = match self.nmr_tab {
-                NmrViewTab::Proton1H => self.spectrometer_mhz.max(60.0),
-                NmrViewTab::Carbon13C => (self.spectrometer_mhz * 0.251_45).max(25.0),
-            };
-            let gamma = (0.7 / freq).max(span * 0.0012);
-            let mut sublines = Vec::new();
-            for sig in signals {
-                for (dhz, amp) in expand_multiplet_lines_hz(&sig.multiplicity, &sig.couplings_hz) {
-                    sublines.push((sig.ppm + dhz / freq, amp * sig.integral.max(0.5)));
-                }
-            }
-            let mut ys = vec![0.0_f64; n_pts];
-            let mut ymax = 1e-9_f64;
-            for (k, y_slot) in ys.iter_mut().enumerate() {
-                let ppm = ppm_hi - (k as f64 / (n_pts - 1) as f64) * span;
-                let mut v = 0.0;
-                for &(lp, la) in &sublines {
-                    let d = (ppm - lp) / gamma;
-                    if d.abs() < 35.0 {
-                        v += la / (1.0 + d * d);
-                    }
-                }
-                *y_slot = v;
-                ymax = ymax.max(v);
-            }
-            let trace_pts: Vec<egui::Pos2> = (0..n_pts)
-                .map(|k| {
-                    let ppm = ppm_hi - (k as f64 / (n_pts - 1) as f64) * span;
-                    let norm = (ys[k] / ymax) as f32;
-                    egui::pos2(ppm_to_x(ppm), axis_y - 3.0 - norm * h_amp)
-                })
-                .collect();
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left() + 6.0, axis_y),
-                    egui::pos2(rect.right() - 6.0, axis_y),
-                ],
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 116, 139)),
-            );
-            painter.add(egui::Shape::line(
-                trace_pts,
-                egui::Stroke::new(1.4, egui::Color32::from_rgb(56, 189, 248)),
-            ));
-
-            // Ticks & hover cross-highlighting
-            let step = if span > 50.0 { 20.0 } else { 1.0 };
-            let mut tk = (ppm_lo / step).ceil() * step;
-            while tk <= ppm_hi {
-                let tx = ppm_to_x(tk);
-                painter.text(
-                    egui::pos2(tx, rect.bottom() - 2.0),
-                    egui::Align2::CENTER_BOTTOM,
-                    format!("{tk:.0}"),
-                    egui::FontId::monospace(11.0),
-                    egui::Color32::from_rgb(148, 163, 184),
-                );
-                tk += step;
-            }
-
-            if let Some(hp) = resp.hover_pos() {
-                let u =
-                    ((hp.x - (rect.left() + 8.0)) / (rect.width() - 16.0).max(1.0)).clamp(0.0, 1.0);
-                let cur_ppm = ppm_hi - (u as f64) * span;
-                painter.text(
-                    egui::pos2(rect.right() - 8.0, rect.top() + 4.0),
-                    egui::Align2::RIGHT_TOP,
-                    format!("{cur_ppm:.2} ppm"),
-                    egui::FontId::monospace(11.0),
-                    egui::Color32::from_rgb(226, 232, 240),
-                );
-                for sig in signals {
-                    if (sig.ppm - cur_ppm).abs() < span * 0.025 {
-                        for &ai in &sig.atom_indices {
-                            self.highlighted_nmr_atoms.insert(ai);
-                        }
-                    }
-                }
-            }
-            if let Some(hai) = hovered_canvas_atom {
-                for sig in signals {
-                    if sig.atom_indices.contains(&hai) {
-                        let sx = ppm_to_x(sig.ppm);
-                        painter.line_segment(
-                            [egui::pos2(sx, top_y), egui::pos2(sx, axis_y)],
-                            egui::Stroke::new(1.5, egui::Color32::from_rgb(250, 204, 21)),
-                        );
-                    }
-                }
-            }
-
-            // Right column: Multiplet & Coupling Shift Table
-            egui::ScrollArea::vertical()
-                .id_salt("octet_nmr_table_scroll")
-                .show(&mut cols[1], |ui| {
-                    egui::Grid::new("octet_nmr_peaks_grid")
-                        .striped(true)
-                        .min_col_width(44.0)
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new("Shift (ppm)").size(11.5).strong());
-                            ui.label(egui::RichText::new("Mult.").size(11.5).strong());
-                            ui.label(egui::RichText::new("J (Hz)").size(11.5).strong());
-                            ui.label(egui::RichText::new("Int.").size(11.5).strong());
-                            ui.label(egui::RichText::new("Assignment").size(11.5).strong());
-                            ui.end_row();
-
-                            for sig in signals {
-                                let is_hl = hovered_canvas_atom
-                                    .is_some_and(|a| sig.atom_indices.contains(&a));
-                                let col = if is_hl {
-                                    egui::Color32::from_rgb(250, 204, 21)
-                                } else {
-                                    ui.visuals().text_color()
-                                };
-                                let r_shift = ui.label(
-                                    egui::RichText::new(format!("{:.2}", sig.ppm))
-                                        .size(11.5)
-                                        .monospace()
-                                        .color(col),
-                                );
-                                ui.label(
-                                    egui::RichText::new(&sig.multiplicity)
-                                        .size(11.5)
-                                        .monospace(),
-                                );
-                                let j_txt = if sig.couplings_hz.is_empty() {
-                                    "-".to_string()
-                                } else {
-                                    sig.couplings_hz
-                                        .iter()
-                                        .map(|j| format!("{j:.1}"))
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                };
-                                ui.label(egui::RichText::new(j_txt).size(11.5).monospace());
-                                ui.label(
-                                    egui::RichText::new(format!("{:.0}", sig.integral))
-                                        .size(11.5)
-                                        .monospace(),
-                                );
-                                ui.label(
-                                    egui::RichText::new(
-                                        sig.assignment_label.as_deref().unwrap_or("-"),
+                    let exp_combo_label = match self
+                        .selected_experimental_idx
+                        .and_then(|i| self.experimental_spectra.get(i))
+                    {
+                        Some(sp) => format_experimental_spectrum_label(
+                            self.selected_experimental_idx.unwrap_or(0),
+                            sp,
+                        ),
+                        None => "None".to_string(),
+                    };
+                    egui::ComboBox::from_id_salt("octet_exp_1d_selector")
+                        .selected_text(egui::RichText::new(exp_combo_label).size(11.5))
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(
+                                    self.selected_experimental_idx.is_none(),
+                                    egui::RichText::new("None").size(11.5),
+                                )
+                                .clicked()
+                            {
+                                self.selected_experimental_idx = None;
+                                self.auto_assign_result = None;
+                                self.swap_source_group = None;
+                            }
+                            let exp_labels: Vec<(usize, String, bool)> = self
+                                .experimental_spectra
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, sp)| {
+                                    (
+                                        idx,
+                                        format_experimental_spectrum_label(idx, sp),
+                                        is_carbon_nucleus(&sp.nucleus),
                                     )
-                                    .size(11.5),
-                                );
-                                if r_shift.hovered() {
-                                    for &ai in &sig.atom_indices {
-                                        self.highlighted_nmr_atoms.insert(ai);
-                                    }
+                                })
+                                .collect();
+                            for (idx, lbl, sp_is_c13) in exp_labels {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_experimental_idx == Some(idx),
+                                        egui::RichText::new(lbl).size(11.5),
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected_experimental_idx = Some(idx);
+                                    self.nmr_tab = if sp_is_c13 {
+                                        NmrViewTab::Carbon13C
+                                    } else {
+                                        NmrViewTab::Proton1H
+                                    };
+                                    self.auto_assign_result = None;
+                                    self.swap_source_group = None;
                                 }
-                                ui.end_row();
                             }
                         });
+
+                    let has_exp = self
+                        .selected_experimental_idx
+                        .and_then(|i| self.experimental_spectra.get(i))
+                        .is_some();
+
+                    if ui
+                        .add_enabled(
+                            has_exp,
+                            egui::Button::new(egui::RichText::new("Overlay").size(11.5))
+                                .selected(!self.mirror_experimental),
+                        )
+                        .on_hover_text("Overlay experimental trace on predicted ppm axis")
+                        .clicked()
+                    {
+                        self.mirror_experimental = false;
+                    }
+                    if ui
+                        .add_enabled(
+                            has_exp,
+                            egui::Button::new(egui::RichText::new("Mirror").size(11.5))
+                                .selected(self.mirror_experimental),
+                        )
+                        .on_hover_text(
+                            "Mirror experimental trace inverted below midline on same ppm scale",
+                        )
+                        .clicked()
+                    {
+                        self.mirror_experimental = true;
+                    }
+
+                    if ui
+                        .add_enabled(
+                            has_exp,
+                            egui::Button::new(
+                                egui::RichText::new("Fit & Auto-Assign").size(11.5).strong(),
+                            ),
+                        )
+                        .on_hover_text(
+                            "Run Hungarian optimal assignment matching collected 1D peaks to 2D structure atoms",
+                        )
+                        .clicked()
+                    {
+                        do_run_auto_assign = true;
+                    }
+
+                    if let Some(res) = &self.auto_assign_result {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Matched {}/{} | RMSD {:.2} ppm | Conf {:.0}%",
+                                res.matched_count,
+                                res.assignments.len(),
+                                res.rmsd_ppm,
+                                res.mean_confidence * 100.0
+                            ))
+                            .size(11.5)
+                            .monospace(),
+                        );
+                        if ui
+                            .button(egui::RichText::new("Copy ACS").size(11.5))
+                            .on_hover_text("Copy ACS NMR report string with structure atom labels")
+                            .clicked()
+                        {
+                            do_copy_acs = true;
+                        }
+                    }
+
+                    if let Some(src_g) = self.swap_source_group {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Swap #{} -> click target peak/row",
+                                src_g + 1
+                            ))
+                            .size(11.5)
+                            .strong()
+                            .color(egui::Color32::from_rgb(217, 119, 6)),
+                        );
+                        if ui.button(egui::RichText::new("Cancel").size(11.5)).clicked() {
+                            self.swap_source_group = None;
+                        }
+                    }
                 });
-        });
+
+                ui.add_space(4.0);
+
+                let signals = match self.nmr_tab {
+                    NmrViewTab::Proton1H => self.cached_1h.clone(),
+                    NmrViewTab::Carbon13C => self.cached_13c.clone(),
+                };
+                let active_exp = self
+                    .selected_experimental_idx
+                    .and_then(|i| self.experimental_spectra.get(i))
+                    .cloned();
+                let active_assign = self
+                    .auto_assign_result
+                    .as_ref()
+                    .filter(|r| {
+                        let tab_c13 = self.nmr_tab == NmrViewTab::Carbon13C;
+                        is_carbon_nucleus(&r.nucleus) == tab_c13
+                    })
+                    .cloned();
+                let selected_single_atom = (self.selected_atoms.len() == 1)
+                    .then(|| self.selected_atoms.iter().next().copied())
+                    .flatten();
+
+                ui.columns(2, |cols| {
+                    // Left column: Interactive 1D Spectrum Plot (Predicted + Optional Overlay/Mirror Experimental)
+                    let avail = cols[0].available_size();
+                    let plot_size = egui::vec2(avail.x.max(180.0), avail.y.max(112.0));
+                    let (rect, resp) =
+                        cols[0].allocate_exact_size(plot_size, egui::Sense::click());
+                    let painter = cols[0].painter_at(rect);
+                    painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(15, 23, 42));
+
+                    let (ppm_lo, ppm_hi) = match self.nmr_tab {
+                        NmrViewTab::Proton1H => (-0.5_f64, 11.5_f64),
+                        NmrViewTab::Carbon13C => (0.0_f64, 220.0_f64),
+                    };
+                    let span = (ppm_hi - ppm_lo).max(1e-6);
+                    let axis_y = rect.bottom() - 18.0;
+                    let top_y = rect.top() + 14.0;
+                    let mirror_active = active_exp.is_some() && self.mirror_experimental;
+                    let base_y = if mirror_active {
+                        0.5 * (top_y + axis_y)
+                    } else {
+                        axis_y - 3.0
+                    };
+                    let h_amp = if mirror_active {
+                        (0.5 * (axis_y - top_y) - 5.0).max(16.0)
+                    } else {
+                        (axis_y - top_y - 6.0).max(20.0)
+                    };
+
+                    let ppm_to_x = |ppm: f64| -> f32 {
+                        let u = ((ppm_hi - ppm) / span).clamp(0.0, 1.0) as f32;
+                        rect.left() + 8.0 + u * (rect.width() - 16.0)
+                    };
+
+                    // Synthesize live predicted Lorentzian trace
+                    let n_pts = 380_usize;
+                    let freq = match self.nmr_tab {
+                        NmrViewTab::Proton1H => self.spectrometer_mhz.max(60.0),
+                        NmrViewTab::Carbon13C => (self.spectrometer_mhz * 0.251_45).max(25.0),
+                    };
+                    let gamma = (0.7 / freq).max(span * 0.0012);
+                    let mut sublines = Vec::new();
+                    for sig in &signals {
+                        for (dhz, amp) in
+                            expand_multiplet_lines_hz(&sig.multiplicity, &sig.couplings_hz)
+                        {
+                            sublines.push((sig.ppm + dhz / freq, amp * sig.integral.max(0.5)));
+                        }
+                    }
+                    let mut ys = vec![0.0_f64; n_pts];
+                    let mut ymax = 1e-9_f64;
+                    for (k, y_slot) in ys.iter_mut().enumerate() {
+                        let ppm = ppm_hi - (k as f64 / (n_pts - 1) as f64) * span;
+                        let mut v = 0.0;
+                        for &(lp, la) in &sublines {
+                            let d = (ppm - lp) / gamma;
+                            if d.abs() < 35.0 {
+                                v += la / (1.0 + d * d);
+                            }
+                        }
+                        *y_slot = v;
+                        ymax = ymax.max(v);
+                    }
+                    let pred_pts: Vec<egui::Pos2> = (0..n_pts)
+                        .map(|k| {
+                            let ppm = ppm_hi - (k as f64 / (n_pts - 1) as f64) * span;
+                            let norm = (ys[k] / ymax) as f32;
+                            egui::pos2(ppm_to_x(ppm), base_y - norm * h_amp)
+                        })
+                        .collect();
+
+                    // Baseline(s)
+                    painter.line_segment(
+                        [
+                            egui::pos2(rect.left() + 6.0, axis_y),
+                            egui::pos2(rect.right() - 6.0, axis_y),
+                        ],
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 116, 139)),
+                    );
+                    if mirror_active {
+                        painter.line_segment(
+                            [
+                                egui::pos2(rect.left() + 6.0, base_y),
+                                egui::pos2(rect.right() - 6.0, base_y),
+                            ],
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(71, 85, 105)),
+                        );
+                    }
+
+                    // Draw predicted trace (cyan)
+                    painter.add(egui::Shape::line(
+                        pred_pts,
+                        egui::Stroke::new(1.4, egui::Color32::from_rgb(56, 189, 248)),
+                    ));
+
+                    // Draw experimental overlay or mirrored trace on the exact same ppm scale
+                    let exp_peaks = active_exp
+                        .as_ref()
+                        .map(extract_experimental_peaks_from_spectrum)
+                        .unwrap_or_default();
+
+                    if let Some(exp_sp) = &active_exp {
+                        let exp_pts = build_experimental_trace_screen_pts(
+                            exp_sp,
+                            ppm_lo,
+                            ppm_hi,
+                            n_pts,
+                            freq,
+                            &ppm_to_x,
+                            base_y,
+                            h_amp,
+                            mirror_active,
+                        );
+                        if exp_pts.len() >= 2 {
+                            painter.add(egui::Shape::line(
+                                exp_pts,
+                                egui::Stroke::new(1.4, egui::Color32::from_rgb(251, 146, 60)),
+                            ));
+                        }
+
+                        // Compact legend in top-left corner (>= 11.0 px)
+                        painter.text(
+                            egui::pos2(rect.left() + 8.0, rect.top() + 3.0),
+                            egui::Align2::LEFT_TOP,
+                            if mirror_active {
+                                "Pred (up) / Exp (down)"
+                            } else {
+                                "Pred (cyan) / Exp (amber)"
+                            },
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::from_rgb(203, 213, 225),
+                        );
+
+                        // Peak tick markers for experimental peaks
+                        for pk in &exp_peaks {
+                            let px = ppm_to_x(pk.ppm);
+                            let is_assigned_hl = next_hovered_peak == Some(pk.peak_idx)
+                                || self.hovered_peak_idx == Some(pk.peak_idx);
+                            let marker_y = if mirror_active {
+                                base_y + 4.0
+                            } else {
+                                top_y + 2.0
+                            };
+                            let marker_col = if is_assigned_hl {
+                                egui::Color32::from_rgb(250, 204, 21)
+                            } else {
+                                egui::Color32::from_rgb(251, 146, 60)
+                            };
+                            painter.circle_filled(
+                                egui::pos2(px, marker_y),
+                                if is_assigned_hl { 4.0 } else { 2.5 },
+                                marker_col,
+                            );
+                        }
+                    }
+
+                    // Axis ticks (>= 11.0 px)
+                    let step = if span > 50.0 { 20.0 } else { 1.0 };
+                    let mut tk = (ppm_lo / step).ceil() * step;
+                    while tk <= ppm_hi {
+                        let tx = ppm_to_x(tk);
+                        painter.text(
+                            egui::pos2(tx, rect.bottom() - 2.0),
+                            egui::Align2::CENTER_BOTTOM,
+                            format!("{tk:.0}"),
+                            egui::FontId::monospace(11.0),
+                            egui::Color32::from_rgb(148, 163, 184),
+                        );
+                        tk += step;
+                    }
+
+                    // Pointer hover & click interaction on 1D spectrum plot
+                    if let Some(hp) = resp.hover_pos() {
+                        let u = ((hp.x - (rect.left() + 8.0)) / (rect.width() - 16.0).max(1.0))
+                            .clamp(0.0, 1.0);
+                        let cur_ppm = ppm_hi - (u as f64) * span;
+                        painter.text(
+                            egui::pos2(rect.right() - 8.0, rect.top() + 3.0),
+                            egui::Align2::RIGHT_TOP,
+                            format!("{cur_ppm:.2} ppm"),
+                            egui::FontId::monospace(11.0),
+                            egui::Color32::from_rgb(226, 232, 240),
+                        );
+
+                        // Nearest experimental peak within tolerance
+                        let peak_tol = span * 0.025;
+                        let nearest_exp_pk = exp_peaks
+                            .iter()
+                            .filter(|pk| (pk.ppm - cur_ppm).abs() < peak_tol)
+                            .min_by(|a, b| {
+                                (a.ppm - cur_ppm)
+                                    .abs()
+                                    .total_cmp(&(b.ppm - cur_ppm).abs())
+                            });
+
+                        if let Some(pk) = nearest_exp_pk {
+                            next_hovered_peak = Some(pk.peak_idx);
+                            if let Some(res) = &active_assign {
+                                if let Some(asgn) = res.assignment_for_peak(pk.peak_idx) {
+                                    for &ai in &asgn.atom_indices {
+                                        self.highlighted_nmr_atoms.insert(ai);
+                                    }
+                                    if let Some(&first_ai) = asgn.atom_indices.first() {
+                                        next_hovered_atom = Some(first_ai);
+                                    }
+                                }
+                            }
+                            if resp.clicked() {
+                                if let Some(res) = &active_assign {
+                                    if let Some(src_g) = self.swap_source_group {
+                                        pending_swap = Some((src_g, Some(pk.peak_idx), true));
+                                        self.swap_source_group = None;
+                                    } else if let Some(sel_ai) = selected_single_atom {
+                                        if let Some(asgn) = res.assignment_for_atom(sel_ai) {
+                                            pending_swap =
+                                                Some((asgn.group_idx, Some(pk.peak_idx), true));
+                                        }
+                                    } else if let Some(asgn) = res.assignment_for_peak(pk.peak_idx)
+                                    {
+                                        self.swap_source_group = Some(asgn.group_idx);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Predicted signal hover highlight on 2D structure
+                        for sig in &signals {
+                            if (sig.ppm - cur_ppm).abs() < peak_tol {
+                                for &ai in &sig.atom_indices {
+                                    self.highlighted_nmr_atoms.insert(ai);
+                                }
+                                if next_hovered_atom.is_none() {
+                                    next_hovered_atom = sig.atom_indices.first().copied();
+                                }
+                            }
+                        }
+                    }
+
+                    // Highlight vertical cursor for hovered structure atom + its assigned experimental peak
+                    if let Some(hai) = hovered_canvas_atom {
+                        for sig in &signals {
+                            if sig.atom_indices.contains(&hai) {
+                                let sx = ppm_to_x(sig.ppm);
+                                painter.line_segment(
+                                    [egui::pos2(sx, top_y), egui::pos2(sx, axis_y)],
+                                    egui::Stroke::new(
+                                        1.5,
+                                        egui::Color32::from_rgb(250, 204, 21),
+                                    ),
+                                );
+                            }
+                        }
+                        if let Some(res) = &active_assign {
+                            if let Some(asgn) = res.assignment_for_atom(hai) {
+                                if let Some(exp_ppm) = asgn.experimental_ppm {
+                                    let ex = ppm_to_x(exp_ppm);
+                                    let px = ppm_to_x(asgn.predicted_ppm);
+                                    painter.line_segment(
+                                        [egui::pos2(ex, top_y), egui::pos2(ex, axis_y)],
+                                        egui::Stroke::new(
+                                            1.8,
+                                            egui::Color32::from_rgb(16, 185, 129),
+                                        ),
+                                    );
+                                    // Horizontal tie line connecting predicted and experimental shift
+                                    painter.line_segment(
+                                        [
+                                            egui::pos2(px, top_y + 6.0),
+                                            egui::pos2(ex, top_y + 6.0),
+                                        ],
+                                        egui::Stroke::new(
+                                            1.5,
+                                            egui::Color32::from_rgb(250, 204, 21),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Right column: Multiplet & Auto-Assignment Table with click-to-swap / lock
+                    egui::ScrollArea::vertical()
+                        .id_salt("octet_nmr_table_scroll")
+                        .show(&mut cols[1], |ui| {
+                            egui::Grid::new("octet_nmr_peaks_grid")
+                                .striped(true)
+                                .min_col_width(38.0)
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Pred").size(11.5).strong());
+                                    if active_assign.is_some() {
+                                        ui.label(egui::RichText::new("Exp").size(11.5).strong());
+                                    }
+                                    ui.label(egui::RichText::new("Mult.").size(11.5).strong());
+                                    ui.label(egui::RichText::new("J (Hz)").size(11.5).strong());
+                                    ui.label(egui::RichText::new("Int.").size(11.5).strong());
+                                    ui.label(egui::RichText::new("Group").size(11.5).strong());
+                                    if active_assign.is_some() {
+                                        ui.label(
+                                            egui::RichText::new("Conf / Edit").size(11.5).strong(),
+                                        );
+                                    }
+                                    ui.end_row();
+
+                                    for (g_idx, sig) in signals.iter().enumerate() {
+                                        let asgn_opt = active_assign.as_ref().and_then(|r| {
+                                            r.assignments.iter().find(|a| a.group_idx == g_idx)
+                                        });
+                                        let is_hl = hovered_canvas_atom
+                                            .is_some_and(|a| sig.atom_indices.contains(&a))
+                                            || asgn_opt.is_some_and(|a| {
+                                                a.peak_idx.is_some()
+                                                    && a.peak_idx == next_hovered_peak
+                                            });
+                                        let col = if is_hl {
+                                            egui::Color32::from_rgb(217, 119, 6)
+                                        } else {
+                                            ui.visuals().text_color()
+                                        };
+                                        let r_shift = ui.label(
+                                            egui::RichText::new(format!("{:.2}", sig.ppm))
+                                                .size(11.5)
+                                                .monospace()
+                                                .color(col),
+                                        );
+                                        if let Some(asgn) = asgn_opt {
+                                            let exp_txt = asgn
+                                                .experimental_ppm
+                                                .map(|p| format!("{p:.2}"))
+                                                .unwrap_or_else(|| "-".to_string());
+                                            let r_exp = ui.label(
+                                                egui::RichText::new(exp_txt)
+                                                    .size(11.5)
+                                                    .monospace()
+                                                    .color(if asgn.locked {
+                                                        egui::Color32::from_rgb(16, 185, 129)
+                                                    } else {
+                                                        col
+                                                    }),
+                                            );
+                                            if r_exp.hovered() {
+                                                for &ai in &sig.atom_indices {
+                                                    self.highlighted_nmr_atoms.insert(ai);
+                                                }
+                                                next_hovered_atom =
+                                                    sig.atom_indices.first().copied();
+                                                next_hovered_peak = asgn.peak_idx;
+                                            }
+                                        } else if active_assign.is_some() {
+                                            ui.label(egui::RichText::new("-").size(11.5));
+                                        }
+
+                                        ui.label(
+                                            egui::RichText::new(&sig.multiplicity)
+                                                .size(11.5)
+                                                .monospace(),
+                                        );
+                                        let j_txt = if sig.couplings_hz.is_empty() {
+                                            "-".to_string()
+                                        } else {
+                                            sig.couplings_hz
+                                                .iter()
+                                                .map(|j| format!("{j:.1}"))
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        };
+                                        ui.label(egui::RichText::new(j_txt).size(11.5).monospace());
+                                        ui.label(
+                                            egui::RichText::new(format!("{:.0}", sig.integral))
+                                                .size(11.5)
+                                                .monospace(),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(
+                                                sig.assignment_label.as_deref().unwrap_or("-"),
+                                            )
+                                            .size(11.5),
+                                        );
+
+                                        if let Some(asgn) = asgn_opt {
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 3.0;
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{:.0}%",
+                                                        asgn.confidence * 100.0
+                                                    ))
+                                                    .size(11.0)
+                                                    .monospace(),
+                                                );
+                                                let swap_lbl = match self.swap_source_group {
+                                                    Some(src) if src == g_idx => "Cancel",
+                                                    Some(_) => "Swap Here",
+                                                    None => "Swap",
+                                                };
+                                                if ui
+                                                    .button(
+                                                        egui::RichText::new(swap_lbl).size(11.0),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    match self.swap_source_group {
+                                                        Some(src) if src == g_idx => {
+                                                            self.swap_source_group = None;
+                                                        }
+                                                        Some(src) => {
+                                                            pending_swap =
+                                                                Some((src, asgn.peak_idx, true));
+                                                            self.swap_source_group = None;
+                                                        }
+                                                        None => {
+                                                            self.swap_source_group = Some(g_idx);
+                                                        }
+                                                    }
+                                                }
+                                                let lock_lbl = if asgn.locked { "Unlock" } else { "Lock" };
+                                                if ui
+                                                    .add_enabled(
+                                                        asgn.peak_idx.is_some(),
+                                                        egui::Button::new(
+                                                            egui::RichText::new(lock_lbl)
+                                                                .size(11.0),
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    pending_swap = Some((
+                                                        g_idx,
+                                                        asgn.peak_idx,
+                                                        !asgn.locked,
+                                                    ));
+                                                }
+                                            });
+                                        } else if active_assign.is_some() {
+                                            ui.label(egui::RichText::new("-").size(11.0));
+                                        }
+
+                                        if r_shift.hovered() {
+                                            for &ai in &sig.atom_indices {
+                                                self.highlighted_nmr_atoms.insert(ai);
+                                            }
+                                            next_hovered_atom = sig.atom_indices.first().copied();
+                                            if let Some(asgn) = asgn_opt {
+                                                next_hovered_peak = asgn.peak_idx;
+                                            }
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                });
+            });
+
+        // Seamlessly erase the bottom seam directly beneath the active folder tab
+        if let Some(tab_r) = active_tab_rect {
+            let seam_y = body_resp.response.rect.top();
+            let bridge = egui::Rect::from_min_max(
+                egui::pos2(tab_r.left() + 1.0, seam_y - 1.5),
+                egui::pos2(tab_r.right() - 1.0, seam_y + 2.0),
+            );
+            ui.painter().rect_filled(bridge, 0.0, body_bg);
+        }
+
+        self.hovered_atom_idx = next_hovered_atom;
+        self.hovered_peak_idx = next_hovered_peak;
+
+        if do_embed {
+            self.embed_1d_spectrum_on_canvas();
+        }
+        if do_send_1d {
+            self.send_active_1d_to_suite();
+        }
+        if do_run_auto_assign {
+            self.run_auto_assign_1d();
+        }
+        if do_copy_acs {
+            if let Some(res) = &self.auto_assign_result {
+                let acs = format_acs_with_atom_labels(res);
+                ui.ctx().copy_text(acs.clone());
+                self.status_msg = format!("Copied ACS report: {acs}");
+            }
+        }
+        if let Some((gid, pk, lock)) = pending_swap {
+            self.swap_or_lock_nmr_assignment(gid, pk, lock);
+        }
     }
 
     // ========================================================================
@@ -3597,6 +4488,562 @@ impl SwapBondEnds for SceneBond {
 
 fn to_egui_color(c: RgbaColor) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RailToolIconKind {
+    Select,
+    Lasso,
+    Pan,
+    Eraser,
+    SingleBond,
+    DoubleBond,
+    TripleBond,
+    WedgeBond,
+    DashBond,
+    Chain,
+    Benzene,
+    Cyclohexane,
+    Cyclopentane,
+    ReactionArrow,
+    CurvedArrow,
+    TextLabel,
+}
+
+struct RailToolSpec {
+    tool: DrawTool,
+    icon: RailToolIconKind,
+    name: &'static str,
+    shortcut: &'static str,
+    hint: &'static str,
+}
+
+fn rail_tool_specs() -> Vec<RailToolSpec> {
+    vec![
+        RailToolSpec {
+            tool: DrawTool::SelectBox,
+            icon: RailToolIconKind::Select,
+            name: "Select / Move",
+            shortcut: "V",
+            hint: "Click atom or drag marquee to select and move",
+        },
+        RailToolSpec {
+            tool: DrawTool::Lasso,
+            icon: RailToolIconKind::Lasso,
+            name: "Lasso Select",
+            shortcut: "L",
+            hint: "Drag freehand polygon to select atoms",
+        },
+        RailToolSpec {
+            tool: DrawTool::Pan,
+            icon: RailToolIconKind::Pan,
+            name: "Pan Canvas",
+            shortcut: "Space+Drag",
+            hint: "Drag to pan the chemical drawing canvas",
+        },
+        RailToolSpec {
+            tool: DrawTool::Eraser,
+            icon: RailToolIconKind::Eraser,
+            name: "Eraser",
+            shortcut: "Del",
+            hint: "Click atom, bond, or object to delete",
+        },
+        RailToolSpec {
+            tool: DrawTool::Bond {
+                order: BondOrder::Single,
+                stereo: BondStereo::None,
+            },
+            icon: RailToolIconKind::SingleBond,
+            name: "Single Bond",
+            shortcut: "1",
+            hint: "Click atom to sprout or drag to draw single bond",
+        },
+        RailToolSpec {
+            tool: DrawTool::Bond {
+                order: BondOrder::Double,
+                stereo: BondStereo::None,
+            },
+            icon: RailToolIconKind::DoubleBond,
+            name: "Double Bond",
+            shortcut: "2",
+            hint: "Click bond to toggle or drag to draw double bond",
+        },
+        RailToolSpec {
+            tool: DrawTool::Bond {
+                order: BondOrder::Triple,
+                stereo: BondStereo::None,
+            },
+            icon: RailToolIconKind::TripleBond,
+            name: "Triple Bond",
+            shortcut: "3",
+            hint: "Click bond or drag to draw triple bond",
+        },
+        RailToolSpec {
+            tool: DrawTool::Bond {
+                order: BondOrder::Single,
+                stereo: BondStereo::UpWedge,
+            },
+            icon: RailToolIconKind::WedgeBond,
+            name: "Solid Wedge",
+            shortcut: "W",
+            hint: "Draw or flip wedged stereobond (above plane)",
+        },
+        RailToolSpec {
+            tool: DrawTool::Bond {
+                order: BondOrder::Single,
+                stereo: BondStereo::DownHash,
+            },
+            icon: RailToolIconKind::DashBond,
+            name: "Hashed Dash",
+            shortcut: "H",
+            hint: "Draw or flip hashed stereobond (below plane)",
+        },
+        RailToolSpec {
+            tool: DrawTool::Chain,
+            icon: RailToolIconKind::Chain,
+            name: "Alkane Chain",
+            shortcut: "Drag",
+            hint: "Drag to draw 120 deg zig-zag carbon chain",
+        },
+        RailToolSpec {
+            tool: DrawTool::RingStamp {
+                template_id: "benzene".to_string(),
+            },
+            icon: RailToolIconKind::Benzene,
+            name: "Benzene Ring",
+            shortcut: "Click/Fuse",
+            hint: "Click canvas to stamp or click bond to fuse benzene",
+        },
+        RailToolSpec {
+            tool: DrawTool::RingStamp {
+                template_id: "cyclohexane".to_string(),
+            },
+            icon: RailToolIconKind::Cyclohexane,
+            name: "Cyclohexane 6-Ring",
+            shortcut: "6",
+            hint: "Stamp 6-membered ring or click bond to fuse",
+        },
+        RailToolSpec {
+            tool: DrawTool::RingStamp {
+                template_id: "cyclopentane".to_string(),
+            },
+            icon: RailToolIconKind::Cyclopentane,
+            name: "Cyclopentane 5-Ring",
+            shortcut: "5",
+            hint: "Stamp 5-membered ring or click bond to fuse",
+        },
+        RailToolSpec {
+            tool: DrawTool::ReactionArrow {
+                kind: ArrowKind::Solid,
+            },
+            icon: RailToolIconKind::ReactionArrow,
+            name: "Reaction Arrow",
+            shortcut: "Drag",
+            hint: "Drag to place straight reaction arrow",
+        },
+        RailToolSpec {
+            tool: DrawTool::CurvedArrow {
+                kind: PushingArrowKind::FullTwoElectron,
+            },
+            icon: RailToolIconKind::CurvedArrow,
+            name: "Curved Arrow (2e-)",
+            shortcut: "Drag",
+            hint: "Drag to draw curved electron-pushing arrow",
+        },
+        RailToolSpec {
+            tool: DrawTool::TextLabel,
+            icon: RailToolIconKind::TextLabel,
+            name: "Text / Label",
+            shortcut: "T",
+            hint: "Click canvas for caption or atom for group label",
+        },
+    ]
+}
+
+/// Draw crisp geometric vector icons for the ChemDraw-style left tool rail using pure
+/// `egui::Painter` geometry (zero emojis, zero glyph text).
+fn paint_rail_tool_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    kind: RailToolIconKind,
+    color: egui::Color32,
+) {
+    let pt = |nx: f32, ny: f32| -> egui::Pos2 {
+        egui::pos2(
+            rect.left() + nx * rect.width(),
+            rect.top() + ny * rect.height(),
+        )
+    };
+    let s1 = egui::Stroke::new(1.5, color);
+    let s_thin = egui::Stroke::new(1.15, color);
+    let s_bold = egui::Stroke::new(1.85, color);
+
+    match kind {
+        RailToolIconKind::Select => {
+            // Crisp pointer arrow + subtle selection marquee corner
+            let arrow = vec![
+                pt(0.22, 0.14),
+                pt(0.22, 0.80),
+                pt(0.42, 0.62),
+                pt(0.68, 0.62),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                arrow,
+                color,
+                egui::Stroke::NONE,
+            ));
+            painter.line_segment([pt(0.45, 0.62), pt(0.58, 0.86)], s_bold);
+            // Tiny dashed bracket accent in top-right
+            painter.line_segment([pt(0.66, 0.16), pt(0.86, 0.16)], s_thin);
+            painter.line_segment([pt(0.86, 0.16), pt(0.86, 0.36)], s_thin);
+        }
+        RailToolIconKind::Lasso => {
+            // Tilted freehand ellipse loop + bottom-right knot tail
+            let mut loop_pts = Vec::with_capacity(21);
+            for k in 0..=20 {
+                let th = (k as f32 / 20.0) * std::f32::consts::TAU;
+                let ex = 0.36 * th.cos();
+                let ey = 0.24 * th.sin();
+                let rot = -0.35_f32;
+                let rx = ex * rot.cos() - ey * rot.sin();
+                let ry = ex * rot.sin() + ey * rot.cos();
+                loop_pts.push(pt(0.48 + rx, 0.44 + ry));
+            }
+            painter.add(egui::Shape::line(loop_pts, s1));
+            painter.circle_filled(pt(0.66, 0.66), 2.1, color);
+            painter.line_segment([pt(0.66, 0.66), pt(0.80, 0.86)], s1);
+        }
+        RailToolIconKind::Pan => {
+            // 4-way directional cross with crisp arrowheads
+            let c = pt(0.50, 0.50);
+            painter.line_segment([pt(0.16, 0.50), pt(0.84, 0.50)], s1);
+            painter.line_segment([pt(0.50, 0.16), pt(0.50, 0.84)], s1);
+            let heads = [
+                vec![pt(0.50, 0.08), pt(0.38, 0.24), pt(0.62, 0.24)],
+                vec![pt(0.50, 0.92), pt(0.38, 0.76), pt(0.62, 0.76)],
+                vec![pt(0.08, 0.50), pt(0.24, 0.38), pt(0.24, 0.62)],
+                vec![pt(0.92, 0.50), pt(0.76, 0.38), pt(0.76, 0.62)],
+            ];
+            for h in heads {
+                painter.add(egui::Shape::convex_polygon(h, color, egui::Stroke::NONE));
+            }
+            painter.circle_filled(c, 1.5, color);
+        }
+        RailToolIconKind::Eraser => {
+            // Angled beveled eraser block + baseline
+            let body = vec![
+                pt(0.16, 0.62),
+                pt(0.52, 0.20),
+                pt(0.86, 0.44),
+                pt(0.50, 0.84),
+            ];
+            painter.add(egui::Shape::closed_line(body, s1));
+            let tip = vec![
+                pt(0.16, 0.62),
+                pt(0.34, 0.41),
+                pt(0.68, 0.65),
+                pt(0.50, 0.84),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                tip,
+                egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 90),
+                egui::Stroke::NONE,
+            ));
+            painter.line_segment([pt(0.34, 0.41), pt(0.68, 0.65)], s1);
+            painter.line_segment([pt(0.14, 0.86), pt(0.86, 0.86)], s1);
+        }
+        RailToolIconKind::SingleBond => {
+            painter.line_segment([pt(0.16, 0.80), pt(0.84, 0.20)], s_bold);
+        }
+        RailToolIconKind::DoubleBond => {
+            painter.line_segment([pt(0.12, 0.72), pt(0.76, 0.14)], s1);
+            painter.line_segment([pt(0.24, 0.86), pt(0.88, 0.28)], s1);
+        }
+        RailToolIconKind::TripleBond => {
+            painter.line_segment([pt(0.10, 0.64), pt(0.66, 0.12)], s_thin);
+            painter.line_segment([pt(0.20, 0.78), pt(0.80, 0.22)], s_thin);
+            painter.line_segment([pt(0.32, 0.88), pt(0.90, 0.34)], s_thin);
+        }
+        RailToolIconKind::WedgeBond => {
+            let tri = vec![pt(0.14, 0.82), pt(0.74, 0.14), pt(0.90, 0.34)];
+            painter.add(egui::Shape::convex_polygon(tri, color, egui::Stroke::NONE));
+        }
+        RailToolIconKind::DashBond => {
+            let p0 = pt(0.14, 0.82);
+            let p1 = pt(0.84, 0.22);
+            let dir = p1 - p0;
+            let len = dir.length().max(1.0);
+            let perp = egui::vec2(-dir.y / len, dir.x / len);
+            let max_hw = rect.width() * 0.16;
+            for k in 0..5 {
+                let t = (k as f32 + 0.6) / 5.0;
+                let center = p0 + dir * t;
+                let hw = max_hw * t;
+                painter.line_segment([center - perp * hw, center + perp * hw], s1);
+            }
+        }
+        RailToolIconKind::Chain => {
+            let pts = vec![
+                pt(0.10, 0.66),
+                pt(0.32, 0.34),
+                pt(0.54, 0.66),
+                pt(0.76, 0.34),
+                pt(0.92, 0.56),
+            ];
+            painter.add(egui::Shape::line(pts, s1));
+        }
+        RailToolIconKind::Benzene => {
+            let r = rect.width().min(rect.height()) * 0.43;
+            let c = rect.center();
+            let mut verts = Vec::with_capacity(6);
+            for k in 0..6 {
+                let ang = -std::f32::consts::FRAC_PI_2 + (k as f32) * std::f32::consts::TAU / 6.0;
+                verts.push(egui::pos2(c.x + r * ang.cos(), c.y + r * ang.sin()));
+            }
+            painter.add(egui::Shape::closed_line(verts.clone(), s1));
+            // Three alternating inner double-bond strokes (unmistakable Kekule benzene)
+            let ri = r * 0.72;
+            for &k in &[0usize, 2, 4] {
+                let a0 = -std::f32::consts::FRAC_PI_2 + (k as f32) * std::f32::consts::TAU / 6.0;
+                let a1 =
+                    -std::f32::consts::FRAC_PI_2 + ((k + 1) as f32) * std::f32::consts::TAU / 6.0;
+                let p0 = egui::pos2(c.x + ri * a0.cos(), c.y + ri * a0.sin());
+                let p1 = egui::pos2(c.x + ri * a1.cos(), c.y + ri * a1.sin());
+                painter.line_segment([p0, p1], s_thin);
+            }
+        }
+        RailToolIconKind::Cyclohexane => {
+            let r = rect.width().min(rect.height()) * 0.43;
+            let c = rect.center();
+            let mut verts = Vec::with_capacity(6);
+            for k in 0..6 {
+                let ang = -std::f32::consts::FRAC_PI_2 + (k as f32) * std::f32::consts::TAU / 6.0;
+                verts.push(egui::pos2(c.x + r * ang.cos(), c.y + r * ang.sin()));
+            }
+            painter.add(egui::Shape::closed_line(verts, s1));
+        }
+        RailToolIconKind::Cyclopentane => {
+            let r = rect.width().min(rect.height()) * 0.43;
+            let c = egui::pos2(rect.center().x, rect.center().y + rect.height() * 0.04);
+            let mut verts = Vec::with_capacity(5);
+            for k in 0..5 {
+                let ang = -std::f32::consts::FRAC_PI_2 + (k as f32) * std::f32::consts::TAU / 5.0;
+                verts.push(egui::pos2(c.x + r * ang.cos(), c.y + r * ang.sin()));
+            }
+            painter.add(egui::Shape::closed_line(verts, s1));
+        }
+        RailToolIconKind::ReactionArrow => {
+            painter.line_segment([pt(0.10, 0.50), pt(0.76, 0.50)], s_bold);
+            let head = vec![pt(0.92, 0.50), pt(0.66, 0.30), pt(0.66, 0.70)];
+            painter.add(egui::Shape::convex_polygon(head, color, egui::Stroke::NONE));
+        }
+        RailToolIconKind::CurvedArrow => {
+            // Smooth quadratic Bezier arc curving upward and right + arrowhead
+            let p0 = pt(0.14, 0.76);
+            let pc = pt(0.36, 0.10);
+            let p2 = pt(0.82, 0.46);
+            let mut pts = Vec::with_capacity(13);
+            for k in 0..=12 {
+                let t = k as f32 / 12.0;
+                let mt = 1.0 - t;
+                let x = mt * mt * p0.x + 2.0 * mt * t * pc.x + t * t * p2.x;
+                let y = mt * mt * p0.y + 2.0 * mt * t * pc.y + t * t * p2.y;
+                pts.push(egui::pos2(x, y));
+            }
+            painter.add(egui::Shape::line(pts, s1));
+            // Arrowhead aligned with end tangent `(p2 - pc)`
+            let tan = (p2 - pc).normalized();
+            let perp = egui::vec2(-tan.y, tan.x);
+            let sz = rect.width() * 0.28;
+            let tip = p2 + tan * (sz * 0.25);
+            let head = vec![
+                tip,
+                tip - tan * sz + perp * (sz * 0.55),
+                tip - tan * sz - perp * (sz * 0.55),
+            ];
+            painter.add(egui::Shape::convex_polygon(head, color, egui::Stroke::NONE));
+        }
+        RailToolIconKind::TextLabel => {
+            // Pure geometric serif capital 'T' drawn with line primitives (zero glyph text)
+            painter.line_segment([pt(0.16, 0.20), pt(0.84, 0.20)], s_bold);
+            painter.line_segment([pt(0.16, 0.20), pt(0.16, 0.32)], s1);
+            painter.line_segment([pt(0.84, 0.20), pt(0.84, 0.32)], s1);
+            painter.line_segment([pt(0.50, 0.20), pt(0.50, 0.84)], s_bold);
+            painter.line_segment([pt(0.34, 0.84), pt(0.66, 0.84)], s1);
+        }
+    }
+}
+
+/// Draw a real connected folder-style tab (`active` joins seamlessly into the panel below with
+/// no bottom seam; `inactive` has a subtle background fill and full 1px outline).
+#[allow(clippy::too_many_arguments)]
+fn draw_folder_tab(
+    ui: &mut egui::Ui,
+    label: &str,
+    width: f32,
+    height: f32,
+    active: bool,
+    body_bg: egui::Color32,
+    inactive_bg: egui::Color32,
+    inactive_hover: egui::Color32,
+    border_col: egui::Color32,
+    accent_col: egui::Color32,
+    active_text: egui::Color32,
+    inactive_text: egui::Color32,
+) -> (egui::Rect, bool) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let hovered = resp.hovered();
+    if hovered && !active {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let painter = ui.painter();
+    let cr = egui::CornerRadius {
+        nw: 5,
+        ne: 5,
+        sw: 0,
+        se: 0,
+    };
+
+    if active {
+        painter.rect_filled(rect, cr, body_bg);
+        // Top accent bar inside the active folder tab
+        let accent_bar = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 1.0, rect.top() + 0.5),
+            egui::pos2(rect.right() - 1.0, rect.top() + 3.0),
+        );
+        painter.rect_filled(accent_bar, 2.0, accent_col);
+        // Draw left, top, and right borders ONLY (NO bottom seam!)
+        let stroke = egui::Stroke::new(1.0, border_col);
+        painter.line_segment([rect.left_bottom(), rect.left_top()], stroke);
+        painter.line_segment([rect.left_top(), rect.right_top()], stroke);
+        painter.line_segment([rect.right_top(), rect.right_bottom()], stroke);
+    } else {
+        let fill = if hovered { inactive_hover } else { inactive_bg };
+        painter.rect_filled(rect, cr, fill);
+        painter.rect_stroke(
+            rect,
+            cr,
+            egui::Stroke::new(1.0, border_col),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    painter.text(
+        rect.center() + egui::vec2(0.0, if active { 1.0 } else { 0.0 }),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(12.0),
+        if active { active_text } else { inactive_text },
+    );
+
+    (rect, resp.clicked())
+}
+
+fn format_experimental_spectrum_label(idx: usize, sp: &SceneSpectrum1D) -> String {
+    let nuc = if is_carbon_nucleus(&sp.nucleus) {
+        "13C"
+    } else {
+        "1H"
+    };
+    let mhz = sp.spectrometer_mhz.round().max(1.0) as usize;
+    if let Some(t) = sp.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        format!("{t} ({nuc}, {mhz} MHz)")
+    } else {
+        format!("Exp #{} ({nuc}, {mhz} MHz)", idx + 1)
+    }
+}
+
+/// Build screen-space polyline points for an experimental `SceneSpectrum1D` on the exact same
+/// `[ppm_lo, ppm_hi]` axis as the predicted spectrum (either upward for Overlay or downward for Mirror).
+#[allow(clippy::too_many_arguments)]
+fn build_experimental_trace_screen_pts(
+    spec: &SceneSpectrum1D,
+    ppm_lo: f64,
+    ppm_hi: f64,
+    n_pts: usize,
+    fallback_freq_mhz: f64,
+    ppm_to_x: &dyn Fn(f64) -> f32,
+    base_y: f32,
+    h_amp: f32,
+    mirror_down: bool,
+) -> Vec<egui::Pos2> {
+    let dir: f32 = if mirror_down { 1.0 } else { -1.0 };
+
+    if spec.custom_trace.len() >= 2 {
+        let mut pts: Vec<[f64; 2]> = spec
+            .custom_trace
+            .iter()
+            .copied()
+            .filter(|p| p[0].is_finite() && p[1].is_finite() && p[0] >= ppm_lo && p[0] <= ppm_hi)
+            .collect();
+        if pts.len() >= 2 {
+            pts.sort_by(|a, b| b[0].total_cmp(&a[0]));
+            let ymax = pts
+                .iter()
+                .map(|p| p[1].abs())
+                .fold(1e-9_f64, f64::max)
+                .max(1e-9);
+            let step = (pts.len() / 512).max(1);
+            return pts
+                .into_iter()
+                .step_by(step)
+                .map(|[ppm, y]| {
+                    let norm = (y.max(0.0) / ymax).clamp(0.0, 1.0) as f32;
+                    egui::pos2(ppm_to_x(ppm), base_y + dir * norm * h_amp)
+                })
+                .collect();
+        }
+    }
+
+    if spec.signals.is_empty() || n_pts < 2 {
+        return Vec::new();
+    }
+
+    let span = (ppm_hi - ppm_lo).max(1e-6);
+    let freq = if spec.spectrometer_mhz.is_finite() && spec.spectrometer_mhz > 10.0 {
+        spec.spectrometer_mhz
+    } else {
+        fallback_freq_mhz.max(25.0)
+    };
+    let lw_hz = if spec.linewidth_hz.is_finite() && spec.linewidth_hz > 0.05 {
+        spec.linewidth_hz
+    } else {
+        1.4
+    };
+    let gamma = (0.5 * lw_hz / freq).max(span * 0.0012);
+    let mut sublines = Vec::new();
+    for sig in &spec.signals {
+        let mult = if sig.multiplicity.trim().is_empty() {
+            "s"
+        } else {
+            sig.multiplicity.as_str()
+        };
+        for (dhz, amp) in expand_multiplet_lines_hz(mult, &sig.couplings_hz) {
+            sublines.push((sig.ppm + dhz / freq, amp * sig.integral.max(0.5)));
+        }
+    }
+    let mut ys = vec![0.0_f64; n_pts];
+    let mut ymax = 1e-9_f64;
+    for (k, y_slot) in ys.iter_mut().enumerate() {
+        let ppm = ppm_hi - (k as f64 / (n_pts - 1) as f64) * span;
+        let mut v = 0.0;
+        for &(lp, la) in &sublines {
+            let d = (ppm - lp) / gamma;
+            if d.abs() < 35.0 {
+                v += la / (1.0 + d * d);
+            }
+        }
+        *y_slot = v;
+        ymax = ymax.max(v);
+    }
+    (0..n_pts)
+        .map(|k| {
+            let ppm = ppm_hi - (k as f64 / (n_pts - 1) as f64) * span;
+            let norm = (ys[k] / ymax) as f32;
+            egui::pos2(ppm_to_x(ppm), base_y + dir * norm * h_amp)
+        })
+        .collect()
 }
 
 fn paint_vector_primitive(
@@ -5482,5 +6929,242 @@ mod tests {
             share >= 0.68,
             "Expected Octet canvas share >= 0.68 at 1440x900, got {share:.3} ({canvas_rect:?})"
         );
+    }
+
+    #[test]
+    fn left_vector_icon_rail_has_16_tools_switches_on_click_and_removes_top_tool_dropdown() {
+        let ctx = egui::Context::default();
+        let mut panel = OctetDrawPanel::new();
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+        let raw = egui::RawInput {
+            screen_rect: Some(vp),
+            ..Default::default()
+        };
+
+        let run_pass = |input: egui::RawInput, p: &mut OctetDrawPanel| {
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    p.ui(ui);
+                });
+            });
+            out.textures_delta.clear();
+            out
+        };
+
+        let _ = run_pass(raw.clone(), &mut panel);
+        let out2 = run_pass(raw.clone(), &mut panel);
+
+        let rail_rect = panel
+            .last_tool_rail_rect
+            .expect("left vector icon rail rect recorded");
+        assert!(
+            (38.0..=44.0).contains(&rail_rect.width()),
+            "Expected ~40 px left icon rail, got {:.1} px",
+            rail_rect.width()
+        );
+        assert_eq!(
+            panel.last_tool_slot_rects.len(),
+            16,
+            "Left vector icon rail must expose all 16 ChemDraw tools"
+        );
+
+        // Verify clicking Benzene tool slot (index 10) activates Benzene RingStamp
+        let (benzene_tool, benzene_rect) = panel.last_tool_slot_rects[10].clone();
+        assert_eq!(
+            benzene_tool,
+            DrawTool::RingStamp {
+                template_id: "benzene".to_string()
+            }
+        );
+        let click_pt = benzene_rect.center();
+        let mut click_down = raw.clone();
+        click_down.events.push(egui::Event::PointerMoved(click_pt));
+        click_down.events.push(egui::Event::PointerButton {
+            pos: click_pt,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = run_pass(click_down, &mut panel);
+
+        let mut click_up = raw;
+        click_up.events.push(egui::Event::PointerMoved(click_pt));
+        click_up.events.push(egui::Event::PointerButton {
+            pos: click_pt,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = run_pass(click_up, &mut panel);
+
+        assert_eq!(
+            panel.active_tool,
+            DrawTool::RingStamp {
+                template_id: "benzene".to_string()
+            }
+        );
+
+        // Verify redundant "Tool:" dropdown label is gone from top bar
+        let audit = crate::workbench_mode::audit_text_layout(&out2.shapes, vp);
+        assert!(
+            !audit.texts.iter().any(|t| t.text.trim() == "Tool:"),
+            "Redundant 'Tool:' ComboBox label must be removed from top bar"
+        );
+        assert!(
+            audit.min_font_px >= crate::workbench_mode::MIN_FONT_PX - 1e-3,
+            "Font floor violated: min_font_px = {}",
+            audit.min_font_px
+        );
+    }
+
+    #[test]
+    fn connected_folder_tabs_embed_send_to_1d_and_experimental_auto_assign_workflow() {
+        let ctx = egui::Context::default();
+        let mut panel = OctetDrawPanel::new();
+        panel.show_bottom_nmr_panel = true;
+
+        // Build realistic collected experimental 1H spectrum shifted slightly from predicted Aspirin
+        let exp_signals: Vec<SpectrumSignal1D> = panel
+            .cached_1h
+            .iter()
+            .map(|s| {
+                let mut e = s.clone();
+                e.ppm += 0.04;
+                e.atom_indices.clear();
+                e.assignment_label = None;
+                e
+            })
+            .collect();
+        panel.experimental_spectra.push(SceneSpectrum1D {
+            origin: [0.0, 0.0],
+            width_mol: 10.0,
+            height_mol: 3.4,
+            nucleus: "1H".to_string(),
+            spectrometer_mhz: 500.0,
+            ppm_min: -0.5,
+            ppm_max: 11.5,
+            linewidth_hz: 1.4,
+            show_integrals: true,
+            show_peak_labels: true,
+            title: Some("Collected Aspirin 1H".to_string()),
+            signals: exp_signals,
+            custom_trace: Vec::new(),
+        });
+        panel.selected_experimental_idx = Some(0);
+
+        // Run auto-assign and verify optimal matching
+        panel.run_auto_assign_1d();
+        let res = panel
+            .auto_assign_result
+            .as_ref()
+            .expect("auto_assign_result populated");
+        assert_eq!(res.matched_count, panel.cached_1h.len());
+        assert!(res.rmsd_ppm < 0.08);
+        assert!(res.mean_confidence > 0.65);
+
+        // Manual swap + lock override on groups 0 and 1
+        let orig_pk0 = res.assignments[0].peak_idx;
+        let orig_pk1 = res.assignments[1].peak_idx;
+        panel.swap_or_lock_nmr_assignment(0, orig_pk1, true);
+        let res_after = panel.auto_assign_result.as_ref().expect("result present");
+        assert_eq!(res_after.assignments[0].peak_idx, orig_pk1);
+        assert!(res_after.assignments[0].locked);
+        assert_eq!(res_after.assignments[1].peak_idx, orig_pk0);
+
+        // Send to 1D Suite populates pending_send_to_1d
+        assert!(panel.pending_send_to_1d.is_none());
+        panel.send_active_1d_to_suite();
+        let queued = panel
+            .pending_send_to_1d
+            .as_ref()
+            .expect("pending_send_to_1d must be set");
+        assert_eq!(queued.nucleus, "1H");
+        assert_eq!(queued.signals.len(), panel.cached_1h.len());
+
+        // Render both Overlay and Mirror modes at 1280x800 and verify folder tabs + no clipped text + font floor
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let raw = egui::RawInput {
+            screen_rect: Some(vp),
+            ..Default::default()
+        };
+        for mirror in [false, true] {
+            panel.mirror_experimental = mirror;
+            let mut out1 = ctx.run_ui(raw.clone(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    panel.ui(ui);
+                });
+            });
+            out1.textures_delta.clear();
+            let mut out2 = ctx.run_ui(raw.clone(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    panel.ui(ui);
+                });
+            });
+            out2.textures_delta.clear();
+
+            assert!(panel.last_nmr_tab_rects[0].is_some());
+            assert!(panel.last_nmr_tab_rects[1].is_some());
+
+            let audit = crate::workbench_mode::audit_text_layout(&out2.shapes, vp);
+            assert!(
+                audit
+                    .texts
+                    .iter()
+                    .any(|t| t.text.contains("Embed on Canvas")),
+                "Shortened 'Embed on Canvas' button must be rendered"
+            );
+            assert!(
+                audit
+                    .texts
+                    .iter()
+                    .any(|t| t.text.contains("Send to 1D Suite")),
+                "'Send to 1D Suite' button must be rendered"
+            );
+            assert!(
+                audit
+                    .texts
+                    .iter()
+                    .any(|t| t.text.contains("Fit & Auto-Assign")),
+                "'Fit & Auto-Assign' button must be rendered"
+            );
+            assert!(
+                audit.min_font_px >= crate::workbench_mode::MIN_FONT_PX - 1e-3,
+                "Font floor violated (mirror={mirror}): min_font_px = {}",
+                audit.min_font_px
+            );
+        }
+
+        // Click 13C{1H} NMR connected folder tab -> switches nmr_tab to Carbon13C
+        let tab_13c = panel.last_nmr_tab_rects[1].expect("13C tab rect");
+        let pt = tab_13c.center();
+        let mut down = raw.clone();
+        down.events.push(egui::Event::PointerMoved(pt));
+        down.events.push(egui::Event::PointerButton {
+            pos: pt,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut down_out = ctx.run_ui(down, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                panel.ui(ui);
+            });
+        });
+        down_out.textures_delta.clear();
+        let mut up = raw;
+        up.events.push(egui::Event::PointerMoved(pt));
+        up.events.push(egui::Event::PointerButton {
+            pos: pt,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut up_out = ctx.run_ui(up, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                panel.ui(ui);
+            });
+        });
+        up_out.textures_delta.clear();
+        assert_eq!(panel.nmr_tab, NmrViewTab::Carbon13C);
     }
 }
