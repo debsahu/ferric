@@ -312,8 +312,8 @@ fn f32_ulp_distance(a: f32, b: f32) -> u32 {
 /// macOS `aarch64` (`5c4e87d`):
 /// - Strict length equality before zipping (`21F:B16`).
 /// - On macOS `aarch64` (reference `libSystem`): exact `0.0` (`0` ULP).
-/// - On other OS/arch targets (e.g. Linux `x86_64` `glibc libm`, where `f64::exp`/`ln` differs by
-///   `~1-4 ULP` ~ `2.8e-14`): `max_diff <= 1.0e-12`.
+/// - On other OS/arch targets (e.g. Linux `x86_64` `glibc libm`, where `f64::exp`/`ln`/`cos`
+///   differ slightly from macOS `libSystem`, e.g. `1.16e-12` on `CPU P`): `max_diff <= 1.0e-11`.
 fn verify_golden_cpu_f64_slice(label: &str, got: &[f64], expected: &[f64]) -> Result<(), String> {
     if got.len() != expected.len() {
         return Err(format!(
@@ -330,7 +330,7 @@ fn verify_golden_cpu_f64_slice(label: &str, got: &[f64], expected: &[f64]) -> Re
     let tol = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         0.0
     } else {
-        1.0e-12
+        1.0e-11
     };
     if max_diff > tol {
         return Err(format!(
