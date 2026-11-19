@@ -503,7 +503,9 @@ fn cli_s4_help_honesty_no_apo_guard_pre_tau_c_and_boltz_range_checks() {
         "Gamma_2 PRE without tau_c must fail closed"
     );
 
-    let pre_metal_ok = Command::new(ferric_bin())
+    // 3b. `21F:B18`: `Gamma_2` PRE with `--pre-tau-c` but WITHOUT `--pre-proton-mhz` (or `# proton_mhz:`)
+    //     MUST also fail closed (no silent 600 MHz default)!
+    let pre_no_mhz_fail = Command::new(ferric_bin())
         .args([
             "cofold",
             "export",
@@ -524,14 +526,83 @@ fn cli_s4_help_honesty_no_apo_guard_pre_tau_c_and_boltz_range_checks() {
         .output()
         .unwrap();
     assert!(
+        !pre_no_mhz_fail.status.success(),
+        "21F:B18: Gamma_2 PRE without --pre-proton-mhz must fail closed"
+    );
+    let no_mhz_err = String::from_utf8_lossy(&pre_no_mhz_fail.stderr);
+    assert!(
+        no_mhz_err.contains("proton_mhz"),
+        "missing proton_mhz error should mention proton_mhz, got: {no_mhz_err}"
+    );
+
+    // 3c. With explicit `--pre-tau-c 10.0 --pre-proton-mhz 600.0 --pre-rigid-metal --max-contact-dist 20.0` succeeds!
+    let pre_metal_ok = Command::new(ferric_bin())
+        .args([
+            "cofold",
+            "export",
+            "--apo-structure",
+            ubq_pdb_path.to_str().unwrap(),
+            "--ligand-ccd",
+            "M:ZN",
+            "--pre",
+            pre_p.to_str().unwrap(),
+            "--pre-tau-c",
+            "10.0",
+            "--pre-proton-mhz",
+            "600.0",
+            "--pre-rigid-metal",
+            "--max-contact-dist",
+            "20.0",
+            "-o",
+            out_yaml.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
         pre_metal_ok.status.success(),
         "rigid-metal Solomon PRE export failed: {}",
         String::from_utf8_lossy(&pre_metal_ok.stderr)
+    );
+    let metal_stderr = String::from_utf8_lossy(&pre_metal_ok.stderr);
+    assert!(
+        metal_stderr.contains("proton_mhz=600.0 MHz"),
+        "CLI stderr must echo explicit proton_mhz=600.0 MHz, got: {metal_stderr}"
     );
     let metal_yaml = fs::read_to_string(&out_yaml).unwrap();
     assert!(
         metal_yaml.contains("  - contact:\n"),
         "expected ~19.0 A rigid-metal Solomon PRE contact <= 20.0 A in YAML:\n{metal_yaml}"
+    );
+
+    // 3d. `21F:B18`: MTSL `Gamma_2` PRE at default `14.0 A` ceiling emits explicit WARNING on stderr!
+    let pre_mtsl_warn = Command::new(ferric_bin())
+        .args([
+            "cofold",
+            "export",
+            "--apo-structure",
+            ubq_pdb_path.to_str().unwrap(),
+            "--ligand-ccd",
+            "M:ZN",
+            "--pre",
+            pre_p.to_str().unwrap(),
+            "--pre-tau-c",
+            "10.0",
+            "--pre-proton-mhz",
+            "600.0",
+            "-o",
+            out_yaml.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        pre_mtsl_warn.status.success(),
+        "MTSL PRE export with explicit proton_mhz failed: {}",
+        String::from_utf8_lossy(&pre_mtsl_warn.stderr)
+    );
+    let mtsl_stderr = String::from_utf8_lossy(&pre_mtsl_warn.stderr);
+    assert!(
+        mtsl_stderr.contains("WARNING:") && mtsl_stderr.contains("Solomon Gamma2 PRE"),
+        "CLI stderr must warn when default 14.0 A ceiling drops MTSL PRE restraints, got: {mtsl_stderr}"
     );
 
     // 4. `--pocket-max-dist` and `--max-contact-dist` outside `[4.0, 20.0]` fail closed

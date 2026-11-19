@@ -19,13 +19,12 @@ use nmr_core::cofold_bridge::{
     extract_nmr_interface_restraints, format_pose_score_json, format_pose_score_tsv,
     ligand_spec_from_octet_file, ligand_spec_from_octet_str, parse_cofold_fasta_str,
     parse_cofold_pcs_tsv_str, parse_cofold_rdc_tsv_str, parse_csp_restraint_str,
-    parse_intermolecular_noe_tsv_str, parse_intermolecular_pre_tsv_str_with_params,
+    parse_intermolecular_noe_tsv_str, parse_intermolecular_pre_tsv_str_with_overrides,
     score_cofold_poses, Af3ExportConfig, Boltz2ExportConfig, BondedAtomPairSpec, BondedAtomRef,
     CofoldConfidenceMetadata, CofoldEntitySpec, CofoldLigandSpec, CofoldPolymerKind,
     CofoldRestraintBundle, CofoldRestraintExtractConfig, CofoldRestraintInput, CspScoringMode,
-    PoseScoreConfig, PoseVerdict, PreSolomonParams, StructurePoseInput, BOLTZ2_MAX_DISTANCE_A,
-    BOLTZ2_MIN_DISTANCE_A, DEFAULT_MTSL_TETHER_PAD_A, DEFAULT_PRE_PROTON_MHZ,
-    MAX_COFOLD_INPUT_BYTES,
+    PoseScoreConfig, PoseVerdict, StructurePoseInput, BOLTZ2_MAX_DISTANCE_A,
+    BOLTZ2_MIN_DISTANCE_A, MAX_COFOLD_INPUT_BYTES,
 };
 use nmr_core::struct_shifts::StructureModel;
 
@@ -36,7 +35,7 @@ pub fn cofold_usage() -> &'static str {
                             [--ligand-smiles <ID:SMILES>] [--ligand-ccd <ID:CCD>] [--ligand-file <[ID:]path>]\n\
                             [--apo-structure <apo.cif|pdb>] [--allow-unfiltered-no-apo] [--min-rsasa 0.20]\n\
                             [--csp <csp.tsv|json>] [--noesy <inter_noe.tsv>] [--pre <pre.tsv>]\n\
-                            [--pre-anchor <CHAIN:SEQ:ATOM>] [--pre-tau-c <ns>] [--pre-proton-mhz 600.0]\n\
+                            [--pre-anchor <CHAIN:SEQ:ATOM>] [--pre-tau-c <ns>] [--pre-proton-mhz <MHz>]\n\
                             [--pre-tether-pad 6.0] [--pre-rigid-metal] [--pre-spin 0.5]\n\
                             [--rdc <rdcs.tsv>] [--pcs <pcs.tsv>] [--receptor-chain <ID>] [--binder-chain <ID>]\n\
                             [--pocket-max-dist 6.0] [--max-contact-dist 14.0] [--affinity] [--seeds 1,2,3] [--name <job>]\n\
@@ -46,7 +45,7 @@ pub fn cofold_usage() -> &'static str {
                             [--restraints <sidecar.nmr_restraints.json>] [--csp <csp.tsv|json>]\n\
                             [--apo-structure <apo.cif|pdb>] [--allow-unfiltered-no-apo]\n\
                             [--noesy <inter_noe.tsv>] [--pre <pre.tsv>] [--pre-anchor <CHAIN:SEQ:ATOM>]\n\
-                            [--pre-tau-c <ns>] [--pre-proton-mhz 600.0] [--pre-tether-pad 6.0] [--pre-rigid-metal]\n\
+                            [--pre-tau-c <ns>] [--pre-proton-mhz <MHz>] [--pre-tether-pad 6.0] [--pre-rigid-metal]\n\
                             [--rdc <rdcs.tsv>] [--pcs <pcs.tsv>] [--ligand-smiles <ID:SMILES>]\n\
                             [--ligand-file <[ID:]path>] [--receptor-chain <ID>] [--binder-chain <ID>]\n\
                             [--reference-pose <native.cif|pdb>] [--confidence <pose_id=conf.json>]\n\
@@ -262,9 +261,9 @@ fn run_cofold_export_cli(args: &[String]) -> Result<(), String> {
     let mut pre_path: Option<PathBuf> = None;
     let mut pre_anchor: Option<(String, i32, String)> = None;
     let mut pre_tau_c_ns: Option<f64> = None;
-    let mut pre_proton_mhz: f64 = DEFAULT_PRE_PROTON_MHZ;
-    let mut pre_tether_pad_a: f64 = DEFAULT_MTSL_TETHER_PAD_A;
-    let mut pre_spin_s: f64 = 0.5;
+    let mut pre_proton_mhz: Option<f64> = None;
+    let mut pre_tether_pad_a: Option<f64> = None;
+    let mut pre_spin_s: Option<f64> = None;
     let mut rdc_path: Option<PathBuf> = None;
     let mut pcs_path: Option<PathBuf> = None;
     let mut explicit_format: Option<ExportFormat> = None;
@@ -395,7 +394,7 @@ fn run_cofold_export_cli(args: &[String]) -> Result<(), String> {
                 }
                 pre_tau_c_ns = Some(tau);
             }
-            "--pre-proton-mhz" => {
+            "--pre-proton-mhz" | "--proton-mhz" => {
                 let v = next_val(&mut i, flag)?;
                 let mhz: f64 = v
                     .parse()
@@ -405,7 +404,7 @@ fn run_cofold_export_cli(args: &[String]) -> Result<(), String> {
                         "--pre-proton-mhz {mhz} must be finite in [1, 5000] MHz"
                     ));
                 }
-                pre_proton_mhz = mhz;
+                pre_proton_mhz = Some(mhz);
             }
             "--pre-tether-pad" => {
                 let v = next_val(&mut i, flag)?;
@@ -417,10 +416,10 @@ fn run_cofold_export_cli(args: &[String]) -> Result<(), String> {
                         "--pre-tether-pad {pad} must be finite in [0.0, 15.0] A"
                     ));
                 }
-                pre_tether_pad_a = pad;
+                pre_tether_pad_a = Some(pad);
             }
             "--pre-rigid-metal" => {
-                pre_tether_pad_a = 0.0;
+                pre_tether_pad_a = Some(0.0);
             }
             "--pre-spin" => {
                 let v = next_val(&mut i, flag)?;
@@ -430,7 +429,7 @@ fn run_cofold_export_cli(args: &[String]) -> Result<(), String> {
                 if !s.is_finite() || !(0.5..=8.0).contains(&s) {
                     return Err(format!("--pre-spin {s} must be finite in [0.5, 8.0]"));
                 }
-                pre_spin_s = s;
+                pre_spin_s = Some(s);
             }
             "--rdc" => {
                 rdc_path = Some(PathBuf::from(next_val(&mut i, flag)?));
@@ -561,18 +560,15 @@ fn run_cofold_export_cli(args: &[String]) -> Result<(), String> {
         let anc_ref = pre_anchor
             .as_ref()
             .map(|(c, s, a)| (c.as_str(), *s, a.as_str()));
-        let solomon_params = pre_tau_c_ns.map(|tau_c_ns| PreSolomonParams {
-            tau_c_ns,
-            proton_mhz: pre_proton_mhz,
-            spin_s: pre_spin_s,
-            tether_pad_a: pre_tether_pad_a,
-            upper_margin_a: extract_cfg.pre_gamma2_upper_margin_a,
-        });
-        let pres = parse_intermolecular_pre_tsv_str_with_params(
+        let pres = parse_intermolecular_pre_tsv_str_with_overrides(
             &txt,
             anc_ref,
             &default_rec,
-            solomon_params.as_ref(),
+            pre_tau_c_ns,
+            pre_proton_mhz,
+            pre_spin_s,
+            pre_tether_pad_a,
+            extract_cfg.pre_gamma2_upper_margin_a,
         )
         .map_err(String::from)?;
         input.raw_distance_restraints.extend(pres);
@@ -605,6 +601,11 @@ fn run_cofold_export_cli(args: &[String]) -> Result<(), String> {
     }
 
     let bundle = extract_nmr_interface_restraints(&input, &extract_cfg).map_err(String::from)?;
+    for diag in &bundle.diagnostics {
+        if diag.starts_with("WARNING:") || diag.starts_with("Solomon Gamma2 PRE") {
+            eprintln!("[cofold] {diag}");
+        }
+    }
 
     let fmt = match (explicit_format, out_path.as_deref(), out_prefix.as_deref()) {
         (Some(f), _, _) => f,
@@ -739,9 +740,9 @@ fn run_cofold_score_cli(args: &[String]) -> Result<(), String> {
     let mut pre_path: Option<PathBuf> = None;
     let mut pre_anchor: Option<(String, i32, String)> = None;
     let mut pre_tau_c_ns: Option<f64> = None;
-    let mut pre_proton_mhz: f64 = DEFAULT_PRE_PROTON_MHZ;
-    let mut pre_tether_pad_a: f64 = DEFAULT_MTSL_TETHER_PAD_A;
-    let mut pre_spin_s: f64 = 0.5;
+    let mut pre_proton_mhz: Option<f64> = None;
+    let mut pre_tether_pad_a: Option<f64> = None;
+    let mut pre_spin_s: Option<f64> = None;
     let mut rdc_path: Option<PathBuf> = None;
     let mut pcs_path: Option<PathBuf> = None;
     let mut ref_pose_path: Option<PathBuf> = None;
@@ -835,7 +836,7 @@ fn run_cofold_score_cli(args: &[String]) -> Result<(), String> {
                 }
                 pre_tau_c_ns = Some(tau);
             }
-            "--pre-proton-mhz" => {
+            "--pre-proton-mhz" | "--proton-mhz" => {
                 let v = next_val(&mut i, flag)?;
                 let mhz: f64 = v
                     .parse()
@@ -845,7 +846,7 @@ fn run_cofold_score_cli(args: &[String]) -> Result<(), String> {
                         "--pre-proton-mhz {mhz} must be finite in [1, 5000] MHz"
                     ));
                 }
-                pre_proton_mhz = mhz;
+                pre_proton_mhz = Some(mhz);
             }
             "--pre-tether-pad" => {
                 let v = next_val(&mut i, flag)?;
@@ -857,10 +858,10 @@ fn run_cofold_score_cli(args: &[String]) -> Result<(), String> {
                         "--pre-tether-pad {pad} must be finite in [0.0, 15.0] A"
                     ));
                 }
-                pre_tether_pad_a = pad;
+                pre_tether_pad_a = Some(pad);
             }
             "--pre-rigid-metal" => {
-                pre_tether_pad_a = 0.0;
+                pre_tether_pad_a = Some(0.0);
             }
             "--pre-spin" => {
                 let v = next_val(&mut i, flag)?;
@@ -870,7 +871,7 @@ fn run_cofold_score_cli(args: &[String]) -> Result<(), String> {
                 if !s.is_finite() || !(0.5..=8.0).contains(&s) {
                     return Err(format!("--pre-spin {s} must be finite in [0.5, 8.0]"));
                 }
-                pre_spin_s = s;
+                pre_spin_s = Some(s);
             }
             "--csp-scoring" => {
                 let v = next_val(&mut i, flag)?;
@@ -1088,18 +1089,15 @@ fn run_cofold_score_cli(args: &[String]) -> Result<(), String> {
             let anc_ref = pre_anchor
                 .as_ref()
                 .map(|(c, s, a)| (c.as_str(), *s, a.as_str()));
-            let solomon_params = pre_tau_c_ns.map(|tau_c_ns| PreSolomonParams {
-                tau_c_ns,
-                proton_mhz: pre_proton_mhz,
-                spin_s: pre_spin_s,
-                tether_pad_a: pre_tether_pad_a,
-                upper_margin_a: extract_cfg.pre_gamma2_upper_margin_a,
-            });
-            let pres = parse_intermolecular_pre_tsv_str_with_params(
+            let pres = parse_intermolecular_pre_tsv_str_with_overrides(
                 &txt,
                 anc_ref,
                 &default_rec,
-                solomon_params.as_ref(),
+                pre_tau_c_ns,
+                pre_proton_mhz,
+                pre_spin_s,
+                pre_tether_pad_a,
+                extract_cfg.pre_gamma2_upper_margin_a,
             )
             .map_err(String::from)?;
             raw_input.raw_distance_restraints.extend(pres);

@@ -115,12 +115,11 @@ pub const DEFAULT_MAX_ALLOWED_VIOLATION_A: f64 = 1.50;
 
 /// Minimum `CSP` `5.0 A` contact ROC-AUC (`0.65`) required when `>= 5` surface `CSP` hits exist.
 ///
-/// Derived *a priori* (before any benchmark was run; `21.W3:P0-3`): `0.65` is the conventional
-/// "better than weak" operating point, and for the minimum guard population (`n_pos = 5`
-/// surface hits against `n_neg >= 20` non-hits) it sits `~1.0` Mann-Whitney standard deviations
-/// above chance (`sigma_AUC = sqrt((n_pos + n_neg + 1) / (12 n_pos n_neg)) ~ 0.147`), i.e. a
-/// pose is flagged unless its contact enrichment is at least visibly above random. The value
-/// formerly used (`0.58`) had been fitted to a single circular test pose (`0.607`).
+/// Conventional moderate-enrichment operating point (`0.65`; committed alongside the synthetic
+/// self-consistency benchmark, not audited as an a-priori holdout, `21F:B17`): for the minimum
+/// guard population (`n_pos = 5` surface hits against `n_neg >= 20` non-hits) it sits `~1.0`
+/// Mann-Whitney standard deviations above chance
+/// (`sigma_AUC = sqrt((n_pos + n_neg + 1) / (12 n_pos n_neg)) ~ 0.147`).
 /// Every pose additionally reports the one-sided Mann-Whitney `p` value of its contact AUC.
 pub const DEFAULT_MIN_CSP_ROC_AUC: f64 = 0.65;
 
@@ -1230,6 +1229,10 @@ pub struct IntermolecularDistanceRestraint {
     /// Optional quantitative Solomon `PRE` `(gamma2_obs_s1, sigma_s1, k_eff_a6_s1)` metadata, where
     /// `k_eff_a6_s1 = K_Solomon * (4 tau_c + 3 tau_c / (1 + omega_H^2 tau_c^2))`.
     pub pre_gamma2: Option<(f64, f64, f64)>,
+    /// Explicit spectrometer `1H` Larmor frequency (`MHz`) used to convert `Gamma_2` PRE rates
+    /// (`Some(mhz)` for `PreGamma2Rate`, `None` otherwise; echoed in JSON & CLI diagnostics, `21F:B18`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_proton_mhz: Option<f64>,
     /// Attractive upper bound exported to `Boltz-2` `contact` (`None` if non-attractive, distal, or
     /// **dropped** because its upper bound exceeds the configured ceiling; never clamped down).
     pub exported_contact_max_distance_a: Option<f64>,
@@ -2556,6 +2559,9 @@ pub fn extract_nmr_interface_restraints(
     //    Upper bounds above `max_contact_distance_a` are DROPPED (never clamped to the ceiling).
     let mut distance_restraints = Vec::with_capacity(input.raw_distance_restraints.len());
     let mut dropped_weak = 0usize;
+    let mut dropped_pre_gamma2 = 0usize;
+    let mut total_pre_gamma2 = 0usize;
+    let mut pre_proton_mhz_seen: Vec<f64> = Vec::new();
     let mut unexportable_lig_contacts = 0usize;
     for raw in &input.raw_distance_restraints {
         if !raw.lower_a.is_finite()
@@ -2597,11 +2603,26 @@ pub fn extract_nmr_interface_restraints(
             })
         };
 
+        let is_pre_gamma2 = raw.source == DistanceRestraintSource::PreGamma2Rate;
+        if is_pre_gamma2 {
+            total_pre_gamma2 += 1;
+            if let Some(mhz) = raw.pre_proton_mhz {
+                if !pre_proton_mhz_seen
+                    .iter()
+                    .any(|&x| (x - mhz).abs() < 1e-6)
+                {
+                    pre_proton_mhz_seen.push(mhz);
+                }
+            }
+        }
         let attractive = raw.chain_1 != raw.chain_2 && raw.upper_a.is_finite();
         let mut exported_max = None;
         if attractive {
             if raw.upper_a > cfg.max_contact_distance_a {
                 dropped_weak += 1;
+                if is_pre_gamma2 {
+                    dropped_pre_gamma2 += 1;
+                }
             } else {
                 exported_max = Some(raw.upper_a.max(cfg.min_contact_distance_a));
             }
@@ -2670,10 +2691,27 @@ pub fn extract_nmr_interface_restraints(
             upper_a: raw.upper_a,
             sigma_a: raw.sigma_a,
             pre_gamma2: raw.pre_gamma2,
+            pre_proton_mhz: raw.pre_proton_mhz,
             exported_contact_max_distance_a: exported_max,
             boltz_token_1: tok1,
             boltz_token_2: tok2,
         });
+    }
+    if total_pre_gamma2 > 0 && !pre_proton_mhz_seen.is_empty() {
+        let mhz_list: Vec<String> = pre_proton_mhz_seen
+            .iter()
+            .map(|m| format!("{m:.1}"))
+            .collect();
+        diagnostics.push(format!(
+            "Solomon Gamma2 PRE restraints ({total_pre_gamma2}) calibrated at explicit 1H Larmor frequency proton_mhz={} MHz.",
+            mhz_list.join(", ")
+        ));
+    }
+    if dropped_pre_gamma2 > 0 {
+        diagnostics.push(format!(
+            "WARNING: Boltz-2 contact export dropped {dropped_pre_gamma2}/{total_pre_gamma2} Solomon Gamma2 PRE restraint(s) because their tether-padded upper bound exceeds the {:.1} A contact export ceiling (with the default 6.0 A MTSL tether allowance + 1.5 A margin, most MTSL Gamma2 PRE restraints exceed 14.0 A and are inert in Boltz-2 export unless `--max-contact-dist 20.0` or `--pre-rigid-metal` is set; all PRE restraints remain active in `ferric cofold score`).",
+            cfg.max_contact_distance_a
+        ));
     }
     if dropped_weak > 0 {
         diagnostics.push(format!(
@@ -3057,6 +3095,7 @@ pub fn parse_intermolecular_noe_tsv_str(
             upper_a,
             sigma_a,
             pre_gamma2: None,
+            pre_proton_mhz: None,
             exported_contact_max_distance_a: None,
             boltz_token_1: None,
             boltz_token_2: None,
@@ -3081,23 +3120,26 @@ pub fn parse_intermolecular_pre_tsv_str(
     default_target_chain: &str,
     gamma2_upper_margin_a: f64,
 ) -> Result<Vec<IntermolecularDistanceRestraint>, NmrError> {
-    parse_intermolecular_pre_tsv_str_with_margin(
+    parse_intermolecular_pre_tsv_str_with_overrides(
         text,
         default_anchor,
         default_target_chain,
+        None,
+        None,
+        None,
         None,
         gamma2_upper_margin_a,
     )
 }
 
 /// Parse intermolecular `T11.4` `PRE` bleaching / distance-bound / Solomon `Gamma_2` restraints from
-/// TSV text with explicit [`PreSolomonParams`] (mandatory `tau_c_ns`, `proton_mhz`, `spin_s`,
-/// `tether_pad_a`).
+/// TSV text with explicit [`PreSolomonParams`] (mandatory `tau_c_ns` and `proton_mhz`, plus `spin_s`
+/// and `tether_pad_a`).
 ///
 /// Header directives:
 /// - `# anchor: <chain_id> <seq_id> <atom_name>`
 /// - `# tau_c_ns: <f64>` (required for `gamma2` unless `solomon_params` is `Some`)
-/// - `# proton_mhz: <f64>` (default `600.0 MHz`)
+/// - `# proton_mhz: <f64>` (required for `gamma2` unless `solomon_params` is `Some`; no silent 600 MHz default, `21F:B18`)
 /// - `# spin_s: <f64>` (default `0.5`)
 /// - `# tether_pad_a: <f64>` (default `6.0 A` for MTSL; `0.0 A` for rigid paramagnetic metal)
 /// - `# mode: bounds | gamma2 | bleach`
@@ -3107,39 +3149,42 @@ pub fn parse_intermolecular_pre_tsv_str_with_params(
     default_target_chain: &str,
     solomon_params: Option<&PreSolomonParams>,
 ) -> Result<Vec<IntermolecularDistanceRestraint>, NmrError> {
-    let margin = solomon_params.map(|p| p.upper_margin_a).unwrap_or(1.5);
-    parse_intermolecular_pre_tsv_str_with_margin(
+    parse_intermolecular_pre_tsv_str_with_overrides(
         text,
         default_anchor,
         default_target_chain,
-        solomon_params,
-        margin,
+        solomon_params.map(|p| p.tau_c_ns),
+        solomon_params.map(|p| p.proton_mhz),
+        solomon_params.map(|p| p.spin_s),
+        solomon_params.map(|p| p.tether_pad_a),
+        solomon_params.map(|p| p.upper_margin_a).unwrap_or(1.5),
     )
 }
 
-fn parse_intermolecular_pre_tsv_str_with_margin(
+/// Parse intermolecular `PRE` TSV with independent CLI/caller overrides for `tau_c_ns`, `proton_mhz`,
+/// `spin_s`, `tether_pad_a`, and `gamma2_upper_margin_a` (`21F:B18`).
+///
+/// For `gamma2` rows, BOTH `tau_c_ns` and `proton_mhz` MUST be explicitly provided via either the
+/// override arguments or `# tau_c_ns:` / `# proton_mhz:` TSV headers (fails closed otherwise).
+#[allow(clippy::too_many_arguments)]
+pub fn parse_intermolecular_pre_tsv_str_with_overrides(
     text: &str,
     default_anchor: Option<(&str, i32, &str)>,
     default_target_chain: &str,
-    solomon_params: Option<&PreSolomonParams>,
+    cli_tau_c_ns: Option<f64>,
+    cli_proton_mhz: Option<f64>,
+    cli_spin_s: Option<f64>,
+    cli_tether_pad_a: Option<f64>,
     gamma2_upper_margin_a: f64,
 ) -> Result<Vec<IntermolecularDistanceRestraint>, NmrError> {
     check_bounded_text(text, "intermolecular PRE TSV")?;
     let mut header_anchor: Option<(String, i32, String)> =
         default_anchor.map(|(c, s, a)| (c.to_string(), s, a.to_ascii_uppercase()));
-    let mut header_tau_c_ns: Option<f64> = solomon_params.map(|p| p.tau_c_ns);
-    let mut header_proton_mhz: f64 = solomon_params
-        .map(|p| p.proton_mhz)
-        .unwrap_or(DEFAULT_PRE_PROTON_MHZ);
-    let mut header_spin_s: f64 = solomon_params
-        .map(|p| p.spin_s)
-        .unwrap_or(DEFAULT_PRE_ELECTRON_SPIN);
-    let mut header_tether_pad_a: f64 = solomon_params
-        .map(|p| p.tether_pad_a)
-        .unwrap_or(DEFAULT_MTSL_TETHER_PAD_A);
-    let header_upper_margin_a: f64 = solomon_params
-        .map(|p| p.upper_margin_a)
-        .unwrap_or(gamma2_upper_margin_a);
+    let mut header_tau_c_ns: Option<f64> = cli_tau_c_ns;
+    let mut header_proton_mhz: Option<f64> = cli_proton_mhz;
+    let mut header_spin_s: f64 = cli_spin_s.unwrap_or(DEFAULT_PRE_ELECTRON_SPIN);
+    let mut header_tether_pad_a: f64 = cli_tether_pad_a.unwrap_or(DEFAULT_MTSL_TETHER_PAD_A);
+    let header_upper_margin_a: f64 = gamma2_upper_margin_a;
     let mut mode_hint: Option<String> = None;
     let mut out = Vec::new();
 
@@ -3186,10 +3231,14 @@ fn parse_intermolecular_pre_tsv_str_with_margin(
                         "PRE TSV line {line_no}: # tau_c_ns ({tv}) must be finite in [0.05, 10000] ns"
                     )));
                 }
-                if solomon_params.is_none() {
+                if cli_tau_c_ns.is_none() {
                     header_tau_c_ns = Some(tv);
                 }
-            } else if let Some(rest) = c.strip_prefix("proton_mhz:") {
+            } else if let Some(rest) = c
+                .strip_prefix("proton_mhz:")
+                .or_else(|| c.strip_prefix("field_mhz:"))
+                .or_else(|| c.strip_prefix("omega_h_mhz:"))
+            {
                 let fv: f64 = rest.trim().parse().map_err(|e| {
                     NmrError::parse(format!("PRE TSV line {line_no}: invalid # proton_mhz: {e}"))
                 })?;
@@ -3198,8 +3247,8 @@ fn parse_intermolecular_pre_tsv_str_with_margin(
                         "PRE TSV line {line_no}: # proton_mhz ({fv}) must be finite in [1, 5000] MHz"
                     )));
                 }
-                if solomon_params.is_none() {
-                    header_proton_mhz = fv;
+                if cli_proton_mhz.is_none() {
+                    header_proton_mhz = Some(fv);
                 }
             } else if let Some(rest) = c.strip_prefix("spin_s:") {
                 let sv: f64 = rest.trim().parse().map_err(|e| {
@@ -3210,7 +3259,7 @@ fn parse_intermolecular_pre_tsv_str_with_margin(
                         "PRE TSV line {line_no}: # spin_s ({sv}) must be finite in [0.5, 8.0]"
                     )));
                 }
-                if solomon_params.is_none() {
+                if cli_spin_s.is_none() {
                     header_spin_s = sv;
                 }
             } else if let Some(rest) = c
@@ -3227,7 +3276,7 @@ fn parse_intermolecular_pre_tsv_str_with_margin(
                         "PRE TSV line {line_no}: # tether_pad_a ({pv}) must be finite in [0, 15] A"
                     )));
                 }
-                if solomon_params.is_none() {
+                if cli_tether_pad_a.is_none() {
                     header_tether_pad_a = pv;
                 }
             } else if let Some(rest) = c.strip_prefix("mode:") {
@@ -3367,6 +3416,7 @@ fn parse_intermolecular_pre_tsv_str_with_margin(
                 upper_a: r_bleach,
                 sigma_a: 1.00,
                 pre_gamma2: None,
+                pre_proton_mhz: None,
                 exported_contact_max_distance_a: None,
                 boltz_token_1: None,
                 boltz_token_2: None,
@@ -3411,6 +3461,7 @@ fn parse_intermolecular_pre_tsv_str_with_margin(
                 upper_a,
                 sigma_a,
                 pre_gamma2: None,
+                pre_proton_mhz: None,
                 exported_contact_max_distance_a: None,
                 boltz_token_1: None,
                 boltz_token_2: None,
@@ -3421,9 +3472,14 @@ fn parse_intermolecular_pre_tsv_str_with_margin(
                     "PRE line {line_no}: Gamma_2 PRE conversion requires rotational correlation time tau_c_ns (--pre-tau-c or `# tau_c_ns: <ns>` header); no default tau_c is assumed (21.W3:P0-4)"
                 ))
             })?;
+            let proton_mhz = header_proton_mhz.ok_or_else(|| {
+                NmrError::invalid_input(format!(
+                    "PRE line {line_no}: Gamma_2 PRE conversion requires explicit 1H spectrometer Larmor frequency proton_mhz (--pre-proton-mhz / --proton-mhz or `# proton_mhz: <MHz>` header); no default 600 MHz is assumed (21F:B18)"
+                ))
+            })?;
             let params = PreSolomonParams {
                 tau_c_ns,
-                proton_mhz: header_proton_mhz,
+                proton_mhz,
                 spin_s: header_spin_s,
                 tether_pad_a: header_tether_pad_a,
                 upper_margin_a: header_upper_margin_a,
@@ -3468,6 +3524,7 @@ fn parse_intermolecular_pre_tsv_str_with_margin(
                 upper_a,
                 sigma_a: 1.00,
                 pre_gamma2: Some((gamma2, sigma_g2, k_eff)),
+                pre_proton_mhz: Some(proton_mhz),
                 exported_contact_max_distance_a: None,
                 boltz_token_1: None,
                 boltz_token_2: None,

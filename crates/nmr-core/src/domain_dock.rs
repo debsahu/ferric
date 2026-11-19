@@ -3206,8 +3206,8 @@ pub fn parse_domain_pre_tsv_str_with_defaults(
     let mut tau_c_map: BTreeMap<String, f64> = BTreeMap::new();
     let mut mhz_map: BTreeMap<String, f64> = BTreeMap::new();
     let mut tether_map: BTreeMap<String, f64> = BTreeMap::new();
-    let mut spin_s_val = 0.5_f64;
-    let mut g_factor_val = CODATA_ELECTRON_G_FACTOR;
+    let mut spin_s_map: BTreeMap<String, f64> = BTreeMap::new();
+    let mut g_factor_map: BTreeMap<String, f64> = BTreeMap::new();
     let mut saw_legacy_k_pre = false;
     let mut bounds_mode = false;
     let mut has_site_col = false;
@@ -3269,16 +3269,18 @@ pub fn parse_domain_pre_tsv_str_with_defaults(
                     ));
                 }
                 mhz_map.insert(k_site, mhz);
-            } else if let Some((_, rest)) = parse_directive_key_and_tag(c, "spin_s") {
-                spin_s_val = parse_finite_f64(rest.trim(), "spin_s", line_no)?;
-                if spin_s_val <= 0.0 {
+            } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "spin_s") {
+                let s_val = parse_finite_f64(rest.trim(), "spin_s", line_no)?;
+                if s_val <= 0.0 {
                     return Err(format!("PRE line {line_no}: # spin_s must be > 0"));
                 }
-            } else if let Some((_, rest)) = parse_directive_key_and_tag(c, "g_factor") {
-                g_factor_val = parse_finite_f64(rest.trim(), "g_factor", line_no)?;
-                if g_factor_val <= 0.0 {
+                spin_s_map.insert(k_site, s_val);
+            } else if let Some((k_site, rest)) = parse_directive_key_and_tag(c, "g_factor") {
+                let g_val = parse_finite_f64(rest.trim(), "g_factor", line_no)?;
+                if g_val <= 0.0 {
                     return Err(format!("PRE line {line_no}: # g_factor must be > 0"));
                 }
+                g_factor_map.insert(k_site, g_val);
             } else if let Some((k_site, rest)) =
                 parse_directive_key_and_tag(c, "mtsl_tether_allowance_a")
                     .or_else(|| parse_directive_key_and_tag(c, "tether_allowance_a"))
@@ -3410,8 +3412,18 @@ pub fn parse_domain_pre_tsv_str_with_defaults(
                     "PRE line {line_no}: Solomon Gamma2 PRE restraints require mandatory `# proton_mhz: <MHz>` (or `--pre-proton-mhz <MHz>`) alongside tau_c_ns={tau_c_ns}"
                 )
             })?;
+            let spin_s_eff = spin_s_map
+                .get(&site_id)
+                .or_else(|| spin_s_map.get(""))
+                .copied()
+                .unwrap_or(0.5);
+            let g_factor_eff = g_factor_map
+                .get(&site_id)
+                .or_else(|| g_factor_map.get(""))
+                .copied()
+                .unwrap_or(CODATA_ELECTRON_G_FACTOR);
             let k_pre_a6_s1 =
-                compute_solomon_k_pre_a6_s1(tau_c_ns, proton_mhz, spin_s_val, g_factor_val)?;
+                compute_solomon_k_pre_a6_s1(tau_c_ns, proton_mhz, spin_s_eff, g_factor_eff)?;
             PreRestraintKind::Gamma2Rate {
                 gamma2_obs_s1,
                 sigma_s1,
@@ -4158,7 +4170,8 @@ impl DomainLinkerKinematics {
             let mut c_end = c_start + 1;
             while c_end < l
                 && af_residues[c_end].chain_id == cid
-                && v_dist(ref_chain.residues[c_end - 1].c, ref_chain.residues[c_end].n) <= 2.5
+                && (v_dist(ref_chain.residues[c_end - 1].c, ref_chain.residues[c_end].n) <= 2.5
+                    || af_residues[c_end].seq_id == af_residues[c_end - 1].seq_id + 1)
             {
                 c_end += 1;
             }
@@ -4289,12 +4302,28 @@ impl DomainLinkerKinematics {
             let (r_c_prev_n, ang_ca_prev_c_prev_n, r_n_ca, ang_c_prev_n_ca, phi_r) =
                 if !is_chain_start {
                     let prev = &ref_chain.residues[i - 1];
-                    let rc_n = v_dist(prev.c, r_pdb.n).clamp(1.10, 2.50);
-                    let a_cacn = interior_angle_rad(prev.ca, prev.c, r_pdb.n, ANGLE_CA_C_N_DEG);
+                    let raw_cn = v_dist(prev.c, r_pdb.n);
                     let rn_ca = v_dist(r_pdb.n, r_pdb.ca).clamp(1.20, 1.80);
-                    let a_cnca = interior_angle_rad(prev.c, r_pdb.n, r_pdb.ca, ANGLE_C_N_CA_DEG);
-                    let ph = calc_dihedral_deg(prev.c, r_pdb.n, r_pdb.ca, r_pdb.c).to_radians();
-                    (rc_n, a_cacn, rn_ca, a_cnca, ph)
+                    if is_reentry_start && (raw_cn - BOND_C_N).abs() > 0.15 {
+                        // Input model has a broken/stretched re-entry peptide bond: enforce
+                        // canonical peptide-bond closure geometry (`1.329 Å`, `21F:B5`).
+                        (
+                            BOND_C_N,
+                            ANGLE_CA_C_N_DEG.to_radians(),
+                            rn_ca,
+                            ANGLE_C_N_CA_DEG.to_radians(),
+                            -120.0_f64.to_radians(),
+                        )
+                    } else {
+                        let rc_n = raw_cn.clamp(1.10, 2.50);
+                        let a_cacn =
+                            interior_angle_rad(prev.ca, prev.c, r_pdb.n, ANGLE_CA_C_N_DEG);
+                        let a_cnca =
+                            interior_angle_rad(prev.c, r_pdb.n, r_pdb.ca, ANGLE_C_N_CA_DEG);
+                        let ph =
+                            calc_dihedral_deg(prev.c, r_pdb.n, r_pdb.ca, r_pdb.c).to_radians();
+                        (rc_n, a_cacn, rn_ca, a_cnca, ph)
+                    }
                 } else {
                     let rn_ca = v_dist(r_pdb.n, r_pdb.ca).clamp(1.20, 1.80);
                     let a_cnca =
@@ -4317,7 +4346,14 @@ impl DomainLinkerKinematics {
             let (psi_r, omg_r) = if i + 1 < ce {
                 let nxt = &ref_chain.residues[i + 1];
                 let ps = calc_dihedral_deg(r_pdb.n, r_pdb.ca, r_pdb.c, nxt.n).to_radians();
-                let om = calc_dihedral_deg(r_pdb.ca, r_pdb.c, nxt.n, nxt.ca).to_radians();
+                let next_is_reentry = res_block_id[i + 1].is_some_and(|bid| {
+                    rigid_blocks[bid].start_res == i + 1 && rigid_blocks[bid].master_block_id != bid
+                });
+                let om = if next_is_reentry && (v_dist(r_pdb.c, nxt.n) - BOND_C_N).abs() > 0.15 {
+                    PI
+                } else {
+                    calc_dihedral_deg(r_pdb.ca, r_pdb.c, nxt.n, nxt.ca).to_radians()
+                };
                 (ps, om)
             } else {
                 let ps = wrap_angle_rad(
@@ -4704,6 +4740,44 @@ impl DomainLinkerKinematics {
             max_rmsd
         }
     }
+
+    /// Return `true` if any rigid domain has discontinuous re-entry spans (`master_block_id != block_id`).
+    pub fn has_reentry_blocks(&self) -> bool {
+        self.rigid_blocks
+            .iter()
+            .any(|b| b.master_block_id != b.block_id)
+    }
+
+    /// Maximum peptide-bond `|d(C_{s_1 - 1}, N_{s_1}) - r_c_prev_n|` deviation (Å) across all
+    /// discontinuous insertion-domain re-entry boundaries (`21F:B5`). Returns `0.0` when there are
+    /// no discontinuous re-entry boundaries.
+    pub fn max_reentry_cn_err_angstrom(&self, state: &DomainDockState) -> f64 {
+        let (slots, _) = self.forward_slots_and_block_frames(state);
+        self.max_reentry_cn_err_from_slots(&slots)
+    }
+
+    /// Compute maximum re-entry peptide-bond C–N deviation (Å) directly from evaluated atom slots.
+    pub(crate) fn max_reentry_cn_err_from_slots(&self, slots: &[(Vec3, bool)]) -> f64 {
+        let mut max_err = 0.0_f64;
+        for blk in &self.rigid_blocks {
+            if blk.master_block_id == blk.block_id {
+                continue;
+            }
+            let s_1 = blk.start_res;
+            let (cs, _) = self.chain_ranges[blk.chain_idx];
+            if s_1 <= cs {
+                continue;
+            }
+            let c_prev = slots[7 * (s_1 - 1) + 4].0;
+            let n_reentry = slots[7 * s_1].0;
+            let ideal_cn = self.residues[s_1].r_c_prev_n;
+            let err = (v_dist(c_prev, n_reentry) - ideal_cn).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+        max_err
+    }
 }
 
 // ---- Prepared Restraint Tables (Zero `is_free` Leakage; Shared with `nmr-gpu`) ----
@@ -4901,7 +4975,7 @@ impl PreparedDomainDockRestraints {
             DEFAULT_MIN_ORDERED_PLDDT,
             false,
             8.0,
-            0.0,
+            DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM,
         )
     }
 
@@ -5165,9 +5239,18 @@ impl PreparedDomainDockRestraints {
                 site_local_pos,
             });
 
+            // Explicit `# site_pos` (rigid metal / explicit electron coordinates) defaults to `0.0 Å`
+            // unless overridden per-site; `# site_anchor` (e.g. `CYS:CB` nitroxide spin label)
+            // applies `default_mtsl_tether_allowance_a` (`DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM`, `21F:B18`).
             let tether_a = ps
                 .mtsl_tether_allowance_a
-                .unwrap_or(default_mtsl_tether_allowance_a)
+                .unwrap_or_else(|| {
+                    if ps.site_pos_initial.is_some() && ps.anchor_residue_atom.is_none() {
+                        0.0
+                    } else {
+                        default_mtsl_tether_allowance_a
+                    }
+                })
                 .max(0.0);
 
             for r in &ps.restraints {
@@ -5989,17 +6072,37 @@ pub fn evaluate_domain_dock_fixed_saupe_cpu(
         &blk_frames,
         saupe_matrices,
         weights,
+        None,
     )
 }
 
 /// Evaluate the full variable-projection (`VarPro`) composite docking energy and exact Envelope-Theorem
 /// analytical gradients on CPU (`f64`), fitting each medium's global Saupe matrix on the fly from
 /// strictly working (`!is_free`) couplings.
+///
+/// Always enforces stiff covalent re-entry peptide-bond closure on discontinuous insertion domains
+/// regardless of `weights.w_rama` (`21F:B5`).
 pub fn evaluate_domain_dock_state_cpu(
     kin: &DomainLinkerKinematics,
     prep: &PreparedDomainDockRestraints,
     state: &DomainDockState,
     weights: &DomainDockEnergyWeights,
+) -> (DomainDockEnergyBreakdown, DomainDockGradient) {
+    evaluate_domain_dock_state_cpu_with_loop_k(
+        kin,
+        prep,
+        state,
+        weights,
+        Some(500.0_f64.max(25.0 * weights.w_rama)),
+    )
+}
+
+fn evaluate_domain_dock_state_cpu_with_loop_k(
+    kin: &DomainLinkerKinematics,
+    prep: &PreparedDomainDockRestraints,
+    state: &DomainDockState,
+    weights: &DomainDockEnergyWeights,
+    k_loop_override: Option<f64>,
 ) -> (DomainDockEnergyBreakdown, DomainDockGradient) {
     let (slots, blk_frames) = kin.forward_slots_and_block_frames(state);
     let saupe = if weights.w_rdc > 0.0 && prep.n_media > 0 {
@@ -6015,9 +6118,11 @@ pub fn evaluate_domain_dock_state_cpu(
         &blk_frames,
         &saupe,
         weights,
+        k_loop_override,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_domain_dock_on_precomputed_slots(
     kin: &DomainLinkerKinematics,
     prep: &PreparedDomainDockRestraints,
@@ -6026,6 +6131,7 @@ fn evaluate_domain_dock_on_precomputed_slots(
     blk_frames: &[(Vec3, [[f64; 3]; 3])],
     saupe_matrices: &[[[f64; 3]; 3]],
     weights: &DomainDockEnergyWeights,
+    k_loop_override: Option<f64>,
 ) -> (DomainDockEnergyBreakdown, DomainDockGradient) {
     let l = kin.residues.len();
     let n_chains = kin.chain_ranges.len();
@@ -6344,10 +6450,20 @@ fn evaluate_domain_dock_on_precomputed_slots(
     }
 
     // 5b. Cyclic covalent peptide loop-closure restraint across discontinuous re-entry domain
-    //     boundaries (`21.W2:P0-4`: keeps re-entry linker C'_{s_1-1}-N_{s_1} peptide geometry closed
-    //     while `s_1..e_1` remains strictly locked to `master_block_id` with `0.000 Å` internal drift!).
-    if weights.w_rama > 0.0 {
-        let k_loop = 25.0 * weights.w_rama;
+    //     boundaries (`21.W2:P0-4`, `21F:B5`: always-on during docking/L-BFGS via `k_loop_override`
+    //     regardless of `weights.w_rama`, while `None` matches `domain_dock.wgsl` for fixed-Saupe
+    //     GPU parity!).
+    let k_loop = match k_loop_override {
+        Some(k) => k,
+        None => {
+            if weights.w_rama > 0.0 {
+                25.0 * weights.w_rama
+            } else {
+                0.0
+            }
+        }
+    };
+    if k_loop > 0.0 {
         for blk in &kin.rigid_blocks {
             if blk.master_block_id == blk.block_id {
                 continue;
@@ -6639,8 +6755,10 @@ pub struct DomainDockConfig {
     /// Default $^1\text{H}$ Larmor frequency (MHz) for Solomon–Bloembergen PRE dispersion (`21.W3:P0-4`).
     #[serde(default)]
     pub pre_proton_mhz: Option<f64>,
-    /// Configurable flexible MTSL nitroxide tether allowance (Å, e.g. `6.0` for `CYS:CB`-anchored spin labels; `default = 0.0`, `21.W3:P0-4`).
-    #[serde(default)]
+    /// Configurable flexible MTSL nitroxide tether allowance (Å, `default = 6.0` =
+    /// `DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM` for `# site_anchor` spin labels; `# site_pos`
+    /// explicit coordinates default to `0.0 Å` unless overridden per-site, `21F:B18`).
+    #[serde(default = "default_mtsl_tether_allowance_a")]
     pub mtsl_tether_allowance_a: f64,
     /// Optional chain-explicit `DomainRdcMediumSet` list overriding `rdc_media_in` for multi-chain complexes (`21.W2:P1-8`).
     #[serde(default)]
@@ -6679,6 +6797,10 @@ fn default_pcs_search_radius_a() -> f64 {
     8.0
 }
 
+fn default_mtsl_tether_allowance_a() -> f64 {
+    DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM
+}
+
 impl Default for DomainDockConfig {
     fn default() -> Self {
         Self {
@@ -6696,7 +6818,7 @@ impl Default for DomainDockConfig {
             pcs_metal_search_radius_a: 8.0,
             pre_tau_c_ns: None,
             pre_proton_mhz: None,
-            mtsl_tether_allowance_a: 0.0,
+            mtsl_tether_allowance_a: DEFAULT_MTSL_TETHER_ALLOWANCE_ANGSTROM,
             chain_rdc_media: Vec::new(),
             ensemble_size: 10,
             n_replicas: 64,
@@ -6715,6 +6837,10 @@ pub struct DockedConformer {
     pub state: DomainDockState,
     pub energy: DomainDockEnergyBreakdown,
     pub max_intra_domain_rmsd_angstrom: f64,
+    /// Maximum peptide-bond `|d(C, N) - r_c_prev_n|` deviation (Å) at discontinuous insertion-domain
+    /// re-entry boundaries (`0.0` when all domains are contiguous, `21F:B5`).
+    #[serde(default)]
+    pub max_reentry_cn_err_a: f64,
 }
 
 /// Per-domain cross-validated quality summary on Model 1.
@@ -6752,6 +6878,10 @@ pub struct DomainDockReport {
     pub n_pcs_work: usize,
     pub n_pcs_free: usize,
     pub max_intra_domain_rmsd_angstrom: f64,
+    /// Maximum peptide-bond `|d(C, N) - r_c_prev_n|` deviation (Å) across discontinuous
+    /// insertion-domain re-entry boundaries on Model 1 (`0.0` when all domains are contiguous, `21F:B5`).
+    #[serde(default)]
+    pub max_reentry_cn_err_a: f64,
     pub ensemble_pairwise_bb_rmsd_angstrom: f64,
     pub per_domain_validation: Vec<PerDomainValidationSummary>,
     pub rdc_validation: Option<RdcValidationSummary>,
@@ -8088,6 +8218,42 @@ pub fn polish_domain_dock_state_lbfgs(
     weights: &DomainDockEnergyWeights,
     max_iters: usize,
 ) -> (DomainDockState, DomainDockEnergyBreakdown) {
+    let base_k_loop = 500.0_f64.max(25.0 * weights.w_rama);
+    let (mut state, mut eb) = polish_domain_dock_state_lbfgs_with_loop_k(
+        kin,
+        prep,
+        initial,
+        weights,
+        max_iters,
+        base_k_loop,
+    );
+    if kin.has_reentry_blocks() && kin.max_reentry_cn_err_angstrom(&state) > 0.05 {
+        let (closed_state, _) = polish_domain_dock_state_lbfgs_with_loop_k(
+            kin,
+            prep,
+            &state,
+            weights,
+            max_iters.max(80),
+            4000.0_f64.max(base_k_loop),
+        );
+        if kin.max_reentry_cn_err_angstrom(&closed_state)
+            < kin.max_reentry_cn_err_angstrom(&state)
+        {
+            state = closed_state;
+            eb = evaluate_domain_dock_state_cpu(kin, prep, &state, weights).0;
+        }
+    }
+    (state, eb)
+}
+
+fn polish_domain_dock_state_lbfgs_with_loop_k(
+    kin: &DomainLinkerKinematics,
+    prep: &PreparedDomainDockRestraints,
+    initial: &DomainDockState,
+    weights: &DomainDockEnergyWeights,
+    max_iters: usize,
+    k_loop: f64,
+) -> (DomainDockState, DomainDockEnergyBreakdown) {
     let mut active_tors: Vec<(usize, bool)> = Vec::new();
     for &i in &kin.active_linker_residues {
         if kin.residues[i].phi_active {
@@ -8103,7 +8269,8 @@ pub fn polish_domain_dock_state_lbfgs(
     let n_dim = n_tors + 6 * n_partner_chains;
 
     let mut cur_state = initial.clone();
-    let (mut cur_eb, cur_grad) = evaluate_domain_dock_state_cpu(kin, prep, &cur_state, weights);
+    let (mut cur_eb, cur_grad) =
+        evaluate_domain_dock_state_cpu_with_loop_k(kin, prep, &cur_state, weights, Some(k_loop));
     if n_dim == 0 || max_iters == 0 {
         return (cur_state, cur_eb);
     }
@@ -8177,12 +8344,12 @@ pub fn polish_domain_dock_state_lbfgs(
                 .sum();
             let yy: f64 = y_hist[k_h - 1].iter().map(|b| b * b).sum();
             if yy > 1e-18 {
-                (sy / yy).clamp(1e-5, 10.0)
+                (sy / yy).clamp(1e-8, 10.0)
             } else {
-                (0.05 / g_norm.max(1.0)).clamp(1e-5, 0.05)
+                (0.05 / g_norm.max(1.0)).clamp(1e-8, 0.05)
             }
         } else {
-            (0.08 / g_norm.max(1.0)).clamp(1e-4, 0.08)
+            (0.08 / g_norm.max(1.0)).clamp(1e-8, 0.08)
         };
         for v in &mut q {
             *v *= gamma;
@@ -8220,9 +8387,15 @@ pub fn polish_domain_dock_state_lbfgs(
         let mut next_state = cur_state.clone();
         let mut next_eb = cur_eb;
         let mut next_g = g.clone();
-        for _ in 0..10 {
+        for _ in 0..20 {
             let cand_st = apply_step(&cur_state, step, &dir);
-            let (cand_eb, cand_gr) = evaluate_domain_dock_state_cpu(kin, prep, &cand_st, weights);
+            let (cand_eb, cand_gr) = evaluate_domain_dock_state_cpu_with_loop_k(
+                kin,
+                prep,
+                &cand_st,
+                weights,
+                Some(k_loop),
+            );
             if cand_eb.total <= cur_eb.total + 1e-4 * step * dg {
                 next_state = cand_st;
                 next_eb = cand_eb;
@@ -8231,6 +8404,12 @@ pub fn polish_domain_dock_state_lbfgs(
                 break;
             }
             step *= 0.5;
+        }
+        if !accepted && !s_hist.is_empty() {
+            s_hist.clear();
+            y_hist.clear();
+            rho_hist.clear();
+            continue;
         }
         if !accepted {
             break;
@@ -8421,14 +8600,15 @@ pub fn prepare_domain_dock_inputs_full(
                     ps.site_id
                 ));
             }
-            let had_site_tc = ps.tau_c_ns.is_some() && ps.proton_mhz.is_some();
             ps.tau_c_ns = Some(tc);
             ps.proton_mhz = Some(mhz);
             let default_exact_k =
                 compute_solomon_k_pre_a6_s1(tc, mhz, 0.5, CODATA_ELECTRON_G_FACTOR)?;
             for r in &mut ps.restraints {
                 if let PreRestraintKind::Gamma2Rate { k_pre_a6_s1, .. } = &mut r.kind {
-                    if !had_site_tc || *k_pre_a6_s1 < 1.0e12 || !k_pre_a6_s1.is_finite() {
+                    // Only populate unset/invalid K (<= 0 or non-finite); preserve explicit per-site
+                    // K (e.g. Gd3+ S=7/2 or Mn2+ S=5/2 parsed from `# spin_s` / `# g_factor`, `21F:B4`).
+                    if !k_pre_a6_s1.is_finite() || *k_pre_a6_s1 <= 0.0 {
                         *k_pre_a6_s1 = default_exact_k;
                     }
                 }
@@ -8966,8 +9146,10 @@ pub fn finalize_domain_dock_pipeline(
     let mut max_intra_all = 0.0_f64;
 
     for (idx, (state, energy)) in polished.into_iter().enumerate() {
-        let ch = kin.build_pdb_chain(&state);
+        let (slots, _) = kin.forward_slots_and_block_frames(&state);
+        let ch = kin.slots_to_pdb_chain(&slots);
         let intra_rmsd = kin.max_intra_domain_rmsd(&ch, &partition);
+        let reentry_cn_err = kin.max_reentry_cn_err_from_slots(&slots);
         if intra_rmsd > max_intra_all {
             max_intra_all = intra_rmsd;
         }
@@ -8976,6 +9158,7 @@ pub fn finalize_domain_dock_pipeline(
             state,
             energy,
             max_intra_domain_rmsd_angstrom: intra_rmsd,
+            max_reentry_cn_err_a: reentry_cn_err,
         });
         chains.push(ch);
     }
@@ -9217,6 +9400,7 @@ pub fn finalize_domain_dock_pipeline(
         n_pcs_work,
         n_pcs_free,
         max_intra_domain_rmsd_angstrom: max_intra_all,
+        max_reentry_cn_err_a: conformers[0].max_reentry_cn_err_a,
         ensemble_pairwise_bb_rmsd_angstrom,
         per_domain_validation,
         rdc_validation,
@@ -9729,6 +9913,10 @@ pub fn format_domain_dock_tsv(report: &DomainDockReport) -> String {
     out.push_str(&format!(
         "# max_intra_domain_rmsd_angstrom\t{:.4}\n",
         report.max_intra_domain_rmsd_angstrom
+    ));
+    out.push_str(&format!(
+        "# max_reentry_cn_err_a\t{:.4}\n",
+        report.max_reentry_cn_err_a
     ));
     for note in &report.candor_notes {
         out.push_str(&format!("# candor_note\t{note}\n"));
