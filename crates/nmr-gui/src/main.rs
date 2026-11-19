@@ -156,6 +156,7 @@ use nmr_gui::{
     mol3d_overlay::{Mol3dSyncAction, QuantitativeTrack},
     mol3d_viewer::{Mol3dPipelineResource, Mol3dViewerPanel},
     octet_canvas,
+    p22_tools_panel::{P22ToolTab, P22ToolsPanel},
     relax_panel::{RelaxPanelAction, RelaxPanelState},
     session_io::WorkbenchSessionController,
     sidechain_widget::{
@@ -1822,6 +1823,7 @@ struct NmrWorkbenchApp {
     show_workflow_dag_window: bool,
     assign_setup_drawer: AssignSetupDrawerState,
     about_references_modal: AboutReferencesModal,
+    p22_tools_panel: P22ToolsPanel,
     octet_exp_sync_key: (usize, usize),
     relax_peaks_sync_key: (usize, usize),
     mcp_last_viewport_key: (u64, i32, i32, i32),
@@ -2368,6 +2370,7 @@ impl NmrWorkbenchApp {
             show_workflow_dag_window: false,
             assign_setup_drawer: AssignSetupDrawerState::new(),
             about_references_modal: AboutReferencesModal::new(),
+            p22_tools_panel: P22ToolsPanel::new(),
             octet_exp_sync_key: (0, usize::MAX),
             relax_peaks_sync_key: (0, 0),
             mcp_last_viewport_key: (0, 0, 0, -1),
@@ -7700,6 +7703,35 @@ impl NmrWorkbenchApp {
                     {
                         ui.close();
                         self.show_workflow_dag_window = !self.show_workflow_dag_window;
+                    }
+                    ui.separator();
+                    if ui
+                        .button(egui::RichText::new("Deconv 2D/3D (VarPro)...").size(12.0))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.p22_tools_panel.open_tab(P22ToolTab::Deconv2d3d);
+                    }
+                    if ui
+                        .button(egui::RichText::new("MaxEnt 2D/3D NUS...").size(12.0))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.p22_tools_panel.open_tab(P22ToolTab::MaxEntNus);
+                    }
+                    if ui
+                        .button(egui::RichText::new("ARTSY RDC Extraction...").size(12.0))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.p22_tools_panel.open_tab(P22ToolTab::ArtsyRdc);
+                    }
+                    if ui
+                        .button(egui::RichText::new("2D PCS & Curie CCR...").size(12.0))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.p22_tools_panel.open_tab(P22ToolTab::PcsCurieCcr);
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     if ui
@@ -16184,8 +16216,10 @@ impl NmrWorkbenchApp {
     }
 
     fn draw_v0171_windows_and_bridges(&mut self, ctx: &egui::Context) {
-        // 1. In-app About & Verified Scientific References modal
+        // 1. In-app About & Verified Scientific References modal + Quantitative NMR Tools window
         self.about_references_modal.show(ctx);
+        self.p22_tools_panel
+            .show_window(ctx, self.hsqc_spec.as_ref(), self.paper_white_canvas);
 
         // 2. 3-Step Assignment Setup Drawer
         if self.assign_setup_drawer.open {
@@ -17936,6 +17970,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             show_workflow_dag_window: false,
             assign_setup_drawer: AssignSetupDrawerState::new(),
             about_references_modal: AboutReferencesModal::new(),
+            p22_tools_panel: P22ToolsPanel::new(),
             octet_exp_sync_key: (0, usize::MAX),
             relax_peaks_sync_key: (0, 0),
             mcp_last_viewport_key: (0, 0, 0, -1),
