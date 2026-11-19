@@ -2846,3 +2846,103 @@ fn v0150_p2_strip_transformed_procs_53280_625_and_ipap_strip_procs_and_overrides
     );
     let _ = fs::remove_dir_all(&dir_ipap);
 }
+
+#[test]
+fn test_b7_raw_3d_ipap_c_cbcanco_and_c_canco_fail_closed_while_splitcomb_loads() {
+    // B7 regression: raw unsplit 3D 13C-detected IPAP datasets (`c_cbcanco_ia3d`, `c_canco_ia3d`)
+    // previously bypassed IPAP handling in `read_bruker_fid_3d` and silently loaded with
+    // `n2 = 64` instead of `32` (v0150:P0-1 in 3D). They must fail closed with an explicit error
+    // recommending TopSpin `splitcomb`, while already-`splitcomb` 3D datasets load cleanly.
+    let td0 = 256usize; // 128 complex direct points -> 1024-byte aligned stride
+    let td1 = 8usize; // 4 complex F2 points (15N)
+    let td2_raw = 128usize; // unsplit IP+AP F1 traces (64 complex if mis-loaded without recombination!)
+    let td2_split = 64usize; // post-splitcomb F1 traces -> 32 complex F1 points (13C)
+
+    let acqu2s_txt = format!(
+        "##TITLE= acqu2s\n##$NUC1= <15N>\n##$BF1= 60.810645\n##$SFO1= 60.817820\n\
+         ##$SW= 32.0\n##$SW_h= 1945.94\n##$TD= {td1}\n##$FnMODE= 5\n"
+    );
+    let acqu3s_raw_txt = format!(
+        "##TITLE= acqu3s\n##$NUC1= <13C>\n##$BF1= 150.90280\n##$SFO1= 150.91095\n\
+         ##$SW= 40.0\n##$SW_h= 6036.11\n##$TD= {td2_raw}\n##$FnMODE= 5\n"
+    );
+    let acqu3s_split_txt = format!(
+        "##TITLE= acqu3s\n$$ process /opt/topspin/prog/au/bin/splitcomb\n\
+         ##$NUC1= <13C>\n##$BF1= 150.90280\n##$SFO1= 150.91095\n\
+         ##$SW= 40.0\n##$SW_h= 6036.11\n##$TD= {td2_split}\n##$FnMODE= 5\n"
+    );
+
+    let ser_raw = vec![0u8; td0 * 4 * td1 * td2_raw];
+    let ser_split = vec![0u8; td0 * 4 * td1 * td2_split];
+
+    for pulprog in ["c_cbcanco_ia3d", "c_canco_ia3d"] {
+        let acqus_txt = format!(
+            "##TITLE= acqus\n##$PULPROG= <{pulprog}>\n##$NUC1= <13C>\n\
+             ##$BF1= 150.90280\n##$SFO1= 150.92935\n##$SW= 30.0\n##$SW_h= 4527.08\n\
+             ##$TD= {td0}\n##$BYTORDA= 0\n##$DTYPA= 0\n##$AQSEQ= 0\n##$GRPDLY= 0\n"
+        );
+
+        // 1. In-memory bytes path must fail closed (never silently load n2 = 64).
+        let err_bytes = nmr_core::fid::read_bruker_fid_3d_from_bytes(
+            pulprog,
+            &acqus_txt,
+            None,
+            &acqu2s_txt,
+            None,
+            &acqu3s_raw_txt,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &ser_raw,
+            false,
+        )
+        .expect_err(&format!(
+            "unsplit 3D IPAP {pulprog} must fail closed instead of silently loading n2=64"
+        ));
+        assert!(
+            err_bytes.contains("IPAP") && err_bytes.contains("splitcomb"),
+            "error for {pulprog} must explain IPAP and recommend splitcomb, got: {err_bytes}"
+        );
+
+        // 2. Filesystem `read_bruker_fid_3d` path must also fail closed.
+        let dir_raw = temp_test_dir(&format!("b7_raw_{pulprog}"));
+        fs::write(dir_raw.join("acqus"), &acqus_txt).unwrap();
+        fs::write(dir_raw.join("acqu2s"), &acqu2s_txt).unwrap();
+        fs::write(dir_raw.join("acqu3s"), &acqu3s_raw_txt).unwrap();
+        fs::write(dir_raw.join("ser"), &ser_raw).unwrap();
+
+        let err_dir = read_bruker_fid_3d(&dir_raw).expect_err(&format!(
+            "read_bruker_fid_3d on unsplit 3D IPAP {pulprog} must fail closed"
+        ));
+        assert!(
+            err_dir.contains("IPAP") && err_dir.contains("splitcomb"),
+            "filesystem error for {pulprog} must explain IPAP and recommend splitcomb, got: {err_dir}"
+        );
+        let _ = fs::remove_dir_all(&dir_raw);
+
+        // 3. Already-`splitcomb` 3D dataset with the same PULPROG must load cleanly with n2 = 32.
+        let fid_split = nmr_core::fid::read_bruker_fid_3d_from_bytes(
+            &format!("{pulprog}_splitcomb"),
+            &acqus_txt,
+            None,
+            &acqu2s_txt,
+            None,
+            &acqu3s_split_txt,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &ser_split,
+            false,
+        )
+        .expect(&format!(
+            "already-splitcomb 3D {pulprog} must load cleanly"
+        ));
+        assert_eq!(fid_split.axis_z.complex_points, 32);
+    }
+}

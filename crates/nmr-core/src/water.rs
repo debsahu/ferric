@@ -181,13 +181,36 @@ fn find_band_extremum(
     Some((best_abs, refined_ppm))
 }
 
-/// Detect the dominant residual water / HDO chemical shift (in ppm) along `axis` from 1D `profile`:
-/// - Searches `4.60..=5.00 ppm` for aqueous $\text{H}_2\text{O}/\text{D}_2\text{O}$ ($\sim 4.70\text{ ppm}$).
-/// - Searches `3.22..=3.48 ppm` when `solvent_hint` indicates `DMSO` (`"DMSO"`, `"DMSO-d6"`, etc.)
-///   or when no strong `4.7 ppm` water peak is present and a dominant solvent singlet sits near `3.33 ppm`
-///   (Gottlieb et al. 1997; Fulmer et al. 2010).
-/// - Falls back to `4.70 ppm` when `profile` is empty or flat noise.
-pub fn detect_water_ppm(axis: &AxisPpm, profile: &[f64], solvent_hint: Option<&str>) -> f64 {
+/// Maximum absolute value in `profile` strictly outside `[lo_ppm, hi_ppm]`.
+fn max_outside_band(axis: &AxisPpm, profile: &[f64], lo_ppm: f64, hi_ppm: f64) -> f64 {
+    let n = axis.size.min(profile.len());
+    let (lo, hi) = (lo_ppm.min(hi_ppm), lo_ppm.max(hi_ppm));
+    let mut best = 0.0_f64;
+    for (i, &v) in profile.iter().take(n).enumerate() {
+        if !v.is_finite() {
+            continue;
+        }
+        let ppm = axis.index_to_ppm(i as f64);
+        if !(lo..=hi).contains(&ppm) {
+            best = best.max(v.abs());
+        }
+    }
+    best
+}
+
+/// Detect a dominant residual water / HDO chemical shift (in ppm) along `axis` from 1D `profile`.
+///
+/// Unlike [`detect_water_ppm`], which falls back to `4.70 ppm` (or `3.33 ppm` for DMSO) when no
+/// dominant solvent resonance is present, this returns `None` when no candidate peak dominates the
+/// spectrum. Requiring spectral dominance (`> 6 * sigma`, `>= 0.50 * global_max`, and `> 5x` the
+/// tallest peak outside `±0.15 ppm` of the candidate) prevents auto-detection from deleting solute
+/// resonances inside `4.60..=5.00 ppm` (e.g. β-glucose anomeric H1 at `4.64 ppm` in dry or D2O
+/// samples) when no dominant residual water peak is present.
+pub fn detect_dominant_water_ppm(
+    axis: &AxisPpm,
+    profile: &[f64],
+    solvent_hint: Option<&str>,
+) -> Option<f64> {
     let hint_low = solvent_hint.unwrap_or("").trim().to_ascii_lowercase();
     let is_dmso_hint = hint_low.contains("dmso");
     let is_aqueous_hint =
@@ -195,43 +218,28 @@ pub fn detect_water_ppm(axis: &AxisPpm, profile: &[f64], solvent_hint: Option<&s
 
     let n = axis.size.min(profile.len());
     if n == 0 {
-        if is_dmso_hint && axis.min_ppm() <= 3.33 && axis.max_ppm() >= 3.33 {
-            return 3.33;
-        }
-        return 4.70;
+        return None;
     }
 
     let (sigma, global_max) = robust_abs_mad_and_max(&profile[..n]);
     if global_max <= 0.0 {
-        if is_dmso_hint && axis.min_ppm() <= 3.33 && axis.max_ppm() >= 3.33 {
-            return 3.33;
-        }
-        return 4.70;
+        return None;
     }
 
     let h2o_cand = find_band_extremum(axis, &profile[..n], 4.60, 5.00);
     let dmso_cand = find_band_extremum(axis, &profile[..n], 3.22, 3.48);
-    let noise_gate = (2.5 * sigma).max(1e-30);
+    let sig_gate = (6.0 * sigma).max(1e-30);
 
     if is_dmso_hint {
-        if let Some((amp, ppm)) = dmso_cand {
-            if amp > noise_gate {
-                return ppm;
+        if let Some((dmso_amp, dmso_ppm)) = dmso_cand {
+            let outside_dmso =
+                max_outside_band(axis, &profile[..n], dmso_ppm - 0.15, dmso_ppm + 0.15);
+            if dmso_amp > sig_gate && dmso_amp >= 0.50 * global_max && dmso_amp > 5.0 * outside_dmso
+            {
+                return Some(dmso_ppm);
             }
         }
-        if axis.min_ppm() <= 3.33 && axis.max_ppm() >= 3.33 {
-            return 3.33;
-        }
-        return 4.70;
-    }
-
-    if is_aqueous_hint {
-        if let Some((amp, ppm)) = h2o_cand {
-            if amp > noise_gate {
-                return ppm;
-            }
-        }
-        return 4.70;
+        return None;
     }
 
     let h2o_amp = h2o_cand.map(|c| c.0).unwrap_or(0.0);
@@ -240,23 +248,53 @@ pub fn detect_water_ppm(axis: &AxisPpm, profile: &[f64], solvent_hint: Option<&s
     // Un-hinted DMSO-d6 detection (e.g. `.ucsf` files without solvent header):
     // When no strong ~4.70 ppm solvent peak exists (`h2o_amp < 0.15 * global_max`) and a dominant
     // water singlet in `3.22..3.48 ppm` dominates both the spectrum (`>= 0.50 * global_max`) and
-    // the 4.7 ppm band by > 5x, select the ~3.33 ppm DMSO water peak.
-    if let Some((_, dmso_ppm)) = dmso_cand {
-        if dmso_amp > (6.0 * sigma).max(1e-30)
-            && dmso_amp >= 0.50 * global_max
-            && h2o_amp < 0.15 * global_max
-            && dmso_amp > 5.0 * h2o_amp
-        {
-            return dmso_ppm;
+    // outside peaks by > 5x, select the ~3.33 ppm DMSO water peak.
+    if !is_aqueous_hint {
+        if let Some((_, dmso_ppm)) = dmso_cand {
+            if dmso_amp > sig_gate
+                && dmso_amp >= 0.50 * global_max
+                && h2o_amp < 0.15 * global_max
+                && dmso_amp > 5.0 * h2o_amp
+            {
+                let outside_dmso =
+                    max_outside_band(axis, &profile[..n], dmso_ppm - 0.15, dmso_ppm + 0.15);
+                if dmso_amp > 5.0 * outside_dmso {
+                    return Some(dmso_ppm);
+                }
+            }
         }
     }
 
+    // Aqueous H2O / HDO dominance check in `4.60..=5.00 ppm`:
+    // Require the candidate to dominate the spectrum (`> 6 * sigma`, `>= 0.50 * global_max`, and
+    // `> 5x` the tallest peak outside `±0.15 ppm`) so dry / D2O solute resonances such as
+    // β-glucose anomeric H1 (`4.64 ppm`) are never mistaken for residual water.
     if let Some((amp, h2o_ppm)) = h2o_cand {
-        if amp > noise_gate {
-            return h2o_ppm;
+        let outside_h2o = max_outside_band(axis, &profile[..n], h2o_ppm - 0.15, h2o_ppm + 0.15);
+        if amp > sig_gate && amp >= 0.50 * global_max && amp > 5.0 * outside_h2o {
+            return Some(h2o_ppm);
         }
     }
 
+    None
+}
+
+/// Detect the dominant residual water / HDO chemical shift (in ppm) along `axis` from 1D `profile`:
+/// - Searches `4.60..=5.00 ppm` for a dominant aqueous $\text{H}_2\text{O}/\text{D}_2\text{O}$
+///   peak ($\sim 4.70\text{ ppm}$).
+/// - Searches `3.22..=3.48 ppm` when `solvent_hint` indicates `DMSO` (`"DMSO"`, `"DMSO-d6"`, etc.)
+///   or when no strong `4.7 ppm` water peak is present and a dominant solvent singlet sits near
+///   `3.33 ppm` (Gottlieb et al. 1997; Fulmer et al. 2010).
+/// - Falls back to `4.70 ppm` (or `3.33 ppm` for DMSO hints) when `profile` is empty, flat noise,
+///   or contains no dominant solvent peak (e.g. dry or D2O solute-only spectra).
+pub fn detect_water_ppm(axis: &AxisPpm, profile: &[f64], solvent_hint: Option<&str>) -> f64 {
+    if let Some(ppm) = detect_dominant_water_ppm(axis, profile, solvent_hint) {
+        return ppm;
+    }
+    let hint_low = solvent_hint.unwrap_or("").trim().to_ascii_lowercase();
+    if hint_low.contains("dmso") && axis.min_ppm() <= 3.33 && axis.max_ppm() >= 3.33 {
+        return 3.33;
+    }
     4.70
 }
 
@@ -699,9 +737,33 @@ where
 /// Gaussian time-domain convolution subtraction (`radius <= valid_len / 4`), and smooth raised-cosine
 /// residual notch polish inside the immediate water core. Returns the detected or configured `water_ppm`.
 pub fn suppress_water_spectrum_1d(spec: &mut Spectrum1D, cfg: &WaterSuppressionConfig) -> f64 {
-    let water_ppm = cfg
-        .water_ppm
-        .unwrap_or_else(|| detect_water_ppm(&spec.axis, &spec.real, spec.solvent.as_deref()));
+    let water_ppm = match cfg.water_ppm {
+        Some(w) => w,
+        None => {
+            if let Some(w) =
+                detect_dominant_water_ppm(&spec.axis, &spec.real, spec.solvent.as_deref())
+            {
+                w
+            } else {
+                // No dominant solvent peak detected in auto-detect mode: skip suppression
+                // rather than attenuating solute resonances in 4.60..=5.00 ppm (e.g. β-glucose
+                // anomeric H1 at 4.64 ppm in dry or D2O samples).
+                let hint_low = spec
+                    .solvent
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                if hint_low.contains("dmso")
+                    && spec.axis.min_ppm() <= 3.33
+                    && spec.axis.max_ppm() >= 3.33
+                {
+                    return 3.33;
+                }
+                return 4.70;
+            }
+        }
+    };
     if spec.len() < 8 {
         return water_ppm;
     }
