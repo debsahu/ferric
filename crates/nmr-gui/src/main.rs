@@ -9,11 +9,11 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 #[cfg(not(target_arch = "wasm32"))]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::{egui, egui_wgpu};
 use nmr_core::aromatic::{
@@ -1781,9 +1781,9 @@ struct NmrWorkbenchApp {
     hsqc_spec: Option<Spectrum2D>,
     hsqc_arc: Arc<Vec<f32>>,
     hsqc_gen: u64,
-    hncacb_3d: Option<Spectrum3D>,
-    hnco_3d: Option<Spectrum3D>,
-    hncaco_3d: Option<Spectrum3D>,
+    hncacb_3d: Option<Arc<Spectrum3D>>,
+    hnco_3d: Option<Arc<Spectrum3D>>,
+    hncaco_3d: Option<Arc<Spectrum3D>>,
     cubes_3d: Vec<Arc<Spectrum3D>>,
     active_cube_idx: Option<usize>,
     cube_slice: Cube3dSliceState,
@@ -1874,8 +1874,839 @@ struct NmrWorkbenchApp {
     wgpu_render_state: Option<egui_wgpu::RenderState>,
     suppress_hsqc_pan_until_release: bool,
     suppress_octet_pan_until_release: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    background_ingest: Option<BackgroundIngestJob>,
     #[cfg(target_arch = "wasm32")]
     pending_drop_outcome: Arc<std::sync::Mutex<Option<Result<IngestDropOutcome, String>>>>,
+}
+
+/// Detect whether a filesystem path resides inside a cloud-synced directory
+/// (iCloud Drive / `CloudStorage`, Google Drive, OneDrive, Dropbox) where
+/// large raw/processed NMR files may stream on demand.
+fn is_cloud_storage_path(path: &Path) -> bool {
+    let full = path.to_string_lossy();
+    let check = |s: &str| -> bool {
+        s.contains("CloudStorage")
+            || s.contains("GoogleDrive")
+            || s.contains("Google Drive")
+            || s.contains("OneDrive")
+            || s.contains("Dropbox")
+            || s.contains("Mobile Documents")
+    };
+    check(&full)
+        || path
+            .components()
+            .any(|c| check(&c.as_os_str().to_string_lossy()))
+}
+
+/// Pick 2D `1H–15N` HSQC peaks with the neural picker, enforcing a MAD SNR
+/// height floor (`picker_snr * noise`) and greedy non-maximum suppression
+/// within `(|dH| <= 0.025, |dN| <= 0.25)` keeping highest intensity.
+fn pick_hsqc_2d_neural_hardened(
+    spec: &Spectrum2D,
+    cfg: &NeuralPickerConfig,
+    picker_snr: f32,
+) -> Vec<Peak> {
+    let mut peaks = pick_hsqc_2d_neural(spec, cfg);
+    let noise = estimate_noise_mad(&spec.data);
+    let min_height = (picker_snr * noise) as f64;
+    peaks.retain(|p| p.height.unwrap_or(0.0).abs() >= min_height);
+    peaks.sort_by(|a, b| {
+        b.height
+            .unwrap_or(0.0)
+            .abs()
+            .total_cmp(&a.height.unwrap_or(0.0).abs())
+    });
+    let mut deduped: Vec<Peak> = Vec::with_capacity(peaks.len());
+    for pk in peaks {
+        let dup = deduped
+            .iter()
+            .any(|kept| (kept.h - pk.h).abs() <= 0.025 && (kept.n - pk.n).abs() <= 0.25);
+        if !dup {
+            deduped.push(pk);
+        }
+    }
+    deduped
+}
+
+struct IngestLoadedPayload {
+    plan: IngestExecutionPlan,
+    run_full_pipeline: bool,
+    loaded_2d_list: Vec<(String, PulseSequenceClass, Option<&'static str>, Spectrum2D)>,
+    cubes_3d: Vec<(String, PulseSequenceClass, Spectrum3D)>,
+    loaded_1d_specs: Vec<nmr_core::nmr1d::Spectrum1D>,
+    ingested_recipes: BTreeMap<String, ProcessingRecipe>,
+    load_errors: Vec<String>,
+    processed_fids: usize,
+}
+
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+enum IngestProgressMsg {
+    Progress {
+        current: usize,
+        total: usize,
+        label: String,
+        size_bytes: u64,
+        cloud_storage: bool,
+    },
+    Completed(Box<IngestLoadedPayload>),
+    Cancelled,
+}
+
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+enum IngestLoadOutcome {
+    Completed(Box<IngestLoadedPayload>),
+    SentToChannel,
+    Cancelled,
+}
+
+fn load_ingest_plan_payload(
+    plan: IngestExecutionPlan,
+    enable_axis_rescue: bool,
+    run_full_pipeline: bool,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    progress_tx: Option<mpsc::Sender<IngestProgressMsg>>,
+) -> IngestLoadOutcome {
+    let is_cancelled = || -> bool {
+        cancel_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    };
+    let cancel_outcome = |tx_opt: &Option<mpsc::Sender<IngestProgressMsg>>| -> IngestLoadOutcome {
+        if let Some(tx) = tx_opt {
+            let _ = tx.send(IngestProgressMsg::Cancelled);
+        }
+        IngestLoadOutcome::Cancelled
+    };
+    if is_cancelled() {
+        return cancel_outcome(&progress_tx);
+    }
+
+    let total_items = plan
+        .selected_experiments
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.experiment.dimensionality,
+                ExperimentDimensionality::Dim1D
+                    | ExperimentDimensionality::Dim2D
+                    | ExperimentDimensionality::Pseudo3D
+                    | ExperimentDimensionality::Dim3D
+            )
+        })
+        .count()
+        .max(1);
+    let mut progress_idx = 0usize;
+    let plan_root_cloud = plan.root_path.as_deref().is_some_and(is_cloud_storage_path);
+    let estimate_item_bytes = |item: &nmr_gui::ingest_panel::SelectedExperimentSpec| -> u64 {
+        match item.experiment.data_state {
+            DataState::RawFid => item
+                .experiment
+                .raw_signal_bytes
+                .max(item.experiment.processed_bytes),
+            DataState::Processed => item
+                .experiment
+                .processed_bytes
+                .max(item.experiment.raw_signal_bytes),
+            DataState::Both => {
+                if item.experiment.raw_signal_bytes > 0 && run_full_pipeline {
+                    item.experiment.raw_signal_bytes
+                } else {
+                    item.experiment
+                        .processed_bytes
+                        .max(item.experiment.raw_signal_bytes)
+                }
+            }
+        }
+    };
+    let emit_progress = |current: usize, label: &str, size_bytes: u64, cloud_storage: bool| {
+        if let Some(ref tx) = progress_tx {
+            let _ = tx.send(IngestProgressMsg::Progress {
+                current: current.min(total_items),
+                total: total_items,
+                label: label.to_string(),
+                size_bytes,
+                cloud_storage,
+            });
+        }
+    };
+
+    let mut ingested_recipes: BTreeMap<String, ProcessingRecipe> = BTreeMap::new();
+    let mut load_errors: Vec<String> = Vec::new();
+    let mut loaded_2d_list: Vec<(String, PulseSequenceClass, Option<&'static str>, Spectrum2D)> =
+        Vec::new();
+    let mut cubes_3d: Vec<(String, PulseSequenceClass, Spectrum3D)> = Vec::new();
+    let mut processed_fids = 0usize;
+
+    let find_mem_file = |exp_rel: &str, child: &str| -> Option<&[u8]> {
+        let prefix = exp_rel.trim_matches('/').trim_start_matches("./");
+        let target = if prefix.is_empty() || prefix == "." {
+            child.to_string()
+        } else {
+            format!("{prefix}/{child}")
+        };
+        if let Some(b) = plan.in_memory_files.get(&target) {
+            return Some(b.as_slice());
+        }
+        let suffix = format!("/{target}");
+        plan.in_memory_files
+            .iter()
+            .find(|(k, _)| {
+                k.eq_ignore_ascii_case(&target)
+                    || k.to_ascii_lowercase()
+                        .ends_with(&suffix.to_ascii_lowercase())
+            })
+            .map(|(_, v)| v.as_slice())
+    };
+
+    let find_mem_exact = |rel_path: &str| -> Option<&[u8]> {
+        let clean = rel_path.trim_matches('/').trim_start_matches("./");
+        if let Some(b) = plan.in_memory_files.get(clean) {
+            return Some(b.as_slice());
+        }
+        let suffix = format!("/{clean}");
+        plan.in_memory_files
+            .iter()
+            .find(|(k, _)| {
+                k.eq_ignore_ascii_case(clean)
+                    || k.to_ascii_lowercase()
+                        .ends_with(&suffix.to_ascii_lowercase())
+            })
+            .map(|(_, v)| v.as_slice())
+    };
+
+    // Discover all Bruker `pdata/<procno>` sub-prefixes present in `in_memory_files` (`1` first, then numeric ascending)
+    let find_mem_pdata_prefixes = |exp_rel: &str, bin_file: &str| -> Vec<String> {
+        let exp_clean = exp_rel.trim_matches('/').trim_start_matches("./");
+        let mut procnos: Vec<(u32, String)> = Vec::new();
+        let mut has_direct = false;
+        let suffix_bin = format!("/{bin_file}").to_ascii_lowercase();
+        for key in plan.in_memory_files.keys() {
+            let k_clean = key.trim_matches('/').trim_start_matches("./");
+            let tail_opt = if exp_clean.is_empty() || exp_clean == "." {
+                Some(k_clean)
+            } else if let Some(rest) = k_clean.strip_prefix(&format!("{exp_clean}/")) {
+                Some(rest)
+            } else {
+                let marker = format!("/{exp_clean}/");
+                k_clean
+                    .find(&marker)
+                    .map(|idx| &k_clean[idx + marker.len()..])
+            };
+            let Some(tail) = tail_opt else {
+                continue;
+            };
+            if tail.eq_ignore_ascii_case(bin_file) {
+                has_direct = true;
+                continue;
+            }
+            let tail_low = tail.to_ascii_lowercase();
+            if tail_low.starts_with("pdata/") && tail_low.ends_with(&suffix_bin) {
+                let mid = &tail[6..tail.len() - suffix_bin.len()];
+                if !mid.contains('/') {
+                    let rank = if mid == "1" {
+                        0
+                    } else {
+                        mid.parse::<u32>().unwrap_or(u32::MAX - 1).saturating_add(1)
+                    };
+                    let pfx = format!("pdata/{mid}");
+                    if !procnos.iter().any(|(_, existing)| existing == &pfx) {
+                        procnos.push((rank, pfx));
+                    }
+                }
+            }
+        }
+        procnos.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut out: Vec<String> = procnos.into_iter().map(|(_, p)| p).collect();
+        if out.is_empty() {
+            out.push("pdata/1".to_string());
+        }
+        if has_direct || !out.iter().any(|p| p.is_empty()) {
+            out.push(String::new());
+        }
+        out
+    };
+
+    for item in &plan.selected_experiments {
+        if !matches!(
+            item.experiment.dimensionality,
+            ExperimentDimensionality::Dim2D
+                | ExperimentDimensionality::Pseudo3D
+                | ExperimentDimensionality::Dim3D
+        ) {
+            continue;
+        }
+        if is_cancelled() {
+            return cancel_outcome(&progress_tx);
+        }
+
+        let exp_token = item.solver_exp_name.unwrap_or("HNCACB");
+        let cls = item.effective_class;
+        let rel = &item.experiment.relative_path;
+        let disp = &item.experiment.display_name;
+        let item_cloud = plan_root_cloud
+            || item
+                .resolved_path
+                .as_deref()
+                .is_some_and(is_cloud_storage_path);
+        progress_idx += 1;
+        emit_progress(progress_idx, disp, estimate_item_bytes(item), item_cloud);
+
+        match item.experiment.dimensionality {
+            ExperimentDimensionality::Dim2D | ExperimentDimensionality::Pseudo3D => {
+                let mut loaded_2d: Option<Spectrum2D> = None;
+                let mut item_err: Option<String> = None;
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(ref path) = item.resolved_path {
+                    if path.exists() {
+                        if item.experiment.data_state == DataState::RawFid {
+                            match process_fid_dir_2d(path, false, false) {
+                                Ok((s2, mut recipe)) => {
+                                    recipe.enable_axis_rescue = enable_axis_rescue;
+                                    processed_fids += 1;
+                                    ingested_recipes.insert(disp.clone(), recipe);
+                                    loaded_2d = Some(s2);
+                                }
+                                Err(e) => item_err = Some(e),
+                            }
+                        } else {
+                            let res_2d = match item.experiment.vendor {
+                                ExperimentVendor::SparkyUcsf => read_ucsf_2d(path),
+                                ExperimentVendor::NmrPipe => read_nmrpipe_2d(path),
+                                ExperimentVendor::Bruker => {
+                                    let pdata = resolve_bruker_pdata_dir(path, "2rr");
+                                    read_bruker_pdata_2d(&pdata)
+                                }
+                                _ => Err("Unsupported 2D vendor format".to_string()),
+                            };
+                            match res_2d {
+                                Ok(s2) => loaded_2d = Some(s2),
+                                Err(e) => {
+                                    if item.experiment.data_state == DataState::Both
+                                        && item.experiment.vendor == ExperimentVendor::Bruker
+                                    {
+                                        match process_fid_dir_2d(path, false, false) {
+                                            Ok((s2, mut recipe)) => {
+                                                recipe.enable_axis_rescue = enable_axis_rescue;
+                                                processed_fids += 1;
+                                                ingested_recipes.insert(disp.clone(), recipe);
+                                                loaded_2d = Some(s2);
+                                            }
+                                            Err(_) => item_err = Some(e),
+                                        }
+                                    } else {
+                                        item_err = Some(e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Cross-platform in-memory loader (`wasm32` browser + `.zip`/`.tar.gz` archives)
+                if loaded_2d.is_none() && !plan.in_memory_files.is_empty() {
+                    let try_fid_mem =
+                        |ingested_recipes: &mut BTreeMap<String, ProcessingRecipe>,
+                         processed_fids: &mut usize|
+                         -> Result<Spectrum2D, String> {
+                            let acqus_b = find_mem_file(rel, "acqus")
+                                .or_else(|| find_mem_file(rel, "acqu"))
+                                .ok_or_else(|| "missing acqus".to_string())?;
+                            let acqu2s_b = find_mem_file(rel, "acqu2s")
+                                .or_else(|| find_mem_file(rel, "acqu2"))
+                                .ok_or_else(|| "missing acqu2s".to_string())?;
+                            let ser_b = find_mem_file(rel, "ser")
+                                .ok_or_else(|| "missing ser".to_string())?;
+                            let acqus_s = String::from_utf8_lossy(acqus_b);
+                            let acqu_s = find_mem_file(rel, "acqu")
+                                .map(|b| String::from_utf8_lossy(b).into_owned());
+                            let acqu2s_s = String::from_utf8_lossy(acqu2s_b);
+                            let acqu2_s = find_mem_file(rel, "acqu2")
+                                .map(|b| String::from_utf8_lossy(b).into_owned());
+                            let procs_s = find_mem_file(rel, "pdata/1/procs")
+                                .or_else(|| find_mem_file(rel, "procs"))
+                                .map(|b| String::from_utf8_lossy(b).into_owned());
+                            let proc2s_s = find_mem_file(rel, "pdata/1/proc2s")
+                                .or_else(|| find_mem_file(rel, "proc2s"))
+                                .map(|b| String::from_utf8_lossy(b).into_owned());
+                            let pp_s = find_mem_file(rel, "pulseprogram")
+                                .or_else(|| find_mem_file(rel, "pulseprogram.precomp"))
+                                .map(|b| String::from_utf8_lossy(b).into_owned());
+                            let nl_s = find_mem_file(rel, "nuslist")
+                                .map(|b| String::from_utf8_lossy(b).into_owned());
+                            let fid2d = read_bruker_fid_2d_from_bytes(
+                                disp,
+                                &acqus_s,
+                                acqu_s.as_deref(),
+                                &acqu2s_s,
+                                acqu2_s.as_deref(),
+                                procs_s.as_deref(),
+                                proc2s_s.as_deref(),
+                                pp_s.as_deref(),
+                                nl_s.as_deref(),
+                                ser_b,
+                                false,
+                            )?;
+                            let mut recipe = ProcessingRecipe::from_fid_2d(&fid2d);
+                            recipe.enable_axis_rescue = enable_axis_rescue;
+                            let s2 = process_fid_2d_mut(&fid2d, &mut recipe)?;
+                            *processed_fids += 1;
+                            ingested_recipes.insert(disp.clone(), recipe);
+                            Ok(s2)
+                        };
+
+                    if item.experiment.data_state == DataState::RawFid {
+                        match try_fid_mem(&mut ingested_recipes, &mut processed_fids) {
+                            Ok(s2) => loaded_2d = Some(s2),
+                            Err(e) => item_err = Some(e),
+                        }
+                    } else {
+                        let mem_res: Result<Spectrum2D, String> = match item.experiment.vendor {
+                            ExperimentVendor::SparkyUcsf => find_mem_exact(rel)
+                                .ok_or_else(|| format!("missing bytes for '{rel}'"))
+                                .and_then(|b| read_ucsf_2d_from_bytes(disp, b)),
+                            ExperimentVendor::NmrPipe => find_mem_exact(rel)
+                                .ok_or_else(|| format!("missing bytes for '{rel}'"))
+                                .and_then(|b| read_nmrpipe_2d_from_bytes(disp, b)),
+                            ExperimentVendor::Bruker => {
+                                let mut last_e =
+                                    "missing Bruker 2D pdata (procs/proc2s/2rr)".to_string();
+                                let mut found_s2 = None;
+                                for pfx in find_mem_pdata_prefixes(rel, "2rr") {
+                                    let k_p1 = if pfx.is_empty() {
+                                        "procs".to_string()
+                                    } else {
+                                        format!("{pfx}/procs")
+                                    };
+                                    let k_p2 = if pfx.is_empty() {
+                                        "proc2s".to_string()
+                                    } else {
+                                        format!("{pfx}/proc2s")
+                                    };
+                                    let k_rr = if pfx.is_empty() {
+                                        "2rr".to_string()
+                                    } else {
+                                        format!("{pfx}/2rr")
+                                    };
+                                    if let (Some(p1), Some(p2), Some(rr)) = (
+                                        find_mem_file(rel, &k_p1),
+                                        find_mem_file(rel, &k_p2),
+                                        find_mem_file(rel, &k_rr),
+                                    ) {
+                                        match read_bruker_pdata_2d_from_bytes(
+                                            disp,
+                                            &String::from_utf8_lossy(p1),
+                                            &String::from_utf8_lossy(p2),
+                                            rr,
+                                        ) {
+                                            Ok(s2) => {
+                                                found_s2 = Some(s2);
+                                                break;
+                                            }
+                                            Err(e) => last_e = e,
+                                        }
+                                    }
+                                }
+                                found_s2.ok_or(last_e)
+                            }
+                            _ => Err("Unsupported 2D vendor format".to_string()),
+                        };
+                        match mem_res {
+                            Ok(s2) => loaded_2d = Some(s2),
+                            Err(e) => {
+                                if item.experiment.data_state == DataState::Both
+                                    && item.experiment.vendor == ExperimentVendor::Bruker
+                                {
+                                    if let Ok(s2) =
+                                        try_fid_mem(&mut ingested_recipes, &mut processed_fids)
+                                    {
+                                        loaded_2d = Some(s2);
+                                    } else {
+                                        item_err = Some(e);
+                                    }
+                                } else {
+                                    item_err = Some(e);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(s2) = loaded_2d {
+                    loaded_2d_list.push((disp.clone(), cls, item.solver_exp_name, s2));
+                } else if item.experiment.dimensionality == ExperimentDimensionality::Dim2D
+                    || plan.selected_experiments.len() == 1
+                {
+                    if let Some(e) = item_err {
+                        load_errors.push(format!("{disp}: {e}"));
+                    } else {
+                        load_errors.push(format!("{disp}: spectrum binary not found"));
+                    }
+                }
+            }
+            ExperimentDimensionality::Dim3D => {
+                let mut loaded_3d: Option<Spectrum3D> = None;
+                let mut item_err: Option<String> = None;
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(ref path) = item.resolved_path {
+                    if path.exists() {
+                        let prefer_3d_ser = item.experiment.data_state == DataState::RawFid
+                            || (item.experiment.data_state == DataState::Both
+                                && item.experiment.vendor == ExperimentVendor::Bruker
+                                && (run_full_pipeline || {
+                                    let pdata_3rrr =
+                                        resolve_bruker_pdata_dir(path, "3rrr").join("3rrr");
+                                    std::fs::metadata(&pdata_3rrr)
+                                        .map(|m| m.len() > 512 * 1024 * 1024)
+                                        .unwrap_or(false)
+                                }));
+                        if prefer_3d_ser {
+                            match process_fid_dir_3d(path, exp_token, false, false) {
+                                Ok((s3, mut recipe)) => {
+                                    recipe.enable_axis_rescue = enable_axis_rescue;
+                                    processed_fids += 1;
+                                    ingested_recipes.insert(disp.clone(), recipe);
+                                    loaded_3d = Some(s3);
+                                }
+                                Err(e) => item_err = Some(e),
+                            }
+                        } else {
+                            let res_3d = match item.experiment.vendor {
+                                ExperimentVendor::SparkyUcsf => read_ucsf_3d(path, exp_token),
+                                ExperimentVendor::NmrPipe => read_nmrpipe_3d(path, exp_token),
+                                ExperimentVendor::Bruker => {
+                                    let pdata = resolve_bruker_pdata_dir(path, "3rrr");
+                                    read_bruker_pdata_3d(&pdata, exp_token)
+                                }
+                                _ => Err("Unsupported 3D vendor format".to_string()),
+                            };
+                            match res_3d {
+                                Ok(s3) => loaded_3d = Some(s3),
+                                Err(e) => {
+                                    if item.experiment.data_state == DataState::Both
+                                        && item.experiment.vendor == ExperimentVendor::Bruker
+                                    {
+                                        if let Ok((s3, mut recipe)) =
+                                            process_fid_dir_3d(path, exp_token, false, false)
+                                        {
+                                            recipe.enable_axis_rescue = enable_axis_rescue;
+                                            processed_fids += 1;
+                                            ingested_recipes.insert(disp.clone(), recipe);
+                                            loaded_3d = Some(s3);
+                                        } else {
+                                            item_err = Some(e);
+                                        }
+                                    } else {
+                                        item_err = Some(e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if loaded_3d.is_none() && !plan.in_memory_files.is_empty() {
+                    let mem_res3: Result<Spectrum3D, String> = match item.experiment.vendor {
+                        ExperimentVendor::SparkyUcsf => find_mem_exact(rel)
+                            .ok_or_else(|| format!("missing bytes for '{rel}'"))
+                            .and_then(|b| read_ucsf_3d_from_bytes(disp, exp_token, b)),
+                        ExperimentVendor::NmrPipe => find_mem_exact(rel)
+                            .ok_or_else(|| format!("missing bytes for '{rel}'"))
+                            .and_then(|b| read_nmrpipe_3d_from_bytes(disp, exp_token, b)),
+                        ExperimentVendor::Bruker => {
+                            let mut last_e =
+                                "missing Bruker 3D pdata (procs/proc2s/proc3s/3rrr) or ser"
+                                    .to_string();
+                            let mut found_s3 = None;
+                            for pfx in find_mem_pdata_prefixes(rel, "3rrr") {
+                                let k1 = if pfx.is_empty() {
+                                    "procs".to_string()
+                                } else {
+                                    format!("{pfx}/procs")
+                                };
+                                let k2 = if pfx.is_empty() {
+                                    "proc2s".to_string()
+                                } else {
+                                    format!("{pfx}/proc2s")
+                                };
+                                let k3 = if pfx.is_empty() {
+                                    "proc3s".to_string()
+                                } else {
+                                    format!("{pfx}/proc3s")
+                                };
+                                let kr = if pfx.is_empty() {
+                                    "3rrr".to_string()
+                                } else {
+                                    format!("{pfx}/3rrr")
+                                };
+                                if let (Some(b1), Some(b2), Some(b3), Some(br)) = (
+                                    find_mem_file(rel, &k1),
+                                    find_mem_file(rel, &k2),
+                                    find_mem_file(rel, &k3),
+                                    find_mem_file(rel, &kr),
+                                ) {
+                                    match read_bruker_pdata_3d_from_bytes(
+                                        disp,
+                                        exp_token,
+                                        &String::from_utf8_lossy(b1),
+                                        &String::from_utf8_lossy(b2),
+                                        &String::from_utf8_lossy(b3),
+                                        br,
+                                    ) {
+                                        Ok(s3) => {
+                                            found_s3 = Some(s3);
+                                            break;
+                                        }
+                                        Err(e) => last_e = e,
+                                    }
+                                }
+                            }
+                            if found_s3.is_none() {
+                                if let (
+                                    Some(b_acqus),
+                                    Some(b_acqu2s),
+                                    Some(b_acqu3s),
+                                    Some(b_ser),
+                                ) = (
+                                    find_mem_file(rel, "acqus"),
+                                    find_mem_file(rel, "acqu2s"),
+                                    find_mem_file(rel, "acqu3s"),
+                                    find_mem_file(rel, "ser"),
+                                ) {
+                                    let b_acqu = find_mem_file(rel, "acqu")
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    let b_acqu2 = find_mem_file(rel, "acqu2")
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    let b_acqu3 = find_mem_file(rel, "acqu3")
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    let b_procs = find_mem_file(rel, "procs")
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    let b_proc2s = find_mem_file(rel, "proc2s")
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    let b_proc3s = find_mem_file(rel, "proc3s")
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    let b_pp = find_mem_file(rel, "pulseprogram")
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    let b_nus = find_mem_file(rel, "nuslist")
+                                        .map(|b| String::from_utf8_lossy(b).into_owned());
+                                    match read_bruker_fid_3d_from_bytes(
+                                        disp,
+                                        &String::from_utf8_lossy(b_acqus),
+                                        b_acqu.as_deref(),
+                                        &String::from_utf8_lossy(b_acqu2s),
+                                        b_acqu2.as_deref(),
+                                        &String::from_utf8_lossy(b_acqu3s),
+                                        b_acqu3.as_deref(),
+                                        b_procs.as_deref(),
+                                        b_proc2s.as_deref(),
+                                        b_proc3s.as_deref(),
+                                        b_pp.as_deref(),
+                                        b_nus.as_deref(),
+                                        b_ser,
+                                        false,
+                                    ) {
+                                        Ok(fid) => {
+                                            let mut recipe = ProcessingRecipe::from_fid_3d(&fid);
+                                            #[cfg(target_arch = "wasm32")]
+                                            {
+                                                // Keep WASM 3D cube <= 64 MiB f32 (512 x 128 x 256)
+                                                if let Some(d0) = recipe.dims.get_mut(0) {
+                                                    d0.si = d0.si.min(512);
+                                                    d0.td_eff = Some(
+                                                        d0.td_eff
+                                                            .unwrap_or(fid.axis_x.complex_points)
+                                                            .min(d0.si),
+                                                    );
+                                                }
+                                                if let Some(d1) = recipe.dims.get_mut(1) {
+                                                    d1.si = d1.si.min(128);
+                                                    d1.td_eff = Some(
+                                                        d1.td_eff
+                                                            .unwrap_or(fid.axis_y.complex_points)
+                                                            .min(d1.si),
+                                                    );
+                                                }
+                                                if let Some(d2) = recipe.dims.get_mut(2) {
+                                                    d2.si = d2.si.min(256);
+                                                    d2.td_eff = Some(
+                                                        d2.td_eff
+                                                            .unwrap_or(fid.axis_z.complex_points)
+                                                            .min(d2.si),
+                                                    );
+                                                }
+                                            }
+                                            match process_fid_3d_mut(&fid, exp_token, &mut recipe) {
+                                                Ok(s3) => {
+                                                    recipe.enable_axis_rescue = enable_axis_rescue;
+                                                    processed_fids += 1;
+                                                    ingested_recipes.insert(disp.clone(), recipe);
+                                                    found_s3 = Some(s3);
+                                                }
+                                                Err(e) => last_e = e,
+                                            }
+                                        }
+                                        Err(e) => last_e = e,
+                                    }
+                                }
+                            }
+                            found_s3.ok_or(last_e)
+                        }
+                        _ => Err("Unsupported 3D vendor format".to_string()),
+                    };
+                    match mem_res3 {
+                        Ok(s3) => loaded_3d = Some(s3),
+                        Err(e) => item_err = Some(e),
+                    }
+                }
+
+                if let Some(s3) = loaded_3d {
+                    cubes_3d.push((disp.clone(), cls, s3));
+                } else if let Some(e) = item_err {
+                    load_errors.push(format!("{disp}: {e}"));
+                } else {
+                    load_errors.push(format!("{disp}: 3D cube binary not found"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if is_cancelled() {
+        return cancel_outcome(&progress_tx);
+    }
+
+    let mut loaded_1d_specs = Vec::new();
+    let has_checked_1d = plan
+        .selected_experiments
+        .iter()
+        .any(|s| matches!(s.experiment.dimensionality, ExperimentDimensionality::Dim1D));
+    if has_checked_1d {
+        #[cfg(not(target_arch = "wasm32"))]
+        for item in &plan.selected_experiments {
+            if matches!(
+                item.experiment.dimensionality,
+                ExperimentDimensionality::Dim1D
+            ) {
+                if is_cancelled() {
+                    return cancel_outcome(&progress_tx);
+                }
+                let item_cloud = plan_root_cloud
+                    || item
+                        .resolved_path
+                        .as_deref()
+                        .is_some_and(is_cloud_storage_path);
+                progress_idx += 1;
+                emit_progress(
+                    progress_idx,
+                    &item.experiment.display_name,
+                    estimate_item_bytes(item),
+                    item_cloud,
+                );
+                if let Some(ref p) = item.resolved_path {
+                    if let Ok(loaded) = nmr_core::nmr1d::load_1d_input(p, None, false) {
+                        if let Ok(sp) = nmr_core::nmr1d::prepare_loaded_1d_for_studio(loaded) {
+                            loaded_1d_specs.push(sp);
+                            continue;
+                        }
+                    }
+                    if let Ok(bytes) = std::fs::read(p) {
+                        if let Some(sp) =
+                            try_load_1d_ucsf_or_pipe_bytes(&item.experiment.display_name, &bytes)
+                        {
+                            loaded_1d_specs.push(sp);
+                        }
+                    }
+                }
+            }
+        }
+        if loaded_1d_specs.is_empty() && !plan.in_memory_files.is_empty() {
+            if is_cancelled() {
+                return cancel_outcome(&progress_tx);
+            }
+            let sel_prefixes: Vec<String> = plan
+                .selected_experiments
+                .iter()
+                .filter(|s| matches!(s.experiment.dimensionality, ExperimentDimensionality::Dim1D))
+                .map(|s| {
+                    s.experiment
+                        .relative_path
+                        .trim_matches('/')
+                        .trim_start_matches("./")
+                        .to_string()
+                })
+                .collect();
+            let refs: Vec<(&str, &[u8])> = plan
+                .in_memory_files
+                .iter()
+                .filter(|(k, _)| {
+                    sel_prefixes.iter().any(|pr| {
+                        pr.is_empty()
+                            || pr == "."
+                            || k.as_str() == pr
+                            || k.starts_with(&format!("{pr}/"))
+                            || k.contains(&format!("/{pr}/"))
+                    })
+                })
+                .map(|(k, v)| (k.as_str(), v.as_slice()))
+                .collect();
+            if let Ok(loaded) = nmr_core::nmr1d::load_1d_from_virtual_entries(&refs, None, false) {
+                for it in loaded {
+                    if let Ok(sp) = nmr_core::nmr1d::prepare_loaded_1d_for_studio(it) {
+                        loaded_1d_specs.push(sp);
+                    }
+                }
+            }
+            if loaded_1d_specs.is_empty() {
+                for (k, v) in &refs {
+                    if let Some(sp) = try_load_1d_ucsf_or_pipe_bytes(k, v) {
+                        loaded_1d_specs.push(sp);
+                    }
+                }
+            }
+        }
+    }
+
+    if is_cancelled() {
+        return cancel_outcome(&progress_tx);
+    }
+
+    let payload = Box::new(IngestLoadedPayload {
+        plan,
+        run_full_pipeline,
+        loaded_2d_list,
+        cubes_3d,
+        loaded_1d_specs,
+        ingested_recipes,
+        load_errors,
+        processed_fids,
+    });
+    if let Some(ref tx) = progress_tx {
+        let _ = tx.send(IngestProgressMsg::Completed(payload));
+        IngestLoadOutcome::SentToChannel
+    } else {
+        IngestLoadOutcome::Completed(payload)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct BackgroundIngestJob {
+    root_name: String,
+    rx: mpsc::Receiver<IngestProgressMsg>,
+    cancel_flag: Arc<AtomicBool>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
+    current: usize,
+    total: usize,
+    current_label: String,
+    current_size_bytes: u64,
+    cloud_storage: bool,
+    cancelling: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for BackgroundIngestJob {
+    fn drop(&mut self) {
+        self.cancel_flag.store(true, Ordering::Relaxed);
+    }
 }
 
 #[inline]
@@ -2184,59 +3015,8 @@ pub(crate) fn pick_2d_crosspeaks_ridge_safe(
     peaks
 }
 
-impl NmrWorkbenchApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_theme(egui::Theme::Dark);
-        let mut style = (*cc.egui_ctx.style_of(egui::Theme::Dark)).clone();
-        style.visuals = egui::Visuals::dark();
-        style.visuals.panel_fill = egui::Color32::from_rgb(16, 20, 28);
-        style.visuals.window_fill = egui::Color32::from_rgb(20, 25, 35);
-        cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut gpu_engine = None;
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut bayes_gpu_solver = None;
-        let mut adapter_label = None;
-
-        if let Some(rs) = &cc.wgpu_render_state {
-            let contour_res = ContourPipelineResource::new(&rs.device, rs.target_format);
-            let mol3d_res = Mol3dPipelineResource::new(&rs.device, Some(rs.target_format));
-            {
-                let mut rend = rs.renderer.write();
-                rend.callback_resources.insert(contour_res);
-                rend.callback_resources.insert(mol3d_res);
-            }
-
-            let info = rs.adapter.get_info();
-            let name = if info.name.trim().is_empty() {
-                "WebGPU Adapter".to_string()
-            } else {
-                info.name.clone()
-            };
-            adapter_label = Some(format!("{} ({:?})", name, info.backend));
-
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let backend_str = format!("{:?}", info.backend);
-                gpu_engine = Some(GpuEngine::from_device(
-                    rs.device.clone(),
-                    rs.queue.clone(),
-                    info.name.clone(),
-                    backend_str.clone(),
-                ));
-                bayes_gpu_solver = Some(BayesSaGpuSolver::with_device_type(
-                    GpuEngine::from_device(
-                        rs.device.clone(),
-                        rs.queue.clone(),
-                        info.name.clone(),
-                        backend_str,
-                    ),
-                    info.device_type,
-                ));
-            }
-        }
-
+impl Default for NmrWorkbenchApp {
+    fn default() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
         let default_replicas = 64;
         #[cfg(target_arch = "wasm32")]
@@ -2250,7 +3030,7 @@ impl NmrWorkbenchApp {
             ..Default::default()
         };
 
-        let mut app = Self {
+        Self {
             workspace_mode: WorkspaceMode::ProteinNmr,
             workbench_mode: WorkbenchMode::Process,
             small_molecule_view: SmallMoleculeView::Sketcher,
@@ -2278,16 +3058,16 @@ impl NmrWorkbenchApp {
             propensity_report: None,
             show_propensity_panel: false,
             #[cfg(not(target_arch = "wasm32"))]
-            use_gpu: gpu_engine.is_some(),
+            use_gpu: false,
             #[cfg(not(target_arch = "wasm32"))]
-            gpu_engine,
+            gpu_engine: None,
             #[cfg(not(target_arch = "wasm32"))]
-            bayes_gpu_solver,
-            use_neural_picker: true,
+            bayes_gpu_solver: None,
+            use_neural_picker: false,
             enable_axis_rescue: true,
             axis_rescue_notices: Vec::new(),
             axis_rescue_audits: Vec::new(),
-            adapter_label,
+            adapter_label: None,
             status_msg: String::new(),
             last_solve_ms: None,
             last_bayes_sa_telemetry: None,
@@ -2413,15 +3193,108 @@ impl NmrWorkbenchApp {
             paste_text_buf: String::new(),
             export_text_buf: String::new(),
             responsive_shell: ResponsiveShellState::new(),
-            wgpu_render_state: cc.wgpu_render_state.clone(),
+            wgpu_render_state: None,
             suppress_hsqc_pan_until_release: false,
             suppress_octet_pan_until_release: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            background_ingest: None,
             #[cfg(target_arch = "wasm32")]
             pending_drop_outcome: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+impl NmrWorkbenchApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
+        let mut style = (*cc.egui_ctx.style_of(egui::Theme::Dark)).clone();
+        style.visuals = egui::Visuals::dark();
+        style.visuals.panel_fill = egui::Color32::from_rgb(16, 20, 28);
+        style.visuals.window_fill = egui::Color32::from_rgb(20, 25, 35);
+        cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut gpu_engine = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut bayes_gpu_solver = None;
+        let mut adapter_label = None;
+
+        if let Some(rs) = &cc.wgpu_render_state {
+            let contour_res = ContourPipelineResource::new(&rs.device, rs.target_format);
+            let mol3d_res = Mol3dPipelineResource::new(&rs.device, Some(rs.target_format));
+            {
+                let mut rend = rs.renderer.write();
+                rend.callback_resources.insert(contour_res);
+                rend.callback_resources.insert(mol3d_res);
+            }
+
+            let info = rs.adapter.get_info();
+            let name = if info.name.trim().is_empty() {
+                "WebGPU Adapter".to_string()
+            } else {
+                info.name.clone()
+            };
+            adapter_label = Some(format!("{} ({:?})", name, info.backend));
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let backend_str = format!("{:?}", info.backend);
+                gpu_engine = Some(GpuEngine::from_device(
+                    rs.device.clone(),
+                    rs.queue.clone(),
+                    info.name.clone(),
+                    backend_str.clone(),
+                ));
+                bayes_gpu_solver = Some(BayesSaGpuSolver::with_device_type(
+                    GpuEngine::from_device(
+                        rs.device.clone(),
+                        rs.queue.clone(),
+                        info.name.clone(),
+                        backend_str,
+                    ),
+                    info.device_type,
+                ));
+            }
+        }
+
+        let mut app = Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            use_gpu: gpu_engine.is_some(),
+            #[cfg(not(target_arch = "wasm32"))]
+            gpu_engine,
+            #[cfg(not(target_arch = "wasm32"))]
+            bayes_gpu_solver,
+            adapter_label,
+            wgpu_render_state: cc.wgpu_render_state.clone(),
+            ..Self::default()
         };
 
         app.load_builtin_demo_suite();
         app
+    }
+
+    fn sync_named_3d_slots(&mut self, cube: &Arc<Spectrum3D>) {
+        if self
+            .hncacb_3d
+            .as_ref()
+            .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
+        {
+            self.hncacb_3d = Some(Arc::clone(cube));
+        }
+        if self
+            .hnco_3d
+            .as_ref()
+            .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
+        {
+            self.hnco_3d = Some(Arc::clone(cube));
+        }
+        if self
+            .hncaco_3d
+            .as_ref()
+            .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
+        {
+            self.hncaco_3d = Some(Arc::clone(cube));
+        }
     }
 
     /// Switch to one of the 6 canonical top-level workbench modes (`UI-B1`).
@@ -2734,20 +3607,7 @@ impl NmrWorkbenchApp {
                         let cur_cube = Arc::clone(&self.cubes_3d[cube_idx]);
                         let _ = self.water_undo_stack_3d.pop(&key);
                         let has_more = self.water_undo_stack_3d.has(&key);
-                        if self
-                            .hncacb_3d
-                            .as_ref()
-                            .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
-                        {
-                            self.hncacb_3d = Some((*cube).clone());
-                        }
-                        if self
-                            .hnco_3d
-                            .as_ref()
-                            .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
-                        {
-                            self.hnco_3d = Some((*cube).clone());
-                        }
+                        self.sync_named_3d_slots(&cube);
                         self.cubes_3d[cube_idx] = Arc::clone(&cube);
                         self.water_undo_3d = has_more.then_some(cube);
                         if self.active_cube_idx == Some(cube_idx) {
@@ -2889,20 +3749,7 @@ impl NmrWorkbenchApp {
                         let cur_cube = Arc::clone(&self.cubes_3d[cube_idx]);
                         self.water_undo_stack_3d
                             .push(key.clone(), Arc::clone(&cur_cube));
-                        if self
-                            .hncacb_3d
-                            .as_ref()
-                            .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
-                        {
-                            self.hncacb_3d = Some((*cube).clone());
-                        }
-                        if self
-                            .hnco_3d
-                            .as_ref()
-                            .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
-                        {
-                            self.hnco_3d = Some((*cube).clone());
-                        }
+                        self.sync_named_3d_slots(&cube);
                         self.cubes_3d[cube_idx] = Arc::clone(&cube);
                         self.water_undo_3d = Some(Arc::clone(&cur_cube));
                         if self.active_cube_idx == Some(cube_idx) {
@@ -3132,6 +3979,7 @@ impl NmrWorkbenchApp {
         if !keep_3d_cubes {
             self.hncacb_3d = None;
             self.hnco_3d = None;
+            self.hncaco_3d = None;
             self.extra_3d_count = 0;
             self.show_mol3d_viewport = false;
             self.show_strips_dock = false;
@@ -3198,8 +4046,8 @@ impl NmrWorkbenchApp {
         self.workbook
             .set_single_2d_page("15N-HSQC", hsqc.clone(), true);
         self.hsqc_spec = Some(hsqc);
-        self.hncacb_3d = Some(render_triple_3d("HNCACB", &self.peaks, &rcfg));
-        self.hnco_3d = Some(render_triple_3d("HNCO", &self.peaks, &rcfg));
+        self.hncacb_3d = Some(Arc::new(render_triple_3d("HNCACB", &self.peaks, &rcfg)));
+        self.hnco_3d = Some(Arc::new(render_triple_3d("HNCO", &self.peaks, &rcfg)));
         self.extra_3d_count = 0;
         self.overlay_layers.clear();
         self.primary_2d_label = "15N-HSQC".to_string();
@@ -4304,8 +5152,8 @@ impl NmrWorkbenchApp {
                 self.hsqc_arc = Arc::new(ubiq_hsqc.data.clone());
                 self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
                 self.hsqc_spec = Some(ubiq_hsqc.clone());
-                self.hncacb_3d = Some(suite.hncacb_3d);
-                self.hnco_3d = Some(suite.hnco_3d);
+                self.hncacb_3d = Some(Arc::new(suite.hncacb_3d));
+                self.hnco_3d = Some(Arc::new(suite.hnco_3d));
                 self.extra_3d_count = 0;
                 self.overlay_layers.clear();
                 self.primary_2d_label = "20 · Ubiquitin 2D ¹H–¹⁵N HSQC".to_string();
@@ -5647,7 +6495,7 @@ impl NmrWorkbenchApp {
                 }
                 Err(_) => match read_ucsf_3d(p, "HNCACB") {
                     Ok(spec3d) => {
-                        self.hncacb_3d = Some(spec3d);
+                        self.hncacb_3d = Some(Arc::new(spec3d));
                         self.workspace_mode = WorkspaceMode::ProteinNmr;
                         self.status_msg = format!("Loaded UCSF 3D spectrum {}", p.display());
                     }
@@ -5688,7 +6536,7 @@ impl NmrWorkbenchApp {
             },
             "ft3" => match read_nmrpipe_3d(p, "HNCACB") {
                 Ok(spec3d) => {
-                    self.hncacb_3d = Some(spec3d);
+                    self.hncacb_3d = Some(Arc::new(spec3d));
                     self.workspace_mode = WorkspaceMode::ProteinNmr;
                     self.status_msg = format!("Loaded NMRPipe 3D spectrum {}", p.display());
                 }
@@ -5835,12 +6683,13 @@ impl NmrWorkbenchApp {
             )
         } else if self.use_neural_picker {
             (
-                pick_hsqc_2d_neural(
+                pick_hsqc_2d_neural_hardened(
                     &spec,
                     &NeuralPickerConfig {
                         prob_threshold: (0.25 + 0.035 * (self.picker_snr - 3.0)).clamp(0.20, 0.85),
                         ..NeuralPickerConfig::default()
                     },
+                    self.picker_snr,
                 ),
                 "Neural 2D CNN picker",
             )
@@ -6412,18 +7261,23 @@ impl NmrWorkbenchApp {
             .inner_margin(egui::Margin::symmetric(8, 5))
             .show(ui, |ui| {
                 let mut repick_cube = false;
+                let has_hsqc_2d = self
+                    .workbook
+                    .pages_2d
+                    .iter()
+                    .any(|pg| !pg.is_cube_3d() && pg.nuc_x == "1H" && pg.nuc_y == "15N");
                 ui.horizontal_wrapped(|ui| {
-                    ui.strong("3D Picker:");
+                    ui.strong(format!("3D Cube Picker ({}):", self.primary_2d_label));
                     ui.label("Min SNR:");
-                    if ui
+                    let snr_resp = ui
                         .add(
                             egui::DragValue::new(&mut self.cube_slice.snr_threshold)
-                                .range(2.0..=50.0)
+                                .range(2.0..=250.0)
                                 .speed(0.2)
                                 .fixed_decimals(1),
                         )
-                        .changed()
-                    {
+                        .on_hover_text("Release drag or press Enter to re-pick 3D cube peaks");
+                    if snr_resp.drag_stopped() || snr_resp.lost_focus() {
                         repick_cube = true;
                     }
                     if ui
@@ -6458,6 +7312,13 @@ impl NmrWorkbenchApp {
                         self.cube_slice.dragging_peak_3d_idx = None;
                         self.save_live_2d_into_workbook();
                         self.status_msg = "Cleared 3D peaks".to_string();
+                    }
+                    if has_hsqc_2d {
+                        ui.label(
+                            egui::RichText::new("Switch to HSQC tab for 2D backbone roots")
+                                .weak()
+                                .small(),
+                        );
                     }
                 });
                 if repick_cube {
@@ -11274,7 +12135,7 @@ impl NmrWorkbenchApp {
                 let locks_snapshot = self.session.state.locked_residues.clone();
                 let links_snapshot = self.session.state.confirmed_links.clone();
                 let strip_actions = {
-                    let hncaco_3d_ref = self.hncaco_3d.as_ref().or_else(|| {
+                    let hncaco_3d_ref = self.hncaco_3d.as_deref().or_else(|| {
                         self.cubes_3d
                             .iter()
                             .find(|c| {
@@ -11284,8 +12145,8 @@ impl NmrWorkbenchApp {
                             .map(|v| &**v)
                     });
                     let spectra_full = StripSpectra3DFull {
-                        aliphatic_3d: self.hncacb_3d.as_ref(),
-                        carbonyl_3d: self.hnco_3d.as_ref(),
+                        aliphatic_3d: self.hncacb_3d.as_deref(),
+                        carbonyl_3d: self.hnco_3d.as_deref(),
                         carbonyl_intra_3d: hncaco_3d_ref,
                     };
                     let tiler_ctx = StripTilerContext {
@@ -11299,8 +12160,8 @@ impl NmrWorkbenchApp {
                         locks: Some(&locks_snapshot),
                         confirmed_links: Some(&links_snapshot),
                         spectra_3d: StripSpectra3D {
-                            aliphatic_3d: self.hncacb_3d.as_ref(),
-                            carbonyl_3d: self.hnco_3d.as_ref(),
+                            aliphatic_3d: self.hncacb_3d.as_deref(),
+                            carbonyl_3d: self.hnco_3d.as_deref(),
                         },
                     };
                     self.strip_tiler.show_full(
@@ -11488,7 +12349,7 @@ impl NmrWorkbenchApp {
         strips: &[(Option<usize>, &str)],
     ) {
         painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(13, 17, 24));
-        let (strip_nuc, (c_top, c_bot)) = if let Some(ref s3) = self.hncacb_3d {
+        let (strip_nuc, (c_top, c_bot)) = if let Some(s3) = self.hncacb_3d.as_deref() {
             let (_, nuc, bounds) = strip_vertical_axis_metadata(s3);
             (nuc, bounds)
         } else {
@@ -11599,7 +12460,7 @@ impl NmrWorkbenchApp {
             );
 
             // Render 3D HNCACB strip slice intensity heatmap if available
-            if let Some(s3) = &self.hncacb_3d {
+            if let Some(s3) = self.hncacb_3d.as_deref() {
                 let slice = s3.extract_strip(ss.h, ss.n, 0.04);
                 let max_v = slice.max_abs().max(1.0);
                 for ic in 0..slice.ny() {
@@ -11728,6 +12589,7 @@ impl NmrWorkbenchApp {
         let spectra_2d_count = usize::from(self.hsqc_spec.is_some()) + self.overlay_layers.len();
         let spectra_3d_count = usize::from(self.hncacb_3d.is_some())
             + usize::from(self.hnco_3d.is_some())
+            + usize::from(self.hncaco_3d.is_some())
             + self.extra_3d_count;
         let assigned_residues_count = self.pred_conf.len();
         let high_confidence_count = self.pred_conf.values().filter(|&&c| c >= 0.80).count();
@@ -11996,7 +12858,18 @@ impl NmrWorkbenchApp {
         }
     }
 
-    fn execute_ingest_plan(&mut self, plan: IngestExecutionPlan, run_full_pipeline: bool) {
+    fn apply_loaded_ingest_payload(&mut self, payload: IngestLoadedPayload) {
+        let IngestLoadedPayload {
+            plan,
+            run_full_pipeline,
+            mut loaded_2d_list,
+            mut cubes_3d,
+            loaded_1d_specs,
+            mut ingested_recipes,
+            load_errors,
+            processed_fids,
+        } = payload;
+
         self.prepare_workbook_for_user_append();
         self.workspace_mode = WorkspaceMode::ProteinNmr;
         self.show_stack1d_panel = false;
@@ -12016,7 +12889,7 @@ impl NmrWorkbenchApp {
             .iter()
             .filter(|s| s.experiment.data_state == DataState::RawFid)
             .count();
-        self.unprocessed_fids_remaining = self.raw_fids_total;
+        self.unprocessed_fids_remaining = self.raw_fids_total.saturating_sub(processed_fids);
 
         self.axis_rescue_notices.clear();
         self.axis_rescue_audits.clear();
@@ -12024,647 +12897,12 @@ impl NmrWorkbenchApp {
         self.water_undo_2d = None;
         self.bare_bruker_hint = None;
 
-        let mut ingested_recipes: BTreeMap<String, ProcessingRecipe> = BTreeMap::new();
-        let mut load_errors: Vec<String> = Vec::new();
         let mut primary_cls: Option<PulseSequenceClass> = None;
         {
-            let mut loaded_2d_list: Vec<(
-                String,
-                PulseSequenceClass,
-                Option<&'static str>,
-                Spectrum2D,
-            )> = Vec::new();
-            let mut cubes_3d: Vec<(String, PulseSequenceClass, Spectrum3D)> = Vec::new();
-            let mut processed_fids = 0usize;
-
-            let find_mem_file = |exp_rel: &str, child: &str| -> Option<&[u8]> {
-                let prefix = exp_rel.trim_matches('/').trim_start_matches("./");
-                let target = if prefix.is_empty() || prefix == "." {
-                    child.to_string()
-                } else {
-                    format!("{prefix}/{child}")
-                };
-                if let Some(b) = plan.in_memory_files.get(&target) {
-                    return Some(b.as_slice());
-                }
-                let suffix = format!("/{target}");
-                plan.in_memory_files
-                    .iter()
-                    .find(|(k, _)| {
-                        k.eq_ignore_ascii_case(&target)
-                            || k.to_ascii_lowercase()
-                                .ends_with(&suffix.to_ascii_lowercase())
-                    })
-                    .map(|(_, v)| v.as_slice())
-            };
-
-            let find_mem_exact = |rel_path: &str| -> Option<&[u8]> {
-                let clean = rel_path.trim_matches('/').trim_start_matches("./");
-                if let Some(b) = plan.in_memory_files.get(clean) {
-                    return Some(b.as_slice());
-                }
-                let suffix = format!("/{clean}");
-                plan.in_memory_files
-                    .iter()
-                    .find(|(k, _)| {
-                        k.eq_ignore_ascii_case(clean)
-                            || k.to_ascii_lowercase()
-                                .ends_with(&suffix.to_ascii_lowercase())
-                    })
-                    .map(|(_, v)| v.as_slice())
-            };
-
-            // Discover all Bruker `pdata/<procno>` sub-prefixes present in `in_memory_files` (`1` first, then numeric ascending)
-            let find_mem_pdata_prefixes = |exp_rel: &str, bin_file: &str| -> Vec<String> {
-                let exp_clean = exp_rel.trim_matches('/').trim_start_matches("./");
-                let mut procnos: Vec<(u32, String)> = Vec::new();
-                let mut has_direct = false;
-                let suffix_bin = format!("/{bin_file}").to_ascii_lowercase();
-                for key in plan.in_memory_files.keys() {
-                    let k_clean = key.trim_matches('/').trim_start_matches("./");
-                    let tail_opt = if exp_clean.is_empty() || exp_clean == "." {
-                        Some(k_clean)
-                    } else if let Some(rest) = k_clean.strip_prefix(&format!("{exp_clean}/")) {
-                        Some(rest)
-                    } else {
-                        let marker = format!("/{exp_clean}/");
-                        k_clean
-                            .find(&marker)
-                            .map(|idx| &k_clean[idx + marker.len()..])
-                    };
-                    let Some(tail) = tail_opt else {
-                        continue;
-                    };
-                    if tail.eq_ignore_ascii_case(bin_file) {
-                        has_direct = true;
-                        continue;
-                    }
-                    let tail_low = tail.to_ascii_lowercase();
-                    if tail_low.starts_with("pdata/") && tail_low.ends_with(&suffix_bin) {
-                        let mid = &tail[6..tail.len() - suffix_bin.len()];
-                        if !mid.contains('/') {
-                            let rank = if mid == "1" {
-                                0
-                            } else {
-                                mid.parse::<u32>().unwrap_or(u32::MAX - 1).saturating_add(1)
-                            };
-                            let pfx = format!("pdata/{mid}");
-                            if !procnos.iter().any(|(_, existing)| existing == &pfx) {
-                                procnos.push((rank, pfx));
-                            }
-                        }
-                    }
-                }
-                procnos.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-                let mut out: Vec<String> = procnos.into_iter().map(|(_, p)| p).collect();
-                if out.is_empty() {
-                    out.push("pdata/1".to_string());
-                }
-                if has_direct || !out.iter().any(|p| p.is_empty()) {
-                    out.push(String::new());
-                }
-                out
-            };
-
-            for item in &plan.selected_experiments {
-                let exp_token = item.solver_exp_name.unwrap_or("HNCACB");
-                let cls = item.effective_class;
-                let rel = &item.experiment.relative_path;
-                let disp = &item.experiment.display_name;
-
-                match item.experiment.dimensionality {
-                    ExperimentDimensionality::Dim2D | ExperimentDimensionality::Pseudo3D => {
-                        let mut loaded_2d: Option<Spectrum2D> = None;
-                        let mut item_err: Option<String> = None;
-                        #[cfg(not(target_arch = "wasm32"))]
-                        if let Some(ref path) = item.resolved_path {
-                            if path.exists() {
-                                if item.experiment.data_state == DataState::RawFid {
-                                    match process_fid_dir_2d(path, false, false) {
-                                        Ok((s2, mut recipe)) => {
-                                            recipe.enable_axis_rescue = self.enable_axis_rescue;
-                                            processed_fids += 1;
-                                            ingested_recipes.insert(disp.clone(), recipe);
-                                            loaded_2d = Some(s2);
-                                        }
-                                        Err(e) => item_err = Some(e),
-                                    }
-                                } else {
-                                    let res_2d = match item.experiment.vendor {
-                                        ExperimentVendor::SparkyUcsf => read_ucsf_2d(path),
-                                        ExperimentVendor::NmrPipe => read_nmrpipe_2d(path),
-                                        ExperimentVendor::Bruker => {
-                                            let pdata = resolve_bruker_pdata_dir(path, "2rr");
-                                            read_bruker_pdata_2d(&pdata)
-                                        }
-                                        _ => Err("Unsupported 2D vendor format".to_string()),
-                                    };
-                                    match res_2d {
-                                        Ok(s2) => loaded_2d = Some(s2),
-                                        Err(e) => {
-                                            if item.experiment.data_state == DataState::Both
-                                                && item.experiment.vendor
-                                                    == ExperimentVendor::Bruker
-                                            {
-                                                match process_fid_dir_2d(path, false, false) {
-                                                    Ok((s2, mut recipe)) => {
-                                                        recipe.enable_axis_rescue =
-                                                            self.enable_axis_rescue;
-                                                        processed_fids += 1;
-                                                        ingested_recipes
-                                                            .insert(disp.clone(), recipe);
-                                                        loaded_2d = Some(s2);
-                                                    }
-                                                    Err(_) => item_err = Some(e),
-                                                }
-                                            } else {
-                                                item_err = Some(e);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Cross-platform in-memory loader (`wasm32` browser + `.zip`/`.tar.gz` archives)
-                        if loaded_2d.is_none() && !plan.in_memory_files.is_empty() {
-                            let try_fid_mem =
-                                |ingested_recipes: &mut BTreeMap<String, ProcessingRecipe>,
-                                 processed_fids: &mut usize|
-                                 -> Result<Spectrum2D, String> {
-                                    let acqus_b = find_mem_file(rel, "acqus")
-                                        .or_else(|| find_mem_file(rel, "acqu"))
-                                        .ok_or_else(|| "missing acqus".to_string())?;
-                                    let acqu2s_b = find_mem_file(rel, "acqu2s")
-                                        .or_else(|| find_mem_file(rel, "acqu2"))
-                                        .ok_or_else(|| "missing acqu2s".to_string())?;
-                                    let ser_b = find_mem_file(rel, "ser")
-                                        .ok_or_else(|| "missing ser".to_string())?;
-                                    let acqus_s = String::from_utf8_lossy(acqus_b);
-                                    let acqu_s = find_mem_file(rel, "acqu")
-                                        .map(|b| String::from_utf8_lossy(b).into_owned());
-                                    let acqu2s_s = String::from_utf8_lossy(acqu2s_b);
-                                    let acqu2_s = find_mem_file(rel, "acqu2")
-                                        .map(|b| String::from_utf8_lossy(b).into_owned());
-                                    let procs_s = find_mem_file(rel, "pdata/1/procs")
-                                        .or_else(|| find_mem_file(rel, "procs"))
-                                        .map(|b| String::from_utf8_lossy(b).into_owned());
-                                    let proc2s_s = find_mem_file(rel, "pdata/1/proc2s")
-                                        .or_else(|| find_mem_file(rel, "proc2s"))
-                                        .map(|b| String::from_utf8_lossy(b).into_owned());
-                                    let pp_s = find_mem_file(rel, "pulseprogram")
-                                        .or_else(|| find_mem_file(rel, "pulseprogram.precomp"))
-                                        .map(|b| String::from_utf8_lossy(b).into_owned());
-                                    let nl_s = find_mem_file(rel, "nuslist")
-                                        .map(|b| String::from_utf8_lossy(b).into_owned());
-                                    let fid2d = read_bruker_fid_2d_from_bytes(
-                                        disp,
-                                        &acqus_s,
-                                        acqu_s.as_deref(),
-                                        &acqu2s_s,
-                                        acqu2_s.as_deref(),
-                                        procs_s.as_deref(),
-                                        proc2s_s.as_deref(),
-                                        pp_s.as_deref(),
-                                        nl_s.as_deref(),
-                                        ser_b,
-                                        false,
-                                    )?;
-                                    let mut recipe = ProcessingRecipe::from_fid_2d(&fid2d);
-                                    recipe.enable_axis_rescue = self.enable_axis_rescue;
-                                    let s2 = process_fid_2d_mut(&fid2d, &mut recipe)?;
-                                    *processed_fids += 1;
-                                    ingested_recipes.insert(disp.clone(), recipe);
-                                    Ok(s2)
-                                };
-
-                            if item.experiment.data_state == DataState::RawFid {
-                                match try_fid_mem(&mut ingested_recipes, &mut processed_fids) {
-                                    Ok(s2) => loaded_2d = Some(s2),
-                                    Err(e) => item_err = Some(e),
-                                }
-                            } else {
-                                let mem_res: Result<Spectrum2D, String> =
-                                    match item.experiment.vendor {
-                                        ExperimentVendor::SparkyUcsf => find_mem_exact(rel)
-                                            .ok_or_else(|| format!("missing bytes for '{rel}'"))
-                                            .and_then(|b| read_ucsf_2d_from_bytes(disp, b)),
-                                        ExperimentVendor::NmrPipe => find_mem_exact(rel)
-                                            .ok_or_else(|| format!("missing bytes for '{rel}'"))
-                                            .and_then(|b| read_nmrpipe_2d_from_bytes(disp, b)),
-                                        ExperimentVendor::Bruker => {
-                                            let mut last_e =
-                                                "missing Bruker 2D pdata (procs/proc2s/2rr)"
-                                                    .to_string();
-                                            let mut found_s2 = None;
-                                            for pfx in find_mem_pdata_prefixes(rel, "2rr") {
-                                                let k_p1 = if pfx.is_empty() {
-                                                    "procs".to_string()
-                                                } else {
-                                                    format!("{pfx}/procs")
-                                                };
-                                                let k_p2 = if pfx.is_empty() {
-                                                    "proc2s".to_string()
-                                                } else {
-                                                    format!("{pfx}/proc2s")
-                                                };
-                                                let k_rr = if pfx.is_empty() {
-                                                    "2rr".to_string()
-                                                } else {
-                                                    format!("{pfx}/2rr")
-                                                };
-                                                if let (Some(p1), Some(p2), Some(rr)) = (
-                                                    find_mem_file(rel, &k_p1),
-                                                    find_mem_file(rel, &k_p2),
-                                                    find_mem_file(rel, &k_rr),
-                                                ) {
-                                                    match read_bruker_pdata_2d_from_bytes(
-                                                        disp,
-                                                        &String::from_utf8_lossy(p1),
-                                                        &String::from_utf8_lossy(p2),
-                                                        rr,
-                                                    ) {
-                                                        Ok(s2) => {
-                                                            found_s2 = Some(s2);
-                                                            break;
-                                                        }
-                                                        Err(e) => last_e = e,
-                                                    }
-                                                }
-                                            }
-                                            found_s2.ok_or(last_e)
-                                        }
-                                        _ => Err("Unsupported 2D vendor format".to_string()),
-                                    };
-                                match mem_res {
-                                    Ok(s2) => loaded_2d = Some(s2),
-                                    Err(e) => {
-                                        if item.experiment.data_state == DataState::Both
-                                            && item.experiment.vendor == ExperimentVendor::Bruker
-                                        {
-                                            if let Ok(s2) = try_fid_mem(
-                                                &mut ingested_recipes,
-                                                &mut processed_fids,
-                                            ) {
-                                                loaded_2d = Some(s2);
-                                            } else {
-                                                item_err = Some(e);
-                                            }
-                                        } else {
-                                            item_err = Some(e);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(s2) = loaded_2d {
-                            loaded_2d_list.push((disp.clone(), cls, item.solver_exp_name, s2));
-                        } else if item.experiment.dimensionality == ExperimentDimensionality::Dim2D
-                            || plan.selected_experiments.len() == 1
-                        {
-                            if let Some(e) = item_err {
-                                load_errors.push(format!("{disp}: {e}"));
-                            } else {
-                                load_errors.push(format!("{disp}: spectrum binary not found"));
-                            }
-                        }
-                    }
-                    ExperimentDimensionality::Dim3D => {
-                        let mut loaded_3d: Option<Spectrum3D> = None;
-                        let mut item_err: Option<String> = None;
-                        #[cfg(not(target_arch = "wasm32"))]
-                        if let Some(ref path) = item.resolved_path {
-                            if path.exists() {
-                                let prefer_3d_ser = item.experiment.data_state == DataState::RawFid
-                                    || (item.experiment.data_state == DataState::Both
-                                        && item.experiment.vendor == ExperimentVendor::Bruker
-                                        && (run_full_pipeline || {
-                                            let pdata_3rrr =
-                                                resolve_bruker_pdata_dir(path, "3rrr").join("3rrr");
-                                            std::fs::metadata(&pdata_3rrr)
-                                                .map(|m| m.len() > 512 * 1024 * 1024)
-                                                .unwrap_or(false)
-                                        }));
-                                if prefer_3d_ser {
-                                    match process_fid_dir_3d(path, exp_token, false, false) {
-                                        Ok((s3, mut recipe)) => {
-                                            recipe.enable_axis_rescue = self.enable_axis_rescue;
-                                            processed_fids += 1;
-                                            ingested_recipes.insert(disp.clone(), recipe);
-                                            loaded_3d = Some(s3);
-                                        }
-                                        Err(e) => item_err = Some(e),
-                                    }
-                                } else {
-                                    let res_3d = match item.experiment.vendor {
-                                        ExperimentVendor::SparkyUcsf => {
-                                            read_ucsf_3d(path, exp_token)
-                                        }
-                                        ExperimentVendor::NmrPipe => {
-                                            read_nmrpipe_3d(path, exp_token)
-                                        }
-                                        ExperimentVendor::Bruker => {
-                                            let pdata = resolve_bruker_pdata_dir(path, "3rrr");
-                                            read_bruker_pdata_3d(&pdata, exp_token)
-                                        }
-                                        _ => Err("Unsupported 3D vendor format".to_string()),
-                                    };
-                                    match res_3d {
-                                        Ok(s3) => loaded_3d = Some(s3),
-                                        Err(e) => {
-                                            if item.experiment.data_state == DataState::Both
-                                                && item.experiment.vendor
-                                                    == ExperimentVendor::Bruker
-                                            {
-                                                if let Ok((s3, mut recipe)) = process_fid_dir_3d(
-                                                    path, exp_token, false, false,
-                                                ) {
-                                                    recipe.enable_axis_rescue =
-                                                        self.enable_axis_rescue;
-                                                    processed_fids += 1;
-                                                    ingested_recipes.insert(disp.clone(), recipe);
-                                                    loaded_3d = Some(s3);
-                                                } else {
-                                                    item_err = Some(e);
-                                                }
-                                            } else {
-                                                item_err = Some(e);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if loaded_3d.is_none() && !plan.in_memory_files.is_empty() {
-                            let mem_res3: Result<Spectrum3D, String> = match item.experiment.vendor
-                            {
-                                ExperimentVendor::SparkyUcsf => find_mem_exact(rel)
-                                    .ok_or_else(|| format!("missing bytes for '{rel}'"))
-                                    .and_then(|b| read_ucsf_3d_from_bytes(disp, exp_token, b)),
-                                ExperimentVendor::NmrPipe => find_mem_exact(rel)
-                                    .ok_or_else(|| format!("missing bytes for '{rel}'"))
-                                    .and_then(|b| read_nmrpipe_3d_from_bytes(disp, exp_token, b)),
-                                ExperimentVendor::Bruker => {
-                                    let mut last_e =
-                                        "missing Bruker 3D pdata (procs/proc2s/proc3s/3rrr) or ser"
-                                            .to_string();
-                                    let mut found_s3 = None;
-                                    for pfx in find_mem_pdata_prefixes(rel, "3rrr") {
-                                        let k1 = if pfx.is_empty() {
-                                            "procs".to_string()
-                                        } else {
-                                            format!("{pfx}/procs")
-                                        };
-                                        let k2 = if pfx.is_empty() {
-                                            "proc2s".to_string()
-                                        } else {
-                                            format!("{pfx}/proc2s")
-                                        };
-                                        let k3 = if pfx.is_empty() {
-                                            "proc3s".to_string()
-                                        } else {
-                                            format!("{pfx}/proc3s")
-                                        };
-                                        let kr = if pfx.is_empty() {
-                                            "3rrr".to_string()
-                                        } else {
-                                            format!("{pfx}/3rrr")
-                                        };
-                                        if let (Some(b1), Some(b2), Some(b3), Some(br)) = (
-                                            find_mem_file(rel, &k1),
-                                            find_mem_file(rel, &k2),
-                                            find_mem_file(rel, &k3),
-                                            find_mem_file(rel, &kr),
-                                        ) {
-                                            match read_bruker_pdata_3d_from_bytes(
-                                                disp,
-                                                exp_token,
-                                                &String::from_utf8_lossy(b1),
-                                                &String::from_utf8_lossy(b2),
-                                                &String::from_utf8_lossy(b3),
-                                                br,
-                                            ) {
-                                                Ok(s3) => {
-                                                    found_s3 = Some(s3);
-                                                    break;
-                                                }
-                                                Err(e) => last_e = e,
-                                            }
-                                        }
-                                    }
-                                    if found_s3.is_none() {
-                                        if let (
-                                            Some(b_acqus),
-                                            Some(b_acqu2s),
-                                            Some(b_acqu3s),
-                                            Some(b_ser),
-                                        ) = (
-                                            find_mem_file(rel, "acqus"),
-                                            find_mem_file(rel, "acqu2s"),
-                                            find_mem_file(rel, "acqu3s"),
-                                            find_mem_file(rel, "ser"),
-                                        ) {
-                                            let b_acqu = find_mem_file(rel, "acqu")
-                                                .map(|b| String::from_utf8_lossy(b).into_owned());
-                                            let b_acqu2 = find_mem_file(rel, "acqu2")
-                                                .map(|b| String::from_utf8_lossy(b).into_owned());
-                                            let b_acqu3 = find_mem_file(rel, "acqu3")
-                                                .map(|b| String::from_utf8_lossy(b).into_owned());
-                                            let b_procs = find_mem_file(rel, "procs")
-                                                .map(|b| String::from_utf8_lossy(b).into_owned());
-                                            let b_proc2s = find_mem_file(rel, "proc2s")
-                                                .map(|b| String::from_utf8_lossy(b).into_owned());
-                                            let b_proc3s = find_mem_file(rel, "proc3s")
-                                                .map(|b| String::from_utf8_lossy(b).into_owned());
-                                            let b_pp = find_mem_file(rel, "pulseprogram")
-                                                .map(|b| String::from_utf8_lossy(b).into_owned());
-                                            let b_nus = find_mem_file(rel, "nuslist")
-                                                .map(|b| String::from_utf8_lossy(b).into_owned());
-                                            match read_bruker_fid_3d_from_bytes(
-                                                disp,
-                                                &String::from_utf8_lossy(b_acqus),
-                                                b_acqu.as_deref(),
-                                                &String::from_utf8_lossy(b_acqu2s),
-                                                b_acqu2.as_deref(),
-                                                &String::from_utf8_lossy(b_acqu3s),
-                                                b_acqu3.as_deref(),
-                                                b_procs.as_deref(),
-                                                b_proc2s.as_deref(),
-                                                b_proc3s.as_deref(),
-                                                b_pp.as_deref(),
-                                                b_nus.as_deref(),
-                                                b_ser,
-                                                false,
-                                            ) {
-                                                Ok(fid) => {
-                                                    let mut recipe =
-                                                        ProcessingRecipe::from_fid_3d(&fid);
-                                                    #[cfg(target_arch = "wasm32")]
-                                                    {
-                                                        // Keep WASM 3D cube <= 64 MiB f32 (512 x 128 x 256)
-                                                        if let Some(d0) = recipe.dims.get_mut(0) {
-                                                            d0.si = d0.si.min(512);
-                                                            d0.td_eff = Some(
-                                                                d0.td_eff
-                                                                    .unwrap_or(
-                                                                        fid.axis_x.complex_points,
-                                                                    )
-                                                                    .min(d0.si),
-                                                            );
-                                                        }
-                                                        if let Some(d1) = recipe.dims.get_mut(1) {
-                                                            d1.si = d1.si.min(128);
-                                                            d1.td_eff = Some(
-                                                                d1.td_eff
-                                                                    .unwrap_or(
-                                                                        fid.axis_y.complex_points,
-                                                                    )
-                                                                    .min(d1.si),
-                                                            );
-                                                        }
-                                                        if let Some(d2) = recipe.dims.get_mut(2) {
-                                                            d2.si = d2.si.min(256);
-                                                            d2.td_eff = Some(
-                                                                d2.td_eff
-                                                                    .unwrap_or(
-                                                                        fid.axis_z.complex_points,
-                                                                    )
-                                                                    .min(d2.si),
-                                                            );
-                                                        }
-                                                    }
-                                                    match process_fid_3d_mut(
-                                                        &fid,
-                                                        exp_token,
-                                                        &mut recipe,
-                                                    ) {
-                                                        Ok(s3) => {
-                                                            recipe.enable_axis_rescue =
-                                                                self.enable_axis_rescue;
-                                                            processed_fids += 1;
-                                                            ingested_recipes
-                                                                .insert(disp.clone(), recipe);
-                                                            found_s3 = Some(s3);
-                                                        }
-                                                        Err(e) => last_e = e,
-                                                    }
-                                                }
-                                                Err(e) => last_e = e,
-                                            }
-                                        }
-                                    }
-                                    found_s3.ok_or(last_e)
-                                }
-                                _ => Err("Unsupported 3D vendor format".to_string()),
-                            };
-                            match mem_res3 {
-                                Ok(s3) => loaded_3d = Some(s3),
-                                Err(e) => item_err = Some(e),
-                            }
-                        }
-
-                        if let Some(s3) = loaded_3d {
-                            cubes_3d.push((disp.clone(), cls, s3));
-                        } else if let Some(e) = item_err {
-                            load_errors.push(format!("{disp}: {e}"));
-                        } else {
-                            load_errors.push(format!("{disp}: 3D cube binary not found"));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            self.unprocessed_fids_remaining = self.raw_fids_total.saturating_sub(processed_fids);
-
-            // Also ingest any checked 1D experiments into `stack1d_panel` so mixed 1D + 2D + 3D
-            // folders populate all workbook sections cleanly without discarding 2D/3D pages.
-            let mut loaded_1d_specs = Vec::new();
-            let has_checked_1d = plan
-                .selected_experiments
-                .iter()
-                .any(|s| matches!(s.experiment.dimensionality, ExperimentDimensionality::Dim1D));
-            if has_checked_1d {
-                #[cfg(not(target_arch = "wasm32"))]
-                for item in &plan.selected_experiments {
-                    if matches!(
-                        item.experiment.dimensionality,
-                        ExperimentDimensionality::Dim1D
-                    ) {
-                        if let Some(ref p) = item.resolved_path {
-                            if let Ok(loaded) = nmr_core::nmr1d::load_1d_input(p, None, false) {
-                                if let Ok(sp) =
-                                    nmr_core::nmr1d::prepare_loaded_1d_for_studio(loaded)
-                                {
-                                    loaded_1d_specs.push(sp);
-                                    continue;
-                                }
-                            }
-                            if let Ok(bytes) = std::fs::read(p) {
-                                if let Some(sp) = try_load_1d_ucsf_or_pipe_bytes(
-                                    &item.experiment.display_name,
-                                    &bytes,
-                                ) {
-                                    loaded_1d_specs.push(sp);
-                                }
-                            }
-                        }
-                    }
-                }
-                if loaded_1d_specs.is_empty() && !plan.in_memory_files.is_empty() {
-                    let sel_prefixes: Vec<String> = plan
-                        .selected_experiments
-                        .iter()
-                        .filter(|s| {
-                            matches!(s.experiment.dimensionality, ExperimentDimensionality::Dim1D)
-                        })
-                        .map(|s| {
-                            s.experiment
-                                .relative_path
-                                .trim_matches('/')
-                                .trim_start_matches("./")
-                                .to_string()
-                        })
-                        .collect();
-                    let refs: Vec<(&str, &[u8])> = plan
-                        .in_memory_files
-                        .iter()
-                        .filter(|(k, _)| {
-                            sel_prefixes.iter().any(|pr| {
-                                pr.is_empty()
-                                    || pr == "."
-                                    || k.as_str() == pr
-                                    || k.starts_with(&format!("{pr}/"))
-                                    || k.contains(&format!("/{pr}/"))
-                            })
-                        })
-                        .map(|(k, v)| (k.as_str(), v.as_slice()))
-                        .collect();
-                    if let Ok(loaded) =
-                        nmr_core::nmr1d::load_1d_from_virtual_entries(&refs, None, false)
-                    {
-                        for it in loaded {
-                            if let Ok(sp) = nmr_core::nmr1d::prepare_loaded_1d_for_studio(it) {
-                                loaded_1d_specs.push(sp);
-                            }
-                        }
-                    }
-                    if loaded_1d_specs.is_empty() {
-                        for (k, v) in &refs {
-                            if let Some(sp) = try_load_1d_ucsf_or_pipe_bytes(k, v) {
-                                loaded_1d_specs.push(sp);
-                            }
-                        }
-                    }
-                }
-                if !loaded_1d_specs.is_empty() {
-                    self.stack1d_panel
-                        .load_user_spectra(loaded_1d_specs.clone());
-                }
-            }
             let any_1d_loaded = !loaded_1d_specs.is_empty();
+            if any_1d_loaded {
+                self.stack1d_panel.load_user_spectra(loaded_1d_specs);
+            }
 
             // Promote primary_2d by priority: N15Hsqc -> Con2D -> C13Hsqc/C13Hmqc -> first loaded Dim2D
             let mut caco_2d_specs: Vec<Spectrum2D> = Vec::new();
@@ -12869,7 +13107,11 @@ impl NmrWorkbenchApp {
                         pick_c13_hsqc_2d(hsqc, &pcfg)
                     } else if nx == "1H" && ny == "15N" {
                         if self.use_neural_picker {
-                            pick_hsqc_2d_neural(hsqc, &NeuralPickerConfig::default())
+                            pick_hsqc_2d_neural_hardened(
+                                hsqc,
+                                &NeuralPickerConfig::default(),
+                                self.picker_snr,
+                            )
                         } else {
                             pick_hsqc_2d(hsqc, &pcfg)
                         }
@@ -12897,33 +13139,36 @@ impl NmrWorkbenchApp {
 
             let mut first_3d_page_idx: Option<usize> = None;
             for (disp_3d, _, s3) in cubes_3d {
-                let exp_key = Self::normalize_exp_key(&s3.exp);
+                let s3_arc = Arc::new(s3);
+                let exp_key = Self::normalize_exp_key(&s3_arc.exp);
                 if exp_key == "HNCO" {
                     if self.hnco_3d.is_none() {
-                        self.hnco_3d = Some(s3.clone());
+                        self.hnco_3d = Some(Arc::clone(&s3_arc));
                     }
                 } else if exp_key == "HNCACO" {
                     if self.hncaco_3d.is_none() {
-                        self.hncaco_3d = Some(s3.clone());
+                        self.hncaco_3d = Some(Arc::clone(&s3_arc));
                     }
                 } else if self.hncacb_3d.is_none() {
-                    self.hncacb_3d = Some(s3.clone());
+                    self.hncacb_3d = Some(Arc::clone(&s3_arc));
                 }
                 let c_idx = self.cubes_3d.len();
-                let mut page_idx = self.workbook.add_3d_cube_page(c_idx, &disp_3d, &s3);
-                if run_full_pipeline {
+                let mut page_idx = self.workbook.add_3d_cube_page(c_idx, &disp_3d, &s3_arc);
+                // Skip redundant slow blind full-cube pick when cube > 8M voxels or HSQC is loaded
+                if run_full_pipeline && s3_arc.data.len() <= 8_000_000 && self.hsqc_spec.is_none() {
                     if let Some(pg3) = self.workbook.pages_2d.get_mut(page_idx) {
-                        let _ = pg3.pick_3d_cube_peaks(&s3);
+                        let _ = pg3.pick_3d_cube_peaks(&s3_arc);
                     }
                 }
                 if first_3d_page_idx.is_none() {
                     first_3d_page_idx = Some(page_idx);
                 }
                 let _ = &mut page_idx;
-                self.cubes_3d.push(Arc::new(s3));
+                self.cubes_3d.push(s3_arc);
             }
-            let stored_3d =
-                usize::from(self.hncacb_3d.is_some()) + usize::from(self.hnco_3d.is_some());
+            let stored_3d = usize::from(self.hncacb_3d.is_some())
+                + usize::from(self.hnco_3d.is_some())
+                + usize::from(self.hncaco_3d.is_some());
             self.extra_3d_count = self.cubes_3d.len().saturating_sub(stored_3d);
             if added_primary_2d {
                 self.save_live_2d_into_workbook();
@@ -12932,7 +13177,15 @@ impl NmrWorkbenchApp {
                 if run_full_pipeline && self.peaks.is_empty() {
                     if let Some(ref sky) = self.hsqc_spec {
                         let pcfg = PickerConfig::default();
-                        let roots = pick_hsqc_2d(sky, &pcfg);
+                        let roots = if self.use_neural_picker {
+                            pick_hsqc_2d_neural_hardened(
+                                sky,
+                                &NeuralPickerConfig::default(),
+                                self.picker_snr,
+                            )
+                        } else {
+                            pick_hsqc_2d(sky, &pcfg)
+                        };
                         if !roots.is_empty() {
                             let c_refs: Vec<&Spectrum3D> =
                                 self.cubes_3d.iter().map(|c| c.as_ref()).collect();
@@ -12954,10 +13207,11 @@ impl NmrWorkbenchApp {
             }
         }
 
-        let n_3d_total = self
-            .cubes_3d
-            .len()
-            .max(usize::from(self.hncacb_3d.is_some()) + usize::from(self.hnco_3d.is_some()));
+        let n_3d_total = self.cubes_3d.len().max(
+            usize::from(self.hncacb_3d.is_some())
+                + usize::from(self.hnco_3d.is_some())
+                + usize::from(self.hncaco_3d.is_some()),
+        );
         self.sync_session_from_app_fresh(&plan.root_name);
         self.session.state.processing_recipes = ingested_recipes;
         self.rebuild_systems_and_matrices();
@@ -13043,6 +13297,230 @@ impl NmrWorkbenchApp {
                 self.peaks.len(),
                 self.sequence.len()
             );
+        }
+    }
+
+    fn execute_ingest_plan(&mut self, plan: IngestExecutionPlan, run_full_pipeline: bool) {
+        match load_ingest_plan_payload(plan, self.enable_axis_rescue, run_full_pipeline, None, None)
+        {
+            IngestLoadOutcome::Completed(payload) => self.apply_loaded_ingest_payload(*payload),
+            IngestLoadOutcome::SentToChannel | IngestLoadOutcome::Cancelled => {}
+        }
+    }
+
+    fn start_ingest_plan_async(
+        &mut self,
+        ctx: &egui::Context,
+        plan: IngestExecutionPlan,
+        run_full_pipeline: bool,
+    ) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = ctx;
+            self.execute_ingest_plan(plan, run_full_pipeline);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if self.background_ingest.is_some() {
+                self.status_msg =
+                    "Background ingest already running — wait for completion or click Cancel."
+                        .to_string();
+                return;
+            }
+            let total = plan
+                .selected_experiments
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.experiment.dimensionality,
+                        ExperimentDimensionality::Dim1D
+                            | ExperimentDimensionality::Dim2D
+                            | ExperimentDimensionality::Pseudo3D
+                            | ExperimentDimensionality::Dim3D
+                    )
+                })
+                .count()
+                .max(1);
+            let initial_cloud = plan.root_path.as_deref().is_some_and(is_cloud_storage_path)
+                || plan.selected_experiments.iter().any(|s| {
+                    s.resolved_path
+                        .as_deref()
+                        .is_some_and(is_cloud_storage_path)
+                });
+            let root_name = plan.root_name.clone();
+            let enable_axis_rescue = self.enable_axis_rescue;
+            let (tx, rx) = mpsc::channel();
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let thread_cancel = Arc::clone(&cancel_flag);
+            let repaint_ctx = ctx.clone();
+            match std::thread::Builder::new()
+                .name("ferric-ingest".to_string())
+                .spawn(move || {
+                    let _ = load_ingest_plan_payload(
+                        plan,
+                        enable_axis_rescue,
+                        run_full_pipeline,
+                        Some(thread_cancel),
+                        Some(tx),
+                    );
+                    repaint_ctx.request_repaint();
+                }) {
+                Ok(handle) => {
+                    self.status_msg =
+                        format!("Loading '{root_name}' in background ({total} experiment(s))...");
+                    self.background_ingest = Some(BackgroundIngestJob {
+                        root_name,
+                        rx,
+                        cancel_flag,
+                        join_handle: Some(handle),
+                        current: 0,
+                        total,
+                        current_label: "Preparing selected spectra...".to_string(),
+                        current_size_bytes: 0,
+                        cloud_storage: initial_cloud,
+                        cancelling: false,
+                    });
+                    ctx.request_repaint();
+                }
+                Err(e) => {
+                    self.status_msg = format!("Failed to start background ingest thread: {e}");
+                }
+            }
+        }
+    }
+
+    fn poll_background_ingest(&mut self, ctx: &egui::Context) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = ctx;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(job) = self.background_ingest.as_mut() else {
+                return;
+            };
+            let mut finished_payload: Option<IngestLoadedPayload> = None;
+            let mut cancelled = false;
+            let mut disconnected = false;
+            loop {
+                match job.rx.try_recv() {
+                    Ok(IngestProgressMsg::Progress {
+                        current,
+                        total,
+                        label,
+                        size_bytes,
+                        cloud_storage,
+                    }) => {
+                        job.current = current;
+                        job.total = total.max(1);
+                        job.current_label = label;
+                        job.current_size_bytes = size_bytes;
+                        job.cloud_storage |= cloud_storage;
+                    }
+                    Ok(IngestProgressMsg::Completed(payload)) => {
+                        finished_payload = Some(*payload);
+                        break;
+                    }
+                    Ok(IngestProgressMsg::Cancelled) => {
+                        cancelled = true;
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+
+            if finished_payload.is_some() || cancelled || disconnected {
+                if let Some(mut done_job) = self.background_ingest.take() {
+                    if let Some(handle) = done_job.join_handle.take() {
+                        let _ = handle.join();
+                    }
+                    if let Some(payload) = finished_payload {
+                        if done_job.cancelling {
+                            self.status_msg =
+                                format!("Cancelled loading '{}'.", done_job.root_name);
+                        } else {
+                            self.apply_loaded_ingest_payload(payload);
+                        }
+                    } else if cancelled {
+                        self.status_msg = format!("Cancelled loading '{}'.", done_job.root_name);
+                    } else if disconnected {
+                        self.status_msg = format!(
+                            "Background ingest of '{}' disconnected unexpectedly.",
+                            done_job.root_name
+                        );
+                    }
+                }
+                ctx.request_repaint();
+                return;
+            }
+
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    fn draw_background_ingest_banner(&mut self, ui: &mut egui::Ui) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = ui;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(job) = self.background_ingest.as_mut() else {
+                return;
+            };
+            let frac = if job.total > 0 {
+                (job.current as f32 / job.total as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let size_text = if job.current_size_bytes > 0 {
+                let mb = job.current_size_bytes as f64 / (1024.0 * 1024.0);
+                if mb >= 0.1 {
+                    format!(" ({mb:.1} MB)")
+                } else {
+                    let kb = job.current_size_bytes as f64 / 1024.0;
+                    format!(" ({kb:.0} KB)")
+                }
+            } else {
+                String::new()
+            };
+            egui::Panel::top("background_ingest_banner").show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spinner();
+                    ui.strong(format!("Loading '{}'", job.root_name));
+                    ui.label(format!(
+                        "file {}/{} — {}{}",
+                        job.current, job.total, job.current_label, size_text
+                    ));
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .desired_width(150.0)
+                            .show_percentage(),
+                    );
+                    if job.cloud_storage {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(245, 196, 81),
+                            "Cloud drive detected — files may stream on demand",
+                        );
+                    }
+                    let btn_lbl = if job.cancelling {
+                        "Cancelling..."
+                    } else {
+                        "Cancel"
+                    };
+                    if ui
+                        .add_enabled(!job.cancelling, egui::Button::new(btn_lbl))
+                        .clicked()
+                    {
+                        job.cancelling = true;
+                        job.cancel_flag.store(true, Ordering::Relaxed);
+                    }
+                });
+            });
         }
     }
 
@@ -13170,6 +13648,7 @@ impl NmrWorkbenchApp {
                 self.hsqc_spec = None;
                 self.hncacb_3d = None;
                 self.hnco_3d = None;
+                self.hncaco_3d = None;
                 self.cubes_3d.clear();
                 self.active_cube_idx = None;
                 self.peaks_3d.clear();
@@ -13199,7 +13678,8 @@ impl NmrWorkbenchApp {
                     let mut n_reg = 0usize;
                     self.axis_rescue_notices.clear();
                     self.axis_rescue_audits.clear();
-                    if let Some(ref mut s3) = self.hncacb_3d {
+                    if let Some(ref mut s3_arc) = self.hncacb_3d {
+                        let s3 = Arc::make_mut(s3_arc);
                         let (_, _, audit_opt) = register_3d_hn_to_hsqc_2d_with_audit(
                             s3,
                             hsqc,
@@ -13215,7 +13695,8 @@ impl NmrWorkbenchApp {
                         }
                         n_reg += 1;
                     }
-                    if let Some(ref mut s3) = self.hnco_3d {
+                    if let Some(ref mut s3_arc) = self.hnco_3d {
+                        let s3 = Arc::make_mut(s3_arc);
                         let (_, _, audit_opt) = register_3d_hn_to_hsqc_2d_with_audit(
                             s3,
                             hsqc,
@@ -13573,10 +14054,10 @@ impl NmrWorkbenchApp {
                         .cloned()
                         .collect();
                     let mut cubes: Vec<&Spectrum3D> = Vec::new();
-                    if let Some(ref s3) = self.hncacb_3d {
+                    if let Some(s3) = self.hncacb_3d.as_deref() {
                         cubes.push(s3);
                     }
-                    if let Some(ref s3) = self.hnco_3d {
+                    if let Some(s3) = self.hnco_3d.as_deref() {
                         cubes.push(s3);
                     }
                     if !roots.is_empty() && !cubes.is_empty() {
@@ -14040,10 +14521,10 @@ impl NmrWorkbenchApp {
                     }
                 }
                 IngestAction::LoadSelectedSpectra(plan) => {
-                    self.execute_ingest_plan(plan, false);
+                    self.start_ingest_plan_async(ctx, plan, false);
                 }
                 IngestAction::ProcessPickAndRun(plan) => {
-                    self.execute_ingest_plan(plan, true);
+                    self.start_ingest_plan_async(ctx, plan, true);
                 }
                 IngestAction::OpenSelected1dInStudio(plan) => {
                     let mut spectra = Vec::new();
@@ -14291,7 +14772,7 @@ impl NmrWorkbenchApp {
                     });
 
                     ui.horizontal(|ui| {
-                        if let Some(ref s3) = self.hncacb_3d {
+                        if let Some(s3) = self.hncacb_3d.as_deref() {
                             if ui
                                 .small_button("+ Add 3D HNCACB 1H-15N Plane Slice")
                                 .clicked()
@@ -14597,22 +15078,9 @@ impl NmrWorkbenchApp {
                     },
                 );
                 self.water_undo_3d = Some(snapshot);
-                self.cubes_3d[c_idx] = Arc::new(suppressed_cube);
-                let updated_cube = (*self.cubes_3d[c_idx]).clone();
-                if self
-                    .hncacb_3d
-                    .as_ref()
-                    .is_some_and(|s| s.name == updated_cube.name && s.exp == updated_cube.exp)
-                {
-                    self.hncacb_3d = Some(updated_cube.clone());
-                }
-                if self
-                    .hnco_3d
-                    .as_ref()
-                    .is_some_and(|s| s.name == updated_cube.name && s.exp == updated_cube.exp)
-                {
-                    self.hnco_3d = Some(updated_cube);
-                }
+                let updated_cube = Arc::new(suppressed_cube);
+                self.sync_named_3d_slots(&updated_cube);
+                self.cubes_3d[c_idx] = updated_cube;
                 self.apply_active_cube_slice_refresh(false);
                 if let Some(ref s2) = self.hsqc_spec {
                     let (base, nref) = Self::estimate_2d_contour_base(&s2.data);
@@ -14702,20 +15170,7 @@ impl NmrWorkbenchApp {
                     .or_else(|| self.water_undo_3d.take());
                 if let Some(prev_cube) = popped {
                     let has_more = self.water_undo_stack_3d.has(&key3);
-                    if self
-                        .hncacb_3d
-                        .as_ref()
-                        .is_some_and(|s| s.name == prev_cube.name && s.exp == prev_cube.exp)
-                    {
-                        self.hncacb_3d = Some((*prev_cube).clone());
-                    }
-                    if self
-                        .hnco_3d
-                        .as_ref()
-                        .is_some_and(|s| s.name == prev_cube.name && s.exp == prev_cube.exp)
-                    {
-                        self.hnco_3d = Some((*prev_cube).clone());
-                    }
+                    self.sync_named_3d_slots(&prev_cube);
                     self.cubes_3d[c_idx] = Arc::clone(&prev_cube);
                     self.water_undo_3d = has_more.then_some(prev_cube);
                     self.apply_active_cube_slice_refresh(false);
@@ -15059,6 +15514,8 @@ impl eframe::App for NmrWorkbenchApp {
 
         // 4. Drag-and-drop + Modals + MCP Live Workbench Bridge + Unified 1D Undo Drain
         self.drain_1d_undo_into_journal();
+        self.poll_background_ingest(&ctx);
+        self.draw_background_ingest_banner(ui);
         self.apply_pending_mcp_bridge_commands();
         self.sync_mcp_bridge_snapshot_and_viewport();
         self.handle_dropped_files(&ctx);
@@ -16524,11 +16981,11 @@ impl NmrWorkbenchApp {
                 for cube_arc in &self.cubes_3d {
                     let k = Self::normalize_exp_key(&cube_arc.exp);
                     if k == "HNCO" && self.hnco_3d.is_none() {
-                        self.hnco_3d = Some((**cube_arc).clone());
+                        self.hnco_3d = Some(Arc::clone(cube_arc));
                     } else if k == "HNCACO" && self.hncaco_3d.is_none() {
-                        self.hncaco_3d = Some((**cube_arc).clone());
+                        self.hncaco_3d = Some(Arc::clone(cube_arc));
                     } else if k != "HNCO" && k != "HNCACO" && self.hncacb_3d.is_none() {
-                        self.hncacb_3d = Some((**cube_arc).clone());
+                        self.hncacb_3d = Some(Arc::clone(cube_arc));
                     }
                 }
                 self.assign_res = None;
@@ -18088,176 +18545,13 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
 
     fn make_headless_test_app() -> super::NmrWorkbenchApp {
         use super::*;
-        let mut octet_app = OctetDrawPanel::new();
-        octet_app.set_backend_adapter(Box::new(CoreOctetBackendAdapter));
         NmrWorkbenchApp {
-            workspace_mode: WorkspaceMode::ProteinNmr,
             workbench_mode: WorkbenchMode::Assign,
-            small_molecule_view: SmallMoleculeView::Sketcher,
-            dynamics_view: DynamicsView::Relaxation,
-            structure_show_pae_view: false,
-            developer_benchmark_mode: false,
-            last_mode_switcher_rect: egui::Rect::ZERO,
-            last_global_chrome_rects: Vec::new(),
-            sequence_search_query: String::new(),
-            goto_ppm_2d_input: String::new(),
-            drag_peak_pre_snapshot: None,
-            drag_peak3d_pre_snapshot: None,
-            undo_journal: UndoJournal::default(),
-            water_undo_stack_2d: KeyedSnapshotStack::default(),
-            water_undo_stack_3d: KeyedSnapshotStack::default(),
-            octet_app,
-            dosy_panel: DosyPanelState::default(),
-            metabolomics_panel: MetabolomicsStudioPanel::new(),
-            solver_kind: GuiSolverKind::default(),
-            regime_kind: GuiRegimeKind::default(),
-            metal_ligands_input: String::new(),
-            idp_temp_k: 298.15,
-            idp_ph_input: "6.5".to_string(),
-            c13_picked_dataset: None,
-            propensity_report: None,
-            show_propensity_panel: false,
-            #[cfg(not(target_arch = "wasm32"))]
-            use_gpu: false,
-            #[cfg(not(target_arch = "wasm32"))]
-            gpu_engine: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            bayes_gpu_solver: None,
-            use_neural_picker: false,
-            enable_axis_rescue: true,
-            axis_rescue_notices: Vec::new(),
-            axis_rescue_audits: Vec::new(),
-            adapter_label: None,
-            status_msg: String::new(),
-            last_solve_ms: None,
-            last_bayes_sa_telemetry: None,
-            priors: Priors::provisional(),
-            sidechain_priors: SidechainPriors::empirical_bmrb(),
-            reference: None,
-            sequence: Vec::new(),
-            seq_ids: Vec::new(),
-            peaks: Vec::new(),
-            truth: None,
-            systems: Vec::new(),
-            u_mat: None,
-            p_mat: None,
-            assign_res: None,
-            pred_ref: None,
-            pred_conf: BTreeMap::new(),
-            pred_ambiguity_codes: BTreeMap::new(),
-            metrics: None,
-            sidechain_ribbon_state: SequenceRibbonState::new(),
-            ss_ribbon_state: SsRibbonState::new(),
-            show_sidechain_inspector: false,
-            overwrite_curated_rings: false,
-            mol3d_panel: Mol3dViewerPanel::new(),
             show_mol3d_viewport: true,
-            loaded_pdb_text: None,
-            relax_panel: RelaxPanelState::new(),
-            show_relax_panel: false,
-            dynamics_panel: DynamicsStudioPanel::new(),
-            show_dynamics_panel: false,
-            stack1d_panel: Stack1dState::default(),
             show_stack1d_panel: false,
-            show_strips_dock: false,
-            show_strip_details_drawer: false,
-            last_sequence_ribbon_rect: None,
-            last_hsqc_plot_rect: None,
-            show_workflow_guide: false,
-            show_sequence_ribbon: true,
-            paper_white_canvas: true,
-            workbook: WorkbookState::default(),
-            show_native_global_open_bar: false,
-            hsqc_spec: None,
-            hsqc_arc: Arc::new(Vec::new()),
-            hsqc_gen: 1,
-            hncacb_3d: None,
-            hnco_3d: None,
-            hncaco_3d: None,
-            cubes_3d: Vec::new(),
-            active_cube_idx: None,
-            cube_slice: Cube3dSliceState::default(),
-            peaks_3d: Vec::new(),
-            water_undo_3d: None,
-            focus_3d_peak_label_input: false,
-            extra_3d_count: 0,
-            overlay_layers: Vec::new(),
-            primary_2d_label: "15N-HSQC".to_string(),
-            primary_2d_visible: true,
-            primary_ppm_nudge: [0.0, 0.0],
-            contour_noise_ref: 1.8,
-            box_zoom_2d_mode: false,
-            box_zoom_2d_anchor: None,
-            next_layer_id: 2,
-            active_overlay_idx: 0,
-            ingest_panel: IngestPanelState::default(),
-            command_palette: CommandPalette::new(),
-            chord_dispatcher: ChordDispatcher::new(),
-            session: WorkbenchSessionController::default(),
-            crosshair: SyncCrosshair::default(),
-            strip_tiler: StripTilerPanel::new(),
-            use_match_finder_strips: true,
-            qc_report: None,
-            raw_fids_total: 0,
-            unprocessed_fids_remaining: 0,
-            has_structure_or_dynamics: false,
-            exported_in_session: false,
-            show_contour_modal: false,
-            show_overlay_manager: false,
-            show_assign_popover: false,
-            show_qc_modal: false,
-            show_about_modal: false,
-            mcp_bridge: McpBridgeState::default(),
-            show_mcp_bridge_window: false,
-            integrative_af_panel: IntegrativeAfPanel::new(),
-            show_integrative_af_window: false,
-            workflow_dag_panel: WorkflowDagPanel::new(),
-            show_workflow_dag_window: false,
-            assign_setup_drawer: AssignSetupDrawerState::new(),
-            about_references_modal: AboutReferencesModal::new(),
-            p22_tools_panel: P22ToolsPanel::new(),
-            octet_exp_sync_key: (0, usize::MAX),
-            relax_peaks_sync_key: (0, 0, u64::MAX),
-            mcp_last_viewport_key: (0, 0, 0, -1),
-            assign_target_res: 0,
-            assign_lock_check: true,
-            view_h_left: 10.4,
-            view_h_right: 6.1,
-            view_n_top: 103.0,
-            view_n_bottom: 135.0,
-            contour_base: 8.5,
-            contour_factor: 1.42,
-            contour_levels: 10,
-            show_negative: true,
-            show_peak_labels: true,
             replicas: 8,
             steps_per_sys: 400,
-            assign_cost: 0.0,
-            sim_missing: 0.06,
-            sim_spurious: 0.04,
-            sim_seed: 0,
-            picker_snr: 5.0,
-            selected_ss: None,
-            selected_res: None,
-            peak_2d_labels: BTreeMap::new(),
-            context_menu_2d_ppm: None,
-            secondary_drag_accum_2d: 0.0,
-            bare_bruker_hint: None,
-            picker_wakeup_until_ms: 0,
-            water_undo_2d: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            path_input: "data/fixtures/synthetic_ubiquitin.str".to_string(),
-            #[cfg(not(target_arch = "wasm32"))]
-            export_prefix: "result_gui".to_string(),
-            show_text_io_modal: false,
-            paste_text_buf: String::new(),
-            export_text_buf: String::new(),
-            responsive_shell: ResponsiveShellState::new(),
-            wgpu_render_state: None,
-            suppress_hsqc_pan_until_release: false,
-            suppress_octet_pan_until_release: false,
-            #[cfg(target_arch = "wasm32")]
-            pending_drop_outcome: Arc::new(std::sync::Mutex::new(None)),
+            ..NmrWorkbenchApp::default()
         }
     }
 
@@ -19529,12 +19823,13 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             axis_z: ax_cw,
             data: cube_w_data,
         };
-        app.hncacb_3d = Some(cube_w.clone());
+        let cube_w_arc = Arc::new(cube_w);
+        app.hncacb_3d = Some(Arc::clone(&cube_w_arc));
         let w_cube_idx = app.cubes_3d.len();
-        app.cubes_3d.push(Arc::new(cube_w.clone()));
+        app.cubes_3d.push(Arc::clone(&cube_w_arc));
         let _ = app
             .workbook
-            .add_3d_cube_page(w_cube_idx, "HNCACB_WATER", &cube_w);
+            .add_3d_cube_page(w_cube_idx, "HNCACB_WATER", &cube_w_arc);
         let w_page_idx = app
             .workbook
             .add_2d_page("HSQC_WATER", hsqc_w_spec, false, true);
@@ -20126,9 +20421,11 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 dropped_files,
                 ..Default::default()
             };
-            // Same per-frame order as `NmrWorkbenchApp::ui`: drops, phase-9 modals (ingest
-            // review matrix), then the responsive shell.
+            // Same per-frame order as `NmrWorkbenchApp::ui`: background ingest poll/banner,
+            // drops, phase-9 modals (ingest review matrix), then the responsive shell.
             let mut out = ctx.run_ui(raw, |ui| {
+                app.poll_background_ingest(ui.ctx());
+                app.draw_background_ingest_banner(ui);
                 app.handle_dropped_files(ui.ctx());
                 app.draw_phase9_modals(ui.ctx());
                 let mut shell = std::mem::take(&mut app.responsive_shell);
@@ -20137,6 +20434,18 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             });
             out.textures_delta.clear();
             out
+        };
+        let wait_for_ingest = |ctx: &egui::Context, app: &mut NmrWorkbenchApp| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while app.background_ingest.is_some() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                let _ = run_frame(ctx, Vec::new(), Vec::new(), app);
+            }
+            assert!(
+                app.background_ingest.is_none(),
+                "background ingest did not finish in time (status={:?})",
+                app.status_msg
+            );
         };
         let real_input_actions = std::cell::Cell::new(0usize);
         // One real input action = one pointer press+release at the centre of the rendered label.
@@ -20225,6 +20534,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
 
         // Action 2: real click on the matrix's "Process, Pick & Run" (load + pick 2D/3D + assign).
         let _ = click_label(&ctx, "Process, Pick & Run", &mut app);
+        wait_for_ingest(&ctx, &mut app);
         assert!(app.hsqc_spec.is_some(), "status={:?}", app.status_msg);
         assert_eq!(app.sequence.len(), N_RES, "Action 2 must load seq.fasta");
         let n_3d_peaks = app.peaks.iter().filter(|p| p.c.is_some()).count();
@@ -20272,6 +20582,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         drop_folder(&ctx_b, &mut app_b);
         assert!(app_b.ingest_panel.open);
         let _ = click_label(&ctx_b, "Load Selected Spectra", &mut app_b);
+        wait_for_ingest(&ctx_b, &mut app_b);
         assert!(app_b.hsqc_spec.is_some());
         let _ = click_label(&ctx_b, "Water", &mut app_b);
         let _ = click_label(&ctx_b, "Assign", &mut app_b);
@@ -20575,9 +20886,10 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             axis_z: dummy_axis_c,
             data: vec![0.0f32; 64],
         };
+        let cube_arc = Arc::new(cube);
         app.cubes_3d.clear();
-        app.cubes_3d.push(Arc::new(cube.clone()));
-        app.hnco_3d = Some(cube);
+        app.cubes_3d.push(Arc::clone(&cube_arc));
+        app.hnco_3d = Some(cube_arc);
         app.hncaco_3d = None;
         app.apply_assign_slot_action(AssignSlotAction::ReassignSlotExperiment {
             from_slot: "HNCO".into(),
@@ -20656,6 +20968,154 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         assert_eq!(
             default_1d.target_total_protons, 0.0,
             "Stack1dState must not default to fabricated 10.0 total protons"
+        );
+    }
+
+    #[test]
+    fn test_default_use_neural_picker_is_false() {
+        let def = super::NmrWorkbenchApp::default();
+        assert!(
+            !def.use_neural_picker,
+            "NmrWorkbenchApp::default() must default to classical physics picker (use_neural_picker: false)"
+        );
+    }
+
+    #[test]
+    fn test_is_cloud_storage_path_detection() {
+        use super::is_cloud_storage_path;
+        use std::path::Path;
+
+        assert!(is_cloud_storage_path(Path::new(
+            "/Users/alice/Library/CloudStorage/Dropbox/nmr_study"
+        )));
+        assert!(is_cloud_storage_path(Path::new(
+            "/Users/alice/GoogleDrive/nmr_study"
+        )));
+        assert!(is_cloud_storage_path(Path::new(
+            "/Users/alice/Google Drive/nmr_study"
+        )));
+        assert!(is_cloud_storage_path(Path::new(
+            "/Users/alice/OneDrive/nmr_study"
+        )));
+        assert!(is_cloud_storage_path(Path::new(
+            "/Users/alice/Dropbox/nmr_study"
+        )));
+        assert!(is_cloud_storage_path(Path::new(
+            "/Users/alice/Library/Mobile Documents/com~apple~CloudDocs/nmr_study"
+        )));
+        assert!(!is_cloud_storage_path(Path::new("/tmp/cisd3_bmrb51439")));
+        assert!(!is_cloud_storage_path(Path::new(
+            "/Users/alice/Projects/ferric/data"
+        )));
+    }
+
+    #[test]
+    fn test_ingest_3d_arc_ptr_eq_zero_copy() {
+        use super::*;
+        use nmr_core::spectrum::AxisPpm;
+
+        let mut app = make_headless_test_app();
+        let mk_cube = |name: &str, exp: &str| -> Spectrum3D {
+            Spectrum3D {
+                name: name.into(),
+                exp: exp.into(),
+                axis_x: AxisPpm::from_bounds("1H", 4, 10.0, 6.5, 600.0),
+                axis_y: AxisPpm::from_bounds("15N", 4, 130.0, 105.0, 60.8),
+                axis_z: AxisPpm::from_bounds("13C", 4, 65.0, 45.0, 150.9),
+                data: vec![0.0_f32; 64],
+            }
+        };
+
+        let payload = IngestLoadedPayload {
+            plan: nmr_gui::ingest_panel::IngestExecutionPlan {
+                root_name: "arc-ptr-test".into(),
+                root_path: None,
+                problem_regime: ProblemRegime::GlobularBackbone,
+                sequence_three_letter: Vec::new(),
+                selected_experiments: Vec::new(),
+                in_memory_files: Arc::new(BTreeMap::new()),
+            },
+            run_full_pipeline: false,
+            loaded_2d_list: Vec::new(),
+            cubes_3d: vec![
+                (
+                    "demo_hncacb".into(),
+                    PulseSequenceClass::Hncacb,
+                    mk_cube("demo_hncacb", "HNCACB"),
+                ),
+                (
+                    "demo_hnco".into(),
+                    PulseSequenceClass::Hnco,
+                    mk_cube("demo_hnco", "HNCO"),
+                ),
+                (
+                    "demo_hncaco".into(),
+                    PulseSequenceClass::Hncaco,
+                    mk_cube("demo_hncaco", "HNCACO"),
+                ),
+            ],
+            loaded_1d_specs: Vec::new(),
+            ingested_recipes: BTreeMap::new(),
+            load_errors: Vec::new(),
+            processed_fids: 0,
+        };
+
+        app.apply_loaded_ingest_payload(payload);
+
+        assert_eq!(app.cubes_3d.len(), 3);
+        let hncacb_slot = app.hncacb_3d.as_ref().expect("hncacb_3d slot populated");
+        let hnco_slot = app.hnco_3d.as_ref().expect("hnco_3d slot populated");
+        let hncaco_slot = app.hncaco_3d.as_ref().expect("hncaco_3d slot populated");
+        assert!(
+            Arc::ptr_eq(&app.cubes_3d[0], hncacb_slot),
+            "cubes_3d[0] and hncacb_3d must share the same Arc<Spectrum3D> allocation"
+        );
+        assert!(
+            Arc::ptr_eq(&app.cubes_3d[1], hnco_slot),
+            "cubes_3d[1] and hnco_3d must share the same Arc<Spectrum3D> allocation"
+        );
+        assert!(
+            Arc::ptr_eq(&app.cubes_3d[2], hncaco_slot),
+            "cubes_3d[2] and hncaco_3d must share the same Arc<Spectrum3D> allocation"
+        );
+    }
+
+    #[test]
+    fn test_load_ingest_plan_payload_cancellation_via_atomic_bool() {
+        use super::*;
+
+        let plan = nmr_gui::ingest_panel::IngestExecutionPlan {
+            root_name: "cancel-plan".into(),
+            root_path: None,
+            problem_regime: ProblemRegime::GlobularBackbone,
+            sequence_three_letter: Vec::new(),
+            selected_experiments: Vec::new(),
+            in_memory_files: Arc::new(BTreeMap::new()),
+        };
+
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel();
+        let outcome = load_ingest_plan_payload(
+            plan.clone(),
+            false,
+            false,
+            Some(Arc::clone(&cancel_flag)),
+            Some(tx),
+        );
+        assert!(
+            matches!(outcome, IngestLoadOutcome::Cancelled),
+            "pre-set cancel flag must return IngestLoadOutcome::Cancelled"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(IngestProgressMsg::Cancelled)),
+            "cancellation must notify channel with IngestProgressMsg::Cancelled"
+        );
+
+        let uncancelled_flag = Arc::new(AtomicBool::new(false));
+        let outcome_ok = load_ingest_plan_payload(plan, false, false, Some(uncancelled_flag), None);
+        assert!(
+            matches!(outcome_ok, IngestLoadOutcome::Completed(_)),
+            "uncancelled load with no channel must return IngestLoadOutcome::Completed"
         );
     }
 }
