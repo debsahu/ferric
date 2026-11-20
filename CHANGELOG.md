@@ -4,6 +4,27 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
+## [0.17.2] — 2026-11-20
+
+### Native OS Clipboard, Auto-SNR Classical Peak Picking, Async 3D Ingest & Full-Control MCP Live Workbench Bridge
+
+- **Native OS Clipboard & FASTA Paste Fix (`Cargo.toml`, `Cargo.lock`, `THIRD_PARTY.md`, `crates/nmr-gui/src/mcp_bridge.rs`)**:
+  - Enabled the `eframe/clipboard` feature (`arboard` / `smithay-clipboard`, MIT) so `Copy MCP Config`, `Copy TSV`, and pasting FASTA/NMR-STAR/NEF text work natively across macOS, Linux, and Windows instead of staying in `egui`'s in-memory fallback buffer.
+  - Added MCP Streamable HTTP `2025-03-26` / `2025-06-18` protocol version negotiation on `initialize` and a collapsible `Show JSON` selectable config preview in the MCP Live Workbench Bridge panel.
+- **Classical Peak Picker Default, Auto-SNR Thresholding & Contour-Coupled 3D Picker (`crates/nmr-core/src/picker.rs`, `crates/nmr-gui/src/{main.rs,workbook.rs,assign_setup_drawer.rs}`)**:
+  - Switched `NmrWorkbenchApp::default()` to the classical physics peak picker (`use_neural_picker: false`), eliminating `80 sigma` neural flat-topping multi-cross splits on high-SNR cryo-probe spectra (validated on real 500 MHz Ubiquitin `HSQC.ucsf` + 3D triple-resonance cubes: `109` clean HSQC roots -> `evo-graph` `75/76` residues, `69 >= 0.8`, `QC=PASS`).
+  - Hardened opt-in `pick_hsqc_2d_neural_hardened` with a `picker_snr * estimate_noise_mad` height floor and greedy `(0.025 ppm 1H, 0.25 ppm 15N)` non-maximum suppression.
+  - Added clean-room `estimate_auto_snr_2d` and strided `estimate_auto_snr_3d` (combining two-pass MAD noise, high-dynamic-range scaling, amide `1H` window gating, and visible contour floor), widened setup-drawer SNR controls to logarithmic `2.0..=200.0` with an `Auto` button, widened the 3D Cube Picker `Min SNR` to `2.0..=250.0` with `Auto` + `Above Contour` (`use_contour_floor`) coupling, clarified `3D Cube Picker (<exp>)` labels/hints, and deferred re-picking to `drag_stopped() || lost_focus()`.
+- **Non-Blocking Off-UI-Thread 3D Ingest, Zero-Copy `Arc<Spectrum3D>` & `.fasta.txt` Auto-Discovery (`crates/nmr-core/src/classify.rs`, `crates/nmr-gui/src/{ingest_panel.rs,main.rs}`)**:
+  - Moved native disk reading and FID processing onto a background worker thread (`load_ingest_plan_payload` / `start_ingest_plan_async`) with a live progress banner (`file i/N`, byte size, cloud-storage streaming notice via `is_cloud_storage_path` for iCloud/Google Drive/OneDrive/Dropbox, and `Cancel` via `AtomicBool`), eliminating UI freezes on large multi-hundred-MB `.ucsf`/Bruker directories.
+  - Switched `hncacb_3d`, `hnco_3d`, and `hncaco_3d` slots to `Option<Arc<Spectrum3D>>` shared with `cubes_3d` (zero `512 MiB` cube cloning) and skipped redundant blind full-cube `pick_3d_cube_peaks` during batch ingest when 2D HSQC is loaded.
+  - Added `.fasta.txt` (and `.fa`) extension auto-discovery alongside `.fasta`/`.faa`/`.seq` for RCSB PDB sequence files.
+- **Full-Control MCP Live Workbench Bridge (`crates/nmr-gui/src/{mcp_bridge.rs,main.rs}`)**:
+  - Preferred deterministic loopback port `17420` (`PREFERRED_LOOPBACK_PORT`) on Start Bridge with automatic fallback to OS-assigned ephemeral `127.0.0.1:0`, plus immediate UI wakeup via `egui::Context::request_repaint()`.
+  - Added `dispatch_workbench_action` (all `WorkbenchAction::ALL` variants in PascalCase/snake_case), expanded `run_workbench_workflow` (`load_study_folder`, `set_sequence`, `pick_peaks`, `run_assignment`, `select_workbook_page`, `set_contour_level`, `set_viewport_bounds`, `export_results`, `set_lock_residue`; strictly `ReadWrite`-gated + audited), added read-only `inspect_workbench_data` (`assignments`, `spin_systems`, `peaks`, `unassigned_residues`, `low_confidence`, `qc_report`, `workbook_pages`, `actions`), and enriched `get_workbench_state`.
+
+---
+
 ## [0.17.1] — 2026-11-19
 
 ### Interactive Workbench UX, Metabolomics BMRB-BMSE Identification, Phase 22 GUI Wiring & Multi-Distro Release Packaging (Claude Round-4 `APPROVE_WITH_FOLLOWUPS`)

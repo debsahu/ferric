@@ -40,7 +40,7 @@ Requires a stable Rust toolchain (`rustup`, Rust 1.80+) and a Vulkan, Metal, or 
 
 ```bash
 # System-wide RPM install (built on AlmaLinux 9, glibc <= 2.34; uses NVIDIA Vulkan GPU automatically)
-VER=0.17.1
+VER=0.17.2
 TMP="$(mktemp -d)" && (
   cd "$TMP"
   curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.rpm"
@@ -55,7 +55,7 @@ ferric-gui
 
 - Verified on RHEL 9.8 with NVIDIA proprietary Vulkan drivers (`wgpu` automatically selects the discrete NVIDIA GPU for `ferric-gui` and `--engine gpu`).
 - On minimal or headless RHEL 9 installs without desktop X11/Vulkan libraries, install GUI runtime dependencies with: `sudo dnf install -y libxkbcommon libX11 vulkan-loader mesa-vulkan-drivers`.
-- **No-`sudo` user-local fallback:** extract [`ferric-v0.17.1-linux-x86_64.tar.gz`](https://github.com/debsahu/ferric/releases) in a private `mktemp -d` directory and run `./install-desktop.sh --prefix "$HOME/.local"` (see the [User Manual](https://debsahu.github.io/ferric/)).
+- **No-`sudo` user-local fallback:** extract [`ferric-v0.17.2-linux-x86_64.tar.gz`](https://github.com/debsahu/ferric/releases) in a private `mktemp -d` directory and run `./install-desktop.sh --prefix "$HOME/.local"` (see the [User Manual](https://debsahu.github.io/ferric/)).
 
 Install via **Homebrew** (macOS Apple Silicon / Intel & Linux `x86_64`):
 
@@ -79,8 +79,8 @@ Or install directly with **Cargo** (from Git) or build from a local clone:
 
 ```bash
 # Install the ferric CLI (and optionally ferric-gui) directly via Cargo
-cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.1 nmr-cli
-cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.1 nmr-gui
+cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.2 nmr-cli
+cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.2 nmr-gui
 
 # Or run from a local checkout
 cargo run --release -p nmr-gui --bin ferric-gui

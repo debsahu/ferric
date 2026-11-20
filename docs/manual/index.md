@@ -88,7 +88,7 @@ FERRIC's `linux-x86_64` release binaries are compiled inside AlmaLinux 9 (`glibc
 
 ```bash
 # System-wide RPM install (requires sudo)
-VER=0.17.1
+VER=0.17.2
 TMP="$(mktemp -d)" && (
   cd "$TMP"
   curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.rpm"
@@ -113,7 +113,7 @@ ferric-gui
   ```
 - **No-`sudo` user-local install into `~/.local/bin` (with desktop launcher & icons)**:
   ```bash
-  VER=0.17.1
+  VER=0.17.2
   TMP="$(mktemp -d)" && (
     cd "$TMP"
     curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.tar.gz"
@@ -128,8 +128,8 @@ ferric-gui
 
 #### Other Prebuilt Platforms & Direct Cargo Install
 
-- **Debian / Ubuntu (`x86_64`)**: Download `ferric-v0.17.1-linux-x86_64.deb` from GitHub Releases and run `sudo apt install ./ferric-v0.17.1-linux-x86_64.deb`.
-- **Legacy 32-bit Linux (`i686` CLI-only)**: Static musl `ferric` CLI packages (`ferric-v0.17.1-linux-i686-cli.rpm`, `.deb`, and `.tar.gz`).
+- **Debian / Ubuntu (`x86_64`)**: Download `ferric-v0.17.2-linux-x86_64.deb` from GitHub Releases and run `sudo apt install ./ferric-v0.17.2-linux-x86_64.deb`.
+- **Legacy 32-bit Linux (`i686` CLI-only)**: Static musl `ferric` CLI packages (`ferric-v0.17.2-linux-i686-cli.rpm`, `.deb`, and `.tar.gz`).
 - **macOS (Apple Silicon & Intel)**:
   ```bash
   brew tap debsahu/tap
@@ -137,11 +137,11 @@ ferric-gui
   brew install --cask --no-quarantine ferric # FERRIC.app GUI + CLI (macOS arm64/x86_64)
   ```
   Or download the `.dmg` / `.tar.gz` archives directly from [**GitHub Releases**](https://github.com/debsahu/ferric/releases). Because `FERRIC.app` is ad-hoc signed (not Apple-notarized), after dragging it from a `.dmg` into `/Applications`, clear the download quarantine flag once with `xattr -dr com.apple.quarantine /Applications/FERRIC.app` (or click **Open Anyway** in **System Settings → Privacy & Security**; `brew install --cask --no-quarantine ferric` skips this automatically).
-- **Windows (`x86_64`)**: Download `ferric-v0.17.1-windows-x86_64.zip` (`ferric-gui.exe` + `ferric.exe`).
+- **Windows (`x86_64`)**: Download `ferric-v0.17.2-windows-x86_64.zip` (`ferric-gui.exe` + `ferric.exe`).
 - **Direct Cargo Install (any platform with Rust)**:
   ```bash
-  cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.1 nmr-cli
-  cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.1 nmr-gui
+  cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.2 nmr-cli
+  cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.2 nmr-gui
   ```
 
 ### Building from Source — Prerequisites
