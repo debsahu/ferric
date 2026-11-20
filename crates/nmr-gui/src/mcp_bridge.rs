@@ -5317,8 +5317,10 @@ mod tests {
         // 1. Custom bind_input values are preserved verbatim without silent :0 fallback
         let busy_ephemeral = TcpListener::bind("127.0.0.1:0").expect("bind dummy ephemeral port");
         let busy_addr_str = busy_ephemeral.local_addr().unwrap().to_string();
-        let mut custom_ctrl = McpBridgeController::default();
-        custom_ctrl.bind_input = busy_addr_str.clone();
+        let mut custom_ctrl = McpBridgeController {
+            bind_input: busy_addr_str.clone(),
+            ..Default::default()
+        };
         assert!(custom_ctrl.start_bridge_preferred().is_err());
         assert_eq!(custom_ctrl.bind_input, busy_addr_str);
         assert!(!custom_ctrl.is_running());
