@@ -130,7 +130,7 @@ ferric-gui
   brew install ferric                        # CLI (macOS arm64/x86_64 + Linux x86_64)
   brew install --cask --no-quarantine ferric # FERRIC.app GUI + CLI (macOS arm64/x86_64)
   ```
-  Or download the `.dmg` / `.tar.gz` archives directly from [**GitHub Releases**](https://github.com/debsahu/ferric/releases).
+  Or download the `.dmg` / `.tar.gz` archives directly from [**GitHub Releases**](https://github.com/debsahu/ferric/releases). Because `FERRIC.app` is ad-hoc signed (not Apple-notarized), after dragging it from a `.dmg` into `/Applications`, clear the download quarantine flag once with `xattr -dr com.apple.quarantine /Applications/FERRIC.app` (or click **Open Anyway** in **System Settings → Privacy & Security**; `brew install --cask --no-quarantine ferric` skips this automatically).
 - **Windows (`x86_64`)**: Download `ferric-v0.17.1-windows-x86_64.zip` (`ferric-gui.exe` + `ferric.exe`).
 - **Direct Cargo Install (any platform with Rust)**:
   ```bash

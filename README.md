@@ -62,7 +62,11 @@ brew install --cask --no-quarantine ferric # FERRIC.app GUI + CLI (macOS arm64/x
 ```
 
 Or download pre-built packages directly from [**GitHub Releases**](https://github.com/debsahu/ferric/releases):
-- **macOS**: Apple Silicon (`macos-arm64`) and Intel (`macos-x86_64`) `.dmg` (`FERRIC.app`) & `.tar.gz`
+- **macOS**: Apple Silicon (`macos-arm64`) and Intel (`macos-x86_64`) `.dmg` (`FERRIC.app`) & `.tar.gz`. Because `FERRIC.app` is ad-hoc signed (not Apple-notarized), if Gatekeeper blocks first launch after dragging into `/Applications`, run once:
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/FERRIC.app
+  ```
+  *(Or click **Open Anyway** in **System Settings → Privacy & Security**; `brew install --cask --no-quarantine ferric` skips this automatically.)*
 - **Linux `x86_64` (RHEL 9 / AlmaLinux 9 / Rocky 9 / Ubuntu / Debian, `glibc <= 2.34`)**: `.rpm`, `.deb`, & `.tar.gz`
 - **Linux `i686` (32-bit static musl CLI)**: `.rpm`, `.deb`, & `.tar.gz`
 - **Windows `x86_64`**: `.zip` (`ferric-gui.exe` + `ferric.exe`)
