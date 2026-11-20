@@ -46,7 +46,7 @@ Output artifacts written to `./workspace/ubq_results`:
 
 ### 3. Drag-and-Drop Interactive Desktop & Browser Workbench
 
-Launch `ferric-gui` directly after installing the RHEL 9 `.rpm`, Homebrew cask, or GitHub Release package (or build from source via `cargo run --release -p nmr-gui --bin ferric-gui`; see [Installation & Building from Source](index.md#installation-building-from-source)), and drag a spectrometer folder, `.tar.gz` archive, `.fasta` sequence, or `.nef` session onto the window:
+Launch `ferric-gui` directly after installing the RHEL 9 `.rpm`, Homebrew cask, or GitHub Release package (or build from source via `cargo run --release -p nmr-gui --bin ferric-gui`; see [Installation & Building from Source](index.md#installation-and-building-from-source)), and drag a spectrometer folder, `.tar.gz` archive, `.fasta` sequence, or `.nef` session onto the window:
 
 1. **Experiment Selection Matrix (`nmr-gui::ingest_panel`)**: Displays every discovered dataset with auto-detected experiment role, observed nuclei (`1H`, `15N`, `13C`, `19F`, `31P`), field strength (`MHz`), quadrature/NUS badge, editable role dropdowns, include/exclude checkboxes, and a 1-click **Process, Pick & Run** button (`<= 5`-click first-run workflow).
 2. **Single 6-Mode Workbench Header (`nmr-gui::workbench_mode`)**: Switches cleanly across **`Process | Assign | Structure | Dynamics | Small molecule | Metabolomics`**, revealing mode-appropriate controls (`<= 12` primary controls/mode, `>= 65%` plot canvas share, `0` emojis) as matching data are loaded.
