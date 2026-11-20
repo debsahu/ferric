@@ -1845,6 +1845,7 @@ struct NmrWorkbenchApp {
     contour_levels: u32,
     show_negative: bool,
     show_peak_labels: bool,
+    declutter_peak_labels: bool,
     peak_label_font_px: f32,
     peak_marker_size_px: f32,
     box_zoom_2d_mode: bool,
@@ -3176,6 +3177,7 @@ impl Default for NmrWorkbenchApp {
             contour_levels: 10,
             show_negative: true,
             show_peak_labels: true,
+            declutter_peak_labels: true,
             peak_label_font_px: 11.0,
             peak_marker_size_px: 3.8,
             box_zoom_2d_mode: false,
@@ -4125,16 +4127,149 @@ impl NmrWorkbenchApp {
         )
     }
 
+    fn title_case_aa(aa: &str) -> String {
+        let mut chars = aa.chars();
+        match chars.next() {
+            Some(first) => {
+                let mut s = first.to_uppercase().to_string();
+                s.push_str(&chars.as_str().to_ascii_lowercase());
+                s
+            }
+            None => String::new(),
+        }
+    }
+
+    fn predict_aa_types_from_shifts(
+        priors: &Priors,
+        ca: Option<f64>,
+        cb: Option<f64>,
+        c: Option<f64>,
+        allow_pro: bool,
+        top_k: usize,
+    ) -> Vec<(&'static str, f64)> {
+        const CANONICAL_AA_20: [&str; 20] = [
+            "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS",
+            "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+        ];
+        if (ca.is_none() && cb.is_none()) || top_k == 0 {
+            return Vec::new();
+        }
+        let mut raw: Vec<(&'static str, f64)> = Vec::with_capacity(20);
+        for &aa in &CANONICAL_AA_20 {
+            if !allow_pro && aa == "PRO" {
+                continue;
+            }
+            let score = ca.map_or(0.0, |v| priors.llr(aa, "CA", v))
+                + cb.map_or(0.0, |v| priors.llr(aa, "CB", v))
+                + c.map_or(0.0, |v| 0.35 * priors.llr(aa, "C", v));
+            if score.is_finite() {
+                raw.push((aa, score));
+            }
+        }
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        let max_s = raw
+            .iter()
+            .map(|&(_, s)| s)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mut probs: Vec<(&'static str, f64)> = raw
+            .into_iter()
+            .map(|(aa, s)| (aa, (s - max_s).exp()))
+            .collect();
+        let sum_w: f64 = probs.iter().map(|&(_, w)| w).sum();
+        if !sum_w.is_finite() || sum_w <= 0.0 {
+            return Vec::new();
+        }
+        for (_, w) in &mut probs {
+            *w /= sum_w;
+        }
+        probs.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        probs.truncate(top_k);
+        probs
+    }
+
+    fn format_unassigned_type_tag(preds: &[(&'static str, f64)]) -> String {
+        let Some(&(aa0, p0)) = preds.first() else {
+            return String::new();
+        };
+        if p0 >= 0.55 || preds.len() == 1 {
+            format!("~{}", three_to_one(aa0))
+        } else {
+            format!("~{}/{}", three_to_one(aa0), three_to_one(preds[1].0))
+        }
+    }
+
+    fn format_aa_type_summary(preds: &[(&'static str, f64)]) -> String {
+        preds
+            .iter()
+            .map(|&(aa, p)| format!("{} {:.0}%", Self::title_case_aa(aa), p * 100.0))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
     fn rebuild_systems_and_matrices(&mut self) {
+        let old_sel_coords = self
+            .selected_ss
+            .and_then(|s| self.systems.get(s))
+            .map(|ss| (ss.h, ss.n));
+        let old_locks: Vec<(f64, f64, usize)> = self
+            .session
+            .state
+            .locked_residues
+            .iter()
+            .filter_map(|(&ss_idx, &res_idx)| {
+                self.systems.get(ss_idx).map(|ss| (ss.h, ss.n, res_idx))
+            })
+            .collect();
+        let old_assign_coords = self.assign_res.as_ref().map(|ar| {
+            let entries: Vec<(f64, f64, i32, f64)> = ar
+                .position
+                .iter()
+                .enumerate()
+                .filter_map(|(s, &pos)| {
+                    if pos < 0 {
+                        return None;
+                    }
+                    let ss = self.systems.get(s)?;
+                    let conf = ar.confidence.get(s).copied().unwrap_or(0.0);
+                    Some((ss.h, ss.n, pos, conf))
+                })
+                .collect();
+            (entries, ar.score, ar.run_scores.clone())
+        });
+
         match build_spin_systems(&self.peaks, &Tolerances::default(), 3, false) {
             Ok(sys) => {
-                let locked: Vec<(usize, usize)> = self
-                    .session
-                    .state
-                    .locked_assignments_vec()
-                    .into_iter()
-                    .filter(|&(s, k)| s < sys.len() && k < self.sequence.len())
-                    .collect();
+                let find_nearest_new = |h: f64, n: f64, used: Option<&[bool]>| -> Option<usize> {
+                    sys.iter()
+                        .enumerate()
+                        .filter(|&(idx, cand)| {
+                            used.is_none_or(|u| !u[idx])
+                                && (cand.h - h).abs() <= 0.03
+                                && (cand.n - n).abs() <= 0.30
+                        })
+                        .min_by(|(_, a), (_, b)| {
+                            let da = ((a.h - h) / 0.03).hypot((a.n - n) / 0.30);
+                            let db = ((b.h - h) / 0.03).hypot((b.n - n) / 0.30);
+                            da.total_cmp(&db)
+                        })
+                        .map(|(idx, _)| idx)
+                };
+
+                let mut used_locks = vec![false; sys.len()];
+                let mut remapped_locks = BTreeMap::new();
+                for &(lh, ln, res_idx) in &old_locks {
+                    if res_idx < self.sequence.len() {
+                        if let Some(ns) = find_nearest_new(lh, ln, Some(&used_locks)) {
+                            used_locks[ns] = true;
+                            remapped_locks.insert(ns, res_idx);
+                        }
+                    }
+                }
+                self.session.state.locked_residues = remapped_locks;
+
+                let locked = self.session.state.locked_assignments_vec();
                 let scfg = ScoreConfig {
                     assign_cost: self.assign_cost,
                     locked_assignments: locked,
@@ -4143,11 +4278,54 @@ impl NmrWorkbenchApp {
                 let (u, p) = self.compute_matrices(&sys, &scfg);
                 self.u_mat = Some(u);
                 self.p_mat = Some(p);
+
+                if let Some((entries, old_score, old_run_scores)) = old_assign_coords {
+                    let mut new_pos = vec![-1i32; sys.len()];
+                    let mut new_conf = vec![0.0f64; sys.len()];
+                    let mut used_ss = vec![false; sys.len()];
+                    let mut new_session_assign: BTreeMap<usize, ResidueAssignmentState> =
+                        BTreeMap::new();
+                    for (oh, on, pos, conf) in entries {
+                        let k = pos as usize;
+                        if k < self.sequence.len() {
+                            if let Some(ns) = find_nearest_new(oh, on, Some(&used_ss)) {
+                                used_ss[ns] = true;
+                                new_pos[ns] = pos;
+                                new_conf[ns] = conf;
+                                let shifts = self
+                                    .session
+                                    .state
+                                    .assignments
+                                    .get(&k)
+                                    .map(|st| st.shifts.clone())
+                                    .unwrap_or_default();
+                                new_session_assign.insert(
+                                    k,
+                                    ResidueAssignmentState {
+                                        spin_system: Some(ns),
+                                        shifts,
+                                        confidence: conf,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    self.assign_res = Some(AssignResult {
+                        position: new_pos,
+                        confidence: new_conf,
+                        score: old_score,
+                        run_scores: old_run_scores,
+                    });
+                    self.session.state.assignments = new_session_assign;
+                }
+
+                let remapped_sel =
+                    old_sel_coords.and_then(|(sh, sn)| find_nearest_new(sh, sn, None));
                 self.systems = sys;
-                self.selected_ss = match self.selected_ss {
+                self.selected_ss = remapped_sel.or_else(|| match self.selected_ss {
                     Some(s) if s < self.systems.len() => Some(s),
                     _ => (!self.systems.is_empty()).then_some(0),
-                };
+                });
             }
             Err(e) => {
                 self.status_msg = format!("Spin system build error: {e}");
@@ -7852,26 +8030,40 @@ impl NmrWorkbenchApp {
                                     let mut lbl_buf =
                                         self.peak_2d_labels.get(&key).cloned().unwrap_or_default();
                                     let auto_hint = if lbl_buf.is_empty() {
-                                        self.assign_res.as_ref().and_then(|ar| {
-                                            let best_ss = self
-                                                .systems
-                                                .iter()
-                                                .enumerate()
-                                                .filter(|(_, ss)| {
-                                                    (ss.h - pk.h).abs() <= 0.03
-                                                        && (ss.n - pk.n).abs() <= 0.30
-                                                })
-                                                .min_by(|(_, a), (_, b)| {
-                                                    let da = ((a.h - pk.h) / 0.03).hypot((a.n - pk.n) / 0.30);
-                                                    let db = ((b.h - pk.h) / 0.03).hypot((b.n - pk.n) / 0.30);
-                                                    da.total_cmp(&db)
-                                                })
-                                                .map(|(idx, _)| idx)?;
-                                            let pos = ar.position.get(best_ss).copied().unwrap_or(-1);
+                                        let best_ss_opt = self
+                                            .systems
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(_, ss)| {
+                                                (ss.h - pk.h).abs() <= 0.03
+                                                    && (ss.n - pk.n).abs() <= 0.30
+                                            })
+                                            .min_by(|(_, a), (_, b)| {
+                                                let da = ((a.h - pk.h) / 0.03)
+                                                    .hypot((a.n - pk.n) / 0.30);
+                                                let db = ((b.h - pk.h) / 0.03)
+                                                    .hypot((b.n - pk.n) / 0.30);
+                                                da.total_cmp(&db)
+                                            })
+                                            .map(|(idx, _)| idx);
+                                        best_ss_opt.and_then(|best_ss| {
+                                            let pos = self
+                                                .assign_res
+                                                .as_ref()
+                                                .and_then(|ar| ar.position.get(best_ss).copied())
+                                                .unwrap_or(-1);
                                             if pos >= 0 && (pos as usize) < self.sequence.len() {
                                                 let k = pos as usize;
-                                                let conf = ar.confidence.get(best_ss).copied().unwrap_or(0.0);
-                                                let sid = self.seq_ids.get(k).copied().unwrap_or((k + 1) as i32);
+                                                let conf = self
+                                                    .assign_res
+                                                    .as_ref()
+                                                    .and_then(|ar| ar.confidence.get(best_ss).copied())
+                                                    .unwrap_or(0.0);
+                                                let sid = self
+                                                    .seq_ids
+                                                    .get(k)
+                                                    .copied()
+                                                    .unwrap_or((k + 1) as i32);
                                                 Some(format!(
                                                     "{}{} ({:.0}%)",
                                                     three_to_one(&self.sequence[k]),
@@ -7879,7 +8071,23 @@ impl NmrWorkbenchApp {
                                                     conf * 100.0
                                                 ))
                                             } else {
-                                                None
+                                                let sh = self.systems[best_ss].shifts();
+                                                let preds = Self::predict_aa_types_from_shifts(
+                                                    &self.priors,
+                                                    sh.get(&("CA".to_string(), 0)).copied(),
+                                                    sh.get(&("CB".to_string(), 0)).copied(),
+                                                    sh.get(&("C".to_string(), 0)).copied(),
+                                                    false,
+                                                    3,
+                                                );
+                                                if preds.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(format!(
+                                                        "#{best_ss} {}",
+                                                        Self::format_aa_type_summary(&preds)
+                                                    ))
+                                                }
                                             }
                                         })
                                     } else {
@@ -10812,19 +11020,25 @@ impl NmrWorkbenchApp {
                                        text: String,
                                        priority: f32,
                                        col: egui::Color32| {
-            let obs = (base_marker_sz * 2.4).max(8.0);
+            let obs = (base_marker_sz * 1.8).clamp(6.0, 18.0);
             obstacles.push(egui::Rect::from_center_size(pt, egui::vec2(obs, obs)));
             let galley = painter.layout_no_wrap(text, label_font.clone(), col);
             let sz = galley.size() + egui::vec2(4.0, 2.0);
-            let hw = sz.x * 0.5 + 6.0;
+            let clear_x = (obs * 0.5 + 3.5).max(base_marker_sz + 3.0);
+            let clear_y = (obs * 0.5 + 3.5).max(base_marker_sz + 3.0);
+            let hw = sz.x * 0.5 + clear_x;
             let hh = sz.y;
             let offsets = vec![
-                egui::vec2(hw, -4.0),
-                egui::vec2(-hw, -4.0),
-                egui::vec2(hw, hh + 5.0),
-                egui::vec2(-hw, hh + 5.0),
-                egui::vec2(0.0, -7.0),
-                egui::vec2(0.0, hh + 8.0),
+                egui::vec2(hw, -clear_y * 0.35),
+                egui::vec2(-hw, -clear_y * 0.35),
+                egui::vec2(hw, hh + clear_y * 0.35),
+                egui::vec2(-hw, hh + clear_y * 0.35),
+                egui::vec2(0.0, -clear_y),
+                egui::vec2(0.0, hh + clear_y),
+                egui::vec2(hw + 8.0, -clear_y - 2.0),
+                egui::vec2(-hw - 8.0, -clear_y - 2.0),
+                egui::vec2(hw + 8.0, hh + clear_y + 2.0),
+                egui::vec2(-hw - 8.0, hh + clear_y + 2.0),
             ];
             items.push((
                 nmr_gui::label_layout::LabelCandidate {
@@ -11002,7 +11216,16 @@ impl NmrWorkbenchApp {
                             format!("{}{}", three_to_one(&self.sequence[k]), self.seq_ids[k])
                         }
                     } else {
-                        format!("#{s}")
+                        let sh = ss.shifts();
+                        let preds = Self::predict_aa_types_from_shifts(
+                            &self.priors,
+                            sh.get(&("CA".to_string(), 0)).copied(),
+                            sh.get(&("CB".to_string(), 0)).copied(),
+                            sh.get(&("C".to_string(), 0)).copied(),
+                            false,
+                            2,
+                        );
+                        format!("#{s}{}", Self::format_unassigned_type_tag(&preds))
                     };
                     let prio = if is_sel {
                         1.0e9
@@ -11114,12 +11337,26 @@ impl NmrWorkbenchApp {
         if !label_items.is_empty() {
             let cands: Vec<nmr_gui::label_layout::LabelCandidate> =
                 label_items.iter().map(|(c, _, _)| c.clone()).collect();
-            let placed = nmr_gui::label_layout::place_labels(
-                &cands,
-                &label_obstacles,
-                rect.shrink(4.0),
-                2.0,
-            );
+            let bounds = rect.shrink(4.0);
+            let placed = if self.declutter_peak_labels {
+                nmr_gui::label_layout::place_labels(&cands, &label_obstacles, bounds, 2.0)
+            } else {
+                cands
+                    .iter()
+                    .map(|c| {
+                        let off = c.offsets.first().copied().unwrap_or(egui::Vec2::ZERO);
+                        let r = nmr_gui::label_layout::label_rect(c.anchor, off, c.size);
+                        if bounds.contains_rect(r) {
+                            Some(r)
+                        } else {
+                            let off_alt = c.offsets.get(1).copied().unwrap_or(off);
+                            let r_alt =
+                                nmr_gui::label_layout::label_rect(c.anchor, off_alt, c.size);
+                            bounds.contains_rect(r_alt).then_some(r_alt)
+                        }
+                    })
+                    .collect()
+            };
             for (placed_opt, (_, galley, col)) in placed.into_iter().zip(label_items) {
                 if let Some(r) = placed_opt {
                     painter.galley(r.min + egui::vec2(2.0, 1.0), galley, col);
@@ -15002,6 +15239,10 @@ impl NmrWorkbenchApp {
                 .max_width(max_modal_w)
                 .show(ctx, |ui| {
                     ui.checkbox(&mut self.show_peak_labels, "Show Peak Labels (pl)");
+                    ui.checkbox(
+                        &mut self.declutter_peak_labels,
+                        "Declutter Overlapping Labels",
+                    );
                     ui.add(
                         egui::Slider::new(&mut self.peak_label_font_px, 7.0..=28.0)
                             .step_by(0.5)
@@ -15034,6 +15275,7 @@ impl NmrWorkbenchApp {
                     if ui.button("Reset Defaults (11 px / 3.8 px)").clicked() {
                         self.peak_label_font_px = 11.0;
                         self.peak_marker_size_px = 3.8;
+                        self.declutter_peak_labels = true;
                     }
                 });
             self.show_ornament_modal = open;
@@ -15174,10 +15416,60 @@ impl NmrWorkbenchApp {
                 .max_width(max_modal_w)
                 .show(ctx, |ui| {
                     if let Some(ss) = self.selected_ss.filter(|&s| s < self.systems.len()) {
+                        let sh = self.systems[ss].shifts();
+                        let ca = sh.get(&("CA".to_string(), 0)).copied();
+                        let cb = sh.get(&("CB".to_string(), 0)).copied();
+                        let c = sh.get(&("C".to_string(), 0)).copied();
+                        let ca_m1 = sh.get(&("CA".to_string(), -1)).copied();
+                        let cb_m1 = sh.get(&("CB".to_string(), -1)).copied();
+                        let c_m1 = sh.get(&("C".to_string(), -1)).copied();
                         ui.label(format!(
                             "Active Spin System: #{ss} (1H {:.3}, 15N {:.2})",
                             self.systems[ss].h, self.systems[ss].n
                         ));
+                        let fmt_shift = |v: Option<f64>| {
+                            v.map_or_else(|| "-".to_string(), |x| format!("{x:.2}"))
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Shifts (ppm): CA {}  CB {}  C' {}",
+                                fmt_shift(ca),
+                                fmt_shift(cb),
+                                fmt_shift(c),
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                        let preds_i =
+                            Self::predict_aa_types_from_shifts(&self.priors, ca, cb, c, false, 3);
+                        if !preds_i.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Predicted i (CA/CB): {}",
+                                    Self::format_aa_type_summary(&preds_i)
+                                ))
+                                .small()
+                                .color(egui::Color32::from_rgb(125, 224, 255)),
+                            );
+                        }
+                        let preds_m1 = Self::predict_aa_types_from_shifts(
+                            &self.priors,
+                            ca_m1,
+                            cb_m1,
+                            c_m1,
+                            true,
+                            3,
+                        );
+                        if !preds_m1.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Predicted i-1: {}",
+                                    Self::format_aa_type_summary(&preds_m1)
+                                ))
+                                .small()
+                                .color(egui::Color32::from_rgb(255, 212, 110)),
+                            );
+                        }
                         if !self.sequence.is_empty() {
                             let max_k = self.sequence.len().saturating_sub(1);
                             self.assign_target_res =
@@ -17373,18 +17665,53 @@ impl NmrWorkbenchApp {
                         Some(&(sid, c)) => (Some(sid), Some(c)),
                         None => (None, None),
                     };
+                    let ca = sh.get(&("CA".to_string(), 0)).copied();
+                    let cb = sh.get(&("CB".to_string(), 0)).copied();
+                    let c = sh.get(&("C".to_string(), 0)).copied();
+                    let ca_m1 = sh.get(&("CA".to_string(), -1)).copied();
+                    let cb_m1 = sh.get(&("CB".to_string(), -1)).copied();
+                    let c_m1 = sh.get(&("C".to_string(), -1)).copied();
+                    let pred_json = |preds: Vec<(&'static str, f64)>| -> Vec<serde_json::Value> {
+                        preds
+                            .into_iter()
+                            .map(|(aa, prob)| {
+                                serde_json::json!({
+                                    "aa": aa,
+                                    "prob": (prob * 1000.0).round() / 1000.0,
+                                })
+                            })
+                            .collect()
+                    };
+                    let preds_i = pred_json(Self::predict_aa_types_from_shifts(
+                        &self.priors,
+                        ca,
+                        cb,
+                        c,
+                        false,
+                        3,
+                    ));
+                    let preds_m1 = pred_json(Self::predict_aa_types_from_shifts(
+                        &self.priors,
+                        ca_m1,
+                        cb_m1,
+                        c_m1,
+                        true,
+                        3,
+                    ));
                     serde_json::json!({
                         "cluster_id": idx,
                         "h": sys.h,
                         "n": sys.n,
-                        "ca": sh.get(&("CA".to_string(), 0)).copied(),
-                        "cb": sh.get(&("CB".to_string(), 0)).copied(),
-                        "c": sh.get(&("C".to_string(), 0)).copied(),
-                        "ca_m1": sh.get(&("CA".to_string(), -1)).copied(),
-                        "cb_m1": sh.get(&("CB".to_string(), -1)).copied(),
-                        "c_m1": sh.get(&("C".to_string(), -1)).copied(),
+                        "ca": ca,
+                        "cb": cb,
+                        "c": c,
+                        "ca_m1": ca_m1,
+                        "cb_m1": cb_m1,
+                        "c_m1": c_m1,
                         "assigned_seq_id": assigned_seq_id,
                         "confidence": conf,
+                        "predicted_aa_top3": preds_i,
+                        "predicted_aa_m1_top3": preds_m1,
                     })
                 })
                 .collect();
@@ -22335,11 +22662,9 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
 
         app.peak_label_font_px = 18.0;
         app.peak_marker_size_px = 6.5;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
         let raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1440.0, 900.0),
-            )),
+            screen_rect: Some(screen),
             ..Default::default()
         };
         let _ = ctx.run_ui(raw, |ui| {
@@ -22349,7 +22674,184 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         assert!((app.peak_label_font_px - 18.0).abs() < 1e-4);
         assert!((app.peak_marker_size_px - 6.5).abs() < 1e-4);
 
+        // Sweeping Peak Marker Size up to maximum 14.0 px must never make labels vanish
+        for (marker_sz, font_px) in [(3.8_f32, 11.0_f32), (10.0, 14.0), (14.0, 20.0)] {
+            app.peak_marker_size_px = marker_sz;
+            app.peak_label_font_px = font_px;
+            let raw_sweep = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw_sweep, |ui| {
+                let _ = app.draw_hsqc_canvas(ui);
+            });
+            out.textures_delta.clear();
+            let plot_rect = app.last_hsqc_plot_rect.expect("plot_rect recorded");
+            let audit = nmr_gui::workbench_mode::audit_text_layout(&out.shapes, screen);
+            let inside_count = audit
+                .texts
+                .iter()
+                .filter(|t| plot_rect.contains(t.rect.center()))
+                .count();
+            assert!(
+                inside_count >= 10,
+                "Expected >= 10 visible peak labels at marker_sz={marker_sz}, font_px={font_px}, got {inside_count}"
+            );
+        }
+
         app.dispatch_workbench_action(&ctx, WorkbenchAction::OpenOrnamentSizeDialog);
         assert!(!app.show_ornament_modal);
+    }
+
+    #[test]
+    fn test_rebuild_systems_remaps_assignments_and_locks_by_coordinate() {
+        use super::*;
+
+        let mut app = make_headless_test_app();
+        app.load_builtin_demo_suite();
+        app.run_assignment();
+
+        let assign_before = app.assign_res.clone().expect("assign_res populated");
+        let (orig_ss, orig_pos) = assign_before
+            .position
+            .iter()
+            .enumerate()
+            .find(|&(_, &p)| p >= 0)
+            .map(|(s, &p)| (s, p as usize))
+            .expect("at least one assigned spin system");
+        let orig_h = app.systems[orig_ss].h;
+        let orig_n = app.systems[orig_ss].n;
+
+        let _ = app.execute_session_cmd(WorkbenchCommand::LockResidue {
+            spin_system: orig_ss,
+            residue_seq_idx: orig_pos,
+            locked: true,
+        });
+        app.sync_app_from_session();
+
+        let prev_assigned: Vec<(f64, f64, i32)> = assign_before
+            .position
+            .iter()
+            .enumerate()
+            .filter(|&(_, &pos)| pos >= 0)
+            .map(|(s, &pos)| (app.systems[s].h, app.systems[s].n, pos))
+            .collect();
+
+        // Insert a new manual HSQC root at index 0 so spin-system indices shift downstream
+        app.peaks.insert(
+            0,
+            Peak {
+                exp: "HSQC".into(),
+                h: 9.88,
+                n: 108.4,
+                c: None,
+                h2: None,
+                sign: 1,
+                height: Some(120.0),
+                volume: Some(120.0),
+            },
+        );
+        app.sync_2d_peaks_after_edit();
+
+        let assign_after = app
+            .assign_res
+            .as_ref()
+            .expect("assign_res must stay populated across 2D peak edits");
+        assert_eq!(assign_after.position.len(), app.systems.len());
+
+        for (eh, en, epos) in prev_assigned {
+            let new_ss = assign_after
+                .position
+                .iter()
+                .position(|&p| p == epos)
+                .expect("previously assigned residue must stay assigned after index shift");
+            assert!(
+                (app.systems[new_ss].h - eh).abs() <= 0.02
+                    && (app.systems[new_ss].n - en).abs() <= 0.20,
+                "residue {epos} scrambled from ({eh:.3}, {en:.2}) to ({:.3}, {:.2})",
+                app.systems[new_ss].h,
+                app.systems[new_ss].n
+            );
+        }
+
+        let (&locked_ss, &locked_res) = app
+            .session
+            .state
+            .locked_residues
+            .iter()
+            .next()
+            .expect("lock must remain intact after peak insertion");
+        assert_eq!(locked_res, orig_pos);
+        assert!(
+            (app.systems[locked_ss].h - orig_h).abs() <= 0.02
+                && (app.systems[locked_ss].n - orig_n).abs() <= 0.20
+        );
+    }
+
+    #[test]
+    fn test_predict_aa_types_from_cacb_identifies_diagnostic_types() {
+        use super::*;
+
+        let priors = Priors::bmrb();
+
+        assert!(
+            NmrWorkbenchApp::predict_aa_types_from_shifts(&priors, None, None, None, false, 3)
+                .is_empty()
+        );
+
+        let gly = NmrWorkbenchApp::predict_aa_types_from_shifts(
+            &priors,
+            Some(45.2),
+            None,
+            None,
+            false,
+            3,
+        );
+        assert_eq!(gly[0].0, "GLY");
+
+        let ala = NmrWorkbenchApp::predict_aa_types_from_shifts(
+            &priors,
+            Some(52.5),
+            Some(17.5),
+            None,
+            false,
+            3,
+        );
+        assert_eq!(ala[0].0, "ALA");
+
+        let thr = NmrWorkbenchApp::predict_aa_types_from_shifts(
+            &priors,
+            Some(61.5),
+            Some(68.5),
+            None,
+            false,
+            3,
+        );
+        assert_eq!(thr[0].0, "THR");
+
+        let ser = NmrWorkbenchApp::predict_aa_types_from_shifts(
+            &priors,
+            Some(58.0),
+            Some(63.2),
+            None,
+            false,
+            3,
+        );
+        assert_eq!(ser[0].0, "SER");
+
+        let aromatic_asx = NmrWorkbenchApp::predict_aa_types_from_shifts(
+            &priors,
+            Some(55.6),
+            Some(37.4),
+            Some(171.9),
+            false,
+            3,
+        );
+        assert!(
+            aromatic_asx
+                .iter()
+                .any(|&(aa, _)| matches!(aa, "PHE" | "TYR" | "ASN" | "ASP")),
+            "expected Phe/Tyr/Asn/Asp in top-3 for CA=55.6 CB=37.4, got {aromatic_asx:?}"
+        );
     }
 }
