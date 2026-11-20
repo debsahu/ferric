@@ -22543,11 +22543,12 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
 
         let mut outer_rect_out = egui::Rect::NOTHING;
         let mut table_top_out = 0.0_f32;
-        let _ = ctx.run_ui(raw, |ui| {
+        let mut out = ctx.run_ui(raw, |ui| {
             outer_rect_out = app.draw_hsqc_canvas(ui);
             table_top_out = ui.cursor().top();
             app.draw_2d_peaks_bottom_table(ui);
         });
+        out.textures_delta.clear();
 
         let plot_rect = app
             .last_hsqc_plot_rect
@@ -22667,10 +22668,11 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             screen_rect: Some(screen),
             ..Default::default()
         };
-        let _ = ctx.run_ui(raw, |ui| {
+        let mut out = ctx.run_ui(raw, |ui| {
             app.draw_v0171_windows_and_bridges(ui.ctx());
             let _ = app.draw_hsqc_canvas(ui);
         });
+        out.textures_delta.clear();
         assert!((app.peak_label_font_px - 18.0).abs() < 1e-4);
         assert!((app.peak_marker_size_px - 6.5).abs() < 1e-4);
 
