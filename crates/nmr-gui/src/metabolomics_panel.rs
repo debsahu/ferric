@@ -13,7 +13,7 @@ use eframe::egui;
 use nmr_core::metabolite_db::{
     extract_stocsy_cluster_query_peaks, npmrd_web_search_url, query_offline_metabolites,
     synthesize_reference_spectrum_1d, MetaboliteEntry, MetaboliteMatch, MetaboliteNucleus,
-    QueryPeak, ReferenceSpectrum1D, DEFAULT_STOCSY_CLUSTER_MIN_R,
+    PeakMultiplicity, QueryPeak, ReferenceSpectrum1D, DEFAULT_STOCSY_CLUSTER_MIN_R,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_core::metabolite_db::{query_online_bmrb_and_npmrd, OnlineQuerySources};
@@ -468,23 +468,56 @@ impl MetabolomicsStudioPanel {
             return Vec::new();
         }
 
-        // 4. Coalesce adjacent fine-structure multiplet lines (gap <= 0.022 ppm) into one
-        //    intensity-weighted centroid peak per multiplet.
+        // 4. Coalesce fine-structure multiplet sub-lines into intensity-weighted multiplet
+        //    centroids while preserving distinct neighboring singlets (height jump > 4.8x) and
+        //    extracting observed multiplicity + scalar J-couplings (Hz).
         raw_peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let coalesce_gap_ppm = 0.022;
+        let obs_mhz = self
+            .samples
+            .first()
+            .map(|s| s.spectrum.axis.obs_mhz)
+            .filter(|&v| v.is_finite() && v > 40.0)
+            .unwrap_or(600.0);
+        let std_gap_ppm = (12.0 / obs_mhz).clamp(0.015, 0.035);
+        let geminal_gap_ppm = (16.8 / obs_mhz).clamp(0.020, 0.048);
+
         let mut clusters: Vec<Vec<(f64, f64)>> = Vec::new();
         for (ppm, h) in raw_peaks {
             if let Some(last_cluster) = clusters.last_mut() {
-                let prev_ppm = last_cluster.last().map(|x| x.0).unwrap_or(ppm);
-                if (ppm - prev_ppm).abs() <= coalesce_gap_ppm {
-                    last_cluster.push((ppm, h));
-                    continue;
+                if let Some(&(prev_ppm, prev_h)) = last_cluster.last() {
+                    let gap = (ppm - prev_ppm).abs();
+                    let min_h = h.min(prev_h).max(1e-18);
+                    let ratio = h.max(prev_h) / min_h;
+                    let can_merge_vicinal = gap <= std_gap_ppm && ratio <= 4.8;
+                    let can_merge_geminal_ab =
+                        gap <= geminal_gap_ppm && last_cluster.len() == 1 && ratio <= 1.65;
+                    if can_merge_vicinal || can_merge_geminal_ab {
+                        last_cluster.push((ppm, h));
+                        continue;
+                    }
                 }
             }
             clusters.push(vec![(ppm, h)]);
         }
 
-        let mut picked: Vec<QueryPeak> = clusters
+        // Split 2-line pairs with strongly asymmetric heights (ratio > 1.60), which arise from
+        // two distinct closely spaced singlets (e.g. Creatine 3.032 vs Creatinine 3.043) rather
+        // than a 1:1 scalar-coupled doublet.
+        let mut refined_clusters: Vec<Vec<(f64, f64)>> = Vec::with_capacity(clusters.len());
+        for cl in clusters {
+            if cl.len() == 2 {
+                let min_h = cl[0].1.min(cl[1].1).max(1e-18);
+                let ratio = cl[0].1.max(cl[1].1) / min_h;
+                if ratio > 1.60 {
+                    refined_clusters.push(vec![cl[0]]);
+                    refined_clusters.push(vec![cl[1]]);
+                    continue;
+                }
+            }
+            refined_clusters.push(cl);
+        }
+
+        let mut picked: Vec<QueryPeak> = refined_clusters
             .into_iter()
             .map(|cl| {
                 let sum_h: f64 = cl.iter().map(|&(_, h)| h).sum();
@@ -493,7 +526,45 @@ impl MetabolomicsStudioPanel {
                 } else {
                     cl[0].0
                 };
-                let mut qp = QueryPeak::from_ppm(centroid);
+                let (mult, j_hz) = match cl.len() {
+                    1 => (PeakMultiplicity::Singlet, Vec::new()),
+                    2 => (
+                        PeakMultiplicity::Doublet,
+                        vec![(cl[1].0 - cl[0].0).abs() * obs_mhz],
+                    ),
+                    3 => {
+                        let (h0, h1, h2) = (cl[0].1, cl[1].1, cl[2].1);
+                        let wing_ratio = h0.max(h2) / h0.min(h2).max(1e-18);
+                        if h1 > 1.30 * h0 && h1 > 1.30 * h2 && wing_ratio <= 1.65 {
+                            (
+                                PeakMultiplicity::Triplet,
+                                vec![0.5 * (cl[2].0 - cl[0].0).abs() * obs_mhz],
+                            )
+                        } else {
+                            (PeakMultiplicity::Multiplet, Vec::new())
+                        }
+                    }
+                    4 => {
+                        let (h0, h1, h2, h3) = (cl[0].1, cl[1].1, cl[2].1, cl[3].1);
+                        let inner_ratio = h1.max(h2) / h1.min(h2).max(1e-18);
+                        let max_h = h0.max(h1).max(h2).max(h3);
+                        let min_h = h0.min(h1).min(h2).min(h3).max(1e-18);
+                        if h1 > 1.80 * h0 && h2 > 1.80 * h3 && inner_ratio <= 1.55 {
+                            (
+                                PeakMultiplicity::Quartet,
+                                vec![((cl[3].0 - cl[0].0).abs() / 3.0) * obs_mhz],
+                            )
+                        } else if max_h / min_h <= 1.65 {
+                            let j_big = (cl[2].0 - cl[0].0).abs() * obs_mhz;
+                            let j_small = (cl[1].0 - cl[0].0).abs() * obs_mhz;
+                            (PeakMultiplicity::DoubletOfDoublets, vec![j_big, j_small])
+                        } else {
+                            (PeakMultiplicity::Multiplet, Vec::new())
+                        }
+                    }
+                    _ => (PeakMultiplicity::Multiplet, Vec::new()),
+                };
+                let mut qp = QueryPeak::with_multiplet(centroid, mult, j_hz);
                 qp.intensity = Some(sum_h);
                 qp
             })
@@ -586,7 +657,7 @@ impl MetabolomicsStudioPanel {
             return;
         }
         let tol = self.identify_tol_ppm.clamp(0.005, 2.0);
-        let results = query_offline_metabolites(query_peaks, self.identify_nucleus, tol, 12);
+        let results = query_offline_metabolites(query_peaks, self.identify_nucleus, tol, 16);
         let offline_count = results.len();
         self.identify_results = results;
 
@@ -2536,7 +2607,7 @@ impl MetabolomicsStudioPanel {
                                 }
                                 ui.end_row();
 
-                                for (rank, hit) in self.identify_results.iter().take(12).enumerate()
+                                for (rank, hit) in self.identify_results.iter().take(16).enumerate()
                                 {
                                     let is_overlaid = active_overlay_id.as_deref()
                                         == Some(hit.entry.bmse_id.as_str());
@@ -2934,5 +3005,85 @@ mod tests {
             "pure-noise spectrum must not produce a dense bucket comb (got {} peaks)",
             noise_picked.len()
         );
+    }
+
+    #[test]
+    fn test_demo_cohort_gui_identify_ranks_all_true_singlets_and_citrate_in_top_results() {
+        // End-to-end GUI regression test for 171.metab:P1-A and 171.metab:P1-B on the
+        // 24-sample 14-metabolite synthetic biofluid cohort.
+        let mut studio = MetabolomicsStudioPanel::default();
+        studio.config.n_permutations = 5;
+        studio.load_demo_cohort();
+        studio.identify_from_picked_peaks();
+
+        let results = &studio.identify_results;
+        assert!(
+            results.len() >= 14,
+            "expected >= 14 ranked candidates on 14-metabolite demo cohort, got {}",
+            results.len()
+        );
+
+        let summary: Vec<String> = results
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                format!(
+                    "#{}:{}({}) {}/{} s={:.3} err={:.4}",
+                    i + 1,
+                    h.entry.name,
+                    h.entry.bmse_id,
+                    h.matched_ref_peaks,
+                    h.total_ref_peaks,
+                    h.score,
+                    h.mean_abs_error_ppm
+                )
+            })
+            .collect();
+
+        // Citrate (bmse000076) AB doublets (~2.53 / 2.66 ppm) must match 2/2 cleanly.
+        let cit_pos = results
+            .iter()
+            .position(|h| h.entry.bmse_id == "bmse000076")
+            .unwrap_or_else(|| panic!("Citrate missing from GUI results: {summary:?}"));
+        assert_eq!(results[cit_pos].matched_ref_peaks, 2);
+        assert!(
+            cit_pos < 12,
+            "Citrate should rank inside GUI top-12 (got #{}, {summary:?})",
+            cit_pos + 1
+        );
+
+        let best_partial_fp_score = results
+            .iter()
+            .filter(|h| {
+                h.matched_ref_peaks < h.total_ref_peaks && h.entry.bmse_id != "bmse000015"
+                // D-Glucose is a true cohort metabolite
+            })
+            .map(|h| h.score)
+            .fold(0.0_f64, f64::max);
+
+        for (bmse_id, label) in [
+            ("bmse000203", "Formate"),
+            ("bmse000191", "Acetic acid"),
+            ("bmse000183", "Succinic acid"),
+            ("bmse000089", "Glycine"),
+            ("bmse000426", "Trimethylamine N-oxide"),
+        ] {
+            let pos = results
+                .iter()
+                .position(|h| h.entry.bmse_id == bmse_id)
+                .unwrap_or_else(|| {
+                    panic!("true singlet {label} ({bmse_id}) missing from GUI top-16: {summary:?}")
+                });
+            assert!(
+                pos < 14,
+                "true singlet {label} ({bmse_id}) must rank inside top-14 on 14-metabolite demo cohort (got #{}, {summary:?})",
+                pos + 1
+            );
+            assert!(
+                results[pos].score > best_partial_fp_score,
+                "true singlet {label} ({bmse_id}, score={:.4}) must outrank partial-match FPs (best={best_partial_fp_score:.4}, {summary:?})",
+                results[pos].score
+            );
+        }
     }
 }

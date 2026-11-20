@@ -146,8 +146,15 @@ impl PeakMultiplicity {
         if self == other {
             return 1.0;
         }
+        if matches!(self, Self::Singlet) || matches!(other, Self::Singlet) {
+            return if matches!(self, Self::Multiplet) || matches!(other, Self::Multiplet) {
+                0.20
+            } else {
+                0.15
+            };
+        }
         if matches!(self, Self::Multiplet) || matches!(other, Self::Multiplet) {
-            return 0.70;
+            return 0.68;
         }
         match (self, other) {
             (Self::DoubletOfDoublets, Self::Triplet)
@@ -155,8 +162,12 @@ impl PeakMultiplicity {
             | (Self::DoubletOfDoublets, Self::Quartet)
             | (Self::Quartet, Self::DoubletOfDoublets)
             | (Self::DoubletOfTriplets, Self::Triplet)
-            | (Self::Triplet, Self::DoubletOfTriplets) => 0.65,
-            _ => 0.15,
+            | (Self::Triplet, Self::DoubletOfTriplets)
+            | (Self::Doublet, Self::Quartet)
+            | (Self::Quartet, Self::Doublet)
+            | (Self::Triplet, Self::Quintet)
+            | (Self::Quintet, Self::Triplet) => 0.62,
+            _ => 0.20,
         }
     }
 }
@@ -563,6 +574,13 @@ const OFFLINE_BMRB_METABOLITES: &[StaticMetaboliteEntry] = &[
         shifts_13c: &[c13!("C1", 25.990, 1), c13!("C2", 184.250, 1)],
     },
     // 5. Citrate (bmse000076, D2O, pH 7.40)
+    // Live-verified against https://api.bmrb.io/v2/entry/bmse000076: `assigned_chemical_shifts`
+    // (`_Atom_chem_shift`) stores the degenerate spin-system midpoint 2.579 ppm (an empty valley
+    // between the two strongly coupled prochiral CH2 AB doublets), whereas saveframe
+    // `spectral_peak_HSQC` loop `_Peak_char` (`Spectral_dim_ID = 1`) reports the observed 1H AB
+    // peak positions at 2.531 ppm (`Peak_ID = 2`) and 2.661 ppm (`Peak_ID = 1`), with
+    // |2J_AB| = 15.2 Hz from saveframes `spectral_peak_1Hp5` / `spectral_peak_1H_2` loop
+    // `_Spectral_transition_char` (transitions 2.5086, 2.5389, 2.6286, 2.6589 ppm at 500 MHz).
     StaticMetaboliteEntry {
         bmse_id: "bmse000076",
         name: "Citrate",
@@ -570,7 +588,10 @@ const OFFLINE_BMRB_METABOLITES: &[StaticMetaboliteEntry] = &[
         formula: "C6H8O7",
         smiles: "C(C(=O)O)C(CC(=O)O)(C(=O)O)O",
         ph: 7.40,
-        peaks_1h: &[p1h!("H14..H17(4H)", 2.579, DoubletOfDoublets, [], 4)],
+        peaks_1h: &[
+            p1h!("H14..H17", 2.531, Doublet, [15.2], 2),
+            p1h!("H14..H17", 2.661, Doublet, [15.2], 2),
+        ],
         shifts_13c: &[
             c13!("C1/C2", 48.446, 2),
             c13!("C6", 77.963, 1),
@@ -1685,18 +1706,25 @@ fn score_mult_and_j(
     let m_score = q_mult.map(|qm| qm.compatibility(ref_mult)).unwrap_or(1.0);
     let j_score = if has_j {
         if ref_j.is_empty() {
-            // Query reports scalar splitting while reference is a singlet.
-            0.25
+            if matches!(ref_mult, PeakMultiplicity::Singlet) {
+                0.20
+            } else {
+                0.68
+            }
         } else {
             let mut sum = 0.0_f64;
+            let mut min_s = 1.0_f64;
             for &qj in q_j {
                 let min_diff = ref_j
                     .iter()
                     .map(|&rj| (qj - rj).abs())
                     .fold(f64::INFINITY, f64::min);
-                sum += (-0.5 * (min_diff / 1.5).powi(2)).exp();
+                let s = (-0.5 * (min_diff / 1.5).powi(2)).exp();
+                sum += s;
+                min_s = min_s.min(s);
             }
-            (sum / (q_j.len() as f64)).clamp(0.0, 1.0)
+            let mean_s = sum / (q_j.len() as f64);
+            (0.5 * mean_s + 0.5 * min_s).clamp(0.0, 1.0)
         }
     } else {
         1.0
@@ -1738,26 +1766,146 @@ fn filter_active_query_peaks(query_peaks: &[QueryPeak]) -> Vec<&QueryPeak> {
     }
 }
 
-/// Multi-peak specificity / chance-match attenuation factor in `(0.0, 1.0]`.
+/// Local chance-match probability / information-content specificity factor in `(0.0, 1.0]`.
 ///
-/// For a pure-compound query where every query peak is explained (`precision == 1.0`),
-/// the factor is `1.0`. In a dense mixture (`precision < 1.0`), a 1-peak singlet carries a high
-/// chance-match risk (`1 / (1 + 1.5) = 0.40`), whereas a multi-peak spin system (e.g.
-/// L-Isoleucine matching 5/6 peaks: `5 / (5 + 1.5) = 0.77`) carries much stronger statistical
-/// corroboration and ranks strictly above single-peak coincidences.
-fn mixture_specificity_factor(matched_peaks: usize, precision: f64) -> f64 {
-    let m = matched_peaks as f64;
-    let evidence = m / (m + 1.5);
-    let p = precision.clamp(0.0, 1.0);
-    (p + (1.0 - p) * evidence).clamp(0.0, 1.0)
+/// Replaces a fixed peak-count prior with a local Poisson coincidence model:
+/// 1. Around each matched reference shift `r_i`, a Gaussian kernel density estimate (`kde_other`)
+///    measures local spectral crowding from *other* query peaks, yielding the local chance
+///    coincidence probability `p_chance = 1 - exp(-2 * w_eff * rate_eff)` and surprisal `-ln(p_chance)`.
+///    Isolated resonances (e.g. formate `8.45 ppm`, acetate `1.91 ppm`) earn high information content,
+///    whereas crowded sugar-band coincidences (`3.2–4.0 ppm`) earn proportionally smaller credit.
+/// 2. Multi-peak matches (`K >= 2`) must exhibit internally consistent signed shift offsets
+///    (`query_ppm - ref_ppm`), tolerating global referencing offsets (e.g. `TSP` vs `DSS`) while
+///    penalizing opposite-sign scattered coincidences.
+/// 3. Every unmatched expected reference peak (`M - K` missing peaks, plus `unknown_unmatched` for
+///    partial online search hits) incurs a false-negative log-evidence penalty (moderated only if
+///    the missing shift lies in a heavily crowded region where peak coalescence is plausible), so
+///    partial-match false positives (`2/4`, `3/5`, `3/4`) never bury genuine `1/1` singlets while
+///    high-recall multi-peak spin systems (`L-Isoleucine 5/6`, `D-Glucose 9/9`) accumulate strong
+///    additive log-evidence and outrank single-peak coincidences.
+#[allow(clippy::too_many_arguments)]
+fn local_chance_specificity_factor(
+    ref_ppms: &[f64],
+    ref_used: &[bool],
+    matched: &[(usize, usize, f64, f64)],
+    active_q: &[&QueryPeak],
+    nucleus: MetaboliteNucleus,
+    tol_ppm: f64,
+    any_mj_checked: bool,
+    unknown_unmatched: usize,
+) -> f64 {
+    let k = matched.len();
+    if k == 0 || active_q.is_empty() {
+        return 0.0;
+    }
+    let (kde_bw, span, crowd_scale) = match nucleus {
+        MetaboliteNucleus::H1 => (0.12, 9.5, 10.0),
+        MetaboliteNucleus::C13 => (2.40, 200.0, 0.50),
+    };
+    let norm_gauss = 1.0 / ((2.0 * std::f64::consts::PI).sqrt() * kde_bw);
+    let n_unexplained = active_q.len().saturating_sub(k);
+
+    let mut log_info = 0.0_f64;
+    let mut sum_delta = 0.0_f64;
+
+    for &(ri, qi, diff, mj) in matched {
+        let rp = ref_ppms[ri];
+        let qp = active_q[qi].ppm;
+        sum_delta += qp - rp;
+
+        let mut kde_other = 0.0_f64;
+        for (idx, q_other) in active_q.iter().enumerate() {
+            if idx != qi {
+                let z = (q_other.ppm - rp) / kde_bw;
+                if z.abs() <= 6.0 {
+                    kde_other += norm_gauss * (-0.5 * z * z).exp();
+                }
+            }
+        }
+        let rate_prior = if n_unexplained == 0 {
+            0.20 / span
+        } else {
+            0.35 * ((n_unexplained as f64) / span) + 0.35 / span
+        };
+        let rate_eff = kde_other + rate_prior;
+        let w_eff = if any_mj_checked {
+            0.22 * tol_ppm + 0.55 * diff
+        } else {
+            0.08 * tol_ppm + 0.85 * diff
+        };
+        let p_pos = 1.0 - (-2.0 * w_eff * rate_eff).exp();
+        let p_chance = p_pos.clamp(1e-4, 0.96);
+        let mj_weight = if any_mj_checked {
+            mj.clamp(0.05, 1.0).powf(1.5)
+        } else {
+            1.0
+        };
+        let mj_nats = if any_mj_checked {
+            2.2 * (mj - 0.55)
+        } else {
+            0.0
+        };
+        log_info += (-p_chance.ln()) * mj_weight + mj_nats;
+    }
+
+    if k >= 2 {
+        let mean_delta = sum_delta / (k as f64);
+        let mut sum_sq = 0.0_f64;
+        for &(ri, qi, _, _) in matched {
+            let dev = (active_q[qi].ppm - ref_ppms[ri]) - mean_delta;
+            sum_sq += dev * dev;
+        }
+        let var_delta = sum_sq / (k as f64);
+        let (spread_tol, free_band) = if any_mj_checked {
+            (0.25 * tol_ppm, 0.10 * tol_ppm)
+        } else {
+            (0.20 * tol_ppm, 0.06 * tol_ppm)
+        };
+        let excess_var = (var_delta - free_band * free_band).max(0.0);
+        if spread_tol > 1e-12 {
+            log_info -= 0.5 * (excess_var / (spread_tol * spread_tol)) * ((k - 1) as f64);
+        }
+    }
+
+    let base_miss = if any_mj_checked { 4.5 } else { 6.2 };
+    for (ri, &used) in ref_used.iter().enumerate() {
+        if !used {
+            let rp = ref_ppms[ri];
+            let mut kde_here = 0.0_f64;
+            for q in active_q {
+                let z = (q.ppm - rp) / kde_bw;
+                if z.abs() <= 6.0 {
+                    kde_here += norm_gauss * (-0.5 * z * z).exp();
+                }
+            }
+            let crowd_relief = (kde_here / crowd_scale).clamp(0.0, 1.0);
+            log_info -= base_miss - 1.8 * crowd_relief;
+        }
+    }
+    if unknown_unmatched > 0 {
+        log_info -= 3.5 * (unknown_unmatched as f64);
+    }
+
+    let (slope, midpoint) = if any_mj_checked {
+        (0.30, 3.1)
+    } else {
+        (0.28, 3.6)
+    };
+    let odds_evidence = 1.0 / (1.0 + (-slope * (log_info - midpoint)).exp());
+    let precision = ((k as f64) / (active_q.len() as f64)).clamp(0.0, 1.0);
+    if unknown_unmatched > 0 {
+        odds_evidence.clamp(0.0, 1.0)
+    } else {
+        (precision + (1.0 - precision) * odds_evidence).clamp(0.0, 1.0)
+    }
 }
 
 /// Fast `< 5 ms` offline matcher against the built-in `BMRB-BMSE` metabolite index.
 ///
 /// Supports both full picked 1D peak lists (`1H` or `13C`) and `STOCSY` correlated peak clusters
 /// (`r >= 0.85`). Scores chemical-shift recall, query precision, Gaussian shift proximity,
-/// multiplicity/`J`-coupling consistency, and multi-peak mixture specificity into a composite
-/// score in `[0.0, 1.0]`.
+/// multiplicity/`J`-coupling consistency, and local chance-match information content into a
+/// composite score in `[0.0, 1.0]`.
 pub fn query_offline_metabolites(
     query_peaks: &[QueryPeak],
     nucleus: MetaboliteNucleus,
@@ -1821,10 +1969,10 @@ fn score_entry_h1(
         return None;
     }
 
-    // Strict 1-to-1 greedy assignment prioritizing smallest shift error (modulated by mult/J).
+    // Strict 1-to-1 greedy assignment prioritizing smallest shift error and multiplicity consistency.
     pairs.sort_by(|a, b| {
-        let cost_a = a.2 / tol_ppm + 0.35 * (1.0 - a.3);
-        let cost_b = b.2 / tol_ppm + 0.35 * (1.0 - b.3);
+        let cost_a = a.2 / tol_ppm + 0.70 * (1.0 - a.3);
+        let cost_b = b.2 / tol_ppm + 0.70 * (1.0 - b.3);
         cost_a
             .total_cmp(&cost_b)
             .then_with(|| a.2.total_cmp(&b.2))
@@ -1834,8 +1982,10 @@ fn score_entry_h1(
     let mut ref_used = vec![false; n_ref];
     let mut q_used = vec![false; active_q.len()];
     let mut matched_pairs = Vec::new();
+    let mut matched_tuples: Vec<(usize, usize, f64, f64)> = Vec::new();
     let mut sum_shift = 0.0_f64;
     let mut sum_mj = 0.0_f64;
+    let mut prod_mj = 1.0_f64;
     let mut sum_err = 0.0_f64;
     let mut sum_stocsy_r = 0.0_f64;
     let mut any_mj_checked = false;
@@ -1858,6 +2008,7 @@ fn score_entry_h1(
         let s_prox = (-1.5 * (diff / tol_ppm).powi(2)).exp();
         sum_shift += s_prox;
         sum_mj += mj;
+        prod_mj *= mj.max(0.05);
         sum_err += diff;
         if let Some(r) = qp.stocsy_r.filter(|v| v.is_finite()) {
             let rc = r.clamp(0.0, 1.0);
@@ -1872,6 +2023,7 @@ fn score_entry_h1(
         if used_mj {
             any_mj_checked = true;
         }
+        matched_tuples.push((ri, qi, diff, mj));
         matched_pairs.push(MatchedPeakPair {
             assignment: rp.assignment.to_string(),
             ref_ppm: rp.ppm,
@@ -1890,18 +2042,37 @@ fn score_entry_h1(
     let recall = (matched_ref as f64) / (n_ref as f64);
     let precision = (matched_q as f64) / (active_q.len() as f64);
     let shift_score = (sum_shift / (matched_ref as f64)).clamp(0.0, 1.0);
-    let mult_j_score = (sum_mj / (matched_ref as f64)).clamp(0.0, 1.0);
+    let mean_mj = (sum_mj / (matched_ref as f64)).clamp(0.0, 1.0);
+    let geom_mj = prod_mj.powf(1.0 / (matched_ref as f64)).clamp(0.0, 1.0);
+    let mult_j_score = if any_mj_checked {
+        (0.5 * mean_mj + 0.5 * geom_mj).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
     let mean_abs_error_ppm = sum_err / (matched_ref as f64);
 
-    let mut composite = if any_mj_checked {
-        0.45 * recall + 0.20 * precision + 0.20 * shift_score + 0.15 * mult_j_score
-    } else if is_stocsy_mode {
-        let mean_r = (sum_stocsy_r / (matched_ref as f64)).clamp(0.0, 1.0);
-        0.42 * recall + 0.16 * precision + 0.24 * shift_score + 0.18 * mean_r
-    } else {
-        0.50 * recall + 0.22 * precision + 0.28 * shift_score
-    };
-    composite *= mixture_specificity_factor(matched_q, precision);
+    let ref_ppms: Vec<f64> = entry.peaks_1h.iter().map(|p| p.ppm).collect();
+    let spec_factor = local_chance_specificity_factor(
+        &ref_ppms,
+        &ref_used,
+        &matched_tuples,
+        active_q,
+        MetaboliteNucleus::H1,
+        tol_ppm,
+        any_mj_checked,
+        0,
+    );
+
+    let mut composite = recall.powf(0.80)
+        * if any_mj_checked {
+            0.35 + 0.30 * shift_score + 0.35 * mult_j_score
+        } else if is_stocsy_mode {
+            let mean_r = (sum_stocsy_r / (matched_ref as f64)).clamp(0.0, 1.0);
+            0.40 + 0.36 * shift_score + 0.24 * mean_r
+        } else {
+            0.45 + 0.55 * shift_score
+        };
+    composite *= spec_factor;
     if is_stocsy_mode && max_stocsy_r >= DEFAULT_STOCSY_CLUSTER_MIN_R && !matched_driver {
         // Intermolecular pathway correlation (does not explain the STOCSY driver resonance).
         composite *= 0.65;
@@ -1950,6 +2121,7 @@ fn score_entry_c13(
     let mut ref_used = vec![false; n_ref];
     let mut q_used = vec![false; active_q.len()];
     let mut matched_pairs = Vec::new();
+    let mut matched_tuples: Vec<(usize, usize, f64, f64)> = Vec::new();
     let mut sum_shift = 0.0_f64;
     let mut sum_err = 0.0_f64;
     let mut sum_stocsy_r = 0.0_f64;
@@ -1977,6 +2149,7 @@ fn score_entry_c13(
                 matched_driver = true;
             }
         }
+        matched_tuples.push((ri, qi, diff, 1.0));
         matched_pairs.push(MatchedPeakPair {
             assignment: rc.assignment.to_string(),
             ref_ppm: rc.ppm,
@@ -1996,13 +2169,25 @@ fn score_entry_c13(
     let precision = (matched_q as f64) / (active_q.len() as f64);
     let shift_score = (sum_shift / (matched_ref as f64)).clamp(0.0, 1.0);
     let mean_abs_error_ppm = sum_err / (matched_ref as f64);
-    let mut composite = if is_stocsy_mode {
-        let mean_r = (sum_stocsy_r / (matched_ref as f64)).clamp(0.0, 1.0);
-        0.42 * recall + 0.16 * precision + 0.24 * shift_score + 0.18 * mean_r
-    } else {
-        0.50 * recall + 0.22 * precision + 0.28 * shift_score
-    };
-    composite *= mixture_specificity_factor(matched_q, precision);
+    let ref_ppms: Vec<f64> = entry.shifts_13c.iter().map(|c| c.ppm).collect();
+    let spec_factor = local_chance_specificity_factor(
+        &ref_ppms,
+        &ref_used,
+        &matched_tuples,
+        active_q,
+        MetaboliteNucleus::C13,
+        tol_ppm,
+        false,
+        0,
+    );
+    let mut composite = recall.powf(0.80)
+        * if is_stocsy_mode {
+            let mean_r = (sum_stocsy_r / (matched_ref as f64)).clamp(0.0, 1.0);
+            0.40 + 0.36 * shift_score + 0.24 * mean_r
+        } else {
+            0.45 + 0.55 * shift_score
+        };
+    composite *= spec_factor;
     if is_stocsy_mode && max_stocsy_r >= DEFAULT_STOCSY_CLUSTER_MIN_R && !matched_driver {
         composite *= 0.65;
     }
@@ -2413,6 +2598,7 @@ fn build_online_bmrb_match(
     let mut ref_used = vec![false; ref_list.len()];
     let mut q_used = vec![false; active_q.len()];
     let mut matched_pairs = Vec::new();
+    let mut matched_tuples: Vec<(usize, usize, f64, f64)> = Vec::new();
     let mut sum_err = 0.0_f64;
     let mut sum_shift = 0.0_f64;
 
@@ -2426,6 +2612,7 @@ fn build_online_bmrb_match(
         let qp = active_q[qi];
         sum_err += diff;
         sum_shift += (-1.5 * (diff / tol_ppm).powi(2)).exp();
+        matched_tuples.push((ri, qi, diff, 1.0));
         matched_pairs.push(MatchedPeakPair {
             assignment: asgn.to_string(),
             ref_ppm: rppm,
@@ -2441,19 +2628,30 @@ fn build_online_bmrb_match(
     }
     let ref_len = ref_list.len();
     let matched_q = q_used.iter().filter(|&&u| u).count();
-    let total_ref = if total_ref_known {
-        ref_len.max(n_matched)
+    let (total_ref, unknown_unmatched) = if total_ref_known {
+        (ref_len.max(n_matched), 0usize)
     } else {
         // Partial search response does not report unmatched peaks of the compound;
         // do not inflate recall to 1.0.
-        n_matched + 3
+        (n_matched + 3, 3usize)
     };
     let recall = (n_matched as f64) / (total_ref as f64);
     let precision = (matched_q as f64) / (active_q.len() as f64);
     let shift_score = (sum_shift / (n_matched as f64)).clamp(0.0, 1.0);
     let mean_abs_error_ppm = sum_err / (n_matched as f64);
-    let raw_score = 0.50 * recall + 0.22 * precision + 0.28 * shift_score;
-    let score = (raw_score * mixture_specificity_factor(matched_q, precision)).clamp(0.0, 1.0);
+    let ref_ppms: Vec<f64> = ref_list.iter().map(|&(_, p)| p).collect();
+    let spec_factor = local_chance_specificity_factor(
+        &ref_ppms,
+        &ref_used,
+        &matched_tuples,
+        active_q,
+        nucleus,
+        tol_ppm,
+        false,
+        unknown_unmatched,
+    );
+    let raw_score = recall.powf(0.80) * (0.45 + 0.55 * shift_score);
+    let score = (raw_score * spec_factor).clamp(0.0, 1.0);
     let reported_total_ref = if total_ref_known {
         ref_len.max(n_matched)
     } else {
