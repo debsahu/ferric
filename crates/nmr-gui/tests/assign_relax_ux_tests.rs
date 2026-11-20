@@ -58,13 +58,19 @@ fn make_ss(h: f64, n: f64, entries: &[(&str, i32, f64, usize)]) -> SpinSystem {
     ss
 }
 
-fn make_carbonyl_cube(name: &str, exp: &str, peaks: &[(f64, f64, f64, f32)]) -> Spectrum3D {
+fn make_strip_cube(
+    name: &str,
+    exp: &str,
+    c_hi: f64,
+    c_lo: f64,
+    peaks: &[(f64, f64, f64, f32)],
+) -> Spectrum3D {
     let nx = 20usize;
     let ny = 16usize;
     let nz = 32usize;
     let axis_x = AxisPpm::from_bounds("1H", nx, 9.2, 7.6, 600.0);
     let axis_y = AxisPpm::from_bounds("15N", ny, 128.0, 112.0, 60.8);
-    let axis_z = AxisPpm::from_bounds("13C", nz, 182.5, 167.5, 150.9);
+    let axis_z = AxisPpm::from_bounds("13C", nz, c_hi, c_lo, 150.9);
     let mut data = vec![0.0_f32; nx * ny * nz];
     for &(h, n, c, amp) in peaks {
         for iz in 0..nz {
@@ -99,6 +105,10 @@ fn make_carbonyl_cube(name: &str, exp: &str, peaks: &[(f64, f64, f64, f32)]) -> 
         axis_z,
         data,
     }
+}
+
+fn make_carbonyl_cube(name: &str, exp: &str, peaks: &[(f64, f64, f64, f32)]) -> Spectrum3D {
+    make_strip_cube(name, exp, 182.5, 167.5, peaks)
 }
 
 #[test]
@@ -202,6 +212,7 @@ fn test_strip_tiler_full_co_walk_folder_tabs_and_hncaco_pairing() {
                         };
                         let full = StripSpectra3DFull {
                             aliphatic_3d: None,
+                            aliphatic_inter_3d: None,
                             carbonyl_3d: Some(&hnco),
                             carbonyl_intra_3d: Some(&hncaco),
                         };
@@ -288,6 +299,163 @@ fn test_strip_tiler_full_co_walk_folder_tabs_and_hncaco_pairing() {
     let audit_cacb = audit_text_layout(&out_cacb.shapes, vp);
     assert!(audit_cacb.min_font_px >= MIN_FONT_PX);
     assert!(audit_cacb.clipped.is_empty());
+}
+
+#[test]
+fn test_strip_tiler_paired_aliphatic_and_carbonyl_lanes_audit() {
+    let systems = vec![
+        make_ss(
+            8.30,
+            120.0,
+            &[
+                ("CA", 0, 56.20, 2),
+                ("CB", 0, 31.40, 2),
+                ("C", 0, 175.10, 2),
+            ],
+        ),
+        make_ss(
+            8.10,
+            118.4,
+            &[
+                ("CA", -1, 56.22, 2),
+                ("CB", -1, 31.38, 2),
+                ("C", -1, 175.08, 2),
+                ("CA", 0, 61.10, 2),
+                ("CB", 0, 68.50, 2),
+                ("C", 0, 173.80, 2),
+            ],
+        ),
+        make_ss(
+            8.65,
+            123.2,
+            &[
+                ("CA", -1, 61.08, 2),
+                ("CB", -1, 68.52, 2),
+                ("C", -1, 173.82, 2),
+                ("CA", 0, 45.10, 2),
+                ("C", 0, 171.90, 2),
+            ],
+        ),
+    ];
+    let seq: Vec<String> = ["MET", "GLN", "ILE", "THR"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let seq_ids = vec![1, 2, 3, 4];
+    let p_mat = pair_matrix(&systems, &ScoreConfig::default());
+    let assignments = vec![1, 2, 3];
+
+    let hncacb = make_strip_cube(
+        "HNCACB",
+        "HNCACB",
+        74.0,
+        14.0,
+        &[
+            (8.10, 118.4, 56.22, 8.0),
+            (8.10, 118.4, 31.38, -7.0),
+            (8.10, 118.4, 61.10, 11.0),
+            (8.10, 118.4, 68.50, -9.0),
+        ],
+    );
+    let cbcaconh = make_strip_cube(
+        "CBCACONH",
+        "CBCACONH",
+        74.0,
+        14.0,
+        &[(8.10, 118.4, 56.22, 10.0), (8.10, 118.4, 31.38, 8.0)],
+    );
+    let hnco = make_carbonyl_cube("HNCO", "HNCO", &[(8.10, 118.4, 175.08, 10.0)]);
+    let hncaco = make_carbonyl_cube(
+        "HN(CA)CO",
+        "HNCACO",
+        &[(8.10, 118.4, 175.08, 6.0), (8.10, 118.4, 173.80, 10.0)],
+    );
+
+    let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+    let ctx = egui::Context::default();
+    let mut tiler = StripTilerPanel::new();
+    let mut xh = SyncCrosshair::new(8.10, 118.4, Some(61.10));
+
+    let run_dock = |dock_w: f32, tiler: &mut StripTilerPanel, xh: &mut SyncCrosshair| {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(vp),
+                ..Default::default()
+            },
+            |ui| {
+                apply_type_scale(ui.ctx());
+                egui::Panel::right(egui::Id::unique(("paired_dock", dock_w.to_bits())))
+                    .default_size(dock_w)
+                    .min_size(dock_w)
+                    .show(ui, |ui| {
+                        let tctx = StripTilerContext {
+                            systems: &systems,
+                            pair_mat: &p_mat,
+                            u_mat: None,
+                            sequence: &seq,
+                            seq_ids: &seq_ids,
+                            active_root: 1,
+                            assignments: Some(&assignments),
+                            locks: None,
+                            confirmed_links: None,
+                            spectra_3d: StripSpectra3D {
+                                aliphatic_3d: Some(&hncacb),
+                                carbonyl_3d: Some(&hnco),
+                            },
+                        };
+                        let full = StripSpectra3DFull {
+                            aliphatic_3d: Some(&hncacb),
+                            aliphatic_inter_3d: Some(&cbcaconh),
+                            carbonyl_3d: Some(&hnco),
+                            carbonyl_intra_3d: Some(&hncaco),
+                        };
+                        let _ = tiler.show_full(ui, &tctx, full, Some(xh));
+                    });
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.label("HSQC");
+                });
+            },
+        );
+        out.textures_delta.clear();
+        out
+    };
+
+    for dock_w in [320.0_f32, 460.0_f32] {
+        let _ = run_dock(dock_w, &mut tiler, &mut xh);
+        let out = run_dock(dock_w, &mut tiler, &mut xh);
+        let audit = audit_text_layout(&out.shapes, vp);
+        assert!(
+            audit.min_font_px >= MIN_FONT_PX,
+            "dock_w={dock_w}: min font {} < {MIN_FONT_PX}",
+            audit.min_font_px
+        );
+        assert!(
+            audit.clipped.is_empty(),
+            "dock_w={dock_w}: clipped text: {:?}",
+            audit.clipped
+        );
+        assert!(
+            audit.overlapping.is_empty(),
+            "dock_w={dock_w}: overlapping text: {:?}",
+            audit.overlapping
+        );
+        if dock_w >= 460.0 {
+            assert!(
+                audit
+                    .texts
+                    .iter()
+                    .any(|t| t.text == "HNCACB" || t.text == "CACB"),
+                "wide dock must show paired HNCACB lane label"
+            );
+            assert!(
+                audit
+                    .texts
+                    .iter()
+                    .any(|t| t.text == "CBCA(CO)" || t.text == "CBCO"),
+                "wide dock must show paired CBCA(CO)NH lane label"
+            );
+        }
+    }
 }
 
 #[test]

@@ -466,7 +466,8 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
 | **`ci`** | Spectrum & Contours | More Signal (`+`) | Increase 1D vertical gain (`×1.25`) or lower 2D/3D contour floor (`÷1.25`) to reveal weak peaks |
 | **`cb`** | Spectrum & Contours | Less Signal (`-`) | Decrease 1D vertical gain (`÷1.25`) or raise 2D/3D contour floor (`×1.25`) to suppress baseline noise |
 | **`ws` / `wu`** | Solvent DSP | Water Suppression / Multi-Level Undo | Apply solvent suppression to the active trace/page or pop the per-spectrum `KeyedSnapshotStack` (`0` cross-cube mutation). If no dominant water peak is found in the solvent's window, nothing changes and no undo entry is pushed ([Chapter 2](02-custom-pulprog-and-dsp.md#4-workbench-water-action-ws-nmr-corewater)) |
-| **`zf` / `oz`** | Zoom & Navigation | Zoom Out to Full Sweep | Reset viewport bounds to the full spectral sweep width (recording history for `zp`) |
+| **`zf` / `ze`** | Zoom & Navigation | Zoom Out to Full Sweep | Reset viewport bounds to the full spectral sweep width (recording history for `zp`) |
+| **`oz`** | Peak Editing | Ornament & Peak Label Size | Open the Sparky-style dialog to resize peak label font size and peak cross/marker size |
 | **`zp`** | Zoom & Navigation | Previous Zoom | Step back through recorded zoom history (including `Shift+drag` and `Double-click` resets) |
 | **`zi` / `zo`** | Zoom & Navigation | Zoom In / Out (`1.25×`) | Zoom into or out of the active 2D, 3D plane, or strip region |
 | **`xl`** | Zoom & Navigation | Toggle Crosshair Lock | Pin or unpin synchronized `(1H, 15N, 13C)` frequency crosshairs across views (`Space+drag` only pans) |

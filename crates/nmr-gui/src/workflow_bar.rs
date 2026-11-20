@@ -92,8 +92,9 @@ pub enum WorkbenchAction {
     Register3dToHsqc2d,
     ExportProcessingRecipeJson,
 
-    // --- 3. Spectrum View & Contours (23) ---
+    // --- 3. Spectrum View & Contours (24) ---
     OpenContourThresholdPopup,
+    OpenOrnamentSizeDialog,
     ZoomFullSweep,
     ZoomPrevious,
     ZoomIn,
@@ -250,8 +251,9 @@ impl WorkbenchAction {
         Self::SelectReferenceOrAlignMode,
         Self::SuppressWaterPeak,
         Self::UndoWaterSuppression,
-        // Spectrum (23)
+        // Spectrum (24)
         Self::OpenContourThresholdPopup,
+        Self::OpenOrnamentSizeDialog,
         Self::ZoomFullSweep,
         Self::ZoomPrevious,
         Self::ZoomIn,
@@ -560,6 +562,16 @@ impl WorkbenchAction {
                 description: "Open interactive contour base threshold, geometric step factor, and level count dialog",
                 modifier_shortcut: None,
                 chord_badge: Some("ct"),
+                menu_separator_after: false,
+            },
+            Self::OpenOrnamentSizeDialog => ActionMetadata {
+                action: self,
+                menu: TopMenu::Spectrum,
+                category: "Spectrum View",
+                title: "Ornament & Peak Label Size",
+                description: "Adjust peak label font size and peak cross/marker ornament size across 2D, 3D, and 1D spectra (Sparky oz)",
+                modifier_shortcut: None,
+                chord_badge: Some("oz"),
                 menu_separator_after: false,
             },
             Self::RaiseContourFloor => ActionMetadata {

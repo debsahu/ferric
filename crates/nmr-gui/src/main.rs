@@ -1782,6 +1782,7 @@ struct NmrWorkbenchApp {
     hsqc_arc: Arc<Vec<f32>>,
     hsqc_gen: u64,
     hncacb_3d: Option<Arc<Spectrum3D>>,
+    cbcaconh_3d: Option<Arc<Spectrum3D>>,
     hnco_3d: Option<Arc<Spectrum3D>>,
     hncaco_3d: Option<Arc<Spectrum3D>>,
     cubes_3d: Vec<Arc<Spectrum3D>>,
@@ -1812,6 +1813,7 @@ struct NmrWorkbenchApp {
     has_structure_or_dynamics: bool,
     exported_in_session: bool,
     show_contour_modal: bool,
+    show_ornament_modal: bool,
     show_overlay_manager: bool,
     show_assign_popover: bool,
     show_qc_modal: bool,
@@ -1843,6 +1845,8 @@ struct NmrWorkbenchApp {
     contour_levels: u32,
     show_negative: bool,
     show_peak_labels: bool,
+    peak_label_font_px: f32,
+    peak_marker_size_px: f32,
     box_zoom_2d_mode: bool,
     box_zoom_2d_anchor: Option<[f32; 2]>,
 
@@ -3113,6 +3117,7 @@ impl Default for NmrWorkbenchApp {
             hsqc_arc: Arc::new(Vec::new()),
             hsqc_gen: 1,
             hncacb_3d: None,
+            cbcaconh_3d: None,
             hnco_3d: None,
             hncaco_3d: None,
             cubes_3d: Vec::new(),
@@ -3141,6 +3146,7 @@ impl Default for NmrWorkbenchApp {
             has_structure_or_dynamics: false,
             exported_in_session: false,
             show_contour_modal: false,
+            show_ornament_modal: false,
             show_overlay_manager: false,
             show_assign_popover: false,
             show_qc_modal: false,
@@ -3170,6 +3176,8 @@ impl Default for NmrWorkbenchApp {
             contour_levels: 10,
             show_negative: true,
             show_peak_labels: true,
+            peak_label_font_px: 11.0,
+            peak_marker_size_px: 3.8,
             box_zoom_2d_mode: false,
             box_zoom_2d_anchor: None,
             replicas: default_replicas,
@@ -3284,6 +3292,13 @@ impl NmrWorkbenchApp {
             self.hncacb_3d = Some(Arc::clone(cube));
         }
         if self
+            .cbcaconh_3d
+            .as_ref()
+            .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
+        {
+            self.cbcaconh_3d = Some(Arc::clone(cube));
+        }
+        if self
             .hnco_3d
             .as_ref()
             .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
@@ -3296,6 +3311,111 @@ impl NmrWorkbenchApp {
             .is_some_and(|s| s.name == cube.name && s.exp == cube.exp)
         {
             self.hncaco_3d = Some(Arc::clone(cube));
+        }
+    }
+
+    fn assign_named_3d_slot(&mut self, cube: &Arc<Spectrum3D>) {
+        let k = Self::normalize_exp_key(&cube.exp);
+        match k.as_str() {
+            "HNCO" => {
+                if self.hnco_3d.is_none() {
+                    self.hnco_3d = Some(Arc::clone(cube));
+                }
+            }
+            "HNCACO" => {
+                if self.hncaco_3d.is_none() {
+                    self.hncaco_3d = Some(Arc::clone(cube));
+                }
+            }
+            "HNCACB" => {
+                if self
+                    .hncacb_3d
+                    .as_ref()
+                    .is_none_or(|s| Self::normalize_exp_key(&s.exp) != "HNCACB")
+                {
+                    self.hncacb_3d = Some(Arc::clone(cube));
+                }
+            }
+            "CBCACONH" => {
+                if self
+                    .cbcaconh_3d
+                    .as_ref()
+                    .is_none_or(|s| Self::normalize_exp_key(&s.exp) != "CBCACONH")
+                {
+                    self.cbcaconh_3d = Some(Arc::clone(cube));
+                }
+            }
+            "HNCA" => {
+                if self.hncacb_3d.is_none() {
+                    self.hncacb_3d = Some(Arc::clone(cube));
+                }
+            }
+            "HNCOCA" => {
+                if self.cbcaconh_3d.is_none() {
+                    self.cbcaconh_3d = Some(Arc::clone(cube));
+                }
+            }
+            _ => {
+                if self.hncacb_3d.is_none() {
+                    self.hncacb_3d = Some(Arc::clone(cube));
+                }
+            }
+        }
+    }
+
+    fn resync_all_named_3d_slots(&mut self) {
+        self.hncacb_3d = None;
+        self.cbcaconh_3d = None;
+        self.hnco_3d = None;
+        self.hncaco_3d = None;
+        let cubes = self.cubes_3d.clone();
+        for cube in &cubes {
+            self.assign_named_3d_slot(cube);
+        }
+        let stored_3d = usize::from(self.hncacb_3d.is_some())
+            + usize::from(self.cbcaconh_3d.is_some())
+            + usize::from(self.hnco_3d.is_some())
+            + usize::from(self.hncaco_3d.is_some());
+        self.extra_3d_count = self.cubes_3d.len().saturating_sub(stored_3d);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn infer_3d_exp_from_path(p: &Path) -> &'static str {
+        let up = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if up.contains("CBCACONH") || up.contains("CBCA(CO)NH") {
+            "CBCACONH"
+        } else if up.contains("HNCACO") || up.contains("HN(CA)CO") {
+            "HNCACO"
+        } else if up.contains("HNCO") {
+            "HNCO"
+        } else if up.contains("HNCOCA") || up.contains("HN(CO)CA") {
+            "HNCOCA"
+        } else if up.contains("HNCA") {
+            "HNCA"
+        } else {
+            "HNCACB"
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn register_one_3d_cube(
+        s3: &mut Spectrum3D,
+        hsqc: &Spectrum2D,
+        enable_axis_rescue: bool,
+        notices: &mut Vec<String>,
+        audits: &mut Vec<AxisRescueAuditRecord>,
+    ) {
+        let (_, _, audit_opt) =
+            register_3d_hn_to_hsqc_2d_with_audit(s3, hsqc, 0.08, 0.60, enable_axis_rescue);
+        if let Some(audit) = audit_opt {
+            if let Some(warn) = audit.warning_message() {
+                notices.push(warn);
+            }
+            audits.push(audit);
         }
     }
 
@@ -3980,6 +4100,7 @@ impl NmrWorkbenchApp {
         self.has_structure_or_dynamics = false;
         if !keep_3d_cubes {
             self.hncacb_3d = None;
+            self.cbcaconh_3d = None;
             self.hnco_3d = None;
             self.hncaco_3d = None;
             self.extra_3d_count = 0;
@@ -4049,7 +4170,9 @@ impl NmrWorkbenchApp {
             .set_single_2d_page("15N-HSQC", hsqc.clone(), true);
         self.hsqc_spec = Some(hsqc);
         self.hncacb_3d = Some(Arc::new(render_triple_3d("HNCACB", &self.peaks, &rcfg)));
+        self.cbcaconh_3d = None;
         self.hnco_3d = Some(Arc::new(render_triple_3d("HNCO", &self.peaks, &rcfg)));
+        self.hncaco_3d = None;
         self.extra_3d_count = 0;
         self.overlay_layers.clear();
         self.primary_2d_label = "15N-HSQC".to_string();
@@ -4708,8 +4831,11 @@ impl NmrWorkbenchApp {
                 self.systems.clear();
             }
         }
-        let has_3d =
-            self.hncacb_3d.is_some() || self.hnco_3d.is_some() || !self.cubes_3d.is_empty();
+        let has_3d = self.hncacb_3d.is_some()
+            || self.cbcaconh_3d.is_some()
+            || self.hnco_3d.is_some()
+            || self.hncaco_3d.is_some()
+            || !self.cubes_3d.is_empty();
         self.show_strips_dock = pg.has_3d_strips && has_3d && self.active_cube_idx.is_none();
         if !pg.has_3d_strips {
             self.show_mol3d_viewport = false;
@@ -5155,7 +5281,9 @@ impl NmrWorkbenchApp {
                 self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
                 self.hsqc_spec = Some(ubiq_hsqc.clone());
                 self.hncacb_3d = Some(Arc::new(suite.hncacb_3d));
+                self.cbcaconh_3d = None;
                 self.hnco_3d = Some(Arc::new(suite.hnco_3d));
+                self.hncaco_3d = None;
                 self.extra_3d_count = 0;
                 self.overlay_layers.clear();
                 self.primary_2d_label = "20 · Ubiquitin 2D ¹H–¹⁵N HSQC".to_string();
@@ -6495,10 +6623,21 @@ impl NmrWorkbenchApp {
                         format!("Loaded Sparky/UCSF 2D spectrum {}", p.display()),
                     );
                 }
-                Err(_) => match read_ucsf_3d(p, "HNCACB") {
+                Err(_) => match read_ucsf_3d(p, Self::infer_3d_exp_from_path(p)) {
                     Ok(spec3d) => {
-                        self.hncacb_3d = Some(Arc::new(spec3d));
+                        let arc = Arc::new(spec3d);
+                        let c_idx = self.cubes_3d.len();
+                        let disp = arc.name.clone();
+                        self.assign_named_3d_slot(&arc);
+                        self.cubes_3d.push(arc);
+                        let stored_3d = usize::from(self.hncacb_3d.is_some())
+                            + usize::from(self.cbcaconh_3d.is_some())
+                            + usize::from(self.hnco_3d.is_some())
+                            + usize::from(self.hncaco_3d.is_some());
+                        self.extra_3d_count = self.cubes_3d.len().saturating_sub(stored_3d);
                         self.workspace_mode = WorkspaceMode::ProteinNmr;
+                        let _ = c_idx;
+                        let _ = disp;
                         self.status_msg = format!("Loaded UCSF 3D spectrum {}", p.display());
                     }
                     Err(e) => {
@@ -6536,9 +6675,16 @@ impl NmrWorkbenchApp {
                 }
                 Err(e) => self.status_msg = format!("NMRPipe load error: {e}"),
             },
-            "ft3" => match read_nmrpipe_3d(p, "HNCACB") {
+            "ft3" => match read_nmrpipe_3d(p, Self::infer_3d_exp_from_path(p)) {
                 Ok(spec3d) => {
-                    self.hncacb_3d = Some(Arc::new(spec3d));
+                    let arc = Arc::new(spec3d);
+                    self.assign_named_3d_slot(&arc);
+                    self.cubes_3d.push(arc);
+                    let stored_3d = usize::from(self.hncacb_3d.is_some())
+                        + usize::from(self.cbcaconh_3d.is_some())
+                        + usize::from(self.hnco_3d.is_some())
+                        + usize::from(self.hncaco_3d.is_some());
+                    self.extra_3d_count = self.cubes_3d.len().saturating_sub(stored_3d);
                     self.workspace_mode = WorkspaceMode::ProteinNmr;
                     self.status_msg = format!("Loaded NMRPipe 3D spectrum {}", p.display());
                 }
@@ -7325,6 +7471,13 @@ impl NmrWorkbenchApp {
                         repick_cube = true;
                     }
                     ui.checkbox(&mut self.show_peak_labels, "Peak Labels (pl)");
+                    if ui
+                        .button("Label Size (oz)")
+                        .on_hover_text("Adjust peak label font size and marker cross size (Sparky `oz`)")
+                        .clicked()
+                    {
+                        self.show_ornament_modal = !self.show_ornament_modal;
+                    }
                     if !self.peaks_3d.is_empty() && ui.button("Copy TSV").clicked() {
                         ui.ctx().copy_text(self.export_3d_peaks_tsv());
                         self.status_msg = format!(
@@ -7547,16 +7700,30 @@ impl NmrWorkbenchApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.strong("2D Peak Picker:");
                     ui.label("Min SNR:");
-                    if ui
+                    let snr_resp = ui
                         .add(
                             egui::DragValue::new(&mut self.picker_snr)
-                                .range(2.0..=50.0)
+                                .range(2.0..=250.0)
                                 .speed(0.2)
                                 .fixed_decimals(1),
                         )
-                        .changed()
-                    {
+                        .on_hover_text("Release drag or press Enter to re-pick 2D peaks");
+                    if snr_resp.drag_stopped() || snr_resp.lost_focus() {
                         repick = true;
+                    }
+                    if ui
+                        .button("Auto")
+                        .on_hover_text(
+                            "Auto-estimate 2D SNR threshold from MAD noise, dynamic range & contour floor",
+                        )
+                        .clicked()
+                    {
+                        if let Some(ref hsqc) = self.hsqc_spec {
+                            let auto_snr = estimate_auto_snr_2d(hsqc, Some(self.contour_base));
+                            self.picker_snr = auto_snr;
+                            self.assign_setup_drawer.snr_threshold = f64::from(auto_snr);
+                            repick = true;
+                        }
                     }
                     if ui.button("Re-Pick 2D").clicked() {
                         repick = true;
@@ -7576,6 +7743,13 @@ impl NmrWorkbenchApp {
                         repick = true;
                     }
                     ui.checkbox(&mut self.show_peak_labels, "Peak Labels");
+                    if ui
+                        .button("Label Size (oz)")
+                        .on_hover_text("Adjust peak label font size and marker cross size (Sparky `oz`)")
+                        .clicked()
+                    {
+                        self.show_ornament_modal = !self.show_ornament_modal;
+                    }
                     if !indices.is_empty() && ui.button("Copy TSV").clicked() {
                         ui.ctx().copy_text(self.export_2d_peaks_tsv());
                         self.status_msg =
@@ -7677,11 +7851,46 @@ impl NmrWorkbenchApp {
                                     let key = peak_label_key_2d(pk.h, pk.n);
                                     let mut lbl_buf =
                                         self.peak_2d_labels.get(&key).cloned().unwrap_or_default();
+                                    let auto_hint = if lbl_buf.is_empty() {
+                                        self.assign_res.as_ref().and_then(|ar| {
+                                            let best_ss = self
+                                                .systems
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(_, ss)| {
+                                                    (ss.h - pk.h).abs() <= 0.03
+                                                        && (ss.n - pk.n).abs() <= 0.30
+                                                })
+                                                .min_by(|(_, a), (_, b)| {
+                                                    let da = ((a.h - pk.h) / 0.03).hypot((a.n - pk.n) / 0.30);
+                                                    let db = ((b.h - pk.h) / 0.03).hypot((b.n - pk.n) / 0.30);
+                                                    da.total_cmp(&db)
+                                                })
+                                                .map(|(idx, _)| idx)?;
+                                            let pos = ar.position.get(best_ss).copied().unwrap_or(-1);
+                                            if pos >= 0 && (pos as usize) < self.sequence.len() {
+                                                let k = pos as usize;
+                                                let conf = ar.confidence.get(best_ss).copied().unwrap_or(0.0);
+                                                let sid = self.seq_ids.get(k).copied().unwrap_or((k + 1) as i32);
+                                                Some(format!(
+                                                    "{}{} ({:.0}%)",
+                                                    three_to_one(&self.sequence[k]),
+                                                    sid,
+                                                    conf * 100.0
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                    let hint_str = auto_hint.as_deref().unwrap_or("label / residue");
                                     if ui
                                         .add(
                                             egui::TextEdit::singleline(&mut lbl_buf)
                                                 .desired_width(135.0)
-                                                .hint_text("label / residue"),
+                                                .hint_text(hint_str),
                                         )
                                         .changed()
                                     {
@@ -7999,6 +8208,7 @@ impl NmrWorkbenchApp {
     }
 
     fn render_and_sync_stack1d_panel(&mut self, ui: &mut egui::Ui) {
+        self.stack1d_panel.peak_label_font_px = self.peak_label_font_px;
         ui.ctx().data_mut(|d| {
             d.insert_temp::<(bool, bool)>(
                 egui::Id::unique("ferric_wb_cfg"),
@@ -9296,19 +9506,16 @@ impl NmrWorkbenchApp {
                 ToolMode2d::CrosshairSlice => MouseMode2D::CrosshairMeasure,
                 ToolMode2d::PickPeaks => MouseMode2D::PickPeak,
             };
-            let rail_out = ui
-                .scope_builder(egui::UiBuilder::new().max_rect(rail_host), |ui| {
-                    render_2d_vnmrj_rail(
-                        ui,
-                        &mut active_mouse_mode,
-                        VnmrJRail2DConfig {
-                            paper_white: self.paper_white_canvas,
-                            enabled: true,
-                            water_suppressed: false,
-                        },
-                    )
-                })
-                .inner;
+            let mut rail_ui = ui.new_child(egui::UiBuilder::new().max_rect(rail_host));
+            let rail_out = render_2d_vnmrj_rail(
+                &mut rail_ui,
+                &mut active_mouse_mode,
+                VnmrJRail2DConfig {
+                    paper_white: self.paper_white_canvas,
+                    enabled: true,
+                    water_suppressed: false,
+                },
+            );
             if let Some(act) = rail_out.action {
                 match act {
                     RailAction2D::SetMode(m) => {
@@ -10568,8 +10775,9 @@ impl NmrWorkbenchApp {
         }
 
         // Draw up to `3,000` 2D cross-peak / CON / protein spin-system / 3D cube markers + decluttered AABB labels (`UI-B4`)
+        let base_marker_sz = self.peak_marker_size_px.clamp(1.5, 14.0);
         let draw_selection_diamond = |pt: egui::Pos2| {
-            let r = 8.5_f32;
+            let r = (base_marker_sz * 1.9).clamp(6.0, 18.0);
             let pts = vec![
                 egui::pos2(pt.x, pt.y - r),
                 egui::pos2(pt.x + r, pt.y),
@@ -10583,7 +10791,7 @@ impl NmrWorkbenchApp {
             ));
         };
 
-        let label_font = egui::FontId::monospace(11.0);
+        let label_font = egui::FontId::monospace(self.peak_label_font_px.clamp(7.0, 28.0));
         let mut label_items: Vec<(
             nmr_gui::label_layout::LabelCandidate,
             Arc<egui::Galley>,
@@ -10604,7 +10812,8 @@ impl NmrWorkbenchApp {
                                        text: String,
                                        priority: f32,
                                        col: egui::Color32| {
-            obstacles.push(egui::Rect::from_center_size(pt, egui::vec2(10.0, 10.0)));
+            let obs = (base_marker_sz * 2.4).max(8.0);
+            obstacles.push(egui::Rect::from_center_size(pt, egui::vec2(obs, obs)));
             let galley = painter.layout_no_wrap(text, label_font.clone(), col);
             let sz = galley.size() + egui::vec2(4.0, 2.0);
             let hw = sz.x * 0.5 + 6.0;
@@ -10658,7 +10867,11 @@ impl NmrWorkbenchApp {
                         } else {
                             theme.peak_hi_conf
                         };
-                        let sz = if is_sel { 6.0 } else { 4.2 };
+                        let sz = if is_sel {
+                            (base_marker_sz * 1.55).max(base_marker_sz + 2.0)
+                        } else {
+                            base_marker_sz
+                        };
                         let sw = if is_sel { 2.0 } else { 1.35 };
                         painter.line_segment(
                             [egui::pos2(pt.x - sz, pt.y), egui::pos2(pt.x + sz, pt.y)],
@@ -10757,7 +10970,11 @@ impl NmrWorkbenchApp {
                     theme.peak_unassigned
                 };
 
-                let sz = if is_sel { 6.5 } else { 3.8 };
+                let sz = if is_sel {
+                    (base_marker_sz * 1.55).max(base_marker_sz + 2.0)
+                } else {
+                    base_marker_sz
+                };
                 painter.line_segment(
                     [egui::pos2(pt.x - sz, pt.y), egui::pos2(pt.x + sz, pt.y)],
                     egui::Stroke::new(if is_sel { 2.0 } else { 1.2 }, marker_col),
@@ -10841,7 +11058,11 @@ impl NmrWorkbenchApp {
                 } else {
                     theme.peak_hi_conf
                 };
-                let sz = if is_sel { 5.8 } else { 3.8 };
+                let sz = if is_sel {
+                    (base_marker_sz * 1.55).max(base_marker_sz + 2.0)
+                } else {
+                    base_marker_sz
+                };
                 let sw = if is_sel { 1.9 } else { 1.25 };
                 painter.line_segment(
                     [egui::pos2(pt.x - sz, pt.y), egui::pos2(pt.x + sz, pt.y)],
@@ -12161,6 +12382,15 @@ impl NmrWorkbenchApp {
                 let locks_snapshot = self.session.state.locked_residues.clone();
                 let links_snapshot = self.session.state.confirmed_links.clone();
                 let strip_actions = {
+                    let cbcaconh_3d_ref = self.cbcaconh_3d.as_deref().or_else(|| {
+                        self.cubes_3d
+                            .iter()
+                            .find(|c| {
+                                let k = Self::normalize_exp_key(&c.exp);
+                                k == "CBCACONH" || k == "HNCOCA"
+                            })
+                            .map(|v| &**v)
+                    });
                     let hncaco_3d_ref = self.hncaco_3d.as_deref().or_else(|| {
                         self.cubes_3d
                             .iter()
@@ -12172,6 +12402,7 @@ impl NmrWorkbenchApp {
                     });
                     let spectra_full = StripSpectra3DFull {
                         aliphatic_3d: self.hncacb_3d.as_deref(),
+                        aliphatic_inter_3d: cbcaconh_3d_ref,
                         carbonyl_3d: self.hnco_3d.as_deref(),
                         carbonyl_intra_3d: hncaco_3d_ref,
                     };
@@ -12375,12 +12606,13 @@ impl NmrWorkbenchApp {
         strips: &[(Option<usize>, &str)],
     ) {
         painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(13, 17, 24));
-        let (strip_nuc, (c_top, c_bot)) = if let Some(s3) = self.hncacb_3d.as_deref() {
-            let (_, nuc, bounds) = strip_vertical_axis_metadata(s3);
-            (nuc, bounds)
-        } else {
-            ("13C", (13.0f64, 74.0f64))
-        };
+        let (strip_nuc, (c_top, c_bot)) =
+            if let Some(s3) = self.hncacb_3d.as_deref().or(self.cbcaconh_3d.as_deref()) {
+                let (_, nuc, bounds) = strip_vertical_axis_metadata(s3);
+                (nuc, bounds)
+            } else {
+                ("13C", (13.0f64, 74.0f64))
+            };
         let top_pad = 22.0f32;
         let bot_pad = 8.0f32;
         let left_axis_w = 38.0f32;
@@ -12614,6 +12846,7 @@ impl NmrWorkbenchApp {
     fn compute_workspace_readiness(&self) -> WorkspaceReadiness {
         let spectra_2d_count = usize::from(self.hsqc_spec.is_some()) + self.overlay_layers.len();
         let spectra_3d_count = usize::from(self.hncacb_3d.is_some())
+            + usize::from(self.cbcaconh_3d.is_some())
             + usize::from(self.hnco_3d.is_some())
             + usize::from(self.hncaco_3d.is_some())
             + self.extra_3d_count;
@@ -13166,18 +13399,7 @@ impl NmrWorkbenchApp {
             let mut first_3d_page_idx: Option<usize> = None;
             for (disp_3d, _, s3) in cubes_3d {
                 let s3_arc = Arc::new(s3);
-                let exp_key = Self::normalize_exp_key(&s3_arc.exp);
-                if exp_key == "HNCO" {
-                    if self.hnco_3d.is_none() {
-                        self.hnco_3d = Some(Arc::clone(&s3_arc));
-                    }
-                } else if exp_key == "HNCACO" {
-                    if self.hncaco_3d.is_none() {
-                        self.hncaco_3d = Some(Arc::clone(&s3_arc));
-                    }
-                } else if self.hncacb_3d.is_none() {
-                    self.hncacb_3d = Some(Arc::clone(&s3_arc));
-                }
+                self.assign_named_3d_slot(&s3_arc);
                 let c_idx = self.cubes_3d.len();
                 let mut page_idx = self.workbook.add_3d_cube_page(c_idx, &disp_3d, &s3_arc);
                 // Skip redundant slow blind full-cube pick when cube > 8M voxels or HSQC is loaded
@@ -13193,6 +13415,7 @@ impl NmrWorkbenchApp {
                 self.cubes_3d.push(s3_arc);
             }
             let stored_3d = usize::from(self.hncacb_3d.is_some())
+                + usize::from(self.cbcaconh_3d.is_some())
                 + usize::from(self.hnco_3d.is_some())
                 + usize::from(self.hncaco_3d.is_some());
             self.extra_3d_count = self.cubes_3d.len().saturating_sub(stored_3d);
@@ -13235,6 +13458,7 @@ impl NmrWorkbenchApp {
 
         let n_3d_total = self.cubes_3d.len().max(
             usize::from(self.hncacb_3d.is_some())
+                + usize::from(self.cbcaconh_3d.is_some())
                 + usize::from(self.hnco_3d.is_some())
                 + usize::from(self.hncaco_3d.is_some()),
         );
@@ -13673,6 +13897,7 @@ impl NmrWorkbenchApp {
                 self.box_zoom_2d_anchor = None;
                 self.hsqc_spec = None;
                 self.hncacb_3d = None;
+                self.cbcaconh_3d = None;
                 self.hnco_3d = None;
                 self.hncaco_3d = None;
                 self.cubes_3d.clear();
@@ -13704,39 +13929,39 @@ impl NmrWorkbenchApp {
                     let mut n_reg = 0usize;
                     self.axis_rescue_notices.clear();
                     self.axis_rescue_audits.clear();
-                    if let Some(ref mut s3_arc) = self.hncacb_3d {
-                        let s3 = Arc::make_mut(s3_arc);
-                        let (_, _, audit_opt) = register_3d_hn_to_hsqc_2d_with_audit(
-                            s3,
-                            hsqc,
-                            0.08,
-                            0.60,
-                            self.enable_axis_rescue,
-                        );
-                        if let Some(audit) = audit_opt {
-                            if let Some(warn) = audit.warning_message() {
-                                self.axis_rescue_notices.push(warn);
-                            }
-                            self.axis_rescue_audits.push(audit);
+                    if !self.cubes_3d.is_empty() {
+                        for s3_arc in &mut self.cubes_3d {
+                            let s3 = Arc::make_mut(s3_arc);
+                            Self::register_one_3d_cube(
+                                s3,
+                                hsqc,
+                                self.enable_axis_rescue,
+                                &mut self.axis_rescue_notices,
+                                &mut self.axis_rescue_audits,
+                            );
+                            n_reg += 1;
                         }
-                        n_reg += 1;
-                    }
-                    if let Some(ref mut s3_arc) = self.hnco_3d {
-                        let s3 = Arc::make_mut(s3_arc);
-                        let (_, _, audit_opt) = register_3d_hn_to_hsqc_2d_with_audit(
-                            s3,
-                            hsqc,
-                            0.08,
-                            0.60,
-                            self.enable_axis_rescue,
-                        );
-                        if let Some(audit) = audit_opt {
-                            if let Some(warn) = audit.warning_message() {
-                                self.axis_rescue_notices.push(warn);
-                            }
-                            self.axis_rescue_audits.push(audit);
+                        self.resync_all_named_3d_slots();
+                    } else {
+                        for s3_arc in [
+                            &mut self.hncacb_3d,
+                            &mut self.cbcaconh_3d,
+                            &mut self.hnco_3d,
+                            &mut self.hncaco_3d,
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            let s3 = Arc::make_mut(s3_arc);
+                            Self::register_one_3d_cube(
+                                s3,
+                                hsqc,
+                                self.enable_axis_rescue,
+                                &mut self.axis_rescue_notices,
+                                &mut self.axis_rescue_audits,
+                            );
+                            n_reg += 1;
                         }
-                        n_reg += 1;
                     }
                     self.status_msg = if let Some(first_warn) = self.axis_rescue_notices.first() {
                         first_warn.clone()
@@ -13819,6 +14044,9 @@ impl NmrWorkbenchApp {
             // --- 3. Spectrum View & Contours ---
             WorkbenchAction::OpenContourThresholdPopup => {
                 self.show_contour_modal = !self.show_contour_modal;
+            }
+            WorkbenchAction::OpenOrnamentSizeDialog => {
+                self.show_ornament_modal = !self.show_ornament_modal;
             }
             WorkbenchAction::ZoomFullSweep => {
                 if self.is_1d_studio_active() {
@@ -14079,13 +14307,19 @@ impl NmrWorkbenchApp {
                         .filter(|p| p.exp == "HSQC")
                         .cloned()
                         .collect();
-                    let mut cubes: Vec<&Spectrum3D> = Vec::new();
-                    if let Some(s3) = self.hncacb_3d.as_deref() {
-                        cubes.push(s3);
-                    }
-                    if let Some(s3) = self.hnco_3d.as_deref() {
-                        cubes.push(s3);
-                    }
+                    let cubes: Vec<&Spectrum3D> = if !self.cubes_3d.is_empty() {
+                        self.cubes_3d.iter().map(|c| c.as_ref()).collect()
+                    } else {
+                        [
+                            self.hncacb_3d.as_deref(),
+                            self.cbcaconh_3d.as_deref(),
+                            self.hnco_3d.as_deref(),
+                            self.hncaco_3d.as_deref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect()
+                    };
                     if !roots.is_empty() && !cubes.is_empty() {
                         let pcfg = PickerConfig {
                             snr_threshold: self.picker_snr,
@@ -14755,6 +14989,54 @@ impl NmrWorkbenchApp {
                     }
                 });
             self.show_contour_modal = open;
+        }
+
+        // 4b. `oz` Sparky-style Ornament & Peak Label Size Dialog
+        if self.show_ornament_modal {
+            let mut open = self.show_ornament_modal;
+            egui::Window::new("Ornament & Peak Label Size (oz)")
+                .id(egui::Id::unique("nmr_ornament_size_modal"))
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(340.0_f32.min(max_modal_w))
+                .max_width(max_modal_w)
+                .show(ctx, |ui| {
+                    ui.checkbox(&mut self.show_peak_labels, "Show Peak Labels (pl)");
+                    ui.add(
+                        egui::Slider::new(&mut self.peak_label_font_px, 7.0..=28.0)
+                            .step_by(0.5)
+                            .suffix(" px")
+                            .text("Label Font Size"),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Preset:");
+                        for &(lbl, px) in &[
+                            ("9 px", 9.0_f32),
+                            ("11 px", 11.0),
+                            ("14 px", 14.0),
+                            ("18 px", 18.0),
+                        ] {
+                            if ui
+                                .selectable_label((self.peak_label_font_px - px).abs() < 0.25, lbl)
+                                .clicked()
+                            {
+                                self.peak_label_font_px = px;
+                            }
+                        }
+                    });
+                    ui.add(
+                        egui::Slider::new(&mut self.peak_marker_size_px, 1.5..=14.0)
+                            .step_by(0.2)
+                            .suffix(" px")
+                            .text("Peak Marker Size"),
+                    );
+                    ui.separator();
+                    if ui.button("Reset Defaults (11 px / 3.8 px)").clicked() {
+                        self.peak_label_font_px = 11.0;
+                        self.peak_marker_size_px = 3.8;
+                    }
+                });
+            self.show_ornament_modal = open;
         }
 
         // 5. Multi-Spectrum Overlay Stack Manager (`T09.5`, `UI-C12`)
@@ -15992,7 +16274,11 @@ impl ResponsiveWorkbenchHost for NmrWorkbenchApp {
         match self.workbench_mode {
             WorkbenchMode::Process | WorkbenchMode::Assign => {
                 let sel = self.current_workbook_selection();
-                let has_3d = self.hncacb_3d.is_some() || self.hnco_3d.is_some();
+                let has_3d = self.hncacb_3d.is_some()
+                    || self.cbcaconh_3d.is_some()
+                    || self.hnco_3d.is_some()
+                    || self.hncaco_3d.is_some()
+                    || !self.cubes_3d.is_empty();
                 let has_pdb = self.loaded_pdb_text.is_some() || self.mol3d_panel.ensemble.is_some();
                 let show_strips = self.show_strips_dock && self.is_protein_2d_context();
                 let show_mol3d = self.show_mol3d_viewport && self.is_protein_2d_context();
@@ -17556,10 +17842,15 @@ impl NmrWorkbenchApp {
                 if target_key == "HSQC" {
                     self.hsqc_spec = None;
                 } else {
+                    let had_cubes = !self.cubes_3d.is_empty();
                     self.cubes_3d
                         .retain(|c| Self::normalize_exp_key(&c.exp) != target_key);
-                    if target_key == "HNCACB" {
+                    if had_cubes {
+                        self.resync_all_named_3d_slots();
+                    } else if target_key == "HNCACB" || target_key == "HNCA" {
                         self.hncacb_3d = None;
+                    } else if target_key == "CBCACONH" || target_key == "HNCOCA" {
+                        self.cbcaconh_3d = None;
                     } else if target_key == "HNCO" {
                         self.hnco_3d = None;
                     } else if target_key == "HNCACO" {
@@ -17588,19 +17879,7 @@ impl NmrWorkbenchApp {
                     }
                 }
                 // Re-sync dedicated strip cube slots strictly by normalized experiment key.
-                self.hncacb_3d = None;
-                self.hnco_3d = None;
-                self.hncaco_3d = None;
-                for cube_arc in &self.cubes_3d {
-                    let k = Self::normalize_exp_key(&cube_arc.exp);
-                    if k == "HNCO" && self.hnco_3d.is_none() {
-                        self.hnco_3d = Some(Arc::clone(cube_arc));
-                    } else if k == "HNCACO" && self.hncaco_3d.is_none() {
-                        self.hncaco_3d = Some(Arc::clone(cube_arc));
-                    } else if k != "HNCO" && k != "HNCACO" && self.hncacb_3d.is_none() {
-                        self.hncacb_3d = Some(Arc::clone(cube_arc));
-                    }
-                }
+                self.resync_all_named_3d_slots();
                 self.assign_res = None;
                 self.relax_peaks_sync_key = (usize::MAX, usize::MAX, 0);
                 if !self.peaks.is_empty() {
@@ -17648,6 +17927,7 @@ impl NmrWorkbenchApp {
                 let loaded = pc > 0
                     || (*name == "HSQC" && self.hsqc_spec.is_some())
                     || (*name == "HNCACB" && self.hncacb_3d.is_some())
+                    || (*name == "CBCA(CO)NH" && self.cbcaconh_3d.is_some())
                     || (*name == "HNCO" && self.hnco_3d.is_some())
                     || (*name == "HN(CA)CO" && self.hncaco_3d.is_some())
                     || has_cube(name);
@@ -21915,5 +22195,161 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 "section '{section}' must return non-empty items: {val}"
             );
         }
+    }
+
+    #[test]
+    fn test_2d_peak_table_never_overlaps_hsqc_plot_rect() {
+        use eframe::egui;
+
+        let mut app = make_headless_test_app();
+        app.load_builtin_demo_suite();
+        app.workbook.two_d.show_peak_table = true;
+
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 900.0),
+            )),
+            ..Default::default()
+        };
+
+        let mut outer_rect_out = egui::Rect::NOTHING;
+        let mut table_top_out = 0.0_f32;
+        let _ = ctx.run_ui(raw, |ui| {
+            outer_rect_out = app.draw_hsqc_canvas(ui);
+            table_top_out = ui.cursor().top();
+            app.draw_2d_peaks_bottom_table(ui);
+        });
+
+        let plot_rect = app
+            .last_hsqc_plot_rect
+            .expect("draw_hsqc_canvas must record last_hsqc_plot_rect");
+        assert!(
+            table_top_out >= outer_rect_out.bottom() - 0.5,
+            "2D peak table cursor top ({table_top_out}) must be at/below outer_rect bottom ({})",
+            outer_rect_out.bottom()
+        );
+        assert!(
+            table_top_out >= plot_rect.bottom() + 18.0,
+            "2D peak table cursor top ({table_top_out}) must sit below the f2 ruler under plot_rect ({})",
+            plot_rect.bottom()
+        );
+    }
+
+    #[test]
+    fn test_ingest_cbcaconh_before_hncacb_routes_both_strip_slots_without_hijack() {
+        use super::*;
+        use nmr_core::spectrum::AxisPpm;
+
+        let mut app = make_headless_test_app();
+        let mk_cube = |name: &str, exp: &str| -> Spectrum3D {
+            Spectrum3D {
+                name: name.into(),
+                exp: exp.into(),
+                axis_x: AxisPpm::from_bounds("1H", 4, 10.0, 6.5, 600.0),
+                axis_y: AxisPpm::from_bounds("15N", 4, 130.0, 105.0, 60.8),
+                axis_z: AxisPpm::from_bounds("13C", 4, 70.0, 15.0, 150.9),
+                data: vec![0.0_f32; 64],
+            }
+        };
+
+        // Load CBCACONH alphabetically BEFORE HNCACB (as OS directory listings do on Ubiquitin)
+        let payload = IngestLoadedPayload {
+            plan: nmr_gui::ingest_panel::IngestExecutionPlan {
+                root_name: "alphabetical-3d-order".into(),
+                root_path: None,
+                problem_regime: ProblemRegime::GlobularBackbone,
+                sequence_three_letter: Vec::new(),
+                selected_experiments: Vec::new(),
+                in_memory_files: Arc::new(BTreeMap::new()),
+            },
+            run_full_pipeline: false,
+            loaded_2d_list: Vec::new(),
+            cubes_3d: vec![
+                (
+                    "CBCACONH.ucsf".into(),
+                    PulseSequenceClass::Cbcaconh,
+                    mk_cube("CBCACONH.ucsf", "CBCACONH"),
+                ),
+                (
+                    "HNCACB.ucsf".into(),
+                    PulseSequenceClass::Hncacb,
+                    mk_cube("HNCACB.ucsf", "HNCACB"),
+                ),
+                (
+                    "HNCACO.ucsf".into(),
+                    PulseSequenceClass::Hncaco,
+                    mk_cube("HNCACO.ucsf", "HNCACO"),
+                ),
+                (
+                    "HNCO.ucsf".into(),
+                    PulseSequenceClass::Hnco,
+                    mk_cube("HNCO.ucsf", "HNCO"),
+                ),
+            ],
+            loaded_1d_specs: Vec::new(),
+            ingested_recipes: BTreeMap::new(),
+            load_errors: Vec::new(),
+            processed_fids: 0,
+        };
+
+        app.apply_loaded_ingest_payload(payload);
+
+        assert_eq!(app.cubes_3d.len(), 4);
+        let cbca_slot = app.cbcaconh_3d.as_ref().expect("cbcaconh_3d populated");
+        let hncacb_slot = app.hncacb_3d.as_ref().expect("hncacb_3d populated");
+        let hncaco_slot = app.hncaco_3d.as_ref().expect("hncaco_3d populated");
+        let hnco_slot = app.hnco_3d.as_ref().expect("hnco_3d populated");
+
+        assert_eq!(cbca_slot.exp, "CBCACONH");
+        assert_eq!(
+            hncacb_slot.exp, "HNCACB",
+            "CBCACONH loaded first must NEVER hijack hncacb_3d"
+        );
+        assert_eq!(hncaco_slot.exp, "HNCACO");
+        assert_eq!(hnco_slot.exp, "HNCO");
+        assert!(Arc::ptr_eq(&app.cubes_3d[0], cbca_slot));
+        assert!(Arc::ptr_eq(&app.cubes_3d[1], hncacb_slot));
+        assert!(Arc::ptr_eq(&app.cubes_3d[2], hncaco_slot));
+        assert!(Arc::ptr_eq(&app.cubes_3d[3], hnco_slot));
+        assert_eq!(app.extra_3d_count, 0);
+    }
+
+    #[test]
+    fn test_oz_chord_opens_ornament_dialog_and_resizes_labels() {
+        use super::*;
+        use eframe::egui;
+
+        let mut app = make_headless_test_app();
+        app.load_builtin_demo_suite();
+        assert!(!app.show_ornament_modal);
+        assert!((app.peak_label_font_px - 11.0).abs() < 1e-4);
+
+        let ctx = egui::Context::default();
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::OpenOrnamentSizeDialog);
+        assert!(
+            app.show_ornament_modal,
+            "oz chord must open the Ornament & Peak Label Size dialog"
+        );
+
+        app.peak_label_font_px = 18.0;
+        app.peak_marker_size_px = 6.5;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(raw, |ui| {
+            app.draw_v0171_windows_and_bridges(ui.ctx());
+            let _ = app.draw_hsqc_canvas(ui);
+        });
+        assert!((app.peak_label_font_px - 18.0).abs() < 1e-4);
+        assert!((app.peak_marker_size_px - 6.5).abs() < 1e-4);
+
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::OpenOrnamentSizeDialog);
+        assert!(!app.show_ornament_modal);
     }
 }

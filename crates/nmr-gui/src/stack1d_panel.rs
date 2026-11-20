@@ -3011,6 +3011,7 @@ pub struct Stack1dState {
     pub picker_min_snr: f64,
     pub estimated_noise_sigma: f64,
     pub show_peak_labels: bool,
+    pub peak_label_font_px: f32,
     pub peak_labels_in_hz: bool,
     pub show_j_trees: bool,
     pub show_multiplet_boxes: bool,
@@ -3164,6 +3165,7 @@ impl Default for Stack1dState {
             picker_min_snr: 6.0,
             estimated_noise_sigma: 1e-6,
             show_peak_labels: true,
+            peak_label_font_px: TYPE_CAPTION_PX,
             peak_labels_in_hz: false,
             show_j_trees: true,
             show_multiplet_boxes: false,
@@ -7183,7 +7185,12 @@ fn compute_1d_peak_flag_layout(
             txt
         };
         let is_sel = state.selected_peak_idx == Some(p_idx);
-        let font_px = if is_sel { 11.5 } else { TYPE_CAPTION_PX };
+        let base_px = state.peak_label_font_px.clamp(7.0, 28.0);
+        let font_px = if is_sel {
+            (base_px + 1.0).min(28.0)
+        } else {
+            base_px
+        };
         let g_size = painter
             .layout_no_wrap(
                 full_lbl.clone(),

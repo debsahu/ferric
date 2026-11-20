@@ -40,7 +40,11 @@ const EXPECTED_TWO_KEY_CHORDS: &[((char, char), &str, WorkbenchAction)] = &[
     (('p', 'l'), "Chord: p_", WorkbenchAction::TogglePeakLabels),
     (('z', 'f'), "Chord: z_", WorkbenchAction::ZoomFullSweep),
     (('z', 'p'), "Chord: z_", WorkbenchAction::ZoomPrevious),
-    (('o', 'z'), "Chord: o_", WorkbenchAction::ZoomFullSweep),
+    (
+        ('o', 'z'),
+        "Chord: o_",
+        WorkbenchAction::OpenOrnamentSizeDialog,
+    ),
     (('z', 'i'), "Chord: z_", WorkbenchAction::ZoomIn),
     (('z', 'o'), "Chord: z_", WorkbenchAction::ZoomOut),
     (('z', 'm'), "Chord: z_", WorkbenchAction::SelectZoomBoxMode),

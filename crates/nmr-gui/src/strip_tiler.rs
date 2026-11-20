@@ -486,13 +486,15 @@ pub struct StripSpectra3D<'a> {
     pub carbonyl_3d: Option<&'a Spectrum3D>,
 }
 
-/// Full 3D strip cube bundle pairing aliphatic (`HNCACB`/`CBCA(CO)NH`/`HNCA`/`HN(CO)CA`) with
-/// both inter-residue carbonyl (`HNCO`: `C'_{i-1}`) and intra+inter carbonyl (`HN(CA)CO`:
-/// `C'_i + C'_{i-1}`) volumetric cubes.
+/// Full 3D strip cube bundle pairing intra+inter/inter-residue aliphatic cubes (`HNCACB`/`HNCA`
+/// and `CBCA(CO)NH`/`HN(CO)CA`) with inter-residue carbonyl (`HNCO`: `C'_{i-1}`) and intra+inter
+/// carbonyl (`HN(CA)CO`: `C'_i + C'_{i-1}`) volumetric cubes.
 #[derive(Clone, Copy, Default)]
 pub struct StripSpectra3DFull<'a> {
-    /// Aliphatic `13C` 3D cube (`HNCACB`, `CBCA(CO)NH`, `HNCA`, `HN(CO)CA`).
+    /// Aliphatic intra+inter `13C` 3D cube (`HNCACB` or `HNCA`: `i` and `i-1`).
     pub aliphatic_3d: Option<&'a Spectrum3D>,
+    /// Aliphatic inter-residue `13C` 3D cube (`CBCA(CO)NH` or `HN(CO)CA`: `i-1` only).
+    pub aliphatic_inter_3d: Option<&'a Spectrum3D>,
     /// Inter-residue carbonyl `13C'` 3D cube (`HNCO`, `C'_{i-1}`).
     pub carbonyl_3d: Option<&'a Spectrum3D>,
     /// Intra+inter carbonyl `13C'` 3D cube (`HN(CA)CO`, `C'_i + C'_{i-1}`).
@@ -513,6 +515,7 @@ impl<'a> From<StripSpectra3D<'a>> for StripSpectra3DFull<'a> {
     fn from(s: StripSpectra3D<'a>) -> Self {
         Self {
             aliphatic_3d: s.aliphatic_3d,
+            aliphatic_inter_3d: None,
             carbonyl_3d: s.carbonyl_3d,
             carbonyl_intra_3d: None,
         }
@@ -803,6 +806,7 @@ impl StripTilerPanel {
     ) -> Vec<StripTilerAction> {
         let spectra_full = StripSpectra3DFull {
             aliphatic_3d: ctx.spectra_3d.aliphatic_3d,
+            aliphatic_inter_3d: None,
             carbonyl_3d: ctx.spectra_3d.carbonyl_3d,
             carbonyl_intra_3d,
         };
@@ -810,7 +814,7 @@ impl StripTilerPanel {
     }
 
     /// Render the strip tiler using an explicit [`StripSpectra3DFull`] cube bundle (`HNCACB`/`HNCA`
-    /// + `HNCO` + `HN(CA)CO`).
+    /// + `CBCA(CO)NH`/`HN(CO)CA` + `HNCO` + `HN(CA)CO`).
     pub fn show_full(
         &mut self,
         ui: &mut egui::Ui,
@@ -970,7 +974,10 @@ impl StripTilerPanel {
             (left_axis_w + (columns.len() as f32) * col_w + 8.0).max(avail_w)
         };
 
-        let (ali_nuc, base_ali_range) = if let Some(s3) = spectra_full.aliphatic_3d {
+        let (ali_nuc, base_ali_range) = if let Some(s3) = spectra_full
+            .aliphatic_3d
+            .or(spectra_full.aliphatic_inter_3d)
+        {
             let (_, nuc, bounds) = strip_vertical_axis_metadata(s3);
             (nuc, bounds)
         } else {
@@ -1682,6 +1689,11 @@ impl StripTilerPanel {
                     sub_col,
                 );
 
+                let co_paired =
+                    spectra_full.carbonyl_3d.is_some() && spectra_full.carbonyl_intra_3d.is_some();
+                let ali_paired = spectra_full.aliphatic_3d.is_some()
+                    && spectra_full.aliphatic_inter_3d.is_some();
+
                 // Paint volumetric 3D slice OR synthetic Gaussian strip profile
                 if show_co_band {
                     let co_painter = painter.with_clip_rect(co_box);
@@ -1697,20 +1709,25 @@ impl StripTilerPanel {
                 }
                 if show_ali_band {
                     let ali_painter = painter.with_clip_rect(ali_box);
-                    self.paint_band_profile(
+                    self.paint_aliphatic_band_profile(
                         &ali_painter,
                         ali_box,
                         ss,
                         spectra_full.aliphatic_3d,
+                        spectra_full.aliphatic_inter_3d,
                         ali_range,
                         &ali_to_y,
                     );
                 }
 
-                // Paint resolved candidate markers: (i) filled circles on left, (i-1) diamonds on right
+                // Paint resolved candidate markers: (i) filled circles on left lane, (i-1) diamonds on right lane
                 self.paint_spin_system_markers(
                     &painter,
                     cx,
+                    co_box,
+                    ali_box,
+                    co_paired,
+                    ali_paired,
                     ss_idx,
                     ss,
                     show_co_band,
@@ -2303,49 +2320,67 @@ impl StripTilerPanel {
                     ],
                     egui::Stroke::new(0.8, egui::Color32::from_rgb(38, 48, 64)),
                 );
-                self.paint_single_cube_colored(
+                self.paint_single_cube_signed(
                     painter,
                     left_lane,
                     ss,
                     s_intra,
                     (lo, hi),
                     c_to_y,
-                    gain,
                     emerald_rgb,
+                    emerald_rgb,
+                    160.0,
                 );
-                self.paint_single_cube_colored(
+                self.paint_single_cube_signed(
                     painter,
                     right_lane,
                     ss,
                     s_inter,
                     (lo, hi),
                     c_to_y,
-                    gain,
                     amber_rgb,
+                    amber_rgb,
+                    160.0,
+                );
+                Self::paint_lane_micro_labels(
+                    painter,
+                    band_box,
+                    left_lane,
+                    right_lane,
+                    egui::Color32::from_rgb(138, 240, 178),
+                    egui::Color32::from_rgb(255, 212, 110),
+                    &[
+                        ("HN(CA)CO", "HNCO"),
+                        ("CACO", "HNCO"),
+                        ("i+i-1", "i-1"),
+                        ("i", "i-1"),
+                    ],
                 );
             }
             (Some(s_intra), None) => {
-                self.paint_single_cube_colored(
+                self.paint_single_cube_signed(
                     painter,
                     band_box,
                     ss,
                     s_intra,
                     (lo, hi),
                     c_to_y,
-                    gain,
                     emerald_rgb,
+                    emerald_rgb,
+                    160.0,
                 );
             }
             (None, Some(s_inter)) => {
-                self.paint_single_cube_colored(
+                self.paint_single_cube_signed(
                     painter,
                     band_box,
                     ss,
                     s_inter,
                     (lo, hi),
                     c_to_y,
-                    gain,
                     amber_rgb,
+                    amber_rgb,
+                    160.0,
                 );
             }
             (None, None) => {
@@ -2419,7 +2454,39 @@ impl StripTilerPanel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_single_cube_colored(
+    fn paint_lane_micro_labels(
+        painter: &egui::Painter,
+        band_box: egui::Rect,
+        left_lane: egui::Rect,
+        right_lane: egui::Rect,
+        left_col: egui::Color32,
+        right_col: egui::Color32,
+        candidates: &[(&str, &str)],
+    ) {
+        if band_box.height() < 28.0 {
+            return;
+        }
+        let font = egui::FontId::monospace(TYPE_CAPTION_PX);
+        for &(lbl_l, lbl_r) in candidates {
+            let g_l = painter.layout_no_wrap(lbl_l.to_string(), font.clone(), left_col);
+            let g_r = painter.layout_no_wrap(lbl_r.to_string(), font.clone(), right_col);
+            let max_h = g_l.size().y.max(g_r.size().y);
+            if 2.0 + max_h + 2.0 <= band_box.height()
+                && g_l.size().x + 4.0 <= left_lane.width()
+                && g_r.size().x + 4.0 <= right_lane.width()
+            {
+                let lx = (left_lane.center().x - g_l.size().x * 0.5).round();
+                let rx = (right_lane.center().x - g_r.size().x * 0.5).round();
+                let ty = (band_box.top() + 2.0).round();
+                painter.galley(egui::pos2(lx, ty), g_l, left_col);
+                painter.galley(egui::pos2(rx, ty), g_r, right_col);
+                return;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_single_cube_signed(
         &self,
         painter: &egui::Painter,
         lane_box: egui::Rect,
@@ -2427,9 +2494,11 @@ impl StripTilerPanel {
         s3: &Spectrum3D,
         bounds: (f64, f64),
         c_to_y: &dyn Fn(f64) -> f32,
-        gain: f32,
-        rgb: (u8, u8, u8),
+        pos_rgb: (u8, u8, u8),
+        neg_rgb: (u8, u8, u8),
+        alpha_scale: f32,
     ) {
+        let gain = self.strip_gain as f32;
         let slice = s3.extract_strip(ss.h, ss.n, self.strip_half_width_h_ppm);
         let max_v = slice.max_abs().max(1.0);
         let nx = slice.nx().max(1);
@@ -2444,11 +2513,12 @@ impl StripTilerPanel {
                 let val = slice.get(ix, ic);
                 let norm = ((val.abs() / max_v) * gain).clamp(0.0, 1.0);
                 if norm > 0.14 {
+                    let rgb = if val >= 0.0 { pos_rgb } else { neg_rgb };
                     let col = egui::Color32::from_rgba_unmultiplied(
                         rgb.0,
                         rgb.1,
                         rgb.2,
-                        (norm * 160.0) as u8,
+                        (norm * alpha_scale) as u8,
                     );
                     let px0 = lane_box.left() + lane_box.width() * 0.08 + (ix as f32) * col_dx;
                     painter.line_segment(
@@ -2460,12 +2530,14 @@ impl StripTilerPanel {
         }
     }
 
-    fn paint_band_profile(
+    #[allow(clippy::too_many_arguments)]
+    fn paint_aliphatic_band_profile(
         &self,
         painter: &egui::Painter,
         band_box: egui::Rect,
         ss: &SpinSystem,
-        spec3d: Option<&Spectrum3D>,
+        intra_3d: Option<&Spectrum3D>,
+        inter_3d: Option<&Spectrum3D>,
         c_range: (f64, f64),
         c_to_y: &dyn Fn(f64) -> f32,
     ) {
@@ -2473,65 +2545,136 @@ impl StripTilerPanel {
         let lo = c_range.0.min(c_range.1);
         let hi = c_range.0.max(c_range.1);
         let gain = self.strip_gain as f32;
+        let ca_pos_rgb = (45u8, 200u8, 255u8);
+        let cb_neg_rgb = (255u8, 105u8, 95u8);
+        let inter_pos_rgb = (250u8, 198u8, 82u8);
+        let inter_neg_rgb = (255u8, 130u8, 115u8);
 
-        if let Some(s3) = spec3d {
-            let slice = s3.extract_strip(ss.h, ss.n, self.strip_half_width_h_ppm);
-            let max_v = slice.max_abs().max(1.0);
-            let nx = slice.nx().max(1);
-            let col_dx = (band_box.width() * 0.80) / (nx as f32);
-            for ic in 0..slice.ny() {
-                let c_ppm = slice.axis_y.index_to_ppm(ic as f64);
-                if !(lo..=hi).contains(&c_ppm) {
-                    continue;
-                }
-                let y = c_to_y(c_ppm);
-                for ix in 0..nx {
-                    let val = slice.get(ix, ic);
-                    let norm = ((val.abs() / max_v) * gain).clamp(0.0, 1.0);
-                    if norm > 0.14 {
-                        let col = if val >= 0.0 {
+        match (intra_3d, inter_3d) {
+            (Some(s_intra), Some(s_inter)) => {
+                // Paired side-by-side aliphatic lanes:
+                // left = HNCACB / HNCA (4 peaks: +CA_i/+CA_{i-1}, -CB_i/-CB_{i-1}),
+                // right = CBCA(CO)NH / HN(CO)CA (2 i-1-only peaks).
+                let mid_x = band_box.center().x;
+                let left_lane = egui::Rect::from_min_max(
+                    band_box.min,
+                    egui::pos2(mid_x - 0.5, band_box.bottom()),
+                );
+                let right_lane =
+                    egui::Rect::from_min_max(egui::pos2(mid_x + 0.5, band_box.top()), band_box.max);
+                painter.line_segment(
+                    [
+                        egui::pos2(mid_x, band_box.top() + 1.0),
+                        egui::pos2(mid_x, band_box.bottom() - 1.0),
+                    ],
+                    egui::Stroke::new(0.8, egui::Color32::from_rgb(38, 48, 64)),
+                );
+                self.paint_single_cube_signed(
+                    painter,
+                    left_lane,
+                    ss,
+                    s_intra,
+                    (lo, hi),
+                    c_to_y,
+                    ca_pos_rgb,
+                    cb_neg_rgb,
+                    155.0,
+                );
+                self.paint_single_cube_signed(
+                    painter,
+                    right_lane,
+                    ss,
+                    s_inter,
+                    (lo, hi),
+                    c_to_y,
+                    inter_pos_rgb,
+                    inter_neg_rgb,
+                    155.0,
+                );
+                let is_hnca = s_intra.exp.eq_ignore_ascii_case("HNCA");
+                let label_tiers: &[(&str, &str)] = if is_hnca {
+                    &[
+                        ("HNCA", "HN(CO)CA"),
+                        ("HNCA", "HNCOCA"),
+                        ("CA", "CO-CA"),
+                        ("i+i-1", "i-1"),
+                        ("i", "i-1"),
+                    ]
+                } else {
+                    &[
+                        ("HNCACB", "CBCA(CO)"),
+                        ("CACB", "CBCO"),
+                        ("i+i-1", "i-1"),
+                        ("i", "i-1"),
+                    ]
+                };
+                Self::paint_lane_micro_labels(
+                    painter,
+                    band_box,
+                    left_lane,
+                    right_lane,
+                    egui::Color32::from_rgb(125, 224, 255),
+                    egui::Color32::from_rgb(255, 212, 110),
+                    label_tiers,
+                );
+            }
+            (Some(s_intra), None) => {
+                self.paint_single_cube_signed(
+                    painter,
+                    band_box,
+                    ss,
+                    s_intra,
+                    (lo, hi),
+                    c_to_y,
+                    ca_pos_rgb,
+                    cb_neg_rgb,
+                    150.0,
+                );
+            }
+            (None, Some(s_inter)) => {
+                self.paint_single_cube_signed(
+                    painter,
+                    band_box,
+                    ss,
+                    s_inter,
+                    (lo, hi),
+                    c_to_y,
+                    inter_pos_rgb,
+                    inter_neg_rgb,
+                    150.0,
+                );
+            }
+            (None, None) => {
+                // Peak-only synthetic Gaussian strip profile
+                let n_samples = (band_box.height().round() as usize).clamp(24, 180);
+                for s_idx in 0..=n_samples {
+                    let t = (s_idx as f64) / (n_samples as f64);
+                    let c_ppm = c_range.0 + t * (c_range.1 - c_range.0);
+                    let amp = synthetic_strip_intensity_at_ppm(ss, c_ppm);
+                    let norm = (amp.abs() * gain).clamp(0.0, 1.0);
+                    if norm > 0.08 {
+                        let y = c_to_y(c_ppm);
+                        let col = if amp >= 0.0 {
                             egui::Color32::from_rgba_unmultiplied(
-                                45,
+                                55,
                                 200,
                                 255,
-                                (norm * 145.0) as u8,
+                                (norm * 115.0) as u8,
                             )
                         } else {
                             egui::Color32::from_rgba_unmultiplied(
                                 255,
-                                105,
-                                95,
-                                (norm * 145.0) as u8,
+                                115,
+                                85,
+                                (norm * 115.0) as u8,
                             )
                         };
-                        let px0 = band_box.left() + band_box.width() * 0.10 + (ix as f32) * col_dx;
+                        let half_w = norm * (band_box.width() * 0.34);
                         painter.line_segment(
-                            [egui::pos2(px0, y), egui::pos2(px0 + col_dx.max(1.5), y)],
-                            egui::Stroke::new(2.0, col),
+                            [egui::pos2(cx - half_w, y), egui::pos2(cx + half_w, y)],
+                            egui::Stroke::new(1.8, col),
                         );
                     }
-                }
-            }
-        } else {
-            // Peak-only synthetic Gaussian strip profile
-            let n_samples = (band_box.height().round() as usize).clamp(24, 180);
-            for s_idx in 0..=n_samples {
-                let t = (s_idx as f64) / (n_samples as f64);
-                let c_ppm = c_range.0 + t * (c_range.1 - c_range.0);
-                let amp = synthetic_strip_intensity_at_ppm(ss, c_ppm);
-                let norm = (amp.abs() * gain).clamp(0.0, 1.0);
-                if norm > 0.08 {
-                    let y = c_to_y(c_ppm);
-                    let col = if amp >= 0.0 {
-                        egui::Color32::from_rgba_unmultiplied(55, 200, 255, (norm * 115.0) as u8)
-                    } else {
-                        egui::Color32::from_rgba_unmultiplied(255, 115, 85, (norm * 115.0) as u8)
-                    };
-                    let half_w = norm * (band_box.width() * 0.34);
-                    painter.line_segment(
-                        [egui::pos2(cx - half_w, y), egui::pos2(cx + half_w, y)],
-                        egui::Stroke::new(1.8, col),
-                    );
                 }
             }
         }
@@ -2542,6 +2685,10 @@ impl StripTilerPanel {
         &self,
         painter: &egui::Painter,
         cx: f32,
+        co_box: egui::Rect,
+        ali_box: egui::Rect,
+        co_paired: bool,
+        ali_paired: bool,
         ss_idx: usize,
         ss: &SpinSystem,
         show_co_band: bool,
@@ -2588,12 +2735,27 @@ impl StripTilerPanel {
                 continue;
             }
             let y = if is_co { co_to_y(ppm) } else { ali_to_y(ppm) };
+            let (band_box, is_paired) = if is_co {
+                (co_box, co_paired)
+            } else {
+                (ali_box, ali_paired)
+            };
             let pos = if *off == 0 {
-                let p = egui::pos2(cx - 7.0, y);
+                let px = if is_paired {
+                    band_box.left() + band_box.width() * 0.25
+                } else {
+                    cx - 7.0
+                };
+                let p = egui::pos2(px, y);
                 painter.circle_filled(p, 3.6, base_col);
                 p
             } else {
-                let p = egui::pos2(cx + 7.0, y);
+                let px = if is_paired {
+                    band_box.left() + band_box.width() * 0.75
+                } else {
+                    cx + 7.0
+                };
+                let p = egui::pos2(px, y);
                 let pts = vec![
                     egui::pos2(p.x, y - 3.8),
                     egui::pos2(p.x + 3.8, y),

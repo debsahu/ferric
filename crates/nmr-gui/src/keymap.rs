@@ -207,10 +207,10 @@ pub const SPECTRUM_ACCELERATORS: &[AcceleratorBinding] = &[
     AcceleratorBinding {
         keys_label: "oz",
         chord_pair: Some(('o', 'z')),
-        category: "Zoom & Navigation",
-        title: "Zoom Out to Full Sweep",
-        description: "Reset 2D or 1D viewport bounds to the full spectral sweep width",
-        action: WorkbenchAction::ZoomFullSweep,
+        category: "Peak Editing",
+        title: "Ornament & Peak Label Size",
+        description: "Open peak label font size and peak marker/cross size dialog (Sparky oz)",
+        action: WorkbenchAction::OpenOrnamentSizeDialog,
     },
     AcceleratorBinding {
         keys_label: "zi",
@@ -689,7 +689,8 @@ fn lookup_two_key_chord(prefix: char, second: char) -> Option<WorkbenchAction> {
     match (prefix, second) {
         // Zoom & Viewport
         ('z', 'p') => Some(WorkbenchAction::ZoomPrevious),
-        ('z', 'f') | ('z', 'e') | ('o', 'z') => Some(WorkbenchAction::ZoomFullSweep),
+        ('z', 'f') | ('z', 'e') => Some(WorkbenchAction::ZoomFullSweep),
+        ('o', 'z') => Some(WorkbenchAction::OpenOrnamentSizeDialog),
         ('z', 'i') => Some(WorkbenchAction::ZoomIn),
         ('z', 'o') => Some(WorkbenchAction::ZoomOut),
         ('z', 'm') => Some(WorkbenchAction::SelectZoomBoxMode),
