@@ -53,6 +53,10 @@ pub const MAX_MCP_UNDO_DEPTH: usize = 256;
 /// Default loopback bind address (`127.0.0.1:0`, OS-assigned ephemeral port).
 pub const DEFAULT_LOOPBACK_BIND: &str = "127.0.0.1:0";
 
+/// Preferred stable loopback TCP port (`17420`) tried first on desktop start when
+/// `bind_input == DEFAULT_LOOPBACK_BIND`, falling back to `127.0.0.1:0` if already bound.
+pub const PREFERRED_LOOPBACK_PORT: u16 = 17420;
+
 /// PNG 8-byte file signature (`\x89PNG\r\n\x1a\n`, RFC 2083 §3.1).
 pub const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -167,6 +171,26 @@ pub struct WorkbenchSnapshot {
     pub excluded_peaks: BTreeSet<usize>,
     /// Ordered 1-based residue `Seq_ID`s highlighted in the 3D structure viewer.
     pub highlighted_residues_3d: Vec<i32>,
+    /// Total residue count in the loaded target polymer sequence.
+    pub sequence_len: usize,
+    /// Labels of spectra currently loaded in the workbench.
+    pub loaded_spectra: Vec<String>,
+    /// Total picked peak count currently loaded across workbench spectra.
+    pub peak_count: usize,
+    /// Total assembled spin-system count currently in the workbench.
+    pub spin_system_count: usize,
+    /// Number of assigned residues produced by automated or curated assignment.
+    pub assigned_count: usize,
+    /// Number of high-confidence assigned residues.
+    pub high_conf_count: usize,
+    /// Current workbench status bar message.
+    pub status_msg: String,
+    /// Whether an asynchronous study-folder / spectrum ingest task is running.
+    pub ingest_in_progress: bool,
+    /// Active peak-picking backend mode (`"classical"` or `"neural"`).
+    pub picker_mode: String,
+    /// Active peak-picking minimum SNR threshold.
+    pub picker_snr: f64,
 }
 
 impl Default for WorkbenchSnapshot {
@@ -184,6 +208,16 @@ impl Default for WorkbenchSnapshot {
             assigned_residues: BTreeMap::new(),
             excluded_peaks: BTreeSet::new(),
             highlighted_residues_3d: Vec::new(),
+            sequence_len: 0,
+            loaded_spectra: Vec::new(),
+            peak_count: 0,
+            spin_system_count: 0,
+            assigned_count: 0,
+            high_conf_count: 0,
+            status_msg: String::new(),
+            ingest_in_progress: false,
+            picker_mode: "classical".to_string(),
+            picker_snr: 5.0,
         }
     }
 }
@@ -242,6 +276,16 @@ impl WorkbenchSnapshot {
             "assigned_residues": Value::Object(assigned_obj),
             "excluded_peaks": excluded,
             "highlighted_residues_3d": self.highlighted_residues_3d,
+            "sequence_len": self.sequence_len,
+            "loaded_spectra": self.loaded_spectra,
+            "peak_count": self.peak_count,
+            "spin_system_count": self.spin_system_count,
+            "assigned_count": self.assigned_count,
+            "high_conf_count": self.high_conf_count,
+            "status_msg": self.status_msg,
+            "ingest_in_progress": self.ingest_in_progress,
+            "picker_mode": self.picker_mode,
+            "picker_snr": self.picker_snr,
         })
     }
 }
@@ -269,6 +313,20 @@ pub enum McpUiCommand {
     TogglePeakExclusion { peak_id: usize, excluded: bool },
     /// Highlight 1-based residue `seq_ids` in the 3D biomolecular viewport.
     HighlightResidues3d { seq_ids: Vec<i32> },
+    /// Queue loading a study folder of NMR spectra (optionally running the full pipeline).
+    LoadStudyFolder {
+        path: String,
+        run_full_pipeline: bool,
+    },
+    /// Queue setting the target protein amino-acid sequence in the workbench.
+    SetSequence { sequence: String },
+    /// Queue peak picking across loaded spectra with optional manual or auto SNR threshold.
+    PickAllSpectra {
+        snr_threshold: Option<f64>,
+        use_auto_threshold: bool,
+    },
+    /// Queue running backbone resonance assignment (`"evo-graph"`, `"standard"`, or `"bayes-sa"`).
+    RunAssignment { solver: String },
 }
 
 impl McpUiCommand {
@@ -304,6 +362,25 @@ impl McpUiCommand {
                     seq_ids
                 )
             }
+            Self::LoadStudyFolder {
+                path,
+                run_full_pipeline,
+            } => {
+                format!("LoadStudyFolder(path={path}, run_full_pipeline={run_full_pipeline})")
+            }
+            Self::SetSequence { sequence } => {
+                format!("SetSequence(len={})", sequence.len())
+            }
+            Self::PickAllSpectra {
+                snr_threshold,
+                use_auto_threshold,
+            } => match snr_threshold {
+                Some(snr) => format!("PickAllSpectra(snr={snr:.2}, auto={use_auto_threshold})"),
+                None => format!("PickAllSpectra(snr=current, auto={use_auto_threshold})"),
+            },
+            Self::RunAssignment { solver } => {
+                format!("RunAssignment(solver={solver})")
+            }
         }
     }
 }
@@ -333,6 +410,10 @@ enum UndoDelta {
     },
     HighlightResidues3d {
         prev_highlighted: Vec<i32>,
+    },
+    WorkflowAction {
+        prev_status_msg: String,
+        prev_picker_snr: f64,
     },
 }
 
@@ -599,6 +680,63 @@ impl McpUndoLog {
                     std::mem::replace(&mut snapshot.highlighted_residues_3d, seq_ids.clone());
                 UndoDelta::HighlightResidues3d { prev_highlighted }
             }
+            McpUiCommand::LoadStudyFolder {
+                path,
+                run_full_pipeline,
+            } => {
+                let prev_status_msg = std::mem::replace(
+                    &mut snapshot.status_msg,
+                    format!("Queued study folder load: {path} (full_pipeline={run_full_pipeline})"),
+                );
+                UndoDelta::WorkflowAction {
+                    prev_status_msg,
+                    prev_picker_snr: snapshot.picker_snr,
+                }
+            }
+            McpUiCommand::SetSequence { sequence } => {
+                let prev_status_msg = std::mem::replace(
+                    &mut snapshot.status_msg,
+                    format!("Queued sequence update ({} chars)", sequence.len()),
+                );
+                UndoDelta::WorkflowAction {
+                    prev_status_msg,
+                    prev_picker_snr: snapshot.picker_snr,
+                }
+            }
+            McpUiCommand::PickAllSpectra {
+                snr_threshold,
+                use_auto_threshold,
+            } => {
+                let prev_picker_snr = snapshot.picker_snr;
+                if let Some(snr) = snr_threshold {
+                    if !*use_auto_threshold && snr.is_finite() && *snr > 0.0 {
+                        snapshot.picker_snr = *snr;
+                    }
+                }
+                let prev_status_msg = std::mem::replace(
+                    &mut snapshot.status_msg,
+                    match snr_threshold {
+                        Some(snr) => {
+                            format!("Queued peak picking (snr={snr:.2}, auto={use_auto_threshold})")
+                        }
+                        None => format!("Queued peak picking (auto={use_auto_threshold})"),
+                    },
+                );
+                UndoDelta::WorkflowAction {
+                    prev_status_msg,
+                    prev_picker_snr,
+                }
+            }
+            McpUiCommand::RunAssignment { solver } => {
+                let prev_status_msg = std::mem::replace(
+                    &mut snapshot.status_msg,
+                    format!("Queued assignment run (solver={solver})"),
+                );
+                UndoDelta::WorkflowAction {
+                    prev_status_msg,
+                    prev_picker_snr: snapshot.picker_snr,
+                }
+            }
         }
     }
 
@@ -655,6 +793,13 @@ impl McpUndoLog {
             }
             UndoDelta::HighlightResidues3d { prev_highlighted } => {
                 snapshot.highlighted_residues_3d = prev_highlighted.clone();
+            }
+            UndoDelta::WorkflowAction {
+                prev_status_msg,
+                prev_picker_snr,
+            } => {
+                snapshot.status_msg = prev_status_msg.clone();
+                snapshot.picker_snr = *prev_picker_snr;
             }
         }
     }
@@ -1277,7 +1422,7 @@ fn mcp_tool_schemas_json() -> Value {
     json!([
         {
             "name": "get_workbench_state",
-            "description": "Inspect live nmr-gui workbench state (active_residue_seq, crosshair_ppm, active_experiment, strip_candidates, selected_pdb_chain_res, undo_depth, redo_depth, qc_status, assigned_residues, excluded_peaks, highlighted_residues_3d).",
+            "description": "Inspect live nmr-gui workbench state (active_residue_seq, crosshair_ppm, active_experiment, strip_candidates, selected_pdb_chain_res, undo_depth, redo_depth, qc_status, assigned_residues, excluded_peaks, highlighted_residues_3d, sequence_len, loaded_spectra, peak_count, spin_system_count, assigned_count, high_conf_count, status_msg, ingest_in_progress, picker_mode, picker_snr).",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -1349,6 +1494,29 @@ fn mcp_tool_schemas_json() -> Value {
                         "enum": ["active", "contour_2d", "strip_3d", "mol3d"]
                     }
                 }
+            }
+        },
+        {
+            "name": "run_workbench_workflow",
+            "description": "Queue an interactive desktop workbench workflow (`load_study_folder`, `set_sequence`, `pick_peaks`, or `run_assignment`). Requires ReadWrite permission.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["load_study_folder", "set_sequence", "pick_peaks", "run_assignment"]
+                    },
+                    "path": { "type": "string" },
+                    "run_full_pipeline": { "type": "boolean" },
+                    "sequence": { "type": "string" },
+                    "snr_threshold": { "type": "number" },
+                    "auto_threshold": { "type": "boolean" },
+                    "solver": {
+                        "type": "string",
+                        "enum": ["evo-graph", "standard", "bayes-sa"]
+                    }
+                },
+                "required": ["action"]
             }
         }
     ])
@@ -1508,6 +1676,90 @@ fn parse_curation_command(args: &Value) -> Result<McpUiCommand, String> {
             Ok(McpUiCommand::TogglePeakExclusion { peak_id, excluded })
         }
         other => Err(format!("unknown propose_curation_edit action '{other}'")),
+    }
+}
+
+fn parse_optional_bool(args: &Value, key: &str, default: bool) -> Result<bool, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| format!("'{key}' must be a boolean")),
+    }
+}
+
+fn parse_workflow_command(args: &Value) -> Result<(&'static str, McpUiCommand), String> {
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    match action {
+        "load_study_folder" => {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.contains('\0'))
+                .ok_or_else(|| "load_study_folder requires non-empty string 'path'".to_string())?
+                .to_string();
+            let run_full_pipeline = parse_optional_bool(args, "run_full_pipeline", false)?;
+            Ok((
+                "load_study_folder",
+                McpUiCommand::LoadStudyFolder {
+                    path,
+                    run_full_pipeline,
+                },
+            ))
+        }
+        "set_sequence" => {
+            let sequence = args
+                .get("sequence")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.contains('\0'))
+                .ok_or_else(|| "set_sequence requires non-empty string 'sequence'".to_string())?
+                .to_string();
+            Ok(("set_sequence", McpUiCommand::SetSequence { sequence }))
+        }
+        "pick_peaks" => {
+            let snr_threshold = match args.get("snr_threshold") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_f64()
+                        .filter(|s| s.is_finite() && *s > 0.0)
+                        .ok_or_else(|| {
+                            "'snr_threshold' must be a finite positive number or null".to_string()
+                        })?,
+                ),
+            };
+            let use_auto_threshold = parse_optional_bool(args, "auto_threshold", false)?;
+            Ok((
+                "pick_peaks",
+                McpUiCommand::PickAllSpectra {
+                    snr_threshold,
+                    use_auto_threshold,
+                },
+            ))
+        }
+        "run_assignment" => {
+            let solver = match args.get("solver") {
+                None | Some(Value::Null) => "evo-graph".to_string(),
+                Some(v) => {
+                    let s = v.as_str().map(str::trim).ok_or_else(|| {
+                        "'solver' must be one of 'evo-graph', 'standard', 'bayes-sa'".to_string()
+                    })?;
+                    if !matches!(s, "evo-graph" | "standard" | "bayes-sa") {
+                        return Err(format!(
+                            "unknown solver '{s}'; expected one of 'evo-graph', 'standard', 'bayes-sa'"
+                        ));
+                    }
+                    s.to_string()
+                }
+            };
+            Ok(("run_assignment", McpUiCommand::RunAssignment { solver }))
+        }
+        other => Err(format!("unknown run_workbench_workflow action '{other}'")),
     }
 }
 
@@ -1782,6 +2034,48 @@ fn dispatch_mcp_jsonrpc_with_permission(
                             ],
                             "isError": false,
                         }),
+                    ))
+                }
+                "run_workbench_workflow" => {
+                    let (action_name, cmd) = match parse_workflow_command(&args) {
+                        Ok(parsed) => parsed,
+                        Err(msg) => return Some(jsonrpc_err(id, -32602, msg)),
+                    };
+                    if effective_permission == McpBridgePermission::ReadOnly {
+                        inner.undo_log.record_blocked_readonly(format!(
+                            "run_workbench_workflow: {}",
+                            cmd.summary()
+                        ));
+                        return Some(jsonrpc_ok(
+                            id,
+                            mcp_text_result(
+                                json!({
+                                    "status": "denied",
+                                    "queued": false,
+                                    "action": action_name,
+                                    "permission": effective_permission.as_str(),
+                                    "reason": "MCP bridge is in ReadOnly mode; switch UI panel to ReadWrite to permit workflow execution.",
+                                }),
+                                true,
+                            ),
+                        ));
+                    }
+                    let summary = cmd.summary();
+                    let action_id = inner.undo_log.apply_command(&mut inner.snapshot, cmd);
+                    Some(jsonrpc_ok(
+                        id,
+                        mcp_text_result(
+                            json!({
+                                "queued": true,
+                                "action": action_name,
+                                "permission": effective_permission.as_str(),
+                                "action_id": action_id,
+                                "summary": summary,
+                                "undo_depth": inner.snapshot.undo_depth,
+                                "redo_depth": inner.snapshot.redo_depth,
+                            }),
+                            false,
+                        ),
                     ))
                 }
                 unknown => Some(jsonrpc_err(
@@ -2196,6 +2490,39 @@ impl McpBridgeController {
         }
     }
 
+    /// Start the authenticated loopback HTTP bridge, trying [`PREFERRED_LOOPBACK_PORT`] (`17420`)
+    /// first when [`Self::bind_input`] equals [`DEFAULT_LOOPBACK_BIND`] (`"127.0.0.1:0"`), and
+    /// silently falling back to `"127.0.0.1:0"` if port `17420` is already bound.
+    ///
+    /// Preserves custom user-edited `bind_input` values verbatim without fallback. On `wasm32`,
+    /// delegates cleanly to [`Self::start_bridge`].
+    pub fn start_bridge_preferred(&mut self) -> Result<String, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let target = self.bind_input.trim().to_string();
+            if target == DEFAULT_LOOPBACK_BIND {
+                let preferred = format!("127.0.0.1:{PREFERRED_LOOPBACK_PORT}");
+                match self.start_bridge(&preferred) {
+                    Ok(addr) => Ok(addr),
+                    Err(preferred_err) => {
+                        if preferred_err.contains("OS CSPRNG") {
+                            Err(preferred_err)
+                        } else {
+                            self.start_bridge(DEFAULT_LOOPBACK_BIND)
+                        }
+                    }
+                }
+            } else {
+                self.start_bridge(&target)
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let target = self.bind_input.clone();
+            self.start_bridge(&target)
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn start_bridge_with_entropy(
         &mut self,
@@ -2465,8 +2792,7 @@ pub fn render_mcp_bridge_panel(
                 ui.label("Bind:");
                 ui.add(egui::TextEdit::singleline(&mut controller.bind_input).desired_width(130.0));
                 if ui.button("Start Local Bridge").clicked() {
-                    let target = controller.bind_input.clone();
-                    if let Err(err) = controller.start_bridge(&target) {
+                    if let Err(err) = controller.start_bridge_preferred() {
                         controller.status_banner = format!("Start failed: {err}");
                     }
                 }
@@ -2877,6 +3203,7 @@ mod tests {
             assigned_residues: BTreeMap::new(),
             excluded_peaks: BTreeSet::new(),
             highlighted_residues_3d: vec![5],
+            ..WorkbenchSnapshot::default()
         };
         let mut log = McpUndoLog::new();
         let s0 = snap.clone();
@@ -3252,6 +3579,7 @@ mod tests {
             assigned_residues: BTreeMap::new(),
             excluded_peaks: BTreeSet::new(),
             highlighted_residues_3d: vec![3],
+            ..WorkbenchSnapshot::default()
         };
 
         let mut ctrl = McpBridgeController::new(initial.clone());
@@ -3320,7 +3648,8 @@ mod tests {
                 "navigate_workbench",
                 "propose_curation_edit",
                 "undo_last_ai_edit",
-                "capture_viewport_png"
+                "capture_viewport_png",
+                "run_workbench_workflow"
             ]
         );
 
@@ -3539,5 +3868,368 @@ mod tests {
             assert!(!resp.copied_config);
         });
         out.textures_delta.clear();
+    }
+
+    #[test]
+    fn test_enriched_workbench_snapshot_defaults_and_get_workbench_state() {
+        let def = WorkbenchSnapshot::default();
+        assert_eq!(def.sequence_len, 0);
+        assert!(def.loaded_spectra.is_empty());
+        assert_eq!(def.peak_count, 0);
+        assert_eq!(def.spin_system_count, 0);
+        assert_eq!(def.assigned_count, 0);
+        assert_eq!(def.high_conf_count, 0);
+        assert!(def.status_msg.is_empty());
+        assert!(!def.ingest_in_progress);
+        assert_eq!(def.picker_mode, "classical");
+        assert!((def.picker_snr - 5.0).abs() < 1e-12);
+
+        let populated = WorkbenchSnapshot {
+            sequence_len: 76,
+            loaded_spectra: vec!["15N-HSQC".to_string(), "HNCACB".to_string()],
+            peak_count: 142,
+            spin_system_count: 68,
+            assigned_count: 61,
+            high_conf_count: 54,
+            status_msg: "Assigned 61/76 residues".to_string(),
+            ingest_in_progress: true,
+            picker_mode: "neural".to_string(),
+            picker_snr: 8.5,
+            ..WorkbenchSnapshot::default()
+        };
+        let ctrl = McpBridgeController::new(populated);
+        let resp = ctrl
+            .handle_jsonrpc_bytes(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_workbench_state","arguments":{}}}"#,
+            )
+            .expect("get_workbench_state response");
+        assert_eq!(resp["result"]["isError"], false);
+        let state: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("valid JSON text");
+        assert_eq!(state["sequence_len"], 76);
+        assert_eq!(state["loaded_spectra"], json!(["15N-HSQC", "HNCACB"]));
+        assert_eq!(state["peak_count"], 142);
+        assert_eq!(state["spin_system_count"], 68);
+        assert_eq!(state["assigned_count"], 61);
+        assert_eq!(state["high_conf_count"], 54);
+        assert_eq!(state["status_msg"], "Assigned 61/76 residues");
+        assert_eq!(state["ingest_in_progress"], true);
+        assert_eq!(state["picker_mode"], "neural");
+        assert_eq!(state["picker_snr"], 8.5);
+        assert_eq!(state["permission"], "read_only");
+    }
+
+    #[test]
+    fn test_run_workbench_workflow_readonly_refusal_validation_and_readwrite_queueing() {
+        let ctrl = McpBridgeController::default();
+
+        // 1. tools/list exposes run_workbench_workflow with expected schema
+        let list_resp = ctrl
+            .handle_jsonrpc_bytes(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+            .expect("tools/list response");
+        let tools = list_resp["result"]["tools"].as_array().unwrap();
+        let wf_tool = tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some("run_workbench_workflow"))
+            .expect("run_workbench_workflow in tools/list");
+        assert_eq!(wf_tool["inputSchema"]["required"], json!(["action"]));
+        assert_eq!(
+            wf_tool["inputSchema"]["properties"]["action"]["enum"],
+            json!([
+                "load_study_folder",
+                "set_sequence",
+                "pick_peaks",
+                "run_assignment"
+            ])
+        );
+        assert_eq!(
+            wf_tool["inputSchema"]["properties"]["solver"]["enum"],
+            json!(["evo-graph", "standard", "bayes-sa"])
+        );
+
+        // 2. ReadOnly mode refuses workflow commands and records BlockedReadOnly audit
+        assert_eq!(ctrl.permission(), McpBridgePermission::ReadOnly);
+        for args in [
+            json!({ "action": "load_study_folder", "path": "/tmp/study" }),
+            json!({ "action": "set_sequence", "sequence": "MQIFVK" }),
+            json!({ "action": "pick_peaks", "snr_threshold": 6.5 }),
+            json!({ "action": "run_assignment", "solver": "evo-graph" }),
+        ] {
+            let req = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_workbench_workflow",
+                    "arguments": args,
+                }
+            }))
+            .unwrap();
+            let ro_resp = ctrl.handle_jsonrpc_bytes(&req).unwrap();
+            assert_eq!(ro_resp["result"]["isError"], true);
+            let ro_payload: Value =
+                serde_json::from_str(ro_resp["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(ro_payload["queued"], false);
+            assert_eq!(ro_payload["status"], "denied");
+            assert_eq!(ro_payload["permission"], "read_only");
+        }
+        assert!(ctrl.drain_pending_ui_commands().is_empty());
+        {
+            let guard = ctrl.shared.lock().unwrap();
+            assert_eq!(guard.undo_log.audit_records().len(), 4);
+            assert!(guard
+                .undo_log
+                .audit_records()
+                .iter()
+                .all(|r| r.outcome == McpAuditOutcome::BlockedReadOnly));
+        }
+
+        // 3. Invalid arguments return JSON-RPC -32602 even in ReadWrite mode
+        ctrl.set_permission(McpBridgePermission::ReadWrite);
+        for bad_args in [
+            json!({ "action": "unknown_action" }),
+            json!({ "action": "load_study_folder", "path": "   " }),
+            json!({ "action": "load_study_folder", "path": "/tmp/s", "run_full_pipeline": "yes" }),
+            json!({ "action": "set_sequence", "sequence": "" }),
+            json!({ "action": "pick_peaks", "snr_threshold": -1.0 }),
+            json!({ "action": "pick_peaks", "auto_threshold": "true" }),
+            json!({ "action": "run_assignment", "solver": "invalid-solver" }),
+        ] {
+            let req = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_workbench_workflow",
+                    "arguments": bad_args,
+                }
+            }))
+            .unwrap();
+            let err_resp = ctrl.handle_jsonrpc_bytes(&req).unwrap();
+            assert_eq!(err_resp["error"]["code"], -32602, "bad_args: {bad_args}");
+        }
+
+        // 4. X-Nmr-Access-Mode read-only override still blocks workflow execution
+        {
+            let req = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_workbench_workflow",
+                    "arguments": { "action": "run_assignment", "solver": "standard" }
+                }
+            }))
+            .unwrap();
+            let mut guard = ctrl.shared.lock().unwrap();
+            let ov_resp = dispatch_mcp_jsonrpc_with_permission(
+                &mut guard,
+                &req,
+                Some(McpBridgePermission::ReadOnly),
+            )
+            .unwrap();
+            assert_eq!(ov_resp["result"]["isError"], true);
+            assert_eq!(
+                guard.undo_log.audit_records().back().unwrap().outcome,
+                McpAuditOutcome::BlockedReadOnly
+            );
+        }
+        assert!(ctrl.drain_pending_ui_commands().is_empty());
+
+        // 5. ReadWrite mode queues all 4 workflow commands + curation undo compatibility
+        let _ = ctrl.apply_ui_command(McpUiCommand::AssignSpinSystemToResidue {
+            cluster_id: 2,
+            seq_id: 14,
+            reason: "Anchor check".to_string(),
+        });
+        let _ = ctrl.drain_pending_ui_commands();
+
+        let valid_calls = [
+            (
+                "load_study_folder",
+                json!({
+                    "action": "load_study_folder",
+                    "path": "/tmp/ubq_study",
+                    "run_full_pipeline": true
+                }),
+            ),
+            (
+                "set_sequence",
+                json!({
+                    "action": "set_sequence",
+                    "sequence": "MQIFVKTLTG"
+                }),
+            ),
+            (
+                "pick_peaks",
+                json!({
+                    "action": "pick_peaks",
+                    "snr_threshold": 7.5,
+                    "auto_threshold": false
+                }),
+            ),
+            (
+                "pick_peaks",
+                json!({
+                    "action": "pick_peaks",
+                    "auto_threshold": true
+                }),
+            ),
+            (
+                "run_assignment",
+                json!({
+                    "action": "run_assignment",
+                    "solver": "bayes-sa"
+                }),
+            ),
+            (
+                "run_assignment",
+                json!({
+                    "action": "run_assignment"
+                }),
+            ),
+        ];
+
+        for (idx, (expected_action, args)) in valid_calls.iter().enumerate() {
+            let req = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 100 + idx,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_workbench_workflow",
+                    "arguments": args
+                }
+            }))
+            .unwrap();
+            let resp = ctrl.handle_jsonrpc_bytes(&req).unwrap();
+            assert_eq!(resp["result"]["isError"], false);
+            let payload: Value =
+                serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(payload["queued"], true);
+            assert_eq!(payload["action"], *expected_action);
+            assert_eq!(payload["permission"], "read_write");
+        }
+
+        let queued = ctrl.drain_pending_ui_commands();
+        assert_eq!(
+            queued,
+            vec![
+                McpUiCommand::LoadStudyFolder {
+                    path: "/tmp/ubq_study".to_string(),
+                    run_full_pipeline: true,
+                },
+                McpUiCommand::SetSequence {
+                    sequence: "MQIFVKTLTG".to_string(),
+                },
+                McpUiCommand::PickAllSpectra {
+                    snr_threshold: Some(7.5),
+                    use_auto_threshold: false,
+                },
+                McpUiCommand::PickAllSpectra {
+                    snr_threshold: None,
+                    use_auto_threshold: true,
+                },
+                McpUiCommand::RunAssignment {
+                    solver: "bayes-sa".to_string(),
+                },
+                McpUiCommand::RunAssignment {
+                    solver: "evo-graph".to_string(),
+                },
+            ]
+        );
+        assert!((ctrl.snapshot().picker_snr - 7.5).abs() < 1e-12);
+
+        // Undo across all 6 workflow commands + earlier AssignSpinSystemToResidue cleanly
+        for _ in 0..6 {
+            assert!(ctrl.undo_last().is_some());
+        }
+        assert!((ctrl.snapshot().picker_snr - 5.0).abs() < 1e-12);
+        assert_eq!(ctrl.snapshot().assigned_residues[&14].cluster_id, 2);
+        let reverted_assign = ctrl.undo_last().expect("undo prior assign");
+        assert!(matches!(
+            reverted_assign,
+            McpUiCommand::AssignSpinSystemToResidue { seq_id: 14, .. }
+        ));
+        assert!(ctrl.snapshot().assigned_residues.is_empty());
+        assert!(ctrl.redo_last().is_some());
+        assert_eq!(ctrl.snapshot().assigned_residues[&14].cluster_id, 2);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_start_bridge_preferred_port_and_ephemeral_fallback() {
+        // 1. Custom bind_input values are preserved verbatim without silent :0 fallback
+        let busy_ephemeral = TcpListener::bind("127.0.0.1:0").expect("bind dummy ephemeral port");
+        let busy_addr_str = busy_ephemeral.local_addr().unwrap().to_string();
+        let mut custom_ctrl = McpBridgeController::default();
+        custom_ctrl.bind_input = busy_addr_str.clone();
+        assert!(custom_ctrl.start_bridge_preferred().is_err());
+        assert_eq!(custom_ctrl.bind_input, busy_addr_str);
+        assert!(!custom_ctrl.is_running());
+
+        custom_ctrl.bind_input = "0.0.0.0:17420".to_string();
+        assert!(custom_ctrl.start_bridge_preferred().is_err());
+        assert_eq!(custom_ctrl.bind_input, "0.0.0.0:17420");
+        drop(busy_ephemeral);
+
+        // 2. When 17420 is held, start_bridge_preferred falls back silently to an ephemeral port
+        let preferred_addr = SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            PREFERRED_LOOPBACK_PORT,
+        ));
+        match TcpListener::bind(preferred_addr) {
+            Ok(holder) => {
+                let mut fallback_ctrl = McpBridgeController::default();
+                let fb_addr = fallback_ctrl
+                    .start_bridge_preferred()
+                    .expect("fallback to ephemeral port while 17420 is held");
+                assert!(fallback_ctrl.is_running());
+                assert_ne!(
+                    fb_addr,
+                    format!("127.0.0.1:{PREFERRED_LOOPBACK_PORT}"),
+                    "must use ephemeral port when 17420 is held"
+                );
+                assert_eq!(fallback_ctrl.bind_input, DEFAULT_LOOPBACK_BIND);
+                fallback_ctrl.stop_bridge();
+                drop(holder);
+
+                // 3. Once 17420 is free, start_bridge_preferred claims 17420; a second controller
+                //    concurrently falls back to a distinct ephemeral port
+                let mut primary_ctrl = McpBridgeController::default();
+                let prim_addr = primary_ctrl
+                    .start_bridge_preferred()
+                    .expect("bind preferred port 17420 when free");
+                assert_eq!(prim_addr, format!("127.0.0.1:{PREFERRED_LOOPBACK_PORT}"));
+                assert_eq!(
+                    primary_ctrl.endpoint_url(),
+                    format!("http://127.0.0.1:{PREFERRED_LOOPBACK_PORT}/mcp")
+                );
+                assert_eq!(primary_ctrl.bind_input, DEFAULT_LOOPBACK_BIND);
+
+                let mut second_ctrl = McpBridgeController::default();
+                let sec_addr = second_ctrl
+                    .start_bridge_preferred()
+                    .expect("second bridge falls back to ephemeral port");
+                assert_ne!(sec_addr, prim_addr);
+                assert!(second_ctrl.is_running());
+
+                second_ctrl.stop_bridge();
+                primary_ctrl.stop_bridge();
+            }
+            Err(_) => {
+                // External process on the host already holds 17420; verify fallback still succeeds
+                let mut fallback_ctrl = McpBridgeController::default();
+                let fb_addr = fallback_ctrl
+                    .start_bridge_preferred()
+                    .expect("fallback to ephemeral port when 17420 is externally held");
+                assert!(fallback_ctrl.is_running());
+                assert_ne!(fb_addr, format!("127.0.0.1:{PREFERRED_LOOPBACK_PORT}"));
+                assert_eq!(fallback_ctrl.bind_input, DEFAULT_LOOPBACK_BIND);
+                fallback_ctrl.stop_bridge();
+            }
+        }
     }
 }
