@@ -50,9 +50,14 @@ Or download pre-built packages directly from [**GitHub Releases**](https://githu
 - **Linux `i686` (32-bit static musl CLI)**: `.rpm`, `.deb`, & `.tar.gz`
 - **Windows `x86_64`**: `.zip` (`ferric-gui.exe` + `ferric.exe`)
 
-Or build from source:
+Or install directly with **Cargo** (from Git) or build from a local clone:
 
 ```bash
+# Install the ferric CLI (and optionally ferric-gui) directly via Cargo
+cargo install --git https://github.com/debsahu/ferric --tag v0.17.1 nmr-cli
+cargo install --git https://github.com/debsahu/ferric --tag v0.17.1 nmr-gui
+
+# Or run from a local checkout
 cargo run --release -p nmr-gui --bin ferric-gui
 ```
 
