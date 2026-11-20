@@ -8,6 +8,7 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ### Native OS Clipboard, Auto-SNR Classical Peak Picking, Async 3D Ingest & Full-Control MCP Live Workbench Bridge
 
+- **Verification & Benchmark Gates**: Full workspace release suite (`121` suites, `1,049 passed, 0 failed, 7 ignored`), `fmt`, `clippy --workspace --all-targets -- -D warnings`, `wasm32-unknown-unknown`, docs/CLI-flags (`1005` flags, `44` subcommands)/manual (`11` pages)/p17 (`8/8`), `0`-byte protected diff on `docs/specs/03-assignment.md` & `.github/workflows/docs.yml`, Ubiquitin 5-seed `--realistic` (`evo-graph` CPU `acc=98.4%`, `rec=90.8%`, `HC_prec=98.4% (310/315)`; `standard` CPU `acc=90.0%`, `rec=72.5%`, `HC_prec=97.1% (170/175)`; `standard` WebGPU Apple M5 Pro `acc=88.4%`, `rec=70.2%`, `HC_prec=95.8% (181/189)`), and CISD3 (`BMRB 51439`) 5-seed evaluation (`standard` CPU mean `acc=53.33%`; `evo-graph` mean `acc=55.43%`, `rec=38.04%`, `HC_prec=100.00%`).
 - **Native OS Clipboard & FASTA Paste Fix (`Cargo.toml`, `Cargo.lock`, `THIRD_PARTY.md`, `crates/nmr-gui/src/mcp_bridge.rs`)**:
   - Enabled the `eframe/clipboard` feature (`arboard` / `smithay-clipboard`, MIT) so `Copy MCP Config`, `Copy TSV`, and pasting FASTA/NMR-STAR/NEF text work natively across macOS, Linux, and Windows instead of staying in `egui`'s in-memory fallback buffer.
   - Added MCP Streamable HTTP `2025-03-26` / `2025-06-18` protocol version negotiation on `initialize` and a collapsible `Show JSON` selectable config preview in the MCP Live Workbench Bridge panel.

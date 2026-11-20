@@ -21911,7 +21911,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 .expect("inspect_workbench_data text");
             let val: serde_json::Value = serde_json::from_str(txt).expect("valid inspect json");
             assert!(
-                !val["items"].as_array().map_or(true, |a| a.is_empty()),
+                !val["items"].as_array().is_none_or(|a| a.is_empty()),
                 "section '{section}' must return non-empty items: {val}"
             );
         }

@@ -25,7 +25,7 @@
 
 ## 2. Key Transitive Workspace Crates (`Cargo.lock` Audit)
 
-All 327 resolved packages in `Cargo.lock` were audited via `cargo metadata --format-version 1`. Zero `GPL-only`, `AGPL`, `LGPL-only`, or `MPL-2.0` crates are present.
+All 333 resolved packages (329 external crates) in `Cargo.lock` were audited via `cargo metadata --format-version 1`. Zero `GPL-only`, `AGPL`, `LGPL-only`, or `MPL-2.0` crates are present.
 
 | Crate Family | Version(s) | SPDX Licence | Notes |
 | :--- | :--- | :--- | :--- |
