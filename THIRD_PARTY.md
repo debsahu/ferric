@@ -30,6 +30,7 @@ All 327 resolved packages in `Cargo.lock` were audited via `cargo metadata --for
 | Crate Family | Version(s) | SPDX Licence | Notes |
 | :--- | :--- | :--- | :--- |
 | `egui`, `egui-wgpu`, `egui-winit`, `epaint`, `emath`, `ecolor` | `0.37.0` | `MIT OR Apache-2.0` | Immediate-mode GUI layout, vector tessellation, and `wgpu` render pass integration |
+| `arboard`, `smithay-clipboard`, `wl-clipboard-rs` | `3.7` / `0.7` / `0.9` | `MIT OR Apache-2.0` / `MIT` | Cross-platform desktop OS clipboard support enabled via `eframe`'s `clipboard` feature (`arboard` on macOS/Windows/X11/Wayland + `smithay-clipboard` on Linux Wayland) |
 | `wgpu-core`, `wgpu-hal`, `wgpu-types`, `naga` | `30.0.1` | `MIT OR Apache-2.0` | WebGPU validation layer, Metal/Vulkan/DX12/GLES HAL backends, and WGSL shader compiler |
 | `winit`, `raw-window-handle`, `cursor-icon` | `0.30` / `0.6` / `1.2` | `Apache-2.0` / `MIT OR Apache-2.0 OR Zlib` | Cross-platform desktop windowing & input events |
 | `js-sys`, `web-time` | `0.3.107` / `1.1.0` | `MIT OR Apache-2.0` | WebAssembly JS standard objects and browser time bindings |

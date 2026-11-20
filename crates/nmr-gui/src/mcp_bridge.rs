@@ -1570,19 +1570,26 @@ fn dispatch_mcp_jsonrpc_with_permission(
     let params = obj.get("params").cloned().unwrap_or_else(|| json!({}));
 
     match method {
-        "initialize" => Some(jsonrpc_ok(
-            id,
-            json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {
-                    "tools": { "listChanged": false }
-                },
-                "serverInfo": {
-                    "name": "ferric-gui-mcp-bridge",
-                    "version": nmr_core::VERSION,
-                }
-            }),
-        )),
+        "initialize" => {
+            let negotiated_version = params
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .filter(|v| nmr_core::mcp::SUPPORTED_MCP_PROTOCOL_VERSIONS.contains(v))
+                .unwrap_or(MCP_PROTOCOL_VERSION);
+            Some(jsonrpc_ok(
+                id,
+                json!({
+                    "protocolVersion": negotiated_version,
+                    "capabilities": {
+                        "tools": { "listChanged": false }
+                    },
+                    "serverInfo": {
+                        "name": "ferric-gui-mcp-bridge",
+                        "version": nmr_core::VERSION,
+                    }
+                }),
+            ))
+        }
         "ping" => Some(jsonrpc_ok(id, json!({}))),
         "tools/list" => Some(jsonrpc_ok(id, json!({ "tools": mcp_tool_schemas_json() }))),
         "tools/call" => {
@@ -2108,6 +2115,8 @@ pub struct McpBridgeController {
     pub selected_client: McpClientTarget,
     /// Whether the full bearer token is temporarily revealed in the UI panel.
     pub reveal_token: bool,
+    /// Whether the raw client MCP JSON config preview drawer is shown in the UI panel.
+    pub show_config_json: bool,
     /// Last informational or error banner message displayed in the panel.
     pub status_banner: String,
 }
@@ -2132,6 +2141,7 @@ impl McpBridgeController {
             bind_input: DEFAULT_LOOPBACK_BIND.to_string(),
             selected_client: McpClientTarget::Antigravity,
             reveal_token: false,
+            show_config_json: false,
             status_banner: String::new(),
         }
     }
@@ -2559,7 +2569,30 @@ pub fn render_mcp_bridge_panel(
             );
             response.copied_config = true;
         }
+        let toggle_label = if controller.show_config_json {
+            "Hide JSON"
+        } else {
+            "Show JSON"
+        };
+        if ui.small_button(toggle_label).clicked() {
+            controller.show_config_json = !controller.show_config_json;
+        }
     });
+
+    if controller.show_config_json {
+        let cfg_json = controller.build_client_config_json();
+        let mut preview = cfg_json.as_str();
+        egui::ScrollArea::vertical()
+            .id_salt("mcp_bridge_config_json_scroll")
+            .max_height(140.0)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut preview)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY),
+                );
+            });
+    }
 
     if !controller.status_banner.is_empty() {
         ui.small(&controller.status_banner);
@@ -3465,5 +3498,46 @@ mod tests {
 
         ctrl.stop_bridge();
         assert!(!ctrl.is_running());
+    }
+
+    #[test]
+    fn test_protocol_version_negotiation_and_show_config_json_preview() {
+        let mut ctrl = McpBridgeController::default();
+
+        // Requested supported version 2025-03-26 is echoed verbatim
+        let init_2025 = ctrl
+            .handle_jsonrpc_bytes(
+                br#"{"jsonrpc":"2.0","id":10,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#,
+            )
+            .expect("initialize response");
+        assert_eq!(init_2025["result"]["protocolVersion"], "2025-03-26");
+
+        // Legacy supported version 2024-11-05 is echoed verbatim
+        let init_2024 = ctrl
+            .handle_jsonrpc_bytes(
+                br#"{"jsonrpc":"2.0","id":11,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#,
+            )
+            .expect("initialize response");
+        assert_eq!(init_2024["result"]["protocolVersion"], "2024-11-05");
+
+        // Unsupported version falls back safely to default MCP_PROTOCOL_VERSION
+        let init_unknown = ctrl
+            .handle_jsonrpc_bytes(
+                br#"{"jsonrpc":"2.0","id":12,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}"#,
+            )
+            .expect("initialize response");
+        assert_eq!(
+            init_unknown["result"]["protocolVersion"],
+            MCP_PROTOCOL_VERSION
+        );
+
+        // Headless egui renders cleanly with Show JSON preview toggled open
+        ctrl.show_config_json = true;
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let resp = render_mcp_bridge_panel(ui, &mut ctrl);
+            assert!(!resp.copied_config);
+        });
+        out.textures_delta.clear();
     }
 }
