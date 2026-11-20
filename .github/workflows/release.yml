@@ -32,6 +32,12 @@ jobs:
             artifact_paths: |
               dist/*.dmg
               dist/*.tar.gz
+          - platform: macos-x86_64
+            os: macos-latest
+            rust_target: x86_64-apple-darwin
+            artifact_paths: |
+              dist/*.dmg
+              dist/*.tar.gz
           - platform: windows-x86_64
             os: windows-latest
             rust_target: x86_64-pc-windows-msvc
@@ -42,27 +48,44 @@ jobs:
             rust_target: x86_64-unknown-linux-gnu
             artifact_paths: |
               dist/*.tar.gz
+              dist/*.deb
+              dist/*.rpm
+          - platform: linux-i686-cli
+            os: ubuntu-22.04
+            rust_target: i686-unknown-linux-musl
+            artifact_paths: |
+              dist/*.tar.gz
+              dist/*.deb
+              dist/*.rpm
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Linux X11, Wayland & Vulkan GUI build dependencies
+      - name: Install Linux x86_64 packaging & verification tools (rpmbuild, objdump)
         if: matrix.platform == 'linux-x86_64'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config \
-            libx11-dev \
-            libxcb-render0-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libxkbcommon-dev \
-            libwayland-dev \
-            libvulkan-dev \
-            libgl1-mesa-dev
+            binutils \
+            dpkg \
+            file \
+            rpm
+
+      - name: Install Linux i686 static musl cross-compile & packaging tools
+        if: matrix.platform == 'linux-i686-cli'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils \
+            dpkg \
+            file \
+            gcc-multilib \
+            musl-tools \
+            rpm
 
       - name: Activate stable Rust toolchain (${{ matrix.rust_target }})
+        if: matrix.platform != 'linux-x86_64'
         shell: bash
         run: |
           set -euo pipefail
@@ -112,59 +135,166 @@ jobs:
           fi
           "$PY_BIN" scripts/package_release.py --self-test
 
-      - name: Build workspace release binaries (ferric and ferric-gui)
-        run: cargo build --release --workspace --bins
+      - name: Build macOS release binaries (${{ matrix.rust_target }})
+        if: matrix.platform == 'macos-arm64' || matrix.platform == 'macos-x86_64'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+        run: cargo build --release --locked --workspace --bins --target "${{ matrix.rust_target }}"
+
+      - name: Build Windows x86_64 release binaries (ferric and ferric-gui)
+        if: matrix.platform == 'windows-x86_64'
+        run: cargo build --release --locked --workspace --bins --target "${{ matrix.rust_target }}"
+
+      - name: Build Linux x86_64 release binaries in AlmaLinux 9 (RHEL 9.x glibc 2.34)
+        if: matrix.platform == 'linux-x86_64'
+        run: |
+          set -euo pipefail
+          HOST_UID="$(id -u)"
+          HOST_GID="$(id -g)"
+          mkdir -p "$HOME/.cargo/registry" "$HOME/.cargo/git" target
+          docker run --rm \
+            -v "$PWD:/work" \
+            -v "$HOME/.cargo/registry:/root/.cargo/registry" \
+            -v "$HOME/.cargo/git:/root/.cargo/git" \
+            -w /work \
+            -e CARGO_TERM_COLOR=always \
+            -e HOST_UID="$HOST_UID" \
+            -e HOST_GID="$HOST_GID" \
+            almalinux:9 \
+            bash -euo pipefail -c '
+              cleanup() {
+                chown -R "${HOST_UID}:${HOST_GID}" /work/target /root/.cargo/registry /root/.cargo/git || true
+              }
+              trap cleanup EXIT
+              dnf install -y --setopt=install_weak_deps=False \
+                gcc \
+                make \
+                pkgconf-pkg-config \
+                binutils \
+                tar \
+                gzip \
+                xz \
+                libX11-devel \
+                libxcb-devel \
+                libxkbcommon-devel \
+                wayland-devel \
+                vulkan-loader-devel \
+                mesa-libGL-devel \
+                mesa-libEGL-devel
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+              export PATH="/root/.cargo/bin:$PATH"
+              rustc -vV
+              cargo -V
+              cargo build --release --locked --workspace --bins --target x86_64-unknown-linux-gnu
+            '
+
+      - name: Build Linux i686 static musl CLI binary (ferric)
+        if: matrix.platform == 'linux-i686-cli'
+        run: cargo build --release --locked -p nmr-cli --bin ferric --target i686-unknown-linux-musl
 
       - name: Package & verify Apple Silicon macOS release (.app + .dmg + .tar.gz)
         if: matrix.platform == 'macos-arm64'
         run: |
           set -euo pipefail
           test "$(uname -m)" = "arm64"
-          ./target/release/ferric --version
+          ./target/aarch64-apple-darwin/release/ferric --version
           python3 scripts/package_release.py \
             --platform macos-arm64 \
-            --bin-dir target/release \
+            --bin-dir target/aarch64-apple-darwin/release \
             --out-dir dist
+          test "$(lipo -archs dist/FERRIC.app/Contents/MacOS/ferric)" = "arm64"
+          test "$(lipo -archs dist/FERRIC.app/Contents/MacOS/ferric-gui)" = "arm64"
           plutil -lint dist/FERRIC.app/Contents/Info.plist
           codesign --verify --deep --strict dist/FERRIC.app
           hdiutil imageinfo dist/ferric-v*-macos-arm64.dmg >/dev/null
+
+      - name: Package & verify Intel macOS x86_64 release (.app + .dmg + .tar.gz)
+        if: matrix.platform == 'macos-x86_64'
+        run: |
+          set -euo pipefail
+          python3 scripts/package_release.py \
+            --platform macos-x86_64 \
+            --bin-dir target/x86_64-apple-darwin/release \
+            --out-dir dist
+          test "$(lipo -archs dist/FERRIC.app/Contents/MacOS/ferric)" = "x86_64"
+          test "$(lipo -archs dist/FERRIC.app/Contents/MacOS/ferric-gui)" = "x86_64"
+          plutil -lint dist/FERRIC.app/Contents/Info.plist
+          codesign --verify --deep --strict dist/FERRIC.app
+          hdiutil imageinfo dist/ferric-v*-macos-x86_64.dmg >/dev/null
 
       - name: Package & verify Windows x86_64 release (.zip)
         if: matrix.platform == 'windows-x86_64'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          .\target\release\ferric.exe --version
+          .\target\x86_64-pc-windows-msvc\release\ferric.exe --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/package_release.py `
             --platform windows-x86_64 `
-            --bin-dir target/release `
+            --bin-dir target\x86_64-pc-windows-msvc\release `
             --out-dir dist
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Package & verify Linux x86_64 release (.tar.gz + FreeDesktop launcher + glibc <= 2.35)
+      - name: Package & verify Linux x86_64 release (.tar.gz + .deb + .rpm + RHEL 9 glibc <= 2.34)
         if: matrix.platform == 'linux-x86_64'
         run: |
           set -euo pipefail
-          ./target/release/ferric --version
+          ./target/x86_64-unknown-linux-gnu/release/ferric --version
           python3 - <<'PY'
           import re, subprocess, sys
           max_ver = (0, 0)
-          for b in ("target/release/ferric", "target/release/ferric-gui"):
+          for b in (
+              "target/x86_64-unknown-linux-gnu/release/ferric",
+              "target/x86_64-unknown-linux-gnu/release/ferric-gui",
+          ):
               out = subprocess.check_output(["objdump", "-T", b], text=True)
               for m in re.finditer(r"GLIBC_(\d+)\.(\d+)", out):
                   v = (int(m.group(1)), int(m.group(2)))
                   if v > max_ver:
                       max_ver = v
           print(f"Detected max GLIBC symbol version: GLIBC_{max_ver[0]}.{max_ver[1]}")
-          if max_ver > (2, 35):
-              print(f"ERROR: GLIBC_{max_ver[0]}.{max_ver[1]} exceeds Ubuntu 22.04 baseline (2.35)", file=sys.stderr)
+          if max_ver > (2, 34):
+              print(
+                  f"ERROR: GLIBC_{max_ver[0]}.{max_ver[1]} exceeds RHEL 9.x / AlmaLinux 9 baseline (2.34)",
+                  file=sys.stderr,
+              )
               sys.exit(1)
           PY
           python3 scripts/package_release.py \
             --platform linux-x86_64 \
-            --bin-dir target/release \
+            --bin-dir target/x86_64-unknown-linux-gnu/release \
             --out-dir dist
+          dpkg-deb --info dist/ferric-v*-linux-x86_64.deb
+          dpkg-deb --contents dist/ferric-v*-linux-x86_64.deb
+          rpm -qp --info --list dist/ferric-v*-linux-x86_64.rpm
+          docker run --rm -v "$PWD/dist:/dist:ro" almalinux:9 bash -euo pipefail -c '
+            rpm -Uvh /dist/ferric-v*-linux-x86_64.rpm
+            /usr/bin/ferric --version
+            test -x /usr/bin/ferric-gui
+            test -f /usr/share/applications/ferric.desktop
+            test -f /usr/share/icons/hicolor/256x256/apps/ferric.png
+          '
+
+      - name: Package & verify Linux i686 static CLI release (.tar.gz + .deb + .rpm)
+        if: matrix.platform == 'linux-i686-cli'
+        run: |
+          set -euo pipefail
+          FILE_INFO="$(file target/i686-unknown-linux-musl/release/ferric)"
+          echo "$FILE_INFO"
+          grep -q "ELF 32-bit LSB" <<<"$FILE_INFO"
+          grep -Eq "statically linked|static-pie linked" <<<"$FILE_INFO"
+          if readelf -d target/i686-unknown-linux-musl/release/ferric | grep -q "(NEEDED)"; then
+            echo "ERROR: Expected zero DT_NEEDED shared libraries in static musl i686 ferric CLI" >&2
+            exit 1
+          fi
+          ./target/i686-unknown-linux-musl/release/ferric --version
+          python3 scripts/package_release.py \
+            --platform linux-i686-cli \
+            --bin-dir target/i686-unknown-linux-musl/release \
+            --out-dir dist
+          dpkg-deb --info dist/ferric-v*-linux-i686-cli.deb
+          dpkg-deb --contents dist/ferric-v*-linux-i686-cli.deb
+          rpm -qp --info --list dist/ferric-v*-linux-i686-cli.rpm
 
       - name: Upload platform release artifact (${{ matrix.platform }})
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -198,8 +328,15 @@ jobs:
           EXPECTED_FILES=(
             "dist/ferric-v${WS_VER}-macos-arm64.dmg"
             "dist/ferric-v${WS_VER}-macos-arm64.tar.gz"
+            "dist/ferric-v${WS_VER}-macos-x86_64.dmg"
+            "dist/ferric-v${WS_VER}-macos-x86_64.tar.gz"
             "dist/ferric-v${WS_VER}-windows-x86_64.zip"
             "dist/ferric-v${WS_VER}-linux-x86_64.tar.gz"
+            "dist/ferric-v${WS_VER}-linux-x86_64.deb"
+            "dist/ferric-v${WS_VER}-linux-x86_64.rpm"
+            "dist/ferric-v${WS_VER}-linux-i686-cli.tar.gz"
+            "dist/ferric-v${WS_VER}-linux-i686-cli.deb"
+            "dist/ferric-v${WS_VER}-linux-i686-cli.rpm"
           )
           for f in "${EXPECTED_FILES[@]}"; do
             if [[ ! -s "$f" ]]; then
@@ -223,10 +360,12 @@ jobs:
             dist/*.dmg
             dist/*.tar.gz
             dist/*.zip
+            dist/*.deb
+            dist/*.rpm
             dist/SHA256SUMS.txt
           )
-          if [[ "${#ASSETS[@]}" -ne 5 ]]; then
-            echo "ERROR: Expected 5 release assets (4 archives + SHA256SUMS.txt), found ${#ASSETS[@]}" >&2
+          if [[ "${#ASSETS[@]}" -ne 12 ]]; then
+            echo "ERROR: Expected 12 release assets (11 platform packages/archives + SHA256SUMS.txt), found ${#ASSETS[@]}" >&2
             exit 1
           fi
           set +e
@@ -268,7 +407,7 @@ jobs:
             gh release create "$TAG_NAME" "${ASSETS[@]}" \
               --verify-tag \
               --title "FERRIC ${TAG_NAME}" \
-              --notes "Linux x86_64 binaries target Ubuntu 22.04 (minimum \`glibc >= 2.35\`)." \
+              --notes "Includes macOS Apple Silicon (arm64) & Intel (x86_64) .dmg/.tar.gz, Windows x86_64 .zip, Linux x86_64 .tar.gz/.deb/.rpm (RHEL 9 / AlmaLinux 9 / Rocky 9 / Debian 12 / Ubuntu 22.04+, minimum \`glibc >= 2.34\`), and static 32-bit Linux i686 CLI (\`musl\`) .tar.gz/.deb/.rpm." \
               --generate-notes
           else
             echo "ERROR: Failed to inspect GitHub Release ${TAG_NAME} via gh release view:" >&2

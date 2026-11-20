@@ -3,19 +3,23 @@
 
 Builds reproducible release bundles and procedural vector/raster desktop icons
 for ``FERRIC`` across:
-- ``macos-arm64``: ``FERRIC.app`` bundle (``ferric-gui`` + ``ferric`` CLI/MCP
-  + deprecated ``nmrassign`` alias for ``v0.14.x``, ``Info.plist``, ``PkgInfo``,
-  ``FERRIC.icns``, ad-hoc Apple Silicon ``codesign``), compressed drag-and-drop
-  ``.dmg`` (with ``/Applications`` symlink and quickstart guide), and ``.tar.gz``
+- ``macos-arm64``: ``FERRIC.app`` bundle (``ferric-gui`` + ``ferric`` CLI/MCP,
+  ``Info.plist``, ``PkgInfo``, ``FERRIC.icns``, ad-hoc Apple Silicon ``codesign``),
+  compressed drag-and-drop ``.dmg`` (with ``/Applications`` symlink and quickstart
+  guide), and ``.tar.gz`` archive.
+- ``macos-x86_64``: ``FERRIC.app`` bundle cross-compiled for Intel Macs
+  (``x86_64-apple-darwin``), ad-hoc ``codesign``, compressed ``.dmg``, and ``.tar.gz``
   archive.
 - ``windows-x86_64``: deterministic ``.zip`` archive containing
-  ``ferric-gui.exe``, ``ferric.exe``, ``nmrassign.exe`` (``v0.14.x`` alias),
-  multi-resolution ``ferric.ico``, ``Launch-NMR-Workbench.bat``, ``README.md``,
-  and ``THIRD_PARTY.md``.
-- ``linux-x86_64``: deterministic ``.tar.gz`` archive containing ``bin/``
-  executables (``ferric-gui``, ``ferric``, ``nmrassign``, ``0755``), FreeDesktop
-  ``ferric.desktop``, scalable SVG + ``256x256`` PNG hicolor icons, user-level
-  ``install-desktop.sh`` XDG installer, ``README.md``, and ``THIRD_PARTY.md``.
+  ``ferric-gui.exe``, ``ferric.exe``, multi-resolution ``ferric.ico``,
+  ``Launch-NMR-Workbench.bat``, ``README.md``, and ``THIRD_PARTY.md``.
+- ``linux-x86_64``: deterministic ``.tar.gz`` archive (``bin/ferric-gui``,
+  ``bin/ferric``, FreeDesktop ``ferric.desktop``, scalable SVG + ``256x256`` PNG
+  hicolor icons, user-level ``install-desktop.sh``, ``README.md``, ``THIRD_PARTY.md``)
+  plus native Debian/Ubuntu ``.deb`` (``amd64``) and RHEL 9 / AlmaLinux 9 / Rocky 9 /
+  Fedora ``.rpm`` (``x86_64``, ``glibc >= 2.34``).
+- ``linux-i686-cli``: static ``musl`` 32-bit CLI-only ``ferric`` packaged as
+  deterministic ``.tar.gz``, ``.deb`` (``i386``), and ``.rpm`` (``i686``).
 - ``--checksums <dir>``: deterministic ``SHA256SUMS.txt`` generator and verifier.
 
 Provenance: Original clean-room Python 3 standard-library release packaging and
@@ -51,6 +55,8 @@ CLI_BIN = "ferric"
 CLI_ALIAS_BIN = "nmrassign"
 GUI_BIN = "ferric-gui"
 BUNDLE_ID = "io.github.debsahu.ferric"
+PROJECT_URL = "https://github.com/debsahu/ferric"
+DEB_MAINTAINER = "Debashish Sahu <debashish.sahu@gmail.com>"
 MACOS_MIN_SYSTEM_VERSION = "13.0"
 DETERMINISTIC_MTIME = 1700000000  # 2023-11-14T22:13:20Z
 DETERMINISTIC_ZIP_DT = (2026, 1, 1, 0, 0, 0)
@@ -72,8 +78,18 @@ ICNS_SLOTS: Tuple[Tuple[bytes, int], ...] = (
 
 SUPPORTED_PLATFORMS: Tuple[str, ...] = (
     "macos-arm64",
+    "macos-x86_64",
     "windows-x86_64",
     "linux-x86_64",
+    "linux-i686-cli",
+)
+
+RELEASE_ARCHIVE_SUFFIXES: Tuple[str, ...] = (
+    ".dmg",
+    ".tar.gz",
+    ".zip",
+    ".deb",
+    ".rpm",
 )
 
 
@@ -679,10 +695,12 @@ def validate_info_plist(plist_path: Path, expected_version: str) -> None:
         )
 
 
-def render_cli_and_mcp_quickstart(version: str) -> str:
+def render_cli_and_mcp_quickstart(version: str, arch_title: str = "Apple Silicon") -> str:
     """Render plain-text macOS quickstart bundled inside the ``.dmg`` volume."""
-    return f"""FERRIC v{version} — Apple Silicon Desktop, CLI & MCP Quickstart
-================================================================
+    header = f"FERRIC v{version} — {arch_title} Desktop, CLI & MCP Quickstart"
+    rule = "=" * len(header)
+    return f"""{header}
+{rule}
 
 1. Install the Desktop Workbench (`FERRIC.app`)
 -----------------------------------------------
@@ -693,8 +711,8 @@ fallback).
 
 2. Command-Line Interface (`ferric`)
 ------------------------------------
-`ferric-gui`, the `ferric` CLI / MCP server, and the `v0.14.x` deprecated
-`nmrassign` compatibility alias ship directly inside `FERRIC.app/Contents/MacOS/`.
+Both `ferric-gui` and the `ferric` CLI / MCP server ship directly inside
+`FERRIC.app/Contents/MacOS/`.
 To add `ferric` to your `zsh` PATH:
 
   export PATH="/Applications/FERRIC.app/Contents/MacOS:$PATH"
@@ -956,7 +974,7 @@ def _require_binary(bin_dir: Path, name: str) -> Path:
 
 
 def _codesign_macos_app(app_dir: Path) -> None:
-    """Apply ad-hoc Apple Silicon code signature and strict verification on macOS."""
+    """Apply ad-hoc macOS code signature (arm64 or x86_64) and strict verification."""
     if sys.platform != "darwin" or not shutil.which("codesign"):
         return
     cli_bin = app_dir / "Contents" / "MacOS" / CLI_BIN
@@ -1014,14 +1032,16 @@ def _create_macos_dmg(volname: str, src_folder: Path, out_dmg: Path) -> None:
     raise RuntimeError(f"hdiutil create failed after 3 attempts: {last_err.stderr}") from last_err
 
 
-def package_macos_arm64(
+def _package_macos_bundle(
     repo_root: Path,
     bin_dir: Path,
     out_dir: Path,
     version: str,
+    platform_slug: str,
+    arch_title: str,
     skip_dmg: bool = False,
 ) -> List[Path]:
-    """Build ``FERRIC.app``, ``.dmg``, and ``.tar.gz`` for ``macos-arm64``."""
+    """Build ``FERRIC.app``, ``.dmg``, and ``.tar.gz`` for ``macos-arm64`` or ``macos-x86_64``."""
     gui_src = _require_binary(bin_dir, GUI_BIN)
     cli_src = _require_binary(bin_dir, CLI_BIN)
     readme_src = repo_root / "README.md"
@@ -1032,7 +1052,7 @@ def package_macos_arm64(
     icns_bytes = build_icns(pngs)
     validate_icns_bytes(icns_bytes)
 
-    prefix = f"{APP_SLUG}-v{version}-macos-arm64"
+    prefix = f"{APP_SLUG}-v{version}-{platform_slug}"
     outputs: List[Path] = []
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1093,7 +1113,7 @@ def package_macos_arm64(
         if not skip_dmg:
             if sys.platform != "darwin" or not shutil.which("hdiutil"):
                 raise RuntimeError(
-                    "Building macos-arm64 .dmg requires macOS `hdiutil` (pass --skip-dmg to build .tar.gz only)."
+                    f"Building {platform_slug} .dmg requires macOS `hdiutil` (pass --skip-dmg to build .tar.gz only)."
                 )
             dmg_stage = tmp_path / "dmg_stage"
             dmg_stage.mkdir(parents=True, exist_ok=True)
@@ -1101,7 +1121,7 @@ def package_macos_arm64(
             os.symlink("/Applications", dmg_stage / "Applications")
             shutil.copyfile(readme_src, dmg_stage / "README.md")
             (dmg_stage / "CLI_AND_MCP_QUICKSTART.txt").write_text(
-                render_cli_and_mcp_quickstart(version),
+                render_cli_and_mcp_quickstart(version, arch_title=arch_title),
                 encoding="utf-8",
                 newline="\n",
             )
@@ -1110,6 +1130,44 @@ def package_macos_arm64(
             outputs.insert(0, dmg_path)
 
     return outputs
+
+
+def package_macos_arm64(
+    repo_root: Path,
+    bin_dir: Path,
+    out_dir: Path,
+    version: str,
+    skip_dmg: bool = False,
+) -> List[Path]:
+    """Build ``FERRIC.app``, ``.dmg``, and ``.tar.gz`` for ``macos-arm64``."""
+    return _package_macos_bundle(
+        repo_root=repo_root,
+        bin_dir=bin_dir,
+        out_dir=out_dir,
+        version=version,
+        platform_slug="macos-arm64",
+        arch_title="Apple Silicon",
+        skip_dmg=skip_dmg,
+    )
+
+
+def package_macos_x86_64(
+    repo_root: Path,
+    bin_dir: Path,
+    out_dir: Path,
+    version: str,
+    skip_dmg: bool = False,
+) -> List[Path]:
+    """Build ``FERRIC.app``, ``.dmg``, and ``.tar.gz`` for Intel ``macos-x86_64``."""
+    return _package_macos_bundle(
+        repo_root=repo_root,
+        bin_dir=bin_dir,
+        out_dir=out_dir,
+        version=version,
+        platform_slug="macos-x86_64",
+        arch_title="Intel (x86_64)",
+        skip_dmg=skip_dmg,
+    )
 
 
 def package_windows_x86_64(
@@ -1155,13 +1213,412 @@ def package_windows_x86_64(
     return [out_zip]
 
 
+def _deb_safe_version(version: str) -> str:
+    return f"{version.replace('-', '~')}-1"
+
+
+def _rpm_safe_version(version: str) -> str:
+    return version.replace("-", "~")
+
+
+def _md5_file(path: Path) -> str:
+    digest = hashlib.md5()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def render_deb_control(
+    version: str,
+    deb_arch: str,
+    installed_kib: int,
+    include_gui: bool,
+) -> str:
+    """Render Debian ``DEBIAN/control`` metadata for ``amd64`` desktop+CLI or ``i386`` static CLI."""
+    lines = [
+        f"Package: {APP_SLUG}",
+        f"Version: {_deb_safe_version(version)}",
+        "Section: science",
+        "Priority: optional",
+        f"Architecture: {deb_arch}",
+        f"Installed-Size: {max(1, installed_kib)}",
+    ]
+    if include_gui:
+        lines.append("Depends: libc6 (>= 2.34), libgcc-s1 (>= 3.0)")
+        lines.append(
+            "Recommends: libvulkan1, mesa-vulkan-drivers, libx11-6, libwayland-client0, libxkbcommon0"
+        )
+        synopsis = "Open-source GPU-accelerated protein NMR assignment and spectrum workbench"
+        ext_desc = (
+            " FERRIC provides automated protein NMR backbone/sidechain resonance assignment,\n"
+            " raw Bruker/Varian FID and NUS processing, spin relaxation/CEST/CPMG/CSP\n"
+            " dynamics, 1D analytical NMR/DOSY/metabolomics, an interactive WebGPU desktop\n"
+            " workbench (ferric-gui), and a CLI / MCP server (ferric)."
+        )
+    else:
+        synopsis = "Open-source protein NMR assignment and analytical spectroscopy CLI (32-bit static)"
+        ext_desc = (
+            " Statically linked 32-bit x86 (i686 musl) command-line interface and MCP server\n"
+            " for FERRIC automated protein NMR resonance assignment, raw FID processing,\n"
+            " spin relaxation/exchange, and 1D analytical NMR/DOSY/metabolomics."
+        )
+    lines.extend(
+        [
+            f"Maintainer: {DEB_MAINTAINER}",
+            f"Homepage: {PROJECT_URL}",
+            f"Description: {synopsis}",
+            ext_desc,
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def validate_deb_control(
+    control_text: str,
+    expected_arch: str,
+    expect_glibc_dep: bool,
+) -> None:
+    """Validate Debian ``DEBIAN/control`` fields and architecture/dependency invariants."""
+    if not control_text.endswith("\n"):
+        raise ValueError("DEBIAN/control must end with a trailing newline")
+    fields: Dict[str, str] = {}
+    saw_continuation = False
+    last_key: Optional[str] = None
+    for raw_line in control_text.splitlines():
+        if not raw_line.strip():
+            raise ValueError("Unexpected blank stanza separator in single-package DEBIAN/control")
+        if raw_line.startswith(" "):
+            if last_key != "Description":
+                raise ValueError(f"Unexpected continuation line under {last_key!r}: {raw_line!r}")
+            saw_continuation = True
+            continue
+        if ":" not in raw_line:
+            raise ValueError(f"Malformed DEBIAN/control header line: {raw_line!r}")
+        k, v = raw_line.split(":", 1)
+        fields[k.strip()] = v.strip()
+        last_key = k.strip()
+
+    expected_exact = {
+        "Package": APP_SLUG,
+        "Section": "science",
+        "Priority": "optional",
+        "Architecture": expected_arch,
+        "Maintainer": DEB_MAINTAINER,
+        "Homepage": PROJECT_URL,
+    }
+    for key, exp_val in expected_exact.items():
+        if fields.get(key) != exp_val:
+            raise ValueError(f"DEBIAN/control {key}={fields.get(key)!r} != expected {exp_val!r}")
+    if int(fields.get("Installed-Size", "0")) <= 0:
+        raise ValueError(f"Invalid DEBIAN/control Installed-Size: {fields.get('Installed-Size')!r}")
+    if not fields.get("Description") or not saw_continuation:
+        raise ValueError("DEBIAN/control Description must include synopsis and extended lines")
+    if expect_glibc_dep:
+        deps = fields.get("Depends", "")
+        if "libc6 (>= 2.34)" not in deps:
+            raise ValueError(f"Expected RHEL 9 / glibc 2.34 floor in Depends, got {deps!r}")
+    else:
+        if "Depends" in fields:
+            raise ValueError(f"Static i386 musl CLI .deb must not declare shared Depends, got {fields['Depends']!r}")
+
+
+def render_rpm_spec(
+    version: str,
+    stage_payload: Path,
+    include_gui: bool,
+) -> str:
+    """Render RPM ``.spec`` file for ``x86_64`` desktop+CLI (RHEL 9+) or ``i686`` static CLI."""
+    rpm_ver = _rpm_safe_version(version)
+    if include_gui:
+        summary = "Open-source GPU-accelerated protein NMR assignment and spectrum workbench"
+        extra_header = "Recommends:     vulkan-loader, libxkbcommon, libX11, libwayland-client"
+        description = (
+            "FERRIC provides automated protein NMR backbone and sidechain resonance\n"
+            "assignment, raw Bruker/Varian FID and NUS processing, spin relaxation,\n"
+            "CEST/CPMG/CSP dynamics, 1D analytical NMR/DOSY/metabolomics, an interactive\n"
+            "WebGPU desktop workbench (ferric-gui), and a CLI / MCP server (ferric)."
+        )
+        files_entries = "\n".join(
+            [
+                f"%attr(0755,root,root) /usr/bin/{CLI_BIN}",
+                f"%attr(0755,root,root) /usr/bin/{GUI_BIN}",
+                f"%attr(0644,root,root) /usr/share/applications/{APP_SLUG}.desktop",
+                f"%attr(0644,root,root) /usr/share/icons/hicolor/256x256/apps/{APP_SLUG}.png",
+                f"%attr(0644,root,root) /usr/share/icons/hicolor/scalable/apps/{APP_SLUG}.svg",
+                f"%dir /usr/share/doc/{APP_SLUG}",
+                f"%doc /usr/share/doc/{APP_SLUG}/README.md",
+                f"%license /usr/share/doc/{APP_SLUG}/THIRD_PARTY.md",
+            ]
+        )
+    else:
+        summary = "Open-source protein NMR assignment and analytical spectroscopy CLI (32-bit static)"
+        extra_header = "AutoReqProv:    no"
+        description = (
+            "Statically linked 32-bit x86 (i686 musl) command-line interface and MCP\n"
+            "server for FERRIC automated protein NMR resonance assignment, raw FID\n"
+            "processing, spin relaxation/exchange, and 1D analytical NMR/DOSY/metabolomics."
+        )
+        files_entries = "\n".join(
+            [
+                f"%attr(0755,root,root) /usr/bin/{CLI_BIN}",
+                f"%dir /usr/share/doc/{APP_SLUG}",
+                f"%doc /usr/share/doc/{APP_SLUG}/README.md",
+                f"%license /usr/share/doc/{APP_SLUG}/THIRD_PARTY.md",
+            ]
+        )
+
+    return f"""%global debug_package %{{nil}}
+%define _build_id_links none
+%define _binary_payload w9.xzdio
+%define __os_install_post %{{nil}}
+%define use_source_date_epoch_as_buildtime 1
+%define clamp_mtime_to_source_date_epoch 1
+
+Name:           {APP_SLUG}
+Version:        {rpm_ver}
+Release:        1
+Summary:        {summary}
+License:        MIT
+URL:            {PROJECT_URL}
+{extra_header}
+
+%description
+{description}
+
+%prep
+
+%build
+
+%install
+rm -rf %{{buildroot}}
+mkdir -p %{{buildroot}}
+cp -a "{stage_payload.as_posix()}/." %{{buildroot}}/
+
+%files
+%defattr(-,root,root,-)
+{files_entries}
+"""
+
+
+def validate_rpm_spec(spec_text: str, include_gui: bool) -> None:
+    """Validate RPM ``.spec`` directives, payload compression, and file ownership rules."""
+    for req_directive in (
+        "%global debug_package %{nil}",
+        "%define _build_id_links none",
+        "%define _binary_payload w9.xzdio",
+        f"Name:           {APP_SLUG}",
+        "License:        MIT",
+        f"%attr(0755,root,root) /usr/bin/{CLI_BIN}",
+        f"%dir /usr/share/doc/{APP_SLUG}",
+    ):
+        if req_directive not in spec_text:
+            raise ValueError(f"RPM spec missing required directive: {req_directive!r}")
+    for forbidden_dir in ("%dir /usr\n", "%dir /usr/bin\n", "%dir /usr/share/applications\n"):
+        if forbidden_dir in spec_text:
+            raise ValueError(f"RPM spec must not claim system directory ownership: {forbidden_dir.strip()!r}")
+    if include_gui:
+        for gui_entry in (
+            f"%attr(0755,root,root) /usr/bin/{GUI_BIN}",
+            f"%attr(0644,root,root) /usr/share/applications/{APP_SLUG}.desktop",
+            f"%attr(0644,root,root) /usr/share/icons/hicolor/256x256/apps/{APP_SLUG}.png",
+        ):
+            if gui_entry not in spec_text:
+                raise ValueError(f"Desktop RPM spec missing GUI entry: {gui_entry!r}")
+    else:
+        if "AutoReqProv:    no" not in spec_text:
+            raise ValueError("Static i686 CLI RPM spec must set AutoReqProv: no")
+        if GUI_BIN in spec_text or f"{APP_SLUG}.desktop" in spec_text:
+            raise ValueError("CLI-only RPM spec must not reference ferric-gui or ferric.desktop")
+
+
+def _stage_linux_sysroot(
+    sysroot_dir: Path,
+    cli_src: Path,
+    readme_src: Path,
+    third_party_src: Path,
+    gui_src: Optional[Path] = None,
+    desktop_text: Optional[str] = None,
+    png_256: Optional[bytes] = None,
+    svg_text: Optional[str] = None,
+) -> None:
+    """Populate FHS ``/usr`` tree for ``.deb`` and ``.rpm`` builders with deterministic modes/mtimes."""
+    mtime = _source_mtime()
+    bin_dir = sysroot_dir / "usr" / "bin"
+    doc_dir = sysroot_dir / "usr" / "share" / "doc" / APP_SLUG
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    doc_dir.mkdir(parents=True, exist_ok=True)
+
+    shutil.copyfile(cli_src, bin_dir / CLI_BIN)
+    os.chmod(bin_dir / CLI_BIN, 0o755)
+
+    if gui_src is not None:
+        if desktop_text is None or png_256 is None or svg_text is None:
+            raise ValueError("Desktop assets (desktop_text, png_256, svg_text) are required when gui_src is set")
+        app_dir = sysroot_dir / "usr" / "share" / "applications"
+        png_dir = sysroot_dir / "usr" / "share" / "icons" / "hicolor" / "256x256" / "apps"
+        svg_dir = sysroot_dir / "usr" / "share" / "icons" / "hicolor" / "scalable" / "apps"
+        for d in (app_dir, png_dir, svg_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        shutil.copyfile(gui_src, bin_dir / GUI_BIN)
+        os.chmod(bin_dir / GUI_BIN, 0o755)
+        (app_dir / f"{APP_SLUG}.desktop").write_text(desktop_text, encoding="utf-8", newline="\n")
+        (png_dir / f"{APP_SLUG}.png").write_bytes(png_256)
+        (svg_dir / f"{APP_SLUG}.svg").write_text(svg_text, encoding="utf-8", newline="\n")
+        os.chmod(app_dir / f"{APP_SLUG}.desktop", 0o644)
+        os.chmod(png_dir / f"{APP_SLUG}.png", 0o644)
+        os.chmod(svg_dir / f"{APP_SLUG}.svg", 0o644)
+
+    shutil.copyfile(readme_src, doc_dir / "README.md")
+    shutil.copyfile(third_party_src, doc_dir / "THIRD_PARTY.md")
+    os.chmod(doc_dir / "README.md", 0o644)
+    os.chmod(doc_dir / "THIRD_PARTY.md", 0o644)
+
+    os.chmod(sysroot_dir, 0o755)
+    for item in sorted(sysroot_dir.rglob("*"), key=lambda p: p.as_posix(), reverse=True):
+        if item.is_dir():
+            os.chmod(item, 0o755)
+        os.utime(item, (mtime, mtime))
+    os.utime(sysroot_dir, (mtime, mtime))
+
+
+def _prepare_deb_tree(
+    deb_stage: Path,
+    sysroot_dir: Path,
+    version: str,
+    deb_arch: str,
+    include_gui: bool,
+) -> str:
+    """Copy staged ``/usr`` tree into ``deb_stage`` and emit validated ``DEBIAN/{control,md5sums}``."""
+    mtime = _source_mtime()
+    if deb_stage.exists():
+        shutil.rmtree(deb_stage)
+    shutil.copytree(sysroot_dir, deb_stage)
+
+    payload_files = sorted(
+        (p for p in deb_stage.rglob("*") if p.is_file()),
+        key=lambda p: p.relative_to(deb_stage).as_posix(),
+    )
+    total_bytes = sum(p.stat().st_size for p in payload_files)
+    installed_kib = max(1, (total_bytes + 1023) // 1024)
+
+    debian_dir = deb_stage / "DEBIAN"
+    debian_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(debian_dir, 0o755)
+
+    control_text = render_deb_control(
+        version=version,
+        deb_arch=deb_arch,
+        installed_kib=installed_kib,
+        include_gui=include_gui,
+    )
+    validate_deb_control(control_text, expected_arch=deb_arch, expect_glibc_dep=include_gui)
+    control_path = debian_dir / "control"
+    control_path.write_text(control_text, encoding="utf-8", newline="\n")
+    os.chmod(control_path, 0o644)
+
+    md5_lines = [f"{_md5_file(p)}  {p.relative_to(deb_stage).as_posix()}" for p in payload_files]
+    md5_path = debian_dir / "md5sums"
+    md5_path.write_text("\n".join(md5_lines) + "\n", encoding="utf-8", newline="\n")
+    os.chmod(md5_path, 0o644)
+
+    os.chmod(deb_stage, 0o755)
+    for p in (control_path, md5_path, debian_dir, deb_stage):
+        os.utime(p, (mtime, mtime))
+    return control_text
+
+
+def _build_deb_package(
+    deb_stage: Path,
+    out_deb: Path,
+) -> Path:
+    """Build XZ-compressed ``.deb`` archive via ``dpkg-deb --build --root-owner-group``."""
+    if not shutil.which("dpkg-deb"):
+        raise RuntimeError(
+            f"dpkg-deb is required to build {out_deb.name} (install dpkg or pass --skip-deb)."
+        )
+    out_deb.parent.mkdir(parents=True, exist_ok=True)
+    if out_deb.exists():
+        out_deb.unlink()
+    env = dict(os.environ)
+    env["SOURCE_DATE_EPOCH"] = str(_source_mtime())
+    subprocess.run(
+        [
+            "dpkg-deb",
+            "-Zxz",
+            "--build",
+            "--root-owner-group",
+            str(deb_stage),
+            str(out_deb),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    return out_deb
+
+
+def _build_rpm_package(
+    rpm_top: Path,
+    sysroot_dir: Path,
+    out_rpm: Path,
+    version: str,
+    rpm_arch: str,
+    include_gui: bool,
+) -> Path:
+    """Build XZ-compressed ``.rpm`` package via ``rpmbuild -bb --target <arch>-linux``."""
+    for sub in ("BUILD", "RPMS", "SOURCES", "SPECS", "SRPMS", "BUILDROOT"):
+        (rpm_top / sub).mkdir(parents=True, exist_ok=True)
+    spec_text = render_rpm_spec(version=version, stage_payload=sysroot_dir, include_gui=include_gui)
+    validate_rpm_spec(spec_text, include_gui=include_gui)
+    spec_path = rpm_top / "SPECS" / f"{APP_SLUG}.spec"
+    spec_path.write_text(spec_text, encoding="utf-8", newline="\n")
+
+    if not shutil.which("rpmbuild"):
+        raise RuntimeError(
+            f"rpmbuild is required to build {out_rpm.name} (install rpm or pass --skip-rpm)."
+        )
+    out_rpm.parent.mkdir(parents=True, exist_ok=True)
+    if out_rpm.exists():
+        out_rpm.unlink()
+    env = dict(os.environ)
+    env["SOURCE_DATE_EPOCH"] = str(_source_mtime())
+    subprocess.run(
+        [
+            "rpmbuild",
+            "-bb",
+            "--target",
+            f"{rpm_arch}-linux",
+            "--define",
+            f"_topdir {rpm_top.as_posix()}",
+            str(spec_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    built_rpms = sorted((rpm_top / "RPMS").rglob("*.rpm"))
+    if len(built_rpms) != 1:
+        raise RuntimeError(f"Expected exactly 1 built .rpm in {rpm_top / 'RPMS'}, found {built_rpms}")
+    shutil.copyfile(built_rpms[0], out_rpm)
+    return out_rpm
+
+
 def package_linux_x86_64(
     repo_root: Path,
     bin_dir: Path,
     out_dir: Path,
     version: str,
+    skip_deb: bool = False,
+    skip_rpm: bool = False,
 ) -> List[Path]:
-    """Build deterministic ``.tar.gz`` FreeDesktop bundle for ``linux-x86_64``."""
+    """Build deterministic ``.tar.gz``, ``.deb`` (``amd64``), and ``.rpm`` (``x86_64``) for ``linux-x86_64``."""
     gui_src = _require_binary(bin_dir, GUI_BIN)
     cli_src = _require_binary(bin_dir, CLI_BIN)
     readme_src = repo_root / "README.md"
@@ -1174,11 +1631,14 @@ def package_linux_x86_64(
     desktop_text = render_linux_desktop_entry()
     validate_desktop_entry(desktop_text)
 
+    out_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"{APP_SLUG}-v{version}-linux-x86_64"
     out_tar_gz = out_dir / f"{prefix}.tar.gz"
+    outputs: List[Path] = [out_tar_gz]
 
     with tempfile.TemporaryDirectory() as tmp:
-        stage = Path(tmp) / prefix
+        tmp_path = Path(tmp)
+        stage = tmp_path / prefix
         bin_stage = stage / "bin"
         app_stage = stage / "share" / "applications"
         svg_stage = stage / "share" / "icons" / "hicolor" / "scalable" / "apps"
@@ -1213,7 +1673,127 @@ def package_linux_x86_64(
             ),
         )
 
-    return [out_tar_gz]
+        # Always stage and validate .deb / .rpm metadata even when host tools are skipped
+        sysroot_dir = tmp_path / "sysroot_x86_64"
+        _stage_linux_sysroot(
+            sysroot_dir=sysroot_dir,
+            cli_src=cli_src,
+            readme_src=readme_src,
+            third_party_src=third_party_src,
+            gui_src=gui_src,
+            desktop_text=desktop_text,
+            png_256=png_256,
+            svg_text=svg_text,
+        )
+        deb_stage = tmp_path / "deb_x86_64"
+        _prepare_deb_tree(
+            deb_stage=deb_stage,
+            sysroot_dir=sysroot_dir,
+            version=version,
+            deb_arch="amd64",
+            include_gui=True,
+        )
+        validate_rpm_spec(
+            render_rpm_spec(version=version, stage_payload=sysroot_dir, include_gui=True),
+            include_gui=True,
+        )
+
+        if not skip_deb:
+            out_deb = out_dir / f"{prefix}.deb"
+            _build_deb_package(deb_stage=deb_stage, out_deb=out_deb)
+            outputs.append(out_deb)
+
+        if not skip_rpm:
+            out_rpm = out_dir / f"{prefix}.rpm"
+            _build_rpm_package(
+                rpm_top=tmp_path / "rpm_x86_64",
+                sysroot_dir=sysroot_dir,
+                out_rpm=out_rpm,
+                version=version,
+                rpm_arch="x86_64",
+                include_gui=True,
+            )
+            outputs.append(out_rpm)
+
+    return outputs
+
+
+def package_linux_i686_cli(
+    repo_root: Path,
+    bin_dir: Path,
+    out_dir: Path,
+    version: str,
+    skip_deb: bool = False,
+    skip_rpm: bool = False,
+) -> List[Path]:
+    """Build deterministic ``.tar.gz``, ``.deb`` (``i386``), and ``.rpm`` (``i686``) for ``linux-i686-cli``."""
+    cli_src = _require_binary(bin_dir, CLI_BIN)
+    readme_src = repo_root / "README.md"
+    third_party_src = repo_root / "THIRD_PARTY.md"
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prefix = f"{APP_SLUG}-v{version}-linux-i686-cli"
+    out_tar_gz = out_dir / f"{prefix}.tar.gz"
+    outputs: List[Path] = [out_tar_gz]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        stage = tmp_path / prefix
+        bin_stage = stage / "bin"
+        bin_stage.mkdir(parents=True, exist_ok=True)
+
+        shutil.copyfile(cli_src, bin_stage / CLI_BIN)
+        os.chmod(bin_stage / CLI_BIN, 0o755)
+        shutil.copyfile(readme_src, stage / "README.md")
+        shutil.copyfile(third_party_src, stage / "THIRD_PARTY.md")
+
+        _write_deterministic_tar_gz(
+            staging_root=stage,
+            archive_prefix=prefix,
+            out_tar_gz=out_tar_gz,
+            executable_relpaths=(f"bin/{CLI_BIN}",),
+        )
+
+        # Always stage and validate .deb / .rpm metadata even when host tools are skipped
+        sysroot_dir = tmp_path / "sysroot_i686"
+        _stage_linux_sysroot(
+            sysroot_dir=sysroot_dir,
+            cli_src=cli_src,
+            readme_src=readme_src,
+            third_party_src=third_party_src,
+            gui_src=None,
+        )
+        deb_stage = tmp_path / "deb_i686"
+        _prepare_deb_tree(
+            deb_stage=deb_stage,
+            sysroot_dir=sysroot_dir,
+            version=version,
+            deb_arch="i386",
+            include_gui=False,
+        )
+        validate_rpm_spec(
+            render_rpm_spec(version=version, stage_payload=sysroot_dir, include_gui=False),
+            include_gui=False,
+        )
+
+        if not skip_deb:
+            out_deb = out_dir / f"{prefix}.deb"
+            _build_deb_package(deb_stage=deb_stage, out_deb=out_deb)
+            outputs.append(out_deb)
+
+        if not skip_rpm:
+            out_rpm = out_dir / f"{prefix}.rpm"
+            _build_rpm_package(
+                rpm_top=tmp_path / "rpm_i686",
+                sysroot_dir=sysroot_dir,
+                out_rpm=out_rpm,
+                version=version,
+                rpm_arch="i686",
+                include_gui=False,
+            )
+            outputs.append(out_rpm)
+
+    return outputs
 
 
 def _sha256_file(path: Path) -> str:
@@ -1236,7 +1816,7 @@ def _iter_release_archives(target_dir: Path) -> List[Path]:
             continue
         if entry.name == "SHA256SUMS.txt" or entry.name.startswith("."):
             continue
-        if entry.name.endswith((".dmg", ".tar.gz", ".zip")):
+        if entry.name.endswith(RELEASE_ARCHIVE_SUFFIXES):
             archives.append(entry)
     return archives
 
@@ -1245,7 +1825,9 @@ def write_checksums(target_dir: Path) -> Path:
     """Write deterministic ``SHA256SUMS.txt`` over all release archives in ``target_dir``."""
     archives = _iter_release_archives(target_dir)
     if not archives:
-        raise ValueError(f"No release archives (.dmg, .tar.gz, .zip) found in {target_dir}")
+        raise ValueError(
+            f"No release archives ({', '.join(RELEASE_ARCHIVE_SUFFIXES)}) found in {target_dir}"
+        )
     lines: List[str] = []
     for arc in archives:
         size = arc.stat().st_size
@@ -1281,17 +1863,23 @@ def verify_checksums(target_dir: Path) -> List[Tuple[str, str]]:
     return verified
 
 
-def _build_mock_binaries(mock_bin_dir: Path) -> None:
-    """Create tiny valid mock executables for ``--self-test`` across all 3 platforms."""
+def _build_mock_binaries(mock_bin_dir: Path, macos_arch: Optional[str] = None) -> bool:
+    """Create tiny valid mock executables for ``--self-test`` across all 5 platform targets."""
     mock_bin_dir.mkdir(parents=True, exist_ok=True)
     unix_stub: Optional[bytes] = None
+    built_macho = False
     if sys.platform == "darwin" and shutil.which("cc"):
         c_src = mock_bin_dir / "_stub.c"
         out_macho = mock_bin_dir / "_stub_bin"
         c_src.write_text("int main(void) { return 0; }\n", encoding="utf-8")
-        res = subprocess.run(["cc", "-O2", str(c_src), "-o", str(out_macho)], capture_output=True, text=True)
+        cc_cmd = ["cc", "-O2"]
+        if macos_arch is not None:
+            cc_cmd.extend(["-arch", macos_arch])
+        cc_cmd.extend([str(c_src), "-o", str(out_macho)])
+        res = subprocess.run(cc_cmd, capture_output=True, text=True)
         if res.returncode == 0 and out_macho.is_file():
             unix_stub = out_macho.read_bytes()
+            built_macho = True
         c_src.unlink(missing_ok=True)
         out_macho.unlink(missing_ok=True)
 
@@ -1307,12 +1895,75 @@ def _build_mock_binaries(mock_bin_dir: Path) -> None:
     pe_stub = b"MZ" + b"\x00" * 58 + struct.pack("<I", 64) + b"PE\x00\x00ferric-mock-win64"
     for win_name in (f"{GUI_BIN}.exe", f"{CLI_BIN}.exe", f"{CLI_ALIAS_BIN}.exe"):
         (mock_bin_dir / win_name).write_bytes(pe_stub)
+    return built_macho
+
+
+def _verify_macos_self_test_bundle(
+    dist_dir: Path,
+    version: str,
+    platform_slug: str,
+    expected_lipo_arch: Optional[str],
+    is_macos_dmg_capable: bool,
+) -> None:
+    app_bundle = dist_dir / f"{APP_NAME}.app"
+    validate_info_plist(app_bundle / "Contents" / "Info.plist", version)
+    if (app_bundle / "Contents" / "PkgInfo").read_bytes() != b"APPL????":
+        raise AssertionError("Invalid Contents/PkgInfo bytes")
+    validate_icns_bytes((app_bundle / "Contents" / "Resources" / f"{APP_NAME}.icns").read_bytes())
+
+    if expected_lipo_arch is not None and sys.platform == "darwin" and shutil.which("lipo"):
+        for bin_name in (GUI_BIN, CLI_BIN):
+            archs = subprocess.check_output(
+                ["lipo", "-archs", str(app_bundle / "Contents" / "MacOS" / bin_name)],
+                text=True,
+            ).strip()
+            if archs != expected_lipo_arch:
+                raise AssertionError(
+                    f"Expected lipo -archs {expected_lipo_arch!r} for {platform_slug}/{bin_name}, got {archs!r}"
+                )
+
+    mac_prefix = f"{APP_SLUG}-v{version}-{platform_slug}"
+    mac_tar = dist_dir / f"{mac_prefix}.tar.gz"
+    with tarfile.open(mac_tar, "r:gz") as tf:
+        members = {m.name: m for m in tf.getmembers()}
+        for req_exec in (
+            f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/{GUI_BIN}",
+            f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/{CLI_BIN}",
+            f"{mac_prefix}/bin/{CLI_BIN}",
+        ):
+            if req_exec not in members:
+                raise AssertionError(f"Missing {req_exec} in {platform_slug} .tar.gz")
+            if (members[req_exec].mode & 0o777) != 0o755:
+                raise AssertionError(f"Expected 0755 on {req_exec}, got {oct(members[req_exec].mode)}")
+        for absent_alias in (
+            f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/{CLI_ALIAS_BIN}",
+            f"{mac_prefix}/bin/{CLI_ALIAS_BIN}",
+        ):
+            if absent_alias in members:
+                raise AssertionError(f"Deprecated alias {absent_alias} must not ship")
+        for req_doc in (
+            f"{mac_prefix}/{APP_NAME}.app/Contents/Info.plist",
+            f"{mac_prefix}/{APP_NAME}.app/Contents/PkgInfo",
+            f"{mac_prefix}/{APP_NAME}.app/Contents/Resources/{APP_NAME}.icns",
+            f"{mac_prefix}/README.md",
+            f"{mac_prefix}/THIRD_PARTY.md",
+        ):
+            if req_doc not in members:
+                raise AssertionError(f"Missing {req_doc} in {platform_slug} .tar.gz")
+
+    if is_macos_dmg_capable:
+        mac_dmg = dist_dir / f"{mac_prefix}.dmg"
+        if not mac_dmg.is_file() or mac_dmg.stat().st_size <= 0:
+            raise AssertionError(f"{platform_slug} .dmg was not created")
+        subprocess.run(["hdiutil", "imageinfo", str(mac_dmg)], check=True, capture_output=True, text=True)
 
 
 def run_self_test(repo_root: Path) -> int:
-    """Exercise icon encoders, all 3 platform packagers, permissions, and SHA256SUMS."""
+    """Exercise icon encoders, all 5 platform packagers, .deb/.rpm metadata, and SHA256SUMS."""
     version = read_workspace_version(repo_root)
     is_macos_dmg_capable = sys.platform == "darwin" and bool(shutil.which("hdiutil"))
+    has_dpkg_deb = bool(shutil.which("dpkg-deb"))
+    has_rpmbuild = bool(shutil.which("rpmbuild"))
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -1327,72 +1978,62 @@ def run_self_test(repo_root: Path) -> int:
             if p1.read_bytes() != emitted_2[key].read_bytes():
                 raise AssertionError(f"Non-deterministic icon output for {key}")
         print(
-            f"[self-test 1/5] Icon suite OK: PNGs (16,32,48,64,128,256,512), "
+            f"[self-test 1/7] Icon suite OK: PNGs (16,32,48,64,128,256,512), "
             f"ICNS ({emitted['icns'].stat().st_size} B), "
             f"ICO ({emitted['ico'].stat().st_size} B), "
             f"SVG ({emitted['svg'].stat().st_size} B)"
         )
 
-        mock_bins = tmp_path / "mock_bins"
-        _build_mock_binaries(mock_bins)
+        mock_bins_arm64 = tmp_path / "mock_bins_arm64"
+        built_arm64_macho = _build_mock_binaries(mock_bins_arm64, macos_arch="arm64")
+        mock_bins_x86_64 = tmp_path / "mock_bins_x86_64"
+        built_x86_64_macho = _build_mock_binaries(mock_bins_x86_64, macos_arch="x86_64")
         dist_dir = tmp_path / "dist"
 
-        # 1. macOS arm64 bundle + .dmg (on macOS) + .tar.gz
-        mac_outputs = package_macos_arm64(
+        # 2. macOS arm64 bundle + .dmg (on macOS) + .tar.gz
+        mac_arm_outputs = package_macos_arm64(
             repo_root=repo_root,
-            bin_dir=mock_bins,
+            bin_dir=mock_bins_arm64,
             out_dir=dist_dir,
             version=version,
             skip_dmg=not is_macos_dmg_capable,
         )
-        app_bundle = dist_dir / f"{APP_NAME}.app"
-        validate_info_plist(app_bundle / "Contents" / "Info.plist", version)
-        if (app_bundle / "Contents" / "PkgInfo").read_bytes() != b"APPL????":
-            raise AssertionError("Invalid Contents/PkgInfo bytes")
-        validate_icns_bytes((app_bundle / "Contents" / "Resources" / f"{APP_NAME}.icns").read_bytes())
-
-        mac_prefix = f"{APP_SLUG}-v{version}-macos-arm64"
-        mac_tar = dist_dir / f"{mac_prefix}.tar.gz"
-        with tarfile.open(mac_tar, "r:gz") as tf:
-            members = {m.name: m for m in tf.getmembers()}
-            for req_exec in (
-                f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/{GUI_BIN}",
-                f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/{CLI_BIN}",
-                f"{mac_prefix}/bin/{CLI_BIN}",
-            ):
-                if req_exec not in members:
-                    raise AssertionError(f"Missing {req_exec} in macOS .tar.gz")
-                if (members[req_exec].mode & 0o777) != 0o755:
-                    raise AssertionError(f"Expected 0755 on {req_exec}, got {oct(members[req_exec].mode)}")
-            for absent_alias in (
-                f"{mac_prefix}/{APP_NAME}.app/Contents/MacOS/{CLI_ALIAS_BIN}",
-                f"{mac_prefix}/bin/{CLI_ALIAS_BIN}",
-            ):
-                if absent_alias in members:
-                    raise AssertionError(f"Deprecated alias {absent_alias} must not ship in v0.15.0")
-            for req_doc in (
-                f"{mac_prefix}/{APP_NAME}.app/Contents/Info.plist",
-                f"{mac_prefix}/{APP_NAME}.app/Contents/PkgInfo",
-                f"{mac_prefix}/{APP_NAME}.app/Contents/Resources/{APP_NAME}.icns",
-                f"{mac_prefix}/README.md",
-                f"{mac_prefix}/THIRD_PARTY.md",
-            ):
-                if req_doc not in members:
-                    raise AssertionError(f"Missing {req_doc} in macOS .tar.gz")
-
-        if is_macos_dmg_capable:
-            mac_dmg = dist_dir / f"{mac_prefix}.dmg"
-            if not mac_dmg.is_file() or mac_dmg.stat().st_size <= 0:
-                raise AssertionError("macOS .dmg was not created")
-            subprocess.run(["hdiutil", "imageinfo", str(mac_dmg)], check=True, capture_output=True, text=True)
+        _verify_macos_self_test_bundle(
+            dist_dir=dist_dir,
+            version=version,
+            platform_slug="macos-arm64",
+            expected_lipo_arch="arm64" if built_arm64_macho else None,
+            is_macos_dmg_capable=is_macos_dmg_capable,
+        )
         print(
-            f"[self-test 2/5] macos-arm64 OK: {[p.name for p in mac_outputs]} "
+            f"[self-test 2/7] macos-arm64 OK: {[p.name for p in mac_arm_outputs]} "
             f"(Info.plist + PkgInfo + 0755 binaries"
-            f"{' + codesign + UDZO .dmg' if is_macos_dmg_capable else ''})"
+            f"{' + arm64 lipo + codesign + UDZO .dmg' if is_macos_dmg_capable else ''})"
         )
 
-        # 2. Windows x86_64 .zip
-        win_outputs = package_windows_x86_64(repo_root, mock_bins, dist_dir, version)
+        # 3. macOS Intel x86_64 bundle + .dmg (on macOS) + .tar.gz
+        mac_x64_outputs = package_macos_x86_64(
+            repo_root=repo_root,
+            bin_dir=mock_bins_x86_64,
+            out_dir=dist_dir,
+            version=version,
+            skip_dmg=not is_macos_dmg_capable,
+        )
+        _verify_macos_self_test_bundle(
+            dist_dir=dist_dir,
+            version=version,
+            platform_slug="macos-x86_64",
+            expected_lipo_arch="x86_64" if built_x86_64_macho else None,
+            is_macos_dmg_capable=is_macos_dmg_capable,
+        )
+        print(
+            f"[self-test 3/7] macos-x86_64 OK: {[p.name for p in mac_x64_outputs]} "
+            f"(Info.plist + PkgInfo + 0755 binaries"
+            f"{' + x86_64 lipo + codesign + UDZO .dmg' if is_macos_dmg_capable else ''})"
+        )
+
+        # 4. Windows x86_64 .zip
+        win_outputs = package_windows_x86_64(repo_root, mock_bins_arm64, dist_dir, version)
         win_prefix = f"{APP_SLUG}-v{version}-windows-x86_64"
         win_zip = win_outputs[0]
         with zipfile.ZipFile(win_zip, "r") as zf:
@@ -1408,18 +2049,25 @@ def run_self_test(repo_root: Path) -> int:
                 if req_win not in names:
                     raise AssertionError(f"Missing {req_win} in Windows .zip")
             if f"{win_prefix}/{CLI_ALIAS_BIN}.exe" in names:
-                raise AssertionError("Deprecated nmrassign.exe alias must not ship in v0.15.0")
+                raise AssertionError("Deprecated nmrassign.exe alias must not ship")
             validate_ico_bytes(zf.read(f"{win_prefix}/{APP_SLUG}.ico"), ICO_SIZES)
         win_repeat_dir = tmp_path / "win_repeat"
-        win_repeat = package_windows_x86_64(repo_root, mock_bins, win_repeat_dir, version)[0]
+        win_repeat = package_windows_x86_64(repo_root, mock_bins_arm64, win_repeat_dir, version)[0]
         if win_zip.read_bytes() != win_repeat.read_bytes():
             raise AssertionError("Windows .zip output is not byte-for-byte deterministic")
-        print(f"[self-test 3/5] windows-x86_64 OK: {win_zip.name} ({win_zip.stat().st_size} B, deterministic)")
+        print(f"[self-test 4/7] windows-x86_64 OK: {win_zip.name} ({win_zip.stat().st_size} B, deterministic)")
 
-        # 3. Linux x86_64 .tar.gz + XDG desktop installer test
-        lin_outputs = package_linux_x86_64(repo_root, mock_bins, dist_dir, version)
+        # 5. Linux x86_64 .tar.gz + .deb/.rpm metadata (and live .deb/.rpm when tools exist) + XDG installer
+        lin_outputs = package_linux_x86_64(
+            repo_root,
+            mock_bins_arm64,
+            dist_dir,
+            version,
+            skip_deb=not has_dpkg_deb,
+            skip_rpm=not has_rpmbuild,
+        )
         lin_prefix = f"{APP_SLUG}-v{version}-linux-x86_64"
-        lin_tar = lin_outputs[0]
+        lin_tar = dist_dir / f"{lin_prefix}.tar.gz"
         with tarfile.open(lin_tar, "r:gz") as tf:
             members = {m.name: m for m in tf.getmembers()}
             for req_exec in (
@@ -1432,7 +2080,7 @@ def run_self_test(repo_root: Path) -> int:
                 if (members[req_exec].mode & 0o777) != 0o755:
                     raise AssertionError(f"Expected 0755 on {req_exec}, got {oct(members[req_exec].mode)}")
             if f"{lin_prefix}/bin/{CLI_ALIAS_BIN}" in members:
-                raise AssertionError("Deprecated nmrassign alias must not ship in Linux v0.15.0 archive")
+                raise AssertionError("Deprecated nmrassign alias must not ship in Linux archive")
             for req_file in (
                 f"{lin_prefix}/share/applications/{APP_SLUG}.desktop",
                 f"{lin_prefix}/share/icons/hicolor/scalable/apps/{APP_SLUG}.svg",
@@ -1453,7 +2101,6 @@ def run_self_test(repo_root: Path) -> int:
                 else:
                     tf.extractall(extract_dir)
                 xdg_prefix = tmp_path / "xdg_local"
-                # Stage a legacy v0.13.0/v0.14.x layout to verify upgrade cleanup
                 legacy_alias = xdg_prefix / "bin" / CLI_ALIAS_BIN
                 legacy_bin = xdg_prefix / "bin" / "nmrassign-gui"
                 legacy_desktop = xdg_prefix / "share" / "applications" / "nmr-assign.desktop"
@@ -1481,18 +2128,181 @@ def run_self_test(repo_root: Path) -> int:
                 ):
                     raise AssertionError("install-desktop.sh failed to populate XDG prefix")
 
-        lin_repeat_dir = tmp_path / "lin_repeat"
-        lin_repeat = package_linux_x86_64(repo_root, mock_bins, lin_repeat_dir, version)[0]
-        if lin_tar.read_bytes() != lin_repeat.read_bytes():
-            raise AssertionError("Linux .tar.gz output is not byte-for-byte deterministic")
-        print(f"[self-test 4/5] linux-x86_64 OK: {lin_tar.name} ({lin_tar.stat().st_size} B, deterministic)")
+        if has_dpkg_deb:
+            lin_deb = dist_dir / f"{lin_prefix}.deb"
+            info_out = subprocess.check_output(["dpkg-deb", "--info", str(lin_deb)], text=True)
+            contents_out = subprocess.check_output(["dpkg-deb", "--contents", str(lin_deb)], text=True)
+            if "Architecture: amd64" not in info_out or "libc6 (>= 2.34)" not in info_out:
+                raise AssertionError(f"Unexpected linux-x86_64 .deb metadata: {info_out}")
+            for req_deb_path in (
+                "./usr/bin/ferric",
+                "./usr/bin/ferric-gui",
+                "./usr/share/applications/ferric.desktop",
+                "./usr/share/icons/hicolor/256x256/apps/ferric.png",
+            ):
+                if req_deb_path not in contents_out:
+                    raise AssertionError(f"Missing {req_deb_path} in linux-x86_64 .deb")
 
-        # 4. Checksum generation & tamper detection
+        if has_rpmbuild and shutil.which("rpm"):
+            lin_rpm = dist_dir / f"{lin_prefix}.rpm"
+            rpm_out = subprocess.check_output(["rpm", "-qp", "--info", "--list", str(lin_rpm)], text=True)
+            for req_rpm_path in (
+                "/usr/bin/ferric",
+                "/usr/bin/ferric-gui",
+                "/usr/share/applications/ferric.desktop",
+                "/usr/share/icons/hicolor/256x256/apps/ferric.png",
+            ):
+                if req_rpm_path not in rpm_out:
+                    raise AssertionError(f"Missing {req_rpm_path} in linux-x86_64 .rpm")
+
+        lin_repeat_dir = tmp_path / "lin_repeat"
+        lin_repeat = package_linux_x86_64(
+            repo_root, mock_bins_arm64, lin_repeat_dir, version, skip_deb=True, skip_rpm=True
+        )[0]
+        if lin_tar.read_bytes() != lin_repeat.read_bytes():
+            raise AssertionError("Linux x86_64 .tar.gz output is not byte-for-byte deterministic")
+        print(
+            f"[self-test 5/7] linux-x86_64 OK: {[p.name for p in lin_outputs]} "
+            f"(deterministic .tar.gz + validated amd64/x86_64 .deb/.rpm specs)"
+        )
+
+        # 6. Linux i686 static CLI-only .tar.gz + .deb/.rpm metadata (without ferric-gui!)
+        cli_only_bins = tmp_path / "mock_bins_i686_cli"
+        cli_only_bins.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(mock_bins_arm64 / CLI_BIN, cli_only_bins / CLI_BIN)
+        i686_outputs = package_linux_i686_cli(
+            repo_root,
+            cli_only_bins,
+            dist_dir,
+            version,
+            skip_deb=not has_dpkg_deb,
+            skip_rpm=not has_rpmbuild,
+        )
+        i686_prefix = f"{APP_SLUG}-v{version}-linux-i686-cli"
+        i686_tar = dist_dir / f"{i686_prefix}.tar.gz"
+        with tarfile.open(i686_tar, "r:gz") as tf:
+            members = {m.name: m for m in tf.getmembers()}
+            if f"{i686_prefix}/bin/{CLI_BIN}" not in members:
+                raise AssertionError("Missing bin/ferric in linux-i686-cli .tar.gz")
+            if (members[f"{i686_prefix}/bin/{CLI_BIN}"].mode & 0o777) != 0o755:
+                raise AssertionError("Expected 0755 on bin/ferric in linux-i686-cli .tar.gz")
+            for forbidden in (
+                f"{i686_prefix}/bin/{GUI_BIN}",
+                f"{i686_prefix}/share/applications/{APP_SLUG}.desktop",
+            ):
+                if forbidden in members:
+                    raise AssertionError(f"CLI-only i686 archive must not include {forbidden}")
+            for req_doc in (f"{i686_prefix}/README.md", f"{i686_prefix}/THIRD_PARTY.md"):
+                if req_doc not in members:
+                    raise AssertionError(f"Missing {req_doc} in linux-i686-cli .tar.gz")
+
+        if has_dpkg_deb:
+            i686_deb = dist_dir / f"{i686_prefix}.deb"
+            info_out = subprocess.check_output(["dpkg-deb", "--info", str(i686_deb)], text=True)
+            contents_out = subprocess.check_output(["dpkg-deb", "--contents", str(i686_deb)], text=True)
+            if "Architecture: i386" not in info_out:
+                raise AssertionError(f"Expected Architecture: i386 in i686 .deb: {info_out}")
+            if "./usr/bin/ferric" not in contents_out or "ferric-gui" in contents_out:
+                raise AssertionError(f"Unexpected contents in i686 CLI .deb: {contents_out}")
+
+        if has_rpmbuild and shutil.which("rpm"):
+            i686_rpm = dist_dir / f"{i686_prefix}.rpm"
+            rpm_out = subprocess.check_output(["rpm", "-qp", "--info", "--list", str(i686_rpm)], text=True)
+            if "/usr/bin/ferric" not in rpm_out or "ferric-gui" in rpm_out:
+                raise AssertionError(f"Unexpected contents in i686 CLI .rpm: {rpm_out}")
+
+        i686_repeat_dir = tmp_path / "i686_repeat"
+        i686_repeat = package_linux_i686_cli(
+            repo_root, cli_only_bins, i686_repeat_dir, version, skip_deb=True, skip_rpm=True
+        )[0]
+        if i686_tar.read_bytes() != i686_repeat.read_bytes():
+            raise AssertionError("Linux i686 CLI .tar.gz output is not byte-for-byte deterministic")
+
+        # Exercise _build_deb_package / _build_rpm_package subprocess plumbing on macOS hosts too
+        if os.name != "nt" and shutil.which("bash") and (not has_dpkg_deb or not has_rpmbuild):
+            shim_dir = tmp_path / "pkg_shims"
+            shim_dir.mkdir(parents=True, exist_ok=True)
+            dpkg_shim = shim_dir / "dpkg-deb"
+            dpkg_shim.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'test "$1" = "-Zxz"\n'
+                'test "$2" = "--build"\n'
+                'test "$3" = "--root-owner-group"\n'
+                'test -f "$4/DEBIAN/control"\n'
+                'test -f "$4/DEBIAN/md5sums"\n'
+                'printf "!<arch>\\ndebian-binary   mock\\n" > "$5"\n',
+                encoding="utf-8",
+                newline="\n",
+            )
+            os.chmod(dpkg_shim, 0o755)
+            rpm_shim = shim_dir / "rpmbuild"
+            rpm_shim.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'test "$1" = "-bb"\n'
+                'test "$2" = "--target"\n'
+                'ARCH="${3%-linux}"\n'
+                'test "$4" = "--define"\n'
+                'TOPDIR="${5#_topdir }"\n'
+                'test -f "$6"\n'
+                'mkdir -p "${TOPDIR}/RPMS/${ARCH}"\n'
+                'printf "\\xed\\xab\\xee\\xdbmock-rpm" > "${TOPDIR}/RPMS/${ARCH}/ferric-mock.${ARCH}.rpm"\n',
+                encoding="utf-8",
+                newline="\n",
+            )
+            os.chmod(rpm_shim, 0o755)
+            old_path = os.environ.get("PATH", "")
+            try:
+                os.environ["PATH"] = f"{shim_dir}{os.pathsep}{old_path}"
+                shim_out = tmp_path / "shim_out"
+                x64_all = package_linux_x86_64(
+                    repo_root, mock_bins_arm64, shim_out, version, skip_deb=False, skip_rpm=False
+                )
+                i686_all = package_linux_i686_cli(
+                    repo_root, cli_only_bins, shim_out, version, skip_deb=False, skip_rpm=False
+                )
+                if [p.name for p in x64_all] != [
+                    f"{lin_prefix}.tar.gz",
+                    f"{lin_prefix}.deb",
+                    f"{lin_prefix}.rpm",
+                ]:
+                    raise AssertionError(f"Unexpected x86_64 artifact list: {[p.name for p in x64_all]}")
+                if [p.name for p in i686_all] != [
+                    f"{i686_prefix}.tar.gz",
+                    f"{i686_prefix}.deb",
+                    f"{i686_prefix}.rpm",
+                ]:
+                    raise AssertionError(f"Unexpected i686 artifact list: {[p.name for p in i686_all]}")
+            finally:
+                os.environ["PATH"] = old_path
+
+        print(
+            f"[self-test 6/7] linux-i686-cli OK: {[p.name for p in i686_outputs]} "
+            f"(CLI-only deterministic .tar.gz + validated i386/i686 .deb/.rpm specs)"
+        )
+
+        # 7. Checksum generation & tamper detection (including .deb and .rpm suffixes)
         sums_file = write_checksums(dist_dir)
         verified = verify_checksums(dist_dir)
-        expected_count = 4 if is_macos_dmg_capable else 3
+        expected_count = (
+            (4 if is_macos_dmg_capable else 2)  # macos-arm64 + macos-x86_64
+            + 1  # windows-x86_64 .zip
+            + 2  # linux-x86_64 + linux-i686-cli .tar.gz
+            + (2 if has_dpkg_deb else 0)
+            + (2 if has_rpmbuild else 0)
+        )
         if len(verified) != expected_count:
             raise AssertionError(f"Expected {expected_count} checksummed archives, got {len(verified)}")
+
+        # Explicitly verify .deb and .rpm discovery in write_checksums even on macOS/Windows hosts
+        suffix_probe_dir = tmp_path / "suffix_probe"
+        suffix_probe_dir.mkdir(parents=True, exist_ok=True)
+        for ext in RELEASE_ARCHIVE_SUFFIXES:
+            (suffix_probe_dir / f"probe{ext}").write_bytes(f"payload-{ext}".encode("utf-8"))
+        write_checksums(suffix_probe_dir)
+        if len(verify_checksums(suffix_probe_dir)) != len(RELEASE_ARCHIVE_SUFFIXES):
+            raise AssertionError("SHA256SUMS failed to index all 5 release archive extensions")
 
         # Flip one byte in Windows zip and ensure verify_checksums rejects it
         orig_bytes = win_zip.read_bytes()
@@ -1508,8 +2318,8 @@ def run_self_test(repo_root: Path) -> int:
             raise AssertionError("verify_checksums failed to detect archive byte corruption")
         verify_checksums(dist_dir)
         print(
-            f"[self-test 5/5] SHA256SUMS.txt OK: {len(verified)} archives verified "
-            f"({sums_file.stat().st_size} B) + tamper rejection confirmed"
+            f"[self-test 7/7] SHA256SUMS.txt OK: {len(verified)} archives verified "
+            f"({sums_file.stat().st_size} B, all 5 suffixes indexed) + tamper rejection confirmed"
         )
 
     print(f"ALL SELF-TESTS PASSED ({APP_NAME} v{version})")
@@ -1551,7 +2361,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--skip-dmg",
         action="store_true",
-        help="Skip macOS hdiutil .dmg image creation when packaging macos-arm64.",
+        help="Skip macOS hdiutil .dmg image creation when packaging macos-arm64 or macos-x86_64.",
+    )
+    parser.add_argument(
+        "--skip-deb",
+        action="store_true",
+        help="Skip Debian/Ubuntu .deb creation when packaging linux-x86_64 or linux-i686-cli.",
+    )
+    parser.add_argument(
+        "--skip-rpm",
+        action="store_true",
+        help="Skip RHEL/Fedora .rpm creation when packaging linux-x86_64 or linux-i686-cli.",
     )
     parser.add_argument(
         "--emit-icons",
@@ -1602,10 +2422,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for target in targets:
             if target == "macos-arm64":
                 built = package_macos_arm64(repo_root, bin_dir, out_dir, version, skip_dmg=args.skip_dmg)
+            elif target == "macos-x86_64":
+                built = package_macos_x86_64(repo_root, bin_dir, out_dir, version, skip_dmg=args.skip_dmg)
             elif target == "windows-x86_64":
                 built = package_windows_x86_64(repo_root, bin_dir, out_dir, version)
             elif target == "linux-x86_64":
-                built = package_linux_x86_64(repo_root, bin_dir, out_dir, version)
+                built = package_linux_x86_64(
+                    repo_root,
+                    bin_dir,
+                    out_dir,
+                    version,
+                    skip_deb=args.skip_deb,
+                    skip_rpm=args.skip_rpm,
+                )
+            elif target == "linux-i686-cli":
+                built = package_linux_i686_cli(
+                    repo_root,
+                    bin_dir,
+                    out_dir,
+                    version,
+                    skip_deb=args.skip_deb,
+                    skip_rpm=args.skip_rpm,
+                )
             else:
                 raise ValueError(f"Unhandled platform: {target}")
             for artifact in built:
