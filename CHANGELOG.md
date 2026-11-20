@@ -4,6 +4,29 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
+## [0.17.1] — 2026-11-19
+
+### Interactive Workbench UX, Metabolomics BMRB-BMSE Identification, Phase 22 GUI Wiring & Multi-Distro Release Packaging (Claude Round-4 `APPROVE_WITH_FOLLOWUPS`)
+
+- **Release Provenance**: Claude Round-4 `APPROVE_WITH_FOLLOWUPS` (`pretag=none`, `maintainer=none`) on `ed4dd34`, with full workspace release tests (`core` 632/0, `cli` 116/0, `gui` 223/0, `gpu` 63/0), `fmt`, `clippy -D warnings`, `wasm32-unknown-unknown`, Ubiquitin 5-seed exact (`310/315` evo-graph CPU, `170/175` standard CPU, `181/189` standard GPU), docs/CLI-flags/p17/package/tours self-tests, `0`-byte protected diff on `docs/specs/03-assignment.md` & `.github/workflows/docs.yml`, and a full local **AlmaLinux 9 (`glibc 2.34`)** Docker build + `rpm -Uvh` + `ferric benchmark` replay. Also folds in `origin/main` CI fixes (`beffa918`, `a5489596`, `a1c455ea`).
+- **VnmrJ/Mnova-Inspired Workbench UX & 3D Assignment Data Input**:
+  - Added color-coded left vertical mouse-mode rails (`nmr-gui::vnmrj_rail`) for 1D, 2D, and 3D views, restored the 16-tool ChemDraw-style left vector icon rail in `OctetDrawPanel`, and added connected folder-style `1H NMR | 13C{1H} NMR` tabs.
+  - Added the 3-step `Run Assignment` setup drawer (`nmr-gui::assign_setup_drawer`) with a 7-slot 3D data-input mapper (`Load Study Folder...`, per-slot `Load...`/`Clear`/experiment override writing canonical `HNCACO`/`CBCACONH`/`HNCOCA` keys), real two-pass `pick_triple_3d_two_pass` in `PickAllSpectra` with matrix rebuild + stale `assign_res` invalidation, and dedicated `hncaco_3d` routing for full `CO` (`HNCO` + `HN(CA)CO`) sequential walk strips (`nmr-gui::strip_tiler`).
+  - Wired strict greedy one-to-one solver-assigned `HSQC` -> `RelaxPanel` peak syncing (`sync_assigned_hsqc_peaks_to_relax`), atomic `purge_unassigned_picks()` on assignment sync, shared locked `auto_picked_seeds` across unassigned pseudo-3D slots with fail-closed blocking of unassigned picks from Model-Free / Detectors / IMPACT / 3D export, explicit CPMG `vclist` cycle duration validation, `HetNoeOrder::Auto` default, and preserved imported DANTE/cos-CEST `B1` fields.
+- **Octet Collected 1D <-> Predicted 1D Auto-Assign & Honest Experimental ACS**:
+  - Added `nmr-core::octet_assign` with peak-preserving decimation (`decimate_trace_peak_preserving`), full-resolution peak extraction (`64k`-pt `0.8 Hz` singlet detection), many-to-one composite multiplet matching, real `axis.obs_mhz` & `13C` Larmor frequency propagation, `experimental_solvent: Option<String>` (never fabricated), measured-only ACS summaries, read-only `OctetDrawPanel::predict_1d_from_current_scene` for blank-SMILES `"Use Octet (1H/13C)"` overlays, fail-closed `predict_1d_from_smiles_standalone`, and honest default `Stack1dState` (`solvent_choice = ""`, `target_total_protons = 0.0`).
+- **Metabolomics Live-Verified BMRB-BMSE Database & Local Chance-Match Scoring**:
+  - Added `nmr-core::metabolite_db` with **57 live-verified BMRB-BMSE entries** (`api.bmrb.io/v2/entry/<id>`, including live `_Peak_char` Citrate `bmse000076` AB doublet shifts `2.531`/`2.661` ppm, `|2J_AB| = 15.2 Hz`), accurate BMRB attribution (`free access, © UConn Health, acknowledgement requested`), non-clobbering online BMRB `shift=` lookup + honest NP-MRD web search URLs + off-UI-thread GUI search, MAD-SNR local-maxima 1D peak picking, and local chance-match probability specificity scoring (held-out 24-query Recall@k `0.88` ppm-only / `0.94` with multiplicity, P@12 `0.90–0.95`).
+- **Phase 22 GUI Wiring & Crossref-Verified References**:
+  - Wired all 6 ready Phase 22 quantitative engines (`Deconv 2D (VarPro)`, `MaxEnt 2D NUS` with real user TSV loading + `[Synthetic 3-Peak Demo]` badge, `ARTSY RDC` with editable `J_iso ± σ_J` quadrature propagation, `PCS Transfer + Curie CCR`, `DANTE/cos-CEST`, `2D Titration`, `Dynamics Detectors`, `IMPACT`, `TRACT`) into `ferric-gui` with off-UI-thread `BackgroundJobSlot` execution.
+  - Added Crossref/PubMed-verified `REFERENCES.md`, `docs/manual/10-references-and-acknowledgments.md`, and the in-app `About & References` modal (`nmr-gui::about_references_modal`), and clarified desktop-only MCP bridge availability in docs.
+- **Expanded Multi-Platform Release Packaging (`scripts/package_release.py`, `.github/workflows/release.yml`)**:
+  - **Linux `x86_64` (RHEL 9.x / AlmaLinux 9 / Ubuntu / Debian)**: builds inside `almalinux:9` (`glibc <= 2.34`, fixing `hypot@@GLIBC_2.35` on RHEL 9.x) and emits `.tar.gz`, `.deb`, and `.rpm` (with `rpm -Uvh` smoke test).
+  - **macOS Intel (`x86_64-apple-darwin`)**: cross-compiled on `macos-latest` -> `.dmg` + `.tar.gz` alongside `macos-arm64`.
+  - **Linux `i686` CLI-only (`i686-unknown-linux-musl`)**: static zero-dependency `ferric` binary -> `.tar.gz`, `.deb`, and `.rpm`.
+
+---
+
 ## [0.17.0] — 2026-11-19
 
 ### Phase 22 — Quantitative Spectroscopy, Relaxation Physics, Neural Inference Architectures & Typed DAG Workflow Engine (`T22.1`–`T22.13`)

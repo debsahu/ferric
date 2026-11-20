@@ -242,7 +242,13 @@ Specs: `docs/specs/`. Agent rules: `AGENTS.md`.
 
 ## Housekeeping
 - [x] (A) CCPN NEF v1.1 lossless import/export (`nmr-core::nef`, `ferric nef-import` / `nef-export`)
-- [x] (A) Single-source SemVer versioning (`v0.17.0` -> upcoming `v0.17.1`, `nmr_core::VERSION`, `ferric --version` with short git SHA, NEF/HTML/API provenance, annotated `vX.Y.Z` git tags)
+- [x] (A) Single-source SemVer versioning (`v0.17.1`, `nmr_core::VERSION`, `ferric --version` with short git SHA, NEF/HTML/API provenance, annotated `vX.Y.Z` git tags)
 - [x] (M) Choose a public project name -> FERRIC (maintainer sign-off 2026-11-16, `data/private/PHASE18_FERRIC_RENAME_BRIEF.md`)
 - [ ] (M) Patent search on deep-learning peak picking and automated assignment
 - [x] (A) Add `CONTRIBUTING.md`, `THIRD_PARTY.md`, author metadata, and CI workflow
+- [ ] (A) **`v0.17.1` Follow-Ups (P2, non-blocking — carried from Claude Round-4 `APPROVE_WITH_FOLLOWUPS`)**:
+  1. **Release Packaging**: Keep `package_release.py` Python 3.9 compatible (`open(..., newline="\n")` instead of `Path.write_text(newline=...)` for stock RHEL 9 python3); declare optional GUI runtime libs (`libxkbcommon`, `libX11`/`libxcb`, `wayland`, `vulkan-loader`) as `Recommends`/`Suggests` in `.rpm`/`.deb`; install `git` or pass `FERRIC_GIT_SHA` into the `almalinux:9` build container so `--version` shows the commit SHA; pin `almalinux:9` digest & `rustup` version; bump Linux cache key; ship `LICENSE` + `.deb` `copyright`; add Gatekeeper note for ad-hoc signed macOS builds; test `i686` `--engine auto` CPU fallback; add build provenance / signed `SHA256SUMS`.
+  2. **Metabolomics**: Label offline match score explicitly as an uncalibrated similarity score in GUI (`P2-D`); update 3-hydroxybutyrate, asparagine, and glycerol `CH2` shifts to live BMRB `_Peak_char` observed lines (`P2-E`); guard stale online merge into later offline-only queries & deduplicate offline+online accessions.
+  3. **Assign & Relax**: Use a disjoint negative/high ID range for unassigned auto-picks (`P2-11`) and reset stale `auto_picked_seeds` on a fresh unassigned T1 load; normalize `"15N-HSQC"`/`TROSY` root labels in core `build_spin_systems`; honor or label `use_af_priors`; allow plain-integer seconds in T1 `vdlist` override.
+  4. **Octet & 1D Suite**: Exclude residual CHCl3 peak (`7.26 ppm`) from ACS & avoid rounding tiny `<0.3H` areas up to `1H` (`P2-12`); refresh cached signals inside `predict_1d_from_current_scene` when scene is dirty (`P2-13`); pass measured solvent to Octet & refresh sync key on 1D reprocessing.
+  5. **Phase 22 GUI Tools**: Reject 3-column 1D-slice TSV in 2D MaxEnt NUS; tag/cancel stale background jobs after grid edits; warn on duplicate TSV rows.
