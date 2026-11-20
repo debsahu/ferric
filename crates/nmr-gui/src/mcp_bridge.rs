@@ -43,6 +43,7 @@ use serde_json::{json, Value};
 
 use crate::contour_painter::SyncCrosshair;
 use crate::strip_tiler::{StripMatchCandidate, StripMatchDirection};
+use crate::workflow_bar::WorkbenchAction;
 
 /// Negotiated Model Context Protocol specification revision.
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -191,6 +192,20 @@ pub struct WorkbenchSnapshot {
     pub picker_mode: String,
     /// Active peak-picking minimum SNR threshold.
     pub picker_snr: f64,
+    /// Active top-level workspace mode (`"ProteinNmr"`, `"OctetChem"`, `"Dosy"`, `"Metabolomics"`).
+    pub workspace_mode: String,
+    /// Active 2D/3D workbook page index.
+    pub active_page_index: usize,
+    /// Active backbone solver backend (`"evo-graph"`, `"standard"`, `"bayes-sa"`).
+    pub solver_kind: String,
+    /// Active 2D/3D contour floor threshold.
+    pub contour_base: f64,
+    /// Active 2D viewport chemical shift bounds `[h_left, h_right, n_top, n_bottom]`.
+    pub view_bounds: [f64; 4],
+    /// Live background ingest progress status text, if any.
+    pub ingest_progress_text: String,
+    /// Per-experiment picked peak counts keyed by experiment label.
+    pub peaks_by_experiment: BTreeMap<String, usize>,
 }
 
 impl Default for WorkbenchSnapshot {
@@ -218,6 +233,13 @@ impl Default for WorkbenchSnapshot {
             ingest_in_progress: false,
             picker_mode: "classical".to_string(),
             picker_snr: 5.0,
+            workspace_mode: "ProteinNmr".to_string(),
+            active_page_index: 0,
+            solver_kind: "evo-graph".to_string(),
+            contour_base: 0.0,
+            view_bounds: [10.5, 6.0, 102.0, 134.0],
+            ingest_progress_text: String::new(),
+            peaks_by_experiment: BTreeMap::new(),
         }
     }
 }
@@ -286,8 +308,72 @@ impl WorkbenchSnapshot {
             "ingest_in_progress": self.ingest_in_progress,
             "picker_mode": self.picker_mode,
             "picker_snr": self.picker_snr,
+            "workspace_mode": self.workspace_mode,
+            "active_page_index": self.active_page_index,
+            "solver_kind": self.solver_kind,
+            "contour_base": self.contour_base,
+            "view_bounds": self.view_bounds,
+            "ingest_progress_text": self.ingest_progress_text,
+            "peaks_by_experiment": self.peaks_by_experiment,
         })
     }
+}
+
+/// Structured tabular workbench data published read-only for `inspect_workbench_data`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WorkbenchDataTables {
+    /// Per-residue assignment rows (`seq_id`, `res_name`, `spin_system_idx`, `confidence`, etc.).
+    pub assignments: Vec<Value>,
+    /// Assembled spin-system cluster rows.
+    pub spin_systems: Vec<Value>,
+    /// Picked 2D/3D cross-peak rows (`experiment`, `h_ppm`, `n_ppm`, `c_ppm`, `intensity`, etc.).
+    pub peaks: Vec<Value>,
+    /// Loaded 2D/3D workbook page descriptors.
+    pub workbook_pages: Vec<Value>,
+    /// Latest dataset quality-control report JSON, if evaluated.
+    pub qc_report: Option<Value>,
+}
+
+fn normalize_action_token(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '_' | '-' | ' ' | '\t'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Return the canonical PascalCase name of a [`WorkbenchAction`] (matching its Rust variant name).
+pub fn workbench_action_canonical_name(action: WorkbenchAction) -> String {
+    format!("{action:?}")
+}
+
+/// Return the snake_case identifier for a [`WorkbenchAction`].
+fn workbench_action_snake_name(action: WorkbenchAction) -> String {
+    let raw = workbench_action_canonical_name(action);
+    let mut out = String::with_capacity(raw.len() + 6);
+    let mut prev: Option<char> = None;
+    for ch in raw.chars() {
+        if let Some(p) = prev {
+            if (ch.is_ascii_uppercase() || ch.is_ascii_digit()) && p.is_ascii_lowercase() {
+                out.push('_');
+            }
+        }
+        out.push(ch.to_ascii_lowercase());
+        prev = Some(ch);
+    }
+    out
+}
+
+/// Parse a [`WorkbenchAction`] name case-insensitively across PascalCase (`"SwitchModeAssign"`),
+/// snake_case (`"switch_mode_assign"`), and kebab-case (`"switch-mode-assign"`).
+pub fn parse_workbench_action(name: &str) -> Option<WorkbenchAction> {
+    let target = normalize_action_token(name.trim());
+    if target.is_empty() {
+        return None;
+    }
+    WorkbenchAction::ALL
+        .iter()
+        .copied()
+        .find(|&act| normalize_action_token(&format!("{act:?}")) == target)
 }
 
 /// Undo-tagged UI navigation and resonance curation commands executable via the MCP bridge.
@@ -318,15 +404,47 @@ pub enum McpUiCommand {
         path: String,
         run_full_pipeline: bool,
     },
-    /// Queue setting the target protein amino-acid sequence in the workbench.
-    SetSequence { sequence: String },
-    /// Queue peak picking across loaded spectra with optional manual or auto SNR threshold.
+    /// Queue setting the target protein amino-acid sequence in the workbench (inline or via path).
+    SetSequence {
+        sequence: String,
+        sequence_path: Option<String>,
+    },
+    /// Queue peak picking across loaded spectra with optional manual/auto SNR and picker backend.
     PickAllSpectra {
         snr_threshold: Option<f64>,
         use_auto_threshold: bool,
+        picker_mode: Option<String>,
     },
-    /// Queue running backbone resonance assignment (`"evo-graph"`, `"standard"`, or `"bayes-sa"`).
-    RunAssignment { solver: String },
+    /// Queue running backbone resonance assignment (`"evo-graph"`, `"standard"`, `"bayes-sa"`)
+    /// with optional compute engine (`"cpu"` or `"gpu"`).
+    RunAssignment {
+        solver: String,
+        engine: Option<String>,
+    },
+    /// Queue selecting an active 2D/3D workbook page by index and/or name.
+    SelectWorkbookPage {
+        page_index: Option<usize>,
+        page_name: Option<String>,
+    },
+    /// Queue updating 2D/3D contour floor, level multiplier, and/or negative contours toggle.
+    SetContourLevel {
+        contour_base: Option<f64>,
+        multiplier: Option<f64>,
+        show_negative: Option<bool>,
+    },
+    /// Queue setting 2D viewport chemical-shift bounds `[h_left, h_right, n_top, n_bottom]`.
+    SetViewportBounds {
+        h_left: f64,
+        h_right: f64,
+        n_top: f64,
+        n_bottom: f64,
+    },
+    /// Queue exporting workbench outputs (`"star"`, `"peaks"`, `"nef"`, or `"html"`) to `prefix`.
+    ExportResults { prefix: String, format: String },
+    /// Queue locking or unlocking a 1-based residue assignment anchor.
+    SetLockResidue { seq_id: i32, locked: bool },
+    /// Queue dispatching any registered [`WorkbenchAction`] from the workbench action catalog.
+    DispatchWorkbenchAction { action: WorkbenchAction },
 }
 
 impl McpUiCommand {
@@ -368,18 +486,63 @@ impl McpUiCommand {
             } => {
                 format!("LoadStudyFolder(path={path}, run_full_pipeline={run_full_pipeline})")
             }
-            Self::SetSequence { sequence } => {
-                format!("SetSequence(len={})", sequence.len())
-            }
+            Self::SetSequence {
+                sequence,
+                sequence_path,
+            } => match sequence_path {
+                Some(p) if sequence.is_empty() => format!("SetSequence(path={p})"),
+                Some(p) => format!("SetSequence(len={}, path={p})", sequence.len()),
+                None => format!("SetSequence(len={})", sequence.len()),
+            },
             Self::PickAllSpectra {
                 snr_threshold,
                 use_auto_threshold,
-            } => match snr_threshold {
-                Some(snr) => format!("PickAllSpectra(snr={snr:.2}, auto={use_auto_threshold})"),
-                None => format!("PickAllSpectra(snr=current, auto={use_auto_threshold})"),
+                picker_mode,
+            } => {
+                let snr_str = match snr_threshold {
+                    Some(snr) => format!("{snr:.2}"),
+                    None => "current".to_string(),
+                };
+                match picker_mode {
+                    Some(mode) => format!(
+                        "PickAllSpectra(snr={snr_str}, auto={use_auto_threshold}, mode={mode})"
+                    ),
+                    None => format!("PickAllSpectra(snr={snr_str}, auto={use_auto_threshold})"),
+                }
+            }
+            Self::RunAssignment { solver, engine } => match engine {
+                Some(eng) => format!("RunAssignment(solver={solver}, engine={eng})"),
+                None => format!("RunAssignment(solver={solver})"),
             },
-            Self::RunAssignment { solver } => {
-                format!("RunAssignment(solver={solver})")
+            Self::SelectWorkbookPage {
+                page_index,
+                page_name,
+            } => {
+                format!("SelectWorkbookPage(index={page_index:?}, name={page_name:?})")
+            }
+            Self::SetContourLevel {
+                contour_base,
+                multiplier,
+                show_negative,
+            } => format!(
+                "SetContourLevel(base={contour_base:?}, mult={multiplier:?}, neg={show_negative:?})"
+            ),
+            Self::SetViewportBounds {
+                h_left,
+                h_right,
+                n_top,
+                n_bottom,
+            } => format!(
+                "SetViewportBounds(H=[{h_left:.2}, {h_right:.2}], N=[{n_top:.2}, {n_bottom:.2}])"
+            ),
+            Self::ExportResults { prefix, format } => {
+                format!("ExportResults(prefix={prefix}, format={format})")
+            }
+            Self::SetLockResidue { seq_id, locked } => {
+                format!("SetLockResidue(seq={seq_id}, locked={locked})")
+            }
+            Self::DispatchWorkbenchAction { action } => {
+                format!("DispatchWorkbenchAction({action:?})")
             }
         }
     }
@@ -414,6 +577,11 @@ enum UndoDelta {
     WorkflowAction {
         prev_status_msg: String,
         prev_picker_snr: f64,
+        prev_picker_mode: String,
+        prev_solver_kind: String,
+        prev_active_page_index: usize,
+        prev_contour_base: f64,
+        prev_view_bounds: [f64; 4],
     },
 }
 
@@ -684,59 +852,131 @@ impl McpUndoLog {
                 path,
                 run_full_pipeline,
             } => {
-                let prev_status_msg = std::mem::replace(
-                    &mut snapshot.status_msg,
-                    format!("Queued study folder load: {path} (full_pipeline={run_full_pipeline})"),
-                );
-                UndoDelta::WorkflowAction {
-                    prev_status_msg,
-                    prev_picker_snr: snapshot.picker_snr,
-                }
+                let delta = Self::capture_workflow_undo(snapshot);
+                snapshot.status_msg =
+                    format!("Queued study folder load: {path} (full_pipeline={run_full_pipeline})");
+                delta
             }
-            McpUiCommand::SetSequence { sequence } => {
-                let prev_status_msg = std::mem::replace(
-                    &mut snapshot.status_msg,
-                    format!("Queued sequence update ({} chars)", sequence.len()),
-                );
-                UndoDelta::WorkflowAction {
-                    prev_status_msg,
-                    prev_picker_snr: snapshot.picker_snr,
-                }
+            McpUiCommand::SetSequence {
+                sequence,
+                sequence_path,
+            } => {
+                let delta = Self::capture_workflow_undo(snapshot);
+                snapshot.status_msg = match sequence_path {
+                    Some(p) if sequence.is_empty() => format!("Queued sequence file: {p}"),
+                    Some(p) => {
+                        format!(
+                            "Queued sequence update ({} chars, path={p})",
+                            sequence.len()
+                        )
+                    }
+                    None => format!("Queued sequence update ({} chars)", sequence.len()),
+                };
+                delta
             }
             McpUiCommand::PickAllSpectra {
                 snr_threshold,
                 use_auto_threshold,
+                picker_mode,
             } => {
-                let prev_picker_snr = snapshot.picker_snr;
+                let delta = Self::capture_workflow_undo(snapshot);
                 if let Some(snr) = snr_threshold {
                     if !*use_auto_threshold && snr.is_finite() && *snr > 0.0 {
                         snapshot.picker_snr = *snr;
                     }
                 }
-                let prev_status_msg = std::mem::replace(
-                    &mut snapshot.status_msg,
-                    match snr_threshold {
-                        Some(snr) => {
-                            format!("Queued peak picking (snr={snr:.2}, auto={use_auto_threshold})")
-                        }
-                        None => format!("Queued peak picking (auto={use_auto_threshold})"),
-                    },
-                );
-                UndoDelta::WorkflowAction {
-                    prev_status_msg,
-                    prev_picker_snr,
+                if let Some(mode) = picker_mode {
+                    snapshot.picker_mode = mode.clone();
                 }
+                snapshot.status_msg = match snr_threshold {
+                    Some(snr) => {
+                        format!("Queued peak picking (snr={snr:.2}, auto={use_auto_threshold})")
+                    }
+                    None => format!("Queued peak picking (auto={use_auto_threshold})"),
+                };
+                delta
             }
-            McpUiCommand::RunAssignment { solver } => {
-                let prev_status_msg = std::mem::replace(
-                    &mut snapshot.status_msg,
-                    format!("Queued assignment run (solver={solver})"),
-                );
-                UndoDelta::WorkflowAction {
-                    prev_status_msg,
-                    prev_picker_snr: snapshot.picker_snr,
+            McpUiCommand::RunAssignment { solver, engine } => {
+                let delta = Self::capture_workflow_undo(snapshot);
+                snapshot.solver_kind = solver.clone();
+                snapshot.status_msg = match engine {
+                    Some(eng) => format!("Queued assignment run (solver={solver}, engine={eng})"),
+                    None => format!("Queued assignment run (solver={solver})"),
+                };
+                delta
+            }
+            McpUiCommand::SelectWorkbookPage {
+                page_index,
+                page_name,
+            } => {
+                let delta = Self::capture_workflow_undo(snapshot);
+                if let Some(idx) = page_index {
+                    snapshot.active_page_index = *idx;
                 }
+                snapshot.status_msg =
+                    format!("Queued workbook page selection ({page_index:?}, {page_name:?})");
+                delta
             }
+            McpUiCommand::SetContourLevel {
+                contour_base,
+                multiplier,
+                show_negative,
+            } => {
+                let delta = Self::capture_workflow_undo(snapshot);
+                if let Some(cb) = contour_base {
+                    if cb.is_finite() && *cb >= 0.0 {
+                        snapshot.contour_base = *cb;
+                    }
+                }
+                snapshot.status_msg = format!(
+                    "Queued contour update (base={contour_base:?}, mult={multiplier:?}, neg={show_negative:?})"
+                );
+                delta
+            }
+            McpUiCommand::SetViewportBounds {
+                h_left,
+                h_right,
+                n_top,
+                n_bottom,
+            } => {
+                let delta = Self::capture_workflow_undo(snapshot);
+                snapshot.view_bounds = [*h_left, *h_right, *n_top, *n_bottom];
+                snapshot.status_msg = format!(
+                    "Queued viewport bounds H=[{h_left:.2}, {h_right:.2}], N=[{n_top:.2}, {n_bottom:.2}]"
+                );
+                delta
+            }
+            McpUiCommand::ExportResults { prefix, format } => {
+                let delta = Self::capture_workflow_undo(snapshot);
+                snapshot.status_msg = format!("Queued export ({format} -> {prefix})");
+                delta
+            }
+            McpUiCommand::SetLockResidue { seq_id, locked } => {
+                let delta = Self::capture_workflow_undo(snapshot);
+                snapshot.status_msg = format!(
+                    "Queued residue {} ({seq_id})",
+                    if *locked { "lock" } else { "unlock" }
+                );
+                delta
+            }
+            McpUiCommand::DispatchWorkbenchAction { action } => {
+                let delta = Self::capture_workflow_undo(snapshot);
+                snapshot.status_msg =
+                    format!("Queued workbench action: {}", action.metadata().title);
+                delta
+            }
+        }
+    }
+
+    fn capture_workflow_undo(snapshot: &WorkbenchSnapshot) -> UndoDelta {
+        UndoDelta::WorkflowAction {
+            prev_status_msg: snapshot.status_msg.clone(),
+            prev_picker_snr: snapshot.picker_snr,
+            prev_picker_mode: snapshot.picker_mode.clone(),
+            prev_solver_kind: snapshot.solver_kind.clone(),
+            prev_active_page_index: snapshot.active_page_index,
+            prev_contour_base: snapshot.contour_base,
+            prev_view_bounds: snapshot.view_bounds,
         }
     }
 
@@ -797,9 +1037,19 @@ impl McpUndoLog {
             UndoDelta::WorkflowAction {
                 prev_status_msg,
                 prev_picker_snr,
+                prev_picker_mode,
+                prev_solver_kind,
+                prev_active_page_index,
+                prev_contour_base,
+                prev_view_bounds,
             } => {
                 snapshot.status_msg = prev_status_msg.clone();
                 snapshot.picker_snr = *prev_picker_snr;
+                snapshot.picker_mode = prev_picker_mode.clone();
+                snapshot.solver_kind = prev_solver_kind.clone();
+                snapshot.active_page_index = *prev_active_page_index;
+                snapshot.contour_base = *prev_contour_base;
+                snapshot.view_bounds = *prev_view_bounds;
             }
         }
     }
@@ -1384,15 +1634,16 @@ pub fn verify_bearer_authorization(auth_header: Option<&str>, expected_token: &s
     constant_time_eq(expected_token.as_bytes(), candidate.as_bytes())
 }
 
-#[derive(Debug)]
 struct SharedBridgeInner {
     snapshot: WorkbenchSnapshot,
+    data_tables: WorkbenchDataTables,
     undo_log: McpUndoLog,
     viewport: ViewportFrameBuffer,
     permission: McpBridgePermission,
     bearer_token: String,
     bearer_token_csprng: bool,
     handled_requests: u64,
+    repaint_ctx: Option<egui::Context>,
 }
 
 impl SharedBridgeInner {
@@ -1408,12 +1659,20 @@ impl SharedBridgeInner {
 
         Self {
             snapshot,
+            data_tables: WorkbenchDataTables::default(),
             undo_log: McpUndoLog::new(),
             viewport: ViewportFrameBuffer::diagnostic_card(64, 48, xh),
             permission: McpBridgePermission::ReadOnly,
             bearer_token,
             bearer_token_csprng,
             handled_requests: 0,
+            repaint_ctx: None,
+        }
+    }
+
+    fn request_ui_repaint(&self) {
+        if let Some(ctx) = &self.repaint_ctx {
+            ctx.request_repaint();
         }
     }
 }
@@ -1422,7 +1681,7 @@ fn mcp_tool_schemas_json() -> Value {
     json!([
         {
             "name": "get_workbench_state",
-            "description": "Inspect live nmr-gui workbench state (active_residue_seq, crosshair_ppm, active_experiment, strip_candidates, selected_pdb_chain_res, undo_depth, redo_depth, qc_status, assigned_residues, excluded_peaks, highlighted_residues_3d, sequence_len, loaded_spectra, peak_count, spin_system_count, assigned_count, high_conf_count, status_msg, ingest_in_progress, picker_mode, picker_snr).",
+            "description": "Inspect live nmr-gui workbench state (active_residue_seq, crosshair_ppm, active_experiment, strip_candidates, selected_pdb_chain_res, undo_depth, redo_depth, qc_status, assigned_residues, excluded_peaks, highlighted_residues_3d, sequence_len, loaded_spectra, peak_count, spin_system_count, assigned_count, high_conf_count, status_msg, ingest_in_progress, picker_mode, picker_snr, workspace_mode, active_page_index, solver_kind, contour_base, view_bounds, ingest_progress_text, peaks_by_experiment).",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -1498,25 +1757,101 @@ fn mcp_tool_schemas_json() -> Value {
         },
         {
             "name": "run_workbench_workflow",
-            "description": "Queue an interactive desktop workbench workflow (`load_study_folder`, `set_sequence`, `pick_peaks`, or `run_assignment`). Requires ReadWrite permission.",
+            "description": "Queue parameterized workbench workflows (`load_study_folder`, `set_sequence`, `pick_peaks`, `run_assignment`, `select_workbook_page`, `set_contour_level`, `set_viewport_bounds`, `export_results`, `set_lock_residue`). Requires ReadWrite permission.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["load_study_folder", "set_sequence", "pick_peaks", "run_assignment"]
+                        "enum": [
+                            "load_study_folder",
+                            "set_sequence",
+                            "pick_peaks",
+                            "run_assignment",
+                            "select_workbook_page",
+                            "set_contour_level",
+                            "set_viewport_bounds",
+                            "export_results",
+                            "set_lock_residue"
+                        ]
                     },
                     "path": { "type": "string" },
                     "run_full_pipeline": { "type": "boolean" },
                     "sequence": { "type": "string" },
+                    "sequence_path": { "type": "string" },
                     "snr_threshold": { "type": "number" },
                     "auto_threshold": { "type": "boolean" },
+                    "picker_mode": {
+                        "type": "string",
+                        "enum": ["classical", "neural"]
+                    },
                     "solver": {
                         "type": "string",
                         "enum": ["evo-graph", "standard", "bayes-sa"]
+                    },
+                    "engine": {
+                        "type": "string",
+                        "enum": ["cpu", "gpu"]
+                    },
+                    "page_index": { "type": "integer", "minimum": 0 },
+                    "page_name": { "type": "string" },
+                    "contour_base": { "type": "number" },
+                    "multiplier": { "type": "number" },
+                    "show_negative": { "type": "boolean" },
+                    "h_left": { "type": "number" },
+                    "h_right": { "type": "number" },
+                    "n_top": { "type": "number" },
+                    "n_bottom": { "type": "number" },
+                    "prefix": { "type": "string" },
+                    "format": {
+                        "type": "string",
+                        "enum": ["star", "peaks", "nef", "html"]
+                    },
+                    "seq_id": { "type": "integer" },
+                    "locked": { "type": "boolean" }
+                },
+                "required": ["action"]
+            }
+        },
+        {
+            "name": "dispatch_workbench_action",
+            "description": "Dispatch any registered WorkbenchAction (menu, workflow, view, picker, assignment, structure, dynamics, or mode switch) by PascalCase or snake_case name. Requires ReadWrite permission.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "WorkbenchAction variant name in PascalCase (e.g. 'SwitchModeAssign') or snake_case (e.g. 'switch_mode_assign'). Call inspect_workbench_data with section='actions' to list all valid names."
                     }
                 },
                 "required": ["action"]
+            }
+        },
+        {
+            "name": "inspect_workbench_data",
+            "description": "Inspect structured workbench tables (`assignments`, `spin_systems`, `peaks`, `unassigned_residues`, `low_confidence`, `qc_report`, `workbook_pages`, `actions`) with optional filtering and pagination. ReadOnly-safe.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "section": {
+                        "type": "string",
+                        "enum": [
+                            "assignments",
+                            "spin_systems",
+                            "peaks",
+                            "unassigned_residues",
+                            "low_confidence",
+                            "qc_report",
+                            "workbook_pages",
+                            "actions"
+                        ]
+                    },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
+                    "offset": { "type": "integer", "minimum": 0 },
+                    "experiment": { "type": "string" },
+                    "max_confidence": { "type": "number" }
+                },
+                "required": ["section"]
             }
         }
     ])
@@ -1688,6 +2023,39 @@ fn parse_optional_bool(args: &Value, key: &str, default: bool) -> Result<bool, S
     }
 }
 
+fn parse_optional_tri_bool(args: &Value, key: &str) -> Result<Option<bool>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| format!("'{key}' must be a boolean or null")),
+    }
+}
+
+fn parse_optional_nonempty_str(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let s = v
+                .as_str()
+                .map(str::trim)
+                .ok_or_else(|| format!("'{key}' must be a string"))?;
+            if s.is_empty() || s.contains('\0') {
+                return Err(format!("'{key}' must be a non-empty string"));
+            }
+            Ok(Some(s.to_string()))
+        }
+    }
+}
+
+fn parse_required_finite_f64(args: &Value, key: &str) -> Result<f64, String> {
+    args.get(key)
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| format!("'{key}' must be a finite number"))
+}
+
 fn parse_workflow_command(args: &Value) -> Result<(&'static str, McpUiCommand), String> {
     let action = args
         .get("action")
@@ -1696,13 +2064,8 @@ fn parse_workflow_command(args: &Value) -> Result<(&'static str, McpUiCommand), 
         .trim();
     match action {
         "load_study_folder" => {
-            let path = args
-                .get("path")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && !s.contains('\0'))
-                .ok_or_else(|| "load_study_folder requires non-empty string 'path'".to_string())?
-                .to_string();
+            let path = parse_optional_nonempty_str(args, "path")?
+                .ok_or_else(|| "load_study_folder requires non-empty string 'path'".to_string())?;
             let run_full_pipeline = parse_optional_bool(args, "run_full_pipeline", false)?;
             Ok((
                 "load_study_folder",
@@ -1713,14 +2076,21 @@ fn parse_workflow_command(args: &Value) -> Result<(&'static str, McpUiCommand), 
             ))
         }
         "set_sequence" => {
-            let sequence = args
-                .get("sequence")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && !s.contains('\0'))
-                .ok_or_else(|| "set_sequence requires non-empty string 'sequence'".to_string())?
-                .to_string();
-            Ok(("set_sequence", McpUiCommand::SetSequence { sequence }))
+            let seq_opt = parse_optional_nonempty_str(args, "sequence")?;
+            let path_opt = parse_optional_nonempty_str(args, "sequence_path")?;
+            if seq_opt.is_none() && path_opt.is_none() {
+                return Err(
+                    "set_sequence requires non-empty string 'sequence' or 'sequence_path'"
+                        .to_string(),
+                );
+            }
+            Ok((
+                "set_sequence",
+                McpUiCommand::SetSequence {
+                    sequence: seq_opt.unwrap_or_default(),
+                    sequence_path: path_opt,
+                },
+            ))
         }
         "pick_peaks" => {
             let snr_threshold = match args.get("snr_threshold") {
@@ -1734,11 +2104,26 @@ fn parse_workflow_command(args: &Value) -> Result<(&'static str, McpUiCommand), 
                 ),
             };
             let use_auto_threshold = parse_optional_bool(args, "auto_threshold", false)?;
+            let picker_mode = match args.get("picker_mode") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let s = v.as_str().map(str::trim).ok_or_else(|| {
+                        "'picker_mode' must be 'classical' or 'neural'".to_string()
+                    })?;
+                    if !matches!(s, "classical" | "neural") {
+                        return Err(format!(
+                            "unknown picker_mode '{s}'; expected 'classical' or 'neural'"
+                        ));
+                    }
+                    Some(s.to_string())
+                }
+            };
             Ok((
                 "pick_peaks",
                 McpUiCommand::PickAllSpectra {
                     snr_threshold,
                     use_auto_threshold,
+                    picker_mode,
                 },
             ))
         }
@@ -1757,10 +2142,337 @@ fn parse_workflow_command(args: &Value) -> Result<(&'static str, McpUiCommand), 
                     s.to_string()
                 }
             };
-            Ok(("run_assignment", McpUiCommand::RunAssignment { solver }))
+            let engine = match args.get("engine") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let s = v
+                        .as_str()
+                        .map(str::trim)
+                        .ok_or_else(|| "'engine' must be 'cpu' or 'gpu'".to_string())?;
+                    if !matches!(s, "cpu" | "gpu") {
+                        return Err(format!("unknown engine '{s}'; expected 'cpu' or 'gpu'"));
+                    }
+                    Some(s.to_string())
+                }
+            };
+            Ok((
+                "run_assignment",
+                McpUiCommand::RunAssignment { solver, engine },
+            ))
+        }
+        "select_workbook_page" => {
+            let page_index = match args.get("page_index") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_u64()
+                        .and_then(|u| usize::try_from(u).ok())
+                        .ok_or_else(|| "'page_index' must be a non-negative integer".to_string())?,
+                ),
+            };
+            let page_name = parse_optional_nonempty_str(args, "page_name")?;
+            if page_index.is_none() && page_name.is_none() {
+                return Err(
+                    "select_workbook_page requires 'page_index' and/or 'page_name'".to_string(),
+                );
+            }
+            Ok((
+                "select_workbook_page",
+                McpUiCommand::SelectWorkbookPage {
+                    page_index,
+                    page_name,
+                },
+            ))
+        }
+        "set_contour_level" => {
+            let contour_base = match args.get("contour_base") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_f64()
+                        .filter(|c| c.is_finite() && *c >= 0.0)
+                        .ok_or_else(|| {
+                            "'contour_base' must be a finite non-negative number or null"
+                                .to_string()
+                        })?,
+                ),
+            };
+            let multiplier = match args.get("multiplier") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_f64()
+                        .filter(|m| m.is_finite() && *m > 0.0)
+                        .ok_or_else(|| {
+                            "'multiplier' must be a finite positive number or null".to_string()
+                        })?,
+                ),
+            };
+            let show_negative = parse_optional_tri_bool(args, "show_negative")?;
+            if contour_base.is_none() && multiplier.is_none() && show_negative.is_none() {
+                return Err(
+                    "set_contour_level requires at least one of 'contour_base', 'multiplier', or 'show_negative'"
+                        .to_string(),
+                );
+            }
+            Ok((
+                "set_contour_level",
+                McpUiCommand::SetContourLevel {
+                    contour_base,
+                    multiplier,
+                    show_negative,
+                },
+            ))
+        }
+        "set_viewport_bounds" => {
+            let h_left = parse_required_finite_f64(args, "h_left")?;
+            let h_right = parse_required_finite_f64(args, "h_right")?;
+            let n_top = parse_required_finite_f64(args, "n_top")?;
+            let n_bottom = parse_required_finite_f64(args, "n_bottom")?;
+            if (h_left - h_right).abs() <= 1e-6 || (n_top - n_bottom).abs() <= 1e-6 {
+                return Err(
+                    "set_viewport_bounds requires non-degenerate H and N ranges".to_string()
+                );
+            }
+            Ok((
+                "set_viewport_bounds",
+                McpUiCommand::SetViewportBounds {
+                    h_left,
+                    h_right,
+                    n_top,
+                    n_bottom,
+                },
+            ))
+        }
+        "export_results" => {
+            let prefix = parse_optional_nonempty_str(args, "prefix")?
+                .ok_or_else(|| "export_results requires non-empty string 'prefix'".to_string())?;
+            let format = args
+                .get("format")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .ok_or_else(|| {
+                    "export_results requires 'format' ('star', 'peaks', 'nef', or 'html')"
+                        .to_string()
+                })?;
+            if !matches!(format, "star" | "peaks" | "nef" | "html") {
+                return Err(format!(
+                    "unknown export format '{format}'; expected 'star', 'peaks', 'nef', or 'html'"
+                ));
+            }
+            Ok((
+                "export_results",
+                McpUiCommand::ExportResults {
+                    prefix,
+                    format: format.to_string(),
+                },
+            ))
+        }
+        "set_lock_residue" => {
+            let seq_id = args
+                .get("seq_id")
+                .and_then(Value::as_i64)
+                .and_then(|v| i32::try_from(v).ok())
+                .ok_or_else(|| "set_lock_residue requires integer 'seq_id'".to_string())?;
+            let locked = args
+                .get("locked")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| "set_lock_residue requires boolean 'locked'".to_string())?;
+            Ok((
+                "set_lock_residue",
+                McpUiCommand::SetLockResidue { seq_id, locked },
+            ))
         }
         other => Err(format!("unknown run_workbench_workflow action '{other}'")),
     }
+}
+
+fn parse_dispatch_action_command(args: &Value) -> Result<(String, McpUiCommand), String> {
+    let raw = args
+        .get("action")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "dispatch_workbench_action requires non-empty string 'action'".to_string()
+        })?;
+    let action =
+        parse_workbench_action(raw).ok_or_else(|| format!("unknown WorkbenchAction '{raw}'"))?;
+    let canonical = workbench_action_canonical_name(action);
+    Ok((canonical, McpUiCommand::DispatchWorkbenchAction { action }))
+}
+
+fn slice_paginated_items(items: Vec<Value>, offset: usize, limit: usize) -> Value {
+    let total_matching = items.len();
+    let sliced: Vec<Value> = items.into_iter().skip(offset).take(limit).collect();
+    json!({
+        "total_matching": total_matching,
+        "offset": offset,
+        "limit": limit,
+        "items": sliced,
+    })
+}
+
+fn execute_inspect_workbench_data(
+    inner: &SharedBridgeInner,
+    args: &Value,
+) -> Result<Value, String> {
+    let section = args
+        .get("section")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .ok_or_else(|| "inspect_workbench_data requires string 'section'".to_string())?;
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => 100usize,
+        Some(v) => v
+            .as_i64()
+            .map(|n| n.clamp(1, 500) as usize)
+            .ok_or_else(|| "'limit' must be an integer".to_string())?,
+    };
+    let offset = match args.get("offset") {
+        None | Some(Value::Null) => 0usize,
+        Some(v) => v
+            .as_u64()
+            .and_then(|u| usize::try_from(u).ok())
+            .ok_or_else(|| "'offset' must be a non-negative integer".to_string())?,
+    };
+    let experiment_filter = match args.get("experiment") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .map(str::trim)
+                .ok_or_else(|| "'experiment' must be a string".to_string())?;
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        }
+    };
+    let max_confidence = match args.get("max_confidence") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_f64()
+                .filter(|c| c.is_finite())
+                .ok_or_else(|| "'max_confidence' must be a finite number or null".to_string())?,
+        ),
+    };
+
+    let payload = match section {
+        "assignments" => {
+            let mut body =
+                slice_paginated_items(inner.data_tables.assignments.clone(), offset, limit);
+            if let Some(m) = body.as_object_mut() {
+                m.insert("section".to_string(), json!("assignments"));
+            }
+            body
+        }
+        "spin_systems" => {
+            let mut body =
+                slice_paginated_items(inner.data_tables.spin_systems.clone(), offset, limit);
+            if let Some(m) = body.as_object_mut() {
+                m.insert("section".to_string(), json!("spin_systems"));
+            }
+            body
+        }
+        "peaks" => {
+            let filtered: Vec<Value> = match experiment_filter.as_deref() {
+                Some(exp_q) => inner
+                    .data_tables
+                    .peaks
+                    .iter()
+                    .filter(|row| {
+                        row.get("experiment")
+                            .or_else(|| row.get("exp"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|e| e.trim().eq_ignore_ascii_case(exp_q))
+                    })
+                    .cloned()
+                    .collect(),
+                None => inner.data_tables.peaks.clone(),
+            };
+            let mut body = slice_paginated_items(filtered, offset, limit);
+            if let Some(m) = body.as_object_mut() {
+                m.insert("section".to_string(), json!("peaks"));
+                m.insert("experiment".to_string(), json!(experiment_filter));
+            }
+            body
+        }
+        "unassigned_residues" => {
+            let filtered: Vec<Value> = inner
+                .data_tables
+                .assignments
+                .iter()
+                .filter(|row| match row.get("spin_system_idx") {
+                    None | Some(Value::Null) => true,
+                    Some(v) => v.as_i64().is_none_or(|idx| idx < 0),
+                })
+                .cloned()
+                .collect();
+            let mut body = slice_paginated_items(filtered, offset, limit);
+            if let Some(m) = body.as_object_mut() {
+                m.insert("section".to_string(), json!("unassigned_residues"));
+            }
+            body
+        }
+        "low_confidence" => {
+            let thresh = max_confidence.unwrap_or(0.8);
+            let filtered: Vec<Value> = inner
+                .data_tables
+                .assignments
+                .iter()
+                .filter(|row| match row.get("confidence") {
+                    None | Some(Value::Null) => true,
+                    Some(v) => v.as_f64().is_none_or(|c| !c.is_finite() || c < thresh),
+                })
+                .cloned()
+                .collect();
+            let mut body = slice_paginated_items(filtered, offset, limit);
+            if let Some(m) = body.as_object_mut() {
+                m.insert("section".to_string(), json!("low_confidence"));
+                m.insert("max_confidence".to_string(), json!(thresh));
+            }
+            body
+        }
+        "qc_report" => {
+            json!({
+                "section": "qc_report",
+                "available": inner.data_tables.qc_report.is_some(),
+                "qc_report": inner.data_tables.qc_report,
+            })
+        }
+        "workbook_pages" => {
+            let mut body =
+                slice_paginated_items(inner.data_tables.workbook_pages.clone(), offset, limit);
+            if let Some(m) = body.as_object_mut() {
+                m.insert("section".to_string(), json!("workbook_pages"));
+            }
+            body
+        }
+        "actions" => {
+            let items: Vec<Value> = WorkbenchAction::ALL
+                .iter()
+                .map(|&act| {
+                    let meta = act.metadata();
+                    json!({
+                        "name": workbench_action_canonical_name(act),
+                        "snake_name": workbench_action_snake_name(act),
+                        "category": meta.category,
+                        "title": meta.title,
+                        "description": meta.description,
+                        "chord_badge": meta.chord_badge,
+                    })
+                })
+                .collect();
+            let mut body = slice_paginated_items(items, offset, limit);
+            if let Some(m) = body.as_object_mut() {
+                m.insert("section".to_string(), json!("actions"));
+            }
+            body
+        }
+        other => {
+            return Err(format!("unknown inspect_workbench_data section '{other}'"));
+        }
+    };
+    Ok(payload)
 }
 
 /// Execute a single JSON-RPC 2.0 MCP message against `inner`, returning `None` for one-way
@@ -1897,6 +2609,7 @@ fn dispatch_mcp_jsonrpc_with_permission(
                             inner.snapshot.crosshair_ppm,
                         );
                     }
+                    inner.request_ui_repaint();
                     Some(jsonrpc_ok(
                         id,
                         mcp_text_result(
@@ -1934,6 +2647,7 @@ fn dispatch_mcp_jsonrpc_with_permission(
                     }
                     let summary = cmd.summary();
                     let action_id = inner.undo_log.apply_command(&mut inner.snapshot, cmd);
+                    inner.request_ui_repaint();
                     Some(jsonrpc_ok(
                         id,
                         mcp_text_result(
@@ -1980,18 +2694,21 @@ fn dispatch_mcp_jsonrpc_with_permission(
                         }
                     };
                     match outcome {
-                        Some(reverted_cmd) => Some(jsonrpc_ok(
-                            id,
-                            mcp_text_result(
-                                json!({
-                                    "status": direction,
-                                    "command": reverted_cmd.summary(),
-                                    "undo_depth": inner.snapshot.undo_depth,
-                                    "redo_depth": inner.snapshot.redo_depth,
-                                }),
-                                false,
-                            ),
-                        )),
+                        Some(reverted_cmd) => {
+                            inner.request_ui_repaint();
+                            Some(jsonrpc_ok(
+                                id,
+                                mcp_text_result(
+                                    json!({
+                                        "status": direction,
+                                        "command": reverted_cmd.summary(),
+                                        "undo_depth": inner.snapshot.undo_depth,
+                                        "redo_depth": inner.snapshot.redo_depth,
+                                    }),
+                                    false,
+                                ),
+                            ))
+                        }
                         None => Some(jsonrpc_ok(
                             id,
                             mcp_text_result(
@@ -2062,6 +2779,7 @@ fn dispatch_mcp_jsonrpc_with_permission(
                     }
                     let summary = cmd.summary();
                     let action_id = inner.undo_log.apply_command(&mut inner.snapshot, cmd);
+                    inner.request_ui_repaint();
                     Some(jsonrpc_ok(
                         id,
                         mcp_text_result(
@@ -2078,6 +2796,66 @@ fn dispatch_mcp_jsonrpc_with_permission(
                         ),
                     ))
                 }
+                "dispatch_workbench_action" => {
+                    let (canonical_action, cmd) = match parse_dispatch_action_command(&args) {
+                        Ok(parsed) => parsed,
+                        Err(msg) => return Some(jsonrpc_err(id, -32602, msg)),
+                    };
+                    if effective_permission == McpBridgePermission::ReadOnly {
+                        inner.undo_log.record_blocked_readonly(format!(
+                            "dispatch_workbench_action: {}",
+                            cmd.summary()
+                        ));
+                        return Some(jsonrpc_ok(
+                            id,
+                            mcp_text_result(
+                                json!({
+                                    "status": "denied",
+                                    "queued": false,
+                                    "action": canonical_action,
+                                    "permission": effective_permission.as_str(),
+                                    "reason": "MCP bridge is in ReadOnly mode; switch UI panel to ReadWrite to dispatch workbench actions.",
+                                }),
+                                true,
+                            ),
+                        ));
+                    }
+                    let title = match &cmd {
+                        McpUiCommand::DispatchWorkbenchAction { action } => action.metadata().title,
+                        _ => "",
+                    };
+                    let summary = cmd.summary();
+                    let action_id = inner.undo_log.apply_command(&mut inner.snapshot, cmd);
+                    inner.request_ui_repaint();
+                    Some(jsonrpc_ok(
+                        id,
+                        mcp_text_result(
+                            json!({
+                                "queued": true,
+                                "action": canonical_action,
+                                "title": title,
+                                "permission": effective_permission.as_str(),
+                                "action_id": action_id,
+                                "summary": summary,
+                                "undo_depth": inner.snapshot.undo_depth,
+                                "redo_depth": inner.snapshot.redo_depth,
+                            }),
+                            false,
+                        ),
+                    ))
+                }
+                "inspect_workbench_data" => match execute_inspect_workbench_data(inner, &args) {
+                    Ok(mut payload) => {
+                        if let Some(m) = payload.as_object_mut() {
+                            m.insert(
+                                "permission".to_string(),
+                                Value::String(effective_permission.as_str().to_string()),
+                            );
+                        }
+                        Some(jsonrpc_ok(id, mcp_text_result(payload, false)))
+                    }
+                    Err(msg) => Some(jsonrpc_err(id, -32602, msg)),
+                },
                 unknown => Some(jsonrpc_err(
                     id,
                     -32602,
@@ -2669,6 +3447,20 @@ impl McpBridgeController {
             f(&mut g.snapshot);
             g.snapshot.undo_depth = g.undo_log.undo_depth();
             g.snapshot.redo_depth = g.undo_log.redo_depth();
+        }
+    }
+
+    /// Store the live `egui::Context` so background MCP commands trigger an immediate UI repaint.
+    pub fn set_repaint_context(&self, ctx: egui::Context) {
+        if let Ok(mut g) = self.shared.lock() {
+            g.repaint_ctx = Some(ctx);
+        }
+    }
+
+    /// Update structured tabular inspection data exposed read-only via `inspect_workbench_data`.
+    pub fn update_data_tables(&self, f: impl FnOnce(&mut WorkbenchDataTables)) {
+        if let Ok(mut g) = self.shared.lock() {
+            f(&mut g.data_tables);
         }
     }
 
@@ -3649,7 +4441,9 @@ mod tests {
                 "propose_curation_edit",
                 "undo_last_ai_edit",
                 "capture_viewport_png",
-                "run_workbench_workflow"
+                "run_workbench_workflow",
+                "dispatch_workbench_action",
+                "inspect_workbench_data"
             ]
         );
 
@@ -3883,6 +4677,17 @@ mod tests {
         assert!(!def.ingest_in_progress);
         assert_eq!(def.picker_mode, "classical");
         assert!((def.picker_snr - 5.0).abs() < 1e-12);
+        assert_eq!(def.workspace_mode, "ProteinNmr");
+        assert_eq!(def.active_page_index, 0);
+        assert_eq!(def.solver_kind, "evo-graph");
+        assert!((def.contour_base - 0.0).abs() < 1e-12);
+        assert_eq!(def.view_bounds, [10.5, 6.0, 102.0, 134.0]);
+        assert!(def.ingest_progress_text.is_empty());
+        assert!(def.peaks_by_experiment.is_empty());
+
+        let mut peaks_by_exp = BTreeMap::new();
+        peaks_by_exp.insert("HSQC".to_string(), 74usize);
+        peaks_by_exp.insert("HNCACB".to_string(), 68usize);
 
         let populated = WorkbenchSnapshot {
             sequence_len: 76,
@@ -3895,6 +4700,13 @@ mod tests {
             ingest_in_progress: true,
             picker_mode: "neural".to_string(),
             picker_snr: 8.5,
+            workspace_mode: "Dosy".to_string(),
+            active_page_index: 2,
+            solver_kind: "bayes-sa".to_string(),
+            contour_base: 12500.0,
+            view_bounds: [9.8, 6.4, 105.0, 131.0],
+            ingest_progress_text: "Loading 2/4 HNCACB".to_string(),
+            peaks_by_experiment: peaks_by_exp,
             ..WorkbenchSnapshot::default()
         };
         let ctrl = McpBridgeController::new(populated);
@@ -3917,6 +4729,16 @@ mod tests {
         assert_eq!(state["ingest_in_progress"], true);
         assert_eq!(state["picker_mode"], "neural");
         assert_eq!(state["picker_snr"], 8.5);
+        assert_eq!(state["workspace_mode"], "Dosy");
+        assert_eq!(state["active_page_index"], 2);
+        assert_eq!(state["solver_kind"], "bayes-sa");
+        assert_eq!(state["contour_base"], 12500.0);
+        assert_eq!(state["view_bounds"], json!([9.8, 6.4, 105.0, 131.0]));
+        assert_eq!(state["ingest_progress_text"], "Loading 2/4 HNCACB");
+        assert_eq!(
+            state["peaks_by_experiment"],
+            json!({ "HSQC": 74, "HNCACB": 68 })
+        );
         assert_eq!(state["permission"], "read_only");
     }
 
@@ -3924,7 +4746,7 @@ mod tests {
     fn test_run_workbench_workflow_readonly_refusal_validation_and_readwrite_queueing() {
         let ctrl = McpBridgeController::default();
 
-        // 1. tools/list exposes run_workbench_workflow with expected schema
+        // 1. tools/list exposes run_workbench_workflow with all 9 actions
         let list_resp = ctrl
             .handle_jsonrpc_bytes(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
             .expect("tools/list response");
@@ -3940,7 +4762,12 @@ mod tests {
                 "load_study_folder",
                 "set_sequence",
                 "pick_peaks",
-                "run_assignment"
+                "run_assignment",
+                "select_workbook_page",
+                "set_contour_level",
+                "set_viewport_bounds",
+                "export_results",
+                "set_lock_residue"
             ])
         );
         assert_eq!(
@@ -3955,6 +4782,11 @@ mod tests {
             json!({ "action": "set_sequence", "sequence": "MQIFVK" }),
             json!({ "action": "pick_peaks", "snr_threshold": 6.5 }),
             json!({ "action": "run_assignment", "solver": "evo-graph" }),
+            json!({ "action": "select_workbook_page", "page_index": 1 }),
+            json!({ "action": "set_contour_level", "contour_base": 5000.0 }),
+            json!({ "action": "set_viewport_bounds", "h_left": 10.0, "h_right": 6.5, "n_top": 105.0, "n_bottom": 132.0 }),
+            json!({ "action": "export_results", "prefix": "/tmp/out", "format": "star" }),
+            json!({ "action": "set_lock_residue", "seq_id": 12, "locked": true }),
         ] {
             let req = serde_json::to_vec(&json!({
                 "jsonrpc": "2.0",
@@ -3978,7 +4810,7 @@ mod tests {
         assert!(ctrl.drain_pending_ui_commands().is_empty());
         {
             let guard = ctrl.shared.lock().unwrap();
-            assert_eq!(guard.undo_log.audit_records().len(), 4);
+            assert_eq!(guard.undo_log.audit_records().len(), 9);
             assert!(guard
                 .undo_log
                 .audit_records()
@@ -3993,9 +4825,20 @@ mod tests {
             json!({ "action": "load_study_folder", "path": "   " }),
             json!({ "action": "load_study_folder", "path": "/tmp/s", "run_full_pipeline": "yes" }),
             json!({ "action": "set_sequence", "sequence": "" }),
+            json!({ "action": "set_sequence" }),
             json!({ "action": "pick_peaks", "snr_threshold": -1.0 }),
             json!({ "action": "pick_peaks", "auto_threshold": "true" }),
+            json!({ "action": "pick_peaks", "picker_mode": "invalid" }),
             json!({ "action": "run_assignment", "solver": "invalid-solver" }),
+            json!({ "action": "run_assignment", "engine": "tpu" }),
+            json!({ "action": "select_workbook_page" }),
+            json!({ "action": "select_workbook_page", "page_index": -1 }),
+            json!({ "action": "set_contour_level" }),
+            json!({ "action": "set_contour_level", "multiplier": 0.0 }),
+            json!({ "action": "set_viewport_bounds", "h_left": 8.0, "h_right": 8.0, "n_top": 105.0, "n_bottom": 130.0 }),
+            json!({ "action": "export_results", "prefix": "", "format": "star" }),
+            json!({ "action": "export_results", "prefix": "/tmp/out", "format": "pdf" }),
+            json!({ "action": "set_lock_residue", "seq_id": 12 }),
         ] {
             let req = serde_json::to_vec(&json!({
                 "jsonrpc": "2.0",
@@ -4038,7 +4881,7 @@ mod tests {
         }
         assert!(ctrl.drain_pending_ui_commands().is_empty());
 
-        // 5. ReadWrite mode queues all 4 workflow commands + curation undo compatibility
+        // 5. ReadWrite mode queues all 9 workflow actions + curation undo compatibility
         let _ = ctrl.apply_ui_command(McpUiCommand::AssignSpinSystemToResidue {
             cluster_id: 2,
             seq_id: 14,
@@ -4063,11 +4906,19 @@ mod tests {
                 }),
             ),
             (
+                "set_sequence",
+                json!({
+                    "action": "set_sequence",
+                    "sequence_path": "/tmp/ubq.fasta"
+                }),
+            ),
+            (
                 "pick_peaks",
                 json!({
                     "action": "pick_peaks",
                     "snr_threshold": 7.5,
-                    "auto_threshold": false
+                    "auto_threshold": false,
+                    "picker_mode": "neural"
                 }),
             ),
             (
@@ -4081,13 +4932,57 @@ mod tests {
                 "run_assignment",
                 json!({
                     "action": "run_assignment",
-                    "solver": "bayes-sa"
+                    "solver": "bayes-sa",
+                    "engine": "gpu"
                 }),
             ),
             (
                 "run_assignment",
                 json!({
                     "action": "run_assignment"
+                }),
+            ),
+            (
+                "select_workbook_page",
+                json!({
+                    "action": "select_workbook_page",
+                    "page_index": 2,
+                    "page_name": "HNCACB"
+                }),
+            ),
+            (
+                "set_contour_level",
+                json!({
+                    "action": "set_contour_level",
+                    "contour_base": 4200.0,
+                    "multiplier": 1.3,
+                    "show_negative": true
+                }),
+            ),
+            (
+                "set_viewport_bounds",
+                json!({
+                    "action": "set_viewport_bounds",
+                    "h_left": 9.9,
+                    "h_right": 6.2,
+                    "n_top": 104.0,
+                    "n_bottom": 133.0
+                }),
+            ),
+            (
+                "export_results",
+                json!({
+                    "action": "export_results",
+                    "prefix": "/tmp/ubq_export",
+                    "format": "nef"
+                }),
+            ),
+            (
+                "set_lock_residue",
+                json!({
+                    "action": "set_lock_residue",
+                    "seq_id": 14,
+                    "locked": true
                 }),
             ),
         ];
@@ -4123,31 +5018,74 @@ mod tests {
                 },
                 McpUiCommand::SetSequence {
                     sequence: "MQIFVKTLTG".to_string(),
+                    sequence_path: None,
+                },
+                McpUiCommand::SetSequence {
+                    sequence: String::new(),
+                    sequence_path: Some("/tmp/ubq.fasta".to_string()),
                 },
                 McpUiCommand::PickAllSpectra {
                     snr_threshold: Some(7.5),
                     use_auto_threshold: false,
+                    picker_mode: Some("neural".to_string()),
                 },
                 McpUiCommand::PickAllSpectra {
                     snr_threshold: None,
                     use_auto_threshold: true,
+                    picker_mode: None,
                 },
                 McpUiCommand::RunAssignment {
                     solver: "bayes-sa".to_string(),
+                    engine: Some("gpu".to_string()),
                 },
                 McpUiCommand::RunAssignment {
                     solver: "evo-graph".to_string(),
+                    engine: None,
+                },
+                McpUiCommand::SelectWorkbookPage {
+                    page_index: Some(2),
+                    page_name: Some("HNCACB".to_string()),
+                },
+                McpUiCommand::SetContourLevel {
+                    contour_base: Some(4200.0),
+                    multiplier: Some(1.3),
+                    show_negative: Some(true),
+                },
+                McpUiCommand::SetViewportBounds {
+                    h_left: 9.9,
+                    h_right: 6.2,
+                    n_top: 104.0,
+                    n_bottom: 133.0,
+                },
+                McpUiCommand::ExportResults {
+                    prefix: "/tmp/ubq_export".to_string(),
+                    format: "nef".to_string(),
+                },
+                McpUiCommand::SetLockResidue {
+                    seq_id: 14,
+                    locked: true,
                 },
             ]
         );
-        assert!((ctrl.snapshot().picker_snr - 7.5).abs() < 1e-12);
+        let snap_after = ctrl.snapshot();
+        assert!((snap_after.picker_snr - 7.5).abs() < 1e-12);
+        assert_eq!(snap_after.picker_mode, "neural");
+        assert_eq!(snap_after.active_page_index, 2);
+        assert!((snap_after.contour_base - 4200.0).abs() < 1e-12);
+        assert_eq!(snap_after.view_bounds, [9.9, 6.2, 104.0, 133.0]);
 
-        // Undo across all 6 workflow commands + earlier AssignSpinSystemToResidue cleanly
-        for _ in 0..6 {
+        // Undo across all 12 workflow commands + earlier AssignSpinSystemToResidue cleanly
+        for _ in 0..12 {
             assert!(ctrl.undo_last().is_some());
         }
-        assert!((ctrl.snapshot().picker_snr - 5.0).abs() < 1e-12);
-        assert_eq!(ctrl.snapshot().assigned_residues[&14].cluster_id, 2);
+        let snap_reverted = ctrl.snapshot();
+        assert!((snap_reverted.picker_snr - 5.0).abs() < 1e-12);
+        assert_eq!(snap_reverted.picker_mode, "classical");
+        assert_eq!(snap_reverted.solver_kind, "evo-graph");
+        assert_eq!(snap_reverted.active_page_index, 0);
+        assert!((snap_reverted.contour_base - 0.0).abs() < 1e-12);
+        assert_eq!(snap_reverted.view_bounds, [10.5, 6.0, 102.0, 134.0]);
+        assert_eq!(snap_reverted.assigned_residues[&14].cluster_id, 2);
         let reverted_assign = ctrl.undo_last().expect("undo prior assign");
         assert!(matches!(
             reverted_assign,
@@ -4156,6 +5094,221 @@ mod tests {
         assert!(ctrl.snapshot().assigned_residues.is_empty());
         assert!(ctrl.redo_last().is_some());
         assert_eq!(ctrl.snapshot().assigned_residues[&14].cluster_id, 2);
+    }
+
+    #[test]
+    fn test_dispatch_workbench_action_all_variants_and_repaint_wakeup() {
+        // 1. Every WorkbenchAction::ALL variant round-trips in PascalCase, snake_case, and lowercase
+        assert!(!WorkbenchAction::ALL.is_empty());
+        for &action in WorkbenchAction::ALL {
+            let pascal = workbench_action_canonical_name(action);
+            let snake = workbench_action_snake_name(action);
+            assert_eq!(
+                parse_workbench_action(&pascal),
+                Some(action),
+                "PascalCase round-trip failed for {pascal}"
+            );
+            assert_eq!(
+                parse_workbench_action(&snake),
+                Some(action),
+                "snake_case round-trip failed for {snake} ({pascal})"
+            );
+            assert_eq!(
+                parse_workbench_action(&pascal.to_ascii_lowercase()),
+                Some(action),
+                "lowercase round-trip failed for {pascal}"
+            );
+        }
+        assert_eq!(
+            parse_workbench_action("switch_mode_assign"),
+            Some(WorkbenchAction::SwitchModeAssign)
+        );
+        assert_eq!(
+            parse_workbench_action("SuppressWaterPeak"),
+            Some(WorkbenchAction::SuppressWaterPeak)
+        );
+        assert_eq!(
+            parse_workbench_action("fold-structure-ensemble"),
+            Some(WorkbenchAction::FoldStructureEnsemble)
+        );
+        assert_eq!(parse_workbench_action("not_a_real_action"), None);
+        assert_eq!(parse_workbench_action("   "), None);
+
+        // 2. ReadOnly blocks dispatch_workbench_action and records BlockedReadOnly audit
+        let ctrl = McpBridgeController::default();
+        let ctx = egui::Context::default();
+        ctrl.set_repaint_context(ctx);
+
+        let ro_req = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "dispatch_workbench_action",
+                "arguments": { "action": "switch_mode_assign" }
+            }
+        }))
+        .unwrap();
+        let ro_resp = ctrl.handle_jsonrpc_bytes(&ro_req).unwrap();
+        assert_eq!(ro_resp["result"]["isError"], true);
+        let ro_payload: Value =
+            serde_json::from_str(ro_resp["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(ro_payload["queued"], false);
+        assert_eq!(ro_payload["status"], "denied");
+        assert!(ctrl.drain_pending_ui_commands().is_empty());
+        {
+            let guard = ctrl.shared.lock().unwrap();
+            assert_eq!(
+                guard.undo_log.audit_records().back().unwrap().outcome,
+                McpAuditOutcome::BlockedReadOnly
+            );
+        }
+
+        // 3. Invalid action returns -32602; ReadWrite queues DispatchWorkbenchAction
+        ctrl.set_permission(McpBridgePermission::ReadWrite);
+        let bad_resp = ctrl
+            .handle_jsonrpc_bytes(
+                br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"dispatch_workbench_action","arguments":{"action":"nonexistent_xyz"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(bad_resp["error"]["code"], -32602);
+
+        let rw_resp = ctrl.handle_jsonrpc_bytes(&ro_req).unwrap();
+        assert_eq!(rw_resp["result"]["isError"], false);
+        let rw_payload: Value =
+            serde_json::from_str(rw_resp["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(rw_payload["queued"], true);
+        assert_eq!(rw_payload["action"], "SwitchModeAssign");
+        assert_eq!(rw_payload["permission"], "read_write");
+        assert_eq!(
+            ctrl.drain_pending_ui_commands(),
+            vec![McpUiCommand::DispatchWorkbenchAction {
+                action: WorkbenchAction::SwitchModeAssign
+            }]
+        );
+    }
+
+    #[test]
+    fn test_inspect_workbench_data_all_sections_filters_and_pagination() {
+        let ctrl = McpBridgeController::default();
+        assert_eq!(ctrl.permission(), McpBridgePermission::ReadOnly);
+
+        // Seed realistic tabular workbench state
+        ctrl.update_data_tables(|t| {
+            t.assignments = vec![
+                json!({ "seq_id": 1, "res_name": "MET", "spin_system_idx": 0, "confidence": 0.96 }),
+                json!({ "seq_id": 2, "res_name": "GLN", "spin_system_idx": 1, "confidence": 0.62 }),
+                json!({ "seq_id": 3, "res_name": "ILE", "spin_system_idx": null, "confidence": null }),
+                json!({ "seq_id": 4, "res_name": "PHE", "spin_system_idx": -1, "confidence": 0.45 }),
+            ];
+            t.spin_systems = vec![
+                json!({ "cluster_id": 0, "h_ppm": 8.21, "n_ppm": 120.4 }),
+                json!({ "cluster_id": 1, "h_ppm": 8.45, "n_ppm": 118.9 }),
+            ];
+            t.peaks = vec![
+                json!({ "experiment": "HSQC", "h_ppm": 8.21, "n_ppm": 120.4 }),
+                json!({ "experiment": "HNCACB", "h_ppm": 8.21, "n_ppm": 120.4, "c_ppm": 55.2 }),
+                json!({ "experiment": "hsqc", "h_ppm": 8.45, "n_ppm": 118.9 }),
+                json!({ "experiment": "HNCO", "h_ppm": 8.45, "n_ppm": 118.9, "c_ppm": 175.1 }),
+            ];
+            t.workbook_pages = vec![
+                json!({ "index": 0, "label": "HSQC" }),
+                json!({ "index": 1, "label": "HNCACB" }),
+            ];
+        });
+
+        let call_inspect = |args: Value| -> Value {
+            let req = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "inspect_workbench_data",
+                    "arguments": args
+                }
+            }))
+            .unwrap();
+            let resp = ctrl.handle_jsonrpc_bytes(&req).unwrap();
+            assert_eq!(resp["result"]["isError"], false);
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+        };
+
+        // 1. Actions catalog lists all WorkbenchAction::ALL with snake_name + metadata + pagination
+        let actions_p1 = call_inspect(json!({ "section": "actions", "limit": 50, "offset": 0 }));
+        assert_eq!(actions_p1["total_matching"], WorkbenchAction::ALL.len());
+        assert_eq!(actions_p1["items"].as_array().unwrap().len(), 50);
+        let first_act = &actions_p1["items"][0];
+        assert!(first_act["name"].is_string());
+        assert!(first_act["snake_name"].is_string());
+        assert!(first_act["category"].is_string());
+        assert!(first_act["title"].is_string());
+        assert!(first_act["description"].is_string());
+        assert!(first_act.get("chord_badge").is_some());
+
+        // Limit clamps to 1..=500
+        let actions_clamped =
+            call_inspect(json!({ "section": "actions", "limit": 9999, "offset": 0 }));
+        assert_eq!(actions_clamped["limit"], 500);
+        assert_eq!(
+            actions_clamped["items"].as_array().unwrap().len(),
+            WorkbenchAction::ALL.len()
+        );
+
+        // 2. Peaks filter (case-insensitive) + pagination
+        let hsqc_peaks = call_inspect(json!({
+            "section": "peaks",
+            "experiment": "HsQc",
+            "limit": 1,
+            "offset": 1
+        }));
+        assert_eq!(hsqc_peaks["total_matching"], 2);
+        assert_eq!(hsqc_peaks["items"].as_array().unwrap().len(), 1);
+        assert_eq!(hsqc_peaks["items"][0]["h_ppm"], 8.45);
+
+        // 3. low_confidence (default 0.8 + explicit threshold)
+        let low_default = call_inspect(json!({ "section": "low_confidence" }));
+        assert_eq!(low_default["total_matching"], 3);
+        let low_strict =
+            call_inspect(json!({ "section": "low_confidence", "max_confidence": 0.5 }));
+        assert_eq!(low_strict["total_matching"], 2); // seq 3 (null) + seq 4 (0.45)
+
+        // 4. unassigned_residues (null or < 0)
+        let unassigned = call_inspect(json!({ "section": "unassigned_residues" }));
+        assert_eq!(unassigned["total_matching"], 2); // seq 3 (null) + seq 4 (-1)
+
+        // 5. assignments, spin_systems, workbook_pages, qc_report
+        assert_eq!(
+            call_inspect(json!({ "section": "assignments" }))["total_matching"],
+            4
+        );
+        assert_eq!(
+            call_inspect(json!({ "section": "spin_systems" }))["total_matching"],
+            2
+        );
+        assert_eq!(
+            call_inspect(json!({ "section": "workbook_pages" }))["total_matching"],
+            2
+        );
+        let qc_empty = call_inspect(json!({ "section": "qc_report" }));
+        assert_eq!(qc_empty["available"], false);
+        assert!(qc_empty["qc_report"].is_null());
+
+        ctrl.update_data_tables(|t| {
+            t.qc_report = Some(json!({ "verdict": "PASS", "completeness": 0.94 }));
+        });
+        let qc_pop = call_inspect(json!({ "section": "qc_report" }));
+        assert_eq!(qc_pop["available"], true);
+        assert_eq!(qc_pop["qc_report"]["verdict"], "PASS");
+
+        // 6. Unknown section returns -32602
+        let bad = ctrl
+            .handle_jsonrpc_bytes(
+                br#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"inspect_workbench_data","arguments":{"section":"bogus"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(bad["error"]["code"], -32602);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
