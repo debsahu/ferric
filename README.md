@@ -34,9 +34,23 @@ Every panel below is generated deterministically (`seed = 42`, zero external plo
 
 Requires a stable Rust toolchain (`rustup`, Rust 1.80+) and a Vulkan, Metal, or DX12 GPU (falls back cleanly to multi-threaded `rayon` CPU `f64` everywhere).
 
-### 1. Interactive Desktop Workbench (`ferric-gui`)
+### 1. Interactive Desktop Workbench (`ferric-gui`) & Prebuilt Packages
 
-Download pre-built desktop + CLI archives (`macos-arm64` `.dmg`/`FERRIC.app`/`.tar.gz`, `windows-x86_64` `.zip`, `linux-x86_64` `.tar.gz`) from [**GitHub Releases**](https://github.com/debsahu/ferric/releases), or build from source:
+Install via **Homebrew** (macOS Apple Silicon / Intel & Linux `x86_64`):
+
+```bash
+brew tap debsahu/tap
+brew install ferric                        # CLI (macOS arm64/x86_64 + Linux x86_64)
+brew install --cask --no-quarantine ferric # FERRIC.app GUI + CLI (macOS arm64/x86_64)
+```
+
+Or download pre-built packages directly from [**GitHub Releases**](https://github.com/debsahu/ferric/releases):
+- **macOS**: Apple Silicon (`macos-arm64`) and Intel (`macos-x86_64`) `.dmg` (`FERRIC.app`) & `.tar.gz`
+- **Linux `x86_64` (RHEL 9 / AlmaLinux 9 / Rocky 9 / Ubuntu / Debian, `glibc <= 2.34`)**: `.rpm`, `.deb`, & `.tar.gz`
+- **Linux `i686` (32-bit static musl CLI)**: `.rpm`, `.deb`, & `.tar.gz`
+- **Windows `x86_64`**: `.zip` (`ferric-gui.exe` + `ferric.exe`)
+
+Or build from source:
 
 ```bash
 cargo run --release -p nmr-gui --bin ferric-gui
