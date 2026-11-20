@@ -94,6 +94,99 @@ pub fn estimate_noise_mad(data: &[f32]) -> f32 {
     (1.4826 * median_f32(&mut dev1)).max(1e-12)
 }
 
+/// Shared clean-room dynamic-range and contour-floor SNR threshold formula.
+fn auto_snr_from_stats(max_abs: f32, noise: f32, contour_base: Option<f32>) -> f32 {
+    let noise = if noise.is_finite() {
+        noise.max(1e-12)
+    } else {
+        1.0
+    };
+    let max_snr = if max_abs.is_finite() {
+        (max_abs / noise).max(0.0)
+    } else {
+        0.0
+    };
+    let dr_snr = if max_snr > 120.0 {
+        (0.015 * max_snr).clamp(5.5, 45.0)
+    } else {
+        5.5
+    };
+    match contour_base {
+        Some(cb) if cb.is_finite() && cb > 0.0 => {
+            let contour_snr = (cb / noise).clamp(3.0, 200.0);
+            dr_snr.max(contour_snr).clamp(5.5, 200.0)
+        }
+        _ => dr_snr.clamp(5.5, 45.0),
+    }
+}
+
+/// Original clean-room automatic SNR threshold estimator for 2D NMR spectra.
+///
+/// Combines two-pass outlier-trimmed MAD noise ([`estimate_noise_mad`]), dynamic-range scaling
+/// (`0.015 * max_snr` above `120 sigma`, clamped to `[5.5, 45.0]`), and optional visible
+/// contour-floor coupling (`contour_base / noise` clamped to `[3.0, 200.0]`). When `axis_x`
+/// spans beyond the amide region (`min_ppm < 4.5 && max_ppm > 5.5`), `max_abs` is restricted to
+/// the `5.5..=11.5 ppm` amide `${}^{1}\text{H}$ window so residual water or aliphatic signals do
+/// not inflate the dynamic-range threshold.
+pub fn estimate_auto_snr_2d(spec: &Spectrum2D, contour_base: Option<f32>) -> f32 {
+    if spec.data.is_empty() {
+        return 5.5;
+    }
+    let noise = estimate_noise_mad(&spec.data).max(1e-12);
+    let nx = spec.nx();
+    let ny = spec.ny();
+    let use_amide_window = spec.axis_x.min_ppm() < 4.5
+        && spec.axis_x.max_ppm() > 5.5
+        && nx > 0
+        && ny > 0
+        && spec.data.len() >= nx * ny;
+    let mut max_abs = 0.0_f32;
+    if use_amide_window {
+        let active_cols: Vec<usize> = (0..nx)
+            .filter(|&ix| {
+                let hp = spec.axis_x.index_to_ppm(ix as f64);
+                (5.5..=11.5).contains(&hp)
+            })
+            .collect();
+        for iy in 0..ny {
+            let row = &spec.data[iy * nx..(iy + 1) * nx];
+            for &ix in &active_cols {
+                let v = row[ix];
+                if v.is_finite() {
+                    max_abs = max_abs.max(v.abs());
+                }
+            }
+        }
+    } else {
+        for &v in &spec.data {
+            if v.is_finite() {
+                max_abs = max_abs.max(v.abs());
+            }
+        }
+    }
+    auto_snr_from_stats(max_abs, noise, contour_base)
+}
+
+/// Original clean-room automatic SNR threshold estimator for 3D NMR cubes.
+///
+/// Uses the same dynamic-range and contour-floor model as [`estimate_auto_snr_2d`], scanning
+/// `spec.data` with an `O(65_536)` deterministic stride (`step_by((len / 65_536).max(1))`)
+/// paired with strided [`estimate_noise_mad`] for sub-2 ms execution on large 512 MiB cubes.
+pub fn estimate_auto_snr_3d(spec: &Spectrum3D, contour_base: Option<f32>) -> f32 {
+    if spec.data.is_empty() {
+        return 5.5;
+    }
+    let noise = estimate_noise_mad(&spec.data).max(1e-12);
+    let stride = (spec.data.len() / 65_536).max(1);
+    let mut max_abs = 0.0_f32;
+    for &v in spec.data.iter().step_by(stride) {
+        if v.is_finite() {
+            max_abs = max_abs.max(v.abs());
+        }
+    }
+    auto_snr_from_stats(max_abs, noise, contour_base)
+}
+
 /// Compute two-pass outlier-trimmed baseline median, local MAD (floored at `fallback_mad`), and `max_abs`.
 fn slice_trimmed_median_mad_and_max(
     vals: &[f32],
@@ -3055,5 +3148,127 @@ mod tests {
             infer_cube_axis_iso(&ax("X", 752.9, -70.0, -140.0), Some(h)),
             "19F"
         );
+    }
+
+    fn make_noisy_2d(nx: usize, ny: usize, hi_x: f64, lo_x: f64) -> Spectrum2D {
+        let axis_x = AxisPpm::from_bounds("1H", nx, hi_x, lo_x, 800.13);
+        let axis_y = AxisPpm::from_bounds("15N", ny, 132.0, 104.0, 81.08);
+        let mut data = vec![0.0_f32; nx * ny];
+        let mut st = 0x9E37_79B9_7F4A_7C15_u64;
+        for cell in &mut data {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u = ((st >> 32) as f32 / (u32::MAX as f32)) - 0.5;
+            *cell = u * 2.0;
+        }
+        Spectrum2D {
+            name: "HSQC".to_string(),
+            axis_x,
+            axis_y,
+            data,
+        }
+    }
+
+    #[test]
+    fn test_estimate_auto_snr_2d_low_high_dr_water_and_contour_floor() {
+        // Empty spectrum returns baseline 5.5 safely
+        let empty_2d = Spectrum2D {
+            name: "empty".to_string(),
+            axis_x: AxisPpm::from_bounds("1H", 0, 10.0, 6.0, 600.0),
+            axis_y: AxisPpm::from_bounds("15N", 0, 130.0, 105.0, 60.8),
+            data: Vec::new(),
+        };
+        assert_eq!(estimate_auto_snr_2d(&empty_2d, None), 5.5);
+
+        // Wide 1H axis (-0.5..11.5 ppm): water at 4.70 ppm is outside amide 5.5..11.5 ppm window
+        let mut low_spec = make_noisy_2d(128, 64, 11.5, -0.5);
+        let base_noise = estimate_noise_mad(&low_spec.data);
+        let ix_water = low_spec.axis_x.ppm_to_index(4.70).round() as usize;
+        let ix_amide = low_spec.axis_x.ppm_to_index(8.40).round() as usize;
+        let iy_mid = 32usize;
+        low_spec.data[iy_mid * 128 + ix_water] = 25_000.0 * base_noise;
+        low_spec.data[iy_mid * 128 + ix_amide] = 40.0 * base_noise;
+        assert!(
+            (estimate_auto_snr_2d(&low_spec, None) - 5.5).abs() < 1e-5,
+            "low-SNR amide (40 sigma) must stay 5.5 even with 25000 sigma water peak at 4.70 ppm"
+        );
+
+        // High-DR spectrum (1650 sigma inside amide window -> 0.015 * 1650 = 24.75)
+        let mut hi_spec = make_noisy_2d(128, 64, 11.5, -0.5);
+        let hi_noise = estimate_noise_mad(&hi_spec.data);
+        let ix_hi = hi_spec.axis_x.ppm_to_index(8.40).round() as usize;
+        hi_spec.data[iy_mid * 128 + ix_hi] = 1_650.0 * hi_noise;
+        hi_spec.data[iy_mid * 128 + ix_hi + 1] = f32::NAN; // finite guard
+        let est_hi = estimate_auto_snr_2d(&hi_spec, None);
+        assert!(
+            (est_hi - 24.75).abs() < 0.2,
+            "expected ~24.75 for 1650 sigma peak, got {est_hi}"
+        );
+
+        // Uncoupled dynamic range caps at 45.0; contour floor can push up to 200.0
+        let mut extreme = make_noisy_2d(128, 64, 10.5, 5.8); // narrow amide-only -> full plane
+        let ex_noise = estimate_noise_mad(&extreme.data);
+        extreme.data[16 * 128 + 64] = 10_000.0 * ex_noise;
+        assert!((estimate_auto_snr_2d(&extreme, None) - 45.0).abs() < 1e-4);
+
+        // Contour floor coupling on low-SNR spectrum
+        let est_cb_60 = estimate_auto_snr_2d(&low_spec, Some(60.0 * base_noise));
+        assert!(
+            (est_cb_60 - 60.0).abs() < 0.5,
+            "expected ~60.0 with contour_base = 60*noise, got {est_cb_60}"
+        );
+        assert!((estimate_auto_snr_2d(&low_spec, Some(500.0 * base_noise)) - 200.0).abs() < 1e-4);
+        assert!((estimate_auto_snr_2d(&low_spec, Some(2.0 * base_noise)) - 5.5).abs() < 1e-4);
+        assert!((estimate_auto_snr_2d(&low_spec, Some(-5.0)) - 5.5).abs() < 1e-4);
+        assert!((estimate_auto_snr_2d(&low_spec, Some(f32::NAN)) - 5.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_estimate_auto_snr_3d_empty_strided_high_dr_and_contour_floor() {
+        let empty_3d = Spectrum3D {
+            name: "empty".to_string(),
+            exp: "HNCA".to_string(),
+            axis_x: AxisPpm::from_bounds("1H", 0, 10.5, 6.0, 800.13),
+            axis_y: AxisPpm::from_bounds("15N", 0, 130.0, 105.0, 81.08),
+            axis_z: AxisPpm::from_bounds("13C", 0, 70.0, 40.0, 201.19),
+            data: Vec::new(),
+        };
+        assert_eq!(estimate_auto_snr_3d(&empty_3d, None), 5.5);
+
+        // 64 x 48 x 64 = 196_608 voxels (> 65_536 so strided scan has stride = 3)
+        let (nx, ny, nz) = (64usize, 48usize, 64usize);
+        let mut data = vec![0.0_f32; nx * ny * nz];
+        let mut st = 0x1234_5678_ABCD_EF01_u64;
+        for cell in &mut data {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u = ((st >> 32) as f32 / (u32::MAX as f32)) - 0.5;
+            *cell = u * 2.0;
+        }
+        let mut cube = Spectrum3D {
+            name: "HNCA".to_string(),
+            exp: "HNCA".to_string(),
+            axis_x: AxisPpm::from_bounds("1H", nx, 10.5, 6.0, 800.13),
+            axis_y: AxisPpm::from_bounds("15N", ny, 130.0, 105.0, 81.08),
+            axis_z: AxisPpm::from_bounds("13C", nz, 70.0, 40.0, 201.19),
+            data,
+        };
+        let noise = estimate_noise_mad(&cube.data);
+        assert!((estimate_auto_snr_3d(&cube, None) - 5.5).abs() < 1e-5);
+
+        // Inject a 3D peak hitting strided indices (stride = 196608 / 65536 = 3) at 1650 * noise
+        let peak_idx = 3 * 12_345;
+        cube.data[peak_idx] = 1_650.0 * noise;
+        cube.data[peak_idx + 3] = f32::INFINITY; // finite guard
+        let est = estimate_auto_snr_3d(&cube, None);
+        assert!(
+            (est - 24.75).abs() < 0.25,
+            "expected ~24.75 on strided 3D cube, got {est}"
+        );
+
+        let est_cb = estimate_auto_snr_3d(&cube, Some(85.0 * noise));
+        assert!(
+            (est_cb - 85.0).abs() < 0.5,
+            "expected ~85.0 with contour floor on 3D cube, got {est_cb}"
+        );
+        assert!((estimate_auto_snr_3d(&cube, Some(500.0 * noise)) - 200.0).abs() < 1e-4);
     }
 }

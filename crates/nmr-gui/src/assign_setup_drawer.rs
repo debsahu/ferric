@@ -266,6 +266,8 @@ pub enum AssignSetupAction {
     ApplySequenceText(String),
     /// User clicked `Pick All (2D + 3D)` with the selected SNR threshold.
     PickAllSpectra { snr_threshold: f64 },
+    /// User clicked `Auto` next to the `SNR:` slider to estimate threshold from spectrum stats.
+    AutoEstimateSnr,
     /// User clicked `Run Assignment` with selected solver engine, regime, and AF-prior toggle.
     RunAssignment {
         engine: AssignSolverEngine,
@@ -665,10 +667,22 @@ impl AssignSetupDrawerState {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("SNR:").size(TYPE_CAPTION_PX));
                     ui.add(
-                        egui::Slider::new(&mut self.snr_threshold, 2.0..=20.0)
+                        egui::Slider::new(&mut self.snr_threshold, 2.0..=200.0)
+                            .logarithmic(true)
                             .fixed_decimals(1)
                             .clamping(egui::SliderClamping::Always),
                     );
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("Auto").size(TYPE_CAPTION_PX),
+                        ))
+                        .on_hover_text(
+                            "Auto-estimate SNR threshold from spectrum MAD noise, dynamic range & contour floor",
+                        )
+                        .clicked()
+                    {
+                        actions.push(AssignSetupAction::AutoEstimateSnr);
+                    }
                 });
                 ui.add_space(4.0);
 
@@ -1074,4 +1088,162 @@ fn draw_status_pill(ui: &mut egui::Ui, text: &str, fill: egui::Color32, text_col
                     .color(text_color),
             );
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workbench_mode::{apply_type_scale, audit_text_layout, MIN_FONT_PX};
+
+    fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_assign_setup_drawer_auto_snr_button_and_wide_slider_range() {
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 960.0));
+        let ctx = egui::Context::default();
+        let mut drawer = AssignSetupDrawerState::new();
+        let input = AssignSetupInput {
+            sequence_len: 76,
+            sequence_preview: "MQIFVKTLTG...".to_string(),
+            experiments: AssignSetupInput::canonical_checklist([(true, 72); 7]),
+            ..Default::default()
+        };
+
+        let render = |drawer: &mut AssignSetupDrawerState,
+                      events: Vec<egui::Event>|
+         -> (egui::FullOutput, Vec<AssignSetupAction>) {
+            let mut emitted = Vec::new();
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(vp),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    apply_type_scale(ui.ctx());
+                    egui::Panel::left("assign_setup_auto_snr_test_host")
+                        .default_size(380.0)
+                        .show(ui, |ui| {
+                            emitted = drawer.show_contents(ui, &input);
+                        });
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        ui.label("Main");
+                    });
+                },
+            );
+            out.textures_delta.clear();
+            (out, emitted)
+        };
+
+        // Two warmup passes for layout stabilization + text audit
+        let _ = render(&mut drawer, Vec::new());
+        let (out, _) = render(&mut drawer, Vec::new());
+        let audit = audit_text_layout(&out.shapes, vp);
+        assert!(audit.min_font_px >= MIN_FONT_PX);
+        assert!(
+            audit.clipped.is_empty(),
+            "clipped text with Auto SNR button: {:?}",
+            audit.clipped
+        );
+        assert!(
+            audit.overlapping.is_empty(),
+            "overlapping text with Auto SNR button: {:?}",
+            audit.overlapping
+        );
+
+        // Clicking `Auto` button emits AssignSetupAction::AutoEstimateSnr
+        let auto_rect = audit
+            .texts
+            .iter()
+            .find(|t| t.text == "Auto")
+            .expect("missing Auto SNR button")
+            .rect;
+        let (_, acts_auto) = render(&mut drawer, click_at(auto_rect.center()));
+        assert_eq!(acts_auto, vec![AssignSetupAction::AutoEstimateSnr]);
+
+        // Cryo-probe SNR values above 20.0 up to 200.0 are preserved and emitted
+        drawer.snr_threshold = 185.0;
+        let (out_hi, _) = render(&mut drawer, Vec::new());
+        assert!((drawer.snr_threshold - 185.0).abs() < 1e-6);
+        let pick_rect = audit_text_layout(&out_hi.shapes, vp)
+            .texts
+            .iter()
+            .find(|t| t.text.contains("Pick All (2D + 3D)"))
+            .expect("missing Pick All button")
+            .rect;
+        let (_, acts_pick) = render(&mut drawer, click_at(pick_rect.center()));
+        assert_eq!(
+            acts_pick,
+            vec![AssignSetupAction::PickAllSpectra {
+                snr_threshold: 185.0
+            }]
+        );
+
+        // Interactive slider drag across the rail reaches cryo-probe range > 20.0 up to 200.0
+        drawer.snr_threshold = 5.0;
+        let (out_sl, _) = render(&mut drawer, Vec::new());
+        let audit_sl = audit_text_layout(&out_sl.shapes, vp);
+        let snr_rect = audit_sl
+            .texts
+            .iter()
+            .find(|t| t.text == "SNR:")
+            .expect("missing SNR: label")
+            .rect;
+        let val_rect = audit_sl
+            .texts
+            .iter()
+            .find(|t| t.text == "5.0")
+            .expect("missing slider value readout")
+            .rect;
+        let start = egui::pos2(snr_rect.right() + 24.0, snr_rect.center().y);
+        let end = egui::pos2(
+            (val_rect.left() - 4.0).max(start.x + 40.0),
+            snr_rect.center().y,
+        );
+        let _ = render(
+            &mut drawer,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = render(
+            &mut drawer,
+            vec![
+                egui::Event::PointerMoved(end),
+                egui::Event::PointerButton {
+                    pos: end,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            drawer.snr_threshold > 50.0 && drawer.snr_threshold <= 200.0,
+            "dragging SNR slider to right end must reach cryo-probe range (50..=200), got {}",
+            drawer.snr_threshold
+        );
+    }
 }

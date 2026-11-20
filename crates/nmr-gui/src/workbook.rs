@@ -1369,6 +1369,8 @@ pub struct Cube3dSliceState {
     pub exclude_diagonal: bool,
     pub exclude_water_band: bool,
     pub snr_threshold: f32,
+    /// Couple 3D peak picking minimum intensity to the active contour base level (`base_level`).
+    pub use_contour_floor: bool,
 }
 
 impl Default for Cube3dSliceState {
@@ -1385,6 +1387,7 @@ impl Default for Cube3dSliceState {
             exclude_diagonal: true,
             exclude_water_band: true,
             snr_threshold: 6.0,
+            use_contour_floor: true,
         }
     }
 }
@@ -1995,6 +1998,11 @@ impl Stored2dPage {
     pub fn cube_picker_config(&self) -> Cube3dPickerConfig {
         Cube3dPickerConfig {
             snr_threshold: self.cube_slice.snr_threshold.max(2.0),
+            min_abs_intensity: if self.cube_slice.use_contour_floor && self.base_level.is_finite() {
+                self.base_level.max(0.0)
+            } else {
+                0.0
+            },
             allow_negative: self.show_negative,
             exclude_diagonal: self.cube_slice.exclude_diagonal && !self.pick_diagonal,
             exclude_water_band: self.cube_slice.exclude_water_band,
@@ -4219,5 +4227,68 @@ mod tests {
             }
         });
         out.textures_delta.clear();
+    }
+
+    #[test]
+    fn test_cube_picker_config_respects_use_contour_floor() {
+        let def_slice = Cube3dSliceState::default();
+        assert!(def_slice.use_contour_floor);
+
+        let (nx, ny, nz) = (24usize, 16usize, 24usize);
+        let ax_x = AxisPpm::from_bounds("1H", nx, 10.5, 6.0, 800.13);
+        let ax_y = AxisPpm::from_bounds("15N", ny, 130.0, 107.0, 81.08);
+        let ax_z = AxisPpm::from_bounds("13C", nz, 70.0, 40.0, 201.19);
+        let mut data = vec![0.0_f32; nx * ny * nz];
+        let mut st = 0x5555_1234_ABCD_0001_u64;
+        for cell in &mut data {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *cell = (((st >> 32) as f32 / (u32::MAX as f32)) - 0.5) * 2.0;
+        }
+        let cx = ax_x.ppm_to_index(8.40);
+        let cy = ax_y.ppm_to_index(120.0);
+        let cz = ax_z.ppm_to_index(55.0);
+        for iz in 0..nz {
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    let r2 = ((ix as f64 - cx) / 1.2).powi(2)
+                        + ((iy as f64 - cy) / 1.1).powi(2)
+                        + ((iz as f64 - cz) / 1.2).powi(2);
+                    if r2 <= 9.0 {
+                        data[(iz * ny + iy) * nx + ix] += 200.0 * (-0.5 * r2).exp() as f32;
+                    }
+                }
+            }
+        }
+        let cube = Spectrum3D {
+            name: "HNCA".to_string(),
+            exp: "HNCA".to_string(),
+            axis_x: ax_x,
+            axis_y: ax_y,
+            axis_z: ax_z,
+            data,
+        };
+        let mut pg = Stored2dPage::from_3d_cube(1, 0, "3D HNCA", &cube);
+        assert!(pg.cube_slice.use_contour_floor);
+
+        // Coupled mode passes positive base_level to min_abs_intensity
+        pg.base_level = 42.5;
+        assert_eq!(pg.cube_picker_config().min_abs_intensity, 42.5);
+
+        // Raising contour base above the 200.0 peak filters it out when coupled
+        pg.base_level = 250.0;
+        assert_eq!(pg.cube_picker_config().min_abs_intensity, 250.0);
+        assert_eq!(pg.pick_3d_cube_peaks(&cube), 0);
+
+        // Uncoupled mode forces min_abs_intensity = 0.0 and recovers the peak
+        pg.cube_slice.use_contour_floor = false;
+        assert_eq!(pg.cube_picker_config().min_abs_intensity, 0.0);
+        assert_eq!(pg.pick_3d_cube_peaks(&cube), 1);
+
+        // Defensive guards against negative / non-finite base_level
+        pg.cube_slice.use_contour_floor = true;
+        pg.base_level = -5.0;
+        assert_eq!(pg.cube_picker_config().min_abs_intensity, 0.0);
+        pg.base_level = f32::NAN;
+        assert_eq!(pg.cube_picker_config().min_abs_intensity, 0.0);
     }
 }
