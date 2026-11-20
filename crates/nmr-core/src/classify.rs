@@ -1411,8 +1411,13 @@ fn classify_file_read_action(rel_path: &str) -> FileReadAction {
         return FileReadAction::BoundedBinary(NMRPIPE_HEADER_BYTES);
     }
 
-    // 5. Polymer sequence (`.fasta`, `.fa`, `.seq`) & shift/session interchange (`.str`, `.star`, `.bmrb`, `.nef`)
-    if lower.ends_with(".fasta") || lower.ends_with(".faa") || lower.ends_with(".seq") {
+    // 5. Polymer sequence (`.fasta`, `.fasta.txt`, `.fa`, `.faa`, `.seq`) & shift/session interchange (`.str`, `.star`, `.bmrb`, `.nef`)
+    if lower.ends_with(".fasta")
+        || lower.ends_with(".fasta.txt")
+        || lower.ends_with(".fa")
+        || lower.ends_with(".faa")
+        || lower.ends_with(".seq")
+    {
         return FileReadAction::BoundedText(MAX_TABLE_SNIFF_BYTES);
     }
     if lower.ends_with(".str")
@@ -5890,7 +5895,12 @@ fn classify_nmr_entries_named(root_name: &str, raw_entries: &[VirtualEntry]) -> 
             let lower = fname.to_ascii_lowercase();
 
             // Sequence & STAR/NEF files anywhere in workspace
-            if lower.ends_with(".fasta") || lower.ends_with(".faa") || lower.ends_with(".seq") {
+            if lower.ends_with(".fasta")
+                || lower.ends_with(".fasta.txt")
+                || lower.ends_with(".fa")
+                || lower.ends_with(".faa")
+                || lower.ends_with(".seq")
+            {
                 let txt = String::from_utf8_lossy(&e.header_bytes);
                 let res_count: usize = txt
                     .lines()
@@ -6394,6 +6404,8 @@ pub fn classify_nmr_workspace(path: &Path) -> Result<WorkspaceInventory, String>
                     || low.ends_with(".bmrb")
                     || low.ends_with(".nef")
                     || low.ends_with(".fasta")
+                    || low.ends_with(".fasta.txt")
+                    || low.ends_with(".fa")
                     || low.ends_with(".faa")
                     || low.ends_with(".seq"))
             });

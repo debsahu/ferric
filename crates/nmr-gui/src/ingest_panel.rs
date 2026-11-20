@@ -630,6 +630,7 @@ pub fn extract_sequence_from_auxiliary_text(filename: &str, text: &str) -> Optio
         }
     }
     if lower.ends_with(".fasta")
+        || lower.ends_with(".fasta.txt")
         || lower.ends_with(".fa")
         || lower.ends_with(".faa")
         || lower.ends_with(".seq")

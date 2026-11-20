@@ -70,11 +70,11 @@ use nmr_core::paramagnetic::{
     ParamagneticAssignConfig, ParamagneticSolverMode,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use nmr_core::peaks::read_peaks;
+use nmr_core::peaks::{read_peaks, write_peaks};
 use nmr_core::peaks::{read_peaks_str, Peak, EXPERIMENT_NAMES};
 use nmr_core::picker::{
-    estimate_noise_mad, pick_c13_hsqc_2d, pick_hsqc_2d, pick_triple_3d_two_pass,
-    CorroboratedRepickConfig, CubePeak3D, PickerConfig,
+    estimate_auto_snr_2d, estimate_auto_snr_3d, estimate_noise_mad, pick_c13_hsqc_2d, pick_hsqc_2d,
+    pick_triple_3d_two_pass, CorroboratedRepickConfig, CubePeak3D, PickerConfig,
 };
 use nmr_core::priors::{one_to_three, three_to_one, Priors, ATOMS};
 use nmr_core::process::{
@@ -1828,6 +1828,7 @@ struct NmrWorkbenchApp {
     octet_exp_sync_key: (usize, usize),
     relax_peaks_sync_key: (usize, usize, u64),
     mcp_last_viewport_key: (u64, i32, i32, i32),
+    mcp_tables_dirty_key: (usize, usize, usize, u64, usize, usize, u64, u64),
     assign_target_res: usize,
     assign_lock_check: bool,
 
@@ -3156,6 +3157,7 @@ impl Default for NmrWorkbenchApp {
             octet_exp_sync_key: (0, usize::MAX),
             relax_peaks_sync_key: (0, 0, u64::MAX),
             mcp_last_viewport_key: (0, 0, 0, -1),
+            mcp_tables_dirty_key: (usize::MAX, 0, 0, 0, 0, 0, 0, 0),
             assign_target_res: 0,
             assign_lock_check: true,
             view_h_left: 10.4,
@@ -7278,6 +7280,30 @@ impl NmrWorkbenchApp {
                         )
                         .on_hover_text("Release drag or press Enter to re-pick 3D cube peaks");
                     if snr_resp.drag_stopped() || snr_resp.lost_focus() {
+                        repick_cube = true;
+                    }
+                    if ui
+                        .button("Auto")
+                        .on_hover_text(
+                            "Auto-estimate 3D SNR threshold from cube MAD noise, dynamic range & contour floor",
+                        )
+                        .clicked()
+                    {
+                        if let Some(cube) =
+                            self.active_cube_idx.and_then(|idx| self.cubes_3d.get(idx))
+                        {
+                            self.cube_slice.snr_threshold =
+                                estimate_auto_snr_3d(cube, Some(self.contour_base));
+                            repick_cube = true;
+                        }
+                    }
+                    if ui
+                        .checkbox(&mut self.cube_slice.use_contour_floor, "Above Contour")
+                        .on_hover_text(
+                            "Restrict 3D cube picking to extrema at or above the visible contour floor",
+                        )
+                        .changed()
+                    {
                         repick_cube = true;
                     }
                     if ui
@@ -15516,7 +15542,8 @@ impl eframe::App for NmrWorkbenchApp {
         self.drain_1d_undo_into_journal();
         self.poll_background_ingest(&ctx);
         self.draw_background_ingest_banner(ui);
-        self.apply_pending_mcp_bridge_commands();
+        self.mcp_bridge.set_repaint_context(ctx.clone());
+        self.apply_pending_mcp_bridge_commands_with_ctx(Some(&ctx));
         self.sync_mcp_bridge_snapshot_and_viewport();
         self.handle_dropped_files(&ctx);
         self.draw_text_io_window(&ctx);
@@ -16406,7 +16433,12 @@ impl NmrWorkbenchApp {
             })
     }
 
+    #[cfg(test)]
     fn apply_pending_mcp_bridge_commands(&mut self) {
+        self.apply_pending_mcp_bridge_commands_with_ctx(None);
+    }
+
+    fn apply_pending_mcp_bridge_commands_with_ctx(&mut self, ctx_opt: Option<&egui::Context>) {
         self.drain_1d_undo_into_journal();
         let pending = self.mcp_bridge.drain_pending_ui_commands();
         if pending.is_empty() {
@@ -16486,6 +16518,344 @@ impl NmrWorkbenchApp {
                     }
                     self.status_msg = format!("MCP highlighted {} 3D residues", seq_ids.len());
                 }
+                McpUiCommand::LoadStudyFolder {
+                    path,
+                    run_full_pipeline,
+                } => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let cleaned = sanitize_user_path_input(&path);
+                        match IngestPanelState::from_native_path(Path::new(&cleaned)) {
+                            Ok(panel) => {
+                                self.ingest_panel = panel;
+                                let plan = self.ingest_panel.build_execution_plan();
+                                self.ingest_panel.open = false;
+                                if let Some(ctx) = ctx_opt {
+                                    self.start_ingest_plan_async(ctx, plan, run_full_pipeline);
+                                } else {
+                                    self.execute_ingest_plan(plan, run_full_pipeline);
+                                }
+                            }
+                            Err(e) => {
+                                self.status_msg = format!("MCP load_study_folder failed: {e}");
+                            }
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let _ = (path, run_full_pipeline);
+                        self.status_msg =
+                            "MCP load_study_folder requires native desktop runtime".to_string();
+                    }
+                }
+                McpUiCommand::SetSequence {
+                    sequence,
+                    sequence_path,
+                } => {
+                    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+                    let mut raw_seq = sequence;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(ref seq_p) = sequence_path {
+                        let cleaned = sanitize_user_path_input(seq_p);
+                        match std::fs::read_to_string(Path::new(&cleaned)) {
+                            Ok(contents) => raw_seq = contents,
+                            Err(e) => {
+                                self.status_msg = format!("MCP set_sequence read error: {e}");
+                                continue;
+                            }
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    let _ = sequence_path;
+                    let parsed = nmr_gui::ingest_panel::parse_sequence_three_letter(&raw_seq);
+                    if parsed.is_empty() {
+                        self.status_msg =
+                            "MCP set_sequence parsed 0 valid amino-acid residues".to_string();
+                    } else {
+                        self.sequence = parsed;
+                        self.seq_ids = (1..=(self.sequence.len() as i32)).collect();
+                        self.session.state.sequence = self.sequence.clone();
+                        self.session.state.seq_ids = self.seq_ids.clone();
+                        self.octet_app
+                            .set_loaded_protein_sequence(self.sequence.clone());
+                        self.assign_res = None;
+                        self.pred_ref = None;
+                        self.pred_conf.clear();
+                        self.rebuild_systems_and_matrices();
+                        self.status_msg =
+                            format!("MCP set sequence ({} residues)", self.sequence.len());
+                    }
+                }
+                McpUiCommand::PickAllSpectra {
+                    snr_threshold,
+                    use_auto_threshold,
+                    picker_mode,
+                } => {
+                    if let Some(mode) = picker_mode {
+                        self.use_neural_picker = mode.trim().eq_ignore_ascii_case("neural");
+                    }
+                    let snr = if use_auto_threshold || snr_threshold.is_none() {
+                        let est = if let Some(ref hsqc) = self.hsqc_spec {
+                            estimate_auto_snr_2d(hsqc, Some(self.contour_base))
+                        } else if let Some(cube) = self
+                            .active_cube_idx
+                            .and_then(|idx| self.cubes_3d.get(idx))
+                            .or_else(|| self.cubes_3d.first())
+                        {
+                            estimate_auto_snr_3d(cube, Some(self.contour_base))
+                        } else {
+                            self.picker_snr.max(5.5)
+                        };
+                        f64::from(est)
+                    } else {
+                        snr_threshold.unwrap_or(5.0).clamp(2.0, 250.0)
+                    };
+                    self.assign_setup_drawer.snr_threshold = snr;
+                    self.pick_all_2d_and_3d_spectra(snr);
+                }
+                McpUiCommand::RunAssignment { solver, engine } => {
+                    self.solver_kind = match solver.trim().to_ascii_lowercase().as_str() {
+                        "standard" => GuiSolverKind::Standard,
+                        "bayes-sa" | "bayes_sa" => GuiSolverKind::BayesSa,
+                        _ => GuiSolverKind::EvoGraph,
+                    };
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(eng) = engine {
+                        self.use_gpu = eng.trim().eq_ignore_ascii_case("gpu");
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    let _ = engine;
+                    self.run_assignment();
+                }
+                McpUiCommand::SelectWorkbookPage {
+                    page_index,
+                    page_name,
+                } => {
+                    let target_idx = page_index
+                        .filter(|&idx| idx < self.workbook.pages_2d.len())
+                        .or_else(|| {
+                            page_name.as_deref().and_then(|wanted| {
+                                let w = wanted.trim().to_ascii_lowercase();
+                                self.workbook
+                                    .pages_2d
+                                    .iter()
+                                    .position(|pg| pg.title.to_ascii_lowercase() == w)
+                                    .or_else(|| {
+                                        self.workbook.pages_2d.iter().position(|pg| {
+                                            pg.title.to_ascii_lowercase().contains(&w)
+                                        })
+                                    })
+                            })
+                        });
+                    if let Some(idx) = target_idx {
+                        self.activate_2d_workbook_page(idx);
+                        let title = self
+                            .workbook
+                            .pages_2d
+                            .get(idx)
+                            .map(|pg| pg.title.as_str())
+                            .unwrap_or("");
+                        self.status_msg = format!("MCP selected workbook page #{idx} '{title}'");
+                    } else {
+                        self.status_msg = "MCP select_workbook_page: page not found".to_string();
+                    }
+                }
+                McpUiCommand::SetContourLevel {
+                    contour_base,
+                    multiplier,
+                    show_negative,
+                } => {
+                    if let Some(base) = contour_base.filter(|v| v.is_finite() && *v > 0.0) {
+                        self.contour_base = base as f32;
+                    }
+                    if let Some(mult) = multiplier.filter(|v| v.is_finite() && *v > 0.0) {
+                        self.contour_base = (self.contour_base.max(1e-6) * mult as f32).max(1e-6);
+                    }
+                    if let Some(neg) = show_negative {
+                        self.show_negative = neg;
+                    }
+                    self.save_live_2d_into_workbook();
+                    self.status_msg = format!(
+                        "MCP set contour base {:.2e} (neg={})",
+                        self.contour_base, self.show_negative
+                    );
+                }
+                McpUiCommand::SetViewportBounds {
+                    h_left,
+                    h_right,
+                    n_top,
+                    n_bottom,
+                } => {
+                    if h_left.is_finite()
+                        && h_right.is_finite()
+                        && n_top.is_finite()
+                        && n_bottom.is_finite()
+                    {
+                        self.view_h_left = h_left.max(h_right) as f32;
+                        self.view_h_right = h_left.min(h_right) as f32;
+                        self.view_n_top = n_top.min(n_bottom) as f32;
+                        self.view_n_bottom = n_top.max(n_bottom) as f32;
+                        self.save_live_2d_into_workbook();
+                        self.status_msg = format!(
+                            "MCP set viewport 1H [{:.2}, {:.2}] / 15N [{:.1}, {:.1}] ppm",
+                            self.view_h_left,
+                            self.view_h_right,
+                            self.view_n_top,
+                            self.view_n_bottom
+                        );
+                    }
+                }
+                McpUiCommand::ExportResults { prefix, format } => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        if !prefix.trim().is_empty() {
+                            self.export_prefix = prefix.trim().to_string();
+                        }
+                        let base_p = Path::new(self.export_prefix.trim());
+                        match format.trim().to_ascii_lowercase().as_str() {
+                            "peaks" => {
+                                let out_p = base_p.with_extension("tsv");
+                                match write_peaks(&out_p, &self.peaks) {
+                                    Ok(()) => {
+                                        self.exported_in_session = true;
+                                        self.status_msg = format!(
+                                            "MCP exported {} peaks to {}",
+                                            self.peaks.len(),
+                                            out_p.display()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        self.status_msg = format!("MCP peak export failed: {e}")
+                                    }
+                                }
+                            }
+                            "nef" => {
+                                self.session.state.sequence = self.sequence.clone();
+                                self.session.state.seq_ids = self.seq_ids.clone();
+                                self.session.state.peaks = self.peaks.clone();
+                                let out_p = base_p.with_extension("nef");
+                                match self.session.save_to_path(&out_p) {
+                                    Ok(msg) => {
+                                        self.exported_in_session = true;
+                                        self.status_msg = format!("MCP exported NEF: {msg}");
+                                    }
+                                    Err(e) => {
+                                        self.status_msg = format!("MCP NEF export failed: {e}")
+                                    }
+                                }
+                            }
+                            "html" => {
+                                if let Some(pred) =
+                                    self.pred_ref.clone().or_else(|| self.reference.clone())
+                                {
+                                    let mut inp = ReportInput::new(
+                                        self.session.state.protein_name.clone(),
+                                        pred,
+                                        self.pred_conf.clone(),
+                                    );
+                                    inp.n_peaks = Some(self.peaks.len());
+                                    inp.n_spin_systems = Some(self.systems.len());
+                                    if let Some(res) = &self.assign_res {
+                                        inp.solver_score = Some(res.score);
+                                        inp.systems_and_assignment =
+                                            Some((self.systems.clone(), res.clone()));
+                                    }
+                                    inp.engine_label = Some(self.solver_kind.label().to_string());
+                                    let html = generate_quality_report_html(&inp);
+                                    let out_p = base_p.with_extension("html");
+                                    match std::fs::write(&out_p, &html) {
+                                        Ok(()) => {
+                                            self.exported_in_session = true;
+                                            self.status_msg = format!(
+                                                "MCP exported HTML report to {}",
+                                                out_p.display()
+                                            );
+                                        }
+                                        Err(e) => {
+                                            self.status_msg =
+                                                format!("MCP HTML export failed: {e}");
+                                        }
+                                    }
+                                } else {
+                                    self.status_msg =
+                                        "MCP export_results(html): run assignment first"
+                                            .to_string();
+                                }
+                            }
+                            _ => {
+                                if let Some(pred) = &self.pred_ref {
+                                    let out_p = base_p.with_extension("str");
+                                    match write_star(&out_p, pred, Some(&self.pred_conf)) {
+                                        Ok(()) => {
+                                            self.exported_in_session = true;
+                                            self.status_msg = format!(
+                                                "MCP exported NMR-STAR to {}",
+                                                out_p.display()
+                                            );
+                                        }
+                                        Err(e) => {
+                                            self.status_msg =
+                                                format!("MCP STAR export failed: {e}");
+                                        }
+                                    }
+                                } else {
+                                    self.status_msg =
+                                        "MCP export_results(star): run assignment first"
+                                            .to_string();
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let _ = (prefix, format);
+                        self.status_msg =
+                            "MCP export_results files require native desktop".to_string();
+                    }
+                }
+                McpUiCommand::SetLockResidue { seq_id, locked } => {
+                    if let Some(res_idx) = self.resolve_seq_idx_by_id(seq_id) {
+                        let ss_opt = if locked {
+                            self.assign_res
+                                .as_ref()
+                                .and_then(|ar| {
+                                    ar.position.iter().position(|&pos| pos == res_idx as i32)
+                                })
+                                .or(self.selected_ss)
+                        } else {
+                            self.session
+                                .state
+                                .locked_residues
+                                .iter()
+                                .find_map(|(&ss, &rk)| (rk == res_idx).then_some(ss))
+                        };
+                        if let Some(ss_idx) = ss_opt {
+                            if ss_idx < self.systems.len() {
+                                let msg = self.execute_session_cmd(WorkbenchCommand::LockResidue {
+                                    spin_system: ss_idx,
+                                    residue_seq_idx: res_idx,
+                                    locked,
+                                });
+                                self.sync_app_from_session();
+                                self.status_msg = msg;
+                            }
+                        } else {
+                            self.status_msg = format!(
+                                "MCP set_lock_residue(seq={seq_id}, locked={locked}): no matching spin system"
+                            );
+                        }
+                    }
+                }
+                McpUiCommand::DispatchWorkbenchAction { action } => {
+                    if action == WorkbenchAction::LoadPathOrSpectrum {
+                        self.status_msg = "Use run_workbench_workflow(action='load_study_folder', path=...) to load datasets via MCP".to_string();
+                    } else if let Some(ctx) = ctx_opt {
+                        self.dispatch_workbench_action(ctx, action);
+                    } else {
+                        let fallback_ctx = egui::Context::default();
+                        self.dispatch_workbench_action(&fallback_ctx, action);
+                    }
+                }
             }
         }
     }
@@ -16520,7 +16890,7 @@ impl NmrWorkbenchApp {
                 } else if self.show_stack1d_panel {
                     "NMR1D_STACK".to_string()
                 } else {
-                    "HSQC".to_string()
+                    self.primary_2d_label.clone()
                 }
             }
             WorkspaceMode::OctetChem => "OCTET_1D".to_string(),
@@ -16528,12 +16898,255 @@ impl NmrWorkbenchApp {
             WorkspaceMode::Metabolomics => "METABOLOMICS_1D".to_string(),
         };
 
+        let mut loaded_spectra = Vec::new();
+        for pg in &self.workbook.pages_2d {
+            if !loaded_spectra.contains(&pg.title) {
+                loaded_spectra.push(pg.title.clone());
+            }
+        }
+        if loaded_spectra.is_empty() && self.hsqc_spec.is_some() {
+            loaded_spectra.push(self.primary_2d_label.clone());
+        }
+        for cube in &self.cubes_3d {
+            let lbl = format!("3D {} ({})", cube.exp, cube.name);
+            if !loaded_spectra.contains(&lbl) {
+                loaded_spectra.push(lbl);
+            }
+        }
+
+        let mut peaks_by_experiment: BTreeMap<String, usize> = BTreeMap::new();
+        for pk in &self.peaks {
+            let k = Self::normalize_exp_key(&pk.exp);
+            *peaks_by_experiment.entry(k).or_insert(0) += 1;
+        }
+
+        let mut assigned_count = 0usize;
+        let mut high_conf_count = 0usize;
+        let mut placed_by_res: BTreeMap<usize, (usize, f64)> = BTreeMap::new();
+        let mut placed_by_ss: BTreeMap<usize, (i32, f64)> = BTreeMap::new();
+        if let Some(ref res) = self.assign_res {
+            for (ss_idx, &pos_i32) in res.position.iter().enumerate() {
+                if pos_i32 >= 0 {
+                    let r = pos_i32 as usize;
+                    if r < self.sequence.len() {
+                        let conf = res.confidence.get(ss_idx).copied().unwrap_or(0.0);
+                        assigned_count += 1;
+                        if conf >= 0.80 {
+                            high_conf_count += 1;
+                        }
+                        placed_by_res.insert(r, (ss_idx, conf));
+                        let sid = self.seq_ids.get(r).copied().unwrap_or((r + 1) as i32);
+                        placed_by_ss.insert(ss_idx, (sid, conf));
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let (ingest_in_progress, ingest_progress_text) = match &self.background_ingest {
+            Some(job) => (
+                true,
+                format!(
+                    "{}/{}: {} ({})",
+                    job.current, job.total, job.current_label, job.root_name
+                ),
+            ),
+            None => (false, String::new()),
+        };
+        #[cfg(target_arch = "wasm32")]
+        let (ingest_in_progress, ingest_progress_text) = (false, String::new());
+
+        let solver_kind_str = match self.solver_kind {
+            GuiSolverKind::EvoGraph => "evo-graph",
+            GuiSolverKind::Standard => "standard",
+            GuiSolverKind::BayesSa => "bayes-sa",
+        }
+        .to_string();
+        let picker_mode_str = if self.use_neural_picker {
+            "neural"
+        } else {
+            "classical"
+        }
+        .to_string();
+        let ws_mode_str = format!("{:?}", self.workspace_mode);
+        let status_copy = self.status_msg.clone();
+        let seq_len = self.sequence.len();
+        let peak_len = self.peaks.len();
+        let sys_len = self.systems.len();
+        let active_page_idx = self.workbook.active_2d_idx;
+        let c_base = f64::from(self.contour_base);
+        let v_bounds = [
+            f64::from(self.view_h_left),
+            f64::from(self.view_h_right),
+            f64::from(self.view_n_top),
+            f64::from(self.view_n_bottom),
+        ];
+        let p_snr = f64::from(self.picker_snr);
+
         self.mcp_bridge.update_snapshot(|snap| {
             snap.active_residue_seq = active_seq;
             snap.crosshair_ppm = (xh.h_ppm, xh.n_ppm, xh.c_ppm);
             snap.active_experiment = active_exp;
             snap.qc_status = qc_badge;
+            snap.sequence_len = seq_len;
+            snap.loaded_spectra = loaded_spectra;
+            snap.peak_count = peak_len;
+            snap.spin_system_count = sys_len;
+            snap.assigned_count = assigned_count;
+            snap.high_conf_count = high_conf_count;
+            snap.status_msg = status_copy;
+            snap.ingest_in_progress = ingest_in_progress;
+            snap.picker_mode = picker_mode_str;
+            snap.picker_snr = p_snr;
+            snap.workspace_mode = ws_mode_str;
+            snap.active_page_index = active_page_idx;
+            snap.solver_kind = solver_kind_str;
+            snap.contour_base = c_base;
+            snap.view_bounds = v_bounds;
+            snap.ingest_progress_text = ingest_progress_text;
+            snap.peaks_by_experiment = peaks_by_experiment;
         });
+
+        let cur_snap = self.mcp_bridge.snapshot();
+        let mut assign_hash = self.assign_res.as_ref().map_or(0u64, |r| {
+            r.score.to_bits() ^ ((assigned_count as u64) << 32)
+        });
+        for (&r, &(ss, conf)) in &placed_by_res {
+            assign_hash = assign_hash.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ ((r as u64) << 16)
+                ^ (ss as u64)
+                ^ ((conf * 10_000.0) as u64);
+        }
+        let mut aux_hash = u64::from(cur_snap.excluded_peaks.len() as u32)
+            ^ ((u64::from(self.qc_report.is_some())) << 40);
+        for &pidx in &cur_snap.excluded_peaks {
+            aux_hash ^= (pidx as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
+        }
+        let tables_key = (
+            peak_len,
+            sys_len,
+            seq_len,
+            self.hsqc_gen,
+            self.workbook.pages_2d.len(),
+            self.session.state.locked_residues.len(),
+            assign_hash,
+            aux_hash,
+        );
+        if tables_key != self.mcp_tables_dirty_key {
+            self.mcp_tables_dirty_key = tables_key;
+            let excluded_set = cur_snap.excluded_peaks;
+            let locked_by_res: BTreeSet<usize> = self
+                .session
+                .state
+                .locked_residues
+                .values()
+                .copied()
+                .collect();
+            let assignments_rows: Vec<serde_json::Value> = (0..self.sequence.len())
+                .map(|r| {
+                    let seq_id = self.seq_ids.get(r).copied().unwrap_or((r + 1) as i32);
+                    let res_name = &self.sequence[r];
+                    let (ss_opt, conf_opt) = match placed_by_res.get(&r) {
+                        Some(&(ss, c)) => (Some(ss), Some(c)),
+                        None => (None, None),
+                    };
+                    let shifts = ss_opt
+                        .and_then(|ss| self.systems.get(ss))
+                        .map(|sys| (Some(sys.h), Some(sys.n), sys.shifts()));
+                    let (h, n, ca, cb, c) = match shifts {
+                        Some((h, n, sh)) => (
+                            h,
+                            n,
+                            sh.get(&("CA".to_string(), 0)).copied(),
+                            sh.get(&("CB".to_string(), 0)).copied(),
+                            sh.get(&("C".to_string(), 0)).copied(),
+                        ),
+                        None => (None, None, None, None, None),
+                    };
+                    serde_json::json!({
+                        "seq_id": seq_id,
+                        "res_name": res_name,
+                        "spin_system_idx": ss_opt,
+                        "confidence": conf_opt,
+                        "locked": locked_by_res.contains(&r),
+                        "h": h,
+                        "n": n,
+                        "ca": ca,
+                        "cb": cb,
+                        "c": c,
+                    })
+                })
+                .collect();
+            let spin_system_rows: Vec<serde_json::Value> = self
+                .systems
+                .iter()
+                .enumerate()
+                .map(|(idx, sys)| {
+                    let sh = sys.shifts();
+                    let (assigned_seq_id, conf) = match placed_by_ss.get(&idx) {
+                        Some(&(sid, c)) => (Some(sid), Some(c)),
+                        None => (None, None),
+                    };
+                    serde_json::json!({
+                        "cluster_id": idx,
+                        "h": sys.h,
+                        "n": sys.n,
+                        "ca": sh.get(&("CA".to_string(), 0)).copied(),
+                        "cb": sh.get(&("CB".to_string(), 0)).copied(),
+                        "c": sh.get(&("C".to_string(), 0)).copied(),
+                        "ca_m1": sh.get(&("CA".to_string(), -1)).copied(),
+                        "cb_m1": sh.get(&("CB".to_string(), -1)).copied(),
+                        "c_m1": sh.get(&("C".to_string(), -1)).copied(),
+                        "assigned_seq_id": assigned_seq_id,
+                        "confidence": conf,
+                    })
+                })
+                .collect();
+            let peak_rows: Vec<serde_json::Value> = self
+                .peaks
+                .iter()
+                .enumerate()
+                .map(|(idx, pk)| {
+                    serde_json::json!({
+                        "index": idx,
+                        "exp": pk.exp,
+                        "h": pk.h,
+                        "n": pk.n,
+                        "c": pk.c,
+                        "sign": pk.sign,
+                        "height": pk.height,
+                        "excluded": excluded_set.contains(&idx),
+                    })
+                })
+                .collect();
+            let page_rows: Vec<serde_json::Value> = self
+                .workbook
+                .pages_2d
+                .iter()
+                .enumerate()
+                .map(|(idx, pg)| {
+                    serde_json::json!({
+                        "index": idx,
+                        "name": pg.title,
+                        "is_cube_3d": pg.is_cube_3d(),
+                        "nuc_x": pg.nuc_x,
+                        "nuc_y": pg.nuc_y,
+                        "peak_count": if pg.is_cube_3d() { pg.peaks_3d.len() } else { pg.peaks.len() },
+                    })
+                })
+                .collect();
+            let qc_json = self
+                .qc_report
+                .as_ref()
+                .and_then(|r| serde_json::to_value(r).ok());
+            self.mcp_bridge.update_data_tables(|tables| {
+                tables.assignments = assignments_rows;
+                tables.spin_systems = spin_system_rows;
+                tables.peaks = peak_rows;
+                tables.workbook_pages = page_rows;
+                tables.qc_report = qc_json;
+            });
+        }
 
         let vp_key = (
             self.hsqc_gen,
@@ -17136,6 +17749,22 @@ impl NmrWorkbenchApp {
                     }
                     AssignSetupAction::PickAllSpectra { snr_threshold } => {
                         self.pick_all_2d_and_3d_spectra(snr_threshold);
+                    }
+                    AssignSetupAction::AutoEstimateSnr => {
+                        let est = if let Some(ref hsqc) = self.hsqc_spec {
+                            estimate_auto_snr_2d(hsqc, Some(self.contour_base))
+                        } else if let Some(cube) = self
+                            .active_cube_idx
+                            .and_then(|idx| self.cubes_3d.get(idx))
+                            .or_else(|| self.cubes_3d.first())
+                        {
+                            estimate_auto_snr_3d(cube, Some(self.contour_base))
+                        } else {
+                            5.5
+                        };
+                        self.picker_snr = est;
+                        self.assign_setup_drawer.snr_threshold = f64::from(est);
+                        self.status_msg = format!("Auto-estimated picker SNR threshold: {est:.1}");
                     }
                     AssignSetupAction::RunAssignment {
                         engine,
@@ -21117,5 +21746,174 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             matches!(outcome_ok, IngestLoadOutcome::Completed(_)),
             "uncancelled load with no channel must return IngestLoadOutcome::Completed"
         );
+    }
+
+    #[test]
+    fn test_mcp_full_control_workflow_and_inspect_workbench_data() {
+        use super::*;
+        use nmr_gui::mcp_bridge::McpBridgePermission;
+
+        let mut app = make_headless_test_app();
+        app.load_builtin_demo_suite();
+        assert!(!app.sequence.is_empty());
+        assert!(!app.peaks.is_empty());
+
+        app.mcp_bridge
+            .set_permission(McpBridgePermission::ReadWrite);
+
+        let rpc = |app: &mut NmrWorkbenchApp, id: u64, method: &str, params: serde_json::Value| {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            });
+            let resp = app
+                .mcp_bridge
+                .handle_jsonrpc_bytes(body.to_string().as_bytes())
+                .expect("JSON-RPC response");
+            assert!(
+                resp.get("error").is_none(),
+                "unexpected JSON-RPC error for {method}: {resp}"
+            );
+            resp["result"].clone()
+        };
+
+        // 1. Sequence via FASTA header + auto-pick + evo-graph assignment + view/contour + mode switch
+        let res_seq = rpc(
+            &mut app,
+            1,
+            "tools/call",
+            serde_json::json!({
+                "name": "run_workbench_workflow",
+                "arguments": {
+                    "action": "set_sequence",
+                    "sequence": format!(">1UBQ:A|PDBID\n{UBIQUITIN_SEQ}\n"),
+                }
+            }),
+        );
+        assert_ne!(res_seq["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert_eq!(app.sequence.len(), 76);
+
+        let res_pick = rpc(
+            &mut app,
+            2,
+            "tools/call",
+            serde_json::json!({
+                "name": "run_workbench_workflow",
+                "arguments": {
+                    "action": "pick_peaks",
+                    "auto_threshold": true,
+                    "picker_mode": "classical",
+                }
+            }),
+        );
+        assert_ne!(res_pick["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert!(!app.peaks.is_empty());
+
+        let res_assign = rpc(
+            &mut app,
+            3,
+            "tools/call",
+            serde_json::json!({
+                "name": "run_workbench_workflow",
+                "arguments": {
+                    "action": "run_assignment",
+                    "solver": "evo-graph",
+                }
+            }),
+        );
+        assert_ne!(res_assign["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert!(app.assign_res.is_some());
+
+        let _ = rpc(
+            &mut app,
+            4,
+            "tools/call",
+            serde_json::json!({
+                "name": "run_workbench_workflow",
+                "arguments": {
+                    "action": "set_contour_level",
+                    "contour_base": 12.5,
+                    "show_negative": false,
+                }
+            }),
+        );
+        let _ = rpc(
+            &mut app,
+            5,
+            "tools/call",
+            serde_json::json!({
+                "name": "run_workbench_workflow",
+                "arguments": {
+                    "action": "set_viewport_bounds",
+                    "h_left": 9.8,
+                    "h_right": 6.4,
+                    "n_top": 106.0,
+                    "n_bottom": 132.0,
+                }
+            }),
+        );
+        let _ = rpc(
+            &mut app,
+            6,
+            "tools/call",
+            serde_json::json!({
+                "name": "dispatch_workbench_action",
+                "arguments": { "action": "switch_mode_assign" }
+            }),
+        );
+        app.apply_pending_mcp_bridge_commands();
+        app.sync_mcp_bridge_snapshot_and_viewport();
+
+        // 2. Verify enriched get_workbench_state
+        let state_res = rpc(
+            &mut app,
+            7,
+            "tools/call",
+            serde_json::json!({ "name": "get_workbench_state", "arguments": {} }),
+        );
+        let state_txt = state_res["content"][0]["text"]
+            .as_str()
+            .expect("get_workbench_state text");
+        let state_json: serde_json::Value =
+            serde_json::from_str(state_txt).expect("valid state json");
+        assert_eq!(state_json["sequence_len"], 76);
+        assert!(state_json["peak_count"].as_u64().unwrap_or(0) > 0);
+        assert!(state_json["assigned_count"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(state_json["picker_mode"], "classical");
+        assert_eq!(state_json["solver_kind"], "evo-graph");
+        assert_eq!(state_json["workspace_mode"], "ProteinNmr");
+        assert!((state_json["contour_base"].as_f64().unwrap_or(0.0) - 12.5).abs() < 1e-4);
+        assert!((state_json["view_bounds"][0].as_f64().unwrap_or(0.0) - 9.8).abs() < 1e-3);
+
+        // 3. Verify inspect_workbench_data sections
+        for (req_id, section) in [
+            (8, "assignments"),
+            (9, "spin_systems"),
+            (10, "peaks"),
+            (11, "actions"),
+        ] {
+            let insp = rpc(
+                &mut app,
+                req_id,
+                "tools/call",
+                serde_json::json!({
+                    "name": "inspect_workbench_data",
+                    "arguments": { "section": section, "limit": 50 }
+                }),
+            );
+            let txt = insp["content"][0]["text"]
+                .as_str()
+                .expect("inspect_workbench_data text");
+            let val: serde_json::Value = serde_json::from_str(txt).expect("valid inspect json");
+            assert!(
+                !val["items"].as_array().map_or(true, |a| a.is_empty()),
+                "section '{section}' must return non-empty items: {val}"
+            );
+        }
     }
 }
