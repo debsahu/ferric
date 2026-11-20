@@ -19,7 +19,11 @@ use nmr_gui::assign_setup_drawer::{
     ExperimentChecklistRow, TriageBucket, CANONICAL_BACKBONE_EXPERIMENTS,
 };
 use nmr_gui::contour_painter::SyncCrosshair;
-use nmr_gui::relax_panel::{Peak2D, RelaxPanelState, RelaxStudioSubTab, TRACT_MISSING_RATES_ERR};
+use nmr_gui::mol3d_overlay::QuantitativeTrack;
+use nmr_gui::relax_panel::{
+    Peak2D, RelaxPanelAction, RelaxPanelState, RelaxStudioSubTab, TRACT_MISSING_RATES_ERR,
+    UNASSIGNED_DYNAMICS_BANNER,
+};
 use nmr_gui::strip_tiler::{
     StripBandView, StripSpectra3D, StripSpectra3DFull, StripTilerContext, StripTilerPanel,
 };
@@ -1065,4 +1069,396 @@ fn test_relax_panel_hetnoe_auto_default_fails_closed_without_pulprog() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_synthetic_multi_peak_pseudo3d_bruker_dir(
+    dir: &std::path::Path,
+    delays: &[f64],
+    peaks: &[(f64, f64, f64, f64)], // (h_ppm, n_ppm, amp0, rate_s_inv)
+) {
+    use nmr_core::rng::Rng;
+    use std::f64::consts::PI;
+    use std::fs;
+
+    fs::create_dir_all(dir).expect("create temp bruker dir");
+    let n0 = 128usize; // complex points direct 1H
+    let n1 = 48usize; // complex points indirect 15N
+    let td_x = 2 * n0;
+    let td_y = 2 * n1;
+    let n_planes = delays.len();
+
+    let bf1_x = 600.0_f64;
+    let sfo1_x = 600.0 * (1.0 + 8.30e-6); // carrier at 8.30 ppm (5.3..11.3 ppm amide window)
+    let sw_hz_x = 3600.0_f64;
+
+    let bf1_y = 60.80_f64;
+    let sfo1_y = 60.80 * (1.0 + 118.0e-6); // carrier at 118.0 ppm (104..132 ppm)
+    let sw_ppm_y = 28.0_f64;
+    let sw_hz_y = sw_ppm_y * sfo1_y;
+
+    let acqus = format!(
+        "##TITLE= Synthetic Multi-Peak Relax\n\
+         ##$PULPROG= <hsqct1etf3gpsi3d>\n\
+         ##$PARMODE= 2\n\
+         ##$AQSEQ= 0\n\
+         ##$BYTORDA= 0\n\
+         ##$DTYPA= 2\n\
+         ##$AQ_mod= 3\n\
+         ##$TD= {td_x}\n\
+         ##$SFO1= {sfo1_x:.8}\n\
+         ##$BF1= {bf1_x:.8}\n\
+         ##$SW_h= {sw_hz_x:.6}\n\
+         ##$NUC1= <1H>\n\
+         ##$GRPDLY= 0\n\
+         ##END=\n"
+    );
+    let acqu2s = format!(
+        "##TITLE= Indirect 15N\n\
+         ##$FnMODE= 4\n\
+         ##$TD= {td_y}\n\
+         ##$SFO1= {sfo1_y:.8}\n\
+         ##$BF1= {bf1_y:.8}\n\
+         ##$SW= {sw_ppm_y:.6}\n\
+         ##$SW_h= {sw_hz_y:.6}\n\
+         ##$NUC1= <15N>\n\
+         ##END=\n"
+    );
+    let acqu3s = format!(
+        "##TITLE= Pseudo Delay Axis\n\
+         ##$FnMODE= 1\n\
+         ##$TD= {n_planes}\n\
+         ##$SFO1= {sfo1_y:.8}\n\
+         ##$BF1= {bf1_y:.8}\n\
+         ##$SW= 1.0\n\
+         ##$SW_h= 60.8\n\
+         ##$NUC1= <off>\n\
+         ##END=\n"
+    );
+    fs::write(dir.join("acqus"), acqus).expect("write acqus");
+    fs::write(dir.join("acqu2s"), acqu2s).expect("write acqu2s");
+    fs::write(dir.join("acqu3s"), acqu3s).expect("write acqu3s");
+    fs::write(
+        dir.join("pulseprogram"),
+        "; synthetic pseudo3d: plane_queued\n; f2 reverse: false\n",
+    )
+    .expect("write pulseprogram");
+
+    let pdata1 = dir.join("pdata").join("1");
+    fs::create_dir_all(&pdata1).expect("create pdata/1");
+    fs::write(
+        pdata1.join("procs"),
+        "##$PHC0= 0\n##$PHC1= 0\n##$WDW= 3\n##$SSB= 2.0\n##$SI= 256\n##$BC_mod= 0\n##END=\n",
+    )
+    .expect("write procs");
+    fs::write(
+        pdata1.join("proc2s"),
+        "##$PHC0= 0\n##$PHC1= 0\n##$WDW= 3\n##$SSB= 2.0\n##$SI= 128\n##$REVERSE= no\n##$BC_mod= 0\n##END=\n",
+    )
+    .expect("write proc2s");
+
+    let vdlist: Vec<String> = delays.iter().map(|d| format!("{d:.6}s")).collect();
+    fs::write(dir.join("vdlist"), vdlist.join("\n") + "\n").expect("write vdlist");
+
+    let carrier_ppm_x = (sfo1_x - bf1_x) * 1.0e6 / bf1_x;
+    let carrier_ppm_y = (sfo1_y - bf1_y) * 1.0e6 / bf1_y;
+    let dt_x = 1.0 / sw_hz_x;
+    let dt_y = 1.0 / sw_hz_y;
+    let r2_td_x = 140.0_f64;
+    let r2_td_y = 160.0_f64;
+
+    let total_traces = n_planes * n1 * 2;
+    let mut traces = vec![vec![[0.0_f64; 2]; n0]; total_traces];
+    let mut rng = Rng::new(2026_1710);
+
+    for (p_idx, &t_delay) in delays.iter().enumerate() {
+        for k1 in 0..n1 {
+            let t1 = (k1 as f64) * dt_y;
+            let env1 = (-r2_td_y * t1).exp();
+            for q in 0..2 {
+                let tidx = (p_idx * n1 + k1) * 2 + q;
+                let tr = &mut traces[tidx];
+                for &(dh, dn, i0, r_rate) in peaks {
+                    let amp = i0 * (-r_rate * t_delay).exp();
+                    let fx = (dh - carrier_ppm_x) * bf1_x;
+                    let fy = (dn - carrier_ppm_y) * bf1_y;
+                    let mod_y = if q == 0 {
+                        (2.0 * PI * fy * t1).cos()
+                    } else {
+                        (2.0 * PI * fy * t1).sin()
+                    } * env1;
+                    for (k0, sample) in tr.iter_mut().enumerate() {
+                        let t0 = (k0 as f64) * dt_x;
+                        let env0 = (-r2_td_x * t0).exp();
+                        let (s0, c0) = (2.0 * PI * fx * t0).sin_cos();
+                        let w = amp * mod_y * env0;
+                        sample[0] += w * c0;
+                        sample[1] += w * s0;
+                    }
+                }
+                for sample in tr.iter_mut() {
+                    sample[0] += rng.normal(0.0, 4.5);
+                    sample[1] += rng.normal(0.0, 4.5);
+                }
+            }
+        }
+    }
+
+    let mut ser_bytes = Vec::with_capacity(total_traces * n0 * 16);
+    for tr in &traces {
+        for &[re, im] in tr {
+            ser_bytes.extend_from_slice(&re.to_le_bytes());
+            ser_bytes.extend_from_slice(&im.to_le_bytes());
+        }
+    }
+    fs::write(dir.join("ser"), &ser_bytes).expect("write ser");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn test_relax_panel_unassigned_t1_t2_reuse_footprints_refuse_modelfree_and_purge_on_sync() {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base_dir =
+        std::env::temp_dir().join(format!("ferric_gui_p1_9_10_{}_{}", std::process::id(), ts));
+    let t1_dir = base_dir.join("t1_unassigned");
+    let t2_dir = base_dir.join("t2_unassigned");
+
+    // 3 well-separated NH cross-peaks in T1:
+    //   Peak A (8.65, 124.0): R1 = 1.30 s^-1, R2 = 9.0 s^-1
+    //   Peak B (8.10, 118.5): R1 = 2.15 s^-1, R2 = 15.5 s^-1
+    //   Peak C (7.60, 113.0): R1 = 0.85 s^-1, R2 = 5.8 s^-1
+    // In T2, deliberately add an extra strong Peak X at (9.05, 127.0) with R2 = 28.0 s^-1 AND
+    // scramble relative plane-0 amplitudes so independent T2 auto-picking would assign completely
+    // mismatched 1..4 synthetic IDs!
+    let t1_delays = [0.02_f64, 0.15, 0.35, 0.65, 1.10];
+    let t2_delays = [0.008_f64, 0.024, 0.056, 0.100, 0.160];
+    write_synthetic_multi_peak_pseudo3d_bruker_dir(
+        &t1_dir,
+        &t1_delays,
+        &[
+            (8.65, 124.0, 120.0, 1.30),
+            (8.10, 118.5, 95.0, 2.15),
+            (7.60, 113.0, 80.0, 0.85),
+        ],
+    );
+    write_synthetic_multi_peak_pseudo3d_bruker_dir(
+        &t2_dir,
+        &t2_delays,
+        &[
+            (9.05, 127.0, 150.0, 28.0), // extra peak absent from T1 plane 0
+            (8.65, 124.0, 75.0, 9.0),
+            (8.10, 118.5, 125.0, 15.5),
+            (7.60, 113.0, 95.0, 5.8),
+        ],
+    );
+
+    let mut panel = RelaxPanelState::new();
+    panel.mc_replicates = 40;
+    let seq: Vec<String> = ["MET", "GLN", "ILE", "PHE", "VAL"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let seq_ids: Vec<i32> = (1..=5).collect();
+
+    // --- Part (b): Load unassigned T1 then unassigned T2 (171.assign:P1-10) ---
+    panel
+        .load_bruker_pseudo3d_series(RelaxExperimentKind::R1, &t1_dir, HetNoeOrder::Auto, None)
+        .expect("unassigned T1 load must succeed");
+    assert_eq!(panel.auto_picked_seeds.len(), 3);
+    assert_eq!(panel.unassigned_pick_ids.len(), 3);
+    assert_eq!(panel.r1_fits.len(), 3);
+    let t1_seeds_snapshot = panel.auto_picked_seeds.clone();
+
+    panel
+        .load_bruker_pseudo3d_series(RelaxExperimentKind::R2, &t2_dir, HetNoeOrder::Auto, None)
+        .expect("unassigned T2 load must reuse T1 plane-0 footprints");
+    assert_eq!(
+        panel.auto_picked_seeds, t1_seeds_snapshot,
+        "T2 slot MUST reuse exact (H, N) auto_picked_seeds from T1 rather than re-picking T2 plane 0"
+    );
+    assert_eq!(
+        panel.r2_fits.len(),
+        3,
+        "T2 must integrate the 3 locked T1 seeds (ignoring T2-only Peak X at 9.05/127.0)"
+    );
+    assert!(
+        panel
+            .t2_slot
+            .warnings
+            .iter()
+            .any(|w| w.contains("reused 3 unassigned plane-0 footprints")),
+        "expected T2 reuse warning, got {:?}",
+        panel.t2_slot.warnings
+    );
+
+    // Every synthetic pick ID must pair the matching (R1, R2) of the SAME (H, N) peak (never R2 = 28.0)
+    for seed in &panel.auto_picked_seeds {
+        let r1 = panel.r1_fits[&seed.seq_id].rate;
+        let r2 = panel.r2_fits[&seed.seq_id].rate;
+        let (exp_r1, exp_r2) = if (seed.delta_h_ppm - 8.65).abs() < 0.15 {
+            (1.30, 9.0)
+        } else if (seed.delta_h_ppm - 8.10).abs() < 0.15 {
+            (2.15, 15.5)
+        } else {
+            (0.85, 5.8)
+        };
+        assert!(
+            (r1 - exp_r1).abs() < 0.30,
+            "seed {} (H={:.2}) R1={r1:.2} vs expected {exp_r1:.2}",
+            seed.seq_id,
+            seed.delta_h_ppm
+        );
+        assert!(
+            (r2 - exp_r2).abs() < 1.8,
+            "seed {} (H={:.2}) R2={r2:.2} vs expected {exp_r2:.2} (must not cross-pair with 28.0!)",
+            seed.seq_id,
+            seed.delta_h_ppm
+        );
+    }
+
+    // Residue-indexed Model-Free, Detectors, IMPACT, and 3D export MUST refuse unassigned picks!
+    let mf_err = panel
+        .run_modelfree(None)
+        .expect_err("Model-Free must refuse unassigned pick IDs");
+    assert_eq!(mf_err, UNASSIGNED_DYNAMICS_BANNER);
+    assert_eq!(panel.status_banner, UNASSIGNED_DYNAMICS_BANNER);
+    assert!(panel.modelfree_result.is_none());
+
+    let det_err = panel
+        .run_phase22_detectors()
+        .expect_err("Detectors must refuse unassigned pick IDs");
+    assert_eq!(det_err, UNASSIGNED_DYNAMICS_BANNER);
+    assert!(panel.detector_fits.is_empty());
+
+    let imp_err = panel
+        .run_phase22_impact()
+        .expect_err("IMPACT must refuse unassigned pick IDs");
+    assert_eq!(imp_err, UNASSIGNED_DYNAMICS_BANNER);
+    assert!(panel.impact_fits.is_empty());
+
+    assert!(panel
+        .build_3d_track_export(&seq_ids, QuantitativeTrack::LipariSzaboS2)
+        .is_none());
+
+    // Headless egui render on CurvesAndModelFree must NOT label unassigned picks as MET1/GLN2/ILE3
+    // and must show UNASSIGNED_DYNAMICS_BANNER instead of sequence-residue bars!
+    let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+    let ctx = egui::Context::default();
+    panel.active_sub_tab = RelaxStudioSubTab::CurvesAndModelFree;
+    let mut out_unassigned = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(vp),
+            ..Default::default()
+        },
+        |ui| {
+            apply_type_scale(ui.ctx());
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = panel.ui(ui, &seq, &seq_ids, Some(0), None);
+            });
+        },
+    );
+    let audit_unassigned = audit_text_layout(&out_unassigned.shapes, vp);
+    out_unassigned.textures_delta.clear();
+    assert!(audit_unassigned.min_font_px >= MIN_FONT_PX);
+    assert!(
+        audit_unassigned.clipped.is_empty(),
+        "clipped: {:?}",
+        audit_unassigned.clipped
+    );
+    assert!(
+        audit_unassigned.overlapping.is_empty(),
+        "overlapping: {:?}",
+        audit_unassigned.overlapping
+    );
+    let all_txt: String = audit_unassigned
+        .texts
+        .iter()
+        .map(|t| t.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        all_txt.contains("Unassigned PK#"),
+        "decay canvas must label curve as Unassigned PK#k, got: {all_txt}"
+    );
+    assert!(
+        all_txt.contains(UNASSIGNED_DYNAMICS_BANNER),
+        "sequence track area must show UNASSIGNED_DYNAMICS_BANNER, got: {all_txt}"
+    );
+    for forbidden_res in ["MET1", "GLN2", "ILE3"] {
+        assert!(
+            !all_txt.contains(forbidden_res),
+            "unassigned pick must NEVER be painted onto sequence residue {forbidden_res}: {all_txt}"
+        );
+    }
+
+    // --- Part (a): Sync 1 assigned peak -> purge all stale auto-pick fits & clear modelfree (171.assign:P1-9) ---
+    // Also inject a synthetic stale modelfree_result on IDs 1..=3 to prove sync clears modelfree_result too
+    let mut stale_mf_donor = RelaxPanelState::new();
+    stale_mf_donor.mc_replicates = 20;
+    stale_mf_donor
+        .load_demo_dynamics(&seq[..3], &seq_ids[..3], None)
+        .expect("donor demo");
+    panel.modelfree_result = stale_mf_donor.modelfree_result;
+    assert!(panel.modelfree_result.is_some());
+
+    let synced_cnt =
+        panel.sync_assigned_hsqc_peaks(&[Peak2D::assigned(4, "PHE", 8.10, 118.5)], ">seq\nMQIFV");
+    assert_eq!(synced_cnt, 1);
+    assert!(panel.unassigned_pick_ids.is_empty());
+    assert!(panel.auto_picked_seeds.is_empty());
+    assert!(
+        panel.r1_curves.is_empty()
+            && panel.r1_fits.is_empty()
+            && panel.r2_curves.is_empty()
+            && panel.r2_fits.is_empty()
+            && panel.hetnoe_fits.is_empty()
+            && panel.detector_fits.is_empty()
+            && panel.impact_fits.is_empty(),
+        "sync_assigned_hsqc_peaks MUST purge every stale unassigned auto-pick entry across all maps"
+    );
+    assert!(
+        panel.modelfree_result.is_none(),
+        "sync_assigned_hsqc_peaks MUST clear stale modelfree_result"
+    );
+    assert!(
+        panel
+            .build_3d_track_export(&seq_ids, QuantitativeTrack::LipariSzaboS2)
+            .is_none(),
+        "build_3d_track_export MUST return None after purging stale unassigned picks"
+    );
+
+    // Re-load T1 & T2 with the 1 synced peak (PHE4, seq_id=4, seq_idx=3), run Model-Free, and
+    // prove build_3d_track_export ONLY exports PHE4 (seq_idx=3) and NEVER stale picks #1..#3!
+    panel
+        .load_bruker_pseudo3d_series(RelaxExperimentKind::R1, &t1_dir, HetNoeOrder::Auto, None)
+        .expect("assigned T1 load for PHE4");
+    panel
+        .load_bruker_pseudo3d_series(RelaxExperimentKind::R2, &t2_dir, HetNoeOrder::Auto, None)
+        .expect("assigned T2 load for PHE4");
+    assert_eq!(panel.r1_fits.keys().copied().collect::<Vec<_>>(), vec![4]);
+    assert_eq!(panel.r2_fits.keys().copied().collect::<Vec<_>>(), vec![4]);
+    panel
+        .run_modelfree(None)
+        .expect("Model-Free on assigned PHE4 must succeed");
+    let export_act = panel
+        .build_3d_track_export(&seq_ids, QuantitativeTrack::LipariSzaboS2)
+        .expect("3D export for assigned PHE4");
+    match export_act {
+        RelaxPanelAction::ExportTo3dTrack { s2_by_seq_idx, .. } => {
+            assert_eq!(
+                s2_by_seq_idx.keys().copied().collect::<Vec<_>>(),
+                vec![3],
+                "3D export must ONLY map PHE4 (seq_idx=3), NEVER stale picks 0..2"
+            );
+        }
+        other => panic!("unexpected action: {other:?}"),
+    }
+
+    let _ = fs::remove_dir_all(&base_dir);
 }

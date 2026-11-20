@@ -154,6 +154,11 @@ pub struct Pseudo3dSlotState {
 pub const TRACT_MISSING_RATES_ERR: &str =
     "TRACT requires experimental TROSY (Rα) and anti-TROSY (Rβ) decay rates";
 
+/// Status banner & fail-closed error when residue-indexed dynamics (`Model-Free`, `Detectors`,
+/// `IMPACT`) are requested while only unassigned auto-picked peaks are present.
+pub const UNASSIGNED_DYNAMICS_BANNER: &str =
+    "Sync assigned HSQC peaks from Assign mode before running residue-indexed Model-Free / Detectors / IMPACT";
+
 /// Compact Phase 22 `TRACT` / CCR ($\eta_{xy}$, $R_{\text{ex}}$-free $\tau_m$, $\kappa_0$) summary.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TractSummaryReport {
@@ -212,7 +217,11 @@ pub struct RelaxPanelState {
 
     /// Locked HSQC peak footprints synced from `Assign` mode for pseudo-3D plane integration.
     pub synced_peak_seeds: Vec<TargetPeakSeed>,
-    /// Synthetic pick IDs created by unassigned plane-0 auto-picking (never exported onto 3D PDB residues).
+    /// Shared unassigned plane-0 footprints auto-picked from the first unassigned pseudo-3D slot
+    /// so subsequent unassigned slots (`T1`, `T2`, `hetNOE`) integrate the exact same `(H, N)` coordinates.
+    pub auto_picked_seeds: Vec<TargetPeakSeed>,
+    /// Synthetic pick IDs created by unassigned plane-0 auto-picking (never combined into
+    /// residue-indexed Model-Free / Detectors / IMPACT or exported onto 3D PDB residues).
     pub unassigned_pick_ids: std::collections::BTreeSet<i32>,
     pub t1_slot: Pseudo3dSlotState,
     pub t2_slot: Pseudo3dSlotState,
@@ -272,6 +281,7 @@ impl RelaxPanelState {
             aux_field_rates: Vec::new(),
             modelfree_result: None,
             synced_peak_seeds: Vec::new(),
+            auto_picked_seeds: Vec::new(),
             unassigned_pick_ids: std::collections::BTreeSet::new(),
             t1_slot: Pseudo3dSlotState::default(),
             t2_slot: Pseudo3dSlotState::default(),
@@ -363,7 +373,9 @@ impl RelaxPanelState {
 
         let n = seeds.len();
         self.synced_peak_seeds = seeds;
-        self.unassigned_pick_ids.clear();
+        if n > 0 {
+            self.purge_unassigned_picks();
+        }
         if skipped_duplicates > 0 || skipped_unassigned > 0 {
             self.status_banner = format!(
                 "Synced {n} assigned HSQC peak footprints (dropped {skipped_duplicates} duplicate seq_id(s), {skipped_unassigned} unassigned peak(s))."
@@ -374,6 +386,80 @@ impl RelaxPanelState {
             );
         }
         n
+    }
+
+    /// Clear `unassigned_pick_ids` and `auto_picked_seeds`, purging every stale unassigned entry
+    /// from `r1_curves`, `r1_fits`, `r2_curves`, `r2_fits`, `hetnoe_fits`, `detector_fits`, and
+    /// `impact_fits`, and clearing `modelfree_result = None` whenever any purged ID was present.
+    pub fn purge_unassigned_picks(&mut self) -> usize {
+        self.auto_picked_seeds.clear();
+        if self.unassigned_pick_ids.is_empty() {
+            return 0;
+        }
+        let flagged = std::mem::take(&mut self.unassigned_pick_ids);
+        let mut purged_ids = std::collections::BTreeSet::new();
+        for &id in &flagged {
+            if self.r1_curves.remove(&id).is_some() {
+                purged_ids.insert(id);
+            }
+            if self.r1_fits.remove(&id).is_some() {
+                purged_ids.insert(id);
+            }
+            if self.r2_curves.remove(&id).is_some() {
+                purged_ids.insert(id);
+            }
+            if self.r2_fits.remove(&id).is_some() {
+                purged_ids.insert(id);
+            }
+            if self.hetnoe_fits.remove(&id).is_some() {
+                purged_ids.insert(id);
+            }
+            if self.detector_fits.remove(&id).is_some() {
+                purged_ids.insert(id);
+            }
+            if self.impact_fits.remove(&id).is_some() {
+                purged_ids.insert(id);
+            }
+            if self
+                .modelfree_result
+                .as_ref()
+                .is_some_and(|mf| mf.residues.iter().any(|r| r.seq_id == id))
+            {
+                purged_ids.insert(id);
+            }
+        }
+        for aux in &mut self.aux_field_rates {
+            let before = aux.len();
+            aux.retain(|r| !flagged.contains(&r.seq_id));
+            if aux.len() != before {
+                purged_ids.insert(-1);
+            }
+        }
+        if !purged_ids.is_empty() {
+            self.modelfree_result = None;
+            self.exported_tsv_preview.clear();
+            self.show_tsv_modal = false;
+            if self.detector_fits.is_empty() {
+                self.detector_design = None;
+            }
+            self.t1_slot.fitted_residues = self.r1_fits.len();
+            self.t2_slot.fitted_residues = self.r2_fits.len();
+            self.hetnoe_slot.fitted_residues = self.hetnoe_fits.len();
+            if self
+                .selected_seq_id
+                .is_some_and(|sid| flagged.contains(&sid))
+            {
+                self.selected_seq_id = self
+                    .r1_fits
+                    .keys()
+                    .chain(self.r2_fits.keys())
+                    .chain(self.hetnoe_fits.keys())
+                    .next()
+                    .copied();
+            }
+        }
+        purged_ids.remove(&-1);
+        purged_ids.len()
     }
 
     /// Parse an optional comma/whitespace/newline-separated `vdlist` or `vclist` delay override
@@ -491,42 +577,47 @@ impl RelaxPanelState {
         let mut warnings = raw.warnings.clone();
         let (planes, _recipe) = nmr_core::relax_io::process_pseudo3d_fids(&raw.planes, None)?;
 
-        let seeds: Vec<TargetPeakSeed> = if !self.synced_peak_seeds.is_empty() {
-            self.unassigned_pick_ids.clear();
-            self.synced_peak_seeds.clone()
-        } else {
-            let Some(ref_plane) = planes.first() else {
-                return Err("pseudo-3D folder yielded zero processed 2D planes".to_string());
-            };
-            let picked = nmr_core::picker::pick_hsqc_2d(
-                ref_plane,
-                &nmr_core::picker::PickerConfig::default(),
-            );
-            if picked.is_empty() {
-                return Err(
-                    "No HSQC peaks synced and auto-pick on plane 0 found 0 peaks. Sync HSQC peaks from Assign mode first."
-                        .to_string(),
+        let (seeds, newly_auto_picked, is_assigned_sync): (Vec<TargetPeakSeed>, bool, bool) =
+            if !self.synced_peak_seeds.is_empty() {
+                (self.synced_peak_seeds.clone(), false, true)
+            } else if !self.auto_picked_seeds.is_empty() {
+                warnings.push(format!(
+                    "No assigned HSQC peaks synced: reused {} unassigned plane-0 footprints from earlier slot (sync assigned HSQC peaks from Assign mode before Model-Free / 3D export).",
+                    self.auto_picked_seeds.len()
+                ));
+                (self.auto_picked_seeds.clone(), false, false)
+            } else {
+                let Some(ref_plane) = planes.first() else {
+                    return Err("pseudo-3D folder yielded zero processed 2D planes".to_string());
+                };
+                let picked = nmr_core::picker::pick_hsqc_2d(
+                    ref_plane,
+                    &nmr_core::picker::PickerConfig::default(),
                 );
-            }
-            warnings.push(format!(
-                "No assigned HSQC peaks synced: integrated {} unassigned plane-0 picks (blocked from 3D structure export until assigned).",
-                picked.len()
-            ));
-            let mut auto_seeds = Vec::with_capacity(picked.len());
-            for (idx, pk) in picked.iter().enumerate() {
-                let synthetic_id = (idx as i32) + 1;
-                self.unassigned_pick_ids.insert(synthetic_id);
-                auto_seeds.push(TargetPeakSeed {
-                    seq_id: synthetic_id,
-                    res_name: "PK".to_string(),
-                    atom_h: "H".to_string(),
-                    atom_x: "N".to_string(),
-                    delta_h_ppm: pk.h,
-                    delta_x_ppm: pk.n,
-                });
-            }
-            auto_seeds
-        };
+                if picked.is_empty() {
+                    return Err(
+                        "No HSQC peaks synced and auto-pick on plane 0 found 0 peaks. Sync HSQC peaks from Assign mode first."
+                            .to_string(),
+                    );
+                }
+                warnings.push(format!(
+                    "No assigned HSQC peaks synced: integrated {} unassigned plane-0 picks (blocked from residue-indexed Model-Free / Detectors / IMPACT and 3D structure export until assigned).",
+                    picked.len()
+                ));
+                let mut auto_seeds = Vec::with_capacity(picked.len());
+                for (idx, pk) in picked.iter().enumerate() {
+                    let synthetic_id = (idx as i32) + 1;
+                    auto_seeds.push(TargetPeakSeed {
+                        seq_id: synthetic_id,
+                        res_name: "PK".to_string(),
+                        atom_h: "H".to_string(),
+                        atom_x: "N".to_string(),
+                        delta_h_ppm: pk.h,
+                        delta_x_ppm: pk.n,
+                    });
+                }
+                (auto_seeds, true, false)
+            };
 
         let ds = nmr_core::relax_io::integrate_relax_planes(
             raw.name,
@@ -536,7 +627,17 @@ impl RelaxPanelState {
             &seeds,
             &nmr_core::relax_io::RelaxIntegrationConfig::default(),
         )?;
-        let msg = self.ingest_series_dataset(&ds)?;
+        if is_assigned_sync {
+            self.purge_unassigned_picks();
+        } else {
+            if newly_auto_picked {
+                self.auto_picked_seeds = seeds.clone();
+            }
+            for seed in &seeds {
+                self.unassigned_pick_ids.insert(seed.seq_id);
+            }
+        }
+        let msg = self.ingest_series_dataset_internal(&ds, !is_assigned_sync)?;
 
         let slot = match kind {
             RelaxExperimentKind::R1 => &mut self.t1_slot,
@@ -553,6 +654,9 @@ impl RelaxPanelState {
 
     /// Collect all multi-field `ResidueRelaxRates` entries for a given `seq_id` (primary + auxiliary fields).
     fn multifield_rates_for_seq_id(&self, seq_id: i32) -> Vec<ResidueRelaxRates> {
+        if self.unassigned_pick_ids.contains(&seq_id) {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         if let (Some(r1), Some(r2)) = (self.r1_fits.get(&seq_id), self.r2_fits.get(&seq_id)) {
             let (hetnoe, sigma_hetnoe) = match self.hetnoe_fits.get(&seq_id) {
@@ -584,6 +688,13 @@ impl RelaxPanelState {
     pub fn run_phase22_detectors(&mut self) -> Result<String, String> {
         let primary = self.primary_rate_table();
         if primary.is_empty() {
+            if !self.unassigned_pick_ids.is_empty() {
+                self.detector_design = None;
+                self.detector_fits.clear();
+                let msg = UNASSIGNED_DYNAMICS_BANNER.to_string();
+                self.status_banner.clone_from(&msg);
+                return Err(msg);
+            }
             return Err(
                 "Fit R1 and R2 rates before running Dynamics Detectors (T22.3)".to_string(),
             );
@@ -635,6 +746,12 @@ impl RelaxPanelState {
     pub fn run_phase22_impact(&mut self) -> Result<String, String> {
         let primary = self.primary_rate_table();
         if primary.is_empty() {
+            if !self.unassigned_pick_ids.is_empty() {
+                self.impact_fits.clear();
+                let msg = UNASSIGNED_DYNAMICS_BANNER.to_string();
+                self.status_banner.clone_from(&msg);
+                return Err(msg);
+            }
             return Err("Fit R1, R2, and hetNOE rates before running IMPACT (T22.4)".to_string());
         }
         let phys = RelaxPhysicsConfig::default();
@@ -961,6 +1078,15 @@ impl RelaxPanelState {
 
     /// Fit an integrated `RelaxSeriesDataset` (`R1`, `R2`/`R1rho`, or `hetNOE`) and store curves + MC uncertainties.
     pub fn ingest_series_dataset(&mut self, ds: &RelaxSeriesDataset) -> Result<String, String> {
+        self.purge_unassigned_picks();
+        self.ingest_series_dataset_internal(ds, false)
+    }
+
+    fn ingest_series_dataset_internal(
+        &mut self,
+        ds: &RelaxSeriesDataset,
+        is_unassigned_autopick: bool,
+    ) -> Result<String, String> {
         let fm = if ds.field_mhz.is_finite() && ds.field_mhz > 0.0 {
             ds.field_mhz
         } else {
@@ -994,6 +1120,12 @@ impl RelaxPanelState {
                     })
                     .collect();
                 let res = compute_hetnoe_batch(&inputs, self.mc_replicates, 2026_1302)?;
+                self.modelfree_result = None;
+                self.exported_tsv_preview.clear();
+                self.show_tsv_modal = false;
+                self.detector_design = None;
+                self.detector_fits.clear();
+                self.impact_fits.clear();
                 self.hetnoe_fits.clear();
                 for r in res {
                     if self.selected_seq_id.is_none() {
@@ -1001,8 +1133,13 @@ impl RelaxPanelState {
                     }
                     self.hetnoe_fits.insert(r.seq_id, r);
                 }
+                let kind_noun = if is_unassigned_autopick {
+                    "unassigned picks"
+                } else {
+                    "residues"
+                };
                 let msg = format!(
-                    "Computed steady-state hetNOE for {} residues ({fm:.1} MHz)",
+                    "Computed steady-state hetNOE for {} {kind_noun} ({fm:.1} MHz)",
                     self.hetnoe_fits.len()
                 );
                 self.status_banner.clone_from(&msg);
@@ -1017,6 +1154,12 @@ impl RelaxPanelState {
                     ..ExpFitConfig::default()
                 };
                 let fits = fit_decay_batch_cpu(&curves, &cfg)?;
+                self.modelfree_result = None;
+                self.exported_tsv_preview.clear();
+                self.show_tsv_modal = false;
+                self.detector_design = None;
+                self.detector_fits.clear();
+                self.impact_fits.clear();
                 let is_r1 = ds.experiment_kind == RelaxExperimentKind::R1;
                 if is_r1 {
                     self.r1_curves.clear();
@@ -1046,8 +1189,13 @@ impl RelaxPanelState {
                 } else {
                     self.r2_fits.len()
                 };
+                let kind_noun = if is_unassigned_autopick {
+                    "unassigned picks"
+                } else {
+                    "residues"
+                };
                 let msg = format!(
-                    "Fitted {} curves for {count} residues ({fm:.1} MHz, {} MC trials)",
+                    "Fitted {} curves for {count} {kind_noun} ({fm:.1} MHz, {} MC trials)",
                     ds.experiment_kind.as_str(),
                     self.mc_replicates
                 );
@@ -1093,6 +1241,9 @@ impl RelaxPanelState {
     pub fn primary_rate_table(&self) -> Vec<ResidueRelaxRates> {
         let mut out = Vec::new();
         for (&seq_id, r1_fit) in &self.r1_fits {
+            if self.unassigned_pick_ids.contains(&seq_id) {
+                continue;
+            }
             let Some(r2_fit) = self.r2_fits.get(&seq_id) else {
                 continue;
             };
@@ -1119,12 +1270,24 @@ impl RelaxPanelState {
     pub fn run_modelfree(&mut self, pdb_text: Option<&str>) -> Result<String, String> {
         let primary = self.primary_rate_table();
         if primary.is_empty() {
+            if !self.unassigned_pick_ids.is_empty() {
+                self.modelfree_result = None;
+                self.exported_tsv_preview.clear();
+                let msg = UNASSIGNED_DYNAMICS_BANNER.to_string();
+                self.status_banner.clone_from(&msg);
+                return Err(msg);
+            }
             return Err("Fit both R1 and R2 rates before running Model-Free M1-M5".to_string());
         }
         let mut tables = vec![primary];
         for aux in &self.aux_field_rates {
-            if !aux.is_empty() {
-                tables.push(aux.clone());
+            let filtered: Vec<ResidueRelaxRates> = aux
+                .iter()
+                .filter(|r| !self.unassigned_pick_ids.contains(&r.seq_id))
+                .cloned()
+                .collect();
+            if !filtered.is_empty() {
+                tables.push(filtered);
             }
         }
 
@@ -1378,10 +1541,11 @@ impl RelaxPanelState {
             traces: noe_traces,
         };
 
+        self.purge_unassigned_picks();
         self.selected_seq_id = None;
-        self.ingest_series_dataset(&ds_r1)?;
-        self.ingest_series_dataset(&ds_r2)?;
-        self.ingest_series_dataset(&ds_noe)?;
+        self.ingest_series_dataset_internal(&ds_r1, false)?;
+        self.ingest_series_dataset_internal(&ds_r2, false)?;
+        self.ingest_series_dataset_internal(&ds_noe, false)?;
         self.active_decay = ActiveDecayView::R1;
         self.aux_field_rates = vec![rates_800];
         self.run_modelfree(pdb_text)
@@ -1443,9 +1607,10 @@ impl RelaxPanelState {
 
         if let Some(idx) = selected_res_idx {
             if let Some(&sid) = seq_ids.get(idx) {
-                if self.r1_fits.contains_key(&sid)
-                    || self.r2_fits.contains_key(&sid)
-                    || self.hetnoe_fits.contains_key(&sid)
+                if !self.unassigned_pick_ids.contains(&sid)
+                    && (self.r1_fits.contains_key(&sid)
+                        || self.r2_fits.contains_key(&sid)
+                        || self.hetnoe_fits.contains_key(&sid))
                 {
                     self.selected_seq_id = Some(sid);
                 }
@@ -1488,7 +1653,14 @@ impl RelaxPanelState {
             {
                 match self.run_modelfree(pdb_text) {
                     Ok(msg) => actions.push(RelaxPanelAction::StatusMessage(msg)),
-                    Err(e) => self.status_banner = format!("Model-Free error: {e}"),
+                    Err(e) => {
+                        if e == UNASSIGNED_DYNAMICS_BANNER {
+                            self.status_banner.clone_from(&e);
+                            actions.push(RelaxPanelAction::StatusMessage(e));
+                        } else {
+                            self.status_banner = format!("Model-Free error: {e}");
+                        }
+                    }
                 }
             }
 
@@ -1806,6 +1978,15 @@ impl RelaxPanelState {
                                     ))
                                     .size(TYPE_BODY_PX),
                                 );
+                            } else if !self.auto_picked_seeds.is_empty() {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(248, 182, 74),
+                                    egui::RichText::new(format!(
+                                        "0 assigned ({} shared unassigned plane-0 footprints locked)",
+                                        self.auto_picked_seeds.len()
+                                    ))
+                                    .size(TYPE_CAPTION_PX),
+                                );
                             } else {
                                 ui.colored_label(
                                     egui::Color32::from_rgb(248, 182, 74),
@@ -1889,7 +2070,14 @@ impl RelaxPanelState {
                                         self.active_sub_tab = RelaxStudioSubTab::CurvesAndModelFree;
                                         actions.push(RelaxPanelAction::StatusMessage(msg));
                                     }
-                                    Err(e) => self.status_banner = format!("Model-Free error: {e}"),
+                                    Err(e) => {
+                                        if e == UNASSIGNED_DYNAMICS_BANNER {
+                                            self.status_banner.clone_from(&e);
+                                            actions.push(RelaxPanelAction::StatusMessage(e));
+                                        } else {
+                                            self.status_banner = format!("Model-Free error: {e}");
+                                        }
+                                    }
                                 }
                             }
                             if ui
@@ -1909,7 +2097,13 @@ impl RelaxPanelState {
                                         actions.push(RelaxPanelAction::StatusMessage(msg));
                                     }
                                     Err(e) => {
-                                        self.status_banner = format!("Phase 22 dynamics error: {e}")
+                                        if e == UNASSIGNED_DYNAMICS_BANNER {
+                                            self.status_banner.clone_from(&e);
+                                            actions.push(RelaxPanelAction::StatusMessage(e));
+                                        } else {
+                                            self.status_banner =
+                                                format!("Phase 22 dynamics error: {e}");
+                                        }
                                     }
                                 }
                             }
@@ -2154,7 +2348,14 @@ impl RelaxPanelState {
                     {
                         match self.run_phase22_suite() {
                             Ok(msg) => actions.push(RelaxPanelAction::StatusMessage(msg)),
-                            Err(e) => self.status_banner = format!("Phase 22 error: {e}"),
+                            Err(e) => {
+                                if e == UNASSIGNED_DYNAMICS_BANNER {
+                                    self.status_banner.clone_from(&e);
+                                    actions.push(RelaxPanelAction::StatusMessage(e));
+                                } else {
+                                    self.status_banner = format!("Phase 22 error: {e}");
+                                }
+                            }
                         }
                     }
                     if ui
@@ -2168,7 +2369,14 @@ impl RelaxPanelState {
                     {
                         match self.run_phase22_detectors() {
                             Ok(msg) => actions.push(RelaxPanelAction::StatusMessage(msg)),
-                            Err(e) => self.status_banner = format!("Detectors error: {e}"),
+                            Err(e) => {
+                                if e == UNASSIGNED_DYNAMICS_BANNER {
+                                    self.status_banner.clone_from(&e);
+                                    actions.push(RelaxPanelAction::StatusMessage(e));
+                                } else {
+                                    self.status_banner = format!("Detectors error: {e}");
+                                }
+                            }
                         }
                     }
                     if ui
@@ -2182,7 +2390,14 @@ impl RelaxPanelState {
                     {
                         match self.run_phase22_impact() {
                             Ok(msg) => actions.push(RelaxPanelAction::StatusMessage(msg)),
-                            Err(e) => self.status_banner = format!("IMPACT error: {e}"),
+                            Err(e) => {
+                                if e == UNASSIGNED_DYNAMICS_BANNER {
+                                    self.status_banner.clone_from(&e);
+                                    actions.push(RelaxPanelAction::StatusMessage(e));
+                                } else {
+                                    self.status_banner = format!("IMPACT error: {e}");
+                                }
+                            }
                         }
                     }
                 });
@@ -2220,8 +2435,16 @@ impl RelaxPanelState {
 
                             let active_sid = self
                                 .selected_seq_id
-                                .filter(|sid| self.detector_fits.contains_key(sid))
-                                .or_else(|| self.detector_fits.keys().next().copied());
+                                .filter(|sid| {
+                                    !self.unassigned_pick_ids.contains(sid)
+                                        && self.detector_fits.contains_key(sid)
+                                })
+                                .or_else(|| {
+                                    self.detector_fits
+                                        .keys()
+                                        .find(|sid| !self.unassigned_pick_ids.contains(sid))
+                                        .copied()
+                                });
                             if let Some(sid) = active_sid {
                                 if let Some(dfit) = self.detector_fits.get(&sid) {
                                     let rname = seq_ids
@@ -2310,8 +2533,16 @@ impl RelaxPanelState {
                         );
                         let active_sid = self
                             .selected_seq_id
-                            .filter(|sid| self.impact_fits.contains_key(sid))
-                            .or_else(|| self.impact_fits.keys().next().copied());
+                            .filter(|sid| {
+                                !self.unassigned_pick_ids.contains(sid)
+                                    && self.impact_fits.contains_key(sid)
+                            })
+                            .or_else(|| {
+                                self.impact_fits
+                                    .keys()
+                                    .find(|sid| !self.unassigned_pick_ids.contains(sid))
+                                    .copied()
+                            });
                         if let Some(sid) = active_sid {
                             if let Some(ifit) = self.impact_fits.get(&sid) {
                                 ui.label(
@@ -2544,49 +2775,61 @@ impl RelaxPanelState {
             if ui.button("<").clicked() && cur_pos > 0 {
                 let prev_sid = all_sids[cur_pos - 1];
                 self.selected_seq_id = Some(prev_sid);
-                if let Some(k) = seq_ids.iter().position(|&x| x == prev_sid) {
-                    actions.push(RelaxPanelAction::SelectResidueIndex(k));
+                if !self.unassigned_pick_ids.contains(&prev_sid) {
+                    if let Some(k) = seq_ids.iter().position(|&x| x == prev_sid) {
+                        actions.push(RelaxPanelAction::SelectResidueIndex(k));
+                    }
                 }
             }
             if ui.button(">").clicked() && cur_pos + 1 < all_sids.len() {
                 let next_sid = all_sids[cur_pos + 1];
                 self.selected_seq_id = Some(next_sid);
-                if let Some(k) = seq_ids.iter().position(|&x| x == next_sid) {
-                    actions.push(RelaxPanelAction::SelectResidueIndex(k));
+                if !self.unassigned_pick_ids.contains(&next_sid) {
+                    if let Some(k) = seq_ids.iter().position(|&x| x == next_sid) {
+                        actions.push(RelaxPanelAction::SelectResidueIndex(k));
+                    }
                 }
             }
 
-            let res_label = seq_ids
-                .iter()
-                .position(|&x| x == sid)
-                .and_then(|k| sequence.get(k))
-                .map(|s| s.as_str())
-                .unwrap_or(&fit.res_name);
+            let is_unassigned = self.unassigned_pick_ids.contains(&sid);
+            let res_prefix = if is_unassigned {
+                format!("Unassigned PK#{sid}")
+            } else {
+                let res_label = seq_ids
+                    .iter()
+                    .position(|&x| x == sid)
+                    .and_then(|k| sequence.get(k))
+                    .map(|s| s.as_str())
+                    .unwrap_or(&fit.res_name);
+                format!("{res_label}{sid}")
+            };
             ui.label(
                 egui::RichText::new(format!(
-                    "{res_label}{sid} -- {label} = {:.3} +- {:.3} s^-1 (I0 = {:.1}, chi^2/dof = {:.2}/{})",
+                    "{res_prefix} -- {label} = {:.3} +- {:.3} s^-1 (I0 = {:.1}, chi^2/dof = {:.2}/{})",
                     fit.rate, fit.sigma_rate_mc, fit.i0, fit.chi2, fit.dof
                 ))
                 .size(12.5)
                 .strong(),
             );
 
-            if let Some(mf) = self
-                .modelfree_result
-                .as_ref()
-                .and_then(|m| m.residues.iter().find(|r| r.seq_id == sid))
-            {
-                ui.colored_label(
-                    egui::Color32::from_rgb(130, 235, 165),
-                    egui::RichText::new(format!(
-                        "[{}] S^2 = {:.3} +- {:.3}  R_ex = {:.2} s^-1",
-                        mf.selected_model.as_str(),
-                        mf.params.s2,
-                        mf.sigma_s2,
-                        mf.params.rex_ref_s_inv
-                    ))
-                    .size(11.0),
-                );
+            if !is_unassigned {
+                if let Some(mf) = self
+                    .modelfree_result
+                    .as_ref()
+                    .and_then(|m| m.residues.iter().find(|r| r.seq_id == sid))
+                {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(130, 235, 165),
+                        egui::RichText::new(format!(
+                            "[{}] S^2 = {:.3} +- {:.3}  R_ex = {:.2} s^-1",
+                            mf.selected_model.as_str(),
+                            mf.params.s2,
+                            mf.sigma_s2,
+                            mf.params.rex_ref_s_inv
+                        ))
+                        .size(11.0),
+                    );
+                }
             }
         });
 
@@ -2752,7 +2995,28 @@ impl RelaxPanelState {
         track_h: f32,
         actions: &mut Vec<RelaxPanelAction>,
     ) {
-        // Collect ordered sequence positions
+        let has_assigned_fits = self
+            .r1_fits
+            .keys()
+            .chain(self.r2_fits.keys())
+            .chain(self.hetnoe_fits.keys())
+            .any(|sid| !self.unassigned_pick_ids.contains(sid));
+        if !has_assigned_fits {
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_rgb(20, 25, 36))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(92, 74, 42)))
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(248, 186, 82),
+                        egui::RichText::new(UNASSIGNED_DYNAMICS_BANNER).size(TYPE_BODY_PX),
+                    );
+                });
+            return;
+        }
+
+        // Collect ordered sequence positions (strictly excluding unassigned synthetic pick IDs)
         let ordered_ids: Vec<(usize, i32, String)> =
             if !seq_ids.is_empty() && seq_ids.len() == sequence.len() {
                 seq_ids
@@ -2767,6 +3031,7 @@ impl RelaxPanelState {
                     .chain(self.r2_fits.keys())
                     .chain(self.hetnoe_fits.keys())
                     .copied()
+                    .filter(|sid| !self.unassigned_pick_ids.contains(sid))
                     .collect();
                 sids.sort_unstable();
                 sids.dedup();
@@ -2782,19 +3047,27 @@ impl RelaxPanelState {
         let mf_by_sid: BTreeMap<i32, _> = self
             .modelfree_result
             .as_ref()
-            .map(|m| m.residues.iter().map(|r| (r.seq_id, r)).collect())
+            .map(|m| {
+                m.residues
+                    .iter()
+                    .filter(|r| !self.unassigned_pick_ids.contains(&r.seq_id))
+                    .map(|r| (r.seq_id, r))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let max_r1 = self
             .r1_fits
-            .values()
-            .map(|f| f.rate + f.sigma_rate_mc)
+            .iter()
+            .filter(|(sid, _)| !self.unassigned_pick_ids.contains(sid))
+            .map(|(_, f)| f.rate + f.sigma_rate_mc)
             .fold(2.5_f64, f64::max)
             * 1.08;
         let max_r2 = self
             .r2_fits
-            .values()
-            .map(|f| f.rate + f.sigma_rate_mc)
+            .iter()
+            .filter(|(sid, _)| !self.unassigned_pick_ids.contains(sid))
+            .map(|(_, f)| f.rate + f.sigma_rate_mc)
             .fold(12.0_f64, f64::max)
             * 1.08;
         let max_rex = mf_by_sid
@@ -2897,7 +3170,8 @@ impl RelaxPanelState {
                 let x1 = x0 + (col_w - 1.0).max(1.2);
                 let xc = 0.5 * (x0 + x1);
 
-                if self.selected_seq_id == Some(sid) {
+                let sid_is_assigned = !self.unassigned_pick_ids.contains(&sid);
+                if sid_is_assigned && self.selected_seq_id == Some(sid) {
                     painter.rect_filled(
                         egui::Rect::from_min_max(
                             egui::pos2(x0, bar_area.top()),
@@ -2908,32 +3182,36 @@ impl RelaxPanelState {
                     );
                 }
 
-                let val_sig_col: Option<(f64, f64, egui::Color32)> = match t_idx {
-                    0 => self
-                        .r1_fits
-                        .get(&sid)
-                        .map(|f| (f.rate, f.sigma_rate_mc, spec.base_color)),
-                    1 => self
-                        .r2_fits
-                        .get(&sid)
-                        .map(|f| (f.rate, f.sigma_rate_mc, spec.base_color)),
-                    2 => self
-                        .hetnoe_fits
-                        .get(&sid)
-                        .map(|n| (n.noe, n.sigma_noe, spec.base_color)),
-                    3 => mf_by_sid.get(&sid).map(|r| {
-                        let col = match r.selected_model {
-                            ModelFreeId::M1 => egui::Color32::from_rgb(76, 206, 146),
-                            ModelFreeId::M2 => egui::Color32::from_rgb(82, 182, 248),
-                            ModelFreeId::M3 => egui::Color32::from_rgb(248, 168, 68),
-                            ModelFreeId::M4 => egui::Color32::from_rgb(244, 102, 114),
-                            ModelFreeId::M5 => egui::Color32::from_rgb(196, 122, 250),
-                        };
-                        (r.params.s2, r.sigma_s2, col)
-                    }),
-                    _ => mf_by_sid
-                        .get(&sid)
-                        .map(|r| (r.params.rex_ref_s_inv, r.sigma_rex_ref, spec.base_color)),
+                let val_sig_col: Option<(f64, f64, egui::Color32)> = if !sid_is_assigned {
+                    None
+                } else {
+                    match t_idx {
+                        0 => self
+                            .r1_fits
+                            .get(&sid)
+                            .map(|f| (f.rate, f.sigma_rate_mc, spec.base_color)),
+                        1 => self
+                            .r2_fits
+                            .get(&sid)
+                            .map(|f| (f.rate, f.sigma_rate_mc, spec.base_color)),
+                        2 => self
+                            .hetnoe_fits
+                            .get(&sid)
+                            .map(|n| (n.noe, n.sigma_noe, spec.base_color)),
+                        3 => mf_by_sid.get(&sid).map(|r| {
+                            let col = match r.selected_model {
+                                ModelFreeId::M1 => egui::Color32::from_rgb(76, 206, 146),
+                                ModelFreeId::M2 => egui::Color32::from_rgb(82, 182, 248),
+                                ModelFreeId::M3 => egui::Color32::from_rgb(248, 168, 68),
+                                ModelFreeId::M4 => egui::Color32::from_rgb(244, 102, 114),
+                                ModelFreeId::M5 => egui::Color32::from_rgb(196, 122, 250),
+                            };
+                            (r.params.s2, r.sigma_s2, col)
+                        }),
+                        _ => mf_by_sid
+                            .get(&sid)
+                            .map(|r| (r.params.rex_ref_s_inv, r.sigma_rex_ref, spec.base_color)),
+                    }
                 };
 
                 if let Some((val, sig, col)) = val_sig_col {
@@ -2980,29 +3258,34 @@ impl RelaxPanelState {
                         .min(n_cols.saturating_sub(1));
                     let (_seq_idx, sid, ref rname) = ordered_ids[c_idx];
                     let mut tip = format!("{rname}{sid}");
-                    if let Some(f1) = self.r1_fits.get(&sid) {
-                        tip.push_str(&format!(
-                            "\nR₁ = {:.3} ± {:.3} s⁻¹",
-                            f1.rate, f1.sigma_rate_mc
-                        ));
-                    }
-                    if let Some(f2) = self.r2_fits.get(&sid) {
-                        tip.push_str(&format!(
-                            "\nR₂ = {:.3} ± {:.3} s⁻¹",
-                            f2.rate, f2.sigma_rate_mc
-                        ));
-                    }
-                    if let Some(hn) = self.hetnoe_fits.get(&sid) {
-                        tip.push_str(&format!("\nhetNOE = {:.3} ± {:.3}", hn.noe, hn.sigma_noe));
-                    }
-                    if let Some(mf) = mf_by_sid.get(&sid) {
-                        tip.push_str(&format!(
-                            "\n{} S² = {:.3} ± {:.3}, R_ex = {:.2} s⁻¹",
-                            mf.selected_model.as_str(),
-                            mf.params.s2,
-                            mf.sigma_s2,
-                            mf.params.rex_ref_s_inv
-                        ));
+                    if !self.unassigned_pick_ids.contains(&sid) {
+                        if let Some(f1) = self.r1_fits.get(&sid) {
+                            tip.push_str(&format!(
+                                "\nR₁ = {:.3} ± {:.3} s⁻¹",
+                                f1.rate, f1.sigma_rate_mc
+                            ));
+                        }
+                        if let Some(f2) = self.r2_fits.get(&sid) {
+                            tip.push_str(&format!(
+                                "\nR₂ = {:.3} ± {:.3} s⁻¹",
+                                f2.rate, f2.sigma_rate_mc
+                            ));
+                        }
+                        if let Some(hn) = self.hetnoe_fits.get(&sid) {
+                            tip.push_str(&format!(
+                                "\nhetNOE = {:.3} ± {:.3}",
+                                hn.noe, hn.sigma_noe
+                            ));
+                        }
+                        if let Some(mf) = mf_by_sid.get(&sid) {
+                            tip.push_str(&format!(
+                                "\n{} S² = {:.3} ± {:.3}, R_ex = {:.2} s⁻¹",
+                                mf.selected_model.as_str(),
+                                mf.params.s2,
+                                mf.sigma_s2,
+                                mf.params.rex_ref_s_inv
+                            ));
+                        }
                     }
                     resp.on_hover_text(tip);
                 }
@@ -3278,5 +3561,82 @@ mod tests {
         });
         out2.textures_delta.clear();
         assert_eq!(panel.selected_seq_id, Some(3));
+    }
+
+    #[test]
+    fn unassigned_autopick_state_refuses_residue_combination_and_purges_on_sync() {
+        let mut panel = RelaxPanelState::new();
+        panel.mc_replicates = 40;
+        let seq: Vec<String> = ["MET", "GLN", "ILE", "PHE", "VAL"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let seq_ids: Vec<i32> = (1..=5).collect();
+
+        // Seed full demo state first so r1/r2/hetnoe/detectors/impact/modelfree are all populated
+        panel.load_demo_dynamics(&seq, &seq_ids, None).unwrap();
+        panel.run_phase22_suite().unwrap();
+        assert!(panel.modelfree_result.is_some());
+        assert_eq!(panel.detector_fits.len(), 5);
+        assert_eq!(panel.impact_fits.len(), 5);
+
+        // Mark IDs 1..=5 as unassigned auto-picks + auto_picked_seeds (simulating unassigned slot load)
+        panel.unassigned_pick_ids = (1..=5).collect();
+        panel.auto_picked_seeds = (1..=5)
+            .map(|k| TargetPeakSeed {
+                seq_id: k,
+                res_name: "PK".to_string(),
+                atom_h: "H".to_string(),
+                atom_x: "N".to_string(),
+                delta_h_ppm: 8.0 + 0.1 * (k as f64),
+                delta_x_ppm: 118.0 + (k as f64),
+            })
+            .collect();
+
+        // 171.assign:P1-10: Model-Free, Detectors, IMPACT, and 3D export must refuse unassigned picks
+        assert!(panel.primary_rate_table().is_empty());
+        let mf_err = panel.run_modelfree(None).unwrap_err();
+        assert_eq!(mf_err, UNASSIGNED_DYNAMICS_BANNER);
+        assert_eq!(panel.status_banner, UNASSIGNED_DYNAMICS_BANNER);
+        assert!(panel.modelfree_result.is_none());
+
+        let det_err = panel.run_phase22_detectors().unwrap_err();
+        assert_eq!(det_err, UNASSIGNED_DYNAMICS_BANNER);
+        assert!(panel.detector_fits.is_empty());
+
+        let imp_err = panel.run_phase22_impact().unwrap_err();
+        assert_eq!(imp_err, UNASSIGNED_DYNAMICS_BANNER);
+        assert!(panel.impact_fits.is_empty());
+
+        assert!(panel
+            .build_3d_track_export(&seq_ids, QuantitativeTrack::LipariSzaboS2)
+            .is_none());
+
+        // Re-seed a stale modelfree_result before syncing 1 assigned peak to prove P1-9 purges everything
+        let mut tmp = RelaxPanelState::new();
+        tmp.mc_replicates = 20;
+        tmp.load_demo_dynamics(&seq, &seq_ids, None).unwrap();
+        tmp.run_phase22_suite().unwrap();
+        panel.modelfree_result = tmp.modelfree_result;
+        panel.detector_fits = tmp.detector_fits;
+        panel.impact_fits = tmp.impact_fits;
+
+        // 171.assign:P1-9: Syncing 1 assigned peak MUST purge all stale 1..=5 entries and clear modelfree_result
+        let n_synced =
+            panel.sync_assigned_hsqc_peaks(&[Peak2D::assigned(2, "GLN", 8.42, 121.3)], "MQIFV");
+        assert_eq!(n_synced, 1);
+        assert!(panel.unassigned_pick_ids.is_empty());
+        assert!(panel.auto_picked_seeds.is_empty());
+        assert!(panel.r1_curves.is_empty());
+        assert!(panel.r1_fits.is_empty());
+        assert!(panel.r2_curves.is_empty());
+        assert!(panel.r2_fits.is_empty());
+        assert!(panel.hetnoe_fits.is_empty());
+        assert!(panel.detector_fits.is_empty());
+        assert!(panel.impact_fits.is_empty());
+        assert!(panel.modelfree_result.is_none());
+        assert!(panel
+            .build_3d_track_export(&seq_ids, QuantitativeTrack::LipariSzaboS2)
+            .is_none());
     }
 }

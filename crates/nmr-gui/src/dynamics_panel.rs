@@ -14,9 +14,9 @@
 //! - McConnell, H. M. (*J. Chem. Phys.* 1958, 28, 430–431), Vallurupalli, P., Bouvignies, G. &
 //!   Kay, L. E. (*J. Am. Chem. Soc.* 2012, 134, 8148–8161), Fawzi, N. L. et al. (*Nature* 2011,
 //!   480, 268–272), and Higham, N. J. (*SIAM J. Matrix Anal. Appl.* 2005, 26, 1179–1193) — `CEST`/`DEST`.
-//! - Yuwen, T., Bouvignies, G. & Kay, L. E. (*ChemPhysChem* 2018, 19, 1707–1710,
+//! - Yuwen, T., Kay, L. E. & Bouvignies, G. (*ChemPhysChem* 2018, 19, 1707–1710,
 //!   DOI: 10.1002/cphc.201800249 — `DANTE-CEST` pulse-train Bloch–McConnell propagator).
-//! - Yuwen, T., Kay, L. E. & Bouvignies, G. (*J. Magn. Reson.* 2018, 292, 1–7,
+//! - Yuwen, T., Bouvignies, G. & Kay, L. E. (*J. Magn. Reson.* 2018, 292, 1–7,
 //!   DOI: 10.1016/j.jmr.2018.04.013 — cosine-modulated `cos-CEST` dual-sideband saturation propagator).
 //! - Luz, Z. & Meiboom, S. (*J. Chem. Phys.* 1963, 39, 366–370), Carver, J. P. & Richards, R. E.
 //!   (*J. Magn. Reson.* 1972, 6, 89–105), Baldwin, A. J. (*J. Magn. Reson.* 2014, 244, 114–124),
