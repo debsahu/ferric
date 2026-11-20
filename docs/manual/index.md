@@ -89,10 +89,14 @@ FERRIC's `linux-x86_64` release binaries are compiled inside AlmaLinux 9 (`glibc
 ```bash
 # System-wide RPM install (requires sudo)
 VER=0.17.1
-curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.rpm"
-curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/SHA256SUMS.txt"
-grep "ferric-v${VER}-linux-x86_64.rpm" SHA256SUMS.txt | sha256sum -c -
-sudo dnf install -y "./ferric-v${VER}-linux-x86_64.rpm"
+TMP="$(mktemp -d)" && (
+  cd "$TMP"
+  curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.rpm"
+  curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/SHA256SUMS.txt"
+  grep "ferric-v${VER}-linux-x86_64.rpm" SHA256SUMS.txt | sha256sum -c -
+  sudo dnf install -y "./ferric-v${VER}-linux-x86_64.rpm"
+)
+rm -rf "$TMP"
 
 # Verify CLI and hardware Vulkan GPU compute
 ferric --version
@@ -107,16 +111,18 @@ ferric-gui
   ```bash
   sudo dnf install -y libxkbcommon libX11 vulkan-loader mesa-vulkan-drivers
   ```
-- **No-`sudo` user-local install into `~/.local/bin`**:
+- **No-`sudo` user-local install into `~/.local/bin` (with desktop launcher & icons)**:
   ```bash
   VER=0.17.1
-  mkdir -p ~/.local/bin
-  curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.tar.gz"
-  curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/SHA256SUMS.txt"
-  grep "ferric-v${VER}-linux-x86_64.tar.gz" SHA256SUMS.txt | sha256sum -c -
-  tar -xzf "ferric-v${VER}-linux-x86_64.tar.gz"
-  cd "ferric-v${VER}-linux-x86_64"
-  if [ -x ./install.sh ]; then ./install.sh --prefix "$HOME/.local"; else install -m 0755 bin/ferric bin/ferric-gui "$HOME/.local/bin/"; fi
+  TMP="$(mktemp -d)" && (
+    cd "$TMP"
+    curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.tar.gz"
+    curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/SHA256SUMS.txt"
+    grep "ferric-v${VER}-linux-x86_64.tar.gz" SHA256SUMS.txt | sha256sum -c -
+    tar -xzf "ferric-v${VER}-linux-x86_64.tar.gz"
+    "./ferric-v${VER}-linux-x86_64/install-desktop.sh" --prefix "$HOME/.local"
+  )
+  rm -rf "$TMP"
   "$HOME/.local/bin/ferric" --version
   ```
 
