@@ -700,3 +700,168 @@ fn test_online_query_mock_transport_bmrb_v2_enrichment_and_fail_closed_offline()
     .expect_err("offline query must fail closed with Err");
     assert!(err.contains("offline") || err.contains("failed"));
 }
+
+#[test]
+fn test_citrate_ab_quartet_peaks_match_live_bmrb_peak_char() {
+    // Regression test for 171.metab:P1-B:
+    // Live https://api.bmrb.io/v2/entry/bmse000076 saveframe `spectral_peak_HSQC` loop
+    // `_Peak_char` (`Spectral_dim_ID = 1`) reports Citrate's two observed 1H AB doublets at
+    // 2.531 and 2.661 ppm (|2J_AB| = 15.2 Hz from `spectral_peak_1Hp5` / `spectral_peak_1H_2`),
+    // rather than the empty spin-system midpoint valley at 2.579 ppm.
+    let cit = lookup_offline_metabolite("Citrate").expect("Citrate (bmse000076) in offline DB");
+    assert_eq!(cit.bmse_id, "bmse000076");
+    assert_eq!(cit.peaks_1h.len(), 2);
+    assert!((cit.peaks_1h[0].ppm - 2.531).abs() < 1e-6);
+    assert!((cit.peaks_1h[1].ppm - 2.661).abs() < 1e-6);
+    assert_eq!(cit.peaks_1h[0].multiplicity, PeakMultiplicity::Doublet);
+    assert_eq!(cit.peaks_1h[1].multiplicity, PeakMultiplicity::Doublet);
+
+    // Querying observed biofluid AB doublet centres (~2.53 / 2.66 ppm) matches Citrate #1 (2/2)
+    // both with and without explicit multiplicity/J annotations.
+    let q_ppm = vec![QueryPeak::from_ppm(2.530), QueryPeak::from_ppm(2.660)];
+    let hits_ppm = query_offline_metabolites(&q_ppm, MetaboliteNucleus::H1, 0.03, 5);
+    assert_eq!(hits_ppm[0].entry.bmse_id, "bmse000076");
+    assert_eq!(hits_ppm[0].matched_ref_peaks, 2);
+    assert_eq!(hits_ppm[0].total_ref_peaks, 2);
+    assert!(hits_ppm[0].score > 0.98, "score={}", hits_ppm[0].score);
+
+    let q_ab = vec![
+        QueryPeak::with_multiplet(2.535, PeakMultiplicity::Doublet, vec![15.3]),
+        QueryPeak::with_multiplet(2.675, PeakMultiplicity::Doublet, vec![15.3]),
+    ];
+    let hits_ab = query_offline_metabolites(&q_ab, MetaboliteNucleus::H1, 0.03, 5);
+    assert_eq!(hits_ab[0].entry.bmse_id, "bmse000076");
+    assert_eq!(hits_ab[0].matched_ref_peaks, 2);
+    assert!(hits_ab[0].score > 0.95, "score={}", hits_ab[0].score);
+
+    // Synthesized 1D reference spectrum produces 4 AB quartet sticks with a valley at 2.579 ppm.
+    let spec = synthesize_reference_spectrum_1d(&cit, MetaboliteNucleus::H1, 600.0, 4096);
+    assert_eq!(spec.sticks.len(), 4);
+    let max_near = |target: f64| -> f64 {
+        spec.ppm_grid
+            .iter()
+            .enumerate()
+            .filter(|(_, &p)| (p - target).abs() < 0.02)
+            .map(|(i, _)| spec.intensities[i])
+            .fold(0.0_f64, f64::max)
+    };
+    assert!(max_near(2.531) > 0.70);
+    assert!(max_near(2.661) > 0.70);
+    assert!(
+        max_near(2.579) < 0.15,
+        "2.579 ppm midpoint between Citrate AB doublets should be a valley"
+    );
+}
+
+#[test]
+fn test_demo_mixture_14_metabolites_singlets_outrank_partial_false_positives() {
+    // Regression test for 171.metab:P1-A:
+    // 1. In the 14-metabolite biofluid demo mixture (13 distinct BMRB-BMSE entries:
+    //    D-(+)-Glucose [alpha + beta], L-Valine, Hippurate, Citrate, L-Lactate, L-Alanine,
+    //    Creatine, Creatinine, plus the 5 true singlets Formate, Glycine, Acetate, Succinate,
+    //    TMAO), local chance-match scoring places ALL 13 true metabolites in the top 13
+    //    (including all 5 true singlets inside top-14 and strictly above every partial-match
+    //    false positive).
+    let demo_multiplet_q = vec![
+        QueryPeak::with_multiplet(8.448, PeakMultiplicity::Singlet, vec![]), // Formate
+        QueryPeak::with_multiplet(7.832, PeakMultiplicity::Doublet, vec![7.6]), // Hippurate
+        QueryPeak::with_multiplet(7.635, PeakMultiplicity::Triplet, vec![7.4]),
+        QueryPeak::with_multiplet(7.548, PeakMultiplicity::Triplet, vec![7.6]),
+        QueryPeak::with_multiplet(5.233, PeakMultiplicity::Doublet, vec![3.7]), // alpha/beta-Glucose
+        QueryPeak::with_multiplet(4.642, PeakMultiplicity::Doublet, vec![7.9]),
+        QueryPeak::with_multiplet(4.110, PeakMultiplicity::Quartet, vec![6.9]), // L-Lactate
+        QueryPeak::with_multiplet(4.052, PeakMultiplicity::Singlet, vec![]),    // Creatinine
+        QueryPeak::with_multiplet(3.968, PeakMultiplicity::Singlet, vec![]),    // Hippurate CH2
+        QueryPeak::with_multiplet(3.928, PeakMultiplicity::Singlet, vec![]),    // Creatine CH2
+        QueryPeak::with_multiplet(3.895, PeakMultiplicity::DoubletOfDoublets, vec![12.2, 2.1]),
+        QueryPeak::with_multiplet(3.833, PeakMultiplicity::Multiplet, vec![]),
+        QueryPeak::with_multiplet(3.778, PeakMultiplicity::Quartet, vec![7.2]), // L-Alanine
+        QueryPeak::with_multiplet(3.718, PeakMultiplicity::Multiplet, vec![]),
+        QueryPeak::with_multiplet(3.605, PeakMultiplicity::Doublet, vec![4.4]), // L-Valine
+        QueryPeak::with_multiplet(3.555, PeakMultiplicity::Singlet, vec![]),    // Glycine
+        QueryPeak::with_multiplet(3.533, PeakMultiplicity::DoubletOfDoublets, vec![9.8, 3.7]),
+        QueryPeak::with_multiplet(3.475, PeakMultiplicity::Triplet, vec![9.2]),
+        QueryPeak::with_multiplet(3.401, PeakMultiplicity::Multiplet, vec![]),
+        QueryPeak::with_multiplet(3.266, PeakMultiplicity::Singlet, vec![]), // TMAO
+        QueryPeak::with_multiplet(3.242, PeakMultiplicity::DoubletOfDoublets, vec![9.2, 7.9]),
+        QueryPeak::with_multiplet(3.043, PeakMultiplicity::Singlet, vec![]), // Creatinine CH3
+        QueryPeak::with_multiplet(3.032, PeakMultiplicity::Singlet, vec![]), // Creatine CH3
+        QueryPeak::with_multiplet(2.675, PeakMultiplicity::Doublet, vec![15.3]), // Citrate AB
+        QueryPeak::with_multiplet(2.535, PeakMultiplicity::Doublet, vec![15.3]),
+        QueryPeak::with_multiplet(2.405, PeakMultiplicity::Singlet, vec![]), // Succinate
+        QueryPeak::with_multiplet(2.268, PeakMultiplicity::Multiplet, vec![]), // L-Valine
+        QueryPeak::with_multiplet(1.918, PeakMultiplicity::Singlet, vec![]), // Acetate
+        QueryPeak::with_multiplet(1.478, PeakMultiplicity::Doublet, vec![7.2]), // L-Alanine
+        QueryPeak::with_multiplet(1.330, PeakMultiplicity::Doublet, vec![6.9]), // L-Lactate
+        QueryPeak::with_multiplet(1.037, PeakMultiplicity::Doublet, vec![7.0]), // L-Valine
+        QueryPeak::with_multiplet(0.985, PeakMultiplicity::Doublet, vec![7.0]),
+    ];
+
+    let hits = query_offline_metabolites(&demo_multiplet_q, MetaboliteNucleus::H1, 0.03, 30);
+    let true_singlets = [
+        ("bmse000203", "Formate"),
+        ("bmse000191", "Acetic acid"),
+        ("bmse000183", "Succinic acid"),
+        ("bmse000089", "Glycine"),
+        ("bmse000426", "Trimethylamine N-oxide"),
+    ];
+    let best_partial_fp_score = hits
+        .iter()
+        .filter(|h| h.matched_ref_peaks < h.total_ref_peaks)
+        .map(|h| h.score)
+        .fold(0.0_f64, f64::max);
+
+    for (bmse_id, label) in true_singlets {
+        let pos = hits
+            .iter()
+            .position(|h| h.entry.bmse_id == bmse_id)
+            .unwrap_or_else(|| panic!("true singlet {label} ({bmse_id}) missing from hits"));
+        assert!(
+            pos < 14,
+            "true singlet {label} ({bmse_id}) must rank inside top-14 on 14-metabolite demo mixture (got rank #{}, score={:.4})",
+            pos + 1,
+            hits[pos].score
+        );
+        assert!(
+            hits[pos].score > best_partial_fp_score,
+            "true singlet {label} ({bmse_id}, score={:.4}) must outrank every partial-match false positive (best partial FP score={best_partial_fp_score:.4})",
+            hits[pos].score
+        );
+    }
+
+    // Citrate must also be matched 2/2 inside top-10 on the demo mixture.
+    let cit_pos = hits
+        .iter()
+        .position(|h| h.entry.bmse_id == "bmse000076")
+        .expect("Citrate must match in demo mixture");
+    assert!(cit_pos < 10 && hits[cit_pos].matched_ref_peaks == 2);
+
+    // 2. Even on a blind PPM-only query (zero multiplicity annotations, +-0.002 ppm jitter),
+    //    a 1/1 singlet with delta = 0.002 ppm must strictly outrank 2/9, 2/6, 3/5, and 3/4
+    //    partial-match false positives.
+    let ppm_only_q: Vec<QueryPeak> = [
+        1.320, 4.099, 1.473, 3.769, 0.983, 1.032, 2.268, 3.597, 3.234, 3.399, 3.461, 3.515, 3.728,
+        3.826, 3.889, 4.634, 5.224, 2.533, 2.659, 2.393, 1.907, 3.026, 3.918, 3.036, 4.040, 3.251,
+        3.547, 8.449, 3.946, 7.528, 7.620, 7.806,
+    ]
+    .into_iter()
+    .map(QueryPeak::from_ppm)
+    .collect();
+    let ppm_hits = query_offline_metabolites(&ppm_only_q, MetaboliteNucleus::H1, 0.03, 40);
+    let best_ppm_partial_fp = ppm_hits
+        .iter()
+        .filter(|h| h.matched_ref_peaks < h.total_ref_peaks)
+        .map(|h| h.score)
+        .fold(0.0_f64, f64::max);
+    for (bmse_id, label) in true_singlets {
+        let hit = ppm_hits
+            .iter()
+            .find(|h| h.entry.bmse_id == bmse_id)
+            .unwrap_or_else(|| panic!("{label} missing from PPM-only hits"));
+        assert!(
+            hit.score > best_ppm_partial_fp,
+            "PPM-only 1/1 singlet {label} (score={:.4}) must outrank partial-match FPs (best={best_ppm_partial_fp:.4})",
+            hit.score
+        );
+    }
+}
