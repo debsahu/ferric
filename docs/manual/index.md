@@ -80,7 +80,65 @@ Launch the **[Interactive Showcase Cinema Gallery](tours/index.html)** (`60 fps`
 
 ## Installation & Building from Source
 
-### Prerequisites
+### Prebuilt Packages (NMR Workstations, macOS & Windows)
+
+#### RHEL 9 / AlmaLinux 9 / Rocky 9 (Bruker & Varian Workstations with NVIDIA GPU)
+
+FERRIC's `linux-x86_64` release binaries are compiled inside AlmaLinux 9 (`glibc <= 2.34`) specifically for spectrometer acquisition and processing workstations:
+
+```bash
+# System-wide RPM install (requires sudo)
+VER=0.17.1
+curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.rpm"
+curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/SHA256SUMS.txt"
+grep "ferric-v${VER}-linux-x86_64.rpm" SHA256SUMS.txt | sha256sum -c -
+sudo dnf install -y "./ferric-v${VER}-linux-x86_64.rpm"
+
+# Verify CLI and hardware Vulkan GPU compute
+ferric --version
+ferric-gui
+```
+
+- **NVIDIA Vulkan GPU**: Proprietary NVIDIA Vulkan drivers are selected automatically by `wgpu` for both `ferric-gui` and `ferric ... --engine gpu` (verified on RHEL 9.8 + NVIDIA Quadro P400). You can confirm hardware GPU execution from a source checkout or with any `.str` file via:
+  ```bash
+  ferric benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 1 --engine gpu
+  ```
+- **Minimal RHEL 9 installs**: If a minimal or server install is missing X11/Wayland/Vulkan desktop runtime libraries for `ferric-gui`, install them with:
+  ```bash
+  sudo dnf install -y libxkbcommon libX11 vulkan-loader mesa-vulkan-drivers
+  ```
+- **No-`sudo` user-local install into `~/.local/bin`**:
+  ```bash
+  VER=0.17.1
+  mkdir -p ~/.local/bin
+  curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.tar.gz"
+  curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/SHA256SUMS.txt"
+  grep "ferric-v${VER}-linux-x86_64.tar.gz" SHA256SUMS.txt | sha256sum -c -
+  tar -xzf "ferric-v${VER}-linux-x86_64.tar.gz"
+  cd "ferric-v${VER}-linux-x86_64"
+  if [ -x ./install.sh ]; then ./install.sh --prefix "$HOME/.local"; else install -m 0755 bin/ferric bin/ferric-gui "$HOME/.local/bin/"; fi
+  "$HOME/.local/bin/ferric" --version
+  ```
+
+#### Other Prebuilt Platforms & Direct Cargo Install
+
+- **Debian / Ubuntu (`x86_64`)**: Download `ferric-v0.17.1-linux-x86_64.deb` from GitHub Releases and run `sudo apt install ./ferric-v0.17.1-linux-x86_64.deb`.
+- **Legacy 32-bit Linux (`i686` CLI-only)**: Static musl `ferric` CLI packages (`ferric-v0.17.1-linux-i686-cli.rpm`, `.deb`, and `.tar.gz`).
+- **macOS (Apple Silicon & Intel)**:
+  ```bash
+  brew tap debsahu/tap
+  brew install ferric                        # CLI (macOS arm64/x86_64 + Linux x86_64)
+  brew install --cask --no-quarantine ferric # FERRIC.app GUI + CLI (macOS arm64/x86_64)
+  ```
+  Or download the `.dmg` / `.tar.gz` archives directly from [**GitHub Releases**](https://github.com/debsahu/ferric/releases).
+- **Windows (`x86_64`)**: Download `ferric-v0.17.1-windows-x86_64.zip` (`ferric-gui.exe` + `ferric.exe`).
+- **Direct Cargo Install (any platform with Rust)**:
+  ```bash
+  cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.1 nmr-cli
+  cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.1 nmr-gui
+  ```
+
+### Building from Source — Prerequisites
 
 - **Rust stable toolchain** (`1.81+`, via `rustup`) with `cargo`.
 - **GPU backend (automatic)**: Metal on macOS, Vulkan on Linux/Windows, or DirectX 12 on Windows. When no hardware GPU adapter is present, all commands transparently support `--engine cpu` (`f64` multi-threaded CPU execution).

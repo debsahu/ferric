@@ -49,4 +49,7 @@ The maintainer (an NMR scientist) owns `docs/specs/03-assignment.md` sections 3 
 ## Versioning & Releases
 - Single source of truth: `[workspace.package] version` in `Cargo.toml` (exposed as `nmr_core::VERSION`, `ferric --version` / `-V` with short git SHA via `crates/nmr-cli/build.rs`, NEF metadata, HTML reports, and `/api/v1/health`).
 - Pre-1.0 Semantic Versioning (`0.MINOR.PATCH`): bump `MINOR` for new capabilities, CLI/interchange changes, or benchmark-gate upgrades; bump `PATCH` for bug fixes, calibration, and documentation fixes.
-- Every release bumps `[workspace.package] version`, adds a `## [X.Y.Z] — YYYY-MM-DD` section to `CHANGELOG.md`, and creates an annotated git tag `vX.Y.Z`.
+- Every release `vX.Y.Z` MUST:
+  1. Bump `[workspace.package] version` in `Cargo.toml` (+ `Cargo.lock`) and add a `## [X.Y.Z] — YYYY-MM-DD` section to `CHANGELOG.md`.
+  2. Update pinned release versions and package filenames (`VER=X.Y.Z`, `--tag vX.Y.Z`, `.deb`/`.zip`/`i686` filenames) in `README.md` and `docs/manual/index.md`.
+  3. Create and push annotated tag `vX.Y.Z` after 4/4 green CI, and once the Release workflow publishes `SHA256SUMS.txt`, update `debsahu/homebrew-tap` (`Formula/ferric.rb` & `Casks/ferric.rb`) with the new version and verified SHA256 hashes.
